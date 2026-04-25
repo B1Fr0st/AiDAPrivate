@@ -30,8 +30,8 @@ namespace settings_overlay {
 	void toggle();
 	bool is_open();
 
-	void set_active_tab(int tab_index);
-	int  active_tab();
+	void set_active_tab(tab_index_t tab_index);
+	tab_index_t active_tab();
 
 
 }

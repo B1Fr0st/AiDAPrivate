@@ -678,8 +678,33 @@ if(WIN32)
             src/net_security.cpp
             src/emulation_engine.cpp
             "${STANDALONE_ROOT}/core/tls_exporter.cpp"
+            "${STANDALONE_ROOT}/core/auth_store.cpp"
+            "${STANDALONE_ROOT}/core/auth_codex.cpp"
+            "${STANDALONE_ROOT}/core/auth_copilot.cpp"
+            "${STANDALONE_ROOT}/core/auth_claude_code.cpp"
+            "${STANDALONE_ROOT}/core/auth_view.cpp"
+            "${STANDALONE_ROOT}/core/provider_catalog.cpp"
+            "${STANDALONE_ROOT}/core/provider_transforms.cpp"
+            "${STANDALONE_ROOT}/core/provider_view.cpp"
+            "${STANDALONE_ROOT}/core/event_bus.cpp"
+            "${STANDALONE_ROOT}/core/binary_map.cpp"
+            "${STANDALONE_ROOT}/core/session_store.cpp"
+            "${STANDALONE_ROOT}/core/agent_registry.cpp"
+            "${STANDALONE_ROOT}/core/agent_task.cpp"
+            "${STANDALONE_ROOT}/core/compaction.cpp"
+            "${STANDALONE_ROOT}/core/cost_calculator.cpp"
+            "${STANDALONE_ROOT}/core/command_registry.cpp"
+            "${STANDALONE_ROOT}/core/settings_overlay.cpp"
+            "${DEPS_DIR}/sqlite-amalgamation-3530000/sqlite3.c"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/hardware_id/hardware_id.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/telemetry/telemetry_client.cpp"
+        )
+
+        set_source_files_properties(
+            "${DEPS_DIR}/sqlite-amalgamation-3530000/sqlite3.c"
+            PROPERTIES
+                COMPILE_DEFINITIONS "SQLITE_THREADSAFE=1;SQLITE_DQS=0;SQLITE_OMIT_DEPRECATED;SQLITE_DEFAULT_MEMSTATUS=0;SQLITE_DEFAULT_WAL_SYNCHRONOUS=1;SQLITE_LIKE_DOESNT_MATCH_BLOBS;SQLITE_MAX_EXPR_DEPTH=0;SQLITE_OMIT_DECLTYPE;SQLITE_OMIT_PROGRESS_CALLBACK;SQLITE_OMIT_SHARED_CACHE;SQLITE_USE_ALLOCA"
+                COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:C>:/wd4146>;$<$<COMPILE_LANGUAGE:C>:/wd4244>;$<$<COMPILE_LANGUAGE:C>:/wd4267>;$<$<COMPILE_LANGUAGE:C>:/wd4996>"
         )
 
         set(IMGUI_SOURCES
@@ -740,6 +765,7 @@ if(WIN32)
             "${CMAKE_BINARY_DIR}/.deps/triton/src/libtriton/includes"
             "${Z3_INCLUDE_DIRS}"
             "${GHIDRA_DECOMP_DIR}"
+            "${DEPS_DIR}/sqlite-amalgamation-3530000"
         )
 
         target_compile_definitions(AiDAStandalone PRIVATE

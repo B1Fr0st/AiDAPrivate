@@ -801,17 +801,18 @@ namespace settings_overlay {
 	}
 
 
-	void set_active_tab(int tab_index)
+	void set_active_tab(tab_index_t tab_index)
 	{
 		auto& s = detail::state();
-		if (tab_index < 0 || tab_index >= tab_count) return;
-		s.active_tab.store(tab_index);
+		const int idx = static_cast<int>(tab_index);
+		if (idx < 0 || idx >= tab_count) return;
+		s.active_tab.store(idx);
 	}
 
 
-	int active_tab()
+	tab_index_t active_tab()
 	{
-		return detail::state().active_tab.load();
+		return static_cast<tab_index_t>(detail::state().active_tab.load());
 	}
 
 

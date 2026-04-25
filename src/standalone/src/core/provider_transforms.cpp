@@ -231,7 +231,7 @@ bool transform_request(const std::string& provider_id, const std::string& model_
 	return true;
 }
 
-bool transform_response(const std::string& /*provider_id*/, const std::string& /*model_id*/, nlohmann::json& response)
+bool transform_response(const std::string&, const std::string&, nlohmann::json& response)
 {
 	if (!response.is_object() && !response.is_array()) {
 		set_error("transform_response: response must be a JSON object or array");
