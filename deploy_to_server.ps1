@@ -5,28 +5,36 @@
 # Build via CMake/MSBuild before running this script.
 #
 # Usage:
-#   .\deploy_to_server.ps1              # Upload ARC + AiDAStandalone
+#   .\deploy_to_server.ps1              # Upload ARC + AiDAStandalone (auto-detect build dir)
 #   .\deploy_to_server.ps1 -ArcOnly     # Upload ARC only
 #   .\deploy_to_server.ps1 -ExeOnly     # Upload AiDAStandalone only
+#   .\deploy_to_server.ps1 -BuildDir "C:\path\to\build" # Specify custom build directory
 # ============================================================================
 
 param(
     [switch]$ArcOnly,
-    [switch]$ExeOnly
+    [switch]$ExeOnly,
+    [string]$BuildDir
 )
 
 $ErrorActionPreference = "Continue"
 
-# ── Configuration ────────────────────────────────────────────────────────────
-
 $REPO_ROOT           = "C:\Users\ruar\AiDAPrivate"
-$BUILD_DIR           = "$REPO_ROOT\build"
-$RELEASE_DIR         = "$BUILD_DIR\Release"
 $SSH_KEY             = "C:\Users\ruar\.ssh\aida_server"
 $SERVER              = "ruarr@23.88.62.199"
 $REMOTE_ARC_PATH     = "~/aida-server/arc/aida_core.bin"
 $REMOTE_EXE_PATH     = "~/aida-server/bin/AiDA.exe"
 $ARC_MASTER_SECRET   = "b3c4700abcf39f23d46527f2d2efd4b7d6e81dce0a674bd72d77a73067728453"
+
+if (-not $BuildDir) {
+    if (Test-Path "$REPO_ROOT\build-ninja") {
+        $RELEASE_DIR = "$REPO_ROOT\build-ninja"
+    } else {
+        $RELEASE_DIR = "$REPO_ROOT\build\Release"
+    }
+} else {
+    $RELEASE_DIR = $BuildDir
+}
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 

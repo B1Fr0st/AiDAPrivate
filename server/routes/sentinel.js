@@ -11,6 +11,7 @@ const router = express.Router();
 const ATTEST_HMAC_LABEL = 'aida/attest/v1';
 const KW_ISSUANCE_LABEL = 'aida/kw_issuance/v1';
 const RING_BUFFER_MAX = parseInt(process.env.SENTINEL_RING_MAX || '2048', 10);
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 
 function clientIp(req) {
     return (req.headers['x-forwarded-for'] || '').split(',')[0].trim()
@@ -40,6 +41,43 @@ async function recordSentinelEvent(licenseKey, quorumId, eventType, severity, pa
         [licenseKey, quorumId || '', eventType, severity || 'info', JSON.stringify(payload || {}), hvci === undefined ? null : !!hvci, ntBuild || null, bootCount || null, now, ip || '']
     );
     await pool.query('DELETE FROM sentinel_events WHERE id IN (SELECT id FROM sentinel_events WHERE license_key = $1 ORDER BY id DESC OFFSET $2)', [licenseKey, RING_BUFFER_MAX]);
+}
+
+async function sendDiscordWebhook(title, fields, color = 0xFF4444) {
+    if (!DISCORD_WEBHOOK_URL) return;
+    try {
+        const embed = {
+            title,
+            color,
+            fields: fields.map(f => ({
+                name: f.name,
+                value: String(f.value).slice(0, 1024),
+                inline: f.inline !== false,
+            })),
+            timestamp: new Date().toISOString(),
+            footer: { text: 'AiDA Sentinel' },
+        };
+        await fetch(DISCORD_WEBHOOK_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ embeds: [embed] }),
+        });
+    } catch (_) { }
+}
+
+async function recordSentinelViolation(licenseKey, quorumId, reason, evidence, ip, hvci, ntBuild, bootCount) {
+    await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [licenseKey]);
+    await recordSentinelEvent(licenseKey, quorumId, reason, 'critical', evidence, ip, hvci, ntBuild, bootCount);
+    await sendDiscordWebhook('AiDA Sentinel Violation Detected', [
+        { name: 'Route', value: 'sentinel' },
+        { name: 'Action', value: 'heartbeat' },
+        { name: 'Reason', value: reason },
+        { name: 'License', value: `\`${licenseKey}\`` },
+        { name: 'Quorum', value: `\`${quorumId || 'unknown'}\`` },
+        { name: 'IP', value: `\`${ip || 'unknown'}\`` },
+        { name: 'NT Build', value: ntBuild || 'unknown' },
+        { name: 'Evidence', value: JSON.stringify(evidence || {}) },
+    ], 0xFF0000);
 }
 
 async function upsertQuorumSeen(licenseKey, quorumId, ntBuild, hvci) {
@@ -217,7 +255,6 @@ router.post('/heartbeat', async (req, res) => {
             await recordSentinelEvent(license_key, quorum_id, type, sev, ev.payload || {}, ip, hvci_enabled, nt_build, boot_count);
         }
 
-        let sensorAnomalyDelta = 0;
         const sensorDeviations = [];
         if (sensors && typeof sensors === 'object' && lic.last_sensor_snapshot) {
             try {
@@ -228,12 +265,10 @@ router.post('/heartbeat', async (req, res) => {
                 for (const f of checkFields) {
                     if (prev[f] !== undefined && sensors[f] !== undefined && prev[f] !== sensors[f]) {
                         sensorDeviations.push({ field: f, prev: prev[f], now: sensors[f] });
-                        sensorAnomalyDelta += (f === 'lstar_msr' || f === 'ki_service_table_crc') ? 40 : 20;
                     }
                 }
                 if (prev.hvci_enabled === true && sensors.hvci_enabled === false) {
                     sensorDeviations.push({ field: 'hvci_enabled', prev: true, now: false });
-                    sensorAnomalyDelta += 20;
                 }
             } catch (_) { }
         }
@@ -246,19 +281,19 @@ router.post('/heartbeat', async (req, res) => {
         }
 
         if (sensorDeviations.length > 0) {
-            await recordSentinelEvent(license_key, quorum_id, 'sensor_deviation',
-                sensorAnomalyDelta >= 40 ? 'critical' : 'warn',
-                { deviations: sensorDeviations, delta: sensorAnomalyDelta },
+            await recordSentinelViolation(license_key, quorum_id, 'sensor_deviation',
+                { deviations: sensorDeviations },
                 ip, hvci_enabled, nt_build, boot_count);
-
-            const { rows: sRows } = await pool.query('SELECT anomaly_score FROM sessions WHERE license_key = $1', [license_key]);
-            if (sRows.length > 0) {
-                const nextScore = Math.min(100, (sRows[0].anomaly_score || 0) + sensorAnomalyDelta);
-                await pool.query('UPDATE sessions SET anomaly_score = $1 WHERE license_key = $2', [nextScore, license_key]);
-                if (nextScore >= 100) {
-                    await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
-                }
-            }
+            const response = {
+                status: 'killed',
+                live_quorum: 0,
+                required_quorum: 2,
+                kill_flag: true,
+                reason: 'sensor_deviation',
+                next_interval_seconds: 0,
+            };
+            response.signature = sigSignOrFallback(response);
+            return res.json(response);
         }
 
         const quorumWindow = 120;
@@ -270,31 +305,20 @@ router.post('/heartbeat', async (req, res) => {
         const liveQuorum = parseInt(qRows[0].live, 10) || 0;
 
         let killFlag = false;
-        let degradationFactor = 0;
         if (liveQuorum === 0) {
             killFlag = true;
-        } else if (liveQuorum === 1) {
-            degradationFactor = 0.5;
-            await recordSentinelEvent(license_key, quorum_id, 'quorum_degraded_1', 'critical',
-                { live: 1, required: 2 }, ip, hvci_enabled, nt_build, boot_count);
-        } else if (liveQuorum === 2) {
-            degradationFactor = 0.2;
-        }
-
-        if (killFlag) {
-            await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
-            await recordSentinelEvent(license_key, quorum_id, 'quorum_lost', 'critical',
+            await recordSentinelViolation(license_key, quorum_id, 'quorum_lost',
                 { live: 0, required: 2 }, ip, hvci_enabled, nt_build, boot_count);
+        } else if (liveQuorum === 1) {
+            await recordSentinelEvent(license_key, quorum_id, 'quorum_observed_1', 'warn',
+                { live: 1, required: 2 }, ip, hvci_enabled, nt_build, boot_count);
         }
 
         const response = {
             status: 'ok',
             live_quorum: liveQuorum,
             required_quorum: 2,
-            degraded: liveQuorum < 3,
-            degradation_factor: degradationFactor,
             kill_flag: killFlag,
-            sensor_anomaly_delta: sensorAnomalyDelta,
             next_interval_seconds: liveQuorum >= 2 ? 45 : 20,
         };
         response.signature = sigSignOrFallback(response);

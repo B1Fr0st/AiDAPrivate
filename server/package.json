@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test tests/",
+    "test": "node --test tests/*.js",
     "migrate": "psql $DATABASE_URL -f db/schema.sql"
   },
   "dependencies": {

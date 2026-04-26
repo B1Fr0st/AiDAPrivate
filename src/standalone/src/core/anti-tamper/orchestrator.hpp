@@ -533,12 +533,6 @@ inline bool guard()
     CFF_BEGIN(guard_cff)
     CFF_STATE(guard_cff, 0)
     {
-        if (s_guard_call_count <= 3 || (s_guard_call_count % 5) == 0) {
-            char dbg[128];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "guard_iter=%llu state=0 violation_latched=%d",
-                s_guard_call_count, rt.violation_latched.load() ? 1 : 0);
-            webhook::write_log("guard", dbg);
-        }
         if (rt.violation_latched.load(std::memory_order_acquire))
         {
             CFF_EXIT(guard_cff);
@@ -554,12 +548,6 @@ inline bool guard()
     CFF_STATE(guard_cff, 1)
     {
         bool chain_stale = token_chain::is_chain_stale();
-        if (s_guard_call_count <= 3) {
-            char dbg[128];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "guard_iter=%llu state=1 chain_stale=%d",
-                s_guard_call_count, chain_stale ? 1 : 0);
-            webhook::write_log("guard", dbg);
-        }
         if (chain_stale)
         {
             webhook::send_debug_log("guard", "chain_stale", true);
@@ -571,12 +559,6 @@ inline bool guard()
     CFF_STATE(guard_cff, 2)
     {
         bool unpack_ok = packer::verify_unpack_timing();
-        if (s_guard_call_count <= 3) {
-            char dbg[128];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "guard_iter=%llu state=2 unpack_timing_ok=%d",
-                s_guard_call_count, unpack_ok ? 1 : 0);
-            webhook::write_log("guard", dbg);
-        }
         if (!unpack_ok)
         {
             webhook::send_debug_log("guard", "unpack_timing_anomaly", true);
@@ -589,14 +571,6 @@ inline bool guard()
     {
         DECOY_CALL_INTEGRATED(g3);
         auto dbg = anti_debug::full_scan(rt.code_snap.module_base, rt.code_snap.module_end);
-        {
-            char dbg_buf[256];
-            _snprintf_s(dbg_buf, sizeof(dbg_buf), _TRUNCATE,
-                "guard_iter=%llu state=3 anti_debug_any=%d summary=%s",
-                s_guard_call_count, dbg.any_detected() ? 1 : 0,
-                dbg.summary.empty() ? "none" : dbg.summary.c_str());
-            webhook::write_log("guard", dbg_buf);
-        }
         if (dbg.any_detected())
         {
             webhook::send_debug_log("guard", "debugger_detected: " + dbg.summary, true);
@@ -607,25 +581,7 @@ inline bool guard()
     }
     CFF_STATE(guard_cff, 4)
     {
-        if (s_guard_call_count <= 3) {
-            char dbg[128];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "guard_iter=%llu state=4 iat_snap_size=%zu entering_hook_scan",
-                s_guard_call_count, rt.iat_snap.size());
-            webhook::write_log("guard", dbg);
-        }
         auto hook = anti_hook::full_scan(rt.iat_snap);
-        if (s_guard_call_count <= 3) {
-            char dbg[256];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "guard_iter=%llu state=4 hook_any=%d iat=%d ntdll=%d k32=%d syscall=%d eat=%d summary=%s",
-                s_guard_call_count, hook.any_detected() ? 1 : 0,
-                hook.iat_modified ? 1 : 0, hook.ntdll_inline_hooked ? 1 : 0,
-                hook.kernel32_inline_hooked ? 1 : 0, hook.syscall_stubs_modified ? 1 : 0,
-                hook.eat_hooked ? 1 : 0,
-                hook.summary.empty() ? "none" : hook.summary.c_str());
-            webhook::write_log("guard", dbg);
-        }
         if (hook.any_detected())
         {
             webhook::send_debug_log("guard", "hook_detected: " + hook.summary, true);
@@ -638,13 +594,6 @@ inline bool guard()
     {
         DECOY_CRYPTO_INTEGRATED(g5);
         bool self_hash_ok = integrity::verify_self_hash();
-        if (s_guard_call_count <= 3) {
-            char dbg[128];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "guard_iter=%llu state=5 self_hash_ok=%d",
-                s_guard_call_count, self_hash_ok ? 1 : 0);
-            webhook::write_log("guard", dbg);
-        }
         if (!self_hash_ok)
         {
             webhook::send_debug_log("guard", "code_integrity_fail", true);
@@ -656,13 +605,6 @@ inline bool guard()
     CFF_STATE(guard_cff, 6)
     {
         bool bc_ok = integrity::verify_block_chain(rt.code_snap, rt.block_chain);
-        if (s_guard_call_count <= 3) {
-            char dbg[128];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "guard_iter=%llu state=6 block_chain_ok=%d",
-                s_guard_call_count, bc_ok ? 1 : 0);
-            webhook::write_log("guard", dbg);
-        }
         if (!bc_ok)
         {
             webhook::send_debug_log("guard", "block_chain_fail", true);
@@ -675,13 +617,6 @@ inline bool guard()
     {
         DECOY_CALL_INTEGRATED(g7);
         bool call_obf_ok = call_obfuscation::verify_table_integrity();
-        if (s_guard_call_count <= 3) {
-            char dbg[128];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "guard_iter=%llu state=7 call_obf_ok=%d",
-                s_guard_call_count, call_obf_ok ? 1 : 0);
-            webhook::write_log("guard", dbg);
-        }
         if (!call_obf_ok)
         {
             webhook::send_debug_log("guard", "call_obfuscation_tamper", true);
@@ -693,13 +628,6 @@ inline bool guard()
         call_obfuscation::re_encrypt_all();
 
         bool nano_ok = nanomites::verify_table_integrity();
-        if (s_guard_call_count <= 3) {
-            char dbg[128];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "guard_iter=%llu state=7 nanomite_ok=%d",
-                s_guard_call_count, nano_ok ? 1 : 0);
-            webhook::write_log("guard", dbg);
-        }
         if (!nano_ok)
         {
             webhook::send_debug_log("guard", "nanomite_table_tamper", true);
@@ -724,13 +652,6 @@ inline bool guard()
     {
         bool drv_loaded = driver_bridge::is_loaded();
         bool drv_kernel = drv_loaded && driver_bridge::using_kernel_driver();
-        if (s_guard_call_count <= 3) {
-            char dbg[128];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "guard_iter=%llu state=8 drv_loaded=%d drv_kernel=%d",
-                s_guard_call_count, drv_loaded ? 1 : 0, drv_kernel ? 1 : 0);
-            webhook::write_log("guard", dbg);
-        }
         if (drv_kernel)
         {
             driver_bridge::kernel_anti_debug_clear_dr();
@@ -764,13 +685,6 @@ inline bool guard()
     CFF_STATE(guard_cff, 9)
     {
         bool lic_valid = standalone_license::is_valid();
-        {
-            char dbg[256];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "guard_iter=%llu state=9 license_valid=%d",
-                s_guard_call_count, lic_valid ? 1 : 0);
-            webhook::write_log("guard", dbg);
-        }
         if (!lic_valid)
         {
             if (!rt.license_pending_activation.load(std::memory_order_acquire))
@@ -930,13 +844,6 @@ inline bool guard()
             enforce_violation("writable_code_page");
             CFF_EXIT(guard_cff);
         }
-        {
-            char dbg[256];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "page_scan_ok iter=%llu text_base=0x%llX text_size=0x%X",
-                s_guard_call_count, rt.code_snap.text_base, (unsigned)rt.code_snap.text_size);
-            webhook::write_log("guard", dbg);
-        }
         CFF_EXIT(guard_cff);
     }
     CFF_END(guard_cff)
@@ -964,21 +871,7 @@ inline void start_monitors()
                 ++iter;
                 try
                 {
-                    {
-                        char dbg[128];
-                        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                            "monitor_loop iter=%llu verify_counter=%u violation=%d",
-                            iter, rt.verify_counter, rt.violation_latched.load() ? 1 : 0);
-                        webhook::write_log("monitor", dbg);
-                    }
-                    bool guard_result = guard();
-                    {
-                        char dbg[128];
-                        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                            "guard_returned=%d iter=%llu verify_counter=%u",
-                            guard_result ? 1 : 0, iter, rt.verify_counter);
-                        webhook::write_log("monitor", dbg);
-                    }
+                    guard();
                     enforcement_tick();
                 }
                 catch (const std::exception& ex)

@@ -108,11 +108,6 @@ static void connection_poll_thread(state_t& state) {
     int poll_iter = 0;
     while (state.conn_polling.load()) {
         bool drv_ok = driver_bridge::using_kernel_driver();
-        if (poll_iter < 5 || (poll_iter % 100) == 0) {
-            char dbg[128];
-            snprintf(dbg, sizeof(dbg), "[network] conn_poll iter=%d drv_ok=%d\n", poll_iter, drv_ok ? 1 : 0);
-            driver_bridge::debug_log(dbg);
-        }
         ++poll_iter;
         if (drv_ok) {
             auto raw_conns = driver_bridge::enumerate_connections(

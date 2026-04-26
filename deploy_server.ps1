@@ -21,7 +21,8 @@ $files = @(
     "crypto\arc-encrypt.js",
     "crypto\kw_wrap.js",
     "crypto\tls_exporter.js",
-    "db\pool.js"
+    "db\pool.js",
+    "db\schema.sql"
 )
 foreach ($f in $files) {
     $local = Join-Path $SRC $f
@@ -41,6 +42,10 @@ $nl = "`n"
 $script  = "#!/bin/bash$nl"
 $script += "set -e$nl"
 $script += "cd /home/ruarr/aida-server$nl"
+$script += "set -a$nl"
+$script += ". ./.env$nl"
+$script += "set +a$nl"
+$script += "psql `"`$DATABASE_URL`" -f db/schema.sql$nl"
 $script += "pm2 restart aida-api 2>&1 | grep -E 'online|error|Done' || true$nl"
 $script += "sleep 3$nl"
 $script += "echo '[health]'$nl"

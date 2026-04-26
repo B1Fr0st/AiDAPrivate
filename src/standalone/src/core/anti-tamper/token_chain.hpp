@@ -98,6 +98,30 @@ namespace token_chain {
             return static_cast<int64_t>((c.QuadPart * 1000) / f.QuadPart);
         }
 
+        inline std::atomic<int>& trusted_ui_depth()
+        {
+            static std::atomic<int> v{0};
+            return v;
+        }
+
+        inline std::atomic<int64_t>& trusted_ui_until_ms()
+        {
+            static std::atomic<int64_t> v{0};
+            return v;
+        }
+
+        inline std::atomic<int64_t>& stale_log_ms()
+        {
+            static std::atomic<int64_t> v{0};
+            return v;
+        }
+
+        inline void refresh_check_times(state::runtime_t& rt, int64_t now)
+        {
+            rt.chain.last_fast_check_ms.store(now, std::memory_order_release);
+            rt.chain.last_integrity_check_ms.store(now, std::memory_order_release);
+        }
+
         inline uint64_t mix_token(uint64_t check_result, uint64_t chain_prev,
                                    uint64_t rdtsc_val, uint64_t proof_hash,
                                    uint64_t k0, uint64_t k1)
@@ -385,6 +409,52 @@ namespace token_chain {
         return token;
     }
 
+    inline void resync_freshness()
+    {
+        auto& rt = state::get();
+        detail::refresh_check_times(rt, detail::now_ms());
+    }
+
+    inline void begin_trusted_interaction()
+    {
+        detail::trusted_ui_depth().fetch_add(1, std::memory_order_acq_rel);
+        resync_freshness();
+    }
+
+    inline void end_trusted_interaction()
+    {
+        auto& depth = detail::trusted_ui_depth();
+        int prev = depth.fetch_sub(1, std::memory_order_acq_rel);
+        int64_t now = detail::now_ms();
+        if (prev <= 1)
+        {
+            depth.store(0, std::memory_order_release);
+            detail::trusted_ui_until_ms().store(now + 15000, std::memory_order_release);
+        }
+        auto& rt = state::get();
+        detail::refresh_check_times(rt, now);
+    }
+
+    struct trusted_interaction_scope_t
+    {
+        bool active = false;
+
+        trusted_interaction_scope_t()
+        {
+            begin_trusted_interaction();
+            active = true;
+        }
+
+        trusted_interaction_scope_t(const trusted_interaction_scope_t&) = delete;
+        trusted_interaction_scope_t& operator=(const trusted_interaction_scope_t&) = delete;
+
+        ~trusted_interaction_scope_t()
+        {
+            if (active)
+                end_trusted_interaction();
+        }
+    };
+
     inline bool is_chain_stale()
     {
         auto& rt = state::get();
@@ -394,17 +464,36 @@ namespace token_chain {
 
         int64_t now = detail::now_ms();
 
+        if (detail::trusted_ui_depth().load(std::memory_order_acquire) > 0 ||
+            now < detail::trusted_ui_until_ms().load(std::memory_order_acquire))
+        {
+            detail::refresh_check_times(rt, now);
+            return false;
+        }
+
         int64_t init_time = rt.chain.last_deep_check_ms.load(std::memory_order_acquire);
         if (init_time > 0 && (now - init_time) < 30000)
             return false;
 
         int64_t last_fast = rt.chain.last_fast_check_ms.load(std::memory_order_acquire);
-        if (last_fast > 0 && (now - last_fast) > 10000)
-            return true;
-
         int64_t last_integ = rt.chain.last_integrity_check_ms.load(std::memory_order_acquire);
-        if (last_integ > 0 && (now - last_integ) > 60000)
-            return true;
+        bool fast_stale = last_fast > 0 && (now - last_fast) > 10000;
+        bool integ_stale = last_integ > 0 && (now - last_integ) > 60000;
+        if (fast_stale || integ_stale)
+        {
+            int64_t last_log = detail::stale_log_ms().load(std::memory_order_acquire);
+            if ((now - last_log) > 5000 &&
+                detail::stale_log_ms().compare_exchange_strong(last_log, now, std::memory_order_acq_rel))
+            {
+                char buf[192];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "chain_freshness_resync fast_age=%lld integ_age=%lld",
+                    static_cast<long long>(last_fast > 0 ? now - last_fast : 0),
+                    static_cast<long long>(last_integ > 0 ? now - last_integ : 0));
+                webhook::write_log("token_chain", buf);
+            }
+            detail::refresh_check_times(rt, now);
+        }
 
         return false;
     }

@@ -49,6 +49,24 @@ static int                        g_loader_icon_h    = 0;
 DisasmState                       g_disasm;
 const char*                       g_render_section = "idle";
 
+static bool trusted_get_open_file_name(OPENFILENAMEA& ofn)
+{
+	anti_tamper::token_chain::trusted_interaction_scope_t trusted_scope;
+	return GetOpenFileNameA(&ofn) != FALSE;
+}
+
+static bool trusted_get_save_file_name(OPENFILENAMEA& ofn)
+{
+	anti_tamper::token_chain::trusted_interaction_scope_t trusted_scope;
+	return GetSaveFileNameA(&ofn) != FALSE;
+}
+
+static HRESULT trusted_show_file_dialog(IFileOpenDialog* dialog, HWND owner)
+{
+	anti_tamper::token_chain::trusted_interaction_scope_t trusted_scope;
+	return dialog ? dialog->Show(owner) : E_POINTER;
+}
+
 
 #include "../assets/theme_icons/kaneki.h"
 #include "../assets/theme_icons/rias.h"
@@ -603,14 +621,6 @@ void helpers::render_title()
 		standalone_license::fold_integrity_token(tok);
 		static uint64_t s_inline_log_ctr = 0;
 		++s_inline_log_ctr;
-		if (s_inline_log_ctr <= 3 || (s_inline_log_ctr % 500) == 0) {
-			char dbg[128];
-			_snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-				"inline_check frame=%llu tok=0x%llX",
-				s_inline_log_ctr, tok);
-			anti_tamper::webhook::write_log("render", dbg);
-		}
-
 
 		if ((s_inline_log_ctr % 1000) == 0) {
 			anti_tamper::run_inline_check(anti_tamper::CHECK_CODE_INTEGRITY);
@@ -622,15 +632,6 @@ void helpers::render_title()
 			standalone_license::gate_ui_render_loop);
 		(void)standalone_license::verify_gate_token(
 			standalone_license::gate_ui_render_loop, gt);
-		static uint64_t s_gate_log_ctr = 0;
-		++s_gate_log_ctr;
-		if (s_gate_log_ctr <= 3 || (s_gate_log_ctr % 500) == 0) {
-			char dbg[128];
-			_snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-				"gate_check frame=%llu gt=0x%llX",
-				s_gate_log_ctr, gt);
-			anti_tamper::webhook::write_log("render", dbg);
-		}
 	}
 
 	g_render_section = "theme_resolve";
@@ -1779,7 +1780,7 @@ void helpers::render_title()
 							ofn.lpstrFilter = "AiDA Theme (*.json)\0*.json\0All Files\0*.*\0\0";
 							ofn.nFilterIndex = 1;
 							ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-							if (GetOpenFileNameA(&ofn)) {
+							if (trusted_get_open_file_name(ofn)) {
 								std::ifstream ifs(buf);
 								if (ifs.is_open()) {
 									try {
@@ -1891,7 +1892,7 @@ void helpers::render_title()
 							ofn2.nMaxFile = MAX_PATH;
 							ofn2.lpstrFilter = "Images\0*.png;*.jpg;*.jpeg;*.bmp\0All Files\0*.*\0\0";
 							ofn2.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-							if (GetOpenFileNameA(&ofn2)) {
+							if (trusted_get_open_file_name(ofn2)) {
 								ed.icon_index = -1;
 								ed.icon_file_path = icon_buf;
 							}
@@ -1956,7 +1957,7 @@ void helpers::render_title()
 						sfn.lpstrFilter = "AiDA Theme (*.json)\0*.json\0\0";
 						sfn.lpstrDefExt = "json";
 						sfn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
-						if (GetSaveFileNameA(&sfn)) {
+						if (trusted_get_save_file_name(sfn)) {
 							nlohmann::json jt;
 							jt["name"] = std::string(name_buf);
 							jt["accent"] = { ed.accent[0], ed.accent[1], ed.accent[2] };
@@ -2142,7 +2143,7 @@ void helpers::render_title()
 							ofn.nMaxFile = MAX_PATH;
 							ofn.lpstrFilter = "All Files\0*.*\0C/C++\0*.c;*.cpp;*.h;*.hpp\0";
 							ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-							if (GetOpenFileNameA(&ofn)) {
+							if (trusted_get_open_file_name(ofn)) {
 								std::string content;
 								FILE* f = nullptr;
 								fopen_s(&f, buf, "rb");
@@ -2170,7 +2171,7 @@ void helpers::render_title()
 								pfd->GetOptions(&opts);
 								pfd->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
 								pfd->SetTitle(L"Open Workspace Folder");
-								hr = pfd->Show(g_hwnd);
+								hr = trusted_show_file_dialog(pfd, g_hwnd);
 								if (SUCCEEDED(hr)) {
 									IShellItem* psi = nullptr;
 									hr = pfd->GetResult(&psi);
@@ -2205,7 +2206,7 @@ void helpers::render_title()
 							sfn.nMaxFile = MAX_PATH;
 							sfn.lpstrFilter = "All Files\0*.*\0";
 							sfn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
-							if (GetSaveFileNameA(&sfn)) {
+							if (trusted_get_save_file_name(sfn)) {
 								code_editor::filepath = buf;
 								std::string fn = buf;
 								auto p = fn.find_last_of("\\/");

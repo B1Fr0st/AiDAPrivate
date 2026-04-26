@@ -27,6 +27,19 @@ CREATE TABLE IF NOT EXISTS licenses (
     revoked_hwid    TEXT
 );
 
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS active          BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS hwid            TEXT    NOT NULL DEFAULT '';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS expires         TEXT    NOT NULL DEFAULT '';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS plan            TEXT    NOT NULL DEFAULT 'standard';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS note            TEXT    NOT NULL DEFAULT '';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS created_at      BIGINT  NOT NULL DEFAULT (EXTRACT(EPOCH FROM now())::BIGINT);
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS created_by      TEXT    NOT NULL DEFAULT '';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS revoked_at      BIGINT;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS revoked_at_iso  TEXT;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS revoked_reason  TEXT;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS revoked_version TEXT;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS revoked_hwid    TEXT;
+
 CREATE INDEX IF NOT EXISTS idx_licenses_hwid   ON licenses (hwid) WHERE hwid != '';
 CREATE INDEX IF NOT EXISTS idx_licenses_active ON licenses (active);
 CREATE INDEX IF NOT EXISTS idx_licenses_plan   ON licenses (plan);
@@ -49,10 +62,24 @@ CREATE TABLE IF NOT EXISTS sessions (
     heartbeat_count INTEGER     NOT NULL DEFAULT 0,
     last_proof_token TEXT       NOT NULL DEFAULT '',
     last_code_hash  TEXT        NOT NULL DEFAULT '',
-    anomaly_score   REAL        NOT NULL DEFAULT 0,
     ip_history      TEXT[]      NOT NULL DEFAULT '{}',
     heartbeat_times BIGINT[]    NOT NULL DEFAULT '{}'
 );
+
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_token    TEXT     NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS server_nonce     TEXT     NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS issued_at        BIGINT   NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ttl              INTEGER  NOT NULL DEFAULT 3600;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS hwid             TEXT     NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ip               TEXT     NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS plugin_version   TEXT     NOT NULL DEFAULT 'unknown';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_heartbeat   BIGINT   NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS kill_flag        BOOLEAN  NOT NULL DEFAULT false;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS heartbeat_count  INTEGER  NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_proof_token TEXT     NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_code_hash   TEXT     NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ip_history       TEXT[]   NOT NULL DEFAULT '{}';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS heartbeat_times  BIGINT[] NOT NULL DEFAULT '{}';
 
 CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions (session_token);
 CREATE INDEX IF NOT EXISTS idx_sessions_kill  ON sessions (kill_flag) WHERE kill_flag = true;
@@ -112,12 +139,10 @@ CREATE TABLE IF NOT EXISTS downloads (
 CREATE INDEX IF NOT EXISTS idx_downloads_hwid      ON downloads (hwid);
 CREATE INDEX IF NOT EXISTS idx_downloads_timestamp ON downloads (downloaded_at DESC);
 
-ALTER TABLE licenses ADD COLUMN IF NOT EXISTS hwid_anomaly_sum REAL NOT NULL DEFAULT 0;
 ALTER TABLE licenses ADD COLUMN IF NOT EXISTS key_rotation_ts  BIGINT NOT NULL DEFAULT 0;
 
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS honeypot_export TEXT NOT NULL DEFAULT '';
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS challenge_id    TEXT NOT NULL DEFAULT '';
-ALTER TABLE sessions ADD COLUMN IF NOT EXISTS step_up_pending BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_chain_tag  TEXT NOT NULL DEFAULT '';
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_gate_bitmap INTEGER NOT NULL DEFAULT 0;
 

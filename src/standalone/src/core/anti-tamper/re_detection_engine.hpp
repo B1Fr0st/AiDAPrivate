@@ -60,7 +60,7 @@ struct re_evidence_blob_t
     uint32_t version;
     uint32_t signal_family;
     uint32_t signal_id;
-    uint32_t score;
+    uint32_t signal_count;
     uint32_t pid;
     uint32_t reserved0;
     uint64_t caller_image_hash;
@@ -68,37 +68,35 @@ struct re_evidence_blob_t
     uint64_t timestamp;
 };
 
-constexpr uint32_t THRESHOLD_CONFIRMED = 100;
-constexpr uint32_t PERSISTENCE_TICKS   = 3;
 constexpr uint32_t TICK_INTERVAL_MS    = 500;
 
 struct signal_desc_t
 {
     uint32_t bit;
-    uint32_t weight;
     uint32_t family;
+    const char* name;
 };
 
 inline const signal_desc_t& signals(uint32_t bit)
 {
     static const signal_desc_t table[] = {
-        { SIGNAL_FOREIGN_HANDLE,  70, FAMILY_HANDLE },
-        { SIGNAL_INJECTED_MODULE, 60, FAMILY_INJECTION },
-        { SIGNAL_KERNEL_DEBUG,    90, FAMILY_KDEBUG },
-        { SIGNAL_DR_SET,          95, FAMILY_DR },
-        { SIGNAL_DEBUG_PORT,      95, FAMILY_DPORT },
-        { SIGNAL_PEB_CLASSIC,     60, FAMILY_CLASSIC },
-        { SIGNAL_API_IS_DBG,      30, FAMILY_CLASSIC },
-        { SIGNAL_DEBUG_ATTACH,   100, FAMILY_ATTACH },
-        { SIGNAL_DBGUI_BREAKIN,   80, FAMILY_ATTACH },
-        { SIGNAL_TEXT_WRITABLE,     100, FAMILY_MEMORY },
-        { SIGNAL_PROC_DEBUG_HANDLE,  95, FAMILY_DPORT_X },
-        { SIGNAL_THREAD_SUSPENDED,   90, FAMILY_TARGET },
-        { SIGNAL_VEH_TAMPERED,       85, FAMILY_INJECTION },
-        { SIGNAL_DEBUG_REATTACH,     95, FAMILY_ATTACH },
-        { SIGNAL_KD_TARGETING_US,   100, FAMILY_KDEBUG },
+        { SIGNAL_FOREIGN_HANDLE, FAMILY_HANDLE, "foreign_handle" },
+        { SIGNAL_INJECTED_MODULE, FAMILY_INJECTION, "injected_module" },
+        { SIGNAL_KERNEL_DEBUG, FAMILY_KDEBUG, "kernel_debug" },
+        { SIGNAL_DR_SET, FAMILY_DR, "hardware_breakpoint" },
+        { SIGNAL_DEBUG_PORT, FAMILY_DPORT, "debug_port" },
+        { SIGNAL_PEB_CLASSIC, FAMILY_CLASSIC, "peb_debug_flags" },
+        { SIGNAL_API_IS_DBG, FAMILY_CLASSIC, "debugger_api" },
+        { SIGNAL_DEBUG_ATTACH, FAMILY_ATTACH, "debug_attach" },
+        { SIGNAL_DBGUI_BREAKIN, FAMILY_ATTACH, "dbgui_breakin" },
+        { SIGNAL_TEXT_WRITABLE, FAMILY_MEMORY, "text_writable" },
+        { SIGNAL_PROC_DEBUG_HANDLE, FAMILY_DPORT_X, "process_debug_handle" },
+        { SIGNAL_THREAD_SUSPENDED, FAMILY_TARGET, "thread_suspended" },
+        { SIGNAL_VEH_TAMPERED, FAMILY_INJECTION, "veh_tampered" },
+        { SIGNAL_DEBUG_REATTACH, FAMILY_ATTACH, "debug_reattach" },
+        { SIGNAL_KD_TARGETING_US, FAMILY_KDEBUG, "kernel_debug_targeting_us" },
     };
-    static const signal_desc_t zero = { 0, 0, 0 };
+    static const signal_desc_t zero = { 0, 0, "unknown" };
     for (const auto& d : table) {
         if (d.bit == bit) return d;
     }
@@ -597,16 +595,16 @@ namespace detail {
         ev.reserved0 = 0;
         ev.caller_image_hash = module_image_hash();
 
-        uint32_t score = 0;
+        uint32_t signal_count = 0;
         uint32_t families_hit = 0;
         for (int bit = 0; bit < 32; ++bit)
         {
             if ((mask & (1u << bit)) == 0) continue;
             const auto& d = signals(1u << bit);
-            score += d.weight;
+            ++signal_count;
             families_hit |= d.family;
         }
-        ev.score = score;
+        ev.signal_count = signal_count;
 
         uint64_t sh = hash_evidence(mask);
         sh ^= static_cast<uint64_t>(families_hit) * 0x9E3779B97F4A7C15ULL;
@@ -672,21 +670,40 @@ namespace detail {
         return mask;
     }
 
-    inline bool score_exceeds_threshold(uint32_t mask)
+    inline bool has_confirmed_signal(uint32_t mask)
     {
-        uint32_t score = 0;
-        uint32_t families = 0;
-        int family_count = 0;
         for (int bit = 0; bit < 32; ++bit) {
             if ((mask & (1u << bit)) == 0) continue;
             const auto& d = signals(1u << bit);
-            score += d.weight;
-            if ((families & d.family) == 0) {
-                families |= d.family;
-                ++family_count;
-            }
+            if (d.bit != 0)
+                return true;
         }
-        return score >= THRESHOLD_CONFIRMED && family_count >= 2;
+        return false;
+    }
+
+    inline std::string describe_signals(uint32_t mask)
+    {
+        std::string names;
+        for (int bit = 0; bit < 32; ++bit) {
+            if ((mask & (1u << bit)) == 0) continue;
+            const auto& d = signals(1u << bit);
+            if (d.bit == 0) continue;
+            if (!names.empty())
+                names += ",";
+            names += d.name;
+        }
+        return names.empty() ? "none" : names;
+    }
+
+    inline std::string format_signal_detail(uint32_t mask, uint64_t evidence)
+    {
+        char buf[192];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "mask=0x%08X evidence=0x%016llX signals=%s",
+            mask,
+            static_cast<unsigned long long>(evidence),
+            describe_signals(mask).c_str());
+        return std::string(buf);
     }
 
     inline uint64_t hash_evidence(uint32_t mask)
@@ -708,7 +725,7 @@ inline bool should_bsod(uint32_t mask)
 {
     if (detail::is_devmode_hwid_allowlisted())
         return false;
-    return detail::score_exceeds_threshold(mask);
+    return detail::has_confirmed_signal(mask);
 }
 
 inline void tick()
@@ -721,64 +738,37 @@ inline void tick()
     s.last_mask.store(mask);
 
     static std::atomic<uint32_t> s_tick_num{0};
-    uint32_t tn = s_tick_num.fetch_add(1);
-    {
-
-        uint32_t _sc = 0, _fam = 0; int _fc = 0;
-        for (int _b = 0; _b < 32; ++_b) {
-            if ((mask & (1u << _b)) == 0) continue;
-            const auto& _d = signals(1u << _b);
-            _sc += _d.weight;
-            if ((_fam & _d.family) == 0) { _fam |= _d.family; ++_fc; }
-        }
-        bool _dev = detail::is_devmode_hwid_allowlisted();
-        bool _exc = _sc >= THRESHOLD_CONFIRMED && _fc >= 2;
-        char tb[192];
-        _snprintf_s(tb, sizeof(tb), _TRUNCATE,
-            "re_tick tick=%u mask=0x%X score=%u families=%d threshold=%u exceeds=%d devmode=%d",
-            tn, mask, _sc, _fc, THRESHOLD_CONFIRMED, (int)_exc, (int)_dev);
-        webhook::write_log("re_tick", tb);
-    }
-
-    uint32_t prev = s.persist_mask.load();
-    uint32_t intersect = prev & mask;
-    if (intersect != 0) {
-        uint32_t c = s.persist_count.fetch_add(1) + 1;
+    s_tick_num.fetch_add(1);
+    if (should_bsod(mask)) {
         {
             char pb[128];
             _snprintf_s(pb, sizeof(pb), _TRUNCATE,
-                "re_persist intersect=0x%X count=%u persistence_ticks=%u should_bsod=%d",
-                intersect, c, PERSISTENCE_TICKS, (int)should_bsod(intersect));
+                "re_signal mask=0x%08X should_bsod=1",
+                mask);
             webhook::write_log("re_tick", pb);
         }
-        if (c >= PERSISTENCE_TICKS && should_bsod(intersect)) {
-            uint64_t evidence = detail::hash_evidence(intersect);
-            standalone_license::fold_integrity_token(evidence);
-            std::string detail_str = "re_detected mask=0x" +
-                std::to_string(intersect) + " evidence=0x" +
-                std::to_string(evidence);
-            webhook::send_debug_log("re_detect", detail_str, true);
-            webhook::post_critical_then_enforce("re_detected", detail_str, intersect);
-            if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver()) {
-                uint32_t reason = 0x0000DEEEu;
-                if (intersect & SIGNAL_DR_SET)                reason = 0x0000D7D7u;
-                else if (intersect & SIGNAL_DEBUG_PORT)        reason = 0x0000DBDBu;
-                else if (intersect & SIGNAL_FOREIGN_HANDLE)    reason = 0x0000AD7Du;
-                else if (intersect & SIGNAL_INJECTED_MODULE)   reason = 0x0000114Du;
-                else if (intersect & SIGNAL_DEBUG_ATTACH)      reason = 0x0000DBDBu;
-                else if (intersect & SIGNAL_PROC_DEBUG_HANDLE) reason = 0x0000DBDBu;
-                else if (intersect & SIGNAL_TEXT_WRITABLE)     reason = 0x0000D7ECu;
-                else if (intersect & SIGNAL_KD_TARGETING_US)   reason = 0x00007A63u;
-                driver_bridge::latch_targeting_from_usermode(reason);
-                driver_bridge::trigger_kernel_bsod(reason, evidence);
-            }
-            enforce_violation("re_detected", detail_str);
-            s.persist_count.store(0);
-            s.persist_mask.store(0);
-            return;
+        uint64_t evidence = detail::hash_evidence(mask);
+        standalone_license::fold_integrity_token(evidence);
+        std::string detail_str = detail::format_signal_detail(mask, evidence);
+        webhook::send_debug_log("re_detect", detail_str, true);
+        webhook::post_critical_then_enforce("re_detected", detail_str, mask);
+        if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver()) {
+            uint32_t reason = 0x0000DEEEu;
+            if (mask & SIGNAL_DR_SET)                reason = 0x0000D7D7u;
+            else if (mask & SIGNAL_DEBUG_PORT)        reason = 0x0000DBDBu;
+            else if (mask & SIGNAL_FOREIGN_HANDLE)    reason = 0x0000AD7Du;
+            else if (mask & SIGNAL_INJECTED_MODULE)   reason = 0x0000114Du;
+            else if (mask & SIGNAL_DEBUG_ATTACH)      reason = 0x0000DBDBu;
+            else if (mask & SIGNAL_PROC_DEBUG_HANDLE) reason = 0x0000DBDBu;
+            else if (mask & SIGNAL_TEXT_WRITABLE)     reason = 0x0000D7ECu;
+            else if (mask & SIGNAL_KD_TARGETING_US)   reason = 0x00007A63u;
+            driver_bridge::latch_targeting_from_usermode(reason);
+            driver_bridge::trigger_kernel_bsod(reason, evidence);
         }
-    } else {
+        enforce_violation("re_detected", detail_str);
         s.persist_count.store(0);
+        s.persist_mask.store(0);
+        return;
     }
     s.persist_mask.store(mask);
 }
@@ -817,7 +807,7 @@ inline int __declspec(noinline) seh_watchdog_step(
         bool advanced = current != *last_counter;
         if (!advanced || !monitors_ok) {
             uint32_t mask = detail::collect_signals();
-            if (detail::score_exceeds_threshold(mask)) {
+            if (detail::has_confirmed_signal(mask)) {
                 *last_counter = current;
                 return static_cast<int>(mask);
             }
@@ -845,14 +835,14 @@ inline void watchdog_loop()
             uint32_t mask = static_cast<uint32_t>(rc);
             uint64_t evidence = detail::hash_evidence(mask);
             standalone_license::fold_integrity_token(evidence);
-            webhook::send_debug_log("re_watchdog",
-                "watchdog_stall mask=0x" + std::to_string(mask), true);
+            std::string detail_str = "watchdog_stall " + detail::format_signal_detail(mask, evidence);
+            webhook::send_debug_log("re_watchdog", detail_str, true);
             webhook::post_critical_then_enforce("re_watchdog_stall",
-                "mask=0x" + std::to_string(mask), mask);
+                detail_str, mask);
             if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver()) {
                 driver_bridge::trigger_kernel_bsod(0x0000DEDDu, evidence);
             }
-            enforce_violation("re_watchdog_stall");
+            enforce_violation("re_watchdog_stall", detail_str);
             return;
         }
     }

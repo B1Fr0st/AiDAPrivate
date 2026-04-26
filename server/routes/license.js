@@ -35,6 +35,11 @@ const HONEYPOT_POOL = [
     'PspRemapWithoutPeb', 'IoSealDispatch', 'RtlpFrontendTeleport',
 ];
 
+const NON_ENFORCING_BAN_REASONS = new Set([
+    'anomaly_auto_kill',
+    'cross_session_anomaly_ban',
+]);
+
 
 function todayStr() {
     return new Date().toISOString().slice(0, 10);
@@ -59,6 +64,58 @@ function sanitizeReason(reason) {
     return typeof reason === 'string'
         ? reason.slice(0, 128).replace(/[^a-zA-Z0-9_ :\-]/g, '')
         : 'unknown';
+}
+
+function isNonEnforcingBanReason(reason) {
+    return NON_ENFORCING_BAN_REASONS.has(String(reason || '').trim());
+}
+
+function normalizeBanCheckHwids(body) {
+    const values = [];
+    const append = value => {
+        if (typeof value !== 'string') return;
+        const trimmed = value.trim();
+        if (trimmed.length < 8 || trimmed.length > 256) return;
+        if (!values.includes(trimmed)) values.push(trimmed);
+    };
+    append(body && body.hwid);
+    if (body && Array.isArray(body.hwids)) {
+        for (const hwid of body.hwids.slice(0, 8)) append(hwid);
+    }
+    return values;
+}
+
+function evaluateHeartbeatContinuity(session, body) {
+    const proofToken = typeof body.proof_token === 'string' ? body.proof_token : '';
+    const lastProofToken = typeof session.last_proof_token === 'string' ? session.last_proof_token : '';
+    const rawHeartbeatCount = body.heartbeat_count;
+    const heartbeatCount = typeof rawHeartbeatCount === 'number' && Number.isFinite(rawHeartbeatCount)
+        ? Math.max(0, Math.floor(rawHeartbeatCount))
+        : null;
+    const serverCountRaw = Number(session.heartbeat_count || 0);
+    const serverCount = Number.isFinite(serverCountRaw) ? Math.max(0, Math.floor(serverCountRaw)) : 0;
+    const continuityReasons = [];
+
+    if (!proofToken) {
+        continuityReasons.push('missing_proof_token');
+    } else if (lastProofToken && proofToken === lastProofToken) {
+        continuityReasons.push('replayed_proof_token');
+    }
+
+    if (heartbeatCount !== null) {
+        const expectedCount = serverCount + 1;
+        if (heartbeatCount < expectedCount) {
+            continuityReasons.push('heartbeat_count_regression');
+        } else if (heartbeatCount > expectedCount + 5) {
+            continuityReasons.push('heartbeat_count_skip');
+        }
+    }
+
+    return {
+        proof_token_to_store: proofToken.length > 0 ? proofToken : lastProofToken,
+        continuity_reasons: continuityReasons,
+        violation_reasons: [],
+    };
 }
 
 function getClientIp(req) {
@@ -287,8 +344,8 @@ async function verifyOrBindHwid(licenseKey, hwid, existingHwid) {
 
 async function storeSession(licenseKey, sessionData) {
     await pool.query(`
-        INSERT INTO sessions (license_key, session_token, server_nonce, issued_at, ttl, hwid, ip, plugin_version, last_heartbeat, kill_flag, heartbeat_count, last_proof_token, last_code_hash, anomaly_score, ip_history, heartbeat_times, honeypot_export, challenge_id, step_up_pending, last_chain_tag)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, 0, '', '', 0, ARRAY[$7]::TEXT[], ARRAY[]::BIGINT[], $10, $11, false, '')
+        INSERT INTO sessions (license_key, session_token, server_nonce, issued_at, ttl, hwid, ip, plugin_version, last_heartbeat, kill_flag, heartbeat_count, last_proof_token, last_code_hash, ip_history, heartbeat_times, honeypot_export, challenge_id, last_chain_tag)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, 0, '', '', ARRAY[$7]::TEXT[], ARRAY[]::BIGINT[], $10, $11, '')
         ON CONFLICT (license_key) DO UPDATE SET
             session_token     = EXCLUDED.session_token,
             server_nonce      = EXCLUDED.server_nonce,
@@ -302,12 +359,10 @@ async function storeSession(licenseKey, sessionData) {
             heartbeat_count   = 0,
             last_proof_token  = '',
             last_code_hash    = '',
-            anomaly_score     = 0,
             ip_history        = ARRAY[EXCLUDED.ip]::TEXT[],
             heartbeat_times   = ARRAY[]::BIGINT[],
             honeypot_export   = EXCLUDED.honeypot_export,
             challenge_id      = EXCLUDED.challenge_id,
-            step_up_pending   = false,
             last_chain_tag    = ''
     `, [
         licenseKey,
@@ -338,8 +393,9 @@ async function checkBans(hwid, clientIp) {
             'SELECT * FROM bans WHERE ban_type = $1 AND value = $2',
             ['hwid', hwid]
         );
-        if (rows.length > 0) {
-            return { banned: true, reason: 'hwid_banned', data: rows[0] };
+        const activeBan = rows.find(row => !isNonEnforcingBanReason(row.reason));
+        if (activeBan) {
+            return { banned: true, reason: 'hwid_banned', data: activeBan };
         }
     }
     if (clientIp && clientIp !== 'unknown') {
@@ -348,11 +404,47 @@ async function checkBans(hwid, clientIp) {
             'SELECT * FROM bans WHERE ban_type = $1 AND (value = $2 OR value = $3)',
             ['ip', clientIp, normalized]
         );
-        if (rows.length > 0) {
-            return { banned: true, reason: 'ip_banned', data: rows[0] };
+        const activeBan = rows.find(row => !isNonEnforcingBanReason(row.reason));
+        if (activeBan) {
+            return { banned: true, reason: 'ip_banned', data: activeBan };
         }
     }
     return { banned: false };
+}
+
+async function handleBanCheck(body, clientIp) {
+    const ipBan = await checkBans('', clientIp);
+    if (ipBan.banned) {
+        return {
+            status: 200,
+            body: {
+                status: 'banned',
+                banned: true,
+                reason: ipBan.reason,
+                ban_reason: ipBan.data && ipBan.data.reason ? ipBan.data.reason : '',
+                ban_type: ipBan.data && ipBan.data.ban_type ? ipBan.data.ban_type : 'ip',
+            },
+        };
+    }
+
+    const hwids = normalizeBanCheckHwids(body);
+    for (const hwid of hwids) {
+        const hwidBan = await checkBans(hwid, '');
+        if (hwidBan.banned) {
+            return {
+                status: 200,
+                body: {
+                    status: 'banned',
+                    banned: true,
+                    reason: hwidBan.reason,
+                    ban_reason: hwidBan.data && hwidBan.data.reason ? hwidBan.data.reason : '',
+                    ban_type: hwidBan.data && hwidBan.data.ban_type ? hwidBan.data.ban_type : 'hwid',
+                },
+            };
+        }
+    }
+
+    return { status: 200, body: { status: 'ok', banned: false } };
 }
 
 async function revokeLicenseAndSession(licenseKey, reason, version, hwid) {
@@ -373,7 +465,7 @@ async function revokeLicenseAndSession(licenseKey, reason, version, hwid) {
     await pool.query('DELETE FROM sessions WHERE license_key = $1', [licenseKey]);
 }
 
-async function recordBan(hwid, clientIp, reason, version) {
+async function recordBan(hwid, clientIp, reason, version, context = {}) {
     const now = Math.floor(Date.now() / 1000);
     const isoNow = new Date().toISOString();
     const sanitized = reason || 'violation';
@@ -425,10 +517,22 @@ async function recordBan(hwid, clientIp, reason, version) {
 
     const fields = [
         { name: '\uD83D\uDEA8 Reason', value: sanitized },
+        { name: 'Route', value: context.route || 'license' },
+        { name: 'Action', value: context.action || 'enforce' },
+        { name: 'License', value: context.license_key ? `\`${context.license_key}\`` : 'unknown' },
         { name: '\uD83D\uDDA5\uFE0F HWID', value: `\`${hwid || 'unknown'}\`` },
         { name: '\uD83C\uDF10 IP', value: `\`${clientIp || 'unknown'}\`` },
         { name: '\uD83D\uDCE6 Version', value: version || 'unknown' },
     ];
+    if (context.session_token) {
+        fields.push({ name: 'Session', value: `\`${String(context.session_token).slice(0, 16)}...\`` });
+    }
+    if (Array.isArray(context.reasons) && context.reasons.length > 0) {
+        fields.push({ name: 'Signals', value: context.reasons.join(', ') });
+    }
+    if (context.evidence) {
+        fields.push({ name: 'Evidence', value: typeof context.evidence === 'string' ? context.evidence : JSON.stringify(context.evidence) });
+    }
     if (deletedKeys.length > 0) {
         fields.push({
             name: '\uD83D\uDDD1\uFE0F Deleted Keys',
@@ -534,7 +638,7 @@ async function handleValidate(body, clientIp) {
 
 
 async function handleHeartbeat(body, clientIp) {
-    const { license_key, session_token, hwid, proof_token, heartbeat_count, code_hash } = body;
+    const { license_key, session_token, hwid, code_hash } = body;
 
     if (!license_key || !session_token) {
         return { status: 400, body: { status: 'error', reason: 'missing_fields' } };
@@ -597,54 +701,47 @@ async function handleHeartbeat(body, clientIp) {
             if (typeof nm === 'string' && nm === session.honeypot_export) {
                 await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
                 await revokeLicenseAndSession(license_key, 'honeypot_export_called', body.plugin_version, hwid || session.hwid);
-                await recordBan(hwid || session.hwid, clientIp, 'honeypot_export_called', body.plugin_version);
+                await recordBan(hwid || session.hwid, clientIp, 'honeypot_export_called', body.plugin_version, {
+                    route: 'license',
+                    action: 'heartbeat',
+                    license_key,
+                    session_token,
+                    reasons: ['honeypot_export_called'],
+                    evidence: { honeypot_export: session.honeypot_export },
+                });
                 return { status: 200, body: { status: 'killed', alive: false, reason: 'honeypot' } };
             }
         }
     }
 
-    let anomalyDelta = 0;
-    const anomalyReasons = [];
-
-    if (typeof proof_token === 'string' && proof_token.length > 0) {
-        if (session.last_proof_token && proof_token === session.last_proof_token) {
-            anomalyDelta += 30;
-            anomalyReasons.push('replayed_proof_token');
-        }
-    } else {
-        anomalyDelta += 15;
-        anomalyReasons.push('missing_proof_token');
-    }
-
-    if (typeof heartbeat_count === 'number' && heartbeat_count >= 0) {
-        const expectedCount = (session.heartbeat_count || 0) + 1;
-        if (heartbeat_count < expectedCount) {
-            anomalyDelta += 25;
-            anomalyReasons.push('heartbeat_count_regression');
-        } else if (heartbeat_count > expectedCount + 5) {
-            anomalyDelta += 10;
-            anomalyReasons.push('heartbeat_count_skip');
-        }
-    }
+    const continuity = evaluateHeartbeatContinuity(session, body);
+    const violationReasons = [];
+    const violationEvidence = {};
 
     if (typeof code_hash === 'string' && code_hash.length > 0) {
         if (session.last_code_hash && session.last_code_hash !== '' && code_hash !== session.last_code_hash) {
-            anomalyDelta += 50;
-            anomalyReasons.push('code_hash_mismatch');
+            violationReasons.push('code_hash_mismatch');
+            violationEvidence.previous_code_hash = session.last_code_hash;
+            violationEvidence.current_code_hash = code_hash;
         }
     }
 
 
     const prevGateBitmap = Number(session.last_gate_bitmap || 0);
-    const curGateBitmap  = Number(body.gate_bitmap || 0) | 0;
-    if (curGateBitmap >= 0 && curGateBitmap < (1 << 24)) {
+    const rawGateBitmap = Number(body.gate_bitmap || 0);
+    let curGateBitmap = Number.isFinite(rawGateBitmap) ? (rawGateBitmap | 0) : 0;
+    let gateBitmapToStore = prevGateBitmap;
+    if (Number.isFinite(rawGateBitmap) && curGateBitmap >= 0 && curGateBitmap < (1 << 24)) {
         if (prevGateBitmap !== 0 && (curGateBitmap & prevGateBitmap) !== prevGateBitmap) {
-            anomalyDelta += 35;
-            anomalyReasons.push('gate_bitmap_regression');
+            violationReasons.push('gate_bitmap_regression');
+            violationEvidence.previous_gate_bitmap = prevGateBitmap;
+            violationEvidence.current_gate_bitmap = curGateBitmap;
         }
+        gateBitmapToStore = Math.max(prevGateBitmap, curGateBitmap & ((1 << 24) - 1));
     } else if (body.gate_bitmap !== undefined) {
-        anomalyDelta += 10;
-        anomalyReasons.push('gate_bitmap_invalid');
+        violationReasons.push('gate_bitmap_invalid');
+        violationEvidence.raw_gate_bitmap = body.gate_bitmap;
+        curGateBitmap = 0;
     }
 
     const ipHistory = session.ip_history || [];
@@ -653,81 +750,31 @@ async function handleHeartbeat(body, clientIp) {
         const lastIp = ipHistory.length > 0 ? ipHistory[ipHistory.length - 1] : '';
         if (lastIp !== clientIp) {
             newIpHistory = [...ipHistory, clientIp].slice(-16);
-            const uniqueIps = new Set(newIpHistory);
-            if (uniqueIps.size > 5) {
-                anomalyDelta += 20;
-                anomalyReasons.push('excessive_ip_changes');
-            } else if (uniqueIps.size > 2) {
-                anomalyDelta += 5;
-            }
         }
     }
 
     const hbTimes = session.heartbeat_times || [];
     const newHbTimes = [...hbTimes, now].slice(-20);
-    if (newHbTimes.length >= 3) {
-        const intervals = [];
-        for (let i = 1; i < newHbTimes.length; i++) {
-            intervals.push(newHbTimes[i] - newHbTimes[i - 1]);
-        }
-        const avg = intervals.reduce((a, b) => a + b, 0) / intervals.length;
-        const variance = intervals.reduce((a, b) => a + (b - avg) ** 2, 0) / intervals.length;
-        if (variance < 0.5 && intervals.length >= 5) {
-            anomalyDelta += 15;
-            anomalyReasons.push('bot_like_regularity');
-        }
-        const minInterval = Math.min(...intervals);
-        if (minInterval < 5) {
-            anomalyDelta += 20;
-            anomalyReasons.push('heartbeat_flood');
-        }
-    }
 
-    const stepUpOk = !session.step_up_pending
-        || (typeof body.step_up_response === 'string' && body.step_up_response.length >= 32);
-    if (session.step_up_pending && !stepUpOk) {
-        anomalyDelta += 10;
-        anomalyReasons.push('step_up_missing');
-    }
-
-    const priorScore = Number(session.anomaly_score || 0);
-    let nextScore = priorScore + anomalyDelta;
-    if (anomalyDelta === 0) {
-        nextScore = Math.max(0, priorScore - 2);
-    }
-    nextScore = Math.max(0, Math.min(100, nextScore));
-
-    let stepUpPending = session.step_up_pending || false;
-    let stepUpNonce = '';
-    let degradationFactor = 0.0;
-    let tierLabel = 'clean';
-    if (nextScore >= 100) tierLabel = 'nuclear';
-    else if (nextScore >= 80) {
-        tierLabel = 'degrade';
-        degradationFactor = Math.min(1.0, (nextScore - 80) / 20.0);
-    } else if (nextScore >= 60) {
-        tierLabel = 'stepup';
-        if (!stepUpPending) {
-            stepUpPending = true;
-            stepUpNonce = crypto.randomBytes(16).toString('hex');
-        }
-    } else if (nextScore >= 40) {
-        tierLabel = 'silent';
-    } else {
-        stepUpPending = false;
-    }
-
-    if (stepUpOk && session.step_up_pending && nextScore < 60) {
-        stepUpPending = false;
-    }
-
-    let crossSessionSum = Number(lookup.data.hwid_anomaly_sum || 0);
-    if (anomalyDelta > 0) {
-        crossSessionSum += anomalyDelta;
-        await pool.query(
-            'UPDATE licenses SET hwid_anomaly_sum = $1 WHERE key = $2',
-            [crossSessionSum, license_key]
-        );
+    if (violationReasons.length > 0) {
+        const violationReason = sanitizeReason(`heartbeat_${violationReasons.join('_')}`);
+        const effectiveHwid = hwid || session.hwid;
+        await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
+        await revokeLicenseAndSession(license_key, violationReason, body.plugin_version, effectiveHwid);
+        await recordBan(effectiveHwid, clientIp, violationReason, body.plugin_version, {
+            route: 'license',
+            action: 'heartbeat',
+            license_key,
+            session_token,
+            reasons: violationReasons,
+            evidence: {
+                ...violationEvidence,
+                continuity_reasons: continuity.continuity_reasons,
+                heartbeat_count: body.heartbeat_count,
+                server_heartbeat_count: session.heartbeat_count || 0,
+            },
+        });
+        return { status: 200, body: { status: 'killed', alive: false, reason: violationReason } };
     }
 
     await pool.query(`
@@ -736,45 +783,19 @@ async function handleHeartbeat(body, clientIp) {
             heartbeat_count   = heartbeat_count + 1,
             last_proof_token  = $2,
             last_code_hash    = $3,
-            anomaly_score     = $4,
-            ip_history        = $5,
-            heartbeat_times   = $6,
-            step_up_pending   = $7,
-            last_gate_bitmap  = $9
-        WHERE license_key = $8
+            ip_history        = $4,
+            heartbeat_times   = $5,
+            last_gate_bitmap  = $7
+        WHERE license_key = $6
     `, [
         now,
-        (typeof proof_token === 'string' ? proof_token : ''),
+        continuity.proof_token_to_store,
         (typeof code_hash === 'string' ? code_hash : session.last_code_hash || ''),
-        nextScore,
         newIpHistory,
         newHbTimes,
-        stepUpPending,
         license_key,
-        Math.max(prevGateBitmap, curGateBitmap & ((1 << 24) - 1)),
+        gateBitmapToStore,
     ]);
-
-    if (nextScore >= 80 && anomalyDelta > 0) {
-        const fields = [
-            { name: 'License', value: `\`${license_key}\`` },
-            { name: 'HWID', value: `\`${hwid || session.hwid || 'unknown'}\`` },
-            { name: 'IP', value: `\`${clientIp}\`` },
-            { name: 'Score', value: `${nextScore}/100` },
-            { name: 'Tier', value: tierLabel },
-            { name: 'CrossSession', value: `${crossSessionSum}` },
-            { name: 'Flags', value: anomalyReasons.join(', ') || 'accumulated' },
-        ];
-        await sendDiscordWebhook('\u26A0\uFE0F Anomaly Threshold Reached', fields, 0xFFA500);
-        await sendTelegramAlert('\u26A0\uFE0F Anomaly Threshold Reached', fields);
-    }
-
-    if (nextScore >= 100 || crossSessionSum >= 300) {
-        await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
-        const killReason = crossSessionSum >= 300 ? 'cross_session_anomaly_ban' : 'anomaly_auto_kill';
-        await revokeLicenseAndSession(license_key, killReason, body.plugin_version, hwid || session.hwid);
-        await recordBan(hwid || session.hwid, clientIp, killReason, body.plugin_version);
-        return { status: 200, body: { status: 'killed', alive: false, reason: killReason } };
-    }
 
     const heartbeatNonce = body.heartbeat_nonce || '';
     const serverNonce = generateServerNonce();
@@ -790,12 +811,8 @@ async function handleHeartbeat(body, clientIp) {
         heartbeat_nonce: heartbeatNonce,
         server_nonce: serverNonce,
         page_epoch: pageEpoch,
-        anomaly_score: nextScore,
-        anomaly_tier: tierLabel,
-        degradation_factor: degradationFactor,
         ttl_grace_factor: SESSION_TTL_GRACE_FACTOR,
     };
-    if (stepUpPending && stepUpNonce) sigPayload.step_up_nonce = stepUpNonce;
     const rotationBlock = buildRotationBlock();
     Object.assign(sigPayload, rotationBlock);
     const { signature, next_signature } = dualSignPayload(sigPayload);
@@ -884,7 +901,14 @@ async function handleReportViolation(body, clientIp) {
     }
 
     await revokeLicenseAndSession(license_key, sanitizedReason, version, hwid);
-    await recordBan(hwid, clientIp, sanitizedReason, version);
+    await recordBan(hwid, clientIp, sanitizedReason, version, {
+        route: 'license',
+        action: 'report_violation',
+        license_key,
+        session_token,
+        reasons: [sanitizedReason],
+        evidence: { client_reason: sanitizedReason },
+    });
 
     return { status: 200, body: { status: 'ok' } };
 }
@@ -963,28 +987,28 @@ async function handleDriverProof(body, clientIp) {
 
     const proofNum = BigInt(`0x${driver_proof}`);
     if (proofNum === 0n) {
-
-        const newScore = Math.min(100, (session.anomaly_score || 0) + 40);
-        await pool.query(
-            'UPDATE sessions SET anomaly_score = $1 WHERE license_key = $2',
-            [newScore, license_key]
-        );
-        if (newScore >= 100) {
-            await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
-            await revokeLicenseAndSession(license_key, 'zero_driver_proof', body.plugin_version, hwid);
-            await recordBan(hwid, clientIp, 'zero_driver_proof', body.plugin_version);
-            return { status: 200, body: { status: 'killed', alive: false } };
-        }
-        return { status: 200, body: { status: 'warning', anomaly_score: newScore } };
+        await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
+        await revokeLicenseAndSession(license_key, 'zero_driver_proof', body.plugin_version, hwid || session.hwid);
+        await recordBan(hwid || session.hwid, clientIp, 'zero_driver_proof', body.plugin_version, {
+            route: 'license',
+            action: 'driver_proof',
+            license_key,
+            session_token,
+            reasons: ['zero_driver_proof'],
+            evidence: { driver_proof: String(driver_proof).slice(0, 64), proof_version: body.proof_version || 0 },
+        });
+        return { status: 200, body: { status: 'killed', alive: false, reason: 'zero_driver_proof' } };
     }
 
 
     if (typeof tsc_drift === 'number' && tsc_drift > 1000000) {
-        const newScore = Math.min(100, (session.anomaly_score || 0) + 25);
-        await pool.query(
-            'UPDATE sessions SET anomaly_score = $1 WHERE license_key = $2',
-            [newScore, license_key]
-        );
+        await sendDiscordWebhook('Driver Proof Timing Drift', [
+            { name: 'License', value: `\`${license_key}\`` },
+            { name: 'HWID', value: `\`${hwid || session.hwid || 'unknown'}\`` },
+            { name: 'IP', value: `\`${clientIp}\`` },
+            { name: 'Action', value: 'driver_proof' },
+            { name: 'Drift', value: String(tsc_drift) },
+        ], 0xFFA500);
     }
 
 
@@ -1010,15 +1034,25 @@ async function handleDriverProof(body, clientIp) {
         const aBuf = Buffer.from(expected, 'utf8');
         const bBuf = Buffer.from(String(driver_proof), 'utf8');
         if (aBuf.length !== bBuf.length || !crypto.timingSafeEqual(aBuf, bBuf)) {
-            const newScore = Math.min(100, (session.anomaly_score || 0) + 50);
-            await pool.query('UPDATE sessions SET anomaly_score = $1 WHERE license_key = $2', [newScore, license_key]);
-            if (newScore >= 100) {
-                await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
-                await revokeLicenseAndSession(license_key, 'proof_v3_mismatch', body.plugin_version, hwid);
-                await recordBan(hwid, clientIp, 'proof_v3_mismatch', body.plugin_version);
-                return { status: 200, body: { status: 'killed', alive: false } };
-            }
-            return { status: 200, body: { status: 'invalid', reason: 'proof_v3_mismatch', anomaly_score: newScore } };
+            await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
+            await revokeLicenseAndSession(license_key, 'proof_v3_mismatch', body.plugin_version, hwid || session.hwid);
+            await recordBan(hwid || session.hwid, clientIp, 'proof_v3_mismatch', body.plugin_version, {
+                route: 'license',
+                action: 'driver_proof',
+                license_key,
+                session_token,
+                reasons: ['proof_v3_mismatch'],
+                evidence: {
+                    proof_version: 3,
+                    token_hash: token_hash || '',
+                    server_nonce: server_nonce || session.server_nonce || '',
+                    tsc: tsc || 0,
+                    cr3: cr3 || 0,
+                    boot_nonce: boot_nonce || '',
+                    hardware_id: hardware_id || '',
+                },
+            });
+            return { status: 200, body: { status: 'killed', alive: false, reason: 'proof_v3_mismatch' } };
         }
     }
 
@@ -1049,6 +1083,9 @@ router.post('/', async (req, res) => {
         let result;
 
         switch (action) {
+            case 'ban_check':
+                result = await withPgRetry(() => handleBanCheck(body, clientIp));
+                break;
             case 'validate':
                 result = await withPgRetry(() => handleValidate(body, clientIp));
                 break;
@@ -1153,5 +1190,11 @@ router.post('/create', async (req, res) => {
 
     return res.status(200).json({ status: 'ok', key, plan, expires: expires || null });
 });
+
+router._internal = {
+    evaluateHeartbeatContinuity,
+    isNonEnforcingBanReason,
+    normalizeBanCheckHwids,
+};
 
 module.exports = router;

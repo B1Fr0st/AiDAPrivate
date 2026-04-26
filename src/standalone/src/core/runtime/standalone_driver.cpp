@@ -1404,7 +1404,6 @@ namespace driver_bridge
         }
 
         auto raw = device->enumerate_connections(filter_pid, filter_protocol);
-        logf("enumerate_connections: got %zu raw entries (filter_pid=%u proto=%u)\n", raw.size(), filter_pid, filter_protocol);
         result.reserve(raw.size());
         for (const auto& src : raw) {
             net_connection_info_t c;

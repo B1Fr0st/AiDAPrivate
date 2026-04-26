@@ -29,6 +29,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windns.h>
+#include <winhttp.h>
 
 #include <atomic>
 #include <algorithm>
@@ -36,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -305,7 +307,132 @@ struct resolved_addr_t {
     int sa_len = 0;
 };
 
+static std::wstring license_utf8_to_utf16(const std::string& text)
+{
+    if (text.empty()) return std::wstring();
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+                                    nullptr, 0);
+    if (wlen <= 0) return std::wstring();
+    std::wstring out;
+    out.resize(static_cast<size_t>(wlen));
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+                        out.data(), wlen);
+    return out;
+}
+
+static void append_addrinfoex_results(PADDRINFOEXW gai_res,
+                                      std::vector<resolved_addr_t>& results)
+{
+    for (ADDRINFOEXW* entry = gai_res; entry; entry = entry->ai_next) {
+        if (entry->ai_family != AF_INET && entry->ai_family != AF_INET6) continue;
+        if (!entry->ai_addr || entry->ai_addrlen == 0 ||
+            entry->ai_addrlen > sizeof(sockaddr_storage)) continue;
+        resolved_addr_t resolved;
+        resolved.family = entry->ai_family;
+        resolved.sa_len = static_cast<int>(entry->ai_addrlen);
+        memcpy(&resolved.sa, entry->ai_addr, entry->ai_addrlen);
+        results.push_back(resolved);
+    }
+}
+
+static void append_dns_records(PDNS_RECORD records, WORD query_type, int port,
+                               std::vector<resolved_addr_t>& results)
+{
+    const u_short port_be = htons(static_cast<u_short>(port));
+    for (PDNS_RECORD record = records; record; record = record->pNext) {
+        if (query_type == DNS_TYPE_A && record->wType == DNS_TYPE_A) {
+            resolved_addr_t resolved;
+            resolved.family = AF_INET;
+            resolved.sa_len = static_cast<int>(sizeof(sockaddr_in));
+            auto* sin = reinterpret_cast<sockaddr_in*>(&resolved.sa);
+            sin->sin_family = AF_INET;
+            sin->sin_port = port_be;
+            sin->sin_addr.S_un.S_addr = record->Data.A.IpAddress;
+            results.push_back(resolved);
+        } else if (query_type == DNS_TYPE_AAAA && record->wType == DNS_TYPE_AAAA) {
+            resolved_addr_t resolved;
+            resolved.family = AF_INET6;
+            resolved.sa_len = static_cast<int>(sizeof(sockaddr_in6));
+            auto* sin6 = reinterpret_cast<sockaddr_in6*>(&resolved.sa);
+            sin6->sin6_family = AF_INET6;
+            sin6->sin6_port = port_be;
+            memcpy(&sin6->sin6_addr, &record->Data.AAAA.Ip6Address, sizeof(IN6_ADDR));
+            results.push_back(resolved);
+        }
+    }
+}
+
+struct dns_query_state_t {
+    HANDLE event_handle = nullptr;
+    DNS_QUERY_RESULT result = {};
+    DNS_QUERY_CANCEL cancel = {};
+};
+
+static void WINAPI dns_query_completion(void* context, PDNS_QUERY_RESULT)
+{
+    auto* state = static_cast<dns_query_state_t*>(context);
+    if (state && state->event_handle) SetEvent(state->event_handle);
+}
+
+static DNS_STATUS query_dns_records_bounded(const std::wstring& host_w, WORD query_type,
+                                            int timeout_ms, PDNS_RECORD* records_out,
+                                            bool& timed_out)
+{
+    *records_out = nullptr;
+    timed_out = false;
+
+    auto state = std::make_unique<dns_query_state_t>();
+    state->event_handle = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!state->event_handle) return static_cast<DNS_STATUS>(GetLastError());
+
+    state->result.Version = DNS_QUERY_RESULTS_VERSION1;
+
+    DNS_QUERY_REQUEST request = {};
+    request.Version = DNS_QUERY_REQUEST_VERSION1;
+    request.QueryName = host_w.c_str();
+    request.QueryType = query_type;
+    request.QueryOptions = DNS_QUERY_BYPASS_CACHE | DNS_QUERY_NO_HOSTS_FILE |
+                           DNS_QUERY_NO_NETBT | DNS_QUERY_NO_MULTICAST;
+    request.pQueryCompletionCallback = dns_query_completion;
+    request.pQueryContext = state.get();
+
+    DNS_STATUS status = DnsQueryEx(&request, &state->result, &state->cancel);
+    if (status == DNS_REQUEST_PENDING) {
+        DWORD wait_ms = timeout_ms > 0 ? static_cast<DWORD>(timeout_ms) : 1u;
+        DWORD wait_rc = WaitForSingleObject(state->event_handle, wait_ms);
+        if (wait_rc == WAIT_TIMEOUT) {
+            timed_out = true;
+            DnsCancelQuery(&state->cancel);
+            DWORD cancel_wait = WaitForSingleObject(state->event_handle, 1000);
+            if (cancel_wait != WAIT_OBJECT_0) {
+                state.release();
+                return ERROR_TIMEOUT;
+            }
+        } else if (wait_rc != WAIT_OBJECT_0) {
+            CloseHandle(state->event_handle);
+            return static_cast<DNS_STATUS>(GetLastError());
+        }
+        status = state->result.QueryStatus;
+    } else if (state->result.QueryStatus != 0) {
+        status = state->result.QueryStatus;
+    }
+
+    if (status == 0 && state->result.pQueryRecords) {
+        *records_out = state->result.pQueryRecords;
+        state->result.pQueryRecords = nullptr;
+    }
+
+    if (state->result.pQueryRecords) {
+        DnsRecordListFree(state->result.pQueryRecords, DnsFreeRecordList);
+        state->result.pQueryRecords = nullptr;
+    }
+
+    CloseHandle(state->event_handle);
+    return status;
+}
+
 static std::vector<resolved_addr_t> resolve_host_addrs(const std::string& host, int port,
+                                                        int timeout_ms,
                                                         std::string& diag_out)
 {
     std::vector<resolved_addr_t> results;
@@ -313,78 +440,72 @@ static std::vector<resolved_addr_t> resolve_host_addrs(const std::string& host, 
     _snprintf_s(port_str, sizeof(port_str), _TRUNCATE, "%d", port);
     char gai_buf[160] = {};
 
+    const int total_budget_ms = std::max(500, timeout_ms);
+    const auto started_at = std::chrono::steady_clock::now();
+    const auto deadline = started_at + std::chrono::milliseconds(total_budget_ms);
+    auto remaining_ms = [&]() -> int {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return 0;
+        return static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+    };
+
+    std::wstring host_w = license_utf8_to_utf16(host);
+    std::wstring port_w = license_utf8_to_utf16(port_str);
+
     {
-        struct addrinfo hints = {}, *gai_res = nullptr;
+        ADDRINFOEXW hints = {};
         hints.ai_family   = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
         hints.ai_protocol = IPPROTO_TCP;
-        const int gai_rc = getaddrinfo(host.c_str(), port_str, &hints, &gai_res);
+        PADDRINFOEXW gai_res = nullptr;
+        const int gai_budget_ms = std::max(250, remaining_ms());
+        timeval gai_timeout = {};
+        gai_timeout.tv_sec = gai_budget_ms / 1000;
+        gai_timeout.tv_usec = (gai_budget_ms % 1000) * 1000;
+        const int gai_rc = GetAddrInfoExW(host_w.c_str(), port_w.c_str(), NS_DNS,
+                                          nullptr, &hints, &gai_res, &gai_timeout,
+                                          nullptr, nullptr, nullptr);
         if (gai_rc == 0 && gai_res) {
-            for (addrinfo* p = gai_res; p; p = p->ai_next) {
-                if (p->ai_family != AF_INET && p->ai_family != AF_INET6) continue;
-                if (p->ai_addrlen == 0 || p->ai_addrlen > sizeof(sockaddr_storage))
-                    continue;
-                resolved_addr_t r;
-                r.family = p->ai_family;
-                r.sa_len = static_cast<int>(p->ai_addrlen);
-                memcpy(&r.sa, p->ai_addr, p->ai_addrlen);
-                results.push_back(r);
-            }
-            freeaddrinfo(gai_res);
+            append_addrinfoex_results(gai_res, results);
+            FreeAddrInfoExW(gai_res);
         } else {
             _snprintf_s(gai_buf, sizeof(gai_buf), _TRUNCATE,
-                "getaddrinfo rc=%d wsa=%lu",
-                gai_rc, static_cast<unsigned long>(WSAGetLastError()));
+                "GetAddrInfoExW rc=%d wsa=%lu budget_ms=%d",
+                gai_rc, static_cast<unsigned long>(WSAGetLastError()), gai_budget_ms);
+            if (gai_res) FreeAddrInfoExW(gai_res);
         }
     }
 
     if (!results.empty()) return results;
 
     char dns_buf[160] = {};
-    const DWORD bypass_flags = DNS_QUERY_BYPASS_CACHE | DNS_QUERY_NO_HOSTS_FILE;
-    const u_short port_be = htons(static_cast<u_short>(port));
-
-    {
-        PDNS_RECORDA recA = nullptr;
-        DNS_STATUS sta = DnsQuery_A(host.c_str(), DNS_TYPE_A, bypass_flags, nullptr,
-            reinterpret_cast<PDNS_RECORD*>(&recA), nullptr);
-        if (sta == 0 && recA) {
-            for (PDNS_RECORDA p = recA; p; p = p->pNext) {
-                if (p->wType != DNS_TYPE_A) continue;
-                resolved_addr_t r;
-                r.family = AF_INET;
-                r.sa_len = static_cast<int>(sizeof(sockaddr_in));
-                auto* sin = reinterpret_cast<sockaddr_in*>(&r.sa);
-                sin->sin_family = AF_INET;
-                sin->sin_port   = port_be;
-                sin->sin_addr.S_un.S_addr = p->Data.A.IpAddress;
-                results.push_back(r);
-            }
-            DnsRecordListFree(reinterpret_cast<PDNS_RECORD>(recA), DnsFreeRecordList);
-        } else if (sta != 0 && dns_buf[0] == '\0') {
-            _snprintf_s(dns_buf, sizeof(dns_buf), _TRUNCATE, "DnsQuery_A status=%lu",
-                static_cast<unsigned long>(sta));
-        }
+    bool a_timeout = false;
+    PDNS_RECORD records_a = nullptr;
+    DNS_STATUS status_a = query_dns_records_bounded(host_w, DNS_TYPE_A,
+                                                    std::max(1, remaining_ms() / 2),
+                                                    &records_a, a_timeout);
+    if (status_a == 0 && records_a) {
+        append_dns_records(records_a, DNS_TYPE_A, port, results);
+        DnsRecordListFree(records_a, DnsFreeRecordList);
     }
 
-    {
-        PDNS_RECORDA rec6 = nullptr;
-        DNS_STATUS st6 = DnsQuery_A(host.c_str(), DNS_TYPE_AAAA, bypass_flags, nullptr,
-            reinterpret_cast<PDNS_RECORD*>(&rec6), nullptr);
-        if (st6 == 0 && rec6) {
-            for (PDNS_RECORDA p = rec6; p; p = p->pNext) {
-                if (p->wType != DNS_TYPE_AAAA) continue;
-                resolved_addr_t r;
-                r.family = AF_INET6;
-                r.sa_len = static_cast<int>(sizeof(sockaddr_in6));
-                auto* sin6 = reinterpret_cast<sockaddr_in6*>(&r.sa);
-                sin6->sin6_family = AF_INET6;
-                sin6->sin6_port   = port_be;
-                memcpy(&sin6->sin6_addr, &p->Data.AAAA.Ip6Address, sizeof(IN6_ADDR));
-                results.push_back(r);
-            }
-            DnsRecordListFree(reinterpret_cast<PDNS_RECORD>(rec6), DnsFreeRecordList);
-        }
+    bool aaaa_timeout = false;
+    PDNS_RECORD records_aaaa = nullptr;
+    DNS_STATUS status_aaaa = query_dns_records_bounded(host_w, DNS_TYPE_AAAA,
+                                                       std::max(1, remaining_ms()),
+                                                       &records_aaaa, aaaa_timeout);
+    if (status_aaaa == 0 && records_aaaa) {
+        append_dns_records(records_aaaa, DNS_TYPE_AAAA, port, results);
+        DnsRecordListFree(records_aaaa, DnsFreeRecordList);
+    }
+
+    if (results.empty()) {
+        _snprintf_s(dns_buf, sizeof(dns_buf), _TRUNCATE,
+            "DnsQueryEx A=%lu%s AAAA=%lu%s remaining_ms=%d",
+            static_cast<unsigned long>(status_a), a_timeout ? ":timeout" : "",
+            static_cast<unsigned long>(status_aaaa), aaaa_timeout ? ":timeout" : "",
+            remaining_ms());
     }
 
     if (results.empty()) {
@@ -397,13 +518,13 @@ static std::vector<resolved_addr_t> resolve_host_addrs(const std::string& host, 
     return results;
 }
 
-static SimpleHttpResponse raw_https_request(
+static SimpleHttpResponse raw_https_request_socket(
     const char* verb,
     const std::string& url,
-    const std::vector<std::pair<std::string,std::string>>& extra_headers = {},
-    const std::string& req_body = {},
-    const std::string& content_type = {},
-    int timeout_sec = 15)
+    const std::vector<std::pair<std::string,std::string>>& extra_headers,
+    const std::string& req_body,
+    const std::string& content_type,
+    int timeout_sec)
 {
     SimpleHttpResponse out;
 
@@ -437,7 +558,24 @@ static SimpleHttpResponse raw_https_request(
 
 
     std::string resolve_diag;
-    auto candidate_addrs = resolve_host_addrs(host, port, resolve_diag);
+    std::vector<resolved_addr_t> candidate_addrs;
+    {
+        char dbuf[160];
+        _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
+            "raw_resolve_begin host=%.96s port=%d", host.c_str(), port);
+        lic_log(dbuf);
+    }
+    {
+        const int resolve_budget_ms = std::max(2000, timeout_sec * 1000 / 2);
+        candidate_addrs = resolve_host_addrs(host, port, resolve_budget_ms, resolve_diag);
+    }
+    {
+        char dbuf[256];
+        _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
+            "raw_resolve_done host=%.96s port=%d count=%zu diag=%.120s",
+            host.c_str(), port, candidate_addrs.size(), resolve_diag.c_str());
+        lic_log(dbuf);
+    }
     if (candidate_addrs.empty()) {
         out.error = "DNS resolution failed for " + host + " (" + resolve_diag + ")";
         return out;
@@ -467,10 +605,32 @@ static SimpleHttpResponse raw_https_request(
         return WSAPoll(&pfd, 1, wait_ms);
     };
 
+    auto fmt_addr = [](const resolved_addr_t& addr) -> std::string {
+        char ip[64] = {};
+        if (addr.family == AF_INET) {
+            const auto* sin = reinterpret_cast<const sockaddr_in*>(&addr.sa);
+            inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
+        } else if (addr.family == AF_INET6) {
+            const auto* sin6 = reinterpret_cast<const sockaddr_in6*>(&addr.sa);
+            inet_ntop(AF_INET6, &sin6->sin6_addr, ip, sizeof(ip));
+        }
+        return std::string(ip);
+    };
+
+    int attempt_index = 0;
     for (auto& addr : candidate_addrs) {
+        ++attempt_index;
+        const std::string addr_str = fmt_addr(addr);
+        const char family_label = (addr.family == AF_INET) ? '4' : '6';
+
         if (remaining_ms() <= 0) {
             if (!connect_errors.empty()) connect_errors += "; ";
             connect_errors += "deadline_reached_before_connect";
+            char dbuf[256];
+            _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
+                "raw_connect_attempt host=%.96s ip=%.46s v%c idx=%d host_port=%d skip=deadline_reached",
+                host.c_str(), addr_str.c_str(), family_label, attempt_index, port);
+            lic_log(dbuf);
             break;
         }
 
@@ -479,6 +639,11 @@ static SimpleHttpResponse raw_https_request(
             int wsa = WSAGetLastError();
             if (!connect_errors.empty()) connect_errors += "; ";
             connect_errors += "socket() wsa=" + std::to_string(wsa);
+            char dbuf[256];
+            _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
+                "raw_connect_attempt host=%.96s ip=%.46s v%c idx=%d port=%d socket_fail wsa=%d",
+                host.c_str(), addr_str.c_str(), family_label, attempt_index, port, wsa);
+            lic_log(dbuf);
             continue;
         }
 
@@ -491,6 +656,28 @@ static SimpleHttpResponse raw_https_request(
             if (wsa != WSAEWOULDBLOCK) {
                 if (!connect_errors.empty()) connect_errors += "; ";
                 connect_errors += "connect() wsa=" + std::to_string(wsa);
+                sockaddr_storage local_sa = {};
+                int local_len = static_cast<int>(sizeof(local_sa));
+                char local_ip[64] = {};
+                int local_port = 0;
+                if (getsockname(sock, reinterpret_cast<sockaddr*>(&local_sa), &local_len) == 0) {
+                    if (local_sa.ss_family == AF_INET) {
+                        const auto* l4 = reinterpret_cast<const sockaddr_in*>(&local_sa);
+                        inet_ntop(AF_INET, &l4->sin_addr, local_ip, sizeof(local_ip));
+                        local_port = ntohs(l4->sin_port);
+                    } else if (local_sa.ss_family == AF_INET6) {
+                        const auto* l6 = reinterpret_cast<const sockaddr_in6*>(&local_sa);
+                        inet_ntop(AF_INET6, &l6->sin6_addr, local_ip, sizeof(local_ip));
+                        local_port = ntohs(l6->sin6_port);
+                    }
+                }
+                char dbuf[384];
+                _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
+                    "raw_connect_attempt host=%.96s ip=%.46s v%c idx=%d port=%d sock=0x%llX local=%.46s:%d connect_immediate_fail wsa=%d",
+                    host.c_str(), addr_str.c_str(), family_label, attempt_index, port,
+                    static_cast<unsigned long long>(sock),
+                    local_ip, local_port, wsa);
+                lic_log(dbuf);
                 closesocket(sock);
                 sock = INVALID_SOCKET;
                 continue;
@@ -499,6 +686,11 @@ static SimpleHttpResponse raw_https_request(
             if (p == 0) {
                 if (!connect_errors.empty()) connect_errors += "; ";
                 connect_errors += "connect_timeout";
+                char dbuf[256];
+                _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
+                    "raw_connect_attempt host=%.96s ip=%.46s v%c idx=%d port=%d connect_poll_timeout remaining_ms=%d",
+                    host.c_str(), addr_str.c_str(), family_label, attempt_index, port, remaining_ms());
+                lic_log(dbuf);
                 closesocket(sock);
                 sock = INVALID_SOCKET;
                 continue;
@@ -507,6 +699,11 @@ static SimpleHttpResponse raw_https_request(
                 int err = WSAGetLastError();
                 if (!connect_errors.empty()) connect_errors += "; ";
                 connect_errors += "wsapoll wsa=" + std::to_string(err);
+                char dbuf[256];
+                _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
+                    "raw_connect_attempt host=%.96s ip=%.46s v%c idx=%d port=%d wsapoll_fail wsa=%d",
+                    host.c_str(), addr_str.c_str(), family_label, attempt_index, port, err);
+                lic_log(dbuf);
                 closesocket(sock);
                 sock = INVALID_SOCKET;
                 continue;
@@ -517,10 +714,22 @@ static SimpleHttpResponse raw_https_request(
             if (so_err != 0) {
                 if (!connect_errors.empty()) connect_errors += "; ";
                 connect_errors += "connect_so_err=" + std::to_string(so_err);
+                char dbuf[256];
+                _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
+                    "raw_connect_attempt host=%.96s ip=%.46s v%c idx=%d port=%d connect_so_error so_err=%d",
+                    host.c_str(), addr_str.c_str(), family_label, attempt_index, port, so_err);
+                lic_log(dbuf);
                 closesocket(sock);
                 sock = INVALID_SOCKET;
                 continue;
             }
+        }
+        {
+            char dbuf[256];
+            _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
+                "raw_connect_attempt host=%.96s ip=%.46s v%c idx=%d port=%d connect_ok",
+                host.c_str(), addr_str.c_str(), family_label, attempt_index, port);
+            lic_log(dbuf);
         }
         break;
     }
@@ -713,6 +922,672 @@ static SimpleHttpResponse raw_https_request(
     return out;
 }
 
+static SimpleHttpResponse winhttp_https_request_impl(
+    const char* verb,
+    const std::string& url,
+    const std::vector<std::pair<std::string,std::string>>& extra_headers,
+    const std::string& req_body,
+    const std::string& content_type,
+    int timeout_sec)
+{
+    SimpleHttpResponse out;
+
+    lic_log("winhttp_impl_enter");
+
+    HMODULE wh_mod = LoadLibraryW(L"winhttp.dll");
+    if (!wh_mod) {
+        out.error = "winhttp_load_failed gle=" + std::to_string(GetLastError());
+        lic_log(out.error.c_str());
+        return out;
+    }
+    lic_log("winhttp_dll_loaded");
+
+    using fn_open_t           = HINTERNET (WINAPI*)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
+    using fn_connect_t        = HINTERNET (WINAPI*)(HINTERNET, LPCWSTR, INTERNET_PORT, DWORD);
+    using fn_open_request_t   = HINTERNET (WINAPI*)(HINTERNET, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR*, DWORD);
+    using fn_send_request_t   = BOOL (WINAPI*)(HINTERNET, LPCWSTR, DWORD, LPVOID, DWORD, DWORD, DWORD_PTR);
+    using fn_recv_response_t  = BOOL (WINAPI*)(HINTERNET, LPVOID);
+    using fn_query_headers_t  = BOOL (WINAPI*)(HINTERNET, DWORD, LPCWSTR, LPVOID, LPDWORD, LPDWORD);
+    using fn_query_avail_t    = BOOL (WINAPI*)(HINTERNET, LPDWORD);
+    using fn_read_data_t      = BOOL (WINAPI*)(HINTERNET, LPVOID, DWORD, LPDWORD);
+    using fn_close_handle_t   = BOOL (WINAPI*)(HINTERNET);
+    using fn_set_timeouts_t   = BOOL (WINAPI*)(HINTERNET, int, int, int, int);
+    using fn_set_option_t     = BOOL (WINAPI*)(HINTERNET, DWORD, LPVOID, DWORD);
+
+    auto p_open           = reinterpret_cast<fn_open_t>          (GetProcAddress(wh_mod, "WinHttpOpen"));
+    auto p_connect        = reinterpret_cast<fn_connect_t>       (GetProcAddress(wh_mod, "WinHttpConnect"));
+    auto p_open_request   = reinterpret_cast<fn_open_request_t>  (GetProcAddress(wh_mod, "WinHttpOpenRequest"));
+    auto p_send_request   = reinterpret_cast<fn_send_request_t>  (GetProcAddress(wh_mod, "WinHttpSendRequest"));
+    auto p_recv_response  = reinterpret_cast<fn_recv_response_t> (GetProcAddress(wh_mod, "WinHttpReceiveResponse"));
+    auto p_query_headers  = reinterpret_cast<fn_query_headers_t> (GetProcAddress(wh_mod, "WinHttpQueryHeaders"));
+    auto p_query_avail    = reinterpret_cast<fn_query_avail_t>   (GetProcAddress(wh_mod, "WinHttpQueryDataAvailable"));
+    auto p_read_data      = reinterpret_cast<fn_read_data_t>     (GetProcAddress(wh_mod, "WinHttpReadData"));
+    auto p_close_handle   = reinterpret_cast<fn_close_handle_t>  (GetProcAddress(wh_mod, "WinHttpCloseHandle"));
+    auto p_set_timeouts   = reinterpret_cast<fn_set_timeouts_t>  (GetProcAddress(wh_mod, "WinHttpSetTimeouts"));
+    auto p_set_option     = reinterpret_cast<fn_set_option_t>    (GetProcAddress(wh_mod, "WinHttpSetOption"));
+
+    if (!p_open || !p_connect || !p_open_request || !p_send_request || !p_recv_response ||
+        !p_query_headers || !p_query_avail || !p_read_data || !p_close_handle ||
+        !p_set_timeouts) {
+        out.error = "winhttp_resolve_failed";
+        lic_log(out.error.c_str());
+        FreeLibrary(wh_mod);
+        return out;
+    }
+    lic_log("winhttp_funcs_resolved");
+
+    bool is_https = true;
+    std::string work = url;
+    if (work.rfind("https://", 0) == 0)      work = work.substr(8);
+    else if (work.rfind("http://", 0) == 0) { work = work.substr(7); is_https = false; }
+
+    std::string host_str, path = "/";
+    int port = is_https ? 443 : 80;
+
+    auto slash = work.find('/');
+    if (slash != std::string::npos) {
+        host_str = work.substr(0, slash);
+        path = work.substr(slash);
+    } else {
+        host_str = work;
+    }
+    auto colon = host_str.find(':');
+    if (colon != std::string::npos) {
+        port = atoi(host_str.c_str() + colon + 1);
+        host_str = host_str.substr(0, colon);
+    }
+
+    {
+        char dbuf[256];
+        _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
+            "winhttp_url_parsed host=%.96s port=%d https=%d path=%.96s",
+            host_str.c_str(), port, is_https ? 1 : 0, path.c_str());
+        lic_log(dbuf);
+    }
+
+    std::wstring agent  = L"AiDAStandalone/1.0";
+    std::wstring whost  = license_utf8_to_utf16(host_str);
+    std::wstring wpath  = license_utf8_to_utf16(path.empty() ? std::string("/") : path);
+    std::wstring wverb  = license_utf8_to_utf16(verb ? std::string(verb) : std::string("GET"));
+
+    lic_log("winhttp_calling_open");
+    HINTERNET h_session = p_open(agent.c_str(),
+                                  WINHTTP_ACCESS_TYPE_NO_PROXY,
+                                  WINHTTP_NO_PROXY_NAME,
+                                  WINHTTP_NO_PROXY_BYPASS,
+                                  0);
+    if (!h_session) {
+        out.error = "winhttp_open_failed gle=" + std::to_string(GetLastError());
+        lic_log(out.error.c_str());
+        FreeLibrary(wh_mod);
+        return out;
+    }
+    lic_log("winhttp_session_opened");
+
+    int tmo_ms = (timeout_sec > 0 ? timeout_sec : 15) * 1000;
+    p_set_timeouts(h_session, tmo_ms, tmo_ms, tmo_ms, tmo_ms);
+    lic_log("winhttp_session_timeouts_set");
+
+    if (p_set_option) {
+        DWORD proto_flags = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 |
+                            WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+        p_set_option(h_session, WINHTTP_OPTION_SECURE_PROTOCOLS,
+                     &proto_flags, sizeof(proto_flags));
+    }
+
+    lic_log("winhttp_calling_connect");
+    HINTERNET h_connect = p_connect(h_session, whost.c_str(),
+                                     static_cast<INTERNET_PORT>(port), 0);
+    if (!h_connect) {
+        out.error = "winhttp_connect_failed gle=" + std::to_string(GetLastError());
+        lic_log(out.error.c_str());
+        p_close_handle(h_session);
+        FreeLibrary(wh_mod);
+        return out;
+    }
+    lic_log("winhttp_connect_handle_ok");
+
+    DWORD req_flags = is_https ? WINHTTP_FLAG_SECURE : 0;
+    lic_log("winhttp_calling_open_request");
+    HINTERNET h_req = p_open_request(h_connect, wverb.c_str(), wpath.c_str(),
+                                      nullptr, WINHTTP_NO_REFERER,
+                                      WINHTTP_DEFAULT_ACCEPT_TYPES, req_flags);
+    if (!h_req) {
+        out.error = "winhttp_open_request_failed gle=" + std::to_string(GetLastError());
+        lic_log(out.error.c_str());
+        p_close_handle(h_connect);
+        p_close_handle(h_session);
+        FreeLibrary(wh_mod);
+        return out;
+    }
+    lic_log("winhttp_request_opened");
+
+    p_set_timeouts(h_req, tmo_ms, tmo_ms, tmo_ms, tmo_ms);
+    lic_log("winhttp_request_timeouts_set");
+
+    if (p_set_option) {
+        DWORD decompress = WINHTTP_DECOMPRESSION_FLAG_GZIP |
+                           WINHTTP_DECOMPRESSION_FLAG_DEFLATE;
+        p_set_option(h_req, WINHTTP_OPTION_DECOMPRESSION,
+                     &decompress, sizeof(decompress));
+    }
+
+    std::string hdr_str;
+    hdr_str.reserve(256 + extra_headers.size() * 64);
+    if (!content_type.empty()) {
+        hdr_str += "Content-Type: ";
+        hdr_str += content_type;
+        hdr_str += "\r\n";
+    }
+    for (const auto& kv : extra_headers) {
+        hdr_str += kv.first;
+        hdr_str += ": ";
+        hdr_str += kv.second;
+        hdr_str += "\r\n";
+    }
+    std::wstring whdr = license_utf8_to_utf16(hdr_str);
+
+    LPCWSTR hdr_ptr = whdr.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : whdr.c_str();
+    DWORD   hdr_len = whdr.empty() ? 0 : static_cast<DWORD>(whdr.size());
+
+    LPVOID  body_ptr = req_body.empty()
+                        ? WINHTTP_NO_REQUEST_DATA
+                        : const_cast<char*>(req_body.data());
+    DWORD   body_len = static_cast<DWORD>(req_body.size());
+
+    lic_log("winhttp_calling_send_request");
+    BOOL send_ok = p_send_request(h_req, hdr_ptr, hdr_len,
+                                   body_ptr, body_len, body_len, 0);
+    if (!send_ok) {
+        out.error = "winhttp_send_request_failed gle=" + std::to_string(GetLastError());
+        lic_log(out.error.c_str());
+        p_close_handle(h_req);
+        p_close_handle(h_connect);
+        p_close_handle(h_session);
+        FreeLibrary(wh_mod);
+        return out;
+    }
+    lic_log("winhttp_send_request_ok");
+
+    lic_log("winhttp_calling_recv_response");
+    if (!p_recv_response(h_req, nullptr)) {
+        out.error = "winhttp_recv_response_failed gle=" + std::to_string(GetLastError());
+        lic_log(out.error.c_str());
+        p_close_handle(h_req);
+        p_close_handle(h_connect);
+        p_close_handle(h_session);
+        FreeLibrary(wh_mod);
+        return out;
+    }
+    lic_log("winhttp_recv_response_ok");
+
+    DWORD status_code = 0;
+    DWORD scode_size  = sizeof(status_code);
+    p_query_headers(h_req,
+                    WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                    WINHTTP_HEADER_NAME_BY_INDEX,
+                    &status_code, &scode_size, WINHTTP_NO_HEADER_INDEX);
+    out.status = static_cast<int>(status_code);
+    {
+        char dbuf[96];
+        _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
+            "winhttp_status_code=%d", out.status);
+        lic_log(dbuf);
+    }
+
+    std::string body;
+    body.reserve(4096);
+    char chunk[4096];
+    for (;;) {
+        DWORD avail = 0;
+        if (!p_query_avail(h_req, &avail)) break;
+        if (avail == 0) break;
+        DWORD to_read = avail > sizeof(chunk) ? static_cast<DWORD>(sizeof(chunk)) : avail;
+        DWORD got = 0;
+        if (!p_read_data(h_req, chunk, to_read, &got)) break;
+        if (got == 0) break;
+        body.append(chunk, got);
+        if (body.size() > 4u * 1024u * 1024u) break;
+    }
+    out.body = std::move(body);
+    out.ok = true;
+    {
+        char dbuf[96];
+        _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
+            "winhttp_body_read body_len=%zu", out.body.size());
+        lic_log(dbuf);
+    }
+
+    p_close_handle(h_req);
+    p_close_handle(h_connect);
+    p_close_handle(h_session);
+    FreeLibrary(wh_mod);
+    lic_log("winhttp_impl_exit_ok");
+    return out;
+}
+
+static SimpleHttpResponse winhttp_https_request(
+    const char* verb,
+    const std::string& url,
+    const std::vector<std::pair<std::string,std::string>>& extra_headers,
+    const std::string& req_body,
+    const std::string& content_type,
+    int timeout_sec)
+{
+    static std::atomic<bool> s_winhttp_disabled{false};
+    SimpleHttpResponse out;
+
+    if (s_winhttp_disabled.load(std::memory_order_acquire)) {
+        out.error = "winhttp skipped after prior bounded timeout";
+        lic_log("winhttp_outer_skipped_disabled");
+        return out;
+    }
+
+    const int budget_sec = timeout_sec > 0 ? timeout_sec : 15;
+    const int budget_ms_total = std::max(1000, budget_sec * 1000 + 500);
+
+    auto out_shared = std::make_shared<SimpleHttpResponse>();
+    auto done_flag = std::make_shared<std::atomic<bool>>(false);
+    const std::string verb_copy = verb ? verb : "GET";
+    const std::string url_copy = url;
+    const std::string body_copy = req_body;
+    const std::string ct_copy = content_type;
+    const auto hdr_copy = extra_headers;
+    const int tmo_copy = budget_sec;
+
+    try {
+        std::thread([out_shared, done_flag, verb_copy, url_copy, hdr_copy,
+                      body_copy, ct_copy, tmo_copy]() {
+            lic_log("winhttp_outer_thread_begin");
+            *out_shared = winhttp_https_request_impl(verb_copy.c_str(), url_copy,
+                                                     hdr_copy, body_copy, ct_copy,
+                                                     tmo_copy);
+            lic_log("winhttp_outer_thread_done");
+            done_flag->store(true, std::memory_order_release);
+        }).detach();
+    } catch (...) {
+        s_winhttp_disabled.store(true, std::memory_order_release);
+        out.error = "winhttp worker spawn failed";
+        lic_log("winhttp_outer_thread_spawn_failed");
+        return out;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now()
+                        + std::chrono::milliseconds(budget_ms_total);
+    while (!done_flag->load(std::memory_order_acquire)) {
+        if (std::chrono::steady_clock::now() >= deadline) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (!done_flag->load(std::memory_order_acquire)) {
+        s_winhttp_disabled.store(true, std::memory_order_release);
+        char dbuf[192];
+        _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
+            "winhttp_outer_total_timeout budget_ms=%d url=%.120s",
+            budget_ms_total, url_copy.c_str());
+        lic_log(dbuf);
+        out.error = "winhttp_total_timeout";
+        return out;
+    }
+    return *out_shared;
+}
+
+static SimpleHttpResponse curl_subprocess_https_request(
+    const char* verb,
+    const std::string& url,
+    const std::vector<std::pair<std::string,std::string>>& extra_headers,
+    const std::string& req_body,
+    const std::string& content_type,
+    int timeout_sec)
+{
+    SimpleHttpResponse out;
+    lic_log("curl_subprocess_enter");
+
+    char system_dir[MAX_PATH] = {};
+    UINT n = GetSystemDirectoryA(system_dir, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) {
+        out.error = "curl_subprocess_no_system_dir";
+        lic_log(out.error.c_str());
+        return out;
+    }
+    std::string curl_exe = std::string(system_dir) + "\\curl.exe";
+    DWORD attrs = GetFileAttributesA(curl_exe.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        out.error = "curl_subprocess_no_curl_exe";
+        lic_log(out.error.c_str());
+        return out;
+    }
+
+    char temp_dir[MAX_PATH] = {};
+    GetTempPathA(MAX_PATH, temp_dir);
+    char body_path[MAX_PATH] = {};
+    char hdrs_path[MAX_PATH] = {};
+    GetTempFileNameA(temp_dir, "aida", 0, body_path);
+    GetTempFileNameA(temp_dir, "aidh", 0, hdrs_path);
+
+    std::string body_in_path;
+    bool has_body_file = false;
+    if (!req_body.empty()) {
+        char body_in_tmp[MAX_PATH] = {};
+        GetTempFileNameA(temp_dir, "aidb", 0, body_in_tmp);
+        body_in_path = body_in_tmp;
+        HANDLE bf = CreateFileA(body_in_path.c_str(), GENERIC_WRITE, 0, nullptr,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (bf != INVALID_HANDLE_VALUE) {
+            DWORD wr = 0;
+            WriteFile(bf, req_body.data(), static_cast<DWORD>(req_body.size()), &wr, nullptr);
+            CloseHandle(bf);
+            has_body_file = true;
+        }
+    }
+
+    std::string cmd;
+    cmd.reserve(1024 + extra_headers.size() * 96);
+    cmd += "\"";
+    cmd += curl_exe;
+    cmd += "\" -sS --max-time ";
+    cmd += std::to_string(timeout_sec > 0 ? timeout_sec : 15);
+    cmd += " -X ";
+    cmd += (verb && *verb) ? verb : "GET";
+    cmd += " -o \"";
+    cmd += body_path;
+    cmd += "\" -D \"";
+    cmd += hdrs_path;
+    cmd += "\"";
+    if (!content_type.empty()) {
+        cmd += " -H \"Content-Type: ";
+        cmd += content_type;
+        cmd += "\"";
+    }
+    for (const auto& kv : extra_headers) {
+        cmd += " -H \"";
+        cmd += kv.first;
+        cmd += ": ";
+        cmd += kv.second;
+        cmd += "\"";
+    }
+    if (has_body_file) {
+        cmd += " --data-binary \"@";
+        cmd += body_in_path;
+        cmd += "\"";
+    }
+    cmd += " \"";
+    cmd += url;
+    cmd += "\"";
+
+    {
+        char dbuf[256];
+        _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
+            "curl_subprocess_invoke url=%.140s out=%.40s timeout=%d",
+            url.c_str(), body_path, timeout_sec);
+        lic_log(dbuf);
+    }
+
+    STARTUPINFOA si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+
+    std::vector<char> cmd_mut(cmd.begin(), cmd.end());
+    cmd_mut.push_back(0);
+
+    BOOL created = CreateProcessA(nullptr, cmd_mut.data(), nullptr, nullptr,
+                                   FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+                                   &si, &pi);
+    if (!created) {
+        out.error = "curl_subprocess_create_failed gle=" + std::to_string(GetLastError());
+        lic_log(out.error.c_str());
+        DeleteFileA(body_path);
+        DeleteFileA(hdrs_path);
+        if (has_body_file) DeleteFileA(body_in_path.c_str());
+        return out;
+    }
+
+    DWORD wait_ms = static_cast<DWORD>((timeout_sec > 0 ? timeout_sec : 15) * 1000 + 4000);
+    DWORD wr = WaitForSingleObject(pi.hProcess, wait_ms);
+    if (wr != WAIT_OBJECT_0) {
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 1000);
+        out.error = "curl_subprocess_wait_timeout";
+        lic_log(out.error.c_str());
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        DeleteFileA(body_path);
+        DeleteFileA(hdrs_path);
+        if (has_body_file) DeleteFileA(body_in_path.c_str());
+        return out;
+    }
+
+    DWORD exit_code = 1;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    {
+        char dbuf[96];
+        _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
+            "curl_subprocess_exit_code=%lu", exit_code);
+        lic_log(dbuf);
+    }
+
+    auto read_file = [](const char* path, std::string& out_str) -> bool {
+        HANDLE hf = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf == INVALID_HANDLE_VALUE) return false;
+        DWORD high = 0;
+        DWORD low = GetFileSize(hf, &high);
+        if (low == INVALID_FILE_SIZE) { CloseHandle(hf); return false; }
+        out_str.resize(low);
+        DWORD got = 0;
+        BOOL ok = ReadFile(hf, out_str.data(), low, &got, nullptr);
+        out_str.resize(got);
+        CloseHandle(hf);
+        return ok != FALSE;
+    };
+
+    std::string headers_text;
+    read_file(hdrs_path, headers_text);
+    read_file(body_path, out.body);
+
+    if (!headers_text.empty()) {
+        size_t line_end = headers_text.find("\r\n");
+        if (line_end == std::string::npos) line_end = headers_text.size();
+        std::string status_line = headers_text.substr(0, line_end);
+        size_t sp1 = status_line.find(' ');
+        if (sp1 != std::string::npos) {
+            out.status = atoi(status_line.c_str() + sp1 + 1);
+        }
+    }
+
+    DeleteFileA(body_path);
+    DeleteFileA(hdrs_path);
+    if (has_body_file) DeleteFileA(body_in_path.c_str());
+
+    if (exit_code != 0 && out.status == 0) {
+        out.error = "curl_subprocess_exit=" + std::to_string(exit_code);
+        lic_log(out.error.c_str());
+        return out;
+    }
+
+    out.ok = (out.status > 0);
+    {
+        char dbuf[160];
+        _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
+            "curl_subprocess_done ok=%d status=%d body_len=%zu",
+            out.ok ? 1 : 0, out.status, out.body.size());
+        lic_log(dbuf);
+    }
+    return out;
+}
+
+static void schedule_async_network_diagnosis(const std::string& url)
+{
+    static std::atomic<bool> s_diag_emitted{false};
+    bool was_emitted = s_diag_emitted.exchange(true, std::memory_order_acq_rel);
+    if (was_emitted) return;
+
+    std::string diag_host = url;
+    if (diag_host.rfind("https://", 0) == 0)      diag_host = diag_host.substr(8);
+    else if (diag_host.rfind("http://", 0) == 0)  diag_host = diag_host.substr(7);
+    auto cut = diag_host.find('/');
+    if (cut != std::string::npos) diag_host = diag_host.substr(0, cut);
+    auto colon = diag_host.find(':');
+    int diag_port = (url.rfind("http://", 0) == 0) ? 80 : 443;
+    if (colon != std::string::npos) {
+        diag_port = atoi(diag_host.c_str() + colon + 1);
+        diag_host = diag_host.substr(0, colon);
+    }
+
+    try {
+        std::thread([diag_host, diag_port]() {
+            __try {
+                diagnose_network(diag_host.c_str(), diag_port);
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+            }
+        }).detach();
+        lic_log("transport_diag_thread_dispatched");
+    } catch (...) {
+        lic_log("transport_diag_thread_spawn_failed");
+    }
+}
+
+static SimpleHttpResponse raw_https_request(
+    const char* verb,
+    const std::string& url,
+    const std::vector<std::pair<std::string,std::string>>& extra_headers = {},
+    const std::string& req_body = {},
+    const std::string& content_type = {},
+    int timeout_sec = 15)
+{
+    static std::atomic<bool> s_curl_preferred{false};
+    {
+        char buf[256];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "https_request_begin verb=%.8s url=%.140s body_len=%zu timeout=%d",
+            verb ? verb : "?", url.c_str(), req_body.size(), timeout_sec);
+        lic_log(buf);
+    }
+
+    SimpleHttpResponse winhttp_out = winhttp_https_request(verb, url, extra_headers,
+                                                            req_body, content_type,
+                                                            timeout_sec);
+    if (winhttp_out.ok || winhttp_out.status > 0) {
+        char buf[256];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "https_request_winhttp_ok status=%d body_len=%zu",
+            winhttp_out.status, winhttp_out.body.size());
+        lic_log(buf);
+        return winhttp_out;
+    }
+
+    {
+        char buf[384];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "https_request_winhttp_failed err=%.220s falling_back_to_raw",
+            winhttp_out.error.c_str());
+        lic_log(buf);
+    }
+
+    const bool curl_first = s_curl_preferred.load(std::memory_order_acquire) ||
+        winhttp_out.error.find("worker spawn failed") != std::string::npos;
+    SimpleHttpResponse curl_out;
+    bool curl_attempted = false;
+    if (curl_first) {
+        lic_log("https_request_preferring_curl");
+        curl_attempted = true;
+        curl_out = curl_subprocess_https_request(verb, url, extra_headers,
+                                                 req_body, content_type,
+                                                 timeout_sec);
+        if (curl_out.ok || curl_out.status > 0) {
+            s_curl_preferred.store(true, std::memory_order_release);
+            char buf[256];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "https_request_curl_ok status=%d body_len=%zu",
+                curl_out.status, curl_out.body.size());
+            lic_log(buf);
+            return curl_out;
+        }
+        {
+            char buf[384];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "https_request_curl_failed err=%.220s falling_back_to_raw",
+                curl_out.error.c_str());
+            lic_log(buf);
+        }
+    }
+
+    SimpleHttpResponse raw_out = raw_https_request_socket(verb, url, extra_headers,
+                                                           req_body, content_type,
+                                                           timeout_sec);
+    if (raw_out.ok || raw_out.status > 0) {
+        char buf[256];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "https_request_raw_ok status=%d body_len=%zu",
+            raw_out.status, raw_out.body.size());
+        lic_log(buf);
+        return raw_out;
+    }
+
+    if (raw_out.error.find("DNS resolution failed") != std::string::npos ||
+        raw_out.error.find("resolve_timeout") != std::string::npos) {
+        s_curl_preferred.store(true, std::memory_order_release);
+    }
+
+    {
+        char buf[384];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            curl_attempted ? "https_request_raw_failed err=%.220s" :
+                             "https_request_raw_failed err=%.220s falling_back_to_curl",
+            raw_out.error.c_str());
+        lic_log(buf);
+    }
+
+    if (curl_attempted) {
+        if (!winhttp_out.error.empty()) {
+            raw_out.error += " | winhttp_primary: ";
+            raw_out.error += winhttp_out.error;
+        }
+        if (!curl_out.error.empty()) {
+            raw_out.error += " | curl_subprocess: ";
+            raw_out.error += curl_out.error;
+        }
+        schedule_async_network_diagnosis(url);
+        return raw_out;
+    }
+
+    curl_out = curl_subprocess_https_request(verb, url, extra_headers,
+                                             req_body, content_type,
+                                             timeout_sec);
+    if (curl_out.ok || curl_out.status > 0) {
+        s_curl_preferred.store(true, std::memory_order_release);
+        char buf[256];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "https_request_curl_ok status=%d body_len=%zu",
+            curl_out.status, curl_out.body.size());
+        lic_log(buf);
+        return curl_out;
+    }
+
+    {
+        char buf[384];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "https_request_curl_failed err=%.220s",
+            curl_out.error.c_str());
+        lic_log(buf);
+    }
+
+    schedule_async_network_diagnosis(url);
+
+    if (!winhttp_out.error.empty()) {
+        raw_out.error += " | winhttp_primary: ";
+        raw_out.error += winhttp_out.error;
+    }
+    if (!curl_out.error.empty()) {
+        raw_out.error += " | curl_subprocess: ";
+        raw_out.error += curl_out.error;
+    }
+    return raw_out;
+}
+
 namespace
 {
 
@@ -757,14 +1632,6 @@ namespace
     std::vector<code_section_hash_t> s_code_hashes;
     std::mutex s_code_hash_mtx;
 
-    /* ── Step-up nonce (server-initiated re-proof) ──────── */
-    std::string s_pending_step_up_nonce;
-    std::atomic<bool> s_step_up_pending{false};
-    std::mutex s_step_up_mtx;
-
-    /* ── Phase-2 hardening state ─────────────────────────── */
-
-    /* Additional obfuscated state pair: d + e == magic_2 */
     constexpr uint64_t S_MAGIC2_INIT = 0xCAFE'BABE'1337'C0DEull;
     constexpr uint64_t S_ARC_MAGIC_INIT = 0x51A7'F00D'44CC'19E5ull;
     std::atomic<uint64_t> s_state_d{0};
@@ -972,6 +1839,17 @@ namespace
             s_state_e.store(0, std::memory_order_release);
             set_arc_obfuscated_state(false);
         }
+    }
+
+    [[noreturn]] void license_failfast(const char* reason, const std::string& detail)
+    {
+        std::string message = std::string(reason ? reason : "license_violation") + " " + detail;
+        lic_log(message.c_str());
+        anti_tamper::webhook::send_debug_log(reason ? reason : "license_violation", detail, true);
+        anti_tamper::webhook::send_violation_alert(reason ? reason : "license_violation", detail);
+        anti_tamper::server_pages::force_scrub_all();
+        set_obfuscated_valid(false);
+        __fastfail(FAST_FAIL_FATAL_APP_EXIT);
     }
 
 
@@ -1372,6 +2250,63 @@ namespace
         return false;
     }
 
+    bool run_startup_ban_check(settings_sa_t& settings, std::string& reason_out, std::string& message_out)
+    {
+        reason_out.clear();
+        message_out.clear();
+
+        json body;
+        body["action"] = "ban_check";
+        body["timestamp"] = static_cast<int64_t>(std::time(nullptr));
+        body["plugin_version"] = "aida-standalone";
+        body["mac_address"] = get_mac_address();
+
+        const auto candidates = collect_hwid_candidates(settings);
+        body["hwids"] = json::array();
+        for (const auto& hwid : candidates)
+            body["hwids"].push_back(hwid);
+        if (!candidates.empty())
+            body["hwid"] = candidates.front();
+
+        std::string host = get_cloud_function_host();
+        auto resp = raw_https_request("POST", host + "/validateLicense",
+                                      {}, body.dump(), "application/json", 8);
+        {
+            char buf[256];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "startup_ban_check_response ok=%d status=%d err=%.96s",
+                resp.ok ? 1 : 0, resp.status, resp.error.c_str());
+            lic_log(buf);
+        }
+        if (!resp.ok || resp.status != 200)
+            return false;
+
+        auto parsed = json::parse(resp.body, nullptr, false);
+        if (parsed.is_discarded() || !parsed.is_object())
+            return false;
+
+        if (parsed.value("status", "") != "banned" && !parsed.value("banned", false))
+            return false;
+
+        reason_out = parsed.value("reason", "banned");
+        const std::string ban_reason = parsed.value("ban_reason", "");
+        const std::string ban_type = parsed.value("ban_type", "");
+        message_out = "AiDA cannot start because this machine or network is banned.";
+        if (!reason_out.empty()) {
+            message_out += "\n\nReason: ";
+            message_out += reason_out;
+        }
+        if (!ban_type.empty()) {
+            message_out += "\nBan type: ";
+            message_out += ban_type;
+        }
+        if (!ban_reason.empty()) {
+            message_out += "\nServer cause: ";
+            message_out += ban_reason;
+        }
+        return true;
+    }
+
     static std::string hmac_sha256_hex(const std::string& key, const std::string& data)
     {
         BCRYPT_ALG_HANDLE hAlg = nullptr;
@@ -1573,9 +2508,8 @@ namespace
             body["license_key"] = key;
             body["hwid"] = hwid;
             body["timestamp"] = static_cast<int64_t>(std::time(nullptr));
-            lic_log("call_validation_getting_ip");
-            body["public_ip"] = get_public_ip();
-            lic_log(("call_validation_got_ip ip=" + body["public_ip"].get<std::string>()).c_str());
+            body["public_ip"] = "";
+            lic_log("call_validation_public_ip_skipped");
             body["mac_address"] = get_mac_address();
             if (action == "validate") {
                 body["client_nonce"] = nonce;
@@ -1584,38 +2518,13 @@ namespace
                 body["session_token"] = session_token;
                 body["heartbeat_nonce"] = nonce;
                 body["plugin_version"] = "aida-standalone";
-                body["heartbeat_count"] = static_cast<int>(s_heartbeat_counter.load(std::memory_order_acquire));
+                const uint32_t heartbeat_index = s_heartbeat_counter.load(std::memory_order_acquire) + 1;
+                body["heartbeat_count"] = static_cast<int>(heartbeat_index);
 
 
                 body["gate_bitmap"] = static_cast<int64_t>(
                     s_gate_bitmap.load(std::memory_order_acquire) & 0x00FFFFFFu);
 
-
-                if (s_step_up_pending.load(std::memory_order_acquire))
-                {
-                    std::lock_guard<std::mutex> sul(s_step_up_mtx);
-                    if (!s_pending_step_up_nonce.empty())
-                    {
-                        uint64_t su_nonce = fnv1a_str(s_pending_step_up_nonce);
-                        uint64_t su_tsc = __rdtsc();
-                        uint64_t su_proof = s_proof_hash.load(std::memory_order_acquire);
-                        uint64_t su_gates = s_gate_bitmap.load(std::memory_order_acquire);
-
-                        uint64_t combined = su_nonce ^ _rotl64(su_proof, 17)
-                                          ^ _rotl64(su_tsc, 31) ^ su_gates;
-                        combined *= 0x9E3779B97F4A7C15ULL;
-                        combined ^= combined >> 33;
-
-                        char su_buf[32];
-                        snprintf(su_buf, sizeof(su_buf), "%016llX",
-                            static_cast<unsigned long long>(combined));
-                        body["step_up_nonce"] = s_pending_step_up_nonce;
-                        body["step_up_proof"] = su_buf;
-
-                        s_pending_step_up_nonce.clear();
-                        s_step_up_pending.store(false, std::memory_order_release);
-                    }
-                }
 
                 {
                     std::lock_guard<std::mutex> lk(s_honeypot_names_mtx);
@@ -1641,11 +2550,29 @@ namespace
                     }
                 }
 
+                bool proof_token_added = false;
                 if (s_arc_loaded && s_fn_arc_heartbeat) {
                     auto hb = s_fn_arc_heartbeat();
                     if (hb.valid) {
                         char pt[32];
                         snprintf(pt, sizeof(pt), "%016llX", static_cast<unsigned long long>(hb.proof_token));
+                        body["proof_token"] = pt;
+                        proof_token_added = true;
+                    }
+                }
+
+                if (!proof_token_added) {
+                    uint64_t session_seed = s_proof_hash.load(std::memory_order_acquire);
+                    if (session_seed != 0) {
+                        uint64_t server_nonce_hash = fnv1a_str(settings.license_server_nonce);
+                        uint64_t hwid_hash = fnv1a_str(hwid);
+                        uint64_t fallback_proof = vm_generate_proof_token(
+                            session_seed,
+                            heartbeat_index,
+                            server_nonce_hash,
+                            hwid_hash);
+                        char pt[32];
+                        snprintf(pt, sizeof(pt), "%016llX", static_cast<unsigned long long>(fallback_proof));
                         body["proof_token"] = pt;
                     }
                 }
@@ -1760,20 +2687,18 @@ namespace
         s_magic.store(S_MAGIC_INIT ^ nonce_seed, std::memory_order_release);
 
 
-        s_heartbeat_counter.fetch_add(1, std::memory_order_relaxed);
-
         if (response.contains("page_epoch") && response["page_epoch"].is_number())
         {
             uint64_t new_epoch = response["page_epoch"].get<uint64_t>();
+            uint32_t stored_epoch = new_epoch > 0xFFFFFFFFull
+                ? 0xFFFFFFFFu
+                : static_cast<uint32_t>(new_epoch);
+            s_heartbeat_counter.store(stored_epoch, std::memory_order_release);
             anti_tamper::server_pages::advance_epoch(new_epoch);
         }
-
-
-        if (response.contains("step_up_nonce") && response["step_up_nonce"].is_string())
+        else
         {
-            std::lock_guard<std::mutex> sul(s_step_up_mtx);
-            s_pending_step_up_nonce = response["step_up_nonce"].get<std::string>();
-            s_step_up_pending.store(true, std::memory_order_release);
+            s_heartbeat_counter.store(0, std::memory_order_release);
         }
 
 
@@ -2213,6 +3138,87 @@ namespace
         return true;
     }
 
+    bool is_reactivation_required_error(const std::string& error)
+    {
+        return error == "not_found" ||
+               error == "revoked" ||
+               error == "expired" ||
+               error == "session_mismatch" ||
+               error == "session_expired" ||
+               error == "hwid_mismatch" ||
+               error == "clock_drift" ||
+               error == "invalid_format" ||
+               error == "missing_key";
+    }
+
+    std::string user_facing_license_error(const std::string& error)
+    {
+        if (error == "not_found")
+            return "License key was not found on the server.\nRe-enter your active key and press Activate.";
+        if (error == "revoked")
+            return "This license key has been revoked.\nContact support if you believe this is wrong.";
+        if (error == "expired")
+            return "This license key has expired.\nUse a renewed key to continue.";
+        if (error == "session_mismatch" || error == "session_expired")
+            return "Saved license session expired.\nPress Activate to create a new session.";
+        if (error == "hwid_mismatch")
+            return "This license key is bound to another machine.\nContact support if your hardware changed.";
+        if (error == "clock_drift")
+            return "System clock drift blocked license validation.\nSync Windows time and activate again.";
+        if (error == "invalid_format" || error == "missing_key")
+            return "Enter a valid AiDA license key and press Activate.";
+        return error;
+    }
+
+    bool is_authoritative_stop_response(const json& response)
+    {
+        if (!response.is_object())
+            return false;
+        const std::string status = response.value("status", "");
+        return status == "killed" || status == "banned" || response.value("alive", true) == false;
+    }
+
+    std::string license_response_reason(const json& response, const std::string& fallback)
+    {
+        if (response.is_object()) {
+            const std::string reason = response.value("reason", "");
+            if (!reason.empty())
+                return reason;
+        }
+        return fallback.empty() ? std::string("license rejected") : fallback;
+    }
+
+    void enter_pending_activation(settings_sa_t& settings, const std::string& reason)
+    {
+        const std::string effective_reason = reason.empty() ? std::string("License reactivation required.") : reason;
+        lic_log((std::string("enter_pending_activation: ") + effective_reason).c_str());
+        anti_tamper::state::get().license_pending_activation.store(true, std::memory_order_release);
+        unload_arc();
+        reset_arc_fetch_state();
+        reset_activation_completed_at();
+        settings.license_plan.clear();
+        settings.license_sig_payload.clear();
+        settings.license_server_sig.clear();
+        settings.license_session_token.clear();
+        settings.license_server_nonce.clear();
+        settings.license_client_nonce.clear();
+        settings.license_key_seed.clear();
+        settings.license_issued_at = 0;
+        settings.license_ttl = 3600;
+        settings.save();
+        s_cached_hwid.clear();
+        s_cached_session_token.clear();
+        s_proof_hash.store(0, std::memory_order_release);
+        s_heartbeat_counter.store(0, std::memory_order_release);
+        s_magic.store(S_MAGIC_INIT, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(s_state_mtx);
+            s_plan.clear();
+            s_error = effective_reason;
+            set_obfuscated_valid(false);
+        }
+    }
+
     void heartbeat_worker(settings_sa_t* settings)
     {
         std::mt19937 rng(static_cast<unsigned>(
@@ -2258,14 +3264,13 @@ namespace
             }
             if (!hb_ok) {
 
-                if (response.is_object() &&
-                    (response.value("status", "") == "killed" ||
-                     response.value("alive", true) == false)) {
+                if (is_authoritative_stop_response(response)) {
                     lic_log("heartbeat_killed_by_server");
-                    anti_tamper::server_pages::force_scrub_all();
-                    std::lock_guard<std::mutex> lk(s_state_mtx);
-                    s_error = "session_terminated";
-                    set_obfuscated_valid(false);
+                    license_failfast("server_killed_session", "reason=" + license_response_reason(response, "server_killed_session"));
+                }
+
+                if (is_reactivation_required_error(error)) {
+                    enter_pending_activation(*settings, error);
                     break;
                 }
 
@@ -2285,10 +3290,24 @@ namespace
                         continue;
                     }
 
-                    std::lock_guard<std::mutex> lk(s_state_mtx);
-                    s_error = error;
-                    set_obfuscated_valid(false);
-                    break;
+                    if (is_authoritative_stop_response(reval_response)) {
+                        lic_log("heartbeat_revalidation_killed_by_server");
+                        license_failfast("server_killed_session", "reason=" + license_response_reason(reval_response, "server_killed_session"));
+                    }
+
+                    const std::string effective_error = reval_error.empty() ? error : reval_error;
+                    if (is_reactivation_required_error(effective_error)) {
+                        enter_pending_activation(*settings, effective_error);
+                        break;
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lk(s_state_mtx);
+                        s_error = effective_error.empty() ? error : effective_error;
+                    }
+                    lic_log((std::string("heartbeat_revalidation_transient: ") + (effective_error.empty() ? error : effective_error)).c_str());
+                    consecutive_failures = 4;
+                    continue;
                 }
                 continue;
             }
@@ -2468,6 +3487,21 @@ namespace
 
 namespace standalone_license
 {
+    bool startup_ban_check(settings_sa_t& settings, std::string& reason_out, std::string& message_out)
+    {
+        try {
+            lic_log("startup_ban_check_enter");
+            bool banned = run_startup_ban_check(settings, reason_out, message_out);
+            lic_log(banned ? "startup_ban_check_banned" : "startup_ban_check_clear_or_unavailable");
+            return banned;
+        } catch (...) {
+            reason_out.clear();
+            message_out.clear();
+            lic_log("startup_ban_check_exception");
+            return false;
+        }
+    }
+
     bool initialize(settings_sa_t& settings)
     {
         lic_log("initialize_enter");
@@ -2509,9 +3543,11 @@ namespace standalone_license
         if (!call_validation_endpoint_with_hwid_fallback(settings, "validate", key,
                                                          {}, nonce, hwid, error_out, response)) {
             lic_log(("activate_endpoint_failed: " + error_out).c_str());
+            const std::string display_error = user_facing_license_error(error_out);
             std::lock_guard<std::mutex> lk(s_state_mtx);
             s_error = error_out;
             set_obfuscated_valid(false);
+            error_out = display_error;
             return false;
         }
         lic_log((std::string("activate_hwid_ok=") + hwid).c_str());
@@ -2564,7 +3600,7 @@ namespace standalone_license
     std::string last_error()
     {
         std::lock_guard<std::mutex> lk(s_state_mtx);
-        return s_error;
+        return user_facing_license_error(s_error);
     }
 
     void shutdown()
@@ -2664,25 +3700,26 @@ namespace standalone_license
         return delta >= 0 && delta < 180000;
     }
 
-    double compute_degradation_factor()
+    bool verify_runtime_gate_state(gate_slot_t slot)
     {
-        double factor = 1.0;
+        if (!s_valid.load(std::memory_order_acquire))
+            return false;
 
+        const std::string slot_detail = "slot=" + std::to_string(static_cast<int>(slot));
 
-        double a = inline_proof_check_a();
-        if (a < 0.5) factor *= 0.1;
-        else factor *= a;
+        if (inline_proof_check_a() < 0.5)
+            license_failfast("license_proof_hash_invalid", slot_detail);
 
+        if (!inline_proof_check_b())
+            license_failfast("license_state_integrity_invalid", slot_detail);
 
-        if (!inline_proof_check_b()) factor *= 0.05;
+        if (!inline_proof_check_c())
+            license_failfast("license_session_integrity_invalid", slot_detail);
 
+        if (!inline_proof_check_d())
+            return false;
 
-        if (!inline_proof_check_c()) factor *= 0.0;
-
-
-        if (!inline_proof_check_d()) factor *= 0.3;
-
-        return factor;
+        return true;
     }
 
     bool check_feature_allowed(gate_slot_t slot)
@@ -2695,31 +3732,7 @@ namespace standalone_license
              slot == gate_native_tool_use) && !s_arc_loaded)
             return false;
 
-        double factor = compute_degradation_factor();
-
-
-        if (slot == gate_ui_render_loop || slot == gate_ui_bottom_panel ||
-            slot == gate_settings_save)
-            return factor > 0.0;
-
-
-        if (slot == gate_file_browser_open || slot == gate_workspace_search ||
-            slot == gate_terminal_exec || slot == gate_ui_command_palette)
-            return factor >= 0.3;
-
-
-        if (slot == gate_ai_chat_async || slot == gate_ai_generate ||
-            slot == gate_ai_stream_cb || slot == gate_agentic_loop_iter ||
-            slot == gate_mcp_tool_exec || slot == gate_coding_tool_exec ||
-            slot == gate_native_tool_use)
-            return factor >= 0.6;
-
-
-        if (slot == gate_driver_attach || slot == gate_driver_read_mem)
-            return factor >= 0.8;
-
-
-        return factor >= 0.5;
+        return verify_runtime_gate_state(slot);
     }
 
 
@@ -2853,9 +3866,7 @@ namespace standalone_license
                     "cross_validation_magic_FAIL d=%llu e=%llu sum=%llu m2=%llu frame=%d",
                     (unsigned long long)d, (unsigned long long)e,
                     (unsigned long long)(d+e), (unsigned long long)m2, frame_counter);
-                lic_log(magic_buf);
-                set_obfuscated_valid(false);
-                return false;
+                license_failfast("license_cross_validation_invalid", magic_buf);
             }
         }
 

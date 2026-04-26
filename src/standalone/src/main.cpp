@@ -15,6 +15,7 @@
 #include "helpers/globals.h"
 #include "standalone_chat.hpp"
 #include "standalone_license.hpp"
+#include "standalone_settings.hpp"
 #include "standalone_driver.hpp"
 #include "core/anti-tamper/orchestrator.hpp"
 #include "core/anti-tamper/hv_preflight.hpp"
@@ -27,6 +28,7 @@
 #include "command_palette_view.hpp"
 #include "agent_picker_view.hpp"
 #include "settings_overlay.hpp"
+#include "work_queue.hpp"
 #include "helpers/stb_image.h"
 
 #include "embedded_resources.hpp"
@@ -147,6 +149,31 @@ static void crash_log_fmt(const char* fmt, ...)
     _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
     va_end(ap);
     diag::log_tagged("main", buf);
+}
+
+static std::wstring widen_message_text(const std::string& text)
+{
+    if (text.empty()) return std::wstring();
+    int len = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
+    if (len <= 0) return std::wstring(text.begin(), text.end());
+    std::wstring out;
+    out.resize(static_cast<size_t>(len));
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), out.data(), len);
+    return out;
+}
+
+static void show_ban_refuse_ui_and_exit(const std::string& reason, const std::string& message)
+{
+    std::wstring final_message = widen_message_text(message.empty()
+        ? std::string("AiDA cannot start because this machine or network is banned.")
+        : message);
+    if (!reason.empty()) {
+        final_message += L"\n\nCode: ";
+        final_message += widen_message_text(reason);
+    }
+    MessageBoxW(nullptr, final_message.c_str(), L"AiDA",
+        MB_OK | MB_ICONERROR | MB_SYSTEMMODAL | MB_TOPMOST);
+    ExitProcess(1);
 }
 
 __declspec(noinline) static DWORD seh_render_title(helpers* h, uint64_t frame_number)
@@ -389,6 +416,18 @@ int main(int, char**)
             anti_tamper::hv_preflight::show_refuse_ui_and_exit(r);
     }
 
+    {
+        bool settings_loaded = g_sa_settings.load();
+        crash_log_fmt("startup_settings_loaded=%d", settings_loaded ? 1 : 0);
+        std::string ban_reason;
+        std::string ban_message;
+        if (standalone_license::startup_ban_check(g_sa_settings, ban_reason, ban_message)) {
+            crash_log_fmt("startup_ban_refuse reason=%.128s", ban_reason.c_str());
+            show_ban_refuse_ui_and_exit(ban_reason, ban_message);
+        }
+        crash_log_write("startup_ban_check_passed");
+    }
+
     crash_log_write("extracting_z3");
     embedded_resources::extract_and_load_z3();
     crash_log_fmt("z3_loaded module=%p", embedded_resources::g_z3_module);
@@ -539,6 +578,9 @@ int main(int, char**)
     Blur::Init(g_pd3dDevice, g_pd3dDeviceContext, 100, 130);
     crash_log_write("blur_init_ok");
 
+    work_queue::initialize();
+    crash_log_write("work_queue_init_ok");
+
 
     static std::atomic<bool> bg_init_done{false};
     globals::ui::bg_init_done = &bg_init_done;
@@ -617,20 +659,8 @@ int main(int, char**)
     static uint64_t frame_number = 0;
     while (!done)
     {
-        if (frame_number < 5 || (frame_number % 500) == 0)
+        if (frame_number < 5)
             crash_log_fmt("frame_begin #%llu", frame_number);
-
-        static DWORD s_start_tick = GetTickCount();
-        DWORD elapsed_ms = GetTickCount() - s_start_tick;
-        if (frame_number < 5 || (frame_number >= 250 && frame_number <= 260)
-            || (elapsed_ms >= 4500 && elapsed_ms <= 7000 && (frame_number % 10) == 0)
-            || (frame_number % 100) == 0)
-        {
-            crash_log_fmt("frame_detail #%llu elapsed_ms=%lu state=%d bg_done=%d",
-                frame_number, elapsed_ms,
-                (globals::ui::load_timer >= 3.0f ? 1 : 0) + (globals::ui::welcome_done ? 2 : 0),
-                (globals::ui::bg_init_done && globals::ui::bg_init_done->load(std::memory_order_relaxed)) ? 1 : 0);
-        }
 
         if (themes::changed)
         {
@@ -815,7 +845,7 @@ int main(int, char**)
 
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
 
-        if (frame_number < 5 || (frame_number % 500) == 0)
+        if (frame_number < 5)
             crash_log_fmt("frame_end #%llu", frame_number);
         frame_number++;
     }

@@ -20,6 +20,7 @@ struct pool_t {
     std::mutex                        mtx;
     std::condition_variable           cv;
     std::atomic<bool>                 alive{false};
+    std::atomic<bool>                 shutting_down{false};
 };
 
 inline pool_t g_pool;
@@ -28,7 +29,9 @@ inline pool_t g_pool;
 
 inline void initialize() {
     auto& p = detail::g_pool;
-    p.alive.store(true);
+    if (p.shutting_down.load(std::memory_order_acquire)) return;
+    bool expected = false;
+    if (!p.alive.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
     p.workers.reserve(POOL_SIZE);
     for (int i = 0; i < POOL_SIZE; ++i) {
         p.workers.emplace_back([&p]() {
@@ -49,14 +52,20 @@ inline void initialize() {
 
 inline void post(std::function<void()> f) {
     auto& p = detail::g_pool;
-    if (!p.alive.load()) return;
-    { std::lock_guard<std::mutex> lk(p.mtx); p.tasks.push(std::move(f)); }
+    if (!p.alive.load(std::memory_order_acquire)) initialize();
+    if (!p.alive.load(std::memory_order_acquire) || p.shutting_down.load(std::memory_order_acquire)) return;
+    {
+        std::lock_guard<std::mutex> lk(p.mtx);
+        if (!p.alive.load(std::memory_order_acquire) || p.shutting_down.load(std::memory_order_acquire)) return;
+        p.tasks.push(std::move(f));
+    }
     p.cv.notify_one();
 }
 
 inline void shutdown() {
     auto& p = detail::g_pool;
-    p.alive.store(false);
+    p.shutting_down.store(true, std::memory_order_release);
+    p.alive.store(false, std::memory_order_release);
     p.cv.notify_all();
     for (auto& w : p.workers) if (w.joinable()) w.join();
     p.workers.clear();
