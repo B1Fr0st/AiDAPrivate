@@ -3,9 +3,9 @@
 #include <shlobj.h>
 
 #include "globals.h"
-#include "../core/zydis_disasm.hpp"
-#include "../core/standalone_license.hpp"
-#include "../core/hex_view.hpp"
+#include "zydis_disasm.hpp"
+#include "standalone_license.hpp"
+#include "hex_view.hpp"
 
 #include <filesystem>
 #include <algorithm>

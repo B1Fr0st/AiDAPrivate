@@ -1,14 +1,53 @@
-cmake_minimum_required(VERSION 3.21)
+cmake_minimum_required(VERSION 3.25)
+
+set(CMAKE_POLICY_DEFAULT_CMP0091 NEW)
+set(CMAKE_POLICY_DEFAULT_CMP0141 NEW)
 
 project(AiDA
     VERSION   1.2.8
-    LANGUAGES CXX ASM_MASM
+    LANGUAGES C CXX ASM_MASM
 )
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+find_program(AIDA_SCCACHE_PROGRAM sccache)
+if(AIDA_SCCACHE_PROGRAM)
+    message(STATUS "AiDA: sccache enabled for C++ at ${AIDA_SCCACHE_PROGRAM}")
+    set(CMAKE_C_COMPILER_LAUNCHER   "" CACHE STRING "compiler launcher (disabled for C)" FORCE)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${AIDA_SCCACHE_PROGRAM}" CACHE STRING "compiler launcher (sccache)" FORCE)
+endif()
+
+if(MSVC)
+    set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo,Release>:Embedded>")
+
+    if(CMAKE_GENERATOR MATCHES "Ninja")
+        set(_aida_rule_launch_compile "\"${CMAKE_COMMAND}\" -E chdir \"${CMAKE_BINARY_DIR}\"")
+        set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${_aida_rule_launch_compile}")
+        set_property(GLOBAL PROPERTY JOB_POOLS aida_serial_compile=1)
+    endif()
+
+    foreach(_aida_flagset
+        CMAKE_C_FLAGS CMAKE_CXX_FLAGS
+        CMAKE_C_FLAGS_DEBUG CMAKE_CXX_FLAGS_DEBUG
+        CMAKE_C_FLAGS_RELEASE CMAKE_CXX_FLAGS_RELEASE
+        CMAKE_C_FLAGS_RELWITHDEBINFO CMAKE_CXX_FLAGS_RELWITHDEBINFO
+        CMAKE_C_FLAGS_MINSIZEREL CMAKE_CXX_FLAGS_MINSIZEREL)
+        if(DEFINED ${_aida_flagset})
+            string(REGEX REPLACE "[ \t]*/Z[Ii7]([ \t]|$)" " " ${_aida_flagset} "${${_aida_flagset}}")
+            string(REGEX REPLACE "[ \t]*/FS([ \t]|$)"     " " ${_aida_flagset} "${${_aida_flagset}}")
+        endif()
+    endforeach()
+
+    if(NOT AIDA_SCCACHE_PROGRAM AND NOT CMAKE_GENERATOR MATCHES "Ninja")
+        add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/MP>)
+    endif()
+endif()
+
+option(AIDA_ENABLE_LTCG "Enable /GL + /LTCG on AiDA.dll and aida_core.dll (slower link, marginally faster runtime)" OFF)
+option(AIDA_FAST_LINK   "Use /DEBUG (default) instead of /DEBUG:FULL for faster linking" ON)
 
 set(DEPS_DIR "${CMAKE_SOURCE_DIR}/.deps")
 
@@ -127,6 +166,9 @@ set_target_properties(lua54_static PROPERTIES
     C_STANDARD_REQUIRED ON
 )
 if(MSVC)
+    if(CMAKE_GENERATOR MATCHES "Ninja")
+        set_property(TARGET lua54_static PROPERTY JOB_POOL_COMPILE aida_serial_compile)
+    endif()
     target_compile_options(lua54_static PRIVATE /W3 /wd4244 /wd4702 /wd4334)
     target_compile_definitions(lua54_static PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
@@ -207,6 +249,7 @@ endif()
 set(GHIDRA_DECOMP_DIR "${CMAKE_SOURCE_DIR}/sources/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp")
 set(GHIDRA_SPECS_SRC_DIR "${CMAKE_SOURCE_DIR}/sources/ghidra/Ghidra/Processors/x86/data/languages")
 set(GHIDRA_SPECS_OUTPUT_DIR "${CMAKE_BINARY_DIR}/ghidra_specs")
+set(GHIDRA_PREBUILT_SLA "${GHIDRA_SPECS_SRC_DIR}/x86-64.sla")
 
 file(GLOB GHIDRA_ALL_CC "${GHIDRA_DECOMP_DIR}/*.cc")
 
@@ -299,14 +342,25 @@ target_link_libraries(ghidra_sleigh_compiler PRIVATE zlibstatic)
 
 file(MAKE_DIRECTORY "${GHIDRA_SPECS_OUTPUT_DIR}")
 
-add_custom_command(
-    OUTPUT "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
-    COMMAND ghidra_sleigh_compiler "${GHIDRA_SPECS_SRC_DIR}/x86-64.slaspec" "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
-    DEPENDS ghidra_sleigh_compiler "${GHIDRA_SPECS_SRC_DIR}/x86-64.slaspec"
-    WORKING_DIRECTORY "${GHIDRA_SPECS_SRC_DIR}"
-    COMMENT "Compiling SLEIGH: x86-64.slaspec -> x86-64.sla"
-    VERBATIM
-)
+if(EXISTS "${GHIDRA_PREBUILT_SLA}")
+    add_custom_command(
+        OUTPUT "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${GHIDRA_PREBUILT_SLA}" "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
+        DEPENDS "${GHIDRA_PREBUILT_SLA}"
+        COMMENT "Copying prebuilt SLEIGH: x86-64.sla"
+        VERBATIM
+    )
+else()
+    add_custom_command(
+        OUTPUT "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
+        COMMAND ghidra_sleigh_compiler "${GHIDRA_SPECS_SRC_DIR}/x86-64.slaspec" "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
+        DEPENDS ghidra_sleigh_compiler "${GHIDRA_SPECS_SRC_DIR}/x86-64.slaspec"
+        WORKING_DIRECTORY "${GHIDRA_SPECS_SRC_DIR}"
+        COMMENT "Compiling SLEIGH: x86-64.slaspec -> x86-64.sla"
+        VERBATIM
+    )
+endif()
 
 add_custom_command(
     OUTPUT "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.pspec"
@@ -709,7 +763,6 @@ if(WIN32)
 
         set(IMGUI_SOURCES
             "${imgui_SOURCE_DIR}/imgui.cpp"
-            "${imgui_SOURCE_DIR}/imgui_demo.cpp"
             "${imgui_SOURCE_DIR}/imgui_draw.cpp"
             "${imgui_SOURCE_DIR}/imgui_tables.cpp"
             "${imgui_SOURCE_DIR}/imgui_widgets.cpp"
@@ -795,7 +848,7 @@ if(WIN32)
             _UNICODE
             SOL_ALL_SAFETIES_ON=1
             TRITON_Z3_INTERFACE
-            GHIDRA_SPECS_DIR="${GHIDRA_SPECS_OUTPUT_DIR}"
+            GHIDRA_SPECS_DIR=${GHIDRA_SPECS_OUTPUT_DIR}
             AIDA_DEEP_STEAL=1
         )
 
@@ -804,12 +857,11 @@ if(WIN32)
             /wd4005
             /wd4099
             /EHsc
-            /Zi
-            /FS
             /Zc:__cplusplus
             /permissive-
             /Zp8
             /MD
+            /bigobj
         )
 
         target_link_directories(AiDAStandalone PRIVATE
@@ -851,7 +903,7 @@ if(WIN32)
         )
 
         target_link_options(AiDAStandalone PRIVATE
-            /DEBUG:FULL
+            $<IF:$<BOOL:${AIDA_FAST_LINK}>,/DEBUG,/DEBUG:FULL>
             /ENTRY:mainCRTStartup
             /NODEFAULTLIB:LIBCMT
             /IGNORE:4099
@@ -943,14 +995,13 @@ if(WIN32)
         target_compile_options(AiDA_ARC PRIVATE
             /W3
             /EHsc
-            /Zi
-            /FS
             /Zc:__cplusplus
             /permissive-
             /Zp8
             /MD
             /O2
-            /GL
+            /bigobj
+            $<$<BOOL:${AIDA_ENABLE_LTCG}>:/GL>
         )
 
         target_link_libraries(AiDA_ARC PRIVATE
@@ -963,8 +1014,8 @@ if(WIN32)
         )
 
         target_link_options(AiDA_ARC PRIVATE
-            /DEBUG:FULL
-            /LTCG
+            $<IF:$<BOOL:${AIDA_FAST_LINK}>,/DEBUG,/DEBUG:FULL>
+            $<$<BOOL:${AIDA_ENABLE_LTCG}>:/LTCG>
         )
 
         set_target_properties(AiDA_ARC PROPERTIES
@@ -1141,8 +1192,6 @@ target_include_directories(AiDA PRIVATE
 if(WIN32)
     target_compile_options(AiDA PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:/W3>
-        $<$<COMPILE_LANGUAGE:CXX>:/Zi>
-        $<$<COMPILE_LANGUAGE:CXX>:/FS>
         $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>
         $<$<COMPILE_LANGUAGE:CXX>:/permissive->
         $<$<COMPILE_LANGUAGE:CXX>:/Zp8>
@@ -1155,7 +1204,8 @@ if(WIN32)
         $<$<COMPILE_LANGUAGE:CXX>:/Gw>
         $<$<COMPILE_LANGUAGE:CXX>:/Oi>
         $<$<COMPILE_LANGUAGE:CXX>:/Ob2>
-        $<$<COMPILE_LANGUAGE:CXX>:/GL>
+        $<$<COMPILE_LANGUAGE:CXX>:/bigobj>
+        $<$<AND:$<BOOL:${AIDA_ENABLE_LTCG}>,$<COMPILE_LANGUAGE:CXX>>:/GL>
         $<$<COMPILE_LANGUAGE:CXX>:/wd4946>
         $<$<COMPILE_LANGUAGE:CXX>:/wd4826>
         $<$<COMPILE_LANGUAGE:CXX>:/wd4628>
@@ -1165,10 +1215,10 @@ if(WIN32)
     )
 
     target_link_options(AiDA PRIVATE
-        /DEBUG:FULL
+        $<IF:$<BOOL:${AIDA_FAST_LINK}>,/DEBUG,/DEBUG:FULL>
         /OPT:REF,ICF
         /RELEASE
-        /LTCG
+        $<$<BOOL:${AIDA_ENABLE_LTCG}>:/LTCG>
         /PDBALTPATH:none
         /EMITTOOLVERSIONINFO:NO
     )

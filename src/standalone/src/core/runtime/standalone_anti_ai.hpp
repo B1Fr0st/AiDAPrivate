@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-#include "../../obfuscation.hpp"
+#include "obfuscation.hpp"
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")

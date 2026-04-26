@@ -14,7 +14,7 @@
 #include "xref_engine.hpp"
 
 #ifdef __NT__
-#include "../../emulation_engine.hpp"
+#include "emulation_engine.hpp"
 #endif
 
 namespace decrypt_oracle {

@@ -18,7 +18,7 @@
 #include "integrity.hpp"
 #include "metamorphic.hpp"
 #include "state.hpp"
-#include "../../../obfuscation.hpp"
+#include "obfuscation.hpp"
 
 namespace anti_tamper {
 namespace virtualizer

@@ -1,5 +1,5 @@
 #include "chat_render.hpp"
-#include "../ide_icons.h"
+#include "ide_icons.h"
 #include "ui_anim.hpp"
 
 #include <algorithm>

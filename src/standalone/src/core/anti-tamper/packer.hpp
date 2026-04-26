@@ -11,7 +11,7 @@
 #include <mutex>
 #include <vector>
 
-#include "../../../obfuscation.hpp"
+#include "obfuscation.hpp"
 
 namespace anti_tamper {
 namespace packer {

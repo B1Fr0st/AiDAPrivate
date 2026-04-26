@@ -32,7 +32,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include "../../obfuscation.hpp"
+#include "obfuscation.hpp"
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "bcrypt.lib")

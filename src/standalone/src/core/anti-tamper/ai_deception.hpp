@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "webhook.hpp"
-#include "../../../obfuscation.hpp"
+#include "obfuscation.hpp"
 
 namespace anti_tamper {
 namespace ai_deception {

@@ -13,7 +13,7 @@
 #include <thread>
 #include <vector>
 
-#include "../../obfuscation.hpp"
+#include "obfuscation.hpp"
 
 #pragma comment(lib, "ntdll.lib")
 

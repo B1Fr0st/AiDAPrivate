@@ -1,8 +1,8 @@
 #pragma once
 #include "imgui/imgui_internal.h"
-#include "../core/standalone_license.hpp"
-#include "../core/terminal_view.hpp"
-#include "../core/workspace_search.hpp"
+#include "standalone_license.hpp"
+#include "terminal_view.hpp"
+#include "workspace_search.hpp"
 #include <iostream>
 #include <d3d11.h>
 #include <string>

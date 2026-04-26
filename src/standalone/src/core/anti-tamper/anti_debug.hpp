@@ -9,7 +9,7 @@
 
 #include "webhook.hpp"
 #include "syscall.hpp"
-#include "../standalone_driver.hpp"
+#include "standalone_driver.hpp"
 
 namespace anti_tamper {
 namespace anti_debug {

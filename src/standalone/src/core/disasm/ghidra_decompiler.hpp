@@ -168,7 +168,11 @@ inline std::string find_specs_dir() {
 		return candidate;
 
 #ifdef GHIDRA_SPECS_DIR
-	std::string cmake_dir = GHIDRA_SPECS_DIR;
+#define AIDA_GHIDRA_SPECS_STR_IMPL(x) #x
+#define AIDA_GHIDRA_SPECS_STR(x) AIDA_GHIDRA_SPECS_STR_IMPL(x)
+	std::string cmake_dir = AIDA_GHIDRA_SPECS_STR(GHIDRA_SPECS_DIR);
+	#undef AIDA_GHIDRA_SPECS_STR
+	#undef AIDA_GHIDRA_SPECS_STR_IMPL
 	attr = GetFileAttributesA(cmake_dir.c_str());
 	if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
 		return cmake_dir;

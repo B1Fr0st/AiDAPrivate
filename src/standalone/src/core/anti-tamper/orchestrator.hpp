@@ -34,11 +34,11 @@
 #include "vm_compiler.hpp"
 #include "stolen_bytes.hpp"
 #include "vm_nested.hpp"
-#include "../standalone_anti_dump.hpp"
+#include "standalone_anti_dump.hpp"
 #include "re_detection_engine.hpp"
 #include "ghost_veh.hpp"
 
-#include "../../../obfuscation.hpp"
+#include "obfuscation.hpp"
 
 namespace anti_tamper {
 

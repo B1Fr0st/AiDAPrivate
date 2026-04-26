@@ -17,8 +17,8 @@
 #include "state.hpp"
 #include "enforcement.hpp"
 #include "anti_debug.hpp"
-#include "../standalone_driver.hpp"
-#include "../standalone_license.hpp"
+#include "standalone_driver.hpp"
+#include "standalone_license.hpp"
 
 namespace anti_tamper {
 namespace re_detect {

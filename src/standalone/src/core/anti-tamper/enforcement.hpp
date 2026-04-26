@@ -13,8 +13,8 @@
 #include "webhook.hpp"
 #include "syscall.hpp"
 #include "obfuscation_macros.hpp"
-#include "../standalone_license.hpp"
-#include "../standalone_driver.hpp"
+#include "standalone_license.hpp"
+#include "standalone_driver.hpp"
 #include "../../../../../libs/cpp-httplib/httplib.h"
 #include "../../../../../libs/nlohmann/json.hpp"
 

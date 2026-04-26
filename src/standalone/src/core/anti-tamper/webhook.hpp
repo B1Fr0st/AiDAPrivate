@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-#include "../../../obfuscation.hpp"
+#include "obfuscation.hpp"
 #include "../../../../../libs/nlohmann/json.hpp"
 #include "../../../../../src/shared/telemetry/telemetry_client.hpp"
 

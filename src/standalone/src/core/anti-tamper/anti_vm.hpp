@@ -11,7 +11,7 @@
 
 #include "webhook.hpp"
 #include "hv_preflight.hpp"
-#include "../standalone_driver.hpp"
+#include "standalone_driver.hpp"
 
 #pragma comment(lib, "iphlpapi.lib")
 

@@ -3,7 +3,7 @@
 #include "symbolic_engine.hpp"
 #include "cfg_view.hpp"
 #include "zydis_disasm.hpp"
-#include "../../emulation_engine.hpp"
+#include "emulation_engine.hpp"
 #include "comm.h"
 
 #include <triton/context.hpp>

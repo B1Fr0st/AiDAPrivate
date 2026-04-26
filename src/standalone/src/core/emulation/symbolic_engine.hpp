@@ -3,7 +3,7 @@
 #include <triton/context.hpp>
 #include <triton/x86Specifications.hpp>
 
-#include "../../emulation_engine.hpp"
+#include "emulation_engine.hpp"
 #include "comm.h"
 
 #include <algorithm>

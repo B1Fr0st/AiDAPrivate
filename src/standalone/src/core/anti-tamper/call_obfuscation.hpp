@@ -8,7 +8,7 @@
 #include <cstring>
 
 #include "integrity.hpp"
-#include "../../../obfuscation.hpp"
+#include "obfuscation.hpp"
 
 namespace anti_tamper {
 namespace call_obfuscation {

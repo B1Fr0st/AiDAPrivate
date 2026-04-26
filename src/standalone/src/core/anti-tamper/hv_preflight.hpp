@@ -12,7 +12,7 @@
 #include <algorithm>
 #include <string>
 
-#include "../../../obfuscation.hpp"
+#include "obfuscation.hpp"
 #include "../../helpers/diag_log.hpp"
 
 namespace anti_tamper {

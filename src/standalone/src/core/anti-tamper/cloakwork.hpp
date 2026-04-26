@@ -10,7 +10,7 @@
 
 #include "integrity.hpp"
 #include "metamorphic.hpp"
-#include "../../../obfuscation.hpp"
+#include "obfuscation.hpp"
 
 namespace anti_tamper {
 namespace cloakwork {
