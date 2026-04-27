@@ -981,7 +981,11 @@ struct section_skip_list {
             || name_equals(name, ".rsrc")
             || name_equals(name, ".gehi")
             || name_equals(name, ".epheme")
-            || name_equals(name, ".rdiag");
+            || name_equals(name, ".rdiag")
+            || name_equals(name, ".dseal")
+            || name_equals(name, ".dthunk")
+            || name_equals(name, ".licbind")
+            || name_equals(name, ".feat");
     }
 };
 
@@ -1753,7 +1757,11 @@ inline void randomize_section_names(pe_file::pe_image_t& pe, rng_state_t& rng) {
     for (auto& sec : pe.sections) {
         if (section_skip_list::name_equals(sec.name, ".rsrc") ||
             section_skip_list::name_equals(sec.name, ".reloc") ||
-            section_skip_list::name_equals(sec.name, ".packed")) {
+            section_skip_list::name_equals(sec.name, ".packed") ||
+            section_skip_list::name_equals(sec.name, ".dseal") ||
+            section_skip_list::name_equals(sec.name, ".dthunk") ||
+            section_skip_list::name_equals(sec.name, ".licbind") ||
+            section_skip_list::name_equals(sec.name, ".feat")) {
             continue;
         }
         char nn[8] = { 0 };
@@ -2556,6 +2564,382 @@ inline uint32_t inject_symexec_bombs(pe_file::pe_image_t& pe, uint64_t seed) {
     return kBombCount;
 }
 
+namespace deep_steal_detail {
+
+constexpr uint32_t kMinStolenBytes = 5u;
+constexpr uint32_t kMaxStolenBytes = 16u;
+constexpr uint32_t kThunkSlotSize = 96u;
+constexpr uint32_t kScratchSlotSize = 32u;
+constexpr uint32_t kMaxTargets = 64u;
+
+#pragma pack(push, 1)
+struct stolen_entry_t {
+    uint32_t func_rva;
+    uint32_t stolen_byte_count;
+    uint8_t  stolen_bytes[16];
+    uint64_t fnv_check;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(stolen_entry_t) == 32, "stolen_entry_t must be 32 bytes");
+
+inline bool decode_unwind_prolog_size(const pe_file::pe_image_t& pe,
+                                       uint32_t unwind_info_rva,
+                                       uint32_t& out_size) {
+    out_size = 0u;
+    if (unwind_info_rva == 0u) { return false; }
+    const uint8_t* p = pe.rva_ptr(unwind_info_rva);
+    if (p == nullptr) { return false; }
+    const uint8_t version = static_cast<uint8_t>(p[0] & 0x07u);
+    const uint8_t flags = static_cast<uint8_t>((p[0] >> 3) & 0x1Fu);
+    if (version != 1u) { return false; }
+    if ((flags & 0x04u) != 0u) { return false; }
+    out_size = static_cast<uint32_t>(p[1]);
+    return true;
+}
+
+inline bool is_relocatable_prologue(const uint8_t* p, uint32_t count) {
+    if (p == nullptr || count < 3u) { return false; }
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint8_t b = p[i];
+        if (b == 0xE8u) { return false; }
+        if (b == 0xE9u) { return false; }
+        if (b == 0xEBu) { return false; }
+        if (b == 0xE0u || b == 0xE1u || b == 0xE2u) { return false; }
+        if (b >= 0x70u && b <= 0x7Fu) { return false; }
+        if (b == 0x0Fu && i + 1u < count) {
+            const uint8_t nb = p[i + 1u];
+            if (nb >= 0x80u && nb <= 0x8Fu) { return false; }
+        }
+        if (b == 0xFFu && i + 1u < count) {
+            const uint8_t nb = p[i + 1u];
+            const uint8_t mod = static_cast<uint8_t>((nb >> 6u) & 0x3u);
+            const uint8_t reg = static_cast<uint8_t>((nb >> 3u) & 0x7u);
+            const uint8_t rm  = static_cast<uint8_t>(nb & 0x7u);
+            if ((reg == 2u || reg == 3u || reg == 4u || reg == 5u) && mod == 0u && rm == 5u) {
+                return false;
+            }
+        }
+        if ((b == 0x48u || b == 0x4Cu || b == 0x49u || b == 0x4Du) && i + 2u < count) {
+            const uint8_t opc = p[i + 1u];
+            const uint8_t mrm = p[i + 2u];
+            const uint8_t mod = static_cast<uint8_t>((mrm >> 6u) & 0x3u);
+            const uint8_t rm  = static_cast<uint8_t>(mrm & 0x7u);
+            if (mod == 0u && rm == 5u) {
+                if (opc == 0x8Bu || opc == 0x89u || opc == 0x8Du || opc == 0x03u || opc == 0x01u) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+inline uint64_t derive_target_key(const uint8_t master[32], uint32_t func_rva, uint32_t section_index) {
+    uint8_t info[32] = {0};
+    std::memcpy(info, "deep_steal_target", 17);
+    std::memcpy(info + 17, &func_rva, 4);
+    std::memcpy(info + 21, &section_index, 4);
+    uint8_t prk[32];
+    sha256_detail::hkdf_extract(nullptr, 0, master, 32, prk);
+    uint8_t okm[8];
+    sha256_detail::hkdf_expand(prk, info, 25, okm, 8);
+    uint64_t key = 0;
+    std::memcpy(&key, okm, 8);
+    if (key == 0ull) { key = 0xDEEFADDEEFADDEEFull; }
+    return key;
+}
+
+inline void derive_section_iv(const uint8_t master[32], uint32_t section_index, uint8_t iv[16]) {
+    uint8_t info[32] = {0};
+    std::memcpy(info, "deep_steal_iv", 13);
+    std::memcpy(info + 13, &section_index, 4);
+    uint8_t prk[32];
+    sha256_detail::hkdf_extract(nullptr, 0, master, 32, prk);
+    sha256_detail::hkdf_expand(prk, info, 17, iv, 16);
+}
+
+inline void emit_u8(std::vector<uint8_t>& out, uint8_t b) { out.push_back(b); }
+
+inline void emit_u32(std::vector<uint8_t>& out, uint32_t v) {
+    for (int i = 0; i < 4; ++i) {
+        out.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFFu));
+    }
+}
+
+inline void emit_u64(std::vector<uint8_t>& out, uint64_t v) {
+    for (int i = 0; i < 8; ++i) {
+        out.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFFu));
+    }
+}
+
+inline void write_u32_at(std::vector<uint8_t>& out, size_t at, uint32_t v) {
+    for (int i = 0; i < 4; ++i) {
+        out[at + i] = static_cast<uint8_t>((v >> (8 * i)) & 0xFFu);
+    }
+}
+
+inline void build_thunk_code(std::vector<uint8_t>& out,
+                              uint32_t thunk_rva,
+                              uint32_t dseal_entry_rva,
+                              uint32_t scratch_rva,
+                              uint32_t stolen_count,
+                              uint64_t target_key) {
+    const size_t start = out.size();
+
+    emit_u8(out, 0x50u);
+    emit_u8(out, 0x51u);
+    emit_u8(out, 0x57u);
+    emit_u8(out, 0x56u);
+    emit_u8(out, 0x53u);
+
+    emit_u8(out, 0x48u); emit_u8(out, 0x8Du); emit_u8(out, 0x35u);
+    const size_t lea_rsi_disp_pos = out.size();
+    emit_u32(out, 0u);
+
+    emit_u8(out, 0x48u); emit_u8(out, 0x8Du); emit_u8(out, 0x3Du);
+    const size_t lea_rdi_disp_pos = out.size();
+    emit_u32(out, 0u);
+
+    emit_u8(out, 0x48u); emit_u8(out, 0xC7u); emit_u8(out, 0xC1u);
+    emit_u32(out, stolen_count);
+
+    emit_u8(out, 0x48u); emit_u8(out, 0xBBu);
+    emit_u64(out, target_key);
+
+    const size_t loop_start = out.size();
+    emit_u8(out, 0x8Au); emit_u8(out, 0x06u);
+    emit_u8(out, 0x30u); emit_u8(out, 0xD8u);
+    emit_u8(out, 0x48u); emit_u8(out, 0xC1u); emit_u8(out, 0xCBu); emit_u8(out, 0x08u);
+    emit_u8(out, 0x88u); emit_u8(out, 0x07u);
+    emit_u8(out, 0x48u); emit_u8(out, 0xFFu); emit_u8(out, 0xC6u);
+    emit_u8(out, 0x48u); emit_u8(out, 0xFFu); emit_u8(out, 0xC7u);
+    emit_u8(out, 0x48u); emit_u8(out, 0xFFu); emit_u8(out, 0xC9u);
+    emit_u8(out, 0x75u);
+    const size_t loop_back_pos = out.size();
+    emit_u8(out, 0u);
+    const int64_t loop_end = static_cast<int64_t>(out.size());
+    const int64_t loop_back_rel = static_cast<int64_t>(loop_start) - loop_end;
+    out[loop_back_pos] = static_cast<uint8_t>(static_cast<int8_t>(loop_back_rel));
+
+    emit_u8(out, 0x5Bu);
+    emit_u8(out, 0x5Eu);
+    emit_u8(out, 0x5Fu);
+    emit_u8(out, 0x59u);
+    emit_u8(out, 0x58u);
+
+    emit_u8(out, 0xE9u);
+    const size_t jmp_disp_pos = out.size();
+    emit_u32(out, 0u);
+
+    const uint32_t lea_rsi_next_rva = thunk_rva + static_cast<uint32_t>(lea_rsi_disp_pos - start) + 4u;
+    write_u32_at(out, lea_rsi_disp_pos,
+                 static_cast<uint32_t>(static_cast<int32_t>(static_cast<int64_t>(dseal_entry_rva) - static_cast<int64_t>(lea_rsi_next_rva))));
+
+    const uint32_t lea_rdi_next_rva = thunk_rva + static_cast<uint32_t>(lea_rdi_disp_pos - start) + 4u;
+    write_u32_at(out, lea_rdi_disp_pos,
+                 static_cast<uint32_t>(static_cast<int32_t>(static_cast<int64_t>(scratch_rva) - static_cast<int64_t>(lea_rdi_next_rva))));
+
+    const uint32_t jmp_next_rva = thunk_rva + static_cast<uint32_t>(jmp_disp_pos - start) + 4u;
+    write_u32_at(out, jmp_disp_pos,
+                 static_cast<uint32_t>(static_cast<int32_t>(static_cast<int64_t>(scratch_rva) - static_cast<int64_t>(jmp_next_rva))));
+}
+
+}
+
+inline bool apply_deep_steal(pe_file::pe_image_t& pe,
+                              aux_block_t& aux,
+                              const uint8_t master[32],
+                              uint32_t exception_rva_fallback,
+                              uint32_t exception_size_fallback) {
+    using namespace deep_steal_detail;
+
+    aux.stolen_block_count = 0u;
+    aux.stolen_block_table_rva = 0u;
+    aux.stolen_block_table_size = 0u;
+
+    pe_file::section_t* text_sec = nullptr;
+    for (auto& s : pe.sections) {
+        if ((s.characteristics & IMAGE_SCN_MEM_EXECUTE) != 0u && s.virtual_size > 0u && !s.data.empty()) {
+            text_sec = &s;
+            break;
+        }
+    }
+    if (text_sec == nullptr) { return false; }
+
+    std::vector<pe_file::exception_entry_t> entries;
+    if (!pe.exceptions.empty()) {
+        entries = pe.exceptions;
+    } else if (exception_rva_fallback != 0u && exception_size_fallback >= 12u) {
+        const uint32_t count = exception_size_fallback / 12u;
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint8_t* ptr = pe.rva_ptr(exception_rva_fallback + i * 12u);
+            if (ptr == nullptr) { break; }
+            pe_file::exception_entry_t e{};
+            std::memcpy(&e.begin_address, ptr, 4);
+            std::memcpy(&e.end_address, ptr + 4, 4);
+            std::memcpy(&e.unwind_info, ptr + 8, 4);
+            entries.push_back(e);
+        }
+    }
+    if (entries.empty()) { return false; }
+
+    const uint32_t text_start = text_sec->virtual_address;
+    const uint32_t text_end = text_sec->virtual_address + text_sec->virtual_size;
+
+    struct chosen_t {
+        uint32_t func_rva;
+        uint32_t stolen_count;
+        uint8_t  bytes[16];
+    };
+    std::vector<chosen_t> chosen;
+    chosen.reserve(kMaxTargets);
+
+    for (const auto& e : entries) {
+        if (chosen.size() >= kMaxTargets) { break; }
+        if (e.begin_address < text_start || e.begin_address >= text_end) { continue; }
+        uint32_t prolog_size = 0u;
+        if (!decode_unwind_prolog_size(pe, e.unwind_info, prolog_size)) { continue; }
+        if (prolog_size < kMinStolenBytes || prolog_size > kMaxStolenBytes) { continue; }
+        const uint32_t span = (e.end_address > e.begin_address) ? (e.end_address - e.begin_address) : 0u;
+        if (span < prolog_size + kMinStolenBytes) { continue; }
+        const uint8_t* ip = pe.rva_ptr(e.begin_address);
+        if (ip == nullptr) { continue; }
+        if (!is_relocatable_prologue(ip, prolog_size)) { continue; }
+        bool dup = false;
+        for (const auto& c : chosen) {
+            if (c.func_rva == e.begin_address) { dup = true; break; }
+        }
+        if (dup) { continue; }
+        chosen_t c{};
+        c.func_rva = e.begin_address;
+        c.stolen_count = prolog_size;
+        std::memcpy(c.bytes, ip, prolog_size);
+        for (uint32_t fill = prolog_size; fill < 16u; ++fill) { c.bytes[fill] = 0xCCu; }
+        chosen.push_back(c);
+    }
+
+    if (chosen.empty()) { return false; }
+
+    const uint32_t target_count = static_cast<uint32_t>(chosen.size());
+    const uint32_t text_va = text_sec->virtual_address;
+
+    std::vector<uint8_t> dseal_data;
+    uint8_t iv[16];
+    derive_section_iv(master, 0u, iv);
+    dseal_data.insert(dseal_data.end(), iv, iv + 16);
+    const uint32_t dseal_entries_offset = static_cast<uint32_t>(dseal_data.size());
+    dseal_data.resize(dseal_entries_offset + target_count * sizeof(stolen_entry_t), 0u);
+
+    char dseal_name[8] = { '.','d','s','e','a','l',0,0 };
+    const uint32_t dseal_rva = pe_file::add_section(
+        pe, dseal_name,
+        IMAGE_SCN_MEM_READ | IMAGE_SCN_CNT_INITIALIZED_DATA,
+        dseal_data).virtual_address;
+
+    std::vector<uint64_t> target_keys(target_count, 0ull);
+    {
+        pe_file::section_t* dseal_sec_local = nullptr;
+        for (auto& s : pe.sections) {
+            if (s.virtual_address == dseal_rva) { dseal_sec_local = &s; break; }
+        }
+        if (dseal_sec_local == nullptr) { return false; }
+        for (uint32_t i = 0; i < target_count; ++i) {
+            target_keys[i] = deep_steal_detail::derive_target_key(master, chosen[i].func_rva, 0u);
+            stolen_entry_t entry{};
+            entry.func_rva = chosen[i].func_rva;
+            entry.stolen_byte_count = chosen[i].stolen_count;
+            uint64_t k = target_keys[i];
+            for (uint32_t b = 0; b < 16u; ++b) {
+                const uint8_t plain = chosen[i].bytes[b];
+                const uint8_t key_byte = static_cast<uint8_t>(k & 0xFFu);
+                entry.stolen_bytes[b] = static_cast<uint8_t>(plain ^ key_byte);
+                k = (k >> 8) | (k << 56);
+            }
+            uint8_t fnv_input[8 + 16];
+            std::memcpy(fnv_input, &entry.func_rva, 4);
+            std::memcpy(fnv_input + 4, &entry.stolen_byte_count, 4);
+            std::memcpy(fnv_input + 8, chosen[i].bytes, 16);
+            entry.fnv_check = fnv1a64(fnv_input, sizeof(fnv_input));
+            const size_t off = dseal_entries_offset + i * sizeof(stolen_entry_t);
+            std::memcpy(dseal_sec_local->data.data() + off, &entry, sizeof(stolen_entry_t));
+        }
+    }
+
+    const uint32_t thunk_block_size = kThunkSlotSize;
+    const uint32_t scratch_block_size = kScratchSlotSize;
+    const uint32_t thunk_section_size = target_count * (thunk_block_size + scratch_block_size);
+
+    std::vector<uint8_t> dthunk_data(thunk_section_size, 0xCCu);
+    char dthunk_name[8] = { '.','d','t','h','u','n','k',0 };
+    const uint32_t dthunk_rva = pe_file::add_section(
+        pe, dthunk_name,
+        IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE,
+        dthunk_data).virtual_address;
+
+    pe_file::section_t* dthunk_sec_local = nullptr;
+    pe_file::section_t* text_sec_local = nullptr;
+    uint32_t dseal_size_after_alloc = 0u;
+    for (auto& s : pe.sections) {
+        if (s.virtual_address == dthunk_rva) { dthunk_sec_local = &s; }
+        if (s.virtual_address == text_va) { text_sec_local = &s; }
+        if (s.virtual_address == dseal_rva) { dseal_size_after_alloc = static_cast<uint32_t>(s.data.size()); }
+    }
+    if (dthunk_sec_local == nullptr || text_sec_local == nullptr) { return false; }
+
+    for (uint32_t i = 0; i < target_count; ++i) {
+        const uint32_t thunk_rva = dthunk_rva + i * thunk_block_size;
+        const uint32_t scratch_rva = dthunk_rva + target_count * thunk_block_size + i * scratch_block_size;
+        const uint32_t entry_data_rva = dseal_rva + dseal_entries_offset + i * sizeof(stolen_entry_t) + 8u;
+
+        std::vector<uint8_t> thunk_code;
+        deep_steal_detail::build_thunk_code(thunk_code, thunk_rva, entry_data_rva, scratch_rva,
+                                            chosen[i].stolen_count, target_keys[i]);
+        if (thunk_code.size() > thunk_block_size) { return false; }
+        const uint32_t thunk_off = i * thunk_block_size;
+        for (size_t k = 0; k < thunk_code.size(); ++k) {
+            dthunk_sec_local->data[thunk_off + k] = thunk_code[k];
+        }
+        for (size_t k = thunk_code.size(); k < thunk_block_size; ++k) {
+            dthunk_sec_local->data[thunk_off + k] = 0xCCu;
+        }
+
+        const uint32_t scratch_off = target_count * thunk_block_size + i * scratch_block_size;
+        for (uint32_t k = 0; k < chosen[i].stolen_count; ++k) {
+            dthunk_sec_local->data[scratch_off + k] = 0xCCu;
+        }
+        const uint32_t tail_off = scratch_off + chosen[i].stolen_count;
+        dthunk_sec_local->data[tail_off + 0] = 0xE9u;
+        const uint32_t tail_next_rva = scratch_rva + chosen[i].stolen_count + 5u;
+        const uint32_t tail_target_rva = chosen[i].func_rva + chosen[i].stolen_count;
+        const int32_t tail_rel32 = static_cast<int32_t>(static_cast<int64_t>(tail_target_rva) - static_cast<int64_t>(tail_next_rva));
+        const uint32_t tail_rel32_u = static_cast<uint32_t>(tail_rel32);
+        dthunk_sec_local->data[tail_off + 1] = static_cast<uint8_t>(tail_rel32_u & 0xFFu);
+        dthunk_sec_local->data[tail_off + 2] = static_cast<uint8_t>((tail_rel32_u >> 8) & 0xFFu);
+        dthunk_sec_local->data[tail_off + 3] = static_cast<uint8_t>((tail_rel32_u >> 16) & 0xFFu);
+        dthunk_sec_local->data[tail_off + 4] = static_cast<uint8_t>((tail_rel32_u >> 24) & 0xFFu);
+
+        const uint32_t patch_off = chosen[i].func_rva - text_sec_local->virtual_address;
+        if (patch_off + chosen[i].stolen_count > text_sec_local->data.size()) { return false; }
+        text_sec_local->data[patch_off + 0] = 0xE9u;
+        const uint32_t patch_next_rva = chosen[i].func_rva + 5u;
+        const int32_t patch_rel32 = static_cast<int32_t>(static_cast<int64_t>(thunk_rva) - static_cast<int64_t>(patch_next_rva));
+        const uint32_t patch_rel32_u = static_cast<uint32_t>(patch_rel32);
+        text_sec_local->data[patch_off + 1] = static_cast<uint8_t>(patch_rel32_u & 0xFFu);
+        text_sec_local->data[patch_off + 2] = static_cast<uint8_t>((patch_rel32_u >> 8) & 0xFFu);
+        text_sec_local->data[patch_off + 3] = static_cast<uint8_t>((patch_rel32_u >> 16) & 0xFFu);
+        text_sec_local->data[patch_off + 4] = static_cast<uint8_t>((patch_rel32_u >> 24) & 0xFFu);
+        for (uint32_t k = 5u; k < chosen[i].stolen_count; ++k) {
+            text_sec_local->data[patch_off + k] = 0xCCu;
+        }
+    }
+
+    aux.stolen_block_count = target_count;
+    aux.stolen_block_table_rva = dseal_rva;
+    aux.stolen_block_table_size = dseal_size_after_alloc;
+    return true;
+}
+
 inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_options_t& opt) {
     transform_result_t result{};
 
@@ -2738,6 +3122,9 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
     }
     if (opt.llm_poison) {
         (void)llm_poison::inject_llm_poison(pe, rng_seed ^ 0x11AB1E1A7EC0FFEEull);
+    }
+    if (opt.deep_steal) {
+        (void)apply_deep_steal(pe, aux, master, original_exception_rva, original_exception_size);
     }
 
     std::vector<uint32_t> keep_intact_section_rvas;
@@ -2979,37 +3366,37 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
     return result;
 }
 
-inline bool apply_flatten_entropy(pe_file::pe_image_t& pe,
-                                   uint32_t packed_section_rva,
-                                   uint64_t seed,
-                                   bool verbose) {
+inline bool apply_flatten_entropy_band(pe_file::pe_image_t& pe,
+                                        uint32_t packed_section_rva,
+                                        uint64_t seed,
+                                        bool verbose,
+                                        uint32_t target_max,
+                                        uint32_t target_min,
+                                        uint32_t noise_entropy) {
     pe_file::section_t* psec = pe.section_from_rva(packed_section_rva);
     if (psec == nullptr || psec->data.empty()) {
         return false;
     }
     uint32_t cur_ent = pe_file::compute_section_entropy_fixed(psec->data.data(), psec->data.size());
     if (verbose) {
-        std::fprintf(stdout, "[+] flatten_entropy: start size=%zu ent=%u\n",
-                     psec->data.size(), cur_ent);
+        std::fprintf(stdout, "[+] flatten_entropy: start size=%zu ent=%u band=%u..%u\n",
+                     psec->data.size(), cur_ent, target_min, target_max);
     }
-    const uint32_t kTargetMax = 7100u;
-    const uint32_t kTargetMin = 6700u;
-    const uint32_t kNoiseEnt  = 6500u;
     size_t step = 2048;
     size_t iter = 0;
     size_t cap = psec->data.size() * 4u + 0x40000u;
-    while (cur_ent > kTargetMax && psec->data.size() < cap) {
+    while (cur_ent > target_max && psec->data.size() < cap) {
         size_t size_before = psec->data.size();
         uint32_t ent_before = cur_ent;
         std::vector<uint8_t> noise = noise_sections::generate_structured_noise(
-            step, kNoiseEnt, seed ^ (0xE17D0u + static_cast<uint64_t>(iter) * 0x9E37u));
+            step, noise_entropy, seed ^ (0xE17D0u + static_cast<uint64_t>(iter) * 0x9E37u));
         psec->data.insert(psec->data.end(), noise.begin(), noise.end());
         cur_ent = pe_file::compute_section_entropy_fixed(psec->data.data(), psec->data.size());
         if (verbose) {
             std::fprintf(stdout, "[+] flatten_entropy: iter=%zu step=%zu size=%zu ent=%u\n",
                          iter, step, psec->data.size(), cur_ent);
         }
-        if (cur_ent < kTargetMin) {
+        if (cur_ent < target_min) {
             psec->data.resize(size_before);
             cur_ent = ent_before;
             if (step > 64) { step /= 2; } else { break; }
@@ -3028,8 +3415,28 @@ inline bool apply_flatten_entropy(pe_file::pe_image_t& pe,
     return true;
 }
 
+inline bool apply_flatten_entropy(pe_file::pe_image_t& pe,
+                                   uint32_t packed_section_rva,
+                                   uint64_t seed,
+                                   bool verbose) {
+    return apply_flatten_entropy_band(pe, packed_section_rva, seed, verbose,
+                                       7100u, 6700u, 6500u);
+}
+
 inline bool apply_merge_sections(pe_file::pe_image_t& pe, uint64_t seed) {
     if (pe.sections.size() < 2) {
+        return false;
+    }
+    const auto& last = pe.sections[pe.sections.size() - 1];
+    const auto& prev = pe.sections[pe.sections.size() - 2];
+    if (section_skip_list::name_equals(last.name, ".dseal") ||
+        section_skip_list::name_equals(last.name, ".dthunk") ||
+        section_skip_list::name_equals(last.name, ".licbind") ||
+        section_skip_list::name_equals(last.name, ".feat") ||
+        section_skip_list::name_equals(prev.name, ".dseal") ||
+        section_skip_list::name_equals(prev.name, ".dthunk") ||
+        section_skip_list::name_equals(prev.name, ".licbind") ||
+        section_skip_list::name_equals(prev.name, ".feat")) {
         return false;
     }
     std::string new_name = pe_file::pick_plausible_section_name(seed ^ 0x9E3779B97F4A7C15ULL, pe);

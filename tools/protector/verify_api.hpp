@@ -99,6 +99,8 @@ inline probe_result_t probe_p03(const context_t& c) {
         std::memcpy(nm, s.name, 8);
         if (std::strcmp(nm, ".reloc") == 0 || std::strcmp(nm, ".rsrc") == 0) { continue; }
         if (std::strcmp(nm, ".gehi") == 0 || std::strcmp(nm, ".epheme") == 0 || std::strcmp(nm, ".rdiag") == 0) { continue; }
+        if (std::strcmp(nm, ".dseal") == 0 || std::strcmp(nm, ".dthunk") == 0) { continue; }
+        if (std::strcmp(nm, ".licbind") == 0 || std::strcmp(nm, ".feat") == 0) { continue; }
         if (s.raw_size != 0u) { ++nonzero; }
     }
     return { "P03", "original sections zeroed (raw_size==0)", nonzero == 0,
@@ -578,13 +580,105 @@ inline probe_result_t probe_p27(const context_t& c) {
              "no .rdiag section and no decoy signature found in any section" };
 }
 
+inline probe_result_t probe_p28(const context_t& c) {
+    if (!c.aux_found) {
+        return { "P28", "deep_steal stolen-bytes table populated", false, "no aux block" };
+    }
+    bool deep_declared = (c.aux.phase_flags & 0x8u) != 0u;
+    if (!deep_declared) {
+        return { "P28", "deep_steal stolen-bytes table populated (INFO: deep_steal not used)",
+                 true, "skipped" };
+    }
+    if (c.aux.stolen_block_count == 0u) {
+        return { "P28", "deep_steal stolen-bytes table populated", false,
+                 "stolen_block_count is zero (flag-only stub)" };
+    }
+    if (c.aux.stolen_block_table_rva == 0u) {
+        return { "P28", "deep_steal stolen-bytes table populated", false,
+                 "stolen_block_table_rva is zero" };
+    }
+    if (c.aux.stolen_block_table_size < 16u + sizeof(protector::deep_steal_detail::stolen_entry_t)) {
+        return { "P28", "deep_steal stolen-bytes table populated", false,
+                 "stolen_block_table_size below minimum (IV + at least one entry)" };
+    }
+    const pe_file::section_t* dseal = nullptr;
+    for (const auto& s : c.pe.sections) {
+        char nm[9] = { 0 };
+        std::memcpy(nm, s.name, 8);
+        if (std::strcmp(nm, ".dseal") == 0) { dseal = &s; break; }
+    }
+    if (dseal == nullptr) {
+        return { "P28", "deep_steal stolen-bytes table populated", false,
+                 ".dseal section not found by name" };
+    }
+    if (dseal->virtual_address != c.aux.stolen_block_table_rva) {
+        return { "P28", "deep_steal stolen-bytes table populated", false,
+                 ".dseal RVA does not match aux.stolen_block_table_rva" };
+    }
+    const pe_file::section_t* dthunk = nullptr;
+    for (const auto& s : c.pe.sections) {
+        char nm[9] = { 0 };
+        std::memcpy(nm, s.name, 8);
+        if (std::strcmp(nm, ".dthunk") == 0) { dthunk = &s; break; }
+    }
+    if (dthunk == nullptr) {
+        return { "P28", "deep_steal stolen-bytes table populated", false,
+                 ".dthunk section not found by name" };
+    }
+    if ((dthunk->characteristics & IMAGE_SCN_MEM_EXECUTE) == 0u) {
+        return { "P28", "deep_steal stolen-bytes table populated", false,
+                 ".dthunk section is not executable" };
+    }
+    uint32_t valid_entries = 0;
+    uint32_t valid_thunks = 0;
+    const size_t dseal_entries_off = 16u;
+    const size_t dseal_data_size = dseal->data.size();
+    if (dseal_data_size < dseal_entries_off) {
+        return { "P28", "deep_steal stolen-bytes table populated", false,
+                 ".dseal too small for IV header" };
+    }
+    const size_t entry_size = sizeof(protector::deep_steal_detail::stolen_entry_t);
+    const size_t avail = dseal_data_size - dseal_entries_off;
+    const uint32_t entries_in_dseal = static_cast<uint32_t>(avail / entry_size);
+    if (entries_in_dseal < c.aux.stolen_block_count) {
+        return { "P28", "deep_steal stolen-bytes table populated", false,
+                 ".dseal entry count below aux.stolen_block_count" };
+    }
+    const uint32_t thunk_slot = protector::deep_steal_detail::kThunkSlotSize;
+    for (uint32_t i = 0; i < c.aux.stolen_block_count; ++i) {
+        protector::deep_steal_detail::stolen_entry_t entry{};
+        const size_t off = dseal_entries_off + i * entry_size;
+        std::memcpy(&entry, dseal->data.data() + off, entry_size);
+        if (entry.func_rva == 0u) { continue; }
+        if (entry.stolen_byte_count < 5u || entry.stolen_byte_count > 16u) { continue; }
+        const pe_file::section_t* tgt_sec = c.pe.section_from_rva(entry.func_rva);
+        if (tgt_sec == nullptr) { continue; }
+        if ((tgt_sec->characteristics & IMAGE_SCN_MEM_EXECUTE) == 0u) { continue; }
+        ++valid_entries;
+        const size_t thunk_off = static_cast<size_t>(i) * static_cast<size_t>(thunk_slot);
+        if (thunk_off + 5u > dthunk->data.size()) { continue; }
+        const uint8_t* th = dthunk->data.data() + thunk_off;
+        if (th[0] == 0x50u && th[1] == 0x51u && th[2] == 0x57u && th[3] == 0x56u && th[4] == 0x53u) {
+            ++valid_thunks;
+        }
+    }
+    bool ok = (valid_entries > 0u) && (valid_thunks == valid_entries);
+    char buf[224];
+    std::snprintf(buf, sizeof(buf),
+                  "stolen_block_count=%u dseal_size=%u dthunk_size=%u valid_entries=%u valid_thunks=%u",
+                  c.aux.stolen_block_count, c.aux.stolen_block_table_size,
+                  static_cast<uint32_t>(dthunk->data.size()), valid_entries, valid_thunks);
+    return { "P28", "deep_steal real transform: dseal entries valid + dthunk prologue magic match", ok, buf };
+}
+
 inline verify_report_t run_probes(const context_t& c) {
     probe_result_t (*probes[])(const context_t&) = {
         probe_p01, probe_p02, probe_p03, probe_p04, probe_p05,
         probe_p06, probe_p07, probe_p08, probe_p09, probe_p10,
         probe_p11, probe_p12, probe_p13,
         probe_p14, probe_p15, probe_p16, probe_p17, probe_p18, probe_p19, probe_p20,
-        probe_p21, probe_p22, probe_p23, probe_p24, probe_p25, probe_p26, probe_p27
+        probe_p21, probe_p22, probe_p23, probe_p24, probe_p25, probe_p26, probe_p27,
+        probe_p28
     };
     verify_report_t rep;
     for (auto fn : probes) {

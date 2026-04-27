@@ -702,7 +702,7 @@ inline bool guard()
             uint64_t activation_completed_at = standalone_license::activation_completed_at();
             if (activation_completed_at != 0 && !standalone_license::is_arc_loaded())
             {
-                constexpr uint64_t kArcRequiredGraceMs = 60000;
+                constexpr uint64_t kArcRequiredGraceMs = 10000;
                 uint64_t now_ms = guard_now_ms();
                 if ((now_ms - activation_completed_at) > kArcRequiredGraceMs)
                 {

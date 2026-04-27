@@ -4,6 +4,7 @@ const crypto = require('crypto');
 
 let cachedPrivateKey = null;
 let cachedNextPrivateKey = null;
+let s_loggedPubFp = false;
 
 
 function getSigningPrivateKey() {
@@ -21,6 +22,19 @@ function getSigningPrivateKey() {
         format: 'der',
         type: 'pkcs8',
     });
+
+    if (!s_loggedPubFp) {
+        try {
+            const pubSpkiHex = crypto.createPublicKey(cachedPrivateKey)
+                .export({ format: 'der', type: 'spki' })
+                .toString('hex');
+            const fpShort = pubSpkiHex.slice(-16);
+            console.log(`[signing] loaded ED25519 private key, derived public SPKI(hex)=${pubSpkiHex} fp_tail=${fpShort} src_b64_tail=${b64.slice(-12)} src_b64_len=${b64.length}`);
+            s_loggedPubFp = true;
+        } catch (err) {
+            console.warn('[signing] failed to log pub fingerprint:', err && err.message ? err.message : err);
+        }
+    }
 
     return cachedPrivateKey;
 }
@@ -57,8 +71,14 @@ function sortObjectKeys(obj) {
 
 function signPayload(payloadObj) {
     const canonical = JSON.stringify(sortObjectKeys(payloadObj));
-    return crypto.sign(null, Buffer.from(canonical, 'utf8'), getSigningPrivateKey())
+    const sigHex = crypto.sign(null, Buffer.from(canonical, 'utf8'), getSigningPrivateKey())
         .toString('hex');
+    if (process.env.AIDA_SIGN_DEBUG === '1') {
+        const canonHash = crypto.createHash('sha256').update(canonical, 'utf8').digest('hex');
+        const keys = Object.keys(sortObjectKeys(payloadObj)).join(',');
+        console.log(`[signing] signPayload keys=[${keys}] canonical_len=${canonical.length} canonical_sha256=${canonHash} sig_tail=${sigHex.slice(-16)}`);
+    }
+    return sigHex;
 }
 
 

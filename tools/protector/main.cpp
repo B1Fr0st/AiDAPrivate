@@ -52,6 +52,7 @@ struct config_t {
     bool verbose = false;
     bool seed_provided = false;
     bool watermark_provided = false;
+    bool target_arc = false;
     uint64_t seed = 0;
     uint32_t tamper_response_level = 0;
     uint8_t  license_hash[16] = {0};
@@ -95,6 +96,10 @@ static void print_usage(std::FILE* out) {
         "  --embed-watermark           Embed watermark identifier in PE header\n"
         "  --bind-machine              Bind decryption key to current CPUID\n"
         "  --tamper-level <0..3>       Tamper response level for orchestrator\n"
+        "\n"
+        "Targets:\n"
+        "  --target-arc                ARC mode (aida_core.dll): forces deep-steal + opaque-predicates,\n"
+        "                              tighter flatten band, tamper-level 4. Validates input is aida_core.dll.\n"
         "\n"
         "Control:\n"
         "  --seed <u64>                Deterministic seed for RNG\n"
@@ -262,6 +267,8 @@ inline config_t parse_args(int argc, char** argv) {
             cfg.embed_watermark = true;
         } else if (arg == "--bind-machine") {
             cfg.bind_machine = true;
+        } else if (arg == "--target-arc") {
+            cfg.target_arc = true;
         } else if (arg == "--tamper-level") {
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "Error: --tamper-level requires a value\n");
@@ -281,6 +288,12 @@ inline config_t parse_args(int argc, char** argv) {
     }
     if (cfg.no_jit_explicit) { cfg.jit = false; }
     if (cfg.no_llm_poison_explicit) { cfg.llm_poison = false; }
+    if (cfg.target_arc) {
+        cfg.deep_steal = true;
+        cfg.opaque_predicates = true;
+        cfg.flatten_entropy = true;
+        cfg.tamper_response_level = 4u;
+    }
     if (cfg.input_path.empty() || cfg.output_path.empty()) {
         std::fprintf(stderr, "Error: --input and --output are required\n");
         print_usage(stderr);
@@ -341,6 +354,29 @@ inline int run(const config_t& cfg) {
         return 2;
     }
 
+    if (cfg.target_arc) {
+        std::string input_basename;
+        try {
+            std::filesystem::path p(cfg.input_path);
+            input_basename = p.filename().string();
+        } catch (const std::exception&) {
+            input_basename.clear();
+        }
+        std::string lower = input_basename;
+        for (auto& ch : lower) {
+            if (ch >= 'A' && ch <= 'Z') { ch = static_cast<char>(ch - 'A' + 'a'); }
+        }
+        bool name_ok = (lower == "aida_core.dll");
+        bool is_dll_flag = (pe.file_header.Characteristics & IMAGE_FILE_DLL) != 0;
+        if (!name_ok || !is_dll_flag) {
+            std::fprintf(stderr,
+                "[!] --target-arc rejected: input must be aida_core.dll (got '%s', is_dll=%d).\n"
+                "    The ARC protection profile is exclusive to the runtime core DLL.\n",
+                input_basename.c_str(), is_dll_flag ? 1 : 0);
+            return 2;
+        }
+    }
+
     {
         std::string protect_detail;
         if (detect_already_protected(pe, protect_detail)) {
@@ -398,6 +434,10 @@ inline int run(const config_t& cfg) {
                      cfg.input_path.c_str(),
                      static_cast<unsigned long long>(input_size),
                      is_dll ? "DLL" : "EXE");
+        if (cfg.target_arc) {
+            std::fprintf(stdout, "[+] Target profile: ARC (deep_steal+opaque_predicates forced; tamper_level=%u; flatten band 7000..7100)\n",
+                         cfg.tamper_response_level);
+        }
         std::fprintf(stdout, "[+] Sections: %zu\n", pe.sections.size());
         std::fprintf(stdout, "[+] Transforms enabled:%s%s%s%s%s%s%s%s\n",
                      cfg.strip_rich ? " strip_rich" : "",
@@ -532,8 +572,14 @@ inline int run(const config_t& cfg) {
     bool flatten_applied = false;
     bool merge_applied = false;
     if (cfg.flatten_entropy) {
-        flatten_applied = protector::apply_flatten_entropy(
-            pe, result.packed_section_rva, cfg.seed ^ 0xF1A7ULL, cfg.verbose);
+        if (cfg.target_arc) {
+            flatten_applied = protector::apply_flatten_entropy_band(
+                pe, result.packed_section_rva, cfg.seed ^ 0xF1A7ULL, cfg.verbose,
+                7100u, 7000u, 6900u);
+        } else {
+            flatten_applied = protector::apply_flatten_entropy(
+                pe, result.packed_section_rva, cfg.seed ^ 0xF1A7ULL, cfg.verbose);
+        }
     }
     if (cfg.merge_sections) {
         merge_applied = protector::apply_merge_sections(pe, cfg.seed);

@@ -131,6 +131,11 @@ typedef struct resource_fixup_s {
 #define HASH_VIRTUALPROTECT 0xed1006223abbbd53ULL
 #define HASH_LOADLIBRARYA   0x69d265fe6b1c110fULL
 #define HASH_GETPROCADDR    0x578960f1fc7fff25ULL
+#define HASH_NTQUERYINFOPROC 0x32ca9e4b50ffedaaULL
+#define HASH_NTGETCONTEXTTHREAD 0x60b61d0af197a950ULL
+#define HASH_NTQUERYSYSINFO 0xcac033026619e14aULL
+#define HASH_CHECKREMOTEDBG 0xe3549a1b1e8d41e1ULL
+#define HASH_SLEEP          0x503cbccd6a5cdea8ULL
 
 #define IMG_MAGIC           0x41504B44u
 #define MEM_COMMIT_RESERVE  0x3000u
@@ -728,7 +733,18 @@ static void rebuild_iat(uint8_t* image_base, const uint8_t master[32],
                 if (nl > 0) {
                     uint64_t dh = fnv1a64_a_upper((const char*)(pool_local + off), nl);
                     if (dh == e->dll_hash) {
-                        mod = r->LoadLibraryA((const char*)(pool_local + off));
+                        const char* dll_name = (const char*)(pool_local + off);
+                        char host_name[96];
+                        size_t host_len = 0;
+                        if (resolve_apiset_host(dll_name, nl, host_name, sizeof(host_name), &host_len)) {
+                            uint64_t host_hash = fnv1a64_a_upper(host_name, host_len);
+                            mod = find_module(host_hash);
+                            if (mod == 0) {
+                                mod = r->LoadLibraryA(host_name);
+                            }
+                        } else {
+                            mod = r->LoadLibraryA(dll_name);
+                        }
                         found = 1;
                         break;
                     }
@@ -889,6 +905,483 @@ static void apply_relocations(uint8_t* image_base, const resolved_t* r) {
     }
 }
 
+typedef long (__stdcall *nt_query_info_proc_t)(void*, uint32_t, void*, uint32_t, uint32_t*);
+typedef long (__stdcall *nt_get_context_thread_t)(void*, void*);
+typedef long (__stdcall *nt_query_sys_info_t)(uint32_t, void*, uint32_t, uint32_t*);
+typedef int (__stdcall *check_remote_debugger_t)(void*, int*);
+typedef void (__stdcall *sleep_t)(uint32_t);
+
+typedef struct env_thread_context_s {
+    uint64_t P1Home;
+    uint64_t P2Home;
+    uint64_t P3Home;
+    uint64_t P4Home;
+    uint64_t P5Home;
+    uint64_t P6Home;
+    uint32_t ContextFlags;
+    uint32_t MxCsr;
+    uint16_t SegCs;
+    uint16_t SegDs;
+    uint16_t SegEs;
+    uint16_t SegFs;
+    uint16_t SegGs;
+    uint16_t SegSs;
+    uint32_t EFlags;
+    uint64_t Dr0;
+    uint64_t Dr1;
+    uint64_t Dr2;
+    uint64_t Dr3;
+    uint64_t Dr6;
+    uint64_t Dr7;
+    uint64_t Rax;
+    uint64_t Rcx;
+    uint64_t Rdx;
+    uint64_t Rbx;
+    uint64_t Rsp;
+    uint64_t Rbp;
+    uint64_t Rsi;
+    uint64_t Rdi;
+    uint64_t R8;
+    uint64_t R9;
+    uint64_t R10;
+    uint64_t R11;
+    uint64_t R12;
+    uint64_t R13;
+    uint64_t R14;
+    uint64_t R15;
+    uint64_t Rip;
+    uint8_t  pad_fpu[512];
+    uint8_t  pad_vec[416];
+    uint64_t VectorControl;
+    uint64_t DebugControl;
+    uint64_t LastBranchToRip;
+    uint64_t LastBranchFromRip;
+    uint64_t LastExceptionToRip;
+    uint64_t LastExceptionFromRip;
+} env_thread_context_t;
+
+typedef struct sys_kernel_debugger_info_s {
+    uint8_t KernelDebuggerEnabled;
+    uint8_t KernelDebuggerNotPresent;
+} sys_kernel_debugger_info_t;
+
+typedef struct apiset_namespace_s {
+    uint32_t Version;
+    uint32_t Size;
+    uint32_t Flags;
+    uint32_t Count;
+    uint32_t EntryOffset;
+    uint32_t HashOffset;
+    uint32_t HashFactor;
+} apiset_namespace_t;
+
+typedef struct apiset_entry_s {
+    uint32_t Flags;
+    uint32_t NameOffset;
+    uint32_t NameLength;
+    uint32_t HashedLength;
+    uint32_t ValueOffset;
+    uint32_t ValueCount;
+} apiset_entry_t;
+
+typedef struct apiset_value_s {
+    uint32_t Flags;
+    uint32_t NameOffset;
+    uint32_t NameLength;
+    uint32_t ValueOffset;
+    uint32_t ValueLength;
+} apiset_value_t;
+
+#define ENV_CONTEXT_DEBUG_REGISTERS 0x00100010u
+#define ENV_PROCESS_DEBUG_PORT 7u
+#define ENV_PROCESS_DEBUG_OBJECT_HANDLE 30u
+#define ENV_PROCESS_DEBUG_FLAGS 31u
+#define ENV_SYSTEM_KERNEL_DEBUGGER_INFORMATION 23u
+#define ENV_KUSER_SHARED_DATA 0x7FFE0000ULL
+#define ENV_KUSER_KD_DEBUGGER_ENABLED 0x2D4u
+
+static uint8_t env_lower_byte(uint8_t c) {
+    if (c >= 'A' && c <= 'Z') {
+        return (uint8_t)(c + 32);
+    }
+    return c;
+}
+
+static int env_is_apiset_name(const char* name, size_t name_len) {
+    if (name_len < 8u) {
+        return 0;
+    }
+    uint8_t c0 = env_lower_byte((uint8_t)name[0]);
+    uint8_t c1 = env_lower_byte((uint8_t)name[1]);
+    uint8_t c2 = env_lower_byte((uint8_t)name[2]);
+    uint8_t c3 = (uint8_t)name[3];
+    uint8_t c4 = env_lower_byte((uint8_t)name[4]);
+    uint8_t c5 = env_lower_byte((uint8_t)name[5]);
+    uint8_t c6 = (uint8_t)name[6];
+    if (c0 == 'a' && c1 == 'p' && c2 == 'i' && c3 == '-'
+        && c4 == 'm' && c5 == 's' && c6 == '-') {
+        if (name_len >= 11u) {
+            uint8_t c7 = env_lower_byte((uint8_t)name[7]);
+            uint8_t c8 = env_lower_byte((uint8_t)name[8]);
+            uint8_t c9 = env_lower_byte((uint8_t)name[9]);
+            uint8_t c10 = (uint8_t)name[10];
+            if (c7 == 'w' && c8 == 'i' && c9 == 'n' && c10 == '-') {
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (c0 == 'e' && c1 == 'x' && c2 == 't' && c3 == '-'
+        && c4 == 'm' && c5 == 's' && c6 == '-') {
+        return 1;
+    }
+    return 0;
+}
+
+static int env_wide_eq_ascii_ci(const uint16_t* w, size_t w_chars, const char* a, size_t a_len) {
+    if (w_chars != a_len) {
+        return 0;
+    }
+    for (size_t i = 0; i < w_chars; ++i) {
+        uint16_t wc = w[i];
+        uint8_t ac = (uint8_t)a[i];
+        if (wc >= 'A' && wc <= 'Z') wc = (uint16_t)(wc + 32);
+        if (ac >= 'A' && ac <= 'Z') ac = (uint8_t)(ac + 32);
+        if ((uint8_t)(wc & 0xFFu) != ac) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static size_t env_strip_dll_suffix(const char* name, size_t name_len) {
+    if (name_len >= 4) {
+        const char* tail = name + (name_len - 4);
+        uint8_t a = (uint8_t)tail[0];
+        uint8_t b = (uint8_t)tail[1];
+        uint8_t c = (uint8_t)tail[2];
+        uint8_t d = (uint8_t)tail[3];
+        if (a >= 'A' && a <= 'Z') a = (uint8_t)(a + 32);
+        if (b >= 'A' && b <= 'Z') b = (uint8_t)(b + 32);
+        if (c >= 'A' && c <= 'Z') c = (uint8_t)(c + 32);
+        if (d >= 'A' && d <= 'Z') d = (uint8_t)(d + 32);
+        if (a == '.' && b == 'd' && c == 'l' && d == 'l') {
+            name_len -= 4;
+        }
+    }
+    return name_len;
+}
+
+static int resolve_apiset_host(const char* name, size_t name_len,
+                               char* out_host, size_t out_cap, size_t* out_len) {
+    if (name == 0 || out_host == 0 || out_cap < 2 || out_len == 0) {
+        return 0;
+    }
+    if (!env_is_apiset_name(name, name_len)) {
+        return 0;
+    }
+    peb_t* peb = get_peb();
+    uint8_t* peb_raw = (uint8_t*)peb;
+    void* api_set_map_ptr = 0;
+    mem_copy(&api_set_map_ptr, peb_raw + 0x68, sizeof(void*));
+    if (api_set_map_ptr == 0) {
+        return 0;
+    }
+    uint8_t* base = (uint8_t*)api_set_map_ptr;
+    apiset_namespace_t* ns = (apiset_namespace_t*)base;
+    if (ns->Version != 6u || ns->Count == 0u || ns->EntryOffset == 0u) {
+        return 0;
+    }
+    size_t basename_len = env_strip_dll_suffix(name, name_len);
+    if (basename_len == 0) {
+        return 0;
+    }
+    apiset_entry_t* entries = (apiset_entry_t*)(base + ns->EntryOffset);
+    for (uint32_t i = 0; i < ns->Count; ++i) {
+        apiset_entry_t* e = &entries[i];
+        if (e->NameOffset == 0u || e->NameLength == 0u) {
+            continue;
+        }
+        uint16_t* name_w = (uint16_t*)(base + e->NameOffset);
+        uint32_t hashed_chars = e->HashedLength / 2u;
+        if (hashed_chars == 0u || hashed_chars > basename_len) {
+            continue;
+        }
+        if (!env_wide_eq_ascii_ci(name_w, hashed_chars, name, hashed_chars)) {
+            continue;
+        }
+        if (basename_len > hashed_chars) {
+            int all_digits_or_dash = 1;
+            for (size_t k = hashed_chars; k < basename_len; ++k) {
+                uint8_t ch = (uint8_t)name[k];
+                if (!((ch >= '0' && ch <= '9') || ch == '-')) {
+                    all_digits_or_dash = 0;
+                    break;
+                }
+            }
+            if (!all_digits_or_dash) {
+                continue;
+            }
+        }
+        if (e->ValueCount == 0u || e->ValueOffset == 0u) {
+            return 0;
+        }
+        apiset_value_t* values = (apiset_value_t*)(base + e->ValueOffset);
+        apiset_value_t* default_value = &values[0];
+        for (uint32_t j = 0; j < e->ValueCount; ++j) {
+            if (values[j].NameLength == 0u) {
+                default_value = &values[j];
+                break;
+            }
+        }
+        if (default_value->ValueLength == 0u || default_value->ValueOffset == 0u) {
+            return 0;
+        }
+        uint16_t* host_w = (uint16_t*)(base + default_value->ValueOffset);
+        size_t host_chars = (size_t)(default_value->ValueLength / 2u);
+        if (host_chars + 1u > out_cap) {
+            return 0;
+        }
+        for (size_t k = 0; k < host_chars; ++k) {
+            out_host[k] = (char)(host_w[k] & 0xFFu);
+        }
+        out_host[host_chars] = 0;
+        *out_len = host_chars;
+        return 1;
+    }
+    return 0;
+}
+
+static int env_check_peb_being_debugged(void) {
+    peb_t* peb = get_peb();
+    uint8_t* p = (uint8_t*)peb;
+    return p[0x02] != 0;
+}
+
+static int env_check_nt_global_flag(void) {
+    peb_t* peb = get_peb();
+    uint8_t* p = (uint8_t*)peb;
+    uint32_t flags = 0;
+    mem_copy(&flags, p + 0xBC, 4);
+    return (flags & 0x70u) != 0u;
+}
+
+static int env_check_heap_flags(void) {
+    peb_t* peb = get_peb();
+    uint8_t* p = (uint8_t*)peb;
+    void* heap = 0;
+    mem_copy(&heap, p + 0x30, sizeof(void*));
+    if (heap == 0) {
+        return 0;
+    }
+    uint8_t* h = (uint8_t*)heap;
+    uint32_t flags = 0;
+    uint32_t force_flags = 0;
+    mem_copy(&flags, h + 0x70, 4);
+    mem_copy(&force_flags, h + 0x74, 4);
+    if (force_flags != 0u) {
+        return 1;
+    }
+    if ((flags & ~0x02u) != 0u) {
+        return 1;
+    }
+    return 0;
+}
+
+static int env_check_kuser_kd(void) {
+    uint8_t* k = (uint8_t*)(uintptr_t)ENV_KUSER_SHARED_DATA;
+    return k[ENV_KUSER_KD_DEBUGGER_ENABLED] != 0;
+}
+
+static int env_check_rdtsc_skew(void) {
+    int hostile_iterations = 0;
+    for (int loop = 0; loop < 5; ++loop) {
+        uint32_t aux0 = 0;
+        uint32_t aux1 = 0;
+        unsigned long long t0 = __rdtscp(&aux0);
+        volatile uint32_t spin = 0;
+        for (int s = 0; s < 100; ++s) {
+            spin += (uint32_t)s;
+        }
+        unsigned long long t1 = __rdtscp(&aux1);
+        (void)spin;
+        if (t1 < t0) {
+            ++hostile_iterations;
+            continue;
+        }
+        if ((t1 - t0) > 100000000ULL) {
+            ++hostile_iterations;
+        }
+    }
+    return (hostile_iterations >= 3) ? 1 : 0;
+}
+
+static int env_check_xcr0_consistency(void) {
+    int regs[4]; regs[0] = 0; regs[1] = 0; regs[2] = 0; regs[3] = 0;
+    __cpuid(regs, 1);
+    uint32_t feat_ecx = (uint32_t)regs[2];
+    uint32_t feat_edx = (uint32_t)regs[3];
+    if ((feat_edx & (1u << 26)) == 0u) {
+        return 1;
+    }
+    if ((feat_ecx & (1u << 27)) != 0u) {
+        unsigned long long xcr0 = _xgetbv(0);
+        if ((xcr0 & 0x3ull) != 0x3ull) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void env_decrypt_and_run_poison(const resolved_t* r) {
+    if (r == 0 || r->NtAllocateVirtualMemory == 0 || r->NtProtectVirtualMemory == 0
+        || r->NtFreeVirtualMemory == 0) {
+        return;
+    }
+    void* page = 0;
+    size_t page_sz = 4096;
+    long st = r->NtAllocateVirtualMemory((void*)(intptr_t)-1, &page, 0, &page_sz,
+                                         MEM_COMMIT_RESERVE, PAGE_RW);
+    if (st < 0 || page == 0) {
+        return;
+    }
+    uint8_t* buf = (uint8_t*)page;
+    for (uint32_t i = 0; i < 255u; ++i) {
+        buf[i] = 0x90u;
+    }
+    buf[255] = 0xC3u;
+    uint8_t poison_key[32];
+    uint8_t poison_iv[16];
+    uint64_t seed_a = (uint64_t)__rdtsc();
+    uint64_t seed_b = seed_a ^ 0xA5A5A5A5A5A5A5A5ULL;
+    for (int i = 0; i < 4; ++i) {
+        uint64_t kw = siphash_3u64(0xC0DEBABEDEADBEEFULL ^ (uint64_t)i, seed_a, seed_b);
+        mem_copy(poison_key + i * 8, &kw, 8);
+    }
+    for (int i = 0; i < 2; ++i) {
+        uint64_t iw = siphash_3u64(0xFEEDFACEDEADC0DEULL ^ (uint64_t)i, seed_b, seed_a);
+        mem_copy(poison_iv + i * 8, &iw, 8);
+    }
+    aes256_ctr_xor(poison_key, poison_iv, buf, 256);
+    aes256_ctr_xor(poison_key, poison_iv, buf, 256);
+    void* prot_addr = page;
+    size_t prot_sz = 256;
+    uint32_t old_prot = 0;
+    long prot_st = r->NtProtectVirtualMemory((void*)(intptr_t)-1, &prot_addr, &prot_sz, PAGE_EX_R, &old_prot);
+    if (prot_st >= 0) {
+        void (*fn)(void) = (void (*)(void))buf;
+        fn();
+    }
+    void* free_addr = page;
+    size_t free_sz = 0;
+    r->NtFreeVirtualMemory((void*)(intptr_t)-1, &free_addr, &free_sz, MEM_RELEASE);
+}
+
+static int runtime_environment_check(void) {
+    if (env_check_peb_being_debugged()) {
+        return 1;
+    }
+    if (env_check_nt_global_flag()) {
+        return 2;
+    }
+    if (env_check_heap_flags()) {
+        return 3;
+    }
+    void* ntdll_local = find_module(HASH_NTDLL);
+    void* kernel32_local = find_module(HASH_KERNEL32);
+    if (ntdll_local == 0 || kernel32_local == 0) {
+        return 0;
+    }
+    nt_query_info_proc_t pNtQueryInformationProcess =
+        (nt_query_info_proc_t)resolve_export(ntdll_local, HASH_NTQUERYINFOPROC, 0, 0, 0);
+    if (pNtQueryInformationProcess != 0) {
+        uint64_t debug_port = 0;
+        uint32_t ret_len = 0;
+        long st1 = pNtQueryInformationProcess((void*)(intptr_t)-1, ENV_PROCESS_DEBUG_PORT,
+                                              &debug_port, sizeof(debug_port), &ret_len);
+        if (st1 >= 0 && debug_port != 0u) {
+            return 4;
+        }
+        uint64_t debug_object = 0;
+        ret_len = 0;
+        long st2 = pNtQueryInformationProcess((void*)(intptr_t)-1, ENV_PROCESS_DEBUG_OBJECT_HANDLE,
+                                              &debug_object, sizeof(debug_object), &ret_len);
+        if (st2 >= 0 && debug_object != 0u) {
+            return 5;
+        }
+        uint32_t debug_flags = 0;
+        ret_len = 0;
+        long st3 = pNtQueryInformationProcess((void*)(intptr_t)-1, ENV_PROCESS_DEBUG_FLAGS,
+                                              &debug_flags, sizeof(debug_flags), &ret_len);
+        if (st3 >= 0 && debug_flags == 0u) {
+            return 6;
+        }
+    }
+    check_remote_debugger_t pCheckRemoteDebuggerPresent =
+        (check_remote_debugger_t)resolve_export(kernel32_local, HASH_CHECKREMOTEDBG, 0, 0, 0);
+    if (pCheckRemoteDebuggerPresent != 0) {
+        int present = 0;
+        if (pCheckRemoteDebuggerPresent((void*)(intptr_t)-1, &present) != 0) {
+            if (present != 0) {
+                return 7;
+            }
+        }
+    }
+    nt_get_context_thread_t pNtGetContextThread =
+        (nt_get_context_thread_t)resolve_export(ntdll_local, HASH_NTGETCONTEXTTHREAD, 0, 0, 0);
+    if (pNtGetContextThread != 0) {
+        __declspec(align(16)) env_thread_context_t ctx_local;
+        mem_set(&ctx_local, 0, sizeof(ctx_local));
+        ctx_local.ContextFlags = ENV_CONTEXT_DEBUG_REGISTERS;
+        long st_ctx = pNtGetContextThread((void*)(intptr_t)-2, &ctx_local);
+        if (st_ctx >= 0) {
+            uint64_t dr_or = ctx_local.Dr0 | ctx_local.Dr1 | ctx_local.Dr2 | ctx_local.Dr3;
+            if (dr_or != 0u) {
+                return 8;
+            }
+        }
+    }
+    if (env_check_kuser_kd()) {
+        return 9;
+    }
+    if (env_check_rdtsc_skew()) {
+        return 10;
+    }
+    if (env_check_xcr0_consistency()) {
+        return 11;
+    }
+    nt_query_sys_info_t pNtQuerySystemInformation =
+        (nt_query_sys_info_t)resolve_export(ntdll_local, HASH_NTQUERYSYSINFO, 0, 0, 0);
+    if (pNtQuerySystemInformation != 0) {
+        sys_kernel_debugger_info_t kd_info;
+        mem_set(&kd_info, 0, sizeof(kd_info));
+        uint32_t ret_len = 0;
+        long st_kd = pNtQuerySystemInformation(ENV_SYSTEM_KERNEL_DEBUGGER_INFORMATION,
+                                               &kd_info, sizeof(kd_info), &ret_len);
+        if (st_kd >= 0) {
+            if (kd_info.KernelDebuggerEnabled != 0u && kd_info.KernelDebuggerNotPresent == 0u) {
+                return 12;
+            }
+        }
+    }
+    return 0;
+}
+
+static void env_react_to_hostile(int reason, const resolved_t* r) {
+    (void)reason;
+    env_decrypt_and_run_poison(r);
+    if (r != 0 && r->kernel32 != 0) {
+        sleep_t pSleep = (sleep_t)resolve_export(r->kernel32, HASH_SLEEP, 0, 0, 0);
+        if (pSleep == 0 && r->kernelbase != 0) {
+            pSleep = (sleep_t)resolve_export(r->kernelbase, HASH_SLEEP, 0, 0, 0);
+        }
+        if (pSleep != 0) {
+            pSleep(30000u);
+        }
+    }
+    __fastfail(0xDEADC0DEu);
+}
+
 void __cdecl aida_unpack(void* image_base_arg) {
     uint8_t* image_base = (uint8_t*)image_base_arg;
     if (image_base == 0) {
@@ -897,6 +1390,11 @@ void __cdecl aida_unpack(void* image_base_arg) {
     resolved_t r;
     mem_set(&r, 0, sizeof(r));
     if (!resolve_all(&r)) {
+        for (;;) { }
+    }
+    int env_status = runtime_environment_check();
+    if (env_status != 0) {
+        env_react_to_hostile(env_status, &r);
         for (;;) { }
     }
     uint32_t packed_vsize = 0;

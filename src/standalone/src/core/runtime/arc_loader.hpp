@@ -13,7 +13,15 @@ namespace arc_loader
     {
         void*    base;
         size_t   image_size;
+        size_t   header_size;
+        void*    entry_point;
         bool     initialized;
+        bool     sealed;
+        unsigned long owning_pid;
+        uint64_t image_path_hash;
+        uint64_t loader_code_hash;
+        uint64_t binding_salt;
+        void*    auto_seal_timer;
     };
 
 
@@ -21,6 +29,12 @@ namespace arc_loader
 
 
     void* get_export(const loaded_module_t& mod, const char* export_name);
+
+
+    bool seal(loaded_module_t& mod);
+
+
+    bool verify_process_binding(const loaded_module_t& mod);
 
 
     void unload(loaded_module_t& mod);

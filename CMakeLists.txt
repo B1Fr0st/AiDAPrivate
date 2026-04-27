@@ -48,6 +48,7 @@ endif()
 
 option(AIDA_ENABLE_LTCG "Enable /GL + /LTCG on AiDA.dll and aida_core.dll (slower link, marginally faster runtime)" OFF)
 option(AIDA_FAST_LINK   "Use /DEBUG (default) instead of /DEBUG:FULL for faster linking" ON)
+option(AIDA_ARC_ENCRYPT_IMPORTS "Enable --encrypt-imports for ARC (requires api-set resolver in payload.c — W1c-payload)" OFF)
 
 set(DEPS_DIR "${CMAKE_SOURCE_DIR}/.deps")
 
@@ -946,6 +947,13 @@ if(WIN32)
     option(BUILD_ARC_DLL "Build the ARC (AiDA Runtime Core) DLL" ON)
 
     if(BUILD_ARC_DLL)
+        string(RANDOM LENGTH 16 ALPHABET "0123456789abcdef" AIDA_ARC_BUILD_SEED)
+        configure_file(
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/src/core/arc/arc_build_seed.hpp.in"
+            "${CMAKE_CURRENT_BINARY_DIR}/generated/arc_build_seed.hpp"
+            @ONLY
+        )
+
         set(ARC_SOURCES
             "${STANDALONE_ROOT}/core/arc/arc.cpp"
             driver/comm.cpp
@@ -961,6 +969,7 @@ if(WIN32)
         )
 
         target_include_directories(AiDA_ARC PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}/generated"
             "${STANDALONE_ROOT}/core/arc"
             "${STANDALONE_ROOT}/core"
             "${STANDALONE_ROOT}/core/ai"
@@ -1494,14 +1503,30 @@ if(BUILD_PROTECTOR)
     endif()
 
     if(TARGET AiDA_ARC)
-        add_custom_command(TARGET AiDA_ARC POST_BUILD
-            COMMAND $<TARGET_FILE:AiDAProtector>
-                --input "$<TARGET_FILE:AiDA_ARC>"
-                --output "$<TARGET_FILE:AiDA_ARC>"
-                --all --no-encrypt-imports --tamper-level 2 --deep-steal --jit --no-llm-poison --verbose
-            COMMENT "Protecting aida_core.dll..."
-            VERBATIM
-        )
+        string(RANDOM LENGTH 32 ALPHABET "0123456789abcdef" AIDA_ARC_WATERMARK)
+        if(AIDA_ARC_ENCRYPT_IMPORTS)
+            add_custom_command(TARGET AiDA_ARC POST_BUILD
+                COMMAND $<TARGET_FILE:AiDAProtector>
+                    --input "$<TARGET_FILE:AiDA_ARC>"
+                    --output "$<TARGET_FILE:AiDA_ARC>"
+                    --all --tamper-level 2 --deep-steal --jit --no-llm-poison
+                    --target-arc --watermark "${AIDA_ARC_WATERMARK}" --embed-watermark
+                    --verbose
+                COMMENT "Protecting aida_core.dll (target-arc, encrypt-imports ON)..."
+                VERBATIM
+            )
+        else()
+            add_custom_command(TARGET AiDA_ARC POST_BUILD
+                COMMAND $<TARGET_FILE:AiDAProtector>
+                    --input "$<TARGET_FILE:AiDA_ARC>"
+                    --output "$<TARGET_FILE:AiDA_ARC>"
+                    --all --no-encrypt-imports --tamper-level 2 --deep-steal --jit --no-llm-poison
+                    --target-arc --watermark "${AIDA_ARC_WATERMARK}" --embed-watermark
+                    --verbose
+                COMMENT "Protecting aida_core.dll (target-arc, encrypt-imports OFF)..."
+                VERBATIM
+            )
+        endif()
         add_dependencies(AiDA_ARC AiDAProtector)
     endif()
 

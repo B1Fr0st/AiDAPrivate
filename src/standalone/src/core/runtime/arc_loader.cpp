@@ -4,12 +4,132 @@
 #include "arc_loader.hpp"
 
 #include <windows.h>
+#include <bcrypt.h>
 #include <cstring>
 #include <algorithm>
+
+#pragma comment(lib, "bcrypt.lib")
 
 namespace
 {
     std::string g_last_error;
+
+    inline uint64_t splitmix64_step(uint64_t& s)
+    {
+        uint64_t z = (s += 0x9E3779B97F4A7C15ULL);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        return z ^ (z >> 31);
+    }
+
+    inline uint64_t rotl64(uint64_t x, int b)
+    {
+        return (x << b) | (x >> (64 - b));
+    }
+
+    inline uint64_t read_u64_le(const uint8_t* p)
+    {
+        uint64_t r = 0;
+        for (int i = 0; i < 8; ++i)
+            r |= static_cast<uint64_t>(p[i]) << (i * 8);
+        return r;
+    }
+
+    uint64_t siphash_2_4(const uint8_t* data, size_t len, uint64_t k0, uint64_t k1)
+    {
+        uint64_t v0 = k0 ^ 0x736F6D6570736575ULL;
+        uint64_t v1 = k1 ^ 0x646F72616E646F6DULL;
+        uint64_t v2 = k0 ^ 0x6C7967656E657261ULL;
+        uint64_t v3 = k1 ^ 0x7465646279746573ULL;
+
+        const size_t blocks = len / 8u;
+        for (size_t i = 0; i < blocks; ++i) {
+            uint64_t m = read_u64_le(data + i * 8u);
+            v3 ^= m;
+            for (int r = 0; r < 2; ++r) {
+                v0 += v1; v1 = rotl64(v1, 13); v1 ^= v0; v0 = rotl64(v0, 32);
+                v2 += v3; v3 = rotl64(v3, 16); v3 ^= v2;
+                v0 += v3; v3 = rotl64(v3, 21); v3 ^= v0;
+                v2 += v1; v1 = rotl64(v1, 17); v1 ^= v2; v2 = rotl64(v2, 32);
+            }
+            v0 ^= m;
+        }
+
+        uint64_t b = static_cast<uint64_t>(len & 0xFFu) << 56;
+        const uint8_t* tail = data + blocks * 8u;
+        const size_t tail_len = len & 7u;
+        for (size_t i = 0; i < tail_len; ++i)
+            b |= static_cast<uint64_t>(tail[i]) << (i * 8);
+
+        v3 ^= b;
+        for (int r = 0; r < 2; ++r) {
+            v0 += v1; v1 = rotl64(v1, 13); v1 ^= v0; v0 = rotl64(v0, 32);
+            v2 += v3; v3 = rotl64(v3, 16); v3 ^= v2;
+            v0 += v3; v3 = rotl64(v3, 21); v3 ^= v0;
+            v2 += v1; v1 = rotl64(v1, 17); v1 ^= v2; v2 = rotl64(v2, 32);
+        }
+        v0 ^= b;
+
+        v2 ^= 0xFFu;
+        for (int r = 0; r < 4; ++r) {
+            v0 += v1; v1 = rotl64(v1, 13); v1 ^= v0; v0 = rotl64(v0, 32);
+            v2 += v3; v3 = rotl64(v3, 16); v3 ^= v2;
+            v0 += v3; v3 = rotl64(v3, 21); v3 ^= v0;
+            v2 += v1; v1 = rotl64(v1, 17); v1 ^= v2; v2 = rotl64(v2, 32);
+        }
+        return v0 ^ v1 ^ v2 ^ v3;
+    }
+
+    void derive_siphash_key(uint64_t salt, uint64_t& k0, uint64_t& k1)
+    {
+        uint64_t s = salt;
+        k0 = splitmix64_step(s);
+        k1 = splitmix64_step(s);
+    }
+
+    bool generate_random_u64(uint64_t& out)
+    {
+        out = 0;
+        NTSTATUS st = BCryptGenRandom(nullptr,
+                                      reinterpret_cast<PUCHAR>(&out),
+                                      static_cast<ULONG>(sizeof(out)),
+                                      BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        return st == 0 && out != 0;
+    }
+
+    bool hash_image_path(uint64_t k0, uint64_t k1, uint64_t& out_hash)
+    {
+        out_hash = 0;
+        wchar_t buf[1024];
+        DWORD len = static_cast<DWORD>(sizeof(buf) / sizeof(buf[0]));
+        if (!QueryFullProcessImageNameW(GetCurrentProcess(), 0, buf, &len) || len == 0)
+            return false;
+        const size_t byte_count = static_cast<size_t>(len) * sizeof(wchar_t);
+        out_hash = siphash_2_4(reinterpret_cast<const uint8_t*>(buf), byte_count, k0, k1);
+        return true;
+    }
+
+    bool hash_loader_code(uint64_t k0, uint64_t k1, const void* loader_addr, uint64_t& out_hash)
+    {
+        out_hash = 0;
+        const uint8_t* code = reinterpret_cast<const uint8_t*>(loader_addr);
+        if (!code)
+            return false;
+        constexpr size_t kSampleBytes = 4096;
+        uint8_t snapshot[kSampleBytes];
+        bool ok = false;
+        __try {
+            std::memcpy(snapshot, code, kSampleBytes);
+            ok = true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            ok = false;
+        }
+        if (!ok)
+            return false;
+        out_hash = siphash_2_4(snapshot, kSampleBytes, k0, k1);
+        return true;
+    }
 
     void set_error(const char* msg)
     {
@@ -97,6 +217,29 @@ namespace
     }
 
 
+    bool find_reloc_by_section(const IMAGE_NT_HEADERS* nt,
+                                uint32_t& out_rva,
+                                uint32_t& out_size)
+    {
+        const auto* sec = IMAGE_FIRST_SECTION(nt);
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+            char nm[9];
+            std::memcpy(nm, sec[i].Name, 8);
+            nm[8] = '\0';
+            if (std::strcmp(nm, ".reloc") == 0) {
+                uint32_t s = sec[i].Misc.VirtualSize;
+                if (s == 0)
+                    s = sec[i].SizeOfRawData;
+                if (s == 0)
+                    return false;
+                out_rva = sec[i].VirtualAddress;
+                out_size = s;
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool process_relocations(uint8_t* image_base, const IMAGE_NT_HEADERS* nt)
     {
         auto delta = reinterpret_cast<uintptr_t>(image_base) -
@@ -104,19 +247,19 @@ namespace
         if (delta == 0)
             return true;
 
-        const auto& reloc_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-        if (reloc_dir.VirtualAddress == 0 || reloc_dir.Size == 0) {
-            if (delta != 0) {
-                set_error("Image needs relocation but has no relocation directory.");
+        uint32_t reloc_rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+        uint32_t reloc_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+        if (reloc_rva == 0 || reloc_size == 0) {
+            if (!find_reloc_by_section(nt, reloc_rva, reloc_size)) {
+                set_error("Image needs relocation but has no relocation directory or .reloc section.");
                 return false;
             }
-            return true;
         }
 
         auto* reloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>(
-            image_base + reloc_dir.VirtualAddress);
+            image_base + reloc_rva);
         auto* reloc_end = reinterpret_cast<IMAGE_BASE_RELOCATION*>(
-            image_base + reloc_dir.VirtualAddress + reloc_dir.Size);
+            image_base + reloc_rva + reloc_size);
 
         while (reloc < reloc_end && reloc->SizeOfBlock >= sizeof(IMAGE_BASE_RELOCATION)) {
             uint32_t count = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(uint16_t);
@@ -161,12 +304,21 @@ namespace
 
         static const char* allowed[] = {
             "kernel32.dll",
+            "kernelbase.dll",
             "ntdll.dll",
             "bcrypt.dll",
             "advapi32.dll",
             "ws2_32.dll",
             "iphlpapi.dll",
+            "winhttp.dll",
+            "crypt32.dll",
+            "secur32.dll",
             "msvcrt.dll",
+            "msvcp140.dll",
+            "msvcp140_1.dll",
+            "msvcp140_2.dll",
+            "msvcp140_atomic_wait.dll",
+            "msvcp140_codecvt_ids.dll",
             "vcruntime140.dll",
             "vcruntime140_1.dll",
             "ucrtbase.dll",
@@ -181,6 +333,10 @@ namespace
             "api-ms-win-crt-convert-l1-1-0.dll",
             "api-ms-win-crt-utility-l1-1-0.dll",
             "api-ms-win-crt-filesystem-l1-1-0.dll",
+            "api-ms-win-crt-multibyte-l1-1-0.dll",
+            "api-ms-win-crt-conio-l1-1-0.dll",
+            "api-ms-win-crt-process-l1-1-0.dll",
+            "api-ms-win-crt-private-l1-1-0.dll",
         };
 
         for (const auto* a : allowed) {
@@ -276,23 +432,68 @@ namespace
     }
 
 
-    void process_tls(uint8_t* image_base, const IMAGE_NT_HEADERS* nt)
+    bool process_tls(uint8_t* image_base, const IMAGE_NT_HEADERS* nt)
     {
         const auto& tls_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
         if (tls_dir.VirtualAddress == 0 || tls_dir.Size == 0)
-            return;
+            return true;
 
         auto* tls = reinterpret_cast<const IMAGE_TLS_DIRECTORY*>(
             image_base + tls_dir.VirtualAddress);
         auto** callback = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(tls->AddressOfCallBacks);
         if (!callback)
-            return;
+            return true;
 
         for (; *callback; ++callback) {
-            (*callback)(image_base, DLL_PROCESS_ATTACH, nullptr);
+            __try {
+                (*callback)(image_base, DLL_PROCESS_ATTACH, nullptr);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                set_error("TLS callback threw an exception.");
+                return false;
+            }
         }
+        return true;
     }
 
+
+    void install_guard_pages(uint8_t* image_base, const IMAGE_NT_HEADERS* nt)
+    {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        const size_t page_size = static_cast<size_t>(si.dwPageSize);
+        if (page_size == 0)
+            return;
+
+        const auto* sec = IMAGE_FIRST_SECTION(nt);
+        const size_t image_size = nt->OptionalHeader.SizeOfImage;
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+            uint32_t va = sec[i].VirtualAddress;
+            if (va < 2u * page_size)
+                continue;
+
+            size_t sec_size = sec[i].Misc.VirtualSize;
+            if (sec_size == 0)
+                sec_size = sec[i].SizeOfRawData;
+            if (sec_size == 0)
+                continue;
+
+            uint8_t* leading = image_base + va - page_size;
+            if (VirtualFree(leading, page_size, MEM_DECOMMIT)) {
+                VirtualAlloc(leading, page_size, MEM_COMMIT, PAGE_NOACCESS);
+            }
+
+            const size_t aligned_size = (sec_size + (page_size - 1u)) & ~(page_size - 1u);
+            uint64_t trailing_off = static_cast<uint64_t>(va) + aligned_size;
+            if (trailing_off + page_size > image_size)
+                continue;
+
+            uint8_t* trailing = image_base + trailing_off;
+            if (VirtualFree(trailing, page_size, MEM_DECOMMIT)) {
+                VirtualAlloc(trailing, page_size, MEM_COMMIT, PAGE_NOACCESS);
+            }
+        }
+    }
 
     void* find_export(uint8_t* image_base, const IMAGE_NT_HEADERS* nt, const char* name)
     {
@@ -348,15 +549,21 @@ namespace arc_loader
         auto* nt  = reinterpret_cast<const IMAGE_NT_HEADERS*>(pe_buffer + dos->e_lfanew);
 
         size_t image_size = nt->OptionalHeader.SizeOfImage;
-        if (image_size == 0 || image_size > 16 * 1024 * 1024) {
-            set_error("Image size is invalid (0 or > 16MB).");
+        size_t header_size_capture = nt->OptionalHeader.SizeOfHeaders;
+        if (image_size == 0 || image_size > 64 * 1024 * 1024) {
+            set_error("Image size is invalid (0 or > 64MB).");
             return result;
         }
 
-
         auto* image_base = static_cast<uint8_t*>(
-            VirtualAlloc(nullptr, image_size,
+            VirtualAlloc(reinterpret_cast<LPVOID>(nt->OptionalHeader.ImageBase),
+                         image_size,
                          MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!image_base) {
+            image_base = static_cast<uint8_t*>(
+                VirtualAlloc(nullptr, image_size,
+                             MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        }
         if (!image_base) {
             set_error("VirtualAlloc failed for image.");
             return result;
@@ -387,12 +594,14 @@ namespace arc_loader
 
         finalize_sections(image_base, mapped_nt);
 
+        install_guard_pages(image_base, mapped_nt);
 
-        process_tls(image_base, mapped_nt);
-
+        if (!process_tls(image_base, mapped_nt)) {
+            VirtualFree(image_base, 0, MEM_RELEASE);
+            return result;
+        }
 
         SecureZeroMemory(pe_buffer, pe_size);
-
 
         using DllMain_t = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
         auto entry_point = reinterpret_cast<DllMain_t>(
@@ -417,9 +626,42 @@ namespace arc_loader
             return result;
         }
 
-        result.base        = image_base;
-        result.image_size  = image_size;
-        result.initialized = true;
+        uint64_t binding_salt = 0;
+        if (!generate_random_u64(binding_salt)) {
+            set_error("BCryptGenRandom failed for binding salt.");
+            VirtualFree(image_base, 0, MEM_RELEASE);
+            return result;
+        }
+
+        uint64_t k0 = 0, k1 = 0;
+        derive_siphash_key(binding_salt, k0, k1);
+
+        uint64_t image_path_hash = 0;
+        if (!hash_image_path(k0, k1, image_path_hash)) {
+            set_error("QueryFullProcessImageNameW failed for binding hash.");
+            VirtualFree(image_base, 0, MEM_RELEASE);
+            return result;
+        }
+
+        uint64_t loader_code_hash = 0;
+        if (!hash_loader_code(k0, k1, reinterpret_cast<const void*>(&load),
+                              loader_code_hash)) {
+            set_error("Loader code hash sampling faulted.");
+            VirtualFree(image_base, 0, MEM_RELEASE);
+            return result;
+        }
+
+        result.base             = image_base;
+        result.image_size       = image_size;
+        result.header_size      = header_size_capture;
+        result.entry_point      = image_base + mapped_nt->OptionalHeader.AddressOfEntryPoint;
+        result.initialized      = true;
+        result.sealed           = false;
+        result.owning_pid       = GetCurrentProcessId();
+        result.image_path_hash  = image_path_hash;
+        result.loader_code_hash = loader_code_hash;
+        result.binding_salt     = binding_salt;
+        result.auto_seal_timer  = nullptr;
         return result;
     }
 
@@ -443,6 +685,98 @@ namespace arc_loader
         return addr;
     }
 
+    bool seal(loaded_module_t& mod)
+    {
+        g_last_error.clear();
+
+        if (!mod.base || !mod.initialized) {
+            set_error("seal() called on uninitialized module.");
+            return false;
+        }
+
+        if (mod.sealed)
+            return true;
+
+        if (mod.auto_seal_timer != nullptr) {
+            DeleteTimerQueueTimer(NULL,
+                                  reinterpret_cast<HANDLE>(mod.auto_seal_timer),
+                                  NULL);
+            mod.auto_seal_timer = nullptr;
+        }
+
+        const size_t header_size = mod.header_size;
+        if (header_size == 0) {
+            set_error("seal() module has zero header_size.");
+            return false;
+        }
+
+        DWORD old_protect = 0;
+        if (!VirtualProtect(mod.base, header_size, PAGE_READWRITE, &old_protect)) {
+            set_error("VirtualProtect(PAGE_READWRITE) failed for header scrub.");
+            return false;
+        }
+
+        auto* image_base = static_cast<uint8_t*>(mod.base);
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image_base);
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE &&
+            static_cast<size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS) <= header_size)
+        {
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(image_base + dos->e_lfanew);
+            if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                auto* sec = IMAGE_FIRST_SECTION(nt);
+                const WORD num = nt->FileHeader.NumberOfSections;
+                const uint8_t* hdr_end = image_base + header_size;
+                if (reinterpret_cast<uint8_t*>(sec + num) <= hdr_end) {
+                    for (WORD i = 0; i < num; ++i) {
+                        uint8_t rnd[8] = {0};
+                        BCryptGenRandom(nullptr, rnd, sizeof(rnd),
+                                        BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+                        std::memcpy(sec[i].Name, rnd, 8);
+                        sec[i].Characteristics = IMAGE_SCN_MEM_READ;
+                    }
+                }
+            }
+        }
+
+        SecureZeroMemory(mod.base, header_size);
+
+        DWORD discard = 0;
+        if (!VirtualProtect(mod.base, header_size, PAGE_NOACCESS, &discard)) {
+            set_error("VirtualProtect(PAGE_NOACCESS) failed after header scrub.");
+            return false;
+        }
+
+        mod.sealed = true;
+        return true;
+    }
+
+    bool verify_process_binding(const loaded_module_t& mod)
+    {
+        if (!mod.initialized || !mod.base)
+            return false;
+
+        if (GetCurrentProcessId() != mod.owning_pid)
+            return false;
+
+        uint64_t k0 = 0, k1 = 0;
+        derive_siphash_key(mod.binding_salt, k0, k1);
+
+        uint64_t actual_path = 0;
+        if (!hash_image_path(k0, k1, actual_path))
+            return false;
+        if (actual_path != mod.image_path_hash)
+            return false;
+
+        uint64_t actual_loader = 0;
+        if (!hash_loader_code(k0, k1, reinterpret_cast<const void*>(&load),
+                              actual_loader))
+            return false;
+        if (actual_loader != mod.loader_code_hash)
+            return false;
+
+        return true;
+    }
+
     void unload(loaded_module_t& mod)
     {
         g_last_error.clear();
@@ -452,17 +786,19 @@ namespace arc_loader
 
         auto* image_base = static_cast<uint8_t*>(mod.base);
 
+        if (mod.auto_seal_timer != nullptr) {
+            DeleteTimerQueueTimer(NULL,
+                                  reinterpret_cast<HANDLE>(mod.auto_seal_timer),
+                                  NULL);
+            mod.auto_seal_timer = nullptr;
+        }
 
-        if (mod.initialized) {
-            auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image_base);
-            auto* nt  = reinterpret_cast<const IMAGE_NT_HEADERS*>(image_base + dos->e_lfanew);
-
+        if (mod.initialized && !mod.sealed && mod.entry_point != nullptr) {
             using DllMain_t = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
-            auto entry_point = reinterpret_cast<DllMain_t>(
-                image_base + nt->OptionalHeader.AddressOfEntryPoint);
+            auto entry = reinterpret_cast<DllMain_t>(mod.entry_point);
 
             __try {
-                entry_point(
+                entry(
                     reinterpret_cast<HINSTANCE>(image_base),
                     DLL_PROCESS_DETACH,
                     nullptr);
@@ -473,12 +809,25 @@ namespace arc_loader
         }
 
 
-        SecureZeroMemory(mod.base, mod.image_size);
+        __try {
+            SecureZeroMemory(mod.base, mod.image_size);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+
+        }
         VirtualFree(mod.base, 0, MEM_RELEASE);
 
-        mod.base        = nullptr;
-        mod.image_size  = 0;
-        mod.initialized = false;
+        mod.base             = nullptr;
+        mod.image_size       = 0;
+        mod.header_size      = 0;
+        mod.entry_point      = nullptr;
+        mod.initialized      = false;
+        mod.sealed           = false;
+        mod.owning_pid       = 0;
+        mod.image_path_hash  = 0;
+        mod.loader_code_hash = 0;
+        mod.binding_salt     = 0;
+        mod.auto_seal_timer  = nullptr;
     }
 
     const std::string& last_error()

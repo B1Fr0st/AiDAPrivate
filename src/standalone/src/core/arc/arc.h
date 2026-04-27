@@ -112,13 +112,23 @@ extern "C"
 
 
     ARC_API bool arc_init(
-        const char*  session_token,
-        const char*  hwid,
-        int64_t      timestamp,
-        uint32_t     interface_version
+        const char*    session_token,
+        const char*    hwid,
+        int64_t        timestamp,
+        uint32_t       interface_version,
+        const uint8_t* bind_proof
     );
 
     ARC_API void arc_set_key_seed(const uint8_t* key_seed, uint32_t len);
+
+    ARC_API bool arc_unseal_feature(
+        uint32_t       feature_id,
+        const uint8_t* nonce,
+        uint32_t       nonce_len,
+        uint8_t*       out,
+        uint32_t*      out_size,
+        uint32_t       out_cap
+    );
 
     ARC_API const arc_comm_vtable_t* arc_get_comm_bridge();
 

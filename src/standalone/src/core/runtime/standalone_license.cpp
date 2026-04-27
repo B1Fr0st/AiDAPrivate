@@ -1623,11 +1623,12 @@ namespace
     /* Proof hash: FNV-1a of (session_token + hwid) */
     std::atomic<uint64_t> s_proof_hash{0};
 
-    /* Code integrity hashes (populated at startup) */
     struct code_section_hash_t {
         uintptr_t base;
         size_t    size;
         uint64_t  hash;
+        char      name[16];
+        uint32_t  characteristics;
     };
     std::vector<code_section_hash_t> s_code_hashes;
     std::mutex s_code_hash_mtx;
@@ -1660,12 +1661,13 @@ namespace
     std::mutex                       s_http_mtx;
 
 
-    using arc_init_fn           = bool(*)(const char*, const char*, int64_t, uint32_t);
+    using arc_init_fn           = bool(*)(const char*, const char*, int64_t, uint32_t, const uint8_t*);
     using arc_get_comm_bridge_fn = const arc_comm_vtable_t*(*)();
     using arc_validate_tool_fn  = uint64_t(*)(uint64_t, uint64_t);
     using arc_heartbeat_fn      = arc_heartbeat_result_t(*)();
     using arc_cleanup_fn        = void(*)();
     using arc_set_key_seed_fn   = void(*)(const uint8_t*, uint32_t);
+    using arc_unseal_feature_fn = bool(*)(uint32_t, const uint8_t*, uint32_t, uint8_t*, uint32_t*, uint32_t);
 
     arc_init_fn           s_fn_arc_init            = nullptr;
     arc_get_comm_bridge_fn s_fn_arc_get_comm_bridge = nullptr;
@@ -1673,6 +1675,7 @@ namespace
     arc_heartbeat_fn      s_fn_arc_heartbeat       = nullptr;
     arc_cleanup_fn        s_fn_arc_cleanup          = nullptr;
     arc_set_key_seed_fn   s_fn_arc_set_key_seed    = nullptr;
+    arc_unseal_feature_fn s_fn_arc_unseal_feature  = nullptr;
 
     std::string s_challenge_id;
     std::string s_challenge_nonce;
@@ -1684,7 +1687,7 @@ namespace
     std::vector<std::string> s_honeypot_called_names;
     std::mutex s_honeypot_names_mtx;
 
-    constexpr uint64_t kArcRequiredGraceMs = 60000;
+    constexpr uint64_t kArcRequiredGraceMs = 10000;
 
     bool download_and_load_arc(settings_sa_t& settings, const std::string& hwid, uint32_t attempt_number);
     bool call_validation_endpoint(settings_sa_t& settings,
@@ -2467,12 +2470,61 @@ namespace
             lic_log(sl);
         }
         if (status != "valid") {
+            const std::string rej_reason = response_out.value("reason", "");
             char rej[256];
             _snprintf_s(rej, sizeof(rej), _TRUNCATE,
                 "endpoint_once_rejected status=%.80s reason=%.100s",
-                status.c_str(), response_out.value("reason", "").c_str());
+                status.c_str(), rej_reason.c_str());
             lic_log(rej);
-            error_out = response_out.value("reason", status.empty() ? std::string("license rejected") : status);
+
+            if (status == "killed" && !rej_reason.empty()) {
+                std::string remaining = rej_reason;
+                if (remaining.compare(0, 10, "heartbeat_") == 0) {
+                    remaining.erase(0, 10);
+                }
+                size_t component_idx = 0;
+                size_t cursor = 0;
+                while (cursor < remaining.size() && component_idx < 12) {
+                    static const char* kKnownReasons[] = {
+                        "arc_proof_token_mismatch",
+                        "arc_driver_proof_invalid",
+                        "arc_driver_proof_missing",
+                        "code_hash_mismatch",
+                        "gate_bitmap_regression",
+                        "gate_bitmap_invalid",
+                        "honeypot_export_called",
+                        "anomaly_auto_kill"
+                    };
+                    bool matched = false;
+                    for (const char* k : kKnownReasons) {
+                        size_t klen = strlen(k);
+                        if (remaining.size() - cursor >= klen &&
+                            remaining.compare(cursor, klen, k) == 0) {
+                            char comp_buf[128];
+                            _snprintf_s(comp_buf, sizeof(comp_buf), _TRUNCATE,
+                                "endpoint_once_kill_component[%zu]=%.80s", component_idx, k);
+                            lic_log(comp_buf);
+                            cursor += klen;
+                            if (cursor < remaining.size() && remaining[cursor] == '_') {
+                                cursor += 1;
+                            }
+                            matched = true;
+                            ++component_idx;
+                            break;
+                        }
+                    }
+                    if (!matched) {
+                        char comp_buf[160];
+                        _snprintf_s(comp_buf, sizeof(comp_buf), _TRUNCATE,
+                            "endpoint_once_kill_unknown_component idx=%zu remaining=%.80s",
+                            component_idx, remaining.c_str() + cursor);
+                        lic_log(comp_buf);
+                        break;
+                    }
+                }
+            }
+
+            error_out = rej_reason.empty() ? (status.empty() ? std::string("license rejected") : status) : rej_reason;
             return false;
         }
         if (action == "validate" && response_out.value("client_nonce", "") != nonce) {
@@ -2534,52 +2586,97 @@ namespace
                 if (driver_bridge::is_loaded())
                     body["driver_proof_version"] = 3;
 
+                size_t code_hash_region_count = 0;
+                size_t code_hash_drifted_regions = 0;
+                std::string code_hash_value;
+                std::string code_hash_live_value;
                 {
                     std::lock_guard<std::mutex> lk(s_code_hash_mtx);
+                    code_hash_region_count = s_code_hashes.size();
                     if (!s_code_hashes.empty()) {
-                        uint64_t combined = 14695981039346656037ULL;
-                        for (const auto& entry : s_code_hashes) {
-                            uint64_t h = fnv1a(reinterpret_cast<const void*>(entry.base), entry.size);
-                            combined ^= h;
-                            combined *= 1099511628211ULL;
+                        uint64_t combined_snapshot = 14695981039346656037ULL;
+                        uint64_t combined_live = 14695981039346656037ULL;
+                        for (size_t ri = 0; ri < s_code_hashes.size(); ++ri) {
+                            const auto& entry = s_code_hashes[ri];
+                            combined_snapshot ^= entry.hash;
+                            combined_snapshot *= 1099511628211ULL;
+                            const uint64_t live = fnv1a(
+                                reinterpret_cast<const void*>(entry.base), entry.size);
+                            combined_live ^= live;
+                            combined_live *= 1099511628211ULL;
+                            const bool drift = (live != entry.hash);
+                            if (drift) ++code_hash_drifted_regions;
+                            char dbg_region[256];
+                            _snprintf_s(dbg_region, sizeof(dbg_region), _TRUNCATE,
+                                "heartbeat_region[%zu]=%.8s base=0x%016llX size=0x%zX snapshot=0x%016llX live=0x%016llX drift=%d ch=0x%08X",
+                                ri, entry.name,
+                                static_cast<unsigned long long>(entry.base),
+                                entry.size,
+                                static_cast<unsigned long long>(entry.hash),
+                                static_cast<unsigned long long>(live),
+                                drift ? 1 : 0,
+                                entry.characteristics);
+                            lic_log(dbg_region);
                         }
                         char hash_buf[32];
                         snprintf(hash_buf, sizeof(hash_buf), "%016llX",
-                            static_cast<unsigned long long>(combined));
+                            static_cast<unsigned long long>(combined_snapshot));
                         body["code_hash"] = hash_buf;
+                        code_hash_value.assign(hash_buf);
+                        char live_buf[32];
+                        snprintf(live_buf, sizeof(live_buf), "%016llX",
+                            static_cast<unsigned long long>(combined_live));
+                        code_hash_live_value.assign(live_buf);
                     }
                 }
+                {
+                    char dbg_ch[384];
+                    _snprintf_s(dbg_ch, sizeof(dbg_ch), _TRUNCATE,
+                        "heartbeat_compose_code_hash regions=%zu drifted=%zu snapshot=%.20s live=%.20s sent=snapshot",
+                        code_hash_region_count,
+                        code_hash_drifted_regions,
+                        code_hash_value.empty() ? "<absent>" : code_hash_value.c_str(),
+                        code_hash_live_value.empty() ? "<absent>" : code_hash_live_value.c_str());
+                    lic_log(dbg_ch);
+                }
 
-                bool proof_token_added = false;
+                bool arc_hb_invoked = false;
+                bool arc_hb_valid = false;
+                uint64_t arc_hb_proof_token = 0;
                 if (s_arc_loaded && s_fn_arc_heartbeat) {
+                    arc_hb_invoked = true;
                     auto hb = s_fn_arc_heartbeat();
+                    arc_hb_valid = hb.valid;
+                    arc_hb_proof_token = hb.proof_token;
                     if (hb.valid) {
                         char pt[32];
-                        snprintf(pt, sizeof(pt), "%016llX", static_cast<unsigned long long>(hb.proof_token));
-                        body["proof_token"] = pt;
-                        proof_token_added = true;
-                    }
-                }
-
-                if (!proof_token_added) {
-                    uint64_t session_seed = s_proof_hash.load(std::memory_order_acquire);
-                    if (session_seed != 0) {
-                        uint64_t server_nonce_hash = fnv1a_str(settings.license_server_nonce);
-                        uint64_t hwid_hash = fnv1a_str(hwid);
-                        uint64_t fallback_proof = vm_generate_proof_token(
-                            session_seed,
-                            heartbeat_index,
-                            server_nonce_hash,
-                            hwid_hash);
-                        char pt[32];
-                        snprintf(pt, sizeof(pt), "%016llX", static_cast<unsigned long long>(fallback_proof));
+                        snprintf(pt, sizeof(pt), "%016llx", static_cast<unsigned long long>(hb.proof_token));
                         body["proof_token"] = pt;
                     }
                 }
+                {
+                    char dbg_arc[256];
+                    _snprintf_s(dbg_arc, sizeof(dbg_arc), _TRUNCATE,
+                        "heartbeat_compose_arc loaded=%d fn_set=%d invoked=%d valid=%d proof_token=0x%016llX",
+                        s_arc_loaded ? 1 : 0,
+                        s_fn_arc_heartbeat ? 1 : 0,
+                        arc_hb_invoked ? 1 : 0,
+                        arc_hb_valid ? 1 : 0,
+                        static_cast<unsigned long long>(arc_hb_proof_token));
+                    lic_log(dbg_arc);
+                }
 
-                if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
+                bool drv_loaded = driver_bridge::is_loaded();
+                bool drv_kernel = drv_loaded ? driver_bridge::using_kernel_driver() : false;
+                bool drv_proof_added = false;
+                bool relay_called = false;
+                bool relay_ok = false;
+                uint64_t relay_driver_proof = 0;
+                std::string srv_nonce_for_log;
+                if (drv_loaded && drv_kernel)
                 {
                     std::string srv_nonce_str = settings.license_server_nonce;
+                    srv_nonce_for_log = srv_nonce_str;
                     if (!srv_nonce_str.empty())
                     {
                         uint64_t srv_nonce_val = 0;
@@ -2597,19 +2694,63 @@ namespace
                             fnv1a_str(settings.license_session_token) & 0xFFFFFFFF);
 
                         uint64_t driver_proof = 0;
-                        if (relay_server_token_v2_if_ready(token_hash, srv_nonce_val, &driver_proof))
+                        relay_called = true;
+                        relay_ok = relay_server_token_v2_if_ready(token_hash, srv_nonce_val, &driver_proof);
+                        relay_driver_proof = driver_proof;
+                        if (relay_ok)
                         {
                             char dp_buf[32];
                             snprintf(dp_buf, sizeof(dp_buf), "%016llX",
                                 static_cast<unsigned long long>(driver_proof));
                             body["driver_proof"] = dp_buf;
                             body["server_nonce"] = srv_nonce_str;
+                            drv_proof_added = true;
 
                             uint64_t tsc_now = __rdtsc();
                             uint64_t tsc_base = s_last_heartbeat_time.load(std::memory_order_acquire);
                             body["tsc_drift"] = static_cast<int64_t>(tsc_now - tsc_base);
                         }
                     }
+                }
+                {
+                    char dbg_drv[384];
+                    _snprintf_s(dbg_drv, sizeof(dbg_drv), _TRUNCATE,
+                        "heartbeat_compose_driver loaded=%d kernel=%d srv_nonce_present=%d srv_nonce_len=%zu "
+                        "relay_called=%d relay_ok=%d driver_proof=0x%016llX added_to_body=%d",
+                        drv_loaded ? 1 : 0,
+                        drv_kernel ? 1 : 0,
+                        srv_nonce_for_log.empty() ? 0 : 1,
+                        srv_nonce_for_log.size(),
+                        relay_called ? 1 : 0,
+                        relay_ok ? 1 : 0,
+                        static_cast<unsigned long long>(relay_driver_proof),
+                        drv_proof_added ? 1 : 0);
+                    lic_log(dbg_drv);
+                }
+
+                {
+                    int64_t now_secs = static_cast<int64_t>(std::time(nullptr));
+                    int64_t issued_at = settings.license_issued_at;
+                    int64_t age = (issued_at > 0) ? (now_secs - issued_at) : -1;
+                    char dbg_sum[512];
+                    _snprintf_s(dbg_sum, sizeof(dbg_sum), _TRUNCATE,
+                        "heartbeat_compose_summary action=%.16s hb_count=%u session_age_s=%lld "
+                        "issued_at=%lld ttl=%lld code_hash_set=%d proof_token_set=%d driver_proof_set=%d "
+                        "honeypot_count=%d gate_bitmap=0x%llX session_token_len=%zu hwid_len=%zu",
+                        action.c_str(),
+                        heartbeat_index,
+                        static_cast<long long>(age),
+                        static_cast<long long>(issued_at),
+                        static_cast<long long>(settings.license_ttl),
+                        body.contains("code_hash") ? 1 : 0,
+                        body.contains("proof_token") ? 1 : 0,
+                        body.contains("driver_proof") ? 1 : 0,
+                        static_cast<int>(body.contains("called_honeypot_names")
+                            ? body["called_honeypot_names"].size() : 0),
+                        static_cast<unsigned long long>(s_gate_bitmap.load(std::memory_order_acquire) & 0x00FFFFFFu),
+                        session_token.size(),
+                        hwid.size());
+                    lic_log(dbg_sum);
                 }
             }
 
@@ -2676,6 +2817,8 @@ namespace
         settings.license_ttl = response.value("ttl", static_cast<int64_t>(3600));
         if (response.contains("key_seed") && response["key_seed"].is_string())
             settings.license_key_seed = response["key_seed"].get<std::string>();
+        if (response.contains("bind_proof") && response["bind_proof"].is_string())
+            settings.license_bind_proof = response["bind_proof"].get<std::string>();
         settings.save();
 
         if (!settings.license_key_seed.empty())
@@ -2882,6 +3025,223 @@ namespace
         return out;
     }
 
+    std::string bytes_to_hex(const uint8_t* data, size_t size)
+    {
+        static const char digits[] = "0123456789abcdef";
+        std::string out;
+        out.resize(size * 2);
+        for (size_t i = 0; i < size; ++i) {
+            out[(i * 2) + 0] = digits[(data[i] >> 4) & 0x0F];
+            out[(i * 2) + 1] = digits[data[i] & 0x0F];
+        }
+        return out;
+    }
+
+    std::string get_arc_signing_public_key_der_hex()
+    {
+        std::string k;
+        k.reserve(88);
+        k += OBFSTR("302a3005");
+        k += OBFSTR("06032b65");
+        k += OBFSTR("70032100");
+        k += OBFSTR("ae7ba74a");
+        k += OBFSTR("a9b8a230");
+        k += OBFSTR("d6614d8d");
+        k += OBFSTR("0c78e0e5");
+        k += OBFSTR("33adfa2a");
+        k += OBFSTR("bdc3d632");
+        k += OBFSTR("8438c378");
+        k += OBFSTR("077adc90");
+        return k;
+    }
+
+    bool verify_arc_page_signature(const std::string& canonical, const std::string& sig_hex)
+    {
+        if (canonical.empty() || sig_hex.empty())
+            return false;
+
+        auto signature_bytes = hex_decode(sig_hex);
+        if (signature_bytes.empty())
+            return false;
+
+        auto public_key_der = hex_decode(get_arc_signing_public_key_der_hex());
+        if (public_key_der.empty())
+            return false;
+
+        const unsigned char* der_ptr = public_key_der.data();
+        EVP_PKEY* public_key = d2i_PUBKEY(nullptr, &der_ptr,
+            static_cast<long>(public_key_der.size()));
+        if (public_key == nullptr)
+            return false;
+
+        EVP_MD_CTX* verify_ctx = EVP_MD_CTX_new();
+        if (verify_ctx == nullptr) {
+            EVP_PKEY_free(public_key);
+            return false;
+        }
+
+        bool verified = false;
+        if (EVP_DigestVerifyInit(verify_ctx, nullptr, nullptr, nullptr, public_key) == 1) {
+            verified = EVP_DigestVerify(
+                verify_ctx,
+                signature_bytes.data(), signature_bytes.size(),
+                reinterpret_cast<const unsigned char*>(canonical.data()),
+                canonical.size()) == 1;
+        }
+
+        EVP_MD_CTX_free(verify_ctx);
+        EVP_PKEY_free(public_key);
+        return verified;
+    }
+
+    std::vector<uint8_t> hmac_sha256_block(const uint8_t* key, size_t key_len,
+                                           const uint8_t* data, size_t data_len)
+    {
+        std::vector<uint8_t> result(32);
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+
+        NTSTATUS status = BCryptOpenAlgorithmProvider(
+            &hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+        if (status != 0) return {};
+
+        status = BCryptCreateHash(hAlg, &hHash, nullptr, 0,
+            const_cast<PUCHAR>(key), static_cast<ULONG>(key_len), 0);
+        if (status != 0) {
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return {};
+        }
+
+        status = BCryptHashData(hHash,
+            const_cast<PUCHAR>(data), static_cast<ULONG>(data_len), 0);
+        if (status != 0) {
+            BCryptDestroyHash(hHash);
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return {};
+        }
+
+        status = BCryptFinishHash(hHash, result.data(), 32, 0);
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+
+        if (status != 0) return {};
+        return result;
+    }
+
+    std::vector<uint8_t> hmac_sha256_two(const uint8_t* key, size_t key_len,
+                                         const uint8_t* data1, size_t data1_len,
+                                         const uint8_t* data2, size_t data2_len)
+    {
+        std::vector<uint8_t> result(32);
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+
+        NTSTATUS status = BCryptOpenAlgorithmProvider(
+            &hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+        if (status != 0) return {};
+
+        status = BCryptCreateHash(hAlg, &hHash, nullptr, 0,
+            const_cast<PUCHAR>(key), static_cast<ULONG>(key_len), 0);
+        if (status != 0) {
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return {};
+        }
+
+        status = BCryptHashData(hHash,
+            const_cast<PUCHAR>(data1), static_cast<ULONG>(data1_len), 0);
+        if (status == 0 && data2_len > 0) {
+            status = BCryptHashData(hHash,
+                const_cast<PUCHAR>(data2), static_cast<ULONG>(data2_len), 0);
+        }
+        if (status != 0) {
+            BCryptDestroyHash(hHash);
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return {};
+        }
+
+        status = BCryptFinishHash(hHash, result.data(), 32, 0);
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+
+        if (status != 0) return {};
+        return result;
+    }
+
+    std::vector<uint8_t> sha256_block(const uint8_t* data, size_t len)
+    {
+        std::vector<uint8_t> result(32);
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+
+        NTSTATUS status = BCryptOpenAlgorithmProvider(
+            &hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+        if (status != 0) return {};
+
+        status = BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0);
+        if (status != 0) {
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return {};
+        }
+
+        status = BCryptHashData(hHash, const_cast<PUCHAR>(data), static_cast<ULONG>(len), 0);
+        if (status != 0) {
+            BCryptDestroyHash(hHash);
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return {};
+        }
+
+        status = BCryptFinishHash(hHash, result.data(), 32, 0);
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+
+        if (status != 0) return {};
+        return result;
+    }
+
+    std::vector<uint8_t> derive_arc_page_key(const std::vector<uint8_t>& key_seed,
+                                             uint32_t page_index,
+                                             const std::string& session_token,
+                                             const std::string& hwid,
+                                             int64_t issued_at,
+                                             const std::string& proof_token,
+                                             const std::string& chain_tag_hex)
+    {
+        std::string message;
+        message.reserve(64 + session_token.size() + hwid.size() + proof_token.size() + chain_tag_hex.size());
+        message += "page|";
+        message += std::to_string(page_index);
+        message += '|';
+        message += session_token;
+        message += '|';
+        message += hwid;
+        message += '|';
+        message += std::to_string(issued_at);
+        message += '|';
+        message += proof_token;
+        message += '|';
+        message += chain_tag_hex;
+
+        return hmac_sha256_block(key_seed.data(), key_seed.size(),
+            reinterpret_cast<const uint8_t*>(message.data()), message.size());
+    }
+
+    std::vector<uint8_t> derive_arc_chain_tag(const std::vector<uint8_t>& prev_chain_tag_or_zero32,
+                                              const std::vector<uint8_t>& auth_tag)
+    {
+        static const uint8_t kChainSuffix[5] = { 'c', 'h', 'a', 'i', 'n' };
+        return hmac_sha256_two(prev_chain_tag_or_zero32.data(), prev_chain_tag_or_zero32.size(),
+            auth_tag.data(), auth_tag.size(),
+            kChainSuffix, sizeof(kChainSuffix));
+    }
+
+    std::string compute_arc_bootstrap_proof(const std::string& session_token)
+    {
+        std::string seed = session_token + "bootstrap";
+        auto digest = sha256_block(reinterpret_cast<const uint8_t*>(seed.data()), seed.size());
+        if (digest.size() != 32) return {};
+        return bytes_to_hex(digest.data(), digest.size());
+    }
+
     bool download_and_load_arc(settings_sa_t& settings, const std::string& hwid, uint32_t attempt_number)
     {
         std::lock_guard<std::mutex> lk(s_arc_mtx);
@@ -2899,79 +3259,267 @@ namespace
 
         try {
             std::string host = get_cloud_function_host();
-            json body;
-            body["license_key"] = settings.license_key;
-            body["session_token"] = settings.license_session_token;
-            body["hwid"] = hwid;
-            std::string body_str = body.dump();
 
-            auto whr = raw_https_request("POST", host + "/api/download/arc",
-                                       {}, body_str, "application/json");
-            if (!whr.ok || whr.status != 200) {
-                char arc_fail_buf[96];
-                _snprintf_s(arc_fail_buf, sizeof(arc_fail_buf), _TRUNCATE,
-                    "arc_download_failed status=%d attempt=%u", whr.status, attempt_number);
-                log_arc_status(arc_fail_buf);
-                return false;
-            }
-
-            auto resp = json::parse(whr.body, nullptr, false);
-            if (resp.is_discarded() || !resp.is_object()) {
-                log_arc_status("arc_invalid_response_json");
-                return false;
-            }
-
-
-            std::string blob_b64   = resp.value("encrypted_blob", "");
-            std::string iv_hex     = resp.value("iv", "");
-            std::string tag_hex    = resp.value("auth_tag", "");
-
-            if (blob_b64.empty() || iv_hex.empty() || tag_hex.empty()) {
-                log_arc_status("arc_missing_encryption_fields");
-                return false;
-            }
-
-            auto encrypted_blob = base64_decode(blob_b64);
-            auto iv       = hex_decode(iv_hex);
-            auto auth_tag = hex_decode(tag_hex);
-
-            if (encrypted_blob.empty() || iv.size() != 12 || auth_tag.size() != 16) {
-                log_arc_status("arc_invalid_blob_format");
-                return false;
-            }
-
-
-            auto session_key = hex_decode(settings.license_key_seed);
-
-            if (session_key.empty() || session_key.size() != 32) {
+            std::vector<uint8_t> key_seed = hex_decode(settings.license_key_seed);
+            if (key_seed.empty() || key_seed.size() != 32) {
                 auto fallback_key = derive_session_key(
                     settings.license_session_token,
                     hwid,
                     settings.license_issued_at,
                     get_arc_master_secret());
                 if (fallback_key.empty() || fallback_key.size() != 32) {
-                    log_arc_status("arc_key_derivation_failed");
+                    log_arc_status("arc_paged_key_derivation_failed");
                     return false;
                 }
-                session_key = std::move(fallback_key);
+                key_seed = std::move(fallback_key);
             }
 
+            json count_body;
+            count_body["license_key"] = settings.license_key;
+            count_body["session_token"] = settings.license_session_token;
+            count_body["hwid"] = hwid;
+            std::string count_body_str = count_body.dump();
 
-            auto pe_data = aes_gcm_decrypt(session_key, iv, auth_tag, encrypted_blob);
-            SecureZeroMemory(session_key.data(), session_key.size());
-
-            if (pe_data.empty()) {
-                log_arc_status("arc_decryption_failed");
+            auto count_resp = raw_https_request("POST", host + "/api/download/pages/count",
+                {}, count_body_str, "application/json");
+            if (!count_resp.ok || count_resp.status != 200) {
+                SecureZeroMemory(key_seed.data(), key_seed.size());
+                char buf[128];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "arc_paged_count_failed status=%d attempt=%u",
+                    count_resp.status, attempt_number);
+                log_arc_status(buf);
                 return false;
             }
 
+            auto count_json = json::parse(count_resp.body, nullptr, false);
+            if (count_json.is_discarded() || !count_json.is_object() ||
+                count_json.value("status", "") != "ok") {
+                SecureZeroMemory(key_seed.data(), key_seed.size());
+                log_arc_status("arc_paged_count_invalid_json");
+                return false;
+            }
+
+            uint64_t total_pages_u = count_json.value("total_pages", uint64_t{0});
+            uint64_t blob_size_u   = count_json.value("blob_size",   uint64_t{0});
+
+            constexpr uint64_t kMaxBlobSize = 64ull * 1024ull * 1024ull;
+            if (total_pages_u == 0 || total_pages_u > 1000000ull ||
+                blob_size_u == 0 || blob_size_u > kMaxBlobSize) {
+                SecureZeroMemory(key_seed.data(), key_seed.size());
+                char buf[128];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "arc_paged_count_invalid_values total=%llu size=%llu",
+                    static_cast<unsigned long long>(total_pages_u),
+                    static_cast<unsigned long long>(blob_size_u));
+                log_arc_status(buf);
+                return false;
+            }
+
+            uint32_t total_pages = static_cast<uint32_t>(total_pages_u);
+            size_t   blob_size   = static_cast<size_t>(blob_size_u);
+
+            std::string proof_token = compute_arc_bootstrap_proof(settings.license_session_token);
+            if (proof_token.empty()) {
+                SecureZeroMemory(key_seed.data(), key_seed.size());
+                log_arc_status("arc_paged_bootstrap_proof_failed");
+                return false;
+            }
+
+            std::vector<uint8_t> pe_data;
+            pe_data.reserve(blob_size);
+
+            std::vector<uint8_t> chain_tag;
+            std::string          chain_tag_hex;
+
+            for (uint32_t i = 0; i < total_pages; ++i) {
+                json page_body;
+                page_body["license_key"]   = settings.license_key;
+                page_body["session_token"] = settings.license_session_token;
+                page_body["hwid"]          = hwid;
+                page_body["proof_token"]   = proof_token;
+                std::string page_body_str = page_body.dump();
+
+                char page_url[160];
+                _snprintf_s(page_url, sizeof(page_url), _TRUNCATE,
+                    "%s/api/download/arc/page/%u", host.c_str(), i);
+
+                auto page_resp = raw_https_request("POST", page_url,
+                    {}, page_body_str, "application/json");
+                if (!page_resp.ok || page_resp.status != 200) {
+                    SecureZeroMemory(key_seed.data(), key_seed.size());
+                    SecureZeroMemory(pe_data.data(), pe_data.size());
+                    char buf[160];
+                    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                        "arc_paged_page_http_failed page=%u status=%d attempt=%u",
+                        i, page_resp.status, attempt_number);
+                    log_arc_status(buf);
+                    return false;
+                }
+
+                auto page_json = json::parse(page_resp.body, nullptr, false);
+                if (page_json.is_discarded() || !page_json.is_object() ||
+                    page_json.value("status", "") != "ok") {
+                    SecureZeroMemory(key_seed.data(), key_seed.size());
+                    SecureZeroMemory(pe_data.data(), pe_data.size());
+                    log_arc_status("arc_paged_page_invalid_json");
+                    return false;
+                }
+
+                uint64_t page_index_resp = page_json.value("page_index", uint64_t{UINT64_MAX});
+                uint64_t total_pages_resp = page_json.value("total_pages", uint64_t{0});
+                uint64_t blob_size_resp = page_json.value("blob_size", uint64_t{0});
+                std::string page_data_b64 = page_json.value("data", "");
+                std::string page_iv_hex   = page_json.value("iv", "");
+                std::string page_tag_hex  = page_json.value("auth_tag", "");
+                std::string page_sig      = page_json.value("signature", "");
+
+                if (page_index_resp != static_cast<uint64_t>(i) ||
+                    total_pages_resp != static_cast<uint64_t>(total_pages) ||
+                    blob_size_resp   != static_cast<uint64_t>(blob_size) ||
+                    page_data_b64.empty() || page_iv_hex.empty() ||
+                    page_tag_hex.empty() || page_sig.empty()) {
+                    SecureZeroMemory(key_seed.data(), key_seed.size());
+                    SecureZeroMemory(pe_data.data(), pe_data.size());
+                    log_arc_status("arc_paged_page_field_mismatch");
+                    return false;
+                }
+
+                json signed_view = page_json;
+                signed_view.erase("signature");
+                std::string canonical = signed_view.dump();
+                {
+                    auto canon_digest = sha256_block(
+                        reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
+                    std::string canon_sha = canon_digest.empty() ? std::string("<digest_failed>")
+                        : bytes_to_hex(canon_digest.data(), canon_digest.size());
+                    auto pub_hex = get_arc_signing_public_key_der_hex();
+                    std::string pub_tail = pub_hex.size() >= 16 ? pub_hex.substr(pub_hex.size() - 16) : pub_hex;
+                    std::string sig_tail = page_sig.size() >= 16 ? page_sig.substr(page_sig.size() - 16) : page_sig;
+                    std::string keys_csv;
+                    {
+                        bool first = true;
+                        for (auto it = signed_view.begin(); it != signed_view.end(); ++it) {
+                            if (!first) keys_csv += ",";
+                            keys_csv += it.key();
+                            first = false;
+                        }
+                    }
+                    char dbg[1024];
+                    _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                        "arc_paged_verify page=%u keys=[%.200s] canonical_len=%zu canonical_sha256=%.64s pubkey_tail=%.16s sig_len=%zu sig_tail=%.16s",
+                        static_cast<unsigned>(i),
+                        keys_csv.c_str(),
+                        canonical.size(),
+                        canon_sha.c_str(),
+                        pub_tail.c_str(),
+                        page_sig.size(),
+                        sig_tail.c_str());
+                    log_arc_status(dbg);
+                }
+                if (!verify_arc_page_signature(canonical, page_sig)) {
+                    std::string canonical_head = canonical.size() > 120
+                        ? canonical.substr(0, 120) : canonical;
+                    SecureZeroMemory(key_seed.data(), key_seed.size());
+                    SecureZeroMemory(pe_data.data(), pe_data.size());
+                    char buf[256];
+                    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                        "arc_paged_signature_invalid page=%u canonical_head=%.120s",
+                        static_cast<unsigned>(i),
+                        canonical_head.c_str());
+                    log_arc_status(buf);
+                    return false;
+                }
+
+                auto page_iv  = hex_decode(page_iv_hex);
+                auto page_tag = hex_decode(page_tag_hex);
+                auto page_ct  = base64_decode(page_data_b64);
+                if (page_iv.size() != 12 || page_tag.size() != 16 || page_ct.empty()) {
+                    SecureZeroMemory(key_seed.data(), key_seed.size());
+                    SecureZeroMemory(pe_data.data(), pe_data.size());
+                    log_arc_status("arc_paged_page_invalid_format");
+                    return false;
+                }
+
+                auto page_key = derive_arc_page_key(
+                    key_seed,
+                    i,
+                    settings.license_session_token,
+                    hwid,
+                    settings.license_issued_at,
+                    proof_token,
+                    chain_tag_hex);
+                if (page_key.size() != 32) {
+                    SecureZeroMemory(key_seed.data(), key_seed.size());
+                    SecureZeroMemory(pe_data.data(), pe_data.size());
+                    log_arc_status("arc_paged_page_key_failed");
+                    return false;
+                }
+
+                auto page_plain = aes_gcm_decrypt(page_key, page_iv, page_tag, page_ct);
+                SecureZeroMemory(page_key.data(), page_key.size());
+                if (page_plain.empty()) {
+                    SecureZeroMemory(key_seed.data(), key_seed.size());
+                    SecureZeroMemory(pe_data.data(), pe_data.size());
+                    char buf[96];
+                    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                        "arc_paged_page_decrypt_failed page=%u", i);
+                    log_arc_status(buf);
+                    return false;
+                }
+
+                if (pe_data.size() + page_plain.size() > blob_size) {
+                    SecureZeroMemory(page_plain.data(), page_plain.size());
+                    SecureZeroMemory(key_seed.data(), key_seed.size());
+                    SecureZeroMemory(pe_data.data(), pe_data.size());
+                    log_arc_status("arc_paged_page_overflow");
+                    return false;
+                }
+
+                pe_data.insert(pe_data.end(), page_plain.begin(), page_plain.end());
+                SecureZeroMemory(page_plain.data(), page_plain.size());
+
+                if (s_activation_completed_at_ms.load(std::memory_order_acquire) != 0)
+                    mark_activation_completed();
+
+                auto next_chain = chain_tag.empty()
+                    ? derive_arc_chain_tag(std::vector<uint8_t>(32, 0), page_tag)
+                    : derive_arc_chain_tag(chain_tag, page_tag);
+                if (next_chain.size() != 32) {
+                    SecureZeroMemory(key_seed.data(), key_seed.size());
+                    SecureZeroMemory(pe_data.data(), pe_data.size());
+                    log_arc_status("arc_paged_chain_tag_failed");
+                    return false;
+                }
+                chain_tag = std::move(next_chain);
+                chain_tag_hex = bytes_to_hex(chain_tag.data(), chain_tag.size());
+            }
+
+            SecureZeroMemory(key_seed.data(), key_seed.size());
+            if (!chain_tag.empty())
+                SecureZeroMemory(chain_tag.data(), chain_tag.size());
+
+            if (pe_data.size() != blob_size) {
+                SecureZeroMemory(pe_data.data(), pe_data.size());
+                log_arc_status("arc_paged_blob_size_mismatch");
+                return false;
+            }
+
+            if (s_activation_completed_at_ms.load(std::memory_order_acquire) != 0)
+                mark_activation_completed();
 
             s_arc_module = arc_loader::load(pe_data.data(), pe_data.size());
             if (!s_arc_module.base) {
-                log_arc_status("arc_reflective_load_failed");
+                char rl_buf[192];
+                _snprintf_s(rl_buf, sizeof(rl_buf), _TRUNCATE,
+                    "arc_paged_reflective_load_failed reason=%s",
+                    arc_loader::last_error().c_str());
+                SecureZeroMemory(pe_data.data(), pe_data.size());
+                log_arc_status(rl_buf);
                 return false;
             }
 
+            SecureZeroMemory(pe_data.data(), pe_data.size());
 
             s_fn_arc_init = reinterpret_cast<arc_init_fn>(
                 arc_loader::get_export(s_arc_module, "arc_init"));
@@ -2985,21 +3533,80 @@ namespace
                 arc_loader::get_export(s_arc_module, "arc_cleanup"));
             s_fn_arc_set_key_seed = reinterpret_cast<arc_set_key_seed_fn>(
                 arc_loader::get_export(s_arc_module, "arc_set_key_seed"));
+            s_fn_arc_unseal_feature = reinterpret_cast<arc_unseal_feature_fn>(
+                arc_loader::get_export(s_arc_module, "arc_unseal_feature"));
 
             if (!s_fn_arc_init || !s_fn_arc_get_comm_bridge ||
-                !s_fn_arc_validate_tool || !s_fn_arc_heartbeat || !s_fn_arc_cleanup) {
+                !s_fn_arc_validate_tool || !s_fn_arc_heartbeat || !s_fn_arc_cleanup ||
+                !s_fn_arc_unseal_feature) {
                 log_arc_status("arc_missing_exports");
                 arc_loader::unload(s_arc_module);
+                s_fn_arc_init = nullptr;
+                s_fn_arc_get_comm_bridge = nullptr;
+                s_fn_arc_validate_tool = nullptr;
+                s_fn_arc_heartbeat = nullptr;
+                s_fn_arc_cleanup = nullptr;
+                s_fn_arc_set_key_seed = nullptr;
+                s_fn_arc_unseal_feature = nullptr;
+                return false;
+            }
+
+            if (!arc_loader::seal(s_arc_module)) {
+                char sl_buf[192];
+                _snprintf_s(sl_buf, sizeof(sl_buf), _TRUNCATE,
+                    "arc_seal_failed reason=%s",
+                    arc_loader::last_error().c_str());
+                log_arc_status(sl_buf);
+                arc_loader::unload(s_arc_module);
+                s_fn_arc_init = nullptr;
+                s_fn_arc_get_comm_bridge = nullptr;
+                s_fn_arc_validate_tool = nullptr;
+                s_fn_arc_heartbeat = nullptr;
+                s_fn_arc_cleanup = nullptr;
+                s_fn_arc_set_key_seed = nullptr;
+                s_fn_arc_unseal_feature = nullptr;
                 return false;
             }
 
 
+            std::vector<uint8_t> bind_proof_bytes;
+            if (settings.license_bind_proof.empty()) {
+                log_arc_status("arc_missing_bind_proof");
+                arc_loader::unload(s_arc_module);
+                s_fn_arc_init = nullptr;
+                s_fn_arc_get_comm_bridge = nullptr;
+                s_fn_arc_validate_tool = nullptr;
+                s_fn_arc_heartbeat = nullptr;
+                s_fn_arc_cleanup = nullptr;
+                s_fn_arc_set_key_seed = nullptr;
+                s_fn_arc_unseal_feature = nullptr;
+                return false;
+            }
+            bind_proof_bytes = hex_decode(settings.license_bind_proof);
+            if (bind_proof_bytes.size() != 32) {
+                log_arc_status("arc_missing_bind_proof");
+                if (!bind_proof_bytes.empty())
+                    SecureZeroMemory(bind_proof_bytes.data(), bind_proof_bytes.size());
+                arc_loader::unload(s_arc_module);
+                s_fn_arc_init = nullptr;
+                s_fn_arc_get_comm_bridge = nullptr;
+                s_fn_arc_validate_tool = nullptr;
+                s_fn_arc_heartbeat = nullptr;
+                s_fn_arc_cleanup = nullptr;
+                s_fn_arc_set_key_seed = nullptr;
+                s_fn_arc_unseal_feature = nullptr;
+                return false;
+            }
+
             int64_t now = static_cast<int64_t>(std::time(nullptr));
-            if (!s_fn_arc_init(
+            bool init_ok = s_fn_arc_init(
                     settings.license_session_token.c_str(),
                     hwid.c_str(),
                     now,
-                    ARC_INTERFACE_VERSION)) {
+                    ARC_INTERFACE_VERSION,
+                    bind_proof_bytes.data());
+            SecureZeroMemory(bind_proof_bytes.data(), bind_proof_bytes.size());
+            if (!init_ok) {
                 log_arc_status("arc_init_failed");
                 arc_loader::unload(s_arc_module);
                 s_fn_arc_init = nullptr;
@@ -3007,6 +3614,8 @@ namespace
                 s_fn_arc_validate_tool = nullptr;
                 s_fn_arc_heartbeat = nullptr;
                 s_fn_arc_cleanup = nullptr;
+                s_fn_arc_set_key_seed = nullptr;
+                s_fn_arc_unseal_feature = nullptr;
                 return false;
             }
 
@@ -3016,14 +3625,41 @@ namespace
             if (s_fn_arc_set_key_seed && !settings.license_key_seed.empty())
             {
                 auto seed_bytes = hex_decode(settings.license_key_seed);
-                if (seed_bytes.size() == 32)
+                if (seed_bytes.size() == 32) {
                     s_fn_arc_set_key_seed(seed_bytes.data(), 32);
+                    SecureZeroMemory(seed_bytes.data(), seed_bytes.size());
+                }
+            }
+
+            {
+                uint8_t gate_nonce[32] = {};
+                const std::string& sess_tok = settings.license_session_token;
+                size_t cp = sess_tok.size();
+                if (cp > sizeof(gate_nonce)) cp = sizeof(gate_nonce);
+                if (cp > 0)
+                    memcpy(gate_nonce, sess_tok.data(), cp);
+
+                uint8_t poly_seed[32] = {};
+                uint32_t poly_seed_len = 0;
+                constexpr uint32_t kPolymorphismSeedFeatureId = 1u;
+                bool unseal_ok = s_fn_arc_unseal_feature(
+                    kPolymorphismSeedFeatureId,
+                    gate_nonce, sizeof(gate_nonce),
+                    poly_seed, &poly_seed_len, sizeof(poly_seed));
+                if (!unseal_ok || poly_seed_len != 32) {
+                    SecureZeroMemory(poly_seed, sizeof(poly_seed));
+                    SecureZeroMemory(gate_nonce, sizeof(gate_nonce));
+                    log_arc_status("arc_startup_gate_failed");
+                    __fastfail(0xA1DAFA17u);
+                }
+                SecureZeroMemory(poly_seed, sizeof(poly_seed));
+                SecureZeroMemory(gate_nonce, sizeof(gate_nonce));
             }
 
             return true;
 
         } catch (...) {
-            log_arc_status("arc_download_exception");
+            log_arc_status("arc_paged_download_exception");
             return false;
         }
     }
@@ -3043,6 +3679,7 @@ namespace
         s_fn_arc_heartbeat = nullptr;
         s_fn_arc_cleanup = nullptr;
         s_fn_arc_set_key_seed = nullptr;
+        s_fn_arc_unseal_feature = nullptr;
         s_arc_loaded = false;
         set_arc_obfuscated_state(false);
     }
@@ -3203,6 +3840,7 @@ namespace
         settings.license_server_nonce.clear();
         settings.license_client_nonce.clear();
         settings.license_key_seed.clear();
+        settings.license_bind_proof.clear();
         settings.license_issued_at = 0;
         settings.license_ttl = 3600;
         settings.save();
@@ -3739,32 +4377,117 @@ namespace standalone_license
     void snapshot_code_hashes()
     {
         std::lock_guard<std::mutex> lk(s_code_hash_mtx);
-        s_code_hashes.clear();
 
         HMODULE hMod = GetModuleHandleW(nullptr);
-        if (!hMod) return;
+        if (!hMod) {
+            char dbg[96];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "snapshot_code_hashes_no_module preserved=%zu", s_code_hashes.size());
+            lic_log(dbg);
+            return;
+        }
 
         auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(hMod);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+            char dbg[128];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "snapshot_code_hashes_bad_dos_magic value=0x%04X preserved=%zu",
+                static_cast<unsigned>(dos->e_magic),
+                s_code_hashes.size());
+            lic_log(dbg);
+            return;
+        }
 
         auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
             reinterpret_cast<const uint8_t*>(hMod) + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+        if (nt->Signature != IMAGE_NT_SIGNATURE) {
+            char dbg[128];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "snapshot_code_hashes_bad_nt_sig value=0x%08X preserved=%zu",
+                static_cast<unsigned>(nt->Signature),
+                s_code_hashes.size());
+            lic_log(dbg);
+            return;
+        }
+
+        std::vector<code_section_hash_t> fresh;
+        fresh.reserve(s_code_hashes.empty() ? 16 : s_code_hashes.size());
 
         const auto* sec = IMAGE_FIRST_SECTION(nt);
-        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        const WORD num_sections = nt->FileHeader.NumberOfSections;
+        {
+            char dbg[96];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "snapshot_code_hashes_begin module=%p num_sections=%u",
+                static_cast<void*>(hMod),
+                static_cast<unsigned>(num_sections));
+            lic_log(dbg);
+        }
 
-            if ((sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) ||
-                (sec[i].Characteristics & IMAGE_SCN_MEM_READ &&
-                 !(sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)))
-            {
-                auto base = reinterpret_cast<uintptr_t>(hMod) + sec[i].VirtualAddress;
-                size_t size = sec[i].Misc.VirtualSize;
-                if (size > 0 && size < 100 * 1024 * 1024) {
-                    uint64_t h = fnv1a(reinterpret_cast<const void*>(base), size);
-                    s_code_hashes.push_back({base, size, h});
-                }
+        for (WORD i = 0; i < num_sections; ++i) {
+            const uint32_t ch = sec[i].Characteristics;
+            const bool is_exec = (ch & IMAGE_SCN_MEM_EXECUTE) != 0u;
+            const bool is_read = (ch & IMAGE_SCN_MEM_READ) != 0u;
+            const bool is_write = (ch & IMAGE_SCN_MEM_WRITE) != 0u;
+            const bool eligible = is_exec || (is_read && !is_write);
+
+            char section_name[16] = {};
+            std::memcpy(section_name, sec[i].Name, 8);
+
+            if (!eligible) {
+                char dbg[160];
+                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                    "snapshot_code_hashes_skip[%u]=%.8s ch=0x%08X exec=%d read=%d write=%d",
+                    static_cast<unsigned>(i), section_name, ch,
+                    is_exec ? 1 : 0, is_read ? 1 : 0, is_write ? 1 : 0);
+                lic_log(dbg);
+                continue;
             }
+
+            auto base = reinterpret_cast<uintptr_t>(hMod) + sec[i].VirtualAddress;
+            size_t size = sec[i].Misc.VirtualSize;
+            if (size == 0 || size >= 100u * 1024u * 1024u) {
+                char dbg[160];
+                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                    "snapshot_code_hashes_skip_size[%u]=%.8s size=%zu",
+                    static_cast<unsigned>(i), section_name, size);
+                lic_log(dbg);
+                continue;
+            }
+
+            uint64_t h = fnv1a(reinterpret_cast<const void*>(base), size);
+            code_section_hash_t entry{};
+            entry.base = base;
+            entry.size = size;
+            entry.hash = h;
+            std::memcpy(entry.name, section_name, 8);
+            entry.characteristics = ch;
+            fresh.push_back(entry);
+
+            char dbg[256];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "snapshot_code_hashes_capture[%u]=%.8s rva=0x%08X base=0x%016llX size=0x%zX hash=0x%016llX exec=%d write=%d",
+                static_cast<unsigned>(i), section_name,
+                static_cast<unsigned>(sec[i].VirtualAddress),
+                static_cast<unsigned long long>(base),
+                size,
+                static_cast<unsigned long long>(h),
+                is_exec ? 1 : 0, is_write ? 1 : 0);
+            lic_log(dbg);
+        }
+        {
+            char dbg[160];
+            if (fresh.empty()) {
+                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                    "snapshot_code_hashes_done captured=0 preserved_existing=%zu",
+                    s_code_hashes.size());
+            } else {
+                s_code_hashes.swap(fresh);
+                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                    "snapshot_code_hashes_done captured=%zu",
+                    s_code_hashes.size());
+            }
+            lic_log(dbg);
         }
     }
 
@@ -3937,6 +4660,18 @@ namespace standalone_license
         if (!s_arc_loaded || !s_fn_arc_heartbeat)
             return result;
         return s_fn_arc_heartbeat();
+    }
+
+    bool arc_unseal_feature_blocking(uint32_t feature_id,
+                                     const uint8_t* nonce,
+                                     uint32_t nonce_len,
+                                     uint8_t* out,
+                                     uint32_t* out_size,
+                                     uint32_t out_cap)
+    {
+        if (!s_arc_loaded || !s_fn_arc_unseal_feature)
+            return false;
+        return s_fn_arc_unseal_feature(feature_id, nonce, nonce_len, out, out_size, out_cap);
     }
 
     uint64_t get_server_nonce_hash()

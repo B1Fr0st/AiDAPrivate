@@ -731,6 +731,33 @@ int main(int, char**)
         bool state_changed = (cur_state != prev_state);
         if (state_changed) prev_state = cur_state;
 
+        static bool s_arc_startup_gate_passed = false;
+        if (!s_arc_startup_gate_passed && cur_state == 3 && standalone_license::is_arc_loaded())
+        {
+            uint8_t gate_nonce[32] = {};
+            const std::string sess_tok = standalone_license::get_session_token();
+            size_t cp = sess_tok.size();
+            if (cp > sizeof(gate_nonce)) cp = sizeof(gate_nonce);
+            if (cp > 0)
+                memcpy(gate_nonce, sess_tok.data(), cp);
+
+            uint8_t poly_seed[32] = {};
+            uint32_t poly_seed_len = 0;
+            constexpr uint32_t kPolymorphismSeedFeatureId = 1u;
+            bool unseal_ok = standalone_license::arc_unseal_feature_blocking(
+                kPolymorphismSeedFeatureId,
+                gate_nonce, sizeof(gate_nonce),
+                poly_seed, &poly_seed_len, sizeof(poly_seed));
+            if (!unseal_ok || poly_seed_len != 32) {
+                SecureZeroMemory(poly_seed, sizeof(poly_seed));
+                SecureZeroMemory(gate_nonce, sizeof(gate_nonce));
+                __fastfail(0xA1DAFA17u);
+            }
+            SecureZeroMemory(poly_seed, sizeof(poly_seed));
+            SecureZeroMemory(gate_nonce, sizeof(gate_nonce));
+            s_arc_startup_gate_passed = true;
+        }
+
 
         if (cur_state == 3 && ide_resize_applied) {
             RECT wr; GetWindowRect(hwnd, &wr);

@@ -1,10 +1,19 @@
 
 
-// Load .env file if present (no dotenv dependency needed)
 (function loadEnvFile() {
     const fs = require('fs'), path = require('path');
     const envPath = path.join(__dirname, '.env');
     if (!fs.existsSync(envPath)) return;
+    const overrideKeys = new Set([
+        'ED25519_PRIVATE_KEY_B64',
+        'ED25519_PUBLIC_KEY_B64',
+        'ED25519_NEXT_PRIVATE_KEY_B64',
+        'ED25519_NEXT_PUBKEY_B64',
+        'ARC_MASTER_SECRET',
+        'SERVER_MASTER_KEY_B64',
+        'CHALLENGE_SIGNING_SECRET',
+        'CLIENT_TELEMETRY_PUBKEY_B64',
+    ]);
     for (const line of fs.readFileSync(envPath, 'utf8').split('\n')) {
         const t = line.trim();
         if (!t || t.startsWith('#')) continue;
@@ -12,7 +21,14 @@
         if (idx < 0) continue;
         const k = t.substring(0, idx).trim();
         const v = t.substring(idx + 1).trim();
-        if (k && !(k in process.env)) process.env[k] = v;
+        if (!k) continue;
+        if (overrideKeys.has(k) || !(k in process.env)) {
+            const before = process.env[k];
+            process.env[k] = v;
+            if (overrideKeys.has(k) && before !== undefined && before !== v) {
+                console.warn(`[server] env override: ${k} (was cached, replaced from .env)`);
+            }
+        }
     }
 })();
 
@@ -57,12 +73,36 @@ const limiter = rateLimit({
             || req.ip
             || 'unknown';
     },
+    skip: (req) => {
+        const url = req.originalUrl || req.url || '';
+        return url.startsWith('/api/download/');
+    },
     handler: (_req, res) => {
         res.status(429).json({ status: 'error', reason: 'rate_limited' });
     },
 });
 
+const downloadLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 2000,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => {
+        const body = req.body;
+        if (body && typeof body === 'object' && typeof body.license_key === 'string' && body.license_key.length > 0) {
+            return 'lic:' + body.license_key;
+        }
+        return (req.headers['x-forwarded-for'] || '').split(',')[0].trim()
+            || req.ip
+            || 'unknown';
+    },
+    handler: (_req, res) => {
+        res.status(429).json({ status: 'error', reason: 'download_rate_limited' });
+    },
+});
+
 app.use('/api/', limiter);
+app.use('/api/download/', downloadLimiter);
 app.use('/api/', tlsExporter.middleware);
 app.use('/validateLicense', tlsExporter.middleware);
 

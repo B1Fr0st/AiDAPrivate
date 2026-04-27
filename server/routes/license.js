@@ -6,6 +6,7 @@ const pool = require('../db/pool');
 const { signPayload, dualSignPayload } = require('../crypto/signing');
 const { deriveKeySeed } = require('../crypto/arc-encrypt');
 const kwWrap = require('../crypto/kw_wrap');
+const arcLicenseBind = require('../crypto/arc-license-bind');
 
 const router = express.Router();
 
@@ -83,6 +84,36 @@ function normalizeBanCheckHwids(body) {
         for (const hwid of body.hwids.slice(0, 8)) append(hwid);
     }
     return values;
+}
+
+const FNV_OFFSET_64 = 0xCBF29CE484222325n;
+const FNV_PRIME_64 = 0x00000100000001B3n;
+const U64_MASK = 0xFFFFFFFFFFFFFFFFn;
+
+function fnv1a64Hex(input) {
+    const buf = Buffer.from(String(input || ''), 'utf8');
+    let hash = FNV_OFFSET_64;
+    for (let i = 0; i < buf.length; i++) {
+        hash ^= BigInt(buf[i]);
+        hash = (hash * FNV_PRIME_64) & U64_MASK;
+    }
+    return hash.toString(16).padStart(16, '0');
+}
+
+function buildProofTokenMessage(sessionToken, hwid, heartbeatCounter, codeHashHex) {
+    const sessionFnv = fnv1a64Hex(sessionToken);
+    const hwidFnv = fnv1a64Hex(hwid);
+    const counter = Number.isFinite(heartbeatCounter) ? Math.max(0, Math.floor(heartbeatCounter)) : 0;
+    const ch = typeof codeHashHex === 'string' ? codeHashHex.trim().toLowerCase() : '';
+    const codeHash16 = /^[0-9a-f]{1,16}$/.test(ch) ? ch.padStart(16, '0') : '0000000000000000';
+    return `${sessionFnv}|${hwidFnv}|${counter}|${codeHash16}`;
+}
+
+function parseProofTokenFirst8(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim().toLowerCase();
+    if (!/^[0-9a-f]{16}$/.test(trimmed)) return null;
+    return Buffer.from(trimmed, 'hex');
 }
 
 function evaluateHeartbeatContinuity(session, body) {
@@ -293,6 +324,51 @@ async function sendTelegramAlert(title, fields) {
     } catch (_) {  }
 }
 
+async function ensureLicenseSecrets(licenseKey, data) {
+    if (!data || typeof data !== 'object') return data;
+    let mutated = false;
+    let installSecretWrapped = data.install_secret_wrapped;
+    let witnessKeyWrapped = data.witness_key_wrapped;
+
+    if (!installSecretWrapped || (Buffer.isBuffer(installSecretWrapped) && installSecretWrapped.length === 0)) {
+        try {
+            const installSecret = kwWrap.generateInstallSecret();
+            installSecretWrapped = kwWrap.wrap(installSecret, 'install_secret/v1');
+            mutated = true;
+        } catch (err) {
+            console.error('[license] backfill install_secret_wrapped failed:', err && err.message ? err.message : err);
+        }
+    }
+
+    if (!witnessKeyWrapped || (Buffer.isBuffer(witnessKeyWrapped) && witnessKeyWrapped.length === 0)) {
+        try {
+            const kw = kwWrap.generateWitnessKey();
+            witnessKeyWrapped = kwWrap.wrap(kw, 'kw/v1');
+            mutated = true;
+        } catch (err) {
+            console.error('[license] backfill witness_key_wrapped failed:', err && err.message ? err.message : err);
+        }
+    }
+
+    if (mutated) {
+        try {
+            await pool.query(
+                `UPDATE licenses
+                    SET install_secret_wrapped = COALESCE($1, install_secret_wrapped),
+                        witness_key_wrapped    = COALESCE($2, witness_key_wrapped)
+                  WHERE key = $3`,
+                [installSecretWrapped, witnessKeyWrapped, licenseKey]
+            );
+            data.install_secret_wrapped = installSecretWrapped;
+            data.witness_key_wrapped = witnessKeyWrapped;
+            console.log('[license] backfilled install_secret_wrapped/witness_key_wrapped for key', licenseKey.slice(0, 12) + '...');
+        } catch (err) {
+            console.error('[license] backfill UPDATE failed:', err && err.message ? err.message : err);
+        }
+    }
+    return data;
+}
+
 async function lookupLicense(licenseKey) {
     if (!licenseKey || typeof licenseKey !== 'string') {
         return { valid: false, reason: 'missing_key' };
@@ -317,6 +393,8 @@ async function lookupLicense(licenseKey) {
     if (data.expires && data.expires !== '' && data.expires < todayStr()) {
         return { valid: false, reason: 'expired', data };
     }
+
+    await ensureLicenseSecrets(licenseKey, data);
 
     return { valid: true, data };
 }
@@ -609,6 +687,15 @@ async function handleValidate(body, clientIp) {
 
     const keySeed = deriveKeySeed(sessionToken, hwid, issuedAt);
 
+    let bindProofHex = '';
+    try {
+        const bindProof = arcLicenseBind.deriveBindProof(lookup.data, sessionToken, hwid, issuedAt, 0n);
+        bindProofHex = bindProof.toString('hex');
+    } catch (err) {
+        console.error('[license] bind_proof derivation failed:', err && err.message ? err.message : err);
+        bindProofHex = '';
+    }
+
     const sigPayload = {
         status: 'valid',
         license_key,
@@ -623,6 +710,7 @@ async function handleValidate(body, clientIp) {
         honeypot_export: honeypotExport,
         ttl_grace_factor: SESSION_TTL_GRACE_FACTOR,
     };
+    if (bindProofHex) sigPayload.bind_proof = bindProofHex;
     const rotationBlock = buildRotationBlock();
     Object.assign(sigPayload, rotationBlock);
     const { signature, next_signature } = dualSignPayload(sigPayload);
@@ -637,14 +725,55 @@ async function handleValidate(body, clientIp) {
 }
 
 
+function maskToken(t) {
+    if (typeof t !== 'string' || t.length === 0) return '<empty>';
+    if (t.length <= 8) return t.slice(0, 2) + '***';
+    return t.slice(0, 6) + '...' + t.slice(-4) + `(len=${t.length})`;
+}
+
+function dbgHb(stage, fields) {
+    try {
+        const parts = [];
+        for (const [k, v] of Object.entries(fields || {})) {
+            let rendered;
+            if (v === null || v === undefined) { rendered = '<null>'; }
+            else if (typeof v === 'string') { rendered = v.length > 80 ? `${v.slice(0, 76)}...` : v; }
+            else if (typeof v === 'object') { rendered = JSON.stringify(v).slice(0, 200); }
+            else { rendered = String(v); }
+            parts.push(`${k}=${rendered}`);
+        }
+        console.log(`[heartbeat][${stage}] ${parts.join(' ')}`);
+    } catch (logErr) {
+        console.warn('[heartbeat][dbg] log_render_failed:', logErr && logErr.message);
+    }
+}
+
 async function handleHeartbeat(body, clientIp) {
     const { license_key, session_token, hwid, code_hash } = body;
+    dbgHb('enter', {
+        license_key: maskToken(license_key),
+        session_token: maskToken(session_token),
+        hwid: maskToken(hwid),
+        client_ip: clientIp,
+        body_keys: Object.keys(body || {}).join(','),
+        has_proof_token: typeof body.proof_token === 'string' && body.proof_token.length > 0,
+        has_driver_proof: typeof body.driver_proof === 'string' && body.driver_proof.length > 0,
+        has_driver_proof_message: typeof body.driver_proof_message === 'string' && body.driver_proof_message.length > 0,
+        has_code_hash: typeof code_hash === 'string' && code_hash.length > 0,
+        code_hash_value: typeof code_hash === 'string' ? code_hash.slice(0, 32) : '<absent>',
+        heartbeat_count: body.heartbeat_count,
+        gate_bitmap: body.gate_bitmap,
+        plugin_version: body.plugin_version,
+        timestamp: body.timestamp,
+    });
 
     if (!license_key || !session_token) {
+        dbgHb('reject_missing_fields', { license_key: !!license_key, session_token: !!session_token });
         return { status: 400, body: { status: 'error', reason: 'missing_fields' } };
     }
 
     const banCheck = await checkBans(hwid, clientIp);
+    dbgHb('ban_check', { banned: banCheck.banned, reason: banCheck.reason });
     if (banCheck.banned) {
         return { status: 200, body: { status: 'banned', reason: banCheck.reason } };
     }
@@ -652,15 +781,22 @@ async function handleHeartbeat(body, clientIp) {
     if (body.timestamp && typeof body.timestamp === 'number') {
         const drift = Math.abs(Math.floor(Date.now() / 1000) - body.timestamp);
         if (drift > 300) {
+            dbgHb('clock_drift', { drift, limit: 300 });
             return { status: 200, body: { status: 'invalid', reason: 'clock_drift' } };
         }
     }
 
     if (!isHexNonce(body.heartbeat_nonce || '', 16, 128)) {
+        dbgHb('invalid_heartbeat_nonce', { len: (body.heartbeat_nonce || '').length });
         return { status: 200, body: { status: 'invalid', reason: 'invalid_heartbeat_nonce' } };
     }
 
     const lookup = await lookupLicense(license_key);
+    dbgHb('lookup_license', {
+        valid: lookup.valid,
+        reason: lookup.reason || '<none>',
+        plan: lookup.data ? lookup.data.plan : '<no-data>',
+    });
     if (!lookup.valid) {
         return {
             status: 200,
@@ -669,11 +805,26 @@ async function handleHeartbeat(body, clientIp) {
     }
 
     const session = await getSession(license_key);
+    dbgHb('session_lookup', {
+        found: !!session,
+        token_match: session ? session.session_token === session_token : false,
+        session_token_db: session ? maskToken(session.session_token) : '<no-session>',
+        session_token_body: maskToken(session_token),
+        hwid_db: session ? session.hwid : '<no-session>',
+        issued_at: session ? session.issued_at : null,
+        ttl: session ? session.ttl : null,
+        kill_flag: session ? session.kill_flag : null,
+        heartbeat_count: session ? session.heartbeat_count : null,
+        last_code_hash: session ? maskToken(session.last_code_hash || '') : '<no-session>',
+        last_proof_token: session ? maskToken(session.last_proof_token || '') : '<no-session>',
+        last_gate_bitmap: session ? session.last_gate_bitmap : null,
+    });
     if (!session || session.session_token !== session_token) {
         return { status: 200, body: { status: 'invalid', reason: 'session_mismatch' } };
     }
 
     if (session.kill_flag) {
+        dbgHb('kill_flag_set', { license_key: maskToken(license_key) });
         return { status: 200, body: { status: 'killed', alive: false, reason: 'server_kill' } };
     }
 
@@ -681,11 +832,13 @@ async function handleHeartbeat(body, clientIp) {
     if (session.issued_at && session.ttl) {
         const expiresAt = session.issued_at + Math.floor(session.ttl * SESSION_TTL_GRACE_FACTOR);
         if (now > expiresAt) {
+            dbgHb('session_expired', { now, issued_at: session.issued_at, ttl: session.ttl, expiresAt });
             return { status: 200, body: { status: 'invalid', reason: 'session_expired' } };
         }
     }
 
     if (hwid && session.hwid && hwid !== session.hwid) {
+        dbgHb('hwid_mismatch', { body_hwid: maskToken(hwid), session_hwid: maskToken(session.hwid) });
         return { status: 200, body: { status: 'invalid', reason: 'hwid_mismatch' } };
     }
 
@@ -715,14 +868,90 @@ async function handleHeartbeat(body, clientIp) {
     }
 
     const continuity = evaluateHeartbeatContinuity(session, body);
+    dbgHb('continuity', {
+        proof_token_to_store: maskToken(continuity.proof_token_to_store || ''),
+        continuity_reasons: continuity.continuity_reasons,
+        last_proof_token_db: maskToken(session.last_proof_token || ''),
+        body_proof_token: maskToken(body.proof_token || ''),
+        body_heartbeat_count: body.heartbeat_count,
+        server_heartbeat_count: session.heartbeat_count || 0,
+    });
     const violationReasons = [];
     const violationEvidence = {};
 
+    const clientProofFirst8 = parseProofTokenFirst8(body.proof_token);
+    dbgHb('arc_proof_check_pre', {
+        proof_token_present: !!clientProofFirst8,
+        proof_token_raw_len: typeof body.proof_token === 'string' ? body.proof_token.length : 0,
+    });
+    if (clientProofFirst8) {
+        const expectedHbCount = Number.isFinite(Number(body.heartbeat_count))
+            ? Math.max(0, Math.floor(Number(body.heartbeat_count)))
+            : Math.max(0, Math.floor(Number(session.heartbeat_count || 0)) + 1);
+        const proofMessage = buildProofTokenMessage(
+            session.session_token,
+            session.hwid || hwid || '',
+            expectedHbCount,
+            typeof code_hash === 'string' ? code_hash : ''
+        );
+        const proofOk = arcLicenseBind.verifyArcProofToken(lookup.data, proofMessage, clientProofFirst8);
+        dbgHb('arc_proof_check_post', {
+            proof_message: proofMessage,
+            client_first8_hex: clientProofFirst8.toString('hex'),
+            proof_ok: proofOk,
+            expected_hb_count: expectedHbCount,
+        });
+        if (!proofOk) {
+            violationReasons.push('arc_proof_token_mismatch');
+            violationEvidence.proof_token_message = proofMessage;
+            violationEvidence.proof_token_first8 = clientProofFirst8.toString('hex');
+        }
+    }
+
+    const driverProofRaw = body.driver_proof;
+    const driverProofMessageRaw = body.driver_proof_message;
+    const driverProofPresent = typeof driverProofRaw === 'string' && driverProofRaw.length > 0
+        && typeof driverProofMessageRaw === 'string' && driverProofMessageRaw.length > 0;
+    const issuedAtNum = Number(session.issued_at || 0);
+    const sessionAgeSeconds = Number.isFinite(issuedAtNum) && issuedAtNum > 0 ? (now - issuedAtNum) : 0;
+    dbgHb('driver_proof_check', {
+        present: driverProofPresent,
+        driver_proof_len: typeof driverProofRaw === 'string' ? driverProofRaw.length : 0,
+        message_len: typeof driverProofMessageRaw === 'string' ? driverProofMessageRaw.length : 0,
+        session_age_s: sessionAgeSeconds,
+        threshold_s: 1800,
+        will_violate_if_missing: !driverProofPresent && sessionAgeSeconds > 1800,
+    });
+    if (driverProofPresent) {
+        const driverProofResult = arcLicenseBind.verifyDriverProof(lookup.data, driverProofMessageRaw, driverProofRaw);
+        dbgHb('driver_proof_verify', { result: driverProofResult });
+        if (driverProofResult === false) {
+            violationReasons.push('arc_driver_proof_invalid');
+            violationEvidence.driver_proof_message = driverProofMessageRaw;
+            violationEvidence.driver_proof_signature = driverProofRaw;
+        }
+    } else {
+        if (sessionAgeSeconds > 1800) {
+            violationReasons.push('arc_driver_proof_missing');
+            violationEvidence.session_age_seconds = sessionAgeSeconds;
+        }
+    }
+
+    const codeHashStored = session.last_code_hash || '';
+    const codeHashIncoming = typeof code_hash === 'string' ? code_hash : '';
+    const codeHashMatch = codeHashStored === codeHashIncoming;
+    const codeHashEnforce = codeHashStored.length > 0 && codeHashIncoming.length > 0 && !codeHashMatch;
+    dbgHb('code_hash_check', {
+        stored: codeHashStored ? codeHashStored.slice(0, 32) : '<empty>',
+        incoming: codeHashIncoming ? codeHashIncoming.slice(0, 32) : '<empty>',
+        match: codeHashMatch,
+        will_violate: codeHashEnforce,
+    });
     if (typeof code_hash === 'string' && code_hash.length > 0) {
-        if (session.last_code_hash && session.last_code_hash !== '' && code_hash !== session.last_code_hash) {
+        if (codeHashEnforce) {
             violationReasons.push('code_hash_mismatch');
-            violationEvidence.previous_code_hash = session.last_code_hash;
-            violationEvidence.current_code_hash = code_hash;
+            violationEvidence.previous_code_hash = codeHashStored;
+            violationEvidence.current_code_hash = codeHashIncoming;
         }
     }
 
@@ -759,6 +988,14 @@ async function handleHeartbeat(body, clientIp) {
     if (violationReasons.length > 0) {
         const violationReason = sanitizeReason(`heartbeat_${violationReasons.join('_')}`);
         const effectiveHwid = hwid || session.hwid;
+        dbgHb('killing_session', {
+            reasons: violationReasons,
+            combined_reason: violationReason,
+            effective_hwid: maskToken(effectiveHwid),
+            evidence_keys: Object.keys(violationEvidence),
+            evidence: violationEvidence,
+            continuity_reasons: continuity.continuity_reasons,
+        });
         await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
         await revokeLicenseAndSession(license_key, violationReason, body.plugin_version, effectiveHwid);
         await recordBan(effectiveHwid, clientIp, violationReason, body.plugin_version, {
@@ -776,6 +1013,12 @@ async function handleHeartbeat(body, clientIp) {
         });
         return { status: 200, body: { status: 'killed', alive: false, reason: violationReason } };
     }
+    dbgHb('accept', {
+        next_hb_count: (Number(session.heartbeat_count) || 0) + 1,
+        next_code_hash: codeHashIncoming ? codeHashIncoming.slice(0, 32) : codeHashStored.slice(0, 32),
+        proof_token_to_store: maskToken(continuity.proof_token_to_store || ''),
+        new_gate_bitmap: gateBitmapToStore,
+    });
 
     await pool.query(`
         UPDATE sessions SET
@@ -1177,11 +1420,28 @@ router.post('/create', async (req, res) => {
     const key = 'AIDA-' + segments.join('-');
     const now = Math.floor(Date.now() / 1000);
 
+    let installSecretWrapped = null;
+    let witnessKeyWrapped = null;
+    try {
+        const installSecret = kwWrap.generateInstallSecret();
+        installSecretWrapped = kwWrap.wrap(installSecret, 'install_secret/v1');
+    } catch (err) {
+        console.error('[license/create] install_secret wrap failed:', err && err.message ? err.message : err);
+        return res.status(500).json({ status: 'error', reason: 'install_secret_wrap_failed' });
+    }
+    try {
+        const kw = kwWrap.generateWitnessKey();
+        witnessKeyWrapped = kwWrap.wrap(kw, 'kw/v1');
+    } catch (err) {
+        console.error('[license/create] witness_key wrap failed:', err && err.message ? err.message : err);
+        return res.status(500).json({ status: 'error', reason: 'witness_key_wrap_failed' });
+    }
+
     try {
         await pool.query(
-            `INSERT INTO licenses (key, active, hwid, expires, plan, note, created_at, created_by)
-             VALUES ($1, true, '', $2, $3, $4, $5, $6)`,
-            [key, expires || '', plan, safeNote, now, safeCreatedBy]
+            `INSERT INTO licenses (key, active, hwid, expires, plan, note, created_at, created_by, install_secret_wrapped, witness_key_wrapped)
+             VALUES ($1, true, '', $2, $3, $4, $5, $6, $7, $8)`,
+            [key, expires || '', plan, safeNote, now, safeCreatedBy, installSecretWrapped, witnessKeyWrapped]
         );
     } catch (err) {
         console.error('[license/create] DB insert error:', err);
@@ -1195,6 +1455,9 @@ router._internal = {
     evaluateHeartbeatContinuity,
     isNonEnforcingBanReason,
     normalizeBanCheckHwids,
+    buildProofTokenMessage,
+    parseProofTokenFirst8,
+    fnv1a64Hex,
 };
 
 module.exports = router;

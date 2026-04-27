@@ -8,7 +8,7 @@
 #   .\deploy_to_server.ps1              # Upload ARC + AiDAStandalone (auto-detect build dir)
 #   .\deploy_to_server.ps1 -ArcOnly     # Upload ARC only
 #   .\deploy_to_server.ps1 -ExeOnly     # Upload AiDAStandalone only
-#   .\deploy_to_server.ps1 -BuildDir "C:\path\to\build" # Specify custom build directory
+#   .\deploy_to_server.ps1 -BuildDir "C:\Users\ruar\AiDAPrivate\build-ninja" # Specify custom build directory
 # ============================================================================
 
 param(

@@ -7,16 +7,32 @@ const IV_LEN = 12;
 const TAG_LEN = 16;
 const KEY_LEN = 32;
 
+let s_warned_master_key_fallback = false;
+
 function loadMasterKey() {
     const src = process.env.SERVER_MASTER_KEY_B64 || '';
-    if (!src) {
-        throw new Error('SERVER_MASTER_KEY_B64 env var not set; cannot wrap Kw / install_secret');
+    if (src) {
+        const key = Buffer.from(src, 'base64');
+        if (key.length !== KEY_LEN) {
+            throw new Error(`SERVER_MASTER_KEY_B64 must decode to 32 bytes; got ${key.length}`);
+        }
+        return key;
     }
-    const key = Buffer.from(src, 'base64');
-    if (key.length !== KEY_LEN) {
-        throw new Error(`SERVER_MASTER_KEY_B64 must decode to 32 bytes; got ${key.length}`);
+    const arcSecret = process.env.ARC_MASTER_SECRET || '';
+    if (!arcSecret) {
+        throw new Error('Neither SERVER_MASTER_KEY_B64 nor ARC_MASTER_SECRET is set; cannot derive master key');
     }
-    return key;
+    const derived = crypto.createHmac('sha256', Buffer.from(arcSecret, 'utf8'))
+                          .update('aida/server-master-key/v1')
+                          .digest();
+    if (derived.length !== KEY_LEN) {
+        throw new Error(`derived master key length ${derived.length} != ${KEY_LEN}`);
+    }
+    if (!s_warned_master_key_fallback) {
+        s_warned_master_key_fallback = true;
+        console.warn('[kw_wrap] SERVER_MASTER_KEY_B64 not set; deriving master key from ARC_MASTER_SECRET (set SERVER_MASTER_KEY_B64 in .env for an independent key).');
+    }
+    return derived;
 }
 
 function deriveSubKey(label) {

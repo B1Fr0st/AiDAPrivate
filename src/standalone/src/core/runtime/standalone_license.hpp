@@ -105,6 +105,12 @@ namespace standalone_license
     uint64_t arc_validate_tool(uint64_t tool_name_hash, uint64_t gate_token);
     bool verify_tool_runtime(gate_slot_t slot, uint64_t gate_token, const std::string& tool_name);
     arc_heartbeat_result_t arc_heartbeat();
+    bool arc_unseal_feature_blocking(uint32_t feature_id,
+                                     const uint8_t* nonce,
+                                     uint32_t nonce_len,
+                                     uint8_t* out,
+                                     uint32_t* out_size,
+                                     uint32_t out_cap);
     uint64_t get_server_nonce_hash();
     std::string get_session_token();
 }

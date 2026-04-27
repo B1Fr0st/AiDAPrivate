@@ -1813,7 +1813,6 @@ void render_settings_inline(float panel_w, float panel_h)
 }
 
 
-
 mcp_client::manager_t& get_mcp_client_manager()
 {
     return s_mcp_client_mgr;

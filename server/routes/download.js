@@ -5,8 +5,9 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const pool = require('../db/pool');
-const { encryptArc, encryptPage, splitIntoPages, getPageCount, deriveChainTag } = require('../crypto/arc-encrypt');
+const { encryptArc, encryptArcFull, encryptPage, splitIntoPages, getPageCount, deriveChainTag } = require('../crypto/arc-encrypt');
 const { signPayload } = require('../crypto/signing');
+const arcLicenseBind = require('../crypto/arc-license-bind');
 
 const router = express.Router();
 
@@ -64,6 +65,43 @@ function loadArcBlob() {
 }
 
 
+const TRANSFORMED_BLOB_TTL_MS = 30 * 60 * 1000;
+const transformedArcBlobCache = new Map();
+
+function getTransformedArcBlob(sessionRow, licenseRow) {
+    if (!sessionRow || typeof sessionRow.session_token !== 'string' || sessionRow.session_token.length === 0) {
+        throw new Error('arc_transform_missing_session_token');
+    }
+    const sessionToken = sessionRow.session_token;
+    const now = Date.now();
+    const cached = transformedArcBlobCache.get(sessionToken);
+    if (cached && cached.blob && (now - cached.ts) < TRANSFORMED_BLOB_TTL_MS) {
+        cached.ts = now;
+        return cached.blob;
+    }
+    const baseBlob = loadArcBlob();
+    const transformed = arcLicenseBind.applyLicenseTransform(baseBlob, licenseRow, sessionRow);
+    transformedArcBlobCache.set(sessionToken, { blob: transformed, ts: now });
+    return transformed;
+}
+
+function evictTransformedArcBlob(sessionToken) {
+    if (!sessionToken || typeof sessionToken !== 'string') return;
+    transformedArcBlobCache.delete(sessionToken);
+}
+
+function purgeExpiredTransformedBlobs() {
+    const now = Date.now();
+    for (const [token, entry] of transformedArcBlobCache) {
+        if (!entry || !entry.blob || (now - entry.ts) >= TRANSFORMED_BLOB_TTL_MS) {
+            transformedArcBlobCache.delete(token);
+        }
+    }
+}
+
+setInterval(purgeExpiredTransformedBlobs, 5 * 60 * 1000).unref();
+
+
 async function validateSession(licenseKey, sessionToken, hwid) {
     if (!licenseKey || !sessionToken || !hwid) {
         return { valid: false, reason: 'missing_fields' };
@@ -113,11 +151,16 @@ async function validateSession(licenseKey, sessionToken, hwid) {
     if (session.issued_at && session.ttl) {
         const expiresAt = session.issued_at + Math.floor(session.ttl * graceFactor);
         if (now > expiresAt) {
+            evictTransformedArcBlob(session.session_token);
             return { valid: false, reason: 'session_expired' };
         }
     }
 
-    return { valid: true, session };
+    if (session.kill_flag) {
+        evictTransformedArcBlob(session.session_token);
+    }
+
+    return { valid: true, session, license };
 }
 
 
@@ -133,11 +176,12 @@ router.post('/arc', async (req, res) => {
         }
 
         const session = validation.session;
+        const license = validation.license;
 
 
         let arcBlob;
         try {
-            arcBlob = loadArcBlob();
+            arcBlob = getTransformedArcBlob(session, license);
         } catch (err) {
             console.error('[arc] Failed to load ARC blob:', err.message);
             return res.status(503).json({ status: 'error', reason: 'service_unavailable' });
@@ -146,11 +190,10 @@ router.post('/arc', async (req, res) => {
         arcBlob = watermarkBinary(arcBlob, license_key, hwid, clientIp);
 
 
-        const { encrypted, iv, authTag, hash } = encryptArc(
+        const { encrypted, iv, authTag, hash } = encryptArcFull(
             arcBlob,
-            session.session_token,
-            hwid,
-            session.issued_at
+            license,
+            session
         );
 
 
@@ -308,6 +351,7 @@ router.post('/arc/page/:index', async (req, res) => {
         }
 
         const session = validation.session;
+        const license = validation.license;
 
         if (session.kill_flag) {
             return res.status(403).json({ status: 'error', reason: 'killed' });
@@ -321,7 +365,7 @@ router.post('/arc/page/:index', async (req, res) => {
 
         let arcBlob;
         try {
-            arcBlob = loadArcBlob();
+            arcBlob = getTransformedArcBlob(session, license);
         } catch (err) {
             console.error('[arc-page] Failed to load ARC blob:', err.message);
             return res.status(503).json({ status: 'error', reason: 'service_unavailable' });
@@ -463,13 +507,14 @@ router.post('/pages/:index', async (req, res) => {
         }
 
         const session = validation.session;
+        const license = validation.license;
         if (session.kill_flag) {
             return res.status(403).json({ status: 'error', reason: 'killed' });
         }
 
         let arcBlob;
         try {
-            arcBlob = loadArcBlob();
+            arcBlob = getTransformedArcBlob(session, license);
         } catch (err) {
             console.error('[pages] Failed to load ARC blob:', err.message);
             return res.status(503).json({ status: 'error', reason: 'service_unavailable' });
@@ -634,10 +679,11 @@ router.post('/pages/rotated/:index', async (req, res) => {
         }
 
         const session = validation.session;
+        const license = validation.license;
 
         let arcBlob;
         try {
-            arcBlob = loadArcBlob();
+            arcBlob = getTransformedArcBlob(session, license);
         } catch (err) {
             return res.status(503).json({ status: 'error', reason: 'service_unavailable' });
         }
@@ -655,13 +701,14 @@ router.post('/pages/rotated/:index', async (req, res) => {
         const pages = splitIntoPages(arcBlob);
         const pageData = pages[pageIndex];
         const rotatedIssuedAt = Number(rot.epoch);
+        const rotatedSession = Object.assign({}, session, { issued_at: rotatedIssuedAt });
 
         const { encrypted, iv, authTag, hmac } = encryptPage(
             pageData,
             pageIndex,
-            session.session_token,
+            rotatedSession.session_token,
             hwid,
-            rotatedIssuedAt,
+            rotatedSession.issued_at,
             proof_token || '',
             prevChainTag
         );
