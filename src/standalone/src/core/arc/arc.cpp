@@ -2587,14 +2587,35 @@ ARC_API bool arc_seed_pool_init(const uint8_t*, uint32_t)
 
 }
 
-BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
+namespace {
+struct arc_static_init_probe_t {
+    arc_static_init_probe_t(const char* tag) { arc_internal::arc_log("static_init", tag); }
+};
+static arc_static_init_probe_t g_static_init_probe_a("ctor_a_top");
+static arc_static_init_probe_t g_static_init_probe_z("ctor_z_bottom");
+}
+
+BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
 {
+    char buf[64];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "entry reason=%lu hinst=%p reserved=%p", (unsigned long)reason, (void*)hinst, reserved);
+    arc_internal::arc_log("dllmain", buf);
     switch (reason) {
     case DLL_PROCESS_ATTACH:
+        arc_internal::arc_log("dllmain", "PROCESS_ATTACH_case");
         break;
     case DLL_PROCESS_DETACH:
+        arc_internal::arc_log("dllmain", "PROCESS_DETACH_pre_cleanup");
         arc_cleanup();
+        arc_internal::arc_log("dllmain", "PROCESS_DETACH_post_cleanup");
+        break;
+    case DLL_THREAD_ATTACH:
+        arc_internal::arc_log("dllmain", "THREAD_ATTACH");
+        break;
+    case DLL_THREAD_DETACH:
+        arc_internal::arc_log("dllmain", "THREAD_DETACH");
         break;
     }
+    arc_internal::arc_log("dllmain", "return_TRUE");
     return TRUE;
 }

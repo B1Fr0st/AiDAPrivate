@@ -41,4 +41,7 @@ namespace arc_loader
 
 
     const std::string& last_error();
+
+
+    void prime_import_cache();
 }

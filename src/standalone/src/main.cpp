@@ -17,6 +17,7 @@
 #include "standalone_license.hpp"
 #include "standalone_settings.hpp"
 #include "standalone_driver.hpp"
+#include "core/runtime/arc_loader.hpp"
 #include "core/anti-tamper/orchestrator.hpp"
 #include "core/anti-tamper/hv_preflight.hpp"
 #include "network_view.hpp"
@@ -325,6 +326,9 @@ __declspec(noinline) static DWORD seh_driver_bridge_initialize()
 int main(int, char**)
 {
     crash_log_write("main_enter");
+
+    arc_loader::prime_import_cache();
+    crash_log_write("arc_import_cache_primed");
 
     SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
         standalone_anti_dump::handle_strip::clear_critical_flags();

@@ -6,7 +6,10 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <cstring>
+#include <cctype>
+#include <atomic>
 #include <algorithm>
+#include <cstdio>
 
 #pragma comment(lib, "bcrypt.lib")
 
@@ -131,12 +134,253 @@ namespace
         return true;
     }
 
-    void set_error(const char* msg)
+    void set_error_text(const std::string& msg)
     {
         g_last_error = msg;
         OutputDebugStringA("ARC Loader: ");
-        OutputDebugStringA(msg);
+        OutputDebugStringA(msg.c_str());
         OutputDebugStringA("\n");
+    }
+
+    void set_error(const char* msg)
+    {
+        set_error_text(msg ? std::string(msg) : std::string());
+    }
+
+    void arc_breadcrumb(const char* tag)
+    {
+        if (!tag)
+            return;
+
+        static char s_path[MAX_PATH] = {};
+        static bool s_path_init = false;
+        if (!s_path_init) {
+            DWORD ret = GetModuleFileNameA(nullptr, s_path, MAX_PATH);
+            if (ret == 0 || ret >= MAX_PATH) {
+                strcpy_s(s_path, "aida_debug.log");
+            } else {
+                char* last = strrchr(s_path, '\\');
+                if (last)
+                    *(last + 1) = '\0';
+                else
+                    s_path[0] = '\0';
+                strcat_s(s_path, "aida_debug.log");
+            }
+            s_path_init = true;
+        }
+
+        HANDLE hf = CreateFileA(s_path, FILE_APPEND_DATA | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf == INVALID_HANDLE_VALUE)
+            return;
+
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        char line[512];
+        int len = _snprintf_s(line, sizeof(line), _TRUNCATE,
+            "[%02d:%02d:%02d.%03d] [arc_loader] %s\r\n",
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag);
+        if (len > 0) {
+            DWORD written = 0;
+            WriteFile(hf, line, static_cast<DWORD>(len), &written, nullptr);
+        }
+        CloseHandle(hf);
+    }
+
+    const char* runtime_import_name(const char* name)
+    {
+        if (!name)
+            return "";
+        if (_strnicmp(name, "api-ms-win-crt-", 15) == 0)
+            return "ucrtbase.dll";
+        if (_strnicmp(name, "api-ms-win-core-", 16) == 0)
+            return "kernelbase.dll";
+        return name;
+    }
+
+    bool names_equal_ci(const char* a, const char* b)
+    {
+        if (!a || !b)
+            return false;
+        return _stricmp(a, b) == 0;
+    }
+
+    struct primed_module_t
+    {
+        uint64_t  name_hash;
+        uintptr_t xored_handle;
+    };
+
+    constexpr size_t kPrimedCacheCap = 64;
+
+    primed_module_t* primed_cache_storage()
+    {
+        static primed_module_t s[kPrimedCacheCap]{};
+        return s;
+    }
+
+    std::atomic<size_t>& primed_cache_count()
+    {
+        static std::atomic<size_t> n{0};
+        return n;
+    }
+
+    uint64_t& primed_cache_xor_key()
+    {
+        static uint64_t k = 0;
+        return k;
+    }
+
+    uint64_t& primed_cache_hash_k0()
+    {
+        static uint64_t k = 0;
+        return k;
+    }
+
+    uint64_t& primed_cache_hash_k1()
+    {
+        static uint64_t k = 0;
+        return k;
+    }
+
+    std::atomic<bool>& primed_cache_ready()
+    {
+        static std::atomic<bool> b{false};
+        return b;
+    }
+
+    uint64_t primed_hash_name_ci(const char* s)
+    {
+        char buf[160];
+        size_t i = 0;
+        if (s) {
+            for (; i + 1 < sizeof(buf) && s[i]; ++i)
+                buf[i] = static_cast<char>(::tolower(static_cast<unsigned char>(s[i])));
+        }
+        buf[i] = 0;
+        return siphash_2_4(reinterpret_cast<const uint8_t*>(buf), i,
+                           primed_cache_hash_k0(), primed_cache_hash_k1());
+    }
+
+    void primed_cache_insert(const char* name)
+    {
+        if (!name || !*name)
+            return;
+        const size_t cur = primed_cache_count().load(std::memory_order_relaxed);
+        if (cur >= kPrimedCacheCap)
+            return;
+        HMODULE h = LoadLibraryA(name);
+        if (!h)
+            h = GetModuleHandleA(name);
+        if (!h)
+            return;
+        const uint64_t hash = primed_hash_name_ci(name);
+        primed_module_t* arr = primed_cache_storage();
+        for (size_t i = 0; i < cur; ++i) {
+            if (arr[i].name_hash == hash)
+                return;
+        }
+        arr[cur].name_hash    = hash;
+        arr[cur].xored_handle = reinterpret_cast<uintptr_t>(h)
+                              ^ static_cast<uintptr_t>(primed_cache_xor_key());
+        primed_cache_count().store(cur + 1, std::memory_order_release);
+    }
+
+    HMODULE primed_cache_lookup(const char* name)
+    {
+        if (!primed_cache_ready().load(std::memory_order_acquire))
+            return nullptr;
+        if (!name || !*name)
+            return nullptr;
+        const uint64_t hash = primed_hash_name_ci(name);
+        const size_t cur = primed_cache_count().load(std::memory_order_acquire);
+        primed_module_t* arr = primed_cache_storage();
+        for (size_t i = 0; i < cur; ++i) {
+            if (arr[i].name_hash == hash) {
+                return reinterpret_cast<HMODULE>(
+                    arr[i].xored_handle
+                    ^ static_cast<uintptr_t>(primed_cache_xor_key()));
+            }
+        }
+        return nullptr;
+    }
+
+    void primed_cache_initialize()
+    {
+        if (primed_cache_ready().load(std::memory_order_acquire))
+            return;
+
+        uint64_t kx = 0;
+        if (!generate_random_u64(kx))
+            kx = 0xA1DA10ADCAFEBEEFull;
+        uint64_t k0 = 0;
+        if (!generate_random_u64(k0))
+            k0 = 0xDEADBEEFCAFEBABEull;
+        uint64_t k1 = 0;
+        if (!generate_random_u64(k1))
+            k1 = 0x1337C0DE5EEDF00Dull;
+
+        primed_cache_xor_key()  = kx;
+        primed_cache_hash_k0()  = k0;
+        primed_cache_hash_k1()  = k1;
+
+        static const char* kPrimes[] = {
+            "kernel32.dll",
+            "kernelbase.dll",
+            "ntdll.dll",
+            "bcrypt.dll",
+            "advapi32.dll",
+            "ws2_32.dll",
+            "iphlpapi.dll",
+            "winhttp.dll",
+            "crypt32.dll",
+            "secur32.dll",
+            "msvcrt.dll",
+            "ucrtbase.dll",
+            "msvcp140.dll",
+            "msvcp140_1.dll",
+            "msvcp140_2.dll",
+            "msvcp140_atomic_wait.dll",
+            "msvcp140_codecvt_ids.dll",
+            "vcruntime140.dll",
+            "vcruntime140_1.dll",
+        };
+
+        for (const char* n : kPrimes)
+            primed_cache_insert(n);
+
+        primed_cache_ready().store(true, std::memory_order_release);
+    }
+
+    HMODULE load_import_module(const char* dll_name)
+    {
+        const char* runtime_name = runtime_import_name(dll_name);
+
+        HMODULE hmod = primed_cache_lookup(runtime_name);
+        if (!hmod && !names_equal_ci(runtime_name, dll_name))
+            hmod = primed_cache_lookup(dll_name);
+
+        if (!hmod)
+            hmod = GetModuleHandleA(dll_name);
+        if (!hmod && !names_equal_ci(runtime_name, dll_name))
+            hmod = GetModuleHandleA(runtime_name);
+        if (!hmod)
+            hmod = LoadLibraryA(dll_name);
+        if (!hmod && !names_equal_ci(runtime_name, dll_name))
+            hmod = LoadLibraryA(runtime_name);
+
+        if (!hmod) {
+            const DWORD err = GetLastError();
+            char buf[512];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "Failed to load import DLL: %.180s resolved=%.180s err=%lu",
+                dll_name ? dll_name : "<null>",
+                runtime_name ? runtime_name : "<null>",
+                static_cast<unsigned long>(err));
+            set_error_text(buf);
+        }
+        return hmod;
     }
 
 
@@ -359,18 +603,13 @@ namespace
             const char* dll_name = reinterpret_cast<const char*>(image_base + desc->Name);
 
             if (!is_allowed_import_dll(dll_name)) {
-                set_error("ARC imports from disallowed DLL.");
+                set_error_text(std::string("ARC imports from disallowed DLL: ") + dll_name);
                 return false;
             }
 
-            HMODULE hMod = GetModuleHandleA(dll_name);
-            if (!hMod) {
-                hMod = LoadLibraryA(dll_name);
-                if (!hMod) {
-                    set_error("Failed to load import DLL.");
-                    return false;
-                }
-            }
+            HMODULE hMod = load_import_module(dll_name);
+            if (!hMod)
+                return false;
 
             auto* thunk_ref = reinterpret_cast<IMAGE_THUNK_DATA*>(
                 image_base + (desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk));
@@ -390,7 +629,19 @@ namespace
                 }
 
                 if (!proc) {
-                    set_error("Failed to resolve import function.");
+                    if (IMAGE_SNAP_BY_ORDINAL64(thunk_ref->u1.Ordinal)) {
+                        char buf[256];
+                        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                            "Failed to resolve import ordinal: %.160s#%llu err=%lu",
+                            dll_name,
+                            static_cast<unsigned long long>(IMAGE_ORDINAL64(thunk_ref->u1.Ordinal)),
+                            static_cast<unsigned long>(GetLastError()));
+                        set_error_text(buf);
+                    } else {
+                        auto* import_by_name = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
+                            image_base + thunk_ref->u1.AddressOfData);
+                        set_error_text(std::string("Failed to resolve import function: ") + dll_name + "!" + reinterpret_cast<const char*>(import_by_name->Name));
+                    }
                     return false;
                 }
 
@@ -537,6 +788,8 @@ namespace arc_loader
         loaded_module_t result{};
         g_last_error.clear();
 
+        arc_breadcrumb("load_enter");
+
         if (!pe_buffer || pe_size == 0) {
             set_error("Null PE buffer.");
             return result;
@@ -555,6 +808,8 @@ namespace arc_loader
             return result;
         }
 
+        arc_breadcrumb("load_validate_ok");
+
         auto* image_base = static_cast<uint8_t*>(
             VirtualAlloc(reinterpret_cast<LPVOID>(nt->OptionalHeader.ImageBase),
                          image_size,
@@ -569,12 +824,14 @@ namespace arc_loader
             return result;
         }
 
+        arc_breadcrumb("load_alloc_ok");
 
         if (!map_sections(image_base, pe_buffer, pe_size, nt)) {
             VirtualFree(image_base, 0, MEM_RELEASE);
             return result;
         }
 
+        arc_breadcrumb("load_map_ok");
 
         auto* mapped_nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
             image_base + dos->e_lfanew);
@@ -585,27 +842,64 @@ namespace arc_loader
             return result;
         }
 
+        arc_breadcrumb("load_reloc_ok");
 
         if (!resolve_imports(image_base, mapped_nt)) {
             VirtualFree(image_base, 0, MEM_RELEASE);
             return result;
         }
 
+        arc_breadcrumb("load_imports_ok");
 
         finalize_sections(image_base, mapped_nt);
 
+        arc_breadcrumb("load_finalize_ok");
+
         install_guard_pages(image_base, mapped_nt);
+
+        arc_breadcrumb("load_guard_pages_ok");
 
         if (!process_tls(image_base, mapped_nt)) {
             VirtualFree(image_base, 0, MEM_RELEASE);
             return result;
         }
 
+        arc_breadcrumb("load_tls_ok");
+
         SecureZeroMemory(pe_buffer, pe_size);
+
+        arc_breadcrumb("load_zeroed_source_pe");
 
         using DllMain_t = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
         auto entry_point = reinterpret_cast<DllMain_t>(
             image_base + mapped_nt->OptionalHeader.AddressOfEntryPoint);
+
+        arc_breadcrumb("load_dllmain_pre");
+
+        struct watchdog_ctx_t { volatile LONG done; ULONGLONG start_tick; };
+        watchdog_ctx_t wd_ctx{ 0, GetTickCount64() };
+        DWORD wd_tid = 0;
+        HANDLE wd_thread = CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
+            auto* c = reinterpret_cast<watchdog_ctx_t*>(p);
+            int sec = 0;
+            while (InterlockedCompareExchange(&c->done, 0, 0) == 0) {
+                Sleep(1000);
+                ++sec;
+                ULONGLONG elapsed_ms = GetTickCount64() - c->start_tick;
+                char tag[96];
+                _snprintf_s(tag, sizeof(tag), _TRUNCATE, "load_dllmain_watchdog_tick_%ds_elapsed=%llums", sec, (unsigned long long)elapsed_ms);
+                arc_breadcrumb(tag);
+                if (sec >= 60) break;
+            }
+            return 0;
+        }, &wd_ctx, 0, &wd_tid);
+        if (wd_thread == nullptr) {
+            char wd_err[96];
+            _snprintf_s(wd_err, sizeof(wd_err), _TRUNCATE, "load_dllmain_watchdog_create_FAILED_err=%lu", (unsigned long)GetLastError());
+            arc_breadcrumb(wd_err);
+        } else {
+            arc_breadcrumb("load_dllmain_watchdog_spawned");
+        }
 
         BOOL dll_result = FALSE;
         __try {
@@ -616,9 +910,23 @@ namespace arc_loader
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             set_error("DllMain threw an exception during DLL_PROCESS_ATTACH.");
+            arc_breadcrumb("load_dllmain_seh_caught");
+            InterlockedExchange(&wd_ctx.done, 1);
+            if (wd_thread) { WaitForSingleObject(wd_thread, 2000); CloseHandle(wd_thread); }
             VirtualFree(image_base, 0, MEM_RELEASE);
             return result;
         }
+        InterlockedExchange(&wd_ctx.done, 1);
+        if (wd_thread) {
+            WaitForSingleObject(wd_thread, 2000);
+            CloseHandle(wd_thread);
+        }
+
+        ULONGLONG dllmain_elapsed = GetTickCount64() - wd_ctx.start_tick;
+        char post_tag[96];
+        _snprintf_s(post_tag, sizeof(post_tag), _TRUNCATE, "load_dllmain_post_%s_elapsed=%llums",
+            dll_result ? "ok" : "false", (unsigned long long)dllmain_elapsed);
+        arc_breadcrumb(post_tag);
 
         if (!dll_result) {
             set_error("DllMain returned FALSE.");
@@ -651,6 +959,8 @@ namespace arc_loader
             return result;
         }
 
+        arc_breadcrumb("load_binding_hashes_ok");
+
         result.base             = image_base;
         result.image_size       = image_size;
         result.header_size      = header_size_capture;
@@ -662,6 +972,8 @@ namespace arc_loader
         result.loader_code_hash = loader_code_hash;
         result.binding_salt     = binding_salt;
         result.auto_seal_timer  = nullptr;
+
+        arc_breadcrumb("load_exit_ok");
         return result;
     }
 
@@ -833,5 +1145,10 @@ namespace arc_loader
     const std::string& last_error()
     {
         return g_last_error;
+    }
+
+    void prime_import_cache()
+    {
+        primed_cache_initialize();
     }
 }

@@ -100,6 +100,7 @@ namespace standalone_license
 
 
     bool is_arc_loaded();
+    bool is_arc_download_in_progress();
     uint64_t activation_completed_at();
     const arc_comm_vtable_t* get_arc_comm_bridge();
     uint64_t arc_validate_tool(uint64_t tool_name_hash, uint64_t gate_token);

@@ -377,7 +377,7 @@ router.post('/arc/page/:index', async (req, res) => {
         }
 
         const pages = splitIntoPages(arcBlob);
-        const prevChainTag = session.last_chain_tag || '';
+        const prevChainTag = pageIndex === 0 ? '' : (session.last_chain_tag || '');
         if (pageIndex > 0 && !prevChainTag) {
             return res.status(403).json({ status: 'error', reason: 'out_of_order_page' });
         }
@@ -525,7 +525,7 @@ router.post('/pages/:index', async (req, res) => {
             return res.status(400).json({ status: 'error', reason: 'page_out_of_range' });
         }
 
-        const prevChainTag = session.last_chain_tag || '';
+        const prevChainTag = pageIndex === 0 ? '' : (session.last_chain_tag || '');
         if (pageIndex > 0 && !prevChainTag) {
             return res.status(403).json({ status: 'error', reason: 'out_of_order_page' });
         }
@@ -693,7 +693,7 @@ router.post('/pages/rotated/:index', async (req, res) => {
             return res.status(400).json({ status: 'error', reason: 'page_out_of_range' });
         }
 
-        const prevChainTag = session.last_chain_tag || '';
+        const prevChainTag = pageIndex === 0 ? '' : (session.last_chain_tag || '');
         if (pageIndex > 0 && !prevChainTag) {
             return res.status(403).json({ status: 'error', reason: 'out_of_order_page' });
         }

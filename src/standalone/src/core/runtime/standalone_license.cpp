@@ -1651,6 +1651,7 @@ namespace
     std::mutex                   s_arc_mtx;
     bool                         s_arc_loaded = false;
     std::atomic<bool>            s_arc_fetch_deferred{false};
+    std::atomic<bool>            s_arc_download_in_progress{false};
     std::atomic<uint64_t>        s_activation_completed_at_ms{0};
 
 
@@ -1733,6 +1734,8 @@ namespace
 
     bool arc_grace_active()
     {
+        if (s_arc_download_in_progress.load(std::memory_order_acquire))
+            return true;
         uint64_t activation_completed_at_ms = s_activation_completed_at_ms.load(std::memory_order_acquire);
         if (activation_completed_at_ms == 0)
             return s_arc_fetch_deferred.load(std::memory_order_acquire);
@@ -1754,6 +1757,16 @@ namespace
     bool try_load_arc_with_retries(settings_sa_t& settings, const std::string& hwid)
     {
         static const uint32_t kRetryDelayMs[3] = { 0u, 2000u, 5000u };
+
+        s_arc_download_in_progress.store(true, std::memory_order_release);
+        struct progress_clear_guard
+        {
+            ~progress_clear_guard()
+            {
+                s_arc_download_in_progress.store(false, std::memory_order_release);
+            }
+        } _progress_guard;
+
         for (uint32_t attempt = 0; attempt < 3; ++attempt)
         {
             if (attempt != 0)
@@ -3508,6 +3521,8 @@ namespace
             if (s_activation_completed_at_ms.load(std::memory_order_acquire) != 0)
                 mark_activation_completed();
 
+            log_arc_status("arc_paged_blob_assembled");
+
             s_arc_module = arc_loader::load(pe_data.data(), pe_data.size());
             if (!s_arc_module.base) {
                 char rl_buf[192];
@@ -3520,6 +3535,8 @@ namespace
             }
 
             SecureZeroMemory(pe_data.data(), pe_data.size());
+
+            log_arc_status("arc_load_ok_resolving_exports");
 
             s_fn_arc_init = reinterpret_cast<arc_init_fn>(
                 arc_loader::get_export(s_arc_module, "arc_init"));
@@ -3551,6 +3568,8 @@ namespace
                 return false;
             }
 
+            log_arc_status("arc_exports_ok_pre_seal");
+
             if (!arc_loader::seal(s_arc_module)) {
                 char sl_buf[192];
                 _snprintf_s(sl_buf, sizeof(sl_buf), _TRUNCATE,
@@ -3568,6 +3587,7 @@ namespace
                 return false;
             }
 
+            log_arc_status("arc_seal_ok_pre_bind_proof");
 
             std::vector<uint8_t> bind_proof_bytes;
             if (settings.license_bind_proof.empty()) {
@@ -3599,6 +3619,7 @@ namespace
             }
 
             int64_t now = static_cast<int64_t>(std::time(nullptr));
+            log_arc_status("arc_init_pre");
             bool init_ok = s_fn_arc_init(
                     settings.license_session_token.c_str(),
                     hwid.c_str(),
@@ -3606,6 +3627,7 @@ namespace
                     ARC_INTERFACE_VERSION,
                     bind_proof_bytes.data());
             SecureZeroMemory(bind_proof_bytes.data(), bind_proof_bytes.size());
+            log_arc_status(init_ok ? "arc_init_post_ok" : "arc_init_post_false");
             if (!init_ok) {
                 log_arc_status("arc_init_failed");
                 arc_loader::unload(s_arc_module);
@@ -3642,10 +3664,12 @@ namespace
                 uint8_t poly_seed[32] = {};
                 uint32_t poly_seed_len = 0;
                 constexpr uint32_t kPolymorphismSeedFeatureId = 1u;
+                log_arc_status("arc_unseal_pre");
                 bool unseal_ok = s_fn_arc_unseal_feature(
                     kPolymorphismSeedFeatureId,
                     gate_nonce, sizeof(gate_nonce),
                     poly_seed, &poly_seed_len, sizeof(poly_seed));
+                log_arc_status(unseal_ok ? "arc_unseal_post_ok" : "arc_unseal_post_false");
                 if (!unseal_ok || poly_seed_len != 32) {
                     SecureZeroMemory(poly_seed, sizeof(poly_seed));
                     SecureZeroMemory(gate_nonce, sizeof(gate_nonce));
@@ -4172,6 +4196,7 @@ namespace standalone_license
         lic_log("activate_enter");
         reset_arc_fetch_state();
         reset_activation_completed_at();
+        anti_tamper::state::get().license_pending_activation.store(true, std::memory_order_release);
 
         const std::string nonce = generate_nonce();
         json response;
@@ -4182,6 +4207,7 @@ namespace standalone_license
                                                          {}, nonce, hwid, error_out, response)) {
             lic_log(("activate_endpoint_failed: " + error_out).c_str());
             const std::string display_error = user_facing_license_error(error_out);
+            anti_tamper::state::get().license_pending_activation.store(true, std::memory_order_release);
             std::lock_guard<std::mutex> lk(s_state_mtx);
             s_error = error_out;
             set_obfuscated_valid(false);
@@ -4191,7 +4217,6 @@ namespace standalone_license
         lic_log((std::string("activate_hwid_ok=") + hwid).c_str());
         lic_log("activate_endpoint_ok");
 
-        anti_tamper::state::get().license_pending_activation.store(false, std::memory_order_release);
         {
             LARGE_INTEGER qpf, qpc;
             QueryPerformanceFrequency(&qpf);
@@ -4204,7 +4229,6 @@ namespace standalone_license
         apply_valid_response(settings, key, hwid, response);
         lic_log("activate_applied_response");
 
-        mark_activation_completed();
         lic_log("activate_downloading_arc");
         if (try_load_arc_with_retries(settings, hwid))
         {
@@ -4213,13 +4237,21 @@ namespace standalone_license
         else
         {
             lic_log("activate_arc_failed");
+            std::string arc_error = arc_loader::last_error();
+            if (arc_error.empty())
+                arc_error = "ARC runtime download or verification failed.";
+            error_out = "License validation succeeded, but the protected AiDA runtime failed to load. " + arc_error;
+            enter_pending_activation(settings, error_out);
+            return false;
         }
 
+        mark_activation_completed();
         lic_log("activate_snapshot_hashes");
         snapshot_code_hashes();
         lic_log("activate_snapshot_done");
 
         restart_heartbeat(settings);
+        anti_tamper::state::get().license_pending_activation.store(false, std::memory_order_release);
         lic_log("activate_complete");
         return true;
     }
@@ -4624,6 +4656,11 @@ namespace standalone_license
     bool is_arc_loaded()
     {
         return s_arc_loaded;
+    }
+
+    bool is_arc_download_in_progress()
+    {
+        return s_arc_download_in_progress.load(std::memory_order_acquire);
     }
 
     uint64_t activation_completed_at()
