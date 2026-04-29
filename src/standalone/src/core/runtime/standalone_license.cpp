@@ -3874,11 +3874,49 @@ namespace
                 if (!unseal_ok || poly_seed_len != 32) {
                     SecureZeroMemory(poly_seed, sizeof(poly_seed));
                     SecureZeroMemory(gate_nonce, sizeof(gate_nonce));
-                    log_arc_status("arc_startup_gate_failed");
+                    log_arc_status("arc_startup_gate_failed_unseal");
                     __fastfail(0xA1DAFA17u);
                 }
+                uint64_t poly_seed_acc = 0;
+                for (size_t i = 0; i < sizeof(poly_seed); ++i)
+                    poly_seed_acc |= poly_seed[i];
                 SecureZeroMemory(poly_seed, sizeof(poly_seed));
                 SecureZeroMemory(gate_nonce, sizeof(gate_nonce));
+                if (poly_seed_acc == 0) {
+                    log_arc_status("arc_startup_gate_failed_seed_zero");
+                    __fastfail(0xA1DAFA17u);
+                }
+
+                arc_heartbeat_result_t hb1 = s_fn_arc_heartbeat();
+                arc_heartbeat_result_t hb2 = s_fn_arc_heartbeat();
+                if (!hb1.valid || !hb2.valid ||
+                    hb1.proof_token == 0 || hb2.proof_token == 0 ||
+                    hb1.proof_token == hb2.proof_token) {
+                    char detail[160];
+                    _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                        "arc_startup_gate_failed_heartbeat v1=%d v2=%d t1=0x%016llX t2=0x%016llX",
+                        hb1.valid ? 1 : 0,
+                        hb2.valid ? 1 : 0,
+                        static_cast<unsigned long long>(hb1.proof_token),
+                        static_cast<unsigned long long>(hb2.proof_token));
+                    SecureZeroMemory(&hb1, sizeof(hb1));
+                    SecureZeroMemory(&hb2, sizeof(hb2));
+                    log_arc_status(detail);
+                    __fastfail(0xA1DAFA17u);
+                }
+                SecureZeroMemory(&hb1, sizeof(hb1));
+                SecureZeroMemory(&hb2, sizeof(hb2));
+
+                constexpr uint64_t kStartupValidateNameHash = 0xA1DA5747D45E0001ULL;
+                constexpr uint64_t kStartupValidateGateToken = 0x6F70656E776F6C66ULL;
+                uint64_t validate_token = s_fn_arc_validate_tool(
+                    kStartupValidateNameHash, kStartupValidateGateToken);
+                if (validate_token == 0) {
+                    log_arc_status("arc_startup_gate_failed_validate_zero");
+                    __fastfail(0xA1DAFA17u);
+                }
+
+                log_arc_status("arc_startup_gate_ok");
             }
 
             return true;

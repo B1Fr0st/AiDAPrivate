@@ -2571,10 +2571,10 @@ ARC_API bool arc_unseal_feature(
     uint32_t       out_cap)
 {
     using namespace arc_internal;
-    if (!out || !out_size || out_cap == 0) return false;
-    if (!is_session_valid()) return false;
+    if (!out || !out_size || out_cap == 0) { arc_log("unseal", "bad_args"); return false; }
+    if (!is_session_valid()) { arc_log("unseal", "session_invalid"); return false; }
     if (check_debugger()) { enforce_violation("arc_debugger", "unseal_feature"); }
-    if (!load_bind_secret()) return false;
+    if (!load_bind_secret()) { arc_log("unseal", "bind_secret_load_failed"); return false; }
 
     uint8_t feature_blob[sizeof(g_feature_blob)] = {};
     for (uint32_t i = 0; i < sizeof(feature_blob); ++i)
@@ -2583,15 +2583,46 @@ ARC_API bool arc_unseal_feature(
     }
 
     auto* hdr = reinterpret_cast<const feature_blob_header_t*>(feature_blob);
-    if (hdr->magic != kFeatureMagic) return false;
-    if (hdr->version != 1u) return false;
-    if (hdr->total_size > sizeof(feature_blob)) return false;
-    if (hdr->entry_count == 0u || hdr->entry_count > 16u) return false;
+    if (hdr->magic != kFeatureMagic)
+    {
+        char buf[96];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "bad_magic got=0x%08X exp=0x%08X b0=%02X b1=%02X b2=%02X b3=%02X",
+            hdr->magic, kFeatureMagic,
+            feature_blob[0], feature_blob[1], feature_blob[2], feature_blob[3]);
+        arc_log("unseal", buf);
+        return false;
+    }
+    if (hdr->version != 1u)
+    {
+        char buf[64];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "bad_version got=%u", hdr->version);
+        arc_log("unseal", buf);
+        return false;
+    }
+    if (hdr->total_size > sizeof(feature_blob))
+    {
+        char buf[64];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "bad_total_size got=%u", hdr->total_size);
+        arc_log("unseal", buf);
+        return false;
+    }
+    if (hdr->entry_count == 0u || hdr->entry_count > 16u)
+    {
+        char buf[64];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "bad_entry_count got=%u", hdr->entry_count);
+        arc_log("unseal", buf);
+        return false;
+    }
 
     const auto* entries = reinterpret_cast<const feature_entry_header_t*>(
         feature_blob + sizeof(feature_blob_header_t));
     const uint32_t entries_size = hdr->entry_count * sizeof(feature_entry_header_t);
-    if (sizeof(feature_blob_header_t) + entries_size > sizeof(feature_blob)) return false;
+    if (sizeof(feature_blob_header_t) + entries_size > sizeof(feature_blob))
+    {
+        arc_log("unseal", "entry_table_overflow");
+        return false;
+    }
 
     const feature_entry_header_t* match = nullptr;
     for (uint32_t i = 0; i < hdr->entry_count; ++i)
@@ -2602,21 +2633,57 @@ ARC_API bool arc_unseal_feature(
             break;
         }
     }
-    if (!match) return false;
-    if (match->ciphertext_len == 0u || match->ciphertext_len > kFeatureEntryMaxLen) return false;
-    if (match->ciphertext_offset + match->ciphertext_len > sizeof(feature_blob)) return false;
-    if (match->ciphertext_len > out_cap) return false;
+    if (!match)
+    {
+        char buf[80];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "no_match feature_id=%u entry_count=%u",
+            feature_id, hdr->entry_count);
+        arc_log("unseal", buf);
+        return false;
+    }
+    if (match->ciphertext_len == 0u || match->ciphertext_len > kFeatureEntryMaxLen)
+    {
+        char buf[64];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "bad_ct_len got=%u", match->ciphertext_len);
+        arc_log("unseal", buf);
+        return false;
+    }
+    if (match->ciphertext_offset + match->ciphertext_len > sizeof(feature_blob))
+    {
+        char buf[80];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "bad_ct_off off=%u len=%u",
+            match->ciphertext_offset, match->ciphertext_len);
+        arc_log("unseal", buf);
+        return false;
+    }
+    if (match->ciphertext_len > out_cap)
+    {
+        arc_log("unseal", "ct_gt_out_cap");
+        return false;
+    }
 
     char info[64];
     int info_len = _snprintf_s(info, sizeof(info), _TRUNCATE,
         "feature:%u", static_cast<unsigned>(feature_id));
-    if (info_len <= 0) return false;
+    if (info_len <= 0) { arc_log("unseal", "info_format_failed"); return false; }
 
     uint8_t feature_key[32] = {};
     uint8_t local_secret[32] = {};
+    uint64_t secret_acc = 0;
     {
         std::lock_guard<std::mutex> bs_lk(g_bind_secret_mtx);
         bind_secret_obf_load_unlocked(local_secret);
+    }
+    for (size_t i = 0; i < sizeof(local_secret); ++i)
+        secret_acc |= local_secret[i];
+    if (secret_acc == 0)
+    {
+        arc_log("unseal", "bind_secret_all_zero");
+        SecureZeroMemory(local_secret, sizeof(local_secret));
+        SecureZeroMemory(feature_key, sizeof(feature_key));
+        return false;
     }
     const bool hkdf_ok = hkdf_sha256(local_secret, 32,
             nonce, nonce_len,
@@ -2625,6 +2692,7 @@ ARC_API bool arc_unseal_feature(
     SecureZeroMemory(local_secret, sizeof(local_secret));
     if (!hkdf_ok)
     {
+        arc_log("unseal", "hkdf_failed");
         SecureZeroMemory(feature_key, 32);
         return false;
     }
@@ -2637,8 +2705,17 @@ ARC_API bool arc_unseal_feature(
         match->tag,
         out);
     SecureZeroMemory(feature_key, 32);
-    if (!ok) return false;
+    if (!ok)
+    {
+        char buf[112];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "gcm_failed id=%u ct_off=%u ct_len=%u nonce_len=%u",
+            feature_id, match->ciphertext_offset, match->ciphertext_len, nonce_len);
+        arc_log("unseal", buf);
+        return false;
+    }
     *out_size = match->ciphertext_len;
+    arc_log("unseal", "ok");
     return true;
 }
 

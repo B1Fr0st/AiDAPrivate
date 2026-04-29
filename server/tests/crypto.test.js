@@ -232,3 +232,129 @@ test('deriveExpected different secrets produce different results', () => {
     const b = tls.deriveExpected(crypto.randomBytes(32).toString('hex'));
     assert.notEqual(a, b);
 });
+
+
+const arcLicenseBind = require('../crypto/arc-license-bind.js');
+
+test('feature blob entry stride is 44 bytes (matches ARC C++ struct)', () => {
+    const installSecret = crypto.randomBytes(32);
+    const wrappedInstall = kwWrap.wrap(installSecret, 'install_secret/v1');
+    const licenseRow = {
+        key: 'AIDA-TEST-FEAT-LAYOUT-0001',
+        install_secret_wrapped: wrappedInstall,
+        boot_nonce_last: null,
+    };
+    const sessionRow = { session_token: 'a'.repeat(64) };
+
+    const blob = arcLicenseBind.assembleFeatureBlob(licenseRow, sessionRow);
+    assert.equal(blob.length, 4096);
+
+    const FEAT_MAGIC = 0x46454154;
+    const FEAT_HEADER_SIZE = 16;
+    const FEAT_ENTRY_SIZE_CPP = 44;
+    assert.equal(blob.readUInt32LE(0x000), FEAT_MAGIC);
+    assert.equal(blob.readUInt32LE(0x004), 1);
+    const entryCount = blob.readUInt32LE(0x008);
+    assert.equal(entryCount, 1);
+    const totalSize = blob.readUInt32LE(0x00C);
+    assert.equal(totalSize, FEAT_HEADER_SIZE + entryCount * FEAT_ENTRY_SIZE_CPP + 32);
+
+    const entryOffset = FEAT_HEADER_SIZE;
+    const featureId = blob.readUInt32LE(entryOffset + 0);
+    const ciphertextOffset = blob.readUInt32LE(entryOffset + 4);
+    const ciphertextLen = blob.readUInt32LE(entryOffset + 8);
+    assert.equal(featureId, 1);
+    assert.equal(ciphertextLen, 32);
+    assert.equal(ciphertextOffset, FEAT_HEADER_SIZE + entryCount * FEAT_ENTRY_SIZE_CPP);
+
+    const iv = blob.subarray(entryOffset + 16, entryOffset + 28);
+    const tag = blob.subarray(entryOffset + 28, entryOffset + 44);
+    const ciphertext = blob.subarray(ciphertextOffset, ciphertextOffset + ciphertextLen);
+
+    const tagFromAfterCiphertext = blob.subarray(ciphertextOffset, ciphertextOffset + 4);
+    const lastFourTagBytes = tag.subarray(12, 16);
+    assert.notDeepEqual(
+        Buffer.from(lastFourTagBytes),
+        Buffer.from(tagFromAfterCiphertext),
+        'Tag last 4 bytes must NOT alias ciphertext start; this catches the FEAT_ENTRY_SIZE=40 regression');
+
+    const bindSecretInstall = kwWrap.unwrap(licenseRow.install_secret_wrapped, 'install_secret/v1');
+    const bindSecret = Buffer.from(crypto.hkdfSync(
+        'sha256', bindSecretInstall, Buffer.alloc(8, 0),
+        Buffer.from('arc-bind-secret', 'utf8'), 32));
+    const nonce = Buffer.alloc(32, 0);
+    Buffer.from(sessionRow.session_token, 'utf8').copy(nonce, 0, 0, 32);
+    const featureKey = crypto.hkdfSync(
+        'sha256', bindSecret, nonce,
+        Buffer.from('feature:1', 'utf8'), 32);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', Buffer.from(featureKey), iv);
+    decipher.setAuthTag(tag);
+    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    assert.equal(plaintext.length, 32);
+});
+
+test('applyLicenseTransform writes a feature blob the C++ struct can decrypt', () => {
+    const installSecret = crypto.randomBytes(32);
+    const wrappedInstall = kwWrap.wrap(installSecret, 'install_secret/v1');
+    const licenseRow = {
+        key: 'AIDA-TEST-FEAT-ROUNDTRIP-0001',
+        install_secret_wrapped: wrappedInstall,
+        boot_nonce_last: null,
+    };
+    const sessionRow = { session_token: 'b'.repeat(64) };
+
+    const dosSize = 64;
+    const ntSize = 248;
+    const sectionTableSize = 40 * 2;
+    const headerSize = 4096;
+    const licbindOffset = headerSize;
+    const featOffset = headerSize + 4096;
+    const blobLen = featOffset + 4096;
+    const pe = Buffer.alloc(blobLen, 0);
+    pe[0] = 0x4D; pe[1] = 0x5A;
+    pe.writeUInt32LE(dosSize, 0x3C);
+    pe[dosSize + 0] = 0x50;
+    pe[dosSize + 1] = 0x45;
+    pe[dosSize + 2] = 0x00;
+    pe[dosSize + 3] = 0x00;
+    pe.writeUInt16LE(2, dosSize + 6);
+    pe.writeUInt16LE(ntSize - 24, dosSize + 20);
+
+    const sectionTableOffset = dosSize + 24 + (ntSize - 24);
+    const licSectionHdr = sectionTableOffset;
+    Buffer.from('.licbind', 'utf8').copy(pe, licSectionHdr, 0, 8);
+    pe.writeUInt32LE(32, licSectionHdr + 16);
+    pe.writeUInt32LE(licbindOffset, licSectionHdr + 20);
+    const featSectionHdr = sectionTableOffset + 40;
+    Buffer.from('.feat', 'utf8').copy(pe, featSectionHdr, 0, 5);
+    pe.writeUInt32LE(4096, featSectionHdr + 16);
+    pe.writeUInt32LE(featOffset, featSectionHdr + 20);
+
+    const out = arcLicenseBind.applyLicenseTransform(pe, licenseRow, sessionRow);
+    const featBlob = out.subarray(featOffset, featOffset + 4096);
+
+    assert.equal(featBlob.readUInt32LE(0), 0x46454154);
+    const entryCount = featBlob.readUInt32LE(8);
+    assert.equal(entryCount, 1);
+
+    const entryOffset = 16;
+    const ciphertextOffset = featBlob.readUInt32LE(entryOffset + 4);
+    const ciphertextLen = featBlob.readUInt32LE(entryOffset + 8);
+    const iv = featBlob.subarray(entryOffset + 16, entryOffset + 28);
+    const tag = featBlob.subarray(entryOffset + 28, entryOffset + 44);
+    const ciphertext = featBlob.subarray(ciphertextOffset, ciphertextOffset + ciphertextLen);
+
+    const realBindSecretInstall = kwWrap.unwrap(licenseRow.install_secret_wrapped, 'install_secret/v1');
+    const realBindSecret = Buffer.from(crypto.hkdfSync(
+        'sha256', realBindSecretInstall, Buffer.alloc(8, 0),
+        Buffer.from('arc-bind-secret', 'utf8'), 32));
+    const nonce = Buffer.alloc(32, 0);
+    Buffer.from(sessionRow.session_token, 'utf8').copy(nonce, 0, 0, 32);
+    const featureKey = crypto.hkdfSync(
+        'sha256', realBindSecret, nonce,
+        Buffer.from('feature:1', 'utf8'), 32);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', Buffer.from(featureKey), iv);
+    decipher.setAuthTag(tag);
+    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    assert.equal(plaintext.length, 32);
+});
