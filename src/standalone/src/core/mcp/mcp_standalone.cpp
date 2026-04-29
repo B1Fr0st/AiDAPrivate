@@ -306,8 +306,10 @@ json server_t::handle_tools_list(const json& id, const json&)
     json tools_arr = json::array();
     {
         std::lock_guard<std::mutex> lk(_tools_mtx);
-        for (const auto& t : _tools)
+        for (const auto& t : _tools) {
+            if (t.visibility != tool_visibility_t::external_visible) continue;
             tools_arr.push_back(tool_schema(t));
+        }
     }
     json result;
     result["tools"] = tools_arr;
@@ -340,7 +342,13 @@ json server_t::handle_tools_call(const json& id, const json& params)
     {
         std::lock_guard<std::mutex> lk(_tools_mtx);
         for (const auto& t : _tools) {
-            if (t.name == tool_name) { found = &t; break; }
+            if (t.name == tool_name) {
+                if (t.visibility != tool_visibility_t::external_visible) {
+                    return make_error(id, JSONRPC_INVALID_PARAMS, "Unknown tool: " + tool_name);
+                }
+                found = &t;
+                break;
+            }
         }
     }
 
@@ -695,8 +703,10 @@ void server_t::server_thread_func(int port)
         health["status"]      = "ok";
         health["server"]      = SERVER_NAME;
         health["version"]     = SERVER_VERSION;
-        size_t tool_count;
-        { std::lock_guard<std::mutex> lk(_tools_mtx); tool_count = _tools.size(); }
+        size_t tool_count = 0;
+        { std::lock_guard<std::mutex> lk(_tools_mtx);
+          for (const auto& t : _tools)
+              if (t.visibility == tool_visibility_t::external_visible) ++tool_count; }
         health["tools_count"] = tool_count;
         health["driver"]      = driver_bridge::is_loaded();
         health["attached"]    = driver_bridge::attached_pid();
@@ -706,7 +716,10 @@ void server_t::server_thread_func(int port)
     svr.Get("/api/tools", [this](const httplib::Request&, httplib::Response& res) {
         json tools_arr = json::array();
         { std::lock_guard<std::mutex> lk(_tools_mtx);
-          for (const auto& t : _tools) tools_arr.push_back(tool_schema(t)); }
+          for (const auto& t : _tools) {
+              if (t.visibility != tool_visibility_t::external_visible) continue;
+              tools_arr.push_back(tool_schema(t));
+          } }
         res.set_content(json_dump_safe(tools_arr, 2), "application/json");
     });
 
@@ -730,7 +743,17 @@ void server_t::server_thread_func(int port)
 
         const tool_def_t* found = nullptr;
         { std::lock_guard<std::mutex> lk(_tools_mtx);
-          for (const auto& t : _tools) { if (t.name == tool_name) { found = &t; break; } } }
+          for (const auto& t : _tools) {
+              if (t.name == tool_name) {
+                  if (t.visibility != tool_visibility_t::external_visible) {
+                      res.status = 404;
+                      res.set_content(json_dump_safe({{"error", "Unknown tool: " + tool_name}}), "application/json");
+                      return;
+                  }
+                  found = &t;
+                  break;
+              }
+          } }
 
         if (!found) {
             res.status = 404;

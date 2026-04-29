@@ -160,10 +160,30 @@ inline turn_cost_t compute_turn_cost(const aida::provider::model_info_t& model,
 {
     turn_cost_t r;
     const double per = 1'000'000.0;
-    r.input_cost       = (model.cost.input_per_million       / per) * static_cast<double>(usage.input);
-    r.output_cost      = (model.cost.output_per_million      / per) * static_cast<double>(usage.output);
-    r.cache_read_cost  = (model.cost.cache_read_per_million  / per) * static_cast<double>(usage.cache_read);
-    r.cache_write_cost = (model.cost.cache_write_per_million / per) * static_cast<double>(usage.cache_write);
+    const int64_t context_tokens = usage.input + usage.cache_read;
+    const bool over_200k = context_tokens > 200000 &&
+                           (model.cost.over_200k_input_per_million > 0.0 ||
+                            model.cost.over_200k_output_per_million > 0.0 ||
+                            model.cost.over_200k_cache_read_per_million > 0.0 ||
+                            model.cost.over_200k_cache_write_per_million > 0.0);
+
+    const double input_rate = over_200k && model.cost.over_200k_input_per_million > 0.0
+        ? model.cost.over_200k_input_per_million
+        : model.cost.input_per_million;
+    const double output_rate = over_200k && model.cost.over_200k_output_per_million > 0.0
+        ? model.cost.over_200k_output_per_million
+        : model.cost.output_per_million;
+    const double cache_read_rate = over_200k && model.cost.over_200k_cache_read_per_million > 0.0
+        ? model.cost.over_200k_cache_read_per_million
+        : model.cost.cache_read_per_million;
+    const double cache_write_rate = over_200k && model.cost.over_200k_cache_write_per_million > 0.0
+        ? model.cost.over_200k_cache_write_per_million
+        : model.cost.cache_write_per_million;
+
+    r.input_cost       = (input_rate       / per) * static_cast<double>(usage.input);
+    r.output_cost      = (output_rate      / per) * static_cast<double>(usage.output + usage.reasoning);
+    r.cache_read_cost  = (cache_read_rate  / per) * static_cast<double>(usage.cache_read);
+    r.cache_write_cost = (cache_write_rate / per) * static_cast<double>(usage.cache_write);
     r.total_cost       = r.input_cost + r.output_cost + r.cache_read_cost + r.cache_write_cost;
     return r;
 }
@@ -174,6 +194,11 @@ bool persist_step_finish(const std::string& session_id,
                          const aida::provider::model_info_t& model,
                          const aida::session::usage_tokens_t& usage,
                          const std::string& finish_reason);
+
+
+bool aggregate_subagent_cost(const std::string& parent_session_id,
+                             const std::string& parent_message_id,
+                             const std::string& child_session_id);
 
 
 }

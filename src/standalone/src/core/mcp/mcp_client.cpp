@@ -97,6 +97,27 @@ static std::string json_dump_safe(const json& j, int indent = -1)
     catch (...) { return "{}"; }
 }
 
+static std::string sanitize_identifier(const std::string& input)
+{
+    std::string out;
+    out.reserve(input.size());
+    for (char c : input) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        const bool keep = (uc >= '0' && uc <= '9')
+                       || (uc >= 'A' && uc <= 'Z')
+                       || (uc >= 'a' && uc <= 'z')
+                       || uc == '_'
+                       || uc == '-';
+        out.push_back(keep ? static_cast<char>(uc) : '_');
+    }
+    return out;
+}
+
+static std::string make_qualified_tool_name(const std::string& server, const std::string& tool)
+{
+    return sanitize_identifier(server) + "_" + sanitize_identifier(tool);
+}
+
 
 struct parsed_url_t
 {
@@ -1203,17 +1224,19 @@ std::vector<remote_tool_t> client_t::list_tools()
 
     _cached_tools.clear();
     if (response.contains("result") && response["result"].contains("tools")) {
+        const std::string server_label = _server_name_str.empty() ? _cfg.name : _server_name_str;
         for (const auto& t : response["result"]["tools"]) {
             remote_tool_t tool;
-            tool.server_name  = _server_name_str;
-            tool.name         = t.value("name", "");
+            tool.server_name   = server_label;
+            tool.original_name = t.value("name", "");
+            if (tool.original_name.empty()) continue;
+            tool.name         = make_qualified_tool_name(server_label, tool.original_name);
             tool.description  = t.value("description", "");
             if (t.contains("inputSchema"))
                 tool.input_schema = t["inputSchema"];
             if (t.contains("annotations"))
                 tool.annotations = t["annotations"];
-            if (!tool.name.empty())
-                _cached_tools.push_back(std::move(tool));
+            _cached_tools.push_back(std::move(tool));
         }
     }
 
@@ -1683,14 +1706,17 @@ void client_t::process_notification(const json& notif)
             }
             if (response.contains("result") && response["result"].contains("tools")) {
                 _cached_tools.clear();
+                const std::string server_label = _server_name_str.empty() ? _cfg.name : _server_name_str;
                 for (const auto& t : response["result"]["tools"]) {
                     remote_tool_t tool;
-                    tool.server_name  = _server_name_str;
-                    tool.name         = t.value("name", "");
-                    tool.description  = t.value("description", "");
+                    tool.server_name   = server_label;
+                    tool.original_name = t.value("name", "");
+                    if (tool.original_name.empty()) continue;
+                    tool.name          = make_qualified_tool_name(server_label, tool.original_name);
+                    tool.description   = t.value("description", "");
                     if (t.contains("inputSchema")) tool.input_schema = t["inputSchema"];
                     if (t.contains("annotations")) tool.annotations = t["annotations"];
-                    if (!tool.name.empty()) _cached_tools.push_back(std::move(tool));
+                    _cached_tools.push_back(std::move(tool));
                 }
             }
         }
@@ -2043,11 +2069,10 @@ call_result_t manager_t::call_tool(const std::string& qualified_name, const json
 {
     std::lock_guard<std::mutex> lk(_mtx);
 
-
-    size_t sep = qualified_name.find("::");
-    if (sep != std::string::npos) {
-        std::string server = qualified_name.substr(0, sep);
-        std::string tool   = qualified_name.substr(sep + 2);
+    size_t legacy_sep = qualified_name.find("::");
+    if (legacy_sep != std::string::npos) {
+        std::string server = qualified_name.substr(0, legacy_sep);
+        std::string tool   = qualified_name.substr(legacy_sep + 2);
 
         for (auto& e : _entries) {
             if (e.cfg.name == server && e.client.is_connected())
@@ -2056,12 +2081,19 @@ call_result_t manager_t::call_tool(const std::string& qualified_name, const json
         return call_result_t::error("MCP server '" + server + "' not found or not connected");
     }
 
-
     for (auto& e : _entries) {
         if (!e.client.is_connected()) continue;
         for (const auto& t : e.client.cached_tools()) {
             if (t.name == qualified_name)
-                return e.client.call_tool(qualified_name, arguments);
+                return e.client.call_tool(t.original_name.empty() ? t.name : t.original_name, arguments);
+        }
+    }
+
+    for (auto& e : _entries) {
+        if (!e.client.is_connected()) continue;
+        for (const auto& t : e.client.cached_tools()) {
+            if (t.original_name == qualified_name)
+                return e.client.call_tool(t.original_name, arguments);
         }
     }
 
@@ -2206,6 +2238,28 @@ bool manager_t::find_config(const std::string& name, server_config_t& out) const
         }
     }
     return false;
+}
+
+json manager_t::mcp_tool_list_json()
+{
+    std::lock_guard<std::mutex> lk(_mtx);
+    json arr = json::array();
+    for (auto& e : _entries) {
+        if (!e.client.is_connected()) continue;
+        for (const auto& t : e.client.cached_tools()) {
+            json entry;
+            entry["name"]        = t.name;
+            entry["description"] = t.description;
+            if (!t.input_schema.is_null() && !t.input_schema.empty())
+                entry["input_schema"] = t.input_schema;
+            else
+                entry["input_schema"] = json{{"type", "object"}, {"properties", json::object()}};
+            entry["server_name"]   = t.server_name;
+            entry["original_name"] = t.original_name;
+            arr.push_back(std::move(entry));
+        }
+    }
+    return arr;
 }
 
 

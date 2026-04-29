@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -21,6 +22,8 @@
 #include "binary_map.hpp"
 #include "standalone_chat.hpp"
 #include "mcp_standalone.hpp"
+#include "cost_calculator.hpp"
+#include "provider_catalog.hpp"
 
 #include "../helpers/diag_log.hpp"
 
@@ -69,6 +72,23 @@ namespace task {
 			return out;
 		}
 
+		std::string find_latest_assistant_message_id(const std::string& session_id)
+		{
+			if (session_id.empty()) return std::string{};
+			std::vector<aida::session::message_t> msgs;
+			if (!aida::session::list_messages(session_id, msgs, -1)) return std::string{};
+			std::string latest_id;
+			int64_t latest_unix = 0;
+			for (const auto& m : msgs) {
+				if (m.role != aida::session::message_t::role_t::assistant) continue;
+				if (latest_id.empty() || m.created_unix >= latest_unix) {
+					latest_id = m.id;
+					latest_unix = m.created_unix;
+				}
+			}
+			return latest_id;
+		}
+
 	}
 
 	const std::string& last_error()
@@ -94,17 +114,34 @@ namespace task {
 
 		aida::agent::agent_info_t agent = *agent_info;
 
-		if (!g_sa_ai_client) {
-			set_task_error("ai client not initialized");
-			out_result = "Error: AI client is not initialized.";
-			return false;
-		}
-
 		std::atomic<bool> done{false};
 		std::string thread_result;
 		std::string thread_error;
+		std::string sub_session_id;
 
 		std::thread worker([&]() {
+			std::unique_ptr<standalone_ai_client_t> local_client;
+			try {
+				local_client = std::make_unique<standalone_ai_client_t>(g_sa_settings);
+			} catch (const std::exception& ex) {
+				thread_error = std::string("Failed to construct subagent AI client: ") + ex.what();
+				thread_result = "Error: " + thread_error;
+				done.store(true, std::memory_order_release);
+				return;
+			} catch (...) {
+				thread_error = "Failed to construct subagent AI client: unknown exception";
+				thread_result = "Error: " + thread_error;
+				done.store(true, std::memory_order_release);
+				return;
+			}
+
+			if (!local_client || !local_client->is_available()) {
+				thread_error = "subagent AI client is not available";
+				thread_result = "Error: " + thread_error;
+				done.store(true, std::memory_order_release);
+				return;
+			}
+
 			try {
 				aida::session::session_info_t sub_session;
 				if (!parent_session_id.empty()) {
@@ -116,6 +153,7 @@ namespace task {
 					std::string preview = prompt_text.substr(0, 60);
 					if (prompt_text.size() > 60) preview += "...";
 					(void)aida::session::set_title(sub_session.id, std::string("[task] ") + preview);
+					sub_session_id = sub_session.id;
 				}
 
 				std::string system_prompt = agent.system_prompt;
@@ -154,7 +192,7 @@ namespace task {
 				for (int turn = 0; turn < hard_steps; ++turn) {
 					ai_generation_result_t gen;
 					try {
-						gen = g_sa_ai_client->generate_with_tools(messages, system_prompt, allowed_tools, nullptr);
+						gen = local_client->generate_with_tools(messages, system_prompt, allowed_tools, nullptr);
 					} catch (const std::exception& ex) {
 						thread_error = std::string("Exception: ") + ex.what();
 						break;
@@ -168,6 +206,7 @@ namespace task {
 						break;
 					}
 
+					std::string assistant_message_id;
 					if (!sub_session.id.empty() && (!gen.text.empty() || !gen.tool_calls.empty())) {
 						aida::session::message_t am;
 						am.id = make_id();
@@ -196,6 +235,29 @@ namespace task {
 						}
 						am.created_unix = unix_now();
 						(void)aida::session::append_message(am);
+						assistant_message_id = am.id;
+					}
+
+					if (!assistant_message_id.empty() &&
+					    (gen.input_tokens > 0 || gen.output_tokens > 0 ||
+					     gen.cache_read > 0 || gen.cache_write > 0)) {
+						aida::session::usage_tokens_t usage;
+						usage.input       = gen.input_tokens;
+						usage.output      = gen.output_tokens;
+						usage.cache_read  = gen.cache_read;
+						usage.cache_write = gen.cache_write;
+
+						std::string provider_id = agent.model_override.has_value()
+							? agent.model_override->provider_id : std::string{};
+						std::string model_id = agent.model_override.has_value()
+							? agent.model_override->model_id : std::string{};
+						const aida::provider::model_info_t* mi = nullptr;
+						if (!provider_id.empty() && !model_id.empty())
+							mi = aida::provider::catalog::get_model(provider_id, model_id);
+						if (mi != nullptr) {
+							(void)cost_calc::persist_step_finish(sub_session.id, assistant_message_id,
+								*mi, usage, gen.stop_reason.empty() ? std::string("stop") : gen.stop_reason);
+						}
 					}
 
 					if (gen.tool_calls.empty()) {
@@ -261,6 +323,11 @@ namespace task {
 		});
 
 		worker.join();
+
+		if (!parent_session_id.empty() && !sub_session_id.empty()) {
+			const std::string parent_msg_id = find_latest_assistant_message_id(parent_session_id);
+			(void)cost_calc::aggregate_subagent_cost(parent_session_id, parent_msg_id, sub_session_id);
+		}
 
 		out_result = thread_result;
 		if (!thread_error.empty()) {

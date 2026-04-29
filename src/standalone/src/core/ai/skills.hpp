@@ -193,6 +193,24 @@ namespace skills {
 			return std::filesystem::current_path() / "AiDA";
 		}
 
+		std::filesystem::path user_home_root()
+		{
+			wchar_t* w = nullptr;
+			if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Profile, 0, nullptr, &w))) {
+				std::filesystem::path p(w);
+				CoTaskMemFree(w);
+				return p;
+			}
+			DWORD len = GetEnvironmentVariableW(L"USERPROFILE", nullptr, 0);
+			if (len > 0) {
+				std::wstring buf(static_cast<size_t>(len), L'\0');
+				DWORD actual = GetEnvironmentVariableW(L"USERPROFILE", &buf[0], len);
+				if (actual > 0 && actual < len)
+					return std::filesystem::path(buf.substr(0, actual));
+			}
+			return std::filesystem::current_path();
+		}
+
 		std::filesystem::path aida_json_path()
 		{
 			return appdata_root() / L"aida.json";
@@ -540,6 +558,70 @@ namespace skills {
 	}
 
 
+	namespace {
+
+		size_t leading_indent(const std::string& s)
+		{
+			size_t n = 0;
+			while (n < s.size() && (s[n] == ' ' || s[n] == '\t')) ++n;
+			return n;
+		}
+
+		bool line_is_blank(const std::string& s)
+		{
+			for (char c : s) {
+				if (c != ' ' && c != '\t' && c != '\r') return false;
+			}
+			return true;
+		}
+
+		void strip_quotes_inplace(std::string& v)
+		{
+			if (v.size() >= 2 && v.front() == '"' && v.back() == '"')
+				v = v.substr(1, v.size() - 2);
+			else if (v.size() >= 2 && v.front() == '\'' && v.back() == '\'')
+				v = v.substr(1, v.size() - 2);
+		}
+
+		void parse_inline_array(const std::string& raw, std::vector<std::string>& out)
+		{
+			out.clear();
+			std::string s = raw;
+			if (s.size() >= 2 && s.front() == '[' && s.back() == ']')
+				s = s.substr(1, s.size() - 2);
+			std::istringstream vs(s);
+			std::string item;
+			while (std::getline(vs, item, ',')) {
+				item = trim_copy(item);
+				strip_quotes_inplace(item);
+				if (!item.empty())
+					out.push_back(item);
+			}
+		}
+
+		void apply_frontmatter_field(skill_metadata_t& meta, const std::string& key, const std::string& value)
+		{
+			if (key == "name") {
+				meta.name = value;
+			} else if (key == "description") {
+				meta.description = value;
+			} else if (key == "agent_slugs" || key == "agentSlugs" ||
+			           key == "mode_slugs" || key == "modeSlugs") {
+				parse_inline_array(value, meta.agent_slugs);
+			}
+		}
+
+		void apply_frontmatter_array(skill_metadata_t& meta, const std::string& key, std::vector<std::string>& items)
+		{
+			if (key == "agent_slugs" || key == "agentSlugs" ||
+			    key == "mode_slugs" || key == "modeSlugs") {
+				meta.agent_slugs = std::move(items);
+			}
+		}
+
+	}
+
+
 	bool parse_yaml_frontmatter(const std::string& content, skill_metadata_t& meta, std::string& body)
 	{
 		if (content.size() < 3 || content.substr(0, 3) != "---") {
@@ -557,46 +639,157 @@ namespace skills {
 		body = content.substr(end_pos + 4);
 		if (!body.empty() && body[0] == '\n') body = body.substr(1);
 
-		std::istringstream stream(frontmatter);
-		std::string line;
-		while (std::getline(stream, line)) {
-			if (!line.empty() && line.back() == '\r') line.pop_back();
-
-			auto colon_pos = line.find(':');
-			if (colon_pos == std::string::npos) continue;
-
-			std::string key = line.substr(0, colon_pos);
-			std::string value = line.substr(colon_pos + 1);
-
-			key = trim_copy(key);
-			value = trim_copy(value);
-
-			if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
-				value = value.substr(1, value.size() - 2);
-			else if (value.size() >= 2 && value.front() == '\'' && value.back() == '\'')
-				value = value.substr(1, value.size() - 2);
-
-			if (key == "name") {
-				meta.name = value;
-			} else if (key == "description") {
-				meta.description = value;
-			} else if (key == "agent_slugs" || key == "agentSlugs" ||
-			           key == "mode_slugs" || key == "modeSlugs") {
-				meta.agent_slugs.clear();
-				if (value.size() >= 2 && value.front() == '[' && value.back() == ']')
-					value = value.substr(1, value.size() - 2);
-				std::istringstream vs(value);
-				std::string item;
-				while (std::getline(vs, item, ',')) {
-					item = trim_copy(item);
-					if (item.size() >= 2 && item.front() == '"' && item.back() == '"')
-						item = item.substr(1, item.size() - 2);
-					else if (item.size() >= 2 && item.front() == '\'' && item.back() == '\'')
-						item = item.substr(1, item.size() - 2);
-					if (!item.empty())
-						meta.agent_slugs.push_back(item);
-				}
+		std::vector<std::string> raw_lines;
+		{
+			std::istringstream stream(frontmatter);
+			std::string line;
+			while (std::getline(stream, line)) {
+				if (!line.empty() && line.back() == '\r') line.pop_back();
+				raw_lines.push_back(line);
 			}
+		}
+
+		size_t i = 0;
+		while (i < raw_lines.size()) {
+			const std::string& line = raw_lines[i];
+			if (line_is_blank(line)) { ++i; continue; }
+
+			const size_t key_indent = leading_indent(line);
+			std::string body_line = line.substr(key_indent);
+			if (body_line.empty() || body_line[0] == '#') { ++i; continue; }
+
+			auto colon_pos = body_line.find(':');
+			if (colon_pos == std::string::npos) { ++i; continue; }
+
+			std::string key = trim_copy(body_line.substr(0, colon_pos));
+			std::string after_colon = body_line.substr(colon_pos + 1);
+			std::string trimmed_after = trim_copy(after_colon);
+
+			if (trimmed_after == "|" || trimmed_after == ">" ||
+			    trimmed_after == "|-" || trimmed_after == ">-" ||
+			    trimmed_after == "|+" || trimmed_after == ">+") {
+				const bool literal = (trimmed_after[0] == '|');
+				const char chomp = trimmed_after.size() > 1 ? trimmed_after[1] : '\0';
+				++i;
+
+				size_t block_indent = 0;
+				bool indent_set = false;
+				std::string accumulated;
+				while (i < raw_lines.size()) {
+					const std::string& sub = raw_lines[i];
+					if (line_is_blank(sub)) {
+						if (indent_set) {
+							if (literal) accumulated.push_back('\n');
+							else if (!accumulated.empty() && accumulated.back() != '\n') accumulated.push_back('\n');
+						}
+						++i;
+						continue;
+					}
+					const size_t sub_indent = leading_indent(sub);
+					if (sub_indent <= key_indent) break;
+					if (!indent_set) { block_indent = sub_indent; indent_set = true; }
+					if (sub_indent < block_indent) break;
+					std::string content_part = sub.substr(block_indent);
+					if (literal) {
+						if (!accumulated.empty()) accumulated.push_back('\n');
+						accumulated += content_part;
+					} else {
+						if (!accumulated.empty() && accumulated.back() != '\n' && accumulated.back() != ' ')
+							accumulated.push_back(' ');
+						accumulated += content_part;
+					}
+					++i;
+				}
+
+				if (chomp == '-') {
+					while (!accumulated.empty() && accumulated.back() == '\n') accumulated.pop_back();
+				} else if (chomp == '\0') {
+					while (accumulated.size() >= 2 &&
+					       accumulated[accumulated.size() - 1] == '\n' &&
+					       accumulated[accumulated.size() - 2] == '\n')
+						accumulated.pop_back();
+					if (literal && !accumulated.empty() && accumulated.back() != '\n')
+						accumulated.push_back('\n');
+				}
+
+				apply_frontmatter_field(meta, key, accumulated);
+				continue;
+			}
+
+			if (trimmed_after.empty()) {
+				++i;
+				bool consumed_array = false;
+				std::vector<std::string> items;
+				size_t array_indent = 0;
+				bool array_indent_set = false;
+				while (i < raw_lines.size()) {
+					const std::string& sub = raw_lines[i];
+					if (line_is_blank(sub)) { ++i; continue; }
+					const size_t sub_indent = leading_indent(sub);
+					if (sub_indent <= key_indent) break;
+					std::string after_indent = sub.substr(sub_indent);
+					if (!after_indent.empty() && after_indent[0] == '-') {
+						consumed_array = true;
+						if (!array_indent_set) { array_indent = sub_indent; array_indent_set = true; }
+						if (sub_indent < array_indent) break;
+						std::string item = trim_copy(after_indent.substr(1));
+						strip_quotes_inplace(item);
+						if (!item.empty()) items.push_back(item);
+						++i;
+						continue;
+					}
+					break;
+				}
+				if (consumed_array) {
+					apply_frontmatter_array(meta, key, items);
+					continue;
+				}
+
+				size_t cont_indent = 0;
+				bool cont_set = false;
+				std::string accumulated;
+				while (i < raw_lines.size()) {
+					const std::string& sub = raw_lines[i];
+					if (line_is_blank(sub)) { ++i; continue; }
+					const size_t sub_indent = leading_indent(sub);
+					if (sub_indent <= key_indent) break;
+					if (!cont_set) { cont_indent = sub_indent; cont_set = true; }
+					if (sub_indent < cont_indent) break;
+					std::string content_part = sub.substr(cont_indent);
+					if (!accumulated.empty()) accumulated.push_back(' ');
+					accumulated += content_part;
+					++i;
+				}
+				strip_quotes_inplace(accumulated);
+				apply_frontmatter_field(meta, key, accumulated);
+				continue;
+			}
+
+			std::string value = trimmed_after;
+			++i;
+			while (i < raw_lines.size()) {
+				const std::string& sub = raw_lines[i];
+				if (line_is_blank(sub)) break;
+				const size_t sub_indent = leading_indent(sub);
+				if (sub_indent <= key_indent) break;
+				std::string fragment = trim_copy(sub);
+				if (!fragment.empty() && fragment.find(':') != std::string::npos) {
+					std::string head = trim_copy(fragment.substr(0, fragment.find(':')));
+					bool head_is_word = !head.empty();
+					for (char c : head) {
+						if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-')) {
+							head_is_word = false;
+							break;
+						}
+					}
+					if (head_is_word) break;
+				}
+				if (!value.empty()) value.push_back(' ');
+				value += fragment;
+				++i;
+			}
+			strip_quotes_inplace(value);
+			apply_frontmatter_field(meta, key, value);
 		}
 
 		return true;
@@ -795,6 +988,10 @@ namespace skills {
 		add_if_dir(home_appdata / L".aida" / L"skills");
 		add_if_dir(home_appdata / L".claude" / L"skills");
 
+		const auto user_home = user_home_root();
+		add_if_dir(user_home / L".claude" / L"skills");
+		add_if_dir(user_home / L".agents" / L"skills");
+
 		{
 			std::lock_guard<std::mutex> lk(s_manager_mtx);
 			s_workspace_dir = workspace_dir;
@@ -806,18 +1003,24 @@ namespace skills {
 
 		std::vector<std::filesystem::path> aida_first;
 		std::vector<std::filesystem::path> claude_second;
+		std::vector<std::filesystem::path> agents_third;
 		for (const auto& dir : chain) {
 			const auto aida_dir = dir / ".aida" / "skills";
 			const auto claude_dir = dir / ".claude" / "skills";
+			const auto agents_dir = dir / ".agents" / "skills";
 			std::error_code ec;
 			if (std::filesystem::exists(aida_dir, ec) && std::filesystem::is_directory(aida_dir, ec))
 				aida_first.push_back(aida_dir);
 			ec.clear();
 			if (std::filesystem::exists(claude_dir, ec) && std::filesystem::is_directory(claude_dir, ec))
 				claude_second.push_back(claude_dir);
+			ec.clear();
+			if (std::filesystem::exists(agents_dir, ec) && std::filesystem::is_directory(agents_dir, ec))
+				agents_third.push_back(agents_dir);
 		}
 		for (const auto& p : aida_first) add_if_dir(p);
 		for (const auto& p : claude_second) add_if_dir(p);
+		for (const auto& p : agents_third) add_if_dir(p);
 
 		add_remote_paths_locked(mgr);
 

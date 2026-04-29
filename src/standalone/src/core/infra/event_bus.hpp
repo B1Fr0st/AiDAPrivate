@@ -205,6 +205,39 @@ namespace events {
         std::string session_id;
     };
 
+    struct session_created_t
+    {
+        std::string session_id;
+        std::string project_id;
+        std::string parent_id;
+    };
+
+    struct session_updated_t
+    {
+        std::string session_id;
+        std::string fields_changed;
+    };
+
+    struct session_deleted_t
+    {
+        std::string session_id;
+    };
+
+    struct command_executed_t
+    {
+        std::string session_id;
+        std::string command_name;
+        std::string source;
+        std::string args;
+    };
+
+    struct file_edited_t
+    {
+        std::string path;
+        std::string kind;
+        std::string session_id;
+    };
+
     inline constexpr event_def_t<permission_asked_t>   event_permission_asked{"aida.permission.asked"};
     inline constexpr event_def_t<permission_replied_t> event_permission_replied{"aida.permission.replied"};
     inline constexpr event_def_t<session_compacted_t>  event_session_compacted{"aida.session.compacted"};
@@ -216,6 +249,11 @@ namespace events {
     inline constexpr event_def_t<mcp_tools_changed_t>  event_mcp_tools_changed{"aida.mcp.tools_changed"};
     inline constexpr event_def_t<agent_changed_t>      event_agent_changed{"aida.agent.changed"};
     inline constexpr event_def_t<session_selected_t>   event_session_selected{"aida.session.selected"};
+    inline constexpr event_def_t<session_created_t>    event_session_created{"aida.session.created"};
+    inline constexpr event_def_t<session_updated_t>    event_session_updated{"aida.session.updated"};
+    inline constexpr event_def_t<session_deleted_t>    event_session_deleted{"aida.session.deleted"};
+    inline constexpr event_def_t<command_executed_t>   event_command_executed{"aida.command.executed"};
+    inline constexpr event_def_t<file_edited_t>        event_file_edited{"aida.file.edited"};
 
 }
 }

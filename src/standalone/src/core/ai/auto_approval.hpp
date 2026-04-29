@@ -6,10 +6,13 @@
 #include <cstdint>
 #include <regex>
 #include <functional>
+#include <mutex>
+#include <unordered_map>
 
 #include <nlohmann/json.hpp>
 
 #include "agent_registry.hpp"
+#include "session_store.hpp"
 
 
 namespace aida {
@@ -70,6 +73,74 @@ inline rule_match_t evaluate(const aida::agent::ruleset_t& rules,
         out.action = rule_match_t::action_t::deny; break;
     case aida::agent::permission_rule_t::action_t::ask:
         out.action = rule_match_t::action_t::ask; break;
+    }
+    return out;
+}
+
+
+inline const char* action_to_string(aida::agent::permission_rule_t::action_t a)
+{
+    switch (a)
+    {
+    case aida::agent::permission_rule_t::action_t::allow: return "allow";
+    case aida::agent::permission_rule_t::action_t::deny:  return "deny";
+    case aida::agent::permission_rule_t::action_t::ask:   return "ask";
+    }
+    return "ask";
+}
+
+
+inline aida::agent::permission_rule_t::action_t action_from_string(const std::string& s)
+{
+    if (s == "allow") return aida::agent::permission_rule_t::action_t::allow;
+    if (s == "deny")  return aida::agent::permission_rule_t::action_t::deny;
+    return aida::agent::permission_rule_t::action_t::ask;
+}
+
+
+inline nlohmann::json rule_to_json(const aida::agent::permission_rule_t& r)
+{
+    nlohmann::json j = nlohmann::json::object();
+    j["permission_key"] = r.permission_key;
+    j["pattern"]        = r.pattern;
+    j["action"]         = action_to_string(r.action);
+    return j;
+}
+
+
+inline bool rule_from_json(const nlohmann::json& j, aida::agent::permission_rule_t& out)
+{
+    if (!j.is_object()) return false;
+    out.permission_key = j.value("permission_key", std::string{"*"});
+    out.pattern        = j.value("pattern", std::string{"*"});
+    out.action         = action_from_string(j.value("action", std::string{"ask"}));
+    return true;
+}
+
+
+inline nlohmann::json ruleset_to_json(const aida::agent::ruleset_t& rules)
+{
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& r : rules) arr.push_back(rule_to_json(r));
+    return arr;
+}
+
+
+inline aida::agent::ruleset_t ruleset_from_json(const nlohmann::json& j)
+{
+    aida::agent::ruleset_t out;
+    if (j.is_array())
+    {
+        out.reserve(j.size());
+        for (const auto& item : j)
+        {
+            aida::agent::permission_rule_t r;
+            if (rule_from_json(item, r)) out.push_back(std::move(r));
+        }
+    }
+    else if (j.is_object() && j.contains("rules") && j["rules"].is_array())
+    {
+        out = ruleset_from_json(j["rules"]);
     }
     return out;
 }
@@ -531,6 +602,101 @@ inline std::vector<std::string> load_aidaignore(const std::string& workspace_roo
     }
     fclose(f);
     return patterns;
+}
+
+
+inline std::mutex& session_rules_mutex()
+{
+    static std::mutex m;
+    return m;
+}
+
+
+inline std::unordered_map<std::string, aida::agent::ruleset_t>& session_rules_map()
+{
+    static std::unordered_map<std::string, aida::agent::ruleset_t> m;
+    return m;
+}
+
+
+inline aida::agent::ruleset_t get_session_rules(const std::string& session_id)
+{
+    if (session_id.empty()) return aida::agent::ruleset_t{};
+    std::lock_guard<std::mutex> lk(session_rules_mutex());
+    auto& m = session_rules_map();
+    auto it = m.find(session_id);
+    if (it == m.end()) return aida::agent::ruleset_t{};
+    return it->second;
+}
+
+
+inline void set_session_rules(const std::string& session_id,
+                              const aida::agent::ruleset_t& rules)
+{
+    if (session_id.empty()) return;
+    std::lock_guard<std::mutex> lk(session_rules_mutex());
+    auto& m = session_rules_map();
+    if (rules.empty()) m.erase(session_id);
+    else               m[session_id] = rules;
+}
+
+
+inline void clear_session_rules(const std::string& session_id)
+{
+    if (session_id.empty()) return;
+    std::lock_guard<std::mutex> lk(session_rules_mutex());
+    auto& m = session_rules_map();
+    m.erase(session_id);
+}
+
+
+inline aida::agent::ruleset_t combined_rules(const aida::agent::ruleset_t& agent_rules,
+                                             const std::string& session_id)
+{
+    aida::agent::ruleset_t out;
+    out.reserve(agent_rules.size() + 8);
+    for (const auto& r : agent_rules) out.push_back(r);
+    auto session_rules = get_session_rules(session_id);
+    for (auto& r : session_rules) out.push_back(std::move(r));
+    return out;
+}
+
+
+inline bool append_session_rule(const std::string& session_id,
+                                const aida::agent::permission_rule_t& rule)
+{
+    if (session_id.empty()) return false;
+
+    aida::session::session_info_t info;
+    if (!aida::session::get(session_id, info)) return false;
+
+    aida::agent::ruleset_t existing = aida::permission::ruleset_from_json(info.permission);
+    existing.push_back(rule);
+
+    {
+        std::lock_guard<std::mutex> lk(session_rules_mutex());
+        session_rules_map()[session_id] = existing;
+    }
+
+    info.permission = aida::permission::ruleset_to_json(existing);
+    return aida::session::update(info);
+}
+
+
+inline bool load_session_rules_from_store(const std::string& session_id)
+{
+    if (session_id.empty()) return false;
+
+    aida::session::session_info_t info;
+    if (!aida::session::get(session_id, info)) return false;
+
+    aida::agent::ruleset_t loaded = aida::permission::ruleset_from_json(info.permission);
+    {
+        std::lock_guard<std::mutex> lk(session_rules_mutex());
+        if (loaded.empty()) session_rules_map().erase(session_id);
+        else                session_rules_map()[session_id] = std::move(loaded);
+    }
+    return true;
 }
 
 

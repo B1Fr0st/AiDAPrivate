@@ -6,13 +6,22 @@
 #include "standalone_settings.hpp"
 #include "standalone_license.hpp"
 #include "standalone_context.hpp"
+#include "standalone_chat.hpp"
 #include "mcp_standalone.hpp"
+#include "provider_transforms.hpp"
+#include "../auth/auth_store.hpp"
+#include "../auth/auth_claude_code.hpp"
+#include "../auth/auth_codex.hpp"
+#include "../auth/auth_copilot.hpp"
+#include "../mcp/mcp_client.hpp"
+#include "../session/session_store.hpp"
 #include "../helpers/globals.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <ctime>
 #include <set>
 #include <sstream>
 #include <cstdio>
@@ -21,6 +30,96 @@
 #include <chrono>
 
 using json = nlohmann::json;
+
+extern mcp_client::manager_t s_mcp_client_mgr;
+
+namespace {
+
+constexpr int64_t k_oauth_refresh_safety_margin_sec = 30;
+
+std::string s_last_error;
+
+const char* oauth_store_key_for_profile_kind(const std::string& kind)
+{
+    if (kind == "anthropic")      return "anthropic";
+    if (kind == "openai_codex")   return "openai";
+    if (kind == "openai_native")  return "openai";
+    if (kind == "github-copilot" || kind == "copilot") return "github-copilot";
+    return "";
+}
+
+bool refresh_oauth_if_needed(const std::string& store_key)
+{
+    if (store_key.empty())
+        return true;
+
+    aida::auth::auth_info_t info;
+    if (!aida::auth::store::get(store_key, info))
+        return true;
+    if (info.kind != aida::auth::auth_kind_t::oauth)
+        return true;
+    if (info.expires_unix <= 0)
+        return true;
+
+    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    if (info.expires_unix > now + k_oauth_refresh_safety_margin_sec)
+        return true;
+
+    bool ok = false;
+    if (store_key == "anthropic") {
+        ok = aida::auth::claude_code::refresh_token();
+        if (!ok)
+            s_last_error = std::string("Anthropic OAuth refresh failed: ") + aida::auth::claude_code::last_error();
+    } else if (store_key == "openai") {
+        ok = aida::auth::codex::refresh_token();
+        if (!ok)
+            s_last_error = std::string("Codex OAuth refresh failed: ") + aida::auth::codex::last_error();
+    } else if (store_key == "github-copilot") {
+        ok = aida::auth::copilot::refresh_token();
+        if (!ok)
+            s_last_error = std::string("Copilot token refresh failed: ") + aida::auth::copilot::last_error();
+    } else {
+        return true;
+    }
+    return ok;
+}
+
+bool refresh_active_provider_oauth(const std::string& profile_kind)
+{
+    return refresh_oauth_if_needed(oauth_store_key_for_profile_kind(profile_kind));
+}
+
+aida::provider::transforms::request_context_t build_request_context(const nlohmann::json* request_body)
+{
+    aida::provider::transforms::request_context_t ctx;
+    ctx.session_id = chat_active_session();
+    if (!ctx.session_id.empty()) {
+        aida::session::session_info_t info;
+        if (aida::session::get(ctx.session_id, info))
+            ctx.has_parent_session = !info.parent_id.empty();
+    }
+    ctx.is_compaction_continued = false;
+    ctx.request_body = request_body;
+    return ctx;
+}
+
+void apply_oauth_headers(std::map<std::string, std::string>& headers,
+                         const std::string& provider_id,
+                         const std::string& store_key,
+                         const std::string& model_id,
+                         const aida::provider::transforms::request_context_t& ctx)
+{
+    if (store_key.empty()) return;
+    aida::auth::auth_info_t info;
+    if (!aida::auth::store::get(store_key, info)) return;
+    if (info.kind == aida::auth::auth_kind_t::none) return;
+
+    auto computed = aida::provider::transforms::compute_headers(provider_id, model_id, info, ctx);
+    for (auto& [k, v] : computed)
+        headers[k] = v;
+}
+
+}
 
 
 standalone_ai_client_t::standalone_ai_client_t(const settings_sa_t& settings)
@@ -520,10 +619,22 @@ std::string standalone_ai_client_t::generate_openai(
         body["max_tokens"] = 16384;
     }
 
+    const std::string oai_kind = _settings.get_active_profile_kind();
+    const std::string oai_store_key = oauth_store_key_for_profile_kind(oai_kind);
+    if (!refresh_oauth_if_needed(oai_store_key)) {
+        return std::string("Error: ") + s_last_error;
+    }
+
     std::map<std::string, std::string> headers = _settings.get_active_headers();
     if (!_settings.get_active_api_key().empty())
         headers["Authorization"] = "Bearer " + _settings.get_active_api_key();
     headers["Content-Type"] = "application/json";
+
+    if (!oai_store_key.empty()) {
+        const std::string provider_id = (oai_kind == "openai_codex") ? std::string("openai-codex") : std::string("openai");
+        apply_oauth_headers(headers, provider_id, oai_store_key, model,
+                            build_request_context(&body));
+    }
 
     if (on_chunk) {
         std::string thinking_text;
@@ -638,10 +749,17 @@ std::string standalone_ai_client_t::generate_anthropic(
         body["temperature"] = temperature;
     }
 
+    if (!refresh_active_provider_oauth("anthropic")) {
+        return std::string("Error: ") + s_last_error;
+    }
+
     std::map<std::string, std::string> headers = _settings.get_active_headers();
     headers["x-api-key"] = _settings.get_active_api_key();
     headers["anthropic-version"] = "2023-06-01";
     headers["Content-Type"] = "application/json";
+
+    apply_oauth_headers(headers, "anthropic", "anthropic", clean_model,
+                        build_request_context(&body));
 
     if (on_chunk) {
 
@@ -864,12 +982,33 @@ nlohmann::json standalone_ai_client_t::build_anthropic_tools(
     });
 
 
+    std::set<std::string> emitted;
+    emitted.insert("get_tool_descriptions");
     for (auto& t : tools) {
-        if (t.name == "get_tool_descriptions") continue;
+        if (!emitted.insert(t.name).second) continue;
         arr.push_back({
             {"name", t.name},
             {"description", t.description.substr(0, std::min(t.description.size(), static_cast<size_t>(60)))},
             {"input_schema", {{"type", "object"}, {"properties", json::object()}}}
+        });
+    }
+
+    json mcp_tools = s_mcp_client_mgr.mcp_tool_list_json();
+    for (auto& m : mcp_tools) {
+        std::string qualified = m.value("name", std::string());
+        if (qualified.empty()) continue;
+        std::string prefixed = std::string("mcp::") + qualified;
+        if (!emitted.insert(prefixed).second) continue;
+        std::string desc = m.value("description", std::string());
+        if (desc.size() > 200) desc.resize(200);
+        json schema = m.value("input_schema",
+                              json{{"type", "object"}, {"properties", json::object()}});
+        if (!schema.is_object())
+            schema = json{{"type", "object"}, {"properties", json::object()}};
+        arr.push_back({
+            {"name", prefixed},
+            {"description", desc},
+            {"input_schema", schema}
         });
     }
     return arr;
@@ -1019,6 +1158,28 @@ nlohmann::json standalone_ai_client_t::build_openai_tools(
             }}
         });
     }
+
+    json oai_mcp_tools = s_mcp_client_mgr.mcp_tool_list_json();
+    for (auto& m : oai_mcp_tools) {
+        std::string qualified = m.value("name", std::string());
+        if (qualified.empty()) continue;
+        std::string prefixed = std::string("mcp::") + qualified;
+        if (!seen_names.insert(prefixed).second) continue;
+        std::string desc = m.value("description", std::string());
+        if (desc.size() > 200) desc.resize(200);
+        json schema = m.value("input_schema",
+                              json{{"type", "object"}, {"properties", json::object()}});
+        if (!schema.is_object())
+            schema = json{{"type", "object"}, {"properties", json::object()}};
+        arr.push_back({
+            {"type", "function"},
+            {"function", {
+                {"name", prefixed},
+                {"description", desc},
+                {"parameters", schema}
+            }}
+        });
+    }
     return arr;
 }
 
@@ -1070,6 +1231,25 @@ nlohmann::json standalone_ai_client_t::build_gemini_tools(
         decls.push_back({
             {"name", t.name},
             {"description", t.description.substr(0, (std::min)(t.description.size(), static_cast<size_t>(200)))},
+            {"parametersJsonSchema", schema}
+        });
+    }
+
+    json gem_mcp_tools = s_mcp_client_mgr.mcp_tool_list_json();
+    for (auto& m : gem_mcp_tools) {
+        std::string qualified = m.value("name", std::string());
+        if (qualified.empty()) continue;
+        std::string prefixed = std::string("mcp::") + qualified;
+        if (!seen_names.insert(prefixed).second) continue;
+        std::string desc = m.value("description", std::string());
+        if (desc.size() > 200) desc.resize(200);
+        json schema = m.value("input_schema",
+                              json{{"type", "object"}, {"properties", json::object()}});
+        if (!schema.is_object())
+            schema = json{{"type", "object"}, {"properties", json::object()}};
+        decls.push_back({
+            {"name", prefixed},
+            {"description", desc},
             {"parametersJsonSchema", schema}
         });
     }
@@ -1357,10 +1537,19 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
     }
 
 
+    if (!refresh_active_provider_oauth("anthropic")) {
+        result.is_error = true;
+        result.text = std::string("Error: ") + s_last_error;
+        return result;
+    }
+
     std::map<std::string, std::string> headers = _settings.get_active_headers();
     headers["x-api-key"]          = _settings.get_active_api_key();
     headers["anthropic-version"]  = "2023-06-01";
     headers["Content-Type"]       = "application/json";
+
+    apply_oauth_headers(headers, "anthropic", "anthropic", clean_model,
+                        build_request_context(&body));
 
 
     auto client = get_or_create_client(base_url);
@@ -1564,12 +1753,31 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
         body["temperature"] = 0.0;
     }
 
+    const std::string oai_kind = _settings.get_active_profile_kind();
+    const std::string oai_store_key = oauth_store_key_for_profile_kind(oai_kind);
+    if (!refresh_oauth_if_needed(oai_store_key)) {
+        result.is_error = true;
+        result.text = std::string("Error: ") + s_last_error;
+        return result;
+    }
+
     auto client = get_or_create_client(base_url);
     httplib::Headers hdrs;
     hdrs.emplace("Content-Type", "application/json");
     hdrs.emplace("Authorization", "Bearer " + _settings.get_active_api_key());
 
     for (auto& [k, v] : _settings.get_active_headers()) hdrs.emplace(k, v);
+
+    if (!oai_store_key.empty()) {
+        const std::string provider_id = (oai_kind == "openai_codex") ? std::string("openai-codex") : std::string("openai");
+        std::map<std::string, std::string> overlay_map;
+        apply_oauth_headers(overlay_map, provider_id, oai_store_key, model,
+                            build_request_context(&body));
+        for (auto& [k, v] : overlay_map) {
+            hdrs.erase(k);
+            hdrs.emplace(k, v);
+        }
+    }
 
 
     struct oai_tc_state_t {
@@ -2024,6 +2232,13 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
     }
 
 
+    const std::string generic_store_key = oauth_store_key_for_profile_kind(provider);
+    if (!refresh_oauth_if_needed(generic_store_key)) {
+        result.is_error = true;
+        result.text = std::string("Error: ") + s_last_error;
+        return result;
+    }
+
     auto client = get_or_create_client(base_url);
     httplib::Headers hdrs;
     hdrs.emplace("Content-Type", "application/json");
@@ -2037,6 +2252,16 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
     }
 
     for (auto& [k, v] : _settings.get_active_headers()) hdrs.emplace(k, v);
+
+    if (!generic_store_key.empty()) {
+        std::map<std::string, std::string> overlay_map;
+        apply_oauth_headers(overlay_map, generic_store_key, generic_store_key, model,
+                            build_request_context(&body));
+        for (auto& [k, v] : overlay_map) {
+            hdrs.erase(k);
+            hdrs.emplace(k, v);
+        }
+    }
 
 
     struct oai_tc_state_t {

@@ -156,8 +156,39 @@ struct tool_approval_t {
 };
 tool_approval_t s_tool_approval;
 
+thread_local std::string t_tool_approval_deny_reason;
+
+const std::string& tool_approval_last_deny_reason()
+{
+    return t_tool_approval_deny_reason;
+}
+
 bool request_tool_approval(const std::string& name, const json& arguments)
 {
+    t_tool_approval_deny_reason.clear();
+
+    {
+        aida::agent::initialize();
+        const aida::agent::agent_info_t* agent = aida::agent::active_agent();
+        if (agent == nullptr)
+            agent = aida::agent::get(aida::agent::default_agent_name());
+        if (agent != nullptr) {
+            const std::string permission_key = aida::agent::permission_key_for_tool(name);
+            const std::string pattern_arg    = aida::permission::first_path_or_command_argument(name, arguments);
+
+            auto eval_specific = aida::agent::evaluate_ruleset(
+                agent->permissions, permission_key, pattern_arg);
+            auto eval_tool = aida::agent::evaluate_ruleset(
+                agent->permissions, name, pattern_arg);
+
+            if (eval_specific == aida::agent::permission_rule_t::action_t::deny ||
+                eval_tool     == aida::agent::permission_rule_t::action_t::deny) {
+                t_tool_approval_deny_reason =
+                    "Error: " + agent->name + " mode forbids this tool: " + name;
+                return false;
+            }
+        }
+    }
 
     if (g_sa_settings.tool_auto_approve)
         return true;
@@ -770,7 +801,13 @@ void run_agentic(std::string user_message,
                 }
 
                 if (!request_tool_approval(tc.name, tc.arguments)) {
-                    tool_results += "\n<tool_result name=\"" + tc.name + "\">\nTool execution denied by user.\n</tool_result>\n";
+                    const std::string& deny_reason = tool_approval_last_deny_reason();
+                    const std::string  deny_text   = deny_reason.empty()
+                        ? std::string("Tool execution denied by user.")
+                        : deny_reason;
+                    tool_results += "\n<tool_result name=\"" + tc.name + "\">\n"
+                                  + deny_text
+                                  + "\n</tool_result>\n";
                     continue;
                 }
 
@@ -794,9 +831,115 @@ void run_agentic(std::string user_message,
 
 
     json messages = json::array();
-    for (auto& [role, text] : history) {
-        std::string r = (role == "assistant" || role == "Assistant") ? "assistant" : "user";
-        messages.push_back({{"role", r}, {"content", text}});
+    {
+        std::string sid_for_slice = get_chat_session_id_locked();
+        bool used_compaction_slice = false;
+        if (!sid_for_slice.empty()) {
+            std::vector<aida::session::message_t> persisted;
+            if (aida::session::list_messages(sid_for_slice, persisted, -1)) {
+                std::string compaction_summary;
+                std::string tail_start_id;
+                for (auto rit = persisted.rbegin(); rit != persisted.rend(); ++rit) {
+                    bool found = false;
+                    for (const auto& part : rit->parts) {
+                        if (part.kind == aida::session::part_t::kind_t::compaction
+                            && !part.compaction.summary_text.empty()) {
+                            compaction_summary = part.compaction.summary_text;
+                            tail_start_id      = part.compaction.tail_start_message_id;
+                            found              = true;
+                            break;
+                        }
+                    }
+                    if (found) break;
+                }
+
+                if (!compaction_summary.empty()) {
+                    std::string synth_text;
+                    synth_text.reserve(compaction_summary.size() + 96);
+                    synth_text += "<previous_session_summary>\n";
+                    synth_text += compaction_summary;
+                    synth_text += "\n</previous_session_summary>";
+                    messages.push_back({{"role", "user"}, {"content", synth_text}});
+
+                    const bool has_tail = !tail_start_id.empty();
+                    bool tail_active = false;
+                    for (const auto& m : persisted) {
+                        if (!has_tail) break;
+                        if (!tail_active) {
+                            if (m.id == tail_start_id) tail_active = true;
+                            else continue;
+                        }
+                        bool has_compaction_part = false;
+                        std::string flat;
+                        flat.reserve(256);
+                        for (const auto& part : m.parts) {
+                            switch (part.kind) {
+                                case aida::session::part_t::kind_t::text:
+                                    if (!part.text.text.empty()) {
+                                        if (!flat.empty()) flat += '\n';
+                                        flat += part.text.text;
+                                    }
+                                    break;
+                                case aida::session::part_t::kind_t::tool: {
+                                    if (!flat.empty()) flat += '\n';
+                                    flat += "[tool ";
+                                    flat += part.tool.tool_name;
+                                    flat += "] ";
+                                    if (!part.tool.arguments.is_null()) {
+                                        try { flat += part.tool.arguments.dump(); }
+                                        catch (...) {}
+                                    }
+                                    if (!part.tool.output_text.empty()) {
+                                        flat += "\n[output] ";
+                                        flat += part.tool.output_text;
+                                    }
+                                    if (!part.tool.error_message.empty()) {
+                                        flat += "\n[error] ";
+                                        flat += part.tool.error_message;
+                                    }
+                                    break;
+                                }
+                                case aida::session::part_t::kind_t::reasoning:
+                                    break;
+                                case aida::session::part_t::kind_t::compaction:
+                                    has_compaction_part = true;
+                                    break;
+                                case aida::session::part_t::kind_t::step_finish:
+                                case aida::session::part_t::kind_t::step_start:
+                                    break;
+                                case aida::session::part_t::kind_t::file:
+                                    if (!flat.empty()) flat += '\n';
+                                    flat += "[file ";
+                                    flat += part.file.mime;
+                                    if (!part.file.filename.empty()) {
+                                        flat += ' ';
+                                        flat += part.file.filename;
+                                    }
+                                    flat += "]";
+                                    break;
+                            }
+                        }
+                        if (has_compaction_part) continue;
+                        if (flat.empty()) continue;
+                        std::string r;
+                        switch (m.role) {
+                            case aida::session::message_t::role_t::assistant:   r = "assistant"; break;
+                            case aida::session::message_t::role_t::tool_result: r = "user";      break;
+                            case aida::session::message_t::role_t::user:
+                            default:                                            r = "user";      break;
+                        }
+                        messages.push_back({{"role", r}, {"content", flat}});
+                    }
+                    used_compaction_slice = true;
+                }
+            }
+        }
+        if (!used_compaction_slice) {
+            for (auto& [role, text] : history) {
+                std::string r = (role == "assistant" || role == "Assistant") ? "assistant" : "user";
+                messages.push_back({{"role", r}, {"content", text}});
+            }
+        }
     }
     messages.push_back({{"role", "user"}, {"content", user_message}});
 
@@ -1017,8 +1160,12 @@ void run_agentic(std::string user_message,
             }
 
             if (!request_tool_approval(tc.name, tc.arguments)) {
+                const std::string& deny_reason = tool_approval_last_deny_reason();
+                const std::string  deny_text   = deny_reason.empty()
+                    ? std::string("Tool execution denied by user.")
+                    : deny_reason;
                 tool_result_content.push_back(
-                    standalone_ai_client_t::make_tool_result_block(tc.id, "Tool execution denied by user.", true));
+                    standalone_ai_client_t::make_tool_result_block(tc.id, deny_text, true));
                 continue;
             }
 

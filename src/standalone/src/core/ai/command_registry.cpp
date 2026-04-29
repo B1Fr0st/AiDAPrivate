@@ -659,6 +659,71 @@ namespace commands {
 		}
 
 
+		void register_mcp_tools_locked(std::vector<command_t>& dst, std::set<std::string>& taken_names)
+		{
+			std::vector<mcp_client::remote_tool_t> all = s_mcp_client_mgr.get_all_tools();
+			for (auto& rt : all) {
+				if (rt.name.empty()) continue;
+				if (taken_names.count(rt.name) > 0) continue;
+
+				const std::string server  = rt.server_name;
+				const std::string tool    = rt.original_name.empty() ? rt.name : rt.original_name;
+				const std::string display = rt.name;
+
+				command_t c;
+				c.name        = display;
+				c.description = rt.description.empty()
+					? (std::string("MCP tool from ") + server)
+					: rt.description;
+				c.source         = command_source_t::mcp;
+				c.template_text  = std::string();
+				c.resolver = [display, server, tool](const std::vector<std::string>& args,
+				                                      std::string& out) -> bool {
+					nlohmann::json arguments = nlohmann::json::object();
+					if (!args.empty()) {
+						const std::string joined = [&]() {
+							std::string s;
+							for (size_t i = 0; i < args.size(); ++i) {
+								if (i > 0) s.push_back(' ');
+								s += args[i];
+							}
+							return s;
+						}();
+						if (!joined.empty()) {
+							try {
+								arguments = nlohmann::json::parse(joined);
+								if (!arguments.is_object())
+									arguments = nlohmann::json{{"input", joined}};
+							} catch (...) {
+								arguments = nlohmann::json{{"input", joined}};
+							}
+						}
+					}
+
+					mcp_client::call_result_t r = s_mcp_client_mgr.call_tool(display, arguments);
+					if (!r.success) {
+						out = std::string("[mcp:") + server + "/" + tool + "] " +
+						      (r.text.empty() ? "tool call failed" : r.text);
+						return true;
+					}
+					out = r.text;
+					if (!r.data.is_null() && !r.data.empty()) {
+						try {
+							if (!out.empty()) out += "\n";
+							out += r.data.dump(2);
+						} catch (...) {}
+					}
+					if (out.empty())
+						out = std::string("[mcp:") + server + "/" + tool + "] (no output)";
+					return true;
+				};
+
+				dst.push_back(std::move(c));
+				taken_names.insert(display);
+			}
+		}
+
+
 		void register_agents_locked(std::vector<command_t>& dst, std::set<std::string>& taken_names)
 		{
 			auto primary = aida::agent::primary_agents();
@@ -698,6 +763,7 @@ namespace commands {
 
 			register_skills_locked(dst, taken_names);
 			register_mcp_prompts_locked(dst, taken_names);
+			register_mcp_tools_locked(dst, taken_names);
 			register_agents_locked(dst, taken_names);
 		}
 
@@ -918,6 +984,21 @@ namespace commands {
 			return false;
 		}
 
+		auto publish_executed = [&](const std::string& text) {
+			(void)text;
+			aida::events::command_executed_t evt;
+			evt.session_id   = get_chat_session_id_safe();
+			evt.command_name = name;
+			switch (snapshot.source) {
+				case command_source_t::builtin: evt.source = "builtin"; break;
+				case command_source_t::mcp:     evt.source = "mcp";     break;
+				case command_source_t::skill:   evt.source = "skill";   break;
+				case command_source_t::agent:   evt.source = "agent";   break;
+			}
+			evt.args = join_args(args);
+			aida::events::publish(aida::events::event_command_executed, evt);
+		};
+
 		if (snapshot.resolver) {
 			std::string text;
 			const bool ok = snapshot.resolver(args, text);
@@ -926,10 +1007,12 @@ namespace commands {
 				return false;
 			}
 			out_resolved_text = std::move(text);
+			publish_executed(out_resolved_text);
 			return true;
 		}
 
 		out_resolved_text = apply_placeholders(snapshot.template_text, args);
+		publish_executed(out_resolved_text);
 		return true;
 	}
 

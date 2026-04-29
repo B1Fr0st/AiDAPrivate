@@ -26,6 +26,8 @@ namespace provider {
 		double cache_write_per_million = 0.0;
 		double over_200k_input_per_million = 0.0;
 		double over_200k_output_per_million = 0.0;
+		double over_200k_cache_read_per_million = 0.0;
+		double over_200k_cache_write_per_million = 0.0;
 	};
 
 	struct model_limit_t {
@@ -76,6 +78,7 @@ namespace catalog {
 
 	bool fetch_and_cache(int timeout_ms = 10000);
 	bool load_cached_or_fetch(int max_age_seconds = 3600);
+	void initialize_async(int max_age_seconds = 86400);
 	const std::vector<provider_info_t>& list_providers();
 	const provider_info_t* get_provider(const std::string& provider_id);
 	const model_info_t* get_model(const std::string& provider_id, const std::string& model_id);

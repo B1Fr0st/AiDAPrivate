@@ -16,6 +16,8 @@
 
 #include <sqlite3.h>
 
+#include "event_bus.hpp"
+
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "Shell32.lib")
 
@@ -194,6 +196,8 @@ std::string part_kind_to_string(part_t::kind_t k)
         case part_t::kind_t::compaction:  return "compaction";
         case part_t::kind_t::reasoning:   return "reasoning";
         case part_t::kind_t::step_finish: return "step_finish";
+        case part_t::kind_t::file:        return "file";
+        case part_t::kind_t::step_start:  return "step_start";
     }
     return "text";
 }
@@ -205,6 +209,8 @@ part_t::kind_t part_kind_from_string(const std::string& s)
     if (s == "compaction")  return part_t::kind_t::compaction;
     if (s == "reasoning")   return part_t::kind_t::reasoning;
     if (s == "step_finish") return part_t::kind_t::step_finish;
+    if (s == "file")        return part_t::kind_t::file;
+    if (s == "step_start" || s == "step-start") return part_t::kind_t::step_start;
     return part_t::kind_t::text;
 }
 
@@ -253,6 +259,22 @@ nlohmann::json serialize_part(const part_t& p)
             tk["cache_read"]  = p.step_finish.tokens.cache_read;
             tk["cache_write"] = p.step_finish.tokens.cache_write;
             j["tokens"] = std::move(tk);
+            break;
+        }
+        case part_t::kind_t::file: {
+            j["mime"]            = p.file.mime;
+            j["filename"]        = p.file.filename;
+            j["url"]             = p.file.url;
+            j["source_metadata"] = p.file.source_metadata.is_null()
+                                       ? nlohmann::json::object()
+                                       : p.file.source_metadata;
+            break;
+        }
+        case part_t::kind_t::step_start: {
+            j["snapshot_id"] = p.step_start.snapshot_id;
+            j["agent"]       = p.step_start.agent;
+            j["provider_id"] = p.step_start.provider_id;
+            j["model_id"]    = p.step_start.model_id;
             break;
         }
     }
@@ -304,6 +326,20 @@ part_t deserialize_part(const std::string& kind, const nlohmann::json& j)
             p.step_finish.tokens.reasoning   = tk.value("reasoning", static_cast<int64_t>(0));
             p.step_finish.tokens.cache_read  = tk.value("cache_read", static_cast<int64_t>(0));
             p.step_finish.tokens.cache_write = tk.value("cache_write", static_cast<int64_t>(0));
+            break;
+        }
+        case part_t::kind_t::file: {
+            p.file.mime            = j.value("mime", std::string());
+            p.file.filename        = j.value("filename", std::string());
+            p.file.url             = j.value("url", std::string());
+            p.file.source_metadata = j.value("source_metadata", nlohmann::json::object());
+            break;
+        }
+        case part_t::kind_t::step_start: {
+            p.step_start.snapshot_id = j.value("snapshot_id", std::string());
+            p.step_start.agent       = j.value("agent", std::string());
+            p.step_start.provider_id = j.value("provider_id", std::string());
+            p.step_start.model_id    = j.value("model_id", std::string());
             break;
         }
     }
@@ -587,6 +623,25 @@ bool insert_session_row_locked(sqlite3* db, const session_info_t& info)
 }
 
 
+bool column_exists(sqlite3* db, const char* table, const char* column)
+{
+    sqlite3_stmt* stmt = nullptr;
+    std::string sql = std::string("PRAGMA table_info(") + table + ")";
+    int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) return false;
+    bool found = false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char* p = sqlite3_column_text(stmt, 1);
+        if (p && std::strcmp(reinterpret_cast<const char*>(p), column) == 0) {
+            found = true;
+            break;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+
 bool ensure_schema(sqlite3* db)
 {
     if (!exec_simple(db, "PRAGMA journal_mode=WAL")) return false;
@@ -613,7 +668,8 @@ bool ensure_schema(sqlite3* db)
         "time_compacting INTEGER,"
         "revert_json TEXT,"
         "permission_json TEXT,"
-        "total_cost REAL DEFAULT 0.0"
+        "total_cost REAL DEFAULT 0.0,"
+        "todos_json TEXT NOT NULL DEFAULT ''"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_sessions_binary ON sessions(binary_path);"
         "CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id);"
@@ -644,7 +700,14 @@ bool ensure_schema(sqlite3* db)
         ");"
         "INSERT OR IGNORE INTO schema_meta(key, value) VALUES('version', '1');";
 
-    return exec_simple(db, schema);
+    if (!exec_simple(db, schema)) return false;
+
+    if (!column_exists(db, "sessions", "todos_json")) {
+        if (!exec_simple(db, "ALTER TABLE sessions ADD COLUMN todos_json TEXT NOT NULL DEFAULT ''"))
+            return false;
+    }
+
+    return true;
 }
 
 
@@ -800,6 +863,15 @@ bool create(session_info_t& out_info,
         exec_simple(db, "ROLLBACK");
         return false;
     }
+
+    {
+        aida::events::session_created_t evt;
+        evt.session_id = out_info.id;
+        evt.project_id = out_info.project_id;
+        evt.parent_id  = out_info.parent_id;
+        aida::events::publish(aida::events::event_session_created, evt);
+    }
+
     return true;
 }
 
@@ -883,6 +955,14 @@ bool update(const session_info_t& info)
         set_last_error_sqlite(db, "update_step");
         return false;
     }
+
+    {
+        aida::events::session_updated_t evt;
+        evt.session_id     = info.id;
+        evt.fields_changed = "title,binary_path,directory,version,summary,permission,revert,total_cost,archived,compacting";
+        aida::events::publish(aida::events::event_session_updated, evt);
+    }
+
     return true;
 }
 
@@ -1127,6 +1207,14 @@ bool set_archived(const std::string& session_id, int64_t archived_unix)
         set_last_error_sqlite(db, "set_archived_step");
         return false;
     }
+
+    {
+        aida::events::session_updated_t evt;
+        evt.session_id     = session_id;
+        evt.fields_changed = "archived";
+        aida::events::publish(aida::events::event_session_updated, evt);
+    }
+
     return true;
 }
 
@@ -1209,6 +1297,18 @@ bool remove(const std::string& session_id)
         exec_simple(db, "ROLLBACK");
         return false;
     }
+
+    for (const auto& cid : child_ids) {
+        aida::events::session_deleted_t evt;
+        evt.session_id = cid;
+        aida::events::publish(aida::events::event_session_deleted, evt);
+    }
+    {
+        aida::events::session_deleted_t evt;
+        evt.session_id = session_id;
+        aida::events::publish(aida::events::event_session_deleted, evt);
+    }
+
     return true;
 }
 
@@ -1237,6 +1337,14 @@ bool set_title(const std::string& session_id, const std::string& title)
         set_last_error_sqlite(db, "set_title_step");
         return false;
     }
+
+    {
+        aida::events::session_updated_t evt;
+        evt.session_id     = session_id;
+        evt.fields_changed = "title";
+        aida::events::publish(aida::events::event_session_updated, evt);
+    }
+
     return true;
 }
 
@@ -1489,6 +1597,91 @@ usage_tokens_t session_tokens(const std::string& session_id)
     }
     sqlite3_finalize(stmt);
     return agg;
+}
+
+
+bool get_session_todos(const std::string& session_id, std::string& out)
+{
+    out.clear();
+    sqlite3* db = db_handle();
+    if (!db) {
+        set_last_error("not_initialized");
+        return false;
+    }
+    if (session_id.empty()) {
+        set_last_error("invalid_session_id");
+        return false;
+    }
+
+    const char* sql = "SELECT todos_json FROM sessions WHERE id = ?";
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        set_last_error_sqlite(db, "get_session_todos_prepare");
+        return false;
+    }
+    if (!bind_text(stmt, 1, session_id)) {
+        sqlite3_finalize(stmt);
+        set_last_error("get_session_todos_bind_failed");
+        return false;
+    }
+    bool found = false;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        out = column_text_or_empty(stmt, 0);
+        found = true;
+    }
+    sqlite3_finalize(stmt);
+    if (!found) {
+        set_last_error("session_not_found");
+        return false;
+    }
+    return true;
+}
+
+
+bool set_session_todos(const std::string& session_id, const std::string& todos_text)
+{
+    sqlite3* db = db_handle();
+    if (!db) {
+        set_last_error("not_initialized");
+        return false;
+    }
+    if (session_id.empty()) {
+        set_last_error("invalid_session_id");
+        return false;
+    }
+
+    const char* sql =
+        "UPDATE sessions SET todos_json = ?, time_updated = ? WHERE id = ?";
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        set_last_error_sqlite(db, "set_session_todos_prepare");
+        return false;
+    }
+    bool ok = bind_text(stmt, 1, todos_text) &&
+              bind_int64(stmt, 2, now_unix_ms()) &&
+              bind_text(stmt, 3, session_id);
+    if (ok) rc = sqlite3_step(stmt);
+    int changes = sqlite3_changes(db);
+    sqlite3_finalize(stmt);
+    if (!ok || rc != SQLITE_DONE) {
+        set_last_error_sqlite(db, "set_session_todos_step");
+        return false;
+    }
+    if (changes == 0) {
+        set_last_error("session_not_found");
+        return false;
+    }
+
+    {
+        aida::events::session_updated_t evt;
+        evt.session_id     = session_id;
+        evt.fields_changed = "todos";
+        aida::events::publish(aida::events::event_session_updated, evt);
+    }
+
+    return true;
 }
 
 

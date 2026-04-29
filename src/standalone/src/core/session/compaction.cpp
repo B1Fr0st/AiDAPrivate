@@ -74,6 +74,13 @@ namespace compaction {
 						break;
 					case aida::session::part_t::kind_t::step_finish:
 						break;
+					case aida::session::part_t::kind_t::file:
+						total += context_mgmt::estimate_token_count(p.file.mime);
+						total += context_mgmt::estimate_token_count(p.file.filename);
+						total += context_mgmt::estimate_token_count(p.file.url);
+						break;
+					case aida::session::part_t::kind_t::step_start:
+						break;
 				}
 			}
 			return total;
@@ -138,6 +145,19 @@ namespace compaction {
 						}
 						break;
 					case aida::session::part_t::kind_t::step_finish:
+						break;
+					case aida::session::part_t::kind_t::file:
+						if (!p.file.filename.empty() || !p.file.mime.empty()) {
+							out += "[file ";
+							out += p.file.mime;
+							if (!p.file.filename.empty()) {
+								out += ' ';
+								out += p.file.filename;
+							}
+							out += "]\n";
+						}
+						break;
+					case aida::session::part_t::kind_t::step_start:
 						break;
 				}
 			}
@@ -548,6 +568,21 @@ namespace compaction {
 			set_last_error("maybe_auto_title: empty first_user_message");
 			return false;
 		}
+
+		static std::atomic<bool> s_title_in_flight{false};
+		bool expected = false;
+		if (!s_title_in_flight.compare_exchange_strong(
+				expected, true,
+				std::memory_order_acq_rel,
+				std::memory_order_acquire)) {
+			set_last_error("maybe_auto_title: already running");
+			return false;
+		}
+		struct release_guard_t
+		{
+			std::atomic<bool>* flag;
+			~release_guard_t() { if (flag) flag->store(false, std::memory_order_release); }
+		} release_guard{&s_title_in_flight};
 
 		aida::session::session_info_t info;
 		if (!aida::session::get(session_id, info)) {

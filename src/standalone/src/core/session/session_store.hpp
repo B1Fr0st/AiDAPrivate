@@ -74,6 +74,24 @@ struct part_step_finish_t
 };
 
 
+struct part_file_t
+{
+    std::string    mime;
+    std::string    filename;
+    std::string    url;
+    nlohmann::json source_metadata;
+};
+
+
+struct part_step_start_t
+{
+    std::string snapshot_id;
+    std::string agent;
+    std::string provider_id;
+    std::string model_id;
+};
+
+
 struct part_t
 {
     enum class kind_t
@@ -82,7 +100,9 @@ struct part_t
         tool,
         compaction,
         reasoning,
-        step_finish
+        step_finish,
+        file,
+        step_start
     };
 
     kind_t              kind = kind_t::text;
@@ -91,6 +111,8 @@ struct part_t
     part_compaction_t   compaction;
     part_reasoning_t    reasoning;
     part_step_finish_t  step_finish;
+    part_file_t         file;
+    part_step_start_t   step_start;
 };
 
 
@@ -170,6 +192,9 @@ bool update_message(const message_t& message);
 
 double         session_cost(const std::string& session_id);
 usage_tokens_t session_tokens(const std::string& session_id);
+
+bool        get_session_todos(const std::string& session_id, std::string& out);
+bool        set_session_todos(const std::string& session_id, const std::string& todos_text);
 
 const std::string& last_error();
 

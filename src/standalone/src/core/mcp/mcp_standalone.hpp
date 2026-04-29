@@ -45,6 +45,12 @@ namespace mcp_standalone
         bool        required = false;
     };
 
+    enum class tool_visibility_t : int
+    {
+        external_visible = 0,
+        internal_only    = 1
+    };
+
     struct tool_def_t
     {
         std::string name;
@@ -52,6 +58,7 @@ namespace mcp_standalone
         std::vector<tool_param_t> params;
         bool read_only = true;
         std::function<tool_result_t(const json& params)> handler;
+        tool_visibility_t visibility = tool_visibility_t::external_visible;
     };
 
     class server_t

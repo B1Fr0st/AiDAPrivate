@@ -207,7 +207,7 @@ namespace codex {
 			url += "&id_token_add_organizations=true";
 			url += "&codex_cli_simplified_flow=true";
 			url += "&state=" + url_encode(state_token);
-			url += "&originator=aida";
+			url += "&originator=opencode";
 			return url;
 		}
 

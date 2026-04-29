@@ -673,6 +673,433 @@ namespace
             json{{"results", results}});
     }
 
+    bool webfetch_split_url(const std::string& full,
+                            std::string& scheme,
+                            std::string& host,
+                            int& port,
+                            std::string& path_out,
+                            bool& is_https)
+    {
+        scheme.clear();
+        host.clear();
+        path_out = "/";
+        port = 0;
+        is_https = false;
+        const auto sp = full.find("://");
+        if (sp == std::string::npos)
+            return false;
+        scheme = full.substr(0, sp);
+        std::string rest = full.substr(sp + 3);
+        const auto slash = rest.find('/');
+        std::string host_port;
+        if (slash == std::string::npos) {
+            host_port = rest;
+            path_out = "/";
+        } else {
+            host_port = rest.substr(0, slash);
+            path_out = rest.substr(slash);
+        }
+        const auto colon = host_port.find(':');
+        if (colon == std::string::npos) {
+            host = host_port;
+        } else {
+            host = host_port.substr(0, colon);
+            try {
+                port = std::stoi(host_port.substr(colon + 1));
+            } catch (...) {
+                return false;
+            }
+        }
+        if (scheme == "https") {
+            is_https = true;
+            if (port == 0) port = 443;
+        } else if (scheme == "http") {
+            is_https = false;
+            if (port == 0) port = 80;
+        } else {
+            return false;
+        }
+        if (host.empty())
+            return false;
+        return true;
+    }
+
+    std::string webfetch_strip_blocks(const std::string& html)
+    {
+        std::string out = html;
+        static const std::regex script_block("<script\\b[^>]*>[\\s\\S]*?</script>",
+            std::regex::icase | std::regex::ECMAScript);
+        static const std::regex style_block("<style\\b[^>]*>[\\s\\S]*?</style>",
+            std::regex::icase | std::regex::ECMAScript);
+        static const std::regex noscript_block("<noscript\\b[^>]*>[\\s\\S]*?</noscript>",
+            std::regex::icase | std::regex::ECMAScript);
+        static const std::regex iframe_block("<iframe\\b[^>]*>[\\s\\S]*?</iframe>",
+            std::regex::icase | std::regex::ECMAScript);
+        static const std::regex html_comment("<!--[\\s\\S]*?-->", std::regex::ECMAScript);
+        out = std::regex_replace(out, script_block, "");
+        out = std::regex_replace(out, style_block, "");
+        out = std::regex_replace(out, noscript_block, "");
+        out = std::regex_replace(out, iframe_block, "");
+        out = std::regex_replace(out, html_comment, "");
+        return out;
+    }
+
+    std::string webfetch_decode_entities(const std::string& s)
+    {
+        std::string out;
+        out.reserve(s.size());
+        size_t i = 0;
+        while (i < s.size()) {
+            if (s[i] != '&') { out.push_back(s[i]); ++i; continue; }
+            const auto semi = s.find(';', i + 1);
+            if (semi == std::string::npos || semi - i > 12) { out.push_back(s[i]); ++i; continue; }
+            const std::string entity = s.substr(i + 1, semi - i - 1);
+            if (entity == "amp")        out.push_back('&');
+            else if (entity == "lt")    out.push_back('<');
+            else if (entity == "gt")    out.push_back('>');
+            else if (entity == "quot")  out.push_back('"');
+            else if (entity == "apos")  out.push_back('\'');
+            else if (entity == "nbsp")  out.push_back(' ');
+            else if (entity == "copy")  out.append("(c)");
+            else if (entity == "reg")   out.append("(r)");
+            else if (entity == "trade") out.append("(tm)");
+            else if (entity == "hellip") out.append("...");
+            else if (entity == "mdash") out.append("--");
+            else if (entity == "ndash") out.append("-");
+            else if (!entity.empty() && entity[0] == '#') {
+                long codepoint = 0;
+                bool ok = false;
+                try {
+                    if (entity.size() > 1 && (entity[1] == 'x' || entity[1] == 'X'))
+                        codepoint = std::stol(entity.substr(2), nullptr, 16);
+                    else
+                        codepoint = std::stol(entity.substr(1), nullptr, 10);
+                    ok = true;
+                } catch (...) { ok = false; }
+                if (ok && codepoint > 0 && codepoint <= 0x7F) {
+                    out.push_back(static_cast<char>(codepoint));
+                } else if (ok && codepoint > 0x7F && codepoint <= 0x7FF) {
+                    out.push_back(static_cast<char>(0xC0 | ((codepoint >> 6) & 0x1F)));
+                    out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+                } else if (ok && codepoint > 0x7FF && codepoint <= 0xFFFF) {
+                    out.push_back(static_cast<char>(0xE0 | ((codepoint >> 12) & 0x0F)));
+                    out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+                    out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+                } else if (ok && codepoint > 0xFFFF && codepoint <= 0x10FFFF) {
+                    out.push_back(static_cast<char>(0xF0 | ((codepoint >> 18) & 0x07)));
+                    out.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F)));
+                    out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+                    out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+                } else {
+                    out.append(s.substr(i, semi - i + 1));
+                }
+            } else {
+                out.append(s.substr(i, semi - i + 1));
+            }
+            i = semi + 1;
+        }
+        return out;
+    }
+
+    std::string webfetch_collapse_whitespace(const std::string& s)
+    {
+        std::string out;
+        out.reserve(s.size());
+        bool prev_blank = true;
+        size_t consecutive_newlines = 0;
+        for (char c : s) {
+            if (c == '\r') continue;
+            if (c == '\n') {
+                if (consecutive_newlines < 2)
+                    out.push_back('\n');
+                ++consecutive_newlines;
+                prev_blank = true;
+                continue;
+            }
+            if (c == ' ' || c == '\t') {
+                if (!prev_blank) out.push_back(' ');
+                prev_blank = true;
+                continue;
+            }
+            out.push_back(c);
+            prev_blank = false;
+            consecutive_newlines = 0;
+        }
+        while (!out.empty() && (out.back() == ' ' || out.back() == '\n')) out.pop_back();
+        return out;
+    }
+
+    std::string webfetch_html_to_text(const std::string& html_in)
+    {
+        std::string s = webfetch_strip_blocks(html_in);
+        static const std::regex tag_rx("<[^>]+>", std::regex::ECMAScript);
+        s = std::regex_replace(s, tag_rx, " ");
+        s = webfetch_decode_entities(s);
+        s = webfetch_collapse_whitespace(s);
+        return s;
+    }
+
+    std::string webfetch_html_to_markdown(const std::string& html_in)
+    {
+        const std::string s = webfetch_strip_blocks(html_in);
+
+        std::string out;
+        out.reserve(s.size());
+        const std::regex any_tag(
+            "<(/?)([a-zA-Z][a-zA-Z0-9]*)\\b([^>]*)>",
+            std::regex::ECMAScript);
+        std::smatch match;
+        std::string::const_iterator search_start = s.cbegin();
+        std::string list_indent;
+        bool in_pre = false;
+        while (std::regex_search(search_start, s.cend(), match, any_tag)) {
+            const auto prefix_begin = search_start;
+            const auto prefix_end = match[0].first;
+            std::string prefix(prefix_begin, prefix_end);
+            out += prefix;
+
+            const bool closing = match[1].length() == 1;
+            std::string tag = match[2].str();
+            std::string attrs = match[3].str();
+            std::transform(tag.begin(), tag.end(), tag.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+
+            if (tag.size() == 2 && tag[0] == 'h' && tag[1] >= '1' && tag[1] <= '6') {
+                if (!closing) {
+                    out.append("\n\n");
+                    const int level = tag[1] - '0';
+                    out.append(static_cast<size_t>(level), '#');
+                    out.push_back(' ');
+                } else {
+                    out.append("\n\n");
+                }
+            } else if (tag == "p" || tag == "div" || tag == "section" || tag == "article" ||
+                       tag == "header" || tag == "footer" || tag == "main" || tag == "aside" ||
+                       tag == "nav" || tag == "blockquote") {
+                out.append("\n\n");
+            } else if (tag == "br") {
+                out.append("\n");
+            } else if (tag == "hr") {
+                out.append("\n\n---\n\n");
+            } else if (tag == "ul" || tag == "ol") {
+                if (!closing) list_indent.push_back('\t');
+                else if (!list_indent.empty()) list_indent.pop_back();
+                out.append("\n");
+            } else if (tag == "li") {
+                if (!closing) {
+                    out.push_back('\n');
+                    out.append(list_indent.empty() ? std::string() : list_indent.substr(1));
+                    out.append("- ");
+                }
+            } else if (tag == "strong" || tag == "b") {
+                out.append("**");
+            } else if (tag == "em" || tag == "i") {
+                out.push_back('*');
+            } else if (tag == "code") {
+                if (!in_pre) out.push_back('`');
+            } else if (tag == "pre") {
+                if (!closing) { out.append("\n\n```\n"); in_pre = true; }
+                else { out.append("\n```\n\n"); in_pre = false; }
+            } else if (tag == "a" && !closing) {
+                std::string href;
+                static const std::regex href_rx("href\\s*=\\s*\"([^\"]*)\"|href\\s*=\\s*'([^']*)'",
+                    std::regex::icase | std::regex::ECMAScript);
+                std::smatch href_match;
+                if (std::regex_search(attrs, href_match, href_rx)) {
+                    href = href_match[1].matched ? href_match[1].str() : href_match[2].str();
+                }
+                out.append("__AIDA_A_OPEN__");
+                out.append(href);
+                out.append("__AIDA_A_HREF__");
+            } else if (tag == "a" && closing) {
+                out.append("__AIDA_A_CLOSE__");
+            } else if (tag == "img" && !closing) {
+                std::string alt, src;
+                static const std::regex alt_rx("alt\\s*=\\s*\"([^\"]*)\"|alt\\s*=\\s*'([^']*)'",
+                    std::regex::icase | std::regex::ECMAScript);
+                static const std::regex src_rx("src\\s*=\\s*\"([^\"]*)\"|src\\s*=\\s*'([^']*)'",
+                    std::regex::icase | std::regex::ECMAScript);
+                std::smatch a_match, s_match;
+                if (std::regex_search(attrs, a_match, alt_rx))
+                    alt = a_match[1].matched ? a_match[1].str() : a_match[2].str();
+                if (std::regex_search(attrs, s_match, src_rx))
+                    src = s_match[1].matched ? s_match[1].str() : s_match[2].str();
+                out.push_back('!');
+                out.push_back('[');
+                out.append(alt);
+                out.append("](");
+                out.append(src);
+                out.push_back(')');
+            }
+
+            search_start = match[0].second;
+        }
+        out.append(search_start, s.cend());
+
+        std::string final_out;
+        final_out.reserve(out.size());
+        size_t i = 0;
+        while (i < out.size()) {
+            const auto open_pos = out.find("__AIDA_A_OPEN__", i);
+            if (open_pos == std::string::npos) {
+                final_out.append(out, i, std::string::npos);
+                break;
+            }
+            final_out.append(out, i, open_pos - i);
+            const auto href_pos = out.find("__AIDA_A_HREF__", open_pos + 15);
+            if (href_pos == std::string::npos) {
+                final_out.append(out, open_pos, std::string::npos);
+                break;
+            }
+            const auto close_pos = out.find("__AIDA_A_CLOSE__", href_pos + 15);
+            std::string href = out.substr(open_pos + 15, href_pos - (open_pos + 15));
+            std::string text;
+            if (close_pos != std::string::npos)
+                text = out.substr(href_pos + 15, close_pos - (href_pos + 15));
+            else
+                text = out.substr(href_pos + 15);
+            const std::string trimmed_text = trim(text);
+            if (!href.empty() && !trimmed_text.empty()) {
+                final_out.push_back('[');
+                final_out.append(trimmed_text);
+                final_out.push_back(']');
+                final_out.push_back('(');
+                final_out.append(href);
+                final_out.push_back(')');
+            } else if (!trimmed_text.empty()) {
+                final_out.append(trimmed_text);
+            } else if (!href.empty()) {
+                final_out.append(href);
+            }
+            i = (close_pos == std::string::npos) ? out.size() : close_pos + 16;
+        }
+
+        std::string decoded = webfetch_decode_entities(final_out);
+        return webfetch_collapse_whitespace(decoded);
+    }
+
+    tool_result_t handle_webfetch(const json& params)
+    {
+        if (!params.contains("url") || !params["url"].is_string())
+            return error("Missing required parameter: url");
+
+        const std::string url = params["url"].get<std::string>();
+        if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0)
+            return error("URL must start with http:// or https://");
+
+        std::string format = "markdown";
+        if (params.contains("format") && params["format"].is_string()) {
+            const std::string requested = params["format"].get<std::string>();
+            if (requested == "markdown" || requested == "text" || requested == "html")
+                format = requested;
+            else
+                return error("format must be one of: markdown, text, html");
+        }
+
+        int timeout_sec = 30;
+        if (params.contains("timeout")) {
+            if (params["timeout"].is_number_integer())
+                timeout_sec = params["timeout"].get<int>();
+            else if (params["timeout"].is_number())
+                timeout_sec = static_cast<int>(params["timeout"].get<double>());
+        }
+        if (timeout_sec < 1) timeout_sec = 1;
+        if (timeout_sec > 120) timeout_sec = 120;
+
+        std::string scheme;
+        std::string host;
+        int port = 0;
+        std::string path;
+        bool is_https = false;
+        if (!webfetch_split_url(url, scheme, host, port, path, is_https))
+            return error("Invalid URL: " + url);
+
+        std::string base;
+        if (is_https) base = "https://"; else base = "http://";
+        base += host;
+        base += ":";
+        base += std::to_string(port);
+
+        httplib::Client cli(base);
+        cli.set_connection_timeout(timeout_sec, 0);
+        cli.set_read_timeout(timeout_sec, 0);
+        cli.set_write_timeout(timeout_sec, 0);
+        cli.set_follow_location(true);
+        cli.enable_server_certificate_verification(true);
+
+        std::string accept_header;
+        if (format == "markdown")
+            accept_header = "text/markdown;q=1.0, text/x-markdown;q=0.9, text/plain;q=0.8, text/html;q=0.7, */*;q=0.1";
+        else if (format == "text")
+            accept_header = "text/plain;q=1.0, text/markdown;q=0.9, text/html;q=0.8, */*;q=0.1";
+        else
+            accept_header = "text/html;q=1.0, application/xhtml+xml;q=0.9, text/plain;q=0.8, text/markdown;q=0.7, */*;q=0.1";
+
+        httplib::Headers headers = {
+            { "User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36" },
+            { "Accept", accept_header },
+            { "Accept-Language", "en-US,en;q=0.9" }
+        };
+
+        auto res = cli.Get(path, headers);
+        if (!res)
+            return error("HTTP request failed: " + httplib::to_string(res.error()) + " for " + url);
+        if (res->status < 200 || res->status >= 300)
+            return error("HTTP status " + std::to_string(res->status) + " for " + url);
+
+        constexpr size_t MAX_RAW_BYTES = 5u * 1024u * 1024u;
+        std::string body = res->body;
+        if (body.size() > MAX_RAW_BYTES)
+            body.resize(MAX_RAW_BYTES);
+
+        std::string content_type;
+        auto ct_iter = res->headers.find("Content-Type");
+        if (ct_iter != res->headers.end()) content_type = ct_iter->second;
+        std::string ct_lower = to_lower(content_type);
+        const bool is_html = ct_lower.find("text/html") != std::string::npos
+                          || ct_lower.find("application/xhtml") != std::string::npos;
+
+        std::string output;
+        if (format == "html") {
+            output = std::move(body);
+        } else if (format == "text") {
+            output = is_html ? webfetch_html_to_text(body) : body;
+        } else {
+            output = is_html ? webfetch_html_to_markdown(body) : body;
+        }
+
+        constexpr size_t MAX_OUTPUT_BYTES = 200000u;
+        bool truncated = false;
+        if (output.size() > MAX_OUTPUT_BYTES) {
+            output.resize(MAX_OUTPUT_BYTES);
+            truncated = true;
+        }
+
+        json data;
+        data["url"] = url;
+        data["status"] = res->status;
+        data["format"] = format;
+        data["content_type"] = content_type;
+        data["bytes"] = static_cast<int64_t>(output.size());
+        data["truncated"] = truncated;
+
+        std::string text;
+        text.reserve(output.size() + 128);
+        text += "Fetched ";
+        text += url;
+        text += " (";
+        text += std::to_string(res->status);
+        text += ", ";
+        text += content_type.empty() ? std::string("application/octet-stream") : content_type;
+        text += ")\n\n";
+        text += output;
+        if (truncated)
+            text += "\n\n[truncated to " + std::to_string(MAX_OUTPUT_BYTES) + " bytes]";
+
+        return tool_result_t::ok(text, data);
+    }
+
     tool_result_t handle_reconstruct_source(const json& params)
     {
         if (source_reconstructor::is_running())
@@ -789,26 +1216,34 @@ namespace mcp_standalone
         srv.register_tool({"convert_number", "Convert a number between common representations.",
             {{"value", "string", "Hex, decimal, octal, or binary input", true}},
             true, handle_convert_number});
-        srv.register_tool({"read_file", "Read a text file from disk.", {{"path", "string", "Target path", true}}, true, handle_read_file});
+        srv.register_tool({"read_file", "Read a text file from disk.", {{"path", "string", "Target path", true}}, true, handle_read_file, mcp_standalone::tool_visibility_t::internal_only});
         srv.register_tool({"write_file", "Overwrite a file on disk.",
             {{"path", "string", "Target path", true}, {"content", "string", "New file contents", true}},
-            false, handle_write_file});
+            false, handle_write_file, mcp_standalone::tool_visibility_t::internal_only});
         srv.register_tool({"edit_file", "Replace text in an existing file.",
             {{"path", "string", "Target path", true}, {"find_text", "string", "Text to replace", true},
              {"replace_text", "string", "Replacement text", true}, {"replace_all", "boolean", "Replace every occurrence", false}},
-            false, handle_edit_file});
-        srv.register_tool({"delete_file", "Delete a file on disk.", {{"path", "string", "Target path", true}}, false, handle_delete_file});
-        srv.register_tool({"create_directory", "Create a directory tree on disk.", {{"path", "string", "Target path", true}}, false, handle_create_directory});
-        srv.register_tool({"list_directory", "List the contents of a directory.", {{"path", "string", "Directory path", false}}, true, handle_list_directory});
+            false, handle_edit_file, mcp_standalone::tool_visibility_t::internal_only});
+        srv.register_tool({"delete_file", "Delete a file on disk.", {{"path", "string", "Target path", true}}, false, handle_delete_file, mcp_standalone::tool_visibility_t::internal_only});
+        srv.register_tool({"create_directory", "Create a directory tree on disk.", {{"path", "string", "Target path", true}}, false, handle_create_directory, mcp_standalone::tool_visibility_t::internal_only});
+        srv.register_tool({"list_directory", "List the contents of a directory.", {{"path", "string", "Directory path", false}}, true, handle_list_directory, mcp_standalone::tool_visibility_t::internal_only});
         srv.register_tool({"search_files", "Search for file names under a root directory.",
             {{"root", "string", "Root directory", true}, {"pattern", "string", "Substring to search for", true}, {"limit", "number", "Maximum matches", false}},
-            true, handle_search_files});
+            true, handle_search_files, mcp_standalone::tool_visibility_t::internal_only});
         srv.register_tool({"grep_in_files", "Search file contents with a regular expression.",
             {{"root", "string", "Root directory", true}, {"pattern", "string", "Regex pattern", true}, {"limit", "number", "Maximum matches", false}},
-            true, handle_grep_in_files});
+            true, handle_grep_in_files, mcp_standalone::tool_visibility_t::internal_only});
         srv.register_tool({"web_search", "Search the web using DuckDuckGo Instant Answer API.",
             {{"query", "string", "Search query text", true}, {"max_results", "number", "Maximum results to return (default 5)", false}},
-            true, handle_web_search});
+            true, handle_web_search, mcp_standalone::tool_visibility_t::internal_only});
+        srv.register_tool({"webfetch",
+            "Fetch the contents of a URL via HTTPS and return them as markdown, plain text, or raw HTML. "
+            "Follows redirects, verifies certificates, strips script/style/noscript/iframe blocks before HTML conversion. "
+            "Output capped at ~200 KB; max timeout 120 seconds.",
+            {{"url", "string", "Absolute http:// or https:// URL", true},
+             {"format", "string", "Output format: markdown (default), text, or html", false},
+             {"timeout", "number", "Request timeout in seconds (1-120, default 30)", false}},
+            true, handle_webfetch, mcp_standalone::tool_visibility_t::internal_only});
 
 
         driver_tools::register_driver_tools(srv);

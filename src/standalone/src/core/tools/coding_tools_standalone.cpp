@@ -9,6 +9,8 @@
 #include "standalone_license.hpp"
 #include "standalone_settings.hpp"
 #include "auto_approval.hpp"
+#include "event_bus.hpp"
+#include "standalone_chat.hpp"
 #include "../helpers/globals.h"
 
 #include <algorithm>
@@ -235,6 +237,14 @@ static tool_result_t tool_write_file(const json& params)
 
     file_browser::needs_refresh = true;
 
+    {
+        aida::events::file_edited_t evt;
+        evt.path       = path;
+        evt.kind       = "write";
+        evt.session_id = chat_active_session();
+        aida::events::publish(aida::events::event_file_edited, evt);
+    }
+
     return tool_result_t::ok("File written: " + path + " (" +
                              std::to_string(content.size()) + " bytes)");
 }
@@ -303,6 +313,14 @@ static tool_result_t tool_edit_file(const json& params)
     int line_num = 1;
     for (size_t i = 0; i < pos && i < content.size(); ++i)
         if (content[i] == '\n') ++line_num;
+
+    {
+        aida::events::file_edited_t evt;
+        evt.path       = path;
+        evt.kind       = "edit";
+        evt.session_id = chat_active_session();
+        aida::events::publish(aida::events::event_file_edited, evt);
+    }
 
     return tool_result_t::ok("Edit applied at line " + std::to_string(line_num) +
                              " in " + path);
@@ -706,7 +724,8 @@ void register_coding_tools(mcp_standalone::server_t& srv)
             {"end_line",   "integer", "Ending line number (1-indexed, inclusive). Optional.", false},
         },
         true,
-        tool_read_file
+        tool_read_file,
+        mcp_standalone::tool_visibility_t::internal_only
     });
 
     srv.register_tool({
@@ -719,7 +738,8 @@ void register_coding_tools(mcp_standalone::server_t& srv)
             {"content", "string", "Complete file content to write.", true},
         },
         false,
-        tool_write_file
+        tool_write_file,
+        mcp_standalone::tool_visibility_t::internal_only
     });
 
     srv.register_tool({
@@ -733,7 +753,8 @@ void register_coding_tools(mcp_standalone::server_t& srv)
             {"new_text", "string", "Replacement text.", true},
         },
         false,
-        tool_edit_file
+        tool_edit_file,
+        mcp_standalone::tool_visibility_t::internal_only
     });
 
     srv.register_tool({
@@ -744,7 +765,8 @@ void register_coding_tools(mcp_standalone::server_t& srv)
             {"path", "string", "Directory path. Defaults to workspace root if omitted.", false},
         },
         true,
-        tool_list_directory
+        tool_list_directory,
+        mcp_standalone::tool_visibility_t::internal_only
     });
 
     srv.register_tool({
@@ -759,7 +781,8 @@ void register_coding_tools(mcp_standalone::server_t& srv)
             {"regex",   "boolean", "Treat query as ECMAScript regex. Default: false.", false},
         },
         true,
-        tool_search_workspace
+        tool_search_workspace,
+        mcp_standalone::tool_visibility_t::internal_only
     });
 
     srv.register_tool({
@@ -773,7 +796,8 @@ void register_coding_tools(mcp_standalone::server_t& srv)
             {"cwd",        "string",  "Working directory. Defaults to workspace root.", false},
         },
         false,
-        tool_run_command
+        tool_run_command,
+        mcp_standalone::tool_visibility_t::internal_only
     });
 }
 

@@ -285,8 +285,6 @@ namespace store {
 				case auth_kind_t::api: {
 					j["type"] = "api";
 					j["key"] = info.api_key;
-					if (!info.metadata.is_null() && !info.metadata.empty())
-						j["metadata"] = info.metadata;
 					break;
 				}
 				case auth_kind_t::wellknown: {
@@ -306,6 +304,8 @@ namespace store {
 				j["customRedirectUri"] = info.custom_redirect_uri;
 			if (!info.custom_scopes.empty())
 				j["customScopes"] = info.custom_scopes;
+			if (!info.metadata.is_null() && !info.metadata.empty())
+				j["metadata"] = info.metadata;
 			return j;
 		}
 
@@ -335,6 +335,8 @@ namespace store {
 			} else {
 				out.kind = auth_kind_t::none;
 			}
+			if (j.contains("metadata") && j["metadata"].is_object())
+				out.metadata = j["metadata"];
 			if (j.contains("customClientId") && j["customClientId"].is_string())
 				out.custom_client_id = j["customClientId"].get<std::string>();
 			if (j.contains("customRedirectUri") && j["customRedirectUri"].is_string())

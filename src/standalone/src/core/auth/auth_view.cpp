@@ -919,7 +919,7 @@ namespace auth_view {
 			ImGui::Dummy(ImVec2(0.f, 44.f));
 
 			render_custom_provider_card("Anthropic (Claude Code)", 0,
-				"http://127.0.0.1:0/callback", "org:create_api_key,user:profile,user:inference");
+				"http://localhost:0/callback", "org:create_api_key,user:profile,user:inference,user:sessions:claude_code,user:mcp_servers,user:file_upload");
 
 			render_custom_provider_card("OpenAI (Codex / ChatGPT)", 1,
 				"http://127.0.0.1:1455/auth/callback", "openid,profile,email,offline_access");

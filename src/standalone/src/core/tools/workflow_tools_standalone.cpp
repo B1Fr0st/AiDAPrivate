@@ -13,6 +13,7 @@
 #include "tool_repetition.hpp"
 #include "event_bus.hpp"
 #include "session_store.hpp"
+#include "auto_approval.hpp"
 
 #include "../helpers/globals.h"
 
@@ -319,6 +320,11 @@ tool_result_t handle_update_todo_list(const json& params)
     {
         std::lock_guard<std::mutex> lk(g_todo_mtx);
         g_task_todo = content;
+    }
+
+    const std::string sid = conversations::current_id;
+    if (!sid.empty()) {
+        (void)aida::session::set_session_todos(sid, content);
     }
 
     int total = 0, done = 0;
@@ -792,7 +798,8 @@ void register_workflow_tools(mcp_standalone::server_t& srv)
         "Subagents (build/plan only) cannot be activated as primary.",
         {{"agent", "string", "Agent name (e.g. 'build', 'plan')", true},
          {"reason", "string", "Why you are switching agents", false}},
-        false, handle_switch_agent});
+        false, handle_switch_agent,
+        mcp_standalone::tool_visibility_t::internal_only});
 
     srv.register_tool({"plan_enter",
         "Enter PLAN mode. Use this when the user's request would benefit from planning before "
@@ -802,7 +809,8 @@ void register_workflow_tools(mcp_standalone::server_t& srv)
         "from research and design first; the task involves multiple files or architectural decisions. "
         "Do NOT call for trivial single-step tasks or when the user has asked for immediate execution.",
         {},
-        true, handle_plan_enter});
+        true, handle_plan_enter,
+        mcp_standalone::tool_visibility_t::internal_only});
 
     srv.register_tool({"plan_exit",
         "Exit PLAN mode and switch to the build agent so the plan can be executed. Inserts a "
@@ -810,7 +818,8 @@ void register_workflow_tools(mcp_standalone::server_t& srv)
         "Call this only after the plan is fully written, all clarifying questions are answered, "
         "and the user has confirmed (explicitly or implicitly) they are ready to execute.",
         {{"summary", "string", "Optional one-paragraph plan summary that will be attached to the handoff message.", false}},
-        false, handle_plan_exit});
+        false, handle_plan_exit,
+        mcp_standalone::tool_visibility_t::internal_only});
 
     srv.register_tool({"task",
         "Spawn a subagent in an isolated context to perform a focused task and return its final result. "
@@ -819,76 +828,108 @@ void register_workflow_tools(mcp_standalone::server_t& srv)
         {{"agent", "string", "Subagent name ('general' or 'explore')", true},
          {"prompt", "string", "The task description / instructions for the subagent", true},
          {"max_steps", "number", "Maximum tool-use turns the subagent may take (default 16, max 64)", false}},
-        false, handle_task});
+        false, handle_task,
+        mcp_standalone::tool_visibility_t::internal_only});
 
     srv.register_tool({"list_agents",
         "List all registered agents (primary and subagent), including custom user-defined ones.",
-        {}, true, handle_list_agents});
+        {}, true, handle_list_agents,
+        mcp_standalone::tool_visibility_t::internal_only});
 
     srv.register_tool({"ask_followup_question",
         "Ask the user a clarifying question. Use this when you need more information before proceeding.",
         {{"question", "string", "The question to ask the user", true},
          {"options", "array", "Optional list of suggested answers", false}},
-        true, handle_ask_followup_question});
+        true, handle_ask_followup_question,
+        mcp_standalone::tool_visibility_t::internal_only});
 
     srv.register_tool({"attempt_completion",
         "Signal that you believe the task is complete. Present your result to the user for approval.",
         {{"result", "string", "A summary of what was accomplished", true},
          {"command", "string", "An optional command the user can run to verify", false}},
-        true, handle_attempt_completion});
+        true, handle_attempt_completion,
+        mcp_standalone::tool_visibility_t::internal_only});
 
     srv.register_tool({"update_todo_list",
         "Update the task's todo list. Use markdown checkbox format: - [ ] item or - [x] done item.",
         {{"content", "string", "The full todo list in markdown format", true}},
-        true, handle_update_todo_list});
+        true, handle_update_todo_list,
+        mcp_standalone::tool_visibility_t::internal_only});
 
     srv.register_tool({"apply_diff",
         "Apply a unified diff to a file. Use standard unified diff format with @@ hunks.",
         {{"path", "string", "Path to the file to modify", true},
          {"diff", "string", "The unified diff content to apply", true}},
-        false, handle_apply_diff});
+        false, handle_apply_diff,
+        mcp_standalone::tool_visibility_t::internal_only});
 
     srv.register_tool({"apply_patch",
         "Apply a multi-file patch in Codex format. Supports adding, deleting, updating, and moving files.",
         {{"patch", "string", "The patch content in *** Begin Patch / *** End Patch format", true}},
-        false, handle_apply_patch});
+        false, handle_apply_patch,
+        mcp_standalone::tool_visibility_t::internal_only});
 
     srv.register_tool({"codebase_search",
         "Search the codebase for semantically relevant code. Returns matching code with file paths and line numbers.",
         {{"query", "string", "The search query describing what you're looking for", true},
          {"directory", "string", "Optional directory prefix to scope the search", false}},
-        true, handle_codebase_search});
+        true, handle_codebase_search,
+        mcp_standalone::tool_visibility_t::internal_only});
 
     srv.register_tool({"read_command_output",
         "Read output from a previously started background command by its terminal session ID.",
         {{"id", "string", "The terminal session ID to read output from", true}},
-        true, handle_read_command_output});
+        true, handle_read_command_output,
+        mcp_standalone::tool_visibility_t::internal_only});
 
     srv.register_tool({"save_checkpoint",
         "Save a checkpoint of the current workspace state. Use before making significant changes.",
         {{"message", "string", "Optional description for this checkpoint", false}},
-        false, handle_save_checkpoint});
+        false, handle_save_checkpoint,
+        mcp_standalone::tool_visibility_t::internal_only});
 
     srv.register_tool({"restore_checkpoint",
         "Restore the workspace to a previously saved checkpoint.",
         {{"checkpoint_id", "string", "The ID of the checkpoint to restore", true}},
-        false, handle_restore_checkpoint});
+        false, handle_restore_checkpoint,
+        mcp_standalone::tool_visibility_t::internal_only});
 
     srv.register_tool({"list_checkpoints",
         "List all saved checkpoints for the current workspace.",
-        {}, true, handle_list_checkpoints});
+        {}, true, handle_list_checkpoints,
+        mcp_standalone::tool_visibility_t::internal_only});
 
     srv.register_tool({"skill",
         "Invoke a registered skill by name. Skills provide specialized instructions for specific tasks.",
         {{"name", "string", "The name of the skill to invoke", true},
          {"arguments", "string", "Optional arguments to pass to the skill", false}},
-        true, handle_skill});
+        true, handle_skill,
+        mcp_standalone::tool_visibility_t::internal_only});
 
     srv.register_tool({"run_slash_command",
         "Execute a slash command. Available: /help, /clear, /mode, /checkpoint, /restore, /skills, /index.",
         {{"command", "string", "The command name (without the leading /)", true},
          {"arguments", "string", "Optional arguments for the command", false}},
-        false, handle_run_slash_command});
+        false, handle_run_slash_command,
+        mcp_standalone::tool_visibility_t::internal_only});
+
+    static aida::events::subscription_handle_t s_session_selected_sub;
+    if (!s_session_selected_sub.valid()) {
+        s_session_selected_sub = aida::events::subscribe(
+            aida::events::event_session_selected,
+            std::function<void(const aida::events::session_selected_t&)>(
+                [](const aida::events::session_selected_t& ev) {
+                    if (ev.session_id.empty()) return;
+
+                    std::string todos;
+                    if (aida::session::get_session_todos(ev.session_id, todos)) {
+                        std::lock_guard<std::mutex> lk(g_todo_mtx);
+                        g_task_todo = todos;
+                    }
+
+                    (void)auto_approval::load_session_rules_from_store(ev.session_id);
+                }));
+    }
 }
 
 }

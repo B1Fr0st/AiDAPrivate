@@ -8,6 +8,7 @@
 #include <shlobj.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -16,6 +17,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <httplib.h>
@@ -32,6 +34,8 @@ namespace {
 	std::vector<provider_info_t> s_providers;
 	std::vector<model_info_t> s_models;
 	bool s_loaded = false;
+	std::atomic<bool> s_init_started{false};
+	std::atomic<bool> s_refresh_inflight{false};
 
 	void set_error(const std::string& msg)
 	{
@@ -160,6 +164,10 @@ namespace {
 								mi.cost.over_200k_input_per_million = oj["input"].get<double>();
 							if (oj.contains("output") && oj["output"].is_number())
 								mi.cost.over_200k_output_per_million = oj["output"].get<double>();
+							if (oj.contains("cache_read") && oj["cache_read"].is_number())
+								mi.cost.over_200k_cache_read_per_million = oj["cache_read"].get<double>();
+							if (oj.contains("cache_write") && oj["cache_write"].is_number())
+								mi.cost.over_200k_cache_write_per_million = oj["cache_write"].get<double>();
 						}
 					}
 
@@ -342,14 +350,59 @@ bool load_cached_or_fetch(int max_age_seconds)
 	return fetch_and_cache();
 }
 
+void initialize_async(int max_age_seconds)
+{
+	bool expected = false;
+	if (!s_init_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+		return;
+
+	{
+		std::lock_guard<std::mutex> lk(s_mtx);
+		const auto path = cache_path();
+		std::error_code ec;
+		if (std::filesystem::exists(path, ec)) {
+			std::string body;
+			if (read_cache_file(body))
+				(void)parse_and_replace(body);
+		}
+	}
+
+	bool needs_refresh = true;
+	{
+		std::lock_guard<std::mutex> lk(s_mtx);
+		const auto path = cache_path();
+		std::error_code ec;
+		if (s_loaded && std::filesystem::exists(path, ec)) {
+			const int64_t age = cache_age_seconds();
+			if (age >= 0 && age <= max_age_seconds)
+				needs_refresh = false;
+		}
+	}
+
+	if (!needs_refresh)
+		return;
+
+	bool refresh_expected = false;
+	if (!s_refresh_inflight.compare_exchange_strong(refresh_expected, true, std::memory_order_acq_rel))
+		return;
+
+	std::thread bg([]() {
+		(void)fetch_and_cache();
+		s_refresh_inflight.store(false, std::memory_order_release);
+	});
+	bg.detach();
+}
+
 const std::vector<provider_info_t>& list_providers()
 {
+	initialize_async();
 	std::lock_guard<std::mutex> lk(s_mtx);
 	return s_providers;
 }
 
 const provider_info_t* get_provider(const std::string& provider_id)
 {
+	initialize_async();
 	std::lock_guard<std::mutex> lk(s_mtx);
 	for (const auto& p : s_providers) {
 		if (p.id == provider_id)
@@ -360,12 +413,14 @@ const provider_info_t* get_provider(const std::string& provider_id)
 
 const model_info_t* get_model(const std::string& provider_id, const std::string& model_id)
 {
+	initialize_async();
 	std::lock_guard<std::mutex> lk(s_mtx);
 	return find_model_locked(provider_id, model_id);
 }
 
 std::vector<const model_info_t*> closest(const std::string& provider_id, const std::vector<std::string>& query_terms)
 {
+	initialize_async();
 	std::lock_guard<std::mutex> lk(s_mtx);
 	std::vector<const model_info_t*> result;
 	if (query_terms.empty())
@@ -396,6 +451,7 @@ std::vector<const model_info_t*> closest(const std::string& provider_id, const s
 
 const model_info_t* get_small_model(const std::string& provider_id)
 {
+	initialize_async();
 	std::lock_guard<std::mutex> lk(s_mtx);
 
 	std::vector<std::string> priority = {
@@ -467,6 +523,7 @@ const model_info_t* get_small_model(const std::string& provider_id)
 
 const model_info_t* default_model(const std::string& provider_id)
 {
+	initialize_async();
 	std::lock_guard<std::mutex> lk(s_mtx);
 
 	static const std::vector<std::string> priority = {

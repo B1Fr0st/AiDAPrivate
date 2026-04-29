@@ -18,6 +18,7 @@
 #include <openssl/evp.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <ctime>
@@ -62,7 +63,7 @@ namespace claude_code {
 		}
 
 		struct listener_t {
-			SOCKET sock = INVALID_SOCKET;
+			std::vector<SOCKET> sockets;
 			std::thread worker;
 			std::atomic<bool> stop{ false };
 		};
@@ -189,7 +190,7 @@ namespace claude_code {
 			auth_info_t existing;
 			if (store::get("anthropic", existing) && !existing.custom_redirect_uri.empty())
 				return existing.custom_redirect_uri;
-			return std::string("http://127.0.0.1:") + std::to_string(port) + "/auth/callback";
+			return std::string("http://localhost:") + std::to_string(port) + "/callback";
 		}
 
 		std::string load_scopes()
@@ -214,14 +215,192 @@ namespace claude_code {
 			const std::string& scopes)
 		{
 			std::string url = std::string(CLAUDE_CODE_AUTHORIZE_URL) + "?";
-			url += "response_type=code";
+			url += "code=true";
 			url += "&client_id=" + url_encode(client_id);
+			url += "&response_type=code";
 			url += "&redirect_uri=" + url_encode(redirect_uri);
 			url += "&scope=" + url_encode(scopes);
 			url += "&code_challenge=" + url_encode(challenge);
 			url += "&code_challenge_method=S256";
 			url += "&state=" + url_encode(state_token);
 			return url;
+		}
+
+		int hex_digit(char c)
+		{
+			if (c >= '0' && c <= '9')
+				return c - '0';
+			if (c >= 'a' && c <= 'f')
+				return 10 + (c - 'a');
+			if (c >= 'A' && c <= 'F')
+				return 10 + (c - 'A');
+			return -1;
+		}
+
+		std::vector<std::string> split_scopes(const std::string& scope_string)
+		{
+			std::vector<std::string> scopes;
+			std::string token;
+			for (char ch : scope_string) {
+				if (std::isspace(static_cast<unsigned char>(ch))) {
+					if (!token.empty()) {
+						scopes.push_back(token);
+						token.clear();
+					}
+				} else {
+					token.push_back(ch);
+				}
+			}
+			if (!token.empty())
+				scopes.push_back(token);
+			return scopes;
+		}
+
+		std::string join_scopes(const std::vector<std::string>& scopes)
+		{
+			std::string joined;
+			for (size_t i = 0; i < scopes.size(); ++i) {
+				if (i > 0)
+					joined.push_back(' ');
+				joined += scopes[i];
+			}
+			return joined;
+		}
+
+		std::string json_string(const nlohmann::json& object, const char* key)
+		{
+			if (!object.is_object() || !object.contains(key))
+				return {};
+			const auto& value = object.at(key);
+			if (!value.is_string())
+				return {};
+			return value.get<std::string>();
+		}
+
+		std::string subscription_type_from_profile(const nlohmann::json& profile)
+		{
+			if (!profile.is_object() || !profile.contains("organization")
+				|| !profile["organization"].is_object())
+				return {};
+			const std::string org_type = json_string(profile["organization"], "organization_type");
+			if (org_type == "claude_max")
+				return "max";
+			if (org_type == "claude_pro")
+				return "pro";
+			if (org_type == "claude_enterprise")
+				return "enterprise";
+			if (org_type == "claude_team")
+				return "team";
+			return {};
+		}
+
+		void read_token_account(const nlohmann::json& resp,
+			std::string& account_id,
+			std::string& email,
+			std::string& organization_id)
+		{
+			if (account_id.empty())
+				account_id = resp.value("account_id", std::string{});
+			if (email.empty())
+				email = resp.value("email", std::string{});
+			if (resp.contains("account") && resp["account"].is_object()) {
+				const auto& account = resp["account"];
+				if (account_id.empty())
+					account_id = json_string(account, "uuid");
+				if (account_id.empty())
+					account_id = json_string(account, "id");
+				if (email.empty())
+					email = json_string(account, "email_address");
+				if (email.empty())
+					email = json_string(account, "email");
+			}
+			if (resp.contains("organization") && resp["organization"].is_object()) {
+				const auto& organization = resp["organization"];
+				organization_id = json_string(organization, "uuid");
+				if (organization_id.empty())
+					organization_id = json_string(organization, "id");
+			}
+		}
+
+		void read_profile_account(const nlohmann::json& profile,
+			std::string& account_id,
+			std::string& email,
+			std::string& organization_id)
+		{
+			if (!profile.is_object())
+				return;
+			if (profile.contains("account") && profile["account"].is_object()) {
+				const auto& account = profile["account"];
+				const std::string profile_account = json_string(account, "uuid");
+				const std::string profile_email = json_string(account, "email");
+				if (!profile_account.empty())
+					account_id = profile_account;
+				if (!profile_email.empty())
+					email = profile_email;
+			}
+			if (profile.contains("organization") && profile["organization"].is_object()) {
+				const std::string profile_org = json_string(profile["organization"], "uuid");
+				if (!profile_org.empty())
+					organization_id = profile_org;
+			}
+		}
+
+		nlohmann::json build_oauth_metadata(const nlohmann::json& resp,
+			const nlohmann::json& profile,
+			const std::vector<std::string>& scopes,
+			const std::string& organization_id)
+		{
+			nlohmann::json metadata = nlohmann::json::object();
+			metadata["scope"] = join_scopes(scopes);
+			metadata["scopes"] = scopes;
+			metadata["base_api_url"] = CLAUDE_CODE_BASE_API_URL;
+			metadata["authorize_url"] = CLAUDE_CODE_AUTHORIZE_URL;
+			metadata["token_url"] = CLAUDE_CODE_TOKEN_URL;
+			if (!organization_id.empty())
+				metadata["organization_uuid"] = organization_id;
+			if (resp.contains("account") && resp["account"].is_object())
+				metadata["token_account"] = resp["account"];
+			if (resp.contains("organization") && resp["organization"].is_object())
+				metadata["token_organization"] = resp["organization"];
+			if (profile.is_object() && !profile.empty()) {
+				metadata["profile"] = profile;
+				const std::string subscription = subscription_type_from_profile(profile);
+				if (!subscription.empty())
+					metadata["subscription_type"] = subscription;
+				if (profile.contains("organization") && profile["organization"].is_object()) {
+					const auto& organization = profile["organization"];
+					const std::string tier = json_string(organization, "rate_limit_tier");
+					const std::string billing = json_string(organization, "billing_type");
+					const std::string sub_created = json_string(organization, "subscription_created_at");
+					if (!tier.empty())
+						metadata["rate_limit_tier"] = tier;
+					if (!billing.empty())
+						metadata["billing_type"] = billing;
+					if (!sub_created.empty())
+						metadata["subscription_created_at"] = sub_created;
+					if (organization.contains("has_extra_usage_enabled")
+						&& organization["has_extra_usage_enabled"].is_boolean())
+						metadata["has_extra_usage_enabled"] = organization["has_extra_usage_enabled"];
+				}
+				if (profile.contains("account") && profile["account"].is_object()) {
+					const auto& account = profile["account"];
+					const std::string display = json_string(account, "display_name");
+					const std::string created = json_string(account, "created_at");
+					if (!display.empty())
+						metadata["display_name"] = display;
+					if (!created.empty())
+						metadata["account_created_at"] = created;
+				}
+			}
+			return metadata;
+		}
+
+		bool is_callback_target(const std::string& target)
+		{
+			const size_t query_pos = target.find('?');
+			const std::string path = query_pos == std::string::npos
+				? target : target.substr(0, query_pos);
+			return path == "/callback" || path == "/auth/callback";
 		}
 
 		std::string success_html()
@@ -302,9 +481,14 @@ namespace claude_code {
 					if (val[i] == '+') {
 						decoded.push_back(' ');
 					} else if (val[i] == '%' && i + 2 < val.size()) {
-						const std::string hex = val.substr(i + 1, 2);
-						decoded.push_back(static_cast<char>(std::stoi(hex, nullptr, 16)));
-						i += 2;
+						const int hi = hex_digit(val[i + 1]);
+						const int lo = hex_digit(val[i + 2]);
+						if (hi >= 0 && lo >= 0) {
+							decoded.push_back(static_cast<char>((hi << 4) | lo));
+							i += 2;
+						} else {
+							decoded.push_back(val[i]);
+						}
 					} else {
 						decoded.push_back(val[i]);
 					}
@@ -318,16 +502,35 @@ namespace claude_code {
 		void listener_thread(claude_code_login_state_t* state, std::shared_ptr<listener_t> ctx)
 		{
 			while (!ctx->stop.load() && !state->cancelled.load()) {
-				WSAPOLLFD pfd{};
-				pfd.fd = ctx->sock;
-				pfd.events = POLLIN;
-				int rc = WSAPoll(&pfd, 1, 250);
+				std::vector<WSAPOLLFD> poll_fds;
+				poll_fds.reserve(ctx->sockets.size());
+				for (SOCKET listen_socket : ctx->sockets) {
+					if (listen_socket == INVALID_SOCKET)
+						continue;
+					WSAPOLLFD poll_fd{};
+					poll_fd.fd = listen_socket;
+					poll_fd.events = POLLIN;
+					poll_fds.push_back(poll_fd);
+				}
+				if (poll_fds.empty())
+					return;
+				int rc = WSAPoll(poll_fds.data(), static_cast<ULONG>(poll_fds.size()), 250);
 				if (rc <= 0)
+					continue;
+
+				SOCKET ready_socket = INVALID_SOCKET;
+				for (const auto& poll_fd : poll_fds) {
+					if ((poll_fd.revents & POLLIN) != 0) {
+						ready_socket = poll_fd.fd;
+						break;
+					}
+				}
+				if (ready_socket == INVALID_SOCKET)
 					continue;
 
 				sockaddr_storage cli{};
 				int cli_len = sizeof(cli);
-				SOCKET client = accept(ctx->sock, reinterpret_cast<sockaddr*>(&cli), &cli_len);
+				SOCKET client = accept(ready_socket, reinterpret_cast<sockaddr*>(&cli), &cli_len);
 				if (client == INVALID_SOCKET)
 					continue;
 
@@ -361,7 +564,7 @@ namespace claude_code {
 
 				const std::string target = raw.substr(first_space + 1, second_space - first_space - 1);
 
-				if (target.rfind("/auth/callback", 0) != 0) {
+				if (!is_callback_target(target)) {
 					send_response(client, 404, failure_html("not found"));
 					closesocket(client);
 					continue;
@@ -420,12 +623,99 @@ namespace claude_code {
 				static_cast<std::shared_ptr<listener_t>*>(state.listener_handle));
 			state.listener_handle = nullptr;
 			(*holder)->stop.store(true);
-			if ((*holder)->sock != INVALID_SOCKET) {
-				closesocket((*holder)->sock);
-				(*holder)->sock = INVALID_SOCKET;
+			for (SOCKET& listen_socket : (*holder)->sockets) {
+				if (listen_socket != INVALID_SOCKET) {
+					closesocket(listen_socket);
+					listen_socket = INVALID_SOCKET;
+				}
 			}
 			if ((*holder)->worker.joinable())
 				(*holder)->worker.join();
+		}
+
+		bool prepare_listener_socket(SOCKET listen_socket)
+		{
+			BOOL yes = TRUE;
+			setsockopt(listen_socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+				reinterpret_cast<const char*>(&yes), sizeof(yes));
+			return true;
+		}
+
+		bool create_ipv6_listener(uint16_t requested_port,
+			SOCKET& listen_socket,
+			uint16_t& bound_port)
+		{
+			listen_socket = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+			if (listen_socket == INVALID_SOCKET)
+				return false;
+			prepare_listener_socket(listen_socket);
+			DWORD v6_only = TRUE;
+			setsockopt(listen_socket, IPPROTO_IPV6, IPV6_V6ONLY,
+				reinterpret_cast<const char*>(&v6_only), sizeof(v6_only));
+
+			sockaddr_in6 address{};
+			address.sin6_family = AF_INET6;
+			address.sin6_port = htons(requested_port);
+			address.sin6_addr = in6addr_loopback;
+
+			if (bind(listen_socket, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR) {
+				closesocket(listen_socket);
+				listen_socket = INVALID_SOCKET;
+				return false;
+			}
+
+			sockaddr_in6 bound{};
+			int bound_len = sizeof(bound);
+			if (getsockname(listen_socket, reinterpret_cast<sockaddr*>(&bound), &bound_len) == SOCKET_ERROR) {
+				closesocket(listen_socket);
+				listen_socket = INVALID_SOCKET;
+				return false;
+			}
+			bound_port = ntohs(bound.sin6_port);
+
+			if (listen(listen_socket, 4) == SOCKET_ERROR) {
+				closesocket(listen_socket);
+				listen_socket = INVALID_SOCKET;
+				return false;
+			}
+			return true;
+		}
+
+		bool create_ipv4_listener(uint16_t requested_port,
+			SOCKET& listen_socket,
+			uint16_t& bound_port)
+		{
+			listen_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+			if (listen_socket == INVALID_SOCKET)
+				return false;
+			prepare_listener_socket(listen_socket);
+
+			sockaddr_in address{};
+			address.sin_family = AF_INET;
+			address.sin_port = htons(requested_port);
+			address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+			if (bind(listen_socket, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR) {
+				closesocket(listen_socket);
+				listen_socket = INVALID_SOCKET;
+				return false;
+			}
+
+			sockaddr_in bound{};
+			int bound_len = sizeof(bound);
+			if (getsockname(listen_socket, reinterpret_cast<sockaddr*>(&bound), &bound_len) == SOCKET_ERROR) {
+				closesocket(listen_socket);
+				listen_socket = INVALID_SOCKET;
+				return false;
+			}
+			bound_port = ntohs(bound.sin_port);
+
+			if (listen(listen_socket, 4) == SOCKET_ERROR) {
+				closesocket(listen_socket);
+				listen_socket = INVALID_SOCKET;
+				return false;
+			}
+			return true;
 		}
 
 		bool start_listener_locked(claude_code_login_state_t& state)
@@ -435,47 +725,25 @@ namespace claude_code {
 				return false;
 			}
 
-			SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-			if (s == INVALID_SOCKET) {
-				set_last_error("socket() failed wsa=" + std::to_string(WSAGetLastError()));
-				return false;
-			}
+			std::vector<SOCKET> sockets;
+			SOCKET ipv6_socket = INVALID_SOCKET;
+			SOCKET ipv4_socket = INVALID_SOCKET;
+			uint16_t port = 0;
 
-			BOOL yes = TRUE;
-			setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
-				reinterpret_cast<const char*>(&yes), sizeof(yes));
+			if (create_ipv6_listener(0, ipv6_socket, port))
+				sockets.push_back(ipv6_socket);
+			if (create_ipv4_listener(port, ipv4_socket, port))
+				sockets.push_back(ipv4_socket);
 
-			sockaddr_in addr{};
-			addr.sin_family = AF_INET;
-			addr.sin_port = 0;
-			addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-			if (bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+			if (sockets.empty()) {
 				const int wsa = WSAGetLastError();
-				closesocket(s);
-				set_last_error("bind 127.0.0.1:0 failed wsa=" + std::to_string(wsa));
+				set_last_error("bind localhost callback failed wsa=" + std::to_string(wsa));
 				return false;
 			}
-
-			sockaddr_in bound{};
-			int blen = sizeof(bound);
-			if (getsockname(s, reinterpret_cast<sockaddr*>(&bound), &blen) == SOCKET_ERROR) {
-				const int wsa = WSAGetLastError();
-				closesocket(s);
-				set_last_error("getsockname failed wsa=" + std::to_string(wsa));
-				return false;
-			}
-			state.port = ntohs(bound.sin_port);
-
-			if (listen(s, 4) == SOCKET_ERROR) {
-				const int wsa = WSAGetLastError();
-				closesocket(s);
-				set_last_error("listen failed wsa=" + std::to_string(wsa));
-				return false;
-			}
+			state.port = static_cast<int>(port);
 
 			auto ctx = std::make_shared<listener_t>();
-			ctx->sock = s;
+			ctx->sockets = std::move(sockets);
 			auto holder = std::make_unique<std::shared_ptr<listener_t>>(ctx);
 
 			state.listener_handle = holder.release();
@@ -521,8 +789,9 @@ namespace claude_code {
 			parse_token_url(host, path);
 
 			httplib::Client cli(host);
-			cli.set_connection_timeout(30);
-			cli.set_read_timeout(30);
+			cli.set_connection_timeout(15);
+			cli.set_read_timeout(15);
+			cli.set_write_timeout(15);
 			cli.set_follow_location(true);
 			cli.enable_server_certificate_verification(true);
 
@@ -555,10 +824,58 @@ namespace claude_code {
 			return true;
 		}
 
+		bool profile_get(const std::string& access_token, nlohmann::json& json_out, std::string& err_out)
+		{
+			httplib::Client cli(CLAUDE_CODE_BASE_API_URL);
+			cli.set_connection_timeout(10);
+			cli.set_read_timeout(10);
+			cli.set_write_timeout(10);
+			cli.set_follow_location(true);
+			cli.enable_server_certificate_verification(true);
+
+			httplib::Headers headers = {
+				{ "User-Agent", "AiDA/1.0" },
+				{ "Accept", "application/json" },
+				{ "Content-Type", "application/json" },
+				{ "Authorization", std::string("Bearer ") + access_token },
+			};
+			auto res = cli.Get(CLAUDE_CODE_PROFILE_PATH, headers);
+			if (!res) {
+				err_out = "anthropic profile endpoint unreachable: "
+					+ httplib::to_string(res.error());
+				return false;
+			}
+			if (res->status < 200 || res->status >= 300) {
+				err_out = "anthropic profile endpoint status="
+					+ std::to_string(res->status) + " body=" + res->body.substr(0, 256);
+				return false;
+			}
+			try {
+				json_out = nlohmann::json::parse(res->body);
+				if (!json_out.is_object()) {
+					err_out = "anthropic profile response not object";
+					return false;
+				}
+			} catch (...) {
+				err_out = "anthropic profile response json parse failed";
+				return false;
+			}
+			return true;
+		}
+
+		void log_nonfatal_profile_error(const std::string& err)
+		{
+			if (err.empty())
+				return;
+			const std::string line = std::string("[aida.auth.claude_code] ") + err;
+			anti_tamper::webhook::write_log("auth.claude_code", line.c_str());
+		}
+
 		bool exchange_code(claude_code_login_state_t& state)
 		{
 			const std::string client_id = load_custom_client_id();
 			const std::string redirect_uri = load_redirect_uri(state.port);
+			const std::string requested_scope = load_scopes();
 
 			nlohmann::json body = {
 				{ "grant_type", "authorization_code" },
@@ -566,7 +883,6 @@ namespace claude_code {
 				{ "redirect_uri", redirect_uri },
 				{ "client_id", client_id },
 				{ "code_verifier", state.verifier },
-				{ "state", state.received_state },
 			};
 
 			nlohmann::json resp;
@@ -580,25 +896,30 @@ namespace claude_code {
 			const std::string access = resp.value("access_token", std::string{});
 			const std::string refresh = resp.value("refresh_token", std::string{});
 			const int64_t expires_in = resp.value("expires_in", static_cast<int64_t>(3600));
-			std::string account_id = resp.value("account_id", std::string{});
-			std::string email = resp.value("email", std::string{});
-			if (resp.contains("account") && resp["account"].is_object()) {
-				const auto& acct = resp["account"];
-				if (account_id.empty() && acct.contains("uuid") && acct["uuid"].is_string())
-					account_id = acct["uuid"].get<std::string>();
-				if (account_id.empty() && acct.contains("id") && acct["id"].is_string())
-					account_id = acct["id"].get<std::string>();
-				if (email.empty() && acct.contains("email_address") && acct["email_address"].is_string())
-					email = acct["email_address"].get<std::string>();
-				if (email.empty() && acct.contains("email") && acct["email"].is_string())
-					email = acct["email"].get<std::string>();
-			}
+			std::string account_id;
+			std::string email;
+			std::string organization_id;
+			read_token_account(resp, account_id, email, organization_id);
 
 			if (access.empty() || refresh.empty()) {
 				set_last_error("token response missing access/refresh");
 				state.error = "token response missing access/refresh";
 				return false;
 			}
+
+			nlohmann::json profile = nlohmann::json::object();
+			std::string profile_err;
+			if (profile_get(access, profile, profile_err))
+				read_profile_account(profile, account_id, email, organization_id);
+			else
+				log_nonfatal_profile_error(profile_err);
+
+			std::string scope_string = resp.value("scope", std::string{});
+			if (scope_string.empty())
+				scope_string = requested_scope;
+			std::vector<std::string> scopes = split_scopes(scope_string);
+			if (scopes.empty())
+				scopes = split_scopes(CLAUDE_CODE_DEFAULT_SCOPES);
 
 			auth_info_t info;
 			info.kind = auth_kind_t::oauth;
@@ -607,6 +928,7 @@ namespace claude_code {
 			info.account_id = account_id;
 			info.email = email;
 			info.expires_unix = static_cast<int64_t>(std::time(nullptr)) + expires_in;
+			info.metadata = build_oauth_metadata(resp, profile, scopes, organization_id);
 
 			auth_info_t prev;
 			if (store::get("anthropic", prev)) {
@@ -722,13 +1044,16 @@ namespace claude_code {
 			return false;
 		}
 
-		const std::string client_id = info.custom_client_id.empty()
+			const std::string client_id = info.custom_client_id.empty()
 			? std::string(CLAUDE_CODE_CLIENT_ID) : info.custom_client_id;
+			const std::string scope = info.custom_scopes.empty()
+				? std::string(CLAUDE_CODE_REFRESH_SCOPES) : join_scopes(info.custom_scopes);
 
 		nlohmann::json body = {
 			{ "grant_type", "refresh_token" },
 			{ "refresh_token", info.refresh },
 			{ "client_id", client_id },
+				{ "scope", scope },
 		};
 
 		nlohmann::json resp;
@@ -748,6 +1073,28 @@ namespace claude_code {
 		info.refresh = new_refresh;
 		const int64_t expires_in = resp.value("expires_in", static_cast<int64_t>(3600));
 		info.expires_unix = static_cast<int64_t>(std::time(nullptr)) + expires_in;
+
+			std::string account_id = info.account_id;
+			std::string email = info.email;
+			std::string organization_id;
+			read_token_account(resp, account_id, email, organization_id);
+
+			nlohmann::json profile = nlohmann::json::object();
+			std::string profile_err;
+			if (profile_get(access, profile, profile_err))
+				read_profile_account(profile, account_id, email, organization_id);
+			else
+				log_nonfatal_profile_error(profile_err);
+
+			std::string scope_string = resp.value("scope", std::string{});
+			if (scope_string.empty())
+				scope_string = scope;
+			std::vector<std::string> scopes = split_scopes(scope_string);
+			if (scopes.empty())
+				scopes = split_scopes(CLAUDE_CODE_REFRESH_SCOPES);
+			info.account_id = account_id;
+			info.email = email;
+			info.metadata = build_oauth_metadata(resp, profile, scopes, organization_id);
 
 		if (!store::set("anthropic", info)) {
 			set_last_error("store::set anthropic failed: " + store::last_error());

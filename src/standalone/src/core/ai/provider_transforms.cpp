@@ -7,6 +7,11 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <vector>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace aida {
 namespace provider {
@@ -16,6 +21,8 @@ namespace {
 
 	std::mutex s_mtx;
 	std::string s_last_error;
+
+	constexpr const char* k_aida_user_agent_version = "1.0";
 
 	void set_error(const std::string& msg)
 	{
@@ -32,6 +39,289 @@ namespace {
 	bool starts_with(const std::string& s, const std::string& prefix)
 	{
 		return s.size() >= prefix.size() && std::equal(prefix.begin(), prefix.end(), s.begin());
+	}
+
+	std::string windows_release_string()
+	{
+#if defined(_WIN32)
+		typedef LONG (WINAPI* RtlGetVersionFn)(PRTL_OSVERSIONINFOW);
+		HMODULE hmod = GetModuleHandleW(L"ntdll.dll");
+		if (hmod) {
+			auto fn = reinterpret_cast<RtlGetVersionFn>(reinterpret_cast<void*>(GetProcAddress(hmod, "RtlGetVersion")));
+			if (fn) {
+				RTL_OSVERSIONINFOW vi;
+				vi.dwOSVersionInfoSize = sizeof(vi);
+				if (fn(&vi) == 0) {
+					std::ostringstream os;
+					os << vi.dwMajorVersion << "." << vi.dwMinorVersion << "." << vi.dwBuildNumber;
+					return os.str();
+				}
+			}
+		}
+		return std::string("10.0.0");
+#else
+		return std::string("0.0.0");
+#endif
+	}
+
+	std::string build_opencode_user_agent()
+	{
+		std::ostringstream os;
+		os << "opencode/" << k_aida_user_agent_version
+		   << " (windows " << windows_release_string() << "; x64)";
+		return os.str();
+	}
+
+	bool is_anthropic_or_bedrock(const std::string& provider_id)
+	{
+		if (provider_id == "anthropic")
+			return true;
+		const std::string lid = lower(provider_id);
+		if (lid.find("bedrock") != std::string::npos)
+			return true;
+		return false;
+	}
+
+	bool is_claude_model(const std::string& model_id)
+	{
+		const std::string lid = lower(model_id);
+		return lid.find("claude") != std::string::npos;
+	}
+
+	bool message_has_image_part(const nlohmann::json& msg)
+	{
+		if (!msg.is_object())
+			return false;
+		if (!msg.contains("content"))
+			return false;
+		const auto& content = msg["content"];
+		if (!content.is_array())
+			return false;
+		for (const auto& part : content) {
+			if (!part.is_object())
+				continue;
+			const std::string type = part.value("type", std::string());
+			if (type == "image" || type == "image_url" || type == "input_image")
+				return true;
+			if (type == "tool_result" && part.contains("content") && part["content"].is_array()) {
+				for (const auto& nested : part["content"]) {
+					if (!nested.is_object())
+						continue;
+					const std::string nt = nested.value("type", std::string());
+					if (nt == "image" || nt == "image_url" || nt == "input_image")
+						return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	bool request_has_image_content(const nlohmann::json& request)
+	{
+		if (!request.is_object())
+			return false;
+		if (!request.contains("messages") || !request["messages"].is_array())
+			return false;
+		for (const auto& msg : request["messages"]) {
+			if (message_has_image_part(msg))
+				return true;
+		}
+		return false;
+	}
+
+	bool is_empty_text_or_reasoning_part(const nlohmann::json& part)
+	{
+		if (!part.is_object())
+			return false;
+		const std::string type = part.value("type", std::string());
+		if (type != "text" && type != "reasoning")
+			return false;
+		const std::string text = part.value("text", std::string());
+		return text.empty();
+	}
+
+	void filter_empty_messages_anthropic(nlohmann::json& request)
+	{
+		if (!request.is_object())
+			return;
+		if (!request.contains("messages") || !request["messages"].is_array())
+			return;
+
+		nlohmann::json filtered = nlohmann::json::array();
+		for (const auto& msg : request["messages"]) {
+			if (!msg.is_object())
+				continue;
+			if (!msg.contains("content")) {
+				filtered.push_back(msg);
+				continue;
+			}
+			const auto& content = msg["content"];
+			if (content.is_string()) {
+				if (content.get<std::string>().empty())
+					continue;
+				filtered.push_back(msg);
+				continue;
+			}
+			if (!content.is_array()) {
+				filtered.push_back(msg);
+				continue;
+			}
+			nlohmann::json kept_parts = nlohmann::json::array();
+			for (const auto& part : content) {
+				if (is_empty_text_or_reasoning_part(part))
+					continue;
+				kept_parts.push_back(part);
+			}
+			if (kept_parts.empty())
+				continue;
+			nlohmann::json new_msg = msg;
+			new_msg["content"] = kept_parts;
+			filtered.push_back(std::move(new_msg));
+		}
+		request["messages"] = std::move(filtered);
+	}
+
+	std::string scrub_claude_tool_id(const std::string& id)
+	{
+		static const std::regex re("[^a-zA-Z0-9_-]");
+		return std::regex_replace(id, re, std::string("_"));
+	}
+
+	void scrub_claude_tool_ids(nlohmann::json& request)
+	{
+		if (!request.is_object())
+			return;
+		if (!request.contains("messages") || !request["messages"].is_array())
+			return;
+		for (auto& msg : request["messages"]) {
+			if (!msg.is_object())
+				continue;
+			if (!msg.contains("content") || !msg["content"].is_array())
+				continue;
+			for (auto& part : msg["content"]) {
+				if (!part.is_object())
+					continue;
+				const std::string type = part.value("type", std::string());
+				if (type == "tool_use" || type == "tool-call") {
+					if (part.contains("id") && part["id"].is_string()) {
+						const std::string id = part["id"].get<std::string>();
+						part["id"] = scrub_claude_tool_id(id);
+					}
+					if (part.contains("toolCallId") && part["toolCallId"].is_string()) {
+						const std::string id = part["toolCallId"].get<std::string>();
+						part["toolCallId"] = scrub_claude_tool_id(id);
+					}
+				} else if (type == "tool_result" || type == "tool-result") {
+					if (part.contains("tool_use_id") && part["tool_use_id"].is_string()) {
+						const std::string id = part["tool_use_id"].get<std::string>();
+						part["tool_use_id"] = scrub_claude_tool_id(id);
+					}
+					if (part.contains("toolCallId") && part["toolCallId"].is_string()) {
+						const std::string id = part["toolCallId"].get<std::string>();
+						part["toolCallId"] = scrub_claude_tool_id(id);
+					}
+				}
+			}
+		}
+	}
+
+	void apply_cache_control_to_message(nlohmann::json& msg)
+	{
+		if (!msg.is_object())
+			return;
+		nlohmann::json cc = { {"type", "ephemeral"} };
+		if (!msg.contains("content")) {
+			msg["cache_control"] = cc;
+			return;
+		}
+		auto& content = msg["content"];
+		if (content.is_string()) {
+			msg["cache_control"] = cc;
+			return;
+		}
+		if (!content.is_array() || content.empty()) {
+			msg["cache_control"] = cc;
+			return;
+		}
+		auto& last = content.at(content.size() - 1);
+		if (!last.is_object()) {
+			msg["cache_control"] = cc;
+			return;
+		}
+		const std::string type = last.value("type", std::string());
+		if (type == "tool-approval-request" || type == "tool-approval-response") {
+			msg["cache_control"] = cc;
+			return;
+		}
+		last["cache_control"] = cc;
+	}
+
+	void inject_anthropic_cache_control(nlohmann::json& request)
+	{
+		if (!request.is_object())
+			return;
+
+		std::vector<nlohmann::json*> system_targets;
+		std::vector<nlohmann::json*> final_targets;
+
+		if (request.contains("system") && request["system"].is_array()) {
+			auto& sys = request["system"];
+			const std::size_t cap = (std::min)(static_cast<std::size_t>(2), sys.size());
+			for (std::size_t i = 0; i < cap; ++i) {
+				system_targets.push_back(&sys.at(i));
+			}
+		}
+
+		if (request.contains("messages") && request["messages"].is_array()) {
+			auto& msgs = request["messages"];
+
+			if (system_targets.size() < 2) {
+				for (std::size_t i = 0; i < msgs.size() && system_targets.size() < 2; ++i) {
+					if (!msgs.at(i).is_object())
+						continue;
+					const std::string role = msgs.at(i).value("role", std::string());
+					if (role != "system")
+						continue;
+					system_targets.push_back(&msgs.at(i));
+				}
+			}
+
+			std::vector<std::size_t> non_system_indices;
+			non_system_indices.reserve(msgs.size());
+			for (std::size_t i = 0; i < msgs.size(); ++i) {
+				if (!msgs.at(i).is_object())
+					continue;
+				const std::string role = msgs.at(i).value("role", std::string());
+				if (role == "system")
+					continue;
+				non_system_indices.push_back(i);
+			}
+			const std::size_t take = (std::min)(static_cast<std::size_t>(2), non_system_indices.size());
+			if (take > 0) {
+				const std::size_t start = non_system_indices.size() - take;
+				for (std::size_t k = start; k < non_system_indices.size(); ++k) {
+					final_targets.push_back(&msgs.at(non_system_indices.at(k)));
+				}
+			}
+		}
+
+		std::vector<nlohmann::json*> unique_targets;
+		unique_targets.reserve(system_targets.size() + final_targets.size());
+		auto push_unique = [&unique_targets](nlohmann::json* p) {
+			for (auto* q : unique_targets) {
+				if (q == p)
+					return;
+			}
+			unique_targets.push_back(p);
+		};
+		for (auto* p : system_targets)
+			push_unique(p);
+		for (auto* p : final_targets)
+			push_unique(p);
+
+		for (auto* p : unique_targets) {
+			apply_cache_control_to_message(*p);
+		}
 	}
 
 	bool any_message_has_cache_control(const nlohmann::json& request)
@@ -228,6 +518,16 @@ bool transform_request(const std::string& provider_id, const std::string& model_
 		}
 	}
 
+	if (is_anthropic_or_bedrock(provider_id)) {
+		filter_empty_messages_anthropic(request);
+		if (!any_message_has_cache_control(request))
+			inject_anthropic_cache_control(request);
+	}
+
+	if (provider_id == "anthropic" && is_claude_model(model_id)) {
+		scrub_claude_tool_ids(request);
+	}
+
 	return true;
 }
 
@@ -240,13 +540,17 @@ bool transform_response(const std::string&, const std::string&, nlohmann::json& 
 	return true;
 }
 
-std::map<std::string, std::string> compute_headers(const std::string& provider_id, const std::string& model_id, const aida::auth::auth_info_t& auth)
+std::map<std::string, std::string> compute_headers(const std::string& provider_id, const std::string& model_id, const aida::auth::auth_info_t& auth, const request_context_t& ctx)
 {
 	std::map<std::string, std::string> headers;
 
 	if (provider_id == "anthropic") {
 		headers["anthropic-version"] = "2023-06-01";
-		headers["anthropic-beta"] = "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,prompt-caching-2024-07-31";
+		std::string beta = "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,prompt-caching-2024-07-31";
+		const bool is_oauth = (auth.kind == aida::auth::auth_kind_t::oauth) && !auth.access.empty();
+		if (is_oauth)
+			beta += ",oauth-2025-04-20";
+		headers["anthropic-beta"] = beta;
 		if (!auth.api_key.empty())
 			headers["x-api-key"] = auth.api_key;
 		else if (!auth.access.empty())
@@ -256,10 +560,18 @@ std::map<std::string, std::string> compute_headers(const std::string& provider_i
 
 	if (provider_id == "github-copilot") {
 		if (!auth.access.empty())
-			headers["authorization"] = std::string("Bearer ") + auth.access;
+			headers["Authorization"] = std::string("Bearer ") + auth.access;
 		headers["copilot-integration-id"] = "vscode-chat";
-		headers["editor-version"] = "AiDAStandalone/1.0";
-		headers["editor-plugin-version"] = "AiDAStandalone/1.0";
+		headers["Editor-Version"] = "vscode/1.95.0";
+		headers["Editor-Plugin-Version"] = "copilot-chat/0.20.0";
+		headers["editor-version"] = "vscode/1.95.0";
+		headers["editor-plugin-version"] = "copilot-chat/0.20.0";
+		headers["User-Agent"] = std::string("opencode/") + k_aida_user_agent_version;
+		headers["Openai-Intent"] = "conversation-edits";
+		const bool is_agent = ctx.has_parent_session || ctx.is_compaction_continued;
+		headers["x-initiator"] = is_agent ? "agent" : "user";
+		if (ctx.request_body && request_has_image_content(*ctx.request_body))
+			headers["Copilot-Vision-Request"] = "true";
 		return headers;
 	}
 
@@ -268,9 +580,20 @@ std::map<std::string, std::string> compute_headers(const std::string& provider_i
 			headers["authorization"] = std::string("Bearer ") + auth.api_key;
 		else if (!auth.access.empty())
 			headers["authorization"] = std::string("Bearer ") + auth.access;
-		const std::string acct = read_metadata_string(auth, "account_id");
+		std::string acct = auth.account_id;
+		if (acct.empty())
+			acct = read_metadata_string(auth, "account_id");
+		if (acct.empty())
+			acct = read_metadata_string(auth, "accountId");
+		const bool is_codex = (provider_id == "openai-codex" || provider_id == "openai_codex");
 		if (!acct.empty())
-			headers["openai-account"] = acct;
+			headers["ChatGPT-Account-Id"] = acct;
+		if (is_codex) {
+			headers["originator"] = "opencode";
+			headers["User-Agent"] = build_opencode_user_agent();
+			if (!ctx.session_id.empty())
+				headers["session_id"] = ctx.session_id;
+		}
 		const std::string org = read_metadata_string(auth, "organization");
 		if (!org.empty())
 			headers["openai-organization"] = org;
@@ -326,6 +649,12 @@ std::map<std::string, std::string> compute_headers(const std::string& provider_i
 
 	(void)model_id;
 	return headers;
+}
+
+std::map<std::string, std::string> compute_headers(const std::string& provider_id, const std::string& model_id, const aida::auth::auth_info_t& auth)
+{
+	request_context_t empty_ctx;
+	return compute_headers(provider_id, model_id, auth, empty_ctx);
 }
 
 std::string resolve_endpoint(const std::string& provider_id, const std::string& model_id, const aida::auth::auth_info_t& auth)

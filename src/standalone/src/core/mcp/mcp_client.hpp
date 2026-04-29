@@ -66,6 +66,7 @@ struct remote_tool_t
 {
     std::string server_name;
     std::string name;
+    std::string original_name;
     std::string description;
     json        input_schema;
     json        annotations;
@@ -322,6 +323,9 @@ public:
 
 
     bool find_config(const std::string& name, server_config_t& out) const;
+
+
+    json mcp_tool_list_json();
 
 private:
     struct entry_t
