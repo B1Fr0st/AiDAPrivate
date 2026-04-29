@@ -335,6 +335,10 @@ inline report_t run()
 
     diag::log_tagged("hv_pf", "enter");
 
+    g_ms_hv_approved = true;
+    diag::log_tagged("hv_pf", "anti_vm_disabled_return");
+    return r;
+
     if (detail::devmode_bypass_set())
     {
         diag::log_tagged("hv_pf", "devmode_bypass_return");

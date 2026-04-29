@@ -22,6 +22,8 @@ namespace arc_loader
         uint64_t loader_code_hash;
         uint64_t binding_salt;
         void*    auto_seal_timer;
+        void*    function_table;
+        uint32_t function_table_count;
     };
 
 
@@ -41,6 +43,8 @@ namespace arc_loader
 
 
     const std::string& last_error();
+
+    bool last_error_is_fatal();
 
 
     void prime_import_cache();

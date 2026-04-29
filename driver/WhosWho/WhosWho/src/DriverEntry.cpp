@@ -311,7 +311,56 @@ static VOID DeleteDriverOnDisk(PUNICODE_STRING RegistryPath)
 
 }
 
+static void ZeroUninitializedSectionsSelf(PVOID self_anchor)
+{
+    if (!self_anchor) {
+        return;
+    }
+
+    ULONG_PTR cursor = reinterpret_cast<ULONG_PTR>(self_anchor) & ~(static_cast<ULONG_PTR>(0xFFF));
+    PIMAGE_DOS_HEADER dos = nullptr;
+    for (ULONG steps = 0; steps < 0x4000; ++steps) {
+        PIMAGE_DOS_HEADER candidate = reinterpret_cast<PIMAGE_DOS_HEADER>(cursor);
+        if (candidate->e_magic == IMAGE_DOS_SIGNATURE) {
+            LONG nt_offset = candidate->e_lfanew;
+            if (nt_offset > 0 && nt_offset < 0x1000) {
+                PIMAGE_NT_HEADERS64 nt_check = reinterpret_cast<PIMAGE_NT_HEADERS64>(
+                    reinterpret_cast<UCHAR*>(candidate) + nt_offset);
+                if (nt_check->Signature == IMAGE_NT_SIGNATURE &&
+                    nt_check->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
+                    dos = candidate;
+                    break;
+                }
+            }
+        }
+        if (cursor < 0x1000) {
+            return;
+        }
+        cursor -= 0x1000;
+    }
+
+    if (!dos) {
+        return;
+    }
+
+    UCHAR* base = reinterpret_cast<UCHAR*>(dos);
+    PIMAGE_NT_HEADERS64 nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(base + dos->e_lfanew);
+    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+    USHORT count = nt->FileHeader.NumberOfSections;
+    for (USHORT i = 0; i < count; ++i) {
+        ULONG vsize = sec[i].Misc.VirtualSize;
+        ULONG rsize = sec[i].SizeOfRawData;
+        if (vsize > rsize) {
+            UCHAR* dst = base + sec[i].VirtualAddress + rsize;
+            ULONG diff = vsize - rsize;
+            RtlZeroMemory(dst, diff);
+        }
+    }
+}
+
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+
+    ZeroUninitializedSectionsSelf(reinterpret_cast<PVOID>(&DriverEntry));
 
     if (!SetupFunctions()) {
         return STATUS_UNSUCCESSFUL;

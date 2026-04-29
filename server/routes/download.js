@@ -273,70 +273,6 @@ function watermarkBinary(peBuffer, licenseKey, hwid, clientIp) {
 }
 
 
-router.get('/aida', async (req, res) => {
-    try {
-        const sessionToken = req.headers['authorization'] || '';
-        if (!sessionToken || sessionToken.length < 32) {
-            return res.status(401).json({ status: 'error', reason: 'unauthorized' });
-        }
-
-
-        const { rows } = await pool.query(
-            'SELECT * FROM sessions WHERE session_token = $1',
-            [sessionToken]
-        );
-        if (rows.length === 0) {
-            return res.status(403).json({ status: 'error', reason: 'invalid_session' });
-        }
-
-        const session = rows[0];
-        const clientIp = (req.headers['x-forwarded-for'] || '').split(',')[0].trim()
-            || req.ip || 'unknown';
-
-
-        const aidaPath = process.env.AIDA_BINARY_PATH || '/opt/aida/bin/AiDA.exe';
-        if (!fs.existsSync(aidaPath)) {
-            return res.status(503).json({ status: 'error', reason: 'binary_unavailable' });
-        }
-
-
-        const rawBinary = fs.readFileSync(aidaPath);
-
-
-        if (rawBinary.length < 2 || rawBinary[0] !== 0x4D || rawBinary[1] !== 0x5A) {
-            console.error('[download] AiDA binary does not have valid MZ header');
-            return res.status(503).json({ status: 'error', reason: 'binary_corrupt' });
-        }
-
-
-        const watermarked = watermarkBinary(
-            rawBinary,
-            session.license_key,
-            session.hwid,
-            clientIp
-        );
-
-
-        const now = Math.floor(Date.now() / 1000);
-        await pool.query(`
-            INSERT INTO downloads (hwid, ip, license_key, artifact, user_agent)
-            VALUES ($1, $2, $3, 'aida', $4)
-        `, [session.hwid, clientIp, session.license_key, req.headers['user-agent'] || '']);
-
-
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-        res.setHeader('Content-Type', 'application/octet-stream');
-        res.setHeader('Content-Disposition', `attachment; filename="AiDA_${timestamp}.exe"`);
-        res.setHeader('Content-Length', watermarked.length);
-        res.setHeader('X-Download-Timestamp', String(now));
-        res.end(watermarked);
-    } catch (err) {
-        console.error('[download] AiDA download error:', err);
-        return res.status(500).json({ status: 'error', reason: 'internal_error' });
-    }
-});
-
-
 router.post('/arc/page/:index', async (req, res) => {
     try {
         const pageIndex = parseInt(req.params.index, 10);
@@ -441,6 +377,103 @@ router.post('/arc/pages', async (req, res) => {
             blob_size: arcBlob.length,
         });
     } catch (err) {
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+});
+
+router.post('/arc/pages/bulk', async (req, res) => {
+    try {
+        const { license_key, session_token, hwid, proof_token } = req.body || {};
+        const validation = await validateSession(license_key, session_token, hwid);
+        if (!validation.valid) {
+            return res.status(403).json({ status: 'error', reason: validation.reason });
+        }
+
+        const session = validation.session;
+        const license = validation.license;
+
+        if (session.kill_flag) {
+            return res.status(403).json({ status: 'error', reason: 'killed' });
+        }
+
+        const lastProof = session.last_proof_token || '';
+        const clientProof = proof_token || '';
+        if (!clientProof || (lastProof && clientProof !== lastProof)) {
+            return res.status(403).json({ status: 'error', reason: 'stale_proof_token' });
+        }
+
+        let arcBlob;
+        try {
+            arcBlob = getTransformedArcBlob(session, license);
+        } catch (err) {
+            console.error('[arc-bulk] Failed to load ARC blob:', err.message);
+            return res.status(503).json({ status: 'error', reason: 'service_unavailable' });
+        }
+
+        const rawPages = splitIntoPages(arcBlob);
+        const totalPages = rawPages.length;
+        let prevChainTag = '';
+        const pages = [];
+        const digest = crypto.createHash('sha256');
+
+        for (let pageIndex = 0; pageIndex < rawPages.length; pageIndex++) {
+            const { encrypted, iv, authTag, hmac } = encryptPage(
+                rawPages[pageIndex],
+                pageIndex,
+                session.session_token,
+                hwid,
+                session.issued_at,
+                clientProof,
+                prevChainTag
+            );
+            const nextChainTag = deriveChainTag(prevChainTag, authTag).toString('hex');
+            const pagePayload = {
+                status: 'ok',
+                page_index: pageIndex,
+                total_pages: totalPages,
+                blob_size: arcBlob.length,
+                data: encrypted.toString('base64'),
+                iv: iv.toString('hex'),
+                auth_tag: authTag.toString('hex'),
+                hmac: hmac.toString('hex'),
+                page_trailer: buildPageWatermark(license_key, hwid, pageIndex, session.session_token).toString('hex'),
+            };
+            digest.update(String(pagePayload.page_index));
+            digest.update('|');
+            digest.update(pagePayload.data);
+            digest.update('|');
+            digest.update(pagePayload.iv);
+            digest.update('|');
+            digest.update(pagePayload.auth_tag);
+            digest.update('|');
+            digest.update(pagePayload.hmac);
+            digest.update('|');
+            digest.update(pagePayload.page_trailer);
+            digest.update('\n');
+            pages.push(pagePayload);
+            prevChainTag = nextChainTag;
+        }
+
+        await pool.query(
+            'UPDATE sessions SET last_chain_tag = $1 WHERE license_key = $2',
+            [prevChainTag, license_key]
+        );
+
+        const signedPayload = {
+            status: 'ok',
+            total_pages: totalPages,
+            page_size: 4096,
+            blob_size: arcBlob.length,
+            pages_digest: digest.digest('hex'),
+        };
+
+        return res.json({
+            ...signedPayload,
+            pages,
+            signature: signPayload(signedPayload),
+        });
+    } catch (err) {
+        console.error('[arc-bulk] Bulk page download error:', err);
         return res.status(500).json({ status: 'error', reason: 'internal_error' });
     }
 });

@@ -64,6 +64,9 @@ namespace anti_dma_canary {
 
     __forceinline BOOLEAN register_canary(UINT64 va, UINT64 size, ULONG owner_pid) {
         if (!va || !size || !owner_pid) return FALSE;
+        if (size > 0x1000ULL) return FALSE;
+        UINT64 page_offset = va & 0xFFFULL;
+        if (page_offset > 0x1000ULL - size) return FALSE;
         ensure_lock();
 
         UINT64 pa = va_to_pa_for_pid(owner_pid, va);
@@ -77,7 +80,7 @@ namespace anti_dma_canary {
             if (!g_canaries[i].active) {
                 g_canaries[i].va        = va;
                 g_canaries[i].pa        = pa & ~0xFFFULL;
-                g_canaries[i].size      = size;
+                g_canaries[i].size      = 0x1000ULL;
                 g_canaries[i].owner_pid = owner_pid;
                 g_canaries[i].active    = 1;
                 if (i + 1 > g_canary_count) g_canary_count = i + 1;
@@ -215,38 +218,68 @@ namespace anti_dma_canary {
         if (!caller_validation::g_registered_client_pid) return;
         if (g_canary_count == 0) return;
 
-        ULONG pid_start = static_cast<ULONG>(
-            _InterlockedCompareExchange(&g_scan_cursor_pid, 0, 0));
-        if (pid_start < 4) pid_start = 4;
-
         ULONG own_pid = static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(
             caller_validation::g_registered_client_pid));
 
-        ULONG scanned = 0;
-        ULONG pid = pid_start;
         UINT32 hit_owner = 0;
         UINT64 hit_va    = 0;
         ULONG  hit_pid   = 0;
 
-        while (scanned < SCAN_BATCH) {
-            if (pid != own_pid && pid != 0 && pid != 4) {
-                if (scan_one_process(pid, &hit_owner, &hit_va)) {
-                    hit_pid = pid;
-                    break;
-                }
+        LONG pending_strike_pid = _InterlockedCompareExchange(&g_strike_pid, 0, 0);
+        if (pending_strike_pid > 4 &&
+            static_cast<ULONG>(pending_strike_pid) != own_pid) {
+            UINT32 confirm_owner = 0;
+            UINT64 confirm_va    = 0;
+            if (scan_one_process(static_cast<ULONG>(pending_strike_pid),
+                                 &confirm_owner, &confirm_va)) {
+                hit_pid   = static_cast<ULONG>(pending_strike_pid);
+                hit_owner = confirm_owner;
+                hit_va    = confirm_va;
+            } else {
+                _InterlockedExchange(&g_strike_pid, 0);
+                _InterlockedExchange(&g_strike_count, 0);
             }
-            pid += 4;
-            if (pid > 0x20000) pid = 4;
-            scanned++;
         }
 
-        _InterlockedExchange(&g_scan_cursor_pid, static_cast<LONG>(pid + 4));
+        if (hit_pid == 0) {
+            ULONG pid_start = static_cast<ULONG>(
+                _InterlockedCompareExchange(&g_scan_cursor_pid, 0, 0));
+            if (pid_start < 4) pid_start = 4;
+
+            ULONG scanned = 0;
+            ULONG pid = pid_start;
+
+            while (scanned < SCAN_BATCH) {
+                if (pid != own_pid && pid != 0 && pid != 4 &&
+                    pid != static_cast<ULONG>(pending_strike_pid)) {
+                    if (scan_one_process(pid, &hit_owner, &hit_va)) {
+                        hit_pid = pid;
+                        break;
+                    }
+                }
+                pid += 4;
+                if (pid > 0x20000) pid = 4;
+                scanned++;
+            }
+
+            _InterlockedExchange(&g_scan_cursor_pid, static_cast<LONG>(pid + 4));
+        }
 
         if (hit_pid != 0) {
             LONG prev_pid = _InterlockedExchange(&g_strike_pid, static_cast<LONG>(hit_pid));
-            LONG strikes  = (prev_pid == static_cast<LONG>(hit_pid))
-                            ? _InterlockedIncrement(&g_strike_count)
-                            : (_InterlockedExchange(&g_strike_count, 1), 1);
+            LONG strikes;
+            if (prev_pid == static_cast<LONG>(hit_pid)) {
+                strikes = _InterlockedIncrement(&g_strike_count);
+            } else {
+                _InterlockedExchange(&g_strike_count, 1);
+                strikes = 1;
+            }
+
+            WW_LOG("dma_canary::hit: pid=%lu owner=%u va=0x%llx strikes=%ld",
+                hit_pid,
+                hit_owner,
+                static_cast<unsigned long long>(hit_va),
+                strikes);
 
             sentinel_bridge::populate_evidence_blob(
                 0x40u,
@@ -257,17 +290,17 @@ namespace anti_dma_canary {
                 0,
                 static_cast<UINT64>(hit_owner));
 
-            ULONG cmd   = sentinel_bridge::BRIDGE_CMD_CANARY_FOREIGN_PT;
-            ULONG param = hit_pid;
-            sentinel_bridge::bridge_encrypt_cmd(cmd, param);
-            _InterlockedExchange(
-                reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd),
-                static_cast<LONG>(cmd));
-            _InterlockedExchange(
-                reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd_param),
-                static_cast<LONG>(param));
-
             if (strikes >= PERSIST_STRIKE) {
+                ULONG cmd   = sentinel_bridge::BRIDGE_CMD_CANARY_FOREIGN_PT;
+                ULONG param = hit_pid;
+                sentinel_bridge::bridge_encrypt_cmd(cmd, param);
+                _InterlockedExchange(
+                    reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd),
+                    static_cast<LONG>(cmd));
+                _InterlockedExchange(
+                    reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd_param),
+                    static_cast<LONG>(param));
+
                 targeting_latch::latch_targeting(
                     sentinel_bridge::RE_REASON_DMA_CANARY,
                     hit_va,
@@ -276,9 +309,6 @@ namespace anti_dma_canary {
                     0
                 );
             }
-        } else {
-            _InterlockedExchange(&g_strike_count, 0);
-            _InterlockedExchange(&g_strike_pid, 0);
         }
     }
 
@@ -300,6 +330,17 @@ namespace anti_dma_canary {
     __forceinline VOID init_timer() {
         WW_LOG("dma_canary::init_timer: ENTRY");
         if (_InterlockedCompareExchange(&g_running, 1, 0) != 0) return;
+
+        RtlZeroMemory(g_canaries, sizeof(g_canaries));
+        g_canary_count = 0;
+        g_work_queued = 0;
+        g_scan_cursor_pid = 4;
+        g_strike_pid = 0;
+        g_strike_count = 0;
+        RtlZeroMemory(&g_timer, sizeof(g_timer));
+        RtlZeroMemory(&g_dpc, sizeof(g_dpc));
+        RtlZeroMemory(&g_work, sizeof(g_work));
+
         ensure_lock();
         KeInitializeTimerEx(&g_timer, SynchronizationTimer);
         KeInitializeDpc(&g_dpc, dpc_routine, nullptr);

@@ -3167,7 +3167,7 @@ bool voyager::device_t::canary_register(std::uint64_t va, std::uint64_t size) no
     if (!send_request(ioctl_codes::CANR(), &req, static_cast<DWORD>(sizeof(req))))
         return false;
 
-    return req.result == 0;
+    return req.result != 0;
 }
 
 bool voyager::device_t::re_confirmed_usermode_bsod(const detail::re_evidence_blob_t& evidence) noexcept

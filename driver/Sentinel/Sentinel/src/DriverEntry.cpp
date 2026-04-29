@@ -299,25 +299,21 @@ static void NTAPI init_thread_routine(PVOID ) {
 
     SN_LOG("init_thread: started");
 
-    constexpr ULONG MAX_POLLS = 300;
+    constexpr ULONG SETTLE_POLLS = 5;
     constexpr LONG64 POLL_INTERVAL = -1'000'000LL;
 
     LARGE_INTEGER interval;
     interval.QuadPart = POLL_INTERVAL;
 
-    for (ULONG i = 0; i < MAX_POLLS; i++) {
+    for (ULONG i = 0; i < SETTLE_POLLS; i++) {
         if (_InterlockedCompareExchange(&g_shutdown_flag, 0, 0)) {
-            SN_LOG("init_thread: shutdown flag set at poll %lu", i);
+            SN_LOG("init_thread: shutdown flag set at settle %lu", i);
             goto exit_thread;
         }
 
         if (g_target_driver_base != nullptr) {
-            SN_LOG("init_thread: g_target_driver_base pre-set at %p after %lu polls", (PVOID)g_target_driver_base, i);
+            SN_LOG("init_thread: g_target_driver_base pre-set at %p after %lu settles", (PVOID)g_target_driver_base, i);
             break;
-        }
-
-        if (i % 50 == 0) {
-            SN_LOG("init_thread: polling loop iteration %lu/%lu, g_target_driver_base still NULL", i, MAX_POLLS);
         }
 
         _KeDelayExecutionThread(KernelMode, FALSE, &interval);
@@ -325,7 +321,7 @@ static void NTAPI init_thread_routine(PVOID ) {
 
 
     if (g_target_driver_base == nullptr) {
-        SN_LOG("init_thread: g_target_driver_base still NULL after polling, scanning module list...");
+        SN_LOG("init_thread: settle done, scanning module list immediately for bridge magic...");
 
         if (g_sentinel_driver_object &&
             _MmIsAddressValid(g_sentinel_driver_object) &&

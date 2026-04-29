@@ -270,10 +270,10 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
     static constexpr size_t kBaseCount = sizeof(kBaseCandidates) / sizeof(kBaseCandidates[0]);
     uint32_t base_reg_id = kBaseCandidates[rng.range(static_cast<uint32_t>(kBaseCount))];
 
-    static const uint32_t kNonVolatile[] = { 3, 5, 6, 7, 12, 13, 14, 15 };
-    std::array<uint32_t, 8> push_order{};
-    for (size_t i = 0; i < 8; ++i) { push_order[i] = kNonVolatile[i]; }
-    for (size_t i = 7; i > 0; --i) {
+    static const uint32_t kSavedRegs[] = { 1, 2, 3, 5, 6, 7, 8, 9, 12, 13, 14, 15 };
+    std::array<uint32_t, 12> push_order{};
+    for (size_t i = 0; i < push_order.size(); ++i) { push_order[i] = kSavedRegs[i]; }
+    for (size_t i = push_order.size() - 1; i > 0; --i) {
         uint32_t j = rng.range(static_cast<uint32_t>(i + 1));
         std::swap(push_order[i], push_order[j]);
     }
@@ -389,9 +389,9 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
             uint64_t k = rng.next();
             if (k == 0u) { k = 0xC6BC279692B5C323ULL; }
             a.mov(x86::rax, x86::qword_ptr(lSlot));
-            a.mov(x86::rcx, static_cast<int64_t>(k));
-            a.xor_(x86::rax, x86::rcx);
-            a.xor_(x86::rax, x86::rcx);
+            a.mov(rTmp1, static_cast<int64_t>(k));
+            a.xor_(x86::rax, rTmp1);
+            a.xor_(x86::rax, rTmp1);
             a.jmp(x86::rax);
             break;
         }

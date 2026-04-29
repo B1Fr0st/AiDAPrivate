@@ -52,6 +52,67 @@ option(AIDA_ARC_ENCRYPT_IMPORTS "Enable --encrypt-imports for ARC (requires api-
 
 set(DEPS_DIR "${CMAKE_SOURCE_DIR}/.deps")
 
+if(WIN32 AND MSVC)
+    set(_aida_openssl_root "$ENV{OPENSSL_ROOT_DIR}")
+    if(NOT _aida_openssl_root OR NOT EXISTS "${_aida_openssl_root}/include/openssl/ssl.h")
+        foreach(_candidate
+            "C:/Program Files/OpenSSL-Win64"
+            "C:/Program Files/OpenSSL"
+            "C:/OpenSSL-Win64"
+        )
+            if(EXISTS "${_candidate}/include/openssl/ssl.h")
+                set(_aida_openssl_root "${_candidate}")
+                break()
+            endif()
+        endforeach()
+    endif()
+    if(NOT _aida_openssl_root OR NOT EXISTS "${_aida_openssl_root}/include/openssl/ssl.h")
+        message(FATAL_ERROR
+            "OpenSSL headers not found. Set -DOPENSSL_ROOT_DIR=<path> or install "
+            "OpenSSL (with static libs) under C:/Program Files/OpenSSL-Win64.")
+    endif()
+    set(_aida_openssl_lib_release "${_aida_openssl_root}/lib/VC/x64/MD")
+    set(_aida_openssl_lib_debug   "${_aida_openssl_root}/lib/VC/x64/MDd")
+    if(NOT EXISTS "${_aida_openssl_lib_release}/libssl_static.lib"
+       OR NOT EXISTS "${_aida_openssl_lib_release}/libcrypto_static.lib")
+        message(FATAL_ERROR
+            "OpenSSL static libraries not present at ${_aida_openssl_lib_release}. "
+            "Reinstall OpenSSL with the static-libs option enabled so AiDAStandalone "
+            "can link without runtime DLL dependencies (libssl-3-x64.dll / libcrypto-3-x64.dll).")
+    endif()
+
+    add_library(aida_openssl_crypto STATIC IMPORTED GLOBAL)
+    set_target_properties(aida_openssl_crypto PROPERTIES
+        IMPORTED_LOCATION                "${_aida_openssl_lib_release}/libcrypto_static.lib"
+        IMPORTED_LOCATION_RELEASE        "${_aida_openssl_lib_release}/libcrypto_static.lib"
+        IMPORTED_LOCATION_RELWITHDEBINFO "${_aida_openssl_lib_release}/libcrypto_static.lib"
+        IMPORTED_LOCATION_MINSIZEREL     "${_aida_openssl_lib_release}/libcrypto_static.lib"
+        IMPORTED_LOCATION_DEBUG          "${_aida_openssl_lib_debug}/libcrypto_static.lib"
+        INTERFACE_INCLUDE_DIRECTORIES    "${_aida_openssl_root}/include"
+        INTERFACE_LINK_LIBRARIES         "ws2_32;crypt32;advapi32;user32;gdi32"
+    )
+
+    add_library(aida_openssl_ssl STATIC IMPORTED GLOBAL)
+    set_target_properties(aida_openssl_ssl PROPERTIES
+        IMPORTED_LOCATION                "${_aida_openssl_lib_release}/libssl_static.lib"
+        IMPORTED_LOCATION_RELEASE        "${_aida_openssl_lib_release}/libssl_static.lib"
+        IMPORTED_LOCATION_RELWITHDEBINFO "${_aida_openssl_lib_release}/libssl_static.lib"
+        IMPORTED_LOCATION_MINSIZEREL     "${_aida_openssl_lib_release}/libssl_static.lib"
+        IMPORTED_LOCATION_DEBUG          "${_aida_openssl_lib_debug}/libssl_static.lib"
+        INTERFACE_INCLUDE_DIRECTORIES    "${_aida_openssl_root}/include"
+        INTERFACE_LINK_LIBRARIES         "aida_openssl_crypto"
+    )
+
+    set(OPENSSL_FOUND TRUE CACHE BOOL "" FORCE)
+    set(OPENSSL_INCLUDE_DIR "${_aida_openssl_root}/include" CACHE PATH "" FORCE)
+    set(OPENSSL_SSL_LIBRARY "${_aida_openssl_lib_release}/libssl_static.lib" CACHE FILEPATH "" FORCE)
+    set(OPENSSL_CRYPTO_LIBRARY "${_aida_openssl_lib_release}/libcrypto_static.lib" CACHE FILEPATH "" FORCE)
+    set(OPENSSL_LIBRARIES "${OPENSSL_SSL_LIBRARY};${OPENSSL_CRYPTO_LIBRARY}" CACHE STRING "" FORCE)
+    set(OPENSSL_VERSION "3.0.0" CACHE STRING "" FORCE)
+
+    message(STATUS "AiDA: OpenSSL static linking enabled (root=${_aida_openssl_root})")
+endif()
+
 set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(ZYDIS_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
@@ -598,28 +659,6 @@ if(WIN32)
 
     if(BUILD_AIDA_STANDALONE)
         set(STANDALONE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/src")
-        set(OPENSSL_USE_STATIC_LIBS TRUE)
-        set(OPENSSL_MSVC_STATIC_RT OFF)
-        find_package(OpenSSL REQUIRED)
-
-        # Force static OpenSSL libs — CMake's FindOpenSSL picks the import libs
-        # (libssl.lib/libcrypto.lib) even with OPENSSL_USE_STATIC_LIBS=TRUE on MSVC.
-        # Override to the _static variants so users don't need DLLs at runtime.
-        if(MSVC AND OPENSSL_FOUND)
-            get_filename_component(_ossl_lib_dir "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
-            if(EXISTS "${_ossl_lib_dir}/libssl_static.lib")
-                set_target_properties(OpenSSL::SSL PROPERTIES
-                    IMPORTED_LOCATION "${_ossl_lib_dir}/libssl_static.lib"
-                    IMPORTED_LOCATION_RELEASE "${_ossl_lib_dir}/libssl_static.lib"
-                    IMPORTED_LOCATION_DEBUG "${_ossl_lib_dir}/../MDd/libssl_static.lib"
-                )
-                set_target_properties(OpenSSL::Crypto PROPERTIES
-                    IMPORTED_LOCATION "${_ossl_lib_dir}/libcrypto_static.lib"
-                    IMPORTED_LOCATION_RELEASE "${_ossl_lib_dir}/libcrypto_static.lib"
-                    IMPORTED_LOCATION_DEBUG "${_ossl_lib_dir}/../MDd/libcrypto_static.lib"
-                )
-            endif()
-        endif()
 
         set(IMGUI_WRAPPER_DIR "${CMAKE_BINARY_DIR}/_imgui_wrapper/imgui")
         file(MAKE_DIRECTORY "${IMGUI_WRAPPER_DIR}")
@@ -882,8 +921,8 @@ if(WIN32)
             llhttp_static
             nghttp2_static
             lua54_static
-            OpenSSL::SSL
-            OpenSSL::Crypto
+            aida_openssl_ssl
+            aida_openssl_crypto
             d3d11
             d3dcompiler
             dxgi
@@ -1232,12 +1271,9 @@ if(WIN32)
         /EMITTOOLVERSIONINFO:NO
     )
 
-    set(OPENSSL_USE_STATIC_LIBS TRUE)
-    set(OPENSSL_MSVC_STATIC_RT OFF)
-    find_package(OpenSSL REQUIRED)
     target_link_libraries(AiDA PRIVATE
-        OpenSSL::SSL
-        OpenSSL::Crypto
+        aida_openssl_ssl
+        aida_openssl_crypto
         ws2_32
         crypt32
         Shlwapi

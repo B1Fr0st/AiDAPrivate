@@ -244,11 +244,31 @@ inline bool initialize()
             ExitProcess(1);
         }
 
-        void* canary = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_NOACCESS);
+        void* canary = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (canary != nullptr)
         {
-            rt.canary_page = canary;
-            driver_bridge::canary_register(canary, 4096);
+            auto* canary_bytes = static_cast<unsigned char*>(canary);
+            ULONGLONG canary_seed = GetTickCount64()
+                ^ static_cast<ULONGLONG>(reinterpret_cast<ULONG_PTR>(canary))
+                ^ (static_cast<ULONGLONG>(GetCurrentProcessId()) << 32);
+            for (size_t index = 0; index < 4096; ++index)
+            {
+                canary_seed = canary_seed * 2862933555777941757ULL + 3037000493ULL;
+                canary_bytes[index] = static_cast<unsigned char>(canary_seed >> 33);
+            }
+
+            if (VirtualLock(canary, 4096) && driver_bridge::canary_register(canary, 4096))
+            {
+                DWORD old_protect = 0;
+                VirtualProtect(canary, 4096, PAGE_NOACCESS, &old_protect);
+                rt.canary_page = canary;
+            }
+            else
+            {
+                VirtualUnlock(canary, 4096);
+                SecureZeroMemory(canary, 4096);
+                VirtualFree(canary, 0, MEM_RELEASE);
+            }
         }
     }
 
@@ -478,6 +498,22 @@ inline bool initialize()
     }
 
 
+    webhook::write_log("init", "deferred_seal_until_arc_loaded");
+
+    return true;
+}
+
+inline bool finalize_after_activation()
+{
+    auto& rt = state::get();
+    if (rt.activation_hardening_done.exchange(true, std::memory_order_acq_rel))
+    {
+        webhook::write_log("init", "finalize_after_activation_already_done");
+        return true;
+    }
+
+    webhook::write_log("init", "finalize_after_activation_entering");
+
     if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
     {
         uint32_t self_pid = GetCurrentProcessId();
@@ -515,6 +551,7 @@ inline bool initialize()
     anti_dump::hide_module();
     webhook::write_log("init", "hide_peb_ok");
 
+    webhook::write_log("init", "finalize_after_activation_done");
     return true;
 }
 

@@ -122,7 +122,6 @@ ED25519_PRIVATE_KEY_B64=${ED25519_B64}
 ARC_MASTER_SECRET=${ARC_SECRET}
 DISCORD_WEBHOOK_URL=
 ARC_BLOB_PATH=/opt/aida/arc/aida_core.bin
-AIDA_BINARY_PATH=/opt/aida/bin/AiDA.exe
 PORT=3001
 NODE_ENV=production
 ENVEOF
@@ -220,17 +219,15 @@ echo ""
 echo "  Endpoints:"
 echo "    POST /validateLicense     — License validation & heartbeat"
 echo "    POST /api/download/arc    — ARC DLL delivery (session-encrypted)"
-echo "    GET  /api/download/aida   — AiDA binary (watermarked per-user)"
 echo "    GET  /health              — Health check"
 echo ""
 echo "  ── Remaining Manual Steps ──────────────────────────────────────"
 echo ""
 echo "  1. Edit /opt/aida/api/.env — set DATABASE_URL password, DISCORD_WEBHOOK_URL"
 echo "  2. Upload ARC blob:  scp aida_core.bin ruarr@aidapro.net:/opt/aida/arc/"
-echo "  3. Upload AiDA.exe:  scp AiDA.exe ruarr@aidapro.net:/opt/aida/bin/"
-echo "  4. After DNS propagates: sudo certbot --nginx -d aidapro.net"
-echo "  5. Test: curl -k https://aidapro.net/health"
-echo "  6. Restart after .env changes: pm2 restart aida-api"
+echo "  3. After DNS propagates: sudo certbot --nginx -d aidapro.net"
+echo "  4. Test: curl -k https://aidapro.net/health"
+echo "  5. Restart after .env changes: pm2 restart aida-api"
 echo ""
 echo "  ── Encrypt ARC DLL for at-rest storage ────────────────────────"
 echo "  ARC_MASTER_SECRET=\$(grep ARC_MASTER_SECRET /opt/aida/api/.env | cut -d= -f2) \\"

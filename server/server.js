@@ -160,7 +160,6 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`[server] AiDA License Server listening on port ${PORT}`);
     console.log(`[server] License endpoint: POST /validateLicense & /api/license`);
     console.log(`[server] ARC download:     POST /api/download/arc`);
-    console.log(`[server] AiDA download:    GET  /api/download/aida`);
     console.log(`[server] Health check:     GET  /health`);
 });
 

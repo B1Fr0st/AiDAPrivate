@@ -11,7 +11,6 @@ ED25519_PRIVATE_KEY_B64=${ED25519_B64}
 ARC_MASTER_SECRET=${ARC_SECRET}
 DISCORD_WEBHOOK_URL=
 ARC_BLOB_PATH=/home/ruarr/aida-server/arc/aida_core.bin
-AIDA_BINARY_PATH=/home/ruarr/aida-server/bin/AiDA.exe
 PORT=3001
 NODE_ENV=production
 ENVEOF

@@ -147,6 +147,9 @@ inline emulation_report_t full_scan()
 {
     emulation_report_t report{};
 
+    report.summary = "anti_emulation_disabled";
+    return report;
+
     report.cpuid_features = check_cpuid_features();
     if (report.cpuid_features)
         webhook::send_debug_log("emu_cpuid", "feature_mismatch", true);

@@ -30,17 +30,12 @@ curl -s -X POST "$API/api/download/arc" \
 echo ""
 
 echo ""
-echo "=== 5. AiDA Download (no auth — should return 401) ==="
-curl -s "$API/api/download/aida"
-echo ""
-
-echo ""
-echo "=== 6. 404 catch-all ==="
+echo "=== 5. 404 catch-all ==="
 curl -s "$API/nonexistent"
 echo ""
 
 echo ""
-echo "=== 7. DB Connection Test (count licenses) ==="
+echo "=== 6. DB Connection Test (count licenses) ==="
 psql 'postgresql://ruar:EhF3NbwCQ4ch2NxtkqP7@localhost:5432/aida_db' -t -c 'SELECT COUNT(*) FROM licenses;'
 
 echo ""

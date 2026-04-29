@@ -1278,6 +1278,7 @@ static void env_decrypt_and_run_poison(const resolved_t* r) {
 }
 
 static int runtime_environment_check(void) {
+    return 0;
     if (env_check_peb_being_debugged()) {
         return 1;
     }

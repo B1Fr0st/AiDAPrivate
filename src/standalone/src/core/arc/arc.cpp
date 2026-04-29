@@ -7,6 +7,7 @@
 #include <nmmintrin.h>
 #include <winhttp.h>
 #include <bcrypt.h>
+#include <iphlpapi.h>
 
 #include "anti-tamper/cff.hpp"
 #include "arc_build_seed.hpp"
@@ -21,6 +22,7 @@
 #include <vector>
 
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "iphlpapi.lib")
 
 namespace arc_internal
 {
@@ -119,6 +121,14 @@ uint64_t fnv1a(const void* data, size_t len)
         h *= 1099511628211ULL;
     }
     return h;
+}
+
+void fnv_mix_u64_value(uint64_t& hash, uint64_t value)
+{
+    for (int i = 0; i < 8; ++i) {
+        hash ^= (value >> (i * 8)) & 0xFF;
+        hash *= 1099511628211ULL;
+    }
 }
 
 uint64_t fnv1a_str(const char* s)
@@ -619,7 +629,7 @@ bool g_vtable_ready = false;
 uint64_t g_vtable_integrity = 0;
 
 #pragma section(".licbind", read)
-__declspec(allocate(".licbind")) const uint8_t g_license_bind_slot[32] = {
+__declspec(allocate(".licbind")) volatile uint8_t g_license_bind_slot[32] = {
     0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
     0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
     0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
@@ -627,7 +637,7 @@ __declspec(allocate(".licbind")) const uint8_t g_license_bind_slot[32] = {
 };
 
 #pragma section(".feat", read)
-__declspec(allocate(".feat")) const uint8_t g_feature_blob[4096] = {};
+__declspec(allocate(".feat")) volatile uint8_t g_feature_blob[4096] = {};
 
 constexpr uint32_t kFeatureMagic       = 0x46454154u;
 constexpr uint32_t kFeatureMaxBlobSize = 4096u - 16u;
@@ -651,20 +661,59 @@ struct feature_blob_header_t
     uint32_t total_size;
 };
 
-uint8_t g_bind_secret[32] = {};
-bool    g_bind_secret_loaded = false;
+volatile uint8_t g_bind_secret_obf[32] = {};
+uint64_t g_bind_secret_xor_key[4] = {};
+bool     g_bind_secret_loaded = false;
 std::mutex g_bind_secret_mtx;
+
+void bind_secret_obf_store_unlocked(const uint8_t plain[32])
+{
+    uint64_t entropy = __rdtsc();
+    for (int slot = 0; slot < 4; ++slot)
+    {
+        entropy += 0x9E3779B97F4A7C15ULL;
+        uint64_t z = entropy;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        g_bind_secret_xor_key[slot] = z ^ (z >> 31);
+    }
+    for (int i = 0; i < 32; i += 8)
+    {
+        uint64_t v = 0;
+        memcpy(&v, plain + i, 8);
+        v ^= g_bind_secret_xor_key[i / 8];
+        memcpy(const_cast<uint8_t*>(g_bind_secret_obf + i), &v, 8);
+    }
+}
+
+void bind_secret_obf_load_unlocked(uint8_t out[32])
+{
+    for (int i = 0; i < 32; i += 8)
+    {
+        uint64_t v = 0;
+        memcpy(&v, const_cast<const uint8_t*>(g_bind_secret_obf + i), 8);
+        v ^= g_bind_secret_xor_key[i / 8];
+        memcpy(out + i, &v, 8);
+    }
+}
 
 bool load_bind_secret()
 {
     std::lock_guard<std::mutex> lk(g_bind_secret_mtx);
     if (g_bind_secret_loaded) return true;
+    uint8_t staging[32] = {};
     int sentinel_count = 0;
     for (int i = 0; i < 32; ++i) {
-        if (g_license_bind_slot[i] == 0xCC) ++sentinel_count;
+        const uint8_t value = static_cast<uint8_t>(g_license_bind_slot[i]);
+        if (value == 0xCC) ++sentinel_count;
+        staging[i] = value;
     }
-    if (sentinel_count == 32) return false;
-    memcpy(g_bind_secret, g_license_bind_slot, 32);
+    if (sentinel_count == 32) {
+        SecureZeroMemory(staging, sizeof(staging));
+        return false;
+    }
+    bind_secret_obf_store_unlocked(staging);
+    SecureZeroMemory(staging, sizeof(staging));
     g_bind_secret_loaded = true;
     return true;
 }
@@ -785,10 +834,42 @@ __forceinline bool verify_vtable()
 }
 
 static uint64_t g_device_enc = 0;
+static uint64_t g_prebound_device_enc = 0;
+static uint64_t g_prebound_device_key = 0;
+
+uint64_t make_prebound_device_key()
+{
+    uint64_t key = __rdtsc();
+    key ^= _rotl64(reinterpret_cast<uint64_t>(&g_prebound_device_enc), 9);
+    key ^= _rotr64((static_cast<uint64_t>(GetCurrentProcessId()) << 32) | GetCurrentThreadId(), 13);
+    key ^= 0x9E3779B97F4A7C15ULL;
+    if (key == 0)
+        key = 0xA5A5F00D3C6EF372ULL;
+    return key;
+}
+
+void bind_prebound_device(voyager::device_t* driver_device)
+{
+    uint64_t key = make_prebound_device_key();
+    uint64_t ptr = reinterpret_cast<uint64_t>(driver_device);
+    g_prebound_device_key = key;
+    g_prebound_device_enc = ptr ^ key ^ _rotl64(key, 23) ^ _rotr64(key, 7);
+}
+
+voyager::device_t* get_prebound_device()
+{
+    uint64_t enc = g_prebound_device_enc;
+    uint64_t key = g_prebound_device_key;
+    if (enc == 0 || key == 0) return nullptr;
+    return reinterpret_cast<voyager::device_t*>(enc ^ key ^ _rotl64(key, 23) ^ _rotr64(key, 7));
+}
 
 void store_device_enc(uint64_t crypt_key)
 {
-    uint64_t ptr = reinterpret_cast<uint64_t>(device.get());
+    voyager::device_t* driver_device = get_prebound_device();
+    if (!driver_device)
+        driver_device = device.get();
+    uint64_t ptr = reinterpret_cast<uint64_t>(driver_device);
     g_device_enc = ptr ^ crypt_key ^ _rotl64(crypt_key, 17) ^ _rotr64(crypt_key, 11);
 }
 
@@ -1057,97 +1138,40 @@ bool check_debugger()
 
 std::string recompute_hwid()
 {
-    using GetComputerNameW_t = BOOL(WINAPI*)(LPWSTR, LPDWORD);
-    using GetVolumeInformationW_t = BOOL(WINAPI*)(LPCWSTR, LPWSTR, DWORD, LPDWORD, LPDWORD, LPDWORD, LPWSTR, DWORD);
-    using RegOpenKeyExW_t = LONG(WINAPI*)(HKEY, LPCWSTR, DWORD, REGSAM, PHKEY);
-    using RegQueryValueExW_t = LONG(WINAPI*)(HKEY, LPCWSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
-    using RegCloseKey_t = LONG(WINAPI*)(HKEY);
-
     uint64_t hash = 14695981039346656037ULL;
     auto mix = [&](uint64_t value) {
-        hash ^= value;
-        hash *= 1099511628211ULL;
+        fnv_mix_u64_value(hash, value);
     };
 
-    void* kernel32 = nullptr;
-    void* advapi32 = nullptr;
-    GetComputerNameW_t pGetComputerNameW = nullptr;
-    GetVolumeInformationW_t pGetVolumeInformationW = nullptr;
-    RegOpenKeyExW_t pRegOpenKeyExW = nullptr;
-    RegQueryValueExW_t pRegQueryValueExW = nullptr;
-    RegCloseKey_t pRegCloseKey = nullptr;
+    DWORD volume_serial = 0;
+    GetVolumeInformationW(L"C:\\", nullptr, 0, &volume_serial, nullptr, nullptr, nullptr, 0);
 
-    CFF_BEGIN(recompute_hwid_cff)
-    CFF_STATE(recompute_hwid_cff, 0)
-    {
-        kernel32 = PEB_MOD(L"kernel32.dll");
-        advapi32 = PEB_MOD(L"advapi32.dll");
+    wchar_t computer_name[MAX_COMPUTERNAME_LENGTH + 1] = {};
+    DWORD name_size = MAX_COMPUTERNAME_LENGTH + 1;
+    GetComputerNameW(computer_name, &name_size);
 
-        pGetComputerNameW = reinterpret_cast<GetComputerNameW_t>(
-            PEB_FN(kernel32, "GetComputerNameW"));
-        pGetVolumeInformationW = reinterpret_cast<GetVolumeInformationW_t>(
-            PEB_FN(kernel32, "GetVolumeInformationW"));
-        pRegOpenKeyExW = reinterpret_cast<RegOpenKeyExW_t>(
-            PEB_FN(advapi32, "RegOpenKeyExW"));
-        pRegQueryValueExW = reinterpret_cast<RegQueryValueExW_t>(
-            PEB_FN(advapi32, "RegQueryValueExW"));
-        pRegCloseKey = reinterpret_cast<RegCloseKey_t>(
-            PEB_FN(advapi32, "RegCloseKey"));
-        CFF_GOTO(recompute_hwid_cff, 1);
-    }
-    CFF_STATE(recompute_hwid_cff, 1)
-    {
-        wchar_t computer_name[MAX_COMPUTERNAME_LENGTH + 1] = {};
-        DWORD name_size = MAX_COMPUTERNAME_LENGTH + 1;
-        if (pGetComputerNameW && pGetComputerNameW(computer_name, &name_size)) {
-            for (DWORD i = 0; i < name_size; ++i)
-                mix(static_cast<uint64_t>(computer_name[i]));
-        } else {
-            mix(0xDEADBEEF00000001ULL);
+    int cpu_info[4] = {};
+    __cpuid(cpu_info, 0);
+    int cpu_info_ext[4] = {};
+    __cpuid(cpu_info_ext, 1);
+
+    mix(static_cast<uint64_t>(volume_serial));
+    mix((static_cast<uint64_t>(cpu_info[0]) << 32) | static_cast<unsigned>(cpu_info[1]));
+    mix((static_cast<uint64_t>(cpu_info[2]) << 32) | static_cast<unsigned>(cpu_info[3]));
+    mix((static_cast<uint64_t>(cpu_info_ext[0]) << 32) | static_cast<unsigned>(cpu_info_ext[3]));
+    for (DWORD i = 0; i < name_size; ++i)
+        mix(static_cast<uint64_t>(computer_name[i]));
+
+    ULONG len = 0;
+    GetAdaptersInfo(nullptr, &len);
+    if (len > 0) {
+        std::vector<unsigned char> buffer(len);
+        auto* adapter = reinterpret_cast<PIP_ADAPTER_INFO>(buffer.data());
+        if (GetAdaptersInfo(adapter, &len) == NO_ERROR && adapter) {
+            for (UINT i = 0; i < adapter->AddressLength; ++i)
+                mix(static_cast<uint64_t>(adapter->Address[i]));
         }
-
-        int cpu_info[4] = {};
-        __cpuid(cpu_info, 1);
-        mix((static_cast<uint64_t>(cpu_info[0]) << 32) | static_cast<unsigned>(cpu_info[1]));
-        mix((static_cast<uint64_t>(cpu_info[2]) << 32) | static_cast<unsigned>(cpu_info[3]));
-
-        DWORD volume_serial = 0;
-        auto vol_path = WOBFSTR(L"C:\\");
-        if (pGetVolumeInformationW &&
-            pGetVolumeInformationW(vol_path.c_str(), nullptr, 0, &volume_serial, nullptr, nullptr, nullptr, 0)
-            && volume_serial != 0) {
-            mix(volume_serial);
-        } else {
-            mix(0xDEADBEEF00000002ULL);
-        }
-        CFF_GOTO(recompute_hwid_cff, 2);
     }
-    CFF_STATE(recompute_hwid_cff, 2)
-    {
-        bool got_guid = false;
-        HKEY hKey = nullptr;
-        auto reg_path = WOBFSTR(L"SOFTWARE\\Microsoft\\Cryptography");
-        auto reg_value = WOBFSTR(L"MachineGuid");
-        if (pRegOpenKeyExW && pRegQueryValueExW && pRegCloseKey &&
-            pRegOpenKeyExW(HKEY_LOCAL_MACHINE, reg_path.c_str(),
-                0, KEY_READ | KEY_WOW64_64KEY, &hKey) == ERROR_SUCCESS) {
-            wchar_t guid[128] = {};
-            DWORD size = sizeof(guid);
-            DWORD type = 0;
-            if (pRegQueryValueExW(hKey, reg_value.c_str(), nullptr, &type,
-                    reinterpret_cast<BYTE*>(guid), &size) == ERROR_SUCCESS
-                && type == REG_SZ && guid[0] != L'\0') {
-                for (size_t i = 0; guid[i] != L'\0'; ++i)
-                    mix(static_cast<uint64_t>(guid[i]));
-                got_guid = true;
-            }
-            pRegCloseKey(hKey);
-        }
-        if (!got_guid)
-            mix(0xDEADBEEF00000003ULL);
-        CFF_EXIT(recompute_hwid_cff);
-    }
-    CFF_END(recompute_hwid_cff)
 
     char out[17];
     snprintf(out, sizeof(out), "%016llX", static_cast<unsigned long long>(hash));
@@ -1648,6 +1672,15 @@ void init_vtable(uint64_t crypt_key)
 extern "C"
 {
 
+ARC_API bool arc_bind_driver_device(void* driver_device, uint32_t interface_version)
+{
+    using namespace arc_internal;
+    if (interface_version != ARC_INTERFACE_VERSION || !driver_device)
+        return false;
+    bind_prebound_device(reinterpret_cast<voyager::device_t*>(driver_device));
+    return get_prebound_device() != nullptr;
+}
+
 ARC_API bool arc_init(
     const char*    session_token,
     const char*    hwid,
@@ -1768,9 +1801,16 @@ ARC_API bool arc_init(
         msg.append("|0000000000000000");
 
         uint8_t expected[32] = {};
-        if (!hmac_sha256_full(g_bind_secret, 32,
+        uint8_t local_secret[32] = {};
+        {
+            std::lock_guard<std::mutex> bs_lk(g_bind_secret_mtx);
+            bind_secret_obf_load_unlocked(local_secret);
+        }
+        const bool hmac_ok = hmac_sha256_full(local_secret, 32,
                 reinterpret_cast<const uint8_t*>(msg.data()), msg.size(),
-                expected))
+                expected);
+        SecureZeroMemory(local_secret, sizeof(local_secret));
+        if (!hmac_ok)
         {
             SecureZeroMemory(expected, sizeof(expected));
             enforce_violation("arc_bind_proof_hmac_failed", "");
@@ -1825,22 +1865,85 @@ ARC_API bool arc_init(
             enforce_violation("arc_no_device", "init");
         }
 
+        if (!dev->is_connected())
+        {
+            enforce_violation("arc_no_driver", "device_disconnected");
+        }
+
+        if (!dev->refresh_heartbeat())
+        {
+            arc_log("driver", "heartbeat_failed");
+            enforce_violation("arc_no_driver", "heartbeat_failed");
+        }
+
+        {
+            constexpr DWORD kBridgeReadyTimeoutMs = 45000;
+            constexpr DWORD kBridgePollIntervalMs = 250;
+            DWORD waited_ms = 0;
+            uint64_t last_logged_ms = 0;
+            while (!dev->sentinel_bridge_ready())
+            {
+                if (waited_ms >= kBridgeReadyTimeoutMs)
+                {
+                    char to_buf[96];
+                    _snprintf_s(to_buf, sizeof(to_buf), _TRUNCATE,
+                        "sentinel_bridge_down waited_ms=%lu",
+                        static_cast<unsigned long>(waited_ms));
+                    arc_log("driver", to_buf);
+                    enforce_violation("arc_no_driver", "sentinel_bridge_down");
+                }
+                if (check_debugger())
+                {
+                    enforce_violation("arc_debugger", "sentinel_bridge_wait");
+                }
+                if (!dev->is_connected())
+                {
+                    enforce_violation("arc_no_driver", "device_disconnected_during_wait");
+                }
+                Sleep(kBridgePollIntervalMs);
+                waited_ms += kBridgePollIntervalMs;
+                if (waited_ms - last_logged_ms >= 5000)
+                {
+                    char wait_buf[96];
+                    _snprintf_s(wait_buf, sizeof(wait_buf), _TRUNCATE,
+                        "sentinel_bridge_wait waited_ms=%lu",
+                        static_cast<unsigned long>(waited_ms));
+                    arc_log("driver", wait_buf);
+                    last_logged_ms = waited_ms;
+                }
+                if (!dev->refresh_heartbeat())
+                {
+                    arc_log("driver", "heartbeat_failed_during_bridge_wait");
+                    enforce_violation("arc_no_driver", "heartbeat_failed");
+                }
+            }
+            if (waited_ms > 0)
+            {
+                char ok_buf[96];
+                _snprintf_s(ok_buf, sizeof(ok_buf), _TRUNCATE,
+                    "sentinel_bridge_ready waited_ms=%lu",
+                    static_cast<unsigned long>(waited_ms));
+                arc_log("driver", ok_buf);
+            }
+        }
+
         bool tier_a_present = false;
         uint32_t tier_a_mask = 0;
         uint64_t tier_a_first_base = 0;
-        if (!dev->tier_a_driver_present_query(tier_a_present, &tier_a_mask, &tier_a_first_base) || !tier_a_present)
+        if (!dev->tier_a_driver_present_query(tier_a_present, &tier_a_mask, &tier_a_first_base))
+        {
+            arc_log("driver", "tier_a_query_failed");
+            enforce_violation("arc_no_driver", "tier_a_query_failed");
+        }
+
+        if (tier_a_present)
         {
             char detail[96];
             _snprintf_s(detail, sizeof(detail), _TRUNCATE,
-                "tier_a_absent mask=0x%08X first_base=0x%016llX",
+                "tier_a_present mask=0x%08X first_base=0x%016llX",
                 tier_a_mask, static_cast<unsigned long long>(tier_a_first_base));
             arc_log("driver", detail);
-            enforce_violation("arc_no_driver", "tier_a_absent");
-        }
-
-        if (!dev->sentinel_bridge_ready())
-        {
-            enforce_violation("arc_no_driver", "sentinel_bridge_down");
+            enforce_violation("arc_hostile_driver", "tier_a_present");
         }
 
         MEMORY_BASIC_INFORMATION mbi_self = {};
@@ -1854,23 +1957,12 @@ ARC_API bool arc_init(
         {
             image_base = reinterpret_cast<uint64_t>(mbi_self.AllocationBase);
 
-            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(mbi_self.AllocationBase);
-            if (dos->e_magic == IMAGE_DOS_SIGNATURE)
-            {
-                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
-                    reinterpret_cast<const uint8_t*>(mbi_self.AllocationBase) + dos->e_lfanew);
-                if (nt->Signature == IMAGE_NT_SIGNATURE)
-                {
-                    image_size = static_cast<uint64_t>(nt->OptionalHeader.SizeOfImage);
-                }
-            }
-
-            uintptr_t scan_addr = static_cast<uintptr_t>(image_base);
-            uintptr_t scan_limit = scan_addr + (image_size != 0
-                ? static_cast<uintptr_t>(image_size)
-                : static_cast<uintptr_t>(256ULL * 1024 * 1024));
+            constexpr uint64_t kMaxImageScan = 256ULL * 1024 * 1024;
             constexpr DWORD exec_mask = PAGE_EXECUTE | PAGE_EXECUTE_READ
                 | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+
+            uintptr_t scan_addr = static_cast<uintptr_t>(image_base);
+            const uintptr_t scan_limit = scan_addr + static_cast<uintptr_t>(kMaxImageScan);
 
             while (scan_addr < scan_limit)
             {
@@ -1881,13 +1973,15 @@ ARC_API bool arc_init(
                     break;
                 if (r.AllocationBase != mbi_self.AllocationBase)
                     break;
-                if (r.State == MEM_COMMIT && (r.Protect & exec_mask))
+
+                if (text_va == 0 && r.State == MEM_COMMIT && (r.Protect & exec_mask))
                 {
                     text_va = reinterpret_cast<uint64_t>(r.BaseAddress);
                     text_size = static_cast<uint64_t>(r.RegionSize);
-                    break;
                 }
+
                 scan_addr += r.RegionSize;
+                image_size = static_cast<uint64_t>(scan_addr) - image_base;
             }
         }
 
@@ -1897,10 +1991,6 @@ ARC_API bool arc_init(
                     static_cast<uint32_t>(text_size), code_hash_capture, 2000))
             {
                 arc_log("driver", "register_dll_protection_failed");
-            }
-            if (!dev->canary_register(text_va, text_size))
-            {
-                arc_log("driver", "canary_register_failed");
             }
         }
         else
@@ -1981,7 +2071,14 @@ ARC_API uint64_t arc_validate_tool_exec(
         memcpy(buf + 32, &sess.vtable_crypt_key, 8);
 
         uint8_t mac[32] = {};
-        if (!hmac_sha256_full(g_bind_secret, 32, buf, sizeof(buf), mac))
+        uint8_t local_secret[32] = {};
+        {
+            std::lock_guard<std::mutex> bs_lk(g_bind_secret_mtx);
+            bind_secret_obf_load_unlocked(local_secret);
+        }
+        const bool hmac_ok = hmac_sha256_full(local_secret, 32, buf, sizeof(buf), mac);
+        SecureZeroMemory(local_secret, sizeof(local_secret));
+        if (!hmac_ok)
         {
             SecureZeroMemory(mac, sizeof(mac));
             SecureZeroMemory(&sess, sizeof(sess));
@@ -2111,8 +2208,15 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
         msg.append("|0000000000000000");
 
         uint8_t mac[32] = {};
-        if (!hmac_sha256_full(g_bind_secret, 32,
-                reinterpret_cast<const uint8_t*>(msg.data()), msg.size(), mac))
+        uint8_t local_secret[32] = {};
+        {
+            std::lock_guard<std::mutex> bs_lk(g_bind_secret_mtx);
+            bind_secret_obf_load_unlocked(local_secret);
+        }
+        const bool hmac_ok = hmac_sha256_full(local_secret, 32,
+                reinterpret_cast<const uint8_t*>(msg.data()), msg.size(), mac);
+        SecureZeroMemory(local_secret, sizeof(local_secret));
+        if (!hmac_ok)
         {
             SecureZeroMemory(mac, sizeof(mac));
             SecureZeroMemory(&sess, sizeof(sess));
@@ -2472,16 +2576,22 @@ ARC_API bool arc_unseal_feature(
     if (check_debugger()) { enforce_violation("arc_debugger", "unseal_feature"); }
     if (!load_bind_secret()) return false;
 
-    auto* hdr = reinterpret_cast<const feature_blob_header_t*>(g_feature_blob);
+    uint8_t feature_blob[sizeof(g_feature_blob)] = {};
+    for (uint32_t i = 0; i < sizeof(feature_blob); ++i)
+    {
+        feature_blob[i] = static_cast<uint8_t>(g_feature_blob[i]);
+    }
+
+    auto* hdr = reinterpret_cast<const feature_blob_header_t*>(feature_blob);
     if (hdr->magic != kFeatureMagic) return false;
     if (hdr->version != 1u) return false;
-    if (hdr->total_size > sizeof(g_feature_blob)) return false;
+    if (hdr->total_size > sizeof(feature_blob)) return false;
     if (hdr->entry_count == 0u || hdr->entry_count > 16u) return false;
 
     const auto* entries = reinterpret_cast<const feature_entry_header_t*>(
-        g_feature_blob + sizeof(feature_blob_header_t));
+        feature_blob + sizeof(feature_blob_header_t));
     const uint32_t entries_size = hdr->entry_count * sizeof(feature_entry_header_t);
-    if (sizeof(feature_blob_header_t) + entries_size > sizeof(g_feature_blob)) return false;
+    if (sizeof(feature_blob_header_t) + entries_size > sizeof(feature_blob)) return false;
 
     const feature_entry_header_t* match = nullptr;
     for (uint32_t i = 0; i < hdr->entry_count; ++i)
@@ -2494,7 +2604,7 @@ ARC_API bool arc_unseal_feature(
     }
     if (!match) return false;
     if (match->ciphertext_len == 0u || match->ciphertext_len > kFeatureEntryMaxLen) return false;
-    if (match->ciphertext_offset + match->ciphertext_len > sizeof(g_feature_blob)) return false;
+    if (match->ciphertext_offset + match->ciphertext_len > sizeof(feature_blob)) return false;
     if (match->ciphertext_len > out_cap) return false;
 
     char info[64];
@@ -2503,17 +2613,24 @@ ARC_API bool arc_unseal_feature(
     if (info_len <= 0) return false;
 
     uint8_t feature_key[32] = {};
-    if (!hkdf_sha256(g_bind_secret, 32,
+    uint8_t local_secret[32] = {};
+    {
+        std::lock_guard<std::mutex> bs_lk(g_bind_secret_mtx);
+        bind_secret_obf_load_unlocked(local_secret);
+    }
+    const bool hkdf_ok = hkdf_sha256(local_secret, 32,
             nonce, nonce_len,
             reinterpret_cast<const uint8_t*>(info), static_cast<uint32_t>(info_len),
-            feature_key, 32))
+            feature_key, 32);
+    SecureZeroMemory(local_secret, sizeof(local_secret));
+    if (!hkdf_ok)
     {
         SecureZeroMemory(feature_key, 32);
         return false;
     }
 
     bool ok = aes_gcm_decrypt_ni(
-        g_feature_blob + match->ciphertext_offset,
+        feature_blob + match->ciphertext_offset,
         match->ciphertext_len,
         feature_key,
         match->iv,

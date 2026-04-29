@@ -4,6 +4,7 @@
 #include "arc_loader.hpp"
 
 #include <windows.h>
+#include <winternl.h>
 #include <bcrypt.h>
 #include <cstring>
 #include <cctype>
@@ -16,6 +17,7 @@
 namespace
 {
     std::string g_last_error;
+    bool g_last_error_fatal = false;
 
     inline uint64_t splitmix64_step(uint64_t& s)
     {
@@ -137,7 +139,17 @@ namespace
     void set_error_text(const std::string& msg)
     {
         g_last_error = msg;
+        g_last_error_fatal = false;
         OutputDebugStringA("ARC Loader: ");
+        OutputDebugStringA(msg.c_str());
+        OutputDebugStringA("\n");
+    }
+
+    void set_error_fatal(const std::string& msg)
+    {
+        g_last_error = msg;
+        g_last_error_fatal = true;
+        OutputDebugStringA("ARC Loader (FATAL): ");
         OutputDebugStringA(msg.c_str());
         OutputDebugStringA("\n");
     }
@@ -145,6 +157,17 @@ namespace
     void set_error(const char* msg)
     {
         set_error_text(msg ? std::string(msg) : std::string());
+    }
+
+    bool safe_read_bytes_seh(const uint8_t* src, uint8_t* dst, size_t n)
+    {
+        __try {
+            for (size_t k = 0; k < n; ++k) dst[k] = src[k];
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
     }
 
     void arc_breadcrumb(const char* tag)
@@ -718,6 +741,20 @@ namespace
 
         const auto* sec = IMAGE_FIRST_SECTION(nt);
         const size_t image_size = nt->OptionalHeader.SizeOfImage;
+        auto overlaps_section = [&](uint64_t begin, uint64_t end) -> bool {
+            for (WORD j = 0; j < nt->FileHeader.NumberOfSections; ++j) {
+                size_t other_size = sec[j].Misc.VirtualSize;
+                if (other_size == 0)
+                    other_size = sec[j].SizeOfRawData;
+                if (other_size == 0)
+                    continue;
+                uint64_t other_begin = sec[j].VirtualAddress;
+                uint64_t other_end = other_begin + ((static_cast<uint64_t>(other_size) + (page_size - 1u)) & ~(static_cast<uint64_t>(page_size) - 1u));
+                if (begin < other_end && end > other_begin)
+                    return true;
+            }
+            return false;
+        };
         for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
             uint32_t va = sec[i].VirtualAddress;
             if (va < 2u * page_size)
@@ -729,9 +766,12 @@ namespace
             if (sec_size == 0)
                 continue;
 
-            uint8_t* leading = image_base + va - page_size;
-            if (VirtualFree(leading, page_size, MEM_DECOMMIT)) {
-                VirtualAlloc(leading, page_size, MEM_COMMIT, PAGE_NOACCESS);
+            uint64_t leading_off = static_cast<uint64_t>(va) - page_size;
+            if (leading_off + page_size <= image_size && !overlaps_section(leading_off, leading_off + page_size)) {
+                uint8_t* leading = image_base + leading_off;
+                if (VirtualFree(leading, page_size, MEM_DECOMMIT)) {
+                    VirtualAlloc(leading, page_size, MEM_COMMIT, PAGE_NOACCESS);
+                }
             }
 
             const size_t aligned_size = (sec_size + (page_size - 1u)) & ~(page_size - 1u);
@@ -739,11 +779,37 @@ namespace
             if (trailing_off + page_size > image_size)
                 continue;
 
-            uint8_t* trailing = image_base + trailing_off;
-            if (VirtualFree(trailing, page_size, MEM_DECOMMIT)) {
-                VirtualAlloc(trailing, page_size, MEM_COMMIT, PAGE_NOACCESS);
+            if (!overlaps_section(trailing_off, trailing_off + page_size)) {
+                uint8_t* trailing = image_base + trailing_off;
+                if (VirtualFree(trailing, page_size, MEM_DECOMMIT)) {
+                    VirtualAlloc(trailing, page_size, MEM_COMMIT, PAGE_NOACCESS);
+                }
             }
         }
+    }
+
+    bool register_function_table(uint8_t* image_base, const IMAGE_NT_HEADERS* nt,
+                                  PRUNTIME_FUNCTION& out_table, uint32_t& out_count)
+    {
+        out_table = nullptr;
+        out_count = 0;
+        const auto& exception_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        if (exception_dir.VirtualAddress == 0 || exception_dir.Size < sizeof(RUNTIME_FUNCTION))
+            return false;
+        if (exception_dir.VirtualAddress + exception_dir.Size > nt->OptionalHeader.SizeOfImage)
+            return false;
+
+        auto* table = reinterpret_cast<PRUNTIME_FUNCTION>(image_base + exception_dir.VirtualAddress);
+        const uint32_t count = exception_dir.Size / static_cast<uint32_t>(sizeof(RUNTIME_FUNCTION));
+        if (count == 0)
+            return false;
+
+        if (!RtlAddFunctionTable(table, count, reinterpret_cast<DWORD64>(image_base)))
+            return false;
+
+        out_table = table;
+        out_count = count;
+        return true;
     }
 
     void* find_export(uint8_t* image_base, const IMAGE_NT_HEADERS* nt, const char* name)
@@ -787,6 +853,7 @@ namespace arc_loader
     {
         loaded_module_t result{};
         g_last_error.clear();
+        g_last_error_fatal = false;
 
         arc_breadcrumb("load_enter");
 
@@ -855,11 +922,23 @@ namespace arc_loader
 
         arc_breadcrumb("load_finalize_ok");
 
+        PRUNTIME_FUNCTION ft_table = nullptr;
+        uint32_t ft_count = 0;
+        if (register_function_table(image_base, mapped_nt, ft_table, ft_count)) {
+            char ftbuf[96];
+            _snprintf_s(ftbuf, sizeof(ftbuf), _TRUNCATE,
+                "load_function_table_ok entries=%u", ft_count);
+            arc_breadcrumb(ftbuf);
+        } else {
+            arc_breadcrumb("load_function_table_skipped");
+        }
+
         install_guard_pages(image_base, mapped_nt);
 
         arc_breadcrumb("load_guard_pages_ok");
 
         if (!process_tls(image_base, mapped_nt)) {
+            if (ft_table) RtlDeleteFunctionTable(ft_table);
             VirtualFree(image_base, 0, MEM_RELEASE);
             return result;
         }
@@ -873,6 +952,31 @@ namespace arc_loader
         using DllMain_t = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
         auto entry_point = reinterpret_cast<DllMain_t>(
             image_base + mapped_nt->OptionalHeader.AddressOfEntryPoint);
+
+        {
+            const uint8_t* ep_bytes = reinterpret_cast<const uint8_t*>(entry_point);
+            uint8_t b[16] = {};
+            const bool ep_readable = safe_read_bytes_seh(ep_bytes, b, 16);
+            char ep_dbg[256];
+            if (!ep_readable) {
+                _snprintf_s(ep_dbg, sizeof(ep_dbg), _TRUNCATE,
+                    "load_dllmain_entry_unreadable ep=%p rva=0x%X",
+                    static_cast<void*>(entry_point),
+                    static_cast<unsigned>(mapped_nt->OptionalHeader.AddressOfEntryPoint));
+                arc_breadcrumb(ep_dbg);
+                set_error("ARC entry_point address is not readable.");
+                if (ft_table) RtlDeleteFunctionTable(ft_table);
+                VirtualFree(image_base, 0, MEM_RELEASE);
+                return result;
+            }
+            _snprintf_s(ep_dbg, sizeof(ep_dbg), _TRUNCATE,
+                "load_dllmain_entry ep=%p rva=0x%X first16=%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+                static_cast<void*>(entry_point),
+                static_cast<unsigned>(mapped_nt->OptionalHeader.AddressOfEntryPoint),
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+            arc_breadcrumb(ep_dbg);
+        }
 
         arc_breadcrumb("load_dllmain_pre");
 
@@ -901,21 +1005,88 @@ namespace arc_loader
             arc_breadcrumb("load_dllmain_watchdog_spawned");
         }
 
-        BOOL dll_result = FALSE;
-        __try {
-            dll_result = entry_point(
-                reinterpret_cast<HINSTANCE>(image_base),
-                DLL_PROCESS_ATTACH,
-                nullptr);
+        constexpr size_t kPebImageBaseOffset = 0x10;
+        auto* peb_bytes = reinterpret_cast<uint8_t*>(NtCurrentTeb()->ProcessEnvironmentBlock);
+        auto** peb_image_base_slot = reinterpret_cast<void**>(peb_bytes + kPebImageBaseOffset);
+        void* saved_peb_image_base = *peb_image_base_slot;
+
+        {
+            char pbuf[160];
+            _snprintf_s(pbuf, sizeof(pbuf), _TRUNCATE,
+                "load_dllmain_peb_image_base host=%p arc_target=%p",
+                saved_peb_image_base,
+                static_cast<void*>(image_base));
+            arc_breadcrumb(pbuf);
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            set_error("DllMain threw an exception during DLL_PROCESS_ATTACH.");
-            arc_breadcrumb("load_dllmain_seh_caught");
-            InterlockedExchange(&wd_ctx.done, 1);
-            if (wd_thread) { WaitForSingleObject(wd_thread, 2000); CloseHandle(wd_thread); }
-            VirtualFree(image_base, 0, MEM_RELEASE);
-            return result;
+
+        *peb_image_base_slot = static_cast<void*>(image_base);
+        arc_breadcrumb("load_dllmain_peb_swap_in");
+
+        struct dllmain_invoker_ctx_t {
+            DllMain_t entry;
+            uint8_t* base;
+            volatile LONG completed;
+            volatile LONG seh_caught;
+            volatile DWORD seh_code;
+            BOOL result;
+        };
+        auto* inv_ctx = new dllmain_invoker_ctx_t{
+            entry_point, image_base, 0, 0, 0, FALSE };
+
+        auto inv_thread_proc = [](LPVOID p) -> DWORD {
+            auto* c = reinterpret_cast<dllmain_invoker_ctx_t*>(p);
+            BOOL ok = FALSE;
+            __try {
+                ok = c->entry(
+                    reinterpret_cast<HINSTANCE>(c->base),
+                    DLL_PROCESS_ATTACH,
+                    nullptr);
+            }
+            __except (c->seh_code = GetExceptionCode(),
+                      InterlockedExchange(&c->seh_caught, 1),
+                      EXCEPTION_EXECUTE_HANDLER) {
+                ok = FALSE;
+            }
+            c->result = ok;
+            InterlockedExchange(&c->completed, 1);
+            return 0;
+        };
+
+        DWORD inv_tid = 0;
+        HANDLE inv_thread = CreateThread(nullptr, 0, inv_thread_proc, inv_ctx, 0, &inv_tid);
+
+        const ULONGLONG kDllMainBudgetMs = 20000ull;
+        bool timed_out = false;
+        bool inline_path = false;
+
+        if (inv_thread == nullptr) {
+            char tbuf[160];
+            _snprintf_s(tbuf, sizeof(tbuf), _TRUNCATE,
+                "load_dllmain_thread_create_FAILED_err=%lu_falling_back_inline_tid=%lu",
+                (unsigned long)GetLastError(),
+                (unsigned long)GetCurrentThreadId());
+            arc_breadcrumb(tbuf);
+            inline_path = true;
+            arc_breadcrumb("load_dllmain_inline_pre");
+            inv_thread_proc(inv_ctx);
+            arc_breadcrumb("load_dllmain_inline_post");
+        } else {
+            char tbuf[96];
+            _snprintf_s(tbuf, sizeof(tbuf), _TRUNCATE,
+                "load_dllmain_thread_spawned tid=%lu", (unsigned long)inv_tid);
+            arc_breadcrumb(tbuf);
+            DWORD wait = WaitForSingleObject(inv_thread, static_cast<DWORD>(kDllMainBudgetMs));
+            if (wait != WAIT_OBJECT_0 ||
+                InterlockedCompareExchange(&inv_ctx->completed, 0, 0) == 0) {
+                timed_out = true;
+            } else {
+                CloseHandle(inv_thread);
+            }
         }
+
+        *peb_image_base_slot = saved_peb_image_base;
+        arc_breadcrumb("load_dllmain_peb_swap_out");
+
         InterlockedExchange(&wd_ctx.done, 1);
         if (wd_thread) {
             WaitForSingleObject(wd_thread, 2000);
@@ -923,6 +1094,42 @@ namespace arc_loader
         }
 
         ULONGLONG dllmain_elapsed = GetTickCount64() - wd_ctx.start_tick;
+
+        if (timed_out) {
+            char tobuf[160];
+            _snprintf_s(tobuf, sizeof(tobuf), _TRUNCATE,
+                "load_dllmain_timeout_after_ms=%llu budget_ms=%llu",
+                (unsigned long long)dllmain_elapsed,
+                (unsigned long long)kDllMainBudgetMs);
+            arc_breadcrumb(tobuf);
+            set_error_fatal("ARC DllMain did not return within the activation budget.");
+            return result;
+        }
+
+        const BOOL dll_result = inv_ctx->result;
+        const bool seh = InterlockedCompareExchange(&inv_ctx->seh_caught, 0, 0) != 0;
+        const DWORD seh_code = inv_ctx->seh_code;
+        delete inv_ctx;
+        inv_ctx = nullptr;
+        (void)inline_path;
+
+        if (seh) {
+            char sehbuf[160];
+            _snprintf_s(sehbuf, sizeof(sehbuf), _TRUNCATE,
+                "load_dllmain_seh_caught code=0x%08X elapsed_ms=%llu",
+                static_cast<unsigned>(seh_code),
+                static_cast<unsigned long long>(dllmain_elapsed));
+            arc_breadcrumb(sehbuf);
+            char errbuf[160];
+            _snprintf_s(errbuf, sizeof(errbuf), _TRUNCATE,
+                "DllMain raised SEH exception 0x%08X during DLL_PROCESS_ATTACH.",
+                static_cast<unsigned>(seh_code));
+            set_error(errbuf);
+            if (ft_table) RtlDeleteFunctionTable(ft_table);
+            VirtualFree(image_base, 0, MEM_RELEASE);
+            return result;
+        }
+
         char post_tag[96];
         _snprintf_s(post_tag, sizeof(post_tag), _TRUNCATE, "load_dllmain_post_%s_elapsed=%llums",
             dll_result ? "ok" : "false", (unsigned long long)dllmain_elapsed);
@@ -930,6 +1137,7 @@ namespace arc_loader
 
         if (!dll_result) {
             set_error("DllMain returned FALSE.");
+            if (ft_table) RtlDeleteFunctionTable(ft_table);
             VirtualFree(image_base, 0, MEM_RELEASE);
             return result;
         }
@@ -937,6 +1145,7 @@ namespace arc_loader
         uint64_t binding_salt = 0;
         if (!generate_random_u64(binding_salt)) {
             set_error("BCryptGenRandom failed for binding salt.");
+            if (ft_table) RtlDeleteFunctionTable(ft_table);
             VirtualFree(image_base, 0, MEM_RELEASE);
             return result;
         }
@@ -947,6 +1156,7 @@ namespace arc_loader
         uint64_t image_path_hash = 0;
         if (!hash_image_path(k0, k1, image_path_hash)) {
             set_error("QueryFullProcessImageNameW failed for binding hash.");
+            if (ft_table) RtlDeleteFunctionTable(ft_table);
             VirtualFree(image_base, 0, MEM_RELEASE);
             return result;
         }
@@ -955,23 +1165,26 @@ namespace arc_loader
         if (!hash_loader_code(k0, k1, reinterpret_cast<const void*>(&load),
                               loader_code_hash)) {
             set_error("Loader code hash sampling faulted.");
+            if (ft_table) RtlDeleteFunctionTable(ft_table);
             VirtualFree(image_base, 0, MEM_RELEASE);
             return result;
         }
 
         arc_breadcrumb("load_binding_hashes_ok");
 
-        result.base             = image_base;
-        result.image_size       = image_size;
-        result.header_size      = header_size_capture;
-        result.entry_point      = image_base + mapped_nt->OptionalHeader.AddressOfEntryPoint;
-        result.initialized      = true;
-        result.sealed           = false;
-        result.owning_pid       = GetCurrentProcessId();
-        result.image_path_hash  = image_path_hash;
-        result.loader_code_hash = loader_code_hash;
-        result.binding_salt     = binding_salt;
-        result.auto_seal_timer  = nullptr;
+        result.base                 = image_base;
+        result.image_size           = image_size;
+        result.header_size          = header_size_capture;
+        result.entry_point          = image_base + mapped_nt->OptionalHeader.AddressOfEntryPoint;
+        result.initialized          = true;
+        result.sealed               = false;
+        result.owning_pid           = GetCurrentProcessId();
+        result.image_path_hash      = image_path_hash;
+        result.loader_code_hash     = loader_code_hash;
+        result.binding_salt         = binding_salt;
+        result.auto_seal_timer      = nullptr;
+        result.function_table       = ft_table;
+        result.function_table_count = ft_count;
 
         arc_breadcrumb("load_exit_ok");
         return result;
@@ -1121,6 +1334,12 @@ namespace arc_loader
         }
 
 
+        if (mod.function_table != nullptr) {
+            RtlDeleteFunctionTable(static_cast<PRUNTIME_FUNCTION>(mod.function_table));
+            mod.function_table = nullptr;
+            mod.function_table_count = 0;
+        }
+
         __try {
             SecureZeroMemory(mod.base, mod.image_size);
         }
@@ -1129,22 +1348,29 @@ namespace arc_loader
         }
         VirtualFree(mod.base, 0, MEM_RELEASE);
 
-        mod.base             = nullptr;
-        mod.image_size       = 0;
-        mod.header_size      = 0;
-        mod.entry_point      = nullptr;
-        mod.initialized      = false;
-        mod.sealed           = false;
-        mod.owning_pid       = 0;
-        mod.image_path_hash  = 0;
-        mod.loader_code_hash = 0;
-        mod.binding_salt     = 0;
-        mod.auto_seal_timer  = nullptr;
+        mod.base                 = nullptr;
+        mod.image_size           = 0;
+        mod.header_size          = 0;
+        mod.entry_point          = nullptr;
+        mod.initialized          = false;
+        mod.sealed               = false;
+        mod.owning_pid           = 0;
+        mod.image_path_hash      = 0;
+        mod.loader_code_hash     = 0;
+        mod.binding_salt         = 0;
+        mod.auto_seal_timer      = nullptr;
+        mod.function_table       = nullptr;
+        mod.function_table_count = 0;
     }
 
     const std::string& last_error()
     {
         return g_last_error;
+    }
+
+    bool last_error_is_fatal()
+    {
+        return g_last_error_fatal;
     }
 
     void prime_import_cache()

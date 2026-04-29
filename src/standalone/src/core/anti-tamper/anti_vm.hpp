@@ -282,6 +282,9 @@ inline vm_report_t full_scan()
 {
     vm_report_t report{};
 
+    report.summary = "anti_vm_disabled";
+    return report;
+
     if (hv_preflight::g_ms_hv_approved) {
         report.summary = "ms_hv_approved_by_preflight";
         return report;

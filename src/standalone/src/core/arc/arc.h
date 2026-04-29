@@ -11,7 +11,7 @@
 #endif
 
 
-static constexpr uint32_t ARC_INTERFACE_VERSION = 0x00010001u;
+static constexpr uint32_t ARC_INTERFACE_VERSION = 0x00010002u;
 
 
 struct arc_comm_vtable_t
@@ -109,6 +109,12 @@ struct arc_page_result_t
 
 extern "C"
 {
+
+
+    ARC_API bool arc_bind_driver_device(
+        void*    driver_device,
+        uint32_t interface_version
+    );
 
 
     ARC_API bool arc_init(
