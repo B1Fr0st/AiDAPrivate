@@ -19,6 +19,7 @@ $files = @(
     "routes\telemetry.js",
     "crypto\signing.js",
     "crypto\arc-encrypt.js",
+    "crypto\arc-license-bind.js",
     "crypto\kw_wrap.js",
     "crypto\tls_exporter.js",
     "db\pool.js",

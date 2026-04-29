@@ -127,6 +127,8 @@ extern "C"
 
     ARC_API void arc_set_key_seed(const uint8_t* key_seed, uint32_t len);
 
+    ARC_API uint32_t arc_copy_last_status(char* out, uint32_t cap);
+
     ARC_API bool arc_unseal_feature(
         uint32_t       feature_id,
         const uint8_t* nonce,

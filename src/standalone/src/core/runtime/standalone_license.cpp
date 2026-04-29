@@ -1872,6 +1872,7 @@ namespace
     using arc_cleanup_fn            = void(*)();
     using arc_set_key_seed_fn       = void(*)(const uint8_t*, uint32_t);
     using arc_unseal_feature_fn     = bool(*)(uint32_t, const uint8_t*, uint32_t, uint8_t*, uint32_t*, uint32_t);
+    using arc_copy_last_status_fn   = uint32_t(*)(char*, uint32_t);
 
     arc_init_fn               s_fn_arc_init               = nullptr;
     arc_bind_driver_device_fn s_fn_arc_bind_driver_device = nullptr;
@@ -1881,6 +1882,7 @@ namespace
     arc_cleanup_fn            s_fn_arc_cleanup            = nullptr;
     arc_set_key_seed_fn       s_fn_arc_set_key_seed       = nullptr;
     arc_unseal_feature_fn     s_fn_arc_unseal_feature     = nullptr;
+    arc_copy_last_status_fn   s_fn_arc_copy_last_status   = nullptr;
 
     std::string s_challenge_id;
     std::string s_challenge_nonce;
@@ -3653,6 +3655,8 @@ namespace
                 arc_loader::get_export(s_arc_module, "arc_set_key_seed"));
             s_fn_arc_unseal_feature = reinterpret_cast<arc_unseal_feature_fn>(
                 arc_loader::get_export(s_arc_module, "arc_unseal_feature"));
+            s_fn_arc_copy_last_status = reinterpret_cast<arc_copy_last_status_fn>(
+                arc_loader::get_export(s_arc_module, "arc_copy_last_status"));
 
             if (!s_fn_arc_init || !s_fn_arc_bind_driver_device || !s_fn_arc_get_comm_bridge ||
                 !s_fn_arc_validate_tool || !s_fn_arc_heartbeat || !s_fn_arc_cleanup ||
@@ -3667,6 +3671,7 @@ namespace
                 s_fn_arc_cleanup = nullptr;
                 s_fn_arc_set_key_seed = nullptr;
                 s_fn_arc_unseal_feature = nullptr;
+                s_fn_arc_copy_last_status = nullptr;
                 return false;
             }
 
@@ -3683,6 +3688,7 @@ namespace
                 s_fn_arc_cleanup = nullptr;
                 s_fn_arc_set_key_seed = nullptr;
                 s_fn_arc_unseal_feature = nullptr;
+                s_fn_arc_copy_last_status = nullptr;
                 return false;
             }
 
@@ -3697,6 +3703,7 @@ namespace
                 s_fn_arc_cleanup = nullptr;
                 s_fn_arc_set_key_seed = nullptr;
                 s_fn_arc_unseal_feature = nullptr;
+                s_fn_arc_copy_last_status = nullptr;
                 return false;
             }
 
@@ -3711,6 +3718,7 @@ namespace
                 s_fn_arc_cleanup = nullptr;
                 s_fn_arc_set_key_seed = nullptr;
                 s_fn_arc_unseal_feature = nullptr;
+                s_fn_arc_copy_last_status = nullptr;
                 return false;
             }
 
@@ -3731,6 +3739,7 @@ namespace
                 s_fn_arc_cleanup = nullptr;
                 s_fn_arc_set_key_seed = nullptr;
                 s_fn_arc_unseal_feature = nullptr;
+                s_fn_arc_copy_last_status = nullptr;
                 return false;
             }
 
@@ -3748,6 +3757,7 @@ namespace
                 s_fn_arc_cleanup = nullptr;
                 s_fn_arc_set_key_seed = nullptr;
                 s_fn_arc_unseal_feature = nullptr;
+                s_fn_arc_copy_last_status = nullptr;
                 return false;
             }
             bind_proof_bytes = hex_decode(settings.license_bind_proof);
@@ -3764,6 +3774,7 @@ namespace
                 s_fn_arc_cleanup = nullptr;
                 s_fn_arc_set_key_seed = nullptr;
                 s_fn_arc_unseal_feature = nullptr;
+                s_fn_arc_copy_last_status = nullptr;
                 return false;
             }
 
@@ -3788,6 +3799,7 @@ namespace
                 s_fn_arc_cleanup = nullptr;
                 s_fn_arc_set_key_seed = nullptr;
                 s_fn_arc_unseal_feature = nullptr;
+                s_fn_arc_copy_last_status = nullptr;
                 return false;
             }
 
@@ -3820,29 +3832,8 @@ namespace
                 s_fn_arc_cleanup = nullptr;
                 s_fn_arc_set_key_seed = nullptr;
                 s_fn_arc_unseal_feature = nullptr;
+                s_fn_arc_copy_last_status = nullptr;
                 return false;
-            }
-
-            s_arc_loaded = true;
-            set_arc_obfuscated_state(true);
-
-            settings.license_arc_load_ok = true;
-            settings.save();
-            log_arc_status("arc_load_ok_disk_cache_marked");
-
-            try
-            {
-                anti_tamper::finalize_after_activation();
-                log_arc_status("anti_tamper_finalize_after_activation_done");
-            }
-            catch (const std::exception& ex)
-            {
-                std::string m = std::string("anti_tamper_finalize_exception: ") + ex.what();
-                log_arc_status(m.c_str());
-            }
-            catch (...)
-            {
-                log_arc_status("anti_tamper_finalize_unknown_exception");
             }
 
             if (s_fn_arc_set_key_seed && !settings.license_key_seed.empty())
@@ -3853,6 +3844,16 @@ namespace
                     SecureZeroMemory(seed_bytes.data(), seed_bytes.size());
                 }
             }
+
+            auto copy_arc_status = [&]() -> std::string {
+                if (!s_fn_arc_copy_last_status)
+                    return {};
+                char status[192] = {};
+                uint32_t copied = s_fn_arc_copy_last_status(status, static_cast<uint32_t>(sizeof(status)));
+                if (copied == 0)
+                    return {};
+                return std::string(status);
+            };
 
             {
                 uint8_t gate_nonce[32] = {};
@@ -3874,6 +3875,11 @@ namespace
                 if (!unseal_ok || poly_seed_len != 32) {
                     SecureZeroMemory(poly_seed, sizeof(poly_seed));
                     SecureZeroMemory(gate_nonce, sizeof(gate_nonce));
+                    std::string arc_status = copy_arc_status();
+                    if (!arc_status.empty()) {
+                        std::string detail = std::string("arc_startup_gate_unseal_detail:") + arc_status;
+                        log_arc_status(detail.c_str());
+                    }
                     log_arc_status("arc_startup_gate_failed_unseal");
                     __fastfail(0xA1DAFA17u);
                 }
@@ -3919,6 +3925,28 @@ namespace
                 log_arc_status("arc_startup_gate_ok");
             }
 
+            s_arc_loaded = true;
+            set_arc_obfuscated_state(true);
+
+            settings.license_arc_load_ok = true;
+            settings.save();
+            log_arc_status("arc_load_ok_disk_cache_marked");
+
+            try
+            {
+                anti_tamper::finalize_after_activation();
+                log_arc_status("anti_tamper_finalize_after_activation_done");
+            }
+            catch (const std::exception& ex)
+            {
+                std::string m = std::string("anti_tamper_finalize_exception: ") + ex.what();
+                log_arc_status(m.c_str());
+            }
+            catch (...)
+            {
+                log_arc_status("anti_tamper_finalize_unknown_exception");
+            }
+
             return true;
 
         } catch (...) {
@@ -3944,6 +3972,7 @@ namespace
         s_fn_arc_cleanup = nullptr;
         s_fn_arc_set_key_seed = nullptr;
         s_fn_arc_unseal_feature = nullptr;
+        s_fn_arc_copy_last_status = nullptr;
         s_arc_loaded = false;
         set_arc_obfuscated_state(false);
     }

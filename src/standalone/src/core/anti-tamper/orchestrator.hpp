@@ -4,6 +4,7 @@
 #include <psapi.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -245,26 +246,61 @@ inline bool initialize()
         }
 
         void* canary = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        {
+            char dbg[192];
+            std::snprintf(dbg, sizeof(dbg), "canary_alloc_result va=%p gle=%lu", canary, canary ? 0ul : GetLastError());
+            webhook::write_log("init", dbg);
+        }
         if (canary != nullptr)
         {
             auto* canary_bytes = static_cast<unsigned char*>(canary);
             ULONGLONG canary_seed = GetTickCount64()
                 ^ static_cast<ULONGLONG>(reinterpret_cast<ULONG_PTR>(canary))
                 ^ (static_cast<ULONGLONG>(GetCurrentProcessId()) << 32);
+            ULONGLONG initial_canary_seed = canary_seed;
             for (size_t index = 0; index < 4096; ++index)
             {
                 canary_seed = canary_seed * 2862933555777941757ULL + 3037000493ULL;
                 canary_bytes[index] = static_cast<unsigned char>(canary_seed >> 33);
             }
 
-            if (VirtualLock(canary, 4096) && driver_bridge::canary_register(canary, 4096))
+            BOOL lock_ok = VirtualLock(canary, 4096);
+            DWORD lock_error = lock_ok ? 0 : GetLastError();
+            bool register_ok = false;
+            if (lock_ok)
+                register_ok = driver_bridge::canary_register(canary, 4096);
+            DWORD register_error = register_ok ? 0 : GetLastError();
+            {
+                char dbg[256];
+                std::snprintf(dbg, sizeof(dbg), "canary_stage va=%p pid=%lu seed=0x%llx lock=%d lock_err=%lu register=%d register_err=%lu",
+                    canary,
+                    GetCurrentProcessId(),
+                    static_cast<unsigned long long>(initial_canary_seed),
+                    lock_ok ? 1 : 0,
+                    lock_error,
+                    register_ok ? 1 : 0,
+                    register_error);
+                webhook::write_log("init", dbg);
+            }
+
+            if (lock_ok && register_ok)
             {
                 DWORD old_protect = 0;
-                VirtualProtect(canary, 4096, PAGE_NOACCESS, &old_protect);
+                BOOL protect_ok = VirtualProtect(canary, 4096, PAGE_NOACCESS, &old_protect);
+                {
+                    char dbg[224];
+                    std::snprintf(dbg, sizeof(dbg), "canary_protect va=%p protect=%d old=0x%lx err=%lu",
+                        canary,
+                        protect_ok ? 1 : 0,
+                        old_protect,
+                        protect_ok ? 0ul : GetLastError());
+                    webhook::write_log("init", dbg);
+                }
                 rt.canary_page = canary;
             }
             else
             {
+                webhook::write_log("init", "canary_cleanup_after_failed_stage");
                 VirtualUnlock(canary, 4096);
                 SecureZeroMemory(canary, 4096);
                 VirtualFree(canary, 0, MEM_RELEASE);

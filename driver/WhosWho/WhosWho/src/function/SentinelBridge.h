@@ -406,6 +406,21 @@ namespace sentinel_bridge {
             now_tsc, start, elapsed, GRACE_TSC);
 
         if (elapsed < GRACE_TSC) {
+            ULONG queued_raw_cmd = static_cast<ULONG>(_InterlockedCompareExchange(
+                reinterpret_cast<volatile LONG*>(&g_bridge.sentinel_cmd), 0, 0));
+            ULONG queued_raw_param = static_cast<ULONG>(_InterlockedCompareExchange(
+                reinterpret_cast<volatile LONG*>(&g_bridge.sentinel_cmd_param), 0, 0));
+            if (queued_raw_cmd != 0) {
+                ULONG queued_cmd = 0;
+                ULONG queued_param = 0;
+                bridge_decrypt_cmd(queued_raw_cmd, queued_raw_param, queued_cmd, queued_param);
+                WW_LOG("watchdog_dpc: grace queued command raw_cmd=0x%lx raw_param=0x%lx cmd=%lu param=0x%lx key=0x%llx",
+                    queued_raw_cmd,
+                    queued_raw_param,
+                    queued_cmd,
+                    queued_param,
+                    static_cast<unsigned long long>(g_bridge_crypt_key));
+            }
             WW_LOG("watchdog_dpc: still in grace period (%lld < %lld), skipping",
                 elapsed, GRACE_TSC);
             return;
@@ -431,10 +446,26 @@ namespace sentinel_bridge {
             if (raw_cmd != 0) {
                 ULONG cmd = 0, param = 0;
                 bridge_decrypt_cmd(raw_cmd, raw_param, cmd, param);
+                WW_LOG("watchdog_dpc: raw command raw_cmd=0x%lx raw_param=0x%lx cmd=%lu param=0x%lx key=0x%llx",
+                    raw_cmd,
+                    raw_param,
+                    cmd,
+                    param,
+                    static_cast<unsigned long long>(g_bridge_crypt_key));
                 if (cmd != BRIDGE_CMD_NONE) {
                     WW_LOG("watchdog_dpc: Sentinel command=%lu param=0x%lx", cmd, param);
 
                     if (cmd == BRIDGE_CMD_DMA_CANARY_HIT) {
+                        WW_LOG("watchdog_dpc: BUGCHECK_DMA_CANARY_HIT code=0x%lx cmd=%lu param_pid=%lu raw_cmd=0x%lx raw_param=0x%lx bridge=%p sentinel_tsc=%lld last=%lld elapsed=%lld",
+                            BUGCHECK_DMA_CANARY_HIT,
+                            cmd,
+                            param,
+                            raw_cmd,
+                            raw_param,
+                            &g_bridge,
+                            current_sentinel_tsc,
+                            last,
+                            elapsed);
                         if (_KeBugCheckEx)
                             _KeBugCheckEx(BUGCHECK_DMA_CANARY_HIT, cmd, param, 0, 0);
                     }

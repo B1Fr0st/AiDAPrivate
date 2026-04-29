@@ -27,9 +27,19 @@
 namespace arc_internal
 {
 
+static std::mutex g_last_status_mtx;
+static char g_last_status[192] = {};
+
+static void arc_store_status(const char* tag, const char* msg)
+{
+    std::lock_guard<std::mutex> lk(g_last_status_mtx);
+    _snprintf_s(g_last_status, sizeof(g_last_status), _TRUNCATE,
+        "%s:%s", tag ? tag : "", msg ? msg : "");
+}
 
 static void arc_log(const char* tag, const char* msg)
 {
+    arc_store_status(tag, msg);
 
     static WCHAR s_log_path[MAX_PATH] = {};
     static bool  s_path_ready = false;
@@ -135,6 +145,283 @@ uint64_t fnv1a_str(const char* s)
 {
     if (!s) return 0;
     return fnv1a(s, strlen(s));
+}
+
+DWORD arc_protect_base(DWORD protect)
+{
+    return protect & 0xFFu;
+}
+
+bool arc_is_exec_protect(DWORD protect)
+{
+    switch (arc_protect_base(protect))
+    {
+    case PAGE_EXECUTE:
+    case PAGE_EXECUTE_READ:
+    case PAGE_EXECUTE_READWRITE:
+    case PAGE_EXECUTE_WRITECOPY:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool arc_is_readable_protect(DWORD protect)
+{
+    switch (arc_protect_base(protect))
+    {
+    case PAGE_READONLY:
+    case PAGE_READWRITE:
+    case PAGE_WRITECOPY:
+    case PAGE_EXECUTE_READ:
+    case PAGE_EXECUTE_READWRITE:
+    case PAGE_EXECUTE_WRITECOPY:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool arc_is_writable_protect(DWORD protect)
+{
+    switch (arc_protect_base(protect))
+    {
+    case PAGE_READWRITE:
+    case PAGE_WRITECOPY:
+    case PAGE_EXECUTE_READWRITE:
+    case PAGE_EXECUTE_WRITECOPY:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool arc_is_stable_exec_region(const MEMORY_BASIC_INFORMATION& r)
+{
+    if (r.State != MEM_COMMIT)
+        return false;
+    if (!arc_is_exec_protect(r.Protect))
+        return false;
+    if (!arc_is_readable_protect(r.Protect))
+        return false;
+    if (arc_is_writable_protect(r.Protect))
+        return false;
+    if ((r.Protect & PAGE_GUARD) != 0)
+        return false;
+    if ((r.Protect & PAGE_NOACCESS) != 0)
+        return false;
+    return true;
+}
+
+const char* arc_protect_name(DWORD protect)
+{
+    switch (arc_protect_base(protect))
+    {
+    case PAGE_NOACCESS: return "NOACCESS";
+    case PAGE_READONLY: return "READONLY";
+    case PAGE_READWRITE: return "READWRITE";
+    case PAGE_WRITECOPY: return "WRITECOPY";
+    case PAGE_EXECUTE: return "EXECUTE";
+    case PAGE_EXECUTE_READ: return "EXECUTE_READ";
+    case PAGE_EXECUTE_READWRITE: return "EXECUTE_READWRITE";
+    case PAGE_EXECUTE_WRITECOPY: return "EXECUTE_WRITECOPY";
+    default: return "UNKNOWN";
+    }
+}
+
+uint64_t fnv1a_region_seh(const void* data, size_t len, bool& ok)
+{
+    ok = false;
+    uint64_t h = 14695981039346656037ULL;
+    const auto* p = static_cast<const uint8_t*>(data);
+    __try
+    {
+        for (size_t i = 0; i < len; ++i)
+        {
+            h ^= p[i];
+            h *= 1099511628211ULL;
+        }
+        ok = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        ok = false;
+        h = 0;
+    }
+    return h;
+}
+
+struct integrity_scan_result_t
+{
+    uint64_t hash;
+    uint32_t exec_regions;
+    uint32_t included_regions;
+    uint32_t mutable_exec_regions;
+    uint32_t unreadable_exec_regions;
+    uint32_t guarded_exec_regions;
+    uint32_t read_failures;
+};
+
+void arc_log_integrity_region(const char* phase, uint32_t index, const MEMORY_BASIC_INFORMATION& r,
+                              const char* decision, uint64_t region_hash)
+{
+    char line[256];
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+        "%s region[%u] base=%p size=0x%zX protect=0x%08lX/%s state=0x%08lX type=0x%08lX decision=%s hash=0x%016llX",
+        phase ? phase : "integrity",
+        index,
+        r.BaseAddress,
+        static_cast<size_t>(r.RegionSize),
+        static_cast<unsigned long>(r.Protect),
+        arc_protect_name(r.Protect),
+        static_cast<unsigned long>(r.State),
+        static_cast<unsigned long>(r.Type),
+        decision ? decision : "unknown",
+        static_cast<unsigned long long>(region_hash));
+    arc_log("integrity", line);
+}
+
+integrity_scan_result_t scan_own_code_integrity(bool log_regions, const char* phase)
+{
+    integrity_scan_result_t out{};
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery(reinterpret_cast<const void*>(&scan_own_code_integrity), &mbi, sizeof(mbi)) == 0)
+    {
+        if (log_regions)
+            arc_log("integrity", "scan_virtualquery_self_failed");
+        return out;
+    }
+    const auto hMod = static_cast<const uint8_t*>(mbi.AllocationBase);
+    if (!hMod)
+    {
+        if (log_regions)
+            arc_log("integrity", "scan_allocation_base_null");
+        return out;
+    }
+
+    uintptr_t addr = reinterpret_cast<uintptr_t>(hMod);
+    const uintptr_t scan_limit = addr + (256ULL * 1024 * 1024);
+    uint32_t region_index = 0;
+
+    while (addr < scan_limit)
+    {
+        MEMORY_BASIC_INFORMATION r = {};
+        if (VirtualQuery(reinterpret_cast<const void*>(addr), &r, sizeof(r)) == 0)
+            break;
+        if (r.RegionSize == 0)
+            break;
+        if (r.AllocationBase != mbi.AllocationBase)
+            break;
+
+        const bool exec = r.State == MEM_COMMIT && arc_is_exec_protect(r.Protect);
+        if (exec)
+        {
+            ++out.exec_regions;
+            const bool guarded = (r.Protect & PAGE_GUARD) != 0;
+            const bool readable = arc_is_readable_protect(r.Protect);
+            const bool writable = arc_is_writable_protect(r.Protect);
+            const size_t size = r.RegionSize;
+            if (guarded)
+            {
+                ++out.guarded_exec_regions;
+                if (log_regions)
+                    arc_log_integrity_region(phase, region_index, r, "skip_guarded_exec", 0);
+            }
+            else if (!readable)
+            {
+                ++out.unreadable_exec_regions;
+                if (log_regions)
+                    arc_log_integrity_region(phase, region_index, r, "skip_unreadable_exec", 0);
+            }
+            else if (writable)
+            {
+                ++out.mutable_exec_regions;
+                if (log_regions)
+                    arc_log_integrity_region(phase, region_index, r, "skip_mutable_exec", 0);
+            }
+            else if (size > 0 && size < 64ULL * 1024 * 1024)
+            {
+                bool read_ok = false;
+                uint64_t region_hash = fnv1a_region_seh(r.BaseAddress, size, read_ok);
+                if (read_ok)
+                {
+                    const uint64_t base_val = reinterpret_cast<uint64_t>(r.BaseAddress);
+                    uint8_t buf[32];
+                    memcpy(buf,      &region_hash, 8);
+                    memcpy(buf + 8,  &base_val,    8);
+                    memcpy(buf + 16, &size,        8);
+                    memset(buf + 24, 0,            8);
+                    out.hash ^= siphash_2_4(buf, 32, 0xA1DAC0DE5EC0DEULL, 0xCAFEBABEDEADFEEDULL);
+                    ++out.included_regions;
+                    if (log_regions)
+                        arc_log_integrity_region(phase, region_index, r, "include_stable_exec", region_hash);
+                }
+                else
+                {
+                    ++out.read_failures;
+                    if (log_regions)
+                        arc_log_integrity_region(phase, region_index, r, "read_failed", 0);
+                }
+            }
+            else if (log_regions)
+            {
+                arc_log_integrity_region(phase, region_index, r, "skip_size", 0);
+            }
+            ++region_index;
+        }
+
+        addr += r.RegionSize;
+    }
+
+    if (log_regions)
+    {
+        char summary[256];
+        _snprintf_s(summary, sizeof(summary), _TRUNCATE,
+            "%s summary hash=0x%016llX exec=%u included=%u mutable=%u unreadable=%u guarded=%u read_fail=%u",
+            phase ? phase : "integrity",
+            static_cast<unsigned long long>(out.hash),
+            out.exec_regions,
+            out.included_regions,
+            out.mutable_exec_regions,
+            out.unreadable_exec_regions,
+            out.guarded_exec_regions,
+            out.read_failures);
+        arc_log("integrity", summary);
+    }
+
+    return out;
+}
+
+uint64_t driver_region_crc_hash_seh(const void* data, size_t len, bool& ok)
+{
+    ok = false;
+    uint64_t h1 = 0xFFFFFFFFULL;
+    uint64_t h2 = 0x85EBCA6BULL;
+    const auto* p = static_cast<const uint8_t*>(data);
+    __try
+    {
+        size_t aligned_end = len & ~7ULL;
+        for (size_t i = 0; i < aligned_end; i += 8)
+        {
+            uint64_t block = 0;
+            memcpy(&block, p + i, sizeof(block));
+            h1 = _mm_crc32_u64(h1, block);
+            h2 = _mm_crc32_u64(h2, block ^ 0xA5A5A5A5A5A5A5A5ULL);
+        }
+        for (size_t i = aligned_end; i < len; ++i)
+        {
+            h1 = _mm_crc32_u8(static_cast<uint32_t>(h1), p[i]);
+            h2 = _mm_crc32_u8(static_cast<uint32_t>(h2), p[i] ^ 0xA5u);
+        }
+        ok = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        ok = false;
+        h1 = 0;
+        h2 = 0;
+    }
+    return (h1 & 0xFFFFFFFFULL) | ((h2 & 0xFFFFFFFFULL) << 32);
 }
 
 __forceinline __m128i aes_128_key_assist(__m128i t1, __m128i t2)
@@ -648,10 +935,12 @@ struct feature_entry_header_t
     uint32_t feature_id;
     uint32_t ciphertext_offset;
     uint32_t ciphertext_len;
-    uint32_t reserved;
+    uint32_t entry_size;
     uint8_t  iv[12];
     uint8_t  tag[16];
 };
+
+constexpr uint32_t kFeatureEntryHeaderSize = static_cast<uint32_t>(sizeof(feature_entry_header_t));
 
 struct feature_blob_header_t
 {
@@ -1180,90 +1469,52 @@ std::string recompute_hwid()
 
 uint64_t compute_own_code_hash()
 {
-    uint64_t result = 0;
-    MEMORY_BASIC_INFORMATION mbi = {};
-    uintptr_t alloc_base = 0;
-    uintptr_t addr = 0;
-    uintptr_t scan_limit = 0;
-
-    CFF_BEGIN(compute_code_hash_cff)
-    CFF_STATE(compute_code_hash_cff, 0)
-    {
-        if (VirtualQuery(reinterpret_cast<const void*>(&compute_own_code_hash), &mbi, sizeof(mbi)) == 0)
-        {
-            CFF_EXIT(compute_code_hash_cff);
-        }
-        const auto hMod = static_cast<const uint8_t*>(mbi.AllocationBase);
-        if (!hMod)
-        {
-            CFF_EXIT(compute_code_hash_cff);
-        }
-
-        alloc_base = reinterpret_cast<uintptr_t>(hMod);
-        addr = alloc_base;
-        scan_limit = alloc_base + (256ULL * 1024 * 1024);
-        CFF_GOTO(compute_code_hash_cff, 1);
-    }
-    CFF_STATE(compute_code_hash_cff, 1)
-    {
-        while (addr < scan_limit)
-        {
-            MEMORY_BASIC_INFORMATION r = {};
-            if (VirtualQuery(reinterpret_cast<const void*>(addr), &r, sizeof(r)) == 0)
-                break;
-            if (r.RegionSize == 0)
-                break;
-            if (r.AllocationBase != mbi.AllocationBase)
-                break;
-
-            constexpr DWORD exec_mask = PAGE_EXECUTE | PAGE_EXECUTE_READ
-                | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-
-            if (r.State == MEM_COMMIT && (r.Protect & exec_mask))
-            {
-                const size_t size = r.RegionSize;
-                if (size > 0 && size < 64ULL * 1024 * 1024)
-                {
-                    const uint64_t base_val = reinterpret_cast<uint64_t>(r.BaseAddress);
-                    uint8_t buf[32];
-                    uint64_t h_val = fnv1a(r.BaseAddress, size);
-                    memcpy(buf,      &h_val,    8);
-                    memcpy(buf + 8,  &base_val, 8);
-                    memcpy(buf + 16, &size,     8);
-                    memset(buf + 24, 0,         8);
-                    result ^= siphash_2_4(buf, 32, 0xA1DAC0DE5EC0DEULL, 0xCAFEBABEDEADFEEDULL);
-                }
-            }
-
-            addr += r.RegionSize;
-        }
-        CFF_EXIT(compute_code_hash_cff);
-    }
-    CFF_END(compute_code_hash_cff)
-
-    return result;
+    return scan_own_code_integrity(false, "compute").hash;
 }
 
 bool capture_self_integrity()
 {
     MEMORY_BASIC_INFORMATION mbi = {};
     if (VirtualQuery(reinterpret_cast<const void*>(&capture_self_integrity), &mbi, sizeof(mbi)) == 0)
+    {
+        arc_log("integrity", "capture_virtualquery_self_failed");
         return false;
+    }
     const auto hMod = static_cast<const uint8_t*>(mbi.AllocationBase);
-    if (!hMod) return false;
+    if (!hMod)
+    {
+        arc_log("integrity", "capture_allocation_base_null");
+        return false;
+    }
 
     BCRYPT_ALG_HANDLE  hAlg  = nullptr;
     BCRYPT_HASH_HANDLE hHash = nullptr;
     NTSTATUS st = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
-    if (!BCRYPT_SUCCESS(st) || !hAlg) return false;
+    if (!BCRYPT_SUCCESS(st) || !hAlg)
+    {
+        char buf[96];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "capture_bcrypt_open_failed status=0x%08X",
+            static_cast<unsigned>(st));
+        arc_log("integrity", buf);
+        return false;
+    }
     st = BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0);
     if (!BCRYPT_SUCCESS(st) || !hHash)
     {
+        char buf[96];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "capture_bcrypt_create_failed status=0x%08X",
+            static_cast<unsigned>(st));
+        arc_log("integrity", buf);
         BCryptCloseAlgorithmProvider(hAlg, 0);
         return false;
     }
 
     uint64_t block_count = 0;
+    uint64_t skipped_mutable = 0;
+    uint64_t skipped_unreadable = 0;
+    uint64_t skipped_guarded = 0;
     const uintptr_t alloc_base = reinterpret_cast<uintptr_t>(hMod);
     uintptr_t addr = alloc_base;
     const uintptr_t scan_limit = alloc_base + (256ULL * 1024 * 1024);
@@ -1278,10 +1529,18 @@ bool capture_self_integrity()
         if (r.AllocationBase != mbi.AllocationBase)
             break;
 
-        constexpr DWORD exec_mask = PAGE_EXECUTE | PAGE_EXECUTE_READ
-            | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        const bool exec = r.State == MEM_COMMIT && arc_is_exec_protect(r.Protect);
+        if (exec && !arc_is_stable_exec_region(r))
+        {
+            if ((r.Protect & PAGE_GUARD) != 0)
+                ++skipped_guarded;
+            else if (!arc_is_readable_protect(r.Protect))
+                ++skipped_unreadable;
+            else if (arc_is_writable_protect(r.Protect))
+                ++skipped_mutable;
+        }
 
-        if (r.State == MEM_COMMIT && (r.Protect & exec_mask))
+        if (arc_is_stable_exec_region(r))
         {
             const size_t size = r.RegionSize;
             if (size > 0 && size < 64ULL * 1024 * 1024)
@@ -1302,7 +1561,19 @@ bool capture_self_integrity()
     BCryptDestroyHash(hHash);
     BCryptCloseAlgorithmProvider(hAlg, 0);
 
-    if (!finish_ok || block_count == 0) return false;
+    if (!finish_ok || block_count == 0)
+    {
+        char buf[160];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "capture_finish_failed ok=%d blocks=%llu skip_mutable=%llu skip_unreadable=%llu skip_guarded=%llu",
+            finish_ok ? 1 : 0,
+            static_cast<unsigned long long>(block_count),
+            static_cast<unsigned long long>(skipped_mutable),
+            static_cast<unsigned long long>(skipped_unreadable),
+            static_cast<unsigned long long>(skipped_guarded));
+        arc_log("integrity", buf);
+        return false;
+    }
 
     std::lock_guard<std::mutex> lk(g_self_integrity_mtx);
     memcpy(g_self_integrity.text_sha256, digest, 32);
@@ -1310,6 +1581,20 @@ bool capture_self_integrity()
     g_self_integrity.block_chain_root = siphash_2_4(
         digest, 32, block_count, 0xA1DAC0DE5EC0DEULL);
     g_self_integrity.captured = true;
+    {
+        uint64_t digest_prefix = 0;
+        memcpy(&digest_prefix, digest, sizeof(digest_prefix));
+        char buf[192];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "capture_ok blocks=%llu root=0x%016llX digest0=0x%016llX skip_mutable=%llu skip_unreadable=%llu skip_guarded=%llu",
+            static_cast<unsigned long long>(block_count),
+            static_cast<unsigned long long>(g_self_integrity.block_chain_root),
+            static_cast<unsigned long long>(digest_prefix),
+            static_cast<unsigned long long>(skipped_mutable),
+            static_cast<unsigned long long>(skipped_unreadable),
+            static_cast<unsigned long long>(skipped_guarded));
+        arc_log("integrity", buf);
+    }
     return true;
 }
 
@@ -1325,10 +1610,23 @@ bool verify_self_integrity()
     BCRYPT_ALG_HANDLE  hAlg  = nullptr;
     BCRYPT_HASH_HANDLE hHash = nullptr;
     NTSTATUS st = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
-    if (!BCRYPT_SUCCESS(st) || !hAlg) return false;
+    if (!BCRYPT_SUCCESS(st) || !hAlg)
+    {
+        char buf[96];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "verify_bcrypt_open_failed status=0x%08X",
+            static_cast<unsigned>(st));
+        arc_log("integrity", buf);
+        return false;
+    }
     st = BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0);
     if (!BCRYPT_SUCCESS(st) || !hHash)
     {
+        char buf[96];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "verify_bcrypt_create_failed status=0x%08X",
+            static_cast<unsigned>(st));
+        arc_log("integrity", buf);
         BCryptCloseAlgorithmProvider(hAlg, 0);
         return false;
     }
@@ -1336,12 +1634,16 @@ bool verify_self_integrity()
     MEMORY_BASIC_INFORMATION mbi = {};
     if (VirtualQuery(reinterpret_cast<const void*>(&verify_self_integrity), &mbi, sizeof(mbi)) == 0)
     {
+        arc_log("integrity", "verify_virtualquery_self_failed");
         BCryptDestroyHash(hHash);
         BCryptCloseAlgorithmProvider(hAlg, 0);
         return false;
     }
 
     uint64_t block_count = 0;
+    uint64_t skipped_mutable = 0;
+    uint64_t skipped_unreadable = 0;
+    uint64_t skipped_guarded = 0;
     const uintptr_t alloc_base = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
     uintptr_t addr = alloc_base;
     const uintptr_t scan_limit = alloc_base + (256ULL * 1024 * 1024);
@@ -1353,10 +1655,18 @@ bool verify_self_integrity()
         if (r.RegionSize == 0) break;
         if (r.AllocationBase != mbi.AllocationBase) break;
 
-        constexpr DWORD exec_mask = PAGE_EXECUTE | PAGE_EXECUTE_READ
-            | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        const bool exec = r.State == MEM_COMMIT && arc_is_exec_protect(r.Protect);
+        if (exec && !arc_is_stable_exec_region(r))
+        {
+            if ((r.Protect & PAGE_GUARD) != 0)
+                ++skipped_guarded;
+            else if (!arc_is_readable_protect(r.Protect))
+                ++skipped_unreadable;
+            else if (arc_is_writable_protect(r.Protect))
+                ++skipped_mutable;
+        }
 
-        if (r.State == MEM_COMMIT && (r.Protect & exec_mask))
+        if (arc_is_stable_exec_region(r))
         {
             const size_t size = r.RegionSize;
             if (size > 0 && size < 64ULL * 1024 * 1024)
@@ -1377,11 +1687,51 @@ bool verify_self_integrity()
     BCryptDestroyHash(hHash);
     BCryptCloseAlgorithmProvider(hAlg, 0);
 
-    if (!finish_ok) return false;
-    if (block_count != snapshot.block_count) return false;
-    if (memcmp(digest, snapshot.text_sha256, 32) != 0) return false;
+    if (!finish_ok)
+    {
+        arc_log("integrity", "verify_finish_failed");
+        return false;
+    }
+    if (block_count != snapshot.block_count)
+    {
+        char buf[160];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "verify_block_count_mismatch current=%llu stored=%llu skip_mutable=%llu skip_unreadable=%llu skip_guarded=%llu",
+            static_cast<unsigned long long>(block_count),
+            static_cast<unsigned long long>(snapshot.block_count),
+            static_cast<unsigned long long>(skipped_mutable),
+            static_cast<unsigned long long>(skipped_unreadable),
+            static_cast<unsigned long long>(skipped_guarded));
+        arc_log("integrity", buf);
+        return false;
+    }
+    if (memcmp(digest, snapshot.text_sha256, 32) != 0)
+    {
+        uint64_t current_prefix = 0;
+        uint64_t stored_prefix = 0;
+        memcpy(&current_prefix, digest, sizeof(current_prefix));
+        memcpy(&stored_prefix, snapshot.text_sha256, sizeof(stored_prefix));
+        char buf[160];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "verify_digest_mismatch current0=0x%016llX stored0=0x%016llX blocks=%llu",
+            static_cast<unsigned long long>(current_prefix),
+            static_cast<unsigned long long>(stored_prefix),
+            static_cast<unsigned long long>(block_count));
+        arc_log("integrity", buf);
+        scan_own_code_integrity(true, "verify_digest_mismatch");
+        return false;
+    }
     uint64_t recomputed_root = siphash_2_4(digest, 32, block_count, 0xA1DAC0DE5EC0DEULL);
-    if (recomputed_root != snapshot.block_chain_root) return false;
+    if (recomputed_root != snapshot.block_chain_root)
+    {
+        char buf[128];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "verify_root_mismatch current=0x%016llX stored=0x%016llX",
+            static_cast<unsigned long long>(recomputed_root),
+            static_cast<unsigned long long>(snapshot.block_chain_root));
+        arc_log("integrity", buf);
+        return false;
+    }
     return true;
 }
 
@@ -1774,14 +2124,6 @@ ARC_API bool arc_init(
         memcpy(kb + 8, &km2, 8);
         vtable_crypt_key_capture = siphash_2_4(kb, 16, local_hwid_hash_capture, session_hash_capture);
 
-        code_hash_capture = compute_own_code_hash();
-        {
-            char dbg[96];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "arc_init code_hash=0x%016llX",
-                static_cast<unsigned long long>(code_hash_capture));
-            arc_log("init", dbg);
-        }
         CFF_GOTO(arc_init_cff, 6);
     }
     CFF_STATE(arc_init_cff, 6)
@@ -1827,6 +2169,26 @@ ARC_API bool arc_init(
     }
     CFF_STATE(arc_init_cff, 7)
     {
+        integrity_scan_result_t baseline_scan = scan_own_code_integrity(true, "arc_init_baseline");
+        code_hash_capture = baseline_scan.hash;
+        if (code_hash_capture == 0 || baseline_scan.included_regions == 0)
+        {
+            arc_log("init", "arc_init_code_hash_capture_failed");
+            CFF_EXIT(arc_init_cff);
+        }
+        {
+            char dbg[192];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "arc_init code_hash=0x%016llX exec=%u included=%u mutable=%u guarded=%u read_fail=%u",
+                static_cast<unsigned long long>(code_hash_capture),
+                baseline_scan.exec_regions,
+                baseline_scan.included_regions,
+                baseline_scan.mutable_exec_regions,
+                baseline_scan.guarded_exec_regions,
+                baseline_scan.read_failures);
+            arc_log("init", dbg);
+        }
+
         std::lock_guard<std::mutex> lk(g_session_mtx);
 
         session_data_t sess = {};
@@ -1958,8 +2320,6 @@ ARC_API bool arc_init(
             image_base = reinterpret_cast<uint64_t>(mbi_self.AllocationBase);
 
             constexpr uint64_t kMaxImageScan = 256ULL * 1024 * 1024;
-            constexpr DWORD exec_mask = PAGE_EXECUTE | PAGE_EXECUTE_READ
-                | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
 
             uintptr_t scan_addr = static_cast<uintptr_t>(image_base);
             const uintptr_t scan_limit = scan_addr + static_cast<uintptr_t>(kMaxImageScan);
@@ -1974,7 +2334,7 @@ ARC_API bool arc_init(
                 if (r.AllocationBase != mbi_self.AllocationBase)
                     break;
 
-                if (text_va == 0 && r.State == MEM_COMMIT && (r.Protect & exec_mask))
+                if (text_va == 0 && arc_is_stable_exec_region(r))
                 {
                     text_va = reinterpret_cast<uint64_t>(r.BaseAddress);
                     text_size = static_cast<uint64_t>(r.RegionSize);
@@ -1987,10 +2347,49 @@ ARC_API bool arc_init(
 
         if (image_base != 0 && image_size != 0 && text_va != 0 && text_size != 0)
         {
-            if (!dev->register_dll_protection(image_base, text_va,
-                    static_cast<uint32_t>(text_size), code_hash_capture, 2000))
+            bool driver_hash_ok = false;
+            uint64_t driver_expected_hash = 0;
+            if (text_size <= 0xFFFFFFFFULL)
             {
-                arc_log("driver", "register_dll_protection_failed");
+                driver_expected_hash = driver_region_crc_hash_seh(
+                    reinterpret_cast<const void*>(text_va),
+                    static_cast<size_t>(text_size),
+                    driver_hash_ok);
+            }
+            {
+                char detail[224];
+                _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                    "register_dll_protection_attempt image=0x%016llX image_size=0x%016llX text=0x%016llX text_size=0x%016llX arc_hash=0x%016llX driver_hash=0x%016llX hash_ok=%d",
+                    static_cast<unsigned long long>(image_base),
+                    static_cast<unsigned long long>(image_size),
+                    static_cast<unsigned long long>(text_va),
+                    static_cast<unsigned long long>(text_size),
+                    static_cast<unsigned long long>(code_hash_capture),
+                    static_cast<unsigned long long>(driver_expected_hash),
+                    driver_hash_ok ? 1 : 0);
+                arc_log("driver", detail);
+            }
+            if (!driver_hash_ok || driver_expected_hash == 0 || text_size > 0xFFFFFFFFULL)
+            {
+                arc_log("driver", "register_dll_protection_hash_unavailable");
+            }
+            else if (!dev->register_dll_protection(image_base, text_va,
+                    static_cast<uint32_t>(text_size), driver_expected_hash, 2000))
+            {
+                DWORD gle = GetLastError();
+                char detail[224];
+                _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                    "register_dll_protection_failed gle=%lu image=0x%016llX text=0x%016llX text_size=0x%016llX expected=0x%016llX",
+                    static_cast<unsigned long>(gle),
+                    static_cast<unsigned long long>(image_base),
+                    static_cast<unsigned long long>(text_va),
+                    static_cast<unsigned long long>(text_size),
+                    static_cast<unsigned long long>(driver_expected_hash));
+                arc_log("driver", detail);
+            }
+            else
+            {
+                arc_log("driver", "register_dll_protection_ok");
             }
         }
         else
@@ -2114,7 +2513,8 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
     }
     CFF_STATE(hb_cff, 1)
     {
-        uint64_t current_hash = compute_own_code_hash();
+        integrity_scan_result_t current_scan = scan_own_code_integrity(false, "heartbeat");
+        uint64_t current_hash = current_scan.hash;
         std::lock_guard<std::mutex> lk(g_session_mtx);
         session_data_t sess = {};
         if (!load_session(sess))
@@ -2124,21 +2524,32 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
         }
 
         {
-            char dbg[128];
+            char dbg[192];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "state=1 code_hash_stored=0x%016llX code_hash_current=0x%016llX",
+                "state=1 code_hash_stored=0x%016llX code_hash_current=0x%016llX exec=%u included=%u mutable=%u guarded=%u read_fail=%u",
                 static_cast<unsigned long long>(sess.code_hash),
-                static_cast<unsigned long long>(current_hash));
+                static_cast<unsigned long long>(current_hash),
+                current_scan.exec_regions,
+                current_scan.included_regions,
+                current_scan.mutable_exec_regions,
+                current_scan.guarded_exec_regions,
+                current_scan.read_failures);
             arc_log("heartbeat", dbg);
         }
 
         if (sess.code_hash != 0 && current_hash != sess.code_hash)
         {
-            char detail[128];
+            scan_own_code_integrity(true, "heartbeat_mismatch");
+            char detail[192];
             _snprintf_s(detail, sizeof(detail), _TRUNCATE,
-                "stored=0x%016llX current=0x%016llX",
+                "stored=0x%016llX current=0x%016llX exec=%u included=%u mutable=%u guarded=%u read_fail=%u",
                 static_cast<unsigned long long>(sess.code_hash),
-                static_cast<unsigned long long>(current_hash));
+                static_cast<unsigned long long>(current_hash),
+                current_scan.exec_regions,
+                current_scan.included_regions,
+                current_scan.mutable_exec_regions,
+                current_scan.guarded_exec_regions,
+                current_scan.read_failures);
             enforce_violation("arc_code_hash_mismatch", detail);
         }
         if (!verify_self_integrity())
@@ -2562,6 +2973,21 @@ ARC_API void arc_set_key_seed(const uint8_t* key_seed, uint32_t len)
     g_key_seed_valid = true;
 }
 
+ARC_API uint32_t arc_copy_last_status(char* out, uint32_t cap)
+{
+    if (!out || cap == 0) return 0;
+    using namespace arc_internal;
+    std::lock_guard<std::mutex> lk(g_last_status_mtx);
+    const size_t status_len = strnlen_s(g_last_status, sizeof(g_last_status));
+    const size_t copy_len = status_len < static_cast<size_t>(cap - 1)
+        ? status_len
+        : static_cast<size_t>(cap - 1);
+    if (copy_len > 0)
+        memcpy(out, g_last_status, copy_len);
+    out[copy_len] = '\0';
+    return static_cast<uint32_t>(copy_len);
+}
+
 ARC_API bool arc_unseal_feature(
     uint32_t       feature_id,
     const uint8_t* nonce,
@@ -2617,11 +3043,34 @@ ARC_API bool arc_unseal_feature(
 
     const auto* entries = reinterpret_cast<const feature_entry_header_t*>(
         feature_blob + sizeof(feature_blob_header_t));
-    const uint32_t entries_size = hdr->entry_count * sizeof(feature_entry_header_t);
+    const uint32_t entries_size = hdr->entry_count * kFeatureEntryHeaderSize;
     if (sizeof(feature_blob_header_t) + entries_size > sizeof(feature_blob))
     {
         arc_log("unseal", "entry_table_overflow");
         return false;
+    }
+    const uint32_t minimum_total_size = static_cast<uint32_t>(sizeof(feature_blob_header_t)) + entries_size;
+    if (hdr->total_size < minimum_total_size)
+    {
+        char buf[80];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "bad_total_size_floor got=%u min=%u",
+            hdr->total_size, minimum_total_size);
+        arc_log("unseal", buf);
+        return false;
+    }
+
+    for (uint32_t i = 0; i < hdr->entry_count; ++i)
+    {
+        if (entries[i].entry_size != kFeatureEntryHeaderSize)
+        {
+            char buf[80];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "bad_entry_size index=%u got=%u exp=%u",
+                i, entries[i].entry_size, kFeatureEntryHeaderSize);
+            arc_log("unseal", buf);
+            return false;
+        }
     }
 
     const feature_entry_header_t* match = nullptr;
@@ -2649,7 +3098,17 @@ ARC_API bool arc_unseal_feature(
         arc_log("unseal", buf);
         return false;
     }
-    if (match->ciphertext_offset + match->ciphertext_len > sizeof(feature_blob))
+    if (match->ciphertext_offset < minimum_total_size)
+    {
+        char buf[80];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "bad_ct_overlap off=%u min=%u",
+            match->ciphertext_offset, minimum_total_size);
+        arc_log("unseal", buf);
+        return false;
+    }
+    if (match->ciphertext_offset > hdr->total_size ||
+        match->ciphertext_len > hdr->total_size - match->ciphertext_offset)
     {
         char buf[80];
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,

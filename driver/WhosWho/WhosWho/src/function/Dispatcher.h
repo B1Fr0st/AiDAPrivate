@@ -1067,13 +1067,30 @@ namespace dispatcher {
                 output_size >= sizeof(phase3_msg::canary_register_request_k)) {
                 auto* req = reinterpret_cast<phase3_msg::canary_register_request_k*>(buffer);
                 if (req->session_key != g_session_key) {
+                    WW_LOG("CANR: ACCESS_DENIED session_key=0x%lx expected=0x%lx va=0x%llx size=0x%llx pid=%u",
+                        req->session_key,
+                        g_session_key,
+                        static_cast<unsigned long long>(req->va),
+                        static_cast<unsigned long long>(req->size),
+                        req->pid);
                     status = STATUS_ACCESS_DENIED;
                 } else {
                     ULONG pid = req->pid;
                     if (pid == 0)
                         pid = static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(
                             caller_validation::g_registered_client_pid));
+                    WW_LOG("CANR: request va=0x%llx size=0x%llx requested_pid=%u resolved_pid=%lu session=0x%lx count_before=%lu",
+                        static_cast<unsigned long long>(req->va),
+                        static_cast<unsigned long long>(req->size),
+                        req->pid,
+                        pid,
+                        req->session_key,
+                        anti_dma_canary::g_canary_count);
                     req->result = anti_dma_canary::register_canary(req->va, req->size, pid) ? 1u : 0u;
+                    WW_LOG("CANR: result=%u resolved_pid=%lu count_after=%lu",
+                        req->result,
+                        pid,
+                        anti_dma_canary::g_canary_count);
                     status = STATUS_SUCCESS;
                 }
                 bytes = sizeof(phase3_msg::canary_register_request_k);

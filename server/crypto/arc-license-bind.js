@@ -248,7 +248,7 @@ function assembleFeatureBlob(licenseRow, sessionRow) {
         blob.writeUInt32LE(record.featureId >>> 0, entryOffset + 0);
         blob.writeUInt32LE(record.ciphertextOffset >>> 0, entryOffset + 4);
         blob.writeUInt32LE(record.ciphertextLen >>> 0, entryOffset + 8);
-        blob.writeUInt32LE(0, entryOffset + 12);
+        blob.writeUInt32LE(FEAT_ENTRY_SIZE >>> 0, entryOffset + 12);
         record.iv.copy(blob, entryOffset + 16, 0, 12);
         record.tag.copy(blob, entryOffset + 28, 0, 16);
         record.ciphertext.copy(blob, record.ciphertextOffset, 0, record.ciphertextLen);
@@ -268,12 +268,10 @@ function applyLicenseTransform(blob, licenseRow, sessionRow) {
 
     const featResult = locateSection(out, FEAT_SECTION_NAME, FEAT_SECTION_SIZE);
     if (!featResult.found) {
-        console.warn('[arc-license-bind] .feat section not found, skipping feature blob');
-        return out;
+        throw new Error('arc_feat_section_missing');
     }
     if (featResult.error) {
-        console.warn(`[arc-license-bind] .feat section invalid (${featResult.error}), skipping feature blob`);
-        return out;
+        throw new Error(`arc_feat_section_invalid:${featResult.error}`);
     }
     const featBlob = assembleFeatureBlob(licenseRow, sessionRow);
     featBlob.copy(out, featResult.pointerToRawData, 0, FEAT_SECTION_SIZE);

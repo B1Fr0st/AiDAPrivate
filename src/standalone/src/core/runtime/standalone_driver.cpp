@@ -1915,10 +1915,23 @@ namespace driver_bridge
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
-        if (!kernel_mode) return false;
+        if (!kernel_mode) {
+            diag::log_tagged_fmt("driver", "canary_register_skip kernel_mode=0 va=%p size=%llu",
+                va,
+                static_cast<unsigned long long>(size));
+            return false;
+        }
 
-        return device->canary_register(reinterpret_cast<uint64_t>(va),
-                                       static_cast<uint64_t>(size));
+        diag::log_tagged_fmt("driver", "canary_register_pre va=%p size=%llu",
+            va,
+            static_cast<unsigned long long>(size));
+        bool registered = device->canary_register(reinterpret_cast<uint64_t>(va),
+                                                  static_cast<uint64_t>(size));
+        diag::log_tagged_fmt("driver", "canary_register_post va=%p size=%llu registered=%d",
+            va,
+            static_cast<unsigned long long>(size),
+            registered ? 1 : 0);
+        return registered;
     }
 
     bool re_confirmed_usermode_bsod(const re_evidence_blob_t& evidence)

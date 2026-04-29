@@ -263,8 +263,10 @@ test('feature blob entry stride is 44 bytes (matches ARC C++ struct)', () => {
     const featureId = blob.readUInt32LE(entryOffset + 0);
     const ciphertextOffset = blob.readUInt32LE(entryOffset + 4);
     const ciphertextLen = blob.readUInt32LE(entryOffset + 8);
+    const entrySize = blob.readUInt32LE(entryOffset + 12);
     assert.equal(featureId, 1);
     assert.equal(ciphertextLen, 32);
+    assert.equal(entrySize, FEAT_ENTRY_SIZE_CPP);
     assert.equal(ciphertextOffset, FEAT_HEADER_SIZE + entryCount * FEAT_ENTRY_SIZE_CPP);
 
     const iv = blob.subarray(entryOffset + 16, entryOffset + 28);
@@ -340,6 +342,8 @@ test('applyLicenseTransform writes a feature blob the C++ struct can decrypt', (
     const entryOffset = 16;
     const ciphertextOffset = featBlob.readUInt32LE(entryOffset + 4);
     const ciphertextLen = featBlob.readUInt32LE(entryOffset + 8);
+    const entrySize = featBlob.readUInt32LE(entryOffset + 12);
+    assert.equal(entrySize, 44);
     const iv = featBlob.subarray(entryOffset + 16, entryOffset + 28);
     const tag = featBlob.subarray(entryOffset + 28, entryOffset + 44);
     const ciphertext = featBlob.subarray(ciphertextOffset, ciphertextOffset + ciphertextLen);
@@ -357,4 +361,39 @@ test('applyLicenseTransform writes a feature blob the C++ struct can decrypt', (
     decipher.setAuthTag(tag);
     const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
     assert.equal(plaintext.length, 32);
+});
+
+test('applyLicenseTransform rejects ARC blobs without feature section', () => {
+    const installSecret = crypto.randomBytes(32);
+    const wrappedInstall = kwWrap.wrap(installSecret, 'install_secret/v1');
+    const licenseRow = {
+        key: 'AIDA-TEST-FEAT-MISSING-0001',
+        install_secret_wrapped: wrappedInstall,
+        boot_nonce_last: null,
+    };
+    const sessionRow = { session_token: 'c'.repeat(64) };
+
+    const dosSize = 64;
+    const ntSize = 248;
+    const headerSize = 4096;
+    const licbindOffset = headerSize;
+    const blobLen = licbindOffset + 4096;
+    const pe = Buffer.alloc(blobLen, 0);
+    pe[0] = 0x4D; pe[1] = 0x5A;
+    pe.writeUInt32LE(dosSize, 0x3C);
+    pe[dosSize + 0] = 0x50;
+    pe[dosSize + 1] = 0x45;
+    pe[dosSize + 2] = 0x00;
+    pe[dosSize + 3] = 0x00;
+    pe.writeUInt16LE(1, dosSize + 6);
+    pe.writeUInt16LE(ntSize - 24, dosSize + 20);
+
+    const sectionTableOffset = dosSize + 24 + (ntSize - 24);
+    Buffer.from('.licbind', 'utf8').copy(pe, sectionTableOffset, 0, 8);
+    pe.writeUInt32LE(32, sectionTableOffset + 16);
+    pe.writeUInt32LE(licbindOffset, sectionTableOffset + 20);
+
+    assert.throws(
+        () => arcLicenseBind.applyLicenseTransform(pe, licenseRow, sessionRow),
+        /arc_feat_section_missing/);
 });

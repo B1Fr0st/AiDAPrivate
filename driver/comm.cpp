@@ -3155,7 +3155,10 @@ bool voyager::device_t::tier_a_driver_present_query(bool& out_present, std::uint
 
 bool voyager::device_t::canary_register(std::uint64_t va, std::uint64_t size) noexcept
 {
-    if (!is_connected()) return false;
+    if (!is_connected()) {
+        RC_UM_DBG("CANR skip not_connected va=0x%llX size=0x%llX", va, size);
+        return false;
+    }
 
     detail::canary_register_request req{};
     req.magic = session_key_ ^ dynamic_key::get() ^ 0xCA110013u;
@@ -3164,8 +3167,28 @@ bool voyager::device_t::canary_register(std::uint64_t va, std::uint64_t size) no
     req.size = size;
     req.pid = process_id_ != 0 ? process_id_ : GetCurrentProcessId();
 
-    if (!send_request(ioctl_codes::CANR(), &req, static_cast<DWORD>(sizeof(req))))
+    RC_UM_DBG("CANR request va=0x%llX size=0x%llX pid=%u session=0x%08X magic=0x%08X ioctl=0x%08X",
+        req.va,
+        req.size,
+        req.pid,
+        req.session_key,
+        req.magic,
+        ioctl_codes::CANR());
+
+    if (!send_request(ioctl_codes::CANR(), &req, static_cast<DWORD>(sizeof(req)))) {
+        RC_UM_DBG("CANR send_failed va=0x%llX size=0x%llX pid=%u last_error=%lu",
+            va,
+            size,
+            req.pid,
+            GetLastError());
         return false;
+    }
+
+    RC_UM_DBG("CANR response va=0x%llX size=0x%llX pid=%u result=%u",
+        req.va,
+        req.size,
+        req.pid,
+        req.result);
 
     return req.result != 0;
 }
