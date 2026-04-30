@@ -150,6 +150,12 @@ extern "C"
     ARC_API arc_heartbeat_result_t arc_heartbeat();
 
 
+    ARC_API arc_heartbeat_result_t arc_heartbeat_ex(
+        uint64_t    hb_count,
+        const char* code_hash_hex
+    );
+
+
     ARC_API void arc_cleanup();
 
 

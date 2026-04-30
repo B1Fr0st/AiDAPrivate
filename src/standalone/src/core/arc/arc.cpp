@@ -2652,6 +2652,187 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
     return hb_result;
 }
 
+ARC_API arc_heartbeat_result_t arc_heartbeat_ex(uint64_t hb_count, const char* code_hash_hex)
+{
+    using namespace arc_internal;
+    arc_heartbeat_result_t hb_result{};
+    hb_result.valid = false;
+    hb_result.proof_token = 0;
+    hb_result.timestamp = 0;
+
+    char code_hash_norm[17] = "0000000000000000";
+    if (code_hash_hex)
+    {
+        char tmp[17] = {};
+        size_t n = 0;
+        bool valid = true;
+        for (size_t i = 0; code_hash_hex[i] != '\0' && n < 16; ++i)
+        {
+            char c = code_hash_hex[i];
+            if (c == ' ' || c == '\t') continue;
+            if (c >= '0' && c <= '9') tmp[n++] = c;
+            else if (c >= 'a' && c <= 'f') tmp[n++] = c;
+            else if (c >= 'A' && c <= 'F') tmp[n++] = static_cast<char>(c - 'A' + 'a');
+            else { valid = false; break; }
+        }
+        if (valid && n > 0 && n <= 16)
+        {
+            size_t pad = 16 - n;
+            for (size_t i = 0; i < pad; ++i) code_hash_norm[i] = '0';
+            for (size_t i = 0; i < n; ++i) code_hash_norm[pad + i] = tmp[i];
+            code_hash_norm[16] = '\0';
+        }
+    }
+
+    CFF_BEGIN(hbex_cff)
+    CFF_STATE(hbex_cff, 0)
+    {
+        if (!is_session_valid())
+        {
+            arc_log("heartbeat_ex", "state=0 session_invalid");
+            CFF_EXIT(hbex_cff);
+        }
+        CFF_GOTO(hbex_cff, 1);
+    }
+    CFF_STATE(hbex_cff, 1)
+    {
+        integrity_scan_result_t current_scan = scan_own_code_integrity(false, "heartbeat_ex");
+        uint64_t current_hash = current_scan.hash;
+        std::lock_guard<std::mutex> lk(g_session_mtx);
+        session_data_t sess = {};
+        if (!load_session(sess))
+        {
+            arc_log("heartbeat_ex", "state=1 load_session_failed");
+            CFF_EXIT(hbex_cff);
+        }
+        if (sess.code_hash != 0 && current_hash != sess.code_hash)
+        {
+            scan_own_code_integrity(true, "heartbeat_ex_mismatch");
+            char detail[192];
+            _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                "stored=0x%016llX current=0x%016llX exec=%u included=%u mutable=%u guarded=%u read_fail=%u",
+                static_cast<unsigned long long>(sess.code_hash),
+                static_cast<unsigned long long>(current_hash),
+                current_scan.exec_regions,
+                current_scan.included_regions,
+                current_scan.mutable_exec_regions,
+                current_scan.guarded_exec_regions,
+                current_scan.read_failures);
+            enforce_violation("arc_code_hash_mismatch", detail);
+        }
+        if (!verify_self_integrity())
+        {
+            enforce_violation("arc_self_hash_mismatch", "");
+        }
+        CFF_GOTO(hbex_cff, 2);
+    }
+    CFF_STATE(hbex_cff, 2)
+    {
+        if (check_debugger())
+        {
+            enforce_violation("arc_debugger", "heartbeat_ex");
+        }
+        CFF_GOTO(hbex_cff, 3);
+    }
+    CFF_STATE(hbex_cff, 3)
+    {
+        std::lock_guard<std::mutex> lk(g_session_mtx);
+        session_data_t sess = {};
+        if (!load_session(sess))
+        {
+            arc_log("heartbeat_ex", "state=3 load_session_failed");
+            CFF_EXIT(hbex_cff);
+        }
+
+        uint64_t current_tsc = __rdtsc();
+        if (current_tsc < sess.last_heartbeat_tsc)
+        {
+            char detail[96];
+            _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                "current=0x%016llX last=0x%016llX",
+                static_cast<unsigned long long>(current_tsc),
+                static_cast<unsigned long long>(sess.last_heartbeat_tsc));
+            enforce_violation("arc_tsc_rollback", detail);
+        }
+        sess.last_heartbeat_tsc = current_tsc;
+        sess.heartbeat_counter++;
+
+        if (!load_bind_secret())
+        {
+            SecureZeroMemory(&sess, sizeof(sess));
+            enforce_violation("arc_no_bind_secret", "heartbeat_ex");
+        }
+
+        char sess_fnv[17];
+        char hwid_fnv[17];
+        _snprintf_s(sess_fnv, sizeof(sess_fnv), _TRUNCATE, "%016llx",
+            static_cast<unsigned long long>(sess.session_hash));
+        _snprintf_s(hwid_fnv, sizeof(hwid_fnv), _TRUNCATE, "%016llx",
+            static_cast<unsigned long long>(sess.hwid_hash));
+
+        std::string msg;
+        msg.reserve(96);
+        msg.append(sess_fnv);
+        msg.append("|");
+        msg.append(hwid_fnv);
+        msg.append("|");
+        msg.append(std::to_string(static_cast<unsigned long long>(hb_count)));
+        msg.append("|");
+        msg.append(code_hash_norm);
+
+        {
+            char dbg[320];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "compose internal_counter=%llu hb_count=%llu code_hash=%s msg=%.200s",
+                static_cast<unsigned long long>(sess.heartbeat_counter),
+                static_cast<unsigned long long>(hb_count),
+                code_hash_norm,
+                msg.c_str());
+            arc_log("heartbeat_ex", dbg);
+        }
+
+        uint8_t mac[32] = {};
+        uint8_t local_secret[32] = {};
+        {
+            std::lock_guard<std::mutex> bs_lk(g_bind_secret_mtx);
+            bind_secret_obf_load_unlocked(local_secret);
+        }
+        const bool hmac_ok = hmac_sha256_full(local_secret, 32,
+                reinterpret_cast<const uint8_t*>(msg.data()), msg.size(), mac);
+        SecureZeroMemory(local_secret, sizeof(local_secret));
+        if (!hmac_ok)
+        {
+            SecureZeroMemory(mac, sizeof(mac));
+            SecureZeroMemory(&sess, sizeof(sess));
+            enforce_violation("arc_heartbeat_hmac_failed", "ex");
+        }
+
+        uint64_t proof_be = 0;
+        for (int i = 0; i < 8; ++i)
+            proof_be = (proof_be << 8) | static_cast<uint64_t>(mac[i]);
+        hb_result.proof_token = proof_be;
+        SecureZeroMemory(mac, sizeof(mac));
+
+        hb_result.timestamp = static_cast<uint64_t>(time(nullptr));
+        hb_result.valid = true;
+
+        {
+            char dbg[160];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "ok proof_token=0x%016llX",
+                static_cast<unsigned long long>(hb_result.proof_token));
+            arc_log("heartbeat_ex", dbg);
+        }
+
+        store_session(sess);
+        SecureZeroMemory(&sess, sizeof(sess));
+        CFF_EXIT(hbex_cff);
+    }
+    CFF_END(hbex_cff)
+
+    return hb_result;
+}
+
 }
 
 namespace {

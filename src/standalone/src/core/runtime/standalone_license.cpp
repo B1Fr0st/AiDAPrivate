@@ -1869,6 +1869,7 @@ namespace
     using arc_get_comm_bridge_fn    = const arc_comm_vtable_t*(*)();
     using arc_validate_tool_fn      = uint64_t(*)(uint64_t, uint64_t);
     using arc_heartbeat_fn          = arc_heartbeat_result_t(*)();
+    using arc_heartbeat_ex_fn       = arc_heartbeat_result_t(*)(uint64_t, const char*);
     using arc_cleanup_fn            = void(*)();
     using arc_set_key_seed_fn       = void(*)(const uint8_t*, uint32_t);
     using arc_unseal_feature_fn     = bool(*)(uint32_t, const uint8_t*, uint32_t, uint8_t*, uint32_t*, uint32_t);
@@ -1879,6 +1880,7 @@ namespace
     arc_get_comm_bridge_fn    s_fn_arc_get_comm_bridge    = nullptr;
     arc_validate_tool_fn      s_fn_arc_validate_tool      = nullptr;
     arc_heartbeat_fn          s_fn_arc_heartbeat          = nullptr;
+    arc_heartbeat_ex_fn       s_fn_arc_heartbeat_ex       = nullptr;
     arc_cleanup_fn            s_fn_arc_cleanup            = nullptr;
     arc_set_key_seed_fn       s_fn_arc_set_key_seed       = nullptr;
     arc_unseal_feature_fn     s_fn_arc_unseal_feature     = nullptr;
@@ -2750,9 +2752,19 @@ namespace
                 bool arc_hb_invoked = false;
                 bool arc_hb_valid = false;
                 uint64_t arc_hb_proof_token = 0;
-                if (s_arc_loaded && s_fn_arc_heartbeat) {
+                if (s_arc_loaded && s_fn_arc_heartbeat_ex) {
                     arc_hb_invoked = true;
-                    auto hb = s_fn_arc_heartbeat();
+                    {
+                        char dbg_msg[256];
+                        _snprintf_s(dbg_msg, sizeof(dbg_msg), _TRUNCATE,
+                            "heartbeat_compose_arc_ex_inputs hb_count=%u code_hash=%.20s",
+                            heartbeat_index,
+                            code_hash_value.empty() ? "<absent>" : code_hash_value.c_str());
+                        lic_log(dbg_msg);
+                    }
+                    auto hb = s_fn_arc_heartbeat_ex(
+                        static_cast<uint64_t>(heartbeat_index),
+                        code_hash_value.c_str());
                     arc_hb_valid = hb.valid;
                     arc_hb_proof_token = hb.proof_token;
                     if (hb.valid) {
@@ -2764,9 +2776,10 @@ namespace
                 {
                     char dbg_arc[256];
                     _snprintf_s(dbg_arc, sizeof(dbg_arc), _TRUNCATE,
-                        "heartbeat_compose_arc loaded=%d fn_set=%d invoked=%d valid=%d proof_token=0x%016llX",
+                        "heartbeat_compose_arc loaded=%d fn_set=%d ex_fn_set=%d invoked=%d valid=%d proof_token=0x%016llX",
                         s_arc_loaded ? 1 : 0,
                         s_fn_arc_heartbeat ? 1 : 0,
+                        s_fn_arc_heartbeat_ex ? 1 : 0,
                         arc_hb_invoked ? 1 : 0,
                         arc_hb_valid ? 1 : 0,
                         static_cast<unsigned long long>(arc_hb_proof_token));
@@ -3649,6 +3662,8 @@ namespace
                 arc_loader::get_export(s_arc_module, "arc_validate_tool_exec"));
             s_fn_arc_heartbeat = reinterpret_cast<arc_heartbeat_fn>(
                 arc_loader::get_export(s_arc_module, "arc_heartbeat"));
+            s_fn_arc_heartbeat_ex = reinterpret_cast<arc_heartbeat_ex_fn>(
+                arc_loader::get_export(s_arc_module, "arc_heartbeat_ex"));
             s_fn_arc_cleanup = reinterpret_cast<arc_cleanup_fn>(
                 arc_loader::get_export(s_arc_module, "arc_cleanup"));
             s_fn_arc_set_key_seed = reinterpret_cast<arc_set_key_seed_fn>(
@@ -3659,7 +3674,7 @@ namespace
                 arc_loader::get_export(s_arc_module, "arc_copy_last_status"));
 
             if (!s_fn_arc_init || !s_fn_arc_bind_driver_device || !s_fn_arc_get_comm_bridge ||
-                !s_fn_arc_validate_tool || !s_fn_arc_heartbeat || !s_fn_arc_cleanup ||
+                !s_fn_arc_validate_tool || !s_fn_arc_heartbeat || !s_fn_arc_heartbeat_ex || !s_fn_arc_cleanup ||
                 !s_fn_arc_unseal_feature) {
                 log_arc_status("arc_missing_exports");
                 arc_loader::unload(s_arc_module);
@@ -3668,6 +3683,7 @@ namespace
                 s_fn_arc_get_comm_bridge = nullptr;
                 s_fn_arc_validate_tool = nullptr;
                 s_fn_arc_heartbeat = nullptr;
+                s_fn_arc_heartbeat_ex = nullptr;
                 s_fn_arc_cleanup = nullptr;
                 s_fn_arc_set_key_seed = nullptr;
                 s_fn_arc_unseal_feature = nullptr;
@@ -3685,6 +3701,7 @@ namespace
                 s_fn_arc_get_comm_bridge = nullptr;
                 s_fn_arc_validate_tool = nullptr;
                 s_fn_arc_heartbeat = nullptr;
+                s_fn_arc_heartbeat_ex = nullptr;
                 s_fn_arc_cleanup = nullptr;
                 s_fn_arc_set_key_seed = nullptr;
                 s_fn_arc_unseal_feature = nullptr;
@@ -3700,6 +3717,7 @@ namespace
                 s_fn_arc_get_comm_bridge = nullptr;
                 s_fn_arc_validate_tool = nullptr;
                 s_fn_arc_heartbeat = nullptr;
+                s_fn_arc_heartbeat_ex = nullptr;
                 s_fn_arc_cleanup = nullptr;
                 s_fn_arc_set_key_seed = nullptr;
                 s_fn_arc_unseal_feature = nullptr;
@@ -3715,6 +3733,7 @@ namespace
                 s_fn_arc_get_comm_bridge = nullptr;
                 s_fn_arc_validate_tool = nullptr;
                 s_fn_arc_heartbeat = nullptr;
+                s_fn_arc_heartbeat_ex = nullptr;
                 s_fn_arc_cleanup = nullptr;
                 s_fn_arc_set_key_seed = nullptr;
                 s_fn_arc_unseal_feature = nullptr;
@@ -3736,6 +3755,7 @@ namespace
                 s_fn_arc_get_comm_bridge = nullptr;
                 s_fn_arc_validate_tool = nullptr;
                 s_fn_arc_heartbeat = nullptr;
+                s_fn_arc_heartbeat_ex = nullptr;
                 s_fn_arc_cleanup = nullptr;
                 s_fn_arc_set_key_seed = nullptr;
                 s_fn_arc_unseal_feature = nullptr;
@@ -3754,6 +3774,7 @@ namespace
                 s_fn_arc_get_comm_bridge = nullptr;
                 s_fn_arc_validate_tool = nullptr;
                 s_fn_arc_heartbeat = nullptr;
+                s_fn_arc_heartbeat_ex = nullptr;
                 s_fn_arc_cleanup = nullptr;
                 s_fn_arc_set_key_seed = nullptr;
                 s_fn_arc_unseal_feature = nullptr;
@@ -3771,6 +3792,7 @@ namespace
                 s_fn_arc_get_comm_bridge = nullptr;
                 s_fn_arc_validate_tool = nullptr;
                 s_fn_arc_heartbeat = nullptr;
+                s_fn_arc_heartbeat_ex = nullptr;
                 s_fn_arc_cleanup = nullptr;
                 s_fn_arc_set_key_seed = nullptr;
                 s_fn_arc_unseal_feature = nullptr;
@@ -3796,6 +3818,7 @@ namespace
                 s_fn_arc_get_comm_bridge = nullptr;
                 s_fn_arc_validate_tool = nullptr;
                 s_fn_arc_heartbeat = nullptr;
+                s_fn_arc_heartbeat_ex = nullptr;
                 s_fn_arc_cleanup = nullptr;
                 s_fn_arc_set_key_seed = nullptr;
                 s_fn_arc_unseal_feature = nullptr;
@@ -3829,6 +3852,7 @@ namespace
                 s_fn_arc_get_comm_bridge = nullptr;
                 s_fn_arc_validate_tool = nullptr;
                 s_fn_arc_heartbeat = nullptr;
+                s_fn_arc_heartbeat_ex = nullptr;
                 s_fn_arc_cleanup = nullptr;
                 s_fn_arc_set_key_seed = nullptr;
                 s_fn_arc_unseal_feature = nullptr;
@@ -3969,6 +3993,7 @@ namespace
         s_fn_arc_get_comm_bridge = nullptr;
         s_fn_arc_validate_tool = nullptr;
         s_fn_arc_heartbeat = nullptr;
+        s_fn_arc_heartbeat_ex = nullptr;
         s_fn_arc_cleanup = nullptr;
         s_fn_arc_set_key_seed = nullptr;
         s_fn_arc_unseal_feature = nullptr;
