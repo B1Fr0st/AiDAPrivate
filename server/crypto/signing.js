@@ -6,6 +6,10 @@ let cachedPrivateKey = null;
 let cachedNextPrivateKey = null;
 let s_loggedPubFp = false;
 
+const PRIMARY_KID = parseInt(process.env.ED25519_PRIMARY_KID || '1', 10) || 1;
+const NEXT_KID = parseInt(process.env.ED25519_NEXT_KID || '2', 10) || 2;
+const PRIMARY_RETIRE_AT = parseInt(process.env.ED25519_PRIMARY_RETIRE_AT || '0', 10) || 0;
+
 
 function getSigningPrivateKey() {
     if (cachedPrivateKey) {
@@ -82,6 +86,28 @@ function signPayload(payloadObj) {
 }
 
 
+function activeKidForCanonical() {
+    const now = Math.floor(Date.now() / 1000);
+    if (PRIMARY_RETIRE_AT > 0 && now >= PRIMARY_RETIRE_AT) {
+        const nextKey = getNextSigningPrivateKey();
+        if (nextKey) return NEXT_KID;
+    }
+    return PRIMARY_KID;
+}
+
+function signWithKid(payloadObj) {
+    const kid = activeKidForCanonical();
+    const augmented = { ...payloadObj, kid };
+    const canonical = JSON.stringify(sortObjectKeys(augmented));
+    const buf = Buffer.from(canonical, 'utf8');
+    const key = (kid === NEXT_KID) ? getNextSigningPrivateKey() : getSigningPrivateKey();
+    if (!key) {
+        throw new Error('signWithKid: requested key id has no configured private key');
+    }
+    const signature = crypto.sign(null, buf, key).toString('hex');
+    return { kid, signature, canonical };
+}
+
 function dualSignPayload(payloadObj) {
     const canonical = JSON.stringify(sortObjectKeys(payloadObj));
     const buf = Buffer.from(canonical, 'utf8');
@@ -97,11 +123,20 @@ function dualSignPayload(payloadObj) {
         const nextKey = getNextSigningPrivateKey();
         if (nextKey) {
             const nextSignature = crypto.sign(null, buf, nextKey).toString('hex');
-            return { signature, next_signature: nextSignature };
+            return { signature, next_signature: nextSignature, kid: PRIMARY_KID, next_kid: NEXT_KID };
         }
     }
 
-    return { signature };
+    return { signature, kid: PRIMARY_KID };
+}
+
+function getActiveKidInfo() {
+    return {
+        primary_kid: PRIMARY_KID,
+        next_kid: NEXT_KID,
+        primary_retire_at: PRIMARY_RETIRE_AT,
+        active_kid: activeKidForCanonical(),
+    };
 }
 
 
@@ -113,6 +148,9 @@ function clearKeyCache() {
 module.exports = {
     signPayload,
     dualSignPayload,
+    signWithKid,
+    activeKidForCanonical,
+    getActiveKidInfo,
     getSigningPrivateKey,
     getNextSigningPrivateKey,
     sortObjectKeys,

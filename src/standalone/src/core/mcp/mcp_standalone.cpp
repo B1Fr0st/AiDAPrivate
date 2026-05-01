@@ -271,7 +271,7 @@ json server_t::handle_initialize(const json& id, const json&)
     server_info["version"] = SERVER_VERSION;
 
     static const char* instructions =
-        "You are connected to AiDA Standalone â€” a reverse-engineering assistant "
+        "You are connected to AiDA Standalone - a reverse-engineering assistant "
         "that operates through a kernel-backed live inspection bridge, "
         "Zydis for disassembly, and Windows Sandbox for safe sample execution.\n\n"
         "## Capabilities\n"
@@ -286,7 +286,7 @@ json server_t::handle_initialize(const json& id, const json&)
         "- Call `driver_attach` with a PID or process name before memory operations\n"
         "- Use `disassemble_address` for live memory; `disassemble_file` for PE files\n"
         "- Use `sandbox_execute` for running untrusted binaries safely\n"
-        "- For number conversions, ALWAYS use `convert_number` â€” never convert manually\n";
+        "- For number conversions, ALWAYS use `convert_number` - never convert manually\n";
 
     json result;
     result["protocolVersion"] = PROTOCOL_VERSION;
@@ -677,15 +677,19 @@ void server_t::server_thread_func(int port)
                 "text/event-stream",
                 [this](size_t offset, httplib::DataSink& sink) -> bool {
                     if (offset == 0) {
-                        std::string evt = ": connected\n\n";
-                        if (!sink.write(evt.c_str(), evt.size())) return false;
+                        const char connected[] = ": connected\n\n";
+                        if (!sink.write(connected, sizeof(connected) - 1u)) return false;
                     }
-                    for (int i = 0; i < 15; ++i) {
-                        std::this_thread::sleep_for(std::chrono::seconds(2));
-                        if (_stop_requested.load()) return false;
+                    const char ka[] = ": keepalive\n\n";
+                    for (int i = 0; i < 6; ++i) {
+                        for (int slice = 0; slice < 50; ++slice) {
+                            if (_stop_requested.load(std::memory_order_acquire)) return false;
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        }
+                        if (_stop_requested.load(std::memory_order_acquire)) return false;
+                        if (!sink.write(ka, sizeof(ka) - 1u)) return false;
                     }
-                    std::string ka = ": keepalive\n\n";
-                    return sink.write(ka.c_str(), ka.size());
+                    return true;
                 }, nullptr);
         } else {
             res.set_content("event: endpoint\ndata: /mcp\n\n", "text/event-stream");

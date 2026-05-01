@@ -1,5 +1,6 @@
 #pragma once
 #include <imports/Defs.h>
+#include <core/KernelCrypto.h>
 
 
 extern volatile PVOID  g_target_driver_base;
@@ -23,6 +24,8 @@ namespace heartbeat {
         volatile UINT64 sentinel_challenge;
         volatile UINT64 whoswho_response;
         volatile UINT64 challenge_issued_tsc;
+        volatile UINT64 challenge_counter;
+        volatile UINT8  challenge_tag[16];
     };
 
 
@@ -115,9 +118,41 @@ namespace heartbeat {
 
     constexpr UINT64 HEARTBEAT_TIMEOUT_TSC = 60ULL * 3000000000ULL;
     constexpr UINT64 CHALLENGE_TIMEOUT_TSC = 30ULL * 3000000000ULL;
-    constexpr UINT64 CHALLENGE_HMAC_KEY    = 0x7A3F1D9E5BC82A46ULL;
 
     inline volatile UINT64 g_bridge_crypt_key = 0;
+    inline UINT8 g_challenge_aes_key[kernel_crypto::AES256_KEY_SIZE]    = {};
+    inline UINT8 g_challenge_hmac_key[kernel_crypto::SHA256_DIGEST_SIZE] = {};
+    inline volatile LONG g_challenge_keys_valid = 0;
+    inline volatile LONG64 g_last_seen_challenge_counter = 0;
+    inline volatile LONG64 g_issued_challenge_counter    = 0;
+
+    __forceinline void derive_challenge_subkeys() {
+        UINT8 root[kernel_crypto::AES256_KEY_SIZE];
+        UINT64 root_seed[4];
+        root_seed[0] = g_bridge_crypt_key;
+        root_seed[1] = g_bridge_crypt_key ^ 0x9E3779B97F4A7C15ULL;
+        root_seed[2] = g_bridge_crypt_key * 0xBF58476D1CE4E5B9ULL;
+        root_seed[3] = g_bridge_crypt_key ^ 0x94D049BB133111EBULL;
+        RtlCopyMemory(root, root_seed, sizeof(root));
+
+        const UINT8 aes_label[]  = { 'a','i','d','a','-','b','r','i','d','g','e','-','a','e','s' };
+        const UINT8 hmac_label[] = { 'a','i','d','a','-','b','r','i','d','g','e','-','m','a','c' };
+
+        kernel_crypto::sw_hkdf_sha256(
+            nullptr, 0,
+            root, sizeof(root),
+            aes_label, sizeof(aes_label),
+            g_challenge_aes_key, kernel_crypto::AES256_KEY_SIZE);
+        kernel_crypto::sw_hkdf_sha256(
+            nullptr, 0,
+            root, sizeof(root),
+            hmac_label, sizeof(hmac_label),
+            g_challenge_hmac_key, kernel_crypto::SHA256_DIGEST_SIZE);
+
+        RtlSecureZeroMemory(root, sizeof(root));
+        RtlSecureZeroMemory(root_seed, sizeof(root_seed));
+        _InterlockedExchange(&g_challenge_keys_valid, 1);
+    }
 
     __forceinline void derive_bridge_key_from_whoswho(PVOID whoswho_base) {
         (void)whoswho_base;
@@ -132,6 +167,7 @@ namespace heartbeat {
         k *= 0xC4CEB9FE1A85EC53ULL;
         k ^= k >> 33;
         g_bridge_crypt_key = k;
+        derive_challenge_subkeys();
     }
 
     __forceinline void bridge_encrypt_cmd(ULONG& cmd, ULONG& param) {
@@ -140,8 +176,86 @@ namespace heartbeat {
         param ^= static_cast<ULONG>(key >> 32);
     }
 
-    __forceinline void bridge_encrypt_challenge(UINT64& challenge) {
-        challenge ^= _rotr64(g_bridge_crypt_key, 17);
+    __forceinline void build_challenge_nonce(UINT64 counter, UINT8 nonce_out[kernel_crypto::GCM_NONCE_SIZE]) {
+        for (ULONG i = 0; i < kernel_crypto::GCM_NONCE_SIZE; ++i) nonce_out[i] = 0;
+        for (ULONG i = 0; i < 8; ++i)
+            nonce_out[i] = static_cast<UINT8>((counter >> (i * 8)) & 0xFFu);
+        nonce_out[8]  = 0xA1u;
+        nonce_out[9]  = 0xDAu;
+        nonce_out[10] = 0xB7u;
+        nonce_out[11] = 0x53u;
+    }
+
+    __forceinline BOOLEAN bridge_encrypt_challenge_gcm(
+        UINT64 plaintext_challenge,
+        UINT64 counter,
+        UINT64& ciphertext_out,
+        UINT8  tag_out[kernel_crypto::GCM_TAG_SIZE])
+    {
+        if (_InterlockedCompareExchange(&g_challenge_keys_valid, 0, 0) == 0)
+            return FALSE;
+
+        UINT8 nonce[kernel_crypto::GCM_NONCE_SIZE];
+        build_challenge_nonce(counter, nonce);
+
+        UINT8 aad[16];
+        RtlCopyMemory(aad + 0, &counter, 8);
+        UINT64 magic = 0x57484F535F47434DULL;
+        RtlCopyMemory(aad + 8, &magic, 8);
+
+        UINT8 pt[8];
+        RtlCopyMemory(pt, &plaintext_challenge, 8);
+
+        UINT8 ct[8];
+        kernel_crypto::sw_aes256_gcm_encrypt(
+            g_challenge_aes_key, nonce,
+            aad, sizeof(aad),
+            pt, 8,
+            ct,
+            tag_out);
+
+        RtlCopyMemory(&ciphertext_out, ct, 8);
+        RtlSecureZeroMemory(nonce, sizeof(nonce));
+        RtlSecureZeroMemory(pt,    sizeof(pt));
+        RtlSecureZeroMemory(ct,    sizeof(ct));
+        return TRUE;
+    }
+
+    __forceinline BOOLEAN bridge_decrypt_challenge_gcm(
+        UINT64 ciphertext_in,
+        UINT64 counter,
+        const UINT8 tag_in[kernel_crypto::GCM_TAG_SIZE],
+        UINT64& plaintext_out)
+    {
+        if (_InterlockedCompareExchange(&g_challenge_keys_valid, 0, 0) == 0)
+            return FALSE;
+
+        UINT8 nonce[kernel_crypto::GCM_NONCE_SIZE];
+        build_challenge_nonce(counter, nonce);
+
+        UINT8 aad[16];
+        RtlCopyMemory(aad + 0, &counter, 8);
+        UINT64 magic = 0x57484F535F47434DULL;
+        RtlCopyMemory(aad + 8, &magic, 8);
+
+        UINT8 ct[8];
+        RtlCopyMemory(ct, &ciphertext_in, 8);
+
+        UINT8 pt[8];
+        BOOLEAN ok = kernel_crypto::sw_aes256_gcm_decrypt(
+            g_challenge_aes_key, nonce,
+            aad, sizeof(aad),
+            ct, 8,
+            tag_in,
+            pt);
+
+        if (ok) {
+            RtlCopyMemory(&plaintext_out, pt, 8);
+        }
+        RtlSecureZeroMemory(nonce, sizeof(nonce));
+        RtlSecureZeroMemory(pt,    sizeof(pt));
+        RtlSecureZeroMemory(ct,    sizeof(ct));
+        return ok;
     }
 
     inline volatile sentinel_bridge_t* g_bridge = nullptr;
@@ -404,13 +518,18 @@ namespace heartbeat {
     }
 
     __forceinline UINT64 compute_expected_response(UINT64 challenge) {
-        UINT64 h = challenge ^ CHALLENGE_HMAC_KEY;
-        h ^= h >> 33;
-        h *= 0xFF51AFD7ED558CCDULL;
-        h ^= h >> 33;
-        h *= 0xC4CEB9FE1A85EC53ULL;
-        h ^= h >> 33;
-        return h;
+        UINT8 mac[kernel_crypto::SHA256_DIGEST_SIZE];
+        UINT8 in[8];
+        RtlCopyMemory(in, &challenge, 8);
+        kernel_crypto::sw_hmac_sha256(
+            g_challenge_hmac_key, kernel_crypto::SHA256_DIGEST_SIZE,
+            in, 8,
+            mac);
+        UINT64 result;
+        RtlCopyMemory(&result, mac, 8);
+        RtlSecureZeroMemory(mac, sizeof(mac));
+        RtlSecureZeroMemory(in,  sizeof(in));
+        return result;
     }
 
     __forceinline void issue_challenge() {
@@ -419,12 +538,21 @@ namespace heartbeat {
         if (!g_bridge || !_MmIsAddressValid(reinterpret_cast<PVOID>(
                 const_cast<sentinel_bridge_t*>(g_bridge))))
             return;
+        if (_InterlockedCompareExchange(&g_challenge_keys_valid, 0, 0) == 0)
+            return;
 
         __try {
             UINT64 challenge = __rdtsc() ^ (static_cast<UINT64>(__rdtsc()) << 17);
             challenge |= 1;
-            UINT64 enc_challenge = challenge;
-            bridge_encrypt_challenge(enc_challenge);
+
+            UINT64 counter = static_cast<UINT64>(_InterlockedIncrement64(&g_issued_challenge_counter));
+
+            UINT64 ciphertext = 0;
+            UINT8  tag[kernel_crypto::GCM_TAG_SIZE];
+            if (!bridge_encrypt_challenge_gcm(challenge, counter, ciphertext, tag)) {
+                return;
+            }
+
             InterlockedExchange64(
                 const_cast<volatile LONG64*>(reinterpret_cast<volatile LONG64*>(
                     &g_bridge->whoswho_response)),
@@ -433,11 +561,19 @@ namespace heartbeat {
                 const_cast<volatile LONG64*>(reinterpret_cast<volatile LONG64*>(
                     &g_bridge->challenge_issued_tsc)),
                 static_cast<LONG64>(__rdtsc()));
+            for (ULONG i = 0; i < kernel_crypto::GCM_TAG_SIZE; ++i) {
+                g_bridge->challenge_tag[i] = tag[i];
+            }
+            InterlockedExchange64(
+                const_cast<volatile LONG64*>(reinterpret_cast<volatile LONG64*>(
+                    &g_bridge->challenge_counter)),
+                static_cast<LONG64>(counter));
             InterlockedExchange64(
                 const_cast<volatile LONG64*>(reinterpret_cast<volatile LONG64*>(
                     &g_bridge->sentinel_challenge)),
-                static_cast<LONG64>(enc_challenge));
-            SN_LOG("heartbeat::issue_challenge: challenge=0x%llx", challenge);
+                static_cast<LONG64>(ciphertext));
+            SN_LOG("heartbeat::issue_challenge: challenge=0x%llx counter=%llu", challenge, counter);
+            RtlSecureZeroMemory(tag, sizeof(tag));
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             SN_LOG("heartbeat::issue_challenge: EXCEPTION");
         }
@@ -452,6 +588,8 @@ namespace heartbeat {
         if (!g_bridge || !_MmIsAddressValid(reinterpret_cast<PVOID>(
                 const_cast<sentinel_bridge_t*>(g_bridge))))
             return true;
+        if (_InterlockedCompareExchange(&g_challenge_keys_valid, 0, 0) == 0)
+            return true;
 
         __try {
             UINT64 enc_challenge = static_cast<UINT64>(g_bridge->sentinel_challenge);
@@ -463,8 +601,30 @@ namespace heartbeat {
             if (now - issued_tsc < 10ULL * 3000000000ULL)
                 return true;
 
-            UINT64 challenge = enc_challenge;
-            bridge_encrypt_challenge(challenge);
+            UINT64 counter = static_cast<UINT64>(g_bridge->challenge_counter);
+            UINT8 tag[kernel_crypto::GCM_TAG_SIZE];
+            for (ULONG i = 0; i < kernel_crypto::GCM_TAG_SIZE; ++i)
+                tag[i] = g_bridge->challenge_tag[i];
+
+            UINT64 challenge = 0;
+            BOOLEAN dec_ok = bridge_decrypt_challenge_gcm(enc_challenge, counter, tag, challenge);
+            RtlSecureZeroMemory(tag, sizeof(tag));
+            if (!dec_ok) {
+                LONG fails = _InterlockedIncrement(&g_challenge_failures);
+                SN_LOG("heartbeat::verify_challenge: GCM_TAG_FAIL fails=%ld", fails);
+                if (fails >= CHALLENGE_FAILURE_THRESHOLD) {
+                    return register_quorum_failure(
+                        QUORUM_FAIL_CHALL,
+                        static_cast<ULONG_PTR>(counter),
+                        static_cast<ULONG_PTR>(enc_challenge),
+                        static_cast<ULONG_PTR>(fails));
+                }
+                InterlockedExchange64(
+                    const_cast<volatile LONG64*>(reinterpret_cast<volatile LONG64*>(
+                        &g_bridge->sentinel_challenge)),
+                    0);
+                return true;
+            }
 
             UINT64 response = static_cast<UINT64>(g_bridge->whoswho_response);
             UINT64 expected = compute_expected_response(challenge);
@@ -475,7 +635,7 @@ namespace heartbeat {
                     const_cast<volatile LONG64*>(reinterpret_cast<volatile LONG64*>(
                         &g_bridge->sentinel_challenge)),
                     0);
-                SN_LOG("heartbeat::verify_challenge: PASS");
+                SN_LOG("heartbeat::verify_challenge: PASS counter=%llu", counter);
                 return true;
             }
 

@@ -229,6 +229,28 @@ const char* arc_protect_name(DWORD protect)
     }
 }
 
+__forceinline uint64_t qpc_freq_value()
+{
+    static LARGE_INTEGER s_freq{};
+    if (s_freq.QuadPart == 0) QueryPerformanceFrequency(&s_freq);
+    return static_cast<uint64_t>(s_freq.QuadPart);
+}
+
+__forceinline uint64_t qpc_now_ticks()
+{
+    LARGE_INTEGER c{};
+    QueryPerformanceCounter(&c);
+    return static_cast<uint64_t>(c.QuadPart);
+}
+
+__forceinline uint64_t qpc_now_us()
+{
+    uint64_t f = qpc_freq_value();
+    if (f == 0) return 0;
+    uint64_t t = qpc_now_ticks();
+    return (t * 1000000ULL) / f;
+}
+
 uint64_t fnv1a_region_seh(const void* data, size_t len, bool& ok)
 {
     ok = false;
@@ -2115,7 +2137,7 @@ ARC_API bool arc_init(
         session_hash_capture = fnv1a_str(session_token);
         hwid_hash_capture = fnv1a_str(hwid);
         init_timestamp_capture = static_cast<uint64_t>(timestamp);
-        last_heartbeat_tsc_capture = __rdtsc();
+        last_heartbeat_tsc_capture = qpc_now_us();
 
         uint64_t key_material = local_hwid_hash_capture ^ session_hash_capture ^ tsc;
         uint8_t kb[16];
@@ -2575,25 +2597,25 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
             CFF_EXIT(hb_cff);
         }
 
-        uint64_t current_tsc = __rdtsc();
-        if (current_tsc < sess.last_heartbeat_tsc)
+        uint64_t current_qpc = qpc_now_us();
+        if (current_qpc < sess.last_heartbeat_tsc)
         {
             char detail[96];
             _snprintf_s(detail, sizeof(detail), _TRUNCATE,
                 "current=0x%016llX last=0x%016llX",
-                static_cast<unsigned long long>(current_tsc),
+                static_cast<unsigned long long>(current_qpc),
                 static_cast<unsigned long long>(sess.last_heartbeat_tsc));
-            enforce_violation("arc_tsc_rollback", detail);
+            enforce_violation("arc_qpc_rollback", detail);
         }
         {
             char dbg[96];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "heartbeat_ok counter=%llu tsc=0x%016llX",
+                "heartbeat_ok counter=%llu qpc=0x%016llX",
                 static_cast<unsigned long long>(sess.heartbeat_counter + 1),
-                static_cast<unsigned long long>(current_tsc));
+                static_cast<unsigned long long>(current_qpc));
             arc_log("heartbeat", dbg);
         }
-        sess.last_heartbeat_tsc = current_tsc;
+        sess.last_heartbeat_tsc = current_qpc;
         sess.heartbeat_counter++;
 
         if (!load_bind_secret())
@@ -2744,17 +2766,17 @@ ARC_API arc_heartbeat_result_t arc_heartbeat_ex(uint64_t hb_count, const char* c
             CFF_EXIT(hbex_cff);
         }
 
-        uint64_t current_tsc = __rdtsc();
-        if (current_tsc < sess.last_heartbeat_tsc)
+        uint64_t current_qpc = qpc_now_us();
+        if (current_qpc < sess.last_heartbeat_tsc)
         {
             char detail[96];
             _snprintf_s(detail, sizeof(detail), _TRUNCATE,
                 "current=0x%016llX last=0x%016llX",
-                static_cast<unsigned long long>(current_tsc),
+                static_cast<unsigned long long>(current_qpc),
                 static_cast<unsigned long long>(sess.last_heartbeat_tsc));
-            enforce_violation("arc_tsc_rollback", detail);
+            enforce_violation("arc_qpc_rollback", detail);
         }
-        sess.last_heartbeat_tsc = current_tsc;
+        sess.last_heartbeat_tsc = current_qpc;
         sess.heartbeat_counter++;
 
         if (!load_bind_secret())

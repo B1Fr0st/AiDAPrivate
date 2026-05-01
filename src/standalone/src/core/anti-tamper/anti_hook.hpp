@@ -2,14 +2,24 @@
 
 #include <windows.h>
 #include <psapi.h>
+#include <tlhelp32.h>
+#include <bcrypt.h>
+#include <winternl.h>
 
+#include <atomic>
 #include <cstdint>
+#include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "webhook.hpp"
 #include "state.hpp"
 #include "syscall.hpp"
+
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "ntdll.lib")
 
 namespace anti_tamper {
 namespace anti_hook {
@@ -21,19 +31,54 @@ struct hook_report_t
     bool kernel32_inline_hooked = false;
     bool syscall_stubs_modified = false;
     bool eat_hooked = false;
+    bool prologue_hash_mismatch = false;
+    bool disk_image_mismatch = false;
+    bool veh_chain_tampered = false;
+    bool dr_in_text_range = false;
+    bool dispatch_table_redirected = false;
     std::string hooked_function;
     std::string summary;
 
     bool any_detected() const
     {
         return iat_modified || ntdll_inline_hooked || kernel32_inline_hooked
-            || syscall_stubs_modified || eat_hooked;
+            || syscall_stubs_modified || eat_hooked
+            || prologue_hash_mismatch || disk_image_mismatch
+            || veh_chain_tampered || dr_in_text_range
+            || dispatch_table_redirected;
     }
 };
 
 namespace detail {
 
-    inline bool check_inline_hook_bytes(const uint8_t* func, const char* name)
+    inline bool sha256_hash(const void* data, size_t size, uint8_t out[32])
+    {
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+        bool ok = false;
+
+        if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
+            return false;
+
+        if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) != 0)
+        {
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return false;
+        }
+
+        if (BCryptHashData(hHash,
+            const_cast<PUCHAR>(static_cast<const uint8_t*>(data)),
+            static_cast<ULONG>(size), 0) == 0)
+        {
+            ok = (BCryptFinishHash(hHash, out, 32, 0) == 0);
+        }
+
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return ok;
+    }
+
+    inline bool check_inline_hook_bytes(const uint8_t* func, const char*)
     {
         __try
         {
@@ -73,9 +118,7 @@ namespace detail {
                 return false;
 
             if (func[8] == 0xF6 && func[12] == 0x75)
-            {
                 return true;
-            }
 
             if (func[8] == 0x0F && func[9] == 0x05)
                 return true;
@@ -104,10 +147,6 @@ namespace detail {
         return true;
     }
 
-}
-
-namespace detail {
-
     __declspec(noinline) inline bool safe_read_uint64(uint64_t addr, uint64_t* out)
     {
         __try {
@@ -117,6 +156,578 @@ namespace detail {
             *out = 0;
             return false;
         }
+    }
+
+    inline const char* const k_critical_ntdll_funcs[] = {
+        "NtQueryInformationProcess",
+        "NtQuerySystemInformation",
+        "NtSetInformationThread",
+        "NtClose",
+        "NtProtectVirtualMemory",
+        "NtReadVirtualMemory",
+        "NtWriteVirtualMemory",
+        "LdrLoadDll",
+        "NtCreateFile",
+        "NtOpenProcess",
+        "NtAllocateVirtualMemory",
+        "NtQueryVirtualMemory",
+    };
+
+    inline const char* const k_critical_kernel32_funcs[] = {
+        "IsDebuggerPresent",
+        "CheckRemoteDebuggerPresent",
+        "VirtualProtect",
+        "VirtualQuery",
+        "GetModuleHandleW",
+        "GetProcAddress",
+        "VirtualAlloc",
+        "VirtualFree",
+    };
+
+    constexpr size_t k_prologue_bytes = 32;
+
+    struct prologue_baseline_t
+    {
+        std::string name;
+        uint8_t hash[32];
+        uint64_t cached_va;
+    };
+
+    inline std::vector<prologue_baseline_t>& ntdll_baselines()
+    {
+        static std::vector<prologue_baseline_t> v;
+        return v;
+    }
+
+    inline std::vector<prologue_baseline_t>& kernel32_baselines()
+    {
+        static std::vector<prologue_baseline_t> v;
+        return v;
+    }
+
+    inline std::atomic<bool>& baselines_captured()
+    {
+        static std::atomic<bool> v{false};
+        return v;
+    }
+
+    inline std::mutex& baseline_mtx()
+    {
+        static std::mutex m;
+        return m;
+    }
+
+    struct disk_image_t
+    {
+        std::vector<uint8_t> bytes;
+        std::vector<std::pair<std::string, uint32_t>> exports;
+        bool valid = false;
+    };
+
+    inline disk_image_t& ntdll_disk_image()
+    {
+        static disk_image_t v;
+        return v;
+    }
+
+    inline std::atomic<bool>& disk_image_loaded()
+    {
+        static std::atomic<bool> v{false};
+        return v;
+    }
+
+    inline bool load_disk_image_ntdll()
+    {
+        auto& img = ntdll_disk_image();
+        if (img.valid) return true;
+
+        wchar_t sys_path[MAX_PATH];
+        GetSystemDirectoryW(sys_path, MAX_PATH);
+        wcscat_s(sys_path, L"\\ntdll.dll");
+
+        HANDLE hFile = CreateFileW(sys_path, GENERIC_READ, FILE_SHARE_READ,
+                                   nullptr, OPEN_EXISTING, 0, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) return false;
+
+        LARGE_INTEGER size{};
+        if (!GetFileSizeEx(hFile, &size) || size.QuadPart <= 0
+            || size.QuadPart > 0x4000000)
+        {
+            CloseHandle(hFile);
+            return false;
+        }
+
+        img.bytes.resize(static_cast<size_t>(size.QuadPart));
+        DWORD read_total = 0;
+        DWORD this_read = 0;
+        bool ok = true;
+        while (read_total < img.bytes.size())
+        {
+            DWORD want = static_cast<DWORD>(img.bytes.size() - read_total);
+            if (!ReadFile(hFile, img.bytes.data() + read_total, want, &this_read, nullptr)
+                || this_read == 0)
+            {
+                ok = false;
+                break;
+            }
+            read_total += this_read;
+        }
+        CloseHandle(hFile);
+        if (!ok) return false;
+
+        const uint8_t* mapped = img.bytes.data();
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(mapped);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+            mapped + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+        const auto& exp_dir = nt->OptionalHeader.DataDirectory[
+            IMAGE_DIRECTORY_ENTRY_EXPORT];
+        if (exp_dir.VirtualAddress == 0) return false;
+
+        auto rva_to_off = [&](uint32_t rva) -> uint32_t {
+            const auto* sec = IMAGE_FIRST_SECTION(nt);
+            for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+            {
+                if (rva >= sec[i].VirtualAddress &&
+                    rva < sec[i].VirtualAddress + sec[i].Misc.VirtualSize)
+                {
+                    return rva - sec[i].VirtualAddress + sec[i].PointerToRawData;
+                }
+            }
+            return 0;
+        };
+
+        uint32_t exp_off = rva_to_off(exp_dir.VirtualAddress);
+        if (exp_off == 0) return false;
+
+        const auto* exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(
+            mapped + exp_off);
+        uint32_t names_off = rva_to_off(exports->AddressOfNames);
+        uint32_t funcs_off = rva_to_off(exports->AddressOfFunctions);
+        uint32_t ords_off  = rva_to_off(exports->AddressOfNameOrdinals);
+        if (!names_off || !funcs_off || !ords_off) return false;
+
+        const uint32_t* names = reinterpret_cast<const uint32_t*>(mapped + names_off);
+        const uint32_t* funcs = reinterpret_cast<const uint32_t*>(mapped + funcs_off);
+        const uint16_t* ords  = reinterpret_cast<const uint16_t*>(mapped + ords_off);
+
+        img.exports.reserve(exports->NumberOfNames);
+        for (uint32_t i = 0; i < exports->NumberOfNames; ++i)
+        {
+            uint32_t name_off = rva_to_off(names[i]);
+            if (!name_off) continue;
+            const char* exp_name = reinterpret_cast<const char*>(mapped + name_off);
+            uint16_t ord = ords[i];
+            if (ord >= exports->NumberOfFunctions) continue;
+            uint32_t func_rva = funcs[ord];
+            uint32_t file_off = rva_to_off(func_rva);
+            if (!file_off) continue;
+            img.exports.emplace_back(std::string(exp_name), file_off);
+        }
+
+        img.valid = !img.exports.empty();
+        return img.valid;
+    }
+
+    inline const uint8_t* disk_export_bytes(const char* name)
+    {
+        auto& img = ntdll_disk_image();
+        if (!img.valid) return nullptr;
+        for (const auto& kv : img.exports)
+        {
+            if (kv.first == name)
+                return img.bytes.data() + kv.second;
+        }
+        return nullptr;
+    }
+
+}
+
+namespace baseline {
+
+    __declspec(noinline) inline bool seh_hash_prologue(const uint8_t* addr, uint8_t out_hash[32])
+    {
+        __try
+        {
+            return detail::sha256_hash(addr, detail::k_prologue_bytes, out_hash);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    inline bool capture_module_prologues(HMODULE mod,
+        std::vector<detail::prologue_baseline_t>& out,
+        const char* const* names, size_t name_count)
+    {
+        out.clear();
+        if (!mod) return false;
+
+        for (size_t i = 0; i < name_count; ++i)
+        {
+            const char* name = names[i];
+            auto* addr = reinterpret_cast<const uint8_t*>(GetProcAddress(mod, name));
+            if (!addr) continue;
+
+            detail::prologue_baseline_t b{};
+            b.name = name;
+            b.cached_va = reinterpret_cast<uint64_t>(addr);
+
+            if (!seh_hash_prologue(addr, b.hash))
+                continue;
+
+            out.push_back(std::move(b));
+        }
+
+        return !out.empty();
+    }
+
+    inline bool capture_all()
+    {
+        std::lock_guard<std::mutex> lk(detail::baseline_mtx());
+        if (detail::baselines_captured().load()) return true;
+
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        HMODULE k32   = GetModuleHandleW(L"kernel32.dll");
+
+        bool ok_n = capture_module_prologues(ntdll, detail::ntdll_baselines(),
+            detail::k_critical_ntdll_funcs,
+            sizeof(detail::k_critical_ntdll_funcs) / sizeof(char*));
+
+        bool ok_k = capture_module_prologues(k32, detail::kernel32_baselines(),
+            detail::k_critical_kernel32_funcs,
+            sizeof(detail::k_critical_kernel32_funcs) / sizeof(char*));
+
+        if (detail::load_disk_image_ntdll())
+            detail::disk_image_loaded().store(true);
+
+        bool any = ok_n || ok_k;
+        if (any)
+            detail::baselines_captured().store(true);
+        return any;
+    }
+
+}
+
+namespace veh_chain {
+
+    struct _VECTORED_HANDLER_LIST
+    {
+        LIST_ENTRY ListHead;
+        SRWLOCK    Lock;
+    };
+
+    struct _VECTORED_HANDLER_ENTRY
+    {
+        LIST_ENTRY  Entry;
+        ULONG       Refs;
+        ULONG       Padding;
+        PVOID       VectoredHandler;
+    };
+
+    inline std::atomic<uint32_t>& baseline_count()
+    {
+        static std::atomic<uint32_t> v{0};
+        return v;
+    }
+
+    inline std::vector<uint64_t>& baseline_handlers()
+    {
+        static std::vector<uint64_t> v;
+        return v;
+    }
+
+    inline std::mutex& chain_mtx()
+    {
+        static std::mutex m;
+        return m;
+    }
+
+    inline std::atomic<bool>& baseline_set()
+    {
+        static std::atomic<bool> v{false};
+        return v;
+    }
+
+    inline std::atomic<uint64_t>& list_head_addr()
+    {
+        static std::atomic<uint64_t> v{0};
+        return v;
+    }
+
+    inline uint64_t locate_veh_list_head()
+    {
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (!ntdll) return 0;
+
+        auto* probe1 = reinterpret_cast<const uint8_t*>(
+            GetProcAddress(ntdll, "RtlAddVectoredExceptionHandler"));
+        auto* probe2 = reinterpret_cast<const uint8_t*>(
+            GetProcAddress(ntdll, "RtlRemoveVectoredExceptionHandler"));
+        if (!probe1 || !probe2) return 0;
+
+        const uint8_t* scan_targets[] = { probe1, probe2 };
+        for (const uint8_t* base : scan_targets)
+        {
+            __try
+            {
+                for (size_t off = 0; off < 0x200; ++off)
+                {
+                    if (base[off] == 0x48 && base[off + 1] == 0x8D
+                        && (base[off + 2] == 0x0D || base[off + 2] == 0x15
+                            || base[off + 2] == 0x05 || base[off + 2] == 0x1D))
+                    {
+                        int32_t disp = *reinterpret_cast<const int32_t*>(base + off + 3);
+                        uint64_t target = reinterpret_cast<uint64_t>(base + off + 7) + disp;
+                        MEMORY_BASIC_INFORMATION mbi{};
+                        if (VirtualQuery(reinterpret_cast<LPCVOID>(target), &mbi, sizeof(mbi))
+                            && (mbi.Protect == PAGE_READWRITE
+                                || mbi.Protect == PAGE_READONLY))
+                        {
+                            return target;
+                        }
+                    }
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                continue;
+            }
+        }
+        return 0;
+    }
+
+    inline bool walk_chain(std::vector<uint64_t>& handlers, uint32_t& count)
+    {
+        handlers.clear();
+        count = 0;
+
+        uint64_t head_addr = list_head_addr().load();
+        if (head_addr == 0)
+        {
+            head_addr = locate_veh_list_head();
+            if (head_addr == 0) return false;
+            list_head_addr().store(head_addr);
+        }
+
+        auto* head = reinterpret_cast<_VECTORED_HANDLER_LIST*>(head_addr);
+
+        __try
+        {
+            LIST_ENTRY* cursor = head->ListHead.Flink;
+            uint32_t guard = 0;
+            while (cursor != &head->ListHead && guard < 256)
+            {
+                auto* entry = CONTAINING_RECORD(cursor, _VECTORED_HANDLER_ENTRY, Entry);
+                handlers.push_back(reinterpret_cast<uint64_t>(entry->VectoredHandler));
+                cursor = cursor->Flink;
+                ++guard;
+                if (!cursor) break;
+            }
+            count = guard;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+        return true;
+    }
+
+    inline bool capture_baseline()
+    {
+        std::lock_guard<std::mutex> lk(chain_mtx());
+        if (baseline_set().load()) return true;
+
+        uint32_t count = 0;
+        std::vector<uint64_t> hs;
+        if (!walk_chain(hs, count)) return false;
+
+        baseline_count().store(count);
+        baseline_handlers() = std::move(hs);
+        baseline_set().store(true);
+        return true;
+    }
+
+    inline bool verify_chain()
+    {
+        if (!baseline_set().load())
+        {
+            capture_baseline();
+            return true;
+        }
+
+        std::lock_guard<std::mutex> lk(chain_mtx());
+        std::vector<uint64_t> hs;
+        uint32_t count = 0;
+        if (!walk_chain(hs, count)) return true;
+
+        if (count != baseline_count().load()) return false;
+
+        const auto& base = baseline_handlers();
+        if (hs.size() != base.size()) return false;
+        for (size_t i = 0; i < hs.size(); ++i)
+        {
+            if (hs[i] != base[i]) return false;
+        }
+        return true;
+    }
+
+}
+
+namespace dr_scan {
+
+    inline bool any_dr_in_text_range(uint64_t text_base, uint64_t text_end)
+    {
+        if (text_base == 0 || text_end <= text_base) return false;
+
+        DWORD self_pid = GetCurrentProcessId();
+        DWORD self_tid = GetCurrentThreadId();
+
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) return false;
+
+        THREADENTRY32 te{};
+        te.dwSize = sizeof(te);
+        bool ok = false;
+
+        if (Thread32First(snap, &te))
+        {
+            do
+            {
+                if (te.th32OwnerProcessID != self_pid) continue;
+                if (te.th32ThreadID == self_tid) continue;
+
+                HANDLE ht = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
+                    FALSE, te.th32ThreadID);
+                if (!ht) continue;
+
+                CONTEXT ctx{};
+                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
+                DWORD prev_susp = SuspendThread(ht);
+                if (prev_susp != static_cast<DWORD>(-1))
+                {
+                    if (GetThreadContext(ht, &ctx))
+                    {
+                        const uint64_t drs[4] = { ctx.Dr0, ctx.Dr1, ctx.Dr2, ctx.Dr3 };
+                        const uint64_t dr7 = ctx.Dr7;
+                        for (int i = 0; i < 4; ++i)
+                        {
+                            if (drs[i] == 0) continue;
+                            const bool en_local  = (dr7 >> (i * 2))     & 1;
+                            const bool en_global = (dr7 >> (i * 2 + 1)) & 1;
+                            if (!en_local && !en_global) continue;
+                            if (drs[i] >= text_base && drs[i] < text_end)
+                            {
+                                ok = true;
+                                break;
+                            }
+                        }
+                    }
+                    ResumeThread(ht);
+                }
+                CloseHandle(ht);
+                if (ok) break;
+            } while (Thread32Next(snap, &te));
+        }
+        CloseHandle(snap);
+
+        if (!ok)
+        {
+            CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(GetCurrentThread(), &ctx))
+            {
+                const uint64_t drs[4] = { ctx.Dr0, ctx.Dr1, ctx.Dr2, ctx.Dr3 };
+                const uint64_t dr7 = ctx.Dr7;
+                for (int i = 0; i < 4; ++i)
+                {
+                    if (drs[i] == 0) continue;
+                    const bool en_local  = (dr7 >> (i * 2))     & 1;
+                    const bool en_global = (dr7 >> (i * 2 + 1)) & 1;
+                    if (!en_local && !en_global) continue;
+                    if (drs[i] >= text_base && drs[i] < text_end)
+                    {
+                        ok = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        return ok;
+    }
+
+}
+
+namespace dispatch_check {
+
+    inline bool dispatch_redirected_to_foreign_module(std::string& which)
+    {
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (!ntdll) return false;
+
+        detail::module_range_t ntdll_range{};
+        if (!detail::get_module_range(ntdll, ntdll_range))
+            return false;
+
+        const char* const probes[] = {
+            "NtClose",
+            "NtQueryInformationProcess",
+            "NtQuerySystemInformation",
+            "NtSetInformationThread",
+            "NtProtectVirtualMemory",
+        };
+
+        for (const char* name : probes)
+        {
+            auto* fn = reinterpret_cast<const uint8_t*>(GetProcAddress(ntdll, name));
+            if (!fn) continue;
+
+            __try
+            {
+                for (size_t off = 0; off + 5 < 0x40; ++off)
+                {
+                    if (fn[off] == 0xE9 || fn[off] == 0xEB)
+                    {
+                        int32_t disp = (fn[off] == 0xE9)
+                            ? *reinterpret_cast<const int32_t*>(fn + off + 1)
+                            : static_cast<int32_t>(static_cast<int8_t>(fn[off + 1]));
+                        size_t skip = (fn[off] == 0xE9) ? 5 : 2;
+                        uint64_t target = reinterpret_cast<uint64_t>(fn + off) + skip + disp;
+
+                        if (target < ntdll_range.base || target >= ntdll_range.end)
+                        {
+                            which = name;
+                            return true;
+                        }
+                    }
+
+                    if (fn[off] == 0xFF && fn[off + 1] == 0x25)
+                    {
+                        int32_t disp = *reinterpret_cast<const int32_t*>(fn + off + 2);
+                        uint64_t slot = reinterpret_cast<uint64_t>(fn + off) + 6 + disp;
+                        uint64_t target = 0;
+                        if (!detail::safe_read_uint64(slot, &target)) break;
+                        if (target == 0) break;
+                        if (target < ntdll_range.base || target >= ntdll_range.end)
+                        {
+                            which = name;
+                            return true;
+                        }
+                    }
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                continue;
+            }
+        }
+        return false;
     }
 
 }
@@ -202,27 +813,88 @@ inline bool verify_iat_target_modules(const std::vector<state::iat_entry_t>& sna
     return true;
 }
 
+inline bool verify_prologue_hashes(std::string& mismatched_name)
+{
+    if (!detail::baselines_captured().load())
+        baseline::capture_all();
+
+    std::lock_guard<std::mutex> lk(detail::baseline_mtx());
+
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    HMODULE k32   = GetModuleHandleW(L"kernel32.dll");
+
+    const std::vector<detail::prologue_baseline_t>* sets[2] = {
+        &detail::ntdll_baselines(), &detail::kernel32_baselines()
+    };
+    HMODULE mods[2] = { ntdll, k32 };
+
+    for (size_t s = 0; s < 2; ++s)
+    {
+        if (!mods[s]) continue;
+        for (const auto& b : *sets[s])
+        {
+            auto* addr = reinterpret_cast<const uint8_t*>(
+                GetProcAddress(mods[s], b.name.c_str()));
+            if (!addr) continue;
+
+            uint8_t hash[32]{};
+            if (!baseline::seh_hash_prologue(addr, hash))
+                continue;
+
+            if (memcmp(hash, b.hash, 32) != 0)
+            {
+                mismatched_name = b.name;
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+inline bool verify_disk_image(std::string& mismatched_name)
+{
+    if (!detail::disk_image_loaded().load())
+    {
+        if (!detail::load_disk_image_ntdll())
+            return true;
+        detail::disk_image_loaded().store(true);
+    }
+
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return true;
+
+    for (const char* name : detail::k_critical_ntdll_funcs)
+    {
+        const uint8_t* mem_bytes = reinterpret_cast<const uint8_t*>(
+            GetProcAddress(ntdll, name));
+        if (!mem_bytes) continue;
+
+        const uint8_t* disk_bytes = detail::disk_export_bytes(name);
+        if (!disk_bytes) continue;
+
+        __try
+        {
+            if (memcmp(mem_bytes, disk_bytes, detail::k_prologue_bytes) != 0)
+            {
+                mismatched_name = name;
+                return false;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            continue;
+        }
+    }
+    return true;
+}
+
 inline bool scan_inline_hooks_ntdll(std::string& hooked_name)
 {
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!ntdll) return false;
 
-    const char* critical_funcs[] = {
-        "NtQueryInformationProcess",
-        "NtQuerySystemInformation",
-        "NtSetInformationThread",
-        "NtClose",
-        "NtProtectVirtualMemory",
-        "NtReadVirtualMemory",
-        "NtWriteVirtualMemory",
-        "LdrLoadDll",
-        "NtCreateFile",
-        "NtOpenProcess",
-        "NtAllocateVirtualMemory",
-        "NtQueryVirtualMemory",
-    };
-
-    for (const auto& name : critical_funcs)
+    for (const char* name : detail::k_critical_ntdll_funcs)
     {
         auto* addr = reinterpret_cast<const uint8_t*>(GetProcAddress(ntdll, name));
         if (!addr) continue;
@@ -241,18 +913,7 @@ inline bool scan_inline_hooks_kernel32(std::string& hooked_name)
     HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
     if (!k32) return false;
 
-    const char* critical_funcs[] = {
-        "IsDebuggerPresent",
-        "CheckRemoteDebuggerPresent",
-        "VirtualProtect",
-        "VirtualQuery",
-        "GetModuleHandleW",
-        "GetProcAddress",
-        "VirtualAlloc",
-        "VirtualFree",
-    };
-
-    for (const auto& name : critical_funcs)
+    for (const char* name : detail::k_critical_kernel32_funcs)
     {
         auto* addr = reinterpret_cast<const uint8_t*>(GetProcAddress(k32, name));
         if (!addr) continue;
@@ -336,6 +997,11 @@ inline hook_report_t full_scan(const std::vector<state::iat_entry_t>& iat_snap)
 {
     hook_report_t report{};
 
+    if (!detail::baselines_captured().load())
+        baseline::capture_all();
+    if (!veh_chain::baseline_set().load())
+        veh_chain::capture_baseline();
+
     report.iat_modified = !verify_iat_entries(iat_snap);
     if (report.iat_modified)
         webhook::send_debug_log("iat_hook", "iat_entry_modified", true);
@@ -375,6 +1041,44 @@ inline hook_report_t full_scan(const std::vector<state::iat_entry_t>& iat_snap)
     if (report.eat_hooked)
         webhook::send_debug_log("eat_hook", "ntdll_eat_rva_outside_module", true);
 
+    std::string proem;
+    report.prologue_hash_mismatch = !verify_prologue_hashes(proem);
+    if (report.prologue_hash_mismatch)
+    {
+        report.hooked_function = proem;
+        webhook::send_debug_log("prologue_hash", "prologue_mismatch: " + proem, true);
+    }
+
+    std::string disk_name;
+    report.disk_image_mismatch = !verify_disk_image(disk_name);
+    if (report.disk_image_mismatch)
+    {
+        report.hooked_function = disk_name;
+        webhook::send_debug_log("disk_image", "disk_mismatch: " + disk_name, true);
+    }
+
+    report.veh_chain_tampered = !veh_chain::verify_chain();
+    if (report.veh_chain_tampered)
+        webhook::send_debug_log("veh_chain", "veh_chain_modified", true);
+
+    auto& rt = state::get();
+    if (rt.code_snap.text_base != 0 && rt.code_snap.text_size != 0)
+    {
+        uint64_t text_end = rt.code_snap.text_base + rt.code_snap.text_size;
+        report.dr_in_text_range = dr_scan::any_dr_in_text_range(
+            rt.code_snap.text_base, text_end);
+        if (report.dr_in_text_range)
+            webhook::send_debug_log("dr_scan", "dr_in_text_range", true);
+    }
+
+    std::string redir_name;
+    report.dispatch_table_redirected = dispatch_check::dispatch_redirected_to_foreign_module(redir_name);
+    if (report.dispatch_table_redirected)
+    {
+        report.hooked_function = redir_name;
+        webhook::send_debug_log("dispatch_redirect", "redirected: " + redir_name, true);
+    }
+
     if (syscall::is_initialized())
     {
         std::string disk_hooked;
@@ -394,6 +1098,11 @@ inline hook_report_t full_scan(const std::vector<state::iat_entry_t>& iat_snap)
     if (report.kernel32_inline_hooked) report.summary += "k32:" + k32_hooked + " ";
     if (report.syscall_stubs_modified) report.summary += "syscall ";
     if (report.eat_hooked) report.summary += "eat ";
+    if (report.prologue_hash_mismatch) report.summary += "prologue:" + proem + " ";
+    if (report.disk_image_mismatch) report.summary += "disk:" + disk_name + " ";
+    if (report.veh_chain_tampered) report.summary += "veh ";
+    if (report.dr_in_text_range) report.summary += "dr ";
+    if (report.dispatch_table_redirected) report.summary += "redir:" + redir_name + " ";
 
     return report;
 }

@@ -18,10 +18,9 @@
 #include "integrity.hpp"
 #include "enforcement.hpp"
 #include "webhook.hpp"
+#include "binary_protocol.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_license.hpp"
-#include "../../../../../libs/cpp-httplib/httplib.h"
-#include "../../../../../libs/nlohmann/json.hpp"
 
 namespace anti_tamper {
 namespace server_pages {
@@ -118,6 +117,24 @@ namespace detail {
         return "http://localhost:3000";
 #else
         return "https://aidapro.net";
+#endif
+    }
+
+    inline std::string get_api_hostname()
+    {
+#ifdef AIDA_LOCAL_LICENSE_SERVER
+        return "localhost";
+#else
+        return "aidapro.net";
+#endif
+    }
+
+    inline int get_api_port()
+    {
+#ifdef AIDA_LOCAL_LICENSE_SERVER
+        return 3000;
+#else
+        return 443;
 #endif
     }
 
@@ -301,56 +318,77 @@ namespace detail {
                                        int64_t issued_at,
                                        std::vector<uint8_t>& out_plaintext)
     {
-        httplib::Client cli(get_api_host());
-        cli.set_address_family(AF_INET);
-        cli.set_connection_timeout(FETCH_TIMEOUT_SEC);
-        cli.set_read_timeout(FETCH_TIMEOUT_SEC);
-        cli.set_write_timeout(FETCH_TIMEOUT_SEC);
-        cli.set_keep_alive(false);
-        cli.set_tcp_nodelay(true);
-        cli.set_decompress(true);
-        cli.set_follow_location(true);
-        cli.enable_server_certificate_verification(true);
+        std::vector<uint8_t> resp_payload;
+        uint16_t status = 0;
+        std::string path = "/api/download/arc/page-binary/" + std::to_string(page_index);
 
-        nlohmann::json body;
-        body["license_key"] = license_key;
-        body["session_token"] = session_token;
-        body["hwid"] = hwid;
-        body["proof_token"] = stored_proof_token();
+        bool sent = binary_protocol::send_request(
+            binary_protocol::BINARY_OP_PAGE_FETCH,
+            license_key,
+            session_token,
+            hwid,
+            stored_proof_token(),
+            page_index,
+            static_cast<uint64_t>(issued_at),
+            get_api_hostname(),
+            get_api_port(),
+            path,
+            FETCH_TIMEOUT_SEC,
+            resp_payload,
+            status);
 
-        std::string path = "/api/download/arc/page/" + std::to_string(page_index);
-        auto res = cli.Post(path, body.dump(), "application/json");
-        if (!res || res->status != 200) return false;
-
-        auto j = nlohmann::json::parse(res->body, nullptr, false);
-        if (!j.is_object() || j.value("status", "") != "ok") return false;
-
-        std::string data_b64 = j.value("data", "");
-        std::string iv_hex = j.value("iv", "");
-        std::string tag_hex = j.value("auth_tag", "");
-
-        if (data_b64.empty() || iv_hex.size() != 24 || tag_hex.size() != 32)
+        if (!sent)
+        {
+            webhook::write_log("server_pages", binary_protocol::last_error());
             return false;
+        }
+        if (status != binary_protocol::BINARY_STATUS_OK)
+        {
+            webhook::write_log("server_pages", "binary_op_status_nonzero");
+            return false;
+        }
 
-        auto ciphertext = base64_decode(data_b64);
-        if (ciphertext.empty()) return false;
+        size_t off = 0;
+        uint32_t total_pages_field = 0;
+        if (!binary_protocol::unpack_response_uint32(resp_payload, off, total_pages_field)) return false;
+        off += 4;
 
-        uint8_t iv[12];
-        uint8_t auth_tag[16];
-        if (!hex_decode(iv_hex, iv, 12)) return false;
-        if (!hex_decode(tag_hex, auth_tag, 16)) return false;
+        uint64_t blob_size_field = 0;
+        if (!binary_protocol::unpack_response_uint64(resp_payload, off, blob_size_field)) return false;
+        off += 8;
+
+        uint32_t page_size = 0;
+        if (!binary_protocol::unpack_response_uint32(resp_payload, off, page_size)) return false;
+        off += 4;
+
+        if (page_size == 0 || page_size > 0x00400000u) return false;
+        if (off + page_size + 12 + 16 > resp_payload.size()) return false;
+
+        const uint8_t* page_ct = resp_payload.data() + off;
+        off += page_size;
+
+        const uint8_t* page_iv = resp_payload.data() + off;
+        off += 12;
+
+        const uint8_t* page_tag = resp_payload.data() + off;
+        off += 16;
 
         uint8_t page_key[32];
         if (!derive_page_key(page_index, session_token, hwid, issued_at,
                              stored_proof_token(), page_key))
             return false;
 
-        out_plaintext.resize(ciphertext.size());
-        bool ok = aes_gcm_decrypt(ciphertext.data(), static_cast<uint32_t>(ciphertext.size()),
-                                  page_key, 32, iv, 12, auth_tag, 16, out_plaintext.data());
+        out_plaintext.resize(page_size);
+        bool ok = aes_gcm_decrypt(page_ct, page_size,
+                                  page_key, 32, page_iv, 12, page_tag, 16, out_plaintext.data());
 
         SecureZeroMemory(page_key, 32);
         if (!ok) out_plaintext.clear();
+        else
+        {
+            if (total_pages_field > 0) total_pages() = total_pages_field;
+            if (blob_size_field > 0) blob_size() = blob_size_field;
+        }
         return ok;
     }
 }
@@ -368,29 +406,42 @@ inline bool query_page_count(const std::string& license_key,
                              const std::string& session_token,
                              const std::string& hwid)
 {
-    httplib::Client cli(detail::get_api_host());
-    cli.set_address_family(AF_INET);
-    cli.set_connection_timeout(detail::FETCH_TIMEOUT_SEC);
-    cli.set_read_timeout(detail::FETCH_TIMEOUT_SEC);
-    cli.set_keep_alive(false);
-    cli.set_tcp_nodelay(true);
-    cli.set_decompress(true);
-    cli.set_follow_location(true);
-    cli.enable_server_certificate_verification(true);
+    std::vector<uint8_t> resp_payload;
+    uint16_t status = 0;
 
-    nlohmann::json body;
-    body["license_key"] = license_key;
-    body["session_token"] = session_token;
-    body["hwid"] = hwid;
+    bool sent = binary_protocol::send_request(
+        binary_protocol::BINARY_OP_PAGE_COUNT,
+        license_key,
+        session_token,
+        hwid,
+        std::string(),
+        0,
+        0,
+        detail::get_api_hostname(),
+        detail::get_api_port(),
+        std::string("/api/download/arc/pages-binary"),
+        detail::FETCH_TIMEOUT_SEC,
+        resp_payload,
+        status);
 
-    auto res = cli.Post("/api/download/arc/pages", body.dump(), "application/json");
-    if (!res || res->status != 200) return false;
+    if (!sent)
+    {
+        webhook::write_log("server_pages", binary_protocol::last_error());
+        return false;
+    }
+    if (status != binary_protocol::BINARY_STATUS_OK) return false;
 
-    auto j = nlohmann::json::parse(res->body, nullptr, false);
-    if (!j.is_object() || j.value("status", "") != "ok") return false;
+    if (resp_payload.size() < 16) return false;
 
-    detail::total_pages() = j.value("total_pages", 0u);
-    detail::blob_size() = j.value("blob_size", 0ull);
+    uint32_t total_pages = 0;
+    uint32_t page_size = 0;
+    uint64_t blob_size = 0;
+    if (!binary_protocol::unpack_response_uint32(resp_payload, 0, total_pages)) return false;
+    if (!binary_protocol::unpack_response_uint32(resp_payload, 4, page_size)) return false;
+    if (!binary_protocol::unpack_response_uint64(resp_payload, 8, blob_size)) return false;
+
+    detail::total_pages() = total_pages;
+    detail::blob_size() = blob_size;
     return detail::total_pages() > 0;
 }
 

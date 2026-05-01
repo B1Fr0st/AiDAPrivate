@@ -1017,49 +1017,47 @@ inline void import_crashes()
 		std::ifstream ifs(entry.path());
 		if (!ifs.is_open()) continue;
 
-		try {
-			nlohmann::json j;
-			ifs >> j;
+		auto j = nlohmann::json::parse(ifs, nullptr, false);
+		if (j.is_discarded()) continue;
 
-			crash_info_t crash;
-			crash.type = static_cast<crash_type_t>(j.value("type", 0));
-			crash.score = static_cast<exploit_score_t>(j.value("score", 0));
-			crash.fault_address = j.value("fault_address", uint64_t(0));
-			crash.instruction_address = j.value("instruction_address", uint64_t(0));
-			crash.crash_hash = j.value("crash_hash", uint64_t(0));
-			crash.description = j.value("description", std::string{});
-			crash.crashing_instruction = j.value("crashing_instruction", std::string{});
-			crash.rip = j.value("rip", uint64_t(0));
-			crash.rax = j.value("rax", uint64_t(0));
-			crash.rbx = j.value("rbx", uint64_t(0));
-			crash.rcx = j.value("rcx", uint64_t(0));
-			crash.rdx = j.value("rdx", uint64_t(0));
-			crash.rsp = j.value("rsp", uint64_t(0));
-			crash.rbp = j.value("rbp", uint64_t(0));
-			crash.rsi = j.value("rsi", uint64_t(0));
-			crash.rdi = j.value("rdi", uint64_t(0));
-			crash.ai_analysis = j.value("ai_analysis", std::string{});
+		crash_info_t crash;
+		crash.type = static_cast<crash_type_t>(j.value("type", 0));
+		crash.score = static_cast<exploit_score_t>(j.value("score", 0));
+		crash.fault_address = j.value("fault_address", uint64_t(0));
+		crash.instruction_address = j.value("instruction_address", uint64_t(0));
+		crash.crash_hash = j.value("crash_hash", uint64_t(0));
+		crash.description = j.value("description", std::string{});
+		crash.crashing_instruction = j.value("crashing_instruction", std::string{});
+		crash.rip = j.value("rip", uint64_t(0));
+		crash.rax = j.value("rax", uint64_t(0));
+		crash.rbx = j.value("rbx", uint64_t(0));
+		crash.rcx = j.value("rcx", uint64_t(0));
+		crash.rdx = j.value("rdx", uint64_t(0));
+		crash.rsp = j.value("rsp", uint64_t(0));
+		crash.rbp = j.value("rbp", uint64_t(0));
+		crash.rsi = j.value("rsi", uint64_t(0));
+		crash.rdi = j.value("rdi", uint64_t(0));
+		crash.ai_analysis = j.value("ai_analysis", std::string{});
 
-			std::string input_hex = j.value("input_hex", std::string{});
-			for (size_t k = 0; k + 2 <= input_hex.size(); k += 2) {
-				uint8_t byte = static_cast<uint8_t>(std::strtoul(input_hex.substr(k, 2).c_str(), nullptr, 16));
-				crash.input.push_back(byte);
+		std::string input_hex = j.value("input_hex", std::string{});
+		for (size_t k = 0; k + 2 <= input_hex.size(); k += 2) {
+			uint8_t byte = static_cast<uint8_t>(std::strtoul(input_hex.substr(k, 2).c_str(), nullptr, 16));
+			crash.input.push_back(byte);
+		}
+
+		if (j.contains("minimized_hex")) {
+			crash.is_minimized = true;
+			std::string min_hex = j["minimized_hex"].get<std::string>();
+			for (size_t k = 0; k + 2 <= min_hex.size(); k += 2) {
+				uint8_t byte = static_cast<uint8_t>(std::strtoul(min_hex.substr(k, 2).c_str(), nullptr, 16));
+				crash.minimized_input.push_back(byte);
 			}
+		}
 
-			if (j.contains("minimized_hex")) {
-				crash.is_minimized = true;
-				std::string min_hex = j["minimized_hex"].get<std::string>();
-				for (size_t k = 0; k + 2 <= min_hex.size(); k += 2) {
-					uint8_t byte = static_cast<uint8_t>(std::strtoul(min_hex.substr(k, 2).c_str(), nullptr, 16));
-					crash.minimized_input.push_back(byte);
-				}
-			}
-
-			if (g_state.crash_hashes.find(crash.crash_hash) == g_state.crash_hashes.end()) {
-				g_state.crash_hashes.insert(crash.crash_hash);
-				g_state.unique_crashes.push_back(std::move(crash));
-			}
-		} catch (...) {}
+		if (g_state.crash_hashes.find(crash.crash_hash) == g_state.crash_hashes.end()) {
+			g_state.crash_hashes.insert(crash.crash_hash);
+			g_state.unique_crashes.push_back(std::move(crash));
+		}
 	}
 }
 

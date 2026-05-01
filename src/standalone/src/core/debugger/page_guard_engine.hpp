@@ -185,7 +185,6 @@ struct pg_session_t {
     std::queue<pg_capture_t>   captures;
 
     std::atomic<bool>          polling{false};
-    std::thread                poll_thread;
 
 
     uint32_t prev_write_idx   = 0;
@@ -195,7 +194,6 @@ struct pg_session_t {
     pg_session_t() = default;
     ~pg_session_t() {
         polling.store(false);
-        if (poll_thread.joinable()) poll_thread.join();
     }
 
     pg_session_t(const pg_session_t&)            = delete;
@@ -276,7 +274,6 @@ public:
         session->session_id = sid;
 
         auto* sess_ptr = session.get();
-        session->poll_thread = {};
         work_queue::post([this, sess_ptr]() {
             poll_ring(sess_ptr);
         });
@@ -315,7 +312,6 @@ public:
 
 
         sess->polling.store(false);
-        if (sess->poll_thread.joinable()) sess->poll_thread.join();
 
         if (driver_bridge::using_kernel_driver()) {
 

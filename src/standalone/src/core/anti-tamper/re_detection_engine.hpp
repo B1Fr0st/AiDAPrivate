@@ -223,7 +223,10 @@ namespace detail {
         DWORD count = cb / sizeof(HMODULE);
 
         static const wchar_t* suspicious[] = {
-            L"frida", L"detours64.dll", L"minhook", L"polyhook", L"easyhook"
+            L"frida", L"detours64.dll", L"minhook", L"polyhook", L"easyhook",
+            L"scyllahide", L"hooklibraryx64", L"hooklibrary",
+            L"titanhide", L"hyperhide", L"strongod", L"sharpod",
+            L"apimonitor", L"wpe pro", L"cheatengine"
         };
 
         wchar_t system_dir[MAX_PATH] = {};

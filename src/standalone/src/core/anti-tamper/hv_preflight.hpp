@@ -4,6 +4,9 @@
 #include <winternl.h>
 #include <intrin.h>
 #include <tlhelp32.h>
+#include <bcrypt.h>
+#include <ncrypt.h>
+#include <winioctl.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -11,9 +14,14 @@
 #include <cwctype>
 #include <algorithm>
 #include <string>
+#include <vector>
 
 #include "obfuscation.hpp"
 #include "../../helpers/diag_log.hpp"
+
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "ncrypt.lib")
+#pragma comment(lib, "advapi32.lib")
 
 namespace anti_tamper {
 namespace hv_preflight {
@@ -40,6 +48,10 @@ struct report_t
     bool process_hit;
     bool kd_enabled;
     bool test_signing;
+    bool nvram_vm_string_hit;
+    bool disk_vm_string_hit;
+    bool edid_vm_manufacturer_hit;
+    bool hv_interface_signature_mismatch;
 };
 
 namespace detail {
@@ -88,18 +100,151 @@ inline NtQuerySystemInformation_t resolve_nt_query()
         GetProcAddress(nt, "NtQuerySystemInformation"));
 }
 
+inline constexpr uint8_t kDevModeReceiptMacKey[32] = {
+    0x9D, 0x4A, 0x71, 0xF8, 0x2C, 0xE6, 0x55, 0x18,
+    0xB7, 0x03, 0x1E, 0xCA, 0x8F, 0x6B, 0x40, 0x29,
+    0x77, 0x52, 0x9C, 0x3D, 0xAB, 0xF1, 0x14, 0x8E,
+    0x60, 0x35, 0xD7, 0x21, 0x4F, 0x88, 0xCB, 0x12
+};
+
+inline constexpr uint32_t kDevModeReceiptVersion = 0x4156AD01u;
+inline constexpr uint32_t kDevModeReceiptMinSize = 4 + 16 + 32 + 32;
+inline constexpr uint32_t kDevModeReceiptMaxSize = 4 + 16 + 256 + 32;
+
+inline bool hmac_sha256_verify(const uint8_t* key, uint32_t key_len,
+                                const uint8_t* data, uint32_t data_len,
+                                const uint8_t mac_expected[32])
+{
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM,
+                                    nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0)
+        return false;
+    bool ok = false;
+    if (BCryptCreateHash(alg, &hash, nullptr, 0,
+                         const_cast<PUCHAR>(key), key_len, 0) == 0)
+    {
+        if (BCryptHashData(hash, const_cast<PUCHAR>(data), data_len, 0) == 0)
+        {
+            uint8_t mac_actual[32] = {};
+            if (BCryptFinishHash(hash, mac_actual, 32, 0) == 0)
+            {
+                uint32_t diff = 0;
+                for (int i = 0; i < 32; ++i)
+                    diff |= static_cast<uint32_t>(mac_actual[i] ^ mac_expected[i]);
+                ok = (diff == 0);
+            }
+        }
+        BCryptDestroyHash(hash);
+    }
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
+
+inline bool tpm_provider_available()
+{
+    NCRYPT_PROV_HANDLE prov = 0;
+    SECURITY_STATUS st = NCryptOpenStorageProvider(
+        &prov, MS_PLATFORM_CRYPTO_PROVIDER, 0);
+    if (st != ERROR_SUCCESS)
+        return false;
+    NCryptFreeObject(prov);
+    return true;
+}
+
+inline bool compute_local_quote(uint8_t out_quote[32])
+{
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
+        return false;
+    bool ok = false;
+    if (BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0) == 0)
+    {
+        DWORD vol_serial = 0;
+        wchar_t sys_root[MAX_PATH] = {};
+        UINT got = GetSystemWindowsDirectoryW(sys_root, MAX_PATH);
+        if (got > 0 && got < MAX_PATH)
+        {
+            wchar_t root_path[8] = { sys_root[0], L':', L'\\', 0 };
+            DWORD comp_len = 0, fs_flags = 0;
+            GetVolumeInformationW(root_path, nullptr, 0, &vol_serial, &comp_len, &fs_flags, nullptr, 0);
+        }
+        BCryptHashData(hash, reinterpret_cast<PUCHAR>(&vol_serial), sizeof(vol_serial), 0);
+        wchar_t computer_name[MAX_COMPUTERNAME_LENGTH + 1] = {};
+        DWORD cn_len = MAX_COMPUTERNAME_LENGTH + 1;
+        if (GetComputerNameW(computer_name, &cn_len) && cn_len > 0)
+        {
+            BCryptHashData(hash, reinterpret_cast<PUCHAR>(computer_name),
+                static_cast<ULONG>(cn_len * sizeof(wchar_t)), 0);
+        }
+        uint8_t tpm_marker = 0x00u;
+        BCryptHashData(hash, &tpm_marker, 1, 0);
+        ok = (BCryptFinishHash(hash, out_quote, 32, 0) == 0);
+        BCryptDestroyHash(hash);
+    }
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
+
+inline bool verify_devmode_receipt(const uint8_t* receipt, uint32_t size)
+{
+    if (size < kDevModeReceiptMinSize || size > kDevModeReceiptMaxSize)
+        return false;
+
+    uint32_t version = 0;
+    std::memcpy(&version, receipt, 4);
+    if (version != kDevModeReceiptVersion)
+        return false;
+
+    uint32_t mac_offset = size - 32;
+    const uint8_t* mac_expected = receipt + mac_offset;
+    if (!hmac_sha256_verify(kDevModeReceiptMacKey, 32,
+        receipt, mac_offset, mac_expected))
+        return false;
+
+    uint8_t local_quote[32] = {};
+    if (!compute_local_quote(local_quote))
+        return false;
+
+    uint32_t quote_offset = 4 + 16;
+    if (mac_offset < quote_offset + 32)
+        return false;
+
+    uint32_t diff = 0;
+    for (int i = 0; i < 32; ++i)
+        diff |= static_cast<uint32_t>(local_quote[i] ^ receipt[quote_offset + i]);
+    if (diff != 0)
+        return false;
+
+    return true;
+}
+
 inline bool devmode_bypass_set()
 {
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\AiDA", 0, KEY_READ, &key) != ERROR_SUCCESS)
         return false;
-    DWORD value = 0;
-    DWORD size = sizeof(value);
+
     DWORD type = 0;
-    LONG rc = RegQueryValueExW(key, L"DevMode", nullptr, &type,
-        reinterpret_cast<BYTE*>(&value), &size);
+    DWORD size = 0;
+    LONG rc = RegQueryValueExW(key, L"DevModeReceipt", nullptr, &type,
+        nullptr, &size);
+    if (rc != ERROR_SUCCESS || type != REG_BINARY ||
+        size < kDevModeReceiptMinSize || size > kDevModeReceiptMaxSize)
+    {
+        RegCloseKey(key);
+        return false;
+    }
+
+    std::vector<uint8_t> receipt(size, 0);
+    rc = RegQueryValueExW(key, L"DevModeReceipt", nullptr, &type,
+        receipt.data(), &size);
     RegCloseKey(key);
-    return rc == ERROR_SUCCESS && type == REG_DWORD && value == 1;
+    if (rc != ERROR_SUCCESS)
+        return false;
+
+    return verify_devmode_receipt(receipt.data(), size);
 }
 
 inline bool read_cpuid_hv_bit()
@@ -188,7 +333,8 @@ inline bool scan_firmware_rsmb()
     if (GetSystemFirmwareTable('RSMB', 0, buf, size) == size)
     {
         static const char* needles[] = {
-            "VMware", "VirtualBox", "QEMU", "innotek", "Xen", "Parallels", "Bochs"
+            "VMware", "VirtualBox", "QEMU", "innotek", "Xen", "Parallels", "Bochs",
+            "BXPC", "OVMF", "EDK II", "Tianocore", "Standard PC (Q35", "SeaBIOS", "VBOX"
         };
         for (const char* n : needles)
         {
@@ -281,18 +427,52 @@ inline bool xsetbv_probe()
 
 inline uint32_t timing_probe_median()
 {
-    uint32_t samples[32]{};
-    for (int i = 0; i < 32; ++i)
+    constexpr int kSamples = 1024;
+    std::vector<uint32_t> samples(static_cast<size_t>(kSamples), 0u);
+
+    HANDLE thread = GetCurrentThread();
+    DWORD_PTR previous_mask = 0;
+    DWORD_PTR active_processors = 0;
+    DWORD_PTR system_processors = 0;
+    bool affinity_set = false;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &active_processors, &system_processors) && active_processors != 0)
+    {
+        DWORD_PTR target_mask = active_processors & (~active_processors + 1);
+        DWORD_PTR prev = SetThreadAffinityMask(thread, target_mask);
+        if (prev != 0)
+        {
+            previous_mask = prev;
+            affinity_set = true;
+        }
+    }
+
+    int previous_priority = GetThreadPriority(thread);
+    bool priority_set = false;
+    if (previous_priority != THREAD_PRIORITY_ERROR_RETURN)
+    {
+        if (SetThreadPriority(thread, THREAD_PRIORITY_TIME_CRITICAL))
+            priority_set = true;
+    }
+
+    for (int i = 0; i < kSamples; ++i)
     {
         int dummy[4] = {};
-        unsigned long long t0 = __rdtsc();
+        unsigned int aux0 = 0;
+        unsigned int aux1 = 0;
+        unsigned long long t0 = __rdtscp(&aux0);
         __cpuid(dummy, 0);
-        unsigned long long t1 = __rdtsc();
+        unsigned long long t1 = __rdtscp(&aux1);
         unsigned long long d = t1 - t0;
-        samples[i] = d > 0xFFFFFFFFULL ? 0xFFFFFFFFu : static_cast<uint32_t>(d);
+        samples[static_cast<size_t>(i)] = d > 0xFFFFFFFFULL ? 0xFFFFFFFFu : static_cast<uint32_t>(d);
     }
-    std::sort(samples, samples + 32);
-    return samples[16];
+
+    if (priority_set)
+        SetThreadPriority(thread, previous_priority);
+    if (affinity_set)
+        SetThreadAffinityMask(thread, previous_mask);
+
+    std::sort(samples.begin(), samples.end());
+    return samples[static_cast<size_t>(kSamples / 2)];
 }
 
 inline bool validate_ms_hv_features()
@@ -323,6 +503,330 @@ inline uint32_t get_windows_build_number()
     }
 }
 
+inline bool acquire_system_environment_privilege()
+{
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(),
+                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                          &token))
+        return false;
+
+    LUID luid{};
+    if (!LookupPrivilegeValueW(nullptr, SE_SYSTEM_ENVIRONMENT_NAME, &luid))
+    {
+        CloseHandle(token);
+        return false;
+    }
+
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    BOOL adjusted = AdjustTokenPrivileges(token, FALSE, &tp,
+                                          sizeof(tp), nullptr, nullptr);
+    DWORD adj_err = GetLastError();
+    CloseHandle(token);
+
+    if (!adjusted)
+        return false;
+    if (adj_err == ERROR_NOT_ALL_ASSIGNED)
+        return false;
+    return true;
+}
+
+inline bool case_insensitive_substr_ascii(const uint8_t* hay, size_t hay_len,
+                                          const char* needle)
+{
+    size_t nlen = std::strlen(needle);
+    if (nlen == 0 || hay_len < nlen) return false;
+    for (size_t i = 0; i + nlen <= hay_len; ++i)
+    {
+        bool match = true;
+        for (size_t j = 0; j < nlen; ++j)
+        {
+            unsigned char a = hay[i + j];
+            unsigned char b = static_cast<unsigned char>(needle[j]);
+            if (a >= 'A' && a <= 'Z') a = static_cast<unsigned char>(a + 32);
+            if (b >= 'A' && b <= 'Z') b = static_cast<unsigned char>(b + 32);
+            if (a != b) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+inline bool scan_nvram_boot_order()
+{
+    using GetFwExW_t = DWORD (WINAPI*)(LPCWSTR, LPCWSTR, PVOID, DWORD, PDWORD);
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    if (!k32) return false;
+    auto get_fw = reinterpret_cast<GetFwExW_t>(
+        GetProcAddress(k32, "GetFirmwareEnvironmentVariableExW"));
+    if (!get_fw) return false;
+
+    if (!acquire_system_environment_privilege())
+        return false;
+
+    static const wchar_t kEfiGlobal[] = L"{8BE4DF61-93CA-11D2-AA0D-00E098032B8C}";
+    static const wchar_t* kVarNames[] = {
+        L"BootOrder", L"PK", L"KEK", L"db", L"dbx",
+        L"PKDefault", L"KEKDefault", L"dbDefault", L"dbxDefault"
+    };
+    static const char* kNeedles[] = {
+        "Tianocore", "EDK II", "OVMF", "Red Hat", "QEMU"
+    };
+
+    bool hit = false;
+    for (const wchar_t* var_name : kVarNames)
+    {
+        std::vector<uint8_t> buf(8192, 0u);
+        DWORD attrs = 0;
+        SetLastError(0);
+        DWORD got = get_fw(var_name, kEfiGlobal, buf.data(),
+                           static_cast<DWORD>(buf.size()), &attrs);
+        if (got == 0)
+            continue;
+        if (got > buf.size()) got = static_cast<DWORD>(buf.size());
+
+        std::vector<char> ascii;
+        ascii.reserve(got * 2);
+        for (DWORD i = 0; i < got; ++i)
+        {
+            uint8_t b = buf[i];
+            if (b >= 0x20 && b < 0x7F)
+                ascii.push_back(static_cast<char>(b));
+        }
+        std::vector<char> wide_low;
+        if ((got & 1u) == 0)
+        {
+            wide_low.reserve(got / 2);
+            for (DWORD i = 0; i + 1 < got; i += 2)
+            {
+                uint16_t w = static_cast<uint16_t>(buf[i]) |
+                             (static_cast<uint16_t>(buf[i + 1]) << 8);
+                if (w >= 0x20 && w < 0x7F)
+                    wide_low.push_back(static_cast<char>(w & 0xFF));
+            }
+        }
+
+        for (const char* needle : kNeedles)
+        {
+            if (!ascii.empty() &&
+                case_insensitive_substr_ascii(reinterpret_cast<const uint8_t*>(ascii.data()),
+                                              ascii.size(), needle))
+            {
+                hit = true;
+                break;
+            }
+            if (!wide_low.empty() &&
+                case_insensitive_substr_ascii(reinterpret_cast<const uint8_t*>(wide_low.data()),
+                                              wide_low.size(), needle))
+            {
+                hit = true;
+                break;
+            }
+        }
+        if (hit) break;
+    }
+    return hit;
+}
+
+inline bool scan_disk_model_strings()
+{
+    HANDLE drive = CreateFileW(L"\\\\.\\PhysicalDrive0",
+                               0,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr,
+                               OPEN_EXISTING,
+                               0,
+                               nullptr);
+    if (drive == INVALID_HANDLE_VALUE)
+        return false;
+
+    STORAGE_PROPERTY_QUERY query{};
+    query.PropertyId = StorageDeviceProperty;
+    query.QueryType = PropertyStandardQuery;
+
+    STORAGE_DESCRIPTOR_HEADER header{};
+    DWORD bytes = 0;
+    if (!DeviceIoControl(drive, IOCTL_STORAGE_QUERY_PROPERTY,
+                         &query, sizeof(query),
+                         &header, sizeof(header),
+                         &bytes, nullptr) || header.Size == 0)
+    {
+        CloseHandle(drive);
+        return false;
+    }
+
+    std::vector<uint8_t> buf(header.Size, 0u);
+    if (!DeviceIoControl(drive, IOCTL_STORAGE_QUERY_PROPERTY,
+                         &query, sizeof(query),
+                         buf.data(), static_cast<DWORD>(buf.size()),
+                         &bytes, nullptr))
+    {
+        CloseHandle(drive);
+        return false;
+    }
+    CloseHandle(drive);
+    if (buf.size() < sizeof(STORAGE_DEVICE_DESCRIPTOR))
+        return false;
+
+    auto* desc = reinterpret_cast<STORAGE_DEVICE_DESCRIPTOR*>(buf.data());
+
+    auto extract_str = [&](DWORD off) -> std::string {
+        std::string out;
+        if (off == 0 || off >= buf.size()) return out;
+        size_t i = static_cast<size_t>(off);
+        while (i < buf.size() && buf[i] != 0)
+        {
+            out.push_back(static_cast<char>(buf[i]));
+            ++i;
+            if (out.size() > 1024) break;
+        }
+        return out;
+    };
+
+    std::string vendor = extract_str(desc->VendorIdOffset);
+    std::string product = extract_str(desc->ProductIdOffset);
+    std::string combined;
+    combined.reserve(vendor.size() + 1 + product.size());
+    combined.append(vendor);
+    combined.push_back(' ');
+    combined.append(product);
+
+    static const char* kNeedles[] = {
+        "QEMU HARDDISK", "QEMU DVD-ROM", "ATA QEMU",
+        "VBOX HARDDISK", "VBOX CD-ROM",
+        "VMware Virtual", "VMware NVMe", "VMware, VMware",
+        "Virtual HD,", "Msft Virtual Disk",
+        "Xen Virtual SCSI", "Parallels", "Red Hat VirtIO"
+    };
+
+    const uint8_t* hay = reinterpret_cast<const uint8_t*>(combined.data());
+    size_t hay_len = combined.size();
+    for (const char* needle : kNeedles)
+    {
+        if (case_insensitive_substr_ascii(hay, hay_len, needle))
+            return true;
+    }
+    return false;
+}
+
+inline bool edid_manufacturer_matches(const uint8_t* edid)
+{
+    uint16_t mfg = (static_cast<uint16_t>(edid[8]) << 8) |
+                   static_cast<uint16_t>(edid[9]);
+    char id[4] = {};
+    id[0] = static_cast<char>(((mfg >> 10) & 0x1F) + 'A' - 1);
+    id[1] = static_cast<char>(((mfg >> 5) & 0x1F) + 'A' - 1);
+    id[2] = static_cast<char>((mfg & 0x1F) + 'A' - 1);
+    id[3] = '\0';
+    static const char* kBadIds[] = { "QEM", "RHT", "BOC" };
+    for (const char* candidate : kBadIds)
+    {
+        if (std::memcmp(id, candidate, 3) == 0)
+            return true;
+    }
+    return false;
+}
+
+inline bool edid_validate_one(const uint8_t* edid, size_t len,
+                              bool& header_ok_out,
+                              bool& checksum_ok_out)
+{
+    header_ok_out = false;
+    checksum_ok_out = false;
+    if (!edid || len < 128) return false;
+
+    static const uint8_t kMagic[8] = {
+        0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00
+    };
+    header_ok_out = std::memcmp(edid, kMagic, 8) == 0;
+
+    uint32_t sum = 0;
+    for (size_t i = 0; i < 128; ++i)
+        sum += edid[i];
+    checksum_ok_out = (sum & 0xFFu) == 0;
+
+    return edid_manufacturer_matches(edid);
+}
+
+inline bool walk_edid_subkeys(HKEY parent, bool& mfg_hit_out)
+{
+    bool any_examined = false;
+    DWORD index = 0;
+    wchar_t name[512];
+    DWORD name_len = 0;
+
+    for (;;)
+    {
+        name_len = static_cast<DWORD>(_countof(name));
+        LONG rc = RegEnumKeyExW(parent, index, name, &name_len,
+                                nullptr, nullptr, nullptr, nullptr);
+        if (rc == ERROR_NO_MORE_ITEMS) break;
+        ++index;
+        if (rc != ERROR_SUCCESS) continue;
+
+        HKEY child = nullptr;
+        if (RegOpenKeyExW(parent, name, 0, KEY_READ, &child) != ERROR_SUCCESS)
+            continue;
+
+        HKEY params = nullptr;
+        if (RegOpenKeyExW(child, L"Device Parameters", 0,
+                          KEY_READ, &params) == ERROR_SUCCESS)
+        {
+            DWORD type = 0;
+            DWORD size = 0;
+            if (RegQueryValueExW(params, L"EDID", nullptr, &type,
+                                 nullptr, &size) == ERROR_SUCCESS &&
+                type == REG_BINARY && size >= 128 && size <= 4096)
+            {
+                std::vector<uint8_t> buf(size, 0u);
+                if (RegQueryValueExW(params, L"EDID", nullptr, &type,
+                                     buf.data(), &size) == ERROR_SUCCESS)
+                {
+                    bool header_ok = false;
+                    bool checksum_ok = false;
+                    bool mfg_match = edid_validate_one(buf.data(), size,
+                                                      header_ok, checksum_ok);
+                    any_examined = true;
+                    if (mfg_match) mfg_hit_out = true;
+                }
+            }
+            RegCloseKey(params);
+        }
+        else
+        {
+            bool sub_examined = walk_edid_subkeys(child, mfg_hit_out);
+            if (sub_examined) any_examined = true;
+        }
+        RegCloseKey(child);
+        if (mfg_hit_out) break;
+    }
+    return any_examined;
+}
+
+inline bool scan_edid_manufacturer()
+{
+    HKEY display = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"SYSTEM\\CurrentControlSet\\Enum\\DISPLAY",
+                      0, KEY_READ, &display) != ERROR_SUCCESS)
+        return false;
+    bool mfg_hit = false;
+    walk_edid_subkeys(display, mfg_hit);
+    RegCloseKey(display);
+    return mfg_hit;
+}
+
+inline bool hv_interface_signature_is_hv1()
+{
+    int regs[4] = {};
+    __cpuid(regs, 0x40000001);
+    return static_cast<uint32_t>(regs[0]) == 0x31237648u;
+}
+
 }
 
 inline bool g_ms_hv_approved = false;
@@ -335,13 +839,9 @@ inline report_t run()
 
     diag::log_tagged("hv_pf", "enter");
 
-    g_ms_hv_approved = true;
-    diag::log_tagged("hv_pf", "anti_vm_disabled_return");
-    return r;
-
     if (detail::devmode_bypass_set())
     {
-        diag::log_tagged("hv_pf", "devmode_bypass_return");
+        diag::log_tagged("hv_pf", "devmode_bypass_return_tpm_receipt_validated");
         return r;
     }
 
@@ -390,6 +890,18 @@ inline report_t run()
     r.process_hit = detail::scan_vm_processes();
     diag::log_tagged_fmt("hv_pf", "scan_vm_processes_done hit=%d", r.process_hit ? 1 : 0);
 
+    diag::log_tagged("hv_pf", "scan_nvram_boot_order_start");
+    r.nvram_vm_string_hit = detail::scan_nvram_boot_order();
+    diag::log_tagged_fmt("hv_pf", "scan_nvram_boot_order_done hit=%d", r.nvram_vm_string_hit ? 1 : 0);
+
+    diag::log_tagged("hv_pf", "scan_disk_model_strings_start");
+    r.disk_vm_string_hit = detail::scan_disk_model_strings();
+    diag::log_tagged_fmt("hv_pf", "scan_disk_model_strings_done hit=%d", r.disk_vm_string_hit ? 1 : 0);
+
+    diag::log_tagged("hv_pf", "scan_edid_manufacturer_start");
+    r.edid_vm_manufacturer_hit = detail::scan_edid_manufacturer();
+    diag::log_tagged_fmt("hv_pf", "scan_edid_manufacturer_done hit=%d", r.edid_vm_manufacturer_hit ? 1 : 0);
+
     diag::log_tagged("hv_pf", "xsetbv_probe_start");
     r.xsetbv_forwarded = detail::xsetbv_probe();
     diag::log_tagged_fmt("hv_pf", "xsetbv_probe_done fwd=%d", r.xsetbv_forwarded ? 1 : 0);
@@ -411,11 +923,20 @@ inline report_t run()
         return r;
     }
 
-    const bool ms_hv = r.hv_bit_set && detail::is_microsoft_hv(vendor12);
+    const bool ms_hv_vendor = r.hv_bit_set && detail::is_microsoft_hv(vendor12);
     const bool known_non_ms = r.hv_bit_set && detail::is_known_non_ms_hv(vendor12);
 
-    if (ms_hv)
+    if (ms_hv_vendor)
     {
+        const bool hv1_signature = detail::hv_interface_signature_is_hv1();
+        r.hv_interface_signature_mismatch = !hv1_signature;
+        if (!hv1_signature)
+        {
+            r.result = result_t::refuse_hv;
+            diag::log_tagged("hv_pf", "decision=refuse_hv_interface_signature_mismatch");
+            return r;
+        }
+
         bool genuine_ms = detail::validate_ms_hv_features();
 
         if (!genuine_ms)
@@ -452,6 +973,27 @@ inline report_t run()
         return r;
     }
 
+    if (r.nvram_vm_string_hit)
+    {
+        r.result = result_t::refuse_hv;
+        diag::log_tagged("hv_pf", "decision=refuse_hv_nvram_hit");
+        return r;
+    }
+
+    if (r.disk_vm_string_hit)
+    {
+        r.result = result_t::refuse_hv;
+        diag::log_tagged("hv_pf", "decision=refuse_hv_disk_hit");
+        return r;
+    }
+
+    if (r.edid_vm_manufacturer_hit)
+    {
+        r.result = result_t::refuse_hv;
+        diag::log_tagged("hv_pf", "decision=refuse_hv_edid_manufacturer_hit");
+        return r;
+    }
+
     r.result = result_t::allow;
     diag::log_tagged("hv_pf", "decision=allow");
     return r;
@@ -481,6 +1023,14 @@ inline void show_refuse_ui_and_exit(const report_t& r)
             message += L"\n\nAdditional: VM firmware signatures detected in SMBIOS.";
         if (r.process_hit)
             message += L"\n\nAdditional: VM guest agent processes are running.";
+        if (r.nvram_vm_string_hit)
+            message += L"\n\nAdditional: VM firmware was found in UEFI NVRAM.";
+        if (r.disk_vm_string_hit)
+            message += L"\n\nAdditional: VM virtual disk hardware was detected.";
+        if (r.edid_vm_manufacturer_hit)
+            message += L"\n\nAdditional: VM virtual display was detected.";
+        if (r.hv_interface_signature_mismatch)
+            message += L"\n\nAdditional: a hypervisor masqueraded as Microsoft Hyper-V with the wrong interface signature.";
         break;
     }
     }

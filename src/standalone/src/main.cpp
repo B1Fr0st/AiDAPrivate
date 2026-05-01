@@ -34,6 +34,9 @@
 
 #include "embedded_resources.hpp"
 #include "helpers/diag_log.hpp"
+#include "hardware_id/hardware_id.hpp"
+#include "core/anti-tamper/cff.hpp"
+#include "core/anti-tamper/virtualizer.hpp"
 
 extern "C" {
 #include <openssl/applink.c>
@@ -42,6 +45,7 @@ extern "C" {
 #include <delayimp.h>
 #include <thread>
 #include <cstdarg>
+#include <set>
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "Shcore.lib")
@@ -150,6 +154,164 @@ static void crash_log_fmt(const char* fmt, ...)
     _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
     va_end(ap);
     diag::log_tagged("main", buf);
+}
+
+static void run_phase_1_2_self_tests()
+{
+    crash_log_write("phase_1_2_test:start");
+
+    {
+        int visited[4] = {0, 0, 0, 0};
+        int order[8] = {0};
+        int order_pos = 0;
+        CFF_BEGIN(p12_test_a)
+        CFF_STATE(p12_test_a, 0)
+        {
+            visited[0]++;
+            if (order_pos < 8) order[order_pos++] = 0;
+            CFF_GOTO(p12_test_a, 1);
+        }
+        CFF_STATE(p12_test_a, 1)
+        {
+            visited[1]++;
+            if (order_pos < 8) order[order_pos++] = 1;
+            CFF_GOTO(p12_test_a, 2);
+        }
+        CFF_STATE(p12_test_a, 2)
+        {
+            visited[2]++;
+            if (order_pos < 8) order[order_pos++] = 2;
+            CFF_GOTO(p12_test_a, 3);
+        }
+        CFF_STATE(p12_test_a, 3)
+        {
+            visited[3]++;
+            if (order_pos < 8) order[order_pos++] = 3;
+            CFF_EXIT(p12_test_a);
+        }
+        CFF_END(p12_test_a)
+
+        bool ok = visited[0] == 1 && visited[1] == 1 && visited[2] == 1 && visited[3] == 1;
+        crash_log_fmt("phase_1_2_test:cff_exec ok=%d v=[%d,%d,%d,%d] order=[%d,%d,%d,%d]",
+                      ok ? 1 : 0,
+                      visited[0], visited[1], visited[2], visited[3],
+                      order[0], order[1], order[2], order[3]);
+    }
+
+    {
+        anti_tamper::cff::detail::cff_ctx_t ctx =
+            anti_tamper::cff::detail::init_ctx(0xA1B2C3D4E5F60718ULL);
+        const uint64_t fixed_plain = 5;
+        const int sample_count = 10;
+        uint64_t samples[sample_count] = {};
+        for (int i = 0; i < sample_count; ++i)
+            samples[i] = anti_tamper::cff::detail::encrypt_state(ctx, fixed_plain);
+
+        std::set<uint64_t> uniq;
+        for (int i = 0; i < sample_count; ++i)
+            uniq.insert(samples[i]);
+
+        bool all_distinct = uniq.size() == static_cast<size_t>(sample_count);
+        crash_log_fmt(
+            "phase_1_2_test:cff_distinctness all_distinct=%d unique=%zu of %d",
+            all_distinct ? 1 : 0, uniq.size(), sample_count);
+        for (int i = 0; i < sample_count; ++i)
+            crash_log_fmt("phase_1_2_test:cff_sample [%d]=0x%016llX", i,
+                          static_cast<unsigned long long>(samples[i]));
+    }
+
+    {
+        const uint64_t seed = 0xC0DECAFE5EEDB001ULL;
+        const uint8_t plaintext[16] = {
+            0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+            0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0x11
+        };
+        uint8_t encrypted[16] = {};
+        uint8_t decrypted[16] = {};
+
+        anti_tamper::virtualizer::detail::cipher_stream_t enc_s;
+        anti_tamper::virtualizer::detail::cipher_stream_init(enc_s, seed);
+        for (int i = 0; i < 16; ++i)
+            encrypted[i] = anti_tamper::virtualizer::detail::cipher_stream_xcrypt(enc_s, plaintext[i], true);
+
+        anti_tamper::virtualizer::detail::cipher_stream_t dec_s;
+        anti_tamper::virtualizer::detail::cipher_stream_init(dec_s, seed);
+        for (int i = 0; i < 16; ++i)
+            decrypted[i] = anti_tamper::virtualizer::detail::cipher_stream_xcrypt(dec_s, encrypted[i], false);
+
+        bool roundtrip_ok = memcmp(plaintext, decrypted, 16) == 0;
+
+        uint64_t old_key = seed;
+        uint8_t old_xor_stream[16] = {};
+        for (int i = 0; i < 16; ++i)
+        {
+            old_xor_stream[i] = static_cast<uint8_t>(old_key & 0xFF);
+            old_key ^= old_key << 13;
+            old_key ^= old_key >> 7;
+            old_key ^= old_key << 17;
+        }
+
+        bool differs_from_old = false;
+        uint8_t new_keystream[16];
+        for (int i = 0; i < 16; ++i)
+            new_keystream[i] = static_cast<uint8_t>(plaintext[i] ^ encrypted[i]);
+        for (int i = 0; i < 16; ++i)
+        {
+            if (new_keystream[i] != old_xor_stream[i])
+            {
+                differs_from_old = true;
+                break;
+            }
+        }
+
+        bool input_dependent = false;
+        {
+            uint8_t alt_plain[16];
+            memcpy(alt_plain, plaintext, 16);
+            alt_plain[0] ^= 0xFF;
+            uint8_t alt_enc[16];
+            anti_tamper::virtualizer::detail::cipher_stream_t alt_s;
+            anti_tamper::virtualizer::detail::cipher_stream_init(alt_s, seed);
+            for (int i = 0; i < 16; ++i)
+                alt_enc[i] = anti_tamper::virtualizer::detail::cipher_stream_xcrypt(alt_s, alt_plain[i], true);
+            uint8_t alt_keystream[16];
+            for (int i = 0; i < 16; ++i)
+                alt_keystream[i] = static_cast<uint8_t>(alt_plain[i] ^ alt_enc[i]);
+
+            for (int i = 1; i < 16; ++i)
+            {
+                if (alt_keystream[i] != new_keystream[i])
+                {
+                    input_dependent = true;
+                    break;
+                }
+            }
+        }
+
+        crash_log_fmt(
+            "phase_1_2_test:vm_stream roundtrip=%d diff_from_old_xor=%d input_dependent=%d",
+            roundtrip_ok ? 1 : 0,
+            differs_from_old ? 1 : 0,
+            input_dependent ? 1 : 0);
+
+        char enc_hex[64] = {};
+        char old_hex[64] = {};
+        char new_hex[64] = {};
+        for (int i = 0; i < 16; ++i)
+        {
+            _snprintf_s(enc_hex + i * 2, sizeof(enc_hex) - i * 2, _TRUNCATE,
+                        "%02X", encrypted[i]);
+            _snprintf_s(old_hex + i * 2, sizeof(old_hex) - i * 2, _TRUNCATE,
+                        "%02X", old_xor_stream[i]);
+            _snprintf_s(new_hex + i * 2, sizeof(new_hex) - i * 2, _TRUNCATE,
+                        "%02X", new_keystream[i]);
+        }
+        crash_log_fmt("phase_1_2_test:vm_stream encrypted=%s", enc_hex);
+        crash_log_fmt("phase_1_2_test:vm_stream old_xor_ks=%s", old_hex);
+        crash_log_fmt("phase_1_2_test:vm_stream new_ks=%s", new_hex);
+    }
+
+    crash_log_write("phase_1_2_test:done");
 }
 
 static std::wstring widen_message_text(const std::string& text)
@@ -326,6 +488,26 @@ __declspec(noinline) static DWORD seh_driver_bridge_initialize()
 int main(int, char**)
 {
     crash_log_write("main_enter");
+
+    {
+        aida::hardware_id::anchor_set_t anchors = aida::hardware_id::collect_user_mode();
+        aida::hardware_id::tpm_attest_t tpm{};
+        bool tpm_ok = aida::hardware_id::collect_tpm_attestation(tpm);
+        aida::hardware_id::composite_t composite = tpm_ok
+            ? aida::hardware_id::hash_anchors_with_tpm(anchors, tpm)
+            : aida::hardware_id::hash_anchors(anchors);
+        char hwid_log_msg[512];
+        _snprintf_s(hwid_log_msg, sizeof(hwid_log_msg), _TRUNCATE,
+            "hwid_composition tpm_present=%d ek_pub_sha=%.16s pcr_composite=%.16s composite_hwid=%.16s anchors=%d",
+            tpm_ok ? 1 : 0,
+            tpm.ek_pub_sha256.c_str(),
+            tpm.pcr_composite_sha256.c_str(),
+            composite.hardware_id_sha256.c_str(),
+            composite.anchor_count);
+        crash_log_write(hwid_log_msg);
+    }
+
+    run_phase_1_2_self_tests();
 
     arc_loader::prime_import_cache();
     crash_log_write("arc_import_cache_primed");

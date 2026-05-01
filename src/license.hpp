@@ -67,6 +67,9 @@ private:
                              const unsigned char* data, size_t len) const;
     bool verify_server_signature(const std::string& response_body,
                                  const std::string& signature) const;
+    bool verify_server_signature_with_kid(const std::string& response_body,
+                                          const std::string& signature,
+                                          int kid) const;
     void secure_clear_string(std::string& s) const;
 
     std::atomic<bool> m_valid{false};
@@ -96,6 +99,16 @@ private:
     std::atomic<uint64_t> m_nonce_canary{0};
     std::atomic<uint64_t> m_sig_binding_tag{0};
     std::string m_heartbeat_nonce;
+    std::string m_rotated_heartbeat_nonce;
+    int64_t     m_rotated_heartbeat_nonce_issued_at{0};
+    std::string m_rotated_bind_proof;
+    int64_t     m_rotated_bind_proof_epoch{0};
+    std::string m_next_challenge_id;
+    std::string m_next_challenge_nonce;
+    std::string m_next_challenge_signature;
+    int64_t     m_next_challenge_issued_at{0};
+    int64_t     m_next_challenge_ttl_s{30};
+    std::atomic<int64_t> m_silent_kill_after_ms{0};
 
 
     std::string m_ai_session_key;

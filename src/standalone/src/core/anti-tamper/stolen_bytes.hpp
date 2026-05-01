@@ -3,8 +3,12 @@
 #include <windows.h>
 #include <intrin.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include "integrity.hpp"
@@ -20,13 +24,44 @@ namespace detail {
     static constexpr uint32_t MAX_STOLEN = 32;
     static constexpr uint32_t MAX_ENTRIES = 64;
 
+    struct fetch_oracle_request_t
+    {
+        uint64_t function_hash;
+        uint64_t client_nonce;
+        uint64_t requested_at;
+    };
+
+    struct fetch_oracle_response_t
+    {
+        std::vector<uint8_t> ciphertext;
+        std::vector<uint8_t> aes_gcm_tag;
+        std::vector<uint8_t> session_iv;
+        std::vector<uint8_t> ephemeral_key;
+        uint64_t prologue_len;
+        uint64_t valid_until_tick;
+        uint64_t fetch_id;
+        bool ok;
+        bool flagged;
+        std::string status;
+    };
+
+    using oracle_fetch_fn = std::function<bool(const fetch_oracle_request_t&,
+                                               fetch_oracle_response_t&)>;
+
     struct stolen_entry_t
     {
         uint64_t original_addr;
-        uint8_t  encrypted_prologue[MAX_STOLEN];
+        uint64_t function_hash;
         uint32_t prologue_len;
+        std::vector<uint8_t> cached_ciphertext;
+        std::vector<uint8_t> cached_aes_gcm_tag;
+        std::vector<uint8_t> cached_session_iv;
+        uint64_t cached_fetch_id;
+        uint64_t cached_at_tick;
+        uint64_t valid_until_tick;
+        bool     cached_present;
+        std::vector<uint8_t> ephemeral_session_key;
         uint64_t trampoline_addr;
-        uint64_t encryption_key;
         std::vector<uint8_t> vm_bytecode;
         uint64_t vm_seed;
         uint64_t continuation_addr;
@@ -40,12 +75,15 @@ namespace detail {
         void* trampoline_page;
         uint32_t trampoline_offset;
         uint64_t session_key[2];
-        bool initialized;
+        uint64_t session_epoch;
+        oracle_fetch_fn oracle_fn;
+        std::mutex mtx;
+        std::atomic<bool> initialized;
     };
 
     inline stolen_state_t& get_state()
     {
-        static stolen_state_t s{};
+        static stolen_state_t s;
         return s;
     }
 
@@ -92,15 +130,29 @@ namespace detail {
 
     inline void encrypt_buffer(uint8_t* dst, const uint8_t* src, uint32_t len, uint64_t key)
     {
-        uint64_t rolling = key;
+        anti_tamper::virtualizer::detail::cipher_stream_t s;
+        anti_tamper::virtualizer::detail::cipher_stream_init(s, key);
         for (uint32_t i = 0; i < len; ++i)
-        {
-            dst[i] = src[i] ^ static_cast<uint8_t>(rolling);
-            rolling ^= rolling << 13;
-            rolling ^= rolling >> 7;
-            rolling ^= rolling << 17;
-        }
+            dst[i] = anti_tamper::virtualizer::detail::cipher_stream_xcrypt(s, src[i], true);
+        SecureZeroMemory(&s, sizeof(s));
     }
+
+    inline void decrypt_buffer(uint8_t* dst, const uint8_t* src, uint32_t len, uint64_t key)
+    {
+        anti_tamper::virtualizer::detail::cipher_stream_t s;
+        anti_tamper::virtualizer::detail::cipher_stream_init(s, key);
+        for (uint32_t i = 0; i < len; ++i)
+            dst[i] = anti_tamper::virtualizer::detail::cipher_stream_xcrypt(s, src[i], false);
+        SecureZeroMemory(&s, sizeof(s));
+    }
+
+    inline uint64_t compute_function_hash(const void* code, uint32_t hint_len,
+                                           uint64_t k0, uint64_t k1)
+    {
+        uint32_t scan = (hint_len < 64) ? hint_len : 64;
+        return integrity::siphash::hash(static_cast<const uint8_t*>(code), scan, k0, k1);
+    }
+
     inline uint32_t compute_prologue_length(const uint8_t* code, uint32_t min_bytes)
     {
         uint32_t len = 0;
@@ -171,48 +223,281 @@ namespace detail {
         return len;
     }
 
-    inline void encrypt_prologue(uint8_t* dst, const uint8_t* src, uint32_t len, uint64_t key)
+    inline bool aes_gcm_decrypt(const uint8_t* key, uint32_t key_len,
+                                const uint8_t* iv, uint32_t iv_len,
+                                const uint8_t* aad, uint32_t aad_len,
+                                const uint8_t* ciphertext, uint32_t ct_len,
+                                const uint8_t* tag, uint32_t tag_len,
+                                uint8_t* plaintext_out)
     {
-        uint64_t rolling = key;
-        for (uint32_t i = 0; i < len; ++i)
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_KEY_HANDLE hKey = nullptr;
+        bool ok = false;
+
+        if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0) != 0)
+            return false;
+
+        ULONG cb = 0;
+        if (BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
+                              reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
+                              sizeof(BCRYPT_CHAIN_MODE_GCM), 0) != 0)
         {
-            dst[i] = src[i] ^ static_cast<uint8_t>(rolling);
-            rolling ^= rolling << 13;
-            rolling ^= rolling >> 7;
-            rolling ^= rolling << 17;
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return false;
         }
+
+        if (BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0,
+                                       const_cast<PUCHAR>(key), key_len, 0) != 0)
+        {
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return false;
+        }
+
+        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info{};
+        BCRYPT_INIT_AUTH_MODE_INFO(info);
+        info.pbNonce = const_cast<PUCHAR>(iv);
+        info.cbNonce = iv_len;
+        info.pbAuthData = const_cast<PUCHAR>(aad);
+        info.cbAuthData = aad_len;
+        info.pbTag = const_cast<PUCHAR>(tag);
+        info.cbTag = tag_len;
+
+        ULONG out_size = 0;
+        if (BCryptDecrypt(hKey,
+                          const_cast<PUCHAR>(ciphertext), ct_len,
+                          &info, nullptr, 0,
+                          plaintext_out, ct_len, &out_size, 0) == 0)
+        {
+            ok = (out_size == ct_len);
+        }
+
+        BCryptDestroyKey(hKey);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return ok;
     }
 
-    inline void decrypt_prologue(uint8_t* dst, const uint8_t* src, uint32_t len, uint64_t key)
+    inline bool aes_gcm_encrypt(const uint8_t* key, uint32_t key_len,
+                                const uint8_t* iv, uint32_t iv_len,
+                                const uint8_t* aad, uint32_t aad_len,
+                                const uint8_t* plaintext, uint32_t pt_len,
+                                uint8_t* ciphertext_out, uint8_t tag_out[16])
     {
-        encrypt_prologue(dst, src, len, key);
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_KEY_HANDLE hKey = nullptr;
+        bool ok = false;
+
+        if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0) != 0)
+            return false;
+
+        if (BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
+                              reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
+                              sizeof(BCRYPT_CHAIN_MODE_GCM), 0) != 0)
+        {
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return false;
+        }
+
+        if (BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0,
+                                       const_cast<PUCHAR>(key), key_len, 0) != 0)
+        {
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return false;
+        }
+
+        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info{};
+        BCRYPT_INIT_AUTH_MODE_INFO(info);
+        info.pbNonce = const_cast<PUCHAR>(iv);
+        info.cbNonce = iv_len;
+        info.pbAuthData = const_cast<PUCHAR>(aad);
+        info.cbAuthData = aad_len;
+        info.pbTag = tag_out;
+        info.cbTag = 16;
+
+        ULONG out_size = 0;
+        if (BCryptEncrypt(hKey,
+                          const_cast<PUCHAR>(plaintext), pt_len,
+                          &info, nullptr, 0,
+                          ciphertext_out, pt_len, &out_size, 0) == 0)
+        {
+            ok = (out_size == pt_len);
+        }
+
+        BCryptDestroyKey(hKey);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return ok;
     }
 
 }
 
+inline void install_oracle(detail::oracle_fetch_fn fn)
+{
+    auto& s = detail::get_state();
+    std::lock_guard<std::mutex> lk(s.mtx);
+    s.oracle_fn = std::move(fn);
+}
+
+inline void rotate_session(uint64_t new_epoch)
+{
+    auto& s = detail::get_state();
+    std::lock_guard<std::mutex> lk(s.mtx);
+    s.session_epoch = new_epoch;
+    for (uint32_t i = 0; i < s.count; ++i)
+    {
+        auto& entry = s.entries[i];
+        entry.cached_present = false;
+        entry.cached_ciphertext.clear();
+        entry.cached_aes_gcm_tag.clear();
+        entry.cached_session_iv.clear();
+        entry.cached_fetch_id = 0;
+        entry.cached_at_tick = 0;
+        entry.valid_until_tick = 0;
+        if (!entry.ephemeral_session_key.empty())
+        {
+            volatile uint8_t* p = entry.ephemeral_session_key.data();
+            for (size_t j = 0; j < entry.ephemeral_session_key.size(); ++j) p[j] = 0;
+            entry.ephemeral_session_key.clear();
+        }
+    }
+}
+
+inline bool fetch_prologue_from_oracle(detail::stolen_entry_t& entry, uint64_t now_tick)
+{
+    auto& s = detail::get_state();
+    if (!s.oracle_fn) return false;
+
+    detail::fetch_oracle_request_t req{};
+    req.function_hash = entry.function_hash;
+    uint8_t nonce_buf[8];
+    if (!virtualizer::detail::bcrypt_random(nonce_buf, 8))
+    {
+        uint64_t fb = __rdtsc() ^ entry.original_addr;
+        memcpy(nonce_buf, &fb, 8);
+    }
+    memcpy(&req.client_nonce, nonce_buf, 8);
+    req.requested_at = now_tick;
+
+    detail::fetch_oracle_response_t resp{};
+    if (!s.oracle_fn(req, resp))
+        return false;
+    if (!resp.ok || resp.ciphertext.empty() || resp.aes_gcm_tag.size() != 16
+        || resp.session_iv.size() != 12 || resp.ephemeral_key.size() != 32)
+        return false;
+    if (resp.prologue_len != entry.prologue_len)
+        return false;
+
+    entry.cached_ciphertext = std::move(resp.ciphertext);
+    entry.cached_aes_gcm_tag = std::move(resp.aes_gcm_tag);
+    entry.cached_session_iv = std::move(resp.session_iv);
+    entry.ephemeral_session_key = std::move(resp.ephemeral_key);
+    entry.cached_fetch_id = resp.fetch_id;
+    entry.cached_at_tick = now_tick;
+    entry.valid_until_tick = resp.valid_until_tick;
+    entry.cached_present = true;
+    return true;
+}
+
+inline bool decrypt_and_execute_in_place(detail::stolen_entry_t& entry)
+{
+    auto& s = detail::get_state();
+    if (!entry.cached_present) return false;
+    if (entry.ephemeral_session_key.size() != 32) return false;
+    if (entry.cached_session_iv.size() != 12) return false;
+    if (entry.cached_aes_gcm_tag.size() != 16) return false;
+    if (entry.cached_ciphertext.size() != entry.prologue_len) return false;
+
+    uint8_t aad[24];
+    memcpy(aad, &entry.function_hash, 8);
+    memcpy(aad + 8, &entry.cached_fetch_id, 8);
+    memcpy(aad + 16, &s.session_epoch, 8);
+
+    std::vector<uint8_t> plaintext(entry.prologue_len);
+    bool decrypted = detail::aes_gcm_decrypt(
+        entry.ephemeral_session_key.data(), 32,
+        entry.cached_session_iv.data(), 12,
+        aad, 24,
+        entry.cached_ciphertext.data(),
+        static_cast<uint32_t>(entry.cached_ciphertext.size()),
+        entry.cached_aes_gcm_tag.data(), 16,
+        plaintext.data());
+    if (!decrypted)
+    {
+        volatile uint8_t* p = plaintext.data();
+        for (size_t i = 0; i < plaintext.size(); ++i) p[i] = 0;
+        return false;
+    }
+
+    auto* code_ptr = reinterpret_cast<uint8_t*>(entry.original_addr);
+    DWORD old_prot = 0;
+    if (!VirtualProtect(code_ptr, entry.prologue_len, PAGE_EXECUTE_READWRITE, &old_prot))
+    {
+        volatile uint8_t* p = plaintext.data();
+        for (size_t i = 0; i < plaintext.size(); ++i) p[i] = 0;
+        return false;
+    }
+    memcpy(code_ptr, plaintext.data(), entry.prologue_len);
+    FlushInstructionCache(GetCurrentProcess(), code_ptr, entry.prologue_len);
+
+    auto cont = reinterpret_cast<void(*)()>(static_cast<uintptr_t>(entry.original_addr));
+    cont();
+
+    uint8_t indirect_jmp[14];
+    indirect_jmp[0] = 0xFF;
+    indirect_jmp[1] = 0x25;
+    *reinterpret_cast<uint32_t*>(indirect_jmp + 2) = 0;
+    *reinterpret_cast<uint64_t*>(indirect_jmp + 6) = entry.trampoline_addr;
+    memcpy(code_ptr, indirect_jmp, 14);
+    for (uint32_t i = 14; i < entry.prologue_len; ++i)
+        code_ptr[i] = 0xCC;
+    FlushInstructionCache(GetCurrentProcess(), code_ptr, entry.prologue_len);
+
+    DWORD discard = 0;
+    VirtualProtect(code_ptr, entry.prologue_len, old_prot, &discard);
+
+    volatile uint8_t* pscrub = plaintext.data();
+    for (size_t i = 0; i < plaintext.size(); ++i) pscrub[i] = 0;
+    return true;
+}
+
 inline void vm_prologue_execute(detail::stolen_entry_t* entry)
 {
-    if (!entry || entry->vm_bytecode.empty())
-        return;
-
-    anti_tamper::virtualizer::detail::vm_state_t vm;
-    anti_tamper::virtualizer::detail::init_vm(vm, entry->vm_seed, entry->pool);
-    anti_tamper::virtualizer::detail::vm_execute(
-        vm, entry->vm_bytecode.data(),
-        static_cast<uint32_t>(entry->vm_bytecode.size()));
-    anti_tamper::virtualizer::detail::destroy_vm(vm);
-
-    auto cont = reinterpret_cast<void(*)()>(
-        static_cast<uintptr_t>(entry->continuation_addr));
-    cont();
+    if (!entry) return;
+    auto& s = detail::get_state();
+    std::lock_guard<std::mutex> lk(s.mtx);
+    uint64_t now = GetTickCount64();
+    if (!entry->cached_present || (entry->valid_until_tick > 0 && now >= entry->valid_until_tick))
+    {
+        if (!fetch_prologue_from_oracle(*entry, now))
+        {
+            if (!entry->vm_bytecode.empty())
+            {
+                anti_tamper::virtualizer::detail::vm_state_t vm;
+                anti_tamper::virtualizer::detail::init_vm(vm, entry->vm_seed, entry->pool);
+                anti_tamper::virtualizer::detail::vm_execute(
+                    vm, entry->vm_bytecode.data(),
+                    static_cast<uint32_t>(entry->vm_bytecode.size()));
+                anti_tamper::virtualizer::detail::destroy_vm(vm);
+            }
+            return;
+        }
+    }
+    decrypt_and_execute_in_place(*entry);
 }
 
 inline bool initialize()
 {
     auto& s = detail::get_state();
-    if (s.initialized) return true;
+    if (s.initialized.load(std::memory_order_acquire)) return true;
+
+    std::lock_guard<std::mutex> lk(s.mtx);
+    if (s.initialized.load(std::memory_order_acquire)) return true;
 
     integrity::get_session_keys(s.session_key[0], s.session_key[1]);
+
+    uint8_t epoch_buf[8];
+    if (virtualizer::detail::bcrypt_random(epoch_buf, 8))
+        memcpy(&s.session_epoch, epoch_buf, 8);
+    else
+        s.session_epoch = __rdtsc();
 
     s.trampoline_page = VirtualAlloc(nullptr, 4096,
         MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -220,14 +505,14 @@ inline bool initialize()
 
     s.trampoline_offset = 0;
     s.count = 0;
-    s.initialized = true;
+    s.initialized.store(true, std::memory_order_release);
     return true;
 }
 
 inline bool steal_function_prologue(void* target_func)
 {
     auto& s = detail::get_state();
-    if (!s.initialized || s.count >= detail::MAX_ENTRIES)
+    if (!s.initialized.load(std::memory_order_acquire) || s.count >= detail::MAX_ENTRIES)
         return false;
 
     auto* code = static_cast<uint8_t*>(target_func);
@@ -235,6 +520,7 @@ inline bool steal_function_prologue(void* target_func)
     if (steal_len < 5 || steal_len > detail::MAX_STOLEN)
         return false;
 
+    std::lock_guard<std::mutex> lk(s.mtx);
     if (s.trampoline_offset + 64 > 4096)
         return false;
 
@@ -242,15 +528,12 @@ inline bool steal_function_prologue(void* target_func)
     entry.original_addr = reinterpret_cast<uint64_t>(code);
     entry.prologue_len = steal_len;
     entry.continuation_addr = reinterpret_cast<uint64_t>(code) + steal_len;
-
-    uint8_t buf[16];
-    uint64_t addr_val = reinterpret_cast<uint64_t>(code);
-    memcpy(buf, &addr_val, 8);
-    memcpy(buf + 8, &s.session_key[0], 8);
-    entry.encryption_key = integrity::siphash::hash(
-        buf, 16, s.session_key[0], s.session_key[1]);
-
-    detail::encrypt_prologue(entry.encrypted_prologue, code, steal_len, entry.encryption_key);
+    entry.function_hash = detail::compute_function_hash(code, steal_len,
+                                                         s.session_key[0], s.session_key[1]);
+    entry.cached_present = false;
+    entry.cached_at_tick = 0;
+    entry.valid_until_tick = 0;
+    entry.cached_fetch_id = 0;
 
     uint64_t vm_seed = anti_tamper::virtualizer::detail::secure_seed();
     entry.vm_seed = vm_seed;
@@ -314,8 +597,9 @@ inline bool steal_function_prologue(void* target_func)
 inline bool verify_stolen_bytes()
 {
     auto& s = detail::get_state();
-    if (!s.initialized) return true;
+    if (!s.initialized.load(std::memory_order_acquire)) return true;
 
+    std::lock_guard<std::mutex> lk(s.mtx);
     for (uint32_t i = 0; i < s.count; ++i)
     {
         auto& entry = s.entries[i];
@@ -323,26 +607,21 @@ inline bool verify_stolen_bytes()
         if (entry.vm_bytecode.empty())
             return false;
 
-        uint8_t decrypted[detail::MAX_STOLEN];
-        detail::decrypt_prologue(decrypted, entry.encrypted_prologue,
-                                  entry.prologue_len, entry.encryption_key);
-
-        uint64_t prologue_hash = integrity::siphash::hash(
-            decrypted, entry.prologue_len,
-            s.session_key[0], s.session_key[1]);
-
-        uint64_t bc_hash = integrity::siphash::hash(
-            entry.vm_bytecode.data(),
-            entry.vm_bytecode.size(),
-            s.session_key[0] ^ prologue_hash,
-            s.session_key[1] ^ prologue_hash);
-
-        if (bc_hash == 0)
-            return false;
-
         auto* original = reinterpret_cast<const uint8_t*>(entry.original_addr);
         if (original[0] != 0xFF || original[1] != 0x25)
             return false;
+
+        if (entry.cached_present)
+        {
+            if (entry.cached_ciphertext.size() != entry.prologue_len)
+                return false;
+            if (entry.cached_aes_gcm_tag.size() != 16)
+                return false;
+            if (entry.cached_session_iv.size() != 12)
+                return false;
+            if (entry.ephemeral_session_key.size() != 32)
+                return false;
+        }
     }
 
     return true;
@@ -351,6 +630,21 @@ inline bool verify_stolen_bytes()
 inline void shutdown()
 {
     auto& s = detail::get_state();
+    std::lock_guard<std::mutex> lk(s.mtx);
+    for (uint32_t i = 0; i < s.count; ++i)
+    {
+        auto& entry = s.entries[i];
+        if (!entry.ephemeral_session_key.empty())
+        {
+            volatile uint8_t* p = entry.ephemeral_session_key.data();
+            for (size_t j = 0; j < entry.ephemeral_session_key.size(); ++j) p[j] = 0;
+            entry.ephemeral_session_key.clear();
+        }
+        entry.cached_ciphertext.clear();
+        entry.cached_aes_gcm_tag.clear();
+        entry.cached_session_iv.clear();
+        entry.cached_present = false;
+    }
     if (s.trampoline_page)
     {
         volatile uint8_t* p = static_cast<volatile uint8_t*>(s.trampoline_page);
@@ -358,7 +652,7 @@ inline void shutdown()
         VirtualFree(s.trampoline_page, 0, MEM_RELEASE);
         s.trampoline_page = nullptr;
     }
-    s.initialized = false;
+    s.initialized.store(false, std::memory_order_release);
 
     auto& bb = detail::get_bb_state();
     if (bb.trampoline_page)
@@ -607,7 +901,7 @@ inline bool verify_basic_blocks()
             return false;
 
         uint8_t decrypted[detail::MAX_BB_ORIGINAL];
-        detail::encrypt_buffer(decrypted, entry.encrypted_original,
+        detail::decrypt_buffer(decrypted, entry.encrypted_original,
                                entry.block_length, entry.encryption_key);
 
         uint64_t orig_hash = integrity::siphash::hash(

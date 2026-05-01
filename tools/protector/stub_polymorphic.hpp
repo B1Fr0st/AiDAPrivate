@@ -147,6 +147,101 @@ inline void emit_mba_const(asmjit::x86::Assembler& a,
     }
 }
 
+inline void emit_overlap_pattern_a(asmjit::x86::Assembler& a, poly_rng_t& rng) {
+    using namespace asmjit;
+    Label lAfter = a.new_label();
+    a.short_().jmp(lAfter);
+    std::array<uint8_t, 6> decoys{};
+    static const uint8_t kPrefixSeeds[][3] = {
+        { 0x48u, 0x8Bu, 0x05u },
+        { 0x48u, 0x89u, 0x05u },
+        { 0x48u, 0x83u, 0xC4u },
+        { 0x66u, 0x0Fu, 0x6Eu },
+        { 0x49u, 0xBAu, 0x90u },
+        { 0xF3u, 0x48u, 0xA5u },
+        { 0x48u, 0xC7u, 0xC0u },
+        { 0x4Cu, 0x8Du, 0x35u }
+    };
+    uint32_t pick = rng.range(static_cast<uint32_t>(sizeof(kPrefixSeeds) / sizeof(kPrefixSeeds[0])));
+    decoys[0] = kPrefixSeeds[pick][0];
+    decoys[1] = kPrefixSeeds[pick][1];
+    decoys[2] = kPrefixSeeds[pick][2];
+    decoys[3] = rng.next8();
+    decoys[4] = rng.next8();
+    decoys[5] = rng.next8();
+    uint32_t emit_len = 4u + rng.range(3u);
+    a.embed(decoys.data(), emit_len);
+    a.bind(lAfter);
+}
+
+inline void emit_overlap_pattern_b(asmjit::x86::Assembler& a, poly_rng_t& rng) {
+    using namespace asmjit;
+    Label lAfter = a.new_label();
+    static const uint32_t kSafeScratch[] = { 10u, 11u };
+    uint32_t scratch_id = kSafeScratch[rng.range(2u)];
+    x86::Gp rScratch = gp64_from_id(scratch_id);
+    a.pushfq();
+    a.push(rScratch);
+    a.xor_(rScratch, rScratch);
+    a.short_().jz(lAfter);
+    std::array<uint8_t, 8> trap{};
+    uint32_t trap_len = 3u + rng.range(5u);
+    static const uint8_t kFragmentSeeds[][2] = {
+        { 0xC3u, 0x90u },
+        { 0xCCu, 0xCCu },
+        { 0x0Fu, 0x0Bu },
+        { 0xCDu, 0x29u },
+        { 0xF4u, 0x90u },
+        { 0xEBu, 0xFEu }
+    };
+    uint32_t pick = rng.range(static_cast<uint32_t>(sizeof(kFragmentSeeds) / sizeof(kFragmentSeeds[0])));
+    trap[0] = kFragmentSeeds[pick][0];
+    trap[1] = kFragmentSeeds[pick][1];
+    for (uint32_t i = 2u; i < trap_len; ++i) {
+        trap[i] = rng.next8();
+    }
+    a.embed(trap.data(), trap_len);
+    a.bind(lAfter);
+    a.pop(rScratch);
+    a.popfq();
+}
+
+inline void emit_overlap_pattern_c(asmjit::x86::Assembler& a, poly_rng_t& rng) {
+    using namespace asmjit;
+    Label lInner = a.new_label();
+    Label lAfter = a.new_label();
+    a.short_().jmp(lInner);
+    std::array<uint8_t, 9> outer_decoys{};
+    static const uint8_t kMovabsLead[] = { 0x49u, 0xBAu };
+    outer_decoys[0] = kMovabsLead[0];
+    outer_decoys[1] = kMovabsLead[1];
+    outer_decoys[2] = 0xEBu;
+    outer_decoys[3] = 0x05u;
+    for (uint32_t i = 4u; i < 9u; ++i) {
+        outer_decoys[i] = rng.next8();
+    }
+    a.embed(outer_decoys.data(), 9u);
+    a.bind(lInner);
+    a.short_().jmp(lAfter);
+    std::array<uint8_t, 5> tail_decoys{};
+    tail_decoys[0] = 0x90u;
+    tail_decoys[1] = rng.next8();
+    tail_decoys[2] = rng.next8();
+    tail_decoys[3] = rng.next8();
+    tail_decoys[4] = rng.next8();
+    a.embed(tail_decoys.data(), 5u);
+    a.bind(lAfter);
+}
+
+inline void emit_overlap_dispatch(asmjit::x86::Assembler& a, poly_rng_t& rng) {
+    uint32_t pick = rng.range(3u);
+    switch (pick) {
+        case 0: emit_overlap_pattern_a(a, rng); break;
+        case 1: emit_overlap_pattern_b(a, rng); break;
+        default: emit_overlap_pattern_c(a, rng); break;
+    }
+}
+
 inline void emit_opaque_predicate(asmjit::x86::Assembler& a,
                                     asmjit::x86::Gp scratch,
                                     poly_rng_t& rng) {
@@ -302,12 +397,16 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
         emit_opaque_predicate(a, rTmp1, rng);
     }
 
+    emit_overlap_dispatch(a, rng);
+
     for (size_t i = 0; i < push_order.size(); ++i) {
         a.push(gp64_from_id(push_order[i]));
     }
     a.sub(x86::rsp, 0x28);
 
     emit_opaque_predicate(a, rTmp1, rng);
+
+    emit_overlap_dispatch(a, rng);
 
     emit_mba_const(a, rTmp1, 0x60ULL, rng);
     x86::Mem peb_mem = x86::qword_ptr(rTmp1);
@@ -322,6 +421,8 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
     a.mov(x86::qword_ptr(x86::rsp, 0x20), rBase);
 
     emit_opaque_predicate(a, rTmp2, rng);
+
+    emit_overlap_dispatch(a, rng);
 
     a.jmp(lAfterKey);
     a.bind(lKey);
@@ -351,6 +452,8 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
 
     emit_opaque_predicate(a, rIdx, rng);
 
+    emit_overlap_dispatch(a, rng);
+
     a.mov(x86::rcx, x86::qword_ptr(x86::rsp, 0x20));
     a.lea(x86::rax, x86::ptr(lPayload));
     a.add(x86::rax, static_cast<int32_t>(aida_payload::kEntryOffset));
@@ -365,6 +468,8 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
     }
 
     emit_opaque_predicate(a, rTmp2, rng);
+
+    emit_overlap_dispatch(a, rng);
 
     a.add(x86::rsp, 0x28);
     for (size_t i = push_order.size(); i > 0; --i) {

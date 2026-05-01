@@ -21,32 +21,42 @@ struct pool_t {
     std::condition_variable           cv;
     std::atomic<bool>                 alive{false};
     std::atomic<bool>                 shutting_down{false};
+    std::atomic<bool>                 shutdown_called{false};
 };
 
 inline pool_t g_pool;
 
 }
 
+inline void shutdown();
+
 inline void initialize() {
     auto& p = detail::g_pool;
     if (p.shutting_down.load(std::memory_order_acquire)) return;
     bool expected = false;
     if (!p.alive.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
-    p.workers.reserve(POOL_SIZE);
-    for (int i = 0; i < POOL_SIZE; ++i) {
-        p.workers.emplace_back([&p]() {
-            while (true) {
-                std::function<void()> task;
-                {
-                    std::unique_lock<std::mutex> lk(p.mtx);
-                    p.cv.wait(lk, [&p]() { return !p.tasks.empty() || !p.alive.load(); });
-                    if (!p.alive.load() && p.tasks.empty()) return;
-                    task = std::move(p.tasks.front());
-                    p.tasks.pop();
+    {
+        std::lock_guard<std::mutex> lk(p.mtx);
+        if (p.shutting_down.load(std::memory_order_acquire)) {
+            p.alive.store(false, std::memory_order_release);
+            return;
+        }
+        p.workers.reserve(POOL_SIZE);
+        for (int i = 0; i < POOL_SIZE; ++i) {
+            p.workers.emplace_back([&p]() {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lk(p.mtx);
+                        p.cv.wait(lk, [&p]() { return !p.tasks.empty() || !p.alive.load(); });
+                        if (!p.alive.load() && p.tasks.empty()) return;
+                        task = std::move(p.tasks.front());
+                        p.tasks.pop();
+                    }
+                    try { task(); } catch (...) {}
                 }
-                try { task(); } catch (...) {}
-            }
-        });
+            });
+        }
     }
 }
 
@@ -64,11 +74,24 @@ inline void post(std::function<void()> f) {
 
 inline void shutdown() {
     auto& p = detail::g_pool;
+    bool expected = false;
+    if (!p.shutdown_called.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
     p.shutting_down.store(true, std::memory_order_release);
     p.alive.store(false, std::memory_order_release);
-    p.cv.notify_all();
-    for (auto& w : p.workers) if (w.joinable()) w.join();
-    p.workers.clear();
+    std::vector<std::thread> to_join;
+    {
+        std::lock_guard<std::mutex> lk(p.mtx);
+        to_join = std::move(p.workers);
+        p.workers.clear();
+        p.cv.notify_all();
+    }
+    for (auto& w : to_join) if (w.joinable()) w.join();
 }
+
+struct work_queue_shutdown_guard_t {
+    ~work_queue_shutdown_guard_t() { ::work_queue::shutdown(); }
+};
+
+inline work_queue_shutdown_guard_t g_work_queue_shutdown_guard;
 
 }

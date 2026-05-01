@@ -4,11 +4,15 @@
 #include "ui_anim.hpp"
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
+#include "decompiler_engine.hpp"
+#include "disasm_view.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <string>
 #include <vector>
+
+extern DisasmState g_disasm;
 
 namespace integrity_hunter_view {
 
@@ -16,6 +20,7 @@ struct local_state_t {
 	float scroll_y = 0.f;
 	float target_scroll_y = 0.f;
 	int   selected_node = -1;
+	uint64_t selected_rip = 0;
 	bool  show_event_log = false;
 	float log_scroll_y = 0.f;
 	bool  scrollbar_dragging = false;
@@ -23,7 +28,7 @@ struct local_state_t {
 	float anim_time = 0.f;
 };
 
-static local_state_t s_state;
+inline local_state_t s_state;
 
 inline void render(float pos_x, float pos_y, float width, float height,
                    float alpha, float accent_r, float accent_g, float accent_b)
@@ -254,6 +259,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 			st.selected_node = i;
+			st.selected_rip = node.reader_rip;
 		}
 
 		float col_x = hx + 4.f;
@@ -295,31 +301,48 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			dl->AddText(ImVec2(col_x, ry + 3.f), red_col, "Active");
 		}
 
-		if (selected && hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+			st.selected_node = i;
+			st.selected_rip = node.reader_rip;
 			ImGui::OpenPopup("##ih_ctx");
 		}
 	}
 
 	if (ImGui::BeginPopup("##ih_ctx")) {
-		if (st.selected_node >= 0 && st.selected_node < total_rows) {
-			auto& sel_node = nodes_copy[static_cast<size_t>(st.selected_node)];
+		int live_idx = -1;
+		integrity_hunter::integrity_node_t sel_node{};
+		bool have_sel = false;
+		{
+			std::lock_guard<std::mutex> lk(ih.mutex);
+			for (size_t k = 0; k < ih.nodes.size(); ++k) {
+				if (ih.nodes[k].reader_rip == st.selected_rip) {
+					live_idx = static_cast<int>(k);
+					sel_node = ih.nodes[k];
+					have_sel = true;
+					break;
+				}
+			}
+		}
 
+		if (have_sel) {
 			if (!sel_node.neutralized) {
 				if (ImGui::MenuItem("Neutralize")) {
-					integrity_hunter::neutralize(st.selected_node);
+					integrity_hunter::neutralize(live_idx);
 				}
 			} else {
 				if (ImGui::MenuItem("Restore Original")) {
-					integrity_hunter::restore(st.selected_node);
+					integrity_hunter::restore(live_idx);
 				}
 			}
 
 			if (ImGui::MenuItem("Go to Disassembly")) {
 				globals::ui::active_center_view = center_view_t::disassembly;
+				disasm_view::goto_address(sel_node.reader_rip, g_disasm);
 			}
 
 			if (ImGui::MenuItem("Decompile Reader")) {
 				globals::ui::active_center_view = center_view_t::decompiler;
+				decompiler_engine::decompile_function(sel_node.reader_rip, g_sa_settings);
 			}
 		}
 		ImGui::EndPopup();

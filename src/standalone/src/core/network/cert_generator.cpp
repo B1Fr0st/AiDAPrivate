@@ -202,16 +202,11 @@ bool remove_root_ca(const root_ca_t& ca) {
         CERT_SYSTEM_STORE_CURRENT_USER, L"ROOT");
     if (!store) return false;
 
-    PCCERT_CONTEXT found = CertFindCertificateInStore(store,
-        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, CERT_FIND_EXISTING,
-        nullptr, nullptr);
-
-
     CERT_BLOB blob;
     blob.cbData = static_cast<DWORD>(der.size());
     blob.pbData = der.data();
 
-    found = nullptr;
+    PCCERT_CONTEXT found = nullptr;
     while ((found = CertEnumCertificatesInStore(store, found)) != nullptr) {
         if (found->cbCertEncoded == blob.cbData &&
             memcmp(found->pbCertEncoded, blob.pbData, blob.cbData) == 0) {

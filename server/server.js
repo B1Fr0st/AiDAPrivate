@@ -39,8 +39,11 @@ const rateLimit = require('express-rate-limit');
 
 const licenseRoutes = require('./routes/license');
 const downloadRoutes = require('./routes/download');
+const functionsRoutes = require('./routes/functions');
 const sentinelRoutes = require('./routes/sentinel');
 const telemetryRoutes = require('./routes/telemetry');
+const stolenBytesRoutes = require('./routes/stolen_bytes');
+const attestationRoutes = require('./routes/attestation');
 const tlsExporter = require('./crypto/tls_exporter');
 
 if (process.env.NODE_APP_INSTANCE && parseInt(process.env.NODE_APP_INSTANCE, 10) > 0) {
@@ -134,9 +137,13 @@ app.use('/validateLicense', licenseRoutes);
 app.use('/api/license', licenseRoutes);
 app.use('/api/sentinel', sentinelRoutes);
 app.use('/api/telemetry', telemetryRoutes);
+app.use('/api/stolen_bytes', stolenBytesRoutes);
+app.use('/api/attestation', attestationRoutes);
 
 
 app.use('/api/download', downloadRoutes);
+app.use('/api/arc', downloadRoutes);
+app.use('/api/arc/function', functionsRoutes);
 
 
 app.get('/health', (_req, res) => {

@@ -9,6 +9,19 @@
 
 namespace apply_diff {
 
+namespace detail {
+inline std::string& last_error_ref()
+{
+    static std::string s_last_error;
+    return s_last_error;
+}
+}
+
+inline const std::string& last_error()
+{
+    return detail::last_error_ref();
+}
+
 
 struct hunk_t
 {
@@ -54,7 +67,29 @@ inline std::string join_lines(const std::vector<std::string>& lines)
 }
 
 
-inline double levenshtein_similarity(const std::string& a, const std::string& b)
+namespace detail {
+
+inline double cheap_prefix_similarity(const std::string& a, const std::string& b)
+{
+    size_t len_a = a.size();
+    size_t len_b = b.size();
+    size_t max_len = (std::max)(len_a, len_b);
+    if (max_len == 0) return 1.0;
+    size_t min_len = (std::min)(len_a, len_b);
+    size_t matches = 0;
+    for (size_t i = 0; i < min_len; ++i) {
+        if (a[i] == b[i]) ++matches;
+    }
+    double ratio = static_cast<double>(matches) / static_cast<double>(max_len);
+    if (ratio < 0.0) ratio = 0.0;
+    if (ratio > 1.0) ratio = 1.0;
+    return ratio;
+}
+
+}
+
+
+inline double cheap_levenshtein_or_prefix_similarity(const std::string& a, const std::string& b)
 {
     if (a.empty() && b.empty()) return 1.0;
     if (a.empty() || b.empty()) return 0.0;
@@ -62,14 +97,8 @@ inline double levenshtein_similarity(const std::string& a, const std::string& b)
     size_t len_a = a.size();
     size_t len_b = b.size();
 
-    if (len_a > 500 || len_b > 500) {
-        size_t matches = 0;
-        size_t max_len = (std::max)(len_a, len_b);
-        size_t min_len = (std::min)(len_a, len_b);
-        for (size_t i = 0; i < min_len; ++i) {
-            if (a[i] == b[i]) ++matches;
-        }
-        return static_cast<double>(matches) / static_cast<double>(max_len);
+    if ((std::max)(len_a, len_b) > 500) {
+        return detail::cheap_prefix_similarity(a, b);
     }
 
     std::vector<std::vector<size_t>> dp(len_a + 1, std::vector<size_t>(len_b + 1, 0));
@@ -85,7 +114,10 @@ inline double levenshtein_similarity(const std::string& a, const std::string& b)
     }
 
     size_t max_len = (std::max)(len_a, len_b);
-    return 1.0 - static_cast<double>(dp[len_a][len_b]) / static_cast<double>(max_len);
+    double ratio = 1.0 - static_cast<double>(dp[len_a][len_b]) / static_cast<double>(max_len);
+    if (ratio < 0.0) ratio = 0.0;
+    if (ratio > 1.0) ratio = 1.0;
+    return ratio;
 }
 
 
@@ -159,7 +191,7 @@ inline int find_best_match_line(
         double total_sim = 0.0;
         int matched = 0;
         for (size_t j = 0; j < context_lines.size() && (i + static_cast<int>(j)) < static_cast<int>(file_lines.size()); ++j) {
-            total_sim += levenshtein_similarity(file_lines[i + j], context_lines[j]);
+            total_sim += cheap_levenshtein_or_prefix_similarity(file_lines[i + j], context_lines[j]);
             ++matched;
         }
         if (matched > 0) {
@@ -173,7 +205,7 @@ inline int find_best_match_line(
         }
     }
 
-    if (best_score / context_lines.size() < min_similarity)
+    if (best_score < min_similarity)
         return -1;
 
     return best_line;
@@ -184,9 +216,12 @@ inline diff_result_t apply(const std::string& original_content, const std::strin
 {
     diff_result_t result;
 
+    detail::last_error_ref().clear();
+
     auto hunks = parse_unified_diff(diff_text);
     if (hunks.empty()) {
-        result.error = "No valid hunks found in diff";
+        detail::last_error_ref() = "No valid hunks found in diff";
+        result.error = detail::last_error_ref();
         return result;
     }
 
@@ -220,8 +255,9 @@ inline diff_result_t apply(const std::string& original_content, const std::strin
         int match_line = find_best_match_line(file_lines, context_lines, target_line);
 
         if (match_line < 0) {
-            result.error = "Could not find matching context for hunk at line " +
+            detail::last_error_ref() = "Could not find matching context for hunk at line " +
                 std::to_string(hunk.old_start);
+            result.error = detail::last_error_ref();
             return result;
         }
 
@@ -231,8 +267,17 @@ inline diff_result_t apply(const std::string& original_content, const std::strin
                 ++remove_count;
         }
 
+        if (match_line < 0 || static_cast<size_t>(match_line) > file_lines.size() ||
+            remove_count < 0 ||
+            static_cast<size_t>(match_line) + static_cast<size_t>(remove_count) > file_lines.size()) {
+            detail::last_error_ref() = "remove_count exceeds file_lines.size() at hunk near line " +
+                std::to_string(hunk.old_start);
+            result.error = detail::last_error_ref();
+            return result;
+        }
+
         auto it_start = file_lines.begin() + match_line;
-        auto it_end = it_start + (std::min)(remove_count, static_cast<int>(file_lines.size()) - match_line);
+        auto it_end = it_start + remove_count;
         file_lines.erase(it_start, it_end);
 
         for (int i = static_cast<int>(add_lines.size()) - 1; i >= 0; --i) {

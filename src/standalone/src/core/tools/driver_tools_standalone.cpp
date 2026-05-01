@@ -11,6 +11,9 @@
 #include "obfuscation.hpp"
 #include "pro.h"
 
+#include <Zydis/Zydis.h>
+#include "zydis_disasm.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -514,11 +517,6 @@ tool_result_t driver_connect(const json& params)
     if (device->is_connected())
     {
         bool cleared_self_target = false;
-        if (false)
-        {
-            device->clear_process_context();
-            cleared_self_target = true;
-        }
 
         if (device->get_kernel_dtb() == 0)
             device->solve_kernel_dtb();
@@ -599,12 +597,6 @@ tool_result_t driver_attach(const json& params)
 
     if (is_self_target_pid(pid))
         return tool_result_t::error(OBFSTR("Cannot attach to AiDA's own process."));
-
-    if (false)
-    {
-        device->clear_process_context();
-        return tool_result_t::error(OBFSTR("Refusing to attach kernel driver to current IDA host process PID."));
-    }
 
     std::uint64_t base = device->find_image();
     if (base == 0)
@@ -3354,7 +3346,7 @@ static protection_analysis_t analyze_module_protection(
     if (!has_valid_pe || hdr_read < 0x200)
     {
         steps.push_back({{"step", "dynamic_analysis"}, {"ok", true},
-            {"detail", "PE header invalid/wiped Ã¢â‚¬â€ skipping detailed analysis, will use aggressive dump strategy"}});
+            {"detail", "PE header invalid/wiped - skipping detailed analysis, will use aggressive dump strategy"}});
         return result;
     }
 
@@ -3511,7 +3503,7 @@ static protection_analysis_t analyze_module_protection(
     }
 
     steps.push_back({{"step", "dynamic_analysis"}, {"ok", true}, {"detail", detail}});
-    msg(OBFSTR_C("AiDA: Pre-dump dynamic analysis Ã¢â‚¬â€ %s\n"), detail.c_str());
+    msg(OBFSTR_C("AiDA: Pre-dump dynamic analysis - %s\n"), detail.c_str());
 
     return result;
 }
@@ -3694,7 +3686,7 @@ static int force_decrypt_via_shellcode(
     dev->write_raw(addr_list_base, noaccess_pages.data(),
         entries * sizeof(std::uint64_t));
 
-    msg(OBFSTR_C("AiDA: Injecting decrypt shellcode Ã¢â‚¬â€ %zu NOACCESS code pages to trigger...\n"),
+    msg(OBFSTR_C("AiDA: Injecting decrypt shellcode - %zu NOACCESS code pages to trigger...\n"),
         entries);
 
 
@@ -3710,7 +3702,7 @@ static int force_decrypt_via_shellcode(
     steps.push_back({{"step", "decrypt_shellcode"}, {"ok", pages_decrypted > 0},
         {"detail", std::to_string(pages_decrypted) + "/" + std::to_string(entries) +
             " NOACCESS code pages triggered via usermode exception-based decryption"}});
-    msg(OBFSTR_C("AiDA: Shellcode decryption complete Ã¢â‚¬â€ %d/%zu pages triggered\n"),
+    msg(OBFSTR_C("AiDA: Shellcode decryption complete - %d/%zu pages triggered\n"),
         pages_decrypted, entries);
 
     return pages_decrypted;
@@ -3750,7 +3742,7 @@ static int force_code_pages_in_memory(
     if (kernel32_base == 0)
     {
         steps.push_back({{"step", "force_page_in"}, {"ok", false},
-            {"detail", "kernel32.dll not found in target Ã¢â‚¬â€ skipping active page forcing"}});
+            {"detail", "kernel32.dll not found in target - skipping active page forcing"}});
         return 0;
     }
 
@@ -3758,7 +3750,7 @@ static int force_code_pages_in_memory(
     if (vp_addr == 0)
     {
         steps.push_back({{"step", "force_page_in"}, {"ok", false},
-            {"detail", "Could not resolve VirtualProtect Ã¢â‚¬â€ skipping active page forcing"}});
+            {"detail", "Could not resolve VirtualProtect - skipping active page forcing"}});
         return 0;
     }
 
@@ -3766,7 +3758,7 @@ static int force_code_pages_in_memory(
     if (old_prot_buf == 0)
     {
         steps.push_back({{"step", "force_page_in"}, {"ok", false},
-            {"detail", "Could not allocate scratch buffer Ã¢â‚¬â€ skipping active page forcing"}});
+            {"detail", "Could not allocate scratch buffer - skipping active page forcing"}});
         return 0;
     }
 
@@ -3818,7 +3810,7 @@ static int force_code_pages_in_memory(
     else
     {
         steps.push_back({{"step", "force_page_in"}, {"ok", false},
-            {"detail", "VirtualProtect calls returned 0 Ã¢â‚¬â€ anti-cheat may have blocked protection changes"}});
+            {"detail", "VirtualProtect calls returned 0 - anti-cheat may have blocked protection changes"}});
     }
 
     return pages_forced;
@@ -3852,12 +3844,6 @@ tool_result_t driver_dump_module(const json& params)
         log("find_process", pid != 0, "PID: " + (pid ? std::to_string(pid) : "not found"));
         if (pid == 0)
             return tool_result_t::error(OBFSTR("Process not found: ") + process_name);
-
-        if (false)
-        {
-            device->clear_process_context();
-            return tool_result_t::error(OBFSTR("Refusing to dump from current IDA host process PID."));
-        }
     }
 
     if (device->get_process_id() == 0)
@@ -4087,7 +4073,7 @@ tool_result_t driver_dump_module(const json& params)
         else
         {
             header_wiped = true;
-            log("read_pe_header", false, "MZ found but PE signature invalid/corrupt Ã¢â‚¬â€ will synthesize header after dump");
+            log("read_pe_header", false, "MZ found but PE signature invalid/corrupt - will synthesize header after dump");
         }
     }
     else
@@ -4097,7 +4083,7 @@ tool_result_t driver_dump_module(const json& params)
             "Header likely wiped by anti-cheat. Will synthesize PE header after dump.\n"),
             sa_format_address(base).c_str(), hdr_read);
         log("read_pe_header", false,
-            "MZ signature wiped/missing Ã¢â‚¬â€ anti-cheat header erasure detected. Will synthesize after dump.");
+            "MZ signature wiped/missing - anti-cheat header erasure detected. Will synthesize after dump.");
     }
 
     std::uint64_t ldr_sz = 0;
@@ -4140,7 +4126,7 @@ tool_result_t driver_dump_module(const json& params)
     if (module_size > 0x200000000ULL)
         return tool_result_t::error(OBFSTR("Module size too large (>8GB): ") + std::to_string(module_size));
 
-    msg(OBFSTR_C("AiDA: Module dump plan Ã¢â‚¬â€ %d region, span 0x%zX (%zu MB), image size 0x%X (%u MB)\n"),
+    msg(OBFSTR_C("AiDA: Module dump plan - %d region, span 0x%zX (%zu MB), image size 0x%X (%u MB)\n"),
         vad_plan.committed_region_count, module_size, module_size / (1024 * 1024),
         pe_size_of_image, pe_size_of_image / (1024 * 1024));
 
@@ -4181,7 +4167,7 @@ tool_result_t driver_dump_module(const json& params)
     std::memcpy(module_data.data(), pe_hdr, std::min<std::size_t>(hdr_read, module_size));
     total_read = std::min<std::size_t>(hdr_read, module_size);
 
-    show_wait_box("HIDECANCEL\nAiDA: Dumping %s via kernel Ã¢â‚¬â€ %d regions, 0x%zX bytes (%zu MB)...",
+    show_wait_box("HIDECANCEL\nAiDA: Dumping %s via kernel - %d regions, 0x%zX bytes (%zu MB)...",
                   module_name.c_str(), vad_plan.committed_region_count, module_size,
                   module_size / (1024 * 1024));
 
@@ -4236,7 +4222,7 @@ tool_result_t driver_dump_module(const json& params)
             std::size_t buf_offset = static_cast<std::size_t>(region.offset) + chunk_off;
 
             if (buf_offset % 0x400000 == 0)
-                replace_wait_box("HIDECANCEL\nAiDA: Dumping %s Ã¢â‚¬â€ region %d/%d (0x%zX / 0x%zX, %.1f%%)...",
+                replace_wait_box("HIDECANCEL\nAiDA: Dumping %s - region %d/%d (0x%zX / 0x%zX, %.1f%%)...",
                                  module_name.c_str(), region_idx, vad_plan.committed_region_count,
                                  buf_offset, module_size, (buf_offset * 100.0) / module_size);
 
@@ -4560,7 +4546,7 @@ tool_result_t driver_scan_pattern(const json& params)
 
     uint64_t start_addr = static_cast<uint64_t>(device->get_base_address());
     if (start_addr == 0)
-        return tool_result_t::error(OBFSTR("Process base address is 0 Ã¢â‚¬â€ not attached or invalid target"));
+        return tool_result_t::error(OBFSTR("Process base address is 0 - not attached or invalid target"));
     uint64_t end_addr   = start_addr + (uint64_t)scan_size;
     if (params.contains("start"))
     {
@@ -4574,7 +4560,7 @@ tool_result_t driver_scan_pattern(const json& params)
     }
 
     if (start_addr == 0)
-        return tool_result_t::error(OBFSTR("Scan start address is 0 Ã¢â‚¬â€ provide a valid start address"));
+        return tool_result_t::error(OBFSTR("Scan start address is 0 - provide a valid start address"));
 
     if (end_addr <= start_addr)
         return tool_result_t::error(OBFSTR("Scan end must be greater than start"));
@@ -5619,12 +5605,12 @@ tool_result_t driver_dump_kernel_module(const json& params)
 
         if (iat_rebuild.descriptors_rebuilt == 0 || iat_rebuild.imports_resolved == 0)
         {
-            msg(OBFSTR_C("AiDA: Standard kernel IAT rebuild found nothing Ã¢â‚¬â€ running full export-scan reconstruction...\n"));
+            msg(OBFSTR_C("AiDA: Standard kernel IAT rebuild found nothing - running full export-scan reconstruction...\n"));
             iat_rebuild_result_t scan_result = full_iat_scan_and_rebuild(dump_data, base_addr, device.get(), true);
             if (scan_result.success && scan_result.imports_resolved > 0)
             {
                 iat_rebuild = scan_result;
-                msg(OBFSTR_C("AiDA: Kernel full IAT scan Ã¢â‚¬â€ %d imports resolved, %d DLLs\n"),
+                msg(OBFSTR_C("AiDA: Kernel full IAT scan - %d imports resolved, %d DLLs\n"),
                     scan_result.imports_resolved, scan_result.descriptors_rebuilt);
                 log("iat_full_scan", true, std::to_string(scan_result.imports_resolved) +
                     " imports via full scan, " + std::to_string(scan_result.descriptors_rebuilt) + " DLLs");
@@ -6541,9 +6527,6 @@ tool_result_t driver_spoof_debug_flags(const json& params)
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
-    if (false)
-        return tool_result_t::error(OBFSTR("Refusing to spoof debug flags on the current IDA host process. Attach a non-IDA target first."));
-
     std::uint32_t flags = 0;
     if (!device->spoof_debug_flags(&flags))
         return tool_result_t::error(OBFSTR("Failed to spoof debug flags"));
@@ -7196,13 +7179,6 @@ void DeferredActionManager::watcher_thread_func(int action_id)
             std::uint32_t pid = 0;
             if (poll_process_start(action->target_name, pid))
             {
-                if (false)
-                {
-                    action->error = "Refusing deferred process_start attach for IDA host PID.";
-                    action->status.store(deferred_status::failed);
-                    return;
-                }
-
                 condition_met = true;
                 trigger_context["pid"] = std::to_string(pid);
 
@@ -7245,7 +7221,7 @@ void DeferredActionManager::watcher_thread_func(int action_id)
             bool any_failed = false;
             for (const auto& r : action->results)
             {
-                msg(OBFSTR_C("AiDA: Deferred action #%d - %s: %s Ã¢â‚¬â€ %s\n"),
+                msg(OBFSTR_C("AiDA: Deferred action #%d - %s: %s - %s\n"),
                     action->id, r.action_type.c_str(),
                     r.success ? "OK" : "FAIL", r.message.c_str());
                 if (!r.success) any_failed = true;
@@ -7395,8 +7371,8 @@ tool_result_t driver_defer_action(const json& params)
 
     return tool_result_t::ok(
         already_met
-            ? OBFSTR("Deferred action #") + std::to_string(action_id) + OBFSTR(" Ã¢â‚¬â€ target already loaded, executing immediately!")
-            : OBFSTR("Deferred action #") + std::to_string(action_id) + OBFSTR(" registered Ã¢â‚¬â€ watching for '") + target + "'",
+            ? OBFSTR("Deferred action #") + std::to_string(action_id) + OBFSTR(" - target already loaded, executing immediately!")
+            : OBFSTR("Deferred action #") + std::to_string(action_id) + OBFSTR(" registered - watching for '") + target + "'",
         result);
 }
 
@@ -7463,7 +7439,7 @@ tool_result_t driver_cancel_deferred_action(const json& params)
     }
 
     return tool_result_t::error(OBFSTR("Cannot cancel action #") + std::to_string(id) +
-        OBFSTR(" Ã¢â‚¬â€ not found or already completed/triggered"));
+        OBFSTR(" - not found or already completed/triggered"));
 }
 
 tool_result_t driver_get_deferred_results(const json& params)
@@ -9861,13 +9837,149 @@ tool_result_t driver_walk_seh_chain(const json& params)
     std::string ntdll_name;
     if (resolve_loaded_module_base("ntdll.dll", ntdll_base, ntdll_name) && ntdll_base != 0)
     {
+        const std::uint64_t add_veh = device->resolve_export(ntdll_base, "RtlAddVectoredExceptionHandler");
+        if (add_veh != 0)
+        {
+            std::uint8_t prologue[128] = {};
+            const std::size_t prologue_read = device->read_raw(add_veh, prologue, sizeof(prologue));
+            if (prologue_read >= 16)
+            {
+                zydis_detail::ensure_init();
 
+                std::uint64_t list_head_va = 0;
+                std::size_t off = 0;
+                std::uint64_t va = add_veh;
+                int decoded = 0;
 
-        json veh_note;
-        veh_note["note"] = "VEH list requires ntdll symbol resolution. Use driver_scan_pattern "
-                           "to find LdrpVectorHandlerList in ntdll.";
-        veh_note["ntdll_base"] = sa_format_address(static_cast<uint64_t>(ntdll_base));
-        veh_chain.push_back(std::move(veh_note));
+                ZydisDecodedInstruction instr;
+                ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+
+                while (off < prologue_read && decoded < 48 && list_head_va == 0)
+                {
+                    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+                            &zydis_detail::decoder(),
+                            prologue + off,
+                            prologue_read - off,
+                            &instr, operands)))
+                    {
+                        ++off;
+                        ++va;
+                        continue;
+                    }
+
+                    ++decoded;
+
+                    if (instr.mnemonic == ZYDIS_MNEMONIC_LEA &&
+                        instr.operand_count_visible >= 2 &&
+                        operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                        operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                        operands[1].mem.base == ZYDIS_REGISTER_RIP &&
+                        operands[1].mem.index == ZYDIS_REGISTER_NONE &&
+                        operands[1].mem.disp.size > 0)
+                    {
+                        const ZydisRegister reg = operands[0].reg.value;
+                        if (reg == ZYDIS_REGISTER_RCX || reg == ZYDIS_REGISTER_RDX)
+                        {
+                            ZyanU64 abs_addr = 0;
+                            if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&instr, &operands[1], va, &abs_addr)) &&
+                                abs_addr >= ntdll_base &&
+                                abs_addr < ntdll_base + 0x10000000ULL)
+                            {
+                                list_head_va = static_cast<std::uint64_t>(abs_addr);
+                                break;
+                            }
+                        }
+                    }
+
+                    if (instr.meta.category == ZYDIS_CATEGORY_RET ||
+                        instr.mnemonic == ZYDIS_MNEMONIC_INT3)
+                        break;
+
+                    off += instr.length;
+                    va += instr.length;
+                }
+
+                if (list_head_va != 0)
+                {
+                    const std::uint64_t list_entry_va = list_head_va + 0x8;
+                    const std::uint64_t cookie_va = 0x7FFE0000ULL + 0x330ULL;
+                    std::uint64_t pointer_cookie = 0;
+                    device->read_raw(cookie_va, &pointer_cookie, sizeof(pointer_cookie));
+
+                    std::uint64_t entry = device->read<std::uint64_t>(list_entry_va);
+                    int veh_iter = 0;
+                    int idx = 0;
+
+                    auto modules_snapshot = enumerate_ldr_modules_for_iat(device.get());
+
+                    auto resolve_in_modules = [&](std::uint64_t addr,
+                                                  std::string& out_module,
+                                                  std::uint64_t& out_offset) {
+                        for (const auto& m : modules_snapshot)
+                        {
+                            if (m.base != 0 && addr >= m.base && addr < m.base + m.size)
+                            {
+                                std::string base_name = m.name;
+                                const auto slash = base_name.find_last_of("\\/");
+                                if (slash != std::string::npos)
+                                    base_name = base_name.substr(slash + 1);
+                                out_module = base_name;
+                                out_offset = addr - m.base;
+                                return true;
+                            }
+                        }
+                        return false;
+                    };
+
+                    while (entry != 0 &&
+                           entry != list_entry_va &&
+                           veh_iter++ < 256)
+                    {
+                        const std::uint64_t flink = device->read<std::uint64_t>(entry);
+                        const std::uint32_t ref_count = device->read<std::uint32_t>(entry + 0x10);
+                        const std::uint32_t flags = device->read<std::uint32_t>(entry + 0x14);
+                        const std::uint64_t handler_raw = device->read<std::uint64_t>(entry + 0x18);
+
+                        std::uint64_t handler_decoded = handler_raw;
+                        if (handler_raw != 0 && pointer_cookie != 0)
+                        {
+                            const std::uint32_t rot = static_cast<std::uint32_t>(pointer_cookie & 0x3F);
+                            const std::uint64_t xored = handler_raw ^ pointer_cookie;
+                            handler_decoded = (xored >> rot) | (xored << (64 - rot));
+                        }
+
+                        json veh_entry;
+                        veh_entry["index"] = idx++;
+                        veh_entry["entry_address"] = sa_format_address(static_cast<uint64_t>(entry));
+                        veh_entry["ref_count"] = ref_count;
+                        veh_entry["flags"] = sa_format_address(static_cast<uint64_t>(flags));
+                        veh_entry["handler_encoded"] = sa_format_address(static_cast<uint64_t>(handler_raw));
+                        veh_entry["handler_va"] = sa_format_address(static_cast<uint64_t>(handler_decoded));
+
+                        std::string mod_label;
+                        std::uint64_t mod_off = 0;
+                        if (resolve_in_modules(handler_decoded, mod_label, mod_off))
+                        {
+                            veh_entry["module"] = mod_label;
+                            veh_entry["offset"] = sa_format_address(static_cast<uint64_t>(mod_off));
+                        }
+                        else if (handler_raw != handler_decoded &&
+                                 resolve_in_modules(handler_raw, mod_label, mod_off))
+                        {
+                            veh_entry["module"] = mod_label;
+                            veh_entry["offset"] = sa_format_address(static_cast<uint64_t>(mod_off));
+                            veh_entry["handler_va"] = sa_format_address(static_cast<uint64_t>(handler_raw));
+                        }
+
+                        veh_chain.push_back(std::move(veh_entry));
+
+                        if (flink == entry || flink == 0)
+                            break;
+                        entry = flink;
+                    }
+                }
+            }
+        }
     }
 
     json result;
@@ -9875,9 +9987,12 @@ tool_result_t driver_walk_seh_chain(const json& params)
     result["teb_address"] = sa_format_address(static_cast<uint64_t>(teb_addr));
     result["seh_entries"] = seh_chain.size();
     result["seh_chain"] = std::move(seh_chain);
-    result["veh_info"] = std::move(veh_chain);
+    result["veh_entries"] = veh_chain.size();
+    result["veh_chain"] = std::move(veh_chain);
     result["rip"] = sa_format_address(static_cast<uint64_t>(ctx.rip));
     return tool_result_t::ok(OBFSTR("SEH chain: ") + std::to_string(result["seh_entries"].get<int>()) +
+                             OBFSTR(" handlers, VEH chain: ") +
+                             std::to_string(result["veh_entries"].get<int>()) +
                              OBFSTR(" handlers for TID ") + std::to_string(tid), result);
 }
 
@@ -10346,9 +10461,6 @@ tool_result_t driver_enumerate_windows(const json& params)
 
     if (filter_pid == 0)
         return tool_result_t::error(OBFSTR("No process attached and no pid specified."));
-
-    if (false)
-        return tool_result_t::error(OBFSTR("Refusing to enumerate windows of IDA host process."));
 
     struct window_info_t {
         HWND hwnd;
@@ -11528,7 +11640,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
         OBFSTR("driver_enumerate_kernel_modules"), OBFSTR("driver"),
         OBFSTR("Enumerate ALL loaded kernel drivers and modules via NtQuerySystemInformation. "
                "Returns each driver's name, NT path, resolved disk path, kernel base address, "
-               "and image size. Does NOT require the kernel driver to be connected ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â works "
+               "and image size. Does NOT require the kernel driver to be connected - works "
                "purely from usermode. Use filter to search for a specific driver "
                "(e.g. filter='EasyAntiCheat' or filter='eac')."),
         {{OBFSTR("filter"), OBFSTR("string"),
@@ -11814,13 +11926,13 @@ void register_driver_tools(mcp_standalone::server_t& srv)
                "operations during initialization. By the time you can manually react, the "
                "evidence is already destroyed. This tool lets you queue actions (read memory, "
                "set HW breakpoints, dump module, etc.) that fire IMMEDIATELY when the target "
-               "appears Ã¢â‚¬â€ before its init routine runs. "
+               "appears - before its init routine runs. "
                "\n\nTemplate parameters in action params are resolved at trigger time:\n"
-               "  ${module_base} Ã¢â‚¬â€ runtime kernel base address of the loaded module\n"
-               "  ${module_size} Ã¢â‚¬â€ module image size\n"
-               "  ${module_name} Ã¢â‚¬â€ resolved module filename\n"
-               "  ${pid} Ã¢â‚¬â€ process ID (for process_start)\n"
-               "  ${base_address} Ã¢â‚¬â€ process image base (for process_start)\n"
+               "  ${module_base} - runtime kernel base address of the loaded module\n"
+               "  ${module_size} - module image size\n"
+               "  ${module_name} - resolved module filename\n"
+               "  ${pid} - process ID (for process_start)\n"
+               "  ${base_address} - process image base (for process_start)\n"
                "\nAddress arithmetic: '${module_base}+0x17C000' computes base+offset automatically.\n"
                "\nExample: to capture EAC's IAT before it's wiped:\n"
                "  wait_for='kernel_module_load', target='EasyAntiCheat_EOS.sys',\n"
@@ -12133,7 +12245,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
     register_compat(srv, {
         OBFSTR("driver_enum_minifilters"), OBFSTR("driver"),
         OBFSTR("Enumerate registered filesystem minifilter drivers via Filter Manager (fltmgr.sys). "
-               "Minifilters intercept file I/O Ã¢â‚¬â€ anti-cheats use them to monitor file access, "
+               "Minifilters intercept file I/O - anti-cheats use them to monitor file access, "
                "prevent memory dumps, and detect injection DLLs. Returns filter names, altitudes, and owner modules."),
         {},
         driver_enum_minifilters, true});

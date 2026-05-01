@@ -24,6 +24,9 @@ namespace arc_loader
         void*    auto_seal_timer;
         void*    function_table;
         uint32_t function_table_count;
+        bool     ldr_unlinked;
+        uint32_t ldr_unlink_count;
+        bool     unwind_isolated;
     };
 
 

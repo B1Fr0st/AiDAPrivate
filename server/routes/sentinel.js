@@ -5,8 +5,14 @@ const crypto = require('crypto');
 const pool = require('../db/pool');
 const { signPayload } = require('../crypto/signing');
 const kw = require('../crypto/kw_wrap');
+const hmacAuth = require('../middleware/hmac_auth');
 
 const router = express.Router();
+
+router.use((req, res, next) => {
+    if (req.path === '/attest') return next();
+    return hmacAuth.authenticate(req, res, next);
+});
 
 const ATTEST_HMAC_LABEL = 'aida/attest/v1';
 const KW_ISSUANCE_LABEL = 'aida/kw_issuance/v1';

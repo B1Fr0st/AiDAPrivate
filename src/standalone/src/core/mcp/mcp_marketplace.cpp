@@ -27,16 +27,34 @@ static std::mutex               s_mtx;
 static std::vector<package_info_t>  s_results;
 static search_state_t           s_search_state = search_state_t::idle;
 static std::string              s_search_error;
-static std::thread              s_search_thread;
 
 static install_state_t          s_install_state = install_state_t::idle;
 static std::string              s_install_error;
-static std::thread              s_install_thread;
 
 static std::mutex               s_installed_mtx;
 static std::vector<installed_server_t> s_installed;
 
 static std::atomic<bool>        s_shutdown{false};
+
+struct deferred_log_entry_t
+{
+    bottom_tab_t tab;
+    std::string  line;
+};
+
+static std::mutex                          s_deferred_mtx;
+static std::vector<deferred_log_entry_t>   s_deferred_logs;
+static std::atomic<bool>                   s_persisted_load_initialized{false};
+static install_state_t                     s_last_observed_install_state = install_state_t::idle;
+static std::atomic<bool>                   s_install_persist_pending{false};
+
+static void enqueue_deferred_log(bottom_tab_t tab, std::string line)
+{
+    std::lock_guard<std::mutex> lk(s_deferred_mtx);
+    if (s_deferred_logs.size() >= 1024)
+        s_deferred_logs.erase(s_deferred_logs.begin());
+    s_deferred_logs.push_back({tab, std::move(line)});
+}
 
 
 static std::filesystem::path marketplace_dir()
@@ -293,8 +311,6 @@ void search_async(const std::string& query, registry_t reg)
     }
 
 
-    if (s_search_thread.joinable()) s_search_thread.join();
-
     {
         std::lock_guard<std::mutex> lk(s_mtx);
         s_search_state = search_state_t::searching;
@@ -343,9 +359,9 @@ search_state_t get_search_state()
     return s_search_state;
 }
 
-const std::string& get_search_error()
+std::string get_search_error()
 {
-
+    std::lock_guard<std::mutex> lk(s_mtx);
     return s_search_error;
 }
 
@@ -369,8 +385,6 @@ void install_async(const package_info_t& pkg)
             return;
         }
     }
-
-    if (s_install_thread.joinable()) s_install_thread.join();
 
     {
         std::lock_guard<std::mutex> lk(s_mtx);
@@ -457,7 +471,9 @@ void install_async(const package_info_t& pkg)
             s_install_state = install_state_t::done;
         }
 
-        output_log::push(bottom_tab_t::output,
+        s_install_persist_pending.store(true, std::memory_order_release);
+
+        enqueue_deferred_log(bottom_tab_t::output,
             "[marketplace] Installed " + p.name + "@" + p.version);
     });
 }
@@ -478,6 +494,7 @@ bool uninstall(const std::string& package_name)
     }
 
     s_installed.erase(it);
+    s_install_persist_pending.store(true, std::memory_order_release);
     output_log::push(bottom_tab_t::output,
         "[marketplace] Uninstalled " + package_name);
     return true;
@@ -490,8 +507,9 @@ install_state_t get_install_state()
     return s_install_state;
 }
 
-const std::string& get_install_error()
+std::string get_install_error()
 {
+    std::lock_guard<std::mutex> lk(s_mtx);
     return s_install_error;
 }
 
@@ -596,7 +614,58 @@ std::string save_installed()
 
 void tick()
 {
+    if (s_shutdown.load(std::memory_order_acquire))
+        return;
 
+    bool expected_uninit = false;
+    if (s_persisted_load_initialized.compare_exchange_strong(
+            expected_uninit, true,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        bool need_load = false;
+        {
+            std::lock_guard<std::mutex> lk(s_installed_mtx);
+            need_load = s_installed.empty();
+        }
+        if (need_load)
+        {
+            const std::string& cached = g_sa_settings.marketplace_installed_json;
+            if (!cached.empty())
+                load_installed(cached);
+        }
+    }
+
+    std::vector<deferred_log_entry_t> drained;
+    {
+        std::lock_guard<std::mutex> lk(s_deferred_mtx);
+        if (!s_deferred_logs.empty())
+            drained.swap(s_deferred_logs);
+    }
+    for (auto& entry : drained)
+        output_log::push(entry.tab, entry.line);
+
+    install_state_t cur_install;
+    {
+        std::lock_guard<std::mutex> lk(s_mtx);
+        cur_install = s_install_state;
+    }
+
+    bool install_just_finished =
+        (s_last_observed_install_state == install_state_t::installing) &&
+        (cur_install == install_state_t::done || cur_install == install_state_t::error_state);
+
+    s_last_observed_install_state = cur_install;
+
+    bool persist_now = s_install_persist_pending.exchange(false, std::memory_order_acq_rel);
+    if (persist_now || install_just_finished)
+    {
+        std::string serialized = save_installed();
+        if (g_sa_settings.marketplace_installed_json != serialized)
+        {
+            g_sa_settings.marketplace_installed_json = std::move(serialized);
+            g_sa_settings.save();
+        }
+    }
 }
 
 

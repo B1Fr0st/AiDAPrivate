@@ -42,13 +42,34 @@ const {
     MessageFlags,
 } = require('discord.js');
 const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 const { Pool } = require('pg');
+const audit = require('./audit');
+const dbReadonly = require('./db_readonly');
 
-// ─── Configuration ────────────────────────────────────────────────────────────
+const BOT_TOKEN          = process.env.AIDA_BOT_TOKEN          || '';
+const RAW_OWNER_IDS      = process.env.AIDA_OWNER_IDS          || process.env.AIDA_OWNER_ID || '';
+const DATABASE_URL       = process.env.AIDA_DATABASE_URL       || '';
+const ADMIN_API_BASE     = process.env.AIDA_ADMIN_API_BASE     || '';
+const ADMIN_HMAC_KEY     = process.env.AIDA_ADMIN_HMAC_KEY     || '';
+const ADMIN_API_KEY      = process.env.AIDA_ADMIN_API_KEY      || '';
 
-const BOT_TOKEN    = process.env.AIDA_BOT_TOKEN    || 'MTQ4NzUzNzkyOTM4NjcyNTUyMQ.G1FQRX.HfLlZeo680ebtL1ToqfMcGHFiOF2EAsCdnetCE';
-const OWNER_ID     = process.env.AIDA_OWNER_ID     || '937382022056407160';
-const DATABASE_URL = process.env.AIDA_DATABASE_URL  || 'postgresql://ruar:EhF3NbwCQ4ch2NxtkqP7@23.88.62.199:5432/aida_db';
+if (!BOT_TOKEN) {
+    console.error('[bot] FATAL: AIDA_BOT_TOKEN must be set in env (no in-source default).');
+    process.exit(1);
+}
+if (!DATABASE_URL) {
+    console.error('[bot] FATAL: AIDA_DATABASE_URL must be set in env.');
+    process.exit(1);
+}
+
+const OWNER_IDS = new Set(
+    RAW_OWNER_IDS.split(',').map(s => s.trim()).filter(s => /^[0-9]{15,25}$/.test(s))
+);
+if (OWNER_IDS.size === 0) {
+    console.error('[bot] FATAL: AIDA_OWNER_IDS must list at least one Discord user id.');
+    process.exit(1);
+}
 
 // ─── PostgreSQL connection pool ───────────────────────────────────────────────
 
@@ -141,7 +162,49 @@ function licenseStatus(data) {
 }
 
 function isOwner(interaction) {
-    return interaction.user.id === OWNER_ID;
+    return OWNER_IDS.has(interaction.user.id);
+}
+
+function signAdminCommand(commandObj) {
+    if (!ADMIN_HMAC_KEY) return '';
+    const canonical = JSON.stringify(Object.keys(commandObj).sort().reduce((acc, k) => {
+        acc[k] = commandObj[k]; return acc;
+    }, {}));
+    return crypto.createHmac('sha256', ADMIN_HMAC_KEY).update(canonical).digest('hex');
+}
+
+async function postSignedAdminCommand(action, payload) {
+    if (!ADMIN_API_BASE) {
+        return { ok: false, reason: 'admin_api_base_not_configured' };
+    }
+    if (!ADMIN_API_KEY) {
+        return { ok: false, reason: 'admin_api_key_not_configured' };
+    }
+    const nonce = crypto.randomBytes(16).toString('hex');
+    const ts = Math.floor(Date.now() / 1000);
+    const body = {
+        action,
+        nonce,
+        timestamp: ts,
+        admin_key: ADMIN_API_KEY,
+        ...payload,
+    };
+    const signature = signAdminCommand({ action, nonce, timestamp: ts, ...payload });
+    if (signature) body.signature = signature;
+    try {
+        const url = ADMIN_API_BASE.replace(/\/+$/, '') + '/api/license';
+        const resp = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const text = await resp.text();
+        let json = null;
+        try { json = JSON.parse(text); } catch { json = { raw: text }; }
+        return { ok: resp.ok, status: resp.status, response: json };
+    } catch (err) {
+        return { ok: false, reason: 'network_error', error: err.message };
+    }
 }
 
 function ownerDenied(interaction) {
@@ -149,6 +212,20 @@ function ownerDenied(interaction) {
         content: '❌ Only the bot owner can use this command.',
         flags: MessageFlags.Ephemeral,
     });
+}
+
+async function logAudit(interaction, action, target, details) {
+    try {
+        await audit.appendAuditEntry(pool, {
+            actorId: interaction.user.id,
+            actorTag: interaction.user.tag,
+            action,
+            target: target || '',
+            details: details || {},
+        });
+    } catch (err) {
+        console.error('[bot] audit append failed:', err.message);
+    }
 }
 
 // ─── Discord Client ───────────────────────────────────────────────────────────
@@ -521,6 +598,7 @@ client.on('interactionCreate', async (interaction) => {
                  VALUES ($1, true, '', $2, $3, $4, $5, $6)`,
                 [key, expires, plan, note, Math.floor(Date.now() / 1000), interaction.user.tag]
             );
+            await logAudit(interaction, 'license.generate', key, { plan, expires, note });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -557,6 +635,7 @@ client.on('interactionCreate', async (interaction) => {
                 );
                 keys.push(key);
             }
+            await logAudit(interaction, 'license.bulk_generate', `count=${count}`, { plan, expires, note, keys });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -585,6 +664,7 @@ client.on('interactionCreate', async (interaction) => {
             // Delete session first (FK cascade would handle it, but be explicit)
             await pgQuery('DELETE FROM sessions WHERE license_key = $1', [key]);
             await pgQuery('DELETE FROM licenses WHERE key = $1', [key]);
+            await logAudit(interaction, 'license.revoke', key, { plan: data.plan, hwid: data.hwid, note: data.note });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -763,6 +843,7 @@ client.on('interactionCreate', async (interaction) => {
             await pgQuery("UPDATE licenses SET hwid = '' WHERE key = $1", [key]);
             // Also delete session — new HWID means new session
             await pgQuery('DELETE FROM sessions WHERE license_key = $1', [key]);
+            await logAudit(interaction, 'license.reset_hwid', key, { previous_hwid: data.hwid });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -793,6 +874,7 @@ client.on('interactionCreate', async (interaction) => {
             const newExpiry = addDuration(base, days || 0, hours || 0);
             const addedText = hours ? String(hours) + ' hour(s)' : String(days) + ' day(s)';
             await pgQuery('UPDATE licenses SET expires = $1, active = true WHERE key = $2', [newExpiry, key]);
+            await logAudit(interaction, 'license.extend', key, { previous_expires: data.expires, new_expires: newExpiry, days, hours });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -818,6 +900,7 @@ client.on('interactionCreate', async (interaction) => {
             const data = rows[0];
 
             await pgQuery('UPDATE licenses SET note = $1 WHERE key = $2', [note, key]);
+            await logAudit(interaction, 'license.setnote', key, { previous_note: data.note, new_note: note });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -876,6 +959,8 @@ client.on('interactionCreate', async (interaction) => {
                 deleted.push(row.key);
             }
 
+            await logAudit(interaction, 'ban.hwid_ip', hwid, { ip, reason, deleted_keys: deleted });
+
             const fields = [
                 { name: '🖥️ HWID',   value: `\`${hwid}\``,  inline: true },
                 { name: '🌐 IP',      value: ip || '*(none)*', inline: true },
@@ -916,6 +1001,8 @@ client.on('interactionCreate', async (interaction) => {
 
             if (!removed.length)
                 return interaction.editReply(`❌ No bans found for \`${target}\`.`);
+
+            await logAudit(interaction, 'ban.unban', target, { removed });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -1094,6 +1181,7 @@ client.on('interactionCreate', async (interaction) => {
             const oldHwid = data.hwid || '*(unbound)*';
             await pgQuery('UPDATE licenses SET hwid = $1 WHERE key = $2', [newHwid, key]);
             await pgQuery('DELETE FROM sessions WHERE license_key = $1', [key]);
+            await logAudit(interaction, 'license.transfer', key, { previous_hwid: data.hwid, new_hwid: newHwid });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -1121,6 +1209,7 @@ client.on('interactionCreate', async (interaction) => {
 
             const oldPlan = data.plan || '—';
             await pgQuery('UPDATE licenses SET plan = $1 WHERE key = $2', [plan, key]);
+            await logAudit(interaction, 'license.set_plan', key, { previous_plan: oldPlan, new_plan: plan });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -1149,6 +1238,7 @@ client.on('interactionCreate', async (interaction) => {
                 return interaction.editReply('❌ Invalid date format. Use `YYYY-MM-DD` or `never`.');
 
             await pgQuery('UPDATE licenses SET expires = $1 WHERE key = $2', [newExpiry, key]);
+            await logAudit(interaction, 'license.set_expiry', key, { previous_expires: data.expires, new_expires: newExpiry });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -1180,6 +1270,7 @@ client.on('interactionCreate', async (interaction) => {
             const keys = expired.map(r => r.key);
             await pgQuery('DELETE FROM sessions WHERE license_key = ANY($1)', [keys]);
             await pgQuery('DELETE FROM licenses WHERE key = ANY($1)', [keys]);
+            await logAudit(interaction, 'license.purge_expired', `count=${keys.length}`, { keys });
 
             const lines = expired.slice(0, 20).map(d => {
                 const note = d.note ? ` *(${d.note})*` : '';
@@ -1261,6 +1352,7 @@ client.on('interactionCreate', async (interaction) => {
                 );
                 if (banDeleted > 0) nuked.push(`HWID ban (${data.hwid.slice(0, 12)}…)`);
             }
+            await logAudit(interaction, 'license.nuke', key, { plan: data.plan, hwid: data.hwid, nuked });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -1364,6 +1456,7 @@ client.on('interactionCreate', async (interaction) => {
                 await pgQuery('UPDATE licenses SET expires = $1 WHERE key = $2', [newExpiry, r.key]);
                 updated++;
             }
+            await logAudit(interaction, 'license.extend_all', `count=${updated}`, { days });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -1390,6 +1483,7 @@ client.on('interactionCreate', async (interaction) => {
                 "INSERT INTO violations (hwid, reason, timestamp, timestamp_iso) VALUES ($1, $2, $3, $4)",
                 [key, `admin_kill:${reason}`, Math.floor(Date.now()/1000), new Date().toISOString()]
             );
+            await logAudit(interaction, 'session.kill', key, { reason });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -1440,6 +1534,7 @@ client.on('interactionCreate', async (interaction) => {
             const { rowCount } = await pgQuery(
                 'UPDATE sessions SET kill_flag = true WHERE kill_flag = false'
             );
+            await logAudit(interaction, 'session.global_kill_all', `affected=${rowCount}`, { confirm });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -1469,6 +1564,7 @@ client.on('interactionCreate', async (interaction) => {
                 'UPDATE sessions SET kill_flag = true WHERE license_key = $1',
                 [key]
             );
+            await logAudit(interaction, 'license.rotate_kw', key, { rotation_ts: now });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -1495,14 +1591,16 @@ client.on('interactionCreate', async (interaction) => {
 
 process.on('SIGINT', async () => {
     console.log('\nShutting down...');
-    await pool.end();
+    try { await pool.end(); } catch (_) { }
+    try { await dbReadonly.close(); } catch (_) { }
     client.destroy();
     process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
     console.log('\nShutting down...');
-    await pool.end();
+    try { await pool.end(); } catch (_) { }
+    try { await dbReadonly.close(); } catch (_) { }
     client.destroy();
     process.exit(0);
 });

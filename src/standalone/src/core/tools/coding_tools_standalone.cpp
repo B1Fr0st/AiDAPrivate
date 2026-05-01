@@ -11,6 +11,7 @@
 #include "auto_approval.hpp"
 #include "event_bus.hpp"
 #include "standalone_chat.hpp"
+#include "command_sessions.hpp"
 #include "../helpers/globals.h"
 
 #include <algorithm>
@@ -579,7 +580,19 @@ static tool_result_t tool_run_command(const json& params)
 
     int timeout_ms = 30000;
     if (params.contains("timeout_ms") && params["timeout_ms"].is_number_integer())
-        timeout_ms = (std::clamp)(params["timeout_ms"].get<int>(), 1000, 120000);
+        timeout_ms = (std::clamp)(params["timeout_ms"].get<int>(), 1000, 600000);
+
+    bool wait = true;
+    if (params.contains("wait") && params["wait"].is_boolean())
+        wait = params["wait"].get<bool>();
+
+    bool want_session = false;
+    std::string explicit_session_id;
+    if (params.contains("session_id") && params["session_id"].is_string()) {
+        explicit_session_id = params["session_id"].get<std::string>();
+        want_session = true;
+    }
+    if (!wait) want_session = true;
 
     std::string cwd = file_browser::current_dir;
     if (params.contains("cwd") && params["cwd"].is_string()) {
@@ -603,6 +616,14 @@ static tool_result_t tool_run_command(const json& params)
         return tool_result_t::error("Failed to create pipe for stdout.");
     SetHandleInformation(h_stdout_rd, HANDLE_FLAG_INHERIT, 0);
 
+    HANDLE h_stderr_rd = nullptr, h_stderr_wr = nullptr;
+    if (!CreatePipe(&h_stderr_rd, &h_stderr_wr, &sa, 0)) {
+        CloseHandle(h_stdout_rd);
+        CloseHandle(h_stdout_wr);
+        return tool_result_t::error("Failed to create pipe for stderr.");
+    }
+    SetHandleInformation(h_stderr_rd, HANDLE_FLAG_INHERIT, 0);
+
 
     std::string cmdline = "cmd.exe /c \"" + command + "\"";
 
@@ -610,7 +631,7 @@ static tool_result_t tool_run_command(const json& params)
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
     si.hStdOutput = h_stdout_wr;
-    si.hStdError = h_stdout_wr;
+    si.hStdError = h_stderr_wr;
     si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     si.wShowWindow = SW_HIDE;
 
@@ -626,18 +647,158 @@ static tool_result_t tool_run_command(const json& params)
         &si, &pi);
 
     CloseHandle(h_stdout_wr);
+    CloseHandle(h_stderr_wr);
 
     if (!created) {
         CloseHandle(h_stdout_rd);
+        CloseHandle(h_stderr_rd);
         return tool_result_t::error("Failed to launch command: " + command +
                                     " (error " + std::to_string(GetLastError()) + ")");
     }
 
+    constexpr size_t MAX_OUTPUT = 1048576;
+
+    if (want_session) {
+        command_sessions::prune_finished(64);
+        auto sess = std::make_unique<command_sessions::command_session_t>();
+        sess->id = explicit_session_id.empty()
+            ? command_sessions::generate_session_id()
+            : explicit_session_id;
+        sess->command = command;
+        sess->started_at = std::chrono::steady_clock::now();
+        sess->process_info = pi;
+        sess->stdout_read = h_stdout_rd;
+        sess->stderr_read = h_stderr_rd;
+        sess->timeout_ms = wait ? timeout_ms : 0;
+        sess->alive.store(true);
+
+        std::string session_id_copy = sess->id;
+        command_sessions::command_session_t* raw = command_sessions::register_session(std::move(sess));
+
+        raw->reader_thread = std::thread([raw, timeout_ms, wait]() {
+            auto start = std::chrono::steady_clock::now();
+            auto drain_pipe = [&](HANDLE h, std::string& dest) -> bool {
+                DWORD avail = 0;
+                if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) return false;
+                if (avail == 0) return true;
+                while (avail > 0) {
+                    char buf[8192];
+                    DWORD read_bytes = 0;
+                    DWORD to_read = (std::min)(static_cast<DWORD>(sizeof(buf)), avail);
+                    if (!ReadFile(h, buf, to_read, &read_bytes, nullptr) || read_bytes == 0)
+                        return false;
+                    {
+                        std::lock_guard<std::mutex> lk(raw->output_mutex);
+                        if (dest.size() < MAX_OUTPUT) {
+                            size_t room = MAX_OUTPUT - dest.size();
+                            size_t take = (read_bytes < room) ? read_bytes : room;
+                            dest.append(buf, take);
+                        }
+                    }
+                    avail = 0;
+                    if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) return false;
+                }
+                return true;
+            };
+
+            while (raw->alive.load()) {
+                if (wait && timeout_ms > 0) {
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start).count();
+                    if (elapsed >= timeout_ms) {
+                        raw->timed_out.store(true);
+                        TerminateProcess(raw->process_info.hProcess, 1);
+                        break;
+                    }
+                }
+
+                bool out_ok = drain_pipe(raw->stdout_read, raw->stdout_buf);
+                bool err_ok = drain_pipe(raw->stderr_read, raw->stderr_buf);
+                if (!out_ok && !err_ok) break;
+
+                DWORD wait_res = WaitForSingleObject(raw->process_info.hProcess, 50);
+                if (wait_res == WAIT_OBJECT_0) {
+                    drain_pipe(raw->stdout_read, raw->stdout_buf);
+                    drain_pipe(raw->stderr_read, raw->stderr_buf);
+                    break;
+                }
+            }
+
+            DWORD exit_code = 0;
+            GetExitCodeProcess(raw->process_info.hProcess, &exit_code);
+            raw->exit_code.store(static_cast<int64_t>(exit_code));
+            raw->finished_at = std::chrono::steady_clock::now();
+            raw->alive.store(false);
+
+            output_log::push(bottom_tab_t::sandbox_log,
+                "[run_command:" + raw->id + "] exit=" + std::to_string(exit_code) +
+                (raw->timed_out.load() ? " (TIMED OUT)" : ""));
+        });
+
+        if (wait) {
+            if (raw->reader_thread.joinable())
+                raw->reader_thread.join();
+
+            std::string out_copy, err_copy;
+            int64_t exit_code = 0;
+            bool was_timeout = false;
+            {
+                std::lock_guard<std::mutex> lk(raw->output_mutex);
+                out_copy = raw->stdout_buf;
+                err_copy = raw->stderr_buf;
+                exit_code = raw->exit_code.load();
+                was_timeout = raw->timed_out.load();
+            }
+
+            std::string result;
+            result += "Session ID: " + session_id_copy + "\n";
+            result += "Exit code: " + std::to_string(exit_code);
+            if (was_timeout)
+                result += " (timed out after " + std::to_string(timeout_ms) + "ms)";
+            result += "\n";
+            if (!out_copy.empty()) {
+                result += "--- stdout ---\n";
+                if (out_copy.size() >= MAX_OUTPUT)
+                    result += "(stdout truncated to " + std::to_string(MAX_OUTPUT) + " bytes)\n";
+                result += out_copy;
+                if (!out_copy.empty() && out_copy.back() != '\n') result += "\n";
+            }
+            if (!err_copy.empty()) {
+                result += "--- stderr ---\n";
+                if (err_copy.size() >= MAX_OUTPUT)
+                    result += "(stderr truncated to " + std::to_string(MAX_OUTPUT) + " bytes)\n";
+                result += err_copy;
+            }
+            if (out_copy.empty() && err_copy.empty())
+                result += "(no output)";
+            return tool_result_t::ok(result);
+        }
+
+        return tool_result_t::ok(
+            "Started background command (session " + session_id_copy + "). "
+            "Use read_command_output with this id to retrieve output.",
+            json{{"session_id", session_id_copy}, {"command", command}});
+    }
+
 
     std::string output;
-    constexpr size_t MAX_OUTPUT = 64000;
     auto start = std::chrono::steady_clock::now();
     bool timed_out = false;
+
+    auto drain = [&](HANDLE h) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) return false;
+        if (avail == 0) return true;
+        char buf[4096];
+        DWORD to_read = (std::min)(static_cast<DWORD>(sizeof(buf)), avail);
+        if (output.size() >= MAX_OUTPUT) return true;
+        size_t room = MAX_OUTPUT - output.size();
+        if (static_cast<size_t>(to_read) > room) to_read = static_cast<DWORD>(room);
+        DWORD read_bytes = 0;
+        if (ReadFile(h, buf, to_read, &read_bytes, nullptr) && read_bytes > 0)
+            output.append(buf, read_bytes);
+        return true;
+    };
 
     while (true) {
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -648,31 +809,24 @@ static tool_result_t tool_run_command(const json& params)
             break;
         }
 
-        DWORD avail = 0;
-        if (!PeekNamedPipe(h_stdout_rd, nullptr, 0, nullptr, &avail, nullptr))
-            break;
+        bool any_data = false;
+        DWORD avail_out = 0, avail_err = 0;
+        PeekNamedPipe(h_stdout_rd, nullptr, 0, nullptr, &avail_out, nullptr);
+        PeekNamedPipe(h_stderr_rd, nullptr, 0, nullptr, &avail_err, nullptr);
 
-        if (avail > 0) {
-            char buf[4096];
-            DWORD read_bytes = 0;
-            DWORD to_read = (std::min)(static_cast<DWORD>(sizeof(buf)),
-                                       static_cast<DWORD>(MAX_OUTPUT - output.size()));
-            if (to_read == 0) break;
-            if (ReadFile(h_stdout_rd, buf, (std::min)(avail, to_read), &read_bytes, nullptr) && read_bytes > 0) {
-                output.append(buf, read_bytes);
-                if (output.size() >= MAX_OUTPUT) break;
-            }
-        } else {
+        if (avail_out > 0) { drain(h_stdout_rd); any_data = true; }
+        if (avail_err > 0) { drain(h_stderr_rd); any_data = true; }
+        if (output.size() >= MAX_OUTPUT) break;
 
-            DWORD exit_code = 0;
-            if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0) {
-
+        if (!any_data) {
+            if (WaitForSingleObject(pi.hProcess, 50) == WAIT_OBJECT_0) {
                 while (true) {
-                    char buf[4096];
-                    DWORD read_bytes = 0;
-                    if (!ReadFile(h_stdout_rd, buf, sizeof(buf), &read_bytes, nullptr) || read_bytes == 0)
-                        break;
-                    output.append(buf, read_bytes);
+                    DWORD a_out = 0, a_err = 0;
+                    PeekNamedPipe(h_stdout_rd, nullptr, 0, nullptr, &a_out, nullptr);
+                    PeekNamedPipe(h_stderr_rd, nullptr, 0, nullptr, &a_err, nullptr);
+                    if (a_out == 0 && a_err == 0) break;
+                    if (a_out > 0) drain(h_stdout_rd);
+                    if (a_err > 0) drain(h_stderr_rd);
                     if (output.size() >= MAX_OUTPUT) break;
                 }
                 break;
@@ -684,6 +838,7 @@ static tool_result_t tool_run_command(const json& params)
     GetExitCodeProcess(pi.hProcess, &exit_code);
 
     CloseHandle(h_stdout_rd);
+    CloseHandle(h_stderr_rd);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 
@@ -788,12 +943,16 @@ void register_coding_tools(mcp_standalone::server_t& srv)
     srv.register_tool({
         "run_command",
         "Execute a shell command and return its output. Runs via cmd.exe. "
-        "Default timeout: 30 seconds. Maximum timeout: 120 seconds. "
-        "Output is captured (stdout + stderr) and truncated at 64KB.",
+        "Default timeout: 30 seconds. Maximum timeout: 600 seconds. "
+        "Stdout and stderr are captured separately, each truncated at 1MB. "
+        "Pass wait=false (or supply session_id) to run in the background and "
+        "retrieve output later via read_command_output.",
         {
             {"command",    "string",  "Shell command to execute.", true},
-            {"timeout_ms", "integer", "Timeout in milliseconds (1000-120000). Default: 30000.", false},
+            {"timeout_ms", "integer", "Timeout in milliseconds (1000-600000). Default: 30000.", false},
             {"cwd",        "string",  "Working directory. Defaults to workspace root.", false},
+            {"wait",       "boolean", "If false, run in the background and return a session id immediately. Default: true.", false},
+            {"session_id", "string",  "Optional explicit session id. If omitted while wait=false, one is generated.", false},
         },
         false,
         tool_run_command,

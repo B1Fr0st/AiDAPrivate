@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <sstream>
 #include <iomanip>
 
@@ -601,6 +602,100 @@ static void freeze_loop() {
 }
 
 
+struct pointer_entry_t {
+	uint64_t address = 0;
+	uint64_t value = 0;
+	bool     is_static = false;
+	std::string module_name;
+	uint64_t module_offset = 0;
+};
+
+static bool address_in_modules(uint64_t addr,
+                               const std::vector<driver_bridge::module_info_t>& modules,
+                               std::string& out_name, uint64_t& out_offset) {
+	for (const auto& m : modules) {
+		if (addr >= m.base && addr < m.base + m.size) {
+			out_name = m.name;
+			out_offset = addr - m.base;
+			return true;
+		}
+	}
+	return false;
+}
+
+static void pointer_dfs(const std::multimap<uint64_t, pointer_entry_t>& reverse_map,
+                        uint64_t value_to_find,
+                        int level,
+                        int max_depth,
+                        int64_t max_offset,
+                        std::vector<int64_t>& current_offsets,
+                        std::vector<uint64_t>& visited,
+                        std::vector<pointer_result_t>& results,
+                        std::mutex& results_mutex,
+                        const std::atomic<bool>& cancel,
+                        size_t max_results) {
+	if (cancel.load()) return;
+	if (level >= max_depth) return;
+
+	{
+		std::lock_guard<std::mutex> lk(results_mutex);
+		if (results.size() >= max_results) return;
+	}
+
+	for (auto v : visited) {
+		if (v == value_to_find) return;
+	}
+	visited.push_back(value_to_find);
+
+	uint64_t lo = (value_to_find > static_cast<uint64_t>(max_offset))
+	              ? (value_to_find - static_cast<uint64_t>(max_offset)) : 0;
+	uint64_t hi = value_to_find + static_cast<uint64_t>(max_offset);
+
+	auto it_low = reverse_map.lower_bound(lo);
+	auto it_high = reverse_map.upper_bound(hi);
+
+	for (auto it = it_low; it != it_high; ++it) {
+		if (cancel.load()) break;
+
+		uint64_t pointer_value = it->first;
+		int64_t offset = static_cast<int64_t>(value_to_find) - static_cast<int64_t>(pointer_value);
+		if (offset < -max_offset || offset > max_offset) continue;
+
+		const pointer_entry_t& pe = it->second;
+
+		{
+			std::lock_guard<std::mutex> lk(results_mutex);
+			if (results.size() >= max_results) {
+				visited.pop_back();
+				return;
+			}
+		}
+
+		current_offsets.push_back(offset);
+
+		if (pe.is_static) {
+			pointer_result_t chain;
+			chain.base_address = pe.address;
+			chain.module_name = pe.module_name;
+			chain.module_offset = pe.module_offset;
+			chain.offsets.assign(current_offsets.rbegin(), current_offsets.rend());
+
+			std::lock_guard<std::mutex> lk(results_mutex);
+			if (results.size() < max_results)
+				results.push_back(std::move(chain));
+		}
+
+		if (level + 1 < max_depth) {
+			pointer_dfs(reverse_map, pe.address, level + 1, max_depth, max_offset,
+			            current_offsets, visited, results, results_mutex, cancel, max_results);
+		}
+
+		current_offsets.pop_back();
+	}
+
+	visited.pop_back();
+}
+
 static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_offset) {
 	auto& st = g_state;
 	st.pointer_progress.store(0.f);
@@ -616,61 +711,71 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 	std::vector<driver_bridge::memory_region_t> scan_regions;
 	for (const auto& r : regions) {
 		if (r.state != 0x1000) continue;
+		uint32_t protect_flags = r.protect & 0xFF;
+		if (protect_flags == 0x01 || protect_flags == 0x00) continue;
 		if (r.size > 0x10000000) continue;
 		scan_regions.push_back(r);
 	}
 
-	std::vector<pointer_result_t> results;
-	std::mutex result_mtx;
-
-
-	uint64_t search_lo = target_address > static_cast<uint64_t>(max_offset) ? target_address - max_offset : 0;
-	uint64_t search_hi = target_address + max_offset;
-
+	std::vector<std::multimap<uint64_t, pointer_entry_t>> partial_maps(4);
 	std::atomic<size_t> region_idx{0};
 	constexpr int WORKERS = 4;
 	std::atomic<int> ptr_remaining{WORKERS};
 	std::mutex ptr_done_mtx;
 	std::condition_variable ptr_done_cv;
+	std::atomic<uint64_t> bytes_scanned{0};
+	uint64_t total_bytes = 0;
+	for (const auto& r : scan_regions) total_bytes += r.size;
+	if (total_bytes == 0) total_bytes = 1;
 
 	for (int w = 0; w < WORKERS; ++w) {
-		work_queue::post([&]() {
+		work_queue::post([&, w]() {
+			auto& local_map = partial_maps[w];
 			size_t idx;
 			while ((idx = region_idx.fetch_add(1)) < scan_regions.size()) {
 				if (!st.pointer_scanning.load()) break;
 
-				auto& region = scan_regions[idx];
-				std::vector<uint8_t> buf;
-				if (!driver_bridge::read_memory(region.base, static_cast<size_t>(region.size), buf))
-					continue;
+				const auto& region = scan_regions[idx];
+				const size_t chunk_size = 65536;
+				for (uint64_t off = 0; off < region.size; off += chunk_size) {
+					if (!st.pointer_scanning.load()) break;
+					size_t read_sz = chunk_size;
+					if (off + read_sz > region.size)
+						read_sz = static_cast<size_t>(region.size - off);
 
-				std::vector<pointer_result_t> local;
-				for (size_t i = 0; i + 8 <= buf.size(); i += 8) {
-					uint64_t ptr_val;
-					std::memcpy(&ptr_val, buf.data() + i, 8);
-					if (ptr_val >= search_lo && ptr_val <= search_hi) {
-						int64_t off = static_cast<int64_t>(target_address) - static_cast<int64_t>(ptr_val);
-						pointer_result_t pr;
-						pr.base_address = region.base + i;
-						pr.offsets.push_back(off);
-						for (const auto& m : modules) {
-							if (pr.base_address >= m.base && pr.base_address < m.base + m.size) {
-								pr.module_name = m.name;
-								pr.module_offset = pr.base_address - m.base;
+					std::vector<uint8_t> buf;
+					if (!driver_bridge::read_memory(region.base + off, read_sz, buf)) {
+						bytes_scanned.fetch_add(read_sz);
+						st.pointer_progress.store(
+							static_cast<float>(bytes_scanned.load()) / static_cast<float>(total_bytes) * 0.5f);
+						continue;
+					}
+
+					for (size_t i = 0; i + 8 <= buf.size(); i += 8) {
+						uint64_t value = 0;
+						std::memcpy(&value, buf.data() + i, 8);
+						if (value < 0x10000 || value > 0x00007FFFFFFFFFFFULL) continue;
+
+						bool valid = false;
+						for (const auto& r2 : scan_regions) {
+							if (value >= r2.base && value < r2.base + r2.size) {
+								valid = true;
 								break;
 							}
 						}
-						local.push_back(std::move(pr));
-						if (local.size() >= 100000) break;
+						if (!valid) continue;
+
+						pointer_entry_t pe;
+						pe.address = region.base + off + i;
+						pe.value = value;
+						pe.is_static = address_in_modules(pe.address, modules, pe.module_name, pe.module_offset);
+						local_map.emplace(value, std::move(pe));
 					}
+
+					bytes_scanned.fetch_add(read_sz);
+					st.pointer_progress.store(
+						static_cast<float>(bytes_scanned.load()) / static_cast<float>(total_bytes) * 0.5f);
 				}
-				if (!local.empty()) {
-					std::lock_guard<std::mutex> lk(result_mtx);
-					results.insert(results.end(),
-						std::make_move_iterator(local.begin()),
-						std::make_move_iterator(local.end()));
-				}
-				st.pointer_progress.store(static_cast<float>(idx) / static_cast<float>(scan_regions.size()));
 			}
 			if (--ptr_remaining == 0)
 				ptr_done_cv.notify_all();
@@ -681,15 +786,134 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 		ptr_done_cv.wait(lk, [&ptr_remaining]() { return ptr_remaining.load() == 0; });
 	}
 
+	if (!st.pointer_scanning.load()) {
+		st.pointer_progress.store(1.f);
+		return;
+	}
+
+	std::multimap<uint64_t, pointer_entry_t> reverse_map;
+	for (auto& pm : partial_maps) {
+		for (auto& kv : pm)
+			reverse_map.emplace(kv.first, std::move(kv.second));
+		pm.clear();
+	}
+
+	st.pointer_progress.store(0.5f);
+
+	std::vector<pointer_result_t> results;
+	std::mutex result_mtx;
+	constexpr size_t MAX_RESULTS = 10000;
+
+	std::vector<uint64_t> seed_values;
+	{
+		uint64_t lo = (target_address > static_cast<uint64_t>(max_offset))
+		              ? (target_address - static_cast<uint64_t>(max_offset)) : 0;
+		uint64_t hi = target_address + static_cast<uint64_t>(max_offset);
+		auto it_low = reverse_map.lower_bound(lo);
+		auto it_high = reverse_map.upper_bound(hi);
+		std::vector<uint64_t> uniq;
+		for (auto it = it_low; it != it_high; ++it) {
+			if (uniq.empty() || uniq.back() != it->first)
+				uniq.push_back(it->first);
+		}
+		seed_values = std::move(uniq);
+	}
+
+	if (seed_values.empty()) {
+		std::lock_guard<std::mutex> lk(st.pointer_mutex);
+		st.pointer_results.clear();
+		st.pointer_progress.store(1.f);
+		st.pointer_scanning.store(false);
+		return;
+	}
+
+	std::atomic<size_t> seed_idx{0};
+	std::atomic<int> dfs_remaining{WORKERS};
+	std::mutex dfs_done_mtx;
+	std::condition_variable dfs_done_cv;
+	std::atomic<bool> dfs_cancel{false};
+
+	for (int w = 0; w < WORKERS; ++w) {
+		work_queue::post([&]() {
+			std::vector<int64_t> current_offsets;
+			std::vector<uint64_t> visited;
+			visited.push_back(target_address);
+			while (true) {
+				size_t idx = seed_idx.fetch_add(1);
+				if (idx >= seed_values.size()) break;
+				if (!st.pointer_scanning.load()) {
+					dfs_cancel.store(true);
+					break;
+				}
+
+				{
+					std::lock_guard<std::mutex> lk(result_mtx);
+					if (results.size() >= MAX_RESULTS) {
+						dfs_cancel.store(true);
+						break;
+					}
+				}
+
+				uint64_t seed_val = seed_values[idx];
+				int64_t offset = static_cast<int64_t>(target_address) - static_cast<int64_t>(seed_val);
+				if (offset < -max_offset || offset > max_offset) continue;
+
+				auto range = reverse_map.equal_range(seed_val);
+				for (auto it = range.first; it != range.second; ++it) {
+					if (!st.pointer_scanning.load() || dfs_cancel.load()) break;
+					{
+						std::lock_guard<std::mutex> lk(result_mtx);
+						if (results.size() >= MAX_RESULTS) {
+							dfs_cancel.store(true);
+							break;
+						}
+					}
+
+					const pointer_entry_t& pe = it->second;
+					current_offsets.clear();
+					current_offsets.push_back(offset);
+
+					{
+						pointer_result_t chain;
+						chain.base_address = pe.address;
+						chain.module_name = pe.module_name;
+						chain.module_offset = pe.module_offset;
+						chain.offsets.assign(current_offsets.rbegin(), current_offsets.rend());
+						std::lock_guard<std::mutex> lk(result_mtx);
+						if (results.size() < MAX_RESULTS)
+							results.push_back(std::move(chain));
+					}
+
+					if (max_depth > 1) {
+						pointer_dfs(reverse_map, pe.address, 1, max_depth, max_offset,
+						            current_offsets, visited, results, result_mtx,
+						            dfs_cancel, MAX_RESULTS);
+					}
+				}
+
+				st.pointer_progress.store(
+					0.5f + (static_cast<float>(idx + 1) / static_cast<float>(seed_values.size())) * 0.5f);
+			}
+			if (--dfs_remaining == 0)
+				dfs_done_cv.notify_all();
+		});
+	}
+	{
+		std::unique_lock<std::mutex> lk(dfs_done_mtx);
+		dfs_done_cv.wait(lk, [&dfs_remaining]() { return dfs_remaining.load() == 0; });
+	}
+
 	std::sort(results.begin(), results.end(),
 		[](const pointer_result_t& a, const pointer_result_t& b) {
 			if (!a.module_name.empty() && b.module_name.empty()) return true;
 			if (a.module_name.empty() && !b.module_name.empty()) return false;
+			if (a.offsets.size() != b.offsets.size())
+				return a.offsets.size() < b.offsets.size();
 			return a.base_address < b.base_address;
 		});
 
-	if (results.size() > 500000)
-		results.resize(500000);
+	if (results.size() > MAX_RESULTS)
+		results.resize(MAX_RESULTS);
 
 	{
 		std::lock_guard<std::mutex> lk(st.pointer_mutex);

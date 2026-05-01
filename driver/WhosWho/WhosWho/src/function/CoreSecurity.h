@@ -2,6 +2,7 @@
 #include <ntifs.h>
 #include <intrin.h>
 #include "../imports/Defs.h"
+#include "KernelCrypto.h"
 
 #ifndef YieldProcessor
 #define YieldProcessor() _mm_pause()
@@ -777,53 +778,21 @@ namespace secure_comm {
     inline volatile UINT64 g_client_token = 0;
     inline volatile LONG g_comm_initialized = 0;
 
-    constexpr UINT64 KEY_PRIME_1 = 0x100000001B3ULL;
-    constexpr UINT64 KEY_PRIME_2 = 0xCBF29CE484222325ULL;
-    constexpr UINT64 KEY_MIX_CONST = 0xFF51AFD7ED558CCDULL;
-
-    __forceinline UINT64 derive_key(UINT64 seed, UINT64 request_id) {
-        UINT64 hash = KEY_PRIME_2;
-        hash ^= seed;
-        hash *= KEY_PRIME_1;
-        hash ^= request_id;
-        hash *= KEY_PRIME_1;
-        hash ^= (__rdtsc() & 0xFFFFULL);
-        hash *= KEY_PRIME_1;
-        return hash ^ (hash >> 32);
-    }
-
-    __forceinline void xor_buffer(PVOID buffer, SIZE_T size, UINT64 key) {
-        if (!buffer || size == 0) return;
-
-        PUINT8 bytes = static_cast<PUINT8>(buffer);
-        UINT64 rolling_key = key;
-
-        SIZE_T chunks = size / sizeof(UINT64);
-        PUINT64 chunks_ptr = reinterpret_cast<PUINT64>(bytes);
-
-        for (SIZE_T i = 0; i < chunks; i++) {
-            chunks_ptr[i] ^= rolling_key;
-            rolling_key = (rolling_key * KEY_PRIME_1) ^ KEY_MIX_CONST;
-        }
-
-        SIZE_T remaining_offset = chunks * sizeof(UINT64);
-        for (SIZE_T i = remaining_offset; i < size; i++) {
-            bytes[i] ^= static_cast<UINT8>(rolling_key >> ((i - remaining_offset) * 8));
-        }
-    }
-
     #pragma pack(push, 1)
     typedef struct _SECURE_HEADER {
         UINT64 request_id;
         UINT64 client_token;
         UINT64 entropy;
         UINT32 payload_size;
-        UINT32 checksum;
+        UINT32 reserved;
     } SECURE_HEADER, *PSECURE_HEADER;
     #pragma pack(pop)
 
     static_assert(sizeof(SECURE_HEADER) == 32, "SECURE_HEADER must be 32 bytes");
 
+
+    constexpr UINT32 SECURE_HEADER_VERSION_V2 = 2;
+    constexpr ULONG  SECURE_AAD_LABEL_LEN     = 16;
 
     #pragma pack(push, 1)
     typedef struct _SECURE_HEADER_V2 {
@@ -832,104 +801,124 @@ namespace secure_comm {
         UINT64 entropy;
         UINT32 payload_size;
         UINT32 version;
+        UINT8  gcm_tag[16];
         UINT8  payload_hmac[32];
     } SECURE_HEADER_V2, *PSECURE_HEADER_V2;
     #pragma pack(pop)
 
-    static_assert(sizeof(SECURE_HEADER_V2) == 64, "SECURE_HEADER_V2 must be 64 bytes");
+    static_assert(sizeof(SECURE_HEADER_V2) == 80, "SECURE_HEADER_V2 must be 80 bytes");
+
+    inline volatile LONG  g_master_key_valid = 0;
+    inline UINT8          g_master_key[kernel_crypto::AES256_KEY_SIZE] = {};
+    inline UINT8          g_aes_key[kernel_crypto::AES256_KEY_SIZE]    = {};
+    inline UINT8          g_hmac_key[kernel_crypto::SHA256_DIGEST_SIZE] = {};
+    inline volatile LONG64 g_ioctl_counter                              = 0;
+    inline volatile LONG64 g_last_validated_counter                     = 0;
 
 
-    __forceinline void compute_payload_hmac(
-        const UINT8* payload, SIZE_T size,
-        UINT64 key, UINT64 entropy,
-        UINT8 out[32])
-    {
-
-        UINT64 v0 = key ^ 0x736F6D6570736575ULL;
-        UINT64 v1 = entropy ^ 0x646F72616E646F6DULL;
-        UINT64 v2 = key ^ 0x6C7967656E657261ULL;
-        UINT64 v3 = entropy ^ 0x7465646279746573ULL;
-
-
-        SIZE_T blocks = size / 8;
-        for (SIZE_T i = 0; i < blocks; i++) {
-            UINT64 m;
-            RtlCopyMemory(&m, payload + i * 8, 8);
-            v3 ^= m;
-
-            v0 += v1; v2 += v3;
-            v1 = _rotl64(v1, 13) ^ v0; v3 = _rotl64(v3, 16) ^ v2;
-            v0 = _rotl64(v0, 32);
-            v2 += v1; v0 += v3;
-            v1 = _rotl64(v1, 17) ^ v2; v3 = _rotl64(v3, 21) ^ v0;
-            v2 = _rotl64(v2, 32);
-            v0 ^= m;
-        }
-
-
-        UINT64 tail = static_cast<UINT64>(size) << 56;
-        SIZE_T rem_start = blocks * 8;
-        for (SIZE_T i = 0; i < size - rem_start; i++)
-            tail |= static_cast<UINT64>(payload[rem_start + i]) << (i * 8);
-        v3 ^= tail;
-        v0 += v1; v2 += v3;
-        v1 = _rotl64(v1, 13) ^ v0; v3 = _rotl64(v3, 16) ^ v2;
-        v0 = _rotl64(v0, 32);
-        v2 += v1; v0 += v3;
-        v1 = _rotl64(v1, 17) ^ v2; v3 = _rotl64(v3, 21) ^ v0;
-        v2 = _rotl64(v2, 32);
-        v0 ^= tail;
-
-
-        v2 ^= 0xFF;
-        for (int r = 0; r < 4; r++) {
-            v0 += v1; v2 += v3;
-            v1 = _rotl64(v1, 13) ^ v0; v3 = _rotl64(v3, 16) ^ v2;
-            v0 = _rotl64(v0, 32);
-            v2 += v1; v0 += v3;
-            v1 = _rotl64(v1, 17) ^ v2; v3 = _rotl64(v3, 21) ^ v0;
-            v2 = _rotl64(v2, 32);
-        }
-
-        UINT64 h0 = v0 ^ v1 ^ v2 ^ v3;
-        UINT64 h1 = h0 * 0xFF51AFD7ED558CCDULL; h1 ^= h1 >> 33;
-        UINT64 h2 = v1 ^ v3 ^ h0; h2 *= 0xC4CEB9FE1A85EC53ULL; h2 ^= h2 >> 33;
-        UINT64 h3 = v0 ^ v2 ^ h1; h3 *= 0xFF51AFD7ED558CCDULL; h3 ^= h3 >> 33;
-
-        RtlCopyMemory(out,      &h0, 8);
-        RtlCopyMemory(out + 8,  &h1, 8);
-        RtlCopyMemory(out + 16, &h2, 8);
-        RtlCopyMemory(out + 24, &h3, 8);
+    __forceinline void derive_session_keys(const UINT8 master[kernel_crypto::AES256_KEY_SIZE]) {
+        const UINT8 aes_label[]  = { 'a','i','d','a','-','s','e','c','-','a','e','s','-','k','e','y' };
+        const UINT8 hmac_label[] = { 'a','i','d','a','-','s','e','c','-','m','a','c','-','k','e','y' };
+        kernel_crypto::sw_hkdf_sha256(
+            nullptr, 0,
+            master, kernel_crypto::AES256_KEY_SIZE,
+            aes_label, sizeof(aes_label),
+            g_aes_key, kernel_crypto::AES256_KEY_SIZE);
+        kernel_crypto::sw_hkdf_sha256(
+            nullptr, 0,
+            master, kernel_crypto::AES256_KEY_SIZE,
+            hmac_label, sizeof(hmac_label),
+            g_hmac_key, kernel_crypto::SHA256_DIGEST_SIZE);
     }
 
+    __forceinline void build_gcm_nonce(UINT64 entropy, UINT64 request_id, UINT8 nonce_out[kernel_crypto::GCM_NONCE_SIZE]) {
+        UINT8 src[16];
+        RtlCopyMemory(src,     &entropy,     8);
+        RtlCopyMemory(src + 8, &request_id,  8);
+        UINT8 digest[kernel_crypto::SHA256_DIGEST_SIZE];
+        kernel_crypto::sw_hmac_sha256(
+            g_hmac_key, kernel_crypto::SHA256_DIGEST_SIZE,
+            src, sizeof(src),
+            digest);
+        for (ULONG i = 0; i < kernel_crypto::GCM_NONCE_SIZE; ++i)
+            nonce_out[i] = digest[i];
+        RtlSecureZeroMemory(digest, sizeof(digest));
+        RtlSecureZeroMemory(src, sizeof(src));
+    }
 
-    __forceinline BOOLEAN verify_payload_hmac(
-        const UINT8* payload, SIZE_T size,
-        UINT64 key, UINT64 entropy,
+    __forceinline void compute_secure_hmac(
+        const SECURE_HEADER_V2* header,
+        UINT64 counter,
+        const UINT8* ciphertext, SIZE_T ciphertext_size,
+        UINT8 out[32])
+    {
+        UINT8 hmac_input[sizeof(SECURE_HEADER_V2) - 32 - 16 + 8];
+        SIZE_T off = 0;
+        RtlCopyMemory(hmac_input + off, &header->request_id,   8); off += 8;
+        RtlCopyMemory(hmac_input + off, &header->client_token, 8); off += 8;
+        RtlCopyMemory(hmac_input + off, &header->entropy,      8); off += 8;
+        RtlCopyMemory(hmac_input + off, &header->payload_size, 4); off += 4;
+        RtlCopyMemory(hmac_input + off, &header->version,      4); off += 4;
+        RtlCopyMemory(hmac_input + off, &counter,              8); off += 8;
+
+        UINT8 prefix_digest[kernel_crypto::SHA256_DIGEST_SIZE];
+        kernel_crypto::sha256_ctx_t ctx;
+
+        UINT8 k_block[kernel_crypto::SHA256_BLOCK_SIZE];
+        UINT8 ipad[kernel_crypto::SHA256_BLOCK_SIZE];
+        UINT8 opad[kernel_crypto::SHA256_BLOCK_SIZE];
+        for (ULONG i = 0; i < kernel_crypto::SHA256_DIGEST_SIZE; ++i) k_block[i] = g_hmac_key[i];
+        for (ULONG i = kernel_crypto::SHA256_DIGEST_SIZE; i < kernel_crypto::SHA256_BLOCK_SIZE; ++i) k_block[i] = 0;
+        for (ULONG i = 0; i < kernel_crypto::SHA256_BLOCK_SIZE; ++i) {
+            ipad[i] = k_block[i] ^ 0x36u;
+            opad[i] = k_block[i] ^ 0x5Cu;
+        }
+
+        kernel_crypto::sha256_init(&ctx);
+        kernel_crypto::sha256_update(&ctx, ipad, kernel_crypto::SHA256_BLOCK_SIZE);
+        kernel_crypto::sha256_update(&ctx, hmac_input, static_cast<ULONG>(off));
+        if (ciphertext && ciphertext_size > 0) {
+            kernel_crypto::sha256_update(&ctx, ciphertext, static_cast<ULONG>(ciphertext_size));
+        }
+        kernel_crypto::sha256_final(&ctx, prefix_digest);
+
+        kernel_crypto::sha256_init(&ctx);
+        kernel_crypto::sha256_update(&ctx, opad, kernel_crypto::SHA256_BLOCK_SIZE);
+        kernel_crypto::sha256_update(&ctx, prefix_digest, kernel_crypto::SHA256_DIGEST_SIZE);
+        kernel_crypto::sha256_final(&ctx, out);
+
+        RtlSecureZeroMemory(k_block, sizeof(k_block));
+        RtlSecureZeroMemory(ipad,    sizeof(ipad));
+        RtlSecureZeroMemory(opad,    sizeof(opad));
+        RtlSecureZeroMemory(prefix_digest, sizeof(prefix_digest));
+        RtlSecureZeroMemory(hmac_input, sizeof(hmac_input));
+    }
+
+    __forceinline BOOLEAN verify_secure_hmac(
+        const SECURE_HEADER_V2* header,
+        UINT64 counter,
+        const UINT8* ciphertext, SIZE_T ciphertext_size,
         const UINT8 expected[32])
     {
         UINT8 computed[32];
-        compute_payload_hmac(payload, size, key, entropy, computed);
+        compute_secure_hmac(header, counter, ciphertext, ciphertext_size, computed);
         volatile UINT8 diff = 0;
         for (int i = 0; i < 32; i++)
             diff |= computed[i] ^ expected[i];
-        return (diff == 0) ? TRUE : FALSE;
+        BOOLEAN ok = (diff == 0) ? TRUE : FALSE;
+        RtlSecureZeroMemory(computed, sizeof(computed));
+        return ok;
     }
 
-    __forceinline UINT32 compute_checksum(PVOID data, SIZE_T size) {
-        if (!data || size == 0) return 0;
+    constexpr SIZE_T SECURE_WIRE_PREFIX  = sizeof(SECURE_HEADER) + 16 + 32;
+    constexpr SIZE_T SECURE_GCM_TAG_OFF  = sizeof(SECURE_HEADER);
+    constexpr SIZE_T SECURE_HMAC_OFF     = sizeof(SECURE_HEADER) + 16;
 
-        PUINT8 bytes = static_cast<PUINT8>(data);
-        UINT32 sum = 0x12345678u;
-
-        for (SIZE_T i = 0; i < size; i++) {
-            sum = ((sum << 5) | (sum >> 27)) ^ bytes[i];
-        }
-
-        return sum;
-    }
-
-    __forceinline BOOLEAN init_session(UINT64 client_token, UINT64 initial_entropy) {
+    __forceinline BOOLEAN init_session_with_master(
+        UINT64 client_token,
+        UINT64 initial_entropy,
+        const UINT8 master_key[kernel_crypto::AES256_KEY_SIZE])
+    {
         if (_InterlockedCompareExchange(&g_comm_initialized, 1, 0) != 0) {
             return (g_client_token == client_token);
         }
@@ -937,16 +926,48 @@ namespace secure_comm {
         g_client_token = client_token;
         g_session_entropy = initial_entropy ^ __rdtsc();
         g_request_id = 0;
+        _InterlockedExchange64(&g_ioctl_counter, 0);
+        _InterlockedExchange64(&g_last_validated_counter, 0);
+
+        if (master_key) {
+            RtlCopyMemory(g_master_key, master_key, kernel_crypto::AES256_KEY_SIZE);
+        } else {
+            UINT8 fallback[kernel_crypto::AES256_KEY_SIZE];
+            UINT64 t = __rdtsc();
+            RtlCopyMemory(fallback,         &t,                8);
+            RtlCopyMemory(fallback + 8,     &client_token,     8);
+            RtlCopyMemory(fallback + 16,    &initial_entropy,  8);
+            UINT64 mix = t ^ initial_entropy ^ client_token;
+            RtlCopyMemory(fallback + 24,    &mix,              8);
+            UINT8 expanded[kernel_crypto::AES256_KEY_SIZE];
+            kernel_crypto::sw_sha256(fallback, sizeof(fallback), expanded);
+            RtlCopyMemory(g_master_key, expanded, kernel_crypto::AES256_KEY_SIZE);
+            RtlSecureZeroMemory(fallback, sizeof(fallback));
+            RtlSecureZeroMemory(expanded, sizeof(expanded));
+        }
+
+        derive_session_keys(g_master_key);
+        _InterlockedExchange(&g_master_key_valid, 1);
 
         KeMemoryBarrier();
         return TRUE;
     }
 
+    __forceinline BOOLEAN init_session(UINT64 client_token, UINT64 initial_entropy) {
+        return init_session_with_master(client_token, initial_entropy, nullptr);
+    }
+
     __forceinline void reset() {
         _InterlockedExchange(&g_comm_initialized, 0);
+        _InterlockedExchange(&g_master_key_valid, 0);
         g_client_token = 0;
         g_session_entropy = 0x5A5A5A5A5A5A5A5AULL;
         g_request_id = 0;
+        _InterlockedExchange64(&g_ioctl_counter, 0);
+        _InterlockedExchange64(&g_last_validated_counter, 0);
+        RtlSecureZeroMemory(g_master_key, sizeof(g_master_key));
+        RtlSecureZeroMemory(g_aes_key,    sizeof(g_aes_key));
+        RtlSecureZeroMemory(g_hmac_key,   sizeof(g_hmac_key));
         KeMemoryBarrier();
     }
 
@@ -957,66 +978,93 @@ namespace secure_comm {
         SIZE_T output_size,
         PSIZE_T actual_size
     ) {
-        if (!encrypted_buffer || buffer_size < sizeof(SECURE_HEADER) || !output_buffer) {
+        if (!encrypted_buffer || buffer_size < SECURE_WIRE_PREFIX || !output_buffer) {
             return FALSE;
         }
 
-        if (g_comm_initialized == 0) {
+        if (_InterlockedCompareExchange(&g_comm_initialized, 0, 0) == 0) {
+            return FALSE;
+        }
+        if (_InterlockedCompareExchange(&g_master_key_valid, 0, 0) == 0) {
             return FALSE;
         }
 
-        SECURE_HEADER header;
-        RtlCopyMemory(&header, encrypted_buffer, sizeof(SECURE_HEADER));
+        SECURE_HEADER_V2 v2{};
+        RtlCopyMemory(&v2.request_id,   static_cast<UINT8*>(encrypted_buffer) + 0,  8);
+        RtlCopyMemory(&v2.client_token, static_cast<UINT8*>(encrypted_buffer) + 8,  8);
+        RtlCopyMemory(&v2.entropy,      static_cast<UINT8*>(encrypted_buffer) + 16, 8);
+        RtlCopyMemory(&v2.payload_size, static_cast<UINT8*>(encrypted_buffer) + 24, 4);
+        RtlCopyMemory(&v2.version,      static_cast<UINT8*>(encrypted_buffer) + 28, 4);
+        RtlCopyMemory(v2.gcm_tag,       static_cast<UINT8*>(encrypted_buffer) + SECURE_GCM_TAG_OFF, 16);
+        RtlCopyMemory(v2.payload_hmac,  static_cast<UINT8*>(encrypted_buffer) + SECURE_HMAC_OFF,    32);
 
-        if (header.client_token != g_client_token) {
+        if (v2.version != SECURE_HEADER_VERSION_V2) {
             return FALSE;
         }
 
-        UINT64 expected_id = _InterlockedCompareExchange64(
-            reinterpret_cast<volatile LONG64*>(&g_request_id), 0, 0);
-
-        if (header.request_id <= expected_id) {
-            if (expected_id - header.request_id > 16) {
-                return FALSE;
-            }
-        }
-
-        SIZE_T payload_offset = sizeof(SECURE_HEADER);
-        if (payload_offset + header.payload_size > buffer_size) {
+        if (v2.client_token != g_client_token) {
             return FALSE;
         }
 
-        if (header.payload_size > output_size) {
+        UINT64 expected_id = static_cast<UINT64>(_InterlockedCompareExchange64(
+            reinterpret_cast<volatile LONG64*>(&g_request_id), 0, 0));
+        if (v2.request_id <= expected_id) {
             return FALSE;
         }
 
-        UINT64 decrypt_key = derive_key(
-            g_session_entropy ^ header.entropy,
-            header.request_id
-        );
+        SIZE_T payload_offset = SECURE_WIRE_PREFIX;
+        if (payload_offset + v2.payload_size > buffer_size) {
+            return FALSE;
+        }
+        if (v2.payload_size > output_size) {
+            return FALSE;
+        }
 
-        PUINT8 payload = static_cast<PUINT8>(encrypted_buffer) + payload_offset;
-        RtlCopyMemory(output_buffer, payload, header.payload_size);
+        const UINT8* ciphertext = static_cast<const UINT8*>(encrypted_buffer) + payload_offset;
 
-        xor_buffer(output_buffer, header.payload_size, decrypt_key);
+        UINT64 counter = static_cast<UINT64>(_InterlockedIncrement64(&g_ioctl_counter));
 
-        UINT32 computed_checksum = compute_checksum(output_buffer, header.payload_size);
-        if (computed_checksum != header.checksum) {
-            RtlSecureZeroMemory(output_buffer, header.payload_size);
+        if (!verify_secure_hmac(&v2, counter, ciphertext, v2.payload_size, v2.payload_hmac)) {
+            return FALSE;
+        }
+
+        UINT8 nonce[kernel_crypto::GCM_NONCE_SIZE];
+        build_gcm_nonce(v2.entropy, v2.request_id, nonce);
+
+        UINT8 aad[40];
+        RtlCopyMemory(aad + 0,  &v2.request_id,   8);
+        RtlCopyMemory(aad + 8,  &v2.client_token, 8);
+        RtlCopyMemory(aad + 16, &v2.entropy,      8);
+        RtlCopyMemory(aad + 24, &v2.payload_size, 4);
+        RtlCopyMemory(aad + 28, &v2.version,      4);
+        RtlCopyMemory(aad + 32, &counter,         8);
+
+        if (!kernel_crypto::sw_aes256_gcm_decrypt(
+                g_aes_key, nonce,
+                aad, sizeof(aad),
+                ciphertext, v2.payload_size,
+                v2.gcm_tag,
+                static_cast<UINT8*>(output_buffer))) {
+            RtlSecureZeroMemory(output_buffer, v2.payload_size);
+            RtlSecureZeroMemory(nonce, sizeof(nonce));
+            RtlSecureZeroMemory(aad,   sizeof(aad));
             return FALSE;
         }
 
         _InterlockedCompareExchange64(
             reinterpret_cast<volatile LONG64*>(&g_request_id),
-            header.request_id,
-            expected_id);
+            static_cast<LONG64>(v2.request_id),
+            static_cast<LONG64>(expected_id));
+        _InterlockedExchange64(&g_last_validated_counter, static_cast<LONG64>(counter));
 
-        g_session_entropy ^= header.entropy ^ __rdtsc();
+        g_session_entropy ^= v2.entropy ^ __rdtsc();
 
         if (actual_size) {
-            *actual_size = header.payload_size;
+            *actual_size = v2.payload_size;
         }
 
+        RtlSecureZeroMemory(nonce, sizeof(nonce));
+        RtlSecureZeroMemory(aad,   sizeof(aad));
         return TRUE;
     }
 
@@ -1032,30 +1080,57 @@ namespace secure_comm {
             return FALSE;
         }
 
-        SIZE_T required_size = sizeof(SECURE_HEADER) + plaintext_size;
+        if (_InterlockedCompareExchange(&g_master_key_valid, 0, 0) == 0) {
+            return FALSE;
+        }
+
+        SIZE_T required_size = SECURE_WIRE_PREFIX + plaintext_size;
         if (required_size > output_buffer_size) {
             return FALSE;
         }
 
-        SECURE_HEADER header;
-        header.request_id = request_id;
-        header.client_token = g_client_token;
-        header.entropy = request_entropy ^ (__rdtsc() & 0xFFFFFFFF);
-        header.payload_size = static_cast<UINT32>(plaintext_size);
-        header.checksum = compute_checksum(plaintext_buffer, plaintext_size);
+        SECURE_HEADER_V2 v2{};
+        v2.request_id   = request_id;
+        v2.client_token = g_client_token;
+        v2.entropy      = request_entropy ^ __rdtsc();
+        v2.payload_size = static_cast<UINT32>(plaintext_size);
+        v2.version      = SECURE_HEADER_VERSION_V2;
 
-        RtlCopyMemory(output_buffer, &header, sizeof(SECURE_HEADER));
+        UINT64 counter = static_cast<UINT64>(_InterlockedIncrement64(&g_ioctl_counter));
 
-        UINT64 encrypt_key = derive_key(
-            g_session_entropy ^ header.entropy,
-            header.request_id
-        );
+        UINT8 nonce[kernel_crypto::GCM_NONCE_SIZE];
+        build_gcm_nonce(v2.entropy, v2.request_id, nonce);
 
-        PUINT8 payload_dest = static_cast<PUINT8>(output_buffer) + sizeof(SECURE_HEADER);
-        RtlCopyMemory(payload_dest, plaintext_buffer, plaintext_size);
+        UINT8 aad[40];
+        RtlCopyMemory(aad + 0,  &v2.request_id,   8);
+        RtlCopyMemory(aad + 8,  &v2.client_token, 8);
+        RtlCopyMemory(aad + 16, &v2.entropy,      8);
+        RtlCopyMemory(aad + 24, &v2.payload_size, 4);
+        RtlCopyMemory(aad + 28, &v2.version,      4);
+        RtlCopyMemory(aad + 32, &counter,         8);
 
-        xor_buffer(payload_dest, plaintext_size, encrypt_key);
+        UINT8* ciphertext = static_cast<UINT8*>(output_buffer) + SECURE_WIRE_PREFIX;
 
+        kernel_crypto::sw_aes256_gcm_encrypt(
+            g_aes_key, nonce,
+            aad, sizeof(aad),
+            static_cast<const UINT8*>(plaintext_buffer), static_cast<ULONG>(plaintext_size),
+            ciphertext,
+            v2.gcm_tag);
+
+        compute_secure_hmac(&v2, counter, ciphertext, plaintext_size, v2.payload_hmac);
+
+        UINT8* hdr = static_cast<UINT8*>(output_buffer);
+        RtlCopyMemory(hdr + 0,                 &v2.request_id,   8);
+        RtlCopyMemory(hdr + 8,                 &v2.client_token, 8);
+        RtlCopyMemory(hdr + 16,                &v2.entropy,      8);
+        RtlCopyMemory(hdr + 24,                &v2.payload_size, 4);
+        RtlCopyMemory(hdr + 28,                &v2.version,      4);
+        RtlCopyMemory(hdr + SECURE_GCM_TAG_OFF, v2.gcm_tag,      16);
+        RtlCopyMemory(hdr + SECURE_HMAC_OFF,    v2.payload_hmac, 32);
+
+        RtlSecureZeroMemory(nonce, sizeof(nonce));
+        RtlSecureZeroMemory(aad,   sizeof(aad));
         return TRUE;
     }
 

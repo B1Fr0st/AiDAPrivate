@@ -9,8 +9,10 @@
 #include <vector>
 #include <deque>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <atomic>
+#include <mutex>
 
 
 enum class center_view_t : int {
@@ -122,6 +124,50 @@ inline bool  g_ai_thinking_active = false;
 inline std::vector<ChatMessage> g_chat_messages;
 inline char                     g_chat_buf[4096] = {};
 inline bool                     g_chat_scroll_to_bottom = false;
+
+namespace chat_inject {
+
+	inline std::mutex&        queue_mutex() { static std::mutex m; return m; }
+	inline std::deque<std::string>& queue()       { static std::deque<std::string> q; return q; }
+
+	inline void post(const std::string& text)
+	{
+		if (text.empty()) return;
+		std::lock_guard<std::mutex> lk(queue_mutex());
+		queue().push_back(text);
+	}
+
+	inline bool drain_into_buffer()
+	{
+		std::deque<std::string> local;
+		{
+			std::lock_guard<std::mutex> lk(queue_mutex());
+			if (queue().empty()) return false;
+			local.swap(queue());
+		}
+
+		const size_t cap = sizeof(g_chat_buf) - 1u;
+		bool any_appended = false;
+		for (const auto& text : local) {
+			if (text.empty()) continue;
+			size_t cur = std::strlen(g_chat_buf);
+			if (cur + text.size() >= cap) continue;
+			if (cur > 0 && cur + 2u < cap) {
+				g_chat_buf[cur] = '\n';
+				g_chat_buf[cur + 1u] = '\n';
+				g_chat_buf[cur + 2u] = '\0';
+				cur += 2u;
+			}
+			const size_t room = cap - cur;
+			const size_t copy = (text.size() < room) ? text.size() : room;
+			std::memcpy(g_chat_buf + cur, text.data(), copy);
+			g_chat_buf[cur + copy] = '\0';
+			any_appended = true;
+		}
+		return any_appended;
+	}
+
+}
 
 
 inline std::vector<const ChatMessage*> get_effective_api_history()

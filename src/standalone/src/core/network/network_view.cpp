@@ -21,6 +21,7 @@
 #include <ws2tcpip.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -113,10 +114,10 @@ static void connection_poll_thread(state_t& state) {
             auto raw_conns = driver_bridge::enumerate_connections(
                 state.conn_filter_pid, state.conn_filter_protocol);
 
-            std::vector<connection_entry> entries;
+            std::vector<connection_entry_t> entries;
             entries.reserve(raw_conns.size());
             for (auto& c : raw_conns) {
-                connection_entry e;
+                connection_entry_t e;
                 e.pid = c.pid;
                 e.protocol = c.protocol;
                 e.state = c.state;
@@ -134,9 +135,10 @@ static void connection_poll_thread(state_t& state) {
             }
         }
 
-
-        for (int i = 0; i < 100 && state.conn_polling.load(); i++)
-            Sleep(10);
+        std::unique_lock<std::mutex> lk(state.conn_cv_mutex);
+        state.conn_cv.wait_for(lk, std::chrono::milliseconds(1000), [&state]() {
+            return !state.conn_polling.load();
+        });
     }
 }
 
@@ -171,7 +173,7 @@ static void capture_poll_thread(state_t& state) {
                     driver_bridge::debug_log(dbg);
                     std::lock_guard<std::mutex> lock(state.cap_mutex);
                     for (auto& p : raw_packets) {
-                        packet_entry entry;
+                        packet_entry_t entry;
                         entry.timestamp = p.timestamp;
                         entry.pid = p.pid;
                         entry.protocol = static_cast<uint8_t>(p.protocol);
@@ -244,7 +246,7 @@ static void dns_poll_thread(state_t& state) {
                             }
                         }
                         if (!duplicate) {
-                            dns_entry e;
+                            dns_entry_t e;
                             e.timestamp = d.timestamp;
                             e.pid = d.pid;
                             e.query_type = static_cast<uint16_t>(d.query_type);
@@ -281,16 +283,16 @@ static void bandwidth_poll_thread(state_t& state) {
             if (driver_bridge::using_kernel_driver()) {
                 auto raw_bw = driver_bridge::get_bw_per_process();
 
-            std::vector<bw_entry> old_entries;
+            std::vector<bw_entry_t> old_entries;
             {
                 std::lock_guard<std::mutex> lock(state.bw_mutex);
                 old_entries = state.bw_entries;
             }
 
-            std::vector<bw_entry> entries;
+            std::vector<bw_entry_t> entries;
             entries.reserve(raw_bw.size());
             for (auto& b : raw_bw) {
-                bw_entry e;
+                bw_entry_t e;
                 e.pid = b.pid;
                 e.bytes_in = b.bytes_recv;
                 e.bytes_out = b.bytes_sent;
@@ -367,6 +369,7 @@ void initialize() {
 
 void shutdown() {
     g_state.conn_polling.store(false);
+    g_state.conn_cv.notify_all();
     g_state.bw_polling.store(false);
     g_state.bw_thread_alive.store(false);
     g_state.bw_cv.notify_all();
@@ -557,7 +560,7 @@ static void render_connections(state_t& state, float x, float y, float w, float 
             std::lock_guard<std::mutex> lock(state.conn_mutex);
             state.connections.clear();
             for (auto& c : raw) {
-                connection_entry e;
+                connection_entry_t e;
                 e.pid = c.pid;
                 e.protocol = c.protocol;
                 e.state = c.state;
@@ -1034,7 +1037,7 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
                     }
                 }
                 if (!duplicate) {
-                    dns_entry e;
+                    dns_entry_t e;
                     e.timestamp = d.timestamp;
                     e.pid = d.pid;
                     e.query_type = static_cast<uint16_t>(d.query_type);
@@ -1389,7 +1392,7 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
 
         ImGui::Spacing();
         if (ImGui::SmallButton("Send to Repeater")) {
-            repeater_entry rep;
+            repeater_entry_t rep;
             rep.host = ex.target_host;
             rep.port = ex.target_port;
             rep.use_tls = ex.is_tls;
@@ -1642,7 +1645,7 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
     ImGui::SameLine();
 
     if (ImGui::SmallButton("New")) {
-        repeater_entry rep;
+        repeater_entry_t rep;
         rep.host = state.rep_host;
         rep.port = static_cast<uint16_t>(state.rep_port);
         rep.use_tls = state.rep_use_tls;
@@ -1729,7 +1732,7 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                     static_cast<unsigned long long>(rep.latency_ms));
             }
 
-            ImGui::InputTextMultiline("##rep_resp_view", const_cast<char*>(rep.raw_response.c_str()),
+            ImGui::InputTextMultiline("##rep_resp_view", rep.raw_response.data(),
                 rep.raw_response.size() + 1,
                 ImVec2(half_w - 4.f, panel_h - 50.f),
                 ImGuiInputTextFlags_ReadOnly);
@@ -1864,13 +1867,23 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
 
     if (state.intercept_selected >= 0 && state.intercept_selected < static_cast<int>(held.size())) {
         auto& sel = held[static_cast<size_t>(state.intercept_selected)];
+        static char mod_buf[65536] = {};
+        static uint64_t mod_buf_loaded_id = 0;
+        if (mod_buf_loaded_id != sel.id) {
+            size_t copy_len = sel.raw_request.size() < (sizeof(mod_buf) - 1)
+                ? sel.raw_request.size()
+                : (sizeof(mod_buf) - 1);
+            memcpy(mod_buf, sel.raw_request.data(), copy_len);
+            mod_buf[copy_len] = '\0';
+            mod_buf_loaded_id = sel.id;
+        }
+        ImGui::TextColored(ImVec4(ar, ag, ab, alpha), "Modified Request Buffer");
+        ImGui::InputTextMultiline("##mod_buf", mod_buf, sizeof(mod_buf), ImVec2(-1, 200));
         if (ImGui::SmallButton("Forward (F)")) mitm_proxy::forward_exchange(sel.id);
         ImGui::SameLine();
         if (ImGui::SmallButton("Drop (D)")) mitm_proxy::drop_exchange(sel.id);
         ImGui::SameLine();
         if (ImGui::SmallButton("Forward Modified (M)")) {
-
-            static char mod_buf[65536] = {};
             size_t len = strlen(mod_buf);
             if (len > 0) {
                 std::vector<uint8_t> mod_data(mod_buf, mod_buf + len);
@@ -1881,7 +1894,7 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("Send to Repeater")) {
-            repeater_entry rep;
+            repeater_entry_t rep;
             rep.host = sel.target_host;
             rep.port = sel.target_port;
             rep.use_tls = sel.is_tls;
@@ -2042,7 +2055,7 @@ static void write_pcap_header(std::ofstream& f) {
     f.write(reinterpret_cast<const char*>(&network), 4);
 }
 
-static void write_pcap_packet(std::ofstream& f, const packet_entry& pkt) {
+static void write_pcap_packet(std::ofstream& f, const packet_entry_t& pkt) {
 
     uint32_t ts_sec = static_cast<uint32_t>(pkt.timestamp / 1000);
     uint32_t ts_usec = static_cast<uint32_t>((pkt.timestamp % 1000) * 1000);
@@ -2170,7 +2183,7 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
             state.pcap_written_count = 0;
 
 
-            std::deque<packet_entry> packets_copy;
+            std::deque<packet_entry_t> packets_copy;
             {
                 std::lock_guard<std::mutex> lock(state.cap_mutex);
                 packets_copy = state.captured_packets;
@@ -2451,7 +2464,7 @@ static void run_fuzzer_thread(state_t& state) {
             auto res = mitm_proxy::repeat_request(cfg.host, cfg.port, cfg.use_tls, raw_req);
             auto elapsed = GetTickCount64() - t0;
 
-            state_t::fuzzer_result fr;
+            state_t::fuzzer_result_t fr;
             fr.index     = idx;
             fr.payloads  = combo;
             fr.payload   = combo.empty() ? std::string() : combo[0];
@@ -2750,7 +2763,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
     ImGui::Spacing();
 
 
-    std::vector<state_t::fuzzer_result> results_copy;
+    std::vector<state_t::fuzzer_result_t> results_copy;
     {
         std::lock_guard<std::mutex> lk(state.fuzz_mutex);
         results_copy = state.fuzz_results;
@@ -3102,7 +3115,7 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
                     }
                 }
                 if (!updated) {
-                    state_t::script_entry ne;
+                    state_t::script_entry_t ne;
                     ne.name = stem;
                     ne.path = path_str;
                     ne.enabled = true;
@@ -3277,7 +3290,7 @@ static void render_decoder(state_t& state, float x, float y, float w, float h,
     if (ImGui::SmallButton("Add##dec")) {
         if (state.decoder_add_transform >= 0 &&
             state.decoder_add_transform < static_cast<int>(transforms.size())) {
-            state_t::decoder_step step;
+            state_t::decoder_step_t step;
             step.transform_name = transforms[static_cast<size_t>(state.decoder_add_transform)]->id;
             state.decoder_pipeline.push_back(std::move(step));
         }
@@ -3424,7 +3437,7 @@ static void render_decoder(state_t& state, float x, float y, float w, float h,
 
     ImGui::SetCursorPos(ImVec2(4.f, 22.f));
     ImGui::InputTextMultiline("##dec_out",
-        const_cast<char*>(state.decoder_output.c_str()),
+        state.decoder_output.data(),
         state.decoder_output.size() + 1,
         ImVec2(right_w - 8.f, output_h - 28.f),
         ImGuiInputTextFlags_ReadOnly);

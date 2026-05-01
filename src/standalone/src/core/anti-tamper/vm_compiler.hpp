@@ -26,20 +26,43 @@ namespace vm_compiler {
         return virtualizer::detail::derive_function_opcode_map(func_rva, master_key);
     }
 
+    inline std::vector<virtualizer::detail::dag_node_t> build_dag_from_bytecode(
+        const std::vector<uint8_t>& bc,
+        const uint8_t opcode_map[256],
+        uint64_t initial_rolling_key,
+        uint64_t initial_handler_chain_key,
+        uint64_t dag_master_key)
+    {
+        uint8_t reverse_map[256];
+        for (int i = 0; i < 256; ++i)
+            reverse_map[opcode_map[i]] = static_cast<uint8_t>(i);
+        return virtualizer::detail::build_dag_from_bytecode(
+            bc, opcode_map, reverse_map, initial_rolling_key,
+            initial_handler_chain_key, dag_master_key);
+    }
+
+    inline virtualizer::detail::vm_program_t build_program(
+        std::vector<uint8_t> bc,
+        const uint8_t opcode_map[256],
+        uint64_t initial_rolling_key,
+        uint64_t initial_handler_chain_key,
+        uint64_t dag_master_key)
+    {
+        virtualizer::detail::vm_program_t program;
+        program.dag_master_key = dag_master_key;
+        program.dag = build_dag_from_bytecode(bc, opcode_map,
+                                              initial_rolling_key,
+                                              initial_handler_chain_key,
+                                              dag_master_key);
+        program.bc = std::move(bc);
+        return program;
+    }
+
     namespace detail
     {
-        inline void advance_rolling_key(uint64_t& key)
+        inline uint8_t encrypt_byte(virtualizer::detail::cipher_stream_t& stream, uint8_t raw)
         {
-            key ^= key << 13;
-            key ^= key >> 7;
-            key ^= key << 17;
-        }
-
-        inline uint8_t encrypt_byte(uint64_t& rolling_key, uint8_t raw)
-        {
-            uint8_t key_byte = static_cast<uint8_t>(rolling_key & 0xFF);
-            advance_rolling_key(rolling_key);
-            return raw ^ key_byte;
+            return virtualizer::detail::cipher_stream_xcrypt(stream, raw, true);
         }
 
         inline uint64_t derive_block_key(uint64_t saved_key, uint32_t target)
@@ -61,6 +84,7 @@ namespace vm_compiler {
         {
             m_rolling_key = initial_rolling_key;
             m_initial_key = initial_rolling_key;
+            virtualizer::detail::cipher_stream_init(m_stream, initial_rolling_key);
         }
 
         void set_opcode_map(const uint8_t map[256])
@@ -72,7 +96,9 @@ namespace vm_compiler {
         void reset()
         {
             m_bytecode.clear();
+            m_raw_log.clear();
             m_rolling_key = m_initial_key;
+            virtualizer::detail::cipher_stream_init(m_stream, m_initial_key);
         }
 
 
@@ -656,8 +682,9 @@ namespace vm_compiler {
 
             m_bytecode.clear();
             m_rolling_key = m_initial_key;
+            virtualizer::detail::cipher_stream_init(m_stream, m_initial_key);
             for (uint8_t b : m_raw_log)
-                m_bytecode.push_back(detail::encrypt_byte(m_rolling_key, b));
+                m_bytecode.push_back(detail::encrypt_byte(m_stream, b));
 
             return m_bytecode;
         }
@@ -668,6 +695,7 @@ namespace vm_compiler {
         uint64_t             m_rolling_key = 0;
         uint64_t             m_initial_key = 0;
         uint8_t              m_opcode_map[256] = {};
+        virtualizer::detail::cipher_stream_t m_stream{};
 
         struct fixup_t
         {
@@ -682,13 +710,13 @@ namespace vm_compiler {
         {
             uint8_t mapped = m_opcode_map[raw_opcode];
             m_raw_log.push_back(mapped);
-            m_bytecode.push_back(detail::encrypt_byte(m_rolling_key, mapped));
+            m_bytecode.push_back(detail::encrypt_byte(m_stream, mapped));
         }
 
         void emit_raw(uint8_t byte)
         {
             m_raw_log.push_back(byte);
-            m_bytecode.push_back(detail::encrypt_byte(m_rolling_key, byte));
+            m_bytecode.push_back(detail::encrypt_byte(m_stream, byte));
         }
 
         void emit_u32(uint32_t val)

@@ -843,7 +843,8 @@ quic_header parse_quic_header(const uint8_t* data, size_t len) {
     } else {
         h.packet_type = "1-RTT (Short)";
         if (len > 1) {
-            size_t dcid_len = (std::min)(static_cast<size_t>(20), len - 1);
+            constexpr size_t kQuicDcidLenHeuristic = 20;
+            size_t dcid_len = (std::min)(kQuicDcidLenHeuristic, len - 1);
             h.dcid.assign(data + 1, data + 1 + dcid_len);
         }
         h.payload_offset = 1 + h.dcid.size();

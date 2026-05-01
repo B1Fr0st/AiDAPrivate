@@ -361,7 +361,7 @@ tool_result_t trace_execution_unicorn(const json& params)
     auto code = emulation::driver_read_bytes(*addr, size);
     if (code.empty())
         return tool_result_t::error(OBFSTR("Failed to read code at ") + sa_format_address(*addr) +
-                                    (kernel_mode ? OBFSTR(" (kernel address Ã¢â‚¬â€ is the page paged out?)") :
+                                    (kernel_mode ? OBFSTR(" (kernel address - is the page paged out?)") :
                                                    OBFSTR(" (is the process attached?)")));
 
     emulation::process_snapshot_t snapshot;
@@ -984,13 +984,13 @@ void register_emulation_tools(mcp_standalone::server_t& srv)
         register_compat(srv, {
         OBFSTR("disassemble_zydis"), OBFSTR("emulation"),
         OBFSTR("Disassemble raw bytes from LIVE MEMORY using the Zydis engine via the kernel driver. "
-               "Reads memory directly Ã¢â‚¬â€ completely independent of the IDA database. "
+               "Reads memory directly - completely independent of the IDA database. "
                "Works on both user-mode process addresses (requires driver_attach) and "
                "kernel-mode addresses (requires only driver_connect). "
                "Produces rich instruction metadata: branch/call/ret/nop/privileged "
                "classification, precise mnemonic parsing, and accurate instruction lengths. "
                "Use follow_jumps=true to automatically follow unconditional JMP trampolines (up to 16 hops) "
-               "to reach the real code Ã¢â‚¬â€ essential for VM-protected binaries where every function "
+               "to reach the real code - essential for VM-protected binaries where every function "
                "is a jmp-trampoline into a packed section."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address to disassemble (user-mode or kernel-mode)"), true},
          {OBFSTR("size"), OBFSTR("number"), OBFSTR("Number of bytes to read and disassemble (default 256, max 65536)"), false},

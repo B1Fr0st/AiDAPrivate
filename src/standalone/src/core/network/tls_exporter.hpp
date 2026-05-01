@@ -9,6 +9,6 @@ namespace aida::tls_exporter
     inline constexpr const char* kExporterLabel = "aida/v1";
     inline constexpr uint32_t     kExporterLen  = 32;
 
-    std::string compute_header_value_schannel(void* schannel_ctx) noexcept;
+    std::string compute_header_value_openssl(void* ssl_ctx) noexcept;
     std::string derive_expected(const std::string& secret_hex) noexcept;
 }

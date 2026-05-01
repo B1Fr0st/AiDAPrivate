@@ -8,8 +8,36 @@ const pool = require('../db/pool');
 const { encryptArc, encryptArcFull, encryptPage, splitIntoPages, getPageCount, deriveChainTag } = require('../crypto/arc-encrypt');
 const { signPayload } = require('../crypto/signing');
 const arcLicenseBind = require('../crypto/arc-license-bind');
+const pageKeys = require('../crypto/page_keys');
+const columnCrypt = require('../crypto/column_crypt');
+const binaryProto = require('../crypto/binary_protocol');
 
 const router = express.Router();
+
+
+function decryptSessionRowLocal(row) {
+    if (!row) return row;
+    const uuid = typeof row.session_uuid === 'string' ? row.session_uuid : '';
+    if (!uuid) return row;
+    if (typeof row.session_token === 'string' && columnCrypt.isCiphertext(row.session_token)) {
+        try {
+            row.session_token = columnCrypt.decrypt(uuid, 'sessions/session_token', row.session_token);
+        } catch (err) {
+            console.error('[download] session_token decrypt failed for', row.license_key, err && err.message);
+            row.session_token = '';
+        }
+    }
+    if (typeof row.last_proof_token === 'string' && row.last_proof_token.length > 0
+        && columnCrypt.isCiphertext(row.last_proof_token)) {
+        try {
+            row.last_proof_token = columnCrypt.decrypt(uuid, 'sessions/last_proof_token', row.last_proof_token);
+        } catch (err) {
+            console.error('[download] last_proof_token decrypt failed for', row.license_key, err && err.message);
+            row.last_proof_token = '';
+        }
+    }
+    return row;
+}
 
 
 const ARC_BLOB_PATH = process.env.ARC_BLOB_PATH || '/opt/aida/arc/aida_core.bin';
@@ -134,11 +162,13 @@ async function validateSession(licenseKey, sessionToken, hwid) {
         'SELECT * FROM sessions WHERE license_key = $1',
         [licenseKey]
     );
-    if (sesRows.length === 0 || sesRows[0].session_token !== sessionToken) {
+    if (sesRows.length === 0) {
         return { valid: false, reason: 'session_mismatch' };
     }
-
-    const session = sesRows[0];
+    const session = decryptSessionRowLocal(sesRows[0]);
+    if (session.session_token !== sessionToken) {
+        return { valid: false, reason: 'session_mismatch' };
+    }
 
 
     if (session.hwid && session.hwid !== hwid) {
@@ -334,6 +364,29 @@ router.post('/arc/page/:index', async (req, res) => {
 
         const pageTrailer = buildPageWatermark(license_key, hwid, pageIndex, session.session_token);
 
+        let codeBindingSig = '';
+        let codeBindingDigest = '';
+        try {
+            const bindingResult = arcLicenseBind.signCodePage(license, session, hwid, pageIndex, encrypted);
+            codeBindingSig = bindingResult.signature.toString('hex');
+            codeBindingDigest = bindingResult.digest.toString('hex');
+            try {
+                await pool.query(`
+                    INSERT INTO code_page_signatures (license_key, page_index, page_digest, page_signature, issued_at)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (license_key, page_index) DO UPDATE SET
+                        page_digest = EXCLUDED.page_digest,
+                        page_signature = EXCLUDED.page_signature,
+                        issued_at = EXCLUDED.issued_at
+                `, [license_key, pageIndex, codeBindingDigest, codeBindingSig, Math.floor(Date.now() / 1000)]);
+            } catch (storeErr) {
+                console.warn('[arc-page] code_page_signatures upsert failed:', storeErr && storeErr.message ? storeErr.message : storeErr);
+            }
+        } catch (bindErr) {
+            console.warn('[arc-page] code-binding signing failed:', bindErr && bindErr.message ? bindErr.message : bindErr);
+        }
+        const licenseeId = arcLicenseBind.deriveLicenseeId(license);
+
         const pagePayload = {
             status: 'ok',
             page_index: pageIndex,
@@ -344,6 +397,9 @@ router.post('/arc/page/:index', async (req, res) => {
             auth_tag: authTag.toString('hex'),
             hmac: hmac.toString('hex'),
             page_trailer: pageTrailer.toString('hex'),
+            code_binding_sig: codeBindingSig,
+            code_binding_digest: codeBindingDigest,
+            licensee_id: licenseeId,
         };
         pagePayload.signature = signPayload(pagePayload);
 
@@ -416,6 +472,9 @@ router.post('/arc/pages/bulk', async (req, res) => {
         const pages = [];
         const digest = crypto.createHash('sha256');
 
+        const licenseeIdBulk = arcLicenseBind.deriveLicenseeId(license);
+        const codeBindingTuples = [];
+        const issuedAtNow = Math.floor(Date.now() / 1000);
         for (let pageIndex = 0; pageIndex < rawPages.length; pageIndex++) {
             const { encrypted, iv, authTag, hmac } = encryptPage(
                 rawPages[pageIndex],
@@ -427,6 +486,17 @@ router.post('/arc/pages/bulk', async (req, res) => {
                 prevChainTag
             );
             const nextChainTag = deriveChainTag(prevChainTag, authTag).toString('hex');
+            let codeBindingSig = '';
+            let codeBindingDigest = '';
+            try {
+                const bindingResult = arcLicenseBind.signCodePage(license, session, hwid, pageIndex, encrypted);
+                codeBindingSig = bindingResult.signature.toString('hex');
+                codeBindingDigest = bindingResult.digest.toString('hex');
+                codeBindingTuples.push([license_key, pageIndex, codeBindingDigest, codeBindingSig, issuedAtNow]);
+            } catch (bindErr) {
+                console.warn('[arc-bulk] code-binding signing failed for page', pageIndex,
+                    bindErr && bindErr.message ? bindErr.message : bindErr);
+            }
             const pagePayload = {
                 status: 'ok',
                 page_index: pageIndex,
@@ -437,6 +507,9 @@ router.post('/arc/pages/bulk', async (req, res) => {
                 auth_tag: authTag.toString('hex'),
                 hmac: hmac.toString('hex'),
                 page_trailer: buildPageWatermark(license_key, hwid, pageIndex, session.session_token).toString('hex'),
+                code_binding_sig: codeBindingSig,
+                code_binding_digest: codeBindingDigest,
+                licensee_id: licenseeIdBulk,
             };
             digest.update(String(pagePayload.page_index));
             digest.update('|');
@@ -449,9 +522,33 @@ router.post('/arc/pages/bulk', async (req, res) => {
             digest.update(pagePayload.hmac);
             digest.update('|');
             digest.update(pagePayload.page_trailer);
+            digest.update('|');
+            digest.update(pagePayload.code_binding_sig);
             digest.update('\n');
             pages.push(pagePayload);
             prevChainTag = nextChainTag;
+        }
+        if (codeBindingTuples.length > 0) {
+            try {
+                const valuesSql = [];
+                const params = [];
+                let pi = 1;
+                for (const tuple of codeBindingTuples) {
+                    valuesSql.push(`($${pi++}, $${pi++}, $${pi++}, $${pi++}, $${pi++})`);
+                    params.push(tuple[0], tuple[1], tuple[2], tuple[3], tuple[4]);
+                }
+                await pool.query(
+                    `INSERT INTO code_page_signatures (license_key, page_index, page_digest, page_signature, issued_at)
+                     VALUES ${valuesSql.join(', ')}
+                     ON CONFLICT (license_key, page_index) DO UPDATE SET
+                        page_digest = EXCLUDED.page_digest,
+                        page_signature = EXCLUDED.page_signature,
+                        issued_at = EXCLUDED.issued_at`,
+                    params
+                );
+            } catch (storeErr) {
+                console.warn('[arc-bulk] code_page_signatures bulk upsert failed:', storeErr && storeErr.message ? storeErr.message : storeErr);
+            }
         }
 
         await pool.query(
@@ -465,6 +562,7 @@ router.post('/arc/pages/bulk', async (req, res) => {
             page_size: 4096,
             blob_size: arcBlob.length,
             pages_digest: digest.digest('hex'),
+            licensee_id: licenseeIdBulk,
         };
 
         return res.json({
@@ -770,5 +868,391 @@ router.post('/pages/rotated/:index', async (req, res) => {
         return res.status(500).json({ status: 'error', reason: 'internal_error' });
     }
 });
+
+router.post('/streaming/info', async (req, res) => {
+    try {
+        const { license_key, session_token, hwid } = req.body || {};
+        const validation = await validateSession(license_key, session_token, hwid);
+        if (!validation.valid) {
+            return res.status(403).json({ status: 'error', reason: validation.reason });
+        }
+        const session = validation.session;
+        const license = validation.license;
+        let arcBlob;
+        try {
+            arcBlob = getTransformedArcBlob(session, license);
+        } catch (err) {
+            return res.status(503).json({ status: 'error', reason: 'service_unavailable' });
+        }
+        const epochSec = pageKeys.currentEpoch();
+        const epochBuf = pageKeys.epochNonce(epochSec, session.session_token, hwid);
+        const responsePayload = {
+            status: 'ok',
+            page_size: pageKeys.PAGE_SIZE_BYTES,
+            total_pages: pageKeys.getPageCount(arcBlob.length),
+            blob_size: arcBlob.length,
+            current_epoch: epochSec,
+            epoch_interval_seconds: pageKeys.EPOCH_INTERVAL_SECONDS,
+            epoch_nonce: epochBuf.toString('hex'),
+        };
+        epochBuf.fill(0);
+        responsePayload.signature = signPayload(responsePayload);
+        return res.json(responsePayload);
+    } catch (err) {
+        console.error('[arc-streaming-info] error:', err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+});
+
+router.post('/page/:index', async (req, res) => {
+    try {
+        const pageIndex = parseInt(req.params.index, 10);
+        if (isNaN(pageIndex) || pageIndex < 0) {
+            return res.status(400).json({ status: 'error', reason: 'invalid_page_index' });
+        }
+        const { license_key, session_token, hwid, client_epoch } = req.body || {};
+        const validation = await validateSession(license_key, session_token, hwid);
+        if (!validation.valid) {
+            return res.status(403).json({ status: 'error', reason: validation.reason });
+        }
+        const session = validation.session;
+        const license = validation.license;
+        if (session.kill_flag) {
+            return res.status(403).json({ status: 'error', reason: 'killed' });
+        }
+
+        let arcBlob;
+        try {
+            arcBlob = getTransformedArcBlob(session, license);
+        } catch (err) {
+            return res.status(503).json({ status: 'error', reason: 'service_unavailable' });
+        }
+
+        const totalPages = pageKeys.getPageCount(arcBlob.length);
+        if (pageIndex >= totalPages) {
+            return res.status(404).json({ status: 'error', reason: 'page_out_of_range', total_pages: totalPages });
+        }
+
+        const epochSec = pageKeys.currentEpoch();
+        if (typeof client_epoch === 'number' && client_epoch !== 0 && client_epoch < epochSec) {
+            return res.status(409).json({
+                status: 'error',
+                reason: 'epoch_stale',
+                current_epoch: epochSec,
+                epoch_interval_seconds: pageKeys.EPOCH_INTERVAL_SECONDS,
+            });
+        }
+
+        const bounds = pageKeys.pageBoundsForBlob(arcBlob.length, pageIndex);
+        if (!bounds) {
+            return res.status(404).json({ status: 'error', reason: 'page_out_of_range', total_pages: totalPages });
+        }
+        const plaintext = arcBlob.subarray(bounds.start, bounds.end);
+
+        const enc = pageKeys.encryptPage(plaintext, license_key, session.session_token, hwid, pageIndex, epochSec);
+        const epochBuf = pageKeys.epochNonce(epochSec, session.session_token, hwid);
+
+        const responsePayload = {
+            status: 'ok',
+            page_index: pageIndex,
+            total_pages: totalPages,
+            page_size: pageKeys.PAGE_SIZE_BYTES,
+            blob_size: arcBlob.length,
+            current_epoch: epochSec,
+            epoch_nonce: epochBuf.toString('hex'),
+            data: enc.ciphertext.toString('base64'),
+            iv: enc.iv.toString('hex'),
+            auth_tag: enc.authTag.toString('hex'),
+            hmac: enc.hmac.toString('hex'),
+        };
+        epochBuf.fill(0);
+        enc.hmac.fill(0);
+        responsePayload.signature = signPayload(responsePayload);
+
+        const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || 'unknown';
+        try {
+            await pool.query(
+                `INSERT INTO downloads (hwid, ip, license_key, artifact, user_agent)
+                 VALUES ($1,$2,$3,'arc',$4)`,
+                [hwid, ip, license_key, (req.headers['user-agent'] || '').slice(0, 256)]
+            );
+        } catch (_) {}
+
+        return res.json(responsePayload);
+    } catch (err) {
+        console.error('[arc-page-streaming] error:', err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+});
+
+
+function sendBinaryError(res, sessionNonce, status) {
+    const buf = binaryProto.buildResponse(sessionNonce, status, Buffer.alloc(0), '', '');
+    res.set('Content-Type', 'application/octet-stream');
+    res.status(status === binaryProto.STATUS_AUTH_FAIL || status === binaryProto.STATUS_PIN_FAIL ? 403 : 400);
+    return res.send(buf);
+}
+
+const rawBinaryMiddleware = express.raw({
+    type: 'application/octet-stream',
+    limit: '10mb',
+});
+
+function logSpkiPin() {
+    const pinHex = process.env.LICENSE_SERVER_SPKI_PIN_HEX;
+    if (pinHex && typeof pinHex === 'string') {
+        const trimmed = pinHex.trim().toLowerCase();
+        if (/^[0-9a-f]{64}$/.test(trimmed)) {
+            console.log('[binary-proto] LICENSE_SERVER_SPKI_PIN_HEX configured: ' + trimmed.substring(0, 16) + '...');
+            return trimmed;
+        }
+        console.warn('[binary-proto] LICENSE_SERVER_SPKI_PIN_HEX is set but not 64 hex chars; ignored.');
+    }
+    return null;
+}
+const _serverSpkiPinHex = logSpkiPin();
+
+
+router.post('/arc/page-binary/:idx', rawBinaryMiddleware, async (req, res) => {
+    let sessionNonce = Buffer.alloc(8, 0);
+    try {
+        const pageIndex = parseInt(req.params.idx, 10);
+        if (isNaN(pageIndex) || pageIndex < 0) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_BAD_REQUEST);
+        }
+
+        const reqBuf = req.body;
+        if (!Buffer.isBuffer(reqBuf) || reqBuf.length < binaryProto.REQUEST_HEADER_SIZE) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_BAD_REQUEST);
+        }
+
+        const headerBuf = reqBuf.subarray(0, binaryProto.REQUEST_HEADER_SIZE);
+        const parsed = binaryProto.parseRequestHeader(headerBuf);
+        if (!parsed.ok) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_BAD_REQUEST);
+        }
+        sessionNonce = parsed.sessionNonce;
+
+        if (parsed.op !== binaryProto.OP_PAGE_FETCH) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_BAD_REQUEST);
+        }
+
+        const declaredPayloadLen = parsed.payloadLen;
+        if (declaredPayloadLen + binaryProto.REQUEST_HEADER_SIZE !== reqBuf.length) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_BAD_REQUEST);
+        }
+        const encryptedAndTag = reqBuf.subarray(binaryProto.REQUEST_HEADER_SIZE);
+
+        if (!binaryProto.verifyRequestCrc(headerBuf, encryptedAndTag)) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_BAD_REQUEST);
+        }
+
+        let unpacked = null;
+        try {
+            const sessionTokenAttempt = req.headers['x-aida-session-hint'] || '';
+            void sessionTokenAttempt;
+        } catch (_) {}
+
+        const { rows: candidateRows } = await pool.query(
+            `SELECT s.session_token, s.hwid, s.session_uuid FROM sessions s WHERE s.session_token IS NOT NULL`
+        );
+
+        let bodyPlain = null;
+        let chosenSession = null;
+        let chosenHwid = null;
+        for (const row of candidateRows) {
+            const decrypted = decryptSessionRowLocal(row);
+            const sessionToken = decrypted.session_token;
+            const hwid = decrypted.hwid;
+            if (!sessionToken || !hwid) continue;
+            try {
+                bodyPlain = binaryProto.decryptRequestBody(headerBuf, encryptedAndTag, sessionToken, hwid);
+                chosenSession = sessionToken;
+                chosenHwid = hwid;
+                break;
+            } catch (_) {
+                continue;
+            }
+        }
+        if (!bodyPlain || !chosenSession) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_AUTH_FAIL);
+        }
+
+        try {
+            unpacked = binaryProto.parsePackedRequestBody(bodyPlain, parsed.op);
+        } catch (_) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_BAD_REQUEST);
+        }
+        if (unpacked.session_token !== chosenSession || unpacked.hwid !== chosenHwid) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_AUTH_FAIL);
+        }
+
+        const validation = await validateSession(unpacked.license_key, unpacked.session_token, unpacked.hwid);
+        if (!validation.valid) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_AUTH_FAIL);
+        }
+        const session = validation.session;
+        const license = validation.license;
+        if (session.kill_flag) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_AUTH_FAIL);
+        }
+        if (unpacked.page_index !== pageIndex) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_BAD_REQUEST);
+        }
+
+        const lastProof = session.last_proof_token || '';
+        const clientProof = unpacked.proof_token || '';
+        if (!clientProof || (lastProof && clientProof !== lastProof)) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_AUTH_FAIL);
+        }
+
+        let arcBlob;
+        try {
+            arcBlob = getTransformedArcBlob(session, license);
+        } catch (err) {
+            console.error('[arc-page-binary] failed to load arc blob:', err.message);
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_SERVER_ERROR);
+        }
+
+        const totalPages = getPageCount(arcBlob.length);
+        if (pageIndex >= totalPages) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_NOT_FOUND);
+        }
+
+        const pages = splitIntoPages(arcBlob);
+        const prevChainTag = pageIndex === 0 ? '' : (session.last_chain_tag || '');
+        if (pageIndex > 0 && !prevChainTag) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_AUTH_FAIL);
+        }
+
+        const { encrypted, iv, authTag } = encryptPage(
+            pages[pageIndex],
+            pageIndex,
+            session.session_token,
+            session.hwid,
+            session.issued_at,
+            clientProof,
+            prevChainTag
+        );
+        const nextChainTag = deriveChainTag(prevChainTag, authTag).toString('hex');
+        await pool.query(
+            'UPDATE sessions SET last_chain_tag = $1 WHERE license_key = $2',
+            [nextChainTag, unpacked.license_key]
+        );
+
+        const responsePlain = Buffer.concat([
+            binaryProto.packU32LE(totalPages),
+            binaryProto.packU64LE(arcBlob.length),
+            binaryProto.packU32LE(encrypted.length),
+            encrypted,
+            iv,
+            authTag,
+        ]);
+
+        const responseBuf = binaryProto.buildResponse(
+            sessionNonce,
+            binaryProto.STATUS_OK,
+            responsePlain,
+            session.session_token,
+            session.hwid
+        );
+
+        res.set('Content-Type', 'application/octet-stream');
+        return res.status(200).send(responseBuf);
+    } catch (err) {
+        console.error('[arc-page-binary] error:', err);
+        return sendBinaryError(res, sessionNonce, binaryProto.STATUS_SERVER_ERROR);
+    }
+});
+
+
+router.post('/arc/pages-binary', rawBinaryMiddleware, async (req, res) => {
+    let sessionNonce = Buffer.alloc(8, 0);
+    try {
+        const reqBuf = req.body;
+        if (!Buffer.isBuffer(reqBuf) || reqBuf.length < binaryProto.REQUEST_HEADER_SIZE) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_BAD_REQUEST);
+        }
+        const headerBuf = reqBuf.subarray(0, binaryProto.REQUEST_HEADER_SIZE);
+        const parsed = binaryProto.parseRequestHeader(headerBuf);
+        if (!parsed.ok) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_BAD_REQUEST);
+        }
+        sessionNonce = parsed.sessionNonce;
+        if (parsed.op !== binaryProto.OP_PAGE_COUNT) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_BAD_REQUEST);
+        }
+        const encryptedAndTag = reqBuf.subarray(binaryProto.REQUEST_HEADER_SIZE);
+        if (!binaryProto.verifyRequestCrc(headerBuf, encryptedAndTag)) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_BAD_REQUEST);
+        }
+
+        const { rows: candidateRows } = await pool.query(
+            `SELECT s.session_token, s.hwid, s.session_uuid FROM sessions s WHERE s.session_token IS NOT NULL`
+        );
+
+        let bodyPlain = null;
+        let chosenSession = null;
+        let chosenHwid = null;
+        for (const row of candidateRows) {
+            const decrypted = decryptSessionRowLocal(row);
+            const sessionToken = decrypted.session_token;
+            const hwid = decrypted.hwid;
+            if (!sessionToken || !hwid) continue;
+            try {
+                bodyPlain = binaryProto.decryptRequestBody(headerBuf, encryptedAndTag, sessionToken, hwid);
+                chosenSession = sessionToken;
+                chosenHwid = hwid;
+                break;
+            } catch (_) {
+                continue;
+            }
+        }
+        if (!bodyPlain || !chosenSession) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_AUTH_FAIL);
+        }
+
+        let unpacked;
+        try {
+            unpacked = binaryProto.parsePackedRequestBody(bodyPlain, parsed.op);
+        } catch (_) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_BAD_REQUEST);
+        }
+        if (unpacked.session_token !== chosenSession || unpacked.hwid !== chosenHwid) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_AUTH_FAIL);
+        }
+
+        const validation = await validateSession(unpacked.license_key, unpacked.session_token, unpacked.hwid);
+        if (!validation.valid) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_AUTH_FAIL);
+        }
+
+        let arcBlob;
+        try {
+            arcBlob = loadArcBlob();
+        } catch (err) {
+            return sendBinaryError(res, sessionNonce, binaryProto.STATUS_SERVER_ERROR);
+        }
+        const totalPages = getPageCount(arcBlob.length);
+        const responsePlain = Buffer.concat([
+            binaryProto.packU32LE(totalPages),
+            binaryProto.packU32LE(4096),
+            binaryProto.packU64LE(arcBlob.length),
+        ]);
+        const responseBuf = binaryProto.buildResponse(
+            sessionNonce,
+            binaryProto.STATUS_OK,
+            responsePlain,
+            chosenSession,
+            chosenHwid
+        );
+        res.set('Content-Type', 'application/octet-stream');
+        return res.status(200).send(responseBuf);
+    } catch (err) {
+        console.error('[arc-pages-binary] error:', err);
+        return sendBinaryError(res, sessionNonce, binaryProto.STATUS_SERVER_ERROR);
+    }
+});
+
 
 module.exports = router;

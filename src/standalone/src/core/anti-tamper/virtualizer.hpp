@@ -3,6 +3,8 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <intrin.h>
+#include <immintrin.h>
+#include <float.h>
 
 #include <atomic>
 #include <cstdint>
@@ -14,6 +16,8 @@
 
 #include <array>
 #include <bitset>
+
+#include <openssl/evp.h>
 
 #include "integrity.hpp"
 #include "metamorphic.hpp"
@@ -61,6 +65,39 @@ namespace detail
         uint8_t _pad : 2;
     };
 
+    struct cipher_stream_t
+    {
+        uint8_t  key[32];
+        uint8_t  block[64];
+        uint64_t feedback;
+        uint64_t base_seed;
+        uint32_t block_index;
+        uint32_t block_pos;
+    };
+
+    struct dag_node_t
+    {
+        uint32_t bc_offset;
+        uint32_t bc_length;
+        uint64_t enter_hash;
+        uint32_t next_node_a;
+        uint32_t next_node_b;
+        uint64_t handler_chain;
+    };
+
+    static constexpr uint32_t DAG_NODE_HALT = 0xFFFFFFFFu;
+    static constexpr uint32_t DAG_NODE_INVALID = 0xFFFFFFFEu;
+
+    static constexpr uint32_t TAINT_SEVER_RING_SIZE = 64;
+
+    struct taint_sever_cell_t
+    {
+        std::atomic<uint64_t> tag;
+        std::atomic<uint64_t> value;
+        std::atomic<uint32_t> dirty;
+        uint32_t pad;
+    };
+
     struct vm_state_t
     {
         uint64_t regs[16];
@@ -75,6 +112,7 @@ namespace detail
         uint32_t insn_count;
         uint32_t max_insn;
         bool halted;
+        cipher_stream_t stream;
 
         uint8_t reg_shuffle[16];
         uint8_t reg_unshuffle[16];
@@ -88,6 +126,43 @@ namespace detail
         context_crypt_t     ctx_crypt;
 
         handler_pool_t* pool;
+
+        uint64_t reg_keys[16];
+        uint64_t fake_regs[16];
+        uint8_t  fake_shuffle[16];
+        uint64_t fake_decoy_key;
+        uint32_t per_op_shuffle_counter;
+        uint64_t last_op_result;
+
+        uint32_t anti_emu_counter;
+        uint64_t anti_emu_corruption_flags;
+        uint64_t anti_emu_last_pmc;
+        uint32_t anti_emu_pmc_failures;
+        uint16_t anti_emu_fpu_baseline;
+        uint8_t  anti_emu_misalign_seen;
+        uint8_t  anti_emu_force_emulator;
+        uint64_t anti_emu_handler_t0;
+        uint64_t anti_emu_avg_window;
+        uint32_t anti_emu_window_count;
+
+        const dag_node_t* dag_nodes;
+        uint32_t dag_nodes_size;
+        uint32_t dag_node;
+        uint32_t dag_cursor;
+        uint32_t dag_branch_taken;
+        uint32_t dag_pad;
+        uint64_t dag_violation_code;
+        uint64_t dag_master_key;
+        taint_sever_cell_t* taint_ring;
+        uint32_t taint_ring_size;
+        uint32_t taint_seq;
+    };
+
+    struct vm_program_t
+    {
+        std::vector<uint8_t> bc;
+        std::vector<dag_node_t> dag;
+        uint64_t dag_master_key = 0;
     };
 
     enum vm_ops : uint8_t
@@ -154,6 +229,280 @@ namespace detail
         return BCryptGenRandom(nullptr, buf, len, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
     }
 
+    inline bool sha256_oneshot(const uint8_t* data, uint32_t data_len, uint8_t out[32])
+    {
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+        bool ok = false;
+        if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
+            return false;
+        if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) != 0)
+        {
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return false;
+        }
+        if (BCryptHashData(hHash, const_cast<PUCHAR>(data), data_len, 0) == 0)
+            ok = (BCryptFinishHash(hHash, out, 32, 0) == 0);
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return ok;
+    }
+
+    inline void cipher_stream_refill(cipher_stream_t& s)
+    {
+        uint8_t iv[16];
+        uint32_t ctr = s.block_index;
+        memcpy(iv, &ctr, 4);
+        uint64_t fb_a = s.feedback ^ s.base_seed;
+        uint64_t fb_b = _rotl64(s.feedback, 23) ^ _rotr64(s.base_seed, 17);
+        memcpy(iv + 4, &fb_a, 8);
+        uint32_t fb_b_lo = static_cast<uint32_t>(fb_b);
+        memcpy(iv + 12, &fb_b_lo, 4);
+
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        if (!ctx)
+        {
+            for (int i = 0; i < 64; ++i)
+                s.block[i] = static_cast<uint8_t>((s.feedback >> ((i & 7) * 8)) ^ (s.base_seed >> ((i & 7) * 8)) ^ i);
+        }
+        else
+        {
+            uint8_t zeros[64] = {};
+            int outlen = 0;
+            if (EVP_EncryptInit_ex(ctx, EVP_chacha20(), nullptr, s.key, iv) == 1 &&
+                EVP_EncryptUpdate(ctx, s.block, &outlen, zeros, 64) == 1 &&
+                outlen == 64)
+            {
+            }
+            else
+            {
+                for (int i = 0; i < 64; ++i)
+                    s.block[i] = static_cast<uint8_t>((s.feedback >> ((i & 7) * 8)) ^ (s.base_seed >> ((i & 7) * 8)) ^ i);
+            }
+            EVP_CIPHER_CTX_free(ctx);
+        }
+        s.block_pos = 0;
+        s.block_index += 1;
+    }
+
+    inline void cipher_stream_init(cipher_stream_t& s, uint64_t seed)
+    {
+        memset(&s, 0, sizeof(s));
+        s.base_seed = seed;
+        s.feedback  = seed ^ 0x9E3779B97F4A7C15ULL;
+
+        uint8_t key_input[24];
+        memcpy(key_input, &seed, 8);
+        static const uint8_t key_label[16] = {
+            'a','i','d','a','_','v','m','_','s','t','r','m','_','k','e','y'
+        };
+        memcpy(key_input + 8, key_label, 16);
+        sha256_oneshot(key_input, sizeof(key_input), s.key);
+
+        s.block_index = 0;
+        s.block_pos   = 64;
+
+        SecureZeroMemory(key_input, sizeof(key_input));
+    }
+
+    __forceinline uint8_t cipher_stream_xcrypt(cipher_stream_t& s, uint8_t in_byte, bool encrypt_dir)
+    {
+        if (s.block_pos >= 64)
+            cipher_stream_refill(s);
+        uint8_t ks = s.block[s.block_pos++];
+        uint8_t out_byte = static_cast<uint8_t>(in_byte ^ ks);
+        uint8_t plaintext_byte = encrypt_dir ? in_byte : out_byte;
+        s.feedback = _rotl64(s.feedback, 13)
+                     ^ static_cast<uint64_t>(plaintext_byte)
+                     ^ (static_cast<uint64_t>(ks) << 32)
+                     ^ (static_cast<uint64_t>(s.block_index) * 0x9E3779B97F4A7C15ULL);
+        return out_byte;
+    }
+
+    struct cpu_caps_t
+    {
+        bool has_rdseed;
+        bool has_rdrand;
+        uint32_t cpuid7_ebx;
+        uint32_t cpuid7_ecx;
+        uint32_t cpuid7_edx;
+        uint32_t cpuid1_ecx;
+        bool initialized;
+    };
+
+    inline cpu_caps_t& get_cpu_caps()
+    {
+        static cpu_caps_t c{};
+        if (!c.initialized)
+        {
+            int regs[4] = { 0, 0, 0, 0 };
+            __cpuid(regs, 0);
+            int max_basic = regs[0];
+
+            __cpuid(regs, 1);
+            c.cpuid1_ecx = static_cast<uint32_t>(regs[2]);
+            c.has_rdrand = (c.cpuid1_ecx & (1u << 30)) != 0;
+
+            if (max_basic >= 7)
+            {
+                __cpuidex(regs, 7, 0);
+                c.cpuid7_ebx = static_cast<uint32_t>(regs[1]);
+                c.cpuid7_ecx = static_cast<uint32_t>(regs[2]);
+                c.cpuid7_edx = static_cast<uint32_t>(regs[3]);
+                c.has_rdseed = (c.cpuid7_ebx & (1u << 18)) != 0;
+            }
+            c.initialized = true;
+        }
+        return c;
+    }
+
+    __forceinline bool try_rdseed64(uint64_t& out)
+    {
+        const cpu_caps_t& caps = get_cpu_caps();
+        if (!caps.has_rdseed) return false;
+        unsigned __int64 v = 0;
+        for (int attempt = 0; attempt < 32; ++attempt)
+        {
+            if (_rdseed64_step(&v))
+            {
+                out = static_cast<uint64_t>(v);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    __forceinline bool try_rdrand64(uint64_t& out)
+    {
+        const cpu_caps_t& caps = get_cpu_caps();
+        if (!caps.has_rdrand) return false;
+        unsigned __int64 v = 0;
+        for (int attempt = 0; attempt < 32; ++attempt)
+        {
+            if (_rdrand64_step(&v))
+            {
+                out = static_cast<uint64_t>(v);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    struct runtime_seed_t
+    {
+        uint8_t bytes[32];
+        std::atomic<bool> ready;
+        std::mutex init_mtx;
+    };
+
+    inline runtime_seed_t& get_runtime_seed_state()
+    {
+        static runtime_seed_t s{};
+        return s;
+    }
+
+    inline const uint8_t* runtime_master_seed()
+    {
+        runtime_seed_t& s = get_runtime_seed_state();
+        if (s.ready.load(std::memory_order_acquire))
+            return s.bytes;
+
+        std::lock_guard<std::mutex> lk(s.init_mtx);
+        if (s.ready.load(std::memory_order_relaxed))
+            return s.bytes;
+
+        uint8_t pool[192];
+        memset(pool, 0, sizeof(pool));
+        uint32_t off = 0;
+
+        uint64_t rs_val = 0;
+        if (try_rdseed64(rs_val))
+        {
+            memcpy(pool + off, &rs_val, 8); off += 8;
+        }
+        uint64_t rs_val2 = 0;
+        if (try_rdseed64(rs_val2))
+        {
+            memcpy(pool + off, &rs_val2, 8); off += 8;
+        }
+
+        uint64_t rr_val = 0;
+        if (try_rdrand64(rr_val))
+        {
+            memcpy(pool + off, &rr_val, 8); off += 8;
+        }
+        uint64_t rr_val2 = 0;
+        if (try_rdrand64(rr_val2))
+        {
+            memcpy(pool + off, &rr_val2, 8); off += 8;
+        }
+
+        cpu_caps_t& caps = get_cpu_caps();
+        memcpy(pool + off, &caps.cpuid7_ebx, 4); off += 4;
+        memcpy(pool + off, &caps.cpuid7_ecx, 4); off += 4;
+        memcpy(pool + off, &caps.cpuid7_edx, 4); off += 4;
+        memcpy(pool + off, &caps.cpuid1_ecx, 4); off += 4;
+
+        ULONGLONG tick = GetTickCount64();
+        memcpy(pool + off, &tick, 8); off += 8;
+        LARGE_INTEGER perf_now;
+        perf_now.QuadPart = 0;
+        QueryPerformanceCounter(&perf_now);
+        memcpy(pool + off, &perf_now.QuadPart, 8); off += 8;
+
+        DWORD pid = GetCurrentProcessId();
+        DWORD tid = GetCurrentThreadId();
+        memcpy(pool + off, &pid, 4); off += 4;
+        memcpy(pool + off, &tid, 4); off += 4;
+
+        uint64_t tsc_a = __rdtsc();
+        memcpy(pool + off, &tsc_a, 8); off += 8;
+        uint64_t tsc_b = __rdtsc();
+        memcpy(pool + off, &tsc_b, 8); off += 8;
+
+        uint8_t bcrypt_buf[32];
+        memset(bcrypt_buf, 0, sizeof(bcrypt_buf));
+        if (bcrypt_random(bcrypt_buf, 32))
+        {
+            memcpy(pool + off, bcrypt_buf, 32);
+            off += 32;
+        }
+
+        uintptr_t self_addr = reinterpret_cast<uintptr_t>(&runtime_master_seed);
+        memcpy(pool + off, &self_addr, sizeof(self_addr));
+        off += static_cast<uint32_t>(sizeof(self_addr));
+
+        uintptr_t stack_var = reinterpret_cast<uintptr_t>(&pool);
+        memcpy(pool + off, &stack_var, sizeof(stack_var));
+        off += static_cast<uint32_t>(sizeof(stack_var));
+
+        uint8_t digest[32];
+        if (!sha256_oneshot(pool, off, digest))
+        {
+            uint64_t fb_a = __rdtsc() ^ static_cast<uint64_t>(pid) ^ static_cast<uint64_t>(tick);
+            uint64_t fb_b = static_cast<uint64_t>(perf_now.QuadPart) ^ self_addr;
+            memcpy(digest, &fb_a, 8);
+            memcpy(digest + 8, &fb_b, 8);
+            memcpy(digest + 16, bcrypt_buf, 16);
+        }
+
+        memcpy(s.bytes, digest, 32);
+        SecureZeroMemory(pool, sizeof(pool));
+        SecureZeroMemory(bcrypt_buf, sizeof(bcrypt_buf));
+        SecureZeroMemory(digest, sizeof(digest));
+
+        s.ready.store(true, std::memory_order_release);
+        return s.bytes;
+    }
+
+    inline uint64_t runtime_seed_qword(uint32_t lane)
+    {
+        const uint8_t* m = runtime_master_seed();
+        uint64_t v;
+        memcpy(&v, m + ((lane & 3) * 8), 8);
+        return v;
+    }
+
     inline bool hmac_sha256(const uint8_t* key, uint32_t key_len,
                             const uint8_t* data, uint32_t data_len,
                             uint8_t out[32])
@@ -203,16 +552,26 @@ namespace detail
     inline std::array<uint8_t, 256> derive_function_opcode_map(
         uint32_t func_rva, const uint8_t master_key[32])
     {
-        uint8_t rva_bytes[4];
-        memcpy(rva_bytes, &func_rva, 4);
-        uint8_t prk[32];
-        hmac_sha256(master_key, 32, rva_bytes, 4, prk);
+        const uint8_t* rt_seed = runtime_master_seed();
 
-        static const uint8_t info[12] = {
-            'a','i','d','a','_','v','m','_','o','p','m','p'
+        uint8_t mixed_key[32];
+        for (int i = 0; i < 32; ++i)
+            mixed_key[i] = master_key[i] ^ rt_seed[i];
+
+        uint8_t input[40];
+        memcpy(input, &func_rva, 4);
+        memcpy(input + 4, rt_seed, 32);
+        uint64_t pid_q = static_cast<uint64_t>(GetCurrentProcessId());
+        memcpy(input + 36, &pid_q, 4);
+
+        uint8_t prk[32];
+        hmac_sha256(mixed_key, 32, input, 40, prk);
+
+        static const uint8_t info[16] = {
+            'a','i','d','a','_','v','m','_','o','p','m','p','_','r','t','1'
         };
         uint8_t okm[256];
-        hkdf_expand_sha256(prk, info, 12, okm, 256);
+        hkdf_expand_sha256(prk, info, 16, okm, 256);
 
         std::array<uint8_t, 256> map{};
         for (int i = 0; i < 256; ++i)
@@ -228,6 +587,8 @@ namespace detail
 
         SecureZeroMemory(prk, 32);
         SecureZeroMemory(okm, 256);
+        SecureZeroMemory(mixed_key, 32);
+        SecureZeroMemory(input, 40);
         return map;
     }
 
@@ -277,6 +638,18 @@ namespace detail
         uint8_t    count;
     };
 
+    struct handler_set_t
+    {
+        uint8_t     variant_order[256][4];
+        uint8_t     variant_count[256];
+        uint64_t    dispatch_xor_table[256];
+        uint64_t    dispatch_hmac_key[4];
+        uint64_t    uf_table[64];
+        uint32_t    crc_accumulator;
+        uint32_t    set_generation;
+        bool        initialized;
+    };
+
     struct handler_pool_t
     {
         handler_slot_t   slots[HANDLER_POOL_SIZE];
@@ -293,6 +666,7 @@ namespace detail
         uint32_t         child_pool_count;
         handler_pool_t*  child_pools[8];
         std::unordered_map<uint32_t, uint32_t>* hot_block_counts;
+        handler_set_t    handler_set;
     };
 
     inline handler_pool_t g_default_pool{};
@@ -313,6 +687,8 @@ namespace detail
     inline void build_handler_pool(handler_pool_t& pool, const uint8_t* reverse_map, uint64_t pool_seed);
     inline void build_poly_table();
     inline void build_poly_table(handler_pool_t& pool);
+    inline void build_handler_set(handler_pool_t& pool);
+    __forceinline handler_fn resolve_dispatch(vm_state_t& vm, uint8_t opcode);
     __forceinline handler_fn select_handler(vm_state_t& vm, uint8_t opcode);
     inline void init_vm(vm_state_t& vm, uint64_t seed);
     inline uint64_t vm_execute(vm_state_t& vm, const uint8_t* bytecode, uint32_t bc_size);
@@ -326,13 +702,72 @@ namespace detail
         return state;
     }
 
+#pragma region oblivious_register_file
+
+    inline void derive_register_keys(vm_state_t& vm, uint64_t seed)
+    {
+        uint8_t prk_input[24];
+        memcpy(prk_input, &seed, 8);
+        uint64_t pid_mix = static_cast<uint64_t>(GetCurrentProcessId())
+            ^ static_cast<uint64_t>(GetCurrentThreadId()) * 0x9E3779B97F4A7C15ULL;
+        memcpy(prk_input + 8, &pid_mix, 8);
+        memcpy(prk_input + 16, &vm.context_entropy, 8);
+
+        uint8_t prk[32];
+        hmac_sha256(state::g_vm_master_key, 32, prk_input, sizeof(prk_input), prk);
+
+        static const uint8_t info[14] = {
+            'a','i','d','a','_','v','m','_','r','e','g','k','e','y'
+        };
+        uint8_t okm[128];
+        hkdf_expand_sha256(prk, info, 14, okm, 128);
+
+        for (int i = 0; i < 16; ++i)
+        {
+            uint64_t k;
+            memcpy(&k, okm + i * 8, 8);
+            vm.reg_keys[i] = k;
+        }
+
+        SecureZeroMemory(prk, sizeof(prk));
+        SecureZeroMemory(okm, sizeof(okm));
+        SecureZeroMemory(prk_input, sizeof(prk_input));
+    }
+
+    inline void rebuild_fake_register_layout(vm_state_t& vm, uint64_t entropy)
+    {
+        for (int i = 0; i < 16; ++i)
+            vm.fake_shuffle[i] = static_cast<uint8_t>(i);
+
+        uint64_t state = entropy;
+        for (int i = 15; i > 0; --i)
+        {
+            xorshift_advance(state);
+            int j = static_cast<int>(state % (i + 1));
+            uint8_t tmp = vm.fake_shuffle[i];
+            vm.fake_shuffle[i] = vm.fake_shuffle[j];
+            vm.fake_shuffle[j] = tmp;
+        }
+
+        for (int i = 0; i < 16; ++i)
+        {
+            xorshift_advance(state);
+            vm.fake_regs[i] = state;
+        }
+
+        vm.fake_decoy_key = state ^ 0xC8E5C123F11A4D9DULL;
+    }
+
     inline void shuffle_registers(vm_state_t& vm)
     {
         uint64_t entropy = secure_seed() ^ vm.context_entropy;
 
         uint64_t old_xor = vm.reg_xor_key;
         for (int i = 0; i < 16; ++i)
-            vm.regs[vm.reg_shuffle[i]] ^= old_xor;
+        {
+            vm.regs[i] ^= old_xor;
+            vm.regs[i] ^= vm.reg_keys[i];
+        }
 
         for (int i = 0; i < 16; ++i)
             vm.reg_shuffle[i] = static_cast<uint8_t>(i);
@@ -354,21 +789,117 @@ namespace detail
         vm.reg_xor_key = entropy;
         vm.context_entropy = entropy;
 
+        derive_register_keys(vm, entropy ^ vm.handler_chain_key);
+
         for (int i = 0; i < 16; ++i)
-            vm.regs[vm.reg_shuffle[i]] ^= vm.reg_xor_key;
+        {
+            vm.regs[i] ^= vm.reg_xor_key;
+            vm.regs[i] ^= vm.reg_keys[i];
+        }
+
+        rebuild_fake_register_layout(vm, entropy ^ 0x6C078965FAB89E11ULL);
 
         vm.shuffle_counter = 0;
     }
 
     __forceinline uint64_t read_vreg(vm_state_t& vm, uint8_t logical)
     {
-        return vm.regs[vm.reg_shuffle[logical & 0x0F]] ^ vm.reg_xor_key;
+        uint8_t phys = vm.reg_shuffle[logical & 0x0F];
+        return vm.regs[phys] ^ vm.reg_xor_key ^ vm.reg_keys[phys];
+    }
+
+    __forceinline void dummy_register_write(vm_state_t& vm, uint8_t logical, uint64_t val)
+    {
+        uint8_t target = vm.fake_shuffle[(logical ^ static_cast<uint8_t>(val & 0x0F)) & 0x0F];
+        uint64_t mixed = val
+            ^ vm.fake_decoy_key
+            ^ (static_cast<uint64_t>(logical) * 0xBF58476D1CE4E5B9ULL)
+            ^ _rotl64(vm.last_op_result, (logical & 0x3F));
+        vm.fake_regs[target] = mixed;
     }
 
     __forceinline void write_vreg(vm_state_t& vm, uint8_t logical, uint64_t val)
     {
-        vm.regs[vm.reg_shuffle[logical & 0x0F]] = val ^ vm.reg_xor_key;
+        uint8_t phys = vm.reg_shuffle[logical & 0x0F];
+        vm.regs[phys] = val ^ vm.reg_xor_key ^ vm.reg_keys[phys];
+        dummy_register_write(vm, logical, val);
+        vm.last_op_result = val;
     }
+
+    __forceinline void mutate_shuffle_per_op(vm_state_t& vm, uint8_t opcode, uint64_t result)
+    {
+        vm.last_op_result = result;
+        uint32_t mix = (static_cast<uint32_t>(opcode) + static_cast<uint32_t>(result & 0xFFFFFFFFu)) & 0x0F;
+        uint32_t partner = (mix + 1u + (static_cast<uint32_t>(result >> 56) & 0x0F)) & 0x0F;
+        if (mix == partner) partner = (partner + 1u) & 0x0F;
+
+        uint8_t a_logical = static_cast<uint8_t>(mix);
+        uint8_t b_logical = static_cast<uint8_t>(partner);
+        uint8_t a_phys = vm.reg_shuffle[a_logical];
+        uint8_t b_phys = vm.reg_shuffle[b_logical];
+
+        if (a_phys == b_phys) return;
+
+        uint64_t va = vm.regs[a_phys] ^ vm.reg_xor_key ^ vm.reg_keys[a_phys];
+        uint64_t vb = vm.regs[b_phys] ^ vm.reg_xor_key ^ vm.reg_keys[b_phys];
+
+        vm.reg_shuffle[a_logical] = b_phys;
+        vm.reg_shuffle[b_logical] = a_phys;
+        vm.reg_unshuffle[a_phys] = b_logical;
+        vm.reg_unshuffle[b_phys] = a_logical;
+
+        vm.regs[b_phys] = va ^ vm.reg_xor_key ^ vm.reg_keys[b_phys];
+        vm.regs[a_phys] = vb ^ vm.reg_xor_key ^ vm.reg_keys[a_phys];
+
+        ++vm.per_op_shuffle_counter;
+    }
+
+    inline void linearize_register_file(vm_state_t& vm, uint64_t saved_keys[16])
+    {
+        uint64_t plain[16];
+        for (int i = 0; i < 16; ++i)
+            plain[i] = vm.regs[i] ^ vm.reg_xor_key ^ vm.reg_keys[i];
+
+        uint64_t laid_out[16];
+        for (int i = 0; i < 16; ++i)
+            laid_out[i] = plain[vm.reg_shuffle[i]];
+
+        for (int i = 0; i < 16; ++i)
+        {
+            saved_keys[i] = vm.reg_keys[i];
+            vm.regs[i] = laid_out[i];
+            vm.reg_keys[i] = 0;
+        }
+
+        vm.reg_xor_key = 0;
+        for (int i = 0; i < 16; ++i)
+        {
+            vm.reg_shuffle[i] = static_cast<uint8_t>(i);
+            vm.reg_unshuffle[i] = static_cast<uint8_t>(i);
+        }
+
+        SecureZeroMemory(plain, sizeof(plain));
+        SecureZeroMemory(laid_out, sizeof(laid_out));
+    }
+
+    inline void delinearize_register_file(vm_state_t& vm, const uint64_t saved_keys[16], uint64_t fresh_xor)
+    {
+        uint64_t plain[16];
+        for (int i = 0; i < 16; ++i)
+            plain[i] = vm.regs[i];
+
+        for (int i = 0; i < 16; ++i)
+            vm.reg_keys[i] = saved_keys[i];
+
+        vm.reg_xor_key = fresh_xor;
+
+        for (int i = 0; i < 16; ++i)
+            vm.regs[i] = plain[i] ^ vm.reg_xor_key ^ vm.reg_keys[i];
+
+        SecureZeroMemory(plain, sizeof(plain));
+    }
+
+#pragma endregion
 
     inline void generate_opcode_map(uint64_t seed, uint8_t* map, uint8_t* reverse)
     {
@@ -391,20 +922,136 @@ namespace detail
 
     inline void advance_rolling_key(vm_state_t& vm)
     {
-        vm.rolling_key ^= vm.rolling_key << 13;
-        vm.rolling_key ^= vm.rolling_key >> 7;
-        vm.rolling_key ^= vm.rolling_key << 17;
+        vm.rolling_key = _rotl64(vm.rolling_key, 13)
+                         ^ static_cast<uint64_t>(vm.stream.feedback)
+                         ^ static_cast<uint64_t>(vm.stream.block_index);
     }
 
     inline uint8_t decrypt_byte(vm_state_t& vm, uint8_t raw)
     {
-        uint8_t key_byte = static_cast<uint8_t>(vm.rolling_key & 0xFF);
-        advance_rolling_key(vm);
-        return raw ^ key_byte;
+        return cipher_stream_xcrypt(vm.stream, raw, false);
+    }
+
+    __forceinline uint64_t dag_state_hash(uint64_t dag_master_key, uint64_t node_index,
+                                          uint64_t handler_chain)
+    {
+        uint64_t v0 = dag_master_key ^ 0x736F6D6570736575ULL;
+        uint64_t v1 = node_index ^ 0x646F72616E646F6DULL;
+        uint64_t v2 = handler_chain ^ 0x6C7967656E657261ULL;
+        uint64_t v3 = (dag_master_key ^ handler_chain) ^ 0x7465646279746573ULL;
+
+        uint64_t lanes[4] = { dag_master_key, node_index, handler_chain,
+                              dag_master_key ^ handler_chain };
+        for (int i = 0; i < 4; ++i)
+        {
+            v3 ^= lanes[i];
+            v0 += v1; v1 = _rotl64(v1, 13); v1 ^= v0; v0 = _rotl64(v0, 32);
+            v2 += v3; v3 = _rotl64(v3, 16); v3 ^= v2;
+            v0 += v3; v3 = _rotl64(v3, 21); v3 ^= v0;
+            v2 += v1; v1 = _rotl64(v1, 17); v1 ^= v2; v2 = _rotl64(v2, 32);
+            v0 ^= lanes[i];
+        }
+        v2 ^= 0xFF;
+        for (int i = 0; i < 4; ++i)
+        {
+            v0 += v1; v1 = _rotl64(v1, 13); v1 ^= v0; v0 = _rotl64(v0, 32);
+            v2 += v3; v3 = _rotl64(v3, 16); v3 ^= v2;
+            v0 += v3; v3 = _rotl64(v3, 21); v3 ^= v0;
+            v2 += v1; v1 = _rotl64(v1, 17); v1 ^= v2; v2 = _rotl64(v2, 32);
+        }
+        return v0 ^ v1 ^ v2 ^ v3;
+    }
+
+    __forceinline uint64_t dag_compute_state_hash(const vm_state_t& vm, uint64_t handler_chain)
+    {
+        return dag_state_hash(vm.dag_master_key,
+                              static_cast<uint64_t>(vm.dag_node),
+                              handler_chain);
+    }
+
+    __forceinline bool dag_taint_store(vm_state_t& vm, uint8_t logical, uint64_t value)
+    {
+        if (!vm.taint_ring || vm.taint_ring_size == 0) return false;
+        uint32_t idx = (vm.taint_seq + (logical & 0x0F)) % vm.taint_ring_size;
+        uint64_t tag = (static_cast<uint64_t>(logical) << 56)
+                     ^ (static_cast<uint64_t>(vm.taint_seq) * 0x9E3779B97F4A7C15ULL)
+                     ^ vm.handler_chain_key;
+        taint_sever_cell_t& cell = vm.taint_ring[idx];
+        cell.tag.store(tag, std::memory_order_release);
+        cell.value.store(value, std::memory_order_release);
+        cell.dirty.store(1, std::memory_order_release);
+        ++vm.taint_seq;
+        SwitchToThread();
+        return true;
+    }
+
+    __forceinline bool dag_taint_load(vm_state_t& vm, uint8_t logical, uint64_t& out_value)
+    {
+        if (!vm.taint_ring || vm.taint_ring_size == 0) return false;
+        bool found = false;
+        uint64_t latest_tag = 0;
+        for (uint32_t i = 0; i < vm.taint_ring_size; ++i)
+        {
+            taint_sever_cell_t& cell = vm.taint_ring[i];
+            if (cell.dirty.load(std::memory_order_acquire) == 0) continue;
+            uint64_t tag = cell.tag.load(std::memory_order_acquire);
+            uint8_t cell_logical = static_cast<uint8_t>((tag >> 56) & 0x0F);
+            if (cell_logical != (logical & 0x0F)) continue;
+            if (!found || tag > latest_tag)
+            {
+                out_value = cell.value.load(std::memory_order_acquire);
+                latest_tag = tag;
+                found = true;
+            }
+        }
+        return found;
+    }
+
+    inline uint32_t dag_find_node_for_offset(const dag_node_t* nodes, uint32_t nodes_size,
+                                             uint32_t bc_offset)
+    {
+        for (uint32_t i = 0; i < nodes_size; ++i)
+        {
+            if (nodes[i].bc_offset == bc_offset)
+                return i;
+        }
+        return DAG_NODE_INVALID;
+    }
+
+    __forceinline bool dag_active(const vm_state_t& vm)
+    {
+        return vm.dag_nodes != nullptr && vm.dag_nodes_size > 0;
+    }
+
+    __forceinline bool dag_advance_to_offset(vm_state_t& vm, uint32_t target_offset)
+    {
+        uint32_t idx = dag_find_node_for_offset(vm.dag_nodes, vm.dag_nodes_size, target_offset);
+        if (idx == DAG_NODE_INVALID)
+        {
+            vm.halted = true;
+            vm.dag_node = DAG_NODE_HALT;
+            return false;
+        }
+        vm.dag_node = idx;
+        vm.dag_cursor = 0;
+        vm.rip = target_offset;
+        return true;
     }
 
     inline uint8_t fetch_byte(vm_state_t& vm, const uint8_t* bc, uint32_t bc_size)
     {
+        if (dag_active(vm))
+        {
+            if (vm.dag_node >= vm.dag_nodes_size) { vm.halted = true; return 0; }
+            const dag_node_t& node = vm.dag_nodes[vm.dag_node];
+            if (vm.dag_cursor >= node.bc_length) { vm.halted = true; return 0; }
+            uint32_t bc_pos = node.bc_offset + vm.dag_cursor;
+            if (bc_pos >= bc_size) { vm.halted = true; return 0; }
+            uint8_t raw = bc[bc_pos];
+            ++vm.dag_cursor;
+            vm.rip = bc_pos + 1;
+            return decrypt_byte(vm, raw);
+        }
         if (vm.rip >= bc_size) { vm.halted = true; return 0; }
         return decrypt_byte(vm, bc[vm.rip++]);
     }
@@ -505,6 +1152,176 @@ namespace detail
             return metamorphic::mba::keyed_xor(a, b, sel);
         uint64_t nand_ab = nand_op(a, b);
         return nand_op(nand_op(a, nand_ab), nand_op(b, nand_ab));
+    }
+
+    __forceinline uint64_t handler_entropy_bit(vm_state_t& vm, uint8_t tag)
+    {
+        uint64_t e = vm.context_entropy;
+        e ^= static_cast<uint64_t>(tag) * 0x9E3779B97F4A7C15ULL;
+        e ^= vm.handler_chain_key * 0xBF58476D1CE4E5B9ULL;
+        e ^= vm.rolling_key;
+        e ^= e >> 33;
+        e *= 0xFF51AFD7ED558CCDULL;
+        e ^= e >> 33;
+        return e;
+    }
+
+    __forceinline uint64_t bswap_identity(uint64_t v)
+    {
+        return _byteswap_uint64(_byteswap_uint64(v));
+    }
+
+    __forceinline uint64_t uf_shadow_lookup(vm_state_t& vm, uint64_t mix)
+    {
+        handler_pool_t& pool = vm.pool ? *vm.pool : g_default_pool;
+        if (!pool.handler_set.initialized)
+            return 0;
+        uint8_t idx = static_cast<uint8_t>(mix & 0x3F);
+        uint64_t v = pool.handler_set.uf_table[idx];
+        return v ^ v;
+    }
+
+    __forceinline void crc_accumulate(vm_state_t& vm, uint64_t mix)
+    {
+        handler_pool_t& pool = vm.pool ? *vm.pool : g_default_pool;
+        if (!pool.handler_set.initialized) return;
+        uint32_t lo = static_cast<uint32_t>(mix);
+        uint32_t hi = static_cast<uint32_t>(mix >> 32);
+        uint32_t prev = pool.handler_set.crc_accumulator;
+        prev = _mm_crc32_u32(prev, lo);
+        prev = _mm_crc32_u32(prev, hi);
+        pool.handler_set.crc_accumulator = prev;
+    }
+
+    __forceinline uint64_t triton_break_inject(vm_state_t& vm, uint64_t value, uint8_t tag)
+    {
+        uint64_t entropy = handler_entropy_bit(vm, tag);
+        uint64_t out = bswap_identity(value);
+        uint64_t mask = (entropy >> 11) & 3;
+        switch (mask)
+        {
+        case 0:
+        {
+            uint64_t shadow = uf_shadow_lookup(vm, entropy);
+            out ^= shadow;
+            break;
+        }
+        case 1:
+            crc_accumulate(vm, entropy ^ value);
+            break;
+        case 2:
+        {
+            uint64_t z = entropy ^ entropy;
+            out ^= z;
+            crc_accumulate(vm, value);
+            break;
+        }
+        default:
+            out = bswap_identity(out);
+            break;
+        }
+        return out;
+    }
+
+    __forceinline uint64_t mba_add(uint64_t a, uint64_t b, uint64_t entropy)
+    {
+        uint64_t form = (entropy >> 7) & 3;
+        switch (form)
+        {
+        case 0: return (a ^ b) + ((a & b) << 1);
+        case 1: return (a | b) + (a & b);
+        case 2: {
+            uint64_t na = ~a;
+            uint64_t nb = ~b;
+            uint64_t and_ab = a & b;
+            uint64_t nand_ab = ~(na & nb);
+            return nand_ab + and_ab;
+        }
+        default:
+            return metamorphic::mba::keyed_add_dynamic(a, b, entropy);
+        }
+    }
+
+    __forceinline uint64_t mba_sub(uint64_t a, uint64_t b, uint64_t entropy)
+    {
+        uint64_t form = (entropy >> 9) & 3;
+        switch (form)
+        {
+        case 0: return a + ((~b) + 1);
+        case 1: {
+            uint64_t neg_b = ~b;
+            return (a ^ neg_b) + ((a & neg_b) << 1) + 1;
+        }
+        case 2:
+            return metamorphic::mba::keyed_add_dynamic(a, (~b) + 1, entropy);
+        default:
+            return a - b;
+        }
+    }
+
+    __forceinline uint64_t mba_xor(uint64_t a, uint64_t b, uint64_t entropy)
+    {
+        uint64_t form = (entropy >> 5) & 3;
+        switch (form)
+        {
+        case 0: return (a | b) - (a & b);
+        case 1: return (a & ~b) | (~a & b);
+        case 2: return (a + b) - ((a & b) << 1);
+        default:
+            return metamorphic::mba::keyed_xor_dynamic(a, b, entropy);
+        }
+    }
+
+    __forceinline uint64_t mba_and(uint64_t a, uint64_t b, uint64_t entropy)
+    {
+        uint64_t form = (entropy >> 3) & 3;
+        switch (form)
+        {
+        case 0: return (a + b - (a | b));
+        case 1: return ~((~a) | (~b));
+        case 2: return ((a ^ b) ^ (a | b));
+        default:
+            return metamorphic::mba::keyed_and_dynamic(a, b, entropy);
+        }
+    }
+
+    __forceinline uint64_t mba_or(uint64_t a, uint64_t b, uint64_t entropy)
+    {
+        uint64_t form = (entropy >> 13) & 3;
+        switch (form)
+        {
+        case 0: return (a + b) - (a & b);
+        case 1: return ~((~a) & (~b));
+        case 2: return (a ^ b) + (a & b);
+        default:
+            return metamorphic::mba::keyed_or(a, b, entropy);
+        }
+    }
+
+    __forceinline uint64_t mba_not(uint64_t a, uint64_t entropy)
+    {
+        uint64_t form = (entropy >> 17) & 3;
+        switch (form)
+        {
+        case 0: return a ^ 0xFFFFFFFFFFFFFFFFULL;
+        case 1: return (0 - a) - 1;
+        case 2: {
+            uint64_t z = (a & a) ^ a;
+            return ~a ^ z;
+        }
+        default:
+            return metamorphic::mba::keyed_not(a, entropy);
+        }
+    }
+
+    __forceinline uint64_t mba_nand(uint64_t a, uint64_t b, uint64_t entropy)
+    {
+        return mba_not(mba_and(a, b, entropy), entropy ^ 0xA5A5A5A5A5A5A5A5ULL);
+    }
+
+    __forceinline uint64_t mba_nor(uint64_t a, uint64_t b, uint64_t entropy)
+    {
+        return mba_not(mba_or(a, b, entropy), entropy ^ 0x5A5A5A5A5A5A5A5AULL);
     }
 
     __forceinline uint8_t compute_parity(uint64_t val)
@@ -682,9 +1499,315 @@ namespace detail
             build_poly_table(pool);
         }
 
+        pool.handler_set.initialized = false;
+        build_handler_set(pool);
+
         vm.context_entropy ^= new_seed;
         pool.regen_counter++;
     }
+
+#pragma region anti_emu_traps
+
+    static constexpr uint64_t ANTI_EMU_FLAG_RDTSC      = 1ULL << 0;
+    static constexpr uint64_t ANTI_EMU_FLAG_RDPMC      = 1ULL << 1;
+    static constexpr uint64_t ANTI_EMU_FLAG_CAPABILITY = 1ULL << 2;
+    static constexpr uint64_t ANTI_EMU_FLAG_FPU        = 1ULL << 3;
+    static constexpr uint64_t ANTI_EMU_FLAG_MISALIGN   = 1ULL << 4;
+
+    static constexpr uint64_t ANTI_EMU_RDTSC_MIN_CYCLES = 10ULL;
+    static constexpr uint64_t ANTI_EMU_RDTSC_MAX_CYCLES = 10000ULL;
+
+    __forceinline uint64_t vm_anti_emu_rdtsc_now()
+    {
+        unsigned int aux = 0;
+        return __rdtscp(&aux);
+    }
+
+    __forceinline void vm_anti_emu_record_handler_entry(vm_state_t& vm)
+    {
+        vm.anti_emu_handler_t0 = vm_anti_emu_rdtsc_now();
+    }
+
+    __forceinline bool vm_anti_emu_validate_rdtsc(vm_state_t& vm)
+    {
+        if (vm.anti_emu_handler_t0 == 0)
+            return true;
+
+        uint64_t now = vm_anti_emu_rdtsc_now();
+        uint64_t delta = now - vm.anti_emu_handler_t0;
+
+        if (delta == 0 || delta < ANTI_EMU_RDTSC_MIN_CYCLES || delta > ANTI_EMU_RDTSC_MAX_CYCLES)
+        {
+            ++vm.anti_emu_window_count;
+            if (vm.anti_emu_window_count >= 4)
+            {
+                vm.anti_emu_corruption_flags |= ANTI_EMU_FLAG_RDTSC;
+                vm.anti_emu_handler_t0 = 0;
+                return false;
+            }
+        }
+        else
+        {
+            vm.anti_emu_avg_window = (vm.anti_emu_avg_window * 7 + delta) >> 3;
+            vm.anti_emu_window_count = 0;
+        }
+
+        vm.anti_emu_handler_t0 = 0;
+        return true;
+    }
+
+    __forceinline bool vm_anti_emu_rdpmc_check(vm_state_t& vm)
+    {
+        uint64_t pmc_value = 0;
+        bool readable = false;
+
+        __try {
+            pmc_value = __readpmc(0x40000000u);
+            readable = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            readable = false;
+        }
+
+        if (!readable)
+        {
+            vm.anti_emu_pmc_failures = 0;
+            vm.anti_emu_last_pmc = 0;
+            return true;
+        }
+
+        if (vm.anti_emu_last_pmc != 0 && pmc_value <= vm.anti_emu_last_pmc)
+        {
+            ++vm.anti_emu_pmc_failures;
+            if (vm.anti_emu_pmc_failures >= 3)
+            {
+                vm.anti_emu_corruption_flags |= ANTI_EMU_FLAG_RDPMC;
+                vm.anti_emu_last_pmc = pmc_value;
+                return false;
+            }
+        }
+        else
+        {
+            vm.anti_emu_pmc_failures = 0;
+        }
+
+        vm.anti_emu_last_pmc = pmc_value;
+        return true;
+    }
+
+    __forceinline bool vm_anti_emu_capability_probe(vm_state_t& vm)
+    {
+        int info[4] = {0};
+        __cpuid(info, 7);
+        bool reports_rdfsbase = (info[1] & (1 << 0)) != 0;
+        bool reports_avx512f  = (info[1] & (1 << 16)) != 0;
+
+        int info1[4] = {0};
+        __cpuid(info1, 1);
+        bool reports_movbe = (info1[2] & (1 << 22)) != 0;
+
+        if (reports_rdfsbase)
+        {
+            bool exec_ok = false;
+            __try {
+                volatile uint64_t fs_base = _readfsbase_u64();
+                (void)fs_base;
+                exec_ok = true;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                exec_ok = false;
+            }
+
+            if (!exec_ok)
+            {
+                vm.anti_emu_corruption_flags |= ANTI_EMU_FLAG_CAPABILITY;
+                return false;
+            }
+        }
+
+        if (reports_movbe)
+        {
+            volatile uint64_t test = 0x0123456789ABCDEFULL;
+            volatile uint64_t swapped = 0;
+            bool exec_ok = false;
+            __try {
+                swapped = _byteswap_uint64(test);
+                exec_ok = (swapped == 0xEFCDAB8967452301ULL);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                exec_ok = false;
+            }
+
+            if (!exec_ok)
+            {
+                vm.anti_emu_corruption_flags |= ANTI_EMU_FLAG_CAPABILITY;
+                return false;
+            }
+        }
+
+        if (reports_avx512f)
+        {
+            bool exec_ok = false;
+            __try {
+                volatile uint32_t v = 0xFEDCBA98u;
+                volatile uint32_t lz = static_cast<uint32_t>(__lzcnt(v));
+                exec_ok = (lz == 0u);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                exec_ok = false;
+            }
+
+            if (!exec_ok)
+            {
+                vm.anti_emu_corruption_flags |= ANTI_EMU_FLAG_CAPABILITY;
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    __forceinline uint16_t vm_anti_emu_read_x87_cw()
+    {
+        uint16_t cw = 0;
+        __try {
+            uint32_t cur = _control87(0, 0);
+            cw = static_cast<uint16_t>(cur & 0xFFFFu);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            cw = 0xFFFFu;
+        }
+        return cw;
+    }
+
+    __forceinline bool vm_anti_emu_fpu_check(vm_state_t& vm)
+    {
+        uint16_t cw = vm_anti_emu_read_x87_cw();
+
+        if (vm.anti_emu_fpu_baseline == 0)
+        {
+            if (cw == 0xFFFFu)
+            {
+                vm.anti_emu_corruption_flags |= ANTI_EMU_FLAG_FPU;
+                return false;
+            }
+            vm.anti_emu_fpu_baseline = cw;
+        }
+        else
+        {
+            if (cw != vm.anti_emu_fpu_baseline)
+            {
+                vm.anti_emu_corruption_flags |= ANTI_EMU_FLAG_FPU;
+                return false;
+            }
+        }
+
+        volatile double a = 1.0;
+        volatile double b = 3.0;
+        volatile double q = a / b;
+        volatile double r = q * b;
+        volatile double residual = (r > a) ? (r - a) : (a - r);
+
+        union { double d; uint64_t u; } pun;
+        pun.d = residual;
+
+        bool real_cpu_native = (pun.u != 0ULL) && (pun.u < 0x3CB0000000000000ULL);
+
+#ifdef _AIDA_FORCE_EMULATOR_RESPONSE
+        real_cpu_native = false;
+#endif
+        if (vm.anti_emu_force_emulator)
+            real_cpu_native = false;
+
+        if (!real_cpu_native)
+        {
+            vm.anti_emu_corruption_flags |= ANTI_EMU_FLAG_FPU;
+            return false;
+        }
+
+        return true;
+    }
+
+    __forceinline bool vm_anti_emu_misalign_check(vm_state_t& vm)
+    {
+        alignas(16) uint8_t buffer[32];
+        for (int i = 0; i < 32; ++i)
+            buffer[i] = static_cast<uint8_t>(i ^ 0x5A);
+
+        volatile uint64_t* misaligned = reinterpret_cast<volatile uint64_t*>(buffer + 1);
+        volatile uint64_t v = 0;
+        bool seh_fired = false;
+
+        __try {
+            v = *misaligned;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            seh_fired = true;
+        }
+
+        if (seh_fired)
+        {
+            vm.anti_emu_corruption_flags |= ANTI_EMU_FLAG_MISALIGN;
+            return false;
+        }
+
+        if (v == 0)
+        {
+            vm.anti_emu_corruption_flags |= ANTI_EMU_FLAG_MISALIGN;
+            return false;
+        }
+
+        vm.anti_emu_misalign_seen = 1;
+        return true;
+    }
+
+    __forceinline bool vm_anti_emu_run_probe(vm_state_t& vm)
+    {
+        bool ok = true;
+
+        uint32_t which = vm.anti_emu_counter & 0x07u;
+        switch (which)
+        {
+        case 0:
+            ok = vm_anti_emu_validate_rdtsc(vm) && ok;
+            break;
+        case 1:
+            ok = vm_anti_emu_rdpmc_check(vm) && ok;
+            break;
+        case 2:
+            ok = vm_anti_emu_capability_probe(vm) && ok;
+            break;
+        case 3:
+            ok = vm_anti_emu_fpu_check(vm) && ok;
+            break;
+        case 4:
+            ok = vm_anti_emu_misalign_check(vm) && ok;
+            break;
+        case 5:
+            ok = vm_anti_emu_validate_rdtsc(vm) && vm_anti_emu_rdpmc_check(vm) && ok;
+            break;
+        case 6:
+            ok = vm_anti_emu_capability_probe(vm) && vm_anti_emu_fpu_check(vm) && ok;
+            break;
+        case 7:
+            ok = vm_anti_emu_validate_rdtsc(vm)
+                 && vm_anti_emu_rdpmc_check(vm)
+                 && vm_anti_emu_fpu_check(vm)
+                 && ok;
+            break;
+        }
+
+        ++vm.anti_emu_counter;
+        return ok;
+    }
+
+    __forceinline void vm_anti_emu_inject_corruption(vm_state_t& vm)
+    {
+        uint64_t poison = 0xDEADBEEFDEADBEEFULL ^ vm.anti_emu_corruption_flags
+            ^ _rotl64(vm.rolling_key, 13);
+        for (int i = 0; i < 16; ++i)
+            vm.regs[i] ^= poison;
+        vm.rolling_key ^= poison;
+        vm.handler_chain_key ^= _rotl64(poison, 17);
+        vm.vflags.ZF = 0;
+        vm.vflags.SF = 1;
+    }
+
+#pragma endregion
 
 
     __forceinline void dispatch_next(vm_state_t& vm, const uint8_t* bc, uint32_t bc_size)
@@ -693,18 +1816,75 @@ namespace detail
 
         encrypt_context(vm);
 
-        if (vm.halted || vm.rip >= bc_size || vm.insn_count >= vm.max_insn)
-            return;
+        if (dag_active(vm))
+        {
+            if (vm.halted || vm.insn_count >= vm.max_insn)
+                return;
 
-        if (g_jit_hook)
+            if (vm.dag_cursor != 0)
+            {
+                if (vm.dag_node == DAG_NODE_HALT || vm.dag_node >= vm.dag_nodes_size)
+                {
+                    return;
+                }
+                const dag_node_t& cur = vm.dag_nodes[vm.dag_node];
+                uint32_t next = (vm.dag_branch_taken && cur.next_node_b != UINT32_MAX)
+                                    ? cur.next_node_b
+                                    : cur.next_node_a;
+                vm.dag_branch_taken = 0;
+                if (next == UINT32_MAX)
+                {
+                    vm.dag_node = DAG_NODE_HALT;
+                    vm.halted = true;
+                    return;
+                }
+
+                uint32_t prev_bc_end = static_cast<uint32_t>(vm.rip);
+                uint32_t new_bc_start = vm.dag_nodes[next].bc_offset;
+                if (new_bc_start > prev_bc_end && new_bc_start <= bc_size)
+                {
+                    for (uint32_t p = prev_bc_end; p < new_bc_start; ++p)
+                        cipher_stream_xcrypt(vm.stream, bc[p], false);
+                }
+                else if (new_bc_start < prev_bc_end)
+                {
+                    uint64_t saved_seed = vm.stream.base_seed;
+                    cipher_stream_init(vm.stream, saved_seed);
+                    for (uint32_t p = 0; p < new_bc_start && p < bc_size; ++p)
+                        cipher_stream_xcrypt(vm.stream, bc[p], false);
+                }
+
+                vm.dag_node = next;
+                vm.dag_cursor = 0;
+                vm.rip = vm.dag_nodes[next].bc_offset;
+            }
+
+            if (vm.dag_node == DAG_NODE_HALT || vm.dag_node >= vm.dag_nodes_size)
+            {
+                vm.halted = true;
+                return;
+            }
+        }
+        else
+        {
+            if (vm.halted || vm.rip >= bc_size || vm.insn_count >= vm.max_insn)
+                return;
+        }
+
+        if (g_jit_hook && !dag_active(vm))
         {
             decrypt_context(vm);
+            uint64_t saved_keys[16];
+            linearize_register_file(vm, saved_keys);
+            uint64_t fresh_xor = secure_seed() ^ vm.context_entropy;
             if (g_jit_hook(vm, bc, bc_size))
             {
+                delinearize_register_file(vm, saved_keys, fresh_xor);
                 encrypt_context(vm);
                 dispatch_next(vm, bc, bc_size);
                 return;
             }
+            delinearize_register_file(vm, saved_keys, fresh_xor);
             encrypt_context(vm);
         }
 
@@ -751,6 +1931,54 @@ namespace detail
 
         decrypt_context(vm);
 
+        if ((vm.insn_count & 0x07u) == 0)
+        {
+            if (!vm_anti_emu_run_probe(vm))
+            {
+                vm_anti_emu_inject_corruption(vm);
+                write_vreg(vm, 0, 0xDEADBEEFDEADBEEFULL);
+                vm.halted = true;
+                return;
+            }
+        }
+
+        if (dag_active(vm))
+        {
+            const dag_node_t& node = vm.dag_nodes[vm.dag_node];
+            uint64_t actual_hash = dag_compute_state_hash(vm, node.handler_chain);
+            if ((actual_hash ^ node.enter_hash) != 0)
+            {
+                vm.dag_violation_code = actual_hash ^ node.enter_hash;
+                write_vreg(vm, 0, 0xDEADBEEFDEADBEEFULL);
+                vm.halted = true;
+                vm.dag_node = DAG_NODE_HALT;
+                return;
+            }
+
+            if (node.bc_offset >= bc_size)
+            {
+                vm.halted = true;
+                vm.dag_node = DAG_NODE_HALT;
+                return;
+            }
+
+            uint8_t raw = bc[node.bc_offset];
+            uint8_t decrypted = decrypt_byte(vm, raw);
+            vm.dag_cursor = 1;
+            vm.rip = static_cast<uint64_t>(node.bc_offset) + 1;
+
+            compute_handler_chain_addr(vm, decrypted);
+            ++vm.insn_count;
+
+            mutate_shuffle_per_op(vm, decrypted, vm.last_op_result);
+
+            vm_anti_emu_record_handler_entry(vm);
+
+            auto handler = resolve_dispatch(vm, decrypted);
+            handler(vm, bc, bc_size);
+            return;
+        }
+
         uint8_t raw = bc[vm.rip];
         uint8_t decrypted = decrypt_byte(vm, raw);
         ++vm.rip;
@@ -758,8 +1986,11 @@ namespace detail
         compute_handler_chain_addr(vm, decrypted);
         ++vm.insn_count;
 
+        mutate_shuffle_per_op(vm, decrypted, vm.last_op_result);
 
-        auto handler = pool.poly_initialized ? select_handler(vm, decrypted) : pool.dispatch_table[decrypted];
+        vm_anti_emu_record_handler_entry(vm);
+
+        auto handler = resolve_dispatch(vm, decrypted);
         handler(vm, bc, bc_size);
     }
 
@@ -779,7 +2010,14 @@ namespace detail
     {
         uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint8_t src = fetch_byte(vm, bc, bc_size) & 0x0F;
-        write_vreg(vm, dst, read_vreg(vm, src));
+        uint64_t val = read_vreg(vm, src);
+        if (dag_active(vm))
+        {
+            uint64_t taint_val = 0;
+            if (dag_taint_load(vm, src, taint_val))
+                val = taint_val;
+        }
+        write_vreg(vm, dst, val);
         dispatch_next(vm, bc, bc_size);
     }
 
@@ -787,7 +2025,10 @@ namespace detail
     {
         uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint8_t src = fetch_byte(vm, bc, bc_size) & 0x0F;
-        write_vreg(vm, dst, read_vreg(vm, src));
+        uint64_t val = read_vreg(vm, src);
+        write_vreg(vm, dst, val);
+        if (dag_active(vm))
+            dag_taint_store(vm, dst, val);
         dispatch_next(vm, bc, bc_size);
     }
 
@@ -798,7 +2039,9 @@ namespace detail
         uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint64_t va = read_vreg(vm, a);
         uint64_t vb = read_vreg(vm, b);
-        uint64_t result = nand_op(va, vb);
+        uint64_t entropy = handler_entropy_bit(vm, 0x11);
+        uint64_t result = mba_nand(va, vb, entropy);
+        result = triton_break_inject(vm, result, 0x11);
         write_vreg(vm, dst, result);
         update_flags_logic(vm, result);
         dispatch_next(vm, bc, bc_size);
@@ -811,7 +2054,9 @@ namespace detail
         uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint64_t va = read_vreg(vm, a);
         uint64_t vb = read_vreg(vm, b);
-        uint64_t result = nor_op(va, vb);
+        uint64_t entropy = handler_entropy_bit(vm, 0x12);
+        uint64_t result = mba_nor(va, vb, entropy);
+        result = triton_break_inject(vm, result, 0x12);
         write_vreg(vm, dst, result);
         update_flags_logic(vm, result);
         dispatch_next(vm, bc, bc_size);
@@ -824,7 +2069,9 @@ namespace detail
         uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint64_t va = read_vreg(vm, a);
         uint64_t vb = read_vreg(vm, b);
-        uint64_t result = micro_xor(va, vb);
+        uint64_t entropy = handler_entropy_bit(vm, 0x13);
+        uint64_t result = mba_xor(va, vb, entropy);
+        result = triton_break_inject(vm, result, 0x13);
         write_vreg(vm, dst, result);
         update_flags_logic(vm, result);
         dispatch_next(vm, bc, bc_size);
@@ -834,7 +2081,11 @@ namespace detail
     {
         uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint8_t src = fetch_byte(vm, bc, bc_size) & 0x0F;
-        write_vreg(vm, dst, nand_op(read_vreg(vm, src), read_vreg(vm, src)));
+        uint64_t va = read_vreg(vm, src);
+        uint64_t entropy = handler_entropy_bit(vm, 0x14);
+        uint64_t result = mba_not(va, entropy);
+        result = triton_break_inject(vm, result, 0x14);
+        write_vreg(vm, dst, result);
         dispatch_next(vm, bc, bc_size);
     }
 
@@ -897,7 +2148,6 @@ namespace detail
     {
         uint64_t saved_key = vm.rolling_key;
         uint32_t target = fetch_u32(vm, bc, bc_size);
-        vm.rip = target;
         uint64_t block_key = saved_key ^ target;
         block_key ^= block_key >> 30;
         block_key *= 0xBF58476D1CE4E5B9ULL;
@@ -905,6 +2155,14 @@ namespace detail
         block_key *= 0x94D049BB133111EBULL;
         block_key ^= block_key >> 31;
         vm.rolling_key = block_key;
+        if (dag_active(vm))
+        {
+            vm.dag_branch_taken = 0;
+        }
+        else
+        {
+            vm.rip = target;
+        }
         dispatch_next(vm, bc, bc_size);
     }
 
@@ -914,7 +2172,6 @@ namespace detail
         uint32_t target = fetch_u32(vm, bc, bc_size);
         if (vm.vflags.ZF)
         {
-            vm.rip = target;
             uint64_t block_key = saved_key ^ target;
             block_key ^= block_key >> 30;
             block_key *= 0xBF58476D1CE4E5B9ULL;
@@ -922,6 +2179,14 @@ namespace detail
             block_key *= 0x94D049BB133111EBULL;
             block_key ^= block_key >> 31;
             vm.rolling_key = block_key;
+            if (dag_active(vm))
+            {
+                vm.dag_branch_taken = 1;
+            }
+            else
+            {
+                vm.rip = target;
+            }
         }
         dispatch_next(vm, bc, bc_size);
     }
@@ -932,7 +2197,6 @@ namespace detail
         uint32_t target = fetch_u32(vm, bc, bc_size);
         if (!vm.vflags.ZF)
         {
-            vm.rip = target;
             uint64_t block_key = saved_key ^ target;
             block_key ^= block_key >> 30;
             block_key *= 0xBF58476D1CE4E5B9ULL;
@@ -940,6 +2204,14 @@ namespace detail
             block_key *= 0x94D049BB133111EBULL;
             block_key ^= block_key >> 31;
             vm.rolling_key = block_key;
+            if (dag_active(vm))
+            {
+                vm.dag_branch_taken = 1;
+            }
+            else
+            {
+                vm.rip = target;
+            }
         }
         dispatch_next(vm, bc, bc_size);
     }
@@ -1040,7 +2312,9 @@ namespace detail
         uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint64_t va = read_vreg(vm, a);
         uint64_t vb = read_vreg(vm, b);
-        uint64_t result = micro_add(va, vb);
+        uint64_t entropy = handler_entropy_bit(vm, 0x21);
+        uint64_t result = mba_add(va, vb, entropy);
+        result = triton_break_inject(vm, result, 0x21);
         write_vreg(vm, dst, result);
         update_flags_add(vm, va, vb, result);
         dispatch_next(vm, bc, bc_size);
@@ -1053,7 +2327,9 @@ namespace detail
         uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint64_t va = read_vreg(vm, a);
         uint64_t vb = read_vreg(vm, b);
-        uint64_t result = micro_sub(va, vb);
+        uint64_t entropy = handler_entropy_bit(vm, 0x22);
+        uint64_t result = mba_sub(va, vb, entropy);
+        result = triton_break_inject(vm, result, 0x22);
         write_vreg(vm, dst, result);
         update_flags_sub(vm, va, vb, result);
         dispatch_next(vm, bc, bc_size);
@@ -1067,10 +2343,10 @@ namespace detail
         uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint64_t va = read_vreg(vm, a);
         uint64_t vb = read_vreg(vm, b);
-        uint64_t r = ~va;
-        r = micro_or(r, ~vb);
-        r = micro_xor(r, micro_and(~va, ~vb));
-        r = nand_op(va, vb);
+        uint64_t entropy = handler_entropy_bit(vm, 0x31);
+        uint64_t and_ab = mba_and(va, vb, entropy);
+        uint64_t r = mba_not(and_ab, entropy ^ 0xC0);
+        r = triton_break_inject(vm, r, 0x31);
         write_vreg(vm, dst, r);
         update_flags_logic(vm, r);
         dispatch_next(vm, bc, bc_size);
@@ -1083,8 +2359,9 @@ namespace detail
         uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint64_t va = read_vreg(vm, a);
         uint64_t vb = read_vreg(vm, b);
-        uint64_t nand_ab = nand_op(va, vb);
-        uint64_t r = nand_op(nand_op(va, nand_ab), nand_op(vb, nand_ab));
+        uint64_t entropy = handler_entropy_bit(vm, 0x32);
+        uint64_t r = metamorphic::mba::keyed_xor_dynamic(va, vb, entropy);
+        r = triton_break_inject(vm, r, 0x32);
         write_vreg(vm, dst, r);
         update_flags_logic(vm, r);
         dispatch_next(vm, bc, bc_size);
@@ -1122,9 +2399,11 @@ namespace detail
         uint64_t va = read_vreg(vm, a);
         uint64_t vb = read_vreg(vm, b);
 
-        uint64_t xor_ab = micro_xor(va, vb);
-        uint64_t and_ab = micro_and(va, vb);
-        uint64_t result = micro_add(xor_ab, micro_add(and_ab, and_ab));
+        uint64_t entropy = handler_entropy_bit(vm, 0x33);
+        uint64_t xor_ab = mba_xor(va, vb, entropy);
+        uint64_t and_ab = mba_and(va, vb, entropy ^ 0x55);
+        uint64_t result = mba_add(xor_ab, (and_ab << 1), entropy ^ 0xAA);
+        result = triton_break_inject(vm, result, 0x33);
         write_vreg(vm, dst, result);
         update_flags_add(vm, va, vb, result);
         dispatch_next(vm, bc, bc_size);
@@ -1138,9 +2417,11 @@ namespace detail
         uint64_t va = read_vreg(vm, a);
         uint64_t vb = read_vreg(vm, b);
 
-        uint64_t neg_b = nand_op(vb, vb);
-        neg_b = micro_add(neg_b, 1);
-        uint64_t result = micro_add(va, neg_b);
+        uint64_t entropy = handler_entropy_bit(vm, 0x34);
+        uint64_t neg_b = mba_not(vb, entropy);
+        neg_b = mba_add(neg_b, 1, entropy ^ 0x66);
+        uint64_t result = metamorphic::mba::keyed_add_dynamic(va, neg_b, entropy);
+        result = triton_break_inject(vm, result, 0x34);
         write_vreg(vm, dst, result);
         update_flags_sub(vm, va, vb, result);
         dispatch_next(vm, bc, bc_size);
@@ -1154,9 +2435,11 @@ namespace detail
         uint64_t va = read_vreg(vm, a);
         uint64_t vb = read_vreg(vm, b);
 
-        uint64_t or_ab  = micro_or(va, vb);
-        uint64_t and_ab = micro_and(va, vb);
-        uint64_t result = micro_sub(or_ab, and_ab);
+        uint64_t entropy = handler_entropy_bit(vm, 0x35);
+        uint64_t or_ab  = mba_or(va, vb, entropy);
+        uint64_t and_ab = mba_and(va, vb, entropy ^ 0x77);
+        uint64_t result = mba_sub(or_ab, and_ab, entropy ^ 0x88);
+        result = triton_break_inject(vm, result, 0x35);
         write_vreg(vm, dst, result);
         update_flags_logic(vm, result);
         dispatch_next(vm, bc, bc_size);
@@ -1170,9 +2453,11 @@ namespace detail
         uint64_t va = read_vreg(vm, a);
         uint64_t vb = read_vreg(vm, b);
 
-        uint64_t na = nand_op(va, va);
-        uint64_t nb = nand_op(vb, vb);
-        uint64_t result = micro_or(na, nb);
+        uint64_t entropy = handler_entropy_bit(vm, 0x36);
+        uint64_t na = mba_not(va, entropy);
+        uint64_t nb = mba_not(vb, entropy ^ 0x99);
+        uint64_t result = mba_or(na, nb, entropy ^ 0xBB);
+        result = triton_break_inject(vm, result, 0x36);
         write_vreg(vm, dst, result);
         update_flags_logic(vm, result);
         dispatch_next(vm, bc, bc_size);
@@ -1285,7 +2570,9 @@ namespace detail
         uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint8_t src = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint64_t va = read_vreg(vm, src);
-        uint64_t result = nand_op(va, va);
+        uint64_t entropy = handler_entropy_bit(vm, 0x37);
+        uint64_t result = mba_not(va, entropy);
+        result = triton_break_inject(vm, result, 0x37);
         write_vreg(vm, dst, result);
         update_flags_logic(vm, result);
         dispatch_next(vm, bc, bc_size);
@@ -1296,7 +2583,9 @@ namespace detail
         uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint8_t src = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint64_t va = read_vreg(vm, src);
-        uint64_t result = micro_xor(va, 0xFFFFFFFFFFFFFFFFULL);
+        uint64_t entropy = handler_entropy_bit(vm, 0x38);
+        uint64_t result = mba_xor(va, 0xFFFFFFFFFFFFFFFFULL, entropy);
+        result = triton_break_inject(vm, result, 0x38);
         write_vreg(vm, dst, result);
         update_flags_logic(vm, result);
         dispatch_next(vm, bc, bc_size);
@@ -1344,7 +2633,10 @@ namespace detail
         uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint64_t va = read_vreg(vm, a);
         uint64_t vb = read_vreg(vm, b);
-        uint64_t result = micro_sub(va, micro_sub(0, vb));
+        uint64_t entropy = handler_entropy_bit(vm, 0x39);
+        uint64_t neg_vb = mba_sub(0, vb, entropy);
+        uint64_t result = mba_sub(va, neg_vb, entropy ^ 0x44);
+        result = triton_break_inject(vm, result, 0x39);
         write_vreg(vm, dst, result);
         update_flags_add(vm, va, vb, result);
         dispatch_next(vm, bc, bc_size);
@@ -1357,12 +2649,13 @@ namespace detail
         uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint64_t va = read_vreg(vm, a);
         uint64_t vb = read_vreg(vm, b);
-        uint64_t not_b = nand_op(vb, vb);
-        uint64_t one = micro_and(1ULL, 1ULL);
-        uint64_t neg_b = micro_add(not_b, one);
-        uint64_t xor_ab = micro_xor(va, neg_b);
-        uint64_t and_ab = micro_and(va, neg_b);
-        uint64_t result = micro_add(xor_ab, micro_add(and_ab, and_ab));
+        uint64_t entropy = handler_entropy_bit(vm, 0x3A);
+        uint64_t not_b = mba_not(vb, entropy);
+        uint64_t neg_b = mba_add(not_b, 1, entropy ^ 0x55);
+        uint64_t xor_ab = mba_xor(va, neg_b, entropy ^ 0x66);
+        uint64_t and_ab = mba_and(va, neg_b, entropy ^ 0x77);
+        uint64_t result = mba_add(xor_ab, (and_ab << 1), entropy ^ 0x88);
+        result = triton_break_inject(vm, result, 0x3A);
         write_vreg(vm, dst, result);
         update_flags_sub(vm, va, vb, result);
         dispatch_next(vm, bc, bc_size);
@@ -1389,9 +2682,11 @@ namespace detail
         uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint64_t va = read_vreg(vm, a);
         uint64_t vb = read_vreg(vm, b);
-        uint64_t not_a = nand_op(va, va);
-        uint64_t not_b = nand_op(vb, vb);
-        uint64_t result = micro_and(not_a, not_b);
+        uint64_t entropy = handler_entropy_bit(vm, 0x3B);
+        uint64_t not_a = mba_not(va, entropy);
+        uint64_t not_b = mba_not(vb, entropy ^ 0x99);
+        uint64_t result = metamorphic::mba::keyed_and_dynamic(not_a, not_b, entropy);
+        result = triton_break_inject(vm, result, 0x3B);
         write_vreg(vm, dst, result);
         update_flags_logic(vm, result);
         dispatch_next(vm, bc, bc_size);
@@ -1506,10 +2801,19 @@ namespace detail
         uint32_t target = fetch_u32(vm, bc, bc_size);
         if (vm.rsp < 8) { vm.halted = true; return; }
         vm.rsp -= 8;
-        uint64_t ret_addr = vm.rip;
-        memcpy(vm.stack + vm.rsp, &ret_addr, 8);
         uint64_t saved_key = vm.rolling_key;
-        vm.rip = target;
+        if (dag_active(vm))
+        {
+            uint64_t ret_marker = static_cast<uint64_t>(vm.dag_node);
+            memcpy(vm.stack + vm.rsp, &ret_marker, 8);
+            vm.dag_branch_taken = 0;
+        }
+        else
+        {
+            uint64_t ret_addr = vm.rip;
+            memcpy(vm.stack + vm.rsp, &ret_addr, 8);
+            vm.rip = target;
+        }
         uint64_t block_key = saved_key ^ target;
         block_key ^= block_key >> 30;
         block_key *= 0xBF58476D1CE4E5B9ULL;
@@ -1523,10 +2827,41 @@ namespace detail
     VM_HANDLER(h_vret)
     {
         if (vm.rsp + 8 > vm.stack_size) { vm.halted = true; return; }
-        uint64_t ret_addr;
-        memcpy(&ret_addr, vm.stack + vm.rsp, 8);
+        uint64_t ret_marker;
+        memcpy(&ret_marker, vm.stack + vm.rsp, 8);
         vm.rsp += 8;
-        vm.rip = static_cast<uint32_t>(ret_addr);
+        if (dag_active(vm))
+        {
+            uint32_t ret_node = static_cast<uint32_t>(ret_marker);
+            uint32_t fall_through_node = ret_node + 1;
+            if (fall_through_node >= vm.dag_nodes_size)
+            {
+                vm.halted = true;
+                vm.dag_node = DAG_NODE_HALT;
+                return;
+            }
+            uint32_t target_offset = vm.dag_nodes[fall_through_node].bc_offset;
+            uint32_t cur_pos = static_cast<uint32_t>(vm.rip);
+            if (target_offset > cur_pos && target_offset <= bc_size)
+            {
+                for (uint32_t p = cur_pos; p < target_offset; ++p)
+                    cipher_stream_xcrypt(vm.stream, bc[p], false);
+            }
+            else if (target_offset < cur_pos)
+            {
+                uint64_t saved_seed = vm.stream.base_seed;
+                cipher_stream_init(vm.stream, saved_seed);
+                for (uint32_t p = 0; p < target_offset && p < bc_size; ++p)
+                    cipher_stream_xcrypt(vm.stream, bc[p], false);
+            }
+            vm.dag_node = fall_through_node;
+            vm.dag_cursor = 0;
+            vm.dag_branch_taken = 0;
+            vm.rip = target_offset;
+            dispatch_next(vm, bc, bc_size);
+            return;
+        }
+        vm.rip = static_cast<uint32_t>(ret_marker);
         dispatch_next(vm, bc, bc_size);
     }
 
@@ -1536,7 +2871,6 @@ namespace detail
         uint32_t target = fetch_u32(vm, bc, bc_size);
         if (cond)
         {
-            vm.rip = target;
             uint64_t block_key = saved_key ^ target;
             block_key ^= block_key >> 30;
             block_key *= 0xBF58476D1CE4E5B9ULL;
@@ -1544,6 +2878,14 @@ namespace detail
             block_key *= 0x94D049BB133111EBULL;
             block_key ^= block_key >> 31;
             vm.rolling_key = block_key;
+            if (dag_active(vm))
+            {
+                vm.dag_branch_taken = 1;
+            }
+            else
+            {
+                vm.rip = target;
+            }
         }
         dispatch_next(vm, bc, bc_size);
     }
@@ -1771,18 +3113,163 @@ namespace detail
         build_poly_table(g_default_pool);
     }
 
-    __forceinline handler_fn select_handler(vm_state_t& vm, uint8_t opcode)
+    __forceinline uint64_t internal_opaque_zero(uint64_t noise)
+    {
+        uint64_t h = noise;
+        h ^= h >> 33;
+        h *= 0xFF51AFD7ED558CCDULL;
+        h ^= h >> 33;
+        h *= 0xC4CEB9FE1A85EC53ULL;
+        h ^= h >> 33;
+        return h ^ h;
+    }
+
+    inline void build_handler_set(handler_pool_t& pool)
+    {
+        if (!pool.poly_initialized)
+            build_poly_table(pool);
+
+        const uint8_t* rt_seed = runtime_master_seed();
+
+        uint8_t hk_input[52];
+        memset(hk_input, 0, sizeof(hk_input));
+        memcpy(hk_input, &pool.pool_seed, 8);
+        memcpy(hk_input + 8, &pool.generation, 4);
+        uint64_t pool_addr = reinterpret_cast<uint64_t>(&pool);
+        memcpy(hk_input + 12, &pool_addr, 8);
+        memcpy(hk_input + 20, rt_seed, 32);
+
+        uint8_t prk[32];
+        hmac_sha256(rt_seed, 32, hk_input, 52, prk);
+
+        memcpy(pool.handler_set.dispatch_hmac_key, prk, 32);
+
+        static const uint8_t info_hs[12] = {
+            'a','i','d','a','_','h','s','e','t','_','v','1'
+        };
+        uint8_t okm[2048];
+        hkdf_expand_sha256(prk, info_hs, 12, okm, 2048);
+
+        for (int op = 0; op < 256; ++op)
+        {
+            auto& entry = pool.poly_table[op];
+            uint8_t cnt = entry.count;
+            if (cnt == 0)
+            {
+                pool.handler_set.variant_count[op] = 0;
+                pool.handler_set.variant_order[op][0] = 0;
+                pool.handler_set.variant_order[op][1] = 0;
+                pool.handler_set.variant_order[op][2] = 0;
+                pool.handler_set.variant_order[op][3] = 0;
+                continue;
+            }
+            if (cnt > 4) cnt = 4;
+            pool.handler_set.variant_count[op] = cnt;
+
+            uint8_t order[4] = { 0, 1, 2, 3 };
+            uint32_t base = static_cast<uint32_t>(op) * 4;
+            for (int i = static_cast<int>(cnt) - 1; i > 0; --i)
+            {
+                uint32_t r = okm[base + i];
+                int j = static_cast<int>(r % static_cast<uint32_t>(i + 1));
+                uint8_t tmp = order[i];
+                order[i] = order[j];
+                order[j] = tmp;
+            }
+            pool.handler_set.variant_order[op][0] = order[0];
+            pool.handler_set.variant_order[op][1] = order[1];
+            pool.handler_set.variant_order[op][2] = order[2];
+            pool.handler_set.variant_order[op][3] = order[3];
+
+            uint64_t mask;
+            uint32_t mb = 1024 + static_cast<uint32_t>(op) * 4;
+            uint32_t mask_lo;
+            memcpy(&mask_lo, okm + mb, 4);
+            uint32_t mask_hi;
+            memcpy(&mask_hi, okm + mb + 4, 4);
+            mask = static_cast<uint64_t>(mask_lo) | (static_cast<uint64_t>(mask_hi) << 32);
+            pool.handler_set.dispatch_xor_table[op] = mask;
+        }
+
+        for (int i = 0; i < 64; ++i)
+        {
+            uint64_t v;
+            memcpy(&v, okm + 1536 + i * 8, 8);
+            pool.handler_set.uf_table[i] = v;
+        }
+
+        pool.handler_set.crc_accumulator = 0xCAFEBABEu ^
+            static_cast<uint32_t>(pool.pool_seed) ^
+            static_cast<uint32_t>(pool.pool_seed >> 32) ^
+            pool.generation;
+
+        pool.handler_set.set_generation = pool.generation;
+        pool.handler_set.initialized = true;
+
+        SecureZeroMemory(prk, 32);
+        SecureZeroMemory(okm, 2048);
+        SecureZeroMemory(hk_input, 52);
+    }
+
+    __forceinline handler_fn resolve_dispatch(vm_state_t& vm, uint8_t opcode)
     {
         handler_pool_t& pool = vm.pool ? *vm.pool : g_default_pool;
-        if (!pool.poly_initialized || !verify_environment(vm))
+
+        if (!pool.handler_set.initialized || pool.handler_set.set_generation != pool.generation)
+            build_handler_set(pool);
+
+        uint64_t hkey = pool.handler_set.dispatch_hmac_key[0]
+                      ^ pool.handler_set.dispatch_hmac_key[1]
+                      ^ pool.handler_set.dispatch_hmac_key[2]
+                      ^ pool.handler_set.dispatch_hmac_key[3];
+
+        uint64_t mac_in = static_cast<uint64_t>(opcode) * 0x9E3779B97F4A7C15ULL;
+        mac_in ^= vm.rolling_key * 0xBF58476D1CE4E5B9ULL;
+        mac_in ^= vm.context_entropy * 0x94D049BB133111EBULL;
+        mac_in ^= hkey;
+        mac_in ^= pool.handler_set.dispatch_xor_table[opcode];
+
+        mac_in ^= mac_in >> 33;
+        mac_in *= 0xFF51AFD7ED558CCDULL;
+        mac_in ^= mac_in >> 33;
+        mac_in *= 0xC4CEB9FE1A85EC53ULL;
+        mac_in ^= mac_in >> 33;
+
+        if (!verify_environment(vm))
             return pool.dispatch_table[opcode];
 
-        auto& entry = pool.poly_table[opcode];
-        if (entry.count <= 1)
-            return entry.variants[0];
+        uint8_t variant_count = pool.handler_set.variant_count[opcode];
+        if (variant_count == 0 || !pool.poly_initialized)
+            return pool.dispatch_table[opcode];
 
-        uint64_t sel = vm.rolling_key ^ vm.context_entropy ^ secure_seed();
-        return entry.variants[sel % entry.count];
+        uint8_t safe_count = (variant_count > 4) ? 4 : variant_count;
+        uint8_t pick = static_cast<uint8_t>(mac_in % safe_count);
+        uint8_t order_idx = pool.handler_set.variant_order[opcode][pick];
+
+        auto& entry = pool.poly_table[opcode];
+        if (order_idx >= entry.count) order_idx = 0;
+
+        handler_fn target = entry.variants[order_idx];
+
+        uint64_t z = internal_opaque_zero(mac_in ^ hkey);
+        uintptr_t obfuscated = reinterpret_cast<uintptr_t>(target);
+        obfuscated ^= static_cast<uintptr_t>(z);
+
+        uint8_t lookup_key = static_cast<uint8_t>((mac_in >> 8) & 0x3F);
+        uint64_t uf_val = pool.handler_set.uf_table[lookup_key];
+        uint64_t uf_zero = uf_val ^ uf_val;
+        obfuscated ^= static_cast<uintptr_t>(uf_zero);
+
+        pool.handler_set.crc_accumulator =
+            _mm_crc32_u32(pool.handler_set.crc_accumulator, opcode) ^
+            (static_cast<uint32_t>(mac_in) & 0x00FFFFFFu);
+
+        return reinterpret_cast<handler_fn>(obfuscated);
+    }
+
+    __forceinline handler_fn select_handler(vm_state_t& vm, uint8_t opcode)
+    {
+        return resolve_dispatch(vm, opcode);
     }
 
 #undef VM_HANDLER
@@ -1958,6 +3445,7 @@ namespace detail
         vm.handler_chain_key = seed ^ 0xBB67AE8584CAA73BULL;
         vm.context_entropy = secure_seed() ^ seed;
         vm.shuffle_counter = 0;
+        cipher_stream_init(vm.stream, vm.rolling_key);
 
 
         vm.continuation.next_handler = 0;
@@ -1971,8 +3459,25 @@ namespace detail
         {
             vm.reg_shuffle[i] = static_cast<uint8_t>(i);
             vm.reg_unshuffle[i] = static_cast<uint8_t>(i);
+            vm.reg_keys[i] = 0;
+            vm.fake_regs[i] = 0;
+            vm.fake_shuffle[i] = static_cast<uint8_t>(i);
         }
         vm.reg_xor_key = 0;
+        vm.fake_decoy_key = 0;
+        vm.last_op_result = 0;
+        vm.per_op_shuffle_counter = 0;
+
+        vm.anti_emu_counter = 0;
+        vm.anti_emu_corruption_flags = 0;
+        vm.anti_emu_last_pmc = 0;
+        vm.anti_emu_pmc_failures = 0;
+        vm.anti_emu_fpu_baseline = 0;
+        vm.anti_emu_misalign_seen = 0;
+        vm.anti_emu_force_emulator = 0;
+        vm.anti_emu_handler_t0 = 0;
+        vm.anti_emu_avg_window = 0;
+        vm.anti_emu_window_count = 0;
 
         vm.pool = pool ? pool : &g_default_pool;
 
@@ -1983,6 +3488,9 @@ namespace detail
 
         if (!vm.pool->poly_initialized)
             build_poly_table(*vm.pool);
+
+        vm.pool->handler_set.initialized = false;
+        build_handler_set(*vm.pool);
 
         bind_to_environment(vm);
         shuffle_registers(vm);
@@ -2007,19 +3515,57 @@ namespace detail
         for (int i = 0; i < 256; ++i) vr[i] = 0;
         volatile uint8_t* vs = reinterpret_cast<volatile uint8_t*>(vm.reg_shuffle);
         for (int i = 0; i < 16; ++i) vs[i] = 0;
+        volatile uint64_t* vk = reinterpret_cast<volatile uint64_t*>(vm.reg_keys);
+        for (int i = 0; i < 16; ++i) vk[i] = 0;
+        volatile uint64_t* vfr = reinterpret_cast<volatile uint64_t*>(vm.fake_regs);
+        for (int i = 0; i < 16; ++i) vfr[i] = 0;
+        volatile uint8_t* vfs = reinterpret_cast<volatile uint8_t*>(vm.fake_shuffle);
+        for (int i = 0; i < 16; ++i) vfs[i] = 0;
         vm.reg_xor_key = 0;
         vm.handler_chain_key = 0;
+        vm.fake_decoy_key = 0;
+        vm.last_op_result = 0;
+        vm.anti_emu_corruption_flags = 0;
+        vm.anti_emu_last_pmc = 0;
+        vm.anti_emu_handler_t0 = 0;
+        vm.dag_nodes = nullptr;
+        vm.dag_nodes_size = 0;
+        vm.dag_node = 0;
+        vm.dag_cursor = 0;
+        vm.dag_branch_taken = 0;
+        vm.dag_violation_code = 0;
+        vm.dag_master_key = 0;
+        vm.taint_ring = nullptr;
+        vm.taint_ring_size = 0;
+        vm.taint_seq = 0;
     }
 
     inline uint64_t vm_execute(vm_state_t& vm, const uint8_t* bytecode, uint32_t bc_size)
     {
-        vm.rip = 0;
+        if (dag_active(vm))
+        {
+            vm.dag_node = 0;
+            vm.dag_cursor = 0;
+            vm.dag_branch_taken = 0;
+            vm.dag_violation_code = 0;
+            vm.rip = vm.dag_nodes[0].bc_offset;
+        }
+        else
+        {
+            vm.rip = 0;
+        }
         vm.halted = false;
         vm.insn_count = 0;
         vm.ctx_crypt.encrypted = false;
         vm.ctx_crypt.reg_mask = 0;
         vm.ctx_crypt.flags_mask = 0;
         vm.ctx_crypt.rsp_mask = 0;
+
+        vm.anti_emu_counter = 0;
+        vm.anti_emu_corruption_flags = 0;
+        vm.anti_emu_handler_t0 = 0;
+        vm.anti_emu_window_count = 0;
+        vm.last_op_result = 0;
 
 
         dispatch_next(vm, bytecode, bc_size);
@@ -2028,6 +3574,14 @@ namespace detail
         decrypt_context(vm);
 
         return read_vreg(vm, 0);
+    }
+
+    inline uint64_t vm_execute_program(vm_state_t& vm, const vm_program_t& program)
+    {
+        vm.dag_nodes = program.dag.empty() ? nullptr : program.dag.data();
+        vm.dag_nodes_size = static_cast<uint32_t>(program.dag.size());
+        vm.dag_master_key = program.dag_master_key;
+        return vm_execute(vm, program.bc.data(), static_cast<uint32_t>(program.bc.size()));
     }
 
     inline uint64_t vm_execute_with_rva(vm_state_t& vm,
@@ -2064,6 +3618,7 @@ namespace detail
         local_pool.pool_seed = pool_seed;
         build_handler_pool(local_pool, local_pool.reverse_map, pool_seed ^ 0x428A2F98D728AE22ULL);
         build_poly_table(local_pool);
+        build_handler_set(local_pool);
         vm.pool = &local_pool;
 
         uint64_t result = vm_execute(vm, bytecode, bc_size);
@@ -2083,15 +3638,262 @@ namespace detail
 
     inline void encrypt_bytecode(std::vector<uint8_t>& bc, uint64_t initial_key)
     {
-        uint64_t key = initial_key ^ 0x6A09E667F3BCC908ULL;
+        cipher_stream_t s;
+        cipher_stream_init(s, initial_key ^ 0x6A09E667F3BCC908ULL);
         for (size_t i = 0; i < bc.size(); ++i)
+            bc[i] = cipher_stream_xcrypt(s, bc[i], true);
+        SecureZeroMemory(&s, sizeof(s));
+    }
+
+    inline uint32_t dag_operand_size_for_op(uint8_t raw_op)
+    {
+        switch (raw_op)
         {
-            uint8_t key_byte = static_cast<uint8_t>(key & 0xFF);
-            bc[i] ^= key_byte;
-            key ^= key << 13;
-            key ^= key >> 7;
-            key ^= key << 17;
+        case OP_NOP:        return 0;
+        case OP_LOAD_IMM:   return 1 + 8;
+        case OP_LOAD_REG:   return 2;
+        case OP_STORE_REG:  return 2;
+        case OP_NAND:       return 3;
+        case OP_NOR:        return 3;
+        case OP_XOR:        return 3;
+        case OP_SHL:        return 3;
+        case OP_SHR:        return 3;
+        case OP_NOT:        return 2;
+        case OP_CMP:        return 2;
+        case OP_JMP:        return 4;
+        case OP_JZ:         return 4;
+        case OP_JNZ:        return 4;
+        case OP_PUSH:       return 1;
+        case OP_POP:        return 1;
+        case OP_HASH:       return 2;
+        case OP_RDTSC:      return 1;
+        case OP_SIPHASH:    return 2;
+        case OP_HALT:       return 0;
+        case OP_TRAP:       return 0;
+        case OP_VERIFY:     return 1 + 8;
+        case OP_ROL:        return 3;
+        case OP_ROR:        return 3;
+        case OP_LOAD_MEM:   return 2;
+        case OP_STORE_MEM:  return 2;
+        case OP_ADD:        return 3;
+        case OP_SUB:        return 3;
+        case OP_VM_ENTER:   return 8;
+        case OP_VM_EXIT:    return 0;
+        case OP_LOAD_IMM8:  return 2;
+        case OP_LOAD_IMM16: return 3;
+        case OP_LOAD_IMM32: return 5;
+        case OP_MUL:        return 2;
+        case OP_IMUL:       return 2;
+        case OP_DIV:        return 2;
+        case OP_IDIV:       return 2;
+        case OP_CMOV:       return 2;
+        case OP_SETCC:      return 1;
+        case OP_VCALL:      return 4;
+        case OP_VRET:       return 0;
+        case OP_JL:         return 4;
+        case OP_JLE:        return 4;
+        case OP_JG:         return 4;
+        case OP_JGE:        return 4;
+        case OP_JB:         return 4;
+        case OP_JBE:        return 4;
+        case OP_JS:         return 4;
+        case OP_JO:         return 4;
+        case OP_LAHF:       return 1;
+        case OP_SAHF:       return 1;
+        case OP_JNB:        return 4;
+        case OP_JNBE:       return 4;
+        case OP_VM_SPAWN:   return 1 + 4 + 4 + 1;
+        default:            return 0;
         }
+    }
+
+    inline bool dag_op_is_unconditional_branch(uint8_t raw_op)
+    {
+        return raw_op == OP_JMP;
+    }
+
+    inline bool dag_op_is_conditional_branch(uint8_t raw_op)
+    {
+        switch (raw_op)
+        {
+        case OP_JZ: case OP_JNZ: case OP_JL: case OP_JLE:
+        case OP_JG: case OP_JGE: case OP_JB: case OP_JBE:
+        case OP_JS: case OP_JO: case OP_JNB: case OP_JNBE:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    inline bool dag_op_is_terminator(uint8_t raw_op)
+    {
+        return raw_op == OP_HALT || raw_op == OP_TRAP || raw_op == OP_VM_EXIT;
+    }
+
+    inline bool dag_op_is_call(uint8_t raw_op)
+    {
+        return raw_op == OP_VCALL;
+    }
+
+    inline bool dag_op_is_return(uint8_t raw_op)
+    {
+        return raw_op == OP_VRET;
+    }
+
+    inline uint32_t dag_decrypt_target_u32(const uint8_t* bc, uint32_t bc_size,
+                                           uint32_t bc_offset, cipher_stream_t stream_copy)
+    {
+        if (bc_offset + 4 > bc_size) return 0;
+        uint8_t buf[4];
+        for (int i = 0; i < 4; ++i)
+            buf[i] = cipher_stream_xcrypt(stream_copy, bc[bc_offset + i], false);
+        uint32_t target = 0;
+        memcpy(&target, buf, 4);
+        return target;
+    }
+
+    inline std::vector<dag_node_t> build_dag_from_bytecode(const std::vector<uint8_t>& bc,
+                                                           const uint8_t opcode_map[256],
+                                                           const uint8_t reverse_map[256],
+                                                           uint64_t initial_rolling_key,
+                                                           uint64_t initial_handler_chain_key,
+                                                           uint64_t dag_master_key)
+    {
+        (void)opcode_map;
+        std::vector<dag_node_t> nodes;
+        if (bc.empty()) return nodes;
+
+        cipher_stream_t stream{};
+        cipher_stream_init(stream, initial_rolling_key);
+
+        struct pending_node_t
+        {
+            uint32_t bc_offset;
+            uint32_t bc_length;
+            uint64_t enter_hash;
+            uint64_t handler_chain;
+            uint8_t  raw_op;
+            uint32_t target_offset;
+            bool     is_branch;
+            bool     is_unconditional;
+            bool     is_terminator;
+            bool     is_call;
+            bool     is_return;
+        };
+
+        std::vector<pending_node_t> pending;
+        uint32_t bc_size = static_cast<uint32_t>(bc.size());
+        uint32_t pos = 0;
+        uint32_t node_index = 0;
+
+        while (pos < bc_size)
+        {
+            pending_node_t node{};
+            node.bc_offset = pos;
+
+            uint64_t encrypted_byte_seed = static_cast<uint64_t>(bc[pos])
+                ^ (static_cast<uint64_t>(pos) * 0xC6BC279692B5C323ULL);
+            uint64_t entry_handler_chain = (dag_master_key * 0x517CC1B727220A95ULL)
+                                          ^ (static_cast<uint64_t>(node_index) * 0x9E3779B97F4A7C15ULL)
+                                          ^ encrypted_byte_seed;
+            node.handler_chain = entry_handler_chain;
+            node.enter_hash = dag_state_hash(dag_master_key,
+                                             static_cast<uint64_t>(node_index),
+                                             entry_handler_chain);
+
+            uint8_t encrypted_op = bc[pos];
+            uint8_t mapped_op = cipher_stream_xcrypt(stream, encrypted_op, false);
+            uint8_t raw_op = reverse_map[mapped_op];
+            node.raw_op = raw_op;
+            ++pos;
+            ++node_index;
+
+            uint32_t op_size = dag_operand_size_for_op(raw_op);
+
+            if (raw_op == OP_JMP || raw_op == OP_JZ || raw_op == OP_JNZ
+                || raw_op == OP_JL || raw_op == OP_JLE || raw_op == OP_JG
+                || raw_op == OP_JGE || raw_op == OP_JB || raw_op == OP_JBE
+                || raw_op == OP_JS || raw_op == OP_JO || raw_op == OP_JNB
+                || raw_op == OP_JNBE || raw_op == OP_VCALL)
+            {
+                cipher_stream_t target_stream = stream;
+                node.target_offset = dag_decrypt_target_u32(bc.data(), bc_size, pos, target_stream);
+            }
+            else
+            {
+                node.target_offset = 0xFFFFFFFFu;
+            }
+
+            for (uint32_t i = 0; i < op_size && pos < bc_size; ++i)
+            {
+                uint8_t enc = bc[pos];
+                cipher_stream_xcrypt(stream, enc, false);
+                ++pos;
+            }
+
+            node.bc_length = pos - node.bc_offset;
+            node.is_branch = dag_op_is_conditional_branch(raw_op) || dag_op_is_unconditional_branch(raw_op);
+            node.is_unconditional = dag_op_is_unconditional_branch(raw_op);
+            node.is_terminator = dag_op_is_terminator(raw_op);
+            node.is_call = dag_op_is_call(raw_op);
+            node.is_return = dag_op_is_return(raw_op);
+
+            pending.push_back(node);
+        }
+
+        std::unordered_map<uint32_t, uint32_t> offset_to_index;
+        for (uint32_t i = 0; i < static_cast<uint32_t>(pending.size()); ++i)
+            offset_to_index[pending[i].bc_offset] = i;
+
+        nodes.resize(pending.size());
+        for (uint32_t i = 0; i < pending.size(); ++i)
+        {
+            const pending_node_t& p = pending[i];
+            dag_node_t& out = nodes[i];
+            out.bc_offset = p.bc_offset;
+            out.bc_length = p.bc_length;
+            out.enter_hash = p.enter_hash;
+            out.handler_chain = p.handler_chain;
+
+            if (p.is_terminator)
+            {
+                out.next_node_a = UINT32_MAX;
+                out.next_node_b = UINT32_MAX;
+            }
+            else if (p.is_return)
+            {
+                out.next_node_a = (i + 1 < pending.size()) ? (i + 1) : UINT32_MAX;
+                out.next_node_b = UINT32_MAX;
+            }
+            else if (p.is_unconditional)
+            {
+                auto it = offset_to_index.find(p.target_offset);
+                out.next_node_a = (it != offset_to_index.end()) ? it->second : UINT32_MAX;
+                out.next_node_b = UINT32_MAX;
+            }
+            else if (p.is_branch)
+            {
+                uint32_t fall_through = (i + 1 < pending.size()) ? (i + 1) : UINT32_MAX;
+                auto it = offset_to_index.find(p.target_offset);
+                uint32_t taken = (it != offset_to_index.end()) ? it->second : UINT32_MAX;
+                out.next_node_a = fall_through;
+                out.next_node_b = taken;
+            }
+            else if (p.is_call)
+            {
+                auto it = offset_to_index.find(p.target_offset);
+                out.next_node_a = (it != offset_to_index.end()) ? it->second : UINT32_MAX;
+                out.next_node_b = UINT32_MAX;
+            }
+            else
+            {
+                out.next_node_a = (i + 1 < pending.size()) ? (i + 1) : UINT32_MAX;
+                out.next_node_b = UINT32_MAX;
+            }
+        }
+
+        SecureZeroMemory(&stream, sizeof(stream));
+        return nodes;
     }
 
 }
@@ -2202,13 +4004,20 @@ namespace integrity_vm
         auto& c = get_checker();
         if (!c.initialized) return 0;
 
-        memset(c.vm.regs, 0, sizeof(c.vm.regs));
+        for (int i = 0; i < 16; ++i)
+            detail::write_vreg(c.vm, static_cast<uint8_t>(i), 0ULL);
         c.vm.rsp = c.vm.stack_size;
         c.vm.rip = 0;
         memset(&c.vm.vflags, 0, sizeof(detail::vflags_t));
         c.vm.halted = false;
         c.vm.insn_count = 0;
+        c.vm.last_op_result = 0;
+        c.vm.anti_emu_counter = 0;
+        c.vm.anti_emu_corruption_flags = 0;
+        c.vm.anti_emu_handler_t0 = 0;
+        c.vm.anti_emu_window_count = 0;
         c.vm.rolling_key = c.encryption_seed ^ 0x6A09E667F3BCC908ULL;
+        detail::cipher_stream_init(c.vm.stream, c.vm.rolling_key);
 
         return detail::vm_execute(c.vm, c.bytecode.data(),
             static_cast<uint32_t>(c.bytecode.size()));
@@ -2341,6 +4150,7 @@ inline void reseed_from_server(uint64_t server_nonce)
         c.vm.rolling_key = c.encryption_seed ^ 0x6A09E667F3BCC908ULL;
         c.vm.handler_chain_key = c.encryption_seed ^ 0xBB67AE8584CAA73BULL;
         c.vm.context_entropy = key_schedule ^ derived[0];
+        detail::cipher_stream_init(c.vm.stream, c.vm.rolling_key);
 
         detail::generate_opcode_map(c.encryption_seed, c.vm.opcode_map, c.vm.reverse_map);
         detail::build_handler_pool(c.vm.reverse_map,
@@ -2351,6 +4161,9 @@ inline void reseed_from_server(uint64_t server_nonce)
             detail::g_poly_initialized = false;
             detail::build_poly_table();
         }
+
+        detail::g_default_pool.handler_set.initialized = false;
+        detail::build_handler_set(detail::g_default_pool);
 
         detail::shuffle_registers(c.vm);
     }
@@ -2421,6 +4234,7 @@ namespace pool_manager {
 
         detail::build_handler_pool(*raw, raw->reverse_map, pool_seed ^ 0x428A2F98D728AE22ULL);
         detail::build_poly_table(*raw);
+        detail::build_handler_set(*raw);
 
         SecureZeroMemory(master32, 32);
 
@@ -2442,6 +4256,216 @@ namespace pool_manager {
         }
         index().clear();
         owner().clear();
+    }
+
+}
+
+
+namespace homomorphic_pool_t {
+
+    struct entry_t
+    {
+        uint64_t encrypted_imm;
+        uint8_t  domain_tag[16];
+        uint64_t reg_state_anchor;
+        uint64_t rolling_anchor;
+        uint32_t handler_chain_seed;
+    };
+
+    struct pool_t
+    {
+        std::vector<entry_t> entries;
+        uint8_t              function_key[32];
+        uint64_t             function_rva;
+        uint64_t             pool_seed;
+        bool                 active;
+    };
+
+    inline std::mutex& mtx()
+    {
+        static std::mutex m;
+        return m;
+    }
+
+    inline std::unordered_map<uint64_t, std::unique_ptr<pool_t>>& registry()
+    {
+        static std::unordered_map<uint64_t, std::unique_ptr<pool_t>> r;
+        return r;
+    }
+
+    inline void derive_per_function_key(uint64_t function_rva,
+                                        uint64_t pool_seed,
+                                        uint8_t out_key[32])
+    {
+        uint8_t info[24];
+        memcpy(info, "aida_hpool_keyderiv_v1", 22);
+        info[22] = static_cast<uint8_t>(function_rva & 0xFF);
+        info[23] = static_cast<uint8_t>((function_rva >> 8) & 0xFF);
+
+        uint8_t ikm[16];
+        memcpy(ikm, &function_rva, 8);
+        memcpy(ikm + 8, &pool_seed, 8);
+
+        uint8_t prk[32];
+        detail::hmac_sha256(state::g_vm_master_key, 32, ikm, 16, prk);
+        detail::hkdf_expand_sha256(prk, info, 24, out_key, 32);
+
+        SecureZeroMemory(prk, 32);
+        SecureZeroMemory(ikm, 16);
+        SecureZeroMemory(info, 24);
+    }
+
+    inline pool_t* get_or_create(uint64_t function_rva, uint64_t pool_seed)
+    {
+        std::lock_guard<std::mutex> lk(mtx());
+        auto& r = registry();
+        auto it = r.find(function_rva);
+        if (it != r.end())
+            return it->second.get();
+
+        auto up = std::unique_ptr<pool_t>(new pool_t{});
+        up->function_rva = function_rva;
+        up->pool_seed = pool_seed;
+        up->active = true;
+        derive_per_function_key(function_rva, pool_seed, up->function_key);
+
+        pool_t* raw = up.get();
+        r[function_rva] = std::move(up);
+        return raw;
+    }
+
+    inline uint64_t derive_imm_key(const uint8_t function_key[32],
+                                    uint64_t reg_state_anchor,
+                                    uint64_t rolling_anchor,
+                                    uint32_t handler_chain_seed,
+                                    const uint8_t domain_tag[16])
+    {
+        uint8_t input[40];
+        memcpy(input, &reg_state_anchor, 8);
+        memcpy(input + 8, &rolling_anchor, 8);
+        memcpy(input + 16, &handler_chain_seed, 4);
+        memcpy(input + 20, domain_tag, 16);
+        memcpy(input + 36, &handler_chain_seed, 4);
+
+        uint8_t mac[32];
+        detail::hmac_sha256(function_key, 32, input, 40, mac);
+
+        uint64_t key;
+        memcpy(&key, mac, 8);
+
+        SecureZeroMemory(mac, 32);
+        SecureZeroMemory(input, 40);
+        return key;
+    }
+
+    inline uint32_t register_immediate(pool_t& pool,
+                                        uint64_t plaintext_imm,
+                                        uint64_t reg_state_anchor,
+                                        uint64_t rolling_anchor)
+    {
+        std::lock_guard<std::mutex> lk(mtx());
+
+        entry_t e{};
+        e.reg_state_anchor = reg_state_anchor;
+        e.rolling_anchor = rolling_anchor;
+
+        uint8_t entropy[20];
+        if (!detail::bcrypt_random(entropy, 20))
+        {
+            uint64_t fb = __rdtsc() ^ static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&pool));
+            memcpy(entropy, &fb, 8);
+            uint64_t fb2 = _rotl64(fb, 17) ^ pool.pool_seed;
+            memcpy(entropy + 8, &fb2, 8);
+            uint32_t fb3 = static_cast<uint32_t>(fb2 >> 32);
+            memcpy(entropy + 16, &fb3, 4);
+        }
+        memcpy(e.domain_tag, entropy, 16);
+        memcpy(&e.handler_chain_seed, entropy + 16, 4);
+
+        uint64_t imm_key = derive_imm_key(pool.function_key,
+                                          reg_state_anchor,
+                                          rolling_anchor,
+                                          e.handler_chain_seed,
+                                          e.domain_tag);
+        e.encrypted_imm = plaintext_imm ^ imm_key;
+
+        SecureZeroMemory(entropy, 20);
+
+        uint32_t idx = static_cast<uint32_t>(pool.entries.size());
+        pool.entries.push_back(e);
+        return idx;
+    }
+
+    __forceinline uint64_t resolve_immediate(const pool_t& pool,
+                                             uint32_t entry_index,
+                                             uint64_t live_reg_state,
+                                             uint64_t live_rolling_key)
+    {
+        if (entry_index >= pool.entries.size() || !pool.active)
+            return 0;
+
+        const entry_t& e = pool.entries[entry_index];
+
+        uint64_t reg_anchor = e.reg_state_anchor ^ live_reg_state ^ e.reg_state_anchor;
+        uint64_t roll_anchor = e.rolling_anchor ^ live_rolling_key ^ e.rolling_anchor;
+
+        uint64_t imm_key = derive_imm_key(pool.function_key,
+                                          reg_anchor,
+                                          roll_anchor,
+                                          e.handler_chain_seed,
+                                          e.domain_tag);
+        uint64_t plaintext = e.encrypted_imm ^ imm_key;
+
+        volatile uint64_t scrub_key = imm_key;
+        scrub_key ^= scrub_key;
+        (void)scrub_key;
+
+        return plaintext;
+    }
+
+    inline void destroy(uint64_t function_rva)
+    {
+        std::lock_guard<std::mutex> lk(mtx());
+        auto& r = registry();
+        auto it = r.find(function_rva);
+        if (it == r.end()) return;
+
+        if (it->second)
+        {
+            it->second->active = false;
+            for (auto& e : it->second->entries)
+            {
+                e.encrypted_imm = 0;
+                memset(e.domain_tag, 0, 16);
+                e.reg_state_anchor = 0;
+                e.rolling_anchor = 0;
+                e.handler_chain_seed = 0;
+            }
+            SecureZeroMemory(it->second->function_key, 32);
+            it->second->entries.clear();
+        }
+        r.erase(it);
+    }
+
+    inline void clear_all()
+    {
+        std::lock_guard<std::mutex> lk(mtx());
+        auto& r = registry();
+        for (auto& kv : r)
+        {
+            if (kv.second)
+            {
+                kv.second->active = false;
+                for (auto& e : kv.second->entries)
+                {
+                    e.encrypted_imm = 0;
+                    memset(e.domain_tag, 0, 16);
+                }
+                SecureZeroMemory(kv.second->function_key, 32);
+                kv.second->entries.clear();
+            }
+        }
+        r.clear();
     }
 
 }

@@ -1755,7 +1755,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         OBFSTR("network_deep_inspect"), OBFSTR("network"),
         OBFSTR("Deep packet inspection of captured traffic. Returns protocol-level analysis: HTTP method/host/path, "
                "TLS version/SNI/content type, DNS detection. Requires active capture (network_start_capture). "
-               "Filter by pid, port, or protocol. Superior to basic packet view Ã¢â‚¬â€ identifies application-layer protocols."),
+               "Filter by pid, port, or protocol. Superior to basic packet view - identifies application-layer protocols."),
         {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Filter by process ID"), false},
          {OBFSTR("port"), OBFSTR("number"), OBFSTR("Filter by port number"), false},
          {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("Filter: 'tcp' or 'udp'"), false}},
@@ -1763,7 +1763,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
 
     register_compat(srv, {
         OBFSTR("network_follow_tcp_stream"), OBFSTR("network"),
-        OBFSTR("TCP stream reassembly Ã¢â‚¬â€ equivalent to Wireshark 'Follow TCP Stream'. Reassembles TCP segments into "
+        OBFSTR("TCP stream reassembly - equivalent to Wireshark 'Follow TCP Stream'. Reassembles TCP segments into "
                "complete application-layer data. Operations: 'start' begins tracking a flow, 'get' returns reassembled "
                "bytes (hex + ASCII), 'stop' ends tracking. Identify flows via src_port/dst_port. Max 1024 concurrent streams."),
         {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'start', 'stop', or 'get'"), true},
@@ -1799,14 +1799,14 @@ void register_network_tools(mcp_standalone::server_t& srv) {
     register_compat(srv, {
         OBFSTR("network_get_socket_handles"), OBFSTR("network"),
         OBFSTR("Enumerate kernel socket handle objects for a process. Returns handle value, AFD endpoint address, "
-               "protocol, state, local/remote address:port. Lower-level than netstat Ã¢â‚¬â€ works from kernel object tables."),
+               "protocol, state, local/remote address:port. Lower-level than netstat - works from kernel object tables."),
         {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID (0 = all processes)"), false}},
         network_get_socket_handles, true});
 
     register_compat(srv, {
         OBFSTR("network_dump_tcpip"), OBFSTR("network"),
         OBFSTR("Deep kernel TCPIP stack connection dump. Returns TCB address, owning module, bytes in/out, "
-               "create time, and full connection tuple. More detailed than netstat Ã¢â‚¬â€ reads kernel TCPIP internal structures."),
+               "create time, and full connection tuple. More detailed than netstat - reads kernel TCPIP internal structures."),
         {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Filter by process ID (0 = all)"), false},
          {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("Filter: 'tcp' or 'udp'"), false}},
         network_dump_tcpip, true});
@@ -1926,7 +1926,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         OBFSTR("network_spoof_dns"), OBFSTR("network"),
         OBFSTR("Manage kernel-level DNS spoofing rules. 'add' creates a rule to intercept DNS queries for a domain "
                "and return a spoofed A/AAAA record. 'remove' deletes by rule ID. 'clear' removes all. Like a kernel "
-               "hosts file Ã¢â‚¬â€ intercepts at the WFP layer before packets leave. Max 32 rules."),
+               "hosts file - intercepts at the WFP layer before packets leave. Max 32 rules."),
         {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'add', 'remove', or 'clear'"), true},
          {OBFSTR("domain"), OBFSTR("string"), OBFSTR("For add: domain name to intercept (e.g. 'example.com')"), false},
          {OBFSTR("spoof_ip"), OBFSTR("string"), OBFSTR("For add: IP address to return in DNS response"), false},
@@ -1986,7 +1986,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                "hex_dump, protobuf_decode, grpc_decode, upper, lower, reverse, byte_count, entropy. "
                "Input as text or hex. Pipeline steps applied in order."),
         {{OBFSTR("input"), OBFSTR("string"), OBFSTR("Input data (text)"), false},
-         {OBFSTR("input_hex"), OBFSTR("string"), OBFSTR("Input data (hex encoded) — use instead of 'input' for binary"), false},
+         {OBFSTR("input_hex"), OBFSTR("string"), OBFSTR("Input data (hex encoded) - use instead of 'input' for binary"), false},
          {OBFSTR("pipeline"), OBFSTR("array"), OBFSTR("Array of transform step objects: [{\"name\":\"base64_decode\"}, {\"name\":\"xor\",\"params\":{\"key\":\"41\"}}]"), true}},
         [](const json& args) -> tool_result_t {
             std::vector<uint8_t> data;
@@ -2990,7 +2990,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                             auto t0 = GetTickCount64();
                             auto res = mitm_proxy::repeat_request(cfg.host, cfg.port, cfg.use_tls, raw_req);
                             auto elapsed = GetTickCount64() - t0;
-                            network_view::state_t::fuzzer_result fr;
+                            network_view::state_t::fuzzer_result_t fr;
                             fr.index = idx;
                             fr.payloads = combo;
                             fr.payload = combo.empty() ? std::string() : combo[0];
@@ -3309,7 +3309,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             auto& state = network_view::g_state;
 
             if (op == "create") {
-                network_view::repeater_entry entry;
+                network_view::repeater_entry_t entry;
                 entry.host = args.value("host", std::string("localhost"));
                 if (args.contains("port") && args["port"].is_number())
                     entry.port = static_cast<uint16_t>(args["port"].get<int>());

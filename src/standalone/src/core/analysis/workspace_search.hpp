@@ -19,7 +19,7 @@ namespace workspace_search
 {
 
 
-struct MatchResult
+struct match_result_t
 {
     std::string filepath;
     std::string filename;
@@ -30,7 +30,7 @@ struct MatchResult
 };
 
 
-struct SearchState
+struct search_state_t
 {
 
     char            query_buf[512]  = {};
@@ -42,12 +42,13 @@ struct SearchState
 
 
     std::mutex                    results_mtx;
-    std::vector<MatchResult>      results;
+    std::vector<match_result_t>   results;
     int                           selected_idx = -1;
 
 
     std::atomic<bool>             searching{false};
     std::atomic<bool>             cancel{false};
+    std::atomic<bool>             launch_pending{false};
     std::atomic<int>              files_scanned{0};
     std::atomic<int>              match_count{0};
 
@@ -55,7 +56,7 @@ struct SearchState
     bool                          panel_open = false;
 };
 
-inline SearchState g_search;
+inline search_state_t g_search;
 
 
 inline bool is_text_extension(const std::string& ext)
@@ -217,7 +218,7 @@ inline void search_worker(std::string root_dir, std::string query,
             if (use_regex) {
                 std::smatch sm;
                 if (std::regex_search(line, sm, re)) {
-                    MatchResult mr;
+                    match_result_t mr;
                     mr.filepath = path.string();
                     mr.filename = fname;
                     mr.line_number = line_no;
@@ -250,7 +251,7 @@ inline void search_worker(std::string root_dir, std::string query,
                             valid = false;
                     }
                     if (valid) {
-                        MatchResult mr;
+                        match_result_t mr;
                         mr.filepath = path.string();
                         mr.filename = fname;
                         mr.line_number = line_no;
@@ -283,26 +284,42 @@ inline void search_worker(std::string root_dir, std::string query,
 inline void start_search(const std::string& root_dir)
 {
     auto& st = g_search;
-    if (st.searching.load()) {
-        st.cancel.store(true, std::memory_order_release);
-
-        for (int i = 0; i < 50 && st.searching.load(); ++i)
-            Sleep(10);
-    }
 
     std::string query(st.query_buf);
     if (query.empty() || root_dir.empty())
         return;
 
-    st.cancel.store(false, std::memory_order_release);
-    st.searching.store(true, std::memory_order_release);
+    bool expected_pending = false;
+    if (!st.launch_pending.compare_exchange_strong(expected_pending, true, std::memory_order_acq_rel))
+        return;
 
-    auto includes = parse_globs(st.include_buf);
-    auto excludes = parse_globs(st.exclude_buf);
+    if (st.searching.load(std::memory_order_acquire))
+        st.cancel.store(true, std::memory_order_release);
 
-    std::thread(search_worker, root_dir, query,
-                st.case_sensitive, st.whole_word, st.use_regex,
-                std::move(includes), std::move(excludes)).detach();
+    std::string root_dir_copy = root_dir;
+    bool case_sensitive = st.case_sensitive;
+    bool whole_word     = st.whole_word;
+    bool use_regex      = st.use_regex;
+    auto includes       = parse_globs(st.include_buf);
+    auto excludes       = parse_globs(st.exclude_buf);
+
+    work_queue::post([root_dir_copy = std::move(root_dir_copy),
+                      query = std::move(query),
+                      case_sensitive, whole_word, use_regex,
+                      includes = std::move(includes),
+                      excludes = std::move(excludes)]() mutable {
+        auto& s = g_search;
+        for (int i = 0; i < 500 && s.searching.load(std::memory_order_acquire); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+        s.cancel.store(false, std::memory_order_release);
+        s.searching.store(true, std::memory_order_release);
+        s.launch_pending.store(false, std::memory_order_release);
+
+        std::thread(search_worker, std::move(root_dir_copy), std::move(query),
+                    case_sensitive, whole_word, use_regex,
+                    std::move(includes), std::move(excludes)).detach();
+    });
 }
 
 

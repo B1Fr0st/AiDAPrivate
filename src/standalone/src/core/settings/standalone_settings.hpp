@@ -310,6 +310,8 @@ struct settings_sa_t
     int64_t     license_ttl = 3600;
     std::string license_key_seed;
     std::string license_bind_proof;
+    std::string license_auth_hmac_key_b64;
+    int         license_signing_kid = 1;
     bool        license_arc_load_ok = false;
 
     int         active_theme_idx = 0;
@@ -1195,6 +1197,8 @@ struct settings_sa_t
         i64("license_ttl", license_ttl);
         secret("license_key_seed", license_key_seed);
         secret("license_bind_proof", license_bind_proof);
+        secret("license_auth_hmac_key_b64", license_auth_hmac_key_b64);
+        integer("license_signing_kid", license_signing_kid);
         boolean("license_arc_load_ok", license_arc_load_ok);
 
         integer("active_theme_idx", active_theme_idx);
@@ -1448,6 +1452,8 @@ struct settings_sa_t
         root["license_ttl"] = license_ttl;
         root["license_key_seed"] = sa_settings_detail::obfuscate_key(license_key_seed);
         root["license_bind_proof"] = sa_settings_detail::obfuscate_key(license_bind_proof);
+        root["license_auth_hmac_key_b64"] = sa_settings_detail::obfuscate_key(license_auth_hmac_key_b64);
+        root["license_signing_kid"] = license_signing_kid;
         root["license_arc_load_ok"] = license_arc_load_ok;
 
         root["active_theme_idx"] = active_theme_idx;

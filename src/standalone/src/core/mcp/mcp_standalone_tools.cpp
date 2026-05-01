@@ -16,6 +16,7 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <optional>
 #include <regex>
 #include <sstream>
@@ -111,6 +112,24 @@ namespace
     tool_result_t error(const std::string& text)
     {
         return tool_result_t::error(text);
+    }
+
+    std::mutex& s_last_web_error_mtx()
+    {
+        static std::mutex m;
+        return m;
+    }
+
+    std::string& s_last_web_error_ref()
+    {
+        static std::string s;
+        return s;
+    }
+
+    void set_last_web_error(const std::string& text)
+    {
+        std::lock_guard<std::mutex> lk(s_last_web_error_mtx());
+        s_last_web_error_ref() = text;
     }
 
     tool_result_t handle_driver_status(const json&)
@@ -620,7 +639,7 @@ namespace
 
         json results = json::array();
 
-
+        std::string transport_error;
         try {
             httplib::SSLClient client("api.duckduckgo.com");
             client.set_connection_timeout(10);
@@ -630,10 +649,15 @@ namespace
             std::string path = "/?q=" + encoded_query + "&format=json&no_redirect=1&no_html=1";
             auto res = client.Get(path.c_str());
 
-            if (res && res->status == 200) {
+            if (!res) {
+                transport_error = "no response from api.duckduckgo.com";
+            } else if (res->status != 200) {
+                transport_error = "HTTP status " + std::to_string(res->status);
+            } else {
                 auto j = json::parse(res->body, nullptr, false);
-                if (!j.is_discarded() && j.is_object()) {
-
+                if (j.is_discarded() || !j.is_object()) {
+                    transport_error = "invalid JSON in response body";
+                } else {
                     if (j.contains("Abstract") && !j["Abstract"].get<std::string>().empty()) {
                         results.push_back({
                             {"title", j.value("Heading", "Answer")},
@@ -641,8 +665,6 @@ namespace
                             {"url", j.value("AbstractURL", "")}
                         });
                     }
-
-
                     if (j.contains("RelatedTopics") && j["RelatedTopics"].is_array()) {
                         for (auto& topic : j["RelatedTopics"]) {
                             if ((int)results.size() >= max_results) break;
@@ -657,8 +679,16 @@ namespace
                     }
                 }
             }
+        } catch (const std::exception& e) {
+            transport_error = e.what();
         } catch (...) {
+            transport_error = "unknown network error";
+        }
 
+        if (!transport_error.empty()) {
+            const std::string msg = "web_search: " + transport_error;
+            set_last_web_error(msg);
+            return tool_result_t::error(msg);
         }
 
         if (results.empty()) {

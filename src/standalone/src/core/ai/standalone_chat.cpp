@@ -1609,6 +1609,7 @@ void shutdown_standalone_chat()
 
     (void)aida::session::shutdown();
     aida::events::shutdown();
+    work_queue::shutdown();
 
     persist_workspace_state();
     g_sa_settings.save();

@@ -83,6 +83,8 @@ bool s_request_redo = false;
 bool s_request_find = false;
 bool s_request_replace = false;
 
+std::string s_last_error;
+
 
 void rebuild_lines() {
     s_cache.lines.clear();
@@ -136,15 +138,15 @@ void rebuild_buffer_from_lines() {
     }
 }
 
-int line_count() { return (int)s_cache.lines.size(); }
+int line_count() { return static_cast<int>(s_cache.lines.size()); }
 
 const std::string& line_at(int idx) {
     static const std::string empty;
-    if (idx < 0 || idx >= (int)s_cache.lines.size()) return empty;
+    if (idx < 0 || idx >= static_cast<int>(s_cache.lines.size())) return empty;
     return s_cache.lines[idx];
 }
 
-int line_length(int idx) { return (int)line_at(idx).size(); }
+int line_length(int idx) { return static_cast<int>(line_at(idx).size()); }
 
 int clamp_col(int line, int col) {
     return std::max(0, std::min(col, line_length(line)));
@@ -181,8 +183,8 @@ std::string get_selected_text() {
     selection_ordered(l0, c0, l1, c1);
     if (l0 == l1) {
         auto& ln = line_at(l0);
-        c0 = std::min(c0, (int)ln.size());
-        c1 = std::min(c1, (int)ln.size());
+        c0 = std::min(c0, static_cast<int>(ln.size()));
+        c1 = std::min(c1, static_cast<int>(ln.size()));
         return ln.substr(c0, c1 - c0);
     }
     std::string result;
@@ -202,7 +204,7 @@ void push_undo() {
     e.caret_line = s_sel.caret_line;
     e.caret_col  = s_sel.caret_col;
     s_undo.push_back(std::move(e));
-    if ((int)s_undo.size() > UNDO_MAX) s_undo.erase(s_undo.begin());
+    if (static_cast<int>(s_undo.size()) > UNDO_MAX) s_undo.erase(s_undo.begin());
     s_redo.clear();
 }
 
@@ -255,23 +257,23 @@ void insert_text_at_caret(const std::string& text) {
 
     if (ins_lines.size() == 1) {
         s_cache.lines[line].insert(col, ins_lines[0]);
-        s_sel.caret_col = s_sel.anchor_col = col + (int)ins_lines[0].size();
+        s_sel.caret_col = s_sel.anchor_col = col + static_cast<int>(ins_lines[0].size());
     } else {
         std::string tail = s_cache.lines[line].substr(col);
         s_cache.lines[line] = s_cache.lines[line].substr(0, col) + ins_lines[0];
 
         for (size_t i = 1; i < ins_lines.size() - 1; i++) {
-            s_cache.lines.insert(s_cache.lines.begin() + line + (int)i, ins_lines[i]);
-            s_cache.tokens.insert(s_cache.tokens.begin() + line + (int)i, {});
+            s_cache.lines.insert(s_cache.lines.begin() + line + static_cast<int>(i), ins_lines[i]);
+            s_cache.tokens.insert(s_cache.tokens.begin() + line + static_cast<int>(i), {});
         }
 
-        int last_idx = line + (int)ins_lines.size() - 1;
+        int last_idx = line + static_cast<int>(ins_lines.size()) - 1;
         std::string last_line = ins_lines.back() + tail;
         s_cache.lines.insert(s_cache.lines.begin() + last_idx, last_line);
         s_cache.tokens.insert(s_cache.tokens.begin() + last_idx, {});
 
         s_sel.caret_line = s_sel.anchor_line = last_idx;
-        s_sel.caret_col  = s_sel.anchor_col  = (int)ins_lines.back().size();
+        s_sel.caret_col  = s_sel.anchor_col  = static_cast<int>(ins_lines.back().size());
     }
     s_sel.active = false;
     rebuild_buffer_from_lines();
@@ -295,7 +297,7 @@ std::string clipboard_paste() {
     if (!OpenClipboard(nullptr)) return {};
     HANDLE hd = GetClipboardData(CF_TEXT);
     if (!hd) { CloseClipboard(); return {}; }
-    const char* p = (const char*)GlobalLock(hd);
+    const char* p = static_cast<const char*>(GlobalLock(hd));
     std::string result;
     if (p) {
         result = p;
@@ -370,8 +372,8 @@ void screen_to_linecol(float sx, float sy, float origin_x, float origin_y,
                         int& out_line, int& out_col) {
     float rel_y = sy - origin_y + s_scroll_y;
     float rel_x = sx - origin_x - gutter_w - 4.f + s_scroll_x;
-    out_line = clamp_line((int)(rel_y / line_h));
-    out_col  = std::max(0, (int)((rel_x + char_w * 0.5f) / char_w));
+    out_line = clamp_line(static_cast<int>(rel_y / line_h));
+    out_col  = std::max(0, static_cast<int>((rel_x + char_w * 0.5f) / char_w));
     out_col  = clamp_col(out_line, out_col);
 }
 
@@ -386,7 +388,7 @@ void word_bounds(int line, int col, int& start, int& end) {
     start = col;
     end   = col;
     while (start > 0 && is_word_char(ln[start - 1])) start--;
-    while (end < (int)ln.size() && is_word_char(ln[end])) end++;
+    while (end < static_cast<int>(ln.size()) && is_word_char(ln[end])) end++;
 }
 
 
@@ -405,70 +407,74 @@ void find_all_matches() {
             if (!s_find.case_sensitive)
                 flags |= std::regex_constants::icase;
             std::regex re(needle, flags);
-            for (int i = 0; i < (int)s_cache.lines.size(); i++) {
+            for (int i = 0; i < static_cast<int>(s_cache.lines.size()); i++) {
                 const std::string& line = s_cache.lines[i];
                 auto it  = std::sregex_iterator(line.begin(), line.end(), re);
                 auto end = std::sregex_iterator();
                 for (; it != end; ++it) {
                     if (it->length() == 0) break;
-                    s_find.match_positions.push_back({ i, (int)it->position() });
+                    s_find.match_positions.push_back({ i, static_cast<int>(it->position()) });
                 }
             }
+        } catch (const std::regex_error& e) {
+            s_last_error = std::string("code_editor: invalid regex in live highlight: ") + e.what();
+            s_find.match_positions.clear();
         } catch (...) {
-
+            s_last_error = "code_editor: invalid regex in live highlight";
+            s_find.match_positions.clear();
         }
     } else {
         if (!s_find.case_sensitive) {
-            for (auto& c : needle) c = (char)tolower((unsigned char)c);
+            for (auto& c : needle) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
         }
-        int needle_len = (int)needle.size();
+        int needle_len = static_cast<int>(needle.size());
 
-        for (int i = 0; i < (int)s_cache.lines.size(); i++) {
+        for (int i = 0; i < static_cast<int>(s_cache.lines.size()); i++) {
             std::string haystack = s_cache.lines[i];
             if (!s_find.case_sensitive) {
-                for (auto& c : haystack) c = (char)tolower((unsigned char)c);
+                for (auto& c : haystack) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
             }
             size_t pos = 0;
             while ((pos = haystack.find(needle, pos)) != std::string::npos) {
                 if (s_find.whole_word) {
-                    bool left_ok  = (pos == 0) || !isalnum((unsigned char)haystack[pos - 1]) && haystack[pos - 1] != '_';
-                    bool right_ok = (pos + needle_len >= haystack.size()) || !isalnum((unsigned char)haystack[pos + needle_len]) && haystack[pos + needle_len] != '_';
+                    bool left_ok  = (pos == 0) || (!isalnum(static_cast<unsigned char>(haystack[pos - 1])) && haystack[pos - 1] != '_');
+                    bool right_ok = (pos + needle_len >= haystack.size()) || (!isalnum(static_cast<unsigned char>(haystack[pos + needle_len])) && haystack[pos + needle_len] != '_');
                     if (!left_ok || !right_ok) { pos += 1; continue; }
                 }
-                s_find.match_positions.push_back({ i, (int)pos });
+                s_find.match_positions.push_back({ i, static_cast<int>(pos) });
                 pos += needle_len;
             }
         }
     }
-    s_find.total_matches = (int)s_find.match_positions.size();
+    s_find.total_matches = static_cast<int>(s_find.match_positions.size());
 }
 
 void find_next() {
     if (s_find.match_positions.empty()) return;
-    s_find.current_match = (s_find.current_match + 1) % (int)s_find.match_positions.size();
+    s_find.current_match = (s_find.current_match + 1) % static_cast<int>(s_find.match_positions.size());
     auto [line, col] = s_find.match_positions[s_find.current_match];
     s_sel.caret_line = s_sel.anchor_line = line;
-    s_sel.caret_col  = col + (int)strlen(s_find.find_buf);
+    s_sel.caret_col  = col + static_cast<int>(strlen(s_find.find_buf));
     s_sel.anchor_col = col;
     s_sel.active = true;
 }
 
 void find_prev() {
     if (s_find.match_positions.empty()) return;
-    s_find.current_match = (s_find.current_match - 1 + (int)s_find.match_positions.size())
-                            % (int)s_find.match_positions.size();
+    s_find.current_match = (s_find.current_match - 1 + static_cast<int>(s_find.match_positions.size()))
+                            % static_cast<int>(s_find.match_positions.size());
     auto [line, col] = s_find.match_positions[s_find.current_match];
     s_sel.caret_line = s_sel.anchor_line = line;
-    s_sel.caret_col  = col + (int)strlen(s_find.find_buf);
+    s_sel.caret_col  = col + static_cast<int>(strlen(s_find.find_buf));
     s_sel.anchor_col = col;
     s_sel.active = true;
 }
 
 void replace_current() {
-    if (s_find.current_match < 0 || s_find.current_match >= (int)s_find.match_positions.size())
+    if (s_find.current_match < 0 || s_find.current_match >= static_cast<int>(s_find.match_positions.size()))
         return;
     auto [line, col] = s_find.match_positions[s_find.current_match];
-    int find_len = (int)strlen(s_find.find_buf);
+    int find_len = static_cast<int>(strlen(s_find.find_buf));
     push_undo();
     s_cache.lines[line].erase(col, find_len);
     s_cache.lines[line].insert(col, s_find.replace_buf);
@@ -479,10 +485,10 @@ void replace_current() {
 void replace_all() {
     if (s_find.match_positions.empty()) return;
     push_undo();
-    int find_len = (int)strlen(s_find.find_buf);
-    int repl_len = (int)strlen(s_find.replace_buf);
+    int find_len = static_cast<int>(strlen(s_find.find_buf));
+    int repl_len = static_cast<int>(strlen(s_find.replace_buf));
 
-    for (int i = (int)s_find.match_positions.size() - 1; i >= 0; i--) {
+    for (int i = static_cast<int>(s_find.match_positions.size()) - 1; i >= 0; i--) {
         auto [line, col] = s_find.match_positions[i];
         s_cache.lines[line].erase(col, find_len);
         s_cache.lines[line].insert(col, s_find.replace_buf);
@@ -531,6 +537,10 @@ void code_editor_widget::trigger_redo()   { s_request_redo = true; }
 void code_editor_widget::open_find()      { s_request_find = true; }
 void code_editor_widget::open_replace()   { s_request_replace = true; }
 
+std::string code_editor_widget::last_error() {
+    return s_last_error;
+}
+
 
 void code_editor_widget::render(float pos_x, float pos_y, float width, float height,
                                  float alpha, float accent_r, float accent_g, float accent_b)
@@ -564,7 +574,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     const float text_w  = width - text_x0 - 4.f;
 
 
-    ImU32 tok_colors[(int)syntax::token_type::COUNT];
+    ImU32 tok_colors[static_cast<int>(syntax::token_type::COUNT)];
     syntax::get_token_colors(tok_colors, accent_r * 255.f, accent_g * 255.f, accent_b * 255.f, a);
 
 
@@ -642,14 +652,14 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     }
 
 
-    int first_row = std::max(0, (int)(s_scroll_y / line_h) - 1);
-    int last_row  = std::min(n_lines - 1, (int)((s_scroll_y + editor_h) / line_h) + 1);
+    int first_row = std::max(0, static_cast<int>(s_scroll_y / line_h) - 1);
+    int last_row  = std::min(n_lines - 1, static_cast<int>((s_scroll_y + editor_h) / line_h) + 1);
 
 
     if (show_ln) {
         dl->AddLine(ImVec2(ox + gutter_w, oy),
                     ImVec2(ox + gutter_w, oy + editor_h),
-                    IM_COL32(255, 255, 255, (int)(10 * a)), 1.f);
+                    IM_COL32(255, 255, 255, static_cast<int>(10 * a)), 1.f);
     }
 
 
@@ -657,7 +667,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         float cy = oy + s_sel.caret_line * line_h - s_scroll_y;
         if (cy >= oy - line_h && cy <= oy + editor_h) {
             dl->AddRectFilled(ImVec2(ox, cy), ImVec2(ox + width, cy + line_h),
-                              IM_COL32(255, 255, 255, (int)(8 * a)));
+                              IM_COL32(255, 255, 255, static_cast<int>(8 * a)));
         }
     }
 
@@ -665,8 +675,8 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     if (s_sel.has_selection()) {
         int l0, c0, l1, c1;
         selection_ordered(l0, c0, l1, c1);
-        ImU32 sel_col = IM_COL32((int)(accent_r * 180), (int)(accent_g * 180),
-                                  (int)(accent_b * 180), (int)(60 * a));
+        ImU32 sel_col = IM_COL32(static_cast<int>(accent_r * 180), static_cast<int>(accent_g * 180),
+                                  static_cast<int>(accent_b * 180), static_cast<int>(60 * a));
         for (int i = std::max(first_row, l0); i <= std::min(last_row, l1); i++) {
             float ly = oy + i * line_h - s_scroll_y;
             float sx0, sx1;
@@ -690,12 +700,12 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
 
     if (s_find.visible && !s_find.match_positions.empty()) {
-        int find_len = (int)strlen(s_find.find_buf);
-        ImU32 match_col  = IM_COL32((int)(accent_r * 220), (int)(accent_g * 220),
-                                     (int)(accent_b * 220), (int)(35 * a));
-        ImU32 active_col = IM_COL32((int)(accent_r * 255), (int)(accent_g * 255),
-                                     (int)(accent_b * 255), (int)(70 * a));
-        for (int mi = 0; mi < (int)s_find.match_positions.size(); mi++) {
+        int find_len = static_cast<int>(strlen(s_find.find_buf));
+        ImU32 match_col  = IM_COL32(static_cast<int>(accent_r * 220), static_cast<int>(accent_g * 220),
+                                     static_cast<int>(accent_b * 220), static_cast<int>(35 * a));
+        ImU32 active_col = IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
+                                     static_cast<int>(accent_b * 255), static_cast<int>(70 * a));
+        for (int mi = 0; mi < static_cast<int>(s_find.match_positions.size()); mi++) {
             auto [ml, mc] = s_find.match_positions[mi];
             if (ml < first_row || ml > last_row) continue;
             float my = oy + ml * line_h - s_scroll_y;
@@ -713,20 +723,20 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
         if (i & 1)
             dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + gutter_w, y + line_h - 1.f),
-                              IM_COL32(255, 255, 255, (int)(3.f * a)));
+                              IM_COL32(255, 255, 255, static_cast<int>(3.f * a)));
 
 
         if (show_ln) {
             char ln_buf[8];
             snprintf(ln_buf, sizeof(ln_buf), "%5d", i + 1);
             ImU32 ln_col = (i == s_sel.caret_line)
-                ? IM_COL32(200, 200, 220, (int)(200 * a))
-                : IM_COL32(75, 85, 120, (int)(140 * a));
+                ? IM_COL32(200, 200, 220, static_cast<int>(200 * a))
+                : IM_COL32(75, 85, 120, static_cast<int>(140 * a));
             dl->AddText(ImVec2(ox + 4.f, y + 1.f), ln_col, ln_buf);
         }
 
 
-        if (i < (int)s_cache.tokens.size()) {
+        if (i < static_cast<int>(s_cache.tokens.size())) {
             auto& toks = s_cache.tokens[i];
             auto& ln = s_cache.lines[i];
             float tx = ox + text_x0 - s_scroll_x;
@@ -744,9 +754,9 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                     continue;
                 }
 
-                if (tok.start + tok.length > (uint32_t)ln.size()) continue;
+                if (tok.start + tok.length > static_cast<uint32_t>(ln.size())) continue;
 
-                ImU32 col = tok_colors[(int)tok.type];
+                ImU32 col = tok_colors[static_cast<int>(tok.type)];
                 const char* ts = ln.c_str() + tok.start;
                 const char* te = ts + tok.length;
 
@@ -769,7 +779,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         float cy = oy + s_sel.caret_line * line_h - s_scroll_y;
         if (cy >= oy - line_h && cy <= oy + editor_h) {
             dl->AddLine(ImVec2(cx, cy), ImVec2(cx, cy + line_h),
-                        IM_COL32(230, 230, 255, (int)(220 * a)), 1.5f);
+                        IM_COL32(230, 230, 255, static_cast<int>(220 * a)), 1.5f);
         }
     }
 
@@ -805,7 +815,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                 for (int i = ctx_start; i < n_lines && i <= s_sel.caret_line; i++) {
                     const std::string& ln = line_at(i);
                     if (i == s_sel.caret_line) {
-                        int col = (std::min)(s_sel.caret_col, (int)ln.size());
+                        int col = (std::min)(s_sel.caret_col, static_cast<int>(ln.size()));
                         context.append(ln, 0, col);
                     } else {
                         context += ln;
@@ -862,7 +872,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             float gy = oy + s_sel.caret_line * line_h - s_scroll_y;
             if (gy >= oy - line_h && gy <= oy + editor_h) {
                 dl->AddText(ImVec2(gx, gy + 1.f),
-                    IM_COL32(150, 160, 200, (int)(90 * a)),
+                    IM_COL32(150, 160, 200, static_cast<int>(90 * a)),
                     s_ghost_text.c_str());
             }
 
@@ -889,7 +899,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             screen_to_linecol(mp.x, mp.y, ox, oy, gutter_w, line_h, char_w, ml, mc);
 
 
-            float now = (float)ImGui::GetTime();
+            float now = static_cast<float>(ImGui::GetTime());
             if (now - s_last_click_time < 0.3f) s_click_count++;
             else s_click_count = 1;
             s_last_click_time = now;
@@ -1012,10 +1022,17 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             ensure_caret_visible(editor_h, line_h);
         };
 
-        if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true)) {
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true)) {
             int nl = s_sel.caret_line, nc = s_sel.caret_col;
             if (ctrl) {
-
+                if (nc == 0 && nl > 0) {
+                    nl--;
+                    nc = line_length(nl);
+                } else if (nc > 0) {
+                    const std::string& ln = line_at(nl);
+                    while (nc > 0 && !is_word_char(ln[nc - 1])) nc--;
+                    while (nc > 0 && is_word_char(ln[nc - 1])) nc--;
+                }
             } else if (nc > 0) {
                 nc--;
             } else if (nl > 0) {
@@ -1023,9 +1040,19 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             }
             move_caret(nl, nc);
         }
-        else if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_RightArrow, true)) {
+        else if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, true)) {
             int nl = s_sel.caret_line, nc = s_sel.caret_col;
-            if (nc < line_length(nl)) {
+            if (ctrl) {
+                if (nc >= line_length(nl) && nl < line_count() - 1) {
+                    nl++;
+                    nc = 0;
+                } else {
+                    const std::string& ln = line_at(nl);
+                    int len = static_cast<int>(ln.size());
+                    while (nc < len && is_word_char(ln[nc])) nc++;
+                    while (nc < len && !is_word_char(ln[nc])) nc++;
+                }
+            } else if (nc < line_length(nl)) {
                 nc++;
             } else if (nl < line_count() - 1) {
                 nl++; nc = 0;
@@ -1051,12 +1078,12 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             else move_caret(s_sel.caret_line, line_length(s_sel.caret_line));
         }
         else if (ImGui::IsKeyPressed(ImGuiKey_PageUp, false)) {
-            int page = std::max(1, (int)(editor_h / line_h) - 2);
+            int page = std::max(1, static_cast<int>(editor_h / line_h) - 2);
             int nl = std::max(0, s_sel.caret_line - page);
             move_caret(nl, clamp_col(nl, s_sel.caret_col));
         }
         else if (ImGui::IsKeyPressed(ImGuiKey_PageDown, false)) {
-            int page = std::max(1, (int)(editor_h / line_h) - 2);
+            int page = std::max(1, static_cast<int>(editor_h / line_h) - 2);
             int nl = std::min(line_count() - 1, s_sel.caret_line + page);
             move_caret(nl, clamp_col(nl, s_sel.caret_col));
         }
@@ -1065,7 +1092,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_Enter, true)) {
 
             std::string indent;
-            if (s_sel.caret_line < (int)s_cache.lines.size()) {
+            if (s_sel.caret_line < static_cast<int>(s_cache.lines.size())) {
                 auto& ln = s_cache.lines[s_sel.caret_line];
                 for (char c : ln) {
                     if (c == ' ' || c == '\t') indent += c;
@@ -1089,7 +1116,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
                 if (start > 0) {
 
-                    while (start > 0 && (isalnum((unsigned char)ln[start - 1]) || ln[start - 1] == '_'))
+                    while (start > 0 && (isalnum(static_cast<unsigned char>(ln[start - 1])) || ln[start - 1] == '_'))
                         start--;
                 }
 
@@ -1101,7 +1128,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             } else if (s_sel.caret_line > 0) {
                 push_undo();
                 int prev = s_sel.caret_line - 1;
-                int prev_len = (int)s_cache.lines[prev].size();
+                int prev_len = static_cast<int>(s_cache.lines[prev].size());
                 s_cache.lines[prev] += s_cache.lines[s_sel.caret_line];
                 s_cache.lines.erase(s_cache.lines.begin() + s_sel.caret_line);
                 s_cache.tokens.erase(s_cache.tokens.begin() + s_sel.caret_line);
@@ -1123,7 +1150,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             } else if (s_sel.caret_line > 0) {
                 push_undo();
                 int prev = s_sel.caret_line - 1;
-                int prev_len = (int)s_cache.lines[prev].size();
+                int prev_len = static_cast<int>(s_cache.lines[prev].size());
                 s_cache.lines[prev] += s_cache.lines[s_sel.caret_line];
                 s_cache.lines.erase(s_cache.lines.begin() + s_sel.caret_line);
                 s_cache.tokens.erase(s_cache.tokens.begin() + s_sel.caret_line);
@@ -1167,7 +1194,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             for (int k = 0; k < io.InputQueueCharacters.Size; k++) {
                 ImWchar ch = io.InputQueueCharacters[k];
                 if (ch < 32 || ch > 126) continue;
-                char c = (char)ch;
+                char c = static_cast<char>(ch);
                 insert_text_at_caret(std::string(1, c));
                 ensure_caret_visible(editor_h, line_h);
 
@@ -1176,7 +1203,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                     int cursor = s_sel.caret_col;
                     int ws = cursor;
                     auto& ln = s_cache.lines[s_sel.caret_line];
-                    while (ws > 0 && (isalnum((unsigned char)ln[ws-1]) || ln[ws-1] == '_'))
+                    while (ws > 0 && (isalnum(static_cast<unsigned char>(ln[ws-1])) || ln[ws-1] == '_'))
                         ws--;
                     if (cursor > ws) {
                         autocomplete::partial = ln.substr(ws, cursor - ws);
@@ -1195,24 +1222,24 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
         if (autocomplete::popup_visible && !autocomplete::matches.empty()) {
             if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true)) {
-                autocomplete::selected = (autocomplete::selected - 1 + (int)autocomplete::matches.size())
-                    % (int)autocomplete::matches.size();
+                autocomplete::selected = (autocomplete::selected - 1 + static_cast<int>(autocomplete::matches.size()))
+                    % static_cast<int>(autocomplete::matches.size());
             }
             if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) {
-                autocomplete::selected = (autocomplete::selected + 1) % (int)autocomplete::matches.size();
+                autocomplete::selected = (autocomplete::selected + 1) % static_cast<int>(autocomplete::matches.size());
             }
             if (ImGui::IsKeyPressed(ImGuiKey_Tab, false) || ImGui::IsKeyPressed(ImGuiKey_Enter, false)) {
-                if (autocomplete::selected < (int)autocomplete::matches.size()) {
+                if (autocomplete::selected < static_cast<int>(autocomplete::matches.size())) {
 
                     int cursor = s_sel.caret_col;
                     int ws = cursor;
                     auto& ln = s_cache.lines[s_sel.caret_line];
-                    while (ws > 0 && (isalnum((unsigned char)ln[ws - 1]) || ln[ws - 1] == '_'))
+                    while (ws > 0 && (isalnum(static_cast<unsigned char>(ln[ws - 1])) || ln[ws - 1] == '_'))
                         ws--;
                     push_undo();
                     ln.erase(ws, cursor - ws);
                     ln.insert(ws, autocomplete::matches[autocomplete::selected]);
-                    s_sel.caret_col = s_sel.anchor_col = ws + (int)autocomplete::matches[autocomplete::selected].size();
+                    s_sel.caret_col = s_sel.anchor_col = ws + static_cast<int>(autocomplete::matches[autocomplete::selected].size());
                     rebuild_buffer_from_lines();
                 }
                 autocomplete::popup_visible = false;
@@ -1239,7 +1266,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     if (autocomplete::popup_visible && !autocomplete::matches.empty() && s_has_focus) {
         float popup_w = 220.f;
         float ac_item_h = 22.f;
-        float popup_h = std::min((float)autocomplete::matches.size(), 8.f) * ac_item_h + 8.f;
+        float popup_h = std::min(static_cast<float>(autocomplete::matches.size()), 8.f) * ac_item_h + 8.f;
         float sx = ox + text_x0 + autocomplete::cursor_col * char_w - s_scroll_x;
         float sy = oy + (autocomplete::cursor_line + 1) * line_h - s_scroll_y + 4.f;
 
@@ -1252,18 +1279,18 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         fdl->AddRect(ImVec2(sx, sy), ImVec2(sx + popup_w, sy + popup_h),
             IM_COL32(80, 80, 130, 100), 6.f);
 
-        for (int mi = 0; mi < (int)autocomplete::matches.size() && mi < 8; mi++) {
+        for (int mi = 0; mi < static_cast<int>(autocomplete::matches.size()) && mi < 8; mi++) {
             float iy = sy + 4.f + mi * ac_item_h;
             float text_y = iy + (ac_item_h - ImGui::GetFontSize()) * 0.5f;
             if (mi == autocomplete::selected)
                 fdl->AddRectFilled(ImVec2(sx + 2.f, iy), ImVec2(sx + popup_w - 2.f, iy + ac_item_h),
-                    IM_COL32((int)(accent_r*255), (int)(accent_g*255), (int)(accent_b*255), 50), 4.f);
+                    IM_COL32(static_cast<int>(accent_r*255), static_cast<int>(accent_g*255), static_cast<int>(accent_b*255), 50), 4.f);
 
             auto& match = autocomplete::matches[mi];
             size_t plen = autocomplete::partial.size();
             if (plen > 0 && plen <= match.size()) {
                 fdl->AddText(ImVec2(sx + 10.f, text_y),
-                    IM_COL32((int)(accent_r*255), (int)(accent_g*255), (int)(accent_b*255), 255),
+                    IM_COL32(static_cast<int>(accent_r*255), static_cast<int>(accent_g*255), static_cast<int>(accent_b*255), 255),
                     match.c_str(), match.c_str() + plen);
                 float prefix_w = ImGui::CalcTextSize(match.c_str(), match.c_str() + plen).x;
                 fdl->AddText(ImVec2(sx + 10.f + prefix_w, text_y),
@@ -1482,7 +1509,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         fdl->AddRectFilledMultiColor(
             ImVec2(bar_x + 4.f, bar_y + total_bar_h),
             ImVec2(bar_x + bar_w - 4.f, bar_y + total_bar_h + 6.f),
-            IM_COL32(0, 0, 0, (int)(40 * a)), IM_COL32(0, 0, 0, (int)(40 * a)),
+            IM_COL32(0, 0, 0, static_cast<int>(40 * a)), IM_COL32(0, 0, 0, static_cast<int>(40 * a)),
             IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0));
     } else {
         s_find_has_focus = false;
@@ -1494,7 +1521,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         float gw = 200.f;
         ImDrawList* fdl = ImGui::GetForegroundDrawList();
         fdl->AddRectFilled(ImVec2(ox + 10.f, gy), ImVec2(ox + 10.f + gw, gy + 30.f),
-            IM_COL32(30, 30, 40, (int)(240 * a)), 6.f);
+            IM_COL32(30, 30, 40, static_cast<int>(240 * a)), 6.f);
 
         ImGui::SetCursorPos(ImVec2(pos_x + 18.f, pos_y + 4.f));
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
@@ -1548,14 +1575,14 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
                 dl->AddRectFilled(ImVec2(track_x, track_y0),
                     ImVec2(track_x + sb_w, track_y0 + track_h),
-                    IM_COL32(255, 255, 255, (int)(8.f * sb_a * a)), 3.f);
+                    IM_COL32(255, 255, 255, static_cast<int>(8.f * sb_a * a)), 3.f);
 
 
                 bool thumb_hov = ImGui::IsMouseHoveringRect(
                     ImVec2(track_x - 2.f, thumb_y),
                     ImVec2(track_x + sb_w + 2.f, thumb_y + thumb_h));
                 int thumb_alpha = thumb_hov || s_sb_dragging
-                    ? (int)(120.f * sb_a * a) : (int)(60.f * sb_a * a);
+                    ? static_cast<int>(120.f * sb_a * a) : static_cast<int>(60.f * sb_a * a);
                 dl->AddRectFilled(ImVec2(track_x, thumb_y),
                     ImVec2(track_x + sb_w, thumb_y + thumb_h),
                     IM_COL32(200, 200, 220, thumb_alpha), 3.f);

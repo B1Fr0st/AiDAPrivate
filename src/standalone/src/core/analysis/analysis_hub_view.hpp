@@ -46,7 +46,7 @@ inline void set_sub_tab(sub_tab_t tab)
 	g_state.active_tab = tab;
 }
 
-static const char* tab_names[] = {
+inline constexpr const char* tab_names[] = {
 	"Symbolic", "Taint", "Deobfuscation", "Fuzzer", "Protection"
 };
 

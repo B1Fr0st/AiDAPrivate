@@ -34,7 +34,6 @@ struct keylog_entry {
 struct state_t {
     std::string                keylog_path;
     std::atomic<bool>          watching{false};
-    std::thread                watcher_thread;
 
     std::mutex                 entries_mutex;
     std::deque<keylog_entry>   entries;
@@ -171,7 +170,6 @@ inline void start_watching(const std::string& keylog_path) {
     g_state.file_pos = 0;
     g_state.watching.store(true);
 
-    g_state.watcher_thread = {};
     work_queue::post([&state = g_state]() {
         while (state.watching.load()) {
             std::ifstream file(state.keylog_path, std::ios::binary);
@@ -203,8 +201,6 @@ inline void start_watching(const std::string& keylog_path) {
 
 inline void stop_watching() {
     g_state.watching.store(false);
-    if (g_state.watcher_thread.joinable())
-        g_state.watcher_thread.join();
 }
 
 
@@ -266,7 +262,8 @@ inline std::vector<uint8_t> hex_decode(const std::string& hex) {
 inline std::vector<uint8_t> hkdf_expand_label(const std::vector<uint8_t>& secret,
                                                 const std::string& label,
                                                 const std::vector<uint8_t>& context,
-                                                size_t length) {
+                                                size_t length,
+                                                const EVP_MD* md = EVP_sha256()) {
 
     std::string full_label = "tls13 " + label;
     std::vector<uint8_t> hkdf_label;
@@ -285,7 +282,7 @@ inline std::vector<uint8_t> hkdf_expand_label(const std::vector<uint8_t>& secret
     size_t outlen = length;
     if (EVP_PKEY_derive_init(pctx) <= 0 ||
         EVP_PKEY_CTX_hkdf_mode(pctx, EVP_PKEY_HKDEF_MODE_EXPAND_ONLY) <= 0 ||
-        EVP_PKEY_CTX_set_hkdf_md(pctx, EVP_sha256()) <= 0 ||
+        EVP_PKEY_CTX_set_hkdf_md(pctx, md) <= 0 ||
         EVP_PKEY_CTX_set1_hkdf_key(pctx, secret.data(), static_cast<int>(secret.size())) <= 0 ||
         EVP_PKEY_CTX_add1_hkdf_info(pctx, hkdf_label.data(), static_cast<int>(hkdf_label.size())) <= 0 ||
         EVP_PKEY_derive(pctx, out.data(), &outlen) <= 0) {
@@ -338,9 +335,10 @@ inline decrypt_result decrypt_tls13_record(const uint8_t* record_data, size_t re
         return result;
     }
 
+    const EVP_MD* md = (secret.size() == 48 || key_size == 32) ? EVP_sha384() : EVP_sha256();
 
-    auto key = hkdf_expand_label(secret, "key", {}, key_size);
-    auto iv = hkdf_expand_label(secret, "iv", {}, 12);
+    auto key = hkdf_expand_label(secret, "key", {}, key_size, md);
+    auto iv = hkdf_expand_label(secret, "iv", {}, 12, md);
 
     if (key.size() != key_size || iv.size() != 12) {
         result.error = "HKDF key/IV derivation failed";

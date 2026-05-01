@@ -130,6 +130,12 @@ inline bool extract_target(const uint8_t* code, int code_len, uint64_t ins_addr,
 				}
 			}
 		}
+		if (ins.len >= 6 && code[0] == 0x8D && (code[1] & 0xC7) == 0x05) {
+			int32_t disp = 0;
+			std::memcpy(&disp, code + 2, 4);
+			target = ins_addr + 6 + disp;
+			return true;
+		}
 	}
 
 	if (ins.len >= 6) {

@@ -29,6 +29,7 @@ struct aob_byte_t {
 };
 
 struct signature_t {
+	uint64_t             id = 0;
 	std::string          name;
 	uint64_t             address = 0;
 	std::vector<aob_byte_t> bytes;
@@ -55,6 +56,13 @@ struct state_t {
 };
 
 inline state_t g_state;
+
+inline std::atomic<uint64_t> g_next_signature_id{1};
+
+inline uint64_t allocate_signature_id()
+{
+	return g_next_signature_id.fetch_add(1, std::memory_order_relaxed);
+}
 
 inline std::string format_signature(const signature_t& sig)
 {
@@ -309,6 +317,7 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 
 	work_queue::post([address, num_instructions, auto_wildcard]() {
 		signature_t sig;
+		sig.id = allocate_signature_id();
 		sig.address = address;
 
 		auto modules = driver_bridge::enumerate_modules();
@@ -392,6 +401,7 @@ inline void generate_from_file(const DisasmFile& file, uint64_t address, int num
 	auto file_copy = file;
 	work_queue::post([file_copy, address, num_instructions, auto_wildcard]() {
 		signature_t sig;
+		sig.id = allocate_signature_id();
 		sig.address = address;
 		sig.module_name = file_copy.filename;
 
@@ -474,9 +484,10 @@ inline void generate_from_file(const DisasmFile& file, uint64_t address, int num
 inline void validate_uniqueness_process(signature_t& sig)
 {
 	if (g_state.validating.load()) return;
+	if (sig.id == 0) sig.id = allocate_signature_id();
 	g_state.validating.store(true);
 
-	work_queue::post([&sig]() {
+	work_queue::post([sig_copy = sig]() mutable {
 		int total_count = 0;
 		auto regions = driver_bridge::enumerate_memory_regions();
 
@@ -490,15 +501,31 @@ inline void validate_uniqueness_process(signature_t& sig)
 			driver_bridge::read_memory(region.base, static_cast<size_t>(region.size), data);
 			if (data.empty()) continue;
 
-			total_count += detail::count_pattern_in_data(data.data(), data.size(), sig.bytes);
+			total_count += detail::count_pattern_in_data(data.data(), data.size(), sig_copy.bytes);
 			if (total_count > 1) break;
 		}
 
+		sig_copy.unique = (total_count == 1);
+		sig_copy.uniqueness_count = total_count;
+		sig_copy.quality_score = compute_quality_score(sig_copy);
+
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
-			sig.unique = (total_count == 1);
-			sig.uniqueness_count = total_count;
-			sig.quality_score = compute_quality_score(sig);
+			bool written = false;
+			for (auto& live : g_state.saved_signatures) {
+				if (live.id == sig_copy.id) {
+					live.unique = sig_copy.unique;
+					live.uniqueness_count = sig_copy.uniqueness_count;
+					live.quality_score = sig_copy.quality_score;
+					written = true;
+					break;
+				}
+			}
+			if (!written && g_state.current.id == sig_copy.id) {
+				g_state.current.unique = sig_copy.unique;
+				g_state.current.uniqueness_count = sig_copy.uniqueness_count;
+				g_state.current.quality_score = sig_copy.quality_score;
+			}
 		}
 
 		g_state.validating.store(false);
@@ -529,7 +556,9 @@ inline void save_current()
 		std::snprintf(buf, sizeof(buf), "sig_%llX", static_cast<unsigned long long>(g_state.current.address));
 		g_state.current.name = buf;
 	}
-	g_state.saved_signatures.push_back(g_state.current);
+	signature_t copy = g_state.current;
+	if (copy.id == 0) copy.id = allocate_signature_id();
+	g_state.saved_signatures.push_back(std::move(copy));
 }
 
 inline void generate_batch(const std::vector<uint64_t>& addresses, int num_instructions, bool auto_wildcard)
@@ -551,6 +580,7 @@ inline void generate_batch(const std::vector<uint64_t>& addresses, int num_instr
 			uint64_t address = addrs[ai];
 
 			signature_t sig;
+			sig.id = allocate_signature_id();
 			sig.address = address;
 
 			for (auto& m : modules) {
@@ -728,6 +758,7 @@ inline void export_signatures_json(const std::string& path)
 
 	for (auto& sig : g_state.saved_signatures) {
 		nlohmann::json obj;
+		obj["id"] = sig.id;
 		obj["name"] = sig.name;
 		obj["address"] = sig.address;
 		obj["module"] = sig.module_name;
@@ -810,6 +841,7 @@ inline void import_signatures_json(const std::string& path)
 	std::lock_guard<std::mutex> lk(g_state.mutex);
 	for (auto& obj : arr) {
 		signature_t sig;
+		sig.id = obj.value("id", static_cast<uint64_t>(0));
 		sig.name = obj.value("name", "");
 		sig.address = obj.value("address", static_cast<uint64_t>(0));
 		sig.module_name = obj.value("module", "");
@@ -824,6 +856,14 @@ inline void import_signatures_json(const std::string& path)
 				b.wildcard = bo.value("wildcard", false);
 				sig.bytes.push_back(b);
 			}
+		}
+
+		if (sig.id == 0)
+			sig.id = allocate_signature_id();
+		else {
+			uint64_t expected = g_next_signature_id.load(std::memory_order_relaxed);
+			while (sig.id >= expected &&
+				!g_next_signature_id.compare_exchange_weak(expected, sig.id + 1, std::memory_order_relaxed)) {}
 		}
 
 		if (!sig.bytes.empty())

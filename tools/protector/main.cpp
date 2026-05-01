@@ -56,6 +56,7 @@ struct config_t {
     uint64_t seed = 0;
     uint32_t tamper_response_level = 0;
     uint8_t  license_hash[16] = {0};
+    uint32_t matryoshka_layers = 3u;
 };
 
 static void print_usage(std::FILE* out) {
@@ -100,6 +101,11 @@ static void print_usage(std::FILE* out) {
         "Targets:\n"
         "  --target-arc                ARC mode (aida_core.dll): forces deep-steal + opaque-predicates,\n"
         "                              tighter flatten band, tamper-level 4. Validates input is aida_core.dll.\n"
+        "\n"
+        "Pack-section encryption depth:\n"
+        "  --matryoshka-layers <1|3>   1 = legacy single AES-256-CTR layer.\n"
+        "                              3 (default) = Matryoshka triple-stack: AES-128-CTR (HWID-anchored)\n"
+        "                              -> ChaCha20 (TPM-anchored) -> XTEA-CTR (server-heartbeat-anchored).\n"
         "\n"
         "Control:\n"
         "  --seed <u64>                Deterministic seed for RNG\n"
@@ -280,6 +286,17 @@ inline config_t parse_args(int argc, char** argv) {
                 std::exit(1);
             }
             cfg.tamper_response_level = static_cast<uint32_t>(v);
+        } else if (arg == "--matryoshka-layers") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "Error: --matryoshka-layers requires a value (1 or 3)\n");
+                std::exit(1);
+            }
+            uint64_t v = 0;
+            if (!parse_uint64(argv[++i], v) || (v != 1u && v != 3u)) {
+                std::fprintf(stderr, "Error: --matryoshka-layers must be 1 (legacy) or 3 (full Matryoshka)\n");
+                std::exit(1);
+            }
+            cfg.matryoshka_layers = static_cast<uint32_t>(v);
         } else {
             std::fprintf(stderr, "Unknown option: %s\n", arg.c_str());
             print_usage(stderr);
@@ -427,6 +444,7 @@ inline int run(const config_t& cfg) {
     opt.llm_poison = cfg.llm_poison;
     opt.jit = cfg.jit;
     opt.tamper_response_level = cfg.tamper_response_level;
+    opt.matryoshka_layers = cfg.matryoshka_layers;
     std::memcpy(opt.license_hash, cfg.license_hash, 16);
 
     if (cfg.verbose) {
@@ -461,6 +479,9 @@ inline int run(const config_t& cfg) {
                      cfg.symexec_bombs ? " symexec_bombs" : "",
                      cfg.llm_poison ? " llm_poison" : "",
                      cfg.jit ? " jit" : "");
+        std::fprintf(stdout, "[+] Matryoshka pack layers: %u (%s)\n",
+                     cfg.matryoshka_layers,
+                     cfg.matryoshka_layers >= 3u ? "full triple stack" : "legacy single AES");
     }
 
     const uint32_t reloc_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].rva;

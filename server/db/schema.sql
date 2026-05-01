@@ -187,7 +187,25 @@ ALTER TABLE licenses ADD COLUMN IF NOT EXISTS last_attest_at         BIGINT;
 ALTER TABLE licenses ADD COLUMN IF NOT EXISTS ioctl_seed_wrapped     BYTEA;
 ALTER TABLE licenses ADD COLUMN IF NOT EXISTS last_sensor_snapshot   JSONB;
 
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS tier                   TEXT    NOT NULL DEFAULT 'standard';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS tpm_required           BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS tpm_ek_fingerprint     TEXT    NOT NULL DEFAULT '';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS tpm_ek_vendor          TEXT    NOT NULL DEFAULT '';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS tpm_pcr_digest         TEXT    NOT NULL DEFAULT '';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS tpm_attest_count       INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS tpm_last_attest_at     BIGINT;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS tpm_seal_payload       JSONB;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS flagged                BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS flagged_reason         TEXT    NOT NULL DEFAULT '';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS flagged_at             BIGINT;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS flagged_score          DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS anomaly_last_score     DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS anomaly_last_action    TEXT    NOT NULL DEFAULT '';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS anomaly_last_at        BIGINT;
+
 CREATE INDEX IF NOT EXISTS idx_licenses_hardware_id ON licenses (hardware_id_sha256) WHERE hardware_id_sha256 != '';
+CREATE INDEX IF NOT EXISTS idx_licenses_tpm_ek ON licenses (tpm_ek_fingerprint) WHERE tpm_ek_fingerprint != '';
+CREATE INDEX IF NOT EXISTS idx_licenses_flagged ON licenses (flagged) WHERE flagged = true;
 
 CREATE TABLE IF NOT EXISTS sentinel_events (
     id              BIGSERIAL   PRIMARY KEY,
@@ -214,5 +232,158 @@ CREATE TABLE IF NOT EXISTS sentinel_quorum (
     hvci_enabled    BOOLEAN,
     PRIMARY KEY (license_key, quorum_id)
 );
+
+CREATE TABLE IF NOT EXISTS arc_function_calls (
+    id                  BIGSERIAL   PRIMARY KEY,
+    license_key         TEXT        NOT NULL,
+    hwid                TEXT        NOT NULL,
+    function_hash       TEXT        NOT NULL,
+    nonce               TEXT        NOT NULL,
+    issued_at           BIGINT      NOT NULL,
+    expires_at          BIGINT      NOT NULL,
+    consumed            BOOLEAN     NOT NULL DEFAULT false,
+    consumed_at         BIGINT,
+    duplicate_count     INTEGER     NOT NULL DEFAULT 0,
+    flagged_replay      BOOLEAN     NOT NULL DEFAULT false,
+    UNIQUE (license_key, function_hash, nonce)
+);
+
+CREATE INDEX IF NOT EXISTS idx_arc_function_calls_lic_hash ON arc_function_calls (license_key, function_hash, issued_at DESC);
+CREATE INDEX IF NOT EXISTS idx_arc_function_calls_expires ON arc_function_calls (expires_at);
+
+CREATE TABLE IF NOT EXISTS arc_prologue_requests (
+    id                  BIGSERIAL   PRIMARY KEY,
+    license_key         TEXT        NOT NULL,
+    hwid                TEXT        NOT NULL,
+    function_hash       TEXT        NOT NULL,
+    nonce               TEXT        NOT NULL,
+    requested_at_ms     BIGINT      NOT NULL,
+    consumed            BOOLEAN     NOT NULL DEFAULT false,
+    consumed_at_ms      BIGINT,
+    flagged             BOOLEAN     NOT NULL DEFAULT false,
+    flagged_reason      TEXT        NOT NULL DEFAULT '',
+    UNIQUE (license_key, function_hash, nonce)
+);
+
+CREATE INDEX IF NOT EXISTS idx_arc_prologue_requests_lic_hash ON arc_prologue_requests (license_key, function_hash, requested_at_ms DESC);
+
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS prologue_anomaly_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS prologue_last_anomaly_at BIGINT;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS prologue_last_anomaly_reason TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS heartbeat_nonce         TEXT  NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS heartbeat_nonce_issued_at BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS bind_proof_history      TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS bind_proof_current      TEXT  NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS bind_proof_epoch        BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS challenge_sealed        BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS tpm_quote_digest        TEXT  NOT NULL DEFAULT '';
+
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS licensee_id             TEXT  NOT NULL DEFAULT '';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS code_binding_pubkey     TEXT  NOT NULL DEFAULT '';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS code_binding_privkey    BYTEA;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS vbs_required            BOOLEAN NOT NULL DEFAULT false;
+
+CREATE TABLE IF NOT EXISTS code_page_signatures (
+    license_key     TEXT        NOT NULL,
+    page_index      INTEGER     NOT NULL,
+    page_digest     TEXT        NOT NULL,
+    page_signature  TEXT        NOT NULL,
+    issued_at       BIGINT      NOT NULL,
+    PRIMARY KEY (license_key, page_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_page_sig_issued ON code_page_signatures (issued_at);
+
+CREATE TABLE IF NOT EXISTS bind_proof_rotations (
+    license_key     TEXT        NOT NULL,
+    session_token   TEXT        NOT NULL,
+    epoch           BIGINT      NOT NULL,
+    bind_proof      TEXT        NOT NULL,
+    issued_at       BIGINT      NOT NULL,
+    PRIMARY KEY (session_token, epoch)
+);
+
+CREATE INDEX IF NOT EXISTS idx_bind_proof_session ON bind_proof_rotations (session_token, issued_at DESC);
+CREATE INDEX IF NOT EXISTS idx_bind_proof_proof   ON bind_proof_rotations (bind_proof);
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_uuid          UUID    NOT NULL DEFAULT gen_random_uuid();
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS column_crypt_version  INTEGER NOT NULL DEFAULT 0;
+
+DROP INDEX IF EXISTS idx_sessions_token;
+CREATE INDEX IF NOT EXISTS idx_sessions_uuid ON sessions (session_uuid);
+
+CREATE TABLE IF NOT EXISTS column_crypt_meta (
+    key      TEXT PRIMARY KEY,
+    value    TEXT   NOT NULL,
+    updated  BIGINT NOT NULL DEFAULT (EXTRACT(EPOCH FROM now())::BIGINT)
+);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id              TEXT        PRIMARY KEY,
+    ts              BIGINT      NOT NULL,
+    actor_id        TEXT        NOT NULL DEFAULT '',
+    actor_tag       TEXT        NOT NULL DEFAULT '',
+    action          TEXT        NOT NULL,
+    target          TEXT        NOT NULL DEFAULT '',
+    details         JSONB,
+    prev_chain_hash TEXT        NOT NULL,
+    chain_hash      TEXT        NOT NULL,
+    hmac            TEXT        NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_ts     ON audit_log (ts DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log (action);
+CREATE INDEX IF NOT EXISTS idx_audit_log_actor  ON audit_log (actor_id);
+
+CREATE OR REPLACE FUNCTION audit_log_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_log rows are immutable (% on row id=%)', TG_OP, COALESCE(OLD.id, NEW.id);
+END;
+$$;
+
+DROP TRIGGER IF EXISTS audit_log_no_update ON audit_log;
+CREATE TRIGGER audit_log_no_update
+    BEFORE UPDATE ON audit_log
+    FOR EACH ROW EXECUTE FUNCTION audit_log_immutable();
+
+DROP TRIGGER IF EXISTS audit_log_no_delete ON audit_log;
+CREATE TRIGGER audit_log_no_delete
+    BEFORE DELETE ON audit_log
+    FOR EACH ROW EXECUTE FUNCTION audit_log_immutable();
+
+DO $bot_role$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aida_bot_ro') THEN
+        CREATE ROLE aida_bot_ro NOLOGIN;
+    END IF;
+    GRANT USAGE ON SCHEMA public TO aida_bot_ro;
+    GRANT SELECT ON ALL TABLES IN SCHEMA public TO aida_bot_ro;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO aida_bot_ro;
+END
+$bot_role$;
+
+CREATE TABLE IF NOT EXISTS server_nonce_replay (
+    nonce_b64       TEXT        PRIMARY KEY,
+    license_key     TEXT        NOT NULL DEFAULT '',
+    seen_at         BIGINT      NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_server_nonce_replay_seen ON server_nonce_replay (seen_at);
+
+CREATE TABLE IF NOT EXISTS telemetry_kill_directives (
+    license_key     TEXT        PRIMARY KEY REFERENCES licenses(key) ON DELETE CASCADE,
+    kill_at_epoch   BIGINT      NOT NULL,
+    reason          TEXT        NOT NULL DEFAULT '',
+    issued_at       BIGINT      NOT NULL,
+    issued_by       TEXT        NOT NULL DEFAULT 'server'
+);
+
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS auth_hmac_key BYTEA;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS anomaly_score INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS honeypot_strike_count INTEGER NOT NULL DEFAULT 0;
 
 COMMIT;

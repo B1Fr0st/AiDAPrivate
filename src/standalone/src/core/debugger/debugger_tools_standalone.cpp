@@ -127,16 +127,6 @@ static std::optional<std::uint32_t> parse_tid(const json& params)
 }
 
 
-struct sw_breakpoint
-{
-    std::uint64_t address       = 0;
-    std::uint8_t  original_byte = 0;
-    bool          enabled       = false;
-};
-
-static std::mutex             s_bp_mutex;
-static std::vector<sw_breakpoint> s_breakpoints;
-
 static tool_result_t dbg_set_breakpoint(const json& params)
 {
     if (auto err = ensure_attached(params))
@@ -150,47 +140,25 @@ static tool_result_t dbg_set_breakpoint(const json& params)
         return tool_result_t::error(OBFSTR("Invalid address."));
     const std::uint64_t addr = *addr_opt;
 
-    std::lock_guard<std::mutex> lock(s_bp_mutex);
-
-
-    for (const auto& bp : s_breakpoints)
-    {
-        if (bp.address == addr && bp.enabled)
-            return tool_result_t::error(
-                OBFSTR("Breakpoint already set at ") + sa_format_address(addr));
+    int idx = debugger_engine::add_breakpoint(addr, debugger_engine::bp_type_t::software);
+    if (idx < 0) {
+        const auto& err_msg = debugger_engine::last_error();
+        std::string detail = err_msg.empty() ? std::string() : (OBFSTR(": ") + err_msg);
+        return tool_result_t::error(
+            OBFSTR("Failed to add breakpoint at ") + sa_format_address(addr) + detail);
     }
 
-
-    std::uint8_t original = device->read<std::uint8_t>(addr);
-
-
-    if (original == 0xCC)
-        return tool_result_t::error(
-            OBFSTR("Byte at ") + sa_format_address(addr) +
-            OBFSTR(" is already 0xCC (INT3). Possible existing breakpoint."));
-
-
-    device->write<std::uint8_t>(addr, 0xCC);
-
-
-    std::uint8_t verify = device->read<std::uint8_t>(addr);
-    if (verify != 0xCC)
-        return tool_result_t::error(
-            OBFSTR("Failed to write INT3 at ") + sa_format_address(addr) +
-            OBFSTR(". Read-back: 0x") +
-            sa_format_address(static_cast<uint64_t>(verify)));
-
-
-    sw_breakpoint bp;
-    bp.address       = addr;
-    bp.original_byte = original;
-    bp.enabled       = true;
-    s_breakpoints.push_back(bp);
+    std::uint8_t original = 0;
+    {
+        std::lock_guard<std::mutex> lk(debugger_engine::g_state.bp_mutex);
+        if (idx < static_cast<int>(debugger_engine::g_state.breakpoints.size()))
+            original = debugger_engine::g_state.breakpoints[idx].original_byte;
+    }
 
     json result;
     result["address"]       = sa_format_address(addr);
     result["original_byte"] = sa_format_address(static_cast<uint64_t>(original));
-    result["index"]         = static_cast<int>(s_breakpoints.size()) - 1;
+    result["index"]         = idx;
     return tool_result_t::ok(
         OBFSTR("Software breakpoint set at ") + sa_format_address(addr), result);
 }
@@ -208,53 +176,60 @@ static tool_result_t dbg_remove_breakpoint(const json& params)
         return tool_result_t::error(OBFSTR("Invalid address."));
     const std::uint64_t addr = *addr_opt;
 
-    std::lock_guard<std::mutex> lock(s_bp_mutex);
-
-    for (auto it = s_breakpoints.begin(); it != s_breakpoints.end(); ++it)
+    int target_idx = -1;
+    std::uint8_t original = 0;
     {
-        if (it->address == addr && it->enabled)
-        {
-
-            device->write<std::uint8_t>(addr, it->original_byte);
-
-            std::uint8_t verify = device->read<std::uint8_t>(addr);
-            if (verify != it->original_byte)
-                return tool_result_t::error(
-                    OBFSTR("Failed to restore original byte at ") +
-                    sa_format_address(addr));
-
-            json result;
-            result["address"]       = sa_format_address(addr);
-            result["restored_byte"] = sa_format_address(
-                static_cast<uint64_t>(it->original_byte));
-
-            it->enabled = false;
-            return tool_result_t::ok(
-                OBFSTR("Breakpoint removed at ") + sa_format_address(addr), result);
+        std::lock_guard<std::mutex> lk(debugger_engine::g_state.bp_mutex);
+        for (size_t i = 0; i < debugger_engine::g_state.breakpoints.size(); ++i) {
+            auto& bp = debugger_engine::g_state.breakpoints[i];
+            if (bp.address == addr && bp.type == debugger_engine::bp_type_t::software) {
+                target_idx = static_cast<int>(i);
+                original = bp.original_byte;
+                break;
+            }
         }
     }
 
-    return tool_result_t::error(
-        OBFSTR("No active breakpoint found at ") + sa_format_address(addr));
+    if (target_idx < 0)
+        return tool_result_t::error(
+            OBFSTR("No active breakpoint found at ") + sa_format_address(addr));
+
+    if (!debugger_engine::remove_breakpoint(target_idx)) {
+        const auto& err_msg = debugger_engine::last_error();
+        std::string detail = err_msg.empty() ? std::string() : (OBFSTR(": ") + err_msg);
+        return tool_result_t::error(
+            OBFSTR("Failed to remove breakpoint at ") + sa_format_address(addr) + detail);
+    }
+
+    json result;
+    result["address"]       = sa_format_address(addr);
+    result["restored_byte"] = sa_format_address(static_cast<uint64_t>(original));
+    return tool_result_t::ok(
+        OBFSTR("Breakpoint removed at ") + sa_format_address(addr), result);
 }
 
 static tool_result_t dbg_list_breakpoints(const json& params)
 {
     (void)params;
 
-    std::lock_guard<std::mutex> lock(s_bp_mutex);
+    std::lock_guard<std::mutex> lk(debugger_engine::g_state.bp_mutex);
 
     json arr = json::array();
     int active_count = 0;
-    for (std::size_t i = 0; i < s_breakpoints.size(); ++i)
+    for (std::size_t i = 0; i < debugger_engine::g_state.breakpoints.size(); ++i)
     {
-        const auto& bp = s_breakpoints[i];
-        if (!bp.enabled)
+        const auto& bp = debugger_engine::g_state.breakpoints[i];
+        if (bp.state == debugger_engine::bp_state_t::disabled)
             continue;
         json entry;
         entry["index"]         = static_cast<int>(i);
         entry["address"]       = sa_format_address(bp.address);
         entry["original_byte"] = sa_format_address(static_cast<uint64_t>(bp.original_byte));
+        entry["type"]          = static_cast<int>(bp.type);
+        entry["state"]         = static_cast<int>(bp.state);
+        entry["hit_count"]     = bp.hit_count;
+        if (!bp.name.empty()) entry["name"] = bp.name;
+        if (!bp.condition.empty()) entry["condition"] = bp.condition;
         arr.push_back(entry);
         ++active_count;
     }
@@ -263,7 +238,7 @@ static tool_result_t dbg_list_breakpoints(const json& params)
     result["active_count"] = active_count;
     result["breakpoints"]  = arr;
     return tool_result_t::ok(
-        std::to_string(active_count) + OBFSTR(" active software breakpoint(s)"), result);
+        std::to_string(active_count) + OBFSTR(" active breakpoint(s)"), result);
 }
 
 

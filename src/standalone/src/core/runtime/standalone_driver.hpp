@@ -332,6 +332,7 @@ namespace driver_bridge
     bool set_thread_context(uint32_t tid, const thread_context_t& ctx, uint64_t register_mask);
     bool suspend_thread(uint32_t tid, uint32_t* prev_count = nullptr);
     bool resume_thread(uint32_t tid, uint32_t* prev_count = nullptr);
+    bool query_thread_information(uint32_t tid, uint32_t info_class, void* buffer, uint32_t buffer_size, uint32_t* return_length = nullptr);
 
     bool read_peb(peb_info_t& out);
     uint64_t resolve_export(uint64_t module_base, const char* export_name);
@@ -504,21 +505,42 @@ namespace driver_bridge
 
         uint8_t ve_trigger;
         uint8_t ve_lbr_stack;
-        uint8_t ve_garbage_msr;
         uint8_t ve_xsetbv_gp;
-        uint8_t ve_synthetic_msr;
-        uint8_t ve_cpuid_leaf_cmp;
-        uint8_t ve_rdtsc_cpuid;
-        uint8_t ve_aperf_divergence;
-        uint8_t ve_invd_cache;
         uint8_t ve_cr4_vmxe;
-        uint8_t ve_lbr_tos;
 
-        uint8_t total_failed;
+        uint8_t vmf_cpuid_vendor;
+        uint8_t vmf_hyperv_guest;
+        uint8_t vmf_smbios_vm;
+        uint8_t vmf_acpi_vm;
+        uint8_t vmf_pci_vm;
+        uint8_t vmf_disk_vm;
+        uint8_t vmf_mac_vm;
+        uint8_t vmf_registry_vm;
+
         uint8_t total_run;
-        uint8_t ms_hv_skipped;
+        uint8_t total_failed;
+        uint8_t ms_hv_root;
+        uint8_t is_virtual_machine;
 
-        bool any_detected() const { return total_failed > 0; }
+        char    vm_vendor_name[16];
+        uint8_t measurements_hmac[16];
+
+        bool any_hv_detected() const {
+            return (sidt_lock_prefix | sidt_invalid_pf | sidt_tlb_only | sidt_timing |
+                    sidt_compat_mode | sidt_noncanonical_gp | sidt_noncanonical_ss |
+                    sidt_cpl3_umip_off | sidt_cpl3_umip_on |
+                    lidt_lock_prefix | lidt_invalid_pf | lidt_tlb_only | lidt_timing |
+                    lidt_noncanonical_gp | lidt_noncanonical_ss | lidt_cpl3_gp |
+                    ve_trigger | ve_lbr_stack | ve_xsetbv_gp | ve_cr4_vmxe) != 0;
+        }
+
+        bool any_vm_detected() const {
+            return is_virtual_machine != 0;
+        }
+
+        bool any_detected() const {
+            return any_hv_detected() || any_vm_detected();
+        }
     };
     bool run_kernel_hv_detection(hv_kernel_detect_result_t& result);
 }

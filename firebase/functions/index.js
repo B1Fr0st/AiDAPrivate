@@ -19,6 +19,13 @@ const { getDatabase } = require("firebase-admin/database");
 const { v4: uuidv4 } = require("uuid");
 const crypto = require("crypto");
 
+const USE_CLOUD_HSM = String(process.env.USE_CLOUD_HSM || '0') === '1';
+const KMS_KEY_NAME = process.env.AIDA_KMS_KEY_NAME || '';
+const KMS_NEXT_KEY_NAME = process.env.AIDA_KMS_NEXT_KEY_NAME || '';
+const PRIMARY_KID = parseInt(process.env.AIDA_PRIMARY_KID || '1', 10) || 1;
+const NEXT_KID = parseInt(process.env.AIDA_NEXT_KID || '2', 10) || 2;
+const PRIMARY_RETIRE_AT = parseInt(process.env.AIDA_PRIMARY_RETIRE_AT || '0', 10) || 0;
+
 // Initialize Firebase Admin with an explicit RTDB URL.
 // 2nd-gen runtimes do not always expose enough metadata for getDatabase()
 // to infer the database URL automatically.
@@ -37,7 +44,10 @@ const RATE_LIMIT_WINDOW_MS = 60 * 1000;   // 1 minute window
 const RATE_LIMIT_MAX_CALLS = 30;          // max calls per window per IP
 
 const LICENSE_SIGNING_PRIVATE_KEY_B64 = defineSecret("AIDA_LICENSE_SIGNING_PRIVATE_KEY_B64");
+const LICENSE_SIGNING_PRIVATE_KEY_NEXT_B64 = defineSecret("AIDA_LICENSE_SIGNING_PRIVATE_KEY_NEXT_B64");
 let cachedSigningPrivateKey = null;
+let cachedNextSigningPrivateKey = null;
+let cachedKmsClient = null;
 
 // Discord Webhook URL for violation/ban logging
 const DISCORD_WEBHOOK_URL = process.env.AIDA_DISCORD_WEBHOOK || "https://discord.com/api/webhooks/1487822472207138869/nXIS-mL2ExeO_mRKEHOGUGyw-N8gtLRsKrNSn2zxTtsFQysVVC0CekF238oDbx7WmRGA";
@@ -88,6 +98,79 @@ function getSigningPrivateKey() {
     return cachedSigningPrivateKey;
 }
 
+function getNextSigningPrivateKey() {
+    if (cachedNextSigningPrivateKey !== null) {
+        return cachedNextSigningPrivateKey || null;
+    }
+    let secretValue = process.env.AIDA_LICENSE_SIGNING_PRIVATE_KEY_NEXT_B64;
+    if (!secretValue) {
+        try { secretValue = LICENSE_SIGNING_PRIVATE_KEY_NEXT_B64.value(); }
+        catch (_) { secretValue = ""; }
+    }
+    if (!secretValue || typeof secretValue !== "string" || secretValue.length < 16) {
+        cachedNextSigningPrivateKey = false;
+        return null;
+    }
+    cachedNextSigningPrivateKey = crypto.createPrivateKey({
+        key: Buffer.from(secretValue, "base64"),
+        format: "der",
+        type: "pkcs8",
+    });
+    return cachedNextSigningPrivateKey;
+}
+
+function getKmsClient() {
+    if (cachedKmsClient) return cachedKmsClient;
+    const { KeyManagementServiceClient } = require('@google-cloud/kms');
+    cachedKmsClient = new KeyManagementServiceClient();
+    return cachedKmsClient;
+}
+
+async function signWithKmsKeyName(keyName, message) {
+    const client = getKmsClient();
+    const [resp] = await client.asymmetricSign({
+        name: keyName,
+        data: message,
+    });
+    if (!resp || !resp.signature) {
+        throw new Error('KMS asymmetricSign returned no signature');
+    }
+    return Buffer.from(resp.signature).toString('hex');
+}
+
+function selectKidAtNow() {
+    const now = Math.floor(Date.now() / 1000);
+    if (PRIMARY_RETIRE_AT > 0 && now >= PRIMARY_RETIRE_AT) {
+        if (USE_CLOUD_HSM ? !!KMS_NEXT_KEY_NAME : !!getNextSigningPrivateKey()) {
+            return NEXT_KID;
+        }
+    }
+    return PRIMARY_KID;
+}
+
+async function verifyAgainstKey(keyObject, canonicalBuf, sigBuf) {
+    return crypto.verify(null, canonicalBuf, keyObject, sigBuf);
+}
+
+async function verifyDualSignature(sigHex, canonicalStr) {
+    if (typeof sigHex !== 'string' || sigHex.length === 0) return false;
+    let sigBuf;
+    try { sigBuf = Buffer.from(sigHex, 'hex'); } catch (_) { return false; }
+    const buf = Buffer.from(canonicalStr, 'utf8');
+
+    const primary = getSigningPrivateKey();
+    if (primary) {
+        const pub = crypto.createPublicKey(primary);
+        if (await verifyAgainstKey(pub, buf, sigBuf)) return true;
+    }
+    const next = getNextSigningPrivateKey();
+    if (next) {
+        const pubNext = crypto.createPublicKey(next);
+        if (await verifyAgainstKey(pubNext, buf, sigBuf)) return true;
+    }
+    return false;
+}
+
 function isHexNonce(value, minLength = 16, maxLength = 128) {
     return typeof value === "string"
         && value.length >= minLength
@@ -101,13 +184,32 @@ function sanitizeReason(reason) {
         : "unknown";
 }
 
-/**
- * Compute an Ed25519 signature over a canonical JSON payload string.
- * The client verifies this with the embedded public key.
- */
 function signPayload(payloadObj) {
     const payloadStr = JSON.stringify(sortObjectKeys(payloadObj));
     return crypto.sign(null, Buffer.from(payloadStr, "utf8"), getSigningPrivateKey()).toString("hex");
+}
+
+async function signPayloadWithKid(payloadObj) {
+    const kid = selectKidAtNow();
+    const augmented = { ...payloadObj, kid };
+    const canonical = JSON.stringify(sortObjectKeys(augmented));
+    const buf = Buffer.from(canonical, "utf8");
+
+    if (USE_CLOUD_HSM) {
+        const keyName = (kid === NEXT_KID) ? KMS_NEXT_KEY_NAME : KMS_KEY_NAME;
+        if (!keyName) {
+            throw new Error('USE_CLOUD_HSM=1 but KMS key name not configured');
+        }
+        const signature = await signWithKmsKeyName(keyName, buf);
+        return { kid, signature, canonical };
+    }
+
+    const key = (kid === NEXT_KID) ? getNextSigningPrivateKey() : getSigningPrivateKey();
+    if (!key) {
+        throw new Error('signPayloadWithKid: requested kid has no configured key');
+    }
+    const signature = crypto.sign(null, buf, key).toString("hex");
+    return { kid, signature, canonical };
 }
 
 /**
@@ -425,7 +527,7 @@ async function handleValidate(body, clientIp) {
 
     // 6. Return response — client_nonce is echoed for anti-replay
     //    Signature covers the critical fields so the client can verify authenticity
-    const sigPayload = {
+    const basePayload = {
         status:        "valid",
         license_key:   license_key,
         hwid:          hwid,
@@ -436,21 +538,14 @@ async function handleValidate(body, clientIp) {
         server_nonce:  serverNonce,
         client_nonce:  client_nonce,
     };
-    const signature = signPayload(sigPayload);
+    const { kid, signature } = await signPayloadWithKid(basePayload);
 
     return {
         status: 200,
         body: {
-            status:        "valid",
-            license_key:   license_key,
-            hwid:          hwid,
-            plan:          licenseData.plan || "standard",
-            session_token: sessionToken,
-            ttl:           ttl,
-            issued_at:     issuedAt,
-            server_nonce:  serverNonce,
-            client_nonce:  client_nonce,
-            signature:     signature,
+            ...basePayload,
+            kid,
+            signature,
         },
     };
 }
@@ -540,7 +635,7 @@ async function handleHeartbeat(body, clientIp) {
     const heartbeatNonce = body.heartbeat_nonce || "";
     const serverNonce = generateServerNonce();
 
-    const sigPayload = {
+    const baseHbPayload = {
         status:          "valid",
         license_key:     license_key,
         hwid:            hwid || session.hwid || "",
@@ -549,19 +644,14 @@ async function handleHeartbeat(body, clientIp) {
         heartbeat_nonce: heartbeatNonce,
         server_nonce:    serverNonce,
     };
-    const signature = signPayload(sigPayload);
+    const { kid, signature } = await signPayloadWithKid(baseHbPayload);
 
     return {
         status: 200,
         body: {
-            status:          "valid",
-            license_key:     license_key,
-            hwid:            hwid || session.hwid || "",
-            plan:            lookup.data.plan || "standard",
-            ttl:             SESSION_TTL_SECONDS,
-            heartbeat_nonce: heartbeatNonce,
-            server_nonce:    serverNonce,
-            signature:       signature,
+            ...baseHbPayload,
+            kid,
+            signature,
         },
     };
 }
@@ -632,7 +722,7 @@ exports.validateLicense = onRequest(
         timeoutSeconds: 30,
         memory: "256MiB",
         invoker: "public",
-        secrets: [LICENSE_SIGNING_PRIVATE_KEY_B64],
+        secrets: [LICENSE_SIGNING_PRIVATE_KEY_B64, LICENSE_SIGNING_PRIVATE_KEY_NEXT_B64],
     },
     async (req, res) => {
         // CORS headers — the plugin doesn't need these but useful for testing

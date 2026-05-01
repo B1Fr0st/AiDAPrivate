@@ -1056,7 +1056,8 @@ bool client_t::perform_remote_handshake()
                 json notif;
                 notif["jsonrpc"] = "2.0";
                 notif["method"]  = "notifications/initialized";
-                try { send_rpc(notif); } catch (...) {}
+                json notif_resp;
+                send_rpc(notif_resp, notif);
                 _state = connection_state_t::connected;
                 _oauth_status = stored.access.empty() ? oauth_status_t::not_required : oauth_status_t::authenticated;
                 return true;
@@ -1131,10 +1132,9 @@ bool client_t::perform_initialize_locked()
     });
 
     json response;
-    try {
-        response = send_rpc(init_req);
-    } catch (const std::exception& e) {
-        _last_error = std::string("Initialize failed: ") + e.what();
+    if (!send_rpc(response, init_req)) {
+        const std::string inner = _last_error;
+        _last_error = "Initialize failed: " + inner;
         _state = connection_state_t::error;
         kill_stdio_process();
         return false;
@@ -1163,11 +1163,8 @@ bool client_t::perform_initialize_locked()
     json notif;
     notif["jsonrpc"] = "2.0";
     notif["method"]  = "notifications/initialized";
-    try {
-        send_rpc(notif);
-    } catch (...) {
-
-    }
+    json notif_resp;
+    send_rpc(notif_resp, notif);
 
     _state = connection_state_t::connected;
     return true;
@@ -1210,10 +1207,9 @@ std::vector<remote_tool_t> client_t::list_tools()
 
     json req = rpc_request("tools/list");
     json response;
-    try {
-        response = send_rpc(req);
-    } catch (const std::exception& e) {
-        _last_error = std::string("tools/list failed: ") + e.what();
+    if (!send_rpc(response, req)) {
+        const std::string inner = _last_error;
+        _last_error = "tools/list failed: " + inner;
         return _cached_tools;
     }
 
@@ -1256,10 +1252,8 @@ call_result_t client_t::call_tool(const std::string& tool_name, const json& argu
     });
 
     json response;
-    try {
-        response = send_rpc(req);
-    } catch (const std::exception& e) {
-        return call_result_t::error(std::string("tools/call failed: ") + e.what());
+    if (!send_rpc(response, req)) {
+        return call_result_t::error("tools/call failed: " + _last_error);
     }
 
     if (response.contains("error")) {
@@ -1304,10 +1298,9 @@ std::vector<remote_resource_t> client_t::list_resources()
 
     json req = rpc_request("resources/list");
     json response;
-    try {
-        response = send_rpc(req);
-    } catch (const std::exception& e) {
-        _last_error = std::string("resources/list failed: ") + e.what();
+    if (!send_rpc(response, req)) {
+        const std::string inner = _last_error;
+        _last_error = "resources/list failed: " + inner;
         return {};
     }
 
@@ -1337,10 +1330,9 @@ std::string client_t::read_resource(const std::string& uri)
 
     json req = rpc_request("resources/read", {{"uri", uri}});
     json response;
-    try {
-        response = send_rpc(req);
-    } catch (const std::exception& e) {
-        _last_error = std::string("resources/read failed: ") + e.what();
+    if (!send_rpc(response, req)) {
+        const std::string inner = _last_error;
+        _last_error = "resources/read failed: " + inner;
         return {};
     }
 
@@ -1365,10 +1357,9 @@ std::vector<remote_prompt_t> client_t::list_prompts()
 
     json req = rpc_request("prompts/list");
     json response;
-    try {
-        response = send_rpc(req);
-    } catch (const std::exception& e) {
-        _last_error = std::string("prompts/list failed: ") + e.what();
+    if (!send_rpc(response, req)) {
+        const std::string inner = _last_error;
+        _last_error = "prompts/list failed: " + inner;
         return {};
     }
 
@@ -1423,10 +1414,9 @@ std::string client_t::get_prompt(const std::string& prompt_name,
 
     json req = rpc_request("prompts/get", params);
     json response;
-    try {
-        response = send_rpc(req);
-    } catch (const std::exception& e) {
-        _last_error = std::string("prompts/get failed: ") + e.what();
+    if (!send_rpc(response, req)) {
+        const std::string inner = _last_error;
+        _last_error = "prompts/get failed: " + inner;
         return {};
     }
 
@@ -1529,16 +1519,16 @@ json client_t::rpc_request(const std::string& method, const json& params)
     return req;
 }
 
-json client_t::send_rpc(const json& request)
+bool client_t::send_rpc(json& out, const json& request)
 {
-
     switch (_cfg.transport) {
     case transport_type_t::http_sse:
-        return send_http(request);
+        return send_http(out, request);
     case transport_type_t::stdio:
-        return send_stdio(request);
+        return send_stdio(out, request);
     default:
-        throw std::runtime_error("Unsupported transport type");
+        _last_error = "Unsupported transport type";
+        return false;
     }
 }
 
@@ -1599,13 +1589,15 @@ bool client_t::refresh_access_token_locked()
 }
 
 
-json client_t::send_http(const json& request)
+bool client_t::send_http(json& out, const json& request)
 {
     ensure_access_token_fresh_locked();
 
     parsed_url_t purl;
-    if (!parse_url_full(_cfg.url, purl))
-        throw std::runtime_error("Invalid MCP server URL: " + _cfg.url);
+    if (!parse_url_full(_cfg.url, purl)) {
+        _last_error = "Invalid MCP server URL: " + _cfg.url;
+        return false;
+    }
 
     httplib::Headers headers = {
         {"Content-Type", "application/json"}
@@ -1633,8 +1625,10 @@ json client_t::send_http(const json& request)
         post_path = _sse_post_path;
 
     auto res = do_https_post(purl.origin, post_path, headers, body, "application/json");
-    if (!res)
-        throw std::runtime_error("HTTP request failed: " + httplib::to_string(res.error()));
+    if (!res) {
+        _last_error = "HTTP request failed: " + httplib::to_string(res.error());
+        return false;
+    }
 
     if (res->status == 401 || res->status == 403) {
         std::string www_auth;
@@ -1646,12 +1640,15 @@ json client_t::send_http(const json& request)
         }
         detect_oauth_metadata(www_auth);
         _oauth_status = oauth_status_t::needs_auth;
-        throw std::runtime_error("HTTP " + std::to_string(res->status)
-            + ": MCP server requires OAuth authentication");
+        _last_error = "HTTP " + std::to_string(res->status)
+            + ": MCP server requires OAuth authentication";
+        return false;
     }
 
-    if (res->status < 200 || res->status >= 300)
-        throw std::runtime_error("HTTP " + std::to_string(res->status) + ": " + res->body);
+    if (res->status < 200 || res->status >= 300) {
+        _last_error = "HTTP " + std::to_string(res->status) + ": " + res->body;
+        return false;
+    }
 
 
     json response = json::parse(res->body, nullptr, false);
@@ -1672,19 +1669,23 @@ json client_t::send_http(const json& request)
                         process_notification(maybe);
                         continue;
                     }
-                    return maybe;
+                    out = std::move(maybe);
+                    return true;
                 }
             }
         }
-        throw std::runtime_error("Invalid JSON response from MCP server");
+        _last_error = "Invalid JSON response from MCP server";
+        return false;
     }
 
     if (response.is_object() && response.contains("method") && !response.contains("id")) {
         process_notification(response);
-        return json::object();
+        out = json::object();
+        return true;
     }
 
-    return response;
+    out = std::move(response);
+    return true;
 }
 
 void client_t::process_notification(const json& notif)
@@ -1698,10 +1699,9 @@ void client_t::process_notification(const json& notif)
         if (method == "notifications/tools/list_changed") {
             json req = rpc_request("tools/list");
             json response;
-            try {
-                response = send_rpc(req);
-            } catch (const std::exception& e) {
-                _last_error = std::string("tools/list refresh failed: ") + e.what();
+            if (!send_rpc(response, req)) {
+                const std::string inner = _last_error;
+                _last_error = "tools/list refresh failed: " + inner;
                 return;
             }
             if (response.contains("result") && response["result"].contains("tools")) {
@@ -1741,11 +1741,8 @@ bool client_t::poll_notifications()
     if (bytes_avail == 0) return false;
 
     std::string line;
-    try {
-        line = read_line_from_stdout();
-    } catch (...) {
+    if (!read_line_from_stdout(line))
         return false;
-    }
     if (line.empty()) return false;
     json maybe = json::parse(line, nullptr, false);
     if (maybe.is_discarded() || !maybe.is_object()) return false;
@@ -1835,8 +1832,21 @@ bool client_t::launch_stdio_process()
 
 
     std::wstring wcmdline;
-    wcmdline.reserve(cmdline.size() + 1);
-    for (char c : cmdline) wcmdline += static_cast<wchar_t>(c);
+    if (!cmdline.empty()) {
+        const int wlen = MultiByteToWideChar(CP_UTF8, 0, cmdline.c_str(),
+            static_cast<int>(cmdline.size()), nullptr, 0);
+        if (wlen <= 0) {
+            _last_error = "Failed to convert command line to UTF-16: " + cmdline;
+            CloseHandle(stdin_read);
+            CloseHandle(stdin_write);
+            CloseHandle(stdout_read);
+            CloseHandle(stdout_write);
+            return false;
+        }
+        wcmdline.resize(static_cast<size_t>(wlen));
+        MultiByteToWideChar(CP_UTF8, 0, cmdline.c_str(), static_cast<int>(cmdline.size()),
+            wcmdline.data(), wlen);
+    }
 
     BOOL created = CreateProcessW(
         nullptr,
@@ -1901,37 +1911,42 @@ void client_t::kill_stdio_process()
     }
 }
 
-std::string client_t::read_line_from_stdout()
+bool client_t::read_line_from_stdout(std::string& out)
 {
+    out.clear();
 
-    if (!_child_stdout_r)
-        throw std::runtime_error("stdio: no stdout handle");
+    if (!_child_stdout_r) {
+        _last_error = "stdio: no stdout handle";
+        return false;
+    }
 
-    std::string line;
     char ch;
     DWORD read_bytes;
 
     while (true) {
         BOOL ok = ReadFile(static_cast<HANDLE>(_child_stdout_r), &ch, 1, &read_bytes, nullptr);
         if (!ok || read_bytes == 0) {
-            if (line.empty())
-                throw std::runtime_error("stdio: child process closed stdout");
+            if (out.empty()) {
+                _last_error = "stdio: child process closed stdout";
+                return false;
+            }
             break;
         }
         if (ch == '\n')
             break;
         if (ch != '\r')
-            line += ch;
+            out += ch;
     }
 
-    return line;
+    return true;
 }
 
-void client_t::write_to_stdin(const std::string& data)
+bool client_t::write_to_stdin(const std::string& data)
 {
-
-    if (!_child_stdin_w)
-        throw std::runtime_error("stdio: no stdin handle");
+    if (!_child_stdin_w) {
+        _last_error = "stdio: no stdin handle";
+        return false;
+    }
 
     std::string msg = data + "\n";
     DWORD written;
@@ -1941,33 +1956,41 @@ void client_t::write_to_stdin(const std::string& data)
         static_cast<DWORD>(msg.size()),
         &written, nullptr
     );
-    if (!ok)
-        throw std::runtime_error("stdio: failed to write to child stdin");
+    if (!ok) {
+        _last_error = "stdio: failed to write to child stdin";
+        return false;
+    }
+    return true;
 }
 
-json client_t::send_stdio(const json& request)
+bool client_t::send_stdio(json& out, const json& request)
 {
-
-
     const std::string body = json_dump_safe(request);
-    write_to_stdin(body);
+    if (!write_to_stdin(body))
+        return false;
 
-
-    if (!request.contains("id"))
-        return json::object();
+    if (!request.contains("id")) {
+        out = json::object();
+        return true;
+    }
 
     while (true) {
-        std::string response_str = read_line_from_stdout();
+        std::string response_str;
+        if (!read_line_from_stdout(response_str))
+            return false;
 
         json response = json::parse(response_str, nullptr, false);
-        if (response.is_discarded())
-            throw std::runtime_error("stdio: invalid JSON response");
+        if (response.is_discarded()) {
+            _last_error = "stdio: invalid JSON response";
+            return false;
+        }
 
         if (response.is_object() && response.contains("method") && !response.contains("id")) {
             process_notification(response);
             continue;
         }
-        return response;
+        out = std::move(response);
+        return true;
     }
 }
 

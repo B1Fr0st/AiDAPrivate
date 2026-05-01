@@ -13,12 +13,135 @@
 #endif
 
 #ifdef __NT__
+namespace {
+
+constexpr DWORD kDllMainBadHostFastFailCode  = 0xA1DAB10Fu;
+constexpr DWORD kDllMainBadNameFastFailCode  = 0xA1DAB110u;
+
+bool ascii_iequal_w(const wchar_t* a, const wchar_t* b)
+{
+    while (*a && *b)
+    {
+        wchar_t la = static_cast<wchar_t>(towlower(*a));
+        wchar_t lb = static_cast<wchar_t>(towlower(*b));
+        if (la != lb)
+            return false;
+        ++a;
+        ++b;
+    }
+    return *a == L'\0' && *b == L'\0';
+}
+
+bool plugin_get_basename(HMODULE module, wchar_t* out, size_t cap)
+{
+    wchar_t full_path[MAX_PATH] = {};
+    DWORD got = GetModuleFileNameW(module, full_path, MAX_PATH);
+    if (got == 0 || got >= MAX_PATH)
+        return false;
+    const wchar_t* base = full_path;
+    for (const wchar_t* p = full_path; *p != L'\0'; ++p)
+    {
+        if (*p == L'\\' || *p == L'/')
+            base = p + 1;
+    }
+    size_t len = wcslen(base);
+    if (len + 1 > cap)
+        return false;
+    for (size_t i = 0; i < len; ++i)
+        out[i] = base[i];
+    out[len] = L'\0';
+    return true;
+}
+
+bool plugin_host_is_ida_exe()
+{
+    wchar_t host_name[MAX_PATH] = {};
+    if (!plugin_get_basename(nullptr, host_name, MAX_PATH))
+        return false;
+    static const wchar_t* allowed_hosts[] = {
+        L"ida.exe",      L"ida64.exe",
+        L"idat.exe",     L"idat64.exe",
+        L"idaq.exe",     L"idaq64.exe",
+        L"idaw.exe",     L"idaw64.exe",
+        L"idal.exe",     L"idal64.exe",
+        L"ida-pro.exe",  L"idapro.exe"
+    };
+    for (const wchar_t* allowed : allowed_hosts)
+    {
+        if (ascii_iequal_w(host_name, allowed))
+            return true;
+    }
+    return false;
+}
+
+bool plugin_own_filename_is_canonical(HINSTANCE self_module)
+{
+    wchar_t own_name[MAX_PATH] = {};
+    if (!plugin_get_basename(reinterpret_cast<HMODULE>(self_module), own_name, MAX_PATH))
+        return false;
+    return ascii_iequal_w(own_name, L"aida.dll");
+}
+
+DWORD WINAPI plugin_kill_thread(LPVOID param)
+{
+    DWORD reason = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(param));
+    Sleep(50);
+    bool driver_ok = false;
+    __try {
+        driver_ok = driver_loader::initialize_and_load();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        driver_ok = false;
+    }
+    if (driver_ok)
+    {
+        __try {
+            if (device && (device->is_connected() || device->connect()))
+            {
+                device->trigger_kernel_bsod(
+                    reason,
+                    static_cast<std::uint64_t>(__rdtsc()) ^ 0xA1DAB10C0FF1CEDDull);
+                Sleep(3000);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+    __fastfail(reason);
+    return 0;
+}
+
+void plugin_dispatch_kill(DWORD reason)
+{
+    HANDLE t = CreateThread(
+        nullptr, 0,
+        plugin_kill_thread,
+        reinterpret_cast<LPVOID>(static_cast<ULONG_PTR>(reason)),
+        0, nullptr);
+    if (t)
+        CloseHandle(t);
+}
+
+void plugin_validate_load_context(HINSTANCE self_module)
+{
+    bool host_ok = plugin_host_is_ida_exe();
+    bool name_ok = plugin_own_filename_is_canonical(self_module);
+    if (host_ok && name_ok)
+        return;
+    DWORD reason = host_ok
+        ? kDllMainBadNameFastFailCode
+        : kDllMainBadHostFastFailCode;
+    plugin_dispatch_kill(reason);
+}
+
+}
 extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL,
                                 DWORD     fdwReason,
                                 LPVOID    )
 {
     if (fdwReason == DLL_PROCESS_ATTACH)
+    {
         DisableThreadLibraryCalls(hinstDLL);
+        plugin_validate_load_context(hinstDLL);
+    }
     return TRUE;
 }
 
@@ -55,6 +178,12 @@ bool is_standalone_running()
     return found;
 }
 
+bool plugin_cpuid_vm_vendor_match();
+bool plugin_hyperv_guest_partition();
+bool plugin_smbios_vm_string();
+void plugin_vm_guard();
+void plugin_kd_test_signing_guard();
+
 void standalone_watchdog_thread()
 {
     int consecutive_fail = 0;
@@ -64,6 +193,10 @@ void standalone_watchdog_thread()
         Sleep(kStandaloneWatchdogPeriodMs);
         if (g_standalone_watchdog_stop.load(std::memory_order_acquire))
             break;
+
+        plugin_vm_guard();
+        plugin_kd_test_signing_guard();
+
         bool present = is_standalone_running();
         if (present)
         {
@@ -90,6 +223,184 @@ void start_standalone_watchdog()
     if (!g_standalone_watchdog_started.compare_exchange_strong(expected, true))
         return;
     std::thread(standalone_watchdog_thread).detach();
+}
+
+constexpr DWORD kVirtualMachineFastFailCode = 0xA1DAB10Cu;
+constexpr DWORD kKernelDebugFastFailCode    = 0xA1DAB10Du;
+constexpr DWORD kTestSigningFastFailCode    = 0xA1DAB10Eu;
+
+bool plugin_cpuid_vm_vendor_match()
+{
+    int regs[4] = {};
+    __cpuid(regs, 1);
+    if ((regs[2] & (1 << 31)) == 0)
+        return false;
+
+    __cpuid(regs, 0x40000000);
+    char vendor[12];
+    memcpy(vendor + 0, &regs[1], 4);
+    memcpy(vendor + 4, &regs[2], 4);
+    memcpy(vendor + 8, &regs[3], 4);
+
+    static const char* known[] = {
+        "VMwareVMware",
+        "KVMKVMKVM\0\0\0",
+        "VBoxVBoxVBox",
+        "XenVMMXenVMM",
+        "prl hyperv \0",
+        " lrpepyh vr",
+        "bhyve bhyve ",
+        "TCGTCGTCGTCG",
+        "ACRNACRNACRN",
+    };
+    for (const auto* k : known)
+    {
+        if (memcmp(vendor, k, 12) == 0)
+            return true;
+    }
+    return false;
+}
+
+bool plugin_hyperv_guest_partition()
+{
+    int regs[4] = {};
+    __cpuid(regs, 1);
+    if ((regs[2] & (1 << 31)) == 0)
+        return false;
+
+    __cpuid(regs, 0x40000000);
+    char vendor[12];
+    memcpy(vendor + 0, &regs[1], 4);
+    memcpy(vendor + 4, &regs[2], 4);
+    memcpy(vendor + 8, &regs[3], 4);
+
+    const char hv[12] = { 'M','i','c','r','o','s','o','f','t',' ','H','v' };
+    if (memcmp(vendor, hv, 12) != 0)
+        return false;
+
+    __cpuid(regs, 0x40000001);
+    if (static_cast<uint32_t>(regs[0]) != 0x31237648u)
+        return true;
+
+    __cpuid(regs, 0x40000003);
+    uint32_t partition_caps = static_cast<uint32_t>(regs[0]);
+    const uint32_t root_bits = (1u << 0) | (1u << 1) | (1u << 5);
+    return (partition_caps & root_bits) == 0;
+}
+
+bool plugin_smbios_vm_string()
+{
+    UINT size = GetSystemFirmwareTable('RSMB', 0, nullptr, 0);
+    if (size == 0 || size > 1024 * 1024)
+        return false;
+
+    auto* buf = static_cast<uint8_t*>(malloc(size));
+    if (!buf)
+        return false;
+
+    bool found = false;
+    if (GetSystemFirmwareTable('RSMB', 0, buf, size) == size)
+    {
+        static const char* const short_needles[] = {
+            "QEMU",
+            "VBOX",
+            "VirtualBox",
+            "innotek",
+            "BOCHS",
+            "Bochs",
+            "Parallels",
+            "SeaBIOS",
+            "BXPC",
+            "OVMF",
+            "EDK II",
+            "Tianocore",
+            "Standard PC (Q35"
+        };
+        for (UINT i = 0; i + 4 <= size && !found; ++i)
+        {
+            const char* p = reinterpret_cast<const char*>(buf + i);
+            for (const char* needle : short_needles)
+            {
+                size_t nlen = strlen(needle);
+                if (i + nlen > size)
+                    continue;
+                if (memcmp(p, needle, nlen) == 0)
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if (found)
+                break;
+            if (i + 12 <= size &&
+                (memcmp(p, "VMware, Inc.", 12) == 0
+                 || memcmp(p, "VMware Virt", 11) == 0))
+            {
+                found = true;
+            }
+        }
+    }
+    free(buf);
+    return found;
+}
+
+void plugin_vm_guard()
+{
+    if (plugin_cpuid_vm_vendor_match())
+        __fastfail(kVirtualMachineFastFailCode);
+
+    if (plugin_hyperv_guest_partition())
+        __fastfail(kVirtualMachineFastFailCode);
+
+    if (plugin_smbios_vm_string())
+        __fastfail(kVirtualMachineFastFailCode);
+}
+
+using nt_query_system_information_t = LONG (WINAPI*)(ULONG, PVOID, ULONG, PULONG);
+
+constexpr ULONG kPluginSystemKernelDebuggerInformation = 35;
+constexpr ULONG kPluginSystemCodeIntegrityInformation  = 103;
+constexpr ULONG kPluginCodeIntegrityTestSign           = 0x02;
+
+struct plugin_system_kernel_debugger_information_t
+{
+    BOOLEAN kernel_debugger_enabled;
+    BOOLEAN kernel_debugger_not_present;
+};
+
+struct plugin_system_code_integrity_information_t
+{
+    ULONG length;
+    ULONG code_integrity_options;
+};
+
+nt_query_system_information_t plugin_resolve_nt_query_system_information()
+{
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    if (!nt)
+        return nullptr;
+    return reinterpret_cast<nt_query_system_information_t>(
+        GetProcAddress(nt, "NtQuerySystemInformation"));
+}
+
+void plugin_kd_test_signing_guard()
+{
+    auto fn = plugin_resolve_nt_query_system_information();
+    if (!fn)
+        return;
+
+    plugin_system_kernel_debugger_information_t kdi{};
+    ULONG ret = 0;
+    LONG status = fn(kPluginSystemKernelDebuggerInformation, &kdi, sizeof(kdi), &ret);
+    if (status >= 0 && kdi.kernel_debugger_enabled != 0 && kdi.kernel_debugger_not_present == 0)
+        __fastfail(kKernelDebugFastFailCode);
+
+    plugin_system_code_integrity_information_t sci{};
+    sci.length = sizeof(sci);
+    ret = 0;
+    status = fn(kPluginSystemCodeIntegrityInformation, &sci, sizeof(sci), &ret);
+    if (status >= 0 && (sci.code_integrity_options & kPluginCodeIntegrityTestSign) != 0)
+        __fastfail(kTestSigningFastFailCode);
 }
 
 }
@@ -632,6 +943,9 @@ static plugmod_t* idaapi init()
         msg(OBFSTR_C("AiDA: plugin filename mismatch. Expected exact name: AiDA.dll\n"));
         return PLUGIN_SKIP;
     }
+
+    plugin_vm_guard();
+    plugin_kd_test_signing_guard();
 #endif
 
     g_settings.load_from_file();

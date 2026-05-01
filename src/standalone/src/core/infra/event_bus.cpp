@@ -22,7 +22,7 @@ namespace detail {
         return s;
     }
 
-    const std::string& last_error_slot()
+    std::string last_error_slot()
     {
         std::lock_guard<std::mutex> guard(last_error_mutex());
         return last_error_storage();
@@ -34,7 +34,7 @@ namespace detail {
         last_error_storage() = msg;
     }
 
-    subscription_id_t register_subscription(const std::string& type_name, callback_invoker_t invoker)
+    subscription_id_t register_subscription(const std::string& type_name, std::type_index payload_type, callback_invoker_t invoker)
     {
         registry_t& reg = get_registry();
         if (reg.shutdown_flag.load(std::memory_order_acquire))
@@ -45,9 +45,7 @@ namespace detail {
 
         const subscription_id_t id = reg.next_id.fetch_add(1, std::memory_order_relaxed);
 
-        subscription_record_t record;
-        record.id      = id;
-        record.invoker = std::move(invoker);
+        subscription_record_t record{id, payload_type, std::move(invoker)};
 
         std::unique_lock<std::shared_mutex> lock(reg.mutex);
         reg.by_type[type_name].push_back(std::move(record));
@@ -107,7 +105,7 @@ namespace detail {
     void shutdown()
     {
         detail::registry_t& reg = detail::get_registry();
-        reg.shutdown_flag.store(true, std::memory_order_release);
+        if (reg.shutdown_flag.exchange(true, std::memory_order_acq_rel)) return;
 
         std::unique_lock<std::shared_mutex> lock(reg.mutex);
         reg.by_type.clear();

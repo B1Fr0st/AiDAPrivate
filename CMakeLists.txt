@@ -49,6 +49,205 @@ endif()
 option(AIDA_ENABLE_LTCG "Enable /GL + /LTCG on AiDA.dll and aida_core.dll (slower link, marginally faster runtime)" OFF)
 option(AIDA_FAST_LINK   "Use /DEBUG (default) instead of /DEBUG:FULL for faster linking" ON)
 option(AIDA_ARC_ENCRYPT_IMPORTS "Enable --encrypt-imports for ARC (requires api-set resolver in payload.c — W1c-payload)" OFF)
+option(AIDA_HARDEN_RELEASE "Enable MSVC compiler/linker hardening (/GS /guard:cf /guard:ehcont /guard:xfg /Qspectre /sdl /CETCOMPAT /HIGHENTROPYVA /NXCOMPAT /DYNAMICBASE)" ON)
+option(AIDA_HARDEN_XFG "Enable /guard:xfg (Extended Control Flow Guard, requires Win11 22H2+ runtime)" ON)
+
+set(AIDA_BUILD_SEED_FILE "${CMAKE_BINARY_DIR}/build_seed.txt")
+set(AIDA_BUILD_SEED "")
+if(DEFINED ENV{AIDA_BUILD_SEED} AND NOT "$ENV{AIDA_BUILD_SEED}" STREQUAL "")
+    set(AIDA_BUILD_SEED "$ENV{AIDA_BUILD_SEED}")
+    string(STRIP "${AIDA_BUILD_SEED}" AIDA_BUILD_SEED)
+    file(WRITE "${AIDA_BUILD_SEED_FILE}" "${AIDA_BUILD_SEED}")
+    message(STATUS "AiDA: AIDA_BUILD_SEED supplied via environment")
+elseif(EXISTS "${AIDA_BUILD_SEED_FILE}")
+    file(READ "${AIDA_BUILD_SEED_FILE}" AIDA_BUILD_SEED)
+    string(STRIP "${AIDA_BUILD_SEED}" AIDA_BUILD_SEED)
+endif()
+
+set(_aida_build_seed_needs_regen FALSE)
+if("${AIDA_BUILD_SEED}" STREQUAL "")
+    set(_aida_build_seed_needs_regen TRUE)
+elseif(NOT "${AIDA_BUILD_SEED}" MATCHES "^[0-9a-fA-F]+$")
+    set(_aida_build_seed_needs_regen TRUE)
+else()
+    string(LENGTH "${AIDA_BUILD_SEED}" _aida_build_seed_len_pre)
+    if(NOT _aida_build_seed_len_pre EQUAL 64)
+        set(_aida_build_seed_needs_regen TRUE)
+    endif()
+endif()
+if(_aida_build_seed_needs_regen)
+    if(WIN32)
+        find_program(AIDA_POWERSHELL_EXECUTABLE NAMES pwsh powershell)
+        if(NOT AIDA_POWERSHELL_EXECUTABLE)
+            message(FATAL_ERROR
+                "AiDA build seed missing and PowerShell not found. Provide a 64-character "
+                "lowercase hex AIDA_BUILD_SEED environment variable, or install PowerShell.")
+        endif()
+        execute_process(
+            COMMAND "${AIDA_POWERSHELL_EXECUTABLE}" -NoLogo -NoProfile -NonInteractive -Command
+                "$bytes=New-Object byte[] 32; $rng=[System.Security.Cryptography.RandomNumberGenerator]::Create(); $rng.GetBytes($bytes); $rng.Dispose(); -join ($bytes | ForEach-Object { $_.ToString('x2') })"
+            OUTPUT_VARIABLE AIDA_BUILD_SEED_RAW
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE AIDA_BUILD_SEED_RC
+        )
+        if(NOT AIDA_BUILD_SEED_RC EQUAL 0)
+            message(FATAL_ERROR
+                "AiDA: failed to generate build seed via BCryptGenRandom-backed RNG (rc=${AIDA_BUILD_SEED_RC}).")
+        endif()
+        if(NOT AIDA_BUILD_SEED_RAW MATCHES "^[0-9a-fA-F]+$")
+            message(FATAL_ERROR
+                "AiDA: generated build seed contains invalid characters: ${AIDA_BUILD_SEED_RAW}")
+        endif()
+        string(LENGTH "${AIDA_BUILD_SEED_RAW}" AIDA_BUILD_SEED_LEN)
+        if(NOT AIDA_BUILD_SEED_LEN EQUAL 64)
+            message(FATAL_ERROR
+                "AiDA: generated build seed has unexpected length ${AIDA_BUILD_SEED_LEN} (expected 64).")
+        endif()
+        set(AIDA_BUILD_SEED "${AIDA_BUILD_SEED_RAW}")
+        file(WRITE "${AIDA_BUILD_SEED_FILE}" "${AIDA_BUILD_SEED}")
+        message(STATUS "AiDA: generated 256-bit build seed via system RNG -> ${AIDA_BUILD_SEED_FILE}")
+    else()
+        message(FATAL_ERROR
+            "AiDA: AIDA_BUILD_SEED missing or malformed; non-Windows configure must export "
+            "a 64-character hex AIDA_BUILD_SEED environment variable.")
+    endif()
+endif()
+
+string(LENGTH "${AIDA_BUILD_SEED}" _aida_build_seed_len_check)
+if(NOT _aida_build_seed_len_check EQUAL 64)
+    message(FATAL_ERROR
+        "AiDA: build seed length is ${_aida_build_seed_len_check}; expected 64-character hex.")
+endif()
+if(NOT "${AIDA_BUILD_SEED}" MATCHES "^[0-9a-fA-F]+$")
+    message(FATAL_ERROR
+        "AiDA: build seed contains non-hex characters: ${AIDA_BUILD_SEED}")
+endif()
+
+string(TOLOWER "${AIDA_BUILD_SEED}" AIDA_BUILD_SEED)
+
+set(AIDA_BUILD_SEED_BIN "${CMAKE_BINARY_DIR}/build_seed.bin")
+set(_aida_build_seed_byte_index 0)
+set(_aida_build_seed_byte_list "")
+while(_aida_build_seed_byte_index LESS 32)
+    math(EXPR _aida_build_seed_offset "${_aida_build_seed_byte_index} * 2")
+    string(SUBSTRING "${AIDA_BUILD_SEED}" ${_aida_build_seed_offset} 2 _aida_build_seed_byte_hex)
+    list(APPEND _aida_build_seed_byte_list "0x${_aida_build_seed_byte_hex}")
+    math(EXPR _aida_build_seed_byte_index "${_aida_build_seed_byte_index} + 1")
+endwhile()
+string(REPLACE ";" ", " AIDA_ARC_BUILD_SEED_BYTES_INLINE "${_aida_build_seed_byte_list}")
+set(AIDA_ARC_BUILD_SEED_BYTES "        ${AIDA_ARC_BUILD_SEED_BYTES_INLINE}")
+
+if(WIN32)
+    if(NOT DEFINED AIDA_POWERSHELL_EXECUTABLE OR NOT AIDA_POWERSHELL_EXECUTABLE)
+        find_program(AIDA_POWERSHELL_EXECUTABLE NAMES pwsh powershell)
+    endif()
+    if(NOT AIDA_POWERSHELL_EXECUTABLE)
+        message(FATAL_ERROR "AiDA: PowerShell required to materialize build_seed.bin and compute commitment.")
+    endif()
+    execute_process(
+        COMMAND "${AIDA_POWERSHELL_EXECUTABLE}" -NoLogo -NoProfile -NonInteractive -Command
+            "$hex='${AIDA_BUILD_SEED}'; $bytes=for ($i=0; $i -lt $hex.Length; $i+=2) { [Convert]::ToByte($hex.Substring($i,2),16) }; [System.IO.File]::WriteAllBytes('${AIDA_BUILD_SEED_BIN}', [byte[]]$bytes); $acl=Get-Acl '${AIDA_BUILD_SEED_BIN}'; $acl.SetAccessRuleProtection($true, $false); $rule=New-Object System.Security.AccessControl.FileSystemAccessRule([System.Security.Principal.WindowsIdentity]::GetCurrent().User, 'FullControl', 'Allow'); $acl.AddAccessRule($rule); Set-Acl '${AIDA_BUILD_SEED_BIN}' $acl"
+        RESULT_VARIABLE _aida_seed_bin_rc
+        OUTPUT_QUIET
+        ERROR_QUIET
+    )
+    if(NOT _aida_seed_bin_rc EQUAL 0)
+        message(WARNING "AiDA: failed to materialize build_seed.bin (rc=${_aida_seed_bin_rc}); HKDF still operates from embedded constant.")
+    endif()
+    execute_process(
+        COMMAND "${AIDA_POWERSHELL_EXECUTABLE}" -NoLogo -NoProfile -NonInteractive -Command
+            "$hex='${AIDA_BUILD_SEED}'; $bytes=for ($i=0; $i -lt $hex.Length; $i+=2) { [Convert]::ToByte($hex.Substring($i,2),16) }; $sha=[System.Security.Cryptography.SHA256]::Create(); $h=$sha.ComputeHash([byte[]]$bytes); -join ($h | ForEach-Object { $_.ToString('x2') })"
+        OUTPUT_VARIABLE AIDA_BUILD_COMMITMENT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _aida_commitment_rc
+    )
+    string(LENGTH "${AIDA_BUILD_COMMITMENT}" _aida_commitment_len)
+    if(NOT _aida_commitment_rc EQUAL 0 OR NOT _aida_commitment_len EQUAL 64 OR NOT "${AIDA_BUILD_COMMITMENT}" MATCHES "^[0-9a-fA-F]+$")
+        message(FATAL_ERROR "AiDA: failed to compute build seed SHA-256 commitment (rc=${_aida_commitment_rc} value='${AIDA_BUILD_COMMITMENT}').")
+    endif()
+    string(TOLOWER "${AIDA_BUILD_COMMITMENT}" AIDA_BUILD_COMMITMENT)
+else()
+    find_program(AIDA_OPENSSL_EXECUTABLE NAMES openssl)
+    if(NOT AIDA_OPENSSL_EXECUTABLE)
+        message(FATAL_ERROR "AiDA: openssl(1) not found; required to compute build seed commitment on non-Windows.")
+    endif()
+    file(WRITE "${AIDA_BUILD_SEED_BIN}.hex" "${AIDA_BUILD_SEED}")
+    execute_process(
+        COMMAND "${AIDA_OPENSSL_EXECUTABLE}" dgst -sha256 -hex
+        INPUT_FILE "${AIDA_BUILD_SEED_BIN}.hex"
+        OUTPUT_VARIABLE AIDA_BUILD_COMMITMENT_RAW
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _aida_commitment_rc
+    )
+    if(NOT _aida_commitment_rc EQUAL 0)
+        message(FATAL_ERROR "AiDA: failed to compute build seed commitment via openssl (rc=${_aida_commitment_rc}).")
+    endif()
+    string(REGEX REPLACE ".*= " "" AIDA_BUILD_COMMITMENT "${AIDA_BUILD_COMMITMENT_RAW}")
+    string(TOLOWER "${AIDA_BUILD_COMMITMENT}" AIDA_BUILD_COMMITMENT)
+endif()
+
+string(LENGTH "${AIDA_BUILD_COMMITMENT}" _aida_commitment_len_final)
+if(NOT _aida_commitment_len_final EQUAL 64 OR NOT "${AIDA_BUILD_COMMITMENT}" MATCHES "^[0-9a-f]+$")
+    message(FATAL_ERROR "AiDA: build commitment is malformed: ${AIDA_BUILD_COMMITMENT}")
+endif()
+
+set(_aida_build_commitment_byte_index 0)
+set(_aida_build_commitment_byte_list "")
+while(_aida_build_commitment_byte_index LESS 32)
+    math(EXPR _aida_build_commitment_offset "${_aida_build_commitment_byte_index} * 2")
+    string(SUBSTRING "${AIDA_BUILD_COMMITMENT}" ${_aida_build_commitment_offset} 2 _aida_build_commitment_byte_hex)
+    list(APPEND _aida_build_commitment_byte_list "0x${_aida_build_commitment_byte_hex}")
+    math(EXPR _aida_build_commitment_byte_index "${_aida_build_commitment_byte_index} + 1")
+endwhile()
+string(REPLACE ";" ", " AIDA_ARC_BUILD_COMMITMENT_BYTES_INLINE "${_aida_build_commitment_byte_list}")
+set(AIDA_ARC_BUILD_COMMITMENT_BYTES "        ${AIDA_ARC_BUILD_COMMITMENT_BYTES_INLINE}")
+
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/src/core/arc/arc_build_seed.hpp.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/arc_build_seed.hpp"
+    @ONLY
+)
+message(STATUS "AiDA: build_seed.bin materialized; commitment=${AIDA_BUILD_COMMITMENT}")
+
+if(MSVC AND AIDA_HARDEN_RELEASE)
+    add_library(aida_hardening INTERFACE)
+    target_compile_options(aida_hardening INTERFACE
+        $<$<COMPILE_LANGUAGE:C,CXX>:/GS>
+        $<$<COMPILE_LANGUAGE:C,CXX>:/guard:cf>
+        $<$<COMPILE_LANGUAGE:C,CXX>:/guard:ehcont>
+        $<$<COMPILE_LANGUAGE:C,CXX>:/Qspectre>
+        $<$<COMPILE_LANGUAGE:CXX>:/sdl>
+        $<$<AND:$<BOOL:${AIDA_HARDEN_XFG}>,$<COMPILE_LANGUAGE:C,CXX>>:/guard:xfg>
+    )
+    target_link_options(aida_hardening INTERFACE
+        /DYNAMICBASE
+        /HIGHENTROPYVA
+        /NXCOMPAT
+        /CETCOMPAT
+        /guard:cf
+        /guard:ehcont
+        /force:guardehcont
+    )
+endif()
+
+if(WIN32 AND MSVC)
+    add_executable(aida_build_seed_gen tools/build_seed/build_seed_gen.cpp)
+    target_compile_options(aida_build_seed_gen PRIVATE /W4 /EHsc /O2 /MD /Zc:__cplusplus /permissive-)
+    target_compile_definitions(aida_build_seed_gen PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(aida_build_seed_gen PRIVATE bcrypt)
+    set_target_properties(aida_build_seed_gen PROPERTIES
+        OUTPUT_NAME "aida_build_seed_gen"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+    )
+
+    add_executable(aida_pdb_scrubber tools/pdb_scrubber/pdb_scrubber.cpp)
+    target_compile_options(aida_pdb_scrubber PRIVATE /W4 /EHsc /O2 /MD /Zc:__cplusplus /permissive-)
+    target_compile_definitions(aida_pdb_scrubber PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+    set_target_properties(aida_pdb_scrubber PROPERTIES
+        OUTPUT_NAME "aida_pdb_scrubber"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+    )
+endif()
 
 set(DEPS_DIR "${CMAKE_SOURCE_DIR}/.deps")
 
@@ -478,13 +677,26 @@ if(Python3_FOUND)
         VERBATIM
     )
 
+    # WindMapper.c  ->  src/windmapper_data.inc + src/windmapper_embedded.h
+    add_custom_command(
+        OUTPUT "${CMAKE_BINARY_DIR}/windmapper_encrypted.stamp"
+        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_windmapper.py"
+        COMMAND ${CMAKE_COMMAND} -E touch "${CMAKE_BINARY_DIR}/windmapper_encrypted.stamp"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/WindMapper.c"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_windmapper.py"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Encrypting WindMapper.c -> windmapper_data.inc"
+        VERBATIM
+    )
+
     add_custom_target(encrypt_drivers DEPENDS
         "${CMAKE_BINARY_DIR}/whoswho_encrypted.stamp"
         "${CMAKE_BINARY_DIR}/sentinel_encrypted.stamp"
+        "${CMAKE_BINARY_DIR}/windmapper_encrypted.stamp"
     )
 else()
     message(WARNING "Python3 not found -- encrypt_drivers target disabled. "
-                    "Re-run encrypt scripts manually after updating WhosWho.c / Sentinel.c.")
+                    "Re-run encrypt scripts manually after updating WhosWho.c / Sentinel.c / WindMapper.c.")
 endif()
 
 # Track the generated encrypted headers so MSVC recompiles driver_loader.cpp
@@ -528,55 +740,6 @@ endif()
 if(WIN32)
 
     set(imgui_SOURCE_DIR "${DEPS_DIR}/imgui-src")
-
-    option(BUILD_BEDAISY_DUMPER "Build standalone BEDaisy kernel module dumper tool" ON)
-
-    if(BUILD_BEDAISY_DUMPER)
-        add_executable(BEDaisyDumper
-            tools/bedaisy_dumper/bedaisydumper.cpp
-            driver/comm.cpp
-        )
-
-        target_include_directories(BEDaisyDumper PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/driver"
-            "${CMAKE_CURRENT_SOURCE_DIR}"
-            "${zydis_SOURCE_DIR}/include"
-            "${zydis_SOURCE_DIR}/dependencies/zycore/include"
-            "${zydis_BINARY_DIR}"
-            "${zydis_BINARY_DIR}/zycore"
-            "${unicorn_SOURCE_DIR}/include"
-        )
-
-        target_compile_definitions(BEDaisyDumper PRIVATE
-            _CRT_SECURE_NO_WARNINGS
-            NOMINMAX
-            WIN32_LEAN_AND_MEAN
-        )
-
-        target_compile_options(BEDaisyDumper PRIVATE
-            /W3
-            /EHsc
-            /Zc:__cplusplus
-            /permissive-
-            /Zp8
-            /MD
-            /wd4201
-        )
-
-        target_link_libraries(BEDaisyDumper PRIVATE
-            Zydis
-            unicorn
-            ws2_32
-            dnsapi
-            winhttp
-            iphlpapi
-            ntdll
-        )
-
-        set_target_properties(BEDaisyDumper PROPERTIES
-            OUTPUT_NAME "BEDaisyDumper"
-        )
-    endif()
 
     option(BUILD_DRIVER_TEST "Build WhosWho driver test application" ON)
 
@@ -652,6 +815,52 @@ if(WIN32)
 
         set_target_properties(TestTarget PROPERTIES
             OUTPUT_NAME "test_target"
+        )
+    endif()
+
+    option(BUILD_BINPROTO_TEST "Build the binary protocol test executable" ON)
+
+    if(BUILD_BINPROTO_TEST)
+        add_executable(BINPROTO_TEST
+            tools/binproto_test/binproto_test.cpp
+        )
+
+        target_include_directories(BINPROTO_TEST PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/src/core/anti-tamper"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/src/core"
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+        )
+
+        target_compile_definitions(BINPROTO_TEST PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+            BINPROTO_TEST_BUILD=1
+        )
+
+        target_compile_options(BINPROTO_TEST PRIVATE
+            /W3
+            /EHsc
+            /Zc:__cplusplus
+            /permissive-
+            /Zp8
+            /MD
+            /bigobj
+        )
+
+        target_link_libraries(BINPROTO_TEST PRIVATE
+            aida_openssl_ssl
+            aida_openssl_crypto
+            ws2_32
+            crypt32
+            bcrypt
+            advapi32
+            user32
+            gdi32
+        )
+
+        set_target_properties(BINPROTO_TEST PROPERTIES
+            OUTPUT_NAME "BINPROTO_TEST"
         )
     endif()
 
@@ -831,6 +1040,7 @@ if(WIN32)
         )
 
         target_include_directories(AiDAStandalone PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}/generated"
             "${STANDALONE_ROOT}"
             "${STANDALONE_ROOT}/core"
             "${STANDALONE_ROOT}/core/arc"
@@ -949,9 +1159,14 @@ if(WIN32)
             /IGNORE:4099
             "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
             /DELAYLOAD:libz3.dll
+            /PDBALTPATH:none
+            /EMITTOOLVERSIONINFO:NO
         )
 
         target_link_libraries(AiDAStandalone PRIVATE delayimp)
+        if(TARGET aida_hardening)
+            target_link_libraries(AiDAStandalone PRIVATE aida_hardening)
+        endif()
 
         set_target_properties(AiDAStandalone PROPERTIES
             OUTPUT_NAME "AiDAStandalone"
@@ -986,13 +1201,6 @@ if(WIN32)
     option(BUILD_ARC_DLL "Build the ARC (AiDA Runtime Core) DLL" ON)
 
     if(BUILD_ARC_DLL)
-        string(RANDOM LENGTH 16 ALPHABET "0123456789abcdef" AIDA_ARC_BUILD_SEED)
-        configure_file(
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/src/core/arc/arc_build_seed.hpp.in"
-            "${CMAKE_CURRENT_BINARY_DIR}/generated/arc_build_seed.hpp"
-            @ONLY
-        )
-
         set(ARC_SOURCES
             "${STANDALONE_ROOT}/core/arc/arc.cpp"
             driver/comm.cpp
@@ -1053,6 +1261,8 @@ if(WIN32)
         )
 
         target_link_libraries(AiDA_ARC PRIVATE
+            aida_openssl_ssl
+            aida_openssl_crypto
             ws2_32
             iphlpapi
             ntdll
@@ -1064,7 +1274,13 @@ if(WIN32)
         target_link_options(AiDA_ARC PRIVATE
             $<IF:$<BOOL:${AIDA_FAST_LINK}>,/DEBUG,/DEBUG:FULL>
             $<$<BOOL:${AIDA_ENABLE_LTCG}>:/LTCG>
+            /PDBALTPATH:none
+            /EMITTOOLVERSIONINFO:NO
         )
+
+        if(TARGET aida_hardening)
+            target_link_libraries(AiDA_ARC PRIVATE aida_hardening)
+        endif()
 
         set_target_properties(AiDA_ARC PROPERTIES
             OUTPUT_NAME "aida_core"
@@ -1245,8 +1461,7 @@ if(WIN32)
         $<$<COMPILE_LANGUAGE:CXX>:/Zp8>
         $<$<COMPILE_LANGUAGE:CXX>:/EHa>
         $<$<COMPILE_LANGUAGE:CXX>:/MD>
-        $<$<COMPILE_LANGUAGE:CXX>:/GR>
-        $<$<COMPILE_LANGUAGE:CXX>:/GS>
+        $<$<COMPILE_LANGUAGE:CXX>:/GR->
         $<$<COMPILE_LANGUAGE:CXX>:/GF>
         $<$<COMPILE_LANGUAGE:CXX>:/Gy>
         $<$<COMPILE_LANGUAGE:CXX>:/Gw>
@@ -1270,6 +1485,10 @@ if(WIN32)
         /PDBALTPATH:none
         /EMITTOOLVERSIONINFO:NO
     )
+
+    if(TARGET aida_hardening)
+        target_link_libraries(AiDA PRIVATE aida_hardening)
+    endif()
 
     target_link_libraries(AiDA PRIVATE
         aida_openssl_ssl
@@ -1444,6 +1663,25 @@ if(BUILD_PROTECTOR)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
     )
 
+    option(BUILD_MATRYOSHKA_TEST "Build the Matryoshka 3-layer pack-section test harness" ON)
+    if(BUILD_MATRYOSHKA_TEST)
+        add_executable(MATRYOSHKA_TEST tools/matryoshka_test/matryoshka_test.cpp)
+        target_include_directories(MATRYOSHKA_TEST PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/protector
+        )
+        target_compile_definitions(MATRYOSHKA_TEST PRIVATE
+            _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
+        )
+        target_compile_options(MATRYOSHKA_TEST PRIVATE
+            /W4 /EHsc /O2 /Zc:__cplusplus /permissive- /MD /std:c++17
+        )
+        target_link_libraries(MATRYOSHKA_TEST PRIVATE bcrypt advapi32)
+        set_target_properties(MATRYOSHKA_TEST PROPERTIES
+            OUTPUT_NAME "matryoshka_test"
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+        )
+    endif()
+
     add_executable(AiDATestPayload tools/protector/test_payload/test_payload.c)
     target_compile_options(AiDATestPayload PRIVATE /W3 /O2 /MD)
     set_target_properties(AiDATestPayload PROPERTIES
@@ -1523,6 +1761,16 @@ if(BUILD_PROTECTOR)
         set_tests_properties(protector_full_matrix PROPERTIES
             PASS_REGULAR_EXPRESSION "\"probes_passed\": 27")
     endif()
+
+    option(BUILD_WBAES_TEST "Build white-box AES-128 self-test executable" ON)
+    if(BUILD_WBAES_TEST)
+        add_subdirectory(tools/wbaes_test)
+        if(BUILD_PROTECTOR_TESTS OR BUILD_TESTING)
+            add_test(NAME wbaes_self_test COMMAND $<TARGET_FILE:WBAES_TEST>)
+            set_tests_properties(wbaes_self_test PROPERTIES
+                PASS_REGULAR_EXPRESSION "WBAES_TEST_PASSED")
+        endif()
+    endif()
 endif()
 
 if(BUILD_PROTECTOR)
@@ -1535,11 +1783,20 @@ if(BUILD_PROTECTOR)
             COMMENT "Protecting AiDAStandalone.exe..."
             VERBATIM
         )
+        if(TARGET aida_pdb_scrubber)
+            add_custom_command(TARGET AiDAStandalone POST_BUILD
+                COMMAND $<TARGET_FILE:aida_pdb_scrubber> "$<TARGET_FILE:AiDAStandalone>"
+                COMMENT "Scrubbing Rich header and PDB paths from AiDAStandalone.exe..."
+                VERBATIM
+            )
+            add_dependencies(AiDAStandalone aida_pdb_scrubber)
+        endif()
         add_dependencies(AiDAStandalone AiDAProtector)
     endif()
 
     if(TARGET AiDA_ARC)
-        string(RANDOM LENGTH 32 ALPHABET "0123456789abcdef" AIDA_ARC_WATERMARK)
+        string(SUBSTRING "${AIDA_BUILD_SEED}" 0 32 AIDA_ARC_WATERMARK)
+        string(TOLOWER "${AIDA_ARC_WATERMARK}" AIDA_ARC_WATERMARK)
         if(AIDA_ARC_ENCRYPT_IMPORTS)
             add_custom_command(TARGET AiDA_ARC POST_BUILD
                 COMMAND $<TARGET_FILE:AiDAProtector>
@@ -1563,6 +1820,14 @@ if(BUILD_PROTECTOR)
                 VERBATIM
             )
         endif()
+        if(TARGET aida_pdb_scrubber)
+            add_custom_command(TARGET AiDA_ARC POST_BUILD
+                COMMAND $<TARGET_FILE:aida_pdb_scrubber> "$<TARGET_FILE:AiDA_ARC>"
+                COMMENT "Scrubbing Rich header and PDB paths from aida_core.dll..."
+                VERBATIM
+            )
+            add_dependencies(AiDA_ARC aida_pdb_scrubber)
+        endif()
         add_dependencies(AiDA_ARC AiDAProtector)
     endif()
 
@@ -1575,6 +1840,26 @@ if(BUILD_PROTECTOR)
             COMMENT "Protecting AiDA.dll..."
             VERBATIM
         )
+        if(TARGET aida_pdb_scrubber)
+            add_custom_command(TARGET AiDA POST_BUILD
+                COMMAND $<TARGET_FILE:aida_pdb_scrubber> "$<TARGET_FILE:AiDA>"
+                COMMENT "Scrubbing Rich header and PDB paths from AiDA.dll..."
+                VERBATIM
+            )
+            add_dependencies(AiDA aida_pdb_scrubber)
+        endif()
         add_dependencies(AiDA AiDAProtector)
     endif()
+endif()
+
+if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/nanomite_drx_test/CMakeLists.txt")
+    add_subdirectory(tools/nanomite_drx_test)
+endif()
+
+if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/dag_dispatch_test/CMakeLists.txt")
+    add_subdirectory(tools/dag_dispatch_test)
+endif()
+
+if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/overlap_test/CMakeLists.txt")
+    add_subdirectory(tools/overlap_test)
 endif()

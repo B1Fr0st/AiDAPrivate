@@ -12,6 +12,7 @@
 #include <cstring>
 #include <functional>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -316,24 +317,20 @@ inline ghidra_result_t do_decompile(aida_architecture_t* arch,
 
 
 struct temp_arch_t {
-	aida_buffer_load_image_t* loader = nullptr;
-	aida_architecture_t* arch = nullptr;
+	std::unique_ptr<aida_buffer_load_image_t> loader;
+	std::unique_ptr<aida_architecture_t> arch;
 	std::ostringstream err;
 
 	temp_arch_t(const uint8_t* data, size_t size, uint64_t base,
 	            const std::string& specs_dir)
 	{
-		loader = new aida_buffer_load_image_t(data, size, base);
-		arch = new aida_architecture_t(loader, "x86:LE:64:default", &err);
+		loader = std::make_unique<aida_buffer_load_image_t>(data, size, base);
+		arch = std::make_unique<aida_architecture_t>(loader.get(), "x86:LE:64:default", &err);
 		ghidra::DocumentStorage store;
 		arch->init(store);
 	}
 
-	~temp_arch_t() {
-		delete arch;
-
-		delete loader;
-	}
+	~temp_arch_t() = default;
 
 	temp_arch_t(const temp_arch_t&) = delete;
 	temp_arch_t& operator=(const temp_arch_t&) = delete;
@@ -417,7 +414,7 @@ inline ghidra_result_t decompile_function(uint64_t entry_addr,
 
 	try {
 		detail::temp_arch_t ta(mem.data(), mem.size(), entry_addr, g_state.specs_dir);
-		result = detail::do_decompile(ta.arch, entry_addr, cancel);
+		result = detail::do_decompile(ta.arch.get(), entry_addr, cancel);
 	}
 	catch (ghidra::LowlevelError& err) {
 		result.is_error = true;
@@ -453,7 +450,7 @@ inline ghidra_result_t decompile_buffer(const uint8_t* data, size_t size,
 
 	try {
 		detail::temp_arch_t ta(data, size, base_addr, g_state.specs_dir);
-		result = detail::do_decompile(ta.arch, entry_addr, cancel);
+		result = detail::do_decompile(ta.arch.get(), entry_addr, cancel);
 	}
 	catch (ghidra::LowlevelError& e) {
 		result.is_error = true;
@@ -520,15 +517,16 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 			if (my_indices.empty()) return;
 
 
-			aida_buffer_load_image_t* w_loader = nullptr;
-			aida_architecture_t* w_arch = nullptr;
+			std::unique_ptr<aida_buffer_load_image_t> w_loader;
+			std::unique_ptr<aida_architecture_t> w_arch;
 			std::ostringstream w_err;
 
 			try {
-				w_loader = new aida_buffer_load_image_t(buffer, buf_size, base);
-				w_arch = new aida_architecture_t(w_loader, "x86:LE:64:default", &w_err);
+				w_loader = std::make_unique<aida_buffer_load_image_t>(buffer, buf_size, base);
+				w_arch = std::make_unique<aida_architecture_t>(w_loader.get(), "x86:LE:64:default", &w_err);
 				ghidra::DocumentStorage store;
 				w_arch->init(store);
+				w_loader.release();
 			}
 			catch (...) {
 				for (size_t idx : my_indices) {
@@ -536,8 +534,6 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 					results[idx].is_error = true;
 					results[idx].error_text = "worker architecture init failed";
 				}
-				delete w_arch;
-				delete w_loader;
 				if (progress) progress->fetch_add(static_cast<int>(my_indices.size()),
 				                                  std::memory_order_relaxed);
 				return;
@@ -553,7 +549,7 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 				}
 
 				try {
-					results[idx] = detail::do_decompile(w_arch, entries[idx], cancel);
+					results[idx] = detail::do_decompile(w_arch.get(), entries[idx], cancel);
 				}
 				catch (ghidra::LowlevelError& err) {
 					results[idx].function_addr = entries[idx];
@@ -573,9 +569,6 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 
 				if (progress) progress->fetch_add(1, std::memory_order_relaxed);
 			}
-
-			delete w_arch;
-			delete w_loader;
 		});
 	}
 

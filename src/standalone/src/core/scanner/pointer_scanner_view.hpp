@@ -18,6 +18,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float a = alpha;
 	auto& st = pointer_scanner::g_state;
 
+	static float row_anim_time = 0.f;
+	row_anim_time += ImGui::GetIO().DeltaTime;
+
 	const auto& _t = themes::resolved;
 	const auto _ta = [alpha](ImU32 c) -> ImU32 {
 		return ui_anim::theme_alpha(c, alpha);
@@ -276,13 +279,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		                mp.y >= ry && mp.y < ry + row_h);
 		bool selected = (i == st.selected_result);
 
-		float row_a = ui_anim::render_row_entrance(i, 0.04f, a);
+		float row_a = ui_anim::render_row_entrance(i, row_anim_time, 0.012f);
 		ui_anim::table_row_style_t rs{};
 		rs.selected = selected;
 		rs.hovered = hovered;
 		rs.index = i;
 		rs.alpha = a;
-		rs.entrance = row_a / a;
+		rs.entrance = row_a;
 		rs.ar = accent_r; rs.ag = accent_g; rs.ab = accent_b;
 		ui_anim::render_table_row(dl, table_x, ry, table_w, row_h, rs);
 

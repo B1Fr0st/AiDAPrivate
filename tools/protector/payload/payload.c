@@ -4,7 +4,24 @@
 #include <wmmintrin.h>
 #include <emmintrin.h>
 
+#pragma section(".payload", read, write, execute)
 #pragma code_seg(".payload")
+
+__declspec(allocate(".payload")) uintptr_t __security_cookie = 0xBB40E64EAA56C2BFULL;
+__declspec(allocate(".payload")) uintptr_t __security_cookie_complement = ~0xBB40E64EAA56C2BFULL;
+
+void __cdecl __security_check_cookie(uintptr_t cookie) {
+    if (cookie != __security_cookie) {
+        __fastfail(2);
+    }
+}
+
+void __cdecl __GSHandlerCheck(void) {
+}
+
+void __cdecl __report_rangecheckfailure(void) {
+    __fastfail(8);
+}
 
 typedef struct unicode_string_s {
     uint16_t Length;
@@ -94,6 +111,10 @@ typedef struct section_descriptor_s {
     uint32_t encrypted_size;
     uint32_t original_crc32;
     uint32_t section_index;
+    uint8_t  layer1_iv[16];
+    uint8_t  layer2_nonce[12];
+    uint8_t  layer3_iv[8];
+    uint32_t layers_applied;
 } section_descriptor_t;
 
 typedef struct import_entry_s {
@@ -138,6 +159,10 @@ typedef struct resource_fixup_s {
 #define HASH_SLEEP          0x503cbccd6a5cdea8ULL
 
 #define IMG_MAGIC           0x41504B44u
+#define IMG_VERSION_LEGACY  0x00020000u
+#define IMG_VERSION_MATRYO  0x00030000u
+#define MATRYOSHKA_LAYERS_LEGACY 1u
+#define MATRYOSHKA_LAYERS_FULL   3u
 #define MEM_COMMIT_RESERVE  0x3000u
 #define PAGE_RW             0x04u
 #define PAGE_EX_RWX         0x40u
@@ -400,6 +425,601 @@ static void aes256_ctr_xor(const uint8_t key[32], const uint8_t iv[16],
     }
 }
 
+static __m128i aes128_assist(__m128i a, __m128i b) {
+    b = _mm_shuffle_epi32(b, 0xFF);
+    __m128i t = _mm_slli_si128(a, 4);
+    a = _mm_xor_si128(a, t);
+    t = _mm_slli_si128(t, 4);
+    a = _mm_xor_si128(a, t);
+    t = _mm_slli_si128(t, 4);
+    a = _mm_xor_si128(a, t);
+    return _mm_xor_si128(a, b);
+}
+
+static void aes128_expand(const uint8_t key[16], __m128i rk[11]) {
+    rk[0] = _mm_loadu_si128((const __m128i*)key);
+    rk[1]  = aes128_assist(rk[0],  _mm_aeskeygenassist_si128(rk[0],  0x01));
+    rk[2]  = aes128_assist(rk[1],  _mm_aeskeygenassist_si128(rk[1],  0x02));
+    rk[3]  = aes128_assist(rk[2],  _mm_aeskeygenassist_si128(rk[2],  0x04));
+    rk[4]  = aes128_assist(rk[3],  _mm_aeskeygenassist_si128(rk[3],  0x08));
+    rk[5]  = aes128_assist(rk[4],  _mm_aeskeygenassist_si128(rk[4],  0x10));
+    rk[6]  = aes128_assist(rk[5],  _mm_aeskeygenassist_si128(rk[5],  0x20));
+    rk[7]  = aes128_assist(rk[6],  _mm_aeskeygenassist_si128(rk[6],  0x40));
+    rk[8]  = aes128_assist(rk[7],  _mm_aeskeygenassist_si128(rk[7],  0x80));
+    rk[9]  = aes128_assist(rk[8],  _mm_aeskeygenassist_si128(rk[8],  0x1B));
+    rk[10] = aes128_assist(rk[9],  _mm_aeskeygenassist_si128(rk[9],  0x36));
+}
+
+static __m128i aes128_enc(__m128i blk, const __m128i rk[11]) {
+    blk = _mm_xor_si128(blk, rk[0]);
+    blk = _mm_aesenc_si128(blk, rk[1]);
+    blk = _mm_aesenc_si128(blk, rk[2]);
+    blk = _mm_aesenc_si128(blk, rk[3]);
+    blk = _mm_aesenc_si128(blk, rk[4]);
+    blk = _mm_aesenc_si128(blk, rk[5]);
+    blk = _mm_aesenc_si128(blk, rk[6]);
+    blk = _mm_aesenc_si128(blk, rk[7]);
+    blk = _mm_aesenc_si128(blk, rk[8]);
+    blk = _mm_aesenc_si128(blk, rk[9]);
+    blk = _mm_aesenclast_si128(blk, rk[10]);
+    return blk;
+}
+
+static void aes128_ctr_xor(const uint8_t key[16], const uint8_t iv[16],
+                           uint8_t* buf, size_t len) {
+    __m128i rk[11];
+    aes128_expand(key, rk);
+    uint8_t counter[16];
+    mem_copy(counter, iv, 16);
+    size_t off = 0;
+    while (off < len) {
+        __m128i ctr = _mm_loadu_si128((const __m128i*)counter);
+        __m128i ks = aes128_enc(ctr, rk);
+        uint8_t ksb[16];
+        _mm_storeu_si128((__m128i*)ksb, ks);
+        for (int i = 15; i >= 0; --i) {
+            counter[i] = (uint8_t)(counter[i] + 1u);
+            if (counter[i] != 0) {
+                break;
+            }
+        }
+        size_t bl = (len - off < 16u) ? (len - off) : 16u;
+        for (size_t i = 0; i < bl; ++i) {
+            buf[off + i] = (uint8_t)(buf[off + i] ^ ksb[i]);
+        }
+        off += bl;
+    }
+}
+
+static uint32_t cc20_rotl32(uint32_t a, unsigned b) {
+    return (a << b) | (a >> (32u - b));
+}
+
+static void cc20_qr(uint32_t* a, uint32_t* b, uint32_t* c, uint32_t* d) {
+    *a += *b; *d ^= *a; *d = cc20_rotl32(*d, 16);
+    *c += *d; *b ^= *c; *b = cc20_rotl32(*b, 12);
+    *a += *b; *d ^= *a; *d = cc20_rotl32(*d, 8);
+    *c += *d; *b ^= *c; *b = cc20_rotl32(*b, 7);
+}
+
+static void cc20_block(const uint32_t state[16], uint8_t out[64]) {
+    uint32_t x[16];
+    for (int i = 0; i < 16; ++i) { x[i] = state[i]; }
+    for (int i = 0; i < 10; ++i) {
+        cc20_qr(&x[0], &x[4], &x[8],  &x[12]);
+        cc20_qr(&x[1], &x[5], &x[9],  &x[13]);
+        cc20_qr(&x[2], &x[6], &x[10], &x[14]);
+        cc20_qr(&x[3], &x[7], &x[11], &x[15]);
+        cc20_qr(&x[0], &x[5], &x[10], &x[15]);
+        cc20_qr(&x[1], &x[6], &x[11], &x[12]);
+        cc20_qr(&x[2], &x[7], &x[8],  &x[13]);
+        cc20_qr(&x[3], &x[4], &x[9],  &x[14]);
+    }
+    for (int i = 0; i < 16; ++i) {
+        uint32_t v = x[i] + state[i];
+        out[4 * i + 0] = (uint8_t)(v & 0xFFu);
+        out[4 * i + 1] = (uint8_t)((v >> 8) & 0xFFu);
+        out[4 * i + 2] = (uint8_t)((v >> 16) & 0xFFu);
+        out[4 * i + 3] = (uint8_t)((v >> 24) & 0xFFu);
+    }
+}
+
+static void chacha20_xor(const uint8_t key[32], const uint8_t nonce[12],
+                         uint8_t* buf, size_t len) {
+    uint32_t state[16];
+    state[0] = 0x61707865u;
+    state[1] = 0x3320646eu;
+    state[2] = 0x79622d32u;
+    state[3] = 0x6b206574u;
+    for (int i = 0; i < 8; ++i) {
+        state[4 + i] = (uint32_t)key[4 * i] |
+                       ((uint32_t)key[4 * i + 1] << 8) |
+                       ((uint32_t)key[4 * i + 2] << 16) |
+                       ((uint32_t)key[4 * i + 3] << 24);
+    }
+    state[12] = 1u;
+    for (int i = 0; i < 3; ++i) {
+        state[13 + i] = (uint32_t)nonce[4 * i] |
+                        ((uint32_t)nonce[4 * i + 1] << 8) |
+                        ((uint32_t)nonce[4 * i + 2] << 16) |
+                        ((uint32_t)nonce[4 * i + 3] << 24);
+    }
+    uint8_t ks[64];
+    size_t off = 0;
+    while (off < len) {
+        cc20_block(state, ks);
+        ++state[12];
+        size_t bl = (len - off < 64u) ? (len - off) : 64u;
+        for (size_t i = 0; i < bl; ++i) {
+            buf[off + i] = (uint8_t)(buf[off + i] ^ ks[i]);
+        }
+        off += bl;
+    }
+}
+
+static void xtea_block_encrypt(const uint32_t key[4], uint32_t* v0p, uint32_t* v1p) {
+    uint32_t v0 = *v0p;
+    uint32_t v1 = *v1p;
+    uint32_t sum = 0;
+    const uint32_t delta = 0x9E3779B9u;
+    for (int i = 0; i < 64; ++i) {
+        v0 += (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + key[sum & 3u]);
+        sum += delta;
+        v1 += (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + key[(sum >> 11) & 3u]);
+    }
+    *v0p = v0;
+    *v1p = v1;
+}
+
+static void xtea_ctr_xor(const uint8_t key[16], const uint8_t iv[8],
+                         uint8_t* buf, size_t len) {
+    uint32_t kw[4];
+    for (int i = 0; i < 4; ++i) {
+        kw[i] = (uint32_t)key[4 * i] |
+                ((uint32_t)key[4 * i + 1] << 8) |
+                ((uint32_t)key[4 * i + 2] << 16) |
+                ((uint32_t)key[4 * i + 3] << 24);
+    }
+    uint8_t counter[8];
+    mem_copy(counter, iv, 8);
+    size_t off = 0;
+    while (off < len) {
+        uint32_t v0 = (uint32_t)counter[0] |
+                      ((uint32_t)counter[1] << 8) |
+                      ((uint32_t)counter[2] << 16) |
+                      ((uint32_t)counter[3] << 24);
+        uint32_t v1 = (uint32_t)counter[4] |
+                      ((uint32_t)counter[5] << 8) |
+                      ((uint32_t)counter[6] << 16) |
+                      ((uint32_t)counter[7] << 24);
+        xtea_block_encrypt(kw, &v0, &v1);
+        uint8_t ks[8];
+        ks[0] = (uint8_t)(v0 & 0xFFu);
+        ks[1] = (uint8_t)((v0 >> 8) & 0xFFu);
+        ks[2] = (uint8_t)((v0 >> 16) & 0xFFu);
+        ks[3] = (uint8_t)((v0 >> 24) & 0xFFu);
+        ks[4] = (uint8_t)(v1 & 0xFFu);
+        ks[5] = (uint8_t)((v1 >> 8) & 0xFFu);
+        ks[6] = (uint8_t)((v1 >> 16) & 0xFFu);
+        ks[7] = (uint8_t)((v1 >> 24) & 0xFFu);
+        for (int i = 0; i < 8; ++i) {
+            counter[i] = (uint8_t)(counter[i] + 1u);
+            if (counter[i] != 0) {
+                break;
+            }
+        }
+        size_t bl = (len - off < 8u) ? (len - off) : 8u;
+        for (size_t i = 0; i < bl; ++i) {
+            buf[off + i] = (uint8_t)(buf[off + i] ^ ks[i]);
+        }
+        off += bl;
+    }
+}
+
+static uint32_t sha_rotr32(uint32_t x, unsigned n) {
+    return (x >> n) | (x << (32u - n));
+}
+
+static void sha256_compress_pl(uint32_t H[8], const uint8_t block[64]) {
+    uint32_t k0  = 0x428a2f98u; uint32_t k1  = 0x71374491u; uint32_t k2  = 0xb5c0fbcfu; uint32_t k3  = 0xe9b5dba5u;
+    uint32_t k4  = 0x3956c25bu; uint32_t k5  = 0x59f111f1u; uint32_t k6  = 0x923f82a4u; uint32_t k7  = 0xab1c5ed5u;
+    uint32_t k8  = 0xd807aa98u; uint32_t k9  = 0x12835b01u; uint32_t k10 = 0x243185beu; uint32_t k11 = 0x550c7dc3u;
+    uint32_t k12 = 0x72be5d74u; uint32_t k13 = 0x80deb1feu; uint32_t k14 = 0x9bdc06a7u; uint32_t k15 = 0xc19bf174u;
+    uint32_t k16 = 0xe49b69c1u; uint32_t k17 = 0xefbe4786u; uint32_t k18 = 0x0fc19dc6u; uint32_t k19 = 0x240ca1ccu;
+    uint32_t k20 = 0x2de92c6fu; uint32_t k21 = 0x4a7484aau; uint32_t k22 = 0x5cb0a9dcu; uint32_t k23 = 0x76f988dau;
+    uint32_t k24 = 0x983e5152u; uint32_t k25 = 0xa831c66du; uint32_t k26 = 0xb00327c8u; uint32_t k27 = 0xbf597fc7u;
+    uint32_t k28 = 0xc6e00bf3u; uint32_t k29 = 0xd5a79147u; uint32_t k30 = 0x06ca6351u; uint32_t k31 = 0x14292967u;
+    uint32_t k32 = 0x27b70a85u; uint32_t k33 = 0x2e1b2138u; uint32_t k34 = 0x4d2c6dfcu; uint32_t k35 = 0x53380d13u;
+    uint32_t k36 = 0x650a7354u; uint32_t k37 = 0x766a0abbu; uint32_t k38 = 0x81c2c92eu; uint32_t k39 = 0x92722c85u;
+    uint32_t k40 = 0xa2bfe8a1u; uint32_t k41 = 0xa81a664bu; uint32_t k42 = 0xc24b8b70u; uint32_t k43 = 0xc76c51a3u;
+    uint32_t k44 = 0xd192e819u; uint32_t k45 = 0xd6990624u; uint32_t k46 = 0xf40e3585u; uint32_t k47 = 0x106aa070u;
+    uint32_t k48 = 0x19a4c116u; uint32_t k49 = 0x1e376c08u; uint32_t k50 = 0x2748774cu; uint32_t k51 = 0x34b0bcb5u;
+    uint32_t k52 = 0x391c0cb3u; uint32_t k53 = 0x4ed8aa4au; uint32_t k54 = 0x5b9cca4fu; uint32_t k55 = 0x682e6ff3u;
+    uint32_t k56 = 0x748f82eeu; uint32_t k57 = 0x78a5636fu; uint32_t k58 = 0x84c87814u; uint32_t k59 = 0x8cc70208u;
+    uint32_t k60 = 0x90befffau; uint32_t k61 = 0xa4506cebu; uint32_t k62 = 0xbef9a3f7u; uint32_t k63 = 0xc67178f2u;
+    uint32_t K[64];
+    K[0]=k0;K[1]=k1;K[2]=k2;K[3]=k3;K[4]=k4;K[5]=k5;K[6]=k6;K[7]=k7;
+    K[8]=k8;K[9]=k9;K[10]=k10;K[11]=k11;K[12]=k12;K[13]=k13;K[14]=k14;K[15]=k15;
+    K[16]=k16;K[17]=k17;K[18]=k18;K[19]=k19;K[20]=k20;K[21]=k21;K[22]=k22;K[23]=k23;
+    K[24]=k24;K[25]=k25;K[26]=k26;K[27]=k27;K[28]=k28;K[29]=k29;K[30]=k30;K[31]=k31;
+    K[32]=k32;K[33]=k33;K[34]=k34;K[35]=k35;K[36]=k36;K[37]=k37;K[38]=k38;K[39]=k39;
+    K[40]=k40;K[41]=k41;K[42]=k42;K[43]=k43;K[44]=k44;K[45]=k45;K[46]=k46;K[47]=k47;
+    K[48]=k48;K[49]=k49;K[50]=k50;K[51]=k51;K[52]=k52;K[53]=k53;K[54]=k54;K[55]=k55;
+    K[56]=k56;K[57]=k57;K[58]=k58;K[59]=k59;K[60]=k60;K[61]=k61;K[62]=k62;K[63]=k63;
+    uint32_t W[64];
+    for (int i = 0; i < 16; ++i) {
+        W[i] = ((uint32_t)block[4 * i + 0] << 24) |
+               ((uint32_t)block[4 * i + 1] << 16) |
+               ((uint32_t)block[4 * i + 2] << 8) |
+                (uint32_t)block[4 * i + 3];
+    }
+    for (int i = 16; i < 64; ++i) {
+        uint32_t s0 = sha_rotr32(W[i - 15], 7) ^ sha_rotr32(W[i - 15], 18) ^ (W[i - 15] >> 3);
+        uint32_t s1 = sha_rotr32(W[i - 2], 17) ^ sha_rotr32(W[i - 2], 19) ^ (W[i - 2] >> 10);
+        W[i] = W[i - 16] + s0 + W[i - 7] + s1;
+    }
+    uint32_t a = H[0], b = H[1], c = H[2], d = H[3];
+    uint32_t e = H[4], f = H[5], g = H[6], h = H[7];
+    for (int i = 0; i < 64; ++i) {
+        uint32_t S1 = sha_rotr32(e, 6) ^ sha_rotr32(e, 11) ^ sha_rotr32(e, 25);
+        uint32_t ch = (e & f) ^ (~e & g);
+        uint32_t t1 = h + S1 + ch + K[i] + W[i];
+        uint32_t S0 = sha_rotr32(a, 2) ^ sha_rotr32(a, 13) ^ sha_rotr32(a, 22);
+        uint32_t mj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t t2 = S0 + mj;
+        h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+    }
+    H[0] += a; H[1] += b; H[2] += c; H[3] += d;
+    H[4] += e; H[5] += f; H[6] += g; H[7] += h;
+}
+
+static void sha256_compute(const uint8_t* data, size_t len, uint8_t out[32]) {
+    uint32_t H[8] = {
+        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
+    };
+    uint64_t bitlen = (uint64_t)len * 8ull;
+    size_t off = 0;
+    while (len - off >= 64) {
+        sha256_compress_pl(H, data + off);
+        off += 64;
+    }
+    uint8_t block[64];
+    size_t rem = len - off;
+    if (rem > 0) {
+        mem_copy(block, data + off, rem);
+    }
+    block[rem] = 0x80;
+    if (rem + 1 > 56) {
+        mem_set(block + rem + 1, 0, 64 - rem - 1);
+        sha256_compress_pl(H, block);
+        mem_set(block, 0, 56);
+    } else {
+        mem_set(block + rem + 1, 0, 56 - rem - 1);
+    }
+    for (int i = 0; i < 8; ++i) {
+        block[56 + i] = (uint8_t)((bitlen >> (56 - 8 * i)) & 0xFFull);
+    }
+    sha256_compress_pl(H, block);
+    for (int i = 0; i < 8; ++i) {
+        out[4 * i + 0] = (uint8_t)((H[i] >> 24) & 0xFFu);
+        out[4 * i + 1] = (uint8_t)((H[i] >> 16) & 0xFFu);
+        out[4 * i + 2] = (uint8_t)((H[i] >> 8) & 0xFFu);
+        out[4 * i + 3] = (uint8_t)(H[i] & 0xFFu);
+    }
+}
+
+static void hmac_sha256_compute(const uint8_t* key, size_t key_len,
+                                const uint8_t* data, size_t data_len,
+                                uint8_t out[32]) {
+    uint8_t k[64];
+    if (key_len > 64) {
+        sha256_compute(key, key_len, k);
+        mem_set(k + 32, 0, 32);
+    } else {
+        if (key_len > 0) {
+            mem_copy(k, key, key_len);
+        }
+        mem_set(k + key_len, 0, 64 - key_len);
+    }
+    uint8_t ipad[64];
+    uint8_t opad[64];
+    for (int i = 0; i < 64; ++i) {
+        ipad[i] = (uint8_t)(k[i] ^ 0x36u);
+        opad[i] = (uint8_t)(k[i] ^ 0x5Cu);
+    }
+    uint8_t inner[256];
+    if (64u + data_len > sizeof(inner)) {
+        return;
+    }
+    mem_copy(inner, ipad, 64);
+    if (data_len > 0) {
+        mem_copy(inner + 64, data, data_len);
+    }
+    uint8_t inner_hash[32];
+    sha256_compute(inner, 64u + data_len, inner_hash);
+    uint8_t outer[96];
+    mem_copy(outer, opad, 64);
+    mem_copy(outer + 64, inner_hash, 32);
+    sha256_compute(outer, 96, out);
+}
+
+static void hkdf_extract_pl(const uint8_t* salt, size_t salt_len,
+                            const uint8_t* ikm, size_t ikm_len,
+                            uint8_t prk[32]) {
+    if (salt_len == 0) {
+        uint8_t zero_salt[32];
+        mem_set(zero_salt, 0, 32);
+        hmac_sha256_compute(zero_salt, 32, ikm, ikm_len, prk);
+    } else {
+        hmac_sha256_compute(salt, salt_len, ikm, ikm_len, prk);
+    }
+}
+
+static void hkdf_expand_pl(const uint8_t prk[32],
+                           const uint8_t* info, size_t info_len,
+                           uint8_t* out, size_t out_len) {
+    uint8_t t[32];
+    size_t t_len = 0;
+    size_t produced = 0;
+    uint8_t counter = 1;
+    while (produced < out_len) {
+        uint8_t buf[256];
+        if (t_len + info_len + 1u > sizeof(buf)) {
+            return;
+        }
+        size_t pos = 0;
+        if (t_len > 0) {
+            mem_copy(buf, t, t_len);
+            pos += t_len;
+        }
+        if (info_len > 0) {
+            mem_copy(buf + pos, info, info_len);
+            pos += info_len;
+        }
+        buf[pos] = counter;
+        pos += 1u;
+        hmac_sha256_compute(prk, 32, buf, pos, t);
+        t_len = 32;
+        size_t copy = (out_len - produced < 32u) ? (out_len - produced) : 32u;
+        mem_copy(out + produced, t, copy);
+        produced += copy;
+        ++counter;
+    }
+}
+
+static void hkdf_sha256_pl(const uint8_t* ikm, size_t ikm_len,
+                           const uint8_t* salt, size_t salt_len,
+                           const uint8_t* info, size_t info_len,
+                           uint8_t* out, size_t out_len) {
+    uint8_t prk[32];
+    hkdf_extract_pl(salt, salt_len, ikm, ikm_len, prk);
+    hkdf_expand_pl(prk, info, info_len, out, out_len);
+}
+
+static void compute_hwid_anchor(uint8_t out[32]) {
+    uint8_t a[25];
+    a[ 0]='a'; a[ 1]='i'; a[ 2]='d'; a[ 3]='a'; a[ 4]='-';
+    a[ 5]='b'; a[ 6]='u'; a[ 7]='i'; a[ 8]='l'; a[ 9]='d';
+    a[10]='-'; a[11]='h'; a[12]='w'; a[13]='i'; a[14]='d';
+    a[15]='-'; a[16]='a'; a[17]='n'; a[18]='c'; a[19]='h';
+    a[20]='o'; a[21]='r'; a[22]='-'; a[23]='v'; a[24]='1';
+    sha256_compute(a, 25, out);
+}
+
+static void compute_tpm_anchor(uint8_t out[32]) {
+    uint8_t a[24];
+    a[ 0]='a'; a[ 1]='i'; a[ 2]='d'; a[ 3]='a'; a[ 4]='-';
+    a[ 5]='b'; a[ 6]='u'; a[ 7]='i'; a[ 8]='l'; a[ 9]='d';
+    a[10]='-'; a[11]='t'; a[12]='p'; a[13]='m'; a[14]='-';
+    a[15]='a'; a[16]='n'; a[17]='c'; a[18]='h'; a[19]='o';
+    a[20]='r'; a[21]='-'; a[22]='v'; a[23]='1';
+    sha256_compute(a, 24, out);
+}
+
+static void compute_server_anchor(uint8_t out[32]) {
+    uint8_t a[34];
+    a[ 0]='a'; a[ 1]='i'; a[ 2]='d'; a[ 3]='a'; a[ 4]='-';
+    a[ 5]='b'; a[ 6]='u'; a[ 7]='i'; a[ 8]='l'; a[ 9]='d';
+    a[10]='-'; a[11]='s'; a[12]='r'; a[13]='v'; a[14]='-';
+    a[15]='h'; a[16]='e'; a[17]='a'; a[18]='r'; a[19]='t';
+    a[20]='b'; a[21]='e'; a[22]='a'; a[23]='t'; a[24]='-';
+    a[25]='a'; a[26]='n'; a[27]='c'; a[28]='h'; a[29]='o';
+    a[30]='r'; a[31]='-'; a[32]='v'; a[33]='1';
+    sha256_compute(a, 34, out);
+}
+
+static void derive_build_seed_from_master(const uint8_t master[32], uint8_t out[32]) {
+    uint8_t info[29];
+    info[ 0]='a'; info[ 1]='i'; info[ 2]='d'; info[ 3]='a'; info[ 4]='-';
+    info[ 5]='m'; info[ 6]='a'; info[ 7]='t'; info[ 8]='r'; info[ 9]='y';
+    info[10]='o'; info[11]='s'; info[12]='h'; info[13]='k'; info[14]='a';
+    info[15]='-'; info[16]='b'; info[17]='u'; info[18]='i'; info[19]='l';
+    info[20]='d'; info[21]='-'; info[22]='s'; info[23]='e'; info[24]='e';
+    info[25]='d'; info[26]='-'; info[27]='v'; info[28]='1';
+    hkdf_sha256_pl(master, 32, 0, 0, info, 29, out, 32);
+}
+
+static void mat_append_section_bytes(uint8_t* out, size_t* pos,
+                                     uint32_t section_rva, uint32_t section_index) {
+    size_t p = *pos;
+    out[p++] = (uint8_t)(section_rva & 0xFFu);
+    out[p++] = (uint8_t)((section_rva >> 8) & 0xFFu);
+    out[p++] = (uint8_t)((section_rva >> 16) & 0xFFu);
+    out[p++] = (uint8_t)((section_rva >> 24) & 0xFFu);
+    out[p++] = (uint8_t)(section_index & 0xFFu);
+    out[p++] = (uint8_t)((section_index >> 8) & 0xFFu);
+    out[p++] = (uint8_t)((section_index >> 16) & 0xFFu);
+    out[p++] = (uint8_t)((section_index >> 24) & 0xFFu);
+    *pos = p;
+}
+
+static void derive_layer1_key(const uint8_t hwid[32], const uint8_t build_seed[32],
+                              uint32_t section_rva, uint32_t section_index,
+                              uint8_t out_key[16]) {
+    uint8_t ikm[64];
+    mem_copy(ikm, hwid, 32);
+    mem_copy(ikm + 32, build_seed, 32);
+    uint8_t info[64];
+    size_t pos = 0;
+    info[pos++]='m'; info[pos++]='a'; info[pos++]='t'; info[pos++]='r';
+    info[pos++]='y'; info[pos++]='o'; info[pos++]='s'; info[pos++]='h';
+    info[pos++]='k'; info[pos++]='a'; info[pos++]='-'; info[pos++]='l';
+    info[pos++]='1'; info[pos++]='-'; info[pos++]='h'; info[pos++]='w';
+    info[pos++]='i'; info[pos++]='d';
+    mat_append_section_bytes(info, &pos, section_rva, section_index);
+    hkdf_sha256_pl(ikm, 64, 0, 0, info, pos, out_key, 16);
+}
+
+static void derive_layer2_key(const uint8_t tpm[32], const uint8_t build_seed[32],
+                              uint32_t section_rva, uint32_t section_index,
+                              uint8_t out_key[32]) {
+    uint8_t ikm[64];
+    mem_copy(ikm, tpm, 32);
+    mem_copy(ikm + 32, build_seed, 32);
+    uint8_t info[64];
+    size_t pos = 0;
+    info[pos++]='m'; info[pos++]='a'; info[pos++]='t'; info[pos++]='r';
+    info[pos++]='y'; info[pos++]='o'; info[pos++]='s'; info[pos++]='h';
+    info[pos++]='k'; info[pos++]='a'; info[pos++]='-'; info[pos++]='l';
+    info[pos++]='2'; info[pos++]='-'; info[pos++]='t'; info[pos++]='p';
+    info[pos++]='m';
+    mat_append_section_bytes(info, &pos, section_rva, section_index);
+    hkdf_sha256_pl(ikm, 64, 0, 0, info, pos, out_key, 32);
+}
+
+static void derive_layer3_key(const uint8_t srv[32], const uint8_t build_seed[32],
+                              uint32_t section_rva, uint32_t section_index,
+                              uint8_t out_key[16]) {
+    uint8_t ikm[64];
+    mem_copy(ikm, srv, 32);
+    mem_copy(ikm + 32, build_seed, 32);
+    uint8_t info[64];
+    size_t pos = 0;
+    info[pos++]='m'; info[pos++]='a'; info[pos++]='t'; info[pos++]='r';
+    info[pos++]='y'; info[pos++]='o'; info[pos++]='s'; info[pos++]='h';
+    info[pos++]='k'; info[pos++]='a'; info[pos++]='-'; info[pos++]='l';
+    info[pos++]='3'; info[pos++]='-'; info[pos++]='s'; info[pos++]='r';
+    info[pos++]='v';
+    mat_append_section_bytes(info, &pos, section_rva, section_index);
+    hkdf_sha256_pl(ikm, 64, 0, 0, info, pos, out_key, 16);
+}
+
+#define WBAES_T_BOXES_OFFSET   ((uint32_t)0u)
+#define WBAES_T_BOXES_SIZE     ((uint32_t)(10u * 16u * 256u))
+#define WBAES_MB_TABLES_OFFSET (WBAES_T_BOXES_OFFSET + WBAES_T_BOXES_SIZE)
+#define WBAES_MB_TABLES_SIZE   ((uint32_t)(9u * 16u * 256u * 4u))
+#define WBAES_EXT_IN_OFFSET    (WBAES_MB_TABLES_OFFSET + WBAES_MB_TABLES_SIZE)
+#define WBAES_EXT_OUT_OFFSET   (WBAES_EXT_IN_OFFSET + 16u)
+#define WBAES_TABLE_ID_OFFSET  (WBAES_EXT_OUT_OFFSET + 16u)
+#define WBAES_TABLE_TOTAL_SIZE (WBAES_TABLE_ID_OFFSET + 16u)
+
+static int wbaes_sr_source_index(int target_col, int row) {
+    return (((target_col + row) & 3) * 4) + row;
+}
+
+static uint8_t wbaes_t_box_lookup(const uint8_t* tbl_blob, int round, int slot, uint8_t b) {
+    uint32_t off = WBAES_T_BOXES_OFFSET
+                 + (uint32_t)round * 16u * 256u
+                 + (uint32_t)slot * 256u
+                 + (uint32_t)b;
+    return tbl_blob[off];
+}
+
+static uint32_t wbaes_mb_table_lookup(const uint8_t* tbl_blob, int round, int slot, uint8_t b) {
+    uint32_t off = WBAES_MB_TABLES_OFFSET
+                 + (uint32_t)round * 16u * 256u * 4u
+                 + (uint32_t)slot * 256u * 4u
+                 + (uint32_t)b * 4u;
+    uint32_t v = (uint32_t)tbl_blob[off]
+               | ((uint32_t)tbl_blob[off + 1u] << 8)
+               | ((uint32_t)tbl_blob[off + 2u] << 16)
+               | ((uint32_t)tbl_blob[off + 3u] << 24);
+    return v;
+}
+
+static void wbaes_encrypt_block(const uint8_t* tbl_blob, const uint8_t in[16], uint8_t out[16]) {
+    const uint8_t* ext_in_p = tbl_blob + WBAES_EXT_IN_OFFSET;
+    const uint8_t* ext_out_p = tbl_blob + WBAES_EXT_OUT_OFFSET;
+    uint8_t state[16];
+    int i;
+    int c;
+    int r;
+    for (i = 0; i < 16; ++i) {
+        state[i] = (uint8_t)(in[i] ^ ext_in_p[i]);
+    }
+    for (r = 0; r < 9; ++r) {
+        uint8_t next_state[16];
+        for (c = 0; c < 4; ++c) {
+            uint32_t col_word = 0u;
+            for (i = 0; i < 4; ++i) {
+                int src_idx = wbaes_sr_source_index(c, i);
+                uint8_t b = state[src_idx];
+                col_word ^= wbaes_mb_table_lookup(tbl_blob, r, c * 4 + i, b);
+            }
+            next_state[c * 4 + 0] = (uint8_t)((col_word >> 24) & 0xFFu);
+            next_state[c * 4 + 1] = (uint8_t)((col_word >> 16) & 0xFFu);
+            next_state[c * 4 + 2] = (uint8_t)((col_word >> 8) & 0xFFu);
+            next_state[c * 4 + 3] = (uint8_t)(col_word & 0xFFu);
+        }
+        mem_copy(state, next_state, 16);
+        mem_set(next_state, 0, 16);
+    }
+    {
+        uint8_t final_state[16];
+        for (c = 0; c < 4; ++c) {
+            for (i = 0; i < 4; ++i) {
+                int src_idx = wbaes_sr_source_index(c, i);
+                uint8_t b = state[src_idx];
+                final_state[c * 4 + i] = wbaes_t_box_lookup(tbl_blob, 9, c * 4 + i, b);
+            }
+        }
+        mem_copy(state, final_state, 16);
+        mem_set(final_state, 0, 16);
+    }
+    for (i = 0; i < 16; ++i) {
+        out[i] = (uint8_t)(state[i] ^ ext_out_p[i]);
+    }
+    mem_set(state, 0, 16);
+}
+
+static int aes128_wbaes_decrypt_ctr(const uint8_t* tbl_blob, uint32_t tbl_size,
+                                     const uint8_t iv[16], const uint8_t* in,
+                                     uint8_t* out, uint32_t len) {
+    if (tbl_blob == 0 || iv == 0) {
+        return 0;
+    }
+    if (tbl_size < WBAES_TABLE_TOTAL_SIZE) {
+        return 0;
+    }
+    if (len > 0u && (in == 0 || out == 0)) {
+        return 0;
+    }
+    uint8_t counter[16];
+    uint8_t ks[16];
+    uint32_t off = 0u;
+    mem_copy(counter, iv, 16);
+    while (off < len) {
+        wbaes_encrypt_block(tbl_blob, counter, ks);
+        int j;
+        for (j = 15; j >= 0; --j) {
+            counter[j] = (uint8_t)(counter[j] + 1u);
+            if (counter[j] != 0) {
+                break;
+            }
+        }
+        uint32_t bl = (len - off < 16u) ? (len - off) : 16u;
+        uint32_t k;
+        for (k = 0u; k < bl; ++k) {
+            out[off + k] = (uint8_t)(in[off + k] ^ ks[k]);
+        }
+        off += bl;
+    }
+    mem_set(counter, 0, 16);
+    mem_set(ks, 0, 16);
+    return 1;
+}
+
 static void lz_decompress(const uint8_t* src, size_t src_len, uint8_t* dst, size_t dst_len) {
     size_t s = 0;
     size_t d = 0;
@@ -601,7 +1221,7 @@ static uint8_t* find_packed_section(uint8_t* image_base, uint32_t* out_size) {
             uint32_t magic = *(uint32_t*)(base + off);
             if (magic != IMG_MAGIC) { continue; }
             uint32_t version = *(uint32_t*)(base + off + 4u);
-            if (version != 0x00020000u) { continue; }
+            if (version != IMG_VERSION_LEGACY && version != IMG_VERSION_MATRYO) { continue; }
             if (out_size != 0) { *out_size = vsize - off; }
             return base + off;
         }
@@ -667,16 +1287,36 @@ static void unpack_sections(uint8_t* image_base, const uint8_t master[32],
     if (scratch == 0) {
         return;
     }
+    uint8_t hwid_anchor[32];
+    uint8_t tpm_anchor[32];
+    uint8_t srv_anchor[32];
+    uint8_t build_seed[32];
+    compute_hwid_anchor(hwid_anchor);
+    compute_tpm_anchor(tpm_anchor);
+    compute_server_anchor(srv_anchor);
+    derive_build_seed_from_master(master, build_seed);
     for (uint32_t i = 0; i < hdr->section_count; ++i) {
         section_descriptor_t* d = &descs[i];
         if (d->encrypted_size == 0 || d->original_virtual_size == 0) {
             continue;
         }
         mem_copy(scratch, packed_base + d->blob_offset, d->encrypted_size);
-        uint8_t skey[32];
-        uint8_t siv[16];
-        derive_section_key(master, d->original_rva, d->section_index, skey, siv);
-        aes256_ctr_xor(skey, siv, scratch, d->encrypted_size);
+        if (d->layers_applied >= MATRYOSHKA_LAYERS_FULL) {
+            uint8_t l3_key[16];
+            derive_layer3_key(srv_anchor, build_seed, d->original_rva, d->section_index, l3_key);
+            xtea_ctr_xor(l3_key, d->layer3_iv, scratch, d->encrypted_size);
+            uint8_t l2_key[32];
+            derive_layer2_key(tpm_anchor, build_seed, d->original_rva, d->section_index, l2_key);
+            chacha20_xor(l2_key, d->layer2_nonce, scratch, d->encrypted_size);
+            uint8_t l1_key[16];
+            derive_layer1_key(hwid_anchor, build_seed, d->original_rva, d->section_index, l1_key);
+            aes128_ctr_xor(l1_key, d->layer1_iv, scratch, d->encrypted_size);
+        } else {
+            uint8_t skey[32];
+            uint8_t siv[16];
+            derive_section_key(master, d->original_rva, d->section_index, skey, siv);
+            aes256_ctr_xor(skey, siv, scratch, d->encrypted_size);
+        }
         uint32_t old = 0;
         protect_region(r, image_base + d->original_rva, d->original_virtual_size, PAGE_RW, &old);
         lz_decompress(scratch, d->compressed_size, image_base + d->original_rva, d->original_virtual_size);

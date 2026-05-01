@@ -327,6 +327,18 @@ namespace mba {
         return _rotr64(r, static_cast<int>(c & 0x3F)) ^ _rotl64(r, static_cast<int>((c >> 6) & 0x3F)) ^ (a ^ b);
     }
 
+    __forceinline uint64_t keyed_and_dynamic(uint64_t a, uint64_t b, uint64_t entropy)
+    {
+        uint64_t c0 = dynamic_coefficient(entropy, 4);
+        uint64_t c1 = dynamic_coefficient(entropy, 5);
+        uint64_t c2 = dynamic_coefficient(entropy, 6);
+        uint64_t rot_a = _rotl64(a ^ c0, static_cast<int>(c1 & 0x3F));
+        uint64_t rot_b = _rotr64(b ^ c1, static_cast<int>((c0 >> 6) & 0x3F));
+        uint64_t base = keyed_and(rot_a, rot_b, entropy ^ c2);
+        uint64_t mba = (rot_a + rot_b) - (rot_a | rot_b);
+        return (base ^ mba) * c2;
+    }
+
 }
 
 struct decryptor_stub_t

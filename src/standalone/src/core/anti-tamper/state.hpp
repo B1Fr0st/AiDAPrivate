@@ -2,13 +2,18 @@
 
 #include <windows.h>
 #include <psapi.h>
+#include <intrin.h>
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "key_pipeline.hpp"
+#include "hardware_id/hardware_id.hpp"
 
 namespace anti_tamper {
 namespace state {
@@ -79,6 +84,23 @@ struct runtime_t
 
     std::vector<uint32_t> vm_nested_rvas;
     std::unordered_map<uint32_t, uint32_t> atp_flags;
+
+    std::atomic<uint64_t> watchdog_last_tick_ms{0};
+    std::atomic<uint64_t> worker_a_last_tick_ms{0};
+    std::atomic<uint64_t> worker_b_last_tick_ms{0};
+    std::atomic<uint64_t> worker_c_last_tick_ms{0};
+    std::atomic<uint64_t> witness_chain_a{0};
+    std::atomic<uint64_t> witness_chain_b{0};
+    std::atomic<uint64_t> witness_chain_c{0};
+    std::atomic<uint64_t> reattest_last_proof_token{0};
+    std::atomic<uint64_t> reattest_last_success_ms{0};
+    std::atomic<uint64_t> reattest_first_failure_ms{0};
+    std::atomic<bool> watchdog_running{false};
+
+    std::atomic<bool>     decoy_honeypot_tripped{false};
+    std::atomic<int64_t>  decoy_honeypot_trip_ms{0};
+    std::atomic<bool>     decoy_degrade_active{false};
+    std::atomic<uint32_t> decoy_honeypot_count{0};
 };
 
 inline runtime_t& get()
@@ -87,12 +109,81 @@ inline runtime_t& get()
     return inst;
 }
 
-inline constexpr uint8_t g_vm_master_key[32] = {
-    0x3C, 0x6E, 0xF3, 0x72, 0xFE, 0x94, 0xF8, 0x2B,
-    0xA5, 0x4F, 0xF5, 0x3A, 0x5F, 0x1D, 0x36, 0xF1,
-    0x51, 0x0E, 0x52, 0x7F, 0xAD, 0xE6, 0x82, 0xD1,
-    0x9B, 0x05, 0x68, 0x8C, 0x2B, 0x3E, 0x6C, 0x1F
+namespace detail_master_key {
+
+    inline std::atomic<bool>& s_initialized()
+    {
+        static std::atomic<bool> v{false};
+        return v;
+    }
+
+    inline std::once_flag& s_once_flag()
+    {
+        static std::once_flag f;
+        return f;
+    }
+
+    inline uint8_t* storage()
+    {
+        alignas(32) static uint8_t buf[32] = {};
+        return buf;
+    }
+
+    inline void derive_now()
+    {
+        auto anchors = aida::hardware_id::collect_user_mode();
+        std::string canonical = aida::hardware_id::canonical_string(anchors);
+
+        uint8_t* dst = storage();
+        bool ok = key_pipeline::derive(
+            "aida.vm.master",
+            reinterpret_cast<const uint8_t*>(canonical.data()),
+            canonical.size(),
+            dst, 32);
+
+        if (!ok)
+        {
+            int cpu_info[4] = {};
+            __cpuid(cpu_info, 1);
+            uint8_t fallback_salt[32];
+            std::memcpy(fallback_salt, cpu_info, sizeof(cpu_info));
+            uint64_t pid_tsc[2] = { static_cast<uint64_t>(GetCurrentProcessId()), __rdtsc() };
+            std::memcpy(fallback_salt + 16, pid_tsc, 16);
+
+            ok = key_pipeline::derive(
+                "aida.vm.master.fallback",
+                fallback_salt, sizeof(fallback_salt),
+                dst, 32);
+            SecureZeroMemory(fallback_salt, sizeof(fallback_salt));
+        }
+
+        if (!ok)
+            __fastfail(0xA1DAA0E1u);
+
+        s_initialized().store(true, std::memory_order_release);
+    }
+
+    inline const uint8_t* materialize()
+    {
+        std::call_once(s_once_flag(), derive_now);
+        return storage();
+    }
+
+}
+
+struct vm_master_key_proxy_t
+{
+    operator const uint8_t*() const noexcept
+    {
+        return detail_master_key::materialize();
+    }
+    const uint8_t* data() const noexcept
+    {
+        return detail_master_key::materialize();
+    }
 };
+
+inline const vm_master_key_proxy_t g_vm_master_key{};
 
 }
 }

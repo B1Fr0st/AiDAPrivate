@@ -345,13 +345,14 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 	};
 
 
+	debugger_engine::request_refresh(100);
 	{
 		float px = ox, py = oy, pw = left_w - 1.f, ph = top_h - 1.f;
 		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
 			_ta(_t.bg_base));
 		draw_panel_header(px, py, pw, "Disassembly");
 
-		auto regs = debugger_engine::get_registers();
+		auto regs = debugger_engine::cached_registers();
 		uint64_t rip = regs.rip;
 
 		if (rip != ui.prev_rip && rip != 0) {
@@ -361,9 +362,10 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 		ui_anim::decay_flash(ui.rip_flash, 3.f, dt);
 
 		if (rip != 0) {
-			std::vector<uint8_t> code;
-			if (driver_bridge::read_memory(rip > 0x100 ? rip - 0x100 : 0, 0x400, code)) {
-				uint64_t base = rip > 0x100 ? rip - 0x100 : 0;
+			debugger_engine::request_disasm_refresh(rip, 100);
+			uint64_t base = 0;
+			std::vector<uint8_t> code = debugger_engine::cached_disasm_window(base);
+			if (!code.empty()) {
 
 				std::vector<AsmInstr> insns;
 				{
@@ -491,7 +493,7 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 			_ta(_t.bg_base));
 		draw_panel_header(px, py, pw, "Registers");
 
-		auto regs = debugger_engine::get_registers();
+		auto regs = debugger_engine::cached_registers();
 		struct reg_info { const char* name; uint64_t val; int idx; };
 		reg_info regs_list[] = {
 			{"RAX", regs.rax, 0}, {"RBX", regs.rbx, 1}, {"RCX", regs.rcx, 2}, {"RDX", regs.rdx, 3},
@@ -563,7 +565,7 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 
 		uint64_t dump_addr = ui.dump_address;
 		if (dump_addr == 0) {
-			auto regs = debugger_engine::get_registers();
+			auto regs = debugger_engine::cached_registers();
 			dump_addr = regs.rsp;
 		}
 
@@ -572,8 +574,12 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 			size_t bytes_per_row = 16;
 			size_t total_bytes = static_cast<size_t>(rows) * bytes_per_row;
 
-			std::vector<uint8_t> buf;
-			driver_bridge::read_memory(dump_addr, total_bytes, buf);
+			debugger_engine::request_dump_refresh(dump_addr, total_bytes, 100);
+			uint64_t cached_addr = 0;
+			size_t   cached_size = 0;
+			std::vector<uint8_t> buf = debugger_engine::cached_dump_bytes(cached_addr, cached_size);
+			if (cached_addr != dump_addr || cached_size != total_bytes)
+				buf.clear();
 
 			static std::vector<uint8_t> prev_dump;
 			static std::vector<float> dump_byte_flash;
@@ -661,15 +667,17 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
 			_ta(_t.bg_base));
 		draw_panel_header(px, py, pw, "Stack");
-		auto regs = debugger_engine::get_registers();
+		auto regs = debugger_engine::cached_registers();
 		uint64_t rsp = regs.rsp;
 
 		if (rsp != 0) {
 			int rows = static_cast<int>((ph - HEADER_H) / ROW_HEIGHT);
 			size_t total = static_cast<size_t>(rows) * 8;
 
-			std::vector<uint8_t> buf;
-			driver_bridge::read_memory(rsp, total, buf);
+			debugger_engine::request_stack_refresh(rsp, total, 100);
+			uint64_t cached_rsp = 0;
+			std::vector<uint8_t> buf = debugger_engine::cached_stack_bytes(cached_rsp);
+			if (cached_rsp != rsp) buf.clear();
 
 			float dy = py + HEADER_H;
 			ImGui::PushClipRect(ImVec2(px, dy), ImVec2(px + pw, py + ph), true);
@@ -1158,7 +1166,8 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 		ui_anim::render_table_header(dl, ox, oy, w, HEADER_H, cols, 4, ar, ag, ab, a);
 	}
 
-	auto threads = driver_bridge::enumerate_threads();
+	debugger_engine::request_thread_refresh(250);
+	auto threads = debugger_engine::cached_thread_list();
 	float body_y = oy + HEADER_H;
 	ImGui::PushClipRect(ImVec2(ox, body_y), ImVec2(ox + w, oy + h), true);
 

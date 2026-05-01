@@ -76,8 +76,9 @@
     <ClCompile>
       <LanguageStandard>stdcpplatest</LanguageStandard>
       <LanguageStandard_C>stdclatest</LanguageStandard_C>
+      <AdditionalOptions>/guard:cf %(AdditionalOptions)</AdditionalOptions>
       <BufferSecurityCheck>false</BufferSecurityCheck>
-      <ControlFlowGuard>false</ControlFlowGuard>
+      <ControlFlowGuard>Guard</ControlFlowGuard>
       <TreatWarningAsError>false</TreatWarningAsError>
       <DisableSpecificWarnings>4083;4005;4244;4714;4189;%(DisableSpecificWarnings)</DisableSpecificWarnings>
       <SpectreMitigation>false</SpectreMitigation>
@@ -87,6 +88,7 @@
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
       <TreatLinkerWarningAsErrors>false</TreatLinkerWarningAsErrors>
       <AdditionalDependencies>cng.lib;netio.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions>/guard:cf %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>

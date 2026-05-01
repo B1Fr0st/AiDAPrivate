@@ -42,7 +42,7 @@ inline state_t g_state;
 
 namespace detail {
 
-inline bool spoof_peb_flags(uint32_t pid)
+inline bool spoof_peb_flags()
 {
 	bool ok = driver_bridge::spoof_debug_flags();
 	return ok;
@@ -143,7 +143,7 @@ inline bool enable_stealth(uint32_t pid)
 	g_state.session = {};
 	g_state.session.pid = pid;
 
-	bool peb_ok = detail::spoof_peb_flags(pid);
+	bool peb_ok = detail::spoof_peb_flags();
 	g_state.session.peb_spoofed = peb_ok;
 
 	std::string status_parts;

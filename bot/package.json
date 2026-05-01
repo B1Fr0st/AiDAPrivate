@@ -4,11 +4,16 @@
   "description": "Discord bot for managing AiDA license keys via PostgreSQL",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node bot.js",
+    "test": "node --test tests/*.js",
+    "audit:verify": "node -e \"const a=require('./audit'); const r=a.verifyAuditLog(); console.log(JSON.stringify(r)); process.exit(r.ok?0:1);\""
   },
   "dependencies": {
     "discord.js": "^14.16.3",
     "pg": "^8.13.1",
     "uuid": "^11.1.0"
+  },
+  "optionalDependencies": {
+    "@aws-sdk/client-s3": "^3.654.0"
   }
 }

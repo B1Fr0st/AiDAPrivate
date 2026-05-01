@@ -315,9 +315,80 @@ inline void enforce_violation(const char* reason, const std::string& extra = "")
     CFF_END(ev_cff)
 }
 
+namespace enforcement {
+
+    inline int64_t now_ms()
+    {
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        ULARGE_INTEGER ui;
+        ui.LowPart  = ft.dwLowDateTime;
+        ui.HighPart = ft.dwHighDateTime;
+        return static_cast<int64_t>(ui.QuadPart / 10000ULL);
+    }
+
+    inline int64_t degrade_delay_ms()
+    {
+        char buf[32] = {};
+        DWORD n = GetEnvironmentVariableA("AIDA_DECOY_DEGRADE_MS", buf, 31);
+        if (n > 0 && n < 31)
+        {
+            int64_t v = _atoi64(buf);
+            if (v > 0 && v < 24LL * 3600LL * 1000LL)
+                return v;
+        }
+        return 10LL * 60LL * 1000LL;
+    }
+
+    inline void degrade_mode()
+    {
+        auto& rt = state::get();
+        bool was = rt.decoy_degrade_active.exchange(true);
+        if (was) return;
+
+        webhook::write_log("decoy", "degrade_mode_active");
+
+        rt.license_pending_activation.store(true, std::memory_order_release);
+        rt.activation_hardening_done.store(false, std::memory_order_release);
+    }
+
+    inline bool is_degraded()
+    {
+        return state::get().decoy_degrade_active.load(std::memory_order_acquire);
+    }
+
+    inline void trip_honeypot_silent()
+    {
+        auto& rt = state::get();
+        bool was = rt.decoy_honeypot_tripped.exchange(true);
+        rt.decoy_honeypot_count.fetch_add(1, std::memory_order_relaxed);
+        if (was) return;
+        rt.decoy_honeypot_trip_ms.store(now_ms(), std::memory_order_release);
+        webhook::write_log("decoy", "honeypot_tripped_silent");
+    }
+
+    inline void poll_decoy_degrade()
+    {
+        auto& rt = state::get();
+        if (!rt.decoy_honeypot_tripped.load(std::memory_order_acquire))
+            return;
+        if (rt.decoy_degrade_active.load(std::memory_order_acquire))
+            return;
+        int64_t trip = rt.decoy_honeypot_trip_ms.load(std::memory_order_acquire);
+        if (trip == 0) return;
+        int64_t elapsed = now_ms() - trip;
+        if (elapsed >= degrade_delay_ms())
+            degrade_mode();
+    }
+
+}
+
 inline void enforcement_tick()
 {
     auto& rt = state::get();
+
+    enforcement::poll_decoy_degrade();
+
     if (!rt.violation_latched.load())
         return;
 

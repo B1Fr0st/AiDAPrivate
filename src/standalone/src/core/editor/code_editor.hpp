@@ -68,4 +68,6 @@ void trigger_redo();
 void open_find();
 void open_replace();
 
+std::string last_error();
+
 }

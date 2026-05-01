@@ -3,8 +3,11 @@
 const express = require('express');
 const crypto = require('crypto');
 const pool = require('../db/pool');
+const hmacAuth = require('../middleware/hmac_auth');
 
 const router = express.Router();
+
+router.use(hmacAuth.authenticate);
 
 const CLIENT_PUBKEY_B64 = process.env.CLIENT_TELEMETRY_PUBKEY_B64 || '';
 const DISCORD_WEBHOOK = process.env.DISCORD_TELEMETRY_WEBHOOK || '';

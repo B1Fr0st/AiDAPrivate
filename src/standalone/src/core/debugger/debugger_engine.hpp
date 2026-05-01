@@ -1,7 +1,9 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -39,6 +41,14 @@ struct breakpoint_t {
 	int         hit_count = 0;
 	uint8_t     original_byte = 0;
 	bool        is_internal = false;
+	bool        auto_continue = false;
+	bool        byte_written = false;
+};
+
+struct internal_bp_t {
+	uint64_t address = 0;
+	uint8_t  original_byte = 0;
+	bool     active = false;
 };
 
 
@@ -113,6 +123,15 @@ struct string_ref_t {
 };
 
 
+struct cached_thread_t {
+	uint32_t    tid = 0;
+	uint32_t    owner_pid = 0;
+	int         priority = 0;
+	uint32_t    state = 0;
+	uint64_t    rip = 0;
+};
+
+
 enum class dbg_status_t : int {
 	idle = 0,
 	running,
@@ -130,6 +149,7 @@ struct state_t {
 
 	std::mutex                 bp_mutex;
 	std::vector<breakpoint_t>  breakpoints;
+	std::vector<internal_bp_t> internal_breakpoints;
 	int                        next_bp_id = 1;
 
 
@@ -171,6 +191,39 @@ struct state_t {
 
 	std::thread                  worker_thread;
 	std::atomic<bool>            worker_active{false};
+
+
+	std::mutex                   log_mutex;
+	std::deque<std::string>      log_messages;
+	size_t                       log_messages_max = 4096;
+
+
+	std::mutex                       cache_mtx;
+	register_set_t                   cached_regs{};
+	std::vector<cached_thread_t>     cached_threads;
+	std::vector<uint8_t>             cached_stack;
+	uint64_t                         cached_stack_addr = 0;
+	std::vector<uint8_t>             cached_dump;
+	uint64_t                         cached_dump_addr = 0;
+	size_t                           cached_dump_size = 0;
+	std::vector<uint8_t>             cached_disasm_bytes;
+	uint64_t                         cached_disasm_base = 0;
+	std::atomic<uint64_t>            last_refresh_ms{0};
+	std::atomic<uint64_t>            last_thread_refresh_ms{0};
+	std::atomic<uint64_t>            last_stack_refresh_ms{0};
+	std::atomic<uint64_t>            last_dump_refresh_ms{0};
+	std::atomic<uint64_t>            last_disasm_refresh_ms{0};
+	std::atomic<bool>                refresh_in_flight{false};
+	std::atomic<bool>                thread_refresh_in_flight{false};
+	std::atomic<bool>                stack_refresh_in_flight{false};
+	std::atomic<bool>                dump_refresh_in_flight{false};
+	std::atomic<bool>                disasm_refresh_in_flight{false};
+
+
+	std::mutex                       trap_mtx;
+	std::condition_variable          trap_cv;
+	std::atomic<bool>                trap_signaled{false};
+	uint64_t                         pending_trap_address = 0;
 };
 
 inline state_t g_state;
@@ -185,6 +238,21 @@ int  add_breakpoint(uint64_t address, bp_type_t type = bp_type_t::software,
 bool remove_breakpoint(int index);
 bool toggle_breakpoint(int index);
 void clear_all_breakpoints();
+bool set_breakpoint_condition(int index, const std::string& condition);
+bool set_breakpoint_log(int index, const std::string& log_text, bool auto_continue);
+
+
+enum class bp_hit_action_t : int {
+	stop = 0,
+	resume,
+};
+
+bp_hit_action_t handle_breakpoint_hit(uint64_t address);
+
+
+std::vector<std::string> pop_log_messages();
+size_t log_message_count();
+const std::string& last_error();
 
 
 bool run_target();
@@ -192,11 +260,29 @@ bool pause_target();
 bool step_into();
 bool step_over();
 bool step_out();
-bool run_to_address(uint64_t address);
+bool run_to_address(uint64_t address, bool wait_for_completion = false, uint32_t timeout_ms = 30000);
 
 
 register_set_t get_registers();
 bool set_register(const std::string& name, uint64_t value);
+
+
+register_set_t              cached_registers();
+std::vector<cached_thread_t> cached_thread_list();
+std::vector<uint8_t>        cached_stack_bytes(uint64_t& addr_out);
+std::vector<uint8_t>        cached_dump_bytes(uint64_t& addr_out, size_t& size_out);
+std::vector<uint8_t>        cached_disasm_window(uint64_t& base_out);
+
+void request_refresh(uint32_t max_age_ms = 100);
+void request_thread_refresh(uint32_t max_age_ms = 250);
+void request_stack_refresh(uint64_t rsp, size_t bytes, uint32_t max_age_ms = 100);
+void request_dump_refresh(uint64_t addr, size_t bytes, uint32_t max_age_ms = 100);
+void request_disasm_refresh(uint64_t rip, uint32_t max_age_ms = 100);
+void invalidate_cache();
+
+
+void signal_trap(uint64_t address);
+bool wait_for_trap(uint64_t expected_address, uint32_t timeout_ms);
 
 
 std::vector<stack_frame_t> get_call_stack();

@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace aida::hardware_id
 {
@@ -31,6 +32,16 @@ namespace aida::hardware_id
         int         anchor_count = 0;
     };
 
+    struct tpm_attest_t
+    {
+        bool         present = false;
+        std::string  ek_pub_sha256;
+        std::string  pcr_composite_sha256;
+        std::string  hwid_component_sha256;
+        std::vector<std::array<unsigned char, 32>> pcr_values;
+        std::vector<unsigned char> ek_pub_der;
+    };
+
     anchor_set_t collect_user_mode() noexcept;
 
     bool collect_from_driver(anchor_set_t& out) noexcept;
@@ -38,4 +49,9 @@ namespace aida::hardware_id
     composite_t hash_anchors(const anchor_set_t& anchors) noexcept;
 
     std::string canonical_string(const anchor_set_t& anchors) noexcept;
+
+    bool collect_tpm_attestation(tpm_attest_t& out) noexcept;
+
+    composite_t hash_anchors_with_tpm(const anchor_set_t& anchors,
+                                      const tpm_attest_t& tpm) noexcept;
 }

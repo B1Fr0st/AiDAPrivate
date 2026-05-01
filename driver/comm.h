@@ -1023,22 +1023,28 @@ namespace voyager {
 
             std::uint8_t ve_trigger;
             std::uint8_t ve_lbr_stack;
-            std::uint8_t ve_garbage_msr;
             std::uint8_t ve_xsetbv_gp;
-            std::uint8_t ve_synthetic_msr;
-            std::uint8_t ve_cpuid_leaf_cmp;
-            std::uint8_t ve_rdtsc_cpuid;
-            std::uint8_t ve_aperf_divergence;
-            std::uint8_t ve_invd_cache;
             std::uint8_t ve_cr4_vmxe;
-            std::uint8_t ve_lbr_tos;
 
-            std::uint8_t total_failed;
+            std::uint8_t vmf_cpuid_vendor;
+            std::uint8_t vmf_hyperv_guest;
+            std::uint8_t vmf_smbios_vm;
+            std::uint8_t vmf_acpi_vm;
+            std::uint8_t vmf_pci_vm;
+            std::uint8_t vmf_disk_vm;
+            std::uint8_t vmf_mac_vm;
+            std::uint8_t vmf_registry_vm;
+
             std::uint8_t total_run;
-            std::uint8_t ms_hv_skipped;
-            std::uint8_t padding[2];
+            std::uint8_t total_failed;
+            std::uint8_t ms_hv_root;
+            std::uint8_t is_virtual_machine;
+
+            char         vm_vendor_name[16];
+            std::uint8_t measurements_hmac[16];
+            std::uint8_t reserved_pad[16];
         };
-        static_assert(sizeof(hv_detect_result) == 32, "hv_detect_result must match kernel struct");
+        static_assert(sizeof(hv_detect_result) == 80, "hv_detect_result must match kernel struct");
 #pragma pack(pop)
 
 #pragma pack(pop)

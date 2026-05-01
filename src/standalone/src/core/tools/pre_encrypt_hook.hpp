@@ -43,7 +43,6 @@ struct state_t {
     size_t max_captures = 4096;
     uint32_t attached_pid = 0;
     std::vector<driver_bridge::module_info_t> cached_modules;
-    std::thread poll_thread;
 };
 
 inline state_t g_state;
@@ -187,9 +186,6 @@ inline bool auto_hook(uint32_t pid) {
 inline void unhook_all() {
     g_state.polling.store(false);
 
-    if (g_state.poll_thread.joinable())
-        g_state.poll_thread.join();
-
     std::lock_guard<std::mutex> lock(g_state.mutex);
 
     if (driver_bridge::using_kernel_driver()) {
@@ -244,7 +240,6 @@ inline void start_polling() {
 
     g_state.polling.store(true);
 
-    g_state.poll_thread = {};
     work_queue::post([]() {
         while (g_state.polling.load()) {
             poll_captures();
@@ -255,8 +250,6 @@ inline void start_polling() {
 
 inline void stop_polling() {
     g_state.polling.store(false);
-    if (g_state.poll_thread.joinable())
-        g_state.poll_thread.join();
 }
 
 inline std::vector<plaintext_capture_t> get_captures(size_t max_count = 64) {

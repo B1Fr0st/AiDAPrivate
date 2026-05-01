@@ -6,9 +6,23 @@
 #include <algorithm>
 #include <map>
 #include <filesystem>
+#include <functional>
 
 
 namespace apply_patch {
+
+namespace detail {
+inline std::string& last_error_ref()
+{
+    static std::string s_last_error;
+    return s_last_error;
+}
+}
+
+inline const std::string& last_error()
+{
+    return detail::last_error_ref();
+}
 
 
 enum class file_action_t
@@ -213,9 +227,12 @@ inline patch_result_t apply(
 {
     patch_result_t result;
 
+    detail::last_error_ref().clear();
+
     auto patches = parse(patch_text);
     if (patches.empty()) {
-        result.error = "No valid file patches found";
+        detail::last_error_ref() = "No valid file patches found";
+        result.error = detail::last_error_ref();
         return result;
     }
 
@@ -229,7 +246,8 @@ inline patch_result_t apply(
             }
             std::string content = join_lines(new_lines);
             if (!write_file(patch.path, content)) {
-                result.error = "Failed to write new file: " + patch.path;
+                detail::last_error_ref() = "Failed to write new file: " + patch.path;
+                result.error = detail::last_error_ref();
                 return result;
             }
             result.modified_files[patch.path] = content;
@@ -237,8 +255,14 @@ inline patch_result_t apply(
         }
 
         case file_action_t::delete_file: {
-            if (delete_file_fn && !delete_file_fn(patch.path)) {
-                result.error = "Failed to delete file: " + patch.path;
+            if (!delete_file_fn) {
+                detail::last_error_ref() = "delete_file callback is null but a delete action was encountered for: " + patch.path;
+                result.error = detail::last_error_ref();
+                return result;
+            }
+            if (!delete_file_fn(patch.path)) {
+                detail::last_error_ref() = "Failed to delete file: " + patch.path;
+                result.error = detail::last_error_ref();
                 return result;
             }
             result.deleted_files.push_back(patch.path);
@@ -252,7 +276,8 @@ inline patch_result_t apply(
             for (auto it = patch.hunks.rbegin(); it != patch.hunks.rend(); ++it) {
                 int pos = find_context_match(file_lines, it->context_before);
                 if (pos < 0) {
-                    result.error = "Context not found in " + patch.path;
+                    detail::last_error_ref() = "Context not found in " + patch.path;
+                    result.error = detail::last_error_ref();
                     return result;
                 }
 
@@ -268,8 +293,21 @@ inline patch_result_t apply(
             }
 
             std::string new_content = join_lines(file_lines);
-            if (move_file_fn) move_file_fn(patch.path, patch.move_to);
-            write_file(patch.move_to, new_content);
+            if (!move_file_fn) {
+                detail::last_error_ref() = "move_file callback is null but a move action was encountered for: " + patch.path;
+                result.error = detail::last_error_ref();
+                return result;
+            }
+            if (!move_file_fn(patch.path, patch.move_to)) {
+                detail::last_error_ref() = "Failed to move file: " + patch.path + " -> " + patch.move_to;
+                result.error = detail::last_error_ref();
+                return result;
+            }
+            if (!write_file(patch.move_to, new_content)) {
+                detail::last_error_ref() = "Failed to write moved file: " + patch.move_to;
+                result.error = detail::last_error_ref();
+                return result;
+            }
             result.moved_files[patch.path] = patch.move_to;
             result.modified_files[patch.move_to] = new_content;
             break;
@@ -282,7 +320,8 @@ inline patch_result_t apply(
             for (auto it = patch.hunks.rbegin(); it != patch.hunks.rend(); ++it) {
                 int pos = find_context_match(file_lines, it->context_before);
                 if (pos < 0) {
-                    result.error = "Context not found in " + patch.path + " for hunk";
+                    detail::last_error_ref() = "Context not found in " + patch.path + " for hunk";
+                    result.error = detail::last_error_ref();
                     return result;
                 }
 
@@ -299,7 +338,8 @@ inline patch_result_t apply(
 
             std::string new_content = join_lines(file_lines);
             if (!write_file(patch.path, new_content)) {
-                result.error = "Failed to write updated file: " + patch.path;
+                detail::last_error_ref() = "Failed to write updated file: " + patch.path;
+                result.error = detail::last_error_ref();
                 return result;
             }
             result.modified_files[patch.path] = new_content;

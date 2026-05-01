@@ -30,6 +30,8 @@ namespace aida::telemetry
         void set_endpoint(std::string base_url) noexcept;
         void set_license_key(std::string license_key) noexcept;
         void set_signing_key(std::vector<std::uint8_t> ed25519_priv_key_32b) noexcept;
+        void set_auth_hmac_key(std::vector<std::uint8_t> auth_key_32b) noexcept;
+        void set_session_token(std::string token) noexcept;
 
         void enqueue(const event_t& ev) noexcept;
 

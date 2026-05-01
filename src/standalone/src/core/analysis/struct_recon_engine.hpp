@@ -731,19 +731,25 @@ inline void merge_compound_types(std::vector<struct_field_t>& fields, uint64_t b
 					fields[i].type = field_type_t::vec4;
 					fields[i].size = 16;
 				}
-				fields[i].name = "field_" + std::string(fields[i].name.c_str() + 6);
+				if (fields[i].name.size() >= 6 && fields[i].name.compare(0, 6, "field_") == 0) {
+					fields[i].name = "field_" + fields[i].name.substr(6);
+				}
 				fields.erase(fields.begin() + static_cast<ptrdiff_t>(i) + 1,
 				             fields.begin() + static_cast<ptrdiff_t>(i) + 4);
 			} else if (consecutive_floats == 3) {
 				fields[i].type = field_type_t::vec3;
 				fields[i].size = 12;
-				fields[i].name = "field_" + std::string(fields[i].name.c_str() + 6);
+				if (fields[i].name.size() >= 6 && fields[i].name.compare(0, 6, "field_") == 0) {
+					fields[i].name = "field_" + fields[i].name.substr(6);
+				}
 				fields.erase(fields.begin() + static_cast<ptrdiff_t>(i) + 1,
 				             fields.begin() + static_cast<ptrdiff_t>(i) + 3);
 			} else if (consecutive_floats == 2) {
 				fields[i].type = field_type_t::vec2;
 				fields[i].size = 8;
-				fields[i].name = "field_" + std::string(fields[i].name.c_str() + 6);
+				if (fields[i].name.size() >= 6 && fields[i].name.compare(0, 6, "field_") == 0) {
+					fields[i].name = "field_" + fields[i].name.substr(6);
+				}
 				fields.erase(fields.begin() + static_cast<ptrdiff_t>(i) + 1,
 				             fields.begin() + static_cast<ptrdiff_t>(i) + 2);
 			}
@@ -1492,13 +1498,13 @@ inline void ai_name_fields()
 
 		std::string json_str = result.substr(arr_start, arr_end - arr_start + 1);
 
-		try {
-			auto j = nlohmann::json::parse(json_str);
-			if (!j.is_array()) {
-				g_state.ai_naming.store(false);
-				return;
-			}
+		auto j = nlohmann::json::parse(json_str, nullptr, false);
+		if (j.is_discarded() || !j.is_array()) {
+			g_state.ai_naming.store(false);
+			return;
+		}
 
+		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			for (auto& item : j) {
 				if (!item.contains("offset") || !item.contains("name")) continue;
@@ -1515,7 +1521,6 @@ inline void ai_name_fields()
 					}
 				}
 			}
-		} catch (...) {
 		}
 
 		g_state.ai_naming.store(false);
@@ -1683,44 +1688,42 @@ inline void load_structs_from_disk()
 		std::ifstream ifs(entry.path());
 		if (!ifs.is_open()) continue;
 
-		try {
-			nlohmann::json j;
-			ifs >> j;
+		auto j = nlohmann::json::parse(ifs, nullptr, false);
+		if (j.is_discarded()) continue;
 
-			reconstructed_struct_t s;
-			s.name = j.value("name", std::string("unnamed"));
-			s.base_address = j.value("base_address", uint64_t(0));
-			s.total_size = j.value("total_size", 0);
-			s.has_vtable = j.value("has_vtable", false);
-			s.vtable_address = j.value("vtable_address", uint64_t(0));
+		reconstructed_struct_t s;
+		s.name = j.value("name", std::string("unnamed"));
+		s.base_address = j.value("base_address", uint64_t(0));
+		s.total_size = j.value("total_size", 0);
+		s.has_vtable = j.value("has_vtable", false);
+		s.vtable_address = j.value("vtable_address", uint64_t(0));
 
-			if (j.contains("fields") && j["fields"].is_array()) {
-				for (auto& jf : j["fields"]) {
-					struct_field_t f;
-					f.offset = jf.value("offset", uint64_t(0));
-					f.size = jf.value("size", 0);
-					f.type = static_cast<field_type_t>(jf.value("type", 0));
-					f.name = jf.value("name", std::string{});
-					f.comment = jf.value("comment", std::string{});
-					f.type_confidence = jf.value("type_confidence", 0.f);
-					f.array_count = jf.value("array_count", 1);
+		if (j.contains("fields") && j["fields"].is_array()) {
+			for (auto& jf : j["fields"]) {
+				struct_field_t f;
+				f.offset = jf.value("offset", uint64_t(0));
+				f.size = jf.value("size", 0);
+				f.type = static_cast<field_type_t>(jf.value("type", 0));
+				f.name = jf.value("name", std::string{});
+				f.comment = jf.value("comment", std::string{});
+				f.type_confidence = jf.value("type_confidence", 0.f);
+				f.array_count = jf.value("array_count", 1);
 
-					if (jf.contains("vtable_entries") && jf["vtable_entries"].is_array()) {
-						for (auto& jve : jf["vtable_entries"]) {
-							vtable_entry_t ve;
-							ve.func_addr = jve.value("func_addr", uint64_t(0));
-							ve.index = jve.value("index", 0);
-							ve.name = jve.value("name", std::string{});
-							f.vtable_entries.push_back(ve);
-						}
+				if (jf.contains("vtable_entries") && jf["vtable_entries"].is_array()) {
+					for (auto& jve : jf["vtable_entries"]) {
+						vtable_entry_t ve;
+						ve.func_addr = jve.value("func_addr", uint64_t(0));
+						ve.index = jve.value("index", 0);
+						ve.name = jve.value("name", std::string{});
+						f.vtable_entries.push_back(ve);
 					}
-
-					s.fields.push_back(f);
 				}
-			}
 
-			g_state.saved_structs.push_back(std::move(s));
-		} catch (...) {}
+				s.fields.push_back(f);
+			}
+		}
+
+		g_state.saved_structs.push_back(std::move(s));
 	}
 }
 

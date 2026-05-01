@@ -4,7 +4,7 @@
 
 #include <windows.h>
 #include <shlobj.h>
-#include <wincrypt.h>
+#include <bcrypt.h>
 
 #include <algorithm>
 #include <cctype>
@@ -32,8 +32,7 @@
 #include "xref_db.hpp"
 #include "xref_engine.hpp"
 
-#pragma comment(lib, "Crypt32.lib")
-#pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "Shell32.lib")
 
 namespace aida {
@@ -104,32 +103,45 @@ namespace binary_map {
 
 		std::string sha256_hex(const void* data, size_t length)
 		{
-			HCRYPTPROV prov = 0;
-			HCRYPTHASH hash = 0;
-			unsigned char digest[32] = {};
-			DWORD dlen = sizeof(digest);
 			std::string out;
+			BCRYPT_ALG_HANDLE alg = nullptr;
+			BCRYPT_HASH_HANDLE hash = nullptr;
+			unsigned char digest[32] = {};
 
-			if (!CryptAcquireContextW(&prov, nullptr, nullptr, PROV_RSA_AES,
-				CRYPT_VERIFYCONTEXT | CRYPT_SILENT))
+			NTSTATUS st = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+			if (st < 0) {
+				set_last_error_unlocked("binary_map.sha256_hex: BCryptOpenAlgorithmProvider failed");
 				return out;
-
-			if (CryptCreateHash(prov, CALG_SHA_256, 0, 0, &hash)) {
-				if (CryptHashData(hash,
-					reinterpret_cast<const BYTE*>(data),
-					static_cast<DWORD>(length), 0)) {
-					if (CryptGetHashParam(hash, HP_HASHVAL, digest, &dlen, 0)) {
-						static const char hexd[] = "0123456789abcdef";
-						out.resize(static_cast<size_t>(dlen) * 2u);
-						for (DWORD i = 0; i < dlen; ++i) {
-							out[i * 2u] = hexd[(digest[i] >> 4) & 0xF];
-							out[i * 2u + 1u] = hexd[digest[i] & 0xF];
-						}
-					}
-				}
-				CryptDestroyHash(hash);
 			}
-			CryptReleaseContext(prov, 0);
+
+			st = BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0);
+			if (st < 0) {
+				BCryptCloseAlgorithmProvider(alg, 0);
+				set_last_error_unlocked("binary_map.sha256_hex: BCryptCreateHash failed");
+				return out;
+			}
+
+			st = BCryptHashData(hash,
+				reinterpret_cast<PUCHAR>(const_cast<void*>(data)),
+				static_cast<ULONG>(length), 0);
+			if (st >= 0) {
+				st = BCryptFinishHash(hash, digest, sizeof(digest), 0);
+				if (st >= 0) {
+					static const char hexd[] = "0123456789abcdef";
+					out.resize(sizeof(digest) * 2u);
+					for (size_t i = 0; i < sizeof(digest); ++i) {
+						out[i * 2u] = hexd[(digest[i] >> 4) & 0xF];
+						out[i * 2u + 1u] = hexd[digest[i] & 0xF];
+					}
+				} else {
+					set_last_error_unlocked("binary_map.sha256_hex: BCryptFinishHash failed");
+				}
+			} else {
+				set_last_error_unlocked("binary_map.sha256_hex: BCryptHashData failed");
+			}
+
+			BCryptDestroyHash(hash);
+			BCryptCloseAlgorithmProvider(alg, 0);
 			return out;
 		}
 
@@ -140,7 +152,24 @@ namespace binary_map {
 			std::string lower = canonical_path;
 			for (auto& c : lower)
 				c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-			return sha256_hex(lower.data(), lower.size());
+
+			std::error_code mt_ec;
+			const auto mtime = std::filesystem::last_write_time(
+				std::filesystem::path(canonical_path), mt_ec);
+			int64_t mtime_count = 0;
+			if (!mt_ec)
+				mtime_count = static_cast<int64_t>(mtime.time_since_epoch().count());
+
+			std::string key;
+			key.reserve(lower.size() + 24u);
+			key.append(lower);
+			key.push_back('|');
+			char buf[32];
+			std::snprintf(buf, sizeof(buf), "%lld",
+				static_cast<long long>(mtime_count));
+			key.append(buf);
+
+			return sha256_hex(key.data(), key.size());
 		}
 
 		std::filesystem::path pin_directory()

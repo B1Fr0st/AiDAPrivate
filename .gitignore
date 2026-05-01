@@ -15,6 +15,7 @@
 !.gitignore
 !.aider*
 !CMakeLists.txt
+!CLAUDE.md
 
 # ==========================================
 # 2. EXCLUSIONS (These override the allows)

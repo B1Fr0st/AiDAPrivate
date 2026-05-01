@@ -288,6 +288,66 @@ function deriveBindProof(licenseRow, sessionToken, hwid, timestamp, codeHashUint
     return crypto.createHmac('sha256', bindSecret).update(message, 'utf8').digest();
 }
 
+function deriveRotatingBindProof(licenseRow, sessionToken, hwid, epoch, heartbeatNonce, tpmDigestHex) {
+    const bindSecret = deriveBindSecret(licenseRow);
+    const sessionStr = String(sessionToken || '');
+    const hwidStr = String(hwid || '');
+    const epochStr = String(BigInt(epoch || 0));
+    const nonceStr = String(heartbeatNonce || '');
+    const tpmStr = typeof tpmDigestHex === 'string' && tpmDigestHex.length > 0
+        ? tpmDigestHex.toLowerCase()
+        : '0'.repeat(64);
+    const message = `bind_proof_v2|${sessionStr}|${hwidStr}|${epochStr}|${nonceStr}|${tpmStr}`;
+    return crypto.createHmac('sha256', bindSecret).update(message, 'utf8').digest();
+}
+
+function deriveCodePageSigningKey(licenseRow, sessionRow, hwid) {
+    const sessionToken = sessionRow && typeof sessionRow.session_token === 'string'
+        ? sessionRow.session_token : '';
+    const issuedAt = sessionRow && Number.isFinite(Number(sessionRow.issued_at))
+        ? Number(sessionRow.issued_at) : 0;
+    const bindProof = deriveBindProof(licenseRow, sessionToken, hwid, issuedAt, 0n);
+    const salt = Buffer.from(String(hwid || ''), 'utf8');
+    const info = Buffer.from('code-page-binding/v1', 'utf8');
+    const derived = crypto.hkdfSync('sha256', bindProof, salt, info, 32);
+    return Buffer.from(derived);
+}
+
+function signCodePage(licenseRow, sessionRow, hwid, pageIndex, pageBytes) {
+    if (!Buffer.isBuffer(pageBytes)) {
+        throw new Error('arc_code_page_not_buffer');
+    }
+    const key = deriveCodePageSigningKey(licenseRow, sessionRow, hwid);
+    const indexBuf = Buffer.alloc(4);
+    indexBuf.writeUInt32LE(pageIndex >>> 0, 0);
+    const digest = crypto.createHash('sha256').update(pageBytes).digest();
+    const mac = crypto.createHmac('sha256', key)
+        .update('aida-code-page', 'utf8')
+        .update(indexBuf)
+        .update(digest)
+        .digest();
+    return { digest, signature: mac };
+}
+
+function verifyCodePage(licenseRow, sessionRow, hwid, pageIndex, pageBytes, signatureHex) {
+    if (typeof signatureHex !== 'string' || !/^[0-9a-fA-F]+$/.test(signatureHex)) return false;
+    const expected = signCodePage(licenseRow, sessionRow, hwid, pageIndex, pageBytes).signature;
+    let provided;
+    try { provided = Buffer.from(signatureHex, 'hex'); } catch (_) { return false; }
+    if (provided.length !== expected.length) return false;
+    try { return crypto.timingSafeEqual(provided, expected); } catch (_) { return false; }
+}
+
+function deriveLicenseeId(licenseRow) {
+    if (!licenseRow) return '';
+    if (typeof licenseRow.licensee_id === 'string' && licenseRow.licensee_id.length > 0) {
+        return licenseRow.licensee_id;
+    }
+    const key = typeof licenseRow.key === 'string' ? licenseRow.key : '';
+    if (!key) return '';
+    return crypto.createHash('sha256').update(`licensee/v1|${key}`, 'utf8').digest('hex');
+}
+
 function verifyArcProofToken(licenseRow, expectedData, clientProofFirst8) {
     if (!Buffer.isBuffer(clientProofFirst8) || clientProofFirst8.length !== 8) {
         return false;
@@ -368,6 +428,11 @@ module.exports = {
     applyLicenseTransform,
     assembleFeatureBlob,
     deriveBindProof,
+    deriveRotatingBindProof,
+    deriveCodePageSigningKey,
+    deriveLicenseeId,
+    signCodePage,
+    verifyCodePage,
     verifyArcProofToken,
     verifyDriverProof,
     LICBIND_SECTION_NAME,

@@ -34,6 +34,11 @@ struct state_t {
     char  search_buf[64] = {};
     bool  search_hex     = true;
     int   search_match   = -1;
+    int   search_match_len = 0;
+    int   search_match_idx = -1;
+    std::vector<int> search_matches;
+    std::string search_last_query;
+    bool  search_last_hex = true;
 };
 
 inline state_t g_state;
@@ -44,5 +49,6 @@ void load_from_file(const std::string& path, size_t offset = 0, size_t size = 0)
 bool read_from_process(uint64_t address, size_t size);
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b);
+std::string last_error();
 
 }

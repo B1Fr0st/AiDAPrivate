@@ -12,6 +12,110 @@
 
 namespace hex_view {
 
+namespace {
+
+std::string s_last_error;
+
+bool parse_hex_pattern(const char* in, std::vector<uint8_t>& out) {
+    out.clear();
+    int nibble = -1;
+    for (const char* p = in; *p; ++p) {
+        char c = *p;
+        if (c == ' ' || c == '\t' || c == ',' || c == '-' || c == '_') {
+            if (nibble >= 0) return false;
+            continue;
+        }
+        int v;
+        if (c >= '0' && c <= '9') v = c - '0';
+        else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+        else return false;
+        if (nibble < 0) {
+            nibble = v;
+        } else {
+            out.push_back(static_cast<uint8_t>((nibble << 4) | v));
+            nibble = -1;
+        }
+    }
+    return nibble < 0 && !out.empty();
+}
+
+void recompute_search_matches(state_t& st) {
+    st.search_matches.clear();
+    st.search_match     = -1;
+    st.search_match_idx = -1;
+    st.search_match_len = 0;
+    st.search_last_query.assign(st.search_buf);
+    st.search_last_hex = st.search_hex;
+
+    if (st.data.empty() || st.search_buf[0] == '\0') return;
+
+    std::vector<uint8_t> pat;
+    if (st.search_hex) {
+        if (!parse_hex_pattern(st.search_buf, pat)) return;
+    } else {
+        size_t len = std::strlen(st.search_buf);
+        pat.assign(reinterpret_cast<const uint8_t*>(st.search_buf),
+                   reinterpret_cast<const uint8_t*>(st.search_buf) + len);
+    }
+    if (pat.empty() || pat.size() > st.data.size()) return;
+
+    const size_t n = st.data.size();
+    const size_t m = pat.size();
+    const uint8_t  first = pat[0];
+    const uint8_t* dp    = st.data.data();
+    for (size_t i = 0; i + m <= n; ++i) {
+        if (dp[i] != first) continue;
+        if (std::memcmp(dp + i, pat.data(), m) == 0) {
+            st.search_matches.push_back(static_cast<int>(i));
+            if (st.search_matches.size() >= 65536u) break;
+        }
+    }
+    st.search_match_len = static_cast<int>(m);
+    if (!st.search_matches.empty()) {
+        st.search_match_idx = 0;
+        st.search_match     = st.search_matches[0];
+    }
+}
+
+void goto_search_match(state_t& st, int idx, float line_h, int bytes_per_row, float view_h) {
+    if (idx < 0 || idx >= static_cast<int>(st.search_matches.size())) return;
+    st.search_match_idx = idx;
+    st.search_match     = st.search_matches[idx];
+    int len = st.search_match_len > 0 ? st.search_match_len : 1;
+    st.sel_start = st.search_match;
+    st.sel_end   = st.search_match + len - 1;
+    int row = st.search_match / bytes_per_row;
+    float row_y = row * line_h;
+    float center = row_y - (view_h * 0.5f) + (line_h * 0.5f);
+    if (center < 0.f) center = 0.f;
+    st.target_scroll_y = center;
+}
+
+void step_search(state_t& st, int dir, float line_h, int bytes_per_row, float view_h) {
+    if (st.search_matches.empty()) return;
+    int n = static_cast<int>(st.search_matches.size());
+    int idx = st.search_match_idx + dir;
+    if (idx < 0) idx = n - 1;
+    if (idx >= n) idx = 0;
+    goto_search_match(st, idx, line_h, bytes_per_row, view_h);
+}
+
+bool match_range_contains(const std::vector<int>& matches, int len, int byte_idx, int& which) {
+    if (matches.empty() || len <= 0) return false;
+    auto it = std::upper_bound(matches.begin(), matches.end(), byte_idx);
+    if (it == matches.begin()) return false;
+    --it;
+    int start = *it;
+    if (byte_idx >= start && byte_idx < start + len) {
+        which = static_cast<int>(it - matches.begin());
+        return true;
+    }
+    return false;
+}
+
+}
+
 void set_data(const std::vector<uint8_t>& bytes, uint64_t base_addr,
               const std::string& name) {
     g_state.data       = bytes;
@@ -22,13 +126,24 @@ void set_data(const std::vector<uint8_t>& bytes, uint64_t base_addr,
     g_state.sel_end    = -1;
     g_state.scroll_y   = 0.f;
     g_state.target_scroll_y = 0.f;
+    g_state.search_match     = -1;
+    g_state.search_match_len = 0;
+    g_state.search_match_idx = -1;
+    g_state.search_matches.clear();
+    g_state.search_last_query.clear();
 }
 
 void load_from_file(const std::string& path, size_t offset, size_t size) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f.is_open()) return;
+    if (!f.is_open()) {
+        s_last_error = "hex_view::load_from_file: failed to open " + path;
+        return;
+    }
     size_t fsize = (size_t)f.tellg();
-    if (offset >= fsize) return;
+    if (offset >= fsize) {
+        s_last_error = "hex_view::load_from_file: offset past end of " + path;
+        return;
+    }
     f.seekg((std::streamoff)offset);
     size_t read_sz = (size > 0 && offset + size <= fsize) ? size : (fsize - offset);
     std::vector<uint8_t> buf(read_sz);
@@ -36,6 +151,11 @@ void load_from_file(const std::string& path, size_t offset, size_t size) {
     auto pos = path.find_last_of("/\\");
     std::string name = (pos != std::string::npos) ? path.substr(pos + 1) : path;
     set_data(buf, (uint64_t)offset, name);
+    s_last_error.clear();
+}
+
+std::string last_error() {
+    return s_last_error;
 }
 
 bool read_from_process(uint64_t address, size_t size) {
@@ -43,7 +163,7 @@ bool read_from_process(uint64_t address, size_t size) {
         return false;
     if (driver_bridge::attached_pid() == 0)
         return false;
-    if (size == 0 || size > 64 * 1024 * 1024)
+    if (size == 0 || size > 1 * 1024 * 1024)
         return false;
 
     std::vector<uint8_t> buf;
@@ -216,6 +336,9 @@ void render(float pos_x, float pos_y, float width, float height,
     ImU32 sel_col = IM_COL32((int)(accent_r * 180), (int)(accent_g * 180),
                               (int)(accent_b * 180), (int)(50 * a));
 
+    static float insp_anim_x = 0.f;
+    static bool insp_was_visible = false;
+
     for (int row = first_row; row <= last_row; row++) {
         float y = oy + row * line_h - st.scroll_y;
         int row_off = row * bytes_per_row;
@@ -279,11 +402,21 @@ void render(float pos_x, float pos_y, float width, float height,
             else
                 bc = _ta(_t.text_primary);
 
-            if (st.search_match >= 0 && byte_idx == st.search_match) {
+            int match_which = -1;
+            if (match_range_contains(st.search_matches, st.search_match_len, byte_idx, match_which)) {
+                bool is_current = (match_which == st.search_match_idx);
+                int alpha_byte = is_current ? static_cast<int>(150 * a) : static_cast<int>(55 * a);
                 dl->AddRectFilled(ImVec2(bx - 1.f, y),
                                   ImVec2(bx + char_w * 2.f + 1.f, y + line_h),
                                   IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
-                                           static_cast<int>(accent_b * 255), static_cast<int>(60 * a)));
+                                           static_cast<int>(accent_b * 255), alpha_byte));
+                if (is_current) {
+                    dl->AddRect(ImVec2(bx - 1.f, y),
+                                ImVec2(bx + char_w * 2.f + 1.f, y + line_h),
+                                IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
+                                         static_cast<int>(accent_b * 255), static_cast<int>(220 * a)),
+                                0.f, 0, 1.f);
+                }
             }
 
             char hex[4];
@@ -339,6 +472,15 @@ void render(float pos_x, float pos_y, float width, float height,
             if (sel_lo >= 0 && byte_idx >= sel_lo && byte_idx <= sel_hi)
                 dl->AddRectFilled(ImVec2(ax, y), ImVec2(ax + char_w, y + line_h), sel_col);
 
+            int ascii_match_which = -1;
+            if (match_range_contains(st.search_matches, st.search_match_len, byte_idx, ascii_match_which)) {
+                bool is_current = (ascii_match_which == st.search_match_idx);
+                int alpha_byte = is_current ? static_cast<int>(140 * a) : static_cast<int>(50 * a);
+                dl->AddRectFilled(ImVec2(ax, y), ImVec2(ax + char_w, y + line_h),
+                                  IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
+                                           static_cast<int>(accent_b * 255), alpha_byte));
+            }
+
             dl->AddText(ImVec2(ax, y + 1.f), ac, ch);
             ax += char_w;
         }
@@ -351,8 +493,6 @@ void render(float pos_x, float pos_y, float width, float height,
         float insp_target_x = ox + width - insp_w - 8.f;
         float insp_y = oy + 8.f;
 
-        static float insp_anim_x = 0.f;
-        static bool insp_was_visible = false;
         if (!insp_was_visible) {
             insp_anim_x = ox + width;
             insp_was_visible = true;
@@ -498,17 +638,24 @@ void render(float pos_x, float pos_y, float width, float height,
             iy += row_h;
         }
     } else {
-        static float insp_anim_x;
-        static bool insp_was_visible;
         insp_was_visible = false;
+        insp_anim_x = 0.f;
     }
 
 
     if (hovered || st.goto_visible || st.search_visible) {
-        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_G, false))
+        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_G, false)) {
             st.goto_visible = !st.goto_visible;
-        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false))
+            if (st.goto_visible) st.search_visible = false;
+        }
+        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) {
             st.search_visible = !st.search_visible;
+            if (st.search_visible) st.goto_visible = false;
+        }
+        if (st.search_visible && ImGui::IsKeyPressed(ImGuiKey_F3, false)) {
+            int dir = ImGui::GetIO().KeyShift ? -1 : 1;
+            step_search(st, dir, line_h, bytes_per_row, height);
+        }
         if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
             st.goto_visible = false;
             st.search_visible = false;
@@ -568,6 +715,69 @@ void render(float pos_x, float pos_y, float width, float height,
                     st.goto_visible = false;
                 }
             }
+        }
+    }
+
+
+    if (st.search_visible) {
+        float sy = oy + 4.f;
+        ImDrawList* fdl = ImGui::GetForegroundDrawList();
+        fdl->AddRectFilled(ImVec2(ox + 10.f, sy), ImVec2(ox + 470.f, sy + 30.f),
+            _ta(_t.panel_bg), 6.f);
+
+        ImGui::SetCursorPos(ImVec2(pos_x + 18.f, pos_y + 8.f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.1f, 0.1f, 0.14f, 0.9f));
+        ImGui::PushItemWidth(180.f);
+        const char* hint = st.search_hex ? "DE AD BE EF..." : "text";
+        bool submit = ImGui::InputTextWithHint("##hex_search", hint, st.search_buf, sizeof(st.search_buf),
+            ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::PopItemWidth();
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar();
+
+        ImGui::SameLine();
+        const char* mode_label = st.search_hex ? "Hex" : "Txt";
+        if (ImGui::SmallButton(mode_label)) {
+            st.search_hex = !st.search_hex;
+        }
+
+        bool query_changed = (st.search_last_query != st.search_buf) ||
+                             (st.search_last_hex != st.search_hex);
+        if (query_changed) {
+            recompute_search_matches(st);
+            if (!st.search_matches.empty()) {
+                goto_search_match(st, 0, line_h, bytes_per_row, height);
+            }
+        }
+
+        ImGui::SameLine();
+        bool prev_clicked = ImGui::SmallButton("<##hex_search_prev");
+        ImGui::SameLine();
+        bool next_clicked = ImGui::SmallButton(">##hex_search_next");
+
+        if (submit) {
+            int dir = ImGui::GetIO().KeyShift ? -1 : 1;
+            step_search(st, dir, line_h, bytes_per_row, height);
+        }
+        if (prev_clicked) step_search(st, -1, line_h, bytes_per_row, height);
+        if (next_clicked) step_search(st, +1, line_h, bytes_per_row, height);
+
+        ImGui::SameLine();
+        char count_buf[32];
+        if (st.search_buf[0] == '\0') {
+            std::snprintf(count_buf, sizeof(count_buf), " ");
+        } else if (st.search_matches.empty()) {
+            std::snprintf(count_buf, sizeof(count_buf), "0 matches");
+        } else {
+            std::snprintf(count_buf, sizeof(count_buf), "%d/%d",
+                st.search_match_idx + 1, static_cast<int>(st.search_matches.size()));
+        }
+        ImGui::TextUnformatted(count_buf);
+
+        ImGui::SameLine();
+        if (ImGui::SmallButton("X##hex_search_close")) {
+            st.search_visible = false;
         }
     }
 

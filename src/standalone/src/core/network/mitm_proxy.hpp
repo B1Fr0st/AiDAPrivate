@@ -6,10 +6,13 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <list>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "protocol_parser.hpp"
@@ -18,6 +21,8 @@ namespace mitm_proxy {
 
 
 enum class intercept_action { forward, drop, modify };
+
+enum class hold_decision_t { pending, forward, drop, modified };
 
 struct http_exchange {
     uint64_t    id = 0;
@@ -72,6 +77,14 @@ struct http_exchange {
 
     size_t      request_size = 0;
     size_t      response_size = 0;
+};
+
+struct held_wait_t {
+    std::mutex                mtx;
+    std::condition_variable   cv;
+    hold_decision_t           decision = hold_decision_t::pending;
+    std::vector<uint8_t>      modified_request;
+    bool                      released = false;
 };
 
 
@@ -135,8 +148,11 @@ struct state_t {
     uint64_t                   next_id = 1;
 
 
-    std::mutex                          held_mutex;
-    std::vector<http_exchange*>         held_exchanges;
+    std::mutex                                                           held_mutex;
+    std::condition_variable                                              held_cv;
+    std::list<http_exchange>                                             held_storage;
+    std::vector<http_exchange*>                                          held_exchanges;
+    std::unordered_map<uint64_t, std::shared_ptr<held_wait_t>>           held_waits;
 
 
     std::atomic<uint64_t>  total_requests{0};

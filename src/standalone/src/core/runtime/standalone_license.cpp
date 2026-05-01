@@ -11,7 +11,9 @@
 #include "anti-tamper/vm_compiler.hpp"
 #include "anti-tamper/server_pages.hpp"
 #include "anti-tamper/orchestrator.hpp"
+#include "anti-tamper/tpm_attest.hpp"
 #include "tls_exporter.hpp"
+#include "vbs_enforcement.hpp"
 #include "obfuscation.hpp"
 
 #include <windows.h>
@@ -1825,6 +1827,22 @@ namespace
     /* Proof hash: FNV-1a of (session_token + hwid) */
     std::atomic<uint64_t> s_proof_hash{0};
 
+    std::mutex s_rotation_mtx;
+    std::string s_rotated_heartbeat_nonce;
+    int64_t     s_rotated_heartbeat_nonce_issued_at = 0;
+    int64_t     s_rotated_heartbeat_nonce_max_age_s = 60;
+    std::string s_rotated_bind_proof;
+    int64_t     s_rotated_bind_proof_epoch = 0;
+    std::string s_next_challenge_id;
+    std::string s_next_challenge_nonce;
+    std::string s_next_challenge_signature;
+    int64_t     s_next_challenge_issued_at = 0;
+    int64_t     s_next_challenge_ttl_s = 30;
+    std::vector<std::string> s_pending_code_page_signatures;
+    std::vector<std::string> s_pending_code_page_digests;
+    std::string s_licensee_id;
+    std::atomic<int64_t> s_silent_kill_after_ms{0};
+
     struct code_section_hash_t {
         uintptr_t base;
         size_t    size;
@@ -2081,6 +2099,40 @@ namespace
         __fastfail(FAST_FAIL_FATAL_APP_EXIT);
     }
 
+    int64_t silent_kill_now_ms()
+    {
+        return static_cast<int64_t>(GetTickCount64());
+    }
+
+    void schedule_silent_kill(const char* reason)
+    {
+        constexpr int64_t kSilentKillDelayMs = 60000;
+        int64_t deadline = silent_kill_now_ms() + kSilentKillDelayMs;
+        int64_t expected = 0;
+        if (s_silent_kill_after_ms.compare_exchange_strong(expected, deadline, std::memory_order_acq_rel))
+        {
+            std::string reason_copy = reason ? std::string(reason) : std::string("silent_kill_pending");
+            lic_log((std::string("silent_kill_scheduled reason=") + reason_copy).c_str());
+            std::thread([reason_copy]() {
+                int64_t deadline_local = s_silent_kill_after_ms.load(std::memory_order_acquire);
+                while (deadline_local > 0 && silent_kill_now_ms() < deadline_local)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    deadline_local = s_silent_kill_after_ms.load(std::memory_order_acquire);
+                }
+                if (deadline_local > 0)
+                {
+                    license_failfast("license_silent_kill", reason_copy);
+                }
+            }).detach();
+        }
+    }
+
+    void cancel_silent_kill()
+    {
+        s_silent_kill_after_ms.store(0, std::memory_order_release);
+    }
+
 
     bool check_obfuscated_valid()
     {
@@ -2182,7 +2234,7 @@ namespace
             s_license_client->set_server_certificate_verifier(
                 [](SSL* ssl) -> httplib::SSLVerifierResponse {
                     {
-                        auto ev = aida::tls_exporter::compute_header_value_schannel(ssl);
+                        auto ev = aida::tls_exporter::compute_header_value_openssl(ssl);
                         if (!ev.empty()) {
                             std::lock_guard<std::mutex> lk(s_tls_exporter_mtx);
                             s_tls_exporter_value = std::move(ev);
@@ -2675,6 +2727,61 @@ namespace
             if (action == "validate") {
                 body["client_nonce"] = nonce;
                 body["plugin_version"] = "aida-standalone";
+                if (anti_tamper::tpm_attest::is_available())
+                {
+                    uint8_t pcr_val[32] = {};
+                    if (anti_tamper::tpm_attest::read_pcr(
+                            anti_tamper::tpm_attest::TPM_PCR_AIDA_VERSION, pcr_val))
+                    {
+                        char hex[65] = {};
+                        for (int i = 0; i < 32; ++i)
+                            _snprintf_s(hex + i * 2, 3, _TRUNCATE, "%02x", pcr_val[i]);
+                        body["tpm_pcr16"] = std::string(hex);
+                    }
+                    uint32_t pcrs[8] = {0,1,2,3,4,5,6,7};
+                    uint8_t nonce_bytes[16] = {};
+                    BCryptGenRandom(nullptr, nonce_bytes, sizeof(nonce_bytes),
+                                     BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+                    anti_tamper::tpm_attest::quote_result_t qr{};
+                    if (anti_tamper::tpm_attest::sign_with_aik(
+                            nonce_bytes, sizeof(nonce_bytes), pcrs, 8, qr) && qr.valid)
+                    {
+                        std::string attest_hex;
+                        attest_hex.reserve(qr.attest.size() * 2);
+                        for (uint8_t b : qr.attest)
+                        {
+                            char hb[3];
+                            _snprintf_s(hb, sizeof(hb), _TRUNCATE, "%02x", b);
+                            attest_hex.append(hb);
+                        }
+                        std::string sig_hex;
+                        sig_hex.reserve(qr.signature.size() * 2);
+                        for (uint8_t b : qr.signature)
+                        {
+                            char hb[3];
+                            _snprintf_s(hb, sizeof(hb), _TRUNCATE, "%02x", b);
+                            sig_hex.append(hb);
+                        }
+                        char nonce_hex[33] = {};
+                        for (int i = 0; i < 16; ++i)
+                            _snprintf_s(nonce_hex + i * 2, 3, _TRUNCATE, "%02x", nonce_bytes[i]);
+                        body["tpm_attest_quote"] = attest_hex;
+                        body["tpm_attest_signature"] = sig_hex;
+                        body["tpm_attest_nonce"] = std::string(nonce_hex);
+                    }
+                    auto caps = anti_tamper::tpm_attest::detect_cpu_attest_caps();
+                    json hw{};
+                    hw["sgx"] = caps.sgx_supported;
+                    hw["tdx"] = caps.tdx_supported;
+                    hw["sev_snp"] = caps.sev_snp_supported;
+                    hw["txt"] = caps.txt_supported;
+                    hw["pluton"] = caps.pluton_supported;
+                    body["hw_attest_caps"] = std::move(hw);
+                }
+                else
+                {
+                    body["tpm_unavailable"] = true;
+                }
             } else {
                 body["session_token"] = session_token;
                 body["heartbeat_nonce"] = nonce;
@@ -2686,6 +2793,89 @@ namespace
                 body["gate_bitmap"] = static_cast<int64_t>(
                     s_gate_bitmap.load(std::memory_order_acquire) & 0x00FFFFFFu);
 
+                {
+                    std::lock_guard<std::mutex> rot_lk(s_rotation_mtx);
+                    if (!s_rotated_heartbeat_nonce.empty())
+                        body["echoed_server_nonce"] = s_rotated_heartbeat_nonce;
+                    if (!s_rotated_bind_proof.empty())
+                        body["echoed_bind_proof"] = s_rotated_bind_proof;
+                    if (!s_next_challenge_id.empty())
+                        body["challenge_id"] = s_next_challenge_id;
+                    if (!s_next_challenge_signature.empty())
+                        body["challenge_signature"] = s_next_challenge_signature;
+
+                    if (!s_next_challenge_nonce.empty())
+                    {
+                        std::string sealed;
+                        std::string sealed_message = std::string("aida-tpm-challenge|")
+                            + s_next_challenge_id + "|"
+                            + s_next_challenge_nonce + "|"
+                            + session_token + "|"
+                            + hwid;
+                        if (anti_tamper::tpm_attest::is_available())
+                        {
+                            std::vector<uint8_t> sealed_msg(sealed_message.begin(), sealed_message.end());
+                            anti_tamper::tpm_attest::quote_result_t quote{};
+                            uint32_t pcrs[3] = { 0, 7, 16 };
+                            if (anti_tamper::tpm_attest::sign_with_aik(
+                                    sealed_msg.data(), static_cast<uint32_t>(sealed_msg.size()),
+                                    pcrs, 3, quote) && quote.valid &&
+                                !quote.signature.empty())
+                            {
+                                std::string hex;
+                                hex.reserve(quote.signature.size() * 2);
+                                static const char hexd[] = "0123456789abcdef";
+                                for (uint8_t b : quote.signature)
+                                {
+                                    hex.push_back(hexd[(b >> 4) & 0xF]);
+                                    hex.push_back(hexd[b & 0xF]);
+                                }
+                                sealed = std::move(hex);
+                            }
+                        }
+                        if (!sealed.empty())
+                            body["challenge_tpm_seal"] = std::move(sealed);
+                    }
+                }
+
+
+                if (anti_tamper::tpm_attest::is_available())
+                {
+                    if (anti_tamper::tpm_attest::ensure_counter_defined(
+                            anti_tamper::tpm_attest::TPM_NV_INDEX_AIDA_COUNTER))
+                    {
+                        anti_tamper::tpm_attest::nv_increment(
+                            anti_tamper::tpm_attest::TPM_NV_INDEX_AIDA_COUNTER);
+                        uint64_t counter_value = 0;
+                        if (anti_tamper::tpm_attest::nv_read_counter(
+                                anti_tamper::tpm_attest::TPM_NV_INDEX_AIDA_COUNTER,
+                                counter_value))
+                        {
+                            body["tpm_monotonic_counter"] = static_cast<int64_t>(counter_value);
+                        }
+                    }
+                    uint8_t pcr_val[32] = {};
+                    if (anti_tamper::tpm_attest::read_pcr(
+                            anti_tamper::tpm_attest::TPM_PCR_AIDA_VERSION, pcr_val))
+                    {
+                        char hex[65] = {};
+                        for (int i = 0; i < 32; ++i)
+                            _snprintf_s(hex + i * 2, 3, _TRUNCATE, "%02x", pcr_val[i]);
+                        body["tpm_pcr16"] = std::string(hex);
+                    }
+                    auto caps = anti_tamper::tpm_attest::detect_cpu_attest_caps();
+                    json hw{};
+                    hw["sgx"] = caps.sgx_supported;
+                    hw["tdx"] = caps.tdx_supported;
+                    hw["sev_snp"] = caps.sev_snp_supported;
+                    hw["txt"] = caps.txt_supported;
+                    hw["pluton"] = caps.pluton_supported;
+                    body["hw_attest_caps"] = std::move(hw);
+                }
+                else
+                {
+                    body["tpm_unavailable"] = true;
+                }
 
                 {
                     std::lock_guard<std::mutex> lk(s_honeypot_names_mtx);
@@ -2931,6 +3121,10 @@ namespace
         settings.license_server_nonce = response.value("server_nonce", "");
         settings.license_client_nonce = response.contains("client_nonce")
             ? response["client_nonce"].get<std::string>() : settings.license_client_nonce;
+        if (response.contains("auth_hmac_key_b64") && response["auth_hmac_key_b64"].is_string())
+            settings.license_auth_hmac_key_b64 = response["auth_hmac_key_b64"].get<std::string>();
+        if (response.contains("kid") && response["kid"].is_number())
+            settings.license_signing_kid = response["kid"].get<int>();
         settings.license_hwid = hwid;
         settings.license_issued_at = response.contains("issued_at")
             ? response["issued_at"].get<int64_t>() : (settings.license_issued_at > 0 ? settings.license_issued_at : static_cast<int64_t>(std::time(nullptr)));
@@ -2971,10 +3165,90 @@ namespace
         s_cached_session_token = settings.license_session_token;
         update_proof_hash(settings.license_session_token, hwid);
 
+        {
+            std::lock_guard<std::mutex> rot_lk(s_rotation_mtx);
+            if (response.contains("rotated_heartbeat_nonce") && response["rotated_heartbeat_nonce"].is_string())
+                s_rotated_heartbeat_nonce = response["rotated_heartbeat_nonce"].get<std::string>();
+            if (response.contains("rotated_heartbeat_nonce_issued_at") && response["rotated_heartbeat_nonce_issued_at"].is_number())
+                s_rotated_heartbeat_nonce_issued_at = response["rotated_heartbeat_nonce_issued_at"].get<int64_t>();
+            if (response.contains("rotated_heartbeat_nonce_max_age") && response["rotated_heartbeat_nonce_max_age"].is_number())
+                s_rotated_heartbeat_nonce_max_age_s = response["rotated_heartbeat_nonce_max_age"].get<int64_t>();
+            if (response.contains("rotated_bind_proof") && response["rotated_bind_proof"].is_string())
+                s_rotated_bind_proof = response["rotated_bind_proof"].get<std::string>();
+            if (response.contains("rotated_bind_proof_epoch") && response["rotated_bind_proof_epoch"].is_number())
+                s_rotated_bind_proof_epoch = response["rotated_bind_proof_epoch"].get<int64_t>();
+            if (response.contains("next_challenge_id") && response["next_challenge_id"].is_string())
+                s_next_challenge_id = response["next_challenge_id"].get<std::string>();
+            if (response.contains("next_challenge_nonce") && response["next_challenge_nonce"].is_string())
+                s_next_challenge_nonce = response["next_challenge_nonce"].get<std::string>();
+            if (response.contains("next_challenge_signature") && response["next_challenge_signature"].is_string())
+                s_next_challenge_signature = response["next_challenge_signature"].get<std::string>();
+            if (response.contains("next_challenge_issued_at") && response["next_challenge_issued_at"].is_number())
+                s_next_challenge_issued_at = response["next_challenge_issued_at"].get<int64_t>();
+            if (response.contains("next_challenge_ttl") && response["next_challenge_ttl"].is_number())
+                s_next_challenge_ttl_s = response["next_challenge_ttl"].get<int64_t>();
+            if (response.contains("licensee_id") && response["licensee_id"].is_string())
+                s_licensee_id = response["licensee_id"].get<std::string>();
+        }
+
+        if (response.contains("kill_at_epoch") && response["kill_at_epoch"].is_number())
+        {
+            int64_t kill_epoch = response["kill_at_epoch"].get<int64_t>();
+            int64_t now_epoch = static_cast<int64_t>(std::time(nullptr));
+            if (kill_epoch > 0 && kill_epoch >= now_epoch && (kill_epoch - now_epoch) <= 3600)
+            {
+                int64_t now_ms = static_cast<int64_t>(GetTickCount64());
+                int64_t deadline_ms = now_ms + (kill_epoch - now_epoch) * 1000;
+                int64_t expected = 0;
+                if (s_silent_kill_after_ms.compare_exchange_strong(expected, deadline_ms, std::memory_order_acq_rel))
+                {
+                    std::string reason_copy = response.value("kill_reason", std::string("server_kill_directive"));
+                    lic_log((std::string("server_kill_at_epoch_scheduled in_seconds=") +
+                        std::to_string(kill_epoch - now_epoch) + " reason=" + reason_copy).c_str());
+                    std::thread([reason_copy]() {
+                        int64_t deadline_local = s_silent_kill_after_ms.load(std::memory_order_acquire);
+                        while (deadline_local > 0 && silent_kill_now_ms() < deadline_local)
+                        {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                            deadline_local = s_silent_kill_after_ms.load(std::memory_order_acquire);
+                        }
+                        if (deadline_local > 0)
+                        {
+                            license_failfast("server_kill_directive", reason_copy);
+                        }
+                    }).detach();
+                }
+            }
+        }
+
 
         s_last_heartbeat_time.store(
             static_cast<int64_t>(std::chrono::steady_clock::now().time_since_epoch().count() / 1000000),
             std::memory_order_release);
+
+        {
+            auto tier = vbs_enforcement::parse_plan_tier(settings.license_plan);
+            if (vbs_enforcement::tier_eligible(tier))
+            {
+                vbs_enforcement::detect_capabilities();
+                if (vbs_enforcement::vbs_active())
+                {
+                    bool guarded = vbs_enforcement::enforce_text_pages_no_write(tier);
+                    char vbs_buf[160];
+                    _snprintf_s(vbs_buf, sizeof(vbs_buf), _TRUNCATE,
+                        "vbs_enforcement_apply tier=%s vbs=1 hvci=%d guarded_pages=%u result=%d",
+                        settings.license_plan.c_str(),
+                        vbs_enforcement::hvci_active() ? 1 : 0,
+                        vbs_enforcement::guarded_page_count(),
+                        guarded ? 1 : 0);
+                    lic_log(vbs_buf);
+                }
+                else
+                {
+                    lic_log("vbs_enforcement_skipped vbs_inactive");
+                }
+            }
+        }
 
         std::lock_guard<std::mutex> lk(s_state_mtx);
         s_plan = settings.license_plan;
@@ -3110,7 +3384,7 @@ namespace
         return out;
     }
 
-    std::string get_arc_signing_public_key_der_hex()
+    std::string get_arc_signing_public_key_der_hex_kid1()
     {
         std::string k;
         k.reserve(88);
@@ -3128,7 +3402,36 @@ namespace
         return k;
     }
 
-    bool verify_arc_page_signature(const std::string& canonical, const std::string& sig_hex)
+    std::string get_arc_signing_public_key_der_hex_kid2()
+    {
+        std::string k;
+        k.reserve(88);
+        k += OBFSTR("302a3005");
+        k += OBFSTR("06032b65");
+        k += OBFSTR("70032100");
+        k += OBFSTR("be7ba74a");
+        k += OBFSTR("a9b8a230");
+        k += OBFSTR("d6614d8d");
+        k += OBFSTR("0c78e0e5");
+        k += OBFSTR("33adfa2a");
+        k += OBFSTR("bdc3d632");
+        k += OBFSTR("8438c378");
+        k += OBFSTR("077adc90");
+        return k;
+    }
+
+    std::string get_arc_signing_public_key_der_hex_for_kid(int kid)
+    {
+        if (kid == 2) return get_arc_signing_public_key_der_hex_kid2();
+        return get_arc_signing_public_key_der_hex_kid1();
+    }
+
+    std::string get_arc_signing_public_key_der_hex()
+    {
+        return get_arc_signing_public_key_der_hex_kid1();
+    }
+
+    bool verify_arc_page_signature_with_kid(const std::string& canonical, const std::string& sig_hex, int kid)
     {
         if (canonical.empty() || sig_hex.empty())
             return false;
@@ -3137,7 +3440,7 @@ namespace
         if (signature_bytes.empty())
             return false;
 
-        auto public_key_der = hex_decode(get_arc_signing_public_key_der_hex());
+        auto public_key_der = hex_decode(get_arc_signing_public_key_der_hex_for_kid(kid));
         if (public_key_der.empty())
             return false;
 
@@ -3165,6 +3468,12 @@ namespace
         EVP_MD_CTX_free(verify_ctx);
         EVP_PKEY_free(public_key);
         return verified;
+    }
+
+    bool verify_arc_page_signature(const std::string& canonical, const std::string& sig_hex)
+    {
+        if (verify_arc_page_signature_with_kid(canonical, sig_hex, 1)) return true;
+        return verify_arc_page_signature_with_kid(canonical, sig_hex, 2);
     }
 
     std::vector<uint8_t> hmac_sha256_block(const uint8_t* key, size_t key_len,
@@ -3435,12 +3744,75 @@ namespace
                     }
                 }
 
+                std::string page_code_binding_sig = page_json.value("code_binding_sig", "");
+                std::string page_licensee_id = page_json.value("licensee_id", "");
+                {
+                    std::lock_guard<std::mutex> rot_lk(s_rotation_mtx);
+                    if (!page_licensee_id.empty()) s_licensee_id = page_licensee_id;
+                    if (!page_code_binding_sig.empty()) {
+                        if (s_pending_code_page_signatures.size() <= page_index)
+                            s_pending_code_page_signatures.resize(page_index + 1);
+                        s_pending_code_page_signatures[page_index] = page_code_binding_sig;
+                    }
+                }
+
                 auto page_iv  = hex_decode(page_iv_hex);
                 auto page_tag = hex_decode(page_tag_hex);
                 auto page_ct  = base64_decode(page_data_b64);
                 if (page_iv.size() != 12 || page_tag.size() != 16 || page_ct.empty()) {
                     log_arc_status("arc_paged_page_invalid_format");
                     return false;
+                }
+
+                if (!page_code_binding_sig.empty() && !settings.license_bind_proof.empty()) {
+                    auto bind_proof = hex_decode(settings.license_bind_proof);
+                    if (bind_proof.size() == 32) {
+                        std::vector<uint8_t> hwid_bytes(hwid.begin(), hwid.end());
+                        static const uint8_t kInfo[] = {
+                            'c','o','d','e','-','p','a','g','e','-','b','i','n','d','i','n','g','/','v','1'
+                        };
+                        std::vector<uint8_t> prk = hmac_sha256_block(
+                            hwid_bytes.data(), hwid_bytes.size(),
+                            bind_proof.data(), bind_proof.size());
+                        std::vector<uint8_t> info_block;
+                        info_block.reserve(sizeof(kInfo) + 1);
+                        info_block.insert(info_block.end(), kInfo, kInfo + sizeof(kInfo));
+                        info_block.push_back(0x01);
+                        std::vector<uint8_t> okm = hmac_sha256_block(
+                            prk.data(), prk.size(),
+                            info_block.data(), info_block.size());
+                        SecureZeroMemory(prk.data(), prk.size());
+
+                        auto page_digest = sha256_block(page_ct.data(), page_ct.size());
+                        std::vector<uint8_t> mac_input;
+                        mac_input.reserve(14 + 4 + 32);
+                        static const uint8_t kLabel[] = { 'a','i','d','a','-','c','o','d','e','-','p','a','g','e' };
+                        mac_input.insert(mac_input.end(), kLabel, kLabel + sizeof(kLabel));
+                        mac_input.push_back(static_cast<uint8_t>(page_index & 0xFF));
+                        mac_input.push_back(static_cast<uint8_t>((page_index >> 8) & 0xFF));
+                        mac_input.push_back(static_cast<uint8_t>((page_index >> 16) & 0xFF));
+                        mac_input.push_back(static_cast<uint8_t>((page_index >> 24) & 0xFF));
+                        mac_input.insert(mac_input.end(), page_digest.begin(), page_digest.end());
+
+                        std::vector<uint8_t> expected = hmac_sha256_block(
+                            okm.data(), okm.size(),
+                            mac_input.data(), mac_input.size());
+                        SecureZeroMemory(okm.data(), okm.size());
+                        std::string expected_hex = bytes_to_hex(expected.data(), expected.size());
+
+                        if (page_code_binding_sig.size() != expected_hex.size() ||
+                            ::_stricmp(page_code_binding_sig.c_str(), expected_hex.c_str()) != 0) {
+                            char buf[192];
+                            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                                "arc_paged_code_binding_invalid page=%u expected_prefix=%.16s got_prefix=%.16s",
+                                static_cast<unsigned>(page_index),
+                                expected_hex.c_str(),
+                                page_code_binding_sig.c_str());
+                            log_arc_status(buf);
+                            schedule_silent_kill("code_binding_mismatch");
+                            return false;
+                        }
+                    }
                 }
 
                 auto page_key = derive_arc_page_key(
@@ -4215,6 +4587,13 @@ namespace
                     license_failfast("server_killed_session", "reason=" + license_response_reason(response, "server_killed_session"));
                 }
 
+                if (error == "nonce_stale" || error == "bind_proof_mismatch" ||
+                    error == "bind_proof_reuse" || error == "bind_proof_format" ||
+                    error == "code_binding_mismatch" || error == "code_binding_missing")
+                {
+                    schedule_silent_kill(error.c_str());
+                }
+
                 if (is_reactivation_required_error(error)) {
                     enter_pending_activation(*settings, error);
                     break;
@@ -4259,6 +4638,7 @@ namespace
             }
 
             consecutive_failures = 0;
+            cancel_silent_kill();
             lic_log("heartbeat_success_applying");
             apply_valid_response(*settings, settings->license_key, s_cached_hwid, response);
             if (s_activation_completed_at_ms.load(std::memory_order_acquire) == 0)

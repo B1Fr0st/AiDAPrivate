@@ -170,16 +170,24 @@ inline transform_result apply_single(const std::string& transform_id,
 static std::vector<uint8_t> hex_decode(const std::string& hex) {
     std::vector<uint8_t> out;
     out.reserve(hex.size() / 2);
-    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
 
-        while (i < hex.size() && (hex[i] == ' ' || hex[i] == ':' || hex[i] == '\n' || hex[i] == '\r'))
-            ++i;
-        if (i + 1 >= hex.size()) break;
-        char byte_str[3] = { hex[i], hex[i + 1], 0 };
-        char* end = nullptr;
-        unsigned long val = strtoul(byte_str, &end, 16);
-        if (end != byte_str + 2) break;
-        out.push_back(static_cast<uint8_t>(val));
+    auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+        if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+        return -1;
+    };
+
+    int hi = -1;
+    for (size_t i = 0; i < hex.size(); ++i) {
+        int n = nibble(hex[i]);
+        if (n < 0) continue;
+        if (hi < 0) {
+            hi = n;
+        } else {
+            out.push_back(static_cast<uint8_t>((hi << 4) | n));
+            hi = -1;
+        }
     }
     return out;
 }
@@ -287,19 +295,30 @@ static std::vector<uint8_t> gzip_decompress(const std::vector<uint8_t>& input) {
     strm.next_in  = const_cast<Bytef*>(input.data());
 
     std::vector<uint8_t> out;
-    out.resize(input.size() * 4);
+    out.resize(input.size() * 4 + 64);
 
-    int ret;
+    int ret = Z_OK;
+    uLong last_total_out = 0;
     do {
         if (out.size() - strm.total_out < 4096)
             out.resize(out.size() * 2);
         strm.avail_out = static_cast<uInt>(out.size() - strm.total_out);
         strm.next_out  = out.data() + strm.total_out;
         ret = inflate(&strm, Z_NO_FLUSH);
-        if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
+        if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR ||
+            ret == Z_NEED_DICT || ret == Z_BUF_ERROR) {
+            inflateEnd(&strm);
+            if (ret == Z_BUF_ERROR && strm.total_out > 0) {
+                out.resize(strm.total_out);
+                return out;
+            }
+            return {};
+        }
+        if (strm.total_out == last_total_out && strm.avail_in == 0 && ret != Z_STREAM_END) {
             inflateEnd(&strm);
             return {};
         }
+        last_total_out = strm.total_out;
     } while (ret != Z_STREAM_END);
 
     out.resize(strm.total_out);
@@ -933,14 +952,28 @@ inline void registry::register_builtins() {
             if (inflateInit2(&strm, -15) != Z_OK) return { false, {}, "inflateInit failed" };
             strm.avail_in = static_cast<uInt>(input.size());
             strm.next_in = const_cast<Bytef*>(input.data());
-            std::vector<uint8_t> out(input.size() * 4);
-            int ret;
+            std::vector<uint8_t> out(input.size() * 4 + 64);
+            int ret = Z_OK;
+            uLong last_total_out = 0;
             do {
                 if (out.size() - strm.total_out < 4096) out.resize(out.size() * 2);
                 strm.avail_out = static_cast<uInt>(out.size() - strm.total_out);
                 strm.next_out = out.data() + strm.total_out;
                 ret = inflate(&strm, Z_NO_FLUSH);
-                if (ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) { inflateEnd(&strm); return { false, {}, "Inflate failed" }; }
+                if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR ||
+                    ret == Z_NEED_DICT || ret == Z_BUF_ERROR) {
+                    inflateEnd(&strm);
+                    if (ret == Z_BUF_ERROR && strm.total_out > 0) {
+                        out.resize(strm.total_out);
+                        return { true, std::move(out), {} };
+                    }
+                    return { false, {}, "Inflate failed" };
+                }
+                if (strm.total_out == last_total_out && strm.avail_in == 0 && ret != Z_STREAM_END) {
+                    inflateEnd(&strm);
+                    return { false, {}, "Inflate stalled" };
+                }
+                last_total_out = strm.total_out;
             } while (ret != Z_STREAM_END);
             out.resize(strm.total_out);
             inflateEnd(&strm);

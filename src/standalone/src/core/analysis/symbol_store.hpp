@@ -1,5 +1,8 @@
 #pragma once
 
+#include <windows.h>
+#include <shlobj.h>
+#include <algorithm>
 #include <atomic>
 #include "work_queue.hpp"
 #include <filesystem>

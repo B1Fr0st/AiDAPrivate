@@ -4,6 +4,7 @@
 #include <psapi.h>
 #include <intrin.h>
 #include <winternl.h>
+#include <bcrypt.h>
 
 #include <atomic>
 #include <cstdint>
@@ -15,6 +16,7 @@
 #include "webhook.hpp"
 
 #pragma comment(lib, "ntdll.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 namespace anti_tamper {
 namespace anti_dump
@@ -60,16 +62,53 @@ namespace detail
         return k;
     }
 
+    inline std::atomic<uint64_t>& scylla_iat_hits()
+    {
+        static std::atomic<uint64_t> v{0};
+        return v;
+    }
+
+    inline std::atomic<uint64_t>& ollydump_text_hits()
+    {
+        static std::atomic<uint64_t> v{0};
+        return v;
+    }
+
+    inline bool fill_secure_random(void* buf, size_t bytes)
+    {
+        return BCryptGenRandom(nullptr,
+            static_cast<PUCHAR>(buf), static_cast<ULONG>(bytes),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
+    }
+
     inline uint64_t generate_session_key()
     {
-        uint64_t k = __rdtsc();
-        k ^= (k << 13);
-        k ^= (k >> 7);
-        k ^= (k << 17);
-        k ^= GetCurrentProcessId();
-        k ^= reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
-        if (k == 0) k = 0xDEADC0DEBEEFCAFEULL;
+        uint64_t k = 0;
+        if (!fill_secure_random(&k, sizeof(k)))
+        {
+            k = static_cast<uint64_t>(__rdtsc());
+            k ^= GetCurrentProcessId();
+            k ^= reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+        }
+        if (k == 0)
+        {
+            uint8_t fallback[8]{};
+            fill_secure_random(fallback, sizeof(fallback));
+            memcpy(&k, fallback, sizeof(k));
+            if (k == 0) k = 0xDEADC0DEBEEFCAFEULL;
+        }
         return k;
+    }
+
+    inline void fill_random_bytes(uint8_t* dst, size_t n)
+    {
+        if (fill_secure_random(dst, n)) return;
+        uint64_t fallback = static_cast<uint64_t>(__rdtsc());
+        for (size_t i = 0; i < n; ++i)
+        {
+            fallback = fallback * 6364136223846793005ULL + 1442695040888963407ULL;
+            dst[i] = static_cast<uint8_t>(fallback >> 33);
+        }
     }
 
     inline void xor_region(uint8_t* base, uint32_t size, uint64_t key)
@@ -133,16 +172,57 @@ namespace pe_header
         uint16_t saved_magic = dos->e_magic;
         uint32_t saved_lfanew = dos->e_lfanew;
 
-        volatile uint8_t* vb = reinterpret_cast<volatile uint8_t*>(base);
-        for (DWORD i = 0; i < e_lfanew; ++i)
+        constexpr DWORD k_first8_off = 0;
+        if (e_lfanew >= 8)
         {
-            vb[i] = static_cast<uint8_t>(__rdtsc() & 0xFF);
+            uint64_t random_first8 = 0;
+            detail::fill_random_bytes(reinterpret_cast<uint8_t*>(&random_first8),
+                sizeof(random_first8));
+
+            auto* first8 = reinterpret_cast<volatile LONG64*>(base + k_first8_off);
+            LONG64 expected_orig = 0;
+            memcpy(&expected_orig, base + k_first8_off, sizeof(expected_orig));
+            InterlockedCompareExchange64(first8, static_cast<LONG64>(random_first8),
+                expected_orig);
+        }
+
+        if (e_lfanew > 8)
+        {
+            volatile uint8_t* vb = reinterpret_cast<volatile uint8_t*>(base);
+            uint8_t random_buf[256];
+            DWORD remaining = e_lfanew - 8;
+            DWORD off = 8;
+            while (remaining > 0)
+            {
+                DWORD this_chunk = remaining > sizeof(random_buf)
+                    ? static_cast<DWORD>(sizeof(random_buf)) : remaining;
+                detail::fill_random_bytes(random_buf, this_chunk);
+                for (DWORD i = 0; i < this_chunk; ++i)
+                    vb[off + i] = random_buf[i];
+                off += this_chunk;
+                remaining -= this_chunk;
+            }
         }
 
         auto* new_dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
 
-        new_dos->e_magic = saved_magic;
-        new_dos->e_lfanew = static_cast<LONG>(e_lfanew);
+        union dos_merge_u {
+            struct { uint16_t magic; uint8_t pad[58]; uint32_t lfanew; } parts;
+            LONG64 wide[8];
+        };
+        dos_merge_u merged{};
+        memcpy(&merged, base, sizeof(merged));
+
+        dos_merge_u restored = merged;
+        restored.parts.magic = saved_magic;
+        restored.parts.lfanew = saved_lfanew;
+
+        for (size_t i = 0; i < 8; ++i)
+        {
+            volatile LONG64* slot = reinterpret_cast<volatile LONG64*>(base + i * sizeof(LONG64));
+            LONG64 expected = merged.wide[i];
+            InterlockedCompareExchange64(slot, restored.wide[i], expected);
+        }
 
         VirtualProtect(base, e_lfanew, old_prot, &old_prot);
 
@@ -316,9 +396,15 @@ namespace pe_header
             char fake_name[IMAGE_SIZEOF_SHORT_NAME] = {};
             snprintf(fake_name, IMAGE_SIZEOF_SHORT_NAME, ".x%d%c", i, 'A' + (i % 26));
             memcpy(sec[i].Name, fake_name, IMAGE_SIZEOF_SHORT_NAME);
-            sec[i].VirtualAddress = static_cast<DWORD>(__rdtsc() & 0x7FFFFFFF);
-            sec[i].Misc.VirtualSize = static_cast<DWORD>(__rdtsc() & 0xFFFF) + 0x1000;
-            sec[i].PointerToRawData = static_cast<DWORD>(__rdtsc() & 0x7FFFFFFF);
+
+            uint32_t rand_va = 0, rand_vsz = 0, rand_raw = 0;
+            detail::fill_random_bytes(reinterpret_cast<uint8_t*>(&rand_va), sizeof(rand_va));
+            detail::fill_random_bytes(reinterpret_cast<uint8_t*>(&rand_vsz), sizeof(rand_vsz));
+            detail::fill_random_bytes(reinterpret_cast<uint8_t*>(&rand_raw), sizeof(rand_raw));
+
+            sec[i].VirtualAddress = rand_va & 0x7FFFFFFFu;
+            sec[i].Misc.VirtualSize = (rand_vsz & 0xFFFFu) + 0x1000u;
+            sec[i].PointerToRawData = rand_raw & 0x7FFFFFFFu;
             sec[i].SizeOfRawData = sec[i].Misc.VirtualSize;
             sec[i].Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE;
         }
@@ -417,6 +503,246 @@ namespace module_stealth
 }
 
 
+namespace iat_guard
+{
+
+    inline std::atomic<uint64_t>& iat_base()
+    {
+        static std::atomic<uint64_t> v{0};
+        return v;
+    }
+
+    inline std::atomic<uint32_t>& iat_size()
+    {
+        static std::atomic<uint32_t> v{0};
+        return v;
+    }
+
+    inline bool locate_iat_range(uint64_t& base_out, uint32_t& size_out)
+    {
+        HMODULE mod = GetModuleHandleW(nullptr);
+        if (!mod) return false;
+
+        auto* base = reinterpret_cast<uint8_t*>(mod);
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE && dos->e_magic != 0)
+            return false;
+
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE && nt->Signature != 0)
+            return false;
+        if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_IAT)
+            return false;
+
+        const auto& iat_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+        if (iat_dir.VirtualAddress == 0 || iat_dir.Size == 0)
+        {
+            const auto& imp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+            if (imp_dir.VirtualAddress == 0 || imp_dir.Size == 0)
+                return false;
+            base_out = reinterpret_cast<uint64_t>(base) + imp_dir.VirtualAddress;
+            size_out = imp_dir.Size;
+            return true;
+        }
+
+        base_out = reinterpret_cast<uint64_t>(base) + iat_dir.VirtualAddress;
+        size_out = iat_dir.Size;
+        return true;
+    }
+
+    inline bool arm_guard()
+    {
+        uint64_t b = 0;
+        uint32_t s = 0;
+        if (!locate_iat_range(b, s)) return false;
+
+        SYSTEM_INFO si{};
+        GetSystemInfo(&si);
+        DWORD ps = si.dwPageSize ? si.dwPageSize : 0x1000;
+        uint64_t aligned_base = b & ~static_cast<uint64_t>(ps - 1);
+        uint64_t end = (b + s + ps - 1) & ~static_cast<uint64_t>(ps - 1);
+        uint32_t aligned_size = static_cast<uint32_t>(end - aligned_base);
+
+        DWORD old_prot = 0;
+        if (!VirtualProtect(reinterpret_cast<void*>(aligned_base), aligned_size,
+                PAGE_READONLY | PAGE_GUARD, &old_prot))
+            return false;
+
+        iat_base().store(aligned_base);
+        iat_size().store(aligned_size);
+        return true;
+    }
+
+    inline bool rearm_guard()
+    {
+        uint64_t b = iat_base().load();
+        uint32_t s = iat_size().load();
+        if (b == 0 || s == 0) return false;
+
+        DWORD old_prot = 0;
+        return VirtualProtect(reinterpret_cast<void*>(b), s,
+            PAGE_READONLY | PAGE_GUARD, &old_prot) != 0;
+    }
+
+    inline bool address_in_range(uint64_t addr)
+    {
+        uint64_t b = iat_base().load();
+        uint32_t s = iat_size().load();
+        if (b == 0 || s == 0) return false;
+        return addr >= b && addr < b + s;
+    }
+
+    inline void register_hit()
+    {
+        detail::scylla_iat_hits().fetch_add(1, std::memory_order_relaxed);
+    }
+
+    inline uint64_t hit_count()
+    {
+        return detail::scylla_iat_hits().load(std::memory_order_relaxed);
+    }
+
+    inline void scrub_xor_key()
+    {
+        detail::xor_key() = detail::generate_session_key();
+    }
+
+}
+
+namespace text_guard
+{
+
+    inline std::atomic<uint64_t>& text_base()
+    {
+        static std::atomic<uint64_t> v{0};
+        return v;
+    }
+
+    inline std::atomic<uint32_t>& text_size()
+    {
+        static std::atomic<uint32_t> v{0};
+        return v;
+    }
+
+    inline std::atomic<bool>& cycle_running()
+    {
+        static std::atomic<bool> v{false};
+        return v;
+    }
+
+    inline bool locate_text_range(uint64_t& base_out, uint32_t& size_out)
+    {
+        HMODULE mod = GetModuleHandleW(nullptr);
+        if (!mod) return false;
+
+        auto* base = reinterpret_cast<uint8_t*>(mod);
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+
+        IMAGE_NT_HEADERS64* nt = nullptr;
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE)
+            nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        else
+            nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+
+        if (!nt) return false;
+        if (nt->Signature != IMAGE_NT_SIGNATURE && nt->Signature != 0)
+            return false;
+
+        auto* sec = IMAGE_FIRST_SECTION(nt);
+        WORD num = nt->FileHeader.NumberOfSections;
+        for (WORD i = 0; i < num; ++i)
+        {
+            if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)
+            {
+                base_out = reinterpret_cast<uint64_t>(base) + sec[i].VirtualAddress;
+                size_out = sec[i].Misc.VirtualSize;
+                return true;
+            }
+        }
+
+        MODULEINFO mi{};
+        if (!GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi)))
+            return false;
+        base_out = reinterpret_cast<uint64_t>(mi.lpBaseOfDll) + 0x1000;
+        size_out = mi.SizeOfImage > 0x1000 ? mi.SizeOfImage - 0x1000 : 0;
+        return size_out != 0;
+    }
+
+    inline void cycle_thread()
+    {
+        uint64_t b = text_base().load();
+        uint32_t s = text_size().load();
+        if (b == 0 || s == 0) return;
+
+        bool in_noaccess = false;
+        while (cycle_running().load())
+        {
+            DWORD old = 0;
+            if (in_noaccess)
+            {
+                if (VirtualProtect(reinterpret_cast<void*>(b), s,
+                    PAGE_EXECUTE_READ, &old))
+                {
+                    in_noaccess = false;
+                }
+            }
+            else
+            {
+                in_noaccess = true;
+            }
+            Sleep(100);
+        }
+        DWORD old = 0;
+        VirtualProtect(reinterpret_cast<void*>(b), s, PAGE_EXECUTE_READ, &old);
+    }
+
+    inline bool start_cycle()
+    {
+        uint64_t b = 0;
+        uint32_t s = 0;
+        if (!locate_text_range(b, s)) return false;
+
+        text_base().store(b);
+        text_size().store(s);
+        cycle_running().store(true);
+        try
+        {
+            std::thread(cycle_thread).detach();
+        }
+        catch (...)
+        {
+            cycle_running().store(false);
+            return false;
+        }
+        return true;
+    }
+
+    inline void stop_cycle()
+    {
+        cycle_running().store(false);
+    }
+
+    inline bool address_in_range(uint64_t addr)
+    {
+        uint64_t b = text_base().load();
+        uint32_t s = text_size().load();
+        if (b == 0 || s == 0) return false;
+        return addr >= b && addr < b + s;
+    }
+
+    inline void register_hit()
+    {
+        detail::ollydump_text_hits().fetch_add(1, std::memory_order_relaxed);
+    }
+
+    inline uint64_t hit_count()
+    {
+        return detail::ollydump_text_hits().load(std::memory_order_relaxed);
+    }
+
+}
+
+
 namespace read_intercept
 {
 
@@ -430,6 +756,22 @@ namespace read_intercept
         {
             uint64_t fault_addr = static_cast<uint64_t>(
                 ep->ExceptionRecord->ExceptionInformation[1]);
+
+            if (iat_guard::address_in_range(fault_addr))
+            {
+                iat_guard::register_hit();
+                iat_guard::scrub_xor_key();
+                ep->ContextRecord->EFlags |= 0x100;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+
+            if (text_guard::address_in_range(fault_addr))
+            {
+                text_guard::register_hit();
+                ep->ContextRecord->EFlags |= 0x100;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+
             uint64_t base = trap_page_base.load();
             uint32_t size = trap_page_size.load();
 
@@ -442,10 +784,10 @@ namespace read_intercept
 
         if (ep->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP)
         {
+            iat_guard::rearm_guard();
+
             uint64_t base = trap_page_base.load();
             uint32_t size = trap_page_size.load();
-
-
             if (base != 0 && size != 0)
             {
                 DWORD old_prot;
@@ -453,6 +795,7 @@ namespace read_intercept
                     PAGE_EXECUTE_READ | PAGE_GUARD, &old_prot);
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
+            return EXCEPTION_CONTINUE_EXECUTION;
         }
 
         return EXCEPTION_CONTINUE_SEARCH;
@@ -468,8 +811,6 @@ namespace read_intercept
         if (dos->e_magic != IMAGE_DOS_SIGNATURE && dos->e_magic != 0)
         {
             webhook::write_log("anti_dump", "set_guard_pages: pe_corrupted, setting guards");
-            auto* nt_at_offset = reinterpret_cast<IMAGE_NT_HEADERS64*>(
-                base_ptr + dos->e_lfanew);
 
             MODULEINFO mi{};
             GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi));
@@ -543,7 +884,6 @@ namespace section_encrypt
         MODULEINFO mi{};
         GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi));
 
-        auto* base = reinterpret_cast<uint8_t*>(mod);
         uint64_t mod_base = reinterpret_cast<uint64_t>(mod);
         uint64_t mod_end = mod_base + mi.SizeOfImage;
 
@@ -602,18 +942,16 @@ namespace dump_poison
     {
         for (int i = 0; i < 32; ++i)
         {
-            SIZE_T alloc_size = (1 << 14) + ((__rdtsc() & 0x3FFF));
+            uint32_t rand_size_seed = 0;
+            detail::fill_random_bytes(reinterpret_cast<uint8_t*>(&rand_size_seed),
+                sizeof(rand_size_seed));
+            SIZE_T alloc_size = (1u << 14) + (rand_size_seed & 0x3FFFu);
             void* block = VirtualAlloc(nullptr, alloc_size,
                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (block)
             {
                 auto* ptr = static_cast<uint8_t*>(block);
-                for (SIZE_T j = 0; j < alloc_size; j += 8)
-                {
-                    uint64_t garbage = __rdtsc() ^ (j * 0x9E3779B97F4A7C15ULL);
-                    if (j + 8 <= alloc_size)
-                        *reinterpret_cast<uint64_t*>(ptr + j) = garbage;
-                }
+                detail::fill_random_bytes(ptr, alloc_size);
 
                 DWORD old_prot;
                 VirtualProtect(block, alloc_size, PAGE_EXECUTE_READ, &old_prot);
@@ -767,7 +1105,7 @@ namespace monitor
     {
         while (detail::monitors_running().load())
         {
-            Sleep(10000);
+            Sleep(500);
 
             if (!detail::active().load()) continue;
 
@@ -851,6 +1189,16 @@ inline bool initialize()
     read_intercept::install_veh();
     webhook::write_log("anti_dump", "install_veh_ok");
 
+    if (iat_guard::arm_guard())
+        webhook::write_log("anti_dump", "iat_guard_armed_ok");
+    else
+        webhook::write_log("anti_dump", "iat_guard_armed_fail");
+
+    if (text_guard::start_cycle())
+        webhook::write_log("anti_dump", "text_guard_cycle_started");
+    else
+        webhook::write_log("anti_dump", "text_guard_cycle_failed");
+
     return true;
 }
 
@@ -872,6 +1220,7 @@ inline void shutdown()
 {
     detail::monitors_running().store(false);
     detail::active().store(false);
+    text_guard::stop_cycle();
     read_intercept::remove_veh();
 }
 

@@ -1056,7 +1056,14 @@ inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len
 						|| wcsstr(exe_lower, WOBFSTR(L"dotpeek").c_str())
 						|| wcsstr(exe_lower, WOBFSTR(L"pestudio").c_str())
 						|| wcsstr(exe_lower, WOBFSTR(L"die.exe").c_str())
-						|| wcsstr(exe_lower, WOBFSTR(L"detect it easy").c_str()))
+						|| wcsstr(exe_lower, WOBFSTR(L"detect it easy").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"cheatengine").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"reclassex").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"reclass").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"hxd.exe").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"010editor").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"processhacker").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"systeminformer").c_str()))
 					{
 
 						HANDLE hREProc = OpenProcess(

@@ -469,27 +469,25 @@ inline void load_cache_from_disk()
 		std::ifstream ifs(entry.path());
 		if (!ifs.is_open()) continue;
 
-		try {
-			nlohmann::json j;
-			ifs >> j;
+		auto j = nlohmann::json::parse(ifs, nullptr, false);
+		if (j.is_discarded()) continue;
 
-			decompile_result_t result;
-			result.function_addr = j.value("function_addr", uint64_t(0));
-			result.function_name = j.value("function_name", std::string{});
-			result.pseudocode = j.value("pseudocode", std::string{});
-			result.parameters = j.value("parameters", std::string{});
-			if (j.contains("callees") && j["callees"].is_array()) {
-				for (auto& c : j["callees"])
-					result.callees.push_back(c.get<std::string>());
-			}
-			result.complete = true;
+		decompile_result_t result;
+		result.function_addr = j.value("function_addr", uint64_t(0));
+		result.function_name = j.value("function_name", std::string{});
+		result.pseudocode = j.value("pseudocode", std::string{});
+		result.parameters = j.value("parameters", std::string{});
+		if (j.contains("callees") && j["callees"].is_array()) {
+			for (auto& c : j["callees"])
+				result.callees.push_back(c.get<std::string>());
+		}
+		result.complete = true;
 
-			if (result.function_addr != 0 && !result.pseudocode.empty()) {
-				std::lock_guard<std::mutex> lk(g_state.mutex);
-				if (g_state.cache.find(result.function_addr) == g_state.cache.end())
-					g_state.cache[result.function_addr] = std::move(result);
-			}
-		} catch (...) {}
+		if (result.function_addr != 0 && !result.pseudocode.empty()) {
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			if (g_state.cache.find(result.function_addr) == g_state.cache.end())
+				g_state.cache[result.function_addr] = std::move(result);
+		}
 	}
 }
 

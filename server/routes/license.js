@@ -3,21 +3,33 @@
 const express = require('express');
 const crypto = require('crypto');
 const pool = require('../db/pool');
-const { signPayload, dualSignPayload } = require('../crypto/signing');
+const { signPayload, dualSignPayload, signWithKid, getActiveKidInfo } = require('../crypto/signing');
 const { deriveKeySeed } = require('../crypto/arc-encrypt');
 const kwWrap = require('../crypto/kw_wrap');
 const arcLicenseBind = require('../crypto/arc-license-bind');
+const columnCrypt = require('../crypto/column_crypt');
+const rateLimit = require('../middleware/rate_limit');
+const tpmQuote = require('../crypto/tpm_quote');
+const ekRoots = require('../crypto/ek_roots');
+const anomalyScore = require('../anomaly/score');
 
 const router = express.Router();
 
 
 const SESSION_TTL_SECONDS = 3600;
 const SESSION_TTL_GRACE_FACTOR = 1.1;
-const CHALLENGE_TTL_SECONDS = 10;
-const CHALLENGE_REQUIRED = (process.env.CHALLENGE_REQUIRED || '0') === '1';
+const CHALLENGE_TTL_SECONDS = 30;
+const NONCE_REPLAY_TTL_SECONDS = parseInt(process.env.NONCE_REPLAY_TTL_SECONDS || '60', 10);
+const CHALLENGE_REQUIRED = (process.env.CHALLENGE_REQUIRED || '1') !== '0';
+const HEARTBEAT_NONCE_MAX_AGE_SECONDS = 60;
+const BIND_PROOF_HISTORY_LIMIT = 32;
+const ENTERPRISE_PLAN_TIER = 'enterprise';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 const TELEGRAM_BOT_TOKEN  = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID    = process.env.TELEGRAM_CHAT_ID || '';
+const SLACK_WEBHOOK_URL   = process.env.SLACK_WEBHOOK_URL || '';
+const TPM_REQUIRED_TIERS  = new Set((process.env.TPM_REQUIRED_TIERS || '').split(',').map(s => s.trim()).filter(Boolean));
+const ANOMALY_DISABLED    = (process.env.ANOMALY_DISABLED || '0') === '1';
 
 const ED25519_KEY_ROTATION_NOT_BEFORE = parseInt(process.env.ED25519_KEY_NOT_BEFORE || '0', 10) || 0;
 const ED25519_NEXT_PUBKEY_B64 = process.env.ED25519_NEXT_PUBKEY_B64 || '';
@@ -52,6 +64,39 @@ function generateSessionToken() {
 
 function generateServerNonce() {
     return crypto.randomBytes(16).toString('hex');
+}
+
+function decryptSessionRow(row) {
+    if (!row) return row;
+    const uuid = typeof row.session_uuid === 'string' ? row.session_uuid : '';
+    if (!uuid) return row;
+    if (typeof row.session_token === 'string' && columnCrypt.isCiphertext(row.session_token)) {
+        try {
+            row.session_token = columnCrypt.decrypt(uuid, 'sessions/session_token', row.session_token);
+        } catch (err) {
+            console.error('[license] session_token decrypt failed for', row.license_key, err && err.message);
+            row.session_token = '';
+        }
+    }
+    if (typeof row.last_proof_token === 'string' && row.last_proof_token.length > 0
+        && columnCrypt.isCiphertext(row.last_proof_token)) {
+        try {
+            row.last_proof_token = columnCrypt.decrypt(uuid, 'sessions/last_proof_token', row.last_proof_token);
+        } catch (err) {
+            console.error('[license] last_proof_token decrypt failed for', row.license_key, err && err.message);
+            row.last_proof_token = '';
+        }
+    }
+    return row;
+}
+
+function encryptSessionToken(uuid, plaintext) {
+    return columnCrypt.encrypt(uuid, 'sessions/session_token', plaintext);
+}
+
+function encryptProofToken(uuid, plaintext) {
+    if (!plaintext || plaintext.length === 0) return '';
+    return columnCrypt.encrypt(uuid, 'sessions/last_proof_token', plaintext);
 }
 
 function isHexNonce(value, minLength = 16, maxLength = 128) {
@@ -324,6 +369,181 @@ async function sendTelegramAlert(title, fields) {
     } catch (_) {  }
 }
 
+
+async function sendSlackAlert(title, fields, severity) {
+    if (!SLACK_WEBHOOK_URL) return;
+    try {
+        const blocks = [
+            { type: 'header', text: { type: 'plain_text', text: String(title).slice(0, 150) } },
+        ];
+        const fieldElems = fields.map(f => ({
+            type: 'mrkdwn',
+            text: `*${f.name}*\n${String(f.value).slice(0, 300)}`,
+        }));
+        while (fieldElems.length > 0) {
+            const chunk = fieldElems.splice(0, 10);
+            blocks.push({ type: 'section', fields: chunk });
+        }
+        const fallback = `${title} severity=${severity || 'warn'}`;
+        await fetch(SLACK_WEBHOOK_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: fallback, blocks }),
+        });
+    } catch (_) { }
+}
+
+
+function isTpmRequiredForLicense(lic) {
+    void lic;
+    return false;
+}
+
+
+function combineHardwareIdWithTpm(existingHwid, tpmHwidComponent) {
+    if (!tpmHwidComponent) return existingHwid;
+    if (!existingHwid) return tpmHwidComponent;
+    return crypto.createHash('sha256')
+        .update(String(existingHwid))
+        .update('|tpm-bound|')
+        .update(String(tpmHwidComponent))
+        .digest('hex');
+}
+
+
+async function persistTpmAttestation(licenseKey, verifyResult, sealPayload) {
+    const now = Math.floor(Date.now() / 1000);
+    try {
+        await pool.query(
+            `UPDATE licenses SET
+                tpm_ek_fingerprint  = $1,
+                tpm_ek_vendor       = $2,
+                tpm_pcr_digest      = $3,
+                tpm_attest_count    = tpm_attest_count + 1,
+                tpm_last_attest_at  = $4,
+                tpm_seal_payload    = COALESCE($5, tpm_seal_payload)
+             WHERE key = $6`,
+            [
+                verifyResult.ekCertFingerprint,
+                verifyResult.ekVendor || '',
+                verifyResult.pcrDigestHex,
+                now,
+                sealPayload ? JSON.stringify(sealPayload) : null,
+                licenseKey,
+            ]
+        );
+    } catch (err) {
+        console.error('[tpm] persistTpmAttestation failed:', err && err.message ? err.message : err);
+    }
+}
+
+
+function buildTpmSealedPayload(lic, verifyResult, sessionToken) {
+    if (!verifyResult || !verifyResult.ekPublicKey) return null;
+    if (!lic || !lic.witness_key_wrapped) return null;
+    let kw;
+    try { kw = kwWrap.unwrap(lic.witness_key_wrapped, 'kw/v1'); }
+    catch (_) { return null; }
+    const subkey = kwWrap.deriveKwSubkey(kw, 'tpm_seal/v1');
+    const wrappingMaterial = crypto.createHmac('sha256', subkey)
+        .update(String(sessionToken || ''))
+        .update('|')
+        .update(String(verifyResult.ekCertFingerprint || ''))
+        .digest();
+    const indices = tpmQuote.REQUIRED_PCR_INDICES;
+    const pcrMap = {};
+    for (const idx of indices) pcrMap[idx] = Buffer.from('00'.repeat(32), 'hex');
+    try {
+        return tpmQuote.sealLicenseKeyForClient(wrappingMaterial, verifyResult.ekPublicKey, pcrMap);
+    } catch (err) {
+        console.error('[tpm] buildTpmSealedPayload failed:', err && err.message ? err.message : err);
+        return null;
+    }
+}
+
+
+async function applyAnomalyDecision(licenseKey, hwid, clientIp, body, decision) {
+    if (!decision) return null;
+    const now = Math.floor(Date.now() / 1000);
+    try {
+        await pool.query(
+            `UPDATE licenses SET
+                anomaly_last_score  = $1,
+                anomaly_last_action = $2,
+                anomaly_last_at     = $3
+             WHERE key = $4`,
+            [decision.score, decision.action, now, licenseKey]
+        );
+    } catch (err) {
+        console.warn('[anomaly] persist last-decision failed:', err && err.message ? err.message : err);
+    }
+
+    if (decision.action === 'flag') {
+        try {
+            await pool.query(
+                `UPDATE licenses SET
+                    flagged        = true,
+                    flagged_reason = $1,
+                    flagged_at     = $2,
+                    flagged_score  = $3
+                 WHERE key = $4`,
+                [decision.reason || 'anomaly_flag', now, decision.score, licenseKey]
+            );
+        } catch (err) {
+            console.warn('[anomaly] flag persist failed:', err && err.message ? err.message : err);
+        }
+        await anomalyScore.getDefaultEngine().dispatchAlerts(decision, licenseKey, hwid).catch(() => {});
+        return { action: 'flag', score: decision.score };
+    }
+
+    if (decision.action === 'revoke') {
+        const reason = `anomaly_revoke:${decision.score.toFixed(3)}`;
+        try {
+            await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [licenseKey]);
+        } catch (_) { }
+        try {
+            await revokeLicenseAndSession(licenseKey, reason, body && body.plugin_version, hwid);
+        } catch (err) {
+            console.error('[anomaly] revoke failed:', err && err.message ? err.message : err);
+        }
+        try {
+            await recordBan(hwid, clientIp, reason, body && body.plugin_version, {
+                route: 'license',
+                action: 'anomaly',
+                license_key: licenseKey,
+                reasons: ['anomaly_auto_revoke'],
+                evidence: {
+                    score: decision.score,
+                    perMetric: decision.perMetric,
+                    metrics: decision.metrics,
+                    sample_count: decision.sampleCount,
+                },
+            });
+        } catch (_) { }
+        await anomalyScore.getDefaultEngine().dispatchAlerts(decision, licenseKey, hwid).catch(() => {});
+        return { action: 'revoke', score: decision.score, reason };
+    }
+
+    return { action: decision.action, score: decision.score };
+}
+
+
+async function ingestHeartbeatAnomaly(licenseKey, hwid, clientIp, body, session) {
+    if (ANOMALY_DISABLED) return null;
+    if (!licenseKey) return null;
+    const metrics = anomalyScore.extractMetricsFromHeartbeat(body, session);
+    if (Object.keys(metrics).length === 0) return null;
+    const engine = anomalyScore.getDefaultEngine();
+    const decision = engine.evaluate(licenseKey, metrics);
+    engine.record(licenseKey, metrics, Date.now());
+    if (decision.action === 'observe' || decision.action === 'warmup') {
+        return { decision, applied: { action: decision.action, score: decision.score } };
+    }
+    const applied = await applyAnomalyDecision(licenseKey, hwid, clientIp, body, decision);
+    return { decision, applied };
+}
+
+
 async function ensureLicenseSecrets(licenseKey, data) {
     if (!data || typeof data !== 'object') return data;
     let mutated = false;
@@ -421,30 +641,37 @@ async function verifyOrBindHwid(licenseKey, hwid, existingHwid) {
 }
 
 async function storeSession(licenseKey, sessionData) {
+    const sessionUuid = columnCrypt.generateRowUuid();
+    const sessionTokenWrapped = encryptSessionToken(sessionUuid, sessionData.session_token);
+    const authHmacKey = crypto.randomBytes(32);
     await pool.query(`
-        INSERT INTO sessions (license_key, session_token, server_nonce, issued_at, ttl, hwid, ip, plugin_version, last_heartbeat, kill_flag, heartbeat_count, last_proof_token, last_code_hash, ip_history, heartbeat_times, honeypot_export, challenge_id, last_chain_tag)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, 0, '', '', ARRAY[$7]::TEXT[], ARRAY[]::BIGINT[], $10, $11, '')
+        INSERT INTO sessions (license_key, session_token, server_nonce, issued_at, ttl, hwid, ip, plugin_version, last_heartbeat, kill_flag, heartbeat_count, last_proof_token, last_code_hash, ip_history, heartbeat_times, honeypot_export, challenge_id, last_chain_tag, session_uuid, column_crypt_version, auth_hmac_key, anomaly_score)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, 0, '', '', ARRAY[$7]::TEXT[], ARRAY[]::BIGINT[], $10, $11, '', $12, 1, $13, 0)
         ON CONFLICT (license_key) DO UPDATE SET
-            session_token     = EXCLUDED.session_token,
-            server_nonce      = EXCLUDED.server_nonce,
-            issued_at         = EXCLUDED.issued_at,
-            ttl               = EXCLUDED.ttl,
-            hwid              = EXCLUDED.hwid,
-            ip                = EXCLUDED.ip,
-            plugin_version    = EXCLUDED.plugin_version,
-            last_heartbeat    = EXCLUDED.last_heartbeat,
-            kill_flag         = false,
-            heartbeat_count   = 0,
-            last_proof_token  = '',
-            last_code_hash    = '',
-            ip_history        = ARRAY[EXCLUDED.ip]::TEXT[],
-            heartbeat_times   = ARRAY[]::BIGINT[],
-            honeypot_export   = EXCLUDED.honeypot_export,
-            challenge_id      = EXCLUDED.challenge_id,
-            last_chain_tag    = ''
+            session_token        = EXCLUDED.session_token,
+            server_nonce         = EXCLUDED.server_nonce,
+            issued_at            = EXCLUDED.issued_at,
+            ttl                  = EXCLUDED.ttl,
+            hwid                 = EXCLUDED.hwid,
+            ip                   = EXCLUDED.ip,
+            plugin_version       = EXCLUDED.plugin_version,
+            last_heartbeat       = EXCLUDED.last_heartbeat,
+            kill_flag            = false,
+            heartbeat_count      = 0,
+            last_proof_token     = '',
+            last_code_hash       = '',
+            ip_history           = ARRAY[EXCLUDED.ip]::TEXT[],
+            heartbeat_times      = ARRAY[]::BIGINT[],
+            honeypot_export      = EXCLUDED.honeypot_export,
+            challenge_id         = EXCLUDED.challenge_id,
+            last_chain_tag       = '',
+            session_uuid         = EXCLUDED.session_uuid,
+            column_crypt_version = 1,
+            auth_hmac_key        = EXCLUDED.auth_hmac_key,
+            anomaly_score        = 0
     `, [
         licenseKey,
-        sessionData.session_token,
+        sessionTokenWrapped,
         sessionData.server_nonce,
         sessionData.issued_at,
         sessionData.ttl,
@@ -454,7 +681,10 @@ async function storeSession(licenseKey, sessionData) {
         sessionData.last_heartbeat,
         sessionData.honeypot_export || '',
         sessionData.challenge_id || '',
+        sessionUuid,
+        authHmacKey,
     ]);
+    return { authHmacKey };
 }
 
 async function getSession(licenseKey) {
@@ -462,7 +692,23 @@ async function getSession(licenseKey) {
         'SELECT * FROM sessions WHERE license_key = $1',
         [licenseKey]
     );
-    return rows.length > 0 ? rows[0] : null;
+    if (rows.length === 0) return null;
+    return decryptSessionRow(rows[0]);
+}
+
+async function updateLastProofToken(licenseKey, plaintextProof) {
+    const { rows } = await pool.query(
+        'SELECT session_uuid FROM sessions WHERE license_key = $1',
+        [licenseKey]
+    );
+    if (rows.length === 0) return false;
+    const uuid = rows[0].session_uuid;
+    const wrapped = encryptProofToken(uuid, plaintextProof || '');
+    await pool.query(
+        'UPDATE sessions SET last_proof_token = $1 WHERE license_key = $2',
+        [wrapped, licenseKey]
+    );
+    return true;
 }
 
 async function checkBans(hwid, clientIp) {
@@ -659,7 +905,29 @@ async function handleValidate(body, clientIp) {
     }
 
 
-    const hwidResult = await verifyOrBindHwid(license_key, hwid, lookup.data.hwid || '');
+    let tpmVerify = null;
+    let effectiveHwid = hwid;
+    const tpmBundle = body && body.tpm_attest;
+    if (tpmBundle && typeof tpmBundle === 'object') {
+        const enriched = Object.assign({}, tpmBundle, {
+            existingAnchorString: hwid,
+            expectedNonce: tpmBundle.expectedNonce || tpmBundle.expected_nonce || client_nonce,
+        });
+        const result = tpmQuote.verifyTpmQuote(enriched);
+        if (!result.ok) {
+            return { status: 200, body: { status: 'invalid', reason: 'tpm_quote_invalid', detail: result.reason } };
+        }
+        tpmVerify = result;
+        effectiveHwid = combineHardwareIdWithTpm(hwid, result.hwidComponentHex);
+        if (lookup.data.tpm_ek_fingerprint && lookup.data.tpm_ek_fingerprint !== result.ekCertFingerprint) {
+            return { status: 200, body: { status: 'invalid', reason: 'tpm_ek_mismatch' } };
+        }
+    } else if (isTpmRequiredForLicense(lookup.data)) {
+        return { status: 200, body: { status: 'invalid', reason: 'tpm_attest_required' } };
+    }
+
+
+    const hwidResult = await verifyOrBindHwid(license_key, effectiveHwid, lookup.data.hwid || '');
     if (!hwidResult.ok) {
         return { status: 200, body: { status: 'invalid', reason: hwidResult.reason } };
     }
@@ -671,12 +939,12 @@ async function handleValidate(body, clientIp) {
     const ttl = SESSION_TTL_SECONDS;
     const honeypotExport = pickHoneypotExport();
 
-    await storeSession(license_key, {
+    const sessionStore = await storeSession(license_key, {
         session_token: sessionToken,
         server_nonce: serverNonce,
         issued_at: issuedAt,
         ttl,
-        hwid,
+        hwid: effectiveHwid,
         ip: clientIp,
         plugin_version: plugin_version || 'unknown',
         last_heartbeat: issuedAt,
@@ -684,22 +952,88 @@ async function handleValidate(body, clientIp) {
         challenge_id: (body && body.challenge_id) || '',
     });
 
+    await rateLimit.registerNonce(license_key, sessionToken, 'issued:' + serverNonce, NONCE_REPLAY_TTL_SECONDS);
 
-    const keySeed = deriveKeySeed(sessionToken, hwid, issuedAt);
+    let tpmSealed = null;
+    if (tpmVerify) {
+        tpmSealed = buildTpmSealedPayload(lookup.data, tpmVerify, sessionToken);
+        await persistTpmAttestation(license_key, tpmVerify, tpmSealed);
+    }
+
+    const keySeed = deriveKeySeed(sessionToken, effectiveHwid, issuedAt);
 
     let bindProofHex = '';
     try {
-        const bindProof = arcLicenseBind.deriveBindProof(lookup.data, sessionToken, hwid, issuedAt, 0n);
+        const bindProof = arcLicenseBind.deriveBindProof(lookup.data, sessionToken, effectiveHwid, issuedAt, 0n);
         bindProofHex = bindProof.toString('hex');
     } catch (err) {
         console.error('[license] bind_proof derivation failed:', err && err.message ? err.message : err);
         bindProofHex = '';
     }
 
+    const initialHbNonce = generateServerNonce();
+    const tpmDigestSeed = tpmVerify ? (tpmVerify.pcrDigestHex || '')
+        : (lookup.data && typeof lookup.data.tpm_pcr_digest === 'string' ? lookup.data.tpm_pcr_digest : '');
+    let rotatingBindProofHex = '';
+    try {
+        const proof = arcLicenseBind.deriveRotatingBindProof(
+            lookup.data, sessionToken, effectiveHwid, 0n, initialHbNonce, tpmDigestSeed);
+        rotatingBindProofHex = proof.toString('hex');
+    } catch (err) {
+        console.error('[license] rotating bind_proof derivation failed:', err && err.message ? err.message : err);
+    }
+
+    let initialChallenge = null;
+    try {
+        initialChallenge = await createChallenge(clientIp);
+    } catch (err) {
+        console.warn('[license] validate next-challenge create failed:', err && err.message ? err.message : err);
+    }
+
+    try {
+        await pool.query(`
+            UPDATE sessions SET
+                heartbeat_nonce = $1,
+                heartbeat_nonce_issued_at = $2,
+                bind_proof_current = $3,
+                bind_proof_epoch = $4,
+                bind_proof_history = '{}'::TEXT[],
+                challenge_sealed = $5,
+                tpm_quote_digest = $6,
+                challenge_id = $8
+            WHERE license_key = $7
+        `, [
+            initialHbNonce,
+            issuedAt,
+            rotatingBindProofHex,
+            0,
+            !!tpmVerify,
+            tpmDigestSeed,
+            license_key,
+            initialChallenge ? initialChallenge.challenge_id : '',
+        ]);
+    } catch (err) {
+        console.warn('[license] validate session-rotation update failed:', err && err.message ? err.message : err);
+    }
+
+    if (rotatingBindProofHex) {
+        try {
+            await pool.query(`
+                INSERT INTO bind_proof_rotations (license_key, session_token, epoch, bind_proof, issued_at)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (session_token, epoch) DO UPDATE SET bind_proof = EXCLUDED.bind_proof, issued_at = EXCLUDED.issued_at
+            `, [license_key, sessionToken, 0, rotatingBindProofHex, issuedAt]);
+        } catch (err) {
+            console.warn('[license] validate bind_proof_rotations insert failed:', err && err.message ? err.message : err);
+        }
+    }
+
+    await rateLimit.registerNonce(license_key, sessionToken, 'hbnonce:' + initialHbNonce, HEARTBEAT_NONCE_MAX_AGE_SECONDS);
+
     const sigPayload = {
         status: 'valid',
         license_key,
-        hwid,
+        hwid: effectiveHwid,
         plan: lookup.data.plan || 'standard',
         session_token: sessionToken,
         ttl,
@@ -709,14 +1043,42 @@ async function handleValidate(body, clientIp) {
         key_seed: keySeed.toString('hex'),
         honeypot_export: honeypotExport,
         ttl_grace_factor: SESSION_TTL_GRACE_FACTOR,
+        nonce_replay_ttl: NONCE_REPLAY_TTL_SECONDS,
+        rotated_heartbeat_nonce: initialHbNonce,
+        rotated_heartbeat_nonce_issued_at: issuedAt,
+        rotated_heartbeat_nonce_max_age: HEARTBEAT_NONCE_MAX_AGE_SECONDS,
+        rotated_bind_proof: rotatingBindProofHex,
+        rotated_bind_proof_epoch: 0,
+        challenge_required: CHALLENGE_REQUIRED,
+        challenge_ttl: CHALLENGE_TTL_SECONDS,
     };
+    if (initialChallenge) {
+        sigPayload.next_challenge_id = initialChallenge.challenge_id;
+        sigPayload.next_challenge_nonce = initialChallenge.challenge_nonce;
+        sigPayload.next_challenge_issued_at = initialChallenge.issued_at;
+        sigPayload.next_challenge_ttl = initialChallenge.ttl;
+        if (initialChallenge.signature) sigPayload.next_challenge_signature = initialChallenge.signature;
+    }
     if (bindProofHex) sigPayload.bind_proof = bindProofHex;
+    if (sessionStore && sessionStore.authHmacKey) {
+        sigPayload.auth_hmac_key_b64 = sessionStore.authHmacKey.toString('base64');
+    }
+    if (tpmVerify) {
+        sigPayload.tpm_bound = true;
+        sigPayload.tpm_ek_vendor = tpmVerify.ekVendor || '';
+        sigPayload.tpm_ek_fingerprint = tpmVerify.ekCertFingerprint;
+        sigPayload.tpm_pcr_digest = tpmVerify.pcrDigestHex;
+    }
     const rotationBlock = buildRotationBlock();
     Object.assign(sigPayload, rotationBlock);
-    const { signature, next_signature } = dualSignPayload(sigPayload);
+    const kidInfo = getActiveKidInfo();
+    sigPayload.kid = kidInfo.active_kid;
+    const { signature, next_signature, next_kid } = dualSignPayload(sigPayload);
 
     const responseBody = { ...sigPayload, signature };
     if (next_signature) responseBody.next_signature = next_signature;
+    if (next_kid) responseBody.next_kid = next_kid;
+    if (tpmSealed) responseBody.tpm_sealed_key = tpmSealed;
 
     return {
         status: 200,
@@ -772,6 +1134,16 @@ async function handleHeartbeat(body, clientIp) {
         return { status: 400, body: { status: 'error', reason: 'missing_fields' } };
     }
 
+    const rl = await rateLimit.checkAndRegisterHeartbeat(license_key, session_token);
+    if (!rl.ok) {
+        dbgHb('rate_limited', { reason: rl.reason, retryAfter: rl.retryAfter });
+        return {
+            status: 429,
+            body: { status: 'error', reason: rl.reason || 'rate_limited', retry_after: rl.retryAfter || 0 },
+            headers: { 'Retry-After': String(rl.retryAfter || 1) },
+        };
+    }
+
     const banCheck = await checkBans(hwid, clientIp);
     dbgHb('ban_check', { banned: banCheck.banned, reason: banCheck.reason });
     if (banCheck.banned) {
@@ -789,6 +1161,19 @@ async function handleHeartbeat(body, clientIp) {
     if (!isHexNonce(body.heartbeat_nonce || '', 16, 128)) {
         dbgHb('invalid_heartbeat_nonce', { len: (body.heartbeat_nonce || '').length });
         return { status: 200, body: { status: 'invalid', reason: 'invalid_heartbeat_nonce' } };
+    }
+
+    if (typeof body.echoed_server_nonce === 'string' && body.echoed_server_nonce.length > 0) {
+        const echoed = body.echoed_server_nonce.trim().toLowerCase();
+        if (!/^[0-9a-f]{16,128}$/.test(echoed)) {
+            dbgHb('invalid_echoed_server_nonce', { len: echoed.length });
+            return { status: 401, body: { status: 'error', reason: 'invalid_echoed_server_nonce' } };
+        }
+        const nonceCheck = await rateLimit.registerNonce(license_key, session_token, 'echo:' + echoed, NONCE_REPLAY_TTL_SECONDS);
+        if (!nonceCheck.ok) {
+            dbgHb('nonce_replay', { echoed: echoed.slice(0, 16) });
+            return { status: 401, body: { status: 'error', reason: 'nonce_replay' } };
+        }
     }
 
     const lookup = await lookupLicense(license_key);
@@ -840,6 +1225,47 @@ async function handleHeartbeat(body, clientIp) {
     if (hwid && session.hwid && hwid !== session.hwid) {
         dbgHb('hwid_mismatch', { body_hwid: maskToken(hwid), session_hwid: maskToken(session.hwid) });
         return { status: 200, body: { status: 'invalid', reason: 'hwid_mismatch' } };
+    }
+
+    const sessionStoredHbNonce = typeof session.heartbeat_nonce === 'string' ? session.heartbeat_nonce.trim().toLowerCase() : '';
+    const sessionStoredHbNonceIssuedAt = Number(session.heartbeat_nonce_issued_at || 0);
+    if (sessionStoredHbNonce.length > 0) {
+        const echoedRaw = typeof body.echoed_server_nonce === 'string' ? body.echoed_server_nonce.trim().toLowerCase() : '';
+        if (echoedRaw.length === 0 || echoedRaw !== sessionStoredHbNonce) {
+            dbgHb('echoed_server_nonce_mismatch', {
+                expected_prefix: sessionStoredHbNonce.slice(0, 16),
+                provided_prefix: echoedRaw.slice(0, 16),
+            });
+            return { status: 401, body: { status: 'invalid', reason: 'nonce_stale' } };
+        }
+        const ageS = now - sessionStoredHbNonceIssuedAt;
+        if (sessionStoredHbNonceIssuedAt <= 0 || ageS > HEARTBEAT_NONCE_MAX_AGE_SECONDS || ageS < -HEARTBEAT_NONCE_MAX_AGE_SECONDS) {
+            dbgHb('nonce_stale', { age: ageS, issued_at: sessionStoredHbNonceIssuedAt, limit: HEARTBEAT_NONCE_MAX_AGE_SECONDS });
+            return { status: 401, body: { status: 'invalid', reason: 'nonce_stale' } };
+        }
+    }
+
+    const echoedBindProofRaw = typeof body.echoed_bind_proof === 'string' ? body.echoed_bind_proof.trim().toLowerCase() : '';
+    if (echoedBindProofRaw.length > 0) {
+        if (!/^[0-9a-f]{32,128}$/.test(echoedBindProofRaw)) {
+            return { status: 401, body: { status: 'invalid', reason: 'bind_proof_format' } };
+        }
+        const sessionCurrentBindProof = typeof session.bind_proof_current === 'string' ? session.bind_proof_current.trim().toLowerCase() : '';
+        if (sessionCurrentBindProof.length > 0 && echoedBindProofRaw !== sessionCurrentBindProof) {
+            dbgHb('bind_proof_mismatch', {
+                provided_prefix: echoedBindProofRaw.slice(0, 16),
+                expected_prefix: sessionCurrentBindProof.slice(0, 16),
+            });
+            return { status: 401, body: { status: 'invalid', reason: 'bind_proof_mismatch' } };
+        }
+        const history = Array.isArray(session.bind_proof_history) ? session.bind_proof_history : [];
+        if (history.length > 0) {
+            const reuseHit = history.some(entry => typeof entry === 'string' && entry.trim().toLowerCase() === echoedBindProofRaw);
+            if (sessionCurrentBindProof !== echoedBindProofRaw && reuseHit) {
+                dbgHb('bind_proof_reuse', { proof_prefix: echoedBindProofRaw.slice(0, 16) });
+                return { status: 401, body: { status: 'invalid', reason: 'bind_proof_reuse' } };
+            }
+        }
     }
 
 
@@ -1020,6 +1446,7 @@ async function handleHeartbeat(body, clientIp) {
         new_gate_bitmap: gateBitmapToStore,
     });
 
+    const proofTokenWrapped = encryptProofToken(session.session_uuid, continuity.proof_token_to_store || '');
     await pool.query(`
         UPDATE sessions SET
             last_heartbeat    = $1,
@@ -1032,7 +1459,7 @@ async function handleHeartbeat(body, clientIp) {
         WHERE license_key = $6
     `, [
         now,
-        continuity.proof_token_to_store,
+        proofTokenWrapped,
         (typeof code_hash === 'string' ? code_hash : session.last_code_hash || ''),
         newIpHistory,
         newHbTimes,
@@ -1040,33 +1467,207 @@ async function handleHeartbeat(body, clientIp) {
         gateBitmapToStore,
     ]);
 
+    const anomalyEffectiveHwid = hwid || session.hwid || '';
+    let anomalyResult = null;
+    try {
+        anomalyResult = await ingestHeartbeatAnomaly(license_key, anomalyEffectiveHwid, clientIp, body, session);
+    } catch (err) {
+        console.warn('[anomaly] ingestHeartbeatAnomaly failed:', err && err.message ? err.message : err);
+    }
+    if (anomalyResult && anomalyResult.applied && anomalyResult.applied.action === 'revoke') {
+        return {
+            status: 200,
+            body: {
+                status: 'killed',
+                alive: false,
+                reason: anomalyResult.applied.reason || 'anomaly_auto_revoke',
+                anomaly_score: anomalyResult.applied.score,
+            },
+        };
+    }
+
     const heartbeatNonce = body.heartbeat_nonce || '';
     const serverNonce = generateServerNonce();
     const pageEpoch = (session.heartbeat_count || 0) + 1;
+    const rotatedHbNonce = generateServerNonce();
+    const rotatedHbNonceIssuedAt = now;
+
+    let nextChallenge = null;
+    try {
+        nextChallenge = await createChallenge(clientIp);
+    } catch (err) {
+        console.warn('[license] heartbeat next-challenge create failed:', err && err.message ? err.message : err);
+    }
+
+    let rotatedBindProofHex = '';
+    try {
+        const tpmDigestForBind = typeof session.tpm_quote_digest === 'string' && session.tpm_quote_digest.length > 0
+            ? session.tpm_quote_digest
+            : (lookup.data && typeof lookup.data.tpm_pcr_digest === 'string' ? lookup.data.tpm_pcr_digest : '');
+        const proof = arcLicenseBind.deriveRotatingBindProof(
+            lookup.data,
+            session_token,
+            anomalyEffectiveHwid,
+            BigInt(pageEpoch),
+            rotatedHbNonce,
+            tpmDigestForBind
+        );
+        rotatedBindProofHex = proof.toString('hex');
+    } catch (err) {
+        console.warn('[license] rotating bind_proof derivation failed:', err && err.message ? err.message : err);
+    }
+
+    const previousHistory = Array.isArray(session.bind_proof_history) ? session.bind_proof_history.slice() : [];
+    const previousCurrent = typeof session.bind_proof_current === 'string' ? session.bind_proof_current : '';
+    if (previousCurrent && !previousHistory.includes(previousCurrent)) {
+        previousHistory.push(previousCurrent);
+    }
+    const trimmedHistory = previousHistory.slice(-BIND_PROOF_HISTORY_LIMIT);
+
+    try {
+        await pool.query(`
+            UPDATE sessions SET
+                heartbeat_nonce = $1,
+                heartbeat_nonce_issued_at = $2,
+                bind_proof_current = $3,
+                bind_proof_epoch = $4,
+                bind_proof_history = $5::TEXT[],
+                challenge_id = $7
+            WHERE license_key = $6
+        `, [
+            rotatedHbNonce,
+            rotatedHbNonceIssuedAt,
+            rotatedBindProofHex,
+            pageEpoch,
+            trimmedHistory,
+            license_key,
+            nextChallenge ? nextChallenge.challenge_id : (session.challenge_id || ''),
+        ]);
+    } catch (err) {
+        console.warn('[license] heartbeat session rotation update failed:', err && err.message ? err.message : err);
+    }
+
+    if (rotatedBindProofHex) {
+        try {
+            await pool.query(`
+                INSERT INTO bind_proof_rotations (license_key, session_token, epoch, bind_proof, issued_at)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (session_token, epoch) DO UPDATE SET bind_proof = EXCLUDED.bind_proof, issued_at = EXCLUDED.issued_at
+            `, [license_key, session_token, pageEpoch, rotatedBindProofHex, now]);
+        } catch (err) {
+            console.warn('[license] bind_proof_rotations insert failed:', err && err.message ? err.message : err);
+        }
+    }
+
+    await rateLimit.registerNonce(license_key, session_token, 'issued:' + serverNonce, NONCE_REPLAY_TTL_SECONDS);
+    await rateLimit.registerNonce(license_key, session_token, 'hbnonce:' + rotatedHbNonce, HEARTBEAT_NONCE_MAX_AGE_SECONDS);
 
     const sigPayload = {
         status: 'valid',
         alive: true,
         license_key,
-        hwid: hwid || session.hwid || '',
+        hwid: anomalyEffectiveHwid,
         plan: lookup.data.plan || 'standard',
         ttl: SESSION_TTL_SECONDS,
         heartbeat_nonce: heartbeatNonce,
         server_nonce: serverNonce,
+        rotated_heartbeat_nonce: rotatedHbNonce,
+        rotated_heartbeat_nonce_issued_at: rotatedHbNonceIssuedAt,
+        rotated_heartbeat_nonce_max_age: HEARTBEAT_NONCE_MAX_AGE_SECONDS,
+        rotated_bind_proof: rotatedBindProofHex,
+        rotated_bind_proof_epoch: pageEpoch,
         page_epoch: pageEpoch,
         ttl_grace_factor: SESSION_TTL_GRACE_FACTOR,
+        nonce_replay_ttl: NONCE_REPLAY_TTL_SECONDS,
     };
+    if (nextChallenge) {
+        sigPayload.next_challenge_id = nextChallenge.challenge_id;
+        sigPayload.next_challenge_nonce = nextChallenge.challenge_nonce;
+        sigPayload.next_challenge_issued_at = nextChallenge.issued_at;
+        sigPayload.next_challenge_ttl = nextChallenge.ttl;
+        if (nextChallenge.signature) sigPayload.next_challenge_signature = nextChallenge.signature;
+    }
+    if (anomalyResult && anomalyResult.applied) {
+        sigPayload.anomaly_score = anomalyResult.applied.score;
+        sigPayload.anomaly_action = anomalyResult.applied.action;
+    }
+    try {
+        const { rows: killRows } = await pool.query(
+            'SELECT kill_at_epoch, reason FROM telemetry_kill_directives WHERE license_key = $1',
+            [license_key]
+        );
+        if (killRows.length > 0 && Number.isFinite(Number(killRows[0].kill_at_epoch))) {
+            sigPayload.kill_at_epoch = Number(killRows[0].kill_at_epoch);
+            if (killRows[0].reason) sigPayload.kill_reason = String(killRows[0].reason).slice(0, 64);
+        }
+    } catch (_) { }
     const rotationBlock = buildRotationBlock();
     Object.assign(sigPayload, rotationBlock);
-    const { signature, next_signature } = dualSignPayload(sigPayload);
+    const kidInfo = getActiveKidInfo();
+    sigPayload.kid = kidInfo.active_kid;
+    const { signature, next_signature, next_kid } = dualSignPayload(sigPayload);
 
     const responseBody = { ...sigPayload, signature };
     if (next_signature) responseBody.next_signature = next_signature;
+    if (next_kid) responseBody.next_kid = next_kid;
 
     return {
         status: 200,
         body: responseBody,
     };
+}
+
+
+async function handleTpmAttest(body, clientIp) {
+    const { license_key, hwid, session_token } = body || {};
+    if (!license_key) {
+        return { status: 400, body: { status: 'error', reason: 'missing_fields' } };
+    }
+    const lookup = await lookupLicense(license_key);
+    if (!lookup.valid) {
+        return { status: 200, body: { status: 'invalid', reason: lookup.reason } };
+    }
+    const tpmBundle = body.tpm_attest || body;
+    if (!tpmBundle || typeof tpmBundle !== 'object') {
+        return { status: 400, body: { status: 'error', reason: 'missing_tpm_bundle' } };
+    }
+    const enriched = Object.assign({}, tpmBundle, {
+        existingAnchorString: hwid || '',
+    });
+    const result = tpmQuote.verifyTpmQuote(enriched);
+    if (!result.ok) {
+        return { status: 200, body: { status: 'invalid', reason: 'tpm_quote_invalid', detail: result.reason } };
+    }
+    if (lookup.data.tpm_ek_fingerprint && lookup.data.tpm_ek_fingerprint !== result.ekCertFingerprint) {
+        return { status: 200, body: { status: 'invalid', reason: 'tpm_ek_mismatch' } };
+    }
+    const sessionTokenForSeal = (session_token && typeof session_token === 'string') ? session_token : '';
+    const sealed = sessionTokenForSeal ? buildTpmSealedPayload(lookup.data, result, sessionTokenForSeal) : null;
+    await persistTpmAttestation(license_key, result, sealed);
+
+    const responsePayload = {
+        status: 'valid',
+        license_key,
+        ek_vendor: result.ekVendor || '',
+        ek_fingerprint: result.ekCertFingerprint,
+        pcr_digest: result.pcrDigestHex,
+        hwid_component: result.hwidComponentHex,
+    };
+    if (sealed) responsePayload.tpm_sealed_key = sealed;
+    const kidInfo = getActiveKidInfo();
+    responsePayload.kid = kidInfo.active_kid;
+    const { signature, next_signature, next_kid } = dualSignPayload({
+        status: responsePayload.status,
+        license_key,
+        ek_fingerprint: responsePayload.ek_fingerprint,
+        pcr_digest: responsePayload.pcr_digest,
+        hwid_component: responsePayload.hwid_component,
+        kid: kidInfo.active_kid,
+    });
+    responsePayload.signature = signature;
+    if (next_signature) responsePayload.next_signature = next_signature;
+    if (next_kid) responsePayload.next_kid = next_kid;
+    return { status: 200, body: responsePayload };
 }
 
 
@@ -1300,10 +1901,7 @@ async function handleDriverProof(body, clientIp) {
     }
 
 
-    await pool.query(
-        'UPDATE sessions SET last_proof_token = $1 WHERE license_key = $2',
-        [driver_proof, license_key]
-    );
+    await updateLastProofToken(license_key, driver_proof);
 
     const newNonce = generateServerNonce();
     return {
@@ -1344,10 +1942,18 @@ router.post('/', async (req, res) => {
             case 'driver_proof':
                 result = await handleDriverProof(body, clientIp);
                 break;
+            case 'tpm_attest':
+                result = await withPgRetry(() => handleTpmAttest(body, clientIp));
+                break;
             default:
                 return res.status(400).json({ status: 'error', reason: 'unknown_action' });
         }
 
+        if (result && result.headers && typeof result.headers === 'object') {
+            for (const [hk, hv] of Object.entries(result.headers)) {
+                if (hk && hv !== undefined && hv !== null) res.setHeader(hk, String(hv));
+            }
+        }
         return res.status(result.status).json(result.body);
     } catch (err) {
         console.error(`[license] Error processing ${action}:`, err);
@@ -1458,6 +2064,26 @@ router._internal = {
     buildProofTokenMessage,
     parseProofTokenFirst8,
     fnv1a64Hex,
+    decryptSessionRow,
+    encryptSessionToken,
+    encryptProofToken,
+    updateLastProofToken,
+    rateLimit,
+    handleTpmAttest,
+    handleValidate,
+    handleHeartbeat,
+    isTpmRequiredForLicense,
+    combineHardwareIdWithTpm,
+    ingestHeartbeatAnomaly,
+    applyAnomalyDecision,
+    persistTpmAttestation,
+    buildTpmSealedPayload,
+    sendSlackAlert,
 };
 
 module.exports = router;
+module.exports.decryptSessionRow = decryptSessionRow;
+module.exports.encryptSessionToken = encryptSessionToken;
+module.exports.encryptProofToken = encryptProofToken;
+module.exports.updateLastProofToken = updateLastProofToken;
+module.exports.rateLimit = rateLimit;

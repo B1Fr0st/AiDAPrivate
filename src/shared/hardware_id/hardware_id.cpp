@@ -10,15 +10,19 @@
 #include <iphlpapi.h>
 #include <winioctl.h>
 #include <intrin.h>
+#include <tbs.h>
 
 #include <cstdio>
+#include <cstring>
 #include <vector>
 #include <sstream>
 #include <iomanip>
+#include <array>
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "tbs.lib")
 
 namespace aida::hardware_id
 {
@@ -250,6 +254,224 @@ namespace aida::hardware_id
         c.disk_vpd_hash         = sha256_hex(a.disk_vpd_serial);
         c.machine_guid_hash     = sha256_hex(a.machine_guid);
         c.anchor_count          = a.collected_anchor_count;
+        return c;
+    }
+
+    namespace
+    {
+        constexpr std::uint32_t TPM_ST_NO_SESSIONS                 = 0x8001;
+        constexpr std::uint32_t TPM_CC_PCR_Read                    = 0x0000017E;
+        constexpr std::uint32_t TPM_CC_NV_ReadPublic               = 0x00000169;
+        constexpr std::uint32_t TPM_CC_ReadPublic                  = 0x00000173;
+        constexpr std::uint32_t TPM_RH_ENDORSEMENT                 = 0x4000000B;
+        constexpr std::uint32_t TPM_ALG_SHA256                     = 0x000B;
+        constexpr std::uint32_t EK_NV_INDEX_RSA_2048               = 0x01C00002;
+
+        static void be_put_u16(std::vector<unsigned char>& out, std::uint16_t v)
+        {
+            out.push_back(static_cast<unsigned char>((v >> 8) & 0xFF));
+            out.push_back(static_cast<unsigned char>(v & 0xFF));
+        }
+        static void be_put_u32(std::vector<unsigned char>& out, std::uint32_t v)
+        {
+            out.push_back(static_cast<unsigned char>((v >> 24) & 0xFF));
+            out.push_back(static_cast<unsigned char>((v >> 16) & 0xFF));
+            out.push_back(static_cast<unsigned char>((v >> 8) & 0xFF));
+            out.push_back(static_cast<unsigned char>(v & 0xFF));
+        }
+
+        static std::uint16_t be_get_u16(const unsigned char* p)
+        {
+            return (static_cast<std::uint16_t>(p[0]) << 8) | static_cast<std::uint16_t>(p[1]);
+        }
+        static std::uint32_t be_get_u32(const unsigned char* p)
+        {
+            return (static_cast<std::uint32_t>(p[0]) << 24)
+                 | (static_cast<std::uint32_t>(p[1]) << 16)
+                 | (static_cast<std::uint32_t>(p[2]) << 8)
+                 |  static_cast<std::uint32_t>(p[3]);
+        }
+
+        static std::vector<unsigned char> build_pcr_read_command(const std::vector<int>& indices)
+        {
+            std::vector<unsigned char> cmd;
+            be_put_u16(cmd, static_cast<std::uint16_t>(TPM_ST_NO_SESSIONS));
+            be_put_u32(cmd, 0);
+            be_put_u32(cmd, TPM_CC_PCR_Read);
+            be_put_u32(cmd, 1);
+            be_put_u16(cmd, static_cast<std::uint16_t>(TPM_ALG_SHA256));
+            cmd.push_back(3);
+            unsigned char bitmap[3] = { 0, 0, 0 };
+            for (int idx : indices) {
+                if (idx < 0 || idx >= 24) continue;
+                bitmap[idx >> 3] |= static_cast<unsigned char>(1 << (idx & 7));
+            }
+            cmd.push_back(bitmap[0]);
+            cmd.push_back(bitmap[1]);
+            cmd.push_back(bitmap[2]);
+            std::uint32_t total = static_cast<std::uint32_t>(cmd.size());
+            cmd[2] = static_cast<unsigned char>((total >> 24) & 0xFF);
+            cmd[3] = static_cast<unsigned char>((total >> 16) & 0xFF);
+            cmd[4] = static_cast<unsigned char>((total >> 8) & 0xFF);
+            cmd[5] = static_cast<unsigned char>(total & 0xFF);
+            return cmd;
+        }
+
+        static bool parse_pcr_read_response(const unsigned char* resp, std::uint32_t resp_len, std::vector<std::array<unsigned char, 32>>& out)
+        {
+            if (resp_len < 10) return false;
+            std::uint32_t rc = be_get_u32(resp + 6);
+            if (rc != 0) return false;
+            std::uint32_t cursor = 10;
+            if (cursor + 4 > resp_len) return false;
+            cursor += 4;
+            if (cursor + 4 > resp_len) return false;
+            std::uint32_t pcr_select_count = be_get_u32(resp + cursor);
+            cursor += 4;
+            for (std::uint32_t i = 0; i < pcr_select_count; ++i) {
+                if (cursor + 3 > resp_len) return false;
+                cursor += 2;
+                std::uint8_t size_of_select = resp[cursor];
+                cursor += 1;
+                if (cursor + size_of_select > resp_len) return false;
+                cursor += size_of_select;
+            }
+            if (cursor + 4 > resp_len) return false;
+            std::uint32_t pcr_count = be_get_u32(resp + cursor);
+            cursor += 4;
+            out.clear();
+            out.reserve(pcr_count);
+            for (std::uint32_t i = 0; i < pcr_count; ++i) {
+                if (cursor + 2 > resp_len) return false;
+                std::uint16_t pcr_size = be_get_u16(resp + cursor);
+                cursor += 2;
+                if (pcr_size != 32) return false;
+                if (cursor + pcr_size > resp_len) return false;
+                std::array<unsigned char, 32> pcr;
+                std::memcpy(pcr.data(), resp + cursor, 32);
+                out.push_back(pcr);
+                cursor += pcr_size;
+            }
+            return true;
+        }
+
+        static std::vector<unsigned char> build_nv_readpublic_command(std::uint32_t nv_index)
+        {
+            std::vector<unsigned char> cmd;
+            be_put_u16(cmd, static_cast<std::uint16_t>(TPM_ST_NO_SESSIONS));
+            be_put_u32(cmd, 0);
+            be_put_u32(cmd, TPM_CC_NV_ReadPublic);
+            be_put_u32(cmd, nv_index);
+            std::uint32_t total = static_cast<std::uint32_t>(cmd.size());
+            cmd[2] = static_cast<unsigned char>((total >> 24) & 0xFF);
+            cmd[3] = static_cast<unsigned char>((total >> 16) & 0xFF);
+            cmd[4] = static_cast<unsigned char>((total >> 8) & 0xFF);
+            cmd[5] = static_cast<unsigned char>(total & 0xFF);
+            return cmd;
+        }
+
+        static bool tbs_submit(const std::vector<unsigned char>& cmd, std::vector<unsigned char>& reply)
+        {
+            TBS_CONTEXT_PARAMS2 params{};
+            params.version = TBS_CONTEXT_VERSION_TWO;
+            params.includeTpm20 = 1;
+            TBS_HCONTEXT ctx = nullptr;
+            TBS_RESULT rc = Tbsi_Context_Create(reinterpret_cast<TBS_CONTEXT_PARAMS*>(&params), &ctx);
+            if (rc != TBS_SUCCESS || ctx == nullptr) return false;
+            reply.assign(4096, 0);
+            UINT32 reply_len = static_cast<UINT32>(reply.size());
+            rc = Tbsip_Submit_Command(
+                ctx,
+                TBS_COMMAND_LOCALITY_ZERO,
+                TBS_COMMAND_PRIORITY_NORMAL,
+                cmd.data(),
+                static_cast<UINT32>(cmd.size()),
+                reply.data(),
+                &reply_len);
+            Tbsip_Context_Close(ctx);
+            if (rc != TBS_SUCCESS) return false;
+            reply.resize(reply_len);
+            return true;
+        }
+
+        static bool read_pcr_values_sha256(std::vector<std::array<unsigned char, 32>>& pcr_out)
+        {
+            std::vector<int> indices = { 0, 1, 2, 3, 4, 5, 6, 7 };
+            auto cmd = build_pcr_read_command(indices);
+            std::vector<unsigned char> reply;
+            if (!tbs_submit(cmd, reply)) return false;
+            return parse_pcr_read_response(reply.data(), static_cast<std::uint32_t>(reply.size()), pcr_out);
+        }
+
+        static bool read_ek_public_blob(std::vector<unsigned char>& der_out)
+        {
+            auto cmd = build_nv_readpublic_command(EK_NV_INDEX_RSA_2048);
+            std::vector<unsigned char> reply;
+            if (!tbs_submit(cmd, reply)) return false;
+            if (reply.size() < 14) return false;
+            std::uint32_t rc = be_get_u32(reply.data() + 6);
+            if (rc != 0) return false;
+            der_out.assign(reply.begin() + 10, reply.end());
+            return !der_out.empty();
+        }
+
+        static std::string sha256_bytes_hex(const unsigned char* data, size_t len)
+        {
+            HCRYPTPROV prov = 0;
+            HCRYPTHASH hash = 0;
+            unsigned char digest[32] = {};
+            DWORD dlen = sizeof(digest);
+            if (!CryptAcquireContextW(&prov, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) return {};
+            std::string out;
+            if (CryptCreateHash(prov, CALG_SHA_256, 0, 0, &hash)) {
+                if (CryptHashData(hash, data, static_cast<DWORD>(len), 0)) {
+                    if (CryptGetHashParam(hash, HP_HASHVAL, digest, &dlen, 0)) {
+                        out = to_hex(digest, dlen);
+                    }
+                }
+                CryptDestroyHash(hash);
+            }
+            CryptReleaseContext(prov, 0);
+            return out;
+        }
+    }
+
+    bool collect_tpm_attestation(tpm_attest_t& out) noexcept
+    {
+        out = tpm_attest_t{};
+        std::vector<std::array<unsigned char, 32>> pcrs;
+        if (!read_pcr_values_sha256(pcrs)) return false;
+        if (pcrs.size() < 8) return false;
+        std::vector<unsigned char> ek_blob;
+        if (!read_ek_public_blob(ek_blob)) return false;
+        if (ek_blob.size() < 32) return false;
+        out.present = true;
+        out.pcr_values = pcrs;
+        out.ek_pub_der = ek_blob;
+        out.ek_pub_sha256 = sha256_bytes_hex(ek_blob.data(), ek_blob.size());
+        std::vector<unsigned char> pcr_concat;
+        pcr_concat.reserve(8 * 32);
+        for (size_t i = 0; i < 8; ++i) {
+            pcr_concat.insert(pcr_concat.end(), pcrs[i].begin(), pcrs[i].end());
+        }
+        out.pcr_composite_sha256 = sha256_bytes_hex(pcr_concat.data(), pcr_concat.size());
+        std::vector<unsigned char> hwid_input;
+        hwid_input.reserve(ek_blob.size() + pcr_concat.size());
+        hwid_input.insert(hwid_input.end(), ek_blob.begin(), ek_blob.end());
+        hwid_input.insert(hwid_input.end(), pcr_concat.begin(), pcr_concat.end());
+        out.hwid_component_sha256 = sha256_bytes_hex(hwid_input.data(), hwid_input.size());
+        return true;
+    }
+
+    composite_t hash_anchors_with_tpm(const anchor_set_t& a, const tpm_attest_t& tpm) noexcept
+    {
+        composite_t c = hash_anchors(a);
+        if (!tpm.present) return c;
+        std::ostringstream os;
+        os << c.hardware_id_sha256
+           << "|tpm-ek|" << tpm.ek_pub_sha256
+           << "|tpm-pcr|" << tpm.pcr_composite_sha256;
+        c.hardware_id_sha256 = sha256_hex(os.str());
         return c;
     }
 }

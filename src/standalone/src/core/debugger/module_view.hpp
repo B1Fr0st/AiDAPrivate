@@ -37,7 +37,6 @@ struct ui_state_t {
 	bool                                      detail_scrollbar_dragging = false;
 	float                                     detail_scrollbar_drag_offset = 0.f;
 	float                                     sub_tab_anim[2] = {1.f, 0.f};
-	uint64_t                                  navigate_to = 0;
 };
 
 inline ui_state_t g_ui;
@@ -316,8 +315,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			float ry = det_list_y + idx * row_h - g_ui.detail_scroll_y;
 			if (ry + row_h < det_list_y || ry > det_list_y + det_list_h) continue;
 
-			bool clicked = ui_anim::row_hover_select(dl, right_x, ry, right_w - 12.f, row_h,
-													  idx, g_ui.selected_detail, alpha, ar, ag, ab);
+			ui_anim::row_hover_select(dl, right_x, ry, right_w - 12.f, row_h,
+									  idx, g_ui.selected_detail, alpha, ar, ag, ab);
 
 			char ord_buf[8];
 			snprintf(ord_buf, sizeof(ord_buf), "%u", exp.ordinal);
@@ -334,9 +333,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			snprintf(addr_buf, sizeof(addr_buf), "%016llX", static_cast<unsigned long long>(exp.address));
 			dl->AddText(ImVec2(ec_addr, ry + 2.f),
 						_ta(_t.text_secondary), addr_buf);
-
-			if (clicked && ui_anim::row_double_click(idx, g_ui.selected_detail))
-				g_ui.navigate_to = exp.address;
 		}
 
 		dl->PopClipRect();
@@ -389,8 +385,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			float ry = det_list_y + idx * row_h - g_ui.detail_scroll_y;
 			if (ry + row_h < det_list_y || ry > det_list_y + det_list_h) continue;
 
-			bool clicked = ui_anim::row_hover_select(dl, right_x, ry, right_w - 12.f, row_h,
-													  idx, g_ui.selected_detail, alpha, ar, ag, ab);
+			ui_anim::row_hover_select(dl, right_x, ry, right_w - 12.f, row_h,
+									  idx, g_ui.selected_detail, alpha, ar, ag, ab);
 
 			dl->AddText(ImVec2(ic_mod, ry + 2.f),
 						_ta(_t.text_secondary), imp.module_name.c_str());
@@ -401,9 +397,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			snprintf(addr_buf, sizeof(addr_buf), "%016llX", static_cast<unsigned long long>(imp.bound_address));
 			dl->AddText(ImVec2(ic_addr, ry + 2.f),
 						_ta(_t.text_secondary), addr_buf);
-
-			if (clicked && ui_anim::row_double_click(idx, g_ui.selected_detail))
-				g_ui.navigate_to = imp.bound_address;
 		}
 
 		dl->PopClipRect();

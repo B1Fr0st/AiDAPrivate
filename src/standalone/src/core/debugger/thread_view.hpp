@@ -344,17 +344,36 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (ImGui::BeginPopup("##thread_ctx")) {
 		if (g_ui.context_idx >= 0 && g_ui.context_idx < static_cast<int>(snapshot.size())) {
 			if (ImGui::MenuItem("Suspend")) {
-				std::lock_guard<std::mutex> lk(g_ui.threads_mutex);
-				if (g_ui.context_idx < static_cast<int>(g_ui.threads.size()))
-					g_ui.threads[g_ui.context_idx].suspended = true;
+				uint32_t target_tid = snapshot[g_ui.context_idx].tid;
+				int target_idx = g_ui.context_idx;
+				work_queue::post([target_tid, target_idx]() {
+					if (driver_bridge::suspend_thread(target_tid, nullptr)) {
+						std::lock_guard<std::mutex> lk(g_ui.threads_mutex);
+						if (target_idx < static_cast<int>(g_ui.threads.size()) &&
+							g_ui.threads[target_idx].tid == target_tid) {
+							g_ui.threads[target_idx].suspended = true;
+							g_ui.threads[target_idx].state_text = "Suspended";
+						}
+					}
+				});
 			}
 			if (ImGui::MenuItem("Resume")) {
-				std::lock_guard<std::mutex> lk(g_ui.threads_mutex);
-				if (g_ui.context_idx < static_cast<int>(g_ui.threads.size()))
-					g_ui.threads[g_ui.context_idx].suspended = false;
+				uint32_t target_tid = snapshot[g_ui.context_idx].tid;
+				int target_idx = g_ui.context_idx;
+				work_queue::post([target_tid, target_idx]() {
+					if (driver_bridge::resume_thread(target_tid, nullptr)) {
+						std::lock_guard<std::mutex> lk(g_ui.threads_mutex);
+						if (target_idx < static_cast<int>(g_ui.threads.size()) &&
+							g_ui.threads[target_idx].tid == target_tid) {
+							g_ui.threads[target_idx].suspended = false;
+							g_ui.threads[target_idx].state_text = "Running";
+						}
+					}
+				});
 			}
 			if (ImGui::MenuItem("Switch To")) {
 				debugger_engine::g_state.active_tid = snapshot[g_ui.context_idx].tid;
+				debugger_engine::invalidate_cache();
 			}
 			if (ImGui::MenuItem("Go to RIP in Disasm")) {
 				globals::ui::active_center_view = center_view_t::disassembly;

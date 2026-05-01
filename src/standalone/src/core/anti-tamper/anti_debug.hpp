@@ -4,6 +4,8 @@
 #include <winternl.h>
 #include <intrin.h>
 
+#include <atomic>
+#include <array>
 #include <cstdint>
 #include <string>
 
@@ -36,6 +38,11 @@ struct debug_report_t
     bool qpc_timing = false;
     bool thread_hidden = false;
     bool instrumentation_callback = false;
+    bool branch_miss_flat = false;
+    bool page_fault_timing_anomaly = false;
+    bool ipi_latency_anomaly = false;
+    bool cache_coherency_anomaly = false;
+    bool function_call_timing_anomaly = false;
     std::string summary;
 
     bool any_detected() const
@@ -47,6 +54,123 @@ struct debug_report_t
             || kernel_debugger || kd_shared_data || thread_hidden
             || instrumentation_callback;
     }
+
+    bool any_timing_anomaly() const
+    {
+        return branch_miss_flat || page_fault_timing_anomaly
+            || ipi_latency_anomaly || cache_coherency_anomaly
+            || function_call_timing_anomaly;
+    }
+};
+
+struct timing_sample_t
+{
+    uint32_t kind;
+    uint32_t flags;
+    uint64_t value_a;
+    uint64_t value_b;
+    uint64_t timestamp;
+};
+
+constexpr uint32_t TIMING_KIND_FN_ENTRY_EXIT = 1u;
+constexpr uint32_t TIMING_KIND_BRANCH_MISS   = 2u;
+constexpr uint32_t TIMING_KIND_PAGE_FAULT    = 3u;
+constexpr uint32_t TIMING_KIND_IPI_LATENCY   = 4u;
+constexpr uint32_t TIMING_KIND_CACHE_COHERENCY = 5u;
+
+constexpr uint32_t TIMING_FLAG_ANOMALY = 0x1u;
+constexpr uint32_t TIMING_FLAG_FLAT    = 0x2u;
+constexpr uint32_t TIMING_FLAG_ABSURD  = 0x4u;
+
+inline constexpr size_t TIMING_RING_CAPACITY = 256;
+
+struct timing_ring_t
+{
+    std::array<timing_sample_t, TIMING_RING_CAPACITY> slots{};
+    std::atomic<uint64_t> head{0};
+    std::atomic<uint64_t> dropped{0};
+};
+
+inline timing_ring_t& timing_ring()
+{
+    static timing_ring_t inst;
+    return inst;
+}
+
+inline void timing_ring_push(uint32_t kind, uint32_t flags, uint64_t a, uint64_t b)
+{
+    auto& ring = timing_ring();
+    const uint64_t slot_index = ring.head.fetch_add(1, std::memory_order_acq_rel);
+    timing_sample_t& slot = ring.slots[static_cast<size_t>(slot_index % TIMING_RING_CAPACITY)];
+    slot.kind = kind;
+    slot.flags = flags;
+    slot.value_a = a;
+    slot.value_b = b;
+    slot.timestamp = __rdtsc();
+}
+
+inline uint64_t timing_ring_total_pushed()
+{
+    return timing_ring().head.load(std::memory_order_acquire);
+}
+
+inline size_t timing_ring_snapshot(timing_sample_t* out, size_t out_max)
+{
+    if (out == nullptr || out_max == 0)
+        return 0;
+    auto& ring = timing_ring();
+    const uint64_t total = ring.head.load(std::memory_order_acquire);
+    const uint64_t available = (total > TIMING_RING_CAPACITY) ? TIMING_RING_CAPACITY : total;
+    const size_t to_copy = (available > out_max) ? out_max : static_cast<size_t>(available);
+    if (to_copy == 0)
+        return 0;
+    const uint64_t newest_idx = (total - 1ull) % TIMING_RING_CAPACITY;
+    for (size_t i = 0; i < to_copy; ++i) {
+        const size_t idx = static_cast<size_t>((newest_idx + TIMING_RING_CAPACITY - i) % TIMING_RING_CAPACITY);
+        out[i] = ring.slots[idx];
+    }
+    return to_copy;
+}
+
+class function_entry_exit_rdtsc_t
+{
+public:
+    explicit function_entry_exit_rdtsc_t(uint32_t site_id) noexcept
+        : site_id_(site_id)
+    {
+        unsigned int aux = 0;
+        _mm_lfence();
+        start_ = __rdtscp(&aux);
+        cpu_in_ = aux & 0xFFFu;
+    }
+
+    ~function_entry_exit_rdtsc_t()
+    {
+        unsigned int aux = 0;
+        const uint64_t end = __rdtscp(&aux);
+        _mm_lfence();
+        const uint32_t cpu_out = aux & 0xFFFu;
+        const uint64_t delta = end - start_;
+        uint32_t flags = 0;
+        if (delta == 0)
+            flags |= TIMING_FLAG_FLAT;
+        if (delta > 50000000ULL)
+            flags |= TIMING_FLAG_ABSURD;
+        if (cpu_out != cpu_in_)
+            flags |= TIMING_FLAG_ANOMALY;
+        timing_ring_push(TIMING_KIND_FN_ENTRY_EXIT,
+                         flags | (static_cast<uint32_t>(site_id_) << 8),
+                         delta,
+                         (static_cast<uint64_t>(cpu_in_) << 32) | cpu_out);
+    }
+
+    function_entry_exit_rdtsc_t(const function_entry_exit_rdtsc_t&) = delete;
+    function_entry_exit_rdtsc_t& operator=(const function_entry_exit_rdtsc_t&) = delete;
+
+private:
+    uint32_t site_id_;
+    uint32_t cpu_in_ = 0;
+    uint64_t start_ = 0;
 };
 
 inline bool check_being_debugged()
@@ -278,6 +402,372 @@ inline bool check_thread_hidden()
     return st >= 0 && hidden != 0;
 }
 
+inline bool check_branch_miss_flat()
+{
+    HANDLE this_thread = GetCurrentThread();
+    DWORD_PTR prev_mask = SetThreadAffinityMask(this_thread, 1ull);
+    if (prev_mask == 0)
+        return false;
+
+    int regs[4] = {};
+    __cpuid(regs, 0xA);
+    const unsigned arch_perf_version = static_cast<unsigned>(regs[0] & 0xFF);
+    const unsigned num_counters = static_cast<unsigned>((regs[0] >> 8) & 0xFF);
+    if (arch_perf_version == 0 || num_counters == 0) {
+        SetThreadAffinityMask(this_thread, prev_mask);
+        return false;
+    }
+
+    constexpr unsigned BRANCH_MISS_FIXED_INDEX = 0x40000001u;
+    uint64_t snap_a = 0;
+    uint64_t snap_b = 0;
+    bool measured = false;
+
+    __try {
+        _mm_lfence();
+        snap_a = __readpmc(BRANCH_MISS_FIXED_INDEX);
+        _mm_lfence();
+        measured = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        measured = false;
+    }
+
+    if (!measured) {
+        SetThreadAffinityMask(this_thread, prev_mask);
+        return false;
+    }
+
+    LARGE_INTEGER freq{};
+    LARGE_INTEGER t0{};
+    LARGE_INTEGER t1{};
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+
+    volatile uint64_t pseudo = 0xA5A5A5A5A5A5A5A5ULL;
+    volatile uint64_t accumulator = 0;
+    while (true) {
+        QueryPerformanceCounter(&t1);
+        const double elapsed_ms = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0
+                                  / static_cast<double>(freq.QuadPart);
+        if (elapsed_ms >= 10.0)
+            break;
+
+        for (int i = 0; i < 4096; ++i) {
+            pseudo ^= pseudo << 13;
+            pseudo ^= pseudo >> 7;
+            pseudo ^= pseudo << 17;
+            if ((pseudo & 0x1ULL) != 0)
+                accumulator += static_cast<uint64_t>(i) * 31u;
+            else
+                accumulator -= static_cast<uint64_t>(i) * 17u;
+        }
+    }
+
+    bool flat = false;
+    __try {
+        _mm_lfence();
+        snap_b = __readpmc(BRANCH_MISS_FIXED_INDEX);
+        _mm_lfence();
+        const uint64_t delta = snap_b - snap_a;
+        const uint32_t kind_flags = (delta == 0) ? (TIMING_FLAG_FLAT | TIMING_FLAG_ANOMALY) : 0u;
+        timing_ring_push(TIMING_KIND_BRANCH_MISS, kind_flags, delta, accumulator);
+        flat = (delta == 0);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        flat = false;
+    }
+
+    SetThreadAffinityMask(this_thread, prev_mask);
+    return flat;
+}
+
+inline bool check_page_fault_timing_anomaly()
+{
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    const SIZE_T page_size = si.dwPageSize ? si.dwPageSize : 4096u;
+
+    LPVOID region = VirtualAlloc(nullptr, page_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (region == nullptr)
+        return false;
+
+    *static_cast<volatile uint8_t*>(region) = 0xCD;
+
+    DWORD old_protect = 0;
+    if (!VirtualProtect(region, page_size, PAGE_NOACCESS, &old_protect)) {
+        VirtualFree(region, 0, MEM_RELEASE);
+        return false;
+    }
+
+    constexpr int ROUNDS = 8;
+    uint64_t deltas[ROUNDS] = {};
+    int captured = 0;
+
+    for (int i = 0; i < ROUNDS; ++i) {
+        DWORD restored = 0;
+        VirtualProtect(region, page_size, PAGE_READWRITE, &restored);
+        FlushInstructionCache(GetCurrentProcess(), region, page_size);
+        VirtualProtect(region, page_size, PAGE_NOACCESS, &restored);
+
+        unsigned int aux = 0;
+        _mm_lfence();
+        const uint64_t t0 = __rdtscp(&aux);
+        DWORD restored2 = 0;
+        const BOOL ok = VirtualProtect(region, page_size, PAGE_READWRITE, &restored2);
+        _mm_lfence();
+        const uint64_t t1 = __rdtscp(&aux);
+        if (!ok)
+            continue;
+
+        deltas[captured++] = t1 - t0;
+    }
+
+    VirtualFree(region, 0, MEM_RELEASE);
+    if (captured < 4)
+        return false;
+
+    for (int i = 0; i < captured - 1; ++i) {
+        for (int j = i + 1; j < captured; ++j) {
+            if (deltas[j] < deltas[i]) {
+                const uint64_t tmp = deltas[i];
+                deltas[i] = deltas[j];
+                deltas[j] = tmp;
+            }
+        }
+    }
+    const uint64_t median = deltas[captured / 2];
+
+    const bool too_flat = median < 80ULL;
+    const bool too_high = median > 80000ULL;
+    const uint32_t flags = (too_flat ? TIMING_FLAG_FLAT : 0u)
+                         | (too_high ? TIMING_FLAG_ABSURD : 0u)
+                         | ((too_flat || too_high) ? TIMING_FLAG_ANOMALY : 0u);
+    timing_ring_push(TIMING_KIND_PAGE_FAULT, flags, median, static_cast<uint64_t>(captured));
+    return too_flat || too_high;
+}
+
+inline VOID CALLBACK ipi_apc_proc(ULONG_PTR param)
+{
+    auto* counter = reinterpret_cast<std::atomic<uint64_t>*>(param);
+    if (counter)
+        counter->fetch_add(1, std::memory_order_acq_rel);
+}
+
+inline DWORD WINAPI ipi_alertable_thread(LPVOID arg)
+{
+    auto* signal = reinterpret_cast<std::atomic<uint64_t>*>(arg);
+    SleepEx(120, TRUE);
+    if (signal)
+        signal->fetch_or(0x80000000ULL, std::memory_order_release);
+    return 0;
+}
+
+inline bool check_ipi_latency_anomaly()
+{
+    DWORD_PTR proc_mask = 0;
+    DWORD_PTR sys_mask = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc_mask, &sys_mask))
+        return false;
+
+    int active_cores = 0;
+    int candidate_a = -1;
+    int candidate_b = -1;
+    for (int bit = 0; bit < 64; ++bit) {
+        if (((proc_mask >> bit) & 1ull) != 0) {
+            ++active_cores;
+            if (candidate_a < 0) candidate_a = bit;
+            else if (candidate_b < 0) { candidate_b = bit; }
+        }
+    }
+    if (active_cores < 2 || candidate_a < 0 || candidate_b < 0)
+        return false;
+
+    HANDLE this_thread = GetCurrentThread();
+    const DWORD_PTR prev_mask = SetThreadAffinityMask(this_thread, 1ull << candidate_a);
+    if (prev_mask == 0)
+        return false;
+
+    std::atomic<uint64_t> remote_signal{0};
+    HANDLE remote_handle = CreateThread(nullptr, 0, &ipi_alertable_thread, &remote_signal, CREATE_SUSPENDED, nullptr);
+    if (remote_handle == nullptr) {
+        SetThreadAffinityMask(this_thread, prev_mask);
+        return false;
+    }
+    SetThreadAffinityMask(remote_handle, 1ull << candidate_b);
+    ResumeThread(remote_handle);
+
+    Sleep(2);
+
+    constexpr int ROUNDS = 6;
+    uint64_t deltas[ROUNDS] = {};
+    int captured = 0;
+    std::atomic<uint64_t> apc_counter{0};
+
+    for (int i = 0; i < ROUNDS; ++i) {
+        const uint64_t before = apc_counter.load(std::memory_order_acquire);
+        unsigned int aux = 0;
+        _mm_lfence();
+        const uint64_t t0 = __rdtscp(&aux);
+        const DWORD ok = QueueUserAPC(&ipi_apc_proc, remote_handle, reinterpret_cast<ULONG_PTR>(&apc_counter));
+        if (ok == 0) continue;
+        while (apc_counter.load(std::memory_order_acquire) == before) {
+            _mm_pause();
+            unsigned int aux_now = 0;
+            const uint64_t now = __rdtscp(&aux_now);
+            if ((now - t0) > 50000000ULL)
+                break;
+        }
+        const uint64_t t1 = __rdtscp(&aux);
+        _mm_lfence();
+        if (apc_counter.load(std::memory_order_acquire) > before)
+            deltas[captured++] = t1 - t0;
+    }
+
+    remote_signal.store(0xC0000001ULL, std::memory_order_release);
+    WaitForSingleObject(remote_handle, 200);
+    CloseHandle(remote_handle);
+    SetThreadAffinityMask(this_thread, prev_mask);
+
+    if (captured < 3)
+        return false;
+
+    for (int i = 0; i < captured - 1; ++i) {
+        for (int j = i + 1; j < captured; ++j) {
+            if (deltas[j] < deltas[i]) {
+                const uint64_t tmp = deltas[i];
+                deltas[i] = deltas[j];
+                deltas[j] = tmp;
+            }
+        }
+    }
+    const uint64_t median = deltas[captured / 2];
+
+    const bool too_flat = median < 1000ULL;
+    const bool too_high = median > 5000000ULL;
+    const uint32_t flags = (too_flat ? TIMING_FLAG_FLAT : 0u)
+                         | (too_high ? TIMING_FLAG_ABSURD : 0u)
+                         | ((too_flat || too_high) ? TIMING_FLAG_ANOMALY : 0u);
+    timing_ring_push(TIMING_KIND_IPI_LATENCY, flags, median, static_cast<uint64_t>(captured));
+    return too_flat || too_high;
+}
+
+inline bool check_cache_coherency_anomaly()
+{
+    constexpr size_t LINE_SIZE = 64;
+    constexpr size_t BUFFER_BYTES = LINE_SIZE * 16;
+    void* raw = _aligned_malloc(BUFFER_BYTES, LINE_SIZE);
+    if (raw == nullptr)
+        return false;
+
+    auto* probe = static_cast<volatile uint8_t*>(raw);
+    for (size_t i = 0; i < BUFFER_BYTES; ++i)
+        probe[i] = static_cast<uint8_t>(i ^ 0x5A);
+
+    constexpr int ROUNDS = 32;
+    uint64_t flushed[ROUNDS] = {};
+    uint64_t cached[ROUNDS] = {};
+
+    for (int i = 0; i < ROUNDS; ++i) {
+        for (size_t off = 0; off < BUFFER_BYTES; off += LINE_SIZE)
+            _mm_clflush(const_cast<const uint8_t*>(probe + off));
+        _mm_mfence();
+
+        unsigned int aux = 0;
+        _mm_lfence();
+        const uint64_t t0 = __rdtscp(&aux);
+        volatile uint64_t acc = 0;
+        for (size_t off = 0; off < BUFFER_BYTES; off += LINE_SIZE)
+            acc += probe[off];
+        _mm_lfence();
+        const uint64_t t1 = __rdtscp(&aux);
+        flushed[i] = t1 - t0;
+
+        _mm_lfence();
+        const uint64_t t2 = __rdtscp(&aux);
+        for (size_t off = 0; off < BUFFER_BYTES; off += LINE_SIZE)
+            acc += probe[off];
+        _mm_lfence();
+        const uint64_t t3 = __rdtscp(&aux);
+        cached[i] = t3 - t2;
+        (void)acc;
+    }
+
+    _aligned_free(raw);
+
+    for (int i = 0; i < ROUNDS - 1; ++i) {
+        for (int j = i + 1; j < ROUNDS; ++j) {
+            if (flushed[j] < flushed[i]) { const uint64_t t = flushed[i]; flushed[i] = flushed[j]; flushed[j] = t; }
+            if (cached[j] < cached[i])   { const uint64_t t = cached[i];  cached[i]  = cached[j];  cached[j]  = t; }
+        }
+    }
+    const uint64_t median_flushed = flushed[ROUNDS / 2];
+    const uint64_t median_cached  = cached[ROUNDS / 2];
+
+    bool anomaly = false;
+    uint32_t flags = 0;
+    if (median_flushed == 0 || median_cached == 0) {
+        flags |= TIMING_FLAG_FLAT | TIMING_FLAG_ANOMALY;
+        anomaly = true;
+    }
+    if (median_cached >= median_flushed) {
+        flags |= TIMING_FLAG_ANOMALY;
+        anomaly = true;
+    }
+    if (median_flushed > 5000000ULL) {
+        flags |= TIMING_FLAG_ABSURD | TIMING_FLAG_ANOMALY;
+        anomaly = true;
+    }
+    timing_ring_push(TIMING_KIND_CACHE_COHERENCY, flags, median_flushed, median_cached);
+    return anomaly;
+}
+
+inline bool check_function_call_timing_anomaly()
+{
+    constexpr int CALLS = 32;
+    uint64_t durations[CALLS] = {};
+
+    for (int i = 0; i < CALLS; ++i) {
+        const uint64_t pre = timing_ring_total_pushed();
+        {
+            function_entry_exit_rdtsc_t guard(0xA1DA0000u | static_cast<uint32_t>(i));
+            volatile uint64_t spin = 0;
+            for (int k = 0; k < 64; ++k)
+                spin += static_cast<uint64_t>(k) * 1315423911u;
+            (void)spin;
+        }
+        const uint64_t post = timing_ring_total_pushed();
+        if (post == pre) {
+            durations[i] = 0;
+            continue;
+        }
+        auto& ring = timing_ring();
+        const uint64_t idx = (post - 1ull) % TIMING_RING_CAPACITY;
+        durations[i] = ring.slots[static_cast<size_t>(idx)].value_a;
+    }
+
+    for (int i = 0; i < CALLS - 1; ++i) {
+        for (int j = i + 1; j < CALLS; ++j) {
+            if (durations[j] < durations[i]) {
+                const uint64_t tmp = durations[i];
+                durations[i] = durations[j];
+                durations[j] = tmp;
+            }
+        }
+    }
+    const uint64_t median = durations[CALLS / 2];
+    const uint64_t lo = durations[2];
+    const uint64_t hi = durations[CALLS - 3];
+
+    const bool too_flat = (median == 0) || (hi == lo && median < 50ULL);
+    const bool too_high = median > 1000000ULL;
+    const uint32_t flags = (too_flat ? TIMING_FLAG_FLAT : 0u)
+                         | (too_high ? TIMING_FLAG_ABSURD : 0u)
+                         | ((too_flat || too_high) ? TIMING_FLAG_ANOMALY : 0u);
+    timing_ring_push(TIMING_KIND_FN_ENTRY_EXIT, flags | 0x80000000u, median, hi - lo);
+    return too_flat || too_high;
+}
+
 inline bool check_instrumentation_callback()
 {
     if (!syscall::is_initialized()) return false;
@@ -371,6 +861,26 @@ inline debug_report_t full_scan(uint64_t mod_base = 0, uint64_t mod_end = 0)
     if (report.instrumentation_callback)
         webhook::send_debug_log("instrumentation_cb", "InstrumentationCallback!=NULL", true);
 
+    report.branch_miss_flat = check_branch_miss_flat();
+    if (report.branch_miss_flat)
+        webhook::send_debug_log("branch_miss_flat", "rdpmc_branch_delta=0", true);
+
+    report.page_fault_timing_anomaly = check_page_fault_timing_anomaly();
+    if (report.page_fault_timing_anomaly)
+        webhook::send_debug_log("pf_timing", "VirtualProtect_median_outside_native_band", true);
+
+    report.ipi_latency_anomaly = check_ipi_latency_anomaly();
+    if (report.ipi_latency_anomaly)
+        webhook::send_debug_log("ipi_latency", "QueueUserAPC_cross_core_anomaly", true);
+
+    report.cache_coherency_anomaly = check_cache_coherency_anomaly();
+    if (report.cache_coherency_anomaly)
+        webhook::send_debug_log("cache_coherency", "clflush_reload_profile_inverted", true);
+
+    report.function_call_timing_anomaly = check_function_call_timing_anomaly();
+    if (report.function_call_timing_anomaly)
+        webhook::send_debug_log("fn_call_timing", "rdtscp_entry_exit_distribution_flat", true);
+
     if (report.peb_being_debugged) report.summary += "peb ";
     if (report.peb_nt_global_flag) report.summary += "ntglobal ";
     if (report.peb_heap_flags) report.summary += "heap ";
@@ -389,6 +899,11 @@ inline debug_report_t full_scan(uint64_t mod_base = 0, uint64_t mod_end = 0)
     if (report.qpc_timing) report.summary += "qpc ";
     if (report.thread_hidden) report.summary += "thidden ";
     if (report.instrumentation_callback) report.summary += "instcb ";
+    if (report.branch_miss_flat) report.summary += "brmissflat ";
+    if (report.page_fault_timing_anomaly) report.summary += "pftime ";
+    if (report.ipi_latency_anomaly) report.summary += "ipi ";
+    if (report.cache_coherency_anomaly) report.summary += "coh ";
+    if (report.function_call_timing_anomaly) report.summary += "fncall ";
 
     return report;
 }

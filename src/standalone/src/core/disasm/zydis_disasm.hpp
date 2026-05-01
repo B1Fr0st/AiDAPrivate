@@ -74,9 +74,9 @@ struct DisasmState
     float    live_refresh_interval = 2.0f;
     bool     live_paused     = false;
     bool     live_needs_refresh = false;
-    bool     live_decoding   = false;
-    bool     live_decode_failed = false;
-    int      live_fail_count    = 0;
+    std::atomic<bool> live_decoding{false};
+    std::atomic<bool> live_decode_failed{false};
+    std::atomic<int>  live_fail_count{0};
     std::vector<AsmInstr> live_pending_instrs;
     uint64_t live_pending_va = 0;
     std::atomic<bool> live_pending_ready{false};
@@ -246,13 +246,13 @@ namespace disasm
         }
         CloseHandle(hf);
 
-        auto* dos = (IMAGE_DOS_HEADER*)raw.data();
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(raw.data());
         if (dos->e_magic != IMAGE_DOS_SIGNATURE) { out.err = "Not a PE file"; return false; }
-        if ((DWORD)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > fsz) {
+        if (static_cast<DWORD>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > fsz) {
             out.err = "Corrupt PE"; return false;
         }
 
-        auto* nt = (IMAGE_NT_HEADERS64*)(raw.data() + dos->e_lfanew);
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(raw.data() + dos->e_lfanew);
         if (nt->Signature != IMAGE_NT_SIGNATURE) { out.err = "Not a PE file"; return false; }
         if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
             out.err = "Not x64 PE"; return false;
@@ -261,7 +261,10 @@ namespace disasm
         out.image_base  = nt->OptionalHeader.ImageBase;
         out.entry_point = out.image_base + nt->OptionalHeader.AddressOfEntryPoint;
 
-        auto* sec = IMAGE_FIRST_SECTION(nt);
+        const auto* sec = reinterpret_cast<const IMAGE_SECTION_HEADER*>(
+            reinterpret_cast<const uint8_t*>(nt)
+            + offsetof(IMAGE_NT_HEADERS64, OptionalHeader)
+            + nt->FileHeader.SizeOfOptionalHeader);
         WORD nsec = nt->FileHeader.NumberOfSections;
 
         for (WORD i = 0; i < nsec; i++) {
@@ -272,7 +275,7 @@ namespace disasm
             DWORD sz  = sec[i].SizeOfRawData;
             if (sec[i].Misc.VirtualSize && sec[i].Misc.VirtualSize < sz)
                 sz = sec[i].Misc.VirtualSize;
-            if (sz == 0 || (uint64_t)off + sz > fsz) continue;
+            if (sz == 0 || static_cast<uint64_t>(off) + sz > fsz) continue;
             PESection ps;
             ps.va = out.image_base + sec[i].VirtualAddress;
             ps.bytes.assign(raw.data() + off, raw.data() + off + sz);
@@ -346,7 +349,8 @@ namespace disasm
 
     inline void request_live_decode(DisasmState& state)
     {
-        if (state.live_decoding) {
+        bool expected = false;
+        if (!state.live_decoding.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
             static int s_skip_log = 0;
             if (s_skip_log++ < 5)
                 driver_bridge::debug_log("request_live_decode: SKIPPED (already decoding)\n");
@@ -354,10 +358,12 @@ namespace disasm
         }
         if (!state.live_mode || state.live_base == 0 || state.live_size == 0) {
             driver_bridge::debug_log("request_live_decode: SKIPPED (mode=%d base=0x%llX size=0x%llX)\n",
-                state.live_mode ? 1 : 0, (unsigned long long)state.live_base, (unsigned long long)state.live_size);
+                state.live_mode ? 1 : 0,
+                static_cast<unsigned long long>(state.live_base),
+                static_cast<unsigned long long>(state.live_size));
+            state.live_decoding.store(false, std::memory_order_release);
             return;
         }
-
 
         uint64_t half = state.live_window / 2;
         uint64_t win_start = state.live_view_addr;
@@ -372,23 +378,22 @@ namespace disasm
         uint64_t read_sz = win_end - win_start;
         if (read_sz == 0) {
             driver_bridge::debug_log("request_live_decode: read_sz == 0, aborting\n");
+            state.live_decoding.store(false, std::memory_order_release);
             return;
         }
 
         driver_bridge::debug_log("request_live_decode: win_start=0x%llX read_sz=%llu pid=%u\n",
-            (unsigned long long)win_start, (unsigned long long)read_sz, state.live_pid);
+            static_cast<unsigned long long>(win_start),
+            static_cast<unsigned long long>(read_sz),
+            state.live_pid);
 
-        state.live_decoding = true;
         uint32_t pid = state.live_pid;
+        DisasmState* state_ptr = &state;
 
-
-        {
+        work_queue::post([state_ptr, pid, win_start, read_sz]() {
             std::vector<uint8_t> mem;
-
-            bool did_attempt = false;
             if (driver_bridge::is_loaded() &&
                 driver_bridge::attached_pid() == pid) {
-                did_attempt = true;
                 driver_bridge::read_memory(win_start, static_cast<size_t>(read_sz), mem);
             }
 
@@ -410,18 +415,18 @@ namespace disasm
             }
 
             if (instrs.empty()) {
-                state.live_decode_failed = true;
-                state.live_fail_count++;
+                state_ptr->live_decode_failed.store(true, std::memory_order_release);
+                state_ptr->live_fail_count.fetch_add(1, std::memory_order_acq_rel);
             } else {
-                state.live_decode_failed = false;
-                state.live_fail_count = 0;
+                state_ptr->live_decode_failed.store(false, std::memory_order_release);
+                state_ptr->live_fail_count.store(0, std::memory_order_release);
             }
 
-            state.live_pending_instrs = std::move(instrs);
-            state.live_pending_va = win_start;
-            state.live_pending_ready.store(true, std::memory_order_release);
-            state.live_decoding = false;
-        }
+            state_ptr->live_pending_instrs = std::move(instrs);
+            state_ptr->live_pending_va = win_start;
+            state_ptr->live_pending_ready.store(true, std::memory_order_release);
+            state_ptr->live_decoding.store(false, std::memory_order_release);
+        });
     }
 
 
@@ -430,7 +435,10 @@ namespace disasm
                            const std::string& module_name)
     {
         driver_bridge::debug_log("start_live: pid=%u base=0x%llX size=0x%llX module=%s\n",
-            pid, (unsigned long long)base, (unsigned long long)size, module_name.c_str());
+            pid,
+            static_cast<unsigned long long>(base),
+            static_cast<unsigned long long>(size),
+            module_name.c_str());
 
         state.live_mode   = true;
         state.live_pid    = pid;
@@ -439,9 +447,9 @@ namespace disasm
         state.live_view_addr = base;
         state.live_module = module_name;
         state.live_paused = false;
-        state.live_decoding = false;
-        state.live_decode_failed = false;
-        state.live_fail_count = 0;
+        state.live_decoding.store(false, std::memory_order_release);
+        state.live_decode_failed.store(false, std::memory_order_release);
+        state.live_fail_count.store(0, std::memory_order_release);
         state.live_pending_ready.store(false);
         state.live_refresh_timer = 0.f;
         state.live_needs_refresh = true;
@@ -468,9 +476,9 @@ namespace disasm
         state.live_view_addr = 0;
         state.live_module.clear();
         state.live_paused = false;
-        state.live_decoding = false;
-        state.live_decode_failed = false;
-        state.live_fail_count = 0;
+        state.live_decoding.store(false, std::memory_order_release);
+        state.live_decode_failed.store(false, std::memory_order_release);
+        state.live_fail_count.store(0, std::memory_order_release);
         state.live_pending_ready.store(false);
         state.live_pending_instrs.clear();
     }

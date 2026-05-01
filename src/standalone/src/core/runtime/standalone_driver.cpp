@@ -1323,6 +1323,32 @@ namespace driver_bridge
         return device->resume_thread(tid, prev_count);
     }
 
+    bool query_thread_information(uint32_t tid, uint32_t info_class, void* buffer, uint32_t buffer_size, uint32_t* return_length)
+    {
+        if (tid == 0 || buffer == nullptr || buffer_size == 0)
+            return false;
+
+        using NtQueryInformationThread_fn = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+        static auto pNtQueryInformationThread = reinterpret_cast<NtQueryInformationThread_fn>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+        if (pNtQueryInformationThread == nullptr)
+            return false;
+
+        unique_handle thread_handle(OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(tid)));
+        if (!thread_handle) {
+            thread_handle.reset(OpenThread(THREAD_QUERY_INFORMATION, FALSE, static_cast<DWORD>(tid)));
+            if (!thread_handle)
+                return false;
+        }
+
+        ULONG returned = 0;
+        LONG status = pNtQueryInformationThread(thread_handle.get(), static_cast<ULONG>(info_class),
+                                                buffer, static_cast<ULONG>(buffer_size), &returned);
+        if (return_length != nullptr)
+            *return_length = static_cast<uint32_t>(returned);
+        return status >= 0;
+    }
+
 
     bool read_peb(peb_info_t& out)
     {
@@ -2722,18 +2748,22 @@ namespace driver_bridge
             result.lidt_cpl3_gp        = raw.lidt_cpl3_gp;
             result.ve_trigger          = raw.ve_trigger;
             result.ve_lbr_stack        = raw.ve_lbr_stack;
-            result.ve_garbage_msr      = raw.ve_garbage_msr;
             result.ve_xsetbv_gp        = raw.ve_xsetbv_gp;
-            result.ve_synthetic_msr    = raw.ve_synthetic_msr;
-            result.ve_cpuid_leaf_cmp   = raw.ve_cpuid_leaf_cmp;
-            result.ve_rdtsc_cpuid      = raw.ve_rdtsc_cpuid;
-            result.ve_aperf_divergence = raw.ve_aperf_divergence;
-            result.ve_invd_cache       = raw.ve_invd_cache;
             result.ve_cr4_vmxe         = raw.ve_cr4_vmxe;
-            result.ve_lbr_tos          = raw.ve_lbr_tos;
-            result.total_failed        = raw.total_failed;
+            result.vmf_cpuid_vendor    = raw.vmf_cpuid_vendor;
+            result.vmf_hyperv_guest    = raw.vmf_hyperv_guest;
+            result.vmf_smbios_vm       = raw.vmf_smbios_vm;
+            result.vmf_acpi_vm         = raw.vmf_acpi_vm;
+            result.vmf_pci_vm          = raw.vmf_pci_vm;
+            result.vmf_disk_vm         = raw.vmf_disk_vm;
+            result.vmf_mac_vm          = raw.vmf_mac_vm;
+            result.vmf_registry_vm     = raw.vmf_registry_vm;
             result.total_run           = raw.total_run;
-            result.ms_hv_skipped       = raw.ms_hv_skipped;
+            result.total_failed        = raw.total_failed;
+            result.ms_hv_root          = raw.ms_hv_root;
+            result.is_virtual_machine  = raw.is_virtual_machine;
+            std::memcpy(result.vm_vendor_name, raw.vm_vendor_name, sizeof(result.vm_vendor_name));
+            std::memcpy(result.measurements_hmac, raw.measurements_hmac, sizeof(result.measurements_hmac));
         }
         return ok;
     }

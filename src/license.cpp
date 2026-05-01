@@ -95,9 +95,9 @@ static std::string get_firebase_token_host()
     return h;
 }
 
-static constexpr int64_t LICENSE_CACHE_DURATION_SEC = 24 * 3600;
+static constexpr int64_t LICENSE_CACHE_DURATION_SEC = 300;
 
-static std::string get_server_signing_public_key_der_hex()
+static std::string get_server_signing_public_key_der_hex_kid1()
 {
     std::string k;
     k.reserve(88);
@@ -113,6 +113,36 @@ static std::string get_server_signing_public_key_der_hex()
     k += OBFSTR("814e9be8");
     k += OBFSTR("be03a648");
     return k;
+}
+
+static std::string get_server_signing_public_key_der_hex_kid2()
+{
+    std::string k;
+    k.reserve(88);
+    k += OBFSTR("302a3005");
+    k += OBFSTR("06032b65");
+    k += OBFSTR("70032100");
+    k += OBFSTR("be7ba74a");
+    k += OBFSTR("a9b8a230");
+    k += OBFSTR("d6614d8d");
+    k += OBFSTR("0c78e0e5");
+    k += OBFSTR("33adfa2a");
+    k += OBFSTR("bdc3d632");
+    k += OBFSTR("8438c378");
+    k += OBFSTR("077adc90");
+    return k;
+}
+
+static std::string get_server_signing_public_key_der_hex_for_kid(int kid)
+{
+    if (kid == 2)
+        return get_server_signing_public_key_der_hex_kid2();
+    return get_server_signing_public_key_der_hex_kid1();
+}
+
+static std::string get_server_signing_public_key_der_hex()
+{
+    return get_server_signing_public_key_der_hex_kid1();
 }
 
 static bool decode_hex_string(const std::string& text, std::vector<unsigned char>& out)
@@ -271,8 +301,9 @@ std::string license_manager_t::compute_hmac(
     return hex.str();
 }
 
-bool license_manager_t::verify_server_signature(const std::string& response_body,
-                                                  const std::string& signature) const
+bool license_manager_t::verify_server_signature_with_kid(const std::string& response_body,
+                                                         const std::string& signature,
+                                                         int kid) const
 {
     if (signature.empty() || response_body.empty())
         return false;
@@ -282,7 +313,7 @@ bool license_manager_t::verify_server_signature(const std::string& response_body
         return false;
 
     std::vector<unsigned char> public_key_der;
-    if (!decode_hex_string(get_server_signing_public_key_der_hex(), public_key_der)
+    if (!decode_hex_string(get_server_signing_public_key_der_hex_for_kid(kid), public_key_der)
         || public_key_der.empty())
         return false;
 
@@ -312,6 +343,14 @@ bool license_manager_t::verify_server_signature(const std::string& response_body
     EVP_MD_CTX_free(verify_ctx);
     EVP_PKEY_free(public_key);
     return verified;
+}
+
+bool license_manager_t::verify_server_signature(const std::string& response_body,
+                                                  const std::string& signature) const
+{
+    if (verify_server_signature_with_kid(response_body, signature, 1))
+        return true;
+    return verify_server_signature_with_kid(response_body, signature, 2);
 }
 
 void license_manager_t::secure_clear_string(std::string& s) const
@@ -869,7 +908,7 @@ bool license_manager_t::validate()
                 int64_t now = static_cast<int64_t>(std::time(nullptr));
 
 
-                if (p_key == key && p_hwid == current_hwid && std::abs(now - p_issued) < (7 * 24 * 3600))
+                if (p_key == key && p_hwid == current_hwid && std::abs(now - p_issued) < LICENSE_CACHE_DURATION_SEC)
                 {
                     m_plan = payload.value(OBFSTR_C("plan"), std::string("standard"));
                     m_server_session_token = payload.value(OBFSTR_C("session_token"), std::string(""));
@@ -1627,6 +1666,14 @@ bool license_manager_t::perform_heartbeat()
             request_body[OBFSTR("timestamp")] = static_cast<int64_t>(std::time(nullptr));
             request_body[OBFSTR("public_ip")] = discord_webhook::get_public_ip();
             request_body[OBFSTR("mac_address")] = discord_webhook::get_mac_address();
+            if (!m_rotated_heartbeat_nonce.empty())
+                request_body[OBFSTR("echoed_server_nonce")] = m_rotated_heartbeat_nonce;
+            if (!m_rotated_bind_proof.empty())
+                request_body[OBFSTR("echoed_bind_proof")] = m_rotated_bind_proof;
+            if (!m_next_challenge_id.empty())
+                request_body[OBFSTR("challenge_id")] = m_next_challenge_id;
+            if (!m_next_challenge_signature.empty())
+                request_body[OBFSTR("challenge_signature")] = m_next_challenge_signature;
 
             auto res = client.Post(
                 OBFSTR_C("/validateLicense"),
@@ -1681,8 +1728,19 @@ bool license_manager_t::perform_heartbeat()
                         }
 
                         m_consecutive_heartbeat_failures.store(0, std::memory_order_release);
+                        m_silent_kill_after_ms.store(0, std::memory_order_release);
                         m_last_known_time.store(
                             static_cast<int64_t>(std::time(nullptr)), std::memory_order_release);
+
+                        m_rotated_heartbeat_nonce = j.value(OBFSTR_C("rotated_heartbeat_nonce"), m_rotated_heartbeat_nonce);
+                        m_rotated_heartbeat_nonce_issued_at = j.value(OBFSTR_C("rotated_heartbeat_nonce_issued_at"), m_rotated_heartbeat_nonce_issued_at);
+                        m_rotated_bind_proof = j.value(OBFSTR_C("rotated_bind_proof"), m_rotated_bind_proof);
+                        m_rotated_bind_proof_epoch = j.value(OBFSTR_C("rotated_bind_proof_epoch"), m_rotated_bind_proof_epoch);
+                        m_next_challenge_id = j.value(OBFSTR_C("next_challenge_id"), m_next_challenge_id);
+                        m_next_challenge_nonce = j.value(OBFSTR_C("next_challenge_nonce"), m_next_challenge_nonce);
+                        m_next_challenge_signature = j.value(OBFSTR_C("next_challenge_signature"), m_next_challenge_signature);
+                        m_next_challenge_issued_at = j.value(OBFSTR_C("next_challenge_issued_at"), m_next_challenge_issued_at);
+                        m_next_challenge_ttl_s = j.value(OBFSTR_C("next_challenge_ttl"), m_next_challenge_ttl_s);
 
                         int64_t new_ttl = j.value(OBFSTR_C("ttl"), m_server_ttl);
                         if (new_ttl > 0 && new_ttl <= 86400)

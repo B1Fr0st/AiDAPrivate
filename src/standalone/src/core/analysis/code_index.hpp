@@ -8,6 +8,8 @@
 #include <mutex>
 #include <atomic>
 #include <thread>
+#include <condition_variable>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -15,6 +17,7 @@
 #include <cmath>
 #include <regex>
 #include <functional>
+#include <system_error>
 
 
 namespace code_index {
@@ -74,6 +77,7 @@ struct document_t
     int         line_number = 0;
     std::string content;
     std::map<std::string, double> tf;
+    double dl = 0.0;
 };
 
 
@@ -103,9 +107,9 @@ public:
         std::map<std::string, int> freq;
         for (const auto& t : tokens) freq[t]++;
 
-        double dl = static_cast<double>(tokens.size());
+        doc.dl = static_cast<double>(tokens.size());
         for (const auto& [term, count] : freq) {
-            doc.tf[term] = static_cast<double>(count) / dl;
+            doc.tf[term] = static_cast<double>(count) / doc.dl;
         }
 
         _docs.push_back(std::move(doc));
@@ -119,18 +123,13 @@ public:
         std::map<std::string, int> df;
 
         for (const auto& doc : _docs) {
-            auto tokens = tokenize(doc.content);
-            total_dl += static_cast<double>(tokens.size());
-            std::map<std::string, bool> seen;
-            for (const auto& t : tokens) {
-                if (!seen[t]) {
-                    df[t]++;
-                    seen[t] = true;
-                }
+            total_dl += doc.dl;
+            for (const auto& [term, _] : doc.tf) {
+                df[term]++;
             }
         }
 
-        _avg_dl = total_dl / _docs.size();
+        _avg_dl = total_dl / static_cast<double>(_docs.size());
 
         double n = static_cast<double>(_docs.size());
         for (const auto& [term, count] : df) {
@@ -151,8 +150,8 @@ public:
                 continue;
 
             double score = 0.0;
-            auto doc_tokens = tokenize(_docs[i].content);
-            double dl = static_cast<double>(doc_tokens.size());
+            const double dl = _docs[i].dl;
+            const double avg_dl = (_avg_dl > 0.0) ? _avg_dl : 1.0;
 
             for (const auto& qt : query_tokens) {
                 auto idf_it = _idf.find(qt);
@@ -162,7 +161,8 @@ public:
                 double tf_val = (tf_it != _docs[i].tf.end()) ? tf_it->second * dl : 0.0;
 
                 double numerator = tf_val * (K1 + 1.0);
-                double denominator = tf_val + K1 * (1.0 - B + B * dl / _avg_dl);
+                double denominator = tf_val + K1 * (1.0 - B + B * dl / avg_dl);
+                if (denominator <= 0.0) continue;
                 score += idf_it->second * (numerator / denominator);
             }
 
@@ -288,17 +288,26 @@ public:
 
     void start_indexing()
     {
-        if (_state.load() == index_state_t::indexing) return;
+        if (_running.load()) return;
         _state = index_state_t::indexing;
         _stop = false;
+        _running = true;
 
-        work_queue::post([this]() { index_workspace(); });
+        work_queue::post([this]() {
+            index_workspace();
+            {
+                std::lock_guard<std::mutex> lk(_done_mtx);
+                _running = false;
+            }
+            _done_cv.notify_all();
+        });
     }
 
     void stop_indexing()
     {
         _stop = true;
-        if (_thread.joinable()) _thread.join();
+        std::unique_lock<std::mutex> lk(_done_mtx);
+        _done_cv.wait(lk, [this]() { return !_running.load(); });
     }
 
     std::vector<search_result_t> search(const std::string& query, const std::string& directory = "", int top_k = 10) const
@@ -316,7 +325,8 @@ public:
     ~manager_t()
     {
         _stop = true;
-        if (_thread.joinable()) _thread.join();
+        std::unique_lock<std::mutex> lk(_done_mtx);
+        _done_cv.wait(lk, [this]() { return !_running.load(); });
     }
 
 private:
@@ -325,62 +335,84 @@ private:
     bm25_index_t _index;
     std::atomic<index_state_t> _state{index_state_t::standby};
     std::atomic<bool> _stop{false};
-    std::thread _thread;
+    std::atomic<bool> _running{false};
+    std::mutex _done_mtx;
+    std::condition_variable _done_cv;
 
     void index_workspace()
     {
         bm25_index_t new_index;
 
-        try {
-            for (const auto& entry : std::filesystem::recursive_directory_iterator(_workspace)) {
-                if (_stop.load()) break;
-                if (!entry.is_regular_file()) continue;
+        std::error_code ec;
+        const auto opts = std::filesystem::directory_options::skip_permission_denied;
+        std::filesystem::recursive_directory_iterator iter(_workspace, opts, ec);
+        std::filesystem::recursive_directory_iterator end_iter;
 
+        if (ec) {
+            _state = index_state_t::error;
+            return;
+        }
+
+        while (iter != end_iter) {
+            if (_stop.load()) break;
+
+            const auto& entry = *iter;
+            std::error_code entry_ec;
+
+            if (entry.is_regular_file(entry_ec) && !entry_ec) {
                 auto ext = entry.path().extension().string();
-                if (!is_indexable_extension(ext)) continue;
+                if (is_indexable_extension(ext)) {
+                    std::error_code sz_ec;
+                    auto fsize = entry.file_size(sz_ec);
+                    if (!sz_ec && fsize <= 1024 * 1024) {
+                        std::ifstream ifs(entry.path(), std::ios::binary);
+                        if (ifs) {
+                            std::string content((std::istreambuf_iterator<char>(ifs)),
+                                                 std::istreambuf_iterator<char>());
 
-                auto fsize = entry.file_size();
-                if (fsize > 1024 * 1024) continue;
+                            std::error_code rel_ec;
+                            auto rel = std::filesystem::relative(entry.path(), _workspace, rel_ec).string();
+                            if (rel_ec) rel = entry.path().string();
+                            std::replace(rel.begin(), rel.end(), '\\', '/');
 
-                std::ifstream ifs(entry.path());
-                if (!ifs) continue;
+                            if (ext == ".cpp" || ext == ".c" || ext == ".h" || ext == ".hpp" ||
+                                ext == ".cc" || ext == ".cxx" || ext == ".hxx") {
+                                auto symbols = extract_symbols_cpp(rel, content);
+                                for (const auto& sym : symbols) {
+                                    new_index.add_document(sym.file_path, sym.line_number, sym.content_snippet);
+                                }
+                            }
 
-                std::string content((std::istreambuf_iterator<char>(ifs)),
-                                     std::istreambuf_iterator<char>());
-
-                auto rel = std::filesystem::relative(entry.path(), _workspace).string();
-                std::replace(rel.begin(), rel.end(), '\\', '/');
-
-                if (ext == ".cpp" || ext == ".c" || ext == ".h" || ext == ".hpp" ||
-                    ext == ".cc" || ext == ".cxx" || ext == ".hxx") {
-                    auto symbols = extract_symbols_cpp(rel, content);
-                    for (const auto& sym : symbols) {
-                        new_index.add_document(sym.file_path, sym.line_number, sym.content_snippet);
+                            auto lines = tokenize_lines(content);
+                            int chunk_size = 20;
+                            for (int i = 0; i < static_cast<int>(lines.size()); i += chunk_size / 2) {
+                                int end = (std::min)(i + chunk_size, static_cast<int>(lines.size()));
+                                std::string chunk;
+                                for (int j = i; j < end; ++j)
+                                    chunk += lines[j] + "\n";
+                                new_index.add_document(rel, i + 1, chunk);
+                            }
+                        }
                     }
                 }
-
-                auto lines = tokenize_lines(content);
-                int chunk_size = 20;
-                for (int i = 0; i < static_cast<int>(lines.size()); i += chunk_size / 2) {
-                    int end = (std::min)(i + chunk_size, static_cast<int>(lines.size()));
-                    std::string chunk;
-                    for (int j = i; j < end; ++j)
-                        chunk += lines[j] + "\n";
-                    new_index.add_document(rel, i + 1, chunk);
-                }
             }
 
-            new_index.build();
-
-            {
-                std::lock_guard<std::mutex> lk(_mtx);
-                _index = std::move(new_index);
+            std::error_code inc_ec;
+            iter.increment(inc_ec);
+            if (inc_ec) {
+                iter = end_iter;
+                break;
             }
-
-            _state = index_state_t::idle;
-        } catch (...) {
-            _state = index_state_t::error;
         }
+
+        new_index.build();
+
+        {
+            std::lock_guard<std::mutex> lk(_mtx);
+            _index = std::move(new_index);
+        }
+
+        _state = index_state_t::idle;
     }
 
     static std::vector<std::string> tokenize_lines(const std::string& text)

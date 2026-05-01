@@ -1,7 +1,10 @@
 #pragma once
 
+#include <windows.h>
+#include <shlobj.h>
 #include <atomic>
 #include "work_queue.hpp"
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>

@@ -336,13 +336,25 @@ namespace
 
         uint64_t kx = 0;
         if (!generate_random_u64(kx))
-            kx = 0xA1DA10ADCAFEBEEFull;
+        {
+            kx = static_cast<uint64_t>(__rdtsc());
+            kx ^= static_cast<uint64_t>(GetCurrentProcessId()) * 0x9E3779B97F4A7C15ULL;
+            kx = splitmix64_step(kx);
+        }
         uint64_t k0 = 0;
         if (!generate_random_u64(k0))
-            k0 = 0xDEADBEEFCAFEBABEull;
+        {
+            k0 = static_cast<uint64_t>(__rdtsc());
+            k0 ^= static_cast<uint64_t>(GetCurrentThreadId()) * 0xBF58476D1CE4E5B9ULL;
+            k0 = splitmix64_step(k0);
+        }
         uint64_t k1 = 0;
         if (!generate_random_u64(k1))
-            k1 = 0x1337C0DE5EEDF00Dull;
+        {
+            k1 = static_cast<uint64_t>(__rdtsc());
+            k1 ^= reinterpret_cast<uint64_t>(&kx) * 0x94D049BB133111EBULL;
+            k1 = splitmix64_step(k1);
+        }
 
         primed_cache_xor_key()  = kx;
         primed_cache_hash_k0()  = k0;
@@ -812,6 +824,145 @@ namespace
         return true;
     }
 
+    struct ldr_data_table_entry_layout_t
+    {
+        LIST_ENTRY in_load_order_links;
+        LIST_ENTRY in_memory_order_links;
+        LIST_ENTRY in_initialization_order_links;
+        void*      dll_base;
+        void*      entry_point;
+        ULONG      size_of_image;
+        UNICODE_STRING full_dll_name;
+        UNICODE_STRING base_dll_name;
+        ULONG      flags;
+        WORD       load_count;
+        WORD       tls_index;
+        union {
+            LIST_ENTRY hash_links;
+            struct {
+                void* section_pointer;
+                ULONG checksum;
+            };
+        };
+    };
+
+    void unlink_list_entry_safely(LIST_ENTRY* entry)
+    {
+        if (!entry || !entry->Flink || !entry->Blink) return;
+        __try {
+            LIST_ENTRY* prev = entry->Blink;
+            LIST_ENTRY* next = entry->Flink;
+            if (prev && next) {
+                prev->Flink = next;
+                next->Blink = prev;
+            }
+            entry->Flink = entry;
+            entry->Blink = entry;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+
+    uint32_t unlink_module_from_peb(void* image_base)
+    {
+        uint32_t total_unlinked = 0;
+        if (!image_base) return 0;
+
+        PEB* peb = reinterpret_cast<PEB*>(NtCurrentTeb()->ProcessEnvironmentBlock);
+        if (!peb) return 0;
+        PEB_LDR_DATA* ldr = peb->Ldr;
+        if (!ldr) return 0;
+
+        auto try_walk_and_unlink = [&](LIST_ENTRY* head, size_t links_offset_in_entry) -> uint32_t {
+            uint32_t unlinked = 0;
+            if (!head || !head->Flink) return 0;
+            const LIST_ENTRY* sentinel = head;
+            LIST_ENTRY* cur = head->Flink;
+            int safety = 0;
+            while (cur && cur != sentinel && safety < 4096) {
+                ++safety;
+                LIST_ENTRY* next = cur->Flink;
+                auto* entry = reinterpret_cast<ldr_data_table_entry_layout_t*>(
+                    reinterpret_cast<uint8_t*>(cur) - links_offset_in_entry);
+                __try {
+                    if (entry && entry->dll_base == image_base) {
+                        unlink_list_entry_safely(cur);
+                        ++unlinked;
+                    }
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER) {
+                }
+                cur = next;
+            }
+            return unlinked;
+        };
+
+        total_unlinked += try_walk_and_unlink(
+            &ldr->InMemoryOrderModuleList,
+            offsetof(ldr_data_table_entry_layout_t, in_memory_order_links));
+
+        auto* in_load_head = reinterpret_cast<LIST_ENTRY*>(
+            reinterpret_cast<uint8_t*>(&ldr->InMemoryOrderModuleList) - sizeof(LIST_ENTRY));
+        total_unlinked += try_walk_and_unlink(
+            in_load_head,
+            offsetof(ldr_data_table_entry_layout_t, in_load_order_links));
+
+        auto* in_init_head = reinterpret_cast<LIST_ENTRY*>(
+            reinterpret_cast<uint8_t*>(&ldr->InMemoryOrderModuleList) + sizeof(LIST_ENTRY));
+        total_unlinked += try_walk_and_unlink(
+            in_init_head,
+            offsetof(ldr_data_table_entry_layout_t, in_initialization_order_links));
+
+        if (in_load_head && in_load_head->Flink) {
+            const LIST_ENTRY* sentinel = in_load_head;
+            LIST_ENTRY* cur = in_load_head->Flink;
+            int safety = 0;
+            while (cur && cur != sentinel && safety < 4096) {
+                ++safety;
+                LIST_ENTRY* next = cur->Flink;
+                auto* entry = reinterpret_cast<ldr_data_table_entry_layout_t*>(
+                    reinterpret_cast<uint8_t*>(cur) -
+                    offsetof(ldr_data_table_entry_layout_t, in_load_order_links));
+                __try {
+                    if (entry && entry->dll_base == image_base) {
+                        unlink_list_entry_safely(&entry->hash_links);
+                    }
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER) {
+                }
+                cur = next;
+            }
+        }
+
+        return total_unlinked;
+    }
+
+    bool isolate_unwind_table(uint8_t* image_base, const IMAGE_NT_HEADERS* nt)
+    {
+        if (!image_base || !nt) return false;
+        const auto& exception_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        if (exception_dir.VirtualAddress == 0 || exception_dir.Size < sizeof(RUNTIME_FUNCTION))
+            return false;
+
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        const size_t page_size = static_cast<size_t>(si.dwPageSize);
+        if (page_size == 0) return false;
+
+        uintptr_t start = reinterpret_cast<uintptr_t>(image_base + exception_dir.VirtualAddress);
+        uintptr_t end = start + exception_dir.Size;
+        uintptr_t aligned_start = start & ~static_cast<uintptr_t>(page_size - 1u);
+        uintptr_t aligned_end = (end + (page_size - 1u)) & ~static_cast<uintptr_t>(page_size - 1u);
+        size_t span = aligned_end - aligned_start;
+        if (span == 0) return false;
+
+        DWORD old_protect = 0;
+        if (VirtualProtect(reinterpret_cast<LPVOID>(aligned_start), span,
+                           PAGE_READONLY, &old_protect))
+            return true;
+        return false;
+    }
+
     void* find_export(uint8_t* image_base, const IMAGE_NT_HEADERS* nt, const char* name)
     {
         const auto& export_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
@@ -1186,6 +1337,20 @@ namespace arc_loader
         result.function_table       = ft_table;
         result.function_table_count = ft_count;
 
+        const uint32_t unlinked_count = unlink_module_from_peb(image_base);
+        result.ldr_unlinked = unlinked_count > 0;
+        result.ldr_unlink_count = unlinked_count;
+        {
+            char ulbuf[96];
+            _snprintf_s(ulbuf, sizeof(ulbuf), _TRUNCATE,
+                "load_ldr_unlink_count=%u", unlinked_count);
+            arc_breadcrumb(ulbuf);
+        }
+
+        result.unwind_isolated = isolate_unwind_table(image_base, mapped_nt);
+        arc_breadcrumb(result.unwind_isolated ?
+            "load_unwind_isolated_ok" : "load_unwind_isolated_skipped");
+
         arc_breadcrumb("load_exit_ok");
         return result;
     }
@@ -1361,6 +1526,9 @@ namespace arc_loader
         mod.auto_seal_timer      = nullptr;
         mod.function_table       = nullptr;
         mod.function_table_count = 0;
+        mod.ldr_unlinked         = false;
+        mod.ldr_unlink_count     = 0;
+        mod.unwind_isolated      = false;
     }
 
     const std::string& last_error()

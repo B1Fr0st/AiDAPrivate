@@ -14,6 +14,7 @@
 #include "event_bus.hpp"
 #include "session_store.hpp"
 #include "auto_approval.hpp"
+#include "command_sessions.hpp"
 
 #include "../helpers/globals.h"
 
@@ -485,9 +486,87 @@ tool_result_t handle_read_command_output(const json& params)
         return tool_result_t::error("Missing required parameter: id");
 
     std::string id = params["id"].get<std::string>();
+    if (id.empty())
+        return tool_result_t::error("Session id cannot be empty.");
 
-    return tool_result_t::ok("Terminal output for session " + id + " is not yet available. "
-                            "The terminal integration requires ConPTY session tracking.");
+    bool drop_after = false;
+    if (params.contains("drop") && params["drop"].is_boolean())
+        drop_after = params["drop"].get<bool>();
+
+    size_t max_bytes = 65536;
+    if (params.contains("max_bytes") && params["max_bytes"].is_number_integer()) {
+        int v = params["max_bytes"].get<int>();
+        if (v < 256) v = 256;
+        if (v > 1048576) v = 1048576;
+        max_bytes = static_cast<size_t>(v);
+    }
+
+    bool running = false;
+    int64_t exit_code = 0;
+    bool was_timeout = false;
+    int64_t duration_ms = 0;
+    std::string sess_id;
+    std::string sess_cmd;
+    std::string out_copy;
+    std::string err_copy;
+
+    bool found = command_sessions::with_session(id,
+        [&](command_sessions::command_session_t& sess) {
+            sess_id = sess.id;
+            sess_cmd = sess.command;
+            running = sess.alive.load();
+            exit_code = sess.exit_code.load();
+            was_timeout = sess.timed_out.load();
+            auto end = running ? std::chrono::steady_clock::now() : sess.finished_at;
+            duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                end - sess.started_at).count();
+            std::lock_guard<std::mutex> lk(sess.output_mutex);
+            if (sess.stdout_buf.size() > max_bytes)
+                out_copy.assign(sess.stdout_buf, sess.stdout_buf.size() - max_bytes, max_bytes);
+            else
+                out_copy = sess.stdout_buf;
+            if (sess.stderr_buf.size() > max_bytes)
+                err_copy.assign(sess.stderr_buf, sess.stderr_buf.size() - max_bytes, max_bytes);
+            else
+                err_copy = sess.stderr_buf;
+        });
+
+    if (!found)
+        return tool_result_t::error("Session not found: " + id);
+
+    json status;
+    status["session_id"] = sess_id;
+    status["command"] = sess_cmd;
+    status["running"] = running;
+    status["exit_code"] = running ? json(nullptr) : json(exit_code);
+    status["timed_out"] = was_timeout;
+    status["duration_ms"] = duration_ms;
+    status["stdout"] = out_copy;
+    status["stderr"] = err_copy;
+
+    std::string text;
+    text += "Session: " + sess_id + "\n";
+    text += "Command: " + sess_cmd + "\n";
+    text += running ? "Status: running\n" : ("Status: finished (exit=" + std::to_string(exit_code) + ")\n");
+    if (was_timeout) text += "Timed out: yes\n";
+    text += "Elapsed: " + std::to_string(duration_ms) + "ms\n";
+    if (!out_copy.empty()) {
+        text += "--- stdout ---\n";
+        text += out_copy;
+        if (out_copy.back() != '\n') text += "\n";
+    }
+    if (!err_copy.empty()) {
+        text += "--- stderr ---\n";
+        text += err_copy;
+        if (err_copy.back() != '\n') text += "\n";
+    }
+    if (out_copy.empty() && err_copy.empty())
+        text += "(no output yet)";
+
+    if (drop_after && !running)
+        command_sessions::remove_session(id);
+
+    return tool_result_t::ok(text, status);
 }
 
 
@@ -877,8 +956,13 @@ void register_workflow_tools(mcp_standalone::server_t& srv)
         mcp_standalone::tool_visibility_t::internal_only});
 
     srv.register_tool({"read_command_output",
-        "Read output from a previously started background command by its terminal session ID.",
-        {{"id", "string", "The terminal session ID to read output from", true}},
+        "Read output from a previously started background command by its terminal session id. "
+        "Returns the most recent stdout/stderr (up to max_bytes), running state, exit code if "
+        "finished, and elapsed time. If drop=true and the session has finished, the session is "
+        "removed from the registry after this call.",
+        {{"id",        "string",  "The terminal session id to read output from.", true},
+         {"max_bytes", "integer", "Cap on returned bytes per stream (256-1048576). Default: 65536.", false},
+         {"drop",      "boolean", "Drop the session from the registry after reading (only if finished). Default: false.", false}},
         true, handle_read_command_output,
         mcp_standalone::tool_visibility_t::internal_only});
 

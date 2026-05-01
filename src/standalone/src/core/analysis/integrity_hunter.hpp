@@ -22,6 +22,7 @@ struct integrity_node_t {
 	uint64_t hash_compare_addr = 0;
 	uint64_t loop_start = 0;
 	uint64_t loop_end = 0;
+	uint64_t patch_addr = 0;
 	int      read_count = 0;
 	float    reads_per_second = 0.f;
 	std::string module_name;
@@ -143,13 +144,25 @@ inline void find_loop_bounds(uint64_t rip, uint64_t& loop_start, uint64_t& loop_
 		for (auto& c : mnem) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
 		bool is_jcc = (mnem.size() >= 2 && mnem[0] == 'j' && mnem != "jmp");
 		if (is_jcc && addr > rip) {
-			if (ins.len >= 2) {
+			int64_t rel = 0;
+			bool decoded = false;
+			if (ins.len == 2) {
 				int8_t rel8 = 0;
 				std::memcpy(&rel8, code.data() + pos + 1, 1);
-				uint64_t target = addr + static_cast<uint64_t>(ins.len) + static_cast<uint64_t>(rel8);
+				rel = static_cast<int64_t>(rel8);
+				decoded = true;
+			} else if (ins.len == 6) {
+				int32_t rel32 = 0;
+				std::memcpy(&rel32, code.data() + pos + 2, 4);
+				rel = static_cast<int64_t>(rel32);
+				decoded = true;
+			}
+			if (decoded) {
+				uint64_t next_rip = addr + static_cast<uint64_t>(ins.len);
+				uint64_t target = next_rip + static_cast<uint64_t>(rel);
 				if (target < rip) {
 					loop_start = target;
-					loop_end = addr + static_cast<uint64_t>(ins.len);
+					loop_end = next_rip;
 					return;
 				}
 			}
@@ -378,19 +391,24 @@ inline bool neutralize(int node_index)
 		bool is_jcc = (mnem.size() >= 2 && mnem[0] == 'j' && mnem != "jmp");
 		if (is_jcc) {
 			node.original_bytes.assign(code.data() + pos, code.data() + pos + ins.len);
+			node.patch_addr = scan_addr;
 
 			if (ins.len == 2) {
-				std::vector<uint8_t> nops(2, 0x90);
-				driver_bridge::write_memory(scan_addr, nops);
+				std::vector<uint8_t> patch(2);
+				patch[0] = 0xEB;
+				patch[1] = code[static_cast<size_t>(pos) + 1u];
+				driver_bridge::write_memory(scan_addr, patch);
 			} else if (ins.len == 6) {
-				std::vector<uint8_t> patch = {0xE9, 0x00, 0x00, 0x00, 0x00, 0x90};
-				int32_t rel = 0;
-				std::memcpy(&rel, code.data() + pos + 2, 4);
-				std::memcpy(patch.data() + 1, &rel, 4);
+				std::vector<uint8_t> patch(6);
+				patch[0] = 0xE9;
+				int32_t orig_rel = 0;
+				std::memcpy(&orig_rel, code.data() + pos + 2, 4);
+				int32_t new_rel = orig_rel + 1;
+				std::memcpy(patch.data() + 1, &new_rel, 4);
+				patch[5] = 0x90;
 				driver_bridge::write_memory(scan_addr, patch);
 			} else {
-				std::vector<uint8_t> nops(static_cast<size_t>(ins.len), 0x90);
-				driver_bridge::write_memory(scan_addr, nops);
+				return false;
 			}
 
 			node.neutralized = true;
@@ -413,45 +431,21 @@ inline bool restore(int node_index)
 		return false;
 
 	auto& node = g_state.nodes[static_cast<size_t>(node_index)];
-	if (!node.neutralized || node.original_bytes.empty()) return false;
+	if (!node.neutralized || node.original_bytes.empty() || node.patch_addr == 0)
+		return false;
 
-	uint64_t patch_addr = node.hash_compare_addr;
-	if (patch_addr == 0) patch_addr = node.reader_rip;
+	std::vector<uint8_t> current;
+	driver_bridge::read_memory(node.patch_addr, node.original_bytes.size(), current);
+	if (current.size() != node.original_bytes.size())
+		return false;
 
-	std::vector<uint8_t> code;
-	driver_bridge::read_memory(patch_addr, 32, code);
-	if (code.empty()) return false;
+	if (!driver_bridge::write_memory(node.patch_addr, node.original_bytes))
+		return false;
 
-	uint64_t scan_addr = patch_addr;
-	int pos = 0;
-	int count = 0;
-
-	while (pos < static_cast<int>(code.size()) - 1 && count < 15) {
-		int avail = static_cast<int>(code.size()) - pos;
-		if (avail < 1) break;
-
-		AsmInstr ins = zydis_decode_one(code.data() + pos, avail, scan_addr);
-		if (ins.len == 0) break;
-
-		std::string mnem(ins.mnem);
-		for (auto& c : mnem) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-
-		bool is_nop = (mnem == "nop");
-		bool is_jmp = (mnem == "jmp");
-
-		if ((is_nop || is_jmp) && ins.len == static_cast<int>(node.original_bytes.size())) {
-			driver_bridge::write_memory(scan_addr, node.original_bytes);
-			node.neutralized = false;
-			node.original_bytes.clear();
-			return true;
-		}
-
-		pos += ins.len;
-		scan_addr += static_cast<uint64_t>(ins.len);
-		++count;
-	}
-
-	return false;
+	node.neutralized = false;
+	node.original_bytes.clear();
+	node.patch_addr = 0;
+	return true;
 }
 
 }

@@ -111,9 +111,9 @@
     <ClCompile>
       <LanguageStandard>stdcpplatest</LanguageStandard>
       <LanguageStandard_C>stdclatest</LanguageStandard_C>
-      <AdditionalOptions>/FS %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/FS /guard:cf %(AdditionalOptions)</AdditionalOptions>
       <BufferSecurityCheck>false</BufferSecurityCheck>
-      <ControlFlowGuard>false</ControlFlowGuard>
+      <ControlFlowGuard>Guard</ControlFlowGuard>
       <TreatWarningAsError>false</TreatWarningAsError>
       <DisableSpecificWarnings>4083;4005;4244;4714;4189;%(DisableSpecificWarnings)</DisableSpecificWarnings>
       <SpectreMitigation>false</SpectreMitigation>
@@ -122,6 +122,8 @@
     <Link>
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
       <TreatLinkerWarningAsErrors>false</TreatLinkerWarningAsErrors>
+      <AdditionalOptions>/guard:cf %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalDependencies>cng.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
@@ -157,6 +159,7 @@
     <ClInclude Include="..\..\encrypt\crypter.h" />
     <ClInclude Include="src\function\AntiDebug.h" />
     <ClInclude Include="src\function\CoreSecurity.h" />
+    <ClInclude Include="src\function\KernelCrypto.h" />
     <ClInclude Include="src\function\Dispatcher.h" />
     <ClInclude Include="src\function\Functions.h" />
     <ClInclude Include="src\function\impl\driver\PML_Walker.h" />

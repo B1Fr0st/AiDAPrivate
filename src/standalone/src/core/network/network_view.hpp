@@ -34,7 +34,7 @@ enum class sub_tab_t : int {
 };
 
 
-struct connection_entry {
+struct connection_entry_t {
     uint32_t pid = 0;
     uint8_t  protocol = 0;
     uint8_t  state = 0;
@@ -47,7 +47,7 @@ struct connection_entry {
 };
 
 
-struct packet_entry {
+struct packet_entry_t {
     uint64_t    timestamp = 0;
     uint32_t    pid = 0;
     uint8_t     protocol = 0;
@@ -63,7 +63,7 @@ struct packet_entry {
 };
 
 
-struct dns_entry {
+struct dns_entry_t {
     uint64_t    timestamp = 0;
     uint32_t    pid = 0;
     uint16_t    query_type = 0;
@@ -74,7 +74,7 @@ struct dns_entry {
 };
 
 
-struct filter_entry {
+struct filter_entry_t {
     uint32_t rule_id = 0;
     uint8_t  action = 0;
     uint8_t  direction = 0;
@@ -86,7 +86,7 @@ struct filter_entry {
 };
 
 
-struct bw_entry {
+struct bw_entry_t {
     uint32_t    pid = 0;
     std::string process_name;
     uint64_t    bytes_in = 0;
@@ -98,7 +98,7 @@ struct bw_entry {
 };
 
 
-struct repeater_entry {
+struct repeater_entry_t {
     std::string host;
     uint16_t    port = 443;
     bool        use_tls = true;
@@ -133,7 +133,7 @@ struct state_t {
 
 
     std::mutex                    conn_mutex;
-    std::vector<connection_entry> connections;
+    std::vector<connection_entry_t> connections;
     int                           conn_selected = -1;
     uint32_t                      conn_filter_pid = 0;
     uint8_t                       conn_filter_protocol = 0;
@@ -141,10 +141,12 @@ struct state_t {
     bool                          conn_auto_refresh = true;
     std::thread                   conn_thread;
     std::atomic<bool>             conn_polling{false};
+    std::mutex                    conn_cv_mutex;
+    std::condition_variable       conn_cv;
 
 
     std::mutex                    cap_mutex;
-    std::deque<packet_entry>      captured_packets;
+    std::deque<packet_entry_t>    captured_packets;
     size_t                        cap_max_packets = 8192;
     int                           cap_selected = -1;
     bool                          cap_running = false;
@@ -172,7 +174,7 @@ struct state_t {
 
 
     std::mutex                    dns_mutex;
-    std::deque<dns_entry>         dns_entries;
+    std::deque<dns_entry_t>       dns_entries;
     size_t                        dns_max_entries = 8192;
     int                           dns_selected = -1;
     uint32_t                      dns_filter_pid = 0;
@@ -185,7 +187,7 @@ struct state_t {
     std::atomic<bool>             dns_thread_alive{false};
 
 
-    std::vector<filter_entry>     filters;
+    std::vector<filter_entry_t>   filters;
     int                           filter_selected = -1;
 
     int   nf_action = 0;
@@ -197,7 +199,7 @@ struct state_t {
 
 
     std::mutex                    bw_mutex;
-    std::vector<bw_entry>         bw_entries;
+    std::vector<bw_entry_t>       bw_entries;
     bool                          bw_monitoring = false;
     int                           bw_selected = -1;
     std::thread                   bw_thread;
@@ -207,7 +209,7 @@ struct state_t {
     std::atomic<bool>             bw_thread_alive{false};
 
 
-    std::vector<repeater_entry>   repeater_entries;
+    std::vector<repeater_entry_t> repeater_entries;
     int                           repeater_selected = 0;
     char                          rep_host[256] = {};
     int                           rep_port = 443;
@@ -227,7 +229,7 @@ struct state_t {
     uint8_t                       pcap_filter_protocol = 0;
 
 
-    struct fuzzer_entry {
+    struct fuzzer_entry_t {
         std::string host;
         uint16_t    port = 443;
         bool        use_tls = true;
@@ -245,7 +247,7 @@ struct state_t {
         std::vector<payload_set_t> payload_sets;
     };
 
-    struct fuzzer_result {
+    struct fuzzer_result_t {
         int         index = 0;
         std::string payload;
         int         status_code = 0;
@@ -257,9 +259,9 @@ struct state_t {
         std::string extracted_value;
     };
 
-    fuzzer_entry                  fuzz_config;
+    fuzzer_entry_t                fuzz_config;
     std::mutex                    fuzz_mutex;
-    std::vector<fuzzer_result>    fuzz_results;
+    std::vector<fuzzer_result_t>  fuzz_results;
     std::atomic<bool>             fuzz_running{false};
     std::atomic<int>              fuzz_progress{0};
     std::atomic<int>              fuzz_total{0};
@@ -270,7 +272,7 @@ struct state_t {
     int                           fuzz_selected = -1;
 
 
-    struct ws_frame_entry {
+    struct ws_frame_entry_t {
         uint64_t    timestamp = 0;
         uint64_t    exchange_id = 0;
         std::string host;
@@ -282,20 +284,20 @@ struct state_t {
         std::string preview;
     };
     std::mutex                    ws_mutex;
-    std::deque<ws_frame_entry>    ws_frames;
+    std::deque<ws_frame_entry_t> ws_frames;
     size_t                        ws_max_frames = 4096;
     int                           ws_selected = -1;
     bool                          ws_auto_scroll = true;
     char                          ws_filter_text[128] = {};
 
 
-    struct script_entry {
+    struct script_entry_t {
         std::string name;
         std::string path;
         bool        enabled = true;
         bool        loaded = false;
     };
-    std::vector<script_entry>     scripts;
+    std::vector<script_entry_t>   scripts;
     int                           script_selected = -1;
     char                          script_editor_buf[32768] = {};
     char                          script_console_buf[512] = {};
@@ -305,11 +307,11 @@ struct state_t {
     bool                          script_log_auto_scroll = true;
 
 
-    struct decoder_step {
+    struct decoder_step_t {
         std::string transform_name;
         std::vector<std::pair<std::string, std::string>> params;
     };
-    std::vector<decoder_step>     decoder_pipeline;
+    std::vector<decoder_step_t>   decoder_pipeline;
     char                          decoder_input[16384] = {};
     std::string                   decoder_output;
     int                           decoder_selected_step = -1;

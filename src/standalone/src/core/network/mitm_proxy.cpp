@@ -25,6 +25,15 @@
 
 namespace mitm_proxy {
 
+struct wsa_guard_t {
+    WSADATA data{};
+    bool ok = false;
+    wsa_guard_t() { ok = (WSAStartup(MAKEWORD(2, 2), &data) == 0); }
+    ~wsa_guard_t() { if (ok) WSACleanup(); }
+};
+
+static wsa_guard_t s_wsa_guard;
+
 
 static std::string addr_to_string(const sockaddr_in& addr) {
     char buf[INET_ADDRSTRLEN] = {};
@@ -37,6 +46,71 @@ static void close_socket(SOCKET s) {
         ::shutdown(s, SD_BOTH);
         closesocket(s);
     }
+}
+
+
+struct hold_outcome_t {
+    hold_decision_t       decision = hold_decision_t::forward;
+    std::vector<uint8_t>  modified_request;
+};
+
+static hold_outcome_t hold_until_decision(state_t& state, http_exchange exchange) {
+    auto wait = std::make_shared<held_wait_t>();
+    uint64_t exchange_id = exchange.id;
+
+    http_exchange* held_ptr = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(state.held_mutex);
+        state.held_storage.push_back(std::move(exchange));
+        held_ptr = &state.held_storage.back();
+        state.held_exchanges.push_back(held_ptr);
+        state.held_waits.emplace(exchange_id, wait);
+    }
+    state.held_cv.notify_all();
+
+    bool released = false;
+    hold_decision_t decision = hold_decision_t::forward;
+    std::vector<uint8_t> modified;
+    {
+        std::unique_lock<std::mutex> wlock(wait->mtx);
+        wait->cv.wait(wlock, [&wait, &state]() {
+            return wait->released || !state.running.load() || !state.proxy_alive.load();
+        });
+        released = wait->released;
+        decision = wait->decision;
+        modified = std::move(wait->modified_request);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state.held_mutex);
+        if (held_ptr) {
+            auto vit = std::find(state.held_exchanges.begin(), state.held_exchanges.end(), held_ptr);
+            if (vit != state.held_exchanges.end())
+                state.held_exchanges.erase(vit);
+
+            auto wit = state.held_waits.find(exchange_id);
+            if (wit != state.held_waits.end())
+                state.held_waits.erase(wit);
+
+            for (auto it = state.held_storage.begin(); it != state.held_storage.end(); ++it) {
+                if (&(*it) == held_ptr) {
+                    state.held_storage.erase(it);
+                    break;
+                }
+            }
+        }
+    }
+
+    hold_outcome_t outcome;
+    if (!released) {
+        outcome.decision = hold_decision_t::drop;
+    } else if (decision == hold_decision_t::pending) {
+        outcome.decision = hold_decision_t::forward;
+    } else {
+        outcome.decision = decision;
+    }
+    outcome.modified_request = std::move(modified);
+    return outcome;
 }
 
 static bool recv_all(SOCKET s, std::vector<uint8_t>& out, size_t max_size, int timeout_ms = 5000) {
@@ -882,13 +956,34 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
 
 
             bool should_forward = true;
-            if (state.config.intercept_enabled && state.intercept_cb) {
-                intercept_action action = state.intercept_cb(exchange);
-                if (action == intercept_action::drop) {
-                    exchange.state = http_exchange::state_t::dropped;
-                    should_forward = false;
-                } else if (action == intercept_action::modify) {
-                    request_data = exchange.raw_request;
+            if (state.config.intercept_enabled) {
+                bool cb_decided = false;
+                if (state.intercept_cb) {
+                    intercept_action action = state.intercept_cb(exchange);
+                    if (action == intercept_action::drop) {
+                        exchange.state = http_exchange::state_t::dropped;
+                        should_forward = false;
+                        cb_decided = true;
+                    } else if (action == intercept_action::modify) {
+                        request_data = exchange.raw_request;
+                        cb_decided = true;
+                    } else if (action == intercept_action::forward) {
+                        cb_decided = true;
+                    }
+                }
+                if (!cb_decided && should_forward) {
+                    exchange.raw_request = request_data;
+                    exchange.request_size = request_data.size();
+                    hold_outcome_t outcome = hold_until_decision(state, exchange);
+                    if (outcome.decision == hold_decision_t::drop) {
+                        exchange.state = http_exchange::state_t::dropped;
+                        should_forward = false;
+                    } else if (outcome.decision == hold_decision_t::modified) {
+                        request_data = std::move(outcome.modified_request);
+                        exchange.raw_request = request_data;
+                        exchange.request_size = request_data.size();
+                        exchange.request = protocol_parser::parse_http_request(request_data.data(), request_data.size());
+                    }
                 }
             }
 
@@ -1057,13 +1152,34 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
     }
 
     bool should_forward = true;
-    if (state.config.intercept_enabled && state.intercept_cb) {
-        intercept_action action = state.intercept_cb(exchange);
-        if (action == intercept_action::drop) {
-            exchange.state = http_exchange::state_t::dropped;
-            should_forward = false;
-        } else if (action == intercept_action::modify) {
-            request_data = exchange.raw_request;
+    if (state.config.intercept_enabled) {
+        bool cb_decided = false;
+        if (state.intercept_cb) {
+            intercept_action action = state.intercept_cb(exchange);
+            if (action == intercept_action::drop) {
+                exchange.state = http_exchange::state_t::dropped;
+                should_forward = false;
+                cb_decided = true;
+            } else if (action == intercept_action::modify) {
+                request_data = exchange.raw_request;
+                cb_decided = true;
+            } else if (action == intercept_action::forward) {
+                cb_decided = true;
+            }
+        }
+        if (!cb_decided && should_forward) {
+            exchange.raw_request = request_data;
+            exchange.request_size = request_data.size();
+            hold_outcome_t outcome = hold_until_decision(state, exchange);
+            if (outcome.decision == hold_decision_t::drop) {
+                exchange.state = http_exchange::state_t::dropped;
+                should_forward = false;
+            } else if (outcome.decision == hold_decision_t::modified) {
+                request_data = std::move(outcome.modified_request);
+                exchange.raw_request = request_data;
+                exchange.request_size = request_data.size();
+                exchange.request = protocol_parser::parse_http_request(request_data.data(), request_data.size());
+            }
         }
     }
 
@@ -1299,10 +1415,7 @@ static void listener_thread_func(state_t& state) {
 bool start(const proxy_config& config) {
     if (g_state.running.load()) return false;
 
-
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
-
+    if (!s_wsa_guard.ok) return false;
 
     if (config.decode_tls && !cert_generator::is_ready()) {
         if (!cert_generator::initialize()) return false;
@@ -1382,6 +1495,25 @@ void stop() {
 
 
     g_state.work_cv.notify_all();
+    g_state.held_cv.notify_all();
+
+    std::vector<std::shared_ptr<held_wait_t>> waits;
+    {
+        std::lock_guard<std::mutex> lock(g_state.held_mutex);
+        waits.reserve(g_state.held_waits.size());
+        for (auto& kv : g_state.held_waits)
+            waits.push_back(kv.second);
+    }
+    for (auto& wait : waits) {
+        {
+            std::lock_guard<std::mutex> wlock(wait->mtx);
+            if (!wait->released) {
+                wait->decision = hold_decision_t::drop;
+                wait->released = true;
+            }
+        }
+        wait->cv.notify_all();
+    }
 
 
     if (g_state.listen_socket != ~static_cast<uintptr_t>(0)) {
@@ -1459,49 +1591,97 @@ void set_intercept_callback(intercept_callback_t cb) {
     g_state.intercept_cb = std::move(cb);
 }
 
+static std::shared_ptr<held_wait_t> lookup_wait_locked(uint64_t id) {
+    auto it = g_state.held_waits.find(id);
+    if (it == g_state.held_waits.end()) return nullptr;
+    return it->second;
+}
+
 void forward_exchange(uint64_t id) {
-    std::lock_guard<std::mutex> lock(g_state.held_mutex);
-    auto it = std::find_if(g_state.held_exchanges.begin(), g_state.held_exchanges.end(),
-        [id](const http_exchange* ex) { return ex->id == id; });
-    if (it != g_state.held_exchanges.end()) {
-        (*it)->state = http_exchange::state_t::forwarding;
-        g_state.held_exchanges.erase(it);
+    std::shared_ptr<held_wait_t> wait;
+    {
+        std::lock_guard<std::mutex> lock(g_state.held_mutex);
+        wait = lookup_wait_locked(id);
     }
+    if (!wait) return;
+    {
+        std::lock_guard<std::mutex> wlock(wait->mtx);
+        if (wait->released) return;
+        wait->decision = hold_decision_t::forward;
+        wait->released = true;
+    }
+    wait->cv.notify_all();
 }
 
 void forward_modified(uint64_t id, const std::vector<uint8_t>& modified_request) {
-    std::lock_guard<std::mutex> lock(g_state.held_mutex);
-    auto it = std::find_if(g_state.held_exchanges.begin(), g_state.held_exchanges.end(),
-        [id](const http_exchange* ex) { return ex->id == id; });
-    if (it != g_state.held_exchanges.end()) {
-        (*it)->raw_request = modified_request;
-        (*it)->state = http_exchange::state_t::forwarding;
-        g_state.held_exchanges.erase(it);
+    std::shared_ptr<held_wait_t> wait;
+    {
+        std::lock_guard<std::mutex> lock(g_state.held_mutex);
+        wait = lookup_wait_locked(id);
     }
+    if (!wait) return;
+    {
+        std::lock_guard<std::mutex> wlock(wait->mtx);
+        if (wait->released) return;
+        wait->modified_request = modified_request;
+        wait->decision = hold_decision_t::modified;
+        wait->released = true;
+    }
+    wait->cv.notify_all();
 }
 
 void drop_exchange(uint64_t id) {
-    std::lock_guard<std::mutex> lock(g_state.held_mutex);
-    auto it = std::find_if(g_state.held_exchanges.begin(), g_state.held_exchanges.end(),
-        [id](const http_exchange* ex) { return ex->id == id; });
-    if (it != g_state.held_exchanges.end()) {
-        (*it)->state = http_exchange::state_t::dropped;
-        g_state.held_exchanges.erase(it);
+    std::shared_ptr<held_wait_t> wait;
+    {
+        std::lock_guard<std::mutex> lock(g_state.held_mutex);
+        wait = lookup_wait_locked(id);
     }
+    if (!wait) return;
+    {
+        std::lock_guard<std::mutex> wlock(wait->mtx);
+        if (wait->released) return;
+        wait->decision = hold_decision_t::drop;
+        wait->released = true;
+    }
+    wait->cv.notify_all();
 }
 
 void forward_all() {
-    std::lock_guard<std::mutex> lock(g_state.held_mutex);
-    for (auto* ex : g_state.held_exchanges)
-        ex->state = http_exchange::state_t::forwarding;
-    g_state.held_exchanges.clear();
+    std::vector<std::shared_ptr<held_wait_t>> waits;
+    {
+        std::lock_guard<std::mutex> lock(g_state.held_mutex);
+        waits.reserve(g_state.held_waits.size());
+        for (auto& kv : g_state.held_waits)
+            waits.push_back(kv.second);
+    }
+    for (auto& wait : waits) {
+        {
+            std::lock_guard<std::mutex> wlock(wait->mtx);
+            if (wait->released) continue;
+            wait->decision = hold_decision_t::forward;
+            wait->released = true;
+        }
+        wait->cv.notify_all();
+    }
 }
 
 void drop_all() {
-    std::lock_guard<std::mutex> lock(g_state.held_mutex);
-    for (auto* ex : g_state.held_exchanges)
-        ex->state = http_exchange::state_t::dropped;
-    g_state.held_exchanges.clear();
+    std::vector<std::shared_ptr<held_wait_t>> waits;
+    {
+        std::lock_guard<std::mutex> lock(g_state.held_mutex);
+        waits.reserve(g_state.held_waits.size());
+        for (auto& kv : g_state.held_waits)
+            waits.push_back(kv.second);
+    }
+    for (auto& wait : waits) {
+        {
+            std::lock_guard<std::mutex> wlock(wait->mtx);
+            if (wait->released) continue;
+            wait->decision = hold_decision_t::drop;
+            wait->released = true;
+        }
+        wait->cv.notify_all();
+    }
 }
 
 std::vector<http_exchange> get_held_exchanges() {
@@ -1518,8 +1698,10 @@ repeat_result repeat_request(const std::string& host, uint16_t port, bool use_tl
                              const std::vector<uint8_t>& raw_request) {
     repeat_result result;
 
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
+    if (!s_wsa_guard.ok) {
+        result.error = "WSAStartup failed";
+        return result;
+    }
 
     SOCKET sock = connect_to_target(host, port);
     if (sock == INVALID_SOCKET) {

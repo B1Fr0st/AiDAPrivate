@@ -2,12 +2,14 @@
 
 #include <windows.h>
 #include <psapi.h>
+#include <bcrypt.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <chrono>
 
 #include "webhook.hpp"
 #include "state.hpp"
@@ -31,6 +33,7 @@
 #include "call_obfuscation.hpp"
 #include "decoy_call_graph.hpp"
 #include "nanomites.hpp"
+#include "binary_protocol.hpp"
 #include "server_pages.hpp"
 #include "vm_compiler.hpp"
 #include "stolen_bytes.hpp"
@@ -38,8 +41,13 @@
 #include "standalone_anti_dump.hpp"
 #include "re_detection_engine.hpp"
 #include "ghost_veh.hpp"
+#include "key_pipeline.hpp"
 
 #include "obfuscation.hpp"
+#include "standalone_license.hpp"
+#include "../arc/arc.h"
+
+#pragma comment(lib, "bcrypt.lib")
 
 namespace anti_tamper {
 
@@ -72,9 +80,26 @@ inline uint64_t resolve_rolling_key_for(uint32_t rva)
 {
     uint64_t k0 = 0, k1 = 0;
     integrity::get_session_keys(k0, k1);
-    uint64_t base = k0 ^ k1 ^ 0x9E3779B97F4A7C15ULL;
-    return base ^ (static_cast<uint64_t>(rva) * 0xBF58476D1CE4E5B9ULL)
-               ^ vm_nested::OUTER_ROLLING_SEED_MIX;
+    uint8_t ikm[24];
+    memcpy(ikm, &k0, 8);
+    memcpy(ikm + 8, &k1, 8);
+    uint64_t rva_u64 = static_cast<uint64_t>(rva);
+    memcpy(ikm + 16, &rva_u64, 8);
+    uint8_t prk[32];
+    virtualizer::detail::hmac_sha256(state::g_vm_master_key, 32, ikm, 24, prk);
+    static const uint8_t info[16] = {
+        'a','i','d','a','_','o','r','c','h',
+        '_','i','n','n','e','r','k'
+    };
+    uint8_t okm[16];
+    virtualizer::detail::hkdf_expand_sha256(prk, info, 16, okm, 16);
+    uint64_t out_lo = 0, out_hi = 0;
+    memcpy(&out_lo, okm, 8);
+    memcpy(&out_hi, okm + 8, 8);
+    SecureZeroMemory(prk, 32);
+    SecureZeroMemory(okm, 16);
+    SecureZeroMemory(ikm, 24);
+    return out_lo ^ _rotl64(out_hi, 23);
 }
 
 inline bool extract_inner_bytecode_by_rva(uint32_t rva, std::vector<uint8_t>& out)
@@ -228,6 +253,13 @@ inline bool initialize()
 
     if (rt.initialized.load()) return true;
 
+    if (!key_pipeline::ensure_kat_passed())
+    {
+        webhook::send_debug_log("init", "crypto_kat_failed", true);
+        __fastfail(0xA1DA0CA7u);
+    }
+    webhook::write_log("init", "crypto_kat_ok");
+
     syscall::initialize();
     webhook::write_log("init", "syscall_ok");
 
@@ -351,7 +383,15 @@ inline bool initialize()
     }
     webhook::write_log("init", "anti_hook_ok");
 
-    anti_vm::full_scan();
+    {
+        auto vm = anti_vm::full_scan();
+        if (vm.any_detected())
+        {
+            webhook::send_debug_log("init", "vm_at_startup: " + vm.summary, true);
+            enforce_violation("vm_at_startup", vm.summary);
+            return false;
+        }
+    }
     webhook::write_log("init", "anti_vm_ok");
 
     virtualizer::initialize(
@@ -403,6 +443,11 @@ inline bool initialize()
 
     nanomites::initialize();
     webhook::write_log("init", "nanomites_ok");
+
+    if (binary_protocol::initialize_with_baked_pin())
+        webhook::write_log("init", "binary_protocol_pin_ok");
+    else
+        webhook::write_log("init", "binary_protocol_pin_fail");
 
     server_pages::initialize();
     webhook::write_log("init", "server_pages_ok");
@@ -471,6 +516,18 @@ inline bool initialize()
     rt.initialized.store(true);
     webhook::write_log("init", "initialized_ok");
 
+    if (anti_tamper::tpm_attest::is_available())
+    {
+        anti_tamper::tpm_attest::ensure_counter_defined(anti_tamper::tpm_attest::TPM_NV_INDEX_AIDA_COUNTER);
+        webhook::write_log("init", "tpm_attest_ready");
+    }
+    else
+    {
+        webhook::write_log("init", anti_tamper::tpm_attest::last_error());
+    }
+
+    integrity::periodic::start();
+    webhook::write_log("init", "periodic_integrity_started");
 
     try
     {
@@ -671,6 +728,17 @@ inline bool guard()
         {
             webhook::send_debug_log("guard", "code_integrity_fail", true);
             enforce_violation("code_integrity_runtime");
+            CFF_EXIT(guard_cff);
+        }
+        if (integrity::periodic_violation_latched())
+        {
+            uint32_t mismatch_page = 0;
+            integrity::verify_full_text_eager(&mismatch_page);
+            char detail[96];
+            _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                "page_mac_periodic_mismatch page=%u", mismatch_page);
+            webhook::send_debug_log("guard", detail, true);
+            enforce_violation("page_mac_periodic_mismatch", detail);
             CFF_EXIT(guard_cff);
         }
         CFF_GOTO(guard_cff, 6);
@@ -928,49 +996,343 @@ inline bool guard()
     return !rt.violation_latched.load(std::memory_order_acquire);
 }
 
+namespace watchdog_detail {
+
+inline uint64_t now_ms()
+{
+    return static_cast<uint64_t>(GetTickCount64());
+}
+
+inline uint64_t fast_check_peb()
+{
+    uint64_t score = 0;
+    if (anti_debug::check_being_debugged()) score |= 0x1ull;
+    if (anti_debug::check_nt_global_flag()) score |= 0x2ull;
+    if (anti_debug::check_heap_flags()) score |= 0x4ull;
+    if (anti_debug::check_is_debugger_present()) score |= 0x8ull;
+    return score;
+}
+
+inline uint64_t fast_check_dr()
+{
+    return anti_debug::check_hw_breakpoints_local() ? 0x10ull : 0ull;
+}
+
+inline uint64_t fast_check_guard_pages()
+{
+    auto& rt = state::get();
+    if (rt.code_snap.text_base == 0 || rt.code_snap.text_size == 0) return 0;
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    uint64_t addr = rt.code_snap.text_base;
+    const uint64_t end = rt.code_snap.text_base + rt.code_snap.text_size;
+    constexpr DWORD writable = PAGE_EXECUTE_READWRITE | PAGE_READWRITE
+        | PAGE_EXECUTE_WRITECOPY | PAGE_WRITECOPY;
+
+    while (addr < end)
+    {
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == 0)
+            return 0x40ull;
+        if (mbi.Protect & writable)
+            return 0x80ull;
+        addr = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+    }
+    return 0;
+}
+
+inline uint64_t fast_check_iat()
+{
+    auto& rt = state::get();
+    if (rt.iat_snap.empty()) return 0;
+    return integrity::verify_iat(rt.iat_snap) ? 0 : 0x100ull;
+}
+
+inline uint64_t fast_check_vm_synthetic()
+{
+    return anti_vm::synthetic_vm_trip_active() ? 0x200ull : 0ull;
+}
+
+inline uint64_t worker_compute_score()
+{
+    uint64_t s = 0;
+    s |= fast_check_peb();
+    s |= fast_check_dr();
+    s |= fast_check_guard_pages();
+    s |= fast_check_iat();
+    s |= fast_check_vm_synthetic();
+    return s;
+}
+
+inline bool hmac_sha256(const uint8_t* key, uint32_t key_len,
+                       const uint8_t* data, uint32_t data_len,
+                       uint8_t out[32])
+{
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr,
+                                    BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0)
+        return false;
+    bool ok = false;
+    if (BCryptCreateHash(alg, &hash, nullptr, 0,
+                         const_cast<PUCHAR>(key), key_len, 0) == 0)
+    {
+        if (BCryptHashData(hash, const_cast<PUCHAR>(data), data_len, 0) == 0)
+            ok = (BCryptFinishHash(hash, out, 32, 0) == 0);
+        BCryptDestroyHash(hash);
+    }
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
+
+inline uint64_t fold_witness(uint64_t prev_chain, uint64_t score, uint64_t worker_id,
+                             uint64_t epoch, const uint8_t key[32])
+{
+    uint8_t input[32] = {};
+    std::memcpy(input + 0, &prev_chain, 8);
+    std::memcpy(input + 8, &score, 8);
+    std::memcpy(input + 16, &worker_id, 8);
+    std::memcpy(input + 24, &epoch, 8);
+    uint8_t mac[32] = {};
+    if (!hmac_sha256(key, 32, input, sizeof(input), mac))
+        return prev_chain ^ (score * 0x9E3779B97F4A7C15ULL);
+    uint64_t out = 0;
+    std::memcpy(&out, mac, 8);
+    return out;
+}
+
+inline const uint8_t* witness_key()
+{
+    static uint8_t s_key[32] = {};
+    static std::once_flag s_once;
+    std::call_once(s_once, []() {
+        const char salt_str[] = "aida.watchdog.witness.key.v1";
+        if (!key_pipeline::derive("aida.watchdog.witness",
+                                  reinterpret_cast<const uint8_t*>(salt_str),
+                                  sizeof(salt_str) - 1,
+                                  s_key, 32))
+        {
+            uint64_t k0 = 0, k1 = 0;
+            integrity::get_session_keys(k0, k1);
+            std::memcpy(s_key + 0, &k0, 8);
+            std::memcpy(s_key + 8, &k1, 8);
+            uint64_t mix = 0xC2B2AE3D27D4EB4FULL ^ static_cast<uint64_t>(GetCurrentProcessId());
+            std::memcpy(s_key + 16, &mix, 8);
+            mix ^= __rdtsc();
+            std::memcpy(s_key + 24, &mix, 8);
+        }
+    });
+    return s_key;
+}
+
+inline void worker_loop(int worker_id, std::atomic<uint64_t>& tick_atomic,
+                        std::atomic<uint64_t>& chain_atomic)
+{
+    auto& rt = state::get();
+    uint64_t epoch = 0;
+    while (rt.monitors_running.load() && !rt.violation_latched.load())
+    {
+        ++epoch;
+        uint64_t score = worker_compute_score();
+        uint64_t prev = chain_atomic.load(std::memory_order_acquire);
+        uint64_t folded = fold_witness(prev, score, static_cast<uint64_t>(worker_id),
+                                       epoch, witness_key());
+        chain_atomic.store(folded, std::memory_order_release);
+        tick_atomic.store(now_ms(), std::memory_order_release);
+
+        if (score != 0)
+        {
+            char dbg[128];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "worker%d_score=0x%llX epoch=%llu", worker_id,
+                static_cast<unsigned long long>(score),
+                static_cast<unsigned long long>(epoch));
+            webhook::send_debug_log("watchdog_worker", dbg, true);
+            enforce_violation("watchdog_worker_anomaly", dbg);
+            return;
+        }
+
+        Sleep(75);
+    }
+}
+
+inline bool reattest()
+{
+    auto& rt = state::get();
+    auto hb = standalone_license::arc_heartbeat();
+    if (hb.valid && hb.proof_token != 0)
+    {
+        rt.reattest_last_proof_token.store(hb.proof_token, std::memory_order_release);
+        rt.reattest_last_success_ms.store(now_ms(), std::memory_order_release);
+        rt.reattest_first_failure_ms.store(0, std::memory_order_release);
+        return true;
+    }
+    return false;
+}
+
+inline void watchdog_loop()
+{
+    auto& rt = state::get();
+    HANDLE self_thread = GetCurrentThread();
+    SetThreadPriority(self_thread, THREAD_PRIORITY_HIGHEST);
+
+    constexpr uint64_t kReattestPeriodMs = 5ull * 60ull * 1000ull;
+    constexpr uint64_t kReattestGraceMs = 30ull * 1000ull;
+    constexpr uint64_t kWorkerStallMs = 200ull;
+
+    uint64_t last_reattest_attempt_ms = now_ms();
+    uint64_t startup_grace_until = now_ms() + 8000ull;
+
+    rt.watchdog_last_tick_ms.store(now_ms(), std::memory_order_release);
+
+    while (rt.monitors_running.load() && !rt.violation_latched.load())
+    {
+        uint64_t cur = now_ms();
+        rt.watchdog_last_tick_ms.store(cur, std::memory_order_release);
+
+        if (cur > startup_grace_until)
+        {
+            uint64_t ta = rt.worker_a_last_tick_ms.load(std::memory_order_acquire);
+            uint64_t tb = rt.worker_b_last_tick_ms.load(std::memory_order_acquire);
+            uint64_t tc = rt.worker_c_last_tick_ms.load(std::memory_order_acquire);
+
+            uint64_t da = (ta == 0) ? 0 : (cur - ta);
+            uint64_t db = (tb == 0) ? 0 : (cur - tb);
+            uint64_t dc = (tc == 0) ? 0 : (cur - tc);
+
+            int stalled = 0;
+            if (ta != 0 && da > kWorkerStallMs) ++stalled;
+            if (tb != 0 && db > kWorkerStallMs) ++stalled;
+            if (tc != 0 && dc > kWorkerStallMs) ++stalled;
+
+            if (stalled >= 2)
+            {
+                char dbg[160];
+                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                    "watchdog_workers_stalled da=%llu db=%llu dc=%llu",
+                    static_cast<unsigned long long>(da),
+                    static_cast<unsigned long long>(db),
+                    static_cast<unsigned long long>(dc));
+                webhook::send_debug_log("watchdog_stall", dbg, true);
+                enforce_violation("watchdog_workers_stalled", dbg);
+                return;
+            }
+        }
+
+        if (rt.initialized.load() &&
+            !rt.license_pending_activation.load() &&
+            standalone_license::is_arc_loaded())
+        {
+            uint64_t since_last_attempt = cur - last_reattest_attempt_ms;
+            if (since_last_attempt >= kReattestPeriodMs)
+            {
+                last_reattest_attempt_ms = cur;
+                bool ok = reattest();
+                char dbg[96];
+                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                    "watchdog_reattest ok=%d at_ms=%llu", ok ? 1 : 0,
+                    static_cast<unsigned long long>(cur));
+                webhook::write_log("watchdog", dbg);
+                if (!ok)
+                {
+                    uint64_t first_fail = rt.reattest_first_failure_ms.load(std::memory_order_acquire);
+                    if (first_fail == 0)
+                    {
+                        rt.reattest_first_failure_ms.store(cur, std::memory_order_release);
+                    }
+                    else if ((cur - first_fail) > kReattestGraceMs)
+                    {
+                        webhook::send_debug_log("watchdog", "reattest_grace_exceeded", true);
+                        enforce_violation("reattest_failure", "5min_re_attestation_failed");
+                        return;
+                    }
+                }
+            }
+        }
+
+        Sleep(50);
+    }
+}
+
+inline void monitor_loop()
+{
+    auto& rt = state::get();
+    Sleep(5000);
+    webhook::write_log("monitor", "thread_started");
+    uint64_t iter = 0;
+    while (rt.monitors_running.load() && !rt.violation_latched.load())
+    {
+        ++iter;
+        try
+        {
+            guard();
+            enforcement_tick();
+        }
+        catch (const std::exception& ex)
+        {
+            char ebuf[256];
+            _snprintf_s(ebuf, sizeof(ebuf), _TRUNCATE,
+                "monitor_loop_EXCEPTION iter=%llu what=%s", iter, ex.what());
+            webhook::write_log("monitor", ebuf);
+        }
+        catch (...)
+        {
+            char ebuf[128];
+            _snprintf_s(ebuf, sizeof(ebuf), _TRUNCATE,
+                "monitor_loop_UNKNOWN_EXCEPTION iter=%llu", iter);
+            webhook::write_log("monitor", ebuf);
+        }
+        Sleep(500);
+    }
+    char dbg[128];
+    _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+        "thread_exiting monitors_running=%d violation_latched=%d iter=%llu",
+        rt.monitors_running.load() ? 1 : 0, rt.violation_latched.load() ? 1 : 0, iter);
+    webhook::write_log("monitor", dbg);
+}
+
+}
+
 inline void start_monitors()
 {
     auto& rt = state::get();
     if (rt.monitors_running.exchange(true))
         return;
 
+    rt.watchdog_running.store(true, std::memory_order_release);
+
     try
     {
+        std::thread(watchdog_detail::monitor_loop).detach();
+
         std::thread([]() {
-            Sleep(5000);
-            webhook::write_log("monitor", "thread_started");
             auto& rt = state::get();
-            uint64_t iter = 0;
-            while (rt.monitors_running.load() && !rt.violation_latched.load())
-            {
-                ++iter;
-                try
-                {
-                    guard();
-                    enforcement_tick();
-                }
-                catch (const std::exception& ex)
-                {
-                    char ebuf[256];
-                    _snprintf_s(ebuf, sizeof(ebuf), _TRUNCATE,
-                        "monitor_loop_EXCEPTION iter=%llu what=%s", iter, ex.what());
-                    webhook::write_log("monitor", ebuf);
-                }
-                catch (...)
-                {
-                    char ebuf[128];
-                    _snprintf_s(ebuf, sizeof(ebuf), _TRUNCATE,
-                        "monitor_loop_UNKNOWN_EXCEPTION iter=%llu", iter);
-                    webhook::write_log("monitor", ebuf);
-                }
-                Sleep(500);
-            }
-            char dbg[128];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "thread_exiting monitors_running=%d violation_latched=%d iter=%llu",
-                rt.monitors_running.load() ? 1 : 0, rt.violation_latched.load() ? 1 : 0, iter);
-            webhook::write_log("monitor", dbg);
+            watchdog_detail::worker_loop(0,
+                rt.worker_a_last_tick_ms, rt.witness_chain_a);
+            webhook::write_log("watchdog_worker_a", "exiting");
         }).detach();
+
+        std::thread([]() {
+            auto& rt = state::get();
+            watchdog_detail::worker_loop(1,
+                rt.worker_b_last_tick_ms, rt.witness_chain_b);
+            webhook::write_log("watchdog_worker_b", "exiting");
+        }).detach();
+
+        std::thread([]() {
+            auto& rt = state::get();
+            watchdog_detail::worker_loop(2,
+                rt.worker_c_last_tick_ms, rt.witness_chain_c);
+            webhook::write_log("watchdog_worker_c", "exiting");
+        }).detach();
+
+        std::thread([]() {
+            watchdog_detail::watchdog_loop();
+            auto& rt = state::get();
+            rt.watchdog_running.store(false, std::memory_order_release);
+            webhook::write_log("watchdog", "exiting");
+        }).detach();
+
+        webhook::write_log("init", "watchdog_threads_started");
     }
     catch (const std::exception& ex)
     {
@@ -978,11 +1340,13 @@ inline void start_monitors()
         _snprintf_s(buf, sizeof(buf), _TRUNCATE, "monitor_thread_exception: %s", ex.what());
         webhook::write_log("init", buf);
         rt.monitors_running.store(false);
+        rt.watchdog_running.store(false);
     }
     catch (...)
     {
         webhook::write_log("init", "monitor_thread_failed_unknown");
         rt.monitors_running.store(false);
+        rt.watchdog_running.store(false);
     }
 }
 
@@ -990,6 +1354,7 @@ inline void shutdown()
 {
     auto& rt = state::get();
     rt.monitors_running.store(false);
+    integrity::periodic::stop();
     standalone_anti_dump::shutdown();
     server_pages::shutdown();
     nanomites::shutdown();

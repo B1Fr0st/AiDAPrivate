@@ -7,7 +7,6 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
-#include <map>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -59,15 +58,21 @@ struct stream_key_hash_t {
 };
 
 
+struct half_stream_state_t {
+    std::vector<uint8_t> assembled;
+    uint64_t             total_bytes   = 0;
+    uint64_t             total_packets = 0;
+};
+
 struct stream_state_t {
-    uint32_t                              expected_seq   = 0;
-    bool                                  syn_seen       = false;
-    bool                                  fin_seen       = false;
-    std::map<uint32_t, std::vector<uint8_t>> ooo_buffer;
-    std::vector<uint8_t>                  assembled;
-    uint64_t                              last_activity_ns = 0;
-    uint64_t                              total_bytes    = 0;
-    uint64_t                              total_packets  = 0;
+    bool                 syn_seen       = false;
+    bool                 fin_seen       = false;
+    std::vector<uint8_t> assembled;
+    uint64_t             last_activity_ns = 0;
+    uint64_t             total_bytes    = 0;
+    uint64_t             total_packets  = 0;
+    half_stream_state_t  c2s;
+    half_stream_state_t  s2c;
 };
 
 
@@ -98,14 +103,12 @@ public:
             std::lock_guard<std::mutex> lk(streams_mutex_);
             streams_.clear();
         }
-        poll_thread_ = {};
         work_queue::post([this]() { poll_loop(); });
     }
 
     void stop() {
         if (!running_.load()) return;
         running_.store(false);
-        if (poll_thread_.joinable()) poll_thread_.join();
     }
 
     bool is_running() const noexcept { return running_.load(); }
@@ -141,11 +144,14 @@ public:
         st.last_activity_ns = now_ns;
         st.total_packets++;
         st.total_bytes += pkt.payload.size();
-
-
-        st.assembled.insert(st.assembled.end(),
-                             pkt.payload.begin(), pkt.payload.end());
         st.syn_seen = true;
+
+        half_stream_state_t& half = (pkt.direction == 0) ? st.s2c : st.c2s;
+        half.total_packets++;
+        half.total_bytes += pkt.payload.size();
+        half.assembled.insert(half.assembled.end(), pkt.payload.begin(), pkt.payload.end());
+
+        st.assembled.insert(st.assembled.end(), pkt.payload.begin(), pkt.payload.end());
     }
 
 
@@ -215,7 +221,6 @@ private:
                 }
             }
 
-            // Evict stale streams every ~60 seconds (12000 * 5ms loops)
             evict_counter_++;
             if (evict_counter_ >= 12000) {
                 evict_stale(30'000'000'000ULL);
@@ -230,7 +235,6 @@ private:
 
     mutable std::mutex streams_mutex_;
     std::unordered_map<stream_key_t, stream_state_t, stream_key_hash_t> streams_;
-    std::thread  poll_thread_;
     std::atomic<bool>     running_{false};
     uint32_t              filter_pid_     = 0;
     uint32_t              evict_counter_  = 0;

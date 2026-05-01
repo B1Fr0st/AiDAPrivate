@@ -1,5 +1,8 @@
 #pragma once
 
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
 #include <cstdint>
 #include "work_queue.hpp"
 #include <cstdio>
@@ -11,6 +14,7 @@
 
 #include "imgui/imgui.h"
 #include "standalone_driver.hpp"
+#include "debugger_engine.hpp"
 #include "disasm_view.hpp"
 #include "ui_anim.hpp"
 #include "../helpers/globals.h"
@@ -40,6 +44,26 @@ struct ui_state_t {
 
 inline ui_state_t g_ui;
 
+inline uint64_t resolve_thread_teb(uint32_t tid)
+{
+	if (tid == 0)
+		return 0;
+	struct teb_basic_t {
+		long      exit_status;
+		void*     teb_base;
+		void*     unique_process;
+		void*     unique_thread;
+		uintptr_t affinity_mask;
+		long      priority;
+		long      base_priority;
+	};
+	teb_basic_t tbi{};
+	uint32_t returned = 0;
+	if (!driver_bridge::query_thread_information(tid, 0, &tbi, sizeof(tbi), &returned))
+		return 0;
+	return reinterpret_cast<uint64_t>(tbi.teb_base);
+}
+
 inline void refresh()
 {
 	work_queue::post([]() {
@@ -48,7 +72,7 @@ inline void refresh()
 		auto modules = driver_bridge::enumerate_modules();
 		auto regs = debugger_engine::get_registers();
 
-		uint64_t teb_addr = regs.gs;
+		uint64_t teb_addr = resolve_thread_teb(debugger_engine::g_state.active_tid);
 		uint64_t nt_tib_seh = 0;
 		bool found_seh = false;
 

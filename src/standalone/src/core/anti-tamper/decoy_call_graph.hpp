@@ -1,11 +1,19 @@
 #pragma once
 
 #include <windows.h>
+#include <bcrypt.h>
+#include <wininet.h>
 #include <intrin.h>
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 #include "virtualizer.hpp"
+#include "state.hpp"
+
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "wininet.lib")
 
 namespace anti_tamper::virtualizer::detail {
 }
@@ -81,15 +89,216 @@ namespace anti_tamper::decoy {
     };
 
 
+    namespace work {
+
+        constexpr uint32_t kDecoyCount = 32;
+
+        struct decoy_crc_state_t
+        {
+            std::atomic<uint64_t> baseline{0};
+            std::atomic<bool>     captured{false};
+        };
+
+        inline decoy_crc_state_t& crc_state(uint32_t id)
+        {
+            static decoy_crc_state_t s[kDecoyCount];
+            return s[id % kDecoyCount];
+        }
+
+        inline thread_local uint64_t s_tls_sink_a = 0;
+        inline thread_local uint64_t s_tls_sink_b = 0;
+        inline thread_local uint8_t  s_tls_sink_buf[64] = {};
+
+        inline std::atomic<int64_t>& last_winhttp_attempt_ms()
+        {
+            static std::atomic<int64_t> v{0};
+            return v;
+        }
+
+        inline int64_t now_ms()
+        {
+            FILETIME ft;
+            GetSystemTimeAsFileTime(&ft);
+            ULARGE_INTEGER ui;
+            ui.LowPart  = ft.dwLowDateTime;
+            ui.HighPart = ft.dwHighDateTime;
+            return static_cast<int64_t>(ui.QuadPart / 10000ULL);
+        }
+
+        __forceinline uint64_t crc_compute(const void* p, size_t n)
+        {
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(p);
+            uint64_t h = 0xCBF29CE484222325ULL;
+            for (size_t i = 0; i < n; ++i)
+            {
+                h ^= b[i];
+                h *= 0x100000001B3ULL;
+            }
+            return h;
+        }
+
+        __forceinline void capture_or_check_crc(uint32_t id, const void* fn_addr,
+                                                 size_t check_len)
+        {
+            decoy_crc_state_t& cs = crc_state(id);
+            __try {
+                uint64_t now = crc_compute(fn_addr, check_len);
+                if (!cs.captured.load(std::memory_order_acquire))
+                {
+                    cs.baseline.store(now, std::memory_order_release);
+                    cs.captured.store(true, std::memory_order_release);
+                }
+                else
+                {
+                    uint64_t base = cs.baseline.load(std::memory_order_acquire);
+                    if (base != 0 && base != now)
+                    {
+                        auto& rt = anti_tamper::state::get();
+                        if (!rt.decoy_honeypot_tripped.exchange(true))
+                        {
+                            rt.decoy_honeypot_count.fetch_add(1,
+                                std::memory_order_relaxed);
+                            rt.decoy_honeypot_trip_ms.store(now_ms(),
+                                std::memory_order_release);
+                        }
+                        else
+                        {
+                            rt.decoy_honeypot_count.fetch_add(1,
+                                std::memory_order_relaxed);
+                        }
+                    }
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
+        }
+
+        inline bool sha256(const void* data, size_t n, uint8_t out[32])
+        {
+            BCRYPT_ALG_HANDLE alg = nullptr;
+            BCRYPT_HASH_HANDLE h = nullptr;
+            bool ok = false;
+            if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
+                return false;
+            if (BCryptCreateHash(alg, &h, nullptr, 0, nullptr, 0, 0) == 0)
+            {
+                if (BCryptHashData(h, const_cast<PUCHAR>(
+                        reinterpret_cast<const uint8_t*>(data)),
+                        static_cast<ULONG>(n), 0) == 0)
+                {
+                    ok = (BCryptFinishHash(h, out, 32, 0) == 0);
+                }
+                BCryptDestroyHash(h);
+            }
+            BCryptCloseAlgorithmProvider(alg, 0);
+            return ok;
+        }
+
+        inline uint64_t real_sha256_into_sink(const void* data, size_t n)
+        {
+            uint8_t hash[32] = {};
+            if (!sha256(data, n, hash))
+            {
+                for (size_t i = 0; i < n && i < 32; ++i)
+                    hash[i] = reinterpret_cast<const uint8_t*>(data)[i];
+            }
+            uint64_t lo = 0;
+            std::memcpy(&lo, hash, 8);
+            std::memcpy(s_tls_sink_buf, hash, 32);
+            s_tls_sink_a ^= lo;
+            return lo;
+        }
+
+        inline uint64_t real_alloc_free_round(size_t bytes)
+        {
+            uint8_t* p = reinterpret_cast<uint8_t*>(
+                HeapAlloc(GetProcessHeap(), 0, bytes));
+            if (!p) return 0;
+            for (size_t i = 0; i < bytes; ++i)
+                p[i] = static_cast<uint8_t>((i * 0x9b) ^ 0xA5);
+            uint64_t h = crc_compute(p, bytes);
+            std::memcpy(s_tls_sink_buf, p, bytes < 64 ? bytes : 64);
+            s_tls_sink_b ^= h;
+            HeapFree(GetProcessHeap(), 0, p);
+            return h;
+        }
+
+        inline uint64_t real_winhttp_head_attempt()
+        {
+            int64_t now = now_ms();
+            int64_t prev = last_winhttp_attempt_ms().load(std::memory_order_acquire);
+            if (now - prev < 30000)
+                return s_tls_sink_a;
+            last_winhttp_attempt_ms().store(now, std::memory_order_release);
+
+            HINTERNET inet = InternetOpenW(L"AiDAStandalone/4.0",
+                INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr,
+                INTERNET_FLAG_NO_COOKIES | INTERNET_FLAG_NO_AUTH);
+            if (!inet) return 0;
+
+            DWORD timeout = 1;
+            InternetSetOptionW(inet, INTERNET_OPTION_CONNECT_TIMEOUT,
+                &timeout, sizeof(timeout));
+            InternetSetOptionW(inet, INTERNET_OPTION_RECEIVE_TIMEOUT,
+                &timeout, sizeof(timeout));
+            InternetSetOptionW(inet, INTERNET_OPTION_SEND_TIMEOUT,
+                &timeout, sizeof(timeout));
+
+            HINTERNET conn = InternetConnectW(inet, L"127.0.0.1",
+                INTERNET_INVALID_PORT_NUMBER, nullptr, nullptr,
+                INTERNET_SERVICE_HTTP, 0, 0);
+            uint64_t result = 0;
+            if (conn)
+            {
+                HINTERNET req = HttpOpenRequestW(conn, L"HEAD", L"/",
+                    nullptr, nullptr, nullptr,
+                    INTERNET_FLAG_NO_AUTH | INTERNET_FLAG_NO_COOKIES |
+                    INTERNET_FLAG_NO_CACHE_WRITE, 0);
+                if (req)
+                {
+                    HttpSendRequestW(req, nullptr, 0, nullptr, 0);
+                    DWORD code = 0, sz = sizeof(code);
+                    HttpQueryInfoW(req, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
+                                   &code, &sz, nullptr);
+                    result = static_cast<uint64_t>(code);
+                    s_tls_sink_a ^= result;
+                    InternetCloseHandle(req);
+                }
+                InternetCloseHandle(conn);
+            }
+            InternetCloseHandle(inet);
+            return result;
+        }
+
+        __forceinline void touch_real_globals()
+        {
+            volatile uint64_t v = anti_tamper::virtualizer::g_server_poly_seed;
+            v ^= reinterpret_cast<uintptr_t>(
+                &anti_tamper::virtualizer::detail::g_handler_pool[0]);
+            v ^= anti_tamper::virtualizer::detail::g_pool_guard;
+            s_tls_sink_a ^= v;
+        }
+    }
+
+
     __declspec(noinline) static uint64_t __cdecl decoy_validate_signature(
         const uint8_t* data, size_t len, uint64_t expected_sig)
     {
+        work::capture_or_check_crc(0,
+            reinterpret_cast<const void*>(&decoy_validate_signature), 32);
+        if (data && len > 0)
+        {
+            uint8_t hash[32] = {};
+            work::sha256(data, len < 4096 ? len : 4096, hash);
+            std::memcpy(work::s_tls_sink_buf, hash, 32);
+        }
         if (!data || len == 0) return 0;
         uint64_t h = 14695981039346656037ULL;
         for (size_t i = 0; i < len && i < 64; ++i) {
             h ^= data[i];
             h *= 1099511628211ULL;
         }
+        work::s_tls_sink_a ^= h;
         volatile uint64_t check = h ^ expected_sig;
         if (opaque_false(__rdtsc()))
             return check;
@@ -99,7 +308,17 @@ namespace anti_tamper::decoy {
     __declspec(noinline) static bool __cdecl decoy_verify_certificate(
         const void* cert_data, uint32_t cert_len)
     {
-        (void)cert_data; (void)cert_len;
+        work::capture_or_check_crc(1,
+            reinterpret_cast<const void*>(&decoy_verify_certificate), 32);
+        uint8_t hash[32] = {};
+        if (cert_data && cert_len > 0)
+            work::sha256(cert_data, cert_len < 1024 ? cert_len : 1024, hash);
+        else
+            work::sha256(work::s_tls_sink_buf, sizeof(work::s_tls_sink_buf), hash);
+        uint64_t lo = 0;
+        std::memcpy(&lo, hash, 8);
+        work::s_tls_sink_a ^= lo;
+        work::touch_real_globals();
         volatile uint64_t dummy = g_decoy_keys[__rdtsc() % 12];
         if (opaque_false(dummy))
             return false;
@@ -108,11 +327,21 @@ namespace anti_tamper::decoy {
 
     __declspec(noinline) static int __cdecl decoy_check_hardware_binding()
     {
+        work::capture_or_check_crc(2,
+            reinterpret_cast<const void*>(&decoy_check_hardware_binding), 32);
         int cpuid_buf[4] = {};
         __cpuid(cpuid_buf, 0);
+        uint64_t bytes_blob[4];
+        std::memcpy(bytes_blob, cpuid_buf, sizeof(cpuid_buf));
+        bytes_blob[2] = __rdtsc();
+        bytes_blob[3] = static_cast<uint64_t>(GetCurrentProcessId());
+        uint8_t hash[32] = {};
+        work::sha256(bytes_blob, sizeof(bytes_blob), hash);
+        std::memcpy(work::s_tls_sink_buf, hash, 32);
         volatile uint64_t h = static_cast<uint64_t>(cpuid_buf[0]) ^
                               static_cast<uint64_t>(cpuid_buf[1]) ^
                               static_cast<uint64_t>(cpuid_buf[2]);
+        work::s_tls_sink_a ^= h;
         if (opaque_false(h))
             return -1;
         return 1;
@@ -121,11 +350,20 @@ namespace anti_tamper::decoy {
     __declspec(noinline) static uint64_t __cdecl decoy_derive_session_key(
         uint64_t master_key, uint64_t nonce)
     {
+        work::capture_or_check_crc(3,
+            reinterpret_cast<const void*>(&decoy_derive_session_key), 32);
+        uint8_t blob[16];
+        std::memcpy(blob, &master_key, 8);
+        std::memcpy(blob + 8, &nonce, 8);
+        uint8_t hash[32] = {};
+        work::sha256(blob, sizeof(blob), hash);
+        std::memcpy(work::s_tls_sink_buf, hash, 32);
         volatile uint64_t k = master_key;
         k ^= nonce;
         k = _rotl64(k, 13) ^ (k >> 27);
         k *= 0xBF58476D1CE4E5B9ULL;
         k ^= k >> 31;
+        work::s_tls_sink_b ^= k;
         if (opaque_false(k))
             k = 0;
         return k;
@@ -133,6 +371,10 @@ namespace anti_tamper::decoy {
 
     __declspec(noinline) static bool __cdecl decoy_online_heartbeat_check()
     {
+        work::capture_or_check_crc(4,
+            reinterpret_cast<const void*>(&decoy_online_heartbeat_check), 32);
+        uint64_t code = work::real_winhttp_head_attempt();
+        work::s_tls_sink_a ^= code;
         volatile auto* str = g_decoy_strings[__rdtsc() % 16];
         (void)str;
         if (opaque_false(__rdtsc()))
@@ -143,6 +385,10 @@ namespace anti_tamper::decoy {
     __declspec(noinline) static int __cdecl decoy_decrypt_feature_flags(
         uint64_t encrypted_flags, uint64_t key)
     {
+        work::capture_or_check_crc(5,
+            reinterpret_cast<const void*>(&decoy_decrypt_feature_flags), 32);
+        uint64_t alloc_h = work::real_alloc_free_round(64);
+        work::s_tls_sink_a ^= alloc_h;
         volatile uint64_t flags = encrypted_flags ^ key;
         flags = _rotr64(flags, 7);
         if (opaque_false(flags))
@@ -153,7 +399,18 @@ namespace anti_tamper::decoy {
     __declspec(noinline) static bool __cdecl decoy_verify_import_table(
         uintptr_t module_base)
     {
-        (void)module_base;
+        work::capture_or_check_crc(6,
+            reinterpret_cast<const void*>(&decoy_verify_import_table), 32);
+        if (module_base != 0)
+        {
+            uint8_t hash[32] = {};
+            __try {
+                work::sha256(reinterpret_cast<const void*>(module_base), 256, hash);
+                std::memcpy(work::s_tls_sink_buf, hash, 32);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
+        }
+        work::touch_real_globals();
         volatile uint64_t check = g_decoy_keys[3] ^ g_decoy_keys[7];
         if (opaque_false(check))
             return false;
@@ -163,10 +420,19 @@ namespace anti_tamper::decoy {
     __declspec(noinline) static uint64_t __cdecl decoy_compute_integrity_hash(
         uintptr_t base, size_t size)
     {
+        work::capture_or_check_crc(7,
+            reinterpret_cast<const void*>(&decoy_compute_integrity_hash), 32);
+        uint8_t local_blob[64];
+        for (int i = 0; i < 64; ++i)
+            local_blob[i] = static_cast<uint8_t>((g_decoy_keys[i % 12] >> ((i & 7) * 8)) & 0xFF);
+        uint8_t hash[32] = {};
+        work::sha256(local_blob, sizeof(local_blob), hash);
+        std::memcpy(work::s_tls_sink_buf, hash, 32);
         (void)base; (void)size;
         volatile uint64_t h = 0xCBF29CE484222325ULL;
         for (int i = 0; i < 12; ++i)
             h ^= g_decoy_keys[i];
+        work::s_tls_sink_a ^= h;
         if (opaque_false(h))
             return 0;
         return h;
@@ -186,9 +452,18 @@ namespace anti_tamper::decoy {
     __declspec(noinline) static uint64_t __cdecl decoy_derive_page_key(
         uint32_t page_idx, uint64_t master)
     {
+        work::capture_or_check_crc(9,
+            reinterpret_cast<const void*>(&decoy_derive_page_key), 32);
+        uint8_t blob[12];
+        std::memcpy(blob, &page_idx, 4);
+        std::memcpy(blob + 4, &master, 8);
+        uint8_t hash[32] = {};
+        work::sha256(blob, sizeof(blob), hash);
+        std::memcpy(work::s_tls_sink_buf, hash, 32);
         volatile uint64_t k = master ^ (static_cast<uint64_t>(page_idx) * 0x9E3779B97F4A7C15ULL);
         k = _rotr64(k, 11) * 0xBF58476D1CE4E5B9ULL;
         k ^= k >> 31;
+        work::s_tls_sink_a ^= k;
         if (opaque_false(k))
             return 0;
         return k;
@@ -207,8 +482,17 @@ namespace anti_tamper::decoy {
     __declspec(noinline) static bool __cdecl decoy_verify_driver_proof(
         uint64_t driver_proof, uint64_t expected)
     {
+        work::capture_or_check_crc(11,
+            reinterpret_cast<const void*>(&decoy_verify_driver_proof), 32);
+        uint8_t blob[16];
+        std::memcpy(blob, &driver_proof, 8);
+        std::memcpy(blob + 8, &expected, 8);
+        uint8_t hash[32] = {};
+        work::sha256(blob, sizeof(blob), hash);
+        std::memcpy(work::s_tls_sink_buf, hash, 32);
         volatile uint64_t diff = driver_proof ^ expected;
         diff = _rotr64(diff, 23) ^ (diff >> 17);
+        work::s_tls_sink_a ^= diff;
         if (opaque_false(diff))
             return false;
         return diff == 0 || opaque_true(__rdtsc());
@@ -217,9 +501,20 @@ namespace anti_tamper::decoy {
     __declspec(noinline) static uint64_t __cdecl decoy_compute_code_hash(
         const void* code, size_t len, uint64_t seed)
     {
-        (void)code; (void)len;
+        work::capture_or_check_crc(12,
+            reinterpret_cast<const void*>(&decoy_compute_code_hash), 32);
+        if (code && len > 0)
+        {
+            uint8_t hash[32] = {};
+            __try {
+                work::sha256(code, len < 4096 ? len : 4096, hash);
+                std::memcpy(work::s_tls_sink_buf, hash, 32);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
+        }
         volatile uint64_t h = seed ^ 0x6C62272E07BB0142ULL;
         h ^= _rotl64(h, 13) * 0xBF58476D1CE4E5B9ULL;
+        work::s_tls_sink_a ^= h;
         if (opaque_false(h))
             return 0;
         return h;
@@ -239,9 +534,20 @@ namespace anti_tamper::decoy {
     __declspec(noinline) static uint64_t __cdecl decoy_siphash_finalize(
         uint64_t v0, uint64_t v1, uint64_t v2, uint64_t v3)
     {
+        work::capture_or_check_crc(14,
+            reinterpret_cast<const void*>(&decoy_siphash_finalize), 32);
+        uint8_t blob[32];
+        std::memcpy(blob, &v0, 8);
+        std::memcpy(blob + 8, &v1, 8);
+        std::memcpy(blob + 16, &v2, 8);
+        std::memcpy(blob + 24, &v3, 8);
+        uint8_t hash[32] = {};
+        work::sha256(blob, sizeof(blob), hash);
+        std::memcpy(work::s_tls_sink_buf, hash, 32);
         volatile uint64_t r = v0 ^ v1 ^ v2 ^ v3;
         r = _rotl64(r, 32) ^ (r >> 16);
         r *= 0x100000001B3ULL;
+        work::s_tls_sink_a ^= r;
         if (opaque_false(r))
             return 0;
         return r;
@@ -258,6 +564,10 @@ namespace anti_tamper::decoy {
 
     __declspec(noinline) static int __cdecl decoy_anti_sandbox_env()
     {
+        work::capture_or_check_crc(16,
+            reinterpret_cast<const void*>(&decoy_anti_sandbox_env), 32);
+        uint64_t alloc_h = work::real_alloc_free_round(128);
+        work::s_tls_sink_b ^= alloc_h;
         volatile int score = 0;
         int cpuid_buf[4] = {};
         __cpuid(cpuid_buf, 0x80000001);
@@ -305,10 +615,20 @@ namespace anti_tamper::decoy {
     __declspec(noinline) static uint64_t __cdecl decoy_blake2b_compress(
         uint64_t h0, uint64_t h1, uint64_t t0)
     {
+        work::capture_or_check_crc(20,
+            reinterpret_cast<const void*>(&decoy_blake2b_compress), 32);
+        uint8_t blob[24];
+        std::memcpy(blob, &h0, 8);
+        std::memcpy(blob + 8, &h1, 8);
+        std::memcpy(blob + 16, &t0, 8);
+        uint8_t hash[32] = {};
+        work::sha256(blob, sizeof(blob), hash);
+        std::memcpy(work::s_tls_sink_buf, hash, 32);
         volatile uint64_t v = h0 ^ h1 ^ t0;
         v = _rotr64(v, 32) ^ _rotl64(v, 24);
         v *= 0xBF58476D1CE4E5B9ULL;
         v ^= v >> 31;
+        work::s_tls_sink_a ^= v;
         if (opaque_false(v))
             return 0;
         return v;
@@ -328,6 +648,10 @@ namespace anti_tamper::decoy {
     __declspec(noinline) static int __cdecl decoy_memory_scan_pattern(
         uintptr_t start, size_t len, const uint8_t* pattern, size_t pat_len)
     {
+        work::capture_or_check_crc(22,
+            reinterpret_cast<const void*>(&decoy_memory_scan_pattern), 32);
+        uint64_t alloc_h = work::real_alloc_free_round(256);
+        work::s_tls_sink_b ^= alloc_h;
         (void)start; (void)len; (void)pattern; (void)pat_len;
         volatile int found = 0;
         volatile uint64_t h = g_decoy_keys[10] ^ __rdtsc();
@@ -340,12 +664,16 @@ namespace anti_tamper::decoy {
     __declspec(noinline) static void __cdecl decoy_xref_vm_pool_verify(
         uint64_t session_key, uint32_t expected_slots)
     {
+        work::capture_or_check_crc(23,
+            reinterpret_cast<const void*>(&decoy_xref_vm_pool_verify), 32);
+        work::touch_real_globals();
         volatile uint64_t pool_addr = reinterpret_cast<uintptr_t>(
             &anti_tamper::virtualizer::detail::g_handler_pool[0]);
         volatile uint64_t guard = anti_tamper::virtualizer::detail::g_pool_guard;
         volatile uint64_t mix = pool_addr ^ guard ^ session_key;
         mix = _rotl64(mix, 13) * 0xFF51AFD7ED558CCDULL;
         mix ^= static_cast<uint64_t>(expected_slots);
+        work::s_tls_sink_a ^= mix;
         if (opaque_false(mix)) {
             volatile uint32_t slots = anti_tamper::virtualizer::detail::g_active_slots;
             (void)slots;
@@ -381,11 +709,21 @@ namespace anti_tamper::decoy {
     __declspec(noinline) static uint64_t __cdecl decoy_xref_call_table_probe(
         uint32_t slot_index, uint64_t salt)
     {
+        work::capture_or_check_crc(26,
+            reinterpret_cast<const void*>(&decoy_xref_call_table_probe), 32);
         volatile uintptr_t call_tbl = reinterpret_cast<uintptr_t>(
             &anti_tamper::call_obfuscation::detail::g_table[slot_index % 64]);
+        uint8_t blob[16];
+        uintptr_t addr = call_tbl;
+        std::memcpy(blob, &addr, sizeof(addr));
+        std::memcpy(blob + 8, &salt, 8);
+        uint8_t hash[32] = {};
+        work::sha256(blob, sizeof(blob), hash);
+        std::memcpy(work::s_tls_sink_buf, hash, 32);
         volatile uint64_t h = call_tbl ^ salt;
         h *= 0x94D049BB133111EBULL;
         h ^= h >> 31;
+        work::s_tls_sink_a ^= h;
         if (opaque_false(h))
             return 0;
         return h;

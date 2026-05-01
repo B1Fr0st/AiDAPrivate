@@ -145,32 +145,32 @@ static std::string lua_json_beautify(const std::string& input) {
 }
 
 static bool lua_regex_match(const std::string& text, const std::string& pattern) {
-
-
-    try {
-        sol::state_view lua(*g_lua);
-        auto result = lua["string"]["match"](text, pattern);
-        return result.valid() && result.get_type() != sol::type::lua_nil;
-    } catch (...) {
-        return false;
-    }
+    if (!g_lua) return false;
+    sol::state_view lua(*g_lua);
+    sol::protected_function match_fn = lua["string"]["match"];
+    if (!match_fn.valid()) return false;
+    sol::protected_function_result result = match_fn(text, pattern);
+    if (!result.valid()) return false;
+    return result.get_type() != sol::type::lua_nil;
 }
 
 static sol::table lua_regex_find(const std::string& text, const std::string& pattern) {
     sol::state_view lua(*g_lua);
     sol::table results = lua.create_table();
-    try {
-
-        auto gmatch = lua["string"]["gmatch"];
-        sol::protected_function iter = gmatch(text, pattern);
-        int idx = 1;
-        while (true) {
-            sol::protected_function_result match_result = iter();
-            if (!match_result.valid() || match_result.get_type() == sol::type::lua_nil) break;
-            results[idx++] = match_result.get<std::string>();
-        }
-    } catch (...) {
-
+    sol::protected_function gmatch_fn = lua["string"]["gmatch"];
+    if (!gmatch_fn.valid()) return results;
+    sol::protected_function_result gmatch_result = gmatch_fn(text, pattern);
+    if (!gmatch_result.valid()) return results;
+    if (gmatch_result.get_type() != sol::type::function) return results;
+    sol::protected_function iter = gmatch_result;
+    int idx = 1;
+    while (true) {
+        sol::protected_function_result match_result = iter();
+        if (!match_result.valid()) break;
+        if (match_result.get_type() == sol::type::lua_nil) break;
+        sol::optional<std::string> captured = match_result;
+        if (!captured) break;
+        results[idx++] = *captured;
     }
     return results;
 }
@@ -626,10 +626,20 @@ bool load_script(const std::string& path) {
     std::filesystem::path p(path);
     std::string name = p.stem().string();
 
-
-    if (g_scripts.count(name)) {
-
-
+    auto existing_it = g_scripts.find(name);
+    if (existing_it != g_scripts.end()) {
+        g_scripts.erase(existing_it);
+        (*g_lua)["_hooks"] = g_lua->create_table();
+        for (auto& [sname, sinfo] : g_scripts) {
+            if (!sinfo.enabled || !sinfo.loaded) continue;
+            auto rebind = g_lua->safe_script(sinfo.source, sol::script_pass_on_error);
+            if (!rebind.valid()) {
+                sol::error rerr = rebind;
+                sinfo.last_error = rerr.what();
+                sinfo.loaded = false;
+            }
+        }
+        add_log(name, "info", "Reloading existing script");
     }
 
     script_info info;
@@ -787,24 +797,21 @@ static bool invoke_hook_impl(hook_type type, T& data) {
         return false;
 
     sol::table hook_list = hook_list_obj.as<sol::table>();
-    bool any_modified = false;
 
     for (auto& [idx, fn_obj] : hook_list) {
         if (fn_obj.get_type() != sol::type::function) continue;
-        sol::function fn = fn_obj.as<sol::function>();
-
+        sol::protected_function fn = fn_obj.as<sol::protected_function>();
+        if (!fn.valid()) continue;
 
         current_script_context = hook_name;
 
-        auto result = fn(std::ref(data));
+        sol::protected_function_result result = fn(std::ref(data));
         if (!result.valid()) {
             sol::error err = result;
             add_log(hook_name, "error", "Hook error: " + std::string(err.what()));
         }
     }
 
-
-    (void)any_modified;
     return true;
 }
 
@@ -829,18 +836,22 @@ std::string execute(const std::string& code) {
     }
 
 
-    if (result.get_type() != sol::type::lua_nil) {
-        try {
-            sol::object obj = result;
-            if (obj.is<std::string>()) return obj.as<std::string>();
-            if (obj.is<double>()) return std::to_string(obj.as<double>());
-            if (obj.is<bool>()) return obj.as<bool>() ? "true" : "false";
-            return "[" + std::string(sol::type_name(g_lua->lua_state(), obj.get_type())) + "]";
-        } catch (...) {
-            return "[ok]";
-        }
+    sol::type rt = result.get_type();
+    if (rt == sol::type::lua_nil) return "";
+    sol::object obj = result;
+    if (rt == sol::type::string) {
+        sol::optional<std::string> s = obj.as<sol::optional<std::string>>();
+        if (s) return *s;
     }
-    return "";
+    if (rt == sol::type::number) {
+        sol::optional<double> d = obj.as<sol::optional<double>>();
+        if (d) return std::to_string(*d);
+    }
+    if (rt == sol::type::boolean) {
+        sol::optional<bool> b = obj.as<sol::optional<bool>>();
+        if (b) return *b ? "true" : "false";
+    }
+    return std::string("[") + sol::type_name(g_lua->lua_state(), rt) + "]";
 }
 
 

@@ -383,6 +383,29 @@ inline void aes256_ctr(const uint8_t key[32], const uint8_t iv[16],
     }
 }
 
+inline void aes128_ctr(const uint8_t key[16], const uint8_t iv[16],
+                        const uint8_t* in, uint8_t* out, size_t len) {
+    uint32_t rk[44];
+    key_expansion(key, 4, 10, rk);
+    uint8_t counter[16];
+    std::memcpy(counter, iv, 16);
+    uint8_t ks[16];
+    size_t off = 0;
+    while (off < len) {
+        encrypt_block(counter, ks, rk, 10);
+        for (int i = 15; i >= 0; --i) {
+            if (++counter[i] != 0) {
+                break;
+            }
+        }
+        size_t bl = (std::min)(static_cast<size_t>(16), len - off);
+        for (size_t i = 0; i < bl; ++i) {
+            out[off + i] = static_cast<uint8_t>(in[off + i] ^ ks[i]);
+        }
+        off += bl;
+    }
+}
+
 inline void compute_inner_master(const uint8_t outer[32], uint8_t inner[32]) {
     uint32_t crc = crc32c(outer, 32);
     uint8_t key16[16];
@@ -400,6 +423,234 @@ inline void compute_inner_master(const uint8_t outer[32], uint8_t inner[32]) {
         inner[4 * i + 2] = static_cast<uint8_t>((rk[i] >> 8) & 0xFFu);
         inner[4 * i + 3] = static_cast<uint8_t>(rk[i] & 0xFFu);
     }
+}
+
+struct wbaes_table_t {
+    uint8_t  t_boxes[10][16][256];
+    uint32_t mb_tables[9][16][256];
+    uint8_t  ext_in[16];
+    uint8_t  ext_out[16];
+};
+
+inline uint32_t wbaes_mc_word_for_row(uint8_t v, int row) {
+    uint8_t b2 = gf_mul2(v);
+    uint8_t b3 = gf_mul3(v);
+    uint8_t r0, r1, r2, r3;
+    if (row == 0) { r0 = b2; r1 = v;  r2 = v;  r3 = b3; }
+    else if (row == 1) { r0 = b3; r1 = b2; r2 = v;  r3 = v;  }
+    else if (row == 2) { r0 = v;  r1 = b3; r2 = b2; r3 = v;  }
+    else               { r0 = v;  r1 = v;  r2 = b3; r3 = b2; }
+    return (static_cast<uint32_t>(r0) << 24) |
+           (static_cast<uint32_t>(r1) << 16) |
+           (static_cast<uint32_t>(r2) << 8) |
+            static_cast<uint32_t>(r3);
+}
+
+inline int wbaes_sr_source_col(int target_col, int row) {
+    return (target_col + row) & 3;
+}
+
+inline int wbaes_sr_source_index(int target_col, int row) {
+    return wbaes_sr_source_col(target_col, row) * 4 + row;
+}
+
+inline void wbaes_emit_random(const uint8_t key[16], uint64_t seed, uint64_t counter,
+                               uint8_t* out, size_t n) {
+    static const uint8_t k_label[14] = { 'A','i','D','A','-','W','B','A','E','S','-','G','E','N' };
+    static const uint8_t k_seed_label[18] = { 'A','i','D','A','-','W','B','A','E','S','-','S','E','E','D','-','V','1' };
+    size_t produced = 0;
+    uint64_t local_counter = counter;
+    uint8_t prk[32];
+    uint8_t ikm[24];
+    std::memcpy(ikm, key, 16);
+    for (int j = 0; j < 8; ++j) {
+        ikm[16 + j] = static_cast<uint8_t>((seed >> (j * 8)) & 0xFFu);
+    }
+    sha256_detail::hmac_sha256(k_seed_label, sizeof(k_seed_label), ikm, sizeof(ikm), prk);
+    while (produced < n) {
+        uint8_t blk[40];
+        std::memcpy(blk, prk, 32);
+        for (int j = 0; j < 8; ++j) {
+            blk[32 + j] = static_cast<uint8_t>((local_counter >> (j * 8)) & 0xFFu);
+        }
+        uint8_t hash[32];
+        sha256_detail::hmac_sha256(k_label, sizeof(k_label), blk, sizeof(blk), hash);
+        size_t take = (n - produced > 32) ? 32 : (n - produced);
+        std::memcpy(out + produced, hash, take);
+        produced += take;
+        ++local_counter;
+        SecureZeroMemory(blk, sizeof(blk));
+        SecureZeroMemory(hash, sizeof(hash));
+    }
+    SecureZeroMemory(prk, sizeof(prk));
+    SecureZeroMemory(ikm, sizeof(ikm));
+}
+
+inline bool wbaes_generate_tables(const uint8_t key[16], uint64_t entropy_seed, wbaes_table_t& out) {
+    if (!key) return false;
+    SecureZeroMemory(&out, sizeof(out));
+
+    uint32_t round_keys[44];
+    key_expansion(key, 4, 10, round_keys);
+
+    uint8_t key_bytes[16 * 11];
+    for (int r = 0; r < 11; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            key_bytes[r * 16 + c * 4 + 0] = static_cast<uint8_t>((round_keys[r * 4 + c] >> 24) & 0xFFu);
+            key_bytes[r * 16 + c * 4 + 1] = static_cast<uint8_t>((round_keys[r * 4 + c] >> 16) & 0xFFu);
+            key_bytes[r * 16 + c * 4 + 2] = static_cast<uint8_t>((round_keys[r * 4 + c] >> 8) & 0xFFu);
+            key_bytes[r * 16 + c * 4 + 3] = static_cast<uint8_t>(round_keys[r * 4 + c] & 0xFFu);
+        }
+    }
+
+    uint8_t random_pool[16 + 16 + 16 + 9 * 4 * 4];
+    wbaes_emit_random(key, entropy_seed, 0, random_pool, sizeof(random_pool));
+
+    std::memcpy(out.ext_in, random_pool, 16);
+    std::memcpy(out.ext_out, random_pool + 16, 16);
+    uint8_t mb_masks[9][4][4];
+    std::memcpy(mb_masks, random_pool + 48, 9 * 4 * 4);
+    SecureZeroMemory(random_pool, sizeof(random_pool));
+
+    for (int r = 0; r < 10; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            for (int i = 0; i < 4; ++i) {
+                int target_col = c;
+                int row = i;
+                int src_idx = wbaes_sr_source_index(target_col, row);
+
+                uint8_t input_decode = 0;
+                if (r == 0) {
+                    input_decode = out.ext_in[src_idx];
+                } else {
+                    int src_col = wbaes_sr_source_col(target_col, row);
+                    input_decode = mb_masks[r - 1][src_col][row];
+                }
+
+                uint8_t kbyte = key_bytes[r * 16 + src_idx];
+                uint8_t out_decode = 0;
+                if (r == 9) {
+                    out_decode = static_cast<uint8_t>(key_bytes[10 * 16 + c * 4 + i] ^ out.ext_out[c * 4 + i]);
+                }
+
+                for (int b = 0; b < 256; ++b) {
+                    uint8_t input_byte = static_cast<uint8_t>(b);
+                    uint8_t after_decode = static_cast<uint8_t>(input_byte ^ input_decode);
+                    uint8_t after_key = static_cast<uint8_t>(after_decode ^ kbyte);
+                    uint8_t after_sbox = kSbox[after_key];
+                    uint8_t final_byte = static_cast<uint8_t>(after_sbox ^ out_decode);
+                    out.t_boxes[r][c * 4 + i][b] = final_byte;
+                }
+            }
+        }
+    }
+
+    for (int r = 0; r < 9; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            for (int i = 0; i < 4; ++i) {
+                for (int b = 0; b < 256; ++b) {
+                    uint8_t sbox_out = out.t_boxes[r][c * 4 + i][b];
+                    uint32_t mc_word = wbaes_mc_word_for_row(sbox_out, i);
+                    if (i == 0) {
+                        uint32_t mask_word =
+                            (static_cast<uint32_t>(mb_masks[r][c][0]) << 24) |
+                            (static_cast<uint32_t>(mb_masks[r][c][1]) << 16) |
+                            (static_cast<uint32_t>(mb_masks[r][c][2]) << 8) |
+                             static_cast<uint32_t>(mb_masks[r][c][3]);
+                        mc_word ^= mask_word;
+                    }
+                    out.mb_tables[r][c * 4 + i][b] = mc_word;
+                }
+            }
+        }
+    }
+
+    SecureZeroMemory(round_keys, sizeof(round_keys));
+    SecureZeroMemory(key_bytes, sizeof(key_bytes));
+    SecureZeroMemory(mb_masks, sizeof(mb_masks));
+    return true;
+}
+
+inline void wbaes_encrypt_block(const wbaes_table_t& tbl, const uint8_t in[16], uint8_t out[16]) {
+    uint8_t state[16];
+    for (int i = 0; i < 16; ++i) {
+        state[i] = static_cast<uint8_t>(in[i] ^ tbl.ext_in[i]);
+    }
+    for (int r = 0; r < 9; ++r) {
+        uint8_t next_state[16];
+        for (int c = 0; c < 4; ++c) {
+            uint32_t col_word = 0;
+            for (int i = 0; i < 4; ++i) {
+                int src_idx = wbaes_sr_source_index(c, i);
+                uint8_t b = state[src_idx];
+                col_word ^= tbl.mb_tables[r][c * 4 + i][b];
+            }
+            next_state[c * 4 + 0] = static_cast<uint8_t>((col_word >> 24) & 0xFFu);
+            next_state[c * 4 + 1] = static_cast<uint8_t>((col_word >> 16) & 0xFFu);
+            next_state[c * 4 + 2] = static_cast<uint8_t>((col_word >> 8) & 0xFFu);
+            next_state[c * 4 + 3] = static_cast<uint8_t>(col_word & 0xFFu);
+        }
+        std::memcpy(state, next_state, 16);
+        SecureZeroMemory(next_state, sizeof(next_state));
+    }
+    {
+        uint8_t final_state[16];
+        for (int c = 0; c < 4; ++c) {
+            for (int i = 0; i < 4; ++i) {
+                int src_idx = wbaes_sr_source_index(c, i);
+                uint8_t b = state[src_idx];
+                final_state[c * 4 + i] = tbl.t_boxes[9][c * 4 + i][b];
+            }
+        }
+        std::memcpy(state, final_state, 16);
+        SecureZeroMemory(final_state, sizeof(final_state));
+    }
+    for (int i = 0; i < 16; ++i) {
+        out[i] = static_cast<uint8_t>(state[i] ^ tbl.ext_out[i]);
+    }
+    SecureZeroMemory(state, sizeof(state));
+}
+
+inline void wbaes_encrypt_ctr(const wbaes_table_t& tbl, const uint8_t iv[16],
+                               const uint8_t* in, uint8_t* out, size_t len) {
+    uint8_t counter[16];
+    std::memcpy(counter, iv, 16);
+    uint8_t ks[16];
+    size_t off = 0;
+    while (off < len) {
+        wbaes_encrypt_block(tbl, counter, ks);
+        for (int i = 15; i >= 0; --i) {
+            if (++counter[i] != 0) break;
+        }
+        size_t bl = (std::min)(static_cast<size_t>(16), len - off);
+        for (size_t i = 0; i < bl; ++i) {
+            out[off + i] = static_cast<uint8_t>(in[off + i] ^ ks[i]);
+        }
+        off += bl;
+    }
+    SecureZeroMemory(counter, sizeof(counter));
+    SecureZeroMemory(ks, sizeof(ks));
+}
+
+inline bool wbaes_encrypt_section_buffer(const uint8_t key[16], const uint8_t iv[16],
+                                          const uint8_t* in, uint8_t* out, size_t len) {
+    if (!key || !iv) return false;
+    if (len > 0 && (!in || !out)) return false;
+
+    wbaes_table_t* tbl = static_cast<wbaes_table_t*>(
+        HeapAlloc(GetProcessHeap(), 0, sizeof(wbaes_table_t)));
+    if (!tbl) return false;
+
+    uint64_t entropy_seed = static_cast<uint64_t>(__rdtsc());
+    if (!wbaes_generate_tables(key, entropy_seed, *tbl)) {
+        SecureZeroMemory(tbl, sizeof(wbaes_table_t));
+        HeapFree(GetProcessHeap(), 0, tbl);
+        return false;
+    }
+    wbaes_encrypt_ctr(*tbl, iv, in, out, len);
+    SecureZeroMemory(tbl, sizeof(wbaes_table_t));
+    HeapFree(GetProcessHeap(), 0, tbl);
+    return true;
 }
 
 }
@@ -481,6 +732,208 @@ struct chacha20_drbg {
         }
     }
 };
+
+inline void chacha20_xor(const uint8_t key[32], const uint8_t nonce[12],
+                          const uint8_t* in, uint8_t* out, size_t len) {
+    uint32_t state[16];
+    state[0] = 0x61707865u;
+    state[1] = 0x3320646eu;
+    state[2] = 0x79622d32u;
+    state[3] = 0x6b206574u;
+    for (int i = 0; i < 8; ++i) {
+        state[4 + i] = static_cast<uint32_t>(key[4 * i]) |
+                       (static_cast<uint32_t>(key[4 * i + 1]) << 8) |
+                       (static_cast<uint32_t>(key[4 * i + 2]) << 16) |
+                       (static_cast<uint32_t>(key[4 * i + 3]) << 24);
+    }
+    state[12] = 1u;
+    for (int i = 0; i < 3; ++i) {
+        state[13 + i] = static_cast<uint32_t>(nonce[4 * i]) |
+                        (static_cast<uint32_t>(nonce[4 * i + 1]) << 8) |
+                        (static_cast<uint32_t>(nonce[4 * i + 2]) << 16) |
+                        (static_cast<uint32_t>(nonce[4 * i + 3]) << 24);
+    }
+    uint8_t ks[64];
+    size_t off = 0;
+    while (off < len) {
+        block(state, ks);
+        ++state[12];
+        size_t bl = (std::min)(static_cast<size_t>(64), len - off);
+        for (size_t i = 0; i < bl; ++i) {
+            out[off + i] = static_cast<uint8_t>(in[off + i] ^ ks[i]);
+        }
+        off += bl;
+    }
+}
+
+}
+
+namespace xtea_detail {
+
+inline void block_encrypt(const uint32_t key[4], uint32_t v[2]) {
+    uint32_t v0 = v[0];
+    uint32_t v1 = v[1];
+    uint32_t sum = 0;
+    constexpr uint32_t delta = 0x9E3779B9u;
+    for (int i = 0; i < 64; ++i) {
+        v0 += (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + key[sum & 3u]);
+        sum += delta;
+        v1 += (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + key[(sum >> 11) & 3u]);
+    }
+    v[0] = v0;
+    v[1] = v1;
+}
+
+inline void key_to_words(const uint8_t key[16], uint32_t out[4]) {
+    for (int i = 0; i < 4; ++i) {
+        out[i] = static_cast<uint32_t>(key[4 * i]) |
+                 (static_cast<uint32_t>(key[4 * i + 1]) << 8) |
+                 (static_cast<uint32_t>(key[4 * i + 2]) << 16) |
+                 (static_cast<uint32_t>(key[4 * i + 3]) << 24);
+    }
+}
+
+inline void increment_counter_le(uint8_t ctr[8]) {
+    for (int i = 0; i < 8; ++i) {
+        if (++ctr[i] != 0) {
+            break;
+        }
+    }
+}
+
+inline void counter_to_words(const uint8_t ctr[8], uint32_t out[2]) {
+    out[0] = static_cast<uint32_t>(ctr[0]) |
+             (static_cast<uint32_t>(ctr[1]) << 8) |
+             (static_cast<uint32_t>(ctr[2]) << 16) |
+             (static_cast<uint32_t>(ctr[3]) << 24);
+    out[1] = static_cast<uint32_t>(ctr[4]) |
+             (static_cast<uint32_t>(ctr[5]) << 8) |
+             (static_cast<uint32_t>(ctr[6]) << 16) |
+             (static_cast<uint32_t>(ctr[7]) << 24);
+}
+
+inline void words_to_bytes(const uint32_t v[2], uint8_t out[8]) {
+    out[0] = static_cast<uint8_t>(v[0] & 0xFFu);
+    out[1] = static_cast<uint8_t>((v[0] >> 8) & 0xFFu);
+    out[2] = static_cast<uint8_t>((v[0] >> 16) & 0xFFu);
+    out[3] = static_cast<uint8_t>((v[0] >> 24) & 0xFFu);
+    out[4] = static_cast<uint8_t>(v[1] & 0xFFu);
+    out[5] = static_cast<uint8_t>((v[1] >> 8) & 0xFFu);
+    out[6] = static_cast<uint8_t>((v[1] >> 16) & 0xFFu);
+    out[7] = static_cast<uint8_t>((v[1] >> 24) & 0xFFu);
+}
+
+}
+
+inline void xtea_ctr(const uint8_t key[16], const uint8_t iv[8],
+                      const uint8_t* in, uint8_t* out, size_t len) {
+    uint32_t kw[4];
+    xtea_detail::key_to_words(key, kw);
+    uint8_t counter[8];
+    std::memcpy(counter, iv, 8);
+    uint8_t ks[8];
+    size_t off = 0;
+    while (off < len) {
+        uint32_t cw[2];
+        xtea_detail::counter_to_words(counter, cw);
+        xtea_detail::block_encrypt(kw, cw);
+        xtea_detail::words_to_bytes(cw, ks);
+        xtea_detail::increment_counter_le(counter);
+        size_t bl = (std::min)(static_cast<size_t>(8), len - off);
+        for (size_t i = 0; i < bl; ++i) {
+            out[off + i] = static_cast<uint8_t>(in[off + i] ^ ks[i]);
+        }
+        off += bl;
+    }
+}
+
+namespace matryoshka_detail {
+
+inline void compute_hwid_anchor(uint8_t out[32]) {
+    static constexpr char kAnchor[] = "aida-build-hwid-anchor-v1";
+    sha256_detail::sha256(reinterpret_cast<const uint8_t*>(kAnchor),
+                           sizeof(kAnchor) - 1u, out);
+}
+
+inline void compute_tpm_anchor(uint8_t out[32]) {
+    static constexpr char kAnchor[] = "aida-build-tpm-anchor-v1";
+    sha256_detail::sha256(reinterpret_cast<const uint8_t*>(kAnchor),
+                           sizeof(kAnchor) - 1u, out);
+}
+
+inline void compute_server_anchor(uint8_t out[32]) {
+    static constexpr char kAnchor[] = "aida-build-srv-heartbeat-anchor-v1";
+    sha256_detail::sha256(reinterpret_cast<const uint8_t*>(kAnchor),
+                           sizeof(kAnchor) - 1u, out);
+}
+
+inline void derive_layer1_key(const uint8_t hwid[32], const uint8_t build_seed[32],
+                               uint32_t section_rva, uint32_t section_index,
+                               uint8_t out_key[16]) {
+    uint8_t ikm[64];
+    std::memcpy(ikm, hwid, 32);
+    std::memcpy(ikm + 32, build_seed, 32);
+    uint8_t info[64];
+    static constexpr char kInfo[] = "matryoshka-l1-hwid";
+    std::memcpy(info, kInfo, sizeof(kInfo) - 1u);
+    size_t info_len = sizeof(kInfo) - 1u;
+    info[info_len + 0] = static_cast<uint8_t>(section_rva & 0xFFu);
+    info[info_len + 1] = static_cast<uint8_t>((section_rva >> 8) & 0xFFu);
+    info[info_len + 2] = static_cast<uint8_t>((section_rva >> 16) & 0xFFu);
+    info[info_len + 3] = static_cast<uint8_t>((section_rva >> 24) & 0xFFu);
+    info[info_len + 4] = static_cast<uint8_t>(section_index & 0xFFu);
+    info[info_len + 5] = static_cast<uint8_t>((section_index >> 8) & 0xFFu);
+    info[info_len + 6] = static_cast<uint8_t>((section_index >> 16) & 0xFFu);
+    info[info_len + 7] = static_cast<uint8_t>((section_index >> 24) & 0xFFu);
+    sha256_detail::hkdf_sha256(ikm, 64, nullptr, 0, info, info_len + 8u, out_key, 16);
+}
+
+inline void derive_layer2_key(const uint8_t tpm[32], const uint8_t build_seed[32],
+                               uint32_t section_rva, uint32_t section_index,
+                               uint8_t out_key[32]) {
+    uint8_t ikm[64];
+    std::memcpy(ikm, tpm, 32);
+    std::memcpy(ikm + 32, build_seed, 32);
+    uint8_t info[64];
+    static constexpr char kInfo[] = "matryoshka-l2-tpm";
+    std::memcpy(info, kInfo, sizeof(kInfo) - 1u);
+    size_t info_len = sizeof(kInfo) - 1u;
+    info[info_len + 0] = static_cast<uint8_t>(section_rva & 0xFFu);
+    info[info_len + 1] = static_cast<uint8_t>((section_rva >> 8) & 0xFFu);
+    info[info_len + 2] = static_cast<uint8_t>((section_rva >> 16) & 0xFFu);
+    info[info_len + 3] = static_cast<uint8_t>((section_rva >> 24) & 0xFFu);
+    info[info_len + 4] = static_cast<uint8_t>(section_index & 0xFFu);
+    info[info_len + 5] = static_cast<uint8_t>((section_index >> 8) & 0xFFu);
+    info[info_len + 6] = static_cast<uint8_t>((section_index >> 16) & 0xFFu);
+    info[info_len + 7] = static_cast<uint8_t>((section_index >> 24) & 0xFFu);
+    sha256_detail::hkdf_sha256(ikm, 64, nullptr, 0, info, info_len + 8u, out_key, 32);
+}
+
+inline void derive_layer3_key(const uint8_t srv[32], const uint8_t build_seed[32],
+                               uint32_t section_rva, uint32_t section_index,
+                               uint8_t out_key[16]) {
+    uint8_t ikm[64];
+    std::memcpy(ikm, srv, 32);
+    std::memcpy(ikm + 32, build_seed, 32);
+    uint8_t info[64];
+    static constexpr char kInfo[] = "matryoshka-l3-srv";
+    std::memcpy(info, kInfo, sizeof(kInfo) - 1u);
+    size_t info_len = sizeof(kInfo) - 1u;
+    info[info_len + 0] = static_cast<uint8_t>(section_rva & 0xFFu);
+    info[info_len + 1] = static_cast<uint8_t>((section_rva >> 8) & 0xFFu);
+    info[info_len + 2] = static_cast<uint8_t>((section_rva >> 16) & 0xFFu);
+    info[info_len + 3] = static_cast<uint8_t>((section_rva >> 24) & 0xFFu);
+    info[info_len + 4] = static_cast<uint8_t>(section_index & 0xFFu);
+    info[info_len + 5] = static_cast<uint8_t>((section_index >> 8) & 0xFFu);
+    info[info_len + 6] = static_cast<uint8_t>((section_index >> 16) & 0xFFu);
+    info[info_len + 7] = static_cast<uint8_t>((section_index >> 24) & 0xFFu);
+    sha256_detail::hkdf_sha256(ikm, 64, nullptr, 0, info, info_len + 8u, out_key, 16);
+}
+
+inline void derive_build_seed_from_master(const uint8_t master[32], uint8_t out[32]) {
+    uint8_t info[] = { 'a','i','d','a','-','m','a','t','r','y','o','s','h','k','a','-','b','u','i','l','d','-','s','e','e','d','-','v','1' };
+    sha256_detail::hkdf_sha256(master, 32, nullptr, 0, info, sizeof(info), out, 32);
+}
 
 }
 
@@ -825,12 +1278,17 @@ struct section_descriptor_t {
     uint32_t encrypted_size;
     uint32_t original_crc32;
     uint32_t reserved;
+    uint8_t  layer1_iv[16];
+    uint8_t  layer2_nonce[12];
+    uint8_t  layer3_iv[8];
+    uint32_t layers_applied;
 };
 
-static_assert(sizeof(section_descriptor_t) == 32, "section_descriptor_t must be 32 bytes");
+static_assert(sizeof(section_descriptor_t) == 72, "section_descriptor_t must be 72 bytes");
 
 constexpr uint32_t kPackedMagic    = 0x41504B44u;
-constexpr uint32_t kPackedVersion  = 0x00020000u;
+constexpr uint32_t kPackedVersion  = 0x00030000u;
+constexpr uint32_t kPackedVersionLegacy = 0x00020000u;
 
 constexpr uint16_t kImportFlagByOrdinal   = 0x1u;
 constexpr uint16_t kImportFlagDelayLoaded = 0x2u;
@@ -873,6 +1331,10 @@ struct packed_section_blob_t {
     uint32_t compressed_size;
     uint32_t encrypted_size;
     uint32_t original_crc32;
+    uint8_t  layer1_iv[16];
+    uint8_t  layer2_nonce[12];
+    uint8_t  layer3_iv[8];
+    uint32_t layers_applied;
     std::vector<uint8_t> data;
 };
 
@@ -935,7 +1397,7 @@ struct transform_result_t {
     resource_fixup_table_t resources;
 };
 
-constexpr uint32_t kReservedMainStubSize = 0x6000u;
+constexpr uint32_t kReservedMainStubSize = 0xC000u;
 constexpr uint32_t kReservedTlsStubSize = 0x200u;
 
 struct protect_options_t {
@@ -965,6 +1427,7 @@ struct protect_options_t {
     bool jit = false;
     uint32_t tamper_response_level = 0;
     uint8_t  license_hash[16] = {0};
+    uint32_t matryoshka_layers = 3u;
 };
 
 struct section_skip_list {
@@ -1817,11 +2280,21 @@ inline std::vector<packed_section_blob_t> pack_sections(pe_file::pe_image_t& pe,
                                                          const uint8_t master[32],
                                                          uint32_t exception_rva,
                                                          uint32_t exception_size,
-                                                         const std::vector<uint32_t>& keep_intact_section_rvas) {
+                                                         const std::vector<uint32_t>& keep_intact_section_rvas,
+                                                         uint32_t matryoshka_layers) {
     std::vector<packed_section_blob_t> blobs;
 
     uint32_t reloc_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].rva;
     uint32_t rsrc_rva  = pe.data_directories[IMAGE_DIRECTORY_ENTRY_RESOURCE].rva;
+
+    uint8_t hwid_anchor[32];
+    uint8_t tpm_anchor[32];
+    uint8_t srv_anchor[32];
+    uint8_t build_seed[32];
+    matryoshka_detail::compute_hwid_anchor(hwid_anchor);
+    matryoshka_detail::compute_tpm_anchor(tpm_anchor);
+    matryoshka_detail::compute_server_anchor(srv_anchor);
+    matryoshka_detail::derive_build_seed_from_master(master, build_seed);
 
     for (uint32_t i = 0; i < static_cast<uint32_t>(pe.sections.size()); ++i) {
         auto& sec = pe.sections[i];
@@ -1857,22 +2330,61 @@ inline std::vector<packed_section_blob_t> pack_sections(pe_file::pe_image_t& pe,
             continue;
         }
 
-        uint8_t section_key[32];
-        uint8_t iv[16];
-        derive_section_key(master, sec.virtual_address, i, section_key, iv);
-
-        std::vector<uint8_t> encrypted(compressed.size());
-        aes_detail::aes256_ctr(section_key, iv, compressed.data(), encrypted.data(), compressed.size());
-
         packed_section_blob_t pb{};
         pb.original_rva = sec.virtual_address;
         pb.original_virtual_size = sec.virtual_size;
         pb.original_characteristics = sec.characteristics;
         pb.section_index = i;
         pb.compressed_size = static_cast<uint32_t>(compressed.size());
-        pb.encrypted_size = static_cast<uint32_t>(encrypted.size());
         pb.original_crc32 = plain_crc;
-        pb.data = std::move(encrypted);
+
+        uint32_t applied = (matryoshka_layers >= 3u) ? 3u : 1u;
+        pb.layers_applied = applied;
+
+        if (applied >= 3u) {
+            uint8_t l1_key[16];
+            uint8_t l2_key[32];
+            uint8_t l3_key[16];
+            matryoshka_detail::derive_layer1_key(hwid_anchor, build_seed, sec.virtual_address, i, l1_key);
+            matryoshka_detail::derive_layer2_key(tpm_anchor, build_seed, sec.virtual_address, i, l2_key);
+            matryoshka_detail::derive_layer3_key(srv_anchor, build_seed, sec.virtual_address, i, l3_key);
+
+            uint8_t l1_iv[16] = {0};
+            uint8_t l2_nonce[12] = {0};
+            uint8_t l3_iv[8] = {0};
+            BCryptGenRandom(nullptr, l1_iv, 16, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            BCryptGenRandom(nullptr, l2_nonce, 12, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            BCryptGenRandom(nullptr, l3_iv, 8, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            std::memcpy(pb.layer1_iv, l1_iv, 16);
+            std::memcpy(pb.layer2_nonce, l2_nonce, 12);
+            std::memcpy(pb.layer3_iv, l3_iv, 8);
+
+            std::vector<uint8_t> layer1(compressed.size());
+            aes_detail::aes128_ctr(l1_key, l1_iv, compressed.data(), layer1.data(), compressed.size());
+
+            std::vector<uint8_t> layer2(layer1.size());
+            chacha_detail::chacha20_xor(l2_key, l2_nonce, layer1.data(), layer2.data(), layer1.size());
+
+            std::vector<uint8_t> layer3(layer2.size());
+            xtea_ctr(l3_key, l3_iv, layer2.data(), layer3.data(), layer2.size());
+
+            pb.encrypted_size = static_cast<uint32_t>(layer3.size());
+            pb.data = std::move(layer3);
+        } else {
+            uint8_t section_key[32];
+            uint8_t iv[16];
+            derive_section_key(master, sec.virtual_address, i, section_key, iv);
+
+            std::vector<uint8_t> encrypted(compressed.size());
+            aes_detail::aes256_ctr(section_key, iv, compressed.data(), encrypted.data(), compressed.size());
+
+            std::memset(pb.layer1_iv, 0, 16);
+            std::memset(pb.layer2_nonce, 0, 12);
+            std::memset(pb.layer3_iv, 0, 8);
+            pb.encrypted_size = static_cast<uint32_t>(encrypted.size());
+            pb.data = std::move(encrypted);
+        }
+
         blobs.push_back(std::move(pb));
     }
 
@@ -1967,6 +2479,10 @@ inline packed_section_layout_t build_packed_section(pe_file::pe_image_t& pe,
         d.encrypted_size = blobs[i].encrypted_size;
         d.original_crc32 = blobs[i].original_crc32;
         d.reserved = blobs[i].section_index;
+        std::memcpy(d.layer1_iv, blobs[i].layer1_iv, 16);
+        std::memcpy(d.layer2_nonce, blobs[i].layer2_nonce, 12);
+        std::memcpy(d.layer3_iv, blobs[i].layer3_iv, 8);
+        d.layers_applied = blobs[i].layers_applied;
         std::memcpy(buf.data() + layout.section_table_offset + i * sizeof(d), &d, sizeof(d));
 
         if (!blobs[i].data.empty()) {
@@ -3172,7 +3688,7 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
 
     std::vector<packed_section_blob_t> blobs;
     if (opt.pack_sections) {
-        blobs = pack_sections(pe, master, original_exception_rva, original_exception_size, keep_intact_section_rvas);
+        blobs = pack_sections(pe, master, original_exception_rva, original_exception_size, keep_intact_section_rvas, opt.matryoshka_layers);
     }
 
     std::vector<uint8_t> stub_code;

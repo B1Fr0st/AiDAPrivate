@@ -79,7 +79,7 @@ void search_async(const std::string& query, registry_t reg = registry_t::npm);
 search_state_t get_search_state();
 
 
-const std::string& get_search_error();
+std::string get_search_error();
 
 
 std::vector<package_info_t> get_search_results();
@@ -94,7 +94,7 @@ bool uninstall(const std::string& package_name);
 install_state_t get_install_state();
 
 
-const std::string& get_install_error();
+std::string get_install_error();
 
 
 std::vector<installed_server_t> get_installed();

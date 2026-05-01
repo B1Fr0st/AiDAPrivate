@@ -708,12 +708,18 @@ inline void reconstruct(const reconstruction_config_t& config) {
 		};
 
 		std::filesystem::path out_dir(config.output_dir);
-		try {
-			std::filesystem::create_directories(out_dir / "src");
-			std::filesystem::create_directories(out_dir / "include");
-		} catch (...) {
-			finish(false, "Failed to create output directories.");
-			return;
+		{
+			std::error_code mkdir_ec;
+			std::filesystem::create_directories(out_dir / "src", mkdir_ec);
+			if (mkdir_ec) {
+				finish(false, "Failed to create output directories.");
+				return;
+			}
+			std::filesystem::create_directories(out_dir / "include", mkdir_ec);
+			if (mkdir_ec) {
+				finish(false, "Failed to create output directories.");
+				return;
+			}
 		}
 
 		detail::set_stage(stage_t::collect);

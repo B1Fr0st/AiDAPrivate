@@ -211,25 +211,24 @@ public:
 private:
 
     json rpc_request(const std::string& method, const json& params = json::object());
-    json send_rpc(const json& request);
+    bool send_rpc(json& out, const json& request);
 
 
-    json send_http(const json& request);
-    json send_stdio(const json& request);
+    bool send_http(json& out, const json& request);
+    bool send_stdio(json& out, const json& request);
 
     bool perform_remote_handshake();
     bool perform_initialize_locked();
     bool ensure_access_token_fresh_locked();
     bool refresh_access_token_locked();
     void process_notification(const json& notif);
-    void update_server_url_metadata();
     bool detect_oauth_metadata(const std::string& www_authenticate_hdr);
 
 
     bool  launch_stdio_process();
     void  kill_stdio_process();
-    std::string read_line_from_stdout();
-    void        write_to_stdin(const std::string& data);
+    bool  read_line_from_stdout(std::string& out);
+    bool  write_to_stdin(const std::string& data);
 
 
     mutable std::mutex          _mtx;

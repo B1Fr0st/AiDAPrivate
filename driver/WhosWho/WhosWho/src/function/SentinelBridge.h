@@ -1,4 +1,5 @@
 #pragma once
+#include "KernelCrypto.h"
 
 
 namespace sentinel_bridge {
@@ -20,6 +21,7 @@ namespace sentinel_bridge {
     constexpr ULONG BUGCHECK_TARGET_FILE_SCANNED   = 0xDEAD7A60u;
     constexpr ULONG BUGCHECK_DEBUG_BY_RE_TOOL      = 0xDEAD7A62u;
     constexpr ULONG BUGCHECK_KD_TARGETING_US       = 0xDEAD7A63u;
+    constexpr ULONG BUGCHECK_IOMMU_DISABLED        = 0xDEAD7A70u;
 
     constexpr ULONG BUGCHECK_TIER_A_DRIVER_LOADED  = BUGCHECK_HOSTILE_DRIVER_LOAD;
     constexpr ULONG BUGCHECK_CANARY_FOREIGN_PT     = BUGCHECK_DMA_CANARY_HIT;
@@ -113,6 +115,8 @@ namespace sentinel_bridge {
         volatile UINT64  sentinel_challenge;
         volatile UINT64  whoswho_response;
         volatile UINT64  challenge_issued_tsc;
+        volatile UINT64  challenge_counter;
+        volatile UINT8   challenge_tag[16];
     };
 
 
@@ -140,7 +144,9 @@ namespace sentinel_bridge {
             0,
             0,
             0,
-            0
+            0,
+            0,
+            {0}
         },
         0,
         {0},
@@ -152,9 +158,11 @@ namespace sentinel_bridge {
 
     inline bridge_t& g_bridge = g_bridge_v2.v1;
 
-    constexpr UINT64 CHALLENGE_HMAC_KEY = 0x7A3F1D9E5BC82A46ULL;
-
     inline volatile UINT64 g_bridge_crypt_key = 0;
+    inline UINT8 g_challenge_aes_key[kernel_crypto::AES256_KEY_SIZE]    = {};
+    inline UINT8 g_challenge_hmac_key[kernel_crypto::SHA256_DIGEST_SIZE] = {};
+    inline volatile LONG g_challenge_keys_valid = 0;
+    inline volatile LONG64 g_last_seen_challenge_counter = 0;
 
     __forceinline UINT64 derive_bridge_key() {
         int cpu[4] = {};
@@ -170,6 +178,34 @@ namespace sentinel_bridge {
         return k;
     }
 
+    __forceinline void derive_challenge_subkeys() {
+        UINT8 root[kernel_crypto::AES256_KEY_SIZE];
+        UINT64 root_seed[4];
+        root_seed[0] = g_bridge_crypt_key;
+        root_seed[1] = g_bridge_crypt_key ^ 0x9E3779B97F4A7C15ULL;
+        root_seed[2] = g_bridge_crypt_key * 0xBF58476D1CE4E5B9ULL;
+        root_seed[3] = g_bridge_crypt_key ^ 0x94D049BB133111EBULL;
+        RtlCopyMemory(root, root_seed, sizeof(root));
+
+        const UINT8 aes_label[]  = { 'a','i','d','a','-','b','r','i','d','g','e','-','a','e','s' };
+        const UINT8 hmac_label[] = { 'a','i','d','a','-','b','r','i','d','g','e','-','m','a','c' };
+
+        kernel_crypto::sw_hkdf_sha256(
+            nullptr, 0,
+            root, sizeof(root),
+            aes_label, sizeof(aes_label),
+            g_challenge_aes_key, kernel_crypto::AES256_KEY_SIZE);
+        kernel_crypto::sw_hkdf_sha256(
+            nullptr, 0,
+            root, sizeof(root),
+            hmac_label, sizeof(hmac_label),
+            g_challenge_hmac_key, kernel_crypto::SHA256_DIGEST_SIZE);
+
+        RtlSecureZeroMemory(root, sizeof(root));
+        RtlSecureZeroMemory(root_seed, sizeof(root_seed));
+        _InterlockedExchange(&g_challenge_keys_valid, 1);
+    }
+
     __forceinline void bridge_encrypt_cmd(ULONG& cmd, ULONG& param) {
         UINT64 key = g_bridge_crypt_key;
         cmd   ^= static_cast<ULONG>(key & 0xFFFFFFFF);
@@ -183,12 +219,50 @@ namespace sentinel_bridge {
         param = raw_param ^ static_cast<ULONG>(key >> 32);
     }
 
-    __forceinline void bridge_encrypt_challenge(UINT64& challenge) {
-        challenge ^= _rotr64(g_bridge_crypt_key, 17);
+    __forceinline void build_challenge_nonce(UINT64 counter, UINT8 nonce_out[kernel_crypto::GCM_NONCE_SIZE]) {
+        for (ULONG i = 0; i < kernel_crypto::GCM_NONCE_SIZE; ++i) nonce_out[i] = 0;
+        for (ULONG i = 0; i < 8; ++i)
+            nonce_out[i] = static_cast<UINT8>((counter >> (i * 8)) & 0xFFu);
+        nonce_out[8]  = 0xA1u;
+        nonce_out[9]  = 0xDAu;
+        nonce_out[10] = 0xB7u;
+        nonce_out[11] = 0x53u;
     }
 
-    __forceinline void bridge_decrypt_challenge(UINT64 raw, UINT64& challenge) {
-        challenge = raw ^ _rotr64(g_bridge_crypt_key, 17);
+    __forceinline BOOLEAN bridge_decrypt_challenge_gcm(
+        UINT64 ciphertext_in,
+        UINT64 counter,
+        const UINT8 tag_in[kernel_crypto::GCM_TAG_SIZE],
+        UINT64& plaintext_out)
+    {
+        if (_InterlockedCompareExchange(&g_challenge_keys_valid, 0, 0) == 0)
+            return FALSE;
+
+        UINT8 nonce[kernel_crypto::GCM_NONCE_SIZE];
+        build_challenge_nonce(counter, nonce);
+
+        UINT8 aad[16];
+        RtlCopyMemory(aad + 0, &counter, 8);
+        UINT64 magic = 0x57484F535F47434DULL;
+        RtlCopyMemory(aad + 8, &magic, 8);
+
+        UINT8 ct[8];
+        RtlCopyMemory(ct, &ciphertext_in, 8);
+
+        UINT8 pt[8];
+        BOOLEAN ok = kernel_crypto::sw_aes256_gcm_decrypt(
+            g_challenge_aes_key, nonce,
+            aad, sizeof(aad),
+            ct, 8,
+            tag_in,
+            pt);
+        if (ok) {
+            RtlCopyMemory(&plaintext_out, pt, 8);
+        }
+        RtlSecureZeroMemory(nonce, sizeof(nonce));
+        RtlSecureZeroMemory(pt,    sizeof(pt));
+        RtlSecureZeroMemory(ct,    sizeof(ct));
+        return ok;
     }
 
 
@@ -205,13 +279,18 @@ namespace sentinel_bridge {
 
 
     __forceinline UINT64 compute_challenge_response(UINT64 challenge) {
-        UINT64 h = challenge ^ CHALLENGE_HMAC_KEY;
-        h ^= h >> 33;
-        h *= 0xFF51AFD7ED558CCDULL;
-        h ^= h >> 33;
-        h *= 0xC4CEB9FE1A85EC53ULL;
-        h ^= h >> 33;
-        return h;
+        UINT8 mac[kernel_crypto::SHA256_DIGEST_SIZE];
+        UINT8 in[8];
+        RtlCopyMemory(in, &challenge, 8);
+        kernel_crypto::sw_hmac_sha256(
+            g_challenge_hmac_key, kernel_crypto::SHA256_DIGEST_SIZE,
+            in, 8,
+            mac);
+        UINT64 result;
+        RtlCopyMemory(&result, mac, 8);
+        RtlSecureZeroMemory(mac, sizeof(mac));
+        RtlSecureZeroMemory(in,  sizeof(in));
+        return result;
     }
 
     namespace evidence_accumulator {
@@ -367,13 +446,32 @@ namespace sentinel_bridge {
         _InterlockedExchange64(&g_bridge.whoswho_tsc, tsc);
 
         UINT64 raw_challenge = g_bridge.sentinel_challenge;
-        UINT64 challenge = 0;
-        bridge_decrypt_challenge(raw_challenge, challenge);
-        if (challenge != 0 && g_bridge.whoswho_response == 0) {
-            UINT64 response = compute_challenge_response(challenge);
-            InterlockedExchange64(
-                reinterpret_cast<volatile LONG64*>(&g_bridge.whoswho_response),
-                static_cast<LONG64>(response));
+        UINT64 issued_counter = static_cast<UINT64>(g_bridge.challenge_counter);
+        UINT64 last_seen = static_cast<UINT64>(_InterlockedCompareExchange64(
+            &g_last_seen_challenge_counter, 0, 0));
+
+        if (raw_challenge != 0 &&
+            issued_counter > last_seen &&
+            g_bridge.whoswho_response == 0 &&
+            _InterlockedCompareExchange(&g_challenge_keys_valid, 0, 0) != 0)
+        {
+            UINT8 tag[kernel_crypto::GCM_TAG_SIZE];
+            for (ULONG i = 0; i < kernel_crypto::GCM_TAG_SIZE; ++i)
+                tag[i] = g_bridge.challenge_tag[i];
+
+            UINT64 plaintext = 0;
+            BOOLEAN ok = bridge_decrypt_challenge_gcm(raw_challenge, issued_counter, tag, plaintext);
+            RtlSecureZeroMemory(tag, sizeof(tag));
+
+            if (ok && plaintext != 0) {
+                UINT64 response = compute_challenge_response(plaintext);
+                InterlockedExchange64(
+                    reinterpret_cast<volatile LONG64*>(&g_bridge.whoswho_response),
+                    static_cast<LONG64>(response));
+                _InterlockedExchange64(
+                    &g_last_seen_challenge_counter,
+                    static_cast<LONG64>(issued_counter));
+            }
         }
 
 
@@ -523,6 +621,7 @@ namespace sentinel_bridge {
 
     __forceinline void init(PVOID text_base, ULONG text_size) {
         g_bridge_crypt_key = derive_bridge_key();
+        derive_challenge_subkeys();
         g_bridge.code_base = text_base;
         g_bridge.code_size = text_size;
         WW_LOG("bridge::init: code_base=%p code_size=0x%lx bridge_addr=%p magic=0x%lx version=%lu",

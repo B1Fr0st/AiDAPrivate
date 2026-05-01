@@ -12,11 +12,63 @@
 #include <vector>
 
 #include "obfuscation.hpp"
+#include "key_pipeline.hpp"
 
 namespace anti_tamper {
 namespace packer {
 
 namespace detail {
+
+    inline uint64_t aes_material_salt_a()
+    {
+        static const uint64_t v = []() {
+            uint8_t derived[8] = {};
+            uint64_t out = 0;
+            if (key_pipeline::derive(
+                    "aida.packer.aes_material.a",
+                    nullptr, 0, derived, sizeof(derived)))
+            {
+                std::memcpy(&out, derived, sizeof(out));
+                SecureZeroMemory(derived, sizeof(derived));
+            }
+            return out;
+        }();
+        return v;
+    }
+
+    inline uint64_t aes_material_salt_b()
+    {
+        static const uint64_t v = []() {
+            uint8_t derived[8] = {};
+            uint64_t out = 0;
+            if (key_pipeline::derive(
+                    "aida.packer.aes_material.b",
+                    nullptr, 0, derived, sizeof(derived)))
+            {
+                std::memcpy(&out, derived, sizeof(out));
+                SecureZeroMemory(derived, sizeof(derived));
+            }
+            return out;
+        }();
+        return v;
+    }
+
+    inline uint64_t aes_material_salt_c()
+    {
+        static const uint64_t v = []() {
+            uint8_t derived[8] = {};
+            uint64_t out = 0;
+            if (key_pipeline::derive(
+                    "aida.packer.aes_material.c",
+                    nullptr, 0, derived, sizeof(derived)))
+            {
+                std::memcpy(&out, derived, sizeof(out));
+                SecureZeroMemory(derived, sizeof(derived));
+            }
+            return out;
+        }();
+        return v;
+    }
 
     struct packed_section_t
     {
@@ -85,9 +137,9 @@ namespace detail {
                                      uint64_t master_seed, __m128i& out_key, __m128i& out_nonce)
     {
         uint64_t h0 = derive_section_key(section_base, section_size, master_seed);
-        uint64_t h1 = derive_section_key(section_base ^ 0xCAFEBABEDEADBEEFULL, section_size, master_seed ^ h0);
-        uint64_t n0 = derive_section_key(h0, section_size, h1 ^ 0x0123456789ABCDEFULL);
-        uint64_t n1 = derive_section_key(h1, section_size, h0 ^ 0xFEDCBA9876543210ULL);
+        uint64_t h1 = derive_section_key(section_base ^ aes_material_salt_a(), section_size, master_seed ^ h0);
+        uint64_t n0 = derive_section_key(h0, section_size, h1 ^ aes_material_salt_b());
+        uint64_t n1 = derive_section_key(h1, section_size, h0 ^ aes_material_salt_c());
         out_key   = _mm_set_epi64x(static_cast<long long>(h1), static_cast<long long>(h0));
         out_nonce = _mm_set_epi64x(static_cast<long long>(n1), static_cast<long long>(n0));
     }

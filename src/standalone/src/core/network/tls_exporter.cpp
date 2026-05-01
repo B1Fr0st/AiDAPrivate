@@ -53,11 +53,11 @@ namespace aida::tls_exporter
         return status == 0;
     }
 
-    std::string compute_header_value_schannel(void* ssl_handle) noexcept
+    std::string compute_header_value_openssl(void* ssl_ctx) noexcept
     {
-        if (!ssl_handle) return {};
+        if (!ssl_ctx) return {};
 
-        auto* ssl = static_cast<SSL*>(ssl_handle);
+        auto* ssl = static_cast<SSL*>(ssl_ctx);
 
         uint8_t exported[kExporterLen] = {};
         int rc = SSL_export_keying_material(

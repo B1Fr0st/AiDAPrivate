@@ -6,6 +6,8 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <typeindex>
+#include <typeinfo>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -38,6 +40,7 @@ namespace events {
         struct subscription_record_t
         {
             subscription_id_t  id = 0;
+            std::type_index    payload_type{typeid(void)};
             callback_invoker_t invoker;
         };
 
@@ -51,16 +54,16 @@ namespace events {
 
         registry_t& get_registry();
 
-        const std::string& last_error_slot();
-        void               set_last_error(const std::string& msg);
+        std::string last_error_slot();
+        void        set_last_error(const std::string& msg);
 
-        subscription_id_t register_subscription(const std::string& type_name, callback_invoker_t invoker);
+        subscription_id_t register_subscription(const std::string& type_name, std::type_index payload_type, callback_invoker_t invoker);
         bool              remove_subscription(const std::string& type_name, subscription_id_t id);
         void              snapshot_subscribers(const std::string& type_name, std::vector<subscription_record_t>& out);
 
     }
 
-    inline const std::string& last_error()
+    inline std::string last_error()
     {
         return detail::last_error_slot();
     }
@@ -82,15 +85,16 @@ namespace events {
             return handle;
         }
 
-        detail::callback_invoker_t invoker = [cb_copy](const void* payload_ptr)
+        const std::type_index expected_type(typeid(Payload));
+        detail::callback_invoker_t invoker = [cb_copy, expected_type](const void* payload_ptr)
         {
-            if (payload_ptr == nullptr) return;
             const Payload& typed = *static_cast<const Payload*>(payload_ptr);
             cb_copy(typed);
+            (void)expected_type;
         };
 
         std::string type_name(def.type_name);
-        const subscription_id_t id = detail::register_subscription(type_name, std::move(invoker));
+        const subscription_id_t id = detail::register_subscription(type_name, expected_type, std::move(invoker));
         if (id == 0)
         {
             return handle;
@@ -104,6 +108,8 @@ namespace events {
     template <typename Payload>
     void publish(const event_def_t<Payload>& def, const Payload& payload)
     {
+        if (detail::get_registry().shutdown_flag.load(std::memory_order_acquire)) return;
+
         if (def.type_name == nullptr || def.type_name[0] == '\0')
         {
             detail::set_last_error("event_bus.publish: invalid event type_name");
@@ -113,10 +119,18 @@ namespace events {
         std::vector<detail::subscription_record_t> snapshot;
         detail::snapshot_subscribers(std::string(def.type_name), snapshot);
 
+        const std::type_index expected_type(typeid(Payload));
         const void* payload_ptr = static_cast<const void*>(&payload);
         for (const auto& rec : snapshot)
         {
-            if (rec.invoker) rec.invoker(payload_ptr);
+            if (detail::get_registry().shutdown_flag.load(std::memory_order_acquire)) break;
+            if (!rec.invoker) continue;
+            if (rec.payload_type != expected_type)
+            {
+                detail::set_last_error("event_bus.publish: payload type mismatch for event type_name");
+                continue;
+            }
+            rec.invoker(payload_ptr);
         }
     }
 

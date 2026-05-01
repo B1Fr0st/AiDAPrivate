@@ -64,14 +64,6 @@ inline void init_signature_database() {
     auto& sigs = g_state.signatures;
     sigs.clear();
 
-    auto make_pattern = [](const std::vector<uint8_t>& bytes, const std::vector<uint8_t>& m) -> bypass_signature {
-        bypass_signature sig;
-        sig.pattern = bytes;
-        sig.mask = m;
-        return sig;
-    };
-
-
     {
         bypass_signature sig;
         sig.name = "OpenSSL ssl_verify_cert_chain";

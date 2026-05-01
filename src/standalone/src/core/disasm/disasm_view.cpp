@@ -29,14 +29,14 @@ static float s_xref_anim_t = 0.f;
 static int find_instr_at(uint64_t addr, const DisasmFile& file) {
     if (file.instrs.empty()) return -1;
 
-    int lo = 0, hi = (int)file.instrs.size() - 1;
+    int lo = 0, hi = static_cast<int>(file.instrs.size()) - 1;
     while (lo <= hi) {
         int mid = (lo + hi) / 2;
         if (file.instrs[mid].addr == addr) return mid;
         if (file.instrs[mid].addr < addr) lo = mid + 1;
         else hi = mid - 1;
     }
-    return (lo < (int)file.instrs.size()) ? lo : (int)file.instrs.size() - 1;
+    return (lo < static_cast<int>(file.instrs.size())) ? lo : static_cast<int>(file.instrs.size()) - 1;
 }
 
 void goto_address(uint64_t addr, DisasmState& disasm) {
@@ -47,10 +47,10 @@ void goto_address(uint64_t addr, DisasmState& disasm) {
 
     if (st.selected_row >= 0) {
 
-        if (st.nav_pos + 1 < (int)st.nav_history.size())
+        if (st.nav_pos + 1 < static_cast<int>(st.nav_history.size()))
             st.nav_history.resize(st.nav_pos + 1);
         st.nav_history.push_back(st.selected_row);
-        st.nav_pos = (int)st.nav_history.size() - 1;
+        st.nav_pos = static_cast<int>(st.nav_history.size()) - 1;
     }
 
     st.selected_row = idx;
@@ -67,7 +67,7 @@ void navigate_back() {
 
 void navigate_forward() {
     auto& st = g_state;
-    if (st.nav_pos + 1 >= (int)st.nav_history.size()) return;
+    if (st.nav_pos + 1 >= static_cast<int>(st.nav_history.size())) return;
     st.nav_pos++;
     st.selected_row = st.nav_history[st.nav_pos];
     st.target_scroll_y = st.selected_row * 18.f;
@@ -929,7 +929,7 @@ void render(float pos_x, float pos_y, float width, float height,
     if (disasm.live_mode && disasm.live_pending_ready.load(std::memory_order_acquire)) {
 
         driver_bridge::debug_log("disasm_view: live_pending_ready=TRUE, moving %llu instrs to display\n",
-            (unsigned long long)disasm.live_pending_instrs.size());
+            static_cast<unsigned long long>(disasm.live_pending_instrs.size()));
 
         uint64_t scroll_addr = 0;
         if (st.selected_row >= 0 && st.selected_row < static_cast<int>(disasm.file.instrs.size()))
@@ -965,11 +965,12 @@ void render(float pos_x, float pos_y, float width, float height,
                 driver_bridge::debug_log("disasm_view: pid mismatch (attached=%u live=%u), stopping live\n",
                     driver_bridge::attached_pid(), disasm.live_pid);
                 disasm::stop_live(disasm);
-            } else if (disasm.live_fail_count < 5) {
+            } else if (disasm.live_fail_count.load(std::memory_order_acquire) < 5) {
                 static int s_req_log = 0;
                 if (s_req_log++ < 20)
                     driver_bridge::debug_log("disasm_view: triggering request_live_decode (fail_count=%d, decoding=%d)\n",
-                        disasm.live_fail_count, disasm.live_decoding ? 1 : 0);
+                        disasm.live_fail_count.load(std::memory_order_acquire),
+                        disasm.live_decoding.load(std::memory_order_acquire) ? 1 : 0);
                 disasm::request_live_decode(disasm);
             }
         }
@@ -980,7 +981,7 @@ void render(float pos_x, float pos_y, float width, float height,
     const float a = alpha;
     const auto& _t = themes::resolved;
     const auto _ta = [a](ImU32 c) -> ImU32 { return ui_anim::theme_alpha(c, a); };
-    const int n = (int)instrs.size();
+    const int n = static_cast<int>(instrs.size());
 
     if (n == 0) {
 
@@ -993,14 +994,18 @@ void render(float pos_x, float pos_y, float width, float height,
             float cx = ox + width * 0.5f;
             float cy = oy + height * 0.5f;
 
-            bool failed = disasm.live_mode && disasm.live_decode_failed && disasm.live_fail_count >= 3;
+            bool failed = disasm.live_mode
+                && disasm.live_decode_failed.load(std::memory_order_acquire)
+                && disasm.live_fail_count.load(std::memory_order_acquire) >= 3;
 
             {
                 static int s_spinner_log = 0;
                 if (s_spinner_log++ < 10)
                     driver_bridge::debug_log("disasm_view SPINNER: n=%d live_mode=%d decoding=%d failed=%d fail_count=%d pending_ready=%d paused=%d\n",
-                        n, disasm.live_mode ? 1 : 0, disasm.live_decoding ? 1 : 0,
-                        disasm.live_decode_failed ? 1 : 0, disasm.live_fail_count,
+                        n, disasm.live_mode ? 1 : 0,
+                        disasm.live_decoding.load(std::memory_order_acquire) ? 1 : 0,
+                        disasm.live_decode_failed.load(std::memory_order_acquire) ? 1 : 0,
+                        disasm.live_fail_count.load(std::memory_order_acquire),
                         disasm.live_pending_ready.load() ? 1 : 0, disasm.live_paused ? 1 : 0);
             }
 
@@ -1033,8 +1038,8 @@ void render(float pos_x, float pos_y, float width, float height,
                                        static_cast<int>(accent_b*255), static_cast<int>(220*a))
                             : _ta(_t.text_primary), retry_label);
                 if (btn_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                    disasm.live_fail_count = 0;
-                    disasm.live_decode_failed = false;
+                    disasm.live_fail_count.store(0, std::memory_order_release);
+                    disasm.live_decode_failed.store(false, std::memory_order_release);
                     disasm.live_needs_refresh = true;
                 }
             } else {
@@ -1059,9 +1064,10 @@ void render(float pos_x, float pos_y, float width, float height,
                 dl->AddText(ImVec2(cx - ts.x * 0.5f, cy + 6.f),
                     _ta(_t.text_secondary), msg);
 
-                if (disasm.live_mode && disasm.live_fail_count > 0) {
+                if (disasm.live_mode && disasm.live_fail_count.load(std::memory_order_acquire) > 0) {
                     char attempt_buf[48];
-                    snprintf(attempt_buf, sizeof(attempt_buf), "Retry %d/5...", disasm.live_fail_count);
+                    snprintf(attempt_buf, sizeof(attempt_buf), "Retry %d/5...",
+                        disasm.live_fail_count.load(std::memory_order_acquire));
                     ImVec2 as = ImGui::CalcTextSize(attempt_buf);
                     dl->AddText(ImVec2(cx - as.x * 0.5f, cy + 6.f + ts.y + 8.f),
                         IM_COL32(200, 160, 80, static_cast<int>(160 * a)), attempt_buf);
@@ -1071,7 +1077,7 @@ void render(float pos_x, float pos_y, float width, float height,
                     ? disasm.live_module : disasm.file.filename;
                 if (!label.empty()) {
                     float label_y = cy + 6.f + ImGui::CalcTextSize("A").y + 6.f;
-                    if (disasm.live_mode && disasm.live_fail_count > 0)
+                    if (disasm.live_mode && disasm.live_fail_count.load(std::memory_order_acquire) > 0)
                         label_y += ImGui::CalcTextSize("A").y + 2.f;
                     ImVec2 ms = ImGui::CalcTextSize(label.c_str());
                     dl->AddText(ImVec2(cx - ms.x * 0.5f, label_y),
@@ -1230,21 +1236,21 @@ void render(float pos_x, float pos_y, float width, float height,
     const float x_ops  = x_mnem + 72.f;
 
 
-    ImU32 ac_full = IM_COL32((int)(accent_r*255), (int)(accent_g*255),
-                              (int)(accent_b*255), (int)(200*a));
-    ImU32 ac_dim  = IM_COL32((int)(accent_r*255), (int)(accent_g*255),
-                              (int)(accent_b*255), (int)(15*a));
+    ImU32 ac_full = IM_COL32(static_cast<int>(accent_r*255), static_cast<int>(accent_g*255),
+                              static_cast<int>(accent_b*255), static_cast<int>(200*a));
+    ImU32 ac_dim  = IM_COL32(static_cast<int>(accent_r*255), static_cast<int>(accent_g*255),
+                              static_cast<int>(accent_b*255), static_cast<int>(15*a));
 
 
     dl->AddLine(ImVec2(x_vsep, oy_content), ImVec2(x_vsep, oy_content + content_height),
-                IM_COL32(255, 255, 255, (int)(10 * a)), 1.f);
+                IM_COL32(255, 255, 255, static_cast<int>(10 * a)), 1.f);
     if (st.show_bytes && bytes_col_w > 0.f) {
         dl->AddLine(ImVec2(x_mnem - 6.f, oy_content), ImVec2(x_mnem - 6.f, oy_content + content_height),
-                    IM_COL32(255, 255, 255, (int)(6 * a)), 1.f);
+                    IM_COL32(255, 255, 255, static_cast<int>(6 * a)), 1.f);
     }
 
-    int first_row = std::max(0, (int)(st.scroll_y / line_h) - 1);
-    int last_row  = std::min(n - 1, (int)((st.scroll_y + content_height) / line_h) + 1);
+    int first_row = std::max(0, static_cast<int>(st.scroll_y / line_h) - 1);
+    int last_row  = std::min(n - 1, static_cast<int>((st.scroll_y + content_height) / line_h) + 1);
 
 
     if (disasm.live_mode && n > 0) {
@@ -1260,31 +1266,31 @@ void render(float pos_x, float pos_y, float width, float height,
 
         if (i & 1)
             dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + width, y + line_h - 1.f),
-                              IM_COL32(255, 255, 255, (int)(3.f * a)));
+                              IM_COL32(255, 255, 255, static_cast<int>(3.f * a)));
 
 
         bool row_hovered = ImGui::IsMouseHoveringRect(
             ImVec2(ox, y), ImVec2(ox + width, y + line_h - 1.f), false);
 
-        ImGuiID rhid = ImGui::GetID((void*)(intptr_t)(0xD000 + i));
+        ImGuiID rhid = ImGui::GetID(reinterpret_cast<void*>(static_cast<intptr_t>(0xD000 + i)));
         float rh = ImGui::GetStateStorage()->GetFloat(rhid, 0.f);
         rh += ((row_hovered ? 1.f : 0.f) - rh) * std::min(12.f * dt, 1.f);
         ImGui::GetStateStorage()->SetFloat(rhid, rh);
 
         if (rh > 0.002f)
             dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + width, y + line_h - 1.f),
-                              IM_COL32(255, 255, 255, (int)(rh * 12.f * a)));
+                              IM_COL32(255, 255, 255, static_cast<int>(rh * 12.f * a)));
 
 
         if (i == st.selected_row) {
             float pulse = (std::sin(static_cast<float>(ImGui::GetTime()) * 3.f) + 1.f) * 0.5f;
             float sel_a = 25.f + pulse * 15.f;
             dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + width, y + line_h - 1.f),
-                              IM_COL32((int)(accent_r*180), (int)(accent_g*180),
-                                       (int)(accent_b*180), (int)(sel_a * a)));
+                              IM_COL32(static_cast<int>(accent_r*180), static_cast<int>(accent_g*180),
+                                       static_cast<int>(accent_b*180), static_cast<int>(sel_a * a)));
             dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + 3.f, y + line_h - 1.f),
-                              IM_COL32((int)(accent_r*255), (int)(accent_g*255),
-                                       (int)(accent_b*255), (int)((140.f + pulse * 60.f) * a)));
+                              IM_COL32(static_cast<int>(accent_r*255), static_cast<int>(accent_g*255),
+                                       static_cast<int>(accent_b*255), static_cast<int>((140.f + pulse * 60.f) * a)));
         }
 
 
@@ -1295,7 +1301,7 @@ void render(float pos_x, float pos_y, float width, float height,
         for (auto& bm : st.bookmarks) {
             if (bm.addr == ins.addr) {
                 dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + 3.f, y + line_h),
-                                  IM_COL32(220, 180, 100, (int)(200 * a)));
+                                  IM_COL32(220, 180, 100, static_cast<int>(200 * a)));
                 break;
             }
         }
@@ -1307,8 +1313,8 @@ void render(float pos_x, float pos_y, float width, float height,
             display_addr = ins.addr - file.image_base;
         else if (st.addr_format == addr_format_t::file_offset)
             display_addr = ins.addr - file.text_va;
-        snprintf(addr_buf, sizeof(addr_buf), "%016llX", (unsigned long long)display_addr);
-        dl->AddText(ImVec2(x_addr, y + 1.f), IM_COL32(75, 95, 155, (int)(170 * a)), addr_buf);
+        snprintf(addr_buf, sizeof(addr_buf), "%016llX", static_cast<unsigned long long>(display_addr));
+        dl->AddText(ImVec2(x_addr, y + 1.f), IM_COL32(75, 95, 155, static_cast<int>(170 * a)), addr_buf);
 
 
         if (st.show_bytes) {
@@ -1327,15 +1333,15 @@ void render(float pos_x, float pos_y, float width, float height,
         if (ins.is_call)
             mc = ac_full;
         else if (ins.is_branch)
-            mc = IM_COL32(152, 195, 121, (int)(230 * a));
+            mc = IM_COL32(152, 195, 121, static_cast<int>(230 * a));
         else if (ins.is_ret)
-            mc = IM_COL32(224, 108, 117, (int)(230 * a));
+            mc = IM_COL32(224, 108, 117, static_cast<int>(230 * a));
         else if (ins.is_nop)
-            mc = IM_COL32(100, 100, 110, (int)(140 * a));
+            mc = IM_COL32(100, 100, 110, static_cast<int>(140 * a));
         else if (ins.is_priv)
-            mc = IM_COL32(220, 180, 100, (int)(230 * a));
+            mc = IM_COL32(220, 180, 100, static_cast<int>(230 * a));
         else
-            mc = IM_COL32(200, 200, 240, (int)(235 * a));
+            mc = IM_COL32(200, 200, 240, static_cast<int>(235 * a));
 
         dl->AddText(ImVec2(x_mnem, y + 1.f), mc, ins.mnem);
 
@@ -1343,13 +1349,13 @@ void render(float pos_x, float pos_y, float width, float height,
         if (ins.ops[0]) {
             ImU32 oc;
             if (ins.is_branch || ins.is_call)
-                oc = IM_COL32(210, 215, 255, (int)(160 * a));
+                oc = IM_COL32(210, 215, 255, static_cast<int>(160 * a));
             else if (ins.is_nop)
-                oc = IM_COL32(80, 80, 90, (int)(120 * a));
+                oc = IM_COL32(80, 80, 90, static_cast<int>(120 * a));
             else if (ins.is_priv)
-                oc = IM_COL32(200, 170, 95, (int)(180 * a));
+                oc = IM_COL32(200, 170, 95, static_cast<int>(180 * a));
             else
-                oc = IM_COL32(165, 170, 190, (int)(210 * a));
+                oc = IM_COL32(165, 170, 190, static_cast<int>(210 * a));
 
             dl->AddText(ImVec2(x_ops, y + 1.f), oc, ins.ops);
         }
@@ -1376,7 +1382,7 @@ void render(float pos_x, float pos_y, float width, float height,
                         ImVec2(arrow_x, y + 4.f),
                         ImVec2(arrow_x + 8.f, y + line_h * 0.5f),
                         ImVec2(arrow_x, y + line_h - 4.f),
-                        IM_COL32(100, 160, 100, (int)(120 * a)));
+                        IM_COL32(100, 160, 100, static_cast<int>(120 * a)));
                 }
             }
         }
@@ -1450,7 +1456,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
             if (ImGui::MenuItem("Copy Address")) {
                 char buf[20];
-                snprintf(buf, sizeof(buf), "%016llX", (unsigned long long)ci.addr);
+                snprintf(buf, sizeof(buf), "%016llX", static_cast<unsigned long long>(ci.addr));
                 if (OpenClipboard(nullptr)) {
                     EmptyClipboard();
                     HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, strlen(buf) + 1);
@@ -1486,10 +1492,10 @@ void render(float pos_x, float pos_y, float width, float height,
                 char buf[256];
                 if (ci.ops[0])
                     snprintf(buf, sizeof(buf), "%016llX  %-8s %s",
-                             (unsigned long long)ci.addr, ci.mnem, ci.ops);
+                             static_cast<unsigned long long>(ci.addr), ci.mnem, ci.ops);
                 else
                     snprintf(buf, sizeof(buf), "%016llX  %s",
-                             (unsigned long long)ci.addr, ci.mnem);
+                             static_cast<unsigned long long>(ci.addr), ci.mnem);
                 if (OpenClipboard(nullptr)) {
                     EmptyClipboard();
                     HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, strlen(buf) + 1);
@@ -1507,7 +1513,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
             bool has_bm = false;
             int bm_idx = -1;
-            for (int bi = 0; bi < (int)st.bookmarks.size(); bi++) {
+            for (int bi = 0; bi < static_cast<int>(st.bookmarks.size()); bi++) {
                 if (st.bookmarks[bi].addr == ci.addr) { has_bm = true; bm_idx = bi; break; }
             }
             if (has_bm) {
@@ -1519,7 +1525,7 @@ void render(float pos_x, float pos_y, float width, float height,
                     bookmark_t bm;
                     bm.addr = ci.addr;
                     char lbl[32];
-                    snprintf(lbl, sizeof(lbl), "0x%llX", (unsigned long long)ci.addr);
+                    snprintf(lbl, sizeof(lbl), "0x%llX", static_cast<unsigned long long>(ci.addr));
                     bm.label = lbl;
                     st.bookmarks.push_back(bm);
                 }
@@ -1569,7 +1575,7 @@ void render(float pos_x, float pos_y, float width, float height,
             }
             if (ImGui::MenuItem("Generate AOB Signature")) {
                 char addr_buf[32];
-                snprintf(addr_buf, sizeof(addr_buf), "%llX", (unsigned long long)ci.addr);
+                snprintf(addr_buf, sizeof(addr_buf), "%llX", static_cast<unsigned long long>(ci.addr));
                 strncpy(aob_generator::g_state.address_input, addr_buf, sizeof(aob_generator::g_state.address_input) - 1);
                 aob_generator::generate_from_address(ci.addr, aob_generator::g_state.instruction_count, aob_generator::g_state.auto_wildcard);
                 scan_hub_view::set_sub_tab(scan_hub_view::sub_tab_t::aob);
@@ -1775,9 +1781,9 @@ void render(float pos_x, float pos_y, float width, float height,
                     ImVec2(std::min(bm_x + btn_w, ox + width), bm_y + 19.f));
                 if (bm_hv)
                     dl->AddRectFilled(ImVec2(bm_x, bm_y + 1.f), ImVec2(bm_x + btn_w, bm_y + 19.f),
-                                      IM_COL32(255, 255, 255, (int)(15 * a)), 3.f);
+                                      IM_COL32(255, 255, 255, static_cast<int>(15 * a)), 3.f);
                 dl->AddText(ImVec2(bm_x + 6.f, bm_y + 3.f),
-                            IM_COL32(220, 180, 100, (int)(200 * a)), bm.label.c_str());
+                            IM_COL32(220, 180, 100, static_cast<int>(200 * a)), bm.label.c_str());
                 if (bm_hv && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
                     goto_address(bm.addr, disasm);
             }
@@ -1827,8 +1833,8 @@ void render(float pos_x, float pos_y, float width, float height,
         const char* status_txt = disasm.live_paused ? "PAUSED" : "LIVE";
         dl->AddText(ImVec2(dot_x + 10.f, iy + (ind_h - ImGui::GetFontSize()) * 0.5f),
             disasm.live_paused
-                ? IM_COL32(200, 180, 60, (int)(200 * a))
-                : IM_COL32(60, 220, 80, (int)(220 * a)),
+                ? IM_COL32(200, 180, 60, static_cast<int>(200 * a))
+                : IM_COL32(60, 220, 80, static_cast<int>(220 * a)),
             status_txt);
 
 
@@ -1845,8 +1851,8 @@ void render(float pos_x, float pos_y, float width, float height,
         bool btn_hov = ImGui::IsMouseHoveringRect(
             ImVec2(btn_x, btn_y), ImVec2(btn_x + btn_w2, btn_y + btn_h2));
         dl->AddRectFilled(ImVec2(btn_x, btn_y), ImVec2(btn_x + btn_w2, btn_y + btn_h2),
-            btn_hov ? IM_COL32(255, 255, 255, (int)(25 * a))
-                    : IM_COL32(255, 255, 255, (int)(10 * a)), 6.f);
+            btn_hov ? IM_COL32(255, 255, 255, static_cast<int>(25 * a))
+                    : IM_COL32(255, 255, 255, static_cast<int>(10 * a)), 6.f);
         const char* btn_lbl = disasm.live_paused ? "Play" : "Pause";
         ImVec2 bts = ImGui::CalcTextSize(btn_lbl);
         dl->AddText(ImVec2(btn_x + (btn_w2 - bts.x) * 0.5f, btn_y + (btn_h2 - bts.y) * 0.5f),
@@ -1883,11 +1889,11 @@ void render(float pos_x, float pos_y, float width, float height,
 
             if (sb_a > 0.01f) {
                 dl->AddRectFilled(ImVec2(track_x, track_y0), ImVec2(track_x + sb_w, track_y0 + track_h),
-                    IM_COL32(255, 255, 255, (int)(8.f * sb_a * a)), 3.f);
+                    IM_COL32(255, 255, 255, static_cast<int>(8.f * sb_a * a)), 3.f);
 
                 bool thumb_hov = ImGui::IsMouseHoveringRect(
                     ImVec2(track_x - 2.f, thumb_y), ImVec2(track_x + sb_w + 2.f, thumb_y + thumb_h));
-                int thumb_alpha = thumb_hov || st.sb_dragging ? (int)(120.f * sb_a * a) : (int)(60.f * sb_a * a);
+                int thumb_alpha = thumb_hov || st.sb_dragging ? static_cast<int>(120.f * sb_a * a) : static_cast<int>(60.f * sb_a * a);
                 dl->AddRectFilled(ImVec2(track_x, thumb_y), ImVec2(track_x + sb_w, thumb_y + thumb_h),
                     IM_COL32(200, 200, 220, thumb_alpha), 3.f);
             }
