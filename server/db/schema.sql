@@ -357,11 +357,24 @@ CREATE TRIGGER audit_log_no_delete
 DO $bot_role$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aida_bot_ro') THEN
-        CREATE ROLE aida_bot_ro NOLOGIN;
+        BEGIN
+            CREATE ROLE aida_bot_ro NOLOGIN;
+        EXCEPTION
+            WHEN insufficient_privilege THEN
+                RAISE NOTICE 'skipping CREATE ROLE aida_bot_ro: insufficient_privilege (current role lacks CREATEROLE)';
+                RETURN;
+            WHEN duplicate_object THEN
+                NULL;
+        END;
     END IF;
-    GRANT USAGE ON SCHEMA public TO aida_bot_ro;
-    GRANT SELECT ON ALL TABLES IN SCHEMA public TO aida_bot_ro;
-    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO aida_bot_ro;
+    BEGIN
+        GRANT USAGE ON SCHEMA public TO aida_bot_ro;
+        GRANT SELECT ON ALL TABLES IN SCHEMA public TO aida_bot_ro;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO aida_bot_ro;
+    EXCEPTION
+        WHEN insufficient_privilege THEN
+            RAISE NOTICE 'skipping GRANTs to aida_bot_ro: insufficient_privilege';
+    END;
 END
 $bot_role$;
 

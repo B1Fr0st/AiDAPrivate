@@ -17,20 +17,40 @@ $files = @(
     "routes\download.js",
     "routes\sentinel.js",
     "routes\telemetry.js",
+    "routes\functions.js",
+    "routes\attestation.js",
+    "routes\stolen_bytes.js",
     "crypto\signing.js",
     "crypto\arc-encrypt.js",
     "crypto\arc-license-bind.js",
     "crypto\kw_wrap.js",
     "crypto\tls_exporter.js",
+    "crypto\column_crypt.js",
+    "crypto\local_hsm.js",
+    "crypto\page_keys.js",
+    "crypto\binary_protocol.js",
+    "crypto\tpm_quote.js",
+    "crypto\ek_roots.js",
+    "middleware\hmac_auth.js",
+    "middleware\rate_limit.js",
+    "anomaly\model.js",
+    "anomaly\score.js",
     "db\pool.js",
+    "db\migrate.js",
     "db\schema.sql"
 )
+# Ensure remote subdirectories exist before scp
+$remoteDirs = @("routes", "crypto", "middleware", "anomaly", "db") | ForEach-Object { "$DST$_" }
+$mkdirCmd = "mkdir -p " + ($remoteDirs -join " ")
+& ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no $REMOTE $mkdirCmd | Out-Null
 foreach ($f in $files) {
     $local = Join-Path $SRC $f
     $remotePath = $DST + ($f -replace '\\', '/')
     if (Test-Path $local) {
         & scp -i "$SSH_KEY" -o StrictHostKeyChecking=no "$local" "${REMOTE}:${remotePath}"
         if ($LASTEXITCODE -ne 0) { Write-Host "SCP failed for $f" -ForegroundColor Red; exit 1 }
+    } else {
+        Write-Host "  [WARN] missing local file: $local" -ForegroundColor Yellow
     }
 }
 Write-Host "      Done." -ForegroundColor Green
@@ -102,11 +122,22 @@ $script += "set -a$nl"
 $script += ". ./.env$nl"
 $script += "set +a$nl"
 $script += "psql `"`$DATABASE_URL`" -f db/schema.sql$nl"
-$script += "pm2 restart aida-api --update-env 2>&1 | grep -E 'online|error|Done' || true$nl"
-$script += "sleep 3$nl"
+$script += "pm2 restart aida-api --update-env 2>&1 | tail -5$nl"
+$script += "for i in 1 2 3 4 5 6 7 8; do$nl"
+$script += "  sleep 2$nl"
+$script += "  H=`$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3001/health || echo '000')$nl"
+$script += "  if [ `"`$H`" = '200' ]; then break; fi$nl"
+$script += "done$nl"
 $script += "echo '[health]'$nl"
-$script += "curl -s http://localhost:3001/health$nl"
+$script += "curl -s http://localhost:3001/health || echo 'curl_failed'$nl"
 $script += "echo$nl"
+$script += "if ! curl -s -f http://localhost:3001/health > /dev/null; then$nl"
+$script += "  echo '[pm2 status]'$nl"
+$script += "  pm2 status aida-api$nl"
+$script += "  echo '[pm2 logs - last 60]'$nl"
+$script += "  pm2 logs aida-api --lines 60 --nostream$nl"
+$script += "  exit 0$nl"
+$script += "fi$nl"
 $script += "echo '[keygen]'$nl"
 $script += "curl -s -X POST http://localhost:3001/api/license/create -H 'Content-Type: application/json' -d '{""admin_key"":""$ADMIN_KEY"",""plan"":""pro"",""note"":""deploy_test"",""expires"":""2099-01-01""}'$nl"
 $script += "echo$nl"

@@ -55,6 +55,11 @@ function Invoke-SSH($cmd) {
     return $output
 }
 
+function Invoke-SSHSoft($cmd) {
+    $output = ssh -i $SSH_KEY $SERVER $cmd 2>&1
+    return @{ Output = $output; ExitCode = $LASTEXITCODE }
+}
+
 # ── Encrypt ARC ──────────────────────────────────────────────────────────────
 
 $arcDll = "$RELEASE_DIR\aida_core.dll"
@@ -85,11 +90,26 @@ Write-Ok "API restarted"
 # ── Verify ───────────────────────────────────────────────────────────────────
 
 Write-Step "Verifying server health"
-$health = Invoke-SSH "curl -s http://localhost:3001/health"
-if ($health -match '"ok"') {
+$health = $null
+$healthExit = 1
+for ($i = 1; $i -le 10; $i++) {
+    Start-Sleep -Seconds 2
+    $r = Invoke-SSHSoft "curl -s -o - -w '\n[http_code:%{http_code}]' http://localhost:3001/health"
+    $health = $r.Output
+    $healthExit = $r.ExitCode
+    if ($healthExit -eq 0 -and $health -match '"ok"') { break }
+}
+if ($healthExit -eq 0 -and $health -match '"ok"') {
     Write-Ok "Server healthy: $health"
 } else {
-    Write-Fail "Health check failed: $health"
+    Write-Host "  [WARN] Health check did not return ok after 10 attempts: $health" -ForegroundColor Yellow
+    Write-Host "  --- pm2 status ---" -ForegroundColor Yellow
+    $pm2 = Invoke-SSHSoft "pm2 status aida-api"
+    Write-Host $pm2.Output
+    Write-Host "  --- pm2 logs (last 60 lines) ---" -ForegroundColor Yellow
+    $logs = Invoke-SSHSoft "pm2 logs aida-api --lines 60 --nostream"
+    Write-Host $logs.Output
+    Write-Fail "Health check failed."
 }
 
 # ── Summary ──────────────────────────────────────────────────────────────────
