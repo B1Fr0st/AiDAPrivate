@@ -121,7 +121,8 @@ namespace
             (unsigned long)hb_err, (unsigned long)hb_bytes,
             (unsigned long long)hb_resp,
             hb_ioctl, hb_magic, hb_dioctl ? 1 : 0);
-        diag::log_tagged("driver", buf);
+        diag::log_tagged_critical("driver", buf);
+        diag::log_tagged_critical("driver", "ABOUT_TO_FASTFAIL_0xBEA7DEAD");
         OutputDebugStringA(buf);
         anti_tamper::webhook::send_debug_log("driver", buf, true);
         Sleep(50);
@@ -130,16 +131,30 @@ namespace
 
     void driver_watchdog_thread()
     {
-        diag::log_tagged("driver", "watchdog_thread_entry");
+        diag::log_tagged_critical("driver", "watchdog_thread_entry");
+        uint64_t hb_iter = 0;
         while (!g_driver_watchdog_stop.load(std::memory_order_acquire)) {
             Sleep(kDriverWatchdogPeriodMs);
             if (g_driver_watchdog_stop.load(std::memory_order_acquire)) {
                 break;
             }
+            ++hb_iter;
+            bool connected = (device && device->is_connected());
             bool ok = false;
-            if (device && device->is_connected()) {
+            if (connected) {
                 ok = device->send_heartbeat();
             }
+            diag::log_tagged_critical_fmt("driver",
+                "heartbeat iter=%llu connected=%d ok=%d hb_err=%lu hb_bytes=%lu hb_resp=0x%016llX hb_ioctl=0x%08X hb_magic=0x%08X hb_dioctl=%d",
+                (unsigned long long)hb_iter,
+                connected ? 1 : 0,
+                ok ? 1 : 0,
+                device ? (unsigned long)device->get_last_heartbeat_error() : 0ul,
+                device ? (unsigned long)device->get_last_heartbeat_bytes_returned() : 0ul,
+                device ? (unsigned long long)device->get_last_heartbeat_response() : 0ull,
+                device ? (unsigned int)device->get_last_heartbeat_ioctl_code() : 0u,
+                device ? (unsigned int)device->get_last_heartbeat_magic() : 0u,
+                (device && device->get_last_heartbeat_dioctl_result()) ? 1 : 0);
             if (ok) {
                 g_driver_consecutive_fail.store(0, std::memory_order_release);
                 continue;
@@ -151,12 +166,12 @@ namespace
                 n,
                 device ? (unsigned long)device->get_last_heartbeat_error() : 0ul,
                 device ? (unsigned long)device->get_last_heartbeat_bytes_returned() : 0ul);
-            diag::log_tagged("driver", dbg);
+            diag::log_tagged_critical("driver", dbg);
             if (n >= kDriverWatchdogFailThreshold) {
                 driver_fast_fail("watchdog", 0xBEA70000u | (device ? device->get_last_heartbeat_error() & 0xFFFFu : 0u));
             }
         }
-        diag::log_tagged("driver", "watchdog_thread_exit");
+        diag::log_tagged_critical("driver", "watchdog_thread_exit");
     }
 
     void start_driver_watchdog_locked()

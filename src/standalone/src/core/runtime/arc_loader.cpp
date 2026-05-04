@@ -222,6 +222,129 @@ namespace
         return name;
     }
 
+    void describe_rip(DWORD64 rip, uint8_t* arc_base, size_t arc_size,
+                      char* out_mod_name, size_t mod_name_cap, DWORD64& out_rva)
+    {
+        out_rva = 0;
+        out_mod_name[0] = '?';
+        out_mod_name[1] = '\0';
+
+        const DWORD64 arc_base_64 = reinterpret_cast<DWORD64>(arc_base);
+        if (arc_base != nullptr && rip >= arc_base_64 && rip < arc_base_64 + arc_size) {
+            out_rva = rip - arc_base_64;
+            strncpy_s(out_mod_name, mod_name_cap, "aida_core.dll", _TRUNCATE);
+            return;
+        }
+
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(rip), &mbi, sizeof(mbi)) == 0)
+            return;
+        if (mbi.Type != MEM_IMAGE || mbi.AllocationBase == nullptr)
+            return;
+        const DWORD64 mod_base = reinterpret_cast<DWORD64>(mbi.AllocationBase);
+        out_rva = rip - mod_base;
+        char path[MAX_PATH] = {};
+        if (GetModuleFileNameA(reinterpret_cast<HMODULE>(mbi.AllocationBase),
+                               path, sizeof(path)) > 0) {
+            const char* base_name = strrchr(path, '\\');
+            strncpy_s(out_mod_name, mod_name_cap,
+                      base_name ? base_name + 1 : path, _TRUNCATE);
+        }
+    }
+
+    void dump_thread_stack_on_timeout(HANDLE thread, uint8_t* arc_base, size_t arc_size)
+    {
+        if (thread == nullptr || thread == INVALID_HANDLE_VALUE) {
+            arc_breadcrumb("dllmain_stackwalk_no_thread_handle");
+            return;
+        }
+
+        DWORD prev_count = SuspendThread(thread);
+        if (prev_count == static_cast<DWORD>(-1)) {
+            char tag[96];
+            _snprintf_s(tag, sizeof(tag), _TRUNCATE,
+                "dllmain_stackwalk_suspend_FAILED err=%lu",
+                static_cast<unsigned long>(GetLastError()));
+            arc_breadcrumb(tag);
+            return;
+        }
+
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        if (!GetThreadContext(thread, &ctx)) {
+            char tag[96];
+            _snprintf_s(tag, sizeof(tag), _TRUNCATE,
+                "dllmain_stackwalk_getcontext_FAILED err=%lu",
+                static_cast<unsigned long>(GetLastError()));
+            arc_breadcrumb(tag);
+            ResumeThread(thread);
+            return;
+        }
+
+        {
+            char tag[160];
+            _snprintf_s(tag, sizeof(tag), _TRUNCATE,
+                "dllmain_stackwalk_begin rip=0x%016llX rsp=0x%016llX rbp=0x%016llX",
+                static_cast<unsigned long long>(ctx.Rip),
+                static_cast<unsigned long long>(ctx.Rsp),
+                static_cast<unsigned long long>(ctx.Rbp));
+            arc_breadcrumb(tag);
+        }
+
+        DWORD64 prev_rip = 0;
+        for (int frame = 0; frame < 32; ++frame) {
+            DWORD64 rip = ctx.Rip;
+            if (rip == 0 || rip == prev_rip)
+                break;
+            prev_rip = rip;
+
+            char mod_name[64] = {};
+            DWORD64 rva = 0;
+            describe_rip(rip, arc_base, arc_size, mod_name, sizeof(mod_name), rva);
+
+            char tag[256];
+            _snprintf_s(tag, sizeof(tag), _TRUNCATE,
+                "dllmain_stackwalk[%02d] rip=0x%016llX %s+0x%llX rsp=0x%016llX",
+                frame,
+                static_cast<unsigned long long>(rip),
+                mod_name,
+                static_cast<unsigned long long>(rva),
+                static_cast<unsigned long long>(ctx.Rsp));
+            arc_breadcrumb(tag);
+
+            DWORD64 image_base_for_func = 0;
+            PRUNTIME_FUNCTION rf = nullptr;
+            __try {
+                rf = RtlLookupFunctionEntry(rip, &image_base_for_func, nullptr);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                arc_breadcrumb("dllmain_stackwalk_RtlLookupFunctionEntry_faulted_stop");
+                break;
+            }
+            if (rf == nullptr) {
+                arc_breadcrumb("dllmain_stackwalk_no_runtime_function_leaf_or_unwind_data_missing_stop");
+                break;
+            }
+
+            void* handler_data = nullptr;
+            DWORD64 establisher_frame = 0;
+            KNONVOLATILE_CONTEXT_POINTERS nv{};
+            __try {
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base_for_func, rip, rf,
+                                 &ctx, &handler_data, &establisher_frame, &nv);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                arc_breadcrumb("dllmain_stackwalk_RtlVirtualUnwind_faulted_stop");
+                break;
+            }
+            if (ctx.Rip == 0)
+                break;
+        }
+
+        arc_breadcrumb("dllmain_stackwalk_end");
+        ResumeThread(thread);
+    }
+
     bool names_equal_ci(const char* a, const char* b)
     {
         if (!a || !b)
@@ -364,6 +487,7 @@ namespace
             "kernel32.dll",
             "kernelbase.dll",
             "ntdll.dll",
+            "user32.dll",
             "bcrypt.dll",
             "advapi32.dll",
             "ws2_32.dll",
@@ -585,6 +709,7 @@ namespace
             "kernel32.dll",
             "kernelbase.dll",
             "ntdll.dll",
+            "user32.dll",
             "bcrypt.dll",
             "advapi32.dll",
             "ws2_32.dll",
@@ -1253,6 +1378,8 @@ namespace arc_loader
                 (unsigned long long)dllmain_elapsed,
                 (unsigned long long)kDllMainBudgetMs);
             arc_breadcrumb(tobuf);
+            dump_thread_stack_on_timeout(inv_thread, image_base,
+                static_cast<size_t>(mapped_nt->OptionalHeader.SizeOfImage));
             set_error_fatal("ARC DllMain did not return within the activation budget.");
             return result;
         }
@@ -1539,6 +1666,11 @@ namespace arc_loader
     bool last_error_is_fatal()
     {
         return g_last_error_fatal;
+    }
+
+    void mark_error_fatal(const std::string& msg)
+    {
+        set_error_fatal(msg);
     }
 
     void prime_import_cache()

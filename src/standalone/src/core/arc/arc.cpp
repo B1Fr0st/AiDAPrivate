@@ -13,6 +13,17 @@
 #include "arc_build_seed.hpp"
 #include "obfuscation.hpp"
 
+#undef CFF_BEGIN
+#undef CFF_STATE
+#undef CFF_GOTO
+#undef CFF_EXIT
+#undef CFF_END
+#define CFF_BEGIN(tag)
+#define CFF_STATE(tag, N)
+#define CFF_GOTO(tag, N)
+#define CFF_EXIT(tag) goto cff_exit_label_##tag
+#define CFF_END(tag) cff_exit_label_##tag: ;
+
 #include <atomic>
 #include <cstring>
 #include <cstdio>
@@ -2062,6 +2073,18 @@ ARC_API bool arc_init(
 {
     using namespace arc_internal;
 
+    {
+        char dbg[192];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "arc_init_entry session_token=%p hwid=%p ts=%lld iv=%u bind_proof=%p",
+            static_cast<const void*>(session_token),
+            static_cast<const void*>(hwid),
+            static_cast<long long>(timestamp),
+            interface_version,
+            static_cast<const void*>(bind_proof));
+        arc_log("init", dbg);
+    }
+
     bool result = false;
     uint64_t local_hwid_hash_capture = 0;
     uint64_t code_hash_capture = 0;
@@ -2072,65 +2095,95 @@ ARC_API bool arc_init(
     uint64_t last_heartbeat_tsc_capture = 0;
     uint64_t xor_key_capture = 0;
 
-    CFF_BEGIN(arc_init_cff)
-    CFF_STATE(arc_init_cff, 0)
+    arc_log("init", "arc_init_step0_validate_args");
+    if (interface_version != ARC_INTERFACE_VERSION)
     {
-        if (interface_version != ARC_INTERFACE_VERSION)
-        {
-            CFF_EXIT(arc_init_cff);
-        }
-        if (!session_token || !hwid || !bind_proof)
-        {
-            CFF_EXIT(arc_init_cff);
-        }
-        CFF_GOTO(arc_init_cff, 1);
+        char dbg[96];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "arc_init_interface_version_mismatch got=%u expected=%u",
+            interface_version, static_cast<unsigned>(ARC_INTERFACE_VERSION));
+        arc_log("init", dbg);
+        return false;
     }
-    CFF_STATE(arc_init_cff, 1)
+    if (!session_token || !hwid || !bind_proof)
+    {
+        char dbg[96];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "arc_init_null_param session_token=%d hwid=%d bind_proof=%d",
+            session_token ? 1 : 0, hwid ? 1 : 0, bind_proof ? 1 : 0);
+        arc_log("init", dbg);
+        return false;
+    }
+
+    arc_log("init", "arc_init_step1_validate_lengths");
     {
         size_t token_len = strlen(session_token);
         if (token_len < 32 || token_len > 128)
         {
-            CFF_EXIT(arc_init_cff);
+            char dbg[96];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "arc_init_session_token_len_out_of_range got=%zu expected=[32,128]",
+                token_len);
+            arc_log("init", dbg);
+            return false;
         }
         size_t hwid_len = strlen(hwid);
         if (hwid_len < 8 || hwid_len > 64)
         {
-            CFF_EXIT(arc_init_cff);
+            char dbg[96];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "arc_init_hwid_len_out_of_range got=%zu expected=[8,64]",
+                hwid_len);
+            arc_log("init", dbg);
+            return false;
         }
-        CFF_GOTO(arc_init_cff, 2);
     }
-    CFF_STATE(arc_init_cff, 2)
+
+    arc_log("init", "arc_init_step2_check_debugger");
+    if (check_debugger())
     {
-        if (check_debugger())
-        {
-            enforce_violation("arc_debugger", "arc_init");
-        }
-        CFF_GOTO(arc_init_cff, 3);
+        enforce_violation("arc_debugger", "arc_init");
     }
-    CFF_STATE(arc_init_cff, 3)
+
+    arc_log("init", "arc_init_step3_hwid_recompute");
     {
         std::string local_hwid = recompute_hwid();
         uint64_t local_hash = fnv1a_str(local_hwid.c_str());
         uint64_t provided_hash = fnv1a_str(hwid);
         local_hwid_hash_capture = local_hash;
-
+        {
+            char dbg[160];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "arc_init_hwid local=%s provided=%s local_hash=0x%016llX provided_hash=0x%016llX",
+                local_hwid.c_str(), hwid,
+                static_cast<unsigned long long>(local_hash),
+                static_cast<unsigned long long>(provided_hash));
+            arc_log("init", dbg);
+        }
         if (local_hash != provided_hash)
         {
             enforce_violation("arc_hwid_mismatch", "");
         }
-        CFF_GOTO(arc_init_cff, 4);
     }
-    CFF_STATE(arc_init_cff, 4)
+
+    arc_log("init", "arc_init_step4_timestamp_check");
     {
         int64_t now = static_cast<int64_t>(time(nullptr));
         int64_t drift = now - timestamp;
         if (drift < -300 || drift > 300)
         {
-            CFF_EXIT(arc_init_cff);
+            char dbg[160];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "arc_init_timestamp_drift_out_of_range now=%lld bind_ts=%lld drift=%lld limit=300",
+                static_cast<long long>(now),
+                static_cast<long long>(timestamp),
+                static_cast<long long>(drift));
+            arc_log("init", dbg);
+            return false;
         }
-        CFF_GOTO(arc_init_cff, 5);
     }
-    CFF_STATE(arc_init_cff, 5)
+
+    arc_log("init", "arc_init_step5_derive_keys");
     {
         uint64_t tsc = __rdtsc();
         xor_key_capture = tsc ^ 0xA1DA'CAFE'BABE'C0DEull;
@@ -2145,13 +2198,13 @@ ARC_API bool arc_init(
         uint64_t km2 = key_material ^ 0x6A09E667F3BCC908ULL;
         memcpy(kb + 8, &km2, 8);
         vtable_crypt_key_capture = siphash_2_4(kb, 16, local_hwid_hash_capture, session_hash_capture);
-
-        CFF_GOTO(arc_init_cff, 6);
     }
-    CFF_STATE(arc_init_cff, 6)
+
+    arc_log("init", "arc_init_step6_bind_proof_verify");
     {
         if (!load_bind_secret())
         {
+            arc_log("init", "arc_init_load_bind_secret_FAILED");
             enforce_violation("arc_no_bind_secret", "");
         }
 
@@ -2177,31 +2230,40 @@ ARC_API bool arc_init(
         if (!hmac_ok)
         {
             SecureZeroMemory(expected, sizeof(expected));
+            arc_log("init", "arc_init_bind_proof_hmac_compute_FAILED");
             enforce_violation("arc_bind_proof_hmac_failed", "");
         }
 
         if (memcmp(expected, bind_proof, 32) != 0)
         {
+            char dbg[200];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "arc_init_bind_proof_mismatch expected[0..7]=%02X%02X%02X%02X%02X%02X%02X%02X got[0..7]=%02X%02X%02X%02X%02X%02X%02X%02X",
+                expected[0], expected[1], expected[2], expected[3],
+                expected[4], expected[5], expected[6], expected[7],
+                bind_proof[0], bind_proof[1], bind_proof[2], bind_proof[3],
+                bind_proof[4], bind_proof[5], bind_proof[6], bind_proof[7]);
+            arc_log("init", dbg);
             SecureZeroMemory(expected, sizeof(expected));
             enforce_violation("arc_bind_proof_mismatch", "");
         }
 
         SecureZeroMemory(expected, sizeof(expected));
-        CFF_GOTO(arc_init_cff, 7);
     }
-    CFF_STATE(arc_init_cff, 7)
+
+    arc_log("init", "arc_init_step7_code_hash_and_session");
     {
         integrity_scan_result_t baseline_scan = scan_own_code_integrity(true, "arc_init_baseline");
         code_hash_capture = baseline_scan.hash;
         if (code_hash_capture == 0 || baseline_scan.included_regions == 0)
         {
             arc_log("init", "arc_init_code_hash_capture_failed");
-            CFF_EXIT(arc_init_cff);
+            return false;
         }
         {
             char dbg[192];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "arc_init code_hash=0x%016llX exec=%u included=%u mutable=%u guarded=%u read_fail=%u",
+                "arc_init_code_hash hash=0x%016llX exec=%u included=%u mutable=%u guarded=%u read_fail=%u",
                 static_cast<unsigned long long>(code_hash_capture),
                 baseline_scan.exec_regions,
                 baseline_scan.included_regions,
@@ -2239,18 +2301,20 @@ ARC_API bool arc_init(
         SecureZeroMemory(&sess, sizeof(sess));
 
         result = true;
-        CFF_GOTO(arc_init_cff, 8);
     }
-    CFF_STATE(arc_init_cff, 8)
+
+    arc_log("init", "arc_init_step8_device_bridge");
     {
         voyager::device_t* dev = get_device_enc(g_vtable_crypt_key);
         if (!dev)
         {
+            arc_log("init", "arc_init_get_device_enc_returned_null");
             enforce_violation("arc_no_device", "init");
         }
 
         if (!dev->is_connected())
         {
+            arc_log("init", "arc_init_device_disconnected");
             enforce_violation("arc_no_driver", "device_disconnected");
         }
 
@@ -2418,11 +2482,14 @@ ARC_API bool arc_init(
         {
             arc_log("driver", "image_layout_unavailable");
         }
-
-        CFF_EXIT(arc_init_cff);
     }
-    CFF_END(arc_init_cff)
 
+    {
+        char dbg[96];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "arc_init_exit result=%s", result ? "true" : "false");
+        arc_log("init", dbg);
+    }
     return result;
 }
 

@@ -366,6 +366,7 @@ namespace dispatcher {
                 if (elapsed > HEARTBEAT_TIMEOUT) {
                     WW_LOG("Controller: session timed out (elapsed=%lld > %lld), resetting dynamic state for reconnection",
                         elapsed, (LONG64)HEARTBEAT_TIMEOUT);
+                    HANDLE prev_client = caller_validation::g_registered_client_pid;
                     _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_server_seed), 0);
                     _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_cached_key), 0);
                     _InterlockedExchange(reinterpret_cast<volatile LONG*>(&ioctl_codes::g_server_ioctl_seed), 0);
@@ -375,6 +376,12 @@ namespace dispatcher {
                     _InterlockedExchange64(&g_last_heartbeat_time, 0);
                     caller_validation::unregister_client();
                     secure_comm::reset();
+                    if (prev_client) {
+                        UINT32 prev_pid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(prev_client));
+                        anti_dma_canary::cleanup_for_pid(prev_pid);
+                        continuous_anti_debug::stop();
+                        continuous_anti_dump::stop();
+                    }
                 }
             }
         }
@@ -930,10 +937,17 @@ namespace dispatcher {
                         if (existing_key != 0 && (ULONG)existing_key != hb->session_key) {
                             WW_LOG("HB: session key mismatch existing=0x%lx new=0x%lx, resetting",
                                 (ULONG)existing_key, hb->session_key);
+                            HANDLE prev_client = caller_validation::g_registered_client_pid;
                             caller_validation::unregister_client();
                             _InterlockedExchange((volatile LONG*)&g_session_key, 0);
                             _InterlockedExchange((volatile LONG*)&g_heartbeat_counter, 0);
                             _InterlockedExchange(&g_driver_activated, 0);
+                            if (prev_client) {
+                                UINT32 prev_pid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(prev_client));
+                                anti_dma_canary::cleanup_for_pid(prev_pid);
+                                continuous_anti_debug::stop();
+                                continuous_anti_dump::stop();
+                            }
                             existing_key = _InterlockedCompareExchange((volatile LONG*)&g_session_key, (LONG)hb->session_key, 0);
                         }
 
@@ -1075,23 +1089,33 @@ namespace dispatcher {
                         req->pid);
                     status = STATUS_ACCESS_DENIED;
                 } else {
+                    ULONG client_pid = static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(
+                        caller_validation::g_registered_client_pid));
+                    ULONG caller_pid = static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(
+                        PsGetCurrentProcessId()));
                     ULONG pid = req->pid;
                     if (pid == 0)
-                        pid = static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(
-                            caller_validation::g_registered_client_pid));
-                    WW_LOG("CANR: request va=0x%llx size=0x%llx requested_pid=%u resolved_pid=%lu session=0x%lx count_before=%lu",
-                        static_cast<unsigned long long>(req->va),
-                        static_cast<unsigned long long>(req->size),
-                        req->pid,
-                        pid,
-                        req->session_key,
-                        anti_dma_canary::g_canary_count);
-                    req->result = anti_dma_canary::register_canary(req->va, req->size, pid) ? 1u : 0u;
-                    WW_LOG("CANR: result=%u resolved_pid=%lu count_after=%lu",
-                        req->result,
-                        pid,
-                        anti_dma_canary::g_canary_count);
-                    status = STATUS_SUCCESS;
+                        pid = client_pid;
+                    if (client_pid == 0 || pid != client_pid || caller_pid != client_pid) {
+                        WW_LOG("CANR: REJECT cross_pid_or_unregistered req_pid=%u client_pid=%lu caller_pid=%lu",
+                            req->pid, client_pid, caller_pid);
+                        req->result = 0;
+                        status = STATUS_ACCESS_DENIED;
+                    } else {
+                        WW_LOG("CANR: request va=0x%llx size=0x%llx requested_pid=%u resolved_pid=%lu session=0x%lx count_before=%lu",
+                            static_cast<unsigned long long>(req->va),
+                            static_cast<unsigned long long>(req->size),
+                            req->pid,
+                            pid,
+                            req->session_key,
+                            anti_dma_canary::g_canary_count);
+                        req->result = anti_dma_canary::register_canary(req->va, req->size, pid) ? 1u : 0u;
+                        WW_LOG("CANR: result=%u resolved_pid=%lu count_after=%lu",
+                            req->result,
+                            pid,
+                            anti_dma_canary::g_canary_count);
+                        status = STATUS_SUCCESS;
+                    }
                 }
                 bytes = sizeof(phase3_msg::canary_register_request_k);
             } else { status = STATUS_INFO_LENGTH_MISMATCH; }
@@ -1211,6 +1235,7 @@ namespace dispatcher {
                     WW_LOG("HB-RECONNECT: detected fresh client using base IOCTL code 0x%lx (seeded was 0x%lx)",
                         base_hb_code, ioctl_codes::HB());
 
+                    HANDLE prev_client = caller_validation::g_registered_client_pid;
                     _InterlockedExchange(reinterpret_cast<volatile LONG*>(&ioctl_codes::g_server_ioctl_seed), 0);
                     _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_session_key), 0);
                     _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_heartbeat_counter), 0);
@@ -1218,6 +1243,12 @@ namespace dispatcher {
                     _InterlockedExchange64(&g_last_heartbeat_time, 0);
                     caller_validation::unregister_client();
                     secure_comm::reset();
+                    if (prev_client) {
+                        UINT32 prev_pid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(prev_client));
+                        anti_dma_canary::cleanup_for_pid(prev_pid);
+                        continuous_anti_debug::stop();
+                        continuous_anti_dump::stop();
+                    }
 
 
                     p_heartbeat hb = (p_heartbeat)buffer;

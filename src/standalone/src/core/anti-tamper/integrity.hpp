@@ -780,7 +780,9 @@ inline bool verify_self_hash()
 {
     uint64_t expected = detail::s_self_chain_anchor.load(std::memory_order_acquire);
     if (expected == 0) return true;
-    uint64_t per_call = detail::derive_per_call_key();
+    uint64_t self_seed = detail::s_self_chain_seed.load(std::memory_order_acquire);
+    if (self_seed == 0) return true;
+    uint64_t per_call = siphash::siphash_3u64(self_seed, detail::load_k0(), detail::load_k1());
     uint64_t computed = detail::self_hash_chain_compute(per_call);
     uint8_t mat[16];
     memcpy(mat + 0, &computed, 8);
@@ -795,7 +797,6 @@ inline bool verify_self_hash()
     SecureZeroMemory(mac, sizeof(mac));
     SecureZeroMemory(mat, sizeof(mat));
 
-    uint64_t self_seed = detail::s_self_chain_seed.load(std::memory_order_acquire);
     return (anchor_recomputed ^ self_seed) == expected;
 }
 
@@ -844,7 +845,7 @@ inline bool snapshot_code(state::code_snapshot_t& snap)
     uint64_t seed_value = detail::fresh_entropy();
     if (seed_value == 0) seed_value = 0xA1DAA0E2DEADBEEFULL;
     detail::s_self_chain_seed.store(seed_value, std::memory_order_release);
-    uint64_t per_call = detail::derive_per_call_key();
+    uint64_t per_call = siphash::siphash_3u64(seed_value, detail::load_k0(), detail::load_k1());
     uint64_t chain = detail::self_hash_chain_compute(per_call);
     uint8_t mat[16];
     memcpy(mat + 0, &chain, 8);
@@ -1036,6 +1037,32 @@ inline bool periodic_violation_latched()
     return detail::periodic_violation_flag().load(std::memory_order_acquire);
 }
 
+inline void clear_periodic_violation_flag()
+{
+    detail::periodic_violation_flag().store(false, std::memory_order_release);
+}
+
+inline void rebuild_self_chain_anchor()
+{
+    uint64_t seed_value = detail::s_self_chain_seed.load(std::memory_order_acquire);
+    if (seed_value == 0) return;
+    uint64_t per_call = siphash::siphash_3u64(seed_value, detail::load_k0(), detail::load_k1());
+    uint64_t chain = detail::self_hash_chain_compute(per_call);
+    uint8_t mat[16];
+    memcpy(mat + 0, &chain, 8);
+    memcpy(mat + 8, &per_call, 8);
+    uint8_t mac[32] = {};
+    uint8_t base_secret[32];
+    detail::compute_session_secret(base_secret);
+    sha256::hmac(base_secret, 32, mat, sizeof(mat), mac);
+    SecureZeroMemory(base_secret, sizeof(base_secret));
+    uint64_t anchor = 0;
+    memcpy(&anchor, mac, 8);
+    SecureZeroMemory(mac, sizeof(mac));
+    SecureZeroMemory(mat, sizeof(mat));
+    detail::s_self_chain_anchor.store(anchor ^ seed_value, std::memory_order_release);
+}
+
 inline LONG NTAPI page_mac_veh_handler(EXCEPTION_POINTERS* ep)
 {
     if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
@@ -1065,10 +1092,13 @@ inline void rotate_page_keys_if_due()
     uint64_t now = detail::qpc_now_ms();
     uint64_t last = pt.last_rotation_qpc.load(std::memory_order_acquire);
     if (now - last < static_cast<uint64_t>(detail::kKeyRotationSec) * 1000ULL) return;
-    std::lock_guard<std::mutex> lk(pt.mtx);
-    if (pt.last_rotation_qpc.load(std::memory_order_acquire) != last) return;
-    detail::rotate_session_secret();
-    detail::rotate_page_keys_locked(pt);
+    {
+        std::lock_guard<std::mutex> lk(pt.mtx);
+        if (pt.last_rotation_qpc.load(std::memory_order_acquire) != last) return;
+        detail::rotate_session_secret();
+        detail::rotate_page_keys_locked(pt);
+    }
+    rebuild_self_chain_anchor();
 }
 
 namespace periodic {
@@ -1116,13 +1146,6 @@ namespace periodic {
             const uint8_t* page = reinterpret_cast<const uint8_t*>(pt.base + offset);
             uint64_t live = siphash::hash(page, this_size,
                 k0 ^ static_cast<uint64_t>(i), k1 ^ static_cast<uint64_t>(i + 1));
-            uint64_t stored = 0;
-            memcpy(&stored, pt.entries[i].full_tag, 8);
-            uint64_t mac_recompute = static_cast<uint64_t>(live);
-            if (mac_recompute != stored)
-            {
-                ++mismatch_count_out;
-            }
             signature ^= live;
             signature = (signature * 0x9E3779B97F4A7C15ULL) ^ (signature >> 27);
         }

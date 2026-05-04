@@ -23,6 +23,37 @@ namespace key_pipeline {
 
 namespace detail_kp {
 
+    inline void kat_dbg_log(const char* msg)
+    {
+        char path[MAX_PATH] = {};
+        DWORD ret = GetModuleFileNameA(nullptr, path, MAX_PATH);
+        if (ret == 0 || ret >= MAX_PATH) {
+            std::strcpy(path, "aida_debug.log");
+        } else {
+            char* last = std::strrchr(path, '\\');
+            if (last) *(last + 1) = '\0';
+            else path[0] = '\0';
+            std::strcat(path, "aida_debug.log");
+        }
+        HANDLE hf = CreateFileA(path, FILE_APPEND_DATA | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf == INVALID_HANDLE_VALUE) return;
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        char line[512];
+        int len = _snprintf_s(line, sizeof(line), _TRUNCATE,
+            "[%02d:%02d:%02d.%03d] [kat] %s\r\n",
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+            msg ? msg : "");
+        if (len > 0) {
+            DWORD written = 0;
+            WriteFile(hf, line, static_cast<DWORD>(len), &written, nullptr);
+            FlushFileBuffers(hf);
+        }
+        CloseHandle(hf);
+    }
+
     inline std::string& s_last_error_storage()
     {
         static std::string s;
@@ -160,6 +191,7 @@ namespace detail_kp {
 
     inline bool run_kat()
     {
+        kat_dbg_log("run_kat: ENTRY");
         {
             const uint8_t ikm[22] = {
                 0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,
@@ -174,23 +206,32 @@ namespace detail_kp {
                 0xf0,0xf1,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,0xf8,0xf9
             };
             const uint8_t expected[42] = {
-                0x83,0x2c,0x9b,0xb2,0x9b,0xfd,0x9b,0xc4,
-                0x39,0x97,0xc7,0x4d,0xb1,0xa6,0xa3,0xae,
-                0xe1,0x6a,0x05,0xab,0x6b,0xa3,0xb6,0xc6,
-                0xed,0xc3,0x91,0x46,0x07,0x6f,0x95,0xed,
-                0x96,0x4d,0xb1,0xb1,0x9b,0x84,0xb5,0xfb,
-                0x21,0xa1
+                0x83,0x23,0x90,0x08,0x6c,0xda,0x71,0xfb,
+                0x47,0x62,0x5b,0xb5,0xce,0xb1,0x68,0xe4,
+                0xc8,0xe2,0x6a,0x1a,0x16,0xed,0x34,0xd9,
+                0xfc,0x7f,0xe9,0x2c,0x14,0x81,0x57,0x93,
+                0x38,0xda,0x36,0x2c,0xb8,0xd9,0xf9,0x25,
+                0xd7,0xcb
             };
             uint8_t out[42] = {};
             bool ok = false;
+            kat_dbg_log("run_kat: HKDF-SHA512 calling");
             hkdf_sha512_internal(ikm, sizeof(ikm), salt, sizeof(salt),
                                  info, sizeof(info), out, sizeof(out), ok);
-            if (!ok) { set_last_error("kat_hkdf_sha512_call_failed"); return false; }
+            kat_dbg_log(ok ? "run_kat: HKDF-SHA512 call returned ok=true" : "run_kat: HKDF-SHA512 call returned ok=FALSE");
+            if (!ok) { set_last_error("kat_hkdf_sha512_call_failed"); kat_dbg_log("run_kat: FAIL kat_hkdf_sha512_call_failed"); return false; }
             if (!ct_equal(out, expected, sizeof(expected)))
             {
                 set_last_error("kat_hkdf_sha512_mismatch");
+                char buf[256];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "run_kat: FAIL kat_hkdf_sha512_mismatch first8=%02X%02X%02X%02X%02X%02X%02X%02X expected_first8=%02X%02X%02X%02X%02X%02X%02X%02X",
+                    out[0],out[1],out[2],out[3],out[4],out[5],out[6],out[7],
+                    expected[0],expected[1],expected[2],expected[3],expected[4],expected[5],expected[6],expected[7]);
+                kat_dbg_log(buf);
                 return false;
             }
+            kat_dbg_log("run_kat: HKDF-SHA512 PASS");
         }
 
         {
@@ -208,13 +249,22 @@ namespace detail_kp {
             };
             uint8_t out[32] = {};
             bool ok = false;
+            kat_dbg_log("run_kat: HMAC-SHA256 calling");
             hmac_sha256_internal(key, sizeof(key), data, sizeof(data), out, ok);
-            if (!ok) { set_last_error("kat_hmac_sha256_call_failed"); return false; }
+            kat_dbg_log(ok ? "run_kat: HMAC-SHA256 call returned ok=true" : "run_kat: HMAC-SHA256 call returned ok=FALSE");
+            if (!ok) { set_last_error("kat_hmac_sha256_call_failed"); kat_dbg_log("run_kat: FAIL kat_hmac_sha256_call_failed"); return false; }
             if (!ct_equal(out, expected, 32))
             {
                 set_last_error("kat_hmac_sha256_mismatch");
+                char buf[256];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "run_kat: FAIL kat_hmac_sha256_mismatch first8=%02X%02X%02X%02X%02X%02X%02X%02X expected_first8=%02X%02X%02X%02X%02X%02X%02X%02X",
+                    out[0],out[1],out[2],out[3],out[4],out[5],out[6],out[7],
+                    expected[0],expected[1],expected[2],expected[3],expected[4],expected[5],expected[6],expected[7]);
+                kat_dbg_log(buf);
                 return false;
             }
+            kat_dbg_log("run_kat: HMAC-SHA256 PASS");
         }
 
         {
@@ -260,21 +310,37 @@ namespace detail_kp {
             uint8_t ct[60] = {};
             uint8_t tag[16] = {};
             bool ok = false;
+            kat_dbg_log("run_kat: AES-GCM calling");
             aes_gcm_encrypt_internal(key, iv, aad, sizeof(aad), pt, sizeof(pt),
                                      ct, tag, ok);
-            if (!ok) { set_last_error("kat_aes_gcm_call_failed"); return false; }
+            kat_dbg_log(ok ? "run_kat: AES-GCM call returned ok=true" : "run_kat: AES-GCM call returned ok=FALSE");
+            if (!ok) { set_last_error("kat_aes_gcm_call_failed"); kat_dbg_log("run_kat: FAIL kat_aes_gcm_call_failed"); return false; }
             if (!ct_equal(ct, expected_ct, sizeof(expected_ct)))
             {
                 set_last_error("kat_aes_gcm_ct_mismatch");
+                char buf[256];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "run_kat: FAIL kat_aes_gcm_ct_mismatch first8=%02X%02X%02X%02X%02X%02X%02X%02X expected_first8=%02X%02X%02X%02X%02X%02X%02X%02X",
+                    ct[0],ct[1],ct[2],ct[3],ct[4],ct[5],ct[6],ct[7],
+                    expected_ct[0],expected_ct[1],expected_ct[2],expected_ct[3],expected_ct[4],expected_ct[5],expected_ct[6],expected_ct[7]);
+                kat_dbg_log(buf);
                 return false;
             }
             if (!ct_equal(tag, expected_tag, sizeof(expected_tag)))
             {
                 set_last_error("kat_aes_gcm_tag_mismatch");
+                char buf[256];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "run_kat: FAIL kat_aes_gcm_tag_mismatch tag=%02X%02X%02X%02X%02X%02X%02X%02X expected_tag=%02X%02X%02X%02X%02X%02X%02X%02X",
+                    tag[0],tag[1],tag[2],tag[3],tag[4],tag[5],tag[6],tag[7],
+                    expected_tag[0],expected_tag[1],expected_tag[2],expected_tag[3],expected_tag[4],expected_tag[5],expected_tag[6],expected_tag[7]);
+                kat_dbg_log(buf);
                 return false;
             }
+            kat_dbg_log("run_kat: AES-GCM PASS");
         }
 
+        kat_dbg_log("run_kat: ALL PASS, returning true");
         return true;
     }
 
@@ -287,13 +353,25 @@ inline const char* last_error()
 
 inline bool ensure_kat_passed()
 {
+    detail_kp::kat_dbg_log("ensure_kat_passed: ENTRY");
     std::call_once(detail_kp::s_kat_once(), []() {
+        detail_kp::kat_dbg_log("ensure_kat_passed: call_once callback ENTRY");
         bool ok = detail_kp::run_kat();
+        detail_kp::kat_dbg_log(ok ? "ensure_kat_passed: run_kat returned TRUE" : "ensure_kat_passed: run_kat returned FALSE");
         detail_kp::s_kat_passed().store(ok, std::memory_order_release);
-        if (!ok)
+        if (!ok) {
+            char buf[256];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "ensure_kat_passed: ABOUT TO __fastfail(0xA1DA0CA7) last_error=%s",
+                detail_kp::s_last_error_storage().c_str());
+            detail_kp::kat_dbg_log(buf);
             __fastfail(0xA1DA0CA7u);
+        }
+        detail_kp::kat_dbg_log("ensure_kat_passed: call_once callback DONE");
     });
-    return detail_kp::s_kat_passed().load(std::memory_order_acquire);
+    bool result = detail_kp::s_kat_passed().load(std::memory_order_acquire);
+    detail_kp::kat_dbg_log(result ? "ensure_kat_passed: returning TRUE" : "ensure_kat_passed: returning FALSE");
+    return result;
 }
 
 inline bool derive(const char* domain,

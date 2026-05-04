@@ -67,6 +67,47 @@ static HRESULT trusted_show_file_dialog(IFileOpenDialog* dialog, HWND owner)
 	return dialog ? dialog->Show(owner) : E_POINTER;
 }
 
+static bool license_activate_impl(const char* key_str,
+                                  char* err_buf,
+                                  size_t err_buf_size)
+{
+	if (err_buf && err_buf_size) err_buf[0] = '\0';
+	std::string key(key_str ? key_str : "");
+	std::string err;
+	bool ok = false;
+	try {
+		ok = standalone_license::activate(g_sa_settings, key, err);
+	} catch (const std::exception& ex) {
+		err = std::string("Activation worker exception: ") + ex.what();
+		ok = false;
+	} catch (...) {
+		err = "Activation worker threw unknown exception.";
+		ok = false;
+	}
+	if (err_buf && err_buf_size) {
+		size_t copy = err.size();
+		if (copy >= err_buf_size) copy = err_buf_size - 1;
+		memcpy(err_buf, err.data(), copy);
+		err_buf[copy] = '\0';
+	}
+	return ok;
+}
+
+__declspec(noinline) static DWORD seh_license_activate(const char* key_str,
+                                                       BOOL* out_ok,
+                                                       char* err_buf,
+                                                       size_t err_buf_size)
+{
+	*out_ok = FALSE;
+	__try {
+		bool ok = license_activate_impl(key_str, err_buf, err_buf_size);
+		*out_ok = ok ? TRUE : FALSE;
+		return 0;
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		return GetExceptionCode();
+	}
+}
+
 
 #include "../assets/theme_icons/kaneki.h"
 #include "../assets/theme_icons/rias.h"
@@ -1357,26 +1398,57 @@ void helpers::render_title()
 
 			std::string key_copy(license::key_buf);
 			work_queue::post([key_copy]() {
-				std::string error_text;
-				if (standalone_license::activate(g_sa_settings, key_copy, error_text)) {
-					license::saved_key  = key_copy;
-					license::validated  = true;
-					license::checking   = false;
-					license::error_msg.clear();
-				} else {
-					license::error_msg   = error_text.empty() ? "License validation failed." : error_text;
+				BOOL activation_ok = FALSE;
+				char err_buf[1024] = {};
+				DWORD seh_code = seh_license_activate(key_copy.c_str(),
+				                                     &activation_ok,
+				                                     err_buf, sizeof(err_buf));
+
+				try {
+					if (seh_code != 0) {
+						char dbg[160];
+						_snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+							"Activation crashed (SEH 0x%08X). Please retry.",
+							static_cast<unsigned int>(seh_code));
+						license::error_msg = dbg;
+						license::check_failed = true;
+					}
+					else if (activation_ok) {
+						license::saved_key = key_copy;
+						license::validated = true;
+						license::error_msg.clear();
+					}
+					else {
+						license::error_msg = (err_buf[0] != '\0')
+						    ? std::string(err_buf)
+						    : std::string("License validation failed.");
+						license::check_failed = true;
+					}
+				} catch (...) {
 					license::check_failed = true;
-					license::checking    = false;
 				}
+				license::checking = false;
 			});
 		}
 
 
 		if (license::check_failed && !license::error_msg.empty())
 		{
-			ImVec2 err_ts = ImGui::CalcTextSize(license::error_msg.c_str());
-			dl->AddText(ImVec2(cx - err_ts.x * 0.5f, wp.y + btn_y_rel + btn_h + 14.f),
-				IM_COL32(220, 80, 80, (int)(220 * la)), license::error_msg.c_str());
+			ImFont* err_font = ImGui::GetFont();
+			float err_font_size = ImGui::GetFontSize();
+			float err_wrap_width = ww - 40.f;
+			if (err_wrap_width < 100.f) err_wrap_width = 100.f;
+			ImVec2 err_ts = err_font->CalcTextSizeA(err_font_size, FLT_MAX, err_wrap_width,
+				license::error_msg.c_str(), nullptr, nullptr);
+			float err_x = cx - err_ts.x * 0.5f;
+			float min_x = wp.x + 20.f;
+			if (err_x < min_x) err_x = min_x;
+			dl->AddText(err_font, err_font_size,
+				ImVec2(err_x, wp.y + btn_y_rel + btn_h + 14.f),
+				IM_COL32(220, 80, 80, (int)(220 * la)),
+				license::error_msg.c_str(),
+				nullptr,
+				err_wrap_width);
 		}
 
 

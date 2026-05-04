@@ -117,6 +117,82 @@ namespace anti_dma_canary {
         }
     }
 
+    __forceinline BOOLEAN is_pid_alive(UINT32 pid) {
+        if (pid == 0 || pid == 4) return TRUE;
+        PEPROCESS proc = nullptr;
+        NTSTATUS st = PsLookupProcessByProcessId(
+            reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid)), &proc);
+        if (!NT_SUCCESS(st) || !proc) return FALSE;
+        ObDereferenceObject(proc);
+        return TRUE;
+    }
+
+    __forceinline ULONG cleanup_for_pid(UINT32 owner_pid) {
+        if (owner_pid == 0) return 0;
+        ensure_lock();
+        KIRQL old;
+        KeAcquireSpinLock(&g_canary_lock, &old);
+        ULONG cleared = 0;
+        for (ULONG i = 0; i < MAX_CANARIES; i++) {
+            if (g_canaries[i].active && g_canaries[i].owner_pid == owner_pid) {
+                g_canaries[i].active    = 0;
+                g_canaries[i].pa        = 0;
+                g_canaries[i].va        = 0;
+                g_canaries[i].size      = 0;
+                g_canaries[i].owner_pid = 0;
+                cleared++;
+            }
+        }
+        if (cleared) {
+            ULONG new_count = 0;
+            for (ULONG i = 0; i < MAX_CANARIES; i++) {
+                if (g_canaries[i].active) new_count = i + 1;
+            }
+            g_canary_count = new_count;
+        }
+        KeReleaseSpinLock(&g_canary_lock, old);
+        if (cleared) {
+            WW_LOG("dma_canary::cleanup_for_pid pid=%lu cleared=%lu count=%lu",
+                owner_pid, cleared, g_canary_count);
+        }
+        return cleared;
+    }
+
+    __forceinline ULONG cleanup_dead_owners() {
+        ensure_lock();
+        UINT32 candidates[MAX_CANARIES];
+        ULONG candidate_count = 0;
+        KIRQL old;
+        KeAcquireSpinLock(&g_canary_lock, &old);
+        for (ULONG i = 0; i < MAX_CANARIES; i++) {
+            if (!g_canaries[i].active) continue;
+            UINT32 owner = g_canaries[i].owner_pid;
+            if (owner == 0) continue;
+            BOOLEAN duplicate = FALSE;
+            for (ULONG j = 0; j < candidate_count; j++) {
+                if (candidates[j] == owner) { duplicate = TRUE; break; }
+            }
+            if (!duplicate) candidates[candidate_count++] = owner;
+        }
+        KeReleaseSpinLock(&g_canary_lock, old);
+
+        ULONG total_cleared = 0;
+        UINT32 registered = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(
+            caller_validation::g_registered_client_pid));
+        for (ULONG i = 0; i < candidate_count; i++) {
+            UINT32 pid = candidates[i];
+            if (pid == registered && registered != 0) continue;
+            if (!is_pid_alive(pid)) {
+                ULONG cleared = cleanup_for_pid(pid);
+                if (cleared) {
+                    WW_LOG("dma_canary::cleanup_dead_owner pid=%lu cleared=%lu", pid, cleared);
+                }
+                total_cleared += cleared;
+            }
+        }
+        return total_cleared;
+    }
+
     __forceinline UINT64 va_to_pa_for_pid(ULONG pid, UINT64 va) {
         PEPROCESS proc = nullptr;
         if (!NT_SUCCESS(PsLookupProcessByProcessId(
@@ -134,6 +210,13 @@ namespace anti_dma_canary {
         if (!dtb) return 0;
 
         return strong::translate_virtual_address(dtb, va);
+    }
+
+    __forceinline BOOLEAN canary_still_valid_for(UINT32 owner_pid, UINT64 owner_va, UINT64 canary_pa) {
+        if (owner_pid == 0) return FALSE;
+        UINT64 current_pa = va_to_pa_for_pid(static_cast<ULONG>(owner_pid), owner_va);
+        if (current_pa == 0) return FALSE;
+        return ((current_pa & ~0xFFFULL) == (canary_pa & ~0xFFFULL));
     }
 
     __forceinline BOOLEAN register_canary(UINT64 va, UINT64 size, ULONG owner_pid) {
@@ -344,6 +427,9 @@ namespace anti_dma_canary {
 
     __forceinline void do_scan_batch() {
         if (!caller_validation::g_registered_client_pid) return;
+
+        cleanup_dead_owners();
+
         if (g_canary_count == 0) return;
 
         LONG64 batch_id = _InterlockedIncrement64(&g_scan_batch_id);
@@ -437,6 +523,21 @@ namespace anti_dma_canary {
         }
 
         if (hit_pid != 0) {
+            if (!canary_still_valid_for(hit_info.owner_pid, hit_info.owner_va, hit_info.canary_pa)) {
+                ULONG cleared = cleanup_for_pid(hit_info.owner_pid);
+                _InterlockedExchange(&g_strike_pid, 0);
+                _InterlockedExchange(&g_strike_count, 0);
+                WW_LOG("dma_canary::stale_canary_evicted id=%lld owner=%u va=0x%llx canary_pa=0x%llx mapped_pa=0x%llx offender_pid=%lu cleared=%lu",
+                    batch_id,
+                    hit_info.owner_pid,
+                    static_cast<unsigned long long>(hit_info.owner_va),
+                    static_cast<unsigned long long>(hit_info.canary_pa),
+                    static_cast<unsigned long long>(hit_info.mapped_pa),
+                    hit_pid,
+                    cleared);
+                return;
+            }
+
             LONG prev_pid = _InterlockedExchange(&g_strike_pid, static_cast<LONG>(hit_pid));
             LONG strikes;
             if (prev_pid == static_cast<LONG>(hit_pid)) {
@@ -481,34 +582,56 @@ namespace anti_dma_canary {
                 strikes);
 
             if (strikes >= PERSIST_STRIKE) {
-                ULONG cmd   = sentinel_bridge::BRIDGE_CMD_CANARY_FOREIGN_PT;
-                ULONG param = hit_pid;
-                ULONG plain_cmd = cmd;
-                ULONG plain_param = param;
-                sentinel_bridge::bridge_encrypt_cmd(cmd, param);
-                _InterlockedExchange(
-                    reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd),
-                    static_cast<LONG>(cmd));
-                _InterlockedExchange(
-                    reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd_param),
-                    static_cast<LONG>(param));
+                BOOLEAN owner_alive    = is_pid_alive(hit_info.owner_pid);
+                BOOLEAN offender_alive = is_pid_alive(hit_pid);
 
-                WW_LOG("dma_canary::bridge_armed id=%lld plain_cmd=%lu plain_param_pid=%lu enc_cmd=0x%lx enc_param=0x%lx bridge=%p key=0x%llx",
-                    batch_id,
-                    plain_cmd,
-                    plain_param,
-                    cmd,
-                    param,
-                    &sentinel_bridge::g_bridge,
-                    static_cast<unsigned long long>(sentinel_bridge::g_bridge_crypt_key));
+                if (!owner_alive) {
+                    cleanup_for_pid(hit_info.owner_pid);
+                    _InterlockedExchange(&g_strike_pid, 0);
+                    _InterlockedExchange(&g_strike_count, 0);
+                    WW_LOG("dma_canary::arm_aborted reason=owner_dead id=%lld pid=%lu owner=%u strikes=%ld",
+                        batch_id,
+                        hit_pid,
+                        hit_info.owner_pid,
+                        strikes);
+                } else if (!offender_alive) {
+                    _InterlockedExchange(&g_strike_pid, 0);
+                    _InterlockedExchange(&g_strike_count, 0);
+                    WW_LOG("dma_canary::arm_aborted reason=offender_dead id=%lld pid=%lu owner=%u strikes=%ld",
+                        batch_id,
+                        hit_pid,
+                        hit_info.owner_pid,
+                        strikes);
+                } else {
+                    ULONG cmd   = sentinel_bridge::BRIDGE_CMD_CANARY_FOREIGN_PT;
+                    ULONG param = hit_pid;
+                    ULONG plain_cmd = cmd;
+                    ULONG plain_param = param;
+                    sentinel_bridge::bridge_encrypt_cmd(cmd, param);
+                    _InterlockedExchange(
+                        reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd),
+                        static_cast<LONG>(cmd));
+                    _InterlockedExchange(
+                        reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd_param),
+                        static_cast<LONG>(param));
 
-                targeting_latch::latch_targeting(
-                    sentinel_bridge::RE_REASON_DMA_CANARY,
-                    hit_info.owner_va,
-                    static_cast<UINT64>(hit_pid),
-                    static_cast<UINT64>(hit_info.owner_pid),
-                    0
-                );
+                    WW_LOG("dma_canary::bridge_armed id=%lld plain_cmd=%lu plain_param_pid=%lu enc_cmd=0x%lx enc_param=0x%lx bridge=%p key=0x%llx",
+                        batch_id,
+                        plain_cmd,
+                        plain_param,
+                        cmd,
+                        param,
+                        &sentinel_bridge::g_bridge,
+                        static_cast<unsigned long long>(sentinel_bridge::g_bridge_crypt_key));
+
+                    targeting_latch::latch_targeting(
+                        sentinel_bridge::RE_REASON_DMA_CANARY,
+                        hit_info.owner_va,
+                        static_cast<UINT64>(hit_pid),
+                        static_cast<UINT64>(hit_info.owner_pid),
+                        0
+                    );
+                }
             } else {
                 WW_LOG("dma_canary::bridge_not_armed id=%lld pid=%lu strikes=%ld threshold=%lu",
                     batch_id,

@@ -1099,11 +1099,58 @@ static SimpleHttpResponse winhttp_https_request_impl(
                         : const_cast<char*>(req_body.data());
     DWORD   body_len = static_cast<DWORD>(req_body.size());
 
-    lic_log("winhttp_calling_send_request");
+    {
+        char dbuf[160];
+        _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
+            "winhttp_calling_send_request body_len=%lu hdr_len=%lu",
+            static_cast<unsigned long>(body_len),
+            static_cast<unsigned long>(hdr_len));
+        lic_log(dbuf);
+    }
+
+    struct winhttp_watchdog_t {
+        HINTERNET h_req;
+        fn_close_handle_t p_close;
+        DWORD timeout_ms;
+        volatile LONG finished;
+        HANDLE cancel_ev;
+    };
+
+    DWORD watchdog_timeout_ms = static_cast<DWORD>(tmo_ms) + 5000UL;
+
+    winhttp_watchdog_t wd_send;
+    wd_send.h_req = h_req;
+    wd_send.p_close = p_close_handle;
+    wd_send.timeout_ms = watchdog_timeout_ms;
+    wd_send.finished = 0;
+    wd_send.cancel_ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE wd_send_thread = CreateThread(nullptr, 0, [](LPVOID arg) -> DWORD {
+        auto* w = reinterpret_cast<winhttp_watchdog_t*>(arg);
+        DWORD wait = WaitForSingleObject(w->cancel_ev, w->timeout_ms);
+        if (wait == WAIT_TIMEOUT &&
+            InterlockedCompareExchange(&w->finished, 0, 0) == 0 &&
+            w->h_req && w->p_close) {
+            w->p_close(w->h_req);
+        }
+        return 0;
+    }, &wd_send, 0, nullptr);
+
+    DWORD send_t0 = GetTickCount();
     BOOL send_ok = p_send_request(h_req, hdr_ptr, hdr_len,
                                    body_ptr, body_len, body_len, 0);
+    DWORD send_gle = GetLastError();
+    DWORD send_elapsed = GetTickCount() - send_t0;
+    InterlockedExchange(&wd_send.finished, 1);
+    if (wd_send.cancel_ev) SetEvent(wd_send.cancel_ev);
+    if (wd_send_thread) {
+        WaitForSingleObject(wd_send_thread, 1000);
+        CloseHandle(wd_send_thread);
+    }
+    if (wd_send.cancel_ev) CloseHandle(wd_send.cancel_ev);
+
     if (!send_ok) {
-        out.error = "winhttp_send_request_failed gle=" + std::to_string(GetLastError());
+        out.error = "winhttp_send_request_failed gle=" + std::to_string(send_gle) +
+                     " elapsed_ms=" + std::to_string(send_elapsed);
         lic_log(out.error.c_str());
         p_close_handle(h_req);
         p_close_handle(h_connect);
@@ -1111,11 +1158,46 @@ static SimpleHttpResponse winhttp_https_request_impl(
         FreeLibrary(wh_mod);
         return out;
     }
-    lic_log("winhttp_send_request_ok");
+    {
+        char dbuf[96];
+        _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
+            "winhttp_send_request_ok elapsed_ms=%lu", send_elapsed);
+        lic_log(dbuf);
+    }
 
     lic_log("winhttp_calling_recv_response");
-    if (!p_recv_response(h_req, nullptr)) {
-        out.error = "winhttp_recv_response_failed gle=" + std::to_string(GetLastError());
+    winhttp_watchdog_t wd_recv;
+    wd_recv.h_req = h_req;
+    wd_recv.p_close = p_close_handle;
+    wd_recv.timeout_ms = watchdog_timeout_ms;
+    wd_recv.finished = 0;
+    wd_recv.cancel_ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE wd_recv_thread = CreateThread(nullptr, 0, [](LPVOID arg) -> DWORD {
+        auto* w = reinterpret_cast<winhttp_watchdog_t*>(arg);
+        DWORD wait = WaitForSingleObject(w->cancel_ev, w->timeout_ms);
+        if (wait == WAIT_TIMEOUT &&
+            InterlockedCompareExchange(&w->finished, 0, 0) == 0 &&
+            w->h_req && w->p_close) {
+            w->p_close(w->h_req);
+        }
+        return 0;
+    }, &wd_recv, 0, nullptr);
+
+    DWORD recv_t0 = GetTickCount();
+    BOOL recv_ok = p_recv_response(h_req, nullptr);
+    DWORD recv_gle = GetLastError();
+    DWORD recv_elapsed = GetTickCount() - recv_t0;
+    InterlockedExchange(&wd_recv.finished, 1);
+    if (wd_recv.cancel_ev) SetEvent(wd_recv.cancel_ev);
+    if (wd_recv_thread) {
+        WaitForSingleObject(wd_recv_thread, 1000);
+        CloseHandle(wd_recv_thread);
+    }
+    if (wd_recv.cancel_ev) CloseHandle(wd_recv.cancel_ev);
+
+    if (!recv_ok) {
+        out.error = "winhttp_recv_response_failed gle=" + std::to_string(recv_gle) +
+                     " elapsed_ms=" + std::to_string(recv_elapsed);
         lic_log(out.error.c_str());
         p_close_handle(h_req);
         p_close_handle(h_connect);
@@ -3097,8 +3179,11 @@ namespace
     void apply_valid_response(settings_sa_t& settings, const std::string& key,
                               const std::string& hwid, const json& response)
     {
+        lic_log("apply_valid_response_enter");
         settings.license_key = key;
+        lic_log("apply_valid_response_set_key");
         settings.license_plan = response.value("plan", "standard");
+        lic_log("apply_valid_response_set_plan");
 
 
         json cached_payload = json::object();
@@ -3107,17 +3192,23 @@ namespace
             if (existing.is_object())
                 cached_payload = std::move(existing);
         }
+        lic_log("apply_valid_response_cached_payload_built");
         for (auto it = response.begin(); it != response.end(); ++it)
             cached_payload[it.key()] = it.value();
+        lic_log("apply_valid_response_response_merged");
         cached_payload["hwid"] = hwid;
         cached_payload["license_key"] = key;
         if (!cached_payload.contains("issued_at") || !cached_payload["issued_at"].is_number())
             cached_payload["issued_at"] = static_cast<int64_t>(std::time(nullptr));
+        lic_log("apply_valid_response_pre_dump");
         settings.license_sig_payload = cached_payload.dump();
+        lic_log("apply_valid_response_post_dump");
 
         settings.license_server_sig = response.value("signature", "");
+        lic_log("apply_valid_response_set_sig");
         settings.license_session_token = response.contains("session_token")
             ? response["session_token"].get<std::string>() : settings.license_session_token;
+        lic_log("apply_valid_response_set_session_token");
         settings.license_server_nonce = response.value("server_nonce", "");
         settings.license_client_nonce = response.contains("client_nonce")
             ? response["client_nonce"].get<std::string>() : settings.license_client_nonce;
@@ -3133,9 +3224,11 @@ namespace
             settings.license_key_seed = response["key_seed"].get<std::string>();
         if (response.contains("bind_proof") && response["bind_proof"].is_string())
             settings.license_bind_proof = response["bind_proof"].get<std::string>();
+        lic_log("apply_valid_response_pre_save");
 
         settings.license_arc_load_ok = s_arc_loaded;
         settings.save();
+        lic_log("apply_valid_response_post_save");
 
         if (!settings.license_key_seed.empty())
             anti_tamper::server_pages::detail::stored_key_seed() = settings.license_key_seed;
@@ -3866,7 +3959,7 @@ namespace
                 if (!pages_json.is_array())
                     return {};
                 std::string material;
-                material.reserve(blob_size + pages_json.size() * 192u);
+                material.reserve(blob_size + pages_json.size() * 256u);
                 for (const auto& page_json : pages_json) {
                     if (!page_json.is_object())
                         return {};
@@ -3876,6 +3969,7 @@ namespace
                     std::string page_tag_hex = page_json.value("auth_tag", "");
                     std::string page_hmac_hex = page_json.value("hmac", "");
                     std::string page_trailer_hex = page_json.value("page_trailer", "");
+                    std::string page_code_binding_sig = page_json.value("code_binding_sig", "");
                     if (page_index == uint64_t{UINT64_MAX} || page_data_b64.empty() ||
                         page_iv_hex.empty() || page_tag_hex.empty() ||
                         page_hmac_hex.empty() || page_trailer_hex.empty())
@@ -3891,6 +3985,8 @@ namespace
                     material += page_hmac_hex;
                     material += '|';
                     material += page_trailer_hex;
+                    material += '|';
+                    material += page_code_binding_sig;
                     material += '\n';
                 }
                 auto digest = sha256_block(reinterpret_cast<const uint8_t*>(material.data()), material.size());
@@ -3946,21 +4042,73 @@ namespace
                         signed_bulk.erase("pages");
                     }
                     std::string canonical = signed_bulk.is_object() ? signed_bulk.dump() : "";
-                    if (bulk_json.is_discarded() || !bulk_json.is_object() ||
-                        bulk_json.value("status", "") != "ok" ||
-                        bulk_json.value("total_pages", uint64_t{0}) != static_cast<uint64_t>(total_pages) ||
-                        bulk_json.value("blob_size", uint64_t{0}) != static_cast<uint64_t>(blob_size) ||
-                        pages_json == nullptr || !pages_json->is_array() ||
-                        pages_json->size() != static_cast<size_t>(total_pages) ||
-                        bulk_sig.empty() || pages_digest.empty() ||
-                        computed_digest.empty() || computed_digest != pages_digest ||
-                        !verify_arc_page_signature(canonical, bulk_sig)) {
+
+                    bool fail_discarded = bulk_json.is_discarded();
+                    bool fail_not_object = !fail_discarded && !bulk_json.is_object();
+                    std::string status_value = !fail_discarded && bulk_json.is_object() ? bulk_json.value("status", "") : "";
+                    bool fail_status = (status_value != "ok");
+                    uint64_t got_total_pages = !fail_discarded && bulk_json.is_object() ? bulk_json.value("total_pages", uint64_t{0}) : 0;
+                    uint64_t got_blob_size = !fail_discarded && bulk_json.is_object() ? bulk_json.value("blob_size", uint64_t{0}) : 0;
+                    bool fail_total = (got_total_pages != static_cast<uint64_t>(total_pages));
+                    bool fail_blob = (got_blob_size != static_cast<uint64_t>(blob_size));
+                    bool fail_pages_null = (pages_json == nullptr);
+                    bool fail_pages_not_array = !fail_pages_null && !pages_json->is_array();
+                    size_t got_pages_size = (!fail_pages_null && pages_json->is_array()) ? pages_json->size() : 0;
+                    bool fail_pages_size = (got_pages_size != static_cast<size_t>(total_pages));
+                    bool fail_sig_empty = bulk_sig.empty();
+                    bool fail_digest_empty = pages_digest.empty();
+                    bool fail_computed_empty = computed_digest.empty();
+                    bool fail_digest_mismatch = !fail_computed_empty && !fail_digest_empty && (computed_digest != pages_digest);
+                    bool sig_ok = !fail_sig_empty && !canonical.empty() && verify_arc_page_signature(canonical, bulk_sig);
+                    bool fail_sig_verify = !fail_sig_empty && !sig_ok;
+
+                    if (fail_discarded || fail_not_object || fail_status ||
+                        fail_total || fail_blob || fail_pages_null || fail_pages_not_array ||
+                        fail_pages_size || fail_sig_empty || fail_digest_empty ||
+                        fail_computed_empty || fail_digest_mismatch || fail_sig_verify) {
+                        char detail[512];
+                        _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                            "arc_bulk_failed body_len=%zu disc=%d not_obj=%d status=%.20s status_bad=%d "
+                            "total_pages got=%llu exp=%lu (bad=%d) blob_size got=%llu exp=%lu (bad=%d) "
+                            "pages_null=%d pages_not_array=%d pages_size got=%zu exp=%lu (bad=%d) "
+                            "sig_empty=%d digest_empty=%d computed_empty=%d digest_mismatch=%d sig_verify_failed=%d",
+                            bulk_resp.body.size(),
+                            fail_discarded ? 1 : 0,
+                            fail_not_object ? 1 : 0,
+                            status_value.c_str(),
+                            fail_status ? 1 : 0,
+                            (unsigned long long)got_total_pages, (unsigned long)total_pages,
+                            fail_total ? 1 : 0,
+                            (unsigned long long)got_blob_size, (unsigned long)blob_size,
+                            fail_blob ? 1 : 0,
+                            fail_pages_null ? 1 : 0,
+                            fail_pages_not_array ? 1 : 0,
+                            got_pages_size, (unsigned long)total_pages,
+                            fail_pages_size ? 1 : 0,
+                            fail_sig_empty ? 1 : 0,
+                            fail_digest_empty ? 1 : 0,
+                            fail_computed_empty ? 1 : 0,
+                            fail_digest_mismatch ? 1 : 0,
+                            fail_sig_verify ? 1 : 0);
+                        log_arc_status(detail);
+                        if (!fail_sig_empty && !fail_digest_empty && !computed_digest.empty()) {
+                            char dd[256];
+                            _snprintf_s(dd, sizeof(dd), _TRUNCATE,
+                                "arc_bulk_digests computed=%.16s server=%.16s sig_len=%zu canonical_len=%zu",
+                                computed_digest.c_str(), pages_digest.c_str(),
+                                bulk_sig.size(), canonical.size());
+                            log_arc_status(dd);
+                        }
                         log_arc_status("arc_bulk_signature_or_shape_failed");
                     } else {
                         bulk_loaded = true;
                         for (uint32_t i = 0; i < total_pages; ++i) {
                             if (!append_arc_page((*pages_json)[i], i, false)) {
                                 bulk_loaded = false;
+                                char abuf[96];
+                                _snprintf_s(abuf, sizeof(abuf), _TRUNCATE,
+                                    "arc_bulk_append_page_failed index=%u", i);
+                                log_arc_status(abuf);
                                 break;
                             }
                         }
@@ -4217,7 +4365,24 @@ namespace
             SecureZeroMemory(bind_proof_bytes.data(), bind_proof_bytes.size());
             log_arc_status(init_ok ? "arc_init_post_ok" : "arc_init_post_false");
             if (!init_ok) {
+                if (s_fn_arc_copy_last_status) {
+                    char arc_status[192] = {};
+                    uint32_t copied = s_fn_arc_copy_last_status(arc_status, static_cast<uint32_t>(sizeof(arc_status)));
+                    if (copied > 0 && arc_status[0] != '\0') {
+                        char detail[256];
+                        _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                            "arc_init_internal_status=%.180s", arc_status);
+                        log_arc_status(detail);
+                    } else {
+                        log_arc_status("arc_init_internal_status=<empty>");
+                    }
+                } else {
+                    log_arc_status("arc_init_internal_status=<copy_last_status_unavailable>");
+                }
                 log_arc_status("arc_init_failed");
+                arc_loader::mark_error_fatal(
+                    "arc_init returned false; the protected runtime cannot be reinitialized "
+                    "in this process. Please restart AiDAStandalone.exe and try again.");
                 arc_loader::unload(s_arc_module);
                 s_fn_arc_init = nullptr;
                 s_fn_arc_bind_driver_device = nullptr;
@@ -5120,22 +5285,41 @@ namespace standalone_license
             lic_log(dbg);
         }
 
+        static const char* const kRuntimeMutableSectionNames[] = {
+            ".epheme",
+            ".dthunk",
+            ".gehi",
+            ".dseal",
+            ".licbind",
+            ".feat",
+        };
+
         for (WORD i = 0; i < num_sections; ++i) {
             const uint32_t ch = sec[i].Characteristics;
             const bool is_exec = (ch & IMAGE_SCN_MEM_EXECUTE) != 0u;
             const bool is_read = (ch & IMAGE_SCN_MEM_READ) != 0u;
             const bool is_write = (ch & IMAGE_SCN_MEM_WRITE) != 0u;
-            const bool eligible = is_exec || (is_read && !is_write);
 
             char section_name[16] = {};
             std::memcpy(section_name, sec[i].Name, 8);
 
+            bool runtime_mutable = false;
+            for (const char* mut_name : kRuntimeMutableSectionNames) {
+                if (std::strncmp(section_name, mut_name, 8) == 0) {
+                    runtime_mutable = true;
+                    break;
+                }
+            }
+
+            const bool eligible = !is_write && !runtime_mutable && (is_exec || is_read);
+
             if (!eligible) {
-                char dbg[160];
+                char dbg[200];
                 _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                    "snapshot_code_hashes_skip[%u]=%.8s ch=0x%08X exec=%d read=%d write=%d",
+                    "snapshot_code_hashes_skip[%u]=%.8s ch=0x%08X exec=%d read=%d write=%d runtime_mutable=%d",
                     static_cast<unsigned>(i), section_name, ch,
-                    is_exec ? 1 : 0, is_read ? 1 : 0, is_write ? 1 : 0);
+                    is_exec ? 1 : 0, is_read ? 1 : 0, is_write ? 1 : 0,
+                    runtime_mutable ? 1 : 0);
                 lic_log(dbg);
                 continue;
             }

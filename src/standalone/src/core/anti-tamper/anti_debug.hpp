@@ -846,10 +846,16 @@ inline debug_report_t full_scan(uint64_t mod_base = 0, uint64_t mod_end = 0)
     }
 
     report.kernel_debugger = check_kernel_debugger();
+#if defined(AIDA_TEST_VMWARE_BYPASS)
+    report.kernel_debugger = false;
+#endif
     if (report.kernel_debugger)
         webhook::send_debug_log("kernel_debugger", "KdEnabled", true);
 
     report.kd_shared_data = check_kd_shared_data();
+#if defined(AIDA_TEST_VMWARE_BYPASS)
+    report.kd_shared_data = false;
+#endif
     if (report.kd_shared_data)
         webhook::send_debug_log("kd_shared_data", "KUSER_SharedData.KdDebuggerEnabled", true);
 

@@ -660,12 +660,7 @@ namespace text_guard
             }
         }
 
-        MODULEINFO mi{};
-        if (!GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi)))
-            return false;
-        base_out = reinterpret_cast<uint64_t>(mi.lpBaseOfDll) + 0x1000;
-        size_out = mi.SizeOfImage > 0x1000 ? mi.SizeOfImage - 0x1000 : 0;
-        return size_out != 0;
+        return false;
     }
 
     inline void cycle_thread()

@@ -875,11 +875,35 @@ inline bool verify_disk_image(std::string& mismatched_name)
 
         __try
         {
-            if (memcmp(mem_bytes, disk_bytes, detail::k_prologue_bytes) != 0)
+            if (memcmp(mem_bytes, disk_bytes, detail::k_prologue_bytes) == 0)
+                continue;
+
+            const uint8_t b0 = mem_bytes[0];
+            const uint8_t b1 = mem_bytes[1];
+
+            const bool inline_jmp_rel32 = (b0 == 0xE9);
+            const bool inline_jmp_short = (b0 == 0xEB);
+            const bool inline_indirect_jmp = (b0 == 0xFF && b1 == 0x25);
+            const bool inline_movabs_jmp =
+                (b0 == 0x48 && b1 == 0xB8 && mem_bytes[10] == 0xFF && mem_bytes[11] == 0xE0);
+            const bool inline_push_ret = (b0 == 0x68 && mem_bytes[5] == 0xC3);
+            const bool inline_int3 = (b0 == 0xCC);
+
+            if (inline_jmp_rel32 || inline_jmp_short || inline_indirect_jmp ||
+                inline_movabs_jmp || inline_push_ret || inline_int3)
             {
                 mismatched_name = name;
                 return false;
             }
+
+            const bool standard_x64_syscall_stub =
+                (b0 == 0x4C && b1 == 0x8B && mem_bytes[2] == 0xD1 &&
+                 mem_bytes[3] == 0xB8);
+            const bool wow64_indirect_call =
+                (b0 == 0xB8 && mem_bytes[5] == 0xBA);
+
+            if (standard_x64_syscall_stub || wow64_indirect_call)
+                continue;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {

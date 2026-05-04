@@ -5,6 +5,9 @@
 #include "CoreSecurity.h"
 #include "SentinelBridge.h"
 #include "TargetingLatch.h"
+#include "DmaCanary.h"
+#include "AntiDebug.h"
+#include "impl/AntiDumpKernel.h"
 
 namespace process_guard {
 
@@ -281,11 +284,26 @@ namespace process_guard {
         PPS_CREATE_NOTIFY_INFO CreateInfo)
     {
         UNREFERENCED_PARAMETER(Process);
-        UNREFERENCED_PARAMETER(ProcessId);
 
-
-        if (!CreateInfo)
+        if (!CreateInfo) {
+            UINT32 dying_pid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(ProcessId));
+            if (dying_pid != 0 && dying_pid != 4) {
+                ULONG cleared = anti_dma_canary::cleanup_for_pid(dying_pid);
+                continuous_anti_debug::stop_if_target(dying_pid);
+                continuous_anti_dump::stop_if_target(dying_pid);
+                HANDLE registered = caller_validation::g_registered_client_pid;
+                if (registered &&
+                    reinterpret_cast<UINT64>(registered) == static_cast<UINT64>(dying_pid)) {
+                    caller_validation::unregister_client();
+                    WW_LOG("create_process_notify: registered client pid=%u exited, unregistered (canaries_cleared=%lu)",
+                        dying_pid, cleared);
+                } else if (cleared) {
+                    WW_LOG("create_process_notify: pid=%u exited, canaries_cleared=%lu",
+                        dying_pid, cleared);
+                }
+            }
             return;
+        }
 
         HANDLE client_pid = caller_validation::g_registered_client_pid;
         if (!client_pid)

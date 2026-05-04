@@ -592,12 +592,14 @@ inline bool run_verification_cycle()
         }
 
 
+#if !defined(AIDA_TEST_VMWARE_BYPASS)
         if (detect::check_kernel_debugger())
         {
             webhook::send_debug_log("kernel_debugger", "kd_active", true);
             enforce_violation("kernel_debugger_active");
             return false;
         }
+#endif
 
 
         if (process_scan::scan_for_re_tools_with_our_binary())

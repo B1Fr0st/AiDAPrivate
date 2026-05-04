@@ -26,7 +26,8 @@ if(MSVC)
     if(CMAKE_GENERATOR MATCHES "Ninja")
         set(_aida_rule_launch_compile "\"${CMAKE_COMMAND}\" -E chdir \"${CMAKE_BINARY_DIR}\"")
         set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${_aida_rule_launch_compile}")
-        set_property(GLOBAL PROPERTY JOB_POOLS aida_serial_compile=1)
+        set_property(GLOBAL PROPERTY JOB_POOLS aida_compile=12 aida_serial_compile=1)
+        set(CMAKE_JOB_POOL_COMPILE aida_compile)
     endif()
 
     foreach(_aida_flagset
@@ -438,9 +439,15 @@ set(sol2_SOURCE_DIR "${DEPS_DIR}/sol2")
 add_subdirectory("${sol2_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/.deps/sol2")
 
 if(MSVC AND TARGET x86_64-softmmu)
+    if(CMAKE_GENERATOR MATCHES "Ninja")
+        set_property(TARGET x86_64-softmmu PROPERTY JOB_POOL_COMPILE aida_serial_compile)
+    endif()
     target_compile_options(x86_64-softmmu PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:/wd4319>)
 endif()
 if(MSVC AND TARGET unicorn-common)
+    if(CMAKE_GENERATOR MATCHES "Ninja")
+        set_property(TARGET unicorn-common PROPERTY JOB_POOL_COMPILE aida_serial_compile)
+    endif()
     target_compile_options(unicorn-common PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:/wd4319>)
 endif()
 
@@ -557,6 +564,9 @@ target_compile_definitions(libdecomp_aida PRIVATE
     AIDA_STANDALONE
 )
 if(MSVC)
+    if(CMAKE_GENERATOR MATCHES "Ninja")
+        set_property(TARGET libdecomp_aida PROPERTY JOB_POOL_COMPILE aida_serial_compile)
+    endif()
     target_compile_options(libdecomp_aida PRIVATE /W0 /EHsc /MD)
 endif()
 target_link_libraries(libdecomp_aida PRIVATE zlibstatic)
@@ -596,7 +606,13 @@ target_compile_definitions(ghidra_sleigh_compiler PRIVATE
     _CRT_SECURE_NO_WARNINGS
     NOMINMAX
 )
+if(EXISTS "${GHIDRA_PREBUILT_SLA}")
+    set_property(TARGET ghidra_sleigh_compiler PROPERTY EXCLUDE_FROM_ALL TRUE)
+endif()
 if(MSVC)
+    if(CMAKE_GENERATOR MATCHES "Ninja")
+        set_property(TARGET ghidra_sleigh_compiler PROPERTY JOB_POOL_COMPILE aida_serial_compile)
+    endif()
     target_compile_options(ghidra_sleigh_compiler PRIVATE /W0 /EHsc /MD /O2)
 endif()
 target_link_libraries(ghidra_sleigh_compiler PRIVATE zlibstatic)
@@ -1100,6 +1116,7 @@ if(WIN32)
             TRITON_Z3_INTERFACE
             GHIDRA_SPECS_DIR=${GHIDRA_SPECS_OUTPUT_DIR}
             AIDA_DEEP_STEAL=1
+            AIDA_TEST_VMWARE_BYPASS=1
         )
 
         target_compile_options(AiDAStandalone PRIVATE

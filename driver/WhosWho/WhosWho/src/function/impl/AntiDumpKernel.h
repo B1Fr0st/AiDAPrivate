@@ -466,8 +466,12 @@ namespace continuous_anti_dump {
 
     inline void start(UINT32 pid)
     {
-        if (_InterlockedCompareExchange(&g_active, 1, 0) != 0)
+        if (_InterlockedCompareExchange(&g_active, 1, 0) != 0) {
+            _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_target_pid),
+                static_cast<LONG>(pid));
+            WW_LOG("continuous_admp: retarget pid=%u (was already active)", pid);
             return;
+        }
 
         g_target_pid = pid;
         g_cycle_count = 0;
@@ -493,5 +497,17 @@ namespace continuous_anti_dump {
             _KeFlushQueuedDpcs();
         g_target_pid = 0;
         WW_LOG("continuous_admp: stopped");
+    }
+
+    inline void stop_if_target(UINT32 pid)
+    {
+        if (pid == 0) return;
+        LONG prev = _InterlockedCompareExchange(
+            reinterpret_cast<volatile LONG*>(&g_target_pid),
+            0,
+            static_cast<LONG>(pid));
+        if (prev == static_cast<LONG>(pid)) {
+            WW_LOG("continuous_admp: cleared target pid=%u (process exiting)", pid);
+        }
     }
 }

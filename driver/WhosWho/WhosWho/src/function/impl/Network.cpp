@@ -861,6 +861,9 @@ namespace net_capture {
         if (!should_process_packet_pipeline()) return;
 
         __try {
+        UINT8* pkt_data = nullptr;
+        packet_inject_request* inj_buf = nullptr;
+        __try {
             UINT32 protocol = 0;
             UINT32 local_port = 0;
             UINT32 remote_port = 0;
@@ -946,13 +949,16 @@ namespace net_capture {
                 if (!need_full_pipeline && net_stream::has_active_streams()) need_full_pipeline = TRUE;
                 if (!need_full_pipeline) {
                     if (!g_capture_active || (g_filter_pid != 0 && pid != 0 && pid != g_filter_pid))
-                        return;
+                        __leave;
                 }
             }
 
-            UINT8 pkt_data[NET_PKT_MAX_PAYLOAD] = {};
-            UINT32 pkt_len = 0;
+            pkt_data = (UINT8*)ExAllocatePool2(POOL_FLAG_NON_PAGED, NET_PKT_MAX_PAYLOAD, 'pdNW');
+            if (!pkt_data) __leave;
+            inj_buf = (packet_inject_request*)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(packet_inject_request), 'piNW');
+            if (!inj_buf) __leave;
 
+            UINT32 pkt_len = 0;
             pkt_len = copy_transport_bytes(layerData, pkt_data, NET_PKT_MAX_PAYLOAD);
             if (pkt_len == 0 && layerData) {
             }
@@ -1012,22 +1018,22 @@ namespace net_capture {
                             }
                             if (spoofed) {
                                 NET_DBG("classify_inbound: DNS SPOOFED domain=%s", spoof_domain);
-                                packet_inject_request inj = {};
-                                inj.direction = 0;
-                                inj.protocol = 17;
-                                inj.address_family = 2;
-                                inj.src_port = remote_port;
-                                inj.dst_port = local_port;
-                                strong::kmemcpy(inj.src_addr, remote_ip, 4);
-                                strong::kmemcpy(inj.dst_addr, local_ip, 4);
-                                inj.tcp_flags = net_inject::INJECT_FLAG_RAW_TRANSPORT;
-                                inj.payload_size = pkt_len;
+                                RtlZeroMemory(inj_buf, sizeof(*inj_buf));
+                                inj_buf->direction = 0;
+                                inj_buf->protocol = 17;
+                                inj_buf->address_family = 2;
+                                inj_buf->src_port = remote_port;
+                                inj_buf->dst_port = local_port;
+                                strong::kmemcpy(inj_buf->src_addr, remote_ip, 4);
+                                strong::kmemcpy(inj_buf->dst_addr, local_ip, 4);
+                                inj_buf->tcp_flags = net_inject::INJECT_FLAG_RAW_TRANSPORT;
+                                inj_buf->payload_size = pkt_len;
                                 if (pkt_len <= INJECT_MAX_PAYLOAD)
-                                    strong::kmemcpy(inj.payload, pkt_data, pkt_len);
+                                    strong::kmemcpy(inj_buf->payload, pkt_data, pkt_len);
                                 classifyOut->actionType = FWP_ACTION_BLOCK_;
                                 classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                                net_inject::inject_packet(&inj);
-                                return;
+                                net_inject::inject_packet(inj_buf);
+                                __leave;
                             }
                         }
                     }
@@ -1073,26 +1079,26 @@ namespace net_capture {
 
             if (needs_reinject && pkt_len > 0) {
                 if (net_inject::g_inject_handle_v4) {
-                    packet_inject_request inj = {};
-                    inj.direction = 0;
-                    inj.protocol = protocol;
-                    inj.address_family = 2;
-                    inj.src_port = remote_port;
-                    inj.dst_port = local_port;
-                    strong::kmemcpy(inj.src_addr, remote_ip, 4);
-                    strong::kmemcpy(inj.dst_addr, local_ip, 4);
-                    inj.tcp_flags = net_inject::INJECT_FLAG_RAW_TRANSPORT;
-                    inj.payload_size = pkt_len;
+                    RtlZeroMemory(inj_buf, sizeof(*inj_buf));
+                    inj_buf->direction = 0;
+                    inj_buf->protocol = protocol;
+                    inj_buf->address_family = 2;
+                    inj_buf->src_port = remote_port;
+                    inj_buf->dst_port = local_port;
+                    strong::kmemcpy(inj_buf->src_addr, remote_ip, 4);
+                    strong::kmemcpy(inj_buf->dst_addr, local_ip, 4);
+                    inj_buf->tcp_flags = net_inject::INJECT_FLAG_RAW_TRANSPORT;
+                    inj_buf->payload_size = pkt_len;
                     if (pkt_len <= INJECT_MAX_PAYLOAD)
-                        strong::kmemcpy(inj.payload, pkt_data, pkt_len);
+                        strong::kmemcpy(inj_buf->payload, pkt_data, pkt_len);
                     classifyOut->actionType = FWP_ACTION_BLOCK_;
                     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                    net_inject::inject_packet(&inj);
+                    net_inject::inject_packet(inj_buf);
                 } else {
                     NET_ERR("classify_inbound: packet modified/delta-adjusted but inject handle unavailable, blocking proto=%u pid=%u", protocol, pid);
                     classifyOut->actionType = FWP_ACTION_BLOCK_;
                     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                    return;
+                    __leave;
                 }
             }
 
@@ -1145,7 +1151,7 @@ namespace net_capture {
                 NET_DBG("classify_inbound: HELD by intercept proto=%u pid=%u port=%u", protocol, pid, remote_port);
                 classifyOut->actionType = FWP_ACTION_BLOCK_;
                 classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                return;
+                __leave;
             }
 
 
@@ -1158,6 +1164,10 @@ namespace net_capture {
                     try_parse_dns(pid, pkt_data, pkt_len, local_port, remote_port);
                 }
             }
+        } __finally {
+            if (inj_buf) ExFreePoolWithTag(inj_buf, 'piNW');
+            if (pkt_data) ExFreePoolWithTag(pkt_data, 'pdNW');
+        }
         } __except(EXCEPTION_EXECUTE_HANDLER) {
         }
     }
@@ -1196,6 +1206,9 @@ namespace net_capture {
         if (!inFixedValues || !inMetaValues) return;
         if (!should_process_packet_pipeline()) return;
 
+        __try {
+        UINT8* pkt_data = nullptr;
+        packet_inject_request* inj_buf = nullptr;
         __try {
             UINT32 protocol = 0;
             UINT32 local_port = 0;
@@ -1282,13 +1295,16 @@ namespace net_capture {
                 if (!need_full_pipeline && net_stream::has_active_streams()) need_full_pipeline = TRUE;
                 if (!need_full_pipeline) {
                     if (!g_capture_active || (g_filter_pid != 0 && pid != 0 && pid != g_filter_pid))
-                        return;
+                        __leave;
                 }
             }
 
-            UINT8 pkt_data[NET_PKT_MAX_PAYLOAD] = {};
-            UINT32 pkt_len = 0;
+            pkt_data = (UINT8*)ExAllocatePool2(POOL_FLAG_NON_PAGED, NET_PKT_MAX_PAYLOAD, 'pdNW');
+            if (!pkt_data) __leave;
+            inj_buf = (packet_inject_request*)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(packet_inject_request), 'piNW');
+            if (!inj_buf) __leave;
 
+            UINT32 pkt_len = 0;
             pkt_len = copy_transport_bytes(layerData, pkt_data, NET_PKT_MAX_PAYLOAD);
             if (pkt_len == 0 && layerData) {
             }
@@ -1301,34 +1317,34 @@ namespace net_capture {
                     NET_DBG("classify_outbound: REDIRECTING proto=%u pid=%u port=%u -> %u.%u.%u.%u:%u",
                             protocol, pid, remote_port,
                             redir_addr[0], redir_addr[1], redir_addr[2], redir_addr[3], redir_port);
-                    packet_inject_request inj = {};
-                    inj.direction = 1;
-                    inj.protocol = protocol;
-                    inj.address_family = 2;
-                    inj.src_port = local_port;
-                    inj.dst_port = redir_port;
-                    strong::kmemcpy(inj.src_addr, local_ip, 4);
-                    strong::kmemcpy(inj.dst_addr, redir_addr, 4);
+                    RtlZeroMemory(inj_buf, sizeof(*inj_buf));
+                    inj_buf->direction = 1;
+                    inj_buf->protocol = protocol;
+                    inj_buf->address_family = 2;
+                    inj_buf->src_port = local_port;
+                    inj_buf->dst_port = redir_port;
+                    strong::kmemcpy(inj_buf->src_addr, local_ip, 4);
+                    strong::kmemcpy(inj_buf->dst_addr, redir_addr, 4);
                     UINT32 hdr_skip = 0;
                     if (protocol == 6 && pkt_len >= 20) {
                         hdr_skip = ((UINT32)(pkt_data[12] >> 4)) * 4;
                         if (hdr_skip < 20) hdr_skip = 20;
                         if (hdr_skip > pkt_len) hdr_skip = pkt_len;
-                        inj.tcp_seq = ((UINT32)pkt_data[4] << 24) | ((UINT32)pkt_data[5] << 16) |
+                        inj_buf->tcp_seq = ((UINT32)pkt_data[4] << 24) | ((UINT32)pkt_data[5] << 16) |
                                       ((UINT32)pkt_data[6] << 8) | pkt_data[7];
-                        inj.tcp_ack = ((UINT32)pkt_data[8] << 24) | ((UINT32)pkt_data[9] << 16) |
+                        inj_buf->tcp_ack = ((UINT32)pkt_data[8] << 24) | ((UINT32)pkt_data[9] << 16) |
                                       ((UINT32)pkt_data[10] << 8) | pkt_data[11];
-                        inj.tcp_flags = pkt_data[13];
+                        inj_buf->tcp_flags = pkt_data[13];
                     } else if (protocol == 17 && pkt_len >= 8) {
                         hdr_skip = 8;
                     }
-                    inj.payload_size = pkt_len - hdr_skip;
-                    if (inj.payload_size > 0)
-                        strong::kmemcpy(inj.payload, pkt_data + hdr_skip, inj.payload_size);
+                    inj_buf->payload_size = pkt_len - hdr_skip;
+                    if (inj_buf->payload_size > 0)
+                        strong::kmemcpy(inj_buf->payload, pkt_data + hdr_skip, inj_buf->payload_size);
                     classifyOut->actionType = FWP_ACTION_BLOCK_;
                     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                    net_inject::inject_packet(&inj);
-                    return;
+                    net_inject::inject_packet(inj_buf);
+                    __leave;
                 }
             }
 
@@ -1371,26 +1387,26 @@ namespace net_capture {
 
             if (needs_reinject_out && pkt_len > 0) {
                 if (net_inject::g_inject_handle_v4) {
-                    packet_inject_request inj = {};
-                    inj.direction = 1;
-                    inj.protocol = protocol;
-                    inj.address_family = 2;
-                    inj.src_port = local_port;
-                    inj.dst_port = remote_port;
-                    strong::kmemcpy(inj.src_addr, local_ip, 4);
-                    strong::kmemcpy(inj.dst_addr, remote_ip, 4);
-                    inj.tcp_flags = net_inject::INJECT_FLAG_RAW_TRANSPORT;
-                    inj.payload_size = pkt_len;
+                    RtlZeroMemory(inj_buf, sizeof(*inj_buf));
+                    inj_buf->direction = 1;
+                    inj_buf->protocol = protocol;
+                    inj_buf->address_family = 2;
+                    inj_buf->src_port = local_port;
+                    inj_buf->dst_port = remote_port;
+                    strong::kmemcpy(inj_buf->src_addr, local_ip, 4);
+                    strong::kmemcpy(inj_buf->dst_addr, remote_ip, 4);
+                    inj_buf->tcp_flags = net_inject::INJECT_FLAG_RAW_TRANSPORT;
+                    inj_buf->payload_size = pkt_len;
                     if (pkt_len <= INJECT_MAX_PAYLOAD)
-                        strong::kmemcpy(inj.payload, pkt_data, pkt_len);
+                        strong::kmemcpy(inj_buf->payload, pkt_data, pkt_len);
                     classifyOut->actionType = FWP_ACTION_BLOCK_;
                     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                    net_inject::inject_packet(&inj);
+                    net_inject::inject_packet(inj_buf);
                 } else {
                     NET_ERR("classify_outbound: packet modified/delta-adjusted but inject handle unavailable, blocking proto=%u pid=%u", protocol, pid);
                     classifyOut->actionType = FWP_ACTION_BLOCK_;
                     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                    return;
+                    __leave;
                 }
             }
 
@@ -1419,7 +1435,7 @@ namespace net_capture {
                 NET_DBG("classify_outbound: HELD by intercept proto=%u pid=%u port=%u", protocol, pid, remote_port);
                 classifyOut->actionType = FWP_ACTION_BLOCK_;
                 classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                return;
+                __leave;
             }
 
             if (g_capture_active) {
@@ -1430,6 +1446,10 @@ namespace net_capture {
                     try_parse_dns(pid, pkt_data, pkt_len, local_port, remote_port);
                 }
             }
+        } __finally {
+            if (inj_buf) ExFreePoolWithTag(inj_buf, 'piNW');
+            if (pkt_data) ExFreePoolWithTag(pkt_data, 'pdNW');
+        }
         } __except(EXCEPTION_EXECUTE_HANDLER) {
         }
     }

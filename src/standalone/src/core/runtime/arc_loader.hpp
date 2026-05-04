@@ -49,6 +49,8 @@ namespace arc_loader
 
     bool last_error_is_fatal();
 
+    void mark_error_fatal(const std::string& msg);
+
 
     void prime_import_cache();
 }

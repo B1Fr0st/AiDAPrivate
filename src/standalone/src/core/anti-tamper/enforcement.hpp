@@ -15,6 +15,7 @@
 #include "obfuscation_macros.hpp"
 #include "standalone_license.hpp"
 #include "standalone_driver.hpp"
+#include "../../helpers/diag_log.hpp"
 #include "../../../../../libs/cpp-httplib/httplib.h"
 #include "../../../../../libs/nlohmann/json.hpp"
 
@@ -65,7 +66,7 @@ namespace enforcement_detail {
 
     inline __declspec(noinline) void kill_path_fastfail()
     {
-        webhook::write_log("enforce", "kill_path_fastfail");
+        diag::log_tagged_critical("enforce", "kill_path_fastfail ABOUT_TO_FASTFAIL_FATAL_APP_EXIT");
         __fastfail(FAST_FAIL_FATAL_APP_EXIT);
     }
 
@@ -279,14 +280,17 @@ inline void enforce_violation(const char* reason, const std::string& extra = "")
             reason ? reason : "null",
             extra.empty() ? "none" : extra.c_str(),
             rt.violation_latched.load() ? 1 : 0);
-        webhook::write_log("enforce", enforce_dbg);
+        diag::log_tagged_critical("enforce", enforce_dbg);
     }
 
     OBFUSCATE_JUNK(ev_pre);
 
-    if (rt.violation_latched.exchange(true))
+    if (rt.violation_latched.exchange(true)) {
+        diag::log_tagged_critical("enforce", "already_latched_returning");
         return;
+    }
 
+    diag::log_tagged_critical("enforce", "ev_cff_state_0_entering_set_reason");
     CFF_BEGIN(ev_cff)
     CFF_STATE(ev_cff, 0)
     {
@@ -294,25 +298,33 @@ inline void enforce_violation(const char* reason, const std::string& extra = "")
             std::lock_guard<std::mutex> lk(rt.mtx);
             rt.violation_reason = reason ? reason : "anti_tamper";
         }
+        diag::log_tagged_critical("enforce", "ev_cff_state_0_done_goto_1");
         CFF_GOTO(ev_cff, 1);
     }
     CFF_STATE(ev_cff, 1)
     {
+        diag::log_tagged_critical("enforce", "ev_cff_state_1_calling_send_violation_alert");
         OBFUSCATE_JUNK(ev_wh);
         webhook::send_violation_alert(reason ? reason : "anti_tamper", extra);
+        diag::log_tagged_critical("enforce", "ev_cff_state_1_done_goto_2");
         CFF_GOTO(ev_cff, 2);
     }
     CFF_STATE(ev_cff, 2)
     {
+        diag::log_tagged_critical("enforce", "ev_cff_state_2_calling_license_shutdown");
         standalone_license::shutdown();
+        diag::log_tagged_critical("enforce", "ev_cff_state_2_done_goto_3");
         CFF_GOTO(ev_cff, 3);
     }
     CFF_STATE(ev_cff, 3)
     {
+        diag::log_tagged_critical("enforce", "ev_cff_state_3_calling_graduated_enforcement");
         OBFUSCATE_JUNK(ev_grad);
         enforcement_detail::graduated_enforcement();
+        diag::log_tagged_critical("enforce", "ev_cff_state_3_returned_from_graduated");
     }
     CFF_END(ev_cff)
+    diag::log_tagged_critical("enforce", "enforce_violation_returning_normally");
 }
 
 namespace enforcement {

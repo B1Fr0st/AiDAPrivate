@@ -232,7 +232,16 @@ async function createChallenge(clientIp) {
     return { challenge_id: challengeId, challenge_nonce: challengeNonce, issued_at: issuedAt, ttl: CHALLENGE_TTL_SECONDS, signature };
 }
 
-async function consumeChallenge(challengeId, clientSignature, clientIp, licenseKey) {
+function compareHexConstantTime(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
+    if (a.length !== b.length) return false;
+    const ba = Buffer.from(a, 'utf8');
+    const bb = Buffer.from(b, 'utf8');
+    if (ba.length !== bb.length) return false;
+    return crypto.timingSafeEqual(ba, bb);
+}
+
+async function consumeChallenge(challengeId, clientSignature, clientIp, licenseKey, rawBody) {
     if (!challengeId || typeof challengeId !== 'string' || !/^[a-fA-F0-9]{16,48}$/.test(challengeId)) {
         return { ok: false, reason: 'invalid_challenge_id' };
     }
@@ -247,13 +256,16 @@ async function consumeChallenge(challengeId, clientSignature, clientIp, licenseK
     }
 
     if (CHALLENGE_SIGNING_SECRET) {
-        const expected = signChallenge(ch.challenge_id, ch.challenge_nonce, ch.issued_at, ch.ttl_seconds);
-        if (typeof clientSignature !== 'string' || clientSignature.length !== expected.length) {
+        if (typeof clientSignature !== 'string' || clientSignature.length === 0) {
             return { ok: false, reason: 'challenge_signature_mismatch' };
         }
-        const a = Buffer.from(clientSignature, 'utf8');
-        const b = Buffer.from(expected, 'utf8');
-        if (!crypto.timingSafeEqual(a, b)) {
+        const expectedServerCanonical = signChallenge(ch.challenge_id, ch.challenge_nonce, ch.issued_at, ch.ttl_seconds);
+        let matched = compareHexConstantTime(clientSignature, expectedServerCanonical);
+        if (!matched && typeof rawBody === 'string') {
+            const expectedClientHmacBody = crypto.createHmac('sha256', ch.challenge_nonce).update(rawBody).digest('hex');
+            matched = compareHexConstantTime(clientSignature, expectedClientHmacBody);
+        }
+        if (!matched) {
             return { ok: false, reason: 'challenge_signature_mismatch' };
         }
     }
@@ -299,13 +311,18 @@ async function withPgRetry(fn) {
 }
 
 async function enforceChallenge(body, clientIp, licenseKey) {
-    const challengeId = body && body.challenge_id;
-    const challengeSig = body && body.challenge_signature;
+    const challengeId = (body && body.challenge_id)
+        || (body && body.__challenge_id_header)
+        || '';
+    const challengeSig = (body && body.challenge_signature)
+        || (body && body.__challenge_signature_header)
+        || '';
+    const rawBody = (body && typeof body.__raw_body === 'string') ? body.__raw_body : '';
     if (!challengeId) {
         if (CHALLENGE_REQUIRED) return { ok: false, reason: 'missing_challenge' };
         return { ok: true, skipped: true };
     }
-    return consumeChallenge(challengeId, challengeSig, clientIp, licenseKey);
+    return consumeChallenge(challengeId, challengeSig, clientIp, licenseKey, rawBody);
 }
 
 function buildRotationBlock() {
@@ -1916,6 +1933,11 @@ router.post('/', async (req, res) => {
     if (!body || typeof body !== 'object') {
         return res.status(400).json({ status: 'error', reason: 'invalid_body' });
     }
+
+    const headers = req.headers || {};
+    body.__challenge_id_header = (typeof headers['x-challenge-id'] === 'string') ? headers['x-challenge-id'] : '';
+    body.__challenge_signature_header = (typeof headers['x-challenge-signature'] === 'string') ? headers['x-challenge-signature'] : '';
+    body.__raw_body = (typeof req.rawBody === 'string') ? req.rawBody : '';
 
     const clientIp = getClientIp(req);
     const action = body.action;

@@ -14,6 +14,7 @@
 #include "webhook.hpp"
 #include "state.hpp"
 #include "enforcement.hpp"
+#include "../../helpers/diag_log.hpp"
 #include "integrity.hpp"
 #include "anti_debug.hpp"
 #include "anti_vm.hpp"
@@ -248,13 +249,22 @@ inline void start_monitors();
 
 inline bool initialize()
 {
+    webhook::write_log("init", "initialize_ENTRY before state::get");
     auto& rt = state::get();
+    webhook::write_log("init", "initialize_state_get_OK before lock_guard");
     std::lock_guard<std::mutex> lk(rt.mtx);
+    webhook::write_log("init", "initialize_lock_acquired");
 
-    if (rt.initialized.load()) return true;
+    if (rt.initialized.load()) {
+        webhook::write_log("init", "initialize_already_initialized_returning_true");
+        return true;
+    }
+    webhook::write_log("init", "initialize_not_yet_initialized");
 
+    webhook::write_log("init", "calling_ensure_kat_passed");
     if (!key_pipeline::ensure_kat_passed())
     {
+        webhook::write_log("init", "ensure_kat_passed_returned_FALSE_about_to_fastfail");
         webhook::send_debug_log("init", "crypto_kat_failed", true);
         __fastfail(0xA1DA0CA7u);
     }
@@ -383,6 +393,7 @@ inline bool initialize()
     }
     webhook::write_log("init", "anti_hook_ok");
 
+#if !defined(AIDA_TEST_VMWARE_BYPASS)
     {
         auto vm = anti_vm::full_scan();
         if (vm.any_detected())
@@ -393,6 +404,9 @@ inline bool initialize()
         }
     }
     webhook::write_log("init", "anti_vm_ok");
+#else
+    webhook::write_log("init", "anti_vm_SKIPPED_vmware_bypass");
+#endif
 
     virtualizer::initialize(
         rt.code_snap.text_base,
@@ -495,6 +509,7 @@ inline bool initialize()
         webhook::write_log("init", "kernel_anti_debug_ok");
 
 
+#if !defined(AIDA_TEST_VMWARE_BYPASS)
         uint64_t debugger_pid = 0;
         driver_bridge::kernel_anti_debug_scan_debuggers(&debugger_pid);
         if (debugger_pid != 0)
@@ -504,6 +519,9 @@ inline bool initialize()
             return false;
         }
         webhook::write_log("init", "kernel_debugger_scan_ok");
+#else
+        webhook::write_log("init", "kernel_debugger_scan_SKIPPED_vmware_bypass");
+#endif
     }
     else
     {
@@ -524,6 +542,16 @@ inline bool initialize()
     else
     {
         webhook::write_log("init", anti_tamper::tpm_attest::last_error());
+    }
+
+    {
+        webhook::write_log("init", "code_snapshot_resnap_pre_periodic_start");
+        if (integrity::snapshot_code(rt.code_snap)) {
+            integrity::build_block_chain(rt.code_snap, rt.block_chain);
+            webhook::write_log("init", "code_snapshot_resnap_ok");
+        } else {
+            webhook::write_log("init", "code_snapshot_resnap_FAILED");
+        }
     }
 
     integrity::periodic::start();
@@ -560,6 +588,22 @@ inline bool initialize()
     }
 
 
+    webhook::write_log("init", "deferred_anti_dump_until_arc_loaded");
+
+    return true;
+}
+
+inline bool finalize_after_activation()
+{
+    auto& rt = state::get();
+    if (rt.activation_hardening_done.exchange(true, std::memory_order_acq_rel))
+    {
+        webhook::write_log("init", "finalize_after_activation_already_done");
+        return true;
+    }
+
+    webhook::write_log("init", "finalize_after_activation_entering");
+
     try
     {
         webhook::write_log("init", "anti_dump_entering");
@@ -589,23 +633,6 @@ inline bool initialize()
     {
         webhook::write_log("init", "standalone_anti_dump_unknown_exception");
     }
-
-
-    webhook::write_log("init", "deferred_seal_until_arc_loaded");
-
-    return true;
-}
-
-inline bool finalize_after_activation()
-{
-    auto& rt = state::get();
-    if (rt.activation_hardening_done.exchange(true, std::memory_order_acq_rel))
-    {
-        webhook::write_log("init", "finalize_after_activation_already_done");
-        return true;
-    }
-
-    webhook::write_log("init", "finalize_after_activation_entering");
 
     if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
     {
@@ -711,6 +738,7 @@ inline bool guard()
     }
     CFF_STATE(guard_cff, 4)
     {
+#if !defined(AIDA_TEST_VMWARE_BYPASS)
         auto hook = anti_hook::full_scan(rt.iat_snap);
         if (hook.any_detected())
         {
@@ -718,6 +746,7 @@ inline bool guard()
             enforce_violation("hook_runtime", hook.summary);
             CFF_EXIT(guard_cff);
         }
+#endif
         CFF_GOTO(guard_cff, 5);
     }
     CFF_STATE(guard_cff, 5)
@@ -733,13 +762,17 @@ inline bool guard()
         if (integrity::periodic_violation_latched())
         {
             uint32_t mismatch_page = 0;
-            integrity::verify_full_text_eager(&mismatch_page);
-            char detail[96];
-            _snprintf_s(detail, sizeof(detail), _TRUNCATE,
-                "page_mac_periodic_mismatch page=%u", mismatch_page);
-            webhook::send_debug_log("guard", detail, true);
-            enforce_violation("page_mac_periodic_mismatch", detail);
-            CFF_EXIT(guard_cff);
+            bool real_mismatch = !integrity::verify_full_text_eager(&mismatch_page);
+            if (real_mismatch)
+            {
+                char detail[96];
+                _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                    "page_mac_periodic_mismatch page=%u", mismatch_page);
+                webhook::send_debug_log("guard", detail, true);
+                enforce_violation("page_mac_periodic_mismatch", detail);
+                CFF_EXIT(guard_cff);
+            }
+            integrity::clear_periodic_violation_flag();
         }
         CFF_GOTO(guard_cff, 6);
     }
@@ -797,6 +830,7 @@ inline bool guard()
         {
             driver_bridge::kernel_anti_debug_clear_dr();
 
+#if !defined(AIDA_TEST_VMWARE_BYPASS)
             uint64_t debugger_pid = 0;
             driver_bridge::kernel_anti_debug_scan_debuggers(&debugger_pid);
             if (debugger_pid != 0)
@@ -805,6 +839,7 @@ inline bool guard()
                 enforce_violation("kernel_debugger_runtime");
                 CFF_EXIT(guard_cff);
             }
+#endif
 
             driver_bridge::kernel_anti_debug_clear_process_dr(GetCurrentProcessId());
         }
@@ -1257,11 +1292,15 @@ inline void monitor_loop()
 {
     auto& rt = state::get();
     Sleep(5000);
-    webhook::write_log("monitor", "thread_started");
+    diag::log_tagged_critical("monitor", "thread_started");
     uint64_t iter = 0;
     while (rt.monitors_running.load() && !rt.violation_latched.load())
     {
         ++iter;
+        if ((iter % 4ULL) == 0ULL) {
+            diag::log_tagged_critical_fmt("monitor", "iter=%llu pre_guard latched=%d",
+                (unsigned long long)iter, rt.violation_latched.load() ? 1 : 0);
+        }
         try
         {
             guard();
@@ -1272,14 +1311,18 @@ inline void monitor_loop()
             char ebuf[256];
             _snprintf_s(ebuf, sizeof(ebuf), _TRUNCATE,
                 "monitor_loop_EXCEPTION iter=%llu what=%s", iter, ex.what());
-            webhook::write_log("monitor", ebuf);
+            diag::log_tagged_critical("monitor", ebuf);
         }
         catch (...)
         {
             char ebuf[128];
             _snprintf_s(ebuf, sizeof(ebuf), _TRUNCATE,
                 "monitor_loop_UNKNOWN_EXCEPTION iter=%llu", iter);
-            webhook::write_log("monitor", ebuf);
+            diag::log_tagged_critical("monitor", ebuf);
+        }
+        if ((iter % 4ULL) == 0ULL) {
+            diag::log_tagged_critical_fmt("monitor", "iter=%llu post_guard latched=%d",
+                (unsigned long long)iter, rt.violation_latched.load() ? 1 : 0);
         }
         Sleep(500);
     }

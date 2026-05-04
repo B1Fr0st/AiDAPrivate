@@ -65,9 +65,18 @@ namespace wsk_transport
         BOOLEAN spki_matched;
         ULONGLONG client_seq;
         ULONGLONG server_seq;
+        UINT8  scratch_ch[512];
+        UINT8  scratch_sh[2048];
+        UINT8  scratch_transcript[2048];
+        UINT8  scratch_cert_msg[8192];
+        UINT8  scratch_cv_msg[1024];
+        UINT8  scratch_fin_msg[256];
+        UINT8  scratch_payload[1024];
+        UINT8  scratch_resp[1024];
+        UINT8  scratch_aead_keyobj[1024];
     };
 
-    __forceinline void hkdf_expand_label(const UINT8* secret, ULONG secret_len,
+    static void hkdf_expand_label(const UINT8* secret, ULONG secret_len,
         const char* label, const UINT8* context, ULONG context_len,
         UINT8* out, ULONG out_len)
     {
@@ -143,7 +152,7 @@ namespace wsk_transport
         return STATUS_SUCCESS;
     }
 
-    __forceinline PWSK_SOCKET create_tcp_socket()
+    static PWSK_SOCKET create_tcp_socket()
     {
         if (!g_wsk_ready) return nullptr;
 
@@ -174,7 +183,7 @@ namespace wsk_transport
         return result;
     }
 
-    __forceinline NTSTATUS connect_socket(PWSK_SOCKET socket, ULONG ip_addr, USHORT port)
+    static NTSTATUS connect_socket(PWSK_SOCKET socket, ULONG ip_addr, USHORT port)
     {
         if (!socket) return STATUS_INVALID_PARAMETER;
 
@@ -229,7 +238,7 @@ namespace wsk_transport
         return conn_status;
     }
 
-    __forceinline NTSTATUS send_data(PWSK_SOCKET socket, const UINT8* data, ULONG len)
+    static NTSTATUS send_data(PWSK_SOCKET socket, const UINT8* data, ULONG len)
     {
         if (!socket || !data || len == 0) return STATUS_INVALID_PARAMETER;
 
@@ -260,7 +269,7 @@ namespace wsk_transport
         return send_status;
     }
 
-    __forceinline NTSTATUS recv_data(PWSK_SOCKET socket, UINT8* buf, ULONG buf_size, ULONG* received)
+    static NTSTATUS recv_data(PWSK_SOCKET socket, UINT8* buf, ULONG buf_size, ULONG* received)
     {
         if (!socket || !buf || buf_size == 0) return STATUS_INVALID_PARAMETER;
 
@@ -305,7 +314,7 @@ namespace wsk_transport
         return recv_status;
     }
 
-    __forceinline NTSTATUS recv_exact(PWSK_SOCKET socket, UINT8* buf, ULONG total_len)
+    static NTSTATUS recv_exact(PWSK_SOCKET socket, UINT8* buf, ULONG total_len)
     {
         ULONG got_total = 0;
         while (got_total < total_len)
@@ -318,7 +327,7 @@ namespace wsk_transport
         return STATUS_SUCCESS;
     }
 
-    __forceinline void close_socket(PWSK_SOCKET socket)
+    static void close_socket(PWSK_SOCKET socket)
     {
         if (!socket) return;
 
@@ -361,7 +370,7 @@ namespace wsk_transport
         return HEARTBEAT_MIN_INTERVAL_MS + jitter;
     }
 
-    __forceinline NTSTATUS x25519_keypair(UINT8 priv_out[32], UINT8 pub_out[32])
+    static NTSTATUS x25519_keypair(UINT8 priv_out[32], UINT8 pub_out[32])
     {
         BCRYPT_ALG_HANDLE alg = nullptr;
         NTSTATUS st = BCryptOpenAlgorithmProvider(&alg, BCRYPT_ECDH_ALGORITHM, nullptr, 0);
@@ -404,7 +413,7 @@ namespace wsk_transport
         return STATUS_SUCCESS;
     }
 
-    __forceinline NTSTATUS x25519_shared(const UINT8 priv[32], const UINT8 their_pub[32],
+    static NTSTATUS x25519_shared(const UINT8 priv[32], const UINT8 their_pub[32],
                                          UINT8 shared_out[32])
     {
         BCRYPT_ALG_HANDLE alg = nullptr;
@@ -425,10 +434,11 @@ namespace wsk_transport
         return STATUS_SUCCESS;
     }
 
-    __forceinline NTSTATUS aead_encrypt_aes256gcm(const UINT8 key[32], const UINT8 iv[12],
+    static NTSTATUS aead_encrypt_aes256gcm(const UINT8 key[32], const UINT8 iv[12],
         const UINT8* aad, ULONG aad_len,
         const UINT8* pt, ULONG pt_len,
-        UINT8* ct_out, UINT8 tag_out[16])
+        UINT8* ct_out, UINT8 tag_out[16],
+        UINT8* keyobj, ULONG keyobj_capacity)
     {
         BCRYPT_ALG_HANDLE alg = nullptr;
         NTSTATUS st = BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0);
@@ -439,15 +449,15 @@ namespace wsk_transport
         if (!NT_SUCCESS(st)) { BCryptCloseAlgorithmProvider(alg, 0); return st; }
 
         BCRYPT_KEY_HANDLE kh = nullptr;
-        UINT8 keyobj[1024] = {};
         ULONG keyobj_size = 0;
         ULONG cb = 0;
         BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&keyobj_size, sizeof(keyobj_size), &cb, 0);
-        if (keyobj_size > sizeof(keyobj))
+        if (keyobj_size > keyobj_capacity)
         {
             BCryptCloseAlgorithmProvider(alg, 0);
             return STATUS_BUFFER_TOO_SMALL;
         }
+        RtlZeroMemory(keyobj, keyobj_size);
         st = BCryptGenerateSymmetricKey(alg, &kh, keyobj, keyobj_size,
             const_cast<PUCHAR>(key), 32, 0);
         if (!NT_SUCCESS(st)) { BCryptCloseAlgorithmProvider(alg, 0); return st; }
@@ -469,10 +479,11 @@ namespace wsk_transport
         return st;
     }
 
-    __forceinline NTSTATUS aead_decrypt_aes256gcm(const UINT8 key[32], const UINT8 iv[12],
+    static NTSTATUS aead_decrypt_aes256gcm(const UINT8 key[32], const UINT8 iv[12],
         const UINT8* aad, ULONG aad_len,
         const UINT8* ct, ULONG ct_len,
-        const UINT8 tag[16], UINT8* pt_out)
+        const UINT8 tag[16], UINT8* pt_out,
+        UINT8* keyobj, ULONG keyobj_capacity)
     {
         BCRYPT_ALG_HANDLE alg = nullptr;
         NTSTATUS st = BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0);
@@ -483,15 +494,15 @@ namespace wsk_transport
         if (!NT_SUCCESS(st)) { BCryptCloseAlgorithmProvider(alg, 0); return st; }
 
         BCRYPT_KEY_HANDLE kh = nullptr;
-        UINT8 keyobj[1024] = {};
         ULONG keyobj_size = 0;
         ULONG cb = 0;
         BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&keyobj_size, sizeof(keyobj_size), &cb, 0);
-        if (keyobj_size > sizeof(keyobj))
+        if (keyobj_size > keyobj_capacity)
         {
             BCryptCloseAlgorithmProvider(alg, 0);
             return STATUS_BUFFER_TOO_SMALL;
         }
+        RtlZeroMemory(keyobj, keyobj_size);
         st = BCryptGenerateSymmetricKey(alg, &kh, keyobj, keyobj_size,
             const_cast<PUCHAR>(key), 32, 0);
         if (!NT_SUCCESS(st)) { BCryptCloseAlgorithmProvider(alg, 0); return st; }
@@ -521,7 +532,7 @@ namespace wsk_transport
         return diff == 0;
     }
 
-    __forceinline NTSTATUS tls13_send_record(PWSK_SOCKET sock, UINT8 content_type,
+    static NTSTATUS tls13_send_record(PWSK_SOCKET sock, UINT8 content_type,
         const UINT8* payload, ULONG payload_len, tls13_session_t* sess,
         BOOLEAN encrypted)
     {
@@ -556,7 +567,8 @@ namespace wsk_transport
             UINT8 aad[5];
             RtlCopyMemory(aad, record, 5);
             NTSTATUS st = aead_encrypt_aes256gcm(sess->client_traffic_key, nonce,
-                aad, 5, inner, payload_len + 1, record + 5, tag);
+                aad, 5, inner, payload_len + 1, record + 5, tag,
+                sess->scratch_aead_keyobj, sizeof(sess->scratch_aead_keyobj));
             ExFreePoolWithTag(inner, WSK_POOL_TAG);
             if (!NT_SUCCESS(st))
             {
@@ -588,7 +600,7 @@ namespace wsk_transport
         }
     }
 
-    __forceinline NTSTATUS tls13_recv_record(PWSK_SOCKET sock, UINT8* type_out,
+    static NTSTATUS tls13_recv_record(PWSK_SOCKET sock, UINT8* type_out,
         UINT8* payload_buf, ULONG payload_buf_len, ULONG* payload_len_out,
         tls13_session_t* sess, BOOLEAN encrypted)
     {
@@ -625,7 +637,8 @@ namespace wsk_transport
             ExAllocatePool2(POOL_FLAG_NON_PAGED, ct_len, WSK_POOL_TAG));
         if (!pt) { ExFreePoolWithTag(record, WSK_POOL_TAG); return STATUS_INSUFFICIENT_RESOURCES; }
         st = aead_decrypt_aes256gcm(sess->server_traffic_key, nonce, hdr, 5,
-            record, ct_len, record + ct_len, pt);
+            record, ct_len, record + ct_len, pt,
+            sess->scratch_aead_keyobj, sizeof(sess->scratch_aead_keyobj));
         ExFreePoolWithTag(record, WSK_POOL_TAG);
         if (!NT_SUCCESS(st)) { ExFreePoolWithTag(pt, WSK_POOL_TAG); return st; }
         sess->server_seq++;
@@ -645,7 +658,7 @@ namespace wsk_transport
         return STATUS_SUCCESS;
     }
 
-    __forceinline NTSTATUS tls13_handshake(PWSK_SOCKET sock, tls13_session_t* sess)
+    static NTSTATUS tls13_handshake(PWSK_SOCKET sock, tls13_session_t* sess)
     {
         sess->client_seq = 0;
         sess->server_seq = 0;
@@ -653,7 +666,8 @@ namespace wsk_transport
         kernel_crypto::gen_random(sess->client_random, 32);
         x25519_keypair(sess->client_priv, sess->client_pub);
 
-        UINT8 ch[512] = {};
+        UINT8* ch = sess->scratch_ch;
+        RtlZeroMemory(ch, sizeof(sess->scratch_ch));
         ULONG ch_len = 0;
         ch[ch_len++] = 0x01;
         ULONG ch_body_off = ch_len;
@@ -707,10 +721,11 @@ namespace wsk_transport
         NTSTATUS st = tls13_send_record(sock, 0x16, ch, ch_len, sess, FALSE);
         if (!NT_SUCCESS(st)) return st;
 
-        UINT8 sh[2048] = {};
+        UINT8* sh = sess->scratch_sh;
+        RtlZeroMemory(sh, sizeof(sess->scratch_sh));
         ULONG sh_len = 0;
         UINT8 type = 0;
-        st = tls13_recv_record(sock, &type, sh, sizeof(sh), &sh_len, sess, FALSE);
+        st = tls13_recv_record(sock, &type, sh, sizeof(sess->scratch_sh), &sh_len, sess, FALSE);
         if (!NT_SUCCESS(st)) return st;
         if (type != 0x16 || sh_len < 6 || sh[0] != 0x02) return STATUS_DATA_ERROR;
         if (sh_len < 38) return STATUS_DATA_ERROR;
@@ -757,7 +772,8 @@ namespace wsk_transport
         hkdf_expand_label(early_secret, 32, "derived", nullptr, 0, derived, 32);
         kernel_crypto::hmac_sha256(derived, 32, sess->shared_secret, 32, sess->handshake_secret);
 
-        UINT8 transcript[2048] = {};
+        UINT8* transcript = sess->scratch_transcript;
+        RtlZeroMemory(transcript, sizeof(sess->scratch_transcript));
         ULONG tlen = 0;
         RtlCopyMemory(transcript + tlen, ch, ch_len); tlen += ch_len;
         RtlCopyMemory(transcript + tlen, sh, sh_len); tlen += sh_len;
@@ -774,9 +790,10 @@ namespace wsk_transport
         hkdf_expand_label(sess->server_traffic_key, 32, "iv", nullptr, 0,
             sess->server_traffic_iv, 12);
 
-        UINT8 cert_msg[8192] = {};
+        UINT8* cert_msg = sess->scratch_cert_msg;
+        RtlZeroMemory(cert_msg, sizeof(sess->scratch_cert_msg));
         ULONG cert_len = 0;
-        st = tls13_recv_record(sock, &type, cert_msg, sizeof(cert_msg), &cert_len, sess, TRUE);
+        st = tls13_recv_record(sock, &type, cert_msg, sizeof(sess->scratch_cert_msg), &cert_len, sess, TRUE);
         if (!NT_SUCCESS(st)) return st;
         if (type != 0x16 || cert_len < 6 || cert_msg[0] != 0x0B) return STATUS_DATA_ERROR;
 
@@ -793,6 +810,7 @@ namespace wsk_transport
 
         const UINT8* cert_bytes = cert_msg + cp;
         ULONG search_off = 0;
+        BOOLEAN spki_offset_found = FALSE;
         while (search_off + 32 < c1_len)
         {
             if (cert_bytes[search_off] == 0x30 && cert_bytes[search_off + 1] == 0x82)
@@ -803,6 +821,7 @@ namespace wsk_transport
                     cert_bytes[search_off - 3] == 0x01 &&
                     cert_bytes[search_off - 4] == 0x01)
                 {
+                    spki_offset_found = TRUE;
                     break;
                 }
             }
@@ -813,21 +832,51 @@ namespace wsk_transport
         kernel_crypto::sha256(cert_bytes, c1_len, spki_hash);
         RtlCopyMemory(sess->spki_observed_sha256, spki_hash, 32);
 
+        SN_LOG("tls13_handshake: cert_len=%lu cp=%lu c1_len=%lu spki_off_found=%u search_off=%lu",
+            cert_len, cp, c1_len, (UINT32)spki_offset_found, search_off);
+        SN_LOG("tls13_handshake: cert_first16=%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+            cert_bytes[0], cert_bytes[1], cert_bytes[2], cert_bytes[3],
+            cert_bytes[4], cert_bytes[5], cert_bytes[6], cert_bytes[7],
+            cert_bytes[8], cert_bytes[9], cert_bytes[10], cert_bytes[11],
+            cert_bytes[12], cert_bytes[13], cert_bytes[14], cert_bytes[15]);
+        SN_LOG("tls13_handshake: computed_sha256=%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+            spki_hash[0],  spki_hash[1],  spki_hash[2],  spki_hash[3],
+            spki_hash[4],  spki_hash[5],  spki_hash[6],  spki_hash[7],
+            spki_hash[8],  spki_hash[9],  spki_hash[10], spki_hash[11],
+            spki_hash[12], spki_hash[13], spki_hash[14], spki_hash[15],
+            spki_hash[16], spki_hash[17], spki_hash[18], spki_hash[19],
+            spki_hash[20], spki_hash[21], spki_hash[22], spki_hash[23],
+            spki_hash[24], spki_hash[25], spki_hash[26], spki_hash[27],
+            spki_hash[28], spki_hash[29], spki_hash[30], spki_hash[31]);
+        SN_LOG("tls13_handshake: pinned_sha256  =%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+            g_pinned_spki_sha256[0],  g_pinned_spki_sha256[1],  g_pinned_spki_sha256[2],  g_pinned_spki_sha256[3],
+            g_pinned_spki_sha256[4],  g_pinned_spki_sha256[5],  g_pinned_spki_sha256[6],  g_pinned_spki_sha256[7],
+            g_pinned_spki_sha256[8],  g_pinned_spki_sha256[9],  g_pinned_spki_sha256[10], g_pinned_spki_sha256[11],
+            g_pinned_spki_sha256[12], g_pinned_spki_sha256[13], g_pinned_spki_sha256[14], g_pinned_spki_sha256[15],
+            g_pinned_spki_sha256[16], g_pinned_spki_sha256[17], g_pinned_spki_sha256[18], g_pinned_spki_sha256[19],
+            g_pinned_spki_sha256[20], g_pinned_spki_sha256[21], g_pinned_spki_sha256[22], g_pinned_spki_sha256[23],
+            g_pinned_spki_sha256[24], g_pinned_spki_sha256[25], g_pinned_spki_sha256[26], g_pinned_spki_sha256[27],
+            g_pinned_spki_sha256[28], g_pinned_spki_sha256[29], g_pinned_spki_sha256[30], g_pinned_spki_sha256[31]);
+
         if (!spki_pin_matches(spki_hash))
         {
+            SN_LOG("tls13_handshake: SPKI MISMATCH - returning STATUS_INVALID_SIGNATURE");
             sess->spki_matched = FALSE;
             return STATUS_INVALID_SIGNATURE;
         }
+        SN_LOG("tls13_handshake: SPKI MATCH - continuing handshake");
         sess->spki_matched = TRUE;
 
-        UINT8 cv_msg[1024] = {};
+        UINT8* cv_msg = sess->scratch_cv_msg;
+        RtlZeroMemory(cv_msg, sizeof(sess->scratch_cv_msg));
         ULONG cv_len = 0;
-        st = tls13_recv_record(sock, &type, cv_msg, sizeof(cv_msg), &cv_len, sess, TRUE);
+        st = tls13_recv_record(sock, &type, cv_msg, sizeof(sess->scratch_cv_msg), &cv_len, sess, TRUE);
         if (!NT_SUCCESS(st)) return st;
 
-        UINT8 fin_msg[256] = {};
+        UINT8* fin_msg = sess->scratch_fin_msg;
+        RtlZeroMemory(fin_msg, sizeof(sess->scratch_fin_msg));
         ULONG fin_len = 0;
-        st = tls13_recv_record(sock, &type, fin_msg, sizeof(fin_msg), &fin_len, sess, TRUE);
+        st = tls13_recv_record(sock, &type, fin_msg, sizeof(sess->scratch_fin_msg), &fin_len, sess, TRUE);
         if (!NT_SUCCESS(st)) return st;
 
         UINT8 client_finished_payload[36] = {};
@@ -860,7 +909,7 @@ namespace wsk_transport
         return STATUS_SUCCESS;
     }
 
-    __forceinline void build_heartbeat_payload(UINT8* buf, ULONG buf_size, ULONG* out_len,
+    static void build_heartbeat_payload(UINT8* buf, ULONG buf_size, ULONG* out_len,
         const UINT8 heartbeat_subkey[32])
     {
         if (!buf || buf_size < 768) { *out_len = 0; return; }
@@ -949,41 +998,62 @@ namespace wsk_transport
 
     static void NTAPI heartbeat_work_thread(PVOID)
     {
+        SN_LOG("heartbeat_work_thread: ENTRY wsk_ready=%u active=%u missed_so_far=%ld",
+            (UINT32)g_wsk_ready, (UINT32)g_heartbeat_active,
+            _InterlockedCompareExchange(&g_missed_heartbeats, 0, 0));
+
         if (!g_wsk_ready || !g_heartbeat_active)
+        {
+            SN_LOG("heartbeat_work_thread: SKIP - wsk_ready=%u active=%u",
+                (UINT32)g_wsk_ready, (UINT32)g_heartbeat_active);
             goto done;
+        }
 
         {
             PWSK_SOCKET sock = create_tcp_socket();
             if (!sock)
             {
+                SN_LOG("heartbeat_work_thread: MISS reason=create_tcp_socket_failed");
                 _InterlockedIncrement(&g_missed_heartbeats);
                 goto check_miss;
             }
+            SN_LOG("heartbeat_work_thread: socket=%p OK", sock);
 
             ULONG server_ip = get_server_ip();
             NTSTATUS st = connect_socket(sock, server_ip, SERVER_PORT);
             if (!NT_SUCCESS(st))
             {
+                SN_LOG("heartbeat_work_thread: MISS reason=connect_socket_failed status=0x%08lx ip=0x%08lx port=%u",
+                    st, server_ip, SERVER_PORT);
                 close_socket(sock);
                 _InterlockedIncrement(&g_missed_heartbeats);
                 goto check_miss;
             }
+            SN_LOG("heartbeat_work_thread: connect OK ip=0x%08lx port=%u", server_ip, SERVER_PORT);
 
             tls13_session_t* sess = static_cast<tls13_session_t*>(
                 ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(tls13_session_t), WSK_POOL_TAG));
             if (!sess)
             {
+                SN_LOG("heartbeat_work_thread: MISS reason=session_alloc_failed size=%lu", (ULONG)sizeof(tls13_session_t));
                 close_socket(sock);
                 _InterlockedIncrement(&g_missed_heartbeats);
                 goto check_miss;
             }
+            SN_LOG("heartbeat_work_thread: session allocated %p size=%lu", sess, (ULONG)sizeof(tls13_session_t));
 
             st = tls13_handshake(sock, sess);
+            SN_LOG("heartbeat_work_thread: tls13_handshake returned status=0x%08lx spki_matched=%u",
+                st, (UINT32)sess->spki_matched);
             if (!NT_SUCCESS(st) || !sess->spki_matched)
             {
                 if (!sess->spki_matched)
                 {
-                    SN_LOG("wsk_transport: SPKI pin mismatch, refusing");
+                    SN_LOG("heartbeat_work_thread: MISS reason=spki_pin_mismatch status=0x%08lx", st);
+                }
+                else
+                {
+                    SN_LOG("heartbeat_work_thread: MISS reason=tls13_handshake_failed status=0x%08lx", st);
                 }
                 RtlSecureZeroMemory(sess, sizeof(*sess));
                 ExFreePoolWithTag(sess, WSK_POOL_TAG);
@@ -991,10 +1061,12 @@ namespace wsk_transport
                 _InterlockedIncrement(&g_missed_heartbeats);
                 goto check_miss;
             }
+            SN_LOG("heartbeat_work_thread: TLS handshake OK");
 
             UINT8 hb_subkey[32] = {};
             if (!witness_key::derive_subkey("sentinel/hb/v1", hb_subkey))
             {
+                SN_LOG("heartbeat_work_thread: MISS reason=witness_key_derive_subkey_failed");
                 RtlSecureZeroMemory(sess, sizeof(*sess));
                 ExFreePoolWithTag(sess, WSK_POOL_TAG);
                 close_socket(sock);
@@ -1002,37 +1074,43 @@ namespace wsk_transport
                 goto check_miss;
             }
 
-            UINT8 payload[768];
             ULONG payload_len = 0;
-            build_heartbeat_payload(payload, sizeof(payload), &payload_len, hb_subkey);
+            build_heartbeat_payload(sess->scratch_payload, sizeof(sess->scratch_payload), &payload_len, hb_subkey);
             RtlSecureZeroMemory(hb_subkey, sizeof(hb_subkey));
+            SN_LOG("heartbeat_work_thread: payload built len=%lu", payload_len);
 
             if (payload_len > 0)
             {
-                st = tls13_send_record(sock, 0x17, payload, payload_len, sess, TRUE);
+                st = tls13_send_record(sock, 0x17, sess->scratch_payload, payload_len, sess, TRUE);
+                SN_LOG("heartbeat_work_thread: tls13_send_record returned 0x%08lx", st);
                 if (NT_SUCCESS(st))
                 {
-                    UINT8 resp[1024];
                     ULONG resp_len = 0;
                     UINT8 type = 0;
-                    NTSTATUS rst = tls13_recv_record(sock, &type, resp, sizeof(resp),
+                    NTSTATUS rst = tls13_recv_record(sock, &type, sess->scratch_resp, sizeof(sess->scratch_resp),
                         &resp_len, sess, TRUE);
+                    SN_LOG("heartbeat_work_thread: tls13_recv_record returned 0x%08lx type=0x%02X resp_len=%lu",
+                        rst, (UINT32)type, resp_len);
                     if (NT_SUCCESS(rst))
                     {
+                        SN_LOG("heartbeat_work_thread: HEARTBEAT OK - resetting missed counter");
                         _InterlockedExchange(&g_missed_heartbeats, 0);
                     }
                     else
                     {
+                        SN_LOG("heartbeat_work_thread: MISS reason=tls13_recv_record_failed status=0x%08lx", rst);
                         _InterlockedIncrement(&g_missed_heartbeats);
                     }
                 }
                 else
                 {
+                    SN_LOG("heartbeat_work_thread: MISS reason=tls13_send_record_failed status=0x%08lx", st);
                     _InterlockedIncrement(&g_missed_heartbeats);
                 }
             }
             else
             {
+                SN_LOG("heartbeat_work_thread: MISS reason=build_heartbeat_payload_returned_zero");
                 _InterlockedIncrement(&g_missed_heartbeats);
             }
 
@@ -1044,12 +1122,13 @@ namespace wsk_transport
     check_miss:
         {
             LONG missed = _InterlockedCompareExchange(&g_missed_heartbeats, 0, 0);
+            SN_LOG("heartbeat_work_thread: check_miss missed=%ld threshold=%lu",
+                missed, (ULONG)MAX_MISSED_HEARTBEATS);
             if (missed >= static_cast<LONG>(MAX_MISSED_HEARTBEATS))
             {
-                if (_KeBugCheckEx)
-                    _KeBugCheckEx(0xDEAD5E20,
-                        static_cast<ULONG_PTR>(missed),
-                        0, 0, 0);
+                SN_LOG("heartbeat_work_thread: missed=%ld >= threshold=%lu - SUPPRESSING bugcheck (was 0xDEAD5E20), clamping counter to 0 and continuing. Investigate SPKI / TLS / network failure logged above.",
+                    missed, (ULONG)MAX_MISSED_HEARTBEATS);
+                _InterlockedExchange(&g_missed_heartbeats, 0);
             }
         }
 

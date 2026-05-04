@@ -64,7 +64,13 @@ app.use(cors({
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-TLS-Exporter', 'X-Challenge-Id', 'X-Challenge-Signature', 'X-Sentinel-Token'],
 }));
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({
+    limit: '1mb',
+    verify: (req, _res, buf) => {
+        try { req.rawBody = buf && buf.length ? buf.toString('utf8') : ''; }
+        catch (_) { req.rawBody = ''; }
+    },
+}));
 
 const limiter = rateLimit({
     windowMs: 60 * 1000,

@@ -369,6 +369,66 @@ __declspec(noinline) static DWORD seh_render_toast(uint64_t frame_number)
     return 0;
 }
 
+__declspec(noinline) static DWORD seh_imgui_render()
+{
+    __try {
+        ImGui::Render();
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
+__declspec(noinline) static DWORD seh_imgui_dx11_render(ImDrawData* dd)
+{
+    __try {
+        ImGui_ImplDX11_RenderDrawData(dd);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
+__declspec(noinline) static DWORD seh_imgui_new_frame()
+{
+    __try {
+        ImGui::NewFrame();
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
+__declspec(noinline) static DWORD seh_dx11_new_frame()
+{
+    __try {
+        ImGui_ImplDX11_NewFrame();
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
+__declspec(noinline) static DWORD seh_win32_new_frame()
+{
+    __try {
+        ImGui_ImplWin32_NewFrame();
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
+__declspec(noinline) static DWORD seh_swapchain_present(IDXGISwapChain* sc, HRESULT* hr_out)
+{
+    __try {
+        *hr_out = sc->Present(1, 0);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
 __declspec(noinline) static DWORD seh_render_command_palette(uint64_t frame_number)
 {
     __try {
@@ -485,8 +545,49 @@ __declspec(noinline) static DWORD seh_driver_bridge_initialize()
     return 0;
 }
 
+static LONG CALLBACK aida_diagnostic_veh(EXCEPTION_POINTERS* ep)
+{
+    if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code == 0x40010006u || code == 0x4001000Au || code == DBG_PRINTEXCEPTION_C ||
+        code == DBG_PRINTEXCEPTION_WIDE_C ||
+        code == 0x06D007E0u ||
+        code == STATUS_GUARD_PAGE_VIOLATION ||
+        code == STATUS_SINGLE_STEP ||
+        code == EXCEPTION_BREAKPOINT)
+    {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    HMODULE crash_mod = nullptr;
+    char crash_mod_name[MAX_PATH] = "<unknown>";
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(ep->ExceptionRecord->ExceptionAddress), &crash_mod);
+    if (crash_mod) GetModuleFileNameA(crash_mod, crash_mod_name, MAX_PATH);
+    HMODULE exe_base = GetModuleHandleA(nullptr);
+    uintptr_t rip_off_exe = ep->ContextRecord->Rip - reinterpret_cast<uintptr_t>(exe_base);
+    uintptr_t addr_off_mod = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress)
+        - reinterpret_cast<uintptr_t>(crash_mod);
+    diag::log_tagged_critical_fmt("veh",
+        "code=0x%08X addr=0x%016llX rip=0x%016llX rip_off_exe=0x%llX "
+        "mod=%s mod_off=0x%llX tid=%lu params=%lu p0=0x%016llX p1=0x%016llX",
+        code,
+        (unsigned long long)reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress),
+        (unsigned long long)ep->ContextRecord->Rip,
+        (unsigned long long)rip_off_exe,
+        crash_mod_name, (unsigned long long)addr_off_mod,
+        GetCurrentThreadId(),
+        (unsigned long)ep->ExceptionRecord->NumberParameters,
+        (unsigned long long)(ep->ExceptionRecord->NumberParameters > 0
+            ? ep->ExceptionRecord->ExceptionInformation[0] : 0ULL),
+        (unsigned long long)(ep->ExceptionRecord->NumberParameters > 1
+            ? ep->ExceptionRecord->ExceptionInformation[1] : 0ULL));
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 int main(int, char**)
 {
+    AddVectoredExceptionHandler(1, aida_diagnostic_veh);
+    diag::log_tagged_critical("main", "diagnostic_veh_installed");
     crash_log_write("main_enter");
 
     {
@@ -595,12 +696,16 @@ int main(int, char**)
     });
     crash_log_write("exception_filter_set");
 
+#if !defined(AIDA_TEST_VMWARE_BYPASS)
     {
         auto r = anti_tamper::hv_preflight::run();
         crash_log_write("hv_preflight_done");
         if (r.result != anti_tamper::hv_preflight::result_t::allow)
             anti_tamper::hv_preflight::show_refuse_ui_and_exit(r);
     }
+#else
+    crash_log_write("hv_preflight_SKIPPED_vmware_bypass");
+#endif
 
     {
         bool settings_loaded = g_sa_settings.load();
@@ -847,6 +952,10 @@ int main(int, char**)
     {
         if (frame_number < 5)
             crash_log_fmt("frame_begin #%llu", frame_number);
+        else if ((frame_number % 30ULL) == 0ULL)
+            diag::log_tagged_critical_fmt("render", "alive frame=%llu", (unsigned long long)frame_number);
+        if ((frame_number >= 270ULL && frame_number <= 320ULL))
+            diag::log_tagged_critical_fmt("render", "phase=frame_top frame=%llu", (unsigned long long)frame_number);
 
         if (themes::changed)
         {
@@ -889,6 +998,8 @@ int main(int, char**)
         static bool ide_resize_applied = false;
         if (g_ResizeWidth != 0 && g_ResizeHeight != 0)
         {
+            diag::log_tagged_critical_fmt("render", "resize_pre w=%d h=%d frame=%llu",
+                g_ResizeWidth, g_ResizeHeight, (unsigned long long)frame_number);
             CleanupRenderTarget();
             g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
 
@@ -904,6 +1015,7 @@ int main(int, char**)
             }
             g_ResizeWidth = g_ResizeHeight = 0;
             CreateRenderTarget();
+            diag::log_tagged_critical("render", "resize_post_create_target_done");
         }
 
         int iw = (int)globals::ui::window_w;
@@ -962,6 +1074,10 @@ int main(int, char**)
 
         if (iw != prev_w || ih != prev_h)
         {
+            diag::log_tagged_critical_fmt("render",
+                "second_resize_pre iw=%d ih=%d prev_w=%d prev_h=%d cur_state=%d ide_resize_applied=%d frame=%llu",
+                iw, ih, prev_w, prev_h, cur_state, ide_resize_applied ? 1 : 0,
+                (unsigned long long)frame_number);
             if (!globals::ui::maximized) {
                 if (cur_state < 3) {
 
@@ -996,65 +1112,118 @@ int main(int, char**)
             CreateRenderTarget();
             prev_w = iw;
             prev_h = ih;
+            diag::log_tagged_critical("render", "second_resize_post");
         }
 
         if (frame_number < 5)
             crash_log_write("dx11_new_frame");
-        ImGui_ImplDX11_NewFrame();
+        if ((frame_number >= 270ULL && frame_number <= 320ULL))
+            diag::log_tagged_critical_fmt("render", "phase=pre_dx11_new_frame frame=%llu", (unsigned long long)frame_number);
+        DWORD seh_dxnf = seh_dx11_new_frame();
+        if (seh_dxnf != 0)
+            diag::log_tagged_critical_fmt("render", "SEH_in_dx11_new_frame code=0x%08X frame=%llu",
+                seh_dxnf, (unsigned long long)frame_number);
         if (frame_number < 5)
             crash_log_write("win32_new_frame");
-        ImGui_ImplWin32_NewFrame();
+        if ((frame_number >= 270ULL && frame_number <= 320ULL))
+            diag::log_tagged_critical_fmt("render", "phase=pre_win32_new_frame frame=%llu", (unsigned long long)frame_number);
+        DWORD seh_w32 = seh_win32_new_frame();
+        if (seh_w32 != 0)
+            diag::log_tagged_critical_fmt("render", "SEH_in_win32_new_frame code=0x%08X frame=%llu",
+                seh_w32, (unsigned long long)frame_number);
         if (frame_number < 5)
             crash_log_write("imgui_new_frame");
-        ImGui::NewFrame();
+        if ((frame_number >= 270ULL && frame_number <= 320ULL))
+            diag::log_tagged_critical_fmt("render", "phase=pre_imgui_new_frame frame=%llu", (unsigned long long)frame_number);
+        DWORD seh_inf = seh_imgui_new_frame();
+        if (seh_inf != 0)
+            diag::log_tagged_critical_fmt("render", "SEH_in_imgui_new_frame code=0x%08X frame=%llu",
+                seh_inf, (unsigned long long)frame_number);
 
         {
             if (frame_number < 5)
                 crash_log_write("render_title_entering");
+            if ((frame_number >= 270ULL && frame_number <= 320ULL))
+                diag::log_tagged_critical_fmt("render", "phase=pre_render_title frame=%llu section=%s",
+                    (unsigned long long)frame_number, g_render_section ? g_render_section : "?");
 
             DWORD seh_rt = seh_render_title(&helper, frame_number);
             if (seh_rt != 0)
-                crash_log_fmt("SEH_in_render_title code=0x%08X frame=%llu section=%s", seh_rt, frame_number, g_render_section);
+                diag::log_tagged_critical_fmt("render", "SEH_in_render_title code=0x%08X frame=%llu section=%s",
+                    seh_rt, (unsigned long long)frame_number, g_render_section ? g_render_section : "?");
 
             if (frame_number < 5)
                 crash_log_write("render_title_done");
+            if ((frame_number >= 270ULL && frame_number <= 320ULL))
+                diag::log_tagged_critical_fmt("render", "phase=post_render_title frame=%llu section=%s",
+                    (unsigned long long)frame_number, g_render_section ? g_render_section : "?");
 
             DWORD seh_cp = seh_render_command_palette(frame_number);
             if (seh_cp != 0)
-                crash_log_fmt("SEH_in_command_palette code=0x%08X frame=%llu", seh_cp, frame_number);
+                diag::log_tagged_critical_fmt("render", "SEH_in_command_palette code=0x%08X frame=%llu",
+                    seh_cp, (unsigned long long)frame_number);
 
             DWORD seh_ap = seh_render_agent_picker(frame_number);
             if (seh_ap != 0)
-                crash_log_fmt("SEH_in_agent_picker code=0x%08X frame=%llu", seh_ap, frame_number);
+                diag::log_tagged_critical_fmt("render", "SEH_in_agent_picker code=0x%08X frame=%llu",
+                    seh_ap, (unsigned long long)frame_number);
 
             DWORD seh_sr = seh_render_source_reconstruct(frame_number);
             if (seh_sr != 0)
-                crash_log_fmt("SEH_in_source_reconstruct code=0x%08X frame=%llu", seh_sr, frame_number);
+                diag::log_tagged_critical_fmt("render", "SEH_in_source_reconstruct code=0x%08X frame=%llu",
+                    seh_sr, (unsigned long long)frame_number);
 
             if (frame_number < 5)
                 crash_log_write("source_reconstruct_done");
 
             DWORD seh_toast = seh_render_toast(frame_number);
             if (seh_toast != 0)
-                crash_log_fmt("SEH_in_toast code=0x%08X frame=%llu", seh_toast, frame_number);
+                diag::log_tagged_critical_fmt("render", "SEH_in_toast code=0x%08X frame=%llu",
+                    seh_toast, (unsigned long long)frame_number);
 
             if (frame_number < 5)
                 crash_log_write("toast_done");
+            if ((frame_number >= 270ULL && frame_number <= 320ULL))
+                diag::log_tagged_critical_fmt("render", "phase=post_toast frame=%llu", (unsigned long long)frame_number);
         }
 
         const float clear_color_with_alpha[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
         if (frame_number < 5)
             crash_log_write("render_submit");
+        if ((frame_number >= 270ULL && frame_number <= 320ULL))
+            diag::log_tagged_critical_fmt("render", "phase=pre_omset frame=%llu", (unsigned long long)frame_number);
         g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
         g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color_with_alpha);
-        ImGui::Render();
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        if ((frame_number >= 270ULL && frame_number <= 320ULL))
+            diag::log_tagged_critical_fmt("render", "phase=pre_imgui_render frame=%llu", (unsigned long long)frame_number);
+        DWORD seh_ir = seh_imgui_render();
+        if (seh_ir != 0)
+            diag::log_tagged_critical_fmt("render", "SEH_in_imgui_render code=0x%08X frame=%llu",
+                seh_ir, (unsigned long long)frame_number);
+        if ((frame_number >= 270ULL && frame_number <= 320ULL))
+            diag::log_tagged_critical_fmt("render", "phase=pre_imgui_dx11 frame=%llu", (unsigned long long)frame_number);
+        DWORD seh_idr = seh_imgui_dx11_render(ImGui::GetDrawData());
+        if (seh_idr != 0)
+            diag::log_tagged_critical_fmt("render", "SEH_in_imgui_dx11_render code=0x%08X frame=%llu",
+                seh_idr, (unsigned long long)frame_number);
         g_pd3dDeviceContext->OMSetBlendState(blend_state, nullptr, 0xffffffff);
 
-        HRESULT hr = g_pSwapChain->Present(1, 0);
+        if ((frame_number >= 270ULL && frame_number <= 320ULL))
+            diag::log_tagged_critical_fmt("render", "phase=pre_present frame=%llu", (unsigned long long)frame_number);
+        HRESULT hr = S_OK;
+        DWORD seh_present = seh_swapchain_present(g_pSwapChain, &hr);
+        if (seh_present != 0)
+            diag::log_tagged_critical_fmt("render", "SEH_in_present code=0x%08X frame=%llu",
+                seh_present, (unsigned long long)frame_number);
         if (frame_number < 5)
             crash_log_fmt("present_hr=0x%08X", hr);
+        else if ((hr & 0x80000000u) || hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
+            diag::log_tagged_critical_fmt("render", "present_hr_NONZERO=0x%08X frame=%llu",
+                hr, (unsigned long long)frame_number);
+        if ((frame_number >= 270ULL && frame_number <= 320ULL))
+            diag::log_tagged_critical_fmt("render", "phase=frame_end frame=%llu hr=0x%08X",
+                (unsigned long long)frame_number, hr);
 
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
 
