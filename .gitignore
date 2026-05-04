@@ -16,6 +16,7 @@
 !.aider*
 !CMakeLists.txt
 !CLAUDE.md
+!CMakePresets.json
 
 # ==========================================
 # 2. EXCLUSIONS (These override the allows)
@@ -50,7 +51,6 @@
 **/obj/
 **/bin/
 **/build/
-/.deps/
 stealer/.deps/
 /.cache/
 /dist/
@@ -63,7 +63,6 @@ compile_commands.json
 # IDEs & Environments
 .vs/
 .idea/
-.vscode/
 
 # Secrets
 .env
