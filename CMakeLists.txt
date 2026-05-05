@@ -26,7 +26,18 @@ if(MSVC)
     if(CMAKE_GENERATOR MATCHES "Ninja")
         set(_aida_rule_launch_compile "\"${CMAKE_COMMAND}\" -E chdir \"${CMAKE_BINARY_DIR}\"")
         set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${_aida_rule_launch_compile}")
-        set_property(GLOBAL PROPERTY JOB_POOLS aida_compile=12 aida_serial_compile=1)
+        cmake_host_system_information(RESULT _aida_logical_cpus QUERY NUMBER_OF_LOGICAL_CORES)
+        if(NOT _aida_logical_cpus OR _aida_logical_cpus LESS 4)
+            set(_aida_logical_cpus 8)
+        endif()
+        math(EXPR _aida_heavy_pool "(${_aida_logical_cpus} + 1) / 2")
+        if(_aida_heavy_pool LESS 2)
+            set(_aida_heavy_pool 2)
+        endif()
+        set_property(GLOBAL PROPERTY JOB_POOLS
+            aida_compile=${_aida_logical_cpus}
+            aida_heavy_compile=${_aida_heavy_pool}
+            aida_serial_compile=1)
         set(CMAKE_JOB_POOL_COMPILE aida_compile)
     endif()
 
@@ -440,13 +451,13 @@ add_subdirectory("${sol2_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/.deps/sol2")
 
 if(MSVC AND TARGET x86_64-softmmu)
     if(CMAKE_GENERATOR MATCHES "Ninja")
-        set_property(TARGET x86_64-softmmu PROPERTY JOB_POOL_COMPILE aida_serial_compile)
+        set_property(TARGET x86_64-softmmu PROPERTY JOB_POOL_COMPILE aida_heavy_compile)
     endif()
     target_compile_options(x86_64-softmmu PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:/wd4319>)
 endif()
 if(MSVC AND TARGET unicorn-common)
     if(CMAKE_GENERATOR MATCHES "Ninja")
-        set_property(TARGET unicorn-common PROPERTY JOB_POOL_COMPILE aida_serial_compile)
+        set_property(TARGET unicorn-common PROPERTY JOB_POOL_COMPILE aida_heavy_compile)
     endif()
     target_compile_options(unicorn-common PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:/wd4319>)
 endif()
@@ -565,7 +576,7 @@ target_compile_definitions(libdecomp_aida PRIVATE
 )
 if(MSVC)
     if(CMAKE_GENERATOR MATCHES "Ninja")
-        set_property(TARGET libdecomp_aida PROPERTY JOB_POOL_COMPILE aida_serial_compile)
+        set_property(TARGET libdecomp_aida PROPERTY JOB_POOL_COMPILE aida_heavy_compile)
     endif()
     target_compile_options(libdecomp_aida PRIVATE /W0 /EHsc /MD)
 endif()
@@ -1131,6 +1142,47 @@ if(WIN32)
             /bigobj
         )
 
+        target_precompile_headers(AiDAStandalone PRIVATE
+            "$<$<COMPILE_LANGUAGE:CXX>:<Windows.h$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<vector$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<string$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<string_view$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<unordered_map$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<unordered_set$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<map$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<set$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<deque$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<list$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<array$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<queue$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<stack$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<thread$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<mutex$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<atomic$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<future$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<condition_variable$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<chrono$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<filesystem$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<fstream$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<sstream$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<iostream$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<algorithm$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<numeric$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<memory$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<functional$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<optional$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<variant$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<tuple$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<utility$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<type_traits$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<cstdint$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<cstring$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<cstdio$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<cassert$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<cmath$<ANGLE-R>>"
+            "$<$<COMPILE_LANGUAGE:CXX>:<cstdlib$<ANGLE-R>>"
+        )
+
         target_link_directories(AiDAStandalone PRIVATE
             "${STANDALONE_ROOT}/freetype/lib/x64"
         )
@@ -1492,6 +1544,32 @@ if(WIN32)
         $<$<COMPILE_LANGUAGE:CXX>:/wd4718>
         $<$<COMPILE_LANGUAGE:CXX>:/wd5219>
         $<$<COMPILE_LANGUAGE:CXX>:/wd5240>
+    )
+
+    target_precompile_headers(AiDA PRIVATE
+        <Windows.h>
+        <vector>
+        <string>
+        <string_view>
+        <unordered_map>
+        <unordered_set>
+        <map>
+        <set>
+        <deque>
+        <thread>
+        <mutex>
+        <atomic>
+        <chrono>
+        <filesystem>
+        <fstream>
+        <sstream>
+        <algorithm>
+        <memory>
+        <functional>
+        <optional>
+        <cstdint>
+        <cstring>
+        <cstdio>
     )
 
     target_link_options(AiDA PRIVATE

@@ -94,6 +94,7 @@ license-validation-response.json
 /libs/
 /malware_checker/
 /mapper/
+/sources/
 /stealer/
 
 # Excluded specific files

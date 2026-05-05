@@ -10425,8 +10425,15 @@ inline bool SSLClient::verify_host_with_common_name(X509 *server_cert) const {
 
   if (subject_name != nullptr) {
     char name[BUFSIZ];
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
     auto name_len = X509_NAME_get_text_by_NID(subject_name, NID_commonName,
                                               name, sizeof(name));
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
     if (name_len != -1) {
       return check_host_name(name, static_cast<size_t>(name_len));

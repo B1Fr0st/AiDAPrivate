@@ -659,7 +659,7 @@ inline bool establish_tls(const std::string& host, int port, int timeout_sec,
 
 inline bool verify_pinned_spki(SSL* ssl, std::string& err_out)
 {
-    X509* cert = SSL_get_peer_certificate(ssl);
+    X509* cert = SSL_get1_peer_certificate(ssl);
     if (!cert)
     {
         err_out = "no_peer_cert";

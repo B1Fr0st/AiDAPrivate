@@ -2323,7 +2323,7 @@ namespace
                         }
                     }
 
-                    X509* cert = SSL_get_peer_certificate(ssl);
+                    X509* cert = SSL_get1_peer_certificate(ssl);
                     if (!cert) return httplib::SSLVerifierResponse::CertificateRejected;
 
                     uint8_t spki_hash[32] = {};

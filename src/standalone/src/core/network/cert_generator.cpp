@@ -93,7 +93,7 @@ bool generate_root_ca(root_ca_t& ca) {
     X509_set_pubkey(raw_cert, raw_key);
 
 
-    X509_NAME* name = X509_get_subject_name(raw_cert);
+    X509_NAME* name = const_cast<X509_NAME*>(X509_get_subject_name(raw_cert));
     X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
         reinterpret_cast<const unsigned char*>("AiDA Network Proxy CA"), -1, -1, 0);
     X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC,
@@ -281,7 +281,7 @@ bool generate_server_cert(const std::string& domain, const root_ca_t& ca, server
     X509_set_pubkey(raw_cert, raw_key);
 
 
-    X509_NAME* subject = X509_get_subject_name(raw_cert);
+    X509_NAME* subject = const_cast<X509_NAME*>(X509_get_subject_name(raw_cert));
     X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC,
         reinterpret_cast<const unsigned char*>(domain.c_str()), -1, -1, 0);
 

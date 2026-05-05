@@ -1,10 +1,11 @@
 # AiDA Server Deploy Script
 # Usage: .\deploy_server.ps1
 
-$SSH_KEY = "C:\Users\ruar\.ssh\aida_server"
 $REMOTE  = "ruarr@23.88.62.199"
-$SRC     = "C:\Users\ruar\AiDAPrivate\server\"
+$SRC     = (Join-Path $PSScriptRoot "server") + "\"
 $DST     = "/home/ruarr/aida-server/"
+$AIDA_KEY = Join-Path $env:USERPROFILE ".ssh\aida_server"
+$SSH_OPTS = @('-o', 'StrictHostKeyChecking=no', '-o', 'IdentitiesOnly=yes', '-o', 'PasswordAuthentication=no', '-i', $AIDA_KEY)
 $ADMIN_KEY = "08497b90b9a76d7be929674519ce5d870a5d51185806ea2a6da732f3430f00b1"
 
 Write-Host "`n=== Deploying server/ to $REMOTE ===" -ForegroundColor Cyan
@@ -39,15 +40,14 @@ $files = @(
     "db\migrate.js",
     "db\schema.sql"
 )
-# Ensure remote subdirectories exist before scp
 $remoteDirs = @("routes", "crypto", "middleware", "anomaly", "db") | ForEach-Object { "$DST$_" }
 $mkdirCmd = "mkdir -p " + ($remoteDirs -join " ")
-& ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no $REMOTE $mkdirCmd | Out-Null
+& ssh @SSH_OPTS $REMOTE $mkdirCmd | Out-Null
 foreach ($f in $files) {
     $local = Join-Path $SRC $f
     $remotePath = $DST + ($f -replace '\\', '/')
     if (Test-Path $local) {
-        & scp -i "$SSH_KEY" -o StrictHostKeyChecking=no "$local" "${REMOTE}:${remotePath}"
+        & scp @SSH_OPTS "$local" "${REMOTE}:${remotePath}"
         if ($LASTEXITCODE -ne 0) { Write-Host "SCP failed for $f" -ForegroundColor Red; exit 1 }
     } else {
         Write-Host "  [WARN] missing local file: $local" -ForegroundColor Yellow
@@ -100,8 +100,8 @@ if ((Test-Path $privKeyPath) -and (Test-Path $pubKeyPath)) {
         $alignScript += "chmod 600 .env`n"
         $alignLocal = "$env:TEMP\aida_align_keys.sh"
         [System.IO.File]::WriteAllText($alignLocal, $alignScript, [System.Text.UTF8Encoding]::new($false))
-        & scp -i "$SSH_KEY" -o StrictHostKeyChecking=no "$alignLocal" "${REMOTE}:/tmp/aida_align_keys.sh"
-        $alignOut = & ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no $REMOTE "bash /tmp/aida_align_keys.sh"
+        & scp @SSH_OPTS "$alignLocal" "${REMOTE}:/tmp/aida_align_keys.sh"
+        $alignOut = & ssh @SSH_OPTS $REMOTE "bash /tmp/aida_align_keys.sh"
         Write-Host "      $alignOut" -ForegroundColor Green
     } else {
         Write-Host "[1b] Skipped key alignment (key files empty)" -ForegroundColor Yellow
@@ -145,8 +145,8 @@ $script += "echo$nl"
 $localScript = "$env:TEMP\aida_deploy.sh"
 [System.IO.File]::WriteAllText($localScript, $script, [System.Text.UTF8Encoding]::new($false))
 
-& scp -i "$SSH_KEY" -o StrictHostKeyChecking=no "$localScript" "${REMOTE}:/tmp/aida_deploy.sh"
-$output = & ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no $REMOTE "bash /tmp/aida_deploy.sh"
+& scp @SSH_OPTS "$localScript" "${REMOTE}:/tmp/aida_deploy.sh"
+$output = & ssh @SSH_OPTS $REMOTE "bash /tmp/aida_deploy.sh"
 Write-Host $output
 
 if ($output -like '*"status":"ok"*') {

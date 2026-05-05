@@ -109,7 +109,7 @@ static bool generate_self_signed_rsa(EVP_PKEY*& pkey_out, X509*& cert_out)
     X509_gmtime_adj(X509_getm_notAfter(x), static_cast<long>(60L * 60L * 24L * 30L));
     X509_set_pubkey(x, pkey_out);
 
-    X509_NAME* name = X509_get_subject_name(x);
+    X509_NAME* name = const_cast<X509_NAME*>(X509_get_subject_name(x));
     X509_NAME_add_entry_by_txt(name, "C", MBSTRING_ASC, reinterpret_cast<const unsigned char*>("US"), -1, -1, 0);
     X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC, reinterpret_cast<const unsigned char*>("AiDABinprotoTest"), -1, -1, 0);
     X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char*>("127.0.0.1"), -1, -1, 0);

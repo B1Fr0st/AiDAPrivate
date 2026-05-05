@@ -84,7 +84,7 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
     <IncludePath>ext;src;..\..\encrypt;$(IncludePath)</IncludePath>
-    <OutDir>C:\Users\ruar\AiDAPrivate\build\Release\</OutDir>
+    <OutDir>C:\Users\ruar1337\AiDAPrivate\build\Release\</OutDir>
     <IntDir>$(SolutionDir)artifacts\WhosWho\</IntDir>
     <EnableInf2cat>false</EnableInf2cat>
     <ApiValidator_Enable>false</ApiValidator_Enable>
