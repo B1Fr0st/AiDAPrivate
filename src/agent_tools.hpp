@@ -16,7 +16,6 @@
 #include <typeinf.hpp>
 #include <kernwin.hpp>
 #include <hexrays.hpp>
-#include <dbg.hpp>
 #include <search.hpp>
 #include <entry.hpp>
 #include <lines.hpp>

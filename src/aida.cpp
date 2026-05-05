@@ -514,222 +514,6 @@ ssize_t idaapi ui_event_listener_t::on_event(ssize_t code, va_list va)
     return 0;
 }
 
-ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
-{
-    dbg_event_record_t rec;
-    rec.timestamp_ms = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
-    rec.notification = static_cast<dbg_notification_t>(code);
-    rec.ea  = BADADDR;
-    rec.pid = 0;
-    rec.tid = 0;
-
-    switch (static_cast<dbg_notification_t>(code))
-    {
-    case dbg_process_start:
-    {
-        const debug_event_t* event = va_arg(va, const debug_event_t*);
-        rec.pid = event->pid;
-        rec.tid = event->tid;
-        rec.ea  = event->ea;
-        const char* name = event->modinfo().name.c_str();
-        rec.detail = OBFSTR("process_start: ") + std::string(name[0] ? name : "unknown");
-        break;
-    }
-    case dbg_process_exit:
-    {
-        const debug_event_t* event = va_arg(va, const debug_event_t*);
-        rec.pid = event->pid;
-        rec.tid = event->tid;
-        char buf[128];
-        qsnprintf(buf, sizeof(buf), "process_exit: code=%d", event->exit_code());
-        rec.detail = buf;
-        break;
-    }
-    case dbg_process_attach:
-    {
-        const debug_event_t* event = va_arg(va, const debug_event_t*);
-        rec.pid = event->pid;
-        rec.tid = event->tid;
-        rec.ea  = event->ea;
-        const char* name = event->modinfo().name.c_str();
-        rec.detail = OBFSTR("process_attach: ") + std::string(name[0] ? name : "unknown");
-        break;
-    }
-    case dbg_process_detach:
-    {
-        const debug_event_t* event = va_arg(va, const debug_event_t*);
-        rec.pid = event->pid;
-        rec.tid = event->tid;
-        rec.detail = OBFSTR("process_detach");
-        break;
-    }
-    case dbg_thread_start:
-    {
-        const debug_event_t* event = va_arg(va, const debug_event_t*);
-        rec.pid = event->pid;
-        rec.tid = event->tid;
-        rec.ea  = event->ea;
-        const char* tname = event->info().c_str();
-        char buf[256];
-        qsnprintf(buf, sizeof(buf), "thread_start: tid=%d ea=0x%llX name=%s",
-                  event->tid, static_cast<unsigned long long>(event->ea),
-                  tname[0] ? tname : "");
-        rec.detail = buf;
-        break;
-    }
-    case dbg_thread_exit:
-    {
-        const debug_event_t* event = va_arg(va, const debug_event_t*);
-        rec.pid = event->pid;
-        rec.tid = event->tid;
-        char buf[128];
-        qsnprintf(buf, sizeof(buf), "thread_exit: tid=%d code=%d",
-                  event->tid, event->exit_code());
-        rec.detail = buf;
-        break;
-    }
-    case dbg_library_load:
-    {
-        const debug_event_t* event = va_arg(va, const debug_event_t*);
-        rec.pid = event->pid;
-        rec.tid = event->tid;
-        rec.ea  = event->ea;
-        const char* name = event->modinfo().name.c_str();
-        rec.detail = OBFSTR("library_load: ") + std::string(name[0] ? name : "unknown");
-        break;
-    }
-    case dbg_library_unload:
-    {
-        const debug_event_t* event = va_arg(va, const debug_event_t*);
-        rec.pid = event->pid;
-        rec.tid = event->tid;
-        rec.ea  = event->ea;
-        const char* name = event->info().c_str();
-        rec.detail = OBFSTR("library_unload: ") + std::string(name[0] ? name : "unknown");
-        break;
-    }
-    case dbg_information:
-    {
-        const debug_event_t* event = va_arg(va, const debug_event_t*);
-        rec.pid = event->pid;
-        rec.tid = event->tid;
-        rec.ea  = event->ea;
-        rec.detail = OBFSTR("info: ") + std::string(event->info().c_str());
-        break;
-    }
-    case dbg_exception:
-    {
-        const debug_event_t* event = va_arg(va, const debug_event_t*);
-         va_arg(va, int*);
-        rec.pid = event->pid;
-        rec.tid = event->tid;
-        rec.ea  = event->ea;
-        const excinfo_t& exc = event->exc();
-        char buf[512];
-        qsnprintf(buf, sizeof(buf), "exception: code=0x%X ea=0x%llX can_cont=%d info=%s",
-                  exc.code, static_cast<unsigned long long>(exc.ea),
-                  exc.can_cont ? 1 : 0, exc.info.c_str());
-        rec.detail = buf;
-        break;
-    }
-    case dbg_suspend_process:
-    {
-        const debug_event_t* event = va_arg(va, const debug_event_t*);
-        rec.pid = event->pid;
-        rec.tid = event->tid;
-        rec.ea  = event->ea;
-        rec.detail = OBFSTR("suspend_process");
-        break;
-    }
-    case dbg_bpt:
-    {
-        thid_t tid = va_arg(va, thid_t);
-        ea_t bptea = va_arg(va, ea_t);
-        rec.tid = tid;
-        rec.ea  = bptea;
-        qstring fname;
-        if (get_func_name(&fname, bptea) > 0)
-        {
-            char buf[512];
-            qsnprintf(buf, sizeof(buf), "breakpoint_hit: ea=0x%llX func=%s tid=%d",
-                      static_cast<unsigned long long>(bptea), fname.c_str(), tid);
-            rec.detail = buf;
-        }
-        else
-        {
-            char buf[256];
-            qsnprintf(buf, sizeof(buf), "breakpoint_hit: ea=0x%llX tid=%d",
-                      static_cast<unsigned long long>(bptea), tid);
-            rec.detail = buf;
-        }
-        break;
-    }
-    case dbg_trace:
-    {
-        thid_t tid = va_arg(va, thid_t);
-        ea_t ip = va_arg(va, ea_t);
-        rec.tid = tid;
-        rec.ea  = ip;
-        char buf[128];
-        qsnprintf(buf, sizeof(buf), "trace: ip=0x%llX tid=%d",
-                  static_cast<unsigned long long>(ip), tid);
-        rec.detail = buf;
-        break;
-    }
-    case dbg_step_into:
-    {
-        const debug_event_t* event = va_arg(va, const debug_event_t*);
-        rec.pid = event->pid;
-        rec.tid = event->tid;
-        rec.ea  = event->ea;
-        rec.detail = OBFSTR("step_into_complete");
-        break;
-    }
-    case dbg_step_over:
-    {
-        const debug_event_t* event = va_arg(va, const debug_event_t*);
-        rec.pid = event->pid;
-        rec.tid = event->tid;
-        rec.ea  = event->ea;
-        rec.detail = OBFSTR("step_over_complete");
-        break;
-    }
-    case dbg_step_until_ret:
-    {
-        const debug_event_t* event = va_arg(va, const debug_event_t*);
-        rec.pid = event->pid;
-        rec.tid = event->tid;
-        rec.ea  = event->ea;
-        rec.detail = OBFSTR("step_until_ret_complete");
-        break;
-    }
-    case dbg_run_to:
-    {
-        const debug_event_t* event = va_arg(va, const debug_event_t*);
-        rec.pid = event->pid;
-        rec.tid = event->tid;
-        rec.ea  = event->ea;
-        char buf[128];
-        qsnprintf(buf, sizeof(buf), "run_to: ea=0x%llX",
-                  static_cast<unsigned long long>(event->ea));
-        rec.detail = buf;
-        break;
-    }
-    default:
-    {
-        char buf[64];
-        qsnprintf(buf, sizeof(buf), "dbg_event_%d", static_cast<int>(code));
-        rec.detail = buf;
-        break;
-    }
-    }
-
-    g_dbg_event_log.push(std::move(rec));
-    return 0;
-}
-
 static int idaapi self_analysis_watchdog(void *)
 {
     static bool s_self_target_checked = false;
@@ -762,10 +546,6 @@ aida_plugin_t::aida_plugin_t()
 {
     ida_utils::compute_self_identity();
 
-    if (license_manager_t::instance().get_runtime_nonce() == 0)
-    {
-    }
-
     msg(OBFSTR_C("--- Plugin Loading (v%s) ---\n"), AIDA_VERSION);
 
 #ifdef __NT__
@@ -780,7 +560,6 @@ aida_plugin_t::aida_plugin_t()
     analysis_fixer::install_hexrays_fixups();
     register_actions();
     hook_event_listener(HT_UI, &ui_listener);
-    hook_event_listener(HT_DBG, &dbg_listener);
 
     if (g_settings.mcp_enabled)
         start_mcp_server();
@@ -809,11 +588,9 @@ aida_plugin_t::~aida_plugin_t()
     aida_db::AnalysisDB::instance().save();
 
     stop_mcp_server();
-    ::unhook_event_listener(HT_DBG, &dbg_listener);
     ::unhook_event_listener(HT_UI, &ui_listener);
     analysis_fixer::uninstall_hexrays_fixups();
     unregister_actions();
-    g_dbg_event_log.clear();
     msg(OBFSTR_C("--- Plugin has been unloaded ---\n"));
 }
 
@@ -824,11 +601,6 @@ bool idaapi aida_plugin_t::run(size_t)
     {
         warning(OBFSTR_C("License validation failed. Please restart IDA and enter a valid license key."));
         return false;
-    }
-
-    if (license.get_runtime_nonce() == 0xDEADBEEFCAFEBABEULL
-        || license.get_runtime_nonce() == 0xFFFFFFFFFFFFFFFFULL)
-    {
     }
 
     info(OBFSTR_C("Plugin is active. Use the right-click context menu in a code view or the Tools menu."));

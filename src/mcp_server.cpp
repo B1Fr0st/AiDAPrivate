@@ -1,12 +1,240 @@
 #include "aida_pro.hpp"
 #include "ida_utils.hpp"
+#include "instance_registry.hpp"
 
 #include <queue>
 #include <chrono>
+#include <future>
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
 
 using json = nlohmann::json;
+
+static std::atomic<instance_registry_t*> g_active_registry{nullptr};
+
+static instance_registry_t* current_registry()
+{
+    return g_active_registry.load(std::memory_order_acquire);
+}
+
+static const char* kInstanceArgKey = "instance_id";
+static const char* kPidArgKey      = "pid";
+
+static bool resolve_target_instance(const json& arguments,
+                                    instance_registry_t* registry,
+                                    bool& has_target,
+                                    bool& target_is_self,
+                                    ida_instance_record_t& out_peer,
+                                    std::string& out_error)
+{
+    has_target = false;
+    target_is_self = false;
+    out_error.clear();
+
+    if (!registry)
+        return true;
+
+    std::string requested_instance;
+    if (arguments.contains(kInstanceArgKey) && arguments[kInstanceArgKey].is_string())
+    {
+        std::string s = arguments[kInstanceArgKey].get<std::string>();
+        if (!s.empty())
+            requested_instance = std::move(s);
+    }
+
+    uint64_t requested_pid = 0;
+    if (arguments.contains(kPidArgKey))
+    {
+        const auto& v = arguments[kPidArgKey];
+        if (v.is_number_integer())
+        {
+            int64_t n = v.get<int64_t>();
+            if (n > 0)
+                requested_pid = static_cast<uint64_t>(n);
+        }
+        else if (v.is_string())
+        {
+            try
+            {
+                std::string ps = v.get<std::string>();
+                if (!ps.empty())
+                {
+                    int base = 10;
+                    if (ps.size() > 2 && (ps[0] == '0') && (ps[1] == 'x' || ps[1] == 'X'))
+                        base = 16;
+                    requested_pid = static_cast<uint64_t>(std::stoull(ps, nullptr, base));
+                }
+            }
+            catch (...) { requested_pid = 0; }
+        }
+    }
+
+    if (!requested_instance.empty())
+    {
+        if (requested_instance == registry->self_instance_id())
+        {
+            has_target = true;
+            target_is_self = true;
+            return true;
+        }
+        if (!registry->find_instance(requested_instance, out_peer))
+        {
+            out_error = "Unknown instance_id: " + requested_instance;
+            return false;
+        }
+        has_target = true;
+        target_is_self = (out_peer.instance_id == registry->self_instance_id());
+        return true;
+    }
+
+    if (requested_pid != 0)
+    {
+        if (requested_pid == registry->self_record().pid)
+        {
+            has_target = true;
+            target_is_self = true;
+            return true;
+        }
+        if (!registry->find_instance_by_pid(requested_pid, out_peer))
+        {
+            out_error = "Unknown pid: " + std::to_string(requested_pid);
+            return false;
+        }
+        has_target = true;
+        target_is_self = (out_peer.instance_id == registry->self_instance_id());
+        return true;
+    }
+
+    return true;
+}
+
+static json strip_routing_args(const json& arguments)
+{
+    json out = arguments;
+    if (out.is_object())
+    {
+        if (out.contains(kInstanceArgKey))
+            out.erase(kInstanceArgKey);
+        if (out.contains(kPidArgKey))
+            out.erase(kPidArgKey);
+    }
+    return out;
+}
+
+struct mcp_remote_call_result_t
+{
+    bool ok = false;
+    int  http_status = 0;
+    json payload;
+    std::string error_text;
+};
+
+static mcp_remote_call_result_t mcp_invoke_remote(const ida_instance_record_t& peer,
+                                                  const json& request_body,
+                                                  int timeout_seconds)
+{
+    mcp_remote_call_result_t out;
+    if (peer.port <= 0)
+    {
+        out.error_text = "peer has no port";
+        return out;
+    }
+    try
+    {
+        std::string host = "127.0.0.1";
+        httplib::Client client(host, peer.port);
+        client.set_connection_timeout(timeout_seconds);
+        client.set_read_timeout(timeout_seconds);
+        client.set_write_timeout(timeout_seconds);
+        client.set_keep_alive(false);
+
+        std::string body = json_dump_safe(request_body);
+        httplib::Headers headers = {
+            {"Content-Type", "application/json"},
+            {"Accept",       "application/json"}
+        };
+        auto res = client.Post("/mcp", headers, body, "application/json");
+        if (!res)
+        {
+            out.error_text = "no response from peer";
+            return out;
+        }
+        out.http_status = res->status;
+        if (res->status < 200 || res->status >= 300)
+        {
+            out.error_text = "peer returned HTTP " + std::to_string(res->status);
+            if (!res->body.empty())
+                out.error_text += ": " + res->body.substr(0, 256);
+            return out;
+        }
+        if (res->body.empty())
+        {
+            out.ok = true;
+            return out;
+        }
+        try
+        {
+            out.payload = json::parse(res->body);
+            out.ok = true;
+        }
+        catch (const json::parse_error& e)
+        {
+            out.error_text = std::string("malformed JSON from peer: ") + e.what();
+        }
+    }
+    catch (const std::exception& e)
+    {
+        out.error_text = std::string("HTTP exception: ") + e.what();
+    }
+    return out;
+}
+
+static json mcp_proxy_tools_call_to_peer(const ida_instance_record_t& peer,
+                                         const std::string& tool_name,
+                                         const json& sanitized_arguments,
+                                         int timeout_seconds)
+{
+    json req;
+    req["jsonrpc"] = "2.0";
+    req["id"] = 1;
+    req["method"] = "tools/call";
+    json params;
+    params["name"] = tool_name;
+    params["arguments"] = sanitized_arguments;
+    req["params"] = params;
+    auto rr = mcp_invoke_remote(peer, req, timeout_seconds);
+    if (!rr.ok || rr.payload.is_null())
+    {
+        json err;
+        err["isError"] = true;
+        err["content"] = json::array({
+            { {"type", "text"}, {"text",
+                "Remote instance " + peer.instance_id + " (" + peer.display_name +
+                ") failed: " + (rr.error_text.empty() ? "unknown error" : rr.error_text) } }
+        });
+        return err;
+    }
+    if (rr.payload.contains("result") && rr.payload["result"].is_object())
+        return rr.payload["result"];
+    if (rr.payload.contains("error") && rr.payload["error"].is_object())
+    {
+        json err;
+        err["isError"] = true;
+        std::string msg_txt = rr.payload["error"].value("message", "remote error");
+        err["content"] = json::array({
+            { {"type", "text"}, {"text",
+                "Remote instance " + peer.instance_id + " error: " + msg_txt } }
+        });
+        return err;
+    }
+    json err;
+    err["isError"] = true;
+    err["content"] = json::array({
+        { {"type", "text"}, {"text",
+            "Remote instance " + peer.instance_id + " returned unexpected payload" } }
+    });
+    return err;
+}
 
 static constexpr int JSONRPC_PARSE_ERROR      = -32700;
 static constexpr int JSONRPC_INVALID_REQUEST  = -32600;
@@ -23,15 +251,28 @@ static const std::string& get_mcp_protocol_version()
 static const std::string& get_mcp_server_instructions()
 {
     static const std::string instructions =
-        "You are AiDA, an advanced reverse-engineering assistant operating over MCP against a live IDA Pro database. "
-        "Be precise, tool-driven, and evidence-based. Use the MCP tools to inspect the current binary instead of guessing.\n\n"
+        "AiDA IDA Pro Plugin — STATIC zero-day analysis for binaries loaded in IDA Pro. This plugin performs ONLY static analysis. Runtime, debugger, kernel-memory, and network-interception capabilities live in AiDAStandalone and are NOT available here.\n\n"
         "MANDATORY RULE: For ALL number base conversions (hexadecimal to decimal, decimal to hexadecimal, binary conversions, computing byte representations of integers, interpreting stack-constructed byte sequences as characters, ASCII character value lookups), you MUST use the `convert_number` tool. NEVER interpret hex byte values as ASCII characters manually or convert between number bases in your head.\n\n"
-        "Default to static analysis first, but escalation is mandatory when blocked. Follow this decision tree: Static Analysis -> Deobfuscation -> Driver (live memory) -> Emulation (Zydis+Unicorn). Never stop at 'obfuscated' or 'unreadable' if deeper analysis tools can resolve it.\n\n"
-        "If static analysis is weak, run `detect_obfuscation_patterns`. If obfuscation is present, use `full_deobfuscation_pass` or targeted deobfuscation tools, then re-decompile. If code is still encrypted, packed, or runtime-only, escalate to driver tools: `driver_status`, `driver_connect`, `driver_attach`, `driver_read_memory`, `driver_read_kernel_memory`, and `disassemble_zydis` to inspect real runtime bytes. If logic remains opaque after live-byte recovery, escalate to emulation: `trace_execution_unicorn`, `analyze_vm_handler`, `emulate_multi_trace`, `emulate_function`, or `driver_snapshot_and_emulate`.\n\n"
-        "Treat network analysis as a parallel branch that can be triggered at ANY phase. If you discover network evidence such as imports from ws2_32, winhttp, or wininet; URLs, IPs, domains, HTTP verbs, port numbers, or send/recv/connect style call paths, proactively pivot into network analysis. Use Phase-12 style packet tools for plaintext traffic, Phase-13 style TLS/QUIC/DTLS tooling for encrypted traffic, and `driver_sniff_network_buffers` for proprietary or pre-encryption buffer capture.\n\n"
-        "Use GraphRAG first on indexed binaries: `get_graph_stats` to confirm indexing, then `search_semantic` before slower IDA search tools. NEVER use `find_instructions` or `search_strings` if the binary is indexed — `search_semantic` is orders of magnitude faster. For security analysis, prefer `run_security_analysis`, `run_taint_analysis`, and `get_security_overview`.\n\n"
-        "Use the debugger only when you need runtime state and anti-debug is not a concern. If the target likely contains anti-debug or integrity checks, prefer driver plus emulation instead of the debugger. Before any driver operation, call `driver_status`; if not connected, call `driver_connect`. For usermode process targets, attach with `driver_attach` before process-specific driver operations.\n\n"
-        "Batch related read-only tool calls aggressively, avoid duplicate calls with identical parameters, and keep conclusions tied to concrete addresses, imports, strings, traces, or observed runtime behavior.";
+        "Capability families exposed by this plugin:\n"
+        "- Function, decompilation, xref, type, and segment introspection over the loaded IDB.\n"
+        "- Pattern-based searches: strings, byte patterns, immediate values, and instruction patterns.\n"
+        "- Static analysis: control flow, complexity metrics, obfuscation patterns, anti-analysis detection, PE parsing and entropy, indirect-call classification, vtable reconstruction, and VM-handler mapping.\n"
+        "- Static deobfuscation: control-flow flattening unflattening, opaque predicate solving, stack-string decoding, anti-debug NOP patching of the in-memory IDB, import reconstruction, and section unpacking — all performed statically against the database.\n"
+        "- GraphRAG: semantic search, taint paths, function communities, and network-flow graphs over the indexed binary.\n"
+        "- Zero-day vulnerability tools: callsite enumeration of dangerous APIs, format-string bug discovery, microcode SSA dataflow analysis, interprocedural taint path enumeration, kernel IOCTL handler discovery with ProbeForRead/ProbeForWrite coverage analysis, attack-surface scoring, indirect-call resolution, and check-bypass path enumeration.\n\n"
+        "Use GraphRAG first on indexed binaries: `get_graph_stats` to confirm indexing, then `search_semantic` before slower IDA search tools. NEVER use `find_instructions` or `search_strings` if the binary is indexed — `search_semantic` is orders of magnitude faster.\n\n"
+        "Batch related read-only tool calls aggressively, avoid duplicate calls with identical parameters, and keep conclusions tied to concrete addresses, imports, strings, decompilation, microcode, or taint evidence.\n\n"
+        "MULTI-INSTANCE: Every running IDA Pro is a peer in this MCP mesh. Start by calling `list_ida_instances` "
+        "to enumerate all live IDAs; each entry has instance_id (stable UUID), pid (OS process id), display_name, "
+        "idb_path, input_file, file_md5/sha256, processor, bitness, port, and base_url. To target a specific IDA, "
+        "pass EITHER `instance_id` OR `pid` as an argument on ANY tool call (every tool accepts both). instance_id "
+        "wins if both are set; instance_id is stable across PID reuse, pid is human-friendly and matches Task Manager. "
+        "Omit both to run against the locally connected IDA. To run a tool concurrently across every IDA, use "
+        "`query_all_instances` with {tool, arguments}; it returns a per-instance result map with ok/error flags. "
+        "Use `get_local_instance_info` if you need to know which IDA the current connection is bound to. Mix and "
+        "match freely across calls — e.g., `find_bytes(pattern=A, pid=1234)` then `find_bytes(pattern=B, pid=5678)` "
+        "addresses two different IDAs from the same conversation.\n\n"
+        "Standard zero-day discovery chain: `find_input_sources` -> `find_vulnerable_sinks` -> `trace_taint_path` -> `explain_vulnerability_chain`.";
     return instructions;
 }
 #define MCP_PROTOCOL_VERSION get_mcp_protocol_version().c_str()
@@ -111,13 +352,9 @@ struct mcp_batch_exec_request_t : public exec_request_t
 
         for (size_t ci = 0; ci < calls.size(); ++ci)
         {
-
-
             if (multi)
                 replace_wait_box("HIDECANCEL\nAiDA MCP: [%zu/%zu] %s",
                     ci + 1, calls.size(), calls[ci].first.c_str());
-            else
-                user_cancelled();
 
             results.push_back(agent_tools::ToolRegistry::instance().execute_tool(
                 calls[ci].first, calls[ci].second));
@@ -403,12 +640,10 @@ static std::string compact_tool_text(const std::string& text, std::size_t max_le
 static bool is_destructive_tool(const std::string& name)
 {
     return name == "delete_function"
-        || name == "delete_breakpoint"
         || name == "delete_stack_var"
         || name == "patch_bytes"
         || name == "undefine"
-        || name == "write_memory"
-        || name == "exit_process";
+        || name == "write_memory";
 }
 
 static bool is_idempotent_tool(const std::string& name, bool read_only)
@@ -416,14 +651,7 @@ static bool is_idempotent_tool(const std::string& name, bool read_only)
     if (read_only)
         return true;
     return name != "execute_python"
-        && name != "step_into"
-        && name != "step_over"
-        && name != "step_out"
-        && name != "continue_execution"
-        && name != "start_process"
-        && name != "exit_process"
-        && name != "run_to_address"
-        && name != "suspend";
+        && name != "write_memory";
 }
 
 static bool is_mcp_exposed_tool(const agent_tools::tool_definition_t* tool)
@@ -431,14 +659,112 @@ static bool is_mcp_exposed_tool(const agent_tools::tool_definition_t* tool)
     return tool && tool->category != "session";
 }
 
+static json build_aggregator_tool_entries()
+{
+    json out = json::array();
+
+    {
+        json input_schema;
+        input_schema[OBFSTR_C("type")] = "object";
+        input_schema["properties"] = json::object();
+        json t;
+        t[OBFSTR_C("name")] = "list_ida_instances";
+        t[OBFSTR_C("description")] = "Enumerate every live IDA Pro instance currently exposing AiDA MCP. "
+            "Returns each peer's instance_id (UUID), pid (OS process id), display_name, idb_path, input_file, "
+            "file_md5, file_sha256, processor, bitness, port, and base_url. Use the returned instance_id OR pid "
+            "as the optional instance_id/pid argument on any tool to target a specific IDA, or call "
+            "query_all_instances to fan out a tool to every instance at once.";
+        t[OBFSTR_C("inputSchema")] = input_schema;
+        json ann;
+        ann["title"] = "List IDA Instances";
+        ann["readOnlyHint"] = true;
+        ann["destructiveHint"] = false;
+        ann["idempotentHint"] = true;
+        ann["openWorldHint"] = false;
+        t["annotations"] = ann;
+        out.push_back(t);
+    }
+    {
+        json input_schema;
+        input_schema[OBFSTR_C("type")] = "object";
+        json props;
+        json p_tool;
+        p_tool[OBFSTR_C("type")] = "string";
+        p_tool[OBFSTR_C("description")] = "Tool name to invoke on every live IDA instance (e.g., get_binary_info, list_imports).";
+        props["tool"] = p_tool;
+        json p_args;
+        p_args[OBFSTR_C("type")] = "object";
+        p_args[OBFSTR_C("description")] = "Arguments object passed to the tool on each instance. Optional.";
+        props["arguments"] = p_args;
+        json p_to;
+        p_to[OBFSTR_C("type")] = "integer";
+        p_to[OBFSTR_C("description")] = "Per-instance timeout in seconds (default 60).";
+        props["timeout_seconds"] = p_to;
+        input_schema["properties"] = props;
+        input_schema["required"] = json::array({"tool"});
+        json t;
+        t[OBFSTR_C("name")] = "query_all_instances";
+        t[OBFSTR_C("description")] = "Run a single tool concurrently across every live IDA Pro instance and "
+            "return a per-instance result map. Each entry contains {instance_id, display_name, input_file, "
+            "ok, result_or_error}. Use this to compare or correlate findings across multiple binaries (e.g., "
+            "checking imports/exports/strings across ntoskrnl.exe, ci.dll, and acpi.sys at the same time).";
+        t[OBFSTR_C("inputSchema")] = input_schema;
+        json ann;
+        ann["title"] = "Query All Instances";
+        ann["readOnlyHint"] = false;
+        ann["destructiveHint"] = false;
+        ann["idempotentHint"] = false;
+        ann["openWorldHint"] = true;
+        t["annotations"] = ann;
+        out.push_back(t);
+    }
+    {
+        json input_schema;
+        input_schema[OBFSTR_C("type")] = "object";
+        input_schema["properties"] = json::object();
+        json t;
+        t[OBFSTR_C("name")] = "get_local_instance_info";
+        t[OBFSTR_C("description")] = "Identify which IDA database the current MCP connection is bound to. "
+            "Returns the local instance_id, display name, idb path, and input file metadata. Useful when "
+            "an aggregator entry is the connected endpoint and the agent needs to know which IDA it just hit.";
+        t[OBFSTR_C("inputSchema")] = input_schema;
+        json ann;
+        ann["title"] = "Get Local Instance Info";
+        ann["readOnlyHint"] = true;
+        ann["destructiveHint"] = false;
+        ann["idempotentHint"] = true;
+        ann["openWorldHint"] = false;
+        t["annotations"] = ann;
+        out.push_back(t);
+    }
+
+    return out;
+}
+
 static json build_mcp_tools_list()
 {
     json tools = json::array();
     const auto all_tools = agent_tools::ToolRegistry::instance().get_all_tools();
 
+    json instance_param;
+    instance_param[OBFSTR_C("type")] = "string";
+    instance_param[OBFSTR_C("description")] =
+        "Optional routing key. The IDA Pro instance_id (UUID from list_ida_instances) to target. "
+        "Omit to run against the locally connected IDA. instance_id wins over pid if both are set. "
+        "instance_id is stable across PID reuse.";
+
+    json pid_param;
+    pid_param[OBFSTR_C("type")] = "integer";
+    pid_param[OBFSTR_C("description")] =
+        "Optional routing key. The OS process id of the target IDA Pro instance "
+        "(visible in Task Manager / ps and returned by list_ida_instances). Use this when you "
+        "already know the IDA's pid; otherwise prefer instance_id. Ignored when instance_id is set.";
+
     for (const auto* tool : all_tools)
     {
         if (!is_mcp_exposed_tool(tool))
+            continue;
+        if (tool->category == "instances")
             continue;
 
         json input_schema = json::object();
@@ -463,6 +789,9 @@ static json build_mcp_tools_list()
                 required_arr.push_back(param.name);
         }
 
+        properties[kInstanceArgKey] = instance_param;
+        properties[kPidArgKey]      = pid_param;
+
         input_schema["properties"] = properties;
         if (!required_arr.empty())
             input_schema["required"] = required_arr;
@@ -481,6 +810,10 @@ static json build_mcp_tools_list()
         t["annotations"] = annotations;
         tools.push_back(t);
     }
+
+    json aggregators = build_aggregator_tool_entries();
+    for (auto& a : aggregators)
+        tools.push_back(std::move(a));
 
     return tools;
 }
@@ -587,11 +920,61 @@ static json handle_tools_call(const json& id, const json& params)
                    ? params["arguments"]
                    : json::object();
 
+    auto* registry = current_registry();
+    bool has_target = false;
+    bool target_is_self = false;
+    ida_instance_record_t target_peer;
+    std::string resolve_err;
+    if (!resolve_target_instance(arguments, registry, has_target, target_is_self, target_peer, resolve_err))
+        return make_jsonrpc_error(id, JSONRPC_INVALID_PARAMS, resolve_err);
+
+    json local_args = strip_routing_args(arguments);
+
+    if (has_target && !target_is_self)
+    {
+        json result = mcp_proxy_tools_call_to_peer(target_peer, tool_name, local_args, 60);
+        return make_jsonrpc_result(id, result);
+    }
+
+    if (tool_name == "list_ida_instances" || tool_name == "query_all_instances"
+        || tool_name == "get_local_instance_info")
+    {
+        auto tool_result = agent_tools::ToolRegistry::instance().execute_tool(tool_name, local_args);
+
+        json content = json::array();
+        if (!tool_result.output.empty())
+        {
+            content.push_back({
+                {OBFSTR_C("type"), "text"},
+                {OBFSTR_C("text"), sanitize_utf8(tool_result.output)}
+            });
+        }
+        if (!tool_result.data.is_null() && !tool_result.data.empty())
+        {
+            content.push_back({
+                {OBFSTR_C("type"), "text"},
+                {OBFSTR_C("text"), sanitize_utf8(json_dump_safe(tool_result.data, 2))}
+            });
+        }
+        if (content.empty())
+        {
+            content.push_back({
+                {OBFSTR_C("type"), "text"},
+                {OBFSTR_C("text"), tool_result.success ? "Tool executed (no output)." : "Tool failed."}
+            });
+        }
+        json result;
+        result[OBFSTR_C("content")] = content;
+        if (!tool_result.success)
+            result["isError"] = true;
+        return make_jsonrpc_result(id, result);
+    }
+
     const auto* tool = agent_tools::ToolRegistry::instance().get_tool(tool_name);
     if (!is_mcp_exposed_tool(tool))
         return make_jsonrpc_error(id, JSONRPC_INVALID_PARAMS, "Tool is not exposed through MCP");
 
-    auto tool_result = execute_tool_in_main_thread(tool_name, arguments);
+    auto tool_result = execute_tool_in_main_thread(tool_name, local_args);
 
     json content = json::array();
 
@@ -853,14 +1236,12 @@ static json handle_prompts_get(const json& id, const json& params)
         req.calls.push_back({"list_segments", json::object()});
         req.calls.push_back({"list_imports", json::object()});
         req.calls.push_back({"list_exports", json::object()});
-        req.calls.push_back({"list_exports", json::object()});
         execute_sync(req, MFF_READ);
 
         const auto& info_result = req.results[0];
         const auto& segments_result = req.results[1];
         const auto& imports_result = req.results[2];
         const auto& exports_result = req.results[3];
-        const auto& entries_result = req.results[4];
 
         std::string overview = "Provide a comprehensive analysis of the following binary loaded in IDA Pro.\n\n";
 
@@ -868,12 +1249,10 @@ static json handle_prompts_get(const json& id, const json& params)
             overview += "## Binary Metadata\n```json\n" + json_dump_safe(info_result.data, 2) + "\n```\n\n";
         if (segments_result.success && !segments_result.data.is_null())
             overview += "## Memory Segments\n```json\n" + json_dump_safe(segments_result.data, 2) + "\n```\n\n";
-        if (entries_result.success && !entries_result.data.is_null())
-            overview += "## Entry Points\n```json\n" + json_dump_safe(entries_result.data, 2) + "\n```\n\n";
         if (imports_result.success && !imports_result.data.is_null())
             overview += "## Imports\n```json\n" + json_dump_safe(imports_result.data, 2) + "\n```\n\n";
         if (exports_result.success && !exports_result.data.is_null())
-            overview += "## Exports\n```json\n" + json_dump_safe(exports_result.data, 2) + "\n```\n\n";
+            overview += "## Exports / Entry Points\n```json\n" + json_dump_safe(exports_result.data, 2) + "\n```\n\n";
 
         messages.push_back({
             {"role", "user"},
@@ -1104,6 +1483,261 @@ static std::string format_sse_event(const std::string& event_type, const std::st
     return result;
 }
 
+static std::once_flag g_aggregator_tools_registered;
+
+static json record_to_public_json(const ida_instance_record_t& r)
+{
+    json j;
+    j["instance_id"]       = r.instance_id;
+    j["display_name"]      = r.display_name;
+    j["pid"]               = r.pid;
+    j["port"]              = r.port;
+    j["base_url"]          = r.base_url;
+    j["mcp_url"]           = r.mcp_url;
+    j["sse_url"]           = r.sse_url;
+    j["idb_path"]          = r.idb_path;
+    j["input_file"]        = r.input_file;
+    j["input_basename"]    = r.input_basename;
+    j["config_entry_name"] = r.config_entry_name;
+    j["file_md5"]          = r.file_md5;
+    j["file_sha256"]       = r.file_sha256;
+    j["processor"]         = r.processor;
+    j["bitness"]           = r.bitness;
+    j["hostname"]          = r.hostname;
+    j["ida_version"]       = r.ida_version;
+    j["started_at_ms"]     = r.started_at_ms;
+    j["last_heartbeat_ms"] = r.last_heartbeat_ms;
+    j["is_self"]           = r.is_self;
+    return j;
+}
+
+static agent_tools::tool_result_t aggregator_list_instances(const json&)
+{
+    auto* reg = current_registry();
+    if (!reg)
+        return agent_tools::tool_result_t::error("MCP registry is not initialized.");
+
+    auto all = reg->all_live_instances();
+    json arr = json::array();
+    for (const auto& r : all)
+        arr.push_back(record_to_public_json(r));
+
+    json data;
+    data["count"] = arr.size();
+    data["self_instance_id"] = reg->self_instance_id();
+    data["instances"] = arr;
+
+    std::string summary = "Found " + std::to_string(arr.size()) + " live IDA instance"
+        + (arr.size() == 1 ? "" : "s") + ".";
+    return agent_tools::tool_result_t::ok(summary, data);
+}
+
+static agent_tools::tool_result_t aggregator_get_local_info(const json&)
+{
+    auto* reg = current_registry();
+    if (!reg)
+        return agent_tools::tool_result_t::error("MCP registry is not initialized.");
+    ida_instance_record_t r = reg->self_record();
+    r.is_self = true;
+    return agent_tools::tool_result_t::ok(
+        "Local instance info: " + r.display_name, record_to_public_json(r));
+}
+
+static agent_tools::tool_result_t aggregator_query_all(const json& params)
+{
+    auto* reg = current_registry();
+    if (!reg)
+        return agent_tools::tool_result_t::error("MCP registry is not initialized.");
+
+    std::string tool_name = params.value("tool", "");
+    if (tool_name.empty())
+        return agent_tools::tool_result_t::error("Missing required argument: 'tool'.");
+    if (tool_name == "query_all_instances")
+        return agent_tools::tool_result_t::error("Cannot recursively fan out query_all_instances.");
+
+    json arguments = params.contains("arguments") && params["arguments"].is_object()
+                   ? params["arguments"]
+                   : json::object();
+    arguments = strip_routing_args(arguments);
+
+    int timeout_seconds = 60;
+    if (params.contains("timeout_seconds") && params["timeout_seconds"].is_number_integer())
+    {
+        int t = params["timeout_seconds"].get<int>();
+        if (t > 0 && t < 3600)
+            timeout_seconds = t;
+    }
+
+    const auto* tool_def = agent_tools::ToolRegistry::instance().get_tool(tool_name);
+    bool tool_known_locally = is_mcp_exposed_tool(tool_def);
+
+    auto all = reg->all_live_instances();
+    if (all.empty())
+        return agent_tools::tool_result_t::error("No live IDA instances are registered.");
+
+    struct task_t {
+        ida_instance_record_t rec;
+        std::future<json> fut;
+    };
+    std::vector<task_t> tasks;
+    tasks.reserve(all.size());
+
+    std::string self_id = reg->self_instance_id();
+
+    for (const auto& rec : all)
+    {
+        task_t task;
+        task.rec = rec;
+        if (rec.instance_id == self_id)
+        {
+            json local_args = arguments;
+            if (!tool_known_locally)
+            {
+                json err;
+                err["isError"] = true;
+                err["content"] = json::array({
+                    { {"type","text"}, {"text","Tool '" + tool_name + "' is not registered locally."} }
+                });
+                std::promise<json> pr;
+                pr.set_value(err);
+                task.fut = pr.get_future();
+            }
+            else
+            {
+                task.fut = std::async(std::launch::async,
+                    [tool_name, local_args]() -> json {
+                        auto tr = execute_tool_in_main_thread(tool_name, local_args);
+                        json content = json::array();
+                        if (!tr.output.empty())
+                            content.push_back({ {"type","text"}, {"text",sanitize_utf8(tr.output)} });
+                        if (!tr.data.is_null() && !tr.data.empty())
+                            content.push_back({ {"type","text"},
+                                {"text", sanitize_utf8(json_dump_safe(tr.data, 2))} });
+                        if (content.empty())
+                            content.push_back({ {"type","text"},
+                                {"text", tr.success ? "ok" : "error"} });
+                        json result;
+                        result["content"] = content;
+                        if (!tr.success)
+                            result["isError"] = true;
+                        return result;
+                    });
+            }
+        }
+        else
+        {
+            ida_instance_record_t peer = rec;
+            json fwd_args = arguments;
+            int t_seconds = timeout_seconds;
+            task.fut = std::async(std::launch::async,
+                [peer, tool_name, fwd_args, t_seconds]() -> json {
+                    return mcp_proxy_tools_call_to_peer(peer, tool_name, fwd_args, t_seconds);
+                });
+        }
+        tasks.push_back(std::move(task));
+    }
+
+    json results = json::array();
+    size_t ok_count = 0;
+    size_t err_count = 0;
+    for (auto& t : tasks)
+    {
+        json r;
+        r["instance_id"]  = t.rec.instance_id;
+        r["display_name"] = t.rec.display_name;
+        r["input_file"]   = t.rec.input_file;
+        r["is_self"]      = (t.rec.instance_id == self_id);
+
+        json call_result;
+        try
+        {
+            call_result = t.fut.get();
+        }
+        catch (const std::exception& e)
+        {
+            call_result = json::object();
+            call_result["isError"] = true;
+            call_result["content"] = json::array({
+                { {"type","text"}, {"text", std::string("future exception: ") + e.what()} }
+            });
+        }
+
+        bool is_error = call_result.contains("isError")
+            && call_result["isError"].is_boolean()
+            && call_result["isError"].get<bool>();
+        r["ok"]     = !is_error;
+        r["result"] = call_result;
+        if (is_error) ++err_count; else ++ok_count;
+        results.push_back(r);
+    }
+
+    json data;
+    data["tool"]            = tool_name;
+    data["arguments"]       = arguments;
+    data["instance_count"]  = results.size();
+    data["success_count"]   = ok_count;
+    data["error_count"]     = err_count;
+    data["results"]         = results;
+
+    std::string summary = "Ran '" + tool_name + "' on " + std::to_string(results.size())
+        + " instance" + (results.size() == 1 ? "" : "s")
+        + " (" + std::to_string(ok_count) + " ok, "
+        + std::to_string(err_count) + " error).";
+    return agent_tools::tool_result_t::ok(summary, data);
+}
+
+static void register_aggregator_tools_once()
+{
+    std::call_once(g_aggregator_tools_registered, []() {
+        auto& reg = agent_tools::ToolRegistry::instance();
+
+        agent_tools::tool_definition_t list_def;
+        list_def.name = "list_ida_instances";
+        list_def.category = "instances";
+        list_def.description = "Enumerate every live IDA Pro instance currently exposing AiDA MCP. "
+            "Returns each peer's instance_id (UUID), pid (OS process id), display_name, idb_path, input_file, "
+            "file hashes, processor, bitness, port, and base_url. Use the returned instance_id OR pid as the "
+            "optional instance_id/pid argument on any tool to target a specific IDA.";
+        list_def.read_only = true;
+        list_def.handler = aggregator_list_instances;
+        reg.register_tool(list_def);
+
+        agent_tools::tool_definition_t info_def;
+        info_def.name = "get_local_instance_info";
+        info_def.category = "instances";
+        info_def.description = "Return the metadata of the IDA instance backing this MCP connection.";
+        info_def.read_only = true;
+        info_def.handler = aggregator_get_local_info;
+        reg.register_tool(info_def);
+
+        agent_tools::tool_definition_t fan_def;
+        fan_def.name = "query_all_instances";
+        fan_def.category = "instances";
+        fan_def.description = "Fan out a single tool call to every live IDA instance concurrently and "
+            "aggregate the per-instance results. Use this to compare or correlate findings across multiple "
+            "binaries open in different IDAs.";
+        fan_def.read_only = false;
+        agent_tools::tool_param_t p_tool;
+        p_tool.name = "tool";
+        p_tool.type = "string";
+        p_tool.description = "Tool name to invoke on every live IDA instance.";
+        p_tool.required = true;
+        agent_tools::tool_param_t p_args;
+        p_args.name = "arguments";
+        p_args.type = "object";
+        p_args.description = "Arguments object passed to the tool on each instance.";
+        p_args.required = false;
+        agent_tools::tool_param_t p_to;
+        p_to.name = "timeout_seconds";
+        p_to.type = "integer";
+        p_to.description = "Per-instance timeout in seconds (default 60).";
+        p_to.required = false;
+        fan_def.parameters = { p_tool, p_args, p_to };
+        fan_def.handler = aggregator_query_all;
+        reg.register_tool(fan_def);
+    });
+}
+
 mcp_server_t::mcp_server_t() = default;
 
 mcp_server_t::~mcp_server_t()
@@ -1138,7 +1772,10 @@ bool mcp_server_t::start(int port)
         return true;
     }
 
+    register_aggregator_tools_once();
+
     _stop_requested = false;
+    _bind_failed = false;
     _port = 0;
 
     try
@@ -1151,32 +1788,53 @@ bool mcp_server_t::start(int port)
         return false;
     }
 
-
-    for (int i = 0; i < 10 && !_running.load() && !_stop_requested.load(); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    for (int i = 0; i < 100 && !_running.load() && !_stop_requested.load() && !_bind_failed.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
     if (_running.load())
     {
         size_t tool_count = agent_tools::ToolRegistry::instance().get_tool_names().size();
+
+        std::string base_url = "http://127.0.0.1:" + std::to_string(_port);
+        std::string mcp_url  = base_url + "/mcp";
+        std::string sse_url  = base_url + "/sse";
+
+        if (!_registry)
+            _registry = std::make_unique<instance_registry_t>();
+        if (_registry->start(_port, base_url, mcp_url, sse_url))
+        {
+            g_active_registry.store(_registry.get(), std::memory_order_release);
+            _registry->on_peer_set_changed([this]() {
+                this->write_mcp_client_configs();
+            });
+        }
+        else
+        {
+            msg(OBFSTR_C("AiDA MCP: Warning - instance registry failed to start; multi-instance discovery disabled.\n"));
+        }
+
         msg(OBFSTR_C("AiDA MCP: Server started on http://127.0.0.1:%d\n"), _port);
         if (port > 0 && _port != port)
-            msg(OBFSTR_C("AiDA MCP: Requested port %d was unavailable; using fallback port %d instead.\n"), port, _port);
+            msg(OBFSTR_C("AiDA MCP: Requested port %d was in use; bound to port %d instead.\n"), port, _port);
         msg(OBFSTR_C("AiDA MCP: %zu tools available.\n"), tool_count);
-        msg(OBFSTR_C("AiDA MCP: Streamable HTTP  -> http://127.0.0.1:%d/mcp  (also /sse)\n"), _port);
-        msg(OBFSTR_C("AiDA MCP: Legacy SSE       -> http://127.0.0.1:%d/sse\n"), _port);
+        msg(OBFSTR_C("AiDA MCP: Streamable HTTP  -> %s\n"), mcp_url.c_str());
+        msg(OBFSTR_C("AiDA MCP: Legacy SSE       -> %s\n"), sse_url.c_str());
+        if (_registry)
+        {
+            msg(OBFSTR_C("AiDA MCP: Instance ID         -> %s\n"), _registry->self_instance_id().c_str());
+            msg(OBFSTR_C("AiDA MCP: Config entry name   -> %s\n"), _registry->self_config_entry_name().c_str());
+        }
         return true;
     }
-    else if (_stop_requested.load())
+    else if (_stop_requested.load() || _bind_failed.load())
     {
-        msg(OBFSTR_C("AiDA MCP: Server failed to start on port %d (port may be in use).\n"), port);
+        msg(OBFSTR_C("AiDA MCP: Server failed to start on port %d (no free local port found).\n"), port);
         if (_server_thread.joinable())
             _server_thread.join();
         return false;
     }
     else
     {
-
-
         msg(OBFSTR_C("AiDA MCP: Server starting on port %d (async)...\n"), port);
         return true;
     }
@@ -1184,7 +1842,7 @@ bool mcp_server_t::start(int port)
 
 void mcp_server_t::stop()
 {
-    if (!_running.load() && !_server_thread.joinable())
+    if (!_running.load() && !_server_thread.joinable() && !_registry)
         return;
 
     _stop_requested = true;
@@ -1199,6 +1857,13 @@ void mcp_server_t::stop()
 
     if (_server_thread.joinable())
         _server_thread.join();
+
+    if (_registry)
+    {
+        g_active_registry.store(nullptr, std::memory_order_release);
+        _registry->stop();
+        _registry.reset();
+    }
 
     msg(OBFSTR_C("AiDA MCP: Server stopped.\n"));
 }
@@ -1513,15 +2178,24 @@ void mcp_server_t::server_thread_func(int port)
     });
 
     int bound_port = 0;
-    if (port > 0 && svr.bind_to_port("127.0.0.1", port))
-        bound_port = port;
+    int seed_port = port > 0 ? port : 13120;
+    for (int candidate = seed_port; candidate < seed_port + 256 && bound_port <= 0; ++candidate)
+    {
+        if (svr.bind_to_port("127.0.0.1", candidate))
+        {
+            bound_port = candidate;
+            break;
+        }
+    }
     if (bound_port <= 0)
         bound_port = svr.bind_to_any_port("127.0.0.1");
 
     if (bound_port <= 0)
     {
         if (!_stop_requested.load())
-            msg(OBFSTR_C("AiDA MCP: Failed to bind to 127.0.0.1:%d and no fallback port was available.\n"), port);
+            msg(OBFSTR_C("AiDA MCP: Failed to bind any port near %d and no fallback port was available.\n"), port);
+
+        _bind_failed.store(true, std::memory_order_release);
 
         {
             std::lock_guard<std::mutex> lock(_server_mutex);
@@ -1779,7 +2453,43 @@ static const mcp_client_def_t g_mcp_client_defs[] =
 #endif
 };
 
-static const std::string MCP_SERVER_NAME = OBFSTR("aida-pro-mcp");
+static const std::string MCP_SERVER_NAME       = OBFSTR("aida-pro-mcp");
+static const std::string MCP_AGGREGATOR_NAME    = OBFSTR("aida-ida-all");
+static const std::string MCP_LEGACY_PREFIX      = OBFSTR("aida-pro-mcp");
+static const std::string MCP_INSTANCE_PREFIX    = OBFSTR("aida-ida-");
+
+struct mcp_entry_t
+{
+    std::string name;
+    std::string http_url;
+    std::string sse_url;
+    std::string description;
+};
+
+static bool mcp_is_aida_managed_key(const std::string& key)
+{
+    if (key == MCP_AGGREGATOR_NAME)
+        return true;
+    if (key == MCP_LEGACY_PREFIX)
+        return true;
+    if (key.size() >= MCP_INSTANCE_PREFIX.size()
+        && key.compare(0, MCP_INSTANCE_PREFIX.size(), MCP_INSTANCE_PREFIX) == 0)
+        return true;
+    return false;
+}
+
+static std::vector<std::string> mcp_collect_managed_keys(const json& obj)
+{
+    std::vector<std::string> out;
+    if (!obj.is_object())
+        return out;
+    for (auto it = obj.begin(); it != obj.end(); ++it)
+    {
+        if (mcp_is_aida_managed_key(it.key()))
+            out.push_back(it.key());
+    }
+    return out;
+}
 
 static std::string mcp_get_home_dir()
 {
@@ -1908,7 +2618,8 @@ static bool mcp_read_file_contents(const std::string& path, std::string& out)
 static bool mcp_parse_json_file(const std::string& path, json& out, bool allow_jsonc);
 static bool mcp_write_json_file(const std::string& path, const json& data);
 
-static bool mcp_write_claude_desktop_bridge(const std::string& path, const std::string& sse_url)
+static bool mcp_write_claude_desktop_bridge(const std::string& path,
+                                            const std::vector<mcp_entry_t>& entries)
 {
     json config;
     if (qfileexist(path.c_str()))
@@ -1922,11 +2633,17 @@ static bool mcp_write_claude_desktop_bridge(const std::string& path, const std::
     if (!config.contains("mcpServers") || !config["mcpServers"].is_object())
         config["mcpServers"] = json::object();
 
-    json entry;
-    entry["command"] = "npx";
-    entry["args"] = json::array({"-y", "mcp-bridge", sse_url});
+    auto& root = config["mcpServers"];
+    for (const auto& key : mcp_collect_managed_keys(root))
+        root.erase(key);
 
-    config["mcpServers"][MCP_SERVER_NAME] = entry;
+    for (const auto& e : entries)
+    {
+        json entry;
+        entry["command"] = "npx";
+        entry["args"]    = json::array({"-y", "mcp-bridge", e.sse_url});
+        root[e.name] = entry;
+    }
 
     return mcp_write_json_file(path, config);
 }
@@ -1935,11 +2652,31 @@ static bool mcp_write_file_contents(const std::string& path, const std::string& 
 {
     if (!mcp_ensure_parent_dir(path))
         return false;
-    FILE* fp = qfopen(path.c_str(), "wb");
-    if (!fp)
+
+    std::string tmp = path + ".aida-tmp";
+    {
+        FILE* fp = qfopen(tmp.c_str(), "wb");
+        if (!fp)
+            return false;
+        file_janitor_t fj(fp);
+        if (qfwrite(fp, content.c_str(), content.size()) != static_cast<ssize_t>(content.size()))
+            return false;
+    }
+
+#ifdef _WIN32
+    if (MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) == 0)
+    {
+        qunlink(tmp.c_str());
         return false;
-    file_janitor_t fj(fp);
-    return qfwrite(fp, content.c_str(), content.size()) == static_cast<ssize_t>(content.size());
+    }
+#else
+    if (::rename(tmp.c_str(), path.c_str()) != 0)
+    {
+        qunlink(tmp.c_str());
+        return false;
+    }
+#endif
+    return true;
 }
 
 static std::string mcp_strip_jsonc(const std::string& input)
@@ -2063,7 +2800,7 @@ static bool mcp_write_json_file(const std::string& path, const json& data)
 
 static bool mcp_write_mcpservers_url(
     const std::string& path,
-    const std::string& url,
+    const std::vector<mcp_entry_t>& entries,
     const char* url_key)
 {
     json config;
@@ -2078,13 +2815,22 @@ static bool mcp_write_mcpservers_url(
     if (!config.contains("mcpServers") || !config["mcpServers"].is_object())
         config["mcpServers"] = json::object();
 
-    config["mcpServers"][MCP_SERVER_NAME] = json::object();
-    config["mcpServers"][MCP_SERVER_NAME][url_key] = url;
+    auto& root = config["mcpServers"];
+    for (const auto& key : mcp_collect_managed_keys(root))
+        root.erase(key);
+
+    for (const auto& e : entries)
+    {
+        json entry = json::object();
+        entry[url_key] = e.sse_url;
+        root[e.name] = entry;
+    }
 
     return mcp_write_json_file(path, config);
 }
 
-static bool mcp_write_cline_config(const std::string& path, const std::string& url)
+static bool mcp_write_cline_config(const std::string& path,
+                                   const std::vector<mcp_entry_t>& entries)
 {
     json config;
     if (qfileexist(path.c_str()))
@@ -2098,23 +2844,32 @@ static bool mcp_write_cline_config(const std::string& path, const std::string& u
     if (!config.contains("mcpServers") || !config["mcpServers"].is_object())
         config["mcpServers"] = json::object();
 
-    json entry;
-    entry["url"] = url;
-    entry["disabled"] = false;
-    entry["autoApprove"] = json::array();
+    auto& root = config["mcpServers"];
 
-    if (config["mcpServers"].contains(MCP_SERVER_NAME)
-        && config["mcpServers"][MCP_SERVER_NAME].is_object()
-        && config["mcpServers"][MCP_SERVER_NAME].contains("autoApprove"))
+    std::map<std::string, json> preserved_auto_approve;
+    for (const auto& key : mcp_collect_managed_keys(root))
     {
-        entry["autoApprove"] = config["mcpServers"][MCP_SERVER_NAME]["autoApprove"];
+        if (root[key].is_object() && root[key].contains("autoApprove"))
+            preserved_auto_approve[key] = root[key]["autoApprove"];
+        root.erase(key);
     }
 
-    config["mcpServers"][MCP_SERVER_NAME] = entry;
+    for (const auto& e : entries)
+    {
+        json entry;
+        entry["url"] = e.sse_url;
+        entry["disabled"] = false;
+        entry["autoApprove"] = preserved_auto_approve.count(e.name)
+                              ? preserved_auto_approve[e.name]
+                              : json::array();
+        root[e.name] = entry;
+    }
+
     return mcp_write_json_file(path, config);
 }
 
-static bool mcp_write_vscode_settings(const std::string& path, const std::string& url)
+static bool mcp_write_vscode_settings(const std::string& path,
+                                      const std::vector<mcp_entry_t>& entries)
 {
     json config;
     if (qfileexist(path.c_str()))
@@ -2130,15 +2885,23 @@ static bool mcp_write_vscode_settings(const std::string& path, const std::string
     if (!config["mcp"].contains("servers") || !config["mcp"]["servers"].is_object())
         config["mcp"]["servers"] = json::object();
 
-    json entry;
-    entry[OBFSTR_C("type")] = "sse";
-    entry["url"] = url;
-    config["mcp"]["servers"][MCP_SERVER_NAME] = entry;
+    auto& root = config["mcp"]["servers"];
+    for (const auto& key : mcp_collect_managed_keys(root))
+        root.erase(key);
+
+    for (const auto& e : entries)
+    {
+        json entry;
+        entry[OBFSTR_C("type")] = "sse";
+        entry["url"] = e.sse_url;
+        root[e.name] = entry;
+    }
 
     return mcp_write_json_file(path, config);
 }
 
-static bool mcp_write_vscode_mcp_json(const std::string& path, const std::string& url)
+static bool mcp_write_vscode_mcp_json(const std::string& path,
+                                      const std::vector<mcp_entry_t>& entries)
 {
     json config;
     if (qfileexist(path.c_str()))
@@ -2152,15 +2915,23 @@ static bool mcp_write_vscode_mcp_json(const std::string& path, const std::string
     if (!config.contains("servers") || !config["servers"].is_object())
         config["servers"] = json::object();
 
-    json entry;
-    entry[OBFSTR_C("type")] = "sse";
-    entry["url"] = url;
-    config["servers"][MCP_SERVER_NAME] = entry;
+    auto& root = config["servers"];
+    for (const auto& key : mcp_collect_managed_keys(root))
+        root.erase(key);
+
+    for (const auto& e : entries)
+    {
+        json entry;
+        entry[OBFSTR_C("type")] = "sse";
+        entry["url"] = e.sse_url;
+        root[e.name] = entry;
+    }
 
     return mcp_write_json_file(path, config);
 }
 
-static bool mcp_write_zed_settings(const std::string& path, const std::string& url)
+static bool mcp_write_zed_settings(const std::string& path,
+                                   const std::vector<mcp_entry_t>& entries)
 {
     json config;
     if (qfileexist(path.c_str()))
@@ -2174,50 +2945,83 @@ static bool mcp_write_zed_settings(const std::string& path, const std::string& u
     if (!config.contains("context_servers") || !config["context_servers"].is_object())
         config["context_servers"] = json::object();
 
-    json entry;
-    entry["settings"] = json::object();
-    entry["settings"]["url"] = url;
-    config["context_servers"][MCP_SERVER_NAME] = entry;
+    auto& root = config["context_servers"];
+    for (const auto& key : mcp_collect_managed_keys(root))
+        root.erase(key);
+
+    for (const auto& e : entries)
+    {
+        json entry;
+        entry["settings"] = json::object();
+        entry["settings"]["url"] = e.http_url;
+        root[e.name] = entry;
+    }
 
     return mcp_write_json_file(path, config);
 }
 
-static bool mcp_write_codex_toml(const std::string& path, const std::string& url)
+static bool mcp_write_codex_toml(const std::string& path,
+                                 const std::vector<mcp_entry_t>& entries)
 {
     std::string content;
     if (qfileexist(path.c_str()))
         mcp_read_file_contents(path, content);
 
-    const std::string section_marker = OBFSTR("[mcp_servers.aida-pro-mcp]");
-    size_t section_pos = content.find(section_marker);
+    auto strip_section = [](std::string& doc, const std::string& marker) {
+        size_t pos = doc.find(marker);
+        while (pos != std::string::npos)
+        {
+            size_t end = doc.find("\n[", pos + marker.size());
+            if (end == std::string::npos)
+                end = doc.size();
+            else
+                end += 1;
+            doc.erase(pos, end - pos);
+            pos = doc.find(marker);
+        }
+    };
 
-    if (section_pos != std::string::npos)
     {
-        size_t section_end = content.find("\n[", section_pos + section_marker.size());
-        if (section_end == std::string::npos)
-            section_end = content.size();
-        else
-            section_end += 1;
-
-        std::string new_section = section_marker + "\n"
-            "type = \"sse\"\n"
-            "url = \"" + url + "\"\n";
-
-        content.replace(section_pos, section_end - section_pos, new_section);
+        std::string legacy_marker = OBFSTR("[mcp_servers.aida-pro-mcp]");
+        strip_section(content, legacy_marker);
     }
-    else
+
     {
-        if (!content.empty() && content.back() != '\n')
-            content += "\n";
-        content += "\n" + section_marker + "\n"
+        std::string aggregator_marker = OBFSTR("[mcp_servers.") + MCP_AGGREGATOR_NAME + "]";
+        strip_section(content, aggregator_marker);
+    }
+
+    {
+        const std::string instance_marker_prefix = OBFSTR("[mcp_servers.") + MCP_INSTANCE_PREFIX;
+        size_t pos = content.find(instance_marker_prefix);
+        while (pos != std::string::npos)
+        {
+            size_t end = content.find("\n[", pos + instance_marker_prefix.size());
+            if (end == std::string::npos)
+                end = content.size();
+            else
+                end += 1;
+            content.erase(pos, end - pos);
+            pos = content.find(instance_marker_prefix);
+        }
+    }
+
+    if (!content.empty() && content.back() != '\n')
+        content += "\n";
+
+    for (const auto& e : entries)
+    {
+        std::string section = "\n[mcp_servers." + e.name + "]\n"
             "type = \"sse\"\n"
-            "url = \"" + url + "\"\n";
+            "url = \"" + e.sse_url + "\"\n";
+        content += section;
     }
 
     return mcp_write_file_contents(path, content);
 }
 
-static bool mcp_write_claude_code_json(const std::string& path, const std::string& url)
+static bool mcp_write_claude_code_json(const std::string& path,
+                                       const std::vector<mcp_entry_t>& entries)
 {
     json config;
     if (qfileexist(path.c_str()))
@@ -2231,10 +3035,17 @@ static bool mcp_write_claude_code_json(const std::string& path, const std::strin
     if (!config.contains("mcpServers") || !config["mcpServers"].is_object())
         config["mcpServers"] = json::object();
 
-    json entry;
-    entry[OBFSTR_C("type")] = "sse";
-    entry["url"] = url;
-    config["mcpServers"][MCP_SERVER_NAME] = entry;
+    auto& root = config["mcpServers"];
+    for (const auto& key : mcp_collect_managed_keys(root))
+        root.erase(key);
+
+    for (const auto& e : entries)
+    {
+        json entry;
+        entry[OBFSTR_C("type")] = "sse";
+        entry["url"] = e.sse_url;
+        root[e.name] = entry;
+    }
 
     return mcp_write_json_file(path, config);
 }
@@ -2242,62 +3053,69 @@ static bool mcp_write_claude_code_json(const std::string& path, const std::strin
 static bool mcp_write_single_client(
     const mcp_client_def_t& def,
     const std::string& path,
-    const std::string& http_url,
-    const std::string& sse_url)
+    const std::vector<mcp_entry_t>& entries)
 {
     switch (def.format)
     {
     case mcp_cfg_format_t::mcpservers_url:
-        return mcp_write_mcpservers_url(path, sse_url, "url");
+        return mcp_write_mcpservers_url(path, entries, "url");
 
     case mcp_cfg_format_t::mcpservers_serverurl:
-        return mcp_write_mcpservers_url(path, sse_url, "serverUrl");
+        return mcp_write_mcpservers_url(path, entries, "serverUrl");
 
     case mcp_cfg_format_t::vscode_mcp:
-        return mcp_write_vscode_settings(path, sse_url);
+        return mcp_write_vscode_settings(path, entries);
 
     case mcp_cfg_format_t::vscode_mcp_json:
-        return mcp_write_vscode_mcp_json(path, sse_url);
+        return mcp_write_vscode_mcp_json(path, entries);
 
     case mcp_cfg_format_t::cline_mcp:
-        return mcp_write_cline_config(path, sse_url);
+        return mcp_write_cline_config(path, entries);
 
     case mcp_cfg_format_t::zed_context:
-        return mcp_write_zed_settings(path, http_url);
+        return mcp_write_zed_settings(path, entries);
 
     case mcp_cfg_format_t::codex_toml:
-        return mcp_write_codex_toml(path, sse_url);
+        return mcp_write_codex_toml(path, entries);
 
     case mcp_cfg_format_t::claude_code_json:
-        return mcp_write_claude_code_json(path, sse_url);
+        return mcp_write_claude_code_json(path, entries);
 
     case mcp_cfg_format_t::claude_desktop_bridge:
-        return mcp_write_claude_desktop_bridge(path, sse_url);
+        return mcp_write_claude_desktop_bridge(path, entries);
     }
     return false;
 }
 
 static void mcp_write_reference_config(
-    int port,
-    const std::string& port_str,
-    const std::string& http_url,
-    const std::string& sse_url)
+    const std::vector<mcp_entry_t>& entries,
+    const ida_instance_record_t& self_rec)
 {
     json config;
-    config["_comment"] = OBFSTR("MCP Server - Auto-configured endpoints. All supported MCP clients have been configured automatically.");
+    config["_comment"] = OBFSTR("MCP Server - Auto-configured endpoints. Multi-IDA instance aware. Each running IDA contributes its own entry; aida-ida-all is the aggregator.");
     config["_version"] = AIDA_VERSION;
-    config["_port"] = port;
-    config["_endpoints"] = {
-        {"streamable_http", http_url},
-        {"legacy_sse", sse_url},
-        {"health", "http://127.0.0.1:" + port_str + "/health"}
+    config["self"] = {
+        {"instance_id",       self_rec.instance_id},
+        {"port",              self_rec.port},
+        {"base_url",          self_rec.base_url},
+        {"mcp_url",           self_rec.mcp_url},
+        {"sse_url",           self_rec.sse_url},
+        {"input_file",        self_rec.input_file},
+        {"display_name",      self_rec.display_name},
+        {"config_entry_name", self_rec.config_entry_name}
     };
 
-    config["generic_http"] = {
-        {OBFSTR_C("description"), "For any MCP client that supports Streamable HTTP or SSE transport"},
-        {"streamable_http_url", http_url},
-        {"sse_url", sse_url}
-    };
+    json arr = json::array();
+    for (const auto& e : entries)
+    {
+        json o;
+        o["name"]     = e.name;
+        o["http_url"] = e.http_url;
+        o["sse_url"]  = e.sse_url;
+        o["description"] = e.description;
+        arr.push_back(o);
+    }
+    config["entries"] = arr;
 
     qstring config_file = get_user_idadir();
     config_file.append(OBFSTR_C("/aida_mcp_config.json"));
@@ -2322,15 +3140,38 @@ void mcp_server_t::write_mcp_client_configs() const
 {
     if (!_running.load())
         return;
+    if (!_registry || !_registry->is_running())
+        return;
 
-    std::string port_str = std::to_string(_port);
-    std::string http_url = "http://127.0.0.1:" + port_str + "/mcp";
-    std::string sse_url  = "http://127.0.0.1:" + port_str + "/sse";
+    auto self_rec = _registry->self_record();
+    auto live = _registry->all_live_instances();
 
-    mcp_write_reference_config(_port, port_str, http_url, sse_url);
+    std::vector<mcp_entry_t> entries;
+    entries.reserve(live.size() + 1);
+    for (const auto& r : live)
+    {
+        if (r.config_entry_name.empty() || r.port <= 0)
+            continue;
+        mcp_entry_t e;
+        e.name        = r.config_entry_name;
+        e.http_url    = r.mcp_url.empty() ? (r.base_url + "/mcp") : r.mcp_url;
+        e.sse_url     = r.sse_url.empty() ? (r.base_url + "/sse") : r.sse_url;
+        e.description = r.display_name;
+        entries.push_back(std::move(e));
+    }
+
+    {
+        mcp_entry_t agg;
+        agg.name = MCP_AGGREGATOR_NAME;
+        agg.http_url = self_rec.mcp_url.empty() ? (self_rec.base_url + "/mcp") : self_rec.mcp_url;
+        agg.sse_url  = self_rec.sse_url.empty() ? (self_rec.base_url + "/sse") : self_rec.sse_url;
+        agg.description = "AiDA aggregator (any one live IDA; routes via list_ida_instances/query_all_instances)";
+        entries.push_back(std::move(agg));
+    }
+
+    mcp_write_reference_config(entries, self_rec);
 
     std::set<std::string> written_paths;
-
     int configured_count = 0;
     int skipped_count = 0;
     int failed_count = 0;
@@ -2379,11 +3220,12 @@ void mcp_server_t::write_mcp_client_configs() const
             }
         }
 
-        if (mcp_write_single_client(def, expanded, http_url, sse_url))
+        if (mcp_write_single_client(def, expanded, entries))
         {
             written_paths.insert(expanded);
             ++configured_count;
-            msg(OBFSTR_C("AiDA MCP: [OK] %s -> %s\n"), def.name, expanded.c_str());
+            msg(OBFSTR_C("AiDA MCP: [OK] %s -> %s (%zu entries)\n"),
+                def.name, expanded.c_str(), entries.size());
         }
         else
         {
@@ -2397,20 +3239,34 @@ void mcp_server_t::write_mcp_client_configs() const
 
     msg("\n");
     msg("============================================================\n");
-    msg("  AiDA MCP Server - Auto-Configuration Summary\n");
+    msg("  AiDA MCP Server - Multi-Instance Configuration Summary\n");
     msg("============================================================\n");
-    msg("  Streamable HTTP : %s\n", http_url.c_str());
-    msg("  Legacy SSE      : %s\n", sse_url.c_str());
-    msg("  Health Check    : http://127.0.0.1:%d/health\n", _port);
+    msg("  Self port            : %d\n", self_rec.port);
+    msg("  Self instance_id     : %s\n", self_rec.instance_id.c_str());
+    msg("  Self entry name      : %s\n", self_rec.config_entry_name.c_str());
+    msg("  Live IDA instances   : %zu\n", live.size());
+    for (const auto& r : live)
+    {
+        msg("    - %s | %s | %s%s\n",
+            r.config_entry_name.c_str(),
+            r.input_file.empty() ? "(no input)" : r.input_file.c_str(),
+            r.base_url.c_str(),
+            r.is_self ? "  [self]" : "");
+    }
     msg("------------------------------------------------------------\n");
-    msg("  Clients configured : %d\n", configured_count);
-    msg("  Clients skipped    : %d (not installed or unavailable)\n", skipped_count);
+    msg("  Aggregator entry      : %s -> %s\n",
+        MCP_AGGREGATOR_NAME.c_str(),
+        (self_rec.sse_url.empty() ? (self_rec.base_url + "/sse").c_str() : self_rec.sse_url.c_str()));
+    msg("  Clients configured    : %d\n", configured_count);
+    msg("  Clients skipped       : %d (not installed or unavailable)\n", skipped_count);
     if (failed_count > 0)
-        msg("  Clients failed     : %d\n", failed_count);
+        msg("  Clients failed        : %d\n", failed_count);
     msg("------------------------------------------------------------\n");
-    msg("  All configured clients connect via HTTP/SSE directly.\n");
-    msg("  No external bridge executable is required.\n");
+    msg("  Each running IDA Pro instance is exposed as its own MCP\n");
+    msg("  server entry. Connect to %s for cross-instance\n", MCP_AGGREGATOR_NAME.c_str());
+    msg("  fan-out (list_ida_instances, query_all_instances) or to\n");
+    msg("  any specific aida-ida-<basename>-<id> entry directly.\n");
     msg("------------------------------------------------------------\n");
-    msg("  Reference config : %s\n", ref_file.c_str());
+    msg("  Reference config      : %s\n", ref_file.c_str());
     msg("============================================================\n\n");
 }

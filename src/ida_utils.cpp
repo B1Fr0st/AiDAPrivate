@@ -2345,22 +2345,10 @@ namespace ida_utils
                 {
                     for (auto& lv : *lvars)
                     {
-                        if (lv.name == target_param.c_str() || lv.name == ("a" + std::to_string(lv.is_arg_var())).c_str())
+                        if (lv.name == target_param.c_str())
                         {
                             target_lvar = &lv;
                             break;
-                        }
-                    }
-
-                    if (!target_lvar)
-                    {
-                        for (auto& lv : *lvars)
-                        {
-                            if (lv.name.c_str() == target_param)
-                            {
-                                target_lvar = &lv;
-                                break;
-                            }
                         }
                     }
                 }

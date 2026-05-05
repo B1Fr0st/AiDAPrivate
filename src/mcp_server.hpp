@@ -6,6 +6,8 @@
 #include <atomic>
 #include <mutex>
 
+class instance_registry_t;
+
 class mcp_server_t
 {
 public:
@@ -18,14 +20,19 @@ public:
     int get_port() const;
     void write_mcp_client_configs() const;
 
+    instance_registry_t* registry() const { return _registry.get(); }
+
 private:
     void server_thread_func(int port);
 
     std::thread _server_thread;
     std::atomic<bool> _running{false};
     std::atomic<bool> _stop_requested{false};
+    std::atomic<bool> _bind_failed{false};
 
     void* _active_server = nullptr;
     std::mutex _server_mutex;
     int _port = 0;
+
+    std::unique_ptr<instance_registry_t> _registry;
 };

@@ -821,17 +821,26 @@ tool_result_t build_call_graph(const json& params)
         return tool_result_t::error(OBFSTR("Invalid address"));
 
     int depth = params.value("depth", 3);
+    if (depth < 0) depth = 0;
+    if (depth > 16) depth = 16;
 
+    constexpr size_t MAX_NODES = 4096;
     std::map<ea_t, json> nodes;
     std::set<std::pair<ea_t, ea_t>> edges;
 
-    std::function<void(ea_t, int)> traverse;
-    traverse = [&](ea_t ea, int current_depth) {
-        if (current_depth > depth) return;
-        if (nodes.count(ea)) return;
+    std::deque<std::pair<ea_t, int>> work;
+    work.push_back({*ea_opt, 0});
+
+    while (!work.empty() && nodes.size() < MAX_NODES)
+    {
+        auto [ea, current_depth] = work.front();
+        work.pop_front();
+
+        if (current_depth > depth) continue;
+        if (nodes.count(ea)) continue;
 
         func_t* pfn = get_func(ea);
-        if (!pfn) return;
+        if (!pfn) continue;
 
         qstring name;
         get_func_name(&name, pfn->start_ea);
@@ -841,6 +850,8 @@ tool_result_t build_call_graph(const json& params)
             {"name", name.c_str()},
             {"depth", current_depth}
         };
+
+        if (current_depth >= depth) continue;
 
         func_item_iterator_t fii;
         for (bool ok = fii.set(pfn); ok; ok = fii.next_addr())
@@ -854,14 +865,13 @@ tool_result_t build_call_graph(const json& params)
                     if (callee)
                     {
                         edges.insert({ea, callee->start_ea});
-                        traverse(callee->start_ea, current_depth + 1);
+                        if (!nodes.count(callee->start_ea))
+                            work.push_back({callee->start_ea, current_depth + 1});
                     }
                 }
             }
         }
-    };
-
-    traverse(*ea_opt, 0);
+    }
 
     json result;
     result["nodes"] = json::array();
@@ -948,7 +958,7 @@ void register_tools()
         OBFSTR("Decompile a function at the given address using Hex-Rays."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address to decompile"), true}},
         decompile_function,
-        false
+        true
     });
 
     registry.register_tool({
@@ -1228,8 +1238,9 @@ tool_result_t patch_bytes(const json& params)
 
     for (size_t i = 0; i < bytes.size(); i++)
     {
-        if (!put_byte(*ea_opt + i, bytes[i]))
-            return tool_result_t::error(OBFSTR("Failed to patch byte at offset ") + std::to_string(i));
+        if (!is_loaded(*ea_opt + i))
+            return tool_result_t::error(OBFSTR("Address out of range at offset ") + std::to_string(i));
+        patch_byte(*ea_opt + i, bytes[i]);
     }
 
     json result;
@@ -2401,6 +2412,8 @@ tool_result_t list_types(const json& params)
 tool_result_t create_enum(const json& params)
 {
     std::string name = params["name"].get<std::string>();
+    if (name.empty())
+        return tool_result_t::error(OBFSTR("Enum name is required"));
 
     tinfo_t tif;
     enum_type_data_t etd;
@@ -2416,8 +2429,10 @@ tool_result_t create_enum(const json& params)
         }
     }
 
-    tif.create_enum(etd);
-    tif.set_named_type(get_idati(), name.c_str());
+    if (!tif.create_enum(etd))
+        return tool_result_t::error(OBFSTR("Failed to construct enum tinfo for: ") + name);
+    if (tif.set_named_type(get_idati(), name.c_str()) != TERR_OK)
+        return tool_result_t::error(OBFSTR("Failed to register enum in type library: ") + name);
 
     return tool_result_t::ok(OBFSTR("Enum created: ") + name);
 }
@@ -3290,30 +3305,44 @@ tool_result_t execute_python(const json& params)
 {
     std::string code = params["code"].get<std::string>();
 
+    static const char b64_alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string b64;
+    b64.reserve(((code.size() + 2) / 3) * 4);
+    for (size_t i = 0; i < code.size(); i += 3)
+    {
+        unsigned char c0 = static_cast<unsigned char>(code[i]);
+        unsigned char c1 = (i + 1 < code.size()) ? static_cast<unsigned char>(code[i + 1]) : 0;
+        unsigned char c2 = (i + 2 < code.size()) ? static_cast<unsigned char>(code[i + 2]) : 0;
+        uint32_t v = (static_cast<uint32_t>(c0) << 16)
+                   | (static_cast<uint32_t>(c1) << 8)
+                   | static_cast<uint32_t>(c2);
+        b64.push_back(b64_alphabet[(v >> 18) & 0x3F]);
+        b64.push_back(b64_alphabet[(v >> 12) & 0x3F]);
+        b64.push_back((i + 1 < code.size()) ? b64_alphabet[(v >> 6) & 0x3F] : '=');
+        b64.push_back((i + 2 < code.size()) ? b64_alphabet[v & 0x3F] : '=');
+    }
+
     std::string wrapper = R"PY(
-import sys, io, json as _json
+import sys, io, json as _json, base64 as _b64
 _aida_stdout = io.StringIO()
 _aida_stderr = io.StringIO()
 _aida_result = None
+_aida_user_code = _b64.b64decode(")PY";
+    wrapper += b64;
+    wrapper += R"PY(").decode("utf-8")
 try:
     _old_stdout, _old_stderr = sys.stdout, sys.stderr
     sys.stdout, sys.stderr = _aida_stdout, _aida_stderr
     try:
-        _aida_result = eval(compile("""
-)PY";
-    wrapper += code;
-    wrapper += R"PY(
-""", "<aida>", "eval"))
+        _aida_result = eval(compile(_aida_user_code, "<aida>", "eval"))
     except SyntaxError:
-        exec(compile("""
-)PY";
-    wrapper += code;
-    wrapper += R"PY(
-""", "<aida>", "exec"))
+        exec(compile(_aida_user_code, "<aida>", "exec"))
     sys.stdout, sys.stderr = _old_stdout, _old_stderr
 except Exception as _e:
     sys.stdout, sys.stderr = _old_stdout, _old_stderr
-    _aida_stderr.write(str(_e))
+    import traceback as _tb
+    _aida_stderr.write(_tb.format_exc())
 _aida_out = _json.dumps({
     "result": str(_aida_result) if _aida_result is not None else None,
     "stdout": _aida_stdout.getvalue(),
@@ -3366,15 +3395,9 @@ static void responsive_auto_wait(ea_t start, ea_t end, const char* status_msg)
     if (start != 0 || end != BADADDR)
         auto_mark_range(start, end, AU_FINAL);
 
-
-    while (!auto_is_ok())
-    {
-        if (user_cancelled())
-            break;
-
+    if (!auto_is_ok() && !user_cancelled())
         auto_wait_range(0, BADADDR);
-        break;
-    }
+
     (void)status_msg;
 }
 

@@ -21,7 +21,7 @@ This is **not** a single product — it is a set of interlocking components that
 
 | Component | Output | Source | Notes |
 |---|---|---|---|
-| `AiDA` | `AiDA.dll` | `src/*.cpp`, `src/*.hpp` | IDA Pro plugin (uses `ida-sdk/`). Filename is hard-checked. |
+| `AiDA` | `AiDA.dll` | `src/*.cpp`, `src/*.hpp` | IDA Pro plugin (uses `ida-sdk/`). Filename is hard-checked. THE FULL IDA-SDK IS PROVIDED AT C:\Users\ruar1337\AiDAPrivate\ida-sdk\src\include, ALWAYS USE IT WHENEVER YOU MAKE ANY CHANGES/UPDATES TO THE IDA PRO PLUGIN! |
 | `AiDAStandalone` | `AiDAStandalone.exe` | `src/standalone/src/**` + `src/driver_loader.cpp` + bits of `src/` | Standalone ImGui/DX11 reverse-engineering IDE. `WIN32` GUI, requires admin, statically linked. |
 | `AiDA_ARC` | `aida_core.dll` | `src/standalone/src/core/arc/arc.cpp` | Runtime core delivered by the license server after validation. **Not** linked into AiDAStandalone — served separately. |
 | `WhosWho` driver | `WhosWho.sys` | `driver/WhosWho/` (separate `.sln`) | Kernel driver: anti-debug, process guard, hv_detect, SentinelBridge. |

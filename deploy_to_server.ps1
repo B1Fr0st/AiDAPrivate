@@ -15,8 +15,8 @@ param(
 
 $ErrorActionPreference = "Continue"
 
-$REPO_ROOT           = "C:\Users\ruar\AiDAPrivate"
-$SSH_KEY             = "C:\Users\ruar\.ssh\aida_server"
+$REPO_ROOT           = $PSScriptRoot
+$SSH_KEY             = Join-Path $env:USERPROFILE ".ssh\aida_server"
 $SERVER              = "ruarr@23.88.62.199"
 $REMOTE_ARC_PATH     = "~/aida-server/arc/aida_core.bin"
 $ARC_MASTER_SECRET   = "b3c4700abcf39f23d46527f2d2efd4b7d6e81dce0a674bd72d77a73067728453"

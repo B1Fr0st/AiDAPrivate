@@ -1400,12 +1400,19 @@ set(AIDA_SOURCES
     src/aida.cpp
     src/graphrag.cpp
     src/ida_utils.cpp
+    src/instance_registry.cpp
     src/license.cpp
     src/mcp_server.cpp
     src/settings.cpp
     src/driver_loader.cpp
-    src/net_security.cpp
-    src/emulation_engine.cpp
+    src/vuln/cfg_engine.cpp
+    src/vuln/kernel_engine.cpp
+    src/vuln/microcode_engine.cpp
+    src/vuln/surface_engine.cpp
+    src/vuln/taint_engine.cpp
+    src/vuln/vuln_callsites.cpp
+    src/vuln/vuln_strings.cpp
+    src/vuln/vuln_tools.cpp
     driver/comm.cpp
 )
 
@@ -1423,13 +1430,17 @@ set(AIDA_HEADERS
     src/anti_re.hpp
     src/graphrag.hpp
     src/ida_utils.hpp
+    src/instance_registry.hpp
     src/license.hpp
     src/mcp_server.hpp
     src/obfuscation.hpp
     src/settings.hpp
     src/driver_loader.hpp
-    src/net_security.hpp
-    src/emulation_engine.hpp
+    src/vuln/microcode_engine.hpp
+    src/vuln/taint_engine.hpp
+    src/vuln/vuln_common.hpp
+    src/vuln/vuln_signatures.hpp
+    src/vuln/vuln_tools.hpp
     src/whoswho_encrypted.h
     src/sentinel_encrypted.h
     src/windmapper_embedded.h

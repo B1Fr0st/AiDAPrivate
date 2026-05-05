@@ -81,7 +81,6 @@
 #include <graph.hpp>
 #include <dirtree.hpp>
 #include <registry.hpp>
-#include <dbg.hpp>
 
 #ifdef _MSC_VER
 #pragma warning(pop)
@@ -321,9 +320,9 @@ inline std::string json_str(const nlohmann::json& j, const std::string& key, con
 #include "obfuscation.hpp"
 #include "settings.hpp"
 #include "license.hpp"
-#include "net_security.hpp"
 #include "agent_tools.hpp"
 #include "ida_utils.hpp"
+#include "instance_registry.hpp"
 #include "mcp_server.hpp"
 #include "actions.hpp"
 #include "aida.hpp"
