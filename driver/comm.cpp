@@ -3382,6 +3382,61 @@ bool voyager::device_t::kernel_anti_dump_query(anti_dump_result& out) noexcept
     return true;
 }
 
+bool voyager::device_t::kernel_anti_dump_permit_pid(std::uint32_t pid) noexcept
+{
+    if (!is_connected() || pid == 0) return false;
+
+    detail::anti_dump_request req{};
+    req.operation = 10;
+    req.pid = pid;
+
+    if (!send_request(ioctl_codes::ADMP(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    return req.result == 1;
+}
+
+bool voyager::device_t::kernel_anti_dump_unpermit_pid(std::uint32_t pid) noexcept
+{
+    if (!is_connected() || pid == 0) return false;
+
+    detail::anti_dump_request req{};
+    req.operation = 11;
+    req.pid = pid;
+
+    if (!send_request(ioctl_codes::ADMP(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    return req.result == 1;
+}
+
+bool voyager::device_t::kernel_anti_dump_stop_continuous() noexcept
+{
+    if (!is_connected()) return false;
+
+    detail::anti_dump_request req{};
+    req.operation = 6;
+
+    if (!send_request(ioctl_codes::ADMP(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    return req.result == 1;
+}
+
+bool voyager::device_t::kernel_anti_dump_start_continuous(std::uint32_t pid) noexcept
+{
+    if (!is_connected() || pid == 0) return false;
+
+    detail::anti_dump_request req{};
+    req.operation = 5;
+    req.pid = pid;
+
+    if (!send_request(ioctl_codes::ADMP(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    return req.result == 1;
+}
+
 bool voyager::device_t::relay_server_token(std::uint32_t token_hash, std::uint64_t server_nonce) noexcept
 {
     if (!is_connected()) return false;

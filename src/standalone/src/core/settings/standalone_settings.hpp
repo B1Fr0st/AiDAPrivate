@@ -429,6 +429,8 @@ struct settings_sa_t
     bool        symbol_auto_download = false;
     std::string symbol_server_url = "https://msdl.microsoft.com/download/symbols";
 
+    std::string ida_pro_path;
+
     static std::filesystem::path config_path()
     {
         wchar_t* appdata = nullptr;
@@ -1179,6 +1181,7 @@ struct settings_sa_t
         str("symbol_cache_dir", symbol_cache_dir);
         boolean("symbol_auto_download", symbol_auto_download);
         str("symbol_server_url", symbol_server_url);
+        str("ida_pro_path", ida_pro_path);
 
         if (root.contains("temperature") && root["temperature"].is_number())
             temperature = root["temperature"].get<double>();
@@ -1436,6 +1439,7 @@ struct settings_sa_t
         root["symbol_cache_dir"] = symbol_cache_dir;
         root["symbol_auto_download"] = symbol_auto_download;
         root["symbol_server_url"] = symbol_server_url;
+        root["ida_pro_path"] = ida_pro_path;
 
         root["temperature"] = temperature;
         root["mcp_port"] = mcp_port;

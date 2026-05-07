@@ -291,6 +291,10 @@ namespace process_guard {
                 ULONG cleared = anti_dma_canary::cleanup_for_pid(dying_pid);
                 continuous_anti_debug::stop_if_target(dying_pid);
                 continuous_anti_dump::stop_if_target(dying_pid);
+                if (anti_dump_kernel::remove_permitted_pid(dying_pid)) {
+                    WW_LOG("create_process_notify: pid=%u exited, evicted from permitted_pids list",
+                        dying_pid);
+                }
                 HANDLE registered = caller_validation::g_registered_client_pid;
                 if (registered &&
                     reinterpret_cast<UINT64>(registered) == static_cast<UINT64>(dying_pid)) {

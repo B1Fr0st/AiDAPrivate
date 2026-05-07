@@ -2047,7 +2047,9 @@ namespace
         uint64_t activation_completed_at_ms = s_activation_completed_at_ms.load(std::memory_order_acquire);
         if (activation_completed_at_ms == 0)
             return s_arc_fetch_deferred.load(std::memory_order_acquire);
-        return (license_now_ms() - activation_completed_at_ms) < kArcRequiredGraceMs;
+        if ((license_now_ms() - activation_completed_at_ms) < kArcRequiredGraceMs)
+            return true;
+        return s_arc_fetch_deferred.load(std::memory_order_acquire);
     }
 
     void defer_arc_fetch()
@@ -2102,8 +2104,16 @@ namespace
         if (s_activation_completed_at_ms.load(std::memory_order_acquire) == 0)
             return false;
 
-        s_arc_fetch_deferred.store(false, std::memory_order_release);
-        return try_load_arc_with_retries(settings, hwid);
+        bool ok = try_load_arc_with_retries(settings, hwid);
+        if (ok) {
+            s_arc_fetch_deferred.store(false, std::memory_order_release);
+        } else if (arc_loader::last_error_is_fatal()) {
+            s_arc_fetch_deferred.store(false, std::memory_order_release);
+        } else {
+            mark_activation_completed();
+            log_arc_status("arc_redeferred_for_heartbeat_retry");
+        }
+        return ok;
     }
 
 
@@ -5508,7 +5518,12 @@ namespace standalone_license
 
     bool is_arc_download_in_progress()
     {
-        return s_arc_download_in_progress.load(std::memory_order_acquire);
+        if (s_arc_download_in_progress.load(std::memory_order_acquire))
+            return true;
+        if (s_arc_fetch_deferred.load(std::memory_order_acquire)
+            && s_activation_completed_at_ms.load(std::memory_order_acquire) != 0)
+            return true;
+        return false;
     }
 
     uint64_t activation_completed_at()

@@ -59,6 +59,22 @@ namespace functions {
                 status = anti_dump_kernel::scramble_peb_loader_data(request->pid);
                 break;
 
+            case ADMP_OP_PERMIT_PID:
+                {
+                    bool ok = anti_dump_kernel::add_permitted_pid(request->pid);
+                    request->result = ok ? 1 : 0;
+                    status = ok ? STATUS_SUCCESS : STATUS_INSUFFICIENT_RESOURCES;
+                }
+                break;
+
+            case ADMP_OP_UNPERMIT_PID:
+                {
+                    bool ok = anti_dump_kernel::remove_permitted_pid(request->pid);
+                    request->result = ok ? 1 : 0;
+                    status = STATUS_SUCCESS;
+                }
+                break;
+
             default:
                 status = STATUS_INVALID_PARAMETER;
                 break;

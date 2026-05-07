@@ -945,6 +945,8 @@ static_assert(sizeof(server_token_relay) == 32, "server_token_relay size must be
 #define ADMP_OP_SCAN_KILL         7
 #define ADMP_OP_CORRUPT_SECTIONS  8
 #define ADMP_OP_SCRAMBLE_PEB      9
+#define ADMP_OP_PERMIT_PID       10
+#define ADMP_OP_UNPERMIT_PID     11
 
 typedef struct _ADMP {
     UINT32 operation;

@@ -1,10 +1,17 @@
 """
-AES-256-GCM encrypt the raw WindMapper.exe bytes exported by HxD
-(WindMapper.c) into src/windmapper_data.inc + src/windmapper_embedded.h
-for embedding in AiDAStandalone / AiDA.dll.
+AES-256-GCM encrypt the raw WindMapper.exe bytes into
+src/windmapper_data.inc + src/windmapper_embedded.h for embedding in
+AiDAStandalone / AiDA.dll.
 
 Usage:
     python src/encrypt_windmapper.py
+    python src/encrypt_windmapper.py --from-binary path/to/WindMapper.exe
+
+Without --from-binary the script reads the legacy WindMapper.c hex dump at
+the project root. With --from-binary the binary is read directly, the
+legacy WindMapper.c hex dump is regenerated in HxD-compatible format (so
+diffs and manual inspection still work), and then encryption proceeds.
+This lets CMake skip the manual HxD export step.
 
 Each invocation generates a fresh random 256-bit key and 96-bit nonce; the
 key, nonce, GCM tag, and ciphertext length are written into
@@ -14,6 +21,8 @@ initializer does not bloat the wrapping header). driver_loader.cpp reads
 the key from the generated header at runtime, so keys are NEVER duplicated
 between this script and the C++ loader.
 """
+import argparse
+import datetime
 import os
 import re
 import sys
@@ -25,6 +34,7 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 INPUT_PATH = os.path.join(PROJECT_ROOT, "WindMapper.c")
 INC_PATH = os.path.join(SCRIPT_DIR, "windmapper_data.inc")
 HEADER_PATH = os.path.join(SCRIPT_DIR, "windmapper_embedded.h")
+HEX_VAR_NAME = "rawData"
 
 KEY_BYTES = 32
 NONCE_BYTES = 12
@@ -58,20 +68,73 @@ def _format_inc_lines(data: bytes) -> list:
     return out
 
 
+def _regenerate_hex_dump(binary_path: str, hex_path: str, raw_bytes: bytes) -> None:
+    total = len(raw_bytes)
+    end_offset = max(total - 1, 0)
+    fmt = "%#m/%#d/%Y %#I:%M:%S %p" if os.name == "nt" else "%-m/%-d/%Y %-I:%M:%S %p"
+    timestamp = datetime.datetime.now().strftime(fmt)
+    lines = []
+    lines.append(f"/* {binary_path} ({timestamp})\n")
+    lines.append(
+        f"   StartOffset(h): 00000000, EndOffset(h): {end_offset:08X}, "
+        f"Length(h): {total:08X} */\n"
+    )
+    lines.append("\n")
+    lines.append(f"unsigned char {HEX_VAR_NAME}[{total}] = {{\n")
+    for i in range(0, total, BYTES_PER_LINE):
+        chunk = raw_bytes[i:i + BYTES_PER_LINE]
+        hex_strs = [f"0x{b:02X}" for b in chunk]
+        line = "\t" + ", ".join(hex_strs)
+        if i + BYTES_PER_LINE < total:
+            line += ","
+        lines.append(line + "\n")
+    lines.append("};\n")
+    with open(hex_path, "w", newline="\n") as f:
+        f.writelines(lines)
+
+
 def main():
-    if not os.path.isfile(INPUT_PATH):
-        print(f"[!] Input file not found: {INPUT_PATH}")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Encrypt WindMapper.exe for embedding.")
+    parser.add_argument(
+        "--from-binary",
+        dest="from_binary",
+        default=None,
+        help="Path to the built WindMapper.exe; bypasses the WindMapper.c hex dump and "
+             "regenerates it from the binary before encrypting.",
+    )
+    args = parser.parse_args()
 
-    with open(INPUT_PATH, "r") as f:
-        content = f.read()
+    if args.from_binary and os.path.isfile(args.from_binary):
+        binary_path = os.path.abspath(args.from_binary)
+        with open(binary_path, "rb") as f:
+            raw_bytes = f.read()
+        print(f"[*] Read {len(raw_bytes)} bytes from {binary_path}")
+        _regenerate_hex_dump(binary_path, INPUT_PATH, raw_bytes)
+        print(f"[+] Regenerated hex dump at {INPUT_PATH}")
+    elif args.from_binary:
+        print(f"[!] --from-binary path not found: {args.from_binary}")
+        print(f"[*] Falling back to existing hex dump: {INPUT_PATH}")
+        if not os.path.isfile(INPUT_PATH):
+            print(f"[!] Hex dump not found either: {INPUT_PATH}")
+            sys.exit(1)
+        with open(INPUT_PATH, "r") as f:
+            content = f.read()
+        hex_pattern = re.compile(r"0x([0-9A-Fa-f]{2})")
+        matches = hex_pattern.findall(content)
+        raw_bytes = bytes(int(m, 16) for m in matches)
+    else:
+        if not os.path.isfile(INPUT_PATH):
+            print(f"[!] Input file not found: {INPUT_PATH}")
+            sys.exit(1)
+        with open(INPUT_PATH, "r") as f:
+            content = f.read()
+        hex_pattern = re.compile(r"0x([0-9A-Fa-f]{2})")
+        matches = hex_pattern.findall(content)
+        raw_bytes = bytes(int(m, 16) for m in matches)
 
-    hex_pattern = re.compile(r"0x([0-9A-Fa-f]{2})")
-    matches = hex_pattern.findall(content)
-    raw_bytes = bytes(int(m, 16) for m in matches)
     total = len(raw_bytes)
 
-    print(f"[*] Parsed {total} bytes from {INPUT_PATH}")
+    print(f"[*] Parsed {total} bytes for encryption")
     if total < 2:
         print("[!] Input too small to be a PE.")
         sys.exit(1)

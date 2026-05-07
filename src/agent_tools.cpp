@@ -3,6 +3,8 @@
 #include "graphrag.hpp"
 #include "analysis_db.hpp"
 #include "anti_re.hpp"
+#include "vuln/vuln_tools.hpp"
+#include "vuln/verification_tools.hpp"
 #include <allins.hpp>
 #include <iomanip>
 #include <loader.hpp>
@@ -8497,6 +8499,9 @@ void initialize_all_tools()
     analysis_tools::register_tools();
     deobfuscation_tools::register_tools();
     graphrag_tools::register_tools();
+    vuln_tools::register_tools();
+    vuln_tools::register_advanced_tools();
+    aida::vuln::verify::tools::register_verification_tools();
 
     ToolRegistry::instance().register_tool({
         OBFSTR("list_all_available_tools"), OBFSTR("meta"),
@@ -8506,7 +8511,7 @@ void initialize_all_tools()
         {
             {OBFSTR("category"), OBFSTR("string"),
              OBFSTR("Optional: filter by category (function, memory, comment, type, ") +
-               OBFSTR("import, search, segment, binary, python, navigation, analysis, deobfuscation, graphrag, meta)"),
+               OBFSTR("import, search, segment, binary, python, navigation, analysis, deobfuscation, graphrag, vuln, vuln_advanced, vuln_verify, meta)"),
              false}
         },
         [](const json& params) -> tool_result_t {

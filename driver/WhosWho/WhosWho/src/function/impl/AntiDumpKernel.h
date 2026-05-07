@@ -10,6 +10,51 @@ namespace anti_dump_kernel {
     inline volatile LONG g_initialized = 0;
     inline volatile UINT64 g_blocks_count = 0;
 
+    inline volatile LONG g_permitted_pids[8] = {};
+
+    inline bool is_permitted_pid(UINT32 pid)
+    {
+        if (pid == 0) return false;
+        for (int i = 0; i < 8; ++i) {
+            if ((UINT32)_InterlockedCompareExchange(
+                    const_cast<volatile LONG*>(&g_permitted_pids[i]), 0, 0) == pid)
+                return true;
+        }
+        return false;
+    }
+
+    inline bool add_permitted_pid(UINT32 pid)
+    {
+        if (pid == 0) return false;
+        for (int i = 0; i < 8; ++i) {
+            if ((UINT32)_InterlockedCompareExchange(
+                    const_cast<volatile LONG*>(&g_permitted_pids[i]), 0, 0) == pid)
+                return true;
+        }
+        for (int i = 0; i < 8; ++i) {
+            if (_InterlockedCompareExchange(
+                    const_cast<volatile LONG*>(&g_permitted_pids[i]),
+                    (LONG)pid, 0) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    inline bool remove_permitted_pid(UINT32 pid)
+    {
+        if (pid == 0) return false;
+        bool removed = false;
+        for (int i = 0; i < 8; ++i) {
+            if (_InterlockedCompareExchange(
+                    const_cast<volatile LONG*>(&g_permitted_pids[i]),
+                    0, (LONG)pid) == (LONG)pid) {
+                removed = true;
+            }
+        }
+        return removed;
+    }
+
     static OB_PREOP_CALLBACK_STATUS handle_pre_open(
         PVOID RegistrationContext,
         POB_PRE_OPERATION_INFORMATION OperationInfo)
@@ -372,6 +417,12 @@ namespace anti_dump_kernel {
                         if (a != b) { match = false; break; }
                     }
                     if (match) {
+                        UINT32 pid_u32 = (UINT32)(ULONG_PTR)proc_pid;
+                        if (is_permitted_pid(pid_u32)) {
+                            WW_LOG("anti_dump: skipped kill for permitted pid=%u name=%.15s",
+                                pid_u32, name);
+                            break;
+                        }
                         if (_ZwOpenProcess && _ZwTerminateProcess && _ZwClose) {
                             OBJECT_ATTRIBUTES oa;
                             InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
@@ -382,7 +433,7 @@ namespace anti_dump_kernel {
                                 _ZwTerminateProcess(hProc, STATUS_ACCESS_DENIED);
                                 _ZwClose(hProc);
                                 WW_LOG("anti_dump: killed dump tool pid=%u name=%.15s",
-                                    (UINT32)(ULONG_PTR)proc_pid, name);
+                                    pid_u32, name);
                             }
                         }
                         InterlockedIncrement64((volatile LONG64*)&g_blocks_count);

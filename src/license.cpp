@@ -1,5 +1,6 @@
 #include "aida_pro.hpp"
 #include "anti_re.hpp"
+#include "aida_manual_map_proof.hpp"
 
 #ifdef __NT__
 #include "driver_loader.hpp"
@@ -873,8 +874,105 @@ bool license_manager_t::firebase_refresh_token_if_needed()
     }
 }
 
+extern "C" volatile uint64_t aida_manual_map_marker;
+extern "C" volatile uint8_t  aida_proof_buffer[aida_manual_map::kProofBufferLen];
+
+namespace
+{
+    bool snapshot_manual_map_proof(aida_manual_map::proof_buffer_t& out_proof)
+    {
+        if (aida_manual_map_marker != aida_manual_map::kMarkerValue)
+            return false;
+        aida_manual_map::proof_buffer_t snap{};
+        uint8_t* dst = reinterpret_cast<uint8_t*>(&snap);
+        for (size_t i = 0; i < sizeof(snap); ++i)
+            dst[i] = aida_proof_buffer[i];
+        if (snap.magic != aida_manual_map::kProofMagic)
+            return false;
+        if (snap.version != aida_manual_map::kProofVersion)
+            return false;
+        if (snap.parent_pid == 0 || snap.ida_pid == 0)
+            return false;
+        if (snap.runtime_nonce_seed == 0)
+            return false;
+        out_proof = snap;
+        return true;
+    }
+}
+
+bool license_manager_t::accept_manual_map_proof()
+{
+    aida_manual_map::proof_buffer_t proof{};
+    if (!snapshot_manual_map_proof(proof))
+        return false;
+
+    invalidate_runtime();
+
+    uint64_t canary = 0;
+    {
+        unsigned char canary_buf[8];
+        if (RAND_bytes(canary_buf, sizeof(canary_buf)) == 1)
+            std::memcpy(&canary, canary_buf, sizeof(canary));
+        if (canary == 0)
+            canary = 0xB3A7C9D1E5F02468ULL;
+    }
+
+    uint64_t nonce = proof.runtime_nonce_seed;
+    nonce ^= proof.parent_pid * 1099511628211ULL;
+    nonce ^= proof.timestamp_unix * 0x100000001B3ULL;
+    nonce *= 1099511628211ULL;
+    if (nonce == 0)
+        nonce = 0xA1DAA1DAA1DAA1DAULL;
+    if (nonce == 0xFFFFFFFFFFFFFFFFULL || nonce == 0xDEADBEEFCAFEBABEULL)
+        nonce ^= 0xC0FFEE42DEADBEEFULL;
+
+    m_nonce_canary.store(canary, std::memory_order_release);
+    m_runtime_nonce.store(nonce ^ canary, std::memory_order_release);
+    m_integrity_seed.store((nonce ^ 0xA5A5A5A5A5A5A5A5ULL) * 0x5851F42D4C957F2DULL,
+                            std::memory_order_release);
+
+    std::ostringstream sig_stream;
+    sig_stream << "manualmap|"
+               << std::hex << std::setfill('0')
+               << std::setw(16) << proof.parent_pid
+               << '|' << std::setw(16) << proof.ida_pid
+               << '|' << std::setw(16) << proof.timestamp_unix
+               << '|' << std::setw(16) << proof.plan_id_hash;
+    std::string synthetic_sig = sig_stream.str();
+    m_verified_signature = synthetic_sig;
+    m_server_signature = synthetic_sig;
+    m_sig_binding_tag.store(derive_sig_binding_tag(synthetic_sig, nonce),
+                             std::memory_order_release);
+
+    m_ai_session_key.assign(reinterpret_cast<const char*>(proof.ai_session_key),
+                             aida_manual_map::kAiSessionKeyLen);
+    uint64_t epoch = proof.feature_epoch;
+    if (epoch == 0)
+        epoch = static_cast<uint64_t>(proof.timestamp_unix);
+    if (epoch == 0)
+        epoch = 1;
+    m_feature_epoch.store(epoch, std::memory_order_release);
+
+    size_t plan_len = 0;
+    while (plan_len < aida_manual_map::kProofPlanLen && proof.plan[plan_len] != '\0')
+        ++plan_len;
+    m_plan.assign(proof.plan, plan_len);
+    if (m_plan.empty())
+        m_plan = "standalone";
+
+    m_server_issued_at = static_cast<int64_t>(proof.timestamp_unix);
+    m_server_ttl = 3600;
+    m_bound_hwid = generate_hwid();
+    m_online_validated_this_session.store(true, std::memory_order_release);
+    m_valid.store(true, std::memory_order_release);
+    return true;
+}
+
 bool license_manager_t::validate()
 {
+    if (accept_manual_map_proof())
+        return true;
+
     invalidate_runtime();
 
 #ifdef __NT__

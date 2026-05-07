@@ -1516,6 +1516,10 @@ namespace voyager {
         bool kernel_anti_dump_hide_threads(std::uint32_t pid) noexcept;
         bool kernel_anti_dump_erase_headers(std::uint32_t pid) noexcept;
         bool kernel_anti_dump_query(anti_dump_result& out) noexcept;
+        bool kernel_anti_dump_permit_pid(std::uint32_t pid) noexcept;
+        bool kernel_anti_dump_unpermit_pid(std::uint32_t pid) noexcept;
+        bool kernel_anti_dump_stop_continuous() noexcept;
+        bool kernel_anti_dump_start_continuous(std::uint32_t pid) noexcept;
 
         bool relay_server_token(std::uint32_t token_hash, std::uint64_t server_nonce) noexcept;
         bool relay_server_token_v2(std::uint32_t token_hash, std::uint64_t server_nonce, std::uint64_t* out_driver_proof = nullptr) noexcept;

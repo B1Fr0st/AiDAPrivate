@@ -2167,6 +2167,50 @@ namespace driver_bridge
         return true;
     }
 
+    bool kernel_anti_dump_permit_pid(uint32_t pid)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+        return device->kernel_anti_dump_permit_pid(pid);
+    }
+
+    bool kernel_anti_dump_unpermit_pid(uint32_t pid)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+        return device->kernel_anti_dump_unpermit_pid(pid);
+    }
+
+    bool kernel_anti_dump_stop_continuous()
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+        return device->kernel_anti_dump_stop_continuous();
+    }
+
+    bool kernel_anti_dump_start_continuous(uint32_t pid)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+        return device->kernel_anti_dump_start_continuous(pid);
+    }
+
     bool relay_server_token(uint32_t token_hash, uint64_t server_nonce)
     {
         bool kernel_mode = false;

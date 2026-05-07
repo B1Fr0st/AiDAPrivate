@@ -25,6 +25,8 @@
 #include <atomic>
 #include <fstream>
 
+#include <dbg.hpp>
+
 #include "driver_loader.hpp"
 #include "../driver/comm.h"
 #include "license.hpp"

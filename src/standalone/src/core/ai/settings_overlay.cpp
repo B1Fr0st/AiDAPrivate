@@ -33,6 +33,10 @@
 #include "toast_notification.hpp"
 
 #include "../helpers/globals.h"
+#include "../helpers/helpers.h"
+#include "../helpers/diag_log.hpp"
+#include "../runtime/ida_injector.hpp"
+#include "work_queue.hpp"
 
 
 extern settings_sa_t g_sa_settings;
@@ -688,6 +692,166 @@ namespace settings_overlay {
 		}
 
 
+		inline std::mutex& ida_status_mutex()
+		{
+			static std::mutex m;
+			return m;
+		}
+
+		inline std::string& ida_status_string()
+		{
+			static std::string s;
+			return s;
+		}
+
+		inline std::atomic<bool>& ida_busy_flag()
+		{
+			static std::atomic<bool> b{false};
+			return b;
+		}
+
+		inline void set_ida_status(const std::string& s)
+		{
+			std::lock_guard<std::mutex> lk(ida_status_mutex());
+			ida_status_string() = s;
+		}
+
+		inline std::string snapshot_ida_status()
+		{
+			std::lock_guard<std::mutex> lk(ida_status_mutex());
+			return ida_status_string();
+		}
+
+		inline void render_tab_ida_pro(float content_w, float content_h)
+		{
+			(void)content_h;
+			static char s_path_buf[1024] = {};
+			static bool s_path_loaded = false;
+
+			if (!s_path_loaded)
+			{
+				std::snprintf(s_path_buf, sizeof(s_path_buf), "%s",
+					g_sa_settings.ida_pro_path.c_str());
+				s_path_loaded = true;
+			}
+
+			ImGui::PushID("##ida_pro_tab");
+			ImGui::TextColored(ImVec4(0.78f, 0.80f, 0.88f, 1.f), "IDA Pro Integration");
+			ImGui::Separator();
+			ImGui::TextWrapped("Press Launch to open a fresh IDA instance and manual-map "
+				"the AiDA plugin into it. The AiDA plugin DLL is never written to disk.");
+			ImGui::Spacing();
+
+			ImGui::Text("IDA executable path");
+			ImGui::SetNextItemWidth(content_w - 110.f);
+			if (ImGui::InputText("##ida_pro_path", s_path_buf, sizeof(s_path_buf)))
+			{
+				g_sa_settings.ida_pro_path = s_path_buf;
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Browse...##ida_browse", ImVec2(96.f, 0.f)))
+			{
+				std::string picked;
+				if (ida_injector::prompt_and_persist_ida_path(::g_hwnd, picked))
+				{
+					std::snprintf(s_path_buf, sizeof(s_path_buf), "%s", picked.c_str());
+					set_ida_status("Saved IDA path: " + picked);
+				}
+			}
+
+			if (ImGui::Button("Save##ida_save", ImVec2(96.f, 26.f)))
+			{
+				g_sa_settings.ida_pro_path = s_path_buf;
+				if (g_sa_settings.save())
+					set_ida_status("Saved.");
+				else
+					set_ida_status("Failed to write settings file.");
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Auto-detect##ida_detect", ImVec2(120.f, 26.f)))
+			{
+				std::string discovered = ida_injector::discover_ida_path();
+				if (!discovered.empty())
+				{
+					std::snprintf(s_path_buf, sizeof(s_path_buf), "%s", discovered.c_str());
+					g_sa_settings.ida_pro_path = discovered;
+					g_sa_settings.save();
+					set_ida_status("Auto-detected: " + discovered);
+				}
+				else
+				{
+					set_ida_status("No IDA installation found via registry or Program Files.");
+				}
+			}
+
+			ImGui::Spacing();
+			ImGui::Separator();
+			ImGui::Spacing();
+
+			bool busy = ida_busy_flag().load(std::memory_order_acquire);
+			bool can_launch = !busy && ida_injector::validate_ida_path(g_sa_settings.ida_pro_path);
+			if (!can_launch)
+				ImGui::BeginDisabled();
+			if (ImGui::Button("Launch IDA Pro with AiDA", ImVec2(220.f, 32.f)))
+			{
+				::diag::log_tagged_critical("ida_launch", "click_received");
+				ida_busy_flag().store(true, std::memory_order_release);
+				std::filesystem::path ida_p(g_sa_settings.ida_pro_path);
+				std::string ida_name = ida_p.filename().string();
+				if (ida_name.empty()) ida_name = "IDA";
+				::diag::log_tagged_fmt("ida_launch", "configured_ida_path=%s", g_sa_settings.ida_pro_path.c_str());
+				set_ida_status(std::string("Launching ") + ida_name
+					+ " and manual-mapping AiDA...");
+				::diag::log_tagged("ida_launch", "posting_to_work_queue");
+				work_queue::post([ida_name]{
+					::diag::log_tagged_critical_fmt("ida_launch", "lambda_enter tid=%lu", GetCurrentThreadId());
+					struct busy_guard_t {
+						~busy_guard_t() {
+							ida_busy_flag().store(false, std::memory_order_release);
+							::diag::log_tagged_critical("ida_launch", "busy_guard_cleared");
+						}
+					} guard;
+					std::string err;
+					bool ok = false;
+					::diag::log_tagged("ida_launch", "calling_launch_ida_with_aida");
+					try {
+						ok = ida_injector::launch_ida_with_aida(std::string(), err);
+					} catch (const std::exception& ex) {
+						ok = false;
+						err = std::string("internal exception: ") + ex.what();
+					} catch (...) {
+						ok = false;
+						err = "unknown internal exception";
+					}
+					::diag::log_tagged_critical_fmt("ida_launch", "launch_ida_with_aida_returned ok=%d err=%s",
+						ok ? 1 : 0,
+						err.empty() ? "(none)" : err.c_str());
+					if (ok)
+						set_ida_status("AiDA mapped into " + ida_name + " successfully.");
+					else
+						set_ida_status(std::string("Launch failed: ") + (err.empty() ? "(no detail)" : err));
+				});
+				::diag::log_tagged("ida_launch", "post_returned");
+			}
+			if (!can_launch)
+				ImGui::EndDisabled();
+
+			if (busy)
+			{
+				ImGui::SameLine();
+				ImGui::TextColored(ImVec4(0.85f, 0.75f, 0.40f, 1.f), "Working...");
+			}
+
+			std::string status_snap = snapshot_ida_status();
+			if (!status_snap.empty())
+			{
+				ImGui::Spacing();
+				ImGui::TextWrapped("%s", status_snap.c_str());
+			}
+
+			ImGui::PopID();
+		}
+
 		inline void render_tab_editor_theme(float content_w, float content_h)
 		{
 			(void)content_w; (void)content_h;
@@ -873,10 +1037,11 @@ namespace settings_overlay {
 				"MCP Servers",
 				"Permissions",
 				"Compaction",
-				"Editor"
+				"Editor",
+				"IDA Pro"
 			};
 			static const char* tab_glyphs[tab_count] = {
-				"@", "P", "A", "S", "M", "L", "C", "E"
+				"@", "P", "A", "S", "M", "L", "C", "E", "I"
 			};
 
 			ImGui::Dummy(ImVec2(0, 4));
@@ -906,6 +1071,7 @@ namespace settings_overlay {
 			case tab_permissions:     detail::render_tab_permissions(content_w, content_h); break;
 			case tab_compaction_cost: detail::render_tab_compaction_cost(content_w, content_h); break;
 			case tab_editor_theme:    detail::render_tab_editor_theme(content_w, content_h); break;
+			case tab_ida_pro:         detail::render_tab_ida_pro(content_w, content_h); break;
 			default:                  detail::render_tab_accounts(content_w, content_h); break;
 			}
 			ImGui::PopClipRect();

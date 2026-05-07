@@ -2,6 +2,7 @@
 #include "instance_registry.hpp"
 #include "ida_utils.hpp"
 
+#include <prodir.h>
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
 

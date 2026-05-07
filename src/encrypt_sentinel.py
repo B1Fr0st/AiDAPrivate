@@ -1,15 +1,24 @@
 """
-AES-256-GCM encrypt the raw Sentinel.sys bytes exported by HxD (Sentinel.c)
-into src/sentinel_encrypted.h for embedding in AiDAStandalone / AiDA.dll.
+AES-256-GCM encrypt the raw Sentinel.sys bytes into src/sentinel_encrypted.h
+for embedding in AiDAStandalone / AiDA.dll.
 
 Usage:
     python src/encrypt_sentinel.py
+    python src/encrypt_sentinel.py --from-binary path/to/Sentinel.sys
+
+Without --from-binary the script reads the legacy Sentinel.c hex dump at
+the project root. With --from-binary the binary is read directly, the
+legacy Sentinel.c hex dump is regenerated in HxD-compatible format (so
+diffs and manual inspection still work), and then encryption proceeds.
+This lets CMake skip the manual HxD export step.
 
 Each invocation generates a fresh random 256-bit key and 96-bit nonce; the
 key, nonce, GCM tag, and ciphertext are all emitted into the generated
 header. driver_loader.cpp reads the key from this header at runtime, so
 keys are NEVER duplicated between this script and the C++ loader.
 """
+import argparse
+import datetime
 import os
 import re
 import sys
@@ -20,6 +29,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 INPUT_PATH = os.path.join(PROJECT_ROOT, "Sentinel.c")
 OUTPUT_PATH = os.path.join(SCRIPT_DIR, "sentinel_encrypted.h")
+HEX_VAR_NAME = "rawData"
 
 KEY_BYTES = 32
 NONCE_BYTES = 12
@@ -41,20 +51,73 @@ def _format_byte_array(name: str, data: bytes) -> list:
     return out
 
 
+def _regenerate_hex_dump(binary_path: str, hex_path: str, raw_bytes: bytes) -> None:
+    total = len(raw_bytes)
+    end_offset = max(total - 1, 0)
+    fmt = "%#m/%#d/%Y %#I:%M:%S %p" if os.name == "nt" else "%-m/%-d/%Y %-I:%M:%S %p"
+    timestamp = datetime.datetime.now().strftime(fmt)
+    lines = []
+    lines.append(f"/* {binary_path} ({timestamp})\n")
+    lines.append(
+        f"   StartOffset(h): 00000000, EndOffset(h): {end_offset:08X}, "
+        f"Length(h): {total:08X} */\n"
+    )
+    lines.append("\n")
+    lines.append(f"unsigned char {HEX_VAR_NAME}[{total}] = {{\n")
+    for i in range(0, total, BYTES_PER_LINE):
+        chunk = raw_bytes[i:i + BYTES_PER_LINE]
+        hex_strs = [f"0x{b:02X}" for b in chunk]
+        line = "\t" + ", ".join(hex_strs)
+        if i + BYTES_PER_LINE < total:
+            line += ","
+        lines.append(line + "\n")
+    lines.append("};\n")
+    with open(hex_path, "w", newline="\n") as f:
+        f.writelines(lines)
+
+
 def main():
-    if not os.path.isfile(INPUT_PATH):
-        print(f"[!] Input file not found: {INPUT_PATH}")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Encrypt Sentinel.sys for embedding.")
+    parser.add_argument(
+        "--from-binary",
+        dest="from_binary",
+        default=None,
+        help="Path to the built Sentinel.sys; bypasses the Sentinel.c hex dump and "
+             "regenerates it from the binary before encrypting.",
+    )
+    args = parser.parse_args()
 
-    with open(INPUT_PATH, "r") as f:
-        content = f.read()
+    if args.from_binary and os.path.isfile(args.from_binary):
+        binary_path = os.path.abspath(args.from_binary)
+        with open(binary_path, "rb") as f:
+            raw_bytes = f.read()
+        print(f"[*] Read {len(raw_bytes)} bytes from {binary_path}")
+        _regenerate_hex_dump(binary_path, INPUT_PATH, raw_bytes)
+        print(f"[+] Regenerated hex dump at {INPUT_PATH}")
+    elif args.from_binary:
+        print(f"[!] --from-binary path not found: {args.from_binary}")
+        print(f"[*] Falling back to existing hex dump: {INPUT_PATH}")
+        if not os.path.isfile(INPUT_PATH):
+            print(f"[!] Hex dump not found either: {INPUT_PATH}")
+            sys.exit(1)
+        with open(INPUT_PATH, "r") as f:
+            content = f.read()
+        hex_pattern = re.compile(r"0x([0-9A-Fa-f]{2})")
+        matches = hex_pattern.findall(content)
+        raw_bytes = bytes(int(m, 16) for m in matches)
+    else:
+        if not os.path.isfile(INPUT_PATH):
+            print(f"[!] Input file not found: {INPUT_PATH}")
+            sys.exit(1)
+        with open(INPUT_PATH, "r") as f:
+            content = f.read()
+        hex_pattern = re.compile(r"0x([0-9A-Fa-f]{2})")
+        matches = hex_pattern.findall(content)
+        raw_bytes = bytes(int(m, 16) for m in matches)
 
-    hex_pattern = re.compile(r"0x([0-9A-Fa-f]{2})")
-    matches = hex_pattern.findall(content)
-    raw_bytes = bytes(int(m, 16) for m in matches)
     total = len(raw_bytes)
 
-    print(f"[*] Parsed {total} bytes from {INPUT_PATH}")
+    print(f"[*] Parsed {total} bytes for encryption")
     if total < 2:
         print("[!] Input too small to be a PE.")
         sys.exit(1)

@@ -431,6 +431,10 @@ namespace driver_bridge
         uint64_t blocks_count;
     };
     bool kernel_anti_dump_query(anti_dump_result_t& out);
+    bool kernel_anti_dump_permit_pid(uint32_t pid);
+    bool kernel_anti_dump_unpermit_pid(uint32_t pid);
+    bool kernel_anti_dump_stop_continuous();
+    bool kernel_anti_dump_start_continuous(uint32_t pid);
 
     bool relay_server_token(uint32_t token_hash, uint64_t server_nonce);
     bool relay_server_token_v2(uint32_t token_hash, uint64_t server_nonce, uint64_t* out_driver_proof = nullptr);

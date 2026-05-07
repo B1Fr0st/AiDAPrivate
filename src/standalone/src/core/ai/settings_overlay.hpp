@@ -17,7 +17,8 @@ namespace settings_overlay {
 		tab_permissions       = 5,
 		tab_compaction_cost   = 6,
 		tab_editor_theme      = 7,
-		tab_count             = 8
+		tab_ida_pro           = 8,
+		tab_count             = 9
 	};
 
 

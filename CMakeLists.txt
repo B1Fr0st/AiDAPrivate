@@ -676,54 +676,103 @@ add_custom_target(ghidra_specs ALL DEPENDS
 )
 
 # --- Auto-encrypt embedded driver/mapper byte arrays ---
-# When WhosWho.c, Sentinel.c, or WindMapper.c change, the corresponding
-# encrypted headers are regenerated so driver_loader.cpp picks up the new bytes.
+# When the built drivers/mapper change (WhosWho.sys, Sentinel.sys,
+# WindMapper.exe) -- or, as a fallback, when the legacy hex dumps
+# WhosWho.c / Sentinel.c / WindMapper.c change -- the corresponding
+# encrypted headers are regenerated so driver_loader.cpp picks up the
+# new bytes. The encrypt_*.py scripts now accept --from-binary, which
+# regenerates the legacy .c hex dump from the binary directly so the
+# manual HxD round-trip is no longer required.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_FOUND)
-    # WhosWho.c  ->  src/whoswho_encrypted.h
-    add_custom_command(
-        OUTPUT "${CMAKE_BINARY_DIR}/whoswho_encrypted.stamp"
-        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_whoswho.py"
-        COMMAND ${CMAKE_COMMAND} -E touch "${CMAKE_BINARY_DIR}/whoswho_encrypted.stamp"
-        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/WhosWho.c"
-                "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_whoswho.py"
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        COMMENT "Encrypting WhosWho.c -> whoswho_encrypted.h"
-        VERBATIM
-    )
+    # The driver/mapper .vcxproj files hardcode <OutDir> to
+    # ${CMAKE_SOURCE_DIR}/build-ninja/Release/, so the built binaries
+    # land at a fixed location independent of CMAKE_BINARY_DIR. Expose
+    # as cache vars so users with custom .vcxproj OutDirs can override.
+    set(AIDA_DRIVER_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/build-ninja/Release"
+        CACHE PATH "Directory where WhosWho.sln / Sentinel.sln / WindMapper.sln deposit their build outputs")
+    set(WHOSWHO_BINARY    "${AIDA_DRIVER_OUTPUT_DIR}/WhosWho.sys"
+        CACHE FILEPATH "Path to the built WhosWho.sys")
+    set(SENTINEL_BINARY   "${AIDA_DRIVER_OUTPUT_DIR}/Sentinel.sys"
+        CACHE FILEPATH "Path to the built Sentinel.sys")
+    set(WINDMAPPER_BINARY "${AIDA_DRIVER_OUTPUT_DIR}/WindMapper.exe"
+        CACHE FILEPATH "Path to the built WindMapper.exe")
 
-    # Sentinel.c  ->  src/sentinel_encrypted.h
-    add_custom_command(
-        OUTPUT "${CMAKE_BINARY_DIR}/sentinel_encrypted.stamp"
-        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_sentinel.py"
-        COMMAND ${CMAKE_COMMAND} -E touch "${CMAKE_BINARY_DIR}/sentinel_encrypted.stamp"
-        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/Sentinel.c"
-                "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_sentinel.py"
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        COMMENT "Encrypting Sentinel.c -> sentinel_encrypted.h"
-        VERBATIM
-    )
+    set(WHOSWHO_HEX    "${CMAKE_CURRENT_SOURCE_DIR}/WhosWho.c")
+    set(SENTINEL_HEX   "${CMAKE_CURRENT_SOURCE_DIR}/Sentinel.c")
+    set(WINDMAPPER_HEX "${CMAKE_CURRENT_SOURCE_DIR}/WindMapper.c")
 
-    # WindMapper.c  ->  src/windmapper_data.inc + src/windmapper_embedded.h
-    add_custom_command(
-        OUTPUT "${CMAKE_BINARY_DIR}/windmapper_encrypted.stamp"
-        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_windmapper.py"
-        COMMAND ${CMAKE_COMMAND} -E touch "${CMAKE_BINARY_DIR}/windmapper_encrypted.stamp"
-        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/WindMapper.c"
-                "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_windmapper.py"
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        COMMENT "Encrypting WindMapper.c -> windmapper_data.inc"
-        VERBATIM
-    )
+    set(WHOSWHO_SCRIPT    "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_whoswho.py")
+    set(SENTINEL_SCRIPT   "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_sentinel.py")
+    set(WINDMAPPER_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_windmapper.py")
 
-    add_custom_target(encrypt_drivers DEPENDS
+    set(ENCRYPT_DRIVERS_STAMPS "")
+
+    # Per-driver rule generator: prefer the built binary; fall back to
+    # the legacy .c hex dump; if neither input exists, skip the rule
+    # entirely so Ninja does not error on phantom deps and the existing
+    # encrypted header in src/ stays authoritative.
+    function(_aida_emit_encrypt_rule short_name binary_path hex_path script_path stamp_path comment_text)
+        set(rule_deps "${script_path}")
+        set(rule_command_args "")
+        set(rule_input_label "")
+        if(EXISTS "${binary_path}")
+            list(APPEND rule_deps "${binary_path}")
+            set(rule_command_args --from-binary "${binary_path}")
+            set(rule_input_label "${binary_path}")
+        elseif(EXISTS "${hex_path}")
+            list(APPEND rule_deps "${hex_path}")
+            set(rule_command_args "")
+            set(rule_input_label "${hex_path}")
+        else()
+            message(STATUS "encrypt_drivers: ${short_name} -- neither ${binary_path} nor ${hex_path} found; "
+                           "skipping rule (existing encrypted header will be used as-is). "
+                           "Build the .sln (or restore the .c hex dump) and re-run cmake configure to enable.")
+            return()
+        endif()
+        message(STATUS "encrypt_drivers: ${short_name} <- ${rule_input_label}")
+        add_custom_command(
+            OUTPUT "${stamp_path}"
+            COMMAND ${Python3_EXECUTABLE} "${script_path}" ${rule_command_args}
+            COMMAND ${CMAKE_COMMAND} -E touch "${stamp_path}"
+            DEPENDS ${rule_deps}
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            COMMENT "${comment_text}"
+            VERBATIM
+        )
+        set(ENCRYPT_DRIVERS_STAMPS "${ENCRYPT_DRIVERS_STAMPS};${stamp_path}" PARENT_SCOPE)
+    endfunction()
+
+    _aida_emit_encrypt_rule("WhosWho"
+        "${WHOSWHO_BINARY}" "${WHOSWHO_HEX}" "${WHOSWHO_SCRIPT}"
         "${CMAKE_BINARY_DIR}/whoswho_encrypted.stamp"
+        "Encrypting WhosWho -> whoswho_encrypted.h")
+    _aida_emit_encrypt_rule("Sentinel"
+        "${SENTINEL_BINARY}" "${SENTINEL_HEX}" "${SENTINEL_SCRIPT}"
         "${CMAKE_BINARY_DIR}/sentinel_encrypted.stamp"
+        "Encrypting Sentinel -> sentinel_encrypted.h")
+    _aida_emit_encrypt_rule("WindMapper"
+        "${WINDMAPPER_BINARY}" "${WINDMAPPER_HEX}" "${WINDMAPPER_SCRIPT}"
         "${CMAKE_BINARY_DIR}/windmapper_encrypted.stamp"
-    )
+        "Encrypting WindMapper -> windmapper_data.inc")
+
+    if(ENCRYPT_DRIVERS_STAMPS)
+        add_custom_target(encrypt_drivers DEPENDS ${ENCRYPT_DRIVERS_STAMPS})
+        add_custom_target(reencrypt_drivers
+            COMMAND ${CMAKE_COMMAND} -E remove ${ENCRYPT_DRIVERS_STAMPS}
+            COMMAND ${CMAKE_COMMAND} --build "${CMAKE_BINARY_DIR}" --target encrypt_drivers
+            COMMENT "Force-regenerating encrypted driver/mapper headers from current binaries"
+            VERBATIM
+        )
+    else()
+        add_custom_target(encrypt_drivers
+            COMMAND ${CMAKE_COMMAND} -E echo
+                "encrypt_drivers: no inputs found (no .sys/.exe and no .c); using existing src/*_encrypted.h as-is."
+        )
+    endif()
 else()
     message(WARNING "Python3 not found -- encrypt_drivers target disabled. "
-                    "Re-run encrypt scripts manually after updating WhosWho.c / Sentinel.c / WindMapper.c.")
+                    "Re-run encrypt scripts manually after rebuilding WhosWho.sys / Sentinel.sys / WindMapper.exe.")
 endif()
 
 # Track the generated encrypted headers so MSVC recompiles driver_loader.cpp
@@ -1398,6 +1447,7 @@ set(AIDA_SOURCES
     src/actions.cpp
     src/agent_tools.cpp
     src/aida.cpp
+    src/aida_ipc.cpp
     src/graphrag.cpp
     src/ida_utils.cpp
     src/instance_registry.cpp
@@ -1413,6 +1463,10 @@ set(AIDA_SOURCES
     src/vuln/vuln_callsites.cpp
     src/vuln/vuln_strings.cpp
     src/vuln/vuln_tools.cpp
+    src/vuln/smt_solver.cpp
+    src/vuln/symbolic_engine.cpp
+    src/vuln/verification_engine.cpp
+    src/vuln/verification_tools.cpp
     driver/comm.cpp
 )
 
@@ -1425,6 +1479,8 @@ set(AIDA_HEADERS
     src/actions.hpp
     src/agent_tools.hpp
     src/aida.hpp
+    src/aida_ipc.hpp
+    src/aida_manual_map_proof.hpp
     src/aida_pro.hpp
     src/analysis_db.hpp
     src/anti_re.hpp
@@ -1441,10 +1497,26 @@ set(AIDA_HEADERS
     src/vuln/vuln_common.hpp
     src/vuln/vuln_signatures.hpp
     src/vuln/vuln_tools.hpp
+    src/vuln/smt_solver.hpp
+    src/vuln/symbolic_engine.hpp
+    src/vuln/verification_engine.hpp
+    src/vuln/verification_tools.hpp
+    src/vuln/embedded_libz3.hpp
     src/whoswho_encrypted.h
     src/sentinel_encrypted.h
     src/windmapper_embedded.h
 )
+
+if(WIN32)
+    set(Z3_DLL_PATH_FORWARD "${Z3_INSTALL_DIR}/bin/libz3.dll")
+    string(REPLACE "\\" "/" Z3_DLL_PATH_FORWARD "${Z3_DLL_PATH_FORWARD}")
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/aida_plugin_embedded.rc.in"
+        "${CMAKE_BINARY_DIR}/aida_plugin_embedded.rc"
+        @ONLY
+    )
+    list(APPEND AIDA_SOURCES "${CMAKE_BINARY_DIR}/aida_plugin_embedded.rc")
+endif()
 
 add_library(AiDA SHARED ${AIDA_SOURCES} ${AIDA_HEADERS} ${AIDA_ASM_SOURCES})
 
@@ -1493,6 +1565,9 @@ target_include_directories(AiDA PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/VMProtect3.9.4/Include/C"
     "${CMAKE_CURRENT_SOURCE_DIR}/driver"
     "${CMAKE_CURRENT_SOURCE_DIR}/mapper/src"
+    "${TRITON_SOURCE_DIR}/src/libtriton/includes"
+    "${CMAKE_BINARY_DIR}/.deps/triton/src/libtriton/includes"
+    "${Z3_INCLUDE_DIRS}"
 )
 
 target_compile_definitions(AiDA PRIVATE
@@ -1502,6 +1577,7 @@ target_compile_definitions(AiDA PRIVATE
     CPPHTTPLIB_OPENSSL_SUPPORT
     NOMINMAX
     ATP_JIT_DISABLED=1
+    TRITON_Z3_INTERFACE
 )
 
 
@@ -1524,7 +1600,7 @@ endif()
 
 target_link_libraries(AiDA PRIVATE "${IDA_LINK_LIB}")
 
-target_link_libraries(AiDA PRIVATE Zydis unicorn)
+target_link_libraries(AiDA PRIVATE Zydis unicorn triton)
 target_include_directories(AiDA PRIVATE
     "${zydis_SOURCE_DIR}/include"
     "${zydis_SOURCE_DIR}/dependencies/zycore/include"
@@ -1590,7 +1666,10 @@ if(WIN32)
         $<$<BOOL:${AIDA_ENABLE_LTCG}>:/LTCG>
         /PDBALTPATH:none
         /EMITTOOLVERSIONINFO:NO
+        /DELAYLOAD:libz3.dll
     )
+
+    target_link_libraries(AiDA PRIVATE delayimp)
 
     if(TARGET aida_hardening)
         target_link_libraries(AiDA PRIVATE aida_hardening)
@@ -1956,6 +2035,31 @@ if(BUILD_PROTECTOR)
         endif()
         add_dependencies(AiDA AiDAProtector)
     endif()
+endif()
+
+if(WIN32 AND TARGET AiDA AND TARGET AiDAStandalone AND Python3_FOUND)
+    set(AIDA_PLUGIN_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/src/aida_plugin_encrypted.h")
+    add_custom_command(
+        OUTPUT "${AIDA_PLUGIN_HEADER}"
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_aida_plugin.py"
+                --input  "$<TARGET_FILE:AiDA>"
+                --output "${AIDA_PLUGIN_HEADER}"
+        DEPENDS AiDA
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_aida_plugin.py"
+        COMMENT "Encrypting protected AiDA.dll -> aida_plugin_encrypted.h"
+        VERBATIM
+    )
+    add_custom_target(encrypt_aida_plugin DEPENDS "${AIDA_PLUGIN_HEADER}")
+    add_dependencies(encrypt_aida_plugin AiDA)
+    add_dependencies(AiDAStandalone encrypt_aida_plugin)
+    target_sources(AiDAStandalone PRIVATE
+        "${STANDALONE_ROOT}/core/runtime/ida_injector.cpp"
+    )
+    set_source_files_properties(
+        "${STANDALONE_ROOT}/core/runtime/ida_injector.cpp"
+        PROPERTIES OBJECT_DEPENDS "${AIDA_PLUGIN_HEADER}"
+    )
 endif()
 
 if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/nanomite_drx_test/CMakeLists.txt")

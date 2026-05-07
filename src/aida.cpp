@@ -4,19 +4,79 @@
 #include "ida_utils.hpp"
 #include "graphrag.hpp"
 #include "analysis_db.hpp"
+#include "vuln/embedded_libz3.hpp"
+
+#include <delayimp.h>
+
+extern "C" {
+
+static FARPROC WINAPI aida_plugin_delay_load_hook(unsigned dliNotify, PDelayLoadInfo pdli)
+{
+    if (dliNotify == dliNotePreLoadLibrary && pdli != nullptr && pdli->szDll != nullptr)
+    {
+        if (_stricmp(pdli->szDll, "libz3.dll") == 0)
+        {
+            aida::vuln::embedded_libz3::ensure_loaded();
+            HMODULE m = aida::vuln::embedded_libz3::g_z3_module.load(std::memory_order_acquire);
+            if (m != nullptr)
+                return reinterpret_cast<FARPROC>(m);
+        }
+    }
+    return nullptr;
+}
+
+const PfnDliHook __pfnDliNotifyHook2 = aida_plugin_delay_load_hook;
+
+}
 
 #ifdef __NT__
 #include "driver_loader.hpp"
+#include "aida_manual_map_proof.hpp"
+#include "aida_ipc.hpp"
 #include <atomic>
 #include <thread>
 #include <tlhelp32.h>
+#include <bcrypt.h>
+#include <vector>
+
+#pragma comment(lib, "bcrypt.lib")
 #endif
 
 #ifdef __NT__
+
+extern "C" __declspec(dllexport) volatile uint64_t aida_manual_map_marker = 0ULL;
+extern "C" __declspec(dllexport) volatile uint8_t  aida_proof_buffer[aida_manual_map::kProofBufferLen] = {0};
+extern "C" __declspec(dllexport) const uint32_t    aida_proof_buffer_len = aida_manual_map::kProofBufferLen;
+
 namespace {
 
 constexpr DWORD kDllMainBadHostFastFailCode  = 0xA1DAB10Fu;
 constexpr DWORD kDllMainBadNameFastFailCode  = 0xA1DAB110u;
+
+bool is_manual_mapped()
+{
+    return aida_manual_map_marker == aida_manual_map::kMarkerValue;
+}
+
+bool consume_manual_map_proof(aida_manual_map::proof_buffer_t& out_proof)
+{
+    if (!is_manual_mapped())
+        return false;
+    aida_manual_map::proof_buffer_t snap{};
+    uint8_t* dst = reinterpret_cast<uint8_t*>(&snap);
+    for (size_t i = 0; i < sizeof(snap); ++i)
+        dst[i] = aida_proof_buffer[i];
+    if (snap.magic != aida_manual_map::kProofMagic)
+        return false;
+    if (snap.version != aida_manual_map::kProofVersion)
+        return false;
+    if (snap.parent_pid == 0 || snap.ida_pid == 0)
+        return false;
+    if (snap.runtime_nonce_seed == 0)
+        return false;
+    out_proof = snap;
+    return true;
+}
 
 bool ascii_iequal_w(const wchar_t* a, const wchar_t* b)
 {
@@ -123,13 +183,17 @@ void plugin_dispatch_kill(DWORD reason)
 void plugin_validate_load_context(HINSTANCE self_module)
 {
     bool host_ok = plugin_host_is_ida_exe();
-    bool name_ok = plugin_own_filename_is_canonical(self_module);
-    if (host_ok && name_ok)
+    if (!host_ok)
+    {
+        plugin_dispatch_kill(kDllMainBadHostFastFailCode);
         return;
-    DWORD reason = host_ok
-        ? kDllMainBadNameFastFailCode
-        : kDllMainBadHostFastFailCode;
-    plugin_dispatch_kill(reason);
+    }
+    if (is_manual_mapped())
+        return;
+    if (!plugin_own_filename_is_canonical(self_module))
+    {
+        plugin_dispatch_kill(kDllMainBadNameFastFailCode);
+    }
 }
 
 }
@@ -151,6 +215,143 @@ constexpr int    kStandaloneWatchdogPeriodMs      = 5000;
 constexpr int    kStandaloneWatchdogFailThreshold = 3;
 constexpr int    kStandaloneWatchdogGraceTicks    = 6;
 constexpr DWORD  kStandaloneAbsentFastFailCode    = 0xA1DA1DA1u;
+
+constexpr DWORD  kSelfReverseEngineerBsodCode     = 0xA1DA0DEAu;
+
+uint8_t g_self_re_forbidden_hash_standalone[32] = {};
+uint8_t g_self_re_forbidden_hash_plugin[32]     = {};
+uint8_t g_self_re_forbidden_hash_arc[32]        = {};
+std::atomic<bool> g_self_re_hashes_ready{false};
+
+bool hash_is_zero(const uint8_t h[32])
+{
+    for (int i = 0; i < 32; ++i)
+        if (h[i] != 0) return false;
+    return true;
+}
+
+bool sha256_file_path_w(const wchar_t* path, uint8_t out_hash[32])
+{
+    std::memset(out_hash, 0, 32);
+    HANDLE hf = CreateFileW(path, GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                            nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hh = nullptr;
+    DWORD obj_len = 0, got = 0;
+    std::vector<unsigned char> obj_buf;
+    bool ok = false;
+    do {
+        if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM,
+                                                          nullptr, 0)))
+            break;
+        if (!BCRYPT_SUCCESS(BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH,
+                                                reinterpret_cast<PUCHAR>(&obj_len),
+                                                sizeof(obj_len), &got, 0))
+            || obj_len == 0)
+            break;
+        obj_buf.assign(obj_len, 0);
+        if (!BCRYPT_SUCCESS(BCryptCreateHash(alg, &hh, obj_buf.data(), obj_len,
+                                               nullptr, 0, 0)))
+            break;
+        uint8_t buf[65536];
+        DWORD bytes_read = 0;
+        ok = true;
+        while (ReadFile(hf, buf, sizeof(buf), &bytes_read, nullptr) && bytes_read > 0)
+        {
+            if (!BCRYPT_SUCCESS(BCryptHashData(hh, buf, bytes_read, 0)))
+            {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) break;
+        if (!BCRYPT_SUCCESS(BCryptFinishHash(hh, out_hash, 32, 0)))
+            ok = false;
+    } while (false);
+    if (hh) BCryptDestroyHash(hh);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    CloseHandle(hf);
+    return ok;
+}
+
+void load_forbidden_hashes_from_proof(const aida_manual_map::proof_buffer_t& proof)
+{
+    std::memcpy(g_self_re_forbidden_hash_standalone, proof.forbidden_hash_standalone, 32);
+    std::memcpy(g_self_re_forbidden_hash_plugin,     proof.forbidden_hash_plugin,     32);
+    std::memcpy(g_self_re_forbidden_hash_arc,        proof.forbidden_hash_arc,        32);
+    g_self_re_hashes_ready.store(true, std::memory_order_release);
+}
+
+bool hashes_equal(const uint8_t a[32], const uint8_t b[32])
+{
+    uint8_t diff = 0;
+    for (int i = 0; i < 32; ++i)
+        diff |= static_cast<uint8_t>(a[i] ^ b[i]);
+    return diff == 0;
+}
+
+__declspec(noinline) static DWORD seh_self_re_bsod_call(uint32_t reason_code, uint64_t evidence)
+{
+    DWORD seh = 0;
+    __try {
+        if (device.get() != nullptr
+            && (device->is_connected() || device->connect()))
+        {
+            (void)device->trigger_kernel_bsod(reason_code, evidence);
+        }
+    } __except ((seh = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER) {}
+    return seh;
+}
+
+void trigger_self_re_bsod(const char* full_path, const uint8_t matched_hash[32])
+{
+    msg(OBFSTR_C("AiDA: self-reverse-engineering attempt detected. target=%s\n"),
+        full_path ? full_path : "(null)");
+    std::uint64_t evidence = 0;
+    if (matched_hash)
+        std::memcpy(&evidence, matched_hash, sizeof(evidence));
+    (void)seh_self_re_bsod_call(kSelfReverseEngineerBsodCode, evidence);
+    Sleep(2000);
+    __fastfail(kSelfReverseEngineerBsodCode);
+}
+
+void check_input_for_self_target()
+{
+    if (!g_self_re_hashes_ready.load(std::memory_order_acquire))
+        return;
+    char path_a[MAX_PATH * 2] = {};
+    ssize_t n = get_input_file_path(path_a, sizeof(path_a));
+    if (n <= 0 || path_a[0] == '\0')
+        return;
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, path_a, -1, nullptr, 0);
+    if (wlen <= 0) return;
+    std::vector<wchar_t> wpath(static_cast<size_t>(wlen), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, path_a, -1, wpath.data(), wlen);
+
+    uint8_t actual[32] = {};
+    if (!sha256_file_path_w(wpath.data(), actual))
+        return;
+
+    const uint8_t* matched = nullptr;
+    if (!hash_is_zero(g_self_re_forbidden_hash_standalone)
+        && hashes_equal(actual, g_self_re_forbidden_hash_standalone))
+        matched = g_self_re_forbidden_hash_standalone;
+    else if (!hash_is_zero(g_self_re_forbidden_hash_plugin)
+        && hashes_equal(actual, g_self_re_forbidden_hash_plugin))
+        matched = g_self_re_forbidden_hash_plugin;
+    else if (!hash_is_zero(g_self_re_forbidden_hash_arc)
+        && hashes_equal(actual, g_self_re_forbidden_hash_arc))
+        matched = g_self_re_forbidden_hash_arc;
+
+    if (!matched)
+        return;
+    trigger_self_re_bsod(path_a, matched);
+}
 
 std::atomic<bool> g_standalone_watchdog_started{false};
 std::atomic<bool> g_standalone_watchdog_stop{false};
@@ -409,6 +610,9 @@ void plugin_kd_test_signing_guard()
 #ifdef __NT__
 static bool has_expected_plugin_filename()
 {
+    if (aida_manual_map_marker == aida_manual_map::kMarkerValue)
+        return true;
+
     HMODULE module = nullptr;
     if (!GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
@@ -501,7 +705,14 @@ ssize_t idaapi ui_event_listener_t::on_event(ssize_t code, va_list va)
 {
 #ifdef __NT__
     if (code == ui_ready_to_run)
+    {
         anti_re::initialize();
+        check_input_for_self_target();
+    }
+    if (code == ui_database_inited)
+    {
+        check_input_for_self_target();
+    }
 #endif
 
     if (code == ui_finish_populating_widget_popup)
@@ -580,6 +791,7 @@ aida_plugin_t::~aida_plugin_t()
 {
 #ifdef __NT__
     g_standalone_watchdog_stop.store(true, std::memory_order_release);
+    aida_ipc::shutdown();
 #endif
 
     std::string bin_hash = aida_db::AnalysisDB::instance().get_binary_hash();
@@ -710,7 +922,10 @@ void aida_plugin_t::unregister_actions()
 static plugmod_t* idaapi init()
 {
 #ifdef __NT__
-    if (!has_expected_plugin_filename())
+    aida_manual_map::proof_buffer_t manual_proof{};
+    bool manual_mapped = consume_manual_map_proof(manual_proof);
+
+    if (!manual_mapped && !has_expected_plugin_filename())
     {
         msg(OBFSTR_C("AiDA: plugin filename mismatch. Expected exact name: AiDA.dll\n"));
         return PLUGIN_SKIP;
@@ -734,7 +949,11 @@ static plugmod_t* idaapi init()
     }
 
 #ifdef __NT__
-    if (!driver_loader::initialize_and_load())
+    if (manual_mapped)
+    {
+        driver_loader::mark_already_loaded();
+    }
+    else if (!driver_loader::initialize_and_load())
     {
         msg(OBFSTR_C("AiDA: kernel driver attestation is required and could not be initialized.\n"));
         return PLUGIN_SKIP;
@@ -790,6 +1009,13 @@ static plugmod_t* idaapi init()
     license.snapshot_function_prologues();
 
 #ifdef __NT__
+    if (manual_mapped)
+    {
+        load_forbidden_hashes_from_proof(manual_proof);
+        check_input_for_self_target();
+        aida_ipc::start_if_manual_mapped(manual_proof);
+        std::memset(&manual_proof, 0, sizeof(manual_proof));
+    }
     anti_re::start_pipe_monitor();
     {
         uint8_t self_sha[32] = {};

@@ -1331,7 +1331,8 @@ namespace arc_loader
         DWORD inv_tid = 0;
         HANDLE inv_thread = CreateThread(nullptr, 0, inv_thread_proc, inv_ctx, 0, &inv_tid);
 
-        const ULONGLONG kDllMainBudgetMs = 20000ull;
+        const ULONGLONG kDllMainBudgetMs = 60000ull;
+        const ULONGLONG kDllMainExtendedBudgetMs = 30000ull;
         bool timed_out = false;
         bool inline_path = false;
 
@@ -1354,9 +1355,28 @@ namespace arc_loader
             DWORD wait = WaitForSingleObject(inv_thread, static_cast<DWORD>(kDllMainBudgetMs));
             if (wait != WAIT_OBJECT_0 ||
                 InterlockedCompareExchange(&inv_ctx->completed, 0, 0) == 0) {
-                timed_out = true;
+                char primary_tag[200];
+                _snprintf_s(primary_tag, sizeof(primary_tag), _TRUNCATE,
+                    "load_dllmain_primary_timeout_after_ms=%llu_extending_grace_ms=%llu",
+                    (unsigned long long)kDllMainBudgetMs,
+                    (unsigned long long)kDllMainExtendedBudgetMs);
+                arc_breadcrumb(primary_tag);
+                dump_thread_stack_on_timeout(inv_thread, image_base,
+                    static_cast<size_t>(mapped_nt->OptionalHeader.SizeOfImage));
+
+                DWORD wait_ext = WaitForSingleObject(inv_thread,
+                    static_cast<DWORD>(kDllMainExtendedBudgetMs));
+                if (wait_ext != WAIT_OBJECT_0 ||
+                    InterlockedCompareExchange(&inv_ctx->completed, 0, 0) == 0) {
+                    timed_out = true;
+                } else {
+                    arc_breadcrumb("load_dllmain_completed_during_extended_grace");
+                    CloseHandle(inv_thread);
+                    inv_thread = nullptr;
+                }
             } else {
                 CloseHandle(inv_thread);
+                inv_thread = nullptr;
             }
         }
 
@@ -1372,15 +1392,18 @@ namespace arc_loader
         ULONGLONG dllmain_elapsed = GetTickCount64() - wd_ctx.start_tick;
 
         if (timed_out) {
-            char tobuf[160];
+            char tobuf[200];
             _snprintf_s(tobuf, sizeof(tobuf), _TRUNCATE,
-                "load_dllmain_timeout_after_ms=%llu budget_ms=%llu",
+                "load_dllmain_timeout_after_ms=%llu primary_budget_ms=%llu extended_budget_ms=%llu",
                 (unsigned long long)dllmain_elapsed,
-                (unsigned long long)kDllMainBudgetMs);
+                (unsigned long long)kDllMainBudgetMs,
+                (unsigned long long)kDllMainExtendedBudgetMs);
             arc_breadcrumb(tobuf);
-            dump_thread_stack_on_timeout(inv_thread, image_base,
-                static_cast<size_t>(mapped_nt->OptionalHeader.SizeOfImage));
-            set_error_fatal("ARC DllMain did not return within the activation budget.");
+            if (inv_thread) {
+                CloseHandle(inv_thread);
+                inv_thread = nullptr;
+            }
+            set_error("ARC DllMain did not return within the combined activation budget.");
             return result;
         }
 

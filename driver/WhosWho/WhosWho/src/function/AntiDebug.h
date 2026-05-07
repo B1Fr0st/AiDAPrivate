@@ -4,6 +4,7 @@
 #include "../imports/Defs.h"
 #include <function/CoreSecurity.h>
 #include "SentinelBridge.h"
+#include "impl/AntiDumpKernel.h"
 
 #ifndef YieldProcessor
 #define YieldProcessor() _mm_pause()
@@ -823,7 +824,10 @@ namespace continuous_anti_debug {
                     sentinel_bridge::g_bridge.sentinel_cmd = sentinel_bridge::BRIDGE_CMD_DEBUGGER_FOUND;
                     sentinel_bridge::g_bridge.sentinel_cmd_param = (ULONG)(dbg_pid & 0xFFFFFFFF);
 
-                    if (_ZwOpenProcess && _ZwTerminateProcess && _ZwClose) {
+                    if (anti_dump_kernel::is_permitted_pid((UINT32)(dbg_pid & 0xFFFFFFFF))) {
+                        WW_LOG("continuous_adbg: skipped debugger kill for permitted pid=%llu", dbg_pid);
+                    }
+                    else if (_ZwOpenProcess && _ZwTerminateProcess && _ZwClose) {
                         OBJECT_ATTRIBUTES oa;
                         InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
                         CLIENT_ID cid = {};
