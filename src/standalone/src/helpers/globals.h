@@ -433,6 +433,10 @@ namespace globals
 
 		inline float load_timer = 0.f;
 		inline std::atomic<bool>* bg_init_done = nullptr;
+		inline std::atomic<int>  bg_init_step{0};
+		inline std::atomic<int>  bg_init_total{6};
+		inline std::atomic<int>  arc_unseal_phase{0};
+		inline std::atomic<int>  license_activation_phase{0};
 		inline float window_w = 250;
 		inline float window_h = 200;
 		inline float ui_alpha = 0.f;

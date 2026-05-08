@@ -18,6 +18,7 @@ void poll_ai_chat();
 void render_settings_inline(float panel_w, float panel_h);
 void render_tool_approval_dialog();
 bool is_ai_busy();
+void chat_request_cancel();
 
 
 void        chat_bind_session(const std::string& session_id);

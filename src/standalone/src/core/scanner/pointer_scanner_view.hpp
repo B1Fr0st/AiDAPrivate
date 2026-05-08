@@ -1,260 +1,604 @@
 #pragma once
 
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 #include "imgui/imgui.h"
 #include "pointer_scanner.hpp"
 #include "disasm_view.hpp"
+#include "hex_view.hpp"
 #include "ui_anim.hpp"
 #include "../helpers/globals.h"
+#include "../ui/theme.hpp"
+#include "../ui/components.hpp"
+#include "../ui/clock.hpp"
+#include "../ui/transition.hpp"
+#include "../ui/empty_state.hpp"
+#include "../ui/skeleton.hpp"
+#include "../ui/blur_layer.hpp"
+#include "../ui/fonts.hpp"
 
 extern DisasmState g_disasm;
 
 namespace pointer_scanner_view {
 
+struct chain_anim_t {
+	float reveal = 0.f;
+	float step_flash[16] = {};
+	int   hover_step = -1;
+	uint64_t cached_addr[16] = {};
+	bool     cached_valid[16] = {};
+	float    cache_age = 0.f;
+};
+
+struct view_state_t {
+	std::unordered_map<int, chain_anim_t> chain_anims;
+	int   last_selected = -1;
+	float anim_clock = 0.f;
+};
+
+inline view_state_t g_view;
+
+namespace detail {
+
+inline std::string format_offset(int64_t off) {
+	char buf[32];
+	if (off >= 0) snprintf(buf, sizeof(buf), "+0x%llX", static_cast<unsigned long long>(off));
+	else          snprintf(buf, sizeof(buf), "-0x%llX", static_cast<unsigned long long>(-off));
+	return buf;
+}
+
+inline uint64_t resolve_step_address(const pointer_scanner::pointer_chain_t& chain, int step) {
+	auto& st = pointer_scanner::g_state;
+	uint64_t base_addr = 0;
+	if (chain.is_static && chain.module_index >= 0 &&
+		chain.module_index < static_cast<int>(st.cached_modules.size())) {
+		base_addr = st.cached_modules[chain.module_index].base + chain.base_offset;
+	} else {
+		base_addr = chain.base_offset;
+	}
+	if (step <= 0) return base_addr;
+	uint64_t current = base_addr;
+	for (int i = 0; i < step && i < static_cast<int>(chain.offsets.size()); ++i) {
+		std::vector<uint8_t> buf;
+		if (!driver_bridge::read_memory(current, 8, buf) || buf.size() < 8) return current;
+		uint64_t ptr = 0;
+		std::memcpy(&ptr, buf.data(), 8);
+		current = ptr + chain.offsets[i];
+	}
+	return current;
+}
+
+inline void render_step_box(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 fill, ImU32 border,
+	const char* label, ImU32 text_col, float radius)
+{
+	dl->AddRectFilled(a, b, fill, radius);
+	dl->AddRect(a, b, border, radius, 0, 1.f);
+	ImVec2 ts = ImGui::CalcTextSize(label);
+	dl->AddText(aida::ui::fonts::code(), 12.f,
+		ImVec2(a.x + (b.x - a.x - ts.x) * 0.5f, a.y + (b.y - a.y - 12.f) * 0.5f),
+		text_col, label);
+}
+
+inline void render_arrow(ImDrawList* dl, ImVec2 from, ImVec2 to, ImU32 col, float reveal) {
+	if (reveal <= 0.001f) return;
+	ImVec2 cp1(from.x + (to.x - from.x) * 0.4f, from.y - 6.f);
+	ImVec2 cp2(to.x   - (to.x - from.x) * 0.4f, to.y   + 6.f);
+
+	int segments = 24;
+	float clip_t = reveal;
+	for (int i = 0; i < segments; ++i) {
+		float t1 = (float)i / (float)segments;
+		float t2 = (float)(i + 1) / (float)segments;
+		if (t2 > clip_t) t2 = clip_t;
+		if (t1 >= clip_t) break;
+		auto bez = [&](float tt) {
+			float u = 1.f - tt;
+			float x = u*u*u*from.x + 3.f*u*u*tt*cp1.x + 3.f*u*tt*tt*cp2.x + tt*tt*tt*to.x;
+			float y = u*u*u*from.y + 3.f*u*u*tt*cp1.y + 3.f*u*tt*tt*cp2.y + tt*tt*tt*to.y;
+			return ImVec2(x, y);
+		};
+		dl->AddLine(bez(t1), bez(t2), col, 1.5f);
+	}
+	if (reveal >= 0.99f) {
+		float head = 5.f;
+		dl->AddTriangleFilled(
+			ImVec2(to.x - head, to.y - head * 0.6f),
+			ImVec2(to.x - head, to.y + head * 0.6f),
+			to, col);
+	}
+	float t_sec = aida::ui::clock::seconds() * 0.8f;
+	float ph = fmodf(t_sec, 1.f);
+	if (ph <= reveal) {
+		float u = 1.f - ph;
+		float dx = u*u*u*from.x + 3.f*u*u*ph*cp1.x + 3.f*u*ph*ph*cp2.x + ph*ph*ph*to.x;
+		float dy = u*u*u*from.y + 3.f*u*u*ph*cp1.y + 3.f*u*ph*ph*cp2.y + ph*ph*ph*to.y;
+		dl->AddCircleFilled(ImVec2(dx, dy), 2.f, col, 12);
+	}
+}
+
+inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, float h,
+	int chain_idx, pointer_scanner::pointer_chain_t& chain, float a, chain_anim_t& anim)
+{
+	const auto& t = aida::ui::resolved();
+
+	float pad = 14.f;
+	float row_y = oy + h * 0.5f - 18.f;
+	float box_h = 32.f;
+	float gap_w = 56.f;
+
+	int total_steps = 1 + static_cast<int>(chain.offsets.size());
+	if (total_steps < 1) return;
+
+	std::vector<float> box_w_arr;
+	box_w_arr.reserve(total_steps * 2);
+
+	float total_w = 0.f;
+	{
+		char base_lbl[96];
+		if (chain.is_static && chain.module_index >= 0 &&
+			chain.module_index < static_cast<int>(pointer_scanner::g_state.cached_modules.size())) {
+			snprintf(base_lbl, sizeof(base_lbl), "%s+0x%llX",
+				chain.module_name.c_str(), static_cast<unsigned long long>(chain.base_offset));
+		} else {
+			snprintf(base_lbl, sizeof(base_lbl), "0x%llX",
+				static_cast<unsigned long long>(chain.base_offset));
+		}
+		ImVec2 ts = ImGui::CalcTextSize(base_lbl);
+		float bw = ts.x + 22.f;
+		box_w_arr.push_back(bw);
+		total_w += bw;
+	}
+
+	for (size_t i = 0; i < chain.offsets.size(); ++i) {
+		std::string off = format_offset(chain.offsets[i]);
+		ImVec2 ts = ImGui::CalcTextSize(off.c_str());
+		float bw = ts.x + 18.f;
+		box_w_arr.push_back(bw);
+		total_w += bw + gap_w;
+	}
+
+	float scale = 1.f;
+	if (total_w + pad * 2.f > w) {
+		scale = (w - pad * 2.f) / total_w;
+		if (scale < 0.45f) scale = 0.45f;
+		gap_w *= scale;
+		for (auto& bw : box_w_arr) bw *= scale;
+	}
+
+	float cx = ox + pad;
+	int hover_step = -1;
+
+	float dt = aida::ui::clock::dt();
+	anim.reveal = aida::motion::smooth_lerp(anim.reveal, 1.f, 14.f, dt);
+
+	{
+		float bw = box_w_arr[0];
+		ImVec2 ba(cx, row_y);
+		ImVec2 bb(cx + bw, row_y + box_h);
+		float local_t = anim.reveal * 1.0f;
+		float lift = (1.f - aida::motion::ease::out_cubic(local_t)) * 8.f;
+		ba.y += lift; bb.y += lift;
+
+		ImU32 fill = chain.is_static ? aida::ui::with_alpha(t.accent_dim, a * 0.55f * local_t)
+		                              : aida::ui::with_alpha(t.panel_bg, a * local_t);
+		ImU32 border = chain.is_static ? aida::ui::with_alpha(t.accent_u32, a * local_t)
+		                                : aida::ui::with_alpha(t.border_subtle, a * local_t);
+
+		ImGui::PushID(chain_idx * 100 + 0);
+		ImGui::SetCursorScreenPos(ba);
+		ImGui::InvisibleButton("##step0", ImVec2(bw, box_h));
+		bool clk = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+		bool hov = ImGui::IsItemHovered();
+		if (hov) hover_step = 0;
+		if (clk) {
+			uint64_t addr = resolve_step_address(chain, 0);
+			if (addr != 0) {
+				hex_view::read_from_process(addr, 256);
+				globals::ui::active_center_view = center_view_t::hex_view;
+			}
+		}
+		ImGui::PopID();
+
+		if (hov) {
+			anim.step_flash[0] = 1.f;
+		}
+		float flash = anim.step_flash[0];
+		if (flash > 0.f) {
+			border = aida::ui::with_alpha(t.accent_u32, a * (0.6f + flash * 0.4f));
+			fill = aida::ui::with_alpha(t.accent_glow, a * (0.6f * flash + (chain.is_static ? 0.55f : 0.f)));
+		}
+
+		char lbl[96];
+		if (chain.is_static && chain.module_index >= 0 &&
+			chain.module_index < static_cast<int>(pointer_scanner::g_state.cached_modules.size())) {
+			snprintf(lbl, sizeof(lbl), "%s+0x%llX",
+				chain.module_name.c_str(), static_cast<unsigned long long>(chain.base_offset));
+		} else {
+			snprintf(lbl, sizeof(lbl), "0x%llX", static_cast<unsigned long long>(chain.base_offset));
+		}
+		render_step_box(dl, ba, bb, fill, border, lbl,
+			aida::ui::with_alpha(t.text_primary, a * local_t), 8.f);
+
+		cx += bw;
+	}
+
+	for (size_t i = 0; i < chain.offsets.size(); ++i) {
+		float reveal_offset = (float)(i + 1) * 0.16f;
+		float local_t = (anim.reveal - reveal_offset) / (1.f - reveal_offset + 0.0001f);
+		if (local_t < 0.f) local_t = 0.f;
+		if (local_t > 1.f) local_t = 1.f;
+
+		ImVec2 from(cx, row_y + box_h * 0.5f);
+		ImVec2 to(cx + gap_w, row_y + box_h * 0.5f);
+		render_arrow(dl, from, to,
+			aida::ui::with_alpha(t.accent_u32, a * local_t), local_t);
+
+		cx += gap_w;
+
+		float bw = box_w_arr[i + 1];
+		ImVec2 ba(cx, row_y);
+		ImVec2 bb(cx + bw, row_y + box_h);
+		float lift = (1.f - aida::motion::ease::out_cubic(local_t)) * 8.f;
+		ba.y += lift; bb.y += lift;
+
+		ImU32 fill = aida::ui::with_alpha(t.panel_bg, a * local_t);
+		ImU32 border = aida::ui::with_alpha(t.border_subtle, a * local_t);
+
+		int step_idx = static_cast<int>(i + 1);
+		ImGui::PushID(chain_idx * 100 + step_idx);
+		ImGui::SetCursorScreenPos(ba);
+		ImGui::InvisibleButton("##stepn", ImVec2(bw, box_h));
+		bool clk = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+		bool hov = ImGui::IsItemHovered();
+		if (hov) hover_step = step_idx;
+		if (clk) {
+			uint64_t addr = resolve_step_address(chain, step_idx);
+			if (addr != 0) {
+				hex_view::read_from_process(addr, 256);
+				globals::ui::active_center_view = center_view_t::hex_view;
+			}
+		}
+		ImGui::PopID();
+
+		if (hov) anim.step_flash[step_idx & 15] = 1.f;
+		float flash = anim.step_flash[step_idx & 15];
+		if (flash > 0.f) {
+			border = aida::ui::with_alpha(t.accent_u32, a * (0.6f + flash * 0.4f));
+			fill = aida::ui::with_alpha(t.accent_glow, a * 0.4f * flash);
+		}
+
+		std::string off = format_offset(chain.offsets[i]);
+		ImU32 dot_col = aida::ui::with_alpha(t.accent_u32, a * local_t);
+		float dot_cx = ba.x + 8.f;
+		float dot_cy = (ba.y + bb.y) * 0.5f;
+		dl->AddCircleFilled(ImVec2(dot_cx, dot_cy), 3.f, dot_col, 12);
+
+		ImVec2 ts = ImGui::CalcTextSize(off.c_str());
+		dl->AddRectFilled(ba, bb, fill, 8.f);
+		dl->AddRect(ba, bb, border, 8.f, 0, 1.f);
+		dl->AddText(aida::ui::fonts::code(), 12.f,
+			ImVec2(dot_cx + 8.f, dot_cy - 6.f),
+			aida::ui::with_alpha(t.text_primary, a * local_t), off.c_str());
+
+		cx += bw;
+	}
+
+	for (auto& f : anim.step_flash) {
+		if (f > 0.f) {
+			f -= dt * 1.66f;
+			if (f < 0.f) f = 0.f;
+		}
+	}
+
+	anim.hover_step = hover_step;
+	anim.cache_age += dt;
+	if (anim.cache_age > 0.5f) {
+		anim.cache_age = 0.f;
+		for (int i = 0; i < 16; ++i) anim.cached_valid[i] = false;
+	}
+	if (hover_step >= 0) {
+		int idx = hover_step & 15;
+		if (!anim.cached_valid[idx]) {
+			anim.cached_addr[idx] = resolve_step_address(chain, hover_step);
+			anim.cached_valid[idx] = true;
+		}
+		uint64_t addr = anim.cached_addr[idx];
+		char tip[96];
+		snprintf(tip, sizeof(tip), "Resolved: 0x%llX", static_cast<unsigned long long>(addr));
+		ImVec2 mp = ImGui::GetMousePos();
+		ImVec2 ts = ImGui::CalcTextSize(tip);
+		ImVec2 tp(mp.x + 16.f, mp.y - ts.y - 8.f);
+		dl->AddRectFilled(ImVec2(tp.x - 6.f, tp.y - 4.f),
+			ImVec2(tp.x + ts.x + 6.f, tp.y + ts.y + 4.f),
+			aida::ui::with_alpha(t.bg_overlay, 0.95f), 6.f);
+		dl->AddRect(ImVec2(tp.x - 6.f, tp.y - 4.f),
+			ImVec2(tp.x + ts.x + 6.f, tp.y + ts.y + 4.f),
+			aida::ui::with_alpha(t.border_subtle, 1.f), 6.f, 0, 1.f);
+		dl->AddText(aida::ui::fonts::code(), 12.f, tp,
+			aida::ui::with_alpha(t.text_primary, 1.f), tip);
+	}
+}
+
+}
+
 inline void render(float pos_x, float pos_y, float width, float height,
-                   float alpha, float accent_r, float accent_g, float accent_b)
+                   float alpha, float, float, float)
 {
 	ImDrawList* dl = ImGui::GetWindowDrawList();
 	ImVec2 wp = ImGui::GetWindowPos();
 	float a = alpha;
 	auto& st = pointer_scanner::g_state;
+	auto& view = g_view;
 
-	static float row_anim_time = 0.f;
-	row_anim_time += ImGui::GetIO().DeltaTime;
-
-	const auto& _t = themes::resolved;
-	const auto _ta = [alpha](ImU32 c) -> ImU32 {
-		return ui_anim::theme_alpha(c, alpha);
-	};
-
-	ImU32 bg = _ta(_t.bg_base);
-	ImU32 panel_bg = _ta(_t.panel_bg);
-	ImU32 hdr_bg = _ta(_t.panel_header);
-	ImU32 text_main = _ta(_t.text_primary);
-	ImU32 text_dim = _ta(_t.text_dim);
-	ImU32 text_val = IM_COL32(100, 200, 150, static_cast<int>(220 * a));
-	ImU32 text_inv = IM_COL32(220, 80, 80, static_cast<int>(220 * a));
-	ImU32 accent_col = IM_COL32(
-		static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
-		static_cast<int>(accent_b * 255), static_cast<int>(220 * a));
-	ImU32 accent_dim = IM_COL32(
-		static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
-		static_cast<int>(accent_b * 255), static_cast<int>(80 * a));
-	ImU32 row_hover_col = _ta(_t.panel_header);
-	ImU32 row_sel = IM_COL32(
-		static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
-		static_cast<int>(accent_b * 255), static_cast<int>(30 * a));
-	ImU32 sep_col = _ta(ui_anim::lighten(_t.panel_bg, 12));
+	const auto& t = aida::ui::resolved();
+	float dt = aida::ui::clock::dt();
+	view.anim_clock += dt;
 
 	float x0 = wp.x + pos_x;
 	float y0 = wp.y + pos_y;
 
-	dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + width, y0 + height), bg);
+	dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + width, y0 + height),
+		aida::ui::with_alpha(t.bg_base, a));
 
-	float toolbar_h = 36.f;
-	float config_panel_w = 260.f;
-	float detail_panel_h = 160.f;
-	float row_h = 22.f;
+	float toolbar_h = 48.f;
+	float config_panel_w = 280.f;
+	float row_h = 28.f;
 
-	ui_anim::render_toolbar(dl, x0, y0, width, toolbar_h, accent_r, accent_g, accent_b, a);
+	dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + width, y0 + toolbar_h),
+		aida::ui::with_alpha(t.panel_header, a));
+	dl->AddLine(ImVec2(x0, y0 + toolbar_h), ImVec2(x0 + width, y0 + toolbar_h),
+		aida::ui::with_alpha(t.border_subtle, a), 1.f);
 
-	ImGui::SetCursorPos(ImVec2(pos_x + 8.f, pos_y + 6.f));
-	ImGui::PushStyleColor(ImGuiCol_Text, text_main);
-	ImGui::TextUnformatted("Pointer Chain Scanner");
-	ImGui::PopStyleColor();
+	dl->AddText(aida::ui::fonts::body_em(), 14.f,
+		ImVec2(x0 + 16.f, y0 + (toolbar_h - 14.f) * 0.5f),
+		aida::ui::with_alpha(t.text_primary, a), "Pointer Chain Scanner");
 
 	{
-		char status_buf[128] = {};
-		std::lock_guard<std::mutex> lk(st.map_mutex);
-		snprintf(status_buf, sizeof(status_buf), "Reverse Map: %zu entries | Results: %zu",
-		         st.map_entry_count, st.results.size());
-		float tw = ImGui::CalcTextSize(status_buf).x;
-		ImGui::SetCursorPos(ImVec2(pos_x + width - tw - 12.f, pos_y + 6.f));
-		ImGui::PushStyleColor(ImGuiCol_Text, text_dim);
-		ImGui::TextUnformatted(status_buf);
-		ImGui::PopStyleColor();
+		char status_buf[160];
+		size_t entries;
+		size_t res_count;
+		{
+			std::lock_guard<std::mutex> lk(st.map_mutex);
+			entries = st.map_entry_count;
+		}
+		{
+			std::lock_guard<std::mutex> lk(st.results_mutex);
+			res_count = st.results.size();
+		}
+		snprintf(status_buf, sizeof(status_buf), "Map: %zu  ·  Chains: %zu", entries, res_count);
+		ImVec2 ts = ImGui::CalcTextSize(status_buf);
+		dl->AddText(aida::ui::fonts::caption(), 12.f,
+			ImVec2(x0 + width - ts.x - 16.f, y0 + (toolbar_h - 12.f) * 0.5f),
+			aida::ui::with_alpha(t.text_secondary, a), status_buf);
 	}
 
 	float cfg_x = x0;
 	float cfg_y = y0 + toolbar_h;
 	float cfg_h = height - toolbar_h;
 
-	ui_anim::render_panel_card(dl, cfg_x, cfg_y, config_panel_w, cfg_h, accent_r, accent_g, accent_b, a, 0.f, false);
-	dl->AddLine(ImVec2(cfg_x + config_panel_w, cfg_y), ImVec2(cfg_x + config_panel_w, cfg_y + cfg_h), sep_col);
+	dl->AddRectFilled(ImVec2(cfg_x, cfg_y), ImVec2(cfg_x + config_panel_w, cfg_y + cfg_h),
+		aida::ui::with_alpha(t.panel_bg, a));
+	dl->AddLine(ImVec2(cfg_x + config_panel_w, cfg_y), ImVec2(cfg_x + config_panel_w, cfg_y + cfg_h),
+		aida::ui::with_alpha(t.border_subtle, a), 1.f);
 
-	ImGui::SetCursorPos(ImVec2(pos_x + 10.f, pos_y + toolbar_h + 10.f));
-	ImGui::BeginChild("##ptr_cfg", ImVec2(config_panel_w - 20.f, cfg_h - 20.f), false,
-	                   ImGuiWindowFlags_NoScrollbar);
+	float cy = cfg_y + 16.f;
+	float cx = cfg_x + 16.f;
+	float field_w = config_panel_w - 32.f;
 
-	ImGui::PushStyleColor(ImGuiCol_Text, accent_col);
-	ImGui::TextUnformatted("Configuration");
-	ImGui::PopStyleColor();
-	ImGui::Spacing();
+	dl->AddText(aida::ui::fonts::body_em(), 13.f,
+		ImVec2(cx, cy), aida::ui::with_alpha(t.text_primary, a), "Configuration");
+	cy += 24.f;
 
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
-	ImGui::PushStyleColor(ImGuiCol_Text, text_main);
-	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
-	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 4.f));
-	ImGui::PushItemWidth(-1.f);
+	dl->AddText(aida::ui::fonts::caption(), 11.f,
+		ImVec2(cx, cy), aida::ui::with_alpha(t.text_dim, a), "Target Address");
+	cy += 16.f;
 
-	ImGui::PushStyleColor(ImGuiCol_Text, text_dim);
-	ImGui::TextUnformatted("Target Address");
-	ImGui::PopStyleColor();
-	ImGui::InputTextWithHint("##ptr_addr", "e.g. 7FF60012A440", st.addr_buf, sizeof(st.addr_buf),
-	                          ImGuiInputTextFlags_CharsHexadecimal);
+	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+	aida::ui::input_text("##ptr_addr", st.addr_buf, sizeof(st.addr_buf),
+		"e.g. 7FF60012A440", false, ImVec2(field_w, 32.f));
+	cy += 38.f;
 
-	ImGui::Spacing();
-	ImGui::PushStyleColor(ImGuiCol_Text, text_dim);
-	ImGui::TextUnformatted("Max Depth");
-	ImGui::PopStyleColor();
-	ImGui::SliderInt("##ptr_depth", &st.config.max_depth, 1, 7, "%d");
+	auto draw_label_and_value = [&](const char* lbl, int value) {
+		ImFont* lblf = aida::ui::fonts::caption();
+		if (!lblf) lblf = ImGui::GetFont();
+		ImFont* valf = aida::ui::fonts::body_em();
+		if (!valf) valf = ImGui::GetFont();
+		dl->AddText(lblf, 11.f,
+			ImVec2(cx, cy), aida::ui::with_alpha(t.text_dim, a), lbl);
+		char vbuf[32];
+		std::snprintf(vbuf, sizeof(vbuf), "%d", value);
+		ImVec2 vts = valf->CalcTextSizeA(11.f, FLT_MAX, 0.f, vbuf);
+		dl->AddText(valf, 11.f,
+			ImVec2(cx + field_w - vts.x, cy),
+			aida::ui::with_alpha(t.text_primary, a), vbuf);
+		cy += 16.f;
+	};
 
-	ImGui::Spacing();
-	ImGui::PushStyleColor(ImGuiCol_Text, text_dim);
-	ImGui::TextUnformatted("Max Offset");
-	ImGui::PopStyleColor();
-	int max_off = static_cast<int>(st.config.max_offset);
-	ImGui::SliderInt("##ptr_maxoff", &max_off, 64, 16384, "%d");
-	st.config.max_offset = max_off;
+	draw_label_and_value("Max Depth", st.config.max_depth);
 
-	ImGui::Spacing();
-	ImGui::PushStyleColor(ImGuiCol_Text, text_dim);
-	ImGui::TextUnformatted("Struct Size");
-	ImGui::PopStyleColor();
-	int struct_sz = static_cast<int>(st.config.struct_size);
-	ImGui::SliderInt("##ptr_struct", &struct_sz, 64, 16384, "%d");
-	st.config.struct_size = struct_sz;
-
-	ImGui::Spacing();
-	ImGui::PushStyleColor(ImGuiCol_CheckMark, accent_col);
-	ImGui::Checkbox("Negative Offsets##ptr", &st.config.negative_offsets);
-	ImGui::Checkbox("Static Bases Only##ptr", &st.config.only_static_bases);
-	ImGui::PopStyleColor();
-
+	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+	ImGui::PushItemWidth(field_w);
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(t.panel_header, a));
+	ImGui::PushStyleColor(ImGuiCol_SliderGrab, aida::ui::with_alpha(t.accent_u32, a));
+	ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, aida::ui::with_alpha(t.accent_hover, a));
+	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, a));
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f);
+	ImGui::SliderInt("##ptr_depth", &st.config.max_depth, 1, 7, "");
+	ImGui::PopStyleVar();
+	ImGui::PopStyleColor(4);
 	ImGui::PopItemWidth();
-	ImGui::PopStyleVar(2);
-	ImGui::PopStyleColor(2);
+	cy += 32.f;
 
-	ImGui::Spacing();
-	ImGui::Separator();
-	ImGui::Spacing();
+	int max_off = static_cast<int>(st.config.max_offset);
+	draw_label_and_value("Max Offset", max_off);
 
-	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
-	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 5.f));
+	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+	ImGui::PushItemWidth(field_w);
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(t.panel_header, a));
+	ImGui::PushStyleColor(ImGuiCol_SliderGrab, aida::ui::with_alpha(t.accent_u32, a));
+	ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, aida::ui::with_alpha(t.accent_hover, a));
+	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, a));
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f);
+	ImGui::SliderInt("##ptr_maxoff", &max_off, 64, 16384, "");
+	st.config.max_offset = max_off;
+	ImGui::PopStyleVar();
+	ImGui::PopStyleColor(4);
+	ImGui::PopItemWidth();
+	cy += 32.f;
+
+	int struct_sz = static_cast<int>(st.config.struct_size);
+	draw_label_and_value("Struct Size", struct_sz);
+
+	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+	ImGui::PushItemWidth(field_w);
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(t.panel_header, a));
+	ImGui::PushStyleColor(ImGuiCol_SliderGrab, aida::ui::with_alpha(t.accent_u32, a));
+	ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, aida::ui::with_alpha(t.accent_hover, a));
+	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, a));
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f);
+	ImGui::SliderInt("##ptr_struct", &struct_sz, 64, 16384, "");
+	st.config.struct_size = struct_sz;
+	ImGui::PopStyleVar();
+	ImGui::PopStyleColor(4);
+	ImGui::PopItemWidth();
+	cy += 36.f;
+
+	{
+		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+		bool n = st.config.negative_offsets;
+		aida::ui::toggle_switch("Negative Offsets##neg", &n, aida::ui::size_t_::sm);
+		st.config.negative_offsets = n;
+		cy += 24.f;
+	}
+	{
+		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+		bool s = st.config.only_static_bases;
+		aida::ui::toggle_switch("Static Bases Only##sb", &s, aida::ui::size_t_::sm);
+		st.config.only_static_bases = s;
+		cy += 30.f;
+	}
+
+	dl->AddLine(ImVec2(cx, cy), ImVec2(cx + field_w, cy),
+		aida::ui::with_alpha(t.border_subtle, a), 1.f);
+	cy += 12.f;
 
 	bool building = st.map_building.load();
 	bool scanning = st.scanning.load();
 
 	if (building) {
 		float prog = st.map_progress.load();
-		ImGui::PushStyleColor(ImGuiCol_PlotHistogram, accent_col);
-		ImGui::ProgressBar(prog, ImVec2(-1.f, 24.f), "Building reverse map...");
-		ImGui::PopStyleColor();
-
-		ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(180, 60, 60, static_cast<int>(200 * a)));
-		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(220, 80, 80, static_cast<int>(200 * a)));
-		ImGui::PushStyleColor(ImGuiCol_Text, text_main);
-		if (ImGui::Button("Cancel##map", ImVec2(-1.f, 0.f)))
+		dl->AddText(aida::ui::fonts::caption(), 11.f,
+			ImVec2(cx, cy), aida::ui::with_alpha(t.text_dim, a), "Building reverse map...");
+		aida::ui::render_progress_bar(ImVec2(cx, cy + 18.f), field_w, 6.f, prog, false, true);
+		cy += 32.f;
+		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+		if (aida::ui::button("Cancel", aida::ui::button_kind_t::destructive,
+				aida::ui::size_t_::md, ImVec2(field_w, 0.f))) {
 			pointer_scanner::cancel_all();
-		ImGui::PopStyleColor(3);
+		}
+		cy += 38.f;
 	} else {
-		ImGui::PushStyleColor(ImGuiCol_Button, _ta(_t.panel_header));
-		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, _ta(ui_anim::lighten(_t.panel_header, 14)));
-		ImGui::PushStyleColor(ImGuiCol_Text, text_main);
-		if (ImGui::Button("Build Pointer Map##ptr", ImVec2(-1.f, 0.f)))
+		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+		if (aida::ui::button("Build Pointer Map", aida::ui::button_kind_t::primary,
+				aida::ui::size_t_::md, ImVec2(field_w, 0.f))) {
 			pointer_scanner::build_reverse_map();
-		ImGui::PopStyleColor(3);
+		}
+		cy += 40.f;
 	}
-
-	ImGui::Spacing();
 
 	if (scanning) {
 		float prog = st.scan_progress.load();
-		ImGui::PushStyleColor(ImGuiCol_PlotHistogram, accent_col);
-		ImGui::ProgressBar(prog, ImVec2(-1.f, 24.f), "Scanning...");
-		ImGui::PopStyleColor();
-
-		ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(180, 60, 60, static_cast<int>(200 * a)));
-		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(220, 80, 80, static_cast<int>(200 * a)));
-		ImGui::PushStyleColor(ImGuiCol_Text, text_main);
-		if (ImGui::Button("Cancel##scan", ImVec2(-1.f, 0.f)))
+		dl->AddText(aida::ui::fonts::caption(), 11.f,
+			ImVec2(cx, cy), aida::ui::with_alpha(t.text_dim, a), "Scanning chains...");
+		aida::ui::render_progress_bar(ImVec2(cx, cy + 18.f), field_w, 6.f, prog, false, true);
+		cy += 32.f;
+		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+		if (aida::ui::button("Cancel", aida::ui::button_kind_t::destructive,
+				aida::ui::size_t_::md, ImVec2(field_w, 0.f))) {
 			st.scan_cancel.store(true);
-		ImGui::PopStyleColor(3);
+		}
+		cy += 38.f;
 	} else {
 		bool can_scan = !building && st.map_entry_count > 0;
-		ImGui::PushStyleColor(ImGuiCol_Button, can_scan
-			? _ta(ui_anim::darken(_t.panel_header, 5))
-			: _ta(_t.panel_bg));
-		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, can_scan
-			? _ta(ui_anim::lighten(_t.panel_header, 14))
-			: _ta(_t.panel_bg));
-		ImGui::PushStyleColor(ImGuiCol_Text, can_scan ? text_main : text_dim);
-		if (ImGui::Button("Scan Chains##ptr", ImVec2(-1.f, 0.f)) && can_scan) {
+		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+		if (aida::ui::button("Scan Chains", aida::ui::button_kind_t::primary,
+				aida::ui::size_t_::md, ImVec2(field_w, 0.f), !can_scan)) {
 			st.config.target_address = strtoull(st.addr_buf, nullptr, 16);
 			pointer_scanner::start_scan();
 		}
-		ImGui::PopStyleColor(3);
+		cy += 40.f;
 	}
 
-	ImGui::PopStyleVar(2);
+	dl->AddLine(ImVec2(cx, cy), ImVec2(cx + field_w, cy),
+		aida::ui::with_alpha(t.border_subtle, a), 1.f);
+	cy += 12.f;
 
-	ImGui::Spacing();
-	ImGui::Separator();
-	ImGui::Spacing();
-
-	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
-	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 4.f));
-	ImGui::PushStyleColor(ImGuiCol_Button, _ta(_t.panel_header));
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, _ta(ui_anim::lighten(_t.panel_header, 14)));
-	ImGui::PushStyleColor(ImGuiCol_Text, text_main);
-
-	if (ImGui::Button("Validate All##ptr", ImVec2(-1.f, 0.f)))
+	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+	if (aida::ui::button("Validate All", aida::ui::button_kind_t::secondary,
+			aida::ui::size_t_::md, ImVec2(field_w, 0.f))) {
 		pointer_scanner::validate_all_results();
-
-	ImGui::Spacing();
-	if (ImGui::Button("Clear Results##ptr", ImVec2(-1.f, 0.f)))
+	}
+	cy += 38.f;
+	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+	if (aida::ui::button("Clear Results", aida::ui::button_kind_t::ghost,
+			aida::ui::size_t_::md, ImVec2(field_w, 0.f))) {
 		pointer_scanner::clear_results();
-
-	if (ImGui::Button("Clear Map##ptr", ImVec2(-1.f, 0.f)))
+		view.chain_anims.clear();
+	}
+	cy += 38.f;
+	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+	if (aida::ui::button("Clear Map", aida::ui::button_kind_t::ghost,
+			aida::ui::size_t_::md, ImVec2(field_w, 0.f))) {
 		pointer_scanner::clear_map();
-
-	ImGui::PopStyleColor(3);
-	ImGui::PopStyleVar(2);
-
-	ImGui::EndChild();
+	}
 
 	float table_x = cfg_x + config_panel_w + 1.f;
 	float table_y = cfg_y;
 	float table_w = width - config_panel_w - 1.f;
-	float table_h = cfg_h - detail_panel_h;
 
-	float col_depth_w = 50.f;
-	float col_module_w = 140.f;
-	float col_base_w = 120.f;
-	float col_status_w = 60.f;
-	float col_chain_w = table_w - col_depth_w - col_module_w - col_base_w - col_status_w - 20.f;
+	float detail_h = 200.f;
+	float list_h = cfg_h - detail_h;
+
+	float col_depth_w = 60.f;
+	float col_module_w = 160.f;
+	float col_base_w = 130.f;
+	float col_status_w = 70.f;
+	float col_chain_w = table_w - col_depth_w - col_module_w - col_base_w - col_status_w - 32.f;
 	if (col_chain_w < 100.f) col_chain_w = 100.f;
 
-	float hdr_h = 24.f;
-	{
-		ui_anim::table_col_t hdr_cols[] = {
-			{"Depth", col_depth_w}, {"Module", col_module_w}, {"Base+Offset", col_base_w},
-			{"Chain", col_chain_w}, {"Valid", col_status_w}
-		};
-		ui_anim::render_table_header(dl, table_x, table_y, table_w, hdr_h, hdr_cols, 5, accent_r, accent_g, accent_b, a);
+	float hdr_h = 28.f;
+	dl->AddRectFilled(ImVec2(table_x, table_y),
+		ImVec2(table_x + table_w, table_y + hdr_h),
+		aida::ui::with_alpha(t.panel_header, a * 0.85f));
+	dl->AddLine(ImVec2(table_x, table_y + hdr_h),
+		ImVec2(table_x + table_w, table_y + hdr_h),
+		aida::ui::with_alpha(t.border_subtle, a), 1.f);
+
+	const char* col_names[5] = { "Depth", "Module", "Base+Offset", "Chain", "Valid" };
+	float col_widths[5] = { col_depth_w, col_module_w, col_base_w, col_chain_w, col_status_w };
+	float hx = table_x + 16.f;
+	for (int c = 0; c < 5; ++c) {
+		dl->AddText(aida::ui::fonts::caption(), 11.f,
+			ImVec2(hx, table_y + (hdr_h - 11.f) * 0.5f),
+			aida::ui::with_alpha(t.text_dim, a), col_names[c]);
+		hx += col_widths[c];
 	}
 
 	float body_y = table_y + hdr_h;
-	float body_h = table_h - hdr_h;
+	float body_h = list_h - hdr_h;
 
-	ImGui::SetCursorPos(ImVec2(pos_x + config_panel_w + 1.f, pos_y + toolbar_h + hdr_h));
-
+	ImGui::SetCursorScreenPos(ImVec2(table_x, body_y));
 	ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 0));
 	ImGui::BeginChild("##ptr_results", ImVec2(table_w, body_h), false,
 	                   ImGuiWindowFlags_NoScrollbar);
 
 	std::lock_guard<std::mutex> lk(st.results_mutex);
-	int visible_count = static_cast<int>(body_h / row_h);
 	int total = static_cast<int>(st.results.size());
+	int visible_count = static_cast<int>(body_h / row_h);
 
 	float wheel = ImGui::GetIO().MouseWheel;
 	ImVec2 mp = ImGui::GetMousePos();
@@ -264,7 +608,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float max_scroll = (total > visible_count) ? (total - visible_count) * row_h : 0.f;
 		if (st.target_scroll_y > max_scroll) st.target_scroll_y = max_scroll;
 	}
-	ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, 20.f, ImGui::GetIO().DeltaTime);
+	ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, 20.f, dt);
 
 	int start_row = static_cast<int>(st.scroll_y / row_h);
 	if (start_row < 0) start_row = 0;
@@ -272,51 +616,56 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	for (int i = start_row; i < total && i < start_row + visible_count + 2; ++i) {
 		auto& chain = st.results[i];
 		float ry = body_y + (i - start_row) * row_h - (st.scroll_y - start_row * row_h);
-
 		if (ry + row_h < body_y || ry > body_y + body_h) continue;
 
 		bool hovered = (mp.x >= table_x && mp.x <= table_x + table_w &&
 		                mp.y >= ry && mp.y < ry + row_h);
 		bool selected = (i == st.selected_result);
 
-		float row_a = ui_anim::render_row_entrance(i, row_anim_time, 0.012f);
-		ui_anim::table_row_style_t rs{};
-		rs.selected = selected;
-		rs.hovered = hovered;
-		rs.index = i;
-		rs.alpha = a;
-		rs.entrance = row_a;
-		rs.ar = accent_r; rs.ag = accent_g; rs.ab = accent_b;
-		ui_anim::render_table_row(dl, table_x, ry, table_w, row_h, rs);
+		float row_a = ui_anim::render_row_entrance(i - start_row, view.anim_clock, 0.012f);
+
+		if (selected) {
+			dl->AddRectFilled(ImVec2(table_x, ry), ImVec2(table_x + table_w, ry + row_h),
+				aida::ui::with_alpha(t.selection, a * row_a));
+			dl->AddRectFilled(ImVec2(table_x, ry), ImVec2(table_x + 3.f, ry + row_h),
+				aida::ui::with_alpha(t.accent_u32, a * row_a));
+		} else if (hovered) {
+			dl->AddRectFilled(ImVec2(table_x, ry), ImVec2(table_x + table_w, ry + row_h),
+				aida::ui::with_alpha(t.hover_wash, a * row_a));
+		} else if (i & 1) {
+			dl->AddRectFilled(ImVec2(table_x, ry), ImVec2(table_x + table_w, ry + row_h),
+				aida::ui::with_alpha(IM_COL32(255, 255, 255, 4), a * row_a));
+		}
 
 		if (hovered && ImGui::IsMouseClicked(0))
 			st.selected_result = i;
 
-		float rx = table_x + 6.f;
+		float rx = table_x + 16.f;
 		char buf[32];
 
 		snprintf(buf, sizeof(buf), "%d", chain.depth);
-		dl->AddText(ImVec2(rx, ry + 3.f), text_main, buf);
+		dl->AddText(aida::ui::fonts::body(), 12.f,
+			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
+			aida::ui::with_alpha(t.text_primary, a * row_a), buf);
 		rx += col_depth_w;
 
-		dl->AddText(ImVec2(rx, ry + 3.f),
-		            chain.is_static ? accent_col : text_dim,
-		            chain.module_name.empty() ? "dynamic" : chain.module_name.c_str());
+		dl->AddText(aida::ui::fonts::body(), 12.f,
+			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
+			chain.is_static ? aida::ui::with_alpha(t.accent_u32, a * row_a)
+			                 : aida::ui::with_alpha(t.text_dim, a * row_a),
+			chain.module_name.empty() ? "dynamic" : chain.module_name.c_str());
 		rx += col_module_w;
 
 		snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(chain.base_offset));
-		dl->AddText(ImVec2(rx, ry + 3.f), text_main, buf);
+		dl->AddText(aida::ui::fonts::code(), 12.f,
+			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
+			aida::ui::with_alpha(t.text_address, a * row_a), buf);
 		rx += col_base_w;
 
 		std::string chain_str;
 		for (size_t j = 0; j < chain.offsets.size(); ++j) {
 			if (j > 0) chain_str += " -> ";
-			char ob[20];
-			if (chain.offsets[j] >= 0)
-				snprintf(ob, sizeof(ob), "+0x%llX", static_cast<unsigned long long>(chain.offsets[j]));
-			else
-				snprintf(ob, sizeof(ob), "-0x%llX", static_cast<unsigned long long>(-chain.offsets[j]));
-			chain_str += ob;
+			chain_str += detail::format_offset(chain.offsets[j]);
 		}
 
 		float avail = col_chain_w - 4.f;
@@ -332,156 +681,126 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				}
 			}
 		}
-		dl->AddText(ImVec2(rx, ry + 3.f), text_dim, chain_str.c_str());
+		dl->AddText(aida::ui::fonts::code(), 11.f,
+			ImVec2(rx, ry + (row_h - 11.f) * 0.5f),
+			aida::ui::with_alpha(t.text_secondary, a * row_a), chain_str.c_str());
 		rx += col_chain_w;
 
-		dl->AddText(ImVec2(rx, ry + 3.f),
-		            chain.validated ? text_val : text_inv,
-		            chain.validated ? "\xe2\x9c\x93" : "?");
-		if (chain.validated) {
-			ImVec2 badge_min(rx - 2.f, ry + 2.f);
-			ImVec2 badge_max(rx + 14.f, ry + row_h - 2.f);
-			dl->AddRectFilled(badge_min, badge_max, IM_COL32(
-				(accent_col >> IM_COL32_R_SHIFT) & 0xFF,
-				(accent_col >> IM_COL32_G_SHIFT) & 0xFF,
-				(accent_col >> IM_COL32_B_SHIFT) & 0xFF,
-				static_cast<int>(40 * row_a)), 4.f);
-		}
-
-		if (i < total - 1)
-			dl->AddLine(ImVec2(table_x, ry + row_h), ImVec2(table_x + table_w, ry + row_h),
-			            _ta(ui_anim::lighten(_t.panel_bg, 12)));
+		ImGui::SetCursorScreenPos(ImVec2(rx, ry + (row_h - 18.f) * 0.5f));
+		ImGui::PushID(i + 32768);
+		aida::ui::pill_kind(chain.validated ? "valid" : "?",
+			chain.validated ? aida::ui::components::pill_kind_t::success
+			                : aida::ui::components::pill_kind_t::neutral,
+			aida::ui::size_t_::sm, true);
+		ImGui::PopID();
 	}
 
 	ImGui::EndChild();
 	ImGui::PopStyleColor();
 
+	if (total == 0) {
+		if (scanning || building) {
+			float sk_y = body_y + 12.f;
+			for (int s = 0; s < 6; ++s) {
+				if (sk_y + 24.f > body_y + body_h) break;
+				aida::ui::skeleton::render_block(dl,
+					ImVec2(table_x + 16.f, sk_y),
+					ImVec2(table_x + table_w - 24.f, sk_y + 22.f), 8.f, 1.4f);
+				sk_y += 30.f;
+			}
+		} else {
+			aida::ui::empty_state::config_t cfg;
+			cfg.glyph = aida::ui::empty_state::glyph_t::dots;
+			if (st.map_entry_count == 0) {
+				cfg.title = "Build the map first";
+				cfg.body = "Click \"Build Pointer Map\" to enumerate every pointer in the target.";
+			} else {
+				cfg.title = "No chains yet";
+				cfg.body = "Enter a target address and click \"Scan Chains\".";
+			}
+			aida::ui::empty_state::render(ImVec2(table_x, body_y), ImVec2(table_w, body_h), cfg);
+		}
+	}
+
 	float det_x = table_x;
-	float det_y = cfg_y + table_h;
+	float det_y = cfg_y + list_h;
 	float det_w = table_w;
 
-	dl->AddLine(ImVec2(det_x, det_y), ImVec2(det_x + det_w, det_y), sep_col);
-		ui_anim::render_panel_card(dl, det_x, det_y + 1.f, det_w, detail_panel_h - 1.f, accent_r, accent_g, accent_b, a, 0.f, true);
+	dl->AddLine(ImVec2(det_x, det_y), ImVec2(det_x + det_w, det_y),
+		aida::ui::with_alpha(t.border_subtle, a), 1.f);
+	dl->AddRectFilled(ImVec2(det_x, det_y + 1.f),
+		ImVec2(det_x + det_w, det_y + detail_h),
+		aida::ui::with_alpha(t.panel_bg, a));
+
 	if (st.selected_result >= 0 && st.selected_result < total) {
 		auto& chain = st.results[st.selected_result];
-
-		ImGui::SetCursorPos(ImVec2(pos_x + config_panel_w + 10.f, pos_y + toolbar_h + table_h + 6.f));
-		ImGui::BeginChild("##ptr_detail", ImVec2(det_w - 20.f, detail_panel_h - 12.f), false);
-
-		ImGui::PushStyleColor(ImGuiCol_Text, accent_col);
-		ImGui::TextUnformatted("Chain Detail");
-		ImGui::PopStyleColor();
-		ImGui::SameLine(det_w - 300.f);
-
-		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
-		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 3.f));
-		ImGui::PushStyleColor(ImGuiCol_Button, _ta(_t.panel_header));
-		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, _ta(ui_anim::lighten(_t.panel_header, 14)));
-		ImGui::PushStyleColor(ImGuiCol_Text, text_main);
-
-		if (ImGui::Button("Copy Chain##ptr")) {
-			std::string cs = pointer_scanner::chain_to_string(chain);
-			ImGui::SetClipboardText(cs.c_str());
+		auto& anim = view.chain_anims[st.selected_result];
+		if (view.last_selected != st.selected_result) {
+			anim.reveal = 0.f;
+			view.last_selected = st.selected_result;
 		}
-		ImGui::SameLine();
-		if (ImGui::Button("Copy C++##ptr")) {
-			std::string cs = pointer_scanner::export_chain_cpp(chain);
-			ImGui::SetClipboardText(cs.c_str());
-		}
-		ImGui::SameLine();
-		if (ImGui::Button("Goto Base##ptr")) {
-			uint64_t addr = 0;
-			if (chain.is_static && chain.module_index >= 0 &&
-			    chain.module_index < static_cast<int>(st.cached_modules.size()))
-				addr = st.cached_modules[chain.module_index].base + chain.base_offset;
-			else
-				addr = chain.base_offset;
-			if (addr != 0) {
-				g_disasm.goto_address = addr;
-				g_disasm.has_new_goto = true;
+
+		dl->AddText(aida::ui::fonts::body_em(), 13.f,
+			ImVec2(det_x + 16.f, det_y + 12.f),
+			aida::ui::with_alpha(t.text_primary, a), "Chain Detail");
+
+		{
+			float bx = det_x + det_w - 320.f;
+			ImGui::SetCursorScreenPos(ImVec2(bx, det_y + 8.f));
+			if (aida::ui::button("Copy Chain", aida::ui::button_kind_t::secondary,
+					aida::ui::size_t_::sm)) {
+				std::string cs = pointer_scanner::chain_to_string(chain);
+				ImGui::SetClipboardText(cs.c_str());
+			}
+			ImGui::SetCursorScreenPos(ImVec2(bx + 100.f, det_y + 8.f));
+			if (aida::ui::button("Copy C++", aida::ui::button_kind_t::secondary,
+					aida::ui::size_t_::sm)) {
+				std::string cs = pointer_scanner::export_chain_cpp(chain);
+				ImGui::SetClipboardText(cs.c_str());
+			}
+			ImGui::SetCursorScreenPos(ImVec2(bx + 200.f, det_y + 8.f));
+			if (aida::ui::button("Goto Base", aida::ui::button_kind_t::primary,
+					aida::ui::size_t_::sm)) {
+				uint64_t addr = 0;
+				if (chain.is_static && chain.module_index >= 0 &&
+				    chain.module_index < static_cast<int>(st.cached_modules.size()))
+					addr = st.cached_modules[chain.module_index].base + chain.base_offset;
+				else
+					addr = chain.base_offset;
+				if (addr != 0) {
+					g_disasm.goto_address = addr;
+					g_disasm.has_new_goto = true;
+					globals::ui::active_center_view = center_view_t::disassembly;
+				}
 			}
 		}
 
-		ImGui::PopStyleColor(3);
-		ImGui::PopStyleVar(2);
+		float info_y = det_y + 36.f;
+		char info_buf[160];
+		snprintf(info_buf, sizeof(info_buf), "Depth %d  ·  %s  ·  %s",
+			chain.depth, chain.is_static ? "Static" : "Dynamic",
+			chain.validated ? "Validated" : "Not validated");
+		dl->AddText(aida::ui::fonts::caption(), 12.f,
+			ImVec2(det_x + 16.f, info_y),
+			aida::ui::with_alpha(t.text_secondary, a), info_buf);
 
-		ImGui::Spacing();
+		float diag_y = det_y + 60.f;
+		float diag_h = detail_h - 70.f;
+		dl->AddRectFilled(ImVec2(det_x + 12.f, diag_y),
+			ImVec2(det_x + det_w - 12.f, diag_y + diag_h),
+			aida::ui::with_alpha(t.bg_overlay, a * 0.55f), 10.f);
+		dl->AddRect(ImVec2(det_x + 12.f, diag_y),
+			ImVec2(det_x + det_w - 12.f, diag_y + diag_h),
+			aida::ui::with_alpha(t.border_subtle, a), 10.f, 0, 1.f);
 
-		ImGui::PushStyleColor(ImGuiCol_Text, text_main);
-		std::string full_chain = pointer_scanner::chain_to_string(chain);
-		ImGui::TextWrapped("%s", full_chain.c_str());
-		ImGui::PopStyleColor();
-
-		ImGui::Spacing();
-
-		ImGui::PushStyleColor(ImGuiCol_Text, text_dim);
-		char info_buf[128];
-		snprintf(info_buf, sizeof(info_buf), "Depth: %d | Static: %s | Validated: %s | Module: %s",
-		         chain.depth, chain.is_static ? "Yes" : "No",
-		         chain.validated ? "Yes" : "Not checked",
-		         chain.module_name.empty() ? "N/A" : chain.module_name.c_str());
-		ImGui::TextUnformatted(info_buf);
-		ImGui::PopStyleColor();
-
-		float diagram_y_start = ImGui::GetCursorPosY();
-		float node_w = 90.f;
-		float node_h = 20.f;
-		float gap = 30.f;
-		float dx = 10.f;
-
-		ImVec2 cwp = ImGui::GetWindowPos();
-		ImDrawList* ddl = ImGui::GetWindowDrawList();
-
-		if (chain.is_static) {
-			char lbl[64];
-			snprintf(lbl, sizeof(lbl), "%s+0x%X",
-			         chain.module_name.c_str(),
-			         static_cast<unsigned>(chain.base_offset));
-			ImVec2 ts = ImGui::CalcTextSize(lbl);
-			float nw = ts.x + 12.f;
-			ddl->AddRectFilled(ImVec2(cwp.x + dx, cwp.y + diagram_y_start),
-			                   ImVec2(cwp.x + dx + nw, cwp.y + diagram_y_start + node_h),
-			                   accent_dim, 4.f);
-			ddl->AddText(ImVec2(cwp.x + dx + 6.f, cwp.y + diagram_y_start + 2.f), accent_col, lbl);
-			dx += nw;
-		}
-
-		for (size_t j = 0; j < chain.offsets.size(); ++j) {
-			float lx0 = cwp.x + dx;
-			float ly0 = cwp.y + diagram_y_start + node_h / 2.f;
-			float lx1 = cwp.x + dx + gap;
-			float cp = gap * 0.4f;
-			ddl->AddBezierCubic(
-				ImVec2(lx0, ly0), ImVec2(lx0 + cp, ly0 - 6.f),
-				ImVec2(lx1 - cp, ly0 + 6.f), ImVec2(lx1, ly0),
-				accent_dim, 1.5f);
-			ddl->AddTriangleFilled(
-				ImVec2(lx1 - 6.f, ly0 - 4.f),
-				ImVec2(lx1 - 6.f, ly0 + 4.f),
-				ImVec2(lx1, ly0),
-				accent_col);
-			dx += gap;
-
-			char ob[24];
-			if (chain.offsets[j] >= 0)
-				snprintf(ob, sizeof(ob), "+0x%llX", static_cast<unsigned long long>(chain.offsets[j]));
-			else
-				snprintf(ob, sizeof(ob), "-0x%llX", static_cast<unsigned long long>(-chain.offsets[j]));
-			ImVec2 ots = ImGui::CalcTextSize(ob);
-			float ow = ots.x + 12.f;
-			ddl->AddRectFilled(ImVec2(cwp.x + dx, cwp.y + diagram_y_start),
-			                   ImVec2(cwp.x + dx + ow, cwp.y + diagram_y_start + node_h),
-			                   _ta(_t.panel_bg), 4.f);
-			ddl->AddText(ImVec2(cwp.x + dx + 6.f, cwp.y + diagram_y_start + 2.f), text_main, ob);
-			dx += ow;
-		}
-
-		ImGui::EndChild();
-	} else {
-		ImGui::SetCursorPos(ImVec2(pos_x + config_panel_w + 10.f, pos_y + toolbar_h + table_h + 6.f));
-		ImGui::PushStyleColor(ImGuiCol_Text, text_dim);
-		ImGui::TextUnformatted("Select a result to view chain details");
-		ImGui::PopStyleColor();
+		detail::render_chain_diagram(dl, det_x + 12.f, diag_y, det_w - 24.f, diag_h,
+			st.selected_result, chain, a, anim);
+	} else if (total > 0) {
+		aida::ui::empty_state::config_t cfg;
+		cfg.glyph = aida::ui::empty_state::glyph_t::flow;
+		cfg.title = "Select a chain";
+		cfg.body = "Click any row above to inspect its dereference path. Click any step to peek at the resolved memory.";
+		aida::ui::empty_state::render(ImVec2(det_x, det_y), ImVec2(det_w, detail_h), cfg);
 	}
 }
 

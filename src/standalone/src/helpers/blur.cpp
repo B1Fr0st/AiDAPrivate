@@ -184,6 +184,42 @@ void Blur::Draw(ImDrawList* dl, ImVec2 min, ImVec2 max)
     dl->AddLine(ImVec2(min.x + 2, min.y + 1), ImVec2(max.x - 2, min.y + 1), IM_COL32(255, 255, 255, 60));
 }
 
+void Blur::Resize(int w, int h)
+{
+    if (!s_device) return;
+    if (w <= 0 || h <= 0) return;
+    if (w == s_w && h == s_h) return;
+
+    if (s_copy) { s_copy->Release(); s_copy = nullptr; }
+    if (s_pingpong[0]) { s_pingpong[0]->Release(); s_pingpong[0] = nullptr; }
+    if (s_pingpong[1]) { s_pingpong[1]->Release(); s_pingpong[1] = nullptr; }
+    for (int i = 0; i < 3; i++) if (s_srv[i]) { s_srv[i]->Release(); s_srv[i] = nullptr; }
+    for (int i = 0; i < 2; i++) if (s_rtv[i]) { s_rtv[i]->Release(); s_rtv[i] = nullptr; }
+
+    s_w = w; s_h = h;
+
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    s_device->CreateTexture2D(&td, nullptr, &s_copy);
+    if (s_copy) s_device->CreateShaderResourceView(s_copy, nullptr, &s_srv[0]);
+
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    s_device->CreateTexture2D(&td, nullptr, &s_pingpong[0]);
+    s_device->CreateTexture2D(&td, nullptr, &s_pingpong[1]);
+    if (s_pingpong[0]) {
+        s_device->CreateShaderResourceView(s_pingpong[0], nullptr, &s_srv[1]);
+        s_device->CreateRenderTargetView(s_pingpong[0], nullptr, &s_rtv[0]);
+    }
+    if (s_pingpong[1]) {
+        s_device->CreateShaderResourceView(s_pingpong[1], nullptr, &s_srv[2]);
+        s_device->CreateRenderTargetView(s_pingpong[1], nullptr, &s_rtv[1]);
+    }
+}
+
 void Blur::Shutdown()
 {
     if (s_copy) { s_copy->Release();        s_copy = nullptr; }

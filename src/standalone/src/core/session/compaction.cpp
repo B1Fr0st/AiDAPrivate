@@ -484,9 +484,9 @@ namespace compaction {
 
 		std::string agent_name = "compaction";
 		if (!provider_id.empty()) {
-			const aida::agent::agent_info_t* small =
+			const aida::agent::agent_info_t* sm_agent =
 				aida::agent::small_compaction_agent_for(provider_id);
-			if (small != nullptr) agent_name = small->name;
+			if (sm_agent != nullptr) agent_name = sm_agent->name;
 		}
 
 		std::string summary_text;

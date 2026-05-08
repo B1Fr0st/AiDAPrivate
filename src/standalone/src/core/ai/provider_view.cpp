@@ -36,6 +36,16 @@
 #include "standalone_settings.hpp"
 #include "toast_notification.hpp"
 #include "ui_anim.hpp"
+#include "../ui/avatar.hpp"
+#include "../ui/blur_layer.hpp"
+#include "../ui/brand.hpp"
+#include "../ui/clock.hpp"
+#include "../ui/components.hpp"
+#include "../ui/empty_state.hpp"
+#include "../ui/fonts.hpp"
+#include "../ui/motion.hpp"
+#include "../ui/theme.hpp"
+#include "../ui/transition.hpp"
 #include "../helpers/globals.h"
 
 namespace aida {
@@ -67,6 +77,11 @@ namespace {
 		std::string       message;
 	};
 
+	struct card_anim_t
+	{
+		aida::ui::hover_state_t hover;
+	};
+
 	struct view_state_t
 	{
 		std::mutex                            mtx;
@@ -82,6 +97,7 @@ namespace {
 		refresh_state_t                       refresh;
 		std::atomic<bool>                     shutdown_flag{ false };
 		bool                                  initialized = false;
+		std::unordered_map<std::string, card_anim_t> card_anims;
 	};
 
 	view_state_t& g_state()
@@ -105,29 +121,6 @@ namespace {
 		std::string out = s.substr(0, max_len);
 		out += "...";
 		return out;
-	}
-
-	ImU32 hash_color_for(const std::string& provider_id)
-	{
-		uint32_t h = 2166136261u;
-		for (unsigned char c : provider_id) {
-			h ^= c;
-			h *= 16777619u;
-		}
-		const int r = static_cast<int>(60 + (h & 0x7F));
-		const int g = static_cast<int>(60 + ((h >> 8) & 0x7F));
-		const int b = static_cast<int>(60 + ((h >> 16) & 0x7F));
-		return IM_COL32(r, g, b, 230);
-	}
-
-	char glyph_for(const catalog_provider_t& p)
-	{
-		const std::string& base = p.name.empty() ? p.id : p.name;
-		for (unsigned char c : base) {
-			if (std::isalnum(c))
-				return static_cast<char>(std::toupper(c));
-		}
-		return '?';
 	}
 
 	std::string format_cost_pair(double in_per_m, double out_per_m)
@@ -163,44 +156,44 @@ namespace {
 		return true;
 	}
 
-	struct status_pill_t
+	struct status_summary_t
 	{
 		std::string label;
-		ImU32       fill;
-		ImU32       text;
+		aida::ui::pill_kind_t kind;
+		bool dot_pulse;
 	};
 
-	status_pill_t status_pill_for(const std::string& provider_id)
+	status_summary_t status_for(const std::string& provider_id)
 	{
-		status_pill_t pill;
+		status_summary_t s;
 		auth_info_t info;
 		const bool present = aida::auth::store::get(provider_id, info);
 		if (!present || info.kind == auth_kind_t::none) {
-			pill.label = "Not configured";
-			pill.fill = IM_COL32(70, 75, 90, 200);
-			pill.text = IM_COL32(220, 222, 232, 240);
-			return pill;
+			s.label = "Not configured";
+			s.kind = aida::ui::pill_kind_t::neutral;
+			s.dot_pulse = false;
+			return s;
 		}
 		const auto now = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
 			std::chrono::system_clock::now().time_since_epoch()).count());
 		if (info.kind == auth_kind_t::oauth) {
 			if (info.expires_unix > 0 && info.expires_unix <= now) {
-				pill.label = "Token expired";
-				pill.fill = IM_COL32(170, 110, 60, 220);
-				pill.text = IM_COL32(255, 240, 220, 240);
-				return pill;
+				s.label = "Token expired";
+				s.kind = aida::ui::pill_kind_t::warning;
+				s.dot_pulse = true;
+				return s;
 			}
-			pill.label = "OAuth";
+			s.label = "OAuth";
 		} else if (info.kind == auth_kind_t::api) {
-			pill.label = "API key";
+			s.label = "API key";
 		} else if (info.kind == auth_kind_t::wellknown) {
-			pill.label = "Well-known";
+			s.label = "Well-known";
 		} else {
-			pill.label = "Authenticated";
+			s.label = "Authenticated";
 		}
-		pill.fill = IM_COL32(70, 140, 90, 220);
-		pill.text = IM_COL32(220, 250, 230, 245);
-		return pill;
+		s.kind = aida::ui::pill_kind_t::success;
+		s.dot_pulse = true;
+		return s;
 	}
 
 	std::vector<const catalog_model_t*> collect_models_sorted(const std::string& provider_id)
@@ -574,29 +567,94 @@ namespace {
 		return false;
 	}
 
-	void draw_brand_glyph(ImDrawList* dl, float cx, float cy, float radius,
-		const catalog_provider_t& p, float alpha)
+	void draw_anthropic_glyph(ImDrawList* dl, ImVec2 c, float r, ImU32 col, float alpha)
 	{
-		const ImU32 fill = ui_anim::theme_alpha(hash_color_for(p.id), alpha);
-		const ImU32 ring = ui_anim::theme_alpha(IM_COL32(255, 255, 255, 60), alpha);
-		dl->AddCircleFilled(ImVec2(cx, cy), radius, fill, 32);
-		dl->AddCircle(ImVec2(cx, cy), radius, ring, 32, 1.5f);
-		char letter[2] = { glyph_for(p), '\0' };
-		const ImVec2 ts = ImGui::CalcTextSize(letter);
-		dl->AddText(ImVec2(cx - ts.x * 0.5f, cy - ts.y * 0.5f),
-			ui_anim::theme_alpha(IM_COL32(255, 255, 255, 240), alpha), letter);
+		ImU32 cf = aida::ui::with_alpha(col, alpha);
+		ImVec2 p0(c.x - r * 0.5f, c.y + r * 0.55f);
+		ImVec2 p1(c.x, c.y - r * 0.65f);
+		ImVec2 p2(c.x + r * 0.5f, c.y + r * 0.55f);
+		dl->AddLine(p0, p1, cf, r * 0.18f);
+		dl->AddLine(p1, p2, cf, r * 0.18f);
+		dl->AddLine(ImVec2(c.x - r * 0.2f, c.y + r * 0.05f),
+			ImVec2(c.x + r * 0.2f, c.y + r * 0.05f), cf, r * 0.14f);
 	}
 
-	void draw_status_pill(ImDrawList* dl, float x, float y, const status_pill_t& pill, float alpha)
+	void draw_openai_glyph(ImDrawList* dl, ImVec2 c, float r, ImU32 col, float alpha)
 	{
-		const ImVec2 ts = ImGui::CalcTextSize(pill.label.c_str());
-		const float pad_x = 8.f;
-		const float h = ts.y + 4.f;
-		const float w = ts.x + pad_x * 2.f;
-		const ImU32 fill = ui_anim::theme_alpha(pill.fill, alpha);
-		const ImU32 text = ui_anim::theme_alpha(pill.text, alpha);
-		dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), fill, h * 0.5f);
-		dl->AddText(ImVec2(x + pad_x, y + 2.f), text, pill.label.c_str());
+		ImU32 cf = aida::ui::with_alpha(col, alpha);
+		const int lobes = 3;
+		for (int i = 0; i < lobes; ++i) {
+			float ang = static_cast<float>(i) * (6.2831853f / lobes) - 1.5707963f;
+			ImVec2 lc(c.x + cosf(ang) * r * 0.35f, c.y + sinf(ang) * r * 0.35f);
+			dl->AddCircle(lc, r * 0.45f, cf, 32, r * 0.10f);
+		}
+	}
+
+	void draw_google_glyph(ImDrawList* dl, ImVec2 c, float r, ImU32 col, float alpha)
+	{
+		ImU32 cf = aida::ui::with_alpha(col, alpha);
+		dl->PathArcTo(c, r * 0.7f, 0.f, 5.f, 32);
+		dl->PathStroke(cf, 0, r * 0.18f);
+		dl->AddLine(ImVec2(c.x + r * 0.7f, c.y), ImVec2(c.x + r * 0.15f, c.y),
+			cf, r * 0.18f);
+	}
+
+	void draw_mistral_glyph(ImDrawList* dl, ImVec2 c, float r, ImU32 col, float alpha)
+	{
+		ImU32 cf = aida::ui::with_alpha(col, alpha);
+		float h = r * 1.2f;
+		for (int i = 0; i < 4; ++i) {
+			float x = c.x + (-1.5f + static_cast<float>(i)) * (r * 0.30f);
+			dl->AddLine(ImVec2(x, c.y - h * 0.35f), ImVec2(x, c.y + h * 0.35f), cf, r * 0.14f);
+		}
+		dl->AddLine(ImVec2(c.x - r * 0.55f, c.y - h * 0.35f),
+			ImVec2(c.x + r * 0.55f, c.y - h * 0.35f), cf, r * 0.14f);
+	}
+
+	void draw_provider_mark(ImDrawList* dl, ImVec2 center, float radius,
+		const catalog_provider_t& p, float alpha)
+	{
+		const auto& th = aida::ui::resolved();
+		ImU32 base = aida::ui::brand::hash_color(p.id.c_str(), th.is_dark ? 0.55f : 0.50f);
+		ImU32 top = aida::ui::lighten(base, 30);
+		ImU32 bot = aida::ui::darken(base, 20);
+		int segs = 32;
+		for (int i = 0; i < segs; ++i) {
+			float a0 = (static_cast<float>(i) / segs) * 6.2831853f - 1.5707963f;
+			float a1 = (static_cast<float>(i + 1) / segs) * 6.2831853f - 1.5707963f;
+			float fy = (sinf(a0) + 1.f) * 0.5f;
+			ImU32 col = aida::ui::mix(top, bot, fy);
+			ImVec2 p0(center.x + cosf(a0) * radius, center.y + sinf(a0) * radius);
+			ImVec2 p1(center.x + cosf(a1) * radius, center.y + sinf(a1) * radius);
+			dl->AddTriangleFilled(center, p0, p1, aida::ui::with_alpha(col, alpha));
+		}
+
+		ImU32 ring = aida::ui::with_alpha(th.is_dark ? IM_COL32(255, 255, 255, 50)
+			: IM_COL32(0, 0, 0, 60), alpha);
+		dl->AddCircle(center, radius - 0.5f, ring, 32, 1.f);
+
+		ImU32 fg = IM_COL32(255, 255, 255, 240);
+		float r = (static_cast<float>((base >> IM_COL32_R_SHIFT) & 0xFF)) / 255.f;
+		float g = (static_cast<float>((base >> IM_COL32_G_SHIFT) & 0xFF)) / 255.f;
+		float b = (static_cast<float>((base >> IM_COL32_B_SHIFT) & 0xFF)) / 255.f;
+		float lum = 0.299f * r + 0.587f * g + 0.114f * b;
+		if (lum > 0.65f) fg = IM_COL32(20, 20, 30, 240);
+
+		const std::string& id = p.id;
+		if (id == "anthropic") draw_anthropic_glyph(dl, center, radius * 0.85f, fg, alpha);
+		else if (id == "openai") draw_openai_glyph(dl, center, radius * 0.85f, fg, alpha);
+		else if (id == "google" || id == "google-vertex" || id == "vertex")
+			draw_google_glyph(dl, center, radius * 0.85f, fg, alpha);
+		else if (id == "mistral" || id == "mistralai") draw_mistral_glyph(dl, center, radius * 0.85f, fg, alpha);
+		else {
+			std::string seed = p.name.empty() ? p.id : p.name;
+			char glyph[2] = { aida::ui::avatar::first_glyph(seed), 0 };
+			ImFont* f = aida::ui::fonts::body_strong();
+			float fs = radius * 1.05f;
+			ImVec2 sz = f->CalcTextSizeA(fs, FLT_MAX, 0.f, glyph);
+			dl->AddText(f, fs, ImVec2(center.x - sz.x * 0.5f, center.y - sz.y * 0.5f),
+				aida::ui::with_alpha(fg, alpha), glyph);
+		}
 	}
 
 	void load_detail_buffers(const std::string& provider_id)
@@ -610,63 +668,146 @@ namespace {
 		st.detail_buffers_loaded = true;
 	}
 
-	void render_provider_card(float ox, float oy, float card_w, float card_h,
-		const catalog_provider_t& provider, float alpha,
-		float ar, float ag, float ab)
+	double max_total_cost_in_catalog()
 	{
-		auto* dl = ImGui::GetWindowDrawList();
+		const auto& providers = aida::provider::catalog::list_providers();
+		double max_v = 0.0;
+		for (const auto& p : providers) {
+			std::string mid = preferred_model_for(p.id);
+			if (mid.empty()) continue;
+			const auto* m = aida::provider::catalog::get_model(p.id, mid);
+			if (!m) continue;
+			double total = m->cost.input_per_million + m->cost.output_per_million;
+			if (total > max_v) max_v = total;
+		}
+		if (max_v <= 0.0) max_v = 1.0;
+		return max_v;
+	}
+
+	void render_capability_badges(ImVec2 origin, const catalog_model_t* m, float alpha)
+	{
+		if (m == nullptr) return;
+		const auto& th = aida::ui::resolved();
+		struct cap_t { const char* label; bool active; ImU32 col; };
+		ImU32 col_temp = th.info;
+		ImU32 col_reason = th.accent_u32;
+		ImU32 col_attach = th.success;
+		ImU32 col_tool = th.warning;
+		ImU32 col_inter = th.accent_grad_top;
+		cap_t caps[] = {
+			{ "temp", m->capabilities.temperature, col_temp },
+			{ "reason", m->capabilities.reasoning, col_reason },
+			{ "attach", m->capabilities.attachment, col_attach },
+			{ "tools", m->capabilities.tool_call, col_tool },
+			{ "inter", m->capabilities.interleaved, col_inter },
+		};
+		float x = origin.x;
+		float y = origin.y;
+		for (const auto& c : caps) {
+			if (!c.active) continue;
+			ImGui::SetCursorScreenPos(ImVec2(x, y));
+			aida::ui::badge(c.label, aida::ui::with_alpha(c.col, alpha * 0.85f), 4.f);
+			ImVec2 sz = ImGui::CalcTextSize(c.label);
+			x += sz.x + 14.f;
+		}
+	}
+
+	void render_provider_card(float ox, float oy, float card_w, float card_h,
+		const catalog_provider_t& provider, float alpha, double max_total_cost,
+		float dt)
+	{
 		auto& st = g_state();
+		const auto& th = aida::ui::resolved();
+		auto* dl = ImGui::GetWindowDrawList();
 
 		const bool selected = (st.selected_detail_provider_id == provider.id);
 
-		const ImU32 panel_bg = ui_anim::theme_alpha(IM_COL32(28, 30, 40, 220), alpha);
-		const ImU32 panel_bg_hover = ui_anim::theme_alpha(IM_COL32(38, 42, 56, 230), alpha);
-		const ImU32 panel_border = ui_anim::theme_alpha(IM_COL32(60, 66, 82, 150), alpha);
-		const ImU32 accent_border = IM_COL32(
-			static_cast<int>(ar * 255), static_cast<int>(ag * 255),
-			static_cast<int>(ab * 255), static_cast<int>(220 * alpha));
+		card_anim_t* ca = nullptr;
+		{
+			std::lock_guard<std::mutex> lk(st.mtx);
+			ca = &st.card_anims[provider.id];
+		}
 
-		const ImVec2 card_min(ox, oy);
-		const ImVec2 card_max(ox + card_w, oy + card_h);
-		const bool hovered = ImGui::IsMouseHoveringRect(card_min, card_max, false);
+		ImGui::PushID(provider.id.c_str());
+		ImGui::SetCursorScreenPos(ImVec2(ox, oy));
+		ImGui::SetNextItemAllowOverlap();
+		ImGui::InvisibleButton("##card_hit", ImVec2(card_w, card_h));
+		bool hov = ImGui::IsItemHovered();
+		bool clicked = ImGui::IsItemClicked();
+		ImGui::PopID();
 
-		dl->AddRectFilled(card_min, card_max, hovered ? panel_bg_hover : panel_bg, 8.f);
-		dl->AddRect(card_min, card_max, selected ? accent_border : panel_border,
-			8.f, 0, selected ? 2.f : 1.f);
+		float hov_v = ca->hover.tick(hov, dt, aida::motion::spring::playful);
+		float lift = hov_v * 3.f;
 
-		const float glyph_radius = 20.f;
-		const float glyph_cx = ox + 8.f + glyph_radius;
-		const float glyph_cy = oy + card_h * 0.5f;
-		draw_brand_glyph(dl, glyph_cx, glyph_cy, glyph_radius, provider, alpha);
+		ImVec2 card_a(ox, oy - lift);
+		ImVec2 card_b(ox + card_w, oy + card_h - lift);
+
+		if (hov_v > 0.05f) {
+			aida::ui::blur::render_drop_shadow(dl, card_a, card_b, 12.f, 5,
+				0.30f * hov_v, ImVec2(0.f, 4.f * hov_v));
+		}
+
+		ImU32 fill = aida::ui::mix(
+			aida::ui::with_alpha(th.panel_header, alpha * 0.85f),
+			aida::ui::with_alpha(th.bg_elevated, alpha),
+			0.3f + hov_v * 0.3f);
+		dl->AddRectFilled(card_a, card_b, fill, 12.f);
+		dl->AddRect(card_a, card_b,
+			selected ? th.accent_u32 :
+			aida::ui::with_alpha(th.border_subtle, alpha * (0.7f + hov_v * 0.4f)),
+			12.f, 0, selected ? 1.6f : 1.f);
+
+		const float glyph_radius = 22.f;
+		const float glyph_cx = card_a.x + 14.f + glyph_radius;
+		const float glyph_cy = (card_a.y + card_b.y) * 0.5f;
+		draw_provider_mark(dl, ImVec2(glyph_cx, glyph_cy), glyph_radius, provider, alpha);
 
 		const float middle_x = glyph_cx + glyph_radius + 14.f;
-		const float middle_w = card_w * 0.40f;
-
-		const ImU32 text_primary = ui_anim::theme_alpha(IM_COL32(225, 228, 240, 245), alpha);
-		const ImU32 text_dim = ui_anim::theme_alpha(IM_COL32(160, 165, 180, 200), alpha);
+		const float middle_w = card_w * 0.36f;
 
 		const std::string display_name = provider.name.empty() ? provider.id : provider.name;
-		dl->AddText(ImVec2(middle_x, oy + 10.f), text_primary, display_name.c_str());
+		dl->AddText(aida::ui::fonts::body_strong(), 14.f,
+			ImVec2(middle_x, card_a.y + 10.f),
+			aida::ui::with_alpha(th.text_primary, alpha), display_name.c_str());
 
-		const status_pill_t pill = status_pill_for(provider.id);
-		draw_status_pill(dl, middle_x, oy + 32.f, pill, alpha);
-
-		char count_buf[64];
-		std::snprintf(count_buf, sizeof(count_buf), "%d models",
-			static_cast<int>(provider.model_ids.size()));
-		dl->AddText(ImVec2(middle_x, oy + card_h - 22.f), text_dim, count_buf);
-
-		const float right_x = middle_x + middle_w + 14.f;
-		const float right_w = card_w - (right_x - ox) - 16.f;
-		if (right_w < 100.f)
-			return;
+		status_summary_t status = status_for(provider.id);
+		ImGui::SetCursorScreenPos(ImVec2(middle_x, card_a.y + 30.f));
+		aida::ui::pill_kind(status.label.c_str(), status.kind,
+			aida::ui::size_t_::sm, status.dot_pulse);
 
 		std::string current_model_id = preferred_model_for(provider.id);
 		const auto* current_model = current_model_id.empty()
 			? nullptr
 			: aida::provider::catalog::get_model(provider.id, current_model_id);
 
-		ImGui::SetCursorScreenPos(ImVec2(right_x, oy + 8.f));
+		if (current_model) {
+			render_capability_badges(ImVec2(middle_x, card_a.y + card_h - 28.f),
+				current_model, alpha);
+		} else {
+			char count_buf[64];
+			std::snprintf(count_buf, sizeof(count_buf), "%d models",
+				static_cast<int>(provider.model_ids.size()));
+			dl->AddText(aida::ui::fonts::caption(), 11.f,
+				ImVec2(middle_x, card_a.y + card_h - 22.f),
+				aida::ui::with_alpha(th.text_dim, alpha), count_buf);
+		}
+
+		const float right_x = middle_x + middle_w + 14.f;
+		const float right_w = card_w - (right_x - card_a.x) - 16.f;
+		if (right_w < 100.f) {
+			if (clicked) {
+				if (selected) {
+					st.selected_detail_provider_id.clear();
+					st.detail_buffers_loaded = false;
+				} else {
+					st.selected_detail_provider_id = provider.id;
+					load_detail_buffers(provider.id);
+				}
+			}
+			return;
+		}
+
+		ImGui::SetCursorScreenPos(ImVec2(right_x, card_a.y + 8.f));
 		ImGui::PushID(provider.id.c_str());
 		ImGui::PushItemWidth(right_w);
 
@@ -691,21 +832,38 @@ namespace {
 		}
 		ImGui::PopItemWidth();
 
-		const float info_y = oy + 38.f;
-		std::string cost_label = "cost: ";
-		std::string ctx_label = "context: ";
+		const float info_y = card_a.y + 36.f;
+		double total_cost = 0.0;
 		if (current_model) {
-			cost_label += format_cost_pair(current_model->cost.input_per_million,
+			total_cost = current_model->cost.input_per_million + current_model->cost.output_per_million;
+			std::string cost_label = "cost: " + format_cost_pair(
+				current_model->cost.input_per_million,
 				current_model->cost.output_per_million);
-			ctx_label += format_context(current_model->limit.context);
-		} else {
-			cost_label += "-";
-			ctx_label += "-";
-		}
-		dl->AddText(ImVec2(right_x, info_y), text_dim, cost_label.c_str());
-		dl->AddText(ImVec2(right_x, info_y + 16.f), text_dim, ctx_label.c_str());
+			std::string ctx_label = "ctx: " + format_context(current_model->limit.context);
+			dl->AddText(aida::ui::fonts::caption(), 11.f,
+				ImVec2(right_x, info_y),
+				aida::ui::with_alpha(th.text_dim, alpha), cost_label.c_str());
+			dl->AddText(aida::ui::fonts::caption(), 11.f,
+				ImVec2(right_x, info_y + 14.f),
+				aida::ui::with_alpha(th.text_dim, alpha), ctx_label.c_str());
 
-		ImGui::SetCursorScreenPos(ImVec2(right_x, oy + card_h - 30.f));
+			const float bar_y = info_y + 30.f;
+			const float bar_w = right_w * 0.6f;
+			const float bar_h = 4.f;
+			float ratio = static_cast<float>(total_cost / max_total_cost);
+			if (ratio < 0.f) ratio = 0.f;
+			if (ratio > 1.f) ratio = 1.f;
+			ImVec2 bg_a(right_x, bar_y);
+			ImVec2 bg_b(right_x + bar_w, bar_y + bar_h);
+			dl->AddRectFilled(bg_a, bg_b,
+				aida::ui::with_alpha(th.panel_header, alpha), bar_h * 0.5f);
+			dl->AddRectFilledMultiColor(
+				bg_a, ImVec2(right_x + bar_w * ratio, bar_y + bar_h),
+				th.accent_grad_top, th.accent_grad_top,
+				th.accent_grad_bot, th.accent_grad_bot);
+		}
+
+		ImGui::SetCursorScreenPos(ImVec2(right_x, card_b.y - 32.f));
 
 		const std::string test_key = current_model_id.empty()
 			? std::string()
@@ -725,17 +883,23 @@ namespace {
 			}
 		}
 
-		const std::string test_label = test_running ? std::string("Testing...") : std::string("Test");
-		if (ImGui::Button((test_label + std::string("##") + provider.id).c_str(), ImVec2(80.f, 22.f))) {
+		const std::string test_label = test_running ? std::string("Testing") : std::string("Test");
+		if (aida::ui::button(test_label.c_str(),
+				aida::ui::button_kind_t::ghost,
+				aida::ui::size_t_::sm,
+				ImVec2(80.f, 24.f),
+				false, nullptr, test_running)) {
 			if (!test_running && !current_model_id.empty()) {
 				run_test_connection(provider.id, current_model_id);
 			}
 		}
-		ImGui::SameLine();
+		ImGui::SameLine(0.f, 6.f);
 
 		const bool is_default = (g_sa_settings.default_provider_id == provider.id);
-		const std::string default_label = is_default ? std::string("Default *") : std::string("Set default");
-		if (ImGui::Button((default_label + std::string("##def_") + provider.id).c_str(), ImVec2(110.f, 22.f))) {
+		if (aida::ui::button(is_default ? "Default *" : "Set default",
+				is_default ? aida::ui::button_kind_t::primary : aida::ui::button_kind_t::secondary,
+				aida::ui::size_t_::sm,
+				ImVec2(112.f, 24.f))) {
 			if (!current_model_id.empty()) {
 				g_sa_settings.set_selection(provider.id, current_model_id);
 				g_sa_settings.save();
@@ -751,9 +915,11 @@ namespace {
 					toast_notification::toast_type_t::warning, 3.0f);
 			}
 		}
-		ImGui::SameLine();
-		const std::string detail_label = (selected ? std::string("Hide details") : std::string("Details"));
-		if (ImGui::Button((detail_label + std::string("##det_") + provider.id).c_str(), ImVec2(96.f, 22.f))) {
+		ImGui::SameLine(0.f, 6.f);
+		if (aida::ui::button(selected ? "Hide" : "Details",
+				aida::ui::button_kind_t::ghost,
+				aida::ui::size_t_::sm,
+				ImVec2(80.f, 24.f))) {
 			if (selected) {
 				st.selected_detail_provider_id.clear();
 				st.detail_buffers_loaded = false;
@@ -764,9 +930,9 @@ namespace {
 		}
 
 		if (has_result) {
-			const ImU32 res_col = test_res.success
-				? ui_anim::theme_alpha(IM_COL32(110, 200, 130, 230), alpha)
-				: ui_anim::theme_alpha(IM_COL32(220, 110, 110, 230), alpha);
+			ImU32 res_col = test_res.success
+				? aida::ui::with_alpha(th.success, alpha)
+				: aida::ui::with_alpha(th.error, alpha);
 			char buf[256];
 			if (test_res.success) {
 				std::snprintf(buf, sizeof(buf), "OK %dms - %s",
@@ -774,26 +940,46 @@ namespace {
 			} else {
 				std::snprintf(buf, sizeof(buf), "FAIL: %s", truncate_text(test_res.message, 90).c_str());
 			}
-			dl->AddText(ImVec2(right_x, oy + card_h - 50.f), res_col, buf);
+			dl->AddText(aida::ui::fonts::caption(), 10.f,
+				ImVec2(right_x, card_b.y - 50.f), res_col, buf);
+		}
+
+		if (clicked) {
+			if (selected) {
+				st.selected_detail_provider_id.clear();
+				st.detail_buffers_loaded = false;
+			} else {
+				st.selected_detail_provider_id = provider.id;
+				load_detail_buffers(provider.id);
+			}
 		}
 
 		ImGui::PopID();
 	}
 
-	void render_detail_pane(float panel_w, float panel_h, float ox, float oy,
-		float pane_w, float pane_h, float alpha, float ar, float ag, float ab)
+	void render_detail_pane(float ox, float oy, float pane_w, float pane_h, float alpha)
 	{
-		(void)panel_w;
-		(void)panel_h;
-		auto* dl = ImGui::GetWindowDrawList();
+		const auto& th = aida::ui::resolved();
 		auto& st = g_state();
+		auto* dl = ImGui::GetWindowDrawList();
 		if (st.selected_detail_provider_id.empty())
 			return;
 
-		const ImU32 bg = ui_anim::theme_alpha(IM_COL32(20, 22, 30, 230), alpha);
-		const ImU32 border = ui_anim::theme_alpha(IM_COL32(60, 66, 82, 160), alpha);
-		dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + pane_w, oy + pane_h), bg, 8.f);
-		dl->AddRect(ImVec2(ox, oy), ImVec2(ox + pane_w, oy + pane_h), border, 8.f, 0, 1.f);
+		ImVec2 a(ox, oy);
+		ImVec2 b(ox + pane_w, oy + pane_h);
+
+		aida::ui::blur::layer_request_t br;
+		br.pos = a;
+		br.size = ImVec2(pane_w, pane_h);
+		br.radius = 12.f;
+		br.strength = 0.7f;
+		br.alpha = alpha;
+		aida::ui::blur::schedule(br);
+
+		aida::ui::blur::render_drop_shadow(dl, a, b, 12.f, 4, 0.30f * alpha,
+			ImVec2(0.f, 4.f));
+		aida::ui::blur::render_glass_fill(dl, a, b, 12.f, alpha);
+		aida::ui::blur::render_glass_border(dl, a, b, 12.f, alpha, 1.f);
 
 		const auto* prov = aida::provider::catalog::get_provider(st.selected_detail_provider_id);
 		if (!prov) {
@@ -802,27 +988,32 @@ namespace {
 		}
 
 		ImGui::PushID("provider_detail_pane");
-		const ImU32 text_primary = ui_anim::theme_alpha(IM_COL32(225, 228, 240, 245), alpha);
 		const std::string title = std::string("Details: ") + (prov->name.empty() ? prov->id : prov->name);
-		dl->AddText(ImVec2(ox + 14.f, oy + 10.f), text_primary, title.c_str());
+		dl->AddText(aida::ui::fonts::h2(), 16.f, ImVec2(a.x + 14.f, a.y + 10.f),
+			aida::ui::with_alpha(th.text_primary, alpha), title.c_str());
 
-		ImGui::SetCursorScreenPos(ImVec2(ox + 14.f, oy + 36.f));
-		const float input_w = pane_w - 28.f;
+		ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 40.f));
+		dl->AddText(aida::ui::fonts::body_em(), 12.f,
+			ImVec2(a.x + 14.f, a.y + 40.f),
+			aida::ui::with_alpha(th.text_secondary, alpha), "Base URL");
 
-		ImGui::TextUnformatted("Base URL");
-		ImGui::SetCursorScreenPos(ImVec2(ox + 14.f, oy + 56.f));
-		ImGui::PushItemWidth(input_w);
-		ImGui::InputText("##detail_base_url", st.detail_base_url_buf, sizeof(st.detail_base_url_buf));
-		ImGui::PopItemWidth();
+		ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 58.f));
+		aida::ui::input_text("##detail_base_url",
+			st.detail_base_url_buf, sizeof(st.detail_base_url_buf),
+			"https://api.host", false, ImVec2(pane_w - 28.f, 32.f));
 
-		ImGui::SetCursorScreenPos(ImVec2(ox + 14.f, oy + 88.f));
-		ImGui::TextUnformatted("Extra headers JSON");
-		ImGui::SetCursorScreenPos(ImVec2(ox + 14.f, oy + 108.f));
+		ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 100.f));
+		dl->AddText(aida::ui::fonts::body_em(), 12.f,
+			ImVec2(a.x + 14.f, a.y + 100.f),
+			aida::ui::with_alpha(th.text_secondary, alpha), "Extra headers JSON");
+
+		ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 118.f));
 		ImGui::InputTextMultiline("##detail_headers", st.detail_headers_buf, sizeof(st.detail_headers_buf),
-			ImVec2(input_w, 100.f));
+			ImVec2(pane_w - 28.f, 100.f));
 
-		ImGui::SetCursorScreenPos(ImVec2(ox + 14.f, oy + 220.f));
-		if (ImGui::Button("Save##detail_save", ImVec2(110.f, 24.f))) {
+		ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 230.f));
+		if (aida::ui::button("Save", aida::ui::button_kind_t::primary,
+				aida::ui::size_t_::md, ImVec2(110.f, 28.f))) {
 			const std::string base = sa_settings_detail::trim(std::string(st.detail_base_url_buf));
 			if (base.empty())
 				g_sa_settings.provider_base_url_overrides.erase(st.selected_detail_provider_id);
@@ -840,8 +1031,9 @@ namespace {
 					toast_notification::toast_type_t::info, 3.0f);
 			}
 		}
-		ImGui::SameLine();
-		if (ImGui::Button("Reset##detail_reset", ImVec2(110.f, 24.f))) {
+		ImGui::SameLine(0.f, 8.f);
+		if (aida::ui::button("Reset", aida::ui::button_kind_t::secondary,
+				aida::ui::size_t_::md, ImVec2(110.f, 28.f))) {
 			g_sa_settings.provider_base_url_overrides.erase(st.selected_detail_provider_id);
 			g_sa_settings.provider_headers_overrides.erase(st.selected_detail_provider_id);
 			g_sa_settings.save();
@@ -849,22 +1041,22 @@ namespace {
 			toast_notification::push("Provider overrides cleared",
 				toast_notification::toast_type_t::info, 3.0f);
 		}
-		ImGui::SameLine();
-		ImGui::Checkbox("Show raw model.json", &st.show_raw_model_json);
+		ImGui::SameLine(0.f, 12.f);
+		aida::ui::toggle_switch("Show raw model.json", &st.show_raw_model_json,
+			aida::ui::size_t_::sm);
 
 		if (st.show_raw_model_json) {
 			const std::string mid = preferred_model_for(st.selected_detail_provider_id);
 			const std::string raw = raw_model_json_for(st.selected_detail_provider_id, mid);
-			ImGui::SetCursorScreenPos(ImVec2(ox + 14.f, oy + 256.f));
-			ImGui::PushTextWrapPos(ox + pane_w - 14.f);
-			const ImU32 dim = ui_anim::theme_alpha(IM_COL32(170, 175, 195, 220), alpha);
-			ImGui::PushStyleColor(ImGuiCol_Text, dim);
+			ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 268.f));
+			ImGui::PushTextWrapPos(a.x + pane_w - 14.f);
+			ImGui::PushStyleColor(ImGuiCol_Text,
+				ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)));
 			ImGui::TextUnformatted(raw.c_str());
 			ImGui::PopStyleColor();
 			ImGui::PopTextWrapPos();
 		}
 
-		(void)ar; (void)ag; (void)ab;
 		ImGui::PopID();
 	}
 
@@ -904,9 +1096,8 @@ void render(float panel_w, float panel_h)
 	if (!st.initialized)
 		initialize();
 
-	const float ar = globals::ui::accent.x;
-	const float ag = globals::ui::accent.y;
-	const float ab = globals::ui::accent.z;
+	const auto& th = aida::ui::resolved();
+	const float dt = aida::ui::clock::dt();
 	const float alpha = 1.0f;
 
 	{
@@ -931,29 +1122,31 @@ void render(float panel_w, float panel_h)
 	const float root_w = panel_w;
 	const float root_h = panel_h;
 
-	const float toolbar_h = 32.f;
+	const float toolbar_h = 36.f;
 	const float pad = 12.f;
 
 	const float search_w = (root_w - pad * 3.f) * 0.62f;
 	ImGui::SetCursorScreenPos(ImVec2(root_x + pad, root_y + 4.f));
-	ui_anim::render_filter_input_chip("##provider_filter", st.search_buf, sizeof(st.search_buf),
-		"Filter providers / models", search_w, ar, ag, ab, alpha);
+	char search_local[128];
+	std::memcpy(search_local, st.search_buf, sizeof(search_local));
+	if (aida::ui::input_text("##provider_filter", search_local, sizeof(search_local),
+			"Filter providers / models", false, ImVec2(search_w, 30.f))) {
+		std::lock_guard<std::mutex> lk(st.mtx);
+		std::memcpy(st.search_buf, search_local, sizeof(st.search_buf));
+	}
 
 	const float btn_w = 220.f;
 	const float btn_x = root_x + root_w - pad - btn_w;
 	ImGui::SetCursorScreenPos(ImVec2(btn_x, root_y + 4.f));
 	const bool refreshing = st.refresh.in_flight.load();
-	const std::string refresh_label = refreshing
-		? std::string("Refreshing...##rf")
-		: std::string("Refresh from models.dev##rf");
-	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(ar * 0.35f, ag * 0.35f, ab * 0.35f, 0.6f));
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(ar * 0.55f, ag * 0.55f, ab * 0.55f, 0.8f));
-	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(ar * 0.7f, ag * 0.7f, ab * 0.7f, 1.f));
-	if (ImGui::Button(refresh_label.c_str(), ImVec2(btn_w, 24.f))) {
+	if (aida::ui::button(refreshing ? "Refreshing" : "Refresh from models.dev",
+			aida::ui::button_kind_t::secondary,
+			aida::ui::size_t_::md,
+			ImVec2(btn_w, 30.f),
+			false, nullptr, refreshing)) {
 		if (!refreshing)
 			start_refresh_thread();
 	}
-	ImGui::PopStyleColor(3);
 
 	const auto& providers = aida::provider::catalog::list_providers();
 	const std::string filter = lower_copy(std::string(st.search_buf));
@@ -977,25 +1170,29 @@ void render(float panel_w, float panel_h)
 
 	const float list_inner_w = list_w - pad * 2.f;
 	const float card_w = list_inner_w;
-	const float card_h = 96.f;
-	const float gap = 10.f;
+	const float card_h = 108.f;
+	const float gap = 12.f;
 
 	if (filtered.empty()) {
-		auto* dl = ImGui::GetWindowDrawList();
-		const ImVec2 wp_inner = ImGui::GetCursorScreenPos();
-		const ImU32 dim = IM_COL32(170, 175, 195, static_cast<int>(220 * alpha));
-		const char* msg = providers.empty()
-			? "Catalog empty - click Refresh to fetch from models.dev"
-			: "No providers match the filter";
-		dl->AddText(ImVec2(wp_inner.x + pad, wp_inner.y + 8.f), dim, msg);
-		ImGui::Dummy(ImVec2(card_w, 32.f));
+		ImVec2 region_pos = ImGui::GetCursorScreenPos();
+		ImVec2 region_size(card_w, body_h - 16.f);
+		aida::ui::empty_state::config_t cfg;
+		cfg.glyph = aida::ui::empty_state::glyph_t::dots;
+		cfg.title = providers.empty() ? "Catalog empty" : "No matches";
+		cfg.body = providers.empty()
+			? "Click Refresh to fetch providers from models.dev."
+			: "No providers match your filter.";
+		cfg.max_width = card_w * 0.7f;
+		aida::ui::empty_state::render(region_pos, region_size, cfg);
 	}
+
+	const double max_cost = max_total_cost_in_catalog();
 
 	for (const auto* prov : filtered) {
 		ImGui::Dummy(ImVec2(pad, 0.f));
 		ImGui::SameLine();
 		const ImVec2 sp = ImGui::GetCursorScreenPos();
-		render_provider_card(sp.x, sp.y, card_w, card_h, *prov, alpha, ar, ag, ab);
+		render_provider_card(sp.x, sp.y, card_w, card_h, *prov, alpha, max_cost, dt);
 		ImGui::SetCursorScreenPos(sp);
 		ImGui::Dummy(ImVec2(card_w, card_h + gap));
 	}
@@ -1004,7 +1201,7 @@ void render(float panel_w, float panel_h)
 
 	if (detail_open) {
 		const float detail_x = root_x + list_w + pad * 0.5f;
-		render_detail_pane(panel_w, panel_h, detail_x, body_y, detail_w, body_h, alpha, ar, ag, ab);
+		render_detail_pane(detail_x, body_y, detail_w, body_h, alpha);
 	}
 
 	auto* dl = ImGui::GetWindowDrawList();
@@ -1034,6 +1231,9 @@ void render(float panel_w, float panel_h)
 		show_age_callout = true;
 
 	if (show_age_callout) {
+		float ar = globals::ui::accent.x;
+		float ag = globals::ui::accent.y;
+		float ab = globals::ui::accent.z;
 		ui_anim::render_inline_callout(dl, root_x + pad, callout_y,
 			root_w - pad * 2.f, callout_h,
 			"Catalog cached - click Refresh for latest",
@@ -1041,6 +1241,7 @@ void render(float panel_w, float panel_h)
 	}
 
 	ImGui::EndChild();
+	(void)th;
 }
 
 void render_chat_header_picker(float max_width)

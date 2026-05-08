@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "imgui/imgui.h"
+#include "../ui/theme.hpp"
 
 namespace syntax {
 
@@ -434,26 +435,25 @@ inline void tokenize(std::string_view src, const language_def_t& lang,
 inline void get_token_colors(ImU32 colors[(int)token_type::COUNT],
                               float ax, float ay, float az, float alpha)
 {
-    auto c = [alpha](int r, int g, int b, int a) -> ImU32 {
-        return IM_COL32(r, g, b, (int)(a * alpha));
-    };
+    (void)ax; (void)ay; (void)az;
+    const auto& t = aida::ui::resolved();
 
-    colors[(int)token_type::keyword]       = c((int)(ax * 0.6f + 100), (int)(ay * 0.5f + 80), (int)(az * 0.8f + 120), 240);
-    colors[(int)token_type::type_name]      = c(86, 182, 194, 235);
-    colors[(int)token_type::string_lit]     = c(152, 195, 121, 235);
-    colors[(int)token_type::number]          = c(209, 154, 102, 235);
-    colors[(int)token_type::comment_line]   = c(92, 99, 112, 160);
-    colors[(int)token_type::comment_block]  = c(92, 99, 112, 160);
-    colors[(int)token_type::preprocessor]   = c(198, 120, 221, 230);
-    colors[(int)token_type::operator_sym]   = c(171, 178, 191, 220);
-    colors[(int)token_type::function_call]  = c(97, 175, 239, 240);
-    colors[(int)token_type::identifier]     = c(200, 200, 220, 220);
-    colors[(int)token_type::whitespace]     = c(0, 0, 0, 0);
-    colors[(int)token_type::punctuation]    = c(171, 178, 191, 200);
-    colors[(int)token_type::decorator]      = c(198, 120, 221, 230);
-    colors[(int)token_type::boolean_lit]    = c(209, 154, 102, 235);
-    colors[(int)token_type::register_name]  = c(224, 108, 117, 235);
-    colors[(int)token_type::directive]      = c(198, 120, 221, 230);
+    colors[(int)token_type::keyword]       = aida::ui::with_alpha(t.syn_keyword,       alpha);
+    colors[(int)token_type::type_name]     = aida::ui::with_alpha(t.syn_type,          alpha);
+    colors[(int)token_type::string_lit]    = aida::ui::with_alpha(t.syn_string,        alpha);
+    colors[(int)token_type::number]        = aida::ui::with_alpha(t.syn_number,        alpha);
+    colors[(int)token_type::comment_line]  = aida::ui::with_alpha(t.syn_comment,       alpha);
+    colors[(int)token_type::comment_block] = aida::ui::with_alpha(t.syn_comment,       alpha);
+    colors[(int)token_type::preprocessor]  = aida::ui::with_alpha(t.syn_preprocessor,  alpha);
+    colors[(int)token_type::operator_sym]  = aida::ui::with_alpha(t.syn_operator,      alpha);
+    colors[(int)token_type::function_call] = aida::ui::with_alpha(t.syn_function,      alpha);
+    colors[(int)token_type::identifier]    = aida::ui::with_alpha(t.syn_identifier,    alpha);
+    colors[(int)token_type::whitespace]    = IM_COL32(0, 0, 0, 0);
+    colors[(int)token_type::punctuation]   = aida::ui::with_alpha(t.syn_operator,      alpha * 0.85f);
+    colors[(int)token_type::decorator]     = aida::ui::with_alpha(t.syn_preprocessor,  alpha);
+    colors[(int)token_type::boolean_lit]   = aida::ui::with_alpha(t.syn_number,        alpha);
+    colors[(int)token_type::register_name] = aida::ui::with_alpha(t.syn_register,      alpha);
+    colors[(int)token_type::directive]     = aida::ui::with_alpha(t.syn_preprocessor,  alpha);
 }
 
 }

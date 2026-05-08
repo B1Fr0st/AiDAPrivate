@@ -151,9 +151,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 {
 	ImDrawList* dl = ImGui::GetWindowDrawList();
 	float dt = ImGui::GetIO().DeltaTime;
-	const auto& _t = themes::resolved;
+	const auto& _t = aida::ui::resolved();
 	const auto _ta = [alpha](ImU32 c) -> ImU32 {
-		return ui_anim::theme_alpha(c, alpha);
+		return aida::ui::with_alpha(c, alpha);
 	};
 
 	dl->AddRectFilled(ImVec2(pos_x, pos_y), ImVec2(pos_x + width, pos_y + height),

@@ -682,6 +682,7 @@ async function storeSession(licenseKey, sessionData) {
             honeypot_export      = EXCLUDED.honeypot_export,
             challenge_id         = EXCLUDED.challenge_id,
             last_chain_tag       = '',
+            last_gate_bitmap     = 0,
             session_uuid         = EXCLUDED.session_uuid,
             column_crypt_version = 1,
             auth_hmac_key        = EXCLUDED.auth_hmac_key,
@@ -2101,6 +2102,7 @@ router._internal = {
     persistTpmAttestation,
     buildTpmSealedPayload,
     sendSlackAlert,
+    storeSession,
 };
 
 module.exports = router;

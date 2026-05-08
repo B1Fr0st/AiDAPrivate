@@ -7,6 +7,11 @@
 
 #include "work_queue.hpp"
 #include "imgui/imgui.h"
+#include "theme.hpp"
+#include "clock.hpp"
+#include "motion.hpp"
+#include "transition.hpp"
+#include "fonts.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -67,6 +72,12 @@ struct TerminalSession
 
 
     char                 input_buf[4096] = {};
+
+
+    int                  prev_line_count = 0;
+    std::deque<float>    line_entrance_time;
+    aida::ui::flash_t    bell_flash;
+    std::atomic<bool>    bell_pending{false};
 };
 
 
@@ -204,6 +215,10 @@ inline void push_char(TerminalSession& s, char ch)
         if (s.cursor_col > 0) s.cursor_col--;
         return;
     }
+    if (ch == '\x07') {
+        s.bell_pending.store(true, std::memory_order_release);
+        return;
+    }
 
     ensure_line(s, s.cursor_row);
     auto& row = s.lines[s.cursor_row];
@@ -242,7 +257,10 @@ inline void process_output(TerminalSession& s, const char* data, size_t len)
             } else if (ch == ']') {
 
                 for (++i; i < len; ++i) {
-                    if (data[i] == '\x07') break;
+                    if (data[i] == '\x07') {
+                        s.bell_pending.store(true, std::memory_order_release);
+                        break;
+                    }
                     if (data[i] == '\x1b' && i + 1 < len && data[i + 1] == '\\') { ++i; break; }
                 }
                 state = NORMAL;
@@ -491,8 +509,11 @@ inline void destroy_session(TerminalSession& s)
 inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_color,
                             ImU32 accent_color)
 {
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, bg_color);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6, 4));
+    const auto& th = aida::ui::resolved();
+    ImU32 surface_bg = (bg_color != 0) ? bg_color : th.bg_elevated;
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, surface_bg);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.f, 6.f));
 
     if (!ImGui::BeginChild("##term_view", size, false,
                            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
@@ -502,9 +523,15 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
         return;
     }
 
+    ImFont* mono = aida::ui::fonts::code();
+    bool pushed_font = false;
+    if (mono) { ImGui::PushFont(mono); pushed_font = true; }
+
     const float line_height = ImGui::GetTextLineHeight();
-    const float char_width  = ImGui::CalcTextSize("M").x;
+    const float char_width  = ImGui::GetFont()->CalcTextSizeA(ImGui::GetFontSize(), FLT_MAX, 0.f, "M").x;
     const ImVec2 origin     = ImGui::GetCursorScreenPos();
+    const ImVec2 win_pos    = ImGui::GetWindowPos();
+    const ImVec2 win_size   = ImGui::GetWindowSize();
     auto* dl = ImGui::GetWindowDrawList();
 
 
@@ -512,9 +539,26 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
     const int vis_rows  = static_cast<int>(avail_h / line_height);
 
     int total_lines;
+    int new_lines_added = 0;
     {
         std::lock_guard<std::mutex> lk(s.buffer_mtx);
         total_lines = static_cast<int>(s.lines.size());
+        new_lines_added = total_lines - s.prev_line_count;
+        if (new_lines_added < 0) new_lines_added = 0;
+        s.prev_line_count = total_lines;
+    }
+
+    bool burst = (new_lines_added > 100);
+    if (!burst && new_lines_added > 0) {
+        for (int i = 0; i < new_lines_added; ++i) {
+            int line_idx = total_lines - new_lines_added + i;
+            if (line_idx < 0) continue;
+            s.line_entrance_time.push_back(aida::ui::clock::seconds());
+            while (s.line_entrance_time.size() > static_cast<size_t>(TerminalSession::MAX_LINES))
+                s.line_entrance_time.pop_front();
+        }
+    } else if (burst) {
+        s.line_entrance_time.clear();
     }
 
 
@@ -533,13 +577,43 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
         }
     }
 
+    if (s.bell_pending.exchange(false, std::memory_order_acq_rel)) {
+        s.bell_flash.trigger();
+    }
+
     const int start_line = static_cast<int>(s.scroll_y);
+    const bool window_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    const float now = aida::ui::clock::seconds();
+    const float entrance_dur = 0.080f;
 
     {
         std::lock_guard<std::mutex> lk(s.buffer_mtx);
+
+        size_t entrance_offset = 0;
+        if (s.line_entrance_time.size() < static_cast<size_t>(total_lines))
+            entrance_offset = static_cast<size_t>(total_lines) - s.line_entrance_time.size();
+
         for (int vi = 0; vi < vis_rows && (start_line + vi) < total_lines; ++vi) {
-            const auto& row = s.lines[start_line + vi];
-            const float y = origin.y + vi * line_height;
+            int line_idx = start_line + vi;
+            const auto& row = s.lines[line_idx];
+
+            float row_alpha = 1.f;
+            float row_y_off = 0.f;
+            if (!burst && static_cast<size_t>(line_idx) >= entrance_offset) {
+                size_t et_idx = static_cast<size_t>(line_idx) - entrance_offset;
+                if (et_idx < s.line_entrance_time.size()) {
+                    float age = now - s.line_entrance_time[et_idx];
+                    if (age < entrance_dur) {
+                        float t01 = age / entrance_dur;
+                        if (t01 < 0.f) t01 = 0.f;
+                        float eased = aida::motion::ease::out_cubic(t01);
+                        row_alpha = eased;
+                        row_y_off = (1.f - eased) * (line_height * 0.5f);
+                    }
+                }
+            }
+
+            const float y = origin.y + vi * line_height + row_y_off;
 
             for (int ci = 0; ci < static_cast<int>(row.size()) && ci < s.cols; ++ci) {
                 const auto& cell = row[ci];
@@ -547,13 +621,14 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
 
 
                 if ((cell.bg & IM_COL32_A_MASK) != 0) {
-                    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + char_width, y + line_height), cell.bg);
+                    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + char_width, y + line_height),
+                                      aida::ui::with_alpha(cell.bg, row_alpha));
                 }
 
 
                 if (cell.ch > ' ') {
                     char str[2] = {cell.ch, 0};
-                    dl->AddText(ImVec2(x, y), cell.fg, str);
+                    dl->AddText(ImVec2(x, y), aida::ui::with_alpha(cell.fg, row_alpha), str);
                 }
             }
         }
@@ -562,9 +637,30 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
         if (s.alive && s.cursor_row >= start_line && s.cursor_row < start_line + vis_rows) {
             const float cx = origin.x + s.cursor_col * char_width;
             const float cy = origin.y + (s.cursor_row - start_line) * line_height;
-            dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + char_width, cy + line_height),
-                              (accent_color & 0x00FFFFFFu) | 0x80000000u);
+            float blink_alpha = 0.85f;
+            if (window_focused) {
+                blink_alpha = aida::ui::clock::pulse(2.0f, 0.30f, 1.0f);
+            } else {
+                blink_alpha = 0.30f;
+            }
+            ImU32 cursor_col = aida::ui::with_alpha(th.accent_u32, blink_alpha);
+            dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + char_width, cy + line_height), cursor_col);
+            if (window_focused) {
+                ImU32 glow = aida::ui::with_alpha(th.accent_glow, blink_alpha * 0.7f);
+                dl->AddRectFilled(ImVec2(cx - 1.f, cy - 1.f),
+                                   ImVec2(cx + char_width + 1.f, cy + line_height + 1.f), glow);
+            }
         }
+    }
+
+    if (pushed_font) ImGui::PopFont();
+
+    float bell_v = s.bell_flash.tick(aida::ui::clock::dt(), 3.3f);
+    if (bell_v > 0.001f) {
+        ImU32 bell_col = aida::ui::with_alpha(th.accent_u32, bell_v);
+        dl->AddRect(ImVec2(win_pos.x + 1.f, win_pos.y + 1.f),
+                    ImVec2(win_pos.x + win_size.x - 1.f, win_pos.y + win_size.y - 1.f),
+                    bell_col, 0.f, 0, 2.f);
     }
 
     ImGui::EndChild();

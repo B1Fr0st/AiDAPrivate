@@ -2,6 +2,7 @@
 #include "globals.h"
 #include <commdlg.h>
 #include <shlobj.h>
+#include <shellapi.h>
 #include <dwmapi.h>
 #include <fstream>
 #include <filesystem>
@@ -109,10 +110,6 @@ __declspec(noinline) static DWORD seh_license_activate(const char* key_str,
 }
 
 
-#include "../assets/theme_icons/kaneki.h"
-#include "../assets/theme_icons/rias.h"
-#include "../assets/theme_icons/nagi.h"
-#include "../assets/theme_icons/mio_akiyama.h"
 
 ID3D11ShaderResourceView* helpers::theme_rias = nullptr;
 ID3D11ShaderResourceView* helpers::theme_nagi = nullptr;
@@ -126,6 +123,9 @@ extern unsigned char aidalogo[];
 static ID3D11ShaderResourceView* g_bg_art_srv = nullptr;
 static int g_bg_art_w = 0, g_bg_art_h = 0;
 static bool g_bg_art_loaded = false;
+static ID3D11ShaderResourceView* g_aida_logo_srv = nullptr;
+static int g_aida_logo_w = 0, g_aida_logo_h = 0;
+static bool g_aida_logo_loaded = false;
 
 static int g_theme_icon_w[4] = {}, g_theme_icon_h[4] = {};
 static ID3D11ShaderResourceView* g_custom_theme_icon_srv = nullptr;
@@ -151,6 +151,7 @@ bool helpers::icons_loaded = false;
 
 bool helpers::tab(const char* label, int index, ImVec2 pos, ImVec2 size)
 {
+	const auto& th = aida::ui::resolved();
 	ImDrawList* dl = ImGui::GetWindowDrawList();
 	ImVec2 wp = ImGui::GetWindowPos();
 	ImVec2 tab_min = ImVec2(wp.x + pos.x, wp.y + pos.y);
@@ -168,15 +169,12 @@ bool helpers::tab(const char* label, int index, ImVec2 pos, ImVec2 size)
 	float t = storage->GetFloat(anim_id, active ? 1.0f : 0.0f);
 	float ht = storage->GetFloat(hover_id, 0.0f);
 
-	t += ((active ? 1.0f : 0.0f) - t) * std::min(8.0f * ImGui::GetIO().DeltaTime, 1.0f);
-	ht += ((hovered ? 1.0f : 0.0f) - ht) * std::min(12.0f * ImGui::GetIO().DeltaTime, 1.0f);
+	float dt = aida::ui::clock::dt();
+	t += ((active ? 1.0f : 0.0f) - t) * std::min(8.0f * dt, 1.0f);
+	ht += ((hovered ? 1.0f : 0.0f) - ht) * std::min(12.0f * dt, 1.0f);
 
 	storage->SetFloat(anim_id, t);
 	storage->SetFloat(hover_id, ht);
-
-	float ax = globals::ui::accent.x * 255;
-	float ay = globals::ui::accent.y * 255;
-	float az = globals::ui::accent.z * 255;
 
 	if (t > 0.01f)
 	{
@@ -186,48 +184,31 @@ bool helpers::tab(const char* label, int index, ImVec2 pos, ImVec2 size)
 			dl->AddRectFilled(
 				ImVec2(tab_min.x - spread, tab_min.y - spread),
 				ImVec2(tab_max.x + spread, tab_max.y + spread),
-				IM_COL32((int)ax, (int)ay, (int)az, (int)(8 * t * (5 - i))),
-				6.f + spread
-			);
+				aida::ui::with_alpha(th.accent_glow, 0.08f * t * (5 - i)),
+				6.f + spread);
 		}
 	}
 
-	dl->AddRectFilled(tab_min, tab_max, IM_COL32(
-		(int)(255 * 0.08f * ht * (1.0f - t)),
-		(int)(255 * 0.08f * ht * (1.0f - t)),
-		(int)(255 * 0.08f * ht * (1.0f - t)),
-		(int)(255 * 0.08f * ht * (1.0f - t))
-	), 6.f);
+	if (ht > 0.01f && t < 0.99f)
+		dl->AddRectFilled(tab_min, tab_max,
+			aida::ui::with_alpha(th.hover_wash, ht * (1.0f - t)), 6.f);
 
 	if (t > 0.01f)
 	{
-		dl->AddRectFilled(tab_min, tab_max, IM_COL32(
-			(int)(ax * 0.18f + 15),
-			(int)(ay * 0.18f + 15),
-			(int)(az * 0.18f + 20),
-			(int)(220 * t)
-		), 6.f);
-
-		dl->AddRectFilled(
-			tab_min,
-			ImVec2(tab_max.x, tab_min.y + 1),
-			IM_COL32(255, 255, 255, (int)(20 * t)),
-			6.f
-		);
+		dl->AddRectFilled(tab_min, tab_max,
+			aida::ui::with_alpha(th.selection_strong, t * 0.85f), 6.f);
+		dl->AddRectFilled(tab_min, ImVec2(tab_max.x, tab_min.y + 1.f),
+			aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), 0.08f * t), 6.f);
 	}
 
 	ImVec2 ts = ImGui::CalcTextSize(label);
 	ImVec2 tp = ImVec2(
 		tab_min.x + (size.x - ts.x) * 0.5f,
-		tab_min.y + (size.y - ts.y) * 0.5f
-	);
+		tab_min.y + (size.y - ts.y) * 0.5f);
 
-	ImU32 text_col = IM_COL32(
-		(int)(120 + (ax - 120) * t + 30 * ht * (1.0f - t)),
-		(int)(120 + (ay - 120) * t + 30 * ht * (1.0f - t)),
-		(int)(120 + (az - 120) * t + 30 * ht * (1.0f - t)),
-		255
-	);
+	ImU32 text_col = aida::ui::mix(
+		aida::ui::mix(th.text_secondary, th.text_primary, ht),
+		th.text_primary, t);
 
 	dl->AddText(tp, text_col, label);
 
@@ -890,7 +871,10 @@ void helpers::render_title()
 		if (popup_addr == 0)
 			popup_addr = decompiler_engine::g_state.current.function_addr;
 
-		if (ImGui::Button("AI Decompiler##dec_ai", ImVec2(btn_w, btn_h))) {
+		if (aida::ui::components::button("AI Decompiler##dec_ai",
+			aida::ui::components::button_kind_t::primary,
+			aida::ui::components::size_t_::md,
+			ImVec2(btn_w, btn_h))) {
 			if (popup_addr)
 				decompiler_engine::decompile_function(popup_addr, g_sa_settings);
 			globals::ui::active_center_view = center_view_t::decompiler;
@@ -907,7 +891,10 @@ void helpers::render_title()
 
 		ImGui::Spacing();
 
-		if (ImGui::Button("Ghidra Decompiler##dec_ghidra", ImVec2(btn_w, btn_h))) {
+		if (aida::ui::components::button("Ghidra Decompiler##dec_ghidra",
+			aida::ui::components::button_kind_t::primary,
+			aida::ui::components::size_t_::md,
+			ImVec2(btn_w, btn_h))) {
 			if (popup_addr)
 				decompiler_engine::decompile_function_native(popup_addr);
 			globals::ui::active_center_view = center_view_t::decompiler;
@@ -924,7 +911,10 @@ void helpers::render_title()
 
 		ImGui::Spacing();
 
-		if (ImGui::Button("Hybrid (Ghidra + AI)##dec_hybrid", ImVec2(btn_w, btn_h))) {
+		if (aida::ui::components::button("Hybrid (Ghidra + AI)##dec_hybrid",
+			aida::ui::components::button_kind_t::primary,
+			aida::ui::components::size_t_::md,
+			ImVec2(btn_w, btn_h))) {
 			if (popup_addr)
 				decompiler_engine::decompile_function_hybrid(popup_addr, g_sa_settings);
 			globals::ui::active_center_view = center_view_t::decompiler;
@@ -945,22 +935,24 @@ void helpers::render_title()
 		ImGui::Checkbox("Remember my choice", &remember_choice);
 
 		ImGui::SameLine();
-		if (ImGui::Button("Cancel")) {
+		if (aida::ui::components::button("Cancel",
+			aida::ui::components::button_kind_t::secondary,
+			aida::ui::components::size_t_::md)) {
 			ImGui::CloseCurrentPopup();
 		}
 
 		ImGui::EndPopup();
 	}
 
-	if (!helpers::themes_loaded && g_pd3dDevice) {
-		icon_loader::load(kaneki, sizeof(kaneki), &helpers::theme_kaneki,
-			&g_theme_icon_w[0], &g_theme_icon_h[0], false);
-		icon_loader::load(rias, sizeof(rias), &helpers::theme_rias,
-			&g_theme_icon_w[1], &g_theme_icon_h[1], false);
-		icon_loader::load(nagi, sizeof(nagi), &helpers::theme_nagi,
-			&g_theme_icon_w[2], &g_theme_icon_h[2], false);
-		icon_loader::load(mio, sizeof(mio), &helpers::theme_mio,
-			&g_theme_icon_w[3], &g_theme_icon_h[3], false);
+	if (!helpers::themes_loaded) {
+		helpers::theme_kaneki = nullptr;
+		helpers::theme_rias = nullptr;
+		helpers::theme_nagi = nullptr;
+		helpers::theme_mio = nullptr;
+		for (int i = 0; i < 4; ++i) {
+			g_theme_icon_w[i] = 0;
+			g_theme_icon_h[i] = 0;
+		}
 		helpers::themes_loaded = true;
 	}
 
@@ -969,6 +961,12 @@ void helpers::render_title()
 		icon_loader::load(background, 8640831, &g_bg_art_srv,
 			&g_bg_art_w, &g_bg_art_h, false);
 		g_bg_art_loaded = true;
+	}
+
+	if (!g_aida_logo_loaded && g_pd3dDevice) {
+		icon_loader::load(aidalogo, 1273853, &g_aida_logo_srv,
+			&g_aida_logo_w, &g_aida_logo_h, false);
+		g_aida_logo_loaded = true;
 	}
 
 	std::string active_custom_icon_path;
@@ -1008,16 +1006,7 @@ void helpers::render_title()
 			if (ct.icon_index < 0 && g_custom_theme_icon_srv)
 				return g_custom_theme_icon_srv;
 		}
-		int idx = g_sa_settings.theme_icon_index;
-		if (custom_themes::active_custom >= 0 &&
-		    custom_themes::active_custom < (int)custom_themes::list.size())
-			idx = custom_themes::list[custom_themes::active_custom].icon_index;
-		switch (idx) {
-			case 0: return helpers::theme_kaneki;
-			case 1: return helpers::theme_rias;
-			case 2: return helpers::theme_nagi;
-			case 3: default: return helpers::theme_mio;
-		}
+		return nullptr;
 	};
 
 	bool loading = !bg_completed || globals::ui::load_timer < 3.0f;
@@ -1028,9 +1017,9 @@ void helpers::render_title()
 	{
 		float tw, th;
 		if (!globals::ui::welcome_done) {
-			tw = 500.f; th = 300.f;
+			tw = 560.f; th = 360.f;
 		} else if (!license::validated) {
-			tw = 480.f; th = 320.f;
+			tw = 620.f; th = 540.f;
 		} else {
 			MONITORINFO mi = { sizeof(mi) };
 			GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
@@ -1107,67 +1096,213 @@ void helpers::render_title()
 
 	if (!globals::ui::welcome_done && (loading || !welcome_ready || fadeout > 0.f))
 	{
-		static float text_alpha = 0.f;
-		static float text_dir  = 1.f;
-
-		if (loading)
-		{
-			fadeout = 1.f;
-			text_alpha += text_dir * dt * 1.2f;
-			if (text_alpha >= 1.f) { text_alpha = 1.f; text_dir = -1.f; }
-			if (text_alpha <= 0.f) { text_alpha = 0.f; text_dir =  1.f; }
-		}
-		else
-		{
-			fadeout -= dt * 1.5f;
-			if (fadeout < 0.f) fadeout = 0.f;
-			text_alpha = fadeout;
-		}
-
-		float vis = loading ? 1.f : text_alpha;
-
+		const auto& th = aida::ui::resolved();
 		ImVec2 wp = ImGui::GetWindowPos();
-		float cx  = wp.x + globals::ui::window_w * 0.5f;
-		float cy  = wp.y + globals::ui::window_h * 0.5f - 10.f;
+		float ww_l = globals::ui::window_w;
+		float wh_l = globals::ui::window_h;
+		float cx   = wp.x + ww_l * 0.5f;
+		float cy   = wp.y + wh_l * 0.5f - 8.f;
 		ImDrawList* dl = ImGui::GetWindowDrawList();
 
+		if (loading) {
+			fadeout = 1.f;
+		} else {
+			fadeout -= dt * 1.5f;
+			if (fadeout < 0.f) fadeout = 0.f;
+		}
+		float vis = loading ? 1.f : fadeout;
+
+		dl->AddRectFilled(wp, ImVec2(wp.x + ww_l, wp.y + wh_l),
+			th.bg_base, 14.f);
 
 		if (g_bg_art_srv && g_bg_art_w > 0 && g_bg_art_h > 0) {
-			float ww_l = globals::ui::window_w;
-			float wh_l = globals::ui::window_h;
-			float scale = std::max(ww_l / (float)g_bg_art_w, wh_l / (float)g_bg_art_h);
-			float draw_w = g_bg_art_w * scale;
-			float draw_h = g_bg_art_h * scale;
-			float ox = wp.x + (ww_l - draw_w) * 0.5f;
-			float oy = wp.y + (wh_l - draw_h) * 0.5f;
-			dl->AddImage((ImTextureID)g_bg_art_srv,
-				ImVec2(ox, oy), ImVec2(ox + draw_w, oy + draw_h),
-				ImVec2(0, 0), ImVec2(1, 1),
-				IM_COL32(255, 255, 255, (int)(255 * 0.30f)));
+			float aspect_img = (float)g_bg_art_w / (float)g_bg_art_h;
+			float aspect_win = ww_l / wh_l;
+			float bg_w, bg_h;
+			if (aspect_img > aspect_win) {
+				bg_h = wh_l;
+				bg_w = bg_h * aspect_img;
+			} else {
+				bg_w = ww_l;
+				bg_h = bg_w / aspect_img;
+			}
+			float bg_x = wp.x + (ww_l - bg_w) * 0.5f;
+			float bg_y = wp.y + (wh_l - bg_h) * 0.5f;
+			ImU32 bg_tint = aida::ui::with_alpha(IM_COL32_WHITE, 0.42f * vis);
+			dl->AddImageRounded((ImTextureID)g_bg_art_srv,
+				ImVec2(bg_x, bg_y), ImVec2(bg_x + bg_w, bg_y + bg_h),
+				ImVec2(0.f, 0.f), ImVec2(1.f, 1.f),
+				bg_tint, 14.f);
+			dl->AddRectFilled(wp, ImVec2(wp.x + ww_l, wp.y + wh_l),
+				aida::ui::with_alpha(th.bg_base, 0.55f * vis), 14.f);
 		}
 
-
-		const float dot_r  = 5.f;
-		const float dot_sp = 20.f;
-		for (int i = 0; i < 3; i++)
-		{
-			float phase  = globals::ui::load_timer * 4.f + i * (2.f * 3.14159f / 3.f);
-			float bounce = sinf(phase) * 8.f;
-			float dot_a  = (sinf(phase) * 0.5f + 0.5f) * 0.6f + 0.4f;
-			dl->AddCircleFilled(
-				ImVec2(cx + (i - 1) * dot_sp, cy + bounce),
-				dot_r,
-				IM_COL32(255, 255, 255, (int)(255 * dot_a * vis)));
+		float aura_r = ww_l * 0.55f;
+		ImU32 aura = aida::ui::with_alpha(th.accent_glow, 0.45f * vis);
+		for (int i = 0; i < 5; ++i) {
+			float rr = aura_r + (float)i * 14.f;
+			float fa = (1.f - (float)i / 5.f) * 0.55f;
+			dl->AddCircleFilled(ImVec2(cx, cy), rr, aida::ui::with_alpha(aura, fa), 64);
 		}
 
+		float reveal_t = std::min(globals::ui::load_timer / 0.480f, 1.f);
+		float reveal_eased = aida::motion::ease::out_back(reveal_t);
+		float pulse = aida::ui::clock::pulse(0.6f, 0.0f, 1.0f);
+
+		aida::ui::brand::render_constellation(
+			dl, ImVec2(cx, cy), 80.f, 12,
+			aida::ui::clock::seconds() * 0.4f,
+			aida::ui::with_alpha(th.accent_u32, vis), nullptr);
+
+		float logo_size = 96.f;
+		if (g_aida_logo_srv && g_aida_logo_w > 0 && g_aida_logo_h > 0) {
+			float scale = reveal_eased;
+			float ls = logo_size * (0.6f + 0.4f * scale);
+			float lcx = cx;
+			float lcy = cy - 18.f;
+			float aspect = (float)g_aida_logo_w / (float)g_aida_logo_h;
+			float lw = ls * aspect;
+			float lh = ls;
+			ImU32 logo_tint = aida::ui::with_alpha(IM_COL32_WHITE, vis * (0.85f + 0.15f * pulse));
+			dl->AddImage((ImTextureID)g_aida_logo_srv,
+				ImVec2(lcx - lw * 0.5f, lcy - lh * 0.5f),
+				ImVec2(lcx + lw * 0.5f, lcy + lh * 0.5f),
+				ImVec2(0.f, 0.f), ImVec2(1.f, 1.f), logo_tint);
+		} else {
+			aida::ui::brand::render_logomark(
+				dl, ImVec2(cx, cy - 18.f), logo_size,
+				reveal_eased, pulse, vis);
+		}
+
+		ImFont* display_font = aida::ui::fonts::display();
+		if (!display_font) display_font = ImGui::GetFont();
+		float wm_scale = 1.0f;
+		float wm_size  = 32.f * wm_scale;
+		float wm_total_w = aida::ui::brand::wordmark_total_width(display_font, wm_scale);
+		float wm_x = cx - wm_total_w * 0.5f;
+		float wm_y = cy + logo_size * 0.5f + 12.f;
+		float wm_reveal = std::min((globals::ui::load_timer - 0.18f) / 0.62f, 1.f);
+		if (wm_reveal < 0.f) wm_reveal = 0.f;
+		aida::ui::brand::render_wordmark(dl, ImVec2(wm_x, wm_y), wm_scale,
+			display_font, wm_reveal, vis);
+
+		float tag_a = std::min(std::max(globals::ui::load_timer - 1.6f, 0.f) / 0.5f, 1.f) * vis;
+		if (tag_a > 0.01f) {
+			const char* tag = "Reverse engineering, reimagined.";
+			ImFont* body = aida::ui::fonts::body();
+			if (!body) body = ImGui::GetFont();
+			float ts_x = body->CalcTextSizeA(18.f, FLT_MAX, 0.f, tag).x;
+			dl->AddText(body, 18.f,
+				ImVec2(cx - ts_x * 0.5f, wm_y + wm_size + 18.f),
+				aida::ui::with_alpha(th.text_secondary, tag_a), tag);
+		}
+
+		float bar_w = std::min(ww_l * 0.55f, 280.f);
+		float bar_h = 3.f;
+		float bar_x = cx - bar_w * 0.5f;
+		float bar_y = wp.y + wh_l - 60.f;
+
+		int total_steps = globals::ui::bg_init_total.load(std::memory_order_acquire);
+		int cur_step    = globals::ui::bg_init_step.load(std::memory_order_acquire);
+		if (total_steps < 1) total_steps = 1;
+		if (cur_step > total_steps) cur_step = total_steps;
+		float prog = (float)cur_step / (float)total_steps;
+
+		static float anim_prog = 0.f;
+		anim_prog += (prog - anim_prog) * std::min(8.f * dt, 1.f);
+
+		dl->AddRectFilled(ImVec2(bar_x, bar_y),
+			ImVec2(bar_x + bar_w, bar_y + bar_h),
+			aida::ui::with_alpha(th.panel_header, 0.85f * vis), bar_h * 0.5f);
+
+		float fw = bar_w * anim_prog;
+		if (fw > 1.f) {
+			dl->AddRectFilledMultiColor(
+				ImVec2(bar_x, bar_y), ImVec2(bar_x + fw, bar_y + bar_h),
+				aida::ui::with_alpha(th.accent_grad_top, vis),
+				aida::ui::with_alpha(th.accent_grad_top, vis),
+				aida::ui::with_alpha(th.accent_grad_bot, vis),
+				aida::ui::with_alpha(th.accent_grad_bot, vis));
+
+			float sweep_period = 1.4f;
+			float ph = fmodf(aida::ui::clock::seconds() / sweep_period, 1.f);
+			float sx = bar_x + fw * ph - fw * 0.18f;
+			float sw = fw * 0.36f;
+			if (sw > 4.f) {
+				dl->PushClipRect(ImVec2(bar_x, bar_y), ImVec2(bar_x + fw, bar_y + bar_h), true);
+				dl->AddRectFilledMultiColor(
+					ImVec2(sx, bar_y), ImVec2(sx + sw * 0.5f, bar_y + bar_h),
+					IM_COL32(255,255,255,0), aida::ui::with_alpha(IM_COL32(255,255,255,90), vis),
+					aida::ui::with_alpha(IM_COL32(255,255,255,90), vis), IM_COL32(255,255,255,0));
+				dl->AddRectFilledMultiColor(
+					ImVec2(sx + sw * 0.5f, bar_y), ImVec2(sx + sw, bar_y + bar_h),
+					aida::ui::with_alpha(IM_COL32(255,255,255,90), vis), IM_COL32(255,255,255,0),
+					IM_COL32(255,255,255,0), aida::ui::with_alpha(IM_COL32(255,255,255,90), vis));
+				dl->PopClipRect();
+			}
+		}
+
+		static const char* k_phase_labels[] = {
+			"Bootstrapping",
+			"Initializing chat engine",
+			"Probing network surface",
+			"Arming memory scanner",
+			"Spinning up MITM proxy",
+			"Loading script engine",
+			"Fingerprinting code surface",
+			"Activating tamper guard",
+			"Ready"
+		};
+		int phase_idx = cur_step;
+		if (phase_idx < 0) phase_idx = 0;
+		if (phase_idx > 8) phase_idx = 8;
+
+		static int last_phase = -1;
+		static aida::ui::transition_t phase_swap;
+		static const char* prev_phase_label = k_phase_labels[0];
+		static const char* cur_phase_label  = k_phase_labels[0];
+		if (phase_idx != last_phase) {
+			prev_phase_label = cur_phase_label;
+			cur_phase_label  = k_phase_labels[phase_idx];
+			phase_swap.start(0.140f, aida::motion::ease::out_cubic);
+			last_phase = phase_idx;
+		}
+		phase_swap.tick(dt);
+		float swap_e = phase_swap.eased();
+
+		ImFont* cap = aida::ui::fonts::caption();
+		if (!cap) cap = ImGui::GetFont();
+		float cap_size = 12.f;
+		float ph_y = bar_y - 22.f;
+
+		ImU32 ph_col = aida::ui::with_alpha(th.text_secondary, vis);
+		if (!phase_swap.is_finished() && prev_phase_label) {
+			float prev_a = (1.f - swap_e) * vis;
+			float prev_y = ph_y - swap_e * 6.f;
+			ImVec2 ts_p = cap->CalcTextSizeA(cap_size, FLT_MAX, 0.f, prev_phase_label);
+			dl->AddText(cap, cap_size, ImVec2(cx - ts_p.x * 0.5f, prev_y),
+				aida::ui::with_alpha(th.text_secondary, prev_a), prev_phase_label);
+
+			float cur_y = ph_y + (1.f - swap_e) * 6.f;
+			ImVec2 ts_c = cap->CalcTextSizeA(cap_size, FLT_MAX, 0.f, cur_phase_label);
+			dl->AddText(cap, cap_size, ImVec2(cx - ts_c.x * 0.5f, cur_y),
+				aida::ui::with_alpha(th.text_secondary, swap_e * vis), cur_phase_label);
+		} else {
+			ImVec2 ts_c = cap->CalcTextSizeA(cap_size, FLT_MAX, 0.f, cur_phase_label);
+			dl->AddText(cap, cap_size, ImVec2(cx - ts_c.x * 0.5f, ph_y), ph_col, cur_phase_label);
+		}
+
+		char step_buf[32];
+		snprintf(step_buf, sizeof(step_buf), "%d / %d", cur_step, total_steps);
+		ImVec2 sb_ts = cap->CalcTextSizeA(14.f, FLT_MAX, 0.f, step_buf);
+		dl->AddText(cap, 14.f, ImVec2(cx + bar_w * 0.5f - sb_ts.x, bar_y + bar_h + 10.f),
+			aida::ui::with_alpha(th.text_dim, vis), step_buf);
 
 		static POINT drag_start_wnd   = {};
 		static POINT drag_start_mouse = {};
 		static bool  dragging  = false;
 		static bool  last_lmb  = false;
-
-
-		bool lmb = GetAsyncKeyState(VK_LBUTTON) & 0x8000;
+		bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) && (GetForegroundWindow() == g_hwnd);
 		if (lmb && !last_lmb) {
 			POINT cp; GetCursorPos(&cp);
 			RECT wr; GetWindowRect(g_hwnd, &wr);
@@ -1186,6 +1321,12 @@ void helpers::render_title()
 		}
 		last_lmb = lmb;
 
+		if (!loading && fadeout <= 0.001f && !globals::ui::welcome_done) {
+			globals::ui::welcome_done = true;
+			globals::ui::ui_alpha = 0.f;
+			globals::ui::welcome_timer = 3.5f;
+		}
+
 		ImGui::End();
 		return;
 	}
@@ -1193,6 +1334,10 @@ void helpers::render_title()
 
 	if (!globals::ui::welcome_done)
 	{
+		globals::ui::welcome_done = true;
+		globals::ui::ui_alpha = 0.f;
+		globals::ui::welcome_timer = 3.5f;
+		const auto& th = aida::ui::resolved();
 		globals::ui::welcome_timer += dt;
 		if (globals::ui::welcome_timer >= 3.5f) { globals::ui::welcome_done = true; globals::ui::ui_alpha = 0.f; }
 
@@ -1202,70 +1347,51 @@ void helpers::render_title()
 		float       ww  = globals::ui::window_w;
 		float       wh  = globals::ui::window_h;
 		float       cx  = wp.x + ww * 0.5f;
-		float       cy  = wp.y + wh * 0.5f;
+		float       cy  = wp.y + wh * 0.5f - 4.f;
 
-
-		if (g_bg_art_srv && g_bg_art_w > 0 && g_bg_art_h > 0) {
-			float scale_bg = std::max(ww / (float)g_bg_art_w, wh / (float)g_bg_art_h);
-			float dw_bg = g_bg_art_w * scale_bg;
-			float dh_bg = g_bg_art_h * scale_bg;
-			float ox_bg = wp.x + (ww - dw_bg) * 0.5f;
-			float oy_bg = wp.y + (wh - dh_bg) * 0.5f;
-			dl->AddImage((ImTextureID)g_bg_art_srv,
-				ImVec2(ox_bg, oy_bg), ImVec2(ox_bg + dw_bg, oy_bg + dh_bg),
-				ImVec2(0, 0), ImVec2(1, 1),
-				IM_COL32(255, 255, 255, (int)(255 * 0.30f)));
-		}
-
-		float ax = globals::ui::accent.x * 255.f;
-		float ay = globals::ui::accent.y * 255.f;
-		float az = globals::ui::accent.z * 255.f;
-
-		float fh       = ImGui::GetFontSize();
 		float fade_in  = std::min(t / 0.6f, 1.f);
 		float fade_out = t > 2.6f ? std::max(0.f, 1.f - (t - 2.6f) / 0.9f) : 1.f;
 		float base_a   = fade_in * fade_out;
 
-		const char* letters[4]  = { "A", "I", "D", "A" };
-		float       tracking    = 22.f;
-		float chars_w = 0.f;
-		for (int li = 0; li < 4; li++) chars_w += ImGui::CalcTextSize(letters[li]).x;
-		float title_total_w = chars_w + tracking * 3.f;
-		float title_x0      = cx - title_total_w * 0.5f;
-		float title_y       = cy - fh * 0.5f - 24.f;
+		dl->AddRectFilled(wp, ImVec2(wp.x + ww, wp.y + wh), th.bg_base, 14.f);
 
-		float rule_x0 = 0.f, rule_x1 = 0.f;
-		float cur_x   = title_x0;
-		for (int li = 0; li < 4; li++)
-		{
-			float la   = std::min(std::max(t - li * 0.12f, 0.f) / 0.35f, 1.f) * base_a;
-			ImVec2 lts = ImGui::CalcTextSize(letters[li]);
-
-			if (li == 0) rule_x0 = cur_x;
-			dl->AddText(ImVec2(cur_x, title_y),
-				IM_COL32(238, 235, 255, (int)(250 * la)), letters[li]);
-			cur_x += lts.x;
-			if (li == 3) rule_x1 = cur_x;
-			cur_x += tracking;
+		float aura_r = ww * 0.45f;
+		for (int i = 0; i < 5; ++i) {
+			float rr = aura_r + (float)i * 18.f;
+			float fa = (1.f - (float)i / 5.f) * 0.40f * base_a;
+			dl->AddCircleFilled(ImVec2(cx, cy),
+				rr, aida::ui::with_alpha(th.accent_glow, fa), 64);
 		}
 
+		aida::ui::brand::render_constellation(
+			dl, ImVec2(cx, cy), 92.f, 12,
+			aida::ui::clock::seconds() * 0.4f,
+			aida::ui::with_alpha(th.accent_u32, base_a), nullptr);
 
-		float rule_t  = sqrtf(std::min(std::max(t - 0.2f, 0.f) / 0.42f, 1.f));
-		float rule_y  = title_y + fh + 5.f;
-		float rule_cx = (rule_x0 + rule_x1) * 0.5f;
-		float rule_hw = ((rule_x1 - rule_x0) * 0.5f + 3.f) * rule_t;
-		if (rule_hw > 0.5f)
-			dl->AddLine(ImVec2(rule_cx - rule_hw, rule_y), ImVec2(rule_cx + rule_hw, rule_y),
-				IM_COL32((int)ax, (int)ay, (int)az, (int)(220 * base_a)), 1.f);
+		float reveal = aida::motion::ease::out_back(std::min(t / 0.480f, 1.f));
+		float pulse = aida::ui::clock::pulse(0.6f, 0.0f, 1.0f);
+		aida::ui::brand::render_logomark(dl, ImVec2(cx, cy - 26.f), 84.f,
+			reveal, pulse, base_a);
 
+		ImFont* display_font = aida::ui::fonts::display();
+		if (!display_font) display_font = ImGui::GetFont();
+		float wm_total_w = aida::ui::brand::wordmark_total_width(display_font, 1.0f);
+		float wm_x = cx - wm_total_w * 0.5f;
+		float wm_y = cy + 38.f;
+		float wm_reveal = std::min(std::max(t - 0.18f, 0.f) / 0.62f, 1.f);
+		aida::ui::brand::render_wordmark(dl, ImVec2(wm_x, wm_y), 1.0f,
+			display_font, wm_reveal, base_a);
 
 		float sub_a = std::min(std::max(t - 0.7f, 0.f) / 0.5f, 1.f) * fade_out;
 		if (sub_a > 0.01f)
 		{
-			const char* subtitle = "Artificial Intelligence Disassembly Assistant";
-			ImVec2 sub_ts = ImGui::CalcTextSize(subtitle);
-			dl->AddText(ImVec2(cx - sub_ts.x * 0.5f, rule_y + 8.f),
-				IM_COL32(200, 196, 230, (int)(230 * sub_a)), subtitle);
+			ImFont* body = aida::ui::fonts::body();
+			if (!body) body = ImGui::GetFont();
+			const char* tagline = "Reverse engineering, reimagined.";
+			ImVec2 ts_t = body->CalcTextSizeA(14.f, FLT_MAX, 0.f, tagline);
+			dl->AddText(body, 14.f,
+				ImVec2(cx - ts_t.x * 0.5f, wm_y + 32.f + 14.f),
+				aida::ui::with_alpha(th.text_secondary, sub_a), tagline);
 
 			float msg_a = std::min(std::max(t - 1.4f, 0.f) / 0.5f, 1.f) * fade_out;
 			if (msg_a > 0.01f)
@@ -1273,9 +1399,10 @@ void helpers::render_title()
 				const char* msg = license::validated
 					? "Your session is ready."
 					: "Enter your license key to continue.";
-				ImVec2 msg_ts = ImGui::CalcTextSize(msg);
-				dl->AddText(ImVec2(cx - msg_ts.x * 0.5f, rule_y + 8.f + sub_ts.y + 12.f),
-					IM_COL32(170, 165, 200, (int)(210 * msg_a)), msg);
+				ImVec2 ts_m = body->CalcTextSizeA(13.f, FLT_MAX, 0.f, msg);
+				dl->AddText(body, 13.f,
+					ImVec2(cx - ts_m.x * 0.5f, wm_y + 32.f + 14.f + 22.f),
+					aida::ui::with_alpha(th.text_dim, msg_a), msg);
 			}
 		}
 
@@ -1286,8 +1413,19 @@ void helpers::render_title()
 
 	if (!license::validated)
 	{
+		const auto& th = aida::ui::resolved();
 		static float license_alpha = 0.f;
 		license_alpha += (1.f - license_alpha) * std::min(6.f * dt, 1.f);
+
+		static aida::ui::transition_t card_intro;
+		static bool card_intro_started = false;
+		if (!card_intro_started) {
+			card_intro.start(0.380f, aida::motion::ease::out_back);
+			card_intro_started = true;
+		}
+		card_intro.tick(dt);
+		float intro_e = card_intro.eased();
+		float intro_scale = 0.94f + 0.06f * intro_e;
 
 		ImVec2 wp   = ImGui::GetWindowPos();
 		float  ww   = globals::ui::window_w;
@@ -1295,106 +1433,377 @@ void helpers::render_title()
 		float  cx   = wp.x + ww * 0.5f;
 		float  cy   = wp.y + wh * 0.5f;
 		ImDrawList* dl = ImGui::GetWindowDrawList();
-
-		float ax = globals::ui::accent.x * 255.f;
-		float ay = globals::ui::accent.y * 255.f;
-		float az = globals::ui::accent.z * 255.f;
 		float la  = license_alpha;
 
+		dl->AddRectFilled(wp, ImVec2(wp.x + ww, wp.y + wh), th.bg_base, 14.f);
 
-		const char* title = "Enter License Key";
-		ImVec2 title_ts = ImGui::CalcTextSize(title);
-		dl->AddText(ImVec2(cx - title_ts.x * 0.5f, cy - 70.f),
-			IM_COL32(230, 228, 255, (int)(240 * la)), title);
+		if (g_bg_art_srv && g_bg_art_w > 0 && g_bg_art_h > 0) {
+			float aspect_img = (float)g_bg_art_w / (float)g_bg_art_h;
+			float aspect_win = ww / wh;
+			float bg_w, bg_h;
+			if (aspect_img > aspect_win) {
+				bg_h = wh;
+				bg_w = bg_h * aspect_img;
+			} else {
+				bg_w = ww;
+				bg_h = bg_w / aspect_img;
+			}
+			float bg_x = wp.x + (ww - bg_w) * 0.5f;
+			float bg_y = wp.y + (wh - bg_h) * 0.5f;
+			ImU32 bg_tint = aida::ui::with_alpha(IM_COL32_WHITE, 0.36f * la);
+			dl->AddImageRounded((ImTextureID)g_bg_art_srv,
+				ImVec2(bg_x, bg_y), ImVec2(bg_x + bg_w, bg_y + bg_h),
+				ImVec2(0.f, 0.f), ImVec2(1.f, 1.f),
+				bg_tint, 14.f);
+			dl->AddRectFilled(wp, ImVec2(wp.x + ww, wp.y + wh),
+				aida::ui::with_alpha(th.bg_base, 0.55f * la), 14.f);
+		}
 
+		float aura_r = ww * 0.45f;
+		for (int i = 0; i < 5; ++i) {
+			float rr = aura_r + (float)i * 18.f;
+			float fa = (1.f - (float)i / 5.f) * 0.30f * la;
+			dl->AddCircleFilled(ImVec2(cx, cy), rr,
+				aida::ui::with_alpha(th.accent_glow, fa), 64);
+		}
 
-		float rule_hw = title_ts.x * 0.4f;
-		dl->AddLine(ImVec2(cx - rule_hw, cy - 70.f + title_ts.y + 4.f),
-			ImVec2(cx + rule_hw, cy - 70.f + title_ts.y + 4.f),
-			IM_COL32((int)ax, (int)ay, (int)az, (int)(180 * la)), 1.f);
+		float card_w = std::min(ww - 80.f, 420.f);
+		float card_h = std::min(wh - 80.f, 320.f);
+		card_w *= intro_scale;
+		card_h *= intro_scale;
 
+		static aida::ui::transition_t shake;
+		static int shake_seed = 0;
+		float shake_x = 0.f;
+		if (license::check_failed) {
+			static bool shake_started = false;
+			if (!shake_started) {
+				shake.start(0.280f, aida::motion::ease::out_quint);
+				shake_started = true;
+				shake_seed++;
+			}
+			shake.tick(dt);
+			if (shake.is_finished()) shake_started = false;
+			float sp = shake.progress;
+			shake_x = sinf(sp * 18.84955f) * 6.f * (1.f - sp);
+		} else {
+			shake.reset();
+		}
 
-		float input_w = 280.f;
-		float input_h = 28.f;
-		float input_x = (ww - input_w) * 0.5f;
-		float input_y_rel = wh * 0.5f - 30.f;
+		ImVec2 card_a(cx - card_w * 0.5f + shake_x, cy - card_h * 0.5f);
+		ImVec2 card_b(card_a.x + card_w, card_a.y + card_h);
 
-		ImGui::SetCursorPos(ImVec2(input_x, input_y_rel));
-		ImGui::PushStyleColor(ImGuiCol_FrameBg,   ImVec4(th_pb_r/255.f, th_pb_g/255.f, th_pb_b/255.f, 0.9f * la));
-		ImGui::PushStyleColor(ImGuiCol_Border,     ImVec4(1, 1, 1, 0.1f * la));
-		ImGui::PushStyleColor(ImGuiCol_Text,       ImVec4(0.92f, 0.91f, 1.f, la));
-		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
-		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 6.f));
-		ImGui::PushItemWidth(input_w);
+		aida::ui::blur::layer_request_t req;
+		req.pos = card_a;
+		req.size = ImVec2(card_w, card_h);
+		req.radius = 16.f;
+		req.strength = 0.7f;
+		req.alpha = la;
+		aida::ui::blur::schedule(req);
+
+		float pad = 22.f;
+		float inner_w = card_w - pad * 2.f;
+		float content_x = card_a.x + pad;
+		float content_y = card_a.y + pad;
+
+		ImVec2 lock_c(cx + shake_x, content_y + 32.f);
+		aida::ui::brand::render_lock_icon(dl, lock_c, 52.f,
+			th.text_primary, th.accent_u32, la * intro_e);
+
+		ImFont* h1f = aida::ui::fonts::h1();
+		ImFont* body = aida::ui::fonts::body();
+		ImFont* body_em = aida::ui::fonts::body_em();
+		if (!h1f) h1f = ImGui::GetFont();
+		if (!body) body = ImGui::GetFont();
+		if (!body_em) body_em = ImGui::GetFont();
+
+		float gs = ImGui::GetIO().FontGlobalScale;
+		const char* title = "Welcome to AiDA";
+		float title_size = 22.f;
+		ImVec2 title_ts = h1f->CalcTextSizeA(title_size, FLT_MAX, 0.f, title);
+		dl->AddText(h1f, title_size,
+			ImVec2(cx - title_ts.x * 0.5f + shake_x, content_y + 70.f),
+			aida::ui::with_alpha(th.text_primary, la), title);
+
+		const char* sub = "Enter your license key to continue.";
+		float sub_size = 14.f;
+		ImVec2 sub_ts = body->CalcTextSizeA(sub_size, FLT_MAX, 0.f, sub);
+		dl->AddText(body, sub_size,
+			ImVec2(cx - sub_ts.x * 0.5f + shake_x, content_y + 70.f + 30.f),
+			aida::ui::with_alpha(th.text_secondary, la), sub);
+
+		float input_w = inner_w;
+		float input_h = 42.f;
+		float input_x_screen = content_x;
+		float input_y_screen = content_y + 134.f;
+
+		ImVec2 in_a(input_x_screen, input_y_screen);
+		ImVec2 in_b(input_x_screen + input_w, input_y_screen + input_h);
+
+		static aida::ui::hover_state_t input_focus;
+		static aida::ui::hover_state_t input_hover;
+
+		bool input_active = false;
+		bool enter = false;
+		bool input_hovered = ImGui::IsMouseHoveringRect(in_a, in_b);
+
+		input_hover.tick(input_hovered, dt, aida::motion::spring::balanced);
+
+		ImGui::SetCursorScreenPos(ImVec2(in_a.x + 14.f, in_a.y + (input_h - ImGui::GetFontSize()) * 0.5f));
+		ImGui::PushID("license_input");
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0,0,0,0));
+		ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0,0,0,0));
+		ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0,0,0,0));
+		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.f, 0.f, 0.f, 0.f));
+		ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, 0.45f * la)));
+		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.f, 0.f));
+		ImGui::SetNextItemWidth(input_w - 28.f);
+
+		auto lic_callback = [](ImGuiInputTextCallbackData* data) -> int {
+			if (data->EventFlag == ImGuiInputTextFlags_CallbackCharFilter) {
+				ImWchar c = data->EventChar;
+				if (c >= 'a' && c <= 'z') {
+					data->EventChar = (ImWchar)(c - 'a' + 'A');
+					return 0;
+				}
+				if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-')
+					return 0;
+				return 1;
+			}
+			if (data->EventFlag == ImGuiInputTextFlags_CallbackEdit) {
+				char tmp[256] = {};
+				int j = 0;
+				int alnum = 0;
+				for (int i = 0; i < data->BufTextLen && j < (int)sizeof(tmp) - 1; ++i) {
+					char ch = data->Buf[i];
+					if (ch == '-') continue;
+					if (alnum == 4 && j < (int)sizeof(tmp) - 1) { tmp[j++] = '-'; alnum = 0; }
+					tmp[j++] = ch;
+					alnum++;
+				}
+				tmp[j] = '\0';
+				if (strcmp(tmp, data->Buf) != 0) {
+					data->DeleteChars(0, data->BufTextLen);
+					data->InsertChars(0, tmp);
+				}
+			}
+			return 0;
+		};
 
 		if (ImGui::GetFrameCount() < 5)
 			ImGui::SetKeyboardFocusHere();
 
-		bool enter = ImGui::InputText("##license_key", license::key_buf, sizeof(license::key_buf),
-			ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_Password);
+		ImGuiInputTextFlags flags = ImGuiInputTextFlags_EnterReturnsTrue |
+			ImGuiInputTextFlags_CallbackCharFilter | ImGuiInputTextFlags_CallbackEdit;
+		enter = ImGui::InputText("##license_key", license::key_buf, sizeof(license::key_buf),
+			flags, lic_callback);
+		input_active = ImGui::IsItemActive();
 
-		ImGui::PopItemWidth();
-		ImGui::PopStyleVar(2);
-		ImGui::PopStyleColor(3);
+		ImGui::PopStyleVar();
+		ImGui::PopStyleColor(5);
+		ImGui::PopID();
 
+		float focus_v = input_focus.tick(input_active, dt, aida::motion::spring::balanced);
+		float ring_thick = focus_v * 2.5f + (1.f - focus_v) * 1.2f;
+		float input_radius = 12.f;
+		aida::ui::blur::layer_request_t in_req;
+		in_req.pos = in_a;
+		in_req.size = ImVec2(in_b.x - in_a.x, in_b.y - in_a.y);
+		in_req.radius = input_radius;
+		in_req.strength = 0.55f;
+		in_req.alpha = la;
+		aida::ui::blur::schedule(in_req);
+		ImU32 fill_col = aida::ui::with_alpha(IM_COL32(10, 10, 22, 200), 0.55f * la);
+		dl->AddRectFilled(in_a, in_b, fill_col, input_radius);
+		ImU32 ring = aida::ui::mix(th.border_subtle, th.border_focus, focus_v);
+		dl->AddRect(in_a, in_b, aida::ui::with_alpha(ring, la), input_radius, 0, ring_thick);
 
-		if (license::key_buf[0] == '\0' && !ImGui::IsItemActive()) {
-			ImVec2 ip = ImGui::GetItemRectMin();
-			dl->AddText(ImVec2(ip.x + 10.f, ip.y + 6.f),
-				IM_COL32(110, 105, 145, (int)(140 * la)), "AIDA-XXXX-XXXX-XXXX-XXXX");
+		if (license::key_buf[0] == '\0' && !input_active) {
+			ImFont* code = aida::ui::fonts::code();
+			if (!code) code = ImGui::GetFont();
+			dl->AddText(code, 15.f,
+				ImVec2(in_a.x + 16.f, in_a.y + (input_h - 15.f) * 0.5f),
+				aida::ui::with_alpha(th.text_dim, la), "AiDA-XXXX-XXXX-XXXX-XXXX");
+		} else {
+			ImFont* code = aida::ui::fonts::code();
+			if (!code) code = ImGui::GetFont();
+			dl->AddText(code, 15.f,
+				ImVec2(in_a.x + 16.f, in_a.y + (input_h - 15.f) * 0.5f),
+				aida::ui::with_alpha(th.text_primary, la), license::key_buf);
+			if (input_active) {
+				float caret_a = aida::ui::clock::pulse(2.0f, 0.3f, 1.0f);
+				float text_w = code->CalcTextSizeA(15.f, FLT_MAX, 0.f, license::key_buf).x;
+				float cax = in_a.x + 16.f + text_w + 1.f;
+				dl->AddLine(ImVec2(cax, in_a.y + 10.f), ImVec2(cax, in_b.y - 10.f),
+					aida::ui::with_alpha(th.text_primary, la * caret_a), 1.7f);
+			}
 		}
 
+		float btn_h = 42.f;
+		float btn_y_screen = input_y_screen + input_h + 16.f;
+		ImVec2 btn_a(input_x_screen, btn_y_screen);
+		ImVec2 btn_b(input_x_screen + input_w, btn_y_screen + btn_h);
 
-		float btn_w = 120.f;
-		float btn_h = 28.f;
-		float btn_x = (ww - btn_w) * 0.5f;
-		float btn_y_rel = input_y_rel + input_h + 14.f;
+		static aida::ui::hover_state_t btn_hover;
+		static aida::ui::press_state_t btn_press;
+		static aida::ui::flash_t btn_flash;
+		bool btn_hov = !license::checking && ImGui::IsMouseHoveringRect(btn_a, btn_b);
+		bool btn_held = btn_hov && (GetAsyncKeyState(VK_LBUTTON) & 0x8000);
+		float bhov_v = btn_hover.tick(btn_hov, dt, aida::motion::spring::balanced);
+		float bprs_v = btn_press.tick(btn_held, dt);
+		float bf = btn_flash.tick(dt);
 
-		ImGui::SetCursorPos(ImVec2(btn_x, btn_y_rel));
-		ImVec2 btn_min = ImGui::GetCursorScreenPos();
-		ImVec2 btn_max(btn_min.x + btn_w, btn_min.y + btn_h);
+		ImGui::SetCursorScreenPos(btn_a);
+		ImGui::InvisibleButton("##activate_btn", ImVec2(input_w, btn_h));
+		bool btn_clicked = ImGui::IsItemDeactivated() && ImGui::IsItemHovered() && !license::checking;
 
-		bool btn_hov = ImGui::IsMouseHoveringRect(btn_min, btn_max);
-		static float btn_ht = 0.f;
-		btn_ht += ((btn_hov ? 1.f : 0.f) - btn_ht) * std::min(10.f * dt, 1.f);
+		float lift = bhov_v * 2.5f - bprs_v * 2.f;
+		float scl = 1.f - (1.f - 0.97f) * bprs_v;
+		ImVec2 cb_a(btn_a.x + (1.f - scl) * input_w * 0.5f, btn_a.y + (1.f - scl) * btn_h * 0.5f - lift);
+		ImVec2 cb_b(btn_b.x - (1.f - scl) * input_w * 0.5f, btn_b.y - (1.f - scl) * btn_h * 0.5f - lift);
+		float btn_radius = 10.f;
 
-		ImU32 btn_bg = IM_COL32(
-			(int)(ax * 0.25f + 20), (int)(ay * 0.25f + 15), (int)(az * 0.25f + 30),
-			(int)((180 + 40 * btn_ht) * la));
-		dl->AddRectFilled(btn_min, btn_max, btn_bg, 6.f);
-		if (btn_ht > 0.01f)
-			dl->AddRect(btn_min, btn_max, IM_COL32((int)ax, (int)ay, (int)az, (int)(60 * btn_ht * la)), 6.f);
+		aida::ui::blur::render_drop_shadow(dl, cb_a, cb_b, btn_radius, 4,
+			(0.32f + 0.18f * bhov_v) * la, ImVec2(0.f, 4.f + 2.f * bhov_v));
+
+		aida::ui::blur::layer_request_t btn_blur_req;
+		btn_blur_req.pos = cb_a;
+		btn_blur_req.size = ImVec2(cb_b.x - cb_a.x, cb_b.y - cb_a.y);
+		btn_blur_req.radius = btn_radius;
+		btn_blur_req.strength = 0.7f;
+		btn_blur_req.alpha = la;
+		aida::ui::blur::schedule(btn_blur_req);
+
+		ImU32 fill_base = aida::ui::with_alpha(IM_COL32(255, 255, 255, 14), la * (0.6f + 0.4f * bhov_v));
+		dl->AddRectFilled(cb_a, cb_b, fill_base, btn_radius);
+
+		ImU32 fill_top = aida::ui::with_alpha(th.accent_grad_top, (0.45f + 0.30f * bhov_v) * la);
+		ImU32 fill_bot = aida::ui::with_alpha(th.accent_grad_bot, (0.55f + 0.30f * bhov_v) * la);
+		ImU32 fill_avg = aida::ui::mix(fill_top, fill_bot, 0.6f);
+		dl->AddRectFilled(cb_a, cb_b, fill_avg, btn_radius);
+
+		dl->PushClipRect(cb_a, cb_b, true);
+		dl->AddRectFilledMultiColor(
+			cb_a, ImVec2(cb_b.x, cb_a.y + (cb_b.y - cb_a.y) * 0.5f),
+			aida::ui::with_alpha(IM_COL32(255, 255, 255, 70), la),
+			aida::ui::with_alpha(IM_COL32(255, 255, 255, 70), la),
+			aida::ui::with_alpha(IM_COL32(255, 255, 255,  0), la),
+			aida::ui::with_alpha(IM_COL32(255, 255, 255,  0), la));
+		dl->PopClipRect();
+
+		dl->AddRect(cb_a, cb_b,
+			aida::ui::with_alpha(IM_COL32(255, 255, 255, 180), (0.55f + 0.40f * bhov_v) * la),
+			btn_radius, 0, 1.2f);
+
+		if (bf > 0.f) {
+			dl->AddRectFilled(cb_a, cb_b,
+				aida::ui::with_alpha(IM_COL32(255,255,255,255), bf * 0.22f), btn_radius);
+		}
+		if (btn_clicked) btn_flash.trigger();
 
 		if (license::checking) {
-
-			float dot_r  = 3.5f;
-			float dot_sp = 14.f;
-			float bcx = btn_min.x + btn_w * 0.5f;
-			float bcy = btn_min.y + btn_h * 0.5f;
-			for (int i = 0; i < 3; i++) {
-				float phase  = globals::ui::load_timer * 4.f + i * (2.f * 3.14159f / 3.f);
-				float bounce = sinf(phase) * 5.f;
-				float dot_a  = (sinf(phase) * 0.5f + 0.5f) * 0.6f + 0.4f;
-				dl->AddCircleFilled(
-					ImVec2(bcx + (i - 1) * dot_sp, bcy + bounce),
-					dot_r,
-					IM_COL32(230, 228, 255, (int)(255 * dot_a * la)));
+			ImVec2 ring_c((cb_a.x + cb_b.x) * 0.5f, (cb_a.y + cb_b.y) * 0.5f);
+			float t_sec = aida::ui::clock::seconds() * 4.f;
+			float arc_len = 1.4f;
+			for (int i = 0; i < 24; ++i) {
+				float a0 = t_sec + (float)i / 24.f * arc_len;
+				float a1 = t_sec + (float)(i + 1) / 24.f * arc_len;
+				float fade = 1.f - (float)i / 24.f;
+				dl->PathArcTo(ring_c, 10.f, a0, a1, 4);
+				dl->PathStroke(aida::ui::with_alpha(IM_COL32(255,255,255,255),
+					la * fade), 0, 2.2f);
 			}
 		} else {
+			ImFont* h2f = aida::ui::fonts::h2();
+			if (!h2f) h2f = ImGui::GetFont();
 			const char* btn_label = "Activate";
-			ImVec2 btn_ts = ImGui::CalcTextSize(btn_label);
-			dl->AddText(ImVec2(btn_min.x + (btn_w - btn_ts.x) * 0.5f, btn_min.y + (btn_h - btn_ts.y) * 0.5f),
-				IM_COL32(230, 228, 255, (int)(240 * la)), btn_label);
+			float lbl_size = 16.f;
+			ImVec2 ts = h2f->CalcTextSizeA(lbl_size, FLT_MAX, 0.f, btn_label);
+			dl->AddText(h2f, lbl_size,
+				ImVec2((cb_a.x + cb_b.x) * 0.5f - ts.x * 0.5f, (cb_a.y + cb_b.y) * 0.5f - ts.y * 0.5f),
+				aida::ui::with_alpha(IM_COL32(255,255,255,255), la), btn_label);
 		}
 
-		ImGui::InvisibleButton("##activate_btn", ImVec2(btn_w, btn_h));
-		bool btn_clicked = ImGui::IsItemClicked();
+		if (license::checking) {
+			static const char* k_act_phases[] = {
+				"Resolving license server...",
+				"Verifying signature...",
+				"Issuing session...",
+				"Downloading runtime...",
+				"Sealing..."
+			};
+			int act_phase = globals::ui::license_activation_phase.load(std::memory_order_acquire);
+			if (act_phase < 0) act_phase = 0;
+			if (act_phase > 4) act_phase = 4;
+
+			float pb_x = input_x_screen;
+			float pb_y = btn_y_screen + btn_h + 16.f;
+			float pb_w = input_w;
+			ImGui::GetWindowDrawList();
+			ImGui::SetCursorScreenPos(ImVec2(pb_x, pb_y));
+			aida::ui::render_progress_bar(ImVec2(pb_x, pb_y), pb_w, 4.f,
+				(float)(act_phase + 1) / 5.f, false, true);
+
+			static int last_act_phase = -1;
+			static aida::ui::transition_t act_swap;
+			static const char* prev_lbl = k_act_phases[0];
+			static const char* cur_lbl  = k_act_phases[0];
+			if (act_phase != last_act_phase) {
+				prev_lbl = cur_lbl;
+				cur_lbl  = k_act_phases[act_phase];
+				act_swap.start(0.120f, aida::motion::ease::out_cubic);
+				last_act_phase = act_phase;
+			}
+			act_swap.tick(dt);
+			float sw = act_swap.eased();
+			ImFont* phase_font = aida::ui::fonts::body();
+			if (!phase_font) phase_font = ImGui::GetFont();
+			float phase_size = 16.f;
+			float lbl_y = pb_y + 14.f;
+			if (!act_swap.is_finished() && prev_lbl) {
+				ImVec2 ts_p = phase_font->CalcTextSizeA(phase_size, FLT_MAX, 0.f, prev_lbl);
+				dl->AddText(phase_font, phase_size,
+					ImVec2(cx - ts_p.x * 0.5f + shake_x, lbl_y - sw * 6.f),
+					aida::ui::with_alpha(th.text_secondary, (1.f - sw) * la), prev_lbl);
+				ImVec2 ts_c = phase_font->CalcTextSizeA(phase_size, FLT_MAX, 0.f, cur_lbl);
+				dl->AddText(phase_font, phase_size,
+					ImVec2(cx - ts_c.x * 0.5f + shake_x, lbl_y + (1.f - sw) * 6.f),
+					aida::ui::with_alpha(th.text_secondary, sw * la), cur_lbl);
+			} else {
+				ImVec2 ts_c = phase_font->CalcTextSizeA(phase_size, FLT_MAX, 0.f, cur_lbl);
+				dl->AddText(phase_font, phase_size,
+					ImVec2(cx - ts_c.x * 0.5f + shake_x, lbl_y),
+					aida::ui::with_alpha(th.text_secondary, la), cur_lbl);
+			}
+		}
+
+		int arc_phase = globals::ui::arc_unseal_phase.load(std::memory_order_acquire);
+		if (arc_phase == 1) {
+			ImFont* arc_font = aida::ui::fonts::body();
+			if (!arc_font) arc_font = ImGui::GetFont();
+			const char* msg = "Decrypting runtime core...";
+			float arc_size = 16.f;
+			float pill_y = card_b.y + 18.f;
+			ImVec2 ts = arc_font->CalcTextSizeA(arc_size, FLT_MAX, 0.f, msg);
+			float pill_w = ts.x + 56.f;
+			float pill_h = 34.f;
+			ImVec2 pa(cx - pill_w * 0.5f, pill_y);
+			ImVec2 pb(pa.x + pill_w, pa.y + pill_h);
+			dl->AddRectFilled(pa, pb, aida::ui::with_alpha(th.info_soft, la), pill_h * 0.5f);
+			dl->AddRect(pa, pb, aida::ui::with_alpha(th.info, 0.55f * la), pill_h * 0.5f, 0, 1.f);
+			ImVec2 ring_c(pa.x + 20.f, (pa.y + pb.y) * 0.5f);
+			aida::ui::render_progress_ring(ring_c, 9.f, 1.6f, 0.f, true);
+			dl->AddText(arc_font, arc_size,
+				ImVec2(pa.x + 38.f, pa.y + (pill_h - arc_size) * 0.5f),
+				aida::ui::with_alpha(th.info, la), msg);
+		}
 
 		if ((enter || btn_clicked) && !license::checking && strlen(license::key_buf) > 0)
 		{
 			license::checking    = true;
 			license::check_failed = false;
 			license::error_msg.clear();
+			globals::ui::license_activation_phase.store(0, std::memory_order_release);
 
 			std::string key_copy(license::key_buf);
 			work_queue::post([key_copy]() {
@@ -1434,36 +1843,93 @@ void helpers::render_title()
 
 		if (license::check_failed && !license::error_msg.empty())
 		{
-			ImFont* err_font = ImGui::GetFont();
-			float err_font_size = ImGui::GetFontSize();
-			float err_wrap_width = ww - 40.f;
-			if (err_wrap_width < 100.f) err_wrap_width = 100.f;
-			ImVec2 err_ts = err_font->CalcTextSizeA(err_font_size, FLT_MAX, err_wrap_width,
-				license::error_msg.c_str(), nullptr, nullptr);
-			float err_x = cx - err_ts.x * 0.5f;
-			float min_x = wp.x + 20.f;
-			if (err_x < min_x) err_x = min_x;
-			dl->AddText(err_font, err_font_size,
-				ImVec2(err_x, wp.y + btn_y_rel + btn_h + 14.f),
-				IM_COL32(220, 80, 80, (int)(220 * la)),
-				license::error_msg.c_str(),
-				nullptr,
-				err_wrap_width);
+			ImFont* err_font = aida::ui::fonts::body();
+			if (!err_font) err_font = ImGui::GetFont();
+			float err_font_size = 14.f;
+			float err_y = btn_y_screen + btn_h + 22.f;
+
+			float ic_x = card_a.x + pad;
+			float ic_y = err_y + 4.f;
+			ImVec2 ic_c(ic_x + 9.f, ic_y + 9.f);
+			dl->AddCircleFilled(ic_c, 9.f, aida::ui::with_alpha(th.error_soft, la), 16);
+			dl->AddCircle(ic_c, 9.f, aida::ui::with_alpha(th.error, la), 16, 1.2f);
+			dl->AddText(err_font, 13.f, ImVec2(ic_c.x - 2.f, ic_c.y - 7.f),
+				aida::ui::with_alpha(th.error, la), "!");
+
+			float msg_x = ic_x + 26.f;
+			float msg_w = inner_w - 26.f - 110.f;
+			std::string mapped = license::error_msg;
+			if (mapped.find("not_found") != std::string::npos) {
+				mapped = "This license/session is no longer present on the server. Activate the current key.";
+			}
+			dl->AddText(err_font, err_font_size, ImVec2(msg_x, err_y),
+				aida::ui::with_alpha(th.error, la),
+				mapped.c_str(), nullptr, msg_w);
+
+			ImVec2 disc_a(card_b.x - pad - 108.f, err_y - 4.f);
+			ImVec2 disc_b(disc_a.x + 108.f, err_y - 4.f + 30.f);
+			static aida::ui::hover_state_t disc_h;
+			bool disc_hov = ImGui::IsMouseHoveringRect(disc_a, disc_b);
+			float dhv = disc_h.tick(disc_hov, dt, aida::motion::spring::balanced);
+			ImGui::SetCursorScreenPos(disc_a);
+			ImGui::InvisibleButton("##disc_btn", ImVec2(108.f, 30.f));
+			bool disc_clk = ImGui::IsItemDeactivated() && ImGui::IsItemHovered();
+			float disc_radius = 10.f;
+			aida::ui::blur::layer_request_t disc_req;
+			disc_req.pos = disc_a;
+			disc_req.size = ImVec2(108.f, 30.f);
+			disc_req.radius = disc_radius;
+			disc_req.strength = 0.55f;
+			disc_req.alpha = la;
+			aida::ui::blur::schedule(disc_req);
+			ImU32 disc_fill = aida::ui::with_alpha(IM_COL32(255, 255, 255, 12), la * (0.6f + 0.6f * dhv));
+			dl->AddRectFilled(disc_a, disc_b, disc_fill, disc_radius);
+			ImU32 disc_border = aida::ui::with_alpha(th.border_subtle, la * (0.7f + 0.5f * dhv));
+			dl->AddRect(disc_a, disc_b, disc_border, disc_radius, 0, 1.2f);
+			ImFont* sm_font = aida::ui::fonts::caption();
+			if (!sm_font) sm_font = ImGui::GetFont();
+			float disc_lbl = 13.f;
+			ImVec2 dts = sm_font->CalcTextSizeA(disc_lbl, FLT_MAX, 0.f, "Get a key");
+			dl->AddText(sm_font, disc_lbl,
+				ImVec2((disc_a.x + disc_b.x) * 0.5f - dts.x * 0.5f, (disc_a.y + disc_b.y) * 0.5f - dts.y * 0.5f),
+				aida::ui::with_alpha(th.text_primary, la), "Get a key");
+			if (disc_clk) {
+				ShellExecuteA(nullptr, "open", "https://discord.gg/aida", nullptr, nullptr, SW_SHOWNORMAL);
+			}
 		}
 
+		if (license::validated) {
+			static aida::ui::transition_t check_anim;
+			static aida::ui::transition_t burst_anim;
+			static bool started = false;
+			if (!started) {
+				check_anim.start(0.220f, aida::motion::ease::out_quint);
+				burst_anim.start(0.480f, aida::motion::ease::out_quint, 0.220f);
+				started = true;
+			}
+			check_anim.tick(dt);
+			burst_anim.tick(dt);
+			ImVec2 cm_c((cb_a.x + cb_b.x) * 0.5f, (cb_a.y + cb_b.y) * 0.5f);
+			aida::ui::brand::render_check_drawn(dl, cm_c, 24.f,
+				check_anim.eased(), aida::ui::with_alpha(IM_COL32(255,255,255,255), la), 2.5f);
+			aida::ui::brand::render_sparkle_burst(dl, cm_c, burst_anim.progress, 36.f,
+				aida::ui::with_alpha(th.accent_u32, la), 10);
+		}
 
 		{
 			static POINT lic_drag_wnd = {};
 			static POINT lic_drag_mouse = {};
 			static bool  lic_dragging = false;
 			static bool  lic_last_lmb = false;
-			bool lmb = GetAsyncKeyState(VK_LBUTTON) & 0x8000;
+			bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) && (GetForegroundWindow() == g_hwnd);
 			if (lmb && !lic_last_lmb) {
 				POINT cp; GetCursorPos(&cp);
 				RECT wr; GetWindowRect(g_hwnd, &wr);
-
 				int local_y = cp.y - wr.top;
-				if (cp.x >= wr.left && cp.x <= wr.right && cp.y >= wr.top && cp.y <= wr.bottom && local_y < (wr.bottom - wr.top) / 2) {
+				bool over_card = cp.x >= (int)card_a.x && cp.x <= (int)card_b.x &&
+				                 cp.y >= (int)card_a.y && cp.y <= (int)card_b.y;
+				if (cp.x >= wr.left && cp.x <= wr.right && cp.y >= wr.top && cp.y <= wr.bottom &&
+					local_y < (wr.bottom - wr.top) / 2 && !over_card) {
 					lic_dragging = true;
 					lic_drag_mouse = cp;
 					lic_drag_wnd = { wr.left, wr.top };
@@ -1490,9 +1956,9 @@ void helpers::render_title()
 
 	const float pad      = 6.f;
 	const float gap      = 4.f;
-	const float title_h  = 28.f;
-	const float menu_h   = 22.f;
-	const float status_h = 24.f;
+	const float title_h  = 32.f;
+	const float menu_h   = 24.f;
+	const float status_h = 28.f;
 	float ww = globals::ui::window_w;
 	float wh = globals::ui::window_h;
 
@@ -1567,137 +2033,243 @@ void helpers::render_title()
 	{
 		ImVec2 wp   = ImGui::GetWindowPos();
 		ImDrawList* dl = ImGui::GetWindowDrawList();
-		float ax = globals::ui::accent.x * 255.f;
-		float ay = globals::ui::accent.y * 255.f;
-		float az = globals::ui::accent.z * 255.f;
+		const auto& th_tb = aida::ui::resolved();
 
+		ImVec2 tb_a(wp.x, wp.y);
+		ImVec2 tb_b(wp.x + ww, wp.y + title_h);
 
-		auto& th_tb = themes::resolved;
-		dl->AddRectFilled(ImVec2(wp.x, wp.y), ImVec2(wp.x + ww, wp.y + title_h),
-			th_tb.title_bar, 8.f, ImDrawFlags_RoundCornersTop);
+		aida::ui::blur::layer_request_t tb_req;
+		tb_req.pos = tb_a;
+		tb_req.size = ImVec2(ww, title_h);
+		tb_req.radius = 0.f;
+		tb_req.strength = 0.55f;
+		tb_req.alpha = a;
+		aida::ui::blur::schedule(tb_req);
+		dl->AddRectFilled(tb_a, tb_b, aida::ui::with_alpha(th_tb.title_bar, a), 8.f, ImDrawFlags_RoundCornersTop);
+		dl->AddRectFilled(tb_a, tb_b, aida::ui::with_alpha(th_tb.glass_tint, a * 0.5f), 8.f, ImDrawFlags_RoundCornersTop);
 		dl->AddLine(ImVec2(wp.x, wp.y + title_h), ImVec2(wp.x + ww, wp.y + title_h),
-			IM_COL32(255, 255, 255, (int)(8 * a)));
+			aida::ui::with_alpha(th_tb.border_subtle, a));
 
-
-		const char* app_name = "AiDA Standalone";
-		ImVec2 name_ts = ImGui::CalcTextSize(app_name);
-		dl->AddText(ImVec2(wp.x + 12.f, wp.y + (title_h - name_ts.y) * 0.5f),
-			IM_COL32((int)(ax * 0.6f + 100), (int)(ay * 0.6f + 100), (int)(az * 0.6f + 100), (int)(220 * a)),
-			app_name);
-
-
-		float close_sz = 14.f;
-		ImVec2 close_pos(wp.x + ww - close_sz - 10.f, wp.y + (title_h - close_sz) * 0.5f);
-		ImVec2 close_max(close_pos.x + close_sz, close_pos.y + close_sz);
-		bool close_hov = ImGui::IsMouseHoveringRect(close_pos, close_max);
-		if (close_hov) {
-			dl->AddRectFilled(close_pos, close_max, IM_COL32(200, 60, 60, (int)(120 * a)), 3.f);
-			if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-				DestroyWindow(g_hwnd);
+		float pulse = aida::ui::clock::pulse(0.6f, 0.0f, 1.0f);
+		ImVec2 logo_c(wp.x + 22.f, wp.y + title_h * 0.5f);
+		if (g_aida_logo_srv && g_aida_logo_w > 0 && g_aida_logo_h > 0) {
+			float ls = 22.f * (0.95f + 0.05f * pulse);
+			float aspect = (float)g_aida_logo_w / (float)g_aida_logo_h;
+			float lw = ls * aspect;
+			float lh = ls;
+			ImU32 logo_tint = aida::ui::with_alpha(IM_COL32_WHITE, a);
+			dl->AddImage((ImTextureID)g_aida_logo_srv,
+				ImVec2(logo_c.x - lw * 0.5f, logo_c.y - lh * 0.5f),
+				ImVec2(logo_c.x + lw * 0.5f, logo_c.y + lh * 0.5f),
+				ImVec2(0.f, 0.f), ImVec2(1.f, 1.f), logo_tint);
+		} else {
+			aida::ui::brand::render_logomark(dl, logo_c, 22.f, 1.0f, pulse, a);
 		}
-		ImVec2 xc(close_pos.x + close_sz * 0.5f, close_pos.y + close_sz * 0.5f);
-		float xr = 4.f;
-		dl->AddLine(ImVec2(xc.x - xr, xc.y - xr), ImVec2(xc.x + xr, xc.y + xr),
-			IM_COL32(200, 200, 210, (int)(180 * a)), 1.5f);
-		dl->AddLine(ImVec2(xc.x + xr, xc.y - xr), ImVec2(xc.x - xr, xc.y + xr),
-			IM_COL32(200, 200, 210, (int)(180 * a)), 1.5f);
 
+		ImFont* h2f = aida::ui::fonts::h2();
+		if (!h2f) h2f = ImGui::GetFont();
+		const char* app_name = "AiDA";
+		ImVec2 name_ts = h2f->CalcTextSizeA(14.f, FLT_MAX, 0.f, app_name);
+		dl->AddText(h2f, 14.f,
+			ImVec2(wp.x + 38.f, wp.y + (title_h - 14.f) * 0.5f),
+			aida::ui::with_alpha(th_tb.text_primary, a), app_name);
 
-		ImVec2 max_pos(close_pos.x - close_sz - 8.f, close_pos.y);
-		ImVec2 max_max(max_pos.x + close_sz, max_pos.y + close_sz);
-		bool max_hov = ImGui::IsMouseHoveringRect(max_pos, max_max);
-		if (max_hov) {
-			dl->AddRectFilled(max_pos, max_max, IM_COL32(255, 255, 255, (int)(30 * a)), 3.f);
-			if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-				if (globals::ui::maximized) {
-
-					globals::ui::maximized = false;
-					globals::ui::window_w = globals::ui::pre_max_w;
-					globals::ui::window_h = globals::ui::pre_max_h;
-					SetWindowPos(g_hwnd, nullptr,
-						(int)globals::ui::pre_max_x, (int)globals::ui::pre_max_y,
-						(int)globals::ui::pre_max_w, (int)globals::ui::pre_max_h,
-						SWP_NOZORDER);
-					HRGN rgn = CreateRoundRectRgn(0, 0, (int)globals::ui::pre_max_w, (int)globals::ui::pre_max_h, 16, 16);
-					SetWindowRgn(g_hwnd, rgn, TRUE);
-					DWM_WINDOW_CORNER_PREFERENCE cp = DWMWCP_ROUND;
-					DwmSetWindowAttribute(g_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
-				} else {
-
-					RECT wr; GetWindowRect(g_hwnd, &wr);
-					globals::ui::pre_max_x = (float)wr.left;
-					globals::ui::pre_max_y = (float)wr.top;
-					globals::ui::pre_max_w = globals::ui::window_w;
-					globals::ui::pre_max_h = globals::ui::window_h;
-					globals::ui::maximized = true;
-					MONITORINFO mi = { sizeof(mi) };
-					GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
-					float mw = (float)(mi.rcWork.right - mi.rcWork.left);
-					float mh = (float)(mi.rcWork.bottom - mi.rcWork.top);
-					globals::ui::window_w = mw;
-					globals::ui::window_h = mh;
-					SetWindowPos(g_hwnd, nullptr,
-						mi.rcWork.left, mi.rcWork.top, (int)mw, (int)mh,
-						SWP_NOZORDER);
-					SetWindowRgn(g_hwnd, nullptr, TRUE);
-					DWM_WINDOW_CORNER_PREFERENCE cp = DWMWCP_DONOTROUND;
-					DwmSetWindowAttribute(g_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
-				}
+		{
+			ImFont* body = aida::ui::fonts::body();
+			if (!body) body = ImGui::GetFont();
+			float bc_x = wp.x + 38.f + name_ts.x + 10.f;
+			float bc_y = wp.y + (title_h - 12.f) * 0.5f;
+			std::vector<std::string> segs;
+			if (g_disasm.file.loaded) segs.push_back(g_disasm.file.filename);
+			if (code_editor::active && !code_editor::filename.empty())
+				segs.push_back(code_editor::filename);
+			switch (globals::ui::active_center_view) {
+				case center_view_t::disassembly: segs.push_back("Disassembly"); break;
+				case center_view_t::decompiler:  segs.push_back("Decompiler"); break;
+				case center_view_t::hex_view:    segs.push_back("Hex"); break;
+				case center_view_t::network_view:segs.push_back("Network"); break;
+				case center_view_t::scan_hub:    segs.push_back("Scan"); break;
+				case center_view_t::types_hub:   segs.push_back("Types"); break;
+				case center_view_t::analysis_hub:segs.push_back("Analysis"); break;
+				case center_view_t::binary_map:  segs.push_back("Binary Map"); break;
+				case center_view_t::debugger_view:segs.push_back("Debugger"); break;
+				case center_view_t::welcome:
+				default: break;
+			}
+			float sep_w = body->CalcTextSizeA(12.f, FLT_MAX, 0.f, "›").x;
+			for (size_t si = 0; si < segs.size(); ++si) {
+				dl->AddText(body, 12.f, ImVec2(bc_x, bc_y),
+					aida::ui::with_alpha(th_tb.text_dim, a), "›");
+				bc_x += sep_w + 8.f;
+				ImVec2 ss = body->CalcTextSizeA(12.f, FLT_MAX, 0.f, segs[si].c_str());
+				ImVec2 sa(bc_x - 4.f, bc_y - 2.f);
+				ImVec2 sb_pt(bc_x + ss.x + 4.f, bc_y + ss.y + 2.f);
+				bool h_seg = ImGui::IsMouseHoveringRect(sa, sb_pt);
+				if (h_seg) dl->AddRectFilled(sa, sb_pt, aida::ui::with_alpha(th_tb.hover_wash, a), 4.f);
+				ImU32 col = (si == segs.size() - 1) ? th_tb.text_primary : th_tb.text_secondary;
+				dl->AddText(body, 12.f, ImVec2(bc_x, bc_y - (h_seg ? 1.f : 0.f)),
+					aida::ui::with_alpha(col, a), segs[si].c_str());
+				bc_x += ss.x + 8.f;
 			}
 		}
+
+		auto draw_ctl = [&](float right_offset, const char* tag) -> std::pair<ImVec2, ImVec2> {
+			float ctl_sz = 22.f;
+			ImVec2 cp(wp.x + ww - right_offset - ctl_sz, wp.y + (title_h - ctl_sz) * 0.5f);
+			ImVec2 ce(cp.x + ctl_sz, cp.y + ctl_sz);
+			(void)tag;
+			return {cp, ce};
+		};
+
+		float ctl_off = 8.f;
+
+		auto [close_a, close_b] = draw_ctl(ctl_off, "x");
+		bool close_hov = ImGui::IsMouseHoveringRect(close_a, close_b);
+		static aida::ui::hover_state_t close_h;
+		float chv = close_h.tick(close_hov, dt, aida::motion::spring::balanced);
+		if (chv > 0.01f) {
+			dl->AddRectFilled(close_a, close_b,
+				aida::ui::with_alpha(IM_COL32(220, 70, 80, 255), 0.20f * chv * a), 6.f);
+		}
+		ImVec2 xc((close_a.x + close_b.x) * 0.5f, (close_a.y + close_b.y) * 0.5f);
+		float xr = 5.f;
+		ImU32 xcol = aida::ui::mix(th_tb.text_primary, IM_COL32(255, 130, 138, 255), chv);
+		float xth = 1.7f + chv * 0.6f;
+		dl->AddLine(ImVec2(xc.x - xr, xc.y - xr), ImVec2(xc.x + xr, xc.y + xr),
+			aida::ui::with_alpha(xcol, a), xth);
+		dl->AddLine(ImVec2(xc.x + xr, xc.y - xr), ImVec2(xc.x - xr, xc.y + xr),
+			aida::ui::with_alpha(xcol, a), xth);
+		if (close_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			DestroyWindow(g_hwnd);
+			PostQuitMessage(0);
+			ExitProcess(0);
+		}
+		ctl_off += 22.f + 6.f;
+
+		auto [max_a, max_b] = draw_ctl(ctl_off, "m");
+		bool max_hov = ImGui::IsMouseHoveringRect(max_a, max_b);
+		static aida::ui::hover_state_t max_h;
+		float mhv = max_h.tick(max_hov, dt, aida::motion::spring::balanced);
+		if (mhv > 0.01f) {
+			dl->AddRectFilled(max_a, max_b,
+				aida::ui::with_alpha(th_tb.hover_wash, mhv * a), 6.f);
+		}
+		ImVec2 mc((max_a.x + max_b.x) * 0.5f, (max_a.y + max_b.y) * 0.5f);
+		float mr = 5.f;
+		ImU32 mcol = th_tb.text_primary;
 		if (globals::ui::maximized) {
-
-			float ir = 3.5f;
-			ImVec2 mc(max_pos.x + close_sz * 0.5f, max_pos.y + close_sz * 0.5f);
-			dl->AddRect(ImVec2(mc.x - ir, mc.y - ir + 1.5f), ImVec2(mc.x + ir - 1.5f, mc.y + ir),
-				IM_COL32(200, 200, 210, (int)(180 * a)), 0.f, 0, 1.2f);
-			dl->AddRect(ImVec2(mc.x - ir + 1.5f, mc.y - ir), ImVec2(mc.x + ir, mc.y + ir - 1.5f),
-				IM_COL32(200, 200, 210, (int)(180 * a)), 0.f, 0, 1.2f);
+			dl->AddRect(ImVec2(mc.x - mr, mc.y - mr + 1.5f), ImVec2(mc.x + mr - 1.5f, mc.y + mr),
+				aida::ui::with_alpha(mcol, a), 1.f, 0, 1.4f);
+			dl->AddRect(ImVec2(mc.x - mr + 1.5f, mc.y - mr), ImVec2(mc.x + mr, mc.y + mr - 1.5f),
+				aida::ui::with_alpha(mcol, a), 1.f, 0, 1.4f);
 		} else {
-
-			float ir = 3.5f;
-			ImVec2 mc(max_pos.x + close_sz * 0.5f, max_pos.y + close_sz * 0.5f);
-			dl->AddRect(ImVec2(mc.x - ir, mc.y - ir), ImVec2(mc.x + ir, mc.y + ir),
-				IM_COL32(200, 200, 210, (int)(180 * a)), 0.f, 0, 1.2f);
+			dl->AddRect(ImVec2(mc.x - mr, mc.y - mr), ImVec2(mc.x + mr, mc.y + mr),
+				aida::ui::with_alpha(mcol, a), 1.f, 0, 1.4f);
 		}
-
-
-		ImVec2 min_pos(max_pos.x - close_sz - 8.f, max_pos.y);
-		ImVec2 min_max(min_pos.x + close_sz, min_pos.y + close_sz);
-		bool min_hov = ImGui::IsMouseHoveringRect(min_pos, min_max);
-		if (min_hov) {
-			dl->AddRectFilled(min_pos, min_max, IM_COL32(255, 255, 255, (int)(30 * a)), 3.f);
-			if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-				ShowWindow(g_hwnd, SW_MINIMIZE);
+		if (max_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			if (globals::ui::maximized) {
+				globals::ui::maximized = false;
+				globals::ui::window_w = globals::ui::pre_max_w;
+				globals::ui::window_h = globals::ui::pre_max_h;
+				SetWindowPos(g_hwnd, nullptr,
+					(int)globals::ui::pre_max_x, (int)globals::ui::pre_max_y,
+					(int)globals::ui::pre_max_w, (int)globals::ui::pre_max_h,
+					SWP_NOZORDER);
+				HRGN rgn = CreateRoundRectRgn(0, 0, (int)globals::ui::pre_max_w, (int)globals::ui::pre_max_h, 16, 16);
+				SetWindowRgn(g_hwnd, rgn, TRUE);
+				DWM_WINDOW_CORNER_PREFERENCE cp_w = DWMWCP_ROUND;
+				DwmSetWindowAttribute(g_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp_w, sizeof(cp_w));
+			} else {
+				RECT wr; GetWindowRect(g_hwnd, &wr);
+				globals::ui::pre_max_x = (float)wr.left;
+				globals::ui::pre_max_y = (float)wr.top;
+				globals::ui::pre_max_w = globals::ui::window_w;
+				globals::ui::pre_max_h = globals::ui::window_h;
+				globals::ui::maximized = true;
+				MONITORINFO mi = { sizeof(mi) };
+				GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+				float mw = (float)(mi.rcWork.right - mi.rcWork.left);
+				float mh = (float)(mi.rcWork.bottom - mi.rcWork.top);
+				globals::ui::window_w = mw;
+				globals::ui::window_h = mh;
+				SetWindowPos(g_hwnd, nullptr,
+					mi.rcWork.left, mi.rcWork.top, (int)mw, (int)mh,
+					SWP_NOZORDER);
+				SetWindowRgn(g_hwnd, nullptr, TRUE);
+				DWM_WINDOW_CORNER_PREFERENCE cp_w = DWMWCP_DONOTROUND;
+				DwmSetWindowAttribute(g_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp_w, sizeof(cp_w));
+			}
 		}
-		dl->AddLine(ImVec2(min_pos.x + 3.f, min_pos.y + close_sz * 0.5f),
-			ImVec2(min_max.x - 3.f, min_pos.y + close_sz * 0.5f),
-			IM_COL32(200, 200, 210, (int)(180 * a)), 1.5f);
+		ctl_off += 22.f + 6.f;
+
+		auto [min_a, min_b] = draw_ctl(ctl_off, "n");
+		bool min_hov = ImGui::IsMouseHoveringRect(min_a, min_b);
+		static aida::ui::hover_state_t min_hh;
+		float mnv = min_hh.tick(min_hov, dt, aida::motion::spring::balanced);
+		if (mnv > 0.01f) {
+			dl->AddRectFilled(min_a, min_b,
+				aida::ui::with_alpha(th_tb.hover_wash, mnv * a), 6.f);
+		}
+		ImU32 mncol = th_tb.text_primary;
+		float minc_x = (min_a.x + min_b.x) * 0.5f;
+		float minc_y = (min_a.y + min_b.y) * 0.5f + mnv * 2.f;
+		dl->AddLine(ImVec2(minc_x - 5.f, minc_y), ImVec2(minc_x + 5.f, minc_y),
+			aida::ui::with_alpha(mncol, a), 1.7f);
+		if (min_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+			ShowWindow(g_hwnd, SW_MINIMIZE);
+		ctl_off += 22.f + 12.f;
 
 
 		{
-			static int theme_popup_open_frame = 0;
-			float theme_btn_sz = close_sz;
-			ImVec2 th_pos(min_pos.x - theme_btn_sz - 8.f, min_pos.y);
-			ImVec2 th_max(th_pos.x + theme_btn_sz, th_pos.y + theme_btn_sz);
-			bool th_hov = ImGui::IsMouseHoveringRect(th_pos, th_max);
-			if (th_hov) {
-				dl->AddRectFilled(th_pos, th_max, IM_COL32(255, 255, 255, (int)(30 * a)), 3.f);
-				if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-					ImGui::OpenPopup("##theme_popup");
-					theme_popup_open_frame = ImGui::GetFrameCount();
-				}
+			ImFont* sm_font = aida::ui::fonts::caption();
+			if (!sm_font) sm_font = ImGui::GetFont();
+			float bell_sz = 22.f;
+			ImVec2 bell_a(wp.x + ww - ctl_off - bell_sz, wp.y + (title_h - bell_sz) * 0.5f);
+			ImVec2 bell_b(bell_a.x + bell_sz, bell_a.y + bell_sz);
+			bool bell_hov = ImGui::IsMouseHoveringRect(bell_a, bell_b);
+			static aida::ui::hover_state_t bell_h;
+			float bhv = bell_h.tick(bell_hov, dt, aida::motion::spring::balanced);
+			if (bhv > 0.01f) {
+				dl->AddRectFilled(bell_a, bell_b,
+					aida::ui::with_alpha(th_tb.hover_wash, bhv * a), 6.f);
 			}
+			ImU32 bcol = aida::ui::mix(th_tb.text_secondary, th_tb.text_primary, bhv);
+			ImVec2 bcc((bell_a.x + bell_b.x) * 0.5f, (bell_a.y + bell_b.y) * 0.5f);
+			dl->PathArcTo(ImVec2(bcc.x, bcc.y - 1.f), 5.f, 3.6651915f, 5.7595864f, 12);
+			dl->PathLineTo(ImVec2(bcc.x + 5.5f, bcc.y + 4.f));
+			dl->PathLineTo(ImVec2(bcc.x - 5.5f, bcc.y + 4.f));
+			dl->PathStroke(aida::ui::with_alpha(bcol, a), ImDrawFlags_Closed, 1.5f);
+			dl->AddCircleFilled(ImVec2(bcc.x, bcc.y + 6.5f), 1.5f, aida::ui::with_alpha(bcol, a), 8);
+			ctl_off += bell_sz + 8.f;
+		}
 
-			float dot_r = 2.5f;
-			float dot_cx = th_pos.x + theme_btn_sz * 0.5f;
-			float dot_cy = th_pos.y + theme_btn_sz * 0.5f;
-			dl->AddCircleFilled(ImVec2(dot_cx - 4.f, dot_cy), dot_r,
-				IM_COL32((int)(ax*255), (int)(ay*255), (int)(az*255), (int)(200*a)));
-			dl->AddCircleFilled(ImVec2(dot_cx, dot_cy), dot_r,
-				IM_COL32(200, 200, 200, (int)(180*a)));
-			dl->AddCircleFilled(ImVec2(dot_cx + 4.f, dot_cy), dot_r,
-				IM_COL32(120, 200, 160, (int)(180*a)));
+		{
+			float av_sz = 22.f;
+			ImVec2 av_a(wp.x + ww - ctl_off - av_sz, wp.y + (title_h - av_sz) * 0.5f);
+			ImVec2 av_b(av_a.x + av_sz, av_a.y + av_sz);
+			bool av_hov = ImGui::IsMouseHoveringRect(av_a, av_b);
+			static aida::ui::hover_state_t av_h;
+			float ahv = av_h.tick(av_hov, dt, aida::motion::spring::balanced);
+			if (ahv > 0.01f) {
+				dl->AddRectFilled(av_a, av_b,
+					aida::ui::with_alpha(th_tb.hover_wash, ahv * a), av_sz * 0.5f);
+			}
+			ImVec2 ac((av_a.x + av_b.x) * 0.5f, (av_a.y + av_b.y) * 0.5f);
+			std::string seed = license::saved_key.empty() ? std::string("aida") : license::saved_key;
+			aida::ui::avatar::render(dl, ac, av_sz * 0.45f,
+				seed, aida::ui::avatar::kind_t::gradient, true, a);
+			ctl_off += av_sz + 8.f;
+		}
+
+		{
+			static int theme_popup_open_frame = 0;
+			ImVec2 th_pos(wp.x + ww - 200.f, wp.y + 8.f);
+			(void)th_pos;
+			ImVec2 fake_pos(wp.x + ww - ctl_off - 22.f, wp.y + (title_h - 22.f) * 0.5f);
+			(void)fake_pos;
+			bool dummy_hov = false;
+			(void)dummy_hov;
+			(void)theme_popup_open_frame;
 
 			{
 				float popup_x = std::min(th_pos.x - 100.f, wp.x + ww - 220.f - 8.f);
@@ -1739,7 +2311,7 @@ void helpers::render_title()
 								(int)(tp.accent.z*255), 255));
 
 						ImU32 name_col = is_active
-							? IM_COL32((int)(ax*255), (int)(ay*255), (int)(az*255), 255)
+							? IM_COL32((int)(tp.accent.x*255), (int)(tp.accent.y*255), (int)(tp.accent.z*255), 255)
 							: IM_COL32(200, 200, 210, 220);
 						pdl->AddText(ImVec2(cp.x + 24.f, cp.y + (item_h - ImGui::GetFontSize()) * 0.5f),
 							name_col, tp.name);
@@ -1780,7 +2352,7 @@ void helpers::render_title()
 									(int)(ct.accent[2]*255), 255));
 
 							ImU32 nc = is_active
-								? IM_COL32((int)(ax*255), (int)(ay*255), (int)(az*255), 255)
+								? IM_COL32((int)(ct.accent[0]*255), (int)(ct.accent[1]*255), (int)(ct.accent[2]*255), 255)
 								: IM_COL32(200, 200, 210, 220);
 							pdl->AddText(ImVec2(cp.x + 24.f, cp.y + (item_h - ImGui::GetFontSize()) * 0.5f),
 								nc, ct.name.c_str());
@@ -1908,7 +2480,7 @@ void helpers::render_title()
 					auto& ed = custom_themes::editing_copy;
 					float iw2 = ew - 28.f;
 
-					ImGui::TextColored(ImVec4(ax, ay, az, 1.f),
+					ImGui::TextColored(aida::ui::resolved().accent,
 						custom_themes::editing_idx < 0 ? "Create Theme" : "Edit Theme");
 					ImGui::Dummy(ImVec2(0, 4));
 
@@ -1947,39 +2519,44 @@ void helpers::render_title()
 					u32_edit("Title Bar", "##te_tb", ed.title_bar);
 
 
-					ImGui::Text("Theme Icon");
+					ImGui::Text("Theme Icon (optional)");
 					ImGui::SetNextItemWidth(iw2);
-					const char* icon_names[] = {"Kaneki", "Rias", "Nagi", "Mio Akiyama", "Custom File..."};
-					int icon_sel = ed.icon_index >= 0 ? ed.icon_index : 4;
-					if (ImGui::Combo("##te_icon", &icon_sel, icon_names, 5)) {
-						if (icon_sel < 4) {
-							ed.icon_index = icon_sel;
-							ed.icon_file_path.clear();
-						} else {
-							char icon_buf[MAX_PATH] = {};
-							OPENFILENAMEA ofn2 = {};
-							ofn2.lStructSize = sizeof(ofn2);
-							ofn2.hwndOwner = g_hwnd;
-							ofn2.lpstrFile = icon_buf;
-							ofn2.nMaxFile = MAX_PATH;
-							ofn2.lpstrFilter = "Images\0*.png;*.jpg;*.jpeg;*.bmp\0All Files\0*.*\0\0";
-							ofn2.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-							if (trusted_get_open_file_name(ofn2)) {
-								ed.icon_index = -1;
-								ed.icon_file_path = icon_buf;
-							}
+					if (aida::ui::components::button("Choose Image File...##te_icon",
+						aida::ui::components::button_kind_t::primary,
+						aida::ui::components::size_t_::md,
+						ImVec2(iw2, 0.f))) {
+						char icon_buf[MAX_PATH] = {};
+						OPENFILENAMEA ofn2 = {};
+						ofn2.lStructSize = sizeof(ofn2);
+						ofn2.hwndOwner = g_hwnd;
+						ofn2.lpstrFile = icon_buf;
+						ofn2.nMaxFile = MAX_PATH;
+						ofn2.lpstrFilter = "Images\0*.png;*.jpg;*.jpeg;*.bmp\0All Files\0*.*\0\0";
+						ofn2.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+						if (trusted_get_open_file_name(ofn2)) {
+							ed.icon_index = -1;
+							ed.icon_file_path = icon_buf;
 						}
 					}
 					if (!ed.icon_file_path.empty()) {
 						ImGui::TextColored(ImVec4(0.5f, 0.7f, 0.5f, 1.f), "File: %s",
 							ed.icon_file_path.substr(ed.icon_file_path.find_last_of("\\/") + 1).c_str());
+						if (aida::ui::components::button("Clear Icon##te_clear",
+							aida::ui::components::button_kind_t::ghost,
+							aida::ui::components::size_t_::sm)) {
+							ed.icon_file_path.clear();
+							ed.icon_index = -1;
+						}
 					}
 
 					ImGui::Dummy(ImVec2(0, 8));
 
 
 					float btn_w2 = 70.f;
-					if (ImGui::Button("Save", ImVec2(btn_w2, 26))) {
+					if (aida::ui::components::button("Save",
+						aida::ui::components::button_kind_t::primary,
+						aida::ui::components::size_t_::md,
+						ImVec2(btn_w2, 26.f))) {
 						ed.name = name_buf;
 						if (custom_themes::editing_idx >= 0 &&
 						    custom_themes::editing_idx < (int)custom_themes::list.size()) {
@@ -2018,7 +2595,10 @@ void helpers::render_title()
 					ImGui::SameLine();
 
 
-					if (ImGui::Button("Export", ImVec2(btn_w2, 26))) {
+					if (aida::ui::components::button("Export",
+						aida::ui::components::button_kind_t::secondary,
+						aida::ui::components::size_t_::md,
+						ImVec2(btn_w2, 26.f))) {
 						char export_buf[MAX_PATH] = {};
 						snprintf(export_buf, sizeof(export_buf), "%s.json", name_buf);
 						OPENFILENAMEA sfn = {};
@@ -2050,9 +2630,10 @@ void helpers::render_title()
 
 
 					if (custom_themes::editing_idx >= 0) {
-						ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.1f, 0.1f, 0.7f));
-						ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.7f, 0.15f, 0.15f, 0.9f));
-						if (ImGui::Button("Delete", ImVec2(btn_w2, 26))) {
+						if (aida::ui::components::button("Delete",
+							aida::ui::components::button_kind_t::destructive,
+							aida::ui::components::size_t_::md,
+							ImVec2(btn_w2, 26.f))) {
 							int idx = custom_themes::editing_idx;
 							custom_themes::list.erase(custom_themes::list.begin() + idx);
 							if (custom_themes::active_custom == idx) custom_themes::active_custom = -1;
@@ -2061,16 +2642,16 @@ void helpers::render_title()
 							custom_themes::editor_open = false;
 							name_init = false;
 						}
-						ImGui::PopStyleColor(2);
 						ImGui::SameLine();
 					}
 
-					ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.22f, 0.28f, 0.8f));
-					if (ImGui::Button("Cancel", ImVec2(btn_w2, 26))) {
+					if (aida::ui::components::button("Cancel",
+						aida::ui::components::button_kind_t::secondary,
+						aida::ui::components::size_t_::md,
+						ImVec2(btn_w2, 26.f))) {
 						custom_themes::editor_open = false;
 						name_init = false;
 					}
-					ImGui::PopStyleColor();
 				}
 				ImGui::End();
 				ImGui::PopStyleColor(4);
@@ -2083,7 +2664,7 @@ void helpers::render_title()
 			static POINT tb_drag_mouse = {};
 			static bool  tb_dragging = false;
 			static bool  tb_last_lmb = false;
-			bool lmb = GetAsyncKeyState(VK_LBUTTON) & 0x8000;
+			bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) && (GetForegroundWindow() == g_hwnd);
 			if (lmb && !tb_last_lmb) {
 				POINT cp; GetCursorPos(&cp);
 				RECT wr; GetWindowRect(g_hwnd, &wr);
@@ -2112,17 +2693,21 @@ void helpers::render_title()
 	{
 		ImVec2 wp = ImGui::GetWindowPos();
 		ImDrawList* dl = ImGui::GetWindowDrawList();
-		float ax = globals::ui::accent.x * 255.f;
-		float ay = globals::ui::accent.y * 255.f;
-		float az = globals::ui::accent.z * 255.f;
+		const auto& th_mb = aida::ui::resolved();
 		float my0 = wp.y + title_h;
 		float my1 = my0 + menu_h;
 
-
+		aida::ui::blur::layer_request_t mb_req;
+		mb_req.pos = ImVec2(wp.x, my0);
+		mb_req.size = ImVec2(ww, menu_h);
+		mb_req.radius = 0.f;
+		mb_req.strength = 0.4f;
+		mb_req.alpha = a;
+		aida::ui::blur::schedule(mb_req);
 		dl->AddRectFilled(ImVec2(wp.x, my0), ImVec2(wp.x + ww, my1),
-			IM_COL32(18, 18, 24, (int)(230 * a)));
+			aida::ui::with_alpha(th_mb.panel_header, a));
 		dl->AddLine(ImVec2(wp.x, my1), ImVec2(wp.x + ww, my1),
-			IM_COL32(255, 255, 255, (int)(6 * a)));
+			aida::ui::with_alpha(th_mb.border_subtle, a));
 
 		struct MenuItem {
 			const char* label;
@@ -2132,20 +2717,33 @@ void helpers::render_title()
 			{"File", 0}, {"Edit", 1}, {"View", 2}, {"Tools", 3}, {"AI", 4}, {"Help", 5}
 		};
 
-		float mx_cursor = wp.x + 12.f;
+		ImFont* body = aida::ui::fonts::body();
+		if (!body) body = ImGui::GetFont();
+		float mx_cursor = wp.x + 14.f;
+		ImGuiStorage* mb_storage = ImGui::GetStateStorage();
 		for (int i = 0; i < 6; i++) {
-			ImVec2 ts = ImGui::CalcTextSize(menus[i].label);
-			float btn_w = ts.x + 16.f;
-			ImVec2 bmin(mx_cursor, my0 + 1.f);
-			ImVec2 bmax(mx_cursor + btn_w, my1 - 1.f);
+			ImVec2 ts = body->CalcTextSizeA(13.f, FLT_MAX, 0.f, menus[i].label);
+			float btn_w = ts.x + 18.f;
+			ImVec2 bmin(mx_cursor, my0 + 2.f);
+			ImVec2 bmax(mx_cursor + btn_w, my1 - 2.f);
 			bool hov = ImGui::IsMouseHoveringRect(bmin, bmax);
 			bool is_open = (menu_bar::open_menu == i);
 
-			if (hov || is_open)
-				dl->AddRectFilled(bmin, bmax, IM_COL32(255, 255, 255, is_open ? (int)(18 * a) : (int)(10 * a)), 3.f);
+			ImGuiID mb_hov_id = ImGui::GetID(menus[i].label);
+			float h_v = mb_storage->GetFloat(mb_hov_id, 0.f);
+			float h_target = (hov || is_open) ? 1.f : 0.f;
+			h_v += (h_target - h_v) * std::min(12.f * dt, 1.f);
+			mb_storage->SetFloat(mb_hov_id, h_v);
 
-			dl->AddText(ImVec2(mx_cursor + 8.f, my0 + (menu_h - ts.y) * 0.5f),
-				IM_COL32(200, 200, 215, (int)((hov || is_open ? 255 : 180) * a)), menus[i].label);
+			if (h_v > 0.01f) {
+				ImU32 mfill = is_open ? th_mb.selection_strong : th_mb.hover_wash;
+				dl->AddRectFilled(bmin, bmax, aida::ui::with_alpha(mfill, h_v * a), 6.f);
+			}
+
+			ImU32 tcol = (hov || is_open) ? th_mb.text_primary : th_mb.text_secondary;
+			dl->AddText(body, 13.f,
+				ImVec2(mx_cursor + 9.f, my0 + (menu_h - 13.f) * 0.5f),
+				aida::ui::with_alpha(tcol, a), menus[i].label);
 
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 				menu_bar::open_menu = is_open ? -1 : i;
@@ -2157,34 +2755,57 @@ void helpers::render_title()
 
 
 			if (is_open) {
-				ImGui::SetNextWindowPos(ImVec2(bmin.x, my1 + 1.f));
-				ImGui::SetNextWindowBgAlpha(0.97f);
-				ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.f);
-				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4.f, 6.f));
+				ImGui::SetNextWindowPos(ImVec2(bmin.x, my1 + 4.f));
+				ImGui::SetNextWindowBgAlpha(0.0f);
+				ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.f);
+				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.f, 8.f));
 				ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.f, 0.f));
-				ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(th_ph_r/255.f, th_ph_g/255.f, th_ph_b/255.f, 1.f));
-				ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1, 1, 1, 0.06f));
+				ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0,0,0,0));
+				ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0,0,0,0));
 
 				char popup_id[32];
 				snprintf(popup_id, sizeof(popup_id), "##menu_%d", i);
 				ImGui::OpenPopup(popup_id);
 
 				if (ImGui::BeginPopup(popup_id)) {
-					float mw = 210.f;
-					float ih = 24.f;
+					float mw = 220.f;
+					float ih = 26.f;
+
+					ImVec2 pwp = ImGui::GetWindowPos();
+					ImVec2 pws = ImGui::GetWindowSize();
+					ImVec2 pa(pwp.x, pwp.y);
+					ImVec2 pb(pwp.x + pws.x, pwp.y + pws.y);
+					ImDrawList* pdl = ImGui::GetWindowDrawList();
+					aida::ui::blur::layer_request_t pr;
+					pr.pos = pa; pr.size = pws; pr.radius = 10.f; pr.strength = 0.85f; pr.alpha = 1.f;
+					aida::ui::blur::schedule(pr);
+					aida::ui::blur::render_drop_shadow(pdl, pa, pb, 10.f, 5, 0.55f, ImVec2(0.f, 8.f));
+					{
+						const auto& th_pp = aida::ui::resolved();
+						pdl->AddRectFilled(pa, pb,
+							aida::ui::with_alpha(th_pp.panel_bg, 0.92f), 10.f);
+					}
+					aida::ui::blur::render_glass_border(pdl, pa, pb, 10.f, 1.f, 1.f);
 
 					auto menu_item = [&](const char* label, const char* shortcut, bool enabled = true) -> bool {
+						const auto& th_p = aida::ui::resolved();
 						ImVec2 cp = ImGui::GetCursorScreenPos();
 						ImVec2 rmin = cp;
 						ImVec2 rmax(cp.x + mw, cp.y + ih);
 						bool mhov = enabled && ImGui::IsMouseHoveringRect(rmin, rmax);
-						if (mhov) ImGui::GetWindowDrawList()->AddRectFilled(rmin, rmax, IM_COL32(255, 255, 255, 14), 3.f);
-						ImU32 tc = enabled ? IM_COL32(210, 210, 220, 230) : IM_COL32(100, 100, 110, 120);
-						ImGui::GetWindowDrawList()->AddText(ImVec2(cp.x + 12.f, cp.y + (ih - ImGui::GetFontSize()) * 0.5f), tc, label);
+						ImDrawList* idl = ImGui::GetWindowDrawList();
+						if (mhov) idl->AddRectFilled(rmin, rmax,
+							aida::ui::with_alpha(th_p.hover_wash, 1.f), 6.f);
+						ImU32 tc = enabled ? th_p.text_primary : th_p.text_dim;
+						ImFont* f = aida::ui::fonts::body();
+						if (!f) f = ImGui::GetFont();
+						idl->AddText(f, 13.f,
+							ImVec2(cp.x + 14.f, cp.y + (ih - 13.f) * 0.5f), tc, label);
 						if (shortcut && shortcut[0]) {
-							ImVec2 sts = ImGui::CalcTextSize(shortcut);
-							ImGui::GetWindowDrawList()->AddText(ImVec2(cp.x + mw - sts.x - 12.f, cp.y + (ih - ImGui::GetFontSize()) * 0.5f),
-								IM_COL32(100, 100, 120, 150), shortcut);
+							ImVec2 sts = f->CalcTextSizeA(11.f, FLT_MAX, 0.f, shortcut);
+							idl->AddText(f, 11.f,
+								ImVec2(cp.x + mw - sts.x - 12.f, cp.y + (ih - 11.f) * 0.5f),
+								aida::ui::with_alpha(th_p.text_dim, 1.f), shortcut);
 						}
 						ImGui::Dummy(ImVec2(mw, ih));
 						bool clicked = mhov && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
@@ -2193,10 +2814,12 @@ void helpers::render_title()
 					};
 
 					auto menu_sep = [&]() {
+						const auto& th_p = aida::ui::resolved();
 						ImVec2 cp = ImGui::GetCursorScreenPos();
-						ImGui::GetWindowDrawList()->AddLine(ImVec2(cp.x + 8.f, cp.y + 3.f), ImVec2(cp.x + mw - 8.f, cp.y + 3.f),
-							IM_COL32(255, 255, 255, 14));
-						ImGui::Dummy(ImVec2(mw, 7.f));
+						ImGui::GetWindowDrawList()->AddLine(
+							ImVec2(cp.x + 10.f, cp.y + 4.f), ImVec2(cp.x + mw - 10.f, cp.y + 4.f),
+							aida::ui::with_alpha(th_p.border_subtle, 1.f));
+						ImGui::Dummy(ImVec2(mw, 9.f));
 					};
 
 					switch (i) {
@@ -2290,6 +2913,8 @@ void helpers::render_title()
 						menu_sep();
 						if (menu_item("Exit", "Alt+F4")) {
 							DestroyWindow(g_hwnd);
+							PostQuitMessage(0);
+							ExitProcess(0);
 						}
 						break;
 					}
@@ -2531,41 +3156,71 @@ void helpers::render_title()
 
 
 	if (g_sa_settings.activity_bar_visible) {
+		const auto& th_ab = aida::ui::resolved();
 		const float ab_w = globals::ui::activity_bar_w;
 		ImVec2 ab_pos(wp_m.x + pad, wp_m.y + content_top);
 		ImVec2 ab_end(ab_pos.x + ab_w, ab_pos.y + total_h);
 
-		wdl->AddRectFilled(ab_pos, ab_end, IM_COL32(18, 18, 26, (int)(230 * a)), 8.f, ImDrawFlags_RoundCornersLeft);
-		wdl->AddLine(ImVec2(ab_end.x, ab_pos.y), ImVec2(ab_end.x, ab_end.y), IM_COL32(255, 255, 255, (int)(6 * a)));
+		aida::ui::blur::layer_request_t ab_req;
+		ab_req.pos = ab_pos;
+		ab_req.size = ImVec2(ab_w, total_h);
+		ab_req.radius = 10.f;
+		ab_req.strength = 0.55f;
+		ab_req.alpha = a;
+		aida::ui::blur::schedule(ab_req);
+		aida::ui::blur::render_glass_fill(wdl, ab_pos, ab_end, 10.f, a);
+		wdl->AddLine(ImVec2(ab_end.x, ab_pos.y), ImVec2(ab_end.x, ab_end.y),
+			aida::ui::with_alpha(th_ab.border_subtle, a));
 
-		struct ab_entry { const char* icon; activity_item_t item; };
+		struct ab_entry { const char* icon; activity_item_t item; const char* tip; };
 		static const ab_entry ab_items[] = {
-			{ ICON_FILES_EMPTY, activity_item_t::explorer },
-			{ ICON_SEARCH,      activity_item_t::search },
+			{ ICON_FILES_EMPTY, activity_item_t::explorer, "Explorer" },
+			{ ICON_SEARCH,      activity_item_t::search,   "Search" },
 		};
 		static const int ab_count = sizeof(ab_items) / sizeof(ab_items[0]);
 
-		float iy = ab_pos.y + 8.f;
+		float iy = ab_pos.y + 12.f;
 		float ab_active_y0 = -1.f, ab_active_y1 = -1.f;
+		ImGuiStorage* ab_storage = ImGui::GetStateStorage();
 		for (int ai = 0; ai < ab_count; ai++) {
 			bool active = (globals::ui::active_activity == ab_items[ai].item);
-			float icon_sz = 38.f;
+			float icon_sz = 36.f;
 			ImVec2 imin(ab_pos.x + (ab_w - icon_sz) * 0.5f, iy);
 			ImVec2 imax(imin.x + icon_sz, imin.y + icon_sz);
 			bool ihov = ImGui::IsMouseHoveringRect(imin, imax);
 
+			ImGuiID ab_h_id = ImGui::GetID(ab_items[ai].tip);
+			float ah_v = ab_storage->GetFloat(ab_h_id, 0.f);
+			float ah_target = ihov ? 1.f : 0.f;
+			ah_v += (ah_target - ah_v) * std::min(14.f * dt, 1.f);
+			ab_storage->SetFloat(ab_h_id, ah_v);
+
+			float lift = ah_v * 2.f;
+			ImVec2 ima(imin.x, imin.y - lift);
+			ImVec2 imb(imax.x, imax.y - lift);
+
 			if (active) {
-				wdl->AddRectFilled(imin, imax, IM_COL32((int)(ax3 * 60), (int)(ay3 * 60), (int)(az3 * 60), (int)(100 * a)), 4.f);
-				ab_active_y0 = imin.y;
-				ab_active_y1 = imax.y;
-			} else if (ihov) {
-				wdl->AddRectFilled(imin, imax, IM_COL32(255, 255, 255, (int)(10 * a)), 4.f);
+				wdl->AddRectFilled(ima, imb,
+					aida::ui::with_alpha(th_ab.selection, a), 8.f);
+				aida::ui::blur::render_inner_glow(wdl, ima, imb, 8.f, th_ab.accent_glow, 3);
+				ab_active_y0 = ima.y;
+				ab_active_y1 = imb.y;
+			} else if (ah_v > 0.01f) {
+				wdl->AddRectFilled(ima, imb,
+					aida::ui::with_alpha(th_ab.hover_wash, ah_v * a), 8.f);
 			}
 
 			ImVec2 lts = ImGui::CalcTextSize(ab_items[ai].icon);
-			ImU32 ic = active ? IM_COL32(220, 220, 240, (int)(240 * a))
-			                  : IM_COL32(110, 110, 130, (int)(160 * a));
-			wdl->AddText(ImVec2(imin.x + (icon_sz - lts.x) * 0.5f, imin.y + (icon_sz - lts.y) * 0.5f), ic, ab_items[ai].icon);
+			ImU32 ic = active ? aida::ui::with_alpha(th_ab.text_primary, a)
+			                  : aida::ui::with_alpha(th_ab.text_dim, a);
+			wdl->AddText(ImVec2(ima.x + (icon_sz - lts.x) * 0.5f, ima.y + (icon_sz - lts.y) * 0.5f),
+				ic, ab_items[ai].icon);
+
+			if (ihov) {
+				ImGui::SetCursorScreenPos(imin);
+				ImGui::InvisibleButton(ab_items[ai].tip, ImVec2(icon_sz, icon_sz));
+				aida::ui::tooltip_blur(ab_items[ai].tip, 0.6f);
+			}
 
 			if (ihov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 				if (globals::ui::active_activity == ab_items[ai].item && globals::ui::panel_left_visible) {
@@ -2575,31 +3230,54 @@ void helpers::render_title()
 					globals::ui::panel_left_visible = true;
 				}
 			}
-			iy += icon_sz + 6.f;
+			iy += icon_sz + 8.f;
 		}
 
 		if (ab_active_y0 >= 0.f && globals::ui::panel_left_visible) {
 			ImGuiID ab_uly = ImGui::GetID("##ab_ul_y");
-			float ab_cy = ImGui::GetStateStorage()->GetFloat(ab_uly, ab_active_y0);
-			ab_cy += (ab_active_y0 - ab_cy) * std::min(14.f * dt, 1.f);
-			ImGui::GetStateStorage()->SetFloat(ab_uly, ab_cy);
+			ImGuiID ab_uly_v = ImGui::GetID("##ab_ul_yv");
+			float ab_cy = ab_storage->GetFloat(ab_uly, ab_active_y0);
+			float ab_vy = ab_storage->GetFloat(ab_uly_v, 0.f);
+			ab_cy = aida::motion::spring_step(ab_cy, ab_active_y0, ab_vy,
+				aida::motion::spring::balanced, dt);
+			ab_storage->SetFloat(ab_uly, ab_cy);
+			ab_storage->SetFloat(ab_uly_v, ab_vy);
 			float ab_line_h = ab_active_y1 - ab_active_y0;
-			wdl->AddLine(ImVec2(ab_pos.x, ab_cy), ImVec2(ab_pos.x, ab_cy + ab_line_h),
-				IM_COL32((int)(ax3 * 255), (int)(ay3 * 255), (int)(az3 * 255), (int)(60 * a)), 4.f);
-			wdl->AddLine(ImVec2(ab_pos.x, ab_cy), ImVec2(ab_pos.x, ab_cy + ab_line_h),
-				IM_COL32((int)(ax3 * 255), (int)(ay3 * 255), (int)(az3 * 255), (int)(220 * a)), 2.f);
+			wdl->AddRectFilled(
+				ImVec2(ab_pos.x + 4.f, ab_cy + ab_line_h * 0.18f),
+				ImVec2(ab_pos.x + 7.f, ab_cy + ab_line_h * 0.82f),
+				aida::ui::with_alpha(th_ab.accent_u32, a), 1.5f);
 		}
 
 
 		{
-			float gear_sz = 38.f;
-			ImVec2 gmin(ab_pos.x + (ab_w - gear_sz) * 0.5f, ab_end.y - gear_sz - 8.f);
+			float footer_h = 52.f;
+			ImVec2 fmin(ab_pos.x, ab_end.y - footer_h);
+			ImVec2 fmax(ab_pos.x + ab_w, ab_end.y);
+			wdl->AddLine(ImVec2(fmin.x + 6.f, fmin.y),
+				ImVec2(fmax.x - 6.f, fmin.y),
+				aida::ui::with_alpha(th_ab.border_subtle, a * 0.7f), 1.f);
+
+			float gear_sz = 32.f;
+			ImVec2 gmin(ab_pos.x + (ab_w - gear_sz) * 0.5f, fmin.y + (footer_h - gear_sz) * 0.5f);
 			ImVec2 gmax(gmin.x + gear_sz, gmin.y + gear_sz);
 			bool ghov = ImGui::IsMouseHoveringRect(gmin, gmax);
-			if (ghov) wdl->AddRectFilled(gmin, gmax, IM_COL32(255, 255, 255, (int)(10 * a)), 4.f);
+			static aida::ui::hover_state_t gear_h;
+			float ghv = gear_h.tick(ghov, dt, aida::motion::spring::balanced);
+			if (ghv > 0.01f) {
+				wdl->AddRectFilled(gmin, gmax,
+					aida::ui::with_alpha(th_ab.hover_wash, ghv * a), 8.f);
+			}
 			ImVec2 gts = ImGui::CalcTextSize(ICON_COG);
-			ImU32 gc = ghov ? IM_COL32(220, 220, 240, (int)(220 * a)) : IM_COL32(110, 110, 130, (int)(160 * a));
-			wdl->AddText(ImVec2(gmin.x + (gear_sz - gts.x) * 0.5f, gmin.y + (gear_sz - gts.y) * 0.5f), gc, ICON_COG);
+			ImU32 gc = ghov ? aida::ui::with_alpha(th_ab.text_primary, a)
+			               : aida::ui::with_alpha(th_ab.text_dim, a);
+			wdl->AddText(ImVec2(gmin.x + (gear_sz - gts.x) * 0.5f, gmin.y + (gear_sz - gts.y) * 0.5f),
+				gc, ICON_COG);
+			if (ghov) {
+				ImGui::SetCursorScreenPos(gmin);
+				ImGui::InvisibleButton("##gear_btn", ImVec2(gear_sz, gear_sz));
+				aida::ui::tooltip_blur("Settings", 0.6f);
+			}
 			if (ghov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 				g_settings_open = true;
 		}
@@ -2835,10 +3513,10 @@ void helpers::render_title()
 
 		const char* sessions_lbl = "SESSIONS";
 		float sess_hdr_y = 6.f;
-		const char* sess_arrow = s_sessions_section_expanded ? "v" : ">";
+		const char* sess_arrow = s_sessions_section_expanded ? u8"▾" : u8"▸";
 		ImU32 sess_label_col = IM_COL32(130, 128, 155, (int)(200 * a));
 		fdl->AddText(ImVec2(fwp.x + 10.f, fwp.y + sess_hdr_y), sess_label_col, sess_arrow);
-		fdl->AddText(ImVec2(fwp.x + 22.f, fwp.y + sess_hdr_y), sess_label_col, sessions_lbl);
+		fdl->AddText(ImVec2(fwp.x + 24.f, fwp.y + sess_hdr_y), sess_label_col, sessions_lbl);
 		{
 			ImGui::SetCursorPos(ImVec2(0.f, sess_hdr_y - 2.f));
 			ImGui::InvisibleButton("##sess_hdr_btn", ImVec2(fw, 18.f));
@@ -2893,10 +3571,14 @@ void helpers::render_title()
 			}
 		}
 
-		float fb_label_y = sh_hdr_total + sess_h + splitter_h + 2.f;
+		float fb_label_y = sh_hdr_total + sess_h + splitter_h + 6.f;
+		fdl->AddLine(ImVec2(fwp.x + 8.f, fwp.y + fb_label_y - 4.f),
+			ImVec2(fwp.x + fw - 8.f, fwp.y + fb_label_y - 4.f),
+			IM_COL32(255, 255, 255, (int)(18 * a)), 1.f);
 		const char* explorer_lbl = "EXPLORER";
-		fdl->AddText(ImVec2(fwp.x + 10.f, fwp.y + fb_label_y),
-			IM_COL32(130, 128, 155, (int)(180 * a)), explorer_lbl);
+		fdl->AddText(ImVec2(fwp.x + 10.f, fwp.y + fb_label_y), IM_COL32(130, 128, 155, (int)(200 * a)), u8"▾");
+		fdl->AddText(ImVec2(fwp.x + 24.f, fwp.y + fb_label_y),
+			IM_COL32(130, 128, 155, (int)(200 * a)), explorer_lbl);
 
 		float tree_y = fb_label_y + 20.f;
 		float fb_scroll_h = fh - tree_y;
@@ -2923,7 +3605,7 @@ void helpers::render_title()
 				else if (hov) fdl->AddRectFilled(rmin, rmax, IM_COL32(255, 255, 255, (int)(12*a)));
 
 
-				const char* icon = ent.is_dir ? (ent.expanded ? "v " : "> ") : "  ";
+				const char* icon = ent.is_dir ? (ent.expanded ? u8"▾ " : u8"▸ ") : u8"   ";
 				ImU32 icon_col = ent.is_dir
 					? IM_COL32((int)(ax3*180+60), (int)(ay3*180+60), (int)(az3*180+60), (int)(200*a))
 					: IM_COL32(170, 175, 190, (int)(180*a));
@@ -3205,11 +3887,11 @@ void helpers::render_title()
 
 		} else if (!(g_disasm.file.loaded && !g_disasm.file.filename.empty()) && !hex_view::g_state.active) {
 
-			const char* fn_disp = "No file";
+			const char* fn_disp = "No file open";
 			ImVec2 fn_ts = ImGui::CalcTextSize(fn_disp);
 			float  fn_y  = r1_cy - fn_ts.y * 0.5f;
 			wdl->AddText(ImVec2(hx0 + hdr_pad, fn_y),
-				IM_COL32(120,120,140,(int)(140*a)), fn_disp);
+				IM_COL32(150,150,170,(int)(170*a)), fn_disp);
 		}
 
 
@@ -3386,6 +4068,15 @@ void helpers::render_title()
 		}
 
 
+		float hub_active_x0 = 0.f;
+		float hub_active_x1 = 0.f;
+		float hub_active_y1 = 0.f;
+		bool  hub_has_active = false;
+		float hub_hover_x0 = 0.f;
+		float hub_hover_x1 = 0.f;
+		float hub_hover_y1 = 0.f;
+		bool  hub_has_hover = false;
+
 		{
 			bool net_is_active = (globals::ui::active_center_view == center_view_t::network_view);
 			const char* net_label = "Network";
@@ -3397,17 +4088,19 @@ void helpers::render_title()
 			float nty0 = r1_cy - tab_h4 * 0.5f;
 			float nty1 = nty0 + tab_h4;
 
-			if (ntx0 > hx0 + hdr_pad + 40.f) {
+			if (ntx0 > hx0 + hdr_pad + 4.f) {
 				bool ntab_hov = ImGui::IsMouseHoveringRect(ImVec2(ntx0, nty0), ImVec2(ntx1, nty1), false);
 
 				if (net_is_active) {
 					wdl->AddRectFilled(ImVec2(ntx0, nty0), ImVec2(ntx1, nty1),
 						IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
-					wdl->AddLine(ImVec2(ntx0 + 2.f, nty1), ImVec2(ntx1 - 2.f, nty1),
-						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(200*a)), 2.f);
+					hub_active_x0 = ntx0; hub_active_x1 = ntx1; hub_active_y1 = nty1;
+					hub_has_active = true;
 				} else if (ntab_hov) {
 					wdl->AddRectFilled(ImVec2(ntx0, nty0), ImVec2(ntx1, nty1),
 						IM_COL32(255,255,255,(int)(8*a)), 4.f, ImDrawFlags_RoundCornersTop);
+					hub_hover_x0 = ntx0; hub_hover_x1 = ntx1; hub_hover_y1 = nty1;
+					hub_has_hover = true;
 				}
 
 				ImU32 ntab_col = net_is_active ? ac_full
@@ -3445,17 +4138,19 @@ void helpers::render_title()
 			float sty0 = r1_cy - tab_h_s * 0.5f;
 			float sty1 = sty0 + tab_h_s;
 
-			if (stx0 > hx0 + hdr_pad + 40.f) {
+			if (stx0 > hx0 + hdr_pad + 4.f) {
 				bool stab_hov = ImGui::IsMouseHoveringRect(ImVec2(stx0, sty0), ImVec2(stx1, sty1), false);
 
 				if (scan_is_active) {
 					wdl->AddRectFilled(ImVec2(stx0, sty0), ImVec2(stx1, sty1),
 						IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
-					wdl->AddLine(ImVec2(stx0 + 2.f, sty1), ImVec2(stx1 - 2.f, sty1),
-						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(200*a)), 2.f);
+					hub_active_x0 = stx0; hub_active_x1 = stx1; hub_active_y1 = sty1;
+					hub_has_active = true;
 				} else if (stab_hov) {
 					wdl->AddRectFilled(ImVec2(stx0, sty0), ImVec2(stx1, sty1),
 						IM_COL32(255,255,255,(int)(8*a)), 4.f, ImDrawFlags_RoundCornersTop);
+					hub_hover_x0 = stx0; hub_hover_x1 = stx1; hub_hover_y1 = sty1;
+					hub_has_hover = true;
 				}
 
 				ImU32 stab_col = scan_is_active ? ac_full
@@ -3487,17 +4182,19 @@ void helpers::render_title()
 			float dty0 = r1_cy - tab_h_d * 0.5f;
 			float dty1 = dty0 + tab_h_d;
 
-			if (dtx0 > hx0 + hdr_pad + 40.f) {
+			if (dtx0 > hx0 + hdr_pad + 4.f) {
 				bool dtab_hov = ImGui::IsMouseHoveringRect(ImVec2(dtx0, dty0), ImVec2(dtx1, dty1), false);
 
 				if (dbg_is_active) {
 					wdl->AddRectFilled(ImVec2(dtx0, dty0), ImVec2(dtx1, dty1),
 						IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
-					wdl->AddLine(ImVec2(dtx0 + 2.f, dty1), ImVec2(dtx1 - 2.f, dty1),
-						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(200*a)), 2.f);
+					hub_active_x0 = dtx0; hub_active_x1 = dtx1; hub_active_y1 = dty1;
+					hub_has_active = true;
 				} else if (dtab_hov) {
 					wdl->AddRectFilled(ImVec2(dtx0, dty0), ImVec2(dtx1, dty1),
 						IM_COL32(255,255,255,(int)(8*a)), 4.f, ImDrawFlags_RoundCornersTop);
+					hub_hover_x0 = dtx0; hub_hover_x1 = dtx1; hub_hover_y1 = dty1;
+					hub_has_hover = true;
 				}
 
 				ImU32 dtab_col = dbg_is_active ? ac_full
@@ -3532,21 +4229,23 @@ void helpers::render_title()
 				bool is_active = (acv == view_id) || is_hub_active(view_id);
 				ImVec2 lsz = ImGui::CalcTextSize(label);
 				float tw = 10.f * 2.f + lsz.x;
-				float tx0 = anchor_x0 - tw - 6.f;
+				float tx0 = anchor_x0 - tw - 4.f;
 				float tx1 = tx0 + tw;
 				float th = row_h - 2.f;
 				float ty0 = r1_cy - th * 0.5f;
 				float ty1 = ty0 + th;
-				if (tx0 > hx0 + hdr_pad + 40.f) {
+				if (tx0 > hx0 + hdr_pad + 4.f) {
 					bool hov = ImGui::IsMouseHoveringRect(ImVec2(tx0, ty0), ImVec2(tx1, ty1), false);
 					if (is_active) {
 						wdl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1),
 							IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
-						wdl->AddLine(ImVec2(tx0 + 2.f, ty1), ImVec2(tx1 - 2.f, ty1),
-							IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(200*a)), 2.f);
+						hub_active_x0 = tx0; hub_active_x1 = tx1; hub_active_y1 = ty1;
+						hub_has_active = true;
 					} else if (hov) {
 						wdl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1),
 							IM_COL32(255,255,255,(int)(8*a)), 4.f, ImDrawFlags_RoundCornersTop);
+						hub_hover_x0 = tx0; hub_hover_x1 = tx1; hub_hover_y1 = ty1;
+						hub_has_hover = true;
 					}
 					ImU32 tc = is_active ? ac_full : IM_COL32(170, 175, 190, (int)((hov ? 220.f : 160.f)*a));
 					wdl->AddText(ImVec2(tx0 + 10.f, ty0 + (th - lsz.y) * 0.5f), tc, label);
@@ -3561,6 +4260,130 @@ void helpers::render_title()
 			anchor = add_right_tab("Types",      center_view_t::types_hub, anchor);
 			anchor = add_right_tab("Analysis",   center_view_t::analysis_hub, anchor);
 			anchor = add_right_tab("Binary Map", center_view_t::binary_map, anchor);
+		}
+
+		{
+			ImGuiStorage* hub_st = ImGui::GetStateStorage();
+			ImGuiID hub_id_x   = ImGui::GetID("##hub_ul_x");
+			ImGuiID hub_id_w   = ImGui::GetID("##hub_ul_w");
+			ImGuiID hub_id_v   = ImGui::GetID("##hub_ul_v");
+			ImGuiID hub_id_y   = ImGui::GetID("##hub_ul_y");
+			ImGuiID hub_id_a   = ImGui::GetID("##hub_ul_a");
+			ImGuiID hub_id_init= ImGui::GetID("##hub_ul_init");
+
+			float hub_ul_x = hub_st->GetFloat(hub_id_x, 0.f);
+			float hub_ul_w = hub_st->GetFloat(hub_id_w, 0.f);
+			float hub_ul_v = hub_st->GetFloat(hub_id_v, 0.f);
+			float hub_ul_y = hub_st->GetFloat(hub_id_y, 0.f);
+			float hub_ul_a = hub_st->GetFloat(hub_id_a, 0.f);
+			bool  hub_init = hub_st->GetInt(hub_id_init, 0) != 0;
+
+			float target_x = hub_ul_x;
+			float target_w = hub_ul_w;
+			float target_y = hub_ul_y;
+			float target_a = 0.f;
+			if (hub_has_active) {
+				target_x = hub_active_x0 + 4.f;
+				target_w = (hub_active_x1 - hub_active_x0) - 8.f;
+				target_y = hub_active_y1;
+				target_a = 1.f;
+			}
+
+			if (!hub_init && hub_has_active) {
+				hub_ul_x = target_x;
+				hub_ul_w = target_w;
+				hub_ul_y = target_y;
+				hub_ul_a = target_a;
+				hub_init = true;
+			}
+
+			if (hub_has_active) {
+				hub_ul_x = aida::motion::spring_step(hub_ul_x, target_x, hub_ul_v,
+					aida::motion::spring::balanced, dt);
+				hub_ul_w = aida::motion::smooth_lerp(hub_ul_w, target_w, 16.f, dt);
+				hub_ul_y = aida::motion::smooth_lerp(hub_ul_y, target_y, 18.f, dt);
+				hub_ul_a = aida::motion::smooth_lerp(hub_ul_a, target_a, 12.f, dt);
+			} else {
+				hub_ul_a = aida::motion::smooth_lerp(hub_ul_a, 0.f, 10.f, dt);
+			}
+
+			hub_st->SetFloat(hub_id_x, hub_ul_x);
+			hub_st->SetFloat(hub_id_w, hub_ul_w);
+			hub_st->SetFloat(hub_id_v, hub_ul_v);
+			hub_st->SetFloat(hub_id_y, hub_ul_y);
+			hub_st->SetFloat(hub_id_a, hub_ul_a);
+			hub_st->SetInt(hub_id_init, hub_init ? 1 : 0);
+
+			if (hub_ul_w > 0.5f && hub_ul_a > 0.005f) {
+				const auto& th_hub = aida::ui::resolved();
+				float ul_thickness = 3.f;
+				float ul_x0 = hub_ul_x;
+				float ul_x1 = hub_ul_x + hub_ul_w;
+				float ul_y0 = hub_ul_y - ul_thickness * 0.5f;
+				float ul_y1 = hub_ul_y + ul_thickness * 0.5f;
+
+				for (int g_pass = 0; g_pass < 3; ++g_pass) {
+					float spread = 2.f + static_cast<float>(g_pass) * 2.5f;
+					float halo_a = (0.32f - static_cast<float>(g_pass) * 0.09f) * a * hub_ul_a;
+					if (halo_a <= 0.f) continue;
+					ImU32 halo_col = aida::ui::with_alpha(th_hub.accent_glow, halo_a);
+					wdl->AddRectFilled(
+						ImVec2(ul_x0 - spread, ul_y0 - spread),
+						ImVec2(ul_x1 + spread, ul_y1 + spread),
+						halo_col,
+						3.f + static_cast<float>(g_pass));
+				}
+
+				ImU32 grad_top = aida::ui::with_alpha(th_hub.accent_grad_top, a * hub_ul_a);
+				ImU32 grad_bot = aida::ui::with_alpha(th_hub.accent_grad_bot, a * hub_ul_a);
+				wdl->AddRectFilledMultiColor(
+					ImVec2(ul_x0, ul_y0),
+					ImVec2(ul_x1, ul_y1),
+					grad_top, grad_top, grad_bot, grad_bot);
+			}
+
+			ImGuiID hub_id_hx = ImGui::GetID("##hub_uh_x");
+			ImGuiID hub_id_hw = ImGui::GetID("##hub_uh_w");
+			ImGuiID hub_id_hy = ImGui::GetID("##hub_uh_y");
+			ImGuiID hub_id_ha = ImGui::GetID("##hub_uh_a");
+
+			bool show_hover_preview = hub_has_hover
+				&& (!hub_has_active
+					|| std::abs(hub_hover_x0 - hub_active_x0) > 0.5f);
+
+			if (show_hover_preview) {
+				const auto& th_hub2 = aida::ui::resolved();
+				float hub_uh_x = hub_st->GetFloat(hub_id_hx, hub_hover_x0 + 4.f);
+				float hub_uh_w = hub_st->GetFloat(hub_id_hw, (hub_hover_x1 - hub_hover_x0) - 8.f);
+				float hub_uh_y = hub_st->GetFloat(hub_id_hy, hub_hover_y1);
+				float hub_uh_a = hub_st->GetFloat(hub_id_ha, 0.f);
+
+				float th_x = hub_hover_x0 + 4.f;
+				float th_w = (hub_hover_x1 - hub_hover_x0) - 8.f;
+				float th_y = hub_hover_y1;
+
+				hub_uh_x = aida::motion::smooth_lerp(hub_uh_x, th_x, 22.f, dt);
+				hub_uh_w = aida::motion::smooth_lerp(hub_uh_w, th_w, 22.f, dt);
+				hub_uh_y = aida::motion::smooth_lerp(hub_uh_y, th_y, 22.f, dt);
+				hub_uh_a = aida::motion::smooth_lerp(hub_uh_a, 1.f, 14.f, dt);
+
+				hub_st->SetFloat(hub_id_hx, hub_uh_x);
+				hub_st->SetFloat(hub_id_hw, hub_uh_w);
+				hub_st->SetFloat(hub_id_hy, hub_uh_y);
+				hub_st->SetFloat(hub_id_ha, hub_uh_a);
+
+				if (hub_uh_w > 0.5f && hub_uh_a > 0.01f) {
+					ImU32 hov_col = aida::ui::with_alpha(th_hub2.accent_u32, a * hub_uh_a * 0.45f);
+					wdl->AddLine(
+						ImVec2(hub_uh_x, hub_uh_y),
+						ImVec2(hub_uh_x + hub_uh_w, hub_uh_y),
+						hov_col, 1.5f);
+				}
+			} else {
+				float hub_uh_a = hub_st->GetFloat(hub_id_ha, 0.f);
+				hub_uh_a = aida::motion::smooth_lerp(hub_uh_a, 0.f, 14.f, dt);
+				hub_st->SetFloat(hub_id_ha, hub_uh_a);
+			}
 		}
 
 		bool cf_clicked = ghost_btn("Choose File",
@@ -3951,6 +4774,8 @@ void helpers::render_title()
 		float cw = ImGui::GetWindowWidth();
 		float ch = ImGui::GetWindowHeight();
 		float frame_h    = ImGui::GetFrameHeight();
+		float chat_scroll_y_persistent = 0.f;
+		bool  chat_user_scrolled_up = false;
 
 
 		float line_h     = ImGui::GetFontSize();
@@ -3978,57 +4803,66 @@ void helpers::render_title()
 
 
 		{
-			float gear_sz = 20.f;
-			float btn_gap = 8.f;
+			const auto& th_ch = aida::ui::resolved();
+			ImDrawList* hdr_dl = ImGui::GetWindowDrawList();
+			ImVec2 wpos_ch = ImGui::GetWindowPos();
+			float gear_sz = 28.f;
+			float btn_gap = 6.f;
 			float btn_area = gear_sz * 3.f + btn_gap * 2.f + 8.f;
 			float bx = cw - btn_area;
 			if (bx < 4.f) bx = 4.f;
 
+			ImGuiStorage* hs = ImGui::GetStateStorage();
+			auto draw_circle_btn = [&](const char* label, const char* tip,
+				const char* icon_render, float bx_local, float by_local,
+				ImU32 icon_col_resting) -> bool
+			{
+				ImVec2 ba(wpos_ch.x + bx_local, wpos_ch.y + by_local);
+				ImVec2 bb(ba.x + gear_sz, ba.y + gear_sz);
+				bool hov = ImGui::IsMouseHoveringRect(ba, bb);
+				ImGuiID hid = ImGui::GetID(label);
+				float hv = hs->GetFloat(hid, 0.f);
+				hv += ((hov ? 1.f : 0.f) - hv) * std::min(12.f * dt, 1.f);
+				hs->SetFloat(hid, hv);
+				if (hv > 0.01f) {
+					hdr_dl->AddRectFilled(ba, bb,
+						aida::ui::with_alpha(th_ch.hover_wash, hv * a), gear_sz * 0.5f);
+				}
+				ImU32 ic = aida::ui::mix(icon_col_resting, th_ch.text_primary, hv);
+				ImVec2 ic_ts = ImGui::CalcTextSize(icon_render);
+				hdr_dl->AddText(
+					ImVec2((ba.x + bb.x) * 0.5f - ic_ts.x * 0.5f,
+					       (ba.y + bb.y) * 0.5f - ic_ts.y * 0.5f),
+					aida::ui::with_alpha(ic, a), icon_render);
 
-			ImGui::SetCursorPos(ImVec2(bx, 3.f));
-			ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
-			ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1,1,1,0.08f));
-			ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1,1,1,0.12f));
-			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f,0.55f,0.60f,1.f));
-			if (ImGui::Button("H##chat_history", ImVec2(gear_sz, gear_sz))) {
+				ImGui::SetCursorPos(ImVec2(bx_local, by_local));
+				ImGui::InvisibleButton(label, ImVec2(gear_sz, gear_sz));
+				bool clicked = ImGui::IsItemDeactivated() && ImGui::IsItemHovered();
+				if (ImGui::IsItemHovered() && tip) ImGui::SetTooltip("%s", tip);
+				return clicked;
+			};
+
+			if (draw_circle_btn("##chat_history", "Conversation history", "H", bx, 4.f, th_ch.text_primary)) {
 				conversations::refresh_history();
 				conversations::browser_open = !conversations::browser_open;
 			}
-			ImGui::PopStyleColor(4);
-			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("Conversation history");
-
 			bx += gear_sz + btn_gap;
-			ImGui::SetCursorPos(ImVec2(bx, 3.f));
-			ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
-			ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1,1,1,0.08f));
-			ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1,1,1,0.12f));
-			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f,0.55f,0.60f,1.f));
-			if (ImGui::Button("+##new_chat", ImVec2(gear_sz, gear_sz))) {
+			if (draw_circle_btn("##new_chat", "New chat", "+", bx, 4.f, th_ch.text_primary)) {
 				conversations::new_chat();
 			}
-			ImGui::PopStyleColor(4);
-			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("New chat");
-
 			bx += gear_sz + btn_gap;
-			ImGui::SetCursorPos(ImVec2(bx, 3.f));
-			ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
-			ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1,1,1,0.08f));
-			ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1,1,1,0.12f));
-			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f,0.55f,0.60f,1.f));
-			if (ImGui::Button(ICON_COG "##chat_settings", ImVec2(gear_sz, gear_sz)))
+			if (draw_circle_btn("##chat_settings", "AI Settings", ICON_COG, bx, 4.f, th_ch.text_primary)) {
 				g_settings_open = true;
-			ImGui::PopStyleColor(4);
-			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("AI Settings");
-			ImGui::SetCursorPosY(24.f);
+			}
+			ImGui::SetCursorPosY(28.f);
 		}
 
 
 		if (conversations::browser_open) {
 			static float history_appear = 0.f;
-			history_appear += (1.f - history_appear) * std::min(10.f * dt, 1.f);
+			static float history_appear_v = 0.f;
+			history_appear = aida::motion::spring_step(history_appear, 1.f, history_appear_v,
+				aida::motion::spring::balanced, dt);
 
 			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
 			ImGui::BeginChild("##history_panel", ImVec2(cw, msg_area_h), false,
@@ -4036,6 +4870,18 @@ void helpers::render_title()
 
 			ImDrawList* hdl = ImGui::GetWindowDrawList();
 			ImVec2 hp = ImGui::GetWindowPos();
+			{
+				const auto& hth = aida::ui::resolved();
+				ImVec2 ha(hp.x, hp.y);
+				ImVec2 hb(hp.x + cw, hp.y + msg_area_h);
+				aida::ui::blur::layer_request_t hr;
+				hr.pos = ha; hr.size = ImVec2(cw, msg_area_h);
+				hr.radius = 10.f; hr.strength = 0.6f; hr.alpha = history_appear * a;
+				aida::ui::blur::schedule(hr);
+				aida::ui::blur::render_glass_fill(hdl, ha, hb, 10.f, history_appear * a);
+				aida::ui::blur::render_glass_border(hdl, ha, hb, 10.f, history_appear * a, 1.f);
+				(void)hth;
+			}
 
 			float pad = 8.f;
 			float header_h = 32.f;
@@ -4723,6 +5569,13 @@ void helpers::render_title()
 		}
 
 		float chat_scroll_y   = ImGui::GetScrollY();
+		float chat_scroll_max = ImGui::GetScrollMaxY();
+		static bool s_chat_user_scrolled_up = false;
+		static float s_chat_scroll_y_persistent = 0.f;
+		s_chat_scroll_y_persistent = chat_scroll_y;
+		s_chat_user_scrolled_up = (chat_scroll_max > 4.f) && (chat_scroll_max - chat_scroll_y) > 32.f;
+		chat_scroll_y_persistent = s_chat_scroll_y_persistent;
+		chat_user_scrolled_up = s_chat_user_scrolled_up;
 		ImVec2 msgs_screen_pos = ImGui::GetWindowPos();
 
 		ImGui::EndChild();
@@ -4840,9 +5693,10 @@ void helpers::render_title()
 			};
 
 			float input_w = cw - btn_sz - igap;
+			ImGui::SetNextItemWidth(input_w);
 			ImGui::InputTextMultiline("##chatinput", g_chat_buf, sizeof(g_chat_buf),
 				ImVec2(input_w, input_h),
-				ImGuiInputTextFlags_CallbackAlways | ImGuiInputTextFlags_CtrlEnterForNewLine,
+				ImGuiInputTextFlags_CallbackAlways | ImGuiInputTextFlags_CtrlEnterForNewLine | ImGuiInputTextFlags_NoHorizontalScroll,
 				input_callback);
 			bool enter_pressed = s_enter_pressed;
 			s_enter_pressed = false;
@@ -4871,15 +5725,22 @@ void helpers::render_title()
 				std::string model    = active_profile ? active_profile->model : "No model";
 
 				if (model.empty()) model = "Select model";
-				std::string pill_text = provider + " / " + model;
+				std::string pill_text = model;
 
-				float max_pill_w = (input_max.x - input_min.x) * 0.7f;
+				float max_pill_w = (input_max.x - input_min.x) * 0.85f;
 				ImVec2 pill_ts = ImGui::CalcTextSize(pill_text.c_str());
-				if (pill_ts.x > max_pill_w && pill_text.size() > 20) {
-					pill_text.resize(20);
-					pill_text += "...";
-					pill_ts = ImGui::CalcTextSize(pill_text.c_str());
+				if (pill_ts.x > max_pill_w) {
+					while (pill_text.size() > 6) {
+						pill_text.pop_back();
+						std::string candidate = pill_text + "...";
+						ImVec2 cts = ImGui::CalcTextSize(candidate.c_str());
+						if (cts.x <= max_pill_w) {
+							pill_text = candidate;
+							break;
+						}
+					}
 				}
+				pill_ts = ImGui::CalcTextSize(pill_text.c_str());
 
 				float pill_h  = 22.f;
 				float pill_w  = pill_ts.x + 24.f;
@@ -4990,8 +5851,21 @@ void helpers::render_title()
 			}
 
 
+			const auto& th_chat = aida::ui::resolved();
 			float btn_y = input_y + input_h - btn_sz;
-			ImGui::SetCursorPos(ImVec2(input_w + igap, btn_y));
+			float send_x = input_w + igap;
+
+			bool ai_busy = is_ai_busy();
+			static aida::ui::transition_t stop_slide;
+			static bool stop_shown_prev = false;
+			if (ai_busy && !stop_shown_prev) { stop_slide.start(0.180f, aida::motion::ease::out_back); stop_shown_prev = true; }
+			if (!ai_busy && stop_shown_prev) { stop_slide.start_reverse(0.180f, aida::motion::ease::out_cubic); stop_shown_prev = false; }
+			stop_slide.tick(dt);
+			float stop_e = stop_slide.eased();
+
+			float stop_w = btn_sz * stop_e;
+
+			ImGui::SetCursorPos(ImVec2(send_x, btn_y));
 			ImVec2 btn_min = ImGui::GetCursorScreenPos();
 			ImVec2 btn_max = ImVec2(btn_min.x + btn_sz, btn_min.y + btn_sz);
 			ImVec2 btn_ctr = ImVec2((btn_min.x + btn_max.x) * 0.5f, (btn_min.y + btn_max.y) * 0.5f);
@@ -5000,34 +5874,193 @@ void helpers::render_title()
 			ImGui::InvisibleButton("##sendbtn", ImVec2(btn_sz, btn_sz));
 			bool btn_clicked = ImGui::IsItemClicked();
 
-			static float btn_ht    = 0.f;
-			static float btn_flash = 0.f;
+			static aida::ui::hover_state_t s_send_hover;
+			static aida::ui::press_state_t s_send_press;
+			static aida::ui::flash_t       s_send_flash;
+			float sh_v = s_send_hover.tick(btn_hovered, dt, aida::motion::spring::balanced);
+			float sp_v = s_send_press.tick(btn_hovered && (GetAsyncKeyState(VK_LBUTTON) & 0x8000), dt);
+			float sf_v = s_send_flash.tick(dt);
+			if (btn_clicked) s_send_flash.trigger();
 
-			btn_ht    += ((btn_hovered ? 1.f : 0.f) - btn_ht) * std::min(10.f * dt, 1.f);
-			btn_flash  = std::max(0.f, btn_flash - 5.f * dt);
+			float scl = 1.f - (1.f - 0.94f) * sp_v;
+			ImVec2 cb_a(btn_min.x + (1.f - scl) * btn_sz * 0.5f, btn_min.y + (1.f - scl) * btn_sz * 0.5f);
+			ImVec2 cb_b(btn_max.x - (1.f - scl) * btn_sz * 0.5f, btn_max.y - (1.f - scl) * btn_sz * 0.5f);
 
-			if (btn_clicked)
-				btn_flash = 1.f;
-
-			ImVec4 bg_f = ImGui::ColorConvertU32ToFloat4(input_bg_col);
-			float btn_alpha = bg_f.w + btn_ht * 0.07f + btn_flash * 0.55f;
-			dl->AddRectFilled(btn_min, btn_max,
-				IM_COL32(255, 255, 255, (int)(btn_alpha * 255.f)), 8.f);
+			dl->AddRectFilledMultiColor(cb_a, cb_b,
+				aida::ui::with_alpha(th_chat.accent_grad_top, a),
+				aida::ui::with_alpha(th_chat.accent_grad_top, a),
+				aida::ui::with_alpha(th_chat.accent_grad_bot, a),
+				aida::ui::with_alpha(th_chat.accent_grad_bot, a));
+			dl->AddRect(cb_a, cb_b,
+				aida::ui::with_alpha(th_chat.accent_hover, (0.5f + sh_v * 0.5f) * a), 8.f, 0, 1.f);
+			if (sf_v > 0.f) {
+				dl->AddRectFilled(cb_a, cb_b,
+					aida::ui::with_alpha(IM_COL32(255,255,255,255), sf_v * 0.25f), 8.f);
+			}
 
 			if (g_send_icon_srv)
 			{
-				float icon_sz = btn_sz * 0.52f;
+				float icon_sz = btn_sz * 0.50f;
 				float ix = btn_ctr.x - icon_sz * 0.5f;
 				float iy = btn_ctr.y - icon_sz * 0.5f;
 				dl->AddImage((ImTextureID)g_send_icon_srv,
 					ImVec2(ix, iy), ImVec2(ix + icon_sz, iy + icon_sz),
 					ImVec2(0, 0), ImVec2(1, 1),
-					IM_COL32(255, 255, 255, (int)(220 * a)));
+					aida::ui::with_alpha(IM_COL32(255, 255, 255, 245), a));
+			}
+
+			if (stop_e > 0.005f) {
+				float stop_x = send_x - stop_w - 6.f;
+				ImGui::SetCursorPos(ImVec2(stop_x, btn_y));
+				ImVec2 sb_a = ImGui::GetCursorScreenPos();
+				ImVec2 sb_b(sb_a.x + stop_w, sb_a.y + btn_sz);
+				bool stop_hov = ImGui::IsMouseHoveringRect(sb_a, sb_b);
+				ImGui::InvisibleButton("##stopbtn", ImVec2(stop_w, btn_sz));
+				bool stop_clicked = ImGui::IsItemClicked();
+				static aida::ui::hover_state_t stop_h;
+				float sthv = stop_h.tick(stop_hov, dt, aida::motion::spring::balanced);
+				ImU32 stop_top = IM_COL32(238, 99, 109, 255);
+				ImU32 stop_bot = IM_COL32(196, 51, 64, 255);
+				dl->AddRectFilledMultiColor(sb_a, sb_b,
+					aida::ui::with_alpha(stop_top, a * stop_e),
+					aida::ui::with_alpha(stop_top, a * stop_e),
+					aida::ui::with_alpha(stop_bot, a * stop_e),
+					aida::ui::with_alpha(stop_bot, a * stop_e));
+				dl->AddRect(sb_a, sb_b,
+					aida::ui::with_alpha(IM_COL32(255,255,255,255), 0.25f * sthv * a * stop_e), 8.f, 0, 1.f);
+				float sq = btn_sz * 0.30f;
+				ImVec2 sqc((sb_a.x + sb_b.x) * 0.5f, (sb_a.y + sb_b.y) * 0.5f);
+				dl->AddRectFilled(
+					ImVec2(sqc.x - sq * 0.5f, sqc.y - sq * 0.5f),
+					ImVec2(sqc.x + sq * 0.5f, sqc.y + sq * 0.5f),
+					aida::ui::with_alpha(IM_COL32(255,255,255,255), a * stop_e), 1.5f);
+				if (ImGui::IsItemHovered()) ImGui::SetTooltip("Stop generation");
+				if (stop_clicked) chat_request_cancel();
+			}
+
+			{
+				bool show_pill = false;
+				static float scroll_pill_appear = 0.f;
+				if (ai_busy) {
+					float scr_y = chat_scroll_y_persistent;
+					(void)scr_y;
+					show_pill = chat_user_scrolled_up;
+				}
+				float pill_target = show_pill ? 1.f : 0.f;
+				scroll_pill_appear += (pill_target - scroll_pill_appear) * std::min(10.f * dt, 1.f);
+				if (scroll_pill_appear > 0.005f) {
+					float pill_h = 28.f;
+					float pill_w = 130.f;
+					float pill_y_local = chat_sep_y - pill_h - 12.f;
+					float pill_x_local = (cw - pill_w) * 0.5f;
+					ImVec2 pa(ImGui::GetWindowPos().x + pill_x_local,
+					           ImGui::GetWindowPos().y + pill_y_local);
+					ImVec2 pb(pa.x + pill_w, pa.y + pill_h);
+					ImGui::SetCursorPos(ImVec2(pill_x_local, pill_y_local));
+					ImGui::InvisibleButton("##scroll_btm_pill", ImVec2(pill_w, pill_h));
+					bool s_h = ImGui::IsItemHovered();
+					bool s_c = ImGui::IsItemClicked();
+					float pa_alpha = scroll_pill_appear * a;
+					float ring_factor = s_h ? 0.9f : 0.6f;
+					aida::ui::blur::render_drop_shadow(dl, pa, pb, pill_h * 0.5f, 3, 0.30f * pa_alpha, ImVec2(0.f, 3.f));
+					dl->AddRectFilled(pa, pb,
+						aida::ui::with_alpha(th_chat.panel_bg, pa_alpha), pill_h * 0.5f);
+					dl->AddRect(pa, pb,
+						aida::ui::with_alpha(th_chat.accent_dim, ring_factor * pa_alpha), pill_h * 0.5f, 0, 1.f);
+					ImFont* sf = aida::ui::fonts::caption();
+					if (!sf) sf = ImGui::GetFont();
+					const char* lbl = "Jump to latest";
+					ImVec2 lts = sf->CalcTextSizeA(11.f, FLT_MAX, 0.f, lbl);
+					dl->AddText(sf, 11.f,
+						ImVec2((pa.x + pb.x) * 0.5f - lts.x * 0.5f - 6.f,
+						       (pa.y + pb.y) * 0.5f - lts.y * 0.5f),
+						aida::ui::with_alpha(th_chat.text_primary, pa_alpha), lbl);
+					float ax_arr = pb.x - 14.f;
+					float ay_arr = (pa.y + pb.y) * 0.5f;
+					dl->AddLine(ImVec2(ax_arr - 4.f, ay_arr - 2.f), ImVec2(ax_arr, ay_arr + 2.f),
+						aida::ui::with_alpha(th_chat.accent_u32, pa_alpha), 1.5f);
+					dl->AddLine(ImVec2(ax_arr + 4.f, ay_arr - 2.f), ImVec2(ax_arr, ay_arr + 2.f),
+						aida::ui::with_alpha(th_chat.accent_u32, pa_alpha), 1.5f);
+					if (s_c) g_chat_scroll_to_bottom = true;
+				}
+			}
+
+			{
+				bool slash_active = (g_chat_buf[0] == '/');
+				size_t buf_len = strlen(g_chat_buf);
+				bool slash_alone = slash_active && (buf_len <= 64);
+				static float slash_alpha = 0.f;
+				slash_alpha += ((slash_alone ? 1.f : 0.f) - slash_alpha) * std::min(12.f * dt, 1.f);
+				if (slash_alpha > 0.01f) {
+					struct slash_cmd_t { const char* name; const char* desc; const char* icon; };
+					static const slash_cmd_t k_cmds[] = {
+						{ "/clear",     "Clear conversation",        "*" },
+						{ "/new",       "Start new chat",            "+" },
+						{ "/explain",   "Explain selected code",     "?" },
+						{ "/refactor",  "Refactor selected code",    "~" },
+						{ "/test",      "Generate tests",            "T" },
+						{ "/doc",       "Generate documentation",    "D" },
+						{ "/agent",     "Switch agent",              "@" },
+						{ "/settings",  "Open settings",             "G" }
+					};
+					std::string flt;
+					for (size_t i = 1; i < buf_len; ++i) flt += (char)tolower((unsigned char)g_chat_buf[i]);
+
+					float pop_w = std::min(cw - 16.f, 360.f);
+					float row_h = 30.f;
+					int show_n = 0;
+					int matches[8] = {};
+					for (int i = 0; i < 8; ++i) {
+						std::string nm = k_cmds[i].name + 1;
+						std::string nm_l;
+						for (char c : nm) nm_l += (char)tolower((unsigned char)c);
+						if (flt.empty() || nm_l.find(flt) != std::string::npos) {
+							matches[show_n++] = i;
+						}
+					}
+					if (show_n > 0) {
+						float pop_h = row_h * show_n + 12.f;
+						float pop_x = 8.f;
+						float pop_y = input_y - pop_h - 6.f;
+						ImVec2 pa(ImGui::GetWindowPos().x + pop_x, ImGui::GetWindowPos().y + pop_y);
+						ImVec2 pb(pa.x + pop_w, pa.y + pop_h);
+						aida::ui::blur::render_drop_shadow(dl, pa, pb, 10.f, 4, 0.40f * slash_alpha * a, ImVec2(0.f, 4.f));
+						dl->AddRectFilled(pa, pb,
+							aida::ui::with_alpha(th_chat.bg_overlay, slash_alpha * a), 10.f);
+						dl->AddRect(pa, pb,
+							aida::ui::with_alpha(th_chat.border_subtle, slash_alpha * a), 10.f, 0, 1.f);
+
+						ImFont* sf = aida::ui::fonts::body();
+						ImFont* csf = aida::ui::fonts::caption();
+						if (!sf) sf = ImGui::GetFont();
+						if (!csf) csf = ImGui::GetFont();
+						for (int j = 0; j < show_n; ++j) {
+							int idx = matches[j];
+							ImVec2 ra(pa.x + 6.f, pa.y + 6.f + j * row_h);
+							ImVec2 rb(pb.x - 6.f, ra.y + row_h - 4.f);
+							bool rh = ImGui::IsMouseHoveringRect(ra, rb);
+							if (rh) {
+								dl->AddRectFilled(ra, rb,
+									aida::ui::with_alpha(th_chat.hover_wash, slash_alpha * a), 6.f);
+							}
+							dl->AddCircleFilled(ImVec2(ra.x + 14.f, (ra.y + rb.y) * 0.5f), 8.f,
+								aida::ui::with_alpha(th_chat.accent_dim, slash_alpha * a), 16);
+							dl->AddText(sf, 11.f,
+								ImVec2(ra.x + 10.f, (ra.y + rb.y) * 0.5f - 5.5f),
+								aida::ui::with_alpha(th_chat.text_primary, slash_alpha * a), k_cmds[idx].icon);
+							dl->AddText(sf, 13.f,
+								ImVec2(ra.x + 30.f, (ra.y + rb.y) * 0.5f - 13.f),
+								aida::ui::with_alpha(th_chat.text_primary, slash_alpha * a), k_cmds[idx].name);
+							dl->AddText(csf, 11.f,
+								ImVec2(ra.x + 30.f, (ra.y + rb.y) * 0.5f + 0.5f),
+								aida::ui::with_alpha(th_chat.text_dim, slash_alpha * a), k_cmds[idx].desc);
+						}
+					}
+				}
 			}
 
 			if ((enter_pressed || btn_clicked) && strlen(g_chat_buf) > 0)
 			{
-
 				size_t len = strlen(g_chat_buf);
 				while (len > 0 && (g_chat_buf[len-1] == '\n' || g_chat_buf[len-1] == '\r'))
 					g_chat_buf[--len] = '\0';
@@ -5043,7 +6076,19 @@ void helpers::render_title()
 
 	if (settings_visible) {
 		ImVec2 parent_sz = ImGui::GetWindowSize();
+		ImVec2 parent_pos_screen = ImGui::GetWindowPos();
 		float offset_x = (1.f - s_settings_slide) * parent_sz.x;
+
+		{
+			ImDrawList* scrim_dl = ImGui::GetWindowDrawList();
+			float scrim_alpha = s_settings_slide * 0.55f;
+			ImU32 scrim_col = IM_COL32(8, 10, 18, (int)(scrim_alpha * 255.f));
+			scrim_dl->AddRectFilled(parent_pos_screen,
+				ImVec2(parent_pos_screen.x + parent_sz.x,
+					parent_pos_screen.y + parent_sz.y),
+				scrim_col);
+		}
+
 		ImGui::SetCursorPos(ImVec2(offset_x, 0.f));
 		ImGui::BeginChild("##settings_slide_wrap", parent_sz, false,
 			ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
@@ -5329,6 +6374,7 @@ void helpers::render_title()
 
 	g_render_section = "status_bar";
 	{
+		const auto& th_sb = aida::ui::resolved();
 		ImVec2 wp = ImGui::GetWindowPos();
 		ImDrawList* dl = ImGui::GetWindowDrawList();
 		float sx0 = wp.x;
@@ -5336,30 +6382,75 @@ void helpers::render_title()
 		float sx1 = wp.x + ww;
 		float sy1 = wp.y + wh;
 
-		float sax = globals::ui::accent.x * 255.f;
-		float say = globals::ui::accent.y * 255.f;
-		float saz = globals::ui::accent.z * 255.f;
+		ImVec2 sb_a(sx0, sy0);
+		ImVec2 sb_b(sx1, sy1);
+		aida::ui::blur::layer_request_t sb_req;
+		sb_req.pos = sb_a;
+		sb_req.size = ImVec2(ww, status_h);
+		sb_req.radius = 0.f;
+		sb_req.strength = 0.55f;
+		sb_req.alpha = a;
+		aida::ui::blur::schedule(sb_req);
+		dl->AddRectFilled(sb_a, sb_b,
+			aida::ui::with_alpha(th_sb.title_bar, a), 8.f, ImDrawFlags_RoundCornersBottom);
+		dl->AddRectFilled(sb_a, sb_b,
+			aida::ui::with_alpha(th_sb.glass_tint, a * 0.4f), 8.f, ImDrawFlags_RoundCornersBottom);
+		dl->AddLine(sb_a, ImVec2(sx1, sy0),
+			aida::ui::with_alpha(th_sb.border_subtle, a));
 
-		dl->AddRectFilled(ImVec2(sx0, sy0), ImVec2(sx1, sy1),
-			IM_COL32(14, 14, 20, (int)(235 * a)), 8.f, ImDrawFlags_RoundCornersBottom);
-		dl->AddLine(ImVec2(sx0, sy0), ImVec2(sx1, sy0),
-			IM_COL32(255, 255, 255, (int)(6 * a)));
+		ImFont* body = aida::ui::fonts::body();
+		ImFont* cap = aida::ui::fonts::caption();
+		if (!body) body = ImGui::GetFont();
+		if (!cap) cap = ImGui::GetFont();
+		float text_y = sy0 + (status_h - 12.f) * 0.5f;
 
-		float text_y = sy0 + (status_h - ImGui::GetFontSize()) * 0.5f;
+		const float zone_pad = 12.f;
+		const float chip_gap = 8.f;
+		const float chip_h_v = 20.f;
+		const float chip_pad_x = 8.f;
+		float chip_y0 = sy0 + (status_h - chip_h_v) * 0.5f;
+		float chip_y1 = chip_y0 + chip_h_v;
 
+		float total_w = sx1 - sx0;
+		float zone_w = total_w / 3.f;
+		float left_x  = sx0 + zone_pad;
+		float ctr_x0  = sx0 + zone_w;
+		float ctr_x1  = sx0 + zone_w * 2.f;
+		float right_x = sx1 - zone_pad;
+
+		float left_clip_x = ctr_x0 - zone_pad;
+		float right_clip_x0 = ctr_x1 + zone_pad;
+
+		dl->AddLine(ImVec2(ctr_x0, sy0 + 6.f), ImVec2(ctr_x0, sy1 - 6.f),
+			aida::ui::with_alpha(th_sb.border_subtle, a));
+		dl->AddLine(ImVec2(ctr_x1, sy0 + 6.f), ImVec2(ctr_x1, sy1 - 6.f),
+			aida::ui::with_alpha(th_sb.border_subtle, a));
+
+		auto truncate_to_width = [&](std::string s, float max_w) -> std::string {
+			if (s.empty()) return s;
+			ImVec2 ts = body->CalcTextSizeA(12.f, FLT_MAX, 0.f, s.c_str());
+			if (ts.x <= max_w) return s;
+			const std::string ell = "...";
+			while (s.size() > ell.size()) {
+				s.pop_back();
+				std::string candidate = s + ell;
+				float cw_ = body->CalcTextSizeA(12.f, FLT_MAX, 0.f, candidate.c_str()).x;
+				if (cw_ <= max_w) return candidate;
+			}
+			return ell;
+		};
+
+		bool has_file = (code_editor::active && !code_editor::filename.empty()) || g_disasm.file.loaded;
 
 		{
-			bool lic_ok = license::validated && standalone_license::is_valid();
-			float dot_r = 3.5f;
-			float dot_x = sx0 + 8.f + dot_r;
-			float dot_y = text_y + ImGui::GetFontSize() * 0.5f;
-			ImU32 dot_col = lic_ok
-				? IM_COL32(80, 200, 80, (int)(220 * a))
-				: IM_COL32(220, 60, 60, (int)(220 * a));
-			dl->AddCircleFilled(ImVec2(dot_x, dot_y), dot_r, dot_col);
+			ImU32 dot_col = has_file ? th_sb.accent_dim : th_sb.text_dim;
+			float pulse = aida::ui::clock::pulse(1.0f, 0.55f, 1.f);
+			float halo_r = 4.f + pulse * 1.f;
+			dl->AddCircleFilled(ImVec2(left_x + 4.f, text_y + 6.f), halo_r,
+				aida::ui::with_alpha(dot_col, 0.18f * a), 16);
+			dl->AddCircleFilled(ImVec2(left_x + 4.f, text_y + 6.f), 3.f,
+				aida::ui::with_alpha(dot_col, a), 16);
 		}
-		const float lic_dot_offset = 20.f;
-
 
 		{
 			std::string info;
@@ -5369,95 +6460,124 @@ void helpers::render_title()
 				info += "  Ln " + std::to_string(autocomplete::cursor_line + 1) +
 				        ", Col " + std::to_string(autocomplete::cursor_col + 1);
 			} else if (g_disasm.file.loaded) {
-				info = g_disasm.file.filename + "  (" + std::to_string(g_disasm.file.instrs.size()) + " instructions)";
+				info = g_disasm.file.filename + "  (" +
+					std::to_string(g_disasm.file.instrs.size()) + " instructions)";
 			} else {
 				info = "No file open";
 			}
-			dl->AddText(ImVec2(sx0 + lic_dot_offset, text_y), IM_COL32(150, 150, 170, (int)(200 * a)), info.c_str());
+			float info_x = left_x + 18.f;
+			float info_max_w = std::max(0.f, left_clip_x - info_x);
+			info = truncate_to_width(info, info_max_w);
+			dl->AddText(body, 12.f, ImVec2(info_x, text_y),
+				aida::ui::with_alpha(th_sb.text_secondary, a), info.c_str());
 		}
 
-
 		{
-			auto* prof = g_sa_settings.get_active_profile();
-			std::string model_str = prof ? (prof->display_name + " / " + prof->model) : "No model";
-			ImVec2 mts = ImGui::CalcTextSize(model_str.c_str());
-
-
-			float rx = sx1 - mts.x - 16.f;
-			ImU32 dim_col = IM_COL32(120, 120, 145, (int)(160 * a));
-
-			const char* encoding = "UTF-8";
-			const char* line_end = "LF";
-			const char* indent_str = "Spaces: 4";
-			const char* lang = "Plain Text";
-
-			if (code_editor::active && !code_editor::filename.empty()) {
-				auto ext = std::filesystem::path(code_editor::filename).extension().string();
-				if (ext == ".cpp" || ext == ".cc" || ext == ".cxx") lang = "C++";
-				else if (ext == ".c") lang = "C";
-				else if (ext == ".h" || ext == ".hpp" || ext == ".hxx") lang = "C/C++ Header";
-				else if (ext == ".py") lang = "Python";
-				else if (ext == ".js") lang = "JavaScript";
-				else if (ext == ".ts") lang = "TypeScript";
-				else if (ext == ".rs") lang = "Rust";
-				else if (ext == ".go") lang = "Go";
-				else if (ext == ".java") lang = "Java";
-				else if (ext == ".json") lang = "JSON";
-				else if (ext == ".xml") lang = "XML";
-				else if (ext == ".md") lang = "Markdown";
-				else if (ext == ".asm" || ext == ".s") lang = "Assembly";
-				else if (ext == ".cmake") lang = "CMake";
-				else if (ext == ".txt") lang = "Plain Text";
-				indent_str = editor_config::tab_size == 4 ? "Spaces: 4" : "Spaces: 2";
-			}
-
-
-			dl->AddText(ImVec2(rx, text_y),
-				IM_COL32((int)(sax * 0.6f + 60), (int)(say * 0.6f + 60), (int)(saz * 0.6f + 60), (int)(180 * a)),
-				model_str.c_str());
-			rx -= 12.f;
-
-			ImVec2 lang_ts = ImGui::CalcTextSize(lang);
-			rx -= lang_ts.x;
-			dl->AddText(ImVec2(rx, text_y), dim_col, lang);
-			rx -= 12.f;
-
-			ImVec2 enc_ts = ImGui::CalcTextSize(encoding);
-			rx -= enc_ts.x;
-			dl->AddText(ImVec2(rx, text_y), dim_col, encoding);
-			rx -= 12.f;
-
-			ImVec2 le_ts = ImGui::CalcTextSize(line_end);
-			rx -= le_ts.x;
-			dl->AddText(ImVec2(rx, text_y), dim_col, line_end);
-			rx -= 12.f;
-
-			ImVec2 ind_ts = ImGui::CalcTextSize(indent_str);
-			rx -= ind_ts.x;
-			dl->AddText(ImVec2(rx, text_y), dim_col, indent_str);
-		}
-
-
-		{
-			std::string driver_str;
-			if (driver_bridge::attached_pid() != 0) {
-				driver_str = "Driver: " + driver_bridge::attached_process_name() +
-				             " (PID " + std::to_string(driver_bridge::attached_pid()) + ")";
-			} else {
-				driver_str = "Driver: Detached";
-			}
-
+			std::string driver_name;
 			ImU32 driver_col;
-			if (driver_bridge::attached_pid() != 0)
-				driver_col = IM_COL32(100, 200, 100, (int)(200 * a));
-			else
-				driver_col = IM_COL32(120, 120, 140, (int)(160 * a));
-
-			ImVec2 dts = ImGui::CalcTextSize(driver_str.c_str());
-			float dcx = (sx0 + sx1) * 0.5f - dts.x * 0.5f;
-			dl->AddText(ImVec2(dcx, text_y), driver_col, driver_str.c_str());
+			if (driver_bridge::attached_pid() != 0) {
+				driver_name = driver_bridge::attached_process_name() +
+				              " (PID " + std::to_string(driver_bridge::attached_pid()) + ")";
+				driver_col = th_sb.success;
+			} else {
+				driver_name = "Detached";
+				driver_col = th_sb.warning;
+			}
+			float ctr_max_w = std::max(0.f, (ctr_x1 - zone_pad) - (ctr_x0 + zone_pad));
+			std::string label = std::string("Driver: ") + driver_name;
+			float dot_w = 10.f;
+			float pill_max = std::max(0.f, ctr_max_w);
+			float text_budget = pill_max - dot_w - chip_pad_x * 2.f;
+			label = truncate_to_width(label, std::max(0.f, text_budget));
+			ImVec2 lts = body->CalcTextSizeA(12.f, FLT_MAX, 0.f, label.c_str());
+			float pill_w = lts.x + dot_w + chip_pad_x * 2.f;
+			if (pill_w > pill_max) pill_w = pill_max;
+			float pill_x0 = (ctr_x0 + ctr_x1) * 0.5f - pill_w * 0.5f;
+			float pill_x1 = pill_x0 + pill_w;
+			dl->AddRectFilled(ImVec2(pill_x0, chip_y0), ImVec2(pill_x1, chip_y1),
+				aida::ui::with_alpha(driver_col, 0.14f * a), chip_h_v * 0.5f);
+			dl->AddRect(ImVec2(pill_x0, chip_y0), ImVec2(pill_x1, chip_y1),
+				aida::ui::with_alpha(th_sb.border_subtle, a), chip_h_v * 0.5f, 0, 1.f);
+			float pulse = aida::ui::clock::pulse(1.4f, 0.4f, 1.f);
+			float halo = 4.f + pulse * 1.5f;
+			float dot_cx = pill_x0 + chip_pad_x + 3.f;
+			float dot_cy = chip_y0 + chip_h_v * 0.5f;
+			dl->AddCircleFilled(ImVec2(dot_cx, dot_cy), halo,
+				aida::ui::with_alpha(driver_col, 0.18f * a), 16);
+			dl->AddCircleFilled(ImVec2(dot_cx, dot_cy), 3.f,
+				aida::ui::with_alpha(driver_col, a), 16);
+			float text_x = pill_x0 + chip_pad_x + dot_w;
+			dl->AddText(body, 12.f, ImVec2(text_x, text_y),
+				aida::ui::with_alpha(driver_col, a), label.c_str());
 		}
 
+		auto* prof = g_sa_settings.get_active_profile();
+		std::string model_str = prof ? (prof->display_name + " / " + prof->model) : "No model";
+
+		const char* encoding = "UTF-8";
+		const char* line_end = "LF";
+		const char* indent_str = "Spaces: 4";
+		const char* lang = "Plain Text";
+		if (code_editor::active && !code_editor::filename.empty()) {
+			auto ext = std::filesystem::path(code_editor::filename).extension().string();
+			if (ext == ".cpp" || ext == ".cc" || ext == ".cxx") lang = "C++";
+			else if (ext == ".c") lang = "C";
+			else if (ext == ".h" || ext == ".hpp" || ext == ".hxx") lang = "C/C++ Header";
+			else if (ext == ".py") lang = "Python";
+			else if (ext == ".js") lang = "JavaScript";
+			else if (ext == ".ts") lang = "TypeScript";
+			else if (ext == ".rs") lang = "Rust";
+			else if (ext == ".go") lang = "Go";
+			else if (ext == ".java") lang = "Java";
+			else if (ext == ".json") lang = "JSON";
+			else if (ext == ".xml") lang = "XML";
+			else if (ext == ".md") lang = "Markdown";
+			else if (ext == ".asm" || ext == ".s") lang = "Assembly";
+			else if (ext == ".cmake") lang = "CMake";
+			else if (ext == ".txt") lang = "Plain Text";
+			indent_str = editor_config::tab_size == 4 ? "Spaces: 4" : "Spaces: 2";
+		}
+
+		float rx = right_x;
+
+		auto draw_chip_rtl = [&](const std::string& raw_label, ImU32 fg, ImU32 dot_col, bool has_dot) {
+			if (raw_label.empty()) return;
+			if (rx <= right_clip_x0) return;
+			float available = rx - right_clip_x0;
+			float dot_w = has_dot ? 10.f : 0.f;
+			float text_budget = available - dot_w - chip_pad_x * 2.f;
+			if (text_budget <= 4.f) return;
+			std::string trunc = truncate_to_width(raw_label, text_budget);
+			if (trunc.empty()) return;
+			ImVec2 ts = body->CalcTextSizeA(12.f, FLT_MAX, 0.f, trunc.c_str());
+			float chip_w_v = ts.x + dot_w + chip_pad_x * 2.f;
+			if (chip_w_v > available) chip_w_v = available;
+			float cx0 = rx - chip_w_v;
+			float cx1 = rx;
+			dl->AddRectFilled(ImVec2(cx0, chip_y0), ImVec2(cx1, chip_y1),
+				aida::ui::with_alpha(th_sb.border_subtle, a * 0.85f), chip_h_v * 0.5f);
+			dl->AddRect(ImVec2(cx0, chip_y0), ImVec2(cx1, chip_y1),
+				aida::ui::with_alpha(th_sb.border_subtle, a), chip_h_v * 0.5f, 0, 1.f);
+			float tx = cx0 + chip_pad_x;
+			if (has_dot) {
+				float dcy = chip_y0 + chip_h_v * 0.5f;
+				dl->AddCircleFilled(ImVec2(tx + 3.f, dcy), 3.f,
+					aida::ui::with_alpha(dot_col, a), 12);
+				tx += dot_w;
+			}
+			dl->AddText(body, 12.f, ImVec2(tx, text_y),
+				aida::ui::with_alpha(fg, a), trunc.c_str());
+			rx = cx0 - chip_gap;
+		};
+
+		draw_chip_rtl(model_str, th_sb.accent_dim, 0, false);
+		bool editor_visible = code_editor::active && !code_editor::filename.empty();
+		if (editor_visible) {
+			draw_chip_rtl(lang, th_sb.text_dim, 0, false);
+			draw_chip_rtl(encoding, th_sb.text_dim, 0, false);
+			draw_chip_rtl(line_end, th_sb.text_dim, 0, false);
+			draw_chip_rtl(indent_str, th_sb.text_dim, 0, false);
+		}
 
 		{
 			auto& mgr = get_mcp_client_manager();
@@ -5469,54 +6589,35 @@ void helpers::render_title()
 			if (total > 0) {
 				char mcp_buf[64];
 				snprintf(mcp_buf, sizeof(mcp_buf), "MCP %d/%d", connected, total);
-				ImVec2 mts2 = ImGui::CalcTextSize(mcp_buf);
-				float mx = sx1 - mts2.x - 12.f;
-
-				auto* prof = g_sa_settings.get_active_profile();
-				if (prof) {
-					std::string model_str2 = prof->display_name + " / " + prof->model;
-					ImVec2 model_ts = ImGui::CalcTextSize(model_str2.c_str());
-					mx = sx1 - model_ts.x - mts2.x - 28.f;
-				}
-
-				ImU32 mcp_col = (connected == total)
-					? IM_COL32(100, 200, 100, (int)(200 * a))
-					: (connected > 0)
-						? IM_COL32(220, 180, 60, (int)(200 * a))
-						: IM_COL32(200, 100, 100, (int)(200 * a));
-
-				float dot_r = 3.f;
-				dl->AddCircleFilled(ImVec2(mx - dot_r - 4.f, text_y + ImGui::GetFontSize() * 0.5f), dot_r, mcp_col);
-				dl->AddText(ImVec2(mx, text_y), IM_COL32(150, 150, 170, (int)(180 * a)), mcp_buf);
+				ImU32 mcp_col = (connected == total) ? th_sb.success
+					: (connected > 0 ? th_sb.warning : th_sb.error);
+				draw_chip_rtl(mcp_buf, th_sb.text_secondary, mcp_col, true);
 			}
 		}
 
+		if (cost_tracking::session_input_tokens > 0 || cost_tracking::session_output_tokens > 0) {
+			static float anim_in_tokens = 0.f;
+			static float anim_in_vel = 0.f;
+			static float anim_out_tokens = 0.f;
+			static float anim_out_vel = 0.f;
+			static float anim_cost = 0.f;
+			static float anim_cost_vel = 0.f;
+			anim_in_tokens = aida::motion::critically_damped_step(
+				anim_in_tokens, (float)cost_tracking::session_input_tokens, anim_in_vel, 0.40f, dt);
+			anim_out_tokens = aida::motion::critically_damped_step(
+				anim_out_tokens, (float)cost_tracking::session_output_tokens, anim_out_vel, 0.40f, dt);
+			anim_cost = aida::motion::critically_damped_step(
+				anim_cost, (float)cost_tracking::session_cost_usd, anim_cost_vel, 0.50f, dt);
 
-		{
-			if (cost_tracking::session_input_tokens > 0 || cost_tracking::session_output_tokens > 0) {
-				std::string tok_str = cost_tracking::format_tokens(cost_tracking::session_input_tokens) + " in / " +
-				                      cost_tracking::format_tokens(cost_tracking::session_output_tokens) + " out";
-				float cost = (float)cost_tracking::session_cost_usd;
-				if (cost > 0.001f) {
-					char cost_buf[32];
-					snprintf(cost_buf, sizeof(cost_buf), "  ~$%.2f", cost);
-					tok_str += cost_buf;
-				}
-				ImVec2 tts = ImGui::CalcTextSize(tok_str.c_str());
+			std::string tok_str =
+				cost_tracking::format_tokens((uint64_t)anim_in_tokens) + " in / " +
+				cost_tracking::format_tokens((uint64_t)anim_out_tokens) + " out";
+			draw_chip_rtl(tok_str, th_sb.text_secondary, 0, false);
 
-				float file_info_w = 0.f;
-				{
-					std::string info2;
-					if (code_editor::active && !code_editor::filename.empty()) {
-						info2 = code_editor::filename;
-						if (code_editor::dirty) info2 += " [modified]";
-						info2 += "  Ln " + std::to_string(autocomplete::cursor_line + 1) +
-						          ", Col " + std::to_string(autocomplete::cursor_col + 1);
-					}
-					file_info_w = ImGui::CalcTextSize(info2.c_str()).x;
-				}
-				float tx = sx0 + file_info_w + 30.f;
-				dl->AddText(ImVec2(tx, text_y), IM_COL32(130, 130, 155, (int)(160 * a)), tok_str.c_str());
+			if (anim_cost > 0.001f) {
+				char cost_buf[32];
+				snprintf(cost_buf, sizeof(cost_buf), "~$%.2f", anim_cost);
+				draw_chip_rtl(cost_buf, th_sb.warning, 0, false);
 			}
 		}
 	}
@@ -5756,26 +6857,21 @@ void helpers::render_title()
 				float total_btn_w = btn_w * 2.f + 12.f;
 				ImGui::SetCursorPosX((ImGui::GetWindowWidth() - total_btn_w) * 0.5f);
 
-				ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
-				if (can_attach) {
-					ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(ax_pa * 0.35f, ay_pa * 0.35f, az_pa * 0.35f, 0.7f));
-					ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(ax_pa * 0.5f, ay_pa * 0.5f, az_pa * 0.5f, 0.85f));
-					ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(ax_pa * 0.6f, ay_pa * 0.6f, az_pa * 0.6f, 1.f));
-				} else {
-					ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.12f, 0.16f, 0.4f));
-					ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.12f, 0.12f, 0.16f, 0.4f));
-					ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.12f, 0.12f, 0.16f, 0.4f));
+				if (aida::ui::components::button("Attach",
+					aida::ui::components::button_kind_t::primary,
+					aida::ui::components::size_t_::md,
+					ImVec2(btn_w, btn_h),
+					!can_attach) && can_attach) {
+					do_attach = true;
 				}
-				if (ImGui::Button("Attach", ImVec2(btn_w, btn_h)) && can_attach) do_attach = true;
-				ImGui::PopStyleColor(3);
 
 				ImGui::SameLine(0, 12.f);
-				ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.10f, 0.10f, 0.15f, 0.8f));
-				ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.16f, 0.22f, 0.9f));
-				ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.20f, 0.20f, 0.28f, 1.f));
-				if (ImGui::Button("Cancel", ImVec2(btn_w, btn_h))) pa_closing = true;
-				ImGui::PopStyleColor(3);
-				ImGui::PopStyleVar();
+				if (aida::ui::components::button("Cancel",
+					aida::ui::components::button_kind_t::secondary,
+					aida::ui::components::size_t_::md,
+					ImVec2(btn_w, btn_h))) {
+					pa_closing = true;
+				}
 
 
 				if (do_attach && can_attach) {
@@ -5927,12 +7023,18 @@ void helpers::render_title()
 			ImGui::Spacing();
 			float btn_w = 80.f;
 			if (is_attached) {
-				if (ImGui::Button("Detach", ImVec2(btn_w, 26))) {
+				if (aida::ui::components::button("Detach",
+					aida::ui::components::button_kind_t::destructive,
+					aida::ui::components::size_t_::md,
+					ImVec2(btn_w, 26.f))) {
 					driver_bridge::detach();
 				}
 				ImGui::SameLine();
 			}
-			if (ImGui::Button("Close", ImVec2(btn_w, 26))) {
+			if (aida::ui::components::button("Close",
+				aida::ui::components::button_kind_t::secondary,
+				aida::ui::components::size_t_::md,
+				ImVec2(btn_w, 26.f))) {
 				ds_closing = true;
 			}
 		}
@@ -6006,7 +7108,10 @@ void helpers::render_title()
 			ImGui::TextWrapped("Built with ImGui, Zydis, Unicorn, and MCP protocol support.");
 			ImGui::TextWrapped("Multi-provider AI: Anthropic, OpenAI, Google, OpenRouter, Local.");
 			ImGui::Spacing();
-			if (ImGui::Button("OK", ImVec2(80, 26))) {
+			if (aida::ui::components::button("OK",
+				aida::ui::components::button_kind_t::primary,
+				aida::ui::components::size_t_::md,
+				ImVec2(80.f, 26.f))) {
 				ab_closing = true;
 			}
 		}
@@ -6116,7 +7221,10 @@ void helpers::render_title()
 			ImGui::EndChild();
 
 			ImGui::Spacing();
-			if (ImGui::Button("Close", ImVec2(80, 26))) {
+			if (aida::ui::components::button("Close",
+				aida::ui::components::button_kind_t::secondary,
+				aida::ui::components::size_t_::md,
+				ImVec2(80.f, 26.f))) {
 				kb_closing = true;
 			}
 		}

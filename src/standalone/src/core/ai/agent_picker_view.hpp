@@ -10,6 +10,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "imgui/imgui.h"
@@ -18,6 +19,16 @@
 #include "event_bus.hpp"
 #include "toast_notification.hpp"
 #include "ui_anim.hpp"
+#include "../ui/avatar.hpp"
+#include "../ui/blur_layer.hpp"
+#include "../ui/brand.hpp"
+#include "../ui/clock.hpp"
+#include "../ui/components.hpp"
+#include "../ui/empty_state.hpp"
+#include "../ui/fonts.hpp"
+#include "../ui/motion.hpp"
+#include "../ui/theme.hpp"
+#include "../ui/transition.hpp"
 #include "../helpers/globals.h"
 
 namespace aida {
@@ -25,12 +36,19 @@ namespace agent_picker {
 
 	namespace detail {
 
+		struct row_anim_t
+		{
+			aida::ui::transition_t entrance;
+			aida::ui::hover_state_t hover;
+		};
+
 		struct picker_state_t
 		{
 			std::mutex                          mtx;
 			std::atomic<bool>                   open{ false };
 			std::atomic<bool>                   manager_request{ false };
 			float                               anim = 0.f;
+			float                               anim_velocity = 0.f;
 			char                                search_buf[160] = {};
 			int                                 selected_index = 0;
 			aida::events::subscription_handle_t sub_changed;
@@ -38,61 +56,14 @@ namespace agent_picker {
 			std::atomic<bool>                   has_pending_inject{ false };
 			std::atomic<bool>                   prev_was_at_only{ false };
 			bool                                initialized = false;
+			std::unordered_map<std::string, row_anim_t> row_anims;
+			std::string                         last_filter_signature;
 		};
 
 		inline picker_state_t& state()
 		{
 			static picker_state_t s;
 			return s;
-		}
-
-		inline ImU32 hash_color_for(const std::string& text)
-		{
-			uint32_t h = 2166136261u;
-			for (char c : text) {
-				h ^= static_cast<uint8_t>(c);
-				h *= 16777619u;
-			}
-			float hue = static_cast<float>(h % 360u) / 360.f;
-			float r = 0.f, g = 0.f, b = 0.f;
-			float sat = 0.55f;
-			float val = 0.85f;
-			float k_r = std::fmod(5.f + hue * 6.f, 6.f);
-			float k_g = std::fmod(3.f + hue * 6.f, 6.f);
-			float k_b = std::fmod(1.f + hue * 6.f, 6.f);
-			r = val - val * sat * std::max(0.f, std::min(std::min(k_r, 4.f - k_r), 1.f));
-			g = val - val * sat * std::max(0.f, std::min(std::min(k_g, 4.f - k_g), 1.f));
-			b = val - val * sat * std::max(0.f, std::min(std::min(k_b, 4.f - k_b), 1.f));
-			return IM_COL32(static_cast<int>(r * 255.f), static_cast<int>(g * 255.f), static_cast<int>(b * 255.f), 235);
-		}
-
-		inline ImU32 parse_hex_color(const std::string& hex, ImU32 fallback)
-		{
-			if (hex.size() < 7 || hex[0] != '#') return fallback;
-			auto from_hex = [](char c) -> int {
-				if (c >= '0' && c <= '9') return c - '0';
-				if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
-				if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
-				return -1;
-			};
-			int r1 = from_hex(hex[1]);
-			int r2 = from_hex(hex[2]);
-			int g1 = from_hex(hex[3]);
-			int g2 = from_hex(hex[4]);
-			int b1 = from_hex(hex[5]);
-			int b2 = from_hex(hex[6]);
-			if (r1 < 0 || r2 < 0 || g1 < 0 || g2 < 0 || b1 < 0 || b2 < 0) return fallback;
-			int r = r1 * 16 + r2;
-			int g = g1 * 16 + g2;
-			int b = b1 * 16 + b2;
-			return IM_COL32(r, g, b, 235);
-		}
-
-		inline ImU32 color_for_agent(const aida::agent::agent_info_t& info)
-		{
-			if (!info.color.empty())
-				return parse_hex_color(info.color, hash_color_for(info.name));
-			return hash_color_for(info.name);
 		}
 
 		inline std::string lower_copy(const std::string& s)
@@ -129,22 +100,6 @@ namespace agent_picker {
 			return out;
 		}
 
-		inline void render_agent_avatar(ImDrawList* dl, float cx, float cy, float radius, ImU32 color, char glyph)
-		{
-			ImU32 ring = (color & 0x00FFFFFFu) | (static_cast<ImU32>(255) << 24);
-			int rr = (color >> 0) & 0xFF;
-			int gg = (color >> 8) & 0xFF;
-			int bb = (color >> 16) & 0xFF;
-			ImU32 ring_dark = IM_COL32(static_cast<int>(rr * 0.55f), static_cast<int>(gg * 0.55f), static_cast<int>(bb * 0.55f), 230);
-			dl->AddCircleFilled(ImVec2(cx, cy), radius, color, 28);
-			dl->AddCircle(ImVec2(cx, cy), radius, ring_dark, 28, 1.4f);
-			char buf[2] = { glyph, 0 };
-			ImVec2 ts = ImGui::CalcTextSize(buf);
-			float lum = 0.299f * (rr / 255.f) + 0.587f * (gg / 255.f) + 0.114f * (bb / 255.f);
-			ImU32 text_col = lum < 0.5f ? IM_COL32(245, 245, 250, 255) : IM_COL32(20, 20, 28, 255);
-			dl->AddText(ImVec2(cx - ts.x * 0.5f, cy - ts.y * 0.5f), text_col, buf);
-		}
-
 	}
 
 	inline void initialize()
@@ -154,6 +109,7 @@ namespace agent_picker {
 		if (st.initialized) return;
 		st.initialized = true;
 		st.anim = 0.f;
+		st.anim_velocity = 0.f;
 		st.selected_index = 0;
 		st.search_buf[0] = '\0';
 		st.open.store(false);
@@ -178,6 +134,7 @@ namespace agent_picker {
 		st.open.store(false);
 		st.manager_request.store(false);
 		st.has_pending_inject.store(false);
+		st.row_anims.clear();
 		st.initialized = false;
 	}
 
@@ -186,8 +143,11 @@ namespace agent_picker {
 		auto& st = detail::state();
 		std::lock_guard<std::mutex> lk(st.mtx);
 		st.anim = 0.f;
+		st.anim_velocity = 0.f;
 		st.selected_index = 0;
 		st.search_buf[0] = '\0';
+		st.row_anims.clear();
+		st.last_filter_signature.clear();
 		st.open.store(true);
 	}
 
@@ -264,42 +224,44 @@ namespace agent_picker {
 	inline void render_if_open()
 	{
 		auto& st = detail::state();
-		float dt = ImGui::GetIO().DeltaTime;
-		float target = st.open.load() ? 1.f : 0.f;
+		const float dt = aida::ui::clock::dt();
+		const float target = st.open.load() ? 1.f : 0.f;
 		float anim_v = 0.f;
 		{
 			std::lock_guard<std::mutex> lk(st.mtx);
-			st.anim += (target - st.anim) * std::min(10.f * dt, 1.f);
+			st.anim = aida::motion::spring_step(st.anim, target, st.anim_velocity,
+				aida::motion::spring::balanced, dt);
+			if (st.anim < 0.f) st.anim = 0.f;
+			if (st.anim > 1.f) st.anim = 1.f;
 			if (target > 0.5f && st.anim > 0.985f) st.anim = 1.f;
 			if (target < 0.5f && st.anim < 0.015f) st.anim = 0.f;
 			anim_v = st.anim;
 		}
 		if (anim_v <= 0.001f && target <= 0.f) return;
 
+		const auto& th = aida::ui::resolved();
 		ImVec2 display = ImGui::GetIO().DisplaySize;
 
 		const float pw = 480.f;
-		const float ph = 420.f;
-		float scale = 0.94f + 0.06f * anim_v;
-		float sw = pw * scale;
-		float sh = ph * scale;
-		float px = display.x * 0.5f - sw * 0.5f;
-		float py = display.y * 0.5f - sh * 0.5f - 16.f * (1.f - anim_v);
-		float alpha = anim_v;
+		const float ph = 460.f;
+		const float ease = aida::motion::ease::out_back(anim_v);
+		const float scale = 0.92f + 0.08f * ease;
+		const float sw = pw * scale;
+		const float sh = ph * scale;
+		const float px = display.x * 0.5f - sw * 0.5f;
+		const float py = display.y * 0.5f - sh * 0.5f - 18.f * (1.f - ease);
+		const float alpha = anim_v;
 
-		float ax = globals::ui::accent.x;
-		float ay = globals::ui::accent.y;
-		float az = globals::ui::accent.z;
-
-		float content_x_local = 14.f;
-		float content_y_local = 44.f;
-		float content_w = sw - 28.f;
+		const float content_x_local = 16.f;
+		const float content_y_local = 52.f;
+		const float content_w = sw - 32.f;
 
 		ImGui::SetNextWindowPos(ImVec2(px, py), ImGuiCond_Always);
 		ImGui::SetNextWindowSize(ImVec2(sw, sh), ImGuiCond_Always);
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
 		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(0, 0, 0, 0));
+
 		bool win_open = true;
 		if (ImGui::Begin("##aida_agent_picker", &win_open,
 			ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
@@ -310,109 +272,186 @@ namespace agent_picker {
 			ImDrawList* wdl = ImGui::GetWindowDrawList();
 			ImDrawList* bgdl = ImGui::GetBackgroundDrawList();
 			bgdl->AddRectFilled(ImVec2(0, 0), display,
-				IM_COL32(0, 0, 0, static_cast<int>(150 * anim_v)));
+				IM_COL32(0, 0, 0, static_cast<int>(160.f * anim_v)));
 
-			for (int s = 0; s < 4; ++s) {
-				float off = 4.f + s * 3.f;
-				wdl->AddRectFilled(
-					ImVec2(px + off, py + off),
-					ImVec2(px + sw + off, py + sh + off),
-					IM_COL32(0, 0, 0, static_cast<int>(28 * alpha * (4 - s) / 4.f)), 12.f);
-			}
-			wdl->AddRectFilled(ImVec2(px, py), ImVec2(px + sw, py + sh),
-				IM_COL32(28, 28, 38, static_cast<int>(245 * alpha)), 12.f);
-			wdl->AddRect(ImVec2(px, py), ImVec2(px + sw, py + sh),
-				IM_COL32(80, 80, 120, static_cast<int>(60 * alpha)), 12.f);
-			wdl->AddRectFilled(ImVec2(px + 1.f, py + 1.f), ImVec2(px + sw - 1.f, py + 3.f),
-				IM_COL32(static_cast<int>(ax * 255), static_cast<int>(ay * 255), static_cast<int>(az * 255),
-					static_cast<int>(180 * alpha)), 2.f);
+			ImVec2 panel_a(px, py);
+			ImVec2 panel_b(px + sw, py + sh);
 
-			std::string title = "Switch agent";
-			wdl->AddText(ImVec2(px + 18.f, py + 14.f),
-				IM_COL32(232, 232, 245, static_cast<int>(245 * alpha)), title.c_str());
+			aida::ui::blur::layer_request_t br;
+			br.pos = panel_a;
+			br.size = ImVec2(sw, sh);
+			br.radius = 16.f;
+			br.strength = 0.85f;
+			br.alpha = alpha;
+			aida::ui::blur::schedule(br);
 
-			std::string hint = "Esc to cancel  -  Click to switch";
-			ImVec2 hts = ImGui::CalcTextSize(hint.c_str());
-			wdl->AddText(ImVec2(px + sw - hts.x - 18.f, py + 18.f),
-				IM_COL32(150, 152, 168, static_cast<int>(180 * alpha)), hint.c_str());
+			aida::ui::blur::render_drop_shadow(wdl, panel_a, panel_b, 16.f, 6, 0.45f * alpha,
+				ImVec2(0.f, 12.f));
+			aida::ui::blur::render_glass_fill(wdl, panel_a, panel_b, 16.f, alpha);
+			aida::ui::blur::render_glass_border(wdl, panel_a, panel_b, 16.f, alpha, 1.f);
 
-			float content_x = px + content_x_local;
-			float content_y = py + content_y_local;
+			float pulse_v = aida::ui::clock::pulse(0.55f, 0.4f, 1.f) * alpha;
+			ImU32 grad_top = aida::ui::with_alpha(th.accent_grad_top, alpha * (0.85f + 0.15f * pulse_v));
+			ImU32 grad_bot = aida::ui::with_alpha(th.accent_grad_bot, alpha * (0.85f + 0.15f * pulse_v));
+			wdl->AddRectFilledMultiColor(
+				ImVec2(panel_a.x + 1.f, panel_a.y + 1.f),
+				ImVec2(panel_b.x - 1.f, panel_a.y + 4.f),
+				grad_top, grad_top, grad_bot, grad_bot);
+
+			ImFont* f_h2 = aida::ui::fonts::h2();
+			ImFont* f_caption = aida::ui::fonts::caption();
+			ImFont* f_body = aida::ui::fonts::body();
+
+			wdl->AddText(f_h2, 17.f, ImVec2(panel_a.x + 18.f, panel_a.y + 16.f),
+				aida::ui::with_alpha(th.text_primary, alpha), "Switch agent");
+
+			const char* hint = "Esc to cancel  |  Click to switch";
+			ImVec2 hts = f_caption->CalcTextSizeA(11.f, FLT_MAX, 0.f, hint);
+			wdl->AddText(f_caption, 11.f,
+				ImVec2(panel_b.x - hts.x - 18.f, panel_a.y + 21.f),
+				aida::ui::with_alpha(th.text_dim, alpha), hint);
+
+			float content_x = panel_a.x + content_x_local;
+			float content_y = panel_a.y + content_y_local;
 
 			ImGui::SetCursorScreenPos(ImVec2(content_x, content_y));
-			ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
-			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 6.f));
-			ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(20, 22, 30, static_cast<int>(220 * alpha)));
-			ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(228, 230, 248, static_cast<int>(250 * alpha)));
-
-			ImGui::SetNextItemWidth(content_w);
+			char search_local[160];
+			std::memcpy(search_local, st.search_buf, sizeof(search_local));
 			if (st.open.load() && ImGui::IsWindowAppearing())
 				ImGui::SetKeyboardFocusHere();
-			ImGui::InputTextWithHint("##aida_agent_picker_search", "Search agents...",
-				st.search_buf, sizeof(st.search_buf));
+			if (aida::ui::input_text("##aida_agent_picker_search",
+					search_local, sizeof(search_local),
+					"Search agents...", false, ImVec2(content_w, 34.f))) {
+				std::lock_guard<std::mutex> lk(st.mtx);
+				std::memcpy(st.search_buf, search_local, sizeof(st.search_buf));
+			}
 
-			ImGui::PopStyleColor(2);
-			ImGui::PopStyleVar(2);
-
-			float list_y = content_y + 36.f;
-			float list_h = sh - (44.f + 36.f + 44.f);
+			float list_y = content_y + 44.f;
+			float list_h = sh - (52.f + 44.f + 52.f);
 
 			ImGui::SetCursorScreenPos(ImVec2(content_x, list_y));
 			ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 0));
 			ImGui::BeginChild("##aida_agent_picker_list", ImVec2(content_w, list_h), false,
 				ImGuiWindowFlags_NoBackground);
 
-			std::string filter_lower = detail::lower_copy(std::string(st.search_buf));
+			std::string filter_lower;
+			{
+				std::lock_guard<std::mutex> lk(st.mtx);
+				filter_lower = detail::lower_copy(std::string(st.search_buf));
+			}
 			auto items = detail::filtered_primary_agents(filter_lower);
 
 			std::string current_active = aida::agent::active_agent_name();
+
+			std::string sig;
+			sig.reserve(items.size() * 16 + filter_lower.size());
+			sig.append(filter_lower);
+			sig.push_back('|');
+			for (const auto* p : items) sig.append(p->name).push_back(';');
+
+			{
+				std::lock_guard<std::mutex> lk(st.mtx);
+				if (sig != st.last_filter_signature) {
+					st.last_filter_signature = sig;
+					for (size_t i = 0; i < items.size(); ++i) {
+						auto& ra = st.row_anims[items[i]->name];
+						ra.entrance.start(0.42f, aida::motion::ease::out_quint,
+							0.030f * static_cast<float>(i));
+					}
+				}
+			}
 
 			ImDrawList* dl = ImGui::GetWindowDrawList();
 			for (size_t i = 0; i < items.size(); ++i) {
 				const auto* info = items[i];
 				if (info == nullptr) continue;
 
-				ImVec2 row_pos = ImGui::GetCursorScreenPos();
-				const float row_h = 56.f;
-
-				ImGui::PushID(static_cast<int>(i));
-				ImGui::InvisibleButton("##agent_row", ImVec2(content_w, row_h));
-				bool hov = ImGui::IsItemHovered();
-				bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
-				ImGui::PopID();
-
-				ImU32 row_bg = hov
-					? IM_COL32(60, 64, 92, static_cast<int>(180 * alpha))
-					: IM_COL32(255, 255, 255, static_cast<int>(8 * alpha));
-				dl->AddRectFilled(row_pos, ImVec2(row_pos.x + content_w, row_pos.y + row_h - 4.f),
-					row_bg, 8.f);
-
-				bool is_active = (info->name == current_active);
-				if (is_active) {
-					dl->AddRect(row_pos, ImVec2(row_pos.x + content_w, row_pos.y + row_h - 4.f),
-						IM_COL32(static_cast<int>(ax * 255 * 0.9f),
-							static_cast<int>(ay * 255 * 0.9f),
-							static_cast<int>(az * 255 * 0.9f),
-							static_cast<int>(180 * alpha)), 8.f, 0, 1.5f);
+				detail::row_anim_t* ra_ptr = nullptr;
+				{
+					std::lock_guard<std::mutex> lk(st.mtx);
+					ra_ptr = &st.row_anims[info->name];
+					ra_ptr->entrance.tick(dt);
 				}
 
-				ImU32 col = detail::color_for_agent(*info);
-				char glyph = info->name.empty() ? '?' : static_cast<char>(std::toupper(static_cast<unsigned char>(info->name[0])));
-				detail::render_agent_avatar(dl,
-					row_pos.x + 16.f + 16.f, row_pos.y + (row_h - 4.f) * 0.5f,
-					16.f, col, glyph);
+				const float entrance_p = ra_ptr->entrance.eased();
+				const float entrance_y = (1.f - entrance_p) * 14.f;
+				const float entrance_alpha = entrance_p;
 
-				float text_x = row_pos.x + 16.f + 32.f + 12.f;
-				dl->AddText(ImVec2(text_x, row_pos.y + 8.f),
-					IM_COL32(232, 232, 245, static_cast<int>(245 * alpha)), info->name.c_str());
+				ImVec2 row_pos = ImGui::GetCursorScreenPos();
+				row_pos.y += entrance_y;
+				const float row_h = 60.f;
+
+				ImGui::PushID(static_cast<int>(i));
+				ImGui::SetCursorScreenPos(ImVec2(row_pos.x, row_pos.y));
+				ImGui::InvisibleButton("##agent_row", ImVec2(content_w, row_h - 6.f));
+				bool hov = ImGui::IsItemHovered();
+				bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+
+				const float hov_v = ra_ptr->hover.tick(hov, dt, aida::motion::spring::playful);
+				const float lift = hov_v * 2.f;
+				ImVec2 row_a(row_pos.x, row_pos.y - lift);
+				ImVec2 row_b(row_pos.x + content_w, row_pos.y + row_h - 8.f - lift);
+
+				const bool is_active = (info->name == current_active);
+				const float row_alpha = alpha * entrance_alpha;
+
+				if (hov_v > 0.02f) {
+					ImU32 sh_col = IM_COL32(0, 0, 0, static_cast<int>(70.f * row_alpha * hov_v));
+					for (int s = 0; s < 4; ++s) {
+						float spread = (float)(s + 1) * 1.4f * hov_v;
+						dl->AddRectFilled(
+							ImVec2(row_a.x - spread, row_a.y - spread + 4.f),
+							ImVec2(row_b.x + spread, row_b.y + spread + 4.f),
+							IM_COL32(0, 0, 0, static_cast<int>(((4 - s) / 4.f) * 28.f * row_alpha * hov_v)),
+							10.f + spread);
+					}
+					(void)sh_col;
+				}
+
+				ImU32 row_bg = aida::ui::mix(
+					aida::ui::with_alpha(th.panel_header, row_alpha * 0.5f),
+					aida::ui::with_alpha(th.hover_wash, row_alpha),
+					hov_v);
+				if (is_active) {
+					row_bg = aida::ui::mix(row_bg,
+						aida::ui::with_alpha(th.selection, row_alpha * 0.85f), 0.55f);
+				}
+				dl->AddRectFilled(row_a, row_b, row_bg, 10.f);
+
+				if (is_active) {
+					float ring_pulse = aida::ui::clock::pulse(0.8f, 0.5f, 1.f);
+					ImU32 ring_col = aida::ui::with_alpha(th.accent_glow, row_alpha * ring_pulse);
+					dl->AddRect(
+						ImVec2(row_a.x - 1.f, row_a.y - 1.f),
+						ImVec2(row_b.x + 1.f, row_b.y + 1.f),
+						ring_col, 11.f, 0, 2.5f);
+					dl->AddRect(row_a, row_b,
+						aida::ui::with_alpha(th.accent_u32, row_alpha), 10.f, 0, 1.5f);
+				} else {
+					dl->AddRect(row_a, row_b,
+						aida::ui::with_alpha(th.border_subtle, row_alpha * (0.6f + 0.4f * hov_v)),
+						10.f, 0, 1.f);
+				}
+
+				const float avatar_radius = 18.f;
+				const ImVec2 avatar_center(row_a.x + 14.f + avatar_radius, (row_a.y + row_b.y) * 0.5f);
+				aida::ui::avatar::render(dl, avatar_center, avatar_radius,
+					info->name, aida::ui::avatar::kind_t::gradient,
+					true, row_alpha, aida::ui::fonts::body_strong());
+
+				const float text_x = avatar_center.x + avatar_radius + 14.f;
+				dl->AddText(aida::ui::fonts::body_strong(), 14.f,
+					ImVec2(text_x, row_a.y + 9.f),
+					aida::ui::with_alpha(th.text_primary, row_alpha),
+					info->name.c_str());
 
 				if (info->native) {
-					ImVec2 ns = ImGui::CalcTextSize(info->name.c_str());
+					ImVec2 ns = aida::ui::fonts::body_strong()->CalcTextSizeA(14.f, FLT_MAX, 0.f, info->name.c_str());
 					float bx = text_x + ns.x + 8.f;
-					float by = row_pos.y + 9.f;
-					ui_anim::render_badge(dl, "native", bx, by,
-						IM_COL32(40, 56, 80, static_cast<int>(220 * alpha)),
-						IM_COL32(170, 200, 235, static_cast<int>(230 * alpha)));
+					float by = row_a.y + 10.f;
+					ImGui::SetCursorScreenPos(ImVec2(bx, by));
+					aida::ui::badge("native",
+						aida::ui::with_alpha(th.info, row_alpha * 0.85f), 4.f);
 				}
 
 				std::string desc = info->description;
@@ -420,8 +459,9 @@ namespace agent_picker {
 					desc.resize(93);
 					desc.append("...");
 				}
-				dl->AddText(ImVec2(text_x, row_pos.y + 26.f),
-					IM_COL32(168, 170, 188, static_cast<int>(210 * alpha)),
+				dl->AddText(aida::ui::fonts::caption(), 12.f,
+					ImVec2(text_x, row_a.y + 30.f),
+					aida::ui::with_alpha(th.text_secondary, row_alpha * 0.95f),
 					desc.c_str());
 
 				if (clicked) {
@@ -439,37 +479,42 @@ namespace agent_picker {
 					}
 				}
 
-				ImGui::Dummy(ImVec2(content_w, 4.f));
+				ImGui::PopID();
+				ImGui::SetCursorScreenPos(ImVec2(row_pos.x, row_pos.y - entrance_y + row_h - 2.f));
 			}
 
 			if (items.empty()) {
-				ImGui::Dummy(ImVec2(content_w, 32.f));
-				ImVec2 cp = ImGui::GetCursorScreenPos();
-				dl->AddText(ImVec2(cp.x + 12.f, cp.y),
-					IM_COL32(150, 152, 168, static_cast<int>(220 * alpha)),
-					"No matching agents.");
+				ImVec2 region_pos = ImGui::GetCursorScreenPos();
+				ImVec2 region_size(content_w, list_h - 40.f);
+				aida::ui::empty_state::config_t cfg;
+				cfg.glyph = aida::ui::empty_state::glyph_t::dots;
+				cfg.title = "No matching agents";
+				cfg.body = "Refine your search or open the agent manager to add a custom agent.";
+				cfg.max_width = content_w * 0.9f;
+				aida::ui::empty_state::render(region_pos, region_size, cfg);
 			}
 
 			ImGui::EndChild();
 			ImGui::PopStyleColor();
 
-			float footer_y = py + sh - 38.f;
+			float footer_y = panel_b.y - 44.f;
 			ImGui::SetCursorScreenPos(ImVec2(content_x, footer_y));
-			ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(50, 56, 78, static_cast<int>(220 * alpha)));
-			ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(70, 80, 110, static_cast<int>(235 * alpha)));
-			ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(48, 54, 76, static_cast<int>(240 * alpha)));
-			if (ImGui::Button("Manage agents...", ImVec2(170.f, 28.f))) {
+			if (aida::ui::button("Manage agents...",
+					aida::ui::button_kind_t::secondary,
+					aida::ui::size_t_::sm,
+					ImVec2(170.f, 30.f))) {
 				st.manager_request.store(true);
 				close();
 			}
-			ImGui::PopStyleColor(3);
 
-			ImGui::SameLine(0.f, 8.f);
 			std::string active_name = aida::agent::active_agent_name();
 			std::string footer_active = "Active: " + (active_name.empty() ? std::string("none") : active_name);
-			ImVec2 ats = ImGui::CalcTextSize(footer_active.c_str());
-			ImGui::SetCursorScreenPos(ImVec2(content_x + content_w - ats.x - 6.f, footer_y + 6.f));
-			ImGui::TextColored(ImVec4(0.66f, 0.67f, 0.78f, alpha), "%s", footer_active.c_str());
+			ImVec2 ats = aida::ui::fonts::caption()->CalcTextSizeA(12.f, FLT_MAX, 0.f, footer_active.c_str());
+			wdl->AddText(aida::ui::fonts::caption(), 12.f,
+				ImVec2(panel_b.x - ats.x - 18.f, footer_y + 8.f),
+				aida::ui::with_alpha(th.text_secondary, alpha),
+				footer_active.c_str());
+			(void)f_body;
 		}
 		ImGui::End();
 		ImGui::PopStyleColor();

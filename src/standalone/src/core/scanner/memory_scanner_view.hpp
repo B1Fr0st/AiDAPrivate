@@ -1,5 +1,9 @@
 #pragma once
 
+#include <cstdint>
+#include <unordered_set>
+#include <vector>
+
 namespace memory_scanner_view {
 
 struct ui_state_t {
@@ -22,6 +26,11 @@ struct ui_state_t {
 	bool   auto_refresh = false;
 	float  refresh_timer = 0.f;
 	float  refresh_interval = 0.5f;
+
+	std::unordered_set<uint64_t> prev_result_addresses;
+	std::vector<float>           row_flash;
+	bool                         user_scrolled_up = false;
+	float                        autoscroll_pill_alpha = 0.f;
 };
 
 inline ui_state_t g_ui;

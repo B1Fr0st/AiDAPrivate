@@ -11,12 +11,22 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "imgui/imgui.h"
 #include "standalone_driver.hpp"
 #include "ui_anim.hpp"
 #include "../helpers/globals.h"
+#include "../ui/theme.hpp"
+#include "../ui/components.hpp"
+#include "../ui/clock.hpp"
+#include "../ui/transition.hpp"
+#include "../ui/empty_state.hpp"
+#include "../ui/skeleton.hpp"
+#include "../ui/blur_layer.hpp"
+#include "../ui/fonts.hpp"
 
 extern DisasmState g_disasm;
 
@@ -84,6 +94,12 @@ struct state_t {
 	uint64_t                    filter_min_addr = 0;
 	uint64_t                    filter_max_addr = 0;
 	bool                        show_only_changes = true;
+
+	int                         dragging_marker = -1;
+	float                       compare_cursor_t = 0.f;
+	bool                        compare_cursor_active = false;
+	std::unordered_set<uint64_t> prev_change_keys;
+	std::vector<float>           row_flash;
 };
 
 inline state_t g_state;
@@ -157,6 +173,20 @@ inline const char* change_type_name(change_type_t t)
 	case change_type_t::zeroed_out:          return "Zeroed";
 	case change_type_t::byte_flip:           return "Byte";
 	default:                                 return "Unknown";
+	}
+}
+
+inline aida::ui::components::pill_kind_t change_pill_kind(change_type_t t)
+{
+	switch (t) {
+	case change_type_t::pointer_changed:     return aida::ui::components::pill_kind_t::warning;
+	case change_type_t::float_changed:       return aida::ui::components::pill_kind_t::info;
+	case change_type_t::counter_incremented: return aida::ui::components::pill_kind_t::success;
+	case change_type_t::counter_decremented: return aida::ui::components::pill_kind_t::success;
+	case change_type_t::string_modified:     return aida::ui::components::pill_kind_t::accent;
+	case change_type_t::zeroed_out:          return aida::ui::components::pill_kind_t::error;
+	case change_type_t::byte_flip:           return aida::ui::components::pill_kind_t::neutral;
+	default:                                 return aida::ui::components::pill_kind_t::neutral;
 	}
 }
 
@@ -268,6 +298,8 @@ inline void compare_snapshots(int idx_a, int idx_b)
 	g_state.comparing.store(true);
 	g_state.cancel.store(false);
 	g_state.progress.store(0.f);
+	g_state.compare_cursor_active = true;
+	g_state.compare_cursor_t = 0.f;
 
 	work_queue::post([idx_a, idx_b]() {
 		diff_result_t result;
@@ -278,6 +310,7 @@ inline void compare_snapshots(int idx_a, int idx_b)
 			if (idx_a < 0 || idx_a >= static_cast<int>(g_state.snapshots.size()) ||
 			    idx_b < 0 || idx_b >= static_cast<int>(g_state.snapshots.size())) {
 				g_state.comparing.store(false);
+				g_state.compare_cursor_active = false;
 				return;
 			}
 			snap_a = g_state.snapshots[idx_a];
@@ -346,6 +379,7 @@ inline void compare_snapshots(int idx_a, int idx_b)
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			g_state.diff = std::move(result);
 			g_state.selected_change = -1;
+			g_state.row_flash.clear();
 		}
 
 		g_state.comparing.store(false);
@@ -360,79 +394,20 @@ inline void clear_snapshots()
 	g_state.snap_a_idx = -1;
 	g_state.snap_b_idx = -1;
 	g_state.snap_counter = 0;
+	g_state.prev_change_keys.clear();
+	g_state.row_flash.clear();
 }
 
-inline void render(float pos_x, float pos_y, float width, float height,
-                   float alpha, float accent_r, float accent_g, float accent_b)
+namespace detail {
+
+inline void render_timeline(ImDrawList* dl, float ox, float oy, float w, float h, float a)
 {
-	ImDrawList* dl = ImGui::GetWindowDrawList();
-	ImVec2 wp = ImGui::GetWindowPos();
-	float a = alpha;
+	const auto& t = aida::ui::resolved();
 
-	const auto& _t = themes::resolved;
-	const auto _ta = [a](ImU32 c) -> ImU32 {
-		return ui_anim::theme_alpha(c, a);
-	};
-
-	ImU32 bg = _ta(_t.bg_base);
-	ImU32 panel_bg = _ta(_t.panel_bg);
-	ImU32 hdr_bg = _ta(_t.panel_header);
-	ImU32 text_main = _ta(_t.text_primary);
-	ImU32 text_dim = _ta(_t.text_dim);
-	ImU32 text_sec = _ta(_t.text_secondary);
-	ImU32 accent_col = IM_COL32(
-		static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
-		static_cast<int>(accent_b * 255), static_cast<int>(220 * a));
-	ImU32 red_col = IM_COL32(255, 90, 90, static_cast<int>(200 * a));
-	ImU32 green_col = IM_COL32(90, 255, 130, static_cast<int>(200 * a));
-	ImU32 row_hover_col = _ta(_t.panel_header);
-	ImU32 row_sel = IM_COL32(
-		static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
-		static_cast<int>(accent_b * 255), static_cast<int>(30 * a));
-	ImU32 sep_col = _ta(ui_anim::lighten(_t.panel_bg, 12));
-
-	float x0 = wp.x + pos_x;
-	float y0 = wp.y + pos_y;
-
-	dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + width, y0 + height), bg);
-
-	float toolbar_h = 36.f;
-	ui_anim::render_toolbar(dl, x0, y0, width, toolbar_h, accent_r, accent_g, accent_b, a);
-	dl->AddLine(ImVec2(x0, y0 + toolbar_h), ImVec2(x0 + width, y0 + toolbar_h), sep_col);
-
-	ImGui::SetCursorPos(ImVec2(pos_x + 8.f, pos_y + 6.f));
-	ImGui::PushStyleColor(ImGuiCol_Text, text_main);
-	ImGui::TextUnformatted("Memory Snapshot Diff");
-	ImGui::PopStyleColor();
-
-	ImGui::PushStyleColor(ImGuiCol_Button, _ta(_t.panel_header));
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, _ta(ui_anim::lighten(_t.panel_header, 14)));
-	ImGui::PushStyleColor(ImGuiCol_Text, text_main);
-	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
-	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 4.f));
-
-	ImGui::SetCursorPos(ImVec2(pos_x + 200.f, pos_y + 5.f));
-	bool busy = g_state.capturing.load() || g_state.comparing.load();
-	if (!busy) {
-		if (ImGui::Button("Take Snapshot##sd")) {
-			take_snapshot();
-		}
-	} else {
-		float prog = g_state.progress.load();
-		float bar_w = 100.f;
-		float bar_h = 8.f;
-		ImVec2 bp = ImGui::GetCursorScreenPos();
-		dl->AddRectFilled(ImVec2(bp.x, bp.y + 8.f), ImVec2(bp.x + bar_w, bp.y + 8.f + bar_h),
-		                  _ta(_t.panel_header), 4.f);
-		dl->AddRectFilled(ImVec2(bp.x, bp.y + 8.f), ImVec2(bp.x + bar_w * prog, bp.y + 8.f + bar_h),
-		                  accent_col, 4.f);
-		char pct[16];
-		snprintf(pct, sizeof(pct), "%.0f%%", prog * 100.f);
-		dl->AddText(ImVec2(bp.x + bar_w + 6.f, bp.y + 4.f), text_sec, pct);
-	}
-
-	ImGui::PopStyleVar(2);
-	ImGui::PopStyleColor(3);
+	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + h),
+		aida::ui::with_alpha(t.panel_bg, a), 10.f);
+	dl->AddRect(ImVec2(ox, oy), ImVec2(ox + w, oy + h),
+		aida::ui::with_alpha(t.border_subtle, a), 10.f, 0, 1.f);
 
 	int snap_count = 0;
 	{
@@ -440,92 +415,247 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		snap_count = static_cast<int>(g_state.snapshots.size());
 	}
 
-	ImGui::SetCursorPos(ImVec2(pos_x + width * 0.35f, pos_y + 5.f));
-	ImGui::PushStyleColor(ImGuiCol_Text, text_main);
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_header));
-	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
-	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 4.f));
+	float track_y = oy + h * 0.5f;
+	float pad_x = 28.f;
+	float track_x0 = ox + pad_x;
+	float track_x1 = ox + w - pad_x;
+	float track_w = track_x1 - track_x0;
 
-	ImGui::PushItemWidth(100.f);
-	if (ImGui::BeginCombo("##snap_a", g_state.snap_a_idx >= 0 && g_state.snap_a_idx < snap_count
-	                       ? g_state.snapshots[g_state.snap_a_idx].name.c_str() : "Snap A")) {
-		std::lock_guard<std::mutex> lk(g_state.mutex);
-		for (int i = 0; i < snap_count; ++i) {
-			bool sel = (g_state.snap_a_idx == i);
-			if (ImGui::Selectable(g_state.snapshots[i].name.c_str(), sel))
-				g_state.snap_a_idx = i;
-		}
-		ImGui::EndCombo();
+	dl->AddLine(ImVec2(track_x0, track_y), ImVec2(track_x1, track_y),
+		aida::ui::with_alpha(t.border_strong, a), 2.f);
+
+	if (snap_count == 0) {
+		dl->AddText(aida::ui::fonts::caption(), 11.f,
+			ImVec2(ox + w * 0.5f - 80.f, oy + h * 0.5f - 5.f),
+			aida::ui::with_alpha(t.text_dim, a),
+			"Capture snapshots to populate the timeline");
+		return;
 	}
-	ImGui::PopItemWidth();
 
-	ImGui::SameLine();
-	dl->AddText(ImGui::GetCursorScreenPos(), text_sec, "vs");
-	ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 20.f);
+	float seg = (snap_count > 1) ? track_w / static_cast<float>(snap_count - 1) : 0.f;
 
-	ImGui::SameLine();
-	ImGui::PushItemWidth(100.f);
-	if (ImGui::BeginCombo("##snap_b", g_state.snap_b_idx >= 0 && g_state.snap_b_idx < snap_count
-	                       ? g_state.snapshots[g_state.snap_b_idx].name.c_str() : "Snap B")) {
-		std::lock_guard<std::mutex> lk(g_state.mutex);
-		for (int i = 0; i < snap_count; ++i) {
-			bool sel = (g_state.snap_b_idx == i);
-			if (ImGui::Selectable(g_state.snapshots[i].name.c_str(), sel))
-				g_state.snap_b_idx = i;
+	int hot_marker = -1;
+	for (int i = 0; i < snap_count; ++i) {
+		float mx = (snap_count > 1) ? (track_x0 + seg * i) : (track_x0 + track_w * 0.5f);
+		float my = track_y;
+		ImGui::PushID(i + 100000);
+		ImGui::SetCursorScreenPos(ImVec2(mx - 12.f, my - 12.f));
+		ImGui::InvisibleButton("##mk", ImVec2(24.f, 24.f));
+		bool hov = ImGui::IsItemHovered();
+		bool clk = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+		bool clk_r = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+		ImGui::PopID();
+		if (hov) hot_marker = i;
+		if (clk) {
+			if (g_state.snap_a_idx == i) g_state.snap_a_idx = -1;
+			else if (g_state.snap_b_idx == i) g_state.snap_b_idx = -1;
+			else if (g_state.snap_a_idx < 0) g_state.snap_a_idx = i;
+			else if (g_state.snap_b_idx < 0) g_state.snap_b_idx = i;
+			else g_state.snap_b_idx = i;
 		}
-		ImGui::EndCombo();
+		if (clk_r) {
+			if (g_state.snap_a_idx == i) g_state.snap_a_idx = -1;
+			if (g_state.snap_b_idx == i) g_state.snap_b_idx = -1;
+		}
 	}
-	ImGui::PopItemWidth();
 
-	ImGui::PopStyleVar(2);
-	ImGui::PopStyleColor(2);
+	if (g_state.snap_a_idx >= 0 && g_state.snap_a_idx < snap_count &&
+		g_state.snap_b_idx >= 0 && g_state.snap_b_idx < snap_count) {
+		float ax = (snap_count > 1) ? (track_x0 + seg * g_state.snap_a_idx) : (track_x0 + track_w * 0.5f);
+		float bx = (snap_count > 1) ? (track_x0 + seg * g_state.snap_b_idx) : (track_x0 + track_w * 0.5f);
+		if (ax > bx) std::swap(ax, bx);
+		dl->AddRectFilledMultiColor(
+			ImVec2(ax, track_y - 2.f), ImVec2(bx, track_y + 2.f),
+			t.accent_grad_top, t.accent_grad_top,
+			t.accent_grad_bot, t.accent_grad_bot);
 
-	ImGui::SameLine();
-	ImGui::PushStyleColor(ImGuiCol_Button, _ta(_t.panel_header));
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, _ta(ui_anim::lighten(_t.panel_header, 14)));
-	ImGui::PushStyleColor(ImGuiCol_Text, text_main);
-	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
-	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 4.f));
+		if (g_state.compare_cursor_active) {
+			float dt = aida::ui::clock::dt();
+			g_state.compare_cursor_t += dt * 1.4f;
+			if (g_state.compare_cursor_t > 1.f) {
+				g_state.compare_cursor_t = 0.f;
+				if (!g_state.comparing.load()) g_state.compare_cursor_active = false;
+			}
+			float cx_pos = ax + (bx - ax) * g_state.compare_cursor_t;
+			dl->AddCircleFilled(ImVec2(cx_pos, track_y), 5.f,
+				aida::ui::with_alpha(t.accent_u32, a), 24);
+			dl->AddCircle(ImVec2(cx_pos, track_y), 9.f,
+				aida::ui::with_alpha(t.accent_u32, a * 0.4f), 24, 1.5f);
+		}
+	}
 
-	if (!busy && snap_count >= 2 && g_state.snap_a_idx >= 0 && g_state.snap_b_idx >= 0 &&
-	    g_state.snap_a_idx != g_state.snap_b_idx) {
-		if (ImGui::Button("Compare##sd"))
+	for (int i = 0; i < snap_count; ++i) {
+		float mx = (snap_count > 1) ? (track_x0 + seg * i) : (track_x0 + track_w * 0.5f);
+		float my = track_y;
+		bool is_a = (g_state.snap_a_idx == i);
+		bool is_b = (g_state.snap_b_idx == i);
+		bool is_hot = (hot_marker == i);
+
+		ImU32 outer = aida::ui::with_alpha(t.panel_header, a);
+		ImU32 inner = aida::ui::with_alpha(t.text_secondary, a);
+		float r_outer = 7.f;
+		if (is_a || is_b) {
+			outer = aida::ui::with_alpha(t.accent_u32, a);
+			inner = aida::ui::with_alpha(t.accent_grad_top, a);
+			r_outer = 9.f;
+		}
+		if (is_hot) {
+			r_outer += 2.f;
+			dl->AddCircle(ImVec2(mx, my), r_outer + 4.f,
+				aida::ui::with_alpha(t.accent_u32, a * 0.5f), 24, 1.5f);
+		}
+
+		dl->AddCircleFilled(ImVec2(mx, my), r_outer, outer, 24);
+		dl->AddCircleFilled(ImVec2(mx, my), r_outer - 3.f, inner, 24);
+
+		std::string nm;
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			if (i < (int)g_state.snapshots.size())
+				nm = g_state.snapshots[i].name;
+		}
+		ImVec2 ts = ImGui::CalcTextSize(nm.c_str());
+		dl->AddText(aida::ui::fonts::caption(), 10.f,
+			ImVec2(mx - ts.x * 0.5f, my + 11.f),
+			aida::ui::with_alpha(t.text_secondary, a), nm.c_str());
+
+		if (is_a) {
+			dl->AddText(aida::ui::fonts::caption(), 10.f,
+				ImVec2(mx - 5.f, my - 22.f),
+				aida::ui::with_alpha(t.accent_u32, a), "A");
+		}
+		if (is_b) {
+			dl->AddText(aida::ui::fonts::caption(), 10.f,
+				ImVec2(mx - 5.f, my - 22.f),
+				aida::ui::with_alpha(t.accent_u32, a), "B");
+		}
+	}
+}
+
+}
+
+inline void render(float pos_x, float pos_y, float width, float height,
+                   float alpha, float, float, float)
+{
+	ImDrawList* dl = ImGui::GetWindowDrawList();
+	ImVec2 wp = ImGui::GetWindowPos();
+	float a = alpha;
+
+	const auto& t = aida::ui::resolved();
+
+	float x0 = wp.x + pos_x;
+	float y0 = wp.y + pos_y;
+
+	dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + width, y0 + height),
+		aida::ui::with_alpha(t.bg_base, a));
+
+	float toolbar_h = 48.f;
+	dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + width, y0 + toolbar_h),
+		aida::ui::with_alpha(t.panel_header, a));
+	dl->AddLine(ImVec2(x0, y0 + toolbar_h), ImVec2(x0 + width, y0 + toolbar_h),
+		aida::ui::with_alpha(t.border_subtle, a), 1.f);
+
+	float cx = x0 + 16.f;
+	float cy = y0 + (toolbar_h - 32.f) * 0.5f;
+
+	dl->AddText(aida::ui::fonts::body_em(), 14.f,
+		ImVec2(cx, y0 + (toolbar_h - 14.f) * 0.5f),
+		aida::ui::with_alpha(t.text_primary, a), "Snapshot Diff");
+	cx += 130.f;
+
+	bool busy = g_state.capturing.load() || g_state.comparing.load();
+	bool taking = g_state.capturing.load();
+	bool comparing = g_state.comparing.load();
+
+	{
+		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+		const char* lbl = taking ? "Capturing..." : "Take Snapshot";
+		if (aida::ui::button(lbl, aida::ui::button_kind_t::primary,
+				aida::ui::size_t_::md, ImVec2(0.f, 0.f), busy, nullptr, taking)) {
+			take_snapshot();
+		}
+		cx += 150.f;
+	}
+
+	int snap_count = 0;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		snap_count = static_cast<int>(g_state.snapshots.size());
+	}
+
+	bool can_compare = (!busy && snap_count >= 2 &&
+		g_state.snap_a_idx >= 0 && g_state.snap_b_idx >= 0 &&
+		g_state.snap_a_idx != g_state.snap_b_idx);
+
+	{
+		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+		const char* lbl = comparing ? "Comparing..." : "Compare";
+		if (aida::ui::button(lbl, aida::ui::button_kind_t::primary,
+				aida::ui::size_t_::md, ImVec2(0.f, 0.f), !can_compare, nullptr, comparing)) {
 			compare_snapshots(g_state.snap_a_idx, g_state.snap_b_idx);
+		}
+		cx += 110.f;
 	}
 
-	ImGui::SameLine();
-	if (!busy && snap_count > 0) {
-		if (ImGui::Button("Clear All##sd"))
+	{
+		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+		if (aida::ui::button("Clear All", aida::ui::button_kind_t::destructive,
+				aida::ui::size_t_::sm, ImVec2(0.f, 0.f), busy || snap_count == 0)) {
 			clear_snapshots();
+		}
 	}
 
-	ImGui::PopStyleVar(2);
-	ImGui::PopStyleColor(3);
+	{
+		float prog = g_state.progress.load();
+		float bar_w = 180.f;
+		float bar_x = x0 + width - bar_w - 16.f;
+		float bar_y = y0 + (toolbar_h - 6.f) * 0.5f;
+		if (busy) {
+			aida::ui::render_progress_bar(ImVec2(bar_x, bar_y), bar_w, 6.f, prog, false, true);
+		} else {
+			char info[64];
+			snprintf(info, sizeof(info), "%d snapshot%s", snap_count, snap_count == 1 ? "" : "s");
+			ImVec2 ts = ImGui::CalcTextSize(info);
+			dl->AddText(aida::ui::fonts::caption(), 12.f,
+				ImVec2(x0 + width - ts.x - 16.f, y0 + (toolbar_h - 12.f) * 0.5f),
+				aida::ui::with_alpha(t.text_secondary, a), info);
+		}
+	}
 
-	float content_y = y0 + toolbar_h;
-	float content_h = height - toolbar_h;
+	float timeline_h = 64.f;
+	detail::render_timeline(dl, x0 + 12.f, y0 + toolbar_h + 8.f,
+		width - 24.f, timeline_h, a);
 
-	float detail_h = (g_state.selected_change >= 0) ? 160.f : 0.f;
+	float content_y = y0 + toolbar_h + 8.f + timeline_h + 8.f;
+	float content_h = (y0 + height) - content_y;
+
+	float detail_h = (g_state.selected_change >= 0) ? 180.f : 0.f;
 	float table_h = content_h - detail_h;
 
 	float col_addr_w = 130.f;
-	float col_old_w = 160.f;
-	float col_new_w = 160.f;
-	float col_type_w = 80.f;
-	float col_mod_w = width - col_addr_w - col_old_w - col_new_w - col_type_w - 24.f;
+	float col_old_w = 170.f;
+	float col_new_w = 170.f;
+	float col_type_w = 100.f;
+	float col_mod_w = width - col_addr_w - col_old_w - col_new_w - col_type_w - 36.f;
 	if (col_mod_w < 60.f) col_mod_w = 60.f;
 
-	{
-		ui_anim::table_col_t hdr_cols[] = {
-			{"Address", col_addr_w}, {"Old Value", col_old_w}, {"New Value", col_new_w},
-			{"Type", col_type_w}, {"Module", col_mod_w}
-		};
-		ui_anim::render_table_header(dl, x0, content_y, width, 24.f, hdr_cols, 5, accent_r, accent_g, accent_b, a);
-	}
+	float hdr_h = 26.f;
+	dl->AddRectFilled(ImVec2(x0, content_y),
+		ImVec2(x0 + width, content_y + hdr_h),
+		aida::ui::with_alpha(t.panel_header, a * 0.85f));
+	dl->AddLine(ImVec2(x0, content_y + hdr_h),
+		ImVec2(x0 + width, content_y + hdr_h),
+		aida::ui::with_alpha(t.border_subtle, a), 1.f);
 
-	ImGui::SetCursorPos(ImVec2(pos_x, pos_y + toolbar_h + 24.f));
-	ImGui::BeginChild("##snap_diff_table", ImVec2(width, table_h - 24.f), false,
-	                  ImGuiWindowFlags_NoBackground);
+	const char* col_names[5] = { "Address", "Old Value", "New Value", "Type", "Module" };
+	float col_widths[5] = { col_addr_w, col_old_w, col_new_w, col_type_w, col_mod_w };
+	float hx = x0 + 12.f;
+	for (int c = 0; c < 5; ++c) {
+		dl->AddText(aida::ui::fonts::caption(), 11.f,
+			ImVec2(hx, content_y + (hdr_h - 11.f) * 0.5f),
+			aida::ui::with_alpha(t.text_dim, a), col_names[c]);
+		hx += col_widths[c];
+	}
 
 	std::vector<changed_region_t> filtered;
 	{
@@ -537,84 +667,135 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 
-	static float diff_row_anim_time = 0.f;
-	diff_row_anim_time += ImGui::GetIO().DeltaTime;
+	if (g_state.row_flash.size() < filtered.size())
+		g_state.row_flash.resize(filtered.size(), 0.f);
 
-	float row_height = 20.f;
+	{
+		std::unordered_set<uint64_t> current;
+		current.reserve(filtered.size());
+		for (auto& c : filtered) current.insert(c.address);
+		bool changed = (current.size() != g_state.prev_change_keys.size());
+		if (!changed) {
+			for (auto k : current) {
+				if (g_state.prev_change_keys.find(k) == g_state.prev_change_keys.end()) {
+					changed = true; break;
+				}
+			}
+		}
+		if (changed) {
+			for (size_t i = 0; i < filtered.size(); ++i) {
+				if (g_state.prev_change_keys.find(filtered[i].address) == g_state.prev_change_keys.end()) {
+					if (i < g_state.row_flash.size()) g_state.row_flash[i] = 1.f;
+				}
+			}
+			g_state.prev_change_keys = std::move(current);
+		}
+	}
+
+	for (auto& f : g_state.row_flash) {
+		if (f > 0.f) {
+			f -= aida::ui::clock::dt() * 1.66f;
+			if (f < 0.f) f = 0.f;
+		}
+	}
+
+	float body_y = content_y + hdr_h;
+	float body_h = (table_h > hdr_h) ? (table_h - hdr_h) : 0.f;
+
+	ImGui::SetCursorScreenPos(ImVec2(x0, body_y));
+	ImGui::BeginChild("##snap_diff_table", ImVec2(width, body_h), false,
+	                  ImGuiWindowFlags_NoBackground);
+
+	static float diff_row_anim_time = 0.f;
+	diff_row_anim_time += aida::ui::clock::dt();
+
+	float row_height = 22.f;
 	for (int i = 0; i < static_cast<int>(filtered.size()); ++i) {
 		auto& c = filtered[i];
 		ImVec2 rp = ImGui::GetCursorScreenPos();
 
-		float row_entrance = ui_anim::render_row_entrance(i, diff_row_anim_time, 0.012f);
+		float entrance = ui_anim::render_row_entrance(i, diff_row_anim_time, 0.012f);
 		bool hov = ImGui::IsMouseHoveringRect(rp, ImVec2(rp.x + width, rp.y + row_height), true);
 		bool sel = (g_state.selected_change == i);
 
-		ui_anim::table_row_style_t rs{};
-		rs.selected = sel;
-		rs.hovered = hov;
-		rs.index = i;
-		rs.alpha = a;
-		rs.entrance = row_entrance;
-		rs.ar = accent_r; rs.ag = accent_g; rs.ab = accent_b;
-		ui_anim::render_table_row(dl, rp.x, rp.y, width, row_height, rs);
+		if (sel) {
+			dl->AddRectFilled(rp, ImVec2(rp.x + width, rp.y + row_height),
+				aida::ui::with_alpha(t.selection, a * entrance));
+			dl->AddRectFilled(rp, ImVec2(rp.x + 3.f, rp.y + row_height),
+				aida::ui::with_alpha(t.accent_u32, a * entrance));
+		} else if (hov) {
+			dl->AddRectFilled(rp, ImVec2(rp.x + width, rp.y + row_height),
+				aida::ui::with_alpha(t.hover_wash, a * entrance));
+		} else if (i & 1) {
+			dl->AddRectFilled(rp, ImVec2(rp.x + width, rp.y + row_height),
+				aida::ui::with_alpha(IM_COL32(255, 255, 255, 4), a * entrance));
+		}
+
+		float flash = (i < (int)g_state.row_flash.size()) ? g_state.row_flash[i] : 0.f;
+		if (flash > 0.f) {
+			dl->AddRectFilled(rp, ImVec2(rp.x + width, rp.y + row_height),
+				aida::ui::with_alpha(t.accent_glow, a * flash * 0.85f));
+		}
 
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 			g_state.selected_change = i;
 
 		char addr_str[24];
 		snprintf(addr_str, sizeof(addr_str), "0x%llX", static_cast<unsigned long long>(c.address));
-		dl->AddText(ImVec2(rp.x + 4.f, rp.y + 2.f), accent_col, addr_str);
+		dl->AddText(aida::ui::fonts::code(), 12.f,
+			ImVec2(rp.x + 12.f, rp.y + (row_height - 12.f) * 0.5f),
+			aida::ui::with_alpha(t.text_address, a * entrance), addr_str);
 
-		float ox = rp.x + col_addr_w;
+		float old_x = rp.x + 12.f + col_addr_w;
 		std::string old_hex;
 		for (uint32_t j = 0; j < c.size && j < 8; ++j) {
 			char hb[4]; snprintf(hb, sizeof(hb), "%02X ", c.old_data[j]);
 			old_hex += hb;
 		}
 		if (c.size > 8) old_hex += "...";
-		dl->AddText(ImVec2(ox, rp.y + 2.f), red_col, old_hex.c_str());
+		dl->AddText(aida::ui::fonts::code(), 12.f,
+			ImVec2(old_x, rp.y + (row_height - 12.f) * 0.5f),
+			aida::ui::with_alpha(t.error, a * entrance), old_hex.c_str());
 
-		float nx = rp.x + col_addr_w + col_old_w;
+		float new_x = old_x + col_old_w;
 		std::string new_hex;
 		for (uint32_t j = 0; j < c.size && j < 8; ++j) {
 			char hb[4]; snprintf(hb, sizeof(hb), "%02X ", c.new_data[j]);
 			new_hex += hb;
 		}
 		if (c.size > 8) new_hex += "...";
-		dl->AddText(ImVec2(nx, rp.y + 2.f), green_col, new_hex.c_str());
+		dl->AddText(aida::ui::fonts::code(), 12.f,
+			ImVec2(new_x, rp.y + (row_height - 12.f) * 0.5f),
+			aida::ui::with_alpha(t.success, a * entrance), new_hex.c_str());
 
-		const char* type_str = detail::change_type_name(c.type);
-		ImU32 type_col = text_sec;
-		if (c.type == change_type_t::pointer_changed) type_col = IM_COL32(255, 200, 100, static_cast<int>(220 * a));
-		else if (c.type == change_type_t::float_changed) type_col = IM_COL32(100, 200, 255, static_cast<int>(220 * a));
-		else if (c.type == change_type_t::counter_incremented || c.type == change_type_t::counter_decremented)
-			type_col = IM_COL32(200, 255, 100, static_cast<int>(220 * a));
-		{
-			float tx = rp.x + col_addr_w + col_old_w + col_new_w + 4.f;
-			ImVec2 tts = ImGui::CalcTextSize(type_str);
-			float pw = tts.x + 10.f;
-			float ph = tts.y + 2.f;
-			float py = rp.y + (row_height - ph) * 0.5f;
-			dl->AddRectFilled(ImVec2(tx, py), ImVec2(tx + pw, py + ph),
-				IM_COL32((type_col >> IM_COL32_R_SHIFT) & 0xFF,
-				         (type_col >> IM_COL32_G_SHIFT) & 0xFF,
-				         (type_col >> IM_COL32_B_SHIFT) & 0xFF,
-				         static_cast<int>(40 * a)), ph * 0.5f);
-			dl->AddText(ImVec2(tx + 5.f, py + 1.f), type_col, type_str);
+		float type_x = new_x + col_new_w;
+		ImGui::SetCursorScreenPos(ImVec2(type_x, rp.y + (row_height - 18.f) * 0.5f));
+		ImGui::PushID(i + 8192);
+		aida::ui::pill_kind(detail::change_type_name(c.type), detail::change_pill_kind(c.type),
+			aida::ui::size_t_::sm, true);
+		ImGui::PopID();
+
+		float mod_x = type_x + col_type_w;
+		if (!c.module_name.empty()) {
+			dl->AddText(aida::ui::fonts::caption(), 11.f,
+				ImVec2(mod_x, rp.y + (row_height - 11.f) * 0.5f),
+				aida::ui::with_alpha(t.text_dim, a * entrance), c.module_name.c_str());
 		}
-
-		dl->AddText(ImVec2(rp.x + col_addr_w + col_old_w + col_new_w + col_type_w + 4.f, rp.y + 2.f),
-		            text_dim, c.module_name.c_str());
 
 		ImGui::SetCursorScreenPos(ImVec2(rp.x, rp.y + row_height));
 	}
 
 	if (filtered.empty()) {
-		const char* empty_msg = g_state.snapshots.empty()
-			? "Take snapshots of the target process to compare memory states."
-			: "Select two snapshots and click 'Compare' to view differences.";
-		ui_anim::render_empty_state(dl, x0, content_y + 24.f, width, table_h - 24.f,
-			empty_msg, accent_r, accent_g, accent_b, a, static_cast<float>(ImGui::GetTime()));
+		aida::ui::empty_state::config_t cfg;
+		cfg.glyph = aida::ui::empty_state::glyph_t::memory;
+		if (g_state.snapshots.empty()) {
+			cfg.title = "No snapshots yet";
+			cfg.body = "Capture two snapshots of the target process, then compare them to see what changed.";
+		} else {
+			cfg.title = "Pick A and B";
+			cfg.body = "Click two markers on the timeline above and press Compare.";
+		}
+		aida::ui::empty_state::render(ImVec2(x0, body_y), ImVec2(width, body_h), cfg);
 	}
 
 	ImGui::EndChild();
@@ -622,36 +803,65 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (g_state.selected_change >= 0 && g_state.selected_change < static_cast<int>(filtered.size())) {
 		auto& c = filtered[g_state.selected_change];
 		float dy = y0 + height - detail_h;
-		dl->AddLine(ImVec2(x0, dy), ImVec2(x0 + width, dy), sep_col);
-		ui_anim::render_panel_card(dl, x0, dy, width, detail_h, accent_r, accent_g, accent_b, a, 0.f, true);
+		dl->AddLine(ImVec2(x0, dy), ImVec2(x0 + width, dy),
+			aida::ui::with_alpha(t.border_subtle, a), 1.f);
+		dl->AddRectFilled(ImVec2(x0, dy), ImVec2(x0 + width, y0 + height),
+			aida::ui::with_alpha(t.panel_bg, a));
 
-		dl->AddText(ImVec2(x0 + 8.f, dy + 6.f), text_sec, "Detail");
+		dl->AddText(aida::ui::fonts::body_em(), 13.f,
+			ImVec2(x0 + 16.f, dy + 10.f),
+			aida::ui::with_alpha(t.text_primary, a), "Detail");
 
-		char addr_info[64];
-		snprintf(addr_info, sizeof(addr_info), "Address: 0x%llX  Size: %u bytes",
+		char addr_info[80];
+		snprintf(addr_info, sizeof(addr_info), "0x%llX  ·  %u bytes",
 		         static_cast<unsigned long long>(c.address), c.size);
-		dl->AddText(ImVec2(x0 + 8.f, dy + 24.f), text_main, addr_info);
+		dl->AddText(aida::ui::fonts::caption(), 12.f,
+			ImVec2(x0 + 70.f, dy + 11.f),
+			aida::ui::with_alpha(t.text_secondary, a), addr_info);
 
-		float hex_y = dy + 44.f;
-		dl->AddText(ImVec2(x0 + 8.f, hex_y), red_col, "Old:");
-		float ohx = x0 + 48.f;
+		float hex_y = dy + 36.f;
+		float byte_w = 26.f;
+		float byte_h = 22.f;
+		float row_pad_x = 16.f;
+
+		dl->AddText(aida::ui::fonts::caption(), 11.f,
+			ImVec2(x0 + row_pad_x, hex_y + (byte_h - 11.f) * 0.5f),
+			aida::ui::with_alpha(t.error, a), "Old");
+		float ohx = x0 + row_pad_x + 36.f;
 		for (uint32_t j = 0; j < c.size && j < 32; ++j) {
 			char hb[4]; snprintf(hb, sizeof(hb), "%02X", c.old_data[j]);
 			bool diff = (j < c.new_data.size() && c.old_data[j] != c.new_data[j]);
-			dl->AddText(ImVec2(ohx, hex_y), diff ? red_col : text_dim, hb);
-			ohx += 22.f;
+			if (diff) {
+				dl->AddRectFilled(ImVec2(ohx - 3.f, hex_y),
+					ImVec2(ohx + byte_w - 3.f, hex_y + byte_h),
+					aida::ui::with_alpha(t.error_soft, a), 4.f);
+			}
+			dl->AddText(aida::ui::fonts::code(), 12.f,
+				ImVec2(ohx, hex_y + (byte_h - 12.f) * 0.5f),
+				aida::ui::with_alpha(diff ? t.error : t.text_dim, a), hb);
+			ohx += byte_w;
 		}
 
-		hex_y += 18.f;
-		dl->AddText(ImVec2(x0 + 8.f, hex_y), green_col, "New:");
-		float nhx = x0 + 48.f;
+		hex_y += byte_h + 6.f;
+		dl->AddText(aida::ui::fonts::caption(), 11.f,
+			ImVec2(x0 + row_pad_x, hex_y + (byte_h - 11.f) * 0.5f),
+			aida::ui::with_alpha(t.success, a), "New");
+		float nhx = x0 + row_pad_x + 36.f;
 		for (uint32_t j = 0; j < c.size && j < 32; ++j) {
 			char hb[4]; snprintf(hb, sizeof(hb), "%02X", c.new_data[j]);
 			bool diff = (j < c.old_data.size() && c.old_data[j] != c.new_data[j]);
-			dl->AddText(ImVec2(nhx, hex_y), diff ? green_col : text_dim, hb);
-			nhx += 22.f;
+			if (diff) {
+				dl->AddRectFilled(ImVec2(nhx - 3.f, hex_y),
+					ImVec2(nhx + byte_w - 3.f, hex_y + byte_h),
+					aida::ui::with_alpha(t.success_soft, a), 4.f);
+			}
+			dl->AddText(aida::ui::fonts::code(), 12.f,
+				ImVec2(nhx, hex_y + (byte_h - 12.f) * 0.5f),
+				aida::ui::with_alpha(diff ? t.success : t.text_dim, a), hb);
+			nhx += byte_w;
 		}
 
+		hex_y += byte_h + 8.f;
 		if (c.size == 4) {
 			float old_f, new_f;
 			std::memcpy(&old_f, c.old_data.data(), 4);
@@ -660,29 +870,23 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			std::memcpy(&old_i, c.old_data.data(), 4);
 			std::memcpy(&new_i, c.new_data.data(), 4);
 
-			char val_info[128];
+			char val_info[160];
 			snprintf(val_info, sizeof(val_info), "Int32: %d -> %d   Float: %.6f -> %.6f",
 			         old_i, new_i, old_f, new_f);
-			dl->AddText(ImVec2(x0 + 8.f, hex_y + 22.f), text_sec, val_info);
+			dl->AddText(aida::ui::fonts::code(), 12.f,
+				ImVec2(x0 + row_pad_x, hex_y),
+				aida::ui::with_alpha(t.text_secondary, a), val_info);
 		} else if (c.size == 8) {
 			uint64_t old_v, new_v;
 			std::memcpy(&old_v, c.old_data.data(), 8);
 			std::memcpy(&new_v, c.new_data.data(), 8);
-			char val_info[128];
+			char val_info[160];
 			snprintf(val_info, sizeof(val_info), "UInt64: 0x%llX -> 0x%llX",
 			         static_cast<unsigned long long>(old_v), static_cast<unsigned long long>(new_v));
-			dl->AddText(ImVec2(x0 + 8.f, hex_y + 22.f), text_sec, val_info);
+			dl->AddText(aida::ui::fonts::code(), 12.f,
+				ImVec2(x0 + row_pad_x, hex_y),
+				aida::ui::with_alpha(t.text_secondary, a), val_info);
 		}
-	}
-
-	{
-		std::lock_guard<std::mutex> lk(g_state.mutex);
-		char info[64];
-		snprintf(info, sizeof(info), "%d snapshots  |  %d changes",
-		         static_cast<int>(g_state.snapshots.size()),
-		         static_cast<int>(g_state.diff.changes.size()));
-		ImVec2 it = ImGui::CalcTextSize(info);
-		dl->AddText(ImVec2(x0 + width - it.x - 10.f, y0 + height - 18.f), text_dim, info);
 	}
 }
 

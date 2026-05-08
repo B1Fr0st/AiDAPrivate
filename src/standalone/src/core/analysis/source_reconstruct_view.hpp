@@ -9,6 +9,7 @@
 #include "../helpers/globals.h"
 #include "source_reconstructor.hpp"
 #include "ui_anim.hpp"
+#include "theme.hpp"
 
 namespace source_reconstruct_view {
 
@@ -115,7 +116,7 @@ inline void render(float alpha, float ar, float ag, float ab) {
 		ImVec2 cmin(close_x, cur_y);
 		ImVec2 cmax(close_x + 16.f, cur_y + 16.f);
 		bool close_hov = ImGui::IsMouseHoveringRect(cmin, cmax);
-		ImU32 close_col = close_hov ? IM_COL32(230, 80, 80, static_cast<int>(220 * fa))
+		ImU32 close_col = close_hov ? aida::ui::with_alpha(aida::ui::resolved().error, 0.86f * fa)
 		                            : _ta(_t.text_secondary);
 		dl->AddLine(ImVec2(close_x + 2, cur_y + 2), ImVec2(close_x + 14, cur_y + 14), close_col, 2.f);
 		dl->AddLine(ImVec2(close_x + 14, cur_y + 2), ImVec2(close_x + 2, cur_y + 14), close_col, 2.f);
@@ -248,9 +249,10 @@ inline void render(float alpha, float ar, float ag, float ab) {
 					         static_cast<int>(ab * 255), static_cast<int>(40 * fa)), 20);
 			}
 
+			const auto& th_tok = aida::ui::resolved();
 			ImU32 dot_col;
 			if (completed)
-				dot_col = IM_COL32(80, 200, 120, static_cast<int>(220 * fa));
+				dot_col = aida::ui::with_alpha(th_tok.success, 0.86f * fa);
 			else if (active)
 				dot_col = accent;
 			else
@@ -259,10 +261,9 @@ inline void render(float alpha, float ar, float ag, float ab) {
 			dl->AddCircleFilled(ImVec2(dot_x, dot_y), dot_radius, dot_col, 20);
 
 			if (completed) {
-				dl->AddLine(ImVec2(dot_x - 3, dot_y), ImVec2(dot_x - 1, dot_y + 3),
-					IM_COL32(255, 255, 255, static_cast<int>(220 * fa)), 1.5f);
-				dl->AddLine(ImVec2(dot_x - 1, dot_y + 3), ImVec2(dot_x + 4, dot_y - 2),
-					IM_COL32(255, 255, 255, static_cast<int>(220 * fa)), 1.5f);
+				ImU32 ck = aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), 0.86f * fa);
+				dl->AddLine(ImVec2(dot_x - 3, dot_y), ImVec2(dot_x - 1, dot_y + 3), ck, 1.5f);
+				dl->AddLine(ImVec2(dot_x - 1, dot_y + 3), ImVec2(dot_x + 4, dot_y - 2), ck, 1.5f);
 			}
 
 			ImVec2 lsz = ImGui::CalcTextSize(stage_labels[i]);
@@ -270,7 +271,7 @@ inline void render(float alpha, float ar, float ag, float ab) {
 			float ly = dot_y + dot_radius + 6.f;
 
 			ImU32 label_col = active ? text_primary :
-			                  completed ? IM_COL32(80, 200, 120, static_cast<int>(200 * fa)) : text_dim;
+			                  completed ? aida::ui::with_alpha(th_tok.success, 0.78f * fa) : text_dim;
 			dl->AddText(ImVec2(lx, ly), label_col, stage_labels[i]);
 		}
 
@@ -294,29 +295,24 @@ inline void render(float alpha, float ar, float ag, float ab) {
 
 		float fill_w = bar_w * st.progress_display;
 		if (fill_w > 2.f) {
-			ImU32 bar_col = IM_COL32(
-				static_cast<int>(ar * 200 + 30), static_cast<int>(ag * 200 + 30),
-				static_cast<int>(ab * 200 + 30), static_cast<int>(220 * fa));
-			ImU32 bar_bright = IM_COL32(
-				(std::min)(static_cast<int>(ar * 255 + 60), 255),
-				(std::min)(static_cast<int>(ag * 255 + 60), 255),
-				(std::min)(static_cast<int>(ab * 255 + 60), 255),
-				static_cast<int>(255 * fa));
+			const auto& th_bar = aida::ui::resolved();
+			ImU32 bar_top = aida::ui::with_alpha(th_bar.accent_grad_top, 0.92f * fa);
+			ImU32 bar_bot = aida::ui::with_alpha(th_bar.accent_grad_bot, 0.92f * fa);
+			(void)bar_bot;
 
-			dl->AddRectFilled(
+			dl->AddRectFilledMultiColor(
 				ImVec2(bar_x, bar_y), ImVec2(bar_x + fill_w, bar_y + bar_h),
-				bar_col, bar_h * 0.5f);
+				bar_top, bar_top, bar_bot, bar_bot);
 
 			float shimmer_x = bar_x + fill_w * st.shimmer_phase;
 			float shimmer_w = fill_w * 0.15f;
 			if (shimmer_w > 8.f && source_reconstructor::is_running()) {
+				ImU32 sh_off = aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), 0.f);
+				ImU32 sh_on  = aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), 0.20f * fa);
 				dl->AddRectFilledMultiColor(
 					ImVec2(shimmer_x - shimmer_w * 0.5f, bar_y),
 					ImVec2(shimmer_x + shimmer_w * 0.5f, bar_y + bar_h),
-					IM_COL32(255, 255, 255, 0),
-					IM_COL32(255, 255, 255, static_cast<int>(50 * fa)),
-					IM_COL32(255, 255, 255, static_cast<int>(50 * fa)),
-					IM_COL32(255, 255, 255, 0));
+					sh_off, sh_on, sh_on, sh_off);
 			}
 		}
 
@@ -324,7 +320,7 @@ inline void render(float alpha, float ar, float ag, float ab) {
 		snprintf(pct_str, sizeof(pct_str), "%d%%", static_cast<int>(st.progress_display * 100.f));
 		ImVec2 pct_sz = ImGui::CalcTextSize(pct_str);
 		dl->AddText(ImVec2(bar_x + bar_w * 0.5f - pct_sz.x * 0.5f, bar_y + 1.f),
-			IM_COL32(255, 255, 255, static_cast<int>(200 * fa)), pct_str);
+			aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), 0.78f * fa), pct_str);
 
 		cur_y += bar_h + 10.f;
 	}
@@ -382,27 +378,28 @@ inline void render(float alpha, float ar, float ag, float ab) {
 			ImVec2 bmax(btn_x + btn_w, btn_y + btn_h);
 			bool bhov = has_output && ImGui::IsMouseHoveringRect(bmin, bmax);
 
+			const auto& th_btn_start = aida::ui::resolved();
 			ImU32 btn_bg;
 			if (!has_output)
 				btn_bg = _ta(_t.panel_header);
 			else if (bhov)
-				btn_bg = IM_COL32(
-					(std::min)(static_cast<int>(ar * 255 + 40), 255),
-					(std::min)(static_cast<int>(ag * 255 + 40), 255),
-					(std::min)(static_cast<int>(ab * 255 + 40), 255),
-					static_cast<int>(220 * fa));
+				btn_bg = aida::ui::with_alpha(th_btn_start.accent_hover, 0.86f * fa);
 			else
-				btn_bg = IM_COL32(
-					static_cast<int>(ar * 200 + 20),
-					static_cast<int>(ag * 200 + 20),
-					static_cast<int>(ab * 200 + 20),
-					static_cast<int>(200 * fa));
+				btn_bg = aida::ui::with_alpha(th_btn_start.accent_u32, 0.78f * fa);
 
-			dl->AddRectFilled(bmin, bmax, btn_bg, 6.f);
+			dl->AddRectFilled(bmin, bmax, btn_bg, 8.f);
+			if (has_output) {
+				dl->AddRectFilledMultiColor(bmin,
+					ImVec2(bmax.x, bmin.y + 2.f),
+					aida::ui::with_alpha(th_btn_start.accent_grad_top, fa),
+					aida::ui::with_alpha(th_btn_start.accent_grad_top, fa),
+					aida::ui::with_alpha(th_btn_start.accent_grad_bot, fa),
+					aida::ui::with_alpha(th_btn_start.accent_grad_bot, fa));
+			}
 
 			const char* start_lbl = "Start";
 			ImVec2 slsz = ImGui::CalcTextSize(start_lbl);
-			ImU32 start_text_col = has_output ? IM_COL32(255, 255, 255, static_cast<int>(240 * fa))
+			ImU32 start_text_col = has_output ? aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), 0.94f * fa)
 			                                  : _ta(_t.text_dim);
 			dl->AddText(ImVec2(btn_x + btn_w * 0.5f - slsz.x * 0.5f,
 			                    btn_y + btn_h * 0.5f - slsz.y * 0.5f), start_text_col, start_lbl);
@@ -433,23 +430,26 @@ inline void render(float alpha, float ar, float ag, float ab) {
 				ImVec2 bmax(btn_x + btn_w, btn_y + btn_h);
 				bool bhov = ImGui::IsMouseHoveringRect(bmin, bmax);
 
-				ImU32 cancel_bg = bhov ? IM_COL32(200, 60, 60, static_cast<int>(200 * fa))
-				                       : IM_COL32(160, 50, 50, static_cast<int>(160 * fa));
-				dl->AddRectFilled(bmin, bmax, cancel_bg, 6.f);
+				const auto& th_btn = aida::ui::resolved();
+				ImU32 cancel_bg = bhov ? aida::ui::with_alpha(th_btn.error, 0.78f * fa)
+				                       : aida::ui::with_alpha(th_btn.error, 0.50f * fa);
+				dl->AddRectFilled(bmin, bmax, cancel_bg, 8.f);
+				dl->AddRect(bmin, bmax, aida::ui::with_alpha(th_btn.error, 0.85f * fa), 8.f, 0, 1.f);
 
 				const char* cancel_lbl = "Cancel";
 				ImVec2 clsz = ImGui::CalcTextSize(cancel_lbl);
 				dl->AddText(ImVec2(btn_x + btn_w * 0.5f - clsz.x * 0.5f,
 				                    btn_y + btn_h * 0.5f - clsz.y * 0.5f),
-					IM_COL32(255, 255, 255, static_cast<int>(220 * fa)), cancel_lbl);
+					aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), 0.86f * fa), cancel_lbl);
 
 				if (bhov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 					source_reconstructor::cancel();
 			} else {
 				auto& last = source_reconstructor::get_last_result();
 				const char* done_lbl = last.success ? "Complete!" : "Failed";
-				ImU32 done_col = last.success ? IM_COL32(80, 200, 120, static_cast<int>(220 * fa))
-				                              : IM_COL32(230, 80, 80, static_cast<int>(220 * fa));
+				const auto& th_done = aida::ui::resolved();
+				ImU32 done_col = last.success ? aida::ui::with_alpha(th_done.success, 0.86f * fa)
+				                              : aida::ui::with_alpha(th_done.error,   0.86f * fa);
 				dl->AddText(ImVec2(dx + pad, btn_area_y + 6.f), done_col, done_lbl);
 
 				if (last.success) {

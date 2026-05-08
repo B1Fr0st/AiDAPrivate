@@ -33,6 +33,7 @@
 #include "auto_approval.hpp"
 #include "file_context_tracker.hpp"
 #include "standalone_context.hpp"
+#include "../ui/components.hpp"
 
 #include "../helpers/globals.h"
 
@@ -1846,6 +1847,13 @@ bool is_ai_busy()
     return s_ai_running.load();
 }
 
+void chat_request_cancel()
+{
+    if (!s_ai_running.load()) return;
+    s_cancel = true;
+    if (g_sa_ai_client) g_sa_ai_client->cancel();
+}
+
 
 void chat_bind_session(const std::string& session_id)
 {
@@ -1925,28 +1933,29 @@ void render_tool_approval_dialog()
         float total = btn_w * 2 + 12.f;
         ImGui::SetCursorPosX((pw - total) * 0.5f);
 
-        ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(
-            static_cast<int>(ax * 200), static_cast<int>(ay * 200), static_cast<int>(az * 200), 200));
-        if (ImGui::Button("Allow", ImVec2(btn_w, 28))) {
+        if (aida::ui::components::button("Allow",
+            aida::ui::components::button_kind_t::primary,
+            aida::ui::components::size_t_::md,
+            ImVec2(btn_w, 28.f))) {
             std::lock_guard<std::mutex> lk(s_tool_approval.mtx);
             s_tool_approval.approved = true;
             s_tool_approval.answered = true;
             s_tool_approval.cv.notify_one();
             ImGui::CloseCurrentPopup();
         }
-        ImGui::PopStyleColor();
 
         ImGui::SameLine(0, 12.f);
 
-        ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(120, 40, 40, 200));
-        if (ImGui::Button("Deny", ImVec2(btn_w, 28))) {
+        if (aida::ui::components::button("Deny",
+            aida::ui::components::button_kind_t::destructive,
+            aida::ui::components::size_t_::md,
+            ImVec2(btn_w, 28.f))) {
             std::lock_guard<std::mutex> lk(s_tool_approval.mtx);
             s_tool_approval.approved = false;
             s_tool_approval.answered = true;
             s_tool_approval.cv.notify_one();
             ImGui::CloseCurrentPopup();
         }
-        ImGui::PopStyleColor();
 
         ImGui::EndPopup();
     }

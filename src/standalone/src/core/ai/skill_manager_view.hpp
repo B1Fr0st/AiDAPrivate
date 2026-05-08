@@ -11,6 +11,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <windows.h>
@@ -24,6 +25,16 @@
 #include "toast_notification.hpp"
 #include "ui_anim.hpp"
 #include "work_queue.hpp"
+#include "../ui/avatar.hpp"
+#include "../ui/blur_layer.hpp"
+#include "../ui/brand.hpp"
+#include "../ui/clock.hpp"
+#include "../ui/components.hpp"
+#include "../ui/empty_state.hpp"
+#include "../ui/fonts.hpp"
+#include "../ui/motion.hpp"
+#include "../ui/theme.hpp"
+#include "../ui/transition.hpp"
 #include "../helpers/globals.h"
 
 namespace aida {
@@ -60,6 +71,11 @@ namespace skill_manager {
 		return m;
 	}
 
+	struct row_anim_t
+	{
+		aida::ui::hover_state_t hover;
+	};
+
 	struct view_state_t {
 		bool                                                       initialized = false;
 		std::atomic<bool>                                          shutdown_flag{false};
@@ -80,6 +96,14 @@ namespace skill_manager {
 		std::string                                                cached_skill_name;
 		std::string                                                cached_skill_body;
 		std::vector<std::string>                                   cached_skill_hints;
+		bool                                                       refreshing = false;
+		std::unordered_map<std::string, row_anim_t>                row_anims;
+		float                                                      tab_underline_x = 0.f;
+		float                                                      tab_underline_w = 0.f;
+		float                                                      tab_underline_target_x = 0.f;
+		float                                                      tab_underline_target_w = 0.f;
+		float                                                      tab_underline_vel_x = 0.f;
+		float                                                      tab_underline_vel_w = 0.f;
 	};
 
 	inline view_state_t& state()
@@ -140,6 +164,13 @@ namespace skill_manager {
 		return "project";
 	}
 
+	inline aida::ui::pill_kind_t source_pill_kind(const ::aida::skills::skill_metadata_t& m)
+	{
+		if (m.source == "remote") return aida::ui::pill_kind_t::accent;
+		if (m.source == "global") return aida::ui::pill_kind_t::info;
+		return aida::ui::pill_kind_t::success;
+	}
+
 	inline void open_path_in_shell(const std::string& path, bool select_in_explorer)
 	{
 		if (path.empty()) return;
@@ -187,45 +218,6 @@ namespace skill_manager {
 			out.push_back(m);
 		}
 		return out;
-	}
-
-
-	inline void render_chip(ImDrawList* dl, float x, float y, const std::string& text,
-		ImU32 bg, ImU32 fg, float alpha)
-	{
-		ImVec2 ts = ImGui::CalcTextSize(text.c_str());
-		const float pad_x = 6.f;
-		const float pad_y = 2.f;
-		const float w = ts.x + pad_x * 2.f;
-		const float h = ts.y + pad_y * 2.f;
-		ImU32 bg_a = (bg & 0x00FFFFFFu) | (static_cast<unsigned>(((bg >> 24) & 0xFFu) * alpha) << 24);
-		ImU32 fg_a = (fg & 0x00FFFFFFu) | (static_cast<unsigned>(((fg >> 24) & 0xFFu) * alpha) << 24);
-		dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), bg_a, h * 0.5f);
-		dl->AddText(ImVec2(x + pad_x, y + pad_y), fg_a, text.c_str());
-	}
-
-	inline float render_agent_chips_row(ImDrawList* dl, float x, float y, float max_w,
-		const std::vector<std::string>& slugs, float alpha)
-	{
-		if (slugs.empty()) return 0.f;
-		float cx = x;
-		const float gap = 4.f;
-		const ImU32 bg = IM_COL32(60, 70, 90, 200);
-		const ImU32 fg = IM_COL32(190, 210, 240, 240);
-		int shown = 0;
-		for (const auto& s : slugs) {
-			ImVec2 ts = ImGui::CalcTextSize(s.c_str());
-			const float w = ts.x + 12.f;
-			if (shown >= 3 || cx + w > x + max_w) {
-				render_chip(dl, cx, y, "...", IM_COL32(60, 70, 90, 200),
-					IM_COL32(190, 210, 240, 240), alpha);
-				return ts.y + 4.f;
-			}
-			render_chip(dl, cx, y, s, bg, fg, alpha);
-			cx += w + gap;
-			++shown;
-		}
-		return ImGui::GetFontSize() + 4.f;
 	}
 
 
@@ -355,18 +347,23 @@ namespace skill_manager {
 		s.remote_cache.clear();
 		s.install_pending.clear();
 		s.pending_uninstall.clear();
+		s.row_anims.clear();
 	}
 
 
-	inline void render_toolbar(float root_x, float root_y, float root_w, float toolbar_h,
-		float ar, float ag, float ab, float alpha)
+	inline void render_toolbar(float root_x, float root_y, float root_w, float toolbar_h)
 	{
 		auto& st = state();
 		const float pad = 10.f;
 		const float search_w = std::max(220.f, (root_w - pad * 6.f) * 0.30f);
-		ImGui::SetCursorScreenPos(ImVec2(root_x + pad, root_y + 4.f));
-		ui_anim::render_filter_input_chip("##sm_search", st.search_buf, sizeof(st.search_buf),
-			"Filter skills", search_w, ar, ag, ab, alpha);
+		ImGui::SetCursorScreenPos(ImVec2(root_x + pad, root_y + 2.f));
+		char search_local[256];
+		std::memcpy(search_local, st.search_buf, sizeof(search_local));
+		if (aida::ui::input_text("##sm_search", search_local, sizeof(search_local),
+				"Filter skills", false, ImVec2(search_w, 28.f))) {
+			std::lock_guard<std::mutex> lk(state_mutex());
+			std::memcpy(st.search_buf, search_local, sizeof(st.search_buf));
+		}
 
 		const float combo_x = root_x + pad * 2.f + search_w;
 		const float combo_w = 200.f;
@@ -392,19 +389,25 @@ namespace skill_manager {
 		ImGui::PopItemWidth();
 
 		const float refresh_x = combo_x + combo_w + pad;
-		const float refresh_w = 110.f;
-		ImGui::SetCursorScreenPos(ImVec2(refresh_x, root_y + 4.f));
-		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(ar * 0.32f, ag * 0.32f, ab * 0.32f, 0.6f));
-		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(ar * 0.55f, ag * 0.55f, ab * 0.55f, 0.8f));
-		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(ar * 0.7f, ag * 0.7f, ab * 0.7f, 1.f));
-		if (ImGui::Button("Refresh##sm", ImVec2(refresh_w, 24.f))) {
-			::aida::skills::reindex();
-			std::lock_guard<std::mutex> lk(state_mutex());
-			state().last_indexed_unix = static_cast<int64_t>(std::time(nullptr));
-			toast_notification::push("Skills re-indexed",
-				toast_notification::toast_type_t::info, 2.5f);
+		ImGui::SetCursorScreenPos(ImVec2(refresh_x, root_y + 2.f));
+		bool refreshing_local = st.refreshing;
+		if (aida::ui::button("Refresh##sm",
+				aida::ui::button_kind_t::secondary,
+				aida::ui::size_t_::sm,
+				ImVec2(110.f, 28.f),
+				false, nullptr, refreshing_local)) {
+			st.refreshing = true;
+			work_queue::post([]() {
+				::aida::skills::reindex();
+				{
+					std::lock_guard<std::mutex> lk(state_mutex());
+					state().last_indexed_unix = static_cast<int64_t>(std::time(nullptr));
+					state().refreshing = false;
+				}
+				toast_notification::push("Skills re-indexed",
+					toast_notification::toast_type_t::info, 2.5f);
+			});
 		}
-		ImGui::PopStyleColor(3);
 
 		const float url_w = 280.f;
 		const float url_x = root_x + root_w - pad - url_w - 80.f;
@@ -415,11 +418,11 @@ namespace skill_manager {
 		ImGui::PopItemWidth();
 
 		const float add_x = root_x + root_w - pad - 70.f;
-		ImGui::SetCursorScreenPos(ImVec2(add_x, root_y + 4.f));
-		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(ar * 0.40f, ag * 0.40f, ab * 0.40f, 0.7f));
-		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(ar * 0.60f, ag * 0.60f, ab * 0.60f, 0.9f));
-		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(ar * 0.75f, ag * 0.75f, ab * 0.75f, 1.0f));
-		if (ImGui::Button("Add URL##sm", ImVec2(70.f, 24.f))) {
+		ImGui::SetCursorScreenPos(ImVec2(add_x, root_y + 2.f));
+		if (aida::ui::button("Add URL##sm",
+				aida::ui::button_kind_t::primary,
+				aida::ui::size_t_::sm,
+				ImVec2(70.f, 28.f))) {
 			std::string url(st.add_url_buf);
 			if (!url.empty()) {
 				if (::aida::skills::add_remote_url(url)) {
@@ -435,112 +438,172 @@ namespace skill_manager {
 				}
 			}
 		}
-		ImGui::PopStyleColor(3);
 	}
 
-	inline void render_tab_strip(float x, float y, float w,
-		float ar, float ag, float ab, float alpha)
+	inline void render_tab_strip(float x, float y, float w, float dt)
 	{
 		auto& st = state();
-		ImGui::SetCursorScreenPos(ImVec2(x, y));
+		const auto& th = aida::ui::resolved();
 		const source_tab_t tabs[] = { source_tab_t::built_in, source_tab_t::project, source_tab_t::remote };
 		const float btn_w = (w - 8.f) / 3.f;
+		const float btn_h = 26.f;
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+
+		ImVec2 strip_a(x, y);
+		ImVec2 strip_b(x + w, y + btn_h);
+		dl->AddRectFilled(strip_a, strip_b,
+			aida::ui::with_alpha(th.panel_header, 0.45f), 8.f);
+
+		float sel_x = x;
+		float sel_w = btn_w;
 		for (int i = 0; i < 3; ++i) {
-			if (i > 0) ImGui::SameLine(0.f, 4.f);
-			const bool active = (st.active_tab == tabs[i]);
-			if (active) {
-				ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(ar * 0.45f, ag * 0.45f, ab * 0.45f, 0.85f));
-				ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(ar * 0.60f, ag * 0.60f, ab * 0.60f, 0.95f));
-				ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(ar * 0.75f, ag * 0.75f, ab * 0.75f, 1.0f));
-			} else {
-				ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.18f, 0.22f, 0.65f));
-				ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.26f, 0.26f, 0.30f, 0.80f));
-				ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.34f, 0.34f, 0.38f, 0.95f));
+			float bx = x + (btn_w + 4.f) * i;
+			if (st.active_tab == tabs[i]) {
+				sel_x = bx;
+				sel_w = btn_w;
 			}
-			char id[40];
-			std::snprintf(id, sizeof(id), "%s##sm_tab_%d", tab_label(tabs[i]), i);
-			if (ImGui::Button(id, ImVec2(btn_w, 22.f))) {
+		}
+		st.tab_underline_target_x = sel_x;
+		st.tab_underline_target_w = sel_w;
+
+		if (st.tab_underline_w <= 0.001f) {
+			st.tab_underline_x = sel_x;
+			st.tab_underline_w = sel_w;
+		} else {
+			st.tab_underline_x = aida::motion::spring_step(st.tab_underline_x,
+				st.tab_underline_target_x, st.tab_underline_vel_x,
+				aida::motion::spring::balanced, dt);
+			st.tab_underline_w = aida::motion::spring_step(st.tab_underline_w,
+				st.tab_underline_target_w, st.tab_underline_vel_w,
+				aida::motion::spring::balanced, dt);
+		}
+
+		dl->AddRectFilledMultiColor(
+			ImVec2(st.tab_underline_x, y + btn_h - 3.f),
+			ImVec2(st.tab_underline_x + st.tab_underline_w, y + btn_h),
+			th.accent_grad_top, th.accent_grad_top,
+			th.accent_grad_bot, th.accent_grad_bot);
+
+		for (int i = 0; i < 3; ++i) {
+			float bx = x + (btn_w + 4.f) * i;
+			ImGui::SetCursorScreenPos(ImVec2(bx, y));
+			ImGui::PushID(i);
+			ImGui::InvisibleButton("##tab_btn", ImVec2(btn_w, btn_h));
+			bool hov = ImGui::IsItemHovered();
+			bool clicked = ImGui::IsItemClicked();
+			ImGui::PopID();
+
+			ImU32 text_col = (st.active_tab == tabs[i]) ? th.text_primary : th.text_secondary;
+			if (hov) text_col = th.text_primary;
+			ImFont* f = aida::ui::fonts::body_em();
+			float fs = 12.f;
+			ImVec2 ts = f->CalcTextSizeA(fs, FLT_MAX, 0.f, tab_label(tabs[i]));
+			dl->AddText(f, fs,
+				ImVec2(bx + (btn_w - ts.x) * 0.5f, y + (btn_h - ts.y) * 0.5f),
+				text_col, tab_label(tabs[i]));
+
+			if (clicked) {
 				st.active_tab = tabs[i];
 				st.selected_skill_name.clear();
 			}
-			ImGui::PopStyleColor(3);
 		}
-		(void)alpha;
 	}
 
 	inline void render_skill_row(ImDrawList* dl, float x, float y, float w, float h,
 		const ::aida::skills::skill_metadata_t& m, bool selected, bool enabled,
-		float ar, float ag, float ab, float alpha)
+		float hov_v, float lift)
 	{
+		const auto& th = aida::ui::resolved();
+		ImVec2 a(x, y - lift);
+		ImVec2 b(x + w, y + h - lift);
+
 		ImU32 row_bg;
 		if (selected) {
-			row_bg = IM_COL32(
-				static_cast<int>(ar * 0.35f * 255.f),
-				static_cast<int>(ag * 0.35f * 255.f),
-				static_cast<int>(ab * 0.35f * 255.f),
-				static_cast<int>(220 * alpha));
+			row_bg = aida::ui::with_alpha(th.selection, 0.85f);
 		} else {
-			row_bg = IM_COL32(28, 28, 36, static_cast<int>(180 * alpha));
+			row_bg = aida::ui::mix(
+				aida::ui::with_alpha(th.panel_header, 0.5f),
+				aida::ui::with_alpha(th.hover_wash, 1.f),
+				hov_v * 0.65f);
 		}
-		dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), row_bg, 4.f);
-		dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h),
-			IM_COL32(255, 255, 255, static_cast<int>(14 * alpha)), 4.f, 0, 0.5f);
+		dl->AddRectFilled(a, b, row_bg, 10.f);
 
-		const float cb_size = 14.f;
-		const float cb_x = x + 8.f;
-		const float cb_y = y + (h - cb_size) * 0.5f;
-		ImU32 cb_border = IM_COL32(160, 160, 180, static_cast<int>(220 * alpha));
-		dl->AddRect(ImVec2(cb_x, cb_y), ImVec2(cb_x + cb_size, cb_y + cb_size), cb_border, 2.f, 0, 1.f);
-		if (enabled) {
-			ImU32 cb_fill = IM_COL32(
-				static_cast<int>(ar * 255.f),
-				static_cast<int>(ag * 255.f),
-				static_cast<int>(ab * 255.f),
-				static_cast<int>(230 * alpha));
-			dl->AddRectFilled(ImVec2(cb_x + 2.f, cb_y + 2.f),
-				ImVec2(cb_x + cb_size - 2.f, cb_y + cb_size - 2.f),
-				cb_fill, 1.5f);
+		if (selected) {
+			dl->AddRect(a, b, th.accent_u32, 10.f, 0, 1.5f);
+		} else {
+			dl->AddRect(a, b,
+				aida::ui::with_alpha(th.border_subtle, 0.5f + 0.4f * hov_v),
+				10.f, 0, 1.f);
 		}
 
-		const float text_x = cb_x + cb_size + 8.f;
+		if (hov_v > 0.05f) {
+			float strength = 0.18f + hov_v * 0.22f;
+			aida::ui::blur::render_drop_shadow(dl, a, b, 10.f, 4, strength,
+				ImVec2(0.f, 3.f * hov_v));
+		}
+
+		const float av_r = 16.f;
+		ImVec2 av_c(a.x + 14.f + av_r, (a.y + b.y) * 0.5f);
+		aida::ui::avatar::render(dl, av_c, av_r, m.name,
+			aida::ui::avatar::kind_t::gradient, true,
+			enabled ? 1.f : 0.55f,
+			aida::ui::fonts::body_strong());
+
+		const float text_x = av_c.x + av_r + 12.f;
 		ImU32 name_col = enabled
-			? IM_COL32(232, 232, 248, static_cast<int>(245 * alpha))
-			: IM_COL32(150, 150, 170, static_cast<int>(180 * alpha));
-		dl->AddText(ImVec2(text_x, y + 6.f), name_col, m.name.c_str());
+			? th.text_primary
+			: aida::ui::with_alpha(th.text_dim, 0.85f);
+		dl->AddText(aida::ui::fonts::body_strong(), 13.f,
+			ImVec2(text_x, a.y + 8.f), name_col, m.name.c_str());
 
-		ImU32 dim_col = IM_COL32(150, 155, 175, static_cast<int>(170 * alpha));
-		const std::string path_short = truncate_text(m.file_path, 60);
-		dl->AddText(ImVec2(text_x, y + 6.f + ImGui::GetFontSize() + 2.f), dim_col, path_short.c_str());
+		std::string short_path = truncate_text(m.file_path, 60);
+		dl->AddText(aida::ui::fonts::caption(), 11.f,
+			ImVec2(text_x, a.y + 26.f),
+			aida::ui::with_alpha(th.text_dim, 0.85f), short_path.c_str());
 
-		const float chips_y = y + 6.f + (ImGui::GetFontSize() + 2.f) * 2.f;
-		render_agent_chips_row(dl, text_x, chips_y, w - (text_x - x) - 8.f, m.agent_slugs, alpha);
+		if (m.source == "global") {
+			ImGui::SetCursorScreenPos(ImVec2(text_x, a.y + 42.f));
+			aida::ui::pill_kind("built-in", aida::ui::pill_kind_t::info,
+				aida::ui::size_t_::sm, false);
+		} else if (m.source == "remote") {
+			ImGui::SetCursorScreenPos(ImVec2(text_x, a.y + 42.f));
+			aida::ui::pill_kind("remote", aida::ui::pill_kind_t::accent,
+				aida::ui::size_t_::sm, true);
+		} else {
+			ImGui::SetCursorScreenPos(ImVec2(text_x, a.y + 42.f));
+			aida::ui::pill_kind("project", aida::ui::pill_kind_t::success,
+				aida::ui::size_t_::sm, false);
+		}
+
+		float tog_x = b.x - 50.f;
+		float tog_y = a.y + (h - 20.f) * 0.5f;
+		ImGui::SetCursorScreenPos(ImVec2(tog_x, tog_y));
 	}
 
-	inline void render_left_column(float x, float y, float w, float h,
-		float ar, float ag, float ab, float alpha)
+	inline void render_left_column(float x, float y, float w, float h, float dt)
 	{
 		auto& st = state();
+		const auto& th = aida::ui::resolved();
 		ImGui::SetCursorScreenPos(ImVec2(x, y));
-		render_tab_strip(x, y, w, ar, ag, ab, alpha);
+		render_tab_strip(x, y, w, dt);
 
-		const float tab_h = 26.f;
-		const float list_y = y + tab_h;
+		const float tab_h = 28.f;
+		const float list_y = y + tab_h + 4.f;
 		const bool remote_tab = (st.active_tab == source_tab_t::remote);
 		const float remote_panel_h = remote_tab ? 180.f : 0.f;
-		const float list_h = h - tab_h - remote_panel_h - (remote_tab ? 6.f : 0.f);
+		const float list_h = h - tab_h - 4.f - remote_panel_h - (remote_tab ? 6.f : 0.f);
 
 		ImGui::SetCursorScreenPos(ImVec2(x, list_y));
 		ImGui::BeginChild("##sm_list_scroll", ImVec2(w, list_h), false,
 			ImGuiWindowFlags_NoBackground);
 
 		const std::string filter_lower = lower_copy(std::string(st.search_buf));
-		std::vector<::aida::skills::skill_metadata_t> filtered;
 		std::string agent_snapshot;
 		{
 			std::lock_guard<std::mutex> lk(state_mutex());
 			agent_snapshot = st.agent_filter;
 		}
-		filtered = snapshot_filtered_for_view(st.active_tab, filter_lower, agent_snapshot);
+		auto filtered = snapshot_filtered_for_view(st.active_tab, filter_lower, agent_snapshot);
 
 		std::set<std::string> disabled_snapshot;
 		{
@@ -549,15 +612,19 @@ namespace skill_manager {
 		}
 
 		auto* dl = ImGui::GetWindowDrawList();
-		const float row_h = 64.f;
-		const float row_gap = 6.f;
+		const float row_h = 76.f;
+		const float row_gap = 8.f;
 		const float row_w = w - 16.f;
 
 		if (filtered.empty()) {
-			const ImVec2 cs = ImGui::GetCursorScreenPos();
-			ImU32 dim = IM_COL32(170, 175, 195, static_cast<int>(220 * alpha));
-			dl->AddText(ImVec2(cs.x + 8.f, cs.y + 8.f), dim, "No skills in this category");
-			ImGui::Dummy(ImVec2(row_w, 32.f));
+			ImVec2 region_pos = ImGui::GetCursorScreenPos();
+			ImVec2 region_size(row_w, list_h - 16.f);
+			aida::ui::empty_state::config_t cfg;
+			cfg.glyph = aida::ui::empty_state::glyph_t::dots;
+			cfg.title = "No skills here";
+			cfg.body = "No skills matched in this category.";
+			cfg.max_width = w * 0.85f;
+			aida::ui::empty_state::render(region_pos, region_size, cfg);
 		}
 
 		for (const auto& m : filtered) {
@@ -566,23 +633,42 @@ namespace skill_manager {
 			const ImVec2 sp = ImGui::GetCursorScreenPos();
 			const bool sel = (st.selected_skill_name == m.name);
 			const bool en = (disabled_snapshot.count(m.name) == 0);
-			render_skill_row(dl, sp.x, sp.y, row_w, row_h, m, sel, en, ar, ag, ab, alpha);
 
-			ImGui::SetCursorScreenPos(sp);
+			row_anim_t* ra = nullptr;
+			{
+				std::lock_guard<std::mutex> lk(state_mutex());
+				ra = &st.row_anims[m.name];
+			}
+
 			ImGui::PushID(m.name.c_str());
-			ImGui::InvisibleButton("##sm_row", ImVec2(row_w, row_h));
-			const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
-			const bool right   = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+			ImGui::SetNextItemAllowOverlap();
+			ImGui::InvisibleButton("##sm_row_btn", ImVec2(row_w, row_h));
+			bool hov = ImGui::IsItemHovered();
+			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+			bool right   = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+			ImGui::PopID();
+
+			float hov_v = ra->hover.tick(hov, dt, aida::motion::spring::playful);
+			float lift = hov_v * 2.f;
+
+			render_skill_row(dl, sp.x, sp.y, row_w, row_h, m, sel, en, hov_v, lift);
+
+			float tog_x = sp.x + row_w - 50.f;
+			float tog_y = sp.y + (row_h - 20.f) * 0.5f - lift;
+			ImGui::SetCursorScreenPos(ImVec2(tog_x, tog_y));
+			ImGui::PushID((std::string("tog_") + m.name).c_str());
+			bool en_local = en;
+			if (aida::ui::toggle_switch("##en", &en_local, aida::ui::size_t_::sm)) {
+				::aida::skills::set_enabled(m.name, en_local);
+			}
+			ImGui::PopID();
+			(void)th;
 
 			const ImVec2 mp = ImGui::GetIO().MousePos;
-			const bool in_cb = mp.x >= sp.x + 6.f && mp.x <= sp.x + 26.f &&
-				mp.y >= sp.y + 6.f && mp.y <= sp.y + 26.f;
-			if (clicked) {
-				if (in_cb) {
-					::aida::skills::set_enabled(m.name, !en);
-				} else {
-					st.selected_skill_name = m.name;
-				}
+			bool on_toggle = (mp.x >= tog_x - 4.f && mp.x <= tog_x + 38.f &&
+				mp.y >= tog_y - 4.f && mp.y <= tog_y + 24.f);
+			if (clicked && !on_toggle) {
+				st.selected_skill_name = m.name;
 			}
 			if (right) ImGui::OpenPopup("##sm_row_ctx");
 
@@ -608,10 +694,8 @@ namespace skill_manager {
 				}
 				ImGui::EndPopup();
 			}
-			ImGui::PopID();
 
-			ImGui::SetCursorScreenPos(sp);
-			ImGui::Dummy(ImVec2(row_w, row_h + row_gap));
+			ImGui::SetCursorScreenPos(ImVec2(sp.x, sp.y + row_h + row_gap));
 		}
 
 		ImGui::EndChild();
@@ -622,18 +706,18 @@ namespace skill_manager {
 			ImGui::BeginChild("##sm_remote_panel", ImVec2(w, remote_panel_h), false,
 				ImGuiWindowFlags_NoBackground);
 
-			auto* dl2 = ImGui::GetWindowDrawList();
+			ImDrawList* dl2 = ImGui::GetWindowDrawList();
 			const ImVec2 rp = ImGui::GetCursorScreenPos();
-			ImU32 hdr = IM_COL32(220, 220, 240, static_cast<int>(220 * alpha));
-			dl2->AddText(ImVec2(rp.x + 8.f, rp.y + 4.f), hdr, "Remote sources");
+			dl2->AddText(aida::ui::fonts::body_strong(), 13.f,
+				ImVec2(rp.x + 8.f, rp.y + 4.f), th.text_primary, "Remote sources");
 
 			ImGui::Dummy(ImVec2(0.f, 22.f));
 
 			const auto urls = ::aida::skills::list_remote_urls();
 			if (urls.empty()) {
-				ImU32 dim = IM_COL32(160, 165, 185, static_cast<int>(200 * alpha));
 				const ImVec2 cs = ImGui::GetCursorScreenPos();
-				dl2->AddText(ImVec2(cs.x + 8.f, cs.y + 4.f), dim,
+				dl2->AddText(aida::ui::fonts::caption(), 12.f,
+					ImVec2(cs.x + 8.f, cs.y + 4.f), th.text_dim,
 					"No remote URLs registered. Use the toolbar above to add one.");
 				ImGui::Dummy(ImVec2(w, 26.f));
 			}
@@ -642,16 +726,25 @@ namespace skill_manager {
 				ImGui::PushID(u.c_str());
 				const ImVec2 cs = ImGui::GetCursorScreenPos();
 				const float row_w_inner = w - 16.f;
-				dl2->AddRectFilled(ImVec2(cs.x + 4.f, cs.y), ImVec2(cs.x + row_w_inner, cs.y + 24.f),
-					IM_COL32(28, 28, 36, static_cast<int>(170 * alpha)), 4.f);
-				dl2->AddText(ImVec2(cs.x + 10.f, cs.y + 4.f),
-					IM_COL32(220, 222, 240, static_cast<int>(230 * alpha)),
-					truncate_text(u, 80).c_str());
+				dl2->AddRectFilled(ImVec2(cs.x + 4.f, cs.y),
+					ImVec2(cs.x + row_w_inner, cs.y + 24.f),
+					aida::ui::with_alpha(th.panel_header, 0.7f), 6.f);
+				dl2->AddText(aida::ui::fonts::caption(), 11.f,
+					ImVec2(cs.x + 10.f, cs.y + 6.f),
+					th.text_secondary, truncate_text(u, 80).c_str());
 
 				ImGui::SetCursorScreenPos(ImVec2(cs.x + row_w_inner - 140.f, cs.y));
-				if (ImGui::SmallButton("Fetch")) start_remote_fetch(u);
+				if (aida::ui::button("Fetch",
+						aida::ui::button_kind_t::secondary,
+						aida::ui::size_t_::sm,
+						ImVec2(60.f, 22.f))) {
+					start_remote_fetch(u);
+				}
 				ImGui::SameLine(0.f, 4.f);
-				if (ImGui::SmallButton("Remove")) {
+				if (aida::ui::button("Remove",
+						aida::ui::button_kind_t::ghost,
+						aida::ui::size_t_::sm,
+						ImVec2(70.f, 22.f))) {
 					if (::aida::skills::remove_remote_url(u)) {
 						toast_notification::push("Removed remote URL",
 							toast_notification::toast_type_t::info, 3.0f);
@@ -678,9 +771,9 @@ namespace skill_manager {
 					for (const auto& e : snap.index.entries) {
 						ImGui::PushID(e.name.c_str());
 						const ImVec2 ec = ImGui::GetCursorScreenPos();
-						dl2->AddText(ImVec2(ec.x + 16.f, ec.y + 2.f),
-							IM_COL32(210, 215, 235, static_cast<int>(220 * alpha)),
-							e.name.c_str());
+						dl2->AddText(aida::ui::fonts::caption(), 11.f,
+							ImVec2(ec.x + 16.f, ec.y + 2.f),
+							th.text_secondary, e.name.c_str());
 						ImGui::SetCursorScreenPos(ImVec2(ec.x + row_w_inner - 80.f, ec.y));
 						std::shared_ptr<install_request_t> req;
 						{
@@ -691,7 +784,12 @@ namespace skill_manager {
 						if (req) {
 							ImGui::TextUnformatted("Installing...");
 						} else {
-							if (ImGui::SmallButton("Install")) start_install(u, e.name);
+							if (aida::ui::button("Install",
+									aida::ui::button_kind_t::primary,
+									aida::ui::size_t_::sm,
+									ImVec2(74.f, 22.f))) {
+								start_install(u, e.name);
+							}
 						}
 						ImGui::SetCursorScreenPos(ImVec2(ec.x, ec.y + 22.f));
 						ImGui::PopID();
@@ -715,10 +813,9 @@ namespace skill_manager {
 	}
 
 	inline void render_middle_column(float x, float y, float w, float h,
-		const ::aida::skills::skill_metadata_t* meta,
-		float ar, float ag, float ab, float alpha)
+		const ::aida::skills::skill_metadata_t* meta, float alpha)
 	{
-		(void)ar; (void)ag; (void)ab;
+		const auto& th = aida::ui::resolved();
 		ImGui::SetCursorScreenPos(ImVec2(x, y));
 		ImGui::BeginChild("##sm_detail_pane", ImVec2(w, h), false,
 			ImGuiWindowFlags_NoBackground);
@@ -726,86 +823,113 @@ namespace skill_manager {
 		const ImVec2 cs = ImGui::GetCursorScreenPos();
 
 		if (meta == nullptr) {
-			ImU32 dim = IM_COL32(170, 175, 195, static_cast<int>(220 * alpha));
-			dl->AddText(ImVec2(cs.x + 8.f, cs.y + 8.f), dim,
-				"Select a skill from the list to view details.");
+			ImVec2 region_pos = cs;
+			ImVec2 region_size(w, h);
+			aida::ui::empty_state::config_t cfg;
+			cfg.glyph = aida::ui::empty_state::glyph_t::dots;
+			cfg.title = "Pick a skill";
+			cfg.body = "Select a skill from the list to view its metadata, agent slugs and placeholder hints.";
+			cfg.max_width = w * 0.8f;
+			aida::ui::empty_state::render(region_pos, region_size, cfg);
 			ImGui::EndChild();
 			return;
 		}
 
-		ImU32 fg = IM_COL32(232, 232, 248, static_cast<int>(245 * alpha));
-		ImU32 dim = IM_COL32(170, 175, 195, static_cast<int>(220 * alpha));
+		const float av_r = 22.f;
+		ImVec2 av_c(cs.x + 16.f + av_r, cs.y + 16.f + av_r);
+		aida::ui::avatar::render(dl, av_c, av_r, meta->name,
+			aida::ui::avatar::kind_t::gradient, true, alpha,
+			aida::ui::fonts::body_strong());
 
-		dl->AddText(ImVec2(cs.x + 8.f, cs.y + 4.f), fg, meta->name.c_str());
-		const float line_h = ImGui::GetFontSize() + 4.f;
-		dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
-			ImVec2(cs.x + 8.f, cs.y + 4.f + line_h), dim,
-			meta->description.c_str(), nullptr, w - 16.f);
+		dl->AddText(aida::ui::fonts::h2(), 18.f,
+			ImVec2(av_c.x + av_r + 14.f, cs.y + 12.f),
+			th.text_primary, meta->name.c_str());
 
-		float cy = cs.y + 4.f + line_h * 3.f;
-		std::string src = "Source: " + source_label(*meta);
-		dl->AddText(ImVec2(cs.x + 8.f, cy), dim, src.c_str());
-		cy += line_h;
+		ImGui::SetCursorScreenPos(ImVec2(av_c.x + av_r + 14.f, cs.y + 38.f));
+		aida::ui::pill_kind(source_label(*meta).c_str(), source_pill_kind(*meta),
+			aida::ui::size_t_::sm, true);
 
-		std::string fp = "Path: " + meta->file_path;
-		dl->AddText(ImVec2(cs.x + 8.f, cy), dim, truncate_text(fp, 80).c_str());
+		const float content_y = cs.y + av_r * 2.f + 32.f;
+		dl->AddText(aida::ui::fonts::body(), 13.f,
+			ImVec2(cs.x + 12.f, content_y),
+			th.text_secondary, meta->description.c_str(),
+			nullptr, w - 24.f);
 
-		ImGui::SetCursorScreenPos(ImVec2(cs.x + 8.f, cy + line_h + 4.f));
-		if (ImGui::SmallButton("Reveal in Explorer")) {
+		float cy = content_y + 56.f;
+		std::string fp = "Path: " + truncate_text(meta->file_path, 80);
+		dl->AddText(aida::ui::fonts::caption(), 11.f,
+			ImVec2(cs.x + 12.f, cy), th.text_dim, fp.c_str());
+
+		ImGui::SetCursorScreenPos(ImVec2(cs.x + 12.f, cy + 22.f));
+		if (aida::ui::button("Reveal",
+				aida::ui::button_kind_t::secondary,
+				aida::ui::size_t_::sm,
+				ImVec2(96.f, 24.f))) {
 			open_path_in_shell(meta->file_path, true);
 		}
 		ImGui::SameLine(0.f, 6.f);
-		if (ImGui::SmallButton("Open file")) {
+		if (aida::ui::button("Open file",
+				aida::ui::button_kind_t::ghost,
+				aida::ui::size_t_::sm,
+				ImVec2(96.f, 24.f))) {
 			open_path_in_shell(meta->file_path, false);
 		}
 		ImGui::SameLine(0.f, 6.f);
 		const bool en = ::aida::skills::is_enabled(meta->name);
-		if (ImGui::SmallButton(en ? "Disable" : "Enable")) {
+		if (aida::ui::button(en ? "Disable" : "Enable",
+				en ? aida::ui::button_kind_t::ghost : aida::ui::button_kind_t::primary,
+				aida::ui::size_t_::sm,
+				ImVec2(96.f, 24.f))) {
 			::aida::skills::set_enabled(meta->name, !en);
 		}
 
-		ImGui::SetCursorScreenPos(ImVec2(cs.x + 8.f, cy + line_h * 2.5f + 4.f));
-		dl->AddText(ImVec2(cs.x + 8.f, cy + line_h * 2.5f + 4.f), dim, "Agent slugs:");
-		float chip_y = cy + line_h * 3.5f + 4.f;
+		float chip_y = cy + 60.f;
+		dl->AddText(aida::ui::fonts::body_em(), 12.f,
+			ImVec2(cs.x + 12.f, chip_y), th.text_secondary, "Agent slugs:");
+		chip_y += 22.f;
 		if (meta->agent_slugs.empty()) {
-			dl->AddText(ImVec2(cs.x + 8.f, chip_y), dim, "(none, available to all primary agents)");
+			dl->AddText(aida::ui::fonts::caption(), 11.f,
+				ImVec2(cs.x + 12.f, chip_y), th.text_dim,
+				"(none, available to all primary agents)");
 		} else {
-			float chip_x = cs.x + 8.f;
+			float cx = cs.x + 12.f;
+			ImGui::SetCursorScreenPos(ImVec2(cx, chip_y));
 			for (const auto& s : meta->agent_slugs) {
-				render_chip(dl, chip_x, chip_y, s,
-					IM_COL32(60, 70, 90, 200),
-					IM_COL32(190, 210, 240, 240), alpha);
+				ImU32 ch_col = aida::ui::brand::hash_color(s.c_str(), 0.6f);
+				ImGui::SetCursorScreenPos(ImVec2(cx, chip_y));
+				aida::ui::components::chip(s.c_str(), ch_col, false);
 				ImVec2 ts = ImGui::CalcTextSize(s.c_str());
-				chip_x += ts.x + 16.f;
-				if (chip_x > cs.x + w - 60.f) {
-					chip_x = cs.x + 8.f;
-					chip_y += ImGui::GetFontSize() + 8.f;
+				cx += ts.x + 24.f;
+				if (cx > cs.x + w - 60.f) {
+					cx = cs.x + 12.f;
+					chip_y += 24.f;
 				}
 			}
 		}
 
-		const float ph_y = chip_y + ImGui::GetFontSize() + 14.f;
-		dl->AddText(ImVec2(cs.x + 8.f, ph_y), dim, "Placeholder hints:");
+		const float ph_y = chip_y + 36.f;
+		dl->AddText(aida::ui::fonts::body_em(), 12.f,
+			ImVec2(cs.x + 12.f, ph_y), th.text_secondary, "Placeholder hints:");
 
 		std::vector<std::string> hints;
 		{
 			std::lock_guard<std::mutex> lk(state_mutex());
 			hints = state().cached_skill_hints;
 		}
-		float hx = cs.x + 8.f;
-		float hy = ph_y + line_h;
+		float hx = cs.x + 12.f;
+		float hy = ph_y + 22.f;
 		if (hints.empty()) {
-			dl->AddText(ImVec2(hx, hy), dim, "(none)");
+			dl->AddText(aida::ui::fonts::caption(), 11.f,
+				ImVec2(hx, hy), th.text_dim, "(none)");
 		} else {
 			for (const auto& ph : hints) {
-				render_chip(dl, hx, hy, ph,
-					IM_COL32(40, 80, 60, 200),
-					IM_COL32(180, 230, 200, 240), alpha);
+				ImGui::SetCursorScreenPos(ImVec2(hx, hy));
+				aida::ui::components::chip(ph.c_str(), th.success, false);
 				ImVec2 ts = ImGui::CalcTextSize(ph.c_str());
-				hx += ts.x + 16.f;
+				hx += ts.x + 24.f;
 				if (hx > cs.x + w - 60.f) {
-					hx = cs.x + 8.f;
-					hy += ImGui::GetFontSize() + 8.f;
+					hx = cs.x + 12.f;
+					hy += 24.f;
 				}
 			}
 		}
@@ -814,33 +938,28 @@ namespace skill_manager {
 	}
 
 	inline void render_right_column(float x, float y, float w, float h,
-		const ::aida::skills::skill_metadata_t* meta,
-		float ar, float ag, float ab, float alpha)
+		const ::aida::skills::skill_metadata_t* meta, float alpha)
 	{
 		auto& st = state();
+		const auto& th = aida::ui::resolved();
 		ImGui::SetCursorScreenPos(ImVec2(x, y));
 		ImGui::BeginChild("##sm_preview_pane", ImVec2(w, h), false,
 			ImGuiWindowFlags_NoBackground);
 
 		const ImVec2 cs = ImGui::GetCursorScreenPos();
 		auto* dl = ImGui::GetWindowDrawList();
-		ImU32 fg = IM_COL32(232, 232, 248, static_cast<int>(245 * alpha));
-		dl->AddText(ImVec2(cs.x + 8.f, cs.y + 4.f), fg, "Preview");
+		dl->AddText(aida::ui::fonts::body_strong(), 13.f,
+			ImVec2(cs.x + 8.f, cs.y + 4.f), th.text_primary, "Preview");
 
-		ImGui::SetCursorScreenPos(ImVec2(cs.x + w - 120.f, cs.y));
-		ImGui::Checkbox("Render##sm_render_toggle", &st.preview_rendered);
+		ImGui::SetCursorScreenPos(ImVec2(cs.x + w - 110.f, cs.y));
+		aida::ui::toggle_switch("Render##sm_render_toggle", &st.preview_rendered,
+			aida::ui::size_t_::sm);
 
-		ImGui::SetCursorScreenPos(ImVec2(cs.x, cs.y + 26.f));
-		ImGui::BeginChild("##sm_preview_scroll", ImVec2(w, h - 30.f), false,
+		ImGui::SetCursorScreenPos(ImVec2(cs.x, cs.y + 30.f));
+		ImGui::BeginChild("##sm_preview_scroll", ImVec2(w, h - 34.f), false,
 			ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
 		if (meta == nullptr) {
-			auto* dl2 = ImGui::GetWindowDrawList();
-			const ImVec2 ic = ImGui::GetCursorScreenPos();
-			ImU32 dim = IM_COL32(170, 175, 195, static_cast<int>(220 * alpha));
-			dl2->AddText(ImVec2(ic.x + 8.f, ic.y + 8.f), dim,
-				"Select a skill to preview its markdown.");
-			ImGui::Dummy(ImVec2(w - 16.f, 32.f));
 			ImGui::EndChild();
 			ImGui::EndChild();
 			return;
@@ -856,15 +975,19 @@ namespace skill_manager {
 		const ImVec2 ic = ImGui::GetCursorScreenPos();
 		const float wrap_w = w - 24.f;
 
+		float ar = globals::ui::accent.x;
+		float ag = globals::ui::accent.y;
+		float ab = globals::ui::accent.z;
+
 		if (st.preview_rendered) {
 			auto rr = chat_render::render_rich_message(idl,
 				ImVec2(ic.x + 4.f, ic.y + 4.f), wrap_w, body,
-				alpha, ar * 255.f, ag * 255.f, ab * 255.f, 0, ImGui::GetIO().DeltaTime, false);
+				alpha, ar * 255.f, ag * 255.f, ab * 255.f, 0,
+				ImGui::GetIO().DeltaTime, false);
 			ImGui::Dummy(ImVec2(wrap_w, std::max(120.f, rr.height + 20.f)));
 		} else {
-			ImU32 mono_col = IM_COL32(220, 222, 240, static_cast<int>(235 * alpha));
-			idl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
-				ImVec2(ic.x + 4.f, ic.y + 4.f), mono_col,
+			idl->AddText(aida::ui::fonts::code(), ImGui::GetFontSize(),
+				ImVec2(ic.x + 4.f, ic.y + 4.f), th.text_primary,
 				body.c_str(), nullptr, wrap_w);
 			ImVec2 ts = ImGui::GetFont()->CalcTextSizeA(ImGui::GetFontSize(),
 				FLT_MAX, wrap_w, body.c_str());
@@ -884,9 +1007,7 @@ namespace skill_manager {
 		poll_pending_remote_fetches();
 		ensure_selected_cached();
 
-		const float ar = globals::ui::accent.x;
-		const float ag = globals::ui::accent.y;
-		const float ab = globals::ui::accent.z;
+		const float dt = aida::ui::clock::dt();
 		const float alpha = 1.0f;
 
 		ImGui::BeginChild("##skill_manager_root", ImVec2(panel_w, panel_h), false,
@@ -899,18 +1020,18 @@ namespace skill_manager {
 		const float root_w = panel_w;
 		const float root_h = panel_h;
 
-		const float toolbar_h = 32.f;
+		const float toolbar_h = 34.f;
 		const float pad = 8.f;
-		render_toolbar(root_x, root_y, root_w, toolbar_h, ar, ag, ab, alpha);
+		render_toolbar(root_x, root_y, root_w, toolbar_h);
 
 		const float body_y = root_y + toolbar_h + 6.f;
 		const float body_h = root_h - (toolbar_h + 8.f);
 
-		const float left_w = std::max(260.f, root_w * st.list_split);
-		const float right_w = std::max(280.f, root_w * st.detail_split);
+		const float left_w = std::max(280.f, root_w * st.list_split);
+		const float right_w = std::max(300.f, root_w * st.detail_split);
 		const float middle_w = std::max(220.f, root_w - left_w - right_w - pad * 2.f);
 
-		render_left_column(root_x + pad, body_y, left_w, body_h, ar, ag, ab, alpha);
+		render_left_column(root_x + pad, body_y, left_w, body_h, dt);
 
 		std::vector<::aida::skills::skill_metadata_t> all_for_lookup = ::aida::skills::all();
 		const ::aida::skills::skill_metadata_t* meta = nullptr;
@@ -919,10 +1040,10 @@ namespace skill_manager {
 		}
 
 		const float middle_x = root_x + pad + left_w + pad;
-		render_middle_column(middle_x, body_y, middle_w, body_h, meta, ar, ag, ab, alpha);
+		render_middle_column(middle_x, body_y, middle_w, body_h, meta, alpha);
 
 		const float right_x = middle_x + middle_w + pad;
-		render_right_column(right_x, body_y, right_w, body_h, meta, ar, ag, ab, alpha);
+		render_right_column(right_x, body_y, right_w, body_h, meta, alpha);
 
 		ImGui::EndChild();
 	}

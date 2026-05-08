@@ -13,6 +13,13 @@
 #include <dwmapi.h>
 #include <shellscalingapi.h>
 #include "helpers/globals.h"
+#include "core/ui/clock.hpp"
+#include "core/ui/motion.hpp"
+#include "core/ui/transition.hpp"
+#include "core/ui/theme.hpp"
+#include "core/ui/blur_layer.hpp"
+#include "core/ui/components.hpp"
+#include "core/ui/fonts.hpp"
 #include "standalone_chat.hpp"
 #include "standalone_license.hpp"
 #include "standalone_settings.hpp"
@@ -83,45 +90,244 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 inline int prev_w = 0;
 inline int prev_h = 0;
 
+ImFont* g_font_ui_400 = nullptr;
+ImFont* g_font_ui_500 = nullptr;
+ImFont* g_font_ui_600 = nullptr;
+ImFont* g_font_ui_700 = nullptr;
+ImFont* g_font_ui_400_lg = nullptr;
+ImFont* g_font_ui_500_sm = nullptr;
+ImFont* g_font_ui_700_xl = nullptr;
+ImFont* g_font_code_400 = nullptr;
+ImFont* g_font_code_600 = nullptr;
+
+static bool font_file_exists(const std::string& path)
+{
+    DWORD attr = GetFileAttributesA(path.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static std::string repo_fonts_dir()
+{
+    char exe[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    std::string s = exe;
+    size_t cut = s.find_last_of('\\');
+    if (cut != std::string::npos) s = s.substr(0, cut);
+    return s + "\\fonts";
+}
+
+static std::string user_fonts_dir()
+{
+    char appdata[MAX_PATH] = {};
+    if (!GetEnvironmentVariableA("LOCALAPPDATA", appdata, MAX_PATH))
+        return {};
+    return std::string(appdata) + "\\Microsoft\\Windows\\Fonts";
+}
+
+static std::string sys_fonts_dir()
+{
+    char win_dir[MAX_PATH] = {};
+    GetWindowsDirectoryA(win_dir, MAX_PATH);
+    return std::string(win_dir) + "\\Fonts";
+}
+
+static ImFont* load_font_with_fallbacks(ImGuiIO& io,
+                                         const char* embed_data, size_t embed_size,
+                                         const std::vector<std::string>& candidate_paths,
+                                         float pixel_size,
+                                         const ImFontConfig& cfg_in)
+{
+    ImFontConfig cfg = cfg_in;
+    cfg.FontDataOwnedByAtlas = true;
+    for (const auto& p : candidate_paths) {
+        if (font_file_exists(p)) {
+            ImFont* f = io.Fonts->AddFontFromFileTTF(p.c_str(), pixel_size, &cfg);
+            if (f) return f;
+        }
+    }
+    if (embed_data && embed_size > 0) {
+        void* copy = IM_ALLOC(embed_size);
+        memcpy(copy, embed_data, embed_size);
+        return io.Fonts->AddFontFromMemoryTTF(copy, (int)embed_size, pixel_size, &cfg);
+    }
+    return nullptr;
+}
+
+static void merge_icon_font(ImGuiIO& io, float pixel_size)
+{
+    static const ImWchar icon_ranges[] = { ICON_MIN_IDE, ICON_MAX_IDE, 0 };
+    ImFontConfig icon_cfg{};
+    icon_cfg.MergeMode = true;
+    icon_cfg.PixelSnapH = true;
+    icon_cfg.GlyphMinAdvanceX = pixel_size;
+    icon_cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
+    void* icon_data_copy = IM_ALLOC(ide_icon_font_size);
+    memcpy(icon_data_copy, ide_icon_font_data, ide_icon_font_size);
+    io.Fonts->AddFontFromMemoryTTF(icon_data_copy, ide_icon_font_size, pixel_size, &icon_cfg, icon_ranges);
+}
+
 static void rebuild_fonts(float dpi_scale)
 {
     ImGuiIO& io = ImGui::GetIO();
     io.Fonts->Clear();
 
-    float font_size = 14.0f * dpi_scale;
-
-    ImFontConfig cfg{};
-    cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_ForceAutoHint | ImGuiFreeTypeBuilderFlags_LightHinting;
-    cfg.PixelSnapH = false;
-    cfg.RasterizerMultiply = 1.0f;
-    io.Fonts->AddFontFromMemoryTTF(
-        (void*)verdana, sizeof(verdana), font_size, &cfg);
-
+    float screen_factor = 1.0f;
     {
-        static const ImWchar icon_ranges[] = { ICON_MIN_IDE, ICON_MAX_IDE, 0 };
-        ImFontConfig icon_cfg{};
-        icon_cfg.MergeMode = true;
-        icon_cfg.PixelSnapH = true;
-        icon_cfg.GlyphMinAdvanceX = font_size;
-        icon_cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_ForceAutoHint | ImGuiFreeTypeBuilderFlags_LightHinting;
-        void* icon_data_copy = IM_ALLOC(ide_icon_font_size);
-        memcpy(icon_data_copy, ide_icon_font_data, ide_icon_font_size);
-        io.Fonts->AddFontFromMemoryTTF(icon_data_copy, ide_icon_font_size, font_size, &icon_cfg, icon_ranges);
+        HMONITOR hm = MonitorFromWindow(g_hwnd ? g_hwnd : GetDesktopWindow(), MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{ sizeof(mi) };
+        if (GetMonitorInfoW(hm, &mi)) {
+            int mw = mi.rcMonitor.right - mi.rcMonitor.left;
+            int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+            int diag = (int)sqrtf((float)(mw * mw + mh * mh));
+            if (diag >= 3000) screen_factor = 1.35f;
+            else if (diag >= 2400) screen_factor = 1.25f;
+            else if (diag >= 2050) screen_factor = 1.18f;
+            else screen_factor = 1.10f;
+        }
     }
 
-    {
-        char win_dir[MAX_PATH];
-        GetWindowsDirectoryA(win_dir, MAX_PATH);
-        std::string consolas_path = std::string(win_dir) + "\\Fonts\\consola.ttf";
-        ImFontConfig mono_cfg{};
-        mono_cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_ForceAutoHint | ImGuiFreeTypeBuilderFlags_LightHinting;
-        mono_cfg.PixelSnapH = true;
-        mono_cfg.RasterizerMultiply = 1.0f;
-        g_code_font = io.Fonts->AddFontFromFileTTF(consolas_path.c_str(), font_size, &mono_cfg);
-    }
+    const float texture_scale = dpi_scale * screen_factor;
+    const float base = 16.0f * texture_scale;
+    const float lg   = 18.0f * texture_scale;
+    const float sm   = 13.0f * texture_scale;
+    const float xl   = 32.0f * texture_scale;
+    const float code = 14.0f * texture_scale;
+    io.FontGlobalScale = 1.0f;
 
+    const bool enable_lcd = dpi_scale >= 1.5f;
+    constexpr unsigned int lcd_flag_value = 1u << 10;
+
+    auto cfg_ui_smooth = [&](float multiply) {
+        ImFontConfig c{};
+        c.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_NoHinting;
+        if (enable_lcd) c.FontBuilderFlags |= lcd_flag_value;
+        c.PixelSnapH = false;
+        c.OversampleH = 3;
+        c.OversampleV = 1;
+        c.RasterizerMultiply = multiply;
+        return c;
+    };
+    auto cfg_ui_hinted = [&](float multiply) {
+        ImFontConfig c{};
+        c.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
+        if (enable_lcd) c.FontBuilderFlags |= lcd_flag_value;
+        c.PixelSnapH = false;
+        c.OversampleH = 3;
+        c.OversampleV = 1;
+        c.RasterizerMultiply = multiply;
+        return c;
+    };
+    auto cfg_mono = [&](float multiply) {
+        ImFontConfig c{};
+        c.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
+        c.PixelSnapH = true;
+        c.OversampleH = 1;
+        c.OversampleV = 1;
+        c.RasterizerMultiply = multiply;
+        return c;
+    };
+
+    const std::string repo_dir = repo_fonts_dir();
+    const std::string user_dir = user_fonts_dir();
+    const std::string sys_dir  = sys_fonts_dir();
+
+    auto inter_paths = [&](const char* fname) -> std::vector<std::string> {
+        std::vector<std::string> v;
+        v.push_back(repo_dir + "\\" + fname);
+        v.push_back(repo_dir + "\\inter\\" + fname);
+        if (!user_dir.empty()) v.push_back(user_dir + "\\" + fname);
+        v.push_back(sys_dir + "\\" + fname);
+        return v;
+    };
+    auto seguivar      = sys_dir + "\\seguivar.ttf";
+    auto segoe_var_alt = sys_dir + "\\SegoeUIVariable.ttf";
+    auto segoe_ui      = sys_dir + "\\segoeui.ttf";
+    auto segoe_uib     = sys_dir + "\\segoeuib.ttf";
+    auto segoe_uisl    = sys_dir + "\\segoeuisl.ttf";
+
+    auto inter_400 = inter_paths("Inter-Regular.ttf");
+    inter_400.push_back(seguivar); inter_400.push_back(segoe_var_alt);
+    inter_400.push_back(segoe_uisl); inter_400.push_back(segoe_ui);
+
+    auto inter_500 = inter_paths("Inter-Medium.ttf");
+    inter_500.push_back(seguivar); inter_500.push_back(segoe_var_alt); inter_500.push_back(segoe_ui);
+
+    auto inter_600 = inter_paths("Inter-SemiBold.ttf");
+    inter_600.push_back(seguivar); inter_600.push_back(segoe_var_alt); inter_600.push_back(segoe_uib); inter_600.push_back(segoe_ui);
+
+    auto inter_700 = inter_paths("Inter-Bold.ttf");
+    inter_700.push_back(seguivar); inter_700.push_back(segoe_var_alt); inter_700.push_back(segoe_uib); inter_700.push_back(segoe_ui);
+
+    auto jbm_paths = [&](const char* fname) -> std::vector<std::string> {
+        std::vector<std::string> v;
+        v.push_back(repo_dir + "\\" + fname);
+        v.push_back(repo_dir + "\\jetbrains-mono\\" + fname);
+        if (!user_dir.empty()) v.push_back(user_dir + "\\" + fname);
+        v.push_back(sys_dir + "\\" + fname);
+        return v;
+    };
+    auto cascadia_mono = sys_dir + "\\CascadiaMono.ttf";
+    auto cascadia_code = sys_dir + "\\CascadiaCode.ttf";
+    auto consolas      = sys_dir + "\\consola.ttf";
+    auto consolasb     = sys_dir + "\\consolab.ttf";
+
+    auto jbm_400 = jbm_paths("JetBrainsMono-Regular.ttf");
+    jbm_400.push_back(cascadia_mono); jbm_400.push_back(cascadia_code); jbm_400.push_back(consolas);
+
+    auto jbm_600 = jbm_paths("JetBrainsMono-SemiBold.ttf");
+    jbm_600.push_back(cascadia_mono); jbm_600.push_back(consolasb); jbm_600.push_back(consolas);
+
+    ImFontConfig c_400 = cfg_ui_smooth(1.15f);
+    ImFontConfig c_500 = cfg_ui_smooth(1.15f);
+    ImFontConfig c_600 = cfg_ui_hinted(1.05f);
+    ImFontConfig c_700 = cfg_ui_hinted(1.05f);
+    ImFontConfig c_mono = cfg_mono(1.00f);
+
+    g_font_ui_400 = load_font_with_fallbacks(io, (const char*)verdana, sizeof(verdana),
+                                              inter_400, base, c_400);
+    merge_icon_font(io, base);
+
+    g_font_ui_500 = load_font_with_fallbacks(io, (const char*)verdana, sizeof(verdana),
+                                              inter_500, base, c_500);
+    g_font_ui_600 = load_font_with_fallbacks(io, (const char*)verdana, sizeof(verdana),
+                                              inter_600, base, c_600);
+    g_font_ui_700 = load_font_with_fallbacks(io, (const char*)verdana, sizeof(verdana),
+                                              inter_700, base, c_700);
+    g_font_ui_400_lg = load_font_with_fallbacks(io, (const char*)verdana, sizeof(verdana),
+                                                 inter_400, lg, c_400);
+    g_font_ui_500_sm = load_font_with_fallbacks(io, (const char*)verdana, sizeof(verdana),
+                                                 inter_500, sm, c_500);
+    g_font_ui_700_xl = load_font_with_fallbacks(io, (const char*)verdana, sizeof(verdana),
+                                                 inter_700, xl, c_700);
+
+    g_font_code_400 = load_font_with_fallbacks(io, nullptr, 0, jbm_400, code, c_mono);
+    g_font_code_600 = load_font_with_fallbacks(io, nullptr, 0, jbm_600, code, c_mono);
+    if (!g_font_code_400) g_font_code_400 = g_font_ui_400;
+    if (!g_font_code_600) g_font_code_600 = g_font_code_400;
+
+    g_code_font = g_font_code_400;
+    if (!g_font_ui_400) g_font_ui_400 = io.Fonts->Fonts.empty() ? nullptr : io.Fonts->Fonts[0];
+    if (!g_font_ui_500) g_font_ui_500 = g_font_ui_400;
+    if (!g_font_ui_600) g_font_ui_600 = g_font_ui_400;
+    if (!g_font_ui_700) g_font_ui_700 = g_font_ui_400;
+    if (!g_font_ui_400_lg) g_font_ui_400_lg = g_font_ui_400;
+    if (!g_font_ui_500_sm) g_font_ui_500_sm = g_font_ui_400;
+    if (!g_font_ui_700_xl) g_font_ui_700_xl = g_font_ui_700;
+
+    io.FontDefault = g_font_ui_400;
     io.Fonts->Build();
-    ImGui_ImplDX11_InvalidateDeviceObjects();
+    extern bool g_imgui_dx11_initialized;
+    if (g_imgui_dx11_initialized) {
+        ImGui_ImplDX11_InvalidateDeviceObjects();
+    }
+}
+
+bool g_imgui_dx11_initialized = false;
+
+static DWORD compute_acrylic_color_for_theme()
+{
+    const auto& t = aida::ui::resolved();
+    return (DWORD)t.acrylic_color;
 }
 
 void set_acrylic_color(HWND hwnd)
@@ -133,12 +339,35 @@ void set_acrylic_color(HWND hwnd)
         GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute");
     if (!SetWindowCompositionAttribute) return;
 
-
-    DWORD color = (DWORD(5) << 0) | (DWORD(12) << 8) | (DWORD(65) << 16) | (DWORD(0xC0) << 24);
+    DWORD color = compute_acrylic_color_for_theme();
     ACCENT_POLICY accent = { 3, 2, color, 0 };
 
     WINCOMPATTRDATA data = { 19, &accent, sizeof(accent) };
     SetWindowCompositionAttribute(hwnd, &data);
+}
+
+static bool os_prefers_dark()
+{
+    HKEY hk;
+    LONG ok = RegOpenKeyExW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        0, KEY_READ, &hk);
+    if (ok != ERROR_SUCCESS) return true;
+    DWORD val = 1, sz = sizeof(val), type = 0;
+    ok = RegQueryValueExW(hk, L"AppsUseLightTheme", nullptr, &type,
+                          reinterpret_cast<BYTE*>(&val), &sz);
+    RegCloseKey(hk);
+    if (ok != ERROR_SUCCESS) return true;
+    return val == 0;
+}
+
+static void apply_initial_theme()
+{
+    aida::ui::apply_immediate(aida::ui::detail::make_midnight_dark());
+}
+
+static void apply_os_theme_animated()
+{
 }
 
 static void crash_log_write(const char* msg)
@@ -793,66 +1022,20 @@ int main(int, char**)
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
 
 
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.ChildBorderSize = 0.0f;
-    style.WindowBorderSize = 0.0f;
-    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.059f, 0.059f, 0.078f, 1.f);
-    style.Colors[ImGuiCol_ScrollbarBg] = ImVec4(0.f, 0.f, 0.f, 0.f);
-    style.Colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.35f, 0.33f, 0.48f, 0.30f);
-    style.Colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.45f, 0.42f, 0.60f, 0.50f);
-    style.Colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.55f, 0.50f, 0.72f, 0.65f);
-
-    style.WindowRounding = 8.0f;
-    style.ChildRounding = 6.0f;
-    style.FrameRounding = 6.0f;
-    style.PopupRounding = 8.0f;
-    style.ScrollbarRounding = 6.0f;
-    style.GrabRounding = 4.0f;
-    style.TabRounding = 4.0f;
-    style.ScrollbarSize = 4.f;
     {
         UINT dpi = GetDpiForWindow(hwnd);
         globals::ui::dpi_scale = (dpi > 0) ? (static_cast<float>(dpi) / 96.0f) : 1.0f;
     }
 
-    float font_size = 14.0f * globals::ui::dpi_scale;
-    ImFontConfig cfg{};
-    cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_ForceAutoHint | ImGuiFreeTypeBuilderFlags_LightHinting;
-    cfg.PixelSnapH = false;
-    cfg.RasterizerMultiply = 1.0f;
+    apply_initial_theme();
 
-
-    io.Fonts->AddFontFromMemoryTTF(
-        (void*)verdana, sizeof(verdana), font_size, &cfg);
-
-
-    {
-        static const ImWchar icon_ranges[] = { ICON_MIN_IDE, ICON_MAX_IDE, 0 };
-        ImFontConfig icon_cfg{};
-        icon_cfg.MergeMode = true;
-        icon_cfg.PixelSnapH = true;
-        icon_cfg.GlyphMinAdvanceX = font_size;
-        icon_cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_ForceAutoHint | ImGuiFreeTypeBuilderFlags_LightHinting;
-        void* icon_data_copy = IM_ALLOC(ide_icon_font_size);
-        memcpy(icon_data_copy, ide_icon_font_data, ide_icon_font_size);
-        io.Fonts->AddFontFromMemoryTTF(icon_data_copy, ide_icon_font_size, font_size, &icon_cfg, icon_ranges);
-    }
-
-    {
-        char win_dir[MAX_PATH];
-        GetWindowsDirectoryA(win_dir, MAX_PATH);
-        std::string consolas_path = std::string(win_dir) + "\\Fonts\\consola.ttf";
-        ImFontConfig mono_cfg{};
-        mono_cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_ForceAutoHint | ImGuiFreeTypeBuilderFlags_LightHinting;
-        mono_cfg.PixelSnapH = true;
-        mono_cfg.RasterizerMultiply = 1.0f;
-        g_code_font = io.Fonts->AddFontFromFileTTF(consolas_path.c_str(), font_size, &mono_cfg);
-    }
+    rebuild_fonts(globals::ui::dpi_scale);
 
     crash_log_write("fonts_built");
     ImGui_ImplWin32_Init(hwnd);
     crash_log_write("imgui_win32_init_ok");
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+    g_imgui_dx11_initialized = true;
     crash_log_write("imgui_dx11_init_ok");
     D3D11_BLEND_DESC blend_desc = {};
     blend_desc.RenderTarget[0].BlendEnable = TRUE;
@@ -875,6 +1058,8 @@ int main(int, char**)
 
     static std::atomic<bool> bg_init_done{false};
     globals::ui::bg_init_done = &bg_init_done;
+    globals::ui::bg_init_total.store(7, std::memory_order_release);
+    globals::ui::bg_init_step.store(0, std::memory_order_release);
     std::thread([]() {
         diag::log_tagged("bg_init", "thread_entry");
 
@@ -883,36 +1068,42 @@ int main(int, char**)
         if (seh_chat != 0)
             diag::log_tagged_fmt("bg_init", "init_standalone_chat_seh code=0x%08X last_err=%lu", seh_chat, GetLastError());
         diag::log_tagged("bg_init", "standalone_chat_init_ok");
+        globals::ui::bg_init_step.store(1, std::memory_order_release);
 
         diag::log_tagged("bg_init", "network_view_init_start");
         DWORD seh_nv = seh_network_view_initialize();
         if (seh_nv != 0)
             diag::log_tagged_fmt("bg_init", "network_view_init_seh code=0x%08X last_err=%lu", seh_nv, GetLastError());
         diag::log_tagged("bg_init", "network_view_init_ok");
+        globals::ui::bg_init_step.store(2, std::memory_order_release);
 
         diag::log_tagged("bg_init", "memory_scanner_init_start");
         DWORD seh_ms = seh_memory_scanner_initialize();
         if (seh_ms != 0)
             diag::log_tagged_fmt("bg_init", "memory_scanner_init_seh code=0x%08X last_err=%lu", seh_ms, GetLastError());
         diag::log_tagged("bg_init", "memory_scanner_init_ok");
+        globals::ui::bg_init_step.store(3, std::memory_order_release);
 
         diag::log_tagged("bg_init", "mitm_proxy_pre_init_start");
         DWORD seh_mp = seh_mitm_proxy_pre_initialize();
         if (seh_mp != 0)
             diag::log_tagged_fmt("bg_init", "mitm_proxy_pre_init_seh code=0x%08X last_err=%lu", seh_mp, GetLastError());
         diag::log_tagged("bg_init", "mitm_proxy_pre_init_ok");
+        globals::ui::bg_init_step.store(4, std::memory_order_release);
 
         diag::log_tagged("bg_init", "script_engine_init_start");
         DWORD seh_se = seh_script_engine_initialize();
         if (seh_se != 0)
             diag::log_tagged_fmt("bg_init", "script_engine_init_seh code=0x%08X last_err=%lu", seh_se, GetLastError());
         diag::log_tagged("bg_init", "script_engine_init_ok");
+        globals::ui::bg_init_step.store(5, std::memory_order_release);
 
         diag::log_tagged("bg_init", "code_hashes_snapshot_start");
         DWORD seh_ch = seh_snapshot_code_hashes();
         if (seh_ch != 0)
             diag::log_tagged_fmt("bg_init", "code_hashes_snapshot_seh code=0x%08X last_err=%lu", seh_ch, GetLastError());
         diag::log_tagged("bg_init", "code_hashes_snapshot_ok");
+        globals::ui::bg_init_step.store(6, std::memory_order_release);
 
         diag::log_tagged("bg_init", "anti_tamper_initialize_entering");
         bool at_result = false;
@@ -920,6 +1111,7 @@ int main(int, char**)
         if (seh_at != 0)
             diag::log_tagged_fmt("bg_init", "anti_tamper_initialize_seh code=0x%08X last_err=%lu", seh_at, GetLastError());
         diag::log_tagged_fmt("bg_init", "anti_tamper_initialize_result=%d", at_result ? 1 : 0);
+        globals::ui::bg_init_step.store(7, std::memory_order_release);
 
         bg_init_done.store(true, std::memory_order_release);
         diag::log_tagged("bg_init", "thread_exit");
@@ -957,22 +1149,23 @@ int main(int, char**)
         if ((frame_number >= 270ULL && frame_number <= 320ULL))
             diag::log_tagged_critical_fmt("render", "phase=frame_top frame=%llu", (unsigned long long)frame_number);
 
-        if (themes::changed)
         {
-            themes::changed = false;
+            static DWORD s_last_acrylic_applied = 0;
+            DWORD now_acrylic = (DWORD)aida::ui::resolved().acrylic_color;
+            if (themes::changed || s_last_acrylic_applied != now_acrylic)
+            {
+                themes::changed = false;
+                s_last_acrylic_applied = now_acrylic;
 
-            auto& t = themes::resolved;
-            globals::ui::accent = t.accent;
-
-
-            struct ACCENT_POLICY_T { DWORD AccentState; DWORD AccentFlags; DWORD GradientColor; DWORD AnimationId; };
-            struct WINCOMPATTRDATA_T { DWORD Attribute; PVOID pData; ULONG DataSize; };
-            auto SetWCA = (BOOL(WINAPI*)(HWND, void*))
-                GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute");
-            if (SetWCA) {
-                ACCENT_POLICY_T ap = { 3, 2, t.acrylic_color, 0 };
-                WINCOMPATTRDATA_T wd = { 19, &ap, sizeof(ap) };
-                SetWCA(hwnd, &wd);
+                struct ACCENT_POLICY_T { DWORD AccentState; DWORD AccentFlags; DWORD GradientColor; DWORD AnimationId; };
+                struct WINCOMPATTRDATA_T { DWORD Attribute; PVOID pData; ULONG DataSize; };
+                auto SetWCA = (BOOL(WINAPI*)(HWND, void*))
+                    GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute");
+                if (SetWCA) {
+                    ACCENT_POLICY_T ap = { 3, 2, now_acrylic, 0 };
+                    WINCOMPATTRDATA_T wd = { 19, &ap, sizeof(ap) };
+                    SetWCA(hwnd, &wd);
+                }
             }
         }
 
@@ -1032,6 +1225,7 @@ int main(int, char**)
         static bool s_arc_startup_gate_passed = false;
         if (!s_arc_startup_gate_passed && cur_state == 3 && standalone_license::is_arc_loaded())
         {
+            globals::ui::arc_unseal_phase.store(1, std::memory_order_release);
             uint8_t gate_nonce[32] = {};
             const std::string sess_tok = standalone_license::get_session_token();
             size_t cp = sess_tok.size();
@@ -1047,6 +1241,7 @@ int main(int, char**)
                 gate_nonce, sizeof(gate_nonce),
                 poly_seed, &poly_seed_len, sizeof(poly_seed));
             if (!unseal_ok || poly_seed_len != 32) {
+                globals::ui::arc_unseal_phase.store(3, std::memory_order_release);
                 SecureZeroMemory(poly_seed, sizeof(poly_seed));
                 SecureZeroMemory(gate_nonce, sizeof(gate_nonce));
                 __fastfail(0xA1DAFA17u);
@@ -1054,6 +1249,7 @@ int main(int, char**)
             SecureZeroMemory(poly_seed, sizeof(poly_seed));
             SecureZeroMemory(gate_nonce, sizeof(gate_nonce));
             s_arc_startup_gate_passed = true;
+            globals::ui::arc_unseal_phase.store(2, std::memory_order_release);
         }
 
 
@@ -1139,6 +1335,24 @@ int main(int, char**)
         if (seh_inf != 0)
             diag::log_tagged_critical_fmt("render", "SEH_in_imgui_new_frame code=0x%08X frame=%llu",
                 seh_inf, (unsigned long long)frame_number);
+
+        aida::ui::clock::tick();
+        aida::ui::tick_theme_animation(aida::ui::clock::dt());
+        aida::ui::blur::clear_pending();
+        {
+            const auto& __t = aida::ui::resolved();
+            themes::resolved.name = "AiDA";
+            themes::resolved.accent = __t.accent;
+            themes::resolved.bg_base = __t.bg_base;
+            themes::resolved.panel_bg = __t.panel_bg;
+            themes::resolved.panel_header = __t.panel_header;
+            themes::resolved.title_bar = __t.title_bar;
+            themes::resolved.text_primary = __t.text_primary;
+            themes::resolved.text_secondary = __t.text_secondary;
+            themes::resolved.text_dim = __t.text_dim;
+            themes::resolved.acrylic_color = (DWORD)__t.acrylic_color;
+            globals::ui::accent = __t.accent;
+        }
 
         {
             if (frame_number < 5)
@@ -1249,6 +1463,7 @@ int main(int, char**)
     ::DestroyWindow(hwnd);
     ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
 
+    ExitProcess(0);
     return 0;
 }
 
@@ -1294,9 +1509,20 @@ void CleanupDeviceD3D()
 
 void CreateRenderTarget()
 {
-    ID3D11Texture2D* pBackBuffer;
+    ID3D11Texture2D* pBackBuffer = nullptr;
     g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
+    if (!pBackBuffer) return;
     g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
+
+    D3D11_TEXTURE2D_DESC d{};
+    pBackBuffer->GetDesc(&d);
+    int bw = (int)(d.Width  / 4u);
+    int bh = (int)(d.Height / 4u);
+    if (bw < 64) bw = 64;
+    if (bh < 64) bh = 64;
+    Blur::Resize(bw, bh);
+    aida::ui::blur::mark_supported(true);
+
     pBackBuffer->Release();
 }
 
@@ -1385,6 +1611,17 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             suggested->bottom - suggested->top,
             SWP_NOZORDER | SWP_NOACTIVATE);
         rebuild_fonts(globals::ui::dpi_scale);
+        return 0;
+    }
+    case WM_SETTINGCHANGE:
+    {
+        if (lParam) {
+            const wchar_t* p = reinterpret_cast<const wchar_t*>(lParam);
+            if (p && (wcscmp(p, L"ImmersiveColorSet") == 0 ||
+                      wcscmp(p, L"WindowsThemeElement") == 0)) {
+                apply_os_theme_animated();
+            }
+        }
         return 0;
     }
     case WM_DESTROY:

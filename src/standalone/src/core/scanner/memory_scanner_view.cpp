@@ -3,6 +3,14 @@
 #include "standalone_driver.hpp"
 #include "../helpers/globals.h"
 #include "ui_anim.hpp"
+#include "../ui/theme.hpp"
+#include "../ui/components.hpp"
+#include "../ui/clock.hpp"
+#include "../ui/transition.hpp"
+#include "../ui/empty_state.hpp"
+#include "../ui/skeleton.hpp"
+#include "../ui/blur_layer.hpp"
+#include "../ui/fonts.hpp"
 
 #include "imgui/imgui.h"
 
@@ -11,68 +19,33 @@
 #include <cstdio>
 #include <cstring>
 #include <cinttypes>
+#include <unordered_set>
 
 namespace memory_scanner_view {
 
-
-static bool row_hover(ImDrawList* dl, float x0, float y0, float x1, float y1,
-					  float alpha, bool selected, float ar, float ag, float ab) {
-	const auto& _t = themes::resolved;
-	bool hov = ImGui::IsMouseHoveringRect(ImVec2(x0, y0), ImVec2(x1, y1), false);
-	if (selected) {
-		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1),
-			IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
-					 static_cast<int>(ab*255), static_cast<int>(30*alpha)), 3.f);
-		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + 3.f, y1),
-			IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
-					 static_cast<int>(ab*255), static_cast<int>(200*alpha)));
-		for (int gi = 1; gi <= 3; ++gi) {
-			float ga = (0.08f - static_cast<float>(gi) * 0.02f) * alpha;
-			dl->AddRectFilled(ImVec2(x0, y0 - static_cast<float>(gi)),
-				ImVec2(x1, y1 + static_cast<float>(gi)),
-				IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
-						 static_cast<int>(ab*255), static_cast<int>(ga * 255.f)), 2.f);
-		}
-	} else if (hov) {
-		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1),
-			ui_anim::theme_alpha(_t.panel_header, alpha), 3.f);
-		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + 2.f, y1),
-			IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
-					 static_cast<int>(ab*255), static_cast<int>(80*alpha)));
-	}
-	return hov;
-}
-
-
-static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a,
-						   float ar, float ag, float ab) {
+static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
 	auto& sc = memory_scanner::g_state;
 	auto& ui = g_ui;
+	const auto& t = aida::ui::resolved();
 
-	const auto& _t = themes::resolved;
-	const auto _ta = [a](ImU32 c) -> ImU32 {
-		return ui_anim::theme_alpha(c, a);
-	};
+	const float h = 44.f;
+	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + h),
+		aida::ui::with_alpha(t.panel_header, a));
+	dl->AddLine(ImVec2(ox, oy + h),
+		ImVec2(ox + w, oy + h),
+		aida::ui::with_alpha(t.border_subtle, a), 1.f);
 
-	ImU32 text_col  = _ta(_t.text_primary);
-	ImU32 dim_col   = _ta(_t.text_secondary);
-	ImU32 ac_col    = IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
-								static_cast<int>(ab*255), static_cast<int>(220*a));
-
-	ui_anim::render_toolbar(dl, ox, oy, w, 34.f, a, ar, ag, ab);
-	dl->AddLine(ImVec2(ox, oy + 34.f), ImVec2(ox + w, oy + 34.f),
-		_ta(ui_anim::lighten(_t.panel_bg, 12)));
-
-	float pad = 8.f;
-	float cy = oy + pad;
+	float pad = 12.f;
+	float cy = oy + (h - 32.f) * 0.5f;
 	float cx = ox + pad;
 
-
-	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
-	ImGui::PushItemWidth(90.f);
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
-	ImGui::PushStyleColor(ImGuiCol_Text, text_col);
-	ImGui::PushStyleColor(ImGuiCol_PopupBg, _ta(_t.panel_bg));
+	ImGui::SetCursorScreenPos(ImVec2(cx, cy + 4.f));
+	ImGui::PushItemWidth(110.f);
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(t.panel_bg, a));
+	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, a));
+	ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::with_alpha(t.bg_overlay, 1.f));
+	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(t.border_subtle, a));
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f);
 	if (ImGui::BeginCombo("##vtype", memory_scanner::value_type_name(sc.config.value_type))) {
 		for (int i = 0; i < static_cast<int>(memory_scanner::value_type_t::COUNT); ++i) {
 			auto vt = static_cast<memory_scanner::value_type_t>(i);
@@ -82,16 +55,18 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a,
 		}
 		ImGui::EndCombo();
 	}
-	ImGui::PopStyleColor(3);
+	ImGui::PopStyleVar();
+	ImGui::PopStyleColor(4);
 	ImGui::PopItemWidth();
-	cx += 100.f;
+	cx += 120.f;
 
-
-	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
-	ImGui::PushItemWidth(120.f);
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
-	ImGui::PushStyleColor(ImGuiCol_Text, text_col);
-	ImGui::PushStyleColor(ImGuiCol_PopupBg, _ta(_t.panel_bg));
+	ImGui::SetCursorScreenPos(ImVec2(cx, cy + 4.f));
+	ImGui::PushItemWidth(140.f);
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(t.panel_bg, a));
+	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, a));
+	ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::with_alpha(t.bg_overlay, 1.f));
+	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(t.border_subtle, a));
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f);
 	if (ImGui::BeginCombo("##smode", memory_scanner::scan_mode_name(sc.config.scan_mode))) {
 		for (int i = 0; i < static_cast<int>(memory_scanner::scan_mode_t::COUNT); ++i) {
 			auto sm = static_cast<memory_scanner::scan_mode_t>(i);
@@ -101,10 +76,10 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a,
 		}
 		ImGui::EndCombo();
 	}
-	ImGui::PopStyleColor(3);
+	ImGui::PopStyleVar();
+	ImGui::PopStyleColor(4);
 	ImGui::PopItemWidth();
-	cx += 130.f;
-
+	cx += 150.f;
 
 	bool needs_value = (sc.config.scan_mode != memory_scanner::scan_mode_t::changed &&
 						sc.config.scan_mode != memory_scanner::scan_mode_t::unchanged &&
@@ -113,147 +88,153 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a,
 						sc.config.scan_mode != memory_scanner::scan_mode_t::unknown_initial);
 
 	if (needs_value) {
-		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
-		ImGui::PushItemWidth(140.f);
-		ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
-		ImGui::PushStyleColor(ImGuiCol_Text, text_col);
-		ImGui::InputText("##val", ui.value_buf, sizeof(ui.value_buf));
-		ImGui::PopStyleColor(2);
-		ImGui::PopItemWidth();
-		cx += 150.f;
+		ImGui::SetCursorScreenPos(ImVec2(cx, cy + 4.f));
+		aida::ui::input_text("##val", ui.value_buf, sizeof(ui.value_buf),
+			"value", false, ImVec2(160.f, 28.f));
+		cx += 170.f;
 	}
 
 	if (sc.config.scan_mode == memory_scanner::scan_mode_t::value_between) {
-		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
-		dl->AddText(ImVec2(cx, cy + 2.f), dim_col, "to");
+		dl->AddText(aida::ui::fonts::caption(), 12.f,
+			ImVec2(cx, cy + 10.f),
+			aida::ui::with_alpha(t.text_dim, a), "to");
 		cx += 22.f;
-		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
-		ImGui::PushItemWidth(100.f);
-		ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
-		ImGui::PushStyleColor(ImGuiCol_Text, text_col);
-		ImGui::InputText("##val2", ui.value_buf2, sizeof(ui.value_buf2));
-		ImGui::PopStyleColor(2);
-		ImGui::PopItemWidth();
-		cx += 110.f;
+		ImGui::SetCursorScreenPos(ImVec2(cx, cy + 4.f));
+		aida::ui::input_text("##val2", ui.value_buf2, sizeof(ui.value_buf2),
+			"max", false, ImVec2(120.f, 28.f));
+		cx += 130.f;
 	}
 
-
-	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
-	ImGui::PushStyleColor(ImGuiCol_CheckMark, ac_col);
-	ImGui::Checkbox("Hex##shex", &sc.config.hex_input);
-	ImGui::PopStyleColor(2);
-	cx += 50.f;
-
-
-	static float scan_btn_hover[4] = {};
-	int scan_btn_idx = 0;
-	float sdt = ImGui::GetIO().DeltaTime;
-	auto scan_btn = [&](const char* label, bool enabled) -> bool {
-		float bw = ui_anim::toolbar_button_width(label);
-		int idx = scan_btn_idx++;
-		if (idx >= 4) idx = 3;
-		bool clicked = ui_anim::render_toolbar_button(dl, label, cx, cy,
-			ar, ag, ab, a, scan_btn_hover[idx], sdt, false, !enabled);
-		cx += bw + 6.f;
-		return clicked;
-	};
+	{
+		float tw = 28.f;
+		float th = 28.f;
+		ImGui::SetCursorScreenPos(ImVec2(cx, cy + 4.f));
+		ImGui::PushID("hex_toggle");
+		ImGui::InvisibleButton("##hex_b", ImVec2(tw + 26.f, th));
+		bool clk = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+		bool hov = ImGui::IsItemHovered();
+		if (clk) sc.config.hex_input = !sc.config.hex_input;
+		ImU32 fill = sc.config.hex_input ? aida::ui::with_alpha(t.accent_dim, a)
+		                                  : aida::ui::with_alpha(t.panel_bg, a);
+		ImU32 bord = sc.config.hex_input ? aida::ui::with_alpha(t.accent_u32, a)
+		                                  : aida::ui::with_alpha(t.border_subtle, a);
+		if (hov) bord = aida::ui::with_alpha(t.accent_u32, a);
+		ImVec2 ba(cx, cy + 4.f);
+		ImVec2 bb(cx + tw, cy + 4.f + th);
+		dl->AddRectFilled(ba, bb, fill, 8.f);
+		dl->AddRect(ba, bb, bord, 8.f, 0, 1.f);
+		ImVec2 ts = ImGui::CalcTextSize("0x");
+		dl->AddText(ImVec2(ba.x + (tw - ts.x) * 0.5f, ba.y + (th - ts.y) * 0.5f),
+			sc.config.hex_input ? aida::ui::with_alpha(t.accent_u32, a)
+			                    : aida::ui::with_alpha(t.text_secondary, a), "0x");
+		ImGui::PopID();
+		cx += tw + 8.f;
+	}
 
 	bool scanning = sc.scanning.load();
 	bool attached = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
 
+	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 	if (!sc.has_initial_scan) {
-		if (scan_btn("First Scan", attached && !scanning)) {
+		if (aida::ui::button("First Scan", aida::ui::button_kind_t::primary,
+				aida::ui::size_t_::md, ImVec2(0.f, 0.f), !(attached && !scanning))) {
 			sc.config.value_text = ui.value_buf;
 			sc.config.value_text2 = ui.value_buf2;
 			memory_scanner::first_scan(sc.config);
 		}
 	} else {
-		if (scan_btn("Next Scan", !scanning)) {
+		if (aida::ui::button("Next Scan", aida::ui::button_kind_t::primary,
+				aida::ui::size_t_::md, ImVec2(0.f, 0.f), scanning)) {
 			memory_scanner::next_scan(sc.config.scan_mode, std::string(ui.value_buf), std::string(ui.value_buf2));
 		}
 	}
+	cx += 110.f;
 
-	if (scan_btn("Undo", sc.has_initial_scan && !scanning))
+	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+	if (aida::ui::button("Undo", aida::ui::button_kind_t::secondary,
+			aida::ui::size_t_::md, ImVec2(0.f, 0.f), !(sc.has_initial_scan && !scanning))) {
 		memory_scanner::undo_scan();
+	}
+	cx += 78.f;
 
-	if (scan_btn("Reset", !scanning))
+	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+	if (aida::ui::button("Reset", aida::ui::button_kind_t::ghost,
+			aida::ui::size_t_::md, ImVec2(0.f, 0.f), scanning)) {
 		memory_scanner::reset_scan();
-
+	}
+	cx += 80.f;
 
 	if (scanning) {
 		float prog = sc.scan_progress.load();
-		float ring_r = 10.f;
-		float ring_cx = cx + ring_r + 2.f;
-		float ring_cy = cy + 11.f;
-		ui_anim::render_progress_ring(dl, ring_cx, ring_cy, ring_r, 2.5f, prog,
-			_ta(_t.panel_bg), ac_col);
+		float ring_r = 12.f;
+		float ring_cx = cx + ring_r + 4.f;
+		float ring_cy = oy + h * 0.5f;
+		aida::ui::render_progress_ring(ImVec2(ring_cx, ring_cy), ring_r, 2.5f, prog, false);
+
 		char pct_buf[8];
 		snprintf(pct_buf, sizeof(pct_buf), "%d%%", static_cast<int>(prog * 100.f));
 		ImVec2 pct_sz = ImGui::CalcTextSize(pct_buf);
-		dl->AddText(ImVec2(ring_cx - pct_sz.x * 0.5f, ring_cy - pct_sz.y * 0.5f),
-			text_col, pct_buf);
-		cx += ring_r * 2.f + 8.f;
-		ui_anim::render_spinner(dl, cx + 8.f, cy + 11.f, 7.f, 2.f,
-			ac_col, static_cast<float>(ImGui::GetTime()));
-		cx += 24.f;
+		dl->AddText(aida::ui::fonts::caption(), 11.f,
+			ImVec2(ring_cx - pct_sz.x * 0.5f, ring_cy - pct_sz.y * 0.5f),
+			aida::ui::with_alpha(t.text_primary, a), pct_buf);
+		cx += ring_r * 2.f + 14.f;
 	}
-
 
 	{
 		char count_buf[64];
 		snprintf(count_buf, sizeof(count_buf), "%zu found", sc.total_found);
 		ImVec2 cts = ImGui::CalcTextSize(count_buf);
-		dl->AddText(ImVec2(ox + w - pad - cts.x, cy + 2.f), dim_col, count_buf);
+		dl->AddText(aida::ui::fonts::caption(), 12.f,
+			ImVec2(ox + w - pad - cts.x, oy + (h - cts.y) * 0.5f),
+			aida::ui::with_alpha(t.text_secondary, a), count_buf);
 	}
 }
 
-
-static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
-						   float a, float ar, float ag, float ab) {
+static void render_results(ImDrawList* dl, float ox, float oy, float w, float h, float a) {
 	auto& sc = memory_scanner::g_state;
 	auto& ui = g_ui;
+	const auto& t = aida::ui::resolved();
 
-	const auto& _t = themes::resolved;
-	const auto _ta = [a](ImU32 c) -> ImU32 {
-		return ui_anim::theme_alpha(c, a);
-	};
+	float row_h = 24.f;
+	float hdr_h = 26.f;
 
-	ImU32 text_col  = _ta(_t.text_primary);
-	ImU32 dim_col   = _ta(_t.text_secondary);
-	ImU32 addr_col  = _ta(ui_anim::lighten(_t.text_secondary, 30));
-	ImU32 val_col   = IM_COL32(180, 220, 160, static_cast<int>(220*a));
-	ImU32 prev_col  = _ta(_t.text_dim);
+	ImU32 hdr_bg = aida::ui::with_alpha(t.panel_header, a * 0.85f);
+	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + hdr_h), hdr_bg);
+	dl->AddLine(ImVec2(ox, oy + hdr_h), ImVec2(ox + w, oy + hdr_h),
+		aida::ui::with_alpha(t.border_subtle, a), 1.f);
 
-	float row_h = 20.f;
-	float hdr_h = 22.f;
+	float col_addr_w = 150.f;
+	float col_val_w = 130.f;
+	float col_prev_w = 130.f;
+	float col_mod_w = w - col_addr_w - col_val_w - col_prev_w - 24.f;
+	if (col_mod_w < 80.f) col_mod_w = 80.f;
 
-	static float result_row_anim_time = 0.f;
-	result_row_anim_time += ImGui::GetIO().DeltaTime;
-
-	float col_addr_w = 130.f;
-	float col_val_w  = 120.f;
-	float col_prev_w = 120.f;
-	float col_mod_w  = w - col_addr_w - col_val_w - col_prev_w;
-	if (col_mod_w < 40.f) col_mod_w = 40.f;
-
-	ui_anim::table_col_t result_cols[] = {
-		{"Address", col_addr_w}, {"Value", col_val_w},
-		{"Previous", col_prev_w}, {"Module", col_mod_w}
-	};
-	ui_anim::render_table_header(dl, ox, oy, w, hdr_h, result_cols, 4, ar, ag, ab, a);
+	const char* col_names[4] = { "Address", "Value", "Previous", "Module" };
+	float col_widths[4] = { col_addr_w, col_val_w, col_prev_w, col_mod_w };
+	float hx = ox + 12.f;
+	for (int c = 0; c < 4; ++c) {
+		dl->AddText(aida::ui::fonts::caption(), 11.f,
+			ImVec2(hx, oy + (hdr_h - 11.f) * 0.5f),
+			aida::ui::with_alpha(t.text_dim, a), col_names[c]);
+		hx += col_widths[c];
+	}
 
 	{
 		char count_buf[32];
-		auto& sc2 = memory_scanner::g_state;
-		snprintf(count_buf, sizeof(count_buf), "%zu", sc2.total_found);
+		snprintf(count_buf, sizeof(count_buf), "%zu", sc.total_found);
 		ImVec2 cs = ImGui::CalcTextSize(count_buf);
-		float bx = ox + w - 10.f - cs.x - 12.f;
-		ImU32 badge_bg = IM_COL32(static_cast<int>(ar*60), static_cast<int>(ag*60),
-								   static_cast<int>(ab*60), static_cast<int>(180*a));
-		ImU32 badge_tc = IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
-								   static_cast<int>(ab*255), static_cast<int>(220*a));
-		ui_anim::render_badge(dl, count_buf, bx, oy + 3.f, badge_bg, badge_tc);
+		float pad_x = 8.f;
+		float pill_w = cs.x + pad_x * 2.f;
+		float pill_h = 16.f;
+		float bx = ox + w - 16.f - pill_w;
+		float by = oy + (hdr_h - pill_h) * 0.5f;
+		dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + pill_w, by + pill_h),
+			aida::ui::with_alpha(t.accent_dim, a * 0.4f), pill_h * 0.5f);
+		dl->AddRect(ImVec2(bx, by), ImVec2(bx + pill_w, by + pill_h),
+			aida::ui::with_alpha(t.accent_u32, a * 0.6f), pill_h * 0.5f, 0, 1.f);
+		dl->AddText(aida::ui::fonts::caption(), 11.f,
+			ImVec2(bx + pad_x, by + (pill_h - 11.f) * 0.5f),
+			aida::ui::with_alpha(t.accent_u32, a), count_buf);
 	}
 
 	float body_y = oy + hdr_h;
@@ -264,68 +245,133 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 	std::lock_guard<std::mutex> lk(sc.results_mutex);
 	int total = static_cast<int>(sc.results.size());
 
+	if (static_cast<int>(ui.row_flash.size()) < total) {
+		ui.row_flash.resize(static_cast<size_t>(total), 0.f);
+	}
+
+	{
+		std::unordered_set<uint64_t> current;
+		current.reserve(static_cast<size_t>(total));
+		for (auto& r : sc.results) current.insert(r.address);
+
+		bool changed = (current.size() != ui.prev_result_addresses.size());
+		if (!changed) {
+			for (auto a_addr : current) {
+				if (ui.prev_result_addresses.find(a_addr) == ui.prev_result_addresses.end()) {
+					changed = true; break;
+				}
+			}
+		}
+		if (changed) {
+			for (int i = 0; i < total; ++i) {
+				if (ui.prev_result_addresses.find(sc.results[static_cast<size_t>(i)].address) ==
+					ui.prev_result_addresses.end()) {
+					if (i < static_cast<int>(ui.row_flash.size())) ui.row_flash[static_cast<size_t>(i)] = 1.f;
+				}
+			}
+			ui.prev_result_addresses = std::move(current);
+		}
+	}
+
+	for (auto& f : ui.row_flash) {
+		if (f > 0.f) {
+			f -= aida::ui::clock::dt() * 1.66f;
+			if (f < 0.f) f = 0.f;
+		}
+	}
 
 	if (ImGui::IsMouseHoveringRect(ImVec2(ox, body_y), ImVec2(ox + w, body_y + body_h), false)) {
 		float wheel = ImGui::GetIO().MouseWheel;
-		if (wheel != 0.f)
+		if (wheel != 0.f) {
 			ui.result_target_scroll_y -= wheel * row_h * 3.f;
+			if (wheel > 0.f) ui.user_scrolled_up = true;
+		}
 	}
 	float max_scroll = std::max(0.f, static_cast<float>(total) * row_h - body_h);
 	ui.result_target_scroll_y = std::clamp(ui.result_target_scroll_y, 0.f, max_scroll);
-	float rdt = ImGui::GetIO().DeltaTime;
-	ui_anim::smooth_scroll(ui.result_scroll_y, ui.result_target_scroll_y, 20.f, rdt);
+	float dt = aida::ui::clock::dt();
+	ui_anim::smooth_scroll(ui.result_scroll_y, ui.result_target_scroll_y, 20.f, dt);
+
+	if (ui.result_target_scroll_y >= max_scroll - 1.f) ui.user_scrolled_up = false;
 
 	int first_row = static_cast<int>(ui.result_scroll_y / row_h);
 	int last_row = std::min(total, first_row + visible_rows + 2);
 
 	ImGui::PushClipRect(ImVec2(ox, body_y), ImVec2(ox + w, body_y + body_h), true);
 
+	static float result_row_anim_time = 0.f;
+	result_row_anim_time += dt;
+
 	for (int i = first_row; i < last_row; ++i) {
 		float ry = body_y + static_cast<float>(i) * row_h - ui.result_scroll_y;
 		if (ry + row_h < body_y || ry > body_y + body_h) continue;
 
-		float row_entrance = ui_anim::render_row_entrance(i - first_row, result_row_anim_time, 0.015f);
+		float row_entrance = ui_anim::render_row_entrance(i - first_row, result_row_anim_time, 0.012f);
 		bool sel = (ui.selected_result == i);
 		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + row_h), false);
-		ui_anim::table_row_style_t rrs{};
-		rrs.selected = sel;
-		rrs.hovered = hov;
-		rrs.index = i;
-		rrs.alpha = a;
-		rrs.entrance = row_entrance;
-		rrs.ar = ar; rrs.ag = ag; rrs.ab = ab;
-		ui_anim::render_table_row(dl, ox, ry, w, row_h, rrs);
+
+		if (sel) {
+			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + row_h),
+				aida::ui::with_alpha(t.selection, a * row_entrance));
+			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + 3.f, ry + row_h),
+				aida::ui::with_alpha(t.accent_u32, a * row_entrance));
+		} else if (hov) {
+			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + row_h),
+				aida::ui::with_alpha(t.hover_wash, a * row_entrance));
+		} else if (i & 1) {
+			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + row_h),
+				aida::ui::with_alpha(IM_COL32(255, 255, 255, 4), a * row_entrance));
+		}
+
+		float flash = (i < static_cast<int>(ui.row_flash.size())) ? ui.row_flash[static_cast<size_t>(i)] : 0.f;
+		if (flash > 0.f) {
+			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + row_h),
+				aida::ui::with_alpha(t.accent_glow, a * flash * 0.85f));
+			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + 3.f, ry + row_h),
+				aida::ui::with_alpha(t.accent_u32, a * flash));
+		}
 
 		auto& r = sc.results[static_cast<size_t>(i)];
 
 		char addr_buf[20];
 		snprintf(addr_buf, sizeof(addr_buf), "%016" PRIX64, r.address);
 
-		float rx = ox + 6.f;
-		dl->AddText(ImVec2(rx, ry + 2.f), addr_col, addr_buf); rx += col_addr_w;
+		float rx = ox + 12.f;
+		dl->AddText(aida::ui::fonts::code(), 12.f,
+			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
+			aida::ui::with_alpha(t.text_address, a * row_entrance), addr_buf);
+		rx += col_addr_w;
 
 		std::string cur_str = memory_scanner::format_value(r.current_value, sc.config.value_type);
-		ImU32 cur_color = val_col;
+		ImU32 cur_color = aida::ui::with_alpha(t.success, a * row_entrance);
 		if (!r.previous_value.empty() && !r.current_value.empty()) {
 			int64_t cv = 0, pv = 0;
 			std::memcpy(&cv, r.current_value.data(),
 				std::min(r.current_value.size(), sizeof(int64_t)));
 			std::memcpy(&pv, r.previous_value.data(),
 				std::min(r.previous_value.size(), sizeof(int64_t)));
-			cur_color = ui_anim::value_change_color(cv, pv, a);
+			if (cv > pv) cur_color = aida::ui::with_alpha(t.success, a * row_entrance);
+			else if (cv < pv) cur_color = aida::ui::with_alpha(t.error, a * row_entrance);
+			else cur_color = aida::ui::with_alpha(t.text_primary, a * row_entrance);
 		}
-		dl->AddText(ImVec2(rx, ry + 2.f), cur_color, cur_str.c_str()); rx += col_val_w;
+		dl->AddText(aida::ui::fonts::code(), 12.f,
+			ImVec2(rx, ry + (row_h - 12.f) * 0.5f), cur_color, cur_str.c_str());
+		rx += col_val_w;
 
 		if (!r.previous_value.empty()) {
 			std::string prev_str = memory_scanner::format_value(r.previous_value, sc.config.value_type);
-			dl->AddText(ImVec2(rx, ry + 2.f), prev_col, prev_str.c_str());
+			dl->AddText(aida::ui::fonts::code(), 12.f,
+				ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
+				aida::ui::with_alpha(t.text_dim, a * row_entrance), prev_str.c_str());
 		}
 		rx += col_prev_w;
 
 		if (!r.module_name.empty()) {
 			char mod_buf[128];
 			snprintf(mod_buf, sizeof(mod_buf), "%s+0x%" PRIX64, r.module_name.c_str(), r.module_offset);
-			dl->AddText(ImVec2(rx, ry + 2.f), dim_col, mod_buf);
+			dl->AddText(aida::ui::fonts::caption(), 11.f,
+				ImVec2(rx, ry + (row_h - 11.f) * 0.5f),
+				aida::ui::with_alpha(t.text_secondary, a * row_entrance), mod_buf);
 		}
 
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
@@ -338,10 +384,9 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 
 	ImGui::PopClipRect();
 
-
 	if (total > visible_rows) {
 		float sb_w = 6.f;
-		float sb_x = ox + w - sb_w - 2.f;
+		float sb_x = ox + w - sb_w - 4.f;
 		float content_total = static_cast<float>(total) * row_h;
 		ui_anim::render_custom_scrollbar(dl, sb_x, body_y, sb_w, body_h,
 			ui.result_scroll_y, content_total, body_h,
@@ -349,75 +394,116 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 	}
 
 	if (total == 0) {
-		float cx = ox + w * 0.5f;
-		float cy = body_y + body_h * 0.5f;
-		float t = static_cast<float>(ImGui::GetTime());
-		float pulse = std::sin(t * 2.f) * 0.3f + 0.7f;
-		ImU32 empty_col = ui_anim::theme_alpha(_t.text_dim, a * pulse);
-		const char* msg = sc.has_initial_scan ? "No results" : "Start a scan to find values";
-		ImVec2 ts = ImGui::CalcTextSize(msg);
-		dl->AddText(ImVec2(cx - ts.x * 0.5f, cy - ts.y * 0.5f), empty_col, msg);
-		if (!sc.has_initial_scan) {
-			ImU32 spinner_col = IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
-					 static_cast<int>(ab*255), static_cast<int>(60*a));
-			ui_anim::render_spinner(dl, cx, cy + 24.f, 6.f, 1.5f, spinner_col, t);
+		aida::ui::empty_state::config_t cfg;
+		cfg.glyph = aida::ui::empty_state::glyph_t::memory;
+		cfg.title = sc.has_initial_scan ? "No matches" : "Nothing scanned yet";
+		cfg.body = sc.has_initial_scan
+			? "Refine your filter or undo to widen the search."
+			: "Pick a value type and a comparison, then start a scan.";
+		aida::ui::empty_state::render(ImVec2(ox, body_y), ImVec2(w, body_h), cfg);
+	} else if (sc.scanning.load() && total < 6) {
+		float sk_y = body_y + static_cast<float>(total) * row_h + 6.f;
+		for (int s = 0; s < 4; ++s) {
+			if (sk_y + 16.f > body_y + body_h) break;
+			aida::ui::skeleton::render_block(dl,
+				ImVec2(ox + 12.f, sk_y),
+				ImVec2(ox + w - 24.f, sk_y + 14.f), 6.f, 1.4f);
+			sk_y += 22.f;
 		}
+	}
+
+	float pill_target = (ui.user_scrolled_up && total > visible_rows) ? 1.f : 0.f;
+	ui.autoscroll_pill_alpha = aida::motion::smooth_lerp(ui.autoscroll_pill_alpha, pill_target, 12.f, dt);
+	if (ui.autoscroll_pill_alpha > 0.02f) {
+		float pa = ui.autoscroll_pill_alpha;
+		const char* lbl = "Jump to bottom";
+		ImVec2 pts = ImGui::CalcTextSize(lbl);
+		float pad_x = 12.f;
+		float pw = pts.x + pad_x * 2.f + 14.f;
+		float ph = 26.f;
+		float px = ox + w * 0.5f - pw * 0.5f;
+		float py = oy + h - ph - 14.f;
+		ImVec2 pa_min(px, py - (1.f - pa) * 6.f);
+		ImVec2 pa_max(px + pw, py + ph - (1.f - pa) * 6.f);
+
+		dl->AddRectFilled(pa_min, pa_max,
+			aida::ui::with_alpha(t.bg_overlay, a * pa * 0.95f), ph * 0.5f);
+		dl->AddRect(pa_min, pa_max,
+			aida::ui::with_alpha(t.accent_u32, a * pa), ph * 0.5f, 0, 1.f);
+
+		float dot_cx = pa_min.x + pad_x;
+		float dot_cy = (pa_min.y + pa_max.y) * 0.5f;
+		dl->AddTriangleFilled(
+			ImVec2(dot_cx - 5.f, dot_cy - 3.f),
+			ImVec2(dot_cx + 5.f, dot_cy - 3.f),
+			ImVec2(dot_cx, dot_cy + 4.f),
+			aida::ui::with_alpha(t.accent_u32, a * pa));
+		dl->AddText(aida::ui::fonts::caption(), 12.f,
+			ImVec2(dot_cx + 10.f, pa_min.y + (ph - 12.f) * 0.5f),
+			aida::ui::with_alpha(t.text_primary, a * pa), lbl);
+
+		ImGui::SetCursorScreenPos(pa_min);
+		ImGui::PushID("##scroll_jump");
+		ImGui::InvisibleButton("##sj_b", ImVec2(pw, ph));
+		if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+			ui.result_target_scroll_y = max_scroll;
+			ui.user_scrolled_up = false;
+		}
+		ImGui::PopID();
 	}
 }
 
-
-static void render_address_list(ImDrawList* dl, float ox, float oy, float w, float h,
-								float a, float ar, float ag, float ab) {
+static void render_address_list(ImDrawList* dl, float ox, float oy, float w, float h, float a) {
 	auto& sc = memory_scanner::g_state;
 	auto& ui = g_ui;
+	const auto& t = aida::ui::resolved();
 
-	const auto& _t = themes::resolved;
-	const auto _ta = [a](ImU32 c) -> ImU32 {
-		return ui_anim::theme_alpha(c, a);
-	};
+	float row_h = 26.f;
+	float hdr_h = 28.f;
 
-	ImU32 text_col  = _ta(_t.text_primary);
-	ImU32 dim_col   = _ta(_t.text_secondary);
-	ImU32 addr_col  = _ta(ui_anim::lighten(_t.text_secondary, 30));
-	ImU32 val_col   = IM_COL32(180, 220, 160, static_cast<int>(220*a));
-	ImU32 freeze_col = IM_COL32(255, 140, 80, static_cast<int>(220*a));
+	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + hdr_h),
+		aida::ui::with_alpha(t.panel_header, a * 0.85f));
+	dl->AddLine(ImVec2(ox, oy + hdr_h), ImVec2(ox + w, oy + hdr_h),
+		aida::ui::with_alpha(t.border_subtle, a), 1.f);
 
-	float row_h = 22.f;
-	float hdr_h = 22.f;
-
-
-	ui_anim::render_toolbar(dl, ox, oy, w, hdr_h, a, ar, ag, ab);
-	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "Address List");
-
+	dl->AddText(aida::ui::fonts::body_em(), 13.f,
+		ImVec2(ox + 12.f, oy + (hdr_h - 13.f) * 0.5f),
+		aida::ui::with_alpha(t.text_primary, a), "Address List");
 
 	{
-		const char* ar_label = ui.auto_refresh ? "Auto: ON" : "Auto: OFF";
-		ImVec2 arts = ImGui::CalcTextSize(ar_label);
-		float arx = ox + w - arts.x - 12.f;
-		ImU32 arc = ui.auto_refresh
-			? IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
-					   static_cast<int>(ab*255), static_cast<int>(200*a))
-			: dim_col;
-		bool ar_hov = ImGui::IsMouseHoveringRect(ImVec2(arx, oy), ImVec2(arx + arts.x + 8.f, oy + hdr_h), false);
-		dl->AddText(ImVec2(arx, oy + 3.f), ar_hov ? _ta(_t.text_primary) : arc, ar_label);
-		if (ar_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-			ui.auto_refresh = !ui.auto_refresh;
+		ImGui::SetCursorScreenPos(ImVec2(ox + w - 90.f, oy + (hdr_h - 18.f) * 0.5f));
+		ImGui::PushID("##auto_tog");
+		bool prev = ui.auto_refresh;
+		aida::ui::toggle_switch("##atog", &ui.auto_refresh, aida::ui::size_t_::sm);
+		(void)prev;
+		ImGui::PopID();
+		const char* lbl = ui.auto_refresh ? "Auto" : "Manual";
+		ImU32 lbl_col = ui.auto_refresh ? aida::ui::with_alpha(t.accent_u32, a)
+		                                 : aida::ui::with_alpha(t.text_dim, a);
+		dl->AddText(aida::ui::fonts::caption(), 11.f,
+			ImVec2(ox + w - 50.f, oy + (hdr_h - 11.f) * 0.5f), lbl_col, lbl);
 	}
 
-	float col_freeze_w = 40.f;
-	float col_desc_w   = 150.f;
-	float col_addr_w   = 130.f;
-	float col_type_w   = 80.f;
-	float col_val_w    = w - col_freeze_w - col_desc_w - col_addr_w - col_type_w;
+	float col_freeze_w = 56.f;
+	float col_desc_w = 160.f;
+	float col_addr_w = 150.f;
+	float col_type_w = 90.f;
+	float col_val_w = w - col_freeze_w - col_desc_w - col_addr_w - col_type_w - 28.f;
 	if (col_val_w < 60.f) col_val_w = 60.f;
 
-	float tbl_hdr_h = 20.f;
-	{
-		ui_anim::table_col_t addr_hdr_cols[] = {
-			{"Freeze", col_freeze_w}, {"Description", col_desc_w},
-			{"Address", col_addr_w}, {"Type", col_type_w}, {"Value", col_val_w}
-		};
-		ui_anim::render_table_header(dl, ox, oy + hdr_h, w, tbl_hdr_h, addr_hdr_cols, 5, ar, ag, ab, a);
+	const char* col_names[5] = { "Freeze", "Description", "Address", "Type", "Value" };
+	float col_widths[5] = { col_freeze_w, col_desc_w, col_addr_w, col_type_w, col_val_w };
+
+	float tbl_hdr_h = 22.f;
+	dl->AddRectFilled(ImVec2(ox, oy + hdr_h), ImVec2(ox + w, oy + hdr_h + tbl_hdr_h),
+		aida::ui::with_alpha(t.bg_overlay, a * 0.4f));
+
+	float hx = ox + 12.f;
+	for (int c = 0; c < 5; ++c) {
+		dl->AddText(aida::ui::fonts::caption(), 11.f,
+			ImVec2(hx, oy + hdr_h + (tbl_hdr_h - 11.f) * 0.5f),
+			aida::ui::with_alpha(t.text_dim, a), col_names[c]);
+		hx += col_widths[c];
 	}
 
 	float body_y = oy + hdr_h + tbl_hdr_h;
@@ -439,8 +525,8 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 	}
 	float max_scroll = std::max(0.f, static_cast<float>(total) * row_h - body_h);
 	ui.address_target_scroll_y = std::clamp(ui.address_target_scroll_y, 0.f, max_scroll);
-	float adt = ImGui::GetIO().DeltaTime;
-	ui_anim::smooth_scroll(ui.address_scroll_y, ui.address_target_scroll_y, 20.f, adt);
+	float dt = aida::ui::clock::dt();
+	ui_anim::smooth_scroll(ui.address_scroll_y, ui.address_target_scroll_y, 20.f, dt);
 
 	int first_row = static_cast<int>(ui.address_scroll_y / row_h);
 	int last_row = std::min(total, first_row + visible_rows + 2);
@@ -453,66 +539,68 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 
 		bool sel = (ui.selected_address == i);
 		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + row_h), false);
-		ui_anim::render_table_row(dl, ox, ry, w, row_h,
-			{sel, hov, i, a, 1.f, ar, ag, ab});
+
+		if (sel) {
+			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + row_h),
+				aida::ui::with_alpha(t.selection, a));
+			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + 3.f, ry + row_h),
+				aida::ui::with_alpha(t.accent_u32, a));
+		} else if (hov) {
+			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + row_h),
+				aida::ui::with_alpha(t.hover_wash, a));
+		} else if (i & 1) {
+			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + row_h),
+				aida::ui::with_alpha(IM_COL32(255, 255, 255, 4), a));
+		}
 
 		auto& e = sc.address_list[static_cast<size_t>(i)];
-		float rx = ox + 6.f;
-
+		float rx = ox + 12.f;
 
 		{
-			float cb_sz = 12.f;
-			float cb_x = rx + (col_freeze_w - cb_sz) * 0.5f - 6.f;
-			float cb_y = ry + (row_h - cb_sz) * 0.5f;
-			dl->AddRect(ImVec2(cb_x, cb_y), ImVec2(cb_x + cb_sz, cb_y + cb_sz),
-				e.frozen ? freeze_col : dim_col, 2.f);
-			if (e.frozen) {
-				dl->AddRectFilled(ImVec2(cb_x + 2, cb_y + 2), ImVec2(cb_x + cb_sz - 2, cb_y + cb_sz - 2),
-					freeze_col, 1.f);
-			}
-			float dot_cx = cb_x + cb_sz + 7.f;
-			float dot_cy = ry + row_h * 0.5f;
-			if (e.frozen) {
-				ui_anim::render_status_dot(dl, dot_cx, dot_cy, 3.f,
-					IM_COL32(100, 180, 255, 255),
-					static_cast<float>(ImGui::GetTime()) * 2.36f, true);
-			} else {
-				ui_anim::render_status_dot(dl, dot_cx, dot_cy, 3.f,
-					_ta(_t.text_dim),
-					0.f, false);
-			}
-			bool cb_hov = ImGui::IsMouseHoveringRect(ImVec2(cb_x - 2, cb_y - 2),
-				ImVec2(cb_x + cb_sz + 2, cb_y + cb_sz + 2), false);
-			if (cb_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			ImGui::PushID(i * 7 + 1);
+			ImGui::SetCursorScreenPos(ImVec2(rx, ry + (row_h - 18.f) * 0.5f));
+			bool fr = e.frozen;
+			aida::ui::toggle_switch("##fz", &fr, aida::ui::size_t_::sm);
+			if (fr != e.frozen) {
 				freeze_toggle_idx = i;
-				freeze_toggle_val = !e.frozen;
+				freeze_toggle_val = fr;
 			}
+			if (e.frozen) {
+				float dot_cx = rx + 36.f;
+				float dot_cy = ry + row_h * 0.5f;
+				aida::ui::status_dot(ImVec2(dot_cx, dot_cy), 3.f,
+					aida::ui::with_alpha(t.info, a), true, 1.4f);
+			}
+			ImGui::PopID();
 		}
 		rx += col_freeze_w;
 
-
-		dl->AddText(ImVec2(rx, ry + 2.f), text_col,
+		dl->AddText(aida::ui::fonts::body(), 12.f,
+			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
+			aida::ui::with_alpha(t.text_primary, a),
 			e.description.empty() ? "<no description>" : e.description.c_str());
 		rx += col_desc_w;
 
-
 		char abuf[20];
 		snprintf(abuf, sizeof(abuf), "%016" PRIX64, e.address);
-		dl->AddText(ImVec2(rx, ry + 2.f), addr_col, abuf);
+		dl->AddText(aida::ui::fonts::code(), 12.f,
+			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
+			aida::ui::with_alpha(t.text_address, a), abuf);
 		rx += col_addr_w;
 
-
-		dl->AddText(ImVec2(rx, ry + 2.f), dim_col,
+		dl->AddText(aida::ui::fonts::caption(), 11.f,
+			ImVec2(rx, ry + (row_h - 11.f) * 0.5f),
+			aida::ui::with_alpha(t.text_secondary, a),
 			memory_scanner::value_type_name(e.value_type));
 		rx += col_type_w;
 
-
 		std::string val_str = memory_scanner::format_value(e.last_value, e.value_type);
-		dl->AddText(ImVec2(rx, ry + 2.f), val_col, val_str.c_str());
+		dl->AddText(aida::ui::fonts::code(), 12.f,
+			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
+			aida::ui::with_alpha(t.success, a), val_str.c_str());
 
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 			ui.selected_address = i;
-
 
 		if (sel && ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
 			delete_idx = i;
@@ -525,7 +613,7 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 
 	if (total > visible_rows) {
 		float sb_w = 6.f;
-		float sb_x = ox + w - sb_w - 2.f;
+		float sb_x = ox + w - sb_w - 4.f;
 		float content_total = static_cast<float>(total) * row_h;
 		ui_anim::render_custom_scrollbar(dl, sb_x, body_y, sb_w, body_h,
 			ui.address_scroll_y, content_total, body_h,
@@ -533,13 +621,11 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 	}
 
 	if (total == 0) {
-		float cx = ox + w * 0.5f;
-		float cy = body_y + body_h * 0.5f - 8.f;
-		float t = static_cast<float>(ImGui::GetTime());
-		float pulse = std::sin(t * 1.8f) * 0.3f + 0.7f;
-		dl->AddText(ImVec2(cx - 80.f, cy),
-			ui_anim::theme_alpha(_t.text_dim, a * pulse),
-			"Double-click a result to add");
+		aida::ui::empty_state::config_t cfg;
+		cfg.glyph = aida::ui::empty_state::glyph_t::dots;
+		cfg.title = "Watchlist is empty";
+		cfg.body = "Double-click a result above to start tracking and freezing values.";
+		aida::ui::empty_state::render(ImVec2(ox, body_y), ImVec2(w, body_h), cfg);
 	}
 
 	lk.unlock();
@@ -550,9 +636,8 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 		memory_scanner::remove_address(static_cast<size_t>(delete_idx));
 }
 
-
 void render(float pos_x, float pos_y, float width, float height,
-			float alpha, float accent_r, float accent_g, float accent_b) {
+			float alpha, float, float, float) {
 	ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
 	ImGui::BeginChild("##scanner_view", ImVec2(width, height), false,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
@@ -565,54 +650,36 @@ void render(float pos_x, float pos_y, float width, float height,
 	float h = height;
 	float a = alpha;
 
-	const auto& _t = themes::resolved;
-	const auto _ta = [a](ImU32 c) -> ImU32 {
-		return ui_anim::theme_alpha(c, a);
-	};
+	const auto& t = aida::ui::resolved();
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + h),
-		_ta(_t.bg_base));
-
+		aida::ui::with_alpha(t.bg_base, a));
 
 	auto& ui = g_ui;
 	if (ui.auto_refresh) {
-		ui.refresh_timer += ImGui::GetIO().DeltaTime;
+		ui.refresh_timer += aida::ui::clock::dt();
 		if (ui.refresh_timer >= ui.refresh_interval) {
 			ui.refresh_timer = 0.f;
 			memory_scanner::refresh_address_list();
 		}
 	}
 
-
-	float toolbar_h = 34.f;
+	float toolbar_h = 44.f;
 	float remaining = h - toolbar_h;
 	float results_h = remaining * 0.6f;
 	float address_h = remaining - results_h;
 
-	render_toolbar(dl, ox, oy, w, a, accent_r, accent_g, accent_b);
+	render_toolbar(dl, ox, oy, w, a);
 
 	float results_y = oy + toolbar_h;
-	render_results(dl, ox, results_y, w, results_h, a, accent_r, accent_g, accent_b);
-
+	render_results(dl, ox, results_y, w, results_h, a);
 
 	float split_y = results_y + results_h;
-	float t = static_cast<float>(ImGui::GetTime());
-	float glow = (std::sin(t * 1.5f) * 0.5f + 0.5f) * 0.3f + 0.5f;
-	ImU32 split_col = IM_COL32(static_cast<int>(accent_r * 120 * glow),
-		static_cast<int>(accent_g * 120 * glow),
-		static_cast<int>(accent_b * 120 * glow),
-		static_cast<int>(140 * a));
-	dl->AddLine(ImVec2(ox + 8.f, split_y), ImVec2(ox + w - 8.f, split_y),
-		split_col, 1.f);
-	for (int gi = 1; gi <= 2; ++gi) {
-		float ga = (0.06f - static_cast<float>(gi) * 0.02f) * a * glow;
-		dl->AddRectFilled(ImVec2(ox + 8.f, split_y - static_cast<float>(gi)),
-			ImVec2(ox + w - 8.f, split_y + static_cast<float>(gi) + 1.f),
-			IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
-					 static_cast<int>(accent_b * 255), static_cast<int>(ga * 255.f)));
-	}
+	float pulse = aida::ui::clock::pulse(0.4f, 0.3f, 0.6f);
+	dl->AddLine(ImVec2(ox + 12.f, split_y), ImVec2(ox + w - 12.f, split_y),
+		aida::ui::with_alpha(t.accent_dim, a * pulse), 1.f);
 
-	render_address_list(dl, ox, split_y + 1.f, w, address_h - 1.f, a, accent_r, accent_g, accent_b);
+	render_address_list(dl, ox, split_y + 1.f, w, address_h - 1.f, a);
 
 	ImGui::EndChild();
 }

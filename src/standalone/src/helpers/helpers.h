@@ -1,6 +1,17 @@
 #pragma once
 #include "imgui/imgui.h"
 #include "keybind.h"
+#include "../core/ui/theme.hpp"
+#include "../core/ui/motion.hpp"
+#include "../core/ui/clock.hpp"
+#include "../core/ui/transition.hpp"
+#include "../core/ui/components.hpp"
+#include "../core/ui/blur_layer.hpp"
+#include "../core/ui/avatar.hpp"
+#include "../core/ui/brand.hpp"
+#include "../core/ui/empty_state.hpp"
+#include "../core/ui/fonts.hpp"
+#include "../core/ui/skeleton.hpp"
 #include <d3d11.h>
 
 extern ID3D11Device* g_pd3dDevice;

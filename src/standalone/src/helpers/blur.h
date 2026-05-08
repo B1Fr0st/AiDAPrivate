@@ -7,6 +7,7 @@
 class Blur {
 public:
     static void Init(ID3D11Device* device, ID3D11DeviceContext* ctx, int w, int h);
+    static void Resize(int w, int h);
     static void Draw(ImDrawList* dl, ImVec2 min, ImVec2 max);
     static void Shutdown();
     static void ApplyPass(ID3D11ShaderResourceView* src, ID3D11RenderTargetView* dst, bool horizontal);

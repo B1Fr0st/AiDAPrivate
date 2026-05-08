@@ -22,12 +22,31 @@ enum class span_type : int {
     code_block,
     tool_call,
     tool_result,
+    heading1,
+    heading2,
+    heading3,
+    list_bullet,
+    list_numbered,
+    blockquote,
+    link,
+    strikethrough,
+    task_unchecked,
+    task_checked,
+    hrule,
+    table,
+    paragraph_break
 };
+
 
 struct span_t {
     span_type   type;
     std::string text;
     std::string language;
+    std::string url;
+    int         depth        = 0;
+    int         list_index   = 0;
+    int         list_indent  = 0;
+    std::vector<std::vector<std::string>> table_data;
 };
 
 
@@ -73,5 +92,14 @@ float render_code_block(
     float       accent_r,
     float       accent_g,
     float       accent_b);
+
+
+float render_thinking_indicator(
+    ImDrawList* dl,
+    ImVec2      origin,
+    float       max_w,
+    int         msg_idx,
+    float       alpha,
+    float       dt);
 
 }

@@ -32,6 +32,37 @@
 // Uses direct PostgreSQL queries (replaces Firebase REST).
 // ============================================================================
 
+(function loadDotEnv() {
+    const fs = require('fs');
+    const path = require('path');
+    const envPath = path.join(__dirname, '.env');
+    if (!fs.existsSync(envPath)) return;
+    let raw;
+    try {
+        raw = fs.readFileSync(envPath, 'utf8');
+    } catch (err) {
+        console.error('[bot] failed to read .env:', err && err.message ? err.message : err);
+        return;
+    }
+    const lines = raw.split(/\r?\n/);
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const eqIdx = trimmed.indexOf('=');
+        if (eqIdx <= 0) continue;
+        const key = trimmed.substring(0, eqIdx).trim();
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+        let value = trimmed.substring(eqIdx + 1).trim();
+        if ((value.startsWith('"') && value.endsWith('"') && value.length >= 2) ||
+            (value.startsWith("'") && value.endsWith("'") && value.length >= 2)) {
+            value = value.slice(1, -1);
+        }
+        if (process.env[key] === undefined || process.env[key] === '') {
+            process.env[key] = value;
+        }
+    }
+})();
+
 const {
     Client,
     GatewayIntentBits,

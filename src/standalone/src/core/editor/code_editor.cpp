@@ -9,6 +9,7 @@
 #include "imgui/imgui_internal.h"
 #include <Windows.h>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <mutex>
@@ -16,6 +17,14 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "theme.hpp"
+#include "motion.hpp"
+#include "clock.hpp"
+#include "transition.hpp"
+#include "components.hpp"
+#include "blur_layer.hpp"
+#include "fonts.hpp"
+#include "ui_anim.hpp"
 
 
 namespace {
@@ -545,6 +554,7 @@ std::string code_editor_widget::last_error() {
 void code_editor_widget::render(float pos_x, float pos_y, float width, float height,
                                  float alpha, float accent_r, float accent_g, float accent_b)
 {
+    (void)accent_r; (void)accent_g; (void)accent_b;
     if (!code_editor::active || code_editor::buffer.empty())
         return;
 
@@ -563,51 +573,157 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     if (s_cache.dirty)
         rebuild_lines();
 
+    const auto& th = aida::ui::resolved();
     const float a   = alpha;
-    const float dt  = ImGui::GetIO().DeltaTime;
+    const float dt  = aida::ui::clock::dt();
     const float line_h = ImGui::GetFontSize() + 2.f;
     const float char_w = ImGui::CalcTextSize("X").x;
     const bool  show_ln = editor_config::show_line_numbers;
     const int   n_lines = line_count();
     const float gutter_w = show_ln ? (ImGui::CalcTextSize("00000").x + 12.f) : 0.f;
-    const float text_x0 = gutter_w + 4.f;
-    const float text_w  = width - text_x0 - 4.f;
 
+    static aida::ui::transition_t s_caret_move_anim;
+    static int   s_prev_caret_line = 0;
+    static int   s_prev_caret_col  = 0;
+    static aida::ui::transition_t s_focus_anim;
+    static aida::ui::transition_t s_ghost_in;
+    static int   s_ghost_visible_for_line = -1;
+    static int   s_ghost_visible_for_col  = -1;
+    static aida::ui::transition_t s_ghost_absorb;
+    static aida::ui::flash_t      s_breadcrumb_flash;
+    static aida::ui::transition_t s_match_pulse;
+    static int   s_active_match_for = -1;
+    static aida::ui::transition_t s_minimap_hover;
 
     ImU32 tok_colors[static_cast<int>(syntax::token_type::COUNT)];
-    syntax::get_token_colors(tok_colors, accent_r * 255.f, accent_g * 255.f, accent_b * 255.f, a);
+    syntax::get_token_colors(tok_colors,
+        ((float)((th.accent_u32 >> IM_COL32_R_SHIFT) & 0xFF)),
+        ((float)((th.accent_u32 >> IM_COL32_G_SHIFT) & 0xFF)),
+        ((float)((th.accent_u32 >> IM_COL32_B_SHIFT) & 0xFF)), a);
 
-
-    const float goto_bar_h = s_goto.visible ? 32.f : 0.f;
-    const float overlay_h = goto_bar_h;
+    const float goto_bar_h = s_goto.visible ? 36.f : 0.f;
+    const float breadcrumb_h = 28.f;
+    const float minimap_w = (width > 600.f) ? 64.f : 0.f;
+    const float overlay_h = goto_bar_h + breadcrumb_h;
     const float editor_y0 = pos_y + overlay_h;
     const float editor_h  = height - overlay_h;
+    const float code_w = width - minimap_w;
+    const float text_x0 = gutter_w + 4.f;
 
-
-    s_scroll_y += (s_target_scroll_y - s_scroll_y) * std::min(20.f * dt, 1.f);
+    s_scroll_y = aida::motion::smooth_lerp(s_scroll_y, s_target_scroll_y, 20.f, dt);
     if (std::abs(s_target_scroll_y - s_scroll_y) < 0.5f)
         s_scroll_y = s_target_scroll_y;
     float max_scroll = std::max(0.f, n_lines * line_h - editor_h + line_h);
     s_target_scroll_y = std::max(0.f, std::min(s_target_scroll_y, max_scroll));
     s_scroll_y = std::max(0.f, std::min(s_scroll_y, max_scroll));
 
-
     s_blink_timer += dt;
-    if (s_blink_timer > 0.53f) { s_blink_on = !s_blink_on; s_blink_timer = 0.f; }
-
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 wpos   = ImGui::GetWindowPos();
     float ox = wpos.x + pos_x;
     float oy = wpos.y + editor_y0;
+    float bcb_x = wpos.x + pos_x;
+    float bcb_y = wpos.y + pos_y + goto_bar_h;
+    {
+        ImDrawList* bc_dl = ImGui::GetWindowDrawList();
+        ImVec2 bc_min(bcb_x, bcb_y);
+        ImVec2 bc_max(bcb_x + width, bcb_y + breadcrumb_h);
+        bc_dl->AddRectFilled(bc_min, bc_max, aida::ui::with_alpha(th.panel_header, a * 0.85f));
+        bc_dl->AddLine(ImVec2(bc_min.x, bc_max.y - 1.f),
+                       ImVec2(bc_max.x, bc_max.y - 1.f),
+                       aida::ui::with_alpha(th.border_subtle, a), 1.f);
 
+        std::string crumb_path = code_editor::filename.empty() ? std::string("Untitled")
+                                                                : code_editor::filename;
+        std::string crumb_func;
+        std::string crumb_class;
+        for (int i = std::min(s_sel.caret_line, line_count() - 1); i >= 0 && (crumb_func.empty() || crumb_class.empty()); --i) {
+            const std::string& ln = line_at(i);
+            if (crumb_func.empty()) {
+                size_t paren = ln.find('(');
+                if (paren != std::string::npos && paren > 0) {
+                    size_t end = paren;
+                    while (end > 0 && (ln[end - 1] == ' ' || ln[end - 1] == '\t')) end--;
+                    if (end > 0) {
+                        size_t start = end;
+                        while (start > 0 && (isalnum((unsigned char)ln[start - 1]) || ln[start - 1] == '_' || ln[start - 1] == ':')) start--;
+                        if (end > start && (isalpha((unsigned char)ln[start]) || ln[start] == '_')) {
+                            std::string token = ln.substr(start, end - start);
+                            if (token != "if" && token != "for" && token != "while" && token != "switch"
+                                && token != "return" && token != "catch" && token != "sizeof") {
+                                crumb_func = token;
+                            }
+                        }
+                    }
+                }
+            }
+            if (crumb_class.empty()) {
+                static const char* prefixes[] = { "class ", "struct ", "namespace " };
+                for (auto* pref : prefixes) {
+                    size_t pos = ln.find(pref);
+                    if (pos != std::string::npos) {
+                        size_t s = pos + std::strlen(pref);
+                        size_t e = s;
+                        while (e < ln.size() && (isalnum((unsigned char)ln[e]) || ln[e] == '_' || ln[e] == ':')) e++;
+                        if (e > s) crumb_class = ln.substr(s, e - s);
+                        break;
+                    }
+                }
+            }
+        }
+
+        struct seg_t { std::string text; bool is_path; bool is_active; };
+        std::vector<seg_t> segs;
+        size_t lastsep = crumb_path.find_last_of("/\\");
+        std::string parent_path = (lastsep != std::string::npos) ? crumb_path.substr(0, lastsep) : "";
+        std::string name_only   = (lastsep != std::string::npos) ? crumb_path.substr(lastsep + 1) : crumb_path;
+        if (!parent_path.empty()) {
+            size_t prev_sep = parent_path.find_last_of("/\\");
+            std::string parent_seg = (prev_sep != std::string::npos)
+                ? parent_path.substr(prev_sep + 1) : parent_path;
+            if (!parent_seg.empty()) segs.push_back({ parent_seg, true, false });
+        }
+        segs.push_back({ name_only, true, false });
+        if (!crumb_class.empty()) segs.push_back({ crumb_class, false, false });
+        if (!crumb_func.empty())  segs.push_back({ crumb_func,  false, true  });
+
+        ImFont* bc_font = aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont();
+        float crumb_x = bc_min.x + 12.f;
+        float crumb_y = bc_min.y + (breadcrumb_h - 13.f) * 0.5f;
+        float chev_w = 10.f;
+        for (size_t i = 0; i < segs.size(); ++i) {
+            const auto& sg = segs[i];
+            float tw = bc_font->CalcTextSizeA(13.f, FLT_MAX, 0.f, sg.text.c_str()).x;
+            ImVec2 chip_min(crumb_x - 4.f, crumb_y - 3.f);
+            ImVec2 chip_max(crumb_x + tw + 4.f, crumb_y + 16.f);
+            bool seg_hov = ImGui::IsMouseHoveringRect(chip_min, chip_max);
+            ImU32 seg_col = sg.is_path ? th.text_secondary
+                                       : (sg.is_active ? th.accent_u32 : th.text_primary);
+            if (seg_hov) {
+                bc_dl->AddRectFilled(chip_min, chip_max, aida::ui::with_alpha(th.hover_wash, a * 1.4f), 5.f);
+                seg_col = th.accent_u32;
+            }
+            bc_dl->AddText(bc_font, 13.f, ImVec2(crumb_x, crumb_y),
+                aida::ui::with_alpha(seg_col, a), sg.text.c_str());
+            crumb_x += tw;
+            if (i + 1 < segs.size()) {
+                ImU32 chev_col = aida::ui::with_alpha(th.text_dim, a);
+                float cx = crumb_x + 4.f;
+                float cy = crumb_y + 6.f;
+                bc_dl->AddLine(ImVec2(cx, cy - 3.f), ImVec2(cx + 3.f, cy), chev_col, 1.5f);
+                bc_dl->AddLine(ImVec2(cx + 3.f, cy), ImVec2(cx, cy + 3.f), chev_col, 1.5f);
+                crumb_x += chev_w + 4.f;
+            }
+        }
+    }
+    s_breadcrumb_flash.tick(dt, 2.f);
 
     ImGuiID id = ImGui::GetID("##code_editor_widget");
     s_widget_id = id;
     ImRect bb(ImVec2(ox, oy), ImVec2(ox + width, oy + editor_h));
     ImGui::ItemSize(ImVec2(width, height));
-    if (!ImGui::ItemAdd(bb, id)) return;
-
+    if (!ImGui::ItemAdd(bb, id)) { if (g_code_font) ImGui::PopFont(); return; }
 
     bool mouse_over_find_bar = false;
     if (s_find.visible) {
@@ -621,7 +737,6 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
     bool hovered = ImGui::IsMouseHoveringRect(bb.Min, bb.Max);
     if (mouse_over_find_bar) hovered = false;
-
 
     bool input_blocked = (file_tabs::pending_close_idx >= 0)
         || globals::ui::process_attach_open
@@ -643,6 +758,12 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             ImGui::ClearActiveID();
     }
 
+    if (s_has_focus && s_focus_anim.is_finished() && s_focus_anim.progress < 1.f)
+        s_focus_anim.start(0.10f, aida::motion::ease::out_quint);
+    if (!s_has_focus && s_focus_anim.is_finished() && s_focus_anim.progress > 0.f)
+        s_focus_anim.start_reverse(0.18f, aida::motion::ease::in_quint);
+    s_focus_anim.tick(dt);
+    float focus_blend = s_focus_anim.eased();
 
     if (hovered) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
@@ -651,23 +772,71 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             s_target_scroll_y -= wheel * line_h * 3.f;
     }
 
-
     int first_row = std::max(0, static_cast<int>(s_scroll_y / line_h) - 1);
     int last_row  = std::min(n_lines - 1, static_cast<int>((s_scroll_y + editor_h) / line_h) + 1);
-
 
     if (show_ln) {
         dl->AddLine(ImVec2(ox + gutter_w, oy),
                     ImVec2(ox + gutter_w, oy + editor_h),
-                    IM_COL32(255, 255, 255, static_cast<int>(10 * a)), 1.f);
+                    aida::ui::with_alpha(th.border_subtle, a), 1.f);
     }
 
-
-    if (editor_config::highlight_current_line && s_has_focus) {
+    if (editor_config::highlight_current_line && focus_blend > 0.001f) {
         float cy = oy + s_sel.caret_line * line_h - s_scroll_y;
         if (cy >= oy - line_h && cy <= oy + editor_h) {
-            dl->AddRectFilled(ImVec2(ox, cy), ImVec2(ox + width, cy + line_h),
-                              IM_COL32(255, 255, 255, static_cast<int>(8 * a)));
+            dl->AddRectFilled(ImVec2(ox, cy), ImVec2(ox + code_w, cy + line_h),
+                              aida::ui::with_alpha(th.hover_wash, focus_blend * 0.85f * a));
+            dl->AddRectFilled(ImVec2(ox, cy), ImVec2(ox + 2.f, cy + line_h),
+                              aida::ui::with_alpha(th.accent_u32, focus_blend * 0.55f * a));
+        }
+    }
+
+    if (s_sel.caret_line != s_prev_caret_line || s_sel.caret_col != s_prev_caret_col) {
+        if (s_caret_move_anim.is_finished())
+            s_caret_move_anim.start(0.120f, aida::motion::ease::out_quint);
+        else
+            s_caret_move_anim.progress = 0.f;
+    }
+    s_caret_move_anim.tick(dt);
+    if (s_caret_move_anim.active) {
+        float pe = s_caret_move_anim.eased();
+        float prev_x = ox + text_x0 + s_prev_caret_col * char_w - s_scroll_x;
+        float prev_y = oy + s_prev_caret_line * line_h - s_scroll_y;
+        float cur_x  = ox + text_x0 + s_sel.caret_col * char_w - s_scroll_x;
+        float cur_y  = oy + s_sel.caret_line * line_h - s_scroll_y;
+        float gx = prev_x + (cur_x - prev_x) * pe;
+        float gy = prev_y + (cur_y - prev_y) * pe;
+        if (gy >= oy - line_h && gy <= oy + editor_h) {
+            dl->AddRectFilled(ImVec2(gx - 2.f, gy), ImVec2(gx + 6.f, gy + line_h),
+                aida::ui::with_alpha(th.accent_glow, (1.f - pe) * a));
+        }
+    }
+    if (s_caret_move_anim.is_finished() && s_caret_move_anim.progress >= 0.999f) {
+        s_prev_caret_line = s_sel.caret_line;
+        s_prev_caret_col  = s_sel.caret_col;
+    }
+
+    {
+        const int max_indent_render = 16;
+        int tab = std::max(1, editor_config::tab_size);
+        for (int i = first_row; i <= last_row; i++) {
+            const std::string& ln = line_at(i);
+            int leading = 0;
+            for (char c : ln) {
+                if (c == ' ') leading++;
+                else if (c == '\t') leading += tab;
+                else break;
+            }
+            if (leading <= 0) continue;
+            int levels = std::min(max_indent_render, leading / tab);
+            float ly = oy + i * line_h - s_scroll_y;
+            for (int lv = 1; lv <= levels; ++lv) {
+                float gx = ox + text_x0 + lv * tab * char_w - s_scroll_x - char_w * 0.5f;
+                bool active = (s_sel.caret_line == i) && (lv * tab <= leading);
+                ImU32 col = active ? aida::ui::with_alpha(th.accent_dim, 0.45f * a)
+                                   : aida::ui::with_alpha(th.border_subtle, 0.6f * a);
+                dl->AddLine(ImVec2(gx, ly), ImVec2(gx, ly + line_h), col, 1.f);
+            }
         }
     }
 
@@ -675,8 +844,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     if (s_sel.has_selection()) {
         int l0, c0, l1, c1;
         selection_ordered(l0, c0, l1, c1);
-        ImU32 sel_col = IM_COL32(static_cast<int>(accent_r * 180), static_cast<int>(accent_g * 180),
-                                  static_cast<int>(accent_b * 180), static_cast<int>(60 * a));
+        ImU32 sel_col = aida::ui::with_alpha(th.selection, a);
         for (int i = std::max(first_row, l0); i <= std::min(last_row, l1); i++) {
             float ly = oy + i * line_h - s_scroll_y;
             float sx0, sx1;
@@ -694,25 +862,45 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                 sx1 = ox + text_x0 + line_length(i) * char_w - s_scroll_x + char_w;
             }
             sx0 = std::max(sx0, ox + text_x0);
-            dl->AddRectFilled(ImVec2(sx0, ly), ImVec2(sx1, ly + line_h), sel_col);
+            sx1 = std::min(sx1, ox + code_w - 4.f);
+            if (sx1 > sx0) {
+                dl->AddRectFilled(ImVec2(sx0, ly), ImVec2(sx1, ly + line_h), sel_col);
+            }
         }
     }
 
 
     if (s_find.visible && !s_find.match_positions.empty()) {
+        if (s_active_match_for != s_find.current_match) {
+            s_active_match_for = s_find.current_match;
+            s_match_pulse.start(aida::motion::dur::md, aida::motion::ease::out_quint);
+        }
+        s_match_pulse.tick(dt);
         int find_len = static_cast<int>(strlen(s_find.find_buf));
-        ImU32 match_col  = IM_COL32(static_cast<int>(accent_r * 220), static_cast<int>(accent_g * 220),
-                                     static_cast<int>(accent_b * 220), static_cast<int>(35 * a));
-        ImU32 active_col = IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
-                                     static_cast<int>(accent_b * 255), static_cast<int>(70 * a));
+        ImU32 match_col  = aida::ui::with_alpha(th.accent_dim, 0.32f * a);
+        float pulse = aida::ui::clock::pulse(1.5f, 0.55f, 1.f);
+        ImU32 active_col = aida::ui::with_alpha(th.accent_u32, 0.55f * pulse * a);
         for (int mi = 0; mi < static_cast<int>(s_find.match_positions.size()); mi++) {
             auto [ml, mc] = s_find.match_positions[mi];
             if (ml < first_row || ml > last_row) continue;
             float my = oy + ml * line_h - s_scroll_y;
             float mx0 = ox + text_x0 + mc * char_w - s_scroll_x;
             float mx1 = mx0 + find_len * char_w;
+            mx1 = std::min(mx1, ox + code_w - 4.f);
+            if (mx1 <= mx0) continue;
+            bool is_active = (mi == s_find.current_match);
             dl->AddRectFilled(ImVec2(mx0, my), ImVec2(mx1, my + line_h),
-                              (mi == s_find.current_match) ? active_col : match_col);
+                              is_active ? active_col : match_col);
+            if (is_active) {
+                dl->AddRect(ImVec2(mx0 - 1.f, my),
+                            ImVec2(mx1 + 1.f, my + line_h),
+                            aida::ui::with_alpha(th.accent_u32, 0.85f * pulse * a),
+                            2.f, 0, 1.2f);
+                aida::ui::blur::render_inner_glow(dl,
+                    ImVec2(mx0 - 2.f, my - 1.f),
+                    ImVec2(mx1 + 2.f, my + line_h + 1.f),
+                    2.f, aida::ui::with_alpha(th.accent_glow, a), 2);
+            }
         }
     }
 
@@ -723,15 +911,15 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
         if (i & 1)
             dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + gutter_w, y + line_h - 1.f),
-                              IM_COL32(255, 255, 255, static_cast<int>(3.f * a)));
+                              aida::ui::with_alpha(th.text_primary, 0.012f * a));
 
 
         if (show_ln) {
             char ln_buf[8];
             snprintf(ln_buf, sizeof(ln_buf), "%5d", i + 1);
             ImU32 ln_col = (i == s_sel.caret_line)
-                ? IM_COL32(200, 200, 220, static_cast<int>(200 * a))
-                : IM_COL32(75, 85, 120, static_cast<int>(140 * a));
+                ? aida::ui::with_alpha(th.accent_u32, 0.85f * a)
+                : aida::ui::with_alpha(th.text_lineno, a);
             dl->AddText(ImVec2(ox + 4.f, y + 1.f), ln_col, ln_buf);
         }
 
@@ -762,7 +950,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
 
                 float tok_w = tok.length * char_w;
-                if (tx + tok_w < ox + text_x0 || tx > ox + width) {
+                if (tx + tok_w < ox + text_x0 || tx > ox + code_w) {
                     tx += tok_w;
                     continue;
                 }
@@ -774,12 +962,16 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     }
 
 
-    if (s_has_focus && s_blink_on) {
+    if (s_has_focus) {
+        float caret_alpha_pulse = aida::ui::clock::pulse(2.0f, 0.30f, 1.0f);
         float cx = ox + text_x0 + s_sel.caret_col * char_w - s_scroll_x;
         float cy = oy + s_sel.caret_line * line_h - s_scroll_y;
         if (cy >= oy - line_h && cy <= oy + editor_h) {
             dl->AddLine(ImVec2(cx, cy), ImVec2(cx, cy + line_h),
-                        IM_COL32(230, 230, 255, static_cast<int>(220 * a)), 1.5f);
+                        aida::ui::with_alpha(th.accent_hover, caret_alpha_pulse * a), 1.5f);
+            dl->AddLine(ImVec2(cx, cy + line_h - 1.f),
+                        ImVec2(cx, cy + line_h),
+                        aida::ui::with_alpha(th.accent_u32, caret_alpha_pulse * a * 0.85f), 2.f);
         }
     }
 
@@ -868,30 +1060,48 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
 
         if (!s_ghost_text.empty()) {
+            if (s_ghost_visible_for_line != s_sel.caret_line || s_ghost_visible_for_col != s_sel.caret_col) {
+                s_ghost_visible_for_line = s_sel.caret_line;
+                s_ghost_visible_for_col  = s_sel.caret_col;
+                s_ghost_in.start(0.150f, aida::motion::ease::out_quint);
+            }
+            s_ghost_in.tick(dt);
+            s_ghost_absorb.tick(dt);
+            float gv = s_ghost_in.eased();
+            float absorb = s_ghost_absorb.is_finished() ? 0.f : (1.f - s_ghost_absorb.eased());
+            float vis_alpha = (gv * 0.45f + 0.05f) * a * (1.f - s_ghost_absorb.eased() * 0.6f);
             float gx = ox + text_x0 + s_sel.caret_col * char_w - s_scroll_x;
             float gy = oy + s_sel.caret_line * line_h - s_scroll_y;
             if (gy >= oy - line_h && gy <= oy + editor_h) {
-                dl->AddText(ImVec2(gx, gy + 1.f),
-                    IM_COL32(150, 160, 200, static_cast<int>(90 * a)),
-                    s_ghost_text.c_str());
+                ImU32 ghost_col = aida::ui::with_alpha(th.text_dim, vis_alpha);
+                dl->AddText(ImVec2(gx, gy + 1.f), ghost_col, s_ghost_text.c_str());
             }
-
+            (void)absorb;
 
             if (ImGui::IsKeyPressed(ImGuiKey_Tab, false)) {
+                s_ghost_absorb.start(0.18f, aida::motion::ease::out_quint);
                 insert_text_at_caret(s_ghost_text);
                 s_ghost_text.clear();
+                s_ghost_visible_for_line = -1;
+                s_ghost_visible_for_col  = -1;
             }
 
             if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
                 s_ghost_text.clear();
+                s_ghost_in.reset();
+                s_ghost_visible_for_line = -1;
+                s_ghost_visible_for_col  = -1;
             }
+        } else {
+            s_ghost_visible_for_line = -1;
+            s_ghost_visible_for_col  = -1;
         }
     }
 
 
     if ((s_has_focus || hovered) && !input_blocked) {
         ImVec2 mp = ImGui::GetIO().MousePos;
-        bool in_text = mp.x >= ox + text_x0 && mp.x < ox + width - 14.f && mp.y >= oy && mp.y <= oy + editor_h;
+        bool in_text = mp.x >= ox + text_x0 && mp.x < ox + code_w - 14.f && mp.y >= oy && mp.y <= oy + editor_h;
         if (mouse_over_find_bar) in_text = false;
 
         if (in_text && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -1264,40 +1474,46 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
 
     if (autocomplete::popup_visible && !autocomplete::matches.empty() && s_has_focus) {
-        float popup_w = 220.f;
-        float ac_item_h = 22.f;
-        float popup_h = std::min(static_cast<float>(autocomplete::matches.size()), 8.f) * ac_item_h + 8.f;
+        float popup_w = 240.f;
+        float ac_item_h = 24.f;
+        float popup_h = std::min(static_cast<float>(autocomplete::matches.size()), 8.f) * ac_item_h + 10.f;
         float sx = ox + text_x0 + autocomplete::cursor_col * char_w - s_scroll_x;
         float sy = oy + (autocomplete::cursor_line + 1) * line_h - s_scroll_y + 4.f;
 
-        if (sx + popup_w > ox + width) sx = ox + width - popup_w - 4.f;
+        if (sx + popup_w > ox + code_w) sx = ox + code_w - popup_w - 4.f;
         if (sy + popup_h > oy + editor_h) sy = oy + autocomplete::cursor_line * line_h - s_scroll_y - popup_h;
 
         ImDrawList* fdl = ImGui::GetForegroundDrawList();
-        fdl->AddRectFilled(ImVec2(sx, sy), ImVec2(sx + popup_w, sy + popup_h),
-            IM_COL32(20, 20, 30, 240), 6.f);
-        fdl->AddRect(ImVec2(sx, sy), ImVec2(sx + popup_w, sy + popup_h),
-            IM_COL32(80, 80, 130, 100), 6.f);
+        ImVec2 pmin(sx, sy);
+        ImVec2 pmax(sx + popup_w, sy + popup_h);
+        aida::ui::blur::render_drop_shadow(fdl, pmin, pmax, 10.f, 4, 0.40f, ImVec2(0.f, 4.f));
+        aida::ui::blur::render_glass_fill(fdl, pmin, pmax, 10.f, a);
+        aida::ui::blur::render_glass_border(fdl, pmin, pmax, 10.f, a, 1.f);
 
         for (int mi = 0; mi < static_cast<int>(autocomplete::matches.size()) && mi < 8; mi++) {
-            float iy = sy + 4.f + mi * ac_item_h;
+            float iy = sy + 5.f + mi * ac_item_h;
             float text_y = iy + (ac_item_h - ImGui::GetFontSize()) * 0.5f;
-            if (mi == autocomplete::selected)
-                fdl->AddRectFilled(ImVec2(sx + 2.f, iy), ImVec2(sx + popup_w - 2.f, iy + ac_item_h),
-                    IM_COL32(static_cast<int>(accent_r*255), static_cast<int>(accent_g*255), static_cast<int>(accent_b*255), 50), 4.f);
+            if (mi == autocomplete::selected) {
+                fdl->AddRectFilled(ImVec2(sx + 3.f, iy), ImVec2(sx + popup_w - 3.f, iy + ac_item_h),
+                    aida::ui::with_alpha(th.accent_dim, 0.55f * a), 6.f);
+                fdl->AddRectFilled(ImVec2(sx + 3.f, iy), ImVec2(sx + 5.f, iy + ac_item_h),
+                    aida::ui::with_alpha(th.accent_u32, a), 1.f);
+            }
 
             auto& match = autocomplete::matches[mi];
             size_t plen = autocomplete::partial.size();
             if (plen > 0 && plen <= match.size()) {
-                fdl->AddText(ImVec2(sx + 10.f, text_y),
-                    IM_COL32(static_cast<int>(accent_r*255), static_cast<int>(accent_g*255), static_cast<int>(accent_b*255), 255),
+                fdl->AddText(ImVec2(sx + 12.f, text_y),
+                    aida::ui::with_alpha(th.accent_u32, a),
                     match.c_str(), match.c_str() + plen);
                 float prefix_w = ImGui::CalcTextSize(match.c_str(), match.c_str() + plen).x;
-                fdl->AddText(ImVec2(sx + 10.f + prefix_w, text_y),
-                    IM_COL32(200, 200, 220, 220), match.c_str() + plen);
+                fdl->AddText(ImVec2(sx + 12.f + prefix_w, text_y),
+                    aida::ui::with_alpha(th.text_primary, 0.90f * a),
+                    match.c_str() + plen);
             } else {
-                fdl->AddText(ImVec2(sx + 10.f, text_y),
-                    IM_COL32(200, 200, 220, 220), match.c_str());
+                fdl->AddText(ImVec2(sx + 12.f, text_y),
+                    aida::ui::with_alpha(th.text_primary, 0.90f * a),
+                    match.c_str());
             }
         }
     }
@@ -1305,13 +1521,12 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
     if (s_find.visible) {
 
-        const auto& theme = themes::resolved;
-        ImVec4 accent_col(accent_r, accent_g, accent_b, 1.f);
-        ImVec4 bg     = ImGui::ColorConvertU32ToFloat4(theme.panel_header);
-        ImVec4 bg_inp = ImGui::ColorConvertU32ToFloat4(theme.bg_base);
-        ImVec4 txt1   = ImGui::ColorConvertU32ToFloat4(theme.text_primary);
-        ImVec4 txt2   = ImGui::ColorConvertU32ToFloat4(theme.text_secondary);
-        ImVec4 txt_d  = ImGui::ColorConvertU32ToFloat4(theme.text_dim);
+        ImVec4 accent_col = th.accent;
+        ImVec4 bg     = ImGui::ColorConvertU32ToFloat4(th.panel_header);
+        ImVec4 bg_inp = ImGui::ColorConvertU32ToFloat4(th.bg_base);
+        ImVec4 txt1   = ImGui::ColorConvertU32ToFloat4(th.text_primary);
+        ImVec4 txt2   = ImGui::ColorConvertU32ToFloat4(th.text_secondary);
+        ImVec4 txt_d  = ImGui::ColorConvertU32ToFloat4(th.text_dim);
 
         const float row_h       = 28.f;
         const float bar_pad_x   = 8.f;
@@ -1327,11 +1542,11 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         ImGui::SetNextWindowSize(ImVec2(bar_w, total_bar_h), ImGuiCond_Always);
 
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(bar_pad_x, bar_pad_y));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.f);
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3.f, 3.f));
         ImGui::PushStyleColor(ImGuiCol_WindowBg, bg);
-        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(accent_col.x, accent_col.y, accent_col.z, 0.35f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, 0.35f)));
 
         ImGuiWindowFlags find_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
@@ -1455,7 +1670,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             }
             if (match_buf[0]) {
                 bool no_match = (s_find.total_matches == 0 && s_find.find_buf[0] != '\0');
-                ImVec4 mc = no_match ? ImVec4(0.9f, 0.3f, 0.3f, 0.9f) : txt2;
+                ImVec4 mc = no_match ? ImGui::ColorConvertU32ToFloat4(th.error) : txt2;
                 ImGui::PushStyleColor(ImGuiCol_Text, mc);
                 ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (row_h - ImGui::GetFontSize()) * 0.5f);
                 ImGui::TextUnformatted(match_buf);
@@ -1518,23 +1733,34 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
     if (s_goto.visible) {
         float gy = wpos.y + pos_y;
-        float gw = 200.f;
+        float gw = 240.f;
         ImDrawList* fdl = ImGui::GetForegroundDrawList();
-        fdl->AddRectFilled(ImVec2(ox + 10.f, gy), ImVec2(ox + 10.f + gw, gy + 30.f),
-            IM_COL32(30, 30, 40, static_cast<int>(240 * a)), 6.f);
+        ImVec2 gmin(ox + 10.f, gy + 2.f);
+        ImVec2 gmax(ox + 10.f + gw, gy + goto_bar_h - 2.f);
+        aida::ui::blur::render_drop_shadow(fdl, gmin, gmax, 10.f, 3, 0.30f, ImVec2(0.f, 3.f));
+        aida::ui::blur::render_glass_fill(fdl, gmin, gmax, 10.f, a);
+        aida::ui::blur::render_glass_border(fdl, gmin, gmax, 10.f, a, 1.f);
 
-        ImGui::SetCursorPos(ImVec2(pos_x + 18.f, pos_y + 4.f));
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.1f, 0.1f, 0.14f, 0.9f));
-        ImGui::PushItemWidth(120.f);
-        bool go = ImGui::InputText("##goto_line", s_goto.line_buf, sizeof(s_goto.line_buf),
+        ImGui::SetCursorPos(ImVec2(pos_x + 18.f, pos_y + 6.f));
+        ImGui::PushID("##editor_goto_overlay");
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 4.f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.bg_base, 0.65f)));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(th.text_primary));
+        ImGui::SetNextItemWidth(140.f);
+        bool go = ImGui::InputTextWithHint("##goto_line", "line", s_goto.line_buf, sizeof(s_goto.line_buf),
             ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CharsDecimal);
-        ImGui::PopItemWidth();
-        ImGui::PopStyleColor();
-        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar(2);
 
         ImGui::SameLine();
-        if (ImGui::SmallButton("Go") || go) {
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 2.f);
+        bool clicked_go = aida::ui::components::button("Go",
+            aida::ui::components::button_kind_t::primary,
+            aida::ui::components::size_t_::sm);
+        ImGui::PopID();
+
+        if (clicked_go || go) {
             int n = atoi(s_goto.line_buf);
             if (n >= 1 && n <= line_count()) {
                 s_sel.caret_line = s_sel.anchor_line = n - 1;
@@ -1552,7 +1778,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         if (total_content > editor_h) {
             const float sb_w   = 10.f;
             const float sb_pad = 2.f;
-            float track_x  = ox + width - sb_w - sb_pad;
+            float track_x  = ox + code_w - sb_w - sb_pad;
             float track_y0 = oy + sb_pad;
             float track_h  = editor_h - sb_pad * 2.f;
 
@@ -1568,24 +1794,25 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
             ImGuiID sb_hov_id = ImGui::GetID("##code_sb_hov");
             float sb_a = ImGui::GetStateStorage()->GetFloat(sb_hov_id, 0.f);
-            sb_a += ((sb_hov || s_sb_dragging ? 1.f : 0.f) - sb_a) * std::min(14.f * dt, 1.f);
+            sb_a = aida::motion::smooth_lerp(sb_a, (sb_hov || s_sb_dragging) ? 1.f : 0.f, 14.f, dt);
             ImGui::GetStateStorage()->SetFloat(sb_hov_id, sb_a);
 
             if (sb_a > 0.01f) {
 
                 dl->AddRectFilled(ImVec2(track_x, track_y0),
                     ImVec2(track_x + sb_w, track_y0 + track_h),
-                    IM_COL32(255, 255, 255, static_cast<int>(8.f * sb_a * a)), 3.f);
+                    aida::ui::with_alpha(th.text_primary, 0.04f * sb_a * a), 3.f);
 
 
                 bool thumb_hov = ImGui::IsMouseHoveringRect(
                     ImVec2(track_x - 2.f, thumb_y),
                     ImVec2(track_x + sb_w + 2.f, thumb_y + thumb_h));
-                int thumb_alpha = thumb_hov || s_sb_dragging
-                    ? static_cast<int>(120.f * sb_a * a) : static_cast<int>(60.f * sb_a * a);
+                ImU32 thumb_col = aida::ui::with_alpha(
+                    (thumb_hov || s_sb_dragging) ? th.accent_u32 : th.text_secondary,
+                    (thumb_hov || s_sb_dragging ? 0.55f : 0.30f) * sb_a * a);
                 dl->AddRectFilled(ImVec2(track_x, thumb_y),
                     ImVec2(track_x + sb_w, thumb_y + thumb_h),
-                    IM_COL32(200, 200, 220, thumb_alpha), 3.f);
+                    thumb_col, 3.f);
             }
 
             if (sb_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -1610,6 +1837,97 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                     s_sb_dragging = false;
                 }
             }
+        }
+    }
+
+    if (minimap_w > 0.f && n_lines > 1) {
+        float mm_x = ox + code_w;
+        float mm_y = oy;
+        float mm_h = editor_h;
+        ImVec2 mm_min(mm_x, mm_y);
+        ImVec2 mm_max(mm_x + minimap_w, mm_y + mm_h);
+
+        bool mm_hov = ImGui::IsMouseHoveringRect(mm_min, mm_max);
+        float mm_hov_v = s_minimap_hover.eased();
+        if (mm_hov && s_minimap_hover.is_finished() && s_minimap_hover.progress < 1.f)
+            s_minimap_hover.start(0.18f, aida::motion::ease::out_quint);
+        if (!mm_hov && s_minimap_hover.is_finished() && s_minimap_hover.progress > 0.f)
+            s_minimap_hover.start_reverse(0.18f, aida::motion::ease::in_quint);
+        s_minimap_hover.tick(dt);
+
+        aida::ui::blur::render_glass_fill(dl, mm_min, mm_max, 0.f, a);
+        dl->AddLine(ImVec2(mm_x, mm_y), ImVec2(mm_x, mm_y + mm_h),
+            aida::ui::with_alpha(th.border_subtle, a), 1.f);
+
+        float mm_line_h = (n_lines > 0) ? (mm_h / (float)n_lines) : 1.f;
+        if (mm_line_h > 4.f) mm_line_h = 4.f;
+        if (mm_line_h < 1.f) mm_line_h = 1.f;
+        float mm_char_step = (minimap_w - 8.f) / 80.f;
+        if (mm_char_step < 0.6f) mm_char_step = 0.6f;
+
+        int mm_first = 0;
+        int mm_last  = std::min(n_lines - 1, 4000);
+
+        for (int i = mm_first; i <= mm_last; i++) {
+            if (i >= (int)s_cache.tokens.size()) break;
+            float ly = mm_y + (float)i * mm_line_h;
+            if (ly + mm_line_h < mm_y || ly > mm_y + mm_h) continue;
+
+            const auto& toks = s_cache.tokens[i];
+            const auto& ln_text = s_cache.lines[i];
+            float lx = mm_x + 4.f;
+            for (const auto& tok : toks) {
+                if (tok.type == syntax::token_type::whitespace) {
+                    for (uint32_t k = 0; k < tok.length; k++) {
+                        char c = ln_text[tok.start + k];
+                        if (c == '\t') lx += mm_char_step * (float)editor_config::tab_size;
+                        else lx += mm_char_step;
+                    }
+                    continue;
+                }
+                if (tok.start + tok.length > (uint32_t)ln_text.size()) continue;
+                ImU32 tc = tok_colors[(int)tok.type];
+                tc = aida::ui::with_alpha(tc, 0.55f * a);
+                float seg_w = (float)tok.length * mm_char_step;
+                if (lx + seg_w > mm_max.x - 4.f) seg_w = (mm_max.x - 4.f) - lx;
+                if (seg_w < 0.5f) { lx += seg_w; continue; }
+                dl->AddRectFilled(ImVec2(lx, ly + 0.5f),
+                                  ImVec2(lx + seg_w, ly + mm_line_h - 0.5f), tc);
+                lx += (float)tok.length * mm_char_step;
+                if (lx > mm_max.x - 4.f) break;
+            }
+        }
+
+        if (n_lines > 0) {
+            float view_y0 = mm_y + (s_scroll_y / std::max(1.f, n_lines * line_h)) * mm_h;
+            float view_h  = (editor_h / std::max(1.f, n_lines * line_h)) * mm_h;
+            if (view_h < 12.f) view_h = 12.f;
+            if (view_y0 + view_h > mm_y + mm_h) view_y0 = mm_y + mm_h - view_h;
+            ImVec2 vmin(mm_x + 1.f, view_y0);
+            ImVec2 vmax(mm_max.x - 1.f, view_y0 + view_h);
+            dl->AddRectFilled(vmin, vmax,
+                aida::ui::with_alpha(th.accent_glow, (0.55f + mm_hov_v * 0.35f) * a), 4.f);
+            dl->AddRect(vmin, vmax,
+                aida::ui::with_alpha(th.accent_u32, (0.45f + mm_hov_v * 0.35f) * a),
+                4.f, 0, 1.f);
+        }
+
+        float caret_mm_y = mm_y + ((float)s_sel.caret_line / std::max(1.f, (float)n_lines)) * mm_h;
+        dl->AddLine(ImVec2(mm_x + 2.f, caret_mm_y),
+                    ImVec2(mm_max.x - 2.f, caret_mm_y),
+                    aida::ui::with_alpha(th.accent_u32, 0.65f * a), 1.f);
+
+        if (mm_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            float local = (ImGui::GetIO().MousePos.y - mm_y) / mm_h;
+            if (local < 0.f) local = 0.f;
+            if (local > 1.f) local = 1.f;
+            s_target_scroll_y = local * std::max(0.f, n_lines * line_h - editor_h * 0.5f);
+        }
+        if (mm_hov && ImGui::IsMouseDown(ImGuiMouseButton_Left) && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.f)) {
+            float local = (ImGui::GetIO().MousePos.y - mm_y) / mm_h;
+            if (local < 0.f) local = 0.f;
+            if (local > 1.f) local = 1.f;
+            s_target_scroll_y = local * std::max(0.f, n_lines * line_h - editor_h * 0.5f);
         }
     }
 

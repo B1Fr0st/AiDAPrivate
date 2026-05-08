@@ -23,6 +23,17 @@
 #include "standalone_chat.hpp"
 #include "standalone_driver.hpp"
 
+#include "../ui/avatar.hpp"
+#include "../ui/blur_layer.hpp"
+#include "../ui/brand.hpp"
+#include "../ui/clock.hpp"
+#include "../ui/components.hpp"
+#include "../ui/empty_state.hpp"
+#include "../ui/fonts.hpp"
+#include "../ui/motion.hpp"
+#include "../ui/theme.hpp"
+#include "../ui/transition.hpp"
+
 
 namespace aida::session_history {
 
@@ -55,6 +66,51 @@ namespace aida::session_history {
 			bool        archived = false;
 		};
 
+		struct row_anim_t
+		{
+			aida::ui::hover_state_t hover;
+			aida::ui::transition_t  entrance;
+			aida::ui::transition_t  arrow_rotate;
+			bool                    arrow_collapsed = false;
+		};
+
+		enum class group_kind_t : int
+		{
+			today = 0,
+			yesterday,
+			this_week,
+			this_month,
+			older,
+			count
+		};
+
+		inline const char* group_label(group_kind_t k)
+		{
+			switch (k) {
+			case group_kind_t::today:       return "Today";
+			case group_kind_t::yesterday:   return "Yesterday";
+			case group_kind_t::this_week:   return "This week";
+			case group_kind_t::this_month:  return "This month";
+			case group_kind_t::older:       return "Older";
+			default: return "";
+			}
+		}
+
+		inline group_kind_t classify_unix_ms(int64_t unix_ms)
+		{
+			if (unix_ms <= 0) return group_kind_t::older;
+			const int64_t now_ms = static_cast<int64_t>(
+				std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::system_clock::now().time_since_epoch()).count());
+			int64_t delta_s = (now_ms - unix_ms) / 1000;
+			if (delta_s < 0) delta_s = 0;
+			if (delta_s < 86400) return group_kind_t::today;
+			if (delta_s < 86400 * 2) return group_kind_t::yesterday;
+			if (delta_s < 86400 * 7) return group_kind_t::this_week;
+			if (delta_s < 86400 * 31) return group_kind_t::this_month;
+			return group_kind_t::older;
+		}
+
 		struct state_t
 		{
 			std::mutex                                   mtx;
@@ -80,6 +136,8 @@ namespace aida::session_history {
 			double                                       total_all_cost = 0.0;
 			aida::events::subscription_handle_t          sub_compacted;
 			aida::events::subscription_handle_t          sub_binary_loaded;
+			std::unordered_map<std::string, row_anim_t>  row_anims;
+			std::string                                  last_visible_signature;
 		};
 
 		inline state_t& g_state()
@@ -470,6 +528,7 @@ namespace aida::session_history {
 		st.children_index.clear();
 		st.collapsed_parents.clear();
 		st.compacted_cache.clear();
+		st.row_anims.clear();
 	}
 
 
@@ -493,49 +552,46 @@ namespace aida::session_history {
 		if (panel_w < 8.f || panel_h < 8.f) return;
 
 		state_t& st = g_state();
+		const auto& th = aida::ui::resolved();
+		const float dt = aida::ui::clock::dt();
 		maybe_refresh();
 
 		ImGui::PushID("##aida_session_history");
 
-		const float toolbar_h = 28.f;
-		const float footer_h  = 36.f;
-		const float row_h     = 22.f;
-
-		const ImU32 col_text     = IM_COL32(220, 222, 235, 240);
-		const ImU32 col_dim      = IM_COL32(150, 150, 170, 200);
-		const ImU32 col_faint    = IM_COL32(110, 115, 130, 200);
-		const ImU32 col_sel      = IM_COL32(70, 72, 110, 140);
-		const ImU32 col_hov      = IM_COL32(255, 255, 255, 18);
-		const ImU32 col_active   = IM_COL32(120, 130, 220, 200);
-		const ImU32 col_archived = IM_COL32(160, 120, 100, 220);
-		const ImU32 col_tree     = IM_COL32(110, 115, 130, 130);
+		const float toolbar_h = 36.f;
+		const float footer_h  = 44.f;
+		const float row_h     = 30.f;
 
 		{
-			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4.f, 4.f));
-			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, 3.f));
 			float toolbar_w = panel_w - 8.f;
+			float new_btn_w = 32.f;
+			float arch_w = 110.f;
+			float search_w = toolbar_w - new_btn_w - arch_w - 16.f;
+			if (search_w < 80.f) search_w = 80.f;
 			ImGui::SetCursorPos(ImVec2(4.f, 4.f));
-			ImGui::PushItemWidth(toolbar_w * 0.55f);
 			char tmp_buf[128];
-			{ std::lock_guard<std::mutex> lk(st.mtx); memcpy(tmp_buf, st.search_buf, sizeof(tmp_buf)); }
-			if (ImGui::InputTextWithHint("##sh_search", "search sessions", tmp_buf, sizeof(tmp_buf))) {
+			{ std::lock_guard<std::mutex> lk(st.mtx); std::memcpy(tmp_buf, st.search_buf, sizeof(tmp_buf)); }
+			if (aida::ui::input_text("##sh_search", tmp_buf, sizeof(tmp_buf),
+					"Search sessions", false, ImVec2(search_w, 28.f))) {
 				std::lock_guard<std::mutex> lk(st.mtx);
-				memcpy(st.search_buf, tmp_buf, sizeof(st.search_buf));
+				std::memcpy(st.search_buf, tmp_buf, sizeof(st.search_buf));
 				rebuild_visible_locked(st);
 			}
-			ImGui::PopItemWidth();
-			ImGui::SameLine(0.f, 4.f);
-			if (ImGui::SmallButton("+ New")) create_new_session();
-			if (ImGui::IsItemHovered()) ImGui::SetTooltip("New session (Ctrl+N)");
-			ImGui::SameLine(0.f, 4.f);
+			ImGui::SetCursorPos(ImVec2(4.f + search_w + 6.f, 4.f));
+			if (aida::ui::button("+##sh_new",
+					aida::ui::button_kind_t::primary,
+					aida::ui::size_t_::sm,
+					ImVec2(new_btn_w, 28.f))) {
+				create_new_session();
+			}
+			ImGui::SetCursorPos(ImVec2(4.f + search_w + 6.f + new_btn_w + 8.f, 9.f));
 			bool show_arch_local;
 			{ std::lock_guard<std::mutex> lk(st.mtx); show_arch_local = st.show_archived; }
-			if (ImGui::Checkbox("Archived", &show_arch_local)) {
+			if (aida::ui::toggle_switch("Archived##sh_archived", &show_arch_local, aida::ui::size_t_::sm)) {
 				std::lock_guard<std::mutex> lk(st.mtx);
 				st.show_archived = show_arch_local;
 				rebuild_visible_locked(st);
 			}
-			ImGui::PopStyleVar(2);
 		}
 
 		float body_y = 4.f + toolbar_h;
@@ -566,6 +622,23 @@ namespace aida::session_history {
 			for (const auto& kv : st.children_index) child_count_for[kv.first] = kv.second.size();
 		}
 
+		std::string sig;
+		sig.reserve(visible_copy.size() * 16);
+		for (size_t vi : visible_copy) sig.append(rows_copy[vi].id).push_back(';');
+		bool first_render_this_filter = false;
+		{
+			std::lock_guard<std::mutex> lk(st.mtx);
+			if (sig != st.last_visible_signature) {
+				st.last_visible_signature = sig;
+				first_render_this_filter = true;
+				for (size_t vi = 0; vi < visible_copy.size(); ++vi) {
+					auto& ra = st.row_anims[rows_copy[visible_copy[vi]].id];
+					ra.entrance.start(0.36f, aida::motion::ease::out_quint, 0.018f * vi);
+				}
+			}
+		}
+		(void)first_render_this_filter;
+
 		ImDrawList* dl = ImGui::GetWindowDrawList();
 
 		struct ctx_payload_t {
@@ -576,90 +649,184 @@ namespace aida::session_history {
 		} ctx_payload;
 
 		if (visible_copy.empty()) {
-			ImGui::SetCursorPos(ImVec2(8.f, 12.f));
-			ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.7f, 0.9f), "No sessions for this binary.");
+			ImVec2 region_pos = ImGui::GetCursorScreenPos();
+			ImVec2 region_size(panel_w, body_h);
+			aida::ui::empty_state::config_t cfg;
+			cfg.glyph = aida::ui::empty_state::glyph_t::message;
+			cfg.title = "No sessions yet";
+			cfg.body = "Press + to start a new chat session for this binary.";
+			cfg.max_width = panel_w * 0.85f;
+			aida::ui::empty_state::render(region_pos, region_size, cfg);
 		}
 
+		group_kind_t last_group = group_kind_t::count;
 		for (size_t vi = 0; vi < visible_copy.size(); ++vi) {
 			const auto& r = rows_copy[visible_copy[vi]];
 			bool is_active = !r.id.empty() && r.id == active_id_copy;
 			bool is_selected = !r.id.empty() && r.id == selected_id_copy;
 			bool archived = r.time_archived_unix > 0;
 
-			float indent = 6.f + (float)r.depth * 14.f;
+			if (r.depth == 0) {
+				group_kind_t g = classify_unix_ms(r.time_updated_unix);
+				if (g != last_group) {
+					last_group = g;
+					ImVec2 hp = ImGui::GetCursorScreenPos();
+					float hh = 22.f;
+					dl->AddText(aida::ui::fonts::caption(), 11.f,
+						ImVec2(hp.x + 12.f, hp.y + 4.f),
+						aida::ui::with_alpha(th.text_dim, 0.95f),
+						group_label(g));
+					dl->AddLine(
+						ImVec2(hp.x + 12.f + ImGui::CalcTextSize(group_label(g)).x + 8.f, hp.y + hh * 0.5f),
+						ImVec2(hp.x + panel_w - 14.f, hp.y + hh * 0.5f),
+						aida::ui::with_alpha(th.border_subtle, 0.7f), 1.f);
+					ImGui::Dummy(ImVec2(panel_w, hh));
+				}
+			}
+
+			row_anim_t* ra = nullptr;
+			{
+				std::lock_guard<std::mutex> lk(st.mtx);
+				ra = &st.row_anims[r.id];
+			}
+			ra->entrance.tick(dt);
+			ra->arrow_rotate.tick(dt);
+			float ent_p = ra->entrance.eased();
+			float ent_y = (1.f - ent_p) * 8.f;
+			float ent_alpha = ent_p;
+
+			float indent = 8.f + (float)r.depth * 14.f;
 			ImVec2 cp = ImGui::GetCursorScreenPos();
-			ImVec2 rmin(cp.x, cp.y);
-			ImVec2 rmax(cp.x + panel_w, cp.y + row_h);
-			bool hov = ImGui::IsMouseHoveringRect(rmin, rmax, false);
+			cp.y += ent_y;
 
-			if (r.depth > 0) {
-				float vline_x = cp.x + 6.f + (float)(r.depth - 1) * 14.f + 6.f;
-				dl->AddLine(ImVec2(vline_x, cp.y), ImVec2(vline_x, cp.y + row_h), col_tree, 1.f);
-				dl->AddLine(ImVec2(vline_x, cp.y + row_h * 0.5f),
-					ImVec2(vline_x + 8.f, cp.y + row_h * 0.5f), col_tree, 1.f);
-			}
-
-			if (is_selected) dl->AddRectFilled(rmin, rmax, col_sel);
-			else if (hov) dl->AddRectFilled(rmin, rmax, col_hov);
-
-			float arrow_x = rmin.x + indent;
-			bool has_children = child_count_for.count(r.id) > 0 && child_count_for[r.id] > 0;
-			if (has_children) {
-				bool collapsed = collapsed_copy.count(r.id) > 0;
-				const char* ar = collapsed ? ">" : "v";
-				dl->AddText(ImVec2(arrow_x, rmin.y + 3.f), col_dim, ar);
-			}
-			float title_x = arrow_x + 14.f;
-
-			if (is_active) dl->AddCircleFilled(ImVec2(title_x - 6.f, rmin.y + row_h * 0.5f), 3.f, col_active);
-
-			std::string display_title = r.title;
-			if (display_title.empty()) display_title = r.id.substr(0, 8);
-			if (r.has_compaction) display_title = std::string("[C] ") + display_title;
-			if (archived) display_title = std::string("(archived) ") + display_title;
-
-			ImU32 title_col = archived ? col_archived : col_text;
-			dl->AddText(ImVec2(title_x, rmin.y + 3.f), title_col, display_title.c_str());
-
-			std::string time_str = format_relative_time_str(r.time_updated_unix);
-			std::string cost_str = format_cost_str(r.total_cost_usd);
-			std::string right_str = cost_str + std::string("  ") + time_str;
-			ImVec2 rs = ImGui::CalcTextSize(right_str.c_str());
-			float right_x = rmax.x - 8.f - rs.x;
-			if (right_x < title_x + ImGui::CalcTextSize(display_title.c_str()).x + 12.f) {
-				right_x = title_x + ImGui::CalcTextSize(display_title.c_str()).x + 12.f;
-				if (right_x > rmax.x - 8.f - rs.x * 0.5f) right_x = rmax.x - 8.f - rs.x;
-			}
-			dl->AddText(ImVec2(right_x, rmin.y + 3.f), col_faint, right_str.c_str());
-
-			ImGui::SetCursorScreenPos(rmin);
 			ImGui::PushID((int)vi);
+			ImGui::SetCursorScreenPos(cp);
 			ImGui::InvisibleButton("##sh_row", ImVec2(panel_w, row_h));
+			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 			bool dbl = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
 			bool right_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Right);
 
-			if (ImGui::IsItemHovered()) {
-				ImGui::BeginTooltip();
-				ImGui::TextUnformatted(display_title.c_str());
-				ImGui::Separator();
-				char tk_buf[256];
-				snprintf(tk_buf, sizeof(tk_buf),
-					"in: %lld   out: %lld\ncache r: %lld   w: %lld\nupdated: %s",
-					(long long)r.in_tokens, (long long)r.out_tokens,
-					(long long)r.cache_read, (long long)r.cache_write,
-					format_relative_time_str(r.time_updated_unix).c_str());
-				ImGui::TextUnformatted(tk_buf);
-				if (!r.last_msg_costs.empty()) {
-					ImGui::Separator();
-					ImGui::TextUnformatted("Last messages:");
-					for (const auto& mc : r.last_msg_costs) {
-						char l[128];
-						snprintf(l, sizeof(l), "  %s  %s", mc.first.c_str(), format_cost_str(mc.second).c_str());
-						ImGui::TextUnformatted(l);
-					}
+			float hov_v = ra->hover.tick(hov, dt, aida::motion::spring::playful);
+			float lift = hov_v * 2.f;
+			ImVec2 rmin(cp.x + 4.f, cp.y - lift);
+			ImVec2 rmax(cp.x + panel_w - 4.f, cp.y + row_h - 2.f - lift);
+
+			if (is_selected) {
+				dl->AddRectFilled(rmin, rmax,
+					aida::ui::with_alpha(th.selection, ent_alpha * 0.85f), 8.f);
+				dl->AddRect(rmin, rmax,
+					aida::ui::with_alpha(th.accent_u32, ent_alpha), 8.f, 0, 1.5f);
+				aida::ui::blur::render_inner_glow(dl, rmin, rmax, 8.f,
+					aida::ui::with_alpha(th.accent_glow, ent_alpha), 3);
+			} else if (hov_v > 0.02f) {
+				dl->AddRectFilled(rmin, rmax,
+					aida::ui::with_alpha(th.hover_wash, ent_alpha * hov_v), 8.f);
+				if (hov_v > 0.05f) {
+					aida::ui::blur::render_inner_glow(dl, rmin, rmax, 8.f,
+						aida::ui::with_alpha(th.accent_glow, ent_alpha * hov_v * 0.4f), 2);
 				}
-				ImGui::EndTooltip();
+			}
+
+			if (r.depth > 0) {
+				float vline_x = cp.x + 8.f + (float)(r.depth - 1) * 14.f + 6.f;
+				dl->AddLine(ImVec2(vline_x, cp.y - lift),
+					ImVec2(vline_x, cp.y + row_h - lift),
+					aida::ui::with_alpha(th.border_subtle, ent_alpha * 0.7f), 1.f);
+				dl->AddLine(ImVec2(vline_x, cp.y + row_h * 0.5f - lift),
+					ImVec2(vline_x + 8.f, cp.y + row_h * 0.5f - lift),
+					aida::ui::with_alpha(th.border_subtle, ent_alpha * 0.7f), 1.f);
+			}
+
+			float arrow_x = rmin.x + indent;
+			float arrow_y = (rmin.y + rmax.y) * 0.5f;
+			bool has_children = child_count_for.count(r.id) > 0 && child_count_for[r.id] > 0;
+			bool collapsed = collapsed_copy.count(r.id) > 0;
+			if (has_children) {
+				if (ra->arrow_collapsed != collapsed) {
+					ra->arrow_collapsed = collapsed;
+					if (!collapsed)
+						ra->arrow_rotate.start(0.18f, aida::motion::ease::out_cubic);
+					else
+						ra->arrow_rotate.start_reverse(0.18f, aida::motion::ease::in_cubic);
+				}
+				float p = ra->arrow_rotate.eased();
+				float ang = (1.f - p) * 0.f + p * 1.5707963f;
+				if (collapsed) ang = (1.f - p) * 1.5707963f;
+				ImVec2 t0(-3.f, -3.f), t1(3.f, 0.f), t2(-3.f, 3.f);
+				float ca = cosf(ang), sa = sinf(ang);
+				ImVec2 p0(arrow_x + t0.x * ca - t0.y * sa, arrow_y + t0.x * sa + t0.y * ca);
+				ImVec2 p1(arrow_x + t1.x * ca - t1.y * sa, arrow_y + t1.x * sa + t1.y * ca);
+				ImVec2 p2(arrow_x + t2.x * ca - t2.y * sa, arrow_y + t2.x * sa + t2.y * ca);
+				dl->AddTriangleFilled(p0, p1, p2,
+					aida::ui::with_alpha(th.text_secondary, ent_alpha));
+			}
+			float title_x = arrow_x + 14.f;
+
+			if (is_active) {
+				dl->AddCircleFilled(ImVec2(title_x - 6.f, arrow_y), 3.f,
+					aida::ui::with_alpha(th.accent_u32, ent_alpha));
+			}
+
+			std::string display_title = r.title;
+			if (display_title.empty()) display_title = r.id.substr(0, 8);
+
+			ImU32 title_col = archived
+				? aida::ui::with_alpha(th.text_dim, ent_alpha * 0.8f)
+				: aida::ui::with_alpha(th.text_primary, ent_alpha);
+			dl->AddText(aida::ui::fonts::body(), 13.f,
+				ImVec2(title_x, rmin.y + 5.f), title_col, display_title.c_str());
+
+			if (r.has_compaction) {
+				ImVec2 ds = aida::ui::fonts::body()->CalcTextSizeA(13.f, FLT_MAX, 0.f, display_title.c_str());
+				ImGui::SetCursorScreenPos(ImVec2(title_x + ds.x + 8.f, rmin.y + 5.f));
+				aida::ui::badge("C", aida::ui::with_alpha(th.warning, ent_alpha * 0.85f), 4.f);
+			}
+			if (archived) {
+				ImVec2 ds = aida::ui::fonts::body()->CalcTextSizeA(13.f, FLT_MAX, 0.f, display_title.c_str());
+				ImGui::SetCursorScreenPos(ImVec2(title_x + ds.x + (r.has_compaction ? 30.f : 8.f), rmin.y + 5.f));
+				aida::ui::badge("archived", aida::ui::with_alpha(th.text_dim, ent_alpha * 0.85f), 4.f);
+			}
+
+			std::string time_str = format_relative_time_str(r.time_updated_unix);
+			std::string cost_str = format_cost_str(r.total_cost_usd);
+			std::string right_str = cost_str + std::string("  ") + time_str;
+			ImVec2 rs = aida::ui::fonts::caption()->CalcTextSizeA(11.f, FLT_MAX, 0.f, right_str.c_str());
+			float right_x = rmax.x - 8.f - rs.x;
+			dl->AddText(aida::ui::fonts::caption(), 11.f,
+				ImVec2(right_x, rmin.y + 8.f),
+				aida::ui::with_alpha(th.text_dim, ent_alpha * 0.95f), right_str.c_str());
+
+			if (ImGui::IsItemHovered()) {
+				const auto& tt = aida::ui::resolved();
+				ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(tt.bg_overlay));
+				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.f, 8.f));
+				if (ImGui::BeginTooltip()) {
+					ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(tt.text_primary));
+					ImGui::TextUnformatted(display_title.c_str());
+					ImGui::Separator();
+					char tk_buf[256];
+					snprintf(tk_buf, sizeof(tk_buf),
+						"in: %lld   out: %lld\ncache r: %lld   w: %lld\nupdated: %s",
+						(long long)r.in_tokens, (long long)r.out_tokens,
+						(long long)r.cache_read, (long long)r.cache_write,
+						format_relative_time_str(r.time_updated_unix).c_str());
+					ImGui::TextUnformatted(tk_buf);
+					if (!r.last_msg_costs.empty()) {
+						ImGui::Separator();
+						ImGui::TextUnformatted("Last messages:");
+						for (const auto& mc : r.last_msg_costs) {
+							char l[128];
+							snprintf(l, sizeof(l), "  %s  %s", mc.first.c_str(), format_cost_str(mc.second).c_str());
+							ImGui::TextUnformatted(l);
+						}
+					}
+					ImGui::PopStyleColor();
+					ImGui::EndTooltip();
+				}
+				ImGui::PopStyleVar();
+				ImGui::PopStyleColor();
+
 				if (!r.last_msg_costs_loaded) {
 					std::vector<std::pair<std::string, double>> tmp;
 					compute_last_costs(r.id, tmp);
@@ -676,9 +843,12 @@ namespace aida::session_history {
 				std::lock_guard<std::mutex> lk(st.mtx);
 				st.selected_id = r.id;
 				if (has_children) {
-					if (collapsed_copy.count(r.id) > 0) st.collapsed_parents.erase(r.id);
-					else if (cp.x + indent + 12.f >= ImGui::GetIO().MousePos.x) st.collapsed_parents.insert(r.id);
-					rebuild_visible_locked(st);
+					ImVec2 mp = ImGui::GetIO().MousePos;
+					if (mp.x < arrow_x + 12.f) {
+						if (collapsed_copy.count(r.id) > 0) st.collapsed_parents.erase(r.id);
+						else st.collapsed_parents.insert(r.id);
+						rebuild_visible_locked(st);
+					}
 				}
 			}
 			if (dbl) open_session_internal(r.id);
@@ -690,6 +860,7 @@ namespace aida::session_history {
 			}
 
 			ImGui::PopID();
+			ImGui::SetCursorScreenPos(ImVec2(cp.x, cp.y - ent_y + row_h));
 		}
 
 		ImGui::EndChild();
@@ -714,9 +885,9 @@ namespace aida::session_history {
 			if (ImGui::MenuItem("Rename")) {
 				std::lock_guard<std::mutex> lk(st.mtx);
 				st.rename_target_id = target.id;
-				memset(st.rename_buf, 0, sizeof(st.rename_buf));
+				std::memset(st.rename_buf, 0, sizeof(st.rename_buf));
 				size_t cn = (std::min<size_t>)(target.title.size(), sizeof(st.rename_buf) - 1);
-				memcpy(st.rename_buf, target.title.data(), cn);
+				std::memcpy(st.rename_buf, target.title.data(), cn);
 				st.open_rename_popup = true;
 			}
 			if (ImGui::MenuItem(target.archived ? "Unarchive" : "Archive"))
@@ -742,19 +913,23 @@ namespace aida::session_history {
 			std::string id_local;
 			{
 				std::lock_guard<std::mutex> lk(st.mtx);
-				memcpy(buf, st.rename_buf, sizeof(buf));
+				std::memcpy(buf, st.rename_buf, sizeof(buf));
 				id_local = st.rename_target_id;
 			}
 			ImGui::SetNextItemWidth(360.f);
 			bool submit = ImGui::InputText("##sh_rename_in", buf, sizeof(buf),
 				ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
-			{ std::lock_guard<std::mutex> lk(st.mtx); memcpy(st.rename_buf, buf, sizeof(st.rename_buf)); }
-			if (submit || ImGui::Button("OK", ImVec2(80.f, 0.f))) {
+			{ std::lock_guard<std::mutex> lk(st.mtx); std::memcpy(st.rename_buf, buf, sizeof(st.rename_buf)); }
+			if (submit || aida::ui::button("OK", aida::ui::button_kind_t::primary,
+					aida::ui::size_t_::md, ImVec2(80.f, 28.f))) {
 				rename_session(id_local, std::string(buf));
 				ImGui::CloseCurrentPopup();
 			}
 			ImGui::SameLine();
-			if (ImGui::Button("Cancel", ImVec2(80.f, 0.f))) ImGui::CloseCurrentPopup();
+			if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary,
+					aida::ui::size_t_::md, ImVec2(80.f, 28.f))) {
+				ImGui::CloseCurrentPopup();
+			}
 			ImGui::EndPopup();
 		}
 
@@ -769,20 +944,29 @@ namespace aida::session_history {
 			ImGui::Text("Delete this session permanently?");
 			ImGui::TextDisabled("%s", id_local.c_str());
 			ImGui::Separator();
-			if (ImGui::Button("Delete", ImVec2(90.f, 0.f))) {
+			if (aida::ui::button("Delete", aida::ui::button_kind_t::destructive,
+					aida::ui::size_t_::md, ImVec2(90.f, 28.f))) {
 				delete_session(id_local);
 				ImGui::CloseCurrentPopup();
 			}
 			ImGui::SameLine();
-			if (ImGui::Button("Cancel", ImVec2(90.f, 0.f))) ImGui::CloseCurrentPopup();
+			if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary,
+					aida::ui::size_t_::md, ImVec2(90.f, 28.f))) {
+				ImGui::CloseCurrentPopup();
+			}
 			ImGui::EndPopup();
 		}
 
 		{
 			float fy = panel_h - footer_h;
 			ImGui::SetCursorPos(ImVec2(0.f, fy));
-			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.f, 3.f));
-			ImGui::BeginChild("##sh_footer", ImVec2(panel_w, footer_h), false, ImGuiWindowFlags_NoBackground);
+			ImVec2 fpos = ImGui::GetCursorScreenPos();
+			ImDrawList* fdl = ImGui::GetWindowDrawList();
+			ImVec2 fa(fpos.x + 4.f, fpos.y);
+			ImVec2 fb(fpos.x + panel_w - 4.f, fpos.y + footer_h - 2.f);
+			fdl->AddRectFilled(fa, fb, aida::ui::with_alpha(th.panel_header, 0.55f), 8.f);
+			fdl->AddRect(fa, fb, aida::ui::with_alpha(th.border_subtle, 0.85f), 8.f, 0, 1.f);
+
 			double total_visible_local = 0.0;
 			double total_all_local = 0.0;
 			std::string sel_id_local;
@@ -800,19 +984,39 @@ namespace aida::session_history {
 				std::vector<aida::session::message_t> msgs;
 				if (aida::session::list_messages(sel_id_local, msgs, -1)) sel_msg_count = (int)msgs.size();
 			}
-			char l1[128], l2[160];
-			snprintf(l1, sizeof(l1), "Visible: %s   All: %s",
-				format_cost_str(total_visible_local).c_str(),
-				format_cost_str(total_all_local).c_str());
-			if (!sel_id_local.empty())
-				snprintf(l2, sizeof(l2), "Selected: %s across %d messages",
-					format_cost_str(sel_cost).c_str(), sel_msg_count);
-			else
-				snprintf(l2, sizeof(l2), "Selected: -");
-			ImGui::TextColored(ImVec4(0.66f, 0.66f, 0.78f, 0.9f), "%s", l1);
-			ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.7f, 0.9f), "%s", l2);
-			ImGui::EndChild();
-			ImGui::PopStyleVar();
+
+			ImFont* cap = aida::ui::fonts::caption();
+			if (!cap) cap = ImGui::GetFont();
+			ImFont* body = aida::ui::fonts::body();
+			if (!body) body = ImGui::GetFont();
+
+			std::string vis_v = format_cost_str(total_visible_local);
+			std::string all_v = format_cost_str(total_all_local);
+			std::string sel_v;
+			if (!sel_id_local.empty()) {
+				char tmp[64];
+				snprintf(tmp, sizeof(tmp), "%s · %d msg", format_cost_str(sel_cost).c_str(), sel_msg_count);
+				sel_v = tmp;
+			} else {
+				sel_v = "—";
+			}
+
+			float col_w = (fb.x - fa.x) / 3.f;
+			float row1_y = fa.y + 4.f;
+			float row2_y = fa.y + 20.f;
+
+			auto draw_metric = [&](float cx0, const char* lbl, const std::string& val){
+				fdl->AddText(cap, 10.f, ImVec2(cx0 + 8.f, row1_y),
+					aida::ui::with_alpha(th.text_dim, 0.95f), lbl);
+				fdl->AddText(body, 12.f, ImVec2(cx0 + 8.f, row2_y),
+					aida::ui::with_alpha(th.text_primary, 0.95f), val.c_str());
+			};
+
+			draw_metric(fa.x + 0.f * col_w, "VISIBLE", vis_v);
+			draw_metric(fa.x + 1.f * col_w, "ALL", all_v);
+			draw_metric(fa.x + 2.f * col_w, "SELECTED", sel_v);
+
+			ImGui::Dummy(ImVec2(panel_w, footer_h));
 		}
 
 		ImGui::PopID();

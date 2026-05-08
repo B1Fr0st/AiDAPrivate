@@ -46,9 +46,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	st.anim_time += ImGui::GetIO().DeltaTime;
 	float dt = ImGui::GetIO().DeltaTime;
 
-	const auto& _t = themes::resolved;
+	const auto& _t = aida::ui::resolved();
 	const auto _ta = [alpha](ImU32 c) -> ImU32 {
-		return ui_anim::theme_alpha(c, alpha);
+		return aida::ui::with_alpha(c, alpha);
 	};
 	const ImU32 bg        = _ta(_t.bg_base);
 	const ImU32 text_col  = _ta(_t.text_primary);

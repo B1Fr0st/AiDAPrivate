@@ -3,13 +3,17 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
+const capturedQueries = [];
 const poolPath = require.resolve('../db/pool');
 require.cache[poolPath] = {
     id: poolPath,
     filename: poolPath,
     loaded: true,
     exports: {
-        query: async () => ({ rows: [], rowCount: 0 }),
+        query: async (sql, params) => {
+            capturedQueries.push({ sql, params });
+            return { rows: [], rowCount: 0 };
+        },
         end: async () => {},
     },
 };
@@ -65,4 +69,32 @@ test('startup ban check accepts unique current and legacy hwids', () => {
     });
 
     assert.deepEqual(hwids, ['CURRENT-HWID-1234', 'LEGACY-HWID-5678']);
+});
+
+test('storeSession upsert resets last_gate_bitmap to prevent cross-session regression false positives', async () => {
+    capturedQueries.length = 0;
+    await licenseRouter._internal.storeSession('AIDA-TEST-0000-0000-0000', {
+        session_token: 'stub_session_token_for_test',
+        server_nonce: '00112233445566778899aabbccddeeff',
+        issued_at: 1700000000,
+        ttl: 3600,
+        hwid: 'TESTHWID00000001',
+        ip: '127.0.0.1',
+        plugin_version: 'aida-test',
+        last_heartbeat: 1700000000,
+        honeypot_export: 'noop_honeypot_aabbcc',
+        challenge_id: '',
+    });
+
+    const upsert = capturedQueries.find(q =>
+        typeof q.sql === 'string' &&
+        q.sql.includes('INSERT INTO sessions') &&
+        q.sql.includes('ON CONFLICT (license_key) DO UPDATE SET'));
+    assert.ok(upsert, 'storeSession must emit an INSERT ... ON CONFLICT upsert');
+
+    const updateClause = upsert.sql.split('DO UPDATE SET')[1] || '';
+    assert.match(updateClause, /last_gate_bitmap\s*=\s*0/,
+        'ON CONFLICT DO UPDATE clause must reset last_gate_bitmap to 0 — otherwise a stale bitmap from a previous session causes a false-positive heartbeat_gate_bitmap_regression on the next activation');
+    assert.match(updateClause, /heartbeat_count\s*=\s*0/,
+        'ON CONFLICT DO UPDATE clause must reset heartbeat_count alongside last_gate_bitmap so all monotonic per-session fields are zeroed together');
 });

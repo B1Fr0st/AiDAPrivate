@@ -1,4 +1,4 @@
-/* C:\Users\ruar1337\AiDAPrivate\build-ninja\Release\WindMapper.exe (5/7/2026 1:01:47 PM)
+/* C:\Users\ruar1337\AiDAPrivate\build-ninja\Release\WindMapper.exe (5/7/2026 4:13:59 PM)
    StartOffset(h): 00000000, EndOffset(h): 00042DFF, Length(h): 00042E00 */
 
 unsigned char rawData[273920] = {

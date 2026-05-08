@@ -86,14 +86,15 @@ namespace
         g_last_error = text;
         if (!text.empty()) {
             logf("AiDA Standalone: %s\n", text.c_str());
-            toast_notification::push(text);
+            toast_notification::push(text, toast_notification::toast_type_t::error);
         }
     }
 
     void require_kernel_fail(const char* func_name)
     {
         logf("AiDA Standalone: %s requires kernel driver.\n", func_name);
-        toast_notification::push(std::string(func_name) + " requires kernel driver");
+        toast_notification::push(std::string(func_name) + " requires kernel driver",
+                                  toast_notification::toast_type_t::error);
     }
 
     std::atomic<bool> g_driver_watchdog_started{false};
