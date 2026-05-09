@@ -407,7 +407,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		            ImVec2(ox + 14.f, code_top + 8.f),
 		            aida::ui::with_alpha(tk.text_primary, alpha),
 		            "Batch Decompile");
-		dl->AddText(aida::ui::fonts::caption(), 11.f,
+		dl->AddText(aida::ui::fonts::caption(), 13.f,
 		            ImVec2(ox + 14.f, code_top + 26.f),
 		            aida::ui::with_alpha(tk.text_secondary, alpha),
 		            "One hex address per line");
@@ -572,7 +572,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			dl->AddText(aida::ui::fonts::body_em(), 14.f,
 			            ImVec2(px + 18.f, py + 16.f),
 			            aida::ui::with_alpha(tk.error, alpha), "Decompilation failed");
-			dl->AddText(aida::ui::fonts::caption(), 12.f,
+			dl->AddText(aida::ui::fonts::caption(), 14.f,
 			            ImVec2(px + 18.f, py + 38.f),
 			            _ta(tk.text_secondary), st.current.error_text.c_str(),
 			            nullptr, panel_w - 36.f);

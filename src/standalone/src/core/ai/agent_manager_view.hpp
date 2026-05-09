@@ -768,7 +768,7 @@ namespace agent_manager {
 						ImGui::TableSetColumnIndex(3);
 						if (!is_native) {
 							if (aida::ui::button("X", aida::ui::button_kind_t::ghost,
-									aida::ui::size_t_::sm, ImVec2(28.f, 22.f))) {
+									aida::ui::size_t_::sm, ImVec2(28.f, 28.f))) {
 								remove_idx = static_cast<int>(i);
 							}
 						}
@@ -822,7 +822,7 @@ namespace agent_manager {
 					for (size_t i = 0; i < chips.size(); ++i) {
 						ImGui::PushID(static_cast<int>(i + 1000));
 						ImFont* font = ImGui::GetFont();
-						float fs = 12.f;
+						float fs = 14.f;
 						float text_w = font->CalcTextSizeA(fs, FLT_MAX, 0.f, chips[i].c_str()).x;
 						float chip_w = text_w + 30.f;
 						if (chip_x - chip_x_start + chip_w > chip_avail) {

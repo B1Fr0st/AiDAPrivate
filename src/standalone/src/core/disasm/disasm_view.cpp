@@ -1,4 +1,5 @@
 #include "disasm_view.hpp"
+#include "nav_history.hpp"
 #include "zydis_disasm.hpp"
 #include "standalone_driver.hpp"
 #include "../helpers/globals.h"
@@ -6,6 +7,8 @@
 #include "imgui/imgui_internal.h"
 #include <Windows.h>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -19,7 +22,16 @@
 #include "symbol_store.hpp"
 #include "xref_engine.hpp"
 #include "cfg_view.hpp"
+#include "comment_dialog.hpp"
+#include "comment_store.hpp"
+#include "rename_dialog.hpp"
+#include "rename_store.hpp"
 #include "source_reconstruct_view.hpp"
+#include "disasm_theme.hpp"
+#include "file_metadata_banner.hpp"
+#include "xref_index.hpp"
+#include "function_index.hpp"
+#include "symbol_classifier.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/motion.hpp"
 #include "../ui/clock.hpp"
@@ -32,14 +44,492 @@
 
 namespace disasm_view {
 
-static cfg_view::cfg_state_t s_inline_cfg;
 static float s_xref_anim_t = 0.f;
 static float s_first_load_anim = 0.f;
 static int   s_last_known_n = 0;
-static aida::ui::transition_t s_graph_xfade;
 static std::unordered_map<int, aida::ui::hover_state_t> s_row_hover;
 static std::unordered_map<int, float> s_row_entrance;
 static aida::ui::flash_t s_branch_flash;
+
+static std::atomic<uint64_t> s_throttle_until_ns{0};
+static std::atomic<uint32_t> s_last_attached_pid{0xFFFFFFFFu};
+static std::atomic<uint64_t> s_last_loaded_image_base{0xFFFFFFFFFFFFFFFFull};
+static std::atomic<uint64_t> s_visible_warm_last_ns{0};
+static std::atomic<uint32_t> s_format_gen{1};
+static std::atomic<uint64_t> s_render_log_last_ns{0};
+static std::atomic<uint64_t> s_render_ms_accum_us{0};
+static std::atomic<uint32_t> s_render_log_frames{0};
+static std::atomic<uint64_t> s_render_log_rows_accum{0};
+
+static inline uint64_t now_ns() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+static inline bool throttle_active() {
+    uint64_t until = s_throttle_until_ns.load(std::memory_order_acquire);
+    if (until == 0) return false;
+    return now_ns() < until;
+}
+
+static inline void throttle_arm(uint64_t window_ms) {
+    s_throttle_until_ns.store(now_ns() + window_ms * 1000000ull, std::memory_order_release);
+}
+
+struct colored_run_t {
+    ImU32       color = 0;
+    std::string text;
+};
+
+struct instr_cache_entry_t {
+    uint32_t                                       gen = 0;
+    uint8_t                                        raw_sig[16] = {};
+    int                                            raw_len = 0;
+    bool                                           ops_valid = false;
+    std::string                                    ops_subst;
+    std::vector<colored_run_t>                     ops_runs;
+    bool                                           bytes_valid = false;
+    std::string                                    bytes_str;
+    bool                                           inj_valid = false;
+    std::vector<function_index::injection_row_t>   before_rows;
+    std::vector<function_index::injection_row_t>   after_rows;
+    std::string                                    inline_label;
+    bool                                           xref_valid = false;
+    std::vector<xref_index::annotation_t>          xref_at_func;
+    bool                                           xref_more_at_func = false;
+    bool                                           xref_inline_valid = false;
+    std::vector<xref_index::annotation_t>          xref_inline;
+    bool                                           xref_inline_more = false;
+};
+
+static std::unordered_map<uint64_t, instr_cache_entry_t> s_instr_cache;
+
+static inline void instr_cache_clear_all() {
+    s_instr_cache.clear();
+}
+
+static inline void instr_cache_bound_size() {
+    constexpr size_t kCap = 16384;
+    if (s_instr_cache.size() > kCap)
+        s_instr_cache.clear();
+}
+
+static inline instr_cache_entry_t& instr_cache_slot(uint64_t addr, uint32_t gen,
+                                                    const uint8_t* raw, int raw_len)
+{
+    auto& e = s_instr_cache[addr];
+    bool reset = (e.gen != gen);
+    int sig_len = raw_len < 16 ? raw_len : 16;
+    if (!reset) {
+        if (e.raw_len != raw_len) reset = true;
+        else if (sig_len > 0 && std::memcmp(e.raw_sig, raw, static_cast<size_t>(sig_len)) != 0) reset = true;
+    }
+    if (reset) {
+        e.gen = gen;
+        e.raw_len = raw_len;
+        std::memset(e.raw_sig, 0, sizeof(e.raw_sig));
+        if (sig_len > 0) std::memcpy(e.raw_sig, raw, static_cast<size_t>(sig_len));
+        e.ops_valid = false;
+        e.ops_subst.clear();
+        e.ops_runs.clear();
+        e.bytes_valid = false;
+        e.bytes_str.clear();
+        e.inj_valid = false;
+        e.before_rows.clear();
+        e.after_rows.clear();
+        e.inline_label.clear();
+        e.xref_valid = false;
+        e.xref_at_func.clear();
+        e.xref_more_at_func = false;
+        e.xref_inline_valid = false;
+        e.xref_inline.clear();
+        e.xref_inline_more = false;
+    }
+    return e;
+}
+
+void bump_format_generation() {
+    s_format_gen.fetch_add(1u, std::memory_order_release);
+}
+
+static void on_attach_state_changed() {
+    xref_index::on_attach_changed();
+    function_index::on_attach_changed();
+    symbol_classifier::on_attach_changed();
+    s_visible_warm_last_ns.store(0, std::memory_order_release);
+    s_format_gen.fetch_add(1u, std::memory_order_release);
+    instr_cache_clear_all();
+    throttle_arm(120);
+}
+
+enum class layout_row_kind_t : int {
+    instruction,
+    inline_label,
+    function_banner,
+    attributes_line,
+    prototype_line,
+    proc_header,
+    var_decl,
+    proc_endp,
+    endp_separator,
+    label_line,
+    spacer_line,
+    xref_continuation
+};
+
+struct layout_row_t {
+    layout_row_kind_t                  kind = layout_row_kind_t::instruction;
+    int                                instr_index = -1;
+    uint64_t                           addr = 0;
+    std::string                        text;
+    function_index::injection_t        injection_kind = function_index::injection_t::spacer_line;
+    xref_index::annotation_t           xref_ann;
+    bool                               has_xref = false;
+    bool                               xref_more = false;
+};
+
+struct frame_var_cache_t {
+    uint64_t                                            func_start = 0;
+    std::unordered_map<int64_t, std::string>            offset_to_name;
+    std::unordered_map<int64_t, uint32_t>               offset_to_size;
+    bool                                                resolved = false;
+};
+
+static std::string ida_section_name_for_va(const DisasmFile& file, uint64_t va) {
+    if (file.image_base == 0) return std::string();
+    if (va < file.image_base) return std::string();
+    uint64_t module_base = 0;
+    uint32_t module_size = 0;
+    std::string mod_name;
+    if (function_index::detail::resolve_module_for_address(va, module_base, module_size, mod_name)) {
+        pe_parser::pe_info_t pe;
+        if (pe_parser::parse(module_base, pe)) {
+            std::string s = function_index::detail::section_name_for_va(pe, module_base, va);
+            if (!s.empty()) return s;
+        }
+    }
+    return std::string(".text");
+}
+
+static std::string format_segment_address(const DisasmFile& file, uint64_t addr,
+    const std::string& section_override)
+{
+    std::string seg = section_override.empty() ? ida_section_name_for_va(file, addr) : section_override;
+    if (seg.empty()) seg = ".text";
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%s:%08llX",
+        seg.c_str(), static_cast<unsigned long long>(addr));
+    return std::string(buf);
+}
+
+static std::string ida_xref_kind_label(const xref_index::annotation_t& a) {
+    if (a.kind == xref_index::kind_t::data) {
+        switch (a.edge) {
+            case xref_index::edge_t::offset_ref: return std::string("DATA XREF: ");
+            case xref_index::edge_t::call_proc: return std::string("DATA XREF: ");
+            case xref_index::edge_t::jump:      return std::string("DATA XREF: ");
+        }
+        return std::string("DATA XREF: ");
+    }
+    return std::string("CODE XREF: ");
+}
+
+static const char* ida_xref_arrow_utf8(bool up) {
+    return up ? "\xe2\x86\x91" : "\xe2\x86\x93";
+}
+
+static const char* ida_xref_edge_letter(const xref_index::annotation_t& a) {
+    if (a.kind == xref_index::kind_t::data) {
+        return a.edge == xref_index::edge_t::offset_ref ? "o" : "r";
+    }
+    switch (a.edge) {
+        case xref_index::edge_t::call_proc:  return "p";
+        case xref_index::edge_t::jump:       return "j";
+        case xref_index::edge_t::offset_ref: return "o";
+    }
+    return "j";
+}
+
+static std::string ida_format_xref_comment(const xref_index::annotation_t& a, bool more) {
+    std::string out = "; ";
+    out += ida_xref_kind_label(a);
+    out += a.source_label;
+    out += ida_xref_arrow_utf8(a.up);
+    out += ida_xref_edge_letter(a);
+    if (more) out += " ...";
+    return out;
+}
+
+static frame_var_cache_t& var_cache_slot() {
+    static thread_local frame_var_cache_t s;
+    return s;
+}
+
+static void prime_var_cache(uint64_t func_start) {
+    auto& c = var_cache_slot();
+    if (c.resolved && c.func_start == func_start) return;
+    c.func_start = func_start;
+    c.offset_to_name.clear();
+    c.offset_to_size.clear();
+    c.resolved = true;
+    if (func_start == 0) return;
+
+    auto& fc = function_index::detail::cache();
+    std::shared_lock<std::shared_mutex> lk(fc.mutex);
+    auto it = fc.by_start.find(func_start);
+    if (it == fc.by_start.end()) return;
+    for (const auto& v : it->second.vars) {
+        c.offset_to_name[v.offset] = v.name;
+        c.offset_to_size[v.offset] = v.size;
+    }
+}
+
+static bool lookup_named_offset(int64_t offset, std::string& out_name) {
+    auto& c = var_cache_slot();
+    auto it = c.offset_to_name.find(offset);
+    if (it == c.offset_to_name.end()) return false;
+    out_name = it->second;
+    return true;
+}
+
+static bool parse_signed_hex_after(const char* p, int64_t& out) {
+    if (!p || !*p) return false;
+    char sign = '+';
+    if (*p == '+' || *p == '-') { sign = *p; ++p; }
+    while (*p == ' ') ++p;
+    if (*p == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+    char* end = nullptr;
+    unsigned long long v = std::strtoull(p, &end, 16);
+    if (end == p) return false;
+    int64_t sv = static_cast<int64_t>(v);
+    if (sign == '-') sv = -sv;
+    out = sv;
+    return true;
+}
+
+static std::string substitute_operand_text(const AsmInstr& ins, const DisasmFile& file)
+{
+    std::string base(ins.ops);
+    if (base.empty()) return base;
+
+    auto try_replace_hex = [&](const std::string& src, uint64_t target,
+                              const std::string& replacement) -> std::string {
+        char hex_buf[32];
+        std::snprintf(hex_buf, sizeof(hex_buf), "0x%llX", static_cast<unsigned long long>(target));
+        size_t pos = src.find(hex_buf);
+        if (pos == std::string::npos) {
+            std::snprintf(hex_buf, sizeof(hex_buf), "0x%llx", static_cast<unsigned long long>(target));
+            pos = src.find(hex_buf);
+        }
+        if (pos == std::string::npos) {
+            std::snprintf(hex_buf, sizeof(hex_buf), "%llXh", static_cast<unsigned long long>(target));
+            pos = src.find(hex_buf);
+        }
+        if (pos == std::string::npos) return src;
+        std::string out = src.substr(0, pos) + replacement
+                          + src.substr(pos + std::strlen(hex_buf));
+        return out;
+    };
+
+    if (ins.is_branch || ins.is_call) {
+        uint64_t target = 0;
+        const char* hex_p = std::strstr(ins.ops, "0x");
+        if (!hex_p) hex_p = ins.ops;
+        if (sscanf_s(hex_p, "%llx", &target) == 1
+            || sscanf_s(hex_p, "0x%llx", &target) == 1)
+        {
+            if (target != 0) {
+                std::string sym = function_index::synthetic_name(target);
+                if (!sym.empty()) {
+                    base = try_replace_hex(base, target, sym);
+                }
+            }
+        }
+    }
+
+    {
+        size_t bp_pos = base.find("[ebp");
+        if (bp_pos == std::string::npos) bp_pos = base.find("[rbp");
+        if (bp_pos != std::string::npos) {
+            size_t close = base.find(']', bp_pos);
+            if (close != std::string::npos) {
+                size_t off_start = bp_pos + 4;
+                if (off_start < base.size() && (base[off_start] == '+' || base[off_start] == '-')) {
+                    int64_t parsed = 0;
+                    if (parse_signed_hex_after(base.c_str() + off_start, parsed)) {
+                        std::string named;
+                        if (lookup_named_offset(parsed, named) && !named.empty()) {
+                            base = base.substr(0, bp_pos + 4) + "+" + named
+                                   + base.substr(close);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    {
+        size_t ds_pos = base.find("ds:0x");
+        if (ds_pos != std::string::npos) {
+            size_t hex_start = ds_pos + 5;
+            uint64_t target = 0;
+            if (sscanf_s(base.c_str() + hex_start - 2, "%llx", &target) == 1
+                && target != 0)
+            {
+                std::string sym = symbol_store::resolve_symbol_exact(target);
+                if (sym.empty()) sym = symbol_store::resolve_symbol(target);
+                if (!sym.empty()) {
+                    auto bang = sym.find('!');
+                    if (bang != std::string::npos) sym = sym.substr(bang + 1);
+                    char hex_b[32];
+                    std::snprintf(hex_b, sizeof(hex_b), "0x%llX",
+                        static_cast<unsigned long long>(target));
+                    std::string h_lo = hex_b;
+                    std::snprintf(hex_b, sizeof(hex_b), "0x%llx",
+                        static_cast<unsigned long long>(target));
+                    std::string h_lo2 = hex_b;
+                    size_t found = base.find(h_lo);
+                    if (found == std::string::npos) found = base.find(h_lo2);
+                    if (found != std::string::npos) {
+                        size_t take = (base.compare(found, h_lo.size(), h_lo) == 0)
+                                      ? h_lo.size() : h_lo2.size();
+                        base = base.substr(0, found) + sym + base.substr(found + take);
+                    }
+                }
+            }
+        }
+    }
+
+    (void)file;
+    return base;
+}
+
+static inline bool is_ident_start_char(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+}
+
+static inline bool is_ident_body_char(char c) {
+    return is_ident_start_char(c) || (c >= '0' && c <= '9') || c == '!';
+}
+
+static inline bool is_hex_digit_char(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+static inline ImU32 default_operand_color(const AsmInstr& ins) {
+    if (ins.is_branch || ins.is_call) return disasm_theme::sub_label();
+    if (ins.is_nop) return disasm_theme::bytes();
+    return disasm_theme::reg();
+}
+
+static void append_colored_run(std::vector<colored_run_t>& out, ImU32 color, const char* text, size_t len) {
+    if (len == 0) return;
+    if (!out.empty() && out.back().color == color) {
+        out.back().text.append(text, len);
+        return;
+    }
+    colored_run_t run;
+    run.color = color;
+    run.text.assign(text, len);
+    out.push_back(std::move(run));
+}
+
+static void build_operand_colored_runs(const AsmInstr& ins,
+                                       const std::string& subst,
+                                       std::vector<colored_run_t>& out)
+{
+    out.clear();
+    if (subst.empty()) return;
+
+    const ImU32 default_color = default_operand_color(ins);
+    const char* s = subst.c_str();
+    const size_t n = subst.size();
+    size_t i = 0;
+
+    while (i < n) {
+        char c = s[i];
+
+        if (is_ident_start_char(c)) {
+            size_t start = i;
+            ++i;
+            while (i < n && is_ident_body_char(s[i])) ++i;
+            std::string tok(s + start, i - start);
+
+            bool tok_is_hex_h = false;
+            if (tok.size() >= 2) {
+                char last = tok.back();
+                if (last == 'h' || last == 'H') {
+                    bool all_hex = true;
+                    for (size_t k = 0; k + 1 < tok.size(); ++k) {
+                        if (!is_hex_digit_char(tok[k])) { all_hex = false; break; }
+                    }
+                    if (all_hex) tok_is_hex_h = true;
+                }
+            }
+
+            ImU32 color = default_color;
+            if (tok_is_hex_h) {
+                color = disasm_theme::immediate_num();
+            } else {
+                symbol_classifier::kind_t k = symbol_classifier::classify_name(tok);
+                if (k != symbol_classifier::kind_t::unknown) {
+                    color = disasm_theme::color_for_kind(static_cast<int>(k));
+                }
+            }
+
+            append_colored_run(out, color, tok.data(), tok.size());
+            continue;
+        }
+
+        if (c == '0' && i + 1 < n && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
+            size_t start = i;
+            i += 2;
+            while (i < n && is_hex_digit_char(s[i])) ++i;
+            if (i < n && (s[i] == 'h' || s[i] == 'H')) ++i;
+            append_colored_run(out, disasm_theme::immediate_num(), s + start, i - start);
+            continue;
+        }
+
+        if (c >= '0' && c <= '9') {
+            size_t start = i;
+            ++i;
+            while (i < n && is_hex_digit_char(s[i])) ++i;
+            bool has_h = false;
+            if (i < n && (s[i] == 'h' || s[i] == 'H')) {
+                has_h = true;
+                ++i;
+            }
+            if (has_h) {
+                append_colored_run(out, disasm_theme::immediate_num(), s + start, i - start);
+            } else {
+                while (i < n && s[i] >= '0' && s[i] <= '9') ++i;
+                append_colored_run(out, disasm_theme::immediate_num(), s + start, i - start);
+            }
+            continue;
+        }
+
+        size_t start = i;
+        ++i;
+        while (i < n) {
+            char nc = s[i];
+            if (is_ident_start_char(nc)) break;
+            if (nc == '0' && i + 1 < n && (s[i + 1] == 'x' || s[i + 1] == 'X')) break;
+            if (nc >= '0' && nc <= '9') break;
+            ++i;
+        }
+        append_colored_run(out, default_color, s + start, i - start);
+    }
+}
+
+static ImU32 mnemonic_color(const AsmInstr& ins, float a) {
+    if (ins.is_call || ins.is_branch || ins.is_ret)
+        return aida::ui::with_alpha(disasm_theme::mnemonic(), a);
+    if (ins.is_nop)
+        return aida::ui::with_alpha(disasm_theme::bytes(), a * 0.85f);
+    if (ins.is_priv)
+        return aida::ui::with_alpha(disasm_theme::keyword(), a);
+    return aida::ui::with_alpha(disasm_theme::mnemonic(), a);
+}
 
 
 static int find_instr_at(uint64_t addr, const DisasmFile& file) {
@@ -55,6 +545,34 @@ static int find_instr_at(uint64_t addr, const DisasmFile& file) {
     return (lo < static_cast<int>(file.instrs.size())) ? lo : static_cast<int>(file.instrs.size()) - 1;
 }
 
+static uint64_t find_enclosing_function_start(uint64_t addr, const DisasmFile& file) {
+    if (file.instrs.empty()) return addr;
+    int idx = find_instr_at(addr, file);
+    if (idx < 0) return addr;
+
+    const int max_scan = 4096;
+    int last_terminator = -1;
+    for (int i = idx; i >= 0 && (idx - i) < max_scan; --i) {
+        if (i < idx && file.instrs[i].is_ret) {
+            last_terminator = i;
+            break;
+        }
+    }
+
+    if (last_terminator >= 0 && last_terminator + 1 < static_cast<int>(file.instrs.size())) {
+        int candidate = last_terminator + 1;
+        while (candidate < static_cast<int>(file.instrs.size())
+               && file.instrs[candidate].is_nop)
+            ++candidate;
+        if (candidate <= idx)
+            return file.instrs[candidate].addr;
+    }
+
+    return file.instrs[0].addr;
+}
+
+static thread_local bool s_nav_history_suppress_push = false;
+
 void goto_address(uint64_t addr, DisasmState& disasm) {
     auto& st = g_state;
     int idx = find_instr_at(addr, disasm.file);
@@ -67,6 +585,13 @@ void goto_address(uint64_t addr, DisasmState& disasm) {
             st.nav_history.resize(st.nav_pos + 1);
         st.nav_history.push_back(st.selected_row);
         st.nav_pos = static_cast<int>(st.nav_history.size()) - 1;
+
+        if (!s_nav_history_suppress_push
+            && st.selected_row < static_cast<int>(disasm.file.instrs.size())) {
+            uint64_t prev_addr = disasm.file.instrs[st.selected_row].addr;
+            if (prev_addr != addr)
+                nav_history::push(prev_addr);
+        }
     }
 
     st.selected_row = idx;
@@ -175,6 +700,10 @@ static void launch_xref_scan(uint64_t addr)
                         snprintf(buf, sizeof(buf), "%s %s", ins.mnem, ins.ops);
                         e.disasm_text = buf;
                         e.module_name = mod_name;
+                        {
+                            std::string rn = rename_store::get(ins_addr);
+                            e.function_name = !rn.empty() ? rn : symbol_store::resolve_symbol(ins_addr);
+                        }
                         found.push_back(std::move(e));
                     }
                 }
@@ -231,9 +760,15 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
     float px = cx - pw * 0.5f;
     float py = cy - ph * 0.5f + (1.f - t_back) * 12.f;
 
-    char title_buf[64];
-    snprintf(title_buf, sizeof(title_buf), "Cross References to 0x%llX",
-             static_cast<unsigned long long>(st.xref_popup_addr));
+    char title_buf[256];
+    if (!st.xref_popup_target_name.empty()) {
+        snprintf(title_buf, sizeof(title_buf), "Xrefs to %s  (0x%llX)",
+                 st.xref_popup_target_name.c_str(),
+                 static_cast<unsigned long long>(st.xref_popup_addr));
+    } else {
+        snprintf(title_buf, sizeof(title_buf), "Xrefs to 0x%llX",
+                 static_cast<unsigned long long>(st.xref_popup_addr));
+    }
 
     std::vector<xref_popup_entry_t> results_copy;
     {
@@ -307,13 +842,13 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
 
     float col_type_w = 54.f;
     float col_addr_w = 145.f;
-    float col_mod_w = 120.f;
-    float col_disasm_w = pw - col_type_w - col_addr_w - col_mod_w - 30.f;
+    float col_func_w = 200.f;
+    float col_disasm_w = pw - col_type_w - col_addr_w - col_func_w - 30.f;
     if (col_disasm_w < 100.f) col_disasm_w = 100.f;
 
     ui_anim::table_col_t xref_cols[] = {
         { "Type", col_type_w }, { "Address", col_addr_w },
-        { "Module", col_mod_w }, { "Disassembly", col_disasm_w }
+        { "Function", col_func_w }, { "Disassembly", col_disasm_w }
     };
     ui_anim::render_table_header(fdl, px, table_y, pw, row_h, xref_cols, 4,
                                   accent_r, accent_g, accent_b, fa);
@@ -435,14 +970,20 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
             aida::ui::with_alpha(tk.text_address, row_alpha), addr_buf);
         rx += col_addr_w;
 
-        if (!e.module_name.empty()) {
-            size_t max_mod = 16;
-            std::string mod_short = e.module_name.size() > max_mod
-                ? e.module_name.substr(0, max_mod - 2) + ".." : e.module_name;
+        const std::string& fn_text = !e.function_name.empty() ? e.function_name : e.module_name;
+        if (!fn_text.empty()) {
+            size_t max_fn = 28;
+            std::string fn_short = fn_text.size() > max_fn
+                ? fn_text.substr(0, max_fn - 2) + ".." : fn_text;
+            ImU32 fn_col = !e.function_name.empty()
+                ? aida::ui::with_alpha(tk.text_primary, row_alpha)
+                : aida::ui::with_alpha(tk.text_secondary, row_alpha);
+            fdl->AddText(ImVec2(rx, ry + 4.f), fn_col, fn_short.c_str());
+        } else {
             fdl->AddText(ImVec2(rx, ry + 4.f),
-                aida::ui::with_alpha(tk.text_secondary, row_alpha), mod_short.c_str());
+                aida::ui::with_alpha(tk.text_dim, row_alpha), "-");
         }
-        rx += col_mod_w;
+        rx += col_func_w;
 
         const char* disasm_end = e.disasm_text.c_str() + std::min(e.disasm_text.size(), static_cast<size_t>(60));
         fdl->AddText(ImVec2(rx, ry + 4.f),
@@ -490,12 +1031,16 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
     }
 
     if (results_copy.empty() && !scanning) {
-        float cw = std::min(pw - 32.f, 420.f);
+        float cw = std::min(pw - 32.f, 460.f);
         if (cw < 140.f) cw = std::max(140.f, pw - 20.f);
         float ccx = px + (pw - cw) * 0.5f;
         float ccy = list_y + list_h * 0.5f - 26.f;
+        char empty_buf[160];
+        snprintf(empty_buf, sizeof(empty_buf),
+                 "No cross-references found for 0x%llX.",
+                 static_cast<unsigned long long>(st.xref_popup_addr));
         ui_anim::render_inline_callout(fdl, ccx, ccy, cw, 52.f,
-            "No cross references found. This address is not referenced by call/jmp/lea/data.",
+            empty_buf,
             ui_anim::callout_kind_t::info, accent_r, accent_g, accent_b, fa);
     }
 
@@ -530,405 +1075,30 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
     }
 }
 
-static void render_inline_graph(float pos_x, float pos_y, float width, float height,
-                                 float alpha, float accent_r, float accent_g, float accent_b,
-                                 DisasmState& disasm, float dt)
-{
-    auto& st = g_state;
-
-    if (st.cfg_needs_build && !s_inline_cfg.building.load()) {
-        st.cfg_needs_build = false;
-
-        s_inline_cfg.building.store(true);
-        uint64_t entry = st.cfg_entry_addr;
-
-        try {
-        std::thread([entry]() {
-            const size_t max_bytes = 0x10000;
-            const size_t max_insns = 4096;
-
-            std::vector<uint8_t> mem;
-            bool have_data = false;
-
-            if (driver_bridge::attached_pid() != 0) {
-                have_data = driver_bridge::read_memory(entry, max_bytes, mem);
-            }
-
-            if (!have_data || mem.empty()) {
-                have_data = static_analysis::read_bytes_from_pe(g_disasm.file, entry, max_bytes, mem);
-            }
-
-            if (mem.empty()) {
-                s_inline_cfg.building.store(false);
-                return;
-            }
-
-            struct decoded_t {
-                AsmInstr ins;
-                uint64_t branch_target = 0;
-                bool     has_target = false;
-            };
-
-            std::vector<decoded_t> all_insns;
-            all_insns.reserve(max_insns);
-
-            const uint8_t* data = mem.data();
-            int sz = static_cast<int>(mem.size());
-            int pos = 0;
-
-            while (pos < sz && all_insns.size() < max_insns) {
-                int avail = sz - pos;
-                if (avail > 15) avail = 15;
-                uint64_t va = entry + pos;
-                AsmInstr ins = zydis_decode_one(data + pos, avail, va);
-
-                decoded_t d;
-                d.ins = ins;
-
-                if (ins.is_call || ins.is_branch) {
-                    if (ins.len == 5 && (data[pos] == 0xE8 || data[pos] == 0xE9)) {
-                        int32_t rel = 0;
-                        std::memcpy(&rel, data + pos + 1, 4);
-                        d.branch_target = va + ins.len + rel;
-                        d.has_target = true;
-                    } else if (ins.len == 2 && (data[pos] >= 0x70 && data[pos] <= 0x7F)) {
-                        int8_t rel = static_cast<int8_t>(data[pos + 1]);
-                        d.branch_target = va + ins.len + rel;
-                        d.has_target = true;
-                    } else if (ins.len == 6 && data[pos] == 0x0F && (data[pos+1] >= 0x80 && data[pos+1] <= 0x8F)) {
-                        int32_t rel = 0;
-                        std::memcpy(&rel, data + pos + 2, 4);
-                        d.branch_target = va + ins.len + rel;
-                        d.has_target = true;
-                    } else if (ins.len == 2 && data[pos] == 0xEB) {
-                        int8_t rel = static_cast<int8_t>(data[pos + 1]);
-                        d.branch_target = va + ins.len + rel;
-                        d.has_target = true;
-                    }
-                }
-
-                all_insns.push_back(d);
-                if (ins.is_ret) break;
-                pos += ins.len;
-            }
-
-            if (all_insns.empty()) {
-                s_inline_cfg.building.store(false);
-                return;
-            }
-
-            std::map<uint64_t, bool> leaders;
-            leaders[entry] = true;
-
-            for (auto& d : all_insns) {
-                if (d.has_target && !d.ins.is_call) {
-                    leaders[d.branch_target] = true;
-                    leaders[d.ins.addr + d.ins.len] = true;
-                }
-                if (d.ins.is_ret)
-                    leaders[d.ins.addr + d.ins.len] = true;
-            }
-
-            std::vector<cfg_view::basic_block_t> blocks;
-            std::map<uint64_t, int> addr_to_block;
-
-            int cur_block = -1;
-            for (auto& d : all_insns) {
-                if (leaders.count(d.ins.addr)) {
-                    cur_block = cfg_view::detail::find_or_create_block(addr_to_block, blocks, d.ins.addr);
-                    if (d.ins.addr == entry)
-                        blocks[cur_block].is_entry = true;
-                }
-                if (cur_block < 0)
-                    cur_block = cfg_view::detail::find_or_create_block(addr_to_block, blocks, d.ins.addr);
-
-                cfg_view::instruction_line_t line;
-                line.addr = d.ins.addr;
-                char buf[192];
-                snprintf(buf, sizeof(buf), "%s %s", d.ins.mnem, d.ins.ops);
-                line.text = buf;
-                blocks[cur_block].instructions.push_back(std::move(line));
-                blocks[cur_block].end_addr = d.ins.addr + d.ins.len;
-
-                if (d.ins.is_ret) continue;
-
-                if (d.has_target && !d.ins.is_call) {
-                    int tidx = cfg_view::detail::find_or_create_block(addr_to_block, blocks, d.branch_target);
-                    blocks[cur_block].successors.push_back(tidx);
-
-                    bool is_uncond = (std::strcmp(d.ins.mnem, "jmp") == 0 || std::strcmp(d.ins.mnem, "JMP") == 0);
-                    if (!is_uncond) {
-                        int fidx = cfg_view::detail::find_or_create_block(addr_to_block, blocks, d.ins.addr + d.ins.len);
-                        blocks[cur_block].successors.push_back(fidx);
-                    }
-
-                    if (leaders.count(d.ins.addr + d.ins.len))
-                        cur_block = -1;
-                }
-            }
-
-            float line_h = 14.f;
-            float padding = 8.f;
-
-            cfg_layout::graph_t graph;
-            graph.nodes.reserve(blocks.size());
-            for (int i = 0; i < static_cast<int>(blocks.size()); ++i) {
-                cfg_layout::node_t n;
-                n.id = i;
-                n.width = 260.f;
-                n.height = padding * 2.f + static_cast<float>(blocks[i].instructions.size()) * line_h;
-                if (n.height < 30.f) n.height = 30.f;
-                graph.nodes.push_back(n);
-            }
-
-            for (int i = 0; i < static_cast<int>(blocks.size()); ++i) {
-                for (int j = 0; j < static_cast<int>(blocks[i].successors.size()); ++j) {
-                    cfg_layout::edge_t e;
-                    e.from = i;
-                    e.to = blocks[i].successors[j];
-                    e.is_true_branch = (j == 0 && blocks[i].successors.size() > 1);
-                    graph.edges.push_back(e);
-                }
-            }
-
-            cfg_layout::layout(graph, 60.f, 40.f);
-
-            {
-                std::lock_guard<std::mutex> lk(s_inline_cfg.mutex);
-                s_inline_cfg.blocks = std::move(blocks);
-                s_inline_cfg.graph = std::move(graph);
-                s_inline_cfg.entry_addr = entry;
-                s_inline_cfg.built = true;
-                s_inline_cfg.selected_block = -1;
-                s_inline_cfg.pan_x = 0.f;
-                s_inline_cfg.pan_y = 0.f;
-                s_inline_cfg.zoom = 1.f;
-                s_inline_cfg.target_pan_x = 0.f;
-                s_inline_cfg.target_pan_y = 0.f;
-                s_inline_cfg.target_zoom = 1.f;
-                s_inline_cfg.block_motion.clear();
-                s_inline_cfg.rebuild_anim = 0.f;
-            }
-
-            s_inline_cfg.building.store(false);
-        }).detach();
-        } catch (...) {
-            s_inline_cfg.building.store(false);
-            driver_bridge::debug_log("[disasm] CFG build thread creation failed\n");
-        }
-    }
-
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 wp = ImGui::GetWindowPos();
-    float ox = wp.x + pos_x;
-    float oy = wp.y + pos_y;
-
-    dl->PushClipRect(ImVec2(ox, oy), ImVec2(ox + width, oy + height), true);
-    const auto& tk = aida::ui::resolved();
-    const auto _ta = [alpha](ImU32 c) -> ImU32 { return aida::ui::with_alpha(c, alpha); };
-    dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + height),
-        _ta(tk.bg_base));
-
-    const char* hint = "Press SPACE to return to linear view";
-    dl->AddText(ImVec2(ox + 10.f, oy + 8.f),
-        _ta(tk.text_dim), hint);
-
-    if (s_inline_cfg.building.load()) {
-        float panel_w = std::min(420.f, width * 0.6f);
-        float panel_h = 160.f;
-        float px2 = ox + (width - panel_w) * 0.5f;
-        float py2 = oy + (height - panel_h) * 0.5f;
-        ImVec2 ga(px2, py2);
-        ImVec2 gb(px2 + panel_w, py2 + panel_h);
-        aida::ui::blur::render_drop_shadow(dl, ga, gb, 12.f, 4, 0.30f * alpha);
-        aida::ui::blur::render_glass_fill(dl, ga, gb, 12.f, alpha);
-        aida::ui::blur::render_glass_border(dl, ga, gb, 12.f, alpha);
-        dl->AddText(ImVec2(px2 + 20.f, py2 + 18.f),
-            _ta(tk.text_primary), "Building CFG...");
-        aida::ui::skeleton::render_text_line(dl, ImVec2(px2 + 20.f, py2 + 50.f), panel_w - 40.f, 12.f);
-        aida::ui::skeleton::render_text_line(dl, ImVec2(px2 + 20.f, py2 + 70.f), (panel_w - 40.f) * 0.78f, 12.f);
-        aida::ui::skeleton::render_text_line(dl, ImVec2(px2 + 20.f, py2 + 90.f), (panel_w - 40.f) * 0.62f, 12.f);
-        aida::ui::components::render_progress_bar(ImVec2(px2 + 20.f, py2 + panel_h - 24.f),
-                                                  panel_w - 40.f, 4.f, 0.f, true, true);
-        dl->PopClipRect();
-        return;
-    }
-
-    std::lock_guard<std::mutex> lk(s_inline_cfg.mutex);
-
-    if (!s_inline_cfg.built || s_inline_cfg.blocks.empty()) {
-        aida::ui::empty_state::config_t cfg;
-        cfg.glyph = aida::ui::empty_state::glyph_t::flow;
-        cfg.title = "No CFG available";
-        cfg.body  = "Press SPACE on a function entry to build the inline control flow graph.";
-        cfg.hints = { { "Space" }, { "Esc" } };
-        aida::ui::empty_state::render(ImVec2(ox, oy), ImVec2(width, height), cfg);
-        dl->PopClipRect();
-        return;
-    }
-
-    ImGuiIO& io = ImGui::GetIO();
-    bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, oy), ImVec2(ox + width, oy + height), false);
-
-    if (hov && ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.f)) {
-        s_inline_cfg.pan_x += io.MouseDelta.x / s_inline_cfg.zoom;
-        s_inline_cfg.pan_y += io.MouseDelta.y / s_inline_cfg.zoom;
-    }
-
-    if (hov && !ImGui::GetIO().KeyCtrl) {
-        if (io.MouseWheel != 0.f)
-            s_inline_cfg.pan_y += io.MouseWheel * 40.f / s_inline_cfg.zoom;
-    }
-    if (hov && ImGui::GetIO().KeyCtrl && io.MouseWheel != 0.f) {
-        float old_zoom = s_inline_cfg.zoom;
-        s_inline_cfg.zoom *= (io.MouseWheel > 0) ? 1.1f : 0.9f;
-        s_inline_cfg.zoom = std::max(0.1f, std::min(5.f, s_inline_cfg.zoom));
-
-        float mx = io.MousePos.x - ox - width * 0.5f;
-        float my = io.MousePos.y - oy - height * 0.5f;
-        float sc = s_inline_cfg.zoom / old_zoom;
-        s_inline_cfg.pan_x -= mx * (1.f - 1.f / sc) / s_inline_cfg.zoom;
-        s_inline_cfg.pan_y -= my * (1.f - 1.f / sc) / s_inline_cfg.zoom;
-    }
-
-    float center_x = ox + width * 0.5f;
-    float center_y = oy + height * 0.5f;
-    float z = s_inline_cfg.zoom;
-
-    auto world_to_screen = [&](float wx, float wy) -> ImVec2 {
-        return ImVec2(center_x + (wx + s_inline_cfg.pan_x) * z,
-                      center_y + (wy + s_inline_cfg.pan_y) * z);
-    };
-
-    auto& nodes = s_inline_cfg.graph.nodes;
-    auto& edges = s_inline_cfg.graph.edges;
-    auto& blocks = s_inline_cfg.blocks;
-
-    for (auto& e : edges) {
-        int from_idx = -1, to_idx = -1;
-        for (int i = 0; i < static_cast<int>(nodes.size()); ++i) {
-            if (nodes[i].id == e.from) from_idx = i;
-            if (nodes[i].id == e.to) to_idx = i;
-        }
-        if (from_idx < 0 || to_idx < 0) continue;
-
-        auto& fn = nodes[from_idx];
-        auto& tn = nodes[to_idx];
-
-        ImVec2 p1 = world_to_screen(fn.x, fn.y + fn.height);
-        ImVec2 p4 = world_to_screen(tn.x, tn.y);
-        float mid_y = (p1.y + p4.y) * 0.5f;
-        ImVec2 p2(p1.x, mid_y);
-        ImVec2 p3(p4.x, mid_y);
-
-        ImU32 edge_col;
-        if (e.from < static_cast<int>(blocks.size()) && blocks[e.from].successors.size() > 1) {
-            edge_col = e.is_true_branch
-                ? aida::ui::with_alpha(tk.success, alpha * 0.78f)
-                : aida::ui::with_alpha(tk.error,   alpha * 0.78f);
-        } else {
-            edge_col = aida::ui::with_alpha(tk.text_dim, alpha * 0.7f);
-        }
-
-        for (int g = 2; g >= 0; --g) {
-            float gw = (1.5f + static_cast<float>(g) * 1.5f) * z;
-            float ga = (g == 0 ? 0.78f : (g == 1 ? 0.18f : 0.07f));
-            ImU32 gc = aida::ui::with_alpha(edge_col, ga);
-            dl->AddBezierCubic(p1, p2, p3, p4, gc, gw);
-        }
-
-        float arrow_sz = 6.f * z;
-        ImVec2 dir(p4.x - p3.x, p4.y - p3.y);
-        float dir_len = std::sqrt(dir.x * dir.x + dir.y * dir.y);
-        if (dir_len > 0.001f) {
-            dir.x /= dir_len; dir.y /= dir_len;
-            ImVec2 perp(-dir.y, dir.x);
-            ImVec2 a1(p4.x - dir.x * arrow_sz + perp.x * arrow_sz * 0.5f,
-                       p4.y - dir.y * arrow_sz + perp.y * arrow_sz * 0.5f);
-            ImVec2 a2(p4.x - dir.x * arrow_sz - perp.x * arrow_sz * 0.5f,
-                       p4.y - dir.y * arrow_sz - perp.y * arrow_sz * 0.5f);
-            dl->AddTriangleFilled(p4, a1, a2, edge_col);
-        }
-    }
-
-    float line_h = 14.f * z;
-    float pad = 8.f * z;
-
-    for (int ni = 0; ni < static_cast<int>(nodes.size()); ++ni) {
-        auto& n = nodes[ni];
-        if (n.id < 0 || n.id >= static_cast<int>(blocks.size())) continue;
-
-        auto& blk = blocks[n.id];
-
-        float nw = n.width * z;
-        float nh = n.height * z;
-        ImVec2 tl = world_to_screen(n.x - n.width * 0.5f, n.y);
-        ImVec2 br(tl.x + nw, tl.y + nh);
-
-        if (br.x < ox || tl.x > ox + width || br.y < oy || tl.y > oy + height) continue;
-
-        ImU32 bg_col = _ta(tk.panel_bg);
-        dl->AddRectFilled(tl, br, bg_col, 4.f * z);
-
-        bool is_sel = (n.id == s_inline_cfg.selected_block);
-        bool is_entry = blk.is_entry;
-
-        if (is_entry) {
-            dl->AddRectFilled(tl, br, aida::ui::with_alpha(tk.accent_glow, alpha), 4.f * z);
-            dl->AddRect(tl, br, aida::ui::with_alpha(tk.accent_u32, alpha * 0.7f), 4.f * z, 0, 2.f * z);
-        } else if (is_sel) {
-            float pulse = aida::ui::clock::pulse(1.6f, 0.55f, 1.f);
-            dl->AddRect(tl, br, aida::ui::with_alpha(tk.accent_u32, alpha * pulse), 4.f * z, 0, 1.5f * z);
-        } else {
-            dl->AddRect(tl, br, _ta(tk.border_subtle), 4.f * z, 0, 1.f * z);
-        }
-
-        if (blk.has_breakpoint) {
-            dl->AddRectFilled(tl, ImVec2(tl.x + 3.f * z, br.y),
-                aida::ui::with_alpha(tk.error, alpha), 2.f * z);
-        }
-
-        float text_y = tl.y + pad;
-        for (auto& line : blk.instructions) {
-            if (text_y + line_h > oy + height) break;
-            if (text_y + line_h < oy) { text_y += line_h; continue; }
-
-            char addr_buf[24];
-            snprintf(addr_buf, sizeof(addr_buf), "%llX", static_cast<unsigned long long>(line.addr));
-
-            ImU32 addr_col = _ta(tk.text_address);
-            ImU32 text_col = _ta(tk.text_primary);
-
-            if (st.selected_row >= 0 && st.selected_row < static_cast<int>(disasm.file.instrs.size())
-                && disasm.file.instrs[st.selected_row].addr == line.addr) {
-                dl->AddRectFilled(ImVec2(tl.x + 2.f * z, text_y),
-                    ImVec2(br.x - 2.f * z, text_y + line_h),
-                    aida::ui::with_alpha(tk.accent_glow, alpha));
-                text_col = _ta(tk.text_primary);
-            }
-
-            dl->AddText(ImVec2(tl.x + pad, text_y), addr_col, addr_buf);
-            dl->AddText(ImVec2(tl.x + pad + 90.f * z, text_y), text_col, line.text.c_str());
-
-            text_y += line_h;
-        }
-
-        if (hov && ImGui::IsMouseHoveringRect(tl, br, false)) {
-            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-                s_inline_cfg.selected_block = n.id;
-            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-                goto_address(blk.start_addr, disasm);
-        }
-    }
-
-    dl->PopClipRect();
-}
 
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b,
             DisasmState& disasm, float dt) {
 
+    const uint64_t frame_t0_ns = now_ns();
+
     auto& st    = g_state;
+
+    {
+        const uint32_t cur_pid = driver_bridge::attached_pid();
+        const uint32_t prev_pid = s_last_attached_pid.load(std::memory_order_acquire);
+        const uint64_t cur_img = disasm.file.image_base;
+        const uint64_t prev_img = s_last_loaded_image_base.load(std::memory_order_acquire);
+        if (cur_pid != prev_pid || cur_img != prev_img) {
+            s_last_attached_pid.store(cur_pid, std::memory_order_release);
+            s_last_loaded_image_base.store(cur_img, std::memory_order_release);
+            on_attach_state_changed();
+        }
+    }
+
+    instr_cache_bound_size();
+
+    const bool throttled = throttle_active();
 
 
     if (disasm.live_mode && disasm.live_pending_ready.load(std::memory_order_acquire)) {
@@ -1094,57 +1264,6 @@ void render(float pos_x, float pos_y, float width, float height,
         s_first_load_anim += dt * 1.6f;
     if (s_first_load_anim > 1.f) s_first_load_anim = 1.f;
 
-    {
-        static float xf_vel = 0.f;
-        st.graph_crossfade = aida::motion::spring_step(st.graph_crossfade,
-            st.graph_mode ? 1.f : 0.f, xf_vel, aida::motion::spring::balanced, dt);
-    }
-
-    if (st.graph_mode || st.graph_crossfade > 0.01f) {
-        float gf = st.graph_crossfade;
-        float ga = alpha * gf;
-        render_inline_graph(pos_x, pos_y, width, height, ga, accent_r, accent_g, accent_b, disasm, dt);
-
-        ImVec2 gwp = ImGui::GetWindowPos();
-        float pill_x = gwp.x + pos_x + width - 110.f;
-        float pill_y = gwp.y + pos_y + 8.f;
-        ImGui::SetCursorScreenPos(ImVec2(pill_x, pill_y));
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * gf);
-        aida::ui::components::pill_kind("Graph View",
-            aida::ui::components::pill_kind_t::accent,
-            aida::ui::components::size_t_::sm, true);
-        ImGui::PopStyleVar();
-
-        if (gf >= 0.99f) {
-            bool hovered_g = ImGui::IsMouseHoveringRect(
-                ImVec2(ImGui::GetWindowPos().x + pos_x, ImGui::GetWindowPos().y + pos_y),
-                ImVec2(ImGui::GetWindowPos().x + pos_x + width, ImGui::GetWindowPos().y + pos_y + height));
-
-            if (hovered_g || st.goto_visible) {
-                ImGuiIO& graph_hk_io = ImGui::GetIO();
-                bool graph_hk_text_lock = graph_hk_io.WantTextInput
-                    || graph_hk_io.WantCaptureKeyboard
-                    || ImGui::IsAnyItemActive();
-                if (graph_hk_io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_G, false) && !graph_hk_text_lock)
-                    st.goto_visible = !st.goto_visible;
-                if (graph_hk_io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false) && !graph_hk_text_lock)
-                    navigate_back();
-                if (graph_hk_io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_RightArrow, false) && !graph_hk_text_lock)
-                    navigate_forward();
-
-                if (ImGui::IsKeyPressed(ImGuiKey_Escape, false))
-                    st.graph_mode = false;
-                if (ImGui::IsKeyPressed(ImGuiKey_Space, false) && !graph_hk_text_lock)
-                    st.graph_mode = false;
-            }
-        }
-
-        render_xref_popup(ImGui::GetWindowPos().x + pos_x, ImGui::GetWindowPos().y + pos_y,
-                          width, height, alpha, accent_r, accent_g, accent_b, disasm, dt);
-        if (st.graph_mode)
-            return;
-    }
-
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 wpos = ImGui::GetWindowPos();
     float ox = wpos.x + pos_x;
@@ -1152,6 +1271,9 @@ void render(float pos_x, float pos_y, float width, float height,
 
     const float nav_band_h = 6.f;
     const float line_h = 18.f;
+
+    dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + height),
+        aida::ui::with_alpha(disasm_theme::panel_bg(), a));
 
     {
         float bx0 = ox;
@@ -1235,39 +1357,147 @@ void render(float pos_x, float pos_y, float width, float height,
     }
 
 
-    static float addr_col_w = 0.f;
-    if (addr_col_w == 0.f)
-        addr_col_w = ImGui::CalcTextSize("0000000140001000").x + 6.f;
+    ImFont* code_font = aida::ui::fonts::code();
+    if (!code_font) code_font = ImGui::GetFont();
+    const float code_size = code_font->FontSize > 0.f ? code_font->FontSize : ImGui::GetFontSize();
+    const float ch_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, "0").x;
+    const float ch_w_safe = ch_w > 0.f ? ch_w : 7.f;
 
     const float gutter_w = 20.f;
-    const float x_addr = ox + gutter_w + 4.f;
-    const float x_vsep = x_addr + addr_col_w;
-    float x_bytes = x_vsep + 10.f;
-    float bytes_col_w = st.show_bytes ? ImGui::CalcTextSize("00 00 00 00 00 00 00").x + 10.f : 0.f;
-    const float x_mnem = x_bytes + bytes_col_w;
-    const float x_ops  = x_mnem + 72.f;
+    const float seg_addr_chars = 22.f;
+    const float bytes_chars = 35.f;
+    const float mnem_chars = 6.f;
+    const float operand_chars = 28.f;
+    const float comment_indent_chars = 78.f;
 
+    const float x_seg_addr = ox + gutter_w + 4.f;
+    const float x_bytes = x_seg_addr + seg_addr_chars * ch_w_safe + 2.f * ch_w_safe;
+    const float x_mnem = st.show_bytes
+        ? (x_bytes + bytes_chars * ch_w_safe + 1.f * ch_w_safe)
+        : (x_seg_addr + seg_addr_chars * ch_w_safe + 2.f * ch_w_safe);
+    const float x_operand = x_mnem + mnem_chars * ch_w_safe;
+    const float x_comment = x_seg_addr + comment_indent_chars * ch_w_safe;
+    const uint32_t cur_gen = s_format_gen.load(std::memory_order_acquire);
 
-    ImU32 ac_full = aida::ui::with_alpha(tk.accent_u32, a * 0.78f);
-    ImU32 ac_dim  = aida::ui::with_alpha(tk.accent_u32, a * 0.06f);
-
-
-    dl->AddLine(ImVec2(x_vsep, oy_content), ImVec2(x_vsep, oy_content + content_height),
-                aida::ui::with_alpha(tk.border_subtle, a), 1.f);
-    if (st.show_bytes && bytes_col_w > 0.f) {
-        dl->AddLine(ImVec2(x_mnem - 6.f, oy_content), ImVec2(x_mnem - 6.f, oy_content + content_height),
-                    aida::ui::with_alpha(tk.border_subtle, a * 0.6f), 1.f);
-    }
+    dl->AddRectFilled(ImVec2(ox, oy_content), ImVec2(ox + width, oy_content + content_height),
+        aida::ui::with_alpha(disasm_theme::panel_bg(), a));
+    dl->AddRectFilled(ImVec2(ox, oy_content), ImVec2(ox + gutter_w, oy_content + content_height),
+        aida::ui::with_alpha(disasm_theme::gutter_bg(), a));
 
     int first_row = std::max(0, static_cast<int>(st.scroll_y / line_h) - 1);
     int last_row  = std::min(n - 1, static_cast<int>((st.scroll_y + content_height) / line_h) + 1);
 
+    if (n > 0 && first_row <= last_row && !throttled) {
+        uint64_t now_w = now_ns();
+        uint64_t last_w = s_visible_warm_last_ns.load(std::memory_order_acquire);
+        if (now_w - last_w >= 150000000ull) {
+            s_visible_warm_last_ns.store(now_w, std::memory_order_release);
+            uint64_t lo_va = instrs[first_row].addr;
+            uint64_t hi_va = instrs[last_row].addr + static_cast<uint64_t>(instrs[last_row].len);
+            xref_index::warm_range(lo_va, hi_va);
+            function_index::warm_range(lo_va, hi_va);
+            symbol_classifier::warm_range(lo_va, hi_va);
+        }
+    }
 
     if (disasm.live_mode && n > 0) {
         int mid_row = (first_row + last_row) / 2;
         if (mid_row >= 0 && mid_row < n)
             disasm.live_view_addr = instrs[mid_row].addr;
     }
+
+    auto& vc = var_cache_slot();
+    vc.func_start = 0;
+    vc.resolved = false;
+
+    auto draw_addr_prefix = [&](float yy, uint64_t va, const std::string& seg_override,
+                                float row_alpha, float yoff)
+    {
+        std::string seg_addr = format_segment_address(file, va, seg_override);
+        std::string seg_part;
+        std::string addr_part;
+        size_t colon = seg_addr.find(':');
+        if (colon != std::string::npos) {
+            seg_part = seg_addr.substr(0, colon);
+            addr_part = seg_addr.substr(colon + 1);
+        } else {
+            addr_part = seg_addr;
+        }
+        ImVec2 sp(x_seg_addr, yy + 1.f - yoff);
+        dl->AddText(code_font, code_size, sp,
+            aida::ui::with_alpha(disasm_theme::segment(), row_alpha), seg_part.c_str());
+        if (!seg_part.empty()) {
+            float w_seg = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, seg_part.c_str()).x;
+            ImVec2 cp(x_seg_addr + w_seg, yy + 1.f - yoff);
+            dl->AddText(code_font, code_size, cp,
+                aida::ui::with_alpha(disasm_theme::separator(), row_alpha), ":");
+            ImVec2 ap(x_seg_addr + w_seg + ch_w_safe, yy + 1.f - yoff);
+            dl->AddText(code_font, code_size, ap,
+                aida::ui::with_alpha(disasm_theme::address(), row_alpha), addr_part.c_str());
+        } else {
+            dl->AddText(code_font, code_size, sp,
+                aida::ui::with_alpha(disasm_theme::address(), row_alpha), addr_part.c_str());
+        }
+    };
+
+    auto draw_text_at = [&](float xx, float yy, ImU32 col, const char* str, float yoff) {
+        dl->AddText(code_font, code_size, ImVec2(xx, yy + 1.f - yoff), col, str);
+    };
+
+    auto fill_row_bg = [&](float yy, ImU32 col) {
+        dl->AddRectFilled(ImVec2(ox, yy), ImVec2(ox + width, yy + line_h - 1.f), col);
+    };
+
+    struct sec_resolver_t {
+        bool                                   resolved = false;
+        uint64_t                               module_base = 0;
+        uint32_t                               module_size = 0;
+        std::vector<pe_parser::section_info_t> sections;
+        std::string                            fallback;
+    };
+    sec_resolver_t sec_resolver;
+
+    auto sec_resolver_init = [&]() {
+        if (sec_resolver.resolved) return;
+        sec_resolver.resolved = true;
+        sec_resolver.fallback = ".text";
+        if (file.image_base == 0 || n == 0) return;
+
+        uint64_t probe_va = instrs[std::max(0, std::min(n - 1, first_row))].addr;
+        if (auto cached = xref_index::detail::lookup_cached_module(probe_va)) {
+            if (cached->base != 0 && !cached->sections.empty()) {
+                sec_resolver.module_base = cached->base;
+                sec_resolver.module_size = cached->size;
+                sec_resolver.sections = cached->sections;
+                return;
+            }
+        }
+        if (throttled) return;
+
+        uint64_t mb = 0;
+        uint32_t ms = 0;
+        std::string mn;
+        if (!function_index::detail::resolve_module_for_address(probe_va, mb, ms, mn)) return;
+
+        pe_parser::pe_info_t pe;
+        if (!pe_parser::parse(mb, pe)) return;
+
+        sec_resolver.module_base = mb;
+        sec_resolver.module_size = ms;
+        sec_resolver.sections = pe.sections;
+    };
+
+    auto get_visible_section = [&](uint64_t va) -> std::string {
+        if (!sec_resolver.resolved) sec_resolver_init();
+        if (sec_resolver.module_base == 0) return sec_resolver.fallback;
+        if (va < sec_resolver.module_base) return sec_resolver.fallback;
+        uint32_t rva = static_cast<uint32_t>(va - sec_resolver.module_base);
+        for (const auto& s : sec_resolver.sections) {
+            if (rva >= s.virtual_address && rva < s.virtual_address + s.virtual_size)
+                return s.name;
+        }
+        return sec_resolver.fallback;
+    };
 
     for (int i = first_row; i <= last_row; i++) {
         float y = oy_content + i * line_h - st.scroll_y;
@@ -1285,11 +1515,6 @@ void render(float pos_x, float pos_y, float width, float height,
         float row_y_off = (1.f - row_entrance) * 6.f;
         float row_a_inner = a * row_entrance;
 
-        if (i & 1)
-            dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + width, y + line_h - 1.f),
-                              aida::ui::with_alpha(IM_COL32(255, 255, 255, 6), row_a_inner));
-
-
         bool row_hovered = ImGui::IsMouseHoveringRect(
             ImVec2(ox, y), ImVec2(ox + width, y + line_h - 1.f), false);
 
@@ -1297,150 +1522,413 @@ void render(float pos_x, float pos_y, float width, float height,
         float rh = hov_st.tick(row_hovered, dt, aida::motion::spring::snappy);
 
         if (rh > 0.002f)
-            dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + width, y + line_h - 1.f),
-                              aida::ui::with_alpha(tk.hover_wash, row_a_inner * rh));
-
+            fill_row_bg(y, aida::ui::with_alpha(tk.hover_wash, row_a_inner * rh));
 
         if (i == st.selected_row) {
-            float glow_extent = 14.f;
-            for (int gp = 3; gp >= 1; --gp) {
-                float gp_t = (float)gp / 3.f;
-                ImU32 glow = aida::ui::with_alpha(tk.accent_glow, row_a_inner * (1.f - gp_t) * 0.7f);
-                dl->AddRectFilled(ImVec2(ox - glow_extent * gp_t, y - 2.f * gp_t),
-                                  ImVec2(ox + width + glow_extent * gp_t, y + line_h + 2.f * gp_t),
-                                  glow);
-            }
-            dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + width, y + line_h - 1.f),
-                              aida::ui::with_alpha(tk.selection, row_a_inner));
-            float pulse = aida::ui::clock::pulse(1.4f, 0.7f, 1.f);
+            fill_row_bg(y, aida::ui::with_alpha(disasm_theme::cursor_line_bg(), row_a_inner));
             dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + 3.f, y + line_h - 1.f),
-                              aida::ui::with_alpha(tk.accent_u32, row_a_inner * pulse));
+                aida::ui::with_alpha(tk.accent_u32, row_a_inner));
         }
-
-
-        if (ins.is_branch || ins.is_call)
-            dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + width, y + line_h - 1.f),
-                              aida::ui::with_alpha(ac_dim, row_a_inner));
-
 
         for (auto& bm : st.bookmarks) {
             if (bm.addr == ins.addr) {
-                dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + 3.f, y + line_h),
-                                  aida::ui::with_alpha(tk.warning, row_a_inner));
+                dl->AddRectFilled(ImVec2(ox + 4.f, y), ImVec2(ox + 7.f, y + line_h - 1.f),
+                    aida::ui::with_alpha(tk.warning, row_a_inner));
                 break;
             }
         }
 
+        std::string sec_name = throttled ? std::string(".text") : get_visible_section(ins.addr);
 
-        char addr_buf[20];
-        uint64_t display_addr = ins.addr;
-        if (st.addr_format == addr_format_t::rva)
-            display_addr = ins.addr - file.image_base;
-        else if (st.addr_format == addr_format_t::file_offset)
-            display_addr = ins.addr - file.text_va;
-        snprintf(addr_buf, sizeof(addr_buf), "%016llX", static_cast<unsigned long long>(display_addr));
-        dl->AddText(ImVec2(x_addr, y + 1.f - row_y_off),
-            aida::ui::with_alpha(tk.text_address, row_a_inner * 0.85f), addr_buf);
+        instr_cache_entry_t& cache = instr_cache_slot(ins.addr, cur_gen, ins.raw, ins.len);
 
+        const std::vector<function_index::injection_row_t>* before_rows_ptr = nullptr;
+        const std::vector<function_index::injection_row_t>* after_rows_ptr = nullptr;
+        const std::string* inline_label_ptr = nullptr;
+        static const std::vector<function_index::injection_row_t> s_empty_inj;
+        static const std::string s_empty_str;
+        if (!throttled) {
+            if (!cache.inj_valid) {
+                cache.before_rows = function_index::rows_before(ins.addr);
+                cache.after_rows = function_index::rows_after(ins.addr);
+                cache.inline_label = function_index::inline_label_at(ins.addr);
+                cache.inj_valid = true;
+            }
+            before_rows_ptr = &cache.before_rows;
+            after_rows_ptr = &cache.after_rows;
+            inline_label_ptr = &cache.inline_label;
+        } else {
+            before_rows_ptr = &s_empty_inj;
+            after_rows_ptr = &s_empty_inj;
+            inline_label_ptr = &s_empty_str;
+        }
+
+        if (!before_rows_ptr->empty()) {
+            uint64_t fstart = ins.addr;
+            for (const auto& br : *before_rows_ptr) {
+                if (br.kind == function_index::injection_t::var_decl) {
+                    fstart = br.addr;
+                    break;
+                }
+            }
+            prime_var_cache(fstart);
+        }
+
+        const std::vector<xref_index::annotation_t>* xrefs_at_func_ptr = nullptr;
+        bool xrefs_more = false;
+        bool is_proc_start = false;
+        static const std::vector<xref_index::annotation_t> s_empty_xref;
+        if (!throttled) {
+            for (const auto& br : *before_rows_ptr) {
+                if (br.kind == function_index::injection_t::proc_header) {
+                    is_proc_start = true;
+                    if (!cache.xref_valid) {
+                        cache.xref_at_func = xref_index::query_to(ins.addr, 6);
+                        cache.xref_more_at_func = xref_index::has_more(ins.addr, 6);
+                        cache.xref_valid = true;
+                    }
+                    xrefs_at_func_ptr = &cache.xref_at_func;
+                    xrefs_more = cache.xref_more_at_func;
+                    break;
+                }
+            }
+        }
+        if (!xrefs_at_func_ptr) xrefs_at_func_ptr = &s_empty_xref;
+        const std::vector<xref_index::annotation_t>& xrefs_at_func = *xrefs_at_func_ptr;
+
+        auto draw_injection_row = [&](float yy, const function_index::injection_row_t& r,
+                                      const std::string& addr_seg)
+        {
+            draw_addr_prefix(yy, ins.addr, addr_seg, row_a_inner * 0.7f, row_y_off);
+            if (r.kind == function_index::injection_t::spacer_line) return;
+            if (r.text.empty()) return;
+
+            if (r.kind == function_index::injection_t::proc_header
+                || r.kind == function_index::injection_t::proc_endp)
+            {
+                ImU32 name_col = disasm_theme::sub_label();
+                if (!throttled) {
+                    symbol_classifier::kind_t k = symbol_classifier::classify(r.addr);
+                    if (k != symbol_classifier::kind_t::unknown) {
+                        name_col = disasm_theme::color_for_kind(static_cast<int>(k));
+                    }
+                }
+                size_t name_end = 0;
+                const std::string& t = r.text;
+                while (name_end < t.size() && t[name_end] != ' ' && t[name_end] != '\t') ++name_end;
+                std::string name_part = t.substr(0, name_end);
+                std::string tail_part = t.substr(name_end);
+                ImU32 name_alpha = aida::ui::with_alpha(name_col, row_a_inner);
+                draw_text_at(x_mnem, yy, name_alpha, name_part.c_str(), row_y_off);
+                if (!tail_part.empty()) {
+                    float name_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, name_part.c_str()).x;
+                    ImU32 tail_alpha = aida::ui::with_alpha(disasm_theme::keyword(), row_a_inner);
+                    draw_text_at(x_mnem + name_w, yy, tail_alpha, tail_part.c_str(), row_y_off);
+                }
+                return;
+            }
+
+            ImU32 text_col;
+            switch (r.kind) {
+                case function_index::injection_t::function_banner:
+                case function_index::injection_t::endp_separator:
+                    text_col = aida::ui::with_alpha(disasm_theme::banner(), row_a_inner);
+                    break;
+                case function_index::injection_t::attributes_line:
+                case function_index::injection_t::prototype_line:
+                    text_col = aida::ui::with_alpha(disasm_theme::comment(), row_a_inner);
+                    break;
+                case function_index::injection_t::var_decl:
+                    text_col = aida::ui::with_alpha(disasm_theme::var_decl(), row_a_inner);
+                    break;
+                case function_index::injection_t::label_line:
+                    text_col = aida::ui::with_alpha(disasm_theme::loc_label(), row_a_inner);
+                    break;
+                case function_index::injection_t::proc_header:
+                case function_index::injection_t::proc_endp:
+                case function_index::injection_t::spacer_line:
+                    return;
+            }
+            draw_text_at(x_mnem, yy, text_col, r.text.c_str(), row_y_off);
+        };
+
+        float anchor_y = y;
+        int row_local = 0;
+
+        const auto& before_rows_ref = *before_rows_ptr;
+        for (size_t bi = 0; bi < before_rows_ref.size(); ++bi) {
+            float yy = y - static_cast<float>(before_rows_ref.size() - bi) * line_h;
+            if (yy + line_h < oy_content || yy > oy_content + content_height) continue;
+            const auto& br = before_rows_ref[bi];
+            if (br.kind == function_index::injection_t::spacer_line) {
+                draw_addr_prefix(yy, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
+            } else {
+                draw_injection_row(yy, br, sec_name);
+            }
+            if (br.kind == function_index::injection_t::proc_header && !xrefs_at_func.empty()) {
+                std::string xref_text = ida_format_xref_comment(xrefs_at_func[0],
+                    xrefs_more && xrefs_at_func.size() == 1);
+                draw_text_at(x_comment, yy,
+                    aida::ui::with_alpha(disasm_theme::xref(), row_a_inner * 0.95f),
+                    xref_text.c_str(), row_y_off);
+            }
+            (void)row_local;
+        }
+
+        if (is_proc_start && xrefs_at_func.size() > 1) {
+            for (size_t xi = 1; xi < xrefs_at_func.size(); ++xi) {
+                float yy = y - static_cast<float>(xi) * line_h;
+                if (yy + line_h < oy_content || yy > oy_content + content_height) continue;
+                draw_addr_prefix(yy, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
+                bool last_more = (xi + 1 == xrefs_at_func.size()) && xrefs_more;
+                std::string xt = ida_format_xref_comment(xrefs_at_func[xi], last_more);
+                draw_text_at(x_comment, yy,
+                    aida::ui::with_alpha(disasm_theme::xref(), row_a_inner * 0.9f),
+                    xt.c_str(), row_y_off);
+            }
+        }
+
+        if (!inline_label_ptr->empty() && !throttled) {
+            float yy = y - line_h;
+            if (yy + line_h >= oy_content && yy <= oy_content + content_height) {
+                draw_addr_prefix(yy, ins.addr, sec_name, row_a_inner * 0.7f, row_y_off);
+                std::string lbl_text = *inline_label_ptr + ":";
+                draw_text_at(x_mnem, yy,
+                    aida::ui::with_alpha(disasm_theme::loc_label(), row_a_inner),
+                    lbl_text.c_str(), row_y_off);
+                if (!cache.xref_inline_valid) {
+                    cache.xref_inline = xref_index::query_to(ins.addr, 1);
+                    cache.xref_inline_more = xref_index::has_more(ins.addr, 1);
+                    cache.xref_inline_valid = true;
+                }
+                if (!cache.xref_inline.empty()) {
+                    std::string xt = ida_format_xref_comment(cache.xref_inline[0], cache.xref_inline_more);
+                    draw_text_at(x_comment, yy,
+                        aida::ui::with_alpha(disasm_theme::xref(), row_a_inner * 0.9f),
+                        xt.c_str(), row_y_off);
+                }
+            }
+        }
+
+        draw_addr_prefix(y, ins.addr, sec_name, row_a_inner * 0.95f, row_y_off);
 
         if (st.show_bytes) {
-            char bytes_buf[64] = {};
-            int boff = 0;
-            for (int b = 0; b < ins.len && b < 7 && boff + 3 < 64; b++)
-                boff += snprintf(bytes_buf + boff, 64 - boff, b ? " %02X" : "%02X", ins.raw[b]);
-            if (ins.len > 7)
-                snprintf(bytes_buf + boff, 64 - boff, "..");
-            dl->AddText(ImVec2(x_bytes, y + 1.f - row_y_off),
-                        aida::ui::with_alpha(tk.text_dim, row_a_inner), bytes_buf);
+            if (!cache.bytes_valid) {
+                char bytes_buf[96] = {};
+                int boff = 0;
+                int max_pairs = 12;
+                int show_n = ins.len < max_pairs ? ins.len : max_pairs;
+                for (int b = 0; b < show_n && boff + 4 < static_cast<int>(sizeof(bytes_buf)); b++)
+                    boff += std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff,
+                        b ? " %02X" : "%02X", ins.raw[b]);
+                if (ins.len > max_pairs && boff + 4 < static_cast<int>(sizeof(bytes_buf)))
+                    std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff, "...");
+                cache.bytes_str.assign(bytes_buf);
+                cache.bytes_valid = true;
+            }
+            draw_text_at(x_bytes, y,
+                aida::ui::with_alpha(disasm_theme::bytes(), row_a_inner),
+                cache.bytes_str.c_str(), row_y_off);
         }
 
+        ImU32 mc = mnemonic_color(ins, row_a_inner);
+        draw_text_at(x_mnem, y, mc, ins.mnem, row_y_off);
 
-        ImU32 mc;
-        if (ins.is_call)
-            mc = aida::ui::with_alpha(tk.accent_u32, row_a_inner);
-        else if (ins.is_branch)
-            mc = aida::ui::with_alpha(tk.success, row_a_inner);
-        else if (ins.is_ret)
-            mc = aida::ui::with_alpha(tk.error, row_a_inner);
-        else if (ins.is_nop)
-            mc = aida::ui::with_alpha(tk.text_dim, row_a_inner * 0.6f);
-        else if (ins.is_priv)
-            mc = aida::ui::with_alpha(tk.warning, row_a_inner);
-        else
-            mc = aida::ui::with_alpha(tk.text_primary, row_a_inner);
-
-        dl->AddText(ImVec2(x_mnem, y + 1.f - row_y_off), mc, ins.mnem);
-
-
-        if (ins.ops[0]) {
-            ImU32 oc;
-            if (ins.is_branch || ins.is_call)
-                oc = aida::ui::with_alpha(tk.accent_hover, row_a_inner * 0.85f);
-            else if (ins.is_nop)
-                oc = aida::ui::with_alpha(tk.text_dim, row_a_inner * 0.55f);
-            else if (ins.is_priv)
-                oc = aida::ui::with_alpha(tk.warning, row_a_inner * 0.85f);
-            else
-                oc = aida::ui::with_alpha(tk.text_secondary, row_a_inner);
-
-            dl->AddText(ImVec2(x_ops, y + 1.f - row_y_off), oc, ins.ops);
+        const std::string* operand_text_ptr = nullptr;
+        if (throttled) {
+            operand_text_ptr = nullptr;
+        } else {
+            if (!cache.ops_valid) {
+                cache.ops_subst = substitute_operand_text(ins, file);
+                build_operand_colored_runs(ins, cache.ops_subst, cache.ops_runs);
+                cache.ops_valid = true;
+            }
+            operand_text_ptr = &cache.ops_subst;
         }
-
+        const char* operand_render_cstr = throttled ? ins.ops : operand_text_ptr->c_str();
+        if (throttled) {
+            if (operand_render_cstr && operand_render_cstr[0]) {
+                ImU32 oc;
+                if (ins.is_branch || ins.is_call)
+                    oc = aida::ui::with_alpha(disasm_theme::sub_label(), row_a_inner);
+                else if (ins.is_nop)
+                    oc = aida::ui::with_alpha(disasm_theme::bytes(), row_a_inner * 0.7f);
+                else
+                    oc = aida::ui::with_alpha(disasm_theme::reg(), row_a_inner);
+                draw_text_at(x_operand, y, oc, operand_render_cstr, row_y_off);
+            }
+        } else if (!cache.ops_runs.empty()) {
+            float run_x = x_operand;
+            const float run_alpha = ins.is_nop ? row_a_inner * 0.7f : row_a_inner;
+            for (const auto& run : cache.ops_runs) {
+                if (run.text.empty()) continue;
+                ImU32 col = aida::ui::with_alpha(run.color, run_alpha);
+                draw_text_at(run_x, y, col, run.text.c_str(), row_y_off);
+                float run_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, run.text.c_str()).x;
+                run_x += run_w;
+            }
+        }
 
         if (ins.is_branch || ins.is_call) {
-
             uint64_t target = 0;
             const char* hex_p = strstr(ins.ops, "0x");
             if (!hex_p) hex_p = ins.ops;
-            if (sscanf_s(hex_p, "%llx", &target) == 1 || sscanf_s(hex_p, "0x%llx", &target) == 1) {
-
-                std::string sym_name = symbol_store::resolve_symbol(target);
-                if (!sym_name.empty()) {
-                    float ops_w = ImGui::CalcTextSize(ins.ops).x;
-                    std::string label = "; " + sym_name;
-                    dl->AddText(ImVec2(x_ops + ops_w + 12.f, y + 1.f - row_y_off),
-                        aida::ui::with_alpha(tk.success, row_a_inner * 0.78f), label.c_str());
-                }
-
-                if (!instrs.empty() && target >= instrs.front().addr && target <= instrs.back().addr) {
-                    float arrow_x = ox + width - 16.f;
+            if (sscanf_s(hex_p, "%llx", &target) == 1
+                || sscanf_s(hex_p, "0x%llx", &target) == 1)
+            {
+                if (!instrs.empty() && target >= instrs.front().addr
+                    && target <= instrs.back().addr)
+                {
+                    float arrow_x = ox + width - 18.f;
                     bool row_selected = (i == st.selected_row);
                     float arrow_a = row_selected
                         ? row_a_inner * aida::ui::clock::pulse(1.6f, 0.6f, 1.f)
                         : row_a_inner * 0.55f;
                     ImU32 arrow_col = aida::ui::with_alpha(
-                        row_selected ? tk.accent_u32 : tk.success, arrow_a);
-                    dl->AddTriangleFilled(
-                        ImVec2(arrow_x, y + 4.f),
-                        ImVec2(arrow_x + 8.f, y + line_h * 0.5f),
-                        ImVec2(arrow_x, y + line_h - 4.f),
-                        arrow_col);
+                        target < ins.addr ? disasm_theme::arrow_up() : disasm_theme::arrow_down(),
+                        arrow_a);
+                    if (target < ins.addr) {
+                        dl->AddTriangleFilled(
+                            ImVec2(arrow_x + 4.f, y + 4.f),
+                            ImVec2(arrow_x, y + line_h - 4.f),
+                            ImVec2(arrow_x + 8.f, y + line_h - 4.f),
+                            arrow_col);
+                    } else {
+                        dl->AddTriangleFilled(
+                            ImVec2(arrow_x, y + 4.f),
+                            ImVec2(arrow_x + 8.f, y + 4.f),
+                            ImVec2(arrow_x + 4.f, y + line_h - 4.f),
+                            arrow_col);
+                    }
                 }
             }
         }
 
+        if (!throttled && comment_store::has(ins.addr)) {
+            std::string cmt_text = comment_store::get(ins.addr);
+            if (!cmt_text.empty()) {
+                size_t cmt_nl = cmt_text.find('\n');
+                std::string cmt_first = (cmt_nl == std::string::npos) ? cmt_text : cmt_text.substr(0, cmt_nl);
+                bool cmt_multiline = (cmt_nl != std::string::npos);
+
+                const char* operand_for_width = operand_render_cstr ? operand_render_cstr : "";
+                float operand_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, operand_for_width).x;
+                float cmt_x = std::max(x_comment, x_operand + operand_w + 4.f * ch_w_safe);
+                float cmt_max_w = (ox + width - 24.f) - cmt_x;
+                if (cmt_max_w > 24.f) {
+                    std::string cmt_render = "; " + cmt_first;
+                    bool cmt_truncated = cmt_multiline;
+                    float cmt_full_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, cmt_render.c_str()).x;
+                    if (cmt_full_w > cmt_max_w) {
+                        size_t lo = 0;
+                        size_t hi = cmt_render.size();
+                        while (lo < hi) {
+                            size_t mid = (lo + hi + 1) / 2;
+                            std::string trial = cmt_render.substr(0, mid) + "...";
+                            if (code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, trial.c_str()).x <= cmt_max_w)
+                                lo = mid;
+                            else
+                                hi = mid - 1;
+                        }
+                        if (lo < cmt_render.size())
+                            cmt_render = cmt_render.substr(0, lo) + "...";
+                        cmt_truncated = true;
+                    }
+                    ImU32 cmt_col = aida::ui::with_alpha(disasm_theme::comment(), row_a_inner * 0.95f);
+                    draw_text_at(cmt_x, y, cmt_col, cmt_render.c_str(), row_y_off);
+                    if (cmt_truncated) {
+                        float cmt_drawn_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, cmt_render.c_str()).x;
+                        if (ImGui::IsMouseHoveringRect(ImVec2(cmt_x, y),
+                            ImVec2(cmt_x + cmt_drawn_w, y + line_h - 1.f), false))
+                            ImGui::SetTooltip("%s", cmt_text.c_str());
+                    }
+                }
+            }
+        }
+
+        const auto& after_rows_ref = *after_rows_ptr;
+        if (!after_rows_ref.empty()) {
+            for (size_t ai = 0; ai < after_rows_ref.size(); ++ai) {
+                float yy = y + static_cast<float>(ai + 1) * line_h;
+                if (yy + line_h < oy_content || yy > oy_content + content_height) continue;
+                const auto& ar = after_rows_ref[ai];
+                if (ar.kind == function_index::injection_t::spacer_line) {
+                    draw_addr_prefix(yy, ar.addr, sec_name, row_a_inner * 0.55f, row_y_off);
+                } else {
+                    function_index::injection_row_t copy = ar;
+                    draw_injection_row(yy, copy, sec_name);
+                }
+            }
+        }
 
         if (row_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             st.selected_row = i;
         }
-
 
         if (row_hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
             if (ins.is_branch || ins.is_call) {
                 uint64_t target = 0;
                 const char* hex_p = strstr(ins.ops, "0x");
                 if (!hex_p) hex_p = ins.ops;
-                if (sscanf_s(hex_p, "%llx", &target) == 1 || sscanf_s(hex_p, "0x%llx", &target) == 1) {
+                if (sscanf_s(hex_p, "%llx", &target) == 1
+                    || sscanf_s(hex_p, "0x%llx", &target) == 1)
+                {
                     goto_address(target, disasm);
                 }
             }
         }
 
-
         if (row_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
             st.ctx_row = i;
             ImGui::OpenPopup("##disasm_view_ctx");
         }
+
+        (void)anchor_y;
+    }
+
+    {
+        const uint64_t now_end = now_ns();
+        const uint64_t elapsed_ns = now_end - frame_t0_ns;
+        if (elapsed_ns > 24000000ull && !throttled) {
+            throttle_arm(250);
+        }
+        s_render_ms_accum_us.fetch_add(elapsed_ns / 1000ull, std::memory_order_relaxed);
+        s_render_log_frames.fetch_add(1u, std::memory_order_relaxed);
+        s_render_log_rows_accum.fetch_add(
+            static_cast<uint64_t>((last_row >= first_row) ? (last_row - first_row + 1) : 0),
+            std::memory_order_relaxed);
+        uint64_t prev_log = s_render_log_last_ns.load(std::memory_order_acquire);
+        if (prev_log == 0) {
+            s_render_log_last_ns.store(now_end, std::memory_order_release);
+        } else if (now_end - prev_log >= 1000000000ull) {
+            uint64_t total_us = s_render_ms_accum_us.exchange(0, std::memory_order_acq_rel);
+            uint32_t frames = s_render_log_frames.exchange(0, std::memory_order_acq_rel);
+            uint64_t rows_sum = s_render_log_rows_accum.exchange(0, std::memory_order_acq_rel);
+            s_render_log_last_ns.store(now_end, std::memory_order_release);
+            if (frames > 0) {
+                double avg_ms = static_cast<double>(total_us) / 1000.0 / static_cast<double>(frames);
+                double avg_rows = static_cast<double>(rows_sum) / static_cast<double>(frames);
+                driver_bridge::debug_log("[disasm] render_ms=%.2f rows=%.0f frames=%u\n",
+                    avg_ms, avg_rows, frames);
+            }
+        }
+    }
+
+    if (throttled) {
+        float panel_w = 220.f;
+        float panel_h = 32.f;
+        float lx = ox + width - panel_w - 14.f;
+        float ly = oy_content + 6.f;
+        ImVec2 la(lx, ly);
+        ImVec2 lb(lx + panel_w, ly + panel_h);
+        aida::ui::blur::render_drop_shadow(dl, la, lb, panel_h * 0.5f, 4, 0.30f * a);
+        aida::ui::blur::render_glass_fill(dl, la, lb, panel_h * 0.5f, a);
+        aida::ui::blur::render_glass_border(dl, la, lb, panel_h * 0.5f, a);
+        const char* lmsg = "Loading symbols...";
+        ImVec2 ms = ImGui::CalcTextSize(lmsg);
+        dl->AddText(ImVec2(lx + (panel_w - ms.x) * 0.5f,
+                           ly + (panel_h - ImGui::GetFontSize()) * 0.5f),
+                    aida::ui::with_alpha(tk.text_secondary, a), lmsg);
     }
 
     {
@@ -1638,45 +2126,30 @@ void render(float pos_x, float pos_y, float width, float height,
         if (ImGui::GetIO().KeyAlt && ImGui::IsKeyPressed(ImGuiKey_RightArrow, false))
             navigate_forward();
 
-        if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) {
-            uint64_t f5_addr = 0;
-            if (st.ctx_row >= 0 && st.ctx_row < n)
-                f5_addr = instrs[st.ctx_row].addr;
-            if (f5_addr == 0 && !instrs.empty())
-                f5_addr = instrs[0].addr;
-            if (f5_addr != 0)
-                globals::ui::decompile_popup_addr = f5_addr;
-            if (globals::ui::decompile_default_mode == 0) {
-                if (f5_addr)
-                    decompiler_engine::decompile_function(f5_addr, g_sa_settings);
-                globals::ui::active_center_view = center_view_t::decompiler;
-            } else if (globals::ui::decompile_default_mode == 1) {
-                if (f5_addr)
-                    decompiler_engine::decompile_function_native(f5_addr);
-                globals::ui::active_center_view = center_view_t::decompiler;
-            } else if (globals::ui::decompile_default_mode == 2) {
-                if (f5_addr)
-                    decompiler_engine::decompile_function_hybrid(f5_addr, g_sa_settings);
-                globals::ui::active_center_view = center_view_t::decompiler;
-            } else {
-                globals::ui::show_decompile_popup = true;
-            }
-        }
-
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-            if (st.xref_popup_open) {
-                st.xref_popup_open = false;
-            } else if (st.graph_mode) {
-                st.graph_mode = false;
-            } else {
-                st.goto_visible = false;
-            }
-        }
-
         ImGuiIO& disasm_hk_io = ImGui::GetIO();
         bool disasm_hk_text_lock = disasm_hk_io.WantTextInput
             || disasm_hk_io.WantCaptureKeyboard
             || ImGui::IsAnyItemActive();
+
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+            if (st.xref_popup_open) {
+                st.xref_popup_open = false;
+            } else if (st.goto_visible) {
+                st.goto_visible = false;
+            } else if (!comment_dialog::is_open()
+                       && !rename_dialog::is_open()
+                       && !disasm_hk_io.KeyCtrl
+                       && !disasm_hk_io.KeyAlt
+                       && !disasm_hk_text_lock) {
+                uint64_t prev_addr = 0;
+                if (nav_history::pop(&prev_addr)) {
+                    s_nav_history_suppress_push = true;
+                    goto_address(prev_addr, disasm);
+                    s_nav_history_suppress_push = false;
+                }
+            }
+        }
+
         if (!st.xref_popup_open && !st.goto_visible && !disasm_hk_io.KeyCtrl && !disasm_hk_io.KeyAlt
             && !disasm_hk_text_lock) {
             if (ImGui::IsKeyPressed(ImGuiKey_X, false)) {
@@ -1684,6 +2157,10 @@ void render(float pos_x, float pos_y, float width, float height,
                 if (row >= 0 && row < n) {
                     uint64_t addr = instrs[row].addr;
                     st.xref_popup_addr = addr;
+                    {
+                        std::string rn = rename_store::get(addr);
+                        st.xref_popup_target_name = !rn.empty() ? rn : symbol_store::resolve_symbol(addr);
+                    }
                     st.xref_popup_open = true;
                     st.xref_popup_fade = 0.f;
                     st.xref_popup_scroll = 0.f;
@@ -1697,23 +2174,69 @@ void render(float pos_x, float pos_y, float width, float height,
                 }
             }
 
+            if (!comment_dialog::is_open() && ImGui::IsKeyPressed(ImGuiKey_Semicolon, false)) {
+                uint64_t cmt_addr = 0;
+                if (st.selected_row >= 0 && st.selected_row < n)
+                    cmt_addr = instrs[st.selected_row].addr;
+                else if (n > 0)
+                    cmt_addr = instrs[0].addr;
+                if (cmt_addr != 0)
+                    comment_dialog::open(cmt_addr);
+            }
+
             if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
-                st.graph_mode = !st.graph_mode;
-                if (st.graph_mode) {
-                    uint64_t entry = 0;
-                    if (st.selected_row >= 0 && st.selected_row < n)
-                        entry = instrs[st.selected_row].addr;
-                    else if (n > 0)
-                        entry = instrs[0].addr;
-                    if (entry != 0) {
-                        st.cfg_entry_addr = entry;
-                        st.cfg_needs_build = true;
+                uint64_t cursor_addr = 0;
+                if (st.selected_row >= 0 && st.selected_row < n)
+                    cursor_addr = instrs[st.selected_row].addr;
+                else if (n > 0)
+                    cursor_addr = instrs[0].addr;
+                if (cursor_addr != 0) {
+                    uint64_t entry = find_enclosing_function_start(cursor_addr, disasm.file);
+                    if (entry == 0) entry = cursor_addr;
+                    cfg_view::g_state.current_rip = cursor_addr;
+                    cfg_view::g_state.last_cursor_addr = cursor_addr;
+                    if (cfg_view::g_state.entry_addr != entry || !cfg_view::g_state.built)
+                        cfg_view::build_cfg(entry);
+                    cfg_view::g_state.fit_request = true;
+                    globals::ui::active_center_view = center_view_t::graph_view;
+                }
+            }
+
+            if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) {
+                uint64_t f5_cursor_addr = 0;
+                if (st.selected_row >= 0 && st.selected_row < n)
+                    f5_cursor_addr = instrs[st.selected_row].addr;
+                else if (n > 0)
+                    f5_cursor_addr = instrs[0].addr;
+                if (f5_cursor_addr == 0) {
+                    output_log::push(bottom_tab_t::output,
+                        "[disasm] F5: no cursor address available; aborting decompile.");
+                } else {
+                    uint64_t f5_entry = find_enclosing_function_start(f5_cursor_addr, disasm.file);
+                    if (f5_entry == 0) {
+                        output_log::push(bottom_tab_t::output,
+                            "[disasm] F5: enclosing function not found; aborting decompile.");
+                    } else {
+                        globals::ui::decompile_popup_addr = f5_entry;
+                        if (globals::ui::decompile_default_mode == 0) {
+                            decompiler_engine::decompile_function(f5_entry, g_sa_settings);
+                            globals::ui::active_center_view = center_view_t::decompiler;
+                        } else if (globals::ui::decompile_default_mode == 1) {
+                            decompiler_engine::decompile_function_native(f5_entry);
+                            globals::ui::active_center_view = center_view_t::decompiler;
+                        } else if (globals::ui::decompile_default_mode == 2) {
+                            decompiler_engine::decompile_function_hybrid(f5_entry, g_sa_settings);
+                            globals::ui::active_center_view = center_view_t::decompiler;
+                        } else {
+                            globals::ui::show_decompile_popup = true;
+                        }
                     }
                 }
             }
 
             if (ImGui::IsKeyPressed(ImGuiKey_G, false) && !ImGui::GetIO().KeyCtrl) {
-                st.goto_visible = !st.goto_visible;
+                st.goto_visible = true;
+                st.goto_buf[0] = '\0';
             }
 
             if (ImGui::IsKeyPressed(ImGuiKey_Tab, false)) {
@@ -1734,23 +2257,15 @@ void render(float pos_x, float pos_y, float width, float height,
                 }
             }
 
-            if (ImGui::IsKeyPressed(ImGuiKey_N, false)) {
+            if (!rename_dialog::is_open() && ImGui::IsKeyPressed(ImGuiKey_N, false)) {
                 int row = st.selected_row;
-                if (row >= 0 && row < n) {
-                    uint64_t addr = instrs[row].addr;
-                    char label_buf[32];
-                    snprintf(label_buf, sizeof(label_buf), "0x%llX", static_cast<unsigned long long>(addr));
-                    bool already = false;
-                    for (auto& bm : st.bookmarks) {
-                        if (bm.addr == addr) { already = true; break; }
-                    }
-                    if (!already) {
-                        bookmark_t bm;
-                        bm.addr = addr;
-                        bm.label = label_buf;
-                        st.bookmarks.push_back(bm);
-                    }
-                }
+                uint64_t rename_addr = 0;
+                if (row >= 0 && row < n)
+                    rename_addr = instrs[row].addr;
+                else if (n > 0)
+                    rename_addr = instrs[0].addr;
+                if (rename_addr != 0)
+                    rename_dialog::open(rename_addr);
             }
         }
     }
@@ -1775,10 +2290,10 @@ void render(float pos_x, float pos_y, float width, float height,
         ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImGui::ColorConvertU32ToFloat4(tk.panel_header));
         ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImGui::ColorConvertU32ToFloat4(tk.selection));
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
-        ImGui::PushItemWidth(180.f);
-        if (ImGui::InputTextWithHint("##in", "0x140001000",
+        ImGui::PushItemWidth(220.f);
+        if (ImGui::InputTextWithHint("##in", "0x140001000 or CreateFileW",
             st.goto_buf, sizeof(st.goto_buf),
-            ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CharsHexadecimal))
+            ImGuiInputTextFlags_EnterReturnsTrue))
             go = true;
         ImGui::PopItemWidth();
         ImGui::PopStyleVar();
@@ -1788,10 +2303,53 @@ void render(float pos_x, float pos_y, float width, float height,
         ImGui::SameLine();
         if (aida::ui::components::button("Go", aida::ui::components::button_kind_t::primary,
                                           aida::ui::components::size_t_::sm) || go) {
-            uint64_t addr = 0;
-            sscanf_s(st.goto_buf, "%llx", &addr);
-            goto_address(addr, disasm);
-            st.goto_visible = false;
+            std::string raw_input(st.goto_buf);
+            std::string trimmed_input = raw_input;
+            while (!trimmed_input.empty() && (trimmed_input.front() == ' ' || trimmed_input.front() == '\t'))
+                trimmed_input.erase(trimmed_input.begin());
+            while (!trimmed_input.empty() && (trimmed_input.back() == ' ' || trimmed_input.back() == '\t'))
+                trimmed_input.pop_back();
+
+            uint64_t resolved_addr = 0;
+            bool resolved_ok = false;
+
+            if (!trimmed_input.empty()) {
+                std::string hex_view_str = trimmed_input;
+                if (hex_view_str.size() > 2 && hex_view_str[0] == '0'
+                    && (hex_view_str[1] == 'x' || hex_view_str[1] == 'X'))
+                    hex_view_str = hex_view_str.substr(2);
+
+                bool all_hex = !hex_view_str.empty();
+                for (char c : hex_view_str) {
+                    bool is_hex = (c >= '0' && c <= '9')
+                        || (c >= 'a' && c <= 'f')
+                        || (c >= 'A' && c <= 'F');
+                    if (!is_hex) { all_hex = false; break; }
+                }
+
+                if (all_hex) {
+                    char* end = nullptr;
+                    uint64_t parsed = std::strtoull(hex_view_str.c_str(), &end, 16);
+                    if (end && *end == '\0' && parsed != 0) {
+                        resolved_addr = parsed;
+                        resolved_ok = true;
+                    }
+                }
+
+                if (!resolved_ok) {
+                    uint64_t sym_addr = symbol_store::resolve_name_to_addr(trimmed_input);
+                    if (sym_addr != 0) {
+                        resolved_addr = sym_addr;
+                        resolved_ok = true;
+                    }
+                }
+            }
+
+            if (resolved_ok) {
+                goto_address(resolved_addr, disasm);
+                st.goto_visible = false;
+                st.goto_buf[0] = '\0';
+            }
         }
         ImGui::SameLine();
         if (aida::ui::components::button("<", aida::ui::components::button_kind_t::secondary,
@@ -1971,6 +2529,9 @@ void render(float pos_x, float pos_y, float width, float height,
     }
 
     render_xref_popup(pos_x, pos_y, width, height, alpha, accent_r, accent_g, accent_b, disasm, dt);
+
+    comment_dialog::render();
+    rename_dialog::render();
 }
 
 }

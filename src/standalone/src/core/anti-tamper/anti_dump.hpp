@@ -135,6 +135,76 @@ namespace detail
 namespace pe_header
 {
 
+    inline IMAGE_NT_HEADERS64* safe_resolve_self_nt(uint8_t* base, const char* tag)
+    {
+        if (!base) return nullptr;
+
+        IMAGE_NT_HEADERS64* nt = nullptr;
+        __try
+        {
+            auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE && dos->e_magic != 0)
+            {
+                if (tag) {
+                    char buf[128];
+                    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                        "%s: bad e_magic=0x%X", tag, dos->e_magic);
+                    webhook::write_log("anti_dump", buf);
+                }
+                return nullptr;
+            }
+
+            LONG e_lfanew = dos->e_lfanew;
+            if (e_lfanew <= 0 || static_cast<uint32_t>(e_lfanew) > 0x10000u)
+            {
+                if (tag) {
+                    char buf[160];
+                    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                        "%s: bad e_lfanew=0x%lX base=0x%llX",
+                        tag, static_cast<unsigned long>(e_lfanew),
+                        reinterpret_cast<unsigned long long>(base));
+                    webhook::write_log("anti_dump", buf);
+                }
+                return nullptr;
+            }
+
+            nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + e_lfanew);
+            if (nt->Signature != IMAGE_NT_SIGNATURE && nt->Signature != 0)
+            {
+                if (tag) {
+                    char buf[128];
+                    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                        "%s: bad nt sig=0x%X", tag, nt->Signature);
+                    webhook::write_log("anti_dump", buf);
+                }
+                return nullptr;
+            }
+            if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+                nt->OptionalHeader.Magic != 0)
+            {
+                if (tag) {
+                    char buf[128];
+                    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                        "%s: bad opt magic=0x%X", tag, nt->OptionalHeader.Magic);
+                    webhook::write_log("anti_dump", buf);
+                }
+                return nullptr;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            if (tag) {
+                char buf[128];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "%s: SEH on header read code=0x%08X",
+                    tag, static_cast<unsigned int>(GetExceptionCode()));
+                webhook::write_log("anti_dump", buf);
+            }
+            return nullptr;
+        }
+        return nt;
+    }
+
     inline bool erase_dos_header()
     {
         HMODULE mod = GetModuleHandleW(nullptr);
@@ -144,14 +214,10 @@ namespace pe_header
         }
 
         auto* base = reinterpret_cast<uint8_t*>(mod);
-        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
-            char buf[128];
-            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                "erase_dos: e_magic=0x%X (not MZ), already erased?", dos->e_magic);
-            webhook::write_log("anti_dump", buf);
+        if (!safe_resolve_self_nt(base, "erase_dos")) {
             return false;
         }
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
 
         DWORD e_lfanew = dos->e_lfanew;
 
@@ -246,10 +312,11 @@ namespace pe_header
         }
 
         auto* base = reinterpret_cast<uint8_t*>(mod);
+        auto* nt = safe_resolve_self_nt(base, "corrupt_nt");
+        if (!nt) return false;
         auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
 
         uint32_t nt_offset = dos->e_lfanew;
-        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + nt_offset);
 
         DWORD nt_size = sizeof(IMAGE_NT_HEADERS64);
         WORD num_sections = nt->FileHeader.NumberOfSections;
@@ -366,8 +433,8 @@ namespace pe_header
         if (!mod) return false;
 
         auto* base = reinterpret_cast<uint8_t*>(mod);
-        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        auto* nt = safe_resolve_self_nt(base, "inject_fake_sections");
+        if (!nt) return false;
 
         WORD orig_num_sections = nt->FileHeader.NumberOfSections;
         DWORD total = sizeof(IMAGE_NT_HEADERS64)
@@ -960,18 +1027,40 @@ namespace dump_poison
         if (!mod) return;
 
         auto* base = reinterpret_cast<uint8_t*>(mod);
-        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        auto* nt = pe_header::safe_resolve_self_nt(base, "corrupt_debug_dir");
+        if (!nt) return;
+        if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_DEBUG)
+            return;
 
-        auto& dbg_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
-        if (dbg_dir.VirtualAddress == 0) return;
-
-        auto* dbg = reinterpret_cast<uint8_t*>(base + dbg_dir.VirtualAddress);
-        DWORD old_prot;
-        if (VirtualProtect(dbg, dbg_dir.Size, PAGE_READWRITE, &old_prot))
+        uint32_t dbg_rva = 0;
+        uint32_t dbg_size = 0;
+        __try
         {
-            memset(dbg, 0xCC, dbg_dir.Size);
-            VirtualProtect(dbg, dbg_dir.Size, old_prot, &old_prot);
+            const auto& dbg_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+            dbg_rva = dbg_dir.VirtualAddress;
+            dbg_size = dbg_dir.Size;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            webhook::write_log("anti_dump", "corrupt_debug_dir: SEH on dbg_dir read");
+            return;
+        }
+
+        if (dbg_rva == 0 || dbg_size == 0) return;
+
+        auto* dbg = base + dbg_rva;
+        DWORD old_prot = 0;
+        if (VirtualProtect(dbg, dbg_size, PAGE_READWRITE, &old_prot))
+        {
+            __try
+            {
+                memset(dbg, 0xCC, dbg_size);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                webhook::write_log("anti_dump", "corrupt_debug_dir: SEH on memset");
+            }
+            VirtualProtect(dbg, dbg_size, old_prot, &old_prot);
         }
     }
 

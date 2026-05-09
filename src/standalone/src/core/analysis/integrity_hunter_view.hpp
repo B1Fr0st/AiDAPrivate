@@ -78,7 +78,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
 	ImGui::PushStyleColor(ImGuiCol_Border, _ta(ui_anim::lighten(_t.panel_bg, 12)));
 	ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
-	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
 
 	ImGui::PushItemWidth(180.f);
@@ -390,7 +390,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			              evt.access_type == 0 ? "R" : "W",
 			              static_cast<unsigned long long>(evt.rip),
 			              static_cast<unsigned long long>(evt.fault_addr));
-			dl->AddText(ImGui::GetFont(), 12.f, ImVec2(cx + pad, ey), dim_col, line);
+			dl->AddText(ImGui::GetFont(), 14.f, ImVec2(cx + pad, ey), dim_col, line);
 			ey += log_row_h;
 		}
 	}

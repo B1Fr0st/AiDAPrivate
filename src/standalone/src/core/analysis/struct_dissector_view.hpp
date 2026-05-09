@@ -143,7 +143,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	auto& ui = g_ui;
 	auto& st = struct_dissector::g_state;
 	const float dt = aida::ui::clock::dt();
-	const float line_h = 24.f;
+	const float line_h = 28.f;
 	const float top_bar_h = 36.f;
 
 	ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -170,7 +170,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float by = oy + 6.f;
 
 	dl->AddText(aida::ui::fonts::body_em() ? aida::ui::fonts::body_em() : ImGui::GetFont(),
-		12.f, ImVec2(bx, by + 4.f),
+		14.f, ImVec2(bx, by + 4.f),
 		aida::ui::with_alpha(th.text_secondary, alpha), "Base");
 	bx += 36.f;
 
@@ -199,7 +199,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	ImGui::SetCursorScreenPos(ImVec2(bx, by));
 	if (aida::ui::button("Refresh", aida::ui::button_kind_t::primary,
-		aida::ui::size_t_::sm, ImVec2(86.f, 22.f))) {
+		aida::ui::size_t_::sm, ImVec2(96.f, 28.f))) {
 		struct_dissector::refresh_values();
 	}
 	bx += 92.f;
@@ -224,7 +224,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	ImGui::SetCursorScreenPos(ImVec2(bx, by));
 	if (aida::ui::button("Export C", aida::ui::button_kind_t::ghost,
-		aida::ui::size_t_::sm, ImVec2(86.f, 22.f))) {
+		aida::ui::size_t_::sm, ImVec2(86.f, 28.f))) {
 		int aidx = -1;
 		{
 			std::lock_guard<std::mutex> lk(st.mtx);
@@ -317,15 +317,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			}
 
 			dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-				12.f, ImVec2(a.x + 10.f, ry + 4.f),
+				14.f, ImVec2(a.x + 10.f, ry + 5.f),
 				aida::ui::with_alpha(th.text_primary, alpha),
 				entries[static_cast<size_t>(i)].first.c_str());
 			char sz_buf[32];
 			std::snprintf(sz_buf, sizeof(sz_buf), "(%u)", entries[static_cast<size_t>(i)].second);
 			ImFont* code_font = aida::ui::fonts::code();
 			if (!code_font) code_font = ImGui::GetFont();
-			ImVec2 sz = code_font->CalcTextSizeA(11.f, FLT_MAX, 0.f, sz_buf);
-			dl->AddText(code_font, 11.f, ImVec2(b.x - sz.x - 8.f, ry + 5.f),
+			ImVec2 sz = code_font->CalcTextSizeA(13.f, FLT_MAX, 0.f, sz_buf);
+			dl->AddText(code_font, 13.f, ImVec2(b.x - sz.x - 8.f, ry + 6.f),
 				aida::ui::with_alpha(th.text_dim, alpha), sz_buf);
 		}
 		ImGui::PopClipRect();
@@ -345,7 +345,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		ImGui::SameLine();
 		if (aida::ui::button("+", aida::ui::button_kind_t::primary,
-			aida::ui::size_t_::sm, ImVec2(28.f, 22.f))) {
+			aida::ui::size_t_::sm, ImVec2(28.f, 28.f))) {
 			if (ui.name_buf[0] != '\0') {
 				struct_dissector::create_struct(ui.name_buf);
 				ui.name_buf[0] = '\0';
@@ -353,7 +353,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 		ImGui::SameLine();
 		if (aida::ui::button("-", aida::ui::button_kind_t::destructive,
-			aida::ui::size_t_::sm, ImVec2(28.f, 22.f))) {
+			aida::ui::size_t_::sm, ImVec2(28.f, 28.f))) {
 			std::lock_guard<std::mutex> lk(st.mtx);
 			if (st.active_struct >= 0 && st.active_struct < static_cast<int>(st.structs.size())) {
 				st.structs.erase(st.structs.begin() + st.active_struct);
@@ -409,15 +409,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (!head_em) head_em = ImGui::GetFont();
 		ImU32 hc = aida::ui::with_alpha(th.text_secondary, alpha);
 		float hx = rx + 8.f;
-		dl->AddText(head_em, 11.f, ImVec2(hx, hdr_y + 6.f), hc, "Offset");
+		dl->AddText(head_em, 13.f, ImVec2(hx, hdr_y + 7.f), hc, "Offset");
 		hx += col_offset_w + col_glyph_w;
-		dl->AddText(head_em, 11.f, ImVec2(hx, hdr_y + 6.f), hc, "Name");
+		dl->AddText(head_em, 13.f, ImVec2(hx, hdr_y + 7.f), hc, "Name");
 		hx += col_name_w;
-		dl->AddText(head_em, 11.f, ImVec2(hx, hdr_y + 6.f), hc, "Type");
+		dl->AddText(head_em, 13.f, ImVec2(hx, hdr_y + 7.f), hc, "Type");
 		hx += col_type_w;
-		dl->AddText(head_em, 11.f, ImVec2(hx, hdr_y + 6.f), hc, "Value");
+		dl->AddText(head_em, 13.f, ImVec2(hx, hdr_y + 7.f), hc, "Value");
 		hx += col_value_w;
-		dl->AddText(head_em, 11.f, ImVec2(hx, hdr_y + 6.f), hc, "Description");
+		dl->AddText(head_em, 13.f, ImVec2(hx, hdr_y + 7.f), hc, "Description");
 
 		float table_y = ry_start + line_h;
 		float table_h = rh - line_h - line_h - 8.f;
@@ -495,7 +495,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 					char off_str[16];
 					std::snprintf(off_str, sizeof(off_str), "+0x%03X", f.offset);
-					dl->AddText(code_font, 11.f, ImVec2(fx, row_y + 6.f),
+					dl->AddText(code_font, 13.f, ImVec2(fx, row_y + 7.f),
 						aida::ui::with_alpha(th.text_address, alpha * entrance), off_str);
 					fx += col_offset_w;
 
@@ -505,11 +505,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					fx += col_glyph_w;
 
 					dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-						12.f, ImVec2(fx, row_y + 6.f),
+						14.f, ImVec2(fx, row_y + 7.f),
 						aida::ui::with_alpha(th.text_primary, alpha * entrance), f.name.c_str());
 					fx += col_name_w;
 
-					dl->AddText(code_font, 11.f, ImVec2(fx, row_y + 6.f),
+					dl->AddText(code_font, 13.f, ImVec2(fx, row_y + 7.f),
 						type_c, struct_dissector::field_type_name(f.type));
 					fx += col_type_w;
 
@@ -521,7 +521,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 						fa.has_last = true;
 
 						ImU32 val_col = aida::ui::with_alpha(th.text_primary, alpha * entrance);
-						dl->AddText(code_font, 11.f, ImVec2(fx, row_y + 6.f),
+						dl->AddText(code_font, 13.f, ImVec2(fx, row_y + 7.f),
 							val_col, cv.display_text.c_str());
 
 						if (ui.editing_field == fi) {
@@ -537,7 +537,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 								aida::ui::with_alpha(th.panel_header, alpha)));
 							ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
 								aida::ui::with_alpha(th.text_primary, alpha)));
-							ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.f);
+							ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 							ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 2.f));
 							ImGui::PushItemWidth(col_value_w - 8.f);
 							bool committed = ImGui::InputText("##sd_edit_val", ui.edit_value_buf,
@@ -580,7 +580,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 					if (!f.description.empty()) {
 						dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-							11.f, ImVec2(fx, row_y + 6.f),
+							13.f, ImVec2(fx, row_y + 7.f),
 							aida::ui::with_alpha(th.text_dim, alpha * entrance),
 							f.description.c_str());
 					}
@@ -638,7 +638,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::PopStyleVar();
 
 		if (aida::ui::button("Add", aida::ui::button_kind_t::primary,
-			aida::ui::size_t_::sm, ImVec2(72.f, 22.f))) {
+			aida::ui::size_t_::sm, ImVec2(72.f, 28.f))) {
 			if (ui.field_name_buf[0] != '\0') {
 				struct_dissector::field_def_t fd;
 				fd.name = ui.field_name_buf;
@@ -655,7 +655,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 		ImGui::SameLine();
 		if (aida::ui::button("Del", aida::ui::button_kind_t::destructive,
-			aida::ui::size_t_::sm, ImVec2(64.f, 22.f))) {
+			aida::ui::size_t_::sm, ImVec2(64.f, 28.f))) {
 			if (ui.selected_field >= 0) {
 				struct_dissector::remove_field(active_idx, ui.selected_field);
 				ui.selected_field = -1;

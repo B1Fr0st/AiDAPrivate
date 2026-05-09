@@ -193,6 +193,12 @@ namespace detail {
 
     inline std::atomic<uint64_t> s_text_chain_anchor{0};
 
+    inline std::mutex& self_chain_mtx()
+    {
+        static std::mutex m;
+        return m;
+    }
+
     inline bool rdseed_u64(uint64_t& out)
     {
         for (int attempt = 0; attempt < 32; ++attempt)
@@ -778,6 +784,7 @@ inline bool verify_block_chain(const state::code_snapshot_t& snap,
 
 inline bool verify_self_hash()
 {
+    std::lock_guard<std::mutex> chain_lk(detail::self_chain_mtx());
     uint64_t expected = detail::s_self_chain_anchor.load(std::memory_order_acquire);
     if (expected == 0) return true;
     uint64_t self_seed = detail::s_self_chain_seed.load(std::memory_order_acquire);
@@ -1042,7 +1049,7 @@ inline void clear_periodic_violation_flag()
     detail::periodic_violation_flag().store(false, std::memory_order_release);
 }
 
-inline void rebuild_self_chain_anchor()
+inline void rebuild_self_chain_anchor_locked()
 {
     uint64_t seed_value = detail::s_self_chain_seed.load(std::memory_order_acquire);
     if (seed_value == 0) return;
@@ -1061,6 +1068,12 @@ inline void rebuild_self_chain_anchor()
     SecureZeroMemory(mac, sizeof(mac));
     SecureZeroMemory(mat, sizeof(mat));
     detail::s_self_chain_anchor.store(anchor ^ seed_value, std::memory_order_release);
+}
+
+inline void rebuild_self_chain_anchor()
+{
+    std::lock_guard<std::mutex> chain_lk(detail::self_chain_mtx());
+    rebuild_self_chain_anchor_locked();
 }
 
 inline LONG NTAPI page_mac_veh_handler(EXCEPTION_POINTERS* ep)
@@ -1092,13 +1105,12 @@ inline void rotate_page_keys_if_due()
     uint64_t now = detail::qpc_now_ms();
     uint64_t last = pt.last_rotation_qpc.load(std::memory_order_acquire);
     if (now - last < static_cast<uint64_t>(detail::kKeyRotationSec) * 1000ULL) return;
-    {
-        std::lock_guard<std::mutex> lk(pt.mtx);
-        if (pt.last_rotation_qpc.load(std::memory_order_acquire) != last) return;
-        detail::rotate_session_secret();
-        detail::rotate_page_keys_locked(pt);
-    }
-    rebuild_self_chain_anchor();
+    std::lock_guard<std::mutex> chain_lk(detail::self_chain_mtx());
+    std::lock_guard<std::mutex> lk(pt.mtx);
+    if (pt.last_rotation_qpc.load(std::memory_order_acquire) != last) return;
+    detail::rotate_session_secret();
+    detail::rotate_page_keys_locked(pt);
+    rebuild_self_chain_anchor_locked();
 }
 
 namespace periodic {

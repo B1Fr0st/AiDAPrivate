@@ -36,6 +36,7 @@ struct xref_popup_entry_t {
     int         type = 0;
     std::string disasm_text;
     std::string module_name;
+    std::string function_name;
 };
 
 struct state_t {
@@ -44,7 +45,7 @@ struct state_t {
     int              nav_pos = -1;
 
     bool  goto_visible  = false;
-    char  goto_buf[20]  = {};
+    char  goto_buf[192] = {};
 
     addr_format_t addr_format = addr_format_t::va;
     int  active_section = 0;
@@ -63,11 +64,6 @@ struct state_t {
 
     int ctx_row = -1;
 
-    bool  graph_mode = false;
-    float graph_crossfade = 0.f;
-    bool  cfg_needs_build = false;
-    uint64_t cfg_entry_addr = 0;
-
     bool  xref_popup_open = false;
     uint64_t xref_popup_addr = 0;
     float xref_popup_fade = 0.f;
@@ -77,9 +73,13 @@ struct state_t {
     bool  xref_popup_sb_dragging = false;
     float xref_popup_sb_drag_offset = 0.f;
     char  xref_popup_filter[96] = {};
+    std::string xref_popup_target_name;
     std::vector<xref_popup_entry_t> xref_results;
     std::atomic<bool> xref_scanning{false};
     std::mutex xref_mutex;
+
+    uint64_t layout_signature = 0;
+    int      layout_n = 0;
 };
 
 inline state_t g_state;
@@ -91,5 +91,7 @@ void render(float pos_x, float pos_y, float width, float height,
 void goto_address(uint64_t addr, DisasmState& disasm);
 void navigate_back();
 void navigate_forward();
+
+void bump_format_generation();
 
 }

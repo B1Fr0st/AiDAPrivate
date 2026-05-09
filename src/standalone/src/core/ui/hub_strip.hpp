@@ -166,8 +166,9 @@ namespace aida::ui::hub_strip {
 			if (is_active) {
 				ImU32 pill_top = aida::ui::with_alpha(t.accent_grad_top, alpha * 0.95f);
 				ImU32 pill_bot = aida::ui::with_alpha(t.accent_grad_bot, alpha * 0.95f);
-				dl->AddRectFilledMultiColor(ImVec2(bx0 + 4.f, by0), ImVec2(bx1 - 4.f, by1),
-					pill_top, pill_top, pill_bot, pill_bot);
+				ImU32 pill_flat = aida::ui::mix(pill_top, pill_bot, 0.5f);
+				dl->AddRectFilled(ImVec2(bx0 + 4.f, by0), ImVec2(bx1 - 4.f, by1),
+					pill_flat, pill_h * 0.5f);
 				ImU32 ring = aida::ui::with_alpha(t.accent_hover, alpha * 0.35f);
 				dl->AddRect(ImVec2(bx0 + 4.f, by0), ImVec2(bx1 - 4.f, by1),
 					ring, pill_h * 0.5f, 0, 1.f);

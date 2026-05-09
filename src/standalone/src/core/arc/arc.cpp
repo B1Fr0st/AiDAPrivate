@@ -1142,6 +1142,8 @@ bool hkdf_sha256(const uint8_t* ikm, uint32_t ikm_len,
     return true;
 }
 
+static void log_vtable_state(const char* phase, uint64_t integrity_value);
+
 __forceinline uint64_t compute_vtable_integrity()
 {
     uint8_t buf[sizeof(arc_comm_vtable_t)];
@@ -1149,10 +1151,21 @@ __forceinline uint64_t compute_vtable_integrity()
     return siphash_2_4(buf, sizeof(buf), g_vtable_crypt_key, g_vtable_crypt_key ^ 0x5DEECE66DULL);
 }
 
-__forceinline bool verify_vtable()
+bool verify_vtable()
 {
     if (g_vtable_integrity == 0) return true;
-    return compute_vtable_integrity() == g_vtable_integrity;
+    uint64_t fresh = compute_vtable_integrity();
+    if (fresh == g_vtable_integrity) return true;
+    char detail[192];
+    _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+        "verify_vtable_mismatch stored=0x%016llX fresh=0x%016llX crypt_key=0x%016llX tid=%lu",
+        (unsigned long long)g_vtable_integrity,
+        (unsigned long long)fresh,
+        (unsigned long long)g_vtable_crypt_key,
+        GetCurrentThreadId());
+    arc_log("vtable", detail);
+    log_vtable_state("verify_failed", fresh);
+    return false;
 }
 
 static uint64_t g_device_enc = 0;
@@ -1210,14 +1223,16 @@ __declspec(noreturn) __forceinline void enforce_violation(const char* reason, co
     {
         char log_line[384];
         _snprintf_s(log_line, sizeof(log_line), _TRUNCATE,
-            "enforce_violation reason=%s extra=%s", r, x);
+            "enforce_violation reason=%s extra=%s tid=%lu", r, x, GetCurrentThreadId());
         arc_log("violation", log_line);
     }
+    arc_log("violation", "step01_pre_session_lock");
 
     char hwid_buf[66] = {};
     char sess_buf[17] = {};
     if (g_session_mtx.try_lock())
     {
+        arc_log("violation", "step02_session_locked");
         session_data_t sess = {};
         if (decrypt_session_blob(&g_enc_session, &sess) && sess.initialized)
         {
@@ -1226,9 +1241,133 @@ __declspec(noreturn) __forceinline void enforce_violation(const char* reason, co
         }
         SecureZeroMemory(&sess, sizeof(sess));
         g_session_mtx.unlock();
+        arc_log("violation", "step03_session_unlocked");
+    }
+    else
+    {
+        arc_log("violation", "step02_session_lock_skipped_busy");
     }
 
+    arc_log("violation", "step04_pre_exe_path");
+    {
+        char exe_path[MAX_PATH] = {};
+        DWORD got = GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
+        char crash_path[MAX_PATH] = {};
+        if (got > 0 && got < MAX_PATH)
+        {
+            char* last_sep = strrchr(exe_path, '\\');
+            if (last_sep)
+            {
+                *(last_sep + 1) = '\0';
+                _snprintf_s(crash_path, sizeof(crash_path), _TRUNCATE,
+                    "%saida_crash.log", exe_path);
+            }
+        }
+        if (crash_path[0] == '\0')
+            strcpy_s(crash_path, sizeof(crash_path), "aida_crash.log");
+        arc_log("violation", "step05_exe_path_resolved");
+
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+
+        void* return_addr = _ReturnAddress();
+        void* stack_frames[12] = {};
+        USHORT frame_count = RtlCaptureStackBackTrace(0, 12, stack_frames, nullptr);
+        arc_log("violation", "step06_stack_captured");
+
+        char stack_str[640] = {};
+        int stack_off = 0;
+        for (USHORT i = 0; i < frame_count && stack_off < static_cast<int>(sizeof(stack_str) - 24); ++i)
+        {
+            stack_off += _snprintf_s(stack_str + stack_off, sizeof(stack_str) - stack_off, _TRUNCATE,
+                "%s%016llX",
+                (i == 0 ? "" : " "),
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(stack_frames[i])));
+        }
+        {
+            char stack_log[700];
+            _snprintf_s(stack_log, sizeof(stack_log), _TRUNCATE,
+                "step07_stack_str return=0x%016llX frames=%u trace=%s",
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(return_addr)),
+                static_cast<unsigned>(frame_count),
+                stack_str);
+            arc_log("violation", stack_log);
+        }
+
+        HMODULE arc_mod = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(&enforce_violation), &arc_mod);
+        char arc_mod_name[MAX_PATH] = "<unknown>";
+        if (arc_mod)
+            GetModuleFileNameA(arc_mod, arc_mod_name, MAX_PATH);
+        arc_log("violation", "step08_arc_module_resolved");
+
+        char crash_buf[2048];
+        int n = _snprintf_s(crash_buf, sizeof(crash_buf), _TRUNCATE,
+            "[%02d:%02d:%02d.%03d] [arc/violation] FAST_FAIL\r\n"
+            "Reason=%s\r\n"
+            "Extra=%s\r\n"
+            "FastFailCode=0xA1DA\r\n"
+            "Tid=%lu Pid=%lu\r\n"
+            "ReturnAddress=0x%016llX\r\n"
+            "ArcModule=%s\r\n"
+            "Hwid=%s\r\n"
+            "Session=%s\r\n"
+            "EpochTs=%lld\r\n"
+            "StackBackTrace: %s\r\n",
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+            r, x,
+            GetCurrentThreadId(), GetCurrentProcessId(),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(return_addr)),
+            arc_mod_name,
+            hwid_buf,
+            sess_buf,
+            static_cast<long long>(time(nullptr)),
+            stack_str);
+
+        if (n > 0)
+        {
+            arc_log("violation", "step09_pre_crashlog_open");
+            HANDLE hf = CreateFileA(crash_path,
+                FILE_APPEND_DATA | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+            arc_log("violation", "step10_post_crashlog_open");
+            if (hf != INVALID_HANDLE_VALUE)
+            {
+                DWORD written = 0;
+                arc_log("violation", "step11_pre_crashlog_write");
+                WriteFile(hf, crash_buf, static_cast<DWORD>(n), &written, nullptr);
+                arc_log("violation", "step12_post_crashlog_write");
+                FlushFileBuffers(hf);
+                arc_log("violation", "step13_post_crashlog_flush");
+                CloseHandle(hf);
+                arc_log("violation", "step14_post_crashlog_close");
+            }
+            else
+            {
+                arc_log("violation", "step10b_crashlog_open_failed");
+            }
+            OutputDebugStringA(crash_buf);
+            arc_log("violation", "step15_post_outputdebugstring");
+        }
+        else
+        {
+            arc_log("violation", "step09b_crashbuf_format_failed");
+        }
+    }
+
+    arc_log("violation", "step16_pre_load_server_url");
     std::string server = load_server_url();
+    {
+        char srv_log[160];
+        _snprintf_s(srv_log, sizeof(srv_log), _TRUNCATE,
+            "step17_post_load_server_url empty=%d len=%llu",
+            server.empty() ? 1 : 0,
+            (unsigned long long)server.size());
+        arc_log("violation", srv_log);
+    }
     if (!server.empty())
     {
         auto path = OBFSTR("/api/license/violation");
@@ -1256,11 +1395,18 @@ __declspec(noreturn) __forceinline void enforce_violation(const char* reason, co
         body += k_hwid;   body += "\":\""; body += hwid_buf; body += "\",\"";
         body += k_sess;   body += "\":\""; body += sess_buf; body += "\"}";
 
+        arc_log("violation", "step18_pre_http_post");
         http_post_json(url.c_str(), body.c_str());
+        arc_log("violation", "step19_post_http_post");
+    }
+    else
+    {
+        arc_log("violation", "step18_skip_http_post_no_server_url");
     }
 
     SecureZeroMemory(hwid_buf, sizeof(hwid_buf));
     SecureZeroMemory(sess_buf, sizeof(sess_buf));
+    arc_log("violation", "step20_pre_fastfail");
 
     __fastfail(0xA1DA);
 }
@@ -2019,6 +2165,62 @@ __forceinline void decrypt_vtable_into(arc_comm_vtable_t* out)
     }
 }
 
+static void log_vtable_state(const char* phase, uint64_t integrity_value)
+{
+    {
+        char header[224];
+        _snprintf_s(header, sizeof(header), _TRUNCATE,
+            "%s integrity=0x%016llX crypt_key=0x%016llX vtable_addr=0x%016llX size=%llu integrity_addr=0x%016llX tid=%lu",
+            phase,
+            (unsigned long long)integrity_value,
+            (unsigned long long)g_vtable_crypt_key,
+            (unsigned long long)reinterpret_cast<uintptr_t>(&g_vtable),
+            (unsigned long long)sizeof(arc_comm_vtable_t),
+            (unsigned long long)reinterpret_cast<uintptr_t>(&g_vtable_integrity),
+            GetCurrentThreadId());
+        arc_log("vtable", header);
+    }
+    {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&g_vtable);
+        constexpr size_t kBytes = sizeof(arc_comm_vtable_t);
+        for (size_t off = 0; off < kBytes; off += 32) {
+            char line[200];
+            int n = _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "%s bytes off=0x%03X data=", phase, static_cast<unsigned>(off));
+            if (n < 0) n = 0;
+            size_t row_end = (off + 32 <= kBytes) ? off + 32 : kBytes;
+            for (size_t i = off; i < row_end && n < static_cast<int>(sizeof(line)) - 4; ++i) {
+                int w = _snprintf_s(line + n, sizeof(line) - static_cast<size_t>(n), _TRUNCATE,
+                    "%02X", p[i]);
+                if (w <= 0) break;
+                n += w;
+            }
+            arc_log("vtable", line);
+        }
+    }
+    for (int i = 0; i < 16; ++i) {
+        char line[112];
+        _snprintf_s(line, sizeof(line), _TRUNCATE,
+            "%s slot_key[%02d]=0x%016llX",
+            phase, i,
+            (unsigned long long)g_vtable_slot_keys[i]);
+        arc_log("vtable", line);
+    }
+    {
+        MEMORY_BASIC_INFORMATION mbi{};
+        SIZE_T qr = VirtualQuery(reinterpret_cast<LPCVOID>(&g_vtable), &mbi, sizeof(mbi));
+        char prot[160];
+        _snprintf_s(prot, sizeof(prot), _TRUNCATE,
+            "%s vq_ok=%d base=0x%016llX size=%llu state=0x%08X protect=0x%08X type=0x%08X",
+            phase,
+            qr == sizeof(mbi) ? 1 : 0,
+            (unsigned long long)reinterpret_cast<uintptr_t>(mbi.BaseAddress),
+            (unsigned long long)mbi.RegionSize,
+            mbi.State, mbi.Protect, mbi.Type);
+        arc_log("vtable", prot);
+    }
+}
+
 void init_vtable(uint64_t crypt_key)
 {
     g_vtable_crypt_key = crypt_key;
@@ -2041,10 +2243,13 @@ void init_vtable(uint64_t crypt_key)
     g_vtable.enumerate_threads        = vtable_enumerate_threads;
     g_vtable.remote_call              = vtable_remote_call;
     memset(g_vtable._reserved, 0, sizeof(g_vtable._reserved));
-    g_vtable_integrity = compute_vtable_integrity();
 
     generate_slot_keys(crypt_key);
     encrypt_vtable_slots();
+
+    g_vtable_integrity = compute_vtable_integrity();
+
+    log_vtable_state("init_post_encrypt", g_vtable_integrity);
 
     g_vtable_ready = true;
 }

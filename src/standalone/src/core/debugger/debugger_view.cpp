@@ -675,6 +675,7 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h, flo
 	};
 
 	debugger_engine::request_refresh(100);
+	bool attached = driver_bridge::attached_pid() != 0;
 	{
 		float px = ox, py = oy, pw = left_w - 1.f, ph = top_h - 1.f;
 		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
@@ -690,7 +691,7 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h, flo
 		}
 		ui_anim::decay_flash(ui.rip_flash, 3.f, dt);
 
-		if (rip != 0) {
+		if (attached && rip != 0) {
 			debugger_engine::request_disasm_refresh(rip, 100);
 			uint64_t base = 0;
 			std::vector<uint8_t> code = debugger_engine::cached_disasm_window(base);
@@ -813,8 +814,13 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h, flo
 		} else {
 			aida::ui::empty_state::config_t es;
 			es.glyph = aida::ui::empty_state::glyph_t::cpu;
-			es.title = "No process attached";
-			es.body  = "Attach to a process to view live disassembly.";
+			if (attached) {
+				es.title = "Synchronizing thread context";
+				es.body  = "Waiting for the first register snapshot from the target.";
+			} else {
+				es.title = "No process attached";
+				es.body  = "Attach to a process to view live disassembly.";
+			}
 			aida::ui::empty_state::render(ImVec2(px, py + HEADER_H),
 				ImVec2(pw, ph - HEADER_H), es);
 		}
@@ -828,110 +834,119 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h, flo
 		                  with_a(t.bg_base, a));
 		draw_panel_header(dl, px, py, pw, "REGISTERS", a);
 
-		auto regs = debugger_engine::cached_registers();
-		struct reg_info { const char* name; uint64_t val; int idx; };
-		reg_info regs_list[] = {
-			{"RAX", regs.rax, 0}, {"RBX", regs.rbx, 1}, {"RCX", regs.rcx, 2}, {"RDX", regs.rdx, 3},
-			{"RSI", regs.rsi, 4}, {"RDI", regs.rdi, 5}, {"RBP", regs.rbp, 6}, {"RSP", regs.rsp, 7},
-			{"R8",  regs.r8,  8}, {"R9",  regs.r9,  9}, {"R10", regs.r10, 10}, {"R11", regs.r11, 11},
-			{"R12", regs.r12, 12}, {"R13", regs.r13, 13}, {"R14", regs.r14, 14}, {"R15", regs.r15, 15},
-			{"RIP", regs.rip, 16}, {"RFLAGS", regs.rflags, 17},
-		};
+		if (attached) {
+			auto regs = debugger_engine::cached_registers();
+			struct reg_info { const char* name; uint64_t val; int idx; };
+			reg_info regs_list[] = {
+				{"RAX", regs.rax, 0}, {"RBX", regs.rbx, 1}, {"RCX", regs.rcx, 2}, {"RDX", regs.rdx, 3},
+				{"RSI", regs.rsi, 4}, {"RDI", regs.rdi, 5}, {"RBP", regs.rbp, 6}, {"RSP", regs.rsp, 7},
+				{"R8",  regs.r8,  8}, {"R9",  regs.r9,  9}, {"R10", regs.r10, 10}, {"R11", regs.r11, 11},
+				{"R12", regs.r12, 12}, {"R13", regs.r13, 13}, {"R14", regs.r14, 14}, {"R15", regs.r15, 15},
+				{"RIP", regs.rip, 16}, {"RFLAGS", regs.rflags, 17},
+			};
 
-		for (const auto& ri : regs_list) {
-			auto& cell = ui.reg_cells[ri.idx];
-			if (ri.val != ui.prev_regs[ri.idx]) {
-				ui.reg_flash[ri.idx] = 1.f;
-				ui.prev_regs[ri.idx] = ri.val;
-				cell.target_value = ri.val;
-				cell.change_anim = 1.f;
-				cell.edge_intensity = 1.f;
+			for (const auto& ri : regs_list) {
+				auto& cell = ui.reg_cells[ri.idx];
+				if (ri.val != ui.prev_regs[ri.idx]) {
+					ui.reg_flash[ri.idx] = 1.f;
+					ui.prev_regs[ri.idx] = ri.val;
+					cell.target_value = ri.val;
+					cell.change_anim = 1.f;
+					cell.edge_intensity = 1.f;
+				}
+				ui_anim::decay_flash(ui.reg_flash[ri.idx], 2.f, dt);
+				cell.change_anim = ui_anim::smooth_lerp(cell.change_anim, 0.f, 4.2f, dt);
+				cell.edge_intensity = ui_anim::smooth_lerp(cell.edge_intensity, 0.f, 2.4f, dt);
+
+				float roll_t = 1.f - cell.change_anim;
+				float ease = aida::motion::ease::out_cubic(roll_t);
+				if (ease >= 0.999f) cell.shown_value = cell.target_value;
 			}
-			ui_anim::decay_flash(ui.reg_flash[ri.idx], 2.f, dt);
-			cell.change_anim = ui_anim::smooth_lerp(cell.change_anim, 0.f, 4.2f, dt);
-			cell.edge_intensity = ui_anim::smooth_lerp(cell.edge_intensity, 0.f, 2.4f, dt);
 
-			float roll_t = 1.f - cell.change_anim;
-			float ease = aida::motion::ease::out_cubic(roll_t);
-			if (ease >= 0.999f) cell.shown_value = cell.target_value;
-		}
+			float grid_x = px + 8.f;
+			float grid_y = py + HEADER_H + 6.f;
+			float gw = pw - 16.f;
+			int cols = 2;
+			float gap = 6.f;
+			float cell_w = (gw - static_cast<float>(cols - 1) * gap) / static_cast<float>(cols);
+			float cell_h = 36.f;
 
-		float grid_x = px + 8.f;
-		float grid_y = py + HEADER_H + 6.f;
-		float gw = pw - 16.f;
-		int cols = 2;
-		float gap = 6.f;
-		float cell_w = (gw - static_cast<float>(cols - 1) * gap) / static_cast<float>(cols);
-		float cell_h = 36.f;
+			ImFont* lbl_font = aida::ui::fonts::caption();
+			if (!lbl_font) lbl_font = ImGui::GetFont();
+			ImFont* val_font = aida::ui::fonts::code_em();
+			if (!val_font) val_font = ImGui::GetFont();
 
-		ImFont* lbl_font = aida::ui::fonts::caption();
-		if (!lbl_font) lbl_font = ImGui::GetFont();
-		ImFont* val_font = aida::ui::fonts::code_em();
-		if (!val_font) val_font = ImGui::GetFont();
+			ImGui::PushClipRect(ImVec2(px, py + HEADER_H), ImVec2(px + pw, py + ph), true);
 
-		ImGui::PushClipRect(ImVec2(px, py + HEADER_H), ImVec2(px + pw, py + ph), true);
+			for (int i = 0; i < 18; ++i) {
+				const auto& ri = regs_list[i];
+				int rr = i / cols;
+				int cc = i % cols;
+				float cx = grid_x + static_cast<float>(cc) * (cell_w + gap);
+				float cy = grid_y + static_cast<float>(rr) * (cell_h + 4.f);
+				if (cy + cell_h > py + ph) break;
 
-		for (int i = 0; i < 18; ++i) {
-			const auto& ri = regs_list[i];
-			int rr = i / cols;
-			int cc = i % cols;
-			float cx = grid_x + static_cast<float>(cc) * (cell_w + gap);
-			float cy = grid_y + static_cast<float>(rr) * (cell_h + 4.f);
-			if (cy + cell_h > py + ph) break;
+				ImVec2 ca(cx, cy);
+				ImVec2 cb(cx + cell_w, cy + cell_h);
 
-			ImVec2 ca(cx, cy);
-			ImVec2 cb(cx + cell_w, cy + cell_h);
+				bool hov = ImGui::IsMouseHoveringRect(ca, cb, false);
 
-			bool hov = ImGui::IsMouseHoveringRect(ca, cb, false);
+				dl->AddRectFilled(ca, cb, with_a(t.panel_bg, a * 0.85f), 6.f);
+				if (hov) {
+					dl->AddRectFilled(ca, cb, with_a(t.hover_wash, a), 6.f);
+				}
+				dl->AddRect(ca, cb, with_a(t.border_subtle, a), 6.f, 0, 1.f);
 
-			dl->AddRectFilled(ca, cb, with_a(t.panel_bg, a * 0.85f), 6.f);
-			if (hov) {
-				dl->AddRectFilled(ca, cb, with_a(t.hover_wash, a), 6.f);
-			}
-			dl->AddRect(ca, cb, with_a(t.border_subtle, a), 6.f, 0, 1.f);
+				float edge = ui.reg_cells[ri.idx].edge_intensity;
+				if (edge > 0.001f) {
+					dl->AddRectFilled(ImVec2(ca.x, ca.y),
+					                  ImVec2(ca.x + 2.f, cb.y),
+					                  with_a(t.accent_u32, a * edge), 1.f);
+					for (int g = 0; g < 3; ++g) {
+						float spread = static_cast<float>(g + 1) * 1.5f;
+						dl->AddRect(ImVec2(ca.x - spread, ca.y - spread),
+						            ImVec2(cb.x + spread, cb.y + spread),
+						            with_a(t.accent_glow,
+							a * edge * (0.32f - static_cast<float>(g) * 0.10f) * 4.f),
+						            6.f + spread, 0, 1.f);
+					}
+				}
 
-			float edge = ui.reg_cells[ri.idx].edge_intensity;
-			if (edge > 0.001f) {
-				dl->AddRectFilled(ImVec2(ca.x, ca.y),
-				                  ImVec2(ca.x + 2.f, cb.y),
-				                  with_a(t.accent_u32, a * edge), 1.f);
-				for (int g = 0; g < 3; ++g) {
-					float spread = static_cast<float>(g + 1) * 1.5f;
-					dl->AddRect(ImVec2(ca.x - spread, ca.y - spread),
-					            ImVec2(cb.x + spread, cb.y + spread),
-					            with_a(t.accent_glow,
-						a * edge * (0.32f - static_cast<float>(g) * 0.10f) * 4.f),
-					            6.f + spread, 0, 1.f);
+				dl->AddText(lbl_font, 11.f, ImVec2(ca.x + 8.f, ca.y + 4.f),
+				            with_a(t.text_dim, a), ri.name);
+
+				char vbuf[20];
+				std::snprintf(vbuf, sizeof(vbuf), "%016" PRIX64, ri.val);
+				float roll_anim = ui.reg_cells[ri.idx].change_anim;
+				float vy = ca.y + 17.f - roll_anim * 6.f;
+				float val_alpha = a * (1.f - roll_anim * 0.3f);
+
+				ImU32 vcol = (edge > 0.01f)
+					? aida::ui::mix(t.accent_grad_top, t.text_primary, 1.f - edge)
+					: t.syn_register;
+
+				dl->AddText(val_font, 13.f, ImVec2(ca.x + 8.f, vy),
+				            with_a(vcol, val_alpha), vbuf);
+
+				if (roll_anim > 0.01f) {
+					char prev_buf[20];
+					std::snprintf(prev_buf, sizeof(prev_buf), "%016" PRIX64,
+						ui.reg_cells[ri.idx].shown_value);
+					float py2 = ca.y + 17.f + (1.f - roll_anim) * 6.f;
+					dl->AddText(val_font, 13.f, ImVec2(ca.x + 8.f, py2),
+					            with_a(t.text_dim, a * roll_anim * 0.5f), prev_buf);
 				}
 			}
 
-			dl->AddText(lbl_font, 11.f, ImVec2(ca.x + 8.f, ca.y + 4.f),
-			            with_a(t.text_dim, a), ri.name);
-
-			char vbuf[20];
-			std::snprintf(vbuf, sizeof(vbuf), "%016" PRIX64, ri.val);
-			float roll_anim = ui.reg_cells[ri.idx].change_anim;
-			float vy = ca.y + 17.f - roll_anim * 6.f;
-			float val_alpha = a * (1.f - roll_anim * 0.3f);
-
-			ImU32 vcol = (edge > 0.01f)
-				? aida::ui::mix(t.accent_grad_top, t.text_primary, 1.f - edge)
-				: t.syn_register;
-
-			dl->AddText(val_font, 13.f, ImVec2(ca.x + 8.f, vy),
-			            with_a(vcol, val_alpha), vbuf);
-
-			if (roll_anim > 0.01f) {
-				char prev_buf[20];
-				std::snprintf(prev_buf, sizeof(prev_buf), "%016" PRIX64,
-					ui.reg_cells[ri.idx].shown_value);
-				float py2 = ca.y + 17.f + (1.f - roll_anim) * 6.f;
-				dl->AddText(val_font, 13.f, ImVec2(ca.x + 8.f, py2),
-				            with_a(t.text_dim, a * roll_anim * 0.5f), prev_buf);
-			}
+			ImGui::PopClipRect();
+		} else {
+			aida::ui::empty_state::config_t es;
+			es.glyph = aida::ui::empty_state::glyph_t::cpu;
+			es.title = "No process attached";
+			es.body  = "Attach to a process to populate registers.";
+			aida::ui::empty_state::render(ImVec2(px, py + HEADER_H),
+				ImVec2(pw, ph - HEADER_H), es);
 		}
-
-		ImGui::PopClipRect();
 	}
 
 	draw_separator_h(ox, oy + top_h - 0.5f, left_w);
@@ -948,7 +963,7 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h, flo
 			dump_addr = regs.rsp;
 		}
 
-		if (dump_addr != 0) {
+		if (attached && dump_addr != 0) {
 			int rows = static_cast<int>((ph - HEADER_H - ROW_HEIGHT) / ROW_HEIGHT);
 			size_t bytes_per_row = 16;
 			size_t total_bytes = static_cast<size_t>(rows) * bytes_per_row;
@@ -1057,6 +1072,18 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h, flo
 			}
 
 			ImGui::PopClipRect();
+		} else {
+			aida::ui::empty_state::config_t es;
+			es.glyph = aida::ui::empty_state::glyph_t::memory;
+			if (attached) {
+				es.title = "Synchronizing memory window";
+				es.body  = "Waiting for the first stack pointer snapshot.";
+			} else {
+				es.title = "No process attached";
+				es.body  = "Attach to a process to dump memory.";
+			}
+			aida::ui::empty_state::render(ImVec2(px, py + HEADER_H),
+				ImVec2(pw, ph - HEADER_H), es);
 		}
 	}
 
@@ -1071,7 +1098,7 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h, flo
 
 		auto regs = debugger_engine::cached_registers();
 		uint64_t rsp = regs.rsp;
-		if (rsp != 0) {
+		if (attached && rsp != 0) {
 			int rows = static_cast<int>((ph - HEADER_H) / ROW_HEIGHT);
 			size_t total = static_cast<size_t>(rows) * 8;
 			debugger_engine::request_stack_refresh(rsp, total, 100);
@@ -1108,6 +1135,18 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h, flo
 				            with_a(t.text_primary, a), vbuf);
 			}
 			ImGui::PopClipRect();
+		} else {
+			aida::ui::empty_state::config_t es;
+			es.glyph = aida::ui::empty_state::glyph_t::layers;
+			if (attached) {
+				es.title = "Synchronizing stack pointer";
+				es.body  = "Waiting for the first RSP snapshot from the target.";
+			} else {
+				es.title = "No process attached";
+				es.body  = "Attach to a process to inspect the stack.";
+			}
+			aida::ui::empty_state::render(ImVec2(px, py + HEADER_H),
+				ImVec2(pw, ph - HEADER_H), es);
 		}
 	}
 }

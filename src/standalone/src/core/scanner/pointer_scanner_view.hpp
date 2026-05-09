@@ -78,7 +78,7 @@ inline void render_step_box(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 fill, ImU3
 	dl->AddRectFilled(a, b, fill, radius);
 	dl->AddRect(a, b, border, radius, 0, 1.f);
 	ImVec2 ts = ImGui::CalcTextSize(label);
-	dl->AddText(aida::ui::fonts::code(), 12.f,
+	dl->AddText(aida::ui::fonts::code(), 13.f,
 		ImVec2(a.x + (b.x - a.x - ts.x) * 0.5f, a.y + (b.y - a.y - 12.f) * 0.5f),
 		text_col, label);
 }
@@ -280,7 +280,7 @@ inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, fl
 		ImVec2 ts = ImGui::CalcTextSize(off.c_str());
 		dl->AddRectFilled(ba, bb, fill, 8.f);
 		dl->AddRect(ba, bb, border, 8.f, 0, 1.f);
-		dl->AddText(aida::ui::fonts::code(), 12.f,
+		dl->AddText(aida::ui::fonts::code(), 13.f,
 			ImVec2(dot_cx + 8.f, dot_cy - 6.f),
 			aida::ui::with_alpha(t.text_primary, a * local_t), off.c_str());
 
@@ -318,7 +318,7 @@ inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, fl
 		dl->AddRect(ImVec2(tp.x - 6.f, tp.y - 4.f),
 			ImVec2(tp.x + ts.x + 6.f, tp.y + ts.y + 4.f),
 			aida::ui::with_alpha(t.border_subtle, 1.f), 6.f, 0, 1.f);
-		dl->AddText(aida::ui::fonts::code(), 12.f, tp,
+		dl->AddText(aida::ui::fonts::code(), 13.f, tp,
 			aida::ui::with_alpha(t.text_primary, 1.f), tip);
 	}
 }
@@ -371,7 +371,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 		snprintf(status_buf, sizeof(status_buf), "Map: %zu  ·  Chains: %zu", entries, res_count);
 		ImVec2 ts = ImGui::CalcTextSize(status_buf);
-		dl->AddText(aida::ui::fonts::caption(), 12.f,
+		dl->AddText(aida::ui::fonts::caption(), 14.f,
 			ImVec2(x0 + width - ts.x - 16.f, y0 + (toolbar_h - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_secondary, a), status_buf);
 	}
@@ -393,7 +393,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImVec2(cx, cy), aida::ui::with_alpha(t.text_primary, a), "Configuration");
 	cy += 24.f;
 
-	dl->AddText(aida::ui::fonts::caption(), 11.f,
+	dl->AddText(aida::ui::fonts::caption(), 13.f,
 		ImVec2(cx, cy), aida::ui::with_alpha(t.text_dim, a), "Target Address");
 	cy += 16.f;
 
@@ -407,12 +407,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (!lblf) lblf = ImGui::GetFont();
 		ImFont* valf = aida::ui::fonts::body_em();
 		if (!valf) valf = ImGui::GetFont();
-		dl->AddText(lblf, 11.f,
+		dl->AddText(lblf, 13.f,
 			ImVec2(cx, cy), aida::ui::with_alpha(t.text_dim, a), lbl);
 		char vbuf[32];
 		std::snprintf(vbuf, sizeof(vbuf), "%d", value);
 		ImVec2 vts = valf->CalcTextSizeA(11.f, FLT_MAX, 0.f, vbuf);
-		dl->AddText(valf, 11.f,
+		dl->AddText(valf, 13.f,
 			ImVec2(cx + field_w - vts.x, cy),
 			aida::ui::with_alpha(t.text_primary, a), vbuf);
 		cy += 16.f;
@@ -491,7 +491,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	if (building) {
 		float prog = st.map_progress.load();
-		dl->AddText(aida::ui::fonts::caption(), 11.f,
+		dl->AddText(aida::ui::fonts::caption(), 13.f,
 			ImVec2(cx, cy), aida::ui::with_alpha(t.text_dim, a), "Building reverse map...");
 		aida::ui::render_progress_bar(ImVec2(cx, cy + 18.f), field_w, 6.f, prog, false, true);
 		cy += 32.f;
@@ -512,7 +512,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	if (scanning) {
 		float prog = st.scan_progress.load();
-		dl->AddText(aida::ui::fonts::caption(), 11.f,
+		dl->AddText(aida::ui::fonts::caption(), 13.f,
 			ImVec2(cx, cy), aida::ui::with_alpha(t.text_dim, a), "Scanning chains...");
 		aida::ui::render_progress_bar(ImVec2(cx, cy + 18.f), field_w, 6.f, prog, false, true);
 		cy += 32.f;
@@ -582,7 +582,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float col_widths[5] = { col_depth_w, col_module_w, col_base_w, col_chain_w, col_status_w };
 	float hx = table_x + 16.f;
 	for (int c = 0; c < 5; ++c) {
-		dl->AddText(aida::ui::fonts::caption(), 11.f,
+		dl->AddText(aida::ui::fonts::caption(), 13.f,
 			ImVec2(hx, table_y + (hdr_h - 11.f) * 0.5f),
 			aida::ui::with_alpha(t.text_dim, a), col_names[c]);
 		hx += col_widths[c];
@@ -644,12 +644,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		char buf[32];
 
 		snprintf(buf, sizeof(buf), "%d", chain.depth);
-		dl->AddText(aida::ui::fonts::body(), 12.f,
+		dl->AddText(aida::ui::fonts::body(), 14.f,
 			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_primary, a * row_a), buf);
 		rx += col_depth_w;
 
-		dl->AddText(aida::ui::fonts::body(), 12.f,
+		dl->AddText(aida::ui::fonts::body(), 14.f,
 			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
 			chain.is_static ? aida::ui::with_alpha(t.accent_u32, a * row_a)
 			                 : aida::ui::with_alpha(t.text_dim, a * row_a),
@@ -657,7 +657,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		rx += col_module_w;
 
 		snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(chain.base_offset));
-		dl->AddText(aida::ui::fonts::code(), 12.f,
+		dl->AddText(aida::ui::fonts::code(), 13.f,
 			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_address, a * row_a), buf);
 		rx += col_base_w;
@@ -681,7 +681,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				}
 			}
 		}
-		dl->AddText(aida::ui::fonts::code(), 11.f,
+		dl->AddText(aida::ui::fonts::code(), 13.f,
 			ImVec2(rx, ry + (row_h - 11.f) * 0.5f),
 			aida::ui::with_alpha(t.text_secondary, a * row_a), chain_str.c_str());
 		rx += col_chain_w;
@@ -780,7 +780,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		snprintf(info_buf, sizeof(info_buf), "Depth %d  ·  %s  ·  %s",
 			chain.depth, chain.is_static ? "Static" : "Dynamic",
 			chain.validated ? "Validated" : "Not validated");
-		dl->AddText(aida::ui::fonts::caption(), 12.f,
+		dl->AddText(aida::ui::fonts::caption(), 14.f,
 			ImVec2(det_x + 16.f, info_y),
 			aida::ui::with_alpha(t.text_secondary, a), info_buf);
 

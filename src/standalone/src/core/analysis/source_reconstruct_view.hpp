@@ -298,11 +298,11 @@ inline void render(float alpha, float ar, float ag, float ab) {
 			const auto& th_bar = aida::ui::resolved();
 			ImU32 bar_top = aida::ui::with_alpha(th_bar.accent_grad_top, 0.92f * fa);
 			ImU32 bar_bot = aida::ui::with_alpha(th_bar.accent_grad_bot, 0.92f * fa);
-			(void)bar_bot;
+			ImU32 bar_flat = aida::ui::mix(bar_top, bar_bot, 0.5f);
 
-			dl->AddRectFilledMultiColor(
+			dl->AddRectFilled(
 				ImVec2(bar_x, bar_y), ImVec2(bar_x + fill_w, bar_y + bar_h),
-				bar_top, bar_top, bar_bot, bar_bot);
+				bar_flat, bar_h * 0.5f);
 
 			float shimmer_x = bar_x + fill_w * st.shimmer_phase;
 			float shimmer_w = fill_w * 0.15f;

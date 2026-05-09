@@ -99,7 +99,10 @@ namespace brand_glyph {
 		ImVec2 a = ImVec2(center.x - r * 0.95f, center.y - r * 0.85f);
 		ImVec2 b = ImVec2(center.x + r * 0.95f, center.y + r * 0.85f);
 
-		dl->AddRectFilledMultiColor(a, b, a_top, a_top, a_bot, a_bot);
+		{
+			ImU32 gh_flat = aida::ui::mix(a_top, a_bot, 0.5f);
+			dl->AddRectFilled(a, b, gh_flat, r * 0.32f);
+		}
 		dl->AddRect(a, b, a_str, r * 0.32f, 0, 1.f);
 
 		float prompt_thickness = size * 0.10f;

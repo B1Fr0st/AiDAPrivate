@@ -89,6 +89,8 @@ namespace settings_overlay {
 			float tab_underline_target_h = 0.f;
 			float tab_underline_vel_y = 0.f;
 			float tab_underline_vel_h = 0.f;
+			float tab_row_screen_y[tab_count] = {};
+			bool  tab_rows_captured = false;
 			float tab_crossfade_progress = 1.f;
 			int tab_crossfade_from = tab_accounts;
 			aida::ui::flash_t header_flash;
@@ -378,6 +380,12 @@ namespace settings_overlay {
 			const bool is_active = (active == idx);
 
 			ImVec2 row_pos = ImGui::GetCursorScreenPos();
+			if (idx >= 0 && idx < tab_count) {
+				s.tab_row_screen_y[idx] = row_pos.y;
+				if (idx == tab_count - 1) {
+					s.tab_rows_captured = true;
+				}
+			}
 
 			ImGui::PushID(idx);
 			ImGui::SetCursorScreenPos(row_pos);
@@ -433,9 +441,18 @@ namespace settings_overlay {
 			ImVec2 wp = ImGui::GetWindowPos();
 			float row_visible_h = row_h - 4.f;
 			float indicator_h = row_visible_h * 0.6f;
-			float row_top = wp.y + content_y + 8.f + s.active_tab.load() * (row_h + 2.f);
+			const int active_idx = s.active_tab.load();
+			float row_top;
+			if (s.tab_rows_captured && active_idx >= 0 && active_idx < tab_count) {
+				row_top = s.tab_row_screen_y[active_idx];
+			} else {
+				const ImGuiStyle& style = ImGui::GetStyle();
+				const float row_stride = row_h + style.ItemSpacing.y + 2.f + style.ItemSpacing.y;
+				row_top = wp.y + 8.f + style.ItemSpacing.y + active_idx * row_stride;
+			}
 			float target_y = row_top + (row_visible_h - indicator_h) * 0.5f;
 			float target_h = indicator_h;
+			(void)content_y;
 
 			s.tab_underline_target_y = target_y;
 			s.tab_underline_target_h = target_h;
@@ -493,14 +510,16 @@ namespace settings_overlay {
 			const auto& th = aida::ui::resolved();
 			const float dt = aida::ui::clock::dt();
 			ImGui::PushID("##mcp_settings_tab");
+			ImGui::PushFont(aida::ui::fonts::lg());
+			ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.f, 8.f));
+			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 7.f));
 
-			ImGui::Spacing();
 			{
 				ImDrawList* hdl = ImGui::GetWindowDrawList();
 				ImVec2 hp = ImGui::GetCursorScreenPos();
-				hdl->AddText(aida::ui::fonts::h2(), 16.f, hp,
+				hdl->AddText(aida::ui::fonts::h1(), 22.f, hp,
 					th.text_primary, "External MCP Servers");
-				ImGui::Dummy(ImVec2(0.f, 26.f));
+				ImGui::Dummy(ImVec2(0.f, 32.f));
 			}
 
 			static int s_sel_index = 0;
@@ -536,9 +555,9 @@ namespace settings_overlay {
 				if (!servers.empty()) refresh_buf();
 			}
 
-			float left_w = 260.f;
-			float row_h  = 50.f;
-			float list_h = (std::max)(content_h - 110.f, 220.f);
+			float left_w = 280.f;
+			float row_h  = 58.f;
+			float list_h = (std::max)(content_h - 130.f, 240.f);
 
 			ImGui::BeginChild("##mcp_list", ImVec2(left_w, list_h), false,
 				ImGuiWindowFlags_NoSavedSettings);
@@ -600,12 +619,12 @@ namespace settings_overlay {
 				aida::ui::status_dot(ImVec2(a.x + 14.f, (a.y + b.y) * 0.5f),
 					4.5f, dot_col, pulsing, 1.4f);
 
-				dl->AddText(aida::ui::fonts::body_strong(), 13.f,
-					ImVec2(a.x + 30.f, a.y + 6.f), th.text_primary, srv.name.c_str());
+				dl->AddText(aida::ui::fonts::body_strong(), 16.f,
+					ImVec2(a.x + 32.f, a.y + 8.f), th.text_primary, srv.name.c_str());
 
-				ImGui::SetCursorScreenPos(ImVec2(a.x + 30.f, a.y + 26.f));
+				ImGui::SetCursorScreenPos(ImVec2(a.x + 32.f, a.y + 30.f));
 				aida::ui::pill_kind(oauth_pill_label(oauth), oauth_pill_kind(oauth),
-					aida::ui::size_t_::sm, false);
+					aida::ui::size_t_::md, false);
 
 				if (clicked) {
 					s_sel_index = i;
@@ -616,13 +635,13 @@ namespace settings_overlay {
 					oauth == mcp_client::oauth_status_t::needs_client_registration ||
 					oauth == mcp_client::oauth_status_t::failed)
 				{
-					float btn_x = b.x - 84.f;
-					float btn_y = a.y + 14.f;
+					float btn_x = b.x - 96.f;
+					float btn_y = a.y + (row_h - 4.f - 28.f) * 0.5f;
 					ImGui::SetCursorScreenPos(ImVec2(btn_x, btn_y));
 					if (aida::ui::button("Sign in",
 							aida::ui::button_kind_t::primary,
-							aida::ui::size_t_::sm,
-							ImVec2(78.f, 22.f))) {
+							aida::ui::size_t_::md,
+							ImVec2(88.f, 28.f))) {
 						std::string srv_name = srv.name;
 						mcp_client::trigger_auth_flow(srv_name,
 							[](const std::string& nm, mcp_client::oauth_status_t final_status,
@@ -650,48 +669,48 @@ namespace settings_overlay {
 
 			ImDrawList* ddl = ImGui::GetWindowDrawList();
 			ImVec2 dp = ImGui::GetCursorScreenPos();
-			ddl->AddText(aida::ui::fonts::body_strong(), 14.f,
+			ddl->AddText(aida::ui::fonts::body_strong(), 19.f,
 				ImVec2(dp.x + 8.f, dp.y + 4.f),
 				th.text_primary, "Server Configuration");
-			ImGui::Dummy(ImVec2(0.f, 24.f));
+			ImGui::Dummy(ImVec2(0.f, 30.f));
 			ImGui::Separator();
-			ImGui::Spacing();
+			ImGui::Dummy(ImVec2(0.f, 4.f));
 
 			if (s_sel_index >= 0 && s_sel_index < static_cast<int>(servers.size())) {
 				ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Name");
 				aida::ui::input_text("##mcp_name", s_name, sizeof(s_name),
-					"Server name", false, ImVec2(0.f, 32.f));
+					"Server name", false, ImVec2(0.f, 36.f));
 
-				ImGui::Spacing();
+				ImGui::Dummy(ImVec2(0.f, 4.f));
 				const char* transports[] = { "HTTP/SSE", "Stdio" };
 				ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Transport");
 				ImGui::SetNextItemWidth(-12.f);
 				ImGui::Combo("##mcp_transport", &s_transport, transports, 2);
 
 				if (s_transport == 0) {
-					ImGui::Spacing();
+					ImGui::Dummy(ImVec2(0.f, 4.f));
 					ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "URL");
 					aida::ui::input_text("##mcp_url", s_url, sizeof(s_url),
-						"https://server", false, ImVec2(0.f, 32.f));
-					ImGui::Spacing();
+						"https://server", false, ImVec2(0.f, 36.f));
+					ImGui::Dummy(ImVec2(0.f, 4.f));
 					ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "API Key");
 					aida::ui::input_text("##mcp_key", s_key, sizeof(s_key),
-						"secret", true, ImVec2(0.f, 32.f));
+						"secret", true, ImVec2(0.f, 36.f));
 				} else {
-					ImGui::Spacing();
+					ImGui::Dummy(ImVec2(0.f, 4.f));
 					ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Command");
 					aida::ui::input_text("##mcp_cmd", s_cmd, sizeof(s_cmd),
-						"node server.js", false, ImVec2(0.f, 32.f));
-					ImGui::Spacing();
+						"node server.js", false, ImVec2(0.f, 36.f));
+					ImGui::Dummy(ImVec2(0.f, 4.f));
 					ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Args");
 					aida::ui::input_text("##mcp_args", s_args, sizeof(s_args),
-						"--port 3001", false, ImVec2(0.f, 32.f));
+						"--port 3001", false, ImVec2(0.f, 36.f));
 				}
 
-				ImGui::Spacing();
-				aida::ui::toggle_switch("Enabled##mcp", &s_enabled, aida::ui::size_t_::sm);
-				ImGui::SameLine(120.f);
-				aida::ui::toggle_switch("Auto-connect", &s_auto, aida::ui::size_t_::sm);
+				ImGui::Dummy(ImVec2(0.f, 6.f));
+				aida::ui::toggle_switch("Enabled##mcp", &s_enabled, aida::ui::size_t_::md);
+				ImGui::SameLine(140.f);
+				aida::ui::toggle_switch("Auto-connect", &s_auto, aida::ui::size_t_::md);
 
 				auto& srv = servers[s_sel_index];
 				srv.name = s_name;
@@ -715,12 +734,12 @@ namespace settings_overlay {
 
 			ImGui::EndChild();
 
-			ImGui::Dummy(ImVec2(0, 6.f));
+			ImGui::Dummy(ImVec2(0, 12.f));
 
 			if (aida::ui::button("+ Add Server",
 					aida::ui::button_kind_t::primary,
 					aida::ui::size_t_::md,
-					ImVec2(150.f, 30.f))) {
+					ImVec2(170.f, 36.f))) {
 				mcp_client_server_t srv;
 				srv.name = "New Server";
 				srv.url = "http://localhost:3001";
@@ -729,11 +748,11 @@ namespace settings_overlay {
 				refresh_buf();
 				g_sa_settings.save();
 			}
-			ImGui::SameLine(0.f, 8.f);
+			ImGui::SameLine(0.f, 10.f);
 			if (aida::ui::button("Apply Connection Changes",
 					aida::ui::button_kind_t::secondary,
 					aida::ui::size_t_::md,
-					ImVec2(220.f, 30.f))) {
+					ImVec2(240.f, 36.f))) {
 				mgr.disconnect_all();
 				for (const auto& srv : servers) {
 					mcp_client::server_config_t cfg;
@@ -758,11 +777,11 @@ namespace settings_overlay {
 				mgr.connect_all();
 				g_sa_settings.save();
 			}
-			ImGui::SameLine(0.f, 8.f);
+			ImGui::SameLine(0.f, 10.f);
 			if (aida::ui::button("Remove Selected",
 					aida::ui::button_kind_t::destructive,
 					aida::ui::size_t_::md,
-					ImVec2(150.f, 30.f)) &&
+					ImVec2(170.f, 36.f)) &&
 				s_sel_index >= 0 && s_sel_index < static_cast<int>(servers.size()))
 			{
 				servers.erase(servers.begin() + s_sel_index);
@@ -770,14 +789,16 @@ namespace settings_overlay {
 				refresh_buf();
 				g_sa_settings.save();
 			}
-			ImGui::SameLine(0.f, 16.f);
+			ImGui::SameLine(0.f, 18.f);
 			if (aida::ui::button("Marketplace...",
 					aida::ui::button_kind_t::accent_gradient,
 					aida::ui::size_t_::md,
-					ImVec2(140.f, 30.f))) {
+					ImVec2(160.f, 36.f))) {
 				aida::mcp_marketplace_view::open();
 			}
 
+			ImGui::PopStyleVar(2);
+			ImGui::PopFont();
 			ImGui::PopID();
 
 			aida::mcp_marketplace_view::render_modal_if_open();
@@ -793,66 +814,67 @@ namespace settings_overlay {
 			load_permissions_locked(s);
 
 			ImGui::PushID("##permissions_tab");
+			ImGui::PushFont(aida::ui::fonts::lg());
+			ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.f, 10.f));
+			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 7.f));
+
 			ImDrawList* dl = ImGui::GetWindowDrawList();
 			ImVec2 hp = ImGui::GetCursorScreenPos();
-			dl->AddText(aida::ui::fonts::h2(), 16.f, hp, th.text_primary,
+			dl->AddText(aida::ui::fonts::h1(), 22.f, hp, th.text_primary,
 				"Auto-approval Policies");
-			ImGui::Dummy(ImVec2(0.f, 24.f));
+			ImGui::Dummy(ImVec2(0.f, 32.f));
 
 			bool changed = false;
 			changed |= aida::ui::toggle_switch("Auto-approve read-only operations",
-				&g_sa_settings.auto_approve_read);
-			ImGui::Spacing();
+				&g_sa_settings.auto_approve_read, aida::ui::size_t_::md);
 			changed |= aida::ui::toggle_switch("Auto-approve write operations",
-				&g_sa_settings.auto_approve_write);
-			ImGui::Spacing();
+				&g_sa_settings.auto_approve_write, aida::ui::size_t_::md);
 			changed |= aida::ui::toggle_switch("Auto-approve command execution",
-				&g_sa_settings.auto_approve_execute);
-			ImGui::Spacing();
+				&g_sa_settings.auto_approve_execute, aida::ui::size_t_::md);
 			changed |= aida::ui::toggle_switch("Auto-approve MCP tool calls",
-				&g_sa_settings.auto_approve_mcp);
-			ImGui::Spacing();
+				&g_sa_settings.auto_approve_mcp, aida::ui::size_t_::md);
 			changed |= aida::ui::toggle_switch("Auto-approve mode/agent switches",
-				&g_sa_settings.auto_approve_mode_switch);
-			ImGui::Spacing();
+				&g_sa_settings.auto_approve_mode_switch, aida::ui::size_t_::md);
 			changed |= aida::ui::toggle_switch("Auto-approve subtask delegation",
-				&g_sa_settings.auto_approve_subtask);
+				&g_sa_settings.auto_approve_subtask, aida::ui::size_t_::md);
 
-			ImGui::Spacing();
+			ImGui::Dummy(ImVec2(0.f, 6.f));
 			ImGui::Separator();
-			ImGui::Spacing();
+			ImGui::Dummy(ImVec2(0.f, 6.f));
 
 			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f),
 				"Per-task request cap (0 = unlimited)");
-			ImGui::SetNextItemWidth(220.f);
+			ImGui::SetNextItemWidth(240.f);
 			changed |= ImGui::InputInt("##perm_max_req",
 				&g_sa_settings.auto_approve_max_requests, 0, 0);
-			ImGui::SameLine(0.f, 12.f);
+			ImGui::SameLine(0.f, 16.f);
 			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f),
 				"Per-task cost cap USD (0 = unlimited)");
-			ImGui::SetNextItemWidth(220.f);
+			ImGui::SetNextItemWidth(240.f);
 			changed |= ImGui::InputDouble("##perm_max_cost",
 				&g_sa_settings.auto_approve_max_cost, 0.0, 0.0, "%.2f");
 
-			ImGui::Spacing();
+			ImGui::Dummy(ImVec2(0.f, 4.f));
 			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f),
 				"Allowed shell commands (CSV - prefixes ok)");
 			if (aida::ui::input_text("##perm_allow",
 					s.perm_allowed_commands, sizeof(s.perm_allowed_commands),
-					"git, npm, cargo", false, ImVec2(0.f, 32.f)))
+					"git, npm, cargo", false, ImVec2(0.f, 36.f)))
 				changed = true;
 
-			ImGui::Spacing();
+			ImGui::Dummy(ImVec2(0.f, 4.f));
 			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f),
 				"Denied shell commands (CSV)");
 			if (aida::ui::input_text("##perm_deny",
 					s.perm_denied_commands, sizeof(s.perm_denied_commands),
-					"rm, format, shutdown", false, ImVec2(0.f, 32.f)))
+					"rm, format, shutdown", false, ImVec2(0.f, 36.f)))
 				changed = true;
 
 			if (changed)
 				persist_permissions_locked(s);
 
+			ImGui::PopStyleVar(2);
+			ImGui::PopFont();
 			ImGui::PopID();
 		}
 
@@ -868,11 +890,11 @@ namespace settings_overlay {
 				aida::ui::with_alpha(th.panel_header, 0.85f * fade), 10.f);
 			dl->AddRect(a, b,
 				aida::ui::with_alpha(th.border_subtle, fade), 10.f, 0, 1.f);
-			dl->AddText(aida::ui::fonts::caption(), 11.f,
-				ImVec2(a.x + 12.f, a.y + 8.f),
+			dl->AddText(aida::ui::fonts::caption(), 13.f,
+				ImVec2(a.x + 14.f, a.y + 12.f),
 				aida::ui::with_alpha(th.text_dim, fade), title);
-			dl->AddText(aida::ui::fonts::display(), 22.f,
-				ImVec2(a.x + 12.f, a.y + 22.f),
+			dl->AddText(aida::ui::fonts::display(), 28.f,
+				ImVec2(a.x + 14.f, a.y + 30.f),
 				aida::ui::with_alpha(th.text_primary, fade), value);
 		}
 
@@ -899,11 +921,15 @@ namespace settings_overlay {
 			}
 
 			ImGui::PushID("##compact_cost_tab");
+			ImGui::PushFont(aida::ui::fonts::lg());
+			ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.f, 10.f));
+			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 7.f));
+
 			ImDrawList* dl = ImGui::GetWindowDrawList();
 			ImVec2 hp = ImGui::GetCursorScreenPos();
-			dl->AddText(aida::ui::fonts::h2(), 16.f, hp, th.text_primary,
+			dl->AddText(aida::ui::fonts::h1(), 22.f, hp, th.text_primary,
 				"Auto-compaction Threshold");
-			ImGui::Dummy(ImVec2(0.f, 26.f));
+			ImGui::Dummy(ImVec2(0.f, 32.f));
 
 			bool changed = false;
 			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f),
@@ -912,24 +938,23 @@ namespace settings_overlay {
 			changed |= ImGui::SliderFloat("##compact_ratio", &s.compaction_trigger_ratio,
 				0.50f, 0.98f, "%.2f");
 
-			ImGui::Spacing();
+			ImGui::Dummy(ImVec2(0.f, 4.f));
 			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f),
 				"Preserve recent N messages (always keep)");
-			ImGui::SetNextItemWidth(220.f);
+			ImGui::SetNextItemWidth(240.f);
 			changed |= ImGui::InputInt("##compact_msg", &s.compaction_preserve_messages, 0, 0);
 			s.compaction_preserve_messages = (std::max)(0, s.compaction_preserve_messages);
-			ImGui::SameLine(0.f, 12.f);
+			ImGui::SameLine(0.f, 16.f);
 			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f),
 				"Preserve recent tokens budget");
-			ImGui::SetNextItemWidth(220.f);
+			ImGui::SetNextItemWidth(240.f);
 			changed |= ImGui::InputInt("##compact_tok", &s.compaction_preserve_tokens, 0, 0);
 			s.compaction_preserve_tokens = (std::max)(0, s.compaction_preserve_tokens);
 
 			if (changed)
 				save_compaction_locked(s);
 
-			ImGui::Spacing();
-			ImGui::Spacing();
+			ImGui::Dummy(ImVec2(0.f, 8.f));
 			ImVec2 div_pos = ImGui::GetCursorScreenPos();
 			float div_w = ImGui::GetContentRegionAvail().x;
 			float pulse = aida::ui::clock::pulse(0.4f, 0.4f, 1.f);
@@ -940,11 +965,11 @@ namespace settings_overlay {
 				aida::ui::with_alpha(th.accent_grad_top, pulse * 0.5f),
 				aida::ui::with_alpha(th.accent_grad_bot, pulse * 0.5f),
 				aida::ui::with_alpha(th.accent_grad_bot, 0.f));
-			ImGui::Dummy(ImVec2(0.f, 12.f));
+			ImGui::Dummy(ImVec2(0.f, 16.f));
 
-			dl->AddText(aida::ui::fonts::h2(), 16.f, ImGui::GetCursorScreenPos(),
+			dl->AddText(aida::ui::fonts::h1(), 22.f, ImGui::GetCursorScreenPos(),
 				th.text_primary, "Current Session Cost");
-			ImGui::Dummy(ImVec2(0.f, 26.f));
+			ImGui::Dummy(ImVec2(0.f, 32.f));
 
 			if (sid.empty()) {
 				ImVec2 region_pos = ImGui::GetCursorScreenPos();
@@ -965,16 +990,16 @@ namespace settings_overlay {
 				std::snprintf(val_buf, sizeof(val_buf), "$%.4f", s.compaction_cost_anim);
 
 				ImVec2 sp = ImGui::GetCursorScreenPos();
-				float card_w = (ImGui::GetContentRegionAvail().x - 16.f) * 0.5f;
-				float card_h = 76.f;
+				float card_w = (ImGui::GetContentRegionAvail().x - 18.f) * 0.5f;
+				float card_h = 92.f;
 				render_stat_card(sp, ImVec2(card_w, card_h), "Total cost", val_buf, 1.f);
 
 				char tok_buf[128];
 				long long total_tk = static_cast<long long>(s.compaction_session_input + s.compaction_session_output);
 				std::snprintf(tok_buf, sizeof(tok_buf), "%lld", total_tk);
-				render_stat_card(ImVec2(sp.x + card_w + 16.f, sp.y),
+				render_stat_card(ImVec2(sp.x + card_w + 18.f, sp.y),
 					ImVec2(card_w, card_h), "Total tokens", tok_buf, 1.f);
-				ImGui::Dummy(ImVec2(0.f, card_h + 12.f));
+				ImGui::Dummy(ImVec2(0.f, card_h + 14.f));
 
 				char det_buf[256];
 				std::snprintf(det_buf, sizeof(det_buf),
@@ -989,11 +1014,11 @@ namespace settings_overlay {
 					static_cast<long long>(s.compaction_session_cache_write));
 				ImGui::TextColored(ImVec4(0.66f, 0.66f, 0.78f, 0.95f), "%s", det_buf);
 
-				ImGui::Spacing();
+				ImGui::Dummy(ImVec2(0.f, 6.f));
 				if (aida::ui::button("Run /compact now",
 						aida::ui::button_kind_t::primary,
 						aida::ui::size_t_::md,
-						ImVec2(180.f, 30.f))) {
+						ImVec2(200.f, 36.f))) {
 					aida::compaction::compaction_options_t opts;
 					opts.trigger_ratio              = static_cast<double>(s.compaction_trigger_ratio);
 					opts.preserve_recent_messages   = s.compaction_preserve_messages;
@@ -1010,6 +1035,8 @@ namespace settings_overlay {
 					}
 				}
 			}
+			ImGui::PopStyleVar(2);
+			ImGui::PopFont();
 			ImGui::PopID();
 		}
 
@@ -1059,29 +1086,33 @@ namespace settings_overlay {
 			}
 
 			ImGui::PushID("##ida_pro_tab");
+			ImGui::PushFont(aida::ui::fonts::lg());
+			ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.f, 10.f));
+			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 7.f));
+
 			ImDrawList* dl = ImGui::GetWindowDrawList();
 			ImVec2 hp = ImGui::GetCursorScreenPos();
-			dl->AddText(aida::ui::fonts::h2(), 16.f, hp, th.text_primary,
+			dl->AddText(aida::ui::fonts::h1(), 22.f, hp, th.text_primary,
 				"IDA Pro Integration");
-			ImGui::Dummy(ImVec2(0.f, 26.f));
+			ImGui::Dummy(ImVec2(0.f, 32.f));
 
 			ImGui::TextWrapped("Press Launch to open a fresh IDA instance and manual-map "
 				"the AiDA plugin into it. The AiDA plugin DLL is never written to disk.");
-			ImGui::Spacing();
+			ImGui::Dummy(ImVec2(0.f, 6.f));
 
 			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "IDA executable path");
 			if (aida::ui::input_text("##ida_pro_path",
 					s_path_buf, sizeof(s_path_buf),
 					"C:\\Program Files\\IDA Pro\\ida.exe", false,
-					ImVec2(content_w - 130.f, 32.f)))
+					ImVec2(content_w - 150.f, 36.f)))
 			{
 				g_sa_settings.ida_pro_path = s_path_buf;
 			}
-			ImGui::SameLine();
+			ImGui::SameLine(0.f, 10.f);
 			if (aida::ui::button("Browse...##ida_browse",
 					aida::ui::button_kind_t::secondary,
 					aida::ui::size_t_::md,
-					ImVec2(110.f, 32.f)))
+					ImVec2(126.f, 36.f)))
 			{
 				std::string picked;
 				if (ida_injector::prompt_and_persist_ida_path(::g_hwnd, picked))
@@ -1091,11 +1122,11 @@ namespace settings_overlay {
 				}
 			}
 
-			ImGui::Spacing();
+			ImGui::Dummy(ImVec2(0.f, 4.f));
 			if (aida::ui::button("Save##ida_save",
 					aida::ui::button_kind_t::secondary,
-					aida::ui::size_t_::sm,
-					ImVec2(96.f, 26.f)))
+					aida::ui::size_t_::md,
+					ImVec2(112.f, 32.f)))
 			{
 				g_sa_settings.ida_pro_path = s_path_buf;
 				if (g_sa_settings.save())
@@ -1103,11 +1134,11 @@ namespace settings_overlay {
 				else
 					set_ida_status("Failed to write settings file.");
 			}
-			ImGui::SameLine();
+			ImGui::SameLine(0.f, 10.f);
 			if (aida::ui::button("Auto-detect##ida_detect",
 					aida::ui::button_kind_t::secondary,
-					aida::ui::size_t_::sm,
-					ImVec2(120.f, 26.f)))
+					aida::ui::size_t_::md,
+					ImVec2(140.f, 32.f)))
 			{
 				std::string discovered = ida_injector::discover_ida_path();
 				if (!discovered.empty())
@@ -1123,9 +1154,9 @@ namespace settings_overlay {
 				}
 			}
 
-			ImGui::Spacing();
+			ImGui::Dummy(ImVec2(0.f, 6.f));
 			ImGui::Separator();
-			ImGui::Spacing();
+			ImGui::Dummy(ImVec2(0.f, 6.f));
 
 			bool busy = ida_busy_flag().load(std::memory_order_acquire);
 			bool can_launch = !busy && ida_injector::validate_ida_path(g_sa_settings.ida_pro_path);
@@ -1134,7 +1165,7 @@ namespace settings_overlay {
 			if (aida::ui::button("Launch IDA Pro with AiDA",
 					aida::ui::button_kind_t::accent_gradient,
 					aida::ui::size_t_::lg,
-					ImVec2(240.f, 36.f),
+					ImVec2(280.f, 44.f),
 					false, nullptr, busy))
 			{
 				::diag::log_tagged_critical("ida_launch", "click_received");
@@ -1181,17 +1212,19 @@ namespace settings_overlay {
 
 			if (busy)
 			{
-				ImGui::SameLine(0.f, 8.f);
+				ImGui::SameLine(0.f, 12.f);
 				ImGui::TextColored(ImVec4(0.85f, 0.75f, 0.40f, 1.f), "Working...");
 			}
 
 			std::string status_snap = snapshot_ida_status();
 			if (!status_snap.empty())
 			{
-				ImGui::Spacing();
+				ImGui::Dummy(ImVec2(0.f, 6.f));
 				ImGui::TextWrapped("%s", status_snap.c_str());
 			}
 
+			ImGui::PopStyleVar(2);
+			ImGui::PopFont();
 			ImGui::PopID();
 		}
 
@@ -1204,47 +1237,45 @@ namespace settings_overlay {
 			load_editor_locked(s);
 
 			ImGui::PushID("##editor_theme_tab");
+			ImGui::PushFont(aida::ui::fonts::lg());
+			ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.f, 10.f));
+			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 7.f));
+
 			ImDrawList* dl = ImGui::GetWindowDrawList();
 			ImVec2 hp = ImGui::GetCursorScreenPos();
-			dl->AddText(aida::ui::fonts::h2(), 16.f, hp, th.text_primary, "Editor");
-			ImGui::Dummy(ImVec2(0.f, 26.f));
+			dl->AddText(aida::ui::fonts::h1(), 22.f, hp, th.text_primary, "Editor");
+			ImGui::Dummy(ImVec2(0.f, 32.f));
 
 			bool changed = false;
 			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Tab size");
-			ImGui::SetNextItemWidth(220.f);
+			ImGui::SetNextItemWidth(240.f);
 			changed |= ImGui::InputInt("##ed_tab", &s.ed_tab_size, 0, 0);
 			s.ed_tab_size = (std::max)(s.ed_tab_size, 1);
 
 			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Font size");
-			ImGui::SetNextItemWidth(220.f);
+			ImGui::SetNextItemWidth(240.f);
 			changed |= ImGui::SliderFloat("##ed_font", &s.ed_font_size, 9.f, 32.f, "%.0f");
 
-			ImGui::Spacing();
-			changed |= aida::ui::toggle_switch("Show line numbers",       &s.ed_line_numbers);
-			ImGui::Spacing();
-			changed |= aida::ui::toggle_switch("Word wrap",                &s.ed_word_wrap);
-			ImGui::Spacing();
-			changed |= aida::ui::toggle_switch("Minimap",                  &s.ed_minimap);
-			ImGui::Spacing();
-			changed |= aida::ui::toggle_switch("Bracket match",            &s.ed_bracket_match);
-			ImGui::Spacing();
-			changed |= aida::ui::toggle_switch("Highlight current line",   &s.ed_highlight_line);
-			ImGui::Spacing();
-			changed |= aida::ui::toggle_switch("Auto-complete",            &s.ed_autocomplete);
-			ImGui::Spacing();
-			changed |= aida::ui::toggle_switch("Ghost text",               &s.ed_ghost_text);
+			ImGui::Dummy(ImVec2(0.f, 4.f));
+			changed |= aida::ui::toggle_switch("Show line numbers",       &s.ed_line_numbers,    aida::ui::size_t_::md);
+			changed |= aida::ui::toggle_switch("Word wrap",                &s.ed_word_wrap,      aida::ui::size_t_::md);
+			changed |= aida::ui::toggle_switch("Minimap",                  &s.ed_minimap,        aida::ui::size_t_::md);
+			changed |= aida::ui::toggle_switch("Bracket match",            &s.ed_bracket_match,  aida::ui::size_t_::md);
+			changed |= aida::ui::toggle_switch("Highlight current line",   &s.ed_highlight_line, aida::ui::size_t_::md);
+			changed |= aida::ui::toggle_switch("Auto-complete",            &s.ed_autocomplete,   aida::ui::size_t_::md);
+			changed |= aida::ui::toggle_switch("Ghost text",               &s.ed_ghost_text,     aida::ui::size_t_::md);
 
-			ImGui::Spacing();
+			ImGui::Dummy(ImVec2(0.f, 6.f));
 			ImGui::Separator();
-			ImGui::Spacing();
+			ImGui::Dummy(ImVec2(0.f, 6.f));
 
-			dl->AddText(aida::ui::fonts::h2(), 16.f, ImGui::GetCursorScreenPos(),
+			dl->AddText(aida::ui::fonts::h1(), 22.f, ImGui::GetCursorScreenPos(),
 				th.text_primary, "Theme");
-			ImGui::Dummy(ImVec2(0.f, 26.f));
+			ImGui::Dummy(ImVec2(0.f, 32.f));
 
 			static const char* theme_names[] = { "Mio", "Nagi", "Rias", "Kaneki" };
 			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Active theme");
-			ImGui::SetNextItemWidth(220.f);
+			ImGui::SetNextItemWidth(240.f);
 			int prev_idx = g_sa_settings.active_theme_idx;
 			if (ImGui::Combo("##theme_idx", &g_sa_settings.active_theme_idx, theme_names,
 				IM_ARRAYSIZE(theme_names)))
@@ -1257,22 +1288,22 @@ namespace settings_overlay {
 				}
 			}
 
-			ImGui::Spacing();
+			ImGui::Dummy(ImVec2(0.f, 6.f));
 			ImGui::Separator();
-			ImGui::Spacing();
+			ImGui::Dummy(ImVec2(0.f, 6.f));
 
-			dl->AddText(aida::ui::fonts::h2(), 16.f, ImGui::GetCursorScreenPos(),
+			dl->AddText(aida::ui::fonts::h1(), 22.f, ImGui::GetCursorScreenPos(),
 				th.text_primary, "Auto-save");
-			ImGui::Dummy(ImVec2(0.f, 26.f));
+			ImGui::Dummy(ImVec2(0.f, 32.f));
 
 			bool autosave_changed = false;
 			autosave_changed |= aida::ui::toggle_switch("Auto-save edited files",
-				&g_sa_settings.auto_save_enabled);
-			ImGui::Spacing();
+				&g_sa_settings.auto_save_enabled, aida::ui::size_t_::md);
+			ImGui::Dummy(ImVec2(0.f, 4.f));
 			if (!g_sa_settings.auto_save_enabled) ImGui::BeginDisabled();
 			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f),
 				"Auto-save interval (seconds)");
-			ImGui::SetNextItemWidth(220.f);
+			ImGui::SetNextItemWidth(240.f);
 			autosave_changed |= ImGui::InputInt("##autosave_int",
 				&g_sa_settings.auto_save_interval_s, 0, 0);
 			g_sa_settings.auto_save_interval_s = (std::max)(g_sa_settings.auto_save_interval_s, 5);
@@ -1283,6 +1314,8 @@ namespace settings_overlay {
 			if (autosave_changed)
 				g_sa_settings.save();
 
+			ImGui::PopStyleVar(2);
+			ImGui::PopFont();
 			ImGui::PopID();
 		}
 
@@ -1415,12 +1448,12 @@ namespace settings_overlay {
 			};
 			const float row_h = 36.f;
 			ImGui::Dummy(ImVec2(0, 8.f));
-			detail::render_sidebar_underline(side_w, content_y, row_h, dt);
 			for (int i = 0; i < tab_count; ++i) {
 				detail::render_tab_label(i, tab_labels[i], side_w, row_h,
 					th.text_primary, th.text_secondary, dt);
 				ImGui::Dummy(ImVec2(0, 2.f));
 			}
+			detail::render_sidebar_underline(side_w, content_y, row_h, dt);
 		}
 		ImGui::EndChild();
 

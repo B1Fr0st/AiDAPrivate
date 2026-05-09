@@ -565,7 +565,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		char scrub_lbl[64];
 		std::snprintf(scrub_lbl, sizeof(scrub_lbl), "%d / %d", st.scrub_position + 1, total);
 		ImVec2 lsz = ImGui::CalcTextSize(scrub_lbl);
-		dl->AddText(aida::ui::fonts::caption(), 11.f,
+		dl->AddText(aida::ui::fonts::caption(), 13.f,
 			ImVec2(head_x - lsz.x * 0.5f, scrub_y + 4.f),
 			aida::ui::with_alpha(t.text_dim, alpha), scrub_lbl);
 
@@ -603,7 +603,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		};
 		float hx = cx + pad + 12.f;
 		for (auto& c : cols) {
-			dl->AddText(aida::ui::fonts::caption(), 11.f,
+			dl->AddText(aida::ui::fonts::caption(), 13.f,
 				ImVec2(hx, hdr_y + (row_h - 11.f) * 0.5f),
 				aida::ui::with_alpha(tt.text_dim, alpha), c.label);
 			hx += c.w;
@@ -688,26 +688,26 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				static_cast<unsigned long long>(n.address));
 
 			float rx = cx + pad + 12.f;
-			dl->AddText(aida::ui::fonts::code(), 12.f,
+			dl->AddText(aida::ui::fonts::code(), 13.f,
 				ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
 				aida::ui::with_alpha(tt.text_address, alpha * row_t), abuf);
 			rx += cols[0].w;
 
 			std::string disp = n.disasm;
 			if (disp.size() > 36) disp = disp.substr(0, 33) + "...";
-			dl->AddText(aida::ui::fonts::code(), 12.f,
+			dl->AddText(aida::ui::fonts::code(), 13.f,
 				ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
 				aida::ui::with_alpha(tt.text_primary, alpha * row_t), disp.c_str());
 			rx += cols[1].w;
 
 			std::string srcs = detail::join_regs(n.source_regs, 22);
-			dl->AddText(aida::ui::fonts::code(), 12.f,
+			dl->AddText(aida::ui::fonts::code(), 13.f,
 				ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
 				aida::ui::with_alpha(tt.syn_type, alpha * row_t), srcs.c_str());
 			rx += cols[2].w;
 
 			std::string dsts = detail::join_regs(n.dest_regs, 22);
-			dl->AddText(aida::ui::fonts::code(), 12.f,
+			dl->AddText(aida::ui::fonts::code(), 13.f,
 				ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
 				aida::ui::with_alpha(tt.syn_register, alpha * row_t), dsts.c_str());
 			rx += cols[3].w;
@@ -885,13 +885,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			char abuf[20];
 			std::snprintf(abuf, sizeof(abuf), "%llX",
 				static_cast<unsigned long long>(n.address));
-			dl->AddText(aida::ui::fonts::code(), 11.f,
+			dl->AddText(aida::ui::fonts::code(), 13.f,
 				ImVec2(a.x + 56.f, a.y + 6.f),
 				aida::ui::with_alpha(tt.text_address, alpha * row_t), abuf);
 
 			std::string disp = n.disasm;
 			if (disp.size() > 28) disp = disp.substr(0, 25) + "...";
-			dl->AddText(aida::ui::fonts::code(), 12.f,
+			dl->AddText(aida::ui::fonts::code(), 13.f,
 				ImVec2(a.x + 56.f, a.y + 16.f),
 				aida::ui::with_alpha(tt.text_primary, alpha * row_t), disp.c_str());
 
@@ -899,7 +899,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (!n.dest_regs.empty()) regs_text = detail::join_regs(n.dest_regs, 14);
 			else regs_text = detail::join_regs(n.source_regs, 14);
 			ImVec2 rsz = aida::ui::fonts::caption()->CalcTextSizeA(11.f, FLT_MAX, 0.f, regs_text.c_str());
-			dl->AddText(aida::ui::fonts::caption(), 11.f,
+			dl->AddText(aida::ui::fonts::caption(), 13.f,
 				ImVec2(b.x - rsz.x - 10.f, a.y + (node_h - 11.f) * 0.5f),
 				aida::ui::with_alpha(tt.text_dim, alpha * row_t), regs_text.c_str());
 		}

@@ -530,7 +530,8 @@ float chat_render::render_code_block(
 
     ImU32 head_top = aida::ui::with_alpha(aida::ui::mix(th.panel_header, th.accent_grad_top, 0.10f), alpha * 0.95f);
     ImU32 head_bot = aida::ui::with_alpha(aida::ui::mix(th.panel_header, th.accent_grad_bot, 0.04f), alpha * 0.95f);
-    dl->AddRectFilledMultiColor(hmin, hmax, head_top, head_top, head_bot, head_bot);
+    ImU32 head_mix = aida::ui::mix(head_top, head_bot, 0.45f);
+    dl->AddRectFilled(hmin, hmax, head_mix, 10.f, ImDrawFlags_RoundCornersTop);
     dl->AddLine(ImVec2(hmin.x, hmax.y), ImVec2(hmax.x, hmax.y),
                 aida::ui::with_alpha(th.border_subtle, alpha), 1.f);
 
@@ -538,7 +539,7 @@ float chat_render::render_code_block(
     for (char& c : lang_label) c = (char)tolower((unsigned char)c);
 
     ImFont* ui_font = aida::ui::fonts::body_strong() ? aida::ui::fonts::body_strong() : ImGui::GetFont();
-    float lang_fs = 11.f;
+    float lang_fs = 13.f;
 
     ImVec2 lts = ui_font->CalcTextSizeA(lang_fs, FLT_MAX, 0.f, lang_label.c_str());
     float lang_pill_w = lts.x + 16.f;
@@ -613,7 +614,7 @@ float chat_render::render_code_block(
     dl->AddRectFilled(
         ImVec2(bmin.x, hmax.y),
         ImVec2(bmin.x + gutter_w, bmax.y),
-        gutter_bg, 0.f);
+        gutter_bg, 10.f, ImDrawFlags_RoundCornersBottomLeft);
     dl->AddLine(
         ImVec2(bmin.x + gutter_w, hmax.y + 1.f),
         ImVec2(bmin.x + gutter_w, bmax.y - 1.f),
@@ -791,8 +792,9 @@ static float render_table_block(
 
     ImVec2 hd_a = bmin;
     ImVec2 hd_b(bmax.x, bmin.y + row_h);
-    dl->AddRectFilledMultiColor(hd_a, hd_b, head_fill, head_fill,
-        aida::ui::with_alpha(th.panel_header, alpha), aida::ui::with_alpha(th.panel_header, alpha));
+    ImU32 head_panel = aida::ui::with_alpha(th.panel_header, alpha);
+    ImU32 head_table_mix = aida::ui::mix(head_fill, head_panel, 0.45f);
+    dl->AddRectFilled(hd_a, hd_b, head_table_mix, 8.f, ImDrawFlags_RoundCornersTop);
     dl->AddLine(ImVec2(hd_a.x, hd_b.y), ImVec2(hd_b.x, hd_b.y), brd, 1.f);
 
     for (size_t ri = 0; ri < rows.size(); ++ri) {
@@ -856,7 +858,7 @@ static float render_tool_call_card(
 {
     const auto& th = aida::ui::resolved();
     ImFont* ui_font = aida::ui::fonts::body_strong() ? aida::ui::fonts::body_strong() : ImGui::GetFont();
-    float fs = 12.f;
+    float fs = 14.f;
 
     std::string tool_name;
     try_extract_tool_name(payload, tool_name);
@@ -919,7 +921,7 @@ static float render_tool_call_card(
     else           std::strcpy(chev_buf, "\xe2\x96\xbc");
     ImFont* chev_font = ImGui::GetFont();
     ImVec2 chsz = chev_font->CalcTextSizeA(11.f, FLT_MAX, 0.f, chev_buf);
-    dl->AddText(chev_font, 11.f,
+    dl->AddText(chev_font, 13.f,
         ImVec2(ha.x + 32.f, ha.y + (header_h - chsz.y) * 0.5f),
         aida::ui::with_alpha(th.text_secondary, alpha), chev_buf);
 
@@ -931,7 +933,7 @@ static float render_tool_call_card(
     {
         const char* args_label = "args";
         ImFont* tag_font = aida::ui::fonts::caption() ? aida::ui::fonts::caption() : ImGui::GetFont();
-        float tag_fs = 10.f;
+        float tag_fs = 12.f;
         ImVec2 ts = tag_font->CalcTextSizeA(tag_fs, FLT_MAX, 0.f, args_label);
         float pill_w = ts.x + 14.f;
         float pill_h = 16.f;
@@ -1009,7 +1011,7 @@ static float render_tool_result_card(
     ImFont* ui_font = aida::ui::fonts::body_strong() ? aida::ui::fonts::body_strong() : ImGui::GetFont();
     ImFont* code_font = aida::ui::fonts::code() ? aida::ui::fonts::code() : ImGui::GetFont();
     float code_fs = code_font->FontSize > 0.f ? code_font->FontSize : ImGui::GetFontSize();
-    float fs = 12.f;
+    float fs = 14.f;
 
     std::string display = payload;
     bool truncated = display.size() > 500;
@@ -1051,7 +1053,8 @@ static float render_tool_result_card(
     ImVec2 hb(b.x, a.y + header_h);
     ImU32 grad_top = aida::ui::with_alpha(aida::ui::mix(th.panel_header, th.success, 0.18f), alpha * 0.95f);
     ImU32 grad_bot = aida::ui::with_alpha(th.panel_header, alpha * 0.95f);
-    dl->AddRectFilledMultiColor(ha, hb, grad_top, grad_top, grad_bot, grad_bot);
+    ImU32 grad_mix_tr = aida::ui::mix(grad_top, grad_bot, 0.45f);
+    dl->AddRectFilled(ha, hb, grad_mix_tr, 12.f, ImDrawFlags_RoundCornersTop);
     dl->AddLine(ImVec2(ha.x, hb.y), ImVec2(hb.x, hb.y),
         aida::ui::with_alpha(th.border_subtle, alpha), 1.f);
 
@@ -1064,7 +1067,7 @@ static float render_tool_result_card(
     else           std::strcpy(chev_buf, "\xe2\x96\xbc");
     ImFont* chev_font = ImGui::GetFont();
     ImVec2 chsz = chev_font->CalcTextSizeA(11.f, FLT_MAX, 0.f, chev_buf);
-    dl->AddText(chev_font, 11.f,
+    dl->AddText(chev_font, 13.f,
         ImVec2(ha.x + 28.f, ha.y + (header_h - chsz.y) * 0.5f),
         aida::ui::with_alpha(th.text_secondary, alpha), chev_buf);
 
@@ -1145,7 +1148,7 @@ float chat_render::render_thinking_indicator(
     (void)dt;
     const auto& th = aida::ui::resolved();
     ImFont* font = aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont();
-    float fs = 12.f;
+    float fs = 14.f;
     float pill_h = 28.f;
 
     static const char* phases[] = { "Reasoning", "Reading code", "Planning", "Drafting" };

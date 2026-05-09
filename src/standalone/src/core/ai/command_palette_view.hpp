@@ -277,7 +277,8 @@ namespace command_palette {
 
 			ImU32 grad_top = ui::with_alpha(th.accent_grad_top, 0.10f);
 			ImU32 grad_bot = ui::with_alpha(th.accent_grad_bot, 0.04f);
-			dl->AddRectFilledMultiColor(a, b, grad_top, grad_top, grad_bot, grad_bot);
+			ImU32 grad_flat = ui::mix(grad_top, grad_bot, 0.5f);
+			dl->AddRectFilled(a, b, grad_flat, radius);
 
 			ui::blur::render_glass_border(dl, a, b, radius, 1.f, 1.f);
 
@@ -351,7 +352,8 @@ namespace command_palette {
 			if (is_selected) {
 				ImU32 grad_top = ui::with_alpha(t.accent_grad_top, 0.18f * alpha);
 				ImU32 grad_bot = ui::with_alpha(t.accent_grad_bot, 0.10f * alpha);
-				dl->AddRectFilledMultiColor(a, b, grad_top, grad_top, grad_bot, grad_bot);
+				ImU32 grad_flat = ui::mix(grad_top, grad_bot, 0.5f);
+				dl->AddRectFilled(a, b, grad_flat, row_radius);
 				ImU32 wash = ui::with_alpha(t.hover_wash, 0.85f * alpha);
 				dl->AddRectFilled(a, b, wash, row_radius);
 			} else if (hovered) {
@@ -416,7 +418,7 @@ namespace command_palette {
 
 			if (is_selected && show_kbd_chips) {
 				ImFont* sf = ui::fonts::caption();
-				const float kfs = 11.f;
+				const float kfs = 13.f;
 				const struct { const char* lbl; const char* key; } chips[] = {
 					{ "run",     "Enter" },
 					{ "preview", "Tab" },
@@ -449,7 +451,7 @@ namespace command_palette {
 		{
 			const auto& t = ui::resolved();
 			ImFont* font = ui::fonts::caption();
-			const float fs = 11.f;
+			const float fs = 13.f;
 			ImU32 line_col = ui::with_alpha(t.border_subtle, 0.85f * close_alpha);
 			float text_y = (a.y + b.y) * 0.5f - fs * 0.5f;
 			dl->AddText(font, fs, ImVec2(a.x + 4.f, text_y),
@@ -467,7 +469,7 @@ namespace command_palette {
 		                                     int max_lines, float line_h)
 		{
 			ImFont* mono = ui::fonts::code();
-			const float fs = 12.f;
+			const float fs = 13.f;
 			float y = origin.y;
 			size_t i = 0;
 			int line = 0;
@@ -494,14 +496,14 @@ namespace command_palette {
 		{
 			const auto& t = ui::resolved();
 			ImFont* mono = ui::fonts::code();
-			const float fs = 12.f;
+			const float fs = 13.f;
 			const float line_h = 16.f;
 			const float pad = 14.f;
 
 			float y = a.y + pad;
 
 			ImFont* hf = ui::fonts::caption();
-			dl->AddText(hf, 11.f, ImVec2(a.x + pad, y),
+			dl->AddText(hf, 13.f, ImVec2(a.x + pad, y),
 				ui::with_alpha(t.text_dim, alpha), "TEMPLATE");
 			y += 18.f;
 
@@ -555,7 +557,7 @@ namespace command_palette {
 
 			if (!c.placeholder_hints.empty()) {
 				y += 8.f;
-				dl->AddText(hf, 11.f, ImVec2(a.x + pad, y),
+				dl->AddText(hf, 13.f, ImVec2(a.x + pad, y),
 					ui::with_alpha(t.text_dim, alpha), "ARGUMENTS");
 				y += 18.f;
 				std::string args;
@@ -583,11 +585,11 @@ namespace command_palette {
 				ui::with_alpha(t.text_primary, alpha), c.name.c_str());
 
 			ImFont* sub = ui::fonts::caption();
-			dl->AddText(sub, 11.f, ImVec2(av_center.x + 28.f, a.y + pad + 22.f),
+			dl->AddText(sub, 13.f, ImVec2(av_center.x + 28.f, a.y + pad + 22.f),
 				ui::with_alpha(t.text_dim, alpha), "AGENT");
 
 			float y = a.y + pad + 50.f;
-			dl->AddText(sub, 11.f, ImVec2(a.x + pad, y),
+			dl->AddText(sub, 13.f, ImVec2(a.x + pad, y),
 				ui::with_alpha(t.text_dim, alpha), "DESCRIPTION");
 			y += 18.f;
 			std::string desc = c.description.empty() ? std::string("(no description)") : c.description;
@@ -604,7 +606,7 @@ namespace command_palette {
 			float y = a.y + pad;
 
 			ImFont* hf = ui::fonts::caption();
-			dl->AddText(hf, 11.f, ImVec2(a.x + pad, y),
+			dl->AddText(hf, 13.f, ImVec2(a.x + pad, y),
 				ui::with_alpha(t.text_dim, alpha), "SKILL");
 			y += 18.f;
 
@@ -620,7 +622,7 @@ namespace command_palette {
 
 			if (!c.template_text.empty()) {
 				y += 6.f;
-				dl->AddText(hf, 11.f, ImVec2(a.x + pad, y),
+				dl->AddText(hf, 13.f, ImVec2(a.x + pad, y),
 					ui::with_alpha(t.text_dim, alpha), "TEMPLATE");
 				y += 18.f;
 				render_text_lines_mono(dl, ImVec2(a.x + pad, y),
@@ -668,7 +670,7 @@ namespace command_palette {
 
 			if (!sel->source_path.empty()) {
 				ImFont* sm_font = ui::fonts::caption();
-				const float fs = 10.f;
+				const float fs = 12.f;
 				std::string sp = sel->source_path;
 				if (sp.size() > 80) sp = std::string("...") + sp.substr(sp.size() - 77);
 				ImVec2 ts = sm_font->CalcTextSizeA(fs, FLT_MAX, 0.f, sp.c_str());
@@ -1088,7 +1090,7 @@ namespace command_palette {
 			std::snprintf(count_buf, sizeof(count_buf), "%d match%s",
 				hit_count, hit_count == 1 ? "" : "es");
 			ImFont* font = ui::fonts::caption();
-			const float fs = 11.f;
+			const float fs = 13.f;
 			fdl->AddText(font, fs,
 				ImVec2(fa.x, fa.y + (footer_h - fs) * 0.5f),
 				ui::with_alpha(th.text_dim, close_alpha), count_buf);
@@ -1116,10 +1118,10 @@ namespace command_palette {
 					ui::with_alpha(th.panel_header, 0.95f * close_alpha), 4.f);
 				fdl->AddRect(kbox_a, kbox_b,
 					ui::with_alpha(th.border_subtle, 0.95f * close_alpha), 4.f, 0, 1.f);
-				fdl->AddText(sf, 11.f,
+				fdl->AddText(sf, 13.f,
 					ImVec2(kbox_a.x + 6.f, kbox_a.y + (18.f - 11.f) * 0.5f),
 					ui::with_alpha(th.text_secondary, close_alpha), p.key);
-				fdl->AddText(sf, 11.f,
+				fdl->AddText(sf, 13.f,
 					ImVec2(kbox_b.x + 6.f, kbox_a.y + (18.f - 11.f) * 0.5f),
 					ui::with_alpha(th.text_dim, close_alpha), p.lbl);
 				right_x -= spacing;

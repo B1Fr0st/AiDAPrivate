@@ -41,15 +41,15 @@ enum class center_view_t : int {
 	scan_hub,
 	types_hub,
 	analysis_hub,
-	binary_map
+	binary_map,
+	graph_view
 };
 
 
 enum class activity_item_t : int {
 	explorer = 0,
 	search,
-	debug,
-	settings,
+	functions,
 	COUNT
 };
 

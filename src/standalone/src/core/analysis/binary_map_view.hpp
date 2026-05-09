@@ -298,7 +298,7 @@ namespace binary_map_view {
 			float min_size = static_cast<float>(image_size);
 			if (min_size < total_size) min_size = total_size;
 
-			const float strip_h = 28.f;
+			const float strip_h = 38.f;
 			const float gap = 2.f;
 			float x = origin.x;
 			float y = origin.y;
@@ -332,20 +332,23 @@ namespace binary_map_view {
 
 				ImFont* font = aida::ui::fonts::body_em();
 				if (!font) font = ImGui::GetFont();
-				float fs = 11.f;
+				float fs = font->FontSize > 0.f ? font->FontSize : 16.f;
 				ImU32 lbl_col = aida::ui::with_alpha(IM_COL32(255, 255, 255, 245), alpha);
 				ImVec2 ts = font->CalcTextSizeA(fs, FLT_MAX, 0.f, s.name.c_str());
-				if (effective_w > ts.x + 12.f) {
-					dl->AddText(font, fs, ImVec2(a.x + 6.f, a.y + (strip_h - fs) * 0.5f),
+				if (effective_w > ts.x + 14.f) {
+					dl->AddText(font, fs, ImVec2(a.x + 8.f, a.y + (strip_h - fs) * 0.5f),
 						lbl_col, s.name.c_str());
 
-					float perm_w = effective_w - ts.x - 14.f;
-					if (perm_w > 32.f) {
+					float perm_w = effective_w - ts.x - 18.f;
+					ImFont* perm_font = aida::ui::fonts::caption();
+					if (!perm_font) perm_font = font;
+					float perm_fs = perm_font->FontSize > 0.f ? perm_font->FontSize : 13.f;
+					if (perm_w > 36.f) {
 						std::string p = section_perm_string(s);
-						ImVec2 perm_sz = font->CalcTextSizeA(10.f, FLT_MAX, 0.f, p.c_str());
-						dl->AddText(font, 10.f,
-							ImVec2(b.x - perm_sz.x - 6.f, a.y + (strip_h - 10.f) * 0.5f),
-							aida::ui::with_alpha(IM_COL32(255, 255, 255, 220), alpha * 0.8f),
+						ImVec2 perm_sz = perm_font->CalcTextSizeA(perm_fs, FLT_MAX, 0.f, p.c_str());
+						dl->AddText(perm_font, perm_fs,
+							ImVec2(b.x - perm_sz.x - 8.f, a.y + (strip_h - perm_fs) * 0.5f),
+							aida::ui::with_alpha(IM_COL32(255, 255, 255, 220), alpha * 0.85f),
 							p.c_str());
 					}
 				}
@@ -543,16 +546,19 @@ namespace binary_map_view {
 
 			ImFont* head = aida::ui::fonts::body_em();
 			if (!head) head = ImGui::GetFont();
-			dl->AddText(head, 12.f, ImVec2(a.x + 10.f, a.y + 8.f),
+			const float head_fs = head->FontSize > 0.f ? head->FontSize : 16.f;
+			dl->AddText(head, head_fs, ImVec2(a.x + 12.f, a.y + 10.f),
 				aida::ui::with_alpha(t.text_secondary, alpha), "Call Graph");
 
 			if (!selected) {
-				ImFont* font = ImGui::GetFont();
+				ImFont* font = aida::ui::fonts::body();
+				if (!font) font = ImGui::GetFont();
+				const float hint_fs = font->FontSize > 0.f ? font->FontSize : 16.f;
 				const char* hint = "Hover or select a function to see its top callees";
-				ImVec2 ts = font->CalcTextSizeA(12.f, FLT_MAX, width - 20.f, hint);
-				dl->AddText(font, 12.f,
+				ImVec2 ts = font->CalcTextSizeA(hint_fs, FLT_MAX, width - 24.f, hint);
+				dl->AddText(font, hint_fs,
 					ImVec2(a.x + (width - ts.x) * 0.5f, a.y + (height - ts.y) * 0.5f),
-					aida::ui::with_alpha(t.text_dim, alpha), hint, nullptr, width - 20.f);
+					aida::ui::with_alpha(t.text_dim, alpha), hint, nullptr, width - 24.f);
 				return;
 			}
 
@@ -567,8 +573,10 @@ namespace binary_map_view {
 			int callee_n = static_cast<int>(selected->top_callees.size());
 			if (callee_n > 6) callee_n = 6;
 
-			ImFont* small_font = aida::ui::fonts::body();
+			ImFont* small_font = aida::ui::fonts::caption();
+			if (!small_font) small_font = aida::ui::fonts::body();
 			if (!small_font) small_font = ImGui::GetFont();
+			const float callee_fs = small_font->FontSize > 0.f ? small_font->FontSize : 13.f;
 
 			for (int i = 0; i < callee_n; ++i) {
 				float ang = -1.5707963f + (static_cast<float>(i) / static_cast<float>(std::max(1, callee_n))) * 6.2831853f;
@@ -581,9 +589,9 @@ namespace binary_map_view {
 					aida::ui::with_alpha(t.accent_grad_top, alpha * weight), 16);
 
 				const std::string& nm = selected->top_callees[i];
-				ImVec2 lblsz = small_font->CalcTextSizeA(11.f, FLT_MAX, 0.f, nm.c_str());
-				ImVec2 lblpos = ImVec2(p.x - lblsz.x * 0.5f, p.y + 8.f);
-				dl->AddText(small_font, 11.f, lblpos,
+				ImVec2 lblsz = small_font->CalcTextSizeA(callee_fs, FLT_MAX, 0.f, nm.c_str());
+				ImVec2 lblpos = ImVec2(p.x - lblsz.x * 0.5f, p.y + 10.f);
+				dl->AddText(small_font, callee_fs, lblpos,
 					aida::ui::with_alpha(t.text_secondary, alpha), nm.c_str());
 			}
 
@@ -595,15 +603,15 @@ namespace binary_map_view {
 			dl->AddCircleFilled(center, r, sel_fill_top, 24);
 			dl->AddCircleFilled(center, r * 0.6f, sel_fill_bot, 24);
 
-			ImVec2 lblsz = head->CalcTextSizeA(12.f, FLT_MAX, 0.f, selected->name.c_str());
-			dl->AddText(head, 12.f, ImVec2(center.x - lblsz.x * 0.5f, center.y + 16.f),
+			ImVec2 lblsz = head->CalcTextSizeA(head_fs, FLT_MAX, 0.f, selected->name.c_str());
+			dl->AddText(head, head_fs, ImVec2(center.x - lblsz.x * 0.5f, center.y + 18.f),
 				aida::ui::with_alpha(t.text_primary, alpha), selected->name.c_str());
 
 			char addr[32];
 			std::snprintf(addr, sizeof(addr), "0x%llX",
 				static_cast<unsigned long long>(selected->va));
-			ImVec2 addrsz = small_font->CalcTextSizeA(10.f, FLT_MAX, 0.f, addr);
-			dl->AddText(small_font, 10.f, ImVec2(center.x - addrsz.x * 0.5f, center.y + 30.f),
+			ImVec2 addrsz = small_font->CalcTextSizeA(callee_fs, FLT_MAX, 0.f, addr);
+			dl->AddText(small_font, callee_fs, ImVec2(center.x - addrsz.x * 0.5f, center.y + 18.f + head_fs + 4.f),
 				aida::ui::with_alpha(t.text_address, alpha), addr);
 		}
 
@@ -680,7 +688,7 @@ namespace binary_map_view {
 
 		(void)anim_x; (void)anim_y; (void)anim_z;
 
-		const float toolbar_h = 60.f;
+		const float toolbar_h = 68.f;
 		const float pad = 12.f;
 
 		ImU32 bar_top = aida::ui::with_alpha(t.panel_header, a * 0.85f);
@@ -716,13 +724,14 @@ namespace binary_map_view {
 		ImGui::SetCursorScreenPos(ImVec2(ox + pad, oy + 8.f));
 		ImFont* head = aida::ui::fonts::body_strong();
 		if (!head) head = ImGui::GetFont();
+		const float head_fs = head->FontSize > 0.f ? head->FontSize : 16.f;
 		ImGui::PushFont(head);
 		const char* title_text = "Binary Map";
-		dl->AddText(head, 16.f, ImVec2(ox + pad, oy + 6.f),
+		dl->AddText(head, head_fs, ImVec2(ox + pad, oy + 6.f),
 			aida::ui::with_alpha(t.text_primary, a), title_text);
 		ImGui::PopFont();
 
-		float modline_x = ox + pad + 130.f;
+		float modline_x = ox + pad + 150.f;
 		std::string mod_summary;
 		if (!module_name.empty()) {
 			char tmp[256];
@@ -737,7 +746,8 @@ namespace binary_map_view {
 		}
 		ImFont* code_font = aida::ui::fonts::code();
 		if (!code_font) code_font = ImGui::GetFont();
-		dl->AddText(code_font, 11.f, ImVec2(modline_x, oy + 9.f),
+		const float code_fs = code_font->FontSize > 0.f ? code_font->FontSize : 14.f;
+		dl->AddText(code_font, code_fs, ImVec2(modline_x, oy + 12.f),
 			aida::ui::with_alpha(t.text_dim, a), mod_summary.c_str());
 
 		auto format_count = [](int n, char* out, size_t sz) {
@@ -750,19 +760,19 @@ namespace binary_map_view {
 		format_count(total_exports, buf_exp, sizeof(buf_exp));
 		format_count(total_sections, buf_sec, sizeof(buf_sec));
 
-		float chip_y = oy + 30.f;
+		float chip_y = oy + 32.f;
 		float chip_x = ox + pad;
 		ImGui::SetCursorScreenPos(ImVec2(chip_x, chip_y));
 
 		auto render_count_chip = [&](const char* lbl, const char* val, ImU32 col) {
 			ImFont* f = aida::ui::fonts::body();
 			if (!f) f = ImGui::GetFont();
-			float fs = 11.f;
+			float fs = f->FontSize > 0.f ? f->FontSize : 16.f;
 			float lblw = f->CalcTextSizeA(fs, FLT_MAX, 0.f, lbl).x;
 			float valw = f->CalcTextSizeA(fs, FLT_MAX, 0.f, val).x;
-			float pad_x = 8.f;
-			float w_chip = lblw + valw + pad_x * 2.f + 6.f;
-			float h_chip = 20.f;
+			float pad_x = 10.f;
+			float w_chip = lblw + valw + pad_x * 2.f + 8.f;
+			float h_chip = 26.f;
 			ImVec2 cp = ImGui::GetCursorScreenPos();
 			ImVec2 ca = cp;
 			ImVec2 cb = ImVec2(cp.x + w_chip, cp.y + h_chip);
@@ -770,10 +780,10 @@ namespace binary_map_view {
 			dl->AddRect(ca, cb, aida::ui::with_alpha(col, a * 0.55f), h_chip * 0.5f, 0, 1.f);
 			dl->AddText(f, fs, ImVec2(ca.x + pad_x, ca.y + (h_chip - fs) * 0.5f),
 				aida::ui::with_alpha(t.text_secondary, a), lbl);
-			dl->AddText(f, fs, ImVec2(ca.x + pad_x + lblw + 6.f, ca.y + (h_chip - fs) * 0.5f),
+			dl->AddText(f, fs, ImVec2(ca.x + pad_x + lblw + 8.f, ca.y + (h_chip - fs) * 0.5f),
 				aida::ui::with_alpha(col, a), val);
 			ImGui::Dummy(ImVec2(w_chip, h_chip));
-			ImGui::SameLine(0.f, 6.f);
+			ImGui::SameLine(0.f, 8.f);
 		};
 
 		render_count_chip("Sections", buf_sec,   t.info);
@@ -782,22 +792,25 @@ namespace binary_map_view {
 		render_count_chip("Imports",   buf_imp,   t.warning);
 		render_count_chip("Exports",   buf_exp,   t.accent_hover);
 
-		const float btn_y = oy + 28.f;
+		const float btn_y = oy + 30.f;
+		const float btn_w = 104.f;
+		const float btn_h = 32.f;
+		const float btn_gap = 10.f;
 		float btn_right_anchor = ox + w - pad;
 
-		ImGui::SetCursorScreenPos(ImVec2(btn_right_anchor - 88.f, btn_y));
+		ImGui::SetCursorScreenPos(ImVec2(btn_right_anchor - btn_w, btn_y));
 		bool refreshing = s.refreshing.load();
 		if (aida::ui::button(refreshing ? "Refreshing" : "Refresh",
 			aida::ui::button_kind_t::primary,
-			aida::ui::size_t_::sm,
-			ImVec2(82.f, 24.f),
+			aida::ui::size_t_::md,
+			ImVec2(btn_w, btn_h),
 			refreshing, nullptr, refreshing)) {
 			if (!refreshing) s.refresh_requested.store(true);
 		}
 
-		ImGui::SetCursorScreenPos(ImVec2(btn_right_anchor - 88.f - 92.f, btn_y));
+		ImGui::SetCursorScreenPos(ImVec2(btn_right_anchor - btn_w * 2.f - btn_gap, btn_y));
 		if (aida::ui::button("To chat", aida::ui::button_kind_t::secondary,
-			aida::ui::size_t_::sm, ImVec2(86.f, 24.f))) {
+			aida::ui::size_t_::md, ImVec2(btn_w, btn_h))) {
 			std::string payload;
 			{
 				std::lock_guard<std::mutex> g(s.mutex);
@@ -807,9 +820,9 @@ namespace binary_map_view {
 			detail::inject_to_chat(payload);
 		}
 
-		ImGui::SetCursorScreenPos(ImVec2(btn_right_anchor - 88.f - 92.f - 92.f, btn_y));
+		ImGui::SetCursorScreenPos(ImVec2(btn_right_anchor - btn_w * 3.f - btn_gap * 2.f, btn_y));
 		if (aida::ui::button("Copy", aida::ui::button_kind_t::ghost,
-			aida::ui::size_t_::sm, ImVec2(86.f, 24.f))) {
+			aida::ui::size_t_::md, ImVec2(btn_w, btn_h))) {
 			std::string payload;
 			{
 				std::lock_guard<std::mutex> g(s.mutex);
@@ -859,11 +872,15 @@ namespace binary_map_view {
 		float panel_w = left_w - left_pad * 2.f;
 		float panel_y = content_y + 8.f;
 
-		dl->AddText(aida::ui::fonts::body_em() ? aida::ui::fonts::body_em() : ImGui::GetFont(),
-			12.f, ImVec2(panel_x, panel_y),
-			aida::ui::with_alpha(t.text_secondary, a), "Section Layout");
+		{
+			ImFont* sec_label = aida::ui::fonts::body_em();
+			if (!sec_label) sec_label = ImGui::GetFont();
+			const float sec_label_fs = sec_label->FontSize > 0.f ? sec_label->FontSize : 16.f;
+			dl->AddText(sec_label, sec_label_fs, ImVec2(panel_x, panel_y),
+				aida::ui::with_alpha(t.text_secondary, a), "Section Layout");
+		}
 
-		float strip_top = panel_y + 18.f;
+		float strip_top = panel_y + 24.f;
 		std::vector<binary_map::map_section_t> sections_copy;
 		std::vector<binary_map::map_function_t> functions_copy;
 		uint64_t selected_va_local = s.selected_va.load();
@@ -881,10 +898,14 @@ namespace binary_map_view {
 		detail::render_section_strip(dl, ImVec2(panel_x, strip_top), panel_w,
 			sections_copy, image_size, a, s.row_anim_time);
 
-		float heat_top = strip_top + 28.f + 12.f;
-		dl->AddText(aida::ui::fonts::body_em() ? aida::ui::fonts::body_em() : ImGui::GetFont(),
-			12.f, ImVec2(panel_x, heat_top - 18.f),
-			aida::ui::with_alpha(t.text_secondary, a), "Function Heatmap");
+		float heat_top = strip_top + 38.f + 28.f;
+		{
+			ImFont* hh_font = aida::ui::fonts::body_em();
+			if (!hh_font) hh_font = ImGui::GetFont();
+			const float hh_fs = hh_font->FontSize > 0.f ? hh_font->FontSize : 16.f;
+			dl->AddText(hh_font, hh_fs, ImVec2(panel_x, heat_top - hh_fs - 6.f),
+				aida::ui::with_alpha(t.text_secondary, a), "Function Heatmap");
+		}
 
 		float heat_h = (content_h - (heat_top - content_y)) * 0.55f;
 		if (heat_h < 120.f) heat_h = 120.f;
@@ -925,12 +946,13 @@ namespace binary_map_view {
 
 		ImFont* head_em = aida::ui::fonts::body_em();
 		if (!head_em) head_em = ImGui::GetFont();
-		dl->AddText(head_em, 12.f, ImVec2(panel_inner_left, panel_inner_top),
+		const float head_em_fs = head_em->FontSize > 0.f ? head_em->FontSize : 16.f;
+		dl->AddText(head_em, head_em_fs, ImVec2(panel_inner_left, panel_inner_top),
 			aida::ui::with_alpha(t.text_secondary, a), "LLM Preview");
 
-		ImGui::SetCursorScreenPos(ImVec2(r_b.x - 90.f, panel_inner_top - 4.f));
+		ImGui::SetCursorScreenPos(ImVec2(r_b.x - 100.f, panel_inner_top - 6.f));
 		if (aida::ui::button("Copy", aida::ui::button_kind_t::ghost,
-			aida::ui::size_t_::sm, ImVec2(80.f, 22.f))) {
+			aida::ui::size_t_::md, ImVec2(96.f, 30.f))) {
 			std::string payload;
 			{
 				std::lock_guard<std::mutex> g(s.mutex);
@@ -942,15 +964,15 @@ namespace binary_map_view {
 				toast_notification::toast_type_t::info, 3.0f);
 		}
 
-		float filter_y = panel_inner_top + 22.f;
+		float filter_y = panel_inner_top + head_em_fs + 14.f;
 		ImGui::SetCursorScreenPos(ImVec2(panel_inner_left, filter_y));
 		if (aida::ui::input_text("##bm_filter", s.filter_buf, sizeof(s.filter_buf),
 			"Filter functions, globals, imports...", false,
-			ImVec2(panel_inner_w, 28.f))) {
+			ImVec2(panel_inner_w, 32.f))) {
 		}
 		s.filter_lower = detail::to_lower_copy(std::string(s.filter_buf));
 
-		float section_y = filter_y + 38.f;
+		float section_y = filter_y + 42.f;
 		float section_inner_h = (r_b.y - section_y) - 12.f;
 		ImGui::SetCursorScreenPos(ImVec2(panel_inner_left, section_y));
 		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0,0,0,0));
@@ -971,45 +993,53 @@ namespace binary_map_view {
 			const bool collapsed = detail::group_is_collapsed(s, key);
 			ImVec2 cp = ImGui::GetCursorScreenPos();
 			float row_w = ImGui::GetContentRegionAvail().x;
-			float row_h = 24.f;
+			float row_h = 30.f;
 			bool hov = ImGui::IsMouseHoveringRect(cp, ImVec2(cp.x + row_w, cp.y + row_h), true);
 			ImU32 fill = hov
 				? aida::ui::with_alpha(t.hover_wash, a)
 				: aida::ui::with_alpha(t.panel_header, a * 0.55f);
 			dl->AddRectFilled(cp, ImVec2(cp.x + row_w, cp.y + row_h), fill, 6.f);
 			ImU32 arrow_col = aida::ui::with_alpha(t.accent_u32, a);
-			float arrow_x = cp.x + 10.f;
+			float arrow_x = cp.x + 12.f;
 			float arrow_y = cp.y + row_h * 0.5f;
 			ImVec2 a1, a2, a3;
 			if (collapsed) {
-				a1 = ImVec2(arrow_x, arrow_y - 4.f);
-				a2 = ImVec2(arrow_x + 6.f, arrow_y);
-				a3 = ImVec2(arrow_x, arrow_y + 4.f);
+				a1 = ImVec2(arrow_x, arrow_y - 5.f);
+				a2 = ImVec2(arrow_x + 7.f, arrow_y);
+				a3 = ImVec2(arrow_x, arrow_y + 5.f);
 			} else {
 				a1 = ImVec2(arrow_x - 1.f, arrow_y - 2.f);
-				a2 = ImVec2(arrow_x + 7.f, arrow_y - 2.f);
-				a3 = ImVec2(arrow_x + 3.f, arrow_y + 4.f);
+				a2 = ImVec2(arrow_x + 8.f, arrow_y - 2.f);
+				a3 = ImVec2(arrow_x + 3.f, arrow_y + 5.f);
 			}
 			dl->AddTriangleFilled(a1, a2, a3, arrow_col);
 
 			ImFont* f_strong = aida::ui::fonts::body_em();
 			if (!f_strong) f_strong = ImGui::GetFont();
-			dl->AddText(f_strong, 12.f, ImVec2(cp.x + 26.f, cp.y + (row_h - 12.f) * 0.5f),
+			const float gh_fs = f_strong->FontSize > 0.f ? f_strong->FontSize : 16.f;
+			dl->AddText(f_strong, gh_fs, ImVec2(cp.x + 30.f, cp.y + (row_h - gh_fs) * 0.5f),
 				aida::ui::with_alpha(t.text_primary, a), hbuf);
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 				detail::toggle_group(s, key);
 			}
-			ImGui::Dummy(ImVec2(row_w, row_h + 4.f));
+			ImGui::Dummy(ImVec2(row_w, row_h + 6.f));
 			return !collapsed;
 		};
 
 		if (draw_section_header("Sections", static_cast<int>(sections_copy.size()), "sections")) {
 			int idx = 0;
+			const float sec_row_fs = code_font->FontSize > 0.f ? code_font->FontSize : 14.f;
+			ImFont* sec_name_font = aida::ui::fonts::body();
+			if (!sec_name_font) sec_name_font = code_font;
+			const float sec_name_fs = sec_name_font->FontSize > 0.f ? sec_name_font->FontSize : 16.f;
+			ImFont* sec_perm_font = aida::ui::fonts::caption();
+			if (!sec_perm_font) sec_perm_font = code_font;
+			const float sec_perm_fs = sec_perm_font->FontSize > 0.f ? sec_perm_font->FontSize : 13.f;
 			for (const auto& sec : sections_copy) {
 				if (!detail::filter_matches(filter_lower, sec.name)) continue;
 				ImVec2 cp = ImGui::GetCursorScreenPos();
 				float row_w = ImGui::GetContentRegionAvail().x;
-				float row_h = 22.f;
+				float row_h = 28.f;
 				bool hov = ImGui::IsMouseHoveringRect(cp, ImVec2(cp.x + row_w, cp.y + row_h), true);
 				if (hov) {
 					dl->AddRectFilled(cp, ImVec2(cp.x + row_w, cp.y + row_h),
@@ -1019,17 +1049,22 @@ namespace binary_map_view {
 				std::snprintf(addr_buf, sizeof(addr_buf), "0x%llX",
 					static_cast<unsigned long long>(sec.va));
 				ImU32 sc = detail::section_color(sec, a * 0.85f);
-				dl->AddRectFilled(ImVec2(cp.x + 8.f, cp.y + 7.f), ImVec2(cp.x + 14.f, cp.y + 17.f),
-					sc, 1.5f);
-				dl->AddText(code_font, 11.f, ImVec2(cp.x + 22.f, cp.y + 5.f),
+				dl->AddRectFilled(ImVec2(cp.x + 8.f, cp.y + 8.f), ImVec2(cp.x + 16.f, cp.y + row_h - 8.f),
+					sc, 2.f);
+				const float name_y = cp.y + (row_h - sec_name_fs) * 0.5f;
+				const float code_y = cp.y + (row_h - sec_row_fs) * 0.5f;
+				const float perm_y = cp.y + (row_h - sec_perm_fs) * 0.5f;
+				dl->AddText(sec_name_font, sec_name_fs, ImVec2(cp.x + 24.f, name_y),
 					aida::ui::with_alpha(t.text_primary, a), sec.name.c_str());
-				dl->AddText(code_font, 11.f, ImVec2(cp.x + 110.f, cp.y + 5.f),
+				dl->AddText(code_font, sec_row_fs, ImVec2(cp.x + 130.f, code_y),
 					aida::ui::with_alpha(t.text_address, a), addr_buf);
 				std::string sz = detail::format_size_human(sec.size);
-				dl->AddText(code_font, 11.f, ImVec2(cp.x + 220.f, cp.y + 5.f),
+				dl->AddText(code_font, sec_row_fs, ImVec2(cp.x + 250.f, code_y),
 					aida::ui::with_alpha(t.text_secondary, a), sz.c_str());
 				std::string p = detail::section_perm_string(sec);
-				dl->AddText(code_font, 11.f, ImVec2(cp.x + row_w - 40.f, cp.y + 5.f),
+				ImVec2 perm_sz = sec_perm_font->CalcTextSizeA(sec_perm_fs, FLT_MAX, 0.f, p.c_str());
+				dl->AddText(sec_perm_font, sec_perm_fs,
+					ImVec2(cp.x + row_w - perm_sz.x - 12.f, perm_y),
 					aida::ui::with_alpha(t.text_dim, a), p.c_str());
 				ImGui::Dummy(ImVec2(row_w, row_h));
 				++idx;
@@ -1039,11 +1074,18 @@ namespace binary_map_view {
 		if (draw_section_header("Functions", static_cast<int>(functions_copy.size()), "functions")) {
 			int idx = 0;
 			uint64_t cur_sel = s.selected_va.load();
+			const float fn_code_fs = code_font->FontSize > 0.f ? code_font->FontSize : 14.f;
+			ImFont* fn_name_font = aida::ui::fonts::body();
+			if (!fn_name_font) fn_name_font = ImGui::GetFont();
+			const float fn_name_fs = fn_name_font->FontSize > 0.f ? fn_name_font->FontSize : 16.f;
+			ImFont* fn_chip_font = aida::ui::fonts::caption();
+			if (!fn_chip_font) fn_chip_font = code_font;
+			const float fn_chip_fs = fn_chip_font->FontSize > 0.f ? fn_chip_font->FontSize : 13.f;
 			for (auto& fn : functions_copy) {
 				if (!detail::filter_matches(filter_lower, fn.name)) continue;
 				ImVec2 cp = ImGui::GetCursorScreenPos();
 				float row_w = ImGui::GetContentRegionAvail().x;
-				float row_h = 26.f;
+				float row_h = 36.f;
 				bool hov = ImGui::IsMouseHoveringRect(cp, ImVec2(cp.x + row_w, cp.y + row_h), true);
 				bool sel = (cur_sel == fn.va) && fn.va != 0;
 				if (sel) {
@@ -1062,17 +1104,17 @@ namespace binary_map_view {
 				ImU32 star_col = fn.pinned
 					? aida::ui::with_alpha(t.accent_u32, a)
 					: aida::ui::with_alpha(t.text_dim, a);
-				ImVec2 star_pos = ImVec2(cp.x + 12.f, cp.y + row_h * 0.5f);
-				dl->AddCircleFilled(star_pos, 4.f * pin_scale,
+				ImVec2 star_pos = ImVec2(cp.x + 14.f, cp.y + row_h * 0.5f);
+				dl->AddCircleFilled(star_pos, 5.f * pin_scale,
 					aida::ui::with_alpha(star_col, a * 0.85f), 12);
 				if (fn.pinned) {
-					dl->AddCircleFilled(star_pos, 6.f * pin_scale,
+					dl->AddCircleFilled(star_pos, 7.f * pin_scale,
 						aida::ui::with_alpha(t.accent_glow, a * (0.5f + flash.v * 0.5f)), 16);
 				}
 
 				ImGui::SetCursorScreenPos(ImVec2(cp.x + 4.f, cp.y));
 				ImGui::PushID(static_cast<int>(idx));
-				if (ImGui::InvisibleButton("##bm_pin_btn", ImVec2(20.f, row_h))) {
+				if (ImGui::InvisibleButton("##bm_pin_btn", ImVec2(24.f, row_h))) {
 					if (fn.pinned) binary_map::unpin_function(fn.va);
 					else           binary_map::pin_function(fn.va);
 					flash.trigger();
@@ -1083,39 +1125,42 @@ namespace binary_map_view {
 				char addr_buf[24];
 				std::snprintf(addr_buf, sizeof(addr_buf), "0x%llX",
 					static_cast<unsigned long long>(fn.va));
-				dl->AddText(code_font, 11.f, ImVec2(cp.x + 26.f, cp.y + 4.f),
+				const float addr_y = cp.y + 5.f;
+				const float name_y = cp.y + (row_h - fn_name_fs) * 0.5f;
+				dl->AddText(code_font, fn_code_fs, ImVec2(cp.x + 30.f, addr_y),
 					aida::ui::with_alpha(t.text_address, a), addr_buf);
-				dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-					12.f, ImVec2(cp.x + 26.f + 110.f, cp.y + 4.f),
+				dl->AddText(fn_name_font, fn_name_fs,
+					ImVec2(cp.x + 30.f + 138.f, name_y),
 					aida::ui::with_alpha(t.text_primary, a), fn.name.c_str());
 
 				char chip_xref[24];
 				std::snprintf(chip_xref, sizeof(chip_xref), "x%d", fn.xref_count);
 				char chip_call[24];
 				std::snprintf(chip_call, sizeof(chip_call), "c%d", fn.callee_count);
-				float chip_y = cp.y + row_h - 14.f;
-				float chip_x = cp.x + 26.f + 110.f;
+				float chip_h = fn_chip_fs + 6.f;
+				float chip_y = cp.y + row_h - chip_h - 4.f;
+				float chip_x = cp.x + 30.f + 138.f;
 
 				auto draw_mini_chip = [&](const char* label, ImU32 col) {
-					ImFont* f = code_font;
-					float fs = 10.f;
+					ImFont* f = fn_chip_font;
+					float fs = fn_chip_fs;
 					ImVec2 sz = f->CalcTextSizeA(fs, FLT_MAX, 0.f, label);
-					float pad_x = 5.f;
+					float pad_x = 7.f;
 					float wc = sz.x + pad_x * 2.f;
-					float hc = 12.f;
+					float hc = chip_h;
 					dl->AddRectFilled(ImVec2(chip_x, chip_y),
 						ImVec2(chip_x + wc, chip_y + hc),
 						aida::ui::with_alpha(col, a * 0.22f), hc * 0.5f);
-					dl->AddText(f, fs, ImVec2(chip_x + pad_x, chip_y),
+					dl->AddText(f, fs, ImVec2(chip_x + pad_x, chip_y + (hc - fs) * 0.5f),
 						aida::ui::with_alpha(col, a), label);
-					chip_x += wc + 4.f;
+					chip_x += wc + 6.f;
 				};
 				draw_mini_chip(chip_xref, t.info);
 				draw_mini_chip(chip_call, t.accent_u32);
 
-				ImGui::SetCursorScreenPos(ImVec2(cp.x + 26.f, cp.y));
+				ImGui::SetCursorScreenPos(ImVec2(cp.x + 30.f, cp.y));
 				ImGui::PushID(static_cast<int>(0x40000000 | idx));
-				ImGui::InvisibleButton("##bm_fn_row", ImVec2(row_w - 26.f, row_h));
+				ImGui::InvisibleButton("##bm_fn_row", ImVec2(row_w - 30.f, row_h));
 				if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
 					s.selected_va.store(fn.va);
 				}
@@ -1153,11 +1198,18 @@ namespace binary_map_view {
 
 		if (draw_section_header("Globals", static_cast<int>(globals_copy.size()), "globals")) {
 			int idx = 0;
+			const float gl_code_fs = code_font->FontSize > 0.f ? code_font->FontSize : 14.f;
+			ImFont* gl_name_font = aida::ui::fonts::body();
+			if (!gl_name_font) gl_name_font = ImGui::GetFont();
+			const float gl_name_fs = gl_name_font->FontSize > 0.f ? gl_name_font->FontSize : 16.f;
+			ImFont* gl_chip_font = aida::ui::fonts::caption();
+			if (!gl_chip_font) gl_chip_font = code_font;
+			const float gl_chip_fs = gl_chip_font->FontSize > 0.f ? gl_chip_font->FontSize : 13.f;
 			for (const auto& gl : globals_copy) {
 				if (!detail::filter_matches(filter_lower, gl.name)) continue;
 				ImVec2 cp = ImGui::GetCursorScreenPos();
 				float row_w = ImGui::GetContentRegionAvail().x;
-				float row_h = 22.f;
+				float row_h = 30.f;
 				bool hov = ImGui::IsMouseHoveringRect(cp, ImVec2(cp.x + row_w, cp.y + row_h), true);
 				if (hov) {
 					dl->AddRectFilled(cp, ImVec2(cp.x + row_w, cp.y + row_h),
@@ -1166,26 +1218,31 @@ namespace binary_map_view {
 				char addr_buf[24];
 				std::snprintf(addr_buf, sizeof(addr_buf), "0x%llX",
 					static_cast<unsigned long long>(gl.va));
-				dl->AddText(code_font, 11.f, ImVec2(cp.x + 8.f, cp.y + 5.f),
+				const float gl_code_y = cp.y + (row_h - gl_code_fs) * 0.5f;
+				const float gl_name_y = cp.y + (row_h - gl_name_fs) * 0.5f;
+				dl->AddText(code_font, gl_code_fs, ImVec2(cp.x + 10.f, gl_code_y),
 					aida::ui::with_alpha(t.text_address, a), addr_buf);
-				dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-					12.f, ImVec2(cp.x + 110.f, cp.y + 4.f),
+				dl->AddText(gl_name_font, gl_name_fs,
+					ImVec2(cp.x + 130.f, gl_name_y),
 					aida::ui::with_alpha(t.text_primary, a), gl.name.c_str());
 
 				char chip_buf[16];
 				std::snprintf(chip_buf, sizeof(chip_buf), "x%d", gl.xref_count);
-				ImVec2 sz = code_font->CalcTextSizeA(10.f, FLT_MAX, 0.f, chip_buf);
-				float chip_w = sz.x + 10.f;
-				ImVec2 ca = ImVec2(cp.x + row_w - chip_w - 30.f, cp.y + 5.f);
-				ImVec2 cb = ImVec2(ca.x + chip_w, ca.y + 12.f);
-				dl->AddRectFilled(ca, cb, aida::ui::with_alpha(t.info, a * 0.22f), 6.f);
-				dl->AddText(code_font, 10.f, ImVec2(ca.x + 5.f, ca.y),
+				ImVec2 sz = gl_chip_font->CalcTextSizeA(gl_chip_fs, FLT_MAX, 0.f, chip_buf);
+				float chip_w = sz.x + 14.f;
+				float chip_h = gl_chip_fs + 6.f;
+				ImVec2 ca = ImVec2(cp.x + row_w - chip_w - 44.f, cp.y + (row_h - chip_h) * 0.5f);
+				ImVec2 cb = ImVec2(ca.x + chip_w, ca.y + chip_h);
+				dl->AddRectFilled(ca, cb, aida::ui::with_alpha(t.info, a * 0.22f), chip_h * 0.5f);
+				dl->AddText(gl_chip_font, gl_chip_fs,
+					ImVec2(ca.x + 7.f, ca.y + (chip_h - gl_chip_fs) * 0.5f),
 					aida::ui::with_alpha(t.info, a), chip_buf);
 
 				ImU32 perm_col = gl.writable
 					? aida::ui::with_alpha(t.success, a)
 					: aida::ui::with_alpha(t.text_dim, a);
-				dl->AddText(code_font, 10.f, ImVec2(cp.x + row_w - 22.f, cp.y + 5.f),
+				dl->AddText(gl_chip_font, gl_chip_fs,
+					ImVec2(cp.x + row_w - 30.f, cp.y + (row_h - gl_chip_fs) * 0.5f),
 					perm_col, gl.writable ? "rw" : "ro");
 
 				ImGui::SetCursorScreenPos(cp);
@@ -1253,31 +1310,34 @@ namespace binary_map_view {
 
 				ImVec2 cp = ImGui::GetCursorScreenPos();
 				float row_w = ImGui::GetContentRegionAvail().x;
-				float row_h = 20.f;
+				float row_h = 26.f;
 				bool hov = ImGui::IsMouseHoveringRect(cp, ImVec2(cp.x + row_w, cp.y + row_h), true);
 				ImU32 fill = hov
 					? aida::ui::with_alpha(t.hover_wash, a)
 					: aida::ui::with_alpha(t.panel_bg, a * 0.7f);
 				dl->AddRectFilled(cp, ImVec2(cp.x + row_w, cp.y + row_h), fill, 4.f);
 				ImU32 ar = aida::ui::with_alpha(t.accent_u32, a);
-				float arrow_x = cp.x + 10.f;
+				float arrow_x = cp.x + 12.f;
 				float arrow_y = cp.y + row_h * 0.5f;
 				if (collapsed) {
 					dl->AddTriangleFilled(
-						ImVec2(arrow_x, arrow_y - 3.f),
-						ImVec2(arrow_x + 5.f, arrow_y),
-						ImVec2(arrow_x, arrow_y + 3.f), ar);
+						ImVec2(arrow_x, arrow_y - 4.f),
+						ImVec2(arrow_x + 6.f, arrow_y),
+						ImVec2(arrow_x, arrow_y + 4.f), ar);
 				} else {
 					dl->AddTriangleFilled(
 						ImVec2(arrow_x - 1.f, arrow_y - 2.f),
-						ImVec2(arrow_x + 5.f, arrow_y - 2.f),
-						ImVec2(arrow_x + 2.f, arrow_y + 3.f), ar);
+						ImVec2(arrow_x + 7.f, arrow_y - 2.f),
+						ImVec2(arrow_x + 3.f, arrow_y + 4.f), ar);
 				}
 				char hbuf[200];
 				std::snprintf(hbuf, sizeof(hbuf), "%s  (%d)",
 					dll.c_str(), static_cast<int>(funcs.size()));
-				dl->AddText(aida::ui::fonts::body_em() ? aida::ui::fonts::body_em() : ImGui::GetFont(),
-					12.f, ImVec2(cp.x + 24.f, cp.y + 3.f),
+				ImFont* imp_hdr_font = aida::ui::fonts::body_em();
+				if (!imp_hdr_font) imp_hdr_font = ImGui::GetFont();
+				const float imp_hdr_fs = imp_hdr_font->FontSize > 0.f ? imp_hdr_font->FontSize : 16.f;
+				dl->AddText(imp_hdr_font, imp_hdr_fs,
+					ImVec2(cp.x + 28.f, cp.y + (row_h - imp_hdr_fs) * 0.5f),
 					aida::ui::with_alpha(t.text_primary, a), hbuf);
 
 				ImGui::SetCursorScreenPos(cp);
@@ -1289,13 +1349,16 @@ namespace binary_map_view {
 				ImGui::PopID();
 
 				if (!collapsed) {
+					const float imp_fn_fs = code_font->FontSize > 0.f ? code_font->FontSize : 14.f;
+					const float imp_row_h = imp_fn_fs + 10.f;
 					for (const auto& fn : funcs) {
 						if (!detail::filter_matches(filter_lower, fn) &&
 							!detail::filter_matches(filter_lower, dll)) continue;
 						ImVec2 ip = ImGui::GetCursorScreenPos();
-						dl->AddText(code_font, 11.f, ImVec2(ip.x + 30.f, ip.y + 3.f),
+						dl->AddText(code_font, imp_fn_fs,
+							ImVec2(ip.x + 36.f, ip.y + (imp_row_h - imp_fn_fs) * 0.5f),
 							aida::ui::with_alpha(t.text_secondary, a), fn.c_str());
-						ImGui::Dummy(ImVec2(row_w, row_h - 2.f));
+						ImGui::Dummy(ImVec2(row_w, imp_row_h));
 					}
 				}
 				++imp_idx;
@@ -1304,19 +1367,21 @@ namespace binary_map_view {
 
 		if (draw_section_header("Exports", total_exports, "exports")) {
 			int idx = 0;
+			const float exp_fs = code_font->FontSize > 0.f ? code_font->FontSize : 14.f;
+			const float exp_row_h = exp_fs + 10.f;
 			for (const auto& ex : exports_copy) {
 				if (!detail::filter_matches(filter_lower, ex)) continue;
 				ImVec2 cp = ImGui::GetCursorScreenPos();
 				float row_w = ImGui::GetContentRegionAvail().x;
-				float row_h = 18.f;
-				bool hov = ImGui::IsMouseHoveringRect(cp, ImVec2(cp.x + row_w, cp.y + row_h), true);
+				bool hov = ImGui::IsMouseHoveringRect(cp, ImVec2(cp.x + row_w, cp.y + exp_row_h), true);
 				if (hov) {
-					dl->AddRectFilled(cp, ImVec2(cp.x + row_w, cp.y + row_h),
+					dl->AddRectFilled(cp, ImVec2(cp.x + row_w, cp.y + exp_row_h),
 						aida::ui::with_alpha(t.hover_wash, a), 3.f);
 				}
-				dl->AddText(code_font, 11.f, ImVec2(cp.x + 14.f, cp.y + 2.f),
+				dl->AddText(code_font, exp_fs,
+					ImVec2(cp.x + 18.f, cp.y + (exp_row_h - exp_fs) * 0.5f),
 					aida::ui::with_alpha(t.text_primary, a), ex.c_str());
-				ImGui::Dummy(ImVec2(row_w, row_h));
+				ImGui::Dummy(ImVec2(row_w, exp_row_h));
 				++idx;
 			}
 		}

@@ -268,6 +268,115 @@ inline std::string resolve_symbol_exact(uint64_t address)
 	return {};
 }
 
+inline uint64_t resolve_name_to_addr(const std::string& input)
+{
+	if (input.empty())
+		return 0;
+
+	std::string trimmed = input;
+	while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\t'))
+		trimmed.erase(trimmed.begin());
+	while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\t'))
+		trimmed.pop_back();
+	if (trimmed.empty())
+		return 0;
+
+	std::string mod_filter;
+	std::string name = trimmed;
+	auto bang = trimmed.find('!');
+	if (bang != std::string::npos) {
+		mod_filter = trimmed.substr(0, bang);
+		name = trimmed.substr(bang + 1);
+	}
+
+	int64_t extra_offset = 0;
+	auto plus = name.rfind('+');
+	if (plus != std::string::npos && plus > 0) {
+		std::string off_str = name.substr(plus + 1);
+		std::string base_name = name.substr(0, plus);
+		if (!off_str.empty()) {
+			uint64_t off_val = 0;
+			const char* off_cstr = off_str.c_str();
+			if (off_str.size() > 2 && off_str[0] == '0' && (off_str[1] == 'x' || off_str[1] == 'X'))
+				off_cstr = off_str.c_str() + 2;
+			char* end = nullptr;
+			off_val = std::strtoull(off_cstr, &end, 16);
+			if (end && *end == '\0') {
+				extra_offset = static_cast<int64_t>(off_val);
+				name = base_name;
+			}
+		}
+	}
+
+	if (name.empty())
+		return 0;
+
+	auto eq_ci = [](const std::string& a, const std::string& b) {
+		if (a.size() != b.size()) return false;
+		for (size_t i = 0; i < a.size(); ++i) {
+			char ca = a[i];
+			char cb = b[i];
+			if (ca >= 'A' && ca <= 'Z') ca = static_cast<char>(ca - 'A' + 'a');
+			if (cb >= 'A' && cb <= 'Z') cb = static_cast<char>(cb - 'A' + 'a');
+			if (ca != cb) return false;
+		}
+		return true;
+	};
+
+	if (name.size() > 4) {
+		bool prefix_match = (name[0] == 's' || name[0] == 'S')
+			&& (name[1] == 'u' || name[1] == 'U')
+			&& (name[2] == 'b' || name[2] == 'B')
+			&& name[3] == '_';
+		if (prefix_match) {
+			std::string hex_part = name.substr(4);
+			if (!hex_part.empty()) {
+				char* end = nullptr;
+				uint64_t addr = std::strtoull(hex_part.c_str(), &end, 16);
+				if (end && *end == '\0' && addr != 0)
+					return addr + static_cast<uint64_t>(extra_offset);
+			}
+		}
+	}
+
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+
+	for (auto& [mod_name, ms] : g_state.modules) {
+		if (!ms.pdb.loaded) continue;
+		if (!mod_filter.empty()) {
+			std::string mod_no_ext = mod_name;
+			auto dot = mod_no_ext.rfind('.');
+			if (dot != std::string::npos) mod_no_ext = mod_no_ext.substr(0, dot);
+			if (!eq_ci(mod_filter, mod_name) && !eq_ci(mod_filter, mod_no_ext))
+				continue;
+		}
+
+		auto it = ms.pdb.symbol_by_name.find(name);
+		if (it != ms.pdb.symbol_by_name.end()) {
+			uint64_t rva = ms.pdb.symbols[it->second].rva;
+			return ms.base + rva + static_cast<uint64_t>(extra_offset);
+		}
+	}
+
+	for (auto& [mod_name, ms] : g_state.modules) {
+		if (!ms.pdb.loaded) continue;
+		if (!mod_filter.empty()) {
+			std::string mod_no_ext = mod_name;
+			auto dot = mod_no_ext.rfind('.');
+			if (dot != std::string::npos) mod_no_ext = mod_no_ext.substr(0, dot);
+			if (!eq_ci(mod_filter, mod_name) && !eq_ci(mod_filter, mod_no_ext))
+				continue;
+		}
+
+		for (auto& sym : ms.pdb.symbols) {
+			if (eq_ci(sym.name, name))
+				return ms.base + sym.rva + static_cast<uint64_t>(extra_offset);
+		}
+	}
+
+	return 0;
+}
+
 inline const pdb_parser::struct_def_t* find_struct(const std::string& name)
 {
 	std::lock_guard<std::mutex> lk(g_state.mutex);

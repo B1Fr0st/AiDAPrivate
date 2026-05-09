@@ -666,7 +666,36 @@ namespace auth_view {
 			}
 			auto& hov_state = g_state.row_hover[idx];
 
-			const float row_h = 72.f;
+			const float left_pad = 16.f;
+			const float avatar_radius = 22.f;
+			const float text_offset_x = left_pad + avatar_radius * 2.f + 16.f;
+			const float right_pad = 14.f;
+
+			row_status_t status = compute_status(def);
+
+			float ctrl_w_full = 0.f;
+			if (def.is_oauth) {
+				if (status.logged_in || status.expired) {
+					ctrl_w_full = 100.f + 8.f + 92.f;
+				} else {
+					ctrl_w_full = 188.f;
+				}
+			} else {
+				const float api_input_pref = 188.f;
+				const float api_check_w = 24.f;
+				const float api_save_w = 64.f;
+				const float api_clear_w = status.logged_in ? (6.f + 72.f) : 0.f;
+				ctrl_w_full = api_input_pref + 6.f + api_check_w + 8.f + api_save_w + api_clear_w;
+			}
+
+			const float ctrl_w_min = def.is_oauth
+				? ((status.logged_in || status.expired) ? 200.f : 188.f)
+				: 220.f;
+			const float text_min_room = 220.f;
+			const bool stack_layout = (row_w - text_offset_x - right_pad - 12.f - text_min_room) < ctrl_w_min;
+
+			const float row_h = stack_layout ? 124.f : 72.f;
+
 			ImVec2 origin = ImGui::GetCursorScreenPos();
 			ImDrawList* dl = ImGui::GetWindowDrawList();
 
@@ -692,10 +721,8 @@ namespace auth_view {
 			ImU32 border = aida::ui::mix(th.border_subtle, th.accent_dim, hov * 0.55f);
 			dl->AddRect(a, b, border, 10.f, 0, 1.f);
 
-			float left_pad = 16.f;
-			float avatar_radius = 22.f;
 			float avatar_cx = a.x + left_pad + avatar_radius;
-			float avatar_cy = a.y + row_h * 0.5f;
+			float avatar_cy = stack_layout ? (a.y + 12.f + avatar_radius) : (a.y + row_h * 0.5f);
 
 			render_provider_avatar(dl, ImVec2(avatar_cx, avatar_cy), avatar_radius, def, 1.f);
 
@@ -706,8 +733,8 @@ namespace auth_view {
 			ImFont* f_body = aida::ui::fonts::body();
 			ImFont* f_caption = aida::ui::fonts::caption();
 			float fs_title = 14.f;
-			float fs_sub = 12.f;
-			float fs_detail = 11.f;
+			float fs_sub = 14.f;
+			float fs_detail = 13.f;
 
 			dl->AddText(f_strong, fs_title, ImVec2(text_x, text_y),
 				th.text_primary, def.display_name);
@@ -716,9 +743,9 @@ namespace auth_view {
 			dl->AddText(f_body, fs_sub, ImVec2(text_x, text_y + sub_size.y + 4.f),
 				th.text_secondary, def.subtitle);
 
-			row_status_t status = compute_status(def);
-
-			float pill_y = a.y + row_h - 26.f;
+			float pill_y = stack_layout
+				? (a.y + 12.f + avatar_radius * 2.f + 6.f)
+				: (a.y + row_h - 26.f);
 			ImGui::SetCursorScreenPos(ImVec2(text_x, pill_y));
 			aida::ui::pill_kind(status.pill_text.c_str(), status.pill_kind,
 				aida::ui::size_t_::sm, true);
@@ -731,16 +758,34 @@ namespace auth_view {
 					th.text_dim, status.detail_text.c_str());
 			}
 
-			float ctrl_w = 360.f;
-			float ctrl_x = a.x + row_w - ctrl_w - 14.f;
-			float ctrl_y = a.y + (row_h - 32.f) * 0.5f;
+			float ctrl_x;
+			float ctrl_y;
+			float ctrl_avail;
+			if (stack_layout) {
+				ctrl_x = a.x + left_pad;
+				ctrl_y = pill_y + 26.f;
+				ctrl_avail = row_w - left_pad - right_pad;
+			} else {
+				ctrl_x = a.x + row_w - ctrl_w_full - right_pad;
+				ctrl_y = a.y + (row_h - 32.f) * 0.5f;
+				ctrl_avail = ctrl_w_full;
+			}
+
 			ImGui::SetCursorScreenPos(ImVec2(ctrl_x, ctrl_y));
 
 			if (def.is_oauth) {
 				if (status.logged_in || status.expired) {
-					ImGui::SetCursorScreenPos(ImVec2(ctrl_x + ctrl_w - 92.f - 8.f - 100.f, ctrl_y));
+					float refresh_w = 100.f;
+					float signout_w = 92.f;
+					float gap = 8.f;
+					if (refresh_w + gap + signout_w > ctrl_avail) {
+						float total = ctrl_avail - gap;
+						refresh_w = (total > 0.f) ? (total * 0.5f) : 100.f;
+						signout_w = (total > 0.f) ? (total * 0.5f) : 92.f;
+					}
+					ImGui::SetCursorScreenPos(ImVec2(ctrl_x, ctrl_y));
 					if (aida::ui::button("Refresh", aida::ui::button_kind_t::secondary,
-							aida::ui::size_t_::md, ImVec2(100.f, 32.f))) {
+							aida::ui::size_t_::md, ImVec2(refresh_w, 32.f))) {
 						if (refresh_token_for(def.kind)) {
 							toast_notification::push(std::string(def.display_name) + " token refreshed",
 								toast_notification::toast_type_t::info, 3.5f);
@@ -753,9 +798,9 @@ namespace auth_view {
 						}
 					}
 
-					ImGui::SetCursorScreenPos(ImVec2(ctrl_x + ctrl_w - 92.f, ctrl_y));
+					ImGui::SetCursorScreenPos(ImVec2(ctrl_x + refresh_w + gap, ctrl_y));
 					if (aida::ui::button("Sign out", aida::ui::button_kind_t::destructive,
-							aida::ui::size_t_::md, ImVec2(92.f, 32.f))) {
+							aida::ui::size_t_::md, ImVec2(signout_w, 32.f))) {
 						clear_credentials(def, true, false);
 					}
 				} else {
@@ -765,9 +810,10 @@ namespace auth_view {
 						|| (def.kind == row_kind_t::oauth_copilot && g_state.copilot_modal_open.load());
 					const char* label = busy ? "Signing in" : "Sign in";
 
-					ImGui::SetCursorScreenPos(ImVec2(ctrl_x + ctrl_w - 188.f, ctrl_y));
+					float signin_w = (ctrl_avail < 188.f) ? ctrl_avail : 188.f;
+					ImGui::SetCursorScreenPos(ImVec2(ctrl_x, ctrl_y));
 					if (aida::ui::button(label, aida::ui::button_kind_t::primary,
-							aida::ui::size_t_::md, ImVec2(188.f, 32.f),
+							aida::ui::size_t_::md, ImVec2(signin_w, 32.f),
 							busy, nullptr, busy) && !busy) {
 						if (def.kind == row_kind_t::oauth_claude_code) start_claude_code_login();
 						else if (def.kind == row_kind_t::oauth_codex)  start_codex_login();
@@ -778,7 +824,18 @@ namespace auth_view {
 				int b_idx = row_index(def.kind);
 				if (b_idx < 0 || b_idx >= 5) b_idx = 0;
 
-				float input_w = 188.f;
+				float check_w = 24.f;
+				float save_w = 64.f;
+				float clear_w = status.logged_in ? 72.f : 0.f;
+				float gap_input_check = 6.f;
+				float gap_check_save = 8.f;
+				float gap_save_clear = status.logged_in ? 6.f : 0.f;
+				float reserved = check_w + save_w + clear_w
+					+ gap_input_check + gap_check_save + gap_save_clear;
+				float input_w = ctrl_avail - reserved;
+				if (input_w > 188.f) input_w = 188.f;
+				if (input_w < 96.f) input_w = 96.f;
+
 				ImGui::SetCursorScreenPos(ImVec2(ctrl_x, ctrl_y));
 				ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(th.panel_header));
 				ImGui::SetNextItemWidth(input_w);
@@ -790,15 +847,15 @@ namespace auth_view {
 					sizeof(g_state.api_key_buf[b_idx]), flags);
 				ImGui::PopStyleColor();
 
-				ImGui::SameLine(0.f, 6.f);
+				ImGui::SameLine(0.f, gap_input_check);
 				ImGui::Checkbox("##show", &g_state.api_key_show[b_idx]);
 				if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reveal key");
 
-				ImGui::SameLine(0.f, 8.f);
+				ImGui::SameLine(0.f, gap_check_save);
 				ImVec2 save_pos = ImGui::GetCursorScreenPos();
 				ImGui::SetCursorScreenPos(save_pos);
 				if (aida::ui::button("Save", aida::ui::button_kind_t::primary,
-						aida::ui::size_t_::md, ImVec2(64.f, 32.f))) {
+						aida::ui::size_t_::md, ImVec2(save_w, 32.f))) {
 					std::string k = g_state.api_key_buf[b_idx];
 					if (!k.empty()) {
 						save_api_key(def, k);
@@ -807,11 +864,11 @@ namespace auth_view {
 					}
 				}
 				if (status.logged_in) {
-					ImGui::SameLine(0.f, 6.f);
+					ImGui::SameLine(0.f, gap_save_clear);
 					ImVec2 clr_pos = ImGui::GetCursorScreenPos();
 					ImGui::SetCursorScreenPos(clr_pos);
 					if (aida::ui::button("Clear", aida::ui::button_kind_t::destructive,
-							aida::ui::size_t_::md, ImVec2(72.f, 32.f))) {
+							aida::ui::size_t_::md, ImVec2(clear_w, 32.f))) {
 						clear_credentials(def, false, true);
 					}
 				}
@@ -964,7 +1021,7 @@ namespace auth_view {
 			dl->AddText(f_h2, 15.f,
 				ImVec2(glyph_x + glyph_r * 2.f + 12.f, glyph_y + 4.f),
 				th.text_primary, title);
-			dl->AddText(f_caption, 11.f,
+			dl->AddText(f_caption, 13.f,
 				ImVec2(glyph_x + glyph_r * 2.f + 12.f, glyph_y + 22.f),
 				th.text_dim, "Custom OAuth client");
 
@@ -1113,15 +1170,14 @@ namespace auth_view {
 				} else if (is_active) {
 					ImU32 grad_top = aida::ui::with_alpha(accent_top, alpha * pulse);
 					ImU32 grad_bot = aida::ui::with_alpha(accent_bot, alpha * pulse);
-					fdl->AddRectFilledMultiColor(ca, cb, grad_top, grad_top, grad_bot, grad_bot);
+					ImU32 grad_flat = aida::ui::mix(grad_top, grad_bot, 0.5f);
+					fdl->AddRectFilled(ca, cb, grad_flat, chip_h * 0.5f);
 					border = aida::ui::with_alpha(th.accent_hover, alpha);
 					text_col = aida::ui::with_alpha(IM_COL32(255, 255, 255, 250), alpha);
 				}
 
 				if (!is_active || is_done) {
 					fdl->AddRectFilled(ca, cb, fill, chip_h * 0.5f);
-				} else {
-					fdl->AddRectFilled(ca, cb, IM_COL32(0, 0, 0, 0), chip_h * 0.5f);
 				}
 				fdl->AddRect(ca, cb, border, chip_h * 0.5f, 0, 1.f);
 
@@ -1289,7 +1345,10 @@ namespace auth_view {
 					break;
 			}
 
-			fdl->AddRectFilledMultiColor(a, b, fill_top, fill_top, fill_bot, fill_bot);
+			{
+				ImU32 fill_flat = aida::ui::mix(fill_top, fill_bot, 0.5f);
+				fdl->AddRectFilled(a, b, fill_flat, 8.f);
+			}
 			fdl->AddRect(a, b, border, 8.f, 0, 1.f);
 
 			if (hov) {
@@ -1326,7 +1385,7 @@ namespace auth_view {
 				ImVec2(glyph_cx + glyph_r + 14.f, glyph_cy - 13.f),
 				aida::ui::with_alpha(th.text_primary, alpha), title);
 
-			fdl->AddText(f_caption, 11.f,
+			fdl->AddText(f_caption, 13.f,
 				ImVec2(glyph_cx + glyph_r + 14.f, glyph_cy + 4.f),
 				aida::ui::with_alpha(th.text_dim, alpha), def.subtitle);
 		}
@@ -1612,10 +1671,11 @@ namespace auth_view {
 
 				ImU32 fill_top = aida::ui::with_alpha(th.accent_grad_top, sl.alpha);
 				ImU32 fill_bot = aida::ui::with_alpha(th.accent_grad_bot, sl.alpha);
-				fdl->AddRectFilledMultiColor(
+				ImU32 fill_flat = aida::ui::mix(fill_top, fill_bot, 0.5f);
+				fdl->AddRectFilled(
 					ImVec2(chip_x, chip_y_code),
 					ImVec2(chip_x + chip_w, chip_y_code + chip_h),
-					fill_top, fill_top, fill_bot, fill_bot);
+					fill_flat, 10.f);
 				fdl->AddRect(
 					ImVec2(chip_x, chip_y_code),
 					ImVec2(chip_x + chip_w, chip_y_code + chip_h),
@@ -1640,7 +1700,7 @@ namespace auth_view {
 					aida::ui::with_alpha(IM_COL32(255, 255, 255, 120), sl.alpha), 6.f, 0, 1.f);
 				ImFont* f_em = aida::ui::fonts::body_em();
 				ImVec2 cs = f_em->CalcTextSizeA(12.f, FLT_MAX, 0.f, "Copy");
-				fdl->AddText(f_em, 12.f,
+				fdl->AddText(f_em, 14.f,
 					ImVec2(copy_x + (copy_w - cs.x) * 0.5f, copy_y + (copy_h - cs.y) * 0.5f),
 					aida::ui::with_alpha(IM_COL32(255, 255, 255, 250), sl.alpha), "Copy");
 

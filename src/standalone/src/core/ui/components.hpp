@@ -70,27 +70,27 @@ namespace aida::ui::components {
 
 		inline ImVec2 sz_pad(size_t_ s) {
 			switch (s) {
-				case size_t_::sm: return ImVec2(10.f, 5.f);
-				case size_t_::md: return ImVec2(14.f, 8.f);
-				case size_t_::lg: return ImVec2(18.f, 12.f);
+				case size_t_::sm: return ImVec2(12.f, 7.f);
+				case size_t_::md: return ImVec2(16.f, 10.f);
+				case size_t_::lg: return ImVec2(20.f, 14.f);
 			}
-			return ImVec2(14.f, 8.f);
+			return ImVec2(16.f, 10.f);
 		}
 		inline float sz_font(size_t_ s) {
 			switch (s) {
-				case size_t_::sm: return 12.f;
-				case size_t_::md: return 13.f;
-				case size_t_::lg: return 15.f;
+				case size_t_::sm: return 14.f;
+				case size_t_::md: return 15.f;
+				case size_t_::lg: return 17.f;
 			}
-			return 13.f;
+			return 15.f;
 		}
 		inline float sz_height(size_t_ s) {
 			switch (s) {
-				case size_t_::sm: return 24.f;
-				case size_t_::md: return 32.f;
-				case size_t_::lg: return 40.f;
+				case size_t_::sm: return 28.f;
+				case size_t_::md: return 34.f;
+				case size_t_::lg: return 42.f;
 			}
-			return 32.f;
+			return 34.f;
 		}
 	}
 
@@ -162,23 +162,18 @@ namespace aida::ui::components {
 				border = aida::ui::with_alpha(t.error, 0.55f);
 				text_col = t.error;
 				break;
-			case button_kind_t::accent_gradient:
-				dl->AddRectFilledMultiColor(ca, cb,
-					aida::ui::with_alpha(t.accent_grad_top, alpha),
-					aida::ui::with_alpha(t.accent_grad_top, alpha),
-					aida::ui::with_alpha(t.accent_grad_bot, alpha),
-					aida::ui::with_alpha(t.accent_grad_bot, alpha));
+			case button_kind_t::accent_gradient: {
+				ImU32 grad_flat = aida::ui::mix(t.accent_grad_top, t.accent_grad_bot, 0.5f);
+				dl->AddRectFilled(ca, cb, aida::ui::with_alpha(grad_flat, alpha), radius);
 				break;
+			}
 		}
 
 		if (kind != button_kind_t::accent_gradient) {
 			ImU32 hover_blend_top = aida::ui::mix(fill, hover_top, hov * 0.55f);
 			ImU32 hover_blend_bot = aida::ui::mix(fill, hover_bot, hov * 0.55f);
-			dl->AddRectFilledMultiColor(ca, cb,
-				aida::ui::with_alpha(hover_blend_top, alpha),
-				aida::ui::with_alpha(hover_blend_top, alpha),
-				aida::ui::with_alpha(hover_blend_bot, alpha),
-				aida::ui::with_alpha(hover_blend_bot, alpha));
+			ImU32 fill_flat = aida::ui::mix(hover_blend_top, hover_blend_bot, 0.5f);
+			dl->AddRectFilled(ca, cb, aida::ui::with_alpha(fill_flat, alpha), radius);
 		}
 
 		dl->AddRect(ca, cb, aida::ui::with_alpha(border, alpha * (1.f + hov * 0.5f)), radius, 0, 1.f);
@@ -224,8 +219,8 @@ namespace aida::ui::components {
 	                  bool leading_dot = true) {
 		ImFont* font = ImGui::GetFont();
 		float fs = detail::sz_font(size);
-		float pad_x = size == size_t_::sm ? 8.f : 10.f;
-		float h     = size == size_t_::sm ? 18.f : 22.f;
+		float pad_x = size == size_t_::sm ? 10.f : 12.f;
+		float h     = size == size_t_::sm ? 22.f : 26.f;
 
 		float text_w = detail::calc_display_text_width(font, fs, label);
 		float dot_w = leading_dot ? 10.f : 0.f;
@@ -278,9 +273,9 @@ namespace aida::ui::components {
 
 	inline void badge(const char* label, ImU32 color, float radius = 4.f) {
 		ImFont* font = ImGui::GetFont();
-		float fs = 11.f;
-		float pad_x = 6.f;
-		float h = 16.f;
+		float fs = 13.f;
+		float pad_x = 8.f;
+		float h = 20.f;
 		float text_w = detail::calc_display_text_width(font, fs, label);
 		float w = text_w + pad_x * 2.f;
 		ImVec2 pos = ImGui::GetCursorScreenPos();
@@ -300,9 +295,9 @@ namespace aida::ui::components {
 
 	inline bool chip(const char* label, ImU32 color, bool removable = false, bool* removed = nullptr) {
 		ImFont* font = ImGui::GetFont();
-		float fs = 12.f;
-		float pad_x = 8.f;
-		float h = 20.f;
+		float fs = 14.f;
+		float pad_x = 10.f;
+		float h = 26.f;
 		float text_w = detail::calc_display_text_width(font, fs, label);
 		float remove_w = removable ? 14.f : 0.f;
 		float w = text_w + remove_w + pad_x * 2.f;
@@ -349,7 +344,7 @@ namespace aida::ui::components {
 	                        const char* placeholder = nullptr,
 	                        bool password = false, ImVec2 size = ImVec2(0.f, 0.f)) {
 		const auto& t = aida::ui::resolved();
-		float h = size.y > 0.f ? size.y : 32.f;
+		float h = size.y > 0.f ? size.y : 36.f;
 		float w = size.x > 0.f ? size.x : ImGui::GetContentRegionAvail().x;
 
 		ImGui::PushID(label);
@@ -396,11 +391,11 @@ namespace aida::ui::components {
 	                            const char* action_label = nullptr, bool* action_clicked = nullptr) {
 		const auto& t = aida::ui::resolved();
 		ImFont* font = ImGui::GetFont();
-		float fs = 13.f;
+		float fs = 15.f;
 
 		ImVec2 pos = ImGui::GetCursorScreenPos();
 		float w = ImGui::GetContentRegionAvail().x;
-		float h = 26.f;
+		float h = 32.f;
 
 		ImDrawList* dl = ImGui::GetWindowDrawList();
 		ImVec2 a = pos;
@@ -443,9 +438,9 @@ namespace aida::ui::components {
 	inline bool toggle_switch(const char* label, bool* state, size_t_ size = size_t_::sm) {
 		if (!state) return false;
 		const auto& t = aida::ui::resolved();
-		float track_w = size == size_t_::sm ? 30.f : 38.f;
-		float track_h = size == size_t_::sm ? 16.f : 20.f;
-		float fs = size == size_t_::sm ? 12.f : 13.f;
+		float track_w = size == size_t_::sm ? 36.f : 44.f;
+		float track_h = size == size_t_::sm ? 20.f : 24.f;
+		float fs = size == size_t_::sm ? 14.f : 15.f;
 		ImFont* font = ImGui::GetFont();
 
 		const char* disp_end = detail::display_end(label);
@@ -642,9 +637,9 @@ namespace aida::ui::components {
 	inline void kbd_chip(const char* label) {
 		const auto& t = aida::ui::resolved();
 		ImFont* font = ImGui::GetFont();
-		float fs = 11.f;
-		float pad_x = 6.f;
-		float pad_y = 2.f;
+		float fs = 13.f;
+		float pad_x = 8.f;
+		float pad_y = 3.f;
 		float text_w = detail::calc_display_text_width(font, fs, label);
 		float w = text_w + pad_x * 2.f;
 		float h = fs + pad_y * 2.f + 2.f;

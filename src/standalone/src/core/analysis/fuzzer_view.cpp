@@ -151,7 +151,7 @@ void render(float pos_x, float pos_y, float width, float height,
 	bool running = fz.running.load();
 	if (!running) {
 		if (aida::ui::button("Start Fuzzing", aida::ui::button_kind_t::primary,
-			aida::ui::size_t_::sm, ImVec2(112.f, 22.f))) {
+			aida::ui::size_t_::sm, ImVec2(112.f, 28.f))) {
 			auto& cfg = fz.config;
 			if (fz.addr_input[0]) cfg.target_address = std::strtoull(fz.addr_input, nullptr, 16);
 			if (fz.end_addr_input[0]) cfg.end_address = std::strtoull(fz.end_addr_input, nullptr, 16);
@@ -164,18 +164,18 @@ void render(float pos_x, float pos_y, float width, float height,
 		}
 	} else {
 		if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive,
-			aida::ui::size_t_::sm, ImVec2(86.f, 22.f))) {
+			aida::ui::size_t_::sm, ImVec2(86.f, 28.f))) {
 			fuzzer_engine::stop_fuzzing();
 		}
 	}
 	ImGui::SameLine();
 	if (aida::ui::button("Export", aida::ui::button_kind_t::ghost,
-		aida::ui::size_t_::sm, ImVec2(78.f, 22.f))) {
+		aida::ui::size_t_::sm, ImVec2(78.f, 28.f))) {
 		fuzzer_engine::export_crashes();
 	}
 	ImGui::SameLine();
 	if (aida::ui::button("Import", aida::ui::button_kind_t::ghost,
-		aida::ui::size_t_::sm, ImVec2(78.f, 22.f))) {
+		aida::ui::size_t_::sm, ImVec2(78.f, 28.f))) {
 		fuzzer_engine::import_crashes();
 	}
 
@@ -230,7 +230,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		ImFont* cap_f = aida::ui::fonts::caption();
 		if (!cap_f) cap_f = ImGui::GetFont();
 		ImVec2 lbl_ts = cap_f->CalcTextSizeA(10.f, FLT_MAX, 0.f, "STATUS");
-		dl->AddText(cap_f, 10.f,
+		dl->AddText(cap_f, 12.f,
 			ImVec2(sp_b.x - 124.f - lbl_ts.x - 6.f, sp_a.y + 8.f),
 			aida::ui::with_alpha(th.text_dim, alpha), "STATUS");
 		ImGui::SetCursorScreenPos(ImVec2(sp_b.x - 124.f, sp_a.y + 6.f));
@@ -240,7 +240,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		ImFont* cap_f = aida::ui::fonts::caption();
 		if (!cap_f) cap_f = ImGui::GetFont();
 		ImVec2 lbl_ts = cap_f->CalcTextSizeA(10.f, FLT_MAX, 0.f, "STATUS");
-		dl->AddText(cap_f, 10.f,
+		dl->AddText(cap_f, 12.f,
 			ImVec2(sp_b.x - 100.f - lbl_ts.x - 6.f, sp_a.y + 8.f),
 			aida::ui::with_alpha(th.text_dim, alpha), "STATUS");
 		ImGui::SetCursorScreenPos(ImVec2(sp_b.x - 100.f, sp_a.y + 6.f));
@@ -307,7 +307,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		ImVec2 bb = ImVec2(bx + box_w, by + box_h);
 		dl->AddRectFilled(ba, bb, aida::ui::with_alpha(th.panel_header, alpha * 0.55f), 6.f);
 		dl->AddRect(ba, bb, aida::ui::with_alpha(th.border_subtle, alpha), 6.f, 0, 1.f);
-		dl->AddText(lbl_font, 10.f, ImVec2(bx + 10.f, by + 8.f),
+		dl->AddText(lbl_font, 12.f, ImVec2(bx + 10.f, by + 8.f),
 			aida::ui::with_alpha(th.text_dim, alpha), boxes[i].label);
 		dl->AddText(num_font, 22.f, ImVec2(bx + 10.f, by + 22.f), boxes[i].color, boxes[i].value.c_str());
 	}
@@ -328,7 +328,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			aida::ui::with_alpha(th.border_subtle, alpha * 0.6f));
 	}
 
-	dl->AddText(lbl_font, 10.f, ImVec2(gx + 6.f, graph_y + 4.f),
+	dl->AddText(lbl_font, 12.f, ImVec2(gx + 6.f, graph_y + 4.f),
 		aida::ui::with_alpha(th.text_dim, alpha), "exec/s");
 
 	if (rate_history.size() >= 2) {
@@ -388,7 +388,7 @@ void render(float pos_x, float pos_y, float width, float height,
 				dl->AddRectFilled(ImVec2(tx - 6.f, hy - tsz.y - 8.f),
 					ImVec2(tx + tsz.x + 6.f, hy - 2.f),
 					aida::ui::with_alpha(th.bg_overlay, alpha), 4.f);
-				dl->AddText(ImGui::GetFont(), 11.f, ImVec2(tx, hy - tsz.y - 6.f),
+				dl->AddText(ImGui::GetFont(), 13.f, ImVec2(tx, hy - tsz.y - 6.f),
 					aida::ui::with_alpha(th.text_primary, alpha), tip);
 			}
 		}
@@ -442,12 +442,12 @@ void render(float pos_x, float pos_y, float width, float height,
 		ImFont* lbl = aida::ui::fonts::caption();
 		if (!lbl) lbl = ImGui::GetFont();
 		ImVec2 sz = lbl->CalcTextSizeA(10.f, FLT_MAX, 0.f, g_strategy_names[i]);
-		dl->AddText(lbl, 10.f, ImVec2(bx + (bar_w - sz.x) * 0.5f, by + bh + 2.f),
+		dl->AddText(lbl, 12.f, ImVec2(bx + (bar_w - sz.x) * 0.5f, by + bh + 2.f),
 			aida::ui::with_alpha(th.text_dim, alpha), g_strategy_names[i]);
 		char nv[8];
 		std::snprintf(nv, sizeof(nv), "%d", st.strategy_count_unique[i]);
 		ImVec2 vsz = lbl->CalcTextSizeA(10.f, FLT_MAX, 0.f, nv);
-		dl->AddText(lbl, 10.f,
+		dl->AddText(lbl, 12.f,
 			ImVec2(bx + (bar_w - vsz.x) * 0.5f, by + bh - fill_h - 12.f),
 			aida::ui::with_alpha(th.text_primary, alpha), nv);
 	}
@@ -502,7 +502,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		aida::ui::with_alpha(th.text_primary, alpha), "Unique Crashes");
 	cy += 22.f;
 
-	const float row_h = 24.f;
+	const float row_h = 28.f;
 	const float pad = 12.f;
 	const float col_idx_w = 36.f;
 	const float col_score_w = 78.f;
@@ -518,17 +518,17 @@ void render(float pos_x, float pos_y, float width, float height,
 			aida::ui::with_alpha(th.border_subtle, alpha));
 		float hx = ox + 16.f;
 		ImU32 hc = aida::ui::with_alpha(th.text_secondary, alpha);
-		dl->AddText(head_em, 11.f, ImVec2(hx, cy + 6.f), hc, "#");
+		dl->AddText(head_em, 13.f, ImVec2(hx, cy + 7.f), hc, "#");
 		hx += col_idx_w;
-		dl->AddText(head_em, 11.f, ImVec2(hx, cy + 6.f), hc, "Score");
+		dl->AddText(head_em, 13.f, ImVec2(hx, cy + 7.f), hc, "Score");
 		hx += col_score_w;
-		dl->AddText(head_em, 11.f, ImVec2(hx, cy + 6.f), hc, "Type");
+		dl->AddText(head_em, 13.f, ImVec2(hx, cy + 7.f), hc, "Type");
 		hx += col_type_w;
-		dl->AddText(head_em, 11.f, ImVec2(hx, cy + 6.f), hc, "Address");
+		dl->AddText(head_em, 13.f, ImVec2(hx, cy + 7.f), hc, "Address");
 		hx += col_addr_w;
-		dl->AddText(head_em, 11.f, ImVec2(hx, cy + 6.f), hc, "Instruction");
+		dl->AddText(head_em, 13.f, ImVec2(hx, cy + 7.f), hc, "Instruction");
 		hx += col_inst_w;
-		dl->AddText(head_em, 11.f, ImVec2(hx, cy + 6.f), hc, "Description");
+		dl->AddText(head_em, 13.f, ImVec2(hx, cy + 7.f), hc, "Description");
 	}
 	cy += row_h + 2.f;
 
@@ -612,7 +612,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
 		char idx_buf[8];
 		std::snprintf(idx_buf, sizeof(idx_buf), "#%d", i + 1);
-		dl->AddText(code_font, 11.f, ImVec2(rx, ry + 6.f),
+		dl->AddText(code_font, 13.f, ImVec2(rx, ry + 7.f),
 			aida::ui::with_alpha(th.text_dim, alpha * entrance), idx_buf);
 		rx += col_idx_w;
 
@@ -631,7 +631,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		}
 		rx += col_score_w;
 
-		dl->AddText(code_font, 11.f, ImVec2(rx, ry + 6.f),
+		dl->AddText(code_font, 13.f, ImVec2(rx, ry + 7.f),
 			aida::ui::with_alpha(th.error, alpha * entrance),
 			fuzzer_engine::crash_type_name(crash.type));
 		rx += col_type_w;
@@ -639,14 +639,14 @@ void render(float pos_x, float pos_y, float width, float height,
 		char addr_buf[32];
 		std::snprintf(addr_buf, sizeof(addr_buf), "0x%llX",
 			static_cast<unsigned long long>(crash.instruction_address));
-		dl->AddText(code_font, 11.f, ImVec2(rx, ry + 6.f),
+		dl->AddText(code_font, 13.f, ImVec2(rx, ry + 7.f),
 			aida::ui::with_alpha(th.text_address, alpha * entrance), addr_buf);
 		rx += col_addr_w;
 
 		if (!crash.crashing_instruction.empty()) {
 			std::string trim = crash.crashing_instruction;
 			if (trim.size() > 30) trim = trim.substr(0, 28) + "..";
-			dl->AddText(code_font, 11.f, ImVec2(rx, ry + 6.f),
+			dl->AddText(code_font, 13.f, ImVec2(rx, ry + 7.f),
 				aida::ui::with_alpha(th.text_dim, alpha * entrance), trim.c_str());
 		}
 		rx += col_inst_w;
@@ -709,7 +709,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		if (!sel.crashing_instruction.empty()) {
 			std::snprintf(detail_buf, sizeof(detail_buf), "Instruction   %s",
 				sel.crashing_instruction.c_str());
-			dl->AddText(code_font, 11.f, ImVec2(dx_inner, dy_inner),
+			dl->AddText(code_font, 13.f, ImVec2(dx_inner, dy_inner),
 				aida::ui::with_alpha(th.text_primary, detail_alpha), detail_buf);
 			dy_inner += 16.f;
 		}
@@ -717,7 +717,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		std::snprintf(detail_buf, sizeof(detail_buf), "Fault 0x%llX   RIP 0x%llX",
 			static_cast<unsigned long long>(sel.fault_address),
 			static_cast<unsigned long long>(sel.rip));
-		dl->AddText(code_font, 11.f, ImVec2(dx_inner, dy_inner),
+		dl->AddText(code_font, 13.f, ImVec2(dx_inner, dy_inner),
 			aida::ui::with_alpha(th.text_secondary, detail_alpha), detail_buf);
 		dy_inner += 18.f;
 
@@ -729,7 +729,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		auto draw_reg = [&](float rx, float ry, const char* name, uint64_t val) {
 			std::snprintf(detail_buf, sizeof(detail_buf), "%-4s 0x%016llX",
 				name, static_cast<unsigned long long>(val));
-			dl->AddText(code_font, 11.f, ImVec2(rx, ry),
+			dl->AddText(code_font, 13.f, ImVec2(rx, ry),
 				aida::ui::with_alpha(th.text_dim, detail_alpha), detail_buf);
 		};
 		draw_reg(col1, dy_inner, "RAX", sel.rax);
@@ -765,7 +765,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		}
 		std::snprintf(detail_buf, sizeof(detail_buf), "Mutation %s   offset=%zu   size=%zu",
 			mut_strat, sel.mutation.offset, sel.mutation.size);
-		dl->AddText(code_font, 11.f, ImVec2(dx_inner, dy_inner),
+		dl->AddText(code_font, 13.f, ImVec2(dx_inner, dy_inner),
 			aida::ui::with_alpha(th.text_dim, detail_alpha), detail_buf);
 		dy_inner += 16.f;
 
@@ -778,7 +778,7 @@ void render(float pos_x, float pos_y, float width, float height,
 				hex_str += hb;
 			}
 			if (sel.input.size() > 32) hex_str += "...";
-			dl->AddText(code_font, 11.f, ImVec2(dx_inner, dy_inner),
+			dl->AddText(code_font, 13.f, ImVec2(dx_inner, dy_inner),
 				aida::ui::with_alpha(th.text_dim, detail_alpha), hex_str.c_str());
 			dy_inner += 16.f;
 		}
@@ -794,7 +794,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			if (sel.minimized_input.size() > 32) min_str += "...";
 			std::snprintf(detail_buf, sizeof(detail_buf), "%s (%zu bytes)",
 				min_str.c_str(), sel.minimized_input.size());
-			dl->AddText(code_font, 11.f, ImVec2(dx_inner, dy_inner),
+			dl->AddText(code_font, 13.f, ImVec2(dx_inner, dy_inner),
 				aida::ui::with_alpha(th.success, detail_alpha), detail_buf);
 			dy_inner += 16.f;
 		}
@@ -807,7 +807,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		if (aida::ui::button(analyzing ? "Analyzing" : "AI Analyze",
 			aida::ui::button_kind_t::primary,
 			aida::ui::size_t_::sm,
-			ImVec2(106.f, 22.f),
+			ImVec2(112.f, 28.f),
 			analyzing, nullptr, analyzing)) {
 			if (!analyzing) fuzzer_engine::ai_analyze_crash(st.selected_crash);
 		}
@@ -815,14 +815,14 @@ void render(float pos_x, float pos_y, float width, float height,
 		if (aida::ui::button(minimizing ? "Minimizing" : "Minimize",
 			aida::ui::button_kind_t::secondary,
 			aida::ui::size_t_::sm,
-			ImVec2(96.f, 22.f),
+			ImVec2(102.f, 28.f),
 			minimizing, nullptr, minimizing)) {
 			if (!minimizing) fuzzer_engine::minimize_crash(st.selected_crash);
 		}
 		dy_inner += 28.f;
 
 		if (!sel.ai_analysis.empty() && dy_inner < db.y - 8.f) {
-			dl->AddText(head_em, 12.f, ImVec2(dx_inner, dy_inner),
+			dl->AddText(head_em, 14.f, ImVec2(dx_inner, dy_inner),
 				aida::ui::with_alpha(th.accent_u32, detail_alpha), "AI Analysis");
 			dy_inner += 16.f;
 			float wrap_w = dw - 24.f;

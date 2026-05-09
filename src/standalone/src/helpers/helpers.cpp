@@ -24,6 +24,7 @@
 #include "standalone_settings.hpp"
 #include "code_editor.hpp"
 #include "disasm_view.hpp"
+#include "cfg_view.hpp"
 #include "hex_view.hpp"
 #include "chat_render.hpp"
 #include "standalone_driver.hpp"
@@ -39,7 +40,7 @@
 #include "analysis_hub_view.hpp"
 #include "source_reconstruct_view.hpp"
 #include "work_queue.hpp"
-#include "session_history_view.hpp"
+#include "functions_panel.hpp"
 #include "binary_map_view.hpp"
 #include "agent_picker_view.hpp"
 
@@ -435,13 +436,15 @@ void helpers::add_key(const char* label, CKeybind* keybind)
 		ImGui::ClearActiveID();
 	}
 
-	dl->AddRect(btn_min, btn_max, IM_COL32(0, 0, 0, 255));
-	dl->AddRect(ImVec2(btn_min.x + 1, btn_min.y + 1), ImVec2(btn_max.x - 1, btn_max.y - 1), IM_COL32(25, 25, 35, 255));
-	dl->AddRectFilledMultiColor(
+	float kb_radius = 3.0f;
+	dl->AddRect(btn_min, btn_max, IM_COL32(0, 0, 0, 255), kb_radius);
+	dl->AddRect(ImVec2(btn_min.x + 1, btn_min.y + 1), ImVec2(btn_max.x - 1, btn_max.y - 1), IM_COL32(25, 25, 35, 255), kb_radius);
+	ImU32 kb_fill_top = IM_COL32(30, 30, 30, 255);
+	ImU32 kb_fill_bot = IM_COL32(15, 15, 15, 255);
+	ImU32 kb_fill_mix = aida::ui::mix(kb_fill_top, kb_fill_bot, 0.45f);
+	dl->AddRectFilled(
 		ImVec2(btn_min.x + 2, btn_min.y + 2), ImVec2(btn_max.x - 2, btn_max.y - 2),
-		IM_COL32(30, 30, 30, 255), IM_COL32(30, 30, 30, 255),
-		IM_COL32(15, 15, 15, 255), IM_COL32(15, 15, 15, 255)
-	);
+		kb_fill_mix, kb_radius);
 
 	float key_op = 1.0f - height_anim[keybind];
 	if (key_op > 0.01f)
@@ -1682,14 +1685,12 @@ void helpers::render_title()
 		ImU32 fill_avg = aida::ui::mix(fill_top, fill_bot, 0.6f);
 		dl->AddRectFilled(cb_a, cb_b, fill_avg, btn_radius);
 
-		dl->PushClipRect(cb_a, cb_b, true);
-		dl->AddRectFilledMultiColor(
+		ImU32 sheen_top = aida::ui::with_alpha(IM_COL32(255, 255, 255, 70), la);
+		ImU32 sheen_bot = aida::ui::with_alpha(IM_COL32(255, 255, 255, 0), la);
+		ImU32 sheen_mix = aida::ui::mix(sheen_top, sheen_bot, 0.45f);
+		dl->AddRectFilled(
 			cb_a, ImVec2(cb_b.x, cb_a.y + (cb_b.y - cb_a.y) * 0.5f),
-			aida::ui::with_alpha(IM_COL32(255, 255, 255, 70), la),
-			aida::ui::with_alpha(IM_COL32(255, 255, 255, 70), la),
-			aida::ui::with_alpha(IM_COL32(255, 255, 255,  0), la),
-			aida::ui::with_alpha(IM_COL32(255, 255, 255,  0), la));
-		dl->PopClipRect();
+			sheen_mix, btn_radius, ImDrawFlags_RoundCornersTop);
 
 		dl->AddRect(cb_a, cb_b,
 			aida::ui::with_alpha(IM_COL32(255, 255, 255, 180), (0.55f + 0.40f * bhov_v) * la),
@@ -1957,7 +1958,7 @@ void helpers::render_title()
 	const float pad      = 6.f;
 	const float gap      = 4.f;
 	const float title_h  = 32.f;
-	const float menu_h   = 24.f;
+	const float menu_h   = 32.f;
 	const float status_h = 28.f;
 	float ww = globals::ui::window_w;
 	float wh = globals::ui::window_h;
@@ -2093,6 +2094,7 @@ void helpers::render_title()
 				case center_view_t::analysis_hub:segs.push_back("Analysis"); break;
 				case center_view_t::binary_map:  segs.push_back("Binary Map"); break;
 				case center_view_t::debugger_view:segs.push_back("Debugger"); break;
+				case center_view_t::graph_view:  segs.push_back("Graph"); break;
 				case center_view_t::welcome:
 				default: break;
 			}
@@ -2717,15 +2719,17 @@ void helpers::render_title()
 			{"File", 0}, {"Edit", 1}, {"View", 2}, {"Tools", 3}, {"AI", 4}, {"Help", 5}
 		};
 
-		ImFont* body = aida::ui::fonts::body();
-		if (!body) body = ImGui::GetFont();
+		ImFont* mb_label_font = aida::ui::fonts::lg();
+		if (!mb_label_font) mb_label_font = aida::ui::fonts::body();
+		if (!mb_label_font) mb_label_font = ImGui::GetFont();
+		const float mb_label_size = 16.f;
 		float mx_cursor = wp.x + 14.f;
 		ImGuiStorage* mb_storage = ImGui::GetStateStorage();
 		for (int i = 0; i < 6; i++) {
-			ImVec2 ts = body->CalcTextSizeA(13.f, FLT_MAX, 0.f, menus[i].label);
-			float btn_w = ts.x + 18.f;
-			ImVec2 bmin(mx_cursor, my0 + 2.f);
-			ImVec2 bmax(mx_cursor + btn_w, my1 - 2.f);
+			ImVec2 ts = mb_label_font->CalcTextSizeA(mb_label_size, FLT_MAX, 0.f, menus[i].label);
+			float btn_w = ts.x + 24.f;
+			ImVec2 bmin(mx_cursor, my0 + 3.f);
+			ImVec2 bmax(mx_cursor + btn_w, my1 - 3.f);
 			bool hov = ImGui::IsMouseHoveringRect(bmin, bmax);
 			bool is_open = (menu_bar::open_menu == i);
 
@@ -2737,12 +2741,12 @@ void helpers::render_title()
 
 			if (h_v > 0.01f) {
 				ImU32 mfill = is_open ? th_mb.selection_strong : th_mb.hover_wash;
-				dl->AddRectFilled(bmin, bmax, aida::ui::with_alpha(mfill, h_v * a), 6.f);
+				dl->AddRectFilled(bmin, bmax, aida::ui::with_alpha(mfill, h_v * a), 7.f);
 			}
 
 			ImU32 tcol = (hov || is_open) ? th_mb.text_primary : th_mb.text_secondary;
-			dl->AddText(body, 13.f,
-				ImVec2(mx_cursor + 9.f, my0 + (menu_h - 13.f) * 0.5f),
+			dl->AddText(mb_label_font, mb_label_size,
+				ImVec2(mx_cursor + 12.f, my0 + (menu_h - mb_label_size) * 0.5f),
 				aida::ui::with_alpha(tcol, a), menus[i].label);
 
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -2768,8 +2772,8 @@ void helpers::render_title()
 				ImGui::OpenPopup(popup_id);
 
 				if (ImGui::BeginPopup(popup_id)) {
-					float mw = 220.f;
-					float ih = 26.f;
+					float mw = 280.f;
+					float ih = 34.f;
 
 					ImVec2 pwp = ImGui::GetWindowPos();
 					ImVec2 pws = ImGui::GetWindowSize();
@@ -2795,16 +2799,21 @@ void helpers::render_title()
 						bool mhov = enabled && ImGui::IsMouseHoveringRect(rmin, rmax);
 						ImDrawList* idl = ImGui::GetWindowDrawList();
 						if (mhov) idl->AddRectFilled(rmin, rmax,
-							aida::ui::with_alpha(th_p.hover_wash, 1.f), 6.f);
+							aida::ui::with_alpha(th_p.hover_wash, 1.f), 8.f);
 						ImU32 tc = enabled ? th_p.text_primary : th_p.text_dim;
-						ImFont* f = aida::ui::fonts::body();
-						if (!f) f = ImGui::GetFont();
-						idl->AddText(f, 13.f,
-							ImVec2(cp.x + 14.f, cp.y + (ih - 13.f) * 0.5f), tc, label);
+						ImFont* f_label = aida::ui::fonts::lg();
+						if (!f_label) f_label = aida::ui::fonts::body();
+						if (!f_label) f_label = ImGui::GetFont();
+						ImFont* f_short = aida::ui::fonts::body();
+						if (!f_short) f_short = f_label;
+						const float label_sz = 16.f;
+						const float short_sz = 13.f;
+						idl->AddText(f_label, label_sz,
+							ImVec2(cp.x + 16.f, cp.y + (ih - label_sz) * 0.5f), tc, label);
 						if (shortcut && shortcut[0]) {
-							ImVec2 sts = f->CalcTextSizeA(11.f, FLT_MAX, 0.f, shortcut);
-							idl->AddText(f, 11.f,
-								ImVec2(cp.x + mw - sts.x - 12.f, cp.y + (ih - 11.f) * 0.5f),
+							ImVec2 sts = f_short->CalcTextSizeA(short_sz, FLT_MAX, 0.f, shortcut);
+							idl->AddText(f_short, short_sz,
+								ImVec2(cp.x + mw - sts.x - 14.f, cp.y + (ih - short_sz) * 0.5f),
 								aida::ui::with_alpha(th_p.text_dim, 1.f), shortcut);
 						}
 						ImGui::Dummy(ImVec2(mw, ih));
@@ -2817,9 +2826,9 @@ void helpers::render_title()
 						const auto& th_p = aida::ui::resolved();
 						ImVec2 cp = ImGui::GetCursorScreenPos();
 						ImGui::GetWindowDrawList()->AddLine(
-							ImVec2(cp.x + 10.f, cp.y + 4.f), ImVec2(cp.x + mw - 10.f, cp.y + 4.f),
+							ImVec2(cp.x + 12.f, cp.y + 6.f), ImVec2(cp.x + mw - 12.f, cp.y + 6.f),
 							aida::ui::with_alpha(th_p.border_subtle, 1.f));
-						ImGui::Dummy(ImVec2(mw, 9.f));
+						ImGui::Dummy(ImVec2(mw, 12.f));
 					};
 
 					switch (i) {
@@ -3174,8 +3183,9 @@ void helpers::render_title()
 
 		struct ab_entry { const char* icon; activity_item_t item; const char* tip; };
 		static const ab_entry ab_items[] = {
-			{ ICON_FILES_EMPTY, activity_item_t::explorer, "Explorer" },
-			{ ICON_SEARCH,      activity_item_t::search,   "Search" },
+			{ ICON_FILES_EMPTY, activity_item_t::explorer,  "Explorer" },
+			{ ICON_SEARCH,      activity_item_t::search,    "Search" },
+			{ ICON_FUNCTION,    activity_item_t::functions, "Functions" },
 		};
 		static const int ab_count = sizeof(ab_items) / sizeof(ab_items[0]);
 
@@ -3504,78 +3514,12 @@ void helpers::render_title()
 			}
 			ImGui::EndChild();
 			ImGui::PopStyleVar();
+		} else if (globals::ui::active_activity == activity_item_t::functions) {
+			functions_panel::render(fwp.x, fwp.y, fw, fh);
 		} else {
 
-
-		static bool   s_sessions_section_expanded = true;
-		static float  s_sessions_frac = 0.40f;
-		static bool   s_sessions_dragging = false;
-
-		const char* sessions_lbl = "SESSIONS";
-		float sess_hdr_y = 6.f;
-		const char* sess_arrow = s_sessions_section_expanded ? u8"▾" : u8"▸";
-		ImU32 sess_label_col = IM_COL32(130, 128, 155, (int)(200 * a));
-		fdl->AddText(ImVec2(fwp.x + 10.f, fwp.y + sess_hdr_y), sess_label_col, sess_arrow);
-		fdl->AddText(ImVec2(fwp.x + 24.f, fwp.y + sess_hdr_y), sess_label_col, sessions_lbl);
-		{
-			ImGui::SetCursorPos(ImVec2(0.f, sess_hdr_y - 2.f));
-			ImGui::InvisibleButton("##sess_hdr_btn", ImVec2(fw, 18.f));
-			if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-				s_sessions_section_expanded = !s_sessions_section_expanded;
-			}
-		}
-
-		const float sh_hdr_total = 24.f;
-		float avail_below_hdr = fh - sh_hdr_total;
-		if (avail_below_hdr < 60.f) avail_below_hdr = 60.f;
-
-		float sess_h = 0.f;
-		float splitter_h = 0.f;
-		if (s_sessions_section_expanded) {
-			s_sessions_frac = std::clamp(s_sessions_frac, 0.10f, 0.85f);
-			sess_h = avail_below_hdr * s_sessions_frac - 6.f;
-			if (sess_h < 60.f) sess_h = 60.f;
-			splitter_h = 6.f;
-		}
-
-		float sess_y = sh_hdr_total;
-		if (s_sessions_section_expanded) {
-			ImGui::SetCursorPos(ImVec2(0.f, sess_y));
-			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
-			ImGui::BeginChild("##sessions_panel", ImVec2(fw, sess_h), false, ImGuiWindowFlags_NoBackground);
-			aida::session_history::render(fw, sess_h);
-			ImGui::EndChild();
-			ImGui::PopStyleVar();
-
-			float spl_y = sess_y + sess_h;
-			ImVec2 spl_min(fwp.x, fwp.y + spl_y);
-			ImVec2 spl_max(fwp.x + fw, fwp.y + spl_y + splitter_h);
-			bool spl_hov = ImGui::IsMouseHoveringRect(spl_min, spl_max, false);
-			ImU32 spl_col = (spl_hov || s_sessions_dragging)
-				? IM_COL32((int)(ax3*200+50), (int)(ay3*200+50), (int)(az3*200+50), (int)(180 * a))
-				: IM_COL32(255, 255, 255, (int)(20 * a));
-			fdl->AddRectFilled(ImVec2(spl_min.x + 4.f, spl_min.y + 2.f),
-				ImVec2(spl_max.x - 4.f, spl_max.y - 2.f), spl_col, 1.5f);
-
-			ImGui::SetCursorPos(ImVec2(0.f, spl_y));
-			ImGui::InvisibleButton("##sess_split", ImVec2(fw, splitter_h));
-			if (ImGui::IsItemActive()) {
-				s_sessions_dragging = true;
-				float dy = ImGui::GetIO().MouseDelta.y;
-				if (avail_below_hdr > 1.f) s_sessions_frac += dy / avail_below_hdr;
-			} else {
-				s_sessions_dragging = false;
-			}
-			if (ImGui::IsItemHovered() || s_sessions_dragging) {
-				ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
-			}
-		}
-
-		float fb_label_y = sh_hdr_total + sess_h + splitter_h + 6.f;
-		fdl->AddLine(ImVec2(fwp.x + 8.f, fwp.y + fb_label_y - 4.f),
-			ImVec2(fwp.x + fw - 8.f, fwp.y + fb_label_y - 4.f),
-			IM_COL32(255, 255, 255, (int)(18 * a)), 1.f);
 		const char* explorer_lbl = "EXPLORER";
+		float fb_label_y = 6.f;
 		fdl->AddText(ImVec2(fwp.x + 10.f, fwp.y + fb_label_y), IM_COL32(130, 128, 155, (int)(200 * a)), u8"▾");
 		fdl->AddText(ImVec2(fwp.x + 24.f, fwp.y + fb_label_y),
 			IM_COL32(130, 128, 155, (int)(200 * a)), explorer_lbl);
@@ -4547,6 +4491,12 @@ void helpers::render_title()
 		disasm_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3, g_disasm, dt);
 	}
 
+	else if (cv == center_view_t::graph_view)
+	{
+		ImVec2 wp = ImGui::GetWindowPos();
+		cfg_view::render(wp.x, wp.y, vw, vh, a, ax3, ay3, az3);
+	}
+
 	else if (cv == center_view_t::network_view)
 	{
 		network_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
@@ -5142,7 +5092,7 @@ void helpers::render_title()
 					float input_y_screen = bmin.y + edit_pad;
 					ImGui::SetCursorScreenPos(ImVec2(bmin.x + edit_pad, input_y_screen));
 					ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, 4.f));
-					ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+					ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 					ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(0, 0, 0, 0));
 					ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(230, 228, 255, (int)(240 * a)));
 					ImGui::PushItemWidth(edit_w - edit_pad * 2.f - 40.f);
@@ -5786,7 +5736,7 @@ void helpers::render_title()
 					ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings))
 				{
 					static char model_filter[64] = {};
-					ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+					ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 					ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 4.f));
 					ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.06f, 0.06f, 0.09f, 1.f));
 					ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
@@ -5886,11 +5836,10 @@ void helpers::render_title()
 			ImVec2 cb_a(btn_min.x + (1.f - scl) * btn_sz * 0.5f, btn_min.y + (1.f - scl) * btn_sz * 0.5f);
 			ImVec2 cb_b(btn_max.x - (1.f - scl) * btn_sz * 0.5f, btn_max.y - (1.f - scl) * btn_sz * 0.5f);
 
-			dl->AddRectFilledMultiColor(cb_a, cb_b,
-				aida::ui::with_alpha(th_chat.accent_grad_top, a),
-				aida::ui::with_alpha(th_chat.accent_grad_top, a),
-				aida::ui::with_alpha(th_chat.accent_grad_bot, a),
-				aida::ui::with_alpha(th_chat.accent_grad_bot, a));
+			ImU32 sb_grad_top = aida::ui::with_alpha(th_chat.accent_grad_top, a);
+			ImU32 sb_grad_bot = aida::ui::with_alpha(th_chat.accent_grad_bot, a);
+			ImU32 sb_grad_mix = aida::ui::mix(sb_grad_top, sb_grad_bot, 0.45f);
+			dl->AddRectFilled(cb_a, cb_b, sb_grad_mix, 8.f);
 			dl->AddRect(cb_a, cb_b,
 				aida::ui::with_alpha(th_chat.accent_hover, (0.5f + sh_v * 0.5f) * a), 8.f, 0, 1.f);
 			if (sf_v > 0.f) {
@@ -5921,11 +5870,10 @@ void helpers::render_title()
 				float sthv = stop_h.tick(stop_hov, dt, aida::motion::spring::balanced);
 				ImU32 stop_top = IM_COL32(238, 99, 109, 255);
 				ImU32 stop_bot = IM_COL32(196, 51, 64, 255);
-				dl->AddRectFilledMultiColor(sb_a, sb_b,
-					aida::ui::with_alpha(stop_top, a * stop_e),
-					aida::ui::with_alpha(stop_top, a * stop_e),
-					aida::ui::with_alpha(stop_bot, a * stop_e),
-					aida::ui::with_alpha(stop_bot, a * stop_e));
+				ImU32 stop_top_a = aida::ui::with_alpha(stop_top, a * stop_e);
+				ImU32 stop_bot_a = aida::ui::with_alpha(stop_bot, a * stop_e);
+				ImU32 stop_mix = aida::ui::mix(stop_top_a, stop_bot_a, 0.45f);
+				dl->AddRectFilled(sb_a, sb_b, stop_mix, 8.f);
 				dl->AddRect(sb_a, sb_b,
 					aida::ui::with_alpha(IM_COL32(255,255,255,255), 0.25f * sthv * a * stop_e), 8.f, 0, 1.f);
 				float sq = btn_sz * 0.30f;

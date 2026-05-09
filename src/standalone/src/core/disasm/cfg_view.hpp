@@ -65,6 +65,7 @@ struct cfg_state_t {
 	uint64_t                   entry_addr = 0;
 	bool                       built = false;
 	uint64_t                   current_rip = 0;
+	uint64_t                   last_cursor_addr = 0;
 	float                      pan_x = 0.f;
 	float                      pan_y = 0.f;
 	float                      target_pan_x = 0.f;
@@ -76,6 +77,7 @@ struct cfg_state_t {
 	float                      zoom_vel = 0.f;
 	int                        selected_block = -1;
 	float                      rebuild_anim = 1.f;
+	bool                       fit_request = false;
 	std::unordered_map<int, block_motion_t> block_motion;
 	bool                       minimap_dragging = false;
 	std::mutex                 mutex;
@@ -141,6 +143,57 @@ inline void compute_world_bounds(const cfg_layout::graph_t& g, float& min_x, flo
 	if (min_y > max_y) { min_y = -100.f; max_y = 100.f; }
 }
 
+}
+
+inline void fit_to_view(float view_width, float view_height)
+{
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	if (!g_state.built || g_state.graph.nodes.empty())
+		return;
+
+	float min_x, min_y, max_x, max_y;
+	detail::compute_world_bounds(g_state.graph, min_x, min_y, max_x, max_y);
+	float ww = max_x - min_x;
+	float wh = max_y - min_y;
+	if (ww < 1.f) ww = 1.f;
+	if (wh < 1.f) wh = 1.f;
+
+	const float pad = 60.f;
+	float zx = (view_width - pad * 2.f) / ww;
+	float zy = (view_height - pad * 2.f) / wh;
+	float z = zx < zy ? zx : zy;
+	if (z < 0.1f) z = 0.1f;
+	if (z > 5.f) z = 5.f;
+
+	float cx = (min_x + max_x) * 0.5f;
+	float cy = (min_y + max_y) * 0.5f;
+
+	g_state.target_zoom = z;
+	g_state.target_pan_x = -cx;
+	g_state.target_pan_y = -cy;
+}
+
+inline void center_on_address(uint64_t addr)
+{
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	if (!g_state.built)
+		return;
+	for (int i = 0; i < static_cast<int>(g_state.blocks.size()); ++i) {
+		auto& b = g_state.blocks[i];
+		if (addr >= b.start_addr && addr < b.end_addr) {
+			int node_idx = -1;
+			for (int ni = 0; ni < static_cast<int>(g_state.graph.nodes.size()); ++ni) {
+				if (g_state.graph.nodes[ni].id == i) { node_idx = ni; break; }
+			}
+			if (node_idx >= 0) {
+				auto& n = g_state.graph.nodes[node_idx];
+				g_state.target_pan_x = -n.x;
+				g_state.target_pan_y = -(n.y + n.height * 0.5f);
+				g_state.selected_block = i;
+			}
+			return;
+		}
+	}
 }
 
 inline void build_cfg(uint64_t entry_address)
@@ -357,6 +410,44 @@ inline void build_cfg(uint64_t entry_address)
 	});
 }
 
+inline bool handle_view_keys(float view_width, float view_height)
+{
+	if (g_state.fit_request && g_state.built && !g_state.graph.nodes.empty()) {
+		g_state.fit_request = false;
+		fit_to_view(view_width, view_height);
+	}
+
+	ImGuiIO& key_io = ImGui::GetIO();
+	bool key_text_lock = key_io.WantTextInput
+		|| key_io.WantCaptureKeyboard
+		|| ImGui::IsAnyItemActive();
+
+	if (key_text_lock || key_io.KeyCtrl || key_io.KeyAlt)
+		return false;
+
+	if (ImGui::IsKeyPressed(ImGuiKey_Space, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+		uint64_t back_addr = g_state.last_cursor_addr != 0
+			? g_state.last_cursor_addr
+			: g_state.entry_addr;
+		globals::ui::active_center_view = center_view_t::disassembly;
+		if (back_addr != 0)
+			disasm_view::goto_address(back_addr, g_disasm);
+		return true;
+	}
+	if (ImGui::IsKeyPressed(ImGuiKey_F, false)) {
+		fit_to_view(view_width, view_height);
+		return true;
+	}
+	if (ImGui::IsKeyPressed(ImGuiKey_G, false)) {
+		if (g_state.last_cursor_addr != 0)
+			center_on_address(g_state.last_cursor_addr);
+		else if (g_state.entry_addr != 0)
+			center_on_address(g_state.entry_addr);
+		return true;
+	}
+	return false;
+}
+
 inline void render(float pos_x, float pos_y, float width, float height,
 				   float alpha, float accent_r, float accent_g, float accent_b)
 {
@@ -373,6 +464,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float dt = aida::ui::clock::dt();
 
 	dl->AddRectFilled(clip_min, clip_max, _ta(tk.bg_base));
+
+	handle_view_keys(width, height);
 
 	if (g_state.building.load()) {
 		float panel_w = width * 0.55f;
@@ -664,9 +757,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 
 		if (block_hov) {
-			if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+			if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 				g_state.selected_block = n.id;
+				g_state.last_cursor_addr = blk.start_addr;
+			}
 			if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+				g_state.last_cursor_addr = blk.start_addr;
 				globals::ui::active_center_view = center_view_t::disassembly;
 				disasm_view::goto_address(blk.start_addr, g_disasm);
 			}

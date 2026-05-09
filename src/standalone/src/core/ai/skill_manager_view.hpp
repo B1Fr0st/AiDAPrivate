@@ -496,7 +496,7 @@ namespace skill_manager {
 			ImU32 text_col = (st.active_tab == tabs[i]) ? th.text_primary : th.text_secondary;
 			if (hov) text_col = th.text_primary;
 			ImFont* f = aida::ui::fonts::body_em();
-			float fs = 12.f;
+			float fs = 14.f;
 			ImVec2 ts = f->CalcTextSizeA(fs, FLT_MAX, 0.f, tab_label(tabs[i]));
 			dl->AddText(f, fs,
 				ImVec2(bx + (btn_w - ts.x) * 0.5f, y + (btn_h - ts.y) * 0.5f),
@@ -557,7 +557,7 @@ namespace skill_manager {
 			ImVec2(text_x, a.y + 8.f), name_col, m.name.c_str());
 
 		std::string short_path = truncate_text(m.file_path, 60);
-		dl->AddText(aida::ui::fonts::caption(), 11.f,
+		dl->AddText(aida::ui::fonts::caption(), 13.f,
 			ImVec2(text_x, a.y + 26.f),
 			aida::ui::with_alpha(th.text_dim, 0.85f), short_path.c_str());
 
@@ -716,7 +716,7 @@ namespace skill_manager {
 			const auto urls = ::aida::skills::list_remote_urls();
 			if (urls.empty()) {
 				const ImVec2 cs = ImGui::GetCursorScreenPos();
-				dl2->AddText(aida::ui::fonts::caption(), 12.f,
+				dl2->AddText(aida::ui::fonts::caption(), 14.f,
 					ImVec2(cs.x + 8.f, cs.y + 4.f), th.text_dim,
 					"No remote URLs registered. Use the toolbar above to add one.");
 				ImGui::Dummy(ImVec2(w, 26.f));
@@ -729,7 +729,7 @@ namespace skill_manager {
 				dl2->AddRectFilled(ImVec2(cs.x + 4.f, cs.y),
 					ImVec2(cs.x + row_w_inner, cs.y + 24.f),
 					aida::ui::with_alpha(th.panel_header, 0.7f), 6.f);
-				dl2->AddText(aida::ui::fonts::caption(), 11.f,
+				dl2->AddText(aida::ui::fonts::caption(), 13.f,
 					ImVec2(cs.x + 10.f, cs.y + 6.f),
 					th.text_secondary, truncate_text(u, 80).c_str());
 
@@ -737,14 +737,14 @@ namespace skill_manager {
 				if (aida::ui::button("Fetch",
 						aida::ui::button_kind_t::secondary,
 						aida::ui::size_t_::sm,
-						ImVec2(60.f, 22.f))) {
+						ImVec2(60.f, 28.f))) {
 					start_remote_fetch(u);
 				}
 				ImGui::SameLine(0.f, 4.f);
 				if (aida::ui::button("Remove",
 						aida::ui::button_kind_t::ghost,
 						aida::ui::size_t_::sm,
-						ImVec2(70.f, 22.f))) {
+						ImVec2(70.f, 28.f))) {
 					if (::aida::skills::remove_remote_url(u)) {
 						toast_notification::push("Removed remote URL",
 							toast_notification::toast_type_t::info, 3.0f);
@@ -771,7 +771,7 @@ namespace skill_manager {
 					for (const auto& e : snap.index.entries) {
 						ImGui::PushID(e.name.c_str());
 						const ImVec2 ec = ImGui::GetCursorScreenPos();
-						dl2->AddText(aida::ui::fonts::caption(), 11.f,
+						dl2->AddText(aida::ui::fonts::caption(), 13.f,
 							ImVec2(ec.x + 16.f, ec.y + 2.f),
 							th.text_secondary, e.name.c_str());
 						ImGui::SetCursorScreenPos(ImVec2(ec.x + row_w_inner - 80.f, ec.y));
@@ -787,7 +787,7 @@ namespace skill_manager {
 							if (aida::ui::button("Install",
 									aida::ui::button_kind_t::primary,
 									aida::ui::size_t_::sm,
-									ImVec2(74.f, 22.f))) {
+									ImVec2(74.f, 28.f))) {
 								start_install(u, e.name);
 							}
 						}
@@ -857,7 +857,7 @@ namespace skill_manager {
 
 		float cy = content_y + 56.f;
 		std::string fp = "Path: " + truncate_text(meta->file_path, 80);
-		dl->AddText(aida::ui::fonts::caption(), 11.f,
+		dl->AddText(aida::ui::fonts::caption(), 13.f,
 			ImVec2(cs.x + 12.f, cy), th.text_dim, fp.c_str());
 
 		ImGui::SetCursorScreenPos(ImVec2(cs.x + 12.f, cy + 22.f));
@@ -884,11 +884,11 @@ namespace skill_manager {
 		}
 
 		float chip_y = cy + 60.f;
-		dl->AddText(aida::ui::fonts::body_em(), 12.f,
+		dl->AddText(aida::ui::fonts::body_em(), 14.f,
 			ImVec2(cs.x + 12.f, chip_y), th.text_secondary, "Agent slugs:");
 		chip_y += 22.f;
 		if (meta->agent_slugs.empty()) {
-			dl->AddText(aida::ui::fonts::caption(), 11.f,
+			dl->AddText(aida::ui::fonts::caption(), 13.f,
 				ImVec2(cs.x + 12.f, chip_y), th.text_dim,
 				"(none, available to all primary agents)");
 		} else {
@@ -908,7 +908,7 @@ namespace skill_manager {
 		}
 
 		const float ph_y = chip_y + 36.f;
-		dl->AddText(aida::ui::fonts::body_em(), 12.f,
+		dl->AddText(aida::ui::fonts::body_em(), 14.f,
 			ImVec2(cs.x + 12.f, ph_y), th.text_secondary, "Placeholder hints:");
 
 		std::vector<std::string> hints;
@@ -919,7 +919,7 @@ namespace skill_manager {
 		float hx = cs.x + 12.f;
 		float hy = ph_y + 22.f;
 		if (hints.empty()) {
-			dl->AddText(aida::ui::fonts::caption(), 11.f,
+			dl->AddText(aida::ui::fonts::caption(), 13.f,
 				ImVec2(hx, hy), th.text_dim, "(none)");
 		} else {
 			for (const auto& ph : hints) {

@@ -25,7 +25,6 @@
 #include "provider_view.hpp"
 #include "agent_manager_view.hpp"
 #include "skill_manager_view.hpp"
-#include "session_history_view.hpp"
 #include "binary_map_view.hpp"
 #include "command_palette_view.hpp"
 #include "provider_catalog.hpp"
@@ -1491,7 +1490,6 @@ void init_standalone_chat()
     aida::agent_picker::initialize();
     aida::agent_manager::initialize();
     aida::skill_manager::initialize();
-    aida::session_history::initialize();
     aida::binary_map_view::initialize();
     aida::command_palette::initialize();
     aida::settings_overlay::initialize();
@@ -1601,7 +1599,6 @@ void shutdown_standalone_chat()
     aida::settings_overlay::shutdown();
     aida::command_palette::shutdown();
     aida::binary_map_view::shutdown();
-    aida::session_history::shutdown();
     aida::skill_manager::shutdown();
     aida::agent_manager::shutdown();
     aida::agent_picker::shutdown();

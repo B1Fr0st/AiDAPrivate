@@ -565,12 +565,19 @@ inline void render_progress_bar_animated(ImDrawList* dl, float x, float y, float
 
 	float fill_w = w * std::clamp(progress, 0.f, 1.f);
 	if (fill_w > 1.f) {
-		ImU32 fill_left = IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
-									static_cast<int>(ab * 255), static_cast<int>(220 * alpha));
-		ImU32 fill_right = IM_COL32(static_cast<int>(ar * 200 + 55), static_cast<int>(ag * 200 + 55),
-									 static_cast<int>(ab * 200 + 55), static_cast<int>(220 * alpha));
-		dl->AddRectFilledMultiColor(ImVec2(x, y), ImVec2(x + fill_w, y + h),
-			fill_left, fill_right, fill_right, fill_left);
+		float fr_l = ar * 255.f;
+		float fg_l = ag * 255.f;
+		float fb_l = ab * 255.f;
+		float fr_r = ar * 200.f + 55.f;
+		float fg_r = ag * 200.f + 55.f;
+		float fb_r = ab * 200.f + 55.f;
+		float t_mix = 0.45f;
+		ImU32 fill_mix = IM_COL32(
+			static_cast<int>(fr_l + (fr_r - fr_l) * t_mix),
+			static_cast<int>(fg_l + (fg_r - fg_l) * t_mix),
+			static_cast<int>(fb_l + (fb_r - fb_l) * t_mix),
+			static_cast<int>(220.f * alpha));
+		dl->AddRectFilled(ImVec2(x, y), ImVec2(x + fill_w, y + h), fill_mix, h * 0.5f);
 
 		float shimmer = (std::fmod(time * 0.8f, 1.f));
 		float shimmer_x = x + shimmer * fill_w;
@@ -1075,7 +1082,7 @@ inline bool render_toolbar_button(ImDrawList* dl, const char* label, float x, fl
 	if (bg_a > 0.01f)
 		dl->AddRectFilled(rmin, rmax,
 			IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
-					 static_cast<int>(ab * 255), static_cast<int>(bg_a * alpha * 255)), 4.f);
+					 static_cast<int>(ab * 255), static_cast<int>(bg_a * alpha * 255)), 6.f);
 
 	if (active)
 		dl->AddRectFilled(ImVec2(x, y + h - 2.f), ImVec2(x + w, y + h),
@@ -1319,14 +1326,12 @@ inline void render_inline_callout(ImDrawList* dl, float x, float y, float w, flo
 
 	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), fill_col, 5.f);
 
-	ImU32 accent_tint = IM_COL32(
+	ImU32 accent_tint_mix = IM_COL32(
 		static_cast<int>(ar * 255), static_cast<int>(ag * 255), static_cast<int>(ab * 255),
-		static_cast<int>(12 * alpha));
-	ImU32 accent_tint_zero = IM_COL32(
-		static_cast<int>(ar * 255), static_cast<int>(ag * 255), static_cast<int>(ab * 255), 0);
-	dl->AddRectFilledMultiColor(
+		static_cast<int>(6 * alpha));
+	dl->AddRectFilled(
 		ImVec2(x + 3.f, y), ImVec2(x + w, y + h),
-		accent_tint, accent_tint_zero, accent_tint_zero, accent_tint);
+		accent_tint_mix, 5.f, ImDrawFlags_RoundCornersRight);
 
 	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + 3.f, y + h), accent_col);
 	dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h),
@@ -1392,7 +1397,7 @@ inline bool render_filter_input_chip(const char* id, char* buf, size_t bufsz,
 	ImGui::PushStyleColor(ImGuiCol_Text, text_col);
 	ImGui::PushStyleColor(ImGuiCol_TextDisabled, hint_col);
 	ImGui::PushStyleColor(ImGuiCol_Border, border_col);
-	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 4.f));
 
@@ -1514,9 +1519,23 @@ inline void render_graph_node_card(ImDrawList* dl, float x, float y, float w, fl
 		hdr_left  = IM_COL32(42, 46, 60, static_cast<int>(240 * alpha));
 		hdr_right = IM_COL32(30, 33, 44, static_cast<int>(225 * alpha));
 	}
-	dl->AddRectFilledMultiColor(
+	int hdr_lr = (hdr_left >> IM_COL32_R_SHIFT) & 0xFF;
+	int hdr_lg = (hdr_left >> IM_COL32_G_SHIFT) & 0xFF;
+	int hdr_lb = (hdr_left >> IM_COL32_B_SHIFT) & 0xFF;
+	int hdr_la = (hdr_left >> IM_COL32_A_SHIFT) & 0xFF;
+	int hdr_rr = (hdr_right >> IM_COL32_R_SHIFT) & 0xFF;
+	int hdr_rg = (hdr_right >> IM_COL32_G_SHIFT) & 0xFF;
+	int hdr_rb = (hdr_right >> IM_COL32_B_SHIFT) & 0xFF;
+	int hdr_ra = (hdr_right >> IM_COL32_A_SHIFT) & 0xFF;
+	float hdr_t = 0.45f;
+	ImU32 hdr_mix = IM_COL32(
+		static_cast<int>(hdr_lr + (hdr_rr - hdr_lr) * hdr_t),
+		static_cast<int>(hdr_lg + (hdr_rg - hdr_lg) * hdr_t),
+		static_cast<int>(hdr_lb + (hdr_rb - hdr_lb) * hdr_t),
+		static_cast<int>(hdr_la + (hdr_ra - hdr_la) * hdr_t));
+	dl->AddRectFilled(
 		ImVec2(x + 1.f, y + 1.f), ImVec2(x + w - 1.f, y + header_h),
-		hdr_left, hdr_right, hdr_right, hdr_left);
+		hdr_mix, rounding, ImDrawFlags_RoundCornersTop);
 
 	dl->AddLine(ImVec2(x + 4.f, y + header_h), ImVec2(x + w - 4.f, y + header_h),
 		IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),

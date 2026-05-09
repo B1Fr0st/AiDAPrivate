@@ -143,6 +143,8 @@ void push_log_message_locked(state_t& st, const std::string& msg) {
 
 }
 
+void sync_attached_state();
+
 
 void initialize() {
 	auto& st = g_state;
@@ -305,6 +307,7 @@ void clear_all_breakpoints() {
 
 bool run_target() {
 	auto& st = g_state;
+	sync_attached_state();
 	if (st.target_pid == 0) return false;
 
 	auto threads = driver_bridge::enumerate_threads();
@@ -321,6 +324,7 @@ bool run_target() {
 
 bool pause_target() {
 	auto& st = g_state;
+	sync_attached_state();
 	if (st.target_pid == 0) return false;
 
 	auto threads = driver_bridge::enumerate_threads();
@@ -337,6 +341,7 @@ bool pause_target() {
 
 bool step_into() {
 	auto& st = g_state;
+	sync_attached_state();
 	if (st.target_pid == 0 || st.active_tid == 0) return false;
 	st.status.store(dbg_status_t::stepping);
 
@@ -414,6 +419,7 @@ bool step_into() {
 
 bool step_over() {
 	auto& st = g_state;
+	sync_attached_state();
 	if (st.target_pid == 0) return false;
 
 	auto regs = get_registers();
@@ -431,6 +437,7 @@ bool step_over() {
 
 bool step_out() {
 	auto& st = g_state;
+	sync_attached_state();
 	if (st.target_pid == 0) return false;
 
 	auto regs = get_registers();
@@ -447,6 +454,7 @@ bool step_out() {
 
 bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout_ms) {
 	auto& st = g_state;
+	sync_attached_state();
 	if (st.target_pid == 0) return false;
 
 	std::vector<uint8_t> orig_buf;
@@ -523,6 +531,7 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 
 register_set_t get_registers() {
 	auto& st = g_state;
+	sync_attached_state();
 	if (st.target_pid == 0 || st.active_tid == 0) return {};
 
 	driver_bridge::suspend_thread(st.active_tid);
@@ -553,6 +562,7 @@ register_set_t get_registers() {
 
 bool set_register(const std::string& name, uint64_t value) {
 	auto& st = g_state;
+	sync_attached_state();
 	if (st.target_pid == 0 || st.active_tid == 0) return false;
 
 	driver_bridge::suspend_thread(st.active_tid);
@@ -860,6 +870,7 @@ std::string get_label(uint64_t address) {
 
 void enumerate_handles() {
 	auto& st = g_state;
+	sync_attached_state();
 	if (st.target_pid == 0) return;
 
 	static auto nt_query = reinterpret_cast<nt_query_system_information_fn>(
@@ -997,6 +1008,7 @@ void enumerate_handles() {
 
 void find_strings(size_t min_length) {
 	auto& st = g_state;
+	sync_attached_state();
 	if (st.target_pid == 0) return;
 
 	auto regions = driver_bridge::enumerate_memory_regions(4096);
@@ -1272,9 +1284,38 @@ std::vector<uint8_t> cached_disasm_window(uint64_t& base_out) {
 	return st.cached_disasm_bytes;
 }
 
+void sync_attached_state() {
+	auto& st = g_state;
+	uint32_t live_pid = driver_bridge::attached_pid();
+	if (live_pid != st.target_pid) {
+		st.target_pid = live_pid;
+		st.active_tid = 0;
+		std::lock_guard<std::mutex> lk(st.cache_mtx);
+		st.cached_regs = register_set_t{};
+		st.cached_threads.clear();
+		st.cached_stack.clear();
+		st.cached_stack_addr = 0;
+		st.cached_dump.clear();
+		st.cached_dump_addr = 0;
+		st.cached_dump_size = 0;
+		st.cached_disasm_bytes.clear();
+		st.cached_disasm_base = 0;
+	}
+	if (live_pid != 0 && st.active_tid == 0) {
+		auto threads = driver_bridge::enumerate_threads();
+		for (const auto& th : threads) {
+			if (th.owner_pid == live_pid && th.tid != 0) {
+				st.active_tid = th.tid;
+				break;
+			}
+		}
+	}
+}
+
 void request_refresh(uint32_t max_age_ms) {
 	auto& st = g_state;
-	if (st.target_pid == 0 || st.active_tid == 0) return;
+	sync_attached_state();
+	if (st.target_pid == 0) return;
 	uint64_t now = now_ms();
 	if (now - st.last_refresh_ms.load() < max_age_ms) return;
 	bool expected = false;
@@ -1282,6 +1323,15 @@ void request_refresh(uint32_t max_age_ms) {
 
 	work_queue::post([]() {
 		auto& s = g_state;
+		if (s.active_tid == 0 && s.target_pid != 0) {
+			auto threads = driver_bridge::enumerate_threads();
+			for (const auto& th : threads) {
+				if (th.owner_pid == s.target_pid && th.tid != 0) {
+					s.active_tid = th.tid;
+					break;
+				}
+			}
+		}
 		register_set_t fresh = get_registers();
 		{
 			std::lock_guard<std::mutex> lk(s.cache_mtx);
@@ -1294,6 +1344,7 @@ void request_refresh(uint32_t max_age_ms) {
 
 void request_thread_refresh(uint32_t max_age_ms) {
 	auto& st = g_state;
+	sync_attached_state();
 	if (st.target_pid == 0) return;
 	uint64_t now = now_ms();
 	if (now - st.last_thread_refresh_ms.load() < max_age_ms) return;
@@ -1305,7 +1356,9 @@ void request_thread_refresh(uint32_t max_age_ms) {
 		auto raw = driver_bridge::enumerate_threads();
 		std::vector<cached_thread_t> entries;
 		entries.reserve(raw.size());
+		uint32_t pid_filter = s.target_pid;
 		for (auto& t : raw) {
+			if (pid_filter != 0 && t.owner_pid != pid_filter) continue;
 			cached_thread_t e;
 			e.tid = t.tid;
 			e.owner_pid = t.owner_pid;
@@ -1314,6 +1367,8 @@ void request_thread_refresh(uint32_t max_age_ms) {
 			e.rip = t.rip;
 			entries.push_back(e);
 		}
+		if (s.active_tid == 0 && !entries.empty())
+			s.active_tid = entries.front().tid;
 		{
 			std::lock_guard<std::mutex> lk(s.cache_mtx);
 			s.cached_threads = std::move(entries);

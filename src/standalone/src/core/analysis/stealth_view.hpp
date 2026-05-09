@@ -96,18 +96,18 @@ inline void render_protection_scan(float pos_x, float pos_y, float w, float h,
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy + 8.f));
 	if (!scanning) {
 		if (aida::ui::button("Scan", aida::ui::button_kind_t::primary,
-			aida::ui::size_t_::sm, ImVec2(76.f, 22.f))) {
+			aida::ui::size_t_::sm, ImVec2(76.f, 28.f))) {
 			stealth_engine::run_protection_scan();
 		}
 	} else {
 		if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive,
-			aida::ui::size_t_::sm, ImVec2(76.f, 22.f))) {
+			aida::ui::size_t_::sm, ImVec2(76.f, 28.f))) {
 			stealth_engine::stop_protection_scan();
 		}
 	}
 	ImGui::SameLine();
 	if (aida::ui::button("Clear", aida::ui::button_kind_t::ghost,
-		aida::ui::size_t_::sm, ImVec2(76.f, 22.f))) {
+		aida::ui::size_t_::sm, ImVec2(76.f, 28.f))) {
 		std::lock_guard<std::mutex> lk(stealth_engine::g_scan.mutex);
 		stealth_engine::g_scan.findings.clear();
 		stealth_engine::g_scan.scan_status.clear();
@@ -166,7 +166,7 @@ inline void render_protection_scan(float pos_x, float pos_y, float w, float h,
 		}
 	}
 
-	const float row_h = 26.f;
+	const float row_h = 30.f;
 	const float bottom_h = 64.f;
 	const float table_top = cy;
 	const float table_h = oy + pos_y + h - cy - 8.f - bottom_h;
@@ -187,15 +187,15 @@ inline void render_protection_scan(float pos_x, float pos_y, float w, float h,
 	if (!head_em) head_em = ImGui::GetFont();
 	ImU32 hc = aida::ui::with_alpha(th.text_secondary, alpha);
 	float hx = cx + 6.f;
-	dl->AddText(head_em, 11.f, ImVec2(hx, cy + 7.f), hc, "Severity");
+	dl->AddText(head_em, 13.f, ImVec2(hx, cy + 8.f), hc, "Severity");
 	hx += col_sev_w;
-	dl->AddText(head_em, 11.f, ImVec2(hx, cy + 7.f), hc, "Category");
+	dl->AddText(head_em, 13.f, ImVec2(hx, cy + 8.f), hc, "Category");
 	hx += col_cat_w;
-	dl->AddText(head_em, 11.f, ImVec2(hx, cy + 7.f), hc, "Address");
+	dl->AddText(head_em, 13.f, ImVec2(hx, cy + 8.f), hc, "Address");
 	hx += col_addr_w;
-	dl->AddText(head_em, 11.f, ImVec2(hx, cy + 7.f), hc, "Finding");
+	dl->AddText(head_em, 13.f, ImVec2(hx, cy + 8.f), hc, "Finding");
 	hx += col_title_w;
-	dl->AddText(head_em, 11.f, ImVec2(hx, cy + 7.f), hc, "Details");
+	dl->AddText(head_em, 13.f, ImVec2(hx, cy + 8.f), hc, "Details");
 	cy += row_h + 2.f;
 
 	float content_h = static_cast<float>(filtered.size()) * row_h;
@@ -268,7 +268,7 @@ inline void render_protection_scan(float pos_x, float pos_y, float w, float h,
 		rx = cx + col_sev_w + 4.f;
 
 		dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-			11.f, ImVec2(rx, ry + 7.f),
+			13.f, ImVec2(rx, ry + 8.f),
 			aida::ui::with_alpha(th.text_secondary, alpha * entrance),
 			stealth_engine::category_name(f.category));
 		rx += col_cat_w;
@@ -279,7 +279,7 @@ inline void render_protection_scan(float pos_x, float pos_y, float w, float h,
 			char addr_buf[24];
 			std::snprintf(addr_buf, sizeof(addr_buf), "0x%llX",
 				static_cast<unsigned long long>(f.address));
-			dl->AddText(code_font, 11.f, ImVec2(rx, ry + 7.f),
+			dl->AddText(code_font, 13.f, ImVec2(rx, ry + 8.f),
 				aida::ui::with_alpha(th.text_address, alpha * entrance), addr_buf);
 		}
 		rx += col_addr_w;
@@ -287,14 +287,14 @@ inline void render_protection_scan(float pos_x, float pos_y, float w, float h,
 		std::string title = f.title;
 		if (title.size() > 40) title = title.substr(0, 38) + "..";
 		dl->AddText(aida::ui::fonts::body_em() ? aida::ui::fonts::body_em() : ImGui::GetFont(),
-			11.f, ImVec2(rx, ry + 7.f),
+			13.f, ImVec2(rx, ry + 8.f),
 			aida::ui::with_alpha(th.text_primary, alpha * entrance), title.c_str());
 		rx += col_title_w;
 
 		std::string det = f.detail;
 		if (det.size() > 60) det = det.substr(0, 58) + "..";
 		dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-			11.f, ImVec2(rx, ry + 7.f),
+			13.f, ImVec2(rx, ry + 8.f),
 			aida::ui::with_alpha(th.text_secondary, alpha * entrance), det.c_str());
 	}
 
@@ -383,7 +383,7 @@ inline void render_protection_scan(float pos_x, float pos_y, float w, float h,
 		if (!font) font = ImGui::GetFont();
 		const char* msg = "Run a scan to see summary";
 		ImVec2 sz = font->CalcTextSizeA(12.f, FLT_MAX, 0.f, msg);
-		dl->AddText(font, 12.f,
+		dl->AddText(font, 13.f,
 			ImVec2(c_a.x + (c_b.x - c_a.x - sz.x) * 0.5f,
 				   c_a.y + (c_b.y - c_a.y - sz.y) * 0.5f),
 			aida::ui::with_alpha(th.text_dim, alpha), msg);
@@ -431,7 +431,7 @@ inline void render_stealth_controls(float pos_x, float pos_y, float w, float h,
 
 	if (!stealth_active) {
 		if (aida::ui::button("Start Stealth", aida::ui::button_kind_t::primary,
-			aida::ui::size_t_::sm, ImVec2(120.f, 22.f))) {
+			aida::ui::size_t_::sm, ImVec2(120.f, 28.f))) {
 			uint32_t pid = 0;
 			if (st.pid_input[0])
 				pid = static_cast<uint32_t>(std::strtoul(st.pid_input, nullptr, 10));
@@ -440,7 +440,7 @@ inline void render_stealth_controls(float pos_x, float pos_y, float w, float h,
 		}
 	} else {
 		if (aida::ui::button("Stop Stealth", aida::ui::button_kind_t::destructive,
-			aida::ui::size_t_::sm, ImVec2(120.f, 22.f))) {
+			aida::ui::size_t_::sm, ImVec2(120.f, 28.f))) {
 			stealth_engine::disable_stealth();
 		}
 	}
@@ -473,7 +473,7 @@ inline void render_stealth_controls(float pos_x, float pos_y, float w, float h,
 	cy += toolbar_h + 6.f;
 	float hy = cy;
 
-	const float row_h = 24.f;
+	const float row_h = 28.f;
 	std::vector<stealth_engine::hook_entry_t> hooks_copy;
 	bool peb_ok = false;
 	bool rdtsc_ok = false;
@@ -501,15 +501,15 @@ inline void render_stealth_controls(float pos_x, float pos_y, float w, float h,
 	if (!head_em) head_em = ImGui::GetFont();
 	ImU32 hc = aida::ui::with_alpha(th.text_secondary, alpha);
 	float hx = cx + 6.f;
-	dl->AddText(head_em, 11.f, ImVec2(hx, hy + 6.f), hc, "Target Address");
+	dl->AddText(head_em, 13.f, ImVec2(hx, hy + 7.f), hc, "Target Address");
 	hx += col_target_w;
-	dl->AddText(head_em, 11.f, ImVec2(hx, hy + 6.f), hc, "Trampoline");
+	dl->AddText(head_em, 13.f, ImVec2(hx, hy + 7.f), hc, "Trampoline");
 	hx += col_tramp_w;
-	dl->AddText(head_em, 11.f, ImVec2(hx, hy + 6.f), hc, "Size");
+	dl->AddText(head_em, 13.f, ImVec2(hx, hy + 7.f), hc, "Size");
 	hx += col_size_w;
-	dl->AddText(head_em, 11.f, ImVec2(hx, hy + 6.f), hc, "PEB");
+	dl->AddText(head_em, 13.f, ImVec2(hx, hy + 7.f), hc, "PEB");
 	hx += col_peb_w;
-	dl->AddText(head_em, 11.f, ImVec2(hx, hy + 6.f), hc, "Active");
+	dl->AddText(head_em, 13.f, ImVec2(hx, hy + 7.f), hc, "Active");
 	hy += row_h;
 
 	int total_rows = static_cast<int>(hooks_copy.size());
@@ -562,27 +562,27 @@ inline void render_stealth_controls(float pos_x, float pos_y, float w, float h,
 		char addr_buf[24];
 		std::snprintf(addr_buf, sizeof(addr_buf), "0x%llX",
 			static_cast<unsigned long long>(hook.target_addr));
-		dl->AddText(code_font, 11.f, ImVec2(rx, ry + 6.f),
+		dl->AddText(code_font, 13.f, ImVec2(rx, ry + 7.f),
 			aida::ui::with_alpha(th.text_address, alpha), addr_buf);
 		rx += col_target_w;
 
 		char tramp_buf[24];
 		std::snprintf(tramp_buf, sizeof(tramp_buf), "0x%llX",
 			static_cast<unsigned long long>(hook.trampoline_addr));
-		dl->AddText(code_font, 11.f, ImVec2(rx, ry + 6.f),
+		dl->AddText(code_font, 13.f, ImVec2(rx, ry + 7.f),
 			aida::ui::with_alpha(th.text_dim, alpha), tramp_buf);
 		rx += col_tramp_w;
 
 		char size_buf[8];
 		std::snprintf(size_buf, sizeof(size_buf), "%d", hook.hook_size);
-		dl->AddText(code_font, 11.f, ImVec2(rx, ry + 6.f),
+		dl->AddText(code_font, 13.f, ImVec2(rx, ry + 7.f),
 			aida::ui::with_alpha(th.text_primary, alpha), size_buf);
 		rx += col_size_w;
 
 		ImU32 peb_col = peb_ok
 			? aida::ui::with_alpha(th.success, alpha)
 			: aida::ui::with_alpha(th.error, alpha);
-		dl->AddText(code_font, 11.f, ImVec2(rx, ry + 6.f), peb_col, peb_ok ? "yes" : "no");
+		dl->AddText(code_font, 13.f, ImVec2(rx, ry + 7.f), peb_col, peb_ok ? "yes" : "no");
 		rx += col_peb_w;
 
 		ImU32 dot_col = hook.active
@@ -590,7 +590,7 @@ inline void render_stealth_controls(float pos_x, float pos_y, float w, float h,
 			: aida::ui::with_alpha(th.error, alpha);
 		aida::ui::components::status_dot(ImVec2(rx + 6.f, ry + row_h * 0.5f), 3.f,
 			dot_col, hook.active, 1.4f);
-		dl->AddText(code_font, 11.f, ImVec2(rx + 18.f, ry + 6.f),
+		dl->AddText(code_font, 13.f, ImVec2(rx + 18.f, ry + 7.f),
 			dot_col, hook.active ? "active" : "removed");
 		(void)col_active_w;
 	}

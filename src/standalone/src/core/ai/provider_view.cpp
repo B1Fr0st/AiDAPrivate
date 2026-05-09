@@ -787,7 +787,7 @@ namespace {
 			char count_buf[64];
 			std::snprintf(count_buf, sizeof(count_buf), "%d models",
 				static_cast<int>(provider.model_ids.size()));
-			dl->AddText(aida::ui::fonts::caption(), 11.f,
+			dl->AddText(aida::ui::fonts::caption(), 13.f,
 				ImVec2(middle_x, card_a.y + card_h - 22.f),
 				aida::ui::with_alpha(th.text_dim, alpha), count_buf);
 		}
@@ -840,10 +840,10 @@ namespace {
 				current_model->cost.input_per_million,
 				current_model->cost.output_per_million);
 			std::string ctx_label = "ctx: " + format_context(current_model->limit.context);
-			dl->AddText(aida::ui::fonts::caption(), 11.f,
+			dl->AddText(aida::ui::fonts::caption(), 13.f,
 				ImVec2(right_x, info_y),
 				aida::ui::with_alpha(th.text_dim, alpha), cost_label.c_str());
-			dl->AddText(aida::ui::fonts::caption(), 11.f,
+			dl->AddText(aida::ui::fonts::caption(), 13.f,
 				ImVec2(right_x, info_y + 14.f),
 				aida::ui::with_alpha(th.text_dim, alpha), ctx_label.c_str());
 
@@ -857,10 +857,12 @@ namespace {
 			ImVec2 bg_b(right_x + bar_w, bar_y + bar_h);
 			dl->AddRectFilled(bg_a, bg_b,
 				aida::ui::with_alpha(th.panel_header, alpha), bar_h * 0.5f);
-			dl->AddRectFilledMultiColor(
-				bg_a, ImVec2(right_x + bar_w * ratio, bar_y + bar_h),
-				th.accent_grad_top, th.accent_grad_top,
-				th.accent_grad_bot, th.accent_grad_bot);
+			{
+				ImU32 prog_flat = aida::ui::mix(th.accent_grad_top, th.accent_grad_bot, 0.5f);
+				dl->AddRectFilled(
+					bg_a, ImVec2(right_x + bar_w * ratio, bar_y + bar_h),
+					prog_flat, bar_h * 0.5f);
+			}
 		}
 
 		ImGui::SetCursorScreenPos(ImVec2(right_x, card_b.y - 32.f));
@@ -940,7 +942,7 @@ namespace {
 			} else {
 				std::snprintf(buf, sizeof(buf), "FAIL: %s", truncate_text(test_res.message, 90).c_str());
 			}
-			dl->AddText(aida::ui::fonts::caption(), 10.f,
+			dl->AddText(aida::ui::fonts::caption(), 12.f,
 				ImVec2(right_x, card_b.y - 50.f), res_col, buf);
 		}
 
@@ -993,7 +995,7 @@ namespace {
 			aida::ui::with_alpha(th.text_primary, alpha), title.c_str());
 
 		ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 40.f));
-		dl->AddText(aida::ui::fonts::body_em(), 12.f,
+		dl->AddText(aida::ui::fonts::body_em(), 14.f,
 			ImVec2(a.x + 14.f, a.y + 40.f),
 			aida::ui::with_alpha(th.text_secondary, alpha), "Base URL");
 
@@ -1003,7 +1005,7 @@ namespace {
 			"https://api.host", false, ImVec2(pane_w - 28.f, 32.f));
 
 		ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 100.f));
-		dl->AddText(aida::ui::fonts::body_em(), 12.f,
+		dl->AddText(aida::ui::fonts::body_em(), 14.f,
 			ImVec2(a.x + 14.f, a.y + 100.f),
 			aida::ui::with_alpha(th.text_secondary, alpha), "Extra headers JSON");
 

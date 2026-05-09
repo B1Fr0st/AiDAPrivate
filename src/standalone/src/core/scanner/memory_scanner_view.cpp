@@ -95,7 +95,7 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a)
 	}
 
 	if (sc.config.scan_mode == memory_scanner::scan_mode_t::value_between) {
-		dl->AddText(aida::ui::fonts::caption(), 12.f,
+		dl->AddText(aida::ui::fonts::caption(), 14.f,
 			ImVec2(cx, cy + 10.f),
 			aida::ui::with_alpha(t.text_dim, a), "to");
 		cx += 22.f;
@@ -174,7 +174,7 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a)
 		char pct_buf[8];
 		snprintf(pct_buf, sizeof(pct_buf), "%d%%", static_cast<int>(prog * 100.f));
 		ImVec2 pct_sz = ImGui::CalcTextSize(pct_buf);
-		dl->AddText(aida::ui::fonts::caption(), 11.f,
+		dl->AddText(aida::ui::fonts::caption(), 13.f,
 			ImVec2(ring_cx - pct_sz.x * 0.5f, ring_cy - pct_sz.y * 0.5f),
 			aida::ui::with_alpha(t.text_primary, a), pct_buf);
 		cx += ring_r * 2.f + 14.f;
@@ -184,7 +184,7 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a)
 		char count_buf[64];
 		snprintf(count_buf, sizeof(count_buf), "%zu found", sc.total_found);
 		ImVec2 cts = ImGui::CalcTextSize(count_buf);
-		dl->AddText(aida::ui::fonts::caption(), 12.f,
+		dl->AddText(aida::ui::fonts::caption(), 14.f,
 			ImVec2(ox + w - pad - cts.x, oy + (h - cts.y) * 0.5f),
 			aida::ui::with_alpha(t.text_secondary, a), count_buf);
 	}
@@ -195,8 +195,8 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
 
-	float row_h = 24.f;
-	float hdr_h = 26.f;
+	float row_h = 28.f;
+	float hdr_h = 30.f;
 
 	ImU32 hdr_bg = aida::ui::with_alpha(t.panel_header, a * 0.85f);
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + hdr_h), hdr_bg);
@@ -213,7 +213,7 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 	float col_widths[4] = { col_addr_w, col_val_w, col_prev_w, col_mod_w };
 	float hx = ox + 12.f;
 	for (int c = 0; c < 4; ++c) {
-		dl->AddText(aida::ui::fonts::caption(), 11.f,
+		dl->AddText(aida::ui::fonts::caption(), 13.f,
 			ImVec2(hx, oy + (hdr_h - 11.f) * 0.5f),
 			aida::ui::with_alpha(t.text_dim, a), col_names[c]);
 		hx += col_widths[c];
@@ -232,7 +232,7 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 			aida::ui::with_alpha(t.accent_dim, a * 0.4f), pill_h * 0.5f);
 		dl->AddRect(ImVec2(bx, by), ImVec2(bx + pill_w, by + pill_h),
 			aida::ui::with_alpha(t.accent_u32, a * 0.6f), pill_h * 0.5f, 0, 1.f);
-		dl->AddText(aida::ui::fonts::caption(), 11.f,
+		dl->AddText(aida::ui::fonts::caption(), 13.f,
 			ImVec2(bx + pad_x, by + (pill_h - 11.f) * 0.5f),
 			aida::ui::with_alpha(t.accent_u32, a), count_buf);
 	}
@@ -337,7 +337,7 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 		snprintf(addr_buf, sizeof(addr_buf), "%016" PRIX64, r.address);
 
 		float rx = ox + 12.f;
-		dl->AddText(aida::ui::fonts::code(), 12.f,
+		dl->AddText(aida::ui::fonts::code(), 13.f,
 			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_address, a * row_entrance), addr_buf);
 		rx += col_addr_w;
@@ -354,13 +354,13 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 			else if (cv < pv) cur_color = aida::ui::with_alpha(t.error, a * row_entrance);
 			else cur_color = aida::ui::with_alpha(t.text_primary, a * row_entrance);
 		}
-		dl->AddText(aida::ui::fonts::code(), 12.f,
+		dl->AddText(aida::ui::fonts::code(), 13.f,
 			ImVec2(rx, ry + (row_h - 12.f) * 0.5f), cur_color, cur_str.c_str());
 		rx += col_val_w;
 
 		if (!r.previous_value.empty()) {
 			std::string prev_str = memory_scanner::format_value(r.previous_value, sc.config.value_type);
-			dl->AddText(aida::ui::fonts::code(), 12.f,
+			dl->AddText(aida::ui::fonts::code(), 13.f,
 				ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
 				aida::ui::with_alpha(t.text_dim, a * row_entrance), prev_str.c_str());
 		}
@@ -369,7 +369,7 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 		if (!r.module_name.empty()) {
 			char mod_buf[128];
 			snprintf(mod_buf, sizeof(mod_buf), "%s+0x%" PRIX64, r.module_name.c_str(), r.module_offset);
-			dl->AddText(aida::ui::fonts::caption(), 11.f,
+			dl->AddText(aida::ui::fonts::caption(), 13.f,
 				ImVec2(rx, ry + (row_h - 11.f) * 0.5f),
 				aida::ui::with_alpha(t.text_secondary, a * row_entrance), mod_buf);
 		}
@@ -438,7 +438,7 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 			ImVec2(dot_cx + 5.f, dot_cy - 3.f),
 			ImVec2(dot_cx, dot_cy + 4.f),
 			aida::ui::with_alpha(t.accent_u32, a * pa));
-		dl->AddText(aida::ui::fonts::caption(), 12.f,
+		dl->AddText(aida::ui::fonts::caption(), 14.f,
 			ImVec2(dot_cx + 10.f, pa_min.y + (ph - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_primary, a * pa), lbl);
 
@@ -458,8 +458,8 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
 
-	float row_h = 26.f;
-	float hdr_h = 28.f;
+	float row_h = 30.f;
+	float hdr_h = 32.f;
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + hdr_h),
 		aida::ui::with_alpha(t.panel_header, a * 0.85f));
@@ -480,7 +480,7 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 		const char* lbl = ui.auto_refresh ? "Auto" : "Manual";
 		ImU32 lbl_col = ui.auto_refresh ? aida::ui::with_alpha(t.accent_u32, a)
 		                                 : aida::ui::with_alpha(t.text_dim, a);
-		dl->AddText(aida::ui::fonts::caption(), 11.f,
+		dl->AddText(aida::ui::fonts::caption(), 13.f,
 			ImVec2(ox + w - 50.f, oy + (hdr_h - 11.f) * 0.5f), lbl_col, lbl);
 	}
 
@@ -500,7 +500,7 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 
 	float hx = ox + 12.f;
 	for (int c = 0; c < 5; ++c) {
-		dl->AddText(aida::ui::fonts::caption(), 11.f,
+		dl->AddText(aida::ui::fonts::caption(), 13.f,
 			ImVec2(hx, oy + hdr_h + (tbl_hdr_h - 11.f) * 0.5f),
 			aida::ui::with_alpha(t.text_dim, a), col_names[c]);
 		hx += col_widths[c];
@@ -575,7 +575,7 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 		}
 		rx += col_freeze_w;
 
-		dl->AddText(aida::ui::fonts::body(), 12.f,
+		dl->AddText(aida::ui::fonts::body(), 14.f,
 			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_primary, a),
 			e.description.empty() ? "<no description>" : e.description.c_str());
@@ -583,19 +583,19 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 
 		char abuf[20];
 		snprintf(abuf, sizeof(abuf), "%016" PRIX64, e.address);
-		dl->AddText(aida::ui::fonts::code(), 12.f,
+		dl->AddText(aida::ui::fonts::code(), 13.f,
 			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_address, a), abuf);
 		rx += col_addr_w;
 
-		dl->AddText(aida::ui::fonts::caption(), 11.f,
+		dl->AddText(aida::ui::fonts::caption(), 13.f,
 			ImVec2(rx, ry + (row_h - 11.f) * 0.5f),
 			aida::ui::with_alpha(t.text_secondary, a),
 			memory_scanner::value_type_name(e.value_type));
 		rx += col_type_w;
 
 		std::string val_str = memory_scanner::format_value(e.last_value, e.value_type);
-		dl->AddText(aida::ui::fonts::code(), 12.f,
+		dl->AddText(aida::ui::fonts::code(), 13.f,
 			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.success, a), val_str.c_str());
 

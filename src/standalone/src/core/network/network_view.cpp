@@ -1010,67 +1010,56 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
         state.cap_selected = -1;
     }
 
-    ImGui::SameLine();
-    aida::ui::input_text("##cap_filter", state.cap_filter_text, sizeof(state.cap_filter_text),
-                          "Filter packets...", false, ImVec2(220.f, 28.f));
-
-    ImGui::SameLine();
     {
         char count_buf[32];
         snprintf(count_buf, sizeof(count_buf), "%zu packets", pkt_count);
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)), "%s", count_buf);
+        float count_w = ImGui::CalcTextSize(count_buf).x;
+        float row_avail = ImGui::GetContentRegionAvail().x;
+        float pad = 12.f;
+        if (row_avail > count_w + pad) {
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (row_avail - count_w - pad));
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
+                               "%s", count_buf);
+        }
+    }
+
+    ImGui::Spacing();
+
+    {
+        float row_avail = ImGui::GetContentRegionAvail().x;
+        float min_input_w = 200.f;
+        float max_input_w = 640.f;
+        float input_w = row_avail - 8.f;
+        if (input_w < min_input_w) input_w = min_input_w;
+        if (input_w > max_input_w) input_w = max_input_w;
+
+        aida::ui::input_text("##cap_filter", state.cap_filter_text, sizeof(state.cap_filter_text),
+                              "Filter packets...", false, ImVec2(input_w, 28.f));
     }
 
     ImGui::Spacing();
 
 
     float split_y = h * state.detail_ratio;
+    float list_top = ImGui::GetCursorPosY();
+    float list_h = split_y - list_top;
+    if (list_h < 80.f) list_h = 80.f;
     float detail_h = h - split_y - 30.f;
 
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 org = ImGui::GetWindowPos();
-    ImVec2 cursor = ImGui::GetCursorPos();
-    float row_h = 20.f;
-    float hdr_y = org.y + cursor.y;
 
-    float col_no = 44.f, col_time = 110.f, col_proto = 60.f, col_src = 170.f, col_dst = 170.f;
-    float col_info = w - col_no - col_time - col_src - col_dst - col_proto - 24.f;
-    if (col_info < 60.f) col_info = 60.f;
-
-    dl->AddRectFilled(ImVec2(org.x, hdr_y), ImVec2(org.x + w, hdr_y + row_h),
-                      aida::ui::with_alpha(th.panel_header, alpha));
-    ui_anim::render_gradient_header(dl, org.x, hdr_y, w, row_h, ar, ag, ab, alpha * 0.30f);
-
-    float cx = org.x + 8.f;
-    ImU32 hdr_col = aida::ui::with_alpha(th.text_secondary, alpha);
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "#");     cx += col_no;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "Time");  cx += col_time;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "Src");   cx += col_src;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "Dst");   cx += col_dst;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "Proto"); cx += col_proto;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "Info");
-
-    ImGui::SetCursorPosY(cursor.y + row_h + 4.f);
-    dl->AddLine(ImVec2(org.x, hdr_y + row_h - 1.f), ImVec2(org.x + w, hdr_y + row_h - 1.f),
-                aida::ui::with_alpha(th.border_subtle, alpha));
-
-    float list_top = cursor.y + row_h + 6.f;
-    float list_h = split_y - list_top;
-
-    ImGui::SetCursorPosY(list_top);
-    ImGui::BeginChild("##cap_list", ImVec2(w - 4.f, list_h), false, ImGuiWindowFlags_NoBackground);
+    ImGui::BeginChild("##cap_list", ImVec2(w - 4.f, list_h), false,
+                      ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
     {
         std::lock_guard<std::mutex> lock(state.cap_mutex);
         ImVec2 list_org = ImGui::GetWindowPos();
         ImVec2 list_sz  = ImGui::GetWindowSize();
-        dl->PushClipRect(list_org, ImVec2(list_org.x + list_sz.x, list_org.y + list_sz.y), true);
-        int cap_visible_row = 0;
 
         if (state.captured_packets.empty()) {
-            dl->PopClipRect();
-            ImGui::EndChild();
             aida::ui::empty_state::config_t cfg;
             cfg.glyph = aida::ui::empty_state::glyph_t::network;
             cfg.title = state.cap_running ? "Waiting for packets..." : "Capture not running";
@@ -1080,103 +1069,133 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             aida::ui::empty_state::render(ImVec2(list_org.x, list_org.y), ImVec2(list_sz.x, list_h), cfg);
             ImGui::Dummy(ImVec2(0.f, list_h));
             ImGui::EndChild();
+            ImGui::EndChild();
             return;
         }
 
-        for (int i = 0; i < static_cast<int>(state.captured_packets.size()); i++) {
-            auto& p = state.captured_packets[static_cast<size_t>(i)];
+        ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(8.f, 7.f));
+        ImGui::PushStyleColor(ImGuiCol_TableHeaderBg, aida::ui::with_alpha(th.panel_header, alpha));
+        ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt, aida::ui::with_alpha(th.hover_wash, alpha * 0.35f));
+        ImGui::PushStyleColor(ImGuiCol_TableBorderLight, aida::ui::with_alpha(th.border_subtle, alpha));
 
-            std::string src_str = format_ip(p.src_addr, 2) + ":" + std::to_string(p.src_port);
-            std::string dst_str = format_ip(p.dst_addr, 2) + ":" + std::to_string(p.dst_port);
+        ImGuiTableFlags table_flags =
+            ImGuiTableFlags_Resizable |
+            ImGuiTableFlags_Reorderable |
+            ImGuiTableFlags_RowBg |
+            ImGuiTableFlags_BordersInnerV |
+            ImGuiTableFlags_NoSavedSettings |
+            ImGuiTableFlags_SizingStretchProp |
+            ImGuiTableFlags_PadOuterX;
 
-            if (state.cap_filter_text[0]) {
-                std::string all = src_str + " " + dst_str + " " + p.protocol_label + " " + p.summary;
-                if (!filter_text_match(state.cap_filter_text, all)) continue;
-            }
+        bool table_open = ImGui::BeginTable("##cap_table", 6, table_flags);
+        if (table_open) {
+            ImGui::TableSetupColumn("#",     ImGuiTableColumnFlags_WidthFixed,   48.f);
+            ImGui::TableSetupColumn("Time",  ImGuiTableColumnFlags_WidthFixed,   110.f);
+            ImGui::TableSetupColumn("Src",   ImGuiTableColumnFlags_WidthStretch, 0.20f);
+            ImGui::TableSetupColumn("Dst",   ImGuiTableColumnFlags_WidthStretch, 0.20f);
+            ImGui::TableSetupColumn("Proto", ImGuiTableColumnFlags_WidthFixed,   64.f);
+            ImGui::TableSetupColumn("Info",  ImGuiTableColumnFlags_WidthStretch, 0.60f);
+            ImGui::TableHeadersRow();
 
-            float row_alpha = 1.f;
-            float row_yoff = 0.f;
-            compute_row_entrance(s_cap_rows, state.captured_packets.size(), row_alpha, row_yoff, i);
-            float r_alpha = alpha * row_alpha;
+            int cap_visible_row = 0;
+            for (int i = 0; i < static_cast<int>(state.captured_packets.size()); i++) {
+                auto& p = state.captured_packets[static_cast<size_t>(i)];
 
-            float ry = ImGui::GetCursorPosY();
-            float abs_ry = list_org.y + ry - row_yoff;
+                std::string src_str = format_ip(p.src_addr, 2) + ":" + std::to_string(p.src_port);
+                std::string dst_str = format_ip(p.dst_addr, 2) + ":" + std::to_string(p.dst_port);
 
-            if (cap_visible_row & 1)
-                dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w, abs_ry + row_h),
-                                  aida::ui::with_alpha(th.hover_wash, r_alpha * 0.35f));
+                if (state.cap_filter_text[0]) {
+                    std::string all = src_str + " " + dst_str + " " + p.protocol_label + " " + p.summary;
+                    if (!filter_text_match(state.cap_filter_text, all)) continue;
+                }
 
-            ImVec2 mouse = ImGui::GetMousePos();
-            bool hovered = (mouse.x >= list_org.x && mouse.x < list_org.x + w &&
-                            mouse.y >= abs_ry && mouse.y < abs_ry + row_h);
-            bool selected = (state.cap_selected == i);
+                float row_alpha = 1.f;
+                float row_yoff = 0.f;
+                compute_row_entrance(s_cap_rows, state.captured_packets.size(), row_alpha, row_yoff, i);
+                float r_alpha = alpha * row_alpha;
 
-            ImU32 proto_col = protocol_stripe_color(p.protocol_label);
+                ImGui::TableNextRow();
 
-            if (selected) {
-                dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w, abs_ry + row_h),
-                                  aida::ui::with_alpha(th.selection, r_alpha), 4.f);
-            } else if (hovered) {
-                dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w, abs_ry + row_h),
-                                  aida::ui::with_alpha(th.hover_wash, r_alpha), 4.f);
-            }
+                bool selected = (state.cap_selected == i);
+                ImU32 proto_col = protocol_stripe_color(p.protocol_label);
 
-            dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + 3.f, abs_ry + row_h),
-                              aida::ui::with_alpha(proto_col, r_alpha));
+                ImGui::TableSetColumnIndex(0);
+                ImGui::PushID(i);
+                char sel_label[32];
+                snprintf(sel_label, sizeof(sel_label), "%d##sel_%d", i + 1, i);
+                ImGuiSelectableFlags sel_flags = ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap;
+                ImU32 dim_col = aida::ui::with_alpha(th.text_dim, r_alpha);
+                ImGui::PushStyleColor(ImGuiCol_Text, dim_col);
+                if (ImGui::Selectable(sel_label, selected, sel_flags)) {
+                    state.cap_selected = i;
+                }
+                ImGui::PopStyleColor();
+                ImVec2 row_min = ImGui::GetItemRectMin();
+                ImVec2 row_max = ImGui::GetItemRectMax();
+                row_max.x = list_org.x + list_sz.x;
+                dl->AddRectFilled(ImVec2(row_min.x, row_min.y),
+                                  ImVec2(row_min.x + 3.f, row_max.y),
+                                  aida::ui::with_alpha(proto_col, r_alpha));
+                if (selected) {
+                    dl->AddRectFilled(ImVec2(row_min.x + 3.f, row_min.y), row_max,
+                                      aida::ui::with_alpha(th.selection, r_alpha * 0.55f), 0.f);
+                }
 
-            if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-                state.cap_selected = i;
+                ImU32 txt_col = aida::ui::with_alpha(selected ? th.text_primary : th.text_secondary, r_alpha);
 
-            ImU32 txt_col = aida::ui::with_alpha(selected ? th.text_primary : th.text_secondary, r_alpha);
-            ImU32 dim_col = aida::ui::with_alpha(th.text_dim, r_alpha);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(dim_col), "%s",
+                                   format_timestamp(p.timestamp).c_str());
 
-            cx = list_org.x + 8.f;
-            char no_buf[16]; snprintf(no_buf, sizeof(no_buf), "%d", i + 1);
-            dl->AddText(ImVec2(cx, abs_ry + 3.f), dim_col, no_buf);
-            cx += col_no;
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(txt_col), "%s", src_str.c_str());
 
-            dl->AddText(ImVec2(cx, abs_ry + 3.f), dim_col, format_timestamp(p.timestamp).c_str());
-            cx += col_time;
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(txt_col), "%s", dst_str.c_str());
 
-            dl->AddText(ImVec2(cx, abs_ry + 3.f), txt_col, src_str.c_str()); cx += col_src;
-            dl->AddText(ImVec2(cx, abs_ry + 3.f), txt_col, dst_str.c_str()); cx += col_dst;
+                ImGui::TableSetColumnIndex(4);
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(proto_col, r_alpha)),
+                                   "%s", p.protocol_label.c_str());
 
-            dl->AddText(ImVec2(cx, abs_ry + 3.f), aida::ui::with_alpha(proto_col, r_alpha),
-                         p.protocol_label.c_str());
-            cx += col_proto;
-
-
-            std::string info = p.summary;
-            if (info.size() > 80) info = info.substr(0, 77) + "...";
-            ImU32 info_col = aida::ui::with_alpha(th.text_secondary, r_alpha);
-            if (!info.empty()) {
-                const char* methods[] = {"GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS "};
-                for (auto* m : methods) {
-                    if (info.compare(0, strlen(m), m) == 0) {
-                        info_col = ui_anim::http_method_color(m, r_alpha);
-                        break;
+                ImGui::TableSetColumnIndex(5);
+                std::string info = p.summary;
+                if (info.size() > 200) info = info.substr(0, 197) + "...";
+                ImU32 info_col = aida::ui::with_alpha(th.text_secondary, r_alpha);
+                if (!info.empty()) {
+                    const char* methods[] = {"GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS "};
+                    for (auto* m : methods) {
+                        if (info.compare(0, strlen(m), m) == 0) {
+                            info_col = ui_anim::http_method_color(m, r_alpha);
+                            break;
+                        }
                     }
                 }
-            }
-            dl->AddText(ImVec2(cx, abs_ry + 3.f), info_col, info.c_str());
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(info_col), "%s", info.c_str());
 
-            cap_visible_row++;
-            ImGui::SetCursorPosY(ry + row_h);
+                ImGui::PopID();
+                cap_visible_row++;
+            }
+
+            ImGui::EndTable();
         }
 
+        ImGui::PopStyleColor(3);
+        ImGui::PopStyleVar();
 
         if (state.cap_auto_scroll && !state.captured_packets.empty())
             ImGui::SetScrollHereY(1.0f);
-        dl->PopClipRect();
     }
 
     ImGui::EndChild();
 
 
     ImGui::Spacing();
-    dl->AddLine(ImVec2(org.x + 2.f, org.y + ImGui::GetCursorPosY()),
-                ImVec2(org.x + w - 2.f, org.y + ImGui::GetCursorPosY()),
-                aida::ui::with_alpha(th.border_subtle, alpha));
+    {
+        ImVec2 wp = ImGui::GetWindowPos();
+        dl->AddLine(ImVec2(wp.x + 2.f, wp.y + ImGui::GetCursorPosY()),
+                    ImVec2(wp.x + w - 2.f, wp.y + ImGui::GetCursorPosY()),
+                    aida::ui::with_alpha(th.border_subtle, alpha));
+    }
     ImGui::Spacing();
 
     if (detail_h > 30.f) {
@@ -1370,6 +1389,20 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
         return;
     }
 
+    int total_visible_rows = 0;
+    for (int i = 0; i < static_cast<int>(state.dns_entries.size()); i++) {
+        auto& d = state.dns_entries[static_cast<size_t>(i)];
+        if (state.dns_filter_text[0]) {
+            std::string all = d.domain + " " + d.resolved_addr + " " + std::to_string(d.pid);
+            if (!filter_text_match(state.dns_filter_text, all)) continue;
+        }
+        total_visible_rows++;
+    }
+
+    float scroll_y = ImGui::GetScrollY();
+    float viewport_top = scroll_y;
+    float viewport_bot = scroll_y + dns_list_sz.y;
+
     int dns_visible_row = 0;
     for (int i = 0; i < static_cast<int>(state.dns_entries.size()); i++) {
         auto& d = state.dns_entries[static_cast<size_t>(i)];
@@ -1379,13 +1412,19 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
             if (!filter_text_match(state.dns_filter_text, all)) continue;
         }
 
+        float ry = static_cast<float>(dns_visible_row) * row_h;
+
+        if (ry + row_h < viewport_top || ry > viewport_bot) {
+            dns_visible_row++;
+            continue;
+        }
+
         float row_alpha = 1.f;
         float row_yoff = 0.f;
         compute_row_entrance(s_dns_rows, state.dns_entries.size(), row_alpha, row_yoff, i);
         float r_alpha = alpha * row_alpha;
 
-        float ry = ImGui::GetCursorPosY();
-        float abs_ry = list_org.y + ry;
+        float abs_ry = list_org.y + ry - scroll_y;
         ImVec2 mouse = ImGui::GetMousePos();
         bool hovered = (mouse.x >= list_org.x && mouse.x < list_org.x + w &&
                         mouse.y >= abs_ry && mouse.y < abs_ry + row_h);
@@ -1437,10 +1476,10 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
         dl->AddText(ImVec2(cx, abs_ry + 3.f), aida::ui::with_alpha(th.text_dim, r_alpha), buf);
 
         dns_visible_row++;
-        ImGui::SetCursorPosY(ry + row_h);
     }
 
     dl->PopClipRect();
+    ImGui::Dummy(ImVec2(1.f, static_cast<float>(total_visible_rows) * row_h));
     ImGui::EndChild();
     ImGui::EndChild();
 }

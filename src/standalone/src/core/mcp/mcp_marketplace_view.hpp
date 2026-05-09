@@ -229,7 +229,7 @@ namespace aida::mcp_marketplace_view {
 			category_t c = static_cast<category_t>(i);
 			const char* label = category_label(c);
 			ImFont* font = aida::ui::fonts::body();
-			float fs = 12.f;
+			float fs = 14.f;
 			float text_w = font->CalcTextSizeA(fs, FLT_MAX, 0.f, label).x;
 			float pill_w = text_w + 22.f;
 			float pill_h = 24.f;
@@ -396,7 +396,8 @@ namespace aida::mcp_marketplace_view {
 
 		ImU32 grad_top = aida::ui::with_alpha(th.accent_grad_top, 0.18f * (0.4f + hov_v * 0.6f));
 		ImU32 grad_bot = aida::ui::with_alpha(th.accent_grad_bot, 0.05f);
-		dl->AddRectFilledMultiColor(a, b, grad_top, grad_top, grad_bot, grad_bot);
+		ImU32 grad_flat = aida::ui::mix(grad_top, grad_bot, 0.5f);
+		dl->AddRectFilled(a, b, grad_flat, 14.f);
 
 		ImVec2 av_c(a.x + 22.f, a.y + 24.f);
 		render_card_glyph_ring(dl, av_c, 16.f, p.name, 1.f);
@@ -406,7 +407,7 @@ namespace aida::mcp_marketplace_view {
 		dl->AddText(aida::ui::fonts::body_strong(), 13.f,
 			ImVec2(text_x, text_y), th.text_primary,
 			truncate_text(p.display_name.empty() ? p.name : p.display_name, 24).c_str());
-		dl->AddText(aida::ui::fonts::caption(), 11.f,
+		dl->AddText(aida::ui::fonts::caption(), 13.f,
 			ImVec2(text_x, text_y + 18.f),
 			aida::ui::with_alpha(th.text_secondary, 0.95f),
 			truncate_text(p.description, 64).c_str(),
@@ -467,11 +468,11 @@ namespace aida::mcp_marketplace_view {
 		dl->AddText(aida::ui::fonts::body_strong(), 14.f,
 			ImVec2(text_x, a.y + 12.f), th.text_primary,
 			(p.display_name.empty() ? p.name : p.display_name).c_str());
-		dl->AddText(aida::ui::fonts::caption(), 11.f,
+		dl->AddText(aida::ui::fonts::caption(), 13.f,
 			ImVec2(text_x, a.y + 32.f),
 			aida::ui::with_alpha(th.text_dim, 0.9f), p.name.c_str());
 
-		dl->AddText(aida::ui::fonts::body(), 12.f,
+		dl->AddText(aida::ui::fonts::body(), 14.f,
 			ImVec2(text_x, a.y + 50.f),
 			aida::ui::with_alpha(th.text_secondary, 0.95f),
 			truncate_text(p.description, 120).c_str(),
@@ -532,7 +533,7 @@ namespace aida::mcp_marketplace_view {
 		dl->AddText(aida::ui::fonts::h2(), 18.f,
 			ImVec2(a.x + pad + 70.f, a.y + pad),
 			th.text_primary, (p.display_name.empty() ? p.name : p.display_name).c_str());
-		dl->AddText(aida::ui::fonts::caption(), 11.f,
+		dl->AddText(aida::ui::fonts::caption(), 13.f,
 			ImVec2(a.x + pad + 70.f, a.y + pad + 22.f),
 			aida::ui::with_alpha(th.text_dim, 1.f), p.name.c_str());
 
@@ -547,7 +548,7 @@ namespace aida::mcp_marketplace_view {
 		float content_y = a.y + pad + 80.f;
 		float content_w = w - pad * 2.f;
 
-		dl->AddText(aida::ui::fonts::body(), 12.f,
+		dl->AddText(aida::ui::fonts::body(), 14.f,
 			ImVec2(a.x + pad, content_y), th.text_primary,
 			p.description.c_str(), nullptr, content_w);
 
@@ -573,7 +574,7 @@ namespace aida::mcp_marketplace_view {
 
 		if (!p.keywords_str.empty()) {
 			float kw_y = info_y + 36.f;
-			dl->AddText(aida::ui::fonts::body_em(), 12.f,
+			dl->AddText(aida::ui::fonts::body_em(), 14.f,
 				ImVec2(a.x + pad, kw_y),
 				aida::ui::with_alpha(th.text_secondary, 1.f), "Tags");
 			float chip_x = a.x + pad;
@@ -623,7 +624,7 @@ namespace aida::mcp_marketplace_view {
 			float ly = lg_a.y + 6.f;
 			for (const auto& ln : lines) {
 				if (ly + 14.f > lg_b.y) break;
-				dl->AddText(aida::ui::fonts::code(), 11.f, ImVec2(lg_a.x + 8.f, ly),
+				dl->AddText(aida::ui::fonts::code(), 13.f, ImVec2(lg_a.x + 8.f, ly),
 					IM_COL32(180, 220, 180, 245), ln.c_str());
 				ly += 14.f;
 			}
@@ -747,7 +748,7 @@ namespace aida::mcp_marketplace_view {
 			wdl->AddText(aida::ui::fonts::display(), 24.f,
 				ImVec2(panel_a.x + pad, panel_a.y + pad),
 				aida::ui::with_alpha(th.text_primary, alpha), "MCP Marketplace");
-			wdl->AddText(aida::ui::fonts::caption(), 12.f,
+			wdl->AddText(aida::ui::fonts::caption(), 14.f,
 				ImVec2(panel_a.x + pad, panel_a.y + pad + 32.f),
 				aida::ui::with_alpha(th.text_dim, alpha),
 				"Discover and install Model Context Protocol servers from npm.");

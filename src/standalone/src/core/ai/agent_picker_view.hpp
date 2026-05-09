@@ -307,7 +307,7 @@ namespace agent_picker {
 
 			const char* hint = "Esc to cancel  |  Click to switch";
 			ImVec2 hts = f_caption->CalcTextSizeA(11.f, FLT_MAX, 0.f, hint);
-			wdl->AddText(f_caption, 11.f,
+			wdl->AddText(f_caption, 13.f,
 				ImVec2(panel_b.x - hts.x - 18.f, panel_a.y + 21.f),
 				aida::ui::with_alpha(th.text_dim, alpha), hint);
 
@@ -459,7 +459,7 @@ namespace agent_picker {
 					desc.resize(93);
 					desc.append("...");
 				}
-				dl->AddText(aida::ui::fonts::caption(), 12.f,
+				dl->AddText(aida::ui::fonts::caption(), 14.f,
 					ImVec2(text_x, row_a.y + 30.f),
 					aida::ui::with_alpha(th.text_secondary, row_alpha * 0.95f),
 					desc.c_str());
@@ -510,7 +510,7 @@ namespace agent_picker {
 			std::string active_name = aida::agent::active_agent_name();
 			std::string footer_active = "Active: " + (active_name.empty() ? std::string("none") : active_name);
 			ImVec2 ats = aida::ui::fonts::caption()->CalcTextSizeA(12.f, FLT_MAX, 0.f, footer_active.c_str());
-			wdl->AddText(aida::ui::fonts::caption(), 12.f,
+			wdl->AddText(aida::ui::fonts::caption(), 14.f,
 				ImVec2(panel_b.x - ats.x - 18.f, footer_y + 8.f),
 				aida::ui::with_alpha(th.text_secondary, alpha),
 				footer_active.c_str());

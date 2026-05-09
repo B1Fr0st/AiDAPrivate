@@ -127,7 +127,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	ImGui::SameLine();
 	if (aida::ui::button("XRefs To", aida::ui::button_kind_t::primary,
-		aida::ui::size_t_::sm, ImVec2(96.f, 22.f))) {
+		aida::ui::size_t_::sm, ImVec2(102.f, 28.f))) {
 		uint64_t addr = std::strtoull(g_view.addr_buf, nullptr, 16);
 		if (addr != 0) {
 			g_view.show_to = true;
@@ -139,7 +139,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 	ImGui::SameLine();
 	if (aida::ui::button("XRefs From", aida::ui::button_kind_t::secondary,
-		aida::ui::size_t_::sm, ImVec2(106.f, 22.f))) {
+		aida::ui::size_t_::sm, ImVec2(112.f, 28.f))) {
 		uint64_t addr = std::strtoull(g_view.addr_buf, nullptr, 16);
 		if (addr != 0) {
 			g_view.show_to = false;
@@ -177,11 +177,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float by = y0 + toolbar_h * 0.5f - bar_h * 0.5f;
 		dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bar_w, by + bar_h),
 			aida::ui::with_alpha(th.panel_header, a), 4.f);
-		dl->AddRectFilledMultiColor(ImVec2(bx, by), ImVec2(bx + bar_w * prog, by + bar_h),
-			aida::ui::with_alpha(th.accent_grad_top, a),
-			aida::ui::with_alpha(th.accent_grad_top, a),
-			aida::ui::with_alpha(th.accent_grad_bot, a),
-			aida::ui::with_alpha(th.accent_grad_bot, a));
+		{
+			ImU32 xref_prog_flat = aida::ui::mix(
+				aida::ui::with_alpha(th.accent_grad_top, a),
+				aida::ui::with_alpha(th.accent_grad_bot, a), 0.5f);
+			dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bar_w * prog, by + bar_h),
+				xref_prog_flat, 4.f);
+		}
 		char pct[16];
 		std::snprintf(pct, sizeof(pct), "%.0f%%", prog * 100.f);
 		ImVec2 pt = ImGui::CalcTextSize(pct);
@@ -216,7 +218,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	auto modules = xref_db::get_module_list();
 	float my = content_y + 30.f;
-	float row_h = 24.f;
+	float row_h = 28.f;
 
 	ImGui::SetCursorPos(ImVec2(pos_x + 4.f, pos_y + toolbar_h + 30.f));
 	ImGui::BeginChild("##xref_mod_list", ImVec2(left_panel_w - 4.f, content_h - 30.f), false,
@@ -306,13 +308,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	float hxx = table_x + 8.f;
 	ImU32 hc = aida::ui::with_alpha(th.text_secondary, a);
-	dl->AddText(head_em, 11.f, ImVec2(hxx, content_y + 7.f), hc, "Dir");
+	dl->AddText(head_em, 13.f, ImVec2(hxx, content_y + 8.f), hc, "Dir");
 	hxx += col_dir_w;
-	dl->AddText(head_em, 11.f, ImVec2(hxx, content_y + 7.f), hc, "Address");
+	dl->AddText(head_em, 13.f, ImVec2(hxx, content_y + 8.f), hc, "Address");
 	hxx += col_addr_w;
-	dl->AddText(head_em, 11.f, ImVec2(hxx, content_y + 7.f), hc, "Type");
+	dl->AddText(head_em, 13.f, ImVec2(hxx, content_y + 8.f), hc, "Type");
 	hxx += col_type_w;
-	dl->AddText(head_em, 11.f, ImVec2(hxx, content_y + 7.f), hc, "Instruction");
+	dl->AddText(head_em, 13.f, ImVec2(hxx, content_y + 8.f), hc, "Instruction");
 
 	float table_body_y = content_y + 26.f;
 	float table_body_h = content_h - 26.f;
@@ -386,14 +388,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (!code_font) code_font = ImGui::GetFont();
 
 		const char* dir_str = g_view.show_to ? "<-" : "->";
-		dl->AddText(code_font, 11.f, ImVec2(rp.x + 8.f, rp.y + 5.f),
+		dl->AddText(code_font, 13.f, ImVec2(rp.x + 8.f, rp.y + 7.f),
 			aida::ui::with_alpha(th.text_dim, final_alpha * entrance), dir_str);
 
 		uint64_t display_addr = g_view.show_to ? e.from_addr : e.to_addr;
 		char addr_str[24];
 		std::snprintf(addr_str, sizeof(addr_str), "0x%llX",
 			static_cast<unsigned long long>(display_addr));
-		dl->AddText(code_font, 11.f, ImVec2(rp.x + col_dir_w + 4.f, rp.y + 5.f),
+		dl->AddText(code_font, 13.f, ImVec2(rp.x + col_dir_w + 4.f, rp.y + 7.f),
 			aida::ui::with_alpha(th.text_address, final_alpha * entrance), addr_str);
 
 		std::string type_str = xref_engine::xref_type_name(e.type);
@@ -401,8 +403,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		aida::ui::pill_kind(type_str.c_str(), xref_pill(e.type),
 			aida::ui::size_t_::sm, false);
 
-		dl->AddText(code_font, 11.f,
-			ImVec2(rp.x + col_dir_w + col_addr_w + col_type_w + 4.f, rp.y + 5.f),
+		dl->AddText(code_font, 13.f,
+			ImVec2(rp.x + col_dir_w + col_addr_w + col_type_w + 4.f, rp.y + 7.f),
 			aida::ui::with_alpha(th.text_primary, final_alpha * entrance),
 			e.disasm_text.c_str());
 

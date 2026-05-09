@@ -11,6 +11,7 @@
 #define ICON_SEARCH        "\xEE\xA6\x86"
 #define ICON_COG           "\xEE\xA6\x94"
 #define ICON_POWER_CORD    "\xEE\xA6\xB7"
+#define ICON_FUNCTION      "\xC6\x92"
 
 
 static const unsigned char ide_icon_font_data[2388] = {

@@ -97,7 +97,7 @@ inline void render_stat_card(ImDrawList* dl, float x, float y, float w, float h,
 	dl->AddRectFilled(ImVec2(a.x, a.y), ImVec2(a.x + 3.f, a.y + h),
 		aida::ui::with_alpha(accent_token, 0.85f * alpha * row_t), 10.f);
 
-	dl->AddText(aida::ui::fonts::caption(), 11.f, ImVec2(a.x + 12.f, a.y + 6.f),
+	dl->AddText(aida::ui::fonts::caption(), 13.f, ImVec2(a.x + 12.f, a.y + 6.f),
 		aida::ui::with_alpha(t.text_dim, alpha * row_t), label);
 	dl->AddText(aida::ui::fonts::body_strong(), 18.f,
 		ImVec2(a.x + 12.f, a.y + h - 22.f),
@@ -347,7 +347,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		dl->AddRectFilled(ImVec2(xs, code_panel_top + hdr_h - 2.f),
 			ImVec2(xe, code_panel_top + hdr_h),
 			aida::ui::with_alpha(stripe_col, 0.65f * alpha));
-		dl->AddText(aida::ui::fonts::body_em(), 12.f,
+		dl->AddText(aida::ui::fonts::body_em(), 14.f,
 			ImVec2(xs + 14.f, code_panel_top + 7.f),
 			aida::ui::with_alpha(t.text_primary, alpha), title);
 	};
@@ -388,14 +388,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImU32 addr_col = is_junk
 			? aida::ui::with_alpha(t.text_dim, alpha)
 			: aida::ui::with_alpha(t.text_address, alpha);
-		dl->AddText(aida::ui::fonts::code(), 12.f,
+		dl->AddText(aida::ui::fonts::code(), 13.f,
 			ImVec2(xs + 8.f, ry + (row_h - 12.f) * 0.5f), addr_col, abuf);
 
 		ImU32 disasm_col = is_junk
 			? aida::ui::with_alpha(t.text_dim, alpha * 0.85f)
 			: aida::ui::with_alpha(t.text_primary, alpha);
 		std::string disp = detail::short_disasm(ci->disasm, 60);
-		dl->AddText(aida::ui::fonts::code(), 12.f,
+		dl->AddText(aida::ui::fonts::code(), 13.f,
 			ImVec2(xs + 130.f, ry + (row_h - 12.f) * 0.5f),
 			disasm_col, disp.c_str());
 
@@ -592,7 +592,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ui_anim::render_donut_chart(dl, ring_cx, ring_cy, ring_r, 8.f,
 			fracs, cols, 3, alpha, pct_buf);
 
-		dl->AddText(aida::ui::fonts::caption(), 11.f,
+		dl->AddText(aida::ui::fonts::caption(), 13.f,
 			ImVec2(ring_cx - 14.f, ring_cy + ring_r + 6.f),
 			aida::ui::with_alpha(t.text_dim, alpha), "junk");
 
@@ -605,7 +605,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (!res.state_vars.empty() && iy < body_top + body_h - 80.f) {
 		ImGui::SetCursorScreenPos(ImVec2(section_x, iy));
 		ImGui::PushClipRect(ImVec2(info_x, iy), ImVec2(info_x + info_w, body_top + body_h), true);
-		dl->AddText(aida::ui::fonts::body_em(), 12.f, ImVec2(section_x + 4.f, iy),
+		dl->AddText(aida::ui::fonts::body_em(), 14.f, ImVec2(section_x + 4.f, iy),
 			aida::ui::with_alpha(t.text_secondary, alpha), "STATE MACHINE");
 		dl->AddLine(ImVec2(section_x, iy + 16.f), ImVec2(section_x + section_w, iy + 16.f),
 			aida::ui::with_alpha(t.border_subtle, alpha), 1.f);
@@ -615,13 +615,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			char dbuf[64];
 			std::snprintf(dbuf, sizeof(dbuf), "Dispatcher: %llX",
 				static_cast<unsigned long long>(sv.dispatcher_addr));
-			dl->AddText(aida::ui::fonts::code(), 12.f, ImVec2(section_x + 4.f, iy),
+			dl->AddText(aida::ui::fonts::code(), 13.f, ImVec2(section_x + 4.f, iy),
 				aida::ui::with_alpha(t.text_dim, alpha), dbuf);
 			iy += 16.f;
 
-			dl->AddText(aida::ui::fonts::caption(), 11.f, ImVec2(section_x + 4.f, iy),
+			dl->AddText(aida::ui::fonts::caption(), 13.f, ImVec2(section_x + 4.f, iy),
 				aida::ui::with_alpha(t.text_dim, alpha), "Register:");
-			dl->AddText(aida::ui::fonts::code_em(), 12.f, ImVec2(section_x + 64.f, iy - 1.f),
+			dl->AddText(aida::ui::fonts::code_em(), 13.f, ImVec2(section_x + 64.f, iy - 1.f),
 				aida::ui::with_alpha(t.warning, alpha), sv.register_name.c_str());
 			iy += 18.f;
 
@@ -633,7 +633,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				std::snprintf(sbuf, sizeof(sbuf), "  0x%llX -> 0x%llX",
 					static_cast<unsigned long long>(state_val),
 					static_cast<unsigned long long>(target));
-				dl->AddText(aida::ui::fonts::code(), 12.f, ImVec2(section_x + 4.f, iy),
+				dl->AddText(aida::ui::fonts::code(), 13.f, ImVec2(section_x + 4.f, iy),
 					aida::ui::with_alpha(t.info, alpha), sbuf);
 				iy += 16.f;
 				++shown;
@@ -645,7 +645,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	if (!res.opaques.empty() && iy < body_top + body_h - 40.f) {
-		dl->AddText(aida::ui::fonts::body_em(), 12.f, ImVec2(section_x + 4.f, iy),
+		dl->AddText(aida::ui::fonts::body_em(), 14.f, ImVec2(section_x + 4.f, iy),
 			aida::ui::with_alpha(t.text_secondary, alpha), "OPAQUE PREDICATES");
 		dl->AddLine(ImVec2(section_x, iy + 16.f), ImVec2(section_x + section_w, iy + 16.f),
 			aida::ui::with_alpha(t.border_subtle, alpha), 1.f);
@@ -660,7 +660,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			std::snprintf(obuf, sizeof(obuf), "%llX %s",
 				static_cast<unsigned long long>(op.address),
 				op.always_taken ? "always-T" : "never-T");
-			dl->AddText(aida::ui::fonts::code(), 12.f, ImVec2(section_x + 4.f, iy),
+			dl->AddText(aida::ui::fonts::code(), 13.f, ImVec2(section_x + 4.f, iy),
 				aida::ui::with_alpha(t.warning, alpha), obuf);
 			iy += 16.f;
 		}
@@ -668,7 +668,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	if (!res.constants.empty() && iy < body_top + body_h - 40.f) {
-		dl->AddText(aida::ui::fonts::body_em(), 12.f, ImVec2(section_x + 4.f, iy),
+		dl->AddText(aida::ui::fonts::body_em(), 14.f, ImVec2(section_x + 4.f, iy),
 			aida::ui::with_alpha(t.text_secondary, alpha), "RESOLVED CONSTANTS");
 		dl->AddLine(ImVec2(section_x, iy + 16.f), ImVec2(section_x + section_w, iy + 16.f),
 			aida::ui::with_alpha(t.border_subtle, alpha), 1.f);
@@ -684,7 +684,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				static_cast<unsigned long long>(c.address),
 				c.register_name.c_str(),
 				static_cast<unsigned long long>(c.concrete_value));
-			dl->AddText(aida::ui::fonts::code(), 12.f, ImVec2(section_x + 4.f, iy),
+			dl->AddText(aida::ui::fonts::code(), 13.f, ImVec2(section_x + 4.f, iy),
 				aida::ui::with_alpha(t.success, alpha), cbuf);
 			iy += 16.f;
 		}

@@ -108,7 +108,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	bool scanning = oracle.scanning.load();
 	if (!scanning) {
 		if (aida::ui::button("Scan & Decrypt", aida::ui::button_kind_t::primary,
-			aida::ui::size_t_::sm, ImVec2(126.f, 22.f))) {
+			aida::ui::size_t_::sm, ImVec2(126.f, 28.f))) {
 			uint64_t addr = 0;
 			uint64_t sz = 4096;
 			if (oracle.address_input[0]) addr = std::strtoull(oracle.address_input, nullptr, 16);
@@ -117,7 +117,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	} else {
 		if (aida::ui::button("Cancel", aida::ui::button_kind_t::destructive,
-			aida::ui::size_t_::sm, ImVec2(86.f, 22.f))) {
+			aida::ui::size_t_::sm, ImVec2(86.f, 28.f))) {
 			oracle.cancel.store(true);
 		}
 	}
@@ -136,11 +136,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		dl->AddRectFilled(ImVec2(bar_x, bar_y), ImVec2(bar_x + bar_w, bar_y + bar_h),
 			aida::ui::with_alpha(th.panel_header, alpha * 0.6f), 3.f);
-		dl->AddRectFilledMultiColor(ImVec2(bar_x, bar_y), ImVec2(bar_x + bar_w * prog, bar_y + bar_h),
-			aida::ui::with_alpha(th.accent_grad_top, alpha),
-			aida::ui::with_alpha(th.accent_grad_top, alpha),
-			aida::ui::with_alpha(th.accent_grad_bot, alpha),
-			aida::ui::with_alpha(th.accent_grad_bot, alpha));
+		{
+			ImU32 prog_flat = aida::ui::mix(
+				aida::ui::with_alpha(th.accent_grad_top, alpha),
+				aida::ui::with_alpha(th.accent_grad_bot, alpha), 0.5f);
+			dl->AddRectFilled(ImVec2(bar_x, bar_y), ImVec2(bar_x + bar_w * prog, bar_y + bar_h),
+				prog_flat, 3.f);
+		}
 
 		char prog_text[64];
 		std::snprintf(prog_text, sizeof(prog_text), "%d / %d xrefs   %.0f%%",
@@ -228,7 +230,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	float hx = cx + pad;
 	float hy = table_top;
-	const float row_h = 24.f;
+	const float row_h = 28.f;
 
 	ImU32 hdr_bg = aida::ui::with_alpha(th.panel_header, alpha * 0.9f);
 	dl->AddRectFilled(ImVec2(hx, hy), ImVec2(cx + width - pad, hy + row_h), hdr_bg, 6.f);
@@ -239,15 +241,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (!head_em) head_em = ImGui::GetFont();
 	ImU32 hc = aida::ui::with_alpha(th.text_secondary, alpha);
 	float hxx = hx + 6.f;
-	dl->AddText(head_em, 11.f, ImVec2(hxx, hy + 6.f), hc, "Source Func");
+	dl->AddText(head_em, 13.f, ImVec2(hxx, hy + 7.f), hc, "Source Func");
 	hxx += col_func_w;
-	dl->AddText(head_em, 11.f, ImVec2(hxx, hy + 6.f), hc, "Enc Offset");
+	dl->AddText(head_em, 13.f, ImVec2(hxx, hy + 7.f), hc, "Enc Offset");
 	hxx += col_offset_w;
-	dl->AddText(head_em, 11.f, ImVec2(hxx, hy + 6.f), hc, "Decrypted String");
+	dl->AddText(head_em, 13.f, ImVec2(hxx, hy + 7.f), hc, "Decrypted String");
 	hxx += col_string_w;
-	dl->AddText(head_em, 11.f, ImVec2(hxx, hy + 6.f), hc, "Conf");
+	dl->AddText(head_em, 13.f, ImVec2(hxx, hy + 7.f), hc, "Conf");
 	hxx += col_conf_w;
-	dl->AddText(head_em, 11.f, ImVec2(hxx, hy + 6.f), hc, "Len");
+	dl->AddText(head_em, 13.f, ImVec2(hxx, hy + 7.f), hc, "Len");
 	float conf_x = hx + col_func_w + col_offset_w + col_string_w;
 	hy += row_h;
 
@@ -346,20 +348,20 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		char func_buf[24];
 		std::snprintf(func_buf, sizeof(func_buf), "0x%llX",
 			static_cast<unsigned long long>(r.source_function));
-		dl->AddText(code_font, 11.f, ImVec2(hx + 6.f, ry + 6.f),
+		dl->AddText(code_font, 13.f, ImVec2(hx + 6.f, ry + 7.f),
 			aida::ui::with_alpha(th.text_primary, alpha * entrance), func_buf);
 
 		char off_buf[24];
 		std::snprintf(off_buf, sizeof(off_buf), "0x%llX",
 			static_cast<unsigned long long>(r.encrypted_offset));
-		dl->AddText(code_font, 11.f, ImVec2(hx + col_func_w + 4.f, ry + 6.f),
+		dl->AddText(code_font, 13.f, ImVec2(hx + col_func_w + 4.f, ry + 7.f),
 			aida::ui::with_alpha(th.text_dim, alpha * entrance), off_buf);
 
 		float str_max_w = col_string_w - 8.f;
 		std::string display_str = r.decrypted;
 		if (display_str.size() > 80) display_str = display_str.substr(0, 77) + "...";
-		dl->AddText(code_font, 11.f,
-			ImVec2(hx + col_func_w + col_offset_w + 4.f, ry + 6.f),
+		dl->AddText(code_font, 13.f,
+			ImVec2(hx + col_func_w + col_offset_w + 4.f, ry + 7.f),
 			aida::ui::with_alpha(th.success, alpha * entrance),
 			display_str.c_str(), display_str.c_str() + display_str.size(),
 			str_max_w);
@@ -381,21 +383,24 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		} else {
 			fill_top = th.error; fill_bot = aida::ui::darken(th.error, 30);
 		}
-		dl->AddRectFilledMultiColor(ImVec2(bar_x, bar_y),
-			ImVec2(bar_x + bar_w * visible_conf, bar_y + bar_h),
-			aida::ui::with_alpha(fill_top, alpha * entrance),
-			aida::ui::with_alpha(fill_top, alpha * entrance),
-			aida::ui::with_alpha(fill_bot, alpha * entrance),
-			aida::ui::with_alpha(fill_bot, alpha * entrance));
+		{
+			ImU32 conf_flat = aida::ui::mix(
+				aida::ui::with_alpha(fill_top, alpha * entrance),
+				aida::ui::with_alpha(fill_bot, alpha * entrance),
+				0.5f);
+			dl->AddRectFilled(ImVec2(bar_x, bar_y),
+				ImVec2(bar_x + bar_w * visible_conf, bar_y + bar_h),
+				conf_flat, 2.f);
+		}
 		char conf_buf[16];
 		std::snprintf(conf_buf, sizeof(conf_buf), "%.0f%%", r.confidence * 100.f);
 		ImVec2 confts = ImGui::CalcTextSize(conf_buf);
-		dl->AddText(code_font, 10.f, ImVec2(bar_x + bar_w - confts.x, ry + 4.f),
+		dl->AddText(code_font, 12.f, ImVec2(bar_x + bar_w - confts.x, ry + 5.f),
 			aida::ui::with_alpha(th.text_dim, alpha * entrance), conf_buf);
 
 		char len_buf[16];
 		std::snprintf(len_buf, sizeof(len_buf), "%d", r.length);
-		dl->AddText(code_font, 11.f, ImVec2(conf_x + col_conf_w + 4.f, ry + 6.f),
+		dl->AddText(code_font, 13.f, ImVec2(conf_x + col_conf_w + 4.f, ry + 7.f),
 			aida::ui::with_alpha(th.text_dim, alpha * entrance), len_buf);
 	}
 

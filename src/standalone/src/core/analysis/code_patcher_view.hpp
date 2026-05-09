@@ -102,7 +102,7 @@ namespace aida::code_patcher::view {
 			static_cast<unsigned long long>(patch.address));
 		ImFont* code_font = aida::ui::fonts::code();
 		if (!code_font) code_font = ImGui::GetFont();
-		dl->AddText(code_font, 11.f, ImVec2(a.x + 100.f, a.y + 10.f),
+		dl->AddText(code_font, 13.f, ImVec2(a.x + 100.f, a.y + 10.f),
 			aida::ui::with_alpha(th.text_address, alpha), addr);
 
 		float ax = a.x + 12.f;
@@ -130,9 +130,9 @@ namespace aida::code_patcher::view {
 
 		std::string orig_str = format_bytes_short(patch.original_bytes, 16);
 		std::string patched_str = format_bytes_short(patch.patched_bytes, 16);
-		dl->AddText(code_font, 11.f, ImVec2(a_l.x + 8.f, a_l.y + 12.f),
+		dl->AddText(code_font, 13.f, ImVec2(a_l.x + 8.f, a_l.y + 12.f),
 			aida::ui::with_alpha(th.error, alpha), orig_str.c_str());
-		dl->AddText(code_font, 11.f, ImVec2(b_l.x + 8.f, b_l.y + 12.f),
+		dl->AddText(code_font, 13.f, ImVec2(b_l.x + 8.f, b_l.y + 12.f),
 			aida::ui::with_alpha(th.success, alpha), patched_str.c_str());
 
 		row_y += 42.f;
@@ -388,17 +388,17 @@ namespace aida::code_patcher::view {
 			if (!head_em) head_em = ImGui::GetFont();
 			ImU32 hc = aida::ui::with_alpha(th.text_secondary, alpha);
 			float hxx = table_x + 8.f;
-			dl->AddText(head_em, 11.f, ImVec2(hxx, content_y + 6.f), hc, "Address");
+			dl->AddText(head_em, 13.f, ImVec2(hxx, content_y + 7.f), hc, "Address");
 			hxx += col_addr_w;
-			dl->AddText(head_em, 11.f, ImVec2(hxx, content_y + 6.f), hc, "Size");
+			dl->AddText(head_em, 13.f, ImVec2(hxx, content_y + 7.f), hc, "Size");
 			hxx += col_size_w;
-			dl->AddText(head_em, 11.f, ImVec2(hxx, content_y + 6.f), hc, "Description");
+			dl->AddText(head_em, 13.f, ImVec2(hxx, content_y + 7.f), hc, "Description");
 			hxx += col_desc_w;
-			dl->AddText(head_em, 11.f, ImVec2(hxx, content_y + 6.f), hc, "Active");
+			dl->AddText(head_em, 13.f, ImVec2(hxx, content_y + 7.f), hc, "Active");
 			hxx += col_active_w;
-			dl->AddText(head_em, 11.f, ImVec2(hxx, content_y + 6.f), hc, "Created");
+			dl->AddText(head_em, 13.f, ImVec2(hxx, content_y + 7.f), hc, "Created");
 			hxx += col_time_w;
-			dl->AddText(head_em, 11.f, ImVec2(hxx, content_y + 6.f), hc, "Actions");
+			dl->AddText(head_em, 13.f, ImVec2(hxx, content_y + 7.f), hc, "Actions");
 
 			float table_top = content_y + 24.f;
 			float table_h = content_h - 24.f;
@@ -478,13 +478,13 @@ namespace aida::code_patcher::view {
 				char addr_buf[24];
 				std::snprintf(addr_buf, sizeof(addr_buf), "0x%llX",
 					static_cast<unsigned long long>(p.address));
-				dl->AddText(code_font, 11.f, ImVec2(rmin.x + 12.f, ry + 9.f),
+				dl->AddText(code_font, 13.f, ImVec2(rmin.x + 12.f, ry + 9.f),
 					aida::ui::with_alpha(th.text_address, alpha * entrance), addr_buf);
 
 				float rx2 = rmin.x + col_addr_w + 8.f;
 				char size_buf[16];
 				std::snprintf(size_buf, sizeof(size_buf), "%zu B", p.patched_bytes.size());
-				dl->AddText(code_font, 11.f, ImVec2(rx2, ry + 9.f),
+				dl->AddText(code_font, 13.f, ImVec2(rx2, ry + 9.f),
 					aida::ui::with_alpha(th.text_secondary, alpha * entrance), size_buf);
 
 				rx2 += col_size_w;
@@ -511,14 +511,14 @@ namespace aida::code_patcher::view {
 
 				rx2 += col_active_w;
 				std::string ts = format_timestamp(p.timestamp);
-				dl->AddText(code_font, 11.f, ImVec2(rx2, ry + 9.f),
+				dl->AddText(code_font, 13.f, ImVec2(rx2, ry + 9.f),
 					aida::ui::with_alpha(th.text_dim, alpha * entrance), ts.c_str());
 
 				rx2 += col_time_w;
 				ImGui::SetCursorScreenPos(ImVec2(rx2, ry + 4.f));
 				ImGui::PushID(i + 0x10000);
 				if (aida::ui::button("Del", aida::ui::button_kind_t::destructive,
-					aida::ui::size_t_::sm, ImVec2(60.f, 22.f))) {
+					aida::ui::size_t_::sm, ImVec2(60.f, 28.f))) {
 					::code_patcher::remove_patch(i);
 					if (st.selected_index == i) st.selected_index = -1;
 				}
@@ -579,7 +579,7 @@ namespace aida::code_patcher::view {
 				cy += 30.f;
 				ImGui::SetCursorScreenPos(ImVec2(r_a.x + 12.f, cy));
 				if (aida::ui::button("Scan", aida::ui::button_kind_t::primary,
-					aida::ui::size_t_::sm, ImVec2(86.f, 22.f))) {
+					aida::ui::size_t_::sm, ImVec2(86.f, 28.f))) {
 					st.caves.clear();
 					st.caves_loaded = false;
 					auto mods = driver_bridge::enumerate_modules();
@@ -624,12 +624,12 @@ namespace aida::code_patcher::view {
 					char addr_buf[24];
 					std::snprintf(addr_buf, sizeof(addr_buf), "0x%llX",
 						static_cast<unsigned long long>(cv.address));
-					dl->AddText(code_font, 11.f, ImVec2(cp.x + 8.f, cp.y + 4.f),
+					dl->AddText(code_font, 13.f, ImVec2(cp.x + 8.f, cp.y + 4.f),
 						aida::ui::with_alpha(th.text_address, alpha), addr_buf);
 					char sz_buf[24];
 					std::snprintf(sz_buf, sizeof(sz_buf), "%llu B",
 						static_cast<unsigned long long>(cv.size));
-					dl->AddText(code_font, 11.f, ImVec2(cp.x + 8.f, cp.y + 16.f),
+					dl->AddText(code_font, 13.f, ImVec2(cp.x + 8.f, cp.y + 18.f),
 						aida::ui::with_alpha(th.text_dim, alpha), sz_buf);
 					if (!cv.module_name.empty()) {
 						dl->AddText(aida::ui::fonts::caption() ? aida::ui::fonts::caption() : ImGui::GetFont(),
@@ -641,7 +641,7 @@ namespace aida::code_patcher::view {
 					ImGui::SetCursorScreenPos(ImVec2(cp.x + lw - 80.f, cp.y + 4.f));
 					ImGui::PushID(static_cast<int>(0x20000 | ci));
 					if (aida::ui::button("Use", aida::ui::button_kind_t::ghost,
-						aida::ui::size_t_::sm, ImVec2(70.f, 20.f))) {
+						aida::ui::size_t_::sm, ImVec2(76.f, 28.f))) {
 						std::snprintf(st.modal.addr_buf, sizeof(st.modal.addr_buf),
 							"0x%llX", static_cast<unsigned long long>(cv.address));
 						st.modal.bytes_buf[0] = 0;

@@ -1571,7 +1571,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(txt2.x, txt2.y, txt2.z, 0.4f));
                 ImGui::PushStyleColor(ImGuiCol_Text, txt2);
             }
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
             if (ImGui::Button(label, sz)) state = !state;
             ImGui::PopStyleVar();
             ImGui::PopStyleColor(3);
@@ -1586,7 +1586,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.f, 0.f, 0.f, 0.f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(txt_d.x, txt_d.y, txt_d.z, 0.3f));
             ImGui::PushStyleColor(ImGuiCol_Text, txt2);
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
             bool clicked = ImGui::Button(label, ImVec2(w, row_h));
             ImGui::PopStyleVar();
             ImGui::PopStyleColor(3);
@@ -1605,7 +1605,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
 
         {
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, (row_h - ImGui::GetFontSize()) * 0.5f - 1.f));
             ImGui::PushStyleColor(ImGuiCol_FrameBg, bg_inp);
             ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(bg_inp.x + 0.03f, bg_inp.y + 0.03f, bg_inp.z + 0.03f, bg_inp.w));
@@ -1690,7 +1690,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         if (s_find.replace_mode) {
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 22.f);
 
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, (row_h - ImGui::GetFontSize()) * 0.5f - 1.f));
             ImGui::PushStyleColor(ImGuiCol_FrameBg, bg_inp);
             ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(bg_inp.x + 0.03f, bg_inp.y + 0.03f, bg_inp.z + 0.03f, bg_inp.w));

@@ -357,7 +357,7 @@ void render(float pos_x, float pos_y, float width, float height,
             dl->AddText(code_font, font_size, ImVec2(bx, oy + 3.f),
                 aida::ui::with_alpha(t.text_dim, a), hdr);
         }
-        dl->AddText(aida::ui::fonts::caption(), 11.f,
+        dl->AddText(aida::ui::fonts::caption(), 13.f,
             ImVec2(ox + asc_x, oy + (col_hdr_h - 11.f) * 0.5f),
             aida::ui::with_alpha(t.text_dim, a), "DECODED TEXT");
         dl->AddLine(ImVec2(ox, oy + col_hdr_h - 1.f),
