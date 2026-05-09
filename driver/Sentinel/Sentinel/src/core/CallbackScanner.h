@@ -46,6 +46,84 @@ namespace callback_scanner {
         return FALSE;
     }
 
+    __forceinline VOID classify_driver_name(PCUNICODE_STRING name,
+                                            BOOLEAN* out_hostile,
+                                            BOOLEAN* out_tier_a) {
+        if (out_hostile) *out_hostile = FALSE;
+        if (out_tier_a) *out_tier_a = FALSE;
+
+        if (!name || !name->Buffer || name->Length == 0)
+            return;
+
+        WCHAR lower_buf[260];
+        UNICODE_STRING lower;
+        lower.Buffer = lower_buf;
+        lower.MaximumLength = sizeof(lower_buf);
+        lower.Length = 0;
+        if (!NT_SUCCESS(RtlDowncaseUnicodeString(&lower, const_cast<PUNICODE_STRING>(name), FALSE)))
+            return;
+
+        static const wchar_t* kTierA[] = {
+            L"dbk64.sys", L"dbk32.sys", L"hyperdbg.sys", L"dbgv.sys", L"kldbgdrv.sys",
+            L"syser.sys", L"livekd.sys", L"pcileech.sys", L"rwdrv.sys", L"winio.sys",
+            L"winio64.sys", L"capcom.sys", L"gdrv.sys", L"atszio64.sys", L"asmmap64.sys",
+            L"dumpit.sys", L"physmem.sys"
+        };
+
+        if (out_tier_a) {
+            for (const wchar_t* tgt : kTierA) {
+                UNICODE_STRING us;
+                RtlInitUnicodeString(&us, tgt);
+                if (RtlSuffixUnicodeString(&us, &lower, FALSE)) {
+                    *out_tier_a = TRUE;
+                    break;
+                }
+            }
+        }
+
+        if (out_hostile) {
+            static const wchar_t* kHostile[] = {
+                L"dbgv.sys", L"kldbgdrv.sys", L"dbk64.sys",
+                L"virtualkd", L"livekd", L"kdcom.dll",
+                L"syser.sys", L"pchunter", L"kerneldetective",
+                L"windbg", L"kprocesshacker", L"processhacker",
+                L"titanhide", L"scyllahide", L"sharpod",
+                L"hyperdbg", L"drivermon", L"rwdrv.sys",
+                L"pcileech", L"ftd2xx", L"dumpit.sys"
+            };
+
+            USHORT lower_chars = lower.Length / sizeof(WCHAR);
+            USHORT start_idx = 0;
+            for (USHORT i = lower_chars; i > 0; --i) {
+                if (lower.Buffer[i - 1] == L'\\') {
+                    start_idx = i;
+                    break;
+                }
+            }
+
+            USHORT filename_len = lower_chars - start_idx;
+            const WCHAR* filename = &lower.Buffer[start_idx];
+
+            for (const wchar_t* tgt : kHostile) {
+                USHORT tlen = 0;
+                while (tgt[tlen]) tlen++;
+                if (tlen > filename_len) continue;
+
+                BOOLEAN match = TRUE;
+                for (USHORT c = 0; c < tlen; ++c) {
+                    if (filename[c] != tgt[c]) {
+                        match = FALSE;
+                        break;
+                    }
+                }
+                if (match) {
+                    *out_hostile = TRUE;
+                    break;
+                }
+            }
+        }
+    }
+
     struct callback_info_t {
         PVOID   routine;
         PVOID   owning_module_base;
@@ -466,31 +544,32 @@ namespace callback_scanner {
 
         if (!FullImageName || !FullImageName->Buffer) return;
 
-        if (is_hostile_driver_name(FullImageName)) {
+        BOOLEAN is_hostile = FALSE;
+        BOOLEAN is_tier_a = FALSE;
+        classify_driver_name(FullImageName, &is_hostile, &is_tier_a);
+
+        if (is_hostile) {
             InterlockedIncrement64((volatile LONG64*)&g_hostile_driver_loads);
             SN_LOG("callback_scanner: HOSTILE DRIVER LOAD: %wZ", FullImageName);
             heartbeat::send_command(heartbeat::BRIDGE_CMD_INTEGRITY_FAIL,
                 static_cast<ULONG>(g_hostile_driver_loads & 0xFFFFFFFF));
         }
 
+        ULONG64 name_hash = driver_name_fnv64(FullImageName);
+        ULONG_PTR image_base = ImageInfo ? reinterpret_cast<ULONG_PTR>(ImageInfo->ImageBase) : 0;
+        ULONG_PTR image_size = ImageInfo ? static_cast<ULONG_PTR>(ImageInfo->ImageSize) : 0;
+
         {
-            ULONG64 name_hash_for_audit = driver_name_fnv64(FullImageName);
-            ULONG_PTR base_for_audit = ImageInfo ? reinterpret_cast<ULONG_PTR>(ImageInfo->ImageBase) : 0;
-            ULONG_PTR size_for_audit = ImageInfo ? static_cast<ULONG_PTR>(ImageInfo->ImageSize) : 0;
             UINT32 tier = 0;
-            if (is_tier_a_hostile_name(FullImageName)) tier = 2;
-            else if (is_hostile_driver_name(FullImageName)) tier = 1;
-            driver_load_audit::record(name_hash_for_audit,
-                static_cast<UINT64>(base_for_audit),
-                static_cast<UINT32>(size_for_audit & 0xFFFFFFFF),
+            if (is_tier_a) tier = 2;
+            else if (is_hostile) tier = 1;
+            driver_load_audit::record(name_hash,
+                static_cast<UINT64>(image_base),
+                static_cast<UINT32>(image_size & 0xFFFFFFFF),
                 tier);
         }
 
-        if (is_tier_a_hostile_name(FullImageName)) {
-            ULONG64 name_hash = driver_name_fnv64(FullImageName);
-            ULONG_PTR image_base = ImageInfo ? reinterpret_cast<ULONG_PTR>(ImageInfo->ImageBase) : 0;
-            ULONG_PTR image_size = ImageInfo ? static_cast<ULONG_PTR>(ImageInfo->ImageSize) : 0;
-
+        if (is_tier_a) {
             HANDLE prot_pid = reinterpret_cast<HANDLE>(
                 _InterlockedCompareExchange64(
                     reinterpret_cast<volatile LONG64*>(&process_notify::g_protected_pid), 0, 0));

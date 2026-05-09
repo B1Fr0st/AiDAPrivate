@@ -96,19 +96,43 @@ namespace siphash {
 
 namespace sha256 {
 
+    inline BCRYPT_ALG_HANDLE get_hash_alg()
+    {
+        thread_local BCRYPT_ALG_HANDLE h = nullptr;
+        if (!h)
+        {
+            if (BCryptOpenAlgorithmProvider(&h, BCRYPT_SHA256_ALGORITHM,
+                                            nullptr, 0) != 0)
+            {
+                h = nullptr;
+            }
+        }
+        return h;
+    }
+
+    inline BCRYPT_ALG_HANDLE get_hmac_alg()
+    {
+        thread_local BCRYPT_ALG_HANDLE h = nullptr;
+        if (!h)
+        {
+            if (BCryptOpenAlgorithmProvider(&h, BCRYPT_SHA256_ALGORITHM,
+                                            nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0)
+            {
+                h = nullptr;
+            }
+        }
+        return h;
+    }
+
     inline bool hash(const void* data, size_t size, uint8_t out[32])
     {
-        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_ALG_HANDLE hAlg = get_hash_alg();
+        if (!hAlg) return false;
         BCRYPT_HASH_HANDLE hHash = nullptr;
         bool ok = false;
 
-        if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM,
-                                        nullptr, 0) != 0)
-            return false;
-
         if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) != 0)
         {
-            BCryptCloseAlgorithmProvider(hAlg, 0);
             return false;
         }
 
@@ -119,7 +143,6 @@ namespace sha256 {
         }
 
         BCryptDestroyHash(hHash);
-        BCryptCloseAlgorithmProvider(hAlg, 0);
         return ok;
     }
 
@@ -127,11 +150,9 @@ namespace sha256 {
                      const uint8_t* data, size_t data_len,
                      uint8_t out[32])
     {
-        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_ALG_HANDLE hAlg = get_hmac_alg();
+        if (!hAlg) return false;
         BCRYPT_HASH_HANDLE hHash = nullptr;
-        if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM,
-                                        nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0)
-            return false;
         bool ok = false;
         if (BCryptCreateHash(hAlg, &hHash, nullptr, 0,
                              const_cast<PUCHAR>(key),
@@ -144,7 +165,6 @@ namespace sha256 {
             }
             BCryptDestroyHash(hHash);
         }
-        BCryptCloseAlgorithmProvider(hAlg, 0);
         return ok;
     }
 
@@ -1142,20 +1162,21 @@ namespace periodic {
         return v;
     }
 
-    __forceinline uint64_t compute_text_signature_locked(detail::page_table_t& pt,
-                                                         uint64_t& mismatch_count_out)
+    __forceinline uint64_t compute_text_signature_unlocked(uint64_t epoch,
+                                                            uint64_t base,
+                                                            uint32_t size,
+                                                            uint32_t page_count)
     {
-        mismatch_count_out = 0;
-        uint64_t signature = pt.key_epoch.load();
-        signature ^= pt.size;
+        uint64_t signature = epoch;
+        signature ^= size;
         uint64_t k0 = detail::load_k0();
         uint64_t k1 = detail::load_k1();
-        for (uint32_t i = 0; i < pt.entries.size(); ++i)
+        for (uint32_t i = 0; i < page_count; ++i)
         {
             uint32_t this_size = detail::kPageSize;
             uint32_t offset = i * detail::kPageSize;
-            if (offset + this_size > pt.size) this_size = pt.size - offset;
-            const uint8_t* page = reinterpret_cast<const uint8_t*>(pt.base + offset);
+            if (offset + this_size > size) this_size = size - offset;
+            const uint8_t* page = reinterpret_cast<const uint8_t*>(base + offset);
             uint64_t live = siphash::hash(page, this_size,
                 k0 ^ static_cast<uint64_t>(i), k1 ^ static_cast<uint64_t>(i + 1));
             signature ^= live;
@@ -1171,9 +1192,12 @@ namespace periodic {
         {
             uint64_t start_ms = detail::qpc_now_ms();
             auto& pt = detail::page_table();
-            uint64_t mismatches = 0;
             uint64_t sig = 0;
-            uint32_t mismatch_page = 0;
+            uint64_t snap_epoch = 0;
+            uint64_t snap_base = 0;
+            uint32_t snap_size = 0;
+            uint32_t snap_page_count = 0;
+            bool have_snapshot = false;
             {
                 std::lock_guard<std::mutex> lk(pt.mtx);
                 if (pt.entries.empty())
@@ -1181,41 +1205,66 @@ namespace periodic {
                     Sleep(kCadenceMs);
                     continue;
                 }
-                sig = compute_text_signature_locked(pt, mismatches);
-                if (mismatches > 0)
-                {
-                    for (uint32_t i = 0; i < pt.entries.size(); ++i)
-                    {
-                        if (!detail::verify_page_locked(pt, i))
-                        {
-                            mismatch_page = i;
-                            break;
-                        }
-                    }
-                }
+                snap_epoch = pt.key_epoch.load();
+                snap_base = pt.base;
+                snap_size = pt.size;
+                snap_page_count = static_cast<uint32_t>(pt.entries.size());
+                have_snapshot = true;
             }
+
+            if (!have_snapshot)
+            {
+                Sleep(kCadenceMs);
+                continue;
+            }
+
+            sig = compute_text_signature_unlocked(snap_epoch, snap_base, snap_size, snap_page_count);
+
+            bool epoch_stable = false;
+            {
+                std::lock_guard<std::mutex> lk(pt.mtx);
+                uint64_t cur_epoch = pt.key_epoch.load();
+                epoch_stable = (cur_epoch == snap_epoch &&
+                                pt.size == snap_size &&
+                                pt.base == snap_base &&
+                                pt.entries.size() == snap_page_count);
+            }
+
+            if (!epoch_stable)
+            {
+                Sleep(kCadenceMs);
+                continue;
+            }
+
             signature_array()[worker_id].store(sig, std::memory_order_release);
             qpc_array()[worker_id].store(start_ms, std::memory_order_release);
             detail::periodic_pass_counter().fetch_add(1, std::memory_order_acq_rel);
 
-            if (mismatches > 0)
-            {
-                pt.verifier_quorum_failures.fetch_add(1, std::memory_order_acq_rel);
-                detail::periodic_violation_flag().store(true, std::memory_order_release);
-                static_cast<void>(mismatch_page);
-            }
-
             if (worker_id == 0)
             {
-                uint64_t s0 = signature_array()[0].load(std::memory_order_acquire);
-                uint64_t s1 = signature_array()[1].load(std::memory_order_acquire);
-                uint64_t s2 = signature_array()[2].load(std::memory_order_acquire);
-                uint64_t q0 = qpc_array()[0].load(std::memory_order_acquire);
-                uint64_t q1 = qpc_array()[1].load(std::memory_order_acquire);
-                uint64_t q2 = qpc_array()[2].load(std::memory_order_acquire);
-                if (q0 > 0 && q1 > 0 && q2 > 0)
+                bool all_ready = true;
+                uint64_t ref_sig = signature_array()[0].load(std::memory_order_acquire);
+                for (uint32_t w = 0; w < kWorkerCount; ++w)
                 {
-                    bool quorum = (s0 == s1) && (s1 == s2);
+                    uint64_t qw = qpc_array()[w].load(std::memory_order_acquire);
+                    if (qw == 0)
+                    {
+                        all_ready = false;
+                        break;
+                    }
+                }
+                if (all_ready)
+                {
+                    bool quorum = true;
+                    for (uint32_t w = 1; w < kWorkerCount; ++w)
+                    {
+                        uint64_t sw = signature_array()[w].load(std::memory_order_acquire);
+                        if (sw != ref_sig)
+                        {
+                            quorum = false;
+                            break;
+                        }
+                    }
                     if (!quorum)
                     {
                         detail::periodic_violation_flag().store(true, std::memory_order_release);

@@ -744,6 +744,82 @@ namespace detail {
         return o;
     }
 
+    struct protected_range_t
+    {
+        uint64_t begin;
+        uint64_t end;
+    };
+
+    inline std::mutex& protected_ranges_mtx()
+    {
+        static std::mutex m;
+        return m;
+    }
+
+    inline std::vector<protected_range_t>& protected_ranges()
+    {
+        static std::vector<protected_range_t> v;
+        return v;
+    }
+
+    inline bool overlaps_protected(uint64_t begin, uint64_t end)
+    {
+        if (end <= begin) return false;
+        std::lock_guard<std::mutex> lk(protected_ranges_mtx());
+        const auto& v = protected_ranges();
+        for (const auto& r : v)
+        {
+            if (begin < r.end && end > r.begin) return true;
+        }
+        return false;
+    }
+
+    inline void register_protected_range_locked_already_held(uint64_t begin, uint64_t size)
+    {
+        if (size == 0) return;
+        protected_range_t r;
+        r.begin = begin;
+        r.end = begin + size;
+        protected_ranges().push_back(r);
+    }
+
+    inline void register_protected_range(const void* fn_addr, size_t size)
+    {
+        if (fn_addr == nullptr || size == 0) return;
+        std::lock_guard<std::mutex> lk(protected_ranges_mtx());
+        register_protected_range_locked_already_held(
+            reinterpret_cast<uint64_t>(fn_addr), size);
+    }
+
+    inline void ensure_default_protections()
+    {
+        static std::once_flag s_once;
+        std::call_once(s_once, []() {
+            std::lock_guard<std::mutex> lk(protected_ranges_mtx());
+            register_protected_range_locked_already_held(
+                reinterpret_cast<uint64_t>(&integrity::siphash::hash), 256);
+            register_protected_range_locked_already_held(
+                reinterpret_cast<uint64_t>(&integrity::siphash::siphash_3u64), 256);
+            register_protected_range_locked_already_held(
+                reinterpret_cast<uint64_t>(&integrity::verify_self_hash), 512);
+            register_protected_range_locked_already_held(
+                reinterpret_cast<uint64_t>(&integrity::detail::self_hash_chain_compute), 512);
+            register_protected_range_locked_already_held(
+                reinterpret_cast<uint64_t>(&integrity::detail::self_hash_siphash_impl), 512);
+            register_protected_range_locked_already_held(
+                reinterpret_cast<uint64_t>(&integrity::detail::derive_session_keys), 512);
+            register_protected_range_locked_already_held(
+                reinterpret_cast<uint64_t>(&integrity::derive_session_keys_for_caller), 256);
+            register_protected_range_locked_already_held(
+                reinterpret_cast<uint64_t>(&integrity::snapshot_code), 1024);
+        });
+    }
+
+}
+
+inline void register_protected_range(const void* fn_addr, size_t size)
+{
+    detail::register_protected_range(fn_addr, size);
 }
 
 inline bool steal_basic_block(void* target_func_base, size_t func_size_hint)
@@ -752,6 +828,14 @@ inline bool steal_basic_block(void* target_func_base, size_t func_size_hint)
     if (!bb.initialized) return false;
     if (bb.count >= detail::MAX_BB_ENTRIES) return false;
     if (target_func_base == nullptr || func_size_hint < 8) return false;
+
+    detail::ensure_default_protections();
+    {
+        const uint64_t fn_begin = reinterpret_cast<uint64_t>(target_func_base);
+        const uint64_t fn_end   = fn_begin + static_cast<uint64_t>(func_size_hint);
+        if (detail::overlaps_protected(fn_begin, fn_end))
+            return false;
+    }
 
     auto blocks = cfg_extract::extract_blocks(
         target_func_base, func_size_hint,
@@ -778,6 +862,7 @@ inline bool steal_basic_block(void* target_func_base, size_t func_size_hint)
         if (b.has_rip_relative) continue;
         if (b.touches_tls) continue;
         if (b.ends_with_ret) continue;
+        if (detail::overlaps_protected(b.rva_start, b.rva_end)) continue;
         candidate_idx.push_back(i);
     }
     if (candidate_idx.empty()) return false;
@@ -934,6 +1019,8 @@ inline bool verify_basic_blocks()
 inline uint32_t auto_steal_from_self(uint32_t max_functions)
 {
     uint32_t stolen = 0;
+
+    detail::ensure_default_protections();
 
     HMODULE self_mod = GetModuleHandleW(nullptr);
     if (!self_mod) return 0;

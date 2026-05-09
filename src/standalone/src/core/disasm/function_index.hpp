@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -168,23 +170,131 @@ namespace function_index {
 			return out;
 		}
 
+		struct cached_module_entry_t {
+			uint64_t    base = 0;
+			uint64_t    end = 0;
+			uint32_t    size = 0;
+			std::string name;
+		};
+
+		struct cached_module_table_t {
+			std::shared_mutex                    mu;
+			uint32_t                             pid = 0;
+			std::vector<cached_module_entry_t>   entries;
+			std::atomic<uint64_t>                last_built_ms{0};
+			std::atomic<bool>                    rebuild_in_flight{false};
+		};
+
+		inline cached_module_table_t& cached_module_table() {
+			static cached_module_table_t t;
+			return t;
+		}
+
+		inline uint64_t now_ms_steady() {
+			using clock_t = std::chrono::steady_clock;
+			auto tp = clock_t::now().time_since_epoch();
+			return static_cast<uint64_t>(
+				std::chrono::duration_cast<std::chrono::milliseconds>(tp).count());
+		}
+
+		inline bool cached_module_lookup_locked(const std::vector<cached_module_entry_t>& entries,
+			uint64_t addr, uint64_t& out_base, uint32_t& out_size, std::string& out_name)
+		{
+			if (entries.empty()) return false;
+			auto it = std::upper_bound(entries.begin(), entries.end(), addr,
+				[](uint64_t a, const cached_module_entry_t& e) {
+					return a < e.base;
+				});
+			if (it == entries.begin()) return false;
+			--it;
+			if (addr < it->base || addr >= it->end) return false;
+			out_base = it->base;
+			out_size = it->size;
+			out_name = it->name;
+			return true;
+		}
+
+		inline bool resolve_module_for_address_cached_only(uint64_t addr,
+			uint64_t& out_base, uint32_t& out_size, std::string& out_name)
+		{
+			cached_module_table_t& t = cached_module_table();
+			uint32_t pid_now = driver_bridge::attached_pid();
+			if (pid_now == 0) return false;
+			uint64_t built_ms = t.last_built_ms.load(std::memory_order_acquire);
+			if (built_ms == 0) return false;
+			uint64_t now = now_ms_steady();
+			if (now - built_ms > 5000) return false;
+			std::shared_lock<std::shared_mutex> lk(t.mu);
+			if (t.pid != pid_now) return false;
+			return cached_module_lookup_locked(t.entries, addr, out_base, out_size, out_name);
+		}
+
+		inline void rebuild_cached_module_table_offlock(uint32_t pid_now) {
+			cached_module_table_t& t = cached_module_table();
+			auto modules = driver_bridge::enumerate_modules();
+
+			std::vector<cached_module_entry_t> staged;
+			staged.reserve(modules.size());
+			for (const auto& m : modules) {
+				if (m.base == 0 || m.size == 0) continue;
+				cached_module_entry_t e;
+				e.base = m.base;
+				e.end = m.base + m.size;
+				e.size = m.size;
+				e.name = m.name;
+				staged.push_back(std::move(e));
+			}
+			std::sort(staged.begin(), staged.end(),
+				[](const cached_module_entry_t& a, const cached_module_entry_t& b) {
+					return a.base < b.base;
+				});
+
+			{
+				std::scoped_lock<std::shared_mutex> w(t.mu);
+				t.entries.swap(staged);
+				t.pid = pid_now;
+			}
+			t.last_built_ms.store(now_ms_steady(), std::memory_order_release);
+		}
+
 		inline bool resolve_module_for_address(uint64_t addr, uint64_t& out_base,
 			uint32_t& out_size, std::string& out_name)
 		{
 			if (!driver_bridge::is_loaded()) return false;
-			auto modules = driver_bridge::enumerate_modules();
-			if (modules.empty()) return false;
+			uint32_t pid_now = driver_bridge::attached_pid();
+			if (pid_now == 0) return false;
 
-			for (const auto& m : modules) {
-				if (m.base == 0 || m.size == 0) continue;
-				if (addr >= m.base && addr < m.base + m.size) {
-					out_base = m.base;
-					out_size = m.size;
-					out_name = m.name;
-					return true;
+			cached_module_table_t& t = cached_module_table();
+			uint64_t now = now_ms_steady();
+			uint64_t built_ms = t.last_built_ms.load(std::memory_order_acquire);
+			bool cache_hot = false;
+			{
+				std::shared_lock<std::shared_mutex> lk(t.mu);
+				cache_hot = (t.pid == pid_now && built_ms != 0 && now - built_ms < 5000);
+				if (cache_hot) {
+					if (cached_module_lookup_locked(t.entries, addr, out_base, out_size, out_name)) {
+						return true;
+					}
 				}
 			}
-			return false;
+
+			if (cache_hot) {
+				return false;
+			}
+
+			bool expected = false;
+			if (!t.rebuild_in_flight.compare_exchange_strong(expected, true,
+				std::memory_order_acq_rel))
+			{
+				std::shared_lock<std::shared_mutex> lk(t.mu);
+				return cached_module_lookup_locked(t.entries, addr, out_base, out_size, out_name);
+			}
+
+			rebuild_cached_module_table_offlock(pid_now);
+			t.rebuild_in_flight.store(false, std::memory_order_release);
+
+			std::shared_lock<std::shared_mutex> lk(t.mu);
+			return cached_module_lookup_locked(t.entries, addr, out_base, out_size, out_name);
 		}
 
 		inline bool fetch_active_module(uint64_t& out_base, uint32_t& out_size,
@@ -412,6 +522,7 @@ namespace function_index {
 			std::unordered_set<uint64_t> ret_addrs;
 
 			uint64_t last_insn_addr = r.start;
+			uint32_t decoded_since_yield = 0;
 
 			size_t off = 0;
 			while (off < bytes.size()) {
@@ -424,6 +535,11 @@ namespace function_index {
 				{
 					off += 1;
 					continue;
+				}
+
+				if (++decoded_since_yield >= 4096) {
+					decoded_since_yield = 0;
+					std::this_thread::sleep_for(std::chrono::microseconds(50));
 				}
 
 				uint64_t va = r.start + off;
@@ -776,18 +892,28 @@ namespace function_index {
 
 		inline void reset_all() {
 			cache_t& c = cache();
-			std::unique_lock<std::shared_mutex> lk(c.mutex);
-			c.by_start.clear();
-			c.status_by_start.clear();
-			c.addr_to_func_start.clear();
-			c.sorted_starts.clear();
-			c.synthetic_names.clear();
-			c.cached_module_base = 0;
-			c.cached_module_size = 0;
-			c.cached_module_name.clear();
-			c.cached_pid_token = 0;
+			{
+				std::unique_lock<std::shared_mutex> lk(c.mutex);
+				c.by_start.clear();
+				c.status_by_start.clear();
+				c.addr_to_func_start.clear();
+				c.sorted_starts.clear();
+				c.synthetic_names.clear();
+				c.cached_module_base = 0;
+				c.cached_module_size = 0;
+				c.cached_module_name.clear();
+				c.cached_pid_token = 0;
+			}
 			c.bounds_state.store(static_cast<uint32_t>(bounds_state_t::idle),
 				std::memory_order_release);
+
+			cached_module_table_t& t = cached_module_table();
+			{
+				std::scoped_lock<std::shared_mutex> w(t.mu);
+				t.pid = 0;
+				t.entries.clear();
+			}
+			t.last_built_ms.store(0, std::memory_order_release);
 		}
 
 	}
@@ -862,46 +988,54 @@ namespace function_index {
 
 	inline std::vector<injection_row_t> rows_before(uint64_t addr) {
 		detail::cache_t& c = detail::cache();
-		std::shared_lock<std::shared_mutex> lk(c.mutex);
-		if (c.sorted_starts.empty()) return {};
-		auto sit = std::upper_bound(c.sorted_starts.begin(), c.sorted_starts.end(), addr);
-		if (sit == c.sorted_starts.begin()) return {};
-		--sit;
-		uint64_t func_start = *sit;
-		if (addr != func_start) return {};
-		auto it = c.by_start.find(func_start);
-		if (it == c.by_start.end()) return {};
-		auto stit = c.status_by_start.find(func_start);
-		if (stit == c.status_by_start.end() || !stit->second) return {};
-		if (stit->second->state.load(std::memory_order_acquire)
-			!= static_cast<uint32_t>(detail::func_state_t::built))
+		std::vector<injection_row_t> out;
 		{
-			return {};
+			std::shared_lock<std::shared_mutex> lk(c.mutex);
+			if (c.sorted_starts.empty()) return out;
+			auto sit = std::upper_bound(c.sorted_starts.begin(), c.sorted_starts.end(), addr);
+			if (sit == c.sorted_starts.begin()) return out;
+			--sit;
+			uint64_t func_start = *sit;
+			if (addr != func_start) return out;
+			auto it = c.by_start.find(func_start);
+			if (it == c.by_start.end()) return out;
+			auto stit = c.status_by_start.find(func_start);
+			if (stit == c.status_by_start.end() || !stit->second) return out;
+			if (stit->second->state.load(std::memory_order_acquire)
+				!= static_cast<uint32_t>(detail::func_state_t::built))
+			{
+				return out;
+			}
+			out = it->second.before_first_insn;
 		}
-		return it->second.before_first_insn;
+		return out;
 	}
 
 	inline std::vector<injection_row_t> rows_after(uint64_t addr) {
 		detail::cache_t& c = detail::cache();
-		std::shared_lock<std::shared_mutex> lk(c.mutex);
-		if (c.sorted_starts.empty()) return {};
-		auto sit = std::upper_bound(c.sorted_starts.begin(), c.sorted_starts.end(), addr);
-		if (sit == c.sorted_starts.begin()) return {};
-		--sit;
-		uint64_t func_start = *sit;
-		auto it = c.by_start.find(func_start);
-		if (it == c.by_start.end()) return {};
-		const auto& rec = it->second;
-		if (addr < rec.start || addr >= rec.end) return {};
-		auto stit = c.status_by_start.find(func_start);
-		if (stit == c.status_by_start.end() || !stit->second) return {};
-		if (stit->second->state.load(std::memory_order_acquire)
-			!= static_cast<uint32_t>(detail::func_state_t::built))
+		std::vector<injection_row_t> out;
 		{
-			return {};
+			std::shared_lock<std::shared_mutex> lk(c.mutex);
+			if (c.sorted_starts.empty()) return out;
+			auto sit = std::upper_bound(c.sorted_starts.begin(), c.sorted_starts.end(), addr);
+			if (sit == c.sorted_starts.begin()) return out;
+			--sit;
+			uint64_t func_start = *sit;
+			auto it = c.by_start.find(func_start);
+			if (it == c.by_start.end()) return out;
+			const auto& rec = it->second;
+			if (addr < rec.start || addr >= rec.end) return out;
+			auto stit = c.status_by_start.find(func_start);
+			if (stit == c.status_by_start.end() || !stit->second) return out;
+			if (stit->second->state.load(std::memory_order_acquire)
+				!= static_cast<uint32_t>(detail::func_state_t::built))
+			{
+				return out;
+			}
+			if (addr != rec.last_insn_addr) return out;
+			out = rec.after_last_insn;
 		}
-		if (addr != rec.last_insn_addr) return {};
-		return rec.after_last_insn;
+		return out;
 	}
 
 	inline std::string inline_label_at(uint64_t addr) {

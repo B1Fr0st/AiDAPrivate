@@ -705,7 +705,8 @@ namespace arc_page_manager {
 
 
         try {
-            work_queue::post(rotation_worker);
+            if (!s.rotation_thread.joinable())
+                s.rotation_thread = std::thread([]() { rotation_worker(); });
         } catch (...) {}
 
         return true;

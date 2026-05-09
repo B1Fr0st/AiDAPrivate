@@ -87,15 +87,28 @@ namespace detail {
 
 }
 
+namespace detail {
+
+    inline HANDLE& log_handle()
+    {
+        static HANDLE h = INVALID_HANDLE_VALUE;
+        return h;
+    }
+
+}
+
 inline void write_log(const char* tag, const char* detail)
 {
     std::lock_guard<std::mutex> lk(detail::log_mtx());
-    const char* path = detail::log_path();
-
-    HANDLE hf = CreateFileA(path, FILE_APPEND_DATA | SYNCHRONIZE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hf == INVALID_HANDLE_VALUE) return;
+    HANDLE& hf = detail::log_handle();
+    if (hf == INVALID_HANDLE_VALUE)
+    {
+        const char* path = detail::log_path();
+        hf = CreateFileA(path, FILE_APPEND_DATA | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf == INVALID_HANDLE_VALUE) return;
+    }
 
     SYSTEMTIME st{};
     GetLocalTime(&st);
@@ -108,7 +121,6 @@ inline void write_log(const char* tag, const char* detail)
         DWORD written;
         WriteFile(hf, line, static_cast<DWORD>(len), &written, nullptr);
     }
-    CloseHandle(hf);
 }
 
 inline std::string get_computer_name()

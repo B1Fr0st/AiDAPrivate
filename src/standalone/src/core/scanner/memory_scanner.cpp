@@ -590,14 +590,18 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 static void freeze_loop() {
 	auto& st = g_state;
 	while (st.freeze_active.load()) {
+		bool has_frozen = false;
 		{
 			std::lock_guard<std::mutex> lk(st.address_mutex);
 			for (auto& entry : st.address_list) {
-				if (entry.frozen && !entry.freeze_value.empty())
+				if (entry.frozen && !entry.freeze_value.empty()) {
 					driver_bridge::write_memory(entry.address, entry.freeze_value);
+					has_frozen = true;
+				}
 			}
 		}
-		Sleep(10);
+		if (has_frozen) Sleep(10);
+		else Sleep(100);
 	}
 }
 

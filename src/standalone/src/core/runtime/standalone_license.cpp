@@ -3729,7 +3729,7 @@ namespace
 
     bool download_and_load_arc(settings_sa_t& settings, const std::string& hwid, uint32_t attempt_number)
     {
-        std::lock_guard<std::mutex> lk(s_arc_mtx);
+        std::unique_lock<std::mutex> lk(s_arc_mtx);
 
 
         if (s_arc_loaded)
@@ -4502,6 +4502,9 @@ namespace
             settings.license_arc_load_ok = true;
             settings.save();
             log_arc_status("arc_load_ok_disk_cache_marked");
+
+            lk.unlock();
+            log_arc_status("arc_lock_released_pre_finalize");
 
             try
             {

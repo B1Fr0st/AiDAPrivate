@@ -3427,9 +3427,22 @@ ARC_API bool arc_download_all_pages(
     return true;
 }
 
+__declspec(noinline) static void arc_cleanup_unregister_protection_seh()
+{
+    voyager::device_t* dev = arc_internal::get_prebound_device();
+    if (!dev)
+        return;
+    __try {
+        dev->unregister_dll_protection();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
 ARC_API void arc_cleanup()
 {
     using namespace arc_internal;
+    arc_cleanup_unregister_protection_seh();
     std::lock_guard<std::mutex> lk(g_session_mtx);
     SecureZeroMemory(&g_enc_session, sizeof(g_enc_session));
     SecureZeroMemory(&g_vtable, sizeof(g_vtable));
@@ -3437,6 +3450,9 @@ ARC_API void arc_cleanup()
     g_key_seed_valid = false;
     g_vtable_ready = false;
     g_vtable_crypt_key = 0;
+    g_device_enc = 0;
+    g_prebound_device_enc = 0;
+    g_prebound_device_key = 0;
 }
 
 ARC_API void arc_set_key_seed(const uint8_t* key_seed, uint32_t len)

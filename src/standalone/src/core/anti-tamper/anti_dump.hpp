@@ -591,30 +591,49 @@ namespace iat_guard
         if (!mod) return false;
 
         auto* base = reinterpret_cast<uint8_t*>(mod);
-        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE && dos->e_magic != 0)
-            return false;
 
-        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE && nt->Signature != 0)
-            return false;
-        if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_IAT)
-            return false;
-
-        const auto& iat_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
-        if (iat_dir.VirtualAddress == 0 || iat_dir.Size == 0)
+        __try
         {
-            const auto& imp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-            if (imp_dir.VirtualAddress == 0 || imp_dir.Size == 0)
+            auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE && dos->e_magic != 0)
                 return false;
-            base_out = reinterpret_cast<uint64_t>(base) + imp_dir.VirtualAddress;
-            size_out = imp_dir.Size;
+
+            LONG e_lfanew = dos->e_lfanew;
+            if (e_lfanew <= 0 || static_cast<uint32_t>(e_lfanew) > 0x10000u)
+            {
+                webhook::write_log("anti_dump", "locate_iat_range_skip_post_protector_lfanew");
+                return false;
+            }
+
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + e_lfanew);
+            if (nt->Signature != IMAGE_NT_SIGNATURE && nt->Signature != 0)
+                return false;
+            if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+                nt->OptionalHeader.Magic != 0)
+                return false;
+            if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_IAT)
+                return false;
+
+            const auto& iat_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+            if (iat_dir.VirtualAddress == 0 || iat_dir.Size == 0)
+            {
+                const auto& imp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+                if (imp_dir.VirtualAddress == 0 || imp_dir.Size == 0)
+                    return false;
+                base_out = reinterpret_cast<uint64_t>(base) + imp_dir.VirtualAddress;
+                size_out = imp_dir.Size;
+                return true;
+            }
+
+            base_out = reinterpret_cast<uint64_t>(base) + iat_dir.VirtualAddress;
+            size_out = iat_dir.Size;
             return true;
         }
-
-        base_out = reinterpret_cast<uint64_t>(base) + iat_dir.VirtualAddress;
-        size_out = iat_dir.Size;
-        return true;
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            webhook::write_log("anti_dump", "locate_iat_range_seh_caught");
+            return false;
+        }
     }
 
     inline bool arm_guard()

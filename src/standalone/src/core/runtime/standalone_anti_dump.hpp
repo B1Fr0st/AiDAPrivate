@@ -840,7 +840,12 @@ inline bool initialize()
     anti_tamper::webhook::write_log("anti_dump", "monitors_store_ok");
     try
     {
-        work_queue::post(monitor::run_periodic_reencrypt);
+        static std::thread s_anti_dump_reencrypt_thread;
+        if (!s_anti_dump_reencrypt_thread.joinable())
+        {
+            s_anti_dump_reencrypt_thread = std::thread([]() { monitor::run_periodic_reencrypt(); });
+            s_anti_dump_reencrypt_thread.detach();
+        }
         anti_tamper::webhook::write_log("anti_dump", "sa_thread_detach_ok");
     }
     catch (const std::exception& ex) {

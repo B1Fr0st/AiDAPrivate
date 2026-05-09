@@ -1637,6 +1637,7 @@ namespace arc_loader
             using DllMain_t = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
             auto entry = reinterpret_cast<DllMain_t>(mod.entry_point);
 
+            arc_breadcrumb("unload_dllmain_detach_pre_unsealed");
             __try {
                 entry(
                     reinterpret_cast<HINSTANCE>(image_base),
@@ -1646,6 +1647,9 @@ namespace arc_loader
             __except (EXCEPTION_EXECUTE_HANDLER) {
 
             }
+            arc_breadcrumb("unload_dllmain_detach_post_unsealed");
+        } else if (mod.initialized) {
+            arc_breadcrumb("unload_dllmain_detach_skipped_sealed");
         }
 
 
@@ -1655,13 +1659,21 @@ namespace arc_loader
             mod.function_table_count = 0;
         }
 
+        DWORD image_old_protect = 0;
+        const BOOL image_writable_for_zero = VirtualProtect(
+            mod.base, mod.image_size, PAGE_READWRITE, &image_old_protect);
         __try {
             SecureZeroMemory(mod.base, mod.image_size);
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
 
         }
+        if (image_writable_for_zero) {
+            DWORD discard = 0;
+            VirtualProtect(mod.base, mod.image_size, image_old_protect, &discard);
+        }
         VirtualFree(mod.base, 0, MEM_RELEASE);
+        arc_breadcrumb("unload_image_released");
 
         mod.base                 = nullptr;
         mod.image_size           = 0;

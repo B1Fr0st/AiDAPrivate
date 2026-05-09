@@ -213,7 +213,7 @@ inline bool check_debug_port()
     ULONG_PTR debug_port = 0;
     NTSTATUS st = syscall::NtQueryInformationProcess()(
         GetCurrentProcess(), 7, &debug_port, sizeof(debug_port), nullptr);
-    return st >= 0 && debug_port != 0;
+    return (st >= 0 && debug_port != 0);
 }
 
 inline bool check_debug_object_handle()
@@ -238,7 +238,7 @@ inline bool check_debug_flags()
     ULONG debug_flags = 0;
     NTSTATUS st = syscall::NtQueryInformationProcess()(
         GetCurrentProcess(), 0x1F, &debug_flags, sizeof(debug_flags), nullptr);
-    return st >= 0 && debug_flags == 0;
+    return (st >= 0 && debug_flags == 0);
 }
 
 inline bool check_remote_debugger()
@@ -347,7 +347,7 @@ inline bool check_kernel_debugger()
     struct { BOOLEAN KernelDebuggerEnabled; BOOLEAN KernelDebuggerNotPresent; } kd_info{};
     NTSTATUS st = syscall::NtQuerySystemInformation()(
         0x23, &kd_info, sizeof(kd_info), nullptr);
-    return st >= 0 && kd_info.KernelDebuggerEnabled && !kd_info.KernelDebuggerNotPresent;
+    return (st >= 0 && kd_info.KernelDebuggerEnabled && !kd_info.KernelDebuggerNotPresent);
 }
 
 inline bool check_kd_shared_data()

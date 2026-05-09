@@ -63,6 +63,7 @@ namespace xref_index {
 			std::vector<module_range_t>                                      table;
 			std::atomic<uint64_t>                                            generation{0};
 			std::atomic<bool>                                                table_built{false};
+			std::atomic<bool>                                                rebuild_in_flight{false};
 		};
 
 		inline registry_t& registry() {
@@ -297,6 +298,66 @@ namespace xref_index {
 			reg.table_built.store(true, std::memory_order_release);
 		}
 
+		inline bool rebuild_module_table_offlock(registry_t& reg) {
+			if (driver_bridge::attached_pid() == 0) {
+				std::scoped_lock<std::shared_mutex> w(reg.rw);
+				reg.table.clear();
+				reg.table_built.store(true, std::memory_order_release);
+				return true;
+			}
+
+			auto mods = driver_bridge::enumerate_modules();
+
+			std::vector<module_range_t> staged;
+			staged.reserve(mods.size());
+			std::vector<std::pair<std::string, std::shared_ptr<module_index_t>>> new_modules;
+			new_modules.reserve(mods.size());
+
+			{
+				std::shared_lock<std::shared_mutex> r_lk(reg.rw);
+				for (const auto& m : mods) {
+					if (m.base == 0 || m.size == 0) continue;
+					module_range_t r;
+					r.start_va = m.base;
+					r.end_va = m.base + m.size;
+					r.name = m.name;
+
+					auto it = reg.modules.find(m.name);
+					if (it != reg.modules.end() && it->second->base == m.base && it->second->size == m.size) {
+						r.index = it->second;
+					} else {
+						auto mod = std::make_shared<module_index_t>();
+						mod->name = m.name;
+						mod->base = m.base;
+						mod->size = m.size;
+						r.index = mod;
+						new_modules.emplace_back(m.name, mod);
+					}
+					staged.push_back(std::move(r));
+				}
+			}
+
+			std::sort(staged.begin(), staged.end(),
+				[](const module_range_t& a, const module_range_t& b) {
+					return a.start_va < b.start_va;
+				});
+
+			{
+				std::scoped_lock<std::shared_mutex> w(reg.rw);
+				for (auto& kv : new_modules) {
+					auto it = reg.modules.find(kv.first);
+					if (it == reg.modules.end()) {
+						reg.modules.emplace(kv.first, kv.second);
+					} else if (it->second->base != kv.second->base || it->second->size != kv.second->size) {
+						it->second = kv.second;
+					}
+				}
+				reg.table.swap(staged);
+				reg.table_built.store(true, std::memory_order_release);
+			}
+			return true;
+		}
+
 		inline std::shared_ptr<module_index_t> lookup_cached_module(uint64_t addr) {
 			auto& reg = registry();
 			std::shared_lock<std::shared_mutex> lk(reg.rw);
@@ -368,10 +429,16 @@ namespace xref_index {
 		auto& reg = detail::registry();
 
 		if (!reg.table_built.load(std::memory_order_acquire)) {
-			std::unique_lock<std::shared_mutex> lk(reg.rw);
-			if (!reg.table_built.load(std::memory_order_acquire)) {
-				detail::rebuild_module_table_unlocked(reg);
+			bool expected = false;
+			if (reg.rebuild_in_flight.compare_exchange_strong(expected, true,
+				std::memory_order_acq_rel))
+			{
+				work_queue::post([&reg]() {
+					detail::rebuild_module_table_offlock(reg);
+					reg.rebuild_in_flight.store(false, std::memory_order_release);
+				});
 			}
+			return;
 		}
 
 		std::vector<std::shared_ptr<detail::module_index_t>> targets;
@@ -394,10 +461,13 @@ namespace xref_index {
 
 	inline void on_attach_changed() {
 		auto& reg = detail::registry();
-		std::unique_lock<std::shared_mutex> lk(reg.rw);
-		reg.table.clear();
-		reg.modules.clear();
+		{
+			std::unique_lock<std::shared_mutex> lk(reg.rw);
+			reg.table.clear();
+			reg.modules.clear();
+		}
 		reg.table_built.store(false, std::memory_order_release);
+		reg.rebuild_in_flight.store(false, std::memory_order_release);
 		reg.generation.fetch_add(1, std::memory_order_acq_rel);
 	}
 

@@ -11,6 +11,7 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <array>
 
 #include "ghost_veh.hpp"
 
@@ -617,6 +618,22 @@ namespace detail {
 }
 
 
+namespace detail {
+
+    inline std::array<uint64_t, kDrxSlots>& last_drx_addrs_ref()
+    {
+        static std::array<uint64_t, kDrxSlots> g{ 0, 0, 0, 0 };
+        return g;
+    }
+
+    inline std::atomic<bool>& last_drx_addrs_valid_ref()
+    {
+        static std::atomic<bool> v{ false };
+        return v;
+    }
+
+}
+
 inline bool refresh_all_threads()
 {
     auto& s = detail::state();
@@ -633,6 +650,15 @@ inline bool refresh_all_threads()
     }
 
     if (count == 0) return true;
+
+    auto& last = detail::last_drx_addrs_ref();
+    auto& last_valid = detail::last_drx_addrs_valid_ref();
+    bool unchanged = last_valid.load(std::memory_order_acquire)
+        && last[0] == addrs[0]
+        && last[1] == addrs[1]
+        && last[2] == addrs[2]
+        && last[3] == addrs[3];
+    if (unchanged) return true;
 
     DWORD owner_pid = s.owner_pid != 0 ? s.owner_pid : GetCurrentProcessId();
     DWORD self_tid  = GetCurrentThreadId();
@@ -665,6 +691,16 @@ inline bool refresh_all_threads()
     }
 
     CloseHandle(snap);
+
+    if (overall_ok)
+    {
+        last[0] = addrs[0];
+        last[1] = addrs[1];
+        last[2] = addrs[2];
+        last[3] = addrs[3];
+        last_valid.store(true, std::memory_order_release);
+    }
+
     return overall_ok;
 }
 

@@ -25,6 +25,7 @@
 #include "blur_layer.hpp"
 #include "fonts.hpp"
 #include "ui_anim.hpp"
+#include "work_queue.hpp"
 
 
 namespace {
@@ -85,7 +86,6 @@ float          s_ghost_debounce = 0.f;
 int            s_ghost_trigger_line = -1;
 int            s_ghost_trigger_col  = -1;
 bool           s_ghost_requesting = false;
-std::thread    s_ghost_worker;
 
 bool s_request_undo = false;
 bool s_request_redo = false;
@@ -1024,8 +1024,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                         s_ghost_debounce = 0.f;
                     } else {
                     s_ghost_requesting = true;
-                    if (s_ghost_worker.joinable()) s_ghost_worker.join();
-                    s_ghost_worker = std::thread([context]() {
+                    work_queue::post([context]() {
                         std::string prompt = "Complete the following code. Output ONLY the completion text (the part that comes after the cursor), nothing else. No explanation, no markdown. If there's nothing meaningful to suggest, output nothing.\n\n```\n" + context + "```";
                         std::vector<std::pair<std::string, std::string>> empty_history;
                         std::string result = g_sa_ai_client->chat_blocking(prompt, empty_history);

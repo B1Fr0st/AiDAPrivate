@@ -16,15 +16,32 @@
 
 namespace {
 
+bool is_transient_share_error(DWORD err) {
+    return err == ERROR_SHARING_VIOLATION
+        || err == ERROR_LOCK_VIOLATION
+        || err == ERROR_USER_MAPPED_FILE
+        || err == ERROR_ACCESS_DENIED;
+}
+
+HANDLE create_with_retry(const char* path, DWORD access, DWORD share, DWORD disposition) {
+    constexpr int kMaxAttempts = 60;
+    constexpr DWORD kBackoffMs = 500;
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        handle = ::CreateFileA(path, access, share, nullptr, disposition,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle != INVALID_HANDLE_VALUE)
+            return handle;
+        DWORD err = ::GetLastError();
+        if (!is_transient_share_error(err))
+            return INVALID_HANDLE_VALUE;
+        ::Sleep(kBackoffMs);
+    }
+    return INVALID_HANDLE_VALUE;
+}
+
 bool read_file(const char* path, std::vector<uint8_t>& out_buffer) {
-    HANDLE handle = ::CreateFileA(
-        path,
-        GENERIC_READ,
-        FILE_SHARE_READ,
-        nullptr,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr);
+    HANDLE handle = create_with_retry(path, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING);
     if (handle == INVALID_HANDLE_VALUE) {
         return false;
     }
@@ -50,14 +67,7 @@ bool read_file(const char* path, std::vector<uint8_t>& out_buffer) {
 }
 
 bool write_file(const char* path, const std::vector<uint8_t>& buffer) {
-    HANDLE handle = ::CreateFileA(
-        path,
-        GENERIC_WRITE,
-        0,
-        nullptr,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr);
+    HANDLE handle = create_with_retry(path, GENERIC_WRITE, 0, CREATE_ALWAYS);
     if (handle == INVALID_HANDLE_VALUE) {
         return false;
     }

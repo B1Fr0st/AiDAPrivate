@@ -377,8 +377,8 @@ private:
                 drain_ring(sess);
             }
 
-            for (int i = 0; i < 10 && sess->polling.load(); i++)
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (sess->polling.load())
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
 

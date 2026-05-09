@@ -23,7 +23,31 @@ namespace process_guard {
         PROCESS_VM_WRITE | PROCESS_CREATE_THREAD |
         PROCESS_SUSPEND_RESUME | PROCESS_SET_INFORMATION;
 
-    __forceinline bool is_allowlisted_system_caller(HANDLE caller_pid) {
+    constexpr ULONG CALLER_CACHE_SIZE = 16;
+    constexpr LONG64 CALLER_CACHE_TTL_100NS = 50000000LL;
+
+    struct caller_cache_entry_t {
+        HANDLE pid;
+        LARGE_INTEGER last_time;
+        UCHAR valid;
+        UCHAR is_werfault;
+        UCHAR is_allowlisted;
+    };
+
+    inline caller_cache_entry_t g_caller_cache[CALLER_CACHE_SIZE] = {};
+    inline KSPIN_LOCK g_caller_cache_lock = {};
+    inline volatile LONG g_caller_cache_lock_init = 0;
+
+    __forceinline void ensure_caller_cache_lock() {
+        if (_InterlockedCompareExchange(&g_caller_cache_lock_init, 1, 0) == 0) {
+            KeInitializeSpinLock(&g_caller_cache_lock);
+        }
+    }
+
+    __forceinline bool compute_caller_attrs_uncached(HANDLE caller_pid, bool* out_is_werfault, bool* out_is_allowlisted) {
+        *out_is_werfault = false;
+        *out_is_allowlisted = false;
+
         static const char* const ALLOWLIST[] = {
             "csrss", "services", "wininit", "lsass",
             "msmpeng", "securityheal", "werfault"
@@ -35,10 +59,21 @@ namespace process_guard {
         if (!NT_SUCCESS(PsLookupProcessByProcessId(caller_pid, &proc)) || !proc)
             return false;
 
-        bool allowed = false;
+        bool got_image = false;
         __try {
             UCHAR* img = PsGetProcessImageFileName(proc);
             if (img && _MmIsAddressValid(img)) {
+                got_image = true;
+
+                {
+                    const char prefix[] = "werfault";
+                    bool match = true;
+                    for (int c = 0; c < 8; ++c) {
+                        if ((char)(img[c] | 0x20) != prefix[c]) { match = false; break; }
+                    }
+                    if (match) *out_is_werfault = true;
+                }
+
                 for (int i = 0; i < ALLOWLIST_COUNT; ++i) {
                     const char* prefix = ALLOWLIST[i];
                     int plen = ALLOWLIST_LENS[i];
@@ -48,32 +83,110 @@ namespace process_guard {
                         char b = (char)(prefix[c] | 0x20);
                         if (a != b) { match = false; break; }
                     }
-                    if (match) { allowed = true; break; }
+                    if (match) { *out_is_allowlisted = true; break; }
                 }
             }
-        } __except (EXCEPTION_EXECUTE_HANDLER) { allowed = false; }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            got_image = false;
+            *out_is_werfault = false;
+            *out_is_allowlisted = false;
+        }
 
         _ObfDereferenceObject(proc);
-        return allowed;
+        return got_image;
+    }
+
+    __forceinline void query_caller_attrs(HANDLE caller_pid, bool* out_is_werfault, bool* out_is_allowlisted) {
+        *out_is_werfault = false;
+        *out_is_allowlisted = false;
+
+        ensure_caller_cache_lock();
+
+        LARGE_INTEGER now;
+        KeQuerySystemTime(&now);
+
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_caller_cache_lock, &old_irql);
+
+        ULONG hit_index = CALLER_CACHE_SIZE;
+        for (ULONG i = 0; i < CALLER_CACHE_SIZE; ++i) {
+            if (g_caller_cache[i].valid && g_caller_cache[i].pid == caller_pid) {
+                hit_index = i;
+                break;
+            }
+        }
+
+        if (hit_index < CALLER_CACHE_SIZE) {
+            LONG64 delta = now.QuadPart - g_caller_cache[hit_index].last_time.QuadPart;
+            if (delta >= 0 && delta < CALLER_CACHE_TTL_100NS) {
+                *out_is_werfault = g_caller_cache[hit_index].is_werfault != 0;
+                *out_is_allowlisted = g_caller_cache[hit_index].is_allowlisted != 0;
+                KeReleaseSpinLock(&g_caller_cache_lock, old_irql);
+                return;
+            }
+        }
+
+        KeReleaseSpinLock(&g_caller_cache_lock, old_irql);
+
+        bool computed_wer = false;
+        bool computed_allow = false;
+        bool ok = compute_caller_attrs_uncached(caller_pid, &computed_wer, &computed_allow);
+
+        *out_is_werfault = computed_wer;
+        *out_is_allowlisted = computed_allow;
+
+        if (!ok)
+            return;
+
+        KeAcquireSpinLock(&g_caller_cache_lock, &old_irql);
+
+        ULONG slot = CALLER_CACHE_SIZE;
+        for (ULONG i = 0; i < CALLER_CACHE_SIZE; ++i) {
+            if (g_caller_cache[i].valid && g_caller_cache[i].pid == caller_pid) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot == CALLER_CACHE_SIZE) {
+            for (ULONG i = 0; i < CALLER_CACHE_SIZE; ++i) {
+                if (!g_caller_cache[i].valid) {
+                    slot = i;
+                    break;
+                }
+            }
+        }
+        if (slot == CALLER_CACHE_SIZE) {
+            ULONG oldest = 0;
+            LONG64 oldest_time = g_caller_cache[0].last_time.QuadPart;
+            for (ULONG i = 1; i < CALLER_CACHE_SIZE; ++i) {
+                if (g_caller_cache[i].last_time.QuadPart < oldest_time) {
+                    oldest_time = g_caller_cache[i].last_time.QuadPart;
+                    oldest = i;
+                }
+            }
+            slot = oldest;
+        }
+
+        g_caller_cache[slot].pid = caller_pid;
+        g_caller_cache[slot].last_time = now;
+        g_caller_cache[slot].valid = 1;
+        g_caller_cache[slot].is_werfault = computed_wer ? 1 : 0;
+        g_caller_cache[slot].is_allowlisted = computed_allow ? 1 : 0;
+
+        KeReleaseSpinLock(&g_caller_cache_lock, old_irql);
+    }
+
+    __forceinline bool is_allowlisted_system_caller(HANDLE caller_pid) {
+        bool is_wer = false;
+        bool is_allow = false;
+        query_caller_attrs(caller_pid, &is_wer, &is_allow);
+        return is_allow;
     }
 
     __forceinline bool is_werfault_caller(HANDLE caller_pid) {
-        PEPROCESS proc = nullptr;
-        if (!NT_SUCCESS(PsLookupProcessByProcessId(caller_pid, &proc)) || !proc)
-            return false;
         bool is_wer = false;
-        __try {
-            UCHAR* img = PsGetProcessImageFileName(proc);
-            if (img && _MmIsAddressValid(img)) {
-                const char prefix[] = "werfault";
-                bool match = true;
-                for (int c = 0; c < 8; ++c) {
-                    if ((char)(img[c] | 0x20) != prefix[c]) { match = false; break; }
-                }
-                is_wer = match;
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) { is_wer = false; }
-        _ObfDereferenceObject(proc);
+        bool is_allow = false;
+        query_caller_attrs(caller_pid, &is_wer, &is_allow);
         return is_wer;
     }
 

@@ -626,9 +626,10 @@ NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
             slot.current_hash = request->expected_hash;
 
 
-            slot.check_interval_ms =
-                (request->check_interval > 0 && request->check_interval <= 30000)
-                    ? request->check_interval : 10000;
+            if (request->check_interval > 0 && request->check_interval <= 30000)
+                slot.check_interval_ms = request->check_interval;
+            else
+                slot.check_interval_ms = 10000;
             slot.status = DPRT_STATUS_ACTIVE;
             slot.last_check_tsc = __rdtsc();
 

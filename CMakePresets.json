@@ -3,20 +3,9 @@
   "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
   "configurePresets": [
     {
-      "name": "vs2022",
-      "displayName": "Visual Studio 2022 (MSBuild) — legacy fallback",
-      "description": "Original generator. Keeps the .vcxproj/.sln workflow that the existing 'Build AiDAStandalone 2' VS Code task uses. Slower than the Ninja presets; use only if Ninja path has issues.",
-      "generator": "Visual Studio 17 2022",
-      "architecture": { "value": "x64", "strategy": "set" },
-      "binaryDir": "${sourceDir}/build",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
-      }
-    },
-    {
       "name": "ninja-msvc-release",
       "displayName": "Ninja + MSVC + sccache (RELEASE, full protector)",
-      "description": "Production build. Uses Ninja for the build graph (single-graph parallelism beats per-vcxproj /m), sccache as the compiler launcher (caches every .obj keyed on preprocessed input — second clean rebuild is mostly cache hits), /Z7 embedded debug info via CMP0141 (no mspdbsrv.exe serialization). Run from a 'x64 Native Tools Command Prompt for VS 2022' so cl.exe is on PATH.",
+      "description": "Canonical production build. Ninja drives the build graph (single-graph parallelism beats per-vcxproj /m), sccache caches every .obj keyed on preprocessed input (second clean rebuild is mostly cache hits), /Z7 embeds debug info via CMP0141 (no mspdbsrv.exe serialization). The AiDAProtector POST_BUILD step runs on every end-user binary (AiDAStandalone.exe, aida_core.dll, AiDA.dll). This is the only supported build configuration. Run from a 'x64 Native Tools Command Prompt for VS 2022' so cl.exe is on PATH, or use the VS Code task which calls vcvars64.bat first.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build-ninja",
       "cacheVariables": {
@@ -32,67 +21,12 @@
         "SCCACHE_CACHE_SIZE":      "20G",
         "SCCACHE_IDLE_TIMEOUT":    "0"
       }
-    },
-    {
-      "name": "ninja-msvc-fast",
-      "displayName": "Ninja + MSVC + sccache (DEV ITERATION, no protector)",
-      "description": "Dev-iteration preset. Same as ninja-msvc-release but skips the AiDAProtector POST_BUILD on the three protection targets, which alone takes ~5–15 minutes per full build. Output binaries are unprotected — don't ship them. Re-link only is what you usually want here.",
-      "inherits": "ninja-msvc-release",
-      "binaryDir": "${sourceDir}/build-ninja-fast",
-      "cacheVariables": {
-        "BUILD_PROTECTOR": "OFF"
-      }
-    },
-    {
-      "name": "ninja-clangcl-release",
-      "displayName": "Ninja + clang-cl + sccache (RELEASE)",
-      "description": "Clang-cl front-end with the MSVC ABI. Often 10–30% faster on very large C++ TUs because it parses headers more efficiently than cl.exe and works better with sccache hash caching. Requires LLVM in PATH (you have it at C:/Program Files/LLVM/bin).",
-      "inherits": "ninja-msvc-release",
-      "binaryDir": "${sourceDir}/build-ninja-clang",
-      "cacheVariables": {
-        "CMAKE_C_COMPILER":   "clang-cl",
-        "CMAKE_CXX_COMPILER": "clang-cl"
-      }
     }
   ],
   "buildPresets": [
     {
-      "name": "vs2022-release",
-      "configurePreset": "vs2022",
-      "configuration": "Release",
-      "jobs": 0
-    },
-    {
       "name": "ninja-msvc-release",
       "configurePreset": "ninja-msvc-release",
-      "jobs": 12
-    },
-    {
-      "name": "ninja-msvc-fast",
-      "configurePreset": "ninja-msvc-fast",
-      "jobs": 12
-    },
-    {
-      "name": "ninja-msvc-fast-rebuild",
-      "configurePreset": "ninja-msvc-fast",
-      "cleanFirst": true,
-      "jobs": 12
-    },
-    {
-      "name": "ninja-clangcl-release",
-      "configurePreset": "ninja-clangcl-release",
-      "jobs": 12
-    },
-    {
-      "name": "ninja-msvc-release-standalone",
-      "configurePreset": "ninja-msvc-release",
-      "targets": ["AiDAStandalone"],
-      "jobs": 12
-    },
-    {
-      "name": "ninja-msvc-fast-standalone",
-      "configurePreset": "ninja-msvc-fast",
-      "targets": ["AiDAStandalone"],
       "jobs": 12
     },
     {

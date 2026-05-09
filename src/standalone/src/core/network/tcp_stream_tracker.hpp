@@ -228,8 +228,8 @@ private:
             }
 
 
-            for (int i = 0; i < 5 && running_.load(); i++)
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (running_.load())
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
 

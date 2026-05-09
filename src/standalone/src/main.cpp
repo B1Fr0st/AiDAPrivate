@@ -1188,6 +1188,11 @@ int main(int, char**)
         }
         g_SwapChainOccluded = false;
 
+        if (g_hwnd && ::GetForegroundWindow() != g_hwnd)
+        {
+            ::Sleep(16);
+        }
+
         static bool ide_resize_applied = false;
         if (g_ResizeWidth != 0 && g_ResizeHeight != 0)
         {

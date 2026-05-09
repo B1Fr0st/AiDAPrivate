@@ -1353,8 +1353,8 @@ static void worker_thread_func(state_t& state) {
             work_item item;
             {
                 std::unique_lock<std::mutex> lock(state.work_mutex);
-                state.work_cv.wait_for(lock, std::chrono::milliseconds(200), [&] {
-                    return !state.work_queue.empty() || !state.running.load();
+                state.work_cv.wait(lock, [&] {
+                    return !state.work_queue.empty() || !state.running.load() || !state.proxy_alive.load();
                 });
                 if (!state.running.load() && state.work_queue.empty()) break;
                 if (state.work_queue.empty()) continue;

@@ -17,20 +17,22 @@
 #include <mutex>
 
 #include "standalone_driver.hpp"
+#include "../analysis/pe_parser.hpp"
 
 
 struct AsmInstr
 {
-    uint64_t addr       = 0;
-    uint8_t  raw[16]    = {};
-    int      len        = 1;
-    char     mnem[32]   = {};
-    char     ops[128]   = {};
-    bool     is_branch  = false;
-    bool     is_call    = false;
-    bool     is_ret     = false;
-    bool     is_nop     = false;
-    bool     is_priv    = false;
+    uint64_t addr           = 0;
+    uint8_t  raw[16]        = {};
+    int      len            = 1;
+    char     mnem[32]       = {};
+    char     ops[128]       = {};
+    bool     is_branch      = false;
+    bool     is_call        = false;
+    bool     is_ret         = false;
+    bool     is_nop         = false;
+    bool     is_priv        = false;
+    uint64_t branch_target  = 0;
 };
 
 
@@ -67,8 +69,9 @@ struct DisasmState
     uint32_t live_pid        = 0;
     uint64_t live_base       = 0;
     uint64_t live_size       = 0;
+    uint64_t live_floor_va   = 0;
     uint64_t live_view_addr  = 0;
-    uint64_t live_window     = 0x10000;
+    uint64_t live_window     = 0x4000;
     std::string live_module;
     float    live_refresh_timer = 0.f;
     float    live_refresh_interval = 2.0f;
@@ -82,6 +85,7 @@ struct DisasmState
     std::atomic<bool> live_pending_ready{false};
 	uint64_t goto_address = 0;
 	bool has_new_goto = false;
+	bool last_swap_was_live = false;
 };
 
 namespace static_analysis
@@ -201,6 +205,23 @@ inline AsmInstr zydis_decode_one(const uint8_t* code, int avail, uint64_t va)
         instruction.meta.category == ZYDIS_CATEGORY_INTERRUPT)
         ins.is_priv = true;
 
+    if (ins.is_branch || ins.is_call) {
+        for (uint8_t oi = 0; oi < instruction.operand_count_visible; ++oi) {
+            const auto& op = operands[oi];
+            if (op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE && op.imm.is_relative) {
+                uint64_t abs_addr = 0;
+                if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&instruction, &op, va, &abs_addr))) {
+                    ins.branch_target = abs_addr;
+                    break;
+                }
+            }
+            if (op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE && !op.imm.is_relative) {
+                ins.branch_target = static_cast<uint64_t>(op.imm.value.u);
+                break;
+            }
+        }
+    }
+
     return ins;
 }
 
@@ -297,6 +318,9 @@ namespace disasm
         for (auto& s : file.sections) total_bytes += s.bytes.size();
         file.instrs.reserve(total_bytes / 4);
 
+        constexpr size_t kYieldEveryN = 16384;
+        size_t since_yield = 0;
+
         for (auto& section : file.sections) {
             const uint8_t* data = section.bytes.data();
             int             sz   = static_cast<int>(section.bytes.size());
@@ -311,6 +335,10 @@ namespace disasm
                 memcpy(ins.raw, data + off, static_cast<size_t>(raw_len));
                 file.instrs.push_back(ins);
                 off += ins.len;
+                if (++since_yield >= kYieldEveryN) {
+                    since_yield = 0;
+                    std::this_thread::yield();
+                }
             }
         }
 
@@ -367,10 +395,16 @@ namespace disasm
 
         uint64_t half = state.live_window / 2;
         uint64_t win_start = state.live_view_addr;
-        if (win_start > half && (win_start - half) >= state.live_base)
+        uint64_t effective_floor = state.live_base;
+        if (state.live_floor_va != 0 &&
+            state.live_floor_va >= state.live_base &&
+            state.live_floor_va < state.live_base + state.live_size &&
+            state.live_view_addr >= state.live_floor_va)
+            effective_floor = state.live_floor_va;
+        if (win_start > half && (win_start - half) >= effective_floor)
             win_start -= half;
         else
-            win_start = state.live_base;
+            win_start = effective_floor;
 
         uint64_t mod_end = state.live_base + state.live_size;
         uint64_t win_end = win_start + state.live_window;
@@ -403,6 +437,7 @@ namespace disasm
                 const uint8_t* data = mem.data();
                 int sz = static_cast<int>(mem.size());
                 int off = 0;
+                size_t since_yield = 0;
                 while (off < sz) {
                     int remaining = sz - off;
                     int avail = (remaining < 15) ? remaining : 15;
@@ -411,6 +446,10 @@ namespace disasm
                     memcpy(ins.raw, data + off, static_cast<size_t>(raw_len));
                     instrs.push_back(ins);
                     off += ins.len;
+                    if (++since_yield >= 16384) {
+                        since_yield = 0;
+                        std::this_thread::yield();
+                    }
                 }
             }
 
@@ -444,7 +483,26 @@ namespace disasm
         state.live_pid    = pid;
         state.live_base   = base;
         state.live_size   = size;
+        state.live_floor_va = 0;
         state.live_view_addr = base;
+        {
+            pe_parser::pe_info_t pe;
+            if (pe_parser::parse(base, pe)) {
+                constexpr uint32_t kCntCode = 0x00000020u;
+                constexpr uint32_t kMemExec = 0x20000000u;
+                uint64_t first_exec_va = 0;
+                for (const auto& s : pe.sections) {
+                    if ((s.characteristics & kCntCode) || (s.characteristics & kMemExec)) {
+                        first_exec_va = base + static_cast<uint64_t>(s.virtual_address);
+                        break;
+                    }
+                }
+                if (first_exec_va != 0 && first_exec_va >= base && first_exec_va < base + size) {
+                    state.live_view_addr = first_exec_va;
+                    state.live_floor_va  = first_exec_va;
+                }
+            }
+        }
         state.live_module = module_name;
         state.live_paused = false;
         state.live_decoding.store(false, std::memory_order_release);
@@ -458,7 +516,7 @@ namespace disasm
         state.file.filename = module_name + " [LIVE]";
         state.file.path     = "live://" + std::to_string(pid) + "/" + module_name;
         state.file.image_base = base;
-        state.file.text_va    = base;
+        state.file.text_va    = state.live_view_addr;
         state.file.loaded     = true;
 
 
@@ -473,6 +531,7 @@ namespace disasm
         state.live_pid    = 0;
         state.live_base   = 0;
         state.live_size   = 0;
+        state.live_floor_va = 0;
         state.live_view_addr = 0;
         state.live_module.clear();
         state.live_paused = false;

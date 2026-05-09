@@ -10,7 +10,11 @@
 
 namespace work_queue {
 
-inline constexpr int POOL_SIZE = 12;
+inline const int POOL_SIZE = []() {
+    unsigned int hc = std::thread::hardware_concurrency();
+    if (hc < 4u) return 2;
+    return static_cast<int>(hc - 2u);
+}();
 
 namespace detail {
 

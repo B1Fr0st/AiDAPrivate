@@ -51,18 +51,28 @@ struct hook_report_t
 
 namespace detail {
 
+    inline BCRYPT_ALG_HANDLE get_sha256_alg()
+    {
+        thread_local BCRYPT_ALG_HANDLE h = nullptr;
+        if (!h)
+        {
+            if (BCryptOpenAlgorithmProvider(&h, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
+            {
+                h = nullptr;
+            }
+        }
+        return h;
+    }
+
     inline bool sha256_hash(const void* data, size_t size, uint8_t out[32])
     {
-        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_ALG_HANDLE hAlg = get_sha256_alg();
+        if (!hAlg) return false;
         BCRYPT_HASH_HANDLE hHash = nullptr;
         bool ok = false;
 
-        if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
-            return false;
-
         if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) != 0)
         {
-            BCryptCloseAlgorithmProvider(hAlg, 0);
             return false;
         }
 
@@ -74,7 +84,6 @@ namespace detail {
         }
 
         BCryptDestroyHash(hHash);
-        BCryptCloseAlgorithmProvider(hAlg, 0);
         return ok;
     }
 

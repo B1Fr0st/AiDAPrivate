@@ -87,9 +87,7 @@ namespace guardian {
             UINT64 aperf1 = __readmsr(MSR_APERF);
             UINT64 mperf1 = __readmsr(MSR_MPERF);
 
-            volatile ULONG dummy = 0;
-            for (volatile int i = 0; i < 10000; ++i)
-                dummy += i;
+            KeStallExecutionProcessor(50);
 
             UINT64 aperf2 = __readmsr(MSR_APERF);
             UINT64 mperf2 = __readmsr(MSR_MPERF);
@@ -163,25 +161,6 @@ namespace guardian {
         SN_LOG("guardian::dpc: cycle=%ld", cycle);
 
 
-        self_protect::verify_own_integrity();
-
-
-        integrity::verify();
-        if (integrity::g_integrity_strikes >= integrity::INTEGRITY_STRIKE_THRESHOLD) {
-            heartbeat::send_command(heartbeat::BRIDGE_CMD_INTEGRITY_FAIL,
-                static_cast<ULONG>(integrity::g_integrity_strikes));
-        }
-
-
-        dispatch_guard::verify();
-
-
-        if ((cycle % 5) == 0) {
-            SN_LOG("guardian::dpc: IPI clear (cycle %ld)", cycle);
-            thread_guard::ipi_clear_all_cpus();
-        }
-
-
         SN_LOG("guardian::dpc: calling heartbeat::update_and_check (bridge=%p init=%ld)",
             heartbeat::g_bridge, heartbeat::g_initialized);
         heartbeat::update_and_check();
@@ -197,57 +176,51 @@ namespace guardian {
             } __except (EXCEPTION_EXECUTE_HANDLER) {}
         }
 
-
-        if ((cycle % 5) == 0) {
-            callback_scanner::verify();
+        if (integrity::g_integrity_strikes >= integrity::INTEGRITY_STRIKE_THRESHOLD) {
+            heartbeat::send_command(heartbeat::BRIDGE_CMD_INTEGRITY_FAIL,
+                static_cast<ULONG>(integrity::g_integrity_strikes));
         }
 
+        self_protect::verify_own_integrity();
 
-        if ((cycle % 10) == 0) {
-            pool_scrub::periodic_scrub();
+        integrity::verify();
+
+        dispatch_guard::verify();
+
+        SN_LOG("guardian::dpc: IPI clear (cycle %ld)", cycle);
+        thread_guard::ipi_clear_all_cpus();
+
+        callback_scanner::verify();
+
+        pool_scrub::periodic_scrub();
+
+        debug_port_trap::check(reinterpret_cast<HANDLE>(
+            _InterlockedCompareExchange64(
+                reinterpret_cast<volatile LONG64*>(&object_guard::g_protected_pid), 0, 0)));
+
+        vad_text_guard::check(reinterpret_cast<HANDLE>(
+            _InterlockedCompareExchange64(
+                reinterpret_cast<volatile LONG64*>(&object_guard::g_protected_pid), 0, 0)));
+
+        if (!heartbeat::verify_module_presence()) {
+            SN_LOG("guardian::dpc: WhosWho UNLOADED from module list!");
         }
 
-        if ((cycle % 3) == 0) {
-            debug_port_trap::check(reinterpret_cast<HANDLE>(
-                _InterlockedCompareExchange64(
-                    reinterpret_cast<volatile LONG64*>(&object_guard::g_protected_pid), 0, 0)));
-        }
+        heartbeat::verify_challenge_response();
+        heartbeat::issue_challenge();
 
-        if ((cycle % 2) == 0) {
-            vad_text_guard::check(reinterpret_cast<HANDLE>(
-                _InterlockedCompareExchange64(
-                    reinterpret_cast<volatile LONG64*>(&object_guard::g_protected_pid), 0, 0)));
-        }
-
-        if ((cycle % 7) == 0) {
-            if (!heartbeat::verify_module_presence()) {
-                SN_LOG("guardian::dpc: WhosWho UNLOADED from module list!");
+        if (!hv_allow_list::is_microsoft_hyperv_root()) {
+            if (detect_lbr_interception()) {
+                SN_LOG("guardian::dpc: LBR interception detected - hostile HV");
+                heartbeat::send_command(heartbeat::BRIDGE_CMD_RE_EVIDENCE, 0x0000AE01u);
             }
-        }
 
-        if ((cycle % 6) == 0) {
-            heartbeat::verify_challenge_response();
-            heartbeat::issue_challenge();
-        }
-
-        if ((cycle % 4) == 0) {
-            if (!hv_allow_list::is_microsoft_hyperv_root()) {
-                if (detect_lbr_interception()) {
-                    SN_LOG("guardian::dpc: LBR interception detected - hostile HV");
-                    heartbeat::send_command(heartbeat::BRIDGE_CMD_RE_EVIDENCE, 0x0000AE01u);
-                }
-            }
-        }
-
-        if ((cycle % 8) == 0) {
-            if (!hv_allow_list::is_microsoft_hyperv_root()) {
-                if (!_InterlockedCompareExchange(&g_aperf_warmup_done, 0, 0)) {
-                    if (cycle >= APERF_WARMUP_CYCLES)
-                        _InterlockedExchange(&g_aperf_warmup_done, 1);
-                } else if (detect_aperf_anomaly()) {
-                    SN_LOG("guardian::dpc: APERF/MPERF anomaly detected - possible HV");
-                    heartbeat::send_command(heartbeat::BRIDGE_CMD_RE_EVIDENCE, 0x0000AE02u);
-                }
+            if (!_InterlockedCompareExchange(&g_aperf_warmup_done, 0, 0)) {
+                if (cycle >= APERF_WARMUP_CYCLES)
+                    _InterlockedExchange(&g_aperf_warmup_done, 1);
+            } else if (detect_aperf_anomaly()) {
+                SN_LOG("guardian::dpc: APERF/MPERF anomaly detected - possible HV");
+                heartbeat::send_command(heartbeat::BRIDGE_CMD_RE_EVIDENCE, 0x0000AE02u);
             }
         }
 

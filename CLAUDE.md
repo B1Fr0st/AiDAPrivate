@@ -49,18 +49,16 @@ Pipeline:
 
 ### Presets (`CMakePresets.json`)
 
+There is **one** supported configure preset and **one** rebuild variant. There are no fast/dev/clang-cl/standalone-only presets — every build is the protected production build. This is intentional: anti-tamper instrumentation is layered into the runtime via the protector POST_BUILD step, and an unprotected binary behaves differently enough at runtime (no .epheme/.dthunk rotation, no IAT stub, no anti-dump re-encrypt) that "it works in fast mode" tells you nothing about whether the shipping binary works. So we don't ship a fast-mode escape hatch.
+
 | Preset | Generator / toolset | Protector | Use case |
 |---|---|---|---|
-| `vs2022` | VS 17 2022 / MSVC | ON | Legacy/IDE workflow |
-| `ninja-msvc-release` | Ninja+sccache / cl.exe (`/Z7`) | ON | Canonical production build |
-| `ninja-msvc-fast` | Ninja+sccache / cl.exe | OFF | Day-to-day dev iteration (skips 5–15 min POST_BUILD) |
-| `ninja-msvc-fast-rebuild` | Ninja+sccache / cl.exe | OFF | Clean+full, no protector |
-| `ninja-clangcl-release` | Ninja+sccache / clang-cl | ON | 10–30% faster on heavy TUs (anti-tamper headers); requires LLVM in PATH |
-| `ninja-msvc-rebuild` | Ninja+sccache / cl.exe | ON | Full clean rebuild, protector on |
-| `ninja-msvc-release-standalone` | Ninja+sccache / cl.exe | ON | `AiDAStandalone` only |
-| `ninja-msvc-fast-standalone` | Ninja+sccache / cl.exe | OFF | `AiDAStandalone` only, no protector |
+| `ninja-msvc-release` (configure + build, **recommended**) | Ninja+sccache / cl.exe (`/Z7`) | ON | The canonical and only build |
+| `ninja-msvc-rebuild` (build) | Ninja+sccache / cl.exe | ON | Full clean rebuild over the same configure preset |
 
-Output goes to `build/Release/`.
+Output goes to `build-ninja/`. The protector POST_BUILD runs unconditionally on every successful build of `AiDAStandalone.exe`, `aida_core.dll`, and `AiDA.dll`. Expect 5–15 min per protected binary on a clean rebuild; subsequent incremental builds are much faster (sccache amortizes the compile, and the protector is idempotent — `transforms.hpp::detect_already_protected` short-circuits on a re-run).
+
+If you genuinely need to debug the raw compiler output (e.g., to attach WinDbg to a non-protected build), pass `-DBUILD_PROTECTOR=OFF` directly on the cmake command line — there is no preset that does this for you. Don't ship a binary built that way.
 
 ### CMake targets
 
@@ -94,12 +92,14 @@ Protector chain: `AiDAProtector`, `AiDAExtractPayload`, `AiDAPayloadBlob` (compi
 
 ### VS Code tasks
 
-The canonical day-to-day commands referenced by `.github/agents/*`:
+All tasks call `vcvars64.bat` from `C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\` (the installed edition on this machine — adjust the path in `.vscode/tasks.json` if you have a different SKU/version).
 
-- **`Build AiDAStandalone 2`** — `MSBuild.exe build/AiDAStandalone.vcxproj /p:Configuration=Release /p:Platform=x64 /v:minimal /m`. Default build task.
-- **`Configure (Ninja+sccache, FAST iter, no protector)`** + **`Build AiDAStandalone (Ninja, FAST iter, no protector)`** — fastest dev cycle.
-- **`Full rebuild (Ninja+sccache, Release)`** — clean + full production build.
+- **`Configure (Ninja+sccache, Release)`** — runs `cmake --preset ninja-msvc-release`. Required once after a fresh checkout, after pulling new dependencies, or after touching `CMakeLists.txt`.
+- **`Build (Ninja+sccache, Release, full protector)`** — runs `cmake --build --preset ninja-msvc-release`. **This is the default build task.** Builds everything (drivers' encrypted headers excluded — those use their own .sln files); runs the protector POST_BUILD on each end-user binary.
+- **`Full rebuild (Ninja+sccache, Release, full protector)`** — runs `cmake --build --preset ninja-msvc-rebuild` (clean first). Use after pulling changes that invalidate sccache's preprocessed-input keys (compile-flag changes, MSVC update, header-storm refactors).
 - **`sccache: show stats`** / **`sccache: zero stats`** — cache diagnostics.
+
+There are no fast-iteration / no-protector / clang-cl / standalone-only tasks. All builds are full-protector; iteration speed comes from sccache (compile-cached) plus protector idempotency (already-protected sections short-circuit), not from skipping protection.
 
 ### Compiler flags & defines
 
@@ -314,10 +314,10 @@ Condensed from `.github/agents/*.agent.md` (`.github/copilot-instructions.md` is
 
 ## Build-changes gotchas
 
-- Editing any `src/standalone/src/core/anti-tamper/*.hpp` triggers a near-full rebuild — `orchestrator.hpp` pulls the whole graph. Use `ninja-clangcl-release` or `ninja-msvc-fast` while iterating.
+- Editing any `src/standalone/src/core/anti-tamper/*.hpp` triggers a near-full rebuild — `orchestrator.hpp` pulls the whole graph. sccache catches most of the recompile cost on the second build; expect the protector POST_BUILD to dominate once the link finishes.
 - Editing the root `.c` hex dumps (`WhosWho.c`, `Sentinel.c`, `WindMapper.c`) does not by itself rebuild anything except via timestamp; the `encrypt_drivers` target picks up the change and `OBJECT_DEPENDS` on `driver_loader.cpp` re-links. If a driver change isn't reflecting, `touch` the `.c` file or rerun the encrypt script.
 - `strip_comments.py` at the repo root is destructive and rewrites all C/C++/CMake comments under `driver/`. It is not part of the normal build — do not run it as a "cleanup" pass.
-- The protector POST_BUILD step runs every successful build. If you're diffing a binary or attaching a debugger, expect the output to be post-protection. Use `-DBUILD_PROTECTOR=OFF` (or `ninja-msvc-fast`) for raw compiler output.
+- The protector POST_BUILD step runs every successful build. If you're diffing a binary or attaching a debugger, expect the output to be post-protection. To get raw compiler output for one-off debugging, configure with `-DBUILD_PROTECTOR=OFF` directly on the cmake command line — there's no preset that does this, on purpose, because unprotected behavior diverges enough at runtime (no .epheme/.dthunk rotation, no IAT stub, no anti-dump re-encrypt) that a "works in unprotected mode" result tells you nothing about the shipping binary.
 - `ida-sdk/` is gitignored; the `AiDA` target refuses to configure without it (`-DIDASDK_DIR=...` or drop the SDK at `ida-sdk/src`).
 - New protector sections must be added to **both** `transforms.hpp::section_skip_list::is_skipped` AND `verify_api.hpp::probe_p03`.
 - New LoadConfig fields filled by future MSVC versions (e.g., when `/guard:xfg` is enabled) must be added to `add_pointer_target(...)` in `transforms.hpp` or the post-pack zero loop nukes them.

@@ -86,6 +86,7 @@ namespace detail {
 
         std::atomic<bool> regen_thread_running{false};
         std::thread       regen_thread;
+        HANDLE            regen_stop_event{nullptr};
 
         uint64_t          fake_ntdll_ra{0};
     };
@@ -589,12 +590,12 @@ namespace detail {
         auto& s = state();
         while (s.regen_thread_running.load(std::memory_order_acquire))
         {
-            for (int i = 0; i < 30; ++i)
-            {
-                if (!s.regen_thread_running.load(std::memory_order_acquire))
-                    return;
-                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-            }
+            HANDLE ev = s.regen_stop_event;
+            DWORD wait_rc = (ev != nullptr)
+                ? WaitForSingleObject(ev, 30000)
+                : (std::this_thread::sleep_for(std::chrono::milliseconds(30000)), static_cast<DWORD>(WAIT_TIMEOUT));
+            if (wait_rc == WAIT_OBJECT_0) return;
+            if (!s.regen_thread_running.load(std::memory_order_acquire)) return;
 
             std::lock_guard<std::mutex> lk(s.mtx);
             if (!s.active.load(std::memory_order_acquire)) continue;
@@ -650,6 +651,9 @@ inline bool initialize()
 
     s.active.store(true, std::memory_order_release);
     detail::ghost_flags_ref().store(0x1u, std::memory_order_release);
+
+    if (s.regen_stop_event == nullptr)
+        s.regen_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
     s.regen_thread_running.store(true, std::memory_order_release);
     s.regen_thread = std::thread(detail::regen_loop);
@@ -742,8 +746,15 @@ inline void shutdown()
     if (!s.active.load(std::memory_order_acquire)) return;
 
     s.regen_thread_running.store(false, std::memory_order_release);
+    if (s.regen_stop_event != nullptr)
+        SetEvent(s.regen_stop_event);
     if (s.regen_thread.joinable())
         s.regen_thread.join();
+    if (s.regen_stop_event != nullptr)
+    {
+        CloseHandle(s.regen_stop_event);
+        s.regen_stop_event = nullptr;
+    }
 
     std::lock_guard<std::mutex> lk(s.mtx);
     detail::uninstall_current_offset(s);

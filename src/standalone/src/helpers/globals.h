@@ -3,6 +3,7 @@
 #include "standalone_license.hpp"
 #include "terminal_view.hpp"
 #include "workspace_search.hpp"
+#include "work_queue.hpp"
 #include <iostream>
 #include <d3d11.h>
 #include <string>
@@ -13,6 +14,8 @@
 #include <functional>
 #include <atomic>
 #include <mutex>
+#include <filesystem>
+#include <system_error>
 
 
 enum class center_view_t : int {
@@ -769,18 +772,41 @@ namespace file_tabs {
 		if (active_tab >= (int)tabs.size()) active_tab = (int)tabs.size() - 1;
 		if (active_tab >= 0 && active_tab < (int)tabs.size()) {
 			auto& t = tabs[active_tab];
+			std::error_code _ec;
+			uintmax_t fsize = t.filepath.empty() ? 0 : std::filesystem::file_size(t.filepath, _ec);
+			if (_ec) fsize = 0;
 			std::string content;
-			FILE* f = nullptr;
-			fopen_s(&f, t.filepath.c_str(), "rb");
-			if (f) {
-				fseek(f, 0, SEEK_END);
-				long sz = ftell(f);
-				fseek(f, 0, SEEK_SET);
-				content.resize(sz);
-				fread(&content[0], 1, sz, f);
-				fclose(f);
+			if (fsize <= (256ULL * 1024ULL)) {
+				FILE* f = nullptr;
+				fopen_s(&f, t.filepath.c_str(), "rb");
+				if (f) {
+					fseek(f, 0, SEEK_END);
+					long sz = ftell(f);
+					fseek(f, 0, SEEK_SET);
+					content.resize(sz);
+					fread(&content[0], 1, sz, f);
+					fclose(f);
+				}
+				code_editor::load(content, t.filename, t.filepath);
+			} else {
+				std::string fname = t.filename;
+				std::string fpath = t.filepath;
+				code_editor::load(std::string("Loading..."), fname, fpath);
+				work_queue::post([fname, fpath]() {
+					std::string c;
+					FILE* f = nullptr;
+					fopen_s(&f, fpath.c_str(), "rb");
+					if (f) {
+						fseek(f, 0, SEEK_END);
+						long sz = ftell(f);
+						fseek(f, 0, SEEK_SET);
+						c.resize(sz);
+						fread(&c[0], 1, sz, f);
+						fclose(f);
+					}
+					code_editor::load(c, fname, fpath);
+				});
 			}
-			code_editor::load(content, t.filename, t.filepath);
 		} else {
 			code_editor::active = false;
 			code_editor::buffer.clear();

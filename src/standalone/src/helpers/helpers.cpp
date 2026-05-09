@@ -43,6 +43,10 @@
 #include "functions_panel.hpp"
 #include "binary_map_view.hpp"
 #include "agent_picker_view.hpp"
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <shared_mutex>
 
 static ID3D11ShaderResourceView* g_send_icon_srv    = nullptr;
 static ID3D11ShaderResourceView* g_loader_icon_srv  = nullptr;
@@ -50,6 +54,45 @@ static int                        g_loader_icon_w    = 0;
 static int                        g_loader_icon_h    = 0;
 DisasmState                       g_disasm;
 const char*                       g_render_section = "idle";
+
+namespace {
+	std::atomic<bool>          g_settings_dirty{false};
+	std::condition_variable    g_settings_cv;
+	std::mutex                 g_settings_cv_mtx;
+	std::thread                g_settings_saver;
+	std::atomic<bool>          g_settings_saver_running{false};
+	std::atomic<bool>          g_settings_saver_started{false};
+
+	void settings_saver_loop()
+	{
+		while (g_settings_saver_running.load()) {
+			std::unique_lock<std::mutex> lk(g_settings_cv_mtx);
+			g_settings_cv.wait_for(lk, std::chrono::milliseconds(500), [] {
+				return g_settings_dirty.load() || !g_settings_saver_running.load();
+			});
+			lk.unlock();
+			if (!g_settings_saver_running.load()) break;
+			if (g_settings_dirty.exchange(false)) {
+				try {
+					g_sa_settings.save();
+				} catch (...) {
+				}
+			}
+		}
+	}
+
+	void g_sa_settings_request_save()
+	{
+		g_settings_dirty.store(true);
+		bool expected = false;
+		if (g_settings_saver_started.compare_exchange_strong(expected, true)) {
+			g_settings_saver_running.store(true);
+			g_settings_saver = std::thread(settings_saver_loop);
+			g_settings_saver.detach();
+		}
+		g_settings_cv.notify_one();
+	}
+}
 
 static bool trusted_get_open_file_name(OPENFILENAMEA& ofn)
 {
@@ -648,7 +691,12 @@ void helpers::render_title()
 		++s_inline_log_ctr;
 
 		if ((s_inline_log_ctr % 1000) == 0) {
-			anti_tamper::run_inline_check(anti_tamper::CHECK_CODE_INTEGRITY);
+			work_queue::post([] {
+				try {
+					anti_tamper::run_inline_check(anti_tamper::CHECK_CODE_INTEGRITY);
+				} catch (...) {
+				}
+			});
 		}
 	}
 
@@ -734,19 +782,19 @@ void helpers::render_title()
 		if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_B, false)) {
 			globals::ui::panel_left_visible = !globals::ui::panel_left_visible;
 			g_sa_settings.workspace.left_visible = globals::ui::panel_left_visible;
-			g_sa_settings.save();
+			g_sa_settings_request_save();
 		}
 
 		if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_J, false)) {
 			globals::ui::panel_right_visible = !globals::ui::panel_right_visible;
 			g_sa_settings.workspace.right_visible = globals::ui::panel_right_visible;
-			g_sa_settings.save();
+			g_sa_settings_request_save();
 		}
 
 		if (ctrl && ImGui::IsKeyPressed(ImGuiKey_GraveAccent, false)) {
 			globals::ui::panel_bottom_visible = !globals::ui::panel_bottom_visible;
 			g_sa_settings.workspace.bottom_visible = globals::ui::panel_bottom_visible;
-			g_sa_settings.save();
+			g_sa_settings_request_save();
 		}
 
 		if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_S, false) && code_editor::active) {
@@ -771,9 +819,23 @@ void helpers::render_title()
 			if (!file_tabs::tabs.empty()) {
 				file_tabs::active_tab = (file_tabs::active_tab + 1) % (int)file_tabs::tabs.size();
 				auto& t = file_tabs::tabs[file_tabs::active_tab];
-				std::string c; FILE* ff = nullptr; fopen_s(&ff, t.filepath.c_str(), "rb");
-				if (ff) { fseek(ff,0,SEEK_END); long sz=ftell(ff); fseek(ff,0,SEEK_SET); c.resize(sz); fread(&c[0],1,sz,ff); fclose(ff); }
-				code_editor::load(c, t.filename, t.filepath);
+				std::error_code ec;
+				uintmax_t fsize = t.filepath.empty() ? 0 : std::filesystem::file_size(t.filepath, ec);
+				if (ec) fsize = 0;
+				if (fsize > (256ULL * 1024ULL)) {
+					std::string fname = t.filename;
+					std::string fpath = t.filepath;
+					code_editor::load(std::string("Loading..."), fname, fpath);
+					work_queue::post([fname, fpath]() {
+						std::string c; FILE* ff = nullptr; fopen_s(&ff, fpath.c_str(), "rb");
+						if (ff) { fseek(ff,0,SEEK_END); long sz=ftell(ff); fseek(ff,0,SEEK_SET); c.resize(sz); fread(&c[0],1,sz,ff); fclose(ff); }
+						code_editor::load(c, fname, fpath);
+					});
+				} else {
+					std::string c; FILE* ff = nullptr; fopen_s(&ff, t.filepath.c_str(), "rb");
+					if (ff) { fseek(ff,0,SEEK_END); long sz=ftell(ff); fseek(ff,0,SEEK_SET); c.resize(sz); fread(&c[0],1,sz,ff); fclose(ff); }
+					code_editor::load(c, t.filename, t.filepath);
+				}
 			}
 		}
 
@@ -781,9 +843,23 @@ void helpers::render_title()
 			if (!file_tabs::tabs.empty()) {
 				file_tabs::active_tab = (file_tabs::active_tab - 1 + (int)file_tabs::tabs.size()) % (int)file_tabs::tabs.size();
 				auto& t = file_tabs::tabs[file_tabs::active_tab];
-				std::string c; FILE* ff = nullptr; fopen_s(&ff, t.filepath.c_str(), "rb");
-				if (ff) { fseek(ff,0,SEEK_END); long sz=ftell(ff); fseek(ff,0,SEEK_SET); c.resize(sz); fread(&c[0],1,sz,ff); fclose(ff); }
-				code_editor::load(c, t.filename, t.filepath);
+				std::error_code ec;
+				uintmax_t fsize = t.filepath.empty() ? 0 : std::filesystem::file_size(t.filepath, ec);
+				if (ec) fsize = 0;
+				if (fsize > (256ULL * 1024ULL)) {
+					std::string fname = t.filename;
+					std::string fpath = t.filepath;
+					code_editor::load(std::string("Loading..."), fname, fpath);
+					work_queue::post([fname, fpath]() {
+						std::string c; FILE* ff = nullptr; fopen_s(&ff, fpath.c_str(), "rb");
+						if (ff) { fseek(ff,0,SEEK_END); long sz=ftell(ff); fseek(ff,0,SEEK_SET); c.resize(sz); fread(&c[0],1,sz,ff); fclose(ff); }
+						code_editor::load(c, fname, fpath);
+					});
+				} else {
+					std::string c; FILE* ff = nullptr; fopen_s(&ff, t.filepath.c_str(), "rb");
+					if (ff) { fseek(ff,0,SEEK_END); long sz=ftell(ff); fseek(ff,0,SEEK_SET); c.resize(sz); fread(&c[0],1,sz,ff); fclose(ff); }
+					code_editor::load(c, t.filename, t.filepath);
+				}
 			}
 		}
 
@@ -884,7 +960,7 @@ void helpers::render_title()
 			if (remember_choice) {
 				globals::ui::decompile_default_mode = 0;
 				g_sa_settings.decompile_default_mode = 0;
-				g_sa_settings.save();
+				g_sa_settings_request_save();
 			}
 			ImGui::CloseCurrentPopup();
 		}
@@ -904,7 +980,7 @@ void helpers::render_title()
 			if (remember_choice) {
 				globals::ui::decompile_default_mode = 1;
 				g_sa_settings.decompile_default_mode = 1;
-				g_sa_settings.save();
+				g_sa_settings_request_save();
 			}
 			ImGui::CloseCurrentPopup();
 		}
@@ -924,7 +1000,7 @@ void helpers::render_title()
 			if (remember_choice) {
 				globals::ui::decompile_default_mode = 2;
 				g_sa_settings.decompile_default_mode = 2;
-				g_sa_settings.save();
+				g_sa_settings_request_save();
 			}
 			ImGui::CloseCurrentPopup();
 		}
@@ -2325,7 +2401,7 @@ void helpers::render_title()
 							themes::changed = true;
 							g_sa_settings.active_theme_idx = ti;
 							g_sa_settings.active_custom_theme_idx = -1;
-							g_sa_settings.save();
+							g_sa_settings_request_save();
 						}
 					}
 
@@ -2378,7 +2454,7 @@ void helpers::render_title()
 								custom_themes::active_custom = ci;
 								themes::changed = true;
 								g_sa_settings.active_custom_theme_idx = ci;
-								g_sa_settings.save();
+								g_sa_settings_request_save();
 							}
 						}
 					}
@@ -2592,7 +2668,7 @@ void helpers::render_title()
 						}
 						g_sa_settings.custom_themes_json = arr.dump();
 						g_sa_settings.active_custom_theme_idx = custom_themes::active_custom;
-						g_sa_settings.save();
+						g_sa_settings_request_save();
 					}
 					ImGui::SameLine();
 
@@ -2887,7 +2963,7 @@ void helpers::render_title()
 											CoTaskMemFree(wpath);
 											file_browser::refresh(folder);
 											g_sa_settings.workspace.root_path = folder;
-											g_sa_settings.save();
+											g_sa_settings_request_save();
 										}
 										psi->Release();
 									}
@@ -2953,17 +3029,17 @@ void helpers::render_title()
 						if (menu_item(globals::ui::panel_left_visible ? "Hide Explorer" : "Show Explorer", "Ctrl+B")) {
 							globals::ui::panel_left_visible = !globals::ui::panel_left_visible;
 							g_sa_settings.workspace.left_visible = globals::ui::panel_left_visible;
-							g_sa_settings.save();
+							g_sa_settings_request_save();
 						}
 						if (menu_item(globals::ui::panel_right_visible ? "Hide Chat" : "Show Chat", "Ctrl+J")) {
 							globals::ui::panel_right_visible = !globals::ui::panel_right_visible;
 							g_sa_settings.workspace.right_visible = globals::ui::panel_right_visible;
-							g_sa_settings.save();
+							g_sa_settings_request_save();
 						}
 						if (menu_item(globals::ui::panel_bottom_visible ? "Hide Output" : "Show Output", "Ctrl+`")) {
 							globals::ui::panel_bottom_visible = !globals::ui::panel_bottom_visible;
 							g_sa_settings.workspace.bottom_visible = globals::ui::panel_bottom_visible;
-							g_sa_settings.save();
+							g_sa_settings_request_save();
 						}
 						menu_sep();
 						menu_item("Zoom In",  "Ctrl+=", false);
@@ -5764,7 +5840,7 @@ void helpers::render_title()
 						if (ImGui::Selectable(profile.display_name.c_str(), is_active, 0, ImVec2(200.f, 0.f))) {
 							g_sa_settings.active_provider_profile_id = profile.id;
 							g_sa_settings.sync_legacy_fields_from_active_profile();
-							g_sa_settings.save();
+							g_sa_settings_request_save();
 						}
 						if (is_active) ImGui::PopStyleColor();
 					}
@@ -5788,7 +5864,7 @@ void helpers::render_title()
 							if (ImGui::Selectable(m.c_str(), is_sel, 0, ImVec2(260.f, 0.f))) {
 								current_profile->model = m;
 								g_sa_settings.sync_legacy_fields_from_active_profile();
-								g_sa_settings.save();
+								g_sa_settings_request_save();
 								ImGui::CloseCurrentPopup();
 							}
 							if (is_sel) ImGui::PopStyleColor();
@@ -6943,24 +7019,109 @@ void helpers::render_title()
 				ImGui::Separator();
 
 				static int drv_tab = 0;
+				static std::vector<driver_bridge::module_info_t> ds_mods_cache;
+				static std::vector<driver_bridge::thread_info_t>  ds_threads_cache;
+				static LONGLONG                                   ds_mods_last_ms = 0;
+				static LONGLONG                                   ds_threads_last_ms = 0;
+				static uint32_t                                   ds_mods_cache_pid = 0;
+				static uint32_t                                   ds_threads_cache_pid = 0;
+				static std::shared_mutex                          ds_mods_mu;
+				static std::shared_mutex                          ds_threads_mu;
+				static std::atomic<bool>                          ds_mods_in_flight{false};
+				static std::atomic<bool>                          ds_threads_in_flight{false};
+				LONGLONG _ds_now_ms = static_cast<LONGLONG>(GetTickCount64());
 				if (ImGui::BeginTabBar("##drv_tabs")) {
 					if (ImGui::BeginTabItem("Modules")) {
 						drv_tab = 0;
-						auto mods = driver_bridge::enumerate_modules();
-						ImGui::BeginChild("##mod_list", ImVec2(-1, sh - 180.f));
-						for (auto& m : mods) {
-							ImGui::Text("0x%llX  %s", (unsigned long long)m.base, m.name.c_str());
+						uint32_t cur_pid = driver_bridge::attached_pid();
+						bool need_refresh = false;
+						{
+							std::shared_lock<std::shared_mutex> lk(ds_mods_mu);
+							if (ds_mods_cache_pid != cur_pid || (_ds_now_ms - ds_mods_last_ms) >= 2000)
+								need_refresh = true;
 						}
+						if (need_refresh) {
+							bool expected = false;
+							if (ds_mods_in_flight.compare_exchange_strong(expected, true)) {
+								work_queue::post([cur_pid]() {
+									std::vector<driver_bridge::module_info_t> fresh;
+									try {
+										fresh = driver_bridge::enumerate_modules();
+									} catch (...) {
+										fresh.clear();
+									}
+									{
+										std::unique_lock<std::shared_mutex> lk(ds_mods_mu);
+										ds_mods_cache = std::move(fresh);
+										ds_mods_cache_pid = cur_pid;
+										ds_mods_last_ms = static_cast<LONGLONG>(GetTickCount64());
+									}
+									ds_mods_in_flight.store(false);
+								});
+							}
+						}
+						std::vector<driver_bridge::module_info_t> mods_view;
+						{
+							std::shared_lock<std::shared_mutex> lk(ds_mods_mu);
+							mods_view = ds_mods_cache;
+						}
+						ImGui::BeginChild("##mod_list", ImVec2(-1, sh - 180.f));
+						ImGuiListClipper clipper;
+						clipper.Begin(static_cast<int>(mods_view.size()));
+						while (clipper.Step()) {
+							for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
+								auto& m = mods_view[i];
+								ImGui::Text("0x%llX  %s", (unsigned long long)m.base, m.name.c_str());
+							}
+						}
+						clipper.End();
 						ImGui::EndChild();
 						ImGui::EndTabItem();
 					}
 					if (ImGui::BeginTabItem("Threads")) {
 						drv_tab = 1;
-						auto threads = driver_bridge::enumerate_threads();
-						ImGui::BeginChild("##thr_list", ImVec2(-1, sh - 180.f));
-						for (auto& t : threads) {
-							ImGui::Text("TID %u  Priority %d", (unsigned)t.tid, t.priority);
+						uint32_t cur_pid = driver_bridge::attached_pid();
+						bool need_refresh = false;
+						{
+							std::shared_lock<std::shared_mutex> lk(ds_threads_mu);
+							if (ds_threads_cache_pid != cur_pid || (_ds_now_ms - ds_threads_last_ms) >= 2000)
+								need_refresh = true;
 						}
+						if (need_refresh) {
+							bool expected = false;
+							if (ds_threads_in_flight.compare_exchange_strong(expected, true)) {
+								work_queue::post([cur_pid]() {
+									std::vector<driver_bridge::thread_info_t> fresh;
+									try {
+										fresh = driver_bridge::enumerate_threads();
+									} catch (...) {
+										fresh.clear();
+									}
+									{
+										std::unique_lock<std::shared_mutex> lk(ds_threads_mu);
+										ds_threads_cache = std::move(fresh);
+										ds_threads_cache_pid = cur_pid;
+										ds_threads_last_ms = static_cast<LONGLONG>(GetTickCount64());
+									}
+									ds_threads_in_flight.store(false);
+								});
+							}
+						}
+						std::vector<driver_bridge::thread_info_t> threads_view;
+						{
+							std::shared_lock<std::shared_mutex> lk(ds_threads_mu);
+							threads_view = ds_threads_cache;
+						}
+						ImGui::BeginChild("##thr_list", ImVec2(-1, sh - 180.f));
+						ImGuiListClipper clipper;
+						clipper.Begin(static_cast<int>(threads_view.size()));
+						while (clipper.Step()) {
+							for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
+								auto& t = threads_view[i];
+								ImGui::Text("TID %u  Priority %d", (unsigned)t.tid, t.priority);
+							}
+						}
+						clipper.End();
 						ImGui::EndChild();
 						ImGui::EndTabItem();
 					}

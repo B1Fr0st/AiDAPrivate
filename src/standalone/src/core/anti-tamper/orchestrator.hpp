@@ -678,8 +678,6 @@ inline bool finalize_after_activation()
 inline bool guard()
 {
     static bool s_first_guard = true;
-    static uint64_t s_guard_call_count = 0;
-    ++s_guard_call_count;
     if (s_first_guard) {
         webhook::write_log("guard", "first_guard_entry");
         s_first_guard = false;
@@ -1098,15 +1096,27 @@ inline uint64_t worker_compute_score()
     return s;
 }
 
+inline BCRYPT_ALG_HANDLE get_hmac_alg()
+{
+    thread_local BCRYPT_ALG_HANDLE h = nullptr;
+    if (!h)
+    {
+        if (BCryptOpenAlgorithmProvider(&h, BCRYPT_SHA256_ALGORITHM, nullptr,
+                                        BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0)
+        {
+            h = nullptr;
+        }
+    }
+    return h;
+}
+
 inline bool hmac_sha256(const uint8_t* key, uint32_t key_len,
                        const uint8_t* data, uint32_t data_len,
                        uint8_t out[32])
 {
-    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_ALG_HANDLE alg = get_hmac_alg();
+    if (!alg) return false;
     BCRYPT_HASH_HANDLE hash = nullptr;
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr,
-                                    BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0)
-        return false;
     bool ok = false;
     if (BCryptCreateHash(alg, &hash, nullptr, 0,
                          const_cast<PUCHAR>(key), key_len, 0) == 0)
@@ -1115,7 +1125,6 @@ inline bool hmac_sha256(const uint8_t* key, uint32_t key_len,
             ok = (BCryptFinishHash(hash, out, 32, 0) == 0);
         BCryptDestroyHash(hash);
     }
-    BCryptCloseAlgorithmProvider(alg, 0);
     return ok;
 }
 

@@ -702,16 +702,21 @@ inline void start_monitors()
     if (rt.monitors_running.exchange(true))
         return;
 
-    work_queue::post([]() {
-        Sleep(5000);
+    static std::thread s_anti_tamper_monitor_thread;
+    if (!s_anti_tamper_monitor_thread.joinable())
+    {
+        s_anti_tamper_monitor_thread = std::thread([]() {
+            Sleep(5000);
 
-        auto& rt = state::get();
-        while (rt.monitors_running.load() && !rt.violation_latched.load())
-        {
-            run_verification_cycle();
-            Sleep(3000);
-        }
-    });
+            auto& rt = state::get();
+            while (rt.monitors_running.load() && !rt.violation_latched.load())
+            {
+                run_verification_cycle();
+                Sleep(3000);
+            }
+        });
+        s_anti_tamper_monitor_thread.detach();
+    }
 }
 
 

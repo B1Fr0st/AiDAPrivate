@@ -88,6 +88,8 @@ struct instr_cache_entry_t {
     bool                                           ops_valid = false;
     std::string                                    ops_subst;
     std::vector<colored_run_t>                     ops_runs;
+    std::vector<float>                             ops_run_widths;
+    float                                          ops_total_width = 0.f;
     bool                                           bytes_valid = false;
     std::string                                    bytes_str;
     bool                                           inj_valid = false;
@@ -100,24 +102,49 @@ struct instr_cache_entry_t {
     bool                                           xref_inline_valid = false;
     std::vector<xref_index::annotation_t>          xref_inline;
     bool                                           xref_inline_more = false;
+    bool                                           seg_addr_valid = false;
+    std::string                                    seg_addr_str;
+    std::string                                    seg_part_str;
+    std::string                                    addr_part_str;
+    float                                          seg_part_width = 0.f;
+    std::string                                    cmt_trimmed;
+    std::string                                    cmt_source;
+    float                                          cmt_trimmed_for_width = -1.f;
+    bool                                           cmt_truncated = false;
+    float                                          cmt_drawn_width = 0.f;
 };
 
-static std::unordered_map<uint64_t, instr_cache_entry_t> s_instr_cache;
+static std::unordered_map<uint64_t, instr_cache_entry_t> s_instr_cache_hot;
+static std::unordered_map<uint64_t, instr_cache_entry_t> s_instr_cache_cold;
 
 static inline void instr_cache_clear_all() {
-    s_instr_cache.clear();
+    s_instr_cache_hot.clear();
+    s_instr_cache_cold.clear();
 }
 
 static inline void instr_cache_bound_size() {
-    constexpr size_t kCap = 16384;
-    if (s_instr_cache.size() > kCap)
-        s_instr_cache.clear();
+    constexpr size_t kCap = 65536;
+    if (s_instr_cache_hot.size() > kCap) {
+        s_instr_cache_cold = std::move(s_instr_cache_hot);
+        s_instr_cache_hot.clear();
+        s_instr_cache_hot.reserve(kCap / 2);
+    }
 }
 
 static inline instr_cache_entry_t& instr_cache_slot(uint64_t addr, uint32_t gen,
                                                     const uint8_t* raw, int raw_len)
 {
-    auto& e = s_instr_cache[addr];
+    auto hot_it = s_instr_cache_hot.find(addr);
+    if (hot_it == s_instr_cache_hot.end()) {
+        auto cold_it = s_instr_cache_cold.find(addr);
+        if (cold_it != s_instr_cache_cold.end()) {
+            hot_it = s_instr_cache_hot.emplace(addr, std::move(cold_it->second)).first;
+            s_instr_cache_cold.erase(cold_it);
+        } else {
+            hot_it = s_instr_cache_hot.emplace(addr, instr_cache_entry_t{}).first;
+        }
+    }
+    auto& e = hot_it->second;
     bool reset = (e.gen != gen);
     int sig_len = raw_len < 16 ? raw_len : 16;
     if (!reset) {
@@ -132,6 +159,8 @@ static inline instr_cache_entry_t& instr_cache_slot(uint64_t addr, uint32_t gen,
         e.ops_valid = false;
         e.ops_subst.clear();
         e.ops_runs.clear();
+        e.ops_run_widths.clear();
+        e.ops_total_width = 0.f;
         e.bytes_valid = false;
         e.bytes_str.clear();
         e.inj_valid = false;
@@ -144,6 +173,16 @@ static inline instr_cache_entry_t& instr_cache_slot(uint64_t addr, uint32_t gen,
         e.xref_inline_valid = false;
         e.xref_inline.clear();
         e.xref_inline_more = false;
+        e.seg_addr_valid = false;
+        e.seg_addr_str.clear();
+        e.seg_part_str.clear();
+        e.addr_part_str.clear();
+        e.seg_part_width = 0.f;
+        e.cmt_trimmed.clear();
+        e.cmt_source.clear();
+        e.cmt_trimmed_for_width = -1.f;
+        e.cmt_truncated = false;
+        e.cmt_drawn_width = 0.f;
     }
     return e;
 }
@@ -198,14 +237,13 @@ struct frame_var_cache_t {
 static std::string ida_section_name_for_va(const DisasmFile& file, uint64_t va) {
     if (file.image_base == 0) return std::string();
     if (va < file.image_base) return std::string();
-    uint64_t module_base = 0;
-    uint32_t module_size = 0;
-    std::string mod_name;
-    if (function_index::detail::resolve_module_for_address(va, module_base, module_size, mod_name)) {
-        pe_parser::pe_info_t pe;
-        if (pe_parser::parse(module_base, pe)) {
-            std::string s = function_index::detail::section_name_for_va(pe, module_base, va);
-            if (!s.empty()) return s;
+    if (auto cached = xref_index::detail::lookup_cached_module(va)) {
+        if (cached->base != 0 && !cached->sections.empty()) {
+            uint32_t rva = static_cast<uint32_t>(va - cached->base);
+            for (const auto& s : cached->sections) {
+                if (rva >= s.virtual_address && rva < s.virtual_address + s.virtual_size)
+                    return s.name;
+            }
         }
     }
     return std::string(".text");
@@ -331,19 +369,11 @@ static std::string substitute_operand_text(const AsmInstr& ins, const DisasmFile
         return out;
     };
 
-    if (ins.is_branch || ins.is_call) {
-        uint64_t target = 0;
-        const char* hex_p = std::strstr(ins.ops, "0x");
-        if (!hex_p) hex_p = ins.ops;
-        if (sscanf_s(hex_p, "%llx", &target) == 1
-            || sscanf_s(hex_p, "0x%llx", &target) == 1)
-        {
-            if (target != 0) {
-                std::string sym = function_index::synthetic_name(target);
-                if (!sym.empty()) {
-                    base = try_replace_hex(base, target, sym);
-                }
-            }
+    if ((ins.is_branch || ins.is_call) && ins.branch_target != 0) {
+        uint64_t target = ins.branch_target;
+        std::string sym = function_index::synthetic_name(target);
+        if (!sym.empty()) {
+            base = try_replace_hex(base, target, sym);
         }
     }
 
@@ -1114,6 +1144,7 @@ void render(float pos_x, float pos_y, float width, float height,
         disasm.file.image_base = disasm.live_pending_va;
         disasm.file.text_va    = disasm.live_pending_va;
         disasm.live_pending_ready.store(false, std::memory_order_release);
+        disasm.last_swap_was_live = true;
 
 
         if (scroll_addr != 0 && !disasm.file.instrs.empty()) {
@@ -1256,10 +1287,16 @@ void render(float pos_x, float pos_y, float width, float height,
     }
 
     if (s_last_known_n != n) {
-        s_first_load_anim = 0.f;
-        s_row_entrance.clear();
-        s_last_known_n = n;
+        if (disasm.last_swap_was_live) {
+            s_last_known_n = n;
+        } else {
+            s_first_load_anim = 0.f;
+            s_row_entrance.clear();
+            s_row_hover.clear();
+            s_last_known_n = n;
+        }
     }
+    disasm.last_swap_was_live = false;
     if (s_first_load_anim < 1.f)
         s_first_load_anim += dt * 1.6f;
     if (s_first_load_anim > 1.f) s_first_load_anim = 1.f;
@@ -1410,34 +1447,77 @@ void render(float pos_x, float pos_y, float width, float height,
     vc.func_start = 0;
     vc.resolved = false;
 
-    auto draw_addr_prefix = [&](float yy, uint64_t va, const std::string& seg_override,
-                                float row_alpha, float yoff)
+    struct sec_resolver_t {
+        bool                                   resolved = false;
+        uint64_t                               module_base = 0;
+        uint32_t                               module_size = 0;
+        std::vector<pe_parser::section_info_t> sections;
+        std::string                            fallback;
+    };
+    sec_resolver_t sec_resolver;
+
+    auto draw_addr_prefix_cached = [&](float yy, instr_cache_entry_t* cache_ptr,
+                                       uint64_t va, const std::string& seg_override,
+                                       float row_alpha, float yoff)
     {
-        std::string seg_addr = format_segment_address(file, va, seg_override);
-        std::string seg_part;
-        std::string addr_part;
-        size_t colon = seg_addr.find(':');
-        if (colon != std::string::npos) {
-            seg_part = seg_addr.substr(0, colon);
-            addr_part = seg_addr.substr(colon + 1);
+        const std::string* seg_part_ptr = nullptr;
+        const std::string* addr_part_ptr = nullptr;
+        float seg_part_w = 0.f;
+        std::string fallback_seg;
+        std::string fallback_addr;
+        const bool can_cache = (cache_ptr != nullptr) && (sec_resolver.module_base != 0);
+
+        if (can_cache && cache_ptr->seg_addr_valid) {
+            seg_part_ptr = &cache_ptr->seg_part_str;
+            addr_part_ptr = &cache_ptr->addr_part_str;
+            seg_part_w = cache_ptr->seg_part_width;
         } else {
-            addr_part = seg_addr;
+            std::string seg_addr = format_segment_address(file, va, seg_override);
+            size_t colon = seg_addr.find(':');
+            if (colon != std::string::npos) {
+                fallback_seg = seg_addr.substr(0, colon);
+                fallback_addr = seg_addr.substr(colon + 1);
+            } else {
+                fallback_addr = seg_addr;
+            }
+            seg_part_w = fallback_seg.empty() ? 0.f
+                : code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, fallback_seg.c_str()).x;
+            if (can_cache) {
+                cache_ptr->seg_addr_str = std::move(seg_addr);
+                cache_ptr->seg_part_str = fallback_seg;
+                cache_ptr->addr_part_str = fallback_addr;
+                cache_ptr->seg_part_width = seg_part_w;
+                cache_ptr->seg_addr_valid = true;
+                seg_part_ptr = &cache_ptr->seg_part_str;
+                addr_part_ptr = &cache_ptr->addr_part_str;
+            } else {
+                seg_part_ptr = &fallback_seg;
+                addr_part_ptr = &fallback_addr;
+            }
         }
+
+        const std::string& seg_part = *seg_part_ptr;
+        const std::string& addr_part = *addr_part_ptr;
         ImVec2 sp(x_seg_addr, yy + 1.f - yoff);
         dl->AddText(code_font, code_size, sp,
             aida::ui::with_alpha(disasm_theme::segment(), row_alpha), seg_part.c_str());
         if (!seg_part.empty()) {
-            float w_seg = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, seg_part.c_str()).x;
-            ImVec2 cp(x_seg_addr + w_seg, yy + 1.f - yoff);
+            ImVec2 cp(x_seg_addr + seg_part_w, yy + 1.f - yoff);
             dl->AddText(code_font, code_size, cp,
                 aida::ui::with_alpha(disasm_theme::separator(), row_alpha), ":");
-            ImVec2 ap(x_seg_addr + w_seg + ch_w_safe, yy + 1.f - yoff);
+            ImVec2 ap(x_seg_addr + seg_part_w + ch_w_safe, yy + 1.f - yoff);
             dl->AddText(code_font, code_size, ap,
                 aida::ui::with_alpha(disasm_theme::address(), row_alpha), addr_part.c_str());
         } else {
             dl->AddText(code_font, code_size, sp,
                 aida::ui::with_alpha(disasm_theme::address(), row_alpha), addr_part.c_str());
         }
+    };
+
+    auto draw_addr_prefix = [&](float yy, uint64_t va, const std::string& seg_override,
+                                float row_alpha, float yoff)
+    {
+        draw_addr_prefix_cached(yy, nullptr, va, seg_override, row_alpha, yoff);
     };
 
     auto draw_text_at = [&](float xx, float yy, ImU32 col, const char* str, float yoff) {
@@ -1447,15 +1527,6 @@ void render(float pos_x, float pos_y, float width, float height,
     auto fill_row_bg = [&](float yy, ImU32 col) {
         dl->AddRectFilled(ImVec2(ox, yy), ImVec2(ox + width, yy + line_h - 1.f), col);
     };
-
-    struct sec_resolver_t {
-        bool                                   resolved = false;
-        uint64_t                               module_base = 0;
-        uint32_t                               module_size = 0;
-        std::vector<pe_parser::section_info_t> sections;
-        std::string                            fallback;
-    };
-    sec_resolver_t sec_resolver;
 
     auto sec_resolver_init = [&]() {
         if (sec_resolver.resolved) return;
@@ -1472,19 +1543,6 @@ void render(float pos_x, float pos_y, float width, float height,
                 return;
             }
         }
-        if (throttled) return;
-
-        uint64_t mb = 0;
-        uint32_t ms = 0;
-        std::string mn;
-        if (!function_index::detail::resolve_module_for_address(probe_va, mb, ms, mn)) return;
-
-        pe_parser::pe_info_t pe;
-        if (!pe_parser::parse(mb, pe)) return;
-
-        sec_resolver.module_base = mb;
-        sec_resolver.module_size = ms;
-        sec_resolver.sections = pe.sections;
     };
 
     auto get_visible_section = [&](uint64_t va) -> std::string {
@@ -1599,7 +1657,7 @@ void render(float pos_x, float pos_y, float width, float height,
         auto draw_injection_row = [&](float yy, const function_index::injection_row_t& r,
                                       const std::string& addr_seg)
         {
-            draw_addr_prefix(yy, ins.addr, addr_seg, row_a_inner * 0.7f, row_y_off);
+            draw_addr_prefix_cached(yy, &cache, ins.addr, addr_seg, row_a_inner * 0.7f, row_y_off);
             if (r.kind == function_index::injection_t::spacer_line) return;
             if (r.text.empty()) return;
 
@@ -1661,7 +1719,7 @@ void render(float pos_x, float pos_y, float width, float height,
             if (yy + line_h < oy_content || yy > oy_content + content_height) continue;
             const auto& br = before_rows_ref[bi];
             if (br.kind == function_index::injection_t::spacer_line) {
-                draw_addr_prefix(yy, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
+                draw_addr_prefix_cached(yy, &cache, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
             } else {
                 draw_injection_row(yy, br, sec_name);
             }
@@ -1679,7 +1737,7 @@ void render(float pos_x, float pos_y, float width, float height,
             for (size_t xi = 1; xi < xrefs_at_func.size(); ++xi) {
                 float yy = y - static_cast<float>(xi) * line_h;
                 if (yy + line_h < oy_content || yy > oy_content + content_height) continue;
-                draw_addr_prefix(yy, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
+                draw_addr_prefix_cached(yy, &cache, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
                 bool last_more = (xi + 1 == xrefs_at_func.size()) && xrefs_more;
                 std::string xt = ida_format_xref_comment(xrefs_at_func[xi], last_more);
                 draw_text_at(x_comment, yy,
@@ -1691,7 +1749,7 @@ void render(float pos_x, float pos_y, float width, float height,
         if (!inline_label_ptr->empty() && !throttled) {
             float yy = y - line_h;
             if (yy + line_h >= oy_content && yy <= oy_content + content_height) {
-                draw_addr_prefix(yy, ins.addr, sec_name, row_a_inner * 0.7f, row_y_off);
+                draw_addr_prefix_cached(yy, &cache, ins.addr, sec_name, row_a_inner * 0.7f, row_y_off);
                 std::string lbl_text = *inline_label_ptr + ":";
                 draw_text_at(x_mnem, yy,
                     aida::ui::with_alpha(disasm_theme::loc_label(), row_a_inner),
@@ -1710,7 +1768,7 @@ void render(float pos_x, float pos_y, float width, float height,
             }
         }
 
-        draw_addr_prefix(y, ins.addr, sec_name, row_a_inner * 0.95f, row_y_off);
+        draw_addr_prefix_cached(y, &cache, ins.addr, sec_name, row_a_inner * 0.95f, row_y_off);
 
         if (st.show_bytes) {
             if (!cache.bytes_valid) {
@@ -1741,6 +1799,15 @@ void render(float pos_x, float pos_y, float width, float height,
             if (!cache.ops_valid) {
                 cache.ops_subst = substitute_operand_text(ins, file);
                 build_operand_colored_runs(ins, cache.ops_subst, cache.ops_runs);
+                cache.ops_run_widths.clear();
+                cache.ops_run_widths.reserve(cache.ops_runs.size());
+                cache.ops_total_width = 0.f;
+                for (const auto& run : cache.ops_runs) {
+                    float w = run.text.empty() ? 0.f
+                        : code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, run.text.c_str()).x;
+                    cache.ops_run_widths.push_back(w);
+                    cache.ops_total_width += w;
+                }
                 cache.ops_valid = true;
             }
             operand_text_ptr = &cache.ops_subst;
@@ -1760,46 +1827,44 @@ void render(float pos_x, float pos_y, float width, float height,
         } else if (!cache.ops_runs.empty()) {
             float run_x = x_operand;
             const float run_alpha = ins.is_nop ? row_a_inner * 0.7f : row_a_inner;
-            for (const auto& run : cache.ops_runs) {
+            const size_t run_count = cache.ops_runs.size();
+            for (size_t ri = 0; ri < run_count; ++ri) {
+                const auto& run = cache.ops_runs[ri];
                 if (run.text.empty()) continue;
                 ImU32 col = aida::ui::with_alpha(run.color, run_alpha);
                 draw_text_at(run_x, y, col, run.text.c_str(), row_y_off);
-                float run_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, run.text.c_str()).x;
+                float run_w = (ri < cache.ops_run_widths.size())
+                    ? cache.ops_run_widths[ri]
+                    : code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, run.text.c_str()).x;
                 run_x += run_w;
             }
         }
 
-        if (ins.is_branch || ins.is_call) {
-            uint64_t target = 0;
-            const char* hex_p = strstr(ins.ops, "0x");
-            if (!hex_p) hex_p = ins.ops;
-            if (sscanf_s(hex_p, "%llx", &target) == 1
-                || sscanf_s(hex_p, "0x%llx", &target) == 1)
+        if ((ins.is_branch || ins.is_call) && ins.branch_target != 0) {
+            uint64_t target = ins.branch_target;
+            if (!instrs.empty() && target >= instrs.front().addr
+                && target <= instrs.back().addr)
             {
-                if (!instrs.empty() && target >= instrs.front().addr
-                    && target <= instrs.back().addr)
-                {
-                    float arrow_x = ox + width - 18.f;
-                    bool row_selected = (i == st.selected_row);
-                    float arrow_a = row_selected
-                        ? row_a_inner * aida::ui::clock::pulse(1.6f, 0.6f, 1.f)
-                        : row_a_inner * 0.55f;
-                    ImU32 arrow_col = aida::ui::with_alpha(
-                        target < ins.addr ? disasm_theme::arrow_up() : disasm_theme::arrow_down(),
-                        arrow_a);
-                    if (target < ins.addr) {
-                        dl->AddTriangleFilled(
-                            ImVec2(arrow_x + 4.f, y + 4.f),
-                            ImVec2(arrow_x, y + line_h - 4.f),
-                            ImVec2(arrow_x + 8.f, y + line_h - 4.f),
-                            arrow_col);
-                    } else {
-                        dl->AddTriangleFilled(
-                            ImVec2(arrow_x, y + 4.f),
-                            ImVec2(arrow_x + 8.f, y + 4.f),
-                            ImVec2(arrow_x + 4.f, y + line_h - 4.f),
-                            arrow_col);
-                    }
+                float arrow_x = ox + width - 18.f;
+                bool row_selected = (i == st.selected_row);
+                float arrow_a = row_selected
+                    ? row_a_inner * aida::ui::clock::pulse(1.6f, 0.6f, 1.f)
+                    : row_a_inner * 0.55f;
+                ImU32 arrow_col = aida::ui::with_alpha(
+                    target < ins.addr ? disasm_theme::arrow_up() : disasm_theme::arrow_down(),
+                    arrow_a);
+                if (target < ins.addr) {
+                    dl->AddTriangleFilled(
+                        ImVec2(arrow_x + 4.f, y + 4.f),
+                        ImVec2(arrow_x, y + line_h - 4.f),
+                        ImVec2(arrow_x + 8.f, y + line_h - 4.f),
+                        arrow_col);
+                } else {
+                    dl->AddTriangleFilled(
+                        ImVec2(arrow_x, y + 4.f),
+                        ImVec2(arrow_x + 8.f, y + 4.f),
+                        ImVec2(arrow_x + 4.f, y + line_h - 4.f),
+                        arrow_col);
                 }
             }
         }
@@ -1807,39 +1872,48 @@ void render(float pos_x, float pos_y, float width, float height,
         if (!throttled && comment_store::has(ins.addr)) {
             std::string cmt_text = comment_store::get(ins.addr);
             if (!cmt_text.empty()) {
-                size_t cmt_nl = cmt_text.find('\n');
-                std::string cmt_first = (cmt_nl == std::string::npos) ? cmt_text : cmt_text.substr(0, cmt_nl);
-                bool cmt_multiline = (cmt_nl != std::string::npos);
-
-                const char* operand_for_width = operand_render_cstr ? operand_render_cstr : "";
-                float operand_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, operand_for_width).x;
+                float operand_w = (!throttled && cache.ops_valid)
+                    ? cache.ops_total_width
+                    : code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f,
+                        operand_render_cstr ? operand_render_cstr : "").x;
                 float cmt_x = std::max(x_comment, x_operand + operand_w + 4.f * ch_w_safe);
                 float cmt_max_w = (ox + width - 24.f) - cmt_x;
                 if (cmt_max_w > 24.f) {
-                    std::string cmt_render = "; " + cmt_first;
-                    bool cmt_truncated = cmt_multiline;
-                    float cmt_full_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, cmt_render.c_str()).x;
-                    if (cmt_full_w > cmt_max_w) {
-                        size_t lo = 0;
-                        size_t hi = cmt_render.size();
-                        while (lo < hi) {
-                            size_t mid = (lo + hi + 1) / 2;
-                            std::string trial = cmt_render.substr(0, mid) + "...";
-                            if (code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, trial.c_str()).x <= cmt_max_w)
-                                lo = mid;
-                            else
-                                hi = mid - 1;
+                    if (cache.cmt_trimmed_for_width != cmt_max_w
+                        || cache.cmt_source != cmt_text) {
+                        size_t cmt_nl = cmt_text.find('\n');
+                        std::string cmt_first = (cmt_nl == std::string::npos) ? cmt_text : cmt_text.substr(0, cmt_nl);
+                        bool cmt_multiline = (cmt_nl != std::string::npos);
+                        std::string cmt_render = "; " + cmt_first;
+                        bool cmt_truncated = cmt_multiline;
+                        float cmt_full_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, cmt_render.c_str()).x;
+                        if (cmt_full_w > cmt_max_w) {
+                            size_t lo = 0;
+                            size_t hi = cmt_render.size();
+                            while (lo < hi) {
+                                size_t mid = (lo + hi + 1) / 2;
+                                std::string trial = cmt_render.substr(0, mid) + "...";
+                                if (code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, trial.c_str()).x <= cmt_max_w)
+                                    lo = mid;
+                                else
+                                    hi = mid - 1;
+                            }
+                            if (lo < cmt_render.size())
+                                cmt_render = cmt_render.substr(0, lo) + "...";
+                            cmt_truncated = true;
                         }
-                        if (lo < cmt_render.size())
-                            cmt_render = cmt_render.substr(0, lo) + "...";
-                        cmt_truncated = true;
+                        cache.cmt_trimmed = std::move(cmt_render);
+                        cache.cmt_truncated = cmt_truncated;
+                        cache.cmt_drawn_width = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f,
+                            cache.cmt_trimmed.c_str()).x;
+                        cache.cmt_trimmed_for_width = cmt_max_w;
+                        cache.cmt_source = cmt_text;
                     }
                     ImU32 cmt_col = aida::ui::with_alpha(disasm_theme::comment(), row_a_inner * 0.95f);
-                    draw_text_at(cmt_x, y, cmt_col, cmt_render.c_str(), row_y_off);
-                    if (cmt_truncated) {
-                        float cmt_drawn_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, cmt_render.c_str()).x;
+                    draw_text_at(cmt_x, y, cmt_col, cache.cmt_trimmed.c_str(), row_y_off);
+                    if (cache.cmt_truncated) {
                         if (ImGui::IsMouseHoveringRect(ImVec2(cmt_x, y),
-                            ImVec2(cmt_x + cmt_drawn_w, y + line_h - 1.f), false))
+                            ImVec2(cmt_x + cache.cmt_drawn_width, y + line_h - 1.f), false))
                             ImGui::SetTooltip("%s", cmt_text.c_str());
                     }
                 }
@@ -1866,15 +1940,8 @@ void render(float pos_x, float pos_y, float width, float height,
         }
 
         if (row_hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-            if (ins.is_branch || ins.is_call) {
-                uint64_t target = 0;
-                const char* hex_p = strstr(ins.ops, "0x");
-                if (!hex_p) hex_p = ins.ops;
-                if (sscanf_s(hex_p, "%llx", &target) == 1
-                    || sscanf_s(hex_p, "0x%llx", &target) == 1)
-                {
-                    goto_address(target, disasm);
-                }
+            if ((ins.is_branch || ins.is_call) && ins.branch_target != 0) {
+                goto_address(ins.branch_target, disasm);
             }
         }
 
@@ -1937,12 +2004,8 @@ void render(float pos_x, float pos_y, float width, float height,
         for (int bi = first_row; bi <= last_row; ++bi) {
             const AsmInstr& bins = instrs[bi];
             if (!bins.is_branch && !bins.is_call) continue;
-            uint64_t btarget = 0;
-            const char* bhex = strstr(bins.ops, "0x");
-            if (!bhex) bhex = bins.ops;
-            if (sscanf_s(bhex, "%llx", &btarget) != 1)
-                if (sscanf_s(bhex, "0x%llx", &btarget) != 1)
-                    continue;
+            uint64_t btarget = bins.branch_target;
+            if (btarget == 0) continue;
             int tidx = find_instr_at(btarget, file);
             if (tidx < first_row || tidx > last_row) continue;
             float fy = oy_content + static_cast<float>(bi) * line_h - st.scroll_y + line_h * 0.5f;
@@ -2061,11 +2124,8 @@ void render(float pos_x, float pos_y, float width, float height,
 
             if (ci.is_branch || ci.is_call) {
                 if (ImGui::MenuItem("Follow Target")) {
-                    uint64_t target = 0;
-                    const char* hex_p = strstr(ci.ops, "0x");
-                    if (!hex_p) hex_p = ci.ops;
-                    if (sscanf_s(hex_p, "%llx", &target) == 1 || sscanf_s(hex_p, "0x%llx", &target) == 1)
-                        goto_address(target, disasm);
+                    if (ci.branch_target != 0)
+                        goto_address(ci.branch_target, disasm);
                 }
             }
 
