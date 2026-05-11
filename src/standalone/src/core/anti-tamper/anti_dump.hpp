@@ -367,6 +367,7 @@ namespace pe_header
         ULONGLONG saved_image_base = nt->OptionalHeader.ImageBase;
         DWORD saved_signature = nt->Signature;
         WORD saved_magic = nt->OptionalHeader.Magic;
+        WORD saved_machine = nt->FileHeader.Machine;
 
         nt->Signature = 0;
         nt->OptionalHeader.Magic = 0;
@@ -399,6 +400,7 @@ namespace pe_header
         nt->OptionalHeader.ImageBase = saved_image_base;
         nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS] = saved_tls;
         nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION] = saved_exception;
+        nt->FileHeader.Machine = saved_machine;
 
         VirtualProtect(nt, total, old_prot, &old_prot);
 

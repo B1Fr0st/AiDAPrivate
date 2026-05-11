@@ -3,7 +3,8 @@
 #include <windows.h>
 
 #include "standalone_compat.hpp"
-#include "decompiler_engine.hpp"
+#include "../disasm/ghidra_decompiler.hpp"
+#include "../disasm/zydis_disasm.hpp"
 #include "crypto_scanner.hpp"
 #include "aob_generator.hpp"
 #include "struct_recon_engine.hpp"
@@ -24,6 +25,8 @@
 
 using json = nlohmann::json;
 using tool_result_t = mcp_standalone::tool_result_t;
+
+extern DisasmState g_disasm;
 
 namespace analysis_tools {
 
@@ -777,8 +780,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 	});
 
 	srv.register_tool({
-		"decompile_function_native",
-		"Decompile a function using the embedded Ghidra decompiler engine. Returns pseudocode instantly (~100ms) without requiring an API key. The target process must be attached via the kernel driver.",
+		"decompile_function",
+		"Decompile a function using the embedded Ghidra decompiler engine. Returns pseudocode instantly (~100ms) without requiring an API key. Works in either driver-attached mode or static (on-disk) mode - if no process is attached, the bytes are read from the currently loaded PE file.",
 		{{"address", "string", "Function entry point address in hex (e.g. 0x7FF6A1230000)", true}},
 		true,
 		[](const json& params) -> tool_result_t {
@@ -795,7 +798,30 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 					return tool_result_t::error("failed to initialize Ghidra decompiler - specs directory not found");
 			}
 
-			auto result = ghidra_decompiler::decompile_function(addr);
+			constexpr size_t kPrereadSize = 0x40000;
+			std::vector<uint8_t> mem;
+			bool has_static = (g_disasm.file.loaded && !g_disasm.file.sections.empty());
+			driver_bridge::read_memory(addr, kPrereadSize, mem);
+			bool driver_provided = !mem.empty();
+			if (mem.empty() && has_static) {
+				static_analysis::read_bytes_from_pe(g_disasm.file, addr, kPrereadSize, mem);
+			}
+			if (mem.empty()) {
+				uint32_t pid_post = driver_bridge::attached_pid();
+				if (pid_post != 0 && has_static)
+					return tool_result_t::error("no executable bytes at this address (driver returned 0 bytes and address is outside loaded PE sections)");
+				if (pid_post != 0)
+					return tool_result_t::error("driver returned no bytes at this address (open a PE file in the standalone to enable static fallback)");
+				if (has_static)
+					return tool_result_t::error("address is outside the loaded PE's executable sections");
+				if (g_disasm.file.loaded)
+					return tool_result_t::error("driver session lost - re-attach via File > Attach, or open the PE on disk via File > Open");
+				return tool_result_t::error("no source available: open a PE file via File > Open or attach a process via File > Attach");
+			}
+
+			auto result = ghidra_decompiler::decompile_buffer(
+				mem.data(), mem.size(), addr, addr, nullptr,
+				g_disasm.file.loaded ? &g_disasm.file : nullptr);
 			if (result.is_error)
 				return tool_result_t::error(result.error_text);
 
@@ -806,48 +832,18 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			out["function_name"] = result.function_name;
 			out["pseudocode"] = result.pseudocode;
 			out["elapsed_ms"] = result.elapsed_ms;
-			return tool_result_t::ok(out);
-		}
-	});
-
-	srv.register_tool({
-		"decompile_function_hybrid",
-		"Decompile a function using Ghidra for instant structure recovery, then AI to refine variable names and add context. Returns high-quality pseudocode with meaningful identifiers. Requires both driver attachment and API key.",
-		{{"address", "string", "Function entry point address in hex (e.g. 0x7FF6A1230000)", true}},
-		true,
-		[](const json& params) -> tool_result_t {
-			std::string addr_str = params.value("address", "");
-			if (addr_str.empty())
-				return tool_result_t::error("address is required");
-
-			uint64_t addr = std::strtoull(addr_str.c_str(), nullptr, 16);
-			if (addr == 0)
-				return tool_result_t::error("invalid address");
-
-			decompiler_engine::decompile_function_hybrid(addr, g_sa_settings);
-
-			auto& st = decompiler_engine::g_state;
-			int timeout_ms = 60000;
-			int waited = 0;
-			while (st.decompiling.load() && waited < timeout_ms) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(100));
-				waited += 100;
+			out["sleigh_id"] = result.sleigh_id;
+			json callees = json::array();
+			for (auto& kv : result.callees) {
+				char cbuf[32];
+				std::snprintf(cbuf, sizeof(cbuf), "0x%llX", static_cast<unsigned long long>(kv.second));
+				json c;
+				c["name"] = kv.first;
+				c["address"] = cbuf;
+				callees.push_back(c);
 			}
-
-			if (st.decompiling.load())
-				return tool_result_t::error("decompilation timed out after 60 seconds");
-
-			std::lock_guard<std::mutex> lock(st.mutex);
-			if (st.current.pseudocode.empty())
-				return tool_result_t::error("decompilation produced no output");
-
-			json out;
-			char abuf[32];
-			std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(st.current.function_addr));
-			out["address"] = abuf;
-			out["function_name"] = st.current.function_name;
-			out["pseudocode"] = st.current.pseudocode;
-			out["mode"] = "hybrid";
+			out["callees"] = callees;
+			out["source"] = driver_provided ? "driver" : "file";
 			return tool_result_t::ok(out);
 		}
 	});

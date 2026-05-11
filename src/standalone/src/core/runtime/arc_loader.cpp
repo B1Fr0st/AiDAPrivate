@@ -6,8 +6,10 @@
 #include <windows.h>
 #include <winternl.h>
 #include <bcrypt.h>
+#include <tlhelp32.h>
 #include <cstring>
 #include <cctype>
+#include <cstdarg>
 #include <atomic>
 #include <algorithm>
 #include <cstdio>
@@ -207,8 +209,400 @@ namespace
         if (len > 0) {
             DWORD written = 0;
             WriteFile(hf, line, static_cast<DWORD>(len), &written, nullptr);
+
+            char dbg_line[600];
+            _snprintf_s(dbg_line, sizeof(dbg_line), _TRUNCATE,
+                "[AIDA-ARC][%02d:%02d:%02d.%03d] %s",
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag);
+            OutputDebugStringA(dbg_line);
         }
         CloseHandle(hf);
+    }
+
+    inline void arc_breadcrumb_fmt(const char* fmt, ...)
+    {
+        char buf[1024];
+        va_list ap;
+        va_start(ap, fmt);
+        _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+        va_end(ap);
+        arc_breadcrumb(buf);
+    }
+
+    DWORD WINAPI arc_diag_canary_thread_proc(LPVOID p)
+    {
+        volatile LONG* done = reinterpret_cast<volatile LONG*>(p);
+        if (done) InterlockedExchange(done, 1);
+        return 0;
+    }
+
+    void arc_diag_query_process_mitigation(const char* phase_tag)
+    {
+        using GetProcessMitigationPolicy_t = BOOL(WINAPI*)(HANDLE, int, PVOID, SIZE_T);
+        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        auto pGet = k32 ? reinterpret_cast<GetProcessMitigationPolicy_t>(
+            GetProcAddress(k32, "GetProcessMitigationPolicy")) : nullptr;
+        if (!pGet) {
+            arc_breadcrumb_fmt("diag_mitig_%s no_GetProcessMitigationPolicy_export", phase_tag);
+            return;
+        }
+
+        HANDLE me = GetCurrentProcess();
+
+        {
+            PROCESS_MITIGATION_DEP_POLICY dep{};
+            BOOL ok = pGet(me, 0, &dep, sizeof(dep));
+            arc_breadcrumb_fmt("diag_mitig_%s DEP ok=%d enable=%u dat=%u permanent=%u",
+                phase_tag, ok ? 1 : 0,
+                (unsigned)dep.Enable, (unsigned)dep.DisableAtlThunkEmulation, (unsigned)dep.Permanent);
+        }
+        {
+            PROCESS_MITIGATION_ASLR_POLICY aslr{};
+            BOOL ok = pGet(me, 1, &aslr, sizeof(aslr));
+            arc_breadcrumb_fmt("diag_mitig_%s ASLR ok=%d ebot=%u eforce=%u ehe=%u edis=%u",
+                phase_tag, ok ? 1 : 0,
+                (unsigned)aslr.EnableBottomUpRandomization,
+                (unsigned)aslr.EnableForceRelocateImages,
+                (unsigned)aslr.EnableHighEntropy,
+                (unsigned)aslr.DisallowStrippedImages);
+        }
+        {
+            PROCESS_MITIGATION_DYNAMIC_CODE_POLICY dyn{};
+            BOOL ok = pGet(me, 7, &dyn, sizeof(dyn));
+            arc_breadcrumb_fmt("diag_mitig_%s DYNCODE ok=%d prohibit=%u opt_out=%u remote_downgrade=%u",
+                phase_tag, ok ? 1 : 0,
+                (unsigned)dyn.ProhibitDynamicCode,
+                (unsigned)dyn.AllowThreadOptOut,
+                (unsigned)dyn.AllowRemoteDowngrade);
+        }
+        {
+            PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY sh{};
+            BOOL ok = pGet(me, 2, &sh, sizeof(sh));
+            arc_breadcrumb_fmt("diag_mitig_%s STRICT_HANDLE ok=%d raise=%u handle_excep=%u",
+                phase_tag, ok ? 1 : 0,
+                (unsigned)sh.RaiseExceptionOnInvalidHandleReference,
+                (unsigned)sh.HandleExceptionsPermanentlyEnabled);
+        }
+        {
+            PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY sc{};
+            BOOL ok = pGet(me, 3, &sc, sizeof(sc));
+            arc_breadcrumb_fmt("diag_mitig_%s SYS_CALL_DISABLE ok=%d disable_win32k=%u",
+                phase_tag, ok ? 1 : 0,
+                (unsigned)sc.DisallowWin32kSystemCalls);
+        }
+        {
+            PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY ep{};
+            BOOL ok = pGet(me, 4, &ep, sizeof(ep));
+            arc_breadcrumb_fmt("diag_mitig_%s EXTENSION_POINT ok=%d disable_ep=%u",
+                phase_tag, ok ? 1 : 0,
+                (unsigned)ep.DisableExtensionPoints);
+        }
+        {
+            PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY cfg{};
+            BOOL ok = pGet(me, 7 + 1, &cfg, sizeof(cfg));
+            (void)cfg;
+            arc_breadcrumb_fmt("diag_mitig_%s CFG_GUARD_8 ok=%d raw0=0x%08X",
+                phase_tag, ok ? 1 : 0,
+                ok ? *reinterpret_cast<unsigned*>(&cfg) : 0u);
+        }
+        {
+            PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY sig{};
+            BOOL ok = pGet(me, 8, &sig, sizeof(sig));
+            arc_breadcrumb_fmt("diag_mitig_%s BIN_SIG ok=%d raw_flags=0x%08X ms_signed=%u store_signed=%u "
+                "mit_opt_in=%u audit_ms=%u audit_store=%u",
+                phase_tag, ok ? 1 : 0,
+                ok ? sig.Flags : 0u,
+                (unsigned)sig.MicrosoftSignedOnly,
+                (unsigned)sig.StoreSignedOnly,
+                (unsigned)sig.MitigationOptIn,
+                (unsigned)sig.AuditMicrosoftSignedOnly,
+                (unsigned)sig.AuditStoreSignedOnly);
+        }
+        {
+            PROCESS_MITIGATION_FONT_DISABLE_POLICY fnt{};
+            BOOL ok = pGet(me, 9, &fnt, sizeof(fnt));
+            arc_breadcrumb_fmt("diag_mitig_%s FONT_DISABLE ok=%d disable_nonsys_fonts=%u audit=%u",
+                phase_tag, ok ? 1 : 0,
+                (unsigned)fnt.DisableNonSystemFonts,
+                (unsigned)fnt.AuditNonSystemFontLoading);
+        }
+        {
+            PROCESS_MITIGATION_IMAGE_LOAD_POLICY il{};
+            BOOL ok = pGet(me, 10, &il, sizeof(il));
+            arc_breadcrumb_fmt("diag_mitig_%s IMAGE_LOAD ok=%d raw_flags=0x%08X no_remote=%u no_low_mandatory=%u "
+                "prefer_sys32=%u audit_remote=%u audit_low_mandatory=%u",
+                phase_tag, ok ? 1 : 0,
+                ok ? il.Flags : 0u,
+                (unsigned)il.NoRemoteImages,
+                (unsigned)il.NoLowMandatoryLabelImages,
+                (unsigned)il.PreferSystem32Images,
+                (unsigned)il.AuditNoRemoteImages,
+                (unsigned)il.AuditNoLowMandatoryLabelImages);
+        }
+    }
+
+    void arc_diag_query_address(const char* role, void* addr)
+    {
+        if (!addr) {
+            arc_breadcrumb_fmt("diag_addr_%s null_address", role);
+            return;
+        }
+
+        MEMORY_BASIC_INFORMATION mbi{};
+        SIZE_T got = VirtualQuery(addr, &mbi, sizeof(mbi));
+        if (got == 0) {
+            arc_breadcrumb_fmt("diag_addr_%s VirtualQuery_FAILED addr=%p gle=%lu",
+                role, addr, GetLastError());
+            return;
+        }
+
+        char mod_path[MAX_PATH] = "<n/a>";
+        HMODULE host_mod = nullptr;
+        if (GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(addr), &host_mod) && host_mod)
+        {
+            char tmp_path[MAX_PATH] = {};
+            DWORD plen = GetModuleFileNameA(host_mod, tmp_path, sizeof(tmp_path));
+            if (plen > 0 && plen < sizeof(tmp_path)) {
+                const char* base = strrchr(tmp_path, '\\');
+                strcpy_s(mod_path, base ? (base + 1) : tmp_path);
+            }
+        }
+
+        uint8_t first_bytes[16] = {};
+        bool readable = false;
+        __try {
+            std::memcpy(first_bytes, addr, sizeof(first_bytes));
+            readable = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            readable = false;
+        }
+
+        arc_breadcrumb_fmt(
+            "diag_addr_%s addr=%p state=0x%X protect=0x%X allocprotect=0x%X type=0x%X "
+            "alloc_base=%p region_size=0x%llX host_module=%s host_base=%p readable=%d "
+            "first16=%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+            role, addr, mbi.State, mbi.Protect, mbi.AllocationProtect, mbi.Type,
+            mbi.AllocationBase, static_cast<unsigned long long>(mbi.RegionSize),
+            mod_path, host_mod, readable ? 1 : 0,
+            first_bytes[0], first_bytes[1], first_bytes[2], first_bytes[3],
+            first_bytes[4], first_bytes[5], first_bytes[6], first_bytes[7],
+            first_bytes[8], first_bytes[9], first_bytes[10], first_bytes[11],
+            first_bytes[12], first_bytes[13], first_bytes[14], first_bytes[15]);
+    }
+
+    void arc_diag_query_pe_state(const char* phase_tag)
+    {
+        HMODULE mod = GetModuleHandleW(nullptr);
+        if (!mod) {
+            arc_breadcrumb_fmt("diag_pe_%s GetModuleHandle_NULL gle=%lu",
+                phase_tag, GetLastError());
+            return;
+        }
+
+        auto* base = reinterpret_cast<const uint8_t*>(mod);
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        WORD e_magic = 0;
+        LONG e_lfanew = 0;
+        __try {
+            e_magic = dos->e_magic;
+            e_lfanew = dos->e_lfanew;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            arc_breadcrumb_fmt("diag_pe_%s DOS_read_SEH code=0x%08X",
+                phase_tag, GetExceptionCode());
+            return;
+        }
+
+        if (e_lfanew <= 0 || e_lfanew > 0x10000) {
+            arc_breadcrumb_fmt("diag_pe_%s bad_e_lfanew=0x%X e_magic=0x%X",
+                phase_tag, (unsigned)e_lfanew, (unsigned)e_magic);
+            return;
+        }
+
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + e_lfanew);
+        DWORD sig = 0;
+        WORD machine = 0;
+        WORD magic = 0;
+        DWORD entry = 0;
+        DWORD headers_size = 0;
+        DWORD checksum = 0;
+        DWORD numrva = 0;
+        ULONGLONG image_base = 0;
+        DWORD sizeof_image = 0;
+        WORD num_sec = 0;
+        __try {
+            sig = nt->Signature;
+            machine = nt->FileHeader.Machine;
+            magic = nt->OptionalHeader.Magic;
+            entry = nt->OptionalHeader.AddressOfEntryPoint;
+            headers_size = nt->OptionalHeader.SizeOfHeaders;
+            checksum = nt->OptionalHeader.CheckSum;
+            numrva = nt->OptionalHeader.NumberOfRvaAndSizes;
+            image_base = nt->OptionalHeader.ImageBase;
+            sizeof_image = nt->OptionalHeader.SizeOfImage;
+            num_sec = nt->FileHeader.NumberOfSections;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            arc_breadcrumb_fmt("diag_pe_%s NT_read_SEH code=0x%08X",
+                phase_tag, GetExceptionCode());
+            return;
+        }
+
+        arc_breadcrumb_fmt(
+            "diag_pe_%s mod=%p e_magic=0x%X e_lfanew=0x%X sig=0x%X machine=0x%X magic=0x%X "
+            "entry=0x%X headers_size=0x%X checksum=0x%X numrva=%u image_base=0x%llX "
+            "sizeof_image=0x%X num_sections=%u",
+            phase_tag, mod, (unsigned)e_magic, (unsigned)e_lfanew, sig,
+            (unsigned)machine, (unsigned)magic, entry, headers_size, checksum, numrva,
+            static_cast<unsigned long long>(image_base), sizeof_image, (unsigned)num_sec);
+
+        constexpr size_t kPebImageBaseOffset = 0x10;
+        auto* peb_bytes = reinterpret_cast<uint8_t*>(NtCurrentTeb()->ProcessEnvironmentBlock);
+        void* peb_image_base = nullptr;
+        if (peb_bytes) {
+            __try {
+                peb_image_base = *reinterpret_cast<void**>(peb_bytes + kPebImageBaseOffset);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                peb_image_base = (void*)(uintptr_t)0xDEADBEEFDEADBEEFULL;
+            }
+        }
+        arc_breadcrumb_fmt("diag_pe_%s peb=%p peb_image_base=%p teb=%p tid=%lu",
+            phase_tag, peb_bytes, peb_image_base, NtCurrentTeb(),
+            GetCurrentThreadId());
+    }
+
+    void arc_diag_thread_self_state(const char* phase_tag)
+    {
+        HANDLE self_thread = GetCurrentThread();
+        DWORD self_tid = GetCurrentThreadId();
+
+        using NtQueryInfoThread_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+        auto pNtQ = reinterpret_cast<NtQueryInfoThread_t>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+
+        ULONG hide_state = 0xFFFFFFFFu;
+        if (pNtQ) {
+            NTSTATUS st = pNtQ(self_thread, 0x11, &hide_state, sizeof(hide_state), nullptr);
+            arc_breadcrumb_fmt("diag_thread_%s tid=%lu hidden_st=0x%08X hidden=%u",
+                phase_tag, self_tid, (unsigned)st, hide_state);
+        } else {
+            arc_breadcrumb_fmt("diag_thread_%s tid=%lu no_NtQueryInfoThread", phase_tag, self_tid);
+        }
+
+        ULONG cur_prio = (ULONG)GetThreadPriority(self_thread);
+        DWORD_PTR aff_mask = 0;
+        DWORD_PTR sys_mask = 0;
+        if (GetProcessAffinityMask(GetCurrentProcess(), &aff_mask, &sys_mask)) {
+            arc_breadcrumb_fmt("diag_thread_%s tid=%lu prio=%lu proc_aff=0x%llX sys_aff=0x%llX",
+                phase_tag, self_tid, cur_prio,
+                static_cast<unsigned long long>(aff_mask),
+                static_cast<unsigned long long>(sys_mask));
+        }
+    }
+
+    void arc_diag_kernel32_create_thread_canary(const char* phase_tag)
+    {
+        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        if (!k32) {
+            arc_breadcrumb_fmt("diag_canary_%s no_kernel32_module", phase_tag);
+            return;
+        }
+
+        FARPROC raw_create_thread = GetProcAddress(k32, "CreateThread");
+        FARPROC raw_create_remote_thread_ex = GetProcAddress(k32, "CreateRemoteThreadEx");
+        arc_breadcrumb_fmt("diag_canary_%s k32=%p CreateThread=%p CreateRemoteThreadEx=%p",
+            phase_tag, k32, raw_create_thread, raw_create_remote_thread_ex);
+
+        volatile LONG canary_done = 0;
+        DWORD canary_tid = 0;
+        SetLastError(0);
+        HANDLE canary = CreateThread(nullptr, 0, &arc_diag_canary_thread_proc,
+            (LPVOID)&canary_done, 0, &canary_tid);
+        DWORD canary_err = GetLastError();
+        arc_breadcrumb_fmt("diag_canary_%s CreateThread_text_addr=%p result=%p tid=%lu err=%lu",
+            phase_tag, (void*)&arc_diag_canary_thread_proc, canary, canary_tid, canary_err);
+
+        if (canary != nullptr) {
+            WaitForSingleObject(canary, 2000);
+            CloseHandle(canary);
+            arc_breadcrumb_fmt("diag_canary_%s text_addr_canary_completed done=%ld",
+                phase_tag, canary_done);
+        }
+
+        if (raw_create_thread) {
+            using CreateThread_t = HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES, SIZE_T,
+                LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD);
+            auto pCT = reinterpret_cast<CreateThread_t>(raw_create_thread);
+            volatile LONG canary2_done = 0;
+            DWORD canary2_tid = 0;
+            SetLastError(0);
+            HANDLE canary2 = pCT(nullptr, 0, &arc_diag_canary_thread_proc,
+                (LPVOID)&canary2_done, 0, &canary2_tid);
+            DWORD canary2_err = GetLastError();
+            arc_breadcrumb_fmt("diag_canary_%s direct_resolved_CreateThread result=%p tid=%lu err=%lu",
+                phase_tag, canary2, canary2_tid, canary2_err);
+            if (canary2 != nullptr) {
+                WaitForSingleObject(canary2, 2000);
+                CloseHandle(canary2);
+            }
+        }
+
+        using NtCreateThreadEx_t = NTSTATUS(NTAPI*)(
+            PHANDLE, ACCESS_MASK, PVOID, HANDLE,
+            LPTHREAD_START_ROUTINE, PVOID, ULONG,
+            SIZE_T, SIZE_T, SIZE_T, PVOID);
+        auto pNtCTE = reinterpret_cast<NtCreateThreadEx_t>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateThreadEx"));
+        if (pNtCTE) {
+            volatile LONG canary3_done = 0;
+            HANDLE canary3 = nullptr;
+            NTSTATUS st = pNtCTE(&canary3, THREAD_ALL_ACCESS, nullptr, GetCurrentProcess(),
+                &arc_diag_canary_thread_proc, (LPVOID)&canary3_done,
+                0, 0, 0, 0, nullptr);
+            arc_breadcrumb_fmt("diag_canary_%s NtCreateThreadEx_direct status=0x%08X handle=%p",
+                phase_tag, (unsigned)st, canary3);
+            if (canary3) {
+                WaitForSingleObject(canary3, 2000);
+                CloseHandle(canary3);
+            }
+        } else {
+            arc_breadcrumb_fmt("diag_canary_%s no_NtCreateThreadEx_export", phase_tag);
+        }
+    }
+
+    void arc_diag_dump_thread_count()
+    {
+        DWORD pid = GetCurrentProcessId();
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) {
+            arc_breadcrumb_fmt("diag_threads snap_FAILED gle=%lu", GetLastError());
+            return;
+        }
+        THREADENTRY32 te{};
+        te.dwSize = sizeof(te);
+        DWORD count = 0;
+        if (Thread32First(snap, &te)) {
+            do {
+                if (te.th32OwnerProcessID == pid) ++count;
+            } while (Thread32Next(snap, &te));
+        }
+        CloseHandle(snap);
+        arc_breadcrumb_fmt("diag_threads pid=%lu live_thread_count=%lu", pid, count);
+    }
+
+    void arc_diag_dump_full_state(const char* phase_tag, void* lambda_addr_a, void* lambda_addr_b)
+    {
+        arc_breadcrumb_fmt("DIAG_BLOCK_BEGIN phase=%s", phase_tag);
+        arc_diag_query_pe_state(phase_tag);
+        arc_diag_query_process_mitigation(phase_tag);
+        arc_diag_query_address("watchdog_lambda", lambda_addr_a);
+        arc_diag_query_address("inv_lambda", lambda_addr_b);
+        arc_diag_query_address("self_canary_proc", (void*)&arc_diag_canary_thread_proc);
+        arc_diag_thread_self_state(phase_tag);
+        arc_diag_dump_thread_count();
+        arc_diag_kernel32_create_thread_canary(phase_tag);
+        arc_breadcrumb_fmt("DIAG_BLOCK_END phase=%s", phase_tag);
     }
 
     const char* runtime_import_name(const char* name)
@@ -1133,6 +1527,12 @@ namespace arc_loader
 
         arc_breadcrumb("load_enter");
 
+        arc_diag_query_pe_state("load_enter");
+        arc_diag_query_process_mitigation("load_enter");
+        arc_diag_thread_self_state("load_enter");
+        arc_diag_dump_thread_count();
+        arc_diag_kernel32_create_thread_canary("load_enter");
+
         if (!pe_buffer || pe_size == 0) {
             set_error("Null PE buffer.");
             return result;
@@ -1198,6 +1598,8 @@ namespace arc_loader
 
         arc_breadcrumb("load_finalize_ok");
 
+        arc_diag_kernel32_create_thread_canary("pre_register_function_table");
+
         PRUNTIME_FUNCTION ft_table = nullptr;
         uint32_t ft_count = 0;
         if (register_function_table(image_base, mapped_nt, ft_table, ft_count)) {
@@ -1209,9 +1611,13 @@ namespace arc_loader
             arc_breadcrumb("load_function_table_skipped");
         }
 
+        arc_diag_kernel32_create_thread_canary("post_register_function_table");
+
         install_guard_pages(image_base, mapped_nt);
 
         arc_breadcrumb("load_guard_pages_ok");
+
+        arc_diag_kernel32_create_thread_canary("post_install_guard_pages");
 
         if (!process_tls(image_base, mapped_nt)) {
             if (ft_table) RtlDeleteFunctionTable(ft_table);
@@ -1221,9 +1627,13 @@ namespace arc_loader
 
         arc_breadcrumb("load_tls_ok");
 
+        arc_diag_kernel32_create_thread_canary("post_process_tls");
+
         SecureZeroMemory(pe_buffer, pe_size);
 
         arc_breadcrumb("load_zeroed_source_pe");
+
+        arc_diag_kernel32_create_thread_canary("post_zeroed_source_pe");
 
         using DllMain_t = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
         auto entry_point = reinterpret_cast<DllMain_t>(
@@ -1259,7 +1669,17 @@ namespace arc_loader
         struct watchdog_ctx_t { volatile LONG done; ULONGLONG start_tick; };
         watchdog_ctx_t wd_ctx{ 0, GetTickCount64() };
         DWORD wd_tid = 0;
-        HANDLE wd_thread = CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
+
+        struct dllmain_invoker_ctx_t {
+            DllMain_t entry;
+            uint8_t* base;
+            volatile LONG completed;
+            volatile LONG seh_caught;
+            volatile DWORD seh_code;
+            BOOL result;
+        };
+
+        LPTHREAD_START_ROUTINE wd_proc = [](LPVOID p) -> DWORD {
             auto* c = reinterpret_cast<watchdog_ctx_t*>(p);
             int sec = 0;
             while (InterlockedCompareExchange(&c->done, 0, 0) == 0) {
@@ -1272,13 +1692,50 @@ namespace arc_loader
                 if (sec >= 60) break;
             }
             return 0;
-        }, &wd_ctx, 0, &wd_tid);
+        };
+
+        LPTHREAD_START_ROUTINE inv_thread_proc = [](LPVOID p) -> DWORD {
+            auto* c = reinterpret_cast<dllmain_invoker_ctx_t*>(p);
+            BOOL ok = FALSE;
+            __try {
+                ok = c->entry(
+                    reinterpret_cast<HINSTANCE>(c->base),
+                    DLL_PROCESS_ATTACH,
+                    nullptr);
+            }
+            __except (c->seh_code = GetExceptionCode(),
+                      InterlockedExchange(&c->seh_caught, 1),
+                      EXCEPTION_EXECUTE_HANDLER) {
+                ok = FALSE;
+            }
+            c->result = ok;
+            InterlockedExchange(&c->completed, 1);
+            return 0;
+        };
+
+        arc_diag_dump_full_state("pre_watchdog_create",
+            reinterpret_cast<void*>(wd_proc),
+            reinterpret_cast<void*>(inv_thread_proc));
+
+        SetLastError(0);
+        HANDLE wd_thread = CreateThread(nullptr, 0, wd_proc, &wd_ctx, 0, &wd_tid);
+        DWORD wd_post_err = GetLastError();
         if (wd_thread == nullptr) {
-            char wd_err[96];
-            _snprintf_s(wd_err, sizeof(wd_err), _TRUNCATE, "load_dllmain_watchdog_create_FAILED_err=%lu", (unsigned long)GetLastError());
+            char wd_err[256];
+            _snprintf_s(wd_err, sizeof(wd_err), _TRUNCATE,
+                "load_dllmain_watchdog_create_FAILED_err=%lu wd_proc=%p calling_tid=%lu",
+                (unsigned long)wd_post_err, (void*)wd_proc,
+                (unsigned long)GetCurrentThreadId());
             arc_breadcrumb(wd_err);
+            arc_diag_dump_full_state("post_watchdog_FAIL",
+                reinterpret_cast<void*>(wd_proc),
+                reinterpret_cast<void*>(inv_thread_proc));
         } else {
-            arc_breadcrumb("load_dllmain_watchdog_spawned");
+            char wd_ok[160];
+            _snprintf_s(wd_ok, sizeof(wd_ok), _TRUNCATE,
+                "load_dllmain_watchdog_spawned tid=%lu wd_proc=%p",
+                (unsigned long)wd_tid, (void*)wd_proc);
+            arc_breadcrumb(wd_ok);
         }
 
         constexpr size_t kPebImageBaseOffset = 0x10;
@@ -1298,55 +1755,67 @@ namespace arc_loader
         *peb_image_base_slot = static_cast<void*>(image_base);
         arc_breadcrumb("load_dllmain_peb_swap_in");
 
-        struct dllmain_invoker_ctx_t {
-            DllMain_t entry;
-            uint8_t* base;
-            volatile LONG completed;
-            volatile LONG seh_caught;
-            volatile DWORD seh_code;
-            BOOL result;
-        };
         auto* inv_ctx = new dllmain_invoker_ctx_t{
             entry_point, image_base, 0, 0, 0, FALSE };
 
-        auto inv_thread_proc = [](LPVOID p) -> DWORD {
-            auto* c = reinterpret_cast<dllmain_invoker_ctx_t*>(p);
-            BOOL ok = FALSE;
-            __try {
-                ok = c->entry(
-                    reinterpret_cast<HINSTANCE>(c->base),
-                    DLL_PROCESS_ATTACH,
-                    nullptr);
-            }
-            __except (c->seh_code = GetExceptionCode(),
-                      InterlockedExchange(&c->seh_caught, 1),
-                      EXCEPTION_EXECUTE_HANDLER) {
-                ok = FALSE;
-            }
-            c->result = ok;
-            InterlockedExchange(&c->completed, 1);
-            return 0;
-        };
-
         DWORD inv_tid = 0;
+        arc_diag_dump_full_state("pre_inv_thread_create_peb_swapped",
+            reinterpret_cast<void*>(wd_proc),
+            reinterpret_cast<void*>(inv_thread_proc));
+        SetLastError(0);
         HANDLE inv_thread = CreateThread(nullptr, 0, inv_thread_proc, inv_ctx, 0, &inv_tid);
+        DWORD inv_post_err = GetLastError();
 
         const ULONGLONG kDllMainBudgetMs = 60000ull;
         const ULONGLONG kDllMainExtendedBudgetMs = 30000ull;
         bool timed_out = false;
-        bool inline_path = false;
 
         if (inv_thread == nullptr) {
-            char tbuf[160];
+            DWORD create_err = inv_post_err;
+            char tbuf[256];
             _snprintf_s(tbuf, sizeof(tbuf), _TRUNCATE,
-                "load_dllmain_thread_create_FAILED_err=%lu_falling_back_inline_tid=%lu",
-                (unsigned long)GetLastError(),
-                (unsigned long)GetCurrentThreadId());
+                "load_dllmain_thread_create_FAILED_err=%lu_aborting_load tid=%lu inv_proc=%p entry_point=%p",
+                (unsigned long)create_err,
+                (unsigned long)GetCurrentThreadId(),
+                (void*)inv_thread_proc,
+                (void*)entry_point);
             arc_breadcrumb(tbuf);
-            inline_path = true;
-            arc_breadcrumb("load_dllmain_inline_pre");
-            inv_thread_proc(inv_ctx);
-            arc_breadcrumb("load_dllmain_inline_post");
+
+            arc_diag_dump_full_state("post_inv_thread_FAIL_peb_swapped",
+                reinterpret_cast<void*>(wd_proc),
+                reinterpret_cast<void*>(inv_thread_proc));
+            arc_diag_query_address("arc_entry_point", reinterpret_cast<void*>(entry_point));
+            arc_diag_query_address("arc_image_base", reinterpret_cast<void*>(image_base));
+
+            *peb_image_base_slot = saved_peb_image_base;
+            arc_breadcrumb("load_dllmain_peb_swap_out_after_thread_create_fail");
+
+            arc_diag_dump_full_state("post_inv_thread_FAIL_peb_restored",
+                reinterpret_cast<void*>(wd_proc),
+                reinterpret_cast<void*>(inv_thread_proc));
+
+            InterlockedExchange(&wd_ctx.done, 1);
+            if (wd_thread) {
+                WaitForSingleObject(wd_thread, 2000);
+                CloseHandle(wd_thread);
+                wd_thread = nullptr;
+            }
+
+            delete inv_ctx;
+            inv_ctx = nullptr;
+            if (ft_table) {
+                RtlDeleteFunctionTable(ft_table);
+                ft_table = nullptr;
+            }
+            VirtualFree(image_base, 0, MEM_RELEASE);
+
+            char errbuf[200];
+            _snprintf_s(errbuf, sizeof(errbuf), _TRUNCATE,
+                "ARC DllMain thread creation failed (err=%lu). "
+                "Process state may be corrupted; please restart AiDA Standalone.",
+                (unsigned long)create_err);
+            set_error_fatal(errbuf);
+            return result;
         } else {
             char tbuf[96];
             _snprintf_s(tbuf, sizeof(tbuf), _TRUNCATE,
@@ -1412,7 +1881,6 @@ namespace arc_loader
         const DWORD seh_code = inv_ctx->seh_code;
         delete inv_ctx;
         inv_ctx = nullptr;
-        (void)inline_path;
 
         if (seh) {
             char sehbuf[160];
@@ -1633,11 +2101,13 @@ namespace arc_loader
             mod.auto_seal_timer = nullptr;
         }
 
-        if (mod.initialized && !mod.sealed && mod.entry_point != nullptr) {
+        if (mod.initialized && mod.entry_point != nullptr) {
             using DllMain_t = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
             auto entry = reinterpret_cast<DllMain_t>(mod.entry_point);
 
-            arc_breadcrumb("unload_dllmain_detach_pre_unsealed");
+            arc_breadcrumb(mod.sealed
+                ? "unload_dllmain_detach_pre_sealed"
+                : "unload_dllmain_detach_pre_unsealed");
             __try {
                 entry(
                     reinterpret_cast<HINSTANCE>(image_base),
@@ -1647,9 +2117,9 @@ namespace arc_loader
             __except (EXCEPTION_EXECUTE_HANDLER) {
 
             }
-            arc_breadcrumb("unload_dllmain_detach_post_unsealed");
-        } else if (mod.initialized) {
-            arc_breadcrumb("unload_dllmain_detach_skipped_sealed");
+            arc_breadcrumb(mod.sealed
+                ? "unload_dllmain_detach_post_sealed"
+                : "unload_dllmain_detach_post_unsealed");
         }
 
 

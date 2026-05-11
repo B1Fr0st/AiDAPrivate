@@ -48,6 +48,8 @@ struct pe_info_t {
 	uint32_t                    export_dir_size = 0;
 	uint32_t                    import_dir_rva = 0;
 	uint32_t                    import_dir_size = 0;
+	uint16_t                    subsystem = 0;
+	uint16_t                    characteristics = 0;
 };
 
 namespace detail {
@@ -274,7 +276,7 @@ inline bool parse_imports(uint64_t module_base, const pe_info_t& pe, std::vector
 	return true;
 }
 
-inline bool parse(uint64_t module_base, pe_info_t& out)
+inline bool parse(uint64_t module_base, pe_info_t& out, bool include_imports_exports = true)
 {
 	out = {};
 
@@ -308,6 +310,7 @@ inline bool parse(uint64_t module_base, pe_info_t& out)
 	std::memcpy(&out.timestamp, file_header + 4, 4);
 	uint16_t opt_header_size = 0;
 	std::memcpy(&opt_header_size, file_header + 16, 2);
+	std::memcpy(&out.characteristics, file_header + 18, 2);
 
 	uint64_t opt_addr = nt_addr + 24;
 	uint16_t opt_magic = 0;
@@ -328,6 +331,9 @@ inline bool parse(uint64_t module_base, pe_info_t& out)
 		std::memcpy(&out.size_of_image, opt_buf + 56, 4);
 		out.entry_point = module_base + ep_rva;
 
+		if (to_read >= 70)
+			std::memcpy(&out.subsystem, opt_buf + 68, 2);
+
 		if (to_read >= 128) {
 			std::memcpy(&out.export_dir_rva, opt_buf + 112, 4);
 			std::memcpy(&out.export_dir_size, opt_buf + 116, 4);
@@ -347,6 +353,9 @@ inline bool parse(uint64_t module_base, pe_info_t& out)
 		out.image_base = image_base_32;
 		std::memcpy(&out.size_of_image, opt_buf + 56, 4);
 		out.entry_point = module_base + ep_rva;
+
+		if (to_read >= 70)
+			std::memcpy(&out.subsystem, opt_buf + 68, 2);
 
 		if (to_read >= 104) {
 			std::memcpy(&out.export_dir_rva, opt_buf + 96, 4);
@@ -379,8 +388,10 @@ inline bool parse(uint64_t module_base, pe_info_t& out)
 		out.sections.push_back(std::move(sec));
 	}
 
-	parse_exports(module_base, out, out.exports);
-	parse_imports(module_base, out, out.imports);
+	if (include_imports_exports) {
+		parse_exports(module_base, out, out.exports);
+		parse_imports(module_base, out, out.imports);
+	}
 
 	return true;
 }

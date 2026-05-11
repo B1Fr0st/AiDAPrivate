@@ -1,5 +1,6 @@
 #include "helpers.h"
 #include "globals.h"
+#include "diag_log.hpp"
 #include <commdlg.h>
 #include <shlobj.h>
 #include <shellapi.h>
@@ -34,7 +35,7 @@
 #include "terminal_view.hpp"
 #include "network_view.hpp"
 #include "debugger_view.hpp"
-#include "decompiler_view.hpp"
+#include "pseudocode_view.hpp"
 #include "scan_hub_view.hpp"
 #include "types_hub_view.hpp"
 #include "analysis_hub_view.hpp"
@@ -893,23 +894,8 @@ void helpers::render_title()
 		}
 
 		if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) {
-			uint64_t dec_addr = decompiler_engine::g_state.current.function_addr;
-			if (dec_addr == 0)
-				dec_addr = globals::ui::decompile_popup_addr;
-			if (globals::ui::decompile_default_mode == 0) {
-				if (dec_addr)
-					decompiler_engine::decompile_function(dec_addr, g_sa_settings);
-				globals::ui::active_center_view = center_view_t::decompiler;
-			} else if (globals::ui::decompile_default_mode == 1) {
-				if (dec_addr)
-					decompiler_engine::decompile_function_native(dec_addr);
-				globals::ui::active_center_view = center_view_t::decompiler;
-			} else if (globals::ui::decompile_default_mode == 2) {
-				if (dec_addr)
-					decompiler_engine::decompile_function_hybrid(dec_addr, g_sa_settings);
-				globals::ui::active_center_view = center_view_t::decompiler;
-			} else {
-				globals::ui::show_decompile_popup = true;
+			if (pseudocode_view::has_active_tab()) {
+				globals::ui::active_center_view = center_view_t::pseudocode;
 			}
 		}
 
@@ -922,105 +908,6 @@ void helpers::render_title()
 			analysis_hub_view::set_sub_tab(analysis_hub_view::sub_tab_t::deobfuscation);
 			globals::ui::active_center_view = center_view_t::analysis_hub;
 		}
-	}
-
-	if (globals::ui::show_decompile_popup) {
-		ImGui::OpenPopup("##decompile_choice");
-		globals::ui::show_decompile_popup = false;
-	}
-
-	static bool remember_choice = false;
-	if (ImGui::BeginPopupModal("##decompile_choice", nullptr,
-	    ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove)) {
-		ImVec2 display = ImGui::GetIO().DisplaySize;
-		ImVec2 win_size = ImGui::GetWindowSize();
-		ImGui::SetWindowPos(ImVec2(display.x * 0.5f - win_size.x * 0.5f,
-		                            display.y * 0.5f - win_size.y * 0.5f));
-
-		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.9f, 0.95f, 1.f));
-		ImGui::Text("Decompile Function");
-		ImGui::PopStyleColor();
-		ImGui::Separator();
-		ImGui::Spacing();
-
-		float btn_w = 260.f;
-		float btn_h = 52.f;
-
-		uint64_t popup_addr = globals::ui::decompile_popup_addr;
-		if (popup_addr == 0)
-			popup_addr = decompiler_engine::g_state.current.function_addr;
-
-		if (aida::ui::components::button("AI Decompiler##dec_ai",
-			aida::ui::components::button_kind_t::primary,
-			aida::ui::components::size_t_::md,
-			ImVec2(btn_w, btn_h))) {
-			if (popup_addr)
-				decompiler_engine::decompile_function(popup_addr, g_sa_settings);
-			globals::ui::active_center_view = center_view_t::decompiler;
-			if (remember_choice) {
-				globals::ui::decompile_default_mode = 0;
-				g_sa_settings.decompile_default_mode = 0;
-				g_sa_settings_request_save();
-			}
-			ImGui::CloseCurrentPopup();
-		}
-		if (ImGui::IsItemHovered()) {
-			ImGui::SetTooltip("Uses AI to generate high-quality pseudocode with variable naming.\nRequires API key. ~3-15 seconds.");
-		}
-
-		ImGui::Spacing();
-
-		if (aida::ui::components::button("Ghidra Decompiler##dec_ghidra",
-			aida::ui::components::button_kind_t::primary,
-			aida::ui::components::size_t_::md,
-			ImVec2(btn_w, btn_h))) {
-			if (popup_addr)
-				decompiler_engine::decompile_function_native(popup_addr);
-			globals::ui::active_center_view = center_view_t::decompiler;
-			if (remember_choice) {
-				globals::ui::decompile_default_mode = 1;
-				g_sa_settings.decompile_default_mode = 1;
-				g_sa_settings_request_save();
-			}
-			ImGui::CloseCurrentPopup();
-		}
-		if (ImGui::IsItemHovered()) {
-			ImGui::SetTooltip("Native decompilation engine. Instant results (~100ms).\nNo API key needed. Deterministic output.");
-		}
-
-		ImGui::Spacing();
-
-		if (aida::ui::components::button("Hybrid (Ghidra + AI)##dec_hybrid",
-			aida::ui::components::button_kind_t::primary,
-			aida::ui::components::size_t_::md,
-			ImVec2(btn_w, btn_h))) {
-			if (popup_addr)
-				decompiler_engine::decompile_function_hybrid(popup_addr, g_sa_settings);
-			globals::ui::active_center_view = center_view_t::decompiler;
-			if (remember_choice) {
-				globals::ui::decompile_default_mode = 2;
-				g_sa_settings.decompile_default_mode = 2;
-				g_sa_settings_request_save();
-			}
-			ImGui::CloseCurrentPopup();
-		}
-		if (ImGui::IsItemHovered()) {
-			ImGui::SetTooltip("Ghidra for instant structure, then AI refines variable names.\nBest of both worlds.");
-		}
-
-		ImGui::Spacing();
-		ImGui::Separator();
-
-		ImGui::Checkbox("Remember my choice", &remember_choice);
-
-		ImGui::SameLine();
-		if (aida::ui::components::button("Cancel",
-			aida::ui::components::button_kind_t::secondary,
-			aida::ui::components::size_t_::md)) {
-			ImGui::CloseCurrentPopup();
-		}
-
-		ImGui::EndPopup();
 	}
 
 	if (!helpers::themes_loaded) {
@@ -2049,7 +1936,6 @@ void helpers::render_title()
 			globals::ui::panel_left_visible  = g_sa_settings.workspace.left_visible;
 			globals::ui::panel_right_visible = g_sa_settings.workspace.right_visible;
 			globals::ui::panel_bottom_visible = g_sa_settings.workspace.bottom_visible;
-			globals::ui::decompile_default_mode = g_sa_settings.decompile_default_mode;
 			s_layout_synced = true;
 		}
 	}
@@ -2162,7 +2048,7 @@ void helpers::render_title()
 				segs.push_back(code_editor::filename);
 			switch (globals::ui::active_center_view) {
 				case center_view_t::disassembly: segs.push_back("Disassembly"); break;
-				case center_view_t::decompiler:  segs.push_back("Decompiler"); break;
+				case center_view_t::pseudocode:  segs.push_back("Pseudocode"); break;
 				case center_view_t::hex_view:    segs.push_back("Hex"); break;
 				case center_view_t::network_view:segs.push_back("Network"); break;
 				case center_view_t::scan_hub:    segs.push_back("Scan"); break;
@@ -3915,6 +3801,20 @@ void helpers::render_title()
 		}
 
 
+		float next_tab_x_after_disasm = hx0 + hdr_pad;
+		if (!file_tabs::tabs.empty()) {
+			float last_tab_end = hx0 + hdr_pad;
+			for (int ti = 0; ti < (int)file_tabs::tabs.size(); ti++) {
+				auto& tab = file_tabs::tabs[ti];
+				std::string label = tab.filename;
+				if (tab.dirty) label += " *";
+				ImVec2 lts = ImGui::CalcTextSize(label.c_str());
+				float tw = 10.f * 2.f + lts.x + 10.f + 6.f;
+				last_tab_end += tw + 2.f;
+			}
+			next_tab_x_after_disasm = last_tab_end + 4.f;
+		}
+
 		if (g_disasm.file.loaded && !g_disasm.file.filename.empty()) {
 			bool disasm_is_active = (!code_editor::active || code_editor::buffer.empty()) &&
 			                        g_disasm.file.loaded && (g_disasm.live_mode || !g_disasm.file.instrs.empty());
@@ -3924,24 +3824,10 @@ void helpers::render_title()
 			float dtw = 10.f * 2.f + dts.x + close_sz + 12.f;
 			float tab_h2 = row_h - 2.f;
 
-			float dtx0, dtx1;
-			if (!file_tabs::tabs.empty()) {
-				float last_tab_end = hx0 + hdr_pad;
-				for (int ti = 0; ti < (int)file_tabs::tabs.size(); ti++) {
-					auto& tab = file_tabs::tabs[ti];
-					std::string label = tab.filename;
-					if (tab.dirty) label += " *";
-					ImVec2 lts = ImGui::CalcTextSize(label.c_str());
-					float tw = 10.f * 2.f + lts.x + 10.f + 6.f;
-					last_tab_end += tw + 2.f;
-				}
-				dtx0 = last_tab_end + 4.f;
-			} else {
-				dtx0 = hx0 + hdr_pad;
-			}
+			float dtx0 = next_tab_x_after_disasm;
 			if (dtx0 + dtw < rbtn_x0 - 8.f) {
 				float dty0 = r1_cy - tab_h2 * 0.5f;
-				dtx1 = dtx0 + dtw;
+				float dtx1 = dtx0 + dtw;
 				float dty1 = dty0 + tab_h2;
 
 				bool dtab_hov = ImGui::IsMouseHoveringRect(ImVec2(dtx0, dty0), ImVec2(dtx1, dty1), false);
@@ -3988,6 +3874,102 @@ void helpers::render_title()
 				} else if (dtab_hov && !close_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 					globals::ui::active_center_view = center_view_t::disassembly;
 				}
+
+				next_tab_x_after_disasm = dtx1 + 6.f;
+			}
+		}
+
+		{
+			auto psv_tabs = pseudocode_view::snapshot_tabs();
+			if (!psv_tabs.empty()) {
+				bool psv_view_active = (globals::ui::active_center_view == center_view_t::pseudocode);
+				uint64_t active_psv_addr = pseudocode_view::active_tab_address();
+
+				const float p_close_sz = 10.f;
+				float tab_h_p = row_h - 2.f;
+				uint64_t to_activate_addr = 0;
+				uint64_t to_close_addr = 0;
+
+				for (auto& pt : psv_tabs) {
+					std::string lbl;
+					if (pt.loaded && !pt.function_name.empty()) {
+						lbl = pt.function_name;
+					} else if (!pt.label.empty()) {
+						lbl = pt.label;
+					} else {
+						char nm[64];
+						std::snprintf(nm, sizeof(nm), "sub_%llX",
+							static_cast<unsigned long long>(pt.addr));
+						lbl = nm;
+					}
+					if (pt.decompiling) lbl += " ...";
+
+					ImVec2 plts = ImGui::CalcTextSize(lbl.c_str());
+					float ptw = 10.f * 2.f + plts.x + p_close_sz + 12.f;
+					float ptx0 = next_tab_x_after_disasm;
+					if (ptx0 + ptw > rbtn_x0 - 8.f) break;
+					float ptx1 = ptx0 + ptw;
+					float pty0 = r1_cy - tab_h_p * 0.5f;
+					float pty1 = pty0 + tab_h_p;
+
+					bool ptab_active = (psv_view_active && pt.addr == active_psv_addr);
+					bool ptab_hov = ImGui::IsMouseHoveringRect(ImVec2(ptx0, pty0), ImVec2(ptx1, pty1), false);
+
+					if (ptab_active) {
+						wdl->AddRectFilled(ImVec2(ptx0, pty0), ImVec2(ptx1, pty1),
+							IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
+						wdl->AddLine(ImVec2(ptx0 + 2.f, pty1), ImVec2(ptx1 - 2.f, pty1),
+							IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(200*a)), 2.f);
+					} else if (ptab_hov) {
+						wdl->AddRectFilled(ImVec2(ptx0, pty0), ImVec2(ptx1, pty1),
+							IM_COL32(255,255,255,(int)(8*a)), 4.f, ImDrawFlags_RoundCornersTop);
+					}
+
+					ImU32 ptab_col = ptab_active ? ac_full
+					               : (pt.is_error
+					                  ? IM_COL32(255, 130, 130, (int)((ptab_hov ? 220.f : 180.f)*a))
+					                  : IM_COL32(170, 175, 190, (int)((ptab_hov ? 220.f : 160.f)*a)));
+					wdl->AddText(ImVec2(ptx0 + 10.f, pty0 + (tab_h_p - plts.y) * 0.5f),
+						ptab_col, lbl.c_str());
+
+					float pcx0 = ptx1 - p_close_sz - 6.f;
+					float pcy0 = pty0 + (tab_h_p - p_close_sz) * 0.5f;
+					float pcx1 = pcx0 + p_close_sz;
+					float pcy1 = pcy0 + p_close_sz;
+					bool pclose_hov = ImGui::IsMouseHoveringRect(ImVec2(pcx0 - 2, pcy0 - 2),
+						ImVec2(pcx1 + 2, pcy1 + 2), false);
+					if (pclose_hov) {
+						wdl->AddRectFilled(ImVec2(pcx0 - 1, pcy0 - 1), ImVec2(pcx1 + 1, pcy1 + 1),
+							IM_COL32(255,80,80,(int)(40*a)), 3.f);
+					}
+					ImU32 pclose_col = pclose_hov
+						? IM_COL32(255,100,100,(int)(220*a))
+						: IM_COL32(150,150,160,(int)((ptab_active ? 140.f : 80.f)*a));
+					float pcmx = (pcx0 + pcx1) * 0.5f, pcmy = (pcy0 + pcy1) * 0.5f;
+					float pcr = 3.f;
+					wdl->AddLine(ImVec2(pcmx - pcr, pcmy - pcr), ImVec2(pcmx + pcr, pcmy + pcr), pclose_col, 1.2f);
+					wdl->AddLine(ImVec2(pcmx + pcr, pcmy - pcr), ImVec2(pcmx - pcr, pcmy + pcr), pclose_col, 1.2f);
+
+					if (pclose_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+						to_close_addr = pt.addr;
+					} else if (ptab_hov && !pclose_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+						to_activate_addr = pt.addr;
+					} else if (ptab_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) {
+						to_close_addr = pt.addr;
+					}
+
+					next_tab_x_after_disasm = ptx1 + 4.f;
+				}
+
+				if (to_close_addr != 0) {
+					pseudocode_view::close_tab_by_addr(to_close_addr);
+					if (psv_view_active && pseudocode_view::tab_count() == 0) {
+						globals::ui::active_center_view = center_view_t::disassembly;
+					}
+				} else if (to_activate_addr != 0) {
+					pseudocode_view::activate_tab_by_addr(to_activate_addr);
+					globals::ui::active_center_view = center_view_t::pseudocode;
+				}
 			}
 		}
 
@@ -4002,39 +3984,7 @@ void helpers::render_title()
 			float htw = 10.f * 2.f + hts.x + hex_close_sz + 12.f;
 			float tab_h3 = row_h - 2.f;
 
-			float htx0;
-			if (g_disasm.file.loaded && !g_disasm.file.instrs.empty()) {
-				std::string dl2 = g_disasm.file.filename;
-				ImVec2 dl2s = ImGui::CalcTextSize(dl2.c_str());
-				float dlw = 10.f * 2.f + dl2s.x + 10.f + 12.f;
-				float dtx0_base;
-				if (!file_tabs::tabs.empty()) {
-					float last = hx0 + hdr_pad;
-					for (int ti = 0; ti < (int)file_tabs::tabs.size(); ti++) {
-						auto& tab = file_tabs::tabs[ti];
-						std::string lb = tab.filename;
-						if (tab.dirty) lb += " *";
-						ImVec2 ls = ImGui::CalcTextSize(lb.c_str());
-						last += 10.f * 2.f + ls.x + 10.f + 6.f + 2.f;
-					}
-					dtx0_base = last + 4.f;
-				} else {
-					dtx0_base = hx0 + hdr_pad;
-				}
-				htx0 = dtx0_base + dlw + 6.f;
-			} else if (!file_tabs::tabs.empty()) {
-				float last = hx0 + hdr_pad;
-				for (int ti = 0; ti < (int)file_tabs::tabs.size(); ti++) {
-					auto& tab = file_tabs::tabs[ti];
-					std::string lb = tab.filename;
-					if (tab.dirty) lb += " *";
-					ImVec2 ls = ImGui::CalcTextSize(lb.c_str());
-					last += 10.f * 2.f + ls.x + 10.f + 6.f + 2.f;
-				}
-				htx0 = last + 4.f;
-			} else {
-				htx0 = hx0 + hdr_pad;
-			}
+			float htx0 = next_tab_x_after_disasm;
 
 			float htx1 = htx0 + htw;
 			if (htx1 < rbtn_x0 - 8.f) {
@@ -4276,7 +4226,6 @@ void helpers::render_title()
 			};
 
 			float anchor = dtx0;
-			anchor = add_right_tab("Decompiler", center_view_t::decompiler, anchor);
 			anchor = add_right_tab("Types",      center_view_t::types_hub, anchor);
 			anchor = add_right_tab("Analysis",   center_view_t::analysis_hub, anchor);
 			anchor = add_right_tab("Binary Map", center_view_t::binary_map, anchor);
@@ -4583,9 +4532,9 @@ void helpers::render_title()
 		debugger_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
 	}
 
-	else if (cv == center_view_t::decompiler)
+	else if (cv == center_view_t::pseudocode)
 	{
-		decompiler_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+		pseudocode_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
 	}
 
 	else if (cv == center_view_t::scan_hub || cv == center_view_t::memory_scanner
@@ -6899,10 +6848,14 @@ void helpers::render_title()
 
 
 				if (do_attach && can_attach) {
+				  diag::log_tagged_critical("attach", "handler_entered tid=render");
 				  try {
 					auto& p = pa_proc_list[pa_selected];
+					diag::log_tagged_critical_fmt("attach", "phase=pre_driver_attach pid=%u name=%s", p.pid, p.name.c_str());
 					driver_bridge::debug_log("ATTACH: attempting pid=%u name=%s\n", p.pid, p.name.c_str());
-					if (!driver_bridge::attach(p.pid)) {
+					bool attach_ok = driver_bridge::attach(p.pid);
+					diag::log_tagged_critical_fmt("attach", "phase=post_driver_attach pid=%u ok=%d", p.pid, attach_ok ? 1 : 0);
+					if (!attach_ok) {
 						driver_bridge::debug_log("ATTACH: FAILED for pid=%u err=%s\n", p.pid, driver_bridge::last_error().c_str());
 						output_log::push(bottom_tab_t::output,
 							"[Driver] Failed to attach to PID " + std::to_string(p.pid) + ": " +
@@ -6910,7 +6863,9 @@ void helpers::render_title()
 						pa_closing = true;
 					} else {
 						driver_bridge::debug_log("ATTACH: SUCCESS pid=%u, enumerating modules...\n", p.pid);
+						diag::log_tagged_critical("attach", "phase=pre_enumerate_modules");
 						auto modules = driver_bridge::enumerate_modules();
+						diag::log_tagged_critical_fmt("attach", "phase=post_enumerate_modules count=%llu", (unsigned long long)modules.size());
 						driver_bridge::debug_log("ATTACH: enumerate_modules returned %llu modules\n", (unsigned long long)modules.size());
 						if (!modules.empty()) {
 							const auto* target_mod = &modules[0];
@@ -6925,8 +6880,12 @@ void helpers::render_title()
 							if (mod_size == 0) mod_size = 0x100000;
 							driver_bridge::debug_log("ATTACH: calling start_live pid=%u base=0x%llX size=0x%llX mod=%s\n",
 								p.pid, (unsigned long long)target_mod->base, (unsigned long long)mod_size, target_mod->name.c_str());
+							diag::log_tagged_critical_fmt("attach", "phase=pre_start_live pid=%u base=0x%llX size=0x%llX mod=%s",
+								p.pid, (unsigned long long)target_mod->base, (unsigned long long)mod_size, target_mod->name.c_str());
 							disasm::start_live(g_disasm, p.pid, target_mod->base, mod_size, target_mod->name);
+							diag::log_tagged_critical("attach", "phase=post_start_live");
 							globals::ui::active_center_view = center_view_t::disassembly;
+							diag::log_tagged_critical("attach", "phase=post_set_center_view");
 						} else {
 							g_disasm.file = DisasmFile{};
 							output_log::push(bottom_tab_t::output,
@@ -6938,11 +6897,14 @@ void helpers::render_title()
 					char dbg[512];
 					snprintf(dbg, sizeof(dbg), "AiDA Standalone: EXCEPTION in attach handler: %s\n", e.what());
 					OutputDebugStringA(dbg);
+					diag::log_tagged_critical_fmt("attach", "EXCEPTION std=%s", e.what());
 					pa_closing = true;
 				  } catch (...) {
 					OutputDebugStringA("AiDA Standalone: UNKNOWN EXCEPTION in attach handler\n");
+					diag::log_tagged_critical("attach", "EXCEPTION unknown");
 					pa_closing = true;
 				  }
+				  diag::log_tagged_critical("attach", "handler_exit");
 				}
 			}
 			ImGui::EndChild();

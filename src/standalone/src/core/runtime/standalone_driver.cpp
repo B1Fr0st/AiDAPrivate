@@ -372,23 +372,36 @@ namespace driver_bridge
 
     bool attach(uint32_t pid)
     {
+        diag::log_tagged_critical_fmt("driver", "attach_enter pid=%u tid=%lu", pid, GetCurrentThreadId());
 
-        if (pid == static_cast<uint32_t>(GetCurrentProcessId()))
+        if (pid == static_cast<uint32_t>(GetCurrentProcessId())) {
+            diag::log_tagged_critical("driver", "attach_REJECTED_self_pid");
             return false;
-
-        {
-            uint64_t gt = standalone_license::inline_gate_check(
-                standalone_license::gate_driver_attach);
-            if (standalone_license::verify_gate_token(
-                    standalone_license::gate_driver_attach, gt) < 0.5) {
-                return false;
-            }
         }
 
+        {
+            diag::log_tagged_critical("driver", "attach_pre_inline_gate_check");
+            uint64_t gt = standalone_license::inline_gate_check(
+                standalone_license::gate_driver_attach);
+            diag::log_tagged_critical_fmt("driver", "attach_post_inline_gate_check token=0x%llX",
+                (unsigned long long)gt);
+            if (standalone_license::verify_gate_token(
+                    standalone_license::gate_driver_attach, gt) < 0.5) {
+                diag::log_tagged_critical("driver", "attach_REJECTED_gate_check_failed");
+                return false;
+            }
+            diag::log_tagged_critical("driver", "attach_post_verify_gate_token");
+        }
+
+        diag::log_tagged_critical("driver", "attach_pre_state_mtx_lock");
         std::lock_guard<std::mutex> lk(g_state_mtx);
+        diag::log_tagged_critical("driver", "attach_post_state_mtx_lock");
 
         DWORD access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ;
+        diag::log_tagged_critical_fmt("driver", "attach_pre_OpenProcess access=0x%X pid=%u", access, pid);
         unique_handle process(OpenProcess(access, FALSE, pid));
+        diag::log_tagged_critical_fmt("driver", "attach_post_OpenProcess handle=%p gle=%lu",
+            process.get(), process ? 0UL : GetLastError());
         bool has_vm_read = true;
         if (!process) {
             has_vm_read = false;
@@ -410,32 +423,54 @@ namespace driver_bridge
             g_process_name = process_name_from_pid(pid);
 
         bool kernel_ok = g_kernel_mode && device && device->is_connected();
+        diag::log_tagged_critical_fmt("driver", "attach_kernel_check kernel_mode=%d device=%p connected=%d kernel_ok=%d",
+            g_kernel_mode ? 1 : 0, device.get(),
+            (device && device->is_connected()) ? 1 : 0,
+            kernel_ok ? 1 : 0);
         if (kernel_ok) {
+            diag::log_tagged_critical("driver", "attach_pre_set_process_id");
             device->set_process_id(pid);
+            diag::log_tagged_critical("driver", "attach_post_set_process_id");
 
             const auto* vtable = get_arc_vtable();
+            diag::log_tagged_critical_fmt("driver", "attach_arc_vtable=%p", vtable);
             bool vtable_solved = false;
             if (vtable && vtable->set_process_id && vtable->solve_dtb &&
                 vtable->get_dtb && vtable->find_image && vtable->set_base_address) {
+                diag::log_tagged_critical("driver", "attach_arc_vtable_pre_set_process_id");
                 vtable->set_process_id(pid);
+                diag::log_tagged_critical("driver", "attach_arc_vtable_pre_solve_dtb");
                 uint64_t dtb = vtable->solve_dtb();
+                diag::log_tagged_critical_fmt("driver", "attach_arc_vtable_post_solve_dtb dtb=0x%llX",
+                    (unsigned long long)dtb);
                 if (dtb != 0) {
                     vtable_solved = true;
+                    diag::log_tagged_critical("driver", "attach_arc_vtable_pre_find_image");
                     const auto image_base = vtable->find_image();
+                    diag::log_tagged_critical_fmt("driver", "attach_arc_vtable_post_find_image base=0x%llX",
+                        (unsigned long long)image_base);
                     if (image_base != 0)
                         vtable->set_base_address(image_base);
+                    diag::log_tagged_critical("driver", "attach_pre_device_solve_dtb_after_vtable");
                     device->solve_dtb();
+                    diag::log_tagged_critical("driver", "attach_post_device_solve_dtb_after_vtable");
                     if (image_base != 0)
                         device->set_base_address(image_base);
                 }
             }
 
             if (!vtable_solved) {
+                diag::log_tagged_critical("driver", "attach_pre_device_solve_dtb_fallback");
                 device->solve_dtb();
+                diag::log_tagged_critical_fmt("driver", "attach_post_device_solve_dtb_fallback dtb=0x%llX",
+                    (unsigned long long)device->get_dtb());
                 if (device->get_dtb() == 0) {
                     kernel_ok = false;
                 } else {
+                    diag::log_tagged_critical("driver", "attach_pre_device_find_image_fallback");
                     const auto image_base = device->find_image();
+                    diag::log_tagged_critical_fmt("driver", "attach_post_device_find_image_fallback base=0x%llX",
+                        (unsigned long long)image_base);
                     if (image_base != 0)
                         device->set_base_address(image_base);
                 }
@@ -443,7 +478,10 @@ namespace driver_bridge
 
             if (kernel_ok) {
                 g_kernel_attached = true;
+                diag::log_tagged_critical("driver", "attach_pre_solve_kernel_dtb");
                 device->solve_kernel_dtb();
+                diag::log_tagged_critical_fmt("driver", "attach_post_solve_kernel_dtb kdtb=0x%llX",
+                    (unsigned long long)device->get_kernel_dtb());
                 if (device->get_kernel_dtb() != 0) {
                     logf("AiDA Standalone: Kernel DTB solved: 0x%llX\n",
                          static_cast<unsigned long long>(device->get_kernel_dtb()));
@@ -463,6 +501,8 @@ namespace driver_bridge
             logf("AiDA Standalone: Attached to PID %u (%s) via limited handle (query-only).\n",
                  g_pid, g_process_name.empty() ? "unknown" : g_process_name.c_str());
         }
+        diag::log_tagged_critical_fmt("driver", "attach_exit_ok pid=%u kernel_ok=%d has_vm_read=%d",
+            pid, kernel_ok ? 1 : 0, has_vm_read ? 1 : 0);
         return true;
     }
 
@@ -661,10 +701,13 @@ namespace driver_bridge
 
     std::vector<module_info_t> enumerate_modules()
     {
+        diag::log_tagged_critical_fmt("driver", "enumerate_modules_enter tid=%lu", GetCurrentThreadId());
         std::vector<module_info_t> result;
         const uint32_t pid = attached_pid();
-        if (!pid)
+        if (!pid) {
+            diag::log_tagged_critical("driver", "enumerate_modules_no_pid");
             return result;
+        }
 
         HANDLE process = nullptr;
         {
@@ -673,12 +716,15 @@ namespace driver_bridge
         }
 
         if (process) {
+            diag::log_tagged_critical_fmt("driver", "enumerate_modules_pre_usermode pid=%u handle=%p", pid, process);
             result = enumerate_modules_usermode(pid, process);
+            diag::log_tagged_critical_fmt("driver", "enumerate_modules_post_usermode count=%llu", (unsigned long long)result.size());
         }
 
         if (!result.empty()) {
             logf("AiDA Standalone: enumerate_modules: resolved %zu modules via user-mode snapshot for PID %u.\n",
                  result.size(), pid);
+            diag::log_tagged_critical_fmt("driver", "enumerate_modules_exit_ok count=%llu", (unsigned long long)result.size());
             return result;
         }
 

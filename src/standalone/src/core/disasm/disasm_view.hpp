@@ -62,6 +62,22 @@ struct state_t {
 
     int selected_row = -1;
 
+    int  sel_anchor   = -1;
+    int  sel_extent   = -1;
+    bool sel_dragging = false;
+
+    int  banner_selected_row = -1;
+    int  banner_sel_anchor   = -1;
+    int  banner_sel_extent   = -1;
+    bool banner_sel_dragging = false;
+    int  banner_ctx_row      = -1;
+    int  banner_popup_anchor = -1;
+    int  banner_popup_extent = -1;
+
+    int popup_sel_anchor = -1;
+    int popup_sel_extent = -1;
+    int popup_sel_row    = -1;
+
     int ctx_row = -1;
 
     bool  xref_popup_open = false;
@@ -93,5 +109,7 @@ void navigate_back();
 void navigate_forward();
 
 void bump_format_generation();
+
+uint64_t enclosing_function_start(uint64_t addr, const DisasmFile& file);
 
 }

@@ -18,11 +18,32 @@
 #include "state.hpp"
 #include "key_pipeline.hpp"
 #include "tpm_attest.hpp"
+#include "webhook.hpp"
 
 #pragma comment(lib, "bcrypt.lib")
 
 namespace anti_tamper {
 namespace integrity {
+
+namespace diag {
+
+    __forceinline void hex_encode(char* out, size_t out_cap,
+                                   const uint8_t* data, size_t len)
+    {
+        static const char hex[] = "0123456789ABCDEF";
+        size_t pos = 0;
+        for (size_t i = 0; i < len && pos + 2 < out_cap; ++i)
+        {
+            out[pos++] = hex[(data[i] >> 4) & 0xF];
+            out[pos++] = hex[data[i] & 0xF];
+        }
+        if (pos < out_cap)
+            out[pos] = '\0';
+        else if (out_cap > 0)
+            out[out_cap - 1] = '\0';
+    }
+
+}
 
 namespace siphash {
 
@@ -378,6 +399,7 @@ namespace detail {
         uint8_t  tag[8];
         uint8_t  full_tag[16];
         uint64_t seq;
+        uint64_t baseline_siphash;
     };
 
     struct page_table_t
@@ -570,7 +592,7 @@ namespace detail {
         SecureZeroMemory(expanded, sizeof(expanded));
     }
 
-    inline void compute_session_secret(uint8_t out[32])
+    inline bool compute_session_secret(uint8_t out[32])
     {
         uint64_t lo = s_session_secret_lo.load(std::memory_order_acquire);
         uint64_t hi = s_session_secret_hi.load(std::memory_order_acquire);
@@ -581,8 +603,10 @@ namespace detail {
         memcpy(mat + 8,  &hi, 8);
         memcpy(mat + 16, &k0, 8);
         memcpy(mat + 24, &k1, 8);
-        sha256::hash(mat, sizeof(mat), out);
+        memset(out, 0, 32);
+        bool ok = sha256::hash(mat, sizeof(mat), out);
         SecureZeroMemory(mat, sizeof(mat));
+        return ok;
     }
 
     inline bool build_iv_for_page(uint64_t base, uint32_t page_index, uint64_t epoch,
@@ -627,7 +651,6 @@ namespace detail {
         compute_session_secret(base_secret);
         uint8_t key[16];
         derive_page_key(base_secret, epoch, key);
-        SecureZeroMemory(base_secret, sizeof(base_secret));
 
         for (uint32_t i = 0; i < pages; ++i)
         {
@@ -638,13 +661,43 @@ namespace detail {
             uint8_t tag[16];
             if (!compute_page_full_tag(pt, i, page, this_size, key, tag))
             {
+                SecureZeroMemory(base_secret, sizeof(base_secret));
                 SecureZeroMemory(key, sizeof(key));
                 return false;
             }
             memcpy(pt.entries[i].full_tag, tag, 16);
             memcpy(pt.entries[i].tag, tag, 8);
             pt.entries[i].seq = i;
+            pt.entries[i].baseline_siphash = siphash::hash(
+                page, this_size,
+                load_k0() ^ static_cast<uint64_t>(i),
+                load_k1() ^ static_cast<uint64_t>(i + 1));
         }
+
+        if (pages > 0)
+        {
+            const uint8_t* page0 = reinterpret_cast<const uint8_t*>(base);
+            uint32_t page0_size = (kPageSize > size) ? size : kPageSize;
+            char hex_first[129];
+            char hex_tag0[33];
+            char hex_secret[17];
+            diag::hex_encode(hex_first, sizeof(hex_first), page0,
+                             page0_size < 64 ? page0_size : 64);
+            diag::hex_encode(hex_tag0, sizeof(hex_tag0), pt.entries[0].full_tag, 16);
+            diag::hex_encode(hex_secret, sizeof(hex_secret), base_secret, 8);
+            webhook::write_log_critical_fmt("page_mac",
+                "rebuild_baseline pages=%u epoch=%llu base=0x%llX size=0x%X "
+                "page0_first64=%s page0_tag=%s page0_baseline_siphash=0x%016llX session_secret_pfx=%s",
+                pages,
+                static_cast<unsigned long long>(epoch),
+                static_cast<unsigned long long>(base),
+                size,
+                hex_first,
+                hex_tag0,
+                static_cast<unsigned long long>(pt.entries[0].baseline_siphash),
+                hex_secret);
+        }
+        SecureZeroMemory(base_secret, sizeof(base_secret));
         SecureZeroMemory(key, sizeof(key));
 
         uint64_t anchor = 0;
@@ -678,7 +731,6 @@ namespace detail {
         compute_session_secret(base_secret);
         uint8_t new_key[16];
         derive_page_key(base_secret, new_epoch, new_key);
-        SecureZeroMemory(base_secret, sizeof(base_secret));
 
         pt.key_epoch.store(new_epoch, std::memory_order_release);
 
@@ -691,12 +743,41 @@ namespace detail {
             uint8_t tag[16];
             if (!compute_page_full_tag(pt, i, page, this_size, new_key, tag))
             {
+                SecureZeroMemory(base_secret, sizeof(base_secret));
                 SecureZeroMemory(new_key, sizeof(new_key));
                 return false;
             }
             memcpy(pt.entries[i].full_tag, tag, 16);
             memcpy(pt.entries[i].tag, tag, 8);
         }
+
+        if (!pt.entries.empty() && pt.size > 0)
+        {
+            const uint8_t* page0 = reinterpret_cast<const uint8_t*>(pt.base);
+            uint32_t page0_size = (kPageSize > pt.size) ? pt.size : kPageSize;
+            uint64_t live_siphash = siphash::hash(
+                page0, page0_size, load_k0(), load_k1() ^ 1ULL);
+            char hex_first[129];
+            char hex_tag0[33];
+            char hex_secret[17];
+            diag::hex_encode(hex_first, sizeof(hex_first), page0,
+                             page0_size < 64 ? page0_size : 64);
+            diag::hex_encode(hex_tag0, sizeof(hex_tag0), pt.entries[0].full_tag, 16);
+            diag::hex_encode(hex_secret, sizeof(hex_secret), base_secret, 8);
+            webhook::write_log_critical_fmt("page_mac",
+                "rotate old_epoch=%llu new_epoch=%llu pages=%zu "
+                "page0_first64=%s page0_new_tag=%s page0_baseline_siphash=0x%016llX "
+                "page0_live_siphash=0x%016llX session_secret_pfx=%s",
+                static_cast<unsigned long long>(old_epoch),
+                static_cast<unsigned long long>(new_epoch),
+                pt.entries.size(),
+                hex_first,
+                hex_tag0,
+                static_cast<unsigned long long>(pt.entries[0].baseline_siphash),
+                static_cast<unsigned long long>(live_siphash),
+                hex_secret);
+        }
+        SecureZeroMemory(base_secret, sizeof(base_secret));
         SecureZeroMemory(new_key, sizeof(new_key));
         pt.last_rotation_qpc.store(qpc_now_ms(), std::memory_order_release);
         return true;
@@ -704,26 +785,108 @@ namespace detail {
 
     inline bool verify_page_locked(page_table_t& pt, uint32_t page_index)
     {
-        if (page_index >= pt.entries.size()) return false;
+        if (page_index >= pt.entries.size())
+        {
+            webhook::write_log_critical_fmt("page_mac",
+                "verify_page_locked_FAIL_path_A page_index=%u entries_size=%zu pt_base=0x%llX pt_size=0x%X",
+                page_index,
+                pt.entries.size(),
+                static_cast<unsigned long long>(pt.base),
+                pt.size);
+            return false;
+        }
         uint32_t this_size = kPageSize;
         uint32_t offset = page_index * kPageSize;
         if (offset + this_size > pt.size) this_size = pt.size - offset;
         const uint8_t* page = reinterpret_cast<const uint8_t*>(pt.base + offset);
 
         uint8_t base_secret[32];
-        compute_session_secret(base_secret);
+        bool secret_ok = compute_session_secret(base_secret);
         uint8_t key[16];
-        derive_page_key(base_secret, pt.key_epoch.load(), key);
-        SecureZeroMemory(base_secret, sizeof(base_secret));
+        uint64_t cur_epoch = pt.key_epoch.load();
+        derive_page_key(base_secret, cur_epoch, key);
 
         uint8_t tag[16];
         if (!compute_page_full_tag(pt, page_index, page, this_size, key, tag))
         {
+            char hex_secret[17];
+            char hex_key[33];
+            diag::hex_encode(hex_secret, sizeof(hex_secret), base_secret, 8);
+            diag::hex_encode(hex_key, sizeof(hex_key), key, 16);
+            webhook::write_log_critical_fmt("page_mac",
+                "verify_page_locked_FAIL_path_B page=%u offset=0x%X size=0x%X epoch=%llu "
+                "secret_ok=%d session_secret_pfx=%s derived_key=%s pt_base=0x%llX pt_size=0x%X",
+                page_index,
+                offset,
+                this_size,
+                static_cast<unsigned long long>(cur_epoch),
+                secret_ok ? 1 : 0,
+                hex_secret,
+                hex_key,
+                static_cast<unsigned long long>(pt.base),
+                pt.size);
+            SecureZeroMemory(base_secret, sizeof(base_secret));
             SecureZeroMemory(key, sizeof(key));
             return false;
         }
-        SecureZeroMemory(key, sizeof(key));
         bool ok = (memcmp(tag, pt.entries[page_index].full_tag, 16) == 0);
+        if (!ok)
+        {
+            uint64_t baseline = pt.entries[page_index].baseline_siphash;
+            uint64_t live_siphash = siphash::hash(
+                page, this_size,
+                load_k0() ^ static_cast<uint64_t>(page_index),
+                load_k1() ^ static_cast<uint64_t>(page_index + 1));
+            uint64_t k0v = load_k0();
+            uint64_t k1v = load_k1();
+            uint64_t lo = s_session_secret_lo.load(std::memory_order_acquire);
+            uint64_t hi = s_session_secret_hi.load(std::memory_order_acquire);
+            char hex_first[129];
+            char hex_last[65];
+            char hex_expected[33];
+            char hex_computed[33];
+            char hex_secret[17];
+            char hex_key[33];
+            diag::hex_encode(hex_first, sizeof(hex_first), page,
+                             this_size < 64 ? this_size : 64);
+            uint32_t tail_off = (this_size > 32) ? this_size - 32 : 0;
+            uint32_t tail_len = (this_size > 32) ? 32 : this_size;
+            diag::hex_encode(hex_last, sizeof(hex_last), page + tail_off, tail_len);
+            diag::hex_encode(hex_expected, sizeof(hex_expected),
+                             pt.entries[page_index].full_tag, 16);
+            diag::hex_encode(hex_computed, sizeof(hex_computed), tag, 16);
+            diag::hex_encode(hex_secret, sizeof(hex_secret), base_secret, 8);
+            diag::hex_encode(hex_key, sizeof(hex_key), key, 16);
+            const char* diagnosis =
+                (live_siphash == baseline) ? "key_or_iv_mismatch"
+                                           : "page_contents_changed";
+            webhook::write_log_critical_fmt("page_mac",
+                "verify_FAIL page=%u offset=0x%X size=0x%X epoch=%llu "
+                "diagnosis=%s live_siphash=0x%016llX baseline_siphash=0x%016llX "
+                "expected_tag=%s computed_tag=%s "
+                "session_secret_lo=0x%016llX session_secret_hi=0x%016llX "
+                "k0=0x%016llX k1=0x%016llX session_secret_pfx=%s derived_key=%s "
+                "first64=%s last32=%s",
+                page_index,
+                offset,
+                this_size,
+                static_cast<unsigned long long>(cur_epoch),
+                diagnosis,
+                static_cast<unsigned long long>(live_siphash),
+                static_cast<unsigned long long>(baseline),
+                hex_expected,
+                hex_computed,
+                static_cast<unsigned long long>(lo),
+                static_cast<unsigned long long>(hi),
+                static_cast<unsigned long long>(k0v),
+                static_cast<unsigned long long>(k1v),
+                hex_secret,
+                hex_key,
+                hex_first,
+                hex_last);
+        }
+        SecureZeroMemory(base_secret, sizeof(base_secret));
+        SecureZeroMemory(key, sizeof(key));
         SecureZeroMemory(tag, sizeof(tag));
         return ok;
     }
@@ -811,13 +974,25 @@ inline bool verify_self_hash()
     if (self_seed == 0) return true;
     uint64_t per_call = siphash::siphash_3u64(self_seed, detail::load_k0(), detail::load_k1());
     uint64_t computed = detail::self_hash_chain_compute(per_call);
+    if (computed == 0) return true;
     uint8_t mat[16];
     memcpy(mat + 0, &computed, 8);
     memcpy(mat + 8, &per_call, 8);
     uint8_t mac[32] = {};
-    uint8_t base_secret[32];
-    detail::compute_session_secret(base_secret);
-    sha256::hmac(base_secret, 32, mat, sizeof(mat), mac);
+    uint8_t base_secret[32] = {};
+    if (!detail::compute_session_secret(base_secret))
+    {
+        SecureZeroMemory(base_secret, sizeof(base_secret));
+        SecureZeroMemory(mat, sizeof(mat));
+        return true;
+    }
+    if (!sha256::hmac(base_secret, 32, mat, sizeof(mat), mac))
+    {
+        SecureZeroMemory(base_secret, sizeof(base_secret));
+        SecureZeroMemory(mac, sizeof(mac));
+        SecureZeroMemory(mat, sizeof(mat));
+        return true;
+    }
     SecureZeroMemory(base_secret, sizeof(base_secret));
     uint64_t anchor_recomputed = 0;
     memcpy(&anchor_recomputed, mac, 8);
@@ -874,19 +1049,33 @@ inline bool snapshot_code(state::code_snapshot_t& snap)
     detail::s_self_chain_seed.store(seed_value, std::memory_order_release);
     uint64_t per_call = siphash::siphash_3u64(seed_value, detail::load_k0(), detail::load_k1());
     uint64_t chain = detail::self_hash_chain_compute(per_call);
-    uint8_t mat[16];
-    memcpy(mat + 0, &chain, 8);
-    memcpy(mat + 8, &per_call, 8);
-    uint8_t mac[32] = {};
-    uint8_t base_secret[32];
-    detail::compute_session_secret(base_secret);
-    sha256::hmac(base_secret, 32, mat, sizeof(mat), mac);
-    SecureZeroMemory(base_secret, sizeof(base_secret));
-    uint64_t anchor = 0;
-    memcpy(&anchor, mac, 8);
-    SecureZeroMemory(mac, sizeof(mac));
-    SecureZeroMemory(mat, sizeof(mat));
-    detail::s_self_chain_anchor.store(anchor ^ seed_value, std::memory_order_release);
+    if (chain != 0)
+    {
+        uint8_t mat[16];
+        memcpy(mat + 0, &chain, 8);
+        memcpy(mat + 8, &per_call, 8);
+        uint8_t mac[32] = {};
+        uint8_t base_secret[32] = {};
+        bool secret_ok = detail::compute_session_secret(base_secret);
+        bool hmac_ok = secret_ok && sha256::hmac(base_secret, 32, mat, sizeof(mat), mac);
+        SecureZeroMemory(base_secret, sizeof(base_secret));
+        if (hmac_ok)
+        {
+            uint64_t anchor = 0;
+            memcpy(&anchor, mac, 8);
+            detail::s_self_chain_anchor.store(anchor ^ seed_value, std::memory_order_release);
+        }
+        else
+        {
+            detail::s_self_chain_anchor.store(0, std::memory_order_release);
+        }
+        SecureZeroMemory(mac, sizeof(mac));
+        SecureZeroMemory(mat, sizeof(mat));
+    }
+    else
+    {
+        detail::s_self_chain_anchor.store(0, std::memory_order_release);
+    }
 
     {
         auto& pt = detail::page_table();
@@ -1075,14 +1264,26 @@ inline void rebuild_self_chain_anchor_locked()
     if (seed_value == 0) return;
     uint64_t per_call = siphash::siphash_3u64(seed_value, detail::load_k0(), detail::load_k1());
     uint64_t chain = detail::self_hash_chain_compute(per_call);
+    if (chain == 0)
+    {
+        detail::s_self_chain_anchor.store(0, std::memory_order_release);
+        return;
+    }
     uint8_t mat[16];
     memcpy(mat + 0, &chain, 8);
     memcpy(mat + 8, &per_call, 8);
     uint8_t mac[32] = {};
-    uint8_t base_secret[32];
-    detail::compute_session_secret(base_secret);
-    sha256::hmac(base_secret, 32, mat, sizeof(mat), mac);
+    uint8_t base_secret[32] = {};
+    bool secret_ok = detail::compute_session_secret(base_secret);
+    bool hmac_ok = secret_ok && sha256::hmac(base_secret, 32, mat, sizeof(mat), mac);
     SecureZeroMemory(base_secret, sizeof(base_secret));
+    if (!hmac_ok)
+    {
+        SecureZeroMemory(mac, sizeof(mac));
+        SecureZeroMemory(mat, sizeof(mat));
+        detail::s_self_chain_anchor.store(0, std::memory_order_release);
+        return;
+    }
     uint64_t anchor = 0;
     memcpy(&anchor, mac, 8);
     SecureZeroMemory(mac, sizeof(mac));
@@ -1119,6 +1320,10 @@ inline void install_page_mac_veh()
     AddVectoredExceptionHandler(0, page_mac_veh_handler);
 }
 
+namespace periodic {
+    inline void invalidate_all_slots();
+}
+
 inline void rotate_page_keys_if_due()
 {
     auto& pt = detail::page_table();
@@ -1131,6 +1336,7 @@ inline void rotate_page_keys_if_due()
     detail::rotate_session_secret();
     detail::rotate_page_keys_locked(pt);
     rebuild_self_chain_anchor_locked();
+    periodic::invalidate_all_slots();
 }
 
 namespace periodic {
@@ -1160,6 +1366,28 @@ namespace periodic {
     {
         static std::atomic<uint64_t> v[kWorkerCount];
         return v;
+    }
+
+    inline std::atomic<uint64_t>* epoch_array()
+    {
+        static std::atomic<uint64_t> v[kWorkerCount];
+        return v;
+    }
+
+    inline std::atomic<uint64_t>& last_quorum_skip_log_ms()
+    {
+        static std::atomic<uint64_t> v{0};
+        return v;
+    }
+
+    inline void invalidate_all_slots()
+    {
+        for (uint32_t w = 0; w < kWorkerCount; ++w)
+        {
+            qpc_array()[w].store(0, std::memory_order_release);
+            signature_array()[w].store(0, std::memory_order_release);
+            epoch_array()[w].store(0, std::memory_order_release);
+        }
     }
 
     __forceinline uint64_t compute_text_signature_unlocked(uint64_t epoch,
@@ -1237,13 +1465,16 @@ namespace periodic {
             }
 
             signature_array()[worker_id].store(sig, std::memory_order_release);
+            epoch_array()[worker_id].store(snap_epoch, std::memory_order_release);
             qpc_array()[worker_id].store(start_ms, std::memory_order_release);
             detail::periodic_pass_counter().fetch_add(1, std::memory_order_acq_rel);
 
             if (worker_id == 0)
             {
                 bool all_ready = true;
+                bool same_epoch = true;
                 uint64_t ref_sig = signature_array()[0].load(std::memory_order_acquire);
+                uint64_t ref_epoch = epoch_array()[0].load(std::memory_order_acquire);
                 for (uint32_t w = 0; w < kWorkerCount; ++w)
                 {
                     uint64_t qw = qpc_array()[w].load(std::memory_order_acquire);
@@ -1252,8 +1483,14 @@ namespace periodic {
                         all_ready = false;
                         break;
                     }
+                    uint64_t ew = epoch_array()[w].load(std::memory_order_acquire);
+                    if (ew != ref_epoch)
+                    {
+                        same_epoch = false;
+                        break;
+                    }
                 }
-                if (all_ready)
+                if (all_ready && same_epoch)
                 {
                     bool quorum = true;
                     for (uint32_t w = 1; w < kWorkerCount; ++w)
@@ -1267,7 +1504,31 @@ namespace periodic {
                     }
                     if (!quorum)
                     {
+                        uint64_t s1 = signature_array()[1].load(std::memory_order_acquire);
+                        uint64_t s2 = (kWorkerCount > 2) ? signature_array()[2].load(std::memory_order_acquire) : 0;
+                        webhook::write_log_critical_fmt("page_mac",
+                            "worker_quorum_mismatch epoch=%llu sig0=0x%016llX sig1=0x%016llX sig2=0x%016llX",
+                            static_cast<unsigned long long>(ref_epoch),
+                            static_cast<unsigned long long>(ref_sig),
+                            static_cast<unsigned long long>(s1),
+                            static_cast<unsigned long long>(s2));
                         detail::periodic_violation_flag().store(true, std::memory_order_release);
+                    }
+                }
+                else if (all_ready && !same_epoch)
+                {
+                    uint64_t now_ms = detail::qpc_now_ms();
+                    uint64_t last_log = last_quorum_skip_log_ms().load(std::memory_order_acquire);
+                    if (now_ms - last_log >= 5000)
+                    {
+                        last_quorum_skip_log_ms().store(now_ms, std::memory_order_release);
+                        uint64_t e1 = epoch_array()[1].load(std::memory_order_acquire);
+                        uint64_t e2 = (kWorkerCount > 2) ? epoch_array()[2].load(std::memory_order_acquire) : 0;
+                        webhook::write_log_critical_fmt("page_mac",
+                            "worker_quorum_skip_epoch_mismatch e0=%llu e1=%llu e2=%llu",
+                            static_cast<unsigned long long>(ref_epoch),
+                            static_cast<unsigned long long>(e1),
+                            static_cast<unsigned long long>(e2));
                     }
                 }
                 rotate_page_keys_if_due();

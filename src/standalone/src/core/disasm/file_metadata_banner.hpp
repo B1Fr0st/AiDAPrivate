@@ -17,6 +17,7 @@
 #include <zlib.h>
 
 #include "../infra/work_queue.hpp"
+#include "../runtime/standalone_driver.hpp"
 #include "../ui/fonts.hpp"
 #include "disasm_theme.hpp"
 #include "zydis_disasm.hpp"
@@ -28,6 +29,12 @@ namespace file_metadata_banner {
 		pending = 1,
 		ready = 2,
 		failed = 3
+	};
+
+	enum class source_kind_t : int {
+		none = 0,
+		disk_file = 1,
+		live_image = 2
 	};
 
 	struct section_info_t {
@@ -43,15 +50,21 @@ namespace file_metadata_banner {
 	struct metadata_cache_t {
 		std::atomic<int>     state{ static_cast<int>(compute_state_t::idle) };
 		std::mutex           mtx;
+		source_kind_t        source_kind = source_kind_t::none;
 		std::string          source_path;
 		uint64_t             source_size = 0;
 		uint64_t             source_write_time = 0;
+		uint64_t             live_module_base = 0;
+		uint32_t             live_module_size = 0;
+		uint32_t             live_pid = 0;
 		std::string          file_name;
 		std::string          sha256;
 		std::string          md5;
 		std::string          crc32;
 		std::string          compiler;
 		std::string          pdb_file_name;
+		std::string          pdb_guid;
+		uint32_t             pdb_age = 0;
 		std::string          os_type;
 		std::string          app_type;
 		std::string          format_text;
@@ -300,12 +313,41 @@ namespace file_metadata_banner {
 			return "unknown";
 		}
 
+		inline std::string format_pdb_guid(const uint8_t* g) {
+			char buf[48] = {};
+			uint32_t d1 = 0;
+			uint16_t d2 = 0;
+			uint16_t d3 = 0;
+			std::memcpy(&d1, g + 0, 4);
+			std::memcpy(&d2, g + 4, 2);
+			std::memcpy(&d3, g + 6, 2);
+			std::snprintf(buf, sizeof(buf),
+				"%08X%04X%04X%02X%02X%02X%02X%02X%02X%02X%02X",
+				static_cast<unsigned>(d1),
+				static_cast<unsigned>(d2),
+				static_cast<unsigned>(d3),
+				static_cast<unsigned>(g[8]),
+				static_cast<unsigned>(g[9]),
+				static_cast<unsigned>(g[10]),
+				static_cast<unsigned>(g[11]),
+				static_cast<unsigned>(g[12]),
+				static_cast<unsigned>(g[13]),
+				static_cast<unsigned>(g[14]),
+				static_cast<unsigned>(g[15]));
+			return std::string(buf);
+		}
+
 		inline std::string extract_pdb_path(const std::vector<uint8_t>& raw,
 			const IMAGE_NT_HEADERS64* nt64,
 			const IMAGE_NT_HEADERS32* nt32,
 			bool is_pe32_plus,
-			const std::vector<section_info_t>& secs)
+			const std::vector<section_info_t>& secs,
+			bool flat_in_memory_layout,
+			std::string* out_guid,
+			uint32_t* out_age)
 		{
+			if (out_guid) out_guid->clear();
+			if (out_age) *out_age = 0;
 			IMAGE_DATA_DIRECTORY dbg_dir{};
 			if (is_pe32_plus) {
 				if (nt64->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_DEBUG)
@@ -319,7 +361,8 @@ namespace file_metadata_banner {
 			if (dbg_dir.VirtualAddress == 0 || dbg_dir.Size < sizeof(IMAGE_DEBUG_DIRECTORY))
 				return "(none)";
 
-			auto rva_to_offset = [&secs](uint32_t rva) -> uint32_t {
+			auto rva_to_offset = [&secs, flat_in_memory_layout](uint32_t rva) -> uint32_t {
+				if (flat_in_memory_layout) return rva;
 				for (const auto& s : secs) {
 					if (rva >= s.virtual_address && rva < s.virtual_address + std::max<uint32_t>(s.virtual_size, s.raw_size)) {
 						uint32_t delta = rva - s.virtual_address;
@@ -339,10 +382,15 @@ namespace file_metadata_banner {
 				const IMAGE_DEBUG_DIRECTORY* e =
 					reinterpret_cast<const IMAGE_DEBUG_DIRECTORY*>(raw.data() + dbg_off + i * sizeof(IMAGE_DEBUG_DIRECTORY));
 				if (e->Type != IMAGE_DEBUG_TYPE_CODEVIEW) continue;
-				if (e->PointerToRawData == 0 || e->SizeOfData < 24) continue;
-				if (static_cast<uint64_t>(e->PointerToRawData) + e->SizeOfData > raw.size()) continue;
-				const uint8_t* cv = raw.data() + e->PointerToRawData;
+				uint32_t cv_off = flat_in_memory_layout
+					? e->AddressOfRawData
+					: e->PointerToRawData;
+				if (cv_off == 0 || e->SizeOfData < 24) continue;
+				if (static_cast<uint64_t>(cv_off) + e->SizeOfData > raw.size()) continue;
+				const uint8_t* cv = raw.data() + cv_off;
 				if (cv[0] == 'R' && cv[1] == 'S' && cv[2] == 'D' && cv[3] == 'S') {
+					if (out_guid) *out_guid = format_pdb_guid(cv + 4);
+					if (out_age) std::memcpy(out_age, cv + 20, 4);
 					const char* name = reinterpret_cast<const char*>(cv + 24);
 					size_t max_len = static_cast<size_t>(e->SizeOfData) - 24;
 					size_t actual = 0;
@@ -354,7 +402,9 @@ namespace file_metadata_banner {
 			return "(none)";
 		}
 
-		inline bool parse_pe(const std::vector<uint8_t>& raw, metadata_cache_t& target) {
+		inline bool parse_pe(const std::vector<uint8_t>& raw, metadata_cache_t& target,
+			bool flat_in_memory_layout)
+		{
 			if (raw.size() < sizeof(IMAGE_DOS_HEADER)) {
 				set_last_error("file_metadata_banner: file too small for DOS header");
 				return false;
@@ -438,7 +488,12 @@ namespace file_metadata_banner {
 			target.app_type = format_application_type(fh.Machine, fh.Characteristics, subsystem);
 			target.format_text = format_pe_format(fh.Machine);
 			target.compiler = detect_compiler(raw, pe_off, target.sections);
-			target.pdb_file_name = extract_pdb_path(raw, nt64, nt32, is_pe32_plus, target.sections);
+			std::string pdb_guid;
+			uint32_t pdb_age = 0;
+			target.pdb_file_name = extract_pdb_path(raw, nt64, nt32, is_pe32_plus,
+				target.sections, flat_in_memory_layout, &pdb_guid, &pdb_age);
+			target.pdb_guid = std::move(pdb_guid);
+			target.pdb_age = pdb_age;
 			return true;
 		}
 
@@ -458,19 +513,169 @@ namespace file_metadata_banner {
 			return true;
 		}
 
-		inline void run_compute(const std::string& path) {
+		inline bool read_image_in_memory(uint64_t module_base, uint32_t module_size,
+			std::vector<uint8_t>& out)
+		{
+			out.clear();
+			if (module_base == 0 || module_size == 0) {
+				set_last_error("file_metadata_banner: invalid module base/size");
+				return false;
+			}
+			if (!driver_bridge::can_read_memory()) {
+				set_last_error("file_metadata_banner: driver bridge unavailable for memory read");
+				return false;
+			}
+			std::vector<uint8_t> headers;
+			size_t header_read = (module_size < 0x1000u) ? static_cast<size_t>(module_size) : 0x1000u;
+			if (!driver_bridge::read_memory(module_base, header_read, headers) || headers.size() < sizeof(IMAGE_DOS_HEADER)) {
+				set_last_error("file_metadata_banner: cannot read PE headers from memory");
+				return false;
+			}
+			const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(headers.data());
+			if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+				set_last_error("file_metadata_banner: in-memory image lacks DOS signature");
+				return false;
+			}
+			uint32_t pe_off = static_cast<uint32_t>(dos->e_lfanew);
+			if (pe_off + sizeof(IMAGE_NT_HEADERS32) > headers.size()) {
+				set_last_error("file_metadata_banner: PE header truncated in memory snapshot");
+				return false;
+			}
+			const auto* nt_common = reinterpret_cast<const IMAGE_NT_HEADERS32*>(headers.data() + pe_off);
+			if (nt_common->Signature != IMAGE_NT_SIGNATURE) {
+				set_last_error("file_metadata_banner: NT signature invalid in memory snapshot");
+				return false;
+			}
+			const IMAGE_FILE_HEADER& fh = nt_common->FileHeader;
+			const uint16_t opt_magic = nt_common->OptionalHeader.Magic;
+			const bool is_pe32_plus = (opt_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC);
+			const bool is_pe32 = (opt_magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC);
+			if (!is_pe32_plus && !is_pe32) {
+				set_last_error("file_metadata_banner: optional header magic invalid in memory");
+				return false;
+			}
+			uint32_t size_of_image = 0;
+			uint32_t size_of_headers = 0;
+			if (is_pe32_plus) {
+				if (pe_off + sizeof(IMAGE_NT_HEADERS64) > headers.size()) {
+					set_last_error("file_metadata_banner: PE32+ header truncated in memory");
+					return false;
+				}
+				const auto* nt64 = reinterpret_cast<const IMAGE_NT_HEADERS64*>(headers.data() + pe_off);
+				size_of_image = nt64->OptionalHeader.SizeOfImage;
+				size_of_headers = nt64->OptionalHeader.SizeOfHeaders;
+			} else {
+				size_of_image = nt_common->OptionalHeader.SizeOfImage;
+				size_of_headers = nt_common->OptionalHeader.SizeOfHeaders;
+			}
+			if (size_of_image == 0 || size_of_image > module_size + 0x100000u) {
+				size_of_image = module_size;
+			}
+			if (size_of_image > 0x10000000u) size_of_image = 0x10000000u;
+
+			out.assign(size_of_image, 0);
+
+			size_t header_copy = headers.size();
+			if (header_copy > size_of_image) header_copy = size_of_image;
+			std::memcpy(out.data(), headers.data(), header_copy);
+
+			if (size_of_headers > 0 && size_of_headers <= size_of_image && size_of_headers > headers.size()) {
+				std::vector<uint8_t> ext_headers;
+				if (driver_bridge::read_memory(module_base + headers.size(),
+					static_cast<size_t>(size_of_headers) - headers.size(), ext_headers))
+				{
+					size_t copy = ext_headers.size();
+					if (copy + header_copy > size_of_image) copy = size_of_image - header_copy;
+					std::memcpy(out.data() + header_copy, ext_headers.data(), copy);
+				}
+			}
+
+			uint64_t sec_offset = static_cast<uint64_t>(pe_off)
+				+ offsetof(IMAGE_NT_HEADERS32, OptionalHeader)
+				+ fh.SizeOfOptionalHeader;
+			if (sec_offset + static_cast<uint64_t>(fh.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER) > out.size()) {
+				return true;
+			}
+			const auto* sec = reinterpret_cast<const IMAGE_SECTION_HEADER*>(out.data() + sec_offset);
+			const uint32_t nsec = fh.NumberOfSections > 96 ? 96 : fh.NumberOfSections;
+			for (uint32_t i = 0; i < nsec; ++i) {
+				uint32_t va = sec[i].VirtualAddress;
+				uint32_t vsize = sec[i].Misc.VirtualSize;
+				uint32_t rsize = sec[i].SizeOfRawData;
+				uint32_t want = (vsize > rsize) ? vsize : rsize;
+				if (want == 0) continue;
+				if (va == 0) continue;
+				if (static_cast<uint64_t>(va) + want > size_of_image) {
+					if (static_cast<uint64_t>(va) >= size_of_image) continue;
+					want = static_cast<uint32_t>(size_of_image - va);
+				}
+				constexpr size_t kChunk = 0x10000;
+				uint32_t copied = 0;
+				while (copied < want) {
+					size_t to_read = want - copied;
+					if (to_read > kChunk) to_read = kChunk;
+					std::vector<uint8_t> tmp;
+					if (!driver_bridge::read_memory(module_base + va + copied, to_read, tmp) || tmp.empty()) {
+						break;
+					}
+					size_t got = tmp.size();
+					if (got + copied > want) got = want - copied;
+					std::memcpy(out.data() + va + copied, tmp.data(), got);
+					copied += static_cast<uint32_t>(got);
+					if (got < to_read) break;
+				}
+			}
+			return true;
+		}
+
+		inline void apply_compute_failure_defaults(metadata_cache_t& target) {
+			if (target.compiler.empty()) target.compiler = "unknown";
+			if (target.os_type.empty()) target.os_type = "MS Windows";
+			if (target.app_type.empty()) target.app_type = "Executable";
+			if (target.format_text.empty()) target.format_text = "Portable executable (PE)";
+			if (target.pdb_file_name.empty()) target.pdb_file_name = "(none)";
+		}
+
+		inline void publish_result_locked(metadata_cache_t& staged) {
 			auto& c = cache();
+			std::lock_guard<std::mutex> lk(c.mtx);
+			c.source_kind = staged.source_kind;
+			c.source_path = std::move(staged.source_path);
+			c.source_size = staged.source_size;
+			c.source_write_time = staged.source_write_time;
+			c.live_module_base = staged.live_module_base;
+			c.live_module_size = staged.live_module_size;
+			c.live_pid = staged.live_pid;
+			c.file_name = std::move(staged.file_name);
+			c.sha256 = std::move(staged.sha256);
+			c.md5 = std::move(staged.md5);
+			c.crc32 = std::move(staged.crc32);
+			c.compiler = std::move(staged.compiler);
+			c.pdb_file_name = std::move(staged.pdb_file_name);
+			c.pdb_guid = std::move(staged.pdb_guid);
+			c.pdb_age = staged.pdb_age;
+			c.os_type = std::move(staged.os_type);
+			c.app_type = std::move(staged.app_type);
+			c.format_text = std::move(staged.format_text);
+			c.image_base = staged.image_base;
+			c.timestamp = staged.timestamp;
+			c.timestamp_text = std::move(staged.timestamp_text);
+			c.machine = staged.machine;
+			c.characteristics = staged.characteristics;
+			c.subsystem = staged.subsystem;
+			c.entry_point_rva = staged.entry_point_rva;
+			c.sections = std::move(staged.sections);
+			c.last_error = std::move(staged.last_error);
+			c.state.store(static_cast<int>(compute_state_t::ready), std::memory_order_release);
+		}
+
+		inline bool try_compute_from_disk(const std::string& path, metadata_cache_t& staged) {
 			std::vector<uint8_t> raw;
 			uint64_t fsize = 0;
 			uint64_t fwrite = 0;
-			if (!read_whole_file(path, raw, fsize, fwrite)) {
-				std::lock_guard<std::mutex> lk(c.mtx);
-				c.last_error = last_error_storage();
-				c.state.store(static_cast<int>(compute_state_t::failed), std::memory_order_release);
-				return;
-			}
+			if (!read_whole_file(path, raw, fsize, fwrite)) return false;
 
-			metadata_cache_t staged;
+			staged.source_kind = source_kind_t::disk_file;
 			staged.source_path = path;
 			staged.source_size = fsize;
 			staged.source_write_time = fwrite;
@@ -487,73 +692,126 @@ namespace file_metadata_banner {
 			staged.md5 = std::move(md5_hex);
 			staged.crc32 = std::move(crc_hex);
 
-			if (!parse_pe(raw, staged)) {
+			if (!parse_pe(raw, staged, false)) {
 				staged.last_error = last_error_storage();
-				if (staged.compiler.empty()) staged.compiler = "unknown";
-				if (staged.os_type.empty()) staged.os_type = "MS Windows";
-				if (staged.app_type.empty()) staged.app_type = "Executable";
-				if (staged.format_text.empty()) staged.format_text = "Portable executable (PE)";
-				if (staged.pdb_file_name.empty()) staged.pdb_file_name = "(none)";
+				apply_compute_failure_defaults(staged);
 			}
+			return true;
+		}
 
-			{
-				std::lock_guard<std::mutex> lk(c.mtx);
-				c.source_path = std::move(staged.source_path);
-				c.source_size = staged.source_size;
-				c.source_write_time = staged.source_write_time;
-				c.file_name = std::move(staged.file_name);
-				c.sha256 = std::move(staged.sha256);
-				c.md5 = std::move(staged.md5);
-				c.crc32 = std::move(staged.crc32);
-				c.compiler = std::move(staged.compiler);
-				c.pdb_file_name = std::move(staged.pdb_file_name);
-				c.os_type = std::move(staged.os_type);
-				c.app_type = std::move(staged.app_type);
-				c.format_text = std::move(staged.format_text);
-				c.image_base = staged.image_base;
-				c.timestamp = staged.timestamp;
-				c.timestamp_text = std::move(staged.timestamp_text);
-				c.machine = staged.machine;
-				c.characteristics = staged.characteristics;
-				c.subsystem = staged.subsystem;
-				c.entry_point_rva = staged.entry_point_rva;
-				c.sections = std::move(staged.sections);
-				c.last_error = std::move(staged.last_error);
-				c.state.store(static_cast<int>(compute_state_t::ready), std::memory_order_release);
+		inline bool try_compute_from_image(uint64_t module_base, uint32_t module_size,
+			uint32_t pid, const std::string& display_name, metadata_cache_t& staged)
+		{
+			std::vector<uint8_t> raw;
+			if (!read_image_in_memory(module_base, module_size, raw)) return false;
+
+			staged.source_kind = source_kind_t::live_image;
+			staged.source_path.clear();
+			staged.source_size = raw.size();
+			staged.source_write_time = 0;
+			staged.live_module_base = module_base;
+			staged.live_module_size = module_size;
+			staged.live_pid = pid;
+			staged.file_name = display_name;
+
+			std::string sha_hex;
+			std::string md5_hex;
+			std::string crc_hex;
+			if (!digest_with(EVP_sha256(), raw, sha_hex)) sha_hex = "(error)";
+			if (!digest_with(EVP_md5(), raw, md5_hex)) md5_hex = "(error)";
+			if (!compute_crc32(raw, crc_hex)) crc_hex = "(error)";
+			staged.sha256 = std::move(sha_hex);
+			staged.md5 = std::move(md5_hex);
+			staged.crc32 = std::move(crc_hex);
+
+			if (!parse_pe(raw, staged, true)) {
+				staged.last_error = last_error_storage();
+				apply_compute_failure_defaults(staged);
+			} else {
+				staged.image_base = module_base;
 			}
+			return true;
+		}
+
+		inline void run_compute_path(const std::string& path) {
+			metadata_cache_t staged;
+			if (!try_compute_from_disk(path, staged)) {
+				auto& c = cache();
+				std::lock_guard<std::mutex> lk(c.mtx);
+				c.last_error = last_error_storage();
+				c.source_kind = source_kind_t::disk_file;
+				c.source_path = path;
+				c.state.store(static_cast<int>(compute_state_t::failed), std::memory_order_release);
+				return;
+			}
+			publish_result_locked(staged);
+		}
+
+		inline void run_compute_image(uint64_t module_base, uint32_t module_size,
+			uint32_t pid, const std::string& display_name)
+		{
+			metadata_cache_t staged;
+			if (!try_compute_from_image(module_base, module_size, pid, display_name, staged)) {
+				auto& c = cache();
+				std::lock_guard<std::mutex> lk(c.mtx);
+				c.last_error = last_error_storage();
+				c.source_kind = source_kind_t::live_image;
+				c.live_module_base = module_base;
+				c.live_module_size = module_size;
+				c.live_pid = pid;
+				c.file_name = display_name;
+				c.state.store(static_cast<int>(compute_state_t::failed), std::memory_order_release);
+				return;
+			}
+			publish_result_locked(staged);
+		}
+
+		inline void reset_cache_locked(metadata_cache_t& c) {
+			c.source_kind = source_kind_t::none;
+			c.source_path.clear();
+			c.file_name.clear();
+			c.sha256.clear();
+			c.md5.clear();
+			c.crc32.clear();
+			c.compiler.clear();
+			c.pdb_file_name.clear();
+			c.pdb_guid.clear();
+			c.pdb_age = 0;
+			c.os_type.clear();
+			c.app_type.clear();
+			c.format_text.clear();
+			c.sections.clear();
+			c.last_error.clear();
+			c.image_base = 0;
+			c.timestamp = 0;
+			c.timestamp_text.clear();
+			c.machine = 0;
+			c.characteristics = 0;
+			c.subsystem = 0;
+			c.entry_point_rva = 0;
+			c.source_size = 0;
+			c.source_write_time = 0;
+			c.live_module_base = 0;
+			c.live_module_size = 0;
+			c.live_pid = 0;
 		}
 
 		inline void ensure_started_for(const std::string& path) {
+			if (path.empty()) return;
 			auto& c = cache();
 			bool need_dispatch = false;
 			{
 				std::lock_guard<std::mutex> lk(c.mtx);
 				const int st = c.state.load(std::memory_order_acquire);
+				const bool diff_target = (c.source_kind != source_kind_t::disk_file)
+					|| (c.source_path != path);
 				const bool fresh = (st == static_cast<int>(compute_state_t::idle))
-					|| (st == static_cast<int>(compute_state_t::failed) && c.source_path != path)
-					|| (st == static_cast<int>(compute_state_t::ready) && c.source_path != path);
+					|| (st == static_cast<int>(compute_state_t::failed) && diff_target)
+					|| (st == static_cast<int>(compute_state_t::ready) && diff_target);
 				if (fresh) {
+					reset_cache_locked(c);
+					c.source_kind = source_kind_t::disk_file;
 					c.source_path = path;
-					c.file_name.clear();
-					c.sha256.clear();
-					c.md5.clear();
-					c.crc32.clear();
-					c.compiler.clear();
-					c.pdb_file_name.clear();
-					c.os_type.clear();
-					c.app_type.clear();
-					c.format_text.clear();
-					c.sections.clear();
-					c.last_error.clear();
-					c.image_base = 0;
-					c.timestamp = 0;
-					c.timestamp_text.clear();
-					c.machine = 0;
-					c.characteristics = 0;
-					c.subsystem = 0;
-					c.entry_point_rva = 0;
-					c.source_size = 0;
-					c.source_write_time = 0;
 					c.state.store(static_cast<int>(compute_state_t::pending), std::memory_order_release);
 					need_dispatch = true;
 				}
@@ -561,23 +819,46 @@ namespace file_metadata_banner {
 			if (need_dispatch) {
 				std::string captured = path;
 				work_queue::post([captured]() {
-					run_compute(captured);
+					run_compute_path(captured);
 				});
 			}
 		}
 
-		inline void resolve_module_path(std::string& out_path, std::string& out_filename) {
-			out_path.clear();
-			out_filename.clear();
-			HMODULE mod = GetModuleHandleW(nullptr);
-			if (mod) {
-				char buf[MAX_PATH] = {};
-				DWORD got = GetModuleFileNameA(mod, buf, MAX_PATH);
-				if (got > 0 && got < MAX_PATH) {
-					out_path.assign(buf, got);
-					size_t sl = out_path.find_last_of("/\\");
-					out_filename = (sl != std::string::npos) ? out_path.substr(sl + 1) : out_path;
+		inline void ensure_started_for_image(uint64_t module_base, uint32_t module_size,
+			uint32_t pid, const std::string& display_name)
+		{
+			if (module_base == 0 || module_size == 0) return;
+			auto& c = cache();
+			bool need_dispatch = false;
+			{
+				std::lock_guard<std::mutex> lk(c.mtx);
+				const int st = c.state.load(std::memory_order_acquire);
+				const bool diff_target = (c.source_kind != source_kind_t::live_image)
+					|| (c.live_module_base != module_base)
+					|| (c.live_module_size != module_size)
+					|| (c.live_pid != pid);
+				const bool fresh = (st == static_cast<int>(compute_state_t::idle))
+					|| (st == static_cast<int>(compute_state_t::failed) && diff_target)
+					|| (st == static_cast<int>(compute_state_t::ready) && diff_target);
+				if (fresh) {
+					reset_cache_locked(c);
+					c.source_kind = source_kind_t::live_image;
+					c.live_module_base = module_base;
+					c.live_module_size = module_size;
+					c.live_pid = pid;
+					c.file_name = display_name;
+					c.state.store(static_cast<int>(compute_state_t::pending), std::memory_order_release);
+					need_dispatch = true;
 				}
+			}
+			if (need_dispatch) {
+				uint64_t base_c = module_base;
+				uint32_t size_c = module_size;
+				uint32_t pid_c = pid;
+				std::string name_c = display_name;
+				work_queue::post([base_c, size_c, pid_c, name_c]() {
+					run_compute_image(base_c, size_c, pid_c, name_c);
+				});
 			}
 		}
 
@@ -736,7 +1017,19 @@ namespace file_metadata_banner {
 				}
 			}
 
-			std::string file_name_disp = ready ? c.source_path : fallback_path;
+			std::string file_name_disp;
+			if (ready) {
+				if (c.source_kind == source_kind_t::live_image) {
+					if (!c.file_name.empty()) file_name_disp = c.file_name;
+					else file_name_disp = fallback_path;
+				} else {
+					if (!c.source_path.empty()) file_name_disp = c.source_path;
+					else if (!c.file_name.empty()) file_name_disp = c.file_name;
+					else file_name_disp = fallback_path;
+				}
+			} else {
+				file_name_disp = fallback_path;
+			}
 			if (file_name_disp.empty()) file_name_disp = "(unknown)";
 
 			std::snprintf(buf, sizeof(buf), "; File Name   : %s", file_name_disp.c_str());
@@ -808,28 +1101,8 @@ namespace file_metadata_banner {
 	inline void invalidate_cache() {
 		auto& c = detail::cache();
 		std::lock_guard<std::mutex> lk(c.mtx);
+		detail::reset_cache_locked(c);
 		c.state.store(static_cast<int>(compute_state_t::idle), std::memory_order_release);
-		c.source_path.clear();
-		c.file_name.clear();
-		c.sha256.clear();
-		c.md5.clear();
-		c.crc32.clear();
-		c.compiler.clear();
-		c.pdb_file_name.clear();
-		c.os_type.clear();
-		c.app_type.clear();
-		c.format_text.clear();
-		c.timestamp_text.clear();
-		c.sections.clear();
-		c.last_error.clear();
-		c.image_base = 0;
-		c.timestamp = 0;
-		c.machine = 0;
-		c.characteristics = 0;
-		c.subsystem = 0;
-		c.entry_point_rva = 0;
-		c.source_size = 0;
-		c.source_write_time = 0;
 	}
 
 	inline const std::string& last_error() {
@@ -839,23 +1112,17 @@ namespace file_metadata_banner {
 	inline void render() {
 		auto& c = detail::cache();
 
-		std::string mod_path;
-		std::string mod_name;
-		detail::resolve_module_path(mod_path, mod_name);
-
-		if (mod_path.empty()) {
+		std::string fallback_path;
+		{
 			std::lock_guard<std::mutex> lk(c.mtx);
-			if (!c.source_path.empty())
-				mod_path = c.source_path;
+			if (!c.source_path.empty()) fallback_path = c.source_path;
+			else if (!c.file_name.empty()) fallback_path = c.file_name;
 		}
-
-		if (!mod_path.empty())
-			detail::ensure_started_for(mod_path);
 
 		std::vector<detail::line_t> lines;
 		{
 			std::lock_guard<std::mutex> lk(c.mtx);
-			detail::build_lines(c, mod_path, lines);
+			detail::build_lines(c, fallback_path, lines);
 		}
 
 		if (lines.empty()) return;

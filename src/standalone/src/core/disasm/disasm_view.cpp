@@ -3,6 +3,7 @@
 #include "zydis_disasm.hpp"
 #include "standalone_driver.hpp"
 #include "../helpers/globals.h"
+#include "../helpers/diag_log.hpp"
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 #include <Windows.h>
@@ -12,14 +13,22 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <mutex>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
+#include "../../helpers/helpers.h"
 #include "ui_anim.hpp"
 #include "decompiler_engine.hpp"
+#include "pseudocode_view.hpp"
 #include "aob_generator.hpp"
 #include "scan_hub_view.hpp"
 #include "standalone_settings.hpp"
 #include "symbol_store.hpp"
+#include "auto_comment_store.hpp"
+#include "builtin_typelib.hpp"
+#include "event_bus.hpp"
+#include "pdb_events.hpp"
 #include "xref_engine.hpp"
 #include "cfg_view.hpp"
 #include "comment_dialog.hpp"
@@ -28,10 +37,10 @@
 #include "rename_store.hpp"
 #include "source_reconstruct_view.hpp"
 #include "disasm_theme.hpp"
-#include "file_metadata_banner.hpp"
 #include "xref_index.hpp"
 #include "function_index.hpp"
 #include "symbol_classifier.hpp"
+#include "file_metadata_banner.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/motion.hpp"
 #include "../ui/clock.hpp"
@@ -42,14 +51,26 @@
 #include "../ui/skeleton.hpp"
 #include "../ui/fonts.hpp"
 
+extern DisasmState g_disasm;
+
 namespace disasm_view {
 
 static float s_xref_anim_t = 0.f;
 static float s_first_load_anim = 0.f;
 static int   s_last_known_n = 0;
 static std::unordered_map<int, aida::ui::hover_state_t> s_row_hover;
+static std::unordered_map<int, aida::ui::hover_state_t> s_banner_row_hover;
 static std::unordered_map<int, float> s_row_entrance;
 static aida::ui::flash_t s_branch_flash;
+
+struct banner_line_t {
+    std::string text;
+    ImU32       color = 0;
+    bool        is_directive = false;
+};
+static std::vector<banner_line_t> s_banner_cache;
+static int s_banner_line_count = 0;
+static std::atomic<uint64_t> s_banner_cache_signature{0};
 
 static std::atomic<uint64_t> s_throttle_until_ns{0};
 static std::atomic<uint32_t> s_last_attached_pid{0xFFFFFFFFu};
@@ -76,6 +97,28 @@ static inline void throttle_arm(uint64_t window_ms) {
     s_throttle_until_ns.store(now_ns() + window_ms * 1000000ull, std::memory_order_release);
 }
 
+static void copy_text_to_clipboard(const std::string& text)
+{
+#ifdef _WIN32
+    if (!::OpenClipboard(nullptr)) return;
+    ::EmptyClipboard();
+    HGLOBAL hg = ::GlobalAlloc(GMEM_MOVEABLE, text.size() + 1);
+    if (hg) {
+        if (auto* p = ::GlobalLock(hg)) {
+            std::memcpy(p, text.c_str(), text.size() + 1);
+            ::GlobalUnlock(hg);
+            if (!::SetClipboardData(CF_TEXT, hg))
+                ::GlobalFree(hg);
+        } else {
+            ::GlobalFree(hg);
+        }
+    }
+    ::CloseClipboard();
+#else
+    (void)text;
+#endif
+}
+
 struct colored_run_t {
     ImU32       color = 0;
     std::string text;
@@ -90,6 +133,8 @@ struct instr_cache_entry_t {
     std::vector<colored_run_t>                     ops_runs;
     std::vector<float>                             ops_run_widths;
     float                                          ops_total_width = 0.f;
+    bool                                           mnem_valid = false;
+    std::string                                    mnem_str;
     bool                                           bytes_valid = false;
     std::string                                    bytes_str;
     bool                                           inj_valid = false;
@@ -116,6 +161,10 @@ struct instr_cache_entry_t {
 
 static std::unordered_map<uint64_t, instr_cache_entry_t> s_instr_cache_hot;
 static std::unordered_map<uint64_t, instr_cache_entry_t> s_instr_cache_cold;
+
+static std::atomic<bool>                       s_pdb_subscriptions_armed{false};
+static aida::events::subscription_handle_t     s_pdb_loaded_subscription;
+static aida::events::subscription_handle_t     s_pdb_unloaded_subscription;
 
 static inline void instr_cache_clear_all() {
     s_instr_cache_hot.clear();
@@ -161,6 +210,8 @@ static inline instr_cache_entry_t& instr_cache_slot(uint64_t addr, uint32_t gen,
         e.ops_runs.clear();
         e.ops_run_widths.clear();
         e.ops_total_width = 0.f;
+        e.mnem_valid = false;
+        e.mnem_str.clear();
         e.bytes_valid = false;
         e.bytes_str.clear();
         e.inj_valid = false;
@@ -189,6 +240,47 @@ static inline instr_cache_entry_t& instr_cache_slot(uint64_t addr, uint32_t gen,
 
 void bump_format_generation() {
     s_format_gen.fetch_add(1u, std::memory_order_release);
+}
+
+static void on_pdb_loaded_event(const aida::events::event_pdb_loaded& ev) {
+    if (!ev.success) return;
+    bump_format_generation();
+}
+
+static void on_pdb_unloaded_event(const aida::events::event_pdb_unloaded& ev) {
+    if (ev.module_name.empty()) {
+        auto_comment_store::clear();
+    } else {
+        auto mod = symbol_classifier::find_module_by_name(ev.module_name);
+        if (mod && mod->size > 0) {
+            auto_comment_store::clear_module(mod->base, mod->size);
+        }
+    }
+    bump_format_generation();
+}
+
+static void ensure_pdb_event_subscriptions() {
+    if (s_pdb_subscriptions_armed.load(std::memory_order_acquire)) return;
+    bool expected = false;
+    if (!s_pdb_subscriptions_armed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+
+    s_pdb_loaded_subscription = aida::events::subscribe(
+        aida::events::event_pdb_loaded_def,
+        [](const aida::events::event_pdb_loaded& ev) {
+            on_pdb_loaded_event(ev);
+        });
+
+    s_pdb_unloaded_subscription = aida::events::subscribe(
+        aida::events::event_pdb_unloaded_def,
+        [](const aida::events::event_pdb_unloaded& ev) {
+            on_pdb_unloaded_event(ev);
+        });
+
+    symbol_classifier::subscribe_pdb_events();
+
+    if (!s_pdb_loaded_subscription.valid() && !s_pdb_unloaded_subscription.valid()) {
+        s_pdb_subscriptions_armed.store(false, std::memory_order_release);
+    }
 }
 
 static void on_attach_state_changed() {
@@ -231,6 +323,17 @@ struct frame_var_cache_t {
     uint64_t                                            func_start = 0;
     std::unordered_map<int64_t, std::string>            offset_to_name;
     std::unordered_map<int64_t, uint32_t>               offset_to_size;
+    std::unordered_map<uint64_t, std::string>           rsp_access_at_va;
+    std::unordered_map<uint64_t, std::string>           mnem_override_at_va;
+    int64_t                                             entry_to_exit_sp_delta = 0;
+    uint64_t                                            prologue_locals_size = 0;
+    uint32_t                                            saved_reg_count = 0;
+    bool                                                bp_based = false;
+    bool                                                sp_based = false;
+    bool                                                sp_analysis_failed = false;
+    bool                                                is_entry_stub = false;
+    bool                                                is_user_main = false;
+    std::string                                         user_main_kind;
     bool                                                resolved = false;
 };
 
@@ -309,6 +412,17 @@ static void prime_var_cache(uint64_t func_start) {
     c.func_start = func_start;
     c.offset_to_name.clear();
     c.offset_to_size.clear();
+    c.rsp_access_at_va.clear();
+    c.mnem_override_at_va.clear();
+    c.entry_to_exit_sp_delta = 0;
+    c.prologue_locals_size = 0;
+    c.saved_reg_count = 0;
+    c.bp_based = false;
+    c.sp_based = false;
+    c.sp_analysis_failed = false;
+    c.is_entry_stub = false;
+    c.is_user_main = false;
+    c.user_main_kind.clear();
     c.resolved = true;
     if (func_start == 0) return;
 
@@ -316,16 +430,49 @@ static void prime_var_cache(uint64_t func_start) {
     std::shared_lock<std::shared_mutex> lk(fc.mutex);
     auto it = fc.by_start.find(func_start);
     if (it == fc.by_start.end()) return;
-    for (const auto& v : it->second.vars) {
+    const auto& rec = it->second;
+    for (const auto& v : rec.vars) {
         c.offset_to_name[v.offset] = v.name;
         c.offset_to_size[v.offset] = v.size;
     }
+    c.rsp_access_at_va = rec.rsp_access_substitution;
+    c.mnem_override_at_va = rec.insn_kind_override;
+    c.entry_to_exit_sp_delta = rec.entry_to_exit_sp_delta;
+    c.prologue_locals_size = rec.prologue_locals_size;
+    c.bp_based = rec.bp_based;
+    c.sp_based = rec.sp_based;
+    c.sp_analysis_failed = rec.sp_analysis_failed;
+    c.is_entry_stub = rec.is_entry_stub;
+    c.is_user_main = rec.is_user_main;
+    c.user_main_kind = rec.user_main_kind;
+    uint32_t cnt = 0;
+    for (const auto& kv : rec.insn_kind_override) {
+        const std::string& s = kv.second;
+        if (s.size() >= 2 && s[0] == 'r' && s[1] == '_') ++cnt;
+    }
+    c.saved_reg_count = cnt;
 }
 
 static bool lookup_named_offset(int64_t offset, std::string& out_name) {
     auto& c = var_cache_slot();
     auto it = c.offset_to_name.find(offset);
     if (it == c.offset_to_name.end()) return false;
+    out_name = it->second;
+    return true;
+}
+
+static bool lookup_rsp_substitution_at(uint64_t va, std::string& out_name) {
+    auto& c = var_cache_slot();
+    auto it = c.rsp_access_at_va.find(va);
+    if (it == c.rsp_access_at_va.end()) return false;
+    out_name = it->second;
+    return true;
+}
+
+static bool lookup_mnem_override_at(uint64_t va, std::string& out_name) {
+    auto& c = var_cache_slot();
+    auto it = c.mnem_override_at_va.find(va);
+    if (it == c.mnem_override_at_va.end()) return false;
     out_name = it->second;
     return true;
 }
@@ -343,6 +490,417 @@ static bool parse_signed_hex_after(const char* p, int64_t& out) {
     if (sign == '-') sv = -sv;
     out = sv;
     return true;
+}
+
+static int extract_operand_size(const std::string& ops, size_t before_pos)
+{
+    static const struct { const char* tag; int size; } kTable[] = {
+        { "zmmword ptr", 64 },
+        { "ymmword ptr", 32 },
+        { "xmmword ptr", 16 },
+        { "tbyte ptr",   10 },
+        { "qword ptr",    8 },
+        { "fword ptr",    6 },
+        { "dword ptr",    4 },
+        { "word ptr",     2 },
+        { "byte ptr",     1 }
+    };
+    if (before_pos == 0 || before_pos > ops.size()) return 0;
+    std::string head = ops.substr(0, before_pos);
+    for (auto& e : kTable) {
+        size_t pos = 0;
+        size_t taglen = std::strlen(e.tag);
+        while ((pos = head.find(e.tag, pos)) != std::string::npos) {
+            bool prev_ok = (pos == 0)
+                || !((head[pos - 1] >= 'a' && head[pos - 1] <= 'z')
+                  || (head[pos - 1] >= 'A' && head[pos - 1] <= 'Z')
+                  || (head[pos - 1] >= '0' && head[pos - 1] <= '9')
+                  || head[pos - 1] == '_');
+            if (prev_ok) return e.size;
+            pos += taglen;
+        }
+    }
+    return 0;
+}
+
+static std::string synthesize_data_name(uint64_t target, int op_size,
+                                        symbol_classifier::kind_t k)
+{
+    char syn[64];
+    if (k == symbol_classifier::kind_t::string
+        || k == symbol_classifier::kind_t::string_ascii
+        || k == symbol_classifier::kind_t::string_unicode) {
+        std::snprintf(syn, sizeof(syn), "asc_%llX",
+            static_cast<unsigned long long>(target));
+        return syn;
+    }
+    if (k == symbol_classifier::kind_t::external_import
+        || k == symbol_classifier::kind_t::imp_function) {
+        std::snprintf(syn, sizeof(syn), "__imp_unk_%llX",
+            static_cast<unsigned long long>(target));
+        return syn;
+    }
+    if (op_size > 0) {
+        std::snprintf(syn, sizeof(syn), "%s_%llX",
+            symbol_classifier::data_prefix_for_size(op_size),
+            static_cast<unsigned long long>(target));
+        return syn;
+    }
+    if (k == symbol_classifier::kind_t::data
+        || k == symbol_classifier::kind_t::data_byte
+        || k == symbol_classifier::kind_t::data_word
+        || k == symbol_classifier::kind_t::data_dword
+        || k == symbol_classifier::kind_t::data_qword
+        || k == symbol_classifier::kind_t::data_xmmword
+        || k == symbol_classifier::kind_t::data_ymmword
+        || k == symbol_classifier::kind_t::data_zmmword
+        || k == symbol_classifier::kind_t::data_tbyte
+        || k == symbol_classifier::kind_t::data_unknown) {
+        std::snprintf(syn, sizeof(syn), "unk_%llX",
+            static_cast<unsigned long long>(target));
+        return syn;
+    }
+    if (k == symbol_classifier::kind_t::regular_function
+        || k == symbol_classifier::kind_t::library_function
+        || k == symbol_classifier::kind_t::lumina_function
+        || k == symbol_classifier::kind_t::label) {
+        std::snprintf(syn, sizeof(syn), "sub_%llX",
+            static_cast<unsigned long long>(target));
+        return syn;
+    }
+    return std::string();
+}
+
+static std::string resolve_or_synthesize_data(uint64_t target, int op_size)
+{
+    std::string sym = symbol_store::resolve_symbol_exact(target);
+    if (sym.empty()) sym = symbol_store::resolve_symbol(target);
+    symbol_classifier::kind_t k = symbol_classifier::classify(target);
+    if (sym.empty()) {
+        if (k == symbol_classifier::kind_t::regular_function
+            || k == symbol_classifier::kind_t::library_function
+            || k == symbol_classifier::kind_t::lumina_function
+            || k == symbol_classifier::kind_t::entry_point
+            || k == symbol_classifier::kind_t::main_function
+            || k == symbol_classifier::kind_t::winmain_function
+            || k == symbol_classifier::kind_t::dllmain_function
+            || k == symbol_classifier::kind_t::jump_thunk
+            || k == symbol_classifier::kind_t::label) {
+            sym = function_index::synthetic_name(target);
+        }
+        if (sym.empty()) {
+            sym = synthesize_data_name(target, op_size, k);
+        }
+    }
+    if (!sym.empty()) {
+        auto bang = sym.find('!');
+        if (bang != std::string::npos) sym = sym.substr(bang + 1);
+        if ((k == symbol_classifier::kind_t::external_import
+             || k == symbol_classifier::kind_t::imp_function)
+            && sym.compare(0, 6, "__imp_") != 0) {
+            sym = "__imp_" + sym;
+        }
+    }
+    return sym;
+}
+
+static bool parse_signed_hex_run(const char* p, size_t avail, int64_t& out, size_t& consumed)
+{
+    if (avail == 0) return false;
+    size_t i = 0;
+    int sign = 0;
+    if (p[i] == '+' || p[i] == '-') { sign = (p[i] == '-') ? -1 : 1; ++i; if (i >= avail) return false; }
+    while (i < avail && p[i] == ' ') ++i;
+    if (i + 1 >= avail) return false;
+    if (p[i] != '0' || (p[i + 1] != 'x' && p[i + 1] != 'X')) return false;
+    i += 2;
+    size_t hex_start = i;
+    while (i < avail) {
+        char c = p[i];
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+            ++i;
+        } else {
+            break;
+        }
+    }
+    if (i == hex_start) return false;
+    char buf[24];
+    size_t hl = i - hex_start;
+    if (hl >= sizeof(buf)) hl = sizeof(buf) - 1;
+    std::memcpy(buf, p + hex_start, hl);
+    buf[hl] = '\0';
+    unsigned long long v = std::strtoull(buf, nullptr, 16);
+    int64_t sv = static_cast<int64_t>(v);
+    if (sign < 0) sv = -sv;
+    out = sv;
+    consumed = i;
+    return true;
+}
+
+static bool lookup_struct_field_at_base_va(uint64_t base_va, int64_t disp, int op_size,
+                                           std::string& out_struct_name, std::string& out_field_name)
+{
+    out_struct_name.clear();
+    out_field_name.clear();
+    if (base_va == 0 || disp < 0) return false;
+
+    auto mod = symbol_classifier::find_module_by_address(base_va);
+    if (!mod) return false;
+
+    auto bindings = symbol_classifier::get_struct_bindings(mod);
+    if (!bindings || bindings->empty()) return false;
+
+    const symbol_classifier::detail::struct_binding_t* match = nullptr;
+    for (const auto& kv : *bindings) {
+        if (kv.second.base_va == base_va) {
+            match = &kv.second;
+            break;
+        }
+    }
+    if (!match) return false;
+
+    const uint32_t udisp = static_cast<uint32_t>(disp);
+    auto it = match->field_by_offset.find(udisp);
+    if (it != match->field_by_offset.end()) {
+        const auto& field = match->fields[it->second];
+        if (op_size > 0 && field.size > 0
+            && static_cast<uint32_t>(op_size) != field.size) {
+            return false;
+        }
+        out_struct_name = match->struct_name;
+        out_field_name = field.name;
+        return !out_field_name.empty();
+    }
+
+    for (const auto& f : match->fields) {
+        if (f.size == 0) continue;
+        if (udisp < f.offset || udisp >= f.offset + f.size) continue;
+        const uint32_t inner = udisp - f.offset;
+        if (op_size > 0 && static_cast<uint32_t>(op_size) > f.size - inner) continue;
+        out_struct_name = match->struct_name;
+        if (inner == 0) {
+            out_field_name = f.name;
+        } else {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "%s+0x%X", f.name.c_str(),
+                static_cast<unsigned>(inner));
+            out_field_name.assign(buf);
+        }
+        return !out_field_name.empty();
+    }
+
+    return false;
+}
+
+static bool resolve_struct_binding_by_name(std::string_view sym, uint64_t& out_base_va,
+                                           std::string& out_struct_name)
+{
+    out_base_va = 0;
+    out_struct_name.clear();
+    if (sym.empty()) return false;
+
+    if (sym.size() > 5 && (sym[0] == 's' || sym[0] == 'S')
+        && (sym[1] == 't' || sym[1] == 'T')
+        && (sym[2] == 'r' || sym[2] == 'R')
+        && (sym[3] == 'u' || sym[3] == 'U')
+        && sym[4] == '_') {
+        std::string hex_part(sym.substr(5));
+        if (!hex_part.empty()) {
+            char* end = nullptr;
+            uint64_t va = std::strtoull(hex_part.c_str(), &end, 16);
+            if (end && *end == '\0' && va != 0) {
+                out_base_va = va;
+                return true;
+            }
+        }
+    }
+
+    std::string sym_str(sym);
+    uint64_t addr = symbol_store::resolve_name_to_addr(sym_str);
+    if (addr == 0) return false;
+
+    auto mod = symbol_classifier::find_module_by_address(addr);
+    if (!mod) return false;
+    auto bindings = symbol_classifier::get_struct_bindings(mod);
+    if (!bindings) return false;
+    for (const auto& kv : *bindings) {
+        if (kv.second.base_va == addr) {
+            out_base_va = addr;
+            out_struct_name = kv.second.struct_name;
+            return true;
+        }
+    }
+    return false;
+}
+
+static inline bool is_ident_start_char(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+}
+
+static inline bool is_ident_body_char(char c) {
+    return is_ident_start_char(c) || (c >= '0' && c <= '9') || c == '!';
+}
+
+static inline bool is_hex_digit_char(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+namespace ida_demangle {
+
+using PFN_UnDecorateSymbolName = DWORD (WINAPI*)(PCSTR DecoratedName, PSTR UnDecoratedName, DWORD UndecoratedLength, DWORD Flags);
+
+static std::once_flag s_dbghelp_init_once;
+static PFN_UnDecorateSymbolName s_pfn_undecorate = nullptr;
+
+static void init_undecorate() {
+    std::call_once(s_dbghelp_init_once, []() {
+        HMODULE h = GetModuleHandleW(L"dbghelp.dll");
+        if (!h) h = LoadLibraryW(L"dbghelp.dll");
+        if (h) {
+            s_pfn_undecorate = reinterpret_cast<PFN_UnDecorateSymbolName>(
+                GetProcAddress(h, "UnDecorateSymbolName"));
+        }
+    });
+}
+
+static bool demangle_msvc(const std::string& mangled, std::string& out_pretty) {
+    out_pretty.clear();
+    if (mangled.empty()) return false;
+    if (mangled[0] != '?' && mangled.compare(0, 2, "_?") != 0) return false;
+    init_undecorate();
+    if (!s_pfn_undecorate) return false;
+    constexpr DWORD UNDNAME_COMPLETE = 0x0000;
+    constexpr DWORD UNDNAME_NO_LEADING_UNDERSCORES = 0x0001;
+    constexpr DWORD UNDNAME_NO_MS_KEYWORDS = 0x0002;
+    constexpr DWORD UNDNAME_NO_FUNCTION_RETURNS = 0x0004;
+    constexpr DWORD UNDNAME_NO_ALLOCATION_MODEL = 0x0008;
+    constexpr DWORD UNDNAME_NO_ALLOCATION_LANGUAGE = 0x0010;
+    constexpr DWORD UNDNAME_NO_THISTYPE = 0x0060;
+    constexpr DWORD UNDNAME_NO_ACCESS_SPECIFIERS = 0x0080;
+    constexpr DWORD UNDNAME_NO_THROW_SIGNATURES = 0x0100;
+    constexpr DWORD UNDNAME_NO_MEMBER_TYPE = 0x0200;
+    constexpr DWORD UNDNAME_NO_RETURN_UDT_MODEL = 0x0400;
+    DWORD flags = UNDNAME_COMPLETE
+        | UNDNAME_NO_LEADING_UNDERSCORES
+        | UNDNAME_NO_MS_KEYWORDS
+        | UNDNAME_NO_FUNCTION_RETURNS
+        | UNDNAME_NO_ALLOCATION_MODEL
+        | UNDNAME_NO_ALLOCATION_LANGUAGE
+        | UNDNAME_NO_THISTYPE
+        | UNDNAME_NO_ACCESS_SPECIFIERS
+        | UNDNAME_NO_THROW_SIGNATURES
+        | UNDNAME_NO_MEMBER_TYPE
+        | UNDNAME_NO_RETURN_UDT_MODEL;
+    char buf[1024] = {};
+    DWORD r = s_pfn_undecorate(mangled.c_str(), buf, static_cast<DWORD>(sizeof(buf)), flags);
+    if (r == 0) return false;
+    out_pretty.assign(buf, r);
+    if (out_pretty.empty()) return false;
+    if (out_pretty == mangled) return false;
+    return true;
+}
+
+}
+
+namespace ida_api_args {
+
+struct api_arg_table_t {
+    const char* name;
+    const char* args[8];
+};
+
+static const api_arg_table_t kApiArgs[] = {
+    { "??2@YAPEAX_K@Z",            { "Size", nullptr } },
+    { "operator new",               { "Size", nullptr } },
+    { "??3@YAXPEAX_K@Z",            { "Block", "Size", nullptr } },
+    { "operator delete",            { "Block", nullptr } },
+    { "memcpy",                     { "Dst", "Src", "Size", nullptr } },
+    { "memcpy_s",                   { "Dst", "DstSize", "Src", "Size", nullptr } },
+    { "memmove",                    { "Dst", "Src", "Size", nullptr } },
+    { "memset",                     { "Dst", "Val", "Size", nullptr } },
+    { "memcmp",                     { "Buf1", "Buf2", "Size", nullptr } },
+    { "strcpy",                     { "Dst", "Src", nullptr } },
+    { "strcpy_s",                   { "Dst", "DstSize", "Src", nullptr } },
+    { "strncpy",                    { "Dst", "Src", "Size", nullptr } },
+    { "strcat",                     { "Dst", "Src", nullptr } },
+    { "strlen",                     { "Str", nullptr } },
+    { "strcmp",                     { "Str1", "Str2", nullptr } },
+    { "strncmp",                    { "Str1", "Str2", "Size", nullptr } },
+    { "_invoke_watson",             { "Expression", "FunctionName", "FileName", "LineNo", "Reserved", nullptr } },
+    { "atexit",                     { "Func", nullptr } },
+    { "_CxxThrowException",         { "ThrowInfo", "Object", nullptr } },
+    { "RaiseException",             { "ExceptionCode", "ExceptionFlags", "NumberOfArguments", "Arguments", nullptr } },
+    { "HeapAlloc",                  { "hHeap", "dwFlags", "dwBytes", nullptr } },
+    { "HeapFree",                   { "hHeap", "dwFlags", "lpMem", nullptr } },
+    { "HeapReAlloc",                { "hHeap", "dwFlags", "lpMem", "dwBytes", nullptr } },
+    { "VirtualAlloc",               { "lpAddress", "dwSize", "flAllocationType", "flProtect", nullptr } },
+    { "VirtualFree",                { "lpAddress", "dwSize", "dwFreeType", nullptr } },
+    { "VirtualProtect",             { "lpAddress", "dwSize", "flNewProtect", "lpflOldProtect", nullptr } },
+    { "LoadLibraryA",               { "lpLibFileName", nullptr } },
+    { "LoadLibraryW",               { "lpLibFileName", nullptr } },
+    { "LoadLibraryExA",             { "lpLibFileName", "hFile", "dwFlags", nullptr } },
+    { "LoadLibraryExW",             { "lpLibFileName", "hFile", "dwFlags", nullptr } },
+    { "GetProcAddress",             { "hModule", "lpProcName", nullptr } },
+    { "GetModuleHandleA",           { "lpModuleName", nullptr } },
+    { "GetModuleHandleW",           { "lpModuleName", nullptr } },
+    { "CreateFileA",                { "lpFileName", "dwDesiredAccess", "dwShareMode", "lpSecurityAttributes", "dwCreationDisposition", "dwFlagsAndAttributes", "hTemplateFile", nullptr } },
+    { "CreateFileW",                { "lpFileName", "dwDesiredAccess", "dwShareMode", "lpSecurityAttributes", "dwCreationDisposition", "dwFlagsAndAttributes", "hTemplateFile", nullptr } },
+    { "ReadFile",                   { "hFile", "lpBuffer", "nNumberOfBytesToRead", "lpNumberOfBytesRead", "lpOverlapped", nullptr } },
+    { "WriteFile",                  { "hFile", "lpBuffer", "nNumberOfBytesToWrite", "lpNumberOfBytesWritten", "lpOverlapped", nullptr } },
+    { "CloseHandle",                { "hObject", nullptr } },
+    { "SetFilePointerEx",           { "hFile", "liDistanceToMove", "lpNewFilePointer", "dwMoveMethod", nullptr } },
+    { "GetLastError",               { nullptr } },
+    { "SetLastError",               { "dwErrCode", nullptr } },
+    { "ExitProcess",                { "uExitCode", nullptr } },
+    { "TerminateProcess",           { "hProcess", "uExitCode", nullptr } },
+};
+
+static const char* const* args_for(const std::string& fname) {
+    if (fname.empty()) return nullptr;
+    for (const auto& e : kApiArgs) {
+        if (fname == e.name) return e.args;
+    }
+    if (fname.size() > 2 && fname[0] == '_' && fname[1] != '_') {
+        std::string alt = fname.substr(1);
+        for (const auto& e : kApiArgs) {
+            if (alt == e.name) return e.args;
+        }
+    }
+    return nullptr;
+}
+
+}
+
+static std::string strip_module_prefix_fast(std::string s) {
+    auto bang = s.find('!');
+    if (bang != std::string::npos) s = s.substr(bang + 1);
+    return s;
+}
+
+static std::string resolve_import_via_iat(uint64_t iat_va) {
+    if (iat_va == 0) return std::string();
+    std::string name;
+    if (symbol_classifier::lookup_import_by_iat(iat_va, name) && !name.empty()) {
+        return strip_module_prefix_fast(name);
+    }
+    return std::string();
+}
+
+static std::string demangle_or_self(const std::string& name) {
+    std::string out;
+    if (name.empty()) return name;
+    if (name[0] != '?' && (name.size() < 2 || name[0] != '_' || name[1] != '?')) return name;
+    if (ida_demangle::demangle_msvc(name, out) && !out.empty()) return out;
+    return name;
+}
+
+static std::string demangle_tail_comment(const std::string& mangled) {
+    if (mangled.empty()) return std::string();
+    if (mangled[0] != '?' && (mangled.size() < 2 || mangled[0] != '_' || mangled[1] != '?')) return std::string();
+    std::string pretty;
+    if (!ida_demangle::demangle_msvc(mangled, pretty)) return std::string();
+    if (pretty.empty() || pretty == mangled) return std::string();
+    return pretty;
 }
 
 static std::string substitute_operand_text(const AsmInstr& ins, const DisasmFile& file)
@@ -373,6 +931,11 @@ static std::string substitute_operand_text(const AsmInstr& ins, const DisasmFile
         uint64_t target = ins.branch_target;
         std::string sym = function_index::synthetic_name(target);
         if (!sym.empty()) {
+            symbol_classifier::kind_t k = symbol_classifier::classify(target);
+            if (k == symbol_classifier::kind_t::external_import) {
+                if (sym.compare(0, 6, "__imp_") != 0)
+                    sym = "__imp_" + sym;
+            }
             base = try_replace_hex(base, target, sym);
         }
     }
@@ -399,6 +962,45 @@ static std::string substitute_operand_text(const AsmInstr& ins, const DisasmFile
     }
 
     {
+        std::string rsp_named;
+        if (lookup_rsp_substitution_at(ins.addr, rsp_named) && !rsp_named.empty()) {
+            size_t sp_pos = base.find("[rsp");
+            size_t alt_pos = base.find("[esp");
+            if (sp_pos == std::string::npos
+                || (alt_pos != std::string::npos && alt_pos < sp_pos))
+            {
+                sp_pos = alt_pos;
+            }
+            if (sp_pos != std::string::npos) {
+                size_t close = base.find(']', sp_pos);
+                if (close != std::string::npos) {
+                    size_t after_reg = sp_pos + 4;
+                    if (after_reg < base.size()
+                        && (base[after_reg] == ']'
+                            || base[after_reg] == '+'
+                            || base[after_reg] == '-'))
+                    {
+                        int64_t entry_rel = 0;
+                        uint64_t func_start = 0;
+                        uint64_t locals_size = 0;
+                        std::string prefix;
+                        if (function_index::rsp_entry_relative_at(ins.addr, &entry_rel,
+                            &func_start, &locals_size) && locals_size != 0)
+                        {
+                            char hb[24];
+                            std::snprintf(hb, sizeof(hb), "%llXh",
+                                static_cast<unsigned long long>(locals_size));
+                            prefix = std::string("+") + hb;
+                        }
+                        std::string repl = "[rsp" + prefix + "+" + rsp_named;
+                        base = base.substr(0, sp_pos) + repl + base.substr(close);
+                    }
+                }
+            }
+        }
+    }
+
+    {
         size_t ds_pos = base.find("ds:0x");
         if (ds_pos != std::string::npos) {
             size_t hex_start = ds_pos + 5;
@@ -406,11 +1008,9 @@ static std::string substitute_operand_text(const AsmInstr& ins, const DisasmFile
             if (sscanf_s(base.c_str() + hex_start - 2, "%llx", &target) == 1
                 && target != 0)
             {
-                std::string sym = symbol_store::resolve_symbol_exact(target);
-                if (sym.empty()) sym = symbol_store::resolve_symbol(target);
+                int op_size = extract_operand_size(base, ds_pos);
+                std::string sym = resolve_or_synthesize_data(target, op_size);
                 if (!sym.empty()) {
-                    auto bang = sym.find('!');
-                    if (bang != std::string::npos) sym = sym.substr(bang + 1);
                     char hex_b[32];
                     std::snprintf(hex_b, sizeof(hex_b), "0x%llX",
                         static_cast<unsigned long long>(target));
@@ -430,25 +1030,907 @@ static std::string substitute_operand_text(const AsmInstr& ins, const DisasmFile
         }
     }
 
+    {
+        size_t scan_pos = 0;
+        while (scan_pos < base.size()) {
+            size_t rip_pos = base.find("[rip", scan_pos);
+            if (rip_pos == std::string::npos) break;
+            size_t after_rip = rip_pos + 4;
+            while (after_rip < base.size() && base[after_rip] == ' ') ++after_rip;
+            if (after_rip >= base.size() || (base[after_rip] != '+' && base[after_rip] != '-')) {
+                size_t close = base.find(']', rip_pos);
+                if (close == std::string::npos) break;
+                std::string repl = "[rip";
+                size_t take_end = close;
+                size_t close_pos = base.find(']', after_rip);
+                if (close_pos != std::string::npos && after_rip == close_pos) {
+                    uint64_t target = ins.addr + ins.len;
+                    int op_size = extract_operand_size(base, rip_pos);
+                    std::string sym = resolve_or_synthesize_data(target, op_size);
+                    if (!sym.empty()) {
+                        repl = "[" + sym;
+                        base = base.substr(0, rip_pos) + repl + base.substr(take_end);
+                        scan_pos = rip_pos + repl.size();
+                        continue;
+                    }
+                }
+                scan_pos = close + 1;
+                continue;
+            }
+            int64_t disp = 0;
+            size_t consumed = 0;
+            if (!parse_signed_hex_run(base.c_str() + after_rip,
+                                      base.size() - after_rip, disp, consumed)) {
+                scan_pos = after_rip + 1;
+                continue;
+            }
+            size_t close_pos = after_rip + consumed;
+            while (close_pos < base.size() && base[close_pos] == ' ') ++close_pos;
+            if (close_pos >= base.size() || base[close_pos] != ']') {
+                scan_pos = after_rip + consumed;
+                continue;
+            }
+            uint64_t target = ins.addr + ins.len + static_cast<uint64_t>(disp);
+            int op_size = extract_operand_size(base, rip_pos);
+            std::string sym = resolve_or_synthesize_data(target, op_size);
+            if (!sym.empty()) {
+                std::string repl = "[" + sym;
+                base = base.substr(0, rip_pos) + repl + base.substr(close_pos);
+                scan_pos = rip_pos + repl.size();
+            } else {
+                scan_pos = close_pos + 1;
+            }
+        }
+    }
+
+    {
+        size_t scan_pos = 0;
+        while (scan_pos < base.size()) {
+            size_t br_pos = base.find('[', scan_pos);
+            if (br_pos == std::string::npos) break;
+            size_t hx = br_pos + 1;
+            while (hx < base.size() && base[hx] == ' ') ++hx;
+            if (hx + 1 >= base.size() || base[hx] != '0' || (base[hx + 1] != 'x' && base[hx + 1] != 'X')) {
+                scan_pos = br_pos + 1;
+                continue;
+            }
+            size_t hex_run_start = hx + 2;
+            size_t hex_run_end = hex_run_start;
+            while (hex_run_end < base.size()) {
+                char c = base[hex_run_end];
+                if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))
+                    ++hex_run_end;
+                else break;
+            }
+            if (hex_run_end == hex_run_start) {
+                scan_pos = br_pos + 1;
+                continue;
+            }
+            size_t after = hex_run_end;
+            while (after < base.size() && base[after] == ' ') ++after;
+            if (after >= base.size() || base[after] != ']') {
+                scan_pos = br_pos + 1;
+                continue;
+            }
+            char buf[24];
+            size_t hl = hex_run_end - hex_run_start;
+            if (hl >= sizeof(buf)) hl = sizeof(buf) - 1;
+            std::memcpy(buf, base.c_str() + hex_run_start, hl);
+            buf[hl] = '\0';
+            uint64_t target = std::strtoull(buf, nullptr, 16);
+            if (target == 0) {
+                scan_pos = after + 1;
+                continue;
+            }
+            int op_size = extract_operand_size(base, br_pos);
+
+            std::string seg_prefix;
+            std::string sym;
+
+            const bool is_lea = (ins.mnem[0] == 'l' && ins.mnem[1] == 'e' && ins.mnem[2] == 'a' && ins.mnem[3] == '\0');
+
+            if (ins.is_call || ins.is_branch) {
+                std::string imp_name = resolve_import_via_iat(target);
+                if (!imp_name.empty()) {
+                    if (imp_name.size() >= 6 && imp_name.compare(0, 6, "__imp_") == 0)
+                        imp_name = imp_name.substr(6);
+                    sym = imp_name;
+                    seg_prefix = "cs:";
+                }
+            }
+
+            if (sym.empty()) {
+                std::string exact = symbol_store::resolve_symbol_exact(target);
+                exact = strip_module_prefix_fast(exact);
+                if (!exact.empty()) {
+                    sym = exact;
+                    if (!ins.is_call && !ins.is_branch && !is_lea) seg_prefix = "cs:";
+                }
+            }
+
+            if (sym.empty()) {
+                sym = resolve_or_synthesize_data(target, op_size);
+            }
+
+            if (!sym.empty()) {
+                std::string repl;
+                if (!seg_prefix.empty()) {
+                    repl = seg_prefix + sym;
+                    base = base.substr(0, br_pos) + repl + base.substr(after + 1);
+                    scan_pos = br_pos + repl.size();
+                }
+                else if (is_lea) {
+                    repl = sym;
+                    base = base.substr(0, br_pos) + repl + base.substr(after + 1);
+                    scan_pos = br_pos + repl.size();
+                }
+                else {
+                    repl = "[" + sym;
+                    base = base.substr(0, br_pos) + repl + base.substr(after);
+                    scan_pos = br_pos + repl.size();
+                }
+            } else {
+                scan_pos = after + 1;
+            }
+        }
+    }
+
+    {
+        size_t scan_pos = 0;
+        while (scan_pos < base.size()) {
+            size_t br_pos = base.find('[', scan_pos);
+            if (br_pos == std::string::npos) break;
+            size_t name_start = br_pos + 1;
+            while (name_start < base.size() && base[name_start] == ' ') ++name_start;
+            if (name_start >= base.size() || !is_ident_start_char(base[name_start])) {
+                scan_pos = br_pos + 1;
+                continue;
+            }
+            size_t name_end = name_start;
+            while (name_end < base.size() && is_ident_body_char(base[name_end])) ++name_end;
+            if (name_end == name_start) {
+                scan_pos = br_pos + 1;
+                continue;
+            }
+            size_t sep = name_end;
+            while (sep < base.size() && base[sep] == ' ') ++sep;
+            if (sep >= base.size() || (base[sep] != '+' && base[sep] != '-')) {
+                scan_pos = name_end;
+                continue;
+            }
+            int64_t disp = 0;
+            size_t consumed = 0;
+            if (!parse_signed_hex_run(base.c_str() + sep, base.size() - sep, disp, consumed)) {
+                scan_pos = sep + 1;
+                continue;
+            }
+            size_t close_pos = sep + consumed;
+            while (close_pos < base.size() && base[close_pos] == ' ') ++close_pos;
+            if (close_pos >= base.size() || base[close_pos] != ']') {
+                scan_pos = sep + consumed;
+                continue;
+            }
+            std::string_view sym_view(base.c_str() + name_start, name_end - name_start);
+            uint64_t bound_va = 0;
+            std::string struct_name_unused;
+            if (!resolve_struct_binding_by_name(sym_view, bound_va, struct_name_unused) || bound_va == 0) {
+                scan_pos = close_pos + 1;
+                continue;
+            }
+            int op_size = extract_operand_size(base, br_pos);
+            std::string struct_name_resolved;
+            std::string field_name;
+            if (!lookup_struct_field_at_base_va(bound_va, disp, op_size,
+                                                struct_name_resolved, field_name)) {
+                scan_pos = close_pos + 1;
+                continue;
+            }
+            if (field_name.empty()) {
+                scan_pos = close_pos + 1;
+                continue;
+            }
+            std::string base_token(sym_view);
+            std::string replacement = "[" + base_token + "->" + field_name + "]";
+            base = base.substr(0, br_pos) + replacement + base.substr(close_pos + 1);
+            scan_pos = br_pos + replacement.size();
+        }
+    }
+
     (void)file;
     return base;
 }
 
-static inline bool is_ident_start_char(char c) {
-    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+namespace ida_export {
+
+static constexpr int kColBytes      = 23;
+static constexpr int kColName       = 53;
+static constexpr int kColMnem       = 69;
+static constexpr int kColOps        = 77;
+static constexpr int kColComment    = 93;
+static constexpr int kBytesBlockW   = 47;
+static constexpr int kMnemBlockW    = 8;
+static constexpr int kMaxBytesShown = 10;
+static const char* const kEllipsisUtf8 = "\xe2\x80\xa6";
+
+static int visual_length(const std::string& s) {
+    int v = 0;
+    for (size_t i = 0; i < s.size(); ) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80) { v += 1; i += 1; }
+        else if ((c & 0xE0) == 0xC0) { v += 1; i += 2; }
+        else if ((c & 0xF0) == 0xE0) { v += 1; i += 3; }
+        else if ((c & 0xF8) == 0xF0) { v += 1; i += 4; }
+        else { v += 1; i += 1; }
+    }
+    return v;
 }
 
-static inline bool is_ident_body_char(char c) {
-    return is_ident_start_char(c) || (c >= '0' && c <= '9') || c == '!';
+static void pad_to_visual_col(std::string& s, int target) {
+    int v = visual_length(s);
+    while (v < target) { s += ' '; ++v; }
 }
 
-static inline bool is_hex_digit_char(char c) {
-    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+static std::string addr_prefix(const std::string& seg, uint64_t addr) {
+    char buf[40];
+    const char* sp = seg.empty() ? ".text" : seg.c_str();
+    std::snprintf(buf, sizeof(buf), "%s:%016llX", sp, static_cast<unsigned long long>(addr));
+    return std::string(buf);
+}
+
+static std::string section_for(uint64_t va) {
+    if (auto cached = xref_index::detail::lookup_cached_module(va)) {
+        if (cached->base != 0 && !cached->sections.empty()) {
+            if (va >= cached->base) {
+                uint64_t rva64 = va - cached->base;
+                if (rva64 <= 0xFFFFFFFFull) {
+                    uint32_t rva = static_cast<uint32_t>(rva64);
+                    for (const auto& s : cached->sections) {
+                        if (rva >= s.virtual_address && rva < s.virtual_address + s.virtual_size)
+                            return s.name;
+                    }
+                }
+            }
+        }
+    }
+    return std::string(".text");
+}
+
+static std::string ida_mnemonic(const std::string& m) {
+    if (m == "ret")   return "retn";
+    if (m == "iret")  return "iretn";
+    if (m == "iretd") return "iretn";
+    if (m == "iretq") return "iretnq";
+    if (m == "jnbe")  return "ja";
+    if (m == "jna")   return "jbe";
+    if (m == "jnae")  return "jb";
+    if (m == "jc")    return "jb";
+    if (m == "jae")   return "jnb";
+    if (m == "jnc")   return "jnb";
+    if (m == "je")    return "jz";
+    if (m == "jne")   return "jnz";
+    if (m == "jnle")  return "jg";
+    if (m == "jnl")   return "jge";
+    if (m == "jng")   return "jle";
+    if (m == "jnge")  return "jl";
+    if (m == "cmovnbe") return "cmova";
+    if (m == "cmovna")  return "cmovbe";
+    if (m == "cmovnae") return "cmovb";
+    if (m == "cmovae")  return "cmovnb";
+    if (m == "cmovc")   return "cmovb";
+    if (m == "cmovnc")  return "cmovnb";
+    if (m == "cmove")   return "cmovz";
+    if (m == "cmovne")  return "cmovnz";
+    if (m == "cmovnle") return "cmovg";
+    if (m == "cmovnl")  return "cmovge";
+    if (m == "cmovng")  return "cmovle";
+    if (m == "cmovnge") return "cmovl";
+    if (m == "setnbe")  return "seta";
+    if (m == "setna")   return "setbe";
+    if (m == "setnae")  return "setb";
+    if (m == "setae")   return "setnb";
+    if (m == "setc")    return "setb";
+    if (m == "setnc")   return "setnb";
+    if (m == "sete")    return "setz";
+    if (m == "setne")   return "setnz";
+    if (m == "setnle")  return "setg";
+    if (m == "setnl")   return "setge";
+    if (m == "setng")   return "setle";
+    if (m == "setnge")  return "setl";
+    return m;
+}
+
+static std::string format_unsigned_hex(uint64_t v) {
+    if (v < 0xAull) {
+        char buf[4];
+        std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(v));
+        return std::string(buf);
+    }
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%llX", static_cast<unsigned long long>(v));
+    std::string s(buf);
+    if (s[0] >= 'A' && s[0] <= 'F') s.insert(0, 1, '0');
+    s += 'h';
+    return s;
+}
+
+static bool is_hex_char(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
+}
+
+static bool is_ident_char(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+static std::string convert_operands_to_ida(const std::string& ops) {
+    std::string out;
+    out.reserve(ops.size() + 16);
+
+    size_t i = 0;
+    while (i < ops.size()) {
+        if (i + 1 < ops.size() && ops[i] == '0' && (ops[i + 1] == 'x' || ops[i + 1] == 'X')) {
+            bool prev_is_ident = (!out.empty() && is_ident_char(out.back()));
+            if (prev_is_ident) {
+                out += ops[i++];
+                continue;
+            }
+            size_t start = i + 2;
+            size_t end = start;
+            while (end < ops.size() && is_hex_char(ops[end])) ++end;
+            if (end == start) {
+                out += ops[i];
+                out += ops[i + 1];
+                i += 2;
+                continue;
+            }
+            uint64_t val = 0;
+            for (size_t k = start; k < end; ++k) {
+                char ch = ops[k];
+                val <<= 4;
+                if (ch >= '0' && ch <= '9') val |= static_cast<uint64_t>(ch - '0');
+                else if (ch >= 'A' && ch <= 'F') val |= static_cast<uint64_t>(ch - 'A' + 10);
+                else val |= static_cast<uint64_t>(ch - 'a' + 10);
+            }
+            out += format_unsigned_hex(val);
+            i = end;
+            continue;
+        }
+
+        if (i + 1 < ops.size() && ops[i] == '*' && ops[i + 1] == '1') {
+            char nxt = (i + 2 < ops.size()) ? ops[i + 2] : '\0';
+            if (nxt == ']' || nxt == '+' || nxt == '-' || nxt == ',' || nxt == ' ' || nxt == '\0') {
+                i += 2;
+                continue;
+            }
+        }
+
+        out += ops[i++];
+    }
+
+    return out;
+}
+
+static std::string resolve_branch_symbol(uint64_t target) {
+    if (target == 0) return std::string();
+
+    std::string thunk_name = function_index::thunk_target_name_for(target);
+    if (!thunk_name.empty()) return thunk_name;
+
+    std::string label = function_index::inline_label_at(target);
+    if (!label.empty()) {
+        if (label.back() == ':') label.pop_back();
+        return label;
+    }
+
+    if (function_index::is_inside_known_function(target)) {
+        std::string loc = function_index::loc_label_for(target);
+        if (!loc.empty()) return loc;
+    }
+
+    return function_index::synthetic_name(target);
+}
+
+static std::string build_call_tail_comment(uint64_t target,
+                                           const std::string& resolved_branch_sym)
+{
+    std::string demangled = demangle_tail_comment(resolved_branch_sym);
+    if (!demangled.empty()) return demangled;
+
+    if (target != 0) {
+        std::string sym = symbol_store::resolve_symbol_exact(target);
+        sym = strip_module_prefix_fast(sym);
+        if (!sym.empty() && sym != resolved_branch_sym) {
+            std::string d2 = demangle_tail_comment(sym);
+            if (!d2.empty()) return d2;
+        }
+    }
+    return std::string();
+}
+
+static std::string build_instruction_line(const AsmInstr& ins,
+                                          const DisasmFile& file,
+                                          const std::string& seg,
+                                          const std::string& user_comment_full,
+                                          const std::string& xref_comment_full)
+{
+    std::string line = addr_prefix(seg, ins.addr);
+    line += ' ';
+
+    int v = visual_length(line);
+    int target_bytes_end = 22 + kBytesBlockW;
+
+    int byte_count = ins.len > 0 ? ins.len : 0;
+    int shown = std::min(byte_count, kMaxBytesShown);
+    for (int b = 0; b < shown; ++b) {
+        if (b > 0) { line += ' '; ++v; }
+        char hb[4];
+        std::snprintf(hb, sizeof(hb), "%02X", static_cast<unsigned int>(ins.raw[b]));
+        line += hb;
+        v += 2;
+    }
+    if (byte_count > kMaxBytesShown) {
+        line += kEllipsisUtf8;
+        v += 1;
+    }
+    while (v < target_bytes_end) { line += ' '; ++v; }
+
+    std::string mnem = ida_mnemonic(std::string(ins.mnem));
+
+    std::string ops;
+    bool emitted_branch_sym = false;
+    std::string branch_sym_resolved;
+    if ((ins.is_branch || ins.is_call) && ins.branch_target != 0) {
+        uint64_t target = ins.branch_target;
+        std::string sym = resolve_branch_symbol(target);
+        symbol_classifier::kind_t k = symbol_classifier::classify(target);
+        if (k == symbol_classifier::kind_t::external_import) {
+            if (sym.compare(0, 6, "__imp_") != 0) sym = "__imp_" + sym;
+        }
+        if (!sym.empty()) {
+            branch_sym_resolved = sym;
+            ops = sym;
+            if (ins.is_branch && !ins.is_call) {
+                int64_t diff = static_cast<int64_t>(target) - static_cast<int64_t>(ins.addr);
+                if (diff >= -128 && diff <= 127) {
+                    ops = std::string("short ") + ops;
+                }
+            }
+            emitted_branch_sym = true;
+        }
+    }
+    if (!emitted_branch_sym) {
+        std::string raw_ops = substitute_operand_text(ins, file);
+        ops = convert_operands_to_ida(raw_ops);
+    }
+
+    line += mnem;
+    v = visual_length(line);
+    int op_col = target_bytes_end + kMnemBlockW;
+    if (!ops.empty()) {
+        if (v < op_col) {
+            while (v < op_col) { line += ' '; ++v; }
+        } else {
+            line += ' ';
+            ++v;
+        }
+        line += ops;
+    }
+
+    std::string comment;
+    if (!xref_comment_full.empty()) {
+        comment = xref_comment_full;
+    } else if (!user_comment_full.empty()) {
+        comment = user_comment_full;
+    } else {
+        std::string auto_cmt = function_index::inline_comment_at(ins.addr);
+        if (!auto_cmt.empty()) {
+            comment = std::string("; ") + auto_cmt;
+        }
+        else if (emitted_branch_sym) {
+            std::string tail = build_call_tail_comment(ins.branch_target, branch_sym_resolved);
+            if (!tail.empty()) comment = std::string("; ") + tail;
+        }
+    }
+    if (!comment.empty()) {
+        v = visual_length(line);
+        int comment_col = std::max(kColComment, v + 2);
+        while (v < comment_col) { line += ' '; ++v; }
+        line += comment;
+    }
+
+    return line;
+}
+
+static std::string build_injection_line(const std::string& seg,
+                                        uint64_t addr,
+                                        function_index::injection_t kind,
+                                        const std::string& text,
+                                        const std::string& tail_comment)
+{
+    std::string line = addr_prefix(seg, addr);
+    if (kind == function_index::injection_t::spacer_line) return line;
+    pad_to_visual_col(line, kColName);
+    line += text;
+    if (!tail_comment.empty()) {
+        int v = visual_length(line);
+        int comment_col = std::max(kColComment, v + 2);
+        while (v < comment_col) { line += ' '; ++v; }
+        line += tail_comment;
+    }
+    return line;
+}
+
+static std::string build_xref_continuation_line(const std::string& seg,
+                                                uint64_t addr,
+                                                const std::string& xref_comment)
+{
+    std::string line = addr_prefix(seg, addr);
+    pad_to_visual_col(line, kColComment);
+    line += xref_comment;
+    return line;
+}
+
+static std::string build_align_lines(const std::string& seg,
+                                     const function_index::detail::align_run_t& arun)
+{
+    std::string out;
+    std::string lbl_line = addr_prefix(seg, arun.addr);
+    pad_to_visual_col(lbl_line, kColName);
+    char lbl_buf[40];
+    std::snprintf(lbl_buf, sizeof(lbl_buf), "algn_%llX:",
+        static_cast<unsigned long long>(arun.addr));
+    lbl_line += lbl_buf;
+    out += lbl_line;
+    out += "\r\n";
+
+    std::string code_line = addr_prefix(seg, arun.addr);
+    code_line += ' ';
+    int v = visual_length(code_line);
+    int target_bytes_end = 22 + kBytesBlockW;
+    uint64_t run_len = (arun.end > arun.addr) ? (arun.end - arun.addr) : 0;
+    int shown = static_cast<int>(std::min<uint64_t>(run_len, kMaxBytesShown));
+    for (int b = 0; b < shown; ++b) {
+        if (b > 0) { code_line += ' '; ++v; }
+        char hb[4];
+        std::snprintf(hb, sizeof(hb), "%02X", static_cast<unsigned int>(arun.fill_byte));
+        code_line += hb;
+        v += 2;
+    }
+    if (run_len > static_cast<uint64_t>(kMaxBytesShown)) {
+        code_line += kEllipsisUtf8;
+        v += 1;
+    }
+    while (v < target_bytes_end) { code_line += ' '; ++v; }
+    char align_buf[40];
+    std::snprintf(align_buf, sizeof(align_buf), "align %s",
+        format_unsigned_hex(static_cast<uint64_t>(arun.alignment)).c_str());
+    code_line += align_buf;
+    out += code_line;
+    return out;
+}
+
+static std::string build_header_banner(const DisasmFile& file,
+                                       const std::vector<AsmInstr>& instrs,
+                                       int lo)
+{
+    std::string out;
+    if (instrs.empty()) return out;
+
+    uint64_t first_addr = instrs[static_cast<size_t>(lo)].addr;
+    std::string seg = section_for(first_addr);
+    auto& cache = file_metadata_banner::detail::cache();
+
+    std::string fmb_source_path;
+    const bool live_attached = g_disasm.live_mode
+        && g_disasm.live_base != 0
+        && g_disasm.live_size != 0;
+    if (live_attached) {
+        const uint64_t live_base = g_disasm.live_base;
+        const uint32_t live_size = static_cast<uint32_t>(
+            (g_disasm.live_size > 0xFFFFFFFFull) ? 0xFFFFFFFFu : g_disasm.live_size);
+        const uint32_t live_pid = g_disasm.live_pid;
+        const std::string live_name = g_disasm.live_module.empty()
+            ? std::string("(live image)")
+            : g_disasm.live_module;
+        file_metadata_banner::detail::ensure_started_for_image(live_base, live_size, live_pid, live_name);
+        fmb_source_path = live_name;
+    } else if (!file.path.empty() && file.path.compare(0, 7, "live://") != 0) {
+        fmb_source_path = file.path;
+        file_metadata_banner::detail::ensure_started_for(file.path);
+    } else if (!file.filename.empty()) {
+        fmb_source_path = file.filename;
+    }
+
+    std::string sha;
+    std::string md5;
+    std::string crc32_v;
+    std::string compiler;
+    std::string file_name;
+    std::string format_text;
+    std::string app_type;
+    std::string os_type;
+    uint64_t image_base = file.image_base;
+    uint32_t timestamp = 0;
+    std::string timestamp_text;
+    std::vector<file_metadata_banner::section_info_t> sections;
+    int state = 0;
+    {
+        std::lock_guard<std::mutex> lk(cache.mtx);
+        state = cache.state.load(std::memory_order_acquire);
+        sha = cache.sha256;
+        md5 = cache.md5;
+        crc32_v = cache.crc32;
+        compiler = cache.compiler;
+        file_name = cache.source_path.empty() ? fmb_source_path : cache.source_path;
+        format_text = cache.format_text;
+        app_type = cache.app_type;
+        os_type = cache.os_type;
+        if (cache.image_base != 0) image_base = cache.image_base;
+        timestamp = cache.timestamp;
+        timestamp_text = cache.timestamp_text;
+        sections = cache.sections;
+    }
+    const bool ready = (state == static_cast<int>(file_metadata_banner::compute_state_t::ready));
+    if (!ready) {
+        if (sha.empty()) sha = "(computing...)";
+        if (md5.empty()) md5 = "(computing...)";
+        if (crc32_v.empty()) crc32_v = "(computing...)";
+        if (compiler.empty()) compiler = "(computing...)";
+        if (format_text.empty()) format_text = "(computing...)";
+        if (app_type.empty()) app_type = "(computing...)";
+        if (os_type.empty()) os_type = "(computing...)";
+    }
+    if (file_name.empty()) file_name = file.filename;
+
+    auto emit_line = [&](const std::string& text) {
+        std::string line = addr_prefix(seg, first_addr);
+        if (!text.empty()) {
+            pad_to_visual_col(line, kColName);
+            line += text;
+        }
+        out += line;
+        out += "\r\n";
+    };
+
+    emit_line(";");
+    emit_line("; +-------------------------------------------------------------------------+");
+    emit_line("; |             AiDA - Reverse-engineering toolkit by AiDA Team             |");
+    emit_line("; |                          aida.app - Standalone                          |");
+    emit_line("; +-------------------------------------------------------------------------+");
+    emit_line(";");
+
+    char buf[512];
+    std::snprintf(buf, sizeof(buf), "; Input SHA256 : %s", sha.c_str());
+    emit_line(buf);
+    std::snprintf(buf, sizeof(buf), "; Input MD5    : %s", md5.c_str());
+    emit_line(buf);
+    std::snprintf(buf, sizeof(buf), "; Input CRC32  : %s", crc32_v.c_str());
+    emit_line(buf);
+    std::snprintf(buf, sizeof(buf), "; Compiler     : %s", compiler.c_str());
+    emit_line(buf);
+    emit_line("");
+
+    std::snprintf(buf, sizeof(buf), "; File Name   : %s", file_name.c_str());
+    emit_line(buf);
+    std::snprintf(buf, sizeof(buf), "; Format      : %s", format_text.c_str());
+    emit_line(buf);
+    std::snprintf(buf, sizeof(buf), "; Imagebase   : %llX",
+        static_cast<unsigned long long>(image_base));
+    emit_line(buf);
+    if (ready) {
+        std::snprintf(buf, sizeof(buf), "; Timestamp   : %08X (%s)", timestamp, timestamp_text.c_str());
+    } else {
+        std::snprintf(buf, sizeof(buf), "; Timestamp   : (computing...)");
+    }
+    emit_line(buf);
+
+    const file_metadata_banner::section_info_t* primary = nullptr;
+    int section_index = 1;
+    if (ready && !sections.empty()) {
+        for (size_t i = 0; i < sections.size(); ++i) {
+            if (sections[i].characteristics & IMAGE_SCN_MEM_EXECUTE) {
+                primary = &sections[i];
+                section_index = static_cast<int>(i + 1);
+                break;
+            }
+        }
+        if (!primary) {
+            primary = &sections.front();
+            section_index = 1;
+        }
+    }
+    if (primary) {
+        std::snprintf(buf, sizeof(buf), "; Section %d. (virtual address %08X)",
+            section_index, primary->virtual_address);
+        emit_line(buf);
+        std::snprintf(buf, sizeof(buf), "; Virtual size                  : %08X ( %7u.)",
+            primary->virtual_size, static_cast<unsigned int>(primary->virtual_size));
+        emit_line(buf);
+        std::snprintf(buf, sizeof(buf), "; Section size in file          : %08X ( %7u.)",
+            primary->raw_size, static_cast<unsigned int>(primary->raw_size));
+        emit_line(buf);
+        std::snprintf(buf, sizeof(buf), "; Offset to raw data for section: %08X",
+            primary->raw_offset);
+        emit_line(buf);
+        std::string flags_text = file_metadata_banner::detail::section_flags_text(primary->characteristics);
+        std::snprintf(buf, sizeof(buf), "; Flags %08X: %s",
+            primary->characteristics, flags_text.c_str());
+        emit_line(buf);
+        if (primary->alignment == 0)
+            std::snprintf(buf, sizeof(buf), "; Alignment     : default");
+        else
+            std::snprintf(buf, sizeof(buf), "; Alignment     : %u", primary->alignment);
+        emit_line(buf);
+    }
+    std::snprintf(buf, sizeof(buf), "; OS type         :  %s", os_type.c_str());
+    emit_line(buf);
+    std::snprintf(buf, sizeof(buf), "; Application type:  %s", app_type.c_str());
+    emit_line(buf);
+    emit_line("");
+
+    emit_line("                .686p");
+    emit_line("                .mmx");
+    emit_line("                .model flat");
+    emit_line("");
+
+    emit_line("; ===========================================================================");
+    emit_line("");
+
+    emit_line("; Segment type: Pure code");
+    emit_line("; Segment permissions: Read/Execute");
+
+    {
+        const char* seg_word = seg.c_str();
+        std::string seg_name_for_decl = seg;
+        if (!seg_name_for_decl.empty() && seg_name_for_decl[0] == '.')
+            seg_name_for_decl = "_" + seg_name_for_decl.substr(1);
+        std::snprintf(buf, sizeof(buf), "%-15s segment para public 'CODE' use64",
+            seg_name_for_decl.c_str());
+        emit_line(buf);
+        std::snprintf(buf, sizeof(buf), "                assume cs:%s", seg_name_for_decl.c_str());
+        emit_line(buf);
+        char org_buf[40];
+        std::snprintf(org_buf, sizeof(org_buf), "                ;org %llXh",
+            static_cast<unsigned long long>(first_addr));
+        emit_line(org_buf);
+        emit_line("                assume es:nothing, ss:nothing, ds:_data, fs:nothing, gs:nothing");
+        emit_line("");
+        (void)seg_word;
+    }
+
+    return out;
+}
+
+static std::string build_listing(const DisasmFile& file,
+                                 const std::vector<AsmInstr>& instrs,
+                                 int lo, int hi)
+{
+    std::string out;
+    if (instrs.empty()) return out;
+    if (lo < 0) lo = 0;
+    if (hi >= static_cast<int>(instrs.size())) hi = static_cast<int>(instrs.size()) - 1;
+    if (lo > hi) return out;
+
+    out.reserve(static_cast<size_t>(hi - lo + 1) * 160);
+
+    if (lo == 0) {
+        out += build_header_banner(file, instrs, lo);
+    }
+
+    uint64_t align_skip_end = 0;
+
+    for (int i = lo; i <= hi; ++i) {
+        const AsmInstr& ins = instrs[i];
+
+        if (align_skip_end != 0) {
+            if (ins.addr < align_skip_end) continue;
+            align_skip_end = 0;
+        }
+
+        std::string seg = section_for(ins.addr);
+
+        function_index::detail::align_run_t arun;
+        if (function_index::is_align_row_start(ins.addr)
+            && function_index::align_run_at(ins.addr, &arun))
+        {
+            out += build_align_lines(seg, arun);
+            out += "\r\n";
+            align_skip_end = arun.end;
+            continue;
+        }
+
+        std::vector<function_index::injection_row_t> before_rows = function_index::rows_before(ins.addr);
+        std::vector<xref_index::annotation_t> xrefs_at_func;
+        bool xrefs_more = false;
+        bool has_proc_header = false;
+        for (const auto& br : before_rows) {
+            if (br.kind == function_index::injection_t::proc_header) {
+                has_proc_header = true;
+                break;
+            }
+        }
+        if (has_proc_header) {
+            xrefs_at_func = xref_index::query_to(ins.addr, 6);
+            xrefs_more = xref_index::has_more(ins.addr, 6);
+        }
+
+        for (const auto& br : before_rows) {
+            if (br.kind == function_index::injection_t::proc_header && !xrefs_at_func.empty()) {
+                std::string xref_head = ida_format_xref_comment(xrefs_at_func[0],
+                    xrefs_more && xrefs_at_func.size() == 1);
+                out += build_injection_line(seg, ins.addr, br.kind, br.text, xref_head);
+                out += "\r\n";
+                for (size_t xi = 1; xi < xrefs_at_func.size(); ++xi) {
+                    bool last_more = (xi + 1 == xrefs_at_func.size()) && xrefs_more;
+                    std::string xt = ida_format_xref_comment(xrefs_at_func[xi], last_more);
+                    out += build_xref_continuation_line(seg, ins.addr, xt);
+                    out += "\r\n";
+                }
+            } else {
+                out += build_injection_line(seg, ins.addr, br.kind, br.text, std::string());
+                out += "\r\n";
+            }
+        }
+
+        std::string inline_label = function_index::inline_label_at(ins.addr);
+        if (inline_label.empty()) {
+            std::vector<xref_index::annotation_t> xrefs_probe = xref_index::query_to(ins.addr, 1);
+            bool any_code_xref = false;
+            for (const auto& a : xrefs_probe) {
+                if (a.kind == xref_index::kind_t::code && a.edge == xref_index::edge_t::jump) {
+                    any_code_xref = true;
+                    break;
+                }
+            }
+            if (any_code_xref && function_index::is_inside_known_function(ins.addr)) {
+                std::string loc = function_index::loc_label_for(ins.addr);
+                if (!loc.empty()) inline_label = loc + ":";
+            }
+        }
+        if (!inline_label.empty()) {
+            out += addr_prefix(seg, ins.addr);
+            out += "\r\n";
+            std::vector<xref_index::annotation_t> xrefs_at_label = xref_index::query_to(ins.addr, 6);
+            bool xrefs_label_more = xref_index::has_more(ins.addr, 6);
+            std::string head_xref;
+            if (!xrefs_at_label.empty()) {
+                head_xref = ida_format_xref_comment(xrefs_at_label[0],
+                    xrefs_label_more && xrefs_at_label.size() == 1);
+            }
+            out += build_injection_line(seg, ins.addr,
+                function_index::injection_t::label_line, inline_label, head_xref);
+            out += "\r\n";
+            for (size_t xi = 1; xi < xrefs_at_label.size(); ++xi) {
+                bool last_more = (xi + 1 == xrefs_at_label.size()) && xrefs_label_more;
+                std::string xt = ida_format_xref_comment(xrefs_at_label[xi], last_more);
+                out += build_xref_continuation_line(seg, ins.addr, xt);
+                out += "\r\n";
+            }
+        }
+
+        std::string user_cmt;
+        if (comment_store::has(ins.addr)) {
+            user_cmt = "; " + comment_store::get(ins.addr);
+        }
+        out += build_instruction_line(ins, file, seg, user_cmt, std::string());
+        out += "\r\n";
+
+        std::vector<function_index::injection_row_t> after_rows = function_index::rows_after(ins.addr);
+        for (const auto& ar : after_rows) {
+            out += build_injection_line(seg, ins.addr, ar.kind, ar.text, std::string());
+            out += "\r\n";
+        }
+
+    }
+
+    return out;
+}
+
 }
 
 static inline ImU32 default_operand_color(const AsmInstr& ins) {
-    if (ins.is_branch || ins.is_call) return disasm_theme::sub_label();
-    if (ins.is_nop) return disasm_theme::bytes();
+    if (ins.is_call) return disasm_theme::sub_label();
+    if (ins.is_branch) return disasm_theme::loc_label();
+    if (ins.is_nop) return disasm_theme::mnem_nop();
     return disasm_theme::reg();
 }
 
@@ -551,14 +2033,364 @@ static void build_operand_colored_runs(const AsmInstr& ins,
     }
 }
 
+static void rebuild_banner_lines(const DisasmFile& file) {
+    s_banner_cache.clear();
+    auto& cache = file_metadata_banner::detail::cache();
+
+    std::string fmb_source_path;
+    const bool live_attached = g_disasm.live_mode
+        && g_disasm.live_base != 0
+        && g_disasm.live_size != 0;
+    if (live_attached) {
+        const uint64_t live_base = g_disasm.live_base;
+        const uint32_t live_size = static_cast<uint32_t>(
+            (g_disasm.live_size > 0xFFFFFFFFull) ? 0xFFFFFFFFu : g_disasm.live_size);
+        const uint32_t live_pid = g_disasm.live_pid;
+        const std::string live_name = g_disasm.live_module.empty()
+            ? std::string("(live image)")
+            : g_disasm.live_module;
+        file_metadata_banner::detail::ensure_started_for_image(live_base, live_size, live_pid, live_name);
+        fmb_source_path = live_name;
+    } else if (!file.path.empty() && file.path.compare(0, 7, "live://") != 0) {
+        fmb_source_path = file.path;
+        file_metadata_banner::detail::ensure_started_for(file.path);
+    } else if (!file.filename.empty()) {
+        fmb_source_path = file.filename;
+    }
+
+    std::string sha;
+    std::string md5;
+    std::string crc32_v;
+    std::string compiler;
+    std::string file_name;
+    std::string format_text;
+    std::string app_type;
+    std::string os_type;
+    uint64_t image_base = file.image_base;
+    uint32_t timestamp = 0;
+    std::string timestamp_text;
+    std::vector<file_metadata_banner::section_info_t> sections;
+    int state = 0;
+    {
+        std::lock_guard<std::mutex> lk(cache.mtx);
+        state = cache.state.load(std::memory_order_acquire);
+        sha = cache.sha256;
+        md5 = cache.md5;
+        crc32_v = cache.crc32;
+        compiler = cache.compiler;
+        file_name = cache.source_path.empty() ? fmb_source_path : cache.source_path;
+        format_text = cache.format_text;
+        app_type = cache.app_type;
+        os_type = cache.os_type;
+        if (cache.image_base != 0) image_base = cache.image_base;
+        timestamp = cache.timestamp;
+        timestamp_text = cache.timestamp_text;
+        sections = cache.sections;
+    }
+    const bool ready = (state == static_cast<int>(file_metadata_banner::compute_state_t::ready));
+    if (!ready) {
+        if (sha.empty()) sha = "(computing...)";
+        if (md5.empty()) md5 = "(computing...)";
+        if (crc32_v.empty()) crc32_v = "(computing...)";
+        if (compiler.empty()) compiler = "(computing...)";
+        if (format_text.empty()) format_text = "(computing...)";
+        if (app_type.empty()) app_type = "(computing...)";
+        if (os_type.empty()) os_type = "(computing...)";
+    }
+    if (file_name.empty()) file_name = file.filename;
+
+    auto push_comment = [&](std::string text) {
+        banner_line_t bl;
+        bl.text = std::move(text);
+        bl.color = disasm_theme::comment();
+        s_banner_cache.push_back(std::move(bl));
+    };
+    auto push_banner = [&](std::string text) {
+        banner_line_t bl;
+        bl.text = std::move(text);
+        bl.color = disasm_theme::banner();
+        s_banner_cache.push_back(std::move(bl));
+    };
+    auto push_directive = [&](std::string text) {
+        banner_line_t bl;
+        bl.text = std::move(text);
+        bl.color = disasm_theme::directive();
+        bl.is_directive = true;
+        s_banner_cache.push_back(std::move(bl));
+    };
+    auto push_keyword = [&](std::string text) {
+        banner_line_t bl;
+        bl.text = std::move(text);
+        bl.color = disasm_theme::keyword();
+        s_banner_cache.push_back(std::move(bl));
+    };
+    auto push_blank = [&]() {
+        banner_line_t bl;
+        bl.color = disasm_theme::comment();
+        s_banner_cache.push_back(std::move(bl));
+    };
+
+    push_comment(";");
+    push_banner("; +-------------------------------------------------------------------------+");
+    push_banner("; |             AiDA - Reverse-engineering toolkit by AiDA Team             |");
+    push_banner("; |                          aida.app - Standalone                          |");
+    push_banner("; +-------------------------------------------------------------------------+");
+    push_comment(";");
+
+    char buf[512];
+    std::snprintf(buf, sizeof(buf), "; Input SHA256 : %s", sha.c_str());
+    push_comment(buf);
+    std::snprintf(buf, sizeof(buf), "; Input MD5    : %s", md5.c_str());
+    push_comment(buf);
+    std::snprintf(buf, sizeof(buf), "; Input CRC32  : %s", crc32_v.c_str());
+    push_comment(buf);
+    std::snprintf(buf, sizeof(buf), "; Compiler     : %s", compiler.c_str());
+    push_comment(buf);
+    push_blank();
+
+    std::snprintf(buf, sizeof(buf), "; File Name   : %s", file_name.c_str());
+    push_comment(buf);
+    std::snprintf(buf, sizeof(buf), "; Format      : %s", format_text.c_str());
+    push_comment(buf);
+    std::snprintf(buf, sizeof(buf), "; Imagebase   : %llX",
+        static_cast<unsigned long long>(image_base));
+    push_comment(buf);
+    if (ready) {
+        std::snprintf(buf, sizeof(buf), "; Timestamp   : %08X (%s)", timestamp, timestamp_text.c_str());
+    } else {
+        std::snprintf(buf, sizeof(buf), "; Timestamp   : (computing...)");
+    }
+    push_comment(buf);
+
+    const file_metadata_banner::section_info_t* primary = nullptr;
+    int section_index = 1;
+    if (ready && !sections.empty()) {
+        for (size_t i = 0; i < sections.size(); ++i) {
+            if (sections[i].characteristics & IMAGE_SCN_MEM_EXECUTE) {
+                primary = &sections[i];
+                section_index = static_cast<int>(i + 1);
+                break;
+            }
+        }
+        if (!primary) {
+            primary = &sections.front();
+            section_index = 1;
+        }
+    }
+    if (primary) {
+        std::snprintf(buf, sizeof(buf), "; Section %d. (virtual address %08X)",
+            section_index, primary->virtual_address);
+        push_comment(buf);
+        std::snprintf(buf, sizeof(buf), "; Virtual size                  : %08X ( %7u.)",
+            primary->virtual_size, static_cast<unsigned int>(primary->virtual_size));
+        push_comment(buf);
+        std::snprintf(buf, sizeof(buf), "; Section size in file          : %08X ( %7u.)",
+            primary->raw_size, static_cast<unsigned int>(primary->raw_size));
+        push_comment(buf);
+        std::snprintf(buf, sizeof(buf), "; Offset to raw data for section: %08X",
+            primary->raw_offset);
+        push_comment(buf);
+        std::string flags_text = file_metadata_banner::detail::section_flags_text(primary->characteristics);
+        std::snprintf(buf, sizeof(buf), "; Flags %08X: %s",
+            primary->characteristics, flags_text.c_str());
+        push_comment(buf);
+        if (primary->alignment == 0)
+            std::snprintf(buf, sizeof(buf), "; Alignment     : default");
+        else
+            std::snprintf(buf, sizeof(buf), "; Alignment     : %u", primary->alignment);
+        push_comment(buf);
+    } else {
+        push_comment("; Section 1. (virtual address (computing...))");
+        push_comment("; Virtual size                  : (computing...)");
+        push_comment("; Section size in file          : (computing...)");
+        push_comment("; Offset to raw data for section: (computing...)");
+        push_comment("; Flags        : (computing...)");
+        push_comment("; Alignment     : (computing...)");
+    }
+    std::snprintf(buf, sizeof(buf), "; OS type         :  %s", os_type.c_str());
+    push_comment(buf);
+    std::snprintf(buf, sizeof(buf), "; Application type:  %s", app_type.c_str());
+    push_comment(buf);
+    push_blank();
+
+    push_directive(".686p");
+    push_directive(".mmx");
+    push_directive(".model flat");
+    push_blank();
+
+    push_banner("; ===========================================================================");
+    push_blank();
+
+    push_keyword("; Segment type: Pure code");
+    push_keyword("; Segment permissions: Read/Execute");
+
+    std::string seg_name = "_text";
+    {
+        if (!file.instrs.empty()) {
+            std::string s = ida_export::section_for(file.instrs.front().addr);
+            if (!s.empty() && s[0] == '.') seg_name = "_" + s.substr(1);
+            else if (!s.empty()) seg_name = s;
+        }
+    }
+    std::snprintf(buf, sizeof(buf), "%s segment para public 'CODE' use64", seg_name.c_str());
+    push_keyword(buf);
+    std::snprintf(buf, sizeof(buf), "assume cs:%s", seg_name.c_str());
+    push_keyword(buf);
+    uint64_t first_addr = file.instrs.empty() ? image_base : file.instrs.front().addr;
+    std::snprintf(buf, sizeof(buf), ";org %llXh",
+        static_cast<unsigned long long>(first_addr));
+    push_comment(buf);
+    push_keyword("assume es:nothing, ss:nothing, ds:_data, fs:nothing, gs:nothing");
+}
+
+static inline char mnem_lc(char c) {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+static int classify_mnemonic_family(const char* mnem) {
+    if (!mnem || !*mnem) return disasm_theme::kind_mnem_other;
+    char m[16] = {};
+    int len = 0;
+    while (mnem[len] && len < 15) {
+        m[len] = mnem_lc(mnem[len]);
+        ++len;
+    }
+    if (len == 0) return disasm_theme::kind_mnem_other;
+
+    if (len == 3 && m[0] == 'n' && m[1] == 'o' && m[2] == 'p') return disasm_theme::kind_mnem_nop;
+
+    if (len == 3 && m[0] == 'r' && m[1] == 'e' && m[2] == 't') return disasm_theme::kind_mnem_ret;
+    if (len == 4 && m[0] == 'r' && m[1] == 'e' && m[2] == 't' && (m[3] == 'n' || m[3] == 'f')) return disasm_theme::kind_mnem_ret;
+    if (len >= 4 && m[0] == 'i' && m[1] == 'r' && m[2] == 'e' && m[3] == 't') return disasm_theme::kind_mnem_ret;
+    if (len == 6 && m[0] == 's' && m[1] == 'y' && m[2] == 's' && m[3] == 'r' && m[4] == 'e' && m[5] == 't') return disasm_theme::kind_mnem_ret;
+
+    if (len == 4 && m[0] == 'c' && m[1] == 'a' && m[2] == 'l' && m[3] == 'l') return disasm_theme::kind_mnem_call;
+
+    if (m[0] == 'j') return disasm_theme::kind_mnem_branch;
+    if (len >= 4 && m[0] == 'l' && m[1] == 'o' && m[2] == 'o' && m[3] == 'p') return disasm_theme::kind_mnem_branch;
+
+    if (len == 3 && m[0] == 'i' && m[1] == 'n' && m[2] == 't') return disasm_theme::kind_mnem_int;
+    if (len == 4 && m[0] == 'i' && m[1] == 'n' && m[2] == 't' && (m[3] == '3' || m[3] == 'o')) return disasm_theme::kind_mnem_int;
+    if (len == 3 && m[0] == 'u' && m[1] == 'd' && m[2] == '2') return disasm_theme::kind_mnem_int;
+    if (len == 5 && m[0] == 's' && m[1] == 'y' && m[2] == 's' && m[3] == 'c' && m[4] == 'a') return disasm_theme::kind_mnem_int;
+
+    if ((len == 3 && m[0] == 'h' && m[1] == 'l' && m[2] == 't')
+        || (len == 3 && m[0] == 'c' && m[1] == 'l' && m[2] == 'i')
+        || (len == 3 && m[0] == 's' && m[1] == 't' && m[2] == 'i')
+        || (len == 5 && m[0] == 'c' && m[1] == 'p' && m[2] == 'u' && m[3] == 'i' && m[4] == 'd')
+        || (len == 5 && m[0] == 'r' && m[1] == 'd' && m[2] == 't' && m[3] == 's' && m[4] == 'c')
+        || (len == 6 && m[0] == 'r' && m[1] == 'd' && m[2] == 't' && m[3] == 's' && m[4] == 'c' && m[5] == 'p')
+        || (len == 6 && m[0] == 'x' && m[1] == 'g' && m[2] == 'e' && m[3] == 't' && m[4] == 'b' && m[5] == 'v')
+        || (len == 6 && m[0] == 'x' && m[1] == 's' && m[2] == 'e' && m[3] == 't' && m[4] == 'b' && m[5] == 'v')
+        || (len == 4 && m[0] == 'l' && m[1] == 'o' && m[2] == 'c' && m[3] == 'k')
+        || (len == 6 && m[0] == 'i' && m[1] == 'n' && m[2] == 'v' && m[3] == 'l' && m[4] == 'p' && m[5] == 'g')
+        || (len == 5 && m[0] == 'm' && m[1] == 'w' && m[2] == 'a' && m[3] == 'i' && m[4] == 't')
+        || (len == 7 && m[0] == 'm' && m[1] == 'o' && m[2] == 'n' && m[3] == 'i' && m[4] == 't' && m[5] == 'o' && m[6] == 'r')
+        || (len >= 2 && m[0] == 'i' && m[1] == 'n' && (len == 2 || m[2] == 's' || m[2] == 'b'))
+        || (len >= 3 && m[0] == 'o' && m[1] == 'u' && m[2] == 't')
+        || (len >= 4 && m[0] == 'l' && m[1] == 'g' && m[2] == 'd' && m[3] == 't')
+        || (len >= 4 && m[0] == 'l' && m[1] == 'i' && m[2] == 'd' && m[3] == 't')
+        || (len >= 4 && m[0] == 's' && m[1] == 'g' && m[2] == 'd' && m[3] == 't')
+        || (len >= 4 && m[0] == 's' && m[1] == 'i' && m[2] == 'd' && m[3] == 't')
+        || (len >= 6 && m[0] == 's' && m[1] == 'w' && m[2] == 'a' && m[3] == 'p' && m[4] == 'g' && m[5] == 's')
+        || (len >= 5 && m[0] == 'w' && m[1] == 'r' && m[2] == 'm' && m[3] == 's' && m[4] == 'r')
+        || (len >= 5 && m[0] == 'r' && m[1] == 'd' && m[2] == 'm' && m[3] == 's' && m[4] == 'r')
+        || (len >= 6 && m[0] == 'w' && m[1] == 'b' && m[2] == 'i' && m[3] == 'n' && m[4] == 'v' && m[5] == 'd')
+        || (len == 3 && m[0] == 'l' && m[1] == 't' && m[2] == 'r')
+        || (len == 3 && m[0] == 's' && m[1] == 't' && m[2] == 'r'))
+        return disasm_theme::kind_mnem_priv;
+
+    if (len >= 3 && m[0] == 'r' && m[1] == 'e' && m[2] == 'p') return disasm_theme::kind_mnem_string;
+    if ((len >= 4 && (m[0] == 'm' && (m[1] == 'o' && m[2] == 'v' && m[3] == 's')))
+        || (len >= 4 && m[0] == 'l' && m[1] == 'o' && m[2] == 'd' && m[3] == 's')
+        || (len >= 4 && m[0] == 's' && m[1] == 't' && m[2] == 'o' && m[3] == 's')
+        || (len >= 4 && m[0] == 's' && m[1] == 'c' && m[2] == 'a' && m[3] == 's')
+        || (len >= 4 && m[0] == 'c' && m[1] == 'm' && m[2] == 'p' && m[3] == 's'))
+        return disasm_theme::kind_mnem_string;
+
+    if (len >= 4 && m[0] == 'c' && m[1] == 'm' && m[2] == 'o' && m[3] == 'v')
+        return disasm_theme::kind_mnem_data;
+
+    if (len >= 3 && m[0] == 's' && m[1] == 'e' && m[2] == 't')
+        return disasm_theme::kind_mnem_logic;
+
+    if (m[0] == 'v' && len >= 3) return disasm_theme::kind_mnem_sse;
+    if (len == 3 && m[0] == 'p' && (m[1] == 'o' && m[2] == 'r')) return disasm_theme::kind_mnem_sse;
+    if (len == 4 && m[0] == 'p' && m[1] == 'x' && m[2] == 'o' && m[3] == 'r') return disasm_theme::kind_mnem_sse;
+    if (m[0] == 'p' && len >= 4 &&
+        !(m[1] == 'u' && m[2] == 's' && m[3] == 'h') &&
+        !(m[1] == 'o' && m[2] == 'p'))
+        return disasm_theme::kind_mnem_sse;
+    if (len >= 5 && (m[len-2] == 'p' && m[len-1] == 's')) return disasm_theme::kind_mnem_sse;
+    if (len >= 5 && (m[len-2] == 'p' && m[len-1] == 'd')) return disasm_theme::kind_mnem_sse;
+    if (len >= 5 && (m[len-2] == 's' && m[len-1] == 's')) return disasm_theme::kind_mnem_sse;
+    if (len >= 5 && (m[len-2] == 's' && m[len-1] == 'd')) return disasm_theme::kind_mnem_sse;
+
+    if ((len == 3 && ((m[0] == 'a' && m[1] == 'd' && m[2] == 'd')
+                      || (m[0] == 's' && m[1] == 'u' && m[2] == 'b')
+                      || (m[0] == 'm' && m[1] == 'u' && m[2] == 'l')
+                      || (m[0] == 'd' && m[1] == 'i' && m[2] == 'v')
+                      || (m[0] == 'i' && m[1] == 'n' && m[2] == 'c')
+                      || (m[0] == 'd' && m[1] == 'e' && m[2] == 'c')
+                      || (m[0] == 'n' && m[1] == 'e' && m[2] == 'g')
+                      || (m[0] == 'a' && m[1] == 'd' && m[2] == 'c')
+                      || (m[0] == 's' && m[1] == 'b' && m[2] == 'b')))
+        || (len == 4 && ((m[0] == 'i' && m[1] == 'm' && m[2] == 'u' && m[3] == 'l')
+                         || (m[0] == 'i' && m[1] == 'd' && m[2] == 'i' && m[3] == 'v')))
+        || (len == 6 && m[0] == 'p' && m[1] == 'o' && m[2] == 'p' && m[3] == 'c' && m[4] == 'n' && m[5] == 't')
+        || (len == 5 && m[0] == 'l' && m[1] == 'z' && m[2] == 'c' && m[3] == 'n' && m[4] == 't')
+        || (len == 5 && m[0] == 't' && m[1] == 'z' && m[2] == 'c' && m[3] == 'n' && m[4] == 't')
+        || (len == 3 && m[0] == 'b' && m[1] == 's' && (m[2] == 'r' || m[2] == 'f')))
+        return disasm_theme::kind_mnem_arith;
+
+    if ((len == 3 && ((m[0] == 'a' && m[1] == 'n' && m[2] == 'd')
+                      || (m[0] == 'x' && m[1] == 'o' && m[2] == 'r')
+                      || (m[0] == 'n' && m[1] == 'o' && m[2] == 't')
+                      || (m[0] == 'r' && m[1] == 'o' && m[2] == 'l')
+                      || (m[0] == 'r' && m[1] == 'o' && m[2] == 'r')
+                      || (m[0] == 's' && m[1] == 'h' && m[2] == 'l')
+                      || (m[0] == 's' && m[1] == 'h' && m[2] == 'r')
+                      || (m[0] == 's' && m[1] == 'a' && m[2] == 'l')
+                      || (m[0] == 's' && m[1] == 'a' && m[2] == 'r')
+                      || (m[0] == 'r' && m[1] == 'c' && m[2] == 'l')
+                      || (m[0] == 'r' && m[1] == 'c' && m[2] == 'r')))
+        || (len == 2 && m[0] == 'o' && m[1] == 'r')
+        || (len == 4 && ((m[0] == 't' && m[1] == 'e' && m[2] == 's' && m[3] == 't'))))
+        return disasm_theme::kind_mnem_logic;
+
+    if ((len == 3 && ((m[0] == 'm' && m[1] == 'o' && m[2] == 'v')
+                      || (m[0] == 'l' && m[1] == 'e' && m[2] == 'a')
+                      || (m[0] == 'p' && m[1] == 'o' && m[2] == 'p')))
+        || (len == 4 && m[0] == 'p' && m[1] == 'u' && m[2] == 's' && m[3] == 'h')
+        || (len == 4 && ((m[0] == 'x' && m[1] == 'c' && m[2] == 'h' && m[3] == 'g')
+                         || (m[0] == 'x' && m[1] == 'a' && m[2] == 'd' && m[3] == 'd')))
+        || (len >= 5 && m[0] == 'm' && m[1] == 'o' && m[2] == 'v')
+        || (len >= 5 && m[0] == 'c' && m[1] == 'm' && m[2] == 'p' && m[3] == 'x' && m[4] == 'c')
+        || (len == 5 && m[0] == 'b' && m[1] == 's' && m[2] == 'w' && m[3] == 'a' && m[4] == 'p')
+        || (len == 5 && m[0] == 'e' && m[1] == 'n' && m[2] == 't' && m[3] == 'e' && m[4] == 'r')
+        || (len == 5 && m[0] == 'l' && m[1] == 'e' && m[2] == 'a' && m[3] == 'v' && m[4] == 'e'))
+        return disasm_theme::kind_mnem_data;
+
+    if (len == 3 && m[0] == 'c' && m[1] == 'm' && m[2] == 'p') return disasm_theme::kind_mnem_arith;
+
+    return disasm_theme::kind_mnem_other;
+}
+
 static ImU32 mnemonic_color(const AsmInstr& ins, float a) {
-    if (ins.is_call || ins.is_branch || ins.is_ret)
-        return aida::ui::with_alpha(disasm_theme::mnemonic(), a);
     if (ins.is_nop)
-        return aida::ui::with_alpha(disasm_theme::bytes(), a * 0.85f);
+        return aida::ui::with_alpha(disasm_theme::mnem_nop(), a * 0.85f);
+    if (ins.is_call)
+        return aida::ui::with_alpha(disasm_theme::mnem_call(), a);
+    if (ins.is_ret)
+        return aida::ui::with_alpha(disasm_theme::mnem_ret(), a);
+    int family = classify_mnemonic_family(ins.mnem);
+    if (family != disasm_theme::kind_mnem_other)
+        return aida::ui::with_alpha(disasm_theme::color_for_kind(family), a);
     if (ins.is_priv)
-        return aida::ui::with_alpha(disasm_theme::keyword(), a);
-    return aida::ui::with_alpha(disasm_theme::mnemonic(), a);
+        return aida::ui::with_alpha(disasm_theme::mnem_priv(), a);
+    if (ins.is_branch)
+        return aida::ui::with_alpha(disasm_theme::mnem_branch(), a);
+    return aida::ui::with_alpha(disasm_theme::mnem_other(), a);
 }
 
 
@@ -576,29 +2408,45 @@ static int find_instr_at(uint64_t addr, const DisasmFile& file) {
 }
 
 static uint64_t find_enclosing_function_start(uint64_t addr, const DisasmFile& file) {
+    if (addr == 0) return 0;
+
+    uint64_t pdata_start = function_index::detail::lookup_function_start_for_addr(addr);
+    if (pdata_start != 0) return pdata_start;
+
     if (file.instrs.empty()) return addr;
     int idx = find_instr_at(addr, file);
-    if (idx < 0) return addr;
+    if (idx < 0 || idx >= static_cast<int>(file.instrs.size())) return addr;
+    if (file.instrs[idx].addr != addr && idx + 1 < static_cast<int>(file.instrs.size())
+        && file.instrs[idx + 1].addr == addr)
+        ++idx;
 
-    const int max_scan = 4096;
+    const int max_scan = 65536;
     int last_terminator = -1;
     for (int i = idx; i >= 0 && (idx - i) < max_scan; --i) {
-        if (i < idx && file.instrs[i].is_ret) {
-            last_terminator = i;
-            break;
+        if (i < idx) {
+            const auto& ip = file.instrs[i];
+            if (ip.is_ret) { last_terminator = i; break; }
+            if (ip.is_priv && ip.len == 1 && ip.raw[0] == 0xCC) { last_terminator = i; break; }
         }
     }
 
     if (last_terminator >= 0 && last_terminator + 1 < static_cast<int>(file.instrs.size())) {
         int candidate = last_terminator + 1;
-        while (candidate < static_cast<int>(file.instrs.size())
-               && file.instrs[candidate].is_nop)
-            ++candidate;
+        while (candidate < static_cast<int>(file.instrs.size())) {
+            const auto& cp = file.instrs[candidate];
+            if (cp.is_nop) { ++candidate; continue; }
+            if (cp.is_priv && cp.len == 1 && cp.raw[0] == 0xCC) { ++candidate; continue; }
+            break;
+        }
         if (candidate <= idx)
             return file.instrs[candidate].addr;
     }
 
-    return file.instrs[0].addr;
+    return addr;
+}
+
+uint64_t enclosing_function_start(uint64_t addr, const DisasmFile& file) {
+    return find_enclosing_function_start(addr, file);
 }
 
 static thread_local bool s_nav_history_suppress_push = false;
@@ -625,7 +2473,14 @@ void goto_address(uint64_t addr, DisasmState& disasm) {
     }
 
     st.selected_row = idx;
-    st.target_scroll_y = idx * 18.f;
+    st.sel_anchor = idx;
+    st.sel_extent = idx;
+    st.sel_dragging = false;
+    st.banner_selected_row = -1;
+    st.banner_sel_anchor = -1;
+    st.banner_sel_extent = -1;
+    st.banner_sel_dragging = false;
+    st.target_scroll_y = (idx + s_banner_line_count) * 18.f;
 }
 
 void navigate_back() {
@@ -633,7 +2488,14 @@ void navigate_back() {
     if (st.nav_pos <= 0 || st.nav_history.empty()) return;
     st.nav_pos--;
     st.selected_row = st.nav_history[st.nav_pos];
-    st.target_scroll_y = st.selected_row * 18.f;
+    st.sel_anchor = st.selected_row;
+    st.sel_extent = st.selected_row;
+    st.sel_dragging = false;
+    st.banner_selected_row = -1;
+    st.banner_sel_anchor = -1;
+    st.banner_sel_extent = -1;
+    st.banner_sel_dragging = false;
+    st.target_scroll_y = (st.selected_row + s_banner_line_count) * 18.f;
 }
 
 void navigate_forward() {
@@ -641,7 +2503,14 @@ void navigate_forward() {
     if (st.nav_pos + 1 >= static_cast<int>(st.nav_history.size())) return;
     st.nav_pos++;
     st.selected_row = st.nav_history[st.nav_pos];
-    st.target_scroll_y = st.selected_row * 18.f;
+    st.sel_anchor = st.selected_row;
+    st.sel_extent = st.selected_row;
+    st.sel_dragging = false;
+    st.banner_selected_row = -1;
+    st.banner_sel_anchor = -1;
+    st.banner_sel_extent = -1;
+    st.banner_sel_dragging = false;
+    st.target_scroll_y = (st.selected_row + s_banner_line_count) * 18.f;
 }
 
 static void launch_xref_scan(uint64_t addr)
@@ -774,8 +2643,29 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
     const auto _ta = [fa](ImU32 c) -> ImU32 { return aida::ui::with_alpha(c, fa); };
     ImDrawList* fdl = ImGui::GetForegroundDrawList();
 
-    float popup_w = std::min(760.f, width * 0.88f);
-    float popup_h = std::min(460.f, height * 0.8f);
+    std::vector<xref_popup_entry_t> results_copy;
+    {
+        std::lock_guard<std::mutex> lk(st.xref_mutex);
+        results_copy = st.xref_results;
+    }
+    bool scanning = st.xref_scanning.load();
+    bool has_results = !results_copy.empty();
+    bool show_empty_state = !has_results && !scanning;
+    bool show_scanning_state = scanning && !has_results;
+
+    float popup_w;
+    float popup_h;
+    if (show_empty_state) {
+        popup_w = std::min(520.f, width * 0.6f);
+        popup_h = std::min(260.f, height * 0.55f);
+    } else if (show_scanning_state) {
+        popup_w = std::min(520.f, width * 0.6f);
+        popup_h = std::min(220.f, height * 0.5f);
+    } else {
+        popup_w = std::min(760.f, width * 0.88f);
+        popup_h = std::min(460.f, height * 0.8f);
+    }
+
     float cx = pos_x + width * 0.5f;
     float cy = pos_y + height * 0.5f;
 
@@ -800,12 +2690,6 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
                  static_cast<unsigned long long>(st.xref_popup_addr));
     }
 
-    std::vector<xref_popup_entry_t> results_copy;
-    {
-        std::lock_guard<std::mutex> lk(st.xref_mutex);
-        results_copy = st.xref_results;
-    }
-
     float header_h = 38.f;
     ui_anim::render_popup_header(fdl, px, py, pw, header_h,
                                   title_buf, accent_r, accent_g, accent_b, fa);
@@ -824,7 +2708,7 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
     float btn_y = toolbar_y + 4.f;
     if (ui_anim::render_toolbar_button(fdl, "Copy Address", btn_x, btn_y,
                                         accent_r, accent_g, accent_b, fa, s_copy_addr_anim, dt,
-                                        false, results_copy.empty())) {
+                                        false, !has_results)) {
         if (st.xref_popup_selected >= 0 && st.xref_popup_selected < static_cast<int>(results_copy.size())) {
             char addr_buf_copy[20];
             snprintf(addr_buf_copy, sizeof(addr_buf_copy), "%llX",
@@ -835,7 +2719,7 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
     btn_x += ui_anim::toolbar_button_width("Copy Address") + 4.f;
     if (ui_anim::render_toolbar_button(fdl, "Copy All", btn_x, btn_y,
                                         accent_r, accent_g, accent_b, fa, s_copy_all_anim, dt,
-                                        false, results_copy.empty())) {
+                                        false, !has_results)) {
         std::string all_text;
         for (auto& e : results_copy) {
             char line_buf[256];
@@ -847,257 +2731,336 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
             ImGui::SetClipboardText(all_text.c_str());
     }
 
-    bool scanning = st.xref_scanning.load();
-
-    if (scanning) {
-        s_xref_anim_t += dt * 5.f;
-        float spinner_x = px + pw - 28.f;
-        float spinner_y = py + header_h * 0.5f;
-        ImU32 spin_col = aida::ui::with_alpha(tk.accent_u32, fa);
-        ui_anim::render_spinner(fdl, spinner_x, spinner_y, 6.f, 2.f, spin_col, s_xref_anim_t);
-    }
-
     char count_buf[32];
     snprintf(count_buf, sizeof(count_buf), "%zu result%s",
              results_copy.size(), results_copy.size() == 1 ? "" : "s");
-    ImVec2 cs = ImGui::CalcTextSize(count_buf);
-    fdl->AddText(ImVec2(px + pw - cs.x - (scanning ? 42.f : 14.f), py + 11.f),
-        _ta(tk.text_secondary), count_buf);
+    ImVec2 count_ts = ImGui::CalcTextSize(count_buf);
+    float count_pill_w = count_ts.x + 16.f;
+    float count_pill_x = px + pw - count_pill_w - 12.f;
+    float count_pill_y = toolbar_y + (toolbar_h - (count_ts.y + 4.f)) * 0.5f;
+    ImU32 pill_color = has_results ? tk.accent_u32 : tk.text_dim;
+    ui_anim::render_status_pill(fdl, count_pill_x, count_pill_y, count_buf, pill_color, fa);
+
+    if (scanning && has_results) {
+        s_xref_anim_t += dt * 5.f;
+        float spinner_x = count_pill_x - 14.f;
+        float spinner_y = count_pill_y + (count_ts.y + 4.f) * 0.5f;
+        ImU32 spin_col = aida::ui::with_alpha(tk.accent_u32, fa);
+        ui_anim::render_spinner(fdl, spinner_x, spinner_y, 6.f, 2.f, spin_col, s_xref_anim_t);
+    }
 
     float toolbar_end = toolbar_y + toolbar_h;
     const float footer_h = 26.f;
     float table_y = toolbar_end + 2.f;
     float table_h = ph - header_h - toolbar_h - 4.f - footer_h;
     const float row_h = 24.f;
-
-    float col_type_w = 54.f;
-    float col_addr_w = 145.f;
-    float col_func_w = 200.f;
-    float col_disasm_w = pw - col_type_w - col_addr_w - col_func_w - 30.f;
-    if (col_disasm_w < 100.f) col_disasm_w = 100.f;
-
-    ui_anim::table_col_t xref_cols[] = {
-        { "Type", col_type_w }, { "Address", col_addr_w },
-        { "Function", col_func_w }, { "Disassembly", col_disasm_w }
-    };
-    ui_anim::render_table_header(fdl, px, table_y, pw, row_h, xref_cols, 4,
-                                  accent_r, accent_g, accent_b, fa);
-
     float list_y = table_y + row_h;
     float list_h = table_h - row_h;
     if (list_h < 1.f) list_h = 1.f;
+    bool popup_hovered = false;
 
-    float content_h = static_cast<float>(results_copy.size()) * row_h;
-    int n_results = static_cast<int>(results_copy.size());
+    if (has_results) {
+        float col_type_w = 54.f;
+        float col_addr_w = 145.f;
+        float col_func_w = 200.f;
+        float col_disasm_w = pw - col_type_w - col_addr_w - col_func_w - 30.f;
+        if (col_disasm_w < 100.f) col_disasm_w = 100.f;
 
-    bool popup_hovered = ImGui::IsMouseHoveringRect(ImVec2(px, list_y), ImVec2(px + pw, list_y + list_h));
-    if (popup_hovered) {
-        float wheel = ImGui::GetIO().MouseWheel;
-        if (wheel != 0.f)
-            st.xref_popup_target_scroll -= wheel * row_h * 3.f;
-    }
+        ui_anim::table_col_t xref_cols[] = {
+            { "Type", col_type_w }, { "Address", col_addr_w },
+            { "Function", col_func_w }, { "Disassembly", col_disasm_w }
+        };
+        ui_anim::render_table_header(fdl, px, table_y, pw, row_h, xref_cols, 4,
+                                      accent_r, accent_g, accent_b, fa);
 
-    if (st.xref_popup_open) {
-        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) {
-            st.xref_popup_selected = std::min(st.xref_popup_selected + 1, n_results - 1);
-            if (st.xref_popup_selected < 0) st.xref_popup_selected = 0;
-            float sel_y = static_cast<float>(st.xref_popup_selected) * row_h;
-            if (sel_y < st.xref_popup_target_scroll)
-                st.xref_popup_target_scroll = sel_y;
-            if (sel_y + row_h > st.xref_popup_target_scroll + list_h)
-                st.xref_popup_target_scroll = sel_y + row_h - list_h;
-        }
-        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true)) {
-            st.xref_popup_selected = std::max(st.xref_popup_selected - 1, 0);
-            float sel_y = static_cast<float>(st.xref_popup_selected) * row_h;
-            if (sel_y < st.xref_popup_target_scroll)
-                st.xref_popup_target_scroll = sel_y;
-            if (sel_y + row_h > st.xref_popup_target_scroll + list_h)
-                st.xref_popup_target_scroll = sel_y + row_h - list_h;
-        }
-        if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) && st.xref_popup_selected >= 0 &&
-            st.xref_popup_selected < n_results) {
-            goto_address(results_copy[static_cast<size_t>(st.xref_popup_selected)].addr, disasm);
-            st.xref_popup_open = false;
-        }
-    }
+        float content_h = static_cast<float>(results_copy.size()) * row_h;
+        int n_results = static_cast<int>(results_copy.size());
 
-    float max_scroll = std::max(0.f, content_h - list_h);
-    st.xref_popup_target_scroll = std::max(0.f, std::min(st.xref_popup_target_scroll, max_scroll));
-    ui_anim::smooth_scroll(st.xref_popup_scroll, st.xref_popup_target_scroll, 16.f, dt);
-
-    fdl->PushClipRect(ImVec2(px + 1.f, list_y), ImVec2(px + pw - 12.f, list_y + list_h), true);
-
-    int first_vis = static_cast<int>(st.xref_popup_scroll / row_h);
-    int last_vis = first_vis + static_cast<int>(list_h / row_h) + 2;
-    if (first_vis < 0) first_vis = 0;
-    if (last_vis > n_results) last_vis = n_results;
-
-    for (int i = first_vis; i < last_vis; ++i) {
-        float ry = list_y + static_cast<float>(i) * row_h - st.xref_popup_scroll;
-        if (ry + row_h < list_y || ry > list_y + list_h) continue;
-
-        auto& e = results_copy[static_cast<size_t>(i)];
-
-        ImVec2 rmin(px + 4.f, ry);
-        ImVec2 rmax(px + pw - 14.f, ry + row_h);
-
-        bool row_hov = ImGui::IsMouseHoveringRect(rmin, rmax);
-        bool row_sel = (st.xref_popup_selected == i);
-
-        if (row_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-            st.xref_popup_selected = i;
-
-        if (row_hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-            goto_address(e.addr, disasm);
-            st.xref_popup_open = false;
+        popup_hovered = ImGui::IsMouseHoveringRect(ImVec2(px, list_y), ImVec2(px + pw, list_y + list_h));
+        if (popup_hovered) {
+            float wheel = ImGui::GetIO().MouseWheel;
+            if (wheel != 0.f)
+                st.xref_popup_target_scroll -= wheel * row_h * 3.f;
         }
 
-        float row_entrance = 1.f;
-        if (st.xref_popup_fade < 0.95f) {
-            float delay = static_cast<float>(i - first_vis) * 0.03f;
-            float t = (st.xref_popup_fade - delay) / (1.f - delay);
-            if (t < 0.f) t = 0.f;
-            if (t > 1.f) t = 1.f;
-            row_entrance = t;
-        }
-        float row_alpha = fa * row_entrance;
-
-        if (row_sel) {
-            fdl->AddRectFilled(rmin, rmax,
-                aida::ui::with_alpha(tk.selection, row_alpha));
-            fdl->AddRectFilled(ImVec2(rmin.x, rmin.y), ImVec2(rmin.x + 3.f, rmax.y),
-                aida::ui::with_alpha(tk.accent_u32, row_alpha));
-        } else if (row_hov) {
-            fdl->AddRectFilled(rmin, rmax, aida::ui::with_alpha(tk.hover_wash, row_alpha));
-        } else if (i & 1) {
-            fdl->AddRectFilled(rmin, rmax,
-                aida::ui::with_alpha(IM_COL32(255, 255, 255, 6), row_alpha));
-        }
-
-        float rx = px + 10.f;
-
-        ImU32 type_col;
-        const char* type_str;
-        switch (e.type) {
-        case 0:  type_str = "CALL"; type_col = aida::ui::with_alpha(tk.info,    row_alpha); break;
-        case 1:  type_str = "JMP";  type_col = aida::ui::with_alpha(tk.warning, row_alpha); break;
-        case 2:  type_str = "Jcc";  type_col = aida::ui::with_alpha(tk.warning, row_alpha * 0.85f); break;
-        case 3:  type_str = "LEA";  type_col = aida::ui::with_alpha(tk.success, row_alpha); break;
-        default: type_str = "DATA"; type_col = aida::ui::with_alpha(tk.text_secondary, row_alpha); break;
-        }
-
-        ImVec2 tsz = ImGui::CalcTextSize(type_str);
-        float badge_w = tsz.x + 10.f;
-        fdl->AddRectFilled(ImVec2(rx, ry + 3.f), ImVec2(rx + badge_w, ry + row_h - 3.f),
-            aida::ui::with_alpha(type_col, 0.18f), 3.f);
-        fdl->AddText(ImVec2(rx + 5.f, ry + 4.f), type_col, type_str);
-        rx += col_type_w;
-
-        char addr_buf[20];
-        snprintf(addr_buf, sizeof(addr_buf), "%016llX", static_cast<unsigned long long>(e.addr));
-        fdl->AddText(ImVec2(rx, ry + 4.f),
-            aida::ui::with_alpha(tk.text_address, row_alpha), addr_buf);
-        rx += col_addr_w;
-
-        const std::string& fn_text = !e.function_name.empty() ? e.function_name : e.module_name;
-        if (!fn_text.empty()) {
-            size_t max_fn = 28;
-            std::string fn_short = fn_text.size() > max_fn
-                ? fn_text.substr(0, max_fn - 2) + ".." : fn_text;
-            ImU32 fn_col = !e.function_name.empty()
-                ? aida::ui::with_alpha(tk.text_primary, row_alpha)
-                : aida::ui::with_alpha(tk.text_secondary, row_alpha);
-            fdl->AddText(ImVec2(rx, ry + 4.f), fn_col, fn_short.c_str());
-        } else {
-            fdl->AddText(ImVec2(rx, ry + 4.f),
-                aida::ui::with_alpha(tk.text_dim, row_alpha), "-");
-        }
-        rx += col_func_w;
-
-        const char* disasm_end = e.disasm_text.c_str() + std::min(e.disasm_text.size(), static_cast<size_t>(60));
-        fdl->AddText(ImVec2(rx, ry + 4.f),
-            aida::ui::with_alpha(tk.text_primary, row_alpha),
-            e.disasm_text.c_str(), disasm_end);
-
-    }
-
-    fdl->PopClipRect();
-
-    if (content_h > list_h && list_h > 0.f) {
-        float sb_x = px + pw - 10.f;
-        float sb_track_h = list_h;
-        float ratio = list_h / content_h;
-        float thumb_h = std::max(20.f, sb_track_h * ratio);
-        float scroll_range = content_h - list_h;
-        float thumb_y = list_y + (scroll_range > 0.f
-            ? (st.xref_popup_scroll / scroll_range) * (sb_track_h - thumb_h) : 0.f);
-
-        bool sb_hov = ImGui::IsMouseHoveringRect(
-            ImVec2(sb_x - 4.f, list_y), ImVec2(sb_x + 8.f, list_y + sb_track_h));
-
-        if (sb_hov || st.xref_popup_sb_dragging) {
-            fdl->AddRectFilled(ImVec2(sb_x, list_y), ImVec2(sb_x + 6.f, list_y + sb_track_h),
-                aida::ui::with_alpha(tk.hover_wash, fa), 3.f);
-            fdl->AddRectFilled(ImVec2(sb_x, thumb_y), ImVec2(sb_x + 6.f, thumb_y + thumb_h),
-                aida::ui::with_alpha(st.xref_popup_sb_dragging ? tk.accent_u32 : tk.accent_dim, fa), 3.f);
-        }
-
-        if (sb_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            st.xref_popup_sb_dragging = true;
-            st.xref_popup_sb_drag_offset = ImGui::GetIO().MousePos.y - thumb_y;
-        }
-        if (st.xref_popup_sb_dragging) {
-            if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-                float my = ImGui::GetIO().MousePos.y - st.xref_popup_sb_drag_offset;
-                float drag_ratio = (my - list_y) / (sb_track_h - thumb_h);
-                drag_ratio = std::max(0.f, std::min(1.f, drag_ratio));
-                st.xref_popup_target_scroll = drag_ratio * scroll_range;
-                st.xref_popup_scroll = st.xref_popup_target_scroll;
-            } else {
-                st.xref_popup_sb_dragging = false;
+        if (st.xref_popup_open) {
+            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) {
+                st.xref_popup_selected = std::min(st.xref_popup_selected + 1, n_results - 1);
+                if (st.xref_popup_selected < 0) st.xref_popup_selected = 0;
+                float sel_y = static_cast<float>(st.xref_popup_selected) * row_h;
+                if (sel_y < st.xref_popup_target_scroll)
+                    st.xref_popup_target_scroll = sel_y;
+                if (sel_y + row_h > st.xref_popup_target_scroll + list_h)
+                    st.xref_popup_target_scroll = sel_y + row_h - list_h;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true)) {
+                st.xref_popup_selected = std::max(st.xref_popup_selected - 1, 0);
+                float sel_y = static_cast<float>(st.xref_popup_selected) * row_h;
+                if (sel_y < st.xref_popup_target_scroll)
+                    st.xref_popup_target_scroll = sel_y;
+                if (sel_y + row_h > st.xref_popup_target_scroll + list_h)
+                    st.xref_popup_target_scroll = sel_y + row_h - list_h;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) && st.xref_popup_selected >= 0 &&
+                st.xref_popup_selected < n_results) {
+                goto_address(results_copy[static_cast<size_t>(st.xref_popup_selected)].addr, disasm);
+                st.xref_popup_open = false;
             }
         }
-    }
 
-    if (results_copy.empty() && !scanning) {
-        float cw = std::min(pw - 32.f, 460.f);
-        if (cw < 140.f) cw = std::max(140.f, pw - 20.f);
-        float ccx = px + (pw - cw) * 0.5f;
-        float ccy = list_y + list_h * 0.5f - 26.f;
-        char empty_buf[160];
-        snprintf(empty_buf, sizeof(empty_buf),
-                 "No cross-references found for 0x%llX.",
+        float max_scroll = std::max(0.f, content_h - list_h);
+        st.xref_popup_target_scroll = std::max(0.f, std::min(st.xref_popup_target_scroll, max_scroll));
+        ui_anim::smooth_scroll(st.xref_popup_scroll, st.xref_popup_target_scroll, 16.f, dt);
+
+        fdl->PushClipRect(ImVec2(px + 1.f, list_y), ImVec2(px + pw - 12.f, list_y + list_h), true);
+
+        int first_vis = static_cast<int>(st.xref_popup_scroll / row_h);
+        int last_vis = first_vis + static_cast<int>(list_h / row_h) + 2;
+        if (first_vis < 0) first_vis = 0;
+        if (last_vis > n_results) last_vis = n_results;
+
+        for (int i = first_vis; i < last_vis; ++i) {
+            float ry = list_y + static_cast<float>(i) * row_h - st.xref_popup_scroll;
+            if (ry + row_h < list_y || ry > list_y + list_h) continue;
+
+            auto& e = results_copy[static_cast<size_t>(i)];
+
+            ImVec2 rmin(px + 4.f, ry);
+            ImVec2 rmax(px + pw - 14.f, ry + row_h);
+
+            bool row_hov = ImGui::IsMouseHoveringRect(rmin, rmax);
+            bool row_sel = (st.xref_popup_selected == i);
+
+            if (row_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                st.xref_popup_selected = i;
+
+            if (row_hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                goto_address(e.addr, disasm);
+                st.xref_popup_open = false;
+            }
+
+            float row_entrance = 1.f;
+            if (st.xref_popup_fade < 0.95f) {
+                float delay = static_cast<float>(i - first_vis) * 0.03f;
+                float t = (st.xref_popup_fade - delay) / (1.f - delay);
+                if (t < 0.f) t = 0.f;
+                if (t > 1.f) t = 1.f;
+                row_entrance = t;
+            }
+            float row_alpha = fa * row_entrance;
+
+            if (row_sel) {
+                fdl->AddRectFilled(rmin, rmax,
+                    aida::ui::with_alpha(tk.selection, row_alpha));
+                fdl->AddRectFilled(ImVec2(rmin.x, rmin.y), ImVec2(rmin.x + 3.f, rmax.y),
+                    aida::ui::with_alpha(tk.accent_u32, row_alpha));
+                fdl->AddLine(ImVec2(rmin.x, rmax.y - 1.f), ImVec2(rmax.x, rmax.y - 1.f),
+                    aida::ui::with_alpha(tk.accent_dim, row_alpha), 1.5f);
+            } else if (row_hov) {
+                fdl->AddRectFilled(rmin, rmax, aida::ui::with_alpha(tk.hover_wash, row_alpha));
+            } else if (i & 1) {
+                fdl->AddRectFilled(rmin, rmax,
+                    aida::ui::with_alpha(IM_COL32(255, 255, 255, 6), row_alpha));
+            }
+
+            float rx = px + 10.f;
+
+            ImU32 type_col;
+            const char* type_str;
+            switch (e.type) {
+            case 0:  type_str = "CALL"; type_col = aida::ui::with_alpha(tk.info,    row_alpha); break;
+            case 1:  type_str = "JMP";  type_col = aida::ui::with_alpha(tk.warning, row_alpha); break;
+            case 2:  type_str = "Jcc";  type_col = aida::ui::with_alpha(tk.warning, row_alpha * 0.85f); break;
+            case 3:  type_str = "LEA";  type_col = aida::ui::with_alpha(tk.success, row_alpha); break;
+            default: type_str = "DATA"; type_col = aida::ui::with_alpha(tk.text_secondary, row_alpha); break;
+            }
+
+            ImVec2 tsz = ImGui::CalcTextSize(type_str);
+            float badge_w = tsz.x + 10.f;
+            fdl->AddRectFilled(ImVec2(rx, ry + 3.f), ImVec2(rx + badge_w, ry + row_h - 3.f),
+                aida::ui::with_alpha(type_col, 0.18f), 3.f);
+            fdl->AddText(ImVec2(rx + 5.f, ry + 4.f), type_col, type_str);
+            rx += col_type_w;
+
+            char addr_buf[20];
+            snprintf(addr_buf, sizeof(addr_buf), "%016llX", static_cast<unsigned long long>(e.addr));
+            fdl->AddText(ImVec2(rx, ry + 4.f),
+                aida::ui::with_alpha(tk.text_address, row_alpha), addr_buf);
+            rx += col_addr_w;
+
+            const std::string& fn_text = !e.function_name.empty() ? e.function_name : e.module_name;
+            if (!fn_text.empty()) {
+                size_t max_fn = 28;
+                std::string fn_short = fn_text.size() > max_fn
+                    ? fn_text.substr(0, max_fn - 2) + ".." : fn_text;
+                ImU32 fn_col = !e.function_name.empty()
+                    ? aida::ui::with_alpha(tk.text_primary, row_alpha)
+                    : aida::ui::with_alpha(tk.text_secondary, row_alpha);
+                fdl->AddText(ImVec2(rx, ry + 4.f), fn_col, fn_short.c_str());
+            } else {
+                fdl->AddText(ImVec2(rx, ry + 4.f),
+                    aida::ui::with_alpha(tk.text_dim, row_alpha), "-");
+            }
+            rx += col_func_w;
+
+            const char* disasm_end = e.disasm_text.c_str() + std::min(e.disasm_text.size(), static_cast<size_t>(60));
+            fdl->AddText(ImVec2(rx, ry + 4.f),
+                aida::ui::with_alpha(tk.text_primary, row_alpha),
+                e.disasm_text.c_str(), disasm_end);
+
+        }
+
+        fdl->PopClipRect();
+
+        if (content_h > list_h && list_h > 0.f) {
+            float sb_x = px + pw - 10.f;
+            float sb_track_h = list_h;
+            float ratio = list_h / content_h;
+            float thumb_h = std::max(20.f, sb_track_h * ratio);
+            float scroll_range = content_h - list_h;
+            float thumb_y = list_y + (scroll_range > 0.f
+                ? (st.xref_popup_scroll / scroll_range) * (sb_track_h - thumb_h) : 0.f);
+
+            bool sb_hov = ImGui::IsMouseHoveringRect(
+                ImVec2(sb_x - 4.f, list_y), ImVec2(sb_x + 8.f, list_y + sb_track_h));
+
+            if (sb_hov || st.xref_popup_sb_dragging) {
+                fdl->AddRectFilled(ImVec2(sb_x, list_y), ImVec2(sb_x + 6.f, list_y + sb_track_h),
+                    aida::ui::with_alpha(tk.hover_wash, fa), 3.f);
+                fdl->AddRectFilled(ImVec2(sb_x, thumb_y), ImVec2(sb_x + 6.f, thumb_y + thumb_h),
+                    aida::ui::with_alpha(st.xref_popup_sb_dragging ? tk.accent_u32 : tk.accent_dim, fa), 3.f);
+            }
+
+            if (sb_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                st.xref_popup_sb_dragging = true;
+                st.xref_popup_sb_drag_offset = ImGui::GetIO().MousePos.y - thumb_y;
+            }
+            if (st.xref_popup_sb_dragging) {
+                if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    float my = ImGui::GetIO().MousePos.y - st.xref_popup_sb_drag_offset;
+                    float drag_ratio = (my - list_y) / (sb_track_h - thumb_h);
+                    drag_ratio = std::max(0.f, std::min(1.f, drag_ratio));
+                    st.xref_popup_target_scroll = drag_ratio * scroll_range;
+                    st.xref_popup_scroll = st.xref_popup_target_scroll;
+                } else {
+                    st.xref_popup_sb_dragging = false;
+                }
+            }
+        }
+    } else if (show_scanning_state) {
+        s_xref_anim_t += dt * 5.f;
+        float region_top = toolbar_end + 2.f;
+        float region_bottom = py + ph - footer_h;
+        float region_cy = (region_top + region_bottom) * 0.5f;
+        float region_cx = px + pw * 0.5f;
+
+        ImU32 spin_col = aida::ui::with_alpha(tk.accent_u32, fa);
+        ui_anim::render_spinner(fdl, region_cx, region_cy - 12.f, 10.f, 2.5f, spin_col, s_xref_anim_t);
+
+        const char* scan_text = "Scanning for cross-references\xe2\x80\xa6";
+        ImVec2 stsz = ImGui::CalcTextSize(scan_text);
+        fdl->AddText(ImVec2(region_cx - stsz.x * 0.5f, region_cy + 14.f),
+            _ta(tk.text_secondary), scan_text);
+    } else {
+        float region_top = toolbar_end + 2.f;
+        float region_bottom = py + ph - footer_h;
+        float region_h = region_bottom - region_top;
+        float region_cx = px + pw * 0.5f;
+
+        float circle_r = 28.f;
+        float circle_cy = region_top + 32.f + circle_r;
+        if (region_h < circle_r * 2.f + 110.f) {
+            circle_cy = region_top + 22.f + circle_r;
+        }
+
+        ImU32 bg_col = aida::ui::with_alpha(tk.accent_glow, fa * 0.6f);
+        ImU32 border_col = aida::ui::with_alpha(tk.accent_dim, fa);
+        fdl->AddCircleFilled(ImVec2(region_cx, circle_cy), circle_r, bg_col, 32);
+        fdl->AddCircle(ImVec2(region_cx, circle_cy), circle_r, border_col, 32, 1.5f);
+
+        ImU32 glyph_col = aida::ui::with_alpha(tk.accent_u32, fa);
+        fdl->AddCircleFilled(ImVec2(region_cx, circle_cy - 9.f), 2.4f, glyph_col, 12);
+        fdl->AddLine(ImVec2(region_cx, circle_cy - 2.f),
+                     ImVec2(region_cx, circle_cy + 12.f),
+                     glyph_col, 2.5f);
+
+        ImFont* title_font = aida::ui::fonts::body_strong();
+        if (!title_font) title_font = ImGui::GetFont();
+        float title_size = 15.f;
+        const char* title_text = "No cross-references";
+        ImVec2 title_sz = title_font->CalcTextSizeA(title_size, FLT_MAX, 0.f, title_text);
+        float title_y = circle_cy + circle_r + 14.f;
+        fdl->AddText(title_font, title_size,
+            ImVec2(region_cx - title_sz.x * 0.5f, title_y),
+            _ta(tk.text_primary), title_text);
+
+        char sub_buf[160];
+        snprintf(sub_buf, sizeof(sub_buf),
+                 "Nothing in this module calls or references 0x%llX.",
                  static_cast<unsigned long long>(st.xref_popup_addr));
-        ui_anim::render_inline_callout(fdl, ccx, ccy, cw, 52.f,
-            empty_buf,
-            ui_anim::callout_kind_t::info, accent_r, accent_g, accent_b, fa);
+        ImVec2 sub_sz = ImGui::CalcTextSize(sub_buf);
+        float sub_y = title_y + title_sz.y + 6.f;
+        fdl->AddText(ImVec2(region_cx - sub_sz.x * 0.5f, sub_y),
+            _ta(tk.text_secondary), sub_buf);
+
+        const char* hint_text = "Press Esc to close \xc2\xb7 Try Shift+X for extended scan";
+        ImVec2 hint_sz = ImGui::CalcTextSize(hint_text);
+        float hint_y = region_bottom - hint_sz.y - 8.f;
+        if (hint_y < sub_y + sub_sz.y + 10.f)
+            hint_y = sub_y + sub_sz.y + 10.f;
+        fdl->AddText(ImVec2(region_cx - hint_sz.x * 0.5f, hint_y),
+            _ta(tk.text_dim), hint_text);
     }
 
     {
-        float fx = px + 12.f;
+        struct chip_part_t {
+            const char* chip;
+            const char* label;
+        };
+        const chip_part_t parts[] = {
+            { "\xe2\x86\x91\xe2\x86\x93", "navigate" },
+            { "Enter",                    "jump"     },
+            { "Esc",                      "close"    },
+            { "Dbl-click",                "goto"     },
+        };
+        const int part_count = static_cast<int>(sizeof(parts) / sizeof(parts[0]));
+
+        const float gap_chip_label = 6.f;
+        const float gap_pair_pair = 12.f;
+        const float chip_pad_x = 6.f;
+        const float divider_h = 12.f;
+
+        float total_w = 0.f;
+        float chip_w_arr[4];
+        float lbl_w_arr[4];
+        for (int i = 0; i < part_count; ++i) {
+            ImVec2 cts = ImGui::CalcTextSize(parts[i].chip);
+            chip_w_arr[i] = cts.x + chip_pad_x * 2.f;
+            ImVec2 lts = ImGui::CalcTextSize(parts[i].label);
+            lbl_w_arr[i] = lts.x;
+            total_w += chip_w_arr[i] + gap_chip_label + lbl_w_arr[i];
+            if (i < part_count - 1)
+                total_w += gap_pair_pair;
+        }
+
+        float fx = px + pw - 14.f - total_w;
+        if (fx < px + 12.f) fx = px + 12.f;
         float fy = py + ph - footer_h + 4.f;
-        float cw;
-        cw = ui_anim::render_kbd_chip(fdl, fx, fy, "\xe2\x86\x91", fa);
-        fx += cw + 4.f;
-        cw = ui_anim::render_kbd_chip(fdl, fx, fy, "\xe2\x86\x93", fa);
-        fx += cw + 6.f;
-        fdl->AddText(ImVec2(fx, fy + 2.f), _ta(tk.text_dim), "navigate");
-        fx += ImGui::CalcTextSize("navigate").x + 14.f;
 
-        cw = ui_anim::render_kbd_chip(fdl, fx, fy, "Enter", fa);
-        fx += cw + 6.f;
-        fdl->AddText(ImVec2(fx, fy + 2.f), _ta(tk.text_dim), "jump");
-        fx += ImGui::CalcTextSize("jump").x + 14.f;
-
-        cw = ui_anim::render_kbd_chip(fdl, fx, fy, "Esc", fa);
-        fx += cw + 6.f;
-        fdl->AddText(ImVec2(fx, fy + 2.f), _ta(tk.text_dim), "close");
-        fx += ImGui::CalcTextSize("close").x + 14.f;
-
-        cw = ui_anim::render_kbd_chip(fdl, fx, fy, "Dbl-click", fa);
-        fx += cw + 6.f;
-        fdl->AddText(ImVec2(fx, fy + 2.f), _ta(tk.text_dim), "goto");
+        for (int i = 0; i < part_count; ++i) {
+            ui_anim::render_kbd_chip(fdl, fx, fy, parts[i].chip, fa);
+            fx += chip_w_arr[i] + gap_chip_label;
+            fdl->AddText(ImVec2(fx, fy + 2.f), _ta(tk.text_dim), parts[i].label);
+            fx += lbl_w_arr[i];
+            if (i < part_count - 1) {
+                float div_x = fx + gap_pair_pair * 0.5f;
+                float div_y0 = fy + (16.f - divider_h) * 0.5f + 2.f;
+                fdl->AddLine(ImVec2(div_x, div_y0),
+                             ImVec2(div_x, div_y0 + divider_h),
+                             _ta(tk.border_subtle), 1.f);
+                fx += gap_pair_pair;
+            }
+        }
     }
 
     if (!st.xref_popup_open && !popup_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -1112,6 +3075,8 @@ void render(float pos_x, float pos_y, float width, float height,
 
     const uint64_t frame_t0_ns = now_ns();
 
+    ensure_pdb_event_subscriptions();
+
     auto& st    = g_state;
 
     {
@@ -1120,9 +3085,15 @@ void render(float pos_x, float pos_y, float width, float height,
         const uint64_t cur_img = disasm.file.image_base;
         const uint64_t prev_img = s_last_loaded_image_base.load(std::memory_order_acquire);
         if (cur_pid != prev_pid || cur_img != prev_img) {
+            diag::log_tagged_critical_fmt("disasm_view",
+                "attach_state_changed cur_pid=%u prev_pid=%u cur_img=0x%llX prev_img=0x%llX",
+                cur_pid, prev_pid,
+                (unsigned long long)cur_img, (unsigned long long)prev_img);
             s_last_attached_pid.store(cur_pid, std::memory_order_release);
             s_last_loaded_image_base.store(cur_img, std::memory_order_release);
+            diag::log_tagged_critical("disasm_view", "pre_on_attach_state_changed");
             on_attach_state_changed();
+            diag::log_tagged_critical("disasm_view", "post_on_attach_state_changed");
         }
     }
 
@@ -1156,7 +3127,14 @@ void render(float pos_x, float pos_y, float width, float height,
                 if (disasm.file.instrs[mid].addr < scroll_addr) { best = mid; lo = mid + 1; }
                 else hi = mid - 1;
             }
+            bool had_multi_selection = (st.sel_anchor >= 0 && st.sel_extent >= 0
+                && st.sel_anchor != st.sel_extent);
             st.selected_row = best;
+            if (!had_multi_selection) {
+                st.sel_anchor = best;
+                st.sel_extent = best;
+                st.sel_dragging = false;
+            }
         }
     }
 
@@ -1293,6 +3271,7 @@ void render(float pos_x, float pos_y, float width, float height,
             s_first_load_anim = 0.f;
             s_row_entrance.clear();
             s_row_hover.clear();
+            s_banner_row_hover.clear();
             s_last_known_n = n;
         }
     }
@@ -1379,14 +3358,38 @@ void render(float pos_x, float pos_y, float width, float height,
     float oy_content = oy + nav_band_h;
     float content_height = height - nav_band_h;
 
+    {
+        uint64_t fmb_state = static_cast<uint64_t>(
+            file_metadata_banner::detail::cache().state.load(std::memory_order_acquire));
+        uint64_t img_sig = file.image_base ^ (static_cast<uint64_t>(s_format_gen.load(std::memory_order_acquire)) << 32);
+        uint64_t sig = (fmb_state << 1) ^ img_sig;
+        uint64_t cur = s_banner_cache_signature.load(std::memory_order_acquire);
+        if (sig != cur || s_banner_cache.empty()) {
+            rebuild_banner_lines(file);
+            s_banner_line_count = static_cast<int>(s_banner_cache.size());
+            s_banner_cache_signature.store(sig, std::memory_order_release);
+            s_banner_row_hover.clear();
+            const int total_b = s_banner_line_count;
+            if (st.banner_selected_row >= total_b) st.banner_selected_row = -1;
+            if (st.banner_sel_anchor >= total_b)   st.banner_sel_anchor = -1;
+            if (st.banner_sel_extent >= total_b)   st.banner_sel_extent = -1;
+        }
+    }
+    const int banner_lines = s_banner_line_count;
 
     ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, 20.f, dt);
-    float max_scroll = std::max(0.f, n * line_h - content_height + line_h);
+    float max_scroll = std::max(0.f, (n + banner_lines) * line_h - content_height + line_h);
     st.target_scroll_y = std::max(0.f, std::min(st.target_scroll_y, max_scroll));
     st.scroll_y = std::max(0.f, std::min(st.scroll_y, max_scroll));
 
 
-    bool hovered = ImGui::IsMouseHoveringRect(ImVec2(ox, oy_content), ImVec2(ox + width, oy_content + content_height));
+    static bool s_ctx_popup_was_open_prev = false;
+    const bool ctx_popup_open_now = ImGui::IsPopupOpen("##disasm_view_ctx")
+        || ImGui::IsPopupOpen("##disasm_view_banner_ctx");
+    const bool ctx_input_locked = ctx_popup_open_now || s_ctx_popup_was_open_prev;
+    s_ctx_popup_was_open_prev = ctx_popup_open_now;
+
+    bool hovered = !ctx_input_locked && ImGui::IsMouseHoveringRect(ImVec2(ox, oy_content), ImVec2(ox + width, oy_content + content_height));
     if (hovered) {
         float wheel = ImGui::GetIO().MouseWheel;
         if (wheel != 0.f)
@@ -1421,8 +3424,14 @@ void render(float pos_x, float pos_y, float width, float height,
     dl->AddRectFilled(ImVec2(ox, oy_content), ImVec2(ox + gutter_w, oy_content + content_height),
         aida::ui::with_alpha(disasm_theme::gutter_bg(), a));
 
-    int first_row = std::max(0, static_cast<int>(st.scroll_y / line_h) - 1);
-    int last_row  = std::min(n - 1, static_cast<int>((st.scroll_y + content_height) / line_h) + 1);
+    int first_vrow = std::max(0, static_cast<int>(st.scroll_y / line_h) - 1);
+    int last_vrow  = static_cast<int>((st.scroll_y + content_height) / line_h) + 1;
+    int first_row = std::max(0, first_vrow - banner_lines);
+    int last_row  = std::min(n - 1, last_vrow - banner_lines);
+    if (last_row < first_row) {
+        first_row = 0;
+        last_row = -1;
+    }
 
     if (n > 0 && first_row <= last_row && !throttled) {
         uint64_t now_w = now_ns();
@@ -1435,6 +3444,120 @@ void render(float pos_x, float pos_y, float width, float height,
             function_index::warm_range(lo_va, hi_va);
             symbol_classifier::warm_range(lo_va, hi_va);
         }
+    }
+
+    const int banner_sel_lo = (st.banner_sel_anchor < 0 || st.banner_sel_extent < 0)
+        ? -1 : std::min(st.banner_sel_anchor, st.banner_sel_extent);
+    const int banner_sel_hi = (st.banner_sel_anchor < 0 || st.banner_sel_extent < 0)
+        ? -1 : std::max(st.banner_sel_anchor, st.banner_sel_extent);
+
+    if (banner_lines > 0 && first_vrow < banner_lines) {
+        int b_first = std::max(0, first_vrow);
+        int b_last = std::min(banner_lines - 1, last_vrow);
+        if (b_first <= b_last) {
+            const float x_banner_text = x_bytes;
+            const uint64_t banner_addr = instrs.empty() ? file.image_base : instrs.front().addr;
+            const std::string banner_seg = instrs.empty()
+                ? std::string(".text")
+                : ida_export::section_for(banner_addr);
+            const std::string seg_part = banner_seg.empty() ? std::string(".text") : banner_seg;
+            char addr_buf[24];
+            std::snprintf(addr_buf, sizeof(addr_buf), "%016llX",
+                static_cast<unsigned long long>(banner_addr));
+            const float seg_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, seg_part.c_str()).x;
+
+            for (int bi = b_first; bi <= b_last; ++bi) {
+                if (bi >= static_cast<int>(s_banner_cache.size())) break;
+                float y = oy_content + bi * line_h - st.scroll_y;
+                if (y + line_h < oy_content || y > oy_content + content_height) continue;
+                const auto& bl = s_banner_cache[bi];
+
+                bool banner_row_hovered = !ctx_input_locked && ImGui::IsMouseHoveringRect(
+                    ImVec2(ox, y), ImVec2(ox + width, y + line_h - 1.f), false);
+
+                auto& bhov_st = s_banner_row_hover[bi];
+                float brh = bhov_st.tick(banner_row_hovered, dt, aida::motion::spring::snappy);
+
+                if (brh > 0.002f) {
+                    dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + width, y + line_h - 1.f),
+                        aida::ui::with_alpha(tk.hover_wash, a * brh));
+                }
+
+                bool banner_in_sel = (banner_sel_lo >= 0 && bi >= banner_sel_lo && bi <= banner_sel_hi);
+                bool banner_is_cursor = (bi == st.banner_selected_row);
+
+                if (banner_in_sel) {
+                    dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + width, y + line_h - 1.f),
+                        aida::ui::with_alpha(tk.selection, a));
+                }
+                if (banner_is_cursor) {
+                    dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + width, y + line_h - 1.f),
+                        aida::ui::with_alpha(disasm_theme::cursor_line_bg(), a * 0.5f));
+                    dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + 3.f, y + line_h - 1.f),
+                        aida::ui::with_alpha(tk.accent_u32, a));
+                }
+
+                dl->AddText(code_font, code_size, ImVec2(x_seg_addr, y + 1.f),
+                    aida::ui::with_alpha(disasm_theme::segment(), a * 0.85f),
+                    seg_part.c_str());
+                dl->AddText(code_font, code_size, ImVec2(x_seg_addr + seg_w, y + 1.f),
+                    aida::ui::with_alpha(disasm_theme::separator(), a * 0.85f), ":");
+                dl->AddText(code_font, code_size, ImVec2(x_seg_addr + seg_w + ch_w_safe, y + 1.f),
+                    aida::ui::with_alpha(disasm_theme::address(), a * 0.85f), addr_buf);
+
+                if (!bl.text.empty()) {
+                    ImU32 col = aida::ui::with_alpha(bl.color, a);
+                    dl->AddText(code_font, code_size, ImVec2(x_banner_text, y + 1.f),
+                        col, bl.text.c_str());
+                }
+
+                if (banner_row_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    if (ImGui::GetIO().KeyShift) {
+                        if (st.banner_sel_anchor < 0) st.banner_sel_anchor = bi;
+                        st.banner_sel_extent = bi;
+                        st.banner_selected_row = bi;
+                        st.banner_sel_dragging = false;
+                    } else {
+                        st.banner_sel_anchor = bi;
+                        st.banner_sel_extent = bi;
+                        st.banner_selected_row = bi;
+                        st.banner_sel_dragging = true;
+                    }
+                    st.sel_anchor = -1;
+                    st.sel_extent = -1;
+                    st.selected_row = -1;
+                    st.sel_dragging = false;
+                }
+
+                if (banner_row_hovered && st.banner_sel_dragging
+                    && ImGui::IsMouseDown(ImGuiMouseButton_Left)
+                    && st.banner_sel_extent != bi)
+                {
+                    st.banner_sel_extent = bi;
+                    st.banner_selected_row = bi;
+                }
+
+                if (banner_row_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                    st.banner_ctx_row = bi;
+                    if (bi < banner_sel_lo || bi > banner_sel_hi) {
+                        st.banner_sel_anchor = bi;
+                        st.banner_sel_extent = bi;
+                        st.banner_selected_row = bi;
+                    }
+                    st.banner_popup_anchor = st.banner_sel_anchor;
+                    st.banner_popup_extent = st.banner_sel_extent;
+                    st.sel_anchor = -1;
+                    st.sel_extent = -1;
+                    st.selected_row = -1;
+                    st.sel_dragging = false;
+                    ImGui::OpenPopup("##disasm_view_banner_ctx");
+                }
+            }
+        }
+    }
+
+    if (st.banner_sel_dragging && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+        st.banner_sel_dragging = false;
     }
 
     if (disasm.live_mode && n > 0) {
@@ -1557,9 +3680,57 @@ void render(float pos_x, float pos_y, float width, float height,
         return sec_resolver.fallback;
     };
 
+    const int sel_lo = (st.sel_anchor < 0 || st.sel_extent < 0)
+        ? -1 : std::min(st.sel_anchor, st.sel_extent);
+    const int sel_hi = (st.sel_anchor < 0 || st.sel_extent < 0)
+        ? -1 : std::max(st.sel_anchor, st.sel_extent);
+
+    uint64_t align_skip_end = 0;
     for (int i = first_row; i <= last_row; i++) {
-        float y = oy_content + i * line_h - st.scroll_y;
+        float y = oy_content + (i + banner_lines) * line_h - st.scroll_y;
         const AsmInstr& ins = instrs[i];
+
+        if (align_skip_end != 0 && ins.addr < align_skip_end) {
+            continue;
+        }
+        if (align_skip_end != 0 && ins.addr >= align_skip_end) {
+            align_skip_end = 0;
+        }
+
+        if (!throttled) {
+            function_index::detail::align_run_t arun;
+            if (function_index::is_align_row_start(ins.addr)
+                && function_index::align_run_at(ins.addr, &arun)) {
+                float row_entrance_a = 1.f;
+                if (s_first_load_anim < 1.f) {
+                    float& re_a = s_row_entrance[i];
+                    float per_item_a = 0.012f;
+                    float local_a = s_first_load_anim - (float)(i - first_row) * per_item_a;
+                    if (local_a < 0.f) local_a = 0.f;
+                    re_a = aida::motion::ease::out_back(local_a);
+                    row_entrance_a = re_a;
+                }
+                float row_y_off_a = (1.f - row_entrance_a) * 6.f;
+                float row_a_inner_a = a * row_entrance_a;
+                std::string sec_name_a = get_visible_section(ins.addr);
+                draw_addr_prefix(y, ins.addr, sec_name_a, row_a_inner_a * 0.95f, row_y_off_a);
+                char align_buf[64];
+                std::snprintf(align_buf, sizeof(align_buf), "align %u",
+                    static_cast<unsigned int>(arun.alignment));
+                ImU32 align_col = aida::ui::with_alpha(disasm_theme::keyword(), row_a_inner_a);
+                draw_text_at(x_mnem, y, align_col, align_buf, row_y_off_a);
+                uint64_t run_len = (arun.end > arun.addr) ? (arun.end - arun.addr) : 0;
+                char tail_buf[96];
+                const char* fill_label = (arun.fill_byte == 0xCC) ? "0xCC"
+                    : (arun.fill_byte == 0x90) ? "0x90" : "fill";
+                std::snprintf(tail_buf, sizeof(tail_buf), "; %llu bytes of %s",
+                    static_cast<unsigned long long>(run_len), fill_label);
+                ImU32 tail_col = aida::ui::with_alpha(disasm_theme::comment(), row_a_inner_a * 0.85f);
+                draw_text_at(x_comment, y, tail_col, tail_buf, row_y_off_a);
+                align_skip_end = arun.end;
+                continue;
+            }
+        }
 
         float row_entrance = 1.f;
         if (s_first_load_anim < 1.f) {
@@ -1573,7 +3744,7 @@ void render(float pos_x, float pos_y, float width, float height,
         float row_y_off = (1.f - row_entrance) * 6.f;
         float row_a_inner = a * row_entrance;
 
-        bool row_hovered = ImGui::IsMouseHoveringRect(
+        bool row_hovered = !ctx_input_locked && ImGui::IsMouseHoveringRect(
             ImVec2(ox, y), ImVec2(ox + width, y + line_h - 1.f), false);
 
         auto& hov_st = s_row_hover[i];
@@ -1582,8 +3753,14 @@ void render(float pos_x, float pos_y, float width, float height,
         if (rh > 0.002f)
             fill_row_bg(y, aida::ui::with_alpha(tk.hover_wash, row_a_inner * rh));
 
-        if (i == st.selected_row) {
-            fill_row_bg(y, aida::ui::with_alpha(disasm_theme::cursor_line_bg(), row_a_inner));
+        bool in_sel    = (sel_lo >= 0 && i >= sel_lo && i <= sel_hi);
+        bool is_cursor = (i == st.selected_row);
+
+        if (in_sel) {
+            fill_row_bg(y, aida::ui::with_alpha(tk.selection, row_a_inner));
+        }
+        if (is_cursor) {
+            fill_row_bg(y, aida::ui::with_alpha(disasm_theme::cursor_line_bg(), row_a_inner * 0.5f));
             dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + 3.f, y + line_h - 1.f),
                 aida::ui::with_alpha(tk.accent_u32, row_a_inner));
         }
@@ -1610,6 +3787,20 @@ void render(float pos_x, float pos_y, float width, float height,
                 cache.before_rows = function_index::rows_before(ins.addr);
                 cache.after_rows = function_index::rows_after(ins.addr);
                 cache.inline_label = function_index::inline_label_at(ins.addr);
+                if (cache.inline_label.empty()) {
+                    std::vector<xref_index::annotation_t> probe = xref_index::query_to(ins.addr, 1);
+                    bool jump_xref = false;
+                    for (const auto& a : probe) {
+                        if (a.kind == xref_index::kind_t::code && a.edge == xref_index::edge_t::jump) {
+                            jump_xref = true;
+                            break;
+                        }
+                    }
+                    if (jump_xref && function_index::is_inside_known_function(ins.addr)) {
+                        std::string loc = function_index::loc_label_for(ins.addr);
+                        if (!loc.empty()) cache.inline_label = loc + ":";
+                    }
+                }
                 cache.inj_valid = true;
             }
             before_rows_ptr = &cache.before_rows;
@@ -1630,6 +3821,9 @@ void render(float pos_x, float pos_y, float width, float height,
                 }
             }
             prime_var_cache(fstart);
+        } else if (!throttled) {
+            uint64_t enclosing = function_index::detail::lookup_function_start_for_addr(ins.addr);
+            if (enclosing != 0) prime_var_cache(enclosing);
         }
 
         const std::vector<xref_index::annotation_t>* xrefs_at_func_ptr = nullptr;
@@ -1686,6 +3880,35 @@ void render(float pos_x, float pos_y, float width, float height,
                 return;
             }
 
+            if (r.kind == function_index::injection_t::function_banner && !throttled) {
+                bool is_entry = false;
+                bool is_user_main = false;
+                std::string user_main_kind;
+                {
+                    auto& fc = function_index::detail::cache();
+                    std::shared_lock<std::shared_mutex> lk(fc.mutex);
+                    auto fit = fc.by_start.find(r.addr);
+                    if (fit != fc.by_start.end()) {
+                        is_entry = fit->second.is_entry_stub;
+                        is_user_main = fit->second.is_user_main;
+                        user_main_kind = fit->second.user_main_kind;
+                    }
+                }
+                if (is_entry) {
+                    std::string text = "; =============== S U B R O U T I N E (start) =============================";
+                    ImU32 text_col = aida::ui::with_alpha(disasm_theme::banner(), row_a_inner);
+                    draw_text_at(x_mnem, yy, text_col, text.c_str(), row_y_off);
+                    return;
+                }
+                if (is_user_main) {
+                    std::string label = !user_main_kind.empty() ? user_main_kind : std::string("main");
+                    std::string text = "; =============== S U B R O U T I N E (" + label + ") ============================";
+                    ImU32 text_col = aida::ui::with_alpha(disasm_theme::banner(), row_a_inner);
+                    draw_text_at(x_mnem, yy, text_col, text.c_str(), row_y_off);
+                    return;
+                }
+            }
+
             ImU32 text_col;
             switch (r.kind) {
                 case function_index::injection_t::function_banner:
@@ -1730,6 +3953,29 @@ void render(float pos_x, float pos_y, float width, float height,
                     aida::ui::with_alpha(disasm_theme::xref(), row_a_inner * 0.95f),
                     xref_text.c_str(), row_y_off);
             }
+            if (br.kind == function_index::injection_t::proc_header && !throttled) {
+                function_index::frame_summary_t fs;
+                if (function_index::frame_summary(br.addr, &fs)) {
+                    char fs_buf[192];
+                    int64_t neg = fs.delta;
+                    unsigned long long abs_delta = static_cast<unsigned long long>(neg < 0 ? -neg : neg);
+                    std::snprintf(fs_buf, sizeof(fs_buf),
+                        "; sp = -%llXh, locals = %llu bytes, saved_regs = %u",
+                        abs_delta,
+                        static_cast<unsigned long long>(fs.prologue_locals_size),
+                        static_cast<unsigned int>(fs.saved_reg_count));
+                    float fs_x = x_comment;
+                    if (!xrefs_at_func.empty()) {
+                        std::string xref_text_w = ida_format_xref_comment(xrefs_at_func[0],
+                            xrefs_more && xrefs_at_func.size() == 1);
+                        float xref_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f,
+                            xref_text_w.c_str()).x;
+                        fs_x = x_comment + xref_w + 3.f * ch_w_safe;
+                    }
+                    ImU32 fs_col = aida::ui::with_alpha(disasm_theme::comment(), row_a_inner * 0.85f);
+                    draw_text_at(fs_x, yy, fs_col, fs_buf, row_y_off);
+                }
+            }
             (void)row_local;
         }
 
@@ -1750,7 +3996,8 @@ void render(float pos_x, float pos_y, float width, float height,
             float yy = y - line_h;
             if (yy + line_h >= oy_content && yy <= oy_content + content_height) {
                 draw_addr_prefix_cached(yy, &cache, ins.addr, sec_name, row_a_inner * 0.7f, row_y_off);
-                std::string lbl_text = *inline_label_ptr + ":";
+                std::string lbl_text = *inline_label_ptr;
+                if (lbl_text.empty() || lbl_text.back() != ':') lbl_text += ":";
                 draw_text_at(x_mnem, yy,
                     aida::ui::with_alpha(disasm_theme::loc_label(), row_a_inner),
                     lbl_text.c_str(), row_y_off);
@@ -1774,13 +4021,13 @@ void render(float pos_x, float pos_y, float width, float height,
             if (!cache.bytes_valid) {
                 char bytes_buf[96] = {};
                 int boff = 0;
-                int max_pairs = 12;
+                int max_pairs = 10;
                 int show_n = ins.len < max_pairs ? ins.len : max_pairs;
                 for (int b = 0; b < show_n && boff + 4 < static_cast<int>(sizeof(bytes_buf)); b++)
                     boff += std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff,
                         b ? " %02X" : "%02X", ins.raw[b]);
                 if (ins.len > max_pairs && boff + 4 < static_cast<int>(sizeof(bytes_buf)))
-                    std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff, "...");
+                    std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff, "\xe2\x80\xa6");
                 cache.bytes_str.assign(bytes_buf);
                 cache.bytes_valid = true;
             }
@@ -1789,15 +4036,56 @@ void render(float pos_x, float pos_y, float width, float height,
                 cache.bytes_str.c_str(), row_y_off);
         }
 
+        std::string mnem_override_token;
+        bool has_mnem_override = !throttled
+            && lookup_mnem_override_at(ins.addr, mnem_override_token)
+            && !mnem_override_token.empty();
+
         ImU32 mc = mnemonic_color(ins, row_a_inner);
-        draw_text_at(x_mnem, y, mc, ins.mnem, row_y_off);
+        if (has_mnem_override) {
+            const std::string& tok = mnem_override_token;
+            int override_kind = -1;
+            if (tok.size() >= 2 && tok[0] == 'r' && tok[1] == '_') {
+                override_kind = disasm_theme::kind_restored_reg;
+            } else if (tok.size() >= 2 && tok[0] == 's' && tok[1] == '_') {
+                override_kind = disasm_theme::kind_saved_reg;
+            }
+            if (override_kind >= 0) {
+                mc = aida::ui::with_alpha(
+                    disasm_theme::color_for_kind(override_kind), row_a_inner);
+            }
+        }
+        if (!cache.mnem_valid) {
+            cache.mnem_str = ida_export::ida_mnemonic(std::string(ins.mnem));
+            cache.mnem_valid = true;
+        }
+        const char* mnem_render = cache.mnem_str.empty() ? ins.mnem : cache.mnem_str.c_str();
+        draw_text_at(x_mnem, y, mc, mnem_render, row_y_off);
 
         const std::string* operand_text_ptr = nullptr;
         if (throttled) {
             operand_text_ptr = nullptr;
         } else {
             if (!cache.ops_valid) {
-                cache.ops_subst = substitute_operand_text(ins, file);
+                std::string ops_subst = substitute_operand_text(ins, file);
+                if ((ins.is_branch || ins.is_call) && ins.branch_target != 0) {
+                    uint64_t target = ins.branch_target;
+                    std::string ida_label = ida_export::resolve_branch_symbol(target);
+                    symbol_classifier::kind_t kbr = symbol_classifier::classify(target);
+                    if (kbr == symbol_classifier::kind_t::external_import) {
+                        if (!ida_label.empty() && ida_label.compare(0, 6, "__imp_") != 0)
+                            ida_label = "__imp_" + ida_label;
+                    }
+                    if (!ida_label.empty()) {
+                        bool is_short = false;
+                        if (ins.is_branch && !ins.is_call) {
+                            int64_t diff = static_cast<int64_t>(target) - static_cast<int64_t>(ins.addr);
+                            if (diff >= -128 && diff <= 127) is_short = true;
+                        }
+                        ops_subst = is_short ? (std::string("short ") + ida_label) : ida_label;
+                    }
+                }
+                cache.ops_subst = ida_export::convert_operands_to_ida(ops_subst);
                 build_operand_colored_runs(ins, cache.ops_subst, cache.ops_runs);
                 cache.ops_run_widths.clear();
                 cache.ops_run_widths.reserve(cache.ops_runs.size());
@@ -1809,6 +4097,18 @@ void render(float pos_x, float pos_y, float width, float height,
                     cache.ops_total_width += w;
                 }
                 cache.ops_valid = true;
+
+                if (ins.has_imm && builtin_typelib::looks_like_status(ins.imm_unsigned)) {
+                    std::string label;
+                    if (builtin_typelib::lookup_auto(ins.imm_unsigned, label) && !label.empty()) {
+                        std::string existing = auto_comment_store::get(ins.addr);
+                        if (existing.empty()) {
+                            auto_comment_store::set(ins.addr, label);
+                        } else if (existing.find(label) == std::string::npos) {
+                            auto_comment_store::set(ins.addr, existing + "; " + label);
+                        }
+                    }
+                }
             }
             operand_text_ptr = &cache.ops_subst;
         }
@@ -1869,53 +4169,119 @@ void render(float pos_x, float pos_y, float width, float height,
             }
         }
 
-        if (!throttled && comment_store::has(ins.addr)) {
-            std::string cmt_text = comment_store::get(ins.addr);
-            if (!cmt_text.empty()) {
-                float operand_w = (!throttled && cache.ops_valid)
-                    ? cache.ops_total_width
-                    : code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f,
-                        operand_render_cstr ? operand_render_cstr : "").x;
-                float cmt_x = std::max(x_comment, x_operand + operand_w + 4.f * ch_w_safe);
-                float cmt_max_w = (ox + width - 24.f) - cmt_x;
-                if (cmt_max_w > 24.f) {
-                    if (cache.cmt_trimmed_for_width != cmt_max_w
-                        || cache.cmt_source != cmt_text) {
-                        size_t cmt_nl = cmt_text.find('\n');
-                        std::string cmt_first = (cmt_nl == std::string::npos) ? cmt_text : cmt_text.substr(0, cmt_nl);
-                        bool cmt_multiline = (cmt_nl != std::string::npos);
-                        std::string cmt_render = "; " + cmt_first;
-                        bool cmt_truncated = cmt_multiline;
-                        float cmt_full_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, cmt_render.c_str()).x;
-                        if (cmt_full_w > cmt_max_w) {
-                            size_t lo = 0;
-                            size_t hi = cmt_render.size();
-                            while (lo < hi) {
-                                size_t mid = (lo + hi + 1) / 2;
-                                std::string trial = cmt_render.substr(0, mid) + "...";
-                                if (code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, trial.c_str()).x <= cmt_max_w)
-                                    lo = mid;
-                                else
-                                    hi = mid - 1;
-                            }
-                            if (lo < cmt_render.size())
-                                cmt_render = cmt_render.substr(0, lo) + "...";
-                            cmt_truncated = true;
+        std::string composed_cmt;
+        std::string composed_tooltip;
+        bool composed_multiline = false;
+        if (!throttled) {
+            std::string typelib_auto_cmt = auto_comment_store::get(ins.addr);
+            std::string user_cmt = comment_store::has(ins.addr)
+                ? comment_store::get(ins.addr) : std::string();
+            std::string auto_cmt = function_index::inline_comment_at(ins.addr);
+
+            std::string merged_user_cmt;
+            if (!user_cmt.empty() && !typelib_auto_cmt.empty()) {
+                merged_user_cmt = user_cmt + "; " + typelib_auto_cmt;
+            } else if (!user_cmt.empty()) {
+                merged_user_cmt = user_cmt;
+            } else if (!typelib_auto_cmt.empty()) {
+                merged_user_cmt = typelib_auto_cmt;
+            }
+
+            std::string thunk_annotation;
+            std::string demangle_annotation;
+            if ((ins.is_branch || ins.is_call) && ins.branch_target != 0) {
+                if (function_index::is_thunk(ins.branch_target)) {
+                    std::string tgt_name = function_index::synthetic_name(ins.branch_target);
+                    if (!tgt_name.empty()) {
+                        if (tgt_name.size() >= 2 && tgt_name[0] == 'j' && tgt_name[1] == '_') {
+                            thunk_annotation = "tail-call to " + tgt_name.substr(2);
+                        } else {
+                            thunk_annotation = "tail-call to " + tgt_name;
                         }
-                        cache.cmt_trimmed = std::move(cmt_render);
-                        cache.cmt_truncated = cmt_truncated;
-                        cache.cmt_drawn_width = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f,
-                            cache.cmt_trimmed.c_str()).x;
-                        cache.cmt_trimmed_for_width = cmt_max_w;
-                        cache.cmt_source = cmt_text;
                     }
-                    ImU32 cmt_col = aida::ui::with_alpha(disasm_theme::comment(), row_a_inner * 0.95f);
-                    draw_text_at(cmt_x, y, cmt_col, cache.cmt_trimmed.c_str(), row_y_off);
-                    if (cache.cmt_truncated) {
-                        if (ImGui::IsMouseHoveringRect(ImVec2(cmt_x, y),
-                            ImVec2(cmt_x + cache.cmt_drawn_width, y + line_h - 1.f), false))
-                            ImGui::SetTooltip("%s", cmt_text.c_str());
+                }
+                std::string resolved = ida_export::resolve_branch_symbol(ins.branch_target);
+                std::string demangled = demangle_tail_comment(resolved);
+                if (demangled.empty()) {
+                    std::string exact = symbol_store::resolve_symbol_exact(ins.branch_target);
+                    exact = strip_module_prefix_fast(exact);
+                    if (!exact.empty() && exact != resolved) {
+                        demangled = demangle_tail_comment(exact);
                     }
+                }
+                if (!demangled.empty()) demangle_annotation = demangled;
+            }
+
+            std::string parts;
+            std::string full_for_tooltip;
+            if (!merged_user_cmt.empty()) {
+                size_t nl = merged_user_cmt.find('\n');
+                std::string first_line = (nl == std::string::npos) ? merged_user_cmt : merged_user_cmt.substr(0, nl);
+                parts = first_line;
+                if (nl != std::string::npos) composed_multiline = true;
+                full_for_tooltip = merged_user_cmt;
+            }
+            auto append_part = [&](const std::string& s) {
+                if (s.empty()) return;
+                if (!parts.empty()) parts += " | ";
+                parts += s;
+                if (!full_for_tooltip.empty()) full_for_tooltip += "\n";
+                full_for_tooltip += s;
+            };
+            append_part(auto_cmt);
+            append_part(thunk_annotation);
+            append_part(demangle_annotation);
+            if (has_mnem_override) {
+                append_part(mnem_override_token);
+            }
+            if (!parts.empty()) {
+                composed_cmt = parts;
+                composed_tooltip = full_for_tooltip;
+            }
+        }
+
+        if (!throttled && !composed_cmt.empty()) {
+            float operand_w = (!throttled && cache.ops_valid)
+                ? cache.ops_total_width
+                : code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f,
+                    operand_render_cstr ? operand_render_cstr : "").x;
+            float cmt_x = std::max(x_comment, x_operand + operand_w + 4.f * ch_w_safe);
+            float cmt_max_w = (ox + width - 24.f) - cmt_x;
+            if (cmt_max_w > 24.f) {
+                if (cache.cmt_trimmed_for_width != cmt_max_w
+                    || cache.cmt_source != composed_cmt) {
+                    std::string cmt_render = "; " + composed_cmt;
+                    bool cmt_truncated = composed_multiline;
+                    float cmt_full_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, cmt_render.c_str()).x;
+                    if (cmt_full_w > cmt_max_w) {
+                        size_t lo = 0;
+                        size_t hi = cmt_render.size();
+                        while (lo < hi) {
+                            size_t mid = (lo + hi + 1) / 2;
+                            std::string trial = cmt_render.substr(0, mid) + "...";
+                            if (code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, trial.c_str()).x <= cmt_max_w)
+                                lo = mid;
+                            else
+                                hi = mid - 1;
+                        }
+                        if (lo < cmt_render.size())
+                            cmt_render = cmt_render.substr(0, lo) + "...";
+                        cmt_truncated = true;
+                    }
+                    cache.cmt_trimmed = std::move(cmt_render);
+                    cache.cmt_truncated = cmt_truncated;
+                    cache.cmt_drawn_width = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f,
+                        cache.cmt_trimmed.c_str()).x;
+                    cache.cmt_trimmed_for_width = cmt_max_w;
+                    cache.cmt_source = composed_cmt;
+                }
+                ImU32 cmt_col = aida::ui::with_alpha(disasm_theme::comment(), row_a_inner * 0.95f);
+                draw_text_at(cmt_x, y, cmt_col, cache.cmt_trimmed.c_str(), row_y_off);
+                if (cache.cmt_truncated) {
+                    if (ImGui::IsMouseHoveringRect(ImVec2(cmt_x, y),
+                        ImVec2(cmt_x + cache.cmt_drawn_width, y + line_h - 1.f), false))
+                        ImGui::SetTooltip("%s", composed_tooltip.empty()
+                            ? composed_cmt.c_str() : composed_tooltip.c_str());
                 }
             }
         }
@@ -1936,6 +4302,28 @@ void render(float pos_x, float pos_y, float width, float height,
         }
 
         if (row_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            if (ImGui::GetIO().KeyShift) {
+                if (st.sel_anchor < 0) st.sel_anchor = i;
+                st.sel_extent = i;
+                st.selected_row = i;
+                st.sel_dragging = false;
+            } else {
+                st.sel_anchor = i;
+                st.sel_extent = i;
+                st.selected_row = i;
+                st.sel_dragging = true;
+            }
+            st.banner_sel_anchor = -1;
+            st.banner_sel_extent = -1;
+            st.banner_selected_row = -1;
+            st.banner_sel_dragging = false;
+        }
+
+        if (row_hovered && st.sel_dragging
+            && ImGui::IsMouseDown(ImGuiMouseButton_Left)
+            && st.sel_extent != i)
+        {
+            st.sel_extent = i;
             st.selected_row = i;
         }
 
@@ -1947,10 +4335,59 @@ void render(float pos_x, float pos_y, float width, float height,
 
         if (row_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
             st.ctx_row = i;
+            if (i < sel_lo || i > sel_hi) {
+                st.sel_anchor = i;
+                st.sel_extent = i;
+                st.selected_row = i;
+            }
+            st.popup_sel_anchor = st.sel_anchor;
+            st.popup_sel_extent = st.sel_extent;
+            st.popup_sel_row    = st.selected_row;
+            st.banner_sel_anchor = -1;
+            st.banner_sel_extent = -1;
+            st.banner_selected_row = -1;
+            st.banner_sel_dragging = false;
             ImGui::OpenPopup("##disasm_view_ctx");
         }
 
         (void)anchor_y;
+    }
+
+    if (st.sel_dragging && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        const float kAutoScrollMarginSmall = 8.f;
+        const float kAutoScrollMarginFar   = 32.f;
+        const float kAutoScrollSpeedSlow   = 8.f  * line_h;
+        const float kAutoScrollSpeedFast   = 24.f * line_h;
+        float mouse_y = ImGui::GetMousePos().y;
+        float top_y    = oy_content + kAutoScrollMarginSmall;
+        float bottom_y = oy_content + content_height - kAutoScrollMarginSmall;
+        if (mouse_y < top_y) {
+            float depth = top_y - mouse_y;
+            float speed = (depth > kAutoScrollMarginFar) ? kAutoScrollSpeedFast : kAutoScrollSpeedSlow;
+            st.target_scroll_y -= speed * dt;
+            if (st.target_scroll_y < 0.f) st.target_scroll_y = 0.f;
+            int top_row = std::max(0, static_cast<int>(st.target_scroll_y / line_h) - s_banner_line_count);
+            if (top_row >= n) top_row = n - 1;
+            if (top_row >= 0 && top_row != st.sel_extent) {
+                st.sel_extent = top_row;
+                st.selected_row = top_row;
+            }
+        } else if (mouse_y > bottom_y) {
+            float depth = mouse_y - bottom_y;
+            float speed = (depth > kAutoScrollMarginFar) ? kAutoScrollSpeedFast : kAutoScrollSpeedSlow;
+            st.target_scroll_y += speed * dt;
+            if (st.target_scroll_y > max_scroll) st.target_scroll_y = max_scroll;
+            int bottom_row = static_cast<int>((st.target_scroll_y + content_height) / line_h) - s_banner_line_count;
+            if (bottom_row >= n) bottom_row = n - 1;
+            if (bottom_row >= 0 && bottom_row != st.sel_extent) {
+                st.sel_extent = bottom_row;
+                st.selected_row = bottom_row;
+            }
+        }
+    }
+
+    if (st.sel_dragging && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+        st.sel_dragging = false;
     }
 
     {
@@ -2032,6 +4469,23 @@ void render(float pos_x, float pos_y, float width, float height,
     }
 
 
+    auto copy_range_to_clipboard = [&](int lo, int hi) {
+        if (lo < 0 || hi < 0 || lo >= n || hi >= n || lo > hi) return;
+        std::string out = ida_export::build_listing(disasm.file, instrs, lo, hi);
+        copy_text_to_clipboard(out);
+    };
+
+    auto copy_selection_to_clipboard = [&]() {
+        int lo = (st.sel_anchor < 0 || st.sel_extent < 0)
+            ? -1 : std::min(st.sel_anchor, st.sel_extent);
+        int hi = (st.sel_anchor < 0 || st.sel_extent < 0)
+            ? -1 : std::max(st.sel_anchor, st.sel_extent);
+        if (lo < 0 && st.selected_row >= 0) {
+            lo = hi = st.selected_row;
+        }
+        copy_range_to_clipboard(lo, hi);
+    };
+
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 6.f));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.f, 0.f));
@@ -2042,6 +4496,19 @@ void render(float pos_x, float pos_y, float width, float height,
     if (ImGui::BeginPopup("##disasm_view_ctx")) {
         if (st.ctx_row >= 0 && st.ctx_row < n) {
             const AsmInstr& ci = instrs[st.ctx_row];
+
+
+            if (ImGui::MenuItem("Copy", "Ctrl+C")) {
+                int snap_anchor = st.popup_sel_anchor;
+                int snap_extent = st.popup_sel_extent;
+                int snap_row    = st.popup_sel_row;
+                int lo = (snap_anchor < 0 || snap_extent < 0)
+                    ? -1 : std::min(snap_anchor, snap_extent);
+                int hi = (snap_anchor < 0 || snap_extent < 0)
+                    ? -1 : std::max(snap_anchor, snap_extent);
+                if (lo < 0 && snap_row >= 0) { lo = hi = snap_row; }
+                copy_range_to_clipboard(lo, hi);
+            }
 
 
             if (ImGui::MenuItem("Copy Address")) {
@@ -2143,19 +4610,11 @@ void render(float pos_x, float pos_y, float width, float height,
             ImGui::Separator();
 
             if (ImGui::MenuItem("Decompile Function")) {
-                globals::ui::decompile_popup_addr = ci.addr;
-                if (globals::ui::decompile_default_mode == 0) {
-                    decompiler_engine::decompile_function(ci.addr, g_sa_settings);
-                    globals::ui::active_center_view = center_view_t::decompiler;
-                } else if (globals::ui::decompile_default_mode == 1) {
-                    decompiler_engine::decompile_function_native(ci.addr);
-                    globals::ui::active_center_view = center_view_t::decompiler;
-                } else if (globals::ui::decompile_default_mode == 2) {
-                    decompiler_engine::decompile_function_hybrid(ci.addr, g_sa_settings);
-                    globals::ui::active_center_view = center_view_t::decompiler;
-                } else {
-                    globals::ui::show_decompile_popup = true;
-                }
+                uint64_t rc_entry = find_enclosing_function_start(ci.addr, disasm.file);
+                if (rc_entry == 0) rc_entry = ci.addr;
+                pseudocode_view::request_decompile(rc_entry, &disasm.file);
+                diag::log_tagged_critical_fmt("dec_ui", "right_click_native_dispatched addr=0x%llX",
+                    static_cast<unsigned long long>(rc_entry));
             }
             if (ImGui::MenuItem("Reconstruct Source")) {
                 source_reconstruct_view::open();
@@ -2167,6 +4626,73 @@ void render(float pos_x, float pos_y, float width, float height,
                 aob_generator::generate_from_address(ci.addr, aob_generator::g_state.instruction_count, aob_generator::g_state.auto_wildcard);
                 scan_hub_view::set_sub_tab(scan_hub_view::sub_tab_t::aob);
                 globals::ui::active_center_view = center_view_t::scan_hub;
+            }
+        }
+        ImGui::EndPopup();
+    }
+
+    auto build_banner_range_text = [&](int lo, int hi) -> std::string {
+        std::string out;
+        if (lo < 0 || hi < 0 || lo > hi) return out;
+        const int total = static_cast<int>(s_banner_cache.size());
+        if (lo >= total) return out;
+        if (hi >= total) hi = total - 1;
+        uint64_t banner_addr2 = instrs.empty() ? file.image_base : instrs.front().addr;
+        std::string banner_seg2 = instrs.empty()
+            ? std::string(".text")
+            : ida_export::section_for(banner_addr2);
+        if (banner_seg2.empty()) banner_seg2 = ".text";
+        char line_buf[640];
+        for (int bi = lo; bi <= hi; ++bi) {
+            const auto& bl = s_banner_cache[bi];
+            std::snprintf(line_buf, sizeof(line_buf), "%s:%016llX %s",
+                banner_seg2.c_str(),
+                static_cast<unsigned long long>(banner_addr2),
+                bl.text.c_str());
+            out += line_buf;
+            out += "\r\n";
+        }
+        return out;
+    };
+
+    auto copy_banner_range_to_clipboard = [&](int lo, int hi) {
+        std::string out = build_banner_range_text(lo, hi);
+        if (!out.empty()) copy_text_to_clipboard(out);
+    };
+
+    if (ImGui::BeginPopup("##disasm_view_banner_ctx")) {
+        const int snap_anchor = st.banner_popup_anchor;
+        const int snap_extent = st.banner_popup_extent;
+        const int snap_ctx = st.banner_ctx_row;
+        int lo_b = (snap_anchor < 0 || snap_extent < 0)
+            ? -1 : std::min(snap_anchor, snap_extent);
+        int hi_b = (snap_anchor < 0 || snap_extent < 0)
+            ? -1 : std::max(snap_anchor, snap_extent);
+        if (lo_b < 0 && snap_ctx >= 0) { lo_b = hi_b = snap_ctx; }
+
+        if (ImGui::MenuItem("Copy", "Ctrl+C")) {
+            copy_banner_range_to_clipboard(lo_b, hi_b);
+        }
+        if (ImGui::MenuItem("Copy Line Text")) {
+            if (snap_ctx >= 0 && snap_ctx < static_cast<int>(s_banner_cache.size())) {
+                copy_text_to_clipboard(s_banner_cache[snap_ctx].text);
+            }
+        }
+        if (ImGui::MenuItem("Copy Address")) {
+            uint64_t banner_addr2 = instrs.empty() ? file.image_base : instrs.front().addr;
+            char addr_buf[24];
+            std::snprintf(addr_buf, sizeof(addr_buf), "%016llX",
+                static_cast<unsigned long long>(banner_addr2));
+            copy_text_to_clipboard(std::string(addr_buf));
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Select All Banner")) {
+            const int total_b = static_cast<int>(s_banner_cache.size());
+            if (total_b > 0) {
+                st.banner_sel_anchor = 0;
+                st.banner_sel_extent = total_b - 1;
+                st.banner_selected_row = 0;
+                st.banner_sel_dragging = false;
             }
         }
         ImGui::EndPopup();
@@ -2188,7 +4714,6 @@ void render(float pos_x, float pos_y, float width, float height,
 
         ImGuiIO& disasm_hk_io = ImGui::GetIO();
         bool disasm_hk_text_lock = disasm_hk_io.WantTextInput
-            || disasm_hk_io.WantCaptureKeyboard
             || ImGui::IsAnyItemActive();
 
         if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
@@ -2273,24 +4798,10 @@ void render(float pos_x, float pos_y, float width, float height,
                         "[disasm] F5: no cursor address available; aborting decompile.");
                 } else {
                     uint64_t f5_entry = find_enclosing_function_start(f5_cursor_addr, disasm.file);
-                    if (f5_entry == 0) {
-                        output_log::push(bottom_tab_t::output,
-                            "[disasm] F5: enclosing function not found; aborting decompile.");
-                    } else {
-                        globals::ui::decompile_popup_addr = f5_entry;
-                        if (globals::ui::decompile_default_mode == 0) {
-                            decompiler_engine::decompile_function(f5_entry, g_sa_settings);
-                            globals::ui::active_center_view = center_view_t::decompiler;
-                        } else if (globals::ui::decompile_default_mode == 1) {
-                            decompiler_engine::decompile_function_native(f5_entry);
-                            globals::ui::active_center_view = center_view_t::decompiler;
-                        } else if (globals::ui::decompile_default_mode == 2) {
-                            decompiler_engine::decompile_function_hybrid(f5_entry, g_sa_settings);
-                            globals::ui::active_center_view = center_view_t::decompiler;
-                        } else {
-                            globals::ui::show_decompile_popup = true;
-                        }
-                    }
+                    if (f5_entry == 0) f5_entry = f5_cursor_addr;
+                    pseudocode_view::request_decompile(f5_entry, &disasm.file);
+                    diag::log_tagged_critical_fmt("dec_ui", "f5_native_dispatched addr=0x%llX",
+                        static_cast<unsigned long long>(f5_entry));
                 }
             }
 
@@ -2306,14 +4817,11 @@ void render(float pos_x, float pos_y, float width, float height,
                 else if (n > 0)
                     tab_addr = instrs[0].addr;
                 if (tab_addr != 0) {
-                    globals::ui::decompile_popup_addr = tab_addr;
-                    if (globals::ui::decompile_default_mode == 0)
-                        decompiler_engine::decompile_function(tab_addr, g_sa_settings);
-                    else if (globals::ui::decompile_default_mode == 1)
-                        decompiler_engine::decompile_function_native(tab_addr);
-                    else
-                        decompiler_engine::decompile_function_hybrid(tab_addr, g_sa_settings);
-                    globals::ui::active_center_view = center_view_t::decompiler;
+                    uint64_t tab_entry = find_enclosing_function_start(tab_addr, disasm.file);
+                    if (tab_entry == 0) tab_entry = tab_addr;
+                    pseudocode_view::request_decompile(tab_entry, &disasm.file);
+                    diag::log_tagged_critical_fmt("dec_ui", "tab_native_dispatched addr=0x%llX",
+                        static_cast<unsigned long long>(tab_entry));
                 }
             }
 
@@ -2326,6 +4834,51 @@ void render(float pos_x, float pos_y, float width, float height,
                     rename_addr = instrs[0].addr;
                 if (rename_addr != 0)
                     rename_dialog::open(rename_addr);
+            }
+        }
+    }
+
+    {
+        ImGuiIO& copy_hk_io = ImGui::GetIO();
+        bool copy_hk_text_lock = copy_hk_io.WantTextInput
+            || ImGui::IsAnyItemActive();
+        bool copy_hk_has_selection = (st.sel_anchor >= 0 && st.sel_extent >= 0)
+            || st.selected_row >= 0;
+        bool copy_hk_has_banner = (st.banner_sel_anchor >= 0 && st.banner_sel_extent >= 0)
+            || st.banner_selected_row >= 0;
+        if (!st.xref_popup_open && !st.goto_visible
+            && !copy_hk_text_lock
+            && copy_hk_io.KeyCtrl && !copy_hk_io.KeyAlt) {
+            if (ImGui::IsKeyPressed(ImGuiKey_A, false)) {
+                if (copy_hk_has_banner && !copy_hk_has_selection) {
+                    const int total_b = static_cast<int>(s_banner_cache.size());
+                    if (total_b > 0) {
+                        st.banner_sel_anchor = 0;
+                        st.banner_sel_extent = total_b - 1;
+                        st.banner_selected_row = 0;
+                        st.banner_sel_dragging = false;
+                    }
+                } else if (n > 0) {
+                    st.sel_anchor = 0;
+                    st.sel_extent = n - 1;
+                    st.selected_row = 0;
+                    st.sel_dragging = false;
+                }
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_C, false)
+                || ImGui::IsKeyPressed(ImGuiKey_Insert, false)) {
+                if (copy_hk_has_banner) {
+                    int lo_b = (st.banner_sel_anchor < 0 || st.banner_sel_extent < 0)
+                        ? -1 : std::min(st.banner_sel_anchor, st.banner_sel_extent);
+                    int hi_b = (st.banner_sel_anchor < 0 || st.banner_sel_extent < 0)
+                        ? -1 : std::max(st.banner_sel_anchor, st.banner_sel_extent);
+                    if (lo_b < 0 && st.banner_selected_row >= 0) {
+                        lo_b = hi_b = st.banner_selected_row;
+                    }
+                    copy_banner_range_to_clipboard(lo_b, hi_b);
+                } else if (copy_hk_has_selection) {
+                    copy_selection_to_clipboard();
+                }
             }
         }
     }
@@ -2529,7 +5082,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
 
     {
-        float total_content = n * line_h;
+        float total_content = (n + s_banner_line_count) * line_h;
         if (total_content > content_height) {
             const float sb_w = 10.f;
             const float sb_pad = 2.f;

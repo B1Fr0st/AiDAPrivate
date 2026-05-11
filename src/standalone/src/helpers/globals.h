@@ -27,7 +27,7 @@ enum class center_view_t : int {
 	network_view,
 	memory_scanner,
 	debugger_view,
-	decompiler,
+	pseudocode,
 	struct_recon,
 	crypto_scanner,
 	aob_generator,
@@ -469,6 +469,11 @@ namespace globals
 		inline center_view_t active_center_view = center_view_t::welcome;
 
 
+		inline std::atomic<bool>     decompile_popup_active{false};
+		inline std::atomic<uint64_t> decompile_popup_addr{0};
+		inline std::atomic<int>      decompile_popup_anim_frame{0};
+
+
 		inline bool command_palette_open = false;
 		inline char command_palette_buf[128] = {};
 
@@ -539,10 +544,6 @@ namespace globals
 		inline int theme = 0;
 
 		inline bool is_moving = false;
-
-		inline bool show_decompile_popup = false;
-		inline uint64_t decompile_popup_addr = 0;
-		inline int decompile_default_mode = 1;
 
 		inline int welcome_set = -1;
 		inline float welcome_timer = 0.f;

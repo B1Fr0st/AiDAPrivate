@@ -462,66 +462,129 @@ namespace read_intercept
 namespace section_encrypt
 {
 
+    __declspec(noinline) static bool xor_region_seh(uint64_t region_base,
+                                                    uint32_t region_size,
+                                                    uint64_t key,
+                                                    int region_index)
+    {
+        bool ok = false;
+        __try {
+            detail::xor_region(reinterpret_cast<uint8_t*>(region_base),
+                region_size, key);
+            ok = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                "encrypt_non_code_region_xor_SEH #%d base=0x%llX size=0x%X code=0x%08X",
+                region_index, region_base, region_size, GetExceptionCode());
+        }
+        return ok;
+    }
+
     inline bool encrypt_non_code_sections()
     {
         HMODULE mod = GetModuleHandleW(nullptr);
-        if (!mod) return false;
+        if (!mod) {
+            anti_tamper::webhook::write_log_critical("anti_dump",
+                "encrypt_non_code: GetModuleHandle null");
+            return false;
+        }
 
         MODULEINFO mi{};
         GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi));
 
-        auto* base = reinterpret_cast<uint8_t*>(mod);
         uint64_t mod_base = reinterpret_cast<uint64_t>(mod);
         uint64_t mod_end = mod_base + mi.SizeOfImage;
+
+        anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+            "encrypt_non_code_walk_start mod_base=0x%llX mod_end=0x%llX size=0x%X",
+            mod_base, mod_end, mi.SizeOfImage);
 
         MEMORY_BASIC_INFORMATION mbi{};
         uint64_t addr = mod_base + 0x1000;
         int encrypted_count = 0;
+        int region_index = 0;
 
         while (addr < mod_end)
         {
-            if (VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof(mbi)) == 0)
+            if (VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof(mbi)) == 0) {
+                anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                    "encrypt_non_code_walk_break_VirtualQuery_failed addr=0x%llX gle=%lu",
+                    addr, GetLastError());
                 break;
+            }
 
             uint64_t region_base = reinterpret_cast<uint64_t>(mbi.BaseAddress);
             uint32_t region_size = static_cast<uint32_t>(mbi.RegionSize);
+
+            anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                "encrypt_non_code_region #%d base=0x%llX size=0x%X state=0x%X protect=0x%X type=0x%X",
+                region_index, region_base, region_size,
+                mbi.State, mbi.Protect, mbi.Type);
 
             if (mbi.State == MEM_COMMIT
                 && (mbi.Protect == PAGE_READONLY || mbi.Protect == PAGE_READWRITE)
                 && !(mbi.Protect & PAGE_GUARD)
                 && region_size >= 0x100)
             {
+                anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                    "encrypt_non_code_region_pre_VirtualProtect #%d base=0x%llX size=0x%X protect=0x%X",
+                    region_index, region_base, region_size, mbi.Protect);
+
                 DWORD old_prot = 0;
-                if (VirtualProtect(reinterpret_cast<void*>(region_base), region_size,
-                    PAGE_READWRITE, &old_prot))
+                BOOL vp1_ok = VirtualProtect(reinterpret_cast<void*>(region_base), region_size,
+                    PAGE_READWRITE, &old_prot);
+
+                anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                    "encrypt_non_code_region_post_VirtualProtect #%d ok=%d old=0x%X gle=%lu",
+                    region_index, vp1_ok ? 1 : 0, old_prot,
+                    vp1_ok ? 0 : GetLastError());
+
+                if (vp1_ok)
                 {
-                    detail::xor_region(reinterpret_cast<uint8_t*>(region_base),
-                        region_size, detail::xor_key());
+                    anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                        "encrypt_non_code_region_pre_xor #%d base=0x%llX size=0x%X xor_key=0x%llX",
+                        region_index, region_base, region_size, detail::xor_key());
 
+                    bool xor_ok = xor_region_seh(region_base, region_size,
+                        detail::xor_key(), region_index);
+
+                    anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                        "encrypt_non_code_region_post_xor #%d ok=%d",
+                        region_index, xor_ok ? 1 : 0);
+
+                    DWORD discard = 0;
                     VirtualProtect(reinterpret_cast<void*>(region_base), region_size,
-                        old_prot, &old_prot);
+                        old_prot, &discard);
 
-                    std::lock_guard<std::mutex> lk(detail::region_mutex());
-                    detail::encrypted_regions().push_back({region_base, region_size, old_prot});
-                    ++encrypted_count;
+                    if (xor_ok) {
+                        std::lock_guard<std::mutex> lk(detail::region_mutex());
+                        detail::encrypted_regions().push_back({region_base, region_size, old_prot});
+                        ++encrypted_count;
+                    }
 
-                    char dbg[256];
-                    _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                        "encrypted_region #%d base=0x%llX size=0x%X prot=0x%X",
-                        encrypted_count, region_base, region_size, old_prot);
-                    anti_tamper::webhook::write_log("anti_dump", dbg);
+                    anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                        "encrypted_region #%d base=0x%llX size=0x%X prot=0x%X xor_ok=%d",
+                        encrypted_count, region_base, region_size, old_prot,
+                        xor_ok ? 1 : 0);
                 }
+            }
+            else
+            {
+                anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                    "encrypt_non_code_region_skipped #%d reason=protect_or_size",
+                    region_index);
             }
 
             addr = region_base + region_size;
+            ++region_index;
         }
 
         {
-            char dbg[128];
+            char dbg[256];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "encrypt_non_code_done total_regions=%d xor_key=0x%llX",
-                encrypted_count, detail::xor_key());
-            anti_tamper::webhook::write_log("anti_dump", dbg);
+                "encrypt_non_code_done total_encrypted=%d total_regions_walked=%d xor_key=0x%llX",
+                encrypted_count, region_index, detail::xor_key());
+            anti_tamper::webhook::write_log_critical("anti_dump", dbg);
         }
 
         return true;
@@ -757,15 +820,107 @@ namespace monitor
 }
 
 
+__declspec(noinline) static void sa_init_call_corrupt_debug_dir_seh()
+{
+    __try { dump_poison::corrupt_debug_directory(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+            "sa_corrupt_debug_dir_SEH code=0x%08X", GetExceptionCode());
+    }
+}
+
+__declspec(noinline) static void sa_init_call_flood_decoy_seh()
+{
+    __try { dump_poison::flood_decoy_memory(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+            "sa_flood_decoy_SEH code=0x%08X", GetExceptionCode());
+    }
+}
+
+__declspec(noinline) static void sa_init_call_scramble_threads_seh()
+{
+    __try { dump_poison::scramble_thread_objects(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+            "sa_scramble_threads_SEH code=0x%08X", GetExceptionCode());
+    }
+}
+
+__declspec(noinline) static void sa_init_call_hook_minidump_seh()
+{
+    __try { anti_minidump::hook_minidump(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+            "sa_hook_minidump_SEH code=0x%08X", GetExceptionCode());
+    }
+}
+
+__declspec(noinline) static void sa_init_call_inject_fake_sections_seh()
+{
+    __try { pe_header::inject_fake_sections(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+            "sa_inject_fake_sections_SEH code=0x%08X", GetExceptionCode());
+    }
+}
+
+__declspec(noinline) static void sa_init_call_corrupt_nt_seh()
+{
+    __try { pe_header::corrupt_nt_headers(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+            "sa_corrupt_nt_SEH code=0x%08X", GetExceptionCode());
+    }
+}
+
+__declspec(noinline) static void sa_init_call_erase_dos_seh()
+{
+    __try { pe_header::erase_dos_header(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+            "sa_erase_dos_SEH code=0x%08X", GetExceptionCode());
+    }
+}
+
+__declspec(noinline) static void sa_init_call_install_veh_seh()
+{
+    __try { read_intercept::install_veh(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+            "sa_install_veh_SEH code=0x%08X", GetExceptionCode());
+    }
+}
+
+__declspec(noinline) static void sa_init_call_encrypt_non_code_seh()
+{
+    __try { section_encrypt::encrypt_non_code_sections(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+            "sa_encrypt_non_code_SEH code=0x%08X", GetExceptionCode());
+    }
+}
+
+__declspec(noinline) static void sa_init_call_set_guard_pages_seh()
+{
+    __try { read_intercept::set_guard_pages(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+            "sa_set_guard_pages_SEH code=0x%08X", GetExceptionCode());
+    }
+}
+
+
 inline bool initialize()
 {
     if (detail::active().load()) return true;
 
     detail::xor_key() = detail::generate_session_key();
-    anti_tamper::webhook::write_log("anti_dump", "initialize_enter");
+    anti_tamper::webhook::write_log_critical("anti_dump", "initialize_enter");
 
     HMODULE mod = GetModuleHandleW(nullptr);
     bool pe_intact = false;
+    bool pe_already_corrupted_by_orchestrator = false;
     if (mod)
     {
         auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(mod);
@@ -774,20 +929,36 @@ inline bool initialize()
             auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(
                 reinterpret_cast<uint8_t*>(mod) + dos->e_lfanew);
 
-            pe_intact = (nt->FileHeader.Machine != 0);
+            const bool machine_intact   = (nt->FileHeader.Machine != 0);
+            const bool entry_intact     = (nt->OptionalHeader.AddressOfEntryPoint != 0xDEADDEAD);
+            const bool headers_intact   = (nt->OptionalHeader.SizeOfHeaders != 0);
+            const bool checksum_intact  = (nt->OptionalHeader.CheckSum != 0xFFFFFFFF);
 
-            char dbg2[256];
+            pe_intact = machine_intact && entry_intact && headers_intact && checksum_intact;
+            pe_already_corrupted_by_orchestrator = machine_intact &&
+                (!entry_intact || !headers_intact || !checksum_intact);
+
+            char dbg2[512];
             _snprintf_s(dbg2, sizeof(dbg2), _TRUNCATE,
-                "sa_pe_check: e_magic=0x%X sig=0x%X machine=0x%X pe_intact=%d",
-                dos->e_magic, nt->Signature, nt->FileHeader.Machine, pe_intact ? 1 : 0);
-            anti_tamper::webhook::write_log("anti_dump", dbg2);
+                "sa_pe_check: e_magic=0x%X sig=0x%X machine=0x%X entry=0x%X "
+                "headers_size=0x%X checksum=0x%X "
+                "machine_intact=%d entry_intact=%d headers_intact=%d checksum_intact=%d "
+                "pe_intact=%d already_corrupted_by_orchestrator=%d",
+                dos->e_magic, nt->Signature, nt->FileHeader.Machine,
+                nt->OptionalHeader.AddressOfEntryPoint,
+                nt->OptionalHeader.SizeOfHeaders,
+                nt->OptionalHeader.CheckSum,
+                machine_intact ? 1 : 0, entry_intact ? 1 : 0,
+                headers_intact ? 1 : 0, checksum_intact ? 1 : 0,
+                pe_intact ? 1 : 0, pe_already_corrupted_by_orchestrator ? 1 : 0);
+            anti_tamper::webhook::write_log_critical("anti_dump", dbg2);
         }
         else
         {
             char dbg2[128];
             _snprintf_s(dbg2, sizeof(dbg2), _TRUNCATE,
                 "sa_pe_check: e_magic=0x%X (not MZ), pe_intact=0", dos->e_magic);
-            anti_tamper::webhook::write_log("anti_dump", dbg2);
+            anti_tamper::webhook::write_log_critical("anti_dump", dbg2);
         }
     }
 
@@ -795,43 +966,65 @@ inline bool initialize()
         char dbg[128];
         _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "pe_intact=%d xor_key=0x%llX",
             pe_intact ? 1 : 0, detail::xor_key());
-        anti_tamper::webhook::write_log("anti_dump", dbg);
+        anti_tamper::webhook::write_log_critical("anti_dump", dbg);
     }
 
     if (pe_intact)
     {
-        dump_poison::corrupt_debug_directory();
-        anti_tamper::webhook::write_log("anti_dump", "corrupt_debug_dir_ok");
-        dump_poison::flood_decoy_memory();
-        anti_tamper::webhook::write_log("anti_dump", "flood_decoy_ok");
-        dump_poison::scramble_thread_objects();
-        anti_tamper::webhook::write_log("anti_dump", "scramble_threads_ok");
+        anti_tamper::webhook::write_log_critical("anti_dump", "sa_corrupt_debug_dir_pre");
+        sa_init_call_corrupt_debug_dir_seh();
+        anti_tamper::webhook::write_log_critical("anti_dump", "corrupt_debug_dir_ok");
 
-        anti_minidump::hook_minidump();
-        anti_tamper::webhook::write_log("anti_dump", "hook_minidump_ok");
+        anti_tamper::webhook::write_log_critical("anti_dump", "sa_flood_decoy_pre");
+        sa_init_call_flood_decoy_seh();
+        anti_tamper::webhook::write_log_critical("anti_dump", "flood_decoy_ok");
 
-        pe_header::inject_fake_sections();
-        anti_tamper::webhook::write_log("anti_dump", "inject_fake_sections_ok");
-        pe_header::corrupt_nt_headers();
-        anti_tamper::webhook::write_log("anti_dump", "corrupt_nt_ok");
-        pe_header::erase_dos_header();
-        anti_tamper::webhook::write_log("anti_dump", "erase_dos_ok");
+        anti_tamper::webhook::write_log_critical("anti_dump", "sa_scramble_threads_pre");
+        sa_init_call_scramble_threads_seh();
+        anti_tamper::webhook::write_log_critical("anti_dump", "scramble_threads_ok");
 
-        read_intercept::install_veh();
-        anti_tamper::webhook::write_log("anti_dump", "install_veh_ok");
+        anti_tamper::webhook::write_log_critical("anti_dump", "sa_hook_minidump_pre");
+        sa_init_call_hook_minidump_seh();
+        anti_tamper::webhook::write_log_critical("anti_dump", "hook_minidump_ok");
 
-        anti_tamper::webhook::write_log("anti_dump", "sa_encrypt_non_code_entering");
-        section_encrypt::encrypt_non_code_sections();
-        anti_tamper::webhook::write_log("anti_dump", "sa_encrypt_non_code_ok");
+        anti_tamper::webhook::write_log_critical("anti_dump", "sa_inject_fake_sections_pre");
+        sa_init_call_inject_fake_sections_seh();
+        anti_tamper::webhook::write_log_critical("anti_dump", "inject_fake_sections_ok");
 
-        anti_tamper::webhook::write_log("anti_dump", "sa_set_guard_pages_entering");
-        read_intercept::set_guard_pages();
+        anti_tamper::webhook::write_log_critical("anti_dump", "sa_corrupt_nt_pre");
+        sa_init_call_corrupt_nt_seh();
+        anti_tamper::webhook::write_log_critical("anti_dump", "corrupt_nt_ok");
+
+        anti_tamper::webhook::write_log_critical("anti_dump", "sa_erase_dos_pre");
+        sa_init_call_erase_dos_seh();
+        anti_tamper::webhook::write_log_critical("anti_dump", "erase_dos_ok");
+
+        anti_tamper::webhook::write_log_critical("anti_dump", "sa_install_veh_pre");
+        sa_init_call_install_veh_seh();
+        anti_tamper::webhook::write_log_critical("anti_dump", "install_veh_ok");
+
+        anti_tamper::webhook::write_log_critical("anti_dump", "sa_encrypt_non_code_entering");
+        sa_init_call_encrypt_non_code_seh();
+        anti_tamper::webhook::write_log_critical("anti_dump", "sa_encrypt_non_code_ok");
+
+        anti_tamper::webhook::write_log_critical("anti_dump", "sa_set_guard_pages_entering");
+        sa_init_call_set_guard_pages_seh();
         {
             char dbg[128];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "guard_pages_set trap_base=0x%llX trap_size=0x%X",
                 read_intercept::trap_page_base.load(), read_intercept::trap_page_size.load());
-            anti_tamper::webhook::write_log("anti_dump", dbg);
+            anti_tamper::webhook::write_log_critical("anti_dump", dbg);
         }
+    }
+    else if (pe_already_corrupted_by_orchestrator)
+    {
+        anti_tamper::webhook::write_log_critical("anti_dump",
+            "sa_skip_corrupt_phase_already_done_by_orchestrator");
+    }
+    else
+    {
+        anti_tamper::webhook::write_log_critical("anti_dump",
+            "sa_skip_corrupt_phase_pe_not_intact");
     }
 
     detail::active().store(true);

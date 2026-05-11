@@ -53,6 +53,7 @@ extern "C" {
 #include <thread>
 #include <cstdarg>
 #include <set>
+#include <atomic>
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "Shcore.lib")
@@ -383,6 +384,84 @@ static void crash_log_fmt(const char* fmt, ...)
     _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
     va_end(ap);
     diag::log_tagged("main", buf);
+}
+
+namespace aida_tracer {
+    inline std::atomic<uint64_t> g_render_frame{0};
+    inline std::atomic<uint64_t> g_render_last_tick_ms{0};
+    inline std::atomic<uint64_t> g_render_phase_id{0};
+    inline std::atomic<const char*> g_render_phase_name{"<startup>"};
+    inline std::atomic<uint64_t> g_attach_phase_id{0};
+    inline std::atomic<const char*> g_attach_phase_name{"<idle>"};
+    inline std::atomic<bool> g_stop{false};
+
+    inline void mark_render_phase(const char* name) {
+        g_render_phase_name.store(name, std::memory_order_release);
+        g_render_phase_id.fetch_add(1, std::memory_order_acq_rel);
+    }
+    inline void mark_attach_phase(const char* name) {
+        g_attach_phase_name.store(name, std::memory_order_release);
+        g_attach_phase_id.fetch_add(1, std::memory_order_acq_rel);
+        diag::log_tagged_critical_fmt("attach", "phase=%s", name);
+    }
+    inline void render_pulse(uint64_t frame) {
+        g_render_frame.store(frame, std::memory_order_release);
+        g_render_last_tick_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
+    }
+
+    inline void run_tracer_thread() {
+        uint64_t prev_frame = 0;
+        uint64_t prev_render_phase_id = 0;
+        uint64_t stall_streak = 0;
+        const uint64_t kStallThresholdMs = 2000;
+        while (!g_stop.load(std::memory_order_acquire)) {
+            ::Sleep(250);
+
+            uint64_t now = static_cast<uint64_t>(GetTickCount64());
+            uint64_t frame = g_render_frame.load(std::memory_order_acquire);
+            uint64_t last_tick = g_render_last_tick_ms.load(std::memory_order_acquire);
+            uint64_t phase_id = g_render_phase_id.load(std::memory_order_acquire);
+            const char* phase_name = g_render_phase_name.load(std::memory_order_acquire);
+            uint64_t attach_phase_id = g_attach_phase_id.load(std::memory_order_acquire);
+            const char* attach_phase = g_attach_phase_name.load(std::memory_order_acquire);
+
+            uint64_t age_ms = (last_tick > 0 && now >= last_tick) ? (now - last_tick) : 0;
+            bool render_stalled = (last_tick > 0 && age_ms > kStallThresholdMs && frame == prev_frame
+                                   && phase_id == prev_render_phase_id);
+
+            if (render_stalled) {
+                stall_streak++;
+                diag::log_tagged_critical_fmt("tracer",
+                    "RENDER_STALL streak=%llu frame=%llu age_ms=%llu phase=%s phase_id=%llu attach=%s attach_id=%llu tid=%lu",
+                    (unsigned long long)stall_streak,
+                    (unsigned long long)frame,
+                    (unsigned long long)age_ms,
+                    phase_name ? phase_name : "<null>",
+                    (unsigned long long)phase_id,
+                    attach_phase ? attach_phase : "<null>",
+                    (unsigned long long)attach_phase_id,
+                    GetCurrentThreadId());
+            } else {
+                stall_streak = 0;
+                diag::log_tagged_critical_fmt("tracer",
+                    "alive frame=%llu age_ms=%llu phase=%s phase_id=%llu attach=%s",
+                    (unsigned long long)frame,
+                    (unsigned long long)age_ms,
+                    phase_name ? phase_name : "<null>",
+                    (unsigned long long)phase_id,
+                    attach_phase ? attach_phase : "<null>");
+            }
+
+            prev_frame = frame;
+            prev_render_phase_id = phase_id;
+        }
+    }
+
+    inline void start() {
+        diag::log_tagged_critical("tracer", "tracer_thread_starting");
+        std::thread(run_tracer_thread).detach();
+        diag::log_tagged_critical("tracer", "tracer_thread_started");
+    }
 }
 
 static void run_phase_1_2_self_tests()
@@ -819,6 +898,8 @@ int main(int, char**)
     diag::log_tagged_critical("main", "diagnostic_veh_installed");
     crash_log_write("main_enter");
 
+    aida_tracer::start();
+
     {
         aida::hardware_id::anchor_set_t anchors = aida::hardware_id::collect_user_mode();
         aida::hardware_id::tpm_attest_t tpm{};
@@ -1020,6 +1101,7 @@ int main(int, char**)
     ImGuiIO& io = ImGui::GetIO(); (void)io;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+    io.ConfigNavCaptureKeyboard = false;
 
 
     {
@@ -1142,6 +1224,8 @@ int main(int, char**)
     static uint64_t frame_number = 0;
     while (!done)
     {
+        aida_tracer::render_pulse(frame_number);
+        aida_tracer::mark_render_phase("frame_top");
         if (frame_number < 5)
             crash_log_fmt("frame_begin #%llu", frame_number);
         else if ((frame_number % 30ULL) == 0ULL)
@@ -1170,6 +1254,7 @@ int main(int, char**)
         }
 
 
+        aida_tracer::mark_render_phase("peek_message");
         MSG msg;
         while (::PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE))
         {
@@ -1320,6 +1405,7 @@ int main(int, char**)
             crash_log_write("dx11_new_frame");
         if ((frame_number >= 270ULL && frame_number <= 320ULL))
             diag::log_tagged_critical_fmt("render", "phase=pre_dx11_new_frame frame=%llu", (unsigned long long)frame_number);
+        aida_tracer::mark_render_phase("dx11_new_frame");
         DWORD seh_dxnf = seh_dx11_new_frame();
         if (seh_dxnf != 0)
             diag::log_tagged_critical_fmt("render", "SEH_in_dx11_new_frame code=0x%08X frame=%llu",
@@ -1328,6 +1414,7 @@ int main(int, char**)
             crash_log_write("win32_new_frame");
         if ((frame_number >= 270ULL && frame_number <= 320ULL))
             diag::log_tagged_critical_fmt("render", "phase=pre_win32_new_frame frame=%llu", (unsigned long long)frame_number);
+        aida_tracer::mark_render_phase("win32_new_frame");
         DWORD seh_w32 = seh_win32_new_frame();
         if (seh_w32 != 0)
             diag::log_tagged_critical_fmt("render", "SEH_in_win32_new_frame code=0x%08X frame=%llu",
@@ -1336,6 +1423,7 @@ int main(int, char**)
             crash_log_write("imgui_new_frame");
         if ((frame_number >= 270ULL && frame_number <= 320ULL))
             diag::log_tagged_critical_fmt("render", "phase=pre_imgui_new_frame frame=%llu", (unsigned long long)frame_number);
+        aida_tracer::mark_render_phase("imgui_new_frame");
         DWORD seh_inf = seh_imgui_new_frame();
         if (seh_inf != 0)
             diag::log_tagged_critical_fmt("render", "SEH_in_imgui_new_frame code=0x%08X frame=%llu",
@@ -1366,6 +1454,7 @@ int main(int, char**)
                 diag::log_tagged_critical_fmt("render", "phase=pre_render_title frame=%llu section=%s",
                     (unsigned long long)frame_number, g_render_section ? g_render_section : "?");
 
+            aida_tracer::mark_render_phase("render_title");
             DWORD seh_rt = seh_render_title(&helper, frame_number);
             if (seh_rt != 0)
                 diag::log_tagged_critical_fmt("render", "SEH_in_render_title code=0x%08X frame=%llu section=%s",
@@ -1377,16 +1466,19 @@ int main(int, char**)
                 diag::log_tagged_critical_fmt("render", "phase=post_render_title frame=%llu section=%s",
                     (unsigned long long)frame_number, g_render_section ? g_render_section : "?");
 
+            aida_tracer::mark_render_phase("render_command_palette");
             DWORD seh_cp = seh_render_command_palette(frame_number);
             if (seh_cp != 0)
                 diag::log_tagged_critical_fmt("render", "SEH_in_command_palette code=0x%08X frame=%llu",
                     seh_cp, (unsigned long long)frame_number);
 
+            aida_tracer::mark_render_phase("render_agent_picker");
             DWORD seh_ap = seh_render_agent_picker(frame_number);
             if (seh_ap != 0)
                 diag::log_tagged_critical_fmt("render", "SEH_in_agent_picker code=0x%08X frame=%llu",
                     seh_ap, (unsigned long long)frame_number);
 
+            aida_tracer::mark_render_phase("render_source_reconstruct");
             DWORD seh_sr = seh_render_source_reconstruct(frame_number);
             if (seh_sr != 0)
                 diag::log_tagged_critical_fmt("render", "SEH_in_source_reconstruct code=0x%08X frame=%llu",
@@ -1416,12 +1508,14 @@ int main(int, char**)
         g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color_with_alpha);
         if ((frame_number >= 270ULL && frame_number <= 320ULL))
             diag::log_tagged_critical_fmt("render", "phase=pre_imgui_render frame=%llu", (unsigned long long)frame_number);
+        aida_tracer::mark_render_phase("imgui_render");
         DWORD seh_ir = seh_imgui_render();
         if (seh_ir != 0)
             diag::log_tagged_critical_fmt("render", "SEH_in_imgui_render code=0x%08X frame=%llu",
                 seh_ir, (unsigned long long)frame_number);
         if ((frame_number >= 270ULL && frame_number <= 320ULL))
             diag::log_tagged_critical_fmt("render", "phase=pre_imgui_dx11 frame=%llu", (unsigned long long)frame_number);
+        aida_tracer::mark_render_phase("imgui_dx11_render");
         DWORD seh_idr = seh_imgui_dx11_render(ImGui::GetDrawData());
         if (seh_idr != 0)
             diag::log_tagged_critical_fmt("render", "SEH_in_imgui_dx11_render code=0x%08X frame=%llu",
@@ -1430,6 +1524,7 @@ int main(int, char**)
 
         if ((frame_number >= 270ULL && frame_number <= 320ULL))
             diag::log_tagged_critical_fmt("render", "phase=pre_present frame=%llu", (unsigned long long)frame_number);
+        aida_tracer::mark_render_phase("present");
         HRESULT hr = S_OK;
         DWORD seh_present = seh_swapchain_present(g_pSwapChain, &hr);
         if (seh_present != 0)

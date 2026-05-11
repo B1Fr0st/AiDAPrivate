@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "pdb_events.hpp"
 #include "pdb_parser.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_settings.hpp"
@@ -180,19 +181,46 @@ inline void load_pdb_for_module(const std::string& module_name, uint64_t base, u
 		std::atomic<float> progress{0.f};
 		bool ok = pdb_parser::parse_pdb(pdb_path, search_path, info, &progress);
 
-		std::lock_guard<std::mutex> lk(g_state.mutex);
-		auto& ms = g_state.modules[module_name];
-		ms.loading = false;
+		aida::events::event_pdb_loaded ev_payload;
+		bool publish_event = false;
 
-		if (ok) {
-			ms.pdb = std::move(info);
-			char buf[64];
-			snprintf(buf, sizeof(buf), "Loaded: %zu symbols, %zu types",
-			         ms.pdb.symbols.size(), ms.pdb.structs.size());
-			ms.status_text = buf;
-		} else {
-			ms.failed = true;
-			ms.status_text = "Failed to parse PDB";
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			auto& ms = g_state.modules[module_name];
+			ms.loading = false;
+
+			if (ok) {
+				ms.pdb = std::move(info);
+				char buf[64];
+				snprintf(buf, sizeof(buf), "Loaded: %zu symbols, %zu types",
+				         ms.pdb.symbols.size(), ms.pdb.structs.size());
+				ms.status_text = buf;
+
+				ev_payload.module_name = ms.module_name;
+				ev_payload.base = ms.base;
+				ev_payload.size = ms.size;
+				ev_payload.success = true;
+				ev_payload.symbol_count = static_cast<uint32_t>(ms.pdb.symbols.size());
+				ev_payload.struct_count = static_cast<uint32_t>(ms.pdb.structs.size());
+				ev_payload.enum_count = static_cast<uint32_t>(ms.pdb.enums.size());
+				publish_event = true;
+			} else {
+				ms.failed = true;
+				ms.status_text = "Failed to parse PDB";
+
+				ev_payload.module_name = ms.module_name;
+				ev_payload.base = ms.base;
+				ev_payload.size = ms.size;
+				ev_payload.success = false;
+				ev_payload.symbol_count = 0;
+				ev_payload.struct_count = 0;
+				ev_payload.enum_count = 0;
+				publish_event = true;
+			}
+		}
+
+		if (publish_event) {
+			aida::events::publish(aida::events::event_pdb_loaded_def, ev_payload);
 		}
 	});
 }
@@ -412,8 +440,22 @@ inline const module_symbols_t* get_module(const std::string& name)
 
 inline void clear_all()
 {
-	std::lock_guard<std::mutex> lk(g_state.mutex);
-	g_state.modules.clear();
+	std::vector<std::string> unloaded_names;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		unloaded_names.reserve(g_state.modules.size());
+		for (auto& kv : g_state.modules) {
+			if (kv.second.pdb.loaded)
+				unloaded_names.push_back(kv.first);
+		}
+		g_state.modules.clear();
+	}
+
+	for (auto& name : unloaded_names) {
+		aida::events::event_pdb_unloaded ev;
+		ev.module_name = name;
+		aida::events::publish(aida::events::event_pdb_unloaded_def, ev);
+	}
 }
 
 inline void add_search_path(const std::string& path)

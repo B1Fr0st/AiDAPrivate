@@ -593,66 +593,170 @@ inline bool initialize()
     return true;
 }
 
+__declspec(noinline) static void finalize_call_anti_dump_init_seh()
+{
+    __try { anti_dump::initialize(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        webhook::write_log_critical_fmt("init",
+            "anti_dump_init_SEH code=0x%08X", GetExceptionCode());
+    }
+}
+
+__declspec(noinline) static void finalize_call_standalone_anti_dump_init_seh()
+{
+    __try { standalone_anti_dump::initialize(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        webhook::write_log_critical_fmt("init",
+            "standalone_anti_dump_init_SEH code=0x%08X", GetExceptionCode());
+    }
+}
+
+__declspec(noinline) static void finalize_call_anti_dump_seal_seh()
+{
+    __try { anti_dump::seal_handles(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        webhook::write_log_critical_fmt("init",
+            "anti_dump_seal_SEH code=0x%08X", GetExceptionCode());
+    }
+}
+
+__declspec(noinline) static void finalize_call_standalone_anti_dump_seal_seh()
+{
+    __try { standalone_anti_dump::seal_handles(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        webhook::write_log_critical_fmt("init",
+            "standalone_anti_dump_seal_SEH code=0x%08X", GetExceptionCode());
+    }
+}
+
+__declspec(noinline) static void finalize_call_kernel_anti_dump_seh(uint32_t self_pid)
+{
+    __try { driver_bridge::kernel_anti_dump_full(self_pid); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        webhook::write_log_critical_fmt("init",
+            "kernel_anti_dump_full_SEH code=0x%08X", GetExceptionCode());
+    }
+}
+
+__declspec(noinline) static void finalize_call_hide_module_seh()
+{
+    __try { anti_dump::hide_module(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        webhook::write_log_critical_fmt("init",
+            "hide_module_SEH code=0x%08X", GetExceptionCode());
+    }
+}
+
+static bool finalize_post_resnap_inner()
+{
+    auto& rt = state::get();
+    if (rt.code_snap.text_base == 0 || rt.code_snap.text_size == 0)
+    {
+        webhook::write_log_critical("init",
+            "post_finalize_integrity_resnap_skip_no_baseline");
+        return false;
+    }
+
+    auto& pt = integrity::detail::page_table();
+    bool ok = false;
+    size_t pages = 0;
+    {
+        std::lock_guard<std::mutex> lk(pt.mtx);
+        ok = integrity::detail::rebuild_page_table_locked(
+            pt, rt.code_snap.text_base, rt.code_snap.text_size);
+        pages = pt.entries.size();
+    }
+
+    if (ok)
+    {
+        integrity::clear_periodic_violation_flag();
+        webhook::write_log_critical_fmt("init",
+            "post_finalize_integrity_resnap_ok base=0x%llX size=0x%X pages=%zu",
+            static_cast<unsigned long long>(rt.code_snap.text_base),
+            rt.code_snap.text_size,
+            pages);
+    }
+    else
+    {
+        webhook::write_log_critical("init",
+            "post_finalize_integrity_resnap_FAILED");
+    }
+    return ok;
+}
+
+__declspec(noinline) static void finalize_post_resnap_seh()
+{
+    __try { finalize_post_resnap_inner(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        webhook::write_log_critical_fmt("init",
+            "post_finalize_integrity_resnap_SEH code=0x%08X",
+            GetExceptionCode());
+    }
+}
+
 inline bool finalize_after_activation()
 {
     auto& rt = state::get();
     if (rt.activation_hardening_done.exchange(true, std::memory_order_acq_rel))
     {
-        webhook::write_log("init", "finalize_after_activation_already_done");
+        webhook::write_log_critical("init", "finalize_after_activation_already_done");
         return true;
     }
 
-    webhook::write_log("init", "finalize_after_activation_entering");
+    webhook::write_log_critical("init", "finalize_after_activation_entering");
 
     try
     {
-        webhook::write_log("init", "anti_dump_entering");
-        anti_dump::initialize();
-        webhook::write_log("init", "anti_dump_ok");
+        webhook::write_log_critical("init", "anti_dump_entering");
+        finalize_call_anti_dump_init_seh();
+        webhook::write_log_critical("init", "anti_dump_ok");
     }
     catch (const std::exception& ex)
     {
-        webhook::write_log("init", (std::string("anti_dump_exception: ") + ex.what()).c_str());
+        webhook::write_log_critical("init", (std::string("anti_dump_exception: ") + ex.what()).c_str());
     }
     catch (...)
     {
-        webhook::write_log("init", "anti_dump_unknown_exception");
+        webhook::write_log_critical("init", "anti_dump_unknown_exception");
     }
 
     try
     {
-        webhook::write_log("init", "standalone_anti_dump_entering");
-        standalone_anti_dump::initialize();
-        webhook::write_log("init", "standalone_anti_dump_ok");
+        webhook::write_log_critical("init", "standalone_anti_dump_entering");
+        finalize_call_standalone_anti_dump_init_seh();
+        webhook::write_log_critical("init", "standalone_anti_dump_ok");
     }
     catch (const std::exception& ex)
     {
-        webhook::write_log("init", (std::string("standalone_anti_dump_exception: ") + ex.what()).c_str());
+        webhook::write_log_critical("init", (std::string("standalone_anti_dump_exception: ") + ex.what()).c_str());
     }
     catch (...)
     {
-        webhook::write_log("init", "standalone_anti_dump_unknown_exception");
+        webhook::write_log_critical("init", "standalone_anti_dump_unknown_exception");
     }
 
     if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
     {
         uint32_t self_pid = GetCurrentProcessId();
-        driver_bridge::kernel_anti_dump_full(self_pid);
-        webhook::write_log("init", "kernel_anti_dump_ok");
+        webhook::write_log_critical("init", "kernel_anti_dump_entering");
+        finalize_call_kernel_anti_dump_seh(self_pid);
+        webhook::write_log_critical("init", "kernel_anti_dump_ok");
     }
 
-    anti_dump::seal_handles();
-    webhook::write_log("init", "seal_handles_ok");
+    webhook::write_log_critical("init", "anti_dump_seal_handles_entering");
+    finalize_call_anti_dump_seal_seh();
+    webhook::write_log_critical("init", "seal_handles_ok");
 
-    standalone_anti_dump::seal_handles();
-    webhook::write_log("init", "standalone_seal_handles_ok");
+    webhook::write_log_critical("init", "standalone_anti_dump_seal_handles_entering");
+    finalize_call_standalone_anti_dump_seal_seh();
+    webhook::write_log_critical("init", "standalone_seal_handles_ok");
 
 
     try
     {
         std::atomic<bool> test_done{false};
         std::thread([&test_done]() { test_done.store(true); }).join();
-        webhook::write_log("init", test_done.load()
+        webhook::write_log_critical("init", test_done.load()
             ? "post_seal_thread_test_PASS"
             : "post_seal_thread_test_FAIL_no_exec");
     }
@@ -661,17 +765,21 @@ inline bool finalize_after_activation()
         char buf[256];
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
             "post_seal_thread_test_FAIL: %s", ex.what());
-        webhook::write_log("init", buf);
+        webhook::write_log_critical("init", buf);
     }
     catch (...)
     {
-        webhook::write_log("init", "post_seal_thread_test_FAIL_unknown");
+        webhook::write_log_critical("init", "post_seal_thread_test_FAIL_unknown");
     }
 
-    anti_dump::hide_module();
-    webhook::write_log("init", "hide_peb_ok");
+    webhook::write_log_critical("init", "hide_module_entering");
+    finalize_call_hide_module_seh();
+    webhook::write_log_critical("init", "hide_peb_ok");
 
-    webhook::write_log("init", "finalize_after_activation_done");
+    webhook::write_log_critical("init", "post_finalize_integrity_resnap_entering");
+    finalize_post_resnap_seh();
+
+    webhook::write_log_critical("init", "finalize_after_activation_done");
     return true;
 }
 
@@ -759,18 +867,102 @@ inline bool guard()
         }
         if (integrity::periodic_violation_latched())
         {
-            uint32_t mismatch_page = 0;
-            bool real_mismatch = !integrity::verify_full_text_eager(&mismatch_page);
-            if (real_mismatch)
+            static std::atomic<uint32_t> s_periodic_consecutive_fail_count{0};
+            static std::atomic<uint64_t> s_periodic_first_fail_qpc{0};
+            constexpr uint32_t kRequiredConsecutiveFailures = 3;
+
+            uint64_t epoch_at_attempt1 = integrity::detail::page_table().key_epoch.load(std::memory_order_acquire);
+            uint64_t pt_size_at_attempt1 = static_cast<uint64_t>(integrity::detail::page_table().size);
+            size_t entries_at_attempt1 = integrity::detail::page_table().entries.size();
+            uint64_t last_rot_at_attempt1 = integrity::detail::page_table().last_rotation_qpc.load(std::memory_order_acquire);
+            uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
+            uint64_t ms_since_last_rotation = (now_ms >= last_rot_at_attempt1)
+                ? (now_ms - last_rot_at_attempt1) : 0;
+
+            webhook::write_log_critical_fmt("guard",
+                "periodic_violation_attempt1_eager_verify_pre epoch=%llu pt_size=0x%llX entries=%zu ms_since_rotation=%llu",
+                static_cast<unsigned long long>(epoch_at_attempt1),
+                static_cast<unsigned long long>(pt_size_at_attempt1),
+                entries_at_attempt1,
+                static_cast<unsigned long long>(ms_since_last_rotation));
+
+            uint32_t mismatch_page1 = 0;
+            bool attempt1_ok = integrity::verify_full_text_eager(&mismatch_page1);
+            webhook::write_log_critical_fmt("guard",
+                "periodic_violation_attempt1_result ok=%d epoch=%llu page=%u",
+                attempt1_ok ? 1 : 0,
+                static_cast<unsigned long long>(epoch_at_attempt1),
+                mismatch_page1);
+            if (attempt1_ok)
             {
-                char detail[96];
-                _snprintf_s(detail, sizeof(detail), _TRUNCATE,
-                    "page_mac_periodic_mismatch page=%u", mismatch_page);
-                webhook::send_debug_log("guard", detail, true);
-                enforce_violation("page_mac_periodic_mismatch", detail);
+                webhook::write_log_critical("guard", "periodic_violation_FALSE_POSITIVE_cleared");
+                s_periodic_consecutive_fail_count.store(0, std::memory_order_release);
+                s_periodic_first_fail_qpc.store(0, std::memory_order_release);
+                integrity::clear_periodic_violation_flag();
+                CFF_GOTO(guard_cff, 6);
+            }
+            Sleep(250);
+            uint64_t epoch_at_attempt2 = integrity::detail::page_table().key_epoch.load(std::memory_order_acquire);
+            uint32_t mismatch_page2 = 0;
+            bool attempt2_ok = integrity::verify_full_text_eager(&mismatch_page2);
+            webhook::write_log_critical_fmt("guard",
+                "periodic_violation_attempt2_result ok=%d epoch1=%llu epoch2=%llu page=%u",
+                attempt2_ok ? 1 : 0,
+                static_cast<unsigned long long>(epoch_at_attempt1),
+                static_cast<unsigned long long>(epoch_at_attempt2),
+                mismatch_page2);
+            if (attempt2_ok && epoch_at_attempt1 != epoch_at_attempt2)
+            {
+                webhook::write_log_critical("guard", "periodic_violation_FALSE_POSITIVE_rotation_race_cleared");
+                s_periodic_consecutive_fail_count.store(0, std::memory_order_release);
+                s_periodic_first_fail_qpc.store(0, std::memory_order_release);
+                integrity::clear_periodic_violation_flag();
+                CFF_GOTO(guard_cff, 6);
+            }
+            if (attempt2_ok)
+            {
+                webhook::write_log_critical("guard", "periodic_violation_attempt2_ok_clearing_flag");
+                s_periodic_consecutive_fail_count.store(0, std::memory_order_release);
+                s_periodic_first_fail_qpc.store(0, std::memory_order_release);
+                integrity::clear_periodic_violation_flag();
+                CFF_GOTO(guard_cff, 6);
+            }
+
+            uint32_t prior_count = s_periodic_consecutive_fail_count.fetch_add(1, std::memory_order_acq_rel);
+            uint32_t fail_count = prior_count + 1;
+            if (prior_count == 0)
+                s_periodic_first_fail_qpc.store(now_ms, std::memory_order_release);
+            uint64_t first_fail_at = s_periodic_first_fail_qpc.load(std::memory_order_acquire);
+            uint64_t span_ms = (first_fail_at != 0 && now_ms >= first_fail_at)
+                ? (now_ms - first_fail_at) : 0;
+
+            if (fail_count < kRequiredConsecutiveFailures)
+            {
+                webhook::write_log_critical_fmt("guard",
+                    "periodic_violation_DEFERRED count=%u/%u span_ms=%llu page=%u epoch=%llu",
+                    fail_count,
+                    kRequiredConsecutiveFailures,
+                    static_cast<unsigned long long>(span_ms),
+                    mismatch_page2,
+                    static_cast<unsigned long long>(epoch_at_attempt2));
                 CFF_EXIT(guard_cff);
             }
-            integrity::clear_periodic_violation_flag();
+
+            webhook::write_log_critical_fmt("guard",
+                "periodic_violation_CONFIRMED_enforcing count=%u span_ms=%llu page=%u epoch=%llu",
+                fail_count,
+                static_cast<unsigned long long>(span_ms),
+                mismatch_page2,
+                static_cast<unsigned long long>(epoch_at_attempt2));
+            char detail[160];
+            _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                "page_mac_periodic_mismatch page=%u count=%u span_ms=%llu",
+                mismatch_page2,
+                fail_count,
+                static_cast<unsigned long long>(span_ms));
+            webhook::send_debug_log("guard", detail, true);
+            enforce_violation("page_mac_periodic_mismatch", detail);
+            CFF_EXIT(guard_cff);
         }
         CFF_GOTO(guard_cff, 6);
     }
@@ -1172,6 +1364,8 @@ inline void worker_loop(int worker_id, std::atomic<uint64_t>& tick_atomic,
                         std::atomic<uint64_t>& chain_atomic)
 {
     auto& rt = state::get();
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    tick_atomic.store(now_ms(), std::memory_order_release);
     uint64_t epoch = 0;
     while (rt.monitors_running.load() && !rt.violation_latched.load())
     {
@@ -1221,7 +1415,10 @@ inline void watchdog_loop()
 
     constexpr uint64_t kReattestPeriodMs = 5ull * 60ull * 1000ull;
     constexpr uint64_t kReattestGraceMs = 30ull * 1000ull;
-    constexpr uint64_t kWorkerStallMs = 200ull;
+    constexpr uint64_t kWorkerStallMs = 3000ull;
+    constexpr uint32_t kRequiredConsecutiveStalls = 4;
+    uint32_t s_consecutive_stalls = 0;
+    uint64_t s_first_stall_ms = 0;
 
     uint64_t last_reattest_attempt_ms = now_ms();
     uint64_t startup_grace_until = now_ms() + 8000ull;
@@ -1250,15 +1447,46 @@ inline void watchdog_loop()
 
             if (stalled >= 2)
             {
-                char dbg[160];
-                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                    "watchdog_workers_stalled da=%llu db=%llu dc=%llu",
+                if (s_consecutive_stalls == 0)
+                    s_first_stall_ms = cur;
+                ++s_consecutive_stalls;
+                if (s_consecutive_stalls >= kRequiredConsecutiveStalls)
+                {
+                    uint64_t span = (s_first_stall_ms != 0 && cur >= s_first_stall_ms)
+                        ? (cur - s_first_stall_ms) : 0;
+                    char dbg[224];
+                    _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                        "watchdog_workers_stalled da=%llu db=%llu dc=%llu count=%u span_ms=%llu",
+                        static_cast<unsigned long long>(da),
+                        static_cast<unsigned long long>(db),
+                        static_cast<unsigned long long>(dc),
+                        s_consecutive_stalls,
+                        static_cast<unsigned long long>(span));
+                    webhook::send_debug_log("watchdog_stall", dbg, true);
+                    enforce_violation("watchdog_workers_stalled", dbg);
+                    return;
+                }
+                webhook::write_log_critical_fmt("watchdog",
+                    "watchdog_stall_DEFERRED da=%llu db=%llu dc=%llu count=%u/%u",
                     static_cast<unsigned long long>(da),
                     static_cast<unsigned long long>(db),
-                    static_cast<unsigned long long>(dc));
-                webhook::send_debug_log("watchdog_stall", dbg, true);
-                enforce_violation("watchdog_workers_stalled", dbg);
-                return;
+                    static_cast<unsigned long long>(dc),
+                    s_consecutive_stalls,
+                    kRequiredConsecutiveStalls);
+            }
+            else
+            {
+                if (s_consecutive_stalls != 0)
+                {
+                    webhook::write_log_critical_fmt("watchdog",
+                        "watchdog_stall_RECOVERED prior_count=%u da=%llu db=%llu dc=%llu",
+                        s_consecutive_stalls,
+                        static_cast<unsigned long long>(da),
+                        static_cast<unsigned long long>(db),
+                        static_cast<unsigned long long>(dc));
+                }
+                s_consecutive_stalls = 0;
+                s_first_stall_ms = 0;
             }
         }
 

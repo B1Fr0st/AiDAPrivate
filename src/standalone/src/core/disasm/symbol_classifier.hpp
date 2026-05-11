@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -17,6 +18,7 @@
 #include <vector>
 
 #include "event_bus.hpp"
+#include "pdb_events.hpp"
 #include "pe_parser.hpp"
 #include "standalone_driver.hpp"
 #include "symbol_store.hpp"
@@ -36,7 +38,58 @@ namespace symbol_classifier {
 		label            = 8,
 		register_op      = 9,
 		immediate        = 10,
-		comment          = 11
+		comment          = 11,
+		data_byte        = 12,
+		data_word        = 13,
+		data_dword       = 14,
+		data_qword       = 15,
+		data_xmmword     = 16,
+		data_ymmword     = 17,
+		data_zmmword     = 18,
+		data_tbyte       = 19,
+		data_fword       = 20,
+		string_ascii     = 21,
+		string_unicode   = 22,
+		struct_ref       = 23,
+		array_ref        = 24,
+		offset_ref       = 25,
+		segment_ref      = 26,
+		pointer_ref      = 27,
+		data_unknown     = 28,
+		align_directive  = 29,
+		jump_thunk       = 30,
+		case_label       = 31,
+		default_case     = 32,
+		stack_var        = 33,
+		stack_arg        = 34,
+		saved_reg        = 35,
+		restored_reg     = 36,
+		section_text     = 37,
+		section_data     = 38,
+		section_rdata    = 39,
+		section_bss      = 40,
+		section_rsrc     = 41,
+		section_other    = 42,
+		custom_struct    = 43,
+		enum_value       = 44,
+		typelib_type     = 45,
+		mnem_branch      = 46,
+		mnem_call        = 47,
+		mnem_ret         = 48,
+		mnem_arith       = 49,
+		mnem_logic       = 50,
+		mnem_data        = 51,
+		mnem_sse         = 52,
+		mnem_string      = 53,
+		mnem_priv        = 54,
+		mnem_nop         = 55,
+		mnem_int         = 56,
+		mnem_other       = 57,
+		imp_function     = 58,
+		entry_point      = 59,
+		main_function    = 60,
+		winmain_function = 61,
+		dllmain_function = 62
 	};
 
 	inline const char* kind_name(kind_t kind) {
@@ -52,6 +105,57 @@ namespace symbol_classifier {
 			case kind_t::register_op:      return "register_op";
 			case kind_t::immediate:        return "immediate";
 			case kind_t::comment:          return "comment";
+			case kind_t::data_byte:        return "data_byte";
+			case kind_t::data_word:        return "data_word";
+			case kind_t::data_dword:       return "data_dword";
+			case kind_t::data_qword:       return "data_qword";
+			case kind_t::data_xmmword:     return "data_xmmword";
+			case kind_t::data_ymmword:     return "data_ymmword";
+			case kind_t::data_zmmword:     return "data_zmmword";
+			case kind_t::data_tbyte:       return "data_tbyte";
+			case kind_t::data_fword:       return "data_fword";
+			case kind_t::string_ascii:     return "string_ascii";
+			case kind_t::string_unicode:   return "string_unicode";
+			case kind_t::struct_ref:       return "struct_ref";
+			case kind_t::array_ref:        return "array_ref";
+			case kind_t::offset_ref:       return "offset_ref";
+			case kind_t::segment_ref:      return "segment_ref";
+			case kind_t::pointer_ref:      return "pointer_ref";
+			case kind_t::data_unknown:     return "data_unknown";
+			case kind_t::align_directive:  return "align_directive";
+			case kind_t::jump_thunk:       return "jump_thunk";
+			case kind_t::case_label:       return "case_label";
+			case kind_t::default_case:     return "default_case";
+			case kind_t::stack_var:        return "stack_var";
+			case kind_t::stack_arg:        return "stack_arg";
+			case kind_t::saved_reg:        return "saved_reg";
+			case kind_t::restored_reg:     return "restored_reg";
+			case kind_t::section_text:     return "section_text";
+			case kind_t::section_data:     return "section_data";
+			case kind_t::section_rdata:    return "section_rdata";
+			case kind_t::section_bss:      return "section_bss";
+			case kind_t::section_rsrc:     return "section_rsrc";
+			case kind_t::section_other:    return "section_other";
+			case kind_t::custom_struct:    return "custom_struct";
+			case kind_t::enum_value:       return "enum_value";
+			case kind_t::typelib_type:     return "typelib_type";
+			case kind_t::mnem_branch:      return "mnem_branch";
+			case kind_t::mnem_call:        return "mnem_call";
+			case kind_t::mnem_ret:         return "mnem_ret";
+			case kind_t::mnem_arith:       return "mnem_arith";
+			case kind_t::mnem_logic:       return "mnem_logic";
+			case kind_t::mnem_data:        return "mnem_data";
+			case kind_t::mnem_sse:         return "mnem_sse";
+			case kind_t::mnem_string:      return "mnem_string";
+			case kind_t::mnem_priv:        return "mnem_priv";
+			case kind_t::mnem_nop:         return "mnem_nop";
+			case kind_t::mnem_int:         return "mnem_int";
+			case kind_t::mnem_other:       return "mnem_other";
+			case kind_t::imp_function:     return "imp_function";
+			case kind_t::entry_point:      return "entry_point";
+			case kind_t::main_function:    return "main_function";
+			case kind_t::winmain_function: return "winmain_function";
+			case kind_t::dllmain_function: return "dllmain_function";
 			case kind_t::unknown:          return "unknown";
 		}
 		return "unknown";
@@ -74,14 +178,66 @@ namespace symbol_classifier {
 			bool     is_data = false;
 		};
 
+		struct struct_field_t {
+			std::string name;
+			uint32_t    offset = 0;
+			uint32_t    size = 0;
+			uint32_t    type_id = 0;
+			std::string type_name;
+		};
+
+		struct struct_binding_t {
+			uint32_t                                type_id = 0;
+			std::string                             struct_name;
+			uint32_t                                size = 0;
+			std::vector<struct_field_t>             fields;
+			std::unordered_map<uint32_t, size_t>    field_by_offset;
+			uint64_t                                base_va = 0;
+		};
+
+		using address_kind_map_t = std::unordered_map<uint64_t, kind_t>;
+		using struct_binding_map_t = std::map<uint32_t, struct_binding_t>;
+		using enum_value_map_t = std::map<std::string, std::vector<std::pair<int64_t, std::string>>>;
+		using iat_funcname_map_t = std::map<uint64_t, std::string>;
+
+		inline std::shared_ptr<const address_kind_map_t> empty_address_kind_snapshot() {
+			static const std::shared_ptr<const address_kind_map_t> s_empty
+				= std::make_shared<const address_kind_map_t>();
+			return s_empty;
+		}
+
+		inline std::shared_ptr<const struct_binding_map_t> empty_struct_binding_snapshot() {
+			static const std::shared_ptr<const struct_binding_map_t> s_empty
+				= std::make_shared<const struct_binding_map_t>();
+			return s_empty;
+		}
+
+		inline std::shared_ptr<const enum_value_map_t> empty_enum_value_snapshot() {
+			static const std::shared_ptr<const enum_value_map_t> s_empty
+				= std::make_shared<const enum_value_map_t>();
+			return s_empty;
+		}
+
+		inline std::shared_ptr<const iat_funcname_map_t> empty_iat_funcname_snapshot() {
+			static const std::shared_ptr<const iat_funcname_map_t> s_empty
+				= std::make_shared<const iat_funcname_map_t>();
+			return s_empty;
+		}
+
 		struct module_entry_t {
-			std::string                            name;
-			uint64_t                               base = 0;
-			uint64_t                               size = 0;
-			std::vector<section_range_t>           sections;
-			std::unordered_map<uint64_t, kind_t>   address_kind;
-			std::unordered_set<std::string>        external_names;
-			std::atomic<uint32_t>                  state{static_cast<uint32_t>(build_state_t::idle)};
+			std::string                                          name;
+			uint64_t                                             base = 0;
+			uint64_t                                             size = 0;
+			std::vector<section_range_t>                         sections;
+			std::shared_ptr<const address_kind_map_t>            address_kind = empty_address_kind_snapshot();
+			std::shared_ptr<const struct_binding_map_t>          struct_bindings = empty_struct_binding_snapshot();
+			std::shared_ptr<const enum_value_map_t>              enum_value_tables = empty_enum_value_snapshot();
+			std::shared_ptr<const iat_funcname_map_t>            iat_to_funcname = empty_iat_funcname_snapshot();
+			std::unordered_set<std::string>                      external_names;
+			std::atomic<uint32_t>                                state{static_cast<uint32_t>(build_state_t::idle)};
+			std::mutex                                           apply_lock;
+			std::atomic<bool>                                    apply_in_flight{false};
+			std::atomic<uint64_t>                                apply_generation{0};
 		};
 
 		struct module_range_t {
@@ -99,6 +255,8 @@ namespace symbol_classifier {
 			aida::events::subscription_handle_t                            subscription;
 			std::atomic<uint64_t>                                          generation{0};
 			std::atomic<bool>                                              rebuild_in_flight{false};
+			std::atomic<bool>                                              pdb_subscription_armed{false};
+			aida::events::subscription_handle_t                            pdb_subscription;
 		};
 
 		inline registry_t& registry() {
@@ -189,7 +347,7 @@ namespace symbol_classifier {
 
 		inline bool is_library_name(std::string_view name) {
 			if (name.empty()) return false;
-			static constexpr std::array<std::string_view, 28> kLibPrefixes = {
+			static constexpr std::array<std::string_view, 87> kLibPrefixes = {
 				"__security_",
 				"__scrt_",
 				"__std_",
@@ -217,7 +375,66 @@ namespace symbol_classifier {
 				"WinMainCRTStartup",
 				"DllMainCRTStartup",
 				"_DllMainCRTStartup",
-				"__dyn_tls_init"
+				"__dyn_tls_init",
+				"_RTC_CheckEsp",
+				"_RTC_CheckStackVars",
+				"_RTC_AllocaHelper",
+				"_RTC_GetSrcLine",
+				"__GSHandlerCheck_EH",
+				"__GSHandlerCheck_SEH",
+				"__GSHandlerCheck_EH4",
+				"__std_terminate",
+				"__std_exception_copy",
+				"__std_exception_destroy",
+				"__std_type_info_destroy_list",
+				"__std_type_info_compare",
+				"__std_type_info_hash",
+				"__std_type_info_name",
+				"__delayLoadHelper2",
+				"__tailMerge_",
+				"__delay_load_dll",
+				"_CIacos",
+				"_CIasin",
+				"_CIatan",
+				"_CIatan2",
+				"_CIcos",
+				"_CIcosh",
+				"_CIexp",
+				"_CIfmod",
+				"_CIlog",
+				"_CIlog10",
+				"_CIpow",
+				"_CIsin",
+				"_CIsinh",
+				"_CIsqrt",
+				"_CItan",
+				"_CItanh",
+				"__umoddi3",
+				"__udivdi3",
+				"__divdi3",
+				"__moddi3",
+				"_aullshr",
+				"_aullshl",
+				"_alldiv",
+				"_aulldiv",
+				"_allmul",
+				"_aullrem",
+				"_allrem",
+				"__xc_a",
+				"__xc_z",
+				"__xi_a",
+				"__xi_z",
+				"_NLG_Notify",
+				"_NLG_Return2",
+				"__except1",
+				"__except2",
+				"__except_validate_context_record",
+				"__except_validate_jump_buffer",
+				"__JustMyCode_Default",
+				"__GetExceptionInfo",
+				"vtordisp_",
+				"_purecall",
+				"__report_gsfailure"
 			};
 			for (auto p : kLibPrefixes) {
 				if (name_starts_with(name, p)) return true;
@@ -375,23 +592,125 @@ namespace symbol_classifier {
 		}
 
 		inline void apply_pdb_symbols(std::shared_ptr<module_entry_t>& mod) {
-			std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
-			auto it = symbol_store::g_state.modules.find(mod->name);
-			if (it == symbol_store::g_state.modules.end()) return;
-			const auto& ms = it->second;
-			if (!ms.pdb.loaded) return;
-			for (const auto& sym : ms.pdb.symbols) {
-				if (!sym.is_function) continue;
-				uint64_t va = mod->base + sym.rva;
-				if (va < mod->base || va >= mod->base + mod->size) continue;
-				kind_t k = is_library_name(sym.name) ? kind_t::library_function : kind_t::regular_function;
-				auto eit = mod->address_kind.find(va);
-				if (eit == mod->address_kind.end()) {
-					mod->address_kind.emplace(va, k);
-				} else if (eit->second == kind_t::regular_function && k == kind_t::library_function) {
+			if (!mod) return;
+			std::vector<std::pair<uint64_t, kind_t>> updates;
+			{
+				std::lock_guard<std::mutex> lk_store(symbol_store::g_state.mutex);
+				auto it = symbol_store::g_state.modules.find(mod->name);
+				if (it == symbol_store::g_state.modules.end()) return;
+				const auto& ms = it->second;
+				if (!ms.pdb.loaded) return;
+				updates.reserve(ms.pdb.symbols.size());
+				for (const auto& sym : ms.pdb.symbols) {
+					if (!sym.is_function) continue;
+					uint64_t va = mod->base + sym.rva;
+					if (va < mod->base || va >= mod->base + mod->size) continue;
+					kind_t k = is_library_name(sym.name) ? kind_t::library_function : kind_t::regular_function;
+					updates.emplace_back(va, k);
+				}
+			}
+
+			std::lock_guard<std::mutex> lk(mod->apply_lock);
+			auto cur = std::atomic_load(&mod->address_kind);
+			auto next = std::make_shared<address_kind_map_t>(cur ? *cur : address_kind_map_t());
+			for (const auto& u : updates) {
+				auto eit = next->find(u.first);
+				if (eit == next->end()) {
+					next->emplace(u.first, u.second);
+				} else if (eit->second == kind_t::regular_function && u.second == kind_t::library_function) {
 					eit->second = kind_t::library_function;
 				}
 			}
+			std::shared_ptr<const address_kind_map_t> new_snapshot(std::move(next));
+			std::atomic_store(&mod->address_kind, new_snapshot);
+			mod->apply_generation.fetch_add(1, std::memory_order_acq_rel);
+		}
+
+		inline void apply_pdb_types(std::shared_ptr<module_entry_t>& mod) {
+			if (!mod) return;
+			std::vector<std::pair<uint32_t, struct_binding_t>> binding_updates;
+			std::vector<std::pair<std::string, std::vector<std::pair<int64_t, std::string>>>> enum_updates;
+			std::vector<std::pair<uint64_t, kind_t>> address_updates;
+			{
+				std::lock_guard<std::mutex> lk_store(symbol_store::g_state.mutex);
+				auto it = symbol_store::g_state.modules.find(mod->name);
+				if (it == symbol_store::g_state.modules.end()) return;
+				const auto& ms = it->second;
+				if (!ms.pdb.loaded) return;
+
+				binding_updates.reserve(ms.pdb.structs.size());
+				for (const auto& sd : ms.pdb.structs) {
+					struct_binding_t b;
+					b.type_id = sd.type_index;
+					b.struct_name = sd.name;
+					b.size = static_cast<uint32_t>(sd.size);
+					b.fields.reserve(sd.members.size());
+					for (const auto& mem : sd.members) {
+						struct_field_t f;
+						f.name = mem.name;
+						f.offset = static_cast<uint32_t>(mem.offset);
+						f.size = static_cast<uint32_t>(mem.size);
+						f.type_id = mem.type_index;
+						f.type_name = mem.type_name;
+						b.fields.push_back(std::move(f));
+					}
+					b.field_by_offset.reserve(b.fields.size());
+					for (size_t fi = 0; fi < b.fields.size(); ++fi) {
+						b.field_by_offset.emplace(b.fields[fi].offset, fi);
+					}
+
+					auto sym_it = ms.pdb.symbol_by_name.find(sd.name);
+					if (sym_it != ms.pdb.symbol_by_name.end()) {
+						const auto& s = ms.pdb.symbols[sym_it->second];
+						uint64_t va = mod->base + s.rva;
+						if (va >= mod->base && va < mod->base + mod->size) {
+							b.base_va = va;
+							address_updates.emplace_back(va, kind_t::custom_struct);
+						}
+					}
+					binding_updates.emplace_back(sd.type_index, std::move(b));
+				}
+
+				enum_updates.reserve(ms.pdb.enums.size());
+				for (const auto& ed : ms.pdb.enums) {
+					std::vector<std::pair<int64_t, std::string>> entries;
+					entries.reserve(ed.members.size());
+					for (const auto& em : ed.members) {
+						entries.emplace_back(em.value, em.name);
+					}
+					enum_updates.emplace_back(ed.name, std::move(entries));
+				}
+			}
+
+			std::lock_guard<std::mutex> lk(mod->apply_lock);
+
+			auto cur_bindings = std::atomic_load(&mod->struct_bindings);
+			auto next_bindings = std::make_shared<struct_binding_map_t>(cur_bindings ? *cur_bindings : struct_binding_map_t());
+			for (auto& bu : binding_updates) {
+				(*next_bindings)[bu.first] = std::move(bu.second);
+			}
+			std::shared_ptr<const struct_binding_map_t> bindings_snapshot(std::move(next_bindings));
+			std::atomic_store(&mod->struct_bindings, bindings_snapshot);
+
+			auto cur_enums = std::atomic_load(&mod->enum_value_tables);
+			auto next_enums = std::make_shared<enum_value_map_t>(cur_enums ? *cur_enums : enum_value_map_t());
+			for (auto& eu : enum_updates) {
+				(*next_enums)[eu.first] = std::move(eu.second);
+			}
+			std::shared_ptr<const enum_value_map_t> enums_snapshot(std::move(next_enums));
+			std::atomic_store(&mod->enum_value_tables, enums_snapshot);
+
+			if (!address_updates.empty()) {
+				auto cur_kinds = std::atomic_load(&mod->address_kind);
+				auto next_kinds = std::make_shared<address_kind_map_t>(cur_kinds ? *cur_kinds : address_kind_map_t());
+				for (const auto& u : address_updates) {
+					(*next_kinds)[u.first] = u.second;
+				}
+				std::shared_ptr<const address_kind_map_t> kinds_snapshot(std::move(next_kinds));
+				std::atomic_store(&mod->address_kind, kinds_snapshot);
+			}
+
+			mod->apply_generation.fetch_add(1, std::memory_order_acq_rel);
 		}
 
 		inline void build_module_classification(std::shared_ptr<module_entry_t> mod) {
@@ -410,20 +729,30 @@ namespace symbol_classifier {
 				}
 			}
 
-			std::unordered_map<uint64_t, kind_t> kinds;
-			std::unordered_set<std::string>      external_names;
-			kinds.reserve(8192);
+			auto kinds = std::make_shared<address_kind_map_t>();
+			auto iat_map = std::make_shared<iat_funcname_map_t>();
+			std::unordered_set<std::string> external_names;
+			kinds->reserve(8192);
 
 			const bool host_module_is_os = is_os_module(mod->name);
 
 			if (pe_ok) {
 				for (const auto& imp : pe.imports) {
 					if (imp.bound_address != 0) {
-						kinds[imp.bound_address] = kind_t::external_import;
+						(*kinds)[imp.bound_address] = kind_t::external_import;
 					}
 					if (imp.iat_address != 0) {
-						auto it = kinds.find(imp.iat_address);
-						if (it == kinds.end()) kinds.emplace(imp.iat_address, kind_t::external_import);
+						auto it = kinds->find(imp.iat_address);
+						if (it == kinds->end()) kinds->emplace(imp.iat_address, kind_t::external_import);
+						if (!imp.function_name.empty()) {
+							std::string composite;
+							if (!imp.module_name.empty()) {
+								composite = imp.module_name;
+								composite.push_back('!');
+							}
+							composite.append(imp.function_name);
+							iat_map->emplace(imp.iat_address, std::move(composite));
+						}
 					}
 					if (!imp.function_name.empty()) {
 						external_names.insert(imp.function_name);
@@ -441,9 +770,9 @@ namespace symbol_classifier {
 					kind_t k = (host_module_is_os || is_library_name(exp.name))
 						? kind_t::library_function
 						: kind_t::regular_function;
-					auto it = kinds.find(exp.address);
-					if (it == kinds.end()) {
-						kinds.emplace(exp.address, k);
+					auto it = kinds->find(exp.address);
+					if (it == kinds->end()) {
+						kinds->emplace(exp.address, k);
 					} else if (it->second == kind_t::regular_function && k == kind_t::library_function) {
 						it->second = kind_t::library_function;
 					}
@@ -455,28 +784,34 @@ namespace symbol_classifier {
 			for (uint32_t rva : rfn_starts) {
 				uint64_t va = mod->base + rva;
 				if (va < mod->base || va >= mod->base + mod->size) continue;
-				auto it = kinds.find(va);
-				if (it == kinds.end()) {
-					kinds.emplace(va, host_module_is_os ? kind_t::library_function : kind_t::regular_function);
+				auto it = kinds->find(va);
+				if (it == kinds->end()) {
+					kinds->emplace(va, host_module_is_os ? kind_t::library_function : kind_t::regular_function);
 				}
 			}
 
-			mod->sections = std::move(sections);
-			mod->address_kind = std::move(kinds);
-			mod->external_names = std::move(external_names);
-
-			apply_pdb_symbols(mod);
-
 			constexpr size_t kMaxStringScanBytes = 4u * 1024u * 1024u;
-			for (const auto& sec : mod->sections) {
+			for (const auto& sec : sections) {
 				if (!sec.is_data) continue;
 				uint64_t span = sec.end_va > sec.start_va ? (sec.end_va - sec.start_va) : 0;
 				if (span == 0) continue;
 				size_t to_read = static_cast<size_t>(span < kMaxStringScanBytes ? span : kMaxStringScanBytes);
 				std::vector<uint8_t> blob;
 				if (!driver_bridge::read_memory(sec.start_va, to_read, blob) || blob.empty()) continue;
-				scan_strings_in_blob(sec.start_va, blob, mod->address_kind);
+				scan_strings_in_blob(sec.start_va, blob, *kinds);
 			}
+
+			mod->sections = std::move(sections);
+			mod->external_names = std::move(external_names);
+
+			std::shared_ptr<const address_kind_map_t> kinds_snapshot(std::move(kinds));
+			std::atomic_store(&mod->address_kind, kinds_snapshot);
+
+			std::shared_ptr<const iat_funcname_map_t> iat_snapshot(std::move(iat_map));
+			std::atomic_store(&mod->iat_to_funcname, iat_snapshot);
+
+			apply_pdb_symbols(mod);
+			apply_pdb_types(mod);
 
 			mod->state.store(static_cast<uint32_t>(build_state_t::built), std::memory_order_release);
 		}
@@ -622,6 +957,18 @@ namespace symbol_classifier {
 			reg.generation.fetch_add(1, std::memory_order_acq_rel);
 		}
 
+		inline void schedule_table_rebuild_async() {
+			auto& reg = registry();
+			bool expected = false;
+			if (!reg.rebuild_in_flight.compare_exchange_strong(expected, true,
+				std::memory_order_acq_rel))
+				return;
+			work_queue::post([&reg]() {
+				rebuild_module_table_offlock(reg);
+				reg.rebuild_in_flight.store(false, std::memory_order_release);
+			});
+		}
+
 		inline void ensure_subscription() {
 			auto& reg = registry();
 			if (reg.subscription_armed.load(std::memory_order_acquire)) return;
@@ -631,6 +978,7 @@ namespace symbol_classifier {
 				aida::events::event_binary_loaded,
 				[](const aida::events::binary_loaded_t&) {
 					clear_caches();
+					schedule_table_rebuild_async();
 				});
 			if (!reg.subscription.valid()) {
 				reg.subscription_armed.store(false, std::memory_order_release);
@@ -642,22 +990,28 @@ namespace symbol_classifier {
 	inline kind_t classify(uint64_t addr) {
 		if (addr == 0) return kind_t::unknown;
 		auto& reg = detail::registry();
-		std::shared_lock<std::shared_mutex> lk(reg.rw);
-		if (!reg.table_built.load(std::memory_order_acquire)) return kind_t::unknown;
-		if (reg.table.empty()) return kind_t::unknown;
-		auto it = std::upper_bound(reg.table.begin(), reg.table.end(), addr,
-			[](uint64_t a, const detail::module_range_t& r) {
-				return a < r.start_va;
-			});
-		if (it == reg.table.begin()) return kind_t::unknown;
-		--it;
-		if (addr < it->start_va || addr >= it->end_va) return kind_t::unknown;
-		auto& entry = it->entry;
+		std::shared_ptr<detail::module_entry_t> entry;
+		{
+			std::shared_lock<std::shared_mutex> lk(reg.rw);
+			if (!reg.table_built.load(std::memory_order_acquire)) return kind_t::unknown;
+			if (reg.table.empty()) return kind_t::unknown;
+			auto it = std::upper_bound(reg.table.begin(), reg.table.end(), addr,
+				[](uint64_t a, const detail::module_range_t& r) {
+					return a < r.start_va;
+				});
+			if (it == reg.table.begin()) return kind_t::unknown;
+			--it;
+			if (addr < it->start_va || addr >= it->end_va) return kind_t::unknown;
+			entry = it->entry;
+		}
 		if (!entry) return kind_t::unknown;
 		uint32_t st = entry->state.load(std::memory_order_acquire);
 		if (st != static_cast<uint32_t>(detail::build_state_t::built)) return kind_t::unknown;
-		auto kit = entry->address_kind.find(addr);
-		if (kit != entry->address_kind.end()) return kit->second;
+		auto m = std::atomic_load(&entry->address_kind);
+		if (m) {
+			auto kit = m->find(addr);
+			if (kit != m->end()) return kit->second;
+		}
 		const detail::section_range_t* sec = detail::find_section(entry->sections, addr);
 		if (sec) {
 			if (sec->is_data) return kind_t::data;
@@ -673,19 +1027,76 @@ namespace symbol_classifier {
 		while (!nv.empty() && (nv.back() == ' ' || nv.back() == '\t')) nv.remove_suffix(1);
 		if (nv.empty()) return kind_t::unknown;
 
+		if (detail::name_starts_with(nv, "__imp_")) return kind_t::imp_function;
+		if (detail::name_starts_with(nv, "j_sub_")) return kind_t::jump_thunk;
+		if (detail::name_starts_with(nv, "j_")) return kind_t::jump_thunk;
 		if (detail::name_starts_with(nv, "sub_")) return kind_t::regular_function;
+		if (detail::name_starts_with(nv, "nullsub_")) return kind_t::regular_function;
 		if (detail::name_starts_with(nv, "locret_")) return kind_t::label;
 		if (detail::name_starts_with(nv, "loc_")) return kind_t::label;
-		if (detail::name_starts_with(nv, "j_")) return kind_t::label;
-		if (detail::name_starts_with(nv, "nullsub_")) return kind_t::regular_function;
-		if (detail::name_starts_with(nv, "off_")) return kind_t::data;
-		if (detail::name_starts_with(nv, "dword_")) return kind_t::data;
-		if (detail::name_starts_with(nv, "qword_")) return kind_t::data;
-		if (detail::name_starts_with(nv, "word_")) return kind_t::data;
-		if (detail::name_starts_with(nv, "byte_")) return kind_t::data;
-		if (detail::name_starts_with(nv, "unk_")) return kind_t::data;
-		if (detail::name_starts_with(nv, "asc_") || detail::name_starts_with(nv, "aS")) return kind_t::string;
-		if (detail::name_starts_with(nv, "stru_")) return kind_t::data;
+		if (detail::name_starts_with(nv, "case_")) return kind_t::case_label;
+		if (detail::name_starts_with(nv, "def_")) return kind_t::default_case;
+		if (detail::name_starts_with(nv, "off_")) return kind_t::offset_ref;
+		if (detail::name_starts_with(nv, "seg_")) return kind_t::segment_ref;
+		if (detail::name_starts_with(nv, "ptr_")) return kind_t::pointer_ref;
+		if (detail::name_starts_with(nv, "stru_")) return kind_t::struct_ref;
+		if (detail::name_starts_with(nv, "arr_")) return kind_t::array_ref;
+		if (detail::name_starts_with(nv, "xmmword_")) return kind_t::data_xmmword;
+		if (detail::name_starts_with(nv, "ymmword_")) return kind_t::data_ymmword;
+		if (detail::name_starts_with(nv, "zmmword_")) return kind_t::data_zmmword;
+		if (detail::name_starts_with(nv, "tbyte_")) return kind_t::data_tbyte;
+		if (detail::name_starts_with(nv, "fword_")) return kind_t::data_fword;
+		if (detail::name_starts_with(nv, "qword_")) return kind_t::data_qword;
+		if (detail::name_starts_with(nv, "dword_")) return kind_t::data_dword;
+		if (detail::name_starts_with(nv, "word_")) return kind_t::data_word;
+		if (detail::name_starts_with(nv, "byte_")) return kind_t::data_byte;
+		if (detail::name_starts_with(nv, "unk_")) return kind_t::data_unknown;
+		if (detail::name_starts_with(nv, "align_")) return kind_t::align_directive;
+		if (detail::name_starts_with(nv, "asc_")) return kind_t::string_ascii;
+		if (detail::name_starts_with(nv, "str_")) return kind_t::string_unicode;
+		if (nv.size() >= 3 && nv[0] == 'a' && nv[1] == 'S'
+		    && ((nv[2] >= 'A' && nv[2] <= 'Z')
+		        || (nv[2] >= 'a' && nv[2] <= 'z')
+		        || (nv[2] >= '0' && nv[2] <= '9')
+		        || nv[2] == '_')) {
+			return kind_t::string_ascii;
+		}
+		if (detail::name_starts_with(nv, "var_")) return kind_t::stack_var;
+		if (detail::name_starts_with(nv, "arg_")) return kind_t::stack_arg;
+		if (detail::name_starts_with(nv, "saved_")) return kind_t::saved_reg;
+		auto sr_tail_is_hex_or_reg = [](std::string_view rest) -> bool {
+			if (rest.empty() || rest.size() > 8) return false;
+			bool all_hex = true;
+			for (char c : rest) {
+				if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+					all_hex = false;
+					break;
+				}
+			}
+			if (all_hex) return true;
+			return detail::is_register_token(rest);
+		};
+		if (detail::name_starts_with(nv, "s_") && nv.size() > 2 && sr_tail_is_hex_or_reg(nv.substr(2)))
+			return kind_t::saved_reg;
+		if (detail::name_starts_with(nv, "r_") && nv.size() > 2 && sr_tail_is_hex_or_reg(nv.substr(2)))
+			return kind_t::restored_reg;
+
+		if (nv.size() >= 2 && nv.front() == '.') {
+			if (nv == ".text") return kind_t::section_text;
+			if (nv == ".data") return kind_t::section_data;
+			if (nv == ".rdata") return kind_t::section_rdata;
+			if (nv == ".bss") return kind_t::section_bss;
+			if (nv == ".rsrc") return kind_t::section_rsrc;
+			if (nv == ".idata" || nv == ".tls" || nv == ".CRT" || nv == ".pdata"
+			    || nv == ".xdata" || nv == ".reloc" || nv == ".edata" || nv == ".rodata") {
+				return kind_t::section_other;
+			}
+		}
+
+		if (nv == "start") return kind_t::entry_point;
+		if (nv == "main" || nv == "_main" || nv == "wmain") return kind_t::main_function;
+		if (nv == "WinMain" || nv == "wWinMain" || nv == "_WinMain") return kind_t::winmain_function;
+		if (nv == "DllMain" || nv == "_DllMain" || nv == "DllEntryPoint") return kind_t::dllmain_function;
 
 		if (detail::is_register_token(nv)) return kind_t::register_op;
 
@@ -712,6 +1123,36 @@ namespace symbol_classifier {
 		if (detail::is_library_name(nv)) return kind_t::library_function;
 
 		return kind_t::unknown;
+	}
+
+	inline const char* data_prefix_for_size(int size_bytes) {
+		switch (size_bytes) {
+			case 1:  return "byte";
+			case 2:  return "word";
+			case 4:  return "dword";
+			case 6:  return "fword";
+			case 8:  return "qword";
+			case 10: return "tbyte";
+			case 16: return "xmmword";
+			case 32: return "ymmword";
+			case 64: return "zmmword";
+			default: return "unk";
+		}
+	}
+
+	inline kind_t kind_for_data_size(int size_bytes) {
+		switch (size_bytes) {
+			case 1:  return kind_t::data_byte;
+			case 2:  return kind_t::data_word;
+			case 4:  return kind_t::data_dword;
+			case 6:  return kind_t::data_fword;
+			case 8:  return kind_t::data_qword;
+			case 10: return kind_t::data_tbyte;
+			case 16: return kind_t::data_xmmword;
+			case 32: return kind_t::data_ymmword;
+			case 64: return kind_t::data_zmmword;
+			default: return kind_t::data_unknown;
+		}
 	}
 
 	inline void warm_range(uint64_t lo_addr, uint64_t hi_addr) {
@@ -754,6 +1195,182 @@ namespace symbol_classifier {
 
 	inline void on_attach_changed() {
 		detail::clear_caches();
+		detail::ensure_subscription();
+		detail::schedule_table_rebuild_async();
+	}
+
+	inline std::shared_ptr<detail::module_entry_t> find_module_by_address(uint64_t addr) {
+		auto& reg = detail::registry();
+		std::shared_lock<std::shared_mutex> lk(reg.rw);
+		if (!reg.table_built.load(std::memory_order_acquire)) return nullptr;
+		if (reg.table.empty()) return nullptr;
+		auto it = std::upper_bound(reg.table.begin(), reg.table.end(), addr,
+			[](uint64_t a, const detail::module_range_t& r) {
+				return a < r.start_va;
+			});
+		if (it == reg.table.begin()) return nullptr;
+		--it;
+		if (addr < it->start_va || addr >= it->end_va) return nullptr;
+		return it->entry;
+	}
+
+	inline std::shared_ptr<detail::module_entry_t> find_module_by_name(std::string_view module_name) {
+		auto& reg = detail::registry();
+		std::shared_lock<std::shared_mutex> lk(reg.rw);
+		std::string key(module_name);
+		auto it = reg.modules.find(key);
+		if (it != reg.modules.end()) return it->second;
+		for (const auto& kv : reg.modules) {
+			if (!kv.second) continue;
+			if (kv.first.size() == module_name.size()) {
+				bool eq = true;
+				for (size_t i = 0; i < module_name.size(); ++i) {
+					if (!detail::ascii_eq_lower(kv.first[i], module_name[i])) { eq = false; break; }
+				}
+				if (eq) return kv.second;
+			}
+		}
+		return nullptr;
+	}
+
+	inline bool mark_address_kind(uint64_t va, kind_t k) {
+		if (va == 0) return false;
+		auto mod = find_module_by_address(va);
+		if (!mod) return false;
+		std::lock_guard<std::mutex> lk(mod->apply_lock);
+		auto cur = std::atomic_load(&mod->address_kind);
+		auto next = std::make_shared<detail::address_kind_map_t>(cur ? *cur : detail::address_kind_map_t());
+		(*next)[va] = k;
+		std::shared_ptr<const detail::address_kind_map_t> snapshot(std::move(next));
+		std::atomic_store(&mod->address_kind, snapshot);
+		mod->apply_generation.fetch_add(1, std::memory_order_acq_rel);
+		return true;
+	}
+
+	inline bool lookup_import_by_iat(uint64_t iat_va, std::string& out_name) {
+		out_name.clear();
+		if (iat_va == 0) return false;
+		auto mod = find_module_by_address(iat_va);
+		if (!mod) {
+			auto& reg = detail::registry();
+			std::vector<std::shared_ptr<detail::module_entry_t>> mods;
+			{
+				std::shared_lock<std::shared_mutex> lk(reg.rw);
+				mods.reserve(reg.modules.size());
+				for (const auto& kv : reg.modules) {
+					if (kv.second) mods.push_back(kv.second);
+				}
+			}
+			for (auto& m : mods) {
+				auto snap = std::atomic_load(&m->iat_to_funcname);
+				if (!snap) continue;
+				auto it = snap->find(iat_va);
+				if (it != snap->end()) {
+					out_name = it->second;
+					return true;
+				}
+			}
+			return false;
+		}
+		auto snap = std::atomic_load(&mod->iat_to_funcname);
+		if (!snap) return false;
+		auto it = snap->find(iat_va);
+		if (it == snap->end()) return false;
+		out_name = it->second;
+		return true;
+	}
+
+	inline std::shared_ptr<const detail::struct_binding_map_t> get_struct_bindings(std::shared_ptr<detail::module_entry_t> mod) {
+		if (!mod) return detail::empty_struct_binding_snapshot();
+		auto snap = std::atomic_load(&mod->struct_bindings);
+		if (!snap) return detail::empty_struct_binding_snapshot();
+		return snap;
+	}
+
+	inline std::shared_ptr<const detail::enum_value_map_t> get_enum_value_tables(std::shared_ptr<detail::module_entry_t> mod) {
+		if (!mod) return detail::empty_enum_value_snapshot();
+		auto snap = std::atomic_load(&mod->enum_value_tables);
+		if (!snap) return detail::empty_enum_value_snapshot();
+		return snap;
+	}
+
+	inline uint64_t module_apply_generation(std::shared_ptr<detail::module_entry_t> mod) {
+		if (!mod) return 0;
+		return mod->apply_generation.load(std::memory_order_acquire);
+	}
+
+	namespace detail {
+
+		inline void handle_pdb_loaded(const aida::events::event_pdb_loaded& ev) {
+			if (ev.module_name.empty()) return;
+			if (!ev.success) return;
+			auto& reg = registry();
+			std::vector<std::shared_ptr<module_entry_t>> targets;
+			{
+				std::shared_lock<std::shared_mutex> lk(reg.rw);
+				auto it = reg.modules.find(ev.module_name);
+				if (it != reg.modules.end() && it->second) {
+					targets.push_back(it->second);
+				} else {
+					for (const auto& kv : reg.modules) {
+						if (!kv.second) continue;
+						if (kv.first.size() != ev.module_name.size()) continue;
+						bool eq = true;
+						for (size_t i = 0; i < kv.first.size(); ++i) {
+							if (!ascii_eq_lower(kv.first[i], ev.module_name[i])) { eq = false; break; }
+						}
+						if (eq) {
+							targets.push_back(kv.second);
+							break;
+						}
+					}
+				}
+			}
+
+			for (auto& mod : targets) {
+				if (!mod) continue;
+				uint32_t st = mod->state.load(std::memory_order_acquire);
+				if (st != static_cast<uint32_t>(build_state_t::built)) continue;
+				bool expected = false;
+				if (!mod->apply_in_flight.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+					continue;
+				}
+				std::weak_ptr<module_entry_t> weak = mod;
+				work_queue::post([weak]() {
+					auto strong = weak.lock();
+					if (!strong) return;
+					apply_pdb_symbols(strong);
+					apply_pdb_types(strong);
+					strong->apply_in_flight.store(false, std::memory_order_release);
+				});
+			}
+		}
+
+	}
+
+	inline void subscribe_pdb_events() {
+		auto& reg = detail::registry();
+		if (reg.pdb_subscription_armed.load(std::memory_order_acquire)) return;
+		bool expected = false;
+		if (!reg.pdb_subscription_armed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+		reg.pdb_subscription = aida::events::subscribe(
+			aida::events::event_pdb_loaded_def,
+			[](const aida::events::event_pdb_loaded& ev) {
+				detail::handle_pdb_loaded(ev);
+			});
+		if (!reg.pdb_subscription.valid()) {
+			reg.pdb_subscription_armed.store(false, std::memory_order_release);
+		}
+	}
+
+	inline void unsubscribe_pdb_events() {
+		auto& reg = detail::registry();
+		if (!reg.pdb_subscription_armed.load(std::memory_order_acquire)) return;
+		if (reg.pdb_subscription.valid()) {
+			aida::events::unsubscribe(reg.pdb_subscription);
+		}
+		reg.pdb_subscription = aida::events::subscription_handle_t{};
+		reg.pdb_subscription_armed.store(false, std::memory_order_release);
 	}
 
 }

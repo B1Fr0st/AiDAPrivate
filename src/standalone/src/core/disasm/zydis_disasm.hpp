@@ -18,7 +18,19 @@
 
 #include "standalone_driver.hpp"
 #include "../analysis/pe_parser.hpp"
+#include "../../helpers/diag_log.hpp"
 
+
+struct mem_op_snapshot_t
+{
+    uint16_t base_reg     = 0;
+    uint16_t index_reg    = 0;
+    uint8_t  scale        = 0;
+    int64_t  disp         = 0;
+    uint16_t size         = 0;
+    uint8_t  segment      = 0;
+    bool     has_disp     = false;
+};
 
 struct AsmInstr
 {
@@ -33,6 +45,12 @@ struct AsmInstr
     bool     is_nop         = false;
     bool     is_priv        = false;
     uint64_t branch_target  = 0;
+    int64_t  imm_signed     = 0;
+    uint64_t imm_unsigned   = 0;
+    bool     has_imm        = false;
+    uint8_t  imm_op_index   = 0xFF;
+    bool     has_mem_op     = false;
+    mem_op_snapshot_t mem_op{};
 };
 
 
@@ -93,13 +111,13 @@ namespace static_analysis
     inline bool read_bytes_from_pe(const DisasmFile& file, uint64_t va, size_t len, std::vector<uint8_t>& out)
     {
         out.clear();
-        if (!file.loaded || file.sections.empty()) return false;
+        if (!file.loaded || file.sections.empty() || len == 0) return false;
 
         out.resize(len, 0);
         size_t filled = 0;
 
         for (auto& sec : file.sections) {
-            uint64_t sec_start = file.image_base + sec.va;
+            uint64_t sec_start = sec.va;
             uint64_t sec_end   = sec_start + sec.bytes.size();
             if (va + len <= sec_start || va >= sec_end) continue;
 
@@ -111,7 +129,12 @@ namespace static_analysis
             std::memcpy(out.data() + dst_off, sec.bytes.data() + src_off, copy_sz);
             filled += copy_sz;
         }
-        return filled > 0;
+        if (filled == 0) {
+            out.clear();
+            return false;
+        }
+        if (filled < len) out.resize(filled);
+        return true;
     }
 
     inline uint64_t total_image_size(const DisasmFile& file)
@@ -220,6 +243,28 @@ inline AsmInstr zydis_decode_one(const uint8_t* code, int avail, uint64_t va)
                 break;
             }
         }
+    }
+
+    for (uint8_t oi = 0; oi < instruction.operand_count_visible; ++oi) {
+        const auto& op = operands[oi];
+        if (!ins.has_imm && op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE && !op.imm.is_relative) {
+            ins.has_imm = true;
+            ins.imm_op_index = oi;
+            ins.imm_unsigned = static_cast<uint64_t>(op.imm.value.u);
+            ins.imm_signed = static_cast<int64_t>(op.imm.value.s);
+        }
+        if (!ins.has_mem_op && op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            ins.has_mem_op = true;
+            ins.mem_op.base_reg = static_cast<uint16_t>(op.mem.base);
+            ins.mem_op.index_reg = static_cast<uint16_t>(op.mem.index);
+            ins.mem_op.scale = static_cast<uint8_t>(op.mem.scale);
+            ins.mem_op.disp = static_cast<int64_t>(op.mem.disp.value);
+            ins.mem_op.size = static_cast<uint16_t>(op.size);
+            ins.mem_op.segment = static_cast<uint8_t>(op.mem.segment);
+            ins.mem_op.has_disp = (op.mem.disp.size != 0);
+        }
+        if (ins.has_imm && ins.has_mem_op)
+            break;
     }
 
     return ins;
@@ -357,10 +402,6 @@ namespace disasm
         }
 
         file.instrs.shrink_to_fit();
-
-
-        file.sections.clear();
-        file.sections.shrink_to_fit();
     }
 
 
@@ -377,14 +418,24 @@ namespace disasm
 
     inline void request_live_decode(DisasmState& state)
     {
+        diag::log_tagged_critical_fmt("disasm", "request_live_decode_enter pid=%u base=0x%llX size=0x%llX view=0x%llX",
+            state.live_pid,
+            static_cast<unsigned long long>(state.live_base),
+            static_cast<unsigned long long>(state.live_size),
+            static_cast<unsigned long long>(state.live_view_addr));
         bool expected = false;
         if (!state.live_decoding.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            diag::log_tagged_critical("disasm", "request_live_decode_SKIPPED_already_decoding");
             static int s_skip_log = 0;
             if (s_skip_log++ < 5)
                 driver_bridge::debug_log("request_live_decode: SKIPPED (already decoding)\n");
             return;
         }
         if (!state.live_mode || state.live_base == 0 || state.live_size == 0) {
+            diag::log_tagged_critical_fmt("disasm", "request_live_decode_SKIPPED_invalid_state mode=%d base=0x%llX size=0x%llX",
+                state.live_mode ? 1 : 0,
+                static_cast<unsigned long long>(state.live_base),
+                static_cast<unsigned long long>(state.live_size));
             driver_bridge::debug_log("request_live_decode: SKIPPED (mode=%d base=0x%llX size=0x%llX)\n",
                 state.live_mode ? 1 : 0,
                 static_cast<unsigned long long>(state.live_base),
@@ -420,15 +471,30 @@ namespace disasm
             static_cast<unsigned long long>(win_start),
             static_cast<unsigned long long>(read_sz),
             state.live_pid);
+        diag::log_tagged_critical_fmt("disasm",
+            "request_live_decode_posting_to_work_queue win_start=0x%llX read_sz=%llu pid=%u",
+            static_cast<unsigned long long>(win_start),
+            static_cast<unsigned long long>(read_sz),
+            state.live_pid);
 
         uint32_t pid = state.live_pid;
         DisasmState* state_ptr = &state;
 
         work_queue::post([state_ptr, pid, win_start, read_sz]() {
+            diag::log_tagged_critical_fmt("disasm",
+                "live_decode_worker_enter pid=%u win_start=0x%llX read_sz=%llu tid=%lu",
+                pid,
+                static_cast<unsigned long long>(win_start),
+                static_cast<unsigned long long>(read_sz),
+                GetCurrentThreadId());
             std::vector<uint8_t> mem;
             if (driver_bridge::is_loaded() &&
                 driver_bridge::attached_pid() == pid) {
+                diag::log_tagged_critical("disasm", "live_decode_worker_pre_read_memory");
                 driver_bridge::read_memory(win_start, static_cast<size_t>(read_sz), mem);
+                diag::log_tagged_critical_fmt("disasm",
+                    "live_decode_worker_post_read_memory bytes=%llu",
+                    (unsigned long long)mem.size());
             }
 
             std::vector<AsmInstr> instrs;
@@ -465,6 +531,10 @@ namespace disasm
             state_ptr->live_pending_va = win_start;
             state_ptr->live_pending_ready.store(true, std::memory_order_release);
             state_ptr->live_decoding.store(false, std::memory_order_release);
+            diag::log_tagged_critical_fmt("disasm",
+                "live_decode_worker_exit pid=%u win_start=0x%llX",
+                pid,
+                static_cast<unsigned long long>(win_start));
         });
     }
 
@@ -473,6 +543,12 @@ namespace disasm
                            uint64_t base, uint64_t size,
                            const std::string& module_name)
     {
+        diag::log_tagged_critical_fmt("disasm", "start_live_enter pid=%u base=0x%llX size=0x%llX module=%s tid=%lu",
+            pid,
+            static_cast<unsigned long long>(base),
+            static_cast<unsigned long long>(size),
+            module_name.c_str(),
+            GetCurrentThreadId());
         driver_bridge::debug_log("start_live: pid=%u base=0x%llX size=0x%llX module=%s\n",
             pid,
             static_cast<unsigned long long>(base),
@@ -485,22 +561,50 @@ namespace disasm
         state.live_size   = size;
         state.live_floor_va = 0;
         state.live_view_addr = base;
+
+        std::vector<PESection> snapshot_sections;
         {
+            diag::log_tagged_critical("disasm", "start_live_pre_pe_parse_sections_only");
             pe_parser::pe_info_t pe;
-            if (pe_parser::parse(base, pe)) {
+            if (pe_parser::parse(base, pe, false)) {
+                diag::log_tagged_critical_fmt("disasm",
+                    "start_live_post_pe_parse sections=%llu",
+                    (unsigned long long)pe.sections.size());
                 constexpr uint32_t kCntCode = 0x00000020u;
                 constexpr uint32_t kMemExec = 0x20000000u;
+                constexpr size_t kMaxSnapshotBytes = 64ull * 1024ull * 1024ull;
                 uint64_t first_exec_va = 0;
+                size_t snapshot_total = 0;
                 for (const auto& s : pe.sections) {
-                    if ((s.characteristics & kCntCode) || (s.characteristics & kMemExec)) {
+                    bool is_exec = (s.characteristics & kCntCode) || (s.characteristics & kMemExec);
+                    if (!is_exec) continue;
+                    if (first_exec_va == 0)
                         first_exec_va = base + static_cast<uint64_t>(s.virtual_address);
-                        break;
+                    uint32_t sec_size = (s.virtual_size > 0) ? s.virtual_size : s.raw_size;
+                    if (sec_size == 0) continue;
+                    if (snapshot_total >= kMaxSnapshotBytes) continue;
+                    size_t remaining_budget = kMaxSnapshotBytes - snapshot_total;
+                    size_t read_size = (sec_size <= remaining_budget) ? sec_size : remaining_budget;
+                    uint64_t sec_va = base + static_cast<uint64_t>(s.virtual_address);
+                    std::vector<uint8_t> sec_bytes;
+                    if (driver_bridge::read_memory(sec_va, read_size, sec_bytes) && !sec_bytes.empty()) {
+                        PESection ps;
+                        ps.va = sec_va;
+                        ps.bytes = std::move(sec_bytes);
+                        snapshot_total += ps.bytes.size();
+                        snapshot_sections.push_back(std::move(ps));
                     }
                 }
                 if (first_exec_va != 0 && first_exec_va >= base && first_exec_va < base + size) {
                     state.live_view_addr = first_exec_va;
                     state.live_floor_va  = first_exec_va;
                 }
+                diag::log_tagged_critical_fmt("disasm",
+                    "start_live_snapshot sections=%llu bytes=%llu",
+                    (unsigned long long)snapshot_sections.size(),
+                    (unsigned long long)snapshot_total);
+            } else {
+                diag::log_tagged_critical("disasm", "start_live_pe_parse_FAILED");
             }
         }
         state.live_module = module_name;
@@ -517,10 +621,12 @@ namespace disasm
         state.file.path     = "live://" + std::to_string(pid) + "/" + module_name;
         state.file.image_base = base;
         state.file.text_va    = state.live_view_addr;
+        state.file.sections   = std::move(snapshot_sections);
         state.file.loaded     = true;
 
-
+        diag::log_tagged_critical("disasm", "start_live_pre_request_live_decode");
         request_live_decode(state);
+        diag::log_tagged_critical("disasm", "start_live_exit");
         return true;
     }
 

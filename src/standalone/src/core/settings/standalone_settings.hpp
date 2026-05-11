@@ -382,8 +382,6 @@ struct settings_sa_t
 
     bool        activity_bar_visible = true;
 
-    int         decompile_default_mode = 1;
-
 
     int         window_x = -1;
     int         window_y = -1;
@@ -1262,7 +1260,6 @@ struct settings_sa_t
             condense_buffer = root["condense_buffer"].get<double>();
         str("recent_workspaces_json", recent_workspaces_json);
         boolean("activity_bar_visible", activity_bar_visible);
-        integer("decompile_default_mode", decompile_default_mode);
 
         integer("window_x", window_x);
         integer("window_y", window_y);
@@ -1512,7 +1509,6 @@ struct settings_sa_t
         root["condense_buffer"] = condense_buffer;
         root["recent_workspaces_json"] = recent_workspaces_json;
         root["activity_bar_visible"] = activity_bar_visible;
-        root["decompile_default_mode"] = decompile_default_mode;
 
         root["window_x"] = window_x;
         root["window_y"] = window_y;

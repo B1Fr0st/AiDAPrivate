@@ -633,6 +633,36 @@ namespace stack_spoof {
 
         post_call_cleanup();
     }
+
+    __forceinline void spoofed_KeStackAttachProcess(PEPROCESS Process, PKAPC_STATE ApcState) {
+        if (!_KeStackAttachProcess || !Process || !ApcState) {
+            return;
+        }
+
+        pre_call_setup();
+
+        volatile auto func = _KeStackAttachProcess;
+        KeMemoryBarrier();
+
+        func(Process, ApcState);
+
+        post_call_cleanup();
+    }
+
+    __forceinline void spoofed_KeUnstackDetachProcess(PKAPC_STATE ApcState) {
+        if (!_KeUnstackDetachProcess || !ApcState) {
+            return;
+        }
+
+        pre_call_setup();
+
+        volatile auto func = _KeUnstackDetachProcess;
+        KeMemoryBarrier();
+
+        func(ApcState);
+
+        post_call_cleanup();
+    }
 }
 
 #define SPOOF_CALL(ret_type, func, ...) stack_spoof::spoofed_call<ret_type>(func, __VA_ARGS__)

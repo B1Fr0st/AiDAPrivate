@@ -1,6 +1,8 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -404,6 +406,7 @@ inline void build_cfg(uint64_t entry_address)
 			g_state.target_zoom = 1.f;
 			g_state.zoom = 1.f;
 			g_state.rebuild_anim = 0.f;
+			g_state.fit_request = true;
 		}
 
 		g_state.building.store(false);
@@ -419,7 +422,6 @@ inline bool handle_view_keys(float view_width, float view_height)
 
 	ImGuiIO& key_io = ImGui::GetIO();
 	bool key_text_lock = key_io.WantTextInput
-		|| key_io.WantCaptureKeyboard
 		|| ImGui::IsAnyItemActive();
 
 	if (key_text_lock || key_io.KeyCtrl || key_io.KeyAlt)
@@ -503,7 +505,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		aida::ui::empty_state::config_t cfg;
 		cfg.glyph = aida::ui::empty_state::glyph_t::flow;
 		cfg.title = "No CFG built";
-		cfg.body  = "Select an address in disassembly and press SPACE to construct the control flow graph.";
+		cfg.body  = "Place the cursor on an address in the disassembly view, then press Space to build a control-flow graph.";
 		cfg.hints = { { "Space" }, { "Esc" } };
 		aida::ui::empty_state::render(ImVec2(pos_x, pos_y), ImVec2(width, height), cfg);
 		dl->PopClipRect();
@@ -553,6 +555,36 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					  center_y + (wy + g_state.pan_y) * z);
 	};
 
+	{
+		const float grid_step = 40.f;
+		float inv_z = z > 0.0001f ? 1.f / z : 1.f;
+		float w_left   = -g_state.pan_x - (width  * 0.5f) * inv_z;
+		float w_right  = -g_state.pan_x + (width  * 0.5f) * inv_z;
+		float w_top    = -g_state.pan_y - (height * 0.5f) * inv_z;
+		float w_bottom = -g_state.pan_y + (height * 0.5f) * inv_z;
+		float span_x = w_right - w_left;
+		float span_y = w_bottom - w_top;
+		if (span_x > 0.f && span_y > 0.f) {
+			float est_cols = span_x / grid_step;
+			float est_rows = span_y / grid_step;
+			if (est_cols * est_rows <= 4000.f) {
+				float gx0 = std::floor(w_left  / grid_step) * grid_step;
+				float gy0 = std::floor(w_top   / grid_step) * grid_step;
+				float gx1 = std::ceil (w_right / grid_step) * grid_step;
+				float gy1 = std::ceil (w_bottom / grid_step) * grid_step;
+				ImU32 dot_col = aida::ui::with_alpha(tk.border_subtle, alpha * 0.6f);
+				for (float gy = gy0; gy <= gy1; gy += grid_step) {
+					for (float gx = gx0; gx <= gx1; gx += grid_step) {
+						ImVec2 sp = world_to_screen(gx, gy);
+						if (sp.x < pos_x - 2.f || sp.x > pos_x + width + 2.f) continue;
+						if (sp.y < pos_y - 2.f || sp.y > pos_y + height + 2.f) continue;
+						dl->AddCircleFilled(sp, 0.9f, dot_col, 6);
+					}
+				}
+			}
+		}
+	}
+
 	auto& nodes = g_state.graph.nodes;
 	auto& edges = g_state.graph.edges;
 	auto& blocks = g_state.blocks;
@@ -593,10 +625,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImU32 edge_col;
 		if (e.from < static_cast<int>(blocks.size()) && blocks[e.from].successors.size() > 1) {
 			edge_col = e.is_true_branch
-				? aida::ui::with_alpha(tk.success, alpha * 0.85f)
-				: aida::ui::with_alpha(tk.error,   alpha * 0.85f);
+				? aida::ui::with_alpha(tk.success, alpha)
+				: aida::ui::with_alpha(tk.error,   alpha);
 		} else {
-			edge_col = aida::ui::with_alpha(tk.text_dim, alpha * 0.85f);
+			edge_col = aida::ui::with_alpha(aida::ui::lighten(tk.text_secondary, 10), alpha);
 		}
 
 		bool hot_edge = false;
@@ -606,11 +638,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			hot_edge = true;
 		}
 
+		float halo_thick = std::max(3.5f, 5.5f * z);
+		float line_thick = std::max(1.5f, 2.0f * z);
 		ImU32 halo = aida::ui::with_alpha(edge_col, 0.18f);
-		dl->AddBezierCubic(p1, p2, p3, p4, halo, 4.5f * z);
-		dl->AddBezierCubic(p1, p2, p3, p4, edge_col, 1.6f * z);
+		dl->AddBezierCubic(p1, p2, p3, p4, halo, halo_thick);
+		dl->AddBezierCubic(p1, p2, p3, p4, edge_col, line_thick);
 
-		float arrow_sz = 5.f * z;
+		float arrow_sz = std::max(5.f, 7.f * z);
 		ImVec2 dir(p4.x - p3.x, p4.y - p3.y);
 		float dir_len = std::sqrt(dir.x * dir.x + dir.y * dir.y);
 		if (dir_len > 0.001f) {
@@ -625,7 +659,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 
 		float t_secs = aida::ui::clock::seconds();
-		int dot_count = hot_edge ? 4 : 2;
+		int dot_count = hot_edge ? 5 : 2;
 		float speed = hot_edge ? 0.45f : 0.30f;
 		ImU32 dot_col = hot_edge
 			? aida::ui::with_alpha(tk.accent_u32, alpha)
@@ -634,7 +668,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			float phase = fmodf(t_secs * speed + (float)dotidx / (float)dot_count, 1.f);
 			ImVec2 dp = detail::bezier_point(p1, p2, p3, p4, phase);
 			float fade = sinf(phase * 3.1415926f);
-			float r = (hot_edge ? 2.5f : 1.8f) * z;
+			float r = hot_edge ? std::max(2.5f, 3.2f * z) : 1.8f * z;
 			dl->AddCircleFilled(dp, r, aida::ui::with_alpha(dot_col, fade), 12);
 		}
 	}
@@ -703,6 +737,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImU32 ring = aida::ui::with_alpha(tk.accent_u32, row_alpha * 0.10f * pulse);
 			dl->AddRect(ImVec2(tl.x - 2.f, tl.y - 2.f), ImVec2(br.x + 2.f, br.y + 2.f),
 			            ring, 8.f * z, 0, 1.f);
+		} else if (blk.successors.empty()) {
+			dl->AddRectFilled(tl, br,
+			                  aida::ui::with_alpha(tk.warning_soft, row_alpha), 6.f * z);
+			dl->AddRect(tl, br,
+			            aida::ui::with_alpha(tk.warning, row_alpha * 0.65f),
+			            6.f * z, 0, 1.5f * z);
 		} else {
 			dl->AddRect(tl, br, aida::ui::with_alpha(tk.border_subtle, row_alpha),
 			            6.f * z, 0, 1.f * z);
@@ -720,11 +760,34 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		if (blk.is_entry) {
 			char entry_label[32];
-			snprintf(entry_label, sizeof(entry_label), "entry: %llX",
+			snprintf(entry_label, sizeof(entry_label), "ENTRY %llX",
 					 static_cast<unsigned long long>(blk.start_addr));
-			dl->AddText(ImVec2(tl.x + padding, tl.y - 14.f * z),
-			            aida::ui::with_alpha(tk.accent_u32, row_alpha),
+			ImVec2 ts = ImGui::CalcTextSize(entry_label);
+			float pill_pad_x = 6.f;
+			float pill_pad_y = 2.f;
+			ImVec2 pill_a(tl.x, tl.y - ts.y - pill_pad_y * 2.f - 4.f);
+			ImVec2 pill_b(pill_a.x + ts.x + pill_pad_x * 2.f, pill_a.y + ts.y + pill_pad_y * 2.f);
+			dl->AddRectFilled(pill_a, pill_b,
+			                  aida::ui::with_alpha(tk.accent_u32, row_alpha * 0.85f),
+			                  4.f);
+			dl->AddText(ImVec2(pill_a.x + pill_pad_x, pill_a.y + pill_pad_y),
+			            aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), row_alpha),
 			            entry_label);
+		}
+		if (blk.successors.empty() && !is_rip_block && !blk.is_entry) {
+			const char* exit_label = "EXIT";
+			ImVec2 ts = ImGui::CalcTextSize(exit_label);
+			float pill_pad_x = 5.f;
+			float pill_pad_y = 2.f;
+			ImVec2 pill_b(br.x, tl.y - 4.f);
+			ImVec2 pill_a(pill_b.x - ts.x - pill_pad_x * 2.f,
+			              pill_b.y - ts.y - pill_pad_y * 2.f);
+			dl->AddRectFilled(pill_a, pill_b,
+			                  aida::ui::with_alpha(tk.warning, row_alpha * 0.85f),
+			                  4.f);
+			dl->AddText(ImVec2(pill_a.x + pill_pad_x, pill_a.y + pill_pad_y),
+			            aida::ui::with_alpha(IM_COL32(20, 18, 8, 255), row_alpha),
+			            exit_label);
 		}
 
 		float text_y = tl.y + padding;
@@ -770,7 +833,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	{
-		float zoom_w = 132.f;
+		float zoom_w = 220.f;
 		float zoom_h = 32.f;
 		float zx = pos_x + 14.f;
 		float zy = pos_y + height - zoom_h - 14.f;
@@ -781,10 +844,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		aida::ui::blur::render_glass_border(dl, za, zb, zoom_h * 0.5f, alpha);
 
 		float btn_sz = zoom_h - 6.f;
-		float minus_x = zx + 4.f;
-		float plus_x  = zb.x - btn_sz - 4.f;
 		float by = zy + 3.f;
 
+		float minus_x = zx + 4.f;
 		ImVec2 minus_a(minus_x, by);
 		ImVec2 minus_b(minus_x + btn_sz, by + btn_sz);
 		bool minus_hov = ImGui::IsMouseHoveringRect(minus_a, minus_b, false);
@@ -797,6 +859,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		            minus_hov ? aida::ui::with_alpha(tk.accent_u32, alpha)
 		                      : aida::ui::with_alpha(tk.text_secondary, alpha), 2.f);
 
+		float text_box_w = 56.f;
+		float plus_x = minus_b.x + text_box_w;
 		ImVec2 plus_a(plus_x, by);
 		ImVec2 plus_b(plus_x + btn_sz, by + btn_sz);
 		bool plus_hov = ImGui::IsMouseHoveringRect(plus_a, plus_b, false);
@@ -820,6 +884,61 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		dl->AddText(ImVec2(zoom_text_x, zoom_text_y),
 		            aida::ui::with_alpha(tk.text_primary, alpha), zoom_buf);
 
+		float sep_x = plus_b.x + 6.f;
+		dl->AddLine(ImVec2(sep_x, zy + 6.f),
+		            ImVec2(sep_x, zy + zoom_h - 6.f),
+		            aida::ui::with_alpha(tk.border_subtle, alpha), 1.f);
+
+		float fit_x = sep_x + 6.f;
+		ImVec2 fit_a(fit_x, by);
+		ImVec2 fit_b(fit_x + btn_sz, by + btn_sz);
+		bool fit_hov = ImGui::IsMouseHoveringRect(fit_a, fit_b, false);
+		if (fit_hov) {
+			dl->AddRectFilled(fit_a, fit_b,
+			                  aida::ui::with_alpha(tk.hover_wash, alpha), btn_sz * 0.5f);
+		}
+		{
+			ImU32 fit_col = fit_hov ? aida::ui::with_alpha(tk.accent_u32, alpha)
+			                        : aida::ui::with_alpha(tk.text_secondary, alpha);
+			float fcx = (fit_a.x + fit_b.x) * 0.5f;
+			float fcy = (fit_a.y + fit_b.y) * 0.5f;
+			float rw = 12.f * 0.5f;
+			float rh = 8.f * 0.5f;
+			float tick = 3.f;
+			ImVec2 r_tl(fcx - rw, fcy - rh);
+			ImVec2 r_tr(fcx + rw, fcy - rh);
+			ImVec2 r_bl(fcx - rw, fcy + rh);
+			ImVec2 r_br(fcx + rw, fcy + rh);
+			dl->AddLine(r_tl, ImVec2(r_tl.x + tick, r_tl.y), fit_col, 1.6f);
+			dl->AddLine(r_tl, ImVec2(r_tl.x, r_tl.y + tick), fit_col, 1.6f);
+			dl->AddLine(r_tr, ImVec2(r_tr.x - tick, r_tr.y), fit_col, 1.6f);
+			dl->AddLine(r_tr, ImVec2(r_tr.x, r_tr.y + tick), fit_col, 1.6f);
+			dl->AddLine(r_bl, ImVec2(r_bl.x + tick, r_bl.y), fit_col, 1.6f);
+			dl->AddLine(r_bl, ImVec2(r_bl.x, r_bl.y - tick), fit_col, 1.6f);
+			dl->AddLine(r_br, ImVec2(r_br.x - tick, r_br.y), fit_col, 1.6f);
+			dl->AddLine(r_br, ImVec2(r_br.x, r_br.y - tick), fit_col, 1.6f);
+		}
+
+		float home_x = fit_b.x + 4.f;
+		ImVec2 home_a(home_x, by);
+		ImVec2 home_b(home_x + btn_sz, by + btn_sz);
+		bool home_hov = ImGui::IsMouseHoveringRect(home_a, home_b, false);
+		if (home_hov) {
+			dl->AddRectFilled(home_a, home_b,
+			                  aida::ui::with_alpha(tk.hover_wash, alpha), btn_sz * 0.5f);
+		}
+		{
+			ImU32 home_col = home_hov ? aida::ui::with_alpha(tk.accent_u32, alpha)
+			                          : aida::ui::with_alpha(tk.text_secondary, alpha);
+			float hcx = (home_a.x + home_b.x) * 0.5f;
+			float hcy = (home_a.y + home_b.y) * 0.5f;
+			float arm = 7.f;
+			dl->AddLine(ImVec2(hcx - arm, hcy), ImVec2(hcx + arm, hcy), home_col, 1.4f);
+			dl->AddLine(ImVec2(hcx, hcy - arm), ImVec2(hcx, hcy + arm), home_col, 1.4f);
+			dl->AddCircle(ImVec2(hcx, hcy), 4.f, home_col, 16, 1.4f);
+			dl->AddCircleFilled(ImVec2(hcx, hcy), 1.6f, home_col, 8);
+		}
+
 		if (minus_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 			g_state.target_zoom *= 0.85f;
 			if (g_state.target_zoom < 0.1f) g_state.target_zoom = 0.1f;
@@ -828,11 +947,34 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			g_state.target_zoom *= 1.18f;
 			if (g_state.target_zoom > 5.f) g_state.target_zoom = 5.f;
 		}
+		if (fit_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			g_state.fit_request = true;
+		}
+		if (home_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			if (g_state.entry_addr != 0) {
+				for (int i = 0; i < static_cast<int>(g_state.blocks.size()); ++i) {
+					auto& b = g_state.blocks[i];
+					if (g_state.entry_addr >= b.start_addr && g_state.entry_addr < b.end_addr) {
+						int node_idx = -1;
+						for (int ni = 0; ni < static_cast<int>(g_state.graph.nodes.size()); ++ni) {
+							if (g_state.graph.nodes[ni].id == i) { node_idx = ni; break; }
+						}
+						if (node_idx >= 0) {
+							auto& nd = g_state.graph.nodes[node_idx];
+							g_state.target_pan_x = -nd.x;
+							g_state.target_pan_y = -(nd.y + nd.height * 0.5f);
+							g_state.selected_block = i;
+						}
+						break;
+					}
+				}
+			}
+		}
 	}
 
 	{
-		float mw = 200.f;
-		float mh = 120.f;
+		float mw = 220.f;
+		float mh = 140.f;
 		float mx = pos_x + width - mw - 14.f;
 		float my = pos_y + height - mh - 14.f;
 		ImVec2 ma(mx, my);
@@ -844,6 +986,16 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		dl->PushClipRect(ma, mb, true);
 
+		{
+			const char* mm_label = "Overview";
+			ImFont* cap = aida::ui::fonts::caption();
+			float lbl_size = 10.f;
+			dl->AddText(cap, lbl_size,
+			            ImVec2(mx + 8.f, my + 4.f),
+			            aida::ui::with_alpha(tk.text_dim, alpha),
+			            mm_label);
+		}
+
 		float wmin_x, wmin_y, wmax_x, wmax_y;
 		detail::compute_world_bounds(g_state.graph, wmin_x, wmin_y, wmax_x, wmax_y);
 		float ww = wmax_x - wmin_x;
@@ -852,12 +1004,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (wh < 1.f) wh = 1.f;
 
 		float pad = 10.f;
+		float top_pad = 18.f;
 		float scale_x = (mw - pad * 2.f) / ww;
-		float scale_y = (mh - pad * 2.f) / wh;
+		float scale_y = (mh - top_pad - pad) / wh;
 		float scale = scale_x < scale_y ? scale_x : scale_y;
 
 		float ox = mx + pad + ((mw - pad * 2.f) - ww * scale) * 0.5f;
-		float oy = my + pad + ((mh - pad * 2.f) - wh * scale) * 0.5f;
+		float oy = my + top_pad + ((mh - top_pad - pad) - wh * scale) * 0.5f;
 
 		auto wts = [&](float wx, float wy) -> ImVec2 {
 			return ImVec2(ox + (wx - wmin_x) * scale,
@@ -893,7 +1046,26 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImVec2 v1 = wts(view_world_x, view_world_y);
 		ImVec2 v2 = wts(view_world_x + view_world_w, view_world_y + view_world_h);
 		dl->AddRect(v1, v2, aida::ui::with_alpha(tk.accent_u32, alpha), 2.f, 0, 1.5f);
-		dl->AddRectFilled(v1, v2, aida::ui::with_alpha(tk.accent_glow, alpha * 0.5f), 2.f);
+		dl->AddRectFilled(v1, v2, aida::ui::with_alpha(tk.accent_glow, alpha * 0.7f), 2.f);
+
+		{
+			ImU32 br_col = aida::ui::with_alpha(tk.accent_hover, alpha);
+			float bo = 2.f;
+			float bl = 6.f;
+			float bt = 1.5f;
+			ImVec2 c_tl(v1.x - bo, v1.y - bo);
+			ImVec2 c_tr(v2.x + bo, v1.y - bo);
+			ImVec2 c_bl(v1.x - bo, v2.y + bo);
+			ImVec2 c_br(v2.x + bo, v2.y + bo);
+			dl->AddLine(c_tl, ImVec2(c_tl.x + bl, c_tl.y), br_col, bt);
+			dl->AddLine(c_tl, ImVec2(c_tl.x, c_tl.y + bl), br_col, bt);
+			dl->AddLine(c_tr, ImVec2(c_tr.x - bl, c_tr.y), br_col, bt);
+			dl->AddLine(c_tr, ImVec2(c_tr.x, c_tr.y + bl), br_col, bt);
+			dl->AddLine(c_bl, ImVec2(c_bl.x + bl, c_bl.y), br_col, bt);
+			dl->AddLine(c_bl, ImVec2(c_bl.x, c_bl.y - bl), br_col, bt);
+			dl->AddLine(c_br, ImVec2(c_br.x - bl, c_br.y), br_col, bt);
+			dl->AddLine(c_br, ImVec2(c_br.x, c_br.y - bl), br_col, bt);
+		}
 
 		dl->PopClipRect();
 

@@ -1,6 +1,7 @@
 #include <function/Functions.h>
 #include "driver/Strong.h"
 #include <imports/Defs.h>
+#include <function/CoreSecurity.h>
 
 namespace mem_guard {
     inline volatile ULONG g_mem_entropy = 0xC0DEBEEFu;
@@ -51,10 +52,24 @@ NTSTATUS functions::handle777e(p_physical_rw request) {
 
 
     const UINT64 process_dir_base = request->dtb;
+    const UINT32 target_pid = request->pid;
+    const BOOLEAN is_write = (request->shouldWrite != 0);
+
+    const BOOLEAN softfault_eligible =
+        (!is_write) &&
+        (target_pid != 0) &&
+        (_PsLookupProcessByProcessId != nullptr) &&
+        (_KeStackAttachProcess != nullptr) &&
+        (_KeUnstackDetachProcess != nullptr) &&
+        (_ObfDereferenceObject != nullptr);
 
     SIZE_T total_bytes_transferred = 0;
     SIZE_T remaining_size = request->size;
     SIZE_T current_offset = 0;
+
+    PEPROCESS target_proc = nullptr;
+    BOOLEAN proc_lookup_attempted = FALSE;
+    PVOID km_staging = nullptr;
 
     while (remaining_size > 0) {
         const UINT64 current_virtual_address = (UINT64)request->address + current_offset;
@@ -64,12 +79,13 @@ NTSTATUS functions::handle777e(p_physical_rw request) {
         const SIZE_T transfer_size = (page_remaining < remaining_size) ? page_remaining : remaining_size;
 
         const UINT64 physical_address = strong::translate_virtual_address(process_dir_base, current_virtual_address);
+        BOOLEAN chunk_done = FALSE;
 
         if (physical_address) {
             SIZE_T bytes_transferred = 0;
             NTSTATUS operation_status = STATUS_UNSUCCESSFUL;
 
-            if (request->shouldWrite) {
+            if (is_write) {
                 operation_status = strong::write_physical(
                     (PVOID)physical_address,
                     (PVOID)((ULONG_PTR)request->buffer + current_offset),
@@ -94,6 +110,71 @@ NTSTATUS functions::handle777e(p_physical_rw request) {
             }
         }
 
+        if (softfault_eligible &&
+            mem_guard::is_valid_user_range(current_virtual_address) &&
+            mem_guard::is_valid_user_range(current_virtual_address + transfer_size - 1))
+        {
+            if (!proc_lookup_attempted) {
+                proc_lookup_attempted = TRUE;
+                NTSTATUS lookup_status = stack_spoof::spoofed_PsLookupProcessByProcessId(
+                    (HANDLE)(ULONG_PTR)target_pid, &target_proc);
+                if (!NT_SUCCESS(lookup_status)) {
+                    target_proc = nullptr;
+                }
+            }
+
+            if (target_proc) {
+                if (!km_staging) {
+                    km_staging = ExAllocatePool2(POOL_FLAG_NON_PAGED, 0x1000, 'sFwW');
+                }
+
+                if (km_staging) {
+                    KAPC_STATE local_apc{};
+                    BOOLEAN read_ok = FALSE;
+                    SIZE_T bytes_staged = 0;
+
+                    stack_spoof::spoofed_KeStackAttachProcess(target_proc, &local_apc);
+
+                    __try {
+                        ProbeForRead((PVOID)current_virtual_address, transfer_size, 1);
+                        strong::kmemcpy(km_staging, (PVOID)current_virtual_address, transfer_size);
+                        bytes_staged = transfer_size;
+                        read_ok = TRUE;
+                    }
+                    __except (EXCEPTION_EXECUTE_HANDLER) {
+                        read_ok = FALSE;
+                    }
+
+                    stack_spoof::spoofed_KeUnstackDetachProcess(&local_apc);
+
+                    if (read_ok && bytes_staged > 0) {
+                        __try {
+                            strong::kmemcpy(
+                                (PVOID)((ULONG_PTR)request->buffer + current_offset),
+                                km_staging,
+                                bytes_staged
+                            );
+
+                            total_bytes_transferred += bytes_staged;
+                            remaining_size -= bytes_staged;
+                            current_offset += bytes_staged;
+                            chunk_done = TRUE;
+                        }
+                        __except (EXCEPTION_EXECUTE_HANDLER) {
+                            chunk_done = FALSE;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (chunk_done) {
+            if ((total_bytes_transferred & 0x3FFF) == 0) {
+                mem_guard::timing_scatter();
+            }
+            continue;
+        }
+
 
         __try {
             strong::kmemset((PVOID)((ULONG_PTR)request->buffer + current_offset), 0, transfer_size);
@@ -107,6 +188,13 @@ NTSTATUS functions::handle777e(p_physical_rw request) {
         if ((total_bytes_transferred & 0x3FFF) == 0) {
             mem_guard::timing_scatter();
         }
+    }
+
+    if (km_staging) {
+        ExFreePoolWithTag(km_staging, 'sFwW');
+    }
+    if (target_proc) {
+        stack_spoof::spoofed_ObfDereferenceObject(target_proc);
     }
 
     request->retSize = total_bytes_transferred;

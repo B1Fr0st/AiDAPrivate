@@ -631,7 +631,7 @@ inline void scan_file(const DisasmFile& file)
 
 				auto hits = detail::find_pattern_in_region(
 					sec.bytes.data(), sec.bytes.size(),
-					file.image_base + sec.va,
+					sec.va,
 					sig.pattern, sig.min_match);
 
 				for (auto hit_addr : hits) {

@@ -4,7 +4,10 @@
 #include "ui_anim.hpp"
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
+#include "../helpers/diag_log.hpp"
 #include "decompiler_engine.hpp"
+#include "pseudocode_view.hpp"
+#include "../disasm/disasm_view.hpp"
 #include "disasm_view.hpp"
 
 #include <algorithm>
@@ -341,8 +344,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			}
 
 			if (ImGui::MenuItem("Decompile Reader")) {
-				globals::ui::active_center_view = center_view_t::decompiler;
-				decompiler_engine::decompile_function(sel_node.reader_rip, g_sa_settings);
+				uint64_t entry = disasm_view::enclosing_function_start(sel_node.reader_rip, g_disasm.file);
+				if (entry == 0) entry = sel_node.reader_rip;
+				diag::log_tagged_critical_fmt("dec_ui", "integrity_reader_dispatched addr=0x%llX entry=0x%llX",
+					static_cast<unsigned long long>(sel_node.reader_rip),
+					static_cast<unsigned long long>(entry));
+				pseudocode_view::request_decompile(entry, &g_disasm.file);
 			}
 		}
 		ImGui::EndPopup();

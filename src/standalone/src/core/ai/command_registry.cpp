@@ -531,7 +531,7 @@ namespace commands {
 				{ "view:scanner",           "switch to scanner hub",         center_view_t::scan_hub         },
 				{ "view:analysis",          "switch to analysis hub",        center_view_t::analysis_hub     },
 				{ "view:debugger",          "switch to debugger",            center_view_t::debugger_view    },
-				{ "view:decompiler",        "switch to decompiler",          center_view_t::decompiler       },
+				{ "view:decompiler",        "switch to pseudocode",          center_view_t::pseudocode       },
 				{ "view:struct",            "switch to struct recon",        center_view_t::struct_recon     },
 				{ "view:crypto",            "switch to crypto scanner",      center_view_t::crypto_scanner   },
 				{ "view:aob",               "switch to aob generator",       center_view_t::aob_generator    },

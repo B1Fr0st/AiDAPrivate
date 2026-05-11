@@ -64,16 +64,17 @@ inline void initialize() {
     }
 }
 
-inline void post(std::function<void()> f) {
+inline bool post(std::function<void()> f) {
     auto& p = detail::g_pool;
     if (!p.alive.load(std::memory_order_acquire)) initialize();
-    if (!p.alive.load(std::memory_order_acquire) || p.shutting_down.load(std::memory_order_acquire)) return;
+    if (!p.alive.load(std::memory_order_acquire) || p.shutting_down.load(std::memory_order_acquire)) return false;
     {
         std::lock_guard<std::mutex> lk(p.mtx);
-        if (!p.alive.load(std::memory_order_acquire) || p.shutting_down.load(std::memory_order_acquire)) return;
+        if (!p.alive.load(std::memory_order_acquire) || p.shutting_down.load(std::memory_order_acquire)) return false;
         p.tasks.push(std::move(f));
     }
     p.cv.notify_one();
+    return true;
 }
 
 inline void shutdown() {

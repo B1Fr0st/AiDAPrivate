@@ -409,7 +409,7 @@ inline void generate_from_file(const DisasmFile& file, uint64_t address, int num
 		size_t code_size = 0;
 		uint64_t section_va = 0;
 		for (auto& sec : file_copy.sections) {
-			uint64_t sec_start = file_copy.image_base + sec.va;
+			uint64_t sec_start = sec.va;
 			uint64_t sec_end = sec_start + sec.bytes.size();
 			if (address >= sec_start && address < sec_end) {
 				code_data = sec.bytes.data() + (address - sec_start);

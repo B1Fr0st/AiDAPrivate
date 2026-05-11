@@ -13,6 +13,14 @@ The BUILD for sentinel AND the aida driver (Whoswho) is the .vcxproj files! (C:\
 
 **comments are not allowed in the codebase, so DO NOT ADD ANY COMMENTS ANYWHERE.***
 
+**ALWAYS BUILD THE PROJECT AFTER APPLYING CHANGES.** After every set of edits, run the build to confirm zero errors and zero new warnings before reporting the task as complete. The canonical incremental build command is:
+
+```
+cmd /c "\"C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat\" >nul && cmake --build C:/Users/ruar1337/AiDAPrivate/build-ninja --parallel 12"
+```
+
+If a header was edited but the build reports "no work to do", touch the dependent source files (`(Get-Item path).LastWriteTime = Get-Date`) to force a recompile — header-only changes don't always trigger Ninja invalidation. A "compiles in my head" review is not a substitute for an actual build — protected-binary header changes and ScopeInternal-style access-control issues only surface at link/compile time.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Repository shape

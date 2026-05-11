@@ -38,12 +38,14 @@
 #include <atomic>
 #include <algorithm>
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <memory>
 #include <mutex>
 #include <random>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -85,8 +87,103 @@ static void lic_log(const char* step)
     int len = _snprintf_s(line, sizeof(line), _TRUNCATE,
         "[%02d:%02d:%02d.%03d] [license] %s\r\n",
         st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, step);
-    if (len > 0) { DWORD w; WriteFile(hf, line, (DWORD)len, &w, nullptr); }
+    if (len > 0) {
+        DWORD w;
+        WriteFile(hf, line, (DWORD)len, &w, nullptr);
+
+        char dbg_line[1100];
+        _snprintf_s(dbg_line, sizeof(dbg_line), _TRUNCATE,
+            "[AIDA-LIC][%02d:%02d:%02d.%03d] %s",
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, step);
+        OutputDebugStringA(dbg_line);
+    }
     CloseHandle(hf);
+}
+
+static void lic_log_fmt(const char* fmt, ...)
+{
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    lic_log(buf);
+}
+
+namespace lic_diag {
+
+    static DWORD WINAPI canary_proc(LPVOID p)
+    {
+        volatile LONG* done = reinterpret_cast<volatile LONG*>(p);
+        if (done) InterlockedExchange(done, 1);
+        return 0;
+    }
+
+    static void thread_canary(const char* phase)
+    {
+        volatile LONG done = 0;
+        DWORD tid = 0;
+        SetLastError(0);
+        HANDLE h = CreateThread(nullptr, 0, &canary_proc, (LPVOID)&done, 0, &tid);
+        DWORD gle = GetLastError();
+        lic_log_fmt("DIAG_LIC_CANARY phase=%s result=%p tid=%lu err=%lu proc=%p calling_tid=%lu",
+            phase, h, tid, gle, (void*)&canary_proc, GetCurrentThreadId());
+        if (h) {
+            WaitForSingleObject(h, 2000);
+            CloseHandle(h);
+        }
+    }
+
+    static void dump_pe_self(const char* phase)
+    {
+        HMODULE mod = GetModuleHandleW(nullptr);
+        if (!mod) {
+            lic_log_fmt("DIAG_LIC_PE phase=%s mod=NULL gle=%lu", phase, GetLastError());
+            return;
+        }
+        auto* base = reinterpret_cast<const uint8_t*>(mod);
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+            lic_log_fmt("DIAG_LIC_PE phase=%s bad_e_magic=0x%X", phase, (unsigned)dos->e_magic);
+            return;
+        }
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        lic_log_fmt("DIAG_LIC_PE phase=%s mod=%p e_magic=0x%X sig=0x%X machine=0x%X "
+            "magic=0x%X entry=0x%X numrva=%u image_base=0x%llX sizeof_image=0x%X sections=%u",
+            phase, mod, (unsigned)dos->e_magic, nt->Signature,
+            (unsigned)nt->FileHeader.Machine, (unsigned)nt->OptionalHeader.Magic,
+            nt->OptionalHeader.AddressOfEntryPoint,
+            nt->OptionalHeader.NumberOfRvaAndSizes,
+            static_cast<unsigned long long>(nt->OptionalHeader.ImageBase),
+            nt->OptionalHeader.SizeOfImage,
+            (unsigned)nt->FileHeader.NumberOfSections);
+    }
+
+    static void dump_mitigation(const char* phase)
+    {
+        using GetMitig_t = BOOL(WINAPI*)(HANDLE, int, PVOID, SIZE_T);
+        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        auto pGet = k32 ? reinterpret_cast<GetMitig_t>(
+            GetProcAddress(k32, "GetProcessMitigationPolicy")) : nullptr;
+        if (!pGet) {
+            lic_log_fmt("DIAG_LIC_MITIG phase=%s no_export", phase);
+            return;
+        }
+        HANDLE me = GetCurrentProcess();
+        PROCESS_MITIGATION_DYNAMIC_CODE_POLICY dyn{};
+        PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY sig{};
+        PROCESS_MITIGATION_IMAGE_LOAD_POLICY il{};
+        BOOL d_ok = pGet(me, 7, &dyn, sizeof(dyn));
+        BOOL s_ok = pGet(me, 8, &sig, sizeof(sig));
+        BOOL i_ok = pGet(me, 10, &il, sizeof(il));
+        lic_log_fmt("DIAG_LIC_MITIG phase=%s DYN ok=%d prohibit=%u opt_out=%u BIN_SIG ok=%d ms_only=%u "
+            "IL ok=%d no_remote=%u no_low_mandatory=%u prefer_sys32=%u",
+            phase, d_ok, (unsigned)dyn.ProhibitDynamicCode, (unsigned)dyn.AllowThreadOptOut,
+            s_ok, (unsigned)sig.MicrosoftSignedOnly,
+            i_ok, (unsigned)il.NoRemoteImages, (unsigned)il.NoLowMandatoryLabelImages,
+            (unsigned)il.PreferSystem32Images);
+    }
+
 }
 
 static int ensure_winsock_initialized()
@@ -1956,6 +2053,47 @@ namespace
     std::atomic<bool>            s_arc_download_in_progress{false};
     std::atomic<uint64_t>        s_activation_completed_at_ms{0};
 
+    std::shared_mutex            s_arc_call_mtx;
+    std::atomic<bool>            s_arc_unloading{false};
+    std::atomic<int64_t>         s_arc_call_inflight{0};
+
+    struct arc_call_guard_t
+    {
+        bool acquired = false;
+
+        arc_call_guard_t()
+        {
+            s_arc_call_inflight.fetch_add(1, std::memory_order_acq_rel);
+            if (s_arc_unloading.load(std::memory_order_acquire))
+            {
+                s_arc_call_inflight.fetch_sub(1, std::memory_order_acq_rel);
+                return;
+            }
+            s_arc_call_mtx.lock_shared();
+            if (s_arc_unloading.load(std::memory_order_acquire))
+            {
+                s_arc_call_mtx.unlock_shared();
+                s_arc_call_inflight.fetch_sub(1, std::memory_order_acq_rel);
+                return;
+            }
+            acquired = true;
+        }
+
+        arc_call_guard_t(const arc_call_guard_t&) = delete;
+        arc_call_guard_t& operator=(const arc_call_guard_t&) = delete;
+
+        ~arc_call_guard_t()
+        {
+            if (acquired)
+            {
+                s_arc_call_mtx.unlock_shared();
+                s_arc_call_inflight.fetch_sub(1, std::memory_order_acq_rel);
+            }
+        }
+
+        bool live() const { return acquired; }
+    };
+
 
     std::shared_ptr<httplib::Client> s_license_client;
     std::string                      s_license_host;
@@ -3034,25 +3172,28 @@ namespace
                 bool arc_hb_invoked = false;
                 bool arc_hb_valid = false;
                 uint64_t arc_hb_proof_token = 0;
-                if (s_arc_loaded && s_fn_arc_heartbeat_ex) {
-                    arc_hb_invoked = true;
-                    {
-                        char dbg_msg[256];
-                        _snprintf_s(dbg_msg, sizeof(dbg_msg), _TRUNCATE,
-                            "heartbeat_compose_arc_ex_inputs hb_count=%u code_hash=%.20s",
-                            heartbeat_index,
-                            code_hash_value.empty() ? "<absent>" : code_hash_value.c_str());
-                        lic_log(dbg_msg);
-                    }
-                    auto hb = s_fn_arc_heartbeat_ex(
-                        static_cast<uint64_t>(heartbeat_index),
-                        code_hash_value.c_str());
-                    arc_hb_valid = hb.valid;
-                    arc_hb_proof_token = hb.proof_token;
-                    if (hb.valid) {
-                        char pt[32];
-                        snprintf(pt, sizeof(pt), "%016llx", static_cast<unsigned long long>(hb.proof_token));
-                        body["proof_token"] = pt;
+                {
+                    arc_call_guard_t guard;
+                    if (guard.live() && s_arc_loaded && s_fn_arc_heartbeat_ex) {
+                        arc_hb_invoked = true;
+                        {
+                            char dbg_msg[256];
+                            _snprintf_s(dbg_msg, sizeof(dbg_msg), _TRUNCATE,
+                                "heartbeat_compose_arc_ex_inputs hb_count=%u code_hash=%.20s",
+                                heartbeat_index,
+                                code_hash_value.empty() ? "<absent>" : code_hash_value.c_str());
+                            lic_log(dbg_msg);
+                        }
+                        auto hb = s_fn_arc_heartbeat_ex(
+                            static_cast<uint64_t>(heartbeat_index),
+                            code_hash_value.c_str());
+                        arc_hb_valid = hb.valid;
+                        arc_hb_proof_token = hb.proof_token;
+                        if (hb.valid) {
+                            char pt[32];
+                            snprintf(pt, sizeof(pt), "%016llx", static_cast<unsigned long long>(hb.proof_token));
+                            body["proof_token"] = pt;
+                        }
                     }
                 }
                 {
@@ -3331,12 +3472,17 @@ namespace
 
         {
             auto tier = vbs_enforcement::parse_plan_tier(settings.license_plan);
-            if (vbs_enforcement::tier_eligible(tier))
+            bool eligible = vbs_enforcement::tier_eligible(tier);
+            lic_log_fmt("DIAG_VBS plan=%s tier=%d eligible=%d",
+                settings.license_plan.c_str(), (int)tier, eligible ? 1 : 0);
+            if (eligible)
             {
                 vbs_enforcement::detect_capabilities();
                 if (vbs_enforcement::vbs_active())
                 {
+                    lic_diag::thread_canary("pre_vbs_enforce_text_pages_no_write");
                     bool guarded = vbs_enforcement::enforce_text_pages_no_write(tier);
+                    lic_diag::thread_canary("post_vbs_enforce_text_pages_no_write");
                     char vbs_buf[160];
                     _snprintf_s(vbs_buf, sizeof(vbs_buf), _TRUNCATE,
                         "vbs_enforcement_apply tier=%s vbs=1 hvci=%d guarded_pages=%u result=%d",
@@ -4167,6 +4313,10 @@ namespace
 
             log_arc_status("arc_paged_blob_assembled");
 
+            lic_diag::thread_canary("pre_arc_loader_load_call");
+            lic_diag::dump_pe_self("pre_arc_loader_load_call");
+            lic_diag::dump_mitigation("pre_arc_loader_load_call");
+
             s_arc_module = arc_loader::load(pe_data.data(), pe_data.size());
             if (!s_arc_module.base) {
                 char rl_buf[192];
@@ -4175,6 +4325,9 @@ namespace
                     arc_loader::last_error().c_str());
                 SecureZeroMemory(pe_data.data(), pe_data.size());
                 log_arc_status(rl_buf);
+                lic_diag::thread_canary("post_arc_loader_load_FAIL");
+                lic_diag::dump_pe_self("post_arc_loader_load_FAIL");
+                lic_diag::dump_mitigation("post_arc_loader_load_FAIL");
                 return false;
             }
 
@@ -4531,12 +4684,32 @@ namespace
 
     void unload_arc()
     {
+        const bool was_unloading = s_arc_unloading.exchange(true, std::memory_order_acq_rel);
+
+        {
+            char dbg[160];
+            int64_t inflight_pre = s_arc_call_inflight.load(std::memory_order_acquire);
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "unload_arc_drain_begin was_unloading=%d inflight=%lld",
+                was_unloading ? 1 : 0,
+                static_cast<long long>(inflight_pre));
+            lic_log(dbg);
+        }
+
+        std::unique_lock<std::shared_mutex> drain(s_arc_call_mtx);
+
+        {
+            char dbg[160];
+            int64_t inflight_post = s_arc_call_inflight.load(std::memory_order_acquire);
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "unload_arc_drain_done inflight=%lld",
+                static_cast<long long>(inflight_post));
+            lic_log(dbg);
+        }
+
         std::lock_guard<std::mutex> lk(s_arc_mtx);
         if (s_arc_loaded && s_fn_arc_cleanup) {
             s_fn_arc_cleanup();
-        }
-        if (s_arc_module.base) {
-            arc_loader::unload(s_arc_module);
         }
         s_fn_arc_init = nullptr;
         s_fn_arc_bind_driver_device = nullptr;
@@ -4550,6 +4723,13 @@ namespace
         s_fn_arc_copy_last_status = nullptr;
         s_arc_loaded = false;
         set_arc_obfuscated_state(false);
+
+        if (s_arc_module.base) {
+            arc_loader::unload(s_arc_module);
+        }
+
+        drain.unlock();
+        s_arc_unloading.store(false, std::memory_order_release);
     }
 
     bool try_validate_cached(settings_sa_t& settings, std::string& error_out)
@@ -4748,6 +4928,9 @@ namespace
             std::string error;
             json response;
             lic_log("heartbeat_calling");
+            lic_diag::dump_pe_self("pre_heartbeat_call");
+            lic_diag::dump_mitigation("pre_heartbeat_call");
+            lic_diag::thread_canary("pre_heartbeat_call");
             const bool hb_ok = call_validation_endpoint(*settings, "heartbeat", settings->license_key,
                                           s_cached_hwid, settings->license_session_token,
                                           nonce, error, response);
@@ -4818,11 +5001,21 @@ namespace
             consecutive_failures = 0;
             cancel_silent_kill();
             lic_log("heartbeat_success_applying");
+            lic_diag::dump_pe_self("post_heartbeat_call");
+            lic_diag::dump_mitigation("post_heartbeat_call");
+            lic_diag::thread_canary("post_heartbeat_call");
             apply_valid_response(*settings, settings->license_key, s_cached_hwid, response);
+            lic_diag::dump_pe_self("post_apply_valid_response");
+            lic_diag::dump_mitigation("post_apply_valid_response");
+            lic_diag::thread_canary("post_apply_valid_response");
             if (s_activation_completed_at_ms.load(std::memory_order_acquire) == 0)
                 mark_activation_completed();
             if (!s_arc_loaded)
+            {
+                lic_diag::thread_canary("pre_attempt_deferred_arc_fetch");
                 attempt_deferred_arc_fetch(*settings, s_cached_hwid);
+                lic_diag::thread_canary("post_attempt_deferred_arc_fetch");
+            }
             lic_log("heartbeat_apply_done");
         }
     }
@@ -5536,6 +5729,9 @@ namespace standalone_license
 
     const arc_comm_vtable_t* get_arc_comm_bridge()
     {
+        arc_call_guard_t guard;
+        if (!guard.live())
+            return nullptr;
         if (!s_arc_loaded || !s_fn_arc_get_comm_bridge)
             return nullptr;
         return s_fn_arc_get_comm_bridge();
@@ -5543,6 +5739,9 @@ namespace standalone_license
 
     uint64_t arc_validate_tool(uint64_t tool_name_hash, uint64_t gate_token)
     {
+        arc_call_guard_t guard;
+        if (!guard.live())
+            return 0;
         if (!s_arc_loaded || !s_fn_arc_validate_tool)
             return 0;
         return s_fn_arc_validate_tool(tool_name_hash, gate_token);
@@ -5560,6 +5759,9 @@ namespace standalone_license
     arc_heartbeat_result_t arc_heartbeat()
     {
         arc_heartbeat_result_t result{};
+        arc_call_guard_t guard;
+        if (!guard.live())
+            return result;
         if (!s_arc_loaded || !s_fn_arc_heartbeat)
             return result;
         return s_fn_arc_heartbeat();
@@ -5572,6 +5774,9 @@ namespace standalone_license
                                      uint32_t* out_size,
                                      uint32_t out_cap)
     {
+        arc_call_guard_t guard;
+        if (!guard.live())
+            return false;
         if (!s_arc_loaded || !s_fn_arc_unseal_feature)
             return false;
         return s_fn_arc_unseal_feature(feature_id, nonce, nonce_len, out, out_size, out_cap);
