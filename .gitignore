@@ -23,6 +23,9 @@
 # 2. EXCLUSIONS (These override the allows)
 # ==========================================
 
+# Build-generated embedded headers (regenerated from AiDA.dll; >100MB so exceeds GitHub per-file limit)
+/src/aida_plugin_encrypted.h
+
 # Images and Media
 *.png
 *.jpg
