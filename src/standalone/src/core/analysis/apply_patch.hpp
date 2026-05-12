@@ -75,11 +75,26 @@ inline std::vector<std::string> split_lines(const std::string& text)
 }
 
 
-inline std::string join_lines(const std::vector<std::string>& lines)
+inline bool text_uses_crlf(const std::string& text)
+{
+    size_t crlf = 0;
+    size_t lf_only = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '\n') {
+            if (i > 0 && text[i - 1] == '\r') ++crlf;
+            else ++lf_only;
+        }
+    }
+    if (crlf == 0 && lf_only == 0) return false;
+    return crlf >= lf_only;
+}
+
+
+inline std::string join_lines(const std::vector<std::string>& lines, const std::string& eol = "\n")
 {
     std::string result;
     for (size_t i = 0; i < lines.size(); ++i) {
-        if (i > 0) result += "\n";
+        if (i > 0) result += eol;
         result += lines[i];
     }
     return result;
@@ -115,7 +130,7 @@ inline std::vector<file_patch_t> parse(const std::string& patch_text)
 
         if (!in_patch) continue;
 
-        if (line.substr(0, 15) == "*** Add File: ") {
+        if (line.substr(0, 14) == "*** Add File: ") {
             if (in_hunk && (!current_hunk.context_before.empty() || !current_hunk.removals.empty() || !current_hunk.additions.empty())) {
                 current.hunks.push_back(current_hunk);
             }
@@ -126,11 +141,11 @@ inline std::vector<file_patch_t> parse(const std::string& patch_text)
             current_hunk = file_hunk_t{};
             in_hunk = true;
             current.action = file_action_t::add_file;
-            current.path = line.substr(15);
+            current.path = line.substr(14);
             continue;
         }
 
-        if (line.substr(0, 18) == "*** Delete File: ") {
+        if (line.substr(0, 17) == "*** Delete File: ") {
             if (in_hunk && (!current_hunk.context_before.empty() || !current_hunk.removals.empty() || !current_hunk.additions.empty())) {
                 current.hunks.push_back(current_hunk);
             }
@@ -141,11 +156,11 @@ inline std::vector<file_patch_t> parse(const std::string& patch_text)
             current_hunk = file_hunk_t{};
             in_hunk = false;
             current.action = file_action_t::delete_file;
-            current.path = line.substr(18);
+            current.path = line.substr(17);
             continue;
         }
 
-        if (line.substr(0, 18) == "*** Update File: ") {
+        if (line.substr(0, 17) == "*** Update File: ") {
             if (in_hunk && (!current_hunk.context_before.empty() || !current_hunk.removals.empty() || !current_hunk.additions.empty())) {
                 current.hunks.push_back(current_hunk);
             }
@@ -156,7 +171,7 @@ inline std::vector<file_patch_t> parse(const std::string& patch_text)
             current_hunk = file_hunk_t{};
             in_hunk = true;
             current.action = file_action_t::update_file;
-            current.path = line.substr(18);
+            current.path = line.substr(17);
             continue;
         }
 
@@ -271,6 +286,7 @@ inline patch_result_t apply(
 
         case file_action_t::move_file: {
             std::string content = read_file(patch.path);
+            const std::string eol = text_uses_crlf(content) ? "\r\n" : "\n";
             auto file_lines = split_lines(content);
 
             for (auto it = patch.hunks.rbegin(); it != patch.hunks.rend(); ++it) {
@@ -292,7 +308,7 @@ inline patch_result_t apply(
                     file_lines.insert(file_lines.begin() + remove_start, it->additions[j]);
             }
 
-            std::string new_content = join_lines(file_lines);
+            std::string new_content = join_lines(file_lines, eol);
             if (!move_file_fn) {
                 detail::last_error_ref() = "move_file callback is null but a move action was encountered for: " + patch.path;
                 result.error = detail::last_error_ref();
@@ -315,6 +331,7 @@ inline patch_result_t apply(
 
         case file_action_t::update_file: {
             std::string content = read_file(patch.path);
+            const std::string eol = text_uses_crlf(content) ? "\r\n" : "\n";
             auto file_lines = split_lines(content);
 
             for (auto it = patch.hunks.rbegin(); it != patch.hunks.rend(); ++it) {
@@ -336,7 +353,7 @@ inline patch_result_t apply(
                     file_lines.insert(file_lines.begin() + remove_start, it->additions[j]);
             }
 
-            std::string new_content = join_lines(file_lines);
+            std::string new_content = join_lines(file_lines, eol);
             if (!write_file(patch.path, new_content)) {
                 detail::last_error_ref() = "Failed to write updated file: " + patch.path;
                 result.error = detail::last_error_ref();

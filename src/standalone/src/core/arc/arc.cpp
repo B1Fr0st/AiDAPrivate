@@ -2,12 +2,12 @@
 #include "comm.h"
 
 #include <windows.h>
+#include <winioctl.h>
 #include <intrin.h>
 #include <wmmintrin.h>
 #include <nmmintrin.h>
 #include <winhttp.h>
 #include <bcrypt.h>
-#include <iphlpapi.h>
 
 #include "anti-tamper/cff.hpp"
 #include "arc_build_seed.hpp"
@@ -33,7 +33,6 @@
 #include <vector>
 
 #pragma comment(lib, "bcrypt.lib")
-#pragma comment(lib, "iphlpapi.lib")
 
 namespace arc_internal
 {
@@ -142,14 +141,6 @@ uint64_t fnv1a(const void* data, size_t len)
         h *= 1099511628211ULL;
     }
     return h;
-}
-
-void fnv_mix_u64_value(uint64_t& hash, uint64_t value)
-{
-    for (int i = 0; i < 8; ++i) {
-        hash ^= (value >> (i * 8)) & 0xFF;
-        hash *= 1099511628211ULL;
-    }
 }
 
 uint64_t fnv1a_str(const char* s)
@@ -615,12 +606,19 @@ bool aes_gcm_decrypt_ni(const uint8_t* ct, size_t ct_len,
 void* peb_find_module(uint64_t name_hash)
 {
     auto* peb = reinterpret_cast<const uint8_t*>(__readgsqword(0x60));
+    if (!peb) return nullptr;
     auto* ldr = *reinterpret_cast<const uint8_t* const*>(peb + 0x18);
+    if (!ldr) return nullptr;
     auto* list_head = reinterpret_cast<const uint8_t*>(ldr + 0x20);
     auto* entry = *reinterpret_cast<const uint8_t* const*>(list_head);
+    if (!entry) return nullptr;
 
+    constexpr uint32_t kMaxLdrIterations = 4096;
+    uint32_t iterations = 0;
     while (entry != list_head)
     {
+        if (++iterations > kMaxLdrIterations) return nullptr;
+
         auto* dll_base = *reinterpret_cast<void* const*>(entry + 0x20);
         auto* name_buf = *reinterpret_cast<const wchar_t* const*>(entry + 0x50);
         auto name_len = *reinterpret_cast<const uint16_t*>(entry + 0x48);
@@ -639,7 +637,9 @@ void* peb_find_module(uint64_t name_hash)
             if (h == name_hash)
                 return dll_base;
         }
-        entry = *reinterpret_cast<const uint8_t* const*>(entry);
+        auto* next_entry = *reinterpret_cast<const uint8_t* const*>(entry);
+        if (!next_entry) return nullptr;
+        entry = next_entry;
     }
     return nullptr;
 }
@@ -877,6 +877,10 @@ alignas(64) uint8_t  g_key_seed[32] = {};
 bool g_key_seed_valid = false;
 std::mutex g_key_seed_mtx;
 
+std::mutex g_chain_tag_mtx;
+char       g_chain_tag_hex[65] = {};
+bool       g_chain_tag_valid = false;
+
 void encrypt_session_blob(session_data_t* plain, encrypted_session_t* enc)
 {
     static_assert(sizeof(session_data_t) <= sizeof(enc->blob), "session too large");
@@ -945,7 +949,7 @@ bool load_session(session_data_t& out)
 
 uint64_t g_vtable_crypt_key = 0;
 arc_comm_vtable_t g_vtable = {};
-bool g_vtable_ready = false;
+std::atomic<bool> g_vtable_ready{false};
 uint64_t g_vtable_integrity = 0;
 
 #pragma section(".licbind", read)
@@ -1604,46 +1608,228 @@ bool check_debugger()
     return false;
 }
 
+static std::string hwid_read_smbios_uuid()
+{
+    UINT table_size = GetSystemFirmwareTable('RSMB', 0, nullptr, 0);
+    if (table_size < 8) return "unavailable";
+    std::vector<unsigned char> buf(table_size);
+    UINT got = GetSystemFirmwareTable('RSMB', 0, buf.data(), table_size);
+    if (got == 0 || got > table_size) {
+        SecureZeroMemory(buf.data(), buf.size());
+        return "unavailable";
+    }
+    const unsigned char* tbl = buf.data() + 8;
+    size_t tbl_len = buf.size() - 8;
+    size_t off = 0;
+    std::string result;
+    while (off + 4 < tbl_len) {
+        unsigned char type = tbl[off];
+        unsigned char len  = tbl[off + 1];
+        if (len < 4 || off + len > tbl_len) break;
+        if (type == 1 && len >= 24) {
+            const unsigned char* u = tbl + off + 8;
+            bool all_zero = true;
+            for (int i = 0; i < 16; ++i) { if (u[i] != 0) { all_zero = false; break; } }
+            if (!all_zero) {
+                char hex[33] = {};
+                for (int i = 0; i < 16; ++i)
+                    _snprintf_s(hex + i * 2, 3, _TRUNCATE, "%02x", u[i]);
+                result.assign(hex);
+            }
+            break;
+        }
+        size_t after = off + len;
+        while (after + 1 < tbl_len && !(tbl[after] == 0 && tbl[after + 1] == 0)) ++after;
+        off = after + 2;
+    }
+    SecureZeroMemory(buf.data(), buf.size());
+    if (result.empty()) return "unavailable";
+    return result;
+}
+
+static std::string hwid_read_baseboard_serial()
+{
+    UINT table_size = GetSystemFirmwareTable('RSMB', 0, nullptr, 0);
+    if (table_size < 8) return "unavailable";
+    std::vector<unsigned char> buf(table_size);
+    UINT got = GetSystemFirmwareTable('RSMB', 0, buf.data(), table_size);
+    if (got == 0 || got > table_size) {
+        SecureZeroMemory(buf.data(), buf.size());
+        return "unavailable";
+    }
+    const unsigned char* tbl = buf.data() + 8;
+    size_t tbl_len = buf.size() - 8;
+    size_t off = 0;
+    std::string result;
+    while (off + 4 < tbl_len) {
+        unsigned char type = tbl[off];
+        unsigned char len  = tbl[off + 1];
+        if (len < 4 || off + len > tbl_len) break;
+        size_t after = off + len;
+        const unsigned char* strings_start = tbl + after;
+        while (after + 1 < tbl_len && !(tbl[after] == 0 && tbl[after + 1] == 0)) ++after;
+        if (type == 2 && len >= 8) {
+            unsigned char serial_index = tbl[off + 7];
+            if (serial_index > 0) {
+                const char* p = reinterpret_cast<const char*>(strings_start);
+                const char* end = reinterpret_cast<const char*>(tbl + after);
+                for (unsigned char i = 1; i < serial_index && p < end; ++i) {
+                    while (p < end && *p) ++p;
+                    if (p < end) ++p;
+                }
+                if (p < end && *p) {
+                    const char* q = p;
+                    while (q < end && *q) ++q;
+                    result.assign(p, q);
+                    size_t start = result.find_first_not_of(" \t");
+                    size_t fin = result.find_last_not_of(" \t");
+                    if (start == std::string::npos) result.clear();
+                    else result = result.substr(start, fin - start + 1);
+                }
+            }
+            break;
+        }
+        off = after + 2;
+    }
+    SecureZeroMemory(buf.data(), buf.size());
+    if (result.empty()) return "unavailable";
+    return result;
+}
+
+static std::string hwid_read_disk_serial()
+{
+    HANDLE h = CreateFileW(L"\\\\.\\PhysicalDrive0", 0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return "unavailable";
+    STORAGE_PROPERTY_QUERY q = {};
+    q.PropertyId = StorageDeviceProperty;
+    q.QueryType = PropertyStandardQuery;
+    std::vector<unsigned char> out(1024);
+    DWORD returned = 0;
+    BOOL ok = DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY,
+        &q, sizeof(q), out.data(), static_cast<DWORD>(out.size()),
+        &returned, nullptr);
+    CloseHandle(h);
+    if (!ok || returned < sizeof(STORAGE_DEVICE_DESCRIPTOR)) {
+        SecureZeroMemory(out.data(), out.size());
+        return "unavailable";
+    }
+    auto* desc = reinterpret_cast<STORAGE_DEVICE_DESCRIPTOR*>(out.data());
+    if (desc->SerialNumberOffset == 0 || desc->SerialNumberOffset >= returned) {
+        SecureZeroMemory(out.data(), out.size());
+        return "unavailable";
+    }
+    const char* serial = reinterpret_cast<const char*>(out.data() + desc->SerialNumberOffset);
+    size_t maxlen = static_cast<size_t>(returned) - desc->SerialNumberOffset;
+    size_t n = 0;
+    while (n < maxlen && serial[n] != '\0') ++n;
+    std::string result(serial, n);
+    SecureZeroMemory(out.data(), out.size());
+    size_t start = result.find_first_not_of(" \t");
+    size_t fin = result.find_last_not_of(" \t");
+    if (start == std::string::npos) return "unavailable";
+    result = result.substr(start, fin - start + 1);
+    if (result.empty()) return "unavailable";
+    return result;
+}
+
+static std::string hwid_read_machine_guid()
+{
+    HKEY h = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\Microsoft\\Cryptography",
+            0, KEY_READ | KEY_WOW64_64KEY, &h) != ERROR_SUCCESS) {
+        return "unavailable";
+    }
+    wchar_t wbuf[128] = {};
+    DWORD sz = sizeof(wbuf);
+    DWORD type = 0;
+    std::string result;
+    if (RegQueryValueExW(h, L"MachineGuid", nullptr, &type,
+            reinterpret_cast<LPBYTE>(wbuf), &sz) == ERROR_SUCCESS &&
+        type == REG_SZ) {
+        char ascii[128] = {};
+        int conv = WideCharToMultiByte(CP_UTF8, 0, wbuf, -1,
+            ascii, sizeof(ascii), nullptr, nullptr);
+        if (conv > 0) result.assign(ascii);
+        SecureZeroMemory(ascii, sizeof(ascii));
+    }
+    SecureZeroMemory(wbuf, sizeof(wbuf));
+    RegCloseKey(h);
+    if (result.empty()) return "unavailable";
+    return result;
+}
+
+static std::string hwid_read_cpu_brand()
+{
+    int regs[4] = {};
+    __cpuid(regs, 0x80000000);
+    unsigned highest = static_cast<unsigned>(regs[0]);
+    if (highest < 0x80000004u) return "unavailable";
+    char brand[49] = {};
+    __cpuid(reinterpret_cast<int*>(brand + 0),  0x80000002);
+    __cpuid(reinterpret_cast<int*>(brand + 16), 0x80000003);
+    __cpuid(reinterpret_cast<int*>(brand + 32), 0x80000004);
+    brand[48] = '\0';
+    std::string result(brand);
+    SecureZeroMemory(brand, sizeof(brand));
+    size_t start = result.find_first_not_of(" \t");
+    size_t fin = result.find_last_not_of(" \t");
+    if (start == std::string::npos) return "unavailable";
+    result = result.substr(start, fin - start + 1);
+    if (result.empty()) return "unavailable";
+    return result;
+}
+
 std::string recompute_hwid()
 {
-    uint64_t hash = 14695981039346656037ULL;
-    auto mix = [&](uint64_t value) {
-        fnv_mix_u64_value(hash, value);
-    };
+    std::string slot_smbios    = hwid_read_smbios_uuid();
+    std::string slot_baseboard = hwid_read_baseboard_serial();
+    std::string slot_disk      = hwid_read_disk_serial();
+    std::string slot_guid      = hwid_read_machine_guid();
+    std::string slot_cpu       = hwid_read_cpu_brand();
 
-    DWORD volume_serial = 0;
-    GetVolumeInformationW(L"C:\\", nullptr, 0, &volume_serial, nullptr, nullptr, nullptr, 0);
+    std::string canonical;
+    canonical.reserve(slot_smbios.size() + slot_baseboard.size() +
+                      slot_disk.size() + slot_guid.size() +
+                      slot_cpu.size() + 4);
+    canonical.append(slot_smbios);
+    canonical.append("|");
+    canonical.append(slot_baseboard);
+    canonical.append("|");
+    canonical.append(slot_disk);
+    canonical.append("|");
+    canonical.append(slot_guid);
+    canonical.append("|");
+    canonical.append(slot_cpu);
 
-    wchar_t computer_name[MAX_COMPUTERNAME_LENGTH + 1] = {};
-    DWORD name_size = MAX_COMPUTERNAME_LENGTH + 1;
-    GetComputerNameW(computer_name, &name_size);
+    uint8_t digest[32] = {};
+    bool ok = sha256_block(reinterpret_cast<const uint8_t*>(canonical.data()),
+                           canonical.size(), digest);
 
-    int cpu_info[4] = {};
-    __cpuid(cpu_info, 0);
-    int cpu_info_ext[4] = {};
-    __cpuid(cpu_info_ext, 1);
+    SecureZeroMemory(canonical.data(), canonical.size());
+    SecureZeroMemory(const_cast<char*>(slot_smbios.data()), slot_smbios.size());
+    SecureZeroMemory(const_cast<char*>(slot_baseboard.data()), slot_baseboard.size());
+    SecureZeroMemory(const_cast<char*>(slot_disk.data()), slot_disk.size());
+    SecureZeroMemory(const_cast<char*>(slot_guid.data()), slot_guid.size());
+    SecureZeroMemory(const_cast<char*>(slot_cpu.data()), slot_cpu.size());
 
-    mix(static_cast<uint64_t>(volume_serial));
-    mix((static_cast<uint64_t>(cpu_info[0]) << 32) | static_cast<unsigned>(cpu_info[1]));
-    mix((static_cast<uint64_t>(cpu_info[2]) << 32) | static_cast<unsigned>(cpu_info[3]));
-    mix((static_cast<uint64_t>(cpu_info_ext[0]) << 32) | static_cast<unsigned>(cpu_info_ext[3]));
-    for (DWORD i = 0; i < name_size; ++i)
-        mix(static_cast<uint64_t>(computer_name[i]));
-
-    ULONG len = 0;
-    GetAdaptersInfo(nullptr, &len);
-    if (len > 0) {
-        std::vector<unsigned char> buffer(len);
-        auto* adapter = reinterpret_cast<PIP_ADAPTER_INFO>(buffer.data());
-        if (GetAdaptersInfo(adapter, &len) == NO_ERROR && adapter) {
-            for (UINT i = 0; i < adapter->AddressLength; ++i)
-                mix(static_cast<uint64_t>(adapter->Address[i]));
-        }
+    if (!ok) {
+        SecureZeroMemory(digest, sizeof(digest));
+        return "unavailable";
     }
 
-    char out[17];
-    snprintf(out, sizeof(out), "%016llX", static_cast<unsigned long long>(hash));
-    return out;
+    static const char kHexDigits[] = "0123456789abcdef";
+    char hex_out[65] = {};
+    for (int i = 0; i < 32; ++i) {
+        hex_out[i * 2 + 0] = kHexDigits[(digest[i] >> 4) & 0x0F];
+        hex_out[i * 2 + 1] = kHexDigits[digest[i] & 0x0F];
+    }
+    hex_out[64] = '\0';
+    SecureZeroMemory(digest, sizeof(digest));
+    std::string out_hwid(hex_out);
+    SecureZeroMemory(hex_out, sizeof(hex_out));
+    return out_hwid;
 }
 
 uint64_t compute_own_code_hash()
@@ -1918,18 +2104,30 @@ bool is_session_valid_inner()
 {
     session_data_t sess = {};
     if (!load_session(sess))
+    {
+        SecureZeroMemory(&sess, sizeof(sess));
         return false;
+    }
     if (!sess.initialized)
+    {
+        SecureZeroMemory(&sess, sizeof(sess));
         return false;
+    }
 
     uint64_t check = sess.session_hash ^ sess.hwid_hash ^ sess.xor_key;
     if (check == 0)
+    {
+        SecureZeroMemory(&sess, sizeof(sess));
         return false;
+    }
 
     int64_t now = static_cast<int64_t>(time(nullptr));
     int64_t delta = now - static_cast<int64_t>(sess.init_timestamp);
     if (delta < -300 || delta > 86400)
+    {
+        SecureZeroMemory(&sess, sizeof(sess));
         return false;
+    }
 
     SecureZeroMemory(&sess, sizeof(sess));
     return true;
@@ -2251,7 +2449,7 @@ void init_vtable(uint64_t crypt_key)
 
     log_vtable_state("init_post_encrypt", g_vtable_integrity);
 
-    g_vtable_ready = true;
+    g_vtable_ready.store(true, std::memory_order_release);
 }
 
 }
@@ -2704,7 +2902,7 @@ ARC_API const arc_comm_vtable_t* arc_get_comm_bridge()
 {
     using namespace arc_internal;
     if (!is_session_valid()) return nullptr;
-    if (!g_vtable_ready) return nullptr;
+    if (!g_vtable_ready.load(std::memory_order_acquire)) return nullptr;
     decrypt_vtable_into(&g_vtable_decrypted);
     return &g_vtable_decrypted;
 }
@@ -2844,12 +3042,15 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
                 current_scan.mutable_exec_regions,
                 current_scan.guarded_exec_regions,
                 current_scan.read_failures);
+            SecureZeroMemory(&sess, sizeof(sess));
             enforce_violation("arc_code_hash_mismatch", detail);
         }
         if (!verify_self_integrity())
         {
+            SecureZeroMemory(&sess, sizeof(sess));
             enforce_violation("arc_self_hash_mismatch", "");
         }
+        SecureZeroMemory(&sess, sizeof(sess));
         CFF_GOTO(hb_cff, 2);
     }
     CFF_STATE(hb_cff, 2)
@@ -2877,6 +3078,7 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
                 "current=0x%016llX last=0x%016llX",
                 static_cast<unsigned long long>(current_qpc),
                 static_cast<unsigned long long>(sess.last_heartbeat_tsc));
+            SecureZeroMemory(&sess, sizeof(sess));
             enforce_violation("arc_qpc_rollback", detail);
         }
         {
@@ -3012,12 +3214,15 @@ ARC_API arc_heartbeat_result_t arc_heartbeat_ex(uint64_t hb_count, const char* c
                 current_scan.mutable_exec_regions,
                 current_scan.guarded_exec_regions,
                 current_scan.read_failures);
+            SecureZeroMemory(&sess, sizeof(sess));
             enforce_violation("arc_code_hash_mismatch", detail);
         }
         if (!verify_self_integrity())
         {
+            SecureZeroMemory(&sess, sizeof(sess));
             enforce_violation("arc_self_hash_mismatch", "");
         }
+        SecureZeroMemory(&sess, sizeof(sess));
         CFF_GOTO(hbex_cff, 2);
     }
     CFF_STATE(hbex_cff, 2)
@@ -3046,6 +3251,7 @@ ARC_API arc_heartbeat_result_t arc_heartbeat_ex(uint64_t hb_count, const char* c
                 "current=0x%016llX last=0x%016llX",
                 static_cast<unsigned long long>(current_qpc),
                 static_cast<unsigned long long>(sess.last_heartbeat_tsc));
+            SecureZeroMemory(&sess, sizeof(sess));
             enforce_violation("arc_qpc_rollback", detail);
         }
         sess.last_heartbeat_tsc = current_qpc;
@@ -3221,7 +3427,34 @@ namespace {
         return true;
     }
 
-    void derive_page_key(uint32_t page_index, uint8_t out_key[32])
+    std::string compute_bootstrap_proof_token(const char* session_token)
+    {
+        using namespace arc_internal;
+        if (!session_token || session_token[0] == '\0') return std::string();
+        std::string seed(session_token);
+        seed.append("bootstrap");
+        uint8_t digest[32] = {};
+        bool ok = sha256_block(reinterpret_cast<const uint8_t*>(seed.data()),
+                               seed.size(), digest);
+        SecureZeroMemory(const_cast<char*>(seed.data()), seed.size());
+        if (!ok) {
+            SecureZeroMemory(digest, sizeof(digest));
+            return std::string();
+        }
+        static const char kHexDigits[] = "0123456789abcdef";
+        char hex[65] = {};
+        for (int i = 0; i < 32; ++i) {
+            hex[i * 2 + 0] = kHexDigits[(digest[i] >> 4) & 0x0F];
+            hex[i * 2 + 1] = kHexDigits[digest[i] & 0x0F];
+        }
+        hex[64] = '\0';
+        SecureZeroMemory(digest, sizeof(digest));
+        std::string out(hex);
+        SecureZeroMemory(hex, sizeof(hex));
+        return out;
+    }
+
+    void derive_page_key(uint32_t page_index, const std::string& proof_token, uint8_t out_key[32])
     {
         using namespace arc_internal;
 
@@ -3229,6 +3462,7 @@ namespace {
         uint8_t ks[32];
         bool have_seed = false;
         std::string data;
+        std::string chain_snapshot;
         BCRYPT_ALG_HANDLE hAlg = nullptr;
         BCRYPT_HASH_HANDLE hHash = nullptr;
         NTSTATUS st = 0;
@@ -3254,6 +3488,11 @@ namespace {
                     have_seed = true;
                 }
             }
+            {
+                std::lock_guard<std::mutex> lk_chain(g_chain_tag_mtx);
+                if (g_chain_tag_valid)
+                    chain_snapshot.assign(g_chain_tag_hex);
+            }
             CFF_GOTO(derive_page_key_cff, 1);
         }
         CFF_STATE(derive_page_key_cff, 1)
@@ -3266,10 +3505,21 @@ namespace {
                 CFF_EXIT(derive_page_key_cff);
             }
 
-            data = "page|" + std::to_string(page_index) + "|"
-                + std::string(sess.session_token) + "|"
-                + std::string(sess.hwid) + "|"
-                + std::to_string(static_cast<int64_t>(sess.init_timestamp)) + "|";
+            data.reserve(80 + strnlen_s(sess.session_token, sizeof(sess.session_token))
+                         + strnlen_s(sess.hwid, sizeof(sess.hwid))
+                         + proof_token.size() + chain_snapshot.size());
+            data.append("page|");
+            data.append(std::to_string(page_index));
+            data.append("|");
+            data.append(sess.session_token);
+            data.append("|");
+            data.append(sess.hwid);
+            data.append("|");
+            data.append(std::to_string(static_cast<int64_t>(sess.init_timestamp)));
+            data.append("|");
+            data.append(proof_token);
+            data.append("|");
+            data.append(chain_snapshot);
 
             st = BCryptOpenAlgorithmProvider(
                 &hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
@@ -3296,6 +3546,8 @@ namespace {
             if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
             SecureZeroMemory(ks, sizeof(ks));
             SecureZeroMemory(&sess, sizeof(sess));
+            SecureZeroMemory(const_cast<char*>(data.data()), data.size());
+            SecureZeroMemory(const_cast<char*>(chain_snapshot.data()), chain_snapshot.size());
 
             if (!BCRYPT_SUCCESS(st))
                 SecureZeroMemory(out_key, 32);
@@ -3304,6 +3556,70 @@ namespace {
         CFF_END(derive_page_key_cff)
 
         (void)early_exit;
+    }
+
+    bool update_chain_tag_from_auth_tag(const uint8_t auth_tag[16])
+    {
+        using namespace arc_internal;
+        if (!auth_tag) return false;
+
+        std::string prev_hex_snapshot;
+        {
+            std::lock_guard<std::mutex> lk_chain(g_chain_tag_mtx);
+            if (g_chain_tag_valid)
+                prev_hex_snapshot.assign(g_chain_tag_hex);
+        }
+
+        uint8_t prev_buf[32] = {};
+        if (!prev_hex_snapshot.empty()) {
+            if (prev_hex_snapshot.size() != 64) {
+                SecureZeroMemory(const_cast<char*>(prev_hex_snapshot.data()),
+                                 prev_hex_snapshot.size());
+                return false;
+            }
+            for (int i = 0; i < 32; ++i) {
+                char hbuf[3] = { prev_hex_snapshot[i * 2],
+                                 prev_hex_snapshot[i * 2 + 1], 0 };
+                prev_buf[i] = static_cast<uint8_t>(strtoul(hbuf, nullptr, 16));
+                SecureZeroMemory(hbuf, sizeof(hbuf));
+            }
+        }
+        SecureZeroMemory(const_cast<char*>(prev_hex_snapshot.data()),
+                         prev_hex_snapshot.size());
+
+        uint8_t hmac_input[16 + 5] = {};
+        memcpy(hmac_input, auth_tag, 16);
+        hmac_input[16] = 'c';
+        hmac_input[17] = 'h';
+        hmac_input[18] = 'a';
+        hmac_input[19] = 'i';
+        hmac_input[20] = 'n';
+
+        uint8_t next[32] = {};
+        bool ok = hmac_sha256_full(prev_buf, 32, hmac_input, sizeof(hmac_input), next);
+        SecureZeroMemory(prev_buf, sizeof(prev_buf));
+        SecureZeroMemory(hmac_input, sizeof(hmac_input));
+        if (!ok) {
+            SecureZeroMemory(next, sizeof(next));
+            return false;
+        }
+
+        static const char kHexDigits[] = "0123456789abcdef";
+        char hex_out[65] = {};
+        for (int i = 0; i < 32; ++i) {
+            hex_out[i * 2 + 0] = kHexDigits[(next[i] >> 4) & 0x0F];
+            hex_out[i * 2 + 1] = kHexDigits[next[i] & 0x0F];
+        }
+        hex_out[64] = '\0';
+        SecureZeroMemory(next, sizeof(next));
+
+        {
+            std::lock_guard<std::mutex> lk_chain(g_chain_tag_mtx);
+            memcpy(g_chain_tag_hex, hex_out, sizeof(g_chain_tag_hex));
+            g_chain_tag_valid = true;
+        }
+        SecureZeroMemory(hex_out, sizeof(hex_out));
+        return true;
     }
 }
 
@@ -3347,16 +3663,66 @@ ARC_API bool arc_download_page(
     capture_server_url(server_url);
     if (check_debugger()) { enforce_violation("arc_debugger", "download_page"); }
 
+    if (page_index == 0) {
+        std::lock_guard<std::mutex> lk_chain(g_chain_tag_mtx);
+        SecureZeroMemory(g_chain_tag_hex, sizeof(g_chain_tag_hex));
+        g_chain_tag_valid = false;
+    }
+
+    std::string proof_token;
+    std::string license_key_local;
+    std::string session_token_local;
+    std::string hwid_local;
+    {
+        std::lock_guard<std::mutex> lk(g_session_mtx);
+        session_data_t sess = {};
+        if (!load_session(sess)) return false;
+        proof_token = compute_bootstrap_proof_token(sess.session_token);
+        license_key_local.assign(sess.license_key);
+        session_token_local.assign(sess.session_token);
+        hwid_local.assign(sess.hwid);
+        SecureZeroMemory(&sess, sizeof(sess));
+    }
+    if (proof_token.empty() || session_token_local.empty()) {
+        SecureZeroMemory(const_cast<char*>(license_key_local.data()), license_key_local.size());
+        SecureZeroMemory(const_cast<char*>(session_token_local.data()), session_token_local.size());
+        SecureZeroMemory(const_cast<char*>(hwid_local.data()), hwid_local.size());
+        SecureZeroMemory(const_cast<char*>(proof_token.data()), proof_token.size());
+        return false;
+    }
+
     char url_buf[512];
     auto page_path = OBFSTR("/api/download/pages/");
     snprintf(url_buf, sizeof(url_buf), "%s%s%u", server_url, page_path.c_str(), page_index);
 
-    std::string body = build_session_json();
+    std::string body;
+    body.reserve(license_key_local.size() + session_token_local.size()
+                 + hwid_local.size() + proof_token.size() + 96);
+    {
+        auto k1 = OBFSTR("license_key");
+        auto k2 = OBFSTR("session_token");
+        auto k3 = OBFSTR("hwid");
+        auto k4 = OBFSTR("proof_token");
+        body.append("{\"");
+        body.append(k1.c_str()); body.append("\":\""); body.append(license_key_local);
+        body.append("\",\""); body.append(k2.c_str()); body.append("\":\""); body.append(session_token_local);
+        body.append("\",\""); body.append(k3.c_str()); body.append("\":\""); body.append(hwid_local);
+        body.append("\",\""); body.append(k4.c_str()); body.append("\":\""); body.append(proof_token);
+        body.append("\"}");
+    }
     std::string resp = http_post_json(url_buf, body.c_str());
+
+    SecureZeroMemory(const_cast<char*>(body.data()), body.size());
+    SecureZeroMemory(const_cast<char*>(license_key_local.data()), license_key_local.size());
+    SecureZeroMemory(const_cast<char*>(session_token_local.data()), session_token_local.size());
+    SecureZeroMemory(const_cast<char*>(hwid_local.data()), hwid_local.size());
 
     auto status_key = OBFSTR("status");
     auto ok_val = OBFSTR("ok");
-    if (json_get_string(resp, status_key.c_str()) != ok_val) return false;
+    if (json_get_string(resp, status_key.c_str()) != ok_val) {
+        SecureZeroMemory(const_cast<char*>(proof_token.data()), proof_token.size());
+        return false;
+    }
 
     auto data_key = OBFSTR("encrypted_page");
     auto iv_key = OBFSTR("iv");
@@ -3365,26 +3731,53 @@ ARC_API bool arc_download_page(
     std::string hex_iv   = json_get_string(resp, iv_key.c_str());
     std::string hex_tag  = json_get_string(resp, tag_key.c_str());
 
-    if (b64_data.empty() || hex_iv.size() != 24 || hex_tag.size() != 32) return false;
+    if (b64_data.empty() || hex_iv.size() != 24 || hex_tag.size() != 32) {
+        SecureZeroMemory(const_cast<char*>(proof_token.data()), proof_token.size());
+        return false;
+    }
 
     std::vector<uint8_t> ct;
-    if (!base64_decode(b64_data, ct)) return false;
+    if (!base64_decode(b64_data, ct)) {
+        SecureZeroMemory(const_cast<char*>(proof_token.data()), proof_token.size());
+        return false;
+    }
+    if (ct.empty() || ct.size() > ARC_PAGE_SIZE) {
+        SecureZeroMemory(ct.data(), ct.size());
+        SecureZeroMemory(const_cast<char*>(proof_token.data()), proof_token.size());
+        return false;
+    }
 
     uint8_t iv[12] = {}, tag[16] = {};
     hex_to_bytes(hex_iv, iv, 12);
     hex_to_bytes(hex_tag, tag, 16);
 
     uint8_t page_key[32];
-    derive_page_key(page_index, page_key);
+    derive_page_key(page_index, proof_token, page_key);
+    SecureZeroMemory(const_cast<char*>(proof_token.data()), proof_token.size());
 
     if (!aes_gcm_decrypt_ni(ct.data(), ct.size(), page_key, iv, tag, out_decrypted))
     {
         SecureZeroMemory(page_key, 32);
+        SecureZeroMemory(ct.data(), ct.size());
+        SecureZeroMemory(iv, sizeof(iv));
+        SecureZeroMemory(tag, sizeof(tag));
         return false;
     }
 
     *out_size = static_cast<uint32_t>(ct.size());
+
+    if (!update_chain_tag_from_auth_tag(tag)) {
+        SecureZeroMemory(page_key, 32);
+        SecureZeroMemory(ct.data(), ct.size());
+        SecureZeroMemory(iv, sizeof(iv));
+        SecureZeroMemory(tag, sizeof(tag));
+        return false;
+    }
+
     SecureZeroMemory(page_key, 32);
+    SecureZeroMemory(ct.data(), ct.size());
+    SecureZeroMemory(iv, sizeof(iv));
+    SecureZeroMemory(tag, sizeof(tag));
     return true;
 }
 
@@ -3442,13 +3835,18 @@ __declspec(noinline) static void arc_cleanup_unregister_protection_seh()
 ARC_API void arc_cleanup()
 {
     using namespace arc_internal;
+    g_vtable_ready.store(false, std::memory_order_release);
     arc_cleanup_unregister_protection_seh();
+    {
+        std::lock_guard<std::mutex> lk_chain(g_chain_tag_mtx);
+        SecureZeroMemory(g_chain_tag_hex, sizeof(g_chain_tag_hex));
+        g_chain_tag_valid = false;
+    }
     std::lock_guard<std::mutex> lk(g_session_mtx);
     SecureZeroMemory(&g_enc_session, sizeof(g_enc_session));
     SecureZeroMemory(&g_vtable, sizeof(g_vtable));
     SecureZeroMemory(g_key_seed, sizeof(g_key_seed));
     g_key_seed_valid = false;
-    g_vtable_ready = false;
     g_vtable_crypt_key = 0;
     g_device_enc = 0;
     g_prebound_device_enc = 0;
@@ -3459,9 +3857,16 @@ ARC_API void arc_set_key_seed(const uint8_t* key_seed, uint32_t len)
 {
     using namespace arc_internal;
     if (!key_seed || len != 32) return;
-    std::lock_guard<std::mutex> lk(g_key_seed_mtx);
-    memcpy(g_key_seed, key_seed, 32);
-    g_key_seed_valid = true;
+    {
+        std::lock_guard<std::mutex> lk(g_key_seed_mtx);
+        memcpy(g_key_seed, key_seed, 32);
+        g_key_seed_valid = true;
+    }
+    {
+        std::lock_guard<std::mutex> lk_chain(g_chain_tag_mtx);
+        SecureZeroMemory(g_chain_tag_hex, sizeof(g_chain_tag_hex));
+        g_chain_tag_valid = false;
+    }
 }
 
 ARC_API uint32_t arc_copy_last_status(char* out, uint32_t cap)
@@ -3489,6 +3894,7 @@ ARC_API bool arc_unseal_feature(
 {
     using namespace arc_internal;
     if (!out || !out_size || out_cap == 0) { arc_log("unseal", "bad_args"); return false; }
+    if (!nonce || nonce_len == 0 || nonce_len > 256) { arc_log("unseal", "bad_nonce"); return false; }
     if (!is_session_valid()) { arc_log("unseal", "session_invalid"); return false; }
     if (check_debugger()) { enforce_violation("arc_debugger", "unseal_feature"); }
     if (!load_bind_secret()) { arc_log("unseal", "bind_secret_load_failed"); return false; }

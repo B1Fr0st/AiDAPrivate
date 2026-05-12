@@ -6,6 +6,8 @@
 #include "toast_notification.hpp"
 #include "arc/arc.h"
 #include "comm.h"
+#include "event_bus.hpp"
+#include "work_queue.hpp"
 #include "../helpers/diag_log.hpp"
 
 #include <windows.h>
@@ -184,6 +186,120 @@ namespace
         std::thread(driver_watchdog_thread).detach();
     }
 
+    std::atomic<bool> g_event_poller_started{false};
+    std::atomic<bool> g_event_poller_stop{false};
+    constexpr int kEventPollerPeriodMs = 250;
+    constexpr size_t kEventPollerDrainBatch = 64;
+
+    std::string utf8_from_wstring(const std::wstring& w)
+    {
+        if (w.empty()) return {};
+        int needed = WideCharToMultiByte(CP_UTF8, 0, w.c_str(),
+            static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+        if (needed <= 0) return {};
+        std::string out(static_cast<size_t>(needed), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, w.c_str(),
+            static_cast<int>(w.size()), out.data(), needed, nullptr, nullptr);
+        return out;
+    }
+
+    std::string extract_basename_utf8(const std::string& path)
+    {
+        if (path.empty()) return {};
+        size_t slash = path.find_last_of("\\/");
+        if (slash == std::string::npos) return path;
+        return path.substr(slash + 1);
+    }
+
+    void publish_drained_event(const driver_bridge::debug_event_t& evt)
+    {
+        switch (evt.type) {
+            case driver_bridge::debug_event_type_e::image_loaded: {
+                aida::events::dll_loaded_t payload{};
+                payload.process_id = evt.process_id;
+                payload.thread_id = evt.thread_id;
+                payload.image_base = evt.image_base;
+                payload.image_size = evt.image_size;
+                payload.timestamp = evt.timestamp;
+                payload.flags = evt.flags;
+                payload.image_path = evt.image_path;
+                payload.image_name = evt.image_name;
+                aida::events::publish(aida::events::event_dll_loaded, payload);
+                break;
+            }
+            case driver_bridge::debug_event_type_e::process_created: {
+                aida::events::process_created_t payload{};
+                payload.process_id = evt.process_id;
+                payload.timestamp = evt.timestamp;
+                payload.image_path = evt.image_path;
+                payload.image_name = evt.image_name;
+                aida::events::publish(aida::events::event_process_created, payload);
+                break;
+            }
+            case driver_bridge::debug_event_type_e::process_exited: {
+                aida::events::process_exited_t payload{};
+                payload.process_id = evt.process_id;
+                payload.timestamp = evt.timestamp;
+                aida::events::publish(aida::events::event_process_exited, payload);
+                break;
+            }
+            case driver_bridge::debug_event_type_e::invalid:
+            default:
+                break;
+        }
+    }
+
+    void event_poller_thread()
+    {
+        diag::log_tagged("driver", "event_poller_thread_entry");
+        while (!g_event_poller_stop.load(std::memory_order_acquire)) {
+            Sleep(kEventPollerPeriodMs);
+            if (g_event_poller_stop.load(std::memory_order_acquire))
+                break;
+
+            bool kernel_active = false;
+            uint32_t pid_filter = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_state_mtx);
+                kernel_active = g_kernel_mode && device && device->is_connected();
+                pid_filter = g_pid;
+            }
+            if (!kernel_active || pid_filter == 0)
+                continue;
+
+            std::vector<driver_bridge::debug_event_t> events;
+            driver_bridge::debug_event_stats_t stats{};
+            if (!driver_bridge::drain_debug_events(events, kEventPollerDrainBatch, &stats))
+                continue;
+
+            if (stats.returned_count == 0 && stats.dropped_since_last_drain == 0)
+                continue;
+
+            if (stats.returned_count > 0 || stats.dropped_since_last_drain > 0) {
+                aida::events::debug_events_drained_t payload{};
+                payload.returned_count = stats.returned_count;
+                payload.dropped_since_last_drain = stats.dropped_since_last_drain;
+                payload.total_dropped = stats.total_dropped;
+                payload.total_published = stats.total_published;
+                aida::events::publish(aida::events::event_debug_events_drained, payload);
+            }
+
+            for (auto& evt : events) {
+                publish_drained_event(evt);
+            }
+        }
+        diag::log_tagged("driver", "event_poller_thread_exit");
+    }
+
+    void start_event_poller_locked()
+    {
+        bool expected = false;
+        if (!g_event_poller_started.compare_exchange_strong(expected, true)) {
+            return;
+        }
+        std::thread(event_poller_thread).detach();
+    }
+
     std::string utf8_from_wide(const wchar_t* text)
     {
         if (!text || !*text)
@@ -293,6 +409,7 @@ namespace driver_bridge
             g_initialized = true;
             logf("AiDA Standalone: Live inspection bridge initialized with kernel driver backend.\n");
             start_driver_watchdog_locked();
+            start_event_poller_locked();
             return true;
         }
 
@@ -346,6 +463,7 @@ namespace driver_bridge
         set_last_error_locked({});
         logf("AiDA Standalone: Kernel driver backend is active.\n");
         start_driver_watchdog_locked();
+        start_event_poller_locked();
         return true;
     }
 
@@ -2872,5 +2990,49 @@ namespace driver_bridge
             std::memcpy(result.measurements_hmac, raw.measurements_hmac, sizeof(result.measurements_hmac));
         }
         return ok;
+    }
+
+    bool drain_debug_events(std::vector<debug_event_t>& out,
+                            size_t max_events,
+                            debug_event_stats_t* out_stats)
+    {
+        out.clear();
+        if (out_stats) *out_stats = debug_event_stats_t{};
+
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+
+        std::vector<voyager::device_t::debug_event_record> raw;
+        voyager::device_t::debug_event_drain_stats raw_stats{};
+        if (!device->drain_debug_events(raw, max_events, &raw_stats))
+            return false;
+
+        if (out_stats) {
+            out_stats->returned_count = raw_stats.returned_count;
+            out_stats->dropped_since_last_drain = raw_stats.dropped_since_last_drain;
+            out_stats->total_dropped = raw_stats.total_dropped;
+            out_stats->total_published = raw_stats.total_published;
+        }
+
+        out.reserve(raw.size());
+        for (auto& src : raw) {
+            debug_event_t dst;
+            dst.type       = static_cast<debug_event_type_e>(static_cast<uint32_t>(src.type));
+            dst.process_id = src.process_id;
+            dst.thread_id  = src.thread_id;
+            dst.flags      = src.flags;
+            dst.timestamp  = src.timestamp;
+            dst.image_base = src.image_base;
+            dst.image_size = src.image_size;
+            dst.image_path_wide = std::move(src.image_path);
+            dst.image_path = utf8_from_wstring(dst.image_path_wide);
+            dst.image_name = extract_basename_utf8(dst.image_path);
+            out.push_back(std::move(dst));
+        }
+        return true;
     }
 }

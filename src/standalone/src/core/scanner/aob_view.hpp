@@ -228,8 +228,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::SetCursorScreenPos(ImVec2(cx + 174.f, cy));
 		if (aida::ui::button("Optimize", aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::md)) {
-			std::lock_guard<std::mutex> lk(gen.mutex);
-			aob_generator::optimize_signature(gen.current);
+			aob_generator::signature_t to_optimize;
+			{
+				std::lock_guard<std::mutex> lk(gen.mutex);
+				to_optimize = gen.current;
+			}
+			work_queue::post([to_optimize]() mutable {
+				aob_generator::optimize_signature(to_optimize);
+				std::lock_guard<std::mutex> lk(aob_generator::g_state.mutex);
+				if (aob_generator::g_state.current.id == to_optimize.id)
+					aob_generator::g_state.current = std::move(to_optimize);
+			});
 		}
 
 		bool batch_running = gen.batch_generating.load();
@@ -411,13 +420,22 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImGui::SetCursorScreenPos(ImVec2(bx, cy));
 			if (aida::ui::button("Compare", aida::ui::button_kind_t::secondary,
 					aida::ui::size_t_::sm)) {
-				std::lock_guard<std::mutex> lk(gen.mutex);
-				auto results = aob_generator::compare_signatures_against_process(gen.saved_signatures);
-				for (size_t ri = 0; ri < results.size() && ri < gen.saved_signatures.size(); ++ri) {
-					gen.saved_signatures[ri].unique = results[ri].still_found;
-					gen.saved_signatures[ri].uniqueness_count = results[ri].match_count;
-					gen.saved_signatures[ri].quality_score = aob_generator::compute_quality_score(gen.saved_signatures[ri]);
+				std::vector<aob_generator::signature_t> sigs_copy;
+				{
+					std::lock_guard<std::mutex> lk(gen.mutex);
+					sigs_copy = gen.saved_signatures;
 				}
+				work_queue::post([sigs_copy]() mutable {
+					auto results = aob_generator::compare_signatures_against_process(sigs_copy);
+					std::lock_guard<std::mutex> lk(aob_generator::g_state.mutex);
+					auto& saved = aob_generator::g_state.saved_signatures;
+					for (size_t ri = 0; ri < results.size() && ri < saved.size() && ri < sigs_copy.size(); ++ri) {
+						if (saved[ri].id != sigs_copy[ri].id) continue;
+						saved[ri].unique = results[ri].still_found;
+						saved[ri].uniqueness_count = results[ri].match_count;
+						saved[ri].quality_score = aob_generator::compute_quality_score(saved[ri]);
+					}
+				});
 			}
 			bx += 90.f;
 

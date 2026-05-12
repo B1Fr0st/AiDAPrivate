@@ -7,6 +7,8 @@
 #include "zydis_disasm.hpp"
 #include "../editor/expression_eval.hpp"
 #include "work_queue.hpp"
+#include "event_bus.hpp"
+#include "toast_notification.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -17,6 +19,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <thread>
 
 namespace {
 
@@ -141,33 +145,131 @@ void push_log_message_locked(state_t& st, const std::string& msg) {
 	st.log_messages.push_back(msg);
 }
 
+std::recursive_mutex& thread_ctx_serializer() {
+	static std::recursive_mutex m;
+	return m;
+}
+
 }
 
 void sync_attached_state();
 
+namespace {
+
+aida::events::subscription_handle_t g_process_exited_sub;
+std::atomic<bool> g_event_subscriptions_initialized{false};
+
+void handle_process_exited(const aida::events::process_exited_t& evt) {
+	uint32_t attached = driver_bridge::attached_pid();
+	if (attached == 0 || attached != evt.process_id)
+		return;
+
+	auto& st = g_state;
+	st.status.store(dbg_status_t::terminated);
+	st.active_tid = 0;
+	st.tracing.store(false);
+
+	{
+		std::lock_guard<std::mutex> lk(st.bp_mutex);
+		for (auto& bp : st.breakpoints) {
+			bp.byte_written = false;
+			bp.hw_slot = -1;
+		}
+		for (auto& ibp : st.internal_breakpoints) {
+			ibp.active = false;
+		}
+	}
+
+	{
+		std::lock_guard<std::mutex> lk(st.cache_mtx);
+		st.cached_regs = register_set_t{};
+		st.cached_threads.clear();
+		st.cached_stack.clear();
+		st.cached_stack_addr = 0;
+		st.cached_dump.clear();
+		st.cached_dump_addr = 0;
+		st.cached_dump_size = 0;
+		st.cached_disasm_bytes.clear();
+		st.cached_disasm_base = 0;
+	}
+
+	{
+		std::lock_guard<std::mutex> lk(st.trap_mtx);
+		st.pending_trap_address = 0;
+		st.trap_signaled.store(true);
+	}
+	st.trap_cv.notify_all();
+
+	char buf[160];
+	std::snprintf(buf, sizeof(buf),
+		"Target process (PID %u) exited; debugger detached state cached.",
+		evt.process_id);
+	push_log_message_locked(st, buf);
+	toast_notification::push(buf, toast_notification::toast_type_t::warning);
+}
+
+void ensure_event_subscriptions() {
+	bool expected = false;
+	if (!g_event_subscriptions_initialized.compare_exchange_strong(expected, true))
+		return;
+	g_process_exited_sub = aida::events::subscribe(
+		aida::events::event_process_exited,
+		[](const aida::events::process_exited_t& evt) {
+			handle_process_exited(evt);
+		});
+}
+
+}
 
 void initialize() {
 	auto& st = g_state;
 	st.status.store(dbg_status_t::idle);
+	ensure_event_subscriptions();
 }
 
 void shutdown() {
 	auto& st = g_state;
 	st.tracing.store(false);
 	st.worker_active.store(false);
+	{
+		std::lock_guard<std::mutex> lk(st.trap_mtx);
+		st.trap_signaled.store(true);
+	}
+	st.trap_cv.notify_all();
 	if (st.worker_thread.joinable()) st.worker_thread.join();
+	clear_all_breakpoints();
 }
 
 
 int add_breakpoint(uint64_t address, bp_type_t type, const std::string& name,
-				   const std::string& condition) {
+				   const std::string& condition, int size) {
 	auto& st = g_state;
+	sync_attached_state();
+
+	int len_bits = 0;
+	bool is_hw = (type == bp_type_t::hardware_execute ||
+				  type == bp_type_t::hardware_write ||
+				  type == bp_type_t::hardware_read);
+	if (is_hw) {
+		switch (size) {
+			case 1: len_bits = 0; break;
+			case 2: len_bits = 1; break;
+			case 4: len_bits = 3; break;
+			case 8: len_bits = 2; break;
+			default:
+				set_last_error("hw bp size must be 1, 2, 4, or 8 bytes");
+				return -1;
+		}
+	}
+
 	std::lock_guard<std::mutex> lk(st.bp_mutex);
 
 
 	for (auto& bp : st.breakpoints) {
-		if (bp.address == address && bp.type == type)
+		if (bp.address == address && bp.type == type) {
+			set_last_error("add_breakpoint: duplicate at address/type");
 			return -1;
+		}
 	}
 
 	breakpoint_t bp;
@@ -176,6 +278,7 @@ int add_breakpoint(uint64_t address, bp_type_t type, const std::string& name,
 	bp.state = bp_state_t::enabled;
 	bp.name = name;
 	bp.condition = condition;
+	bp.size = is_hw ? size : 1;
 
 
 	if (type == bp_type_t::software) {
@@ -212,13 +315,17 @@ int add_breakpoint(uint64_t address, bp_type_t type, const std::string& name,
 		int slot = -1;
 		bool used[4] = {};
 		for (auto& existing : st.breakpoints) {
-			if (existing.hw_slot >= 0 && existing.hw_slot < 4)
+			if (existing.hw_slot >= 0 && existing.hw_slot < 4 &&
+				existing.state != bp_state_t::disabled)
 				used[existing.hw_slot] = true;
 		}
 		for (int i = 0; i < 4; ++i) {
 			if (!used[i]) { slot = i; break; }
 		}
-		if (slot == -1) return -1;
+		if (slot == -1) {
+			set_last_error("add_breakpoint: no free hardware slot (4 max)");
+			return -1;
+		}
 		bp.hw_slot = slot;
 
 		int hw_type = 0;
@@ -226,9 +333,24 @@ int add_breakpoint(uint64_t address, bp_type_t type, const std::string& name,
 		else if (type == bp_type_t::hardware_write) hw_type = 1;
 		else if (type == bp_type_t::hardware_read)  hw_type = 3;
 
-		if (st.active_tid != 0) {
-			if (!driver_bridge::set_hardware_breakpoint(st.active_tid, slot, address, hw_type, 0))
-				return -1;
+		bool any_applied = false;
+		bool any_failed  = false;
+		if (st.target_pid != 0) {
+			auto threads = driver_bridge::enumerate_threads();
+			for (const auto& t : threads) {
+				if (t.owner_pid != st.target_pid) continue;
+				if (driver_bridge::set_hardware_breakpoint(t.tid, slot, address, hw_type, len_bits))
+					any_applied = true;
+				else
+					any_failed = true;
+			}
+		}
+		if (!any_applied && st.target_pid != 0) {
+			set_last_error("add_breakpoint: failed to program any thread's DRx");
+			return -1;
+		}
+		if (any_failed) {
+			set_last_error("add_breakpoint: partial DRx programming");
 		}
 	}
 
@@ -238,6 +360,7 @@ int add_breakpoint(uint64_t address, bp_type_t type, const std::string& name,
 
 bool remove_breakpoint(int index) {
 	auto& st = g_state;
+	sync_attached_state();
 	std::lock_guard<std::mutex> lk(st.bp_mutex);
 	if (index < 0 || index >= static_cast<int>(st.breakpoints.size()))
 		return false;
@@ -253,8 +376,13 @@ bool remove_breakpoint(int index) {
 		bp.byte_written = false;
 	}
 
-	if (bp.hw_slot >= 0 && bp.hw_slot < 4 && st.active_tid != 0)
-		driver_bridge::clear_hardware_breakpoint(st.active_tid, bp.hw_slot);
+	if (bp.hw_slot >= 0 && bp.hw_slot < 4 && st.target_pid != 0) {
+		auto threads = driver_bridge::enumerate_threads();
+		for (const auto& t : threads) {
+			if (t.owner_pid != st.target_pid) continue;
+			driver_bridge::clear_hardware_breakpoint(t.tid, bp.hw_slot);
+		}
+	}
 
 	st.breakpoints.erase(st.breakpoints.begin() + index);
 	return true;
@@ -262,6 +390,7 @@ bool remove_breakpoint(int index) {
 
 bool toggle_breakpoint(int index) {
 	auto& st = g_state;
+	sync_attached_state();
 	std::lock_guard<std::mutex> lk(st.bp_mutex);
 	if (index < 0 || index >= static_cast<int>(st.breakpoints.size()))
 		return false;
@@ -285,23 +414,98 @@ bool toggle_breakpoint(int index) {
 		}
 	}
 
+	if (bp.type == bp_type_t::hardware_execute || bp.type == bp_type_t::hardware_write ||
+		bp.type == bp_type_t::hardware_read) {
+		if (!will_enable) {
+			if (bp.hw_slot >= 0 && bp.hw_slot < 4 && st.target_pid != 0) {
+				auto threads = driver_bridge::enumerate_threads();
+				for (const auto& t : threads) {
+					if (t.owner_pid != st.target_pid) continue;
+					driver_bridge::clear_hardware_breakpoint(t.tid, bp.hw_slot);
+				}
+			}
+		} else {
+			int slot = -1;
+			bool used[4] = {};
+			for (auto& existing : st.breakpoints) {
+				if (&existing == &bp) continue;
+				if (existing.hw_slot >= 0 && existing.hw_slot < 4 &&
+					existing.state != bp_state_t::disabled)
+					used[existing.hw_slot] = true;
+			}
+			if (bp.hw_slot >= 0 && bp.hw_slot < 4 && !used[bp.hw_slot])
+				slot = bp.hw_slot;
+			else {
+				for (int i = 0; i < 4; ++i) {
+					if (!used[i]) { slot = i; break; }
+				}
+			}
+			if (slot == -1) {
+				set_last_error("toggle_breakpoint: no free hardware slot");
+				return false;
+			}
+			bp.hw_slot = slot;
+
+			int hw_type = 0;
+			if (bp.type == bp_type_t::hardware_execute)    hw_type = 0;
+			else if (bp.type == bp_type_t::hardware_write) hw_type = 1;
+			else if (bp.type == bp_type_t::hardware_read)  hw_type = 3;
+
+			int len_bits = 0;
+			switch (bp.size) {
+				case 1: len_bits = 0; break;
+				case 2: len_bits = 1; break;
+				case 4: len_bits = 3; break;
+				case 8: len_bits = 2; break;
+				default: len_bits = 0; break;
+			}
+
+			if (st.target_pid != 0) {
+				auto threads = driver_bridge::enumerate_threads();
+				for (const auto& t : threads) {
+					if (t.owner_pid != st.target_pid) continue;
+					driver_bridge::set_hardware_breakpoint(t.tid, slot, bp.address, hw_type, len_bits);
+				}
+			}
+		}
+	}
+
 	bp.state = will_enable ? bp_state_t::enabled : bp_state_t::disabled;
 	return true;
 }
 
 void clear_all_breakpoints() {
 	auto& st = g_state;
+	sync_attached_state();
+
+	std::vector<driver_bridge::thread_info_t> threads;
+	if (st.target_pid != 0)
+		threads = driver_bridge::enumerate_threads();
+
 	std::lock_guard<std::mutex> lk(st.bp_mutex);
+
 	for (auto& bp : st.breakpoints) {
 		if (bp.type == bp_type_t::software && bp.byte_written) {
 			std::vector<uint8_t> restore{bp.original_byte};
 			driver_bridge::write_memory(bp.address, restore);
 			bp.byte_written = false;
 		}
-		if (bp.hw_slot >= 0 && bp.hw_slot < 4 && st.active_tid != 0)
-			driver_bridge::clear_hardware_breakpoint(st.active_tid, bp.hw_slot);
+		if (bp.hw_slot >= 0 && bp.hw_slot < 4) {
+			for (const auto& t : threads) {
+				if (t.owner_pid != st.target_pid) continue;
+				driver_bridge::clear_hardware_breakpoint(t.tid, bp.hw_slot);
+			}
+		}
 	}
 	st.breakpoints.clear();
+	for (auto& ibp : st.internal_breakpoints) {
+		if (ibp.active) {
+			std::vector<uint8_t> restore{ibp.original_byte};
+			driver_bridge::write_memory(ibp.address, restore);
+			ibp.active = false;
+		}
+	}
+	st.internal_breakpoints.clear();
 }
 
 
@@ -349,6 +553,25 @@ bool step_into() {
 	if (regs.rip == 0) return false;
 	uint64_t pre_step_rip = regs.rip;
 
+	int rearm_bp_index = -1;
+	uint64_t rearm_bp_address = 0;
+	uint8_t  rearm_bp_original = 0;
+	{
+		std::lock_guard<std::mutex> lk(st.bp_mutex);
+		for (size_t i = 0; i < st.breakpoints.size(); ++i) {
+			auto& bp = st.breakpoints[i];
+			if (bp.type != bp_type_t::software) continue;
+			if (bp.state == bp_state_t::disabled) continue;
+			if (bp.is_internal) continue;
+			if (bp.address != pre_step_rip) continue;
+			if (bp.byte_written) continue;
+			rearm_bp_index = static_cast<int>(i);
+			rearm_bp_address = bp.address;
+			rearm_bp_original = bp.original_byte;
+			break;
+		}
+	}
+
 	if (st.tracing.load()) {
 		std::lock_guard<std::mutex> lk(st.trace_mutex);
 		if (static_cast<int>(st.trace_log.size()) < st.trace_max_depth) {
@@ -371,6 +594,8 @@ bool step_into() {
 		st.trap_signaled.store(false);
 		st.pending_trap_address = pre_step_rip;
 	}
+
+	std::lock_guard<std::recursive_mutex> step_lk(thread_ctx_serializer());
 
 	if (!driver_bridge::suspend_thread(st.active_tid)) {
 		set_last_error("step_into: suspend_thread failed");
@@ -397,19 +622,75 @@ bool step_into() {
 		return false;
 	}
 
-	bool trap_arrived = wait_for_trap(0, 5000);
-	if (!trap_arrived) {
+	const uint32_t step_timeout_ms = 5000;
+	auto deadline = std::chrono::steady_clock::now() +
+		std::chrono::milliseconds(step_timeout_ms);
+	register_set_t post_regs{};
+	bool advanced = false;
+	while (std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		driver_bridge::thread_context_t probe{};
+		if (!driver_bridge::get_thread_context(st.active_tid, probe))
+			continue;
+		if (probe.rip != pre_step_rip) {
+			driver_bridge::suspend_thread(st.active_tid);
+			driver_bridge::thread_context_t stable{};
+			if (driver_bridge::get_thread_context(st.active_tid, stable)) {
+				post_regs.rax = stable.rax; post_regs.rbx = stable.rbx;
+				post_regs.rcx = stable.rcx; post_regs.rdx = stable.rdx;
+				post_regs.rsi = stable.rsi; post_regs.rdi = stable.rdi;
+				post_regs.rbp = stable.rbp; post_regs.rsp = stable.rsp;
+				post_regs.r8  = stable.r8;  post_regs.r9  = stable.r9;
+				post_regs.r10 = stable.r10; post_regs.r11 = stable.r11;
+				post_regs.r12 = stable.r12; post_regs.r13 = stable.r13;
+				post_regs.r14 = stable.r14; post_regs.r15 = stable.r15;
+				post_regs.rip = stable.rip; post_regs.rflags = stable.rflags;
+				post_regs.cs = stable.cs; post_regs.ss = stable.ss;
+				post_regs.dr0 = stable.dr0; post_regs.dr1 = stable.dr1;
+				post_regs.dr2 = stable.dr2; post_regs.dr3 = stable.dr3;
+				post_regs.dr6 = stable.dr6; post_regs.dr7 = stable.dr7;
+			}
+			advanced = true;
+			break;
+		}
+	}
+
+	if (!advanced) {
+		driver_bridge::suspend_thread(st.active_tid);
+		driver_bridge::thread_context_t restore_ctx{};
+		if (driver_bridge::get_thread_context(st.active_tid, restore_ctx)) {
+			restore_ctx.rflags &= ~0x100ULL;
+			driver_bridge::set_thread_context(st.active_tid, restore_ctx, ~0ULL);
+		}
 		st.status.store(dbg_status_t::paused);
-		set_last_error("step_into: timed out waiting for trap");
+		set_last_error("step_into: thread did not advance within timeout");
 		invalidate_cache();
 		return false;
 	}
 
-	register_set_t post_regs = get_registers();
+	{
+		std::lock_guard<std::mutex> lk(st.reg_mutex);
+		st.registers = post_regs;
+	}
+	signal_trap(post_regs.rip);
+
+	if (rearm_bp_index >= 0 && post_regs.rip != rearm_bp_address) {
+		std::vector<uint8_t> cc{0xCC};
+		if (driver_bridge::write_memory(rearm_bp_address, cc)) {
+			std::lock_guard<std::mutex> lk(st.bp_mutex);
+			if (rearm_bp_index < static_cast<int>(st.breakpoints.size()) &&
+				st.breakpoints[static_cast<size_t>(rearm_bp_index)].address == rearm_bp_address) {
+				st.breakpoints[static_cast<size_t>(rearm_bp_index)].byte_written = true;
+				st.breakpoints[static_cast<size_t>(rearm_bp_index)].original_byte = rearm_bp_original;
+			}
+		}
+	}
+
 	auto bp_action = handle_breakpoint_hit(post_regs.rip);
 	invalidate_cache();
 	if (bp_action == bp_hit_action_t::resume) {
 		st.status.store(dbg_status_t::running);
+		driver_bridge::resume_thread(st.active_tid);
 		return true;
 	}
 
@@ -516,12 +797,62 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 	if (!wait_for_completion)
 		return true;
 
-	bool trap_arrived = wait_for_trap(0, timeout_ms);
-	if (!trap_arrived) {
+	auto deadline = std::chrono::steady_clock::now() +
+		std::chrono::milliseconds(timeout_ms);
+	bool reached = false;
+	uint32_t hit_tid = 0;
+	while (std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		auto probe_threads = driver_bridge::enumerate_threads();
+		for (const auto& th : probe_threads) {
+			if (th.owner_pid != st.target_pid) continue;
+			driver_bridge::thread_context_t kctx{};
+			if (!driver_bridge::get_thread_context(th.tid, kctx))
+				continue;
+			if (kctx.rip == address || kctx.rip == address + 1) {
+				reached = true;
+				hit_tid = th.tid;
+				if (kctx.rip == address + 1) {
+					kctx.rip = address;
+					driver_bridge::set_thread_context(th.tid, kctx, ~0ULL);
+				}
+				break;
+			}
+		}
+		if (reached) break;
+	}
+
+	{
+		std::lock_guard<std::mutex> lk(st.bp_mutex);
+		for (auto it = st.internal_breakpoints.begin(); it != st.internal_breakpoints.end(); ) {
+			if (it->address == address && it->active) {
+				std::vector<uint8_t> restore{it->original_byte};
+				driver_bridge::write_memory(address, restore);
+				it = st.internal_breakpoints.erase(it);
+			} else {
+				++it;
+			}
+		}
+		for (auto it = st.breakpoints.begin(); it != st.breakpoints.end(); ) {
+			if (it->address == address && it->is_internal &&
+				it->state == bp_state_t::one_shot && it->byte_written) {
+				it = st.breakpoints.erase(it);
+			} else {
+				++it;
+			}
+		}
+	}
+
+	if (!reached) {
 		set_last_error("run_to_address: timed out waiting for trap");
 		st.status.store(dbg_status_t::paused);
 		invalidate_cache();
 		return false;
+	}
+
+	if (hit_tid != 0) {
+		st.active_tid = hit_tid;
+		signal_trap(address);
 	}
 	st.status.store(dbg_status_t::paused);
 	invalidate_cache();
@@ -534,7 +865,10 @@ register_set_t get_registers() {
 	sync_attached_state();
 	if (st.target_pid == 0 || st.active_tid == 0) return {};
 
-	driver_bridge::suspend_thread(st.active_tid);
+	std::lock_guard<std::recursive_mutex> ctx_lk(thread_ctx_serializer());
+
+	uint32_t saved_suspend_count = 0;
+	bool suspended = driver_bridge::suspend_thread(st.active_tid, &saved_suspend_count);
 
 	driver_bridge::thread_context_t kctx{};
 	if (driver_bridge::get_thread_context(st.active_tid, kctx)) {
@@ -554,7 +888,8 @@ register_set_t get_registers() {
 		st.registers.dr6 = kctx.dr6; st.registers.dr7 = kctx.dr7;
 	}
 
-	driver_bridge::resume_thread(st.active_tid);
+	if (suspended)
+		driver_bridge::resume_thread(st.active_tid);
 
 	std::lock_guard<std::mutex> lk(st.reg_mutex);
 	return st.registers;
@@ -565,11 +900,14 @@ bool set_register(const std::string& name, uint64_t value) {
 	sync_attached_state();
 	if (st.target_pid == 0 || st.active_tid == 0) return false;
 
-	driver_bridge::suspend_thread(st.active_tid);
+	std::lock_guard<std::recursive_mutex> ctx_lk(thread_ctx_serializer());
+
+	uint32_t saved_suspend_count = 0;
+	bool suspended = driver_bridge::suspend_thread(st.active_tid, &saved_suspend_count);
 
 	driver_bridge::thread_context_t kctx{};
 	if (!driver_bridge::get_thread_context(st.active_tid, kctx)) {
-		driver_bridge::resume_thread(st.active_tid);
+		if (suspended) driver_bridge::resume_thread(st.active_tid);
 		return false;
 	}
 
@@ -595,13 +933,13 @@ bool set_register(const std::string& name, uint64_t value) {
 	else if (lower == "rip") kctx.rip = value;
 	else if (lower == "rflags" || lower == "eflags") kctx.rflags = value;
 	else {
-		driver_bridge::resume_thread(st.active_tid);
+		if (suspended) driver_bridge::resume_thread(st.active_tid);
 		return false;
 	}
 
 	bool ok = driver_bridge::set_thread_context(st.active_tid, kctx, ~0ULL);
 
-	driver_bridge::resume_thread(st.active_tid);
+	if (suspended) driver_bridge::resume_thread(st.active_tid);
 
 	if (ok) {
 		std::lock_guard<std::mutex> lk(st.reg_mutex);
@@ -746,62 +1084,33 @@ bool remove_watch(int index) {
 void refresh_watches() {
 	auto& st = g_state;
 	auto regs = get_registers();
+	expression_eval::context_t ctx = build_eval_context(regs);
 	std::lock_guard<std::mutex> lk(st.watch_mutex);
 
 	for (auto& w : st.watches) {
-
-		auto expr = w.expression;
-		for (auto& c : expr) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-
-		uint64_t val = 0;
-		bool found = false;
-
-		if      (expr == "rax") { val = regs.rax; found = true; }
-		else if (expr == "rbx") { val = regs.rbx; found = true; }
-		else if (expr == "rcx") { val = regs.rcx; found = true; }
-		else if (expr == "rdx") { val = regs.rdx; found = true; }
-		else if (expr == "rsi") { val = regs.rsi; found = true; }
-		else if (expr == "rdi") { val = regs.rdi; found = true; }
-		else if (expr == "rbp") { val = regs.rbp; found = true; }
-		else if (expr == "rsp") { val = regs.rsp; found = true; }
-		else if (expr == "r8")  { val = regs.r8;  found = true; }
-		else if (expr == "r9")  { val = regs.r9;  found = true; }
-		else if (expr == "r10") { val = regs.r10; found = true; }
-		else if (expr == "r11") { val = regs.r11; found = true; }
-		else if (expr == "r12") { val = regs.r12; found = true; }
-		else if (expr == "r13") { val = regs.r13; found = true; }
-		else if (expr == "r14") { val = regs.r14; found = true; }
-		else if (expr == "r15") { val = regs.r15; found = true; }
-		else if (expr == "rip") { val = regs.rip; found = true; }
-		else if (expr == "rflags") { val = regs.rflags; found = true; }
-		else {
-			char* end_ptr = nullptr;
-			val = std::strtoull(expr.c_str(), &end_ptr, 16);
-			if (end_ptr && end_ptr != expr.c_str()) {
-				std::vector<uint8_t> buf;
-				if (driver_bridge::read_memory(val, 8, buf) && buf.size() >= 8) {
-					uint64_t deref;
-					std::memcpy(&deref, buf.data(), 8);
-					char hex[20];
-					snprintf(hex, sizeof(hex), "0x%016" PRIX64, deref);
-					w.value = hex;
-					w.type = "uint64";
-					w.valid = true;
-					continue;
-				}
-			}
-		}
-
-		if (found) {
-			char hex[20];
-			snprintf(hex, sizeof(hex), "0x%016" PRIX64, val);
-			w.value = hex;
-			w.type = "uint64";
-			w.valid = true;
-		} else {
-			w.value = "<error>";
+		if (w.expression.empty()) {
+			w.value.clear();
+			w.type.clear();
+			w.error = "empty expression";
 			w.valid = false;
+			continue;
 		}
+
+		auto er = expression_eval::evaluate(w.expression, ctx);
+		if (!er.ok) {
+			w.value.clear();
+			w.type.clear();
+			w.error = er.error;
+			w.valid = false;
+			continue;
+		}
+
+		char hex[20];
+		snprintf(hex, sizeof(hex), "0x%016" PRIX64, er.value);
+		w.value = hex;
+		w.type = "uint64";
+		w.error.clear();
+		w.valid = true;
 	}
 }
 
@@ -1134,30 +1443,36 @@ bp_hit_action_t handle_breakpoint_hit(uint64_t address) {
 	uint8_t     bp_original_byte = 0;
 	bool        bp_byte_written = false;
 	int         bp_index = -1;
+	uint64_t    bp_address_matched = address;
 
 	{
 		std::lock_guard<std::mutex> lk(st.bp_mutex);
-		for (size_t i = 0; i < st.breakpoints.size(); ++i) {
-			auto& bp = st.breakpoints[i];
-			if (bp.address != address) continue;
-			has_bp = true;
-			bp_index = static_cast<int>(i);
-			condition = bp.condition;
-			log_text = bp.log_text;
-			bp_auto_continue = bp.auto_continue;
-			bp_enabled = (bp.state != bp_state_t::disabled);
-			bp_is_internal = bp.is_internal;
-			bp_is_one_shot = (bp.state == bp_state_t::one_shot);
-			bp_original_byte = bp.original_byte;
-			bp_byte_written = bp.byte_written;
-			bp.hit_count += 1;
-			break;
+		const uint64_t probe_addrs[2] = { address, (address > 0) ? address - 1 : 0 };
+		for (int pa = 0; pa < 2 && !has_bp; ++pa) {
+			uint64_t pa_addr = probe_addrs[pa];
+			for (size_t i = 0; i < st.breakpoints.size(); ++i) {
+				auto& bp = st.breakpoints[i];
+				if (bp.address != pa_addr) continue;
+				has_bp = true;
+				bp_index = static_cast<int>(i);
+				bp_address_matched = pa_addr;
+				condition = bp.condition;
+				log_text = bp.log_text;
+				bp_auto_continue = bp.auto_continue;
+				bp_enabled = (bp.state != bp_state_t::disabled);
+				bp_is_internal = bp.is_internal;
+				bp_is_one_shot = (bp.state == bp_state_t::one_shot);
+				bp_original_byte = bp.original_byte;
+				bp_byte_written = bp.byte_written;
+				bp.hit_count += 1;
+				break;
+			}
 		}
 
 		for (auto it = st.internal_breakpoints.begin(); it != st.internal_breakpoints.end(); ) {
-			if (it->address == address && it->active) {
+			if ((it->address == address || it->address + 1 == address) && it->active) {
 				std::vector<uint8_t> restore{it->original_byte};
-				driver_bridge::write_memory(address, restore);
+				driver_bridge::write_memory(it->address, restore);
 				it = st.internal_breakpoints.erase(it);
 			} else {
 				++it;
@@ -1166,12 +1481,22 @@ bp_hit_action_t handle_breakpoint_hit(uint64_t address) {
 
 		if (has_bp && bp_byte_written) {
 			std::vector<uint8_t> restore{bp_original_byte};
-			driver_bridge::write_memory(address, restore);
+			driver_bridge::write_memory(bp_address_matched, restore);
 			st.breakpoints[static_cast<size_t>(bp_index)].byte_written = false;
 		}
 
 		if (has_bp && bp_is_one_shot) {
 			st.breakpoints.erase(st.breakpoints.begin() + bp_index);
+		}
+	}
+
+	if (has_bp && bp_address_matched == address - 1 && st.active_tid != 0) {
+		driver_bridge::thread_context_t adj{};
+		if (driver_bridge::get_thread_context(st.active_tid, adj)) {
+			if (adj.rip == address) {
+				adj.rip = bp_address_matched;
+				driver_bridge::set_thread_context(st.active_tid, adj, ~0ULL);
+			}
 		}
 	}
 

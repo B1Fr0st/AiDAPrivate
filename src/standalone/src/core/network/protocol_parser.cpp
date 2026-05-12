@@ -8,6 +8,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <climits>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 
@@ -76,9 +80,16 @@ static std::vector<uint8_t> decode_chunked(const uint8_t* data, size_t len) {
         if (eol == std::string::npos) break;
 
         std::string chunk_sz_str = make_string(data + pos, eol - pos);
-        unsigned long chunk_sz = 0;
-        try { chunk_sz = std::stoul(chunk_sz_str, nullptr, 16); }
-        catch (...) { break; }
+        size_t ext_pos = chunk_sz_str.find(';');
+        if (ext_pos != std::string::npos) chunk_sz_str.resize(ext_pos);
+        while (!chunk_sz_str.empty() && (chunk_sz_str.back() == ' ' || chunk_sz_str.back() == '\t'))
+            chunk_sz_str.pop_back();
+
+        char* sz_end = nullptr;
+        errno = 0;
+        unsigned long long chunk_sz_ull = strtoull(chunk_sz_str.c_str(), &sz_end, 16);
+        if (errno != 0 || sz_end == chunk_sz_str.c_str() || chunk_sz_ull > 0x40000000ULL) break;
+        size_t chunk_sz = static_cast<size_t>(chunk_sz_ull);
 
         pos = eol + 2;
         if (chunk_sz == 0) break;
@@ -135,7 +146,13 @@ http_request parse_http_request(const uint8_t* data, size_t len) {
         req.total_consumed = len;
     } else if (!cl_str.empty()) {
         size_t cl = 0;
-        try { cl = std::stoul(cl_str); } catch (...) { cl = 0; }
+        {
+            char* cl_end = nullptr;
+            errno = 0;
+            unsigned long long cl_ull = strtoull(cl_str.c_str(), &cl_end, 10);
+            if (errno == 0 && cl_end != cl_str.c_str() && cl_ull <= static_cast<unsigned long long>(SIZE_MAX))
+                cl = static_cast<size_t>(cl_ull);
+        }
         if (pos + cl <= len) {
             req.body.assign(data + pos, data + pos + cl);
             req.complete = true;
@@ -171,7 +188,13 @@ http_response parse_http_response(const uint8_t* data, size_t len) {
         ? status_line.substr(sp1 + 1, sp2 - sp1 - 1)
         : status_line.substr(sp1 + 1);
 
-    try { resp.status_code = std::stoi(code_str); } catch (...) { return resp; }
+    {
+        char* code_end = nullptr;
+        errno = 0;
+        long code_val = strtol(code_str.c_str(), &code_end, 10);
+        if (errno != 0 || code_end == code_str.c_str() || code_val < 100 || code_val > 999) return resp;
+        resp.status_code = static_cast<int>(code_val);
+    }
     if (sp2 != std::string::npos) resp.reason = status_line.substr(sp2 + 1);
 
     resp.valid = true;
@@ -192,7 +215,13 @@ http_response parse_http_response(const uint8_t* data, size_t len) {
         resp.total_consumed = len;
     } else if (!cl_str.empty()) {
         size_t cl = 0;
-        try { cl = std::stoul(cl_str); } catch (...) { cl = 0; }
+        {
+            char* cl_end = nullptr;
+            errno = 0;
+            unsigned long long cl_ull = strtoull(cl_str.c_str(), &cl_end, 10);
+            if (errno == 0 && cl_end != cl_str.c_str() && cl_ull <= static_cast<unsigned long long>(SIZE_MAX))
+                cl = static_cast<size_t>(cl_ull);
+        }
         if (pos + cl <= len) {
             resp.body.assign(data + pos, data + pos + cl);
             resp.complete = true;

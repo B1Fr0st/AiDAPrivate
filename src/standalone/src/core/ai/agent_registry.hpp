@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -92,7 +93,8 @@ namespace agent {
 		             const std::string& prompt_text,
 		             int max_steps,
 		             const std::string& parent_session_id,
-		             std::string& out_result);
+		             std::string& out_result,
+		             std::atomic<bool>* cancel_flag = nullptr);
 
 		const std::string& last_error();
 

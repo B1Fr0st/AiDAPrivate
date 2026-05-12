@@ -51,6 +51,9 @@ namespace mcp_standalone
         internal_only    = 1
     };
 
+    std::atomic<bool>* current_cancel_token() noexcept;
+    bool current_call_cancelled() noexcept;
+
     struct tool_def_t
     {
         std::string name;

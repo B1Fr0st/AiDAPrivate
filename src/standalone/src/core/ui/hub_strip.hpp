@@ -72,7 +72,9 @@ namespace aida::ui::hub_strip {
 	                          float width, const tab_t* tabs, int count,
 	                          state_t& st, float alpha)
 	{
-		if (count <= 0 || count > 32) return;
+		if (count <= 0) return;
+		constexpr int max_tabs = 32;
+		if (count > max_tabs) count = max_tabs;
 		const auto& t = aida::ui::resolved();
 		float dt = aida::ui::clock::dt();
 		st.halo_phase += dt;
@@ -99,8 +101,8 @@ namespace aida::ui::hub_strip {
 		if (!font) font = ImGui::GetFont();
 		const float font_size = 13.f;
 
-		float widths[32] = {};
-		float offsets[32] = {};
+		float widths[max_tabs] = {};
+		float offsets[max_tabs] = {};
 		float total = 0.f;
 		for (int i = 0; i < count; ++i) {
 			float tw = font->CalcTextSizeA(font_size, FLT_MAX, 0.f, tabs[i].label).x;

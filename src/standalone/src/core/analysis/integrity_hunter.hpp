@@ -195,9 +195,10 @@ inline std::vector<uint64_t> walk_callstack(uint64_t rbp, int max_depth)
 		if (top16 != 0x0000 && top16 != 0x7FFF) break;
 
 		stack.push_back(ret_addr);
-		current_rbp = saved_rbp;
 
-		if (saved_rbp <= current_rbp && saved_rbp != 0) break;
+		if (saved_rbp != 0 && saved_rbp <= current_rbp) break;
+
+		current_rbp = saved_rbp;
 	}
 
 	return stack;
@@ -393,23 +394,10 @@ inline bool neutralize(int node_index)
 			node.original_bytes.assign(code.data() + pos, code.data() + pos + ins.len);
 			node.patch_addr = scan_addr;
 
-			if (ins.len == 2) {
-				std::vector<uint8_t> patch(2);
-				patch[0] = 0xEB;
-				patch[1] = code[static_cast<size_t>(pos) + 1u];
-				driver_bridge::write_memory(scan_addr, patch);
-			} else if (ins.len == 6) {
-				std::vector<uint8_t> patch(6);
-				patch[0] = 0xE9;
-				int32_t orig_rel = 0;
-				std::memcpy(&orig_rel, code.data() + pos + 2, 4);
-				int32_t new_rel = orig_rel + 1;
-				std::memcpy(patch.data() + 1, &new_rel, 4);
-				patch[5] = 0x90;
-				driver_bridge::write_memory(scan_addr, patch);
-			} else {
-				return false;
-			}
+			if (ins.len < 2 || ins.len > 6) return false;
+
+			std::vector<uint8_t> patch(static_cast<size_t>(ins.len), 0x90);
+			if (!driver_bridge::write_memory(scan_addr, patch)) return false;
 
 			node.neutralized = true;
 			return true;

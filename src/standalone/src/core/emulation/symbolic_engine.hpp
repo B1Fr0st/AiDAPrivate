@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -170,7 +171,7 @@ inline void load_snapshot_into_context(triton::Context& ctx, const emulation::pr
 inline std::string ast_to_string(const triton::ast::SharedAbstractNode& node) {
 	if (!node) return "<null>";
 	std::ostringstream ss;
-	ss << node;
+	ss << node.get();
 	return ss.str();
 }
 
@@ -184,11 +185,11 @@ inline traced_instruction_t build_traced_insn(triton::Context& ctx, triton::arch
 	t.branch_taken = insn.isConditionTaken();
 
 	if (t.is_branch) {
-		auto operands = insn.operands;
+		const auto& operands = insn.operands;
 		if (!operands.empty()) {
-			auto& op = operands[0];
+			const auto& op = operands[0];
 			if (op.getType() == triton::arch::OP_IMM) {
-				t.branch_target = static_cast<uint64_t>(op.getImmediate().getValue());
+				t.branch_target = static_cast<uint64_t>(op.getConstImmediate().getValue());
 			}
 		}
 	}
@@ -210,35 +211,6 @@ inline traced_instruction_t build_traced_insn(triton::Context& ctx, triton::arch
 	}
 
 	return t;
-}
-
-inline bool is_dead_store(triton::Context& ctx, triton::arch::Instruction& insn,
-						  const std::unordered_set<triton::arch::register_e>& live_regs,
-						  const std::unordered_set<uint64_t>& live_mem) {
-	bool writes_live = false;
-	for (auto& [reg, _] : insn.getWrittenRegisters()) {
-		if (live_regs.count(ctx.getParentRegister(reg).getId())) {
-			writes_live = true;
-			break;
-		}
-	}
-
-	if (!writes_live) {
-		for (auto& [mem, _] : insn.getStoreAccess()) {
-			uint64_t addr = static_cast<uint64_t>(mem.getAddress());
-			for (uint64_t i = 0; i < mem.getSize(); ++i) {
-				if (live_mem.count(addr + i)) {
-					writes_live = true;
-					break;
-				}
-			}
-			if (writes_live) break;
-		}
-	}
-
-	if (insn.isBranch() || insn.isControlFlow()) return false;
-
-	return !writes_live;
 }
 
 }
@@ -297,7 +269,9 @@ inline symbolic_result_t execute_symbolic(
 
 		auto code_bytes = emulation::driver_read_bytes(pc, 16);
 		if (code_bytes.empty()) {
-			result.error = "Failed to read memory at 0x" + (std::ostringstream() << std::hex << pc).str();
+			std::ostringstream oss;
+			oss << "Failed to read memory at 0x" << std::hex << pc;
+			result.error = oss.str();
 			break;
 		}
 
@@ -306,7 +280,12 @@ inline symbolic_result_t execute_symbolic(
 		insn.setAddress(pc);
 
 		auto exc = ctx.processing(insn);
-		if (exc != triton::arch::NO_FAULT) break;
+		if (exc != triton::arch::NO_FAULT) {
+			std::ostringstream oss;
+			oss << "Triton fault at 0x" << std::hex << pc << " (code=" << std::dec << static_cast<int>(exc) << ")";
+			result.error = oss.str();
+			break;
+		}
 
 		auto traced = detail::build_traced_insn(ctx, insn);
 
@@ -334,11 +313,14 @@ inline symbolic_result_t execute_symbolic(
 			}
 		}
 
+		std::unordered_set<triton::arch::register_e> seen_parents_this_insn;
 		for (auto& [reg, _] : insn.getWrittenRegisters()) {
 			auto parent_id = ctx.getParentRegister(reg).getId();
+			if (!seen_parents_this_insn.insert(parent_id).second) continue;
 			auto ast = ctx.getRegisterAst(ctx.getRegister(parent_id));
+			if (!ast || !ast->isSymbolized()) continue;
 			auto simplified = ctx.simplify(ast, true);
-			if (simplified->getType() == triton::ast::BV_NODE) {
+			if (simplified && simplified->getType() == triton::ast::BV_NODE) {
 				uint64_t val = static_cast<uint64_t>(simplified->evaluate());
 				constant_fold_t cf;
 				cf.address = insn.getAddress();
@@ -434,7 +416,6 @@ inline slice_result_t slice_to_register(
 
 	result.total_instructions = count;
 
-	auto target_ast = ctx.getRegisterAst(ctx.getRegister(target_reg_id));
 	auto target_expr = ctx.getSymbolicRegister(ctx.getRegister(target_reg_id));
 	if (!target_expr) {
 		result.error = "Target register has no symbolic expression";
@@ -442,12 +423,6 @@ inline slice_result_t slice_to_register(
 	}
 
 	auto sliced = ctx.sliceExpressions(target_expr);
-	std::unordered_set<uint64_t> effective_addrs;
-	for (auto& [id, expr] : sliced) {
-		if (expr->getOriginMemory().getAddress() != 0) {
-			effective_addrs.insert(expr->getOriginMemory().getAddress());
-		}
-	}
 
 	for (auto& rec : records) {
 		bool is_effective = false;
@@ -471,8 +446,6 @@ inline slice_result_t slice_to_register(
 
 		if (is_effective) {
 			result.effective_instructions.push_back(rec.traced);
-		} else {
-			rec.traced.is_junk = true;
 		}
 	}
 
@@ -512,12 +485,10 @@ inline solve_result_t solve_for_path(
 
 	detail::load_snapshot_into_context(ctx, snapshot);
 
-	std::unordered_map<std::string, triton::engines::symbolic::SharedSymbolicVariable> sym_vars;
 	for (auto& reg_name : symbolic_regs) {
 		auto reg_id = detail::name_to_triton_reg(reg_name);
 		if (reg_id != triton::arch::ID_REG_INVALID) {
-			auto sv = ctx.symbolizeRegister(ctx.getRegister(reg_id), reg_name);
-			sym_vars[reg_name] = sv;
+			ctx.symbolizeRegister(ctx.getRegister(reg_id), reg_name);
 		}
 	}
 
@@ -575,7 +546,7 @@ inline solve_result_t solve_for_path(
 		}
 
 		result.satisfiable = false;
-		result.error = "Path is unsatisfiable";
+		result.success = true;
 		return result;
 	}
 
@@ -756,10 +727,13 @@ inline bool is_opaque_predicate(
 
 	auto start_addr = branch_addr;
 	if (context_instructions > 0) {
-		auto bytes = emulation::driver_read_bytes(branch_addr - context_instructions * 8, context_instructions * 8 + 16);
+		uint64_t back_window = static_cast<uint64_t>(context_instructions) * 8ull;
+		uint64_t scan_base = (branch_addr > back_window) ? (branch_addr - back_window) : 0ull;
+		uint64_t scan_size = (branch_addr - scan_base) + 16ull;
+		auto bytes = emulation::driver_read_bytes(scan_base, static_cast<std::size_t>(scan_size));
 		if (!bytes.empty()) {
 			auto insns = emulation::disassemble_range(bytes.data(), bytes.size(),
-				branch_addr - context_instructions * 8, context_instructions + 1);
+				scan_base, context_instructions + 1);
 			for (auto& insn : insns) {
 				if (insn.address <= branch_addr) {
 					start_addr = insn.address;

@@ -85,22 +85,34 @@ inline bool install_rdtsc_hook(uint64_t rdtsc_addr, uint32_t pid, stealth_sessio
 
 	session.allocated_regions.push_back(cave);
 
-	static uint64_t s_fake_tsc = 0x1000000000ULL;
+	uint64_t fake_tsc_storage = driver_bridge::allocate_memory(8);
+	if (fake_tsc_storage == 0) {
+		driver_bridge::free_memory(cave);
+		session.allocated_regions.pop_back();
+		return false;
+	}
+	session.allocated_regions.push_back(fake_tsc_storage);
+	uint64_t initial_tsc = 0x1000000000ULL;
+	std::vector<uint8_t> tsc_seed(8);
+	std::memcpy(tsc_seed.data(), &initial_tsc, 8);
+	driver_bridge::write_memory(fake_tsc_storage, tsc_seed);
 
 	uint8_t shellcode[] = {
-		0x50,
 		0x51,
-		0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x48, 0x8B, 0x00,
-		0x48, 0x05, 0xA0, 0x0F, 0x00, 0x00,
-		0x48, 0x89, 0xC2,
+		0x57,
+		0x48, 0xBF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x48, 0x8B, 0x0F,
+		0x48, 0x81, 0xC1, 0xA0, 0x0F, 0x00, 0x00,
+		0x48, 0x89, 0x0F,
+		0x89, 0xC8,
+		0x48, 0x89, 0xCA,
 		0x48, 0xC1, 0xEA, 0x20,
+		0x5F,
 		0x59,
-		0x58,
 		0xC3
 	};
 
-	std::memcpy(shellcode + 4, &s_fake_tsc, 8);
+	std::memcpy(shellcode + 4, &fake_tsc_storage, 8);
 
 	std::vector<uint8_t> shellcode_vec(shellcode, shellcode + sizeof(shellcode));
 	driver_bridge::write_memory(cave, shellcode_vec);

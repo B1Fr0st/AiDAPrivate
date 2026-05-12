@@ -143,9 +143,9 @@ struct state_t {
     std::condition_variable       work_cv;
 
 
-    std::mutex                 history_mutex;
-    std::deque<http_exchange>  history;
-    uint64_t                   next_id = 1;
+    std::mutex                                  history_mutex;
+    std::deque<std::shared_ptr<http_exchange>>  history;
+    std::atomic<uint64_t>                       next_id{1};
 
 
     std::mutex                                                           held_mutex;

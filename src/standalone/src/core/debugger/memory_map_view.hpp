@@ -90,12 +90,12 @@ inline ui_state_t g_ui;
 
 inline void refresh()
 {
-	if (g_ui.refreshing.load())
-		return;
-
 	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0)
 		return;
-	g_ui.refreshing.store(true);
+
+	bool expected = false;
+	if (!g_ui.refreshing.compare_exchange_strong(expected, true))
+		return;
 
 	work_queue::post([]() {
 		auto map = debugger_engine::get_memory_map();

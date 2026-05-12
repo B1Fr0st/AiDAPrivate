@@ -10,7 +10,10 @@
 
 #include <nghttp2/nghttp2.h>
 
+#include <cerrno>
+#include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -378,7 +381,12 @@ private:
         if (n == ":authority") { sd.authority  = v; return 0; }
         if (n == ":scheme")    { sd.scheme     = v; return 0; }
         if (n == ":status")    {
-            sd.status_code = std::stoi(v);
+            char* end = nullptr;
+            errno = 0;
+            long code = strtol(v.c_str(), &end, 10);
+            if (errno == 0 && end != v.c_str() && code >= 100 && code <= 999) {
+                sd.status_code = static_cast<int>(code);
+            }
             return 0;
         }
 

@@ -10,6 +10,7 @@
 #include <function/impl/AntiDumpKernel.h>
 #include <function/DmaCanary.h>
 #include <function/TargetingLatch.h>
+#include <function/DebugEvents.h>
 #include <hv_detect/hv_detect.h>
 
 __forceinline ULONG hash_build_key(ULONG key) {
@@ -108,6 +109,7 @@ namespace ioctl_codes {
     __forceinline ULONG DBGA() { return make(51); }
     __forceinline ULONG HVDT() { return make(52); }
     __forceinline ULONG RELA() { return make(53); }
+    __forceinline ULONG EVTS() { return make(54); }
 }
 
 namespace phase3_msg {
@@ -1214,6 +1216,37 @@ namespace dispatcher {
                     status = STATUS_ACCESS_DENIED;
                 }
                 bytes = sizeof(phase3_msg::latch_targeting_request_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::EVTS()) {
+            if (input_size >= sizeof(debug_events::DRAIN_DEBUG_EVENTS_REQUEST_T) &&
+                output_size >= sizeof(debug_events::DRAIN_DEBUG_EVENTS_REQUEST_T)) {
+                auto* req = reinterpret_cast<debug_events::PDRAIN_DEBUG_EVENTS_REQUEST_T>(buffer);
+                if (req->session_key != g_session_key) {
+                    status = STATUS_ACCESS_DENIED;
+                } else {
+                    ULONG cap = static_cast<ULONG>(
+                        sizeof(req->events) / sizeof(req->events[0]));
+                    ULONG limit = req->max_events;
+                    if (limit == 0 || limit > cap) limit = cap;
+
+                    ULONG dropped_window = 0;
+                    UINT64 total_dropped = 0;
+                    UINT64 total_published = 0;
+                    ULONG returned = debug_events::drain_into(
+                        req->events,
+                        limit,
+                        &dropped_window,
+                        reinterpret_cast<PULONG64>(&total_dropped),
+                        reinterpret_cast<PULONG64>(&total_published));
+
+                    req->returned_count = returned;
+                    req->dropped_since_last_drain = dropped_window;
+                    req->total_dropped = total_dropped;
+                    req->total_published = total_published;
+                    status = STATUS_SUCCESS;
+                }
+                bytes = sizeof(debug_events::DRAIN_DEBUG_EVENTS_REQUEST_T);
             } else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
         else {

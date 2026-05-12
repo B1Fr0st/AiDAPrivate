@@ -87,6 +87,7 @@ struct watch_entry_t {
 	std::string expression;
 	std::string value;
 	std::string type;
+	std::string error;
 	bool        valid = false;
 };
 
@@ -234,7 +235,8 @@ void shutdown();
 
 
 int  add_breakpoint(uint64_t address, bp_type_t type = bp_type_t::software,
-					const std::string& name = "", const std::string& condition = "");
+					const std::string& name = "", const std::string& condition = "",
+					int size = 1);
 bool remove_breakpoint(int index);
 bool toggle_breakpoint(int index);
 void clear_all_breakpoints();

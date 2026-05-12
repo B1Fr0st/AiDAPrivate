@@ -9,6 +9,7 @@
 #include <function/AntiDebug.h>
 #include <function/SentinelBridge.h>
 #include <function/ProcessGuard.h>
+#include <function/DebugEvents.h>
 #include <function/impl/driver/FileHandleScanner.h>
 
 namespace net_capture {
@@ -497,6 +498,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     NTSTATUS ob_status = process_guard::init();
     WW_LOG("DriverEntry: process_guard::init returned 0x%08lx", ob_status);
+
+    NTSTATUS dbe_status = debug_events::initialize();
+    WW_LOG("DriverEntry: debug_events::initialize returned 0x%08lx", dbe_status);
 
     WW_LOG("DriverEntry: scheduling stealth hide...");
     stealth::ScheduleDelayedHide(DriverObject);

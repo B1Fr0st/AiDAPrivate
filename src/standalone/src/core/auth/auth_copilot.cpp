@@ -66,13 +66,6 @@ namespace copilot {
 			return "https://github.com";
 		}
 
-		std::string api_host(const std::optional<std::string>& enterprise_url)
-		{
-			if (enterprise_url.has_value() && !enterprise_url->empty())
-				return std::string("https://copilot-api.") + normalize_domain(*enterprise_url);
-			return "https://api.githubcopilot.com";
-		}
-
 		std::string load_custom_client_id()
 		{
 			auth_info_t existing;
@@ -106,7 +99,9 @@ namespace copilot {
 
 			httplib::Headers headers = {
 				{ "Accept", "application/json" },
-				{ "User-Agent", "AiDA/1.0" },
+				{ "User-Agent", "GithubCopilot/1.155.0" },
+				{ "Editor-Version", "AiDA/1.0" },
+				{ "Editor-Plugin-Version", "copilot-aida/1.0.0" },
 			};
 			auto res = cli.Post(path.c_str(), headers, json_body, "application/json");
 			if (!res) {
@@ -136,7 +131,17 @@ namespace copilot {
 			const std::optional<std::string>& enterprise_url,
 			std::string& token_out, int64_t& expires_out, std::string& err_out)
 		{
-			httplib::Client cli("https://api.github.com");
+			std::string host;
+			std::string path;
+			if (enterprise_url.has_value() && !enterprise_url->empty()) {
+				host = std::string("https://") + normalize_domain(*enterprise_url);
+				path = "/api/v3/copilot_internal/v2/token";
+			} else {
+				host = "https://api.github.com";
+				path = "/copilot_internal/v2/token";
+			}
+
+			httplib::Client cli(host);
 			cli.set_connection_timeout(30);
 			cli.set_read_timeout(30);
 			cli.set_follow_location(true);
@@ -145,35 +150,36 @@ namespace copilot {
 			httplib::Headers headers = {
 				{ "Authorization", "Bearer " + long_lived_token },
 				{ "Accept", "application/json" },
-				{ "User-Agent", "AiDA/1.0" },
+				{ "User-Agent", "GithubCopilot/1.155.0" },
+				{ "Editor-Version", "AiDA/1.0" },
+				{ "Editor-Plugin-Version", "copilot-aida/1.0.0" },
 			};
-			auto res = cli.Get("/copilot_internal/v2/token", headers);
+			auto res = cli.Get(path.c_str(), headers);
 			if (!res) {
-				err_out = "copilot_internal/v2/token unreachable: "
+				err_out = host + path + " unreachable: "
 					+ httplib::to_string(res.error());
 				return false;
 			}
 			if (res->status < 200 || res->status >= 300) {
-				err_out = "copilot_internal/v2/token status="
+				err_out = host + path + " status="
 					+ std::to_string(res->status) + " body=" + res->body.substr(0, 256);
 				return false;
 			}
 			try {
 				const auto j = nlohmann::json::parse(res->body);
 				if (!j.is_object()) {
-					err_out = "copilot_internal/v2/token non-object response";
+					err_out = host + path + " non-object response";
 					return false;
 				}
 				token_out = j.value("token", std::string{});
 				expires_out = j.value("expires_at", static_cast<int64_t>(0));
 				if (token_out.empty()) {
-					err_out = "copilot_internal/v2/token missing token field";
+					err_out = host + path + " missing token field";
 					return false;
 				}
-				(void)enterprise_url;
 				return true;
 			} catch (...) {
-				err_out = "copilot_internal/v2/token json parse failed";
+				err_out = host + path + " json parse failed";
 				return false;
 			}
 		}
@@ -376,6 +382,31 @@ namespace copilot {
 		}
 		set_last_error({});
 		return true;
+	}
+
+	bool revoke_tokens(const std::string& access_token,
+		const std::string& refresh_token_value,
+		const std::string& client_id_override)
+	{
+		(void)access_token;
+		(void)refresh_token_value;
+		(void)client_id_override;
+		anti_tamper::webhook::write_log("auth.copilot",
+			"[aida.auth.copilot] revoke_tokens: GitHub does not support per-token "
+			"revocation without an OAuth app client secret; skipping server-side "
+			"revoke and proceeding with local clear");
+		set_last_error({});
+		return true;
+	}
+
+	bool revoke_token()
+	{
+		auth_info_t info;
+		if (!store::get("github-copilot", info) || info.kind != auth_kind_t::oauth) {
+			set_last_error("no github-copilot oauth credentials");
+			return false;
+		}
+		return revoke_tokens(info.access, info.refresh, info.custom_client_id);
 	}
 
 	const std::string& last_error()

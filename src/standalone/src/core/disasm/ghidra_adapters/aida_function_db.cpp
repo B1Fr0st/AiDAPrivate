@@ -118,20 +118,6 @@ std::string sanitize_symbol_name(const std::string& raw)
 	return out;
 }
 
-bool ends_with_ci(const std::string& s, const char* suffix)
-{
-	size_t n = std::strlen(suffix);
-	if (s.size() < n)
-		return false;
-	for (size_t i = 0; i < n; ++i) {
-		char a = static_cast<char>(std::tolower(static_cast<unsigned char>(s[s.size() - n + i])));
-		char b = static_cast<char>(std::tolower(static_cast<unsigned char>(suffix[i])));
-		if (a != b)
-			return false;
-	}
-	return true;
-}
-
 bool name_is_noreturn_default(const std::string& name)
 {
 	static const char* kNoreturn[] = {

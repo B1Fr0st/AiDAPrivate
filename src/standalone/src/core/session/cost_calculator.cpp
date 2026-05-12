@@ -85,13 +85,6 @@ bool aggregate_subagent_cost(const std::string& parent_session_id,
 		return true;
 	}
 
-	{
-		aida::session::session_info_t parent_info;
-		if (!aida::session::get(parent_session_id, parent_info)) return false;
-		parent_info.total_cost_usd += child_cost;
-		if (!aida::session::update(parent_info)) return false;
-	}
-
 	if (parent_message_id.empty()) return true;
 
 	std::vector<aida::session::message_t> parent_msgs;
@@ -129,7 +122,7 @@ bool aggregate_subagent_cost(const std::string& parent_session_id,
 		step->step_finish.tokens.cache_write+= child_usage.cache_write;
 	}
 
-	(void)aida::session::update_message(*target);
+	if (!aida::session::update_message(*target)) return false;
 	return true;
 }
 

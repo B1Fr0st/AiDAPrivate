@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -209,8 +210,8 @@ struct state_t {
     std::atomic<bool>             bw_thread_alive{false};
 
 
-    std::vector<repeater_entry_t> repeater_entries;
-    int                           repeater_selected = 0;
+    std::vector<std::shared_ptr<repeater_entry_t>> repeater_entries;
+    int                                            repeater_selected = 0;
     char                          rep_host[256] = {};
     int                           rep_port = 443;
     bool                          rep_use_tls = true;

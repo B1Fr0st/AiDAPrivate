@@ -182,12 +182,6 @@ protected:
 };
 
 
-std::unique_ptr<provider_t> build_provider(
-    const settings_sa_t& settings,
-    std::function<std::shared_ptr<httplib::Client>(const std::string&)> get_client,
-    std::atomic<bool>& cancelled);
-
-
 enum class api_format_t
 {
     anthropic,
@@ -387,19 +381,6 @@ private:
     };
     std::map<int, tool_state_t> _active;
 };
-
-
-nlohmann::json build_openai_format_tools(const std::vector<mcp_standalone::tool_def_t>& tools);
-nlohmann::json build_anthropic_format_tools(const std::vector<mcp_standalone::tool_def_t>& tools);
-nlohmann::json build_gemini_format_tools(const std::vector<mcp_standalone::tool_def_t>& tools);
-
-nlohmann::json convert_messages_openai(const nlohmann::json& messages, const std::string& system_prompt);
-nlohmann::json convert_messages_gemini(const nlohmann::json& messages);
-nlohmann::json merge_consecutive_roles(const nlohmann::json& messages);
-
-nlohmann::json make_tool_result_anthropic(const std::string& tool_use_id, const std::string& content, bool is_error = false);
-nlohmann::json make_tool_result_openai(const std::string& tool_call_id, const std::string& content);
-nlohmann::json make_tool_result_gemini(const std::string& function_name, const nlohmann::json& result_data);
 
 
 }

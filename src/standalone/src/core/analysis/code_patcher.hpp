@@ -191,48 +191,73 @@ inline std::vector<code_cave_t> find_code_caves(uint64_t module_base, uint32_t m
 	size_t remaining = module_size;
 	uint64_t addr = module_base;
 
+	uint64_t pending_run_start = 0;
+	size_t   pending_run_len = 0;
+	bool     pending_run_active = false;
+
 	while (remaining > 0) {
 		size_t read_size = std::min<size_t>(remaining, CHUNK_SIZE);
 		std::vector<uint8_t> chunk;
-		if (!driver_bridge::read_memory(addr, read_size, chunk))
+		if (!driver_bridge::read_memory(addr, read_size, chunk)) {
+			if (pending_run_active && pending_run_len >= min_cave_size) {
+				code_cave_t cave;
+				cave.address = pending_run_start;
+				cave.size = pending_run_len;
+				cave.module_name = mod_name;
+				caves.push_back(std::move(cave));
+			}
+			pending_run_active = false;
+			pending_run_len = 0;
 			break;
-		if (chunk.empty()) break;
-
-		size_t run_start = 0;
-		size_t run_len = 0;
-		bool in_run = false;
+		}
+		if (chunk.empty()) {
+			if (pending_run_active && pending_run_len >= min_cave_size) {
+				code_cave_t cave;
+				cave.address = pending_run_start;
+				cave.size = pending_run_len;
+				cave.module_name = mod_name;
+				caves.push_back(std::move(cave));
+			}
+			pending_run_active = false;
+			pending_run_len = 0;
+			break;
+		}
 
 		for (size_t i = 0; i < chunk.size(); ++i) {
 			bool is_filler = (chunk[i] == 0x00 || chunk[i] == 0xCC);
 			if (is_filler) {
-				if (!in_run) {
-					run_start = i;
-					run_len = 0;
-					in_run = true;
+				if (!pending_run_active) {
+					pending_run_start = addr + i;
+					pending_run_len = 0;
+					pending_run_active = true;
 				}
-				++run_len;
+				++pending_run_len;
 			} else {
-				if (in_run && run_len >= min_cave_size) {
+				if (pending_run_active && pending_run_len >= min_cave_size) {
 					code_cave_t cave;
-					cave.address = addr + run_start;
-					cave.size = run_len;
+					cave.address = pending_run_start;
+					cave.size = pending_run_len;
 					cave.module_name = mod_name;
 					caves.push_back(std::move(cave));
 				}
-				in_run = false;
-				run_len = 0;
+				pending_run_active = false;
+				pending_run_len = 0;
 			}
-		}
-		if (in_run && run_len >= min_cave_size) {
-			code_cave_t cave;
-			cave.address = addr + run_start;
-			cave.size = run_len;
-			cave.module_name = mod_name;
-			caves.push_back(std::move(cave));
 		}
 
 		addr += chunk.size();
-		remaining -= chunk.size();
+		if (chunk.size() >= remaining)
+			remaining = 0;
+		else
+			remaining -= chunk.size();
+	}
+
+	if (pending_run_active && pending_run_len >= min_cave_size) {
+		code_cave_t cave;
+		cave.address = pending_run_start;
+		cave.size = pending_run_len;
+		cave.module_name = mod_name;
+		caves.push_back(std::move(cave));
 	}
 
 	return caves;

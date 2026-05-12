@@ -169,6 +169,7 @@
     <ClInclude Include="src\function\SentinelBridge.h" />
     <ClInclude Include="src\function\Struct.h" />
     <ClInclude Include="src\function\DmaCanary.h" />
+    <ClInclude Include="src\function\DebugEvents.h" />
     <ClInclude Include="src\imports\Defs.h" />
     <ClInclude Include="src\imports\Strings.h" />
     <ClInclude Include="src\hv_detect\includes.h" />

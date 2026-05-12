@@ -547,4 +547,35 @@ namespace driver_bridge
         }
     };
     bool run_kernel_hv_detection(hv_kernel_detect_result_t& result);
+
+    enum class debug_event_type_e : uint32_t {
+        invalid         = 0,
+        image_loaded    = 1,
+        process_created = 2,
+        process_exited  = 3,
+    };
+
+    struct debug_event_t {
+        debug_event_type_e type = debug_event_type_e::invalid;
+        uint32_t           process_id = 0;
+        uint32_t           thread_id = 0;
+        uint32_t           flags = 0;
+        uint64_t           timestamp = 0;
+        uint64_t           image_base = 0;
+        uint64_t           image_size = 0;
+        std::wstring       image_path_wide;
+        std::string        image_path;
+        std::string        image_name;
+    };
+
+    struct debug_event_stats_t {
+        uint32_t returned_count = 0;
+        uint32_t dropped_since_last_drain = 0;
+        uint64_t total_dropped = 0;
+        uint64_t total_published = 0;
+    };
+
+    bool drain_debug_events(std::vector<debug_event_t>& out,
+                            size_t max_events = 64,
+                            debug_event_stats_t* out_stats = nullptr);
 }

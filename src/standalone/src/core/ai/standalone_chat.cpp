@@ -14,6 +14,7 @@
 #include "agent_picker_view.hpp"
 #include "binary_map.hpp"
 #include "tool_repetition.hpp"
+#include "standalone_tools_fwd.hpp"
 #include "cost_calculator.hpp"
 #include "compaction.hpp"
 #include "command_registry.hpp"
@@ -163,6 +164,114 @@ const std::string& tool_approval_last_deny_reason()
     return t_tool_approval_deny_reason;
 }
 
+
+std::string extract_tool_path_argument(const std::string& tool_name, const json& arguments)
+{
+    if (!arguments.is_object()) return std::string{};
+
+    static const char* const path_keys[] = {
+        "path", "file_path", "file", "filepath",
+        "input_file", "target", "target_file", "directory",
+        "destination", "output_path", "src", "dst"
+    };
+    for (const char* k : path_keys) {
+        if (arguments.contains(k) && arguments[k].is_string()) {
+            std::string v = arguments[k].get<std::string>();
+            if (!v.empty()) return v;
+        }
+    }
+    (void)tool_name;
+    return std::string{};
+}
+
+
+std::string normalize_path_for_compare(const std::string& raw, bool prepend_workspace)
+{
+    if (raw.empty()) return raw;
+    std::string p = raw;
+    for (char& c : p) { if (c == '/') c = '\\'; }
+    if (prepend_workspace &&
+        !file_browser::current_dir.empty() && !p.empty() && p[0] != '\\' &&
+        (p.size() < 2 || p[1] != ':')) {
+        p = file_browser::current_dir + "\\" + p;
+    }
+    std::error_code ec;
+    auto canonical = std::filesystem::weakly_canonical(std::filesystem::path(p), ec);
+    if (ec) return p;
+    return canonical.string();
+}
+
+
+bool tool_path_is_outside_workspace(const std::string& raw_path)
+{
+    if (raw_path.empty()) return false;
+    if (file_browser::current_dir.empty()) return false;
+
+    std::string canonical = normalize_path_for_compare(raw_path, true);
+    if (canonical.empty()) return false;
+
+    std::error_code ec;
+    auto ws = std::filesystem::weakly_canonical(
+        std::filesystem::path(file_browser::current_dir), ec);
+    if (ec) return true;
+
+    std::string ws_str = ws.string();
+    auto to_lower = [](std::string& s) {
+        std::transform(s.begin(), s.end(), s.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    };
+    to_lower(ws_str);
+    to_lower(canonical);
+    return canonical.find(ws_str) != 0;
+}
+
+
+bool tool_path_is_protected(const std::string& raw_path)
+{
+    if (raw_path.empty()) return false;
+
+    std::string lowered = raw_path;
+    for (char& c : lowered) {
+        if (c == '/') c = '\\';
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+
+    static const char* const protected_substrings[] = {
+        "\\.git\\",
+        "\\.aida\\",
+        "\\.claude\\",
+        "\\.agents\\",
+        "\\node_modules\\",
+        "\\.ssh\\",
+        "\\appdata\\roaming\\aida",
+        "\\system32\\",
+        "\\syswow64\\",
+        "\\program files",
+        "\\windows\\",
+        "id_rsa",
+        "id_ed25519",
+        "aida_debug.log"
+    };
+
+    for (const char* s : protected_substrings) {
+        if (lowered.find(s) != std::string::npos)
+            return true;
+    }
+
+    auto ends_with = [](const std::string& s, const std::string& suf) {
+        if (s.size() < suf.size()) return false;
+        return s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
+    };
+    if (ends_with(lowered, "\\.env") || ends_with(lowered, ".env") ||
+        ends_with(lowered, ".envrc") ||
+        ends_with(lowered, ".pem")  || ends_with(lowered, ".pfx") ||
+        ends_with(lowered, ".key")  || ends_with(lowered, ".p12")) {
+        return true;
+    }
+
+    return false;
+}
+
 bool request_tool_approval(const std::string& name, const json& arguments)
 {
     t_tool_approval_deny_reason.clear();
@@ -211,7 +320,11 @@ bool request_tool_approval(const std::string& name, const json& arguments)
         while (std::getline(ss, tok, ',')) {
             while (!tok.empty() && tok.front() == ' ') tok.erase(tok.begin());
             while (!tok.empty() && tok.back() == ' ') tok.pop_back();
-            if (tok == name) return false;
+            if (tok == name) {
+                t_tool_approval_deny_reason =
+                    "Error: tool '" + name + "' is in the always-deny list.";
+                return false;
+            }
         }
     }
 
@@ -231,24 +344,36 @@ bool request_tool_approval(const std::string& name, const json& arguments)
         aa_settings.allowed_commands = g_sa_settings.auto_approve_allowed_commands;
 
 
-        if (arguments.contains("path")) {
+        if (arguments.contains("path") && arguments["path"].is_string()) {
             std::string path = arguments["path"].get<std::string>();
             auto ignore_patterns = auto_approval::load_aidaignore(g_sa_settings.aidaignore_path);
-            if (auto_approval::matches_aidaignore(path, ignore_patterns))
+            if (auto_approval::matches_aidaignore(path, ignore_patterns)) {
+                t_tool_approval_deny_reason =
+                    "Error: path '" + path + "' is excluded by .aidaignore.";
                 return false;
+            }
         }
 
 
         std::string command;
-        if (name == "execute_command" && arguments.contains("command"))
+        if (name == "execute_command" && arguments.contains("command") &&
+            arguments["command"].is_string())
             command = arguments["command"].get<std::string>();
 
+        const std::string arg_path = extract_tool_path_argument(name, arguments);
+        const bool file_outside_workspace = tool_path_is_outside_workspace(arg_path);
+        const bool file_is_protected      = tool_path_is_protected(arg_path);
+
         auto decision = auto_approval::should_auto_approve(
-                name, aa_settings, s_approval_counters, command);
+                name, aa_settings, s_approval_counters, command,
+                file_outside_workspace, file_is_protected);
         if (decision == auto_approval::approval_decision_t::approve)
             return true;
-        if (decision == auto_approval::approval_decision_t::deny)
+        if (decision == auto_approval::approval_decision_t::deny) {
+            t_tool_approval_deny_reason =
+                "Error: auto-approval policy denied tool '" + name + "'.";
             return false;
+        }
     }
 
 
@@ -267,6 +392,39 @@ bool request_tool_approval(const std::string& name, const json& arguments)
     s_tool_approval.pending = false;
     if (s_cancel.load()) return false;
     return s_tool_approval.approved;
+}
+
+
+enum class tool_repetition_decision_t
+{
+    none,
+    warn,
+    force_ask
+};
+
+tool_repetition_decision_t note_tool_repetition(
+    const std::string& tool_name,
+    const json& arguments,
+    std::string& out_message)
+{
+    out_message.clear();
+
+    std::string args_json;
+    try { args_json = arguments.dump(); }
+    catch (...) { args_json.clear(); }
+
+    auto& detector = workflow_tools::get_repetition_detector();
+    detector.record(tool_name, args_json);
+
+    if (detector.should_force_ask()) {
+        out_message = detector.warning_message();
+        return tool_repetition_decision_t::force_ask;
+    }
+    if (detector.should_warn()) {
+        out_message = detector.warning_message();
+        return tool_repetition_decision_t::warn;
+    }
+    return tool_repetition_decision_t::none;
 }
 
 
@@ -639,6 +797,8 @@ void run_agentic(std::string user_message,
 
     s_approval_counters = auto_approval::task_counters_t{};
 
+    workflow_tools::get_repetition_detector().reset();
+
     {
         uint64_t gate = standalone_license::inline_gate_check(
             standalone_license::gate_chat_pre_agentic);
@@ -812,6 +972,20 @@ void run_agentic(std::string user_message,
                 }
 
                 std::string result = execute_tool(tc.name, tc.arguments);
+
+                std::string repetition_msg;
+                const auto rep_decision =
+                    note_tool_repetition(tc.name, tc.arguments, repetition_msg);
+                if (rep_decision != tool_repetition_decision_t::none && !repetition_msg.empty()) {
+                    post_update(ai_update_t::THINKING, repetition_msg);
+                    output_log::push(bottom_tab_t::output,
+                        "[ai] repetition detector: " + repetition_msg);
+                    if (rep_decision == tool_repetition_decision_t::force_ask &&
+                        tc.name != "ask_followup_question") {
+                        result += "\n\n[repetition guard] " + repetition_msg;
+                    }
+                }
+
                 tool_results += "\n<tool_result name=\"" + tc.name + "\">\n"
                               + result
                               + "\n</tool_result>\n";
@@ -1106,7 +1280,7 @@ void run_agentic(std::string user_message,
             }
         }
 
-        if (!gen.thinking.empty())
+        if (!gen.thinking.empty() && !gen.thinking_streamed)
             post_update(ai_update_t::THINKING, gen.thinking);
 
 
@@ -1170,6 +1344,20 @@ void run_agentic(std::string user_message,
             }
 
             std::string result = execute_tool(tc.name, tc.arguments);
+
+            std::string repetition_msg;
+            const auto rep_decision =
+                note_tool_repetition(tc.name, tc.arguments, repetition_msg);
+            if (rep_decision != tool_repetition_decision_t::none && !repetition_msg.empty()) {
+                post_update(ai_update_t::THINKING, repetition_msg);
+                output_log::push(bottom_tab_t::output,
+                    "[ai] repetition detector: " + repetition_msg);
+                if (rep_decision == tool_repetition_decision_t::force_ask &&
+                    tc.name != "ask_followup_question") {
+                    result += "\n\n[repetition guard] " + repetition_msg;
+                }
+            }
+
             bool is_err = (result.size() >= 6 && result.substr(0, 6) == "Error:");
             tool_result_content.push_back(
                 standalone_ai_client_t::make_tool_result_block(tc.id, result, is_err));
@@ -1649,10 +1837,28 @@ void tick_ai_chat()
             size_t s = 0;
             while (s < rest.size() && (rest[s] == ' ' || rest[s] == '\t')) ++s;
             while (s < rest.size()) {
-                size_t e = s;
-                while (e < rest.size() && rest[e] != ' ' && rest[e] != '\t') ++e;
-                cmd_args.push_back(rest.substr(s, e - s));
-                s = e;
+                if (rest[s] == '"' || rest[s] == '\'') {
+                    const char quote = rest[s];
+                    ++s;
+                    std::string tok;
+                    while (s < rest.size() && rest[s] != quote) {
+                        if (rest[s] == '\\' && s + 1 < rest.size() &&
+                            (rest[s + 1] == quote || rest[s + 1] == '\\')) {
+                            tok.push_back(rest[s + 1]);
+                            s += 2;
+                        } else {
+                            tok.push_back(rest[s]);
+                            ++s;
+                        }
+                    }
+                    if (s < rest.size() && rest[s] == quote) ++s;
+                    cmd_args.push_back(std::move(tok));
+                } else {
+                    size_t e = s;
+                    while (e < rest.size() && rest[e] != ' ' && rest[e] != '\t') ++e;
+                    cmd_args.push_back(rest.substr(s, e - s));
+                    s = e;
+                }
                 while (s < rest.size() && (rest[s] == ' ' || rest[s] == '\t')) ++s;
             }
         }
@@ -1732,6 +1938,21 @@ void tick_ai_chat()
         auto& m = g_chat_messages[i];
         if (!m.text.empty())
             history.emplace_back(m.is_user ? "User" : "Assistant", m.text);
+    }
+
+    {
+        std::string sid_check = get_chat_session_id_locked();
+        if (sid_check.empty() && conversations::current_id.empty()) {
+            aida::session::session_info_t info;
+            if (aida::session::create(info, std::string{}, std::string{}, std::string{})) {
+                conversations::current_id = info.id;
+                chat_bind_session(info.id);
+            }
+        } else if (sid_check.empty() && !conversations::current_id.empty()) {
+            chat_bind_session(conversations::current_id);
+        } else if (!sid_check.empty() && conversations::current_id.empty()) {
+            conversations::current_id = sid_check;
+        }
     }
 
     {
@@ -1852,6 +2073,12 @@ void chat_request_cancel()
 }
 
 
+std::atomic<bool>* chat_cancel_flag()
+{
+    return &s_cancel;
+}
+
+
 void chat_bind_session(const std::string& session_id)
 {
     set_chat_session_id_locked(session_id);
@@ -1867,6 +2094,25 @@ std::string chat_active_session()
 void chat_record_assistant_message_id(const std::string& message_id)
 {
     set_chat_last_assistant_message_id_locked(message_id);
+}
+
+
+std::string start_new_conversation()
+{
+    aida::session::session_info_t info;
+    std::string new_id;
+    if (aida::session::create(info, std::string{}, std::string{}, std::string{}))
+        new_id = info.id;
+
+    conversations::current_id = new_id;
+    chat_bind_session(new_id);
+    g_chat_messages.clear();
+    g_chat_buf[0] = '\0';
+    g_chat_scroll_to_bottom = true;
+
+    workflow_tools::get_repetition_detector().reset();
+
+    return new_id;
 }
 
 

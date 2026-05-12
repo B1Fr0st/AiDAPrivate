@@ -200,15 +200,17 @@ Delivered by the license server after activation, written to disk + manual-mappe
 
 `arc_init`, `arc_set_key_seed`, `arc_validate_tool_exec`, `arc_heartbeat`, `arc_heartbeat_ex`, `arc_unseal_feature` / `arc_unseal_feature_blocking`, `arc_get_comm_bridge`, `arc_download_page`, `arc_bind_driver_device`, `arc_cleanup`.
 
-Page manager (`core/runtime/arc_page_manager.hpp`): 4 KiB pages, **50 ms plaintext window** (page is re-sealed after 50 ms idle), function-token TTL 10 s, epoch rotation every 5 min. Page key derivation:
+Page manager (`core/runtime/arc_page_manager.hpp`): 4 KiB pages, **50 ms plaintext window** (page is re-sealed after 50 ms idle), function-token TTL 10 s, epoch rotation every 5 min. Page key derivation (server is ground truth, `server/crypto/arc-encrypt.js`):
 
 ```
-HKDF-SHA256(
-  ikm  = license_key | session_token | hwid,
-  salt = page_index_bytes[4],
-  info = "aida/streaming-page/v1" || epoch_nonce[32]
-) → 32-byte AES-256-GCM key
+keySeed = HMAC-SHA256(MASTER_SECRET, sessionToken | "|" | hwid | "|" | issuedAt)
+pageKey = HMAC-SHA256(keySeed, "page|" | pageIndex | "|" | sessionToken | "|" | hwid
+                                | "|" | issuedAt | "|" | proofToken | "|" | prevChainTag)
+ciphertext = AES-256-GCM(pageKey, plaintext, iv = random_12_bytes)
+nextChainTag = HMAC-SHA256(prevChainTagBytes_or_zero32, authTag || "chain")
 ```
+
+`keySeed` is delivered to the client via `arc_set_key_seed` after activation. `proofToken` is the bootstrap proof (`hex(SHA-256(sessionToken || "bootstrap"))`) for the paged download path; the server stores `last_chain_tag` per session and uses `''` as `prevChainTag` for page 0 (don't reuse the persisted value for index 0 retries). The client mirrors the same in `core/arc/arc.cpp::derive_page_key` + `update_chain_tag_from_auth_tag`, and in `core/runtime/standalone_license.cpp::derive_arc_page_key` + `derive_arc_chain_tag` for the canonical `/api/download/arc/pages/bulk` and `/api/download/pages/:idx` paths.
 
 `arc_build_seed.hpp` is generated at configure time from a `BCryptGenRandom` seed (PowerShell), with a constant commitment that is checked at runtime to detect tampering. Per-tool subkeys: `arc_build_subkey_bytes(domain)` → `HKDF-SHA512(seed, info=domain) → 64 bytes`.
 

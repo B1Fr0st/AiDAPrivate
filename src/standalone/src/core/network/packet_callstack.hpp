@@ -125,7 +125,7 @@ inline void capture_for_packet(uint64_t packet_idx, uint64_t timestamp,
 	int frame_count = 0;
 
 	while (rbp != 0 && frame_count < max_frames) {
-		if (rbp < 0x10000 || rbp == 0xCCCCCCCCCCCCCCCC)
+		if (rbp < 0x10000 || rbp == 0xCCCCCCCCCCCCCCCCULL)
 			break;
 
 		std::vector<uint8_t> buf;

@@ -564,7 +564,16 @@ float chat_render::render_code_block(
     ImVec2 cmin(hmax.x - copy_btn_w - 10.f, hmin.y + (header_h - copy_btn_h) * 0.5f);
     ImVec2 cmax(cmin.x + copy_btn_w, cmin.y + copy_btn_h);
 
-    ImGui::PushID((int)((intptr_t)code.data() & 0x7FFFFFFF));
+    uint32_t cb_hash = 2166136261u;
+    cb_hash ^= (uint32_t)code.size(); cb_hash *= 16777619u;
+    size_t cb_hash_n = code.size() < 64 ? code.size() : 64;
+    for (size_t hi = 0; hi < cb_hash_n; ++hi) {
+        cb_hash ^= (uint8_t)code[hi];
+        cb_hash *= 16777619u;
+    }
+    cb_hash ^= (uint32_t)language.size(); cb_hash *= 16777619u;
+    for (char lc : language) { cb_hash ^= (uint8_t)lc; cb_hash *= 16777619u; }
+    ImGui::PushID((int)(cb_hash & 0x7FFFFFFF));
     ImGuiID copy_id = ImGui::GetID("##cb_copy");
     ImGui::SetCursorScreenPos(cmin);
     ImGui::InvisibleButton("##cb_copy_btn", ImVec2(copy_btn_w, copy_btn_h));
@@ -878,10 +887,6 @@ static float render_tool_call_card(
     float header_h = 30.f;
     float body_pad = 12.f;
 
-    auto json_def = syntax::lang_json();
-    std::vector<syntax::token_t> jt;
-    syntax::tokenize(payload, json_def, jt);
-
     ImFont* code_font = aida::ui::fonts::code() ? aida::ui::fonts::code() : ImGui::GetFont();
     float code_fs = code_font->FontSize > 0.f ? code_font->FontSize : ImGui::GetFontSize();
     int line_count = 1;
@@ -896,6 +901,13 @@ static float render_tool_call_card(
     current_h = aida::motion::spring_step(current_h, target_h, current_v,
                                            aida::motion::spring::balanced, dt);
     storage->SetFloat(anim_id, current_h);
+
+    std::vector<syntax::token_t> jt;
+    bool body_visible = current_h > header_h + 4.f;
+    if (body_visible) {
+        auto json_def = syntax::lang_json();
+        syntax::tokenize(payload, json_def, jt);
+    }
     storage->SetFloat(vel_id, current_v);
 
     ImVec2 a = origin;

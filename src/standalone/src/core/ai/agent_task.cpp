@@ -101,7 +101,8 @@ namespace task {
 	             const std::string& prompt_text,
 	             int max_steps,
 	             const std::string& parent_session_id,
-	             std::string& out_result)
+	             std::string& out_result,
+	             std::atomic<bool>* cancel_flag)
 	{
 		out_result.clear();
 
@@ -118,6 +119,13 @@ namespace task {
 		std::string thread_result;
 		std::string thread_error;
 		std::string sub_session_id;
+		bool         aborted = false;
+		std::atomic<standalone_ai_client_t*> active_client_ptr{nullptr};
+
+		auto is_cancelled = [cancel_flag]() -> bool {
+			return cancel_flag != nullptr &&
+			       cancel_flag->load(std::memory_order_acquire);
+		};
 
 		std::thread worker([&]() {
 			std::unique_ptr<standalone_ai_client_t> local_client;
@@ -134,6 +142,8 @@ namespace task {
 				done.store(true, std::memory_order_release);
 				return;
 			}
+
+			active_client_ptr.store(local_client.get(), std::memory_order_release);
 
 			if (!local_client || !local_client->is_available()) {
 				thread_error = "subagent AI client is not available";
@@ -190,6 +200,10 @@ namespace task {
 
 				std::string final_text;
 				for (int turn = 0; turn < hard_steps; ++turn) {
+					if (is_cancelled()) {
+						aborted = true;
+						break;
+					}
 					ai_generation_result_t gen;
 					try {
 						gen = local_client->generate_with_tools(messages, system_prompt, allowed_tools, nullptr);
@@ -198,6 +212,11 @@ namespace task {
 						break;
 					} catch (...) {
 						thread_error = "Unknown exception in subagent loop.";
+						break;
+					}
+
+					if (is_cancelled()) {
+						aborted = true;
 						break;
 					}
 
@@ -280,6 +299,10 @@ namespace task {
 
 					nlohmann::json tool_result_content = nlohmann::json::array();
 					for (const auto& tc : gen.tool_calls) {
+						if (is_cancelled()) {
+							aborted = true;
+							break;
+						}
 						std::string r;
 						bool tool_is_error = false;
 						if (!aida::agent::tool_allowed(agent, tc.name)) {
@@ -302,10 +325,17 @@ namespace task {
 						tool_result_content.push_back(
 							standalone_ai_client_t::make_tool_result_block(tc.id, r, tool_is_error));
 					}
+					if (aborted) break;
 					messages.push_back({{"role", "user"}, {"content", tool_result_content}});
 				}
 
-				if (!thread_error.empty()) {
+				if (aborted) {
+					thread_result = std::string("(subagent ") + agent.name +
+					                 " aborted: cancellation requested)";
+					if (final_text.empty()) {
+						thread_result += "\naborted: true";
+					}
+				} else if (!thread_error.empty()) {
 					thread_result = std::string("Error: ") + thread_error;
 				} else {
 					thread_result = final_text.empty()
@@ -319,8 +349,23 @@ namespace task {
 				thread_error = "Unknown exception in subagent thread";
 				thread_result = "Error: " + thread_error;
 			}
+			active_client_ptr.store(nullptr, std::memory_order_release);
 			done.store(true, std::memory_order_release);
 		});
+
+		if (cancel_flag != nullptr) {
+			bool propagated = false;
+			while (!done.load(std::memory_order_acquire)) {
+				if (!propagated &&
+				    cancel_flag->load(std::memory_order_acquire)) {
+					standalone_ai_client_t* cli =
+						active_client_ptr.load(std::memory_order_acquire);
+					if (cli != nullptr) cli->cancel();
+					propagated = true;
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			}
+		}
 
 		worker.join();
 
@@ -330,6 +375,10 @@ namespace task {
 		}
 
 		out_result = thread_result;
+		if (aborted) {
+			set_task_error("subagent cancelled");
+			return false;
+		}
 		if (!thread_error.empty()) {
 			set_task_error(thread_error);
 			return false;

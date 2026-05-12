@@ -149,6 +149,8 @@ namespace aida::motion {
 	                                     float& velocity, float halflife,
 	                                     float dt) {
 		if (halflife <= 0.0001f) { current = target; velocity = 0.f; return current; }
+		if (dt < 0.f) dt = 0.f;
+		if (dt > 0.10f) dt = 0.10f;
 		float ln2 = 0.693147f;
 		float lambda = ln2 / halflife;
 		float dx = current - target;
@@ -161,6 +163,7 @@ namespace aida::motion {
 
 	inline float spring_step(float current, float target, float& velocity,
 	                          spring_t s, float dt) {
+		if (dt < 0.f) dt = 0.f;
 		if (dt > 0.04f) dt = 0.04f;
 		float ks = s.stiffness;
 		float kd = s.damping;

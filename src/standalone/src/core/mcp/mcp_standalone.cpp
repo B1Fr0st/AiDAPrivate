@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <memory>
 
 namespace mcp_standalone
 {
@@ -197,6 +198,85 @@ __declspec(noinline) static DWORD seh_sse_provider_step(
     }
 }
 
+namespace
+{
+    std::mutex                                                       g_in_flight_mutex;
+    std::map<std::string, std::shared_ptr<std::atomic<bool>>>        g_in_flight_cancels;
+    thread_local std::atomic<bool>*                                  tls_current_cancel_token = nullptr;
+
+    std::string cancel_key_for_id(const json& id)
+    {
+        if (id.is_null())              return std::string{"\1null"};
+        if (id.is_string())            return std::string{"s:"} + id.get<std::string>();
+        if (id.is_number_integer())    return std::string{"i:"} + std::to_string(id.get<long long>());
+        if (id.is_number_unsigned())   return std::string{"u:"} + std::to_string(id.get<unsigned long long>());
+        if (id.is_number_float())      return std::string{"f:"} + std::to_string(id.get<double>());
+        return std::string{"j:"} + id.dump();
+    }
+
+    std::shared_ptr<std::atomic<bool>> register_in_flight_call(const json& id)
+    {
+        auto token = std::make_shared<std::atomic<bool>>(false);
+        std::lock_guard<std::mutex> lk(g_in_flight_mutex);
+        g_in_flight_cancels[cancel_key_for_id(id)] = token;
+        return token;
+    }
+
+    void unregister_in_flight_call(const json& id)
+    {
+        std::lock_guard<std::mutex> lk(g_in_flight_mutex);
+        g_in_flight_cancels.erase(cancel_key_for_id(id));
+    }
+
+    bool signal_in_flight_cancel(const json& id)
+    {
+        std::shared_ptr<std::atomic<bool>> token;
+        {
+            std::lock_guard<std::mutex> lk(g_in_flight_mutex);
+            auto it = g_in_flight_cancels.find(cancel_key_for_id(id));
+            if (it == g_in_flight_cancels.end()) return false;
+            token = it->second;
+        }
+        if (token) token->store(true, std::memory_order_release);
+        return true;
+    }
+
+    struct cancel_scope_t
+    {
+        json                              id;
+        std::shared_ptr<std::atomic<bool>> token;
+        std::atomic<bool>*                previous = nullptr;
+
+        cancel_scope_t(const json& request_id)
+            : id(request_id)
+        {
+            token = register_in_flight_call(id);
+            previous = tls_current_cancel_token;
+            tls_current_cancel_token = token.get();
+        }
+
+        cancel_scope_t(const cancel_scope_t&) = delete;
+        cancel_scope_t& operator=(const cancel_scope_t&) = delete;
+
+        ~cancel_scope_t()
+        {
+            tls_current_cancel_token = previous;
+            unregister_in_flight_call(id);
+        }
+    };
+}
+
+std::atomic<bool>* current_cancel_token() noexcept
+{
+    return tls_current_cancel_token;
+}
+
+bool current_call_cancelled() noexcept
+{
+    std::atomic<bool>* tok = tls_current_cancel_token;
+    return tok && tok->load(std::memory_order_acquire);
+}
+
 server_t::server_t()  = default;
 server_t::~server_t() { stop(); }
 
@@ -339,6 +419,7 @@ json server_t::handle_tools_call(const json& id, const json& params)
                    ? params["arguments"] : json::object();
 
     const tool_def_t* found = nullptr;
+    std::function<tool_result_t(const json&)> handler_copy;
     {
         std::lock_guard<std::mutex> lk(_tools_mtx);
         for (const auto& t : _tools) {
@@ -347,6 +428,7 @@ json server_t::handle_tools_call(const json& id, const json& params)
                     return make_error(id, JSONRPC_INVALID_PARAMS, "Unknown tool: " + tool_name);
                 }
                 found = &t;
+                handler_copy = t.handler;
                 break;
             }
         }
@@ -355,13 +437,24 @@ json server_t::handle_tools_call(const json& id, const json& params)
     if (!found)
         return make_error(id, JSONRPC_INVALID_PARAMS, "Unknown tool: " + tool_name);
 
+    cancel_scope_t scope(id);
+
     tool_result_t tr;
     try {
-        tr = found->handler(arguments);
+        tr = handler_copy(arguments);
     } catch (const std::exception& e) {
         tr = tool_result_t::error(std::string("Tool threw exception: ") + e.what());
     } catch (...) {
         tr = tool_result_t::error("Tool threw unknown exception");
+    }
+
+    if (scope.token && scope.token->load(std::memory_order_acquire)) {
+        json cancel_result;
+        cancel_result["content"] = json::array({
+            json{{"type", "text"}, {"text", "Tool call cancelled by client request."}}
+        });
+        cancel_result["isError"] = true;
+        return make_result(id, cancel_result);
     }
 
     json content = json::array();
@@ -571,7 +664,12 @@ json server_t::route_request(const json& msg)
     if (method == "resources/read")           return handle_resources_read(id, params);
     if (method == "prompts/list")             return handle_prompts_list(id, params);
     if (method == "prompts/get")              return handle_prompts_get(id, params);
-    if (method == "notifications/cancelled" || method == "logging/setLevel")
+    if (method == "notifications/cancelled") {
+        if (params.is_object() && params.contains("requestId"))
+            signal_in_flight_cancel(params["requestId"]);
+        return json();
+    }
+    if (method == "logging/setLevel")
         return json();
     if (is_notification)                      return json();
 
@@ -1029,6 +1127,7 @@ static bool write_mcpservers(const std::string& path, const std::string& url, co
     if (!config.contains("mcpServers") || !config["mcpServers"].is_object())
         config["mcpServers"] = json::object();
     config["mcpServers"][MCP_NAME] = json::object();
+    config["mcpServers"][MCP_NAME]["type"] = "sse";
     config["mcpServers"][MCP_NAME][key] = url;
     return write_json_file(path, config);
 }

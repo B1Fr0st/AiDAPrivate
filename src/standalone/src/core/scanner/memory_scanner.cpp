@@ -6,13 +6,12 @@
 #include "standalone_driver.hpp"
 
 #include <algorithm>
-#include <chrono>
-#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <sstream>
 #include <iomanip>
+#include <type_traits>
 
 namespace memory_scanner {
 
@@ -185,6 +184,9 @@ static bool compare_bigger(const uint8_t* mem, const uint8_t* target) {
 	T a, b;
 	std::memcpy(&a, mem, sizeof(T));
 	std::memcpy(&b, target, sizeof(T));
+	if constexpr (std::is_floating_point_v<T>) {
+		if (!(a == a) || !(b == b)) return false;
+	}
 	return a > b;
 }
 
@@ -193,6 +195,9 @@ static bool compare_smaller(const uint8_t* mem, const uint8_t* target) {
 	T a, b;
 	std::memcpy(&a, mem, sizeof(T));
 	std::memcpy(&b, target, sizeof(T));
+	if constexpr (std::is_floating_point_v<T>) {
+		if (!(a == a) || !(b == b)) return false;
+	}
 	return a < b;
 }
 
@@ -202,15 +207,15 @@ static bool compare_between(const uint8_t* mem, const uint8_t* lo, const uint8_t
 	std::memcpy(&v, mem, sizeof(T));
 	std::memcpy(&l, lo, sizeof(T));
 	std::memcpy(&h, hi, sizeof(T));
+	if constexpr (std::is_floating_point_v<T>) {
+		if (!(v == v) || !(l == l) || !(h == h)) return false;
+	}
 	return v >= l && v <= h;
 }
 
 template <typename T>
 static bool compare_changed(const uint8_t* cur, const uint8_t* prev) {
-	T a, b;
-	std::memcpy(&a, cur, sizeof(T));
-	std::memcpy(&b, prev, sizeof(T));
-	return a != b;
+	return std::memcmp(cur, prev, sizeof(T)) != 0;
 }
 
 template <typename T>
@@ -218,6 +223,9 @@ static bool compare_increased(const uint8_t* cur, const uint8_t* prev) {
 	T a, b;
 	std::memcpy(&a, cur, sizeof(T));
 	std::memcpy(&b, prev, sizeof(T));
+	if constexpr (std::is_floating_point_v<T>) {
+		if (!(a == a) || !(b == b)) return false;
+	}
 	return a > b;
 }
 
@@ -226,6 +234,9 @@ static bool compare_decreased(const uint8_t* cur, const uint8_t* prev) {
 	T a, b;
 	std::memcpy(&a, cur, sizeof(T));
 	std::memcpy(&b, prev, sizeof(T));
+	if constexpr (std::is_floating_point_v<T>) {
+		if (!(a == a) || !(b == b)) return false;
+	}
 	return a < b;
 }
 
@@ -253,8 +264,11 @@ static void first_scan_thread(scan_config_t config) {
 	std::vector<driver_bridge::memory_region_t> scan_regions;
 	for (const auto& r : regions) {
 		if (r.state != 0x1000) continue;
-		if (config.writable_only && !(r.protect & 0xCC)) continue;
-		if (config.executable_exclude && (r.protect & 0xF0)) continue;
+		if (r.protect & 0x100) continue;
+		uint32_t base_prot = r.protect & 0xFF;
+		if (base_prot == 0x01 || base_prot == 0x00) continue;
+		if (config.writable_only && !(base_prot & 0xCC)) continue;
+		if (config.executable_exclude && (base_prot & 0xF0)) continue;
 		if (r.type == 0x40000) continue;
 		scan_regions.push_back(r);
 	}
@@ -278,9 +292,23 @@ static void first_scan_thread(scan_config_t config) {
 	if (is_string || is_bytearray)
 		val_sz = target_val.size();
 
+	if (is_unknown && val_sz == 0)
+		val_sz = (config.value_type == value_type_t::string_utf16) ? 2 : 1;
+
 	size_t align = config.alignment;
 	if (is_string || is_bytearray) align = 1;
 	if (align == 0) align = 1;
+
+	if (!is_unknown && (val_sz == 0 || target_val.size() < val_sz)) {
+		st.scanning.store(false);
+		st.scan_progress.store(1.f);
+		return;
+	}
+	if (config.scan_mode == scan_mode_t::value_between && target_val2.size() < val_sz) {
+		st.scanning.store(false);
+		st.scan_progress.store(1.f);
+		return;
+	}
 
 	std::vector<scan_result_t> all_results;
 	std::mutex results_mtx;
@@ -302,6 +330,7 @@ static void first_scan_thread(scan_config_t config) {
 			end = end - val_sz + 1;
 
 		for (size_t i = 0; i < end; i += align) {
+			if ((i & 0xFFFF) == 0 && !st.scanning.load()) break;
 			bool match = false;
 
 			if (is_unknown) {
@@ -354,7 +383,7 @@ static void first_scan_thread(scan_config_t config) {
 					res.current_value.assign(buf.data() + i, buf.data() + i + copy_sz);
 				local.push_back(std::move(res));
 
-				if (local.size() >= 10000000) break;
+				if (local.size() >= 2000000) break;
 			}
 		}
 
@@ -370,26 +399,27 @@ static void first_scan_thread(scan_config_t config) {
 	};
 
 
-	constexpr int WORKER_COUNT = 4;
+	const int worker_count = []() {
+		unsigned int hc = std::thread::hardware_concurrency();
+		if (hc < 2u) return 1;
+		if (hc > 8u) return 4;
+		return static_cast<int>(hc / 2u);
+	}();
 	std::atomic<size_t> next_region{0};
-	std::atomic<int> scan_remaining{WORKER_COUNT};
-	std::mutex scan_done_mtx;
-	std::condition_variable scan_done_cv;
+	std::vector<std::thread> workers;
+	workers.reserve(static_cast<size_t>(worker_count));
 
-	for (int w = 0; w < WORKER_COUNT; ++w) {
-		work_queue::post([&]() {
+	for (int w = 0; w < worker_count; ++w) {
+		workers.emplace_back([&]() {
 			size_t idx;
 			while ((idx = next_region.fetch_add(1)) < scan_regions.size()) {
 				if (!st.scanning.load()) break;
 				scan_region(scan_regions[idx]);
 			}
-			if (--scan_remaining == 0)
-				scan_done_cv.notify_all();
 		});
 	}
-	{
-		std::unique_lock<std::mutex> lk(scan_done_mtx);
-		scan_done_cv.wait(lk, [&scan_remaining]() { return scan_remaining.load() == 0; });
+	for (auto& th : workers) {
+		if (th.joinable()) th.join();
 	}
 
 
@@ -457,6 +487,22 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 			val_sz = prev[0].current_value.size();
 	}
 
+	if (val_sz == 0) {
+		st.scanning.store(false);
+		st.scan_progress.store(1.f);
+		return;
+	}
+	if (needs_value && target_val.size() < val_sz) {
+		st.scanning.store(false);
+		st.scan_progress.store(1.f);
+		return;
+	}
+	if (mode == scan_mode_t::value_between && target_val2_bytes.size() < val_sz) {
+		st.scanning.store(false);
+		st.scan_progress.store(1.f);
+		return;
+	}
+
 	{
 		std::lock_guard<std::mutex> lk(st.results_mutex);
 		st.scan_history.push_back(prev);
@@ -474,36 +520,43 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 		std::vector<uint8_t> cur_bytes;
 		if (!driver_bridge::read_memory(pr.address, val_sz, cur_bytes))
 			continue;
+		if (cur_bytes.size() < val_sz)
+			continue;
 
 		bool match = false;
 		switch (mode) {
 			case scan_mode_t::exact:
-				match = compare_exact(cur_bytes.data(), target_val.data(), val_sz);
+				if (target_val.size() >= val_sz)
+					match = compare_exact(cur_bytes.data(), target_val.data(), val_sz);
 				break;
 			case scan_mode_t::bigger_than:
-				switch (vtype) {
-					case value_type_t::byte_val:    match = compare_bigger<uint8_t>(cur_bytes.data(), target_val.data()); break;
-					case value_type_t::int16_val:   match = compare_bigger<int16_t>(cur_bytes.data(), target_val.data()); break;
-					case value_type_t::int32_val:   match = compare_bigger<int32_t>(cur_bytes.data(), target_val.data()); break;
-					case value_type_t::int64_val:   match = compare_bigger<int64_t>(cur_bytes.data(), target_val.data()); break;
-					case value_type_t::float_val:   match = compare_bigger<float>(cur_bytes.data(), target_val.data()); break;
-					case value_type_t::double_val:  match = compare_bigger<double>(cur_bytes.data(), target_val.data()); break;
-					default: break;
+				if (target_val.size() >= val_sz) {
+					switch (vtype) {
+						case value_type_t::byte_val:    match = compare_bigger<uint8_t>(cur_bytes.data(), target_val.data()); break;
+						case value_type_t::int16_val:   match = compare_bigger<int16_t>(cur_bytes.data(), target_val.data()); break;
+						case value_type_t::int32_val:   match = compare_bigger<int32_t>(cur_bytes.data(), target_val.data()); break;
+						case value_type_t::int64_val:   match = compare_bigger<int64_t>(cur_bytes.data(), target_val.data()); break;
+						case value_type_t::float_val:   match = compare_bigger<float>(cur_bytes.data(), target_val.data()); break;
+						case value_type_t::double_val:  match = compare_bigger<double>(cur_bytes.data(), target_val.data()); break;
+						default: break;
+					}
 				}
 				break;
 			case scan_mode_t::smaller_than:
-				switch (vtype) {
-					case value_type_t::byte_val:    match = compare_smaller<uint8_t>(cur_bytes.data(), target_val.data()); break;
-					case value_type_t::int16_val:   match = compare_smaller<int16_t>(cur_bytes.data(), target_val.data()); break;
-					case value_type_t::int32_val:   match = compare_smaller<int32_t>(cur_bytes.data(), target_val.data()); break;
-					case value_type_t::int64_val:   match = compare_smaller<int64_t>(cur_bytes.data(), target_val.data()); break;
-					case value_type_t::float_val:   match = compare_smaller<float>(cur_bytes.data(), target_val.data()); break;
-					case value_type_t::double_val:  match = compare_smaller<double>(cur_bytes.data(), target_val.data()); break;
-					default: break;
+				if (target_val.size() >= val_sz) {
+					switch (vtype) {
+						case value_type_t::byte_val:    match = compare_smaller<uint8_t>(cur_bytes.data(), target_val.data()); break;
+						case value_type_t::int16_val:   match = compare_smaller<int16_t>(cur_bytes.data(), target_val.data()); break;
+						case value_type_t::int32_val:   match = compare_smaller<int32_t>(cur_bytes.data(), target_val.data()); break;
+						case value_type_t::int64_val:   match = compare_smaller<int64_t>(cur_bytes.data(), target_val.data()); break;
+						case value_type_t::float_val:   match = compare_smaller<float>(cur_bytes.data(), target_val.data()); break;
+						case value_type_t::double_val:  match = compare_smaller<double>(cur_bytes.data(), target_val.data()); break;
+						default: break;
+					}
 				}
 				break;
 			case scan_mode_t::value_between:
-				if (!target_val2_bytes.empty()) {
+				if (target_val.size() >= val_sz && target_val2_bytes.size() >= val_sz) {
 					switch (vtype) {
 						case value_type_t::byte_val:    match = compare_between<uint8_t>(cur_bytes.data(), target_val.data(), target_val2_bytes.data()); break;
 						case value_type_t::int16_val:   match = compare_between<int16_t>(cur_bytes.data(), target_val.data(), target_val2_bytes.data()); break;
@@ -516,7 +569,7 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 				}
 				break;
 			case scan_mode_t::changed:
-				if (!pr.current_value.empty()) {
+				if (pr.current_value.size() >= val_sz) {
 					switch (vtype) {
 						case value_type_t::byte_val:    match = compare_changed<uint8_t>(cur_bytes.data(), pr.current_value.data()); break;
 						case value_type_t::int16_val:   match = compare_changed<int16_t>(cur_bytes.data(), pr.current_value.data()); break;
@@ -529,11 +582,11 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 				}
 				break;
 			case scan_mode_t::unchanged:
-				if (!pr.current_value.empty())
+				if (pr.current_value.size() >= val_sz)
 					match = compare_exact(cur_bytes.data(), pr.current_value.data(), val_sz);
 				break;
 			case scan_mode_t::increased:
-				if (!pr.current_value.empty()) {
+				if (pr.current_value.size() >= val_sz) {
 					switch (vtype) {
 						case value_type_t::byte_val:    match = compare_increased<uint8_t>(cur_bytes.data(), pr.current_value.data()); break;
 						case value_type_t::int16_val:   match = compare_increased<int16_t>(cur_bytes.data(), pr.current_value.data()); break;
@@ -546,7 +599,7 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 				}
 				break;
 			case scan_mode_t::decreased:
-				if (!pr.current_value.empty()) {
+				if (pr.current_value.size() >= val_sz) {
 					switch (vtype) {
 						case value_type_t::byte_val:    match = compare_decreased<uint8_t>(cur_bytes.data(), pr.current_value.data()); break;
 						case value_type_t::int16_val:   match = compare_decreased<int16_t>(cur_bytes.data(), pr.current_value.data()); break;
@@ -589,18 +642,21 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 
 static void freeze_loop() {
 	auto& st = g_state;
+	std::vector<std::pair<uint64_t, std::vector<uint8_t>>> snapshot;
 	while (st.freeze_active.load()) {
-		bool has_frozen = false;
+		snapshot.clear();
 		{
 			std::lock_guard<std::mutex> lk(st.address_mutex);
 			for (auto& entry : st.address_list) {
-				if (entry.frozen && !entry.freeze_value.empty()) {
-					driver_bridge::write_memory(entry.address, entry.freeze_value);
-					has_frozen = true;
-				}
+				if (entry.frozen && !entry.freeze_value.empty())
+					snapshot.emplace_back(entry.address, entry.freeze_value);
 			}
 		}
-		if (has_frozen) Sleep(10);
+		for (auto& p : snapshot) {
+			if (!st.freeze_active.load()) break;
+			driver_bridge::write_memory(p.first, p.second);
+		}
+		if (!snapshot.empty()) Sleep(10);
 		else Sleep(100);
 	}
 }
@@ -715,26 +771,31 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 	std::vector<driver_bridge::memory_region_t> scan_regions;
 	for (const auto& r : regions) {
 		if (r.state != 0x1000) continue;
+		if (r.protect & 0x100) continue;
 		uint32_t protect_flags = r.protect & 0xFF;
 		if (protect_flags == 0x01 || protect_flags == 0x00) continue;
 		if (r.size > 0x10000000) continue;
 		scan_regions.push_back(r);
 	}
 
-	std::vector<std::multimap<uint64_t, pointer_entry_t>> partial_maps(4);
+	const int ptr_worker_count = []() {
+		unsigned int hc = std::thread::hardware_concurrency();
+		if (hc < 2u) return 1;
+		if (hc > 8u) return 4;
+		return static_cast<int>(hc / 2u);
+	}();
+	std::vector<std::multimap<uint64_t, pointer_entry_t>> partial_maps(static_cast<size_t>(ptr_worker_count));
 	std::atomic<size_t> region_idx{0};
-	constexpr int WORKERS = 4;
-	std::atomic<int> ptr_remaining{WORKERS};
-	std::mutex ptr_done_mtx;
-	std::condition_variable ptr_done_cv;
 	std::atomic<uint64_t> bytes_scanned{0};
 	uint64_t total_bytes = 0;
 	for (const auto& r : scan_regions) total_bytes += r.size;
 	if (total_bytes == 0) total_bytes = 1;
 
-	for (int w = 0; w < WORKERS; ++w) {
-		work_queue::post([&, w]() {
-			auto& local_map = partial_maps[w];
+	std::vector<std::thread> ptr_workers;
+	ptr_workers.reserve(static_cast<size_t>(ptr_worker_count));
+	for (int w = 0; w < ptr_worker_count; ++w) {
+		ptr_workers.emplace_back([&, w]() {
+			auto& local_map = partial_maps[static_cast<size_t>(w)];
 			size_t idx;
 			while ((idx = region_idx.fetch_add(1)) < scan_regions.size()) {
 				if (!st.pointer_scanning.load()) break;
@@ -781,13 +842,10 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 						static_cast<float>(bytes_scanned.load()) / static_cast<float>(total_bytes) * 0.5f);
 				}
 			}
-			if (--ptr_remaining == 0)
-				ptr_done_cv.notify_all();
 		});
 	}
-	{
-		std::unique_lock<std::mutex> lk(ptr_done_mtx);
-		ptr_done_cv.wait(lk, [&ptr_remaining]() { return ptr_remaining.load() == 0; });
+	for (auto& th : ptr_workers) {
+		if (th.joinable()) th.join();
 	}
 
 	if (!st.pointer_scanning.load()) {
@@ -832,13 +890,12 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 	}
 
 	std::atomic<size_t> seed_idx{0};
-	std::atomic<int> dfs_remaining{WORKERS};
-	std::mutex dfs_done_mtx;
-	std::condition_variable dfs_done_cv;
 	std::atomic<bool> dfs_cancel{false};
 
-	for (int w = 0; w < WORKERS; ++w) {
-		work_queue::post([&]() {
+	std::vector<std::thread> dfs_workers;
+	dfs_workers.reserve(static_cast<size_t>(ptr_worker_count));
+	for (int w = 0; w < ptr_worker_count; ++w) {
+		dfs_workers.emplace_back([&]() {
 			std::vector<int64_t> current_offsets;
 			std::vector<uint64_t> visited;
 			visited.push_back(target_address);
@@ -898,13 +955,10 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 				st.pointer_progress.store(
 					0.5f + (static_cast<float>(idx + 1) / static_cast<float>(seed_values.size())) * 0.5f);
 			}
-			if (--dfs_remaining == 0)
-				dfs_done_cv.notify_all();
 		});
 	}
-	{
-		std::unique_lock<std::mutex> lk(dfs_done_mtx);
-		dfs_done_cv.wait(lk, [&dfs_remaining]() { return dfs_remaining.load() == 0; });
+	for (auto& th : dfs_workers) {
+		if (th.joinable()) th.join();
 	}
 
 	std::sort(results.begin(), results.end(),
@@ -939,6 +993,8 @@ void shutdown() {
 	st.scanning.store(false);
 	st.pointer_scanning.store(false);
 	st.freeze_active.store(false);
+	for (int i = 0; i < 100 && (st.scanning.load() || st.pointer_scanning.load()); ++i)
+		Sleep(20);
 	if (st.scan_thread.joinable()) st.scan_thread.join();
 	if (st.pointer_thread.joinable()) st.pointer_thread.join();
 	if (st.freeze_thread.joinable()) st.freeze_thread.join();
@@ -969,6 +1025,7 @@ bool next_scan(scan_mode_t mode, const std::string& value_text, const std::strin
 	auto& st = g_state;
 	if (st.scanning.load()) return false;
 	if (!st.has_initial_scan) return false;
+	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) return false;
 
 	st.scanning.store(true);
 	if (st.scan_thread.joinable()) st.scan_thread.join();
@@ -985,6 +1042,7 @@ void undo_scan() {
 	st.scan_history.pop_back();
 	st.total_found = st.results.size();
 	if (st.scan_count > 0) st.scan_count--;
+	if (st.scan_count == 0) st.has_initial_scan = false;
 }
 
 void reset_scan() {
@@ -1068,6 +1126,7 @@ void refresh_address_list() {
 void start_pointer_scan(uint64_t target_address, int max_depth, int max_offset) {
 	auto& st = g_state;
 	if (st.pointer_scanning.load()) return;
+	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) return;
 	st.pointer_scanning.store(true);
 	{
 		std::lock_guard<std::mutex> lk(st.pointer_mutex);

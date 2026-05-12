@@ -348,8 +348,8 @@ static std::optional<tool_result_t> ensure_attached_process_context(const json& 
             return tool_result_t::error(OBFSTR("Invalid pid. Expected a positive decimal PID or 0x-prefixed hex PID."));
     }
 
-    if (requested_pid != 0 && false)
-        return tool_result_t::error(OBFSTR("Refusing to target the current IDA host PID."));
+    if (requested_pid != 0 && is_self_target_pid(requested_pid))
+        return tool_result_t::error(OBFSTR("Cannot target AiDA's own process."));
 
     const std::uint32_t current_pid = device->get_process_id();
     if (requested_pid != 0 && requested_pid != current_pid)
@@ -514,9 +514,15 @@ static bool resolve_loaded_module_base(const std::string& query,
 
 tool_result_t driver_connect(const json& params)
 {
+    (void)params;
     if (device->is_connected())
     {
         bool cleared_self_target = false;
+        if (device->get_process_id() != 0 && is_self_target_pid(device->get_process_id()))
+        {
+            device->clear_process_context();
+            cleared_self_target = true;
+        }
 
         if (device->get_kernel_dtb() == 0)
             device->solve_kernel_dtb();
@@ -527,7 +533,7 @@ tool_result_t driver_connect(const json& params)
             result["connected"] = true;
             result["process_id"] = device->get_process_id();
             result["kernel_dtb"] = sa_format_address(device->get_kernel_dtb());
-            return tool_result_t::ok(OBFSTR("Driver connected. Cleared stale IDA host attachment context."), result);
+            return tool_result_t::ok(OBFSTR("Driver connected. Cleared stale AiDA self-attach context."), result);
         }
 
         return tool_result_t::ok(OBFSTR("Driver already connected"));
@@ -547,20 +553,23 @@ tool_result_t driver_connect(const json& params)
 
 tool_result_t driver_status(const json&)
 {
+    const std::uint32_t attached_pid = device->get_process_id();
+    const bool self_target = is_self_target_pid(attached_pid);
+
     json result;
     result["connected"]    = device->is_connected();
-    result["process_id"]   = device->get_process_id();
+    result["process_id"]   = attached_pid;
     result["base_address"] = sa_format_address(device->get_base_address());
     result["dtb"]          = sa_format_address(device->get_dtb());
     result["kernel_dtb"]   = sa_format_address(device->get_kernel_dtb());
-    result["has_process"]  = device->get_process_id() != 0;
+    result["has_process"]  = attached_pid != 0;
     result["has_kernel"]   = device->get_kernel_dtb() != 0;
-    result["is_self_target"] = false;
+    result["is_self_target"] = self_target;
 
-    if (result["is_self_target"].get<bool>())
-        result["warning"] = "Driver target is IDA host process. Call driver_unattach and driver_attach target.exe.";
+    if (self_target)
+        result["warning"] = "Driver target is AiDA's own process. Call driver_unattach and driver_attach <target>.exe.";
 
-    if (device->is_connected() && device->get_process_id() != 0)
+    if (device->is_connected() && attached_pid != 0)
         result["heartbeat"] = device->send_heartbeat() ? "ok" : "failed";
 
     return tool_result_t::ok(OBFSTR("Driver status"), result);
@@ -6869,7 +6878,7 @@ int DeferredActionManager::register_action(std::unique_ptr<deferred_action_t> ac
 
 bool DeferredActionManager::cancel_action(int id)
 {
-    std::lock_guard<std::mutex> lock(_mutex);
+    std::unique_lock<std::mutex> lock(_mutex);
     auto it = _actions.find(id);
     if (it == _actions.end())
         return false;
@@ -6878,11 +6887,13 @@ bool DeferredActionManager::cancel_action(int id)
     if (st == deferred_status::pending || st == deferred_status::watching)
     {
         it->second->status.store(deferred_status::cancelled);
-        if (_watchers.count(id) && _watchers[id].joinable())
+        auto wit = _watchers.find(id);
+        if (wit != _watchers.end() && wit->second.joinable())
         {
-            _mutex.unlock();
-            _watchers[id].join();
-            _mutex.lock();
+            std::thread th = std::move(wit->second);
+            _watchers.erase(wit);
+            lock.unlock();
+            th.join();
         }
         return true;
     }

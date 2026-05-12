@@ -49,6 +49,7 @@ struct ai_generation_result_t
     int64_t cache_read    = 0;
     int64_t cache_write   = 0;
     bool    is_error      = false;
+    bool    thinking_streamed = false;
 };
 
 

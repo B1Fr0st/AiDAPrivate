@@ -19,6 +19,7 @@
 #include "../ui/toast_notification.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -64,7 +65,7 @@ struct local_state_t {
 	std::string expression_text;
 	std::string simplified_text;
 	std::shared_ptr<ast_node_t> ast_root;
-	bool simplifying = false;
+	std::atomic<bool> simplifying{false};
 
 	aida::ui::transition_t sat_celebration;
 	float unsat_shake_v = 0.f;
@@ -100,7 +101,16 @@ inline void start_symbolic_exec(local_state_t& st) {
 
 	symbolic_engine::g_state.processing.store(true);
 	work_queue::post([addr, end, max_i = static_cast<uint32_t>(st.max_insns), regs]() {
-		auto result = symbolic_engine::execute_symbolic(addr, end, max_i, regs, {});
+		symbolic_engine::symbolic_result_t result;
+		try {
+			result = symbolic_engine::execute_symbolic(addr, end, max_i, regs, {});
+		} catch (const std::exception& ex) {
+			result.success = false;
+			result.error = std::string("Symbolic execution aborted: ") + ex.what();
+		} catch (...) {
+			result.success = false;
+			result.error = "Symbolic execution aborted by unknown exception";
+		}
 		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
 		symbolic_engine::g_state.last_result = std::move(result);
 		symbolic_engine::g_state.processing.store(false);
@@ -112,7 +122,16 @@ inline void start_deobfuscate(local_state_t& st) {
 
 	deobfuscation_engine::g_state.processing.store(true);
 	work_queue::post([addr, max_i = static_cast<uint32_t>(st.max_insns)]() {
-		auto result = deobfuscation_engine::deobfuscate_function(addr, max_i);
+		deobfuscation_engine::deobfuscated_result_t result;
+		try {
+			result = deobfuscation_engine::deobfuscate_function(addr, max_i);
+		} catch (const std::exception& ex) {
+			result.success = false;
+			result.error = std::string("Deobfuscation aborted: ") + ex.what();
+		} catch (...) {
+			result.success = false;
+			result.error = "Deobfuscation aborted by unknown exception";
+		}
 		std::lock_guard<std::mutex> lk(deobfuscation_engine::g_state.mutex);
 		deobfuscation_engine::g_state.last_result = std::move(result);
 		deobfuscation_engine::g_state.processing.store(false);
@@ -126,7 +145,16 @@ inline void start_slice(local_state_t& st) {
 
 	symbolic_engine::g_state.processing.store(true);
 	work_queue::post([addr, end, max_i = static_cast<uint32_t>(st.max_insns), target]() {
-		auto result = symbolic_engine::slice_to_register(addr, end, max_i, target);
+		symbolic_engine::slice_result_t result;
+		try {
+			result = symbolic_engine::slice_to_register(addr, end, max_i, target);
+		} catch (const std::exception& ex) {
+			result.success = false;
+			result.error = std::string("Slice aborted: ") + ex.what();
+		} catch (...) {
+			result.success = false;
+			result.error = "Slice aborted by unknown exception";
+		}
 		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
 		symbolic_engine::g_state.last_slice = std::move(result);
 		symbolic_engine::g_state.processing.store(false);
@@ -140,7 +168,16 @@ inline void start_solve(local_state_t& st) {
 
 	symbolic_engine::g_state.processing.store(true);
 	work_queue::post([addr, target, max_i = static_cast<uint32_t>(st.max_insns), regs]() {
-		auto result = symbolic_engine::solve_for_path(addr, target, max_i, regs);
+		symbolic_engine::solve_result_t result;
+		try {
+			result = symbolic_engine::solve_for_path(addr, target, max_i, regs);
+		} catch (const std::exception& ex) {
+			result.success = false;
+			result.error = std::string("Solver aborted: ") + ex.what();
+		} catch (...) {
+			result.success = false;
+			result.error = "Solver aborted by unknown exception";
+		}
 		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
 		symbolic_engine::g_state.last_solve = std::move(result);
 		symbolic_engine::g_state.processing.store(false);
@@ -1160,19 +1197,20 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float ty = table_y + 6.f;
 
 		ImGui::SetCursorScreenPos(ImVec2(cx + pad, ty));
+		bool simplifying_now = st.simplifying.load();
 		bool simplify_clicked = aida::ui::components::button("Simplify",
 			aida::ui::components::button_kind_t::secondary,
 			aida::ui::components::size_t_::sm,
-			ImVec2(0.f, 24.f), st.simplifying, nullptr, st.simplifying);
-		if (simplify_clicked && !st.simplifying && !st.expression_text.empty()) {
-			st.simplifying = true;
+			ImVec2(0.f, 24.f), simplifying_now, nullptr, simplifying_now);
+		if (simplify_clicked && !simplifying_now && !st.expression_text.empty()) {
+			st.simplifying.store(true);
 			std::string text_copy = st.expression_text;
 			work_queue::post([text_copy]() {
 				auto root = detail::parse_ast(text_copy);
 				std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
 				s_state.ast_root = root;
 				s_state.simplified_text = text_copy;
-				s_state.simplifying = false;
+				s_state.simplifying.store(false);
 			});
 		}
 

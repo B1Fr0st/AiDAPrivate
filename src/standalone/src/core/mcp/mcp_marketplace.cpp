@@ -145,9 +145,10 @@ static std::string run_process_capture(const std::string& cmd,
 }
 
 
-static std::vector<package_info_t> search_npm(const std::string& query)
+static std::vector<package_info_t> search_npm(const std::string& query, std::string& err_out)
 {
     std::vector<package_info_t> results;
+    err_out.clear();
 
     httplib::Client cli("https://registry.npmjs.org");
     cli.set_connection_timeout(10);
@@ -162,10 +163,20 @@ static std::vector<package_info_t> search_npm(const std::string& query)
                      + "+keywords:mcp&size=30";
 
     auto res = cli.Get(path);
-    if (!res || res->status != 200) return results;
+    if (!res) {
+        err_out = "registry.npmjs.org unreachable: " + httplib::to_string(res.error());
+        return results;
+    }
+    if (res->status != 200) {
+        err_out = "registry.npmjs.org returned HTTP " + std::to_string(res->status);
+        return results;
+    }
 
     auto j = json::parse(res->body, nullptr, false);
-    if (j.is_discarded() || !j.contains("objects")) return results;
+    if (j.is_discarded() || !j.contains("objects")) {
+        err_out = "registry.npmjs.org returned malformed JSON";
+        return results;
+    }
 
     for (auto& obj : j["objects"]) {
         if (!obj.contains("package")) continue;
@@ -194,6 +205,7 @@ static std::vector<package_info_t> search_npm(const std::string& query)
         if (pkg.contains("keywords") && pkg["keywords"].is_array()) {
             std::string kw;
             for (auto& k : pkg["keywords"]) {
+                if (!k.is_string()) continue;
                 if (!kw.empty()) kw += ", ";
                 kw += k.get<std::string>();
             }
@@ -224,9 +236,11 @@ static std::vector<package_info_t> search_npm(const std::string& query)
 }
 
 
-static std::vector<package_info_t> search_pypi(const std::string& query)
+static std::vector<package_info_t> search_pypi(const std::string& query, std::string& err_out)
 {
     std::vector<package_info_t> results;
+    err_out.clear();
+    bool any_transport_ok = false;
 
     httplib::Client cli("https://pypi.org");
     cli.set_connection_timeout(10);
@@ -241,6 +255,7 @@ static std::vector<package_info_t> search_pypi(const std::string& query)
 
 
     auto res = cli.Get(path);
+    if (res) any_transport_ok = true;
     if (res && res->status == 200) {
         auto j = json::parse(res->body, nullptr, false);
         if (!j.is_discarded() && j.contains("info")) {
@@ -268,6 +283,7 @@ static std::vector<package_info_t> search_pypi(const std::string& query)
         std::string pkg_name = std::string(prefix) + query;
         std::string pkg_path = "/pypi/" + httplib::detail::encode_url(pkg_name) + "/json";
         auto pkg_res = cli.Get(pkg_path);
+        if (pkg_res) any_transport_ok = true;
         if (!pkg_res || pkg_res->status != 200) continue;
 
         auto j = json::parse(pkg_res->body, nullptr, false);
@@ -292,6 +308,8 @@ static std::vector<package_info_t> search_pypi(const std::string& query)
             results.push_back(std::move(info));
     }
 
+    if (!any_transport_ok)
+        err_out = "pypi.org unreachable";
     return results;
 }
 
@@ -321,11 +339,12 @@ void search_async(const std::string& query, registry_t reg)
     std::string q = query;
     work_queue::post([q, reg]() {
         std::vector<package_info_t> results;
+        std::string err;
         try {
             if (reg == registry_t::npm)
-                results = search_npm(q);
+                results = search_npm(q, err);
             else
-                results = search_pypi(q);
+                results = search_pypi(q, err);
         } catch (...) {
             std::lock_guard<std::mutex> lk(s_mtx);
             s_search_state = search_state_t::error_state;
@@ -348,7 +367,13 @@ void search_async(const std::string& query, registry_t reg)
 
         std::lock_guard<std::mutex> lk(s_mtx);
         s_results = std::move(results);
-        s_search_state = search_state_t::done;
+        if (s_results.empty() && !err.empty()) {
+            s_search_state = search_state_t::error_state;
+            s_search_error = err;
+        } else {
+            s_search_state = search_state_t::done;
+            s_search_error.clear();
+        }
     });
 }
 
@@ -395,13 +420,42 @@ void install_async(const package_info_t& pkg)
     package_info_t p = pkg;
     work_queue::post([p]() {
         auto dir = marketplace_dir();
-        std::string pkg_dir = (dir / p.name).string();
 
-
-        std::string safe_name = p.name;
-        std::replace(safe_name.begin(), safe_name.end(), '/', '_');
-        std::replace(safe_name.begin(), safe_name.end(), '@', '_');
-        pkg_dir = (dir / safe_name).string();
+        std::string safe_name;
+        safe_name.reserve(p.name.size());
+        for (char c : p.name) {
+            const unsigned char uc = static_cast<unsigned char>(c);
+            const bool keep = (uc >= '0' && uc <= '9')
+                           || (uc >= 'A' && uc <= 'Z')
+                           || (uc >= 'a' && uc <= 'z')
+                           || uc == '-'
+                           || uc == '_'
+                           || uc == '.';
+            safe_name.push_back(keep ? static_cast<char>(uc) : '_');
+        }
+        while (!safe_name.empty() && safe_name.front() == '.') safe_name.erase(safe_name.begin());
+        if (safe_name.empty() || safe_name == "." || safe_name == "..") {
+            std::lock_guard<std::mutex> lk(s_mtx);
+            s_install_state = install_state_t::error_state;
+            s_install_error = "Refusing to install package with unsafe name: " + p.name;
+            return;
+        }
+        std::error_code can_ec;
+        auto root = std::filesystem::weakly_canonical(dir, can_ec);
+        if (can_ec) root = dir;
+        auto pkg_path = std::filesystem::weakly_canonical(dir / safe_name, can_ec);
+        if (can_ec) pkg_path = dir / safe_name;
+        {
+            const std::string root_str = root.string();
+            const std::string pkg_str = pkg_path.string();
+            if (pkg_str.size() < root_str.size() || pkg_str.compare(0, root_str.size(), root_str) != 0) {
+                std::lock_guard<std::mutex> lk(s_mtx);
+                s_install_state = install_state_t::error_state;
+                s_install_error = "Refusing to install outside marketplace directory: " + p.name;
+                return;
+            }
+        }
+        std::string pkg_dir = pkg_path.string();
 
         std::error_code ec;
         std::filesystem::create_directories(pkg_dir, ec);
@@ -409,9 +463,29 @@ void install_async(const package_info_t& pkg)
         std::string output;
         installed_server_t srv;
 
+        auto safe_for_shell = [](const std::string& s) -> bool {
+            for (unsigned char c : s) {
+                const bool ok = (c >= '0' && c <= '9')
+                             || (c >= 'A' && c <= 'Z')
+                             || (c >= 'a' && c <= 'z')
+                             || c == '-' || c == '_' || c == '.'
+                             || c == '/' || c == '@';
+                if (!ok) return false;
+            }
+            return !s.empty();
+        };
+
+        if (!safe_for_shell(p.name) || (!p.version.empty() && !safe_for_shell(p.version))) {
+            std::lock_guard<std::mutex> lk(s_mtx);
+            s_install_state = install_state_t::error_state;
+            s_install_error = "Refusing to install package with shell-unsafe identifier: " + p.name;
+            return;
+        }
+
         if (p.registry == registry_t::npm) {
 
-            std::string cmd = "cmd.exe /c npm install --prefix \"" + pkg_dir + "\" " + p.name + "@" + p.version;
+            std::string spec = p.name + (p.version.empty() ? std::string{} : "@" + p.version);
+            std::string cmd = "cmd.exe /c npm install --prefix \"" + pkg_dir + "\" \"" + spec + "\"";
             output = run_process_capture(cmd, pkg_dir, 120000);
 
             srv.package_name = p.name;
@@ -428,7 +502,8 @@ void install_async(const package_info_t& pkg)
             run_process_capture(cmd_venv, pkg_dir, 60000);
 
             std::string pip = venv_dir + "\\Scripts\\pip.exe";
-            std::string cmd_install = "\"" + pip + "\" install " + p.name + "==" + p.version;
+            std::string spec = p.version.empty() ? p.name : (p.name + "==" + p.version);
+            std::string cmd_install = "\"" + pip + "\" install \"" + spec + "\"";
             output = run_process_capture(cmd_install, pkg_dir, 120000);
 
             srv.package_name = p.name;
@@ -481,23 +556,43 @@ void install_async(const package_info_t& pkg)
 
 bool uninstall(const std::string& package_name)
 {
-    std::lock_guard<std::mutex> lk(s_installed_mtx);
-    auto it = std::find_if(s_installed.begin(), s_installed.end(),
-        [&](const installed_server_t& s) { return s.package_name == package_name; });
+    ::s_mcp_client_mgr.disconnect_server(package_name);
+    ::s_mcp_client_mgr.remove_server(package_name);
 
-    if (it == s_installed.end()) return false;
-
-
-    if (!it->install_path.empty()) {
-        std::error_code ec;
-        std::filesystem::remove_all(it->install_path, ec);
+    std::string remove_path;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lk(s_installed_mtx);
+        auto it = std::find_if(s_installed.begin(), s_installed.end(),
+            [&](const installed_server_t& s) { return s.package_name == package_name; });
+        if (it == s_installed.end()) return false;
+        remove_path = it->install_path;
+        s_installed.erase(it);
+        found = true;
     }
 
-    s_installed.erase(it);
+    if (!remove_path.empty()) {
+        std::error_code can_ec;
+        auto root = std::filesystem::weakly_canonical(marketplace_dir(), can_ec);
+        if (can_ec) root = marketplace_dir();
+        auto target = std::filesystem::weakly_canonical(remove_path, can_ec);
+        if (can_ec) target = remove_path;
+        const std::string root_str = root.string();
+        const std::string target_str = target.string();
+        if (!root_str.empty()
+            && target_str.size() >= root_str.size()
+            && target_str.compare(0, root_str.size(), root_str) == 0
+            && target_str.size() > root_str.size())
+        {
+            std::error_code ec;
+            std::filesystem::remove_all(target_str, ec);
+        }
+    }
+
     s_install_persist_pending.store(true, std::memory_order_release);
-    output_log::push(bottom_tab_t::output,
+    enqueue_deferred_log(bottom_tab_t::output,
         "[marketplace] Uninstalled " + package_name);
-    return true;
+    return found;
 }
 
 
@@ -536,7 +631,7 @@ void activate_server(const installed_server_t& srv)
     ::s_mcp_client_mgr.add_server(cfg);
     ::s_mcp_client_mgr.connect_server(cfg.name);
 
-    output_log::push(bottom_tab_t::mcp_log,
+    enqueue_deferred_log(bottom_tab_t::mcp_log,
         "[marketplace] Activated server: " + srv.package_name);
 }
 
@@ -545,7 +640,7 @@ void deactivate_server(const std::string& package_name)
     ::s_mcp_client_mgr.disconnect_server(package_name);
     ::s_mcp_client_mgr.remove_server(package_name);
 
-    output_log::push(bottom_tab_t::mcp_log,
+    enqueue_deferred_log(bottom_tab_t::mcp_log,
         "[marketplace] Deactivated server: " + package_name);
 }
 
@@ -567,12 +662,16 @@ void load_installed(const std::string& json_str)
         srv.transport    = item.value("transport", "stdio");
         srv.command      = item.value("command", "");
         if (item.contains("args") && item["args"].is_array()) {
-            for (auto& a : item["args"])
-                srv.args.push_back(a.get<std::string>());
+            for (auto& a : item["args"]) {
+                if (a.is_string())
+                    srv.args.push_back(a.get<std::string>());
+            }
         }
         if (item.contains("env") && item["env"].is_object()) {
-            for (auto it2 = item["env"].begin(); it2 != item["env"].end(); ++it2)
-                srv.env[it2.key()] = it2.value().get<std::string>();
+            for (auto it2 = item["env"].begin(); it2 != item["env"].end(); ++it2) {
+                if (it2.value().is_string())
+                    srv.env[it2.key()] = it2.value().get<std::string>();
+            }
         }
         srv.enabled      = item.value("enabled", true);
         srv.auto_connect  = item.value("auto_connect", true);

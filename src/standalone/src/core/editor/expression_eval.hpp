@@ -96,14 +96,22 @@ public:
 		}
 
 		if (c >= '0' && c <= '9') {
+			const char* scan = p_;
+			while (scan < end_ && is_hex_char(*scan)) ++scan;
+			bool has_h_suffix = (scan < end_) && (*scan == 'h' || *scan == 'H');
+			if (has_h_suffix) {
+				uint64_t val = 0;
+				while (p_ < end_ && is_hex_char(*p_)) {
+					val = (val << 4) | hex_digit(*p_);
+					++p_;
+				}
+				++p_;
+				return {token_type_t::number, val};
+			}
 			uint64_t val = 0;
 			while (p_ < end_ && *p_ >= '0' && *p_ <= '9') {
 				val = val * 10 + static_cast<uint64_t>(*p_ - '0');
 				++p_;
-			}
-			if (p_ < end_ && (*p_ == 'h' || *p_ == 'H')) {
-				++p_;
-				return {token_type_t::number, val};
 			}
 			return {token_type_t::number, val};
 		}
@@ -175,6 +183,8 @@ class parser_t {
 	size_t               pos_ = 0;
 	const context_t*     ctx_ = nullptr;
 	std::string          error_;
+	int                  depth_ = 0;
+	static constexpr int kMaxDepth = 256;
 
 public:
 	parser_t(const std::string& expr, const context_t* ctx) : ctx_(ctx) {
@@ -354,28 +364,36 @@ private:
 	}
 
 	eval_result_t parse_unary() {
+		if (depth_ >= kMaxDepth) return {false, 0, "expression too deeply nested"};
+		++depth_;
+		eval_result_t result;
 		if (peek().type == token_type_t::op_sub) {
 			advance();
 			auto r = parse_unary();
-			if (!r.ok) return r;
-			r.value = static_cast<uint64_t>(-static_cast<int64_t>(r.value));
+			if (!r.ok) { --depth_; return r; }
+			r.value = static_cast<uint64_t>(0) - r.value;
+			--depth_;
 			return r;
 		}
 		if (peek().type == token_type_t::op_tilde) {
 			advance();
 			auto r = parse_unary();
-			if (!r.ok) return r;
+			if (!r.ok) { --depth_; return r; }
 			r.value = ~r.value;
+			--depth_;
 			return r;
 		}
 		if (peek().type == token_type_t::op_logical_not) {
 			advance();
 			auto r = parse_unary();
-			if (!r.ok) return r;
+			if (!r.ok) { --depth_; return r; }
 			r.value = r.value ? 0 : 1;
+			--depth_;
 			return r;
 		}
-		return parse_primary();
+		result = parse_primary();
+		--depth_;
+		return result;
 	}
 
 	eval_result_t parse_primary() {

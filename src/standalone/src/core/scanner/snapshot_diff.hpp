@@ -15,10 +15,14 @@
 #include <unordered_set>
 #include <vector>
 
+#include <shlobj.h>
+#include <commdlg.h>
+
 #include "imgui/imgui.h"
 #include "standalone_driver.hpp"
 #include "ui_anim.hpp"
 #include "../helpers/globals.h"
+#include "../helpers/helpers.h"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
 #include "../ui/clock.hpp"
@@ -40,6 +44,7 @@ struct memory_region_t {
 };
 
 struct snapshot_t {
+	uint64_t                   id = 0;
 	std::string                name;
 	uint32_t                   pid = 0;
 	int64_t                    timestamp = 0;
@@ -77,15 +82,18 @@ struct diff_result_t {
 
 struct state_t {
 	std::vector<snapshot_t>     snapshots;
-	int                         snap_a_idx = -1;
-	int                         snap_b_idx = -1;
+	uint64_t                    snap_a_id = 0;
+	uint64_t                    snap_b_id = 0;
 	diff_result_t               diff;
 	std::mutex                  mutex;
 	std::atomic<bool>           capturing{false};
 	std::atomic<bool>           comparing{false};
+	std::atomic<bool>           loading{false};
 	std::atomic<float>          progress{0.f};
 	std::atomic<bool>           cancel{false};
 	int                         snap_counter = 0;
+	std::atomic<uint64_t>       next_snap_id{1};
+	std::string                 last_error;
 
 	int                         selected_change = -1;
 	float                       scroll_y = 0.f;
@@ -103,6 +111,11 @@ struct state_t {
 };
 
 inline state_t g_state;
+
+inline const std::string& last_error()
+{
+	return g_state.last_error;
+}
 
 namespace detail {
 
@@ -212,11 +225,91 @@ inline void save_snapshot(const snapshot_t& snap)
 
 	for (auto& r : snap.regions) {
 		ofs.write(reinterpret_cast<const char*>(&r.base), 8);
-		uint64_t rsize = r.size;
+		uint64_t rsize = r.data.size();
 		ofs.write(reinterpret_cast<const char*>(&rsize), 8);
 		ofs.write(reinterpret_cast<const char*>(&r.protect), 4);
-		ofs.write(reinterpret_cast<const char*>(r.data.data()), rsize);
+		if (rsize > 0)
+			ofs.write(reinterpret_cast<const char*>(r.data.data()), static_cast<std::streamsize>(rsize));
 	}
+}
+
+inline bool load_snapshot(const std::string& path, snapshot_t& out)
+{
+	std::ifstream ifs(path, std::ios::binary);
+	if (!ifs.is_open()) {
+		g_state.last_error = "load_snapshot: failed to open file";
+		return false;
+	}
+
+	uint32_t name_len = 0;
+	if (!ifs.read(reinterpret_cast<char*>(&name_len), 4)) {
+		g_state.last_error = "load_snapshot: failed reading name length";
+		return false;
+	}
+	if (name_len > 0x10000u) {
+		g_state.last_error = "load_snapshot: implausible name length";
+		return false;
+	}
+
+	std::string name;
+	name.resize(name_len);
+	if (name_len > 0) {
+		if (!ifs.read(name.data(), static_cast<std::streamsize>(name_len))) {
+			g_state.last_error = "load_snapshot: failed reading name";
+			return false;
+		}
+	}
+
+	uint32_t pid = 0;
+	int64_t  ts = 0;
+	uint32_t region_count = 0;
+	if (!ifs.read(reinterpret_cast<char*>(&pid), 4) ||
+	    !ifs.read(reinterpret_cast<char*>(&ts), 8) ||
+	    !ifs.read(reinterpret_cast<char*>(&region_count), 4)) {
+		g_state.last_error = "load_snapshot: failed reading header";
+		return false;
+	}
+
+	if (region_count > 0x10000000u) {
+		g_state.last_error = "load_snapshot: implausible region count";
+		return false;
+	}
+
+	out = snapshot_t{};
+	out.name = std::move(name);
+	out.pid = pid;
+	out.timestamp = ts;
+	out.regions.reserve(region_count);
+
+	for (uint32_t i = 0; i < region_count; ++i) {
+		memory_region_t r;
+		uint64_t rsize = 0;
+		if (!ifs.read(reinterpret_cast<char*>(&r.base), 8) ||
+		    !ifs.read(reinterpret_cast<char*>(&rsize), 8) ||
+		    !ifs.read(reinterpret_cast<char*>(&r.protect), 4)) {
+			g_state.last_error = "load_snapshot: failed reading region header";
+			return false;
+		}
+
+		if (rsize > 0x10000000ULL) {
+			g_state.last_error = "load_snapshot: implausible region size";
+			return false;
+		}
+
+		r.size = rsize;
+		if (rsize > 0) {
+			r.data.resize(static_cast<size_t>(rsize));
+			if (!ifs.read(reinterpret_cast<char*>(r.data.data()), static_cast<std::streamsize>(rsize))) {
+				g_state.last_error = "load_snapshot: failed reading region data";
+				return false;
+			}
+		}
+
+		out.total_bytes += rsize;
+		out.regions.push_back(std::move(r));
+	}
+
+	return true;
 }
 
 }
@@ -240,6 +333,7 @@ inline void take_snapshot(const std::string& name = "")
 
 	work_queue::post([snap_name]() {
 		snapshot_t snap;
+		snap.id = g_state.next_snap_id.fetch_add(1);
 		snap.name = snap_name;
 		snap.pid = driver_bridge::attached_pid();
 		snap.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
@@ -250,6 +344,7 @@ inline void take_snapshot(const std::string& name = "")
 		std::vector<driver_bridge::memory_region_t> readable;
 		for (auto& r : regions) {
 			if (r.state != 0x1000) continue;
+			if (r.protect & 0x100) continue;
 			uint32_t p = r.protect & 0xFF;
 			if (p == 0x01 || p == 0x00) continue;
 			if (r.size > 0x10000000) continue;
@@ -258,6 +353,7 @@ inline void take_snapshot(const std::string& name = "")
 
 		uint64_t total = 0;
 		for (auto& r : readable) total += r.size;
+		if (total == 0) total = 1;
 		uint64_t done = 0;
 
 		for (auto& r : readable) {
@@ -265,10 +361,10 @@ inline void take_snapshot(const std::string& name = "")
 
 			memory_region_t sr;
 			sr.base = r.base;
-			sr.size = r.size;
 			sr.protect = r.protect;
 
-			if (driver_bridge::read_memory(r.base, static_cast<size_t>(r.size), sr.data)) {
+			if (driver_bridge::read_memory(r.base, static_cast<size_t>(r.size), sr.data) && !sr.data.empty()) {
+				sr.size = sr.data.size();
 				snap.total_bytes += sr.data.size();
 				snap.regions.push_back(std::move(sr));
 			}
@@ -281,8 +377,12 @@ inline void take_snapshot(const std::string& name = "")
 
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
-			if (g_state.snapshots.size() >= 10)
+			if (g_state.snapshots.size() >= 10) {
+				uint64_t evicted_id = g_state.snapshots.front().id;
 				g_state.snapshots.erase(g_state.snapshots.begin());
+				if (g_state.snap_a_id == evicted_id) g_state.snap_a_id = 0;
+				if (g_state.snap_b_id == evicted_id) g_state.snap_b_id = 0;
+			}
 			g_state.snapshots.push_back(std::move(snap));
 		}
 
@@ -290,7 +390,51 @@ inline void take_snapshot(const std::string& name = "")
 	});
 }
 
-inline void compare_snapshots(int idx_a, int idx_b)
+inline void load_from_disk(const std::string& path)
+{
+	if (g_state.loading.load() || g_state.capturing.load())
+		return;
+
+	g_state.loading.store(true);
+	g_state.cancel.store(false);
+
+	std::string fallback_name;
+	{
+		++g_state.snap_counter;
+		char buf[32];
+		snprintf(buf, sizeof(buf), "Snap%d", g_state.snap_counter);
+		fallback_name = buf;
+	}
+
+	std::string path_copy = path;
+	work_queue::post([path_copy, fallback_name]() {
+		snapshot_t snap;
+		if (!detail::load_snapshot(path_copy, snap)) {
+			g_state.loading.store(false);
+			return;
+		}
+
+		snap.id = g_state.next_snap_id.fetch_add(1);
+		if (snap.name.empty()) {
+			snap.name = fallback_name;
+		}
+
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			if (g_state.snapshots.size() >= 10) {
+				uint64_t evicted_id = g_state.snapshots.front().id;
+				g_state.snapshots.erase(g_state.snapshots.begin());
+				if (g_state.snap_a_id == evicted_id) g_state.snap_a_id = 0;
+				if (g_state.snap_b_id == evicted_id) g_state.snap_b_id = 0;
+			}
+			g_state.snapshots.push_back(std::move(snap));
+		}
+
+		g_state.loading.store(false);
+	});
+}
+
+inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 {
 	if (g_state.comparing.load())
 		return;
@@ -301,20 +445,30 @@ inline void compare_snapshots(int idx_a, int idx_b)
 	g_state.compare_cursor_active = true;
 	g_state.compare_cursor_t = 0.f;
 
-	work_queue::post([idx_a, idx_b]() {
+	work_queue::post([id_a, id_b]() {
 		diff_result_t result;
 
 		snapshot_t snap_a, snap_b;
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
-			if (idx_a < 0 || idx_a >= static_cast<int>(g_state.snapshots.size()) ||
-			    idx_b < 0 || idx_b >= static_cast<int>(g_state.snapshots.size())) {
+			const snapshot_t* p_a = nullptr;
+			const snapshot_t* p_b = nullptr;
+			for (auto& s : g_state.snapshots) {
+				if (s.id == id_a) p_a = &s;
+				if (s.id == id_b) p_b = &s;
+			}
+			if (p_a == nullptr || p_b == nullptr) {
+				g_state.last_error = (p_a == nullptr && p_b == nullptr)
+					? "compare_snapshots: both snapshots evicted"
+					: (p_a == nullptr
+						? "compare_snapshots: snapshot A evicted"
+						: "compare_snapshots: snapshot B evicted");
 				g_state.comparing.store(false);
 				g_state.compare_cursor_active = false;
 				return;
 			}
-			snap_a = g_state.snapshots[idx_a];
-			snap_b = g_state.snapshots[idx_b];
+			snap_a = *p_a;
+			snap_b = *p_b;
 		}
 
 		result.snap_a_name = snap_a.name;
@@ -327,6 +481,7 @@ inline void compare_snapshots(int idx_a, int idx_b)
 		auto modules = driver_bridge::enumerate_modules();
 
 		uint64_t total = snap_a.regions.size();
+		if (total == 0) total = 1;
 		uint64_t done = 0;
 
 		for (auto& ra : snap_a.regions) {
@@ -346,6 +501,7 @@ inline void compare_snapshots(int idx_a, int idx_b)
 
 			uint64_t i = 0;
 			while (i < cmp_size) {
+				if ((i & 0xFFFFF) == 0 && g_state.cancel.load()) break;
 				if (ra.data[i] == rb.data[i]) { ++i; continue; }
 
 				uint64_t start = i;
@@ -388,14 +544,16 @@ inline void compare_snapshots(int idx_a, int idx_b)
 
 inline void clear_snapshots()
 {
+	g_state.cancel.store(true);
 	std::lock_guard<std::mutex> lk(g_state.mutex);
 	g_state.snapshots.clear();
 	g_state.diff = {};
-	g_state.snap_a_idx = -1;
-	g_state.snap_b_idx = -1;
+	g_state.snap_a_id = 0;
+	g_state.snap_b_id = 0;
 	g_state.snap_counter = 0;
 	g_state.prev_change_keys.clear();
 	g_state.row_flash.clear();
+	g_state.selected_change = -1;
 }
 
 namespace detail {
@@ -410,9 +568,12 @@ inline void render_timeline(ImDrawList* dl, float ox, float oy, float w, float h
 		aida::ui::with_alpha(t.border_subtle, a), 10.f, 0, 1.f);
 
 	int snap_count = 0;
+	std::vector<uint64_t> snap_ids;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mutex);
 		snap_count = static_cast<int>(g_state.snapshots.size());
+		snap_ids.reserve(static_cast<size_t>(snap_count));
+		for (auto& s : g_state.snapshots) snap_ids.push_back(s.id);
 	}
 
 	float track_y = oy + h * 0.5f;
@@ -434,6 +595,13 @@ inline void render_timeline(ImDrawList* dl, float ox, float oy, float w, float h
 
 	float seg = (snap_count > 1) ? track_w / static_cast<float>(snap_count - 1) : 0.f;
 
+	int idx_a = -1;
+	int idx_b = -1;
+	for (int i = 0; i < snap_count; ++i) {
+		if (g_state.snap_a_id != 0 && snap_ids[i] == g_state.snap_a_id) idx_a = i;
+		if (g_state.snap_b_id != 0 && snap_ids[i] == g_state.snap_b_id) idx_b = i;
+	}
+
 	int hot_marker = -1;
 	for (int i = 0; i < snap_count; ++i) {
 		float mx = (snap_count > 1) ? (track_x0 + seg * i) : (track_x0 + track_w * 0.5f);
@@ -446,23 +614,23 @@ inline void render_timeline(ImDrawList* dl, float ox, float oy, float w, float h
 		bool clk_r = ImGui::IsItemClicked(ImGuiMouseButton_Right);
 		ImGui::PopID();
 		if (hov) hot_marker = i;
+		uint64_t this_id = snap_ids[i];
 		if (clk) {
-			if (g_state.snap_a_idx == i) g_state.snap_a_idx = -1;
-			else if (g_state.snap_b_idx == i) g_state.snap_b_idx = -1;
-			else if (g_state.snap_a_idx < 0) g_state.snap_a_idx = i;
-			else if (g_state.snap_b_idx < 0) g_state.snap_b_idx = i;
-			else g_state.snap_b_idx = i;
+			if (g_state.snap_a_id == this_id) g_state.snap_a_id = 0;
+			else if (g_state.snap_b_id == this_id) g_state.snap_b_id = 0;
+			else if (g_state.snap_a_id == 0) g_state.snap_a_id = this_id;
+			else if (g_state.snap_b_id == 0) g_state.snap_b_id = this_id;
+			else g_state.snap_b_id = this_id;
 		}
 		if (clk_r) {
-			if (g_state.snap_a_idx == i) g_state.snap_a_idx = -1;
-			if (g_state.snap_b_idx == i) g_state.snap_b_idx = -1;
+			if (g_state.snap_a_id == this_id) g_state.snap_a_id = 0;
+			if (g_state.snap_b_id == this_id) g_state.snap_b_id = 0;
 		}
 	}
 
-	if (g_state.snap_a_idx >= 0 && g_state.snap_a_idx < snap_count &&
-		g_state.snap_b_idx >= 0 && g_state.snap_b_idx < snap_count) {
-		float ax = (snap_count > 1) ? (track_x0 + seg * g_state.snap_a_idx) : (track_x0 + track_w * 0.5f);
-		float bx = (snap_count > 1) ? (track_x0 + seg * g_state.snap_b_idx) : (track_x0 + track_w * 0.5f);
+	if (idx_a >= 0 && idx_a < snap_count && idx_b >= 0 && idx_b < snap_count) {
+		float ax = (snap_count > 1) ? (track_x0 + seg * idx_a) : (track_x0 + track_w * 0.5f);
+		float bx = (snap_count > 1) ? (track_x0 + seg * idx_b) : (track_x0 + track_w * 0.5f);
 		if (ax > bx) std::swap(ax, bx);
 		dl->AddRectFilledMultiColor(
 			ImVec2(ax, track_y - 2.f), ImVec2(bx, track_y + 2.f),
@@ -487,8 +655,8 @@ inline void render_timeline(ImDrawList* dl, float ox, float oy, float w, float h
 	for (int i = 0; i < snap_count; ++i) {
 		float mx = (snap_count > 1) ? (track_x0 + seg * i) : (track_x0 + track_w * 0.5f);
 		float my = track_y;
-		bool is_a = (g_state.snap_a_idx == i);
-		bool is_b = (g_state.snap_b_idx == i);
+		bool is_a = (idx_a == i);
+		bool is_b = (idx_b == i);
 		bool is_hot = (hot_marker == i);
 
 		ImU32 outer = aida::ui::with_alpha(t.panel_header, a);
@@ -563,9 +731,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		aida::ui::with_alpha(t.text_primary, a), "Snapshot Diff");
 	cx += 130.f;
 
-	bool busy = g_state.capturing.load() || g_state.comparing.load();
+	bool busy = g_state.capturing.load() || g_state.comparing.load() || g_state.loading.load();
 	bool taking = g_state.capturing.load();
 	bool comparing = g_state.comparing.load();
+	bool loading = g_state.loading.load();
 
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
@@ -584,15 +753,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	bool can_compare = (!busy && snap_count >= 2 &&
-		g_state.snap_a_idx >= 0 && g_state.snap_b_idx >= 0 &&
-		g_state.snap_a_idx != g_state.snap_b_idx);
+		g_state.snap_a_id != 0 && g_state.snap_b_id != 0 &&
+		g_state.snap_a_id != g_state.snap_b_id);
 
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		const char* lbl = comparing ? "Comparing..." : "Compare";
 		if (aida::ui::button(lbl, aida::ui::button_kind_t::primary,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), !can_compare, nullptr, comparing)) {
-			compare_snapshots(g_state.snap_a_idx, g_state.snap_b_idx);
+			compare_snapshots(g_state.snap_a_id, g_state.snap_b_id);
 		}
 		cx += 110.f;
 	}
@@ -603,6 +772,35 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				aida::ui::size_t_::sm, ImVec2(0.f, 0.f), busy || snap_count == 0)) {
 			clear_snapshots();
 		}
+		cx += 100.f;
+	}
+
+	{
+		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+		const char* lbl_load = loading ? "Loading..." : "Load";
+		if (aida::ui::button(lbl_load, aida::ui::button_kind_t::secondary,
+				aida::ui::size_t_::sm, ImVec2(0.f, 0.f), busy, nullptr, loading)) {
+			auto initial_dir = detail::snapshot_dir();
+			std::error_code ec;
+			std::filesystem::create_directories(initial_dir, ec);
+			std::string initial_dir_str = initial_dir.string();
+
+			char path_buf[MAX_PATH] = {};
+			OPENFILENAMEA ofn = {};
+			ofn.lStructSize = sizeof(ofn);
+			ofn.hwndOwner = g_hwnd;
+			ofn.lpstrFile = path_buf;
+			ofn.nMaxFile = MAX_PATH;
+			ofn.lpstrFilter = "Snapshot (*.bin)\0*.bin\0All files\0*.*\0\0";
+			ofn.lpstrDefExt = "bin";
+			ofn.lpstrInitialDir = initial_dir_str.c_str();
+			ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+
+			if (GetOpenFileNameA(&ofn)) {
+				load_from_disk(std::string(path_buf));
+			}
+		}
+		cx += 90.f;
 	}
 
 	{

@@ -30,6 +30,12 @@ struct undo_entry_t {
 };
 
 
+struct find_match_t {
+    int line = 0;
+    int col  = 0;
+    int length = 0;
+};
+
 struct find_state_t {
     bool visible          = false;
     bool replace_mode     = false;
@@ -40,7 +46,7 @@ struct find_state_t {
     bool use_regex        = false;
     int  current_match    = -1;
     int  total_matches    = 0;
-    std::vector<std::pair<int,int>> match_positions;
+    std::vector<find_match_t> match_positions;
 };
 
 

@@ -130,7 +130,7 @@ namespace events {
                 detail::set_last_error("event_bus.publish: payload type mismatch for event type_name");
                 continue;
             }
-            rec.invoker(payload_ptr);
+            try { rec.invoker(payload_ptr); } catch (...) { detail::set_last_error("event_bus.publish: subscriber callback raised"); }
         }
     }
 
@@ -252,6 +252,40 @@ namespace events {
         std::string session_id;
     };
 
+    struct dll_loaded_t
+    {
+        uint32_t    process_id = 0;
+        uint32_t    thread_id = 0;
+        uint64_t    image_base = 0;
+        uint64_t    image_size = 0;
+        uint64_t    timestamp = 0;
+        uint32_t    flags = 0;
+        std::string image_path;
+        std::string image_name;
+    };
+
+    struct process_created_t
+    {
+        uint32_t    process_id = 0;
+        uint64_t    timestamp = 0;
+        std::string image_path;
+        std::string image_name;
+    };
+
+    struct process_exited_t
+    {
+        uint32_t process_id = 0;
+        uint64_t timestamp = 0;
+    };
+
+    struct debug_events_drained_t
+    {
+        uint32_t returned_count = 0;
+        uint32_t dropped_since_last_drain = 0;
+        uint64_t total_dropped = 0;
+        uint64_t total_published = 0;
+    };
+
     inline constexpr event_def_t<permission_asked_t>   event_permission_asked{"aida.permission.asked"};
     inline constexpr event_def_t<permission_replied_t> event_permission_replied{"aida.permission.replied"};
     inline constexpr event_def_t<session_compacted_t>  event_session_compacted{"aida.session.compacted"};
@@ -268,6 +302,10 @@ namespace events {
     inline constexpr event_def_t<session_deleted_t>    event_session_deleted{"aida.session.deleted"};
     inline constexpr event_def_t<command_executed_t>   event_command_executed{"aida.command.executed"};
     inline constexpr event_def_t<file_edited_t>        event_file_edited{"aida.file.edited"};
+    inline constexpr event_def_t<dll_loaded_t>            event_dll_loaded{"aida.target.dll_loaded"};
+    inline constexpr event_def_t<process_created_t>       event_process_created{"aida.target.process_created"};
+    inline constexpr event_def_t<process_exited_t>        event_process_exited{"aida.target.process_exited"};
+    inline constexpr event_def_t<debug_events_drained_t>  event_debug_events_drained{"aida.target.debug_events_drained"};
 
 }
 }

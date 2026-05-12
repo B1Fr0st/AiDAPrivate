@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <shlobj.h>
+#include <algorithm>
 #include <atomic>
 #include "work_queue.hpp"
 #include <chrono>
@@ -135,9 +136,8 @@ inline bool load_module_cache(const std::string& name, uint64_t base, uint32_t s
 	if (!ifs.is_open())
 		return false;
 
-	nlohmann::json root;
-	try { root = nlohmann::json::parse(ifs); }
-	catch (...) { return false; }
+	nlohmann::json root = nlohmann::json::parse(ifs, nullptr, false);
+	if (root.is_discarded()) return false;
 
 	out.name = name;
 	out.base = base;
@@ -288,11 +288,13 @@ inline void build_call_graph(const std::string& module_name)
 
 			auto& caller_node = g_state.call_graph[e.from_addr];
 			caller_node.addr = e.from_addr;
-			caller_node.callees.push_back(e.to_addr);
+			if (std::find(caller_node.callees.begin(), caller_node.callees.end(), e.to_addr) == caller_node.callees.end())
+				caller_node.callees.push_back(e.to_addr);
 
 			auto& callee_node = g_state.call_graph[e.to_addr];
 			callee_node.addr = e.to_addr;
-			callee_node.callers.push_back(e.from_addr);
+			if (std::find(callee_node.callers.begin(), callee_node.callers.end(), e.from_addr) == callee_node.callers.end())
+				callee_node.callers.push_back(e.from_addr);
 		}
 	}
 }

@@ -160,7 +160,7 @@ inline turn_cost_t compute_turn_cost(const aida::provider::model_info_t& model,
 {
     turn_cost_t r;
     const double per = 1'000'000.0;
-    const int64_t context_tokens = usage.input + usage.cache_read;
+    const int64_t context_tokens = usage.input + usage.cache_read + usage.cache_write;
     const bool over_200k = context_tokens > 200000 &&
                            (model.cost.over_200k_input_per_million > 0.0 ||
                             model.cost.over_200k_output_per_million > 0.0 ||

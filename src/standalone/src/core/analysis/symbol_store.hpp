@@ -229,16 +229,20 @@ inline void auto_load_attached_modules()
 {
 	auto modules = driver_bridge::enumerate_modules();
 	for (auto& m : modules) {
-		std::lock_guard<std::mutex> lk(g_state.mutex);
-		if (g_state.modules.find(m.name) == g_state.modules.end()) {
-			std::string lower_name = m.name;
-			std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+		bool worth_loading = true;
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			if (g_state.modules.find(m.name) == g_state.modules.end()) {
+				std::string lower_name = m.name;
+				std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
 
-			bool worth_loading = (lower_name.find(".exe") != std::string::npos ||
-			                      lower_name.find("game") != std::string::npos ||
-			                      lower_name.find("engine") != std::string::npos);
-			if (!worth_loading) continue;
+				worth_loading = (lower_name.find(".exe") != std::string::npos ||
+				                 lower_name.find("game") != std::string::npos ||
+				                 lower_name.find("engine") != std::string::npos);
+			}
 		}
+
+		if (!worth_loading) continue;
 
 		load_pdb_for_module(m.name, m.base, m.size);
 	}

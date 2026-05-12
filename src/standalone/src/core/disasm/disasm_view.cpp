@@ -2521,8 +2521,7 @@ static void launch_xref_scan(uint64_t addr)
     st.xref_popup_scroll = 0.f;
     st.xref_popup_target_scroll = 0.f;
 
-    try {
-    std::thread([addr]() {
+    std::thread xref_scan_thread([addr]() {
         auto modules = driver_bridge::enumerate_modules();
 
         uint64_t search_base = 0;
@@ -2615,11 +2614,8 @@ static void launch_xref_scan(uint64_t addr)
             g_state.xref_results = std::move(found);
         }
         g_state.xref_scanning.store(false);
-    }).detach();
-    } catch (...) {
-        g_state.xref_scanning.store(false);
-        driver_bridge::debug_log("[disasm] xref scan thread creation failed\n");
-    }
+    });
+    xref_scan_thread.detach();
 }
 
 static float s_close_btn_anim = 0.f;
@@ -4514,16 +4510,7 @@ void render(float pos_x, float pos_y, float width, float height,
             if (ImGui::MenuItem("Copy Address")) {
                 char buf[20];
                 snprintf(buf, sizeof(buf), "%016llX", static_cast<unsigned long long>(ci.addr));
-                if (OpenClipboard(nullptr)) {
-                    EmptyClipboard();
-                    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, strlen(buf) + 1);
-                    if (hg) {
-                        memcpy(GlobalLock(hg), buf, strlen(buf) + 1);
-                        GlobalUnlock(hg);
-                        SetClipboardData(CF_TEXT, hg);
-                    }
-                    CloseClipboard();
-                }
+                copy_text_to_clipboard(std::string(buf));
             }
 
 
@@ -4532,16 +4519,7 @@ void render(float pos_x, float pos_y, float width, float height,
                 int boff2 = 0;
                 for (int b = 0; b < ci.len && boff2 + 3 < 64; b++)
                     boff2 += snprintf(buf + boff2, 64 - boff2, b ? " %02X" : "%02X", ci.raw[b]);
-                if (OpenClipboard(nullptr)) {
-                    EmptyClipboard();
-                    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, strlen(buf) + 1);
-                    if (hg) {
-                        memcpy(GlobalLock(hg), buf, strlen(buf) + 1);
-                        GlobalUnlock(hg);
-                        SetClipboardData(CF_TEXT, hg);
-                    }
-                    CloseClipboard();
-                }
+                copy_text_to_clipboard(std::string(buf));
             }
 
 
@@ -4553,16 +4531,7 @@ void render(float pos_x, float pos_y, float width, float height,
                 else
                     snprintf(buf, sizeof(buf), "%016llX  %s",
                              static_cast<unsigned long long>(ci.addr), ci.mnem);
-                if (OpenClipboard(nullptr)) {
-                    EmptyClipboard();
-                    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, strlen(buf) + 1);
-                    if (hg) {
-                        memcpy(GlobalLock(hg), buf, strlen(buf) + 1);
-                        GlobalUnlock(hg);
-                        SetClipboardData(CF_TEXT, hg);
-                    }
-                    CloseClipboard();
-                }
+                copy_text_to_clipboard(std::string(buf));
             }
 
             ImGui::Separator();

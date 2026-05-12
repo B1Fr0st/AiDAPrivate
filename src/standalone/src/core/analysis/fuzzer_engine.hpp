@@ -699,6 +699,12 @@ inline void start_fuzzing()
 					entry.new_coverage = 1;
 					entry.source = strategy_name(last_mutation.strategy);
 					g_state.corpus.push_back(std::move(entry));
+					constexpr size_t kMaxCorpusEntries = 4096;
+					if (g_state.corpus.size() > kMaxCorpusEntries) {
+						size_t excess = g_state.corpus.size() - kMaxCorpusEntries;
+						g_state.corpus.erase(g_state.corpus.begin() + 1,
+							g_state.corpus.begin() + 1 + static_cast<ptrdiff_t>(excess));
+					}
 					stats.corpus_size = static_cast<uint32_t>(g_state.corpus.size());
 				}
 				stats.edge_coverage = g_state.coverage.total_edges_discovered;

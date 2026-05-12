@@ -30,8 +30,11 @@
 #include <ws2tcpip.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -1791,11 +1794,11 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
 
         ImGui::Spacing();
         if (aida::ui::button("Send to Repeater", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
-            repeater_entry_t rep;
-            rep.host = ex.target_host;
-            rep.port = ex.target_port;
-            rep.use_tls = ex.is_tls;
-            rep.raw_request = std::string(ex.raw_request.begin(), ex.raw_request.end());
+            auto rep = std::make_shared<repeater_entry_t>();
+            rep->host = ex.target_host;
+            rep->port = ex.target_port;
+            rep->use_tls = ex.is_tls;
+            rep->raw_request = std::string(ex.raw_request.begin(), ex.raw_request.end());
             state.repeater_entries.push_back(std::move(rep));
             state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
         }
@@ -2115,11 +2118,11 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
     ImGui::SameLine();
 
     if (aida::ui::button("New", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
-        repeater_entry_t rep;
-        rep.host = state.rep_host;
-        rep.port = static_cast<uint16_t>(state.rep_port);
-        rep.use_tls = state.rep_use_tls;
-        rep.raw_request = "GET / HTTP/1.1\r\nHost: " + std::string(state.rep_host) + "\r\n\r\n";
+        auto rep = std::make_shared<repeater_entry_t>();
+        rep->host = state.rep_host;
+        rep->port = static_cast<uint16_t>(state.rep_port);
+        rep->use_tls = state.rep_use_tls;
+        rep->raw_request = "GET / HTTP/1.1\r\nHost: " + std::string(state.rep_host) + "\r\n\r\n";
         state.repeater_entries.push_back(std::move(rep));
         state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
     }
@@ -2142,7 +2145,8 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
         ImGui::Spacing();
 
         if (state.repeater_selected >= 0 && state.repeater_selected < static_cast<int>(state.repeater_entries.size())) {
-            auto& rep = state.repeater_entries[static_cast<size_t>(state.repeater_selected)];
+            auto rep_ptr = state.repeater_entries[static_cast<size_t>(state.repeater_selected)];
+            auto& rep = *rep_ptr;
 
             float half_w = (w - 8.f) * 0.5f;
             float panel_h = h - ImGui::GetCursorPosY() - 40.f;
@@ -2165,21 +2169,21 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
             if (!rep.in_progress) {
                 if (aida::ui::button("Send", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
                     rep.in_progress = true;
-                    auto* entry_ptr = &rep;
-                    work_queue::post([entry_ptr]() {
-                        std::vector<uint8_t> raw(entry_ptr->raw_request.begin(), entry_ptr->raw_request.end());
+                    std::shared_ptr<repeater_entry_t> entry = rep_ptr;
+                    work_queue::post([entry]() {
+                        std::vector<uint8_t> raw(entry->raw_request.begin(), entry->raw_request.end());
                         auto result = mitm_proxy::repeat_request(
-                            entry_ptr->host, entry_ptr->port, entry_ptr->use_tls, raw);
+                            entry->host, entry->port, entry->use_tls, raw);
                         if (result.success) {
-                            entry_ptr->raw_response = std::string(result.exchange.raw_response.begin(),
+                            entry->raw_response = std::string(result.exchange.raw_response.begin(),
                                 result.exchange.raw_response.end());
-                            entry_ptr->status_code = result.exchange.response.status_code;
-                            entry_ptr->latency_ms = result.exchange.latency_ms;
+                            entry->status_code = result.exchange.response.status_code;
+                            entry->latency_ms = result.exchange.latency_ms;
                         } else {
-                            entry_ptr->raw_response = "Error: " + result.error;
-                            entry_ptr->status_code = 0;
+                            entry->raw_response = "Error: " + result.error;
+                            entry->status_code = 0;
                         }
-                        entry_ptr->in_progress = false;
+                        entry->in_progress = false;
                     });
                 }
             } else {
@@ -2432,11 +2436,11 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
         aida::ui::kbd_chip("M");
         ImGui::SameLine();
         if (aida::ui::button("Send to Repeater", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
-            repeater_entry_t rep;
-            rep.host = sel.target_host;
-            rep.port = sel.target_port;
-            rep.use_tls = sel.is_tls;
-            rep.raw_request = std::string(sel.raw_request.begin(), sel.raw_request.end());
+            auto rep = std::make_shared<repeater_entry_t>();
+            rep->host = sel.target_host;
+            rep->port = sel.target_port;
+            rep->use_tls = sel.is_tls;
+            rep->raw_request = std::string(sel.raw_request.begin(), sel.raw_request.end());
             state.repeater_entries.push_back(std::move(rep));
         }
         ImGui::SameLine();
@@ -3023,7 +3027,14 @@ static void run_fuzzer_thread(state_t& state) {
             std::smatch m;
             if (std::regex_search(body, m, re)) {
                 int grp = 1;
-                try { grp = std::stoi(grp_str); } catch (...) {}
+                if (grp_str && grp_str[0] != '\0') {
+                    char* end = nullptr;
+                    errno = 0;
+                    long v = strtol(grp_str, &end, 10);
+                    if (errno == 0 && end != grp_str && v >= 0 && v <= INT_MAX) {
+                        grp = static_cast<int>(v);
+                    }
+                }
                 if (grp >= 0 && grp < static_cast<int>(m.size()))
                     return m[static_cast<size_t>(grp)].str();
             }
@@ -3108,7 +3119,7 @@ static void run_fuzzer_thread(state_t& state) {
 
     std::atomic<int> next_index{0};
     int total   = static_cast<int>(combos.size());
-    int threads = std::min(cfg.thread_count, 32);
+    int threads = std::min(std::max(cfg.thread_count, 1), 32);
 
     auto worker = [&]() {
         while (state.fuzz_running.load()) {

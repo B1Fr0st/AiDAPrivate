@@ -396,6 +396,8 @@ static tool_result_t tool_search_workspace(const json& params)
     std::string root = file_browser::current_dir;
     if (params.contains("path") && params["path"].is_string()) {
         std::string custom = sanitize_path(params["path"].get<std::string>());
+        if (!path_within_workspace(custom))
+            return tool_result_t::error("Path is outside the workspace.");
         std::error_code ec;
         if (fs::is_directory(custom, ec))
             root = custom;
@@ -597,6 +599,8 @@ static tool_result_t tool_run_command(const json& params)
     std::string cwd = file_browser::current_dir;
     if (params.contains("cwd") && params["cwd"].is_string()) {
         std::string custom = sanitize_path(params["cwd"].get<std::string>());
+        if (!path_within_workspace(custom))
+            return tool_result_t::error("cwd is outside the workspace.");
         std::error_code ec;
         if (fs::is_directory(custom, ec))
             cwd = custom;
@@ -625,7 +629,7 @@ static tool_result_t tool_run_command(const json& params)
     SetHandleInformation(h_stderr_rd, HANDLE_FLAG_INHERIT, 0);
 
 
-    std::string cmdline = "cmd.exe /c \"" + command + "\"";
+    std::string cmdline = "cmd.exe /s /c \"" + command + "\"";
 
     STARTUPINFOA si{};
     si.cb = sizeof(si);
@@ -800,7 +804,13 @@ static tool_result_t tool_run_command(const json& params)
         return true;
     };
 
+    bool cancelled = false;
     while (true) {
+        if (mcp_standalone::current_call_cancelled()) {
+            cancelled = true;
+            TerminateProcess(pi.hProcess, 1);
+            break;
+        }
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start).count();
         if (elapsed >= timeout_ms) {
@@ -845,7 +855,10 @@ static tool_result_t tool_run_command(const json& params)
 
     output_log::push(bottom_tab_t::sandbox_log,
         "[run_command] exit=" + std::to_string(exit_code) +
-        (timed_out ? " (TIMED OUT)" : ""));
+        (cancelled ? " (CANCELLED)" : (timed_out ? " (TIMED OUT)" : "")));
+
+    if (cancelled)
+        return tool_result_t::error("Command cancelled by client request.");
 
     std::string result;
     result += "Exit code: " + std::to_string(exit_code);
@@ -861,6 +874,115 @@ static tool_result_t tool_run_command(const json& params)
     }
 
     return tool_result_t::ok(result);
+}
+
+
+static tool_result_t tool_cancel_command(const json& params)
+{
+    tool_result_t gate_error;
+    if (!ensure_coding_tool_runtime("cancel_command", gate_error))
+        return gate_error;
+
+    if (!params.contains("session_id") || !params["session_id"].is_string())
+        return tool_result_t::error("Missing required parameter: session_id");
+
+    std::string session_id = params["session_id"].get<std::string>();
+    if (session_id.empty())
+        return tool_result_t::error("session_id cannot be empty.");
+
+    bool was_running = false;
+    bool found = command_sessions::with_session(session_id,
+        [&](command_sessions::command_session_t& sess) {
+            was_running = sess.alive.load();
+            sess.alive.store(false);
+            if (sess.process_info.hProcess) {
+                DWORD code = 0;
+                if (GetExitCodeProcess(sess.process_info.hProcess, &code) && code == STILL_ACTIVE)
+                    TerminateProcess(sess.process_info.hProcess, 1);
+            }
+        });
+
+    if (!found)
+        return tool_result_t::error("Session not found: " + session_id);
+
+    if (!command_sessions::remove_session(session_id))
+        return tool_result_t::error("Failed to remove session: " + session_id);
+
+    output_log::push(bottom_tab_t::sandbox_log,
+        "[cancel_command] session=" + session_id +
+        (was_running ? " (terminated)" : " (already finished)"));
+
+    json data;
+    data["cancelled"] = true;
+    data["session_id"] = session_id;
+    data["was_running"] = was_running;
+    return tool_result_t::ok("Cancelled session " + session_id, data);
+}
+
+
+static tool_result_t tool_list_commands(const json& /*params*/)
+{
+    tool_result_t gate_error;
+    if (!ensure_coding_tool_runtime("list_commands", gate_error))
+        return gate_error;
+
+    auto ids = command_sessions::list_sessions();
+
+    json sessions = json::array();
+    std::string text;
+    text += "Sessions: " + std::to_string(ids.size()) + "\n";
+
+    for (const auto& id : ids) {
+        json entry;
+        std::string sess_id;
+        std::string sess_cmd;
+        bool running = false;
+        int64_t exit_code = 0;
+        bool timed_out = false;
+        int64_t duration_ms = 0;
+        size_t stdout_bytes = 0;
+        size_t stderr_bytes = 0;
+
+        bool found = command_sessions::with_session(id,
+            [&](command_sessions::command_session_t& sess) {
+                sess_id = sess.id;
+                sess_cmd = sess.command;
+                running = sess.alive.load();
+                exit_code = sess.exit_code.load();
+                timed_out = sess.timed_out.load();
+                auto end = running ? std::chrono::steady_clock::now() : sess.finished_at;
+                duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    end - sess.started_at).count();
+                std::lock_guard<std::mutex> lk(sess.output_mutex);
+                stdout_bytes = sess.stdout_buf.size();
+                stderr_bytes = sess.stderr_buf.size();
+            });
+
+        if (!found) continue;
+
+        entry["id"] = sess_id;
+        entry["command"] = sess_cmd;
+        entry["running"] = running;
+        entry["exit_code"] = running ? json(nullptr) : json(exit_code);
+        entry["timed_out"] = timed_out;
+        entry["duration_ms"] = duration_ms;
+        entry["lines_buffered"] = static_cast<int64_t>(stdout_bytes + stderr_bytes);
+        entry["stdout_bytes"] = static_cast<int64_t>(stdout_bytes);
+        entry["stderr_bytes"] = static_cast<int64_t>(stderr_bytes);
+        sessions.push_back(entry);
+
+        text += "  " + sess_id + " | " +
+            (running ? "running" : ("exit=" + std::to_string(exit_code))) +
+            " | " + std::to_string(duration_ms) + "ms" +
+            " | " + sess_cmd + "\n";
+    }
+
+    if (ids.empty())
+        text += "(no active sessions)";
+
+    json data;
+    data["sessions"] = sessions;
+    return tool_result_t::ok(text, data);
 }
 
 
@@ -956,6 +1078,30 @@ void register_coding_tools(mcp_standalone::server_t& srv)
         },
         false,
         tool_run_command,
+        mcp_standalone::tool_visibility_t::internal_only
+    });
+
+    srv.register_tool({
+        "cancel_command",
+        "Cancel a background command session previously started with run_command (wait=false). "
+        "If the child process is still running, it is terminated. The session is then removed "
+        "from the registry. Use list_commands to discover active session ids.",
+        {
+            {"session_id", "string", "The terminal session id returned by run_command.", true},
+        },
+        false,
+        tool_cancel_command,
+        mcp_standalone::tool_visibility_t::internal_only
+    });
+
+    srv.register_tool({
+        "list_commands",
+        "List all currently registered background command sessions (running and finished, "
+        "until pruned). Returns one entry per session with id, command, running state, "
+        "exit code, duration, and buffered output sizes.",
+        {},
+        true,
+        tool_list_commands,
         mcp_standalone::tool_visibility_t::internal_only
     });
 }

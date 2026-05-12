@@ -2,16 +2,30 @@
 
 #pragma once
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shlobj.h>
+
+#pragma comment(lib, "Shell32.lib")
+#pragma comment(lib, "Ole32.lib")
+
 #include "mcp_standalone.hpp"
 
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <functional>
 #include <iomanip>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 
@@ -153,6 +167,18 @@ inline void register_compat(mcp_standalone::server_t& srv,
 
 inline std::string get_downloads_folder()
 {
+    PWSTR known_path = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Downloads, 0, nullptr, &known_path)) && known_path) {
+        const int needed = WideCharToMultiByte(CP_UTF8, 0, known_path, -1, nullptr, 0, nullptr, nullptr);
+        if (needed > 1) {
+            std::string out(static_cast<size_t>(needed - 1), '\0');
+            WideCharToMultiByte(CP_UTF8, 0, known_path, -1, out.data(), needed, nullptr, nullptr);
+            CoTaskMemFree(known_path);
+            out.push_back('\\');
+            return out;
+        }
+        CoTaskMemFree(known_path);
+    }
     char buf[MAX_PATH] = {};
     DWORD len = GetEnvironmentVariableA("USERPROFILE", buf, MAX_PATH);
     if (len > 0 && len < MAX_PATH)
@@ -162,11 +188,10 @@ inline std::string get_downloads_folder()
 
 inline void ensure_parent_dir_exists(const std::string& file_path)
 {
-    std::string::size_type pos = 0;
-    while ((pos = file_path.find_first_of("\\/", pos + 1)) != std::string::npos)
-    {
-        std::string dir = file_path.substr(0, pos);
-        if (dir.size() == 2 && dir[1] == ':') { pos++; continue; }
-        CreateDirectoryA(dir.c_str(), nullptr);
-    }
+    if (file_path.empty()) return;
+    std::filesystem::path p(file_path);
+    auto parent = p.parent_path();
+    if (parent.empty()) return;
+    std::error_code ec;
+    std::filesystem::create_directories(parent, ec);
 }

@@ -185,15 +185,23 @@ struct pg_session_t {
     std::queue<pg_capture_t>   captures;
 
     std::atomic<bool>          polling{false};
+    std::atomic<bool>          exited{false};
 
 
-    uint32_t prev_write_idx   = 0;
-    uint64_t total_captured   = 0;
-    uint64_t estimated_drops  = 0;
+    uint32_t prev_write_idx     = 0;
+    uint32_t prev_raw_write_idx = 0;
+    bool     ring_initialized   = false;
+    uint64_t total_captured     = 0;
+    uint64_t estimated_drops    = 0;
 
     pg_session_t() = default;
     ~pg_session_t() {
         polling.store(false);
+        for (int i = 0; i < 2000; ++i) {
+            if (exited.load())
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
     }
 
     pg_session_t(const pg_session_t&)            = delete;
@@ -232,7 +240,10 @@ public:
         if (ring_addr == 0) return 0;
 
         uint64_t sc_addr = driver_bridge::allocate_memory(SHELLCODE_SIZE + 16);
-        if (sc_addr == 0) return 0;
+        if (sc_addr == 0) {
+            driver_bridge::free_memory(ring_addr);
+            return 0;
+        }
 
 
         std::vector<uint8_t> zeroes(RING_TOTAL_SIZE, 0);
@@ -247,17 +258,36 @@ public:
 
         uint32_t old_prot = 0;
         if (!driver_bridge::protect_memory(target_addr, region_size,
-                                    orig_protect | 0x100 , &old_prot))
+                                    orig_protect | 0x100 , &old_prot)) {
+            driver_bridge::free_memory(sc_addr);
+            driver_bridge::free_memory(ring_addr);
             return 0;
+        }
 
 
         uint64_t ntdll_base_install = find_module_base(pid, "ntdll.dll");
-        if (ntdll_base_install == 0) return 0;
+        if (ntdll_base_install == 0) {
+            driver_bridge::protect_memory(target_addr, region_size, orig_protect, nullptr);
+            driver_bridge::free_memory(sc_addr);
+            driver_bridge::free_memory(ring_addr);
+            return 0;
+        }
         uint64_t rtl_add_fn = driver_bridge::resolve_export(ntdll_base_install,
                                                       "RtlAddVectoredExceptionHandler");
-        if (rtl_add_fn == 0) return 0;
+        if (rtl_add_fn == 0) {
+            driver_bridge::protect_memory(target_addr, region_size, orig_protect, nullptr);
+            driver_bridge::free_memory(sc_addr);
+            driver_bridge::free_memory(ring_addr);
+            return 0;
+        }
 
         uint64_t veh_handle = driver_bridge::call_function(rtl_add_fn, 1, sc_addr);
+        if (veh_handle == 0) {
+            driver_bridge::protect_memory(target_addr, region_size, orig_protect, nullptr);
+            driver_bridge::free_memory(sc_addr);
+            driver_bridge::free_memory(ring_addr);
+            return 0;
+        }
 
 
         auto session         = std::make_unique<pg_session_t>();
@@ -326,6 +356,12 @@ public:
 
             driver_bridge::protect_memory(sess->target_addr, sess->region_size,
                                    sess->orig_protect, nullptr);
+
+            for (int i = 0; i < 2000 && !sess->exited.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+            if (sess->sc_addr) driver_bridge::free_memory(sess->sc_addr);
+            if (sess->ring_addr) driver_bridge::free_memory(sess->ring_addr);
         }
         return true;
     }
@@ -380,6 +416,7 @@ private:
             if (sess->polling.load())
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
+        sess->exited.store(true);
     }
 
     void drain_ring(pg_session_t* sess) {
@@ -390,16 +427,24 @@ private:
             return;
         std::memcpy(&hdr, hdr_buf.data(), sizeof(hdr));
 
-        uint32_t w = hdr.write_idx & (RING_ENTRIES - 1);
-        uint32_t r = hdr.read_idx  & (RING_ENTRIES - 1);
+        uint32_t raw_w = hdr.write_idx;
+        uint32_t raw_r = hdr.read_idx;
+        uint32_t w = raw_w & (RING_ENTRIES - 1);
+        uint32_t r = raw_r & (RING_ENTRIES - 1);
 
 
-        if (w == r && w != sess->prev_write_idx) {
-            sess->estimated_drops += RING_ENTRIES;
+        if (sess->ring_initialized) {
+            uint32_t writes_advanced = raw_w - sess->prev_raw_write_idx;
+            if (writes_advanced > RING_ENTRIES) {
+                sess->estimated_drops += writes_advanced - RING_ENTRIES;
+            }
         }
+        sess->prev_raw_write_idx = raw_w;
+        sess->ring_initialized = true;
         sess->prev_write_idx = w;
 
         uint64_t drained = 0;
+        uint32_t initial_r = r;
         while (r != w) {
             pg_capture_t entry{};
             uint64_t entry_addr = sess->ring_addr + sizeof(pg_ring_header_t)
@@ -415,7 +460,7 @@ private:
         }
         sess->total_captured += drained;
 
-        if (r != (hdr.read_idx & (RING_ENTRIES - 1))) {
+        if (drained > 0 || r != initial_r) {
 
             uint32_t new_r = r;
             std::vector<uint8_t> r_buf(sizeof(new_r));

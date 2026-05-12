@@ -35,6 +35,8 @@
 
 extern mcp_client::manager_t s_mcp_client_mgr;
 
+namespace file_browser { extern std::string current_dir; }
+
 namespace mcp_client
 {
 
@@ -606,7 +608,7 @@ static httplib::Result do_https_get(const parsed_url_t& url, const httplib::Head
     cli.set_connection_timeout(15);
     cli.set_read_timeout(30);
     cli.set_write_timeout(15);
-    cli.enable_server_certificate_verification(false);
+    cli.enable_server_certificate_verification(url.is_https);
     cli.set_follow_location(true);
     return cli.Get(url.path, hdrs);
 }
@@ -619,7 +621,8 @@ static httplib::Result do_https_post(const std::string& origin, const std::strin
     cli.set_connection_timeout(15);
     cli.set_read_timeout(30);
     cli.set_write_timeout(15);
-    cli.enable_server_certificate_verification(false);
+    const bool is_https_origin = origin.rfind("https://", 0) == 0;
+    cli.enable_server_certificate_verification(is_https_origin);
     cli.set_follow_location(true);
     return cli.Post(path.c_str(), hdrs, body, content_type.c_str());
 }
@@ -939,17 +942,13 @@ client_t& client_t::operator=(client_t&& o) noexcept
 
 bool client_t::connect(const server_config_t& cfg)
 {
-    std::lock_guard<std::mutex> lk(_mtx);
-
-
-    if (_state == connection_state_t::connected)
+    bool need_disconnect = false;
     {
-
-        _mtx.unlock();
-        disconnect();
-        _mtx.lock();
+        std::lock_guard<std::mutex> peek(_mtx);
+        need_disconnect = (_state == connection_state_t::connected);
     }
-
+    if (need_disconnect) disconnect();
+    std::lock_guard<std::mutex> lk(_mtx);
     _cfg   = cfg;
     _state = connection_state_t::connecting;
     _last_error.clear();
@@ -1599,32 +1598,49 @@ bool client_t::send_http(json& out, const json& request)
         return false;
     }
 
-    httplib::Headers headers = {
-        {"Content-Type", "application/json"}
-    };
-    if (_transport_mode == transport_mode_t::streamable_http)
-        headers.emplace("Accept", "text/event-stream, application/json");
-    else
-        headers.emplace("Accept", "application/json");
-    headers.emplace("User-Agent", "AiDA-MCP/1.0");
-
-    aida::auth::auth_info_t stored;
-    if (load_mcp_auth(_cfg.name, stored) && !stored.access.empty()) {
-        headers.emplace("Authorization", "Bearer " + stored.access);
-    } else if (!_cfg.api_key.empty()) {
-        headers.emplace("Authorization", "Bearer " + _cfg.api_key);
-    }
-
-    if (!_streamable_session_id.empty())
-        headers.emplace("Mcp-Session-Id", _streamable_session_id);
-
     const std::string body = json_dump_safe(request);
-
     std::string post_path = purl.path;
     if (_transport_mode == transport_mode_t::sse_legacy && !_sse_post_path.empty())
         post_path = _sse_post_path;
 
-    auto res = do_https_post(purl.origin, post_path, headers, body, "application/json");
+    auto build_headers = [this]() {
+        httplib::Headers headers = {
+            {"Content-Type", "application/json"}
+        };
+        if (_transport_mode == transport_mode_t::streamable_http)
+            headers.emplace("Accept", "text/event-stream, application/json");
+        else
+            headers.emplace("Accept", "application/json");
+        headers.emplace("User-Agent", "AiDA-MCP/1.0");
+
+        aida::auth::auth_info_t stored;
+        if (load_mcp_auth(_cfg.name, stored) && !stored.access.empty()) {
+            headers.emplace("Authorization", "Bearer " + stored.access);
+        } else if (!_cfg.api_key.empty()) {
+            headers.emplace("Authorization", "Bearer " + _cfg.api_key);
+        }
+        if (!_streamable_session_id.empty())
+            headers.emplace("Mcp-Session-Id", _streamable_session_id);
+        return headers;
+    };
+
+    auto res = do_https_post(purl.origin, post_path, build_headers(), body, "application/json");
+
+    if (res && (res->status == 401 || res->status == 403)) {
+        bool refreshed = false;
+        {
+            aida::auth::auth_info_t info;
+            if (load_mcp_auth(_cfg.name, info)
+                && info.kind == aida::auth::auth_kind_t::oauth
+                && !info.refresh.empty()) {
+                refreshed = refresh_access_token_locked();
+            }
+        }
+        if (refreshed) {
+            res = do_https_post(purl.origin, post_path, build_headers(), body, "application/json");
+        }
+    }
+
     if (!res) {
         _last_error = "HTTP request failed: " + httplib::to_string(res.error());
         return false;
@@ -1660,18 +1676,31 @@ bool client_t::send_http(json& out, const json& request)
             if (nl == std::string::npos) nl = body_text.size();
             std::string line = body_text.substr(pos, nl - pos);
             pos = nl + 1;
-            if (line.size() >= 6 && line.compare(0, 6, "data: ") == 0) {
-                std::string data_part = line.substr(6);
-                if (data_part == "[DONE]") continue;
-                json maybe = json::parse(data_part, nullptr, false);
-                if (!maybe.is_discarded() && maybe.is_object()) {
-                    if (maybe.contains("method") && !maybe.contains("id")) {
-                        process_notification(maybe);
-                        continue;
-                    }
-                    out = std::move(maybe);
-                    return true;
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty()) continue;
+            if (!line.empty() && line.front() == ':') continue;
+            const size_t colon = line.find(':');
+            if (colon == std::string::npos) continue;
+            const std::string field = line.substr(0, colon);
+            if (field != "data") continue;
+            size_t val_start = colon + 1;
+            if (val_start < line.size() && line[val_start] == ' ') ++val_start;
+            std::string data_part = line.substr(val_start);
+            if (data_part == "[DONE]") continue;
+            json maybe = json::parse(data_part, nullptr, false);
+            if (!maybe.is_discarded() && maybe.is_object()) {
+                if (maybe.contains("method") && !maybe.contains("id")) {
+                    process_notification(maybe);
+                    continue;
                 }
+                if (maybe.contains("method") && maybe.contains("id")) {
+                    json inbound_response;
+                    if (dispatch_inbound_request(maybe, inbound_response))
+                        send_inbound_response(inbound_response);
+                    continue;
+                }
+                out = std::move(maybe);
+                return true;
             }
         }
         _last_error = "Invalid JSON response from MCP server";
@@ -1684,8 +1713,144 @@ bool client_t::send_http(json& out, const json& request)
         return true;
     }
 
+    if (response.is_object() && response.contains("method") && response.contains("id")) {
+        json inbound_response;
+        if (dispatch_inbound_request(response, inbound_response))
+            send_inbound_response(inbound_response);
+        out = json::object();
+        return true;
+    }
+
     out = std::move(response);
     return true;
+}
+
+static std::string encode_file_uri_path(const std::string& abs_path)
+{
+    std::string normalized;
+    normalized.reserve(abs_path.size());
+    for (char c : abs_path) {
+        if (c == '\\') normalized.push_back('/');
+        else           normalized.push_back(c);
+    }
+
+    std::string out;
+    out.reserve(normalized.size() * 3);
+    for (unsigned char c : normalized) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+            || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.'
+            || c == '~' || c == '/' || c == ':') {
+            out.push_back(static_cast<char>(c));
+        } else {
+            char buf[4];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%%%02X", c);
+            out.append(buf);
+        }
+    }
+    return out;
+}
+
+json client_t::build_roots_list_result() const
+{
+    std::string workspace_path = file_browser::current_dir;
+    if (workspace_path.empty()) {
+        char buf[MAX_PATH] = {};
+        if (GetCurrentDirectoryA(MAX_PATH, buf) > 0)
+            workspace_path = buf;
+    }
+
+    json roots = json::array();
+    if (!workspace_path.empty()) {
+        const std::string encoded = encode_file_uri_path(workspace_path);
+        std::string uri;
+        uri.reserve(encoded.size() + 8);
+        uri += "file:///";
+        if (!encoded.empty() && encoded.front() == '/')
+            uri += encoded.substr(1);
+        else
+            uri += encoded;
+
+        json entry;
+        entry["uri"]  = uri;
+        entry["name"] = "AiDA workspace";
+        roots.push_back(std::move(entry));
+    }
+
+    json result;
+    result["roots"] = std::move(roots);
+    return result;
+}
+
+bool client_t::dispatch_inbound_request(const json& request, json& response_out)
+{
+    if (!request.is_object() || !request.contains("method") || !request.contains("id"))
+        return false;
+
+    const std::string method = request.value("method", std::string{});
+    const json& id_val = request["id"];
+
+    json response;
+    response["jsonrpc"] = "2.0";
+    response["id"]      = id_val;
+
+    if (method == "roots/list") {
+        response["result"] = build_roots_list_result();
+    } else if (method == "ping") {
+        response["result"] = json::object();
+    } else {
+        json err;
+        err["code"]    = -32601;
+        err["message"] = std::string("Method not found: ") + method;
+        response["error"] = std::move(err);
+    }
+
+    response_out = std::move(response);
+    return true;
+}
+
+bool client_t::post_outbound_http_message(const json& message)
+{
+    parsed_url_t purl;
+    if (!parse_url_full(_cfg.url, purl))
+        return false;
+
+    std::string post_path = purl.path;
+    if (_transport_mode == transport_mode_t::sse_legacy && !_sse_post_path.empty())
+        post_path = _sse_post_path;
+
+    httplib::Headers headers = {
+        {"Content-Type", "application/json"}
+    };
+    if (_transport_mode == transport_mode_t::streamable_http)
+        headers.emplace("Accept", "text/event-stream, application/json");
+    else
+        headers.emplace("Accept", "application/json");
+    headers.emplace("User-Agent", "AiDA-MCP/1.0");
+
+    aida::auth::auth_info_t stored;
+    if (load_mcp_auth(_cfg.name, stored) && !stored.access.empty()) {
+        headers.emplace("Authorization", "Bearer " + stored.access);
+    } else if (!_cfg.api_key.empty()) {
+        headers.emplace("Authorization", "Bearer " + _cfg.api_key);
+    }
+    if (!_streamable_session_id.empty())
+        headers.emplace("Mcp-Session-Id", _streamable_session_id);
+
+    const std::string body = json_dump_safe(message);
+    auto res = do_https_post(purl.origin, post_path, headers, body, "application/json");
+    return res && res->status >= 200 && res->status < 300;
+}
+
+void client_t::send_inbound_response(const json& response)
+{
+    if (_cfg.transport == transport_type_t::stdio) {
+        const std::string body = json_dump_safe(response);
+        write_to_stdin(body);
+        return;
+    }
+    if (_cfg.transport == transport_type_t::http_sse) {
+        post_outbound_http_message(response);
+    }
 }
 
 void client_t::process_notification(const json& notif)
@@ -1748,6 +1913,12 @@ bool client_t::poll_notifications()
     if (maybe.is_discarded() || !maybe.is_object()) return false;
     if (maybe.contains("method") && !maybe.contains("id")) {
         process_notification(maybe);
+        return true;
+    }
+    if (maybe.contains("method") && maybe.contains("id")) {
+        json inbound_response;
+        if (dispatch_inbound_request(maybe, inbound_response))
+            send_inbound_response(inbound_response);
         return true;
     }
     return false;
@@ -1989,6 +2160,12 @@ bool client_t::send_stdio(json& out, const json& request)
             process_notification(response);
             continue;
         }
+        if (response.is_object() && response.contains("method") && response.contains("id")) {
+            json inbound_response;
+            if (dispatch_inbound_request(response, inbound_response))
+                send_inbound_response(inbound_response);
+            continue;
+        }
         out = std::move(response);
         return true;
     }
@@ -2003,59 +2180,137 @@ void manager_t::add_server(const server_config_t& cfg)
     std::lock_guard<std::mutex> lk(_mtx);
 
 
-    for (auto& e : _entries) {
-        if (e.cfg.name == cfg.name) {
-            e.cfg = cfg;
+    for (auto& ep : _entries) {
+        if (ep->cfg.name == cfg.name) {
+            ep->cfg = cfg;
             return;
         }
     }
 
-    _entries.push_back({cfg, client_t{}});
+    auto ep = std::make_shared<entry_t>();
+    ep->cfg = cfg;
+    _entries.push_back(std::move(ep));
 }
 
 void manager_t::remove_server(const std::string& name)
 {
-    std::lock_guard<std::mutex> lk(_mtx);
+    std::shared_ptr<entry_t> target;
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
 
-    auto it = std::find_if(_entries.begin(), _entries.end(),
-        [&](const entry_t& e) { return e.cfg.name == name; });
+        auto it = std::find_if(_entries.begin(), _entries.end(),
+            [&](const std::shared_ptr<entry_t>& ep) { return ep && ep->cfg.name == name; });
 
-    if (it != _entries.end()) {
-        it->client.disconnect();
+        if (it == _entries.end()) return;
+        target = *it;
         _entries.erase(it);
     }
+
+    if (target) target->client.disconnect();
 }
 
 void manager_t::connect_all()
 {
-    std::lock_guard<std::mutex> lk(_mtx);
+    std::vector<std::string> to_connect;
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        to_connect.reserve(_entries.size());
+        for (auto& ep : _entries) {
+            auto& e = *ep;
+            if (e.cfg.enabled && e.cfg.auto_connect &&
+                e.client.state() != connection_state_t::connected)
+            {
+                bool already = false;
+                for (const auto& n : _in_flight_connects) {
+                    if (n == e.cfg.name) { already = true; break; }
+                }
+                if (already) continue;
+                to_connect.push_back(e.cfg.name);
+                _in_flight_connects.push_back(e.cfg.name);
+            }
+        }
+    }
 
-    for (auto& e : _entries) {
-        if (e.cfg.enabled && e.cfg.auto_connect &&
-            e.client.state() != connection_state_t::connected)
+    for (const auto& name : to_connect) {
+        server_config_t cfg;
+        bool found = false;
         {
-            e.client.connect(e.cfg);
-            if (e.client.is_connected())
-                e.client.list_tools();
+            std::lock_guard<std::mutex> lk(_mtx);
+            for (auto& ep : _entries) {
+                if (ep->cfg.name == name) {
+                    cfg = ep->cfg;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (!found) {
+            std::lock_guard<std::mutex> lk(_mtx);
+            _in_flight_connects.erase(
+                std::remove(_in_flight_connects.begin(), _in_flight_connects.end(), name),
+                _in_flight_connects.end());
+            continue;
+        }
+
+        client_t tmp_client;
+        bool ok = tmp_client.connect(cfg);
+        if (ok) tmp_client.list_tools();
+
+        std::lock_guard<std::mutex> lk(_mtx);
+        _in_flight_connects.erase(
+            std::remove(_in_flight_connects.begin(), _in_flight_connects.end(), name),
+            _in_flight_connects.end());
+        for (auto& ep : _entries) {
+            if (ep->cfg.name == name) {
+                ep->client = std::move(tmp_client);
+                break;
+            }
         }
     }
 }
 
 void manager_t::disconnect_all()
 {
-    std::lock_guard<std::mutex> lk(_mtx);
-    for (auto& e : _entries)
-        e.client.disconnect();
+    std::vector<std::shared_ptr<entry_t>> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        snapshot = _entries;
+    }
+    for (auto& ep : snapshot)
+        ep->client.disconnect();
 }
 
 bool manager_t::connect_server(const std::string& name)
 {
-    std::lock_guard<std::mutex> lk(_mtx);
+    server_config_t cfg;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        for (auto& ep : _entries) {
+            if (ep->cfg.name == name) {
+                cfg = ep->cfg;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+        for (const auto& n : _in_flight_connects) {
+            if (n == name) return true;
+        }
+        _in_flight_connects.push_back(name);
+    }
 
-    for (auto& e : _entries) {
-        if (e.cfg.name == name) {
-            bool ok = e.client.connect(e.cfg);
-            if (ok) e.client.list_tools();
+    client_t tmp_client;
+    bool ok = tmp_client.connect(cfg);
+    if (ok) tmp_client.list_tools();
+
+    std::lock_guard<std::mutex> lk(_mtx);
+    _in_flight_connects.erase(
+        std::remove(_in_flight_connects.begin(), _in_flight_connects.end(), name),
+        _in_flight_connects.end());
+    for (auto& ep : _entries) {
+        if (ep->cfg.name == name) {
+            ep->client = std::move(tmp_client);
             return ok;
         }
     }
@@ -2064,22 +2319,30 @@ bool manager_t::connect_server(const std::string& name)
 
 void manager_t::disconnect_server(const std::string& name)
 {
-    std::lock_guard<std::mutex> lk(_mtx);
-
-    for (auto& e : _entries) {
-        if (e.cfg.name == name) {
-            e.client.disconnect();
-            return;
+    std::shared_ptr<entry_t> target;
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        for (auto& ep : _entries) {
+            if (ep->cfg.name == name) {
+                target = ep;
+                break;
+            }
         }
     }
+    if (target) target->client.disconnect();
 }
 
 std::vector<remote_tool_t> manager_t::get_all_tools()
 {
-    std::lock_guard<std::mutex> lk(_mtx);
+    std::vector<std::shared_ptr<entry_t>> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        snapshot = _entries;
+    }
 
     std::vector<remote_tool_t> all;
-    for (auto& e : _entries) {
+    for (auto& ep : snapshot) {
+        auto& e = *ep;
         if (e.client.is_connected()) {
             const auto& tools = e.client.cached_tools();
             all.insert(all.end(), tools.begin(), tools.end());
@@ -2090,45 +2353,70 @@ std::vector<remote_tool_t> manager_t::get_all_tools()
 
 call_result_t manager_t::call_tool(const std::string& qualified_name, const json& arguments)
 {
-    std::lock_guard<std::mutex> lk(_mtx);
+    std::vector<std::shared_ptr<entry_t>> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        snapshot = _entries;
+    }
 
     size_t legacy_sep = qualified_name.find("::");
     if (legacy_sep != std::string::npos) {
         std::string server = qualified_name.substr(0, legacy_sep);
         std::string tool   = qualified_name.substr(legacy_sep + 2);
 
-        for (auto& e : _entries) {
-            if (e.cfg.name == server && e.client.is_connected())
-                return e.client.call_tool(tool, arguments);
+        std::shared_ptr<entry_t> target;
+        for (auto& ep : snapshot) {
+            if (ep->cfg.name == server && ep->client.is_connected()) {
+                target = ep;
+                break;
+            }
         }
+        if (target) return target->client.call_tool(tool, arguments);
         return call_result_t::error("MCP server '" + server + "' not found or not connected");
     }
 
-    for (auto& e : _entries) {
-        if (!e.client.is_connected()) continue;
-        for (const auto& t : e.client.cached_tools()) {
-            if (t.name == qualified_name)
-                return e.client.call_tool(t.original_name.empty() ? t.name : t.original_name, arguments);
+    std::shared_ptr<entry_t> target;
+    std::string resolved_tool;
+    for (auto& ep : snapshot) {
+        if (!ep->client.is_connected()) continue;
+        for (const auto& t : ep->client.cached_tools()) {
+            if (t.name == qualified_name) {
+                target = ep;
+                resolved_tool = t.original_name.empty() ? t.name : t.original_name;
+                break;
+            }
         }
+        if (target) break;
     }
+    if (target) return target->client.call_tool(resolved_tool, arguments);
 
-    for (auto& e : _entries) {
-        if (!e.client.is_connected()) continue;
-        for (const auto& t : e.client.cached_tools()) {
-            if (t.original_name == qualified_name)
-                return e.client.call_tool(t.original_name, arguments);
+    for (auto& ep : snapshot) {
+        if (!ep->client.is_connected()) continue;
+        for (const auto& t : ep->client.cached_tools()) {
+            if (t.original_name == qualified_name) {
+                target = ep;
+                resolved_tool = t.original_name;
+                break;
+            }
         }
+        if (target) break;
     }
+    if (target) return target->client.call_tool(resolved_tool, arguments);
 
     return call_result_t::error("MCP tool '" + qualified_name + "' not found on any connected server");
 }
 
 size_t manager_t::tool_count() const
 {
-    std::lock_guard<std::mutex> lk(_mtx);
+    std::vector<std::shared_ptr<entry_t>> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        snapshot = _entries;
+    }
 
     size_t count = 0;
-    for (const auto& e : _entries) {
+    for (const auto& ep : snapshot) {
+        const auto& e = *ep;
         if (e.client.is_connected())
             count += e.client.cached_tools().size();
     }
@@ -2137,10 +2425,15 @@ size_t manager_t::tool_count() const
 
 std::vector<remote_resource_t> manager_t::get_all_resources()
 {
-    std::lock_guard<std::mutex> lk(_mtx);
+    std::vector<std::shared_ptr<entry_t>> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        snapshot = _entries;
+    }
 
     std::vector<remote_resource_t> all;
-    for (auto& e : _entries) {
+    for (auto& ep : snapshot) {
+        auto& e = *ep;
         if (e.client.is_connected()) {
             auto res = e.client.list_resources();
             all.insert(all.end(), res.begin(), res.end());
@@ -2151,21 +2444,31 @@ std::vector<remote_resource_t> manager_t::get_all_resources()
 
 std::string manager_t::read_resource(const std::string& server_name, const std::string& uri)
 {
-    std::lock_guard<std::mutex> lk(_mtx);
-
-    for (auto& e : _entries) {
-        if (e.cfg.name == server_name && e.client.is_connected())
-            return e.client.read_resource(uri);
+    std::shared_ptr<entry_t> target;
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        for (auto& ep : _entries) {
+            if (ep->cfg.name == server_name && ep->client.is_connected()) {
+                target = ep;
+                break;
+            }
+        }
     }
+    if (target) return target->client.read_resource(uri);
     return {};
 }
 
 std::vector<remote_prompt_t> manager_t::get_all_prompts()
 {
-    std::lock_guard<std::mutex> lk(_mtx);
+    std::vector<std::shared_ptr<entry_t>> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        snapshot = _entries;
+    }
 
     std::vector<remote_prompt_t> all;
-    for (auto& e : _entries) {
+    for (auto& ep : snapshot) {
+        auto& e = *ep;
         if (e.client.is_connected()) {
             auto pr = e.client.list_prompts();
             all.insert(all.end(), pr.begin(), pr.end());
@@ -2178,23 +2481,33 @@ std::string manager_t::get_prompt(const std::string& server_name,
                                   const std::string& prompt_name,
                                   const std::map<std::string, std::string>& arguments)
 {
-    std::lock_guard<std::mutex> lk(_mtx);
-
-    for (auto& e : _entries) {
-        if (e.cfg.name == server_name && e.client.is_connected())
-            return e.client.get_prompt(prompt_name, arguments);
+    std::shared_ptr<entry_t> target;
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        for (auto& ep : _entries) {
+            if (ep->cfg.name == server_name && ep->client.is_connected()) {
+                target = ep;
+                break;
+            }
+        }
     }
+    if (target) return target->client.get_prompt(prompt_name, arguments);
     return {};
 }
 
 std::vector<manager_t::server_status_t> manager_t::get_status() const
 {
-    std::lock_guard<std::mutex> lk(_mtx);
+    std::vector<std::shared_ptr<entry_t>> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        snapshot = _entries;
+    }
 
     std::vector<server_status_t> result;
-    result.reserve(_entries.size());
+    result.reserve(snapshot.size());
 
-    for (const auto& e : _entries) {
+    for (const auto& ep : snapshot) {
+        const auto& e = *ep;
         result.push_back({
             e.cfg.name,
             e.client.state(),
@@ -2209,54 +2522,69 @@ std::vector<manager_t::server_status_t> manager_t::get_status() const
 
 void manager_t::poll()
 {
-    std::lock_guard<std::mutex> lk(_mtx);
+    std::vector<std::shared_ptr<entry_t>> snapshot;
+    std::vector<std::string> in_flight_snapshot;
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        snapshot = _entries;
+        in_flight_snapshot = _in_flight_connects;
+    }
 
-    for (auto& e : _entries) {
+    std::vector<std::string> needs_reconnect;
+    for (auto& ep : snapshot) {
+        auto& e = *ep;
         if (!e.cfg.enabled || !e.cfg.auto_connect)
             continue;
-
         auto st = e.client.state();
-        if (st == connection_state_t::error ||
-            st == connection_state_t::disconnected)
-        {
-
+        if (st == connection_state_t::error || st == connection_state_t::disconnected) {
             if (e.client.oauth_status() == oauth_status_t::needs_auth
                 || e.client.oauth_status() == oauth_status_t::needs_client_registration)
                 continue;
-
-            e.client.connect(e.cfg);
-            if (e.client.is_connected())
-                e.client.list_tools();
+            bool already = false;
+            for (const auto& n : in_flight_snapshot) {
+                if (n == e.cfg.name) { already = true; break; }
+            }
+            if (already) continue;
+            needs_reconnect.push_back(e.cfg.name);
+            continue;
         }
-
-        if (e.client.is_connected()) {
+        if (e.client.is_connected())
             e.client.poll_notifications();
-        }
+    }
+
+    for (const auto& name : needs_reconnect) {
+        std::thread([this, name]() { this->connect_server(name); }).detach();
     }
 }
 
 bool manager_t::refresh_tools(const std::string& name)
 {
-    std::lock_guard<std::mutex> lk(_mtx);
-    for (auto& e : _entries) {
-        if (e.cfg.name != name) continue;
-        if (!e.client.is_connected()) return false;
-        auto tools = e.client.list_tools();
-        aida::events::mcp_tools_changed_t payload;
-        payload.server_name = name;
-        payload.tool_count = static_cast<int>(tools.size());
-        aida::events::publish(aida::events::event_mcp_tools_changed, payload);
-        return true;
+    std::shared_ptr<entry_t> target;
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        for (auto& ep : _entries) {
+            if (ep->cfg.name == name) {
+                target = ep;
+                break;
+            }
+        }
     }
-    return false;
+    if (!target) return false;
+    if (!target->client.is_connected()) return false;
+    auto tools = target->client.list_tools();
+    aida::events::mcp_tools_changed_t payload;
+    payload.server_name = name;
+    payload.tool_count = static_cast<int>(tools.size());
+    aida::events::publish(aida::events::event_mcp_tools_changed, payload);
+    return true;
 }
 
 bool manager_t::find_config(const std::string& name, server_config_t& out) const
 {
     std::lock_guard<std::mutex> lk(_mtx);
-    for (const auto& e : _entries) {
-        if (e.cfg.name == name) {
-            out = e.cfg;
+    for (const auto& ep : _entries) {
+        if (ep->cfg.name == name) {
+            out = ep->cfg;
             return true;
         }
     }
@@ -2265,9 +2593,15 @@ bool manager_t::find_config(const std::string& name, server_config_t& out) const
 
 json manager_t::mcp_tool_list_json()
 {
-    std::lock_guard<std::mutex> lk(_mtx);
+    std::vector<std::shared_ptr<entry_t>> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        snapshot = _entries;
+    }
+
     json arr = json::array();
-    for (auto& e : _entries) {
+    for (auto& ep : snapshot) {
+        auto& e = *ep;
         if (!e.client.is_connected()) continue;
         for (const auto& t : e.client.cached_tools()) {
             json entry;

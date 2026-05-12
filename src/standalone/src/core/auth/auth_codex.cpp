@@ -271,6 +271,17 @@ namespace codex {
 			::send(client, resp.data(), static_cast<int>(resp.size()), 0);
 		}
 
+		int hex_digit(char c)
+		{
+			if (c >= '0' && c <= '9')
+				return c - '0';
+			if (c >= 'a' && c <= 'f')
+				return 10 + (c - 'a');
+			if (c >= 'A' && c <= 'F')
+				return 10 + (c - 'A');
+			return -1;
+		}
+
 		std::map<std::string, std::string> parse_query(const std::string& query)
 		{
 			std::map<std::string, std::string> out;
@@ -289,9 +300,14 @@ namespace codex {
 					if (val[i] == '+') {
 						decoded.push_back(' ');
 					} else if (val[i] == '%' && i + 2 < val.size()) {
-						const std::string hex = val.substr(i + 1, 2);
-						decoded.push_back(static_cast<char>(std::stoi(hex, nullptr, 16)));
-						i += 2;
+						const int hi = hex_digit(val[i + 1]);
+						const int lo = hex_digit(val[i + 2]);
+						if (hi >= 0 && lo >= 0) {
+							decoded.push_back(static_cast<char>((hi << 4) | lo));
+							i += 2;
+						} else {
+							decoded.push_back(val[i]);
+						}
 					} else {
 						decoded.push_back(val[i]);
 					}
@@ -399,13 +415,23 @@ namespace codex {
 			}
 		}
 
+		std::mutex& listener_mutex()
+		{
+			static std::mutex m;
+			return m;
+		}
+
 		void stop_listener(codex_login_state_t& state)
 		{
-			if (!state.listener_handle)
-				return;
-			std::unique_ptr<std::shared_ptr<listener_t>> holder(
-				static_cast<std::shared_ptr<listener_t>*>(state.listener_handle));
-			state.listener_handle = nullptr;
+			std::shared_ptr<listener_t>* raw_holder = nullptr;
+			{
+				std::lock_guard<std::mutex> lk(listener_mutex());
+				if (!state.listener_handle)
+					return;
+				raw_holder = static_cast<std::shared_ptr<listener_t>*>(state.listener_handle);
+				state.listener_handle = nullptr;
+			}
+			std::unique_ptr<std::shared_ptr<listener_t>> holder(raw_holder);
 			(*holder)->stop.store(true);
 			if ((*holder)->sock != INVALID_SOCKET) {
 				closesocket((*holder)->sock);
@@ -785,6 +811,82 @@ namespace codex {
 		}
 		set_last_error({});
 		return true;
+	}
+
+	bool revoke_tokens(const std::string& access_token,
+		const std::string& refresh_token_value,
+		const std::string& client_id_override)
+	{
+		if (access_token.empty() && refresh_token_value.empty()) {
+			set_last_error("revoke_tokens: no tokens provided");
+			return false;
+		}
+
+		const std::string client_id = client_id_override.empty()
+			? std::string(CODEX_CLIENT_ID) : client_id_override;
+
+		httplib::Client cli(CODEX_ISSUER);
+		cli.set_connection_timeout(10);
+		cli.set_read_timeout(10);
+		cli.set_write_timeout(10);
+		cli.set_follow_location(true);
+		cli.enable_server_certificate_verification(true);
+
+		httplib::Headers headers = {
+			{ "User-Agent", "AiDA/1.0" },
+			{ "Accept", "application/json" },
+		};
+
+		bool any_success = false;
+		std::string last_failure;
+
+		const auto post_revoke = [&](const std::string& token,
+			const char* hint) -> bool {
+			if (token.empty())
+				return true;
+			std::string body = "token=" + url_encode(token);
+			body += "&token_type_hint=";
+			body += hint;
+			body += "&client_id=" + url_encode(client_id);
+			auto res = cli.Post("/oauth/revoke", headers, body,
+				"application/x-www-form-urlencoded");
+			if (!res) {
+				last_failure = std::string("revoke ") + hint + " unreachable: "
+					+ httplib::to_string(res.error());
+				return false;
+			}
+			if (res->status >= 200 && res->status < 300)
+				return true;
+			if (res->status == 400 || res->status == 401)
+				return true;
+			last_failure = std::string("revoke ") + hint + " status="
+				+ std::to_string(res->status);
+			return false;
+		};
+
+		if (post_revoke(refresh_token_value, "refresh_token"))
+			any_success = true;
+		if (post_revoke(access_token, "access_token"))
+			any_success = true;
+
+		if (!any_success) {
+			set_last_error(last_failure.empty()
+				? std::string("revoke failed")
+				: last_failure);
+			return false;
+		}
+		set_last_error({});
+		return true;
+	}
+
+	bool revoke_token()
+	{
+		auth_info_t info;
+		if (!store::get("openai", info) || info.kind != auth_kind_t::oauth) {
+			set_last_error("no openai oauth credentials");
+			return false;
+		}
+		return revoke_tokens(info.access, info.refresh, info.custom_client_id);
 	}
 
 	const std::string& last_error()

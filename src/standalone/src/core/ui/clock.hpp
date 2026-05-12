@@ -2,12 +2,14 @@
 
 #include "imgui/imgui.h"
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 
 namespace aida::ui::clock {
 
 	namespace detail {
 		inline std::atomic<uint64_t> s_frame_index{ 0 };
+		inline int   s_last_imgui_frame = -1;
 		inline float s_seconds = 0.f;
 		inline float s_dt = 0.f;
 		inline float s_dt_unscaled = 0.f;
@@ -16,6 +18,9 @@ namespace aida::ui::clock {
 	}
 
 	inline void tick() {
+		int frame = ImGui::GetFrameCount();
+		if (frame == detail::s_last_imgui_frame) return;
+		detail::s_last_imgui_frame = frame;
 		ImGuiIO& io = ImGui::GetIO();
 		float dt = io.DeltaTime;
 		if (dt < 0.f) dt = 0.f;

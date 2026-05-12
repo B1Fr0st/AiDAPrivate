@@ -312,10 +312,15 @@ bool generate_server_cert(const std::string& domain, const root_ca_t& ca, server
 
 
 SSL_CTX* get_ssl_ctx_for_domain(const std::string& domain, const root_ca_t& ca) {
+    constexpr size_t kMaxCacheEntries = 1024;
     std::lock_guard<std::mutex> lock(g_ctx_mutex);
 
     auto it = g_ctx_cache.find(domain);
     if (it != g_ctx_cache.end()) return it->second.get();
+
+    if (g_ctx_cache.size() >= kMaxCacheEntries) {
+        g_ctx_cache.erase(g_ctx_cache.begin());
+    }
 
 
     server_cert_t srv;

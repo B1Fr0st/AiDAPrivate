@@ -64,10 +64,22 @@ inline void start_deobfuscate(local_state_t& st) {
 			toast_notification::toast_type_t::warning, 3.0f);
 		return;
 	}
+	if (deobfuscation_engine::g_state.processing.load()) return;
 	uint32_t max_insn = static_cast<uint32_t>(st.max_instructions);
 	deobfuscation_engine::g_state.processing.store(true);
+	deobfuscation_engine::g_state.progress_current.store(0);
+	deobfuscation_engine::g_state.progress_total.store(5);
 	work_queue::post([addr, max_insn]() {
-		auto result = deobfuscation_engine::deobfuscate_function(addr, max_insn);
+		deobfuscation_engine::deobfuscated_result_t result;
+		try {
+			result = deobfuscation_engine::deobfuscate_function(addr, max_insn);
+		} catch (const std::exception& ex) {
+			result.success = false;
+			result.error = std::string("Deobfuscation aborted: ") + ex.what();
+		} catch (...) {
+			result.success = false;
+			result.error = "Deobfuscation aborted by unknown exception";
+		}
 		std::lock_guard<std::mutex> lk(deobfuscation_engine::g_state.mutex);
 		deobfuscation_engine::g_state.last_result = std::move(result);
 		deobfuscation_engine::g_state.processing.store(false);

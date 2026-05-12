@@ -34,6 +34,10 @@ namespace copilot {
 	bool poll_login(copilot_login_state_t& state);
 	bool cancel_login(copilot_login_state_t& state);
 	bool refresh_token();
+	bool revoke_token();
+	bool revoke_tokens(const std::string& access_token,
+		const std::string& refresh_token_value,
+		const std::string& client_id_override);
 	const std::string& last_error();
 
 }

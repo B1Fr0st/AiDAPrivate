@@ -425,8 +425,9 @@ nlohmann::json column_json_or_empty(sqlite3_stmt* stmt, int col)
     if (sqlite3_column_type(stmt, col) == SQLITE_NULL) return nlohmann::json();
     const std::string txt = column_text_or_empty(stmt, col);
     if (txt.empty()) return nlohmann::json();
-    try { return nlohmann::json::parse(txt); }
-    catch (...) { return nlohmann::json(); }
+    auto parsed = nlohmann::json::parse(txt, nullptr, false);
+    if (parsed.is_discarded()) return nlohmann::json();
+    return parsed;
 }
 
 
@@ -451,6 +452,8 @@ void hydrate_session_from_row(sqlite3_stmt* stmt, session_info_t& out)
     out.permission           = column_json_or_empty(stmt, 16);
     if (sqlite3_column_type(stmt, 17) != SQLITE_NULL) {
         out.total_cost_usd = sqlite3_column_double(stmt, 17);
+    } else {
+        out.total_cost_usd = 0.0;
     }
     if (out.version <= 0) out.version = 1;
 }
@@ -485,13 +488,10 @@ bool recalc_session_cost_locked(sqlite3* db, const std::string& session_id)
         const std::string kind = column_text_or_empty(stmt, 0);
         if (kind != "step_finish") continue;
         const std::string payload = column_text_or_empty(stmt, 1);
-        try {
-            auto j = nlohmann::json::parse(payload);
-            if (j.contains("cost_usd") && j["cost_usd"].is_number()) {
-                total += j["cost_usd"].get<double>();
-            }
-        }
-        catch (...) {
+        auto j = nlohmann::json::parse(payload, nullptr, false);
+        if (j.is_discarded()) continue;
+        if (j.contains("cost_usd") && j["cost_usd"].is_number()) {
+            total += j["cost_usd"].get<double>();
         }
     }
     sqlite3_finalize(stmt);
@@ -812,13 +812,13 @@ bool initialize()
 
 bool shutdown()
 {
+    std::lock_guard<std::mutex> lk(g_init_mutex);
     sqlite3* db = g_db.exchange(nullptr, std::memory_order_acq_rel);
+    g_initialized.store(false, std::memory_order_release);
     if (!db) {
-        g_initialized.store(false, std::memory_order_release);
         return true;
     }
-    int rc = sqlite3_close(db);
-    g_initialized.store(false, std::memory_order_release);
+    int rc = sqlite3_close_v2(db);
     if (rc != SQLITE_OK) {
         set_last_error("sqlite_close_failed");
         return false;
@@ -1219,6 +1219,51 @@ bool set_archived(const std::string& session_id, int64_t archived_unix)
 }
 
 
+bool set_compacting(const std::string& session_id, int64_t compacting_unix)
+{
+    sqlite3* db = db_handle();
+    if (!db) {
+        set_last_error("not_initialized");
+        return false;
+    }
+    if (session_id.empty()) {
+        set_last_error("invalid_session_id");
+        return false;
+    }
+    const char* sql =
+        "UPDATE sessions SET time_compacting = ?, time_updated = ? WHERE id = ?";
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        set_last_error_sqlite(db, "set_compacting_prepare");
+        return false;
+    }
+    bool ok = bind_int64_or_null(stmt, 1, compacting_unix) &&
+              bind_int64(stmt, 2, now_unix_ms()) &&
+              bind_text(stmt, 3, session_id);
+    if (ok) rc = sqlite3_step(stmt);
+    int changes = sqlite3_changes(db);
+    sqlite3_finalize(stmt);
+    if (!ok || rc != SQLITE_DONE) {
+        set_last_error_sqlite(db, "set_compacting_step");
+        return false;
+    }
+    if (changes == 0) {
+        set_last_error("session_not_found");
+        return false;
+    }
+
+    {
+        aida::events::session_updated_t evt;
+        evt.session_id     = session_id;
+        evt.fields_changed = "compacting";
+        aida::events::publish(aida::events::event_session_updated, evt);
+    }
+
+    return true;
+}
+
+
 bool remove(const std::string& session_id)
 {
     sqlite3* db = db_handle();
@@ -1403,6 +1448,14 @@ bool append_message(const message_t& message)
         exec_simple(db, "ROLLBACK");
         return false;
     }
+
+    {
+        aida::events::session_updated_t evt;
+        evt.session_id     = message.session_id;
+        evt.fields_changed = "messages,total_cost";
+        aida::events::publish(aida::events::event_session_updated, evt);
+    }
+
     return true;
 }
 
@@ -1471,9 +1524,8 @@ bool list_messages(const std::string& session_id,
         while (sqlite3_step(pstmt) == SQLITE_ROW) {
             const std::string kind = column_text_or_empty(pstmt, 0);
             const std::string payload = column_text_or_empty(pstmt, 1);
-            nlohmann::json j;
-            try { j = nlohmann::json::parse(payload); }
-            catch (...) { j = nlohmann::json::object(); }
+            auto j = nlohmann::json::parse(payload, nullptr, false);
+            if (j.is_discarded()) j = nlohmann::json::object();
             m.parts.push_back(deserialize_part(kind, j));
         }
     }
@@ -1546,6 +1598,79 @@ bool update_message(const message_t& message)
         exec_simple(db, "ROLLBACK");
         return false;
     }
+
+    {
+        aida::events::session_updated_t evt;
+        evt.session_id     = message.session_id;
+        evt.fields_changed = "messages,total_cost";
+        aida::events::publish(aida::events::event_session_updated, evt);
+    }
+
+    return true;
+}
+
+
+bool remove_message(const std::string& session_id, const std::string& message_id)
+{
+    sqlite3* db = db_handle();
+    if (!db) {
+        set_last_error("not_initialized");
+        return false;
+    }
+    if (session_id.empty() || message_id.empty()) {
+        set_last_error("invalid_message_id");
+        return false;
+    }
+
+    if (!exec_simple(db, "BEGIN IMMEDIATE")) return false;
+
+    if (!delete_parts_for_message_locked(db, message_id)) {
+        exec_simple(db, "ROLLBACK");
+        return false;
+    }
+
+    const char* sql_del_msg =
+        "DELETE FROM messages WHERE id = ? AND session_id = ?";
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db, sql_del_msg, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        set_last_error_sqlite(db, "remove_message_prepare");
+        exec_simple(db, "ROLLBACK");
+        return false;
+    }
+    bool ok = bind_text(stmt, 1, message_id) &&
+              bind_text(stmt, 2, session_id);
+    if (ok) rc = sqlite3_step(stmt);
+    int changes = sqlite3_changes(db);
+    sqlite3_finalize(stmt);
+    if (!ok || rc != SQLITE_DONE) {
+        set_last_error_sqlite(db, "remove_message_step");
+        exec_simple(db, "ROLLBACK");
+        return false;
+    }
+    if (changes == 0) {
+        exec_simple(db, "ROLLBACK");
+        set_last_error("message_not_found");
+        return false;
+    }
+
+    if (!recalc_session_cost_locked(db, session_id)) {
+        exec_simple(db, "ROLLBACK");
+        return false;
+    }
+
+    if (!exec_simple(db, "COMMIT")) {
+        exec_simple(db, "ROLLBACK");
+        return false;
+    }
+
+    {
+        aida::events::session_updated_t evt;
+        evt.session_id     = session_id;
+        evt.fields_changed = "messages,total_cost";
+        aida::events::publish(aida::events::event_session_updated, evt);
+    }
+
     return true;
 }
 
@@ -1583,17 +1708,14 @@ usage_tokens_t session_tokens(const std::string& session_id)
     }
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         const std::string payload = column_text_or_empty(stmt, 0);
-        try {
-            auto j = nlohmann::json::parse(payload);
-            const auto tk = j.value("tokens", nlohmann::json::object());
-            agg.input       += tk.value("input", static_cast<int64_t>(0));
-            agg.output      += tk.value("output", static_cast<int64_t>(0));
-            agg.reasoning   += tk.value("reasoning", static_cast<int64_t>(0));
-            agg.cache_read  += tk.value("cache_read", static_cast<int64_t>(0));
-            agg.cache_write += tk.value("cache_write", static_cast<int64_t>(0));
-        }
-        catch (...) {
-        }
+        auto j = nlohmann::json::parse(payload, nullptr, false);
+        if (j.is_discarded()) continue;
+        const auto tk = j.value("tokens", nlohmann::json::object());
+        agg.input       += tk.value("input", static_cast<int64_t>(0));
+        agg.output      += tk.value("output", static_cast<int64_t>(0));
+        agg.reasoning   += tk.value("reasoning", static_cast<int64_t>(0));
+        agg.cache_read  += tk.value("cache_read", static_cast<int64_t>(0));
+        agg.cache_write += tk.value("cache_write", static_cast<int64_t>(0));
     }
     sqlite3_finalize(stmt);
     return agg;

@@ -181,6 +181,7 @@ bool fork(const std::string& session_id,
           const std::string& fork_at_message_id,
           session_info_t& out_new);
 bool set_archived(const std::string& session_id, int64_t archived_unix);
+bool set_compacting(const std::string& session_id, int64_t compacting_unix);
 bool remove(const std::string& session_id);
 bool set_title(const std::string& session_id, const std::string& title);
 
@@ -189,6 +190,7 @@ bool list_messages(const std::string& session_id,
                    std::vector<message_t>& out,
                    int limit = -1);
 bool update_message(const message_t& message);
+bool remove_message(const std::string& session_id, const std::string& message_id);
 
 double         session_cost(const std::string& session_id);
 usage_tokens_t session_tokens(const std::string& session_id);

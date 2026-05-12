@@ -122,7 +122,8 @@ inline void rscan(rscan_context_t& ctx, uint64_t value_to_find, int level)
 	}
 	ctx.visited.push_back(value_to_find);
 
-	uint64_t start_value = value_to_find - static_cast<uint64_t>(ctx.config->struct_size);
+	uint64_t start_value = (value_to_find > static_cast<uint64_t>(ctx.config->struct_size))
+		? (value_to_find - static_cast<uint64_t>(ctx.config->struct_size)) : 0;
 	uint64_t stop_value = value_to_find;
 	if (ctx.config->negative_offsets)
 		stop_value = value_to_find + static_cast<uint64_t>(ctx.config->struct_size);
@@ -139,12 +140,13 @@ inline void rscan(rscan_context_t& ctx, uint64_t value_to_find, int level)
 		if (offset < -ctx.config->max_offset || offset > ctx.config->max_offset)
 			continue;
 
+		bool stop_outer = false;
 		for (auto& pd : it->second) {
-			if (ctx.cancel->load()) break;
+			if (ctx.cancel->load()) { stop_outer = true; break; }
 
 			{
 				std::lock_guard<std::mutex> lk(*ctx.results_mutex);
-				if (ctx.results->size() >= ctx.max_results) return;
+				if (ctx.results->size() >= ctx.max_results) { stop_outer = true; break; }
 			}
 
 			ctx.current_offsets.push_back(offset);
@@ -181,6 +183,7 @@ inline void rscan(rscan_context_t& ctx, uint64_t value_to_find, int level)
 
 			ctx.current_offsets.pop_back();
 		}
+		if (stop_outer) break;
 	}
 
 	ctx.visited.pop_back();
@@ -204,6 +207,7 @@ inline void build_reverse_map()
 		std::vector<driver_bridge::memory_region_t> readable;
 		for (auto& r : regions) {
 			if (r.state != 0x1000) continue;
+			if (r.protect & 0x100) continue;
 			uint32_t p = r.protect & 0xFF;
 			if (p == 0x01 || p == 0x00) continue;
 			if (r.size > 0x10000000) continue;
@@ -212,6 +216,7 @@ inline void build_reverse_map()
 
 		uint64_t total_bytes = 0;
 		for (auto& r : readable) total_bytes += r.size;
+		if (total_bytes == 0) total_bytes = 1;
 		uint64_t scanned = 0;
 
 		std::map<uint64_t, std::vector<pointer_data_t>> new_map;
@@ -330,11 +335,14 @@ inline bool validate_chain(const pointer_chain_t& chain)
 {
 	uint64_t base_addr = 0;
 
-	if (chain.is_static && chain.module_index >= 0 &&
-	    chain.module_index < static_cast<int>(g_state.cached_modules.size())) {
-		base_addr = g_state.cached_modules[chain.module_index].base + chain.base_offset;
-	} else {
-		base_addr = chain.base_offset;
+	{
+		std::lock_guard<std::mutex> lk(g_state.map_mutex);
+		if (chain.is_static && chain.module_index >= 0 &&
+		    chain.module_index < static_cast<int>(g_state.cached_modules.size())) {
+			base_addr = g_state.cached_modules[chain.module_index].base + chain.base_offset;
+		} else {
+			base_addr = chain.base_offset;
+		}
 	}
 
 	uint64_t current = base_addr;

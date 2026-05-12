@@ -405,8 +405,11 @@ namespace
         cfg.capture_stdout = params.value("capture_stdout", true);
         cfg.capture_stderr = params.value("capture_stderr", true);
         cfg.allow_network = g_sa_settings.sandbox.network_mode == "default";
+        cfg.cancel_token = mcp_standalone::current_cancel_token();
 
         const auto run = sandbox::execute(cfg);
+        if (run.cancelled)
+            return error(run.error.empty() ? std::string("Sandbox execution cancelled by client request.") : run.error);
         if (!run.success && !run.timed_out)
             return error(run.error);
 
@@ -416,6 +419,7 @@ namespace
         out["pid"] = run.pid;
         out["timed_out"] = run.timed_out;
         out["killed"] = run.killed;
+        out["cancelled"] = run.cancelled;
         out["elapsed_ms"] = run.elapsed_ms;
         out["session_dir"] = run.session_dir;
         out["wsb_path"] = run.wsb_path;
@@ -1014,6 +1018,9 @@ namespace
         if (!params.contains("url") || !params["url"].is_string())
             return error("Missing required parameter: url");
 
+        if (mcp_standalone::current_call_cancelled())
+            return error("webfetch cancelled by client request.");
+
         const std::string url = params["url"].get<std::string>();
         if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0)
             return error("URL must start with http:// or https://");
@@ -1073,6 +1080,8 @@ namespace
         };
 
         auto res = cli.Get(path, headers);
+        if (mcp_standalone::current_call_cancelled())
+            return error("webfetch cancelled by client request.");
         if (!res)
             return error("HTTP request failed: " + httplib::to_string(res.error()) + " for " + url);
         if (res->status < 200 || res->status >= 300)

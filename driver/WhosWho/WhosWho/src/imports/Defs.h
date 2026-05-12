@@ -267,6 +267,11 @@ typedef VOID (NTAPI* PCREATE_PROCESS_NOTIFY_ROUTINE_EX)(
     PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo);
 inline NTSTATUS           (NTAPI* _PsSetCreateProcessNotifyRoutineEx)(PCREATE_PROCESS_NOTIFY_ROUTINE_EX, BOOLEAN);
 
+typedef VOID (NTAPI* PLOAD_IMAGE_NOTIFY_ROUTINE_LOCAL)(
+    PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo);
+inline NTSTATUS           (NTAPI* _PsSetLoadImageNotifyRoutine)    (PLOAD_IMAGE_NOTIFY_ROUTINE_LOCAL);
+inline NTSTATUS           (NTAPI* _PsRemoveLoadImageNotifyRoutine) (PLOAD_IMAGE_NOTIFY_ROUTINE_LOCAL);
+
 inline ULONG              (__cdecl* _DbgPrintEx)                   (ULONG, ULONG, PCSTR, ...);
 
 #define WW_LOG(fmt, ...) do { if (_DbgPrintEx) _DbgPrintEx(77, 0, "[WW] " fmt "\n", ##__VA_ARGS__); } while(0)
@@ -713,6 +718,9 @@ inline bool SetupFunctions() {
 
     *(PVOID*)&_PsSetCreateProcessNotifyRoutineEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsSetCreateProcessNotifyRoutineEx"));
 
+    *(PVOID*)&_PsSetLoadImageNotifyRoutine = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsSetLoadImageNotifyRoutine"));
+    *(PVOID*)&_PsRemoveLoadImageNotifyRoutine = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsRemoveLoadImageNotifyRoutine"));
+
     *(PVOID*)&_DbgPrintEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("DbgPrintEx"));
 
     WW_LOG("SetupFunctions: kernelBase=%p", kernelBase);
@@ -737,6 +745,7 @@ inline bool SetupFunctions() {
     WW_LOG("SetupFunctions: _KeInitializeDpc=%p _KeInitializeTimerEx=%p _KeSetTimerEx=%p _KeCancelTimer=%p _KeFlushQueuedDpcs=%p", _KeInitializeDpc, _KeInitializeTimerEx, _KeSetTimerEx, _KeCancelTimer, _KeFlushQueuedDpcs);
     WW_LOG("SetupFunctions: _ExQueueWorkItem=%p", _ExQueueWorkItem);
     WW_LOG("SetupFunctions: _ObRegisterCallbacks=%p _ObUnRegisterCallbacks=%p _PsSetCreateProcessNotifyRoutineEx=%p", _ObRegisterCallbacks, _ObUnRegisterCallbacks, _PsSetCreateProcessNotifyRoutineEx);
+    WW_LOG("SetupFunctions: _PsSetLoadImageNotifyRoutine=%p _PsRemoveLoadImageNotifyRoutine=%p", _PsSetLoadImageNotifyRoutine, _PsRemoveLoadImageNotifyRoutine);
     WW_LOG("SetupFunctions: _DbgPrintEx=%p", _DbgPrintEx);
 
     if (!_PsSuspendThread && !_ZwSuspendThread) {

@@ -56,11 +56,26 @@ inline std::vector<std::string> split_lines(const std::string& text)
 }
 
 
-inline std::string join_lines(const std::vector<std::string>& lines)
+inline bool text_uses_crlf(const std::string& text)
+{
+    size_t crlf = 0;
+    size_t lf_only = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '\n') {
+            if (i > 0 && text[i - 1] == '\r') ++crlf;
+            else ++lf_only;
+        }
+    }
+    if (crlf == 0 && lf_only == 0) return false;
+    return crlf >= lf_only;
+}
+
+
+inline std::string join_lines(const std::vector<std::string>& lines, const std::string& eol = "\n")
 {
     std::string result;
     for (size_t i = 0; i < lines.size(); ++i) {
-        if (i > 0) result += "\n";
+        if (i > 0) result += eol;
         result += lines[i];
     }
     return result;
@@ -225,6 +240,8 @@ inline diff_result_t apply(const std::string& original_content, const std::strin
         return result;
     }
 
+    const std::string eol = text_uses_crlf(original_content) ? "\r\n" : "\n";
+
     auto file_lines = split_lines(original_content);
 
     int offset = 0;
@@ -233,21 +250,25 @@ inline diff_result_t apply(const std::string& original_content, const std::strin
         std::vector<std::string> context_lines;
         std::vector<std::string> remove_lines;
         std::vector<std::string> add_lines;
+        std::vector<std::string> new_block;
 
         for (const auto& line : hunk.lines) {
             if (line.empty()) {
                 context_lines.push_back("");
+                new_block.push_back("");
                 continue;
             }
             char prefix = line[0];
             std::string content = line.substr(1);
             if (prefix == ' ') {
                 context_lines.push_back(content);
+                new_block.push_back(content);
             } else if (prefix == '-') {
                 context_lines.push_back(content);
                 remove_lines.push_back(content);
             } else if (prefix == '+') {
                 add_lines.push_back(content);
+                new_block.push_back(content);
             }
         }
 
@@ -261,11 +282,7 @@ inline diff_result_t apply(const std::string& original_content, const std::strin
             return result;
         }
 
-        int remove_count = 0;
-        for (const auto& line : hunk.lines) {
-            if (!line.empty() && (line[0] == '-' || line[0] == ' '))
-                ++remove_count;
-        }
+        int remove_count = static_cast<int>(context_lines.size());
 
         if (match_line < 0 || static_cast<size_t>(match_line) > file_lines.size() ||
             remove_count < 0 ||
@@ -280,15 +297,15 @@ inline diff_result_t apply(const std::string& original_content, const std::strin
         auto it_end = it_start + remove_count;
         file_lines.erase(it_start, it_end);
 
-        for (int i = static_cast<int>(add_lines.size()) - 1; i >= 0; --i) {
-            file_lines.insert(file_lines.begin() + match_line, add_lines[i]);
+        for (int i = static_cast<int>(new_block.size()) - 1; i >= 0; --i) {
+            file_lines.insert(file_lines.begin() + match_line, new_block[i]);
         }
 
-        offset += static_cast<int>(add_lines.size()) - remove_count;
+        offset += static_cast<int>(new_block.size()) - remove_count;
     }
 
     result.success = true;
-    result.content = join_lines(file_lines);
+    result.content = join_lines(file_lines, eol);
     return result;
 }
 

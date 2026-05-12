@@ -250,17 +250,19 @@ namespace compaction {
 
 			if (token_budget > 0 && cut > 0) {
 				int64_t accumulated = 0;
+				size_t tail_start = 0;
+				bool budget_exceeded = false;
 				size_t i = messages.size();
 				while (i > 0) {
 					--i;
 					accumulated += estimate_message_tokens(messages[i]);
 					if (accumulated > token_budget) {
-						i = (std::min<size_t>)(i + 1, messages.size());
+						tail_start = (std::min<size_t>)(i + 1, messages.size());
+						budget_exceeded = true;
 						break;
 					}
-					if (i == 0) break;
 				}
-				if (i < cut) cut = i;
+				if (budget_exceeded && tail_start < cut) cut = tail_start;
 			}
 
 			return cut;
@@ -286,14 +288,7 @@ namespace compaction {
 
 		bool set_compacting_marker(const std::string& session_id, int64_t value, std::string& err)
 		{
-			aida::session::session_info_t info;
-			if (!aida::session::get(session_id, info)) {
-				err = aida::session::last_error();
-				return false;
-			}
-			info.time_compacting_unix = value;
-			info.time_updated_unix = now_unix_ms();
-			if (!aida::session::update(info)) {
+			if (!aida::session::set_compacting(session_id, value)) {
 				err = aida::session::last_error();
 				return false;
 			}
@@ -336,8 +331,10 @@ namespace compaction {
 
 	const std::string& last_error()
 	{
+		thread_local std::string snapshot;
 		std::lock_guard<std::mutex> lk(error_mutex());
-		return error_slot();
+		snapshot = error_slot();
+		return snapshot;
 	}
 
 
@@ -367,7 +364,6 @@ namespace compaction {
 	{
 		if (max_chars <= 0) return true;
 		const size_t cap = static_cast<size_t>(max_chars);
-		bool any = false;
 		for (auto& m : messages) {
 			for (auto& p : m.parts) {
 				if (p.kind != aida::session::part_t::kind_t::tool) continue;
@@ -375,10 +371,8 @@ namespace compaction {
 				const size_t dropped = p.tool.output_text.size() - cap;
 				p.tool.output_text = p.tool.output_text.substr(0, cap)
 					+ "\n... [truncated " + std::to_string(dropped) + " chars]";
-				any = true;
 			}
 		}
-		(void)any;
 		return true;
 	}
 
@@ -596,10 +590,19 @@ namespace compaction {
 			|| info.title.rfind("[task] ", 0) == 0;
 		if (!needs_title) return true;
 
-		(void)provider_id;
+		std::string title_agent_name = "title";
+		if (!provider_id.empty()) {
+			const aida::agent::agent_info_t* sm_agent =
+				aida::agent::small_compaction_agent_for(provider_id);
+			if (sm_agent != nullptr) {
+				const aida::agent::agent_info_t* title_specific =
+					aida::agent::get("title");
+				if (title_specific == nullptr) title_agent_name = sm_agent->name;
+			}
+		}
 
 		std::string raw_title;
-		const bool ok = aida::agent::task::execute("title", first_user_message, 1, session_id, raw_title);
+		const bool ok = aida::agent::task::execute(title_agent_name, first_user_message, 1, session_id, raw_title);
 		if (!ok) {
 			set_last_error("maybe_auto_title: " + aida::agent::task::last_error());
 			return false;

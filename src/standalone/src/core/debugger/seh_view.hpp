@@ -3,6 +3,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <atomic>
 #include <cstdint>
 #include "work_queue.hpp"
 #include <cstdio>
@@ -38,6 +39,7 @@ struct ui_state_t {
 	float                    scroll_y = 0.f;
 	float                    target_scroll_y = 0.f;
 	std::mutex               mutex;
+	std::atomic<bool>        refreshing{false};
 	bool                     scrollbar_dragging = false;
 	float                    scrollbar_drag_offset = 0.f;
 };
@@ -66,6 +68,9 @@ inline uint64_t resolve_thread_teb(uint32_t tid)
 
 inline void refresh()
 {
+	bool expected = false;
+	if (!g_ui.refreshing.compare_exchange_strong(expected, true))
+		return;
 	work_queue::post([]() {
 		std::vector<seh_entry_t> entries;
 
@@ -90,7 +95,7 @@ inline void refresh()
 				std::vector<uint8_t> stack_buf;
 				size_t scan_size = 4096;
 				if (driver_bridge::read_memory(rsp, scan_size, stack_buf) && stack_buf.size() >= 16) {
-					for (size_t i = 0; i + 16 <= stack_buf.size(); i += 8) {
+					for (size_t i = 8; i + 8 <= stack_buf.size(); i += 8) {
 						uint64_t candidate = 0;
 						std::memcpy(&candidate, stack_buf.data() + i, 8);
 						if (candidate > 0x10000 && candidate < 0x7FFFFFFFFFFF) {
@@ -98,7 +103,7 @@ inline void refresh()
 								if (candidate >= m.base && candidate < m.base + m.size) {
 									uint64_t potential_next = 0;
 									std::memcpy(&potential_next, stack_buf.data() + i - 8, 8);
-									if (i >= 8 && potential_next > rsp && potential_next < rsp + 0x100000) {
+									if (potential_next > rsp && potential_next < rsp + 0x100000) {
 										nt_tib_seh = rsp + i - 8;
 										found_seh = true;
 									}
@@ -143,6 +148,8 @@ inline void refresh()
 				}
 
 				entries.push_back(std::move(entry));
+				if (next == current || next == 0 || next == 0xFFFFFFFFFFFFFFFFULL)
+					break;
 				current = next;
 				++idx;
 			}
@@ -152,6 +159,7 @@ inline void refresh()
 			std::lock_guard<std::mutex> lk(g_ui.mutex);
 			g_ui.entries = std::move(entries);
 		}
+		g_ui.refreshing.store(false);
 	});
 }
 

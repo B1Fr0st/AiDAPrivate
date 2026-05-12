@@ -11,7 +11,9 @@
 
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <vector>
 
 
 #define IDR_LIBZ3_DLL       101
@@ -93,9 +95,18 @@ inline std::wstring make_temp_dir()
 inline std::wstring g_z3_temp_path;
 inline HMODULE      g_z3_module = nullptr;
 
+namespace detail {
+    inline std::mutex& z3_mutex() { static std::mutex m; return m; }
+}
+
 
 inline bool extract_and_load_z3()
 {
+    std::lock_guard<std::mutex> lk(detail::z3_mutex());
+
+    if (g_z3_module)
+        return true;
+
     const void* data = nullptr;
     size_t size = 0;
     if (!detail::load_resource(IDR_LIBZ3_DLL, data, size)) {
@@ -103,23 +114,25 @@ inline bool extract_and_load_z3()
         return false;
     }
 
-    g_z3_temp_path = detail::make_temp_path(L"z3_", L".dll");
-    if (g_z3_temp_path.empty())
+    std::wstring tmp_path = detail::make_temp_path(L"z3_", L".dll");
+    if (tmp_path.empty())
         return false;
 
-    if (!detail::write_resource_to_file(data, size, g_z3_temp_path)) {
+    if (!detail::write_resource_to_file(data, size, tmp_path)) {
         OutputDebugStringA("embedded_resources: failed to write libz3.dll to temp\n");
+        DeleteFileW(tmp_path.c_str());
         return false;
     }
 
-
-    g_z3_module = LoadLibraryW(g_z3_temp_path.c_str());
-    if (!g_z3_module) {
-        DeleteFileW(g_z3_temp_path.c_str());
+    HMODULE mod = LoadLibraryW(tmp_path.c_str());
+    if (!mod) {
+        DeleteFileW(tmp_path.c_str());
         OutputDebugStringA("embedded_resources: LoadLibrary failed for temp libz3.dll\n");
         return false;
     }
 
+    g_z3_temp_path = std::move(tmp_path);
+    g_z3_module    = mod;
 
     MoveFileExW(g_z3_temp_path.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
 
@@ -129,6 +142,7 @@ inline bool extract_and_load_z3()
 
 inline void cleanup_z3()
 {
+    std::lock_guard<std::mutex> lk(detail::z3_mutex());
     if (g_z3_module) {
         FreeLibrary(g_z3_module);
         g_z3_module = nullptr;
@@ -158,19 +172,31 @@ inline std::string extract_ghidra_specs()
         { IDR_GHIDRA_LDEFS, L"x86.ldefs" },
     };
 
+    std::vector<std::wstring> written;
+    written.reserve(sizeof(specs) / sizeof(specs[0]));
+
+    auto cleanup_on_failure = [&]() {
+        for (const auto& w : written)
+            DeleteFileW(w.c_str());
+        RemoveDirectoryW(dir.c_str());
+    };
+
     for (auto& s : specs) {
         const void* data = nullptr;
         size_t size = 0;
         if (!detail::load_resource(s.resource_id, data, size)) {
             OutputDebugStringA("embedded_resources: ghidra spec resource not found\n");
+            cleanup_on_failure();
             return {};
         }
 
         std::wstring file_path = dir + L"\\" + s.filename;
         if (!detail::write_resource_to_file(data, size, file_path)) {
             OutputDebugStringA("embedded_resources: failed to write ghidra spec file\n");
+            cleanup_on_failure();
             return {};
         }
+        written.push_back(std::move(file_path));
     }
 
 

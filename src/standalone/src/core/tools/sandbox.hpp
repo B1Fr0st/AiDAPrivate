@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -31,6 +32,7 @@ namespace sandbox
         bool         allow_clipboard = false;
         bool         allow_gpu = false;
         bool         cleanup_session = true;
+        std::atomic<bool>* cancel_token = nullptr;
     };
 
     struct result
@@ -43,6 +45,7 @@ namespace sandbox
         std::string error;
         bool        timed_out = false;
         bool        killed = false;
+        bool        cancelled = false;
         uint64_t    peak_memory_bytes = 0;
         uint32_t    elapsed_ms = 0;
         std::string session_dir;
@@ -80,17 +83,29 @@ namespace sandbox
         {
             if (text.empty())
                 return {};
-            char buffer[4096] = {};
-            WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, buffer, sizeof(buffer), nullptr, nullptr);
-            return buffer;
+            int needed = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            if (needed <= 0)
+                return {};
+            std::string out(static_cast<size_t>(needed - 1), '\0');
+            WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, out.data(), needed, nullptr, nullptr);
+            return out;
         }
 
-        inline std::wstring read_text_file(const std::filesystem::path& path)
+        inline std::wstring xml_escape(const std::wstring& text)
         {
-            std::wifstream ifs(path);
-            if (!ifs.is_open())
-                return {};
-            return std::wstring((std::istreambuf_iterator<wchar_t>(ifs)), std::istreambuf_iterator<wchar_t>());
+            std::wstring out;
+            out.reserve(text.size() + 16);
+            for (wchar_t ch : text) {
+                switch (ch) {
+                    case L'&':  out += L"&amp;";  break;
+                    case L'<':  out += L"&lt;";   break;
+                    case L'>':  out += L"&gt;";   break;
+                    case L'"':  out += L"&quot;"; break;
+                    case L'\'': out += L"&apos;"; break;
+                    default:    out.push_back(ch); break;
+                }
+            }
+            return out;
         }
 
         inline std::string read_utf8_file(const std::filesystem::path& path)
@@ -172,9 +187,10 @@ namespace sandbox
             ofs << L"$pidValue = $proc.Id\n";
             ofs << L"if (-not $proc.WaitForExit(" << timeout_ms << L")) {\n";
             ofs << L"  $timedOut = $true\n";
-            ofs << L"  Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue\n";
+            ofs << L"  try { taskkill /T /F /PID $proc.Id | Out-Null } catch {}\n";
+            ofs << L"  try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}\n";
             ofs << L"  $killed = $true\n";
-            ofs << L"  $proc.WaitForExit()\n";
+            ofs << L"  $proc.WaitForExit(5000) | Out-Null\n";
             ofs << L"}\n";
             ofs << L"$sw.Stop()\n";
             ofs << L"if ($proc.HasExited) { $exitCode = $proc.ExitCode }\n";
@@ -194,52 +210,39 @@ namespace sandbox
                               const config& cfg)
         {
             std::wofstream ofs(wsb_path, std::ios::trunc);
-            const std::wstring host = session_dir.wstring();
-            const std::wstring host_input = (session_dir / L"input").wstring();
+            const std::wstring host = xml_escape(session_dir.wstring());
+            const std::wstring host_input = xml_escape((session_dir / L"input").wstring());
             const std::wstring guest_root = L"C:\\Users\\WDAGUtilityAccount\\Desktop\\AiDAWorkspace";
             const std::wstring guest_input = guest_root + L"\\input";
             ofs << L"<Configuration>\n";
-
-
             ofs << L"  <Networking>" << (cfg.allow_network ? L"Default" : L"Disable") << L"</Networking>\n";
-
-
             ofs << L"  <ClipboardRedirection>" << (cfg.allow_clipboard ? L"Default" : L"Disable") << L"</ClipboardRedirection>\n";
-
-
             ofs << L"  <PrinterRedirection>Disable</PrinterRedirection>\n";
-
-
             ofs << L"  <AudioInput>Disable</AudioInput>\n";
             ofs << L"  <VideoInput>Disable</VideoInput>\n";
-
-
             ofs << L"  <vGPU>" << (cfg.allow_gpu ? L"Default" : L"Disable") << L"</vGPU>\n";
-
 
             if (cfg.max_memory_mb > 0)
                 ofs << L"  <MemoryInMB>" << cfg.max_memory_mb << L"</MemoryInMB>\n";
 
             ofs << L"  <MappedFolders>\n";
 
-
             ofs << L"    <MappedFolder>\n";
             ofs << L"      <HostFolder>" << host_input << L"</HostFolder>\n";
-            ofs << L"      <SandboxFolder>" << guest_input << L"</SandboxFolder>\n";
+            ofs << L"      <SandboxFolder>" << xml_escape(guest_input) << L"</SandboxFolder>\n";
             ofs << L"      <ReadOnly>true</ReadOnly>\n";
             ofs << L"    </MappedFolder>\n";
 
-
             ofs << L"    <MappedFolder>\n";
             ofs << L"      <HostFolder>" << host << L"</HostFolder>\n";
-            ofs << L"      <SandboxFolder>" << guest_root << L"</SandboxFolder>\n";
+            ofs << L"      <SandboxFolder>" << xml_escape(guest_root) << L"</SandboxFolder>\n";
             ofs << L"      <ReadOnly>false</ReadOnly>\n";
             ofs << L"    </MappedFolder>\n";
 
             ofs << L"  </MappedFolders>\n";
             ofs << L"  <LogonCommand>\n";
             ofs << L"    <Command>powershell.exe -ExecutionPolicy Bypass -File "
-                << guest_root << L"\\run.ps1</Command>\n";
+                << xml_escape(guest_root) << L"\\run.ps1</Command>\n";
             ofs << L"  </LogonCommand>\n";
             ofs << L"</Configuration>\n";
         }
@@ -318,18 +321,52 @@ namespace sandbox
         res.pid = pi.dwProcessId;
 
         const uint32_t host_timeout = (std::max)(cfg.timeout_ms + 120000u, 180000u);
+        bool sandbox_alive = true;
+        bool cancelled = false;
         while ((GetTickCount() - start_tick) < host_timeout) {
+            if (cfg.cancel_token && cfg.cancel_token->load(std::memory_order_acquire)) {
+                cancelled = true;
+                break;
+            }
             if (std::filesystem::exists(host_meta))
                 break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            DWORD wait_state = WaitForSingleObject(pi.hProcess, 500);
+            if (wait_state == WAIT_OBJECT_0) {
+                sandbox_alive = false;
+                if (std::filesystem::exists(host_meta))
+                    break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+                if (!std::filesystem::exists(host_meta))
+                    break;
+            }
+        }
+
+        if (cancelled) {
+            res.cancelled = true;
+            res.killed = sandbox_alive;
+            if (sandbox_alive)
+                TerminateProcess(pi.hProcess, 0xDEAD);
+            CloseHandle(pi.hProcess);
+            res.error = "Sandbox execution cancelled by client request.";
+            res.elapsed_ms = static_cast<uint32_t>(GetTickCount() - start_tick);
+            res.session_dir = detail::narrow(session_dir.wstring());
+            res.wsb_path = detail::narrow(host_wsb.wstring());
+            if (cfg.cleanup_session) {
+                std::error_code ec;
+                std::filesystem::remove_all(session_dir, ec);
+            }
+            return res;
         }
 
         if (!std::filesystem::exists(host_meta)) {
-            res.timed_out = true;
-            res.killed = true;
-            TerminateProcess(pi.hProcess, 0xDEAD);
+            res.timed_out = !sandbox_alive ? false : true;
+            res.killed = sandbox_alive;
+            if (sandbox_alive)
+                TerminateProcess(pi.hProcess, 0xDEAD);
             CloseHandle(pi.hProcess);
-            res.error = "Timed out waiting for Windows Sandbox to return execution metadata.";
+            res.error = sandbox_alive
+                ? "Timed out waiting for Windows Sandbox to return execution metadata."
+                : "Windows Sandbox terminated before producing execution metadata.";
             res.session_dir = detail::narrow(session_dir.wstring());
             res.wsb_path = detail::narrow(host_wsb.wstring());
             return res;
@@ -346,7 +383,7 @@ namespace sandbox
             return res;
         }
 
-        res.success = meta.value("success", true);
+        res.success = meta.value("success", false);
         res.exit_code = meta.value("exit_code", 0u);
         res.timed_out = meta.value("timed_out", false);
         res.killed = meta.value("killed", false);

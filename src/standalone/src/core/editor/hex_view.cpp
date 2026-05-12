@@ -125,14 +125,18 @@ bool match_range_contains(const std::vector<int>& matches, int len, int byte_idx
 void clipboard_copy_string(const std::string& text) {
     if (text.empty() || !OpenClipboard(nullptr)) return;
     EmptyClipboard();
-    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, text.size() + 1);
-    if (hg) {
-        void* p = GlobalLock(hg);
-        if (p) {
-            memcpy(p, text.c_str(), text.size() + 1);
-            GlobalUnlock(hg);
-            SetClipboardData(CF_TEXT, hg);
-        }
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
+    if (wlen <= 0) { CloseClipboard(); return; }
+    size_t bytes = (static_cast<size_t>(wlen) + 1) * sizeof(wchar_t);
+    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!hg) { CloseClipboard(); return; }
+    wchar_t* dst = static_cast<wchar_t*>(GlobalLock(hg));
+    if (!dst) { GlobalFree(hg); CloseClipboard(); return; }
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), dst, wlen);
+    dst[wlen] = L'\0';
+    GlobalUnlock(hg);
+    if (!SetClipboardData(CF_UNICODETEXT, hg)) {
+        GlobalFree(hg);
     }
     CloseClipboard();
 }
@@ -162,18 +166,27 @@ void load_from_file(const std::string& path, size_t offset, size_t size) {
         s_last_error = "hex_view::load_from_file: failed to open " + path;
         return;
     }
-    size_t fsize = (size_t)f.tellg();
+    std::streampos tp = f.tellg();
+    if (tp < 0) {
+        s_last_error = "hex_view::load_from_file: failed to read size of " + path;
+        return;
+    }
+    size_t fsize = static_cast<size_t>(tp);
     if (offset >= fsize) {
         s_last_error = "hex_view::load_from_file: offset past end of " + path;
         return;
     }
-    f.seekg((std::streamoff)offset);
+    f.seekg(static_cast<std::streamoff>(offset));
+    if (!f.good()) {
+        s_last_error = "hex_view::load_from_file: failed to seek " + path;
+        return;
+    }
     size_t read_sz = (size > 0 && offset + size <= fsize) ? size : (fsize - offset);
     std::vector<uint8_t> buf(read_sz);
-    f.read((char*)buf.data(), (std::streamsize)read_sz);
+    f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(read_sz));
     auto pos = path.find_last_of("/\\");
     std::string name = (pos != std::string::npos) ? path.substr(pos + 1) : path;
-    set_data(buf, (uint64_t)offset, name);
+    set_data(buf, static_cast<uint64_t>(offset), name);
     s_last_error.clear();
 }
 
@@ -925,10 +938,11 @@ void render(float pos_x, float pos_y, float width, float height,
 
         if (clicked_go || go) {
             uint64_t addr = 0;
-            sscanf_s(st.goto_buf, "%llx", &addr);
-            if (addr >= st.base_addr) {
-                int off = (int)(addr - st.base_addr);
-                if (off >= 0 && off < (int)st.data.size()) {
+            if (st.goto_buf[0] != '\0' && sscanf_s(st.goto_buf, "%llx", &addr) == 1 &&
+                addr >= st.base_addr) {
+                uint64_t off64 = addr - st.base_addr;
+                if (off64 < static_cast<uint64_t>(st.data.size())) {
+                    int off = static_cast<int>(off64);
                     int row = off / bytes_per_row;
                     st.target_scroll_y = row * line_h;
                     st.sel_start = st.sel_end = off;

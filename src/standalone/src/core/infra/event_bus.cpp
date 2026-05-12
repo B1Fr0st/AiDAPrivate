@@ -44,10 +44,20 @@ namespace detail {
         }
 
         const subscription_id_t id = reg.next_id.fetch_add(1, std::memory_order_relaxed);
+        if (id == 0)
+        {
+            set_last_error("event_bus: subscription id counter exhausted");
+            return 0;
+        }
 
         subscription_record_t record{id, payload_type, std::move(invoker)};
 
         std::unique_lock<std::shared_mutex> lock(reg.mutex);
+        if (reg.shutdown_flag.load(std::memory_order_acquire))
+        {
+            set_last_error("event_bus: registry has been shut down");
+            return 0;
+        }
         reg.by_type[type_name].push_back(std::move(record));
         return id;
     }

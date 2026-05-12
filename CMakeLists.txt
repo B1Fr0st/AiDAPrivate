@@ -1752,11 +1752,15 @@ if(BUILD_PROTECTOR)
     if(NOT AIDA_PROTECTOR_LEGACY_STUB AND EXISTS "${_aida_asmjit_src}/CMakeLists.txt")
         set(ASMJIT_STATIC ON CACHE BOOL "Build asmjit as static library" FORCE)
         set(ASMJIT_NO_INSTALL ON CACHE BOOL "Disable asmjit install rules" FORCE)
+        set(ASMJIT_NO_FOREIGN ON CACHE BOOL "Compile host backend only (drops AArch64 — AiDAProtector emits x86-64)" FORCE)
         if(NOT TARGET asmjit)
             add_subdirectory("${_aida_asmjit_src}" "${CMAKE_BINARY_DIR}/.deps/asmjit" EXCLUDE_FROM_ALL)
         endif()
         if(TARGET asmjit AND NOT TARGET asmjit::asmjit)
             add_library(asmjit::asmjit ALIAS asmjit)
+        endif()
+        if(MSVC AND TARGET asmjit AND CMAKE_GENERATOR MATCHES "Ninja")
+            set_property(TARGET asmjit PROPERTY JOB_POOL_COMPILE aida_heavy_compile)
         endif()
     endif()
 
@@ -1895,11 +1899,11 @@ if(BUILD_PROTECTOR)
     add_dependencies(AiDAHelloLoop AiDAProtector)
 
     add_custom_command(TARGET AiDAHelloLoop POST_BUILD
-        COMMAND $<TARGET_FILE:AiDAProtector>
-            --input  "$<TARGET_FILE:AiDAHelloLoop>"
-            --output "$<TARGET_FILE:AiDAHelloLoop>"
-            --all --bind-machine --tamper-level 3 --jit --verbose
-        COMMENT "Protecting aida_hello_loop.exe (full --all pipeline)..."
+        COMMAND ${CMAKE_COMMAND}
+            "-DRETRY_LABEL=aida_hello_loop.exe-protect"
+            "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDAHelloLoop>;--output;$<TARGET_FILE:AiDAHelloLoop>;--all;--bind-machine;--tamper-level;3;--jit;--verbose"
+            -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
+        COMMENT "Protecting aida_hello_loop.exe (full --all pipeline, with AV/indexer retry)..."
         VERBATIM
     )
 
@@ -1970,16 +1974,19 @@ endif()
 if(BUILD_PROTECTOR)
     if(TARGET AiDAStandalone)
         add_custom_command(TARGET AiDAStandalone POST_BUILD
-            COMMAND $<TARGET_FILE:AiDAProtector>
-                --input "$<TARGET_FILE:AiDAStandalone>"
-                --output "$<TARGET_FILE:AiDAStandalone>"
-                --all --no-encrypt-imports --bind-machine --tamper-level 3 --jit --no-llm-poison --verbose
-            COMMENT "Protecting AiDAStandalone.exe..."
+            COMMAND ${CMAKE_COMMAND}
+                "-DRETRY_LABEL=AiDAStandalone.exe-protect"
+                "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDAStandalone>;--output;$<TARGET_FILE:AiDAStandalone>;--all;--no-encrypt-imports;--bind-machine;--tamper-level;3;--jit;--no-llm-poison;--verbose"
+                -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
+            COMMENT "Protecting AiDAStandalone.exe (with AV/indexer retry)..."
             VERBATIM
         )
         if(TARGET aida_pdb_scrubber)
             add_custom_command(TARGET AiDAStandalone POST_BUILD
-                COMMAND $<TARGET_FILE:aida_pdb_scrubber> "$<TARGET_FILE:AiDAStandalone>"
+                COMMAND ${CMAKE_COMMAND}
+                    "-DRETRY_LABEL=AiDAStandalone.exe-scrub"
+                    "-DRETRY_CMD=$<TARGET_FILE:aida_pdb_scrubber>;$<TARGET_FILE:AiDAStandalone>"
+                    -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
                 COMMENT "Scrubbing Rich header and PDB paths from AiDAStandalone.exe..."
                 VERBATIM
             )
@@ -1993,30 +2000,29 @@ if(BUILD_PROTECTOR)
         string(TOLOWER "${AIDA_ARC_WATERMARK}" AIDA_ARC_WATERMARK)
         if(AIDA_ARC_ENCRYPT_IMPORTS)
             add_custom_command(TARGET AiDA_ARC POST_BUILD
-                COMMAND $<TARGET_FILE:AiDAProtector>
-                    --input "$<TARGET_FILE:AiDA_ARC>"
-                    --output "$<TARGET_FILE:AiDA_ARC>"
-                    --all --tamper-level 2 --deep-steal --jit --no-llm-poison
-                    --target-arc --watermark "${AIDA_ARC_WATERMARK}" --embed-watermark
-                    --verbose
-                COMMENT "Protecting aida_core.dll (target-arc, encrypt-imports ON)..."
+                COMMAND ${CMAKE_COMMAND}
+                    "-DRETRY_LABEL=aida_core.dll-protect"
+                    "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA_ARC>;--output;$<TARGET_FILE:AiDA_ARC>;--all;--tamper-level;2;--deep-steal;--jit;--no-llm-poison;--target-arc;--watermark;${AIDA_ARC_WATERMARK};--embed-watermark;--verbose"
+                    -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
+                COMMENT "Protecting aida_core.dll (target-arc, encrypt-imports ON, with AV/indexer retry)..."
                 VERBATIM
             )
         else()
             add_custom_command(TARGET AiDA_ARC POST_BUILD
-                COMMAND $<TARGET_FILE:AiDAProtector>
-                    --input "$<TARGET_FILE:AiDA_ARC>"
-                    --output "$<TARGET_FILE:AiDA_ARC>"
-                    --all --no-encrypt-imports --tamper-level 2 --deep-steal --jit --no-llm-poison
-                    --target-arc --watermark "${AIDA_ARC_WATERMARK}" --embed-watermark
-                    --verbose
-                COMMENT "Protecting aida_core.dll (target-arc, encrypt-imports OFF)..."
+                COMMAND ${CMAKE_COMMAND}
+                    "-DRETRY_LABEL=aida_core.dll-protect"
+                    "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA_ARC>;--output;$<TARGET_FILE:AiDA_ARC>;--all;--no-encrypt-imports;--tamper-level;2;--deep-steal;--jit;--no-llm-poison;--target-arc;--watermark;${AIDA_ARC_WATERMARK};--embed-watermark;--verbose"
+                    -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
+                COMMENT "Protecting aida_core.dll (target-arc, encrypt-imports OFF, with AV/indexer retry)..."
                 VERBATIM
             )
         endif()
         if(TARGET aida_pdb_scrubber)
             add_custom_command(TARGET AiDA_ARC POST_BUILD
-                COMMAND $<TARGET_FILE:aida_pdb_scrubber> "$<TARGET_FILE:AiDA_ARC>"
+                COMMAND ${CMAKE_COMMAND}
+                    "-DRETRY_LABEL=aida_core.dll-scrub"
+                    "-DRETRY_CMD=$<TARGET_FILE:aida_pdb_scrubber>;$<TARGET_FILE:AiDA_ARC>"
+                    -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
                 COMMENT "Scrubbing Rich header and PDB paths from aida_core.dll..."
                 VERBATIM
             )
@@ -2027,16 +2033,19 @@ if(BUILD_PROTECTOR)
 
     if(TARGET AiDA)
         add_custom_command(TARGET AiDA POST_BUILD
-            COMMAND $<TARGET_FILE:AiDAProtector>
-                --input "$<TARGET_FILE:AiDA>"
-                --output "$<TARGET_FILE:AiDA>"
-                --all --no-encrypt-imports --tamper-level 2 --no-jit --no-llm-poison --verbose
-            COMMENT "Protecting AiDA.dll..."
+            COMMAND ${CMAKE_COMMAND}
+                "-DRETRY_LABEL=AiDA.dll-protect"
+                "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA>;--output;$<TARGET_FILE:AiDA>;--all;--no-encrypt-imports;--tamper-level;2;--no-jit;--no-llm-poison;--verbose"
+                -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
+            COMMENT "Protecting AiDA.dll (with AV/indexer retry)..."
             VERBATIM
         )
         if(TARGET aida_pdb_scrubber)
             add_custom_command(TARGET AiDA POST_BUILD
-                COMMAND $<TARGET_FILE:aida_pdb_scrubber> "$<TARGET_FILE:AiDA>"
+                COMMAND ${CMAKE_COMMAND}
+                    "-DRETRY_LABEL=AiDA.dll-scrub"
+                    "-DRETRY_CMD=$<TARGET_FILE:aida_pdb_scrubber>;$<TARGET_FILE:AiDA>"
+                    -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
                 COMMENT "Scrubbing Rich header and PDB paths from AiDA.dll..."
                 VERBATIM
             )

@@ -615,13 +615,23 @@ namespace claude_code {
 			}
 		}
 
+		std::mutex& listener_mutex()
+		{
+			static std::mutex m;
+			return m;
+		}
+
 		void stop_listener(claude_code_login_state_t& state)
 		{
-			if (!state.listener_handle)
-				return;
-			std::unique_ptr<std::shared_ptr<listener_t>> holder(
-				static_cast<std::shared_ptr<listener_t>*>(state.listener_handle));
-			state.listener_handle = nullptr;
+			std::shared_ptr<listener_t>* raw_holder = nullptr;
+			{
+				std::lock_guard<std::mutex> lk(listener_mutex());
+				if (!state.listener_handle)
+					return;
+				raw_holder = static_cast<std::shared_ptr<listener_t>*>(state.listener_handle);
+				state.listener_handle = nullptr;
+			}
+			std::unique_ptr<std::shared_ptr<listener_t>> holder(raw_holder);
 			(*holder)->stop.store(true);
 			for (SOCKET& listen_socket : (*holder)->sockets) {
 				if (listen_socket != INVALID_SOCKET) {
@@ -1044,16 +1054,16 @@ namespace claude_code {
 			return false;
 		}
 
-			const std::string client_id = info.custom_client_id.empty()
+		const std::string client_id = info.custom_client_id.empty()
 			? std::string(CLAUDE_CODE_CLIENT_ID) : info.custom_client_id;
-			const std::string scope = info.custom_scopes.empty()
-				? std::string(CLAUDE_CODE_REFRESH_SCOPES) : join_scopes(info.custom_scopes);
+		const std::string scope = info.custom_scopes.empty()
+			? std::string(CLAUDE_CODE_REFRESH_SCOPES) : join_scopes(info.custom_scopes);
 
 		nlohmann::json body = {
 			{ "grant_type", "refresh_token" },
 			{ "refresh_token", info.refresh },
 			{ "client_id", client_id },
-				{ "scope", scope },
+			{ "scope", scope },
 		};
 
 		nlohmann::json resp;
@@ -1074,27 +1084,27 @@ namespace claude_code {
 		const int64_t expires_in = resp.value("expires_in", static_cast<int64_t>(3600));
 		info.expires_unix = static_cast<int64_t>(std::time(nullptr)) + expires_in;
 
-			std::string account_id = info.account_id;
-			std::string email = info.email;
-			std::string organization_id;
-			read_token_account(resp, account_id, email, organization_id);
+		std::string account_id = info.account_id;
+		std::string email = info.email;
+		std::string organization_id;
+		read_token_account(resp, account_id, email, organization_id);
 
-			nlohmann::json profile = nlohmann::json::object();
-			std::string profile_err;
-			if (profile_get(access, profile, profile_err))
-				read_profile_account(profile, account_id, email, organization_id);
-			else
-				log_nonfatal_profile_error(profile_err);
+		nlohmann::json profile = nlohmann::json::object();
+		std::string profile_err;
+		if (profile_get(access, profile, profile_err))
+			read_profile_account(profile, account_id, email, organization_id);
+		else
+			log_nonfatal_profile_error(profile_err);
 
-			std::string scope_string = resp.value("scope", std::string{});
-			if (scope_string.empty())
-				scope_string = scope;
-			std::vector<std::string> scopes = split_scopes(scope_string);
-			if (scopes.empty())
-				scopes = split_scopes(CLAUDE_CODE_REFRESH_SCOPES);
-			info.account_id = account_id;
-			info.email = email;
-			info.metadata = build_oauth_metadata(resp, profile, scopes, organization_id);
+		std::string scope_string = resp.value("scope", std::string{});
+		if (scope_string.empty())
+			scope_string = scope;
+		std::vector<std::string> scopes = split_scopes(scope_string);
+		if (scopes.empty())
+			scopes = split_scopes(CLAUDE_CODE_REFRESH_SCOPES);
+		info.account_id = account_id;
+		info.email = email;
+		info.metadata = build_oauth_metadata(resp, profile, scopes, organization_id);
 
 		if (!store::set("anthropic", info)) {
 			set_last_error("store::set anthropic failed: " + store::last_error());
@@ -1102,6 +1112,112 @@ namespace claude_code {
 		}
 		set_last_error({});
 		return true;
+	}
+
+	bool revoke_tokens(const std::string& access_token,
+		const std::string& refresh_token_value,
+		const std::string& client_id_override)
+	{
+		if (access_token.empty() && refresh_token_value.empty()) {
+			set_last_error("revoke_tokens: no tokens provided");
+			return false;
+		}
+
+		const std::string client_id = client_id_override.empty()
+			? std::string(CLAUDE_CODE_CLIENT_ID) : client_id_override;
+
+		std::string host;
+		std::string token_path;
+		{
+			std::string url = CLAUDE_CODE_TOKEN_URL;
+			if (url.rfind("https://", 0) == 0)
+				url.erase(0, 8);
+			else if (url.rfind("http://", 0) == 0)
+				url.erase(0, 7);
+			const size_t slash = url.find('/');
+			if (slash == std::string::npos) {
+				host = "https://" + url;
+				token_path = "/";
+			} else {
+				host = "https://" + url.substr(0, slash);
+				token_path = url.substr(slash);
+			}
+		}
+
+		std::string revoke_path = token_path;
+		const size_t token_pos = revoke_path.rfind("/token");
+		if (token_pos != std::string::npos
+			&& token_pos + 6 == revoke_path.size())
+			revoke_path.replace(token_pos, 6, "/revoke");
+		else if (!revoke_path.empty() && revoke_path.back() == '/')
+			revoke_path += "revoke";
+		else
+			revoke_path += "/revoke";
+
+		httplib::Client cli(host);
+		cli.set_connection_timeout(10);
+		cli.set_read_timeout(10);
+		cli.set_write_timeout(10);
+		cli.set_follow_location(true);
+		cli.enable_server_certificate_verification(true);
+
+		httplib::Headers headers = {
+			{ "User-Agent", "AiDA/1.0" },
+			{ "Accept", "application/json" },
+		};
+
+		bool any_success = false;
+		std::string last_failure;
+
+		const auto post_revoke = [&](const std::string& token,
+			const char* hint) -> bool {
+			if (token.empty())
+				return true;
+			nlohmann::json body = {
+				{ "token", token },
+				{ "token_type_hint", hint },
+				{ "client_id", client_id },
+			};
+			const std::string body_str = body.dump();
+			auto res = cli.Post(revoke_path.c_str(), headers, body_str,
+				"application/json");
+			if (!res) {
+				last_failure = std::string("revoke ") + hint + " unreachable: "
+					+ httplib::to_string(res.error());
+				return false;
+			}
+			if (res->status >= 200 && res->status < 300)
+				return true;
+			if (res->status == 400 || res->status == 401)
+				return true;
+			last_failure = std::string("revoke ") + hint + " status="
+				+ std::to_string(res->status);
+			return false;
+		};
+
+		if (post_revoke(refresh_token_value, "refresh_token"))
+			any_success = true;
+		if (post_revoke(access_token, "access_token"))
+			any_success = true;
+
+		if (!any_success) {
+			set_last_error(last_failure.empty()
+				? std::string("revoke failed")
+				: last_failure);
+			return false;
+		}
+		set_last_error({});
+		return true;
+	}
+
+	bool revoke_token()
+	{
+		auth_info_t info;
+		if (!store::get("anthropic", info) || info.kind != auth_kind_t::oauth) {
+			set_last_error("no anthropic oauth credentials");
+			return false;
+		}
+		return revoke_tokens(info.access, info.refresh, info.custom_client_id);
 	}
 
 	const std::string& last_error()

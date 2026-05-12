@@ -49,11 +49,12 @@ inline ui_state_t g_ui;
 
 inline void refresh()
 {
-	if (g_ui.refreshing.load())
-		return;
 	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0)
 		return;
-	g_ui.refreshing.store(true);
+
+	bool expected = false;
+	if (!g_ui.refreshing.compare_exchange_strong(expected, true))
+		return;
 
 	work_queue::post([]() {
 		auto raw_threads = driver_bridge::enumerate_threads();
@@ -72,41 +73,37 @@ inline void refresh()
 			e.rsp = 0;
 			e.entry_point = 0;
 
-
-			bool was_already_suspended = (t.state == 5);
-			e.suspended = was_already_suspended;
-
 			if (t.state == 5)
-				e.state_text = "Suspended";
+				e.state_text = "Waiting";
 			else if (t.state == 2)
 				e.state_text = "Running";
 			else if (t.state == 1)
 				e.state_text = "Ready";
 			else if (t.state == 0)
 				e.state_text = "Initialized";
+			else if (t.state == 3)
+				e.state_text = "Standby";
+			else if (t.state == 4)
+				e.state_text = "Terminated";
+			else if (t.state == 6)
+				e.state_text = "Transition";
 			else
-				e.state_text = "Waiting";
+				e.state_text = "Unknown";
 
-
-			if (e.rip == 0 && !was_already_suspended) {
-				if (driver_bridge::suspend_thread(t.tid, nullptr)) {
-					driver_bridge::thread_context_t ctx{};
-					if (driver_bridge::get_thread_context(t.tid, ctx)) {
-						e.rip = ctx.rip;
-						e.rsp = ctx.rsp;
-					}
-					driver_bridge::resume_thread(t.tid, nullptr);
-				}
-			} else if (was_already_suspended) {
-
-
+			uint32_t prev_count = 0;
+			bool we_suspended = driver_bridge::suspend_thread(t.tid, &prev_count);
+			if (we_suspended) {
 				driver_bridge::thread_context_t ctx{};
 				if (driver_bridge::get_thread_context(t.tid, ctx)) {
 					if (e.rip == 0)
 						e.rip = ctx.rip;
 					e.rsp = ctx.rsp;
 				}
+				driver_bridge::resume_thread(t.tid, nullptr);
 			}
+			e.suspended = (prev_count > 0);
+			if (e.suspended)
+				e.state_text = "Suspended";
 
 
 			for (auto& m : modules) {

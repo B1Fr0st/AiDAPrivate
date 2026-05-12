@@ -82,7 +82,9 @@ inline int64_t zigzag_decode(uint64_t n) {
 }
 
 inline uint64_t zigzag_encode(int64_t n) {
-	return static_cast<uint64_t>((n << 1) ^ (n >> 63));
+	uint64_t u = static_cast<uint64_t>(n);
+	uint64_t sign_mask = static_cast<uint64_t>(0) - (u >> 63);
+	return (u << 1) ^ sign_mask;
 }
 
 inline bool is_printable_byte(uint8_t b) {

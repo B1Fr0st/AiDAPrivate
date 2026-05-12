@@ -229,6 +229,13 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			cfg.input_size = params.value("input_size", 256);
 			cfg.max_iterations = params.value("max_iterations", 10000);
 
+			cfg.pid = driver_bridge::attached_pid();
+			auto threads_snap = driver_bridge::enumerate_threads();
+			cfg.tid = threads_snap.empty() ? 0 : threads_snap.front().tid;
+
+			if (cfg.pid == 0 || cfg.tid == 0)
+				return tool_result_t::error("fuzzer requires an attached process and at least one thread for snapshotting");
+
 			fuzzer_engine::start_fuzzing();
 
 			return tool_result_t::ok("Fuzzing started. Use get_fuzz_results to check progress.");

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -19,11 +20,13 @@ void render_settings_inline(float panel_w, float panel_h);
 void render_tool_approval_dialog();
 bool is_ai_busy();
 void chat_request_cancel();
+std::atomic<bool>* chat_cancel_flag();
 
 
 void        chat_bind_session(const std::string& session_id);
 std::string chat_active_session();
 void        chat_record_assistant_message_id(const std::string& message_id);
+std::string start_new_conversation();
 
 
 namespace mcp_client { class manager_t; }

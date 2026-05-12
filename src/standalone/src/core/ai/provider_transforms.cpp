@@ -480,9 +480,10 @@ namespace {
 
 bool copilot_uses_responses_api(const std::string& model_id)
 {
-	if (starts_with(model_id, "o1") || starts_with(model_id, "o3"))
+	if (starts_with(model_id, "o1") || starts_with(model_id, "o3") ||
+	    starts_with(model_id, "o4") || starts_with(model_id, "o5"))
 		return true;
-	std::regex re("^gpt-(\\d+)");
+	static const std::regex re("^gpt-(\\d+)");
 	std::smatch m;
 	if (std::regex_search(model_id, m, re)) {
 		try {

@@ -1248,6 +1248,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 wj["expression"] = st.watches[i].expression;
                 wj["value"] = st.watches[i].value;
                 wj["valid"] = st.watches[i].valid;
+                wj["error"] = st.watches[i].error;
                 arr.push_back(wj);
             }
             return tool_result_t::ok(
@@ -1406,6 +1407,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                "Limited to 4 active hardware breakpoints."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (hex)"), true},
          {OBFSTR("type"), OBFSTR("string"), OBFSTR("Type: 'execute', 'write', 'read' (default 'execute')"), false},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Watch granularity in bytes: 1, 2, 4, or 8 (default 1; ignored for 'execute')"), false},
          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
         [](const json& params) -> tool_result_t {
             if (auto err = ensure_attached(params)) return *err;
@@ -1417,7 +1419,14 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             debugger_engine::bp_type_t bpt = debugger_engine::bp_type_t::hardware_execute;
             if (type_str == "write") bpt = debugger_engine::bp_type_t::hardware_write;
             else if (type_str == "read") bpt = debugger_engine::bp_type_t::hardware_read;
-            debugger_engine::add_breakpoint(*addr, bpt);
+            int size = 1;
+            if (params.contains("size") && params["size"].is_number())
+                size = params["size"].get<int>();
+            if (size != 1 && size != 2 && size != 4 && size != 8)
+                return tool_result_t::error(OBFSTR("'size' must be 1, 2, 4, or 8."));
+            int idx = debugger_engine::add_breakpoint(*addr, bpt, "", "", size);
+            if (idx < 0)
+                return tool_result_t::error(debugger_engine::last_error());
             return tool_result_t::ok(OBFSTR("Hardware breakpoint set at ") + sa_format_address(*addr));
         }, false});
 

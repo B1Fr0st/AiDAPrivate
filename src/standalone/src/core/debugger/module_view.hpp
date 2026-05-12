@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include "work_queue.hpp"
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -14,6 +15,7 @@
 #include "standalone_driver.hpp"
 #include "pe_parser.hpp"
 #include "ui_anim.hpp"
+#include "event_bus.hpp"
 #include "../helpers/globals.h"
 
 namespace module_view {
@@ -31,6 +33,11 @@ struct ui_state_t {
 	char                                      filter_buf[128] = {};
 	std::mutex                                modules_mutex;
 	std::atomic<bool>                         loading{false};
+	std::atomic<uint64_t>                     last_auto_refresh_ms{0};
+	std::atomic<uint64_t>                     last_event_refresh_ms{0};
+	std::atomic<bool>                         subscriptions_initialized{false};
+	aida::events::subscription_handle_t       dll_loaded_sub;
+	aida::events::subscription_handle_t       process_created_sub;
 	int                                       selected_detail = -1;
 	bool                                      mod_scrollbar_dragging = false;
 	float                                     mod_scrollbar_drag_offset = 0.f;
@@ -43,19 +50,72 @@ inline ui_state_t g_ui;
 
 inline void refresh()
 {
-	if (g_ui.loading.load())
-		return;
-
-
 	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0)
 		return;
-	g_ui.loading.store(true);
+
+	bool expected = false;
+	if (!g_ui.loading.compare_exchange_strong(expected, true))
+		return;
 
 	work_queue::post([]() {
 		auto mods = driver_bridge::enumerate_modules();
 		{
 			std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
 			g_ui.modules = std::move(mods);
+		}
+		g_ui.loading.store(false);
+	});
+}
+
+inline void ensure_subscriptions()
+{
+	bool expected = false;
+	if (!g_ui.subscriptions_initialized.compare_exchange_strong(expected, true))
+		return;
+
+	g_ui.dll_loaded_sub = aida::events::subscribe(
+		aida::events::event_dll_loaded,
+		[](const aida::events::dll_loaded_t& evt) {
+			uint32_t attached = driver_bridge::attached_pid();
+			if (attached == 0 || attached != evt.process_id)
+				return;
+			uint64_t now_ms = static_cast<uint64_t>(
+				std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now().time_since_epoch()).count());
+			g_ui.last_event_refresh_ms.store(now_ms, std::memory_order_release);
+			refresh();
+		});
+
+	g_ui.process_created_sub = aida::events::subscribe(
+		aida::events::event_process_created,
+		[](const aida::events::process_created_t&) {
+			uint64_t now_ms = static_cast<uint64_t>(
+				std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now().time_since_epoch()).count());
+			g_ui.last_event_refresh_ms.store(now_ms, std::memory_order_release);
+			refresh();
+		});
+}
+
+inline void load_module_details_by_base(uint64_t base)
+{
+	if (base == 0)
+		return;
+
+	bool expected = false;
+	if (!g_ui.loading.compare_exchange_strong(expected, true))
+		return;
+
+	work_queue::post([base]() {
+		pe_parser::pe_info_t pe;
+		pe_parser::parse(base, pe);
+		{
+			std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
+			g_ui.exports = std::move(pe.exports);
+			g_ui.imports = std::move(pe.imports);
+			g_ui.selected_detail = -1;
+			g_ui.detail_scroll_y = 0.f;
+			g_ui.detail_target_scroll_y = 0.f;
 		}
 		g_ui.loading.store(false);
 	});
@@ -74,21 +134,7 @@ inline void load_module_details(int index)
 		base = g_ui.modules[index].base;
 	}
 
-	g_ui.loading.store(true);
-
-	work_queue::post([base]() {
-		pe_parser::pe_info_t pe;
-		pe_parser::parse(base, pe);
-		{
-			std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
-			g_ui.exports = std::move(pe.exports);
-			g_ui.imports = std::move(pe.imports);
-			g_ui.selected_detail = -1;
-			g_ui.detail_scroll_y = 0.f;
-			g_ui.detail_target_scroll_y = 0.f;
-		}
-		g_ui.loading.store(false);
-	});
+	load_module_details_by_base(base);
 }
 
 namespace detail {
@@ -110,6 +156,23 @@ inline bool match_filter(const std::string& name, const char* filter)
 inline void render(float pos_x, float pos_y, float width, float height,
 				   float alpha, float ar, float ag, float ab)
 {
+	ensure_subscriptions();
+
+	if (driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0) {
+		uint64_t now_ms = static_cast<uint64_t>(
+			std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count());
+		uint64_t last_event = g_ui.last_event_refresh_ms.load(std::memory_order_acquire);
+		uint64_t last_auto = g_ui.last_auto_refresh_ms.load(std::memory_order_acquire);
+		uint64_t newest = (last_event > last_auto) ? last_event : last_auto;
+		if (now_ms - newest >= 5000) {
+			if (g_ui.last_auto_refresh_ms.compare_exchange_strong(
+					last_auto, now_ms, std::memory_order_acq_rel)) {
+				refresh();
+			}
+		}
+	}
+
 	ImDrawList* dl = ImGui::GetWindowDrawList();
 	float dt = ImGui::GetIO().DeltaTime;
 	const auto& _t = aida::ui::resolved();
@@ -203,7 +266,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float mod_row_alpha = ui_anim::render_row_entrance(idx, static_cast<float>(mod_first), dt, alpha);
 		(void)mod_row_alpha;
 		if (clicked)
-			load_module_details(idx);
+			load_module_details_by_base(m.base);
 
 		dl->AddText(ImVec2(mod_col_name, ry + 2.f),
 					_ta(_t.text_primary), m.name.c_str());

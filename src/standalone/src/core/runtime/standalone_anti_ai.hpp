@@ -556,24 +556,6 @@ namespace self_analysis
         return found;
     }
 
-    inline bool detect_window_hooks()
-    {
-        HWND our_window = FindWindowW(L"AiDAStandaloneWindow", nullptr);
-        if (!our_window) return false;
-
-        DWORD our_pid = GetCurrentProcessId();
-        DWORD wnd_thread = GetWindowThreadProcessId(our_window, nullptr);
-        if (wnd_thread == 0) return false;
-
-        HHOOK test_hook = SetWindowsHookExW(WH_CALLWNDPROC, nullptr, nullptr, wnd_thread);
-        if (test_hook)
-        {
-            UnhookWindowsHookEx(test_hook);
-        }
-
-        return false;
-    }
-
 }
 
 

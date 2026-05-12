@@ -8,8 +8,10 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -194,8 +196,12 @@ static void register_usertypes(sol::state& lua) {
             [](hook_request_data& self, sol::table t) {
                 self.headers.clear();
                 for (const auto& kv : t) {
-                    if (kv.first.get_type() == sol::type::string && kv.second.get_type() == sol::type::string)
-                        self.headers[kv.first.as<std::string>()] = kv.second.as<std::string>();
+                    if (kv.first.get_type() != sol::type::string || kv.second.get_type() != sol::type::string)
+                        continue;
+                    sol::optional<std::string> k = kv.first.as<sol::optional<std::string>>();
+                    sol::optional<std::string> v = kv.second.as<sol::optional<std::string>>();
+                    if (k && v)
+                        self.headers[*k] = *v;
                 }
             }
         ),
@@ -238,8 +244,12 @@ static void register_usertypes(sol::state& lua) {
             [](hook_response_data& self, sol::table t) {
                 self.headers.clear();
                 for (const auto& kv : t) {
-                    if (kv.first.get_type() == sol::type::string && kv.second.get_type() == sol::type::string)
-                        self.headers[kv.first.as<std::string>()] = kv.second.as<std::string>();
+                    if (kv.first.get_type() != sol::type::string || kv.second.get_type() != sol::type::string)
+                        continue;
+                    sol::optional<std::string> k = kv.first.as<sol::optional<std::string>>();
+                    sol::optional<std::string> v = kv.second.as<sol::optional<std::string>>();
+                    if (k && v)
+                        self.headers[*k] = *v;
                 }
             }
         ),
@@ -370,9 +380,14 @@ static void register_usertypes(sol::state& lua) {
             for (auto& f : self.fields) {
                 if (f.field_number != field_num) continue;
                 switch (f.wire_type) {
-                    case 0: case 1: case 5:
-                        try { f.varint_value = std::stoull(val); } catch(...) {}
+                    case 0: case 1: case 5: {
+                        char* endp = nullptr;
+                        errno = 0;
+                        unsigned long long parsed = strtoull(val.c_str(), &endp, 0);
+                        if (errno == 0 && endp && *endp == '\0' && endp != val.c_str())
+                            f.varint_value = static_cast<uint64_t>(parsed);
                         return;
+                    }
                     case 2:
                         f.bytes_value.assign(val.begin(), val.end());
                         return;
@@ -433,7 +448,22 @@ static void register_api(sol::state& lua) {
         std::string msg;
         for (auto v : va) {
             if (!msg.empty()) msg += "\t";
-            msg += v.as<std::string>();
+            sol::optional<std::string> s = v.as<sol::optional<std::string>>();
+            if (s) {
+                msg += *s;
+                continue;
+            }
+            sol::optional<double> d = v.as<sol::optional<double>>();
+            if (d) {
+                msg += std::to_string(*d);
+                continue;
+            }
+            sol::optional<bool> b = v.as<sol::optional<bool>>();
+            if (b) {
+                msg += *b ? "true" : "false";
+                continue;
+            }
+            msg += "[?]";
         }
         lua_log_info(msg);
     });
@@ -478,7 +508,10 @@ static void register_api(sol::state& lua) {
         std::map<std::string, std::string> params;
         if (params_table) {
             for (auto& [k, v] : *params_table) {
-                params[k.as<std::string>()] = v.as<std::string>();
+                sol::optional<std::string> ks = k.as<sol::optional<std::string>>();
+                sol::optional<std::string> vs = v.as<sol::optional<std::string>>();
+                if (ks && vs)
+                    params[*ks] = *vs;
             }
         }
         auto result = decoder_pipeline::apply_single(transform_id,
@@ -694,9 +727,9 @@ bool load_script_source(const std::string& name, const std::string& source) {
 
 bool unload_script(const std::string& name) {
     std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_lua) return false;
     auto it = g_scripts.find(name);
     if (it == g_scripts.end()) return false;
-
 
     (*g_lua)["_hooks"] = g_lua->create_table();
     g_scripts.erase(it);
@@ -717,11 +750,11 @@ bool unload_script(const std::string& name) {
 
 bool reload_script(const std::string& name) {
     std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_lua) return false;
     auto it = g_scripts.find(name);
     if (it == g_scripts.end()) return false;
 
     auto& info = it->second;
-
 
     if (!info.path.empty()) {
         std::ifstream file(info.path, std::ios::binary);
@@ -731,7 +764,6 @@ bool reload_script(const std::string& name) {
             file.close();
         }
     }
-
 
     (*g_lua)["_hooks"] = g_lua->create_table();
     for (auto& [sname, sinfo] : g_scripts) {

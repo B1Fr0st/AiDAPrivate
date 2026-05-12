@@ -3489,3 +3489,72 @@ bool voyager::device_t::run_hv_detect(detail::hv_detect_result& out) noexcept {
     std::memcpy(&out, &buf.result, sizeof(out));
     return true;
 }
+
+bool voyager::device_t::drain_debug_events(std::vector<debug_event_record>& out,
+                                           std::size_t max_events,
+                                           debug_event_drain_stats* out_stats) noexcept {
+    out.clear();
+    if (out_stats) {
+        *out_stats = debug_event_drain_stats{};
+    }
+
+    if (!is_connected()) {
+        return false;
+    }
+
+    if (max_events == 0) {
+        return true;
+    }
+
+    if (max_events > detail::DRAIN_DEBUG_EVENTS_CAP) {
+        max_events = detail::DRAIN_DEBUG_EVENTS_CAP;
+    }
+
+    auto buffer = std::make_unique<detail::drain_debug_events_request>();
+    std::memset(buffer.get(), 0, sizeof(*buffer));
+    buffer->session_key = session_key_;
+    buffer->max_events = static_cast<std::uint32_t>(max_events);
+
+    if (!send_request(ioctl_codes::EVTS(), buffer.get(),
+                      static_cast<DWORD>(sizeof(*buffer)))) {
+        return false;
+    }
+
+    std::uint32_t count = buffer->returned_count;
+    if (count > detail::DRAIN_DEBUG_EVENTS_CAP) {
+        count = detail::DRAIN_DEBUG_EVENTS_CAP;
+    }
+
+    out.reserve(count);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const detail::debug_event_t& src = buffer->events[i];
+        debug_event_record rec;
+        rec.type = static_cast<debug_event_type_e>(src.event_type);
+        rec.process_id = src.process_id;
+        rec.thread_id = src.thread_id;
+        rec.flags = src.flags;
+        rec.timestamp = src.timestamp;
+        rec.image_base = src.image_base;
+        rec.image_size = src.image_size;
+
+        std::size_t path_chars = 0;
+        while (path_chars < detail::DEBUG_EVENT_PATH_CHARS &&
+               src.image_path[path_chars] != L'\0') {
+            ++path_chars;
+        }
+        if (path_chars > 0) {
+            rec.image_path.assign(src.image_path, src.image_path + path_chars);
+        }
+
+        out.push_back(std::move(rec));
+    }
+
+    if (out_stats) {
+        out_stats->returned_count = buffer->returned_count;
+        out_stats->dropped_since_last_drain = buffer->dropped_since_last_drain;
+        out_stats->total_dropped = buffer->total_dropped;
+        out_stats->total_published = buffer->total_published;
+    }
+
+    return true;
+}

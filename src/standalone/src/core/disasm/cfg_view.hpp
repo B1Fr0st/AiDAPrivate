@@ -250,26 +250,9 @@ inline void build_cfg(uint64_t entry_address)
 			decoded_insn_t d;
 			d.ins = ins;
 
-			if (ins.is_call || ins.is_branch) {
-				if (ins.len == 5 && (data[pos] == 0xE8 || data[pos] == 0xE9)) {
-					int32_t rel = 0;
-					std::memcpy(&rel, data + pos + 1, 4);
-					d.branch_target = va + ins.len + rel;
-					d.has_target = true;
-				} else if (ins.len == 2 && (data[pos] >= 0x70 && data[pos] <= 0x7F)) {
-					int8_t rel = static_cast<int8_t>(data[pos + 1]);
-					d.branch_target = va + ins.len + rel;
-					d.has_target = true;
-				} else if (ins.len == 6 && data[pos] == 0x0F && (data[pos+1] >= 0x80 && data[pos+1] <= 0x8F)) {
-					int32_t rel = 0;
-					std::memcpy(&rel, data + pos + 2, 4);
-					d.branch_target = va + ins.len + rel;
-					d.has_target = true;
-				} else if (ins.len == 2 && data[pos] == 0xEB) {
-					int8_t rel = static_cast<int8_t>(data[pos + 1]);
-					d.branch_target = va + ins.len + rel;
-					d.has_target = true;
-				}
+			if ((ins.is_call || ins.is_branch) && ins.branch_target != 0) {
+				d.branch_target = ins.branch_target;
+				d.has_target = true;
 			}
 
 			all_insns.push_back(d);
@@ -285,12 +268,16 @@ inline void build_cfg(uint64_t entry_address)
 			return;
 		}
 
+		uint64_t decoded_lo = all_insns.front().ins.addr;
+		uint64_t decoded_hi = all_insns.back().ins.addr + static_cast<uint64_t>(all_insns.back().ins.len);
+
 		std::map<uint64_t, bool> leaders;
 		leaders[entry_address] = true;
 
 		for (auto& d : all_insns) {
 			if (d.has_target && !d.ins.is_call) {
-				leaders[d.branch_target] = true;
+				if (d.branch_target >= decoded_lo && d.branch_target < decoded_hi)
+					leaders[d.branch_target] = true;
 				uint64_t fallthrough = d.ins.addr + d.ins.len;
 				leaders[fallthrough] = true;
 			}
@@ -325,15 +312,18 @@ inline void build_cfg(uint64_t entry_address)
 				continue;
 
 			if (d.has_target && !d.ins.is_call) {
-				auto it_target = addr_to_block.find(d.branch_target);
-				if (it_target != addr_to_block.end())
-					blocks[cur_block].successors.push_back(it_target->second);
-				else {
-					int tidx = detail::find_or_create_block(addr_to_block, blocks, d.branch_target);
-					blocks[cur_block].successors.push_back(tidx);
+				bool target_in_range = (d.branch_target >= decoded_lo && d.branch_target < decoded_hi);
+				if (target_in_range) {
+					auto it_target = addr_to_block.find(d.branch_target);
+					if (it_target != addr_to_block.end())
+						blocks[cur_block].successors.push_back(it_target->second);
+					else {
+						int tidx = detail::find_or_create_block(addr_to_block, blocks, d.branch_target);
+						blocks[cur_block].successors.push_back(tidx);
+					}
 				}
 
-				bool is_unconditional = (std::strcmp(d.ins.mnem, "jmp") == 0 || std::strcmp(d.ins.mnem, "JMP") == 0);
+				bool is_unconditional = (std::strcmp(d.ins.mnem, "jmp") == 0);
 				if (!is_unconditional) {
 					uint64_t fall = d.ins.addr + d.ins.len;
 					auto it_fall = addr_to_block.find(fall);

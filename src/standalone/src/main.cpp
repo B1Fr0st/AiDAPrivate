@@ -24,6 +24,7 @@
 #include "standalone_license.hpp"
 #include "standalone_settings.hpp"
 #include "standalone_driver.hpp"
+#include "standalone_tools_fwd.hpp"
 #include "core/runtime/arc_loader.hpp"
 #include "core/anti-tamper/orchestrator.hpp"
 #include "core/anti-tamper/hv_preflight.hpp"
@@ -1552,6 +1553,7 @@ int main(int, char**)
 
     network_view::shutdown();
     script_engine::shutdown();
+    workflow_tools::shutdown_services();
     shutdown_standalone_chat();
     Blur::Shutdown();
     ImGui_ImplDX11_Shutdown();

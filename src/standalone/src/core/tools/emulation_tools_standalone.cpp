@@ -374,11 +374,13 @@ tool_result_t trace_execution_unicorn(const json& params)
     code_region.size = (static_cast<std::uint64_t>(size) + 0xFFF + (*addr & 0xFFF)) & ~0xFFFULL;
     code_region.data.resize(static_cast<std::size_t>(code_region.size), 0);
     std::memcpy(code_region.data.data() + (*addr - code_region.base), code.data(), code.size());
+    const std::uint64_t code_region_base = code_region.base;
+    const std::uint64_t code_region_size = code_region.size;
     snapshot.regions.push_back(std::move(code_region));
 
     setup_stack_region(snapshot, kernel_mode);
 
-    map_additional_regions(snapshot, params, code_region.base, code_region.base + code_region.size);
+    map_additional_regions(snapshot, params, code_region_base, code_region_base + code_region_size);
 
     if (params.contains("rax")) { auto v = sa_parse_address(params.value("rax", std::string())); if (v) snapshot.rax = *v; }
     if (params.contains("rbx")) { auto v = sa_parse_address(params.value("rbx", std::string())); if (v) snapshot.rbx = *v; }
@@ -527,11 +529,13 @@ tool_result_t analyze_vm_handler(const json& params)
     code_region.size = (static_cast<std::uint64_t>(handler_size) + 0xFFF + (*addr & 0xFFF)) & ~0xFFFULL;
     code_region.data.resize(static_cast<std::size_t>(code_region.size), 0);
     std::memcpy(code_region.data.data() + (*addr - code_region.base), code.data(), code.size());
+    const std::uint64_t code_region_base = code_region.base;
+    const std::uint64_t code_region_size = code_region.size;
     snapshot.regions.push_back(std::move(code_region));
 
     setup_stack_region(snapshot, kernel_mode);
 
-    map_additional_regions(snapshot, params, code_region.base, code_region.base + code_region.size);
+    map_additional_regions(snapshot, params, code_region_base, code_region_base + code_region_size);
 
     emulation::emulation_config_t config;
     config.start_address         = *addr;
@@ -830,6 +834,8 @@ tool_result_t emulate_function(const json& params)
     code_region.size = (static_cast<std::uint64_t>(map_size) + 0xFFF + (*addr & 0xFFF)) & ~0xFFFULL;
     code_region.data.resize(static_cast<std::size_t>(code_region.size), 0);
     std::memcpy(code_region.data.data() + (*addr - code_region.base), code.data(), code.size());
+    const std::uint64_t code_region_base = code_region.base;
+    const std::uint64_t code_region_size = code_region.size;
     snapshot.regions.push_back(std::move(code_region));
 
     emulation::memory_snapshot_region_t stack_region;
@@ -847,7 +853,7 @@ tool_result_t emulate_function(const json& params)
     sentinel_region.data.resize(0x1000, 0xCC);
     snapshot.regions.push_back(std::move(sentinel_region));
 
-    map_additional_regions(snapshot, params, code_region.base, code_region.base + code_region.size);
+    map_additional_regions(snapshot, params, code_region_base, code_region_base + code_region_size);
 
     emulation::emulation_config_t config;
     config.start_address     = *addr;

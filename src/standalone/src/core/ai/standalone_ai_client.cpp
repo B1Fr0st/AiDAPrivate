@@ -634,6 +634,8 @@ std::string standalone_ai_client_t::generate_openai(
         const std::string provider_id = (oai_kind == "openai_codex") ? std::string("openai-codex") : std::string("openai");
         apply_oauth_headers(headers, provider_id, oai_store_key, model,
                             build_request_context(&body));
+        if (headers.count("authorization") > 0)
+            headers.erase("Authorization");
     }
 
     if (on_chunk) {
@@ -754,12 +756,16 @@ std::string standalone_ai_client_t::generate_anthropic(
     }
 
     std::map<std::string, std::string> headers = _settings.get_active_headers();
-    headers["x-api-key"] = _settings.get_active_api_key();
+    const std::string anthropic_api_key = _settings.get_active_api_key();
+    if (!anthropic_api_key.empty())
+        headers["x-api-key"] = anthropic_api_key;
     headers["anthropic-version"] = "2023-06-01";
     headers["Content-Type"] = "application/json";
 
     apply_oauth_headers(headers, "anthropic", "anthropic", clean_model,
                         build_request_context(&body));
+    if (headers.count("authorization") > 0 || headers.count("Authorization") > 0)
+        headers.erase("x-api-key");
 
     if (on_chunk) {
 
@@ -1269,14 +1275,18 @@ nlohmann::json standalone_ai_client_t::convert_messages_for_openai(
     }
 
     for (auto& msg : anthropic_messages) {
+        if (!msg.is_object()) continue;
         std::string role = msg.value("role", "user");
 
-        if (msg["content"].is_string()) {
-            messages.push_back({{"role", role}, {"content", msg["content"].get<std::string>()}});
+        if (!msg.contains("content")) continue;
+        const auto& content_ref = msg["content"];
+
+        if (content_ref.is_string()) {
+            messages.push_back({{"role", role}, {"content", content_ref.get<std::string>()}});
             continue;
         }
 
-        if (!msg["content"].is_array()) continue;
+        if (!content_ref.is_array()) continue;
 
 
         if (role == "assistant") {
@@ -1284,7 +1294,7 @@ nlohmann::json standalone_ai_client_t::convert_messages_for_openai(
             json tool_calls = json::array();
             int tc_idx = 0;
 
-            for (auto& block : msg["content"]) {
+            for (auto& block : content_ref) {
                 std::string btype = block.value("type", "");
                 if (btype == "text") {
                     text_content += block.value("text", "");
@@ -1316,7 +1326,7 @@ nlohmann::json standalone_ai_client_t::convert_messages_for_openai(
         else if (role == "user") {
 
             bool has_tool_results = false;
-            for (auto& block : msg["content"]) {
+            for (auto& block : content_ref) {
                 if (block.value("type", "") == "tool_result") {
                     has_tool_results = true;
                     break;
@@ -1324,7 +1334,7 @@ nlohmann::json standalone_ai_client_t::convert_messages_for_openai(
             }
 
             if (has_tool_results) {
-                for (auto& block : msg["content"]) {
+                for (auto& block : content_ref) {
                     if (block.value("type", "") == "tool_result") {
                         messages.push_back(make_openai_tool_result(
                             block.value("tool_use_id", ""),
@@ -1333,7 +1343,7 @@ nlohmann::json standalone_ai_client_t::convert_messages_for_openai(
                 }
             } else {
                 std::string text_content;
-                for (auto& block : msg["content"]) {
+                for (auto& block : content_ref) {
                     if (block.value("type", "") == "text")
                         text_content += block.value("text", "");
                 }
@@ -1352,23 +1362,27 @@ nlohmann::json standalone_ai_client_t::convert_messages_for_gemini(
     json contents = json::array();
 
     for (auto& msg : anthropic_messages) {
+        if (!msg.is_object()) continue;
         std::string role = msg.value("role", "user");
         std::string gemini_role = (role == "assistant") ? "model" : "user";
 
-        if (msg["content"].is_string()) {
+        if (!msg.contains("content")) continue;
+        const auto& content_ref = msg["content"];
+
+        if (content_ref.is_string()) {
             contents.push_back({
                 {"role", gemini_role},
-                {"parts", json::array({{{"text", msg["content"].get<std::string>()}}})}
+                {"parts", json::array({{{"text", content_ref.get<std::string>()}}})}
             });
             continue;
         }
 
-        if (!msg["content"].is_array()) continue;
+        if (!content_ref.is_array()) continue;
 
         json parts = json::array();
         bool has_tool_results = false;
 
-        for (auto& block : msg["content"]) {
+        for (auto& block : content_ref) {
             std::string btype = block.value("type", "");
 
             if (btype == "text") {
@@ -1544,12 +1558,16 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
     }
 
     std::map<std::string, std::string> headers = _settings.get_active_headers();
-    headers["x-api-key"]          = _settings.get_active_api_key();
+    const std::string anthropic_api_key = _settings.get_active_api_key();
+    if (!anthropic_api_key.empty())
+        headers["x-api-key"] = anthropic_api_key;
     headers["anthropic-version"]  = "2023-06-01";
     headers["Content-Type"]       = "application/json";
 
     apply_oauth_headers(headers, "anthropic", "anthropic", clean_model,
                         build_request_context(&body));
+    if (headers.count("authorization") > 0 || headers.count("Authorization") > 0)
+        headers.erase("x-api-key");
 
 
     auto client = get_or_create_client(base_url);
@@ -1640,7 +1658,10 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
                 else if (delta_type == "thinking_delta") {
                     std::string th = delta.value("thinking", "");
                     result.thinking += th;
-                    if (on_chunk) on_chunk("\x01THINK:" + th);
+                    if (on_chunk) {
+                        on_chunk("\x01THINK:" + th);
+                        result.thinking_streamed = true;
+                    }
                 }
                 else if (delta_type == "input_json_delta") {
                     auto it = blocks.find(idx);
@@ -1845,7 +1866,10 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
                 if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string()) {
                     std::string th = delta["reasoning_content"].get<std::string>();
                     result.thinking += th;
-                    if (on_chunk) on_chunk("\x01THINK:" + th);
+                    if (on_chunk) {
+                        on_chunk("\x01THINK:" + th);
+                        result.thinking_streamed = true;
+                    }
                 }
 
 
@@ -1853,7 +1877,10 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
                     std::string th = delta["reasoning"].get<std::string>();
                     if (!th.empty()) {
                         result.thinking += th;
-                        if (on_chunk) on_chunk("\x01THINK:" + th);
+                        if (on_chunk) {
+                            on_chunk("\x01THINK:" + th);
+                            result.thinking_streamed = true;
+                        }
                     }
                 }
 
@@ -2096,7 +2123,10 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
                     std::string th = part.value("text", "");
                     if (!th.empty()) {
                         result.thinking += th;
-                        if (on_chunk) on_chunk("\x01THINK:" + th);
+                        if (on_chunk) {
+                            on_chunk("\x01THINK:" + th);
+                            result.thinking_streamed = true;
+                        }
                     }
                 }
                 else if (part.contains("text") && part["text"].is_string()) {
@@ -2344,7 +2374,10 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
             if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string()) {
                 std::string th = delta["reasoning_content"].get<std::string>();
                 result.thinking += th;
-                if (on_chunk) on_chunk("\x01THINK:" + th);
+                if (on_chunk) {
+                    on_chunk("\x01THINK:" + th);
+                    result.thinking_streamed = true;
+                }
             }
 
 
@@ -2352,7 +2385,10 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
                 std::string th = delta["reasoning"].get<std::string>();
                 if (!th.empty()) {
                     result.thinking += th;
-                    if (on_chunk) on_chunk("\x01THINK:" + th);
+                    if (on_chunk) {
+                        on_chunk("\x01THINK:" + th);
+                        result.thinking_streamed = true;
+                    }
                 }
             }
 

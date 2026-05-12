@@ -36,6 +36,7 @@
 #include "standalone_settings.hpp"
 #include "toast_notification.hpp"
 #include "ui_anim.hpp"
+#include "work_queue.hpp"
 #include "../ui/avatar.hpp"
 #include "../ui/blur_layer.hpp"
 #include "../ui/brand.hpp"
@@ -350,8 +351,15 @@ namespace {
 			return body;
 		}
 		body["model"] = model_id;
-		body["max_tokens"] = 1;
-		body["max_completion_tokens"] = 1;
+		const bool is_o_series =
+			model_id.find("o1") != std::string::npos ||
+			model_id.find("o3") != std::string::npos ||
+			model_id.find("o4") != std::string::npos ||
+			model_id.find("o5") != std::string::npos;
+		if (is_o_series)
+			body["max_completion_tokens"] = 1;
+		else
+			body["max_tokens"] = 1;
 		body["stream"] = false;
 		nlohmann::json msg;
 		msg["role"] = "user";
@@ -387,31 +395,82 @@ namespace {
 		return p + "/v1/chat/completions";
 	}
 
+	struct test_job_t
+	{
+		std::string                       provider_id;
+		std::string                       model_id;
+		std::string                       key;
+		std::shared_ptr<std::atomic<bool>> flag;
+	};
+
+	void finalize_test_result(const std::shared_ptr<test_job_t>& job, const test_result_t& result)
+	{
+		auto& st = g_state();
+		std::lock_guard<std::mutex> lk(st.mtx);
+		if (st.shutdown_flag.load()) {
+			if (job->flag)
+				job->flag->store(false);
+			st.in_flight_tests.erase(job->key);
+			st.pending_results.erase(job->key);
+			return;
+		}
+		st.pending_results[job->key] = result;
+		auto fit = st.in_flight_tests.find(job->key);
+		if (fit != st.in_flight_tests.end() && fit->second)
+			fit->second->store(false);
+	}
+
 	void run_test_connection(const std::string& provider_id, const std::string& model_id)
 	{
 		auto& st = g_state();
-		const std::string key = provider_id + "/" + model_id;
+		if (st.shutdown_flag.load())
+			return;
+		auto job = std::make_shared<test_job_t>();
+		job->provider_id = provider_id;
+		job->model_id = model_id;
+		job->key = provider_id + "/" + model_id;
 		{
 			std::lock_guard<std::mutex> lk(st.mtx);
-			auto it = st.in_flight_tests.find(key);
+			if (st.shutdown_flag.load())
+				return;
+			auto it = st.in_flight_tests.find(job->key);
 			if (it != st.in_flight_tests.end() && it->second && it->second->load())
 				return;
-			auto flag = std::make_shared<std::atomic<bool>>(true);
-			st.in_flight_tests[key] = flag;
+			job->flag = std::make_shared<std::atomic<bool>>(true);
+			st.in_flight_tests[job->key] = job->flag;
 			test_result_t pending;
 			pending.provider_id = provider_id;
 			pending.model_id = model_id;
 			pending.completed = false;
-			st.pending_results[key] = pending;
+			st.pending_results[job->key] = pending;
 		}
 
-		std::thread worker([provider_id, model_id, key]() {
-			auth_info_t auth_info;
-			has_auth_for(provider_id, auth_info);
-			std::string endpoint = aida::provider::transforms::resolve_endpoint(provider_id, model_id, auth_info);
-			std::map<std::string, std::string> headers = aida::provider::transforms::compute_headers(provider_id, model_id, auth_info);
+		const bool posted = work_queue::post([job]() {
+			auto& st_w = g_state();
+			if (st_w.shutdown_flag.load()) {
+				std::lock_guard<std::mutex> lk(st_w.mtx);
+				if (job->flag)
+					job->flag->store(false);
+				st_w.in_flight_tests.erase(job->key);
+				st_w.pending_results.erase(job->key);
+				return;
+			}
 
-			const std::string base_url_override = base_url_for(provider_id);
+			auth_info_t auth_info;
+			has_auth_for(job->provider_id, auth_info);
+			std::string endpoint = aida::provider::transforms::resolve_endpoint(job->provider_id, job->model_id, auth_info);
+			std::map<std::string, std::string> headers = aida::provider::transforms::compute_headers(job->provider_id, job->model_id, auth_info);
+
+			if (st_w.shutdown_flag.load()) {
+				std::lock_guard<std::mutex> lk(st_w.mtx);
+				if (job->flag)
+					job->flag->store(false);
+				st_w.in_flight_tests.erase(job->key);
+				st_w.pending_results.erase(job->key);
+				return;
+			}
+
+			const std::string base_url_override = base_url_for(job->provider_id);
 			if (!base_url_override.empty()) {
 				std::string ohost;
 				std::string opath;
@@ -425,7 +484,7 @@ namespace {
 				}
 			}
 
-			const std::string headers_json = headers_override_for(provider_id);
+			const std::string headers_json = headers_override_for(job->provider_id);
 			if (!headers_json.empty()) {
 				auto extra = nlohmann::json::parse(headers_json, nullptr, false);
 				if (!extra.is_discarded() && extra.is_object()) {
@@ -437,19 +496,14 @@ namespace {
 			}
 
 			test_result_t result;
-			result.provider_id = provider_id;
-			result.model_id = model_id;
+			result.provider_id = job->provider_id;
+			result.model_id = job->model_id;
 			result.completed = true;
 
 			if (endpoint.empty()) {
 				result.success = false;
 				result.message = "no endpoint resolved (auth or catalog missing)";
-				auto& st2 = g_state();
-				std::lock_guard<std::mutex> lk(st2.mtx);
-				st2.pending_results[key] = result;
-				auto fit = st2.in_flight_tests.find(key);
-				if (fit != st2.in_flight_tests.end() && fit->second)
-					fit->second->store(false);
+				finalize_test_result(job, result);
 				return;
 			}
 
@@ -458,16 +512,20 @@ namespace {
 			if (!split_url(endpoint, host, path)) {
 				result.success = false;
 				result.message = std::string("malformed endpoint: ") + endpoint;
-				auto& st2 = g_state();
-				std::lock_guard<std::mutex> lk(st2.mtx);
-				st2.pending_results[key] = result;
-				auto fit = st2.in_flight_tests.find(key);
-				if (fit != st2.in_flight_tests.end() && fit->second)
-					fit->second->store(false);
+				finalize_test_result(job, result);
 				return;
 			}
 
-			path = compose_test_path(provider_id, model_id, path);
+			if (st_w.shutdown_flag.load()) {
+				std::lock_guard<std::mutex> lk(st_w.mtx);
+				if (job->flag)
+					job->flag->store(false);
+				st_w.in_flight_tests.erase(job->key);
+				st_w.pending_results.erase(job->key);
+				return;
+			}
+
+			path = compose_test_path(job->provider_id, job->model_id, path);
 
 			httplib::Client cli(host.c_str());
 			cli.set_connection_timeout(15);
@@ -482,7 +540,7 @@ namespace {
 			for (const auto& kv : headers)
 				hpp_headers.emplace(kv.first, kv.second);
 
-			const nlohmann::json body = build_test_body(provider_id, model_id);
+			const nlohmann::json body = build_test_body(job->provider_id, job->model_id);
 			const std::string body_str = body.dump();
 
 			const auto t0 = std::chrono::steady_clock::now();
@@ -490,6 +548,15 @@ namespace {
 			const auto t1 = std::chrono::steady_clock::now();
 			result.latency_ms = static_cast<int>(
 				std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+
+			if (st_w.shutdown_flag.load()) {
+				std::lock_guard<std::mutex> lk(st_w.mtx);
+				if (job->flag)
+					job->flag->store(false);
+				st_w.in_flight_tests.erase(job->key);
+				st_w.pending_results.erase(job->key);
+				return;
+			}
 
 			if (!res) {
 				result.success = false;
@@ -512,19 +579,23 @@ namespace {
 				}
 			}
 
-			auto& st2 = g_state();
-			std::lock_guard<std::mutex> lk(st2.mtx);
-			st2.pending_results[key] = result;
-			auto fit = st2.in_flight_tests.find(key);
-			if (fit != st2.in_flight_tests.end() && fit->second)
-				fit->second->store(false);
+			finalize_test_result(job, result);
 		});
-		worker.detach();
+
+		if (!posted) {
+			std::lock_guard<std::mutex> lk(st.mtx);
+			if (job->flag)
+				job->flag->store(false);
+			st.in_flight_tests.erase(job->key);
+			st.pending_results.erase(job->key);
+		}
 	}
 
 	void start_refresh_thread()
 	{
 		auto& st = g_state();
+		if (st.shutdown_flag.load())
+			return;
 		bool expected = false;
 		if (!st.refresh.in_flight.compare_exchange_strong(expected, true))
 			return;
@@ -532,9 +603,19 @@ namespace {
 		st.refresh.success.store(false);
 		st.refresh.message.clear();
 
-		std::thread worker([]() {
-			const bool ok = aida::provider::catalog::fetch_and_cache(10000);
+		const bool posted = work_queue::post([]() {
 			auto& s = g_state();
+			if (s.shutdown_flag.load()) {
+				s.refresh.completed.store(false);
+				s.refresh.in_flight.store(false);
+				return;
+			}
+			const bool ok = aida::provider::catalog::fetch_and_cache(10000);
+			if (s.shutdown_flag.load()) {
+				s.refresh.completed.store(false);
+				s.refresh.in_flight.store(false);
+				return;
+			}
 			s.refresh.success.store(ok);
 			if (!ok)
 				s.refresh.message = aida::provider::catalog::last_error();
@@ -543,7 +624,11 @@ namespace {
 			s.refresh.completed.store(true);
 			s.refresh.in_flight.store(false);
 		});
-		worker.detach();
+
+		if (!posted) {
+			st.refresh.in_flight.store(false);
+			st.refresh.completed.store(false);
+		}
 	}
 
 	bool buffer_match(const std::string& haystack, const std::string& needle_lower)
@@ -1072,10 +1157,12 @@ void initialize()
 	st.initialized = true;
 	st.shutdown_flag.store(false);
 	if (aida::provider::catalog::list_providers().empty()) {
-		std::thread bg([]() {
+		work_queue::post([]() {
+			auto& s = g_state();
+			if (s.shutdown_flag.load())
+				return;
 			aida::provider::catalog::load_cached_or_fetch(86400);
 		});
-		bg.detach();
 	}
 }
 
@@ -1083,7 +1170,18 @@ void shutdown()
 {
 	auto& st = g_state();
 	st.shutdown_flag.store(true);
+	std::lock_guard<std::mutex> lk(st.mtx);
 	st.initialized = false;
+	for (auto& kv : st.in_flight_tests) {
+		if (kv.second)
+			kv.second->store(false);
+	}
+	st.in_flight_tests.clear();
+	st.pending_results.clear();
+	st.refresh.in_flight.store(false);
+	st.refresh.completed.store(false);
+	st.refresh.success.store(false);
+	st.refresh.message.clear();
 }
 
 const std::string& last_error()

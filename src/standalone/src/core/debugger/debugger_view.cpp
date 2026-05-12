@@ -1618,8 +1618,11 @@ static void render_watches(ImDrawList* dl, float ox, float oy, float w, float h,
 		dl->AddText(body_font, 12.f, ImVec2(ox + 230.f, ry + 5.f),
 		            with_a(t.syn_type, a * row_a), w_entry.type.c_str());
 		ImU32 vcol = w_entry.valid ? t.success : t.error;
+		const char* value_text = w_entry.valid
+			? w_entry.value.c_str()
+			: (w_entry.error.empty() ? "<error>" : w_entry.error.c_str());
 		dl->AddText(code_font, 12.f, ImVec2(ox + 350.f, ry + 5.f),
-		            with_a(vcol, a * row_a), w_entry.value.c_str());
+		            with_a(vcol, a * row_a), value_text);
 
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 			ui.watch_panel.selected = i;

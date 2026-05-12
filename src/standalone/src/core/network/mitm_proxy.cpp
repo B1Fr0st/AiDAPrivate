@@ -10,18 +10,25 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windns.h>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/bio.h>
+#include <openssl/rand.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <climits>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "dnsapi.lib")
 
 namespace mitm_proxy {
 
@@ -113,16 +120,18 @@ static hold_outcome_t hold_until_decision(state_t& state, http_exchange exchange
     return outcome;
 }
 
+static constexpr uint8_t kCrlfCrlf[4] = { '\r', '\n', '\r', '\n' };
+
 static bool recv_all(SOCKET s, std::vector<uint8_t>& out, size_t max_size, int timeout_ms = 5000) {
     fd_set fds;
     timeval tv;
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
 
     out.clear();
     out.reserve(4096);
 
     while (out.size() < max_size) {
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
         FD_ZERO(&fds);
         FD_SET(s, &fds);
 
@@ -136,9 +145,7 @@ static bool recv_all(SOCKET s, std::vector<uint8_t>& out, size_t max_size, int t
 
 
         if (out.size() >= 4) {
-
-            auto it = std::search(out.begin(), out.end(),
-                std::begin("\r\n\r\n") - 1, std::end("\r\n\r\n") - 2);
+            auto it = std::search(out.begin(), out.end(), kCrlfCrlf, kCrlfCrlf + 4);
             if (it != out.end()) break;
         }
     }
@@ -149,20 +156,27 @@ static bool recv_ssl_all(SSL* ssl, std::vector<uint8_t>& out, size_t max_size) {
     out.clear();
     out.reserve(4096);
 
+    SOCKET fd = static_cast<SOCKET>(SSL_get_fd(ssl));
     while (out.size() < max_size) {
         uint8_t buf[8192];
         int n = SSL_read(ssl, buf, sizeof(buf));
         if (n <= 0) {
             int err = SSL_get_error(ssl, n);
-            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) continue;
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                WSAPOLLFD pfd{};
+                pfd.fd = fd;
+                pfd.events = (err == SSL_ERROR_WANT_WRITE) ? POLLOUT : POLLIN;
+                int pr = WSAPoll(&pfd, 1, 30000);
+                if (pr <= 0) break;
+                continue;
+            }
             break;
         }
         out.insert(out.end(), buf, buf + n);
 
 
         if (out.size() >= 4) {
-            auto it = std::search(out.begin(), out.end(),
-                std::begin("\r\n\r\n") - 1, std::end("\r\n\r\n") - 2);
+            auto it = std::search(out.begin(), out.end(), kCrlfCrlf, kCrlfCrlf + 4);
             if (it != out.end()) break;
         }
     }
@@ -170,9 +184,37 @@ static bool recv_ssl_all(SSL* ssl, std::vector<uint8_t>& out, size_t max_size) {
 }
 
 
+static size_t parse_content_length(const std::string& headers) {
+    auto find_ci = [](const std::string& h, const char* needle, size_t needle_len) -> size_t {
+        if (needle_len == 0 || h.size() < needle_len) return std::string::npos;
+        for (size_t i = 0; i + needle_len <= h.size(); ++i) {
+            bool match = true;
+            for (size_t j = 0; j < needle_len; ++j) {
+                char a = static_cast<char>(::tolower(static_cast<unsigned char>(h[i + j])));
+                char b = static_cast<char>(::tolower(static_cast<unsigned char>(needle[j])));
+                if (a != b) { match = false; break; }
+            }
+            if (match) return i;
+        }
+        return std::string::npos;
+    };
+    static const char kCl[] = "content-length:";
+    size_t cl_pos = find_ci(headers, kCl, sizeof(kCl) - 1);
+    if (cl_pos == std::string::npos) return 0;
+    size_t val_start = cl_pos + (sizeof(kCl) - 1);
+    while (val_start < headers.size() && (headers[val_start] == ' ' || headers[val_start] == '\t')) val_start++;
+    size_t val_end = headers.find("\r\n", val_start);
+    if (val_end == std::string::npos) return 0;
+    std::string val_str = headers.substr(val_start, val_end - val_start);
+    char* end = nullptr;
+    errno = 0;
+    unsigned long long v = strtoull(val_str.c_str(), &end, 10);
+    if (errno != 0 || end == val_str.c_str() || v > static_cast<unsigned long long>(SIZE_MAX)) return 0;
+    return static_cast<size_t>(v);
+}
+
 static void read_remaining_body_ssl(SSL* ssl, std::vector<uint8_t>& data, size_t max_size) {
-    auto hdr_end = std::search(data.begin(), data.end(),
-        std::begin("\r\n\r\n") - 1, std::end("\r\n\r\n") - 2);
+    auto hdr_end = std::search(data.begin(), data.end(), kCrlfCrlf, kCrlfCrlf + 4);
     if (hdr_end == data.end()) return;
 
     size_t hdr_size = static_cast<size_t>(std::distance(data.begin(), hdr_end)) + 4;
@@ -187,46 +229,60 @@ static void read_remaining_body_ssl(SSL* ssl, std::vector<uint8_t>& data, size_t
         is_chunked = (headers_lower.find("transfer-encoding: chunked") != std::string::npos);
     }
 
+    SOCKET fd = static_cast<SOCKET>(SSL_get_fd(ssl));
+
+    auto ssl_read_one = [&](uint8_t* buf, int max_n) -> int {
+        while (true) {
+            int n = SSL_read(ssl, buf, max_n);
+            if (n > 0) return n;
+            int err = SSL_get_error(ssl, n);
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                WSAPOLLFD pfd{};
+                pfd.fd = fd;
+                pfd.events = (err == SSL_ERROR_WANT_WRITE) ? POLLOUT : POLLIN;
+                int pr = WSAPoll(&pfd, 1, 30000);
+                if (pr <= 0) return -1;
+                continue;
+            }
+            return -1;
+        }
+    };
+
     if (is_chunked) {
 
         while (data.size() < max_size) {
 
-            std::string body_str(data.begin() + static_cast<ptrdiff_t>(hdr_size), data.end());
-            if (body_str.find("0\r\n\r\n") != std::string::npos ||
-                body_str.find("0\r\n") == body_str.size() - 3) break;
+            if (data.size() >= hdr_size + 5) {
+                std::string body_str(data.begin() + static_cast<ptrdiff_t>(hdr_size), data.end());
+                if (body_str.find("\r\n0\r\n\r\n") != std::string::npos ||
+                    (body_str.size() >= 5 && body_str.compare(0, 5, "0\r\n\r\n") == 0)) break;
+            }
 
             uint8_t buf[8192];
-            int n = SSL_read(ssl, buf, sizeof(buf));
+            int n = ssl_read_one(buf, sizeof(buf));
             if (n <= 0) break;
             data.insert(data.end(), buf, buf + n);
         }
     } else {
 
-        size_t cl_pos = headers.find("Content-Length:");
-        if (cl_pos == std::string::npos) cl_pos = headers.find("content-length:");
-        if (cl_pos != std::string::npos) {
-            size_t val_start = cl_pos + 15;
-            while (val_start < headers.size() && headers[val_start] == ' ') val_start++;
-            size_t val_end = headers.find("\r\n", val_start);
-            if (val_end != std::string::npos) {
-                size_t content_length = static_cast<size_t>(std::stoull(headers.substr(val_start, val_end - val_start)));
-                size_t total_needed = hdr_size + content_length;
-                if (total_needed > max_size) total_needed = max_size;
+        size_t content_length = parse_content_length(headers);
+        if (content_length > 0) {
+            size_t total_needed = hdr_size + content_length;
+            if (total_needed > max_size) total_needed = max_size;
 
-                while (data.size() < total_needed) {
-                    uint8_t buf[8192];
-                    int n = SSL_read(ssl, buf, static_cast<int>(std::min(sizeof(buf), total_needed - data.size())));
-                    if (n <= 0) break;
-                    data.insert(data.end(), buf, buf + n);
-                }
+            while (data.size() < total_needed) {
+                uint8_t buf[8192];
+                int remaining = static_cast<int>(std::min(sizeof(buf), total_needed - data.size()));
+                int n = ssl_read_one(buf, remaining);
+                if (n <= 0) break;
+                data.insert(data.end(), buf, buf + n);
             }
         }
     }
 }
 
 static void read_remaining_body(SOCKET s, std::vector<uint8_t>& data, size_t max_size, int timeout_ms = 5000) {
-    auto hdr_end = std::search(data.begin(), data.end(),
-        std::begin("\r\n\r\n") - 1, std::end("\r\n\r\n") - 2);
+    auto hdr_end = std::search(data.begin(), data.end(), kCrlfCrlf, kCrlfCrlf + 4);
     if (hdr_end == data.end()) return;
 
     size_t hdr_size = static_cast<size_t>(std::distance(data.begin(), hdr_end)) + 4;
@@ -243,15 +299,17 @@ static void read_remaining_body(SOCKET s, std::vector<uint8_t>& data, size_t max
 
     fd_set fds;
     timeval tv;
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
 
     if (is_chunked) {
         while (data.size() < max_size) {
-            std::string body_str(data.begin() + static_cast<ptrdiff_t>(hdr_size), data.end());
-            if (body_str.find("0\r\n\r\n") != std::string::npos ||
-                body_str.find("0\r\n") == body_str.size() - 3) break;
+            if (data.size() >= hdr_size + 5) {
+                std::string body_str(data.begin() + static_cast<ptrdiff_t>(hdr_size), data.end());
+                if (body_str.find("\r\n0\r\n\r\n") != std::string::npos ||
+                    (body_str.size() >= 5 && body_str.compare(0, 5, "0\r\n\r\n") == 0)) break;
+            }
 
+            tv.tv_sec = timeout_ms / 1000;
+            tv.tv_usec = (timeout_ms % 1000) * 1000;
             FD_ZERO(&fds);
             FD_SET(s, &fds);
             int sel = select(0, &fds, nullptr, nullptr, &tv);
@@ -263,41 +321,39 @@ static void read_remaining_body(SOCKET s, std::vector<uint8_t>& data, size_t max
             data.insert(data.end(), buf, buf + n);
         }
     } else {
-        size_t cl_pos = headers.find("Content-Length:");
-        if (cl_pos == std::string::npos) cl_pos = headers.find("content-length:");
-        if (cl_pos != std::string::npos) {
-            size_t val_start = cl_pos + 15;
-            while (val_start < headers.size() && headers[val_start] == ' ') val_start++;
-            size_t val_end = headers.find("\r\n", val_start);
-            if (val_end != std::string::npos) {
-                size_t content_length = static_cast<size_t>(std::stoull(headers.substr(val_start, val_end - val_start)));
-                size_t total_needed = hdr_size + content_length;
-                if (total_needed > max_size) total_needed = max_size;
+        size_t content_length = parse_content_length(headers);
+        if (content_length > 0) {
+            size_t total_needed = hdr_size + content_length;
+            if (total_needed > max_size) total_needed = max_size;
 
-                while (data.size() < total_needed) {
-                    FD_ZERO(&fds);
-                    FD_SET(s, &fds);
-                    int sel = select(0, &fds, nullptr, nullptr, &tv);
-                    if (sel <= 0) break;
+            while (data.size() < total_needed) {
+                tv.tv_sec = timeout_ms / 1000;
+                tv.tv_usec = (timeout_ms % 1000) * 1000;
+                FD_ZERO(&fds);
+                FD_SET(s, &fds);
+                int sel = select(0, &fds, nullptr, nullptr, &tv);
+                if (sel <= 0) break;
 
-                    uint8_t buf[8192];
-                    int n = recv(s, reinterpret_cast<char*>(buf),
-                        static_cast<int>(std::min(sizeof(buf), total_needed - data.size())), 0);
-                    if (n <= 0) break;
-                    data.insert(data.end(), buf, buf + n);
-                }
+                uint8_t buf[8192];
+                int n = recv(s, reinterpret_cast<char*>(buf),
+                    static_cast<int>(std::min(sizeof(buf), total_needed - data.size())), 0);
+                if (n <= 0) break;
+                data.insert(data.end(), buf, buf + n);
             }
         }
     }
 }
 
 
-static std::string extract_sni_from_client_hello(const uint8_t* data, size_t len) {
-    auto hello = protocol_parser::parse_client_hello(data, len);
-    if (hello.valid && !hello.sni.empty()) return hello.sni;
-    return {};
+static bool parse_uint16(const std::string& s, uint16_t& out) {
+    if (s.empty()) return false;
+    char* end = nullptr;
+    errno = 0;
+    unsigned long v = strtoul(s.c_str(), &end, 10);
+    if (errno != 0 || end == s.c_str() || v == 0 || v > 65535) return false;
+    out = static_cast<uint16_t>(v);
+    return true;
 }
-
 
 static void parse_connect_target(const std::string& line, std::string& host, uint16_t& port) {
 
@@ -309,7 +365,12 @@ static void parse_connect_target(const std::string& line, std::string& host, uin
     size_t colon = target.rfind(':');
     if (colon != std::string::npos) {
         host = target.substr(0, colon);
-        port = static_cast<uint16_t>(std::stoi(target.substr(colon + 1)));
+        uint16_t parsed_port = 0;
+        if (!parse_uint16(target.substr(colon + 1), parsed_port)) {
+            port = 443;
+            return;
+        }
+        port = parsed_port;
     } else {
         host = target;
         port = 443;
@@ -317,40 +378,133 @@ static void parse_connect_target(const std::string& line, std::string& host, uin
 }
 
 
+static SOCKET try_connect_address(const sockaddr* addr, int addr_len, int family, int socktype, int proto) {
+    SOCKET s = socket(family, socktype, proto);
+    if (s == INVALID_SOCKET) return INVALID_SOCKET;
+
+    u_long nonblocking = 1;
+    if (ioctlsocket(s, FIONBIO, &nonblocking) != 0) {
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+
+    constexpr int kConnectTimeoutMs = 10000;
+    int cr = connect(s, addr, addr_len);
+    if (cr != 0) {
+        int werr = WSAGetLastError();
+        if (werr != WSAEWOULDBLOCK && werr != WSAEINPROGRESS) {
+            closesocket(s);
+            return INVALID_SOCKET;
+        }
+
+        WSAPOLLFD pfd{};
+        pfd.fd = s;
+        pfd.events = POLLOUT;
+        int pr = WSAPoll(&pfd, 1, kConnectTimeoutMs);
+        if (pr <= 0) {
+            closesocket(s);
+            return INVALID_SOCKET;
+        }
+
+        int so_err = 0;
+        int so_err_len = sizeof(so_err);
+        if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_err), &so_err_len) != 0 || so_err != 0) {
+            closesocket(s);
+            return INVALID_SOCKET;
+        }
+    }
+
+    u_long blocking = 0;
+    ioctlsocket(s, FIONBIO, &blocking);
+    DWORD io_timeout_ms = 30000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&io_timeout_ms), sizeof(io_timeout_ms));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&io_timeout_ms), sizeof(io_timeout_ms));
+    return s;
+}
+
 static SOCKET connect_tcp(const std::string& host, uint16_t port) {
     addrinfo hints = {};
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
     addrinfo* result = nullptr;
     std::string port_str = std::to_string(port);
     int rc = getaddrinfo(host.c_str(), port_str.c_str(), &hints, &result);
-    if (rc != 0 || !result) return INVALID_SOCKET;
 
-    SOCKET s = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
-    if (s == INVALID_SOCKET) {
+    SOCKET connected = INVALID_SOCKET;
+    if (rc == 0 && result) {
+        for (addrinfo* ai = result; ai != nullptr && connected == INVALID_SOCKET; ai = ai->ai_next) {
+            connected = try_connect_address(ai->ai_addr, static_cast<int>(ai->ai_addrlen),
+                                            ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        }
         freeaddrinfo(result);
-        return INVALID_SOCKET;
+        if (connected != INVALID_SOCKET) return connected;
     }
 
-    DWORD timeout_ms = 10000;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
-
-    rc = connect(s, result->ai_addr, static_cast<int>(result->ai_addrlen));
-    freeaddrinfo(result);
-
-    if (rc == SOCKET_ERROR) {
-        closesocket(s);
-        return INVALID_SOCKET;
+    PDNS_RECORD dns_rec = nullptr;
+    DNS_STATUS ds = DnsQuery_A(host.c_str(), DNS_TYPE_A,
+                               DNS_QUERY_BYPASS_CACHE | DNS_QUERY_NO_HOSTS_FILE,
+                               nullptr, &dns_rec, nullptr);
+    if (ds == 0 && dns_rec) {
+        for (PDNS_RECORD r = dns_rec; r != nullptr && connected == INVALID_SOCKET; r = r->pNext) {
+            if (r->wType != DNS_TYPE_A) continue;
+            sockaddr_in sin = {};
+            sin.sin_family = AF_INET;
+            sin.sin_port = htons(port);
+            sin.sin_addr.s_addr = r->Data.A.IpAddress;
+            connected = try_connect_address(reinterpret_cast<const sockaddr*>(&sin), sizeof(sin),
+                                            AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        }
+        DnsRecordListFree(dns_rec, DnsFreeRecordList);
+        if (connected != INVALID_SOCKET) return connected;
     }
-    return s;
+
+    PDNS_RECORD dns_rec6 = nullptr;
+    ds = DnsQuery_A(host.c_str(), DNS_TYPE_AAAA,
+                    DNS_QUERY_BYPASS_CACHE | DNS_QUERY_NO_HOSTS_FILE,
+                    nullptr, &dns_rec6, nullptr);
+    if (ds == 0 && dns_rec6) {
+        for (PDNS_RECORD r = dns_rec6; r != nullptr && connected == INVALID_SOCKET; r = r->pNext) {
+            if (r->wType != DNS_TYPE_AAAA) continue;
+            sockaddr_in6 sin6 = {};
+            sin6.sin6_family = AF_INET6;
+            sin6.sin6_port = htons(port);
+            memcpy(&sin6.sin6_addr, &r->Data.AAAA.Ip6Address, sizeof(sin6.sin6_addr));
+            connected = try_connect_address(reinterpret_cast<const sockaddr*>(&sin6), sizeof(sin6),
+                                            AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+        }
+        DnsRecordListFree(dns_rec6, DnsFreeRecordList);
+    }
+    return connected;
 }
 
 
+static bool recv_exact(SOCKET s, uint8_t* buf, size_t need) {
+    size_t got = 0;
+    while (got < need) {
+        int n = recv(s, reinterpret_cast<char*>(buf + got), static_cast<int>(need - got), 0);
+        if (n <= 0) return false;
+        got += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+static bool send_exact(SOCKET s, const uint8_t* buf, size_t need) {
+    size_t sent = 0;
+    while (sent < need) {
+        int n = send(s, reinterpret_cast<const char*>(buf + sent), static_cast<int>(need - sent), 0);
+        if (n <= 0) return false;
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
 static bool socks5_handshake(SOCKET s, const std::string& target_host, uint16_t target_port,
                               const std::string& username, const std::string& password) {
+    if (target_host.empty() || target_host.size() > 255) return false;
+    if (username.size() > 255 || password.size() > 255) return false;
+
     bool use_auth = !username.empty();
 
 
@@ -360,33 +514,32 @@ static bool socks5_handshake(SOCKET s, const std::string& target_host, uint16_t 
         greeting[1] = 0x02;
         greeting[2] = 0x00;
         greeting[3] = 0x02;
-        if (send(s, reinterpret_cast<const char*>(greeting), 4, 0) != 4) return false;
+        if (!send_exact(s, greeting, 4)) return false;
     } else {
         greeting[1] = 0x01;
         greeting[2] = 0x00;
-        if (send(s, reinterpret_cast<const char*>(greeting), 3, 0) != 3) return false;
+        if (!send_exact(s, greeting, 3)) return false;
     }
 
 
     uint8_t choice[2];
-    if (recv(s, reinterpret_cast<char*>(choice), 2, 0) != 2) return false;
+    if (!recv_exact(s, choice, 2)) return false;
     if (choice[0] != 0x05) return false;
 
 
     if (choice[1] == 0x02) {
         if (!use_auth) return false;
         std::vector<uint8_t> auth_req;
+        auth_req.reserve(3 + username.size() + password.size());
         auth_req.push_back(0x01);
         auth_req.push_back(static_cast<uint8_t>(username.size()));
         auth_req.insert(auth_req.end(), username.begin(), username.end());
         auth_req.push_back(static_cast<uint8_t>(password.size()));
         auth_req.insert(auth_req.end(), password.begin(), password.end());
-        if (send(s, reinterpret_cast<const char*>(auth_req.data()),
-                 static_cast<int>(auth_req.size()), 0) != static_cast<int>(auth_req.size()))
-            return false;
+        if (!send_exact(s, auth_req.data(), auth_req.size())) return false;
 
         uint8_t auth_resp[2];
-        if (recv(s, reinterpret_cast<char*>(auth_resp), 2, 0) != 2) return false;
+        if (!recv_exact(s, auth_resp, 2)) return false;
         if (auth_resp[1] != 0x00) return false;
     } else if (choice[1] != 0x00) {
         return false;
@@ -394,6 +547,7 @@ static bool socks5_handshake(SOCKET s, const std::string& target_host, uint16_t 
 
 
     std::vector<uint8_t> conn_req;
+    conn_req.reserve(7 + target_host.size());
     conn_req.push_back(0x05);
     conn_req.push_back(0x01);
     conn_req.push_back(0x00);
@@ -403,29 +557,27 @@ static bool socks5_handshake(SOCKET s, const std::string& target_host, uint16_t 
     conn_req.push_back(static_cast<uint8_t>((target_port >> 8) & 0xFF));
     conn_req.push_back(static_cast<uint8_t>(target_port & 0xFF));
 
-    if (send(s, reinterpret_cast<const char*>(conn_req.data()),
-             static_cast<int>(conn_req.size()), 0) != static_cast<int>(conn_req.size()))
-        return false;
+    if (!send_exact(s, conn_req.data(), conn_req.size())) return false;
 
 
-    uint8_t resp[10];
-    if (recv(s, reinterpret_cast<char*>(resp), 4, 0) != 4) return false;
+    uint8_t resp[4];
+    if (!recv_exact(s, resp, 4)) return false;
     if (resp[0] != 0x05 || resp[1] != 0x00) return false;
 
 
     if (resp[3] == 0x01) {
         uint8_t drain[6];
-        if (recv(s, reinterpret_cast<char*>(drain), 6, 0) != 6) return false;
+        if (!recv_exact(s, drain, 6)) return false;
     } else if (resp[3] == 0x04) {
         uint8_t drain[18];
-        if (recv(s, reinterpret_cast<char*>(drain), 18, 0) != 18) return false;
+        if (!recv_exact(s, drain, 18)) return false;
     } else if (resp[3] == 0x03) {
         uint8_t dlen;
-        if (recv(s, reinterpret_cast<char*>(&dlen), 1, 0) != 1) return false;
+        if (!recv_exact(s, &dlen, 1)) return false;
         std::vector<uint8_t> drain(static_cast<size_t>(dlen) + 2);
-        if (recv(s, reinterpret_cast<char*>(drain.data()),
-                 static_cast<int>(drain.size()), 0) != static_cast<int>(drain.size()))
-            return false;
+        if (!recv_exact(s, drain.data(), drain.size())) return false;
+    } else {
+        return false;
     }
 
     return true;
@@ -457,8 +609,7 @@ static bool http_connect_handshake(SOCKET s, const std::string& target_host, uin
     }
     req += "\r\n";
 
-    if (send(s, req.c_str(), static_cast<int>(req.size()), 0) != static_cast<int>(req.size()))
-        return false;
+    if (!send_exact(s, reinterpret_cast<const uint8_t*>(req.data()), req.size())) return false;
 
 
     std::string response;
@@ -467,12 +618,18 @@ static bool http_connect_handshake(SOCKET s, const std::string& target_host, uin
         int n = recv(s, buf, 1, 0);
         if (n <= 0) return false;
         response.push_back(buf[0]);
-        if (response.size() >= 4 && response.substr(response.size() - 4) == "\r\n\r\n")
+        if (response.size() >= 4 && response.compare(response.size() - 4, 4, "\r\n\r\n") == 0)
             break;
     }
 
 
-    return response.find("200") != std::string::npos;
+    size_t sp = response.find(' ');
+    if (sp == std::string::npos) return false;
+    size_t sp2 = response.find(' ', sp + 1);
+    std::string code = (sp2 == std::string::npos)
+        ? response.substr(sp + 1)
+        : response.substr(sp + 1, sp2 - sp - 1);
+    return code.size() >= 3 && code[0] == '2' && code[1] == '0' && code[2] == '0';
 }
 
 static SOCKET connect_to_target(const std::string& host, uint16_t port) {
@@ -495,12 +652,42 @@ static SOCKET connect_to_target(const std::string& host, uint16_t port) {
     }
 
     if (!ok) {
-        closesocket(s);
+        close_socket(s);
         return INVALID_SOCKET;
     }
     return s;
 }
 
+
+static bool ssl_handshake_with_timeout(SSL* ssl, int (*op)(SSL*), int timeout_ms_total = 30000) {
+    SOCKET fd = static_cast<SOCKET>(SSL_get_fd(ssl));
+    u_long nonblocking = 1;
+    if (ioctlsocket(fd, FIONBIO, &nonblocking) != 0) return false;
+
+    uint64_t deadline = GetTickCount64() + static_cast<uint64_t>(timeout_ms_total);
+    bool success = false;
+
+    while (true) {
+        int rc = op(ssl);
+        if (rc == 1) { success = true; break; }
+        int err = SSL_get_error(ssl, rc);
+        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) break;
+
+        uint64_t now = GetTickCount64();
+        if (now >= deadline) break;
+        int remaining = static_cast<int>(deadline - now);
+
+        WSAPOLLFD pfd{};
+        pfd.fd = fd;
+        pfd.events = (err == SSL_ERROR_WANT_WRITE) ? POLLOUT : POLLIN;
+        int pr = WSAPoll(&pfd, 1, remaining);
+        if (pr <= 0) break;
+    }
+
+    u_long blocking = 0;
+    ioctlsocket(fd, FIONBIO, &blocking);
+    return success;
+}
 
 static void websocket_relay(SSL* client_ssl, SSL* target_ssl, http_exchange& exchange, state_t& state) {
     exchange.is_websocket = true;
@@ -563,22 +750,41 @@ static void websocket_relay(SSL* client_ssl, SSL* target_ssl, http_exchange& exc
                              (static_cast<uint8_t>(frame.opcode) & 0x0F));
                 out_frame.push_back(b0);
 
+                uint8_t mask_bit = outbound ? 0x80 : 0x00;
 
                 if (forward_payload.size() < 126) {
-                    out_frame.push_back(static_cast<uint8_t>(forward_payload.size()));
+                    out_frame.push_back(static_cast<uint8_t>(forward_payload.size()) | mask_bit);
                 } else if (forward_payload.size() <= 0xFFFF) {
-                    out_frame.push_back(126);
+                    out_frame.push_back(static_cast<uint8_t>(126) | mask_bit);
                     uint16_t len16 = static_cast<uint16_t>(forward_payload.size());
                     out_frame.push_back(static_cast<uint8_t>((len16 >> 8) & 0xFF));
                     out_frame.push_back(static_cast<uint8_t>(len16 & 0xFF));
                 } else {
-                    out_frame.push_back(127);
+                    out_frame.push_back(static_cast<uint8_t>(127) | mask_bit);
                     uint64_t len64 = forward_payload.size();
                     for (int i = 7; i >= 0; i--) {
                         out_frame.push_back(static_cast<uint8_t>((len64 >> (i * 8)) & 0xFF));
                     }
                 }
-                out_frame.insert(out_frame.end(), forward_payload.begin(), forward_payload.end());
+
+                if (outbound) {
+                    uint8_t mask_key[4];
+                    if (RAND_bytes(mask_key, 4) != 1) {
+                        uint64_t tk = GetTickCount64();
+                        for (int i = 0; i < 4; i++) mask_key[i] = static_cast<uint8_t>((tk >> (i * 8)) & 0xFF);
+                    }
+                    out_frame.push_back(mask_key[0]);
+                    out_frame.push_back(mask_key[1]);
+                    out_frame.push_back(mask_key[2]);
+                    out_frame.push_back(mask_key[3]);
+                    size_t mask_off = out_frame.size();
+                    out_frame.insert(out_frame.end(), forward_payload.begin(), forward_payload.end());
+                    for (size_t i = 0; i < forward_payload.size(); ++i) {
+                        out_frame[mask_off + i] ^= mask_key[i & 3];
+                    }
+                } else {
+                    out_frame.insert(out_frame.end(), forward_payload.begin(), forward_payload.end());
+                }
                 SSL_write(to_ssl, out_frame.data(), static_cast<int>(out_frame.size()));
             }
 
@@ -633,8 +839,18 @@ static void websocket_relay(SSL* client_ssl, SSL* target_ssl, http_exchange& exc
 
 static bool is_websocket_upgrade(const protocol_parser::http_response& resp) {
     if (resp.status_code != 101) return false;
+    auto iequal = [](const std::string& a, const char* b) -> bool {
+        size_t blen = strlen(b);
+        if (a.size() != blen) return false;
+        for (size_t i = 0; i < blen; ++i) {
+            char ca = static_cast<char>(::tolower(static_cast<unsigned char>(a[i])));
+            char cb = static_cast<char>(::tolower(static_cast<unsigned char>(b[i])));
+            if (ca != cb) return false;
+        }
+        return true;
+    };
     for (const auto& h : resp.headers) {
-        if (h.name == "Upgrade" || h.name == "upgrade") {
+        if (iequal(h.name, "Upgrade")) {
             std::string val = h.value;
             std::transform(val.begin(), val.end(), val.begin(),
                 [](char c) { return static_cast<char>(::tolower(static_cast<unsigned char>(c))); });
@@ -701,7 +917,7 @@ static void handle_h2_session(SSL* client_ssl, SSL* target_ssl,
             if (hook_data.dropped) {
                 exchange.state = http_exchange::state_t::dropped;
                 std::lock_guard<std::mutex> lock(state.history_mutex);
-                state.history.push_back(std::move(exchange));
+                state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
                 return;
             }
         }
@@ -715,7 +931,7 @@ static void handle_h2_session(SSL* client_ssl, SSL* target_ssl,
 
 
         std::lock_guard<std::mutex> lock(state.history_mutex);
-        state.history.push_back(std::move(exchange));
+        state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
         while (state.history.size() > state.config.max_history)
             state.history.pop_front();
     });
@@ -743,16 +959,18 @@ static void handle_h2_session(SSL* client_ssl, SSL* target_ssl,
 
         std::lock_guard<std::mutex> lock(state.history_mutex);
         for (auto it = state.history.rbegin(); it != state.history.rend(); ++it) {
-            if (it->is_h2 && it->target_host == target_host) {
-                it->response.valid = true;
-                it->response.status_code = sd.status_code;
+            auto& ex_ref = **it;
+            if (ex_ref.is_h2 && ex_ref.target_host == target_host &&
+                ex_ref.target_port == target_port && ex_ref.h2_stream_id == sd.stream_id) {
+                ex_ref.response.valid = true;
+                ex_ref.response.status_code = sd.status_code;
                 for (const auto& h : sd.response_headers)
-                    it->response.headers.push_back({h.name, h.value});
-                it->raw_response = sd.response_body;
-                it->response_size = sd.response_body.size();
-                it->response_time = GetTickCount64();
-                it->latency_ms = it->response_time - it->request_time;
-                it->state = http_exchange::state_t::complete;
+                    ex_ref.response.headers.push_back({h.name, h.value});
+                ex_ref.raw_response = sd.response_body;
+                ex_ref.response_size = sd.response_body.size();
+                ex_ref.response_time = GetTickCount64();
+                ex_ref.latency_ms = ex_ref.response_time - ex_ref.request_time;
+                ex_ref.state = http_exchange::state_t::complete;
                 break;
             }
         }
@@ -838,7 +1056,7 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
     }
     SSL_set_fd(client_ssl, static_cast<int>(client_sock));
 
-    if (SSL_accept(client_ssl) <= 0) {
+    if (!ssl_handshake_with_timeout(client_ssl, SSL_accept)) {
         SSL_free(client_ssl);
         close_socket(client_sock);
         return;
@@ -877,10 +1095,18 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
     }
 
     SSL* target_ssl = SSL_new(target_ctx);
+    if (!target_ssl) {
+        SSL_CTX_free(target_ctx);
+        close_socket(target_sock);
+        SSL_shutdown(client_ssl);
+        SSL_free(client_ssl);
+        close_socket(client_sock);
+        return;
+    }
     SSL_set_fd(target_ssl, static_cast<int>(target_sock));
     SSL_set_tlsext_host_name(target_ssl, target_host.c_str());
 
-    if (SSL_connect(target_ssl) <= 0) {
+    if (!ssl_handshake_with_timeout(target_ssl, SSL_connect)) {
         SSL_free(target_ssl);
         SSL_CTX_free(target_ctx);
         close_socket(target_sock);
@@ -947,7 +1173,7 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
                 if (hook_data.dropped) {
                     exchange.state = http_exchange::state_t::dropped;
                     std::lock_guard<std::mutex> lock(state.history_mutex);
-                    state.history.push_back(std::move(exchange));
+                    state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
                     goto cleanup;
                 }
                 if (hook_data.modified)
@@ -1030,14 +1256,16 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
 
 
                         if (state.config.enable_websocket && is_websocket_upgrade(exchange.response)) {
+                            std::shared_ptr<http_exchange> ws_exchange;
                             {
                                 std::lock_guard<std::mutex> lock(state.history_mutex);
-                                state.history.push_back(exchange);
+                                ws_exchange = std::make_shared<http_exchange>(exchange);
+                                state.history.push_back(ws_exchange);
                                 while (state.history.size() > state.config.max_history)
                                     state.history.pop_front();
                             }
 
-                            websocket_relay(client_ssl, target_ssl, state.history.back(), state);
+                            websocket_relay(client_ssl, target_ssl, *ws_exchange, state);
                             goto cleanup_no_history;
                         }
                     } else {
@@ -1053,7 +1281,7 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
 
             {
                 std::lock_guard<std::mutex> lock(state.history_mutex);
-                state.history.push_back(std::move(exchange));
+                state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
                 while (state.history.size() > state.config.max_history)
                     state.history.pop_front();
             }
@@ -1061,8 +1289,8 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
     }
 
 cleanup:
-    state.active_connections.fetch_sub(1);
 cleanup_no_history:
+    state.active_connections.fetch_sub(1);
 
 
     SSL_shutdown(target_ssl);
@@ -1100,7 +1328,9 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
     uint16_t target_port = 80;
     size_t colon = target_host.rfind(':');
     if (colon != std::string::npos) {
-        target_port = static_cast<uint16_t>(std::stoi(target_host.substr(colon + 1)));
+        uint16_t parsed_port = 0;
+        if (parse_uint16(target_host.substr(colon + 1), parsed_port))
+            target_port = parsed_port;
         target_host = target_host.substr(0, colon);
     }
 
@@ -1142,7 +1372,7 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
         if (hook_data.dropped) {
             exchange.state = http_exchange::state_t::dropped;
             std::lock_guard<std::mutex> lock(state.history_mutex);
-            state.history.push_back(std::move(exchange));
+            state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
             state.active_connections.fetch_sub(1);
             close_socket(client_sock);
             return;
@@ -1240,7 +1470,7 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
 
     {
         std::lock_guard<std::mutex> lock(state.history_mutex);
-        state.history.push_back(std::move(exchange));
+        state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
         while (state.history.size() > state.config.max_history)
             state.history.pop_front();
     }
@@ -1551,19 +1781,22 @@ void shutdown() {
 std::vector<http_exchange> get_history(size_t max_count) {
     std::lock_guard<std::mutex> lock(g_state.history_mutex);
     std::vector<http_exchange> result;
-    if (max_count == 0 || max_count >= g_state.history.size()) {
-        result.assign(g_state.history.begin(), g_state.history.end());
-    } else {
-        auto start = g_state.history.end() - static_cast<ptrdiff_t>(max_count);
-        result.assign(start, g_state.history.end());
+    size_t count = g_state.history.size();
+    size_t take = (max_count == 0 || max_count >= count) ? count : max_count;
+    result.reserve(take);
+    size_t skip = count - take;
+    size_t i = 0;
+    for (const auto& ex_ptr : g_state.history) {
+        if (i++ < skip) continue;
+        if (ex_ptr) result.push_back(*ex_ptr);
     }
     return result;
 }
 
 const http_exchange* find_exchange(uint64_t id) {
     std::lock_guard<std::mutex> lock(g_state.history_mutex);
-    for (auto& ex : g_state.history) {
-        if (ex.id == id) return &ex;
+    for (const auto& ex_ptr : g_state.history) {
+        if (ex_ptr && ex_ptr->id == id) return ex_ptr.get();
     }
     return nullptr;
 }
@@ -1571,7 +1804,7 @@ const http_exchange* find_exchange(uint64_t id) {
 void clear_history() {
     std::lock_guard<std::mutex> lock(g_state.history_mutex);
     g_state.history.clear();
-    g_state.next_id = 1;
+    g_state.next_id.store(1);
 }
 
 size_t history_count() {
@@ -1726,10 +1959,16 @@ repeat_result repeat_request(const std::string& host, uint16_t port, bool use_tl
         }
 
         SSL* ssl = SSL_new(ctx);
+        if (!ssl) {
+            SSL_CTX_free(ctx);
+            close_socket(sock);
+            result.error = "SSL_new failed";
+            return result;
+        }
         SSL_set_fd(ssl, static_cast<int>(sock));
         SSL_set_tlsext_host_name(ssl, host.c_str());
 
-        if (SSL_connect(ssl) <= 0) {
+        if (!ssl_handshake_with_timeout(ssl, SSL_connect)) {
             SSL_free(ssl);
             SSL_CTX_free(ctx);
             close_socket(sock);

@@ -45,6 +45,7 @@ struct TerminalSession
 
     std::thread          reader_thread;
     std::atomic<bool>    stop_reader{false};
+    std::atomic<bool>    reader_done{true};
 
 
     std::mutex           buffer_mtx;
@@ -334,8 +335,9 @@ inline void process_output(TerminalSession& s, const char* data, size_t len)
 
     while (static_cast<int>(s.lines.size()) > TerminalSession::MAX_LINES) {
         s.lines.pop_front();
-        s.cursor_row--;
+        if (s.cursor_row > 0) s.cursor_row--;
     }
+    if (s.cursor_row < 0) s.cursor_row = 0;
 }
 
 
@@ -352,6 +354,7 @@ inline void reader_thread_func(TerminalSession* s)
         }
         process_output(*s, buf, bytes_read);
     }
+    s->reader_done.store(true, std::memory_order_release);
 }
 
 
@@ -441,6 +444,7 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr)
 
 
     s.stop_reader.store(false);
+    s.reader_done.store(false, std::memory_order_release);
     s.reader_thread = {};
     work_queue::post([&s]() { reader_thread_func(&s); });
 
@@ -490,6 +494,9 @@ inline void destroy_session(TerminalSession& s)
     }
     if (s.reader_thread.joinable())
         s.reader_thread.join();
+    while (!s.reader_done.load(std::memory_order_acquire)) {
+        Sleep(1);
+    }
     if (s.hPC != INVALID_HANDLE_VALUE) {
         ClosePseudoConsole(s.hPC);
         s.hPC = INVALID_HANDLE_VALUE;
@@ -540,13 +547,25 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
 
     int total_lines;
     int new_lines_added = 0;
+    int lines_popped_front = 0;
     {
         std::lock_guard<std::mutex> lk(s.buffer_mtx);
         total_lines = static_cast<int>(s.lines.size());
-        new_lines_added = total_lines - s.prev_line_count;
-        if (new_lines_added < 0) new_lines_added = 0;
+        int raw_delta = total_lines - s.prev_line_count;
+        if (raw_delta >= 0) {
+            new_lines_added = raw_delta;
+        } else {
+            lines_popped_front = -raw_delta;
+        }
         s.prev_line_count = total_lines;
     }
+
+    while (lines_popped_front > 0 && !s.line_entrance_time.empty()) {
+        s.line_entrance_time.pop_front();
+        --lines_popped_front;
+    }
+    while (s.line_entrance_time.size() > static_cast<size_t>(total_lines))
+        s.line_entrance_time.pop_front();
 
     bool burst = (new_lines_added > 100);
     if (!burst && new_lines_added > 0) {

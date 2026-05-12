@@ -7,6 +7,7 @@
 #include "work_queue.hpp"
 
 #include <atomic>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -123,6 +124,61 @@ inline std::vector<std::string> parse_globs(const char* buf)
 }
 
 
+inline std::vector<std::string> load_aidaignore_patterns(const std::string& root_dir)
+{
+    std::vector<std::string> patterns;
+    std::error_code ec;
+    auto ignore_path = std::filesystem::path(root_dir) / ".aidaignore";
+    if (!std::filesystem::exists(ignore_path, ec)) return patterns;
+    std::ifstream ifs(ignore_path);
+    if (!ifs.is_open()) return patterns;
+    std::string line;
+    while (std::getline(ifs, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
+            line.pop_back();
+        while (!line.empty() && (line.front() == ' ' || line.front() == '\t'))
+            line.erase(line.begin());
+        if (line.empty() || line.front() == '#') continue;
+        patterns.push_back(std::move(line));
+    }
+    return patterns;
+}
+
+inline bool path_matches_aidaignore(const std::string& full_path,
+                                    const std::string& root_dir,
+                                    const std::vector<std::string>& patterns)
+{
+    if (patterns.empty()) return false;
+    std::string rel;
+    if (full_path.size() > root_dir.size() &&
+        std::memcmp(full_path.data(), root_dir.data(), root_dir.size()) == 0) {
+        rel = full_path.substr(root_dir.size());
+        while (!rel.empty() && (rel.front() == '\\' || rel.front() == '/'))
+            rel.erase(rel.begin());
+    } else {
+        rel = full_path;
+    }
+    std::string rel_fwd = rel;
+    for (auto& c : rel_fwd) if (c == '\\') c = '/';
+    std::filesystem::path p(rel);
+    std::string fname = p.filename().string();
+    for (const auto& pat : patterns) {
+        if (glob_match(pat, fname)) return true;
+        if (glob_match(pat, rel_fwd)) return true;
+        if (pat.find('/') == std::string::npos) {
+            size_t slash = 0;
+            while (slash != std::string::npos) {
+                size_t next = rel_fwd.find('/', slash);
+                std::string segment = rel_fwd.substr(slash, next == std::string::npos ? std::string::npos : next - slash);
+                if (glob_match(pat, segment)) return true;
+                if (next == std::string::npos) break;
+                slash = next + 1;
+            }
+        }
+    }
+    return false;
+}
+
 inline void search_worker(std::string root_dir, std::string query,
                           bool case_sensitive, bool whole_word, bool use_regex,
                           std::vector<std::string> include_globs,
@@ -138,12 +194,17 @@ inline void search_worker(std::string root_dir, std::string query,
     }
 
 
+    auto aidaignore = load_aidaignore_patterns(root_dir);
+
     std::regex re;
     if (use_regex) {
         try {
             auto flags = std::regex_constants::ECMAScript;
             if (!case_sensitive) flags |= std::regex_constants::icase;
-            re = std::regex(query, flags);
+            re.assign(query, flags);
+        } catch (const std::regex_error&) {
+            st.searching.store(false);
+            return;
         } catch (...) {
             st.searching.store(false);
             return;
@@ -157,54 +218,69 @@ inline void search_worker(std::string root_dir, std::string query,
             ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
 
     std::error_code ec;
-    for (auto it = std::filesystem::recursive_directory_iterator(root_dir, ec);
-         it != std::filesystem::recursive_directory_iterator(); ++it)
+    auto end_it = std::filesystem::recursive_directory_iterator();
+    auto it = std::filesystem::recursive_directory_iterator(root_dir, ec);
+    while (it != end_it)
     {
         if (st.cancel.load(std::memory_order_acquire))
             break;
 
-        if (!it->is_regular_file(ec))
-            continue;
+        bool skip_iteration = false;
 
-        const auto& path = it->path();
-        const std::string ext = path.extension().string();
-        const std::string fname = path.filename().string();
+        if (!it->is_regular_file(ec)) {
+            skip_iteration = true;
+        }
 
+        std::filesystem::path path;
+        std::string ext, fname, ps;
 
-        if (!is_text_extension(ext) && !ext.empty())
-            continue;
+        if (!skip_iteration) {
+            path = it->path();
+            ext = path.extension().string();
+            fname = path.filename().string();
+            ps = path.string();
 
+            if (!is_text_extension(ext) && !ext.empty())
+                skip_iteration = true;
+        }
 
-        if (!include_globs.empty()) {
+        if (!skip_iteration && !include_globs.empty()) {
             bool match = false;
             for (const auto& g : include_globs)
                 if (glob_match(g, fname)) { match = true; break; }
-            if (!match) continue;
+            if (!match) skip_iteration = true;
         }
 
-
-        {
-            bool skip = false;
+        if (!skip_iteration) {
             for (const auto& g : exclude_globs)
-                if (glob_match(g, fname)) { skip = true; break; }
-            if (skip) continue;
+                if (glob_match(g, fname)) { skip_iteration = true; break; }
         }
 
-
-        {
-            const std::string ps = path.string();
+        if (!skip_iteration) {
             if (ps.find("\\.git\\") != std::string::npos ||
                 ps.find("\\node_modules\\") != std::string::npos ||
                 ps.find("\\__pycache__\\") != std::string::npos ||
                 ps.find("\\.vs\\") != std::string::npos ||
                 ps.find("\\Release\\") != std::string::npos ||
                 ps.find("\\Debug\\") != std::string::npos)
-                continue;
+                skip_iteration = true;
         }
 
+        if (!skip_iteration && path_matches_aidaignore(ps, root_dir, aidaignore))
+            skip_iteration = true;
+
+        if (skip_iteration) {
+            it.increment(ec);
+            if (ec) break;
+            continue;
+        }
 
         std::ifstream ifs(path, std::ios::in);
-        if (!ifs.is_open()) continue;
+        if (!ifs.is_open()) {
+            it.increment(ec);
+            if (ec) break;
+            continue;
+        }
 
         st.files_scanned.fetch_add(1, std::memory_order_relaxed);
 
@@ -275,6 +351,9 @@ inline void search_worker(std::string root_dir, std::string query,
         }
         if (st.match_count.load(std::memory_order_relaxed) > 50000)
             break;
+
+        it.increment(ec);
+        if (ec) break;
     }
 
     st.searching.store(false, std::memory_order_release);

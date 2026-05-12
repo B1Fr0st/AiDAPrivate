@@ -5,6 +5,8 @@
 #include <functional>
 #include <cstdint>
 
+#include <nlohmann/json.hpp>
+
 
 namespace tool_repetition {
 
@@ -14,6 +16,19 @@ struct call_record_t
     std::string name;
     std::size_t args_hash = 0;
 };
+
+
+inline std::size_t hash_args_normalized(const std::string& args_json)
+{
+    if (args_json.empty()) return std::hash<std::string>{}(std::string{});
+    auto parsed = nlohmann::json::parse(args_json, nullptr, false);
+    if (parsed.is_discarded())
+        return std::hash<std::string>{}(args_json);
+    std::string canonical;
+    try { canonical = parsed.dump(); }
+    catch (...) { canonical = args_json; }
+    return std::hash<std::string>{}(canonical);
+}
 
 
 class detector_t
@@ -27,7 +42,7 @@ public:
     {
         call_record_t rec;
         rec.name = tool_name;
-        rec.args_hash = std::hash<std::string>{}(args_json);
+        rec.args_hash = hash_args_normalized(args_json);
 
         _history.push_back(rec);
         if (static_cast<int>(_history.size()) > MAX_HISTORY)

@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <atomic>
 #include <thread>
@@ -224,6 +225,11 @@ private:
     void process_notification(const json& notif);
     bool detect_oauth_metadata(const std::string& www_authenticate_hdr);
 
+    bool dispatch_inbound_request(const json& request, json& response_out);
+    json build_roots_list_result() const;
+    void send_inbound_response(const json& response);
+    bool post_outbound_http_message(const json& message);
+
 
     bool  launch_stdio_process();
     void  kill_stdio_process();
@@ -333,8 +339,9 @@ private:
         client_t        client;
     };
 
-    mutable std::mutex        _mtx;
-    std::vector<entry_t>      _entries;
+    mutable std::mutex                          _mtx;
+    std::vector<std::shared_ptr<entry_t>>       _entries;
+    std::vector<std::string>                    _in_flight_connects;
 };
 
 

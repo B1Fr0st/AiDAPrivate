@@ -4,6 +4,7 @@
 #include "mcp_standalone.hpp"
 #include "agent_registry.hpp"
 #include "standalone_settings.hpp"
+#include "standalone_chat.hpp"
 #include "apply_diff.hpp"
 #include "apply_patch.hpp"
 #include "code_index.hpp"
@@ -25,7 +26,9 @@
 #include <vector>
 #include <mutex>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <system_error>
 
 #include <nlohmann/json.hpp>
 
@@ -65,6 +68,45 @@ std::string                              g_task_id = "default";
 std::unique_ptr<skills::manager_t> g_skills_mgr;
 std::mutex                          g_skills_mtx;
 std::string                         g_workspace_root;
+
+
+std::string sanitize_workspace_path(const std::string& raw)
+{
+    std::string p = raw;
+    for (char& c : p) { if (c == '/') c = '\\'; }
+
+    if (!file_browser::current_dir.empty() && !p.empty() && p[0] != '\\' &&
+        (p.size() < 2 || p[1] != ':'))
+    {
+        p = file_browser::current_dir + "\\" + p;
+    }
+
+    std::error_code ec;
+    auto canonical = fs::weakly_canonical(fs::path(p), ec);
+    if (ec) return raw;
+    return canonical.string();
+}
+
+
+bool path_within_workspace(const std::string& canonical_path)
+{
+    if (file_browser::current_dir.empty())
+        return true;
+
+    std::error_code ec;
+    auto ws = fs::weakly_canonical(fs::path(file_browser::current_dir), ec);
+    if (ec) return false;
+
+    auto ws_str = ws.string();
+    auto p_str  = canonical_path;
+
+    std::transform(ws_str.begin(), ws_str.end(), ws_str.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(p_str.begin(), p_str.end(), p_str.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    return p_str.find(ws_str) == 0;
+}
 
 
 tool_result_t handle_switch_agent(const json& params)
@@ -225,7 +267,9 @@ tool_result_t handle_task(const json& params)
     output_log::push(bottom_tab_t::output, "[task] Spawning subagent: " + agent_name);
 
     std::string result;
-    bool ok = aida::agent::task::execute(agent_name, prompt, max_steps, parent_session_id, result);
+    std::atomic<bool>* cancel_flag = chat_cancel_flag();
+    bool ok = aida::agent::task::execute(agent_name, prompt, max_steps,
+                                         parent_session_id, result, cancel_flag);
     if (!ok && result.empty())
         return tool_result_t::error("Subagent failed: " + aida::agent::task::last_error());
     return tool_result_t::ok(result);
@@ -351,10 +395,14 @@ tool_result_t handle_apply_diff(const json& params)
     if (!params.contains("diff") || !params["diff"].is_string())
         return tool_result_t::error("Missing required parameter: diff");
 
-    std::string path = params["path"].get<std::string>();
+    std::string path = sanitize_workspace_path(params["path"].get<std::string>());
+    if (!path_within_workspace(path))
+        return tool_result_t::error("Path is outside the workspace: " + path);
+
     std::string diff_text = params["diff"].get<std::string>();
 
-    if (!fs::exists(path))
+    std::error_code exists_ec;
+    if (!fs::exists(path, exists_ec) || exists_ec)
         return tool_result_t::error("File not found: " + path);
 
     std::ifstream ifs(path);
@@ -389,6 +437,21 @@ tool_result_t handle_apply_patch(const json& params)
 
     std::string patch_text = params["patch"].get<std::string>();
 
+    auto parsed = apply_patch::parse(patch_text);
+    if (parsed.empty())
+        return tool_result_t::error("No valid file patches found in patch text.");
+
+    for (const auto& fp : parsed) {
+        std::string src = sanitize_workspace_path(fp.path);
+        if (!path_within_workspace(src))
+            return tool_result_t::error("Patch refers to a path outside the workspace: " + fp.path);
+        if (fp.action == apply_patch::file_action_t::move_file) {
+            std::string dst = sanitize_workspace_path(fp.move_to);
+            if (!path_within_workspace(dst))
+                return tool_result_t::error("Patch move destination outside workspace: " + fp.move_to);
+        }
+    }
+
     auto read_fn = [](const std::string& path) -> std::string {
         std::ifstream ifs(path);
         if (!ifs) return "";
@@ -397,7 +460,8 @@ tool_result_t handle_apply_patch(const json& params)
     };
 
     auto write_fn = [](const std::string& path, const std::string& content) -> bool {
-        fs::create_directories(fs::path(path).parent_path());
+        std::error_code ec;
+        fs::create_directories(fs::path(path).parent_path(), ec);
         std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
         if (!ofs) return false;
         ofs << content;
@@ -410,8 +474,8 @@ tool_result_t handle_apply_patch(const json& params)
     };
 
     auto move_fn = [](const std::string& from, const std::string& to) -> bool {
-        fs::create_directories(fs::path(to).parent_path());
         std::error_code ec;
+        fs::create_directories(fs::path(to).parent_path(), ec);
         fs::rename(from, to, ec);
         return !ec;
     };
@@ -584,9 +648,14 @@ tool_result_t handle_save_checkpoint(const json& params)
         g_checkpoint_svc = std::make_unique<checkpoints::service_t>(
             g_sa_settings.workspace.root_path);
 
-        char appdata[MAX_PATH];
-        GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH);
-        std::string checkpoint_dir = std::string(appdata) + "\\AiDA\\Standalone\\checkpoints";
+        char appdata[MAX_PATH] = {};
+        DWORD appdata_len = GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH);
+        std::string checkpoint_dir;
+        if (appdata_len > 0 && appdata_len < MAX_PATH) {
+            checkpoint_dir = std::string(appdata) + "\\AiDA\\Standalone\\checkpoints";
+        } else {
+            checkpoint_dir = g_sa_settings.workspace.root_path + "\\.aida\\checkpoints";
+        }
         g_checkpoint_svc->set_storage_dir(checkpoint_dir);
     }
 
@@ -661,13 +730,14 @@ tool_result_t handle_skill(const json& params)
         if (workspace.empty())
             return tool_result_t::error("No workspace is open.");
 
-        char appdata[MAX_PATH];
-        GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH);
-        std::string global_dir = std::string(appdata) + "\\AiDA\\Standalone\\skills";
+        char appdata[MAX_PATH] = {};
+        DWORD appdata_len = GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH);
 
         g_skills_mgr = std::make_unique<skills::manager_t>();
         g_skills_mgr->add_search_path(workspace + "/.aida/skills");
-        g_skills_mgr->add_search_path(global_dir);
+        if (appdata_len > 0 && appdata_len < MAX_PATH) {
+            g_skills_mgr->add_search_path(std::string(appdata) + "\\AiDA\\Standalone\\skills");
+        }
         g_skills_mgr->discover();
     }
 
@@ -991,7 +1061,7 @@ void register_workflow_tools(mcp_standalone::server_t& srv)
         mcp_standalone::tool_visibility_t::internal_only});
 
     srv.register_tool({"run_slash_command",
-        "Execute a slash command. Available: /help, /clear, /mode, /checkpoint, /restore, /skills, /index.",
+        "Execute a slash command. Available: /help, /clear, /agent <name>, /agents, /checkpoint [message], /restore <id>, /skills, /index.",
         {{"command", "string", "The command name (without the leading /)", true},
          {"arguments", "string", "Optional arguments for the command", false}},
         false, handle_run_slash_command,

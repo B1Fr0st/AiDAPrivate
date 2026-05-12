@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -56,17 +57,34 @@ namespace sa_settings_detail
         if ((text.size() % 2) != 0)
             return false;
 
+        auto nibble = [](char c, unsigned& v) -> bool {
+            if (c >= '0' && c <= '9') { v = static_cast<unsigned>(c - '0'); return true; }
+            if (c >= 'a' && c <= 'f') { v = static_cast<unsigned>(c - 'a' + 10); return true; }
+            if (c >= 'A' && c <= 'F') { v = static_cast<unsigned>(c - 'A' + 10); return true; }
+            return false;
+        };
+
         out.clear();
         out.reserve(text.size() / 2);
         for (size_t i = 0; i < text.size(); i += 2) {
-            unsigned int v = 0;
-            std::istringstream iss(text.substr(i, 2));
-            iss >> std::hex >> v;
-            if (iss.fail())
+            unsigned hi = 0, lo = 0;
+            if (!nibble(text[i], hi) || !nibble(text[i + 1], lo))
                 return false;
-            out.push_back(static_cast<unsigned char>(v));
+            out.push_back(static_cast<unsigned char>((hi << 4) | lo));
         }
         return true;
+    }
+
+    inline std::recursive_mutex& io_mutex()
+    {
+        static std::recursive_mutex m;
+        return m;
+    }
+
+    inline std::string& last_error_ref()
+    {
+        static std::string s;
+        return s;
     }
 
     inline std::string protect_dpapi(const std::string& plaintext, const char* scope)
@@ -119,6 +137,19 @@ namespace sa_settings_detail
         return result;
     }
 
+    inline std::string xor_obfuscate(const std::string& plain)
+    {
+        std::string out(CFG_OBF_PREFIX);
+        out.reserve(out.size() + plain.size() * 2);
+        static const char digits[] = "0123456789abcdef";
+        for (size_t i = 0; i < plain.size(); ++i) {
+            const uint8_t b = static_cast<uint8_t>(plain[i]) ^ CFG_OBF_KEY[i % sizeof(CFG_OBF_KEY)];
+            out.push_back(digits[(b >> 4) & 0x0F]);
+            out.push_back(digits[b & 0x0F]);
+        }
+        return out;
+    }
+
     inline std::string obfuscate_key(const std::string& plain)
     {
         if (plain.empty())
@@ -128,14 +159,7 @@ namespace sa_settings_detail
         if (!dpapi.empty())
             return dpapi;
 
-        std::string out(CFG_OBF_PREFIX);
-        for (size_t i = 0; i < plain.size(); ++i) {
-            const uint8_t b = static_cast<uint8_t>(plain[i]) ^ CFG_OBF_KEY[i % sizeof(CFG_OBF_KEY)];
-            char hex[3];
-            snprintf(hex, sizeof(hex), "%02x", b);
-            out += hex;
-        }
-        return out;
+        return xor_obfuscate(plain);
     }
 
     inline std::string deobfuscate_key(const std::string& encoded)
@@ -148,12 +172,13 @@ namespace sa_settings_detail
             return encoded;
 
         const std::string hex_part = encoded.substr(std::strlen(CFG_OBF_PREFIX));
+        std::vector<unsigned char> bytes;
+        if (!hex_decode(hex_part, bytes))
+            return std::string();
         std::string out;
-        out.reserve(hex_part.size() / 2);
-        for (size_t i = 0; i + 1 < hex_part.size(); i += 2) {
-            const uint8_t b = static_cast<uint8_t>(std::stoi(hex_part.substr(i, 2), nullptr, 16));
-            out.push_back(static_cast<char>(b ^ CFG_OBF_KEY[(i / 2) % sizeof(CFG_OBF_KEY)]));
-        }
+        out.reserve(bytes.size());
+        for (size_t i = 0; i < bytes.size(); ++i)
+            out.push_back(static_cast<char>(bytes[i] ^ CFG_OBF_KEY[i % sizeof(CFG_OBF_KEY)]));
         return out;
     }
 
@@ -1040,7 +1065,11 @@ struct settings_sa_t
             return;
 
         const std::string kind = sa_settings_detail::normalize_provider_kind(api_provider);
-        profile->kind = kind;
+        const std::string profile_kind = sa_settings_detail::normalize_provider_kind(profile->kind);
+
+        if (kind != profile_kind)
+            return;
+
         if (kind == "gemini") {
             profile->base_url = gemini_base_url;
             profile->api_key = gemini_api_key;
@@ -1057,8 +1086,7 @@ struct settings_sa_t
             profile->base_url = local_llm_base_url;
             profile->api_key = local_llm_api_key;
             profile->model = local_llm_model_name;
-        } else {
-            profile->kind = "openai_compatible";
+        } else if (kind == "openai_compatible") {
             profile->base_url = openai_base_url;
             profile->api_key = openai_api_key;
             profile->model = openai_model_name;
@@ -1118,6 +1146,9 @@ struct settings_sa_t
 
     bool load()
     {
+        std::lock_guard<std::recursive_mutex> lock(sa_settings_detail::io_mutex());
+        sa_settings_detail::last_error_ref().clear();
+
         nlohmann::json root;
         auto source = config_path();
         bool imported_legacy = false;
@@ -1128,6 +1159,7 @@ struct settings_sa_t
                 imported_legacy = true;
             } else {
                 ensure_default_profiles();
+                sa_settings_detail::last_error_ref() = "no settings file present; using defaults";
                 return false;
             }
         }
@@ -1267,6 +1299,22 @@ struct settings_sa_t
         integer("window_h", window_h);
         boolean("window_maximized", window_maximized);
 
+        auto json_get_string = [](const nlohmann::json& obj, const char* key, const std::string& fallback) -> std::string {
+            if (obj.contains(key) && obj[key].is_string())
+                return obj[key].get<std::string>();
+            return fallback;
+        };
+        auto json_get_int = [](const nlohmann::json& obj, const char* key, int fallback) -> int {
+            if (obj.contains(key) && obj[key].is_number_integer())
+                return obj[key].get<int>();
+            return fallback;
+        };
+        auto json_get_bool = [](const nlohmann::json& obj, const char* key, bool fallback) -> bool {
+            if (obj.contains(key) && obj[key].is_boolean())
+                return obj[key].get<bool>();
+            return fallback;
+        };
+
         if (root.contains("provider_profiles") && root["provider_profiles"].is_array()) {
             provider_profiles.clear();
             size_t index = 0;
@@ -1274,15 +1322,15 @@ struct settings_sa_t
                 if (!item.is_object())
                     continue;
                 provider_profile_t profile;
-                profile.display_name = item.value("display_name", item.value("name", "Profile"));
-                profile.id = item.value("id", sa_settings_detail::make_profile_id(profile.display_name, index++));
-                profile.kind = sa_settings_detail::normalize_provider_kind(item.value("kind", "openai_compatible"));
-                profile.base_url = item.value("base_url", "");
+                profile.display_name = json_get_string(item, "display_name", json_get_string(item, "name", "Profile"));
+                profile.id = json_get_string(item, "id", sa_settings_detail::make_profile_id(profile.display_name, index++));
+                profile.kind = sa_settings_detail::normalize_provider_kind(json_get_string(item, "kind", "openai_compatible"));
+                profile.base_url = json_get_string(item, "base_url", "");
                 if (item.contains("api_key") && item["api_key"].is_string())
                     profile.api_key = sa_settings_detail::deobfuscate_key(sa_settings_detail::trim(item["api_key"].get<std::string>()));
-                profile.model = item.value("model", "");
-                profile.headers_json = item.value("headers_json", "{}");
-                profile.enabled = item.value("enabled", true);
+                profile.model = json_get_string(item, "model", "");
+                profile.headers_json = json_get_string(item, "headers_json", "{}");
+                profile.enabled = json_get_bool(item, "enabled", true);
 
 
                 if (item.contains("aws_access_key") && item["aws_access_key"].is_string())
@@ -1291,30 +1339,30 @@ struct settings_sa_t
                     profile.aws_secret_key = sa_settings_detail::deobfuscate_key(sa_settings_detail::trim(item["aws_secret_key"].get<std::string>()));
                 if (item.contains("aws_session_token") && item["aws_session_token"].is_string())
                     profile.aws_session_token = sa_settings_detail::deobfuscate_key(sa_settings_detail::trim(item["aws_session_token"].get<std::string>()));
-                profile.aws_region = item.value("aws_region", "us-east-1");
-                profile.aws_use_cross_region = item.value("aws_use_cross_region", false);
+                profile.aws_region = json_get_string(item, "aws_region", "us-east-1");
+                profile.aws_use_cross_region = json_get_bool(item, "aws_use_cross_region", false);
 
 
-                profile.vertex_project_id = item.value("vertex_project_id", "");
-                profile.vertex_region = item.value("vertex_region", "us-east5");
-                profile.vertex_key_file = item.value("vertex_key_file", "");
+                profile.vertex_project_id = json_get_string(item, "vertex_project_id", "");
+                profile.vertex_region = json_get_string(item, "vertex_region", "us-east5");
+                profile.vertex_key_file = json_get_string(item, "vertex_key_file", "");
 
 
-                profile.ollama_num_ctx = item.value("ollama_num_ctx", 0);
+                profile.ollama_num_ctx = json_get_int(item, "ollama_num_ctx", 0);
 
 
-                profile.reasoning_effort = item.value("reasoning_effort", "");
+                profile.reasoning_effort = json_get_string(item, "reasoning_effort", "");
 
 
-                profile.lmstudio_speculative_decoding = item.value("lmstudio_speculative_decoding", false);
-                profile.lmstudio_draft_model = item.value("lmstudio_draft_model", "");
+                profile.lmstudio_speculative_decoding = json_get_bool(item, "lmstudio_speculative_decoding", false);
+                profile.lmstudio_draft_model = json_get_string(item, "lmstudio_draft_model", "");
 
 
-                profile.mistral_codestral_url = item.value("mistral_codestral_url", "");
+                profile.mistral_codestral_url = json_get_string(item, "mistral_codestral_url", "");
 
 
-                profile.azure_deployment = item.value("azure_deployment", "");
-                profile.azure_api_version = item.value("azure_api_version", "2024-10-21");
+                profile.azure_deployment = json_get_string(item, "azure_deployment", "");
+                profile.azure_api_version = json_get_string(item, "azure_api_version", "2024-10-21");
 
                 provider_profiles.push_back(std::move(profile));
             }
@@ -1323,29 +1371,29 @@ struct settings_sa_t
 
         if (root.contains("workspace") && root["workspace"].is_object()) {
             const auto& ws = root["workspace"];
-            workspace.root_path = ws.value("root_path", "");
-            workspace.open_tabs_json = ws.value("open_tabs_json", "[]");
-            workspace.active_tab = ws.value("active_tab", -1);
-            workspace.last_active_path = ws.value("last_active_path", "");
-            workspace.active_view = ws.value("active_view", "editor");
+            workspace.root_path = json_get_string(ws, "root_path", "");
+            workspace.open_tabs_json = json_get_string(ws, "open_tabs_json", "[]");
+            workspace.active_tab = json_get_int(ws, "active_tab", -1);
+            workspace.last_active_path = json_get_string(ws, "last_active_path", "");
+            workspace.active_view = json_get_string(ws, "active_view", "editor");
             if (ws.contains("left_width") && ws["left_width"].is_number())
                 workspace.left_width = ws["left_width"].get<float>();
             if (ws.contains("right_width") && ws["right_width"].is_number())
                 workspace.right_width = ws["right_width"].get<float>();
             if (ws.contains("bottom_height") && ws["bottom_height"].is_number())
                 workspace.bottom_height = ws["bottom_height"].get<float>();
-            workspace.left_visible   = ws.value("left_visible", true);
-            workspace.right_visible  = ws.value("right_visible", true);
-            workspace.bottom_visible = ws.value("bottom_visible", false);
+            workspace.left_visible   = json_get_bool(ws, "left_visible", true);
+            workspace.right_visible  = json_get_bool(ws, "right_visible", true);
+            workspace.bottom_visible = json_get_bool(ws, "bottom_visible", false);
         }
 
         if (root.contains("sandbox") && root["sandbox"].is_object()) {
             const auto& sb = root["sandbox"];
-            sandbox.enabled = sb.value("enabled", true);
-            sandbox.timeout_ms = sb.value("timeout_ms", 30000);
-            sandbox.memory_limit_mb = sb.value("memory_limit_mb", 256);
-            sandbox.network_mode = sb.value("network_mode", "off");
-            sandbox.shared_folder_root = sb.value("shared_folder_root", "");
+            sandbox.enabled = json_get_bool(sb, "enabled", true);
+            sandbox.timeout_ms = json_get_int(sb, "timeout_ms", 30000);
+            sandbox.memory_limit_mb = json_get_int(sb, "memory_limit_mb", 256);
+            sandbox.network_mode = json_get_string(sb, "network_mode", "off");
+            sandbox.shared_folder_root = json_get_string(sb, "shared_folder_root", "");
         }
 
 
@@ -1354,22 +1402,22 @@ struct settings_sa_t
             for (const auto& item : root["mcp_client_servers"]) {
                 if (!item.is_object()) continue;
                 mcp_client_server_t srv;
-                srv.name         = item.value("name", "");
-                srv.url          = item.value("url", "");
-                srv.transport    = item.value("transport", "http_sse");
-                srv.command      = item.value("command", "");
-                srv.args         = item.value("args", "");
+                srv.name         = json_get_string(item, "name", "");
+                srv.url          = json_get_string(item, "url", "");
+                srv.transport    = json_get_string(item, "transport", "http_sse");
+                srv.command      = json_get_string(item, "command", "");
+                srv.args         = json_get_string(item, "args", "");
                 if (item.contains("api_key") && item["api_key"].is_string())
                     srv.api_key = sa_settings_detail::deobfuscate_key(
                         sa_settings_detail::trim(item["api_key"].get<std::string>()));
-                srv.enabled      = item.value("enabled", true);
-                srv.auto_connect = item.value("auto_connect", true);
+                srv.enabled      = json_get_bool(item, "enabled", true);
+                srv.auto_connect = json_get_bool(item, "auto_connect", true);
                 if (!srv.name.empty())
                     mcp_client_servers.push_back(std::move(srv));
             }
         }
 
-        marketplace_installed_json = root.value("marketplace_installed_json", "");
+        marketplace_installed_json = json_get_string(root, "marketplace_installed_json", "");
 
         if (root.contains("preferred_model_per_provider") && root["preferred_model_per_provider"].is_object()) {
             preferred_model_per_provider.clear();
@@ -1401,16 +1449,30 @@ struct settings_sa_t
         return true;
     }
 
+    static const std::string& last_error()
+    {
+        return sa_settings_detail::last_error_ref();
+    }
+
     bool save()
     {
+        std::lock_guard<std::recursive_mutex> lock(sa_settings_detail::io_mutex());
+        sa_settings_detail::last_error_ref().clear();
+
         ensure_default_profiles();
         apply_legacy_fields_to_active_profile();
         sync_legacy_fields_from_active_profile();
 
         auto path = config_path();
-        std::filesystem::create_directories(path.parent_path());
+        std::error_code dir_ec;
+        std::filesystem::create_directories(path.parent_path(), dir_ec);
+        if (dir_ec) {
+            sa_settings_detail::last_error_ref() = "create_directories failed: " + dir_ec.message();
+            return false;
+        }
 
         nlohmann::json root = nlohmann::json::object();
+        root["schema_version"] = 1;
         root["default_provider_id"] = default_provider_id;
         root["default_model_id"] = default_model_id;
         root["small_model_provider_id"] = small_model_provider_id;
@@ -1632,10 +1694,47 @@ struct settings_sa_t
             header_overrides[kv.first] = kv.second;
         root["provider_headers_overrides"] = header_overrides;
 
-        std::ofstream ofs(path, std::ios::trunc);
-        if (!ofs.is_open())
+        const std::string payload = root.dump(4);
+
+        nlohmann::json verify_parse;
+        try {
+            verify_parse = nlohmann::json::parse(payload);
+        } catch (...) {
+            sa_settings_detail::last_error_ref() = "serialized payload failed re-parse";
             return false;
-        ofs << root.dump(4);
+        }
+        if (!verify_parse.is_object()) {
+            sa_settings_detail::last_error_ref() = "serialized payload is not an object";
+            return false;
+        }
+
+        auto tmp_path = path;
+        tmp_path += L".tmp";
+        {
+            std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
+            if (!ofs.is_open()) {
+                sa_settings_detail::last_error_ref() = "failed to open temp settings file for write";
+                return false;
+            }
+            ofs.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+            if (!ofs.good()) {
+                sa_settings_detail::last_error_ref() = "failed to write temp settings file";
+                ofs.close();
+                std::error_code rm_ec;
+                std::filesystem::remove(tmp_path, rm_ec);
+                return false;
+            }
+            ofs.flush();
+            ofs.close();
+        }
+
+        if (!MoveFileExW(tmp_path.c_str(), path.c_str(),
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            sa_settings_detail::last_error_ref() = "MoveFileExW failed: " + std::to_string(GetLastError());
+            std::error_code rm_ec;
+            std::filesystem::remove(tmp_path, rm_ec);
+            return false;
+        }
         return true;
     }
 };

@@ -43,6 +43,7 @@ struct chat_message_t
     std::string thinking_text;
     bool        is_user         = false;
     bool        has_thinking    = false;
+    bool        streaming       = false;
     int64_t     timestamp       = 0;
     int         input_tokens    = 0;
     int         output_tokens   = 0;
@@ -50,6 +51,14 @@ struct chat_message_t
     int         cache_write     = 0;
     bool        is_summary      = false;
     std::string condense_id;
+    std::string condense_parent;
+    bool        is_truncation_marker = false;
+    std::string truncation_id;
+    std::string truncation_parent;
+    double      cost            = 0.0;
+    std::string tool_name;
+    bool        is_tool_result  = false;
+    std::string model_id;
 };
 
 
@@ -95,12 +104,52 @@ inline int64_t unix_timestamp_ms()
 }
 
 
+inline bool write_json_atomic(const std::filesystem::path& target, const std::string& payload)
+{
+    auto tmp = target;
+    tmp += L".tmp";
+    {
+        std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
+        if (!ofs) return false;
+        ofs.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+        if (!ofs.good()) {
+            ofs.close();
+            std::error_code rm_ec;
+            std::filesystem::remove(tmp, rm_ec);
+            return false;
+        }
+        ofs.flush();
+        ofs.close();
+    }
+    if (!MoveFileExW(tmp.c_str(), target.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        std::error_code rm_ec;
+        std::filesystem::remove(tmp, rm_ec);
+        return false;
+    }
+    return true;
+}
+
+inline std::mutex& task_io_mutex()
+{
+    static std::mutex m;
+    return m;
+}
+
 inline bool save_task(
     const std::string& task_id,
     const task_metadata_t& metadata,
     const std::vector<chat_message_t>& chat_messages,
     const std::vector<api_message_t>& api_messages)
 {
+    if (task_id.empty()) return false;
+    if (task_id.find("..") != std::string::npos) return false;
+    if (task_id.find('/')  != std::string::npos) return false;
+    if (task_id.find('\\') != std::string::npos) return false;
+    if (task_id.find(':')  != std::string::npos) return false;
+
+    std::lock_guard<std::mutex> lock(task_io_mutex());
+
     auto task_dir = get_tasks_dir() / task_id;
     std::error_code ec;
     std::filesystem::create_directories(task_dir, ec);
@@ -108,8 +157,13 @@ inline bool save_task(
 
     using json = nlohmann::json;
 
-    {
+    std::string meta_payload;
+    std::string chat_payload;
+    std::string api_payload;
+
+    try {
         json meta;
+        meta["schema_version"] = 1;
         meta["id"]             = metadata.id;
         meta["title"]          = metadata.title;
         meta["mode_slug"]      = metadata.mode_slug;
@@ -122,36 +176,36 @@ inline bool save_task(
         meta["total_output_tokens"] = metadata.total_output_tokens;
         meta["total_cost_usd"] = metadata.total_cost_usd;
         meta["status"]         = metadata.status;
+        meta_payload = meta.dump(2);
 
-        std::ofstream ofs(task_dir / "metadata.json", std::ios::binary);
-        if (!ofs) return false;
-        ofs << meta.dump(2);
-    }
-
-    {
         json arr = json::array();
         for (auto& m : chat_messages) {
             json msg;
-            msg["text"]          = m.text;
-            msg["thinking_text"] = m.thinking_text;
-            msg["is_user"]       = m.is_user;
-            msg["has_thinking"]  = m.has_thinking;
-            msg["timestamp"]     = m.timestamp;
-            msg["input_tokens"]  = m.input_tokens;
-            msg["output_tokens"] = m.output_tokens;
-            msg["cache_read"]    = m.cache_read;
-            msg["cache_write"]   = m.cache_write;
-            msg["is_summary"]    = m.is_summary;
-            msg["condense_id"]   = m.condense_id;
+            msg["text"]                 = m.text;
+            msg["thinking_text"]        = m.thinking_text;
+            msg["is_user"]              = m.is_user;
+            msg["has_thinking"]         = m.has_thinking;
+            msg["streaming"]            = m.streaming;
+            msg["timestamp"]            = m.timestamp;
+            msg["input_tokens"]         = m.input_tokens;
+            msg["output_tokens"]        = m.output_tokens;
+            msg["cache_read"]           = m.cache_read;
+            msg["cache_write"]          = m.cache_write;
+            msg["is_summary"]           = m.is_summary;
+            msg["condense_id"]          = m.condense_id;
+            msg["condense_parent"]      = m.condense_parent;
+            msg["is_truncation_marker"] = m.is_truncation_marker;
+            msg["truncation_id"]        = m.truncation_id;
+            msg["truncation_parent"]    = m.truncation_parent;
+            msg["cost"]                 = m.cost;
+            msg["tool_name"]            = m.tool_name;
+            msg["is_tool_result"]       = m.is_tool_result;
+            msg["model_id"]             = m.model_id;
             arr.push_back(std::move(msg));
         }
-        std::ofstream ofs(task_dir / "chat_messages.json", std::ios::binary);
-        if (!ofs) return false;
-        ofs << arr.dump();
-    }
+        chat_payload = arr.dump();
 
-    {
-        json arr = json::array();
+        json api_arr = json::array();
         for (auto& m : api_messages) {
             json msg;
             msg["role"]            = m.role;
@@ -160,11 +214,63 @@ inline bool save_task(
             msg["is_summary"]      = m.is_summary;
             msg["condense_id"]     = m.condense_id;
             msg["condense_parent"] = m.condense_parent;
-            arr.push_back(std::move(msg));
+            api_arr.push_back(std::move(msg));
         }
-        std::ofstream ofs(task_dir / "api_messages.json", std::ios::binary);
+        api_payload = api_arr.dump();
+    } catch (...) {
+        return false;
+    }
+
+    auto meta_tmp = task_dir / "metadata.json.tmp";
+    auto chat_tmp = task_dir / "chat_messages.json.tmp";
+    auto api_tmp  = task_dir / "api_messages.json.tmp";
+    auto meta_dst = task_dir / "metadata.json";
+    auto chat_dst = task_dir / "chat_messages.json";
+    auto api_dst  = task_dir / "api_messages.json";
+
+    auto write_tmp = [](const std::filesystem::path& tmp, const std::string& payload) -> bool {
+        std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
         if (!ofs) return false;
-        ofs << arr.dump();
+        ofs.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+        if (!ofs.good()) {
+            ofs.close();
+            std::error_code rm_ec;
+            std::filesystem::remove(tmp, rm_ec);
+            return false;
+        }
+        ofs.flush();
+        ofs.close();
+        return true;
+    };
+
+    auto cleanup_tmps = [&]() {
+        std::error_code rm_ec;
+        std::filesystem::remove(meta_tmp, rm_ec);
+        std::filesystem::remove(chat_tmp, rm_ec);
+        std::filesystem::remove(api_tmp, rm_ec);
+    };
+
+    if (!write_tmp(meta_tmp, meta_payload) ||
+        !write_tmp(chat_tmp, chat_payload) ||
+        !write_tmp(api_tmp,  api_payload)) {
+        cleanup_tmps();
+        return false;
+    }
+
+    if (!MoveFileExW(meta_tmp.c_str(), meta_dst.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        cleanup_tmps();
+        return false;
+    }
+    if (!MoveFileExW(chat_tmp.c_str(), chat_dst.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        cleanup_tmps();
+        return false;
+    }
+    if (!MoveFileExW(api_tmp.c_str(), api_dst.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        cleanup_tmps();
+        return false;
     }
 
     return true;
@@ -179,18 +285,35 @@ inline bool load_task_metadata(const std::string& task_id, task_metadata_t& out)
 
     try {
         auto j = nlohmann::json::parse(ifs);
-        out.id             = j.value("id", task_id);
-        out.title          = j.value("title", "");
-        out.mode_slug      = j.value("mode_slug", "agent");
-        out.provider_kind  = j.value("provider_kind", "");
-        out.model_name     = j.value("model_name", "");
-        out.created_at     = j.value("created_at", (int64_t)0);
-        out.updated_at     = j.value("updated_at", (int64_t)0);
-        out.message_count  = j.value("message_count", 0);
-        out.total_input_tokens  = j.value("total_input_tokens", (int64_t)0);
-        out.total_output_tokens = j.value("total_output_tokens", (int64_t)0);
-        out.total_cost_usd = j.value("total_cost_usd", 0.0);
-        out.status         = j.value("status", "active");
+        if (!j.is_object()) return false;
+        auto js = [&](const char* key, const std::string& fallback) -> std::string {
+            if (j.contains(key) && j[key].is_string()) return j[key].get<std::string>();
+            return fallback;
+        };
+        auto ji = [&](const char* key, int fallback) -> int {
+            if (j.contains(key) && j[key].is_number_integer()) return j[key].get<int>();
+            return fallback;
+        };
+        auto ji64 = [&](const char* key, int64_t fallback) -> int64_t {
+            if (j.contains(key) && j[key].is_number_integer()) return j[key].get<int64_t>();
+            return fallback;
+        };
+        auto jd = [&](const char* key, double fallback) -> double {
+            if (j.contains(key) && j[key].is_number()) return j[key].get<double>();
+            return fallback;
+        };
+        out.id             = js("id", task_id);
+        out.title          = js("title", "");
+        out.mode_slug      = js("mode_slug", "agent");
+        out.provider_kind  = js("provider_kind", "");
+        out.model_name     = js("model_name", "");
+        out.created_at     = ji64("created_at", 0);
+        out.updated_at     = ji64("updated_at", 0);
+        out.message_count  = ji("message_count", 0);
+        out.total_input_tokens  = ji64("total_input_tokens", 0);
+        out.total_output_tokens = ji64("total_output_tokens", 0);
+        out.total_cost_usd = jd("total_cost_usd", 0.0);
+        out.status         = js("status", "active");
         return true;
     } catch (...) {
         return false;
@@ -211,18 +334,48 @@ inline bool load_chat_messages(const std::string& task_id, std::vector<chat_mess
         out.clear();
         out.reserve(arr.size());
         for (auto& j : arr) {
+            if (!j.is_object()) continue;
             chat_message_t m;
-            m.text          = j.value("text", "");
-            m.thinking_text = j.value("thinking_text", "");
-            m.is_user       = j.value("is_user", false);
-            m.has_thinking  = j.value("has_thinking", false);
-            m.timestamp     = j.value("timestamp", (int64_t)0);
-            m.input_tokens  = j.value("input_tokens", 0);
-            m.output_tokens = j.value("output_tokens", 0);
-            m.cache_read    = j.value("cache_read", 0);
-            m.cache_write   = j.value("cache_write", 0);
-            m.is_summary    = j.value("is_summary", false);
-            m.condense_id   = j.value("condense_id", "");
+            auto js = [&](const char* key, const std::string& fallback) -> std::string {
+                if (j.contains(key) && j[key].is_string()) return j[key].get<std::string>();
+                return fallback;
+            };
+            auto ji = [&](const char* key, int fallback) -> int {
+                if (j.contains(key) && j[key].is_number_integer()) return j[key].get<int>();
+                return fallback;
+            };
+            auto ji64 = [&](const char* key, int64_t fallback) -> int64_t {
+                if (j.contains(key) && j[key].is_number_integer()) return j[key].get<int64_t>();
+                return fallback;
+            };
+            auto jb = [&](const char* key, bool fallback) -> bool {
+                if (j.contains(key) && j[key].is_boolean()) return j[key].get<bool>();
+                return fallback;
+            };
+            auto jd = [&](const char* key, double fallback) -> double {
+                if (j.contains(key) && j[key].is_number()) return j[key].get<double>();
+                return fallback;
+            };
+            m.text                 = js("text", "");
+            m.thinking_text        = js("thinking_text", "");
+            m.is_user              = jb("is_user", false);
+            m.has_thinking         = jb("has_thinking", false);
+            m.streaming            = jb("streaming", false);
+            m.timestamp            = ji64("timestamp", 0);
+            m.input_tokens         = ji("input_tokens", 0);
+            m.output_tokens        = ji("output_tokens", 0);
+            m.cache_read           = ji("cache_read", 0);
+            m.cache_write          = ji("cache_write", 0);
+            m.is_summary           = jb("is_summary", false);
+            m.condense_id          = js("condense_id", "");
+            m.condense_parent      = js("condense_parent", "");
+            m.is_truncation_marker = jb("is_truncation_marker", false);
+            m.truncation_id        = js("truncation_id", "");
+            m.truncation_parent    = js("truncation_parent", "");
+            m.cost                 = jd("cost", 0.0);
+            m.tool_name            = js("tool_name", "");
+            m.is_tool_result       = jb("is_tool_result", false);
+            m.model_id             = js("model_id", "");
             out.push_back(std::move(m));
         }
         return true;
@@ -245,13 +398,27 @@ inline bool load_api_messages(const std::string& task_id, std::vector<api_messag
         out.clear();
         out.reserve(arr.size());
         for (auto& j : arr) {
+            if (!j.is_object()) continue;
             api_message_t m;
-            m.role            = j.value("role", "");
-            m.content         = j.value("content", nlohmann::json());
-            m.timestamp       = j.value("timestamp", (int64_t)0);
-            m.is_summary      = j.value("is_summary", false);
-            m.condense_id     = j.value("condense_id", "");
-            m.condense_parent = j.value("condense_parent", "");
+            auto js = [&](const char* key, const std::string& fallback) -> std::string {
+                if (j.contains(key) && j[key].is_string()) return j[key].get<std::string>();
+                return fallback;
+            };
+            auto ji64 = [&](const char* key, int64_t fallback) -> int64_t {
+                if (j.contains(key) && j[key].is_number_integer()) return j[key].get<int64_t>();
+                return fallback;
+            };
+            auto jb = [&](const char* key, bool fallback) -> bool {
+                if (j.contains(key) && j[key].is_boolean()) return j[key].get<bool>();
+                return fallback;
+            };
+            m.role            = js("role", "");
+            if (j.contains("content"))
+                m.content     = j["content"];
+            m.timestamp       = ji64("timestamp", 0);
+            m.is_summary      = jb("is_summary", false);
+            m.condense_id     = js("condense_id", "");
+            m.condense_parent = js("condense_parent", "");
             out.push_back(std::move(m));
         }
         return true;
@@ -289,20 +456,30 @@ inline std::vector<task_metadata_t> list_tasks()
 inline bool delete_task(const std::string& task_id)
 {
     if (task_id.empty()) return false;
+    if (task_id.find("..") != std::string::npos) return false;
+    if (task_id.find('/')  != std::string::npos) return false;
+    if (task_id.find('\\') != std::string::npos) return false;
+    if (task_id.find(':')  != std::string::npos) return false;
+
+    std::lock_guard<std::mutex> lock(task_io_mutex());
 
     auto task_dir = get_tasks_dir() / task_id;
     std::error_code ec;
     if (!std::filesystem::exists(task_dir, ec))
         return false;
 
-    return std::filesystem::remove_all(task_dir, ec) > 0;
+    const auto removed = std::filesystem::remove_all(task_dir, ec);
+    if (ec) return false;
+    return removed > 0;
 }
 
 
 inline std::string extract_title_from_first_message(const std::string& text, int max_len = 60)
 {
     if (text.empty()) return "New Chat";
-    std::string title = text.substr(0, static_cast<size_t>(max_len));
+    if (max_len <= 0) return "New Chat";
+    const size_t cap = static_cast<size_t>(max_len);
+    std::string title = text.substr(0, cap);
 
     auto nl = title.find('\n');
     if (nl != std::string::npos) title = title.substr(0, nl);
@@ -310,7 +487,7 @@ inline std::string extract_title_from_first_message(const std::string& text, int
     while (!title.empty() && (title.back() == ' ' || title.back() == '\n' || title.back() == '\r'))
         title.pop_back();
 
-    if (title.size() >= static_cast<size_t>(max_len) - 3)
+    if (cap > 3 && title.size() >= cap - 3)
         title += "...";
 
     return title.empty() ? "New Chat" : title;

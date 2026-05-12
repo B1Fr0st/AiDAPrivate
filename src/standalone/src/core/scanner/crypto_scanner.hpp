@@ -535,7 +535,7 @@ inline void scan_process()
 			signatures.push_back(sig);
 		}
 
-		auto regions = driver_bridge::enumerate_memory_regions();
+		auto regions = driver_bridge::enumerate_memory_regions(4096);
 		auto modules = driver_bridge::enumerate_modules();
 
 		auto find_module = [&](uint64_t addr) -> std::pair<std::string, uint64_t> {
@@ -549,14 +549,16 @@ inline void scan_process()
 		std::vector<driver_bridge::memory_region_t> scan_regions;
 		for (auto& r : regions) {
 			if (r.state != 0x1000) continue;
+			if (r.protect & 0x100) continue;
 			uint32_t prot = r.protect & 0xFF;
-			if (prot == 0x01) continue;
+			if (prot == 0x01 || prot == 0x00) continue;
 			if (r.size > 0x10000000) continue;
 			scan_regions.push_back(r);
 		}
 
 		uint64_t total_bytes = 0;
 		for (auto& r : scan_regions) total_bytes += r.size;
+		if (total_bytes == 0) total_bytes = 1;
 		uint64_t scanned = 0;
 
 		for (auto& region : scan_regions) {
@@ -620,6 +622,7 @@ inline void scan_file(const DisasmFile& file)
 
 		size_t total_bytes = 0;
 		for (auto& sec : file.sections) total_bytes += sec.bytes.size();
+		if (total_bytes == 0) total_bytes = 1;
 		size_t scanned = 0;
 
 		for (auto& sec : file.sections) {
@@ -803,7 +806,7 @@ inline void scan_entropy()
 	g_state.progress.store(0.f);
 
 	work_queue::post([]() {
-		auto regions = driver_bridge::enumerate_memory_regions();
+		auto regions = driver_bridge::enumerate_memory_regions(4096);
 		auto modules = driver_bridge::enumerate_modules();
 
 		auto find_module = [&](uint64_t addr) -> std::string {
@@ -817,14 +820,16 @@ inline void scan_entropy()
 		std::vector<driver_bridge::memory_region_t> scan_regions;
 		for (auto& r : regions) {
 			if (r.state != 0x1000) continue;
+			if (r.protect & 0x100) continue;
 			uint32_t prot = r.protect & 0xFF;
-			if (prot == 0x01) continue;
+			if (prot == 0x01 || prot == 0x00) continue;
 			if (r.size > 0x10000000) continue;
 			scan_regions.push_back(r);
 		}
 
 		uint64_t total_bytes = 0;
 		for (auto& r : scan_regions) total_bytes += r.size;
+		if (total_bytes == 0) total_bytes = 1;
 		uint64_t scanned = 0;
 
 		std::vector<entropy_region_t> high_entropy;

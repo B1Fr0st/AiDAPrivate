@@ -58,6 +58,9 @@ struct launch_result {
 inline launch_result launch_with_keylog(const std::string& exe_path,
                                          const std::string& args = {},
                                          const std::string& keylog_path = {}) {
+    static std::mutex s_launch_mutex;
+    std::lock_guard<std::mutex> launch_lock(s_launch_mutex);
+
     launch_result result;
 
 
@@ -98,7 +101,7 @@ inline launch_result launch_with_keylog(const std::string& exe_path,
         &si, &pi);
 
 
-    if (had_old > 0)
+    if (had_old > 0 && had_old < sizeof(old_keylog))
         SetEnvironmentVariableA("SSLKEYLOGFILE", old_keylog);
     else
         SetEnvironmentVariableA("SSLKEYLOGFILE", nullptr);
@@ -175,19 +178,26 @@ inline void start_watching(const std::string& keylog_path) {
             std::ifstream file(state.keylog_path, std::ios::binary);
             if (file.is_open()) {
                 file.seekg(0, std::ios::end);
-                auto file_size = file.tellg();
+                std::streampos sp = file.tellg();
+                if (sp >= 0) {
+                    size_t file_size = static_cast<size_t>(sp);
 
-                if (static_cast<size_t>(file_size) > state.file_pos) {
-                    file.seekg(static_cast<std::streamoff>(state.file_pos));
-                    size_t to_read = static_cast<size_t>(file_size) - state.file_pos;
-                    std::string content(to_read, '\0');
-                    file.read(content.data(), static_cast<std::streamsize>(to_read));
-                    auto actually_read = file.gcount();
-                    content.resize(static_cast<size_t>(actually_read));
-                    state.file_pos += static_cast<size_t>(actually_read);
-
-                    if (!content.empty()) {
-                        process_new_lines(state, content);
+                    if (file_size < state.file_pos) {
+                        state.file_pos = 0;
+                    }
+                    if (file_size > state.file_pos) {
+                        file.seekg(static_cast<std::streamoff>(state.file_pos));
+                        size_t to_read = file_size - state.file_pos;
+                        constexpr size_t kMaxChunk = 4 * 1024 * 1024;
+                        if (to_read > kMaxChunk) to_read = kMaxChunk;
+                        std::string content(to_read, '\0');
+                        file.read(content.data(), static_cast<std::streamsize>(to_read));
+                        auto actually_read = file.gcount();
+                        if (actually_read > 0) {
+                            content.resize(static_cast<size_t>(actually_read));
+                            state.file_pos += static_cast<size_t>(actually_read);
+                            process_new_lines(state, content);
+                        }
                     }
                 }
                 file.close();

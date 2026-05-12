@@ -19,8 +19,11 @@
 #include "mitm_proxy.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <map>
@@ -1992,8 +1995,19 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             std::vector<uint8_t> data;
             if (args.contains("input_hex") && args["input_hex"].is_string()) {
                 std::string hex = args["input_hex"].get<std::string>();
+                auto nib = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+                    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+                    return -1;
+                };
                 for (size_t i = 0; i + 1 < hex.size(); i += 2) {
-                    data.push_back(static_cast<uint8_t>(std::stoi(hex.substr(i, 2), nullptr, 16)));
+                    int hi = nib(hex[i]);
+                    int lo = nib(hex[i + 1]);
+                    if (hi < 0 || lo < 0) {
+                        return tool_result_t::error("Invalid hex character in 'input_hex'");
+                    }
+                    data.push_back(static_cast<uint8_t>((hi << 4) | lo));
                 }
             } else if (args.contains("input") && args["input"].is_string()) {
                 std::string input = args["input"].get<std::string>();
@@ -2314,7 +2328,11 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 if (params.contains("address")) {
                     auto& av = params["address"];
                     if (av.is_string()) {
-                        addr = std::stoull(av.get<std::string>(), nullptr, 0);
+                        std::string s = av.get<std::string>();
+                        char* end = nullptr;
+                        errno = 0;
+                        unsigned long long v = strtoull(s.c_str(), &end, 0);
+                        if (errno == 0 && end != s.c_str()) addr = static_cast<uint64_t>(v);
                     } else if (av.is_number()) {
                         addr = av.get<uint64_t>();
                     }
@@ -2978,7 +2996,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
 
                     std::atomic<int> next_index{0};
                     int total = static_cast<int>(combos.size());
-                    int threads = std::min(cfg.thread_count, 32);
+                    int threads = std::min(std::max(cfg.thread_count, 1), 32);
 
                     auto worker = [&]() {
                         while (state.fuzz_running.load()) {
@@ -3309,20 +3327,20 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             auto& state = network_view::g_state;
 
             if (op == "create") {
-                network_view::repeater_entry_t entry;
-                entry.host = args.value("host", std::string("localhost"));
+                auto entry = std::make_shared<network_view::repeater_entry_t>();
+                entry->host = args.value("host", std::string("localhost"));
                 if (args.contains("port") && args["port"].is_number())
-                    entry.port = static_cast<uint16_t>(args["port"].get<int>());
+                    entry->port = static_cast<uint16_t>(args["port"].get<int>());
                 if (args.contains("use_tls") && args["use_tls"].is_boolean())
-                    entry.use_tls = args["use_tls"].get<bool>();
+                    entry->use_tls = args["use_tls"].get<bool>();
                 if (args.contains("raw_request") && args["raw_request"].is_string())
-                    entry.raw_request = args["raw_request"].get<std::string>();
-                state.repeater_entries.push_back(std::move(entry));
+                    entry->raw_request = args["raw_request"].get<std::string>();
+                state.repeater_entries.push_back(entry);
                 int idx = static_cast<int>(state.repeater_entries.size()) - 1;
                 json r;
                 r["index"] = idx;
-                r["host"] = state.repeater_entries[static_cast<size_t>(idx)].host;
-                r["port"] = state.repeater_entries[static_cast<size_t>(idx)].port;
+                r["host"] = entry->host;
+                r["port"] = entry->port;
                 return tool_result_t::ok(OBFSTR("Repeater entry created at index ") + std::to_string(idx), r);
             }
 
@@ -3332,38 +3350,41 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 int idx = args["index"].get<int>();
                 if (idx < 0 || idx >= static_cast<int>(state.repeater_entries.size()))
                     return tool_result_t::error(OBFSTR("Invalid repeater entry index"));
-                auto& entry = state.repeater_entries[static_cast<size_t>(idx)];
-                if (entry.in_progress)
+                std::shared_ptr<network_view::repeater_entry_t> entry = state.repeater_entries[static_cast<size_t>(idx)];
+                if (!entry)
+                    return tool_result_t::error(OBFSTR("Invalid repeater entry"));
+                if (entry->in_progress)
                     return tool_result_t::error(OBFSTR("Request already in progress for this entry"));
                 if (args.contains("raw_request") && args["raw_request"].is_string())
-                    entry.raw_request = args["raw_request"].get<std::string>();
+                    entry->raw_request = args["raw_request"].get<std::string>();
                 if (args.contains("host") && args["host"].is_string())
-                    entry.host = args["host"].get<std::string>();
+                    entry->host = args["host"].get<std::string>();
                 if (args.contains("port") && args["port"].is_number())
-                    entry.port = static_cast<uint16_t>(args["port"].get<int>());
+                    entry->port = static_cast<uint16_t>(args["port"].get<int>());
                 if (args.contains("use_tls") && args["use_tls"].is_boolean())
-                    entry.use_tls = args["use_tls"].get<bool>();
-                entry.in_progress = true;
-                entry.raw_response.clear();
-                entry.status_code = 0;
-                entry.latency_ms = 0;
-                std::string host = entry.host;
-                uint16_t port = entry.port;
-                bool tls = entry.use_tls;
-                std::vector<uint8_t> raw(entry.raw_request.begin(), entry.raw_request.end());
-                std::thread([&entry, host, port, tls, raw]() {
+                    entry->use_tls = args["use_tls"].get<bool>();
+                entry->in_progress = true;
+                entry->raw_response.clear();
+                entry->status_code = 0;
+                entry->latency_ms = 0;
+                std::string host = entry->host;
+                uint16_t port = entry->port;
+                bool tls = entry->use_tls;
+                std::vector<uint8_t> raw(entry->raw_request.begin(), entry->raw_request.end());
+                std::thread([entry, host, port, tls, raw]() {
                     auto t0 = GetTickCount64();
                     auto res = mitm_proxy::repeat_request(host, port, tls, raw);
-                    entry.latency_ms = GetTickCount64() - t0;
+                    uint64_t latency = GetTickCount64() - t0;
+                    entry->latency_ms = latency;
                     if (res.success) {
-                        entry.status_code = res.exchange.response.status_code;
-                        entry.raw_response = std::string(res.exchange.raw_response.begin(),
-                                                        res.exchange.raw_response.end());
+                        entry->status_code = res.exchange.response.status_code;
+                        entry->raw_response = std::string(res.exchange.raw_response.begin(),
+                                                          res.exchange.raw_response.end());
                     } else {
-                        entry.status_code = 0;
-                        entry.raw_response = res.error;
+                        entry->status_code = 0;
+                        entry->raw_response = res.error;
                     }
-                    entry.in_progress = false;
+                    entry->in_progress = false;
                 }).detach();
                 json r;
                 r["index"] = idx;
@@ -3375,7 +3396,9 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 int max_count = args.value("max_count", static_cast<int>(state.repeater_entries.size()));
                 json arr = json::array();
                 for (int i = 0; i < static_cast<int>(state.repeater_entries.size()) && i < max_count; i++) {
-                    const auto& e = state.repeater_entries[static_cast<size_t>(i)];
+                    const auto& e_ptr = state.repeater_entries[static_cast<size_t>(i)];
+                    if (!e_ptr) continue;
+                    const auto& e = *e_ptr;
                     json ej;
                     ej["index"] = i;
                     ej["host"] = e.host;
@@ -3398,7 +3421,10 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 int idx = args["index"].get<int>();
                 if (idx < 0 || idx >= static_cast<int>(state.repeater_entries.size()))
                     return tool_result_t::error(OBFSTR("Invalid repeater entry index"));
-                const auto& e = state.repeater_entries[static_cast<size_t>(idx)];
+                const auto& e_ptr = state.repeater_entries[static_cast<size_t>(idx)];
+                if (!e_ptr)
+                    return tool_result_t::error(OBFSTR("Invalid repeater entry"));
+                const auto& e = *e_ptr;
                 json r;
                 r["index"] = idx;
                 r["host"] = e.host;
@@ -3418,7 +3444,8 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 int idx = args["index"].get<int>();
                 if (idx < 0 || idx >= static_cast<int>(state.repeater_entries.size()))
                     return tool_result_t::error(OBFSTR("Invalid repeater entry index"));
-                if (state.repeater_entries[static_cast<size_t>(idx)].in_progress)
+                const auto& del_ptr = state.repeater_entries[static_cast<size_t>(idx)];
+                if (del_ptr && del_ptr->in_progress)
                     return tool_result_t::error(OBFSTR("Cannot delete entry while request is in progress"));
                 state.repeater_entries.erase(state.repeater_entries.begin() + idx);
                 return tool_result_t::ok(OBFSTR("Repeater entry ") + std::to_string(idx) + OBFSTR(" deleted"));

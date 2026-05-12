@@ -362,10 +362,7 @@ namespace commands {
 		bool resolver_clear(const std::vector<std::string>& args, std::string& out_text)
 		{
 			(void)args;
-			g_chat_messages.clear();
-			g_chat_buf[0] = '\0';
-			g_chat_scroll_to_bottom = true;
-			conversations::current_id.clear();
+			(void)start_new_conversation();
 			out_text = "[clear] chat history cleared";
 			return true;
 		}

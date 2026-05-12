@@ -348,6 +348,7 @@ static std::vector<uint8_t> gzip_compress(const std::vector<uint8_t>& input, int
 
 static std::vector<uint8_t> brotli_decompress_impl(const std::vector<uint8_t>& input) {
     size_t decoded_size = input.size() * 8;
+    if (decoded_size < 4096) decoded_size = 4096;
     std::vector<uint8_t> out(decoded_size);
 
     BrotliDecoderResult result = BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT;
@@ -358,13 +359,30 @@ static std::vector<uint8_t> brotli_decompress_impl(const std::vector<uint8_t>& i
     if (!state) return {};
 
     std::vector<uint8_t> final_out;
+    const size_t kMaxIterations = 1u << 20;
+    const size_t kMaxOutputBytes = 1u << 30;
+    size_t iterations = 0;
     while (result == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT) {
+        if (++iterations > kMaxIterations) {
+            BrotliDecoderDestroyInstance(state);
+            return {};
+        }
+        if (final_out.size() > kMaxOutputBytes) {
+            BrotliDecoderDestroyInstance(state);
+            return {};
+        }
         size_t avail_out = out.size();
         uint8_t* next_out = out.data();
+        size_t prev_avail_in = avail_in;
         result = BrotliDecoderDecompressStream(state, &avail_in, &next_in,
                                                 &avail_out, &next_out, nullptr);
         size_t used = out.size() - avail_out;
-        final_out.insert(final_out.end(), out.data(), out.data() + used);
+        if (used > 0) {
+            final_out.insert(final_out.end(), out.data(), out.data() + used);
+        } else if (avail_in == prev_avail_in && result == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT) {
+            BrotliDecoderDestroyInstance(state);
+            return {};
+        }
     }
 
     BrotliDecoderDestroyInstance(state);

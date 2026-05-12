@@ -167,6 +167,7 @@ inline std::vector<block_range_t> recover_cfg_blocks(uint64_t entry_addr, uint32
 		auto& last = block.insns.back();
 		bool is_jmp = (last.mnemonic == "jmp");
 		bool is_jcc = (last.mnemonic.size() >= 2 && last.mnemonic[0] == 'j' && last.mnemonic != "jmp");
+		bool is_ret = (last.mnemonic.find("ret") != std::string::npos);
 
 		if (is_jmp) {
 			uint64_t target = 0;
@@ -187,7 +188,7 @@ inline std::vector<block_range_t> recover_cfg_blocks(uint64_t entry_addr, uint32
 			}
 			auto it3 = addr_to_idx.find(fallthrough);
 			if (it3 != addr_to_idx.end()) block.successor_indices.push_back(it3->second);
-		} else {
+		} else if (!is_ret) {
 			uint64_t fallthrough = last.address + last.length;
 			auto it2 = addr_to_idx.find(fallthrough);
 			if (it2 != addr_to_idx.end()) block.successor_indices.push_back(it2->second);
@@ -199,6 +200,7 @@ inline std::vector<block_range_t> recover_cfg_blocks(uint64_t entry_addr, uint32
 
 inline bool detect_state_machine(triton::Context& ctx, const std::vector<block_range_t>& blocks,
 								 state_variable_t& out_state_var) {
+	(void)ctx;
 	std::unordered_map<std::string, uint32_t> cmp_reg_frequency;
 
 	for (auto& block : blocks) {
@@ -362,14 +364,38 @@ inline std::vector<clean_instruction_t> strip_junk_from_block(
 		if (!needed) {
 			ci.was_junk = true;
 		} else {
+			std::unordered_set<triton::arch::register_e> read_parents;
 			for (auto& [reg, _] : insn.getReadRegisters()) {
-				live.insert(ctx.getParentRegister(reg).getId());
+				read_parents.insert(ctx.getParentRegister(reg).getId());
 			}
+			for (auto& [reg, _] : insn.getWrittenRegisters()) {
+				auto parent_id = ctx.getParentRegister(reg).getId();
+				if (!read_parents.count(parent_id)) {
+					auto it_live = live.find(parent_id);
+					if (it_live != live.end()) live.erase(it_live);
+				}
+			}
+			for (auto& parent_id : read_parents) {
+				live.insert(parent_id);
+			}
+			std::unordered_set<uint64_t> read_mem_addrs;
 			for (auto& [mem, _] : insn.getLoadAccess()) {
 				uint64_t addr = static_cast<uint64_t>(mem.getAddress());
 				for (uint64_t i = 0; i < mem.getSize(); ++i) {
-					live_mem.insert(addr + i);
+					read_mem_addrs.insert(addr + i);
 				}
+			}
+			for (auto& [mem, _] : insn.getStoreAccess()) {
+				uint64_t addr = static_cast<uint64_t>(mem.getAddress());
+				for (uint64_t i = 0; i < mem.getSize(); ++i) {
+					if (!read_mem_addrs.count(addr + i)) {
+						auto it_lm = live_mem.find(addr + i);
+						if (it_lm != live_mem.end()) live_mem.erase(it_lm);
+					}
+				}
+			}
+			for (auto addr : read_mem_addrs) {
+				live_mem.insert(addr);
 			}
 		}
 	}
@@ -480,6 +506,20 @@ inline deobfuscated_result_t deobfuscate_function(uint64_t entry_addr, uint32_t 
 		result.opaque_predicates_found = sym_result.opaque_count;
 		result.constants_resolved = sym_result.constants_count;
 	}
+
+	std::unordered_set<uint64_t> opaque_addr_set;
+	for (auto& op : result.opaques) opaque_addr_set.insert(op.address);
+	std::unordered_set<uint64_t> const_addr_set;
+	for (auto& cf : result.constants) const_addr_set.insert(cf.address);
+
+	auto annotate_ci = [&](clean_instruction_t& ci) {
+		if (opaque_addr_set.count(ci.address)) ci.was_opaque = true;
+		if (const_addr_set.count(ci.address)) ci.was_constant_folded = true;
+	};
+	for (auto& blk : result.clean_blocks) {
+		for (auto& ci : blk.instructions) annotate_ci(ci);
+	}
+	for (auto& ci : result.clean_instructions) annotate_ci(ci);
 
 	for (size_t bi = 0; bi < result.clean_blocks.size(); ++bi) {
 		for (auto succ_idx : result.clean_blocks[bi].successors) {

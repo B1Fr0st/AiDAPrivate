@@ -461,10 +461,7 @@ namespace aida::ui::components {
 		bool clicked = ImGui::IsItemClicked();
 		if (clicked) *state = !*state;
 
-		float st = *state ? 1.f : 0.f;
-		auto& trans = detail::tstate(id);
 		float current = hov.tick(*state, aida::ui::clock::dt(), aida::motion::spring::snappy);
-		(void)trans; (void)st;
 
 		ImDrawList* dl = ImGui::GetWindowDrawList();
 		float center_y = pos.y + total_h * 0.5f;

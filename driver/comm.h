@@ -126,6 +126,7 @@ namespace ioctl_codes {
     __forceinline DWORD DBGA() { return make(51); }
     __forceinline DWORD HVDT() { return make(52); }
     __forceinline DWORD RELA() { return make(53); }
+    __forceinline DWORD EVTS() { return make(54); }
 }
 
 namespace voyager {
@@ -1001,6 +1002,43 @@ namespace voyager {
         };
         static_assert(sizeof(hv_detect_request) == 8, "hv_detect_request must match kernel struct");
 
+        static constexpr std::uint32_t DEBUG_EVENT_TYPE_INVALID         = 0;
+        static constexpr std::uint32_t DEBUG_EVENT_TYPE_IMAGE_LOADED    = 1;
+        static constexpr std::uint32_t DEBUG_EVENT_TYPE_PROCESS_CREATED = 2;
+        static constexpr std::uint32_t DEBUG_EVENT_TYPE_PROCESS_EXITED  = 3;
+
+        static constexpr std::uint32_t DEBUG_EVENT_FLAG_KERNEL_IMAGE = 0x00000001u;
+        static constexpr std::uint32_t DEBUG_EVENT_FLAG_SYSTEM_MODE  = 0x00000002u;
+
+        static constexpr std::uint32_t DEBUG_EVENT_PATH_CHARS = 260;
+
+        struct debug_event_t {
+            std::uint32_t event_type;
+            std::uint32_t process_id;
+            std::uint32_t thread_id;
+            std::uint32_t flags;
+            std::uint64_t timestamp;
+            std::uint64_t image_base;
+            std::uint64_t image_size;
+            wchar_t       image_path[DEBUG_EVENT_PATH_CHARS];
+        };
+        static_assert(sizeof(debug_event_t) == 560, "debug_event_t size must match kernel struct");
+
+        static constexpr std::uint32_t DRAIN_DEBUG_EVENTS_CAP = 64;
+
+        struct drain_debug_events_request {
+            std::uint32_t session_key;
+            std::uint32_t max_events;
+            std::uint32_t returned_count;
+            std::uint32_t dropped_since_last_drain;
+            std::uint64_t total_dropped;
+            std::uint64_t total_published;
+            debug_event_t events[DRAIN_DEBUG_EVENTS_CAP];
+        };
+        static_assert(sizeof(drain_debug_events_request) ==
+            (4u + 4u + 4u + 4u + 8u + 8u + DRAIN_DEBUG_EVENTS_CAP * sizeof(debug_event_t)),
+            "drain_debug_events_request size must match kernel struct");
+
 #pragma pack(push, 1)
         struct hv_detect_result {
             std::uint8_t sidt_lock_prefix;
@@ -1525,6 +1563,35 @@ namespace voyager {
         bool relay_server_token_v2(std::uint32_t token_hash, std::uint64_t server_nonce, std::uint64_t* out_driver_proof = nullptr) noexcept;
 
         bool run_hv_detect(detail::hv_detect_result& out) noexcept;
+
+        enum class debug_event_type_e : std::uint32_t {
+            invalid         = 0,
+            image_loaded    = 1,
+            process_created = 2,
+            process_exited  = 3,
+        };
+
+        struct debug_event_record {
+            debug_event_type_e type = debug_event_type_e::invalid;
+            std::uint32_t      process_id = 0;
+            std::uint32_t      thread_id = 0;
+            std::uint32_t      flags = 0;
+            std::uint64_t      timestamp = 0;
+            std::uint64_t      image_base = 0;
+            std::uint64_t      image_size = 0;
+            std::wstring       image_path;
+        };
+
+        struct debug_event_drain_stats {
+            std::uint32_t returned_count = 0;
+            std::uint32_t dropped_since_last_drain = 0;
+            std::uint64_t total_dropped = 0;
+            std::uint64_t total_published = 0;
+        };
+
+        bool drain_debug_events(std::vector<debug_event_record>& out,
+                                std::size_t max_events = detail::DRAIN_DEBUG_EVENTS_CAP,
+                                debug_event_drain_stats* out_stats = nullptr) noexcept;
 
         [[nodiscard]] std::uint32_t get_process_id() const noexcept { return process_id_; }
         [[nodiscard]] std::uint64_t get_base_address() const noexcept { return base_address_; }

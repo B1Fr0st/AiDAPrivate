@@ -88,11 +88,18 @@ namespace aida::ui {
 		}
 
 		float at(int idx) const {
+			if (per_item_delay <= 0.f) {
+				float p = base.progress;
+				if (p < 0.f) p = 0.f;
+				if (p > 1.f) p = 1.f;
+				return base.curve ? base.curve(p) : p;
+			}
 			float local_t = base.progress - (float)idx * per_item_delay;
 			if (local_t < 0.f) return 0.f;
-			float frac = local_t / (1.f - (float)item_count * per_item_delay > 0.f
-			                         ? 1.f - (float)item_count * per_item_delay
-			                         : 1.f);
+			float total_stagger = (float)(item_count > 0 ? item_count - 1 : 0) * per_item_delay;
+			float denom = 1.f - total_stagger;
+			if (denom < 0.001f) denom = 1.f;
+			float frac = local_t / denom;
 			if (frac < 0.f) frac = 0.f;
 			if (frac > 1.f) frac = 1.f;
 			return base.curve ? base.curve(frac) : frac;

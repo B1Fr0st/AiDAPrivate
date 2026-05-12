@@ -17,7 +17,7 @@
 #include "obfuscation.hpp"
 
 #include <windows.h>
-#include <iphlpapi.h>
+#include <winioctl.h>
 #include <intrin.h>
 #include <psapi.h>
 #include <dbghelp.h>
@@ -51,7 +51,6 @@
 #include <thread>
 #include <vector>
 
-#pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "Psapi.lib")
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "dnsapi.lib")
@@ -1981,7 +1980,6 @@ namespace
     std::atomic<uint64_t> s_state_c{0};
     std::atomic<uint64_t> s_magic{S_MAGIC_INIT};
 
-    /* Legacy atomic kept for backward-compat with existing checks */
     std::atomic<bool> s_valid{false};
     std::atomic<bool> s_stop{false};
     std::thread       s_heartbeat_thread;
@@ -1990,20 +1988,15 @@ namespace
     std::string       s_plan;
     std::string       s_error;
 
-    /* Heartbeat freshness tracking */
     std::atomic<int64_t> s_last_heartbeat_time{0};
     std::atomic<uint32_t> s_heartbeat_counter{0};
 
-    /* Phase 5.2: 24-bit gate bitmap. Each bit = one anti-tamper gate has
-       fired at least once this session. Monotonic; server rejects shrinks. */
     std::atomic<uint32_t> s_gate_bitmap{0};
 
-    /* Cached HWID for inline re-derivation check */
     std::string s_cached_hwid;
 
     std::string s_cached_session_token;
 
-    /* Proof hash: FNV-1a of (session_token + hwid) */
     std::atomic<uint64_t> s_proof_hash{0};
 
     std::mutex s_rotation_mtx;
@@ -2267,8 +2260,10 @@ namespace
              {0x0a,0x28,0x35,0x35,0x3c,0x7a,0x37,0x33,0x29,0x37,0x3b,0x2e,0x39,0x32,0x00},
              {0x12,0x0d,0x13,0x1e,0x7a,0x3e,0x28,0x33,0x3c,0x2e,0x00},
              {0x12,0x3f,0x3b,0x28,0x2e,0x38,0x3f,0x3b,0x2e,0x7a,0x3f,0x22,0x2a,0x33,0x28,0x3f,0x3e,0x00},
+             {0x13,0x34,0x2e,0x3f,0x28,0x34,0x3b,0x36,0x7a,0x3f,0x28,0x28,0x35,0x28,0x00},
+             {0x17,0x35,0x3e,0x3f,0x36,0x7a,0x28,0x35,0x2f,0x2e,0x33,0x34,0x3d,0x00},
         };
-        if (id < 0 || id > 5) return "Error";
+        if (id < 0 || id > 7) return "Error";
         std::string result;
         const uint8_t* p = strs[id];
         while (*p) {
@@ -2549,73 +2544,244 @@ namespace
         return oss.str();
     }
 
-    void fnv_mix_u64(uint64_t& hash, uint64_t value)
+    std::string hwid_read_smbios_uuid()
     {
-        for (int i = 0; i < 8; ++i) {
-            hash ^= (value >> (i * 8)) & 0xFF;
-            hash *= 1099511628211ULL;
+        UINT table_size = GetSystemFirmwareTable('RSMB', 0, nullptr, 0);
+        if (table_size < 8) return "unavailable";
+        std::vector<unsigned char> buf(table_size);
+        UINT got = GetSystemFirmwareTable('RSMB', 0, buf.data(), table_size);
+        if (got == 0 || got > table_size) {
+            SecureZeroMemory(buf.data(), buf.size());
+            return "unavailable";
         }
+        const unsigned char* tbl = buf.data() + 8;
+        size_t tbl_len = buf.size() - 8;
+        size_t off = 0;
+        std::string result;
+        while (off + 4 < tbl_len) {
+            unsigned char type = tbl[off];
+            unsigned char len  = tbl[off + 1];
+            if (len < 4 || off + len > tbl_len) break;
+            if (type == 1 && len >= 24) {
+                const unsigned char* u = tbl + off + 8;
+                bool all_zero = true;
+                for (int i = 0; i < 16; ++i) { if (u[i] != 0) { all_zero = false; break; } }
+                if (!all_zero) {
+                    char hex[33] = {};
+                    for (int i = 0; i < 16; ++i)
+                        _snprintf_s(hex + i * 2, 3, _TRUNCATE, "%02x", u[i]);
+                    result.assign(hex);
+                }
+                break;
+            }
+            size_t after = off + len;
+            while (after + 1 < tbl_len && !(tbl[after] == 0 && tbl[after + 1] == 0)) ++after;
+            off = after + 2;
+        }
+        SecureZeroMemory(buf.data(), buf.size());
+        if (result.empty()) return "unavailable";
+        return result;
+    }
+
+    std::string hwid_read_baseboard_serial()
+    {
+        UINT table_size = GetSystemFirmwareTable('RSMB', 0, nullptr, 0);
+        if (table_size < 8) return "unavailable";
+        std::vector<unsigned char> buf(table_size);
+        UINT got = GetSystemFirmwareTable('RSMB', 0, buf.data(), table_size);
+        if (got == 0 || got > table_size) {
+            SecureZeroMemory(buf.data(), buf.size());
+            return "unavailable";
+        }
+        const unsigned char* tbl = buf.data() + 8;
+        size_t tbl_len = buf.size() - 8;
+        size_t off = 0;
+        std::string result;
+        while (off + 4 < tbl_len) {
+            unsigned char type = tbl[off];
+            unsigned char len  = tbl[off + 1];
+            if (len < 4 || off + len > tbl_len) break;
+            size_t after = off + len;
+            const unsigned char* strings_start = tbl + after;
+            while (after + 1 < tbl_len && !(tbl[after] == 0 && tbl[after + 1] == 0)) ++after;
+            if (type == 2 && len >= 8) {
+                unsigned char serial_index = tbl[off + 7];
+                if (serial_index > 0) {
+                    const char* p = reinterpret_cast<const char*>(strings_start);
+                    const char* end = reinterpret_cast<const char*>(tbl + after);
+                    for (unsigned char i = 1; i < serial_index && p < end; ++i) {
+                        while (p < end && *p) ++p;
+                        if (p < end) ++p;
+                    }
+                    if (p < end && *p) {
+                        const char* q = p;
+                        while (q < end && *q) ++q;
+                        result.assign(p, q);
+                        size_t start = result.find_first_not_of(" \t");
+                        size_t fin = result.find_last_not_of(" \t");
+                        if (start == std::string::npos) result.clear();
+                        else result = result.substr(start, fin - start + 1);
+                    }
+                }
+                break;
+            }
+            off = after + 2;
+        }
+        SecureZeroMemory(buf.data(), buf.size());
+        if (result.empty()) return "unavailable";
+        return result;
+    }
+
+    std::string hwid_read_disk_serial()
+    {
+        HANDLE h = CreateFileW(L"\\\\.\\PhysicalDrive0", 0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return "unavailable";
+        STORAGE_PROPERTY_QUERY q = {};
+        q.PropertyId = StorageDeviceProperty;
+        q.QueryType = PropertyStandardQuery;
+        std::vector<unsigned char> out(1024);
+        DWORD returned = 0;
+        BOOL ok = DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY,
+            &q, sizeof(q), out.data(), static_cast<DWORD>(out.size()),
+            &returned, nullptr);
+        CloseHandle(h);
+        if (!ok || returned < sizeof(STORAGE_DEVICE_DESCRIPTOR)) {
+            SecureZeroMemory(out.data(), out.size());
+            return "unavailable";
+        }
+        auto* desc = reinterpret_cast<STORAGE_DEVICE_DESCRIPTOR*>(out.data());
+        if (desc->SerialNumberOffset == 0 || desc->SerialNumberOffset >= returned) {
+            SecureZeroMemory(out.data(), out.size());
+            return "unavailable";
+        }
+        const char* serial = reinterpret_cast<const char*>(out.data() + desc->SerialNumberOffset);
+        size_t maxlen = static_cast<size_t>(returned) - desc->SerialNumberOffset;
+        size_t n = 0;
+        while (n < maxlen && serial[n] != '\0') ++n;
+        std::string result(serial, n);
+        SecureZeroMemory(out.data(), out.size());
+        size_t start = result.find_first_not_of(" \t");
+        size_t fin = result.find_last_not_of(" \t");
+        if (start == std::string::npos) return "unavailable";
+        result = result.substr(start, fin - start + 1);
+        if (result.empty()) return "unavailable";
+        return result;
+    }
+
+    std::string hwid_read_machine_guid()
+    {
+        HKEY h = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                L"SOFTWARE\\Microsoft\\Cryptography",
+                0, KEY_READ | KEY_WOW64_64KEY, &h) != ERROR_SUCCESS) {
+            return "unavailable";
+        }
+        wchar_t wbuf[128] = {};
+        DWORD sz = sizeof(wbuf);
+        DWORD type = 0;
+        std::string result;
+        if (RegQueryValueExW(h, L"MachineGuid", nullptr, &type,
+                reinterpret_cast<LPBYTE>(wbuf), &sz) == ERROR_SUCCESS &&
+            type == REG_SZ) {
+            char ascii[128] = {};
+            int conv = WideCharToMultiByte(CP_UTF8, 0, wbuf, -1,
+                ascii, sizeof(ascii), nullptr, nullptr);
+            if (conv > 0) result.assign(ascii);
+            SecureZeroMemory(ascii, sizeof(ascii));
+        }
+        SecureZeroMemory(wbuf, sizeof(wbuf));
+        RegCloseKey(h);
+        if (result.empty()) return "unavailable";
+        return result;
+    }
+
+    std::string hwid_read_cpu_brand()
+    {
+        int regs[4] = {};
+        __cpuid(regs, 0x80000000);
+        unsigned highest = static_cast<unsigned>(regs[0]);
+        if (highest < 0x80000004u) return "unavailable";
+        char brand[49] = {};
+        __cpuid(reinterpret_cast<int*>(brand + 0),  0x80000002);
+        __cpuid(reinterpret_cast<int*>(brand + 16), 0x80000003);
+        __cpuid(reinterpret_cast<int*>(brand + 32), 0x80000004);
+        brand[48] = '\0';
+        std::string result(brand);
+        SecureZeroMemory(brand, sizeof(brand));
+        size_t start = result.find_first_not_of(" \t");
+        size_t fin = result.find_last_not_of(" \t");
+        if (start == std::string::npos) return "unavailable";
+        result = result.substr(start, fin - start + 1);
+        if (result.empty()) return "unavailable";
+        return result;
     }
 
     std::string generate_hwid()
     {
-        uint64_t hash = 14695981039346656037ULL;
-        auto mix = [&](uint64_t value) {
-            fnv_mix_u64(hash, value);
-        };
+        std::string slot_smbios   = hwid_read_smbios_uuid();
+        std::string slot_baseboard = hwid_read_baseboard_serial();
+        std::string slot_disk     = hwid_read_disk_serial();
+        std::string slot_guid     = hwid_read_machine_guid();
+        std::string slot_cpu      = hwid_read_cpu_brand();
 
-        DWORD volume_serial = 0;
-        GetVolumeInformationW(L"C:\\", nullptr, 0, &volume_serial, nullptr, nullptr, nullptr, 0);
+        std::string canonical;
+        canonical.reserve(slot_smbios.size() + slot_baseboard.size() +
+                          slot_disk.size() + slot_guid.size() +
+                          slot_cpu.size() + 4);
+        canonical.append(slot_smbios);
+        canonical.append("|");
+        canonical.append(slot_baseboard);
+        canonical.append("|");
+        canonical.append(slot_disk);
+        canonical.append("|");
+        canonical.append(slot_guid);
+        canonical.append("|");
+        canonical.append(slot_cpu);
 
-        wchar_t computer_name[MAX_COMPUTERNAME_LENGTH + 1] = {};
-        DWORD name_size = MAX_COMPUTERNAME_LENGTH + 1;
-        GetComputerNameW(computer_name, &name_size);
-
-        int cpu_info[4] = {};
-        __cpuid(cpu_info, 0);
-        int cpu_info_ext[4] = {};
-        __cpuid(cpu_info_ext, 1);
-
-        mix(static_cast<uint64_t>(volume_serial));
-        mix((static_cast<uint64_t>(cpu_info[0]) << 32) | static_cast<unsigned>(cpu_info[1]));
-        mix((static_cast<uint64_t>(cpu_info[2]) << 32) | static_cast<unsigned>(cpu_info[3]));
-        mix((static_cast<uint64_t>(cpu_info_ext[0]) << 32) | static_cast<unsigned>(cpu_info_ext[3]));
-        for (DWORD i = 0; i < name_size; ++i)
-            mix(static_cast<uint64_t>(computer_name[i]));
-
-        ULONG len = 0;
-        GetAdaptersInfo(nullptr, &len);
-        if (len > 0) {
-            std::vector<unsigned char> buffer(len);
-            auto* adapter = reinterpret_cast<PIP_ADAPTER_INFO>(buffer.data());
-            if (GetAdaptersInfo(adapter, &len) == NO_ERROR && adapter) {
-                for (UINT i = 0; i < adapter->AddressLength; ++i)
-                    mix(static_cast<uint64_t>(adapter->Address[i]));
+        BCRYPT_ALG_HANDLE  hAlg  = nullptr;
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+        uint8_t digest[32] = {};
+        NTSTATUS st = BCryptOpenAlgorithmProvider(
+            &hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+        bool ok = false;
+        if (BCRYPT_SUCCESS(st) && hAlg) {
+            st = BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0);
+            if (BCRYPT_SUCCESS(st) && hHash) {
+                st = BCryptHashData(hHash,
+                    reinterpret_cast<PUCHAR>(const_cast<char*>(canonical.data())),
+                    static_cast<ULONG>(canonical.size()), 0);
+                if (BCRYPT_SUCCESS(st))
+                    st = BCryptFinishHash(hHash, digest, 32, 0);
+                ok = BCRYPT_SUCCESS(st);
             }
         }
+        if (hHash) BCryptDestroyHash(hHash);
+        if (hAlg)  BCryptCloseAlgorithmProvider(hAlg, 0);
 
-        char out[17];
-        snprintf(out, sizeof(out), "%016llX", static_cast<unsigned long long>(hash));
-        return out;
-    }
+        SecureZeroMemory(canonical.data(), canonical.size());
+        SecureZeroMemory(const_cast<char*>(slot_smbios.data()), slot_smbios.size());
+        SecureZeroMemory(const_cast<char*>(slot_baseboard.data()), slot_baseboard.size());
+        SecureZeroMemory(const_cast<char*>(slot_disk.data()), slot_disk.size());
+        SecureZeroMemory(const_cast<char*>(slot_guid.data()), slot_guid.size());
+        SecureZeroMemory(const_cast<char*>(slot_cpu.data()), slot_cpu.size());
 
-    std::string get_mac_address()
-    {
-        ULONG len = 0;
-        GetAdaptersInfo(nullptr, &len);
-        if (len == 0)
-            return {};
+        if (!ok) {
+            SecureZeroMemory(digest, sizeof(digest));
+            return "unavailable";
+        }
 
-        std::vector<unsigned char> buffer(len);
-        auto* info = reinterpret_cast<PIP_ADAPTER_INFO>(buffer.data());
-        if (GetAdaptersInfo(info, &len) != NO_ERROR || !info || info->AddressLength == 0)
-            return {};
-
-        char out[32];
-        snprintf(out, sizeof(out), "%02X:%02X:%02X:%02X:%02X:%02X",
-                 info->Address[0], info->Address[1], info->Address[2],
-                 info->Address[3], info->Address[4], info->Address[5]);
-        return out;
+        static const char kHexDigits[] = "0123456789abcdef";
+        char hex_out[65] = {};
+        for (int i = 0; i < 32; ++i) {
+            hex_out[i * 2 + 0] = kHexDigits[(digest[i] >> 4) & 0x0F];
+            hex_out[i * 2 + 1] = kHexDigits[digest[i] & 0x0F];
+        }
+        hex_out[64] = '\0';
+        SecureZeroMemory(digest, sizeof(digest));
+        std::string out_hwid(hex_out);
+        SecureZeroMemory(hex_out, sizeof(hex_out));
+        return out_hwid;
     }
 
     std::string get_public_ip()
@@ -2658,7 +2824,6 @@ namespace
         body["action"] = "ban_check";
         body["timestamp"] = static_cast<int64_t>(std::time(nullptr));
         body["plugin_version"] = "aida-standalone";
-        body["mac_address"] = get_mac_address();
 
         body["hwid"] = generate_hwid();
 
@@ -2953,7 +3118,6 @@ namespace
             body["timestamp"] = static_cast<int64_t>(std::time(nullptr));
             body["public_ip"] = "";
             lic_log("call_validation_public_ip_skipped");
-            body["mac_address"] = get_mac_address();
             if (action == "validate") {
                 body["client_nonce"] = nonce;
                 body["plugin_version"] = "aida-standalone";

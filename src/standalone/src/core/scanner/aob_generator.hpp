@@ -489,12 +489,13 @@ inline void validate_uniqueness_process(signature_t& sig)
 
 	work_queue::post([sig_copy = sig]() mutable {
 		int total_count = 0;
-		auto regions = driver_bridge::enumerate_memory_regions();
+		auto regions = driver_bridge::enumerate_memory_regions(4096);
 
 		for (auto& region : regions) {
 			if (region.state != 0x1000) continue;
+			if (region.protect & 0x100) continue;
 			uint32_t prot = region.protect & 0xFF;
-			if (prot == 0x01) continue;
+			if (prot == 0x01 || prot == 0x00) continue;
 			if (region.size > 0x10000000) continue;
 
 			std::vector<uint8_t> data;
@@ -670,14 +671,15 @@ inline void optimize_signature(signature_t& sig)
 	}
 	if (concrete.size() < 4) return;
 
-	auto regions = driver_bridge::enumerate_memory_regions();
+	auto regions = driver_bridge::enumerate_memory_regions(4096);
 
 	std::vector<uint8_t> all_data;
 	std::vector<std::pair<uint64_t, size_t>> region_offsets;
 	for (auto& region : regions) {
 		if (region.state != 0x1000) continue;
+		if (region.protect & 0x100) continue;
 		uint32_t prot = region.protect & 0xFF;
-		if (prot == 0x01) continue;
+		if (prot == 0x01 || prot == 0x00) continue;
 		if (region.size > 0x10000000) continue;
 
 		std::vector<uint8_t> data;
@@ -705,6 +707,7 @@ inline void optimize_signature(signature_t& sig)
 		size_t hi = sig.bytes.size() - start;
 		if (hi < lo) continue;
 
+		bool found_unique = false;
 		size_t min_len = hi;
 		while (lo <= hi) {
 			size_t mid = (lo + hi) / 2;
@@ -713,13 +716,15 @@ inline void optimize_signature(signature_t& sig)
 			int cnt = count_matches(sub);
 			if (cnt == 1) {
 				min_len = mid;
+				found_unique = true;
+				if (mid == 0) break;
 				hi = mid - 1;
 			} else {
 				lo = mid + 1;
 			}
 		}
 
-		if (min_len < best_len) {
+		if (found_unique && min_len < best_len) {
 			best_len = min_len;
 			best_start = start;
 		}
@@ -902,14 +907,15 @@ inline std::vector<comparison_result_t> compare_signatures_against_process(
 #ifdef AIDA_STANDALONE
 	std::vector<comparison_result_t> results;
 
-	auto regions = driver_bridge::enumerate_memory_regions();
+	auto regions = driver_bridge::enumerate_memory_regions(4096);
 	std::vector<uint8_t> all_data;
 	std::vector<std::pair<uint64_t, size_t>> region_map;
 
 	for (auto& region : regions) {
 		if (region.state != 0x1000) continue;
+		if (region.protect & 0x100) continue;
 		uint32_t prot = region.protect & 0xFF;
-		if (prot == 0x01) continue;
+		if (prot == 0x01 || prot == 0x00) continue;
 		if (region.size > 0x10000000) continue;
 
 		std::vector<uint8_t> data;
@@ -928,7 +934,7 @@ inline std::vector<comparison_result_t> compare_signatures_against_process(
 		cr.new_address = 0;
 		cr.still_found = false;
 
-		if (all_data.empty() || sig.bytes.empty()) {
+		if (all_data.empty() || sig.bytes.empty() || sig.bytes.size() > all_data.size()) {
 			results.push_back(cr);
 			continue;
 		}

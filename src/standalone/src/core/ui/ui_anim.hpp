@@ -686,10 +686,16 @@ inline void render_hub_tab_bar(ImDrawList* dl, ImVec2 origin, float x, float y, 
 	float tab_h = 28.f;
 	render_gradient_header(dl, origin.x + x, origin.y + y, w, tab_h, ar, ag, ab, alpha);
 
+	if (count <= 0) return;
+	constexpr int max_tabs = 32;
+	int clamped_count = count < max_tabs ? count : max_tabs;
+	if (active_idx < 0) active_idx = 0;
+	if (active_idx >= clamped_count) active_idx = clamped_count - 1;
+
 	float total_w = 0.f;
-	float tab_widths[32] = {};
-	float tab_offsets[32] = {};
-	for (int i = 0; i < count && i < 32; i++) {
+	float tab_widths[max_tabs] = {};
+	float tab_offsets[max_tabs] = {};
+	for (int i = 0; i < clamped_count; i++) {
 		tab_widths[i] = ImGui::CalcTextSize(names[i]).x + 20.f;
 		tab_offsets[i] = total_w;
 		total_w += tab_widths[i] + 2.f;
@@ -728,7 +734,7 @@ inline void render_hub_tab_bar(ImDrawList* dl, ImVec2 origin, float x, float y, 
 
 	ImGui::PushClipRect(ImVec2(clip_x0, clip_y0), ImVec2(clip_x1, clip_y1), true);
 
-	for (int i = 0; i < count; i++) {
+	for (int i = 0; i < clamped_count; i++) {
 		float bx0 = clip_x0 + tab_offsets[i] - scroll_x;
 		float bx1 = bx0 + tab_widths[i];
 		float by0 = clip_y0;

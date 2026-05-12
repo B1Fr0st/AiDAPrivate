@@ -87,6 +87,7 @@ inline std::string lower_copy(const std::string& s) {
 
 inline void start_taint_trace(local_state_t& st) {
 	uint64_t addr = std::strtoull(st.addr_buf, nullptr, 16);
+	if (addr == 0) return;
 	uint64_t end = st.end_addr_buf[0] ? std::strtoull(st.end_addr_buf, nullptr, 16) : 0;
 	auto regs = parse_list(st.taint_regs_buf);
 
@@ -98,9 +99,19 @@ inline void start_taint_trace(local_state_t& st) {
 		}
 	}
 
+	if (symbolic_engine::g_state.processing.load()) return;
 	symbolic_engine::g_state.processing.store(true);
 	work_queue::post([addr, end, max_i = static_cast<uint32_t>(st.max_insns), regs, mem_ranges]() {
-		auto result = symbolic_engine::taint_trace(addr, end, max_i, regs, mem_ranges);
+		symbolic_engine::taint_result_t result;
+		try {
+			result = symbolic_engine::taint_trace(addr, end, max_i, regs, mem_ranges);
+		} catch (const std::exception& ex) {
+			result.success = false;
+			result.error = std::string("Taint trace aborted: ") + ex.what();
+		} catch (...) {
+			result.success = false;
+			result.error = "Taint trace aborted by unknown exception";
+		}
 		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
 		symbolic_engine::g_state.last_taint = std::move(result);
 		symbolic_engine::g_state.processing.store(false);
@@ -179,6 +190,13 @@ inline std::vector<int> downstream_of(const std::vector<taint_node_t>& nodes, in
 		if (consumed) {
 			hits.push_back(i);
 			for (auto& wr : nodes[i].dest_regs) live.insert(lower_copy(wr));
+		} else if (!nodes[i].dest_regs.empty()) {
+			for (auto& wr : nodes[i].dest_regs) {
+				auto lw = lower_copy(wr);
+				auto it = live.find(lw);
+				if (it != live.end()) live.erase(it);
+			}
+			if (live.empty()) break;
 		}
 	}
 	return hits;

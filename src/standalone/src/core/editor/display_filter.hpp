@@ -347,6 +347,8 @@ struct parser_state_t {
     size_t pos = 0;
     std::string error;
     bool has_error = false;
+    int depth = 0;
+    static constexpr int kMaxDepth = 256;
 
     const token_t& current() const {
         return (*tokens)[pos];
@@ -367,6 +369,18 @@ struct parser_state_t {
         advance();
         return true;
     }
+
+    bool enter_depth() {
+        if (depth >= kMaxDepth) {
+            has_error = true;
+            error = "filter expression too deeply nested";
+            return false;
+        }
+        ++depth;
+        return true;
+    }
+
+    void leave_depth() { --depth; }
 
     std::unique_ptr<ast_node_t> parse_expression() {
         return parse_or();
@@ -398,8 +412,10 @@ struct parser_state_t {
 
     std::unique_ptr<ast_node_t> parse_not() {
         if (current().type == token_type::logical_not) {
+            if (!enter_depth()) return nullptr;
             advance();
             auto child = parse_not();
+            leave_depth();
             if (!child) return nullptr;
             return std::make_unique<not_node_t>(std::move(child));
         }
@@ -408,8 +424,10 @@ struct parser_state_t {
 
     std::unique_ptr<ast_node_t> parse_primary() {
         if (current().type == token_type::lparen) {
+            if (!enter_depth()) return nullptr;
             advance();
             auto expr = parse_expression();
+            leave_depth();
             if (!expr) return nullptr;
             if (!expect(token_type::rparen)) return nullptr;
             return expr;
