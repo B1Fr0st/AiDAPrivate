@@ -638,6 +638,19 @@ __declspec(noinline) static void finalize_call_kernel_anti_dump_seh(uint32_t sel
     }
 }
 
+__declspec(noinline) static void finalize_call_kernel_anti_dump_start_continuous_seh(uint32_t self_pid)
+{
+    __try {
+        bool ok = driver_bridge::kernel_anti_dump_start_continuous(self_pid);
+        webhook::write_log_critical_fmt("init",
+            "kernel_anti_dump_start_continuous_result=%d pid=%u", ok ? 1 : 0, self_pid);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        webhook::write_log_critical_fmt("init",
+            "kernel_anti_dump_start_continuous_SEH code=0x%08X", GetExceptionCode());
+    }
+}
+
 __declspec(noinline) static void finalize_call_hide_module_seh()
 {
     __try { anti_dump::hide_module(); }
@@ -741,6 +754,10 @@ inline bool finalize_after_activation()
         webhook::write_log_critical("init", "kernel_anti_dump_entering");
         finalize_call_kernel_anti_dump_seh(self_pid);
         webhook::write_log_critical("init", "kernel_anti_dump_ok");
+
+        webhook::write_log_critical("init", "kernel_anti_dump_start_continuous_entering");
+        finalize_call_kernel_anti_dump_start_continuous_seh(self_pid);
+        webhook::write_log_critical("init", "kernel_anti_dump_start_continuous_ok");
     }
 
     webhook::write_log_critical("init", "anti_dump_seal_handles_entering");

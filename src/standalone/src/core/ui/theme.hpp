@@ -133,6 +133,126 @@ namespace aida::ui {
 			return t;
 		}
 
+		inline theme_t make_claude_dark() {
+			theme_t t;
+			t.name = "Claude Dark";
+			t.is_dark = true;
+
+			t.bg_base       = IM_COL32(0x26, 0x26, 0x24, 255);
+			t.bg_elevated   = IM_COL32(0x2E, 0x2E, 0x2C, 255);
+			t.bg_overlay    = IM_COL32(0x36, 0x36, 0x33, 255);
+			t.panel_bg      = IM_COL32(0x26, 0x26, 0x24, 232);
+			t.panel_header  = IM_COL32(0x1E, 0x1E, 0x1C, 234);
+			t.glass_tint    = IM_COL32(0x32, 0x2A, 0x24, 60);
+			t.title_bar     = IM_COL32(0x1A, 0x1A, 0x18, 234);
+			t.acrylic_color = (uint32_t)((0x1A) | (0x1A << 8) | (0x18 << 16) | (0x84 << 24));
+
+			t.border_subtle = IM_COL32(0xE8, 0xE4, 0xDC, 16);
+			t.border_strong = IM_COL32(0xE8, 0xE4, 0xDC, 40);
+			t.border_focus  = IM_COL32(0xF4, 0x84, 0x5F, 210);
+
+			t.text_primary   = IM_COL32(0xE8, 0xE4, 0xDC, 244);
+			t.text_secondary = IM_COL32(0xB8, 0xB1, 0xA4, 220);
+			t.text_dim       = IM_COL32(0x88, 0x88, 0x88, 200);
+			t.text_address   = IM_COL32(0xF4, 0x84, 0x5F, 220);
+			t.text_lineno    = IM_COL32(0x6F, 0x6F, 0x6A, 200);
+
+			t.hover_wash       = IM_COL32(0xF4, 0x84, 0x5F, 22);
+			t.selection        = IM_COL32(0xF4, 0x84, 0x5F, 64);
+			t.selection_strong = IM_COL32(0xF4, 0x84, 0x5F, 124);
+			t.disabled_alpha   = 0.42f;
+
+			t.accent          = ImVec4(0xF4/255.f, 0x84/255.f, 0x5F/255.f, 1.f);
+			t.accent_u32      = IM_COL32(0xF4, 0x84, 0x5F, 255);
+			t.accent_hover    = IM_COL32(0xF7, 0x9C, 0x7C, 255);
+			t.accent_dim      = IM_COL32(0xF4, 0x84, 0x5F, 130);
+			t.accent_glow     = IM_COL32(0xF4, 0x84, 0x5F, 52);
+			t.accent_grad_top = IM_COL32(0xF7, 0x9C, 0x7C, 255);
+			t.accent_grad_bot = IM_COL32(0xE0, 0x70, 0x4A, 255);
+
+			t.success      = IM_COL32(0x7E, 0xC6, 0x99, 255);
+			t.success_soft = IM_COL32(0x7E, 0xC6, 0x99, 30);
+			t.warning      = IM_COL32(0xE8, 0xC4, 0x7C, 255);
+			t.warning_soft = IM_COL32(0xE8, 0xC4, 0x7C, 30);
+			t.error        = IM_COL32(0xE8, 0x6F, 0x6C, 255);
+			t.error_soft   = IM_COL32(0xE8, 0x6F, 0x6C, 30);
+			t.info         = IM_COL32(0x1F, 0x6F, 0xE4, 255);
+			t.info_soft    = IM_COL32(0x1F, 0x6F, 0xE4, 30);
+
+			t.syn_keyword      = IM_COL32(0xD7, 0x3A, 0x83, 255);
+			t.syn_type         = IM_COL32(0xE8, 0xC4, 0x7C, 255);
+			t.syn_string       = IM_COL32(0x7E, 0xC6, 0x99, 255);
+			t.syn_number       = IM_COL32(0x7C, 0xE8, 0xD4, 255);
+			t.syn_comment      = IM_COL32(0x88, 0x88, 0x88, 255);
+			t.syn_function     = IM_COL32(0x1F, 0x6F, 0xE4, 255);
+			t.syn_identifier   = IM_COL32(0xE8, 0xE4, 0xDC, 255);
+			t.syn_register     = IM_COL32(0xF4, 0x84, 0x5F, 255);
+			t.syn_address      = IM_COL32(0xF4, 0x84, 0x5F, 255);
+			t.syn_preprocessor = IM_COL32(0xD7, 0x3A, 0x83, 255);
+			t.syn_operator     = IM_COL32(0xB8, 0xB1, 0xA4, 255);
+			return t;
+		}
+
+		inline theme_t make_claude_light() {
+			theme_t t;
+			t.name = "Claude Light";
+			t.is_dark = false;
+
+			t.bg_base       = IM_COL32(0xF4, 0xF3, 0xEE, 255);
+			t.bg_elevated   = IM_COL32(0xFA, 0xF9, 0xF5, 255);
+			t.bg_overlay    = IM_COL32(0xE9, 0xEC, 0xEC, 255);
+			t.panel_bg      = IM_COL32(0xFA, 0xF9, 0xF5, 232);
+			t.panel_header  = IM_COL32(0xE9, 0xEC, 0xEC, 234);
+			t.glass_tint    = IM_COL32(0xF4, 0xF3, 0xEE, 60);
+			t.title_bar     = IM_COL32(0xE9, 0xEC, 0xEC, 232);
+			t.acrylic_color = (uint32_t)((0xEE) | (0xF3 << 8) | (0xF4 << 16) | (0xA8 << 24));
+
+			t.border_subtle = IM_COL32(0xB1, 0xAD, 0xA1, 70);
+			t.border_strong = IM_COL32(0xB1, 0xAD, 0xA1, 140);
+			t.border_focus  = IM_COL32(0xC1, 0x5F, 0x3C, 210);
+
+			t.text_primary   = IM_COL32(0x1F, 0x1E, 0x1D, 252);
+			t.text_secondary = IM_COL32(0x6F, 0x6F, 0x78, 232);
+			t.text_dim       = IM_COL32(0xB1, 0xAD, 0xA1, 220);
+			t.text_address   = IM_COL32(0xC1, 0x5F, 0x3C, 230);
+			t.text_lineno    = IM_COL32(0xA0, 0x9A, 0x90, 220);
+
+			t.hover_wash       = IM_COL32(0xC1, 0x5F, 0x3C, 20);
+			t.selection        = IM_COL32(0xC1, 0x5F, 0x3C, 48);
+			t.selection_strong = IM_COL32(0xC1, 0x5F, 0x3C, 110);
+			t.disabled_alpha   = 0.45f;
+
+			t.accent          = ImVec4(0xC1/255.f, 0x5F/255.f, 0x3C/255.f, 1.f);
+			t.accent_u32      = IM_COL32(0xC1, 0x5F, 0x3C, 255);
+			t.accent_hover    = IM_COL32(0xD0, 0x72, 0x52, 255);
+			t.accent_dim      = IM_COL32(0xC1, 0x5F, 0x3C, 130);
+			t.accent_glow     = IM_COL32(0xC1, 0x5F, 0x3C, 48);
+			t.accent_grad_top = IM_COL32(0xD0, 0x72, 0x52, 255);
+			t.accent_grad_bot = IM_COL32(0xB0, 0x50, 0x30, 255);
+
+			t.success      = IM_COL32(0x26, 0x83, 0x1A, 255);
+			t.success_soft = IM_COL32(0x26, 0x83, 0x1A, 26);
+			t.warning      = IM_COL32(0xA5, 0x6F, 0x10, 255);
+			t.warning_soft = IM_COL32(0xA5, 0x6F, 0x10, 26);
+			t.error        = IM_COL32(0xC0, 0x39, 0x2A, 255);
+			t.error_soft   = IM_COL32(0xC0, 0x39, 0x2A, 26);
+			t.info         = IM_COL32(0x1C, 0x6B, 0xBB, 255);
+			t.info_soft    = IM_COL32(0x1C, 0x6B, 0xBB, 26);
+
+			t.syn_keyword      = IM_COL32(0xD7, 0x3A, 0x83, 255);
+			t.syn_type         = IM_COL32(0x8A, 0x46, 0xCE, 255);
+			t.syn_string       = IM_COL32(0x26, 0x83, 0x1A, 255);
+			t.syn_number       = IM_COL32(0x2D, 0x8F, 0x8F, 255);
+			t.syn_comment      = IM_COL32(0x88, 0x88, 0x88, 255);
+			t.syn_function     = IM_COL32(0x1C, 0x6B, 0xBB, 255);
+			t.syn_identifier   = IM_COL32(0x1F, 0x1E, 0x1D, 255);
+			t.syn_register     = IM_COL32(0xC1, 0x5F, 0x3C, 255);
+			t.syn_address      = IM_COL32(0xC1, 0x5F, 0x3C, 255);
+			t.syn_preprocessor = IM_COL32(0xD7, 0x3A, 0x83, 255);
+			t.syn_operator     = IM_COL32(0x6F, 0x6F, 0x78, 255);
+			return t;
+		}
+
 		inline theme_t make_midnight_light() {
 			theme_t t;
 			t.name = "Midnight Light";
@@ -402,6 +522,21 @@ namespace aida::ui {
 
 	inline void use_dark()  { apply(detail::make_midnight_dark()); }
 	inline void use_light() { apply(detail::make_midnight_light()); }
+
+	inline theme_t make_theme_for_index(int idx) {
+		switch (idx) {
+			case 0:  return detail::make_midnight_dark();
+			case 1:  return detail::make_claude_dark();
+			case 2:  return detail::make_claude_light();
+			default: return detail::make_midnight_dark();
+		}
+	}
+
+	inline void apply_for_index(int idx, bool animated = true) {
+		theme_t t = make_theme_for_index(idx);
+		if (animated) apply(t);
+		else apply_immediate(t);
+	}
 
 	inline bool is_dark() { return detail::s_resolved.is_dark; }
 	inline void set_user_override(bool override_active) {

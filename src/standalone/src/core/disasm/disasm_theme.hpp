@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include "imgui/imgui.h"
+#include "../ui/theme.hpp"
 
 namespace disasm_theme {
 
@@ -71,90 +72,94 @@ namespace disasm_theme {
 		kind_dllmain_function = 62
 	};
 
-	inline ImU32 segment()           { return IM_COL32(108, 172, 202, 255); }
-	inline ImU32 address()           { return IM_COL32(108, 198, 252, 255); }
-	inline ImU32 bytes()             { return IM_COL32(132, 132, 142, 255); }
-	inline ImU32 mnemonic()          { return IM_COL32(255,  95,  90, 255); }
-	inline ImU32 reg()               { return IM_COL32(132, 202, 230, 255); }
-	inline ImU32 reg_ptr()           { return IM_COL32(150, 212, 234, 255); }
-	inline ImU32 immediate_num()     { return IM_COL32(240, 134, 134, 255); }
-	inline ImU32 immediate_offset()  { return IM_COL32(228, 226, 240, 255); }
-	inline ImU32 string_ref()        { return IM_COL32(232, 198, 116, 255); }
-	inline ImU32 imp_func()          { return IM_COL32(255, 130, 200, 255); }
-	inline ImU32 external_func()     { return IM_COL32(255, 130, 200, 255); }
-	inline ImU32 library_func()      { return IM_COL32(100, 175, 255, 255); }
-	inline ImU32 lumina_func()       { return IM_COL32(120, 220, 130, 255); }
-	inline ImU32 sub_label()         { return IM_COL32(255, 165,  60, 255); }
-	inline ImU32 loc_label()         { return IM_COL32(245, 180,  84, 255); }
-	inline ImU32 func_name()         { return IM_COL32(255, 165,  60, 255); }
-	inline ImU32 data_ref()          { return IM_COL32(255, 200, 100, 255); }
-	inline ImU32 comment()           { return IM_COL32(132, 218, 134, 255); }
-	inline ImU32 xref()              { return IM_COL32(112, 198, 112, 235); }
-	inline ImU32 separator()         { return IM_COL32( 92,  92, 102, 255); }
-	inline ImU32 banner()            { return IM_COL32(132, 220, 184, 255); }
-	inline ImU32 var_decl()          { return IM_COL32(220, 220, 134, 255); }
-	inline ImU32 var_use()           { return IM_COL32(222, 222, 152, 255); }
-	inline ImU32 keyword()           { return IM_COL32(230, 152, 200, 255); }
-	inline ImU32 directive()         { return IM_COL32(224, 156, 214, 255); }
-	inline ImU32 selection_bg()      { return IM_COL32( 72,  96, 168,  80); }
-	inline ImU32 cursor_line_bg()    { return IM_COL32( 60,  84, 138,  60); }
-	inline ImU32 gutter_bg()         { return IM_COL32( 22,  24,  32, 255); }
-	inline ImU32 panel_bg()          { return IM_COL32( 14,  16,  24, 255); }
-	inline ImU32 arrow_up()          { return IM_COL32(120, 196, 244, 255); }
-	inline ImU32 arrow_down()        { return IM_COL32(244, 188, 120, 255); }
+	inline bool is_dark_theme() { return aida::ui::resolved().is_dark; }
 
-	inline ImU32 data_byte()         { return IM_COL32(255, 215, 130, 255); }
-	inline ImU32 data_word()         { return IM_COL32(255, 200, 110, 255); }
-	inline ImU32 data_dword()        { return IM_COL32(255, 184,  90, 255); }
-	inline ImU32 data_qword()        { return IM_COL32(255, 168,  72, 255); }
-	inline ImU32 data_xmmword()      { return IM_COL32(214, 154, 240, 255); }
-	inline ImU32 data_ymmword()      { return IM_COL32(196, 138, 240, 255); }
-	inline ImU32 data_zmmword()      { return IM_COL32(176, 122, 240, 255); }
-	inline ImU32 data_tbyte()        { return IM_COL32(232, 174, 124, 255); }
-	inline ImU32 data_fword()        { return IM_COL32(232, 188, 132, 255); }
-	inline ImU32 string_ascii()      { return IM_COL32(244, 214, 124, 255); }
-	inline ImU32 string_unicode()    { return IM_COL32(252, 226, 142, 255); }
-	inline ImU32 struct_ref()        { return IM_COL32(180, 220, 248, 255); }
-	inline ImU32 array_ref()         { return IM_COL32(160, 210, 244, 255); }
-	inline ImU32 offset_ref()        { return IM_COL32(196, 218, 252, 255); }
-	inline ImU32 segment_ref()       { return IM_COL32(140, 200, 232, 255); }
-	inline ImU32 pointer_ref()       { return IM_COL32(170, 214, 240, 255); }
-	inline ImU32 data_unknown()      { return IM_COL32(170, 170, 180, 255); }
-	inline ImU32 align_directive()   { return IM_COL32(118, 132, 152, 255); }
-	inline ImU32 jump_thunk()        { return IM_COL32(244, 142, 188, 255); }
-	inline ImU32 case_label()        { return IM_COL32(218, 188, 100, 255); }
-	inline ImU32 default_case()      { return IM_COL32(218, 168,  96, 255); }
-	inline ImU32 stack_var()         { return IM_COL32(208, 220, 142, 255); }
-	inline ImU32 stack_arg()         { return IM_COL32(232, 230, 156, 255); }
-	inline ImU32 saved_reg()         { return IM_COL32(184, 198, 132, 255); }
-	inline ImU32 restored_reg()      { return IM_COL32(196, 210, 144, 255); }
-	inline ImU32 section_text()      { return IM_COL32(140, 196, 232, 255); }
-	inline ImU32 section_data()      { return IM_COL32(232, 196, 132, 255); }
-	inline ImU32 section_rdata()     { return IM_COL32(218, 184, 124, 255); }
-	inline ImU32 section_bss()       { return IM_COL32(196, 158, 100, 255); }
-	inline ImU32 section_rsrc()      { return IM_COL32(204, 188, 240, 255); }
-	inline ImU32 section_other()     { return IM_COL32(168, 178, 200, 255); }
-	inline ImU32 custom_struct()     { return IM_COL32(154, 224, 232, 255); }
-	inline ImU32 enum_value()        { return IM_COL32(224, 168, 232, 255); }
-	inline ImU32 typelib_type()      { return IM_COL32(200, 224, 184, 255); }
-	inline ImU32 mnem_branch()       { return IM_COL32(230, 132, 198, 255); }
-	inline ImU32 mnem_call()         { return IM_COL32(248, 138, 152, 255); }
-	inline ImU32 mnem_ret()          { return IM_COL32(252, 116, 116, 255); }
-	inline ImU32 mnem_arith()        { return IM_COL32(244, 196, 132, 255); }
-	inline ImU32 mnem_logic()        { return IM_COL32(238, 200, 156, 255); }
-	inline ImU32 mnem_data()         { return IM_COL32(220, 232, 162, 255); }
-	inline ImU32 mnem_sse()          { return IM_COL32(196, 162, 240, 255); }
-	inline ImU32 mnem_string()       { return IM_COL32(236, 198, 152, 255); }
-	inline ImU32 mnem_priv()         { return IM_COL32(244, 154, 222, 255); }
-	inline ImU32 mnem_nop()          { return IM_COL32(120, 124, 138, 255); }
-	inline ImU32 mnem_int()          { return IM_COL32(252, 130, 130, 255); }
-	inline ImU32 mnem_other()        { return IM_COL32(255,  95,  90, 255); }
-	inline ImU32 entry_point()       { return IM_COL32(244, 220, 132, 255); }
-	inline ImU32 main_function()     { return IM_COL32(252, 232, 148, 255); }
-	inline ImU32 winmain_function()  { return IM_COL32(232, 220, 156, 255); }
-	inline ImU32 dllmain_function()  { return IM_COL32(220, 232, 168, 255); }
+	inline ImU32 pick(ImU32 dark, ImU32 light) {
+		return is_dark_theme() ? dark : light;
+	}
 
-	inline bool  is_dark_theme()     { return true; }
+	inline ImU32 segment()           { return pick(IM_COL32(184, 168, 152, 255), IM_COL32(111, 111, 120, 255)); }
+	inline ImU32 address()           { return pick(IM_COL32(0xF4, 0x84, 0x5F, 255), IM_COL32(0xC1, 0x5F, 0x3C, 255)); }
+	inline ImU32 bytes()             { return pick(IM_COL32(132, 130, 122, 255), IM_COL32(154, 150, 142, 255)); }
+	inline ImU32 mnemonic()          { return pick(IM_COL32(0xF4, 0x84, 0x5F, 255), IM_COL32(0xC1, 0x5F, 0x3C, 255)); }
+	inline ImU32 reg()               { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
+	inline ImU32 reg_ptr()           { return pick(IM_COL32(0xF0, 0xD2, 0x98, 255), IM_COL32(0x9F, 0x60, 0xD8, 255)); }
+	inline ImU32 immediate_num()     { return pick(IM_COL32(0x7C, 0xE8, 0xD4, 255), IM_COL32(0x2D, 0x8F, 0x8F, 255)); }
+	inline ImU32 immediate_offset()  { return pick(IM_COL32(0xD8, 0xD4, 0xCC, 255), IM_COL32(0x4A, 0x49, 0x48, 255)); }
+	inline ImU32 string_ref()        { return pick(IM_COL32(0x7E, 0xC6, 0x99, 255), IM_COL32(0x26, 0x83, 0x1A, 255)); }
+	inline ImU32 imp_func()          { return pick(IM_COL32(0xD7, 0x3A, 0x83, 255), IM_COL32(0xC1, 0x2F, 0x6B, 255)); }
+	inline ImU32 external_func()     { return pick(IM_COL32(0xD7, 0x3A, 0x83, 255), IM_COL32(0xC1, 0x2F, 0x6B, 255)); }
+	inline ImU32 library_func()      { return pick(IM_COL32(0x1F, 0x6F, 0xE4, 255), IM_COL32(0x1C, 0x6B, 0xBB, 255)); }
+	inline ImU32 lumina_func()       { return pick(IM_COL32(0x7E, 0xC6, 0x99, 255), IM_COL32(0x26, 0x83, 0x1A, 255)); }
+	inline ImU32 sub_label()         { return pick(IM_COL32(0x1F, 0x6F, 0xE4, 255), IM_COL32(0x1C, 0x6B, 0xBB, 255)); }
+	inline ImU32 loc_label()         { return pick(IM_COL32(0x4D, 0x95, 0xEC, 255), IM_COL32(0x2A, 0x7A, 0xCB, 255)); }
+	inline ImU32 func_name()         { return pick(IM_COL32(0x1F, 0x6F, 0xE4, 255), IM_COL32(0x1C, 0x6B, 0xBB, 255)); }
+	inline ImU32 data_ref()          { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
+	inline ImU32 comment()           { return pick(IM_COL32(0x88, 0x88, 0x88, 255), IM_COL32(0x88, 0x88, 0x88, 255)); }
+	inline ImU32 xref()              { return pick(IM_COL32(0x7E, 0xC6, 0x99, 235), IM_COL32(0x26, 0x83, 0x1A, 235)); }
+	inline ImU32 separator()         { return pick(IM_COL32(0x44, 0x44, 0x42, 255), IM_COL32(0xB1, 0xAD, 0xA1, 255)); }
+	inline ImU32 banner()            { return pick(IM_COL32(0xF4, 0x84, 0x5F, 255), IM_COL32(0xC1, 0x5F, 0x3C, 255)); }
+	inline ImU32 var_decl()          { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
+	inline ImU32 var_use()           { return pick(IM_COL32(0xEC, 0xCB, 0x88, 255), IM_COL32(0x9A, 0x58, 0xD6, 255)); }
+	inline ImU32 keyword()           { return pick(IM_COL32(0xD7, 0x3A, 0x83, 255), IM_COL32(0xD7, 0x3A, 0x83, 255)); }
+	inline ImU32 directive()         { return pick(IM_COL32(0xD7, 0x3A, 0x83, 255), IM_COL32(0xD7, 0x3A, 0x83, 255)); }
+	inline ImU32 selection_bg()      { return pick(IM_COL32(0xF4, 0x84, 0x5F, 80), IM_COL32(0xC1, 0x5F, 0x3C, 60)); }
+	inline ImU32 cursor_line_bg()    { return pick(IM_COL32(0xF4, 0x84, 0x5F, 36), IM_COL32(0xC1, 0x5F, 0x3C, 32)); }
+	inline ImU32 gutter_bg()         { return pick(IM_COL32(0x1E, 0x1E, 0x1C, 255), IM_COL32(0xE9, 0xEC, 0xEC, 255)); }
+	inline ImU32 panel_bg()          { return pick(IM_COL32(0x1A, 0x1A, 0x18, 255), IM_COL32(0xF4, 0xF3, 0xEE, 255)); }
+	inline ImU32 arrow_up()          { return pick(IM_COL32(0x7E, 0xC6, 0x99, 255), IM_COL32(0x26, 0x83, 0x1A, 255)); }
+	inline ImU32 arrow_down()        { return pick(IM_COL32(0xF4, 0x84, 0x5F, 255), IM_COL32(0xC1, 0x5F, 0x3C, 255)); }
+
+	inline ImU32 data_byte()         { return pick(IM_COL32(0x7C, 0xE8, 0xD4, 255), IM_COL32(0x2D, 0x8F, 0x8F, 255)); }
+	inline ImU32 data_word()         { return pick(IM_COL32(0x8E, 0xE6, 0xCE, 255), IM_COL32(0x35, 0x9F, 0x9F, 255)); }
+	inline ImU32 data_dword()        { return pick(IM_COL32(0xA0, 0xE2, 0xC4, 255), IM_COL32(0x3D, 0xAA, 0xA5, 255)); }
+	inline ImU32 data_qword()        { return pick(IM_COL32(0xB4, 0xDE, 0xB0, 255), IM_COL32(0x45, 0xA6, 0x88, 255)); }
+	inline ImU32 data_xmmword()      { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
+	inline ImU32 data_ymmword()      { return pick(IM_COL32(0xEC, 0xCB, 0x88, 255), IM_COL32(0x9A, 0x58, 0xD6, 255)); }
+	inline ImU32 data_zmmword()      { return pick(IM_COL32(0xF0, 0xD2, 0x98, 255), IM_COL32(0xAB, 0x6B, 0xDE, 255)); }
+	inline ImU32 data_tbyte()        { return pick(IM_COL32(0xE8, 0xB0, 0x82, 255), IM_COL32(0xB0, 0x60, 0x44, 255)); }
+	inline ImU32 data_fword()        { return pick(IM_COL32(0xE8, 0xBC, 0x94, 255), IM_COL32(0xB8, 0x70, 0x50, 255)); }
+	inline ImU32 string_ascii()      { return pick(IM_COL32(0x7E, 0xC6, 0x99, 255), IM_COL32(0x26, 0x83, 0x1A, 255)); }
+	inline ImU32 string_unicode()    { return pick(IM_COL32(0x96, 0xD2, 0xA6, 255), IM_COL32(0x35, 0x9A, 0x2A, 255)); }
+	inline ImU32 struct_ref()        { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
+	inline ImU32 array_ref()         { return pick(IM_COL32(0xEC, 0xCB, 0x88, 255), IM_COL32(0x9A, 0x58, 0xD6, 255)); }
+	inline ImU32 offset_ref()        { return pick(IM_COL32(0xD8, 0xD4, 0xCC, 255), IM_COL32(0x4A, 0x49, 0x48, 255)); }
+	inline ImU32 segment_ref()       { return pick(IM_COL32(184, 168, 152, 255), IM_COL32(111, 111, 120, 255)); }
+	inline ImU32 pointer_ref()       { return pick(IM_COL32(0x1F, 0x6F, 0xE4, 255), IM_COL32(0x1C, 0x6B, 0xBB, 255)); }
+	inline ImU32 data_unknown()      { return pick(IM_COL32(0xB8, 0xB1, 0xA4, 255), IM_COL32(0x6F, 0x6F, 0x78, 255)); }
+	inline ImU32 align_directive()   { return pick(IM_COL32(0x88, 0x88, 0x88, 255), IM_COL32(0xA0, 0x9A, 0x90, 255)); }
+	inline ImU32 jump_thunk()        { return pick(IM_COL32(0xD7, 0x3A, 0x83, 255), IM_COL32(0xC1, 0x2F, 0x6B, 255)); }
+	inline ImU32 case_label()        { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
+	inline ImU32 default_case()      { return pick(IM_COL32(0xE0, 0xB0, 0x70, 255), IM_COL32(0x70, 0x38, 0xA8, 255)); }
+	inline ImU32 stack_var()         { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
+	inline ImU32 stack_arg()         { return pick(IM_COL32(0xEC, 0xCB, 0x88, 255), IM_COL32(0x9A, 0x58, 0xD6, 255)); }
+	inline ImU32 saved_reg()         { return pick(IM_COL32(0xB8, 0xB1, 0xA4, 255), IM_COL32(0x70, 0x70, 0x78, 255)); }
+	inline ImU32 restored_reg()      { return pick(IM_COL32(0xC8, 0xC2, 0xB4, 255), IM_COL32(0x80, 0x80, 0x88, 255)); }
+	inline ImU32 section_text()      { return pick(IM_COL32(0x1F, 0x6F, 0xE4, 255), IM_COL32(0x1C, 0x6B, 0xBB, 255)); }
+	inline ImU32 section_data()      { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
+	inline ImU32 section_rdata()     { return pick(IM_COL32(0xF0, 0xCC, 0x88, 255), IM_COL32(0x9A, 0x58, 0xD6, 255)); }
+	inline ImU32 section_bss()       { return pick(IM_COL32(0xE8, 0xB0, 0x82, 255), IM_COL32(0xB0, 0x60, 0x44, 255)); }
+	inline ImU32 section_rsrc()      { return pick(IM_COL32(0xD7, 0x3A, 0x83, 255), IM_COL32(0xC1, 0x2F, 0x6B, 255)); }
+	inline ImU32 section_other()     { return pick(IM_COL32(0xB8, 0xB1, 0xA4, 255), IM_COL32(0x6F, 0x6F, 0x78, 255)); }
+	inline ImU32 custom_struct()     { return pick(IM_COL32(0x7C, 0xE8, 0xD4, 255), IM_COL32(0x2D, 0x8F, 0x8F, 255)); }
+	inline ImU32 enum_value()        { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
+	inline ImU32 typelib_type()      { return pick(IM_COL32(0x7E, 0xC6, 0x99, 255), IM_COL32(0x26, 0x83, 0x1A, 255)); }
+	inline ImU32 mnem_branch()       { return pick(IM_COL32(0xD7, 0x3A, 0x83, 255), IM_COL32(0xC1, 0x2F, 0x6B, 255)); }
+	inline ImU32 mnem_call()         { return pick(IM_COL32(0xF4, 0x84, 0x5F, 255), IM_COL32(0xC1, 0x5F, 0x3C, 255)); }
+	inline ImU32 mnem_ret()          { return pick(IM_COL32(0xE8, 0x6F, 0x6C, 255), IM_COL32(0xC0, 0x39, 0x2A, 255)); }
+	inline ImU32 mnem_arith()        { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
+	inline ImU32 mnem_logic()        { return pick(IM_COL32(0xEC, 0xCB, 0x88, 255), IM_COL32(0x9A, 0x58, 0xD6, 255)); }
+	inline ImU32 mnem_data()         { return pick(IM_COL32(0xB8, 0xB1, 0xA4, 255), IM_COL32(0x6F, 0x6F, 0x78, 255)); }
+	inline ImU32 mnem_sse()          { return pick(IM_COL32(0x7C, 0xE8, 0xD4, 255), IM_COL32(0x2D, 0x8F, 0x8F, 255)); }
+	inline ImU32 mnem_string()       { return pick(IM_COL32(0x7E, 0xC6, 0x99, 255), IM_COL32(0x26, 0x83, 0x1A, 255)); }
+	inline ImU32 mnem_priv()         { return pick(IM_COL32(0xD7, 0x3A, 0x83, 255), IM_COL32(0xC1, 0x2F, 0x6B, 255)); }
+	inline ImU32 mnem_nop()          { return pick(IM_COL32(0x6F, 0x6F, 0x6A, 255), IM_COL32(0xA0, 0x9A, 0x90, 255)); }
+	inline ImU32 mnem_int()          { return pick(IM_COL32(0xE8, 0x6F, 0x6C, 255), IM_COL32(0xC0, 0x39, 0x2A, 255)); }
+	inline ImU32 mnem_other()        { return pick(IM_COL32(0xF4, 0x84, 0x5F, 255), IM_COL32(0xC1, 0x5F, 0x3C, 255)); }
+	inline ImU32 entry_point()       { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
+	inline ImU32 main_function()     { return pick(IM_COL32(0xF0, 0xD2, 0x98, 255), IM_COL32(0x9A, 0x58, 0xD6, 255)); }
+	inline ImU32 winmain_function()  { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
+	inline ImU32 dllmain_function()  { return pick(IM_COL32(0x7E, 0xC6, 0x99, 255), IM_COL32(0x26, 0x83, 0x1A, 255)); }
 
 	inline ImU32 color_for_kind(int kind) {
 		switch (kind) {

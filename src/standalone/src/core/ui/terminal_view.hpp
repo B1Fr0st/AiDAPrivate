@@ -66,6 +66,7 @@ struct TerminalSession
 
     float                scroll_y = 0.f;
     bool                 scroll_to_bottom = true;
+    bool                 auto_follow = true;
 
 
     std::string          title = "Terminal";
@@ -460,6 +461,19 @@ inline void send_input(TerminalSession& s, const char* data, size_t len)
     WriteFile(s.hPipeOut, data, static_cast<DWORD>(len), &written, nullptr);
 }
 
+inline void clear_session(TerminalSession& s)
+{
+    std::lock_guard<std::mutex> lk(s.buffer_mtx);
+    s.lines.clear();
+    s.line_entrance_time.clear();
+    s.cursor_row = 0;
+    s.cursor_col = 0;
+    s.scroll_y = 0.f;
+    s.scroll_to_bottom = true;
+    s.auto_follow = true;
+    s.prev_line_count = 0;
+}
+
 inline void send_key(TerminalSession& s, char ch)
 {
     send_input(s, &ch, 1);
@@ -581,19 +595,26 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
     }
 
 
-    if (s.scroll_to_bottom) {
-        s.scroll_y = static_cast<float>(std::max(0, total_lines - vis_rows));
-        s.scroll_to_bottom = false;
-    }
-
+    float max_scroll = static_cast<float>(std::max(0, total_lines - vis_rows));
 
     if (ImGui::IsWindowHovered()) {
         float wheel = ImGui::GetIO().MouseWheel;
         if (wheel != 0.f) {
             s.scroll_y -= wheel * 3.f;
-            s.scroll_y = std::max(0.f, std::min(s.scroll_y,
-                static_cast<float>(std::max(0, total_lines - vis_rows))));
+            s.scroll_y = std::max(0.f, std::min(s.scroll_y, max_scroll));
+            s.auto_follow = (s.scroll_y >= max_scroll - 0.5f);
         }
+    }
+
+    if (s.scroll_to_bottom) {
+        s.auto_follow = true;
+        s.scroll_to_bottom = false;
+    }
+
+    if (s.auto_follow) {
+        s.scroll_y = max_scroll;
+    } else if (s.scroll_y > max_scroll) {
+        s.scroll_y = max_scroll;
     }
 
     if (s.bell_pending.exchange(false, std::memory_order_acq_rel)) {
@@ -687,50 +708,6 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
     ImGui::PopStyleColor();
 
 
-    if (ImGui::IsItemHovered() || ImGui::IsItemFocused()) {
-        auto& io = ImGui::GetIO();
-        for (int k = 0; k < io.InputQueueCharacters.Size; ++k) {
-            ImWchar wc = io.InputQueueCharacters[k];
-            if (wc < 128) {
-                char c = static_cast<char>(wc);
-                send_key(s, c);
-            }
-        }
-
-
-        if (ImGui::IsKeyPressed(ImGuiKey_Enter))
-            send_input(s, "\r", 1);
-        if (ImGui::IsKeyPressed(ImGuiKey_Backspace))
-            send_input(s, "\x7f", 1);
-        if (ImGui::IsKeyPressed(ImGuiKey_Tab))
-            send_input(s, "\t", 1);
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape))
-            send_input(s, "\x1b", 1);
-        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))
-            send_input(s, "\x1b[A", 3);
-        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))
-            send_input(s, "\x1b[B", 3);
-        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow))
-            send_input(s, "\x1b[C", 3);
-        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow))
-            send_input(s, "\x1b[D", 3);
-        if (ImGui::IsKeyPressed(ImGuiKey_Home))
-            send_input(s, "\x1b[H", 3);
-        if (ImGui::IsKeyPressed(ImGuiKey_End))
-            send_input(s, "\x1b[F", 3);
-        if (ImGui::IsKeyPressed(ImGuiKey_Delete))
-            send_input(s, "\x1b[3~", 4);
-
-
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C))
-            send_input(s, "\x03", 1);
-
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D))
-            send_input(s, "\x04", 1);
-
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z))
-            send_input(s, "\x1a", 1);
-    }
 }
 
 

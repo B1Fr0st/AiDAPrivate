@@ -24,6 +24,7 @@
 #include "mcp_standalone.hpp"
 #include "cost_calculator.hpp"
 #include "provider_catalog.hpp"
+#include "../infra/work_queue.hpp"
 
 #include "../helpers/diag_log.hpp"
 
@@ -127,7 +128,7 @@ namespace task {
 			       cancel_flag->load(std::memory_order_acquire);
 		};
 
-		std::thread worker([&]() {
+		work_queue::post([&]() {
 			std::unique_ptr<standalone_ai_client_t> local_client;
 			try {
 				local_client = std::make_unique<standalone_ai_client_t>(g_sa_settings);
@@ -365,9 +366,11 @@ namespace task {
 				}
 				std::this_thread::sleep_for(std::chrono::milliseconds(50));
 			}
+		} else {
+			while (!done.load(std::memory_order_acquire)) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			}
 		}
-
-		worker.join();
 
 		if (!parent_session_id.empty() && !sub_session_id.empty()) {
 			const std::string parent_msg_id = find_latest_assistant_message_id(parent_session_id);

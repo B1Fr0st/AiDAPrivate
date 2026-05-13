@@ -15,6 +15,7 @@
 #include "tls_exporter.hpp"
 #include "vbs_enforcement.hpp"
 #include "obfuscation.hpp"
+#include "../infra/work_queue.hpp"
 
 #include <windows.h>
 #include <winioctl.h>
@@ -1819,15 +1820,17 @@ static void schedule_async_network_diagnosis(const std::string& url)
         diag_host = diag_host.substr(0, colon);
     }
 
-    try {
-        std::thread([diag_host, diag_port]() {
+    if (work_queue::post([diag_host, diag_port]() {
             __try {
                 diagnose_network(diag_host.c_str(), diag_port);
             } __except(EXCEPTION_EXECUTE_HANDLER) {
             }
-        }).detach();
+        }))
+    {
         lic_log("transport_diag_thread_dispatched");
-    } catch (...) {
+    }
+    else
+    {
         lic_log("transport_diag_thread_spawn_failed");
     }
 }
@@ -1982,8 +1985,8 @@ namespace
 
     std::atomic<bool> s_valid{false};
     std::atomic<bool> s_stop{false};
-    std::thread       s_heartbeat_thread;
-    std::thread       s_srv_refresh_thread;
+    std::atomic<bool> s_heartbeat_done{true};
+    std::atomic<bool> s_srv_refresh_done{true};
     std::mutex        s_state_mtx;
     std::string       s_plan;
     std::string       s_error;
@@ -2338,7 +2341,7 @@ namespace
         {
             std::string reason_copy = reason ? std::string(reason) : std::string("silent_kill_pending");
             lic_log((std::string("silent_kill_scheduled reason=") + reason_copy).c_str());
-            std::thread([reason_copy]() {
+            work_queue::post([reason_copy]() {
                 int64_t deadline_local = s_silent_kill_after_ms.load(std::memory_order_acquire);
                 while (deadline_local > 0 && silent_kill_now_ms() < deadline_local)
                 {
@@ -2349,7 +2352,7 @@ namespace
                 {
                     license_failfast("license_silent_kill", reason_copy);
                 }
-            }).detach();
+            });
         }
     }
 
@@ -2361,15 +2364,42 @@ namespace
 
     bool check_obfuscated_valid()
     {
+        std::lock_guard<std::mutex> lk(s_state_mtx);
         uint64_t a = s_state_a.load(std::memory_order_acquire);
         uint64_t b = s_state_b.load(std::memory_order_acquire);
         uint64_t c = s_state_c.load(std::memory_order_acquire);
         uint64_t magic = s_magic.load(std::memory_order_acquire);
         uint64_t arc_magic = s_arc_magic.load(std::memory_order_acquire);
-        uint64_t arc_state = (s_arc_loaded || arc_grace_active())
+        bool arc_loaded_snapshot = s_arc_loaded;
+        bool arc_grace_snapshot = arc_grace_active();
+        uint64_t arc_state = (arc_loaded_snapshot || arc_grace_snapshot)
             ? s_arc_state.load(std::memory_order_acquire)
             : 0;
-        return (a ^ b ^ c ^ arc_state) == (magic ^ arc_magic);
+        bool valid = (a ^ b ^ c ^ arc_state) == (magic ^ arc_magic);
+
+        static std::atomic<int> s_last_validity_log{-1};
+        int last = s_last_validity_log.load(std::memory_order_acquire);
+        int now_state = valid ? 1 : 0;
+        if (last != now_state) {
+            s_last_validity_log.store(now_state, std::memory_order_release);
+            lic_log_fmt("DIAG_VALIDITY tid=%lu new=%d a=%016llX b=%016llX c=%016llX abc_xor=%016llX "
+                        "magic=%016llX arc_state=%016llX arc_magic=%016llX magic_xor_arc=%016llX "
+                        "arc_loaded=%d arc_grace=%d abc_eq_magic=%d arc_match=%d",
+                        GetCurrentThreadId(), now_state,
+                        static_cast<unsigned long long>(a),
+                        static_cast<unsigned long long>(b),
+                        static_cast<unsigned long long>(c),
+                        static_cast<unsigned long long>(a ^ b ^ c),
+                        static_cast<unsigned long long>(magic),
+                        static_cast<unsigned long long>(arc_state),
+                        static_cast<unsigned long long>(arc_magic),
+                        static_cast<unsigned long long>(magic ^ arc_magic),
+                        arc_loaded_snapshot ? 1 : 0,
+                        arc_grace_snapshot ? 1 : 0,
+                        ((a ^ b ^ c) == magic) ? 1 : 0,
+                        (arc_state == arc_magic) ? 1 : 0);
+        }
+        return valid;
     }
 
 
@@ -3551,8 +3581,6 @@ namespace
 
         uint64_t nonce_seed = fnv1a_str(settings.license_server_nonce);
 
-        s_magic.store(S_MAGIC_INIT ^ nonce_seed, std::memory_order_release);
-
 
         if (response.contains("page_epoch") && response["page_epoch"].is_number())
         {
@@ -3613,7 +3641,7 @@ namespace
                     std::string reason_copy = response.value("kill_reason", std::string("server_kill_directive"));
                     lic_log((std::string("server_kill_at_epoch_scheduled in_seconds=") +
                         std::to_string(kill_epoch - now_epoch) + " reason=" + reason_copy).c_str());
-                    std::thread([reason_copy]() {
+                    work_queue::post([reason_copy]() {
                         int64_t deadline_local = s_silent_kill_after_ms.load(std::memory_order_acquire);
                         while (deadline_local > 0 && silent_kill_now_ms() < deadline_local)
                         {
@@ -3624,7 +3652,7 @@ namespace
                         {
                             license_failfast("server_kill_directive", reason_copy);
                         }
-                    }).detach();
+                    });
                 }
             }
         }
@@ -3663,10 +3691,15 @@ namespace
             }
         }
 
-        std::lock_guard<std::mutex> lk(s_state_mtx);
-        s_plan = settings.license_plan;
-        s_error.clear();
-        set_obfuscated_valid(true, nonce_seed);
+        lic_log("apply_valid_response_pre_validity_commit");
+        {
+            std::lock_guard<std::mutex> lk(s_state_mtx);
+            s_magic.store(S_MAGIC_INIT ^ nonce_seed, std::memory_order_release);
+            s_plan = settings.license_plan;
+            s_error.clear();
+            set_obfuscated_valid(true, nonce_seed);
+        }
+        lic_log("apply_valid_response_post_validity_commit");
     }
 
 
@@ -4043,7 +4076,118 @@ namespace
 
 
         if (s_arc_loaded)
+        {
+            log_arc_status("arc_reseed_already_loaded_begin");
+            if (settings.license_session_token.empty() || hwid.empty())
+            {
+                log_arc_status("arc_reseed_skip_preconditions");
+                return false;
+            }
+            if (!s_fn_arc_init)
+            {
+                log_arc_status("arc_reseed_arc_init_unavailable");
+                return false;
+            }
+            if (settings.license_bind_proof.empty())
+            {
+                log_arc_status("arc_reseed_missing_bind_proof");
+                return false;
+            }
+            std::vector<uint8_t> reseed_bind_proof = hex_decode(settings.license_bind_proof);
+            if (reseed_bind_proof.size() != 32)
+            {
+                log_arc_status("arc_reseed_bind_proof_invalid_length");
+                if (!reseed_bind_proof.empty())
+                    SecureZeroMemory(reseed_bind_proof.data(), reseed_bind_proof.size());
+                return false;
+            }
+            const int64_t reseed_bind_ts = settings.license_issued_at;
+            const int64_t reseed_now = static_cast<int64_t>(std::time(nullptr));
+            const int64_t reseed_age = reseed_now - reseed_bind_ts;
+            if (reseed_bind_ts <= 0 || reseed_age < -300 || reseed_age > 300)
+            {
+                char tbuf[192];
+                _snprintf_s(tbuf, sizeof(tbuf), _TRUNCATE,
+                    "arc_reseed_bind_timestamp_invalid issued_at=%lld now=%lld age=%lld",
+                    static_cast<long long>(reseed_bind_ts),
+                    static_cast<long long>(reseed_now),
+                    static_cast<long long>(reseed_age));
+                log_arc_status(tbuf);
+                SecureZeroMemory(reseed_bind_proof.data(), reseed_bind_proof.size());
+                return false;
+            }
+            {
+                std::string sess_pfx = settings.license_session_token.size() >= 16
+                    ? settings.license_session_token.substr(0, 16)
+                    : settings.license_session_token;
+                std::string seed_pfx = settings.license_key_seed.size() >= 16
+                    ? settings.license_key_seed.substr(0, 16)
+                    : settings.license_key_seed;
+                char dbg[256];
+                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                    "arc_reseed_pre session_pfx=%s seed_pfx=%s issued_at=%lld attempt=%u",
+                    sess_pfx.c_str(),
+                    seed_pfx.c_str(),
+                    static_cast<long long>(reseed_bind_ts),
+                    attempt_number);
+                log_arc_status(dbg);
+            }
+            log_arc_status("arc_reseed_arc_init_pre");
+            const bool reseed_init_ok = s_fn_arc_init(
+                settings.license_session_token.c_str(),
+                hwid.c_str(),
+                reseed_bind_ts,
+                ARC_INTERFACE_VERSION,
+                reseed_bind_proof.data());
+            SecureZeroMemory(reseed_bind_proof.data(), reseed_bind_proof.size());
+            log_arc_status(reseed_init_ok ? "arc_reseed_arc_init_post_ok" : "arc_reseed_arc_init_post_false");
+            if (!reseed_init_ok)
+            {
+                if (s_fn_arc_copy_last_status)
+                {
+                    char arc_status[192] = {};
+                    uint32_t copied = s_fn_arc_copy_last_status(arc_status, static_cast<uint32_t>(sizeof(arc_status)));
+                    if (copied > 0 && arc_status[0] != '\0')
+                    {
+                        char detail[256];
+                        _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                            "arc_reseed_internal_status=%.180s", arc_status);
+                        log_arc_status(detail);
+                    }
+                    else
+                    {
+                        log_arc_status("arc_reseed_internal_status=<empty>");
+                    }
+                }
+                else
+                {
+                    log_arc_status("arc_reseed_internal_status=<copy_last_status_unavailable>");
+                }
+                return false;
+            }
+            if (s_fn_arc_set_key_seed && !settings.license_key_seed.empty())
+            {
+                std::vector<uint8_t> reseed_seed_bytes = hex_decode(settings.license_key_seed);
+                if (reseed_seed_bytes.size() == 32)
+                {
+                    s_fn_arc_set_key_seed(reseed_seed_bytes.data(), 32);
+                    SecureZeroMemory(reseed_seed_bytes.data(), reseed_seed_bytes.size());
+                    log_arc_status("arc_reseed_set_key_seed_ok");
+                }
+                else
+                {
+                    if (!reseed_seed_bytes.empty())
+                        SecureZeroMemory(reseed_seed_bytes.data(), reseed_seed_bytes.size());
+                    log_arc_status("arc_reseed_set_key_seed_invalid_length");
+                }
+            }
+            else
+            {
+                log_arc_status("arc_reseed_set_key_seed_skipped");
+            }
+            log_arc_status("arc_reseed_complete");
             return true;
+        }
 
         if (settings.license_key.empty() || settings.license_session_token.empty() || hwid.empty())
         {
@@ -4964,15 +5108,17 @@ namespace
             anti_tamper::server_pages::detail::stored_key_seed() = settings.license_key_seed;
 
         uint64_t nonce_seed = fnv1a_str(settings.license_server_nonce);
-        s_magic.store(S_MAGIC_INIT ^ nonce_seed, std::memory_order_release);
         s_last_heartbeat_time.store(
             static_cast<int64_t>(std::chrono::steady_clock::now().time_since_epoch().count() / 1000000),
             std::memory_order_release);
 
-        std::lock_guard<std::mutex> lk(s_state_mtx);
-        s_plan = settings.license_plan;
-        s_error.clear();
-        set_obfuscated_valid(true, nonce_seed);
+        {
+            std::lock_guard<std::mutex> lk(s_state_mtx);
+            s_magic.store(S_MAGIC_INIT ^ nonce_seed, std::memory_order_release);
+            s_plan = settings.license_plan;
+            s_error.clear();
+            set_obfuscated_valid(true, nonce_seed);
+        }
         return true;
     }
 
@@ -5050,9 +5196,9 @@ namespace
         s_cached_session_token.clear();
         s_proof_hash.store(0, std::memory_order_release);
         s_heartbeat_counter.store(0, std::memory_order_release);
-        s_magic.store(S_MAGIC_INIT, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lk(s_state_mtx);
+            s_magic.store(S_MAGIC_INIT, std::memory_order_release);
             s_plan.clear();
             s_error = effective_reason;
             set_obfuscated_valid(false);
@@ -5226,28 +5372,40 @@ namespace
     void restart_heartbeat(settings_sa_t& settings)
     {
         s_stop.store(true, std::memory_order_release);
-        if (s_heartbeat_thread.joinable())
-            s_heartbeat_thread.join();
-        if (s_srv_refresh_thread.joinable())
-            s_srv_refresh_thread.join();
+        while (!s_heartbeat_done.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        while (!s_srv_refresh_done.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
         s_stop.store(false, std::memory_order_release);
-        try
+
+        settings_sa_t* settings_ptr = &settings;
+
+        s_heartbeat_done.store(false, std::memory_order_release);
+        if (work_queue::post([settings_ptr]() {
+                heartbeat_worker(settings_ptr);
+                s_heartbeat_done.store(true, std::memory_order_release);
+            }))
         {
-            s_heartbeat_thread = std::thread(heartbeat_worker, &settings);
             lic_log("heartbeat_thread_started");
         }
-        catch (...)
+        else
         {
+            s_heartbeat_done.store(true, std::memory_order_release);
             lic_log("heartbeat_thread_failed_skipped");
         }
-        try
+
+        s_srv_refresh_done.store(false, std::memory_order_release);
+        if (work_queue::post([settings_ptr]() {
+                srv_refresh_worker(settings_ptr);
+                s_srv_refresh_done.store(true, std::memory_order_release);
+            }))
         {
-            s_srv_refresh_thread = std::thread(srv_refresh_worker, &settings);
             lic_log("srv_refresh_thread_started");
         }
-        catch (...)
+        else
         {
+            s_srv_refresh_done.store(true, std::memory_order_release);
             lic_log("srv_refresh_thread_failed_skipped");
         }
     }
@@ -5285,10 +5443,10 @@ namespace
         s_honeypot_tripped.store(true, std::memory_order_release);
         s_honeypot_trip_count.fetch_add(1, std::memory_order_relaxed);
 
-        std::thread([trap = std::string(trap_name)]() {
+        work_queue::post([trap = std::string(trap_name)]() {
             try { honeypot_report_impl(trap.c_str(), trap.size()); }
             catch (...) {}
-        }).detach();
+        });
     }
 
 
@@ -5475,10 +5633,10 @@ namespace standalone_license
     void shutdown()
     {
         s_stop.store(true, std::memory_order_release);
-        if (s_heartbeat_thread.joinable())
-            s_heartbeat_thread.join();
-        if (s_srv_refresh_thread.joinable())
-            s_srv_refresh_thread.join();
+        while (!s_heartbeat_done.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        while (!s_srv_refresh_done.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         reset_arc_fetch_state();
         reset_activation_completed_at();
         reset_license_clients();

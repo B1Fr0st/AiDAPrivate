@@ -13,6 +13,7 @@
 #include "standalone_chat.hpp"
 #include "command_sessions.hpp"
 #include "../helpers/globals.h"
+#include "../infra/work_queue.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -679,7 +680,8 @@ static tool_result_t tool_run_command(const json& params)
         std::string session_id_copy = sess->id;
         command_sessions::command_session_t* raw = command_sessions::register_session(std::move(sess));
 
-        raw->reader_thread = std::thread([raw, timeout_ms, wait]() {
+        raw->reader_done.store(false, std::memory_order_release);
+        if (!work_queue::post([raw, timeout_ms, wait]() {
             auto start = std::chrono::steady_clock::now();
             auto drain_pipe = [&](HANDLE h, std::string& dest) -> bool {
                 DWORD avail = 0;
@@ -737,11 +739,16 @@ static tool_result_t tool_run_command(const json& params)
             output_log::push(bottom_tab_t::sandbox_log,
                 "[run_command:" + raw->id + "] exit=" + std::to_string(exit_code) +
                 (raw->timed_out.load() ? " (TIMED OUT)" : ""));
-        });
+            raw->reader_done.store(true, std::memory_order_release);
+        }))
+        {
+            raw->reader_done.store(true, std::memory_order_release);
+            raw->alive.store(false);
+        }
 
         if (wait) {
-            if (raw->reader_thread.joinable())
-                raw->reader_thread.join();
+            while (!raw->reader_done.load(std::memory_order_acquire))
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
             std::string out_copy, err_copy;
             int64_t exit_code = 0;

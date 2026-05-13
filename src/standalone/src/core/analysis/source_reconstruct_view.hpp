@@ -1,12 +1,21 @@
 #pragma once
 
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <shlobj.h>
+#include <objbase.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
+#include "../helpers/helpers.h"
 #include "source_reconstructor.hpp"
 #include "ui_anim.hpp"
 #include "theme.hpp"
@@ -15,6 +24,7 @@ namespace source_reconstruct_view {
 
 struct state_t {
 	bool   open = false;
+	bool   prev_open = false;
 	float  fade = 0.f;
 	float  scale_anim = 0.f;
 	float  anim_time = 0.f;
@@ -33,22 +43,87 @@ inline state_t g_state;
 
 inline bool is_open() { return g_state.open || g_state.fade > 0.01f; }
 
+inline void apply_default_output_dir() {
+	if (g_state.output_dir[0] != '\0') return;
+	char home[MAX_PATH] = {};
+	DWORD got = GetEnvironmentVariableA("USERPROFILE", home, MAX_PATH);
+	if (got == 0 || got >= MAX_PATH) {
+		const char* fallback = std::getenv("USERPROFILE");
+		if (fallback && *fallback) {
+			std::strncpy(home, fallback, MAX_PATH - 1);
+		}
+	}
+	if (home[0] == '\0') {
+		std::strncpy(g_state.output_dir, "C:\\AiDA_Reconstruction", sizeof(g_state.output_dir) - 1);
+		return;
+	}
+	std::snprintf(g_state.output_dir, sizeof(g_state.output_dir),
+		"%s\\Documents\\AiDA_Reconstruction", home);
+}
+
 inline void open() {
 	g_state.open = true;
 	g_state.started = false;
 	g_state.progress_display = 0.f;
 	g_state.pipeline_line_anim = 0.f;
 	for (int i = 0; i < 8; ++i) g_state.stage_dot_pulse[i] = 0.f;
+	apply_default_output_dir();
 }
 
 inline void close() {
 	g_state.open = false;
 }
 
+inline bool pick_output_directory(HWND owner, char* buf, size_t buf_size) {
+	if (!buf || buf_size < 4) return false;
+	HRESULT co_init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+	bool need_uninit = SUCCEEDED(co_init);
+
+	IFileOpenDialog* dialog = nullptr;
+	HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+		IID_IFileOpenDialog, reinterpret_cast<void**>(&dialog));
+	if (FAILED(hr) || !dialog) {
+		if (need_uninit) CoUninitialize();
+		return false;
+	}
+
+	DWORD options = 0;
+	if (SUCCEEDED(dialog->GetOptions(&options))) {
+		dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_PATHMUSTEXIST | FOS_FORCEFILESYSTEM);
+	}
+	dialog->SetTitle(L"Select Output Directory");
+
+	bool ok = false;
+	hr = dialog->Show(owner);
+	if (SUCCEEDED(hr)) {
+		IShellItem* item = nullptr;
+		if (SUCCEEDED(dialog->GetResult(&item)) && item) {
+			PWSTR path = nullptr;
+			if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+				int needed = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr, nullptr);
+				if (needed > 0 && static_cast<size_t>(needed) <= buf_size) {
+					WideCharToMultiByte(CP_UTF8, 0, path, -1, buf,
+						static_cast<int>(buf_size), nullptr, nullptr);
+					ok = true;
+				}
+				CoTaskMemFree(path);
+			}
+			item->Release();
+		}
+	}
+	dialog->Release();
+	if (need_uninit) CoUninitialize();
+	return ok;
+}
+
 inline void render(float alpha, float ar, float ag, float ab) {
 	auto& st = g_state;
 	float dt = ImGui::GetIO().DeltaTime;
 	st.anim_time += dt;
+
+	bool opening_transition = (st.open && !st.prev_open);
+	st.prev_open = st.open;
+	if (opening_transition) apply_default_output_dir();
 
 	float fade_target = st.open ? 1.f : 0.f;
 	st.fade = ui_anim::smooth_lerp(st.fade, fade_target, 10.f, dt);
@@ -58,10 +133,37 @@ inline void render(float alpha, float ar, float ag, float ab) {
 	st.scale_anim = ui_anim::smooth_lerp(st.scale_anim, scale_target, 12.f, dt);
 
 	float fa = alpha * st.fade;
-	ImDrawList* dl = ImGui::GetForegroundDrawList();
 	ImVec2 vp = ImGui::GetMainViewport()->Size;
 
+	ImGui::SetNextWindowPos(ImVec2(0.f, 0.f));
+	ImGui::SetNextWindowSize(vp);
+	ImGui::SetNextWindowBgAlpha(0.0f);
+	if (opening_transition) ImGui::SetNextWindowFocus();
+	ImGuiWindowFlags modal_flags =
+		ImGuiWindowFlags_NoTitleBar |
+		ImGuiWindowFlags_NoResize |
+		ImGuiWindowFlags_NoMove |
+		ImGuiWindowFlags_NoCollapse |
+		ImGuiWindowFlags_NoScrollbar |
+		ImGuiWindowFlags_NoScrollWithMouse |
+		ImGuiWindowFlags_NoBackground |
+		ImGuiWindowFlags_NoSavedSettings |
+		ImGuiWindowFlags_NoDocking;
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
+	bool window_open = ImGui::Begin("##source_reconstruct_modal", nullptr, modal_flags);
+	ImGui::PopStyleVar(2);
+	if (!window_open) {
+		ImGui::End();
+		return;
+	}
+
+	bool blocker_clicked = false;
+
+	ImDrawList* dl = ImGui::GetWindowDrawList();
+
 	const auto& _t = themes::resolved;
+	const auto& _ut = aida::ui::resolved();
 	const auto _ta = [fa](ImU32 c) -> ImU32 {
 		return ui_anim::theme_alpha(c, fa);
 	};
@@ -104,22 +206,46 @@ inline void render(float alpha, float ar, float ag, float ab) {
 		ImVec2(dx, dy), ImVec2(dx + sw, dy + 3.f),
 		accent, accent_dim, accent_dim, accent);
 
-	const float pad = 20.f;
-	float cur_y = dy + 12.f;
+	const float pad = 22.f;
+	float cur_y = dy + 16.f;
 
 	{
-		const char* title = "Reconstruct Source";
-		ImVec2 tsz = ImGui::CalcTextSize(title);
-		dl->AddText(ImVec2(dx + pad, cur_y), text_primary, title);
+		const float icon_sz = 22.f;
+		float icon_x = dx + pad;
+		float icon_y = cur_y + 1.f;
+		ImU32 ic_top = aida::ui::with_alpha(_ut.accent_grad_top, fa);
+		ImU32 ic_bot = aida::ui::with_alpha(_ut.accent_grad_bot, fa);
+		ImU32 ic_flat = aida::ui::mix(ic_top, ic_bot, 0.5f);
+		dl->AddRectFilled(ImVec2(icon_x, icon_y),
+			ImVec2(icon_x + icon_sz, icon_y + icon_sz), ic_flat, 6.f);
+		dl->AddRect(ImVec2(icon_x, icon_y),
+			ImVec2(icon_x + icon_sz, icon_y + icon_sz),
+			aida::ui::with_alpha(_ut.accent_hover, fa * 0.85f), 6.f, 0, 1.2f);
+		ImU32 glyph_col = aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), fa);
+		float gy0 = icon_y + 6.f;
+		float gx0 = icon_x + 6.f;
+		float gw = icon_sz - 12.f;
+		dl->AddLine(ImVec2(gx0, gy0), ImVec2(gx0 + gw, gy0), glyph_col, 1.5f);
+		dl->AddLine(ImVec2(gx0, gy0 + 4.f), ImVec2(gx0 + gw - 2.f, gy0 + 4.f), glyph_col, 1.5f);
+		dl->AddLine(ImVec2(gx0, gy0 + 8.f), ImVec2(gx0 + gw - 4.f, gy0 + 8.f), glyph_col, 1.5f);
 
-		float close_x = dx + sw - pad - 16.f;
-		ImVec2 cmin(close_x, cur_y);
-		ImVec2 cmax(close_x + 16.f, cur_y + 16.f);
+		ImFont* title_font = aida::ui::fonts::body_strong();
+		if (!title_font) title_font = ImGui::GetFont();
+		const char* title = "Reconstruct Source";
+		ImVec2 tsz = title_font->CalcTextSizeA(title_font->FontSize, FLT_MAX, 0.f, title);
+		dl->AddText(title_font, title_font->FontSize,
+			ImVec2(icon_x + icon_sz + 10.f, icon_y + (icon_sz - tsz.y) * 0.5f),
+			text_primary, title);
+
+		float close_x = dx + sw - pad - 18.f;
+		float close_y = icon_y + (icon_sz - 16.f) * 0.5f;
+		ImVec2 cmin(close_x, close_y);
+		ImVec2 cmax(close_x + 16.f, close_y + 16.f);
 		bool close_hov = ImGui::IsMouseHoveringRect(cmin, cmax);
 		ImU32 close_col = close_hov ? aida::ui::with_alpha(aida::ui::resolved().error, 0.86f * fa)
 		                            : _ta(_t.text_secondary);
-		dl->AddLine(ImVec2(close_x + 2, cur_y + 2), ImVec2(close_x + 14, cur_y + 14), close_col, 2.f);
-		dl->AddLine(ImVec2(close_x + 14, cur_y + 2), ImVec2(close_x + 2, cur_y + 14), close_col, 2.f);
+		dl->AddLine(ImVec2(close_x + 2, close_y + 2), ImVec2(close_x + 14, close_y + 14), close_col, 2.f);
+		dl->AddLine(ImVec2(close_x + 14, close_y + 2), ImVec2(close_x + 2, close_y + 14), close_col, 2.f);
 
 		if (close_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 			if (source_reconstructor::is_running())
@@ -127,40 +253,77 @@ inline void render(float alpha, float ar, float ag, float ab) {
 			st.open = false;
 		}
 
-		cur_y += tsz.y + 12.f;
+		cur_y = icon_y + icon_sz + 18.f;
 	}
 
 	{
-		dl->AddText(ImVec2(dx + pad, cur_y), text_secondary, "Output Directory");
-		cur_y += 18.f;
+		ImFont* lbl_font = aida::ui::fonts::body_em();
+		if (!lbl_font) lbl_font = ImGui::GetFont();
+		dl->AddText(lbl_font, lbl_font->FontSize,
+			ImVec2(dx + pad, cur_y), text_secondary, "Output Directory");
+		cur_y += lbl_font->FontSize + 10.f;
 
-		float input_w = sw - pad * 2.f;
-		float input_h = 28.f;
+		float browse_w = 92.f;
+		float gap = 8.f;
+		float input_h = 34.f;
+		float input_w = sw - pad * 2.f - browse_w - gap;
 		ImVec2 imin(dx + pad, cur_y);
 		ImVec2 imax(dx + pad + input_w, cur_y + input_h);
 
-		dl->AddRectFilled(imin, imax, _ta(_t.bg_base), 4.f);
-		dl->AddRect(imin, imax, _ta(ui_anim::lighten(_t.panel_bg, 12)), 4.f, 0, 1.f);
+		dl->AddRectFilled(imin, imax, _ta(_ut.bg_elevated), 8.f);
+		dl->AddRect(imin, imax, _ta(ui_anim::lighten(_t.panel_bg, 14)), 8.f, 0, 1.2f);
 
-		ImGui::SetCursorScreenPos(ImVec2(imin.x + 6.f, imin.y + 4.f));
+		ImGui::SetCursorScreenPos(ImVec2(imin.x + 4.f, imin.y + 2.f));
 		ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(0, 0, 0, 0));
 		ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
-		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
-		ImGui::PushItemWidth(input_w - 16.f);
+		ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, aida::ui::with_alpha(_ut.accent_dim, fa));
+		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 8.f));
+		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
+		ImGui::PushItemWidth(input_w - 8.f);
 
-		if (!st.started)
-			ImGui::InputText("##recon_outdir", st.output_dir, sizeof(st.output_dir), ImGuiInputTextFlags_None);
-		else {
+		if (!st.started) {
+			ImGui::InputTextWithHint("##recon_outdir", "C:\\path\\to\\output", st.output_dir,
+				sizeof(st.output_dir), ImGuiInputTextFlags_None);
+		} else {
 			ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_secondary));
-			ImGui::InputText("##recon_outdir", st.output_dir, sizeof(st.output_dir), ImGuiInputTextFlags_ReadOnly);
+			ImGui::InputText("##recon_outdir", st.output_dir, sizeof(st.output_dir),
+				ImGuiInputTextFlags_ReadOnly);
 			ImGui::PopStyleColor();
 		}
 
 		ImGui::PopItemWidth();
-		ImGui::PopStyleVar();
-		ImGui::PopStyleColor(2);
+		ImGui::PopStyleVar(2);
+		ImGui::PopStyleColor(3);
 
-		cur_y += input_h + 8.f;
+		float browse_x = imax.x + gap;
+		ImVec2 bmin(browse_x, cur_y);
+		ImVec2 bmax(browse_x + browse_w, cur_y + input_h);
+		bool br_hov = !st.started && ImGui::IsMouseHoveringRect(bmin, bmax);
+		ImU32 br_top = br_hov ? aida::ui::with_alpha(_ut.accent_grad_top, fa * 0.95f)
+		                       : aida::ui::with_alpha(_ut.accent_dim, fa * 0.55f);
+		ImU32 br_bot = br_hov ? aida::ui::with_alpha(_ut.accent_grad_bot, fa * 0.95f)
+		                       : aida::ui::with_alpha(_ut.accent_dim, fa * 0.30f);
+		ImU32 br_flat = aida::ui::mix(br_top, br_bot, 0.5f);
+		dl->AddRectFilled(bmin, bmax, br_flat, 8.f);
+		dl->AddRect(bmin, bmax,
+			br_hov ? aida::ui::with_alpha(_ut.accent_hover, fa * 0.92f)
+			       : aida::ui::with_alpha(_ut.accent_dim, fa * 0.75f),
+			8.f, 0, 1.0f);
+		ImFont* br_font = aida::ui::fonts::body_em();
+		if (!br_font) br_font = ImGui::GetFont();
+		const char* br_lbl = "Browse...";
+		ImVec2 bsz = br_font->CalcTextSizeA(br_font->FontSize, FLT_MAX, 0.f, br_lbl);
+		dl->AddText(br_font, br_font->FontSize,
+			ImVec2(browse_x + (browse_w - bsz.x) * 0.5f,
+			       cur_y + (input_h - bsz.y) * 0.5f),
+			br_hov ? aida::ui::with_alpha(IM_COL32(255, 255, 255, 250), fa)
+			       : aida::ui::with_alpha(_t.text_primary, fa * 0.92f),
+			br_lbl);
+		if (br_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			pick_output_directory(::g_hwnd, st.output_dir, sizeof(st.output_dir));
+		}
+
+		cur_y += input_h + 10.f;
 	}
 
 	auto recon_stage = source_reconstructor::get_stage();
@@ -369,8 +532,8 @@ inline void render(float alpha, float ar, float ag, float ab) {
 		if (!st.started) {
 			bool has_output = (st.output_dir[0] != '\0');
 
-			float btn_w = 120.f;
-			float btn_h = 32.f;
+			float btn_w = 140.f;
+			float btn_h = 36.f;
 			float btn_x = dx + sw * 0.5f - btn_w * 0.5f;
 			float btn_y = btn_area_y;
 
@@ -378,31 +541,32 @@ inline void render(float alpha, float ar, float ag, float ab) {
 			ImVec2 bmax(btn_x + btn_w, btn_y + btn_h);
 			bool bhov = has_output && ImGui::IsMouseHoveringRect(bmin, bmax);
 
-			const auto& th_btn_start = aida::ui::resolved();
-			ImU32 btn_bg;
-			if (!has_output)
-				btn_bg = _ta(_t.panel_header);
-			else if (bhov)
-				btn_bg = aida::ui::with_alpha(th_btn_start.accent_hover, 0.86f * fa);
-			else
-				btn_bg = aida::ui::with_alpha(th_btn_start.accent_u32, 0.78f * fa);
-
-			dl->AddRectFilled(bmin, bmax, btn_bg, 8.f);
-			if (has_output) {
-				dl->AddRectFilledMultiColor(bmin,
-					ImVec2(bmax.x, bmin.y + 2.f),
-					aida::ui::with_alpha(th_btn_start.accent_grad_top, fa),
-					aida::ui::with_alpha(th_btn_start.accent_grad_top, fa),
-					aida::ui::with_alpha(th_btn_start.accent_grad_bot, fa),
-					aida::ui::with_alpha(th_btn_start.accent_grad_bot, fa));
-			}
+			float button_alpha = has_output ? fa : (fa * _ut.disabled_alpha);
+			float bhov_f = bhov ? 1.f : 0.f;
+			ImU32 idle_top = aida::ui::with_alpha(_ut.accent_dim, 0.55f);
+			ImU32 idle_bot = aida::ui::with_alpha(_ut.accent_dim, 0.30f);
+			ImU32 hov_top  = aida::ui::with_alpha(_ut.accent_grad_top, 0.95f);
+			ImU32 hov_bot  = aida::ui::with_alpha(_ut.accent_grad_bot, 0.95f);
+			ImU32 cur_top  = aida::ui::mix(idle_top, hov_top, bhov_f);
+			ImU32 cur_bot  = aida::ui::mix(idle_bot, hov_bot, bhov_f);
+			ImU32 btn_flat = aida::ui::mix(cur_top, cur_bot, 0.5f);
+			dl->AddRectFilled(bmin, bmax, aida::ui::with_alpha(btn_flat, button_alpha), 6.f);
+			ImU32 br_idle = aida::ui::with_alpha(_ut.accent_dim, 0.75f);
+			ImU32 br_hov  = aida::ui::with_alpha(_ut.accent_hover, 0.92f);
+			ImU32 btn_border = aida::ui::mix(br_idle, br_hov, bhov_f);
+			dl->AddRect(bmin, bmax, aida::ui::with_alpha(btn_border, button_alpha), 6.f, 0, 1.0f);
 
 			const char* start_lbl = "Start";
-			ImVec2 slsz = ImGui::CalcTextSize(start_lbl);
-			ImU32 start_text_col = has_output ? aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), 0.94f * fa)
-			                                  : _ta(_t.text_dim);
-			dl->AddText(ImVec2(btn_x + btn_w * 0.5f - slsz.x * 0.5f,
-			                    btn_y + btn_h * 0.5f - slsz.y * 0.5f), start_text_col, start_lbl);
+			ImFont* st_font = aida::ui::fonts::body_em();
+			if (!st_font) st_font = ImGui::GetFont();
+			ImVec2 slsz = st_font->CalcTextSizeA(st_font->FontSize, FLT_MAX, 0.f, start_lbl);
+			ImU32 tc_idle = aida::ui::with_alpha(_t.text_primary, 0.92f);
+			ImU32 tc_hov  = aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), 0.96f);
+			ImU32 start_text_col = aida::ui::with_alpha(aida::ui::mix(tc_idle, tc_hov, bhov_f), button_alpha);
+			dl->AddText(st_font, st_font->FontSize,
+				ImVec2(btn_x + (btn_w - slsz.x) * 0.5f,
+				       btn_y + (btn_h - slsz.y) * 0.5f),
+				start_text_col, start_lbl);
 
 			if (bhov && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !source_reconstructor::is_running()) {
 				auto mods = driver_bridge::enumerate_modules();
@@ -490,7 +654,19 @@ inline void render(float alpha, float ar, float ag, float ab) {
 				source_reconstructor::cancel();
 			st.open = false;
 		}
+
+		bool inside_dialog = (ImGui::GetMousePos().x >= dmin.x &&
+		                      ImGui::GetMousePos().x <= dmax.x &&
+		                      ImGui::GetMousePos().y >= dmin.y &&
+		                      ImGui::GetMousePos().y <= dmax.y);
+		(void)blocker_clicked;
+		if (!inside_dialog && !source_reconstructor::is_running() &&
+		    ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsAnyItemActive()) {
+			st.open = false;
+		}
 	}
+
+	ImGui::End();
 }
 
 }

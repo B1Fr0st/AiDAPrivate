@@ -12,7 +12,9 @@
 #include <openssl/x509v3.h>
 
 #include <filesystem>
+#include <fstream>
 #include <mutex>
+#include <vector>
 
 #pragma comment(lib, "crypt32.lib")
 
@@ -116,22 +118,42 @@ bool generate_root_ca(root_ca_t& ca) {
 }
 
 
-bool load_root_ca(const std::string& key_path, const std::string& cert_path, root_ca_t& ca) {
-    FILE* kf = nullptr;
-    fopen_s(&kf, key_path.c_str(), "rb");
-    if (!kf) return false;
+static bool read_file_bytes(const std::string& path, std::vector<uint8_t>& out) {
+    std::ifstream in(std::filesystem::u8path(path), std::ios::binary | std::ios::ate);
+    if (!in) return false;
+    std::streamsize sz = in.tellg();
+    if (sz <= 0 || sz > (std::streamsize)(64 * 1024 * 1024)) return false;
+    in.seekg(0, std::ios::beg);
+    out.resize(static_cast<size_t>(sz));
+    if (!in.read(reinterpret_cast<char*>(out.data()), sz)) return false;
+    return true;
+}
 
-    EVP_PKEY* raw_key = PEM_read_PrivateKey(kf, nullptr, nullptr, nullptr);
-    fclose(kf);
+static bool write_file_bytes(const std::string& path, const uint8_t* data, size_t len) {
+    std::ofstream out(std::filesystem::u8path(path), std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(len));
+    return out.good();
+}
+
+bool load_root_ca(const std::string& key_path, const std::string& cert_path, root_ca_t& ca) {
+    std::vector<uint8_t> key_bytes;
+    if (!read_file_bytes(key_path, key_bytes) || key_bytes.empty()) return false;
+
+    BIO* kbio = BIO_new_mem_buf(key_bytes.data(), static_cast<int>(key_bytes.size()));
+    if (!kbio) return false;
+    EVP_PKEY* raw_key = PEM_read_bio_PrivateKey(kbio, nullptr, nullptr, nullptr);
+    BIO_free(kbio);
     if (!raw_key) return false;
     ca.key.reset(raw_key);
 
-    FILE* cf = nullptr;
-    fopen_s(&cf, cert_path.c_str(), "rb");
-    if (!cf) return false;
+    std::vector<uint8_t> cert_bytes;
+    if (!read_file_bytes(cert_path, cert_bytes) || cert_bytes.empty()) return false;
 
-    X509* raw_cert = PEM_read_X509(cf, nullptr, nullptr, nullptr);
-    fclose(cf);
+    BIO* cbio = BIO_new_mem_buf(cert_bytes.data(), static_cast<int>(cert_bytes.size()));
+    if (!cbio) return false;
+    X509* raw_cert = PEM_read_bio_X509(cbio, nullptr, nullptr, nullptr);
+    BIO_free(cbio);
     if (!raw_cert) return false;
     ca.cert.reset(raw_cert);
 
@@ -142,27 +164,47 @@ bool load_root_ca(const std::string& key_path, const std::string& cert_path, roo
 bool save_root_ca(const root_ca_t& ca, const std::string& key_path, const std::string& cert_path) {
     if (!ca.valid) return false;
 
-
-    std::filesystem::path kp(key_path);
+    std::filesystem::path kp(std::filesystem::u8path(key_path));
     if (kp.has_parent_path())
         std::filesystem::create_directories(kp.parent_path());
 
-    FILE* kf = nullptr;
-    fopen_s(&kf, key_path.c_str(), "wb");
-    if (!kf) return false;
+    BIO* kbio = BIO_new(BIO_s_mem());
+    if (!kbio) return false;
+    int wrote = PEM_write_bio_PrivateKey(kbio, ca.key.get(), nullptr, nullptr, 0, nullptr, nullptr);
+    if (!wrote) {
+        BIO_free(kbio);
+        return false;
+    }
+    BUF_MEM* km = nullptr;
+    BIO_get_mem_ptr(kbio, &km);
+    if (!km || km->length == 0 ||
+        !write_file_bytes(key_path, reinterpret_cast<const uint8_t*>(km->data), km->length)) {
+        BIO_free(kbio);
+        return false;
+    }
+    BIO_free(kbio);
 
+    std::filesystem::path cp(std::filesystem::u8path(cert_path));
+    if (cp.has_parent_path())
+        std::filesystem::create_directories(cp.parent_path());
 
-    int ret = PEM_write_PrivateKey(kf, ca.key.get(), nullptr, nullptr, 0, nullptr, nullptr);
-    fclose(kf);
-    if (!ret) return false;
+    BIO* cbio = BIO_new(BIO_s_mem());
+    if (!cbio) return false;
+    wrote = PEM_write_bio_X509(cbio, ca.cert.get());
+    if (!wrote) {
+        BIO_free(cbio);
+        return false;
+    }
+    BUF_MEM* cm = nullptr;
+    BIO_get_mem_ptr(cbio, &cm);
+    if (!cm || cm->length == 0 ||
+        !write_file_bytes(cert_path, reinterpret_cast<const uint8_t*>(cm->data), cm->length)) {
+        BIO_free(cbio);
+        return false;
+    }
+    BIO_free(cbio);
 
-    FILE* cf = nullptr;
-    fopen_s(&cf, cert_path.c_str(), "wb");
-    if (!cf) return false;
-
-    ret = PEM_write_X509(cf, ca.cert.get());
-    fclose(cf);
-    return ret > 0;
+    return true;
 }
 
 

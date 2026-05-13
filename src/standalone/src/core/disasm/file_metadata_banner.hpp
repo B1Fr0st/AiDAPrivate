@@ -202,32 +202,12 @@ namespace file_metadata_banner {
 		}
 
 		inline std::string format_application_type(uint16_t machine, uint16_t characteristics, uint16_t subsystem) {
+			(void)machine;
 			const bool is_dll = (characteristics & IMAGE_FILE_DLL) != 0;
 			const bool is_sys = (subsystem == IMAGE_SUBSYSTEM_NATIVE);
-			const char* bitness = "64bit";
-			switch (machine) {
-				case IMAGE_FILE_MACHINE_I386:
-				case IMAGE_FILE_MACHINE_ARM:
-				case IMAGE_FILE_MACHINE_ARMNT:
-					bitness = "32bit";
-					break;
-				default:
-					bitness = "64bit";
-					break;
-			}
-			if (is_sys && is_dll) {
-				char buf[64] = {};
-				std::snprintf(buf, sizeof(buf), "Driver %s", bitness);
-				return std::string(buf);
-			}
-			if (is_dll) {
-				char buf[64] = {};
-				std::snprintf(buf, sizeof(buf), "DLL %s", bitness);
-				return std::string(buf);
-			}
-			char buf[64] = {};
-			std::snprintf(buf, sizeof(buf), "Executable %s", bitness);
-			return std::string(buf);
+			if (is_sys && is_dll) return std::string("Driver");
+			if (is_dll) return std::string("DLL");
+			return std::string("Executable");
 		}
 
 		inline std::string format_pe_format(uint16_t machine) {
@@ -1064,12 +1044,12 @@ namespace file_metadata_banner {
 
 			if (ready) {
 				std::string vsize_hex = format_hex_padded(section_vsize, 8);
-				std::string vsize_dec = format_decimal_padded(section_vsize, 7);
+				std::string vsize_dec = format_decimal_padded(section_vsize, 6);
 				std::snprintf(buf, sizeof(buf), "; Virtual size                  : %s ( %s)", vsize_hex.c_str(), vsize_dec.c_str());
 				push_text_line(out, section_seg_name, section_va, buf, c_comment, false);
 
 				std::string rsize_hex = format_hex_padded(section_rsize, 8);
-				std::string rsize_dec = format_decimal_padded(section_rsize, 7);
+				std::string rsize_dec = format_decimal_padded(section_rsize, 6);
 				std::snprintf(buf, sizeof(buf), "; Section size in file          : %s ( %s)", rsize_hex.c_str(), rsize_dec.c_str());
 				push_text_line(out, section_seg_name, section_va, buf, c_comment, false);
 

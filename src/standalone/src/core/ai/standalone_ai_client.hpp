@@ -139,7 +139,6 @@ public:
 private:
     const settings_sa_t& _settings;
 
-    std::thread            _worker;
     std::mutex             _worker_mtx;
     std::atomic<bool>      _task_done{true};
     std::atomic<bool>      _cancelled{false};

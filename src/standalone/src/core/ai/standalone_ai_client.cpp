@@ -16,6 +16,7 @@
 #include "../mcp/mcp_client.hpp"
 #include "../session/session_store.hpp"
 #include "../helpers/globals.h"
+#include "../infra/work_queue.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -131,8 +132,8 @@ standalone_ai_client_t::~standalone_ai_client_t()
 {
     cancel();
     std::lock_guard<std::mutex> lk(_worker_mtx);
-    if (_worker.joinable())
-        _worker.join();
+    while (!_task_done.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
 
 
@@ -181,8 +182,8 @@ void standalone_ai_client_t::chat_async(
     }
 
     std::lock_guard<std::mutex> lk(_worker_mtx);
-    if (_worker.joinable())
-        _worker.join();
+    while (!_task_done.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
     _cancelled = false;
     _task_done = false;
@@ -190,7 +191,7 @@ void standalone_ai_client_t::chat_async(
     auto prompt = build_chat_prompt(user_message, history);
 
 
-    _worker = std::thread([this, prompt, on_complete, on_chunk]() {
+    work_queue::post([this, prompt, on_complete, on_chunk]() {
         std::string result;
         try {
 

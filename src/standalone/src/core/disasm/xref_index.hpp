@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "function_index.hpp"
 #include "functions_panel.hpp"
 #include "pe_parser.hpp"
 #include "xref_engine.hpp"
@@ -45,10 +46,37 @@ namespace xref_index {
 			std::string                                             name;
 			uint64_t                                                base = 0;
 			uint32_t                                                size = 0;
+			bool                                                    is_static_pe = false;
+			std::string                                             static_pe_path;
 			std::vector<pe_parser::section_info_t>                  sections;
 			std::unordered_map<uint64_t, std::vector<annotation_t>> to_index;
 			std::atomic<uint32_t>                                   state{static_cast<uint32_t>(build_state_t::idle)};
 		};
+
+		inline bool xref_static_pe_active() {
+			if (driver_bridge::attached_pid() != 0) return false;
+			if (!g_disasm.file.loaded) return false;
+			if (g_disasm.file.path.empty()) return false;
+			if (g_disasm.file.path.compare(0, 7, "live://") == 0) return false;
+			if (g_disasm.file.image_base == 0) return false;
+			return true;
+		}
+
+		inline bool fetch_static_pe_module(std::string& out_name, uint64_t& out_base,
+			uint32_t& out_size, std::string& out_path)
+		{
+			if (!xref_static_pe_active()) return false;
+			uint64_t img_sz = static_analysis::total_image_size(g_disasm.file);
+			if (img_sz == 0) return false;
+			if (img_sz > 0xFFFFFFFFull) img_sz = 0xFFFFFFFFull;
+			out_base = g_disasm.file.image_base;
+			out_size = static_cast<uint32_t>(img_sz);
+			out_name = g_disasm.file.filename.empty()
+				? g_disasm.file.path
+				: g_disasm.file.filename;
+			out_path = g_disasm.file.path;
+			return true;
+		}
 
 		struct module_range_t {
 			uint64_t                          start_va = 0;
@@ -166,12 +194,42 @@ namespace xref_index {
 		inline std::vector<functions_panel::function_entry_t> snapshot_functions(uint64_t module_base, uint32_t module_size) {
 			std::vector<functions_panel::function_entry_t> out;
 			auto& fs = functions_panel::state();
-			if (!fs.ready.load(std::memory_order_acquire)) return out;
-			std::lock_guard<std::mutex> lk(fs.mtx);
-			out.reserve(fs.entries.size());
-			for (const auto& e : fs.entries) {
-				if (e.address >= module_base && e.address < module_base + module_size)
-					out.push_back(e);
+			if (fs.ready.load(std::memory_order_acquire)) {
+				std::lock_guard<std::mutex> lk(fs.mtx);
+				out.reserve(fs.entries.size());
+				for (const auto& e : fs.entries) {
+					if (e.address >= module_base && e.address < module_base + module_size)
+						out.push_back(e);
+				}
+			}
+			if (out.empty()) {
+				auto& fc = function_index::detail::cache();
+				std::shared_lock<std::shared_mutex> lk(fc.mutex);
+				out.reserve(fc.sorted_starts.size());
+				for (uint64_t start : fc.sorted_starts) {
+					if (start < module_base) continue;
+					if (start >= module_base + module_size) continue;
+					functions_panel::function_entry_t fe;
+					fe.address = start;
+					auto bit = fc.by_start.find(start);
+					if (bit != fc.by_start.end()) {
+						uint64_t end = bit->second.end;
+						if (end > start && (end - start) <= 0xFFFFFFFFull) {
+							fe.size = static_cast<uint32_t>(end - start);
+						}
+						fe.name = bit->second.display_name;
+						fe.section = bit->second.section;
+					}
+					if (fe.name.empty()) {
+						auto sit = fc.synthetic_names.find(start);
+						if (sit != fc.synthetic_names.end() && !sit->second.empty()) {
+							fe.name = sit->second;
+						} else {
+							fe.name = function_index::detail::make_synthetic_sub(start);
+						}
+					}
+					out.push_back(std::move(fe));
+				}
 			}
 			std::sort(out.begin(), out.end(),
 				[](const functions_panel::function_entry_t& a, const functions_panel::function_entry_t& b) {
@@ -180,14 +238,183 @@ namespace xref_index {
 			return out;
 		}
 
-		inline void build_module_to_index(std::shared_ptr<module_index_t> mod) {
-			if (!mod) return;
-
-			if (driver_bridge::attached_pid() == 0) {
-				mod->state.store(static_cast<uint32_t>(build_state_t::failed), std::memory_order_release);
-				return;
+		inline bool build_static_pe_pe_info(const std::string& disk_path,
+			functions_panel::detail::disk_pe_view_t& out_view,
+			pe_parser::pe_info_t& out_pe)
+		{
+			if (disk_path.empty()) return false;
+			if (!functions_panel::detail::disk_read_whole_file(disk_path, out_view.raw)) return false;
+			if (!functions_panel::detail::disk_parse_pe(out_view)) return false;
+			out_pe.image_base = out_view.image_base;
+			out_pe.entry_point = (out_view.entry_rva != 0)
+				? (out_view.image_base + out_view.entry_rva)
+				: 0;
+			out_pe.size_of_image = out_view.size_of_image;
+			out_pe.is_64bit = out_view.is_pe32_plus;
+			out_pe.export_dir_rva = out_view.export_dir_rva;
+			out_pe.export_dir_size = out_view.export_dir_size;
+			out_pe.sections.reserve(out_view.sections.size());
+			for (const auto& s : out_view.sections) {
+				pe_parser::section_info_t si;
+				si.name = s.name;
+				si.virtual_address = s.virtual_address;
+				si.virtual_size = (s.virtual_size != 0) ? s.virtual_size : s.raw_size;
+				si.raw_size = s.raw_size;
+				si.characteristics = s.characteristics;
+				out_pe.sections.push_back(std::move(si));
 			}
+			if (!out_view.raw.empty() && out_view.raw.size() >= sizeof(IMAGE_DOS_HEADER)) {
+				const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(out_view.raw.data());
+				uint32_t pe_off = static_cast<uint32_t>(dos->e_lfanew);
+				if (out_view.is_pe32_plus
+					&& pe_off + sizeof(IMAGE_NT_HEADERS64) <= out_view.raw.size())
+				{
+					const auto* nt64 = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+						out_view.raw.data() + pe_off);
+					out_pe.subsystem = nt64->OptionalHeader.Subsystem;
+					out_pe.characteristics = nt64->FileHeader.Characteristics;
+				}
+				else if (!out_view.is_pe32_plus
+					&& pe_off + sizeof(IMAGE_NT_HEADERS32) <= out_view.raw.size())
+				{
+					const auto* nt32 = reinterpret_cast<const IMAGE_NT_HEADERS32*>(
+						out_view.raw.data() + pe_off);
+					out_pe.subsystem = nt32->OptionalHeader.Subsystem;
+					out_pe.characteristics = nt32->FileHeader.Characteristics;
+				}
+			}
+			return true;
+		}
 
+		inline void scan_block_for_xrefs(
+			const uint8_t* data, size_t length, uint64_t base_va,
+			const std::vector<functions_panel::function_entry_t>& fns,
+			const std::vector<pe_parser::section_info_t>& sections,
+			uint64_t module_base, const std::string& module_name,
+			std::unordered_map<uint64_t, std::vector<annotation_t>>& map)
+		{
+			if (!data || length == 0) return;
+			int sz = static_cast<int>(length);
+			int pos = 0;
+			while (pos < sz) {
+				int avail = sz - pos;
+				if (avail > 15) avail = 15;
+
+				uint64_t ins_addr = base_va + static_cast<uint64_t>(pos);
+				AsmInstr ins = zydis_decode_one(data + pos, avail, ins_addr);
+				if (ins.len <= 0) {
+					pos += 1;
+					continue;
+				}
+
+				uint64_t target = 0;
+				if (xref_engine::detail::extract_target(data + pos, ins.len, ins_addr, ins, target)) {
+					xref_engine::xref_type_t t = xref_engine::detail::classify_instruction(ins);
+
+					annotation_t ann;
+					ann.kind = classify_kind(t);
+					ann.edge = classify_edge(t);
+					ann.up = (ins_addr < target);
+					ann.source_addr = ins_addr;
+					ann.source_label = resolve_source_label(ins_addr, fns, sections, module_base, module_name);
+
+					map[target].push_back(std::move(ann));
+				}
+
+				pos += ins.len;
+			}
+		}
+
+		inline bool section_is_code(uint32_t characteristics) {
+			const uint32_t exec_mask = 0x20000000u;
+			const uint32_t code_mask = 0x00000020u;
+			return (characteristics & exec_mask) != 0
+				|| (characteristics & code_mask) != 0;
+		}
+
+		inline bool section_is_data_readable(uint32_t characteristics) {
+			const uint32_t exec_mask = 0x20000000u;
+			const uint32_t read_mask = 0x40000000u;
+			const uint32_t init_data_mask = 0x00000040u;
+			const uint32_t uninit_data_mask = 0x00000080u;
+			if (characteristics & exec_mask) return false;
+			if (characteristics & uninit_data_mask) return false;
+			if (characteristics & init_data_mask) return true;
+			if (characteristics & read_mask) return true;
+			return false;
+		}
+
+		inline void scan_data_section_for_pointers(
+			const functions_panel::detail::disk_pe_view_t& v,
+			const functions_panel::detail::disk_section_t& sec,
+			uint64_t module_base, uint32_t module_size,
+			const std::vector<functions_panel::function_entry_t>& fns,
+			const std::vector<pe_parser::section_info_t>& sections,
+			const std::string& module_name,
+			std::unordered_map<uint64_t, std::vector<annotation_t>>& map)
+		{
+			if (sec.raw_size == 0 || sec.raw_offset == 0) return;
+			if (static_cast<uint64_t>(sec.raw_offset) + sec.raw_size > v.raw.size()) return;
+			const uint8_t* data = v.raw.data() + sec.raw_offset;
+			uint64_t base_va = module_base + sec.virtual_address;
+			uint32_t avail = sec.raw_size;
+			if (avail > sec.virtual_size && sec.virtual_size > 0) avail = sec.virtual_size;
+
+			std::vector<std::pair<uint64_t, uint64_t>> code_ranges;
+			code_ranges.reserve(sections.size());
+			for (const auto& s : sections) {
+				if (!section_is_code(s.characteristics)) continue;
+				uint64_t lo = module_base + s.virtual_address;
+				uint64_t hi = lo + (s.virtual_size != 0 ? s.virtual_size : s.raw_size);
+				if (hi > lo) code_ranges.emplace_back(lo, hi);
+			}
+			if (code_ranges.empty()) return;
+
+			auto is_code_target = [&](uint64_t target) {
+				for (const auto& r : code_ranges) {
+					if (target >= r.first && target < r.second) return true;
+				}
+				return false;
+			};
+
+			if (v.is_pe32_plus) {
+				for (uint32_t off = 0; off + 8 <= avail; off += 8) {
+					uint64_t ptr = 0;
+					std::memcpy(&ptr, data + off, 8);
+					if (ptr < module_base) continue;
+					if (ptr >= module_base + module_size) continue;
+					if (!is_code_target(ptr)) continue;
+					uint64_t src_va = base_va + off;
+					annotation_t ann;
+					ann.kind = kind_t::data;
+					ann.edge = edge_t::offset_ref;
+					ann.up = (src_va < ptr);
+					ann.source_addr = src_va;
+					ann.source_label = resolve_source_label(src_va, fns, sections, module_base, module_name);
+					map[ptr].push_back(std::move(ann));
+				}
+			}
+			else {
+				for (uint32_t off = 0; off + 4 <= avail; off += 4) {
+					uint32_t ptr32 = 0;
+					std::memcpy(&ptr32, data + off, 4);
+					uint64_t ptr = ptr32;
+					if (ptr < module_base) continue;
+					if (ptr >= module_base + module_size) continue;
+					if (!is_code_target(ptr)) continue;
+					uint64_t src_va = base_va + off;
+					annotation_t ann;
+					ann.kind = kind_t::data;
+					ann.edge = edge_t::offset_ref;
+					ann.up = (src_va < ptr);
+					ann.source_addr = src_va;
+					ann.source_label = resolve_source_label(src_va, fns, sections, module_base, module_name);
+					map[ptr].push_back(std::move(ann));
+				}
+			}
+		}
+
+		inline void build_module_to_index_live(std::shared_ptr<module_index_t> mod) {
 			pe_parser::pe_info_t pe;
 			std::vector<pe_parser::section_info_t> sections;
 			if (pe_parser::parse(mod->base, pe))
@@ -215,36 +442,70 @@ namespace xref_index {
 				if (!driver_bridge::read_memory(mod->base + offset, chunk, page_data) || page_data.empty())
 					continue;
 
-				const uint8_t* data = page_data.data();
-				int sz = static_cast<int>(page_data.size());
-				int pos = 0;
+				scan_block_for_xrefs(page_data.data(), page_data.size(),
+					mod->base + offset, fns, sections, mod->base, mod->name, map);
+			}
 
-				while (pos < sz) {
-					int avail = sz - pos;
-					if (avail > 15) avail = 15;
+			for (auto& kv : map) {
+				std::sort(kv.second.begin(), kv.second.end(), sort_less);
+			}
 
-					uint64_t ins_addr = mod->base + offset + static_cast<uint64_t>(pos);
-					AsmInstr ins = zydis_decode_one(data + pos, avail, ins_addr);
-					if (ins.len <= 0) {
-						pos += 1;
-						continue;
+			mod->sections = std::move(sections);
+			mod->to_index = std::move(map);
+			mod->state.store(static_cast<uint32_t>(build_state_t::built), std::memory_order_release);
+		}
+
+		inline void build_module_to_index_static(std::shared_ptr<module_index_t> mod) {
+			std::string disk_path = mod->static_pe_path;
+			if (disk_path.empty()) disk_path = g_disasm.file.path;
+
+			functions_panel::detail::disk_pe_view_t view;
+			pe_parser::pe_info_t pe;
+			std::vector<pe_parser::section_info_t> sections;
+			bool have_disk_pe = build_static_pe_pe_info(disk_path, view, pe);
+			if (have_disk_pe) {
+				sections = pe.sections;
+			}
+			else {
+				sections.reserve(g_disasm.file.sections.size());
+				for (const auto& s : g_disasm.file.sections) {
+					if (s.va < mod->base) continue;
+					uint64_t rva64 = s.va - mod->base;
+					if (rva64 > 0xFFFFFFFFull) continue;
+					pe_parser::section_info_t si;
+					si.virtual_address = static_cast<uint32_t>(rva64);
+					si.virtual_size = static_cast<uint32_t>(s.bytes.size());
+					si.raw_size = static_cast<uint32_t>(s.bytes.size());
+					si.characteristics = s.is_executable ? 0x60000020u : 0x40000040u;
+					sections.push_back(std::move(si));
+				}
+			}
+
+			auto fns = snapshot_functions(mod->base, mod->size);
+
+			std::unordered_map<uint64_t, std::vector<annotation_t>> map;
+			map.reserve(4096);
+
+			for (const auto& s : g_disasm.file.sections) {
+				if (!s.is_executable) continue;
+				if (s.bytes.empty()) continue;
+				if (!xref_static_pe_active()) {
+					mod->state.store(static_cast<uint32_t>(build_state_t::failed), std::memory_order_release);
+					return;
+				}
+				scan_block_for_xrefs(s.bytes.data(), s.bytes.size(), s.va,
+					fns, sections, mod->base, mod->name, map);
+			}
+
+			if (have_disk_pe) {
+				for (const auto& sec : view.sections) {
+					if (!xref_static_pe_active()) {
+						mod->state.store(static_cast<uint32_t>(build_state_t::failed), std::memory_order_release);
+						return;
 					}
-
-					uint64_t target = 0;
-					if (xref_engine::detail::extract_target(data + pos, ins.len, ins_addr, ins, target)) {
-						xref_engine::xref_type_t t = xref_engine::detail::classify_instruction(ins);
-
-						annotation_t ann;
-						ann.kind = classify_kind(t);
-						ann.edge = classify_edge(t);
-						ann.up = (ins_addr < target);
-						ann.source_addr = ins_addr;
-						ann.source_label = resolve_source_label(ins_addr, fns, sections, mod->base, mod->name);
-
-						map[target].push_back(std::move(ann));
-					}
-
-					pos += ins.len;
+					if (!section_is_data_readable(sec.characteristics)) continue;
+					scan_data_section_for_pointers(view, sec, mod->base, mod->size,
+						fns, sections, mod->name, map);
 				}
 			}
 
@@ -255,6 +516,26 @@ namespace xref_index {
 			mod->sections = std::move(sections);
 			mod->to_index = std::move(map);
 			mod->state.store(static_cast<uint32_t>(build_state_t::built), std::memory_order_release);
+		}
+
+		inline void build_module_to_index(std::shared_ptr<module_index_t> mod) {
+			if (!mod) return;
+
+			if (mod->is_static_pe) {
+				if (!xref_static_pe_active()) {
+					mod->state.store(static_cast<uint32_t>(build_state_t::failed), std::memory_order_release);
+					return;
+				}
+				build_module_to_index_static(mod);
+				return;
+			}
+
+			if (driver_bridge::attached_pid() == 0) {
+				mod->state.store(static_cast<uint32_t>(build_state_t::failed), std::memory_order_release);
+				return;
+			}
+
+			build_module_to_index_live(mod);
 		}
 
 		inline std::shared_ptr<module_index_t> get_or_create_module_unlocked(registry_t& reg,
@@ -274,9 +555,45 @@ namespace xref_index {
 			return mod;
 		}
 
+		inline std::shared_ptr<module_index_t> get_or_create_static_module_unlocked(registry_t& reg,
+			const std::string& name, uint64_t base, uint32_t size, const std::string& disk_path)
+		{
+			auto it = reg.modules.find(name);
+			if (it != reg.modules.end()) {
+				if (it->second->base == base
+					&& it->second->size == size
+					&& it->second->is_static_pe
+					&& it->second->static_pe_path == disk_path)
+				{
+					return it->second;
+				}
+				reg.modules.erase(it);
+			}
+			auto mod = std::make_shared<module_index_t>();
+			mod->name = name;
+			mod->base = base;
+			mod->size = size;
+			mod->is_static_pe = true;
+			mod->static_pe_path = disk_path;
+			reg.modules.emplace(name, mod);
+			return mod;
+		}
+
 		inline void rebuild_module_table_unlocked(registry_t& reg) {
 			reg.table.clear();
 			if (driver_bridge::attached_pid() == 0) {
+				std::string name;
+				uint64_t base = 0;
+				uint32_t size = 0;
+				std::string disk_path;
+				if (fetch_static_pe_module(name, base, size, disk_path)) {
+					module_range_t r;
+					r.start_va = base;
+					r.end_va = base + size;
+					r.name = name;
+					r.index = get_or_create_static_module_unlocked(reg, name, base, size, disk_path);
+					reg.table.push_back(std::move(r));
+				}
 				reg.table_built.store(true, std::memory_order_release);
 				return;
 			}
@@ -300,9 +617,68 @@ namespace xref_index {
 
 		inline bool rebuild_module_table_offlock(registry_t& reg) {
 			if (driver_bridge::attached_pid() == 0) {
-				std::scoped_lock<std::shared_mutex> w(reg.rw);
-				reg.table.clear();
-				reg.table_built.store(true, std::memory_order_release);
+				std::string name;
+				uint64_t base = 0;
+				uint32_t size = 0;
+				std::string disk_path;
+				bool have_static = fetch_static_pe_module(name, base, size, disk_path);
+
+				std::vector<module_range_t> staged;
+				std::shared_ptr<module_index_t> static_mod_new;
+				bool need_replace = false;
+
+				if (have_static) {
+					std::shared_lock<std::shared_mutex> r_lk(reg.rw);
+					auto it = reg.modules.find(name);
+					if (it != reg.modules.end()
+						&& it->second->base == base
+						&& it->second->size == size
+						&& it->second->is_static_pe
+						&& it->second->static_pe_path == disk_path)
+					{
+						module_range_t r;
+						r.start_va = base;
+						r.end_va = base + size;
+						r.name = name;
+						r.index = it->second;
+						staged.push_back(std::move(r));
+					}
+					else {
+						auto mod = std::make_shared<module_index_t>();
+						mod->name = name;
+						mod->base = base;
+						mod->size = size;
+						mod->is_static_pe = true;
+						mod->static_pe_path = disk_path;
+						static_mod_new = mod;
+						need_replace = true;
+						module_range_t r;
+						r.start_va = base;
+						r.end_va = base + size;
+						r.name = name;
+						r.index = mod;
+						staged.push_back(std::move(r));
+					}
+				}
+
+				{
+					std::scoped_lock<std::shared_mutex> w(reg.rw);
+					if (need_replace && static_mod_new) {
+						auto it = reg.modules.find(static_mod_new->name);
+						if (it == reg.modules.end()) {
+							reg.modules.emplace(static_mod_new->name, static_mod_new);
+						}
+						else if (!it->second->is_static_pe
+							|| it->second->base != static_mod_new->base
+							|| it->second->size != static_mod_new->size
+							|| it->second->static_pe_path != static_mod_new->static_pe_path)
+						{
+							it->second = static_mod_new;
+						}
+					}
+					reg.table.swap(staged);
+					reg.table_built.store(true, std::memory_order_release);
+				}
 				return true;
 			}
 
@@ -469,6 +845,30 @@ namespace xref_index {
 		reg.table_built.store(false, std::memory_order_release);
 		reg.rebuild_in_flight.store(false, std::memory_order_release);
 		reg.generation.fetch_add(1, std::memory_order_acq_rel);
+	}
+
+	inline void on_file_loaded() {
+		auto& reg = detail::registry();
+		{
+			std::unique_lock<std::shared_mutex> lk(reg.rw);
+			reg.table.clear();
+			reg.modules.clear();
+		}
+		reg.table_built.store(false, std::memory_order_release);
+		reg.rebuild_in_flight.store(false, std::memory_order_release);
+		reg.generation.fetch_add(1, std::memory_order_acq_rel);
+
+		if (detail::xref_static_pe_active()) {
+			bool expected = false;
+			if (reg.rebuild_in_flight.compare_exchange_strong(expected, true,
+				std::memory_order_acq_rel))
+			{
+				work_queue::post([&reg]() {
+					detail::rebuild_module_table_offlock(reg);
+					reg.rebuild_in_flight.store(false, std::memory_order_release);
+				});
+			}
+		}
 	}
 
 }

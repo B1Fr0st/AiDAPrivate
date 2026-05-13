@@ -14,6 +14,7 @@
 #include "auth_store.hpp"
 #include "event_bus.hpp"
 #include "anti-tamper/webhook.hpp"
+#include "../infra/work_queue.hpp"
 
 #include <httplib.h>
 #include <openssl/evp.h>
@@ -326,7 +327,7 @@ static bool open_browser(const std::string& url)
 struct callback_listener_t
 {
     SOCKET            sock = INVALID_SOCKET;
-    std::thread       worker;
+    std::atomic<bool> worker_done{true};
     std::atomic<bool> stop{false};
     int               bound_port = 0;
 };
@@ -581,7 +582,16 @@ static bool start_oauth_listener(oauth_state_t& state)
     auto holder = std::make_unique<std::shared_ptr<callback_listener_t>>(ctx);
 
     state.listener_handle = holder.release();
-    ctx->worker = std::thread(oauth_listener_thread, &state, ctx);
+    ctx->worker_done.store(false, std::memory_order_release);
+    oauth_state_t* state_ptr = &state;
+    if (!work_queue::post([state_ptr, ctx]() {
+            oauth_listener_thread(state_ptr, ctx);
+            ctx->worker_done.store(true, std::memory_order_release);
+        }))
+    {
+        ctx->worker_done.store(true, std::memory_order_release);
+        return false;
+    }
     return true;
 }
 
@@ -597,8 +607,8 @@ static void stop_oauth_listener(oauth_state_t& state)
         closesocket((*holder)->sock);
         (*holder)->sock = INVALID_SOCKET;
     }
-    if ((*holder)->worker.joinable())
-        (*holder)->worker.join();
+    while (!(*holder)->worker_done.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
 
 
@@ -2553,7 +2563,7 @@ void manager_t::poll()
     }
 
     for (const auto& name : needs_reconnect) {
-        std::thread([this, name]() { this->connect_server(name); }).detach();
+        work_queue::post([this, name]() { this->connect_server(name); });
     }
 }
 
@@ -2909,7 +2919,7 @@ bool trigger_auth_flow(const std::string& server_name, auth_completion_callback_
     if (!state->scope.empty()) stage.metadata["scope"] = state->scope;
     save_mcp_auth(server_name, stage);
 
-    std::thread worker([state, on_complete, server_name]() {
+    work_queue::post([state, on_complete, server_name]() {
         for (;;) {
             oauth_status_t st = poll_auth(*state);
             if (st == oauth_status_t::authenticating) {
@@ -2924,7 +2934,6 @@ bool trigger_auth_flow(const std::string& server_name, auth_completion_callback_
             return;
         }
     });
-    worker.detach();
     return true;
 }
 

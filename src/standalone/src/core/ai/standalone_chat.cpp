@@ -30,6 +30,8 @@
 #include "command_palette_view.hpp"
 #include "provider_catalog.hpp"
 #include "zydis_disasm.hpp"
+#include "function_index.hpp"
+#include "xref_index.hpp"
 #include "auto_approval.hpp"
 #include "file_context_tracker.hpp"
 #include "standalone_context.hpp"
@@ -86,7 +88,6 @@ void post_update(ai_update_t::type_t type, const std::string& text = {})
 }
 
 
-std::thread       s_ai_thread;
 std::mutex        s_ai_thread_mtx;
 std::atomic<bool> s_ai_running{false};
 std::atomic<bool> s_cancel{false};
@@ -1409,6 +1410,8 @@ void restore_workspace_state()
         g_disasm.file = DisasmFile{};
         if (disasm::load_pe(g_sa_settings.workspace.last_active_path, g_disasm.file))
             disasm::decode_section(g_disasm.file);
+        function_index::on_file_loaded();
+        xref_index::on_file_loaded();
     }
 }
 
@@ -2003,6 +2006,9 @@ void poll_ai_chat()
         license::validated = false;
         license::check_failed = true;
         license::error_msg = standalone_license::last_error();
+        diag::log_tagged_fmt("license",
+            "DIAG_DIALOG_TRIGGER source=poll_ai_chat tid=%lu err=%.200s",
+            GetCurrentThreadId(), license::error_msg.c_str());
     }
 
 

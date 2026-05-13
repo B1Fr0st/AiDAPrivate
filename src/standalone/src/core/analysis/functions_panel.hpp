@@ -184,12 +184,28 @@ namespace functions_panel {
 			if (count == 0 || count > 0x100000) return true;
 
 			std::vector<uint8_t> table;
-			if (!driver_bridge::read_memory(module_base + exception_dir_rva,
-				static_cast<size_t>(count) * entry_size, table))
-			{
-				return false;
+			size_t total_bytes = static_cast<size_t>(count) * entry_size;
+			table.reserve(total_bytes);
+			const size_t chunk_bytes = 0x10000;
+			size_t fetched = 0;
+			bool any_chunk_ok = false;
+			while (fetched < total_bytes) {
+				size_t to_read = total_bytes - fetched;
+				if (to_read > chunk_bytes) to_read = chunk_bytes;
+				std::vector<uint8_t> piece;
+				if (driver_bridge::read_memory(module_base + exception_dir_rva + fetched,
+					to_read, piece) && !piece.empty())
+				{
+					any_chunk_ok = true;
+					table.insert(table.end(), piece.begin(), piece.end());
+					fetched += piece.size();
+					if (piece.size() < to_read) break;
+				} else {
+					break;
+				}
 			}
-			if (table.size() < static_cast<size_t>(count) * entry_size) {
+			if (!any_chunk_ok) return false;
+			if (table.size() < total_bytes) {
 				count = static_cast<uint32_t>(table.size() / entry_size);
 			}
 
@@ -401,6 +417,10 @@ namespace functions_panel {
 			uint32_t                          exception_dir_size = 0;
 			uint32_t                          export_dir_rva = 0;
 			uint32_t                          export_dir_size = 0;
+			uint32_t                          import_dir_rva = 0;
+			uint32_t                          import_dir_size = 0;
+			uint32_t                          iat_dir_rva = 0;
+			uint32_t                          iat_dir_size = 0;
 			bool                              is_pe32_plus = false;
 		};
 
@@ -420,6 +440,8 @@ namespace functions_panel {
 			if (!v.is_pe32_plus && !is_pe32) return false;
 			IMAGE_DATA_DIRECTORY exc_dir{};
 			IMAGE_DATA_DIRECTORY exp_dir{};
+			IMAGE_DATA_DIRECTORY imp_dir{};
+			IMAGE_DATA_DIRECTORY iat_dir{};
 			if (v.is_pe32_plus) {
 				if (pe_off + sizeof(IMAGE_NT_HEADERS64) > v.raw.size()) return false;
 				const auto* nt64 = reinterpret_cast<const IMAGE_NT_HEADERS64*>(v.raw.data() + pe_off);
@@ -430,6 +452,10 @@ namespace functions_panel {
 					exc_dir = nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
 				if (nt64->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT)
 					exp_dir = nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+				if (nt64->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT)
+					imp_dir = nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+				if (nt64->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IAT)
+					iat_dir = nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
 			} else {
 				v.image_base = nt_common->OptionalHeader.ImageBase;
 				v.size_of_image = nt_common->OptionalHeader.SizeOfImage;
@@ -438,11 +464,19 @@ namespace functions_panel {
 					exc_dir = nt_common->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
 				if (nt_common->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT)
 					exp_dir = nt_common->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+				if (nt_common->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT)
+					imp_dir = nt_common->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+				if (nt_common->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IAT)
+					iat_dir = nt_common->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
 			}
 			v.exception_dir_rva = exc_dir.VirtualAddress;
 			v.exception_dir_size = exc_dir.Size;
 			v.export_dir_rva = exp_dir.VirtualAddress;
 			v.export_dir_size = exp_dir.Size;
+			v.import_dir_rva = imp_dir.VirtualAddress;
+			v.import_dir_size = imp_dir.Size;
+			v.iat_dir_rva = iat_dir.VirtualAddress;
+			v.iat_dir_size = iat_dir.Size;
 			uint64_t sec_offset = static_cast<uint64_t>(pe_off)
 				+ offsetof(IMAGE_NT_HEADERS32, OptionalHeader) + fh.SizeOfOptionalHeader;
 			uint32_t nsec = fh.NumberOfSections > 96 ? 96 : fh.NumberOfSections;
@@ -536,6 +570,72 @@ namespace functions_panel {
 				uint64_t va = v.image_base + rva;
 				if (out_lookup.find(va) == out_lookup.end()) {
 					out_lookup.emplace(va, std::move(fn));
+				}
+			}
+		}
+
+		inline void disk_parse_imports(const disk_pe_view_t& v,
+			std::vector<pe_parser::import_entry_t>& out)
+		{
+			out.clear();
+			if (v.import_dir_rva == 0 || v.import_dir_size == 0) return;
+			const uint32_t desc_stride = 20;
+			uint32_t max_descriptors = v.import_dir_size / desc_stride;
+			if (max_descriptors == 0) max_descriptors = 4096;
+			if (max_descriptors > 4096) max_descriptors = 4096;
+			for (uint32_t i = 0; i < max_descriptors; ++i) {
+				uint8_t desc[20] = {};
+				if (!disk_read_at_rva(v, v.import_dir_rva + i * desc_stride, desc, 20)) break;
+				uint32_t ilt_rva = 0;
+				uint32_t name_rva = 0;
+				uint32_t iat_rva = 0;
+				std::memcpy(&ilt_rva, desc + 0, 4);
+				std::memcpy(&name_rva, desc + 12, 4);
+				std::memcpy(&iat_rva, desc + 16, 4);
+				if (ilt_rva == 0 && iat_rva == 0) break;
+				std::string mod_name = disk_read_string_at_rva(v, name_rva, 256);
+				uint32_t lookup_rva = (ilt_rva != 0) ? ilt_rva : iat_rva;
+				if (lookup_rva == 0) continue;
+				const uint32_t entry_stride = v.is_pe32_plus ? 8u : 4u;
+				for (uint32_t t = 0; t < 0x10000; ++t) {
+					uint64_t thunk_val = 0;
+					if (v.is_pe32_plus) {
+						if (!disk_read_at_rva(v, lookup_rva + t * entry_stride, &thunk_val, 8)) break;
+					} else {
+						uint32_t tmp32 = 0;
+						if (!disk_read_at_rva(v, lookup_rva + t * entry_stride, &tmp32, 4)) break;
+						thunk_val = tmp32;
+					}
+					if (thunk_val == 0) break;
+					pe_parser::import_entry_t entry;
+					entry.module_name = mod_name;
+					entry.iat_address = v.image_base + iat_rva + t * entry_stride;
+					if (v.is_pe32_plus) {
+						uint64_t iat_val = 0;
+						disk_read_at_rva(v, iat_rva + t * entry_stride, &iat_val, 8);
+						entry.bound_address = iat_val;
+					} else {
+						uint32_t iat_val32 = 0;
+						disk_read_at_rva(v, iat_rva + t * entry_stride, &iat_val32, 4);
+						entry.bound_address = iat_val32;
+					}
+					bool is_ordinal = v.is_pe32_plus
+						? (thunk_val & 0x8000000000000000ULL) != 0
+						: (thunk_val & 0x80000000ULL) != 0;
+					if (is_ordinal) {
+						entry.ordinal = static_cast<uint16_t>(thunk_val & 0xFFFF);
+						char ord_buf[32];
+						std::snprintf(ord_buf, sizeof(ord_buf), "Ordinal#%u",
+							static_cast<unsigned>(entry.ordinal));
+						entry.function_name = ord_buf;
+					} else {
+						uint32_t hint_name_rva = static_cast<uint32_t>(thunk_val & 0x7FFFFFFFu);
+						uint16_t hint = 0;
+						disk_read_at_rva(v, hint_name_rva, &hint, 2);
+						entry.hint = hint;
+						entry.function_name = disk_read_string_at_rva(v, hint_name_rva + 2, 512);
+					}
+					out.push_back(std::move(entry));
 				}
 			}
 		}

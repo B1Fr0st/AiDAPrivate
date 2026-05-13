@@ -502,31 +502,64 @@ void initialize() {
     work_queue::initialize();
 
     g_state.conn_polling.store(true);
-    g_state.conn_thread = std::thread(connection_poll_thread, std::ref(g_state));
+    g_state.conn_thread_done.store(false, std::memory_order_release);
+    if (!work_queue::post([]() {
+            connection_poll_thread(g_state);
+            g_state.conn_thread_done.store(true, std::memory_order_release);
+        }))
+    {
+        g_state.conn_thread_done.store(true, std::memory_order_release);
+    }
 
     g_state.cap_thread_alive.store(true);
-    g_state.cap_thread = std::thread(capture_poll_thread, std::ref(g_state));
+    g_state.cap_thread_done.store(false, std::memory_order_release);
+    if (!work_queue::post([]() {
+            capture_poll_thread(g_state);
+            g_state.cap_thread_done.store(true, std::memory_order_release);
+        }))
+    {
+        g_state.cap_thread_done.store(true, std::memory_order_release);
+    }
 
     g_state.dns_thread_alive.store(true);
-    g_state.dns_thread = std::thread(dns_poll_thread, std::ref(g_state));
+    g_state.dns_thread_done.store(false, std::memory_order_release);
+    if (!work_queue::post([]() {
+            dns_poll_thread(g_state);
+            g_state.dns_thread_done.store(true, std::memory_order_release);
+        }))
+    {
+        g_state.dns_thread_done.store(true, std::memory_order_release);
+    }
 
     g_state.bw_thread_alive.store(true);
-    g_state.bw_thread = std::thread(bandwidth_poll_thread, std::ref(g_state));
+    g_state.bw_thread_done.store(false, std::memory_order_release);
+    if (!work_queue::post([]() {
+            bandwidth_poll_thread(g_state);
+            g_state.bw_thread_done.store(true, std::memory_order_release);
+        }))
+    {
+        g_state.bw_thread_done.store(true, std::memory_order_release);
+    }
 
     g_state.fuzz_thread_alive.store(true);
-    g_state.fuzz_thread = std::thread([]() {
-        while (true) {
-            {
-                std::unique_lock<std::mutex> lk(g_state.fuzz_cv_mutex);
-                g_state.fuzz_cv.wait(lk, []() {
-                    return g_state.fuzz_running.load() || !g_state.fuzz_thread_alive.load();
-                });
+    g_state.fuzz_thread_done.store(false, std::memory_order_release);
+    if (!work_queue::post([]() {
+            while (true) {
+                {
+                    std::unique_lock<std::mutex> lk(g_state.fuzz_cv_mutex);
+                    g_state.fuzz_cv.wait(lk, []() {
+                        return g_state.fuzz_running.load() || !g_state.fuzz_thread_alive.load();
+                    });
+                }
+                if (!g_state.fuzz_thread_alive.load())
+                    break;
+                run_fuzzer_thread(g_state);
             }
-            if (!g_state.fuzz_thread_alive.load())
-                break;
-            run_fuzzer_thread(g_state);
-        }
-    });
+            g_state.fuzz_thread_done.store(true, std::memory_order_release);
+        }))
+    {
+        g_state.fuzz_thread_done.store(true, std::memory_order_release);
+    }
 }
 
 void shutdown() {
@@ -548,11 +581,16 @@ void shutdown() {
     g_state.fuzz_thread_alive.store(false);
     g_state.fuzz_cv.notify_all();
 
-    if (g_state.conn_thread.joinable()) g_state.conn_thread.join();
-    if (g_state.cap_thread.joinable()) g_state.cap_thread.join();
-    if (g_state.dns_thread.joinable()) g_state.dns_thread.join();
-    if (g_state.bw_thread.joinable()) g_state.bw_thread.join();
-    if (g_state.fuzz_thread.joinable()) g_state.fuzz_thread.join();
+    while (!g_state.conn_thread_done.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    while (!g_state.cap_thread_done.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    while (!g_state.dns_thread_done.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    while (!g_state.bw_thread_done.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    while (!g_state.fuzz_thread_done.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
     work_queue::shutdown();
     mitm_proxy::stop();
@@ -791,7 +829,8 @@ static void render_connections(state_t& state, float x, float y, float w, float 
 
 
     float list_h = h - (cursor.y + row_h + 12.f);
-    ImGui::BeginChild("##conn_list", ImVec2(w - 4.f, list_h), false, ImGuiWindowFlags_NoBackground);
+    ImGui::BeginChild("##conn_list", ImVec2(w - 4.f, list_h), false,
+                      ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
     std::lock_guard<std::mutex> lock(state.conn_mutex);
     ImVec2 list_org = ImGui::GetWindowPos();
@@ -836,7 +875,7 @@ static void render_connections(state_t& state, float x, float y, float w, float 
         float r_alpha = alpha * row_alpha;
 
         float ry = ImGui::GetCursorPosY();
-        float abs_ry = list_org.y + ry;
+        float abs_ry = ImGui::GetCursorScreenPos().y;
 
         if (conn_visible_row & 1)
             dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w, abs_ry + row_h),
@@ -1185,8 +1224,15 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
         ImGui::PopStyleColor(3);
         ImGui::PopStyleVar();
 
-        if (state.cap_auto_scroll && !state.captured_packets.empty())
-            ImGui::SetScrollHereY(1.0f);
+        if (state.cap_auto_scroll && !state.captured_packets.empty()) {
+            float scroll_max_y = ImGui::GetScrollMaxY();
+            float scroll_y = ImGui::GetScrollY();
+            bool at_bottom = (scroll_max_y <= 0.f) || ((scroll_max_y - scroll_y) <= 4.f);
+            bool user_scrolling = (ImGui::GetIO().MouseWheel != 0.f) ||
+                                  ImGui::IsMouseDragging(ImGuiMouseButton_Left, 1.f);
+            if (at_bottom && !user_scrolling)
+                ImGui::SetScrollHereY(1.0f);
+        }
     }
 
     ImGui::EndChild();

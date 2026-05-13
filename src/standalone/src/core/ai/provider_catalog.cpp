@@ -3,6 +3,7 @@
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 
 #include "provider_catalog.hpp"
+#include "../infra/work_queue.hpp"
 
 #include <windows.h>
 #include <shlobj.h>
@@ -386,11 +387,10 @@ void initialize_async(int max_age_seconds)
 	if (!s_refresh_inflight.compare_exchange_strong(refresh_expected, true, std::memory_order_acq_rel))
 		return;
 
-	std::thread bg([]() {
+	work_queue::post([]() {
 		(void)fetch_and_cache();
 		s_refresh_inflight.store(false, std::memory_order_release);
 	});
-	bg.detach();
 }
 
 const std::vector<provider_info_t>& list_providers()

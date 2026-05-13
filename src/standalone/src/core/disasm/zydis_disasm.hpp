@@ -58,6 +58,7 @@ struct PESection
 {
     uint64_t             va = 0;
     std::vector<uint8_t> bytes;
+    bool                 is_executable = true;
 };
 
 
@@ -144,7 +145,8 @@ namespace static_analysis
             uint64_t end = sec.va + sec.bytes.size();
             if (end > max_end) max_end = end;
         }
-        return max_end;
+        if (max_end <= file.image_base) return 0;
+        return max_end - file.image_base;
     }
 }
 
@@ -333,6 +335,7 @@ namespace disasm
             + nt->FileHeader.SizeOfOptionalHeader);
         WORD nsec = nt->FileHeader.NumberOfSections;
 
+        bool any_exec_loaded = false;
         for (WORD i = 0; i < nsec; i++) {
             bool is_exec = (sec[i].Characteristics & IMAGE_SCN_CNT_CODE) ||
                            (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE);
@@ -345,10 +348,34 @@ namespace disasm
             PESection ps;
             ps.va = out.image_base + sec[i].VirtualAddress;
             ps.bytes.assign(raw.data() + off, raw.data() + off + sz);
+            ps.is_executable = true;
+            if (!any_exec_loaded) {
+                out.text_va = ps.va;
+                any_exec_loaded = true;
+            }
             out.sections.push_back(std::move(ps));
         }
-        if (out.sections.empty()) { out.err = "No executable section found"; return false; }
-        out.text_va = out.sections[0].va;
+        if (!any_exec_loaded) { out.err = "No executable section found"; return false; }
+
+        for (WORD i = 0; i < nsec; i++) {
+            bool is_exec = (sec[i].Characteristics & IMAGE_SCN_CNT_CODE) ||
+                           (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE);
+            if (is_exec) continue;
+            bool is_readable = (sec[i].Characteristics & IMAGE_SCN_MEM_READ) != 0;
+            bool has_raw     = (sec[i].Characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA) == 0;
+            if (!is_readable || !has_raw) continue;
+            DWORD off = sec[i].PointerToRawData;
+            DWORD sz  = sec[i].SizeOfRawData;
+            if (sec[i].Misc.VirtualSize && sec[i].Misc.VirtualSize < sz)
+                sz = sec[i].Misc.VirtualSize;
+            if (sz == 0 || static_cast<uint64_t>(off) + sz > fsz) continue;
+            PESection ps;
+            ps.va = out.image_base + sec[i].VirtualAddress;
+            ps.bytes.assign(raw.data() + off, raw.data() + off + sz);
+            ps.is_executable = false;
+            out.sections.push_back(std::move(ps));
+        }
+
         out.loaded  = true;
         return true;
     }
@@ -360,13 +387,17 @@ namespace disasm
         if (file.sections.empty()) return;
 
         size_t total_bytes = 0;
-        for (auto& s : file.sections) total_bytes += s.bytes.size();
+        for (auto& s : file.sections) {
+            if (!s.is_executable) continue;
+            total_bytes += s.bytes.size();
+        }
         file.instrs.reserve(total_bytes / 4);
 
         constexpr size_t kYieldEveryN = 16384;
         size_t since_yield = 0;
 
         for (auto& section : file.sections) {
+            if (!section.is_executable) continue;
             const uint8_t* data = section.bytes.data();
             int             sz   = static_cast<int>(section.bytes.size());
             int             off  = 0;
@@ -572,6 +603,8 @@ namespace disasm
                     (unsigned long long)pe.sections.size());
                 constexpr uint32_t kCntCode = 0x00000020u;
                 constexpr uint32_t kMemExec = 0x20000000u;
+                constexpr uint32_t kMemRead = 0x40000000u;
+                constexpr uint32_t kCntUData = 0x00000080u;
                 constexpr size_t kMaxSnapshotBytes = 64ull * 1024ull * 1024ull;
                 uint64_t first_exec_va = 0;
                 size_t snapshot_total = 0;
@@ -591,6 +624,29 @@ namespace disasm
                         PESection ps;
                         ps.va = sec_va;
                         ps.bytes = std::move(sec_bytes);
+                        ps.is_executable = true;
+                        snapshot_total += ps.bytes.size();
+                        snapshot_sections.push_back(std::move(ps));
+                    }
+                }
+                for (const auto& s : pe.sections) {
+                    bool is_exec = (s.characteristics & kCntCode) || (s.characteristics & kMemExec);
+                    if (is_exec) continue;
+                    bool is_readable = (s.characteristics & kMemRead) != 0;
+                    bool has_raw     = (s.characteristics & kCntUData) == 0;
+                    if (!is_readable || !has_raw) continue;
+                    uint32_t sec_size = (s.virtual_size > 0) ? s.virtual_size : s.raw_size;
+                    if (sec_size == 0) continue;
+                    if (snapshot_total >= kMaxSnapshotBytes) continue;
+                    size_t remaining_budget = kMaxSnapshotBytes - snapshot_total;
+                    size_t read_size = (sec_size <= remaining_budget) ? sec_size : remaining_budget;
+                    uint64_t sec_va = base + static_cast<uint64_t>(s.virtual_address);
+                    std::vector<uint8_t> sec_bytes;
+                    if (driver_bridge::read_memory(sec_va, read_size, sec_bytes) && !sec_bytes.empty()) {
+                        PESection ps;
+                        ps.va = sec_va;
+                        ps.bytes = std::move(sec_bytes);
+                        ps.is_executable = false;
                         snapshot_total += ps.bytes.size();
                         snapshot_sections.push_back(std::move(ps));
                     }

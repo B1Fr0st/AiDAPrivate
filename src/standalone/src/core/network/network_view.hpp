@@ -140,7 +140,7 @@ struct state_t {
     uint8_t                       conn_filter_protocol = 0;
     char                          conn_filter_text[128] = {};
     bool                          conn_auto_refresh = true;
-    std::thread                   conn_thread;
+    std::atomic<bool>             conn_thread_done{true};
     std::atomic<bool>             conn_polling{false};
     std::mutex                    conn_cv_mutex;
     std::condition_variable       conn_cv;
@@ -156,7 +156,7 @@ struct state_t {
     uint8_t                       cap_filter_protocol = 0;
     char                          cap_filter_text[128] = {};
     bool                          cap_auto_scroll = true;
-    std::thread                   cap_thread;
+    std::atomic<bool>             cap_thread_done{true};
     std::atomic<bool>             cap_polling{false};
     std::mutex                    cap_cv_mutex;
     std::condition_variable       cap_cv;
@@ -181,7 +181,7 @@ struct state_t {
     uint32_t                      dns_filter_pid = 0;
     char                          dns_filter_text[128] = {};
     bool                          dns_auto_scroll = true;
-    std::thread                   dns_thread;
+    std::atomic<bool>             dns_thread_done{true};
     std::atomic<bool>             dns_polling{false};
     std::mutex                    dns_cv_mutex;
     std::condition_variable       dns_cv;
@@ -203,7 +203,7 @@ struct state_t {
     std::vector<bw_entry_t>       bw_entries;
     bool                          bw_monitoring = false;
     int                           bw_selected = -1;
-    std::thread                   bw_thread;
+    std::atomic<bool>             bw_thread_done{true};
     std::atomic<bool>             bw_polling{false};
     std::mutex                    bw_cv_mutex;
     std::condition_variable       bw_cv;
@@ -266,7 +266,7 @@ struct state_t {
     std::atomic<bool>             fuzz_running{false};
     std::atomic<int>              fuzz_progress{0};
     std::atomic<int>              fuzz_total{0};
-    std::thread                   fuzz_thread;
+    std::atomic<bool>             fuzz_thread_done{true};
     std::mutex                    fuzz_cv_mutex;
     std::condition_variable       fuzz_cv;
     std::atomic<bool>             fuzz_thread_alive{false};

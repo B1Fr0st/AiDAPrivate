@@ -399,4 +399,11 @@ ALTER TABLE sessions ADD COLUMN IF NOT EXISTS anomaly_score INTEGER NOT NULL DEF
 
 ALTER TABLE licenses ADD COLUMN IF NOT EXISTS honeypot_strike_count INTEGER NOT NULL DEFAULT 0;
 
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS discord_id    TEXT   NOT NULL DEFAULT '';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS expires_epoch BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS discord_id_linked_at BIGINT NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS idx_licenses_discord_id ON licenses (discord_id) WHERE discord_id != '';
+CREATE INDEX IF NOT EXISTS idx_licenses_expires_epoch ON licenses (expires_epoch) WHERE expires_epoch > 0;
+
 COMMIT;

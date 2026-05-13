@@ -33,7 +33,7 @@ struct command_session_t
 	PROCESS_INFORMATION process_info{};
 	HANDLE stdout_read = nullptr;
 	HANDLE stderr_read = nullptr;
-	std::thread reader_thread;
+	std::atomic<bool> reader_done{true};
 	int timeout_ms = 0;
 
 	command_session_t() = default;
@@ -42,10 +42,9 @@ struct command_session_t
 
 	~command_session_t()
 	{
-		if (reader_thread.joinable()) {
-			alive.store(false);
-			reader_thread.join();
-		}
+		alive.store(false);
+		while (!reader_done.load(std::memory_order_acquire))
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		if (stdout_read) { CloseHandle(stdout_read); stdout_read = nullptr; }
 		if (stderr_read) { CloseHandle(stderr_read); stderr_read = nullptr; }
 		if (process_info.hProcess) {

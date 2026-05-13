@@ -22,6 +22,7 @@
 #include "pe_parser.hpp"
 #include "rename_store.hpp"
 #include "standalone_driver.hpp"
+#include "symbol_classifier.hpp"
 #include "symbol_store.hpp"
 #include "work_queue.hpp"
 #include "zydis_disasm.hpp"
@@ -37,13 +38,25 @@ namespace function_index {
 		proc_endp,
 		endp_separator,
 		label_line,
-		spacer_line
+		spacer_line,
+		noreturn_separator
 	};
 
 	struct injection_row_t {
 		injection_t kind;
 		std::string text;
 		uint64_t    addr = 0;
+	};
+
+	enum class directive_kind_t : uint8_t {
+		none = 0,
+		align = 1,
+		db = 2
+	};
+
+	struct directive_override_t {
+		directive_kind_t kind = directive_kind_t::none;
+		uint8_t          value = 0;
 	};
 
 	namespace detail {
@@ -76,6 +89,7 @@ namespace function_index {
 			slot_kind_t kind = slot_kind_t::local_var;
 			std::string name;
 			std::string reg_token;
+			std::string prototype_name;
 		};
 
 		struct switch_table_t {
@@ -120,6 +134,7 @@ namespace function_index {
 			std::unordered_map<uint64_t, std::string> rsp_access_substitution;
 			std::unordered_map<uint64_t, int64_t>     rsp_access_entry_relative;
 			std::unordered_map<uint64_t, int64_t>     rsp_access_abs_offset;
+			std::unordered_map<int64_t, std::string>  prototype_slot_names;
 			std::unordered_map<uint64_t, std::string> insn_kind_override;
 			bool                                      is_thunk = false;
 			uint64_t                                  thunk_target = 0;
@@ -131,10 +146,24 @@ namespace function_index {
 			bool                                      is_user_main = false;
 			std::string                               user_main_kind;
 			std::vector<uint64_t>                     call_targets;
+			std::unordered_set<uint64_t>              noreturn_call_addrs;
+			std::unordered_map<uint64_t, directive_override_t> directive_overrides;
+			bool                                      always_noreturn = false;
+			bool                                      is_library = false;
 		};
 
 		struct func_status_t {
 			std::atomic<uint32_t> state{static_cast<uint32_t>(func_state_t::idle)};
+		};
+
+		struct iat_entry_t {
+			std::string module_name;
+			std::string function_name;
+		};
+
+		struct data_symbol_entry_t {
+			std::string name;
+			bool        is_function = false;
 		};
 
 		struct cache_t {
@@ -146,6 +175,8 @@ namespace function_index {
 			std::unordered_map<uint64_t, std::string>                      synthetic_names;
 			std::unordered_map<uint64_t, align_run_t>                      align_runs_by_start;
 			std::vector<uint64_t>                                          align_run_starts;
+			std::unordered_map<uint64_t, iat_entry_t>                      iat_lookup;
+			std::unordered_map<uint64_t, data_symbol_entry_t>              data_symbol_lookup;
 			std::vector<uint8_t>                                           text_blob;
 			uint64_t                                                       text_blob_va = 0;
 			uint64_t                                                       cached_module_base = 0;
@@ -156,6 +187,11 @@ namespace function_index {
 			uint16_t                                                       cached_subsystem = 0;
 			uint16_t                                                       cached_characteristics = 0;
 			std::atomic<uint32_t>                                          bounds_state{static_cast<uint32_t>(bounds_state_t::idle)};
+			std::atomic<uint64_t>                                          built_seq{0};
+			std::shared_ptr<functions_panel::detail::disk_pe_view_t>       static_pe_cached_view;
+			std::string                                                    static_pe_cached_path;
+			std::atomic<uint32_t>                                          static_bulk_pending{0};
+			std::atomic<uint64_t>                                          static_bulk_last_progress_ns{0};
 		};
 
 		inline cache_t& cache() {
@@ -382,6 +418,42 @@ namespace function_index {
 			return true;
 		}
 
+		inline bool static_pe_active() {
+			if (driver_bridge::attached_pid() != 0) return false;
+			if (!g_disasm.file.loaded) return false;
+			if (g_disasm.file.path.empty()) return false;
+			if (g_disasm.file.path.compare(0, 7, "live://") == 0) return false;
+			if (g_disasm.file.image_base == 0) return false;
+			return true;
+		}
+
+		inline bool fetch_static_module(uint64_t& out_base, uint32_t& out_size,
+			std::string& out_name)
+		{
+			if (!static_pe_active()) return false;
+			uint64_t img_sz = static_analysis::total_image_size(g_disasm.file);
+			if (img_sz == 0) return false;
+			if (img_sz > 0xFFFFFFFFull) img_sz = 0xFFFFFFFFull;
+			out_base = g_disasm.file.image_base;
+			out_size = static_cast<uint32_t>(img_sz);
+			out_name = g_disasm.file.filename.empty()
+				? g_disasm.file.path
+				: g_disasm.file.filename;
+			return true;
+		}
+
+		inline bool read_routed_bytes(uint64_t va, size_t len, std::vector<uint8_t>& out) {
+			if (driver_bridge::attached_pid() != 0) {
+				if (driver_bridge::read_memory(va, len, out) && !out.empty()) return true;
+				if (g_disasm.file.loaded && !g_disasm.file.sections.empty()) {
+					return static_analysis::read_bytes_from_pe(g_disasm.file, va, len, out);
+				}
+				return false;
+			}
+			if (!g_disasm.file.loaded) return false;
+			return static_analysis::read_bytes_from_pe(g_disasm.file, va, len, out);
+		}
+
 		inline std::string section_name_for_va(const pe_parser::pe_info_t& pe,
 			uint64_t module_base, uint64_t va)
 		{
@@ -465,6 +537,284 @@ namespace function_index {
 				if ((next_start % a) == 0 && a >= gap_size) return a;
 			}
 			return 1;
+		}
+
+		struct prototype_entry_t {
+			const char* name;
+			const char* params[12];
+		};
+
+		inline const prototype_entry_t* lookup_prototype_entry(const std::string& callee_name) {
+			if (callee_name.empty()) return nullptr;
+			static const prototype_entry_t kTable[] = {
+				{ "_invoke_watson",
+					{ "Expression", "FunctionName", "FileName", "LineNo", "Reserved", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "_invalid_parameter",
+					{ "Expression", "FunctionName", "FileName", "LineNo", "Reserved", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "_invalid_parameter_noinfo",
+					{ nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "_invalid_parameter_noinfo_noreturn",
+					{ nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "memcpy",
+					{ "Dst", "Src", "Size", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "memmove",
+					{ "Dst", "Src", "Size", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "memset",
+					{ "Dst", "Val", "Size", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "memcmp",
+					{ "Buf1", "Buf2", "Size", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "strcpy",
+					{ "Dst", "Src", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "strncpy",
+					{ "Dst", "Src", "Count", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "strcpy_s",
+					{ "Dst", "DstSize", "Src", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "strncpy_s",
+					{ "Dst", "DstSize", "Src", "Count", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "wcscpy",
+					{ "Dst", "Src", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "wcsncpy",
+					{ "Dst", "Src", "Count", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "strlen",
+					{ "Str", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "wcslen",
+					{ "Str", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "strcmp",
+					{ "Str1", "Str2", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "wcscmp",
+					{ "Str1", "Str2", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "RaiseException",
+					{ "dwExceptionCode", "dwExceptionFlags", "nNumberOfArguments", "lpArguments", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "RaiseFailFastException",
+					{ "pExceptionRecord", "pContextRecord", "dwFlags", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "__report_gsfailure",
+					{ "StackCookie", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "__report_rangecheckfailure",
+					{ nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "__report_securityfailure",
+					{ "FailureCode", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "__report_securityfailureEx",
+					{ "FailureCode", "ReturnAddress", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "__GSHandlerCheck",
+					{ "ExceptionRecord", "EstablisherFrame", "ContextRecord", "DispatcherContext", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "__C_specific_handler",
+					{ "ExceptionRecord", "EstablisherFrame", "ContextRecord", "DispatcherContext", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "__CxxFrameHandler",
+					{ "ExceptionRecord", "EstablisherFrame", "ContextRecord", "DispatcherContext", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "__CxxFrameHandler3",
+					{ "ExceptionRecord", "EstablisherFrame", "ContextRecord", "DispatcherContext", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "__CxxFrameHandler4",
+					{ "ExceptionRecord", "EstablisherFrame", "ContextRecord", "DispatcherContext", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "_CxxThrowException",
+					{ "pExceptionObject", "pThrowInfo", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "__std_terminate",
+					{ nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "ExitProcess",
+					{ "uExitCode", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "ExitThread",
+					{ "dwExitCode", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "TerminateProcess",
+					{ "hProcess", "uExitCode", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "TerminateThread",
+					{ "hThread", "dwExitCode", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "Sleep",
+					{ "dwMilliseconds", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "SleepEx",
+					{ "dwMilliseconds", "bAlertable", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "CreateFileW",
+					{ "lpFileName", "dwDesiredAccess", "dwShareMode", "lpSecurityAttributes", "dwCreationDisposition", "dwFlagsAndAttributes", "hTemplateFile", nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "CreateFileA",
+					{ "lpFileName", "dwDesiredAccess", "dwShareMode", "lpSecurityAttributes", "dwCreationDisposition", "dwFlagsAndAttributes", "hTemplateFile", nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "ReadFile",
+					{ "hFile", "lpBuffer", "nNumberOfBytesToRead", "lpNumberOfBytesRead", "lpOverlapped", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "WriteFile",
+					{ "hFile", "lpBuffer", "nNumberOfBytesToWrite", "lpNumberOfBytesWritten", "lpOverlapped", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "CloseHandle",
+					{ "hObject", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "GetLastError",
+					{ nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "SetLastError",
+					{ "dwErrCode", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "VirtualAlloc",
+					{ "lpAddress", "dwSize", "flAllocationType", "flProtect", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "VirtualFree",
+					{ "lpAddress", "dwSize", "dwFreeType", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "VirtualProtect",
+					{ "lpAddress", "dwSize", "flNewProtect", "lpflOldProtect", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "LoadLibraryW",
+					{ "lpLibFileName", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "LoadLibraryA",
+					{ "lpLibFileName", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "GetProcAddress",
+					{ "hModule", "lpProcName", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "GetModuleHandleW",
+					{ "lpModuleName", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } },
+				{ "GetModuleHandleA",
+					{ "lpModuleName", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr } }
+			};
+
+			std::string lookup = callee_name;
+			if (lookup.size() >= 6 && lookup.compare(0, 6, "__imp_") == 0) {
+				lookup = lookup.substr(6);
+			}
+			for (const auto& e : kTable) {
+				if (lookup == e.name) return &e;
+			}
+			if (callee_name.size() >= 14 && callee_name.compare(0, 14, "_invoke_watson") == 0) {
+				for (const auto& e : kTable) {
+					if (std::string("_invoke_watson") == e.name) return &e;
+				}
+			}
+			if (callee_name.size() >= 19 && callee_name.compare(0, 19, "_invalid_parameter_") == 0) {
+				for (const auto& e : kTable) {
+					if (std::string("_invalid_parameter_noinfo") == e.name) return &e;
+				}
+			}
+			return nullptr;
+		}
+
+		inline const char* prototype_param_name(const prototype_entry_t& proto, size_t idx) {
+			if (idx >= sizeof(proto.params) / sizeof(proto.params[0])) return nullptr;
+			return proto.params[idx];
+		}
+
+		inline bool name_is_noreturn(const std::string& name) {
+			if (name.empty()) return false;
+			static const char* const kExact[] = {
+				"_invoke_watson",
+				"_invalid_parameter",
+				"_invalid_parameter_noinfo",
+				"_invalid_parameter_noinfo_noreturn",
+				"_CxxThrowException",
+				"__report_gsfailure",
+				"__report_rangecheckfailure",
+				"__report_securityfailure",
+				"__report_securityfailureEx",
+				"__std_terminate",
+				"terminate",
+				"abort",
+				"_abort",
+				"exit",
+				"_exit",
+				"_purecall",
+				"_unrecoverable_error",
+				"RaiseException",
+				"RaiseFailFastException",
+				"ExitProcess",
+				"ExitThread",
+				"TerminateProcess",
+				"TerminateThread",
+				"FatalAppExit",
+				"FatalAppExitA",
+				"FatalAppExitW",
+				"FatalExit",
+				"__fastfail",
+				"longjmp",
+				"_longjmp",
+				"siglongjmp",
+				"__cxa_throw",
+				"unhandled_exception",
+				"abort_program",
+				"_CRT_DEBUGGER_HOOK",
+				"__chkstk_fail",
+				"_CRT_RTC_INITW",
+				"__GSHandlerCheckCommon",
+				"AcrtTerminate"
+			};
+			for (const char* p : kExact) {
+				if (name == p) return true;
+			}
+			if (name.size() >= 18 && name.compare(0, 18, "_invalid_parameter") == 0) return true;
+			if (name.size() >= 8 && name.compare(0, 8, "__report") == 0) return true;
+			if (name.size() >= 14 && name.compare(0, 14, "_invoke_watson") == 0) return true;
+			return false;
+		}
+
+		inline bool name_is_library_function(const std::string& name) {
+			if (name.empty()) return false;
+			static const char* const kPrefixes[] = {
+				"__security_",
+				"__scrt_",
+				"__std_",
+				"__report_",
+				"__acrt_",
+				"__crt_",
+				"__vcrt_",
+				"_RTC_",
+				"_CRT_",
+				"__chkstk",
+				"__C_specific_handler",
+				"__GSHandlerCheck",
+				"__CxxFrameHandler",
+				"_initterm",
+				"mainCRTStartup",
+				"WinMainCRTStartup",
+				"DllMainCRTStartup",
+				"_DllMainCRTStartup",
+				"_amsg_",
+				"_alloca_probe",
+				"__delayLoadHelper2",
+				"_purecall",
+				"memcpy",
+				"memset",
+				"memmove",
+				"memcmp",
+				"_chkstk",
+				"__alloca_probe"
+			};
+			for (const char* p : kPrefixes) {
+				size_t plen = std::strlen(p);
+				if (name.size() >= plen && name.compare(0, plen, p) == 0) return true;
+			}
+			return false;
+		}
+
+		inline bool target_is_noreturn(uint64_t target_va, uint64_t iat_va) {
+			if (target_va != 0) {
+				std::string sym = symbol_store::resolve_symbol_exact(target_va);
+				if (!sym.empty()) {
+					std::string stripped = strip_module_prefix(sym);
+					if (name_is_noreturn(stripped)) return true;
+				}
+				std::string near_sym = symbol_store::resolve_symbol(target_va);
+				if (!near_sym.empty()) {
+					std::string stripped = strip_module_prefix(near_sym);
+					if (name_is_noreturn(stripped)) return true;
+				}
+			}
+			if (iat_va != 0) {
+				std::string iat_imp;
+				if (symbol_classifier::lookup_import_by_iat(iat_va, iat_imp) && !iat_imp.empty()) {
+					std::string stripped = strip_module_prefix(iat_imp);
+					if (name_is_noreturn(stripped)) return true;
+				}
+				std::string iat_sym = symbol_store::resolve_symbol_exact(iat_va);
+				if (!iat_sym.empty()) {
+					std::string stripped = strip_module_prefix(iat_sym);
+					if (stripped.size() >= 6 && stripped.compare(0, 6, "__imp_") == 0) {
+						stripped = stripped.substr(6);
+					}
+					if (name_is_noreturn(stripped)) return true;
+				}
+				std::string iat_near = symbol_store::resolve_symbol(iat_va);
+				if (!iat_near.empty()) {
+					std::string stripped = strip_module_prefix(iat_near);
+					if (stripped.size() >= 6 && stripped.compare(0, 6, "__imp_") == 0) {
+						stripped = stripped.substr(6);
+					}
+					if (name_is_noreturn(stripped)) return true;
+				}
+			}
+			return false;
+		}
+
+		inline uint8_t pick_intra_align(uint64_t next_code_va, uint64_t gap_size) {
+			if (next_code_va == 0 || gap_size == 0) return 0;
+			static const uint8_t kCandidates[] = {16, 8, 4, 2};
+			for (uint8_t a : kCandidates) {
+				if ((next_code_va % a) == 0 && a >= gap_size) return a;
+			}
+			return 0;
 		}
 
 		inline void rebuild_align_runs_locked(cache_t& c) {
@@ -605,6 +955,94 @@ namespace function_index {
 			}
 		}
 
+		inline std::string normalize_pdb_symbol_name(const std::string& raw) {
+			if (raw.empty()) return raw;
+			auto bang = raw.find('!');
+			if (bang == std::string::npos) return raw;
+			return raw.substr(bang + 1);
+		}
+
+		inline bool is_pdb_function_at(const std::string& module_name, uint64_t va) {
+			std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
+			auto it = symbol_store::g_state.modules.find(module_name);
+			if (it == symbol_store::g_state.modules.end()) return false;
+			if (!it->second.pdb.loaded) return false;
+			if (va < it->second.base) return false;
+			uint64_t rva = va - it->second.base;
+			auto sit = it->second.pdb.symbol_by_rva.find(rva);
+			if (sit == it->second.pdb.symbol_by_rva.end()) return false;
+			return it->second.pdb.symbols[sit->second].is_function;
+		}
+
+		inline void populate_pdb_symbols_into(std::unordered_map<uint64_t, data_symbol_entry_t>& out,
+			const std::string& module_name)
+		{
+			std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
+			auto it = symbol_store::g_state.modules.find(module_name);
+			if (it == symbol_store::g_state.modules.end()) return;
+			if (!it->second.pdb.loaded) return;
+			uint64_t base = it->second.base;
+			for (const auto& sym : it->second.pdb.symbols) {
+				if (sym.name.empty()) continue;
+				if (sym.rva == 0) continue;
+				uint64_t va = base + sym.rva;
+				data_symbol_entry_t e;
+				e.name = sym.name;
+				e.is_function = sym.is_function;
+				auto eit = out.find(va);
+				if (eit == out.end()) {
+					out.emplace(va, std::move(e));
+				}
+				else if (sym.is_function && !eit->second.is_function) {
+					eit->second.is_function = true;
+					eit->second.name = sym.name;
+				}
+			}
+		}
+
+		inline void populate_iat_from_imports_locked(cache_t& c,
+			const std::vector<pe_parser::import_entry_t>& imports)
+		{
+			c.iat_lookup.clear();
+			c.iat_lookup.reserve(imports.size());
+			for (const auto& imp : imports) {
+				if (imp.iat_address == 0) continue;
+				if (imp.function_name.empty() && imp.ordinal == 0) continue;
+				iat_entry_t e;
+				e.module_name = imp.module_name;
+				if (!imp.function_name.empty()) {
+					e.function_name = imp.function_name;
+				}
+				else {
+					char ord_buf[32];
+					std::snprintf(ord_buf, sizeof(ord_buf), "Ordinal#%u",
+						static_cast<unsigned>(imp.ordinal));
+					e.function_name = ord_buf;
+				}
+				c.iat_lookup.emplace(imp.iat_address, std::move(e));
+			}
+		}
+
+		inline void populate_data_symbols_locked(cache_t& c,
+			const pe_parser::pe_info_t& pe,
+			const std::string& module_name)
+		{
+			c.data_symbol_lookup.clear();
+			populate_pdb_symbols_into(c.data_symbol_lookup, module_name);
+			for (const auto& exp : pe.exports) {
+				if (exp.address == 0) continue;
+				if (exp.name.empty()) continue;
+				if (exp.is_forwarded) continue;
+				data_symbol_entry_t e;
+				e.name = exp.name;
+				e.is_function = true;
+				auto it = c.data_symbol_lookup.find(exp.address);
+				if (it == c.data_symbol_lookup.end()) {
+					c.data_symbol_lookup.emplace(exp.address, std::move(e));
+				}
+			}
+		}
+
 		inline void rebuild_bounds_index(uint64_t module_base, uint32_t module_size,
 			const std::string& module_name)
 		{
@@ -619,6 +1057,8 @@ namespace function_index {
 				c.synthetic_names.clear();
 				c.align_runs_by_start.clear();
 				c.align_run_starts.clear();
+				c.iat_lookup.clear();
+				c.data_symbol_lookup.clear();
 				c.text_blob.clear();
 				c.text_blob_va = 0;
 				c.cached_module_base = module_base;
@@ -760,6 +1200,271 @@ namespace function_index {
 			c.cached_entry_point = pe.entry_point;
 			c.cached_subsystem = pe.subsystem;
 			c.cached_characteristics = static_cast<uint16_t>(pe.characteristics);
+			populate_iat_from_imports_locked(c, pe.imports);
+			populate_data_symbols_locked(c, pe, module_name);
+			rebuild_align_runs_locked(c);
+			apply_entry_point_naming_locked(c, pe);
+		}
+
+		inline void rebuild_bounds_index_static(const std::string& module_name)
+		{
+			if (!static_pe_active()) {
+				cache_t& c = cache();
+				std::unique_lock<std::shared_mutex> lk(c.mutex);
+				c.by_start.clear();
+				c.status_by_start.clear();
+				c.addr_to_func_start.clear();
+				c.sorted_starts.clear();
+				c.synthetic_names.clear();
+				c.align_runs_by_start.clear();
+				c.align_run_starts.clear();
+				c.iat_lookup.clear();
+				c.data_symbol_lookup.clear();
+				c.text_blob.clear();
+				c.text_blob_va = 0;
+				c.cached_module_base = 0;
+				c.cached_module_size = 0;
+				c.cached_module_name = module_name;
+				c.cached_entry_point = 0;
+				c.cached_subsystem = 0;
+				c.cached_characteristics = 0;
+				return;
+			}
+
+			const std::string disk_path = g_disasm.file.path;
+			uint64_t module_base = g_disasm.file.image_base;
+			uint32_t module_size = 0;
+			uint64_t img_sz = static_analysis::total_image_size(g_disasm.file);
+			if (img_sz > 0xFFFFFFFFull) img_sz = 0xFFFFFFFFull;
+			module_size = static_cast<uint32_t>(img_sz);
+
+			std::shared_ptr<functions_panel::detail::disk_pe_view_t> view_ptr;
+			{
+				cache_t& cc = cache();
+				std::shared_lock<std::shared_mutex> lk(cc.mutex);
+				if (cc.static_pe_cached_view
+					&& cc.static_pe_cached_path == disk_path)
+				{
+					view_ptr = cc.static_pe_cached_view;
+				}
+			}
+			if (!view_ptr) {
+				auto fresh = std::make_shared<functions_panel::detail::disk_pe_view_t>();
+				if (!functions_panel::detail::disk_read_whole_file(disk_path, fresh->raw)
+					|| !functions_panel::detail::disk_parse_pe(*fresh))
+				{
+					cache_t& c = cache();
+					std::unique_lock<std::shared_mutex> lk(c.mutex);
+					c.by_start.clear();
+					c.status_by_start.clear();
+					c.addr_to_func_start.clear();
+					c.sorted_starts.clear();
+					c.synthetic_names.clear();
+					c.align_runs_by_start.clear();
+					c.align_run_starts.clear();
+					c.iat_lookup.clear();
+					c.data_symbol_lookup.clear();
+					c.text_blob.clear();
+					c.text_blob_va = 0;
+					c.cached_module_base = module_base;
+					c.cached_module_size = module_size;
+					c.cached_module_name = module_name;
+					c.cached_entry_point = 0;
+					c.cached_subsystem = 0;
+					c.cached_characteristics = 0;
+					return;
+				}
+				view_ptr = fresh;
+				{
+					cache_t& cc = cache();
+					std::unique_lock<std::shared_mutex> lk(cc.mutex);
+					cc.static_pe_cached_view = view_ptr;
+					cc.static_pe_cached_path = disk_path;
+				}
+			}
+			functions_panel::detail::disk_pe_view_t& v = *view_ptr;
+
+			if (v.size_of_image != 0) {
+				module_size = v.size_of_image;
+			}
+
+			functions_panel::detail::trigger_disk_pdb_auto_load(disk_path, module_name,
+				v.image_base, v.size_of_image);
+
+			std::unordered_map<uint64_t, uint32_t> size_lookup;
+			std::vector<uint64_t> rf_starts;
+			functions_panel::detail::disk_parse_pdata(v, size_lookup, rf_starts);
+
+			std::unordered_map<uint64_t, std::string> export_lookup;
+			functions_panel::detail::disk_parse_exports(v, export_lookup);
+
+			std::vector<pe_parser::import_entry_t> import_entries;
+			functions_panel::detail::disk_parse_imports(v, import_entries);
+
+			pe_parser::pe_info_t pe;
+			pe.image_base = v.image_base;
+			pe.entry_point = (v.entry_rva != 0) ? (v.image_base + v.entry_rva) : 0;
+			pe.size_of_image = v.size_of_image;
+			pe.is_64bit = v.is_pe32_plus;
+			pe.export_dir_rva = v.export_dir_rva;
+			pe.export_dir_size = v.export_dir_size;
+			pe.import_dir_rva = v.import_dir_rva;
+			pe.import_dir_size = v.import_dir_size;
+			pe.sections.reserve(v.sections.size());
+			for (const auto& s : v.sections) {
+				pe_parser::section_info_t si;
+				si.name = s.name;
+				si.virtual_address = s.virtual_address;
+				si.virtual_size = (s.virtual_size != 0) ? s.virtual_size : s.raw_size;
+				si.raw_size = s.raw_size;
+				si.characteristics = s.characteristics;
+				pe.sections.push_back(std::move(si));
+			}
+			pe.exports.reserve(export_lookup.size());
+			for (const auto& kv : export_lookup) {
+				if (kv.first < v.image_base) continue;
+				pe_parser::export_entry_t e;
+				e.address = kv.first;
+				uint64_t rva64 = kv.first - v.image_base;
+				if (rva64 > 0xFFFFFFFFull) continue;
+				e.rva = static_cast<uint32_t>(rva64);
+				e.name = kv.second;
+				e.is_forwarded = false;
+				pe.exports.push_back(std::move(e));
+			}
+			pe.imports = std::move(import_entries);
+			pe.subsystem = 0;
+			pe.characteristics = 0;
+			{
+				const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(v.raw.data());
+				uint32_t pe_off = static_cast<uint32_t>(dos->e_lfanew);
+				if (v.is_pe32_plus
+					&& pe_off + sizeof(IMAGE_NT_HEADERS64) <= v.raw.size())
+				{
+					const auto* nt64 = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+						v.raw.data() + pe_off);
+					pe.subsystem = nt64->OptionalHeader.Subsystem;
+					pe.characteristics = nt64->FileHeader.Characteristics;
+				}
+				else if (!v.is_pe32_plus
+					&& pe_off + sizeof(IMAGE_NT_HEADERS32) <= v.raw.size())
+				{
+					const auto* nt32 = reinterpret_cast<const IMAGE_NT_HEADERS32*>(
+						v.raw.data() + pe_off);
+					pe.subsystem = nt32->OptionalHeader.Subsystem;
+					pe.characteristics = nt32->FileHeader.Characteristics;
+				}
+			}
+
+			std::vector<uint64_t> candidates;
+			candidates.reserve(rf_starts.size() + pe.exports.size() + 64);
+			for (uint64_t va : rf_starts) {
+				if (va >= module_base && va < module_base + module_size) {
+					candidates.push_back(va);
+				}
+			}
+			for (const auto& exp : pe.exports) {
+				if (exp.is_forwarded || exp.address == 0) continue;
+				if (exp.address < module_base) continue;
+				if (exp.address >= module_base + module_size) continue;
+				candidates.push_back(exp.address);
+			}
+
+			{
+				std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
+				auto it = symbol_store::g_state.modules.find(module_name);
+				if (it != symbol_store::g_state.modules.end() && it->second.pdb.loaded) {
+					for (const auto& sym : it->second.pdb.symbols) {
+						if (!sym.is_function) continue;
+						if (sym.rva == 0) continue;
+						uint64_t va = it->second.base + sym.rva;
+						if (va < module_base || va >= module_base + module_size) continue;
+						candidates.push_back(va);
+					}
+				}
+			}
+
+			if (pe.entry_point >= module_base && pe.entry_point < module_base + module_size) {
+				candidates.push_back(pe.entry_point);
+			}
+
+			std::sort(candidates.begin(), candidates.end());
+			candidates.erase(std::unique(candidates.begin(), candidates.end()),
+				candidates.end());
+
+			std::unordered_map<uint64_t, func_record_t>                  by_start;
+			std::unordered_map<uint64_t, std::shared_ptr<func_status_t>> status_by_start;
+			std::unordered_map<uint64_t, std::string>                    synthetic_names;
+			std::vector<uint64_t>                                        sorted_starts;
+			by_start.reserve(candidates.size());
+			status_by_start.reserve(candidates.size());
+			synthetic_names.reserve(candidates.size());
+			sorted_starts.reserve(candidates.size());
+
+			for (size_t i = 0; i < candidates.size(); ++i) {
+				uint64_t start = candidates[i];
+				uint64_t next = (i + 1 < candidates.size())
+					? candidates[i + 1]
+					: (module_base + module_size);
+
+				uint32_t pdata_size = 0;
+				auto sit = size_lookup.find(start);
+				if (sit != size_lookup.end()) {
+					pdata_size = sit->second;
+				}
+
+				uint64_t end = start + (pdata_size > 0 ? pdata_size : 1);
+				if (end > next) end = next;
+				if (end <= start) end = start + 1;
+				if (end > module_base + module_size) end = module_base + module_size;
+
+				func_record_t r;
+				r.start = start;
+				r.end = end;
+				r.section = section_name_for_va(pe, module_base, start);
+				r.display_name = resolve_display_name(start);
+				r.last_insn_addr = start;
+				synthetic_names.emplace(start, r.display_name);
+				by_start.emplace(start, std::move(r));
+				status_by_start.emplace(start, std::make_shared<func_status_t>());
+				sorted_starts.push_back(start);
+			}
+
+			std::unordered_map<uint64_t, uint64_t> addr_to_func_start;
+			addr_to_func_start.reserve(by_start.size());
+			for (const auto& kv : by_start) {
+				addr_to_func_start.emplace(kv.first, kv.first);
+			}
+
+			std::vector<uint8_t> text_blob;
+			uint64_t             text_blob_va = 0;
+			for (const auto& sec : g_disasm.file.sections) {
+				if (!sec.is_executable) continue;
+				if (sec.bytes.empty()) continue;
+				text_blob = sec.bytes;
+				text_blob_va = sec.va;
+				break;
+			}
+
+			cache_t& c = cache();
+			std::unique_lock<std::shared_mutex> lk(c.mutex);
+			c.by_start = std::move(by_start);
+			c.status_by_start = std::move(status_by_start);
+			c.addr_to_func_start = std::move(addr_to_func_start);
+			c.sorted_starts = std::move(sorted_starts);
+			c.synthetic_names = std::move(synthetic_names);
+			c.text_blob = std::move(text_blob);
+			c.text_blob_va = text_blob_va;
+			c.align_runs_by_start.clear();
+			c.align_run_starts.clear();
+			c.cached_module_base = module_base;
+			c.cached_module_size = module_size;
+			c.cached_module_name = module_name;
+			c.cached_entry_point = pe.entry_point;
+			c.cached_subsystem = pe.subsystem;
+			c.cached_characteristics = static_cast<uint16_t>(pe.characteristics);
+			populate_iat_from_imports_locked(c, pe.imports);
+			populate_data_symbols_locked(c, pe, module_name);
 			rebuild_align_runs_locked(c);
 			apply_entry_point_naming_locked(c, pe);
 		}
@@ -922,6 +1627,54 @@ namespace function_index {
 			return std::string(buf);
 		}
 
+		inline int x64_arg_register_index(ZydisRegister reg) {
+			std::string c = canonical_register_name(reg);
+			if (c == "rcx" || c == "ecx" || c == "cx" || c == "cl") return 0;
+			if (c == "rdx" || c == "edx" || c == "dx" || c == "dl") return 1;
+			if (c == "r8"  || c == "r8d" || c == "r8w" || c == "r8b") return 2;
+			if (c == "r9"  || c == "r9d" || c == "r9w" || c == "r9b") return 3;
+			return -1;
+		}
+
+		inline bool resolve_call_target(const ZydisDecodedInstruction& ins,
+			const ZydisDecodedOperand* operands, uint64_t va, uint64_t& out_target,
+			uint64_t& out_iat_va);
+
+		inline std::string iat_lookup_function_locked(cache_t& c, uint64_t iat_va) {
+			auto it = c.iat_lookup.find(iat_va);
+			if (it == c.iat_lookup.end()) return std::string();
+			return it->second.function_name;
+		}
+
+		inline const prototype_entry_t* lookup_prototype_for_call(
+			const ZydisDecodedInstruction& call_ins,
+			const ZydisDecodedOperand* call_operands,
+			uint64_t call_va)
+		{
+			uint64_t target = 0;
+			uint64_t iat_va = 0;
+			if (!resolve_call_target(call_ins, call_operands, call_va, target, iat_va)) {
+				return nullptr;
+			}
+			std::string name;
+			if (iat_va != 0) {
+				cache_t& c = cache();
+				std::shared_lock<std::shared_mutex> lk(c.mutex);
+				name = iat_lookup_function_locked(c, iat_va);
+			}
+			if (name.empty()) {
+				std::string thunk_name = lookup_thunk_target_name(target, iat_va);
+				if (!thunk_name.empty() && thunk_name.compare(0, 4, "sub_") != 0) {
+					name = thunk_name;
+				}
+			}
+			if (name.empty()) return nullptr;
+			if (name.size() >= 6 && name.compare(0, 6, "__imp_") == 0) {
+				name = name.substr(6);
+			}
+			return lookup_prototype_entry(name);
+		}
+
 		struct sp_tracker_state_t {
 			int64_t                                   sp_delta = 0;
 			int64_t                                   min_sp_delta = 0;
@@ -970,7 +1723,7 @@ namespace function_index {
 					if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &op, va, &iat_va))) {
 						out_iat_va = iat_va;
 						std::vector<uint8_t> ind;
-						if (driver_bridge::read_memory(iat_va, 8, ind)
+						if (read_routed_bytes(iat_va, 8, ind)
 							&& ind.size() >= 8)
 						{
 							uint64_t ptr = 0;
@@ -1035,7 +1788,7 @@ namespace function_index {
 						}
 						iat_va = computed_iat;
 						std::vector<uint8_t> ind;
-						if (driver_bridge::read_memory(iat_va, 8, ind)
+						if (read_routed_bytes(iat_va, 8, ind)
 							&& ind.size() >= 8)
 						{
 							std::memcpy(&target, ind.data(), 8);
@@ -1097,7 +1850,7 @@ namespace function_index {
 					return false;
 				}
 				std::vector<uint8_t> ind;
-				if (driver_bridge::read_memory(iat_va, 8, ind) && ind.size() >= 8) {
+				if (read_routed_bytes(iat_va, 8, ind) && ind.size() >= 8) {
 					std::memcpy(&target, ind.data(), 8);
 				}
 				if (target == 0 && iat_va == 0) return false;
@@ -1264,7 +2017,7 @@ namespace function_index {
 
 			std::vector<uint8_t> tbl;
 			size_t needed = static_cast<size_t>(case_count) * entry_size;
-			if (!driver_bridge::read_memory(table_va, needed, tbl)) return false;
+			if (!read_routed_bytes(table_va, needed, tbl)) return false;
 			if (tbl.size() < needed) return false;
 
 			std::vector<uint64_t> case_addrs;
@@ -1313,7 +2066,7 @@ namespace function_index {
 			if (span > 0x100000) span = 0x100000;
 
 			std::vector<uint8_t> bytes;
-			if (!driver_bridge::read_memory(r.start, span, bytes)) return;
+			if (!read_routed_bytes(r.start, span, bytes)) return;
 			if (bytes.empty()) return;
 
 			zydis_detail::ensure_init();
@@ -1326,7 +2079,7 @@ namespace function_index {
 			std::vector<lookback_entry_t> decoded_seq;
 			decoded_seq.reserve(8);
 
-			constexpr size_t kRingSize = 6;
+			constexpr size_t kRingSize = 12;
 			std::vector<lookback_entry_t> ring(kRingSize);
 			size_t ring_pos = 0;
 
@@ -1518,6 +2271,9 @@ namespace function_index {
 							uint64_t tgt = 0;
 							if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &op, va, &tgt))) {
 								call_targets.push_back(tgt);
+								if (target_is_noreturn(tgt, 0)) {
+									r.noreturn_call_addrs.insert(va);
+								}
 								if (sp.have_chkstk_pending) {
 									std::string near_name = symbol_store::resolve_symbol(tgt);
 									if (!near_name.empty()
@@ -1540,12 +2296,73 @@ namespace function_index {
 							uint64_t iat_va = 0;
 							if (resolve_call_target(ins, operands, va, target, iat_va)) {
 								if (target != 0) call_targets.push_back(target);
+								if (target_is_noreturn(target, iat_va)) {
+									r.noreturn_call_addrs.insert(va);
+								}
 							}
 						}
 						else {
 							sp.have_chkstk_pending = false;
 						}
 					}
+
+					const prototype_entry_t* proto = lookup_prototype_for_call(ins, operands, va);
+					if (proto != nullptr) {
+						bool reg_seen[4] = { false, false, false, false };
+						for (size_t step = 1; step <= kRingSize; ++step) {
+							size_t idx = (ring_pos + kRingSize - 1 - step) % kRingSize;
+							const lookback_entry_t& prev = ring[idx];
+							if (!prev.valid) continue;
+							if (prev.va == va) continue;
+							const ZydisDecodedInstruction& pins = prev.ins;
+							if (pins.meta.category == ZYDIS_CATEGORY_CALL) break;
+							if (pins.meta.category == ZYDIS_CATEGORY_RET) break;
+							if (pins.operand_count_visible == 0) continue;
+							const ZydisDecodedOperand& dst = prev.operands[0];
+							if (dst.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+								int aidx = x64_arg_register_index(dst.reg.value);
+								if (aidx >= 0 && aidx < 4 && !reg_seen[aidx]) {
+									reg_seen[aidx] = true;
+									const char* pname = prototype_param_name(*proto,
+										static_cast<size_t>(aidx));
+									if (pname && *pname && r.inline_comments.find(prev.va)
+										== r.inline_comments.end())
+									{
+										r.inline_comments[prev.va] = std::string(pname);
+									}
+								}
+							}
+							else if (dst.type == ZYDIS_OPERAND_TYPE_MEMORY
+								&& pins.mnemonic == ZYDIS_MNEMONIC_MOV
+								&& is_rsp_family(dst.mem.base)
+								&& dst.mem.index == ZYDIS_REGISTER_NONE
+								&& dst.mem.disp.size != 0
+								&& !sp.sp_failed)
+							{
+								int64_t pdisp = dst.mem.disp.value;
+								if (pdisp >= 0x20 && pdisp < 0x200) {
+									int64_t slot_index = pdisp / 8;
+									if (slot_index >= 4 && slot_index < 12) {
+										const char* pname = prototype_param_name(*proto,
+											static_cast<size_t>(slot_index));
+										if (pname && *pname) {
+											auto erit = r.rsp_access_entry_relative.find(prev.va);
+											if (erit != r.rsp_access_entry_relative.end()) {
+												int64_t entry_off = erit->second;
+												r.rsp_access_substitution[prev.va] = pname;
+												auto cmtit = r.inline_comments.find(prev.va);
+												if (cmtit == r.inline_comments.end()) {
+													r.inline_comments[prev.va] = std::string(pname);
+												}
+												r.prototype_slot_names[entry_off] = pname;
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+
 					sp.saw_call_or_branch = true;
 				}
 
@@ -1586,6 +2403,28 @@ namespace function_index {
 							r.inline_labels[sw.default_addr] = std::move(dn);
 						}
 						r.switches.push_back(std::move(sw));
+					}
+					else if (ins.operand_count_visible >= 1) {
+						const auto& jop = operands[0];
+						if (jop.type == ZYDIS_OPERAND_TYPE_IMMEDIATE && jop.imm.is_relative) {
+							uint64_t jtgt = 0;
+							if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &jop, va, &jtgt))) {
+								if (jtgt < r.start || jtgt >= r.end) {
+									if (target_is_noreturn(jtgt, 0)) {
+										r.noreturn_call_addrs.insert(va);
+									}
+								}
+							}
+						}
+						else if (jop.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+							uint64_t target = 0;
+							uint64_t iat_va = 0;
+							if (resolve_call_target(ins, operands, va, target, iat_va)) {
+								if (target_is_noreturn(target, iat_va)) {
+									r.noreturn_call_addrs.insert(va);
+								}
+							}
+						}
 					}
 				}
 
@@ -1702,6 +2541,17 @@ namespace function_index {
 			r.ret_addrs = std::move(ret_addrs);
 			r.last_insn_addr = last_insn_addr;
 
+			if (!r.prototype_slot_names.empty()) {
+				for (auto& kv : r.rsp_access_substitution) {
+					auto erit = r.rsp_access_entry_relative.find(kv.first);
+					if (erit == r.rsp_access_entry_relative.end()) continue;
+					auto pit = r.prototype_slot_names.find(erit->second);
+					if (pit == r.prototype_slot_names.end()) continue;
+					if (pit->second.empty()) continue;
+					kv.second = pit->second;
+				}
+			}
+
 			std::vector<var_slot_t> vars;
 			vars.reserve(var_map.size());
 			for (auto& kv : var_map) {
@@ -1759,7 +2609,19 @@ namespace function_index {
 					var_slot_t v;
 					v.offset = off;
 					v.size = kv.second;
-					if (off < 0) {
+					auto pit = r.prototype_slot_names.find(off);
+					if (pit != r.prototype_slot_names.end() && !pit->second.empty()) {
+						v.prototype_name = pit->second;
+					}
+					if (!v.prototype_name.empty() && off < 0) {
+						v.kind = slot_kind_t::local_var;
+						v.name = v.prototype_name;
+					}
+					else if (!v.prototype_name.empty() && off >= 0x20) {
+						v.kind = slot_kind_t::stack_arg;
+						v.name = v.prototype_name;
+					}
+					else if (off < 0) {
 						v.kind = slot_kind_t::local_var;
 						v.name = "var_" + format_hex_upper(static_cast<uint64_t>(-off));
 					}
@@ -1816,6 +2678,96 @@ namespace function_index {
 					: std::string("loc_") + format_hex_upper(ls.addr) + ":";
 				r.inline_labels.emplace(ls.addr, std::move(nm));
 			}
+
+			if (!r.display_name.empty()
+				&& r.display_name.rfind("sub_", 0) != 0
+				&& r.display_name.rfind("j_", 0) != 0
+				&& name_is_library_function(r.display_name))
+			{
+				r.is_library = true;
+			}
+
+			if (!bytes.empty()) {
+				size_t fn_span = bytes.size();
+				if (r.end > r.start && (r.end - r.start) < fn_span) {
+					fn_span = static_cast<size_t>(r.end - r.start);
+				}
+				if (r.ret_addrs.empty() && !r.noreturn_call_addrs.empty()) {
+					r.always_noreturn = true;
+				}
+
+				for (uint64_t nc_va : r.noreturn_call_addrs) {
+					if (nc_va < r.start || nc_va >= r.end) continue;
+					size_t nc_off = static_cast<size_t>(nc_va - r.start);
+					if (nc_off >= fn_span) continue;
+					ZydisDecodedInstruction nins;
+					ZydisDecodedOperand nops[ZYDIS_MAX_OPERAND_COUNT];
+					size_t avail = fn_span - nc_off;
+					if (avail > 15) avail = 15;
+					if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec,
+						bytes.data() + nc_off, avail, &nins, nops)))
+					{
+						continue;
+					}
+					size_t after_off = nc_off + nins.length;
+					size_t pad_start = after_off;
+					size_t pad_end = pad_start;
+					while (pad_end < fn_span && bytes[pad_end] == 0xCC) {
+						++pad_end;
+					}
+					if (pad_end == pad_start) continue;
+
+					uint64_t pad_start_va = r.start + static_cast<uint64_t>(pad_start);
+					uint64_t pad_end_va   = r.start + static_cast<uint64_t>(pad_end);
+
+					std::vector<uint8_t> lookahead_bytes;
+					bool lookahead_loaded = false;
+					if (pad_end_va > r.end) {
+						read_routed_bytes(pad_end_va, 16, lookahead_bytes);
+						lookahead_loaded = !lookahead_bytes.empty();
+					}
+
+					for (uint64_t cur = pad_start_va; cur < pad_end_va; ++cur) {
+						uint64_t one_va = cur;
+						uint64_t next_byte_va = cur + 1;
+						bool next_is_cc = false;
+						if (next_byte_va < pad_end_va) {
+							next_is_cc = true;
+						}
+						else {
+							size_t lookahead_off = static_cast<size_t>(next_byte_va - r.start);
+							if (lookahead_off < bytes.size() && bytes[lookahead_off] == 0xCC) {
+								next_is_cc = true;
+							}
+							else if (lookahead_loaded && next_byte_va >= pad_end_va) {
+								size_t ext_off = static_cast<size_t>(next_byte_va - pad_end_va);
+								if (ext_off < lookahead_bytes.size()
+									&& lookahead_bytes[ext_off] == 0xCC)
+								{
+									next_is_cc = true;
+								}
+							}
+						}
+						directive_override_t ov;
+						if (next_is_cc) {
+							ov.kind = directive_kind_t::db;
+							ov.value = 0xCC;
+						}
+						else {
+							uint8_t a = pick_intra_align(next_byte_va, 1);
+							if (a >= 2) {
+								ov.kind = directive_kind_t::align;
+								ov.value = a;
+							}
+							else {
+								ov.kind = directive_kind_t::db;
+								ov.value = 0xCC;
+							}
+						}
+						r.directive_overrides[one_va] = ov;
+					}
+				}
+			}
 		}
 
 		inline void build_before_after(func_record_t& r) {
@@ -1837,11 +2789,21 @@ namespace function_index {
 			injection_row_t sp2 = sp1;
 			r.before_first_insn.push_back(sp2);
 
-			if (r.bp_based) {
+			std::string attrs;
+			auto append_attr = [&](const char* token) {
+				if (!attrs.empty()) attrs += ' ';
+				attrs += token;
+			};
+			if (r.bp_based) append_attr("bp-based frame");
+			if (r.always_noreturn) append_attr("noreturn");
+			if (r.is_thunk) append_attr("thunk");
+			if (r.is_library) append_attr("library function");
+
+			if (!attrs.empty()) {
 				injection_row_t attr;
 				attr.kind = injection_t::attributes_line;
 				attr.addr = r.start;
-				attr.text = "; Attributes: bp-based frame";
+				attr.text = "; Attributes: " + attrs;
 				r.before_first_insn.push_back(std::move(attr));
 
 				injection_row_t sp_after_attr = sp1;
@@ -1912,7 +2874,9 @@ namespace function_index {
 			}
 
 			work_queue::post([func_start, status, mod_name]() {
-				if (driver_bridge::attached_pid() == 0) {
+				bool live = (driver_bridge::attached_pid() != 0);
+				bool static_loaded = static_pe_active();
+				if (!live && !static_loaded) {
 					status->state.store(static_cast<uint32_t>(func_state_t::idle),
 						std::memory_order_release);
 					return;
@@ -1958,6 +2922,9 @@ namespace function_index {
 					it->second.entry_to_exit_sp_delta = snapshot.entry_to_exit_sp_delta;
 					it->second.prologue_locals_size = snapshot.prologue_locals_size;
 					it->second.rsp_access_substitution = std::move(snapshot.rsp_access_substitution);
+					it->second.rsp_access_entry_relative = std::move(snapshot.rsp_access_entry_relative);
+					it->second.rsp_access_abs_offset = std::move(snapshot.rsp_access_abs_offset);
+					it->second.prototype_slot_names = std::move(snapshot.prototype_slot_names);
 					it->second.insn_kind_override = std::move(snapshot.insn_kind_override);
 					it->second.is_thunk = snapshot.is_thunk;
 					it->second.thunk_target = snapshot.thunk_target;
@@ -1973,6 +2940,10 @@ namespace function_index {
 					it->second.inline_labels = std::move(snapshot.inline_labels);
 					it->second.before_first_insn = std::move(snapshot.before_first_insn);
 					it->second.after_last_insn = std::move(snapshot.after_last_insn);
+					it->second.noreturn_call_addrs = std::move(snapshot.noreturn_call_addrs);
+					it->second.directive_overrides = std::move(snapshot.directive_overrides);
+					it->second.always_noreturn = snapshot.always_noreturn;
+					it->second.is_library = snapshot.is_library;
 					std::string final_name = snapshot.display_name;
 					if (it->second.is_thunk
 						&& rename_store::get(func_start).empty()
@@ -1987,6 +2958,16 @@ namespace function_index {
 
 				status->state.store(static_cast<uint32_t>(func_state_t::built),
 					std::memory_order_release);
+				c.built_seq.fetch_add(1u, std::memory_order_acq_rel);
+				uint32_t prev_pending = c.static_bulk_pending.load(std::memory_order_acquire);
+				if (prev_pending > 0u) {
+					c.static_bulk_pending.fetch_sub(1u, std::memory_order_acq_rel);
+					uint64_t now_ns_v = static_cast<uint64_t>(
+						std::chrono::duration_cast<std::chrono::nanoseconds>(
+							std::chrono::steady_clock::now().time_since_epoch()).count());
+					c.static_bulk_last_progress_ns.store(now_ns_v,
+						std::memory_order_release);
+				}
 			});
 		}
 
@@ -2005,7 +2986,9 @@ namespace function_index {
 
 			work_queue::post([]() {
 				cache_t& c2 = cache();
-				if (driver_bridge::attached_pid() == 0) {
+				bool live = (driver_bridge::attached_pid() != 0);
+				bool static_loaded = static_pe_active();
+				if (!live && !static_loaded) {
 					c2.bounds_state.store(static_cast<uint32_t>(bounds_state_t::idle),
 						std::memory_order_release);
 					return;
@@ -2014,14 +2997,25 @@ namespace function_index {
 				uint64_t base = 0;
 				uint32_t size = 0;
 				std::string name;
-				if (!fetch_active_module(base, size, name)) {
-					c2.bounds_state.store(static_cast<uint32_t>(bounds_state_t::failed),
-						std::memory_order_release);
-					return;
+				uint64_t pid_token = 0;
+				if (live) {
+					if (!fetch_active_module(base, size, name)) {
+						c2.bounds_state.store(static_cast<uint32_t>(bounds_state_t::failed),
+							std::memory_order_release);
+						return;
+					}
+					pid_token = static_cast<uint64_t>(driver_bridge::attached_pid())
+						^ (static_cast<uint64_t>(size) << 32);
 				}
-
-				uint64_t pid_token = static_cast<uint64_t>(driver_bridge::attached_pid())
-					^ (static_cast<uint64_t>(size) << 32);
+				else {
+					if (!fetch_static_module(base, size, name)) {
+						c2.bounds_state.store(static_cast<uint32_t>(bounds_state_t::failed),
+							std::memory_order_release);
+						return;
+					}
+					pid_token = std::hash<std::string>{}(g_disasm.file.path)
+						^ (static_cast<uint64_t>(g_disasm.file.image_base) << 32);
+				}
 
 				bool same = false;
 				{
@@ -2037,13 +3031,44 @@ namespace function_index {
 					return;
 				}
 
-				rebuild_bounds_index(base, size, name);
+				if (live) {
+					rebuild_bounds_index(base, size, name);
+				}
+				else {
+					rebuild_bounds_index_static(name);
+				}
 				{
 					std::unique_lock<std::shared_mutex> lk(c2.mutex);
 					c2.cached_pid_token = pid_token;
 				}
 				c2.bounds_state.store(static_cast<uint32_t>(bounds_state_t::ready),
 					std::memory_order_release);
+
+				if (live || static_pe_active()) {
+					std::vector<std::pair<uint64_t, std::shared_ptr<func_status_t>>> all_targets;
+					std::string mod_name;
+					{
+						std::shared_lock<std::shared_mutex> lk(c2.mutex);
+						mod_name = c2.cached_module_name;
+						all_targets.reserve(c2.sorted_starts.size());
+						for (uint64_t start : c2.sorted_starts) {
+							auto sit = c2.status_by_start.find(start);
+							if (sit == c2.status_by_start.end() || !sit->second) continue;
+							uint32_t st = sit->second->state.load(std::memory_order_acquire);
+							if (st != static_cast<uint32_t>(func_state_t::idle)) continue;
+							all_targets.emplace_back(start, sit->second);
+						}
+					}
+					if (!all_targets.empty()) {
+						c2.static_bulk_pending.store(static_cast<uint32_t>(all_targets.size()),
+							std::memory_order_release);
+						c2.static_bulk_last_progress_ns.store(0ull,
+							std::memory_order_release);
+						for (auto& kv : all_targets) {
+							schedule_function_build(kv.first, kv.second, mod_name);
+						}
+					}
+				}
 			});
 		}
 
@@ -2058,6 +3083,8 @@ namespace function_index {
 				c.synthetic_names.clear();
 				c.align_runs_by_start.clear();
 				c.align_run_starts.clear();
+				c.iat_lookup.clear();
+				c.data_symbol_lookup.clear();
 				c.text_blob.clear();
 				c.text_blob_va = 0;
 				c.cached_module_base = 0;
@@ -2067,9 +3094,13 @@ namespace function_index {
 				c.cached_entry_point = 0;
 				c.cached_subsystem = 0;
 				c.cached_characteristics = 0;
+				c.static_pe_cached_view.reset();
+				c.static_pe_cached_path.clear();
 			}
 			c.bounds_state.store(static_cast<uint32_t>(bounds_state_t::idle),
 				std::memory_order_release);
+			c.static_bulk_pending.store(0u, std::memory_order_release);
+			c.static_bulk_last_progress_ns.store(0ull, std::memory_order_release);
 
 			cached_module_table_t& t = cached_module_table();
 			{
@@ -2093,13 +3124,76 @@ namespace function_index {
 		return detail::make_synthetic_sub(addr);
 	}
 
+	inline std::string iat_symbol_at(uint64_t va) {
+		if (va == 0) return std::string();
+		detail::cache_t& c = detail::cache();
+		std::shared_lock<std::shared_mutex> lk(c.mutex);
+		auto it = c.iat_lookup.find(va);
+		if (it == c.iat_lookup.end()) return std::string();
+		return it->second.function_name;
+	}
+
+	inline bool iat_entry_at(uint64_t va, std::string& out_module, std::string& out_function) {
+		out_module.clear();
+		out_function.clear();
+		if (va == 0) return false;
+		detail::cache_t& c = detail::cache();
+		std::shared_lock<std::shared_mutex> lk(c.mutex);
+		auto it = c.iat_lookup.find(va);
+		if (it == c.iat_lookup.end()) return false;
+		out_module = it->second.module_name;
+		out_function = it->second.function_name;
+		return !out_function.empty();
+	}
+
+	inline std::string data_symbol_at(uint64_t va) {
+		if (va == 0) return std::string();
+		detail::cache_t& c = detail::cache();
+		std::shared_lock<std::shared_mutex> lk(c.mutex);
+		auto it = c.data_symbol_lookup.find(va);
+		if (it == c.data_symbol_lookup.end()) return std::string();
+		return it->second.name;
+	}
+
+	inline bool data_symbol_entry_at(uint64_t va, std::string& out_name, bool& out_is_function) {
+		out_name.clear();
+		out_is_function = false;
+		if (va == 0) return false;
+		detail::cache_t& c = detail::cache();
+		std::shared_lock<std::shared_mutex> lk(c.mutex);
+		auto it = c.data_symbol_lookup.find(va);
+		if (it == c.data_symbol_lookup.end()) return false;
+		out_name = it->second.name;
+		out_is_function = it->second.is_function;
+		return !out_name.empty();
+	}
+
 	inline void on_attach_changed() {
 		detail::reset_all();
 	}
 
+	inline void on_file_loaded() {
+		detail::reset_all();
+		if (detail::static_pe_active()) {
+			detail::schedule_bounds_rebuild();
+		}
+	}
+
+	inline bool static_bulk_in_progress() {
+		detail::cache_t& c = detail::cache();
+		return c.static_bulk_pending.load(std::memory_order_acquire) > 0u;
+	}
+
+	inline uint64_t static_bulk_last_progress_ns() {
+		detail::cache_t& c = detail::cache();
+		return c.static_bulk_last_progress_ns.load(std::memory_order_acquire);
+	}
+
 	inline void warm_range(uint64_t lo_addr, uint64_t hi_addr) {
 		if (lo_addr >= hi_addr) return;
-		if (driver_bridge::attached_pid() == 0) return;
+		bool live = (driver_bridge::attached_pid() != 0);
+		bool static_loaded = detail::static_pe_active();
+		if (!live && !static_loaded) return;
 
 		detail::cache_t& c = detail::cache();
 		uint32_t bs = c.bounds_state.load(std::memory_order_acquire);
@@ -2508,6 +3602,69 @@ namespace function_index {
 		if (rit == c.by_start.end()) return false;
 		const auto& rec = rit->second;
 		return va > rec.start && va < rec.end;
+	}
+
+	inline bool is_noreturn_call_at(uint64_t va) {
+		detail::cache_t& c = detail::cache();
+		std::shared_lock<std::shared_mutex> lk(c.mutex);
+		if (c.sorted_starts.empty()) return false;
+		auto it = std::upper_bound(c.sorted_starts.begin(), c.sorted_starts.end(), va);
+		if (it == c.sorted_starts.begin()) return false;
+		--it;
+		uint64_t func_start = *it;
+		auto rit = c.by_start.find(func_start);
+		if (rit == c.by_start.end()) return false;
+		const auto& rec = rit->second;
+		if (va < rec.start || va >= rec.end) return false;
+		auto stit = c.status_by_start.find(func_start);
+		if (stit == c.status_by_start.end() || !stit->second) return false;
+		if (stit->second->state.load(std::memory_order_acquire)
+			!= static_cast<uint32_t>(detail::func_state_t::built))
+		{
+			return false;
+		}
+		return rec.noreturn_call_addrs.count(va) != 0;
+	}
+
+	inline bool directive_override_at(uint64_t va, directive_override_t* out) {
+		detail::cache_t& c = detail::cache();
+		std::shared_lock<std::shared_mutex> lk(c.mutex);
+		if (c.sorted_starts.empty()) return false;
+		auto it = std::upper_bound(c.sorted_starts.begin(), c.sorted_starts.end(), va);
+		if (it == c.sorted_starts.begin()) return false;
+		--it;
+		uint64_t func_start = *it;
+		auto rit = c.by_start.find(func_start);
+		if (rit == c.by_start.end()) return false;
+		const auto& rec = rit->second;
+		if (va < rec.start || va >= rec.end) return false;
+		auto stit = c.status_by_start.find(func_start);
+		if (stit == c.status_by_start.end() || !stit->second) return false;
+		if (stit->second->state.load(std::memory_order_acquire)
+			!= static_cast<uint32_t>(detail::func_state_t::built))
+		{
+			return false;
+		}
+		auto oit = rec.directive_overrides.find(va);
+		if (oit == rec.directive_overrides.end()) return false;
+		if (out) *out = oit->second;
+		return true;
+	}
+
+	inline bool function_is_always_noreturn(uint64_t func_start) {
+		detail::cache_t& c = detail::cache();
+		std::shared_lock<std::shared_mutex> lk(c.mutex);
+		auto it = c.by_start.find(func_start);
+		if (it == c.by_start.end()) return false;
+		return it->second.always_noreturn;
+	}
+
+	inline bool function_is_library(uint64_t func_start) {
+		detail::cache_t& c = detail::cache();
+		std::shared_lock<std::shared_mutex> lk(c.mutex);
+		auto it = c.by_start.find(func_start);
+		if (it == c.by_start.end()) return false;
+		return it->second.is_library;
 	}
 
 }

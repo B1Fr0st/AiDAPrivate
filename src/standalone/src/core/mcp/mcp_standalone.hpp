@@ -95,7 +95,7 @@ namespace mcp_standalone
         json tool_schema(const tool_def_t& tool) const;
         std::vector<tool_def_t> _tools;
         std::mutex _tools_mtx;
-        std::thread _server_thread;
+        std::atomic<bool> _server_done{true};
         std::atomic<bool> _running{false};
         std::atomic<bool> _stop_requested{false};
         void* _active_server = nullptr;

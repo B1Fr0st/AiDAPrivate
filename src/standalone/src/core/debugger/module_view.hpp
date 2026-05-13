@@ -186,42 +186,81 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float left_w = width * 0.4f;
 	float right_w = width - left_w - 2.f;
 	float header_h = 32.f;
-	float row_h = 20.f;
-	float col_header_h = 22.f;
+	float row_h = 22.f;
+	float col_header_h = 26.f;
 
 	ui_anim::render_toolbar(dl, pos_x, pos_y, left_w, header_h, ar, ag, ab, alpha);
-	dl->AddText(ImVec2(pos_x + 10.f, pos_y + 8.f),
-				_ta(_t.text_primary), "Modules");
 
-	float refresh_x = pos_x + 80.f;
-	ImVec2 btn_min(refresh_x, pos_y + 4.f);
-	ImVec2 btn_max(refresh_x + 60.f, pos_y + 26.f);
+	ImVec2 mods_lbl_sz = ImGui::CalcTextSize("Modules");
+	dl->AddText(ImVec2(pos_x + 12.f, pos_y + (header_h - mods_lbl_sz.y) * 0.5f),
+				_ta(_t.text_primary), "Modules");
+	{
+		float ul_x = pos_x + 12.f;
+		float ul_y = pos_y + header_h - 3.f;
+		float ul_w = mods_lbl_sz.x;
+		ImU32 ul_top = aida::ui::with_alpha(_t.accent_grad_top, alpha * 0.95f);
+		ImU32 ul_bot = aida::ui::with_alpha(_t.accent_grad_bot, alpha * 0.95f);
+		dl->AddRectFilledMultiColor(ImVec2(ul_x, ul_y), ImVec2(ul_x + ul_w, ul_y + 2.f),
+								   ul_top, ul_top, ul_bot, ul_bot);
+		dl->AddRectFilled(ImVec2(ul_x - 4.f, ul_y - 2.f), ImVec2(ul_x + ul_w + 4.f, ul_y + 4.f),
+		                  aida::ui::with_alpha(_t.accent_glow, alpha * 0.40f), 1.f);
+	}
+
+	float refresh_w = 78.f;
+	float refresh_h = 24.f;
+	float refresh_x = pos_x + 18.f + mods_lbl_sz.x + 14.f;
+	float refresh_y = pos_y + (header_h - refresh_h) * 0.5f;
+	ImVec2 btn_min(refresh_x, refresh_y);
+	ImVec2 btn_max(refresh_x + refresh_w, refresh_y + refresh_h);
 	bool btn_hover = ImGui::IsMouseHoveringRect(btn_min, btn_max, false);
-	dl->AddRectFilled(btn_min, btn_max,
-					  btn_hover ? _ta(ui_anim::lighten(_t.panel_header, 14))
-								: _ta(_t.panel_header), 3.f);
-	dl->AddText(ImVec2(refresh_x + 8.f, pos_y + 7.f),
-				_ta(_t.text_secondary), "Refresh");
+	ImU32 btn_top = btn_hover ? aida::ui::with_alpha(_t.accent_grad_top, alpha * 0.95f)
+	                          : aida::ui::with_alpha(_t.accent_dim, alpha * 0.55f);
+	ImU32 btn_bot = btn_hover ? aida::ui::with_alpha(_t.accent_grad_bot, alpha * 0.95f)
+	                          : aida::ui::with_alpha(_t.accent_dim, alpha * 0.30f);
+	ImU32 btn_flat = aida::ui::mix(btn_top, btn_bot, 0.5f);
+	dl->AddRectFilled(btn_min, btn_max, btn_flat, 6.f);
+	dl->AddRect(btn_min, btn_max,
+	            btn_hover ? aida::ui::with_alpha(_t.accent_hover, alpha * 0.92f)
+	                      : aida::ui::with_alpha(_t.accent_dim, alpha * 0.75f),
+	            6.f, 0, 1.0f);
+	ImVec2 ref_sz = ImGui::CalcTextSize("Refresh");
+	dl->AddText(ImVec2(refresh_x + (refresh_w - ref_sz.x) * 0.5f,
+	                    refresh_y + (refresh_h - ref_sz.y) * 0.5f),
+				btn_hover ? aida::ui::with_alpha(IM_COL32(255,255,255,255), alpha * 0.96f)
+				          : aida::ui::with_alpha(_t.text_primary, alpha * 0.92f),
+				"Refresh");
 	if (btn_hover && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 		refresh();
 
 	static char mod_list_filter[64] = {};
 	float mlf_x = pos_x + left_w - 160.f;
-	ImGui::SetCursorScreenPos(ImVec2(mlf_x, pos_y + 5.f));
+	ImGui::SetCursorScreenPos(ImVec2(mlf_x, pos_y + (header_h - 22.f) * 0.5f));
 	ImGui::PushItemWidth(140.f);
 	ImGui::PushID("##modlistfilter");
 	ImGui::InputText("##mlf", mod_list_filter, sizeof(mod_list_filter));
 	ImGui::PopID();
 	ImGui::PopItemWidth();
 
-	float mod_col_name = pos_x + 10.f;
-	float mod_col_base = pos_x + left_w * 0.45f;
-	float mod_col_size = pos_x + left_w * 0.75f;
+	float base_col_w = 150.f;
+	float size_col_w = 100.f;
+	float col_inner_pad = 10.f;
+	float row_left_pad = 12.f;
+	float name_col_w = left_w - base_col_w - size_col_w - row_left_pad - 14.f - col_inner_pad * 2.f;
+	if (name_col_w < 80.f) name_col_w = 80.f;
+
+	float mod_col_name = pos_x + row_left_pad;
+	float mod_col_base = mod_col_name + name_col_w + col_inner_pad;
+	float mod_col_size = mod_col_base + base_col_w + col_inner_pad;
 
 	float mod_table_y = pos_y + header_h;
 	{
-		ui_anim::table_col_t cols[] = {{"Name", left_w * 0.45f - 10.f}, {"Base", left_w * 0.3f}, {"Size", left_w * 0.25f}};
-		ui_anim::render_table_header(dl, pos_x, mod_table_y, left_w, col_header_h, cols, 3, ar, ag, ab, alpha);
+		ui_anim::table_col_t cols[] = {
+			{"Name", name_col_w + col_inner_pad},
+			{"Base", base_col_w + col_inner_pad},
+			{"Size", size_col_w}
+		};
+		ui_anim::render_table_header(dl, pos_x + row_left_pad - 8.f, mod_table_y,
+			left_w - (row_left_pad - 8.f), col_header_h, cols, 3, ar, ag, ab, alpha);
 	}
 	ImU32 hdr_col = _ta(_t.text_secondary);
 
@@ -268,17 +307,32 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (clicked)
 			load_module_details_by_base(m.base);
 
-		dl->AddText(ImVec2(mod_col_name, ry + 2.f),
-					_ta(_t.text_primary), m.name.c_str());
+		std::string display_name = m.name;
+		float max_name_w = name_col_w;
+		ImVec2 full_sz = ImGui::CalcTextSize(display_name.c_str());
+		if (full_sz.x > max_name_w) {
+			std::string truncated = display_name;
+			while (truncated.size() > 1) {
+				truncated.pop_back();
+				ImVec2 ts = ImGui::CalcTextSize((truncated + "...").c_str());
+				if (ts.x <= max_name_w) break;
+			}
+			display_name = truncated + "...";
+		}
+		dl->PushClipRect(ImVec2(mod_col_name - 2.f, ry),
+		                 ImVec2(mod_col_name + name_col_w, ry + row_h), true);
+		dl->AddText(ImVec2(mod_col_name, ry + 3.f),
+					_ta(_t.text_primary), display_name.c_str());
+		dl->PopClipRect();
 
 		char base_buf[24];
 		snprintf(base_buf, sizeof(base_buf), "%016llX", static_cast<unsigned long long>(m.base));
-		dl->AddText(ImVec2(mod_col_base, ry + 2.f),
+		dl->AddText(ImVec2(mod_col_base, ry + 3.f),
 					_ta(_t.text_secondary), base_buf);
 
 		char size_buf[16];
 		snprintf(size_buf, sizeof(size_buf), "%08X", m.size);
-		dl->AddText(ImVec2(mod_col_size, ry + 2.f),
+		dl->AddText(ImVec2(mod_col_size, ry + 3.f),
 					_ta(_t.text_secondary), size_buf);
 	}
 

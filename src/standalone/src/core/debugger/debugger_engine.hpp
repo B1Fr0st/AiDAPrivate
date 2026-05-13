@@ -190,7 +190,7 @@ struct state_t {
 	std::vector<string_ref_t>    strings;
 
 
-	std::thread                  worker_thread;
+	std::atomic<bool>            worker_thread_done{true};
 	std::atomic<bool>            worker_active{false};
 
 

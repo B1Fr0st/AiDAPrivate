@@ -183,7 +183,7 @@ namespace
         if (!g_driver_watchdog_started.compare_exchange_strong(expected, true)) {
             return;
         }
-        std::thread(driver_watchdog_thread).detach();
+        work_queue::post([]() { driver_watchdog_thread(); });
     }
 
     std::atomic<bool> g_event_poller_started{false};
@@ -297,7 +297,7 @@ namespace
         if (!g_event_poller_started.compare_exchange_strong(expected, true)) {
             return;
         }
-        std::thread(event_poller_thread).detach();
+        work_queue::post([]() { event_poller_thread(); });
     }
 
     std::string utf8_from_wide(const wchar_t* text)

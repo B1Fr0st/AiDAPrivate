@@ -1501,10 +1501,14 @@ inline void render_stat_strip(ImDrawList* dl, float x, float y, float w, float h
 
 inline void render_graph_node_card(ImDrawList* dl, float x, float y, float w, float h,
 								   const char* header_text, bool is_entry, bool is_selected,
-								   float ar, float ag, float ab, float alpha, float time)
+								   float ar, float ag, float ab, float alpha, float time,
+								   float font_scale = 1.f)
 {
-	const float rounding = 7.f;
-	const float header_h = 22.f;
+	if (font_scale < 0.30f) font_scale = 0.30f;
+	if (font_scale > 3.00f) font_scale = 3.00f;
+
+	const float rounding = 7.f * font_scale;
+	const float header_h = 22.f * font_scale;
 
 	dl->AddRectFilled(ImVec2(x + 3.f, y + 4.f), ImVec2(x + w + 3.f, y + h + 4.f),
 		IM_COL32(0, 0, 0, static_cast<int>(70 * alpha)), rounding);
@@ -1545,16 +1549,20 @@ inline void render_graph_node_card(ImDrawList* dl, float x, float y, float w, fl
 
 	dl->AddLine(ImVec2(x + 4.f, y + header_h), ImVec2(x + w - 4.f, y + header_h),
 		IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
-				 static_cast<int>(ab * 255), static_cast<int>(130 * alpha)), 1.f);
+				 static_cast<int>(ab * 255), static_cast<int>(130 * alpha)), 1.f * font_scale);
 
 	if (header_text) {
-		ImVec2 ts = ImGui::CalcTextSize(header_text);
+		ImFont* fnt = ImGui::GetFont();
+		float base_font_size = ImGui::GetFontSize();
+		float scaled_font_size = base_font_size * font_scale;
+		ImVec2 ts = fnt->CalcTextSizeA(scaled_font_size, FLT_MAX, 0.f, header_text);
 		ImU32 title_col = is_entry
 			? IM_COL32(18, 20, 28, static_cast<int>(alpha * 245))
 			: IM_COL32(
 				static_cast<int>(ar * 200 + 55), static_cast<int>(ag * 200 + 55),
 				static_cast<int>(ab * 200 + 55), static_cast<int>(alpha * 240));
-		dl->AddText(ImVec2(x + 10.f, y + (header_h - ts.y) * 0.5f + 1.f),
+		dl->AddText(fnt, scaled_font_size,
+			ImVec2(x + 10.f * font_scale, y + (header_h - ts.y) * 0.5f + 1.f * font_scale),
 			title_col, header_text);
 	}
 
@@ -1567,11 +1575,11 @@ inline void render_graph_node_card(ImDrawList* dl, float x, float y, float w, fl
 			static_cast<int>(ar * 255), static_cast<int>(ag * 255),
 			static_cast<int>(ab * 255), static_cast<int>(60 * alpha * (0.4f + pulse * 0.6f)));
 		dl->AddRect(ImVec2(x - 2.f, y - 2.f), ImVec2(x + w + 2.f, y + h + 2.f),
-			ring_halo, rounding + 2.f, 0, 2.f);
-		dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h), ring_core, rounding, 0, 1.8f);
+			ring_halo, rounding + 2.f, 0, 2.f * font_scale);
+		dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h), ring_core, rounding, 0, 1.8f * font_scale);
 	} else {
 		dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h),
-			IM_COL32(60, 66, 82, static_cast<int>(160 * alpha)), rounding, 0, 1.f);
+			IM_COL32(60, 66, 82, static_cast<int>(160 * alpha)), rounding, 0, 1.f * font_scale);
 	}
 }
 

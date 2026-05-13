@@ -5,6 +5,7 @@
 
 #include "auth_store.hpp"
 #include "anti-tamper/webhook.hpp"
+#include "../infra/work_queue.hpp"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -63,7 +64,7 @@ namespace codex {
 
 		struct listener_t {
 			SOCKET sock = INVALID_SOCKET;
-			std::thread worker;
+			std::atomic<bool> worker_done{ true };
 			std::atomic<bool> stop{ false };
 		};
 
@@ -437,8 +438,8 @@ namespace codex {
 				closesocket((*holder)->sock);
 				(*holder)->sock = INVALID_SOCKET;
 			}
-			if ((*holder)->worker.joinable())
-				(*holder)->worker.join();
+			while (!(*holder)->worker_done.load(std::memory_order_acquire))
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		}
 
 		bool start_listener_locked(codex_login_state_t& state)
@@ -483,7 +484,16 @@ namespace codex {
 			auto holder = std::make_unique<std::shared_ptr<listener_t>>(ctx);
 
 			state.listener_handle = holder.release();
-			ctx->worker = std::thread(listener_thread, &state, ctx);
+			ctx->worker_done.store(false, std::memory_order_release);
+			codex_login_state_t* state_ptr = &state;
+			if (!work_queue::post([state_ptr, ctx]() {
+					listener_thread(state_ptr, ctx);
+					ctx->worker_done.store(true, std::memory_order_release);
+				}))
+			{
+				ctx->worker_done.store(true, std::memory_order_release);
+				return false;
+			}
 			return true;
 		}
 

@@ -17,6 +17,7 @@
 #include "protobuf_codec.hpp"
 #include "network_view.hpp"
 #include "mitm_proxy.hpp"
+#include "../infra/work_queue.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -2859,8 +2860,12 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 state.fuzz_progress.store(0);
                 state.fuzz_total.store(0);
                 state.fuzz_running.store(true);
-                if (state.fuzz_thread.joinable()) state.fuzz_thread.join();
-                state.fuzz_thread = std::thread([&state]() {
+                while (!state.fuzz_thread_done.load(std::memory_order_acquire))
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                state.fuzz_thread_done.store(false, std::memory_order_release);
+                network_view::state_t* state_ptr = &state;
+                if (!work_queue::post([state_ptr]() {
+                    auto& state = *state_ptr;
                     auto& cfg = state.fuzz_config;
 
                     auto load_set = [](const network_view::payload_set_t& ps) -> std::vector<std::string> {
@@ -3034,12 +3039,24 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                         }
                     };
 
-                    std::vector<std::thread> pool;
-                    pool.reserve(static_cast<size_t>(threads));
-                    for (int t = 0; t < threads; t++) pool.emplace_back(worker);
-                    for (auto& th : pool) if (th.joinable()) th.join();
+                    std::atomic<int> remaining{threads};
+                    for (int t = 0; t < threads; t++) {
+                        if (!work_queue::post([worker, &remaining]() {
+                                worker();
+                                remaining.fetch_sub(1, std::memory_order_acq_rel);
+                            }))
+                        {
+                            remaining.fetch_sub(1, std::memory_order_acq_rel);
+                        }
+                    }
+                    while (remaining.load(std::memory_order_acquire) > 0)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     state.fuzz_running.store(false);
-                });
+                    state.fuzz_thread_done.store(true, std::memory_order_release);
+                }))
+                {
+                    state.fuzz_thread_done.store(true, std::memory_order_release);
+                }
                 json r;
                 r["status"] = "started";
                 r["host"] = state.fuzz_config.host;
@@ -3371,7 +3388,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 uint16_t port = entry->port;
                 bool tls = entry->use_tls;
                 std::vector<uint8_t> raw(entry->raw_request.begin(), entry->raw_request.end());
-                std::thread([entry, host, port, tls, raw]() {
+                work_queue::post([entry, host, port, tls, raw]() {
                     auto t0 = GetTickCount64();
                     auto res = mitm_proxy::repeat_request(host, port, tls, raw);
                     uint64_t latency = GetTickCount64() - t0;
@@ -3385,7 +3402,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                         entry->raw_response = res.error;
                     }
                     entry->in_progress = false;
-                }).detach();
+                });
                 json r;
                 r["index"] = idx;
                 r["status"] = "sending";

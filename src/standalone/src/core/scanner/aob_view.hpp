@@ -191,7 +191,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		bool aw = gen.auto_wildcard;
 		aida::ui::toggle_switch("##aw", &aw, aida::ui::size_t_::sm);
 		gen.auto_wildcard = aw;
-		dl->AddText(aida::ui::fonts::caption(), 13.f,
+		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
 			ImVec2(cx + 40.f, cy + 4.f),
 			aida::ui::with_alpha(t.text_secondary, alpha), "Auto-wildcard");
 
@@ -199,7 +199,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		bool vu = gen.validate_uniqueness;
 		aida::ui::toggle_switch("##vu", &vu, aida::ui::size_t_::sm);
 		gen.validate_uniqueness = vu;
-		dl->AddText(aida::ui::fonts::caption(), 13.f,
+		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
 			ImVec2(cx + 200.f, cy + 4.f),
 			aida::ui::with_alpha(t.text_secondary, alpha), "Validate uniqueness");
 	}
@@ -276,7 +276,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		              current_copy.module_name.empty() ? "<unknown>" : current_copy.module_name.c_str(),
 		              current_copy.bytes.size(),
 		              current_copy.quality_score * 100.f);
-		dl->AddText(aida::ui::fonts::caption(), 13.f,
+		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
 			ImVec2(card_x + 12.f, cy + (card_h - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_secondary, alpha), info_buf);
 
@@ -301,7 +301,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			dl->AddText(aida::ui::fonts::body_em(), 13.f,
 				ImVec2(dot_cx - g_ts.x * 0.5f, dot_cy - 6.f),
 				IM_COL32(255, 255, 255, 245), grade_str);
-			dl->AddText(aida::ui::fonts::caption(), 13.f,
+			dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
 				ImVec2(dot_cx + 12.f, gy + (ph - 11.f) * 0.5f),
 				aida::ui::with_alpha(gc, 1.f), lbl);
 		}
@@ -324,11 +324,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			char hex[4];
 			if (current_copy.bytes[i].wildcard) {
 				hex[0] = '?'; hex[1] = '?'; hex[2] = 0;
-				dl->AddText(aida::ui::fonts::code(), 13.f,
+				dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
 					ImVec2(byte_x, byte_y), wild_col, hex);
 			} else {
 				std::snprintf(hex, sizeof(hex), "%02X", current_copy.bytes[i].value);
-				dl->AddText(aida::ui::fonts::code(), 13.f,
+				dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
 					ImVec2(byte_x, byte_y), fixed_col, hex);
 			}
 			byte_x += byte_w;
@@ -349,7 +349,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImVec2(ox + left_w - 12.f, cy + code_h),
 			aida::ui::with_alpha(t.border_subtle, alpha), 8.f, 0, 1.f);
 		ImGui::PushClipRect(ImVec2(cx, cy), ImVec2(ox + left_w - 16.f, cy + code_h), true);
-		dl->AddText(aida::ui::fonts::code(), 13.f,
+		dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
 			ImVec2(cx + 4.f, cy + (code_h - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_primary, alpha), fmt.c_str());
 		ImGui::PopClipRect();
@@ -529,19 +529,19 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				aida::ui::with_alpha(gc, 1.f), g_str);
 		}
 
-		dl->AddText(aida::ui::fonts::body(), 14.f,
+		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
 			ImVec2(rx + 38.f, row_y + (row_h - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_primary, alpha * entrance), sig.name.c_str());
 
 		float mid_x = rx + right_w * 0.42f;
-		dl->AddText(aida::ui::fonts::code(), 13.f,
+		dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
 			ImVec2(mid_x, row_y + (row_h - 11.f) * 0.5f),
 			aida::ui::with_alpha(t.text_address, alpha * entrance), addr_buf);
 
 		float end_x = rx + right_w * 0.65f;
 		char sz_buf[16];
 		std::snprintf(sz_buf, sizeof(sz_buf), "%zu B", sig.bytes.size());
-		dl->AddText(aida::ui::fonts::caption(), 13.f,
+		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
 			ImVec2(end_x, row_y + (row_h - 11.f) * 0.5f),
 			aida::ui::with_alpha(t.text_dim, alpha * entrance), sz_buf);
 

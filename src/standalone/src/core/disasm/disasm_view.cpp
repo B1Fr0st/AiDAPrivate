@@ -242,6 +242,260 @@ void bump_format_generation() {
     s_format_gen.fetch_add(1u, std::memory_order_release);
 }
 
+struct line_layout_t {
+    std::vector<int>      start_row;
+    std::vector<int>      before_extent;
+    std::vector<int>      after_extent;
+    std::vector<int>      before_row_count;
+    std::vector<int>      proc_xref_extra;
+    std::vector<int>      inline_label_extra;
+    std::vector<int>      inline_xref_extra;
+    std::vector<uint8_t>  align_extra;
+    std::vector<uint8_t>  hidden;
+    int                   total_rows = 0;
+    int                   banner_rows = 0;
+    uint32_t              built_gen = 0;
+    int                   built_n = 0;
+    uint64_t              built_addr_first = 0;
+    uint64_t              built_addr_last = 0;
+    uint64_t              built_fi_state_sig = 0;
+    uint64_t              built_at_ns = 0;
+    bool                  ready = false;
+};
+
+static line_layout_t s_layout;
+
+struct layout_row_metrics_t {
+    int  before_count = 0;
+    int  after_count = 0;
+    int  proc_xref_count = 0;
+    int  inline_xref_count = 0;
+    bool has_proc_header = false;
+    bool has_inline_label = false;
+    bool is_align_start = false;
+    bool has_noreturn_separator = false;
+    uint64_t align_end = 0;
+};
+
+static uint64_t function_index_state_signature() {
+    auto& fc = function_index::detail::cache();
+    uint64_t built_seq = fc.built_seq.load(std::memory_order_acquire);
+    std::shared_lock<std::shared_mutex> lk(fc.mutex);
+    uint64_t sig = fc.bounds_state.load(std::memory_order_acquire);
+    sig = (sig << 32) ^ static_cast<uint64_t>(fc.sorted_starts.size());
+    sig ^= static_cast<uint64_t>(fc.align_run_starts.size()) << 8;
+    sig ^= static_cast<uint64_t>(fc.by_start.size()) << 16;
+    sig ^= built_seq * 0x9E3779B97F4A7C15ull;
+    return sig;
+}
+
+static layout_row_metrics_t compute_row_metrics(uint64_t va,
+                                                uint64_t align_skip_end_in)
+{
+    layout_row_metrics_t m;
+    if (align_skip_end_in != 0 && va < align_skip_end_in) {
+        m.is_align_start = false;
+        m.align_end = align_skip_end_in;
+        return m;
+    }
+
+    function_index::detail::align_run_t arun;
+    if (function_index::is_align_row_start(va)
+        && function_index::align_run_at(va, &arun))
+    {
+        m.is_align_start = true;
+        m.align_end = arun.end;
+        return m;
+    }
+
+    std::vector<function_index::injection_row_t> before_rows = function_index::rows_before(va);
+    std::vector<function_index::injection_row_t> after_rows  = function_index::rows_after(va);
+    m.before_count = static_cast<int>(before_rows.size());
+    m.after_count  = static_cast<int>(after_rows.size());
+    for (const auto& br : before_rows) {
+        if (br.kind == function_index::injection_t::proc_header) {
+            m.has_proc_header = true;
+            break;
+        }
+    }
+    if (m.has_proc_header) {
+        std::vector<xref_index::annotation_t> xrefs = xref_index::query_to(va, 6);
+        if (xrefs.size() > 1) {
+            m.proc_xref_count = static_cast<int>(xrefs.size()) - 1;
+        }
+    }
+
+    std::string inline_lbl = function_index::inline_label_at(va);
+    if (inline_lbl.empty()) {
+        std::vector<xref_index::annotation_t> probe = xref_index::query_to(va, 1);
+        bool jump_xref = false;
+        for (const auto& a : probe) {
+            if (a.kind == xref_index::kind_t::code && a.edge == xref_index::edge_t::jump) {
+                jump_xref = true;
+                break;
+            }
+        }
+        if (jump_xref && function_index::is_inside_known_function(va)) {
+            std::string loc = function_index::loc_label_for(va);
+            if (!loc.empty()) inline_lbl = loc + ":";
+        }
+    }
+    if (!inline_lbl.empty()) {
+        m.has_inline_label = true;
+        std::vector<xref_index::annotation_t> xrefs_label = xref_index::query_to(va, 6);
+        if (xrefs_label.size() > 1) {
+            m.inline_xref_count = static_cast<int>(xrefs_label.size()) - 1;
+        }
+    }
+    if (function_index::is_noreturn_call_at(va)) {
+        m.has_noreturn_separator = true;
+    }
+    return m;
+}
+
+static void rebuild_layout(const std::vector<AsmInstr>& instrs,
+                           int banner_lines,
+                           uint32_t cur_gen,
+                           uint64_t fi_sig)
+{
+    const int n = static_cast<int>(instrs.size());
+    s_layout.start_row.assign(static_cast<size_t>(n), 0);
+    s_layout.before_extent.assign(static_cast<size_t>(n), 0);
+    s_layout.after_extent.assign(static_cast<size_t>(n), 0);
+    s_layout.before_row_count.assign(static_cast<size_t>(n), 0);
+    s_layout.proc_xref_extra.assign(static_cast<size_t>(n), 0);
+    s_layout.inline_label_extra.assign(static_cast<size_t>(n), 0);
+    s_layout.inline_xref_extra.assign(static_cast<size_t>(n), 0);
+    s_layout.align_extra.assign(static_cast<size_t>(n), 0);
+    s_layout.hidden.assign(static_cast<size_t>(n), 0);
+
+    int cursor = banner_lines;
+    uint64_t align_skip_end = 0;
+    int last_visible_i = -1;
+
+    for (int i = 0; i < n; ++i) {
+        const uint64_t va = instrs[i].addr;
+        if (align_skip_end != 0 && va < align_skip_end) {
+            s_layout.hidden[i] = 1;
+            s_layout.start_row[i] = (last_visible_i >= 0)
+                ? s_layout.start_row[last_visible_i]
+                : cursor;
+            continue;
+        }
+        if (align_skip_end != 0 && va >= align_skip_end) {
+            align_skip_end = 0;
+        }
+
+        layout_row_metrics_t m = compute_row_metrics(va, align_skip_end);
+
+        if (m.is_align_start) {
+            s_layout.start_row[i] = cursor;
+            s_layout.align_extra[i] = 1;
+            s_layout.before_extent[i] = 0;
+            s_layout.after_extent[i] = 0;
+            s_layout.proc_xref_extra[i] = 0;
+            s_layout.inline_label_extra[i] = 0;
+            s_layout.inline_xref_extra[i] = 0;
+            cursor += 2;
+            align_skip_end = m.align_end;
+            last_visible_i = i;
+            continue;
+        }
+
+        int proc_xref_extra = m.proc_xref_count;
+        int inline_label_rows = m.has_inline_label ? 2 : 0;
+        int inline_xref_extra = m.has_inline_label ? m.inline_xref_count : 0;
+        int before_extent = m.before_count + proc_xref_extra + inline_label_rows + inline_xref_extra;
+        int noreturn_extra = m.has_noreturn_separator ? 1 : 0;
+        int after_extent  = m.after_count + noreturn_extra;
+
+        cursor += before_extent;
+        s_layout.start_row[i] = cursor;
+        s_layout.before_extent[i] = before_extent;
+        s_layout.after_extent[i]  = after_extent;
+        s_layout.before_row_count[i] = m.before_count;
+        s_layout.proc_xref_extra[i] = proc_xref_extra;
+        s_layout.inline_label_extra[i] = inline_label_rows;
+        s_layout.inline_xref_extra[i]  = inline_xref_extra;
+        cursor += 1;
+        cursor += after_extent;
+        last_visible_i = i;
+    }
+
+    s_layout.total_rows = cursor;
+    s_layout.banner_rows = banner_lines;
+    s_layout.built_gen = cur_gen;
+    s_layout.built_n = n;
+    s_layout.built_addr_first = (n > 0) ? instrs.front().addr : 0;
+    s_layout.built_addr_last  = (n > 0) ? instrs.back().addr  : 0;
+    s_layout.built_fi_state_sig = fi_sig;
+    s_layout.built_at_ns = now_ns();
+    s_layout.ready = true;
+}
+
+static inline int layout_instr_row_height(int i) {
+    if (i < 0 || i >= static_cast<int>(s_layout.start_row.size())) return 1;
+    if (s_layout.hidden[i]) return 0;
+    return 1 + s_layout.align_extra[i] + s_layout.after_extent[i];
+}
+
+static inline int layout_instr_block_start(int i) {
+    if (i < 0 || i >= static_cast<int>(s_layout.start_row.size())) return 0;
+    return s_layout.start_row[i] - s_layout.before_extent[i];
+}
+
+static inline int layout_instr_block_end(int i) {
+    if (i < 0 || i >= static_cast<int>(s_layout.start_row.size())) return 0;
+    if (s_layout.hidden[i]) return s_layout.start_row[i];
+    return s_layout.start_row[i] + 1 + s_layout.align_extra[i] + s_layout.after_extent[i];
+}
+
+static int layout_first_visible_instr(int first_vrow, int banner_lines) {
+    const int n = static_cast<int>(s_layout.start_row.size());
+    if (n <= 0) return -1;
+    if (first_vrow < banner_lines) return 0;
+    int lo = 0;
+    int hi = n - 1;
+    int ans = -1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        int block_end = layout_instr_block_end(mid);
+        if (block_end > first_vrow) {
+            ans = mid;
+            hi = mid - 1;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return ans;
+}
+
+static int layout_last_visible_instr(int last_vrow) {
+    const int n = static_cast<int>(s_layout.start_row.size());
+    if (n <= 0) return -1;
+    int lo = 0;
+    int hi = n - 1;
+    int ans = -1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        int block_start = layout_instr_block_start(mid);
+        if (block_start <= last_vrow) {
+            ans = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return ans;
+}
+
+static inline float layout_instr_target_scroll_y(int idx, float line_h) {
+    if (s_layout.ready && idx >= 0 && idx < static_cast<int>(s_layout.start_row.size())) {
+        return static_cast<float>(s_layout.start_row[idx]) * line_h;
+    }
+    return static_cast<float>(idx + s_banner_line_count) * line_h;
+}
+
 static void on_pdb_loaded_event(const aida::events::event_pdb_loaded& ev) {
     if (!ev.success) return;
     bump_format_generation();
@@ -358,8 +612,15 @@ static std::string format_segment_address(const DisasmFile& file, uint64_t addr,
     std::string seg = section_override.empty() ? ida_section_name_for_va(file, addr) : section_override;
     if (seg.empty()) seg = ".text";
     char buf[64];
-    std::snprintf(buf, sizeof(buf), "%s:%08llX",
-        seg.c_str(), static_cast<unsigned long long>(addr));
+    addr_format_t fmt = g_state.addr_format;
+    if (fmt == addr_format_t::rva && file.image_base != 0 && addr >= file.image_base) {
+        uint64_t rva = addr - file.image_base;
+        std::snprintf(buf, sizeof(buf), "%s:+%08llX",
+            seg.c_str(), static_cast<unsigned long long>(rva));
+    } else {
+        std::snprintf(buf, sizeof(buf), "%s:%08llX",
+            seg.c_str(), static_cast<unsigned long long>(addr));
+    }
     return std::string(buf);
 }
 
@@ -769,6 +1030,8 @@ static bool demangle_msvc(const std::string& mangled, std::string& out_pretty) {
     if (mangled[0] != '?' && mangled.compare(0, 2, "_?") != 0) return false;
     init_undecorate();
     if (!s_pfn_undecorate) return false;
+    std::unique_lock<std::mutex> dbghelp_lk(pdb_parser::g_dbghelp_call_mutex, std::try_to_lock);
+    if (!dbghelp_lk.owns_lock()) return false;
     constexpr DWORD UNDNAME_COMPLETE = 0x0000;
     constexpr DWORD UNDNAME_NO_LEADING_UNDERSCORES = 0x0001;
     constexpr DWORD UNDNAME_NO_MS_KEYWORDS = 0x0002;
@@ -879,6 +1142,8 @@ static std::string strip_module_prefix_fast(std::string s) {
 
 static std::string resolve_import_via_iat(uint64_t iat_va) {
     if (iat_va == 0) return std::string();
+    std::string fi = function_index::iat_symbol_at(iat_va);
+    if (!fi.empty()) return strip_module_prefix_fast(fi);
     std::string name;
     if (symbol_classifier::lookup_import_by_iat(iat_va, name) && !name.empty()) {
         return strip_module_prefix_fast(name);
@@ -901,6 +1166,94 @@ static std::string demangle_tail_comment(const std::string& mangled) {
     if (!ida_demangle::demangle_msvc(mangled, pretty)) return std::string();
     if (pretty.empty() || pretty == mangled) return std::string();
     return pretty;
+}
+
+static bool resolve_memory_operand_va(const AsmInstr& ins,
+                                      uint64_t target,
+                                      int op_size,
+                                      std::string& out_sym,
+                                      std::string& out_seg_prefix,
+                                      bool& out_drop_brackets)
+{
+    out_sym.clear();
+    out_seg_prefix.clear();
+    out_drop_brackets = false;
+    if (target == 0) return false;
+    const bool is_lea = (ins.mnem[0] == 'l' && ins.mnem[1] == 'e' && ins.mnem[2] == 'a' && ins.mnem[3] == '\0');
+
+    {
+        std::string imp_name = resolve_import_via_iat(target);
+        if (!imp_name.empty()) {
+            if (imp_name.size() >= 6 && imp_name.compare(0, 6, "__imp_") == 0)
+                imp_name = imp_name.substr(6);
+            out_sym = imp_name;
+            out_seg_prefix = "cs:";
+            out_drop_brackets = true;
+            return true;
+        }
+    }
+
+    {
+        std::string data_name;
+        bool data_is_function = false;
+        if (function_index::data_symbol_entry_at(target, data_name, data_is_function)
+            && !data_name.empty())
+        {
+            out_sym = data_name;
+            if (data_is_function && is_lea) {
+                out_drop_brackets = true;
+            }
+            else {
+                out_seg_prefix = "cs:";
+                out_drop_brackets = true;
+            }
+            return true;
+        }
+    }
+
+    {
+        std::string exact = symbol_store::resolve_symbol_exact(target);
+        exact = strip_module_prefix_fast(exact);
+        if (!exact.empty()) {
+            out_sym = exact;
+            if (!ins.is_call && !ins.is_branch && !is_lea) {
+                out_seg_prefix = "cs:";
+            }
+            out_drop_brackets = true;
+            return true;
+        }
+    }
+
+    if (function_index::is_inside_known_function(target)
+        || function_index::func_start_for(target) == target)
+    {
+        std::string fn = function_index::synthetic_name(target);
+        if (!fn.empty()) {
+            out_sym = fn;
+            out_drop_brackets = true;
+            if (!is_lea && !ins.is_call && !ins.is_branch) {
+                out_seg_prefix = "cs:";
+            }
+            return true;
+        }
+    }
+
+    {
+        std::string fallback = resolve_or_synthesize_data(target, op_size);
+        if (!fallback.empty()) {
+            out_sym = fallback;
+            if (!is_lea
+                && (fallback.size() >= 6 && fallback.compare(0, 6, "__imp_") == 0))
+            {
+                out_sym = fallback.substr(6);
+                out_seg_prefix = "cs:";
+                out_drop_brackets = true;
+            }
+            return true;
+        }
+    }
+
+    return false;
 }
 
 static std::string substitute_operand_text(const AsmInstr& ins, const DisasmFile& file)
@@ -1032,6 +1385,7 @@ static std::string substitute_operand_text(const AsmInstr& ins, const DisasmFile
 
     {
         size_t scan_pos = 0;
+        const bool is_lea_outer = (ins.mnem[0] == 'l' && ins.mnem[1] == 'e' && ins.mnem[2] == 'a' && ins.mnem[3] == '\0');
         while (scan_pos < base.size()) {
             size_t rip_pos = base.find("[rip", scan_pos);
             if (rip_pos == std::string::npos) break;
@@ -1040,17 +1394,32 @@ static std::string substitute_operand_text(const AsmInstr& ins, const DisasmFile
             if (after_rip >= base.size() || (base[after_rip] != '+' && base[after_rip] != '-')) {
                 size_t close = base.find(']', rip_pos);
                 if (close == std::string::npos) break;
-                std::string repl = "[rip";
-                size_t take_end = close;
                 size_t close_pos = base.find(']', after_rip);
                 if (close_pos != std::string::npos && after_rip == close_pos) {
                     uint64_t target = ins.addr + ins.len;
                     int op_size = extract_operand_size(base, rip_pos);
-                    std::string sym = resolve_or_synthesize_data(target, op_size);
-                    if (!sym.empty()) {
-                        repl = "[" + sym;
-                        base = base.substr(0, rip_pos) + repl + base.substr(take_end);
-                        scan_pos = rip_pos + repl.size();
+                    std::string sym;
+                    std::string seg_prefix;
+                    bool drop_brackets = false;
+                    if (resolve_memory_operand_va(ins, target, op_size, sym, seg_prefix, drop_brackets)
+                        && !sym.empty())
+                    {
+                        std::string repl;
+                        if (!seg_prefix.empty()) {
+                            repl = seg_prefix + sym;
+                            base = base.substr(0, rip_pos) + repl + base.substr(close + 1);
+                            scan_pos = rip_pos + repl.size();
+                        }
+                        else if (is_lea_outer || drop_brackets) {
+                            repl = sym;
+                            base = base.substr(0, rip_pos) + repl + base.substr(close + 1);
+                            scan_pos = rip_pos + repl.size();
+                        }
+                        else {
+                            repl = "[" + sym;
+                            base = base.substr(0, rip_pos) + repl + base.substr(close);
+                            scan_pos = rip_pos + repl.size();
+                        }
                         continue;
                     }
                 }
@@ -1072,11 +1441,28 @@ static std::string substitute_operand_text(const AsmInstr& ins, const DisasmFile
             }
             uint64_t target = ins.addr + ins.len + static_cast<uint64_t>(disp);
             int op_size = extract_operand_size(base, rip_pos);
-            std::string sym = resolve_or_synthesize_data(target, op_size);
-            if (!sym.empty()) {
-                std::string repl = "[" + sym;
-                base = base.substr(0, rip_pos) + repl + base.substr(close_pos);
-                scan_pos = rip_pos + repl.size();
+            std::string sym;
+            std::string seg_prefix;
+            bool drop_brackets = false;
+            if (resolve_memory_operand_va(ins, target, op_size, sym, seg_prefix, drop_brackets)
+                && !sym.empty())
+            {
+                std::string repl;
+                if (!seg_prefix.empty()) {
+                    repl = seg_prefix + sym;
+                    base = base.substr(0, rip_pos) + repl + base.substr(close_pos + 1);
+                    scan_pos = rip_pos + repl.size();
+                }
+                else if (is_lea_outer || drop_brackets) {
+                    repl = sym;
+                    base = base.substr(0, rip_pos) + repl + base.substr(close_pos + 1);
+                    scan_pos = rip_pos + repl.size();
+                }
+                else {
+                    repl = "[" + sym;
+                    base = base.substr(0, rip_pos) + repl + base.substr(close_pos);
+                    scan_pos = rip_pos + repl.size();
+                }
             } else {
                 scan_pos = close_pos + 1;
             }
@@ -1126,40 +1512,19 @@ static std::string substitute_operand_text(const AsmInstr& ins, const DisasmFile
 
             std::string seg_prefix;
             std::string sym;
-
+            bool drop_brackets = false;
             const bool is_lea = (ins.mnem[0] == 'l' && ins.mnem[1] == 'e' && ins.mnem[2] == 'a' && ins.mnem[3] == '\0');
 
-            if (ins.is_call || ins.is_branch) {
-                std::string imp_name = resolve_import_via_iat(target);
-                if (!imp_name.empty()) {
-                    if (imp_name.size() >= 6 && imp_name.compare(0, 6, "__imp_") == 0)
-                        imp_name = imp_name.substr(6);
-                    sym = imp_name;
-                    seg_prefix = "cs:";
-                }
-            }
-
-            if (sym.empty()) {
-                std::string exact = symbol_store::resolve_symbol_exact(target);
-                exact = strip_module_prefix_fast(exact);
-                if (!exact.empty()) {
-                    sym = exact;
-                    if (!ins.is_call && !ins.is_branch && !is_lea) seg_prefix = "cs:";
-                }
-            }
-
-            if (sym.empty()) {
-                sym = resolve_or_synthesize_data(target, op_size);
-            }
-
-            if (!sym.empty()) {
+            if (resolve_memory_operand_va(ins, target, op_size, sym, seg_prefix, drop_brackets)
+                && !sym.empty())
+            {
                 std::string repl;
                 if (!seg_prefix.empty()) {
                     repl = seg_prefix + sym;
                     base = base.substr(0, br_pos) + repl + base.substr(after + 1);
                     scan_pos = br_pos + repl.size();
                 }
-                else if (is_lea) {
+                else if (is_lea || drop_brackets) {
                     repl = sym;
                     base = base.substr(0, br_pos) + repl + base.substr(after + 1);
                     scan_pos = br_pos + repl.size();
@@ -1475,10 +1840,31 @@ static std::string build_instruction_line(const AsmInstr& ins,
 
     std::string mnem = ida_mnemonic(std::string(ins.mnem));
 
+    function_index::directive_override_t dir_ov;
+    bool has_dir_override = function_index::directive_override_at(ins.addr, &dir_ov);
+
+    if (has_dir_override) {
+        if (dir_ov.kind == function_index::directive_kind_t::align) {
+            mnem = "align";
+        }
+        else if (dir_ov.kind == function_index::directive_kind_t::db) {
+            mnem = "db";
+        }
+    }
+
     std::string ops;
     bool emitted_branch_sym = false;
     std::string branch_sym_resolved;
-    if ((ins.is_branch || ins.is_call) && ins.branch_target != 0) {
+    if (has_dir_override) {
+        if (dir_ov.kind == function_index::directive_kind_t::align) {
+            ops = format_unsigned_hex(static_cast<uint64_t>(dir_ov.value));
+        }
+        else if (dir_ov.kind == function_index::directive_kind_t::db) {
+            char hb[16];
+            std::snprintf(hb, sizeof(hb), "0%02Xh", static_cast<unsigned int>(dir_ov.value));
+            ops = hb;
+        }
+    } else if ((ins.is_branch || ins.is_call) && ins.branch_target != 0) {
         uint64_t target = ins.branch_target;
         std::string sym = resolve_branch_symbol(target);
         symbol_classifier::kind_t k = symbol_classifier::classify(target);
@@ -1497,7 +1883,7 @@ static std::string build_instruction_line(const AsmInstr& ins,
             emitted_branch_sym = true;
         }
     }
-    if (!emitted_branch_sym) {
+    if (!has_dir_override && !emitted_branch_sym) {
         std::string raw_ops = substitute_operand_text(ins, file);
         ops = convert_operands_to_ida(raw_ops);
     }
@@ -1528,6 +1914,15 @@ static std::string build_instruction_line(const AsmInstr& ins,
         else if (emitted_branch_sym) {
             std::string tail = build_call_tail_comment(ins.branch_target, branch_sym_resolved);
             if (!tail.empty()) comment = std::string("; ") + tail;
+        }
+    }
+    if (comment.empty() && ins.has_imm && !has_dir_override) {
+        uint64_t imm = ins.imm_unsigned;
+        if (imm >= 0x20 && imm <= 0x7E && imm != 0x60) {
+            char ch = static_cast<char>(imm);
+            char buf[16];
+            std::snprintf(buf, sizeof(buf), "; '%c'", ch);
+            comment = buf;
         }
     }
     if (!comment.empty()) {
@@ -1579,8 +1974,25 @@ static std::string build_align_lines(const std::string& seg,
     std::snprintf(lbl_buf, sizeof(lbl_buf), "algn_%llX:",
         static_cast<unsigned long long>(arun.addr));
     lbl_line += lbl_buf;
+    std::vector<xref_index::annotation_t> xrefs_at_align = xref_index::query_to(arun.addr, 6);
+    bool xrefs_align_more = xref_index::has_more(arun.addr, 6);
+    if (!xrefs_at_align.empty()) {
+        int v_align = visual_length(lbl_line);
+        int comment_col = std::max(kColComment, v_align + 2);
+        while (v_align < comment_col) { lbl_line += ' '; ++v_align; }
+        bool head_more = xrefs_align_more && xrefs_at_align.size() == 1;
+        lbl_line += ida_format_xref_comment(xrefs_at_align[0], head_more);
+    }
     out += lbl_line;
     out += "\r\n";
+    for (size_t xi = 1; xi < xrefs_at_align.size(); ++xi) {
+        std::string cont = addr_prefix(seg, arun.addr);
+        pad_to_visual_col(cont, kColComment);
+        bool last_more = (xi + 1 == xrefs_at_align.size()) && xrefs_align_more;
+        cont += ida_format_xref_comment(xrefs_at_align[xi], last_more);
+        out += cont;
+        out += "\r\n";
+    }
 
     std::string code_line = addr_prefix(seg, arun.addr);
     code_line += ' ';
@@ -1670,14 +2082,16 @@ static std::string build_header_banner(const DisasmFile& file,
         sections = cache.sections;
     }
     const bool ready = (state == static_cast<int>(file_metadata_banner::compute_state_t::ready));
+    const bool failed = (state == static_cast<int>(file_metadata_banner::compute_state_t::failed));
     if (!ready) {
-        if (sha.empty()) sha = "(computing...)";
-        if (md5.empty()) md5 = "(computing...)";
-        if (crc32_v.empty()) crc32_v = "(computing...)";
-        if (compiler.empty()) compiler = "(computing...)";
-        if (format_text.empty()) format_text = "(computing...)";
-        if (app_type.empty()) app_type = "(computing...)";
-        if (os_type.empty()) os_type = "(computing...)";
+        const char* placeholder = failed ? "(unavailable)" : "(computing...)";
+        if (sha.empty()) sha = placeholder;
+        if (md5.empty()) md5 = placeholder;
+        if (crc32_v.empty()) crc32_v = placeholder;
+        if (compiler.empty()) compiler = placeholder;
+        if (format_text.empty()) format_text = placeholder;
+        if (app_type.empty()) app_type = placeholder;
+        if (os_type.empty()) os_type = placeholder;
     }
     if (file_name.empty()) file_name = file.filename;
 
@@ -1742,10 +2156,10 @@ static std::string build_header_banner(const DisasmFile& file,
         std::snprintf(buf, sizeof(buf), "; Section %d. (virtual address %08X)",
             section_index, primary->virtual_address);
         emit_line(buf);
-        std::snprintf(buf, sizeof(buf), "; Virtual size                  : %08X ( %7u.)",
+        std::snprintf(buf, sizeof(buf), "; Virtual size                  : %08X ( %u.)",
             primary->virtual_size, static_cast<unsigned int>(primary->virtual_size));
         emit_line(buf);
-        std::snprintf(buf, sizeof(buf), "; Section size in file          : %08X ( %7u.)",
+        std::snprintf(buf, sizeof(buf), "; Section size in file          : %08X ( %u.)",
             primary->raw_size, static_cast<unsigned int>(primary->raw_size));
         emit_line(buf);
         std::snprintf(buf, sizeof(buf), "; Offset to raw data for section: %08X",
@@ -1817,6 +2231,7 @@ static std::string build_listing(const DisasmFile& file,
     }
 
     uint64_t align_skip_end = 0;
+    uint64_t primed_func_start = 0;
 
     for (int i = lo; i <= hi; ++i) {
         const AsmInstr& ins = instrs[i];
@@ -1824,6 +2239,12 @@ static std::string build_listing(const DisasmFile& file,
         if (align_skip_end != 0) {
             if (ins.addr < align_skip_end) continue;
             align_skip_end = 0;
+        }
+
+        uint64_t enclosing_func = function_index::func_start_for(ins.addr);
+        if (enclosing_func != 0 && enclosing_func != primed_func_start) {
+            prime_var_cache(enclosing_func);
+            primed_func_start = enclosing_func;
         }
 
         std::string seg = section_for(ins.addr);
@@ -1914,6 +2335,14 @@ static std::string build_listing(const DisasmFile& file,
         out += build_instruction_line(ins, file, seg, user_cmt, std::string());
         out += "\r\n";
 
+        if (function_index::is_noreturn_call_at(ins.addr)) {
+            std::string sep_line = addr_prefix(seg, ins.addr);
+            pad_to_visual_col(sep_line, kColName);
+            sep_line += "; ---------------------------------------------------------------------------";
+            out += sep_line;
+            out += "\r\n";
+        }
+
         std::vector<function_index::injection_row_t> after_rows = function_index::rows_after(ins.addr);
         for (const auto& ar : after_rows) {
             out += build_injection_line(seg, ins.addr, ar.kind, ar.text, std::string());
@@ -1979,9 +2408,16 @@ static void build_operand_colored_runs(const AsmInstr& ins,
                 }
             }
 
+            const bool is_seg_prefix = (tok.size() == 2)
+                && (tok == "cs" || tok == "ds" || tok == "ss"
+                    || tok == "es" || tok == "fs" || tok == "gs")
+                && i < n && s[i] == ':';
+
             ImU32 color = default_color;
             if (tok_is_hex_h) {
                 color = disasm_theme::immediate_num();
+            } else if (is_seg_prefix) {
+                color = disasm_theme::segment_ref();
             } else {
                 symbol_classifier::kind_t k = symbol_classifier::classify_name(tok);
                 if (k != symbol_classifier::kind_t::unknown) {
@@ -1990,6 +2426,11 @@ static void build_operand_colored_runs(const AsmInstr& ins,
             }
 
             append_colored_run(out, color, tok.data(), tok.size());
+
+            if (is_seg_prefix) {
+                append_colored_run(out, color, ":", 1);
+                ++i;
+            }
             continue;
         }
 
@@ -2088,14 +2529,16 @@ static void rebuild_banner_lines(const DisasmFile& file) {
         sections = cache.sections;
     }
     const bool ready = (state == static_cast<int>(file_metadata_banner::compute_state_t::ready));
+    const bool failed = (state == static_cast<int>(file_metadata_banner::compute_state_t::failed));
     if (!ready) {
-        if (sha.empty()) sha = "(computing...)";
-        if (md5.empty()) md5 = "(computing...)";
-        if (crc32_v.empty()) crc32_v = "(computing...)";
-        if (compiler.empty()) compiler = "(computing...)";
-        if (format_text.empty()) format_text = "(computing...)";
-        if (app_type.empty()) app_type = "(computing...)";
-        if (os_type.empty()) os_type = "(computing...)";
+        const char* placeholder = failed ? "(unavailable)" : "(computing...)";
+        if (sha.empty()) sha = placeholder;
+        if (md5.empty()) md5 = placeholder;
+        if (crc32_v.empty()) crc32_v = placeholder;
+        if (compiler.empty()) compiler = placeholder;
+        if (format_text.empty()) format_text = placeholder;
+        if (app_type.empty()) app_type = placeholder;
+        if (os_type.empty()) os_type = placeholder;
     }
     if (file_name.empty()) file_name = file.filename;
 
@@ -2181,10 +2624,10 @@ static void rebuild_banner_lines(const DisasmFile& file) {
         std::snprintf(buf, sizeof(buf), "; Section %d. (virtual address %08X)",
             section_index, primary->virtual_address);
         push_comment(buf);
-        std::snprintf(buf, sizeof(buf), "; Virtual size                  : %08X ( %7u.)",
+        std::snprintf(buf, sizeof(buf), "; Virtual size                  : %08X ( %u.)",
             primary->virtual_size, static_cast<unsigned int>(primary->virtual_size));
         push_comment(buf);
-        std::snprintf(buf, sizeof(buf), "; Section size in file          : %08X ( %7u.)",
+        std::snprintf(buf, sizeof(buf), "; Section size in file          : %08X ( %u.)",
             primary->raw_size, static_cast<unsigned int>(primary->raw_size));
         push_comment(buf);
         std::snprintf(buf, sizeof(buf), "; Offset to raw data for section: %08X",
@@ -2422,25 +2865,27 @@ static uint64_t find_enclosing_function_start(uint64_t addr, const DisasmFile& f
 
     const int max_scan = 65536;
     int last_terminator = -1;
-    for (int i = idx; i >= 0 && (idx - i) < max_scan; --i) {
-        if (i < idx) {
-            const auto& ip = file.instrs[i];
-            if (ip.is_ret) { last_terminator = i; break; }
-            if (ip.is_priv && ip.len == 1 && ip.raw[0] == 0xCC) { last_terminator = i; break; }
-        }
+    for (int i = idx - 1; i >= 0 && (idx - i) <= max_scan; --i) {
+        const auto& ip = file.instrs[i];
+        if (ip.is_ret) { last_terminator = i; break; }
+        if (ip.is_priv && ip.len == 1 && ip.raw[0] == 0xCC) { last_terminator = i; break; }
     }
 
+    int candidate;
     if (last_terminator >= 0 && last_terminator + 1 < static_cast<int>(file.instrs.size())) {
-        int candidate = last_terminator + 1;
-        while (candidate < static_cast<int>(file.instrs.size())) {
-            const auto& cp = file.instrs[candidate];
-            if (cp.is_nop) { ++candidate; continue; }
-            if (cp.is_priv && cp.len == 1 && cp.raw[0] == 0xCC) { ++candidate; continue; }
-            break;
-        }
-        if (candidate <= idx)
-            return file.instrs[candidate].addr;
+        candidate = last_terminator + 1;
+    } else {
+        candidate = 0;
     }
+
+    while (candidate < static_cast<int>(file.instrs.size())) {
+        const auto& cp = file.instrs[candidate];
+        if (cp.is_nop) { ++candidate; continue; }
+        if (cp.is_priv && cp.len == 1 && cp.raw[0] == 0xCC) { ++candidate; continue; }
+        break;
+    }
+    if (candidate <= idx && candidate < static_cast<int>(file.instrs.size()))
+        return file.instrs[candidate].addr;
 
     return addr;
 }
@@ -2480,7 +2925,7 @@ void goto_address(uint64_t addr, DisasmState& disasm) {
     st.banner_sel_anchor = -1;
     st.banner_sel_extent = -1;
     st.banner_sel_dragging = false;
-    st.target_scroll_y = (idx + s_banner_line_count) * 18.f;
+    st.target_scroll_y = layout_instr_target_scroll_y(idx, 18.f);
 }
 
 void navigate_back() {
@@ -2495,7 +2940,7 @@ void navigate_back() {
     st.banner_sel_anchor = -1;
     st.banner_sel_extent = -1;
     st.banner_sel_dragging = false;
-    st.target_scroll_y = (st.selected_row + s_banner_line_count) * 18.f;
+    st.target_scroll_y = layout_instr_target_scroll_y(st.selected_row, 18.f);
 }
 
 void navigate_forward() {
@@ -2510,10 +2955,10 @@ void navigate_forward() {
     st.banner_sel_anchor = -1;
     st.banner_sel_extent = -1;
     st.banner_sel_dragging = false;
-    st.target_scroll_y = (st.selected_row + s_banner_line_count) * 18.f;
+    st.target_scroll_y = layout_instr_target_scroll_y(st.selected_row, 18.f);
 }
 
-static void launch_xref_scan(uint64_t addr)
+static void launch_xref_scan(uint64_t addr, uint64_t func_start = 0)
 {
     auto& st = g_state;
     st.xref_scanning.store(true);
@@ -2521,8 +2966,18 @@ static void launch_xref_scan(uint64_t addr)
     st.xref_popup_scroll = 0.f;
     st.xref_popup_target_scroll = 0.f;
 
-    std::thread xref_scan_thread([addr]() {
+    diag::log_tagged_critical_fmt("xref", "launch addr=0x%llX func_start=0x%llX",
+        static_cast<unsigned long long>(addr),
+        static_cast<unsigned long long>(func_start));
+
+    bool posted = work_queue::post([addr, func_start]() {
+        diag::log_tagged_critical_fmt("xref", "thread_entry addr=0x%llX func_start=0x%llX",
+            static_cast<unsigned long long>(addr),
+            static_cast<unsigned long long>(func_start));
+
         auto modules = driver_bridge::enumerate_modules();
+        diag::log_tagged_critical_fmt("xref", "modules_enumerated count=%zu",
+            modules.size());
 
         uint64_t search_base = 0;
         uint64_t search_size = 0;
@@ -2530,35 +2985,89 @@ static void launch_xref_scan(uint64_t addr)
 
         bool use_static = false;
 
+        const bool pe_loaded = g_disasm.file.loaded && !g_disasm.file.sections.empty();
+        const uint64_t pe_size = pe_loaded ? static_analysis::total_image_size(g_disasm.file) : 0;
+        const bool addr_in_pe = pe_loaded && pe_size > 0
+            && addr >= g_disasm.file.image_base
+            && addr <  g_disasm.file.image_base + pe_size;
+
+        diag::log_tagged_critical_fmt("xref",
+            "pe_loaded=%d pe_size=0x%llX image_base=0x%llX addr_in_pe=%d",
+            pe_loaded ? 1 : 0,
+            static_cast<unsigned long long>(pe_size),
+            static_cast<unsigned long long>(g_disasm.file.image_base),
+            addr_in_pe ? 1 : 0);
+
         for (auto& m : modules) {
             if (addr >= m.base && addr < m.base + m.size) {
                 search_base = m.base;
                 search_size = m.size;
                 mod_name = m.name;
+                diag::log_tagged_critical_fmt("xref",
+                    "module_match name=%s base=0x%llX size=0x%llX",
+                    m.name.c_str(),
+                    static_cast<unsigned long long>(m.base),
+                    static_cast<unsigned long long>(m.size));
                 break;
             }
+        }
+
+        if (search_size == 0 && addr_in_pe) {
+            use_static = true;
+            search_base = g_disasm.file.image_base;
+            search_size = pe_size;
+            mod_name = g_disasm.file.filename;
+            diag::log_tagged_critical("xref", "path=static_pe_addr_match");
         }
 
         if (search_size == 0 && !modules.empty()) {
             search_base = modules[0].base;
             search_size = modules[0].size;
             mod_name = modules[0].name;
+            diag::log_tagged_critical_fmt("xref",
+                "path=fallback_modules0 name=%s base=0x%llX size=0x%llX",
+                modules[0].name.c_str(),
+                static_cast<unsigned long long>(modules[0].base),
+                static_cast<unsigned long long>(modules[0].size));
         }
 
-        if (search_size == 0 && g_disasm.file.loaded && !g_disasm.file.sections.empty()) {
+        if (search_size == 0 && pe_loaded && pe_size > 0) {
             use_static = true;
             search_base = g_disasm.file.image_base;
-            search_size = static_analysis::total_image_size(g_disasm.file);
+            search_size = pe_size;
             mod_name = g_disasm.file.filename;
+            diag::log_tagged_critical("xref", "path=fallback_static_pe");
         }
 
         if (search_size == 0) {
+            diag::log_tagged_critical("xref", "exit_no_range");
             g_state.xref_scanning.store(false);
             return;
         }
 
+        diag::log_tagged_critical_fmt("xref",
+            "scan_begin base=0x%llX size=0x%llX use_static=%d mod=%s",
+            static_cast<unsigned long long>(search_base),
+            static_cast<unsigned long long>(search_size),
+            use_static ? 1 : 0,
+            mod_name.c_str());
+
         const size_t page_size = 4096;
         std::vector<xref_popup_entry_t> found;
+        uint64_t pages_done = 0;
+        uint64_t pages_with_data = 0;
+        uint64_t insns_decoded = 0;
+        uint64_t targets_resolved = 0;
+        uint64_t targets_in_pe = 0;
+        uint64_t branches_seen = 0;
+        uint64_t memops_seen = 0;
+        uint64_t memops_rip = 0;
+        uint64_t nearest_diff = UINT64_MAX;
+        uint64_t nearest_target = 0;
+        uint64_t nearest_source = 0;
+        const uint64_t fuzz_window = 0x40;
+        std::vector<uint64_t> sample_targets;
+        sample_targets.reserve(32);
 
         for (uint64_t offset = 0; offset < search_size; offset += page_size) {
             size_t chunk = page_size;
@@ -2574,8 +3083,10 @@ static void launch_xref_scan(uint64_t addr)
             if (!got_page)
                 got_page = static_analysis::read_bytes_from_pe(g_disasm.file, search_base + offset, chunk, page_data);
 
+            ++pages_done;
             if (!got_page || page_data.empty())
                 continue;
+            ++pages_with_data;
 
             const uint8_t* data = page_data.data();
             int sz = static_cast<int>(page_data.size());
@@ -2587,10 +3098,35 @@ static void launch_xref_scan(uint64_t addr)
 
                 uint64_t ins_addr = search_base + offset + pos;
                 AsmInstr ins = zydis_decode_one(data + pos, avail, ins_addr);
+                if (ins.len <= 0) ins.len = 1;
+                ++insns_decoded;
+                if (ins.is_call || ins.is_branch) ++branches_seen;
+                if (ins.has_mem_op) {
+                    ++memops_seen;
+                    if (ins.mem_op.base_reg == static_cast<uint16_t>(ZYDIS_REGISTER_RIP))
+                        ++memops_rip;
+                }
 
                 uint64_t resolved = 0;
                 if (xref_engine::detail::extract_target(data + pos, ins.len, ins_addr, ins, resolved)) {
-                    if (resolved == addr) {
+                    ++targets_resolved;
+                    if (resolved >= search_base && resolved < search_base + search_size) {
+                        ++targets_in_pe;
+                        if (sample_targets.size() < 32) {
+                            bool dup = false;
+                            for (auto& t : sample_targets) { if (t == resolved) { dup = true; break; } }
+                            if (!dup) sample_targets.push_back(resolved);
+                        }
+                        uint64_t diff = resolved > addr ? resolved - addr : addr - resolved;
+                        if (diff < nearest_diff) {
+                            nearest_diff = diff;
+                            nearest_target = resolved;
+                            nearest_source = ins_addr;
+                        }
+                    }
+                    bool hit_addr = (resolved == addr);
+                    bool hit_func = (func_start != 0 && func_start != addr && resolved == func_start);
+                    if (hit_addr || hit_func) {
                         xref_popup_entry_t e;
                         e.addr = ins_addr;
                         e.type = static_cast<int>(xref_engine::detail::classify_instruction(ins));
@@ -2607,6 +3143,68 @@ static void launch_xref_scan(uint64_t addr)
                 }
                 pos += ins.len;
             }
+
+            uint64_t page_va = search_base + offset;
+            uint64_t aligned_start = (page_va + 7ull) & ~7ull;
+            if (aligned_start >= page_va && aligned_start < page_va + static_cast<uint64_t>(sz)) {
+                size_t scan_start = static_cast<size_t>(aligned_start - page_va);
+                for (size_t p = scan_start; p + 8 <= static_cast<size_t>(sz); p += 8) {
+                    uint64_t v;
+                    std::memcpy(&v, data + p, sizeof(v));
+                    bool hit_addr = (v == addr);
+                    bool hit_func = (func_start != 0 && func_start != addr && v == func_start);
+                    if (!hit_addr && !hit_func) continue;
+                    uint64_t ref_va = page_va + static_cast<uint64_t>(p);
+                    xref_popup_entry_t e;
+                    e.addr = ref_va;
+                    e.type = static_cast<int>(xref_engine::xref_type_t::data_ref);
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "dq 0x%llX",
+                        static_cast<unsigned long long>(v));
+                    e.disasm_text = buf;
+                    e.module_name = mod_name;
+                    {
+                        std::string rn = rename_store::get(ref_va);
+                        e.function_name = !rn.empty() ? rn : symbol_store::resolve_symbol(ref_va);
+                    }
+                    found.push_back(std::move(e));
+                }
+            }
+
+            if ((pages_done & 0x3FF) == 0) {
+                diag::log_tagged_critical_fmt("xref",
+                    "scan_progress pages=%llu/%llu hits=%zu",
+                    static_cast<unsigned long long>(pages_done),
+                    static_cast<unsigned long long>(search_size / page_size),
+                    found.size());
+            }
+        }
+
+        diag::log_tagged_critical_fmt("xref",
+            "scan_done pages=%llu data_pages=%llu insns=%llu branches=%llu memops=%llu memops_rip=%llu resolved=%llu in_pe=%llu hits=%zu",
+            static_cast<unsigned long long>(pages_done),
+            static_cast<unsigned long long>(pages_with_data),
+            static_cast<unsigned long long>(insns_decoded),
+            static_cast<unsigned long long>(branches_seen),
+            static_cast<unsigned long long>(memops_seen),
+            static_cast<unsigned long long>(memops_rip),
+            static_cast<unsigned long long>(targets_resolved),
+            static_cast<unsigned long long>(targets_in_pe),
+            found.size());
+
+        if (nearest_diff != UINT64_MAX) {
+            diag::log_tagged_critical_fmt("xref",
+                "nearest_resolved_target target=0x%llX source=0x%llX diff=0x%llX (queried=0x%llX)",
+                static_cast<unsigned long long>(nearest_target),
+                static_cast<unsigned long long>(nearest_source),
+                static_cast<unsigned long long>(nearest_diff),
+                static_cast<unsigned long long>(addr));
+        }
+
+        for (size_t si = 0; si < sample_targets.size(); ++si) {
+            diag::log_tagged_critical_fmt("xref",
+                "sample_target[%zu]=0x%llX", si,
+                static_cast<unsigned long long>(sample_targets[si]));
         }
 
         {
@@ -2614,8 +3212,13 @@ static void launch_xref_scan(uint64_t addr)
             g_state.xref_results = std::move(found);
         }
         g_state.xref_scanning.store(false);
+        diag::log_tagged_critical("xref", "thread_exit");
     });
-    xref_scan_thread.detach();
+
+    if (!posted) {
+        diag::log_tagged_critical("xref", "post_failed");
+        st.xref_scanning.store(false);
+    }
 }
 
 static float s_close_btn_anim = 0.f;
@@ -2626,6 +3229,11 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
                                float alpha, float accent_r, float accent_g, float accent_b,
                                DisasmState& disasm, float dt)
 {
+    (void)pos_x;
+    (void)pos_y;
+    (void)width;
+    (void)height;
+
     auto& st = g_state;
 
     float target_fade = st.xref_popup_open ? 1.f : 0.f;
@@ -2649,25 +3257,43 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
     bool show_empty_state = !has_results && !scanning;
     bool show_scanning_state = scanning && !has_results;
 
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    float vp_px = vp->Pos.x;
+    float vp_py = vp->Pos.y;
+    float vp_pw = vp->Size.x;
+    float vp_ph = vp->Size.y;
+
+    {
+        const auto& th_pop = aida::ui::resolved();
+        ImU32 dim_col = th_pop.is_dark
+            ? IM_COL32(6, 8, 12, static_cast<int>(238 * fa))
+            : IM_COL32(0x1F, 0x1E, 0x1D, static_cast<int>(160 * fa));
+        fdl->AddRectFilled(ImVec2(vp_px, vp_py), ImVec2(vp_px + vp_pw, vp_py + vp_ph),
+            dim_col);
+    }
+
     float popup_w;
     float popup_h;
     if (show_empty_state) {
-        popup_w = std::min(520.f, width * 0.6f);
-        popup_h = std::min(260.f, height * 0.55f);
+        popup_w = 520.f;
+        popup_h = 280.f;
     } else if (show_scanning_state) {
-        popup_w = std::min(520.f, width * 0.6f);
-        popup_h = std::min(220.f, height * 0.5f);
+        popup_w = 520.f;
+        popup_h = 220.f;
     } else {
-        popup_w = std::min(760.f, width * 0.88f);
-        popup_h = std::min(460.f, height * 0.8f);
+        popup_w = std::min(780.f, vp_pw * 0.86f);
+        popup_h = std::min(620.f, vp_ph * 0.82f);
     }
 
-    float cx = pos_x + width * 0.5f;
-    float cy = pos_y + height * 0.5f;
+    float max_w = vp_pw - 24.f;
+    float max_h = vp_ph - 24.f;
+    if (max_w < 240.f) max_w = 240.f;
+    if (max_h < 160.f) max_h = 160.f;
+    if (popup_w > max_w) popup_w = max_w;
+    if (popup_h > max_h) popup_h = max_h;
 
-    ui_anim::render_popup_frame(fdl, cx, cy, popup_w, popup_h, st.xref_popup_fade,
-                                accent_r, accent_g, accent_b, alpha,
-                                pos_x, pos_y, width, height);
+    float cx = vp_px + vp_pw * 0.5f;
+    float cy = vp_py + vp_ph * 0.5f;
 
     float t_back = ui_anim::ease_out_back(std::clamp(st.xref_popup_fade * 1.2f, 0.f, 1.f));
     float scale = 0.92f + 0.08f * t_back;
@@ -2675,6 +3301,33 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
     float ph = popup_h * scale;
     float px = cx - pw * 0.5f;
     float py = cy - ph * 0.5f + (1.f - t_back) * 12.f;
+
+    for (int g = 4; g >= 1; --g) {
+        float expand = static_cast<float>(g) * 4.f;
+        int ga = static_cast<int>(22 * fa / static_cast<float>(g));
+        fdl->AddRect(ImVec2(px - expand, py - expand),
+            ImVec2(px + pw + expand, py + ph + expand),
+            IM_COL32(0, 0, 0, ga), 10.f + expand, 0, 1.f);
+    }
+    for (int g = 3; g >= 1; --g) {
+        float expand = static_cast<float>(g) * 3.f;
+        int ga = static_cast<int>(18 * fa / static_cast<float>(g));
+        fdl->AddRect(ImVec2(px - expand, py - expand),
+            ImVec2(px + pw + expand, py + ph + expand),
+            IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
+                     static_cast<int>(accent_b * 255), ga), 10.f + expand, 0, 1.f);
+    }
+
+    float body_fa = fa < 1.f ? std::sqrt(fa) : 1.f;
+    {
+        const auto& th_pop_body = aida::ui::resolved();
+        ImU32 body_col = aida::ui::with_alpha(th_pop_body.panel_bg, body_fa);
+        fdl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
+            body_col, 8.f);
+    }
+    fdl->AddRect(ImVec2(px, py), ImVec2(px + pw, py + ph),
+        IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
+                 static_cast<int>(accent_b * 255), static_cast<int>(90 * fa)), 8.f, 0, 1.5f);
 
     char title_buf[256];
     if (!st.xref_popup_target_name.empty()) {
@@ -2702,6 +3355,14 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
 
     float btn_x = px + 10.f;
     float btn_y = toolbar_y + 4.f;
+
+    if (!has_results) {
+        float bw_addr = ui_anim::toolbar_button_width("Copy Address");
+        fdl->AddRectFilled(ImVec2(btn_x - 2.f, btn_y - 2.f),
+                           ImVec2(btn_x + bw_addr + 2.f, btn_y + 22.f + 2.f),
+                           aida::ui::with_alpha(IM_COL32(255, 255, 255, 10), fa),
+                           4.f);
+    }
     if (ui_anim::render_toolbar_button(fdl, "Copy Address", btn_x, btn_y,
                                         accent_r, accent_g, accent_b, fa, s_copy_addr_anim, dt,
                                         false, !has_results)) {
@@ -2713,6 +3374,14 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
         }
     }
     btn_x += ui_anim::toolbar_button_width("Copy Address") + 4.f;
+
+    if (!has_results) {
+        float bw_all = ui_anim::toolbar_button_width("Copy All");
+        fdl->AddRectFilled(ImVec2(btn_x - 2.f, btn_y - 2.f),
+                           ImVec2(btn_x + bw_all + 2.f, btn_y + 22.f + 2.f),
+                           aida::ui::with_alpha(IM_COL32(255, 255, 255, 10), fa),
+                           4.f);
+    }
     if (ui_anim::render_toolbar_button(fdl, "Copy All", btn_x, btn_y,
                                         accent_r, accent_g, accent_b, fa, s_copy_all_anim, dt,
                                         false, !has_results)) {
@@ -2727,14 +3396,21 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
             ImGui::SetClipboardText(all_text.c_str());
     }
 
-    char count_buf[32];
-    snprintf(count_buf, sizeof(count_buf), "%zu result%s",
-             results_copy.size(), results_copy.size() == 1 ? "" : "s");
+    char count_buf[40];
+    if (scanning && !has_results) {
+        snprintf(count_buf, sizeof(count_buf), "Searching...");
+    } else if (scanning && has_results) {
+        snprintf(count_buf, sizeof(count_buf), "%zu (scanning)", results_copy.size());
+    } else {
+        snprintf(count_buf, sizeof(count_buf), "%zu result%s",
+                 results_copy.size(),
+                 results_copy.size() == 1 ? "" : "s");
+    }
     ImVec2 count_ts = ImGui::CalcTextSize(count_buf);
     float count_pill_w = count_ts.x + 16.f;
     float count_pill_x = px + pw - count_pill_w - 12.f;
     float count_pill_y = toolbar_y + (toolbar_h - (count_ts.y + 4.f)) * 0.5f;
-    ImU32 pill_color = has_results ? tk.accent_u32 : tk.text_dim;
+    ImU32 pill_color = scanning ? tk.accent_dim : (has_results ? tk.accent_u32 : tk.text_dim);
     ui_anim::render_status_pill(fdl, count_pill_x, count_pill_y, count_buf, pill_color, fa);
 
     if (scanning && has_results) {
@@ -2753,7 +3429,6 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
     float list_y = table_y + row_h;
     float list_h = table_h - row_h;
     if (list_h < 1.f) list_h = 1.f;
-    bool popup_hovered = false;
 
     if (has_results) {
         float col_type_w = 54.f;
@@ -2772,8 +3447,8 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
         float content_h = static_cast<float>(results_copy.size()) * row_h;
         int n_results = static_cast<int>(results_copy.size());
 
-        popup_hovered = ImGui::IsMouseHoveringRect(ImVec2(px, list_y), ImVec2(px + pw, list_y + list_h));
-        if (popup_hovered) {
+        bool list_hovered = ImGui::IsMouseHoveringRect(ImVec2(px, list_y), ImVec2(px + pw, list_y + list_h));
+        if (list_hovered) {
             float wheel = ImGui::GetIO().MouseWheel;
             if (wheel != 0.f)
                 st.xref_popup_target_scroll -= wheel * row_h * 3.f;
@@ -2947,15 +3622,16 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
         s_xref_anim_t += dt * 5.f;
         float region_top = toolbar_end + 2.f;
         float region_bottom = py + ph - footer_h;
-        float region_cy = (region_top + region_bottom) * 0.5f;
         float region_cx = px + pw * 0.5f;
-
-        ImU32 spin_col = aida::ui::with_alpha(tk.accent_u32, fa);
-        ui_anim::render_spinner(fdl, region_cx, region_cy - 12.f, 10.f, 2.5f, spin_col, s_xref_anim_t);
-
-        const char* scan_text = "Scanning for cross-references\xe2\x80\xa6";
+        const char* scan_text = "Scanning for cross-references...";
         ImVec2 stsz = ImGui::CalcTextSize(scan_text);
-        fdl->AddText(ImVec2(region_cx - stsz.x * 0.5f, region_cy + 14.f),
+        float content_h = 12.f + 6.f + stsz.y;
+        float content_top = region_top + ((region_bottom - region_top) - content_h) * 0.5f;
+        float spinner_cy = content_top + 12.f;
+        ImU32 spin_col = aida::ui::with_alpha(tk.accent_u32, fa);
+        ui_anim::render_spinner(fdl, region_cx, spinner_cy, 12.f, 2.5f, spin_col, s_xref_anim_t);
+        float label_y = spinner_cy + 12.f + 6.f;
+        fdl->AddText(ImVec2(region_cx - stsz.x * 0.5f, label_y),
             _ta(tk.text_secondary), scan_text);
     } else {
         float region_top = toolbar_end + 2.f;
@@ -2963,10 +3639,10 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
         float region_h = region_bottom - region_top;
         float region_cx = px + pw * 0.5f;
 
-        float circle_r = 28.f;
-        float circle_cy = region_top + 32.f + circle_r;
-        if (region_h < circle_r * 2.f + 110.f) {
-            circle_cy = region_top + 22.f + circle_r;
+        float circle_r = 22.f;
+        float circle_cy = region_top + 16.f + circle_r;
+        if (region_h < circle_r * 2.f + 90.f) {
+            circle_cy = region_top + 10.f + circle_r;
         }
 
         ImU32 bg_col = aida::ui::with_alpha(tk.accent_glow, fa * 0.6f);
@@ -2975,9 +3651,9 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
         fdl->AddCircle(ImVec2(region_cx, circle_cy), circle_r, border_col, 32, 1.5f);
 
         ImU32 glyph_col = aida::ui::with_alpha(tk.accent_u32, fa);
-        fdl->AddCircleFilled(ImVec2(region_cx, circle_cy - 9.f), 2.4f, glyph_col, 12);
-        fdl->AddLine(ImVec2(region_cx, circle_cy - 2.f),
-                     ImVec2(region_cx, circle_cy + 12.f),
+        fdl->AddCircleFilled(ImVec2(region_cx, circle_cy - 7.f), 2.2f, glyph_col, 12);
+        fdl->AddLine(ImVec2(region_cx, circle_cy - 1.f),
+                     ImVec2(region_cx, circle_cy + 9.f),
                      glyph_col, 2.5f);
 
         ImFont* title_font = aida::ui::fonts::body_strong();
@@ -2985,7 +3661,7 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
         float title_size = 15.f;
         const char* title_text = "No cross-references";
         ImVec2 title_sz = title_font->CalcTextSizeA(title_size, FLT_MAX, 0.f, title_text);
-        float title_y = circle_cy + circle_r + 14.f;
+        float title_y = circle_cy + circle_r + 10.f;
         fdl->AddText(title_font, title_size,
             ImVec2(region_cx - title_sz.x * 0.5f, title_y),
             _ta(tk.text_primary), title_text);
@@ -2995,17 +3671,9 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
                  "Nothing in this module calls or references 0x%llX.",
                  static_cast<unsigned long long>(st.xref_popup_addr));
         ImVec2 sub_sz = ImGui::CalcTextSize(sub_buf);
-        float sub_y = title_y + title_sz.y + 6.f;
+        float sub_y = title_y + title_sz.y + 4.f;
         fdl->AddText(ImVec2(region_cx - sub_sz.x * 0.5f, sub_y),
             _ta(tk.text_secondary), sub_buf);
-
-        const char* hint_text = "Press Esc to close \xc2\xb7 Try Shift+X for extended scan";
-        ImVec2 hint_sz = ImGui::CalcTextSize(hint_text);
-        float hint_y = region_bottom - hint_sz.y - 8.f;
-        if (hint_y < sub_y + sub_sz.y + 10.f)
-            hint_y = sub_y + sub_sz.y + 10.f;
-        fdl->AddText(ImVec2(region_cx - hint_sz.x * 0.5f, hint_y),
-            _ta(tk.text_dim), hint_text);
     }
 
     {
@@ -3014,15 +3682,15 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
             const char* label;
         };
         const chip_part_t parts[] = {
-            { "\xe2\x86\x91\xe2\x86\x93", "navigate" },
-            { "Enter",                    "jump"     },
-            { "Esc",                      "close"    },
-            { "Dbl-click",                "goto"     },
+            { "Up/Dn",    "navigate" },
+            { "Enter",    "jump"     },
+            { "Esc",      "close"    },
+            { "Dbl-click","goto"     },
         };
         const int part_count = static_cast<int>(sizeof(parts) / sizeof(parts[0]));
 
-        const float gap_chip_label = 6.f;
-        const float gap_pair_pair = 12.f;
+        const float gap_chip_label = 10.f;
+        const float gap_pair_pair = 18.f;
         const float chip_pad_x = 6.f;
         const float divider_h = 12.f;
 
@@ -3053,21 +3721,52 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
                 float div_y0 = fy + (16.f - divider_h) * 0.5f + 2.f;
                 fdl->AddLine(ImVec2(div_x, div_y0),
                              ImVec2(div_x, div_y0 + divider_h),
-                             _ta(tk.border_subtle), 1.f);
+                             _ta(tk.text_dim), 1.f);
                 fx += gap_pair_pair;
             }
         }
     }
 
-    if (!st.xref_popup_open && !popup_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        st.xref_popup_fade = 0.f;
+    bool body_hover = ImGui::IsMouseHoveringRect(ImVec2(px, py), ImVec2(px + pw, py + ph));
+    if (st.xref_popup_open && !body_hover && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        st.xref_popup_open = false;
     }
 }
 
 
+struct modal_input_block_scope_t {
+    bool active = false;
+    float saved_mouse_dur[5] = {};
+    bool saved_mouse_down[5] = {};
+    modal_input_block_scope_t() {
+        if (source_reconstruct_view::is_open()) {
+            active = true;
+            ImGuiIO& io = ImGui::GetIO();
+            for (int i = 0; i < 5; ++i) {
+                saved_mouse_dur[i] = io.MouseDownDuration[i];
+                saved_mouse_down[i] = io.MouseDown[i];
+                if (io.MouseDownDuration[i] == 0.0f)
+                    io.MouseDownDuration[i] = 0.0001f;
+                io.MouseDown[i] = false;
+            }
+        }
+    }
+    ~modal_input_block_scope_t() {
+        if (active) {
+            ImGuiIO& io = ImGui::GetIO();
+            for (int i = 0; i < 5; ++i) {
+                io.MouseDownDuration[i] = saved_mouse_dur[i];
+                io.MouseDown[i] = saved_mouse_down[i];
+            }
+        }
+    }
+};
+
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b,
             DisasmState& disasm, float dt) {
+
+    modal_input_block_scope_t input_block_scope;
 
     const uint64_t frame_t0_ns = now_ns();
 
@@ -3108,7 +3807,11 @@ void render(float pos_x, float pos_y, float width, float height,
             scroll_addr = disasm.file.instrs[st.selected_row].addr;
 
         disasm.file.instrs = std::move(disasm.live_pending_instrs);
-        disasm.file.image_base = disasm.live_pending_va;
+        if (disasm.live_base != 0) {
+            disasm.file.image_base = disasm.live_base;
+        } else {
+            disasm.file.image_base = disasm.live_pending_va;
+        }
         disasm.file.text_va    = disasm.live_pending_va;
         disasm.live_pending_ready.store(false, std::memory_order_release);
         disasm.last_swap_was_live = true;
@@ -3373,8 +4076,37 @@ void render(float pos_x, float pos_y, float width, float height,
     }
     const int banner_lines = s_banner_line_count;
 
+    {
+        const uint32_t cur_gen_for_layout = s_format_gen.load(std::memory_order_acquire);
+        const uint64_t fi_sig = function_index_state_signature();
+        const uint64_t first_addr = (n > 0) ? instrs.front().addr : 0;
+        const uint64_t last_addr  = (n > 0) ? instrs.back().addr  : 0;
+        const bool hard_invalid = !s_layout.ready
+            || s_layout.built_n != n
+            || s_layout.built_addr_first != first_addr
+            || s_layout.built_addr_last  != last_addr
+            || s_layout.built_gen != cur_gen_for_layout
+            || s_layout.banner_rows != banner_lines;
+        const bool soft_invalid = s_layout.built_fi_state_sig != fi_sig;
+        bool need_rebuild = hard_invalid;
+        if (!hard_invalid && soft_invalid) {
+            const uint64_t now = now_ns();
+            const bool bulk_active = function_index::static_bulk_in_progress();
+            const uint64_t debounce_ns = bulk_active ? 16000000ull : 120000000ull;
+            if (s_layout.built_at_ns == 0
+                || now - s_layout.built_at_ns >= debounce_ns)
+            {
+                need_rebuild = true;
+            }
+        }
+        if (need_rebuild) {
+            rebuild_layout(instrs, banner_lines, cur_gen_for_layout, fi_sig);
+        }
+    }
+
     ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, 20.f, dt);
-    float max_scroll = std::max(0.f, (n + banner_lines) * line_h - content_height + line_h);
+    float max_scroll = std::max(0.f,
+        static_cast<float>(s_layout.total_rows) * line_h - content_height + line_h);
     st.target_scroll_y = std::max(0.f, std::min(st.target_scroll_y, max_scroll));
     st.scroll_y = std::max(0.f, std::min(st.scroll_y, max_scroll));
 
@@ -3422,17 +4154,33 @@ void render(float pos_x, float pos_y, float width, float height,
 
     int first_vrow = std::max(0, static_cast<int>(st.scroll_y / line_h) - 1);
     int last_vrow  = static_cast<int>((st.scroll_y + content_height) / line_h) + 1;
-    int first_row = std::max(0, first_vrow - banner_lines);
-    int last_row  = std::min(n - 1, last_vrow - banner_lines);
-    if (last_row < first_row) {
-        first_row = 0;
-        last_row = -1;
+    int first_row = -1;
+    int last_row  = -1;
+    if (n > 0 && s_layout.ready) {
+        first_row = layout_first_visible_instr(first_vrow, banner_lines);
+        last_row  = layout_last_visible_instr(last_vrow);
+        if (first_row < 0 || last_row < 0 || first_row > last_row) {
+            first_row = 0;
+            last_row = -1;
+        } else {
+            if (first_row >= n) first_row = n - 1;
+            if (last_row  >= n) last_row  = n - 1;
+        }
+    } else if (n > 0) {
+        first_row = std::max(0, first_vrow - banner_lines);
+        last_row  = std::min(n - 1, last_vrow - banner_lines);
+        if (last_row < first_row) {
+            first_row = 0;
+            last_row = -1;
+        }
     }
 
     if (n > 0 && first_row <= last_row && !throttled) {
         uint64_t now_w = now_ns();
         uint64_t last_w = s_visible_warm_last_ns.load(std::memory_order_acquire);
-        if (now_w - last_w >= 150000000ull) {
+        const bool live_warm = (driver_bridge::attached_pid() != 0);
+        const uint64_t warm_gate_ns = live_warm ? 150000000ull : 16000000ull;
+        if (now_w - last_w >= warm_gate_ns) {
             s_visible_warm_last_ns.store(now_w, std::memory_order_release);
             uint64_t lo_va = instrs[first_row].addr;
             uint64_t hi_va = instrs[last_row].addr + static_cast<uint64_t>(instrs[last_row].len);
@@ -3683,7 +4431,13 @@ void render(float pos_x, float pos_y, float width, float height,
 
     uint64_t align_skip_end = 0;
     for (int i = first_row; i <= last_row; i++) {
-        float y = oy_content + (i + banner_lines) * line_h - st.scroll_y;
+        if (s_layout.ready && i < static_cast<int>(s_layout.hidden.size()) && s_layout.hidden[i]) {
+            continue;
+        }
+        const float instr_row_f = s_layout.ready
+            ? static_cast<float>(s_layout.start_row[i])
+            : static_cast<float>(i + banner_lines);
+        float y = oy_content + instr_row_f * line_h - st.scroll_y;
         const AsmInstr& ins = instrs[i];
 
         if (align_skip_end != 0 && ins.addr < align_skip_end) {
@@ -3709,20 +4463,51 @@ void render(float pos_x, float pos_y, float width, float height,
                 float row_y_off_a = (1.f - row_entrance_a) * 6.f;
                 float row_a_inner_a = a * row_entrance_a;
                 std::string sec_name_a = get_visible_section(ins.addr);
-                draw_addr_prefix(y, ins.addr, sec_name_a, row_a_inner_a * 0.95f, row_y_off_a);
-                char align_buf[64];
-                std::snprintf(align_buf, sizeof(align_buf), "align %u",
-                    static_cast<unsigned int>(arun.alignment));
-                ImU32 align_col = aida::ui::with_alpha(disasm_theme::keyword(), row_a_inner_a);
-                draw_text_at(x_mnem, y, align_col, align_buf, row_y_off_a);
-                uint64_t run_len = (arun.end > arun.addr) ? (arun.end - arun.addr) : 0;
-                char tail_buf[96];
-                const char* fill_label = (arun.fill_byte == 0xCC) ? "0xCC"
-                    : (arun.fill_byte == 0x90) ? "0x90" : "fill";
-                std::snprintf(tail_buf, sizeof(tail_buf), "; %llu bytes of %s",
-                    static_cast<unsigned long long>(run_len), fill_label);
-                ImU32 tail_col = aida::ui::with_alpha(disasm_theme::comment(), row_a_inner_a * 0.85f);
-                draw_text_at(x_comment, y, tail_col, tail_buf, row_y_off_a);
+
+                float y_label = y;
+                float y_directive = y + line_h;
+
+                draw_addr_prefix(y_label, arun.addr, sec_name_a,
+                    row_a_inner_a * 0.95f, row_y_off_a);
+                char label_buf[40];
+                std::snprintf(label_buf, sizeof(label_buf), "algn_%llX:",
+                    static_cast<unsigned long long>(arun.addr));
+                ImU32 label_col = aida::ui::with_alpha(disasm_theme::loc_label(),
+                    row_a_inner_a);
+                draw_text_at(x_mnem, y_label, label_col, label_buf, row_y_off_a);
+
+                draw_addr_prefix(y_directive, arun.addr, sec_name_a,
+                    row_a_inner_a * 0.95f, row_y_off_a);
+
+                if (st.show_bytes) {
+                    uint64_t run_len = (arun.end > arun.addr) ? (arun.end - arun.addr) : 0;
+                    const int max_pairs = 10;
+                    int show_n = run_len < static_cast<uint64_t>(max_pairs)
+                        ? static_cast<int>(run_len) : max_pairs;
+                    char bytes_buf[96] = {};
+                    int boff = 0;
+                    for (int b = 0; b < show_n && boff + 4 < static_cast<int>(sizeof(bytes_buf)); ++b) {
+                        boff += std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff,
+                            b ? " %02X" : "%02X",
+                            static_cast<unsigned int>(arun.fill_byte));
+                    }
+                    if (run_len > static_cast<uint64_t>(max_pairs)
+                        && boff + 4 < static_cast<int>(sizeof(bytes_buf)))
+                    {
+                        std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff, "...");
+                    }
+                    ImU32 bytes_col = aida::ui::with_alpha(disasm_theme::bytes(),
+                        row_a_inner_a);
+                    draw_text_at(x_bytes, y_directive, bytes_col, bytes_buf, row_y_off_a);
+                }
+
+                char align_buf[40];
+                std::snprintf(align_buf, sizeof(align_buf), "align %s",
+                    ida_export::format_unsigned_hex(static_cast<uint64_t>(arun.alignment)).c_str());
+                ImU32 align_col = aida::ui::with_alpha(disasm_theme::keyword(),
+                    row_a_inner_a);
+                draw_text_at(x_mnem, y_directive, align_col, align_buf, row_y_off_a);
+
                 align_skip_end = arun.end;
                 continue;
             }
@@ -3929,82 +4714,99 @@ void render(float pos_x, float pos_y, float width, float height,
             draw_text_at(x_mnem, yy, text_col, r.text.c_str(), row_y_off);
         };
 
-        float anchor_y = y;
-        int row_local = 0;
-
         const auto& before_rows_ref = *before_rows_ptr;
-        for (size_t bi = 0; bi < before_rows_ref.size(); ++bi) {
-            float yy = y - static_cast<float>(before_rows_ref.size() - bi) * line_h;
-            if (yy + line_h < oy_content || yy > oy_content + content_height) continue;
+        const int before_extent_total = (s_layout.ready && i < static_cast<int>(s_layout.before_extent.size()))
+            ? s_layout.before_extent[i]
+            : 0;
+        const int before_row_cap = (s_layout.ready && i < static_cast<int>(s_layout.before_row_count.size()))
+            ? s_layout.before_row_count[i]
+            : static_cast<int>(before_rows_ref.size());
+        int slot_idx = 0;
+
+        auto slot_y = [&](int slot) -> float {
+            return y - static_cast<float>(before_extent_total - slot) * line_h;
+        };
+
+        const size_t before_iter_n = std::min(before_rows_ref.size(), static_cast<size_t>(before_row_cap));
+        for (size_t bi = 0; bi < before_iter_n; ++bi) {
+            const int this_slot = slot_idx++;
+            float yy = slot_y(this_slot);
             const auto& br = before_rows_ref[bi];
-            if (br.kind == function_index::injection_t::spacer_line) {
-                draw_addr_prefix_cached(yy, &cache, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
-            } else {
-                draw_injection_row(yy, br, sec_name);
-            }
-            if (br.kind == function_index::injection_t::proc_header && !xrefs_at_func.empty()) {
-                std::string xref_text = ida_format_xref_comment(xrefs_at_func[0],
-                    xrefs_more && xrefs_at_func.size() == 1);
-                draw_text_at(x_comment, yy,
-                    aida::ui::with_alpha(disasm_theme::xref(), row_a_inner * 0.95f),
-                    xref_text.c_str(), row_y_off);
-            }
-            if (br.kind == function_index::injection_t::proc_header && !throttled) {
-                function_index::frame_summary_t fs;
-                if (function_index::frame_summary(br.addr, &fs)) {
-                    char fs_buf[192];
-                    int64_t neg = fs.delta;
-                    unsigned long long abs_delta = static_cast<unsigned long long>(neg < 0 ? -neg : neg);
-                    std::snprintf(fs_buf, sizeof(fs_buf),
-                        "; sp = -%llXh, locals = %llu bytes, saved_regs = %u",
-                        abs_delta,
-                        static_cast<unsigned long long>(fs.prologue_locals_size),
-                        static_cast<unsigned int>(fs.saved_reg_count));
-                    float fs_x = x_comment;
-                    if (!xrefs_at_func.empty()) {
-                        std::string xref_text_w = ida_format_xref_comment(xrefs_at_func[0],
-                            xrefs_more && xrefs_at_func.size() == 1);
-                        float xref_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f,
-                            xref_text_w.c_str()).x;
-                        fs_x = x_comment + xref_w + 3.f * ch_w_safe;
-                    }
-                    ImU32 fs_col = aida::ui::with_alpha(disasm_theme::comment(), row_a_inner * 0.85f);
-                    draw_text_at(fs_x, yy, fs_col, fs_buf, row_y_off);
+            bool visible = (yy + line_h >= oy_content) && (yy <= oy_content + content_height);
+            if (visible) {
+                if (br.kind == function_index::injection_t::spacer_line) {
+                    draw_addr_prefix_cached(yy, &cache, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
+                } else {
+                    draw_injection_row(yy, br, sec_name);
+                }
+                if (br.kind == function_index::injection_t::proc_header && !xrefs_at_func.empty()) {
+                    std::string xref_text = ida_format_xref_comment(xrefs_at_func[0],
+                        xrefs_more && xrefs_at_func.size() == 1);
+                    draw_text_at(x_comment, yy,
+                        aida::ui::with_alpha(disasm_theme::xref(), row_a_inner * 0.95f),
+                        xref_text.c_str(), row_y_off);
                 }
             }
-            (void)row_local;
-        }
-
-        if (is_proc_start && xrefs_at_func.size() > 1) {
-            for (size_t xi = 1; xi < xrefs_at_func.size(); ++xi) {
-                float yy = y - static_cast<float>(xi) * line_h;
-                if (yy + line_h < oy_content || yy > oy_content + content_height) continue;
-                draw_addr_prefix_cached(yy, &cache, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
-                bool last_more = (xi + 1 == xrefs_at_func.size()) && xrefs_more;
-                std::string xt = ida_format_xref_comment(xrefs_at_func[xi], last_more);
-                draw_text_at(x_comment, yy,
-                    aida::ui::with_alpha(disasm_theme::xref(), row_a_inner * 0.9f),
-                    xt.c_str(), row_y_off);
+            if (br.kind == function_index::injection_t::proc_header && xrefs_at_func.size() > 1) {
+                const int reserved_proc_xref = (s_layout.ready && i < static_cast<int>(s_layout.proc_xref_extra.size()))
+                    ? s_layout.proc_xref_extra[i]
+                    : static_cast<int>(xrefs_at_func.size()) - 1;
+                int drawn_xref = 0;
+                for (size_t xi = 1; xi < xrefs_at_func.size() && drawn_xref < reserved_proc_xref; ++xi, ++drawn_xref) {
+                    const int x_slot = slot_idx++;
+                    float xy = slot_y(x_slot);
+                    if (xy + line_h < oy_content || xy > oy_content + content_height) continue;
+                    draw_addr_prefix_cached(xy, &cache, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
+                    bool last_more = (xi + 1 == xrefs_at_func.size()) && xrefs_more;
+                    std::string xt = ida_format_xref_comment(xrefs_at_func[xi], last_more);
+                    draw_text_at(x_comment, xy,
+                        aida::ui::with_alpha(disasm_theme::xref(), row_a_inner * 0.9f),
+                        xt.c_str(), row_y_off);
+                }
             }
         }
 
         if (!inline_label_ptr->empty() && !throttled) {
-            float yy = y - line_h;
-            if (yy + line_h >= oy_content && yy <= oy_content + content_height) {
-                draw_addr_prefix_cached(yy, &cache, ins.addr, sec_name, row_a_inner * 0.7f, row_y_off);
+            const int prefix_slot = slot_idx++;
+            float prefix_y = slot_y(prefix_slot);
+            if (prefix_y + line_h >= oy_content && prefix_y <= oy_content + content_height) {
+                draw_addr_prefix_cached(prefix_y, &cache, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
+            }
+            const int label_slot = slot_idx++;
+            float label_y = slot_y(label_slot);
+            if (label_y + line_h >= oy_content && label_y <= oy_content + content_height) {
+                draw_addr_prefix_cached(label_y, &cache, ins.addr, sec_name, row_a_inner * 0.7f, row_y_off);
                 std::string lbl_text = *inline_label_ptr;
                 if (lbl_text.empty() || lbl_text.back() != ':') lbl_text += ":";
-                draw_text_at(x_mnem, yy,
+                draw_text_at(x_mnem, label_y,
                     aida::ui::with_alpha(disasm_theme::loc_label(), row_a_inner),
                     lbl_text.c_str(), row_y_off);
                 if (!cache.xref_inline_valid) {
-                    cache.xref_inline = xref_index::query_to(ins.addr, 1);
-                    cache.xref_inline_more = xref_index::has_more(ins.addr, 1);
+                    cache.xref_inline = xref_index::query_to(ins.addr, 6);
+                    cache.xref_inline_more = xref_index::has_more(ins.addr, 6);
                     cache.xref_inline_valid = true;
                 }
                 if (!cache.xref_inline.empty()) {
-                    std::string xt = ida_format_xref_comment(cache.xref_inline[0], cache.xref_inline_more);
-                    draw_text_at(x_comment, yy,
+                    bool head_more = cache.xref_inline_more && cache.xref_inline.size() == 1;
+                    std::string xt = ida_format_xref_comment(cache.xref_inline[0], head_more);
+                    draw_text_at(x_comment, label_y,
+                        aida::ui::with_alpha(disasm_theme::xref(), row_a_inner * 0.9f),
+                        xt.c_str(), row_y_off);
+                }
+            }
+            if (cache.xref_inline_valid && cache.xref_inline.size() > 1) {
+                const int reserved_inline_xref = (s_layout.ready && i < static_cast<int>(s_layout.inline_xref_extra.size()))
+                    ? s_layout.inline_xref_extra[i]
+                    : static_cast<int>(cache.xref_inline.size()) - 1;
+                int drawn_inline = 0;
+                for (size_t xi = 1; xi < cache.xref_inline.size() && drawn_inline < reserved_inline_xref; ++xi, ++drawn_inline) {
+                    const int x_slot = slot_idx++;
+                    float xy = slot_y(x_slot);
+                    if (xy + line_h < oy_content || xy > oy_content + content_height) continue;
+                    draw_addr_prefix_cached(xy, &cache, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
+                    bool last_more = (xi + 1 == cache.xref_inline.size()) && cache.xref_inline_more;
+                    std::string xt = ida_format_xref_comment(cache.xref_inline[xi], last_more);
+                    draw_text_at(x_comment, xy,
                         aida::ui::with_alpha(disasm_theme::xref(), row_a_inner * 0.9f),
                         xt.c_str(), row_y_off);
                 }
@@ -4037,6 +4839,10 @@ void render(float pos_x, float pos_y, float width, float height,
             && lookup_mnem_override_at(ins.addr, mnem_override_token)
             && !mnem_override_token.empty();
 
+        function_index::directive_override_t dir_ov_live;
+        bool has_dir_override_live = !throttled
+            && function_index::directive_override_at(ins.addr, &dir_ov_live);
+
         ImU32 mc = mnemonic_color(ins, row_a_inner);
         if (has_mnem_override) {
             const std::string& tok = mnem_override_token;
@@ -4051,16 +4857,42 @@ void render(float pos_x, float pos_y, float width, float height,
                     disasm_theme::color_for_kind(override_kind), row_a_inner);
             }
         }
+        if (has_dir_override_live) {
+            mc = aida::ui::with_alpha(disasm_theme::keyword(), row_a_inner);
+        }
         if (!cache.mnem_valid) {
             cache.mnem_str = ida_export::ida_mnemonic(std::string(ins.mnem));
             cache.mnem_valid = true;
         }
+        std::string dir_mnem_text;
         const char* mnem_render = cache.mnem_str.empty() ? ins.mnem : cache.mnem_str.c_str();
+        if (has_dir_override_live) {
+            if (dir_ov_live.kind == function_index::directive_kind_t::align) {
+                dir_mnem_text = "align";
+            }
+            else if (dir_ov_live.kind == function_index::directive_kind_t::db) {
+                dir_mnem_text = "db";
+            }
+            if (!dir_mnem_text.empty()) {
+                mnem_render = dir_mnem_text.c_str();
+            }
+        }
         draw_text_at(x_mnem, y, mc, mnem_render, row_y_off);
 
         const std::string* operand_text_ptr = nullptr;
+        std::string dir_ops_text;
         if (throttled) {
             operand_text_ptr = nullptr;
+        } else if (has_dir_override_live) {
+            if (dir_ov_live.kind == function_index::directive_kind_t::align) {
+                dir_ops_text = ida_export::format_unsigned_hex(static_cast<uint64_t>(dir_ov_live.value));
+            }
+            else if (dir_ov_live.kind == function_index::directive_kind_t::db) {
+                char hb[16];
+                std::snprintf(hb, sizeof(hb), "0%02Xh", static_cast<unsigned int>(dir_ov_live.value));
+                dir_ops_text = hb;
+            }
+            operand_text_ptr = &dir_ops_text;
         } else {
             if (!cache.ops_valid) {
                 std::string ops_subst = substitute_operand_text(ins, file);
@@ -4109,7 +4941,10 @@ void render(float pos_x, float pos_y, float width, float height,
             operand_text_ptr = &cache.ops_subst;
         }
         const char* operand_render_cstr = throttled ? ins.ops : operand_text_ptr->c_str();
-        if (throttled) {
+        if (has_dir_override_live && !dir_ops_text.empty()) {
+            ImU32 oc = aida::ui::with_alpha(disasm_theme::bytes(), row_a_inner * 0.85f);
+            draw_text_at(x_operand, y, oc, dir_ops_text.c_str(), row_y_off);
+        } else if (throttled) {
             if (operand_render_cstr && operand_render_cstr[0]) {
                 ImU32 oc;
                 if (ins.is_branch || ins.is_call)
@@ -4230,6 +5065,15 @@ void render(float pos_x, float pos_y, float width, float height,
             if (has_mnem_override) {
                 append_part(mnem_override_token);
             }
+            if (parts.empty() && ins.has_imm) {
+                uint64_t imm_a = ins.imm_unsigned;
+                if (imm_a >= 0x20 && imm_a <= 0x7E && imm_a != 0x60) {
+                    char ch_a = static_cast<char>(imm_a);
+                    char ascii_buf[8];
+                    std::snprintf(ascii_buf, sizeof(ascii_buf), "'%c'", ch_a);
+                    append_part(std::string(ascii_buf));
+                }
+            }
             if (!parts.empty()) {
                 composed_cmt = parts;
                 composed_tooltip = full_for_tooltip;
@@ -4282,10 +5126,24 @@ void render(float pos_x, float pos_y, float width, float height,
             }
         }
 
+        size_t after_row_offset = 0;
+        if (!throttled && function_index::is_noreturn_call_at(ins.addr)) {
+            float yy = y + line_h;
+            if (yy + line_h >= oy_content && yy <= oy_content + content_height) {
+                draw_addr_prefix(yy, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
+                function_index::injection_row_t sep;
+                sep.kind = function_index::injection_t::endp_separator;
+                sep.addr = ins.addr;
+                sep.text = "; ---------------------------------------------------------------------------";
+                draw_injection_row(yy, sep, sec_name);
+            }
+            ++after_row_offset;
+        }
+
         const auto& after_rows_ref = *after_rows_ptr;
         if (!after_rows_ref.empty()) {
             for (size_t ai = 0; ai < after_rows_ref.size(); ++ai) {
-                float yy = y + static_cast<float>(ai + 1) * line_h;
+                float yy = y + static_cast<float>(ai + 1 + after_row_offset) * line_h;
                 if (yy + line_h < oy_content || yy > oy_content + content_height) continue;
                 const auto& ar = after_rows_ref[ai];
                 if (ar.kind == function_index::injection_t::spacer_line) {
@@ -4345,8 +5203,6 @@ void render(float pos_x, float pos_y, float width, float height,
             st.banner_sel_dragging = false;
             ImGui::OpenPopup("##disasm_view_ctx");
         }
-
-        (void)anchor_y;
     }
 
     if (st.sel_dragging && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
@@ -4362,7 +5218,14 @@ void render(float pos_x, float pos_y, float width, float height,
             float speed = (depth > kAutoScrollMarginFar) ? kAutoScrollSpeedFast : kAutoScrollSpeedSlow;
             st.target_scroll_y -= speed * dt;
             if (st.target_scroll_y < 0.f) st.target_scroll_y = 0.f;
-            int top_row = std::max(0, static_cast<int>(st.target_scroll_y / line_h) - s_banner_line_count);
+            int top_row;
+            if (s_layout.ready) {
+                int top_vrow = static_cast<int>(st.target_scroll_y / line_h);
+                top_row = layout_first_visible_instr(top_vrow, banner_lines);
+                if (top_row < 0) top_row = 0;
+            } else {
+                top_row = std::max(0, static_cast<int>(st.target_scroll_y / line_h) - s_banner_line_count);
+            }
             if (top_row >= n) top_row = n - 1;
             if (top_row >= 0 && top_row != st.sel_extent) {
                 st.sel_extent = top_row;
@@ -4373,7 +5236,14 @@ void render(float pos_x, float pos_y, float width, float height,
             float speed = (depth > kAutoScrollMarginFar) ? kAutoScrollSpeedFast : kAutoScrollSpeedSlow;
             st.target_scroll_y += speed * dt;
             if (st.target_scroll_y > max_scroll) st.target_scroll_y = max_scroll;
-            int bottom_row = static_cast<int>((st.target_scroll_y + content_height) / line_h) - s_banner_line_count;
+            int bottom_row;
+            if (s_layout.ready) {
+                int bot_vrow = static_cast<int>((st.target_scroll_y + content_height) / line_h);
+                bottom_row = layout_last_visible_instr(bot_vrow);
+                if (bottom_row < 0) bottom_row = 0;
+            } else {
+                bottom_row = static_cast<int>((st.target_scroll_y + content_height) / line_h) - s_banner_line_count;
+            }
             if (bottom_row >= n) bottom_row = n - 1;
             if (bottom_row >= 0 && bottom_row != st.sel_extent) {
                 st.sel_extent = bottom_row;
@@ -4441,8 +5311,14 @@ void render(float pos_x, float pos_y, float width, float height,
             if (btarget == 0) continue;
             int tidx = find_instr_at(btarget, file);
             if (tidx < first_row || tidx > last_row) continue;
-            float fy = oy_content + static_cast<float>(bi) * line_h - st.scroll_y + line_h * 0.5f;
-            float ty = oy_content + static_cast<float>(tidx) * line_h - st.scroll_y + line_h * 0.5f;
+            const float bi_row = (s_layout.ready && bi < static_cast<int>(s_layout.start_row.size()))
+                ? static_cast<float>(s_layout.start_row[bi])
+                : static_cast<float>(bi + banner_lines);
+            const float tidx_row = (s_layout.ready && tidx < static_cast<int>(s_layout.start_row.size()))
+                ? static_cast<float>(s_layout.start_row[tidx])
+                : static_cast<float>(tidx + banner_lines);
+            float fy = oy_content + bi_row * line_h - st.scroll_y + line_h * 0.5f;
+            float ty = oy_content + tidx_row * line_h - st.scroll_y + line_h * 0.5f;
             ImU32 bcol;
             if (bins.is_call)
                 bcol = aida::ui::with_alpha(tk.accent_u32, a * 0.7f);
@@ -4480,6 +5356,46 @@ void render(float pos_x, float pos_y, float width, float height,
             lo = hi = st.selected_row;
         }
         copy_range_to_clipboard(lo, hi);
+    };
+
+    auto dump_full_listing_to_file = [&]() -> bool {
+        if (n <= 0) return false;
+        std::string out = ida_export::build_listing(disasm.file, instrs, 0, n - 1);
+        if (out.empty()) return false;
+        char path[MAX_PATH];
+        _snprintf_s(path, sizeof(path), _TRUNCATE,
+            "%saida_disasm_dump.txt", diag::resolve_log_dir());
+        HANDLE hf = CreateFileA(path, GENERIC_WRITE,
+            FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf == INVALID_HANDLE_VALUE) {
+            diag::log_tagged_fmt("disasm_dump",
+                "create_failed path=%s err=%lu", path, GetLastError());
+            return false;
+        }
+        const char* data = out.data();
+        size_t remaining = out.size();
+        bool ok = true;
+        while (remaining > 0) {
+            DWORD chunk = static_cast<DWORD>(remaining > (1u << 20) ? (1u << 20) : remaining);
+            DWORD written = 0;
+            if (!WriteFile(hf, data, chunk, &written, nullptr) || written == 0) {
+                ok = false;
+                break;
+            }
+            data += written;
+            remaining -= written;
+        }
+        CloseHandle(hf);
+        if (ok) {
+            diag::log_tagged_fmt("disasm_dump",
+                "wrote path=%s bytes=%zu lines=%d",
+                path, out.size(), n);
+        } else {
+            diag::log_tagged_fmt("disasm_dump",
+                "write_failed path=%s err=%lu", path, GetLastError());
+        }
+        return ok;
     };
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.f);
@@ -4536,6 +5452,12 @@ void render(float pos_x, float pos_y, float width, float height,
 
             ImGui::Separator();
 
+            if (ImGui::MenuItem("Dump full listing to aida_disasm_dump.txt", "Ctrl+Shift+D")) {
+                dump_full_listing_to_file();
+            }
+
+            ImGui::Separator();
+
 
             bool has_bm = false;
             int bm_idx = -1;
@@ -4568,10 +5490,18 @@ void render(float pos_x, float pos_y, float width, float height,
             ImGui::Separator();
 
 
-            if (ImGui::MenuItem("VA Format", nullptr, st.addr_format == addr_format_t::va))
-                st.addr_format = addr_format_t::va;
-            if (ImGui::MenuItem("RVA Format", nullptr, st.addr_format == addr_format_t::rva))
-                st.addr_format = addr_format_t::rva;
+            if (ImGui::MenuItem("VA Format", nullptr, st.addr_format == addr_format_t::va)) {
+                if (st.addr_format != addr_format_t::va) {
+                    st.addr_format = addr_format_t::va;
+                    bump_format_generation();
+                }
+            }
+            if (ImGui::MenuItem("RVA Format", nullptr, st.addr_format == addr_format_t::rva)) {
+                if (st.addr_format != addr_format_t::rva) {
+                    st.addr_format = addr_format_t::rva;
+                    bump_format_generation();
+                }
+            }
 
             if (ImGui::MenuItem("Show Bytes", nullptr, st.show_bytes))
                 st.show_bytes = !st.show_bytes;
@@ -4710,21 +5640,38 @@ void render(float pos_x, float pos_y, float width, float height,
                 int row = st.selected_row;
                 if (row >= 0 && row < n) {
                     uint64_t addr = instrs[row].addr;
-                    st.xref_popup_addr = addr;
-                    {
-                        std::string rn = rename_store::get(addr);
-                        st.xref_popup_target_name = !rn.empty() ? rn : symbol_store::resolve_symbol(addr);
+                    if (addr == 0) {
+                        diag::log_tagged_critical_fmt("xref",
+                            "x_key_skipped_zero_addr row=%d n=%d", row, n);
+                    } else {
+                        uint64_t func_start = find_enclosing_function_start(addr, disasm.file);
+                        uint64_t display_addr = (func_start != 0 && func_start != addr) ? func_start : addr;
+                        st.xref_popup_addr = display_addr;
+                        {
+                            std::string rn = rename_store::get(display_addr);
+                            std::string sym = !rn.empty() ? rn : symbol_store::resolve_symbol(display_addr);
+                            if (sym.empty() && func_start != 0 && func_start != addr) {
+                                char fbuf[40];
+                                snprintf(fbuf, sizeof(fbuf), "sub_%llX",
+                                    static_cast<unsigned long long>(func_start));
+                                sym = fbuf;
+                            }
+                            st.xref_popup_target_name = sym;
+                        }
+                        st.xref_popup_open = true;
+                        st.xref_popup_fade = 0.f;
+                        st.xref_popup_scroll = 0.f;
+                        st.xref_popup_target_scroll = 0.f;
+                        st.xref_popup_selected = -1;
+                        {
+                            std::lock_guard<std::mutex> lk(st.xref_mutex);
+                            st.xref_results.clear();
+                        }
+                        launch_xref_scan(addr, func_start);
                     }
-                    st.xref_popup_open = true;
-                    st.xref_popup_fade = 0.f;
-                    st.xref_popup_scroll = 0.f;
-                    st.xref_popup_target_scroll = 0.f;
-                    st.xref_popup_selected = -1;
-                    {
-                        std::lock_guard<std::mutex> lk(st.xref_mutex);
-                        st.xref_results.clear();
-                    }
-                    launch_xref_scan(addr);
+                } else {
+                    diag::log_tagged_critical_fmt("xref",
+                        "x_key_skipped_no_row selected=%d n=%d", row, n);
                 }
             }
 
@@ -4849,6 +5796,9 @@ void render(float pos_x, float pos_y, float width, float height,
                     copy_selection_to_clipboard();
                 }
             }
+            if (copy_hk_io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_D, false)) {
+                dump_full_listing_to_file();
+            }
         }
     }
 
@@ -4945,21 +5895,29 @@ void render(float pos_x, float pos_y, float width, float height,
 
 
     if (!st.bookmarks.empty()) {
-        float bm_y = oy_content + content_height - 22.f;
-        dl->AddRectFilled(ImVec2(ox, bm_y), ImVec2(ox + width, bm_y + 20.f),
-                          _ta(tk.bg_base));
+        float bm_h = 28.f;
+        float bm_y = oy_content + content_height - bm_h - 2.f;
 
+        const auto& th_bm = aida::ui::resolved();
+        ImU32 backdrop_top = aida::ui::with_alpha(th_bm.bg_overlay, a * 0.92f);
+        ImU32 backdrop_bot = aida::ui::with_alpha(th_bm.panel_header, a * 0.96f);
+        dl->AddRectFilledMultiColor(
+            ImVec2(ox, bm_y - 1.f), ImVec2(ox + width, bm_y + bm_h),
+            backdrop_top, backdrop_top, backdrop_bot, backdrop_bot);
+        dl->AddRectFilled(ImVec2(ox, bm_y - 1.f), ImVec2(ox + width, bm_y),
+                          aida::ui::with_alpha(th_bm.border_strong, a * 0.65f));
+        dl->AddLine(ImVec2(ox + 6.f, bm_y - 0.5f), ImVec2(ox + width - 6.f, bm_y - 0.5f),
+                    aida::ui::with_alpha(tk.warning, a * 0.45f), 1.f);
 
-        float total_bm_w = 6.f;
+        float total_bm_w = 8.f;
         for (auto& bm : st.bookmarks) {
             ImVec2 ts = ImGui::CalcTextSize(bm.label.c_str());
-            total_bm_w += ts.x + 12.f + 4.f;
+            total_bm_w += ts.x + 18.f + 6.f;
         }
-        float max_scroll = std::max(0.f, total_bm_w - width + 6.f);
-
+        float max_scroll = std::max(0.f, total_bm_w - width + 8.f);
 
         bool bm_bar_hov = ImGui::IsMouseHoveringRect(
-            ImVec2(ox, bm_y), ImVec2(ox + width, bm_y + 20.f));
+            ImVec2(ox, bm_y), ImVec2(ox + width, bm_y + bm_h));
         if (bm_bar_hov && max_scroll > 0.f) {
             float wheel = ImGui::GetIO().MouseWheel;
             if (wheel != 0.f)
@@ -4967,41 +5925,56 @@ void render(float pos_x, float pos_y, float width, float height,
         }
         if (st.bm_scroll_x > max_scroll) st.bm_scroll_x = max_scroll;
 
-        float bm_x = ox + 6.f - st.bm_scroll_x;
+        ImU32 gold_r = tk.warning;
+        ImU32 gold_fill_top = aida::ui::with_alpha(aida::ui::lighten(gold_r, 28), a * 0.22f);
+        ImU32 gold_fill_bot = aida::ui::with_alpha(gold_r, a * 0.14f);
+        ImU32 gold_fill_top_hv = aida::ui::with_alpha(aida::ui::lighten(gold_r, 36), a * 0.38f);
+        ImU32 gold_fill_bot_hv = aida::ui::with_alpha(gold_r, a * 0.26f);
+        ImU32 gold_border = aida::ui::with_alpha(gold_r, a * 0.55f);
+        ImU32 gold_border_hv = aida::ui::with_alpha(aida::ui::lighten(gold_r, 18), a * 0.85f);
+        ImU32 gold_text = aida::ui::with_alpha(aida::ui::lighten(gold_r, 24), a * 0.98f);
+
+        float bm_x = ox + 8.f - st.bm_scroll_x;
         for (auto& bm : st.bookmarks) {
             ImVec2 ts = ImGui::CalcTextSize(bm.label.c_str());
-            float btn_w = ts.x + 12.f;
+            float btn_w = ts.x + 18.f;
+            float btn_h = bm_h - 6.f;
+            float btn_y = bm_y + 3.f;
 
             if (bm_x + btn_w >= ox && bm_x <= ox + width) {
                 bool bm_hv = ImGui::IsMouseHoveringRect(
-                    ImVec2(std::max(bm_x, ox), bm_y + 1.f),
-                    ImVec2(std::min(bm_x + btn_w, ox + width), bm_y + 19.f));
-                if (bm_hv)
-                    dl->AddRectFilled(ImVec2(bm_x, bm_y + 1.f), ImVec2(bm_x + btn_w, bm_y + 19.f),
-                                      aida::ui::with_alpha(tk.hover_wash, a), 3.f);
-                dl->AddText(ImVec2(bm_x + 6.f, bm_y + 3.f),
-                            aida::ui::with_alpha(tk.warning, a), bm.label.c_str());
+                    ImVec2(std::max(bm_x, ox), btn_y),
+                    ImVec2(std::min(bm_x + btn_w, ox + width), btn_y + btn_h));
+                ImVec2 pa(bm_x, btn_y);
+                ImVec2 pb(bm_x + btn_w, btn_y + btn_h);
+                float radius = btn_h * 0.5f;
+                ImU32 top_c = bm_hv ? gold_fill_top_hv : gold_fill_top;
+                ImU32 bot_c = bm_hv ? gold_fill_bot_hv : gold_fill_bot;
+                ImU32 flat = aida::ui::mix(top_c, bot_c, 0.5f);
+                dl->AddRectFilled(pa, pb, flat, radius);
+                dl->AddRect(pa, pb, bm_hv ? gold_border_hv : gold_border, radius, 0, 1.0f);
+                dl->AddText(ImVec2(bm_x + 9.f, btn_y + (btn_h - ts.y) * 0.5f),
+                            gold_text, bm.label.c_str());
                 if (bm_hv && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
                     goto_address(bm.addr, disasm);
             }
-            bm_x += btn_w + 4.f;
+            bm_x += btn_w + 6.f;
         }
 
-
         if (st.bm_scroll_x > 0.f) {
-            for (int gi = 0; gi < 20; gi++) {
-                float ga = (1.f - gi / 20.f) * a;
+            for (int gi = 0; gi < 24; gi++) {
+                float ga = (1.f - gi / 24.f) * a * 0.5f;
                 dl->AddLine(ImVec2(ox + static_cast<float>(gi), bm_y),
-                            ImVec2(ox + static_cast<float>(gi), bm_y + 20.f),
-                            aida::ui::with_alpha(tk.bg_base, ga));
+                            ImVec2(ox + static_cast<float>(gi), bm_y + bm_h),
+                            aida::ui::with_alpha(tk.panel_bg, ga));
             }
         }
         if (st.bm_scroll_x < max_scroll) {
-            for (int gi = 0; gi < 20; gi++) {
-                float ga = (1.f - gi / 20.f) * a;
+            for (int gi = 0; gi < 24; gi++) {
+                float ga = (1.f - gi / 24.f) * a * 0.5f;
                 dl->AddLine(ImVec2(ox + width - 1.f - static_cast<float>(gi), bm_y),
-                            ImVec2(ox + width - 1.f - static_cast<float>(gi), bm_y + 20.f),
-                            aida::ui::with_alpha(tk.bg_base, ga));
+                            ImVec2(ox + width - 1.f - static_cast<float>(gi), bm_y + bm_h),
+                            aida::ui::with_alpha(tk.panel_bg, ga));
             }
         }
     }
@@ -5051,7 +6024,9 @@ void render(float pos_x, float pos_y, float width, float height,
 
 
     {
-        float total_content = (n + s_banner_line_count) * line_h;
+        float total_content = s_layout.ready
+            ? static_cast<float>(s_layout.total_rows) * line_h
+            : static_cast<float>(n + s_banner_line_count) * line_h;
         if (total_content > content_height) {
             const float sb_w = 10.f;
             const float sb_pad = 2.f;

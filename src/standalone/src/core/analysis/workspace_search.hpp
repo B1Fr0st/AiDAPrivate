@@ -395,9 +395,9 @@ inline void start_search(const std::string& root_dir)
         s.searching.store(true, std::memory_order_release);
         s.launch_pending.store(false, std::memory_order_release);
 
-        std::thread(search_worker, std::move(root_dir_copy), std::move(query),
-                    case_sensitive, whole_word, use_regex,
-                    std::move(includes), std::move(excludes)).detach();
+        search_worker(std::move(root_dir_copy), std::move(query),
+                      case_sensitive, whole_word, use_regex,
+                      std::move(includes), std::move(excludes));
     });
 }
 

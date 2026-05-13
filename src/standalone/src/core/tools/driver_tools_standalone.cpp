@@ -10,6 +10,7 @@
 #include "comm.h"
 #include "obfuscation.hpp"
 #include "pro.h"
+#include "../infra/work_queue.hpp"
 
 #include <Zydis/Zydis.h>
 #include "zydis_disasm.hpp"
@@ -6775,6 +6776,7 @@ struct deferred_action_t
     std::vector<queued_tool_call_t>         tool_calls;
     std::vector<deferred_action_result_t>   results;
     std::atomic<deferred_status>            status{deferred_status::pending};
+    std::atomic<bool>                       watcher_done{true};
     std::string                             trigger_info;
     std::string                             error;
 };
@@ -6806,7 +6808,6 @@ private:
     json resolve_params(const json& params, const json& context);
 
     std::map<int, std::unique_ptr<deferred_action_t>> _actions;
-    std::map<int, std::thread>                        _watchers;
     mutable std::mutex                                _mutex;
     int                                               _next_id = 1;
     std::atomic<bool>                                 _shutdown{false};
@@ -6846,19 +6847,22 @@ DeferredActionManager::~DeferredActionManager()
 void DeferredActionManager::shutdown()
 {
     _shutdown.store(true);
-    std::lock_guard<std::mutex> lock(_mutex);
-    for (auto& [id, action] : _actions)
+    std::vector<deferred_action_t*> actions_snapshot;
     {
-        auto st = action->status.load();
-        if (st == deferred_status::pending || st == deferred_status::watching)
-            action->status.store(deferred_status::cancelled);
+        std::lock_guard<std::mutex> lock(_mutex);
+        for (auto& [id, action] : _actions)
+        {
+            auto st = action->status.load();
+            if (st == deferred_status::pending || st == deferred_status::watching)
+                action->status.store(deferred_status::cancelled);
+            actions_snapshot.push_back(action.get());
+        }
     }
-    for (auto& [id, thread] : _watchers)
+    for (deferred_action_t* action : actions_snapshot)
     {
-        if (thread.joinable())
-            thread.join();
+        while (!action->watcher_done.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    _watchers.clear();
 }
 
 int DeferredActionManager::register_action(std::unique_ptr<deferred_action_t> action)
@@ -6869,9 +6873,17 @@ int DeferredActionManager::register_action(std::unique_ptr<deferred_action_t> ac
     action->created = std::chrono::steady_clock::now();
     action->status.store(deferred_status::pending);
 
+    deferred_action_t* action_ptr = action.get();
     _actions[id] = std::move(action);
 
-    _watchers[id] = std::thread(&DeferredActionManager::watcher_thread_func, this, id);
+    action_ptr->watcher_done.store(false, std::memory_order_release);
+    if (!work_queue::post([this, id, action_ptr]() {
+            watcher_thread_func(id);
+            action_ptr->watcher_done.store(true, std::memory_order_release);
+        }))
+    {
+        action_ptr->watcher_done.store(true, std::memory_order_release);
+    }
 
     return id;
 }
@@ -6887,14 +6899,10 @@ bool DeferredActionManager::cancel_action(int id)
     if (st == deferred_status::pending || st == deferred_status::watching)
     {
         it->second->status.store(deferred_status::cancelled);
-        auto wit = _watchers.find(id);
-        if (wit != _watchers.end() && wit->second.joinable())
-        {
-            std::thread th = std::move(wit->second);
-            _watchers.erase(wit);
-            lock.unlock();
-            th.join();
-        }
+        deferred_action_t* action_ptr = it->second.get();
+        lock.unlock();
+        while (!action_ptr->watcher_done.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         return true;
     }
     return false;

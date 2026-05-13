@@ -460,7 +460,7 @@ namespace aida_tracer {
 
     inline void start() {
         diag::log_tagged_critical("tracer", "tracer_thread_starting");
-        std::thread(run_tracer_thread).detach();
+        work_queue::post([]() { run_tracer_thread(); });
         diag::log_tagged_critical("tracer", "tracer_thread_started");
     }
 }
@@ -899,6 +899,9 @@ int main(int, char**)
     diag::log_tagged_critical("main", "diagnostic_veh_installed");
     crash_log_write("main_enter");
 
+    work_queue::initialize();
+    crash_log_write("work_queue_init_ok");
+
     aida_tracer::start();
 
     {
@@ -1135,15 +1138,11 @@ int main(int, char**)
     Blur::Init(g_pd3dDevice, g_pd3dDeviceContext, 100, 130);
     crash_log_write("blur_init_ok");
 
-    work_queue::initialize();
-    crash_log_write("work_queue_init_ok");
-
-
     static std::atomic<bool> bg_init_done{false};
     globals::ui::bg_init_done = &bg_init_done;
     globals::ui::bg_init_total.store(7, std::memory_order_release);
     globals::ui::bg_init_step.store(0, std::memory_order_release);
-    std::thread([]() {
+    work_queue::post([]() {
         diag::log_tagged("bg_init", "thread_entry");
 
         diag::log_tagged("bg_init", "init_standalone_chat_start");
@@ -1198,7 +1197,7 @@ int main(int, char**)
 
         bg_init_done.store(true, std::memory_order_release);
         diag::log_tagged("bg_init", "thread_exit");
-    }).detach();
+    });
 
 
     driver_bridge::set_log_callback([](const std::string& msg) {
@@ -1206,13 +1205,13 @@ int main(int, char**)
     });
 
 
-    std::thread([] {
+    work_queue::post([] {
         diag::log_tagged("drv_init", "thread_entry");
         DWORD seh_dbi = seh_driver_bridge_initialize();
         if (seh_dbi != 0)
             diag::log_tagged_fmt("drv_init", "driver_bridge_initialize_seh code=0x%08X last_err=%lu", seh_dbi, GetLastError());
         diag::log_tagged("drv_init", "thread_exit");
-    }).detach();
+    });
     crash_log_write("driver_bridge_thread_launched");
 
 

@@ -406,21 +406,23 @@ static void first_scan_thread(scan_config_t config) {
 		return static_cast<int>(hc / 2u);
 	}();
 	std::atomic<size_t> next_region{0};
-	std::vector<std::thread> workers;
-	workers.reserve(static_cast<size_t>(worker_count));
+	std::atomic<int> remaining_workers{worker_count};
 
 	for (int w = 0; w < worker_count; ++w) {
-		workers.emplace_back([&]() {
-			size_t idx;
-			while ((idx = next_region.fetch_add(1)) < scan_regions.size()) {
-				if (!st.scanning.load()) break;
-				scan_region(scan_regions[idx]);
-			}
-		});
+		if (!work_queue::post([&]() {
+				size_t idx;
+				while ((idx = next_region.fetch_add(1)) < scan_regions.size()) {
+					if (!st.scanning.load()) break;
+					scan_region(scan_regions[idx]);
+				}
+				remaining_workers.fetch_sub(1, std::memory_order_acq_rel);
+			}))
+		{
+			remaining_workers.fetch_sub(1, std::memory_order_acq_rel);
+		}
 	}
-	for (auto& th : workers) {
-		if (th.joinable()) th.join();
-	}
+	while (remaining_workers.load(std::memory_order_acquire) > 0)
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
 
 	std::sort(all_results.begin(), all_results.end(),
@@ -791,10 +793,9 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 	for (const auto& r : scan_regions) total_bytes += r.size;
 	if (total_bytes == 0) total_bytes = 1;
 
-	std::vector<std::thread> ptr_workers;
-	ptr_workers.reserve(static_cast<size_t>(ptr_worker_count));
+	std::atomic<int> ptr_workers_remaining{ptr_worker_count};
 	for (int w = 0; w < ptr_worker_count; ++w) {
-		ptr_workers.emplace_back([&, w]() {
+		if (!work_queue::post([&, w]() {
 			auto& local_map = partial_maps[static_cast<size_t>(w)];
 			size_t idx;
 			while ((idx = region_idx.fetch_add(1)) < scan_regions.size()) {
@@ -842,11 +843,14 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 						static_cast<float>(bytes_scanned.load()) / static_cast<float>(total_bytes) * 0.5f);
 				}
 			}
-		});
+			ptr_workers_remaining.fetch_sub(1, std::memory_order_acq_rel);
+		}))
+		{
+			ptr_workers_remaining.fetch_sub(1, std::memory_order_acq_rel);
+		}
 	}
-	for (auto& th : ptr_workers) {
-		if (th.joinable()) th.join();
-	}
+	while (ptr_workers_remaining.load(std::memory_order_acquire) > 0)
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
 	if (!st.pointer_scanning.load()) {
 		st.pointer_progress.store(1.f);
@@ -892,10 +896,9 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 	std::atomic<size_t> seed_idx{0};
 	std::atomic<bool> dfs_cancel{false};
 
-	std::vector<std::thread> dfs_workers;
-	dfs_workers.reserve(static_cast<size_t>(ptr_worker_count));
+	std::atomic<int> dfs_workers_remaining{ptr_worker_count};
 	for (int w = 0; w < ptr_worker_count; ++w) {
-		dfs_workers.emplace_back([&]() {
+		if (!work_queue::post([&]() {
 			std::vector<int64_t> current_offsets;
 			std::vector<uint64_t> visited;
 			visited.push_back(target_address);
@@ -955,11 +958,14 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 				st.pointer_progress.store(
 					0.5f + (static_cast<float>(idx + 1) / static_cast<float>(seed_values.size())) * 0.5f);
 			}
-		});
+			dfs_workers_remaining.fetch_sub(1, std::memory_order_acq_rel);
+		}))
+		{
+			dfs_workers_remaining.fetch_sub(1, std::memory_order_acq_rel);
+		}
 	}
-	for (auto& th : dfs_workers) {
-		if (th.joinable()) th.join();
-	}
+	while (dfs_workers_remaining.load(std::memory_order_acquire) > 0)
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
 	std::sort(results.begin(), results.end(),
 		[](const pointer_result_t& a, const pointer_result_t& b) {
@@ -985,7 +991,14 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 void initialize() {
 	auto& st = g_state;
 	st.freeze_active.store(true);
-	st.freeze_thread = std::thread(freeze_loop);
+	st.freeze_thread_done.store(false, std::memory_order_release);
+	if (!work_queue::post([]() {
+			freeze_loop();
+			g_state.freeze_thread_done.store(true, std::memory_order_release);
+		}))
+	{
+		st.freeze_thread_done.store(true, std::memory_order_release);
+	}
 }
 
 void shutdown() {
@@ -995,9 +1008,12 @@ void shutdown() {
 	st.freeze_active.store(false);
 	for (int i = 0; i < 100 && (st.scanning.load() || st.pointer_scanning.load()); ++i)
 		Sleep(20);
-	if (st.scan_thread.joinable()) st.scan_thread.join();
-	if (st.pointer_thread.joinable()) st.pointer_thread.join();
-	if (st.freeze_thread.joinable()) st.freeze_thread.join();
+	while (!st.scan_thread_done.load(std::memory_order_acquire))
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	while (!st.pointer_thread_done.load(std::memory_order_acquire))
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	while (!st.freeze_thread_done.load(std::memory_order_acquire))
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
 
 bool first_scan(const scan_config_t& config) {
@@ -1016,8 +1032,18 @@ bool first_scan(const scan_config_t& config) {
 	}
 
 	st.scanning.store(true);
-	if (st.scan_thread.joinable()) st.scan_thread.join();
-	work_queue::post([config]() { first_scan_thread(config); });
+	while (!st.scan_thread_done.load(std::memory_order_acquire))
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	st.scan_thread_done.store(false, std::memory_order_release);
+	if (!work_queue::post([config]() {
+			first_scan_thread(config);
+			g_state.scan_thread_done.store(true, std::memory_order_release);
+		}))
+	{
+		st.scan_thread_done.store(true, std::memory_order_release);
+		st.scanning.store(false);
+		return false;
+	}
 	return true;
 }
 
@@ -1028,8 +1054,18 @@ bool next_scan(scan_mode_t mode, const std::string& value_text, const std::strin
 	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) return false;
 
 	st.scanning.store(true);
-	if (st.scan_thread.joinable()) st.scan_thread.join();
-	work_queue::post([mode, value_text, value_text2]() { next_scan_thread(mode, value_text, value_text2); });
+	while (!st.scan_thread_done.load(std::memory_order_acquire))
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	st.scan_thread_done.store(false, std::memory_order_release);
+	if (!work_queue::post([mode, value_text, value_text2]() {
+			next_scan_thread(mode, value_text, value_text2);
+			g_state.scan_thread_done.store(true, std::memory_order_release);
+		}))
+	{
+		st.scan_thread_done.store(true, std::memory_order_release);
+		st.scanning.store(false);
+		return false;
+	}
 	return true;
 }
 
@@ -1132,8 +1168,17 @@ void start_pointer_scan(uint64_t target_address, int max_depth, int max_offset) 
 		std::lock_guard<std::mutex> lk(st.pointer_mutex);
 		st.pointer_results.clear();
 	}
-	if (st.pointer_thread.joinable()) st.pointer_thread.join();
-	work_queue::post([target_address, max_depth, max_offset]() { pointer_scan_thread(target_address, max_depth, max_offset); });
+	while (!st.pointer_thread_done.load(std::memory_order_acquire))
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	st.pointer_thread_done.store(false, std::memory_order_release);
+	if (!work_queue::post([target_address, max_depth, max_offset]() {
+			pointer_scan_thread(target_address, max_depth, max_offset);
+			g_state.pointer_thread_done.store(true, std::memory_order_release);
+		}))
+	{
+		st.pointer_thread_done.store(true, std::memory_order_release);
+		st.pointer_scanning.store(false);
+	}
 }
 
 void cancel_pointer_scan() {

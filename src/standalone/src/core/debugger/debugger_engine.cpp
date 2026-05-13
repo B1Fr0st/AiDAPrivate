@@ -236,7 +236,8 @@ void shutdown() {
 		st.trap_signaled.store(true);
 	}
 	st.trap_cv.notify_all();
-	if (st.worker_thread.joinable()) st.worker_thread.join();
+	while (!st.worker_thread_done.load(std::memory_order_acquire))
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	clear_all_breakpoints();
 }
 
@@ -1242,7 +1243,7 @@ void enumerate_handles() {
 					ctx->info_class = info_class;
 					ctx->fn = nt_query_object;
 
-					std::thread worker([ctx]() {
+					if (!work_queue::post([ctx]() {
 						ULONG required = 0;
 						std::vector<uint8_t> local_buf(0x1000);
 						NTSTATUS st_q = ctx->fn(ctx->target, ctx->info_class,
@@ -1268,8 +1269,12 @@ void enumerate_handles() {
 						ctx->cv.notify_all();
 						if (close_here && ctx->target)
 							CloseHandle(ctx->target);
-					});
-					worker.detach();
+					}))
+					{
+						std::lock_guard<std::mutex> lk(ctx->mtx);
+						ctx->done = true;
+						ctx->ok = false;
+					}
 
 					std::unique_lock<std::mutex> lk(ctx->mtx);
 					if (!ctx->cv.wait_for(lk, std::chrono::milliseconds(200),

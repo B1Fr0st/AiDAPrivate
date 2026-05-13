@@ -1273,7 +1273,7 @@ namespace settings_overlay {
 				th.text_primary, "Theme");
 			ImGui::Dummy(ImVec2(0.f, 32.f));
 
-			static const char* theme_names[] = { "Mio", "Nagi", "Rias", "Kaneki" };
+			static const char* theme_names[] = { "Mio", "Claude Dark", "Claude Light" };
 			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Active theme");
 			ImGui::SetNextItemWidth(240.f);
 			int prev_idx = g_sa_settings.active_theme_idx;

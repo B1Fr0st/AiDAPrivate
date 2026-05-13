@@ -121,14 +121,14 @@ struct state_t {
 
 	std::atomic<bool>              scanning{false};
 	std::atomic<float>             scan_progress{0.f};
-	std::thread                    scan_thread;
+	std::atomic<bool>              scan_thread_done{true};
 
 	std::atomic<bool>              freeze_active{false};
-	std::thread                    freeze_thread;
+	std::atomic<bool>              freeze_thread_done{true};
 
 	std::atomic<bool>              pointer_scanning{false};
 	std::atomic<float>             pointer_progress{0.f};
-	std::thread                    pointer_thread;
+	std::atomic<bool>              pointer_thread_done{true};
 
 	std::vector<std::vector<scan_result_t>> scan_history;
 };

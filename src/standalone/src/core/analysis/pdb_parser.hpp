@@ -164,7 +164,7 @@ typedef BOOL (WINAPI *fn_SymEnumSymbolsExW)(HANDLE, ULONG64, PCWSTR,
     BOOL (CALLBACK*)(SYMBOL_INFOW_EX*, ULONG, void*), void*, DWORD);
 typedef BOOL (WINAPI *fn_SymGetTypeInfo)(HANDLE, DWORD64, ULONG,
     IMAGEHLP_SYMBOL_TYPE_INFO_E, void*);
-typedef BOOL (WINAPI *fn_SymEnumTypesW)(HANDLE, ULONG64, PCWSTR,
+typedef BOOL (WINAPI *fn_SymEnumTypesW)(HANDLE, ULONG64,
     BOOL (CALLBACK*)(SYMBOL_INFOW_EX*, ULONG, void*), void*);
 
 struct dbghelp_api_t {
@@ -185,6 +185,7 @@ struct dbghelp_api_t {
 
 inline dbghelp_api_t g_api;
 inline std::mutex g_api_mutex;
+inline std::mutex g_dbghelp_call_mutex;
 
 inline bool load_dbghelp()
 {
@@ -511,6 +512,8 @@ inline bool parse_pdb(const std::string& pdb_path,
 {
 	if (!load_dbghelp()) return false;
 
+	std::lock_guard<std::mutex> dbghelp_lk(g_dbghelp_call_mutex);
+
 	out = {};
 	out.file_path = pdb_path;
 
@@ -569,7 +572,7 @@ inline bool parse_pdb(const std::string& pdb_path,
 	typeCtx.modBase = modBase;
 
 	if (g_api.pSymEnumTypesW)
-		g_api.pSymEnumTypesW(hFakeProc, modBase, L"*", detail::type_enum_callback, &typeCtx);
+		g_api.pSymEnumTypesW(hFakeProc, modBase, detail::type_enum_callback, &typeCtx);
 
 	if (progress) progress->store(0.6f);
 

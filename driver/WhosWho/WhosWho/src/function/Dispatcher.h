@@ -969,8 +969,7 @@ namespace dispatcher {
                                 HANDLE caller_pid = PsGetCurrentProcessId();
                                 UINT32 client_pid = (UINT32)(ULONG_PTR)caller_pid;
                                 continuous_anti_debug::start(client_pid);
-                                continuous_anti_dump::start(client_pid);
-                                WW_LOG("HB: continuous anti-debug + anti-dump started for pid=%u", client_pid);
+                                WW_LOG("HB: continuous anti-debug started for pid=%u (anti-dump deferred until user-mode finalize_after_activation)", client_pid);
                             }
 
                             hb->response = (UINT64)g_heartbeat_counter ^ dynamic_key::get();
@@ -1305,12 +1304,11 @@ namespace dispatcher {
                         HANDLE caller_pid = PsGetCurrentProcessId();
                         UINT32 client_pid = (UINT32)(ULONG_PTR)caller_pid;
                         continuous_anti_debug::start(client_pid);
-                        continuous_anti_dump::start(client_pid);
 
                         hb->response = (UINT64)g_heartbeat_counter ^ dynamic_key::get();
 
 
-                        WW_LOG("HB-RECONNECT: SUCCESS, session re-established");
+                        WW_LOG("HB-RECONNECT: SUCCESS, session re-established (anti-dump deferred until user-mode finalize_after_activation)");
                         status = STATUS_SUCCESS;
                     } else {
                         WW_LOG("HB-RECONNECT: magic mismatch, rejecting");

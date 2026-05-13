@@ -796,7 +796,8 @@ inline void reconstruct(const reconstruction_config_t& config) {
 
 
 		std::atomic<bool> progress_done{false};
-		std::thread progress_thread([&]() {
+		std::atomic<bool> progress_thread_exited{false};
+		if (!work_queue::post([&]() {
 			while (!progress_done.load(std::memory_order_acquire)) {
 				int done = decompile_count.load(std::memory_order_relaxed);
 				float pct = 0.07f + 0.63f * (static_cast<float>(done) / static_cast<float>(total));
@@ -813,7 +814,11 @@ inline void reconstruct(const reconstruction_config_t& config) {
 
 				std::this_thread::sleep_for(std::chrono::milliseconds(50));
 			}
-		});
+			progress_thread_exited.store(true, std::memory_order_release);
+		}))
+		{
+			progress_thread_exited.store(true, std::memory_order_release);
+		}
 
 
 		std::vector<ghidra_decompiler::ghidra_result_t> batch_results;
@@ -822,7 +827,8 @@ inline void reconstruct(const reconstruction_config_t& config) {
 			entries, batch_results, &decompile_count, &g_state.cancel_requested);
 
 		progress_done.store(true, std::memory_order_release);
-		progress_thread.join();
+		while (!progress_thread_exited.load(std::memory_order_acquire))
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
 
 		for (size_t i = 0; i < funcs.size() && i < batch_results.size(); ++i) {

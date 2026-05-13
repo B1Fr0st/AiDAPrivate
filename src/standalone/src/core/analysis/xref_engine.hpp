@@ -73,90 +73,19 @@ inline xref_type_t classify_instruction(const AsmInstr& ins)
 
 inline bool extract_target(const uint8_t* code, int code_len, uint64_t ins_addr, const AsmInstr& ins, uint64_t& target)
 {
-	if (ins.is_call || ins.is_branch) {
-		if (ins.len == 5 && (code[0] == 0xE8 || code[0] == 0xE9)) {
-			int32_t rel = 0;
-			std::memcpy(&rel, code + 1, 4);
-			target = ins_addr + ins.len + rel;
-			return true;
-		}
-		if (ins.len == 2 && (code[0] >= 0x70 && code[0] <= 0x7F)) {
-			int8_t rel = static_cast<int8_t>(code[1]);
-			target = ins_addr + ins.len + rel;
-			return true;
-		}
-		if (ins.len == 6 && code[0] == 0x0F && (code[1] >= 0x80 && code[1] <= 0x8F)) {
-			int32_t rel = 0;
-			std::memcpy(&rel, code + 2, 4);
-			target = ins_addr + ins.len + rel;
-			return true;
-		}
-		if (ins.len == 2 && code[0] == 0xEB) {
-			int8_t rel = static_cast<int8_t>(code[1]);
-			target = ins_addr + ins.len + rel;
-			return true;
-		}
-		if (ins.len >= 6 && code[0] == 0xFF) {
-			uint8_t modrm = code[1];
-			uint8_t mod = (modrm >> 6) & 3;
-			uint8_t rm = modrm & 7;
-			if (mod == 0 && rm == 5) {
-				int32_t disp = 0;
-				std::memcpy(&disp, code + 2, 4);
-				target = ins_addr + ins.len + disp;
-				return true;
-			}
-		}
+	(void)code;
+	(void)code_len;
+
+	if ((ins.is_call || ins.is_branch) && ins.branch_target != 0) {
+		target = ins.branch_target;
+		return true;
 	}
 
-	if (std::strncmp(ins.mnem, "lea", 3) == 0 || std::strncmp(ins.mnem, "LEA", 3) == 0) {
-		if (ins.len >= 7) {
-			uint8_t rex = code[0];
-			int off = 0;
-			if ((rex & 0xF0) == 0x40) off = 1;
-			if (off < ins.len && code[off] == 0x8D) {
-				uint8_t modrm = code[off + 1];
-				uint8_t mod = (modrm >> 6) & 3;
-				uint8_t rm = modrm & 7;
-				if (rm == 5 || (rm == 4 && (code[off + 2] & 7) == 5)) {
-					int disp_off = off + 2;
-					if (rm == 4) disp_off = off + 3;
-					if (mod == 0) {
-						int32_t disp = 0;
-						std::memcpy(&disp, code + disp_off, 4);
-						target = ins_addr + ins.len + disp;
-						return true;
-					}
-				}
-			}
-		}
-		if (ins.len >= 6 && code[0] == 0x8D && (code[1] & 0xC7) == 0x05) {
-			int32_t disp = 0;
-			std::memcpy(&disp, code + 2, 4);
-			target = ins_addr + 6 + disp;
+	if (ins.has_mem_op && ins.mem_op.base_reg == static_cast<uint16_t>(ZYDIS_REGISTER_RIP)) {
+		int64_t computed = static_cast<int64_t>(ins_addr) + static_cast<int64_t>(ins.len) + ins.mem_op.disp;
+		if (computed >= 0) {
+			target = static_cast<uint64_t>(computed);
 			return true;
-		}
-	}
-
-	if (ins.len >= 6) {
-		bool has_rex = (code[0] & 0xF0) == 0x40;
-		int base = has_rex ? 1 : 0;
-		uint8_t opcode = code[base];
-		bool is_mov_load = (opcode == 0x8B) || (opcode == 0xA1) || (opcode == 0x3B) || (opcode == 0x39);
-		if (is_mov_load && base + 1 < ins.len) {
-			uint8_t modrm = code[base + 1];
-			uint8_t mod = (modrm >> 6) & 3;
-			uint8_t rm = modrm & 7;
-			if (mod == 0 && rm == 5) {
-				int32_t disp = 0;
-				int disp_off = base + 2;
-				if (rm == 4) disp_off = base + 3;
-				if (disp_off + 4 <= ins.len) {
-					std::memcpy(&disp, code + disp_off, 4);
-					target = ins_addr + ins.len + disp;
-					return true;
-				}
-			}
 		}
 	}
 

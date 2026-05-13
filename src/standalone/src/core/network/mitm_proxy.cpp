@@ -5,6 +5,7 @@
 #include "http_parser_engine.hpp"
 #include "http2_session.hpp"
 #include "script_engine.hpp"
+#include "../infra/work_queue.hpp"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -1759,10 +1760,28 @@ bool is_running() {
 void pre_initialize() {
     auto& st = g_state;
     st.proxy_alive.store(true);
-    st.listener_thread = std::thread(listener_thread_func, std::ref(st));
-    st.worker_threads.reserve(WORKER_POOL_SIZE);
-    for (uint32_t i = 0; i < WORKER_POOL_SIZE; ++i)
-        st.worker_threads.emplace_back(worker_thread_func, std::ref(st));
+
+    state_t* st_ptr = &st;
+
+    st.listener_done.store(false, std::memory_order_release);
+    if (!work_queue::post([st_ptr]() {
+            listener_thread_func(*st_ptr);
+            st_ptr->listener_done.store(true, std::memory_order_release);
+        }))
+    {
+        st.listener_done.store(true, std::memory_order_release);
+    }
+
+    for (uint32_t i = 0; i < WORKER_POOL_SIZE; ++i) {
+        st.active_worker_count.fetch_add(1, std::memory_order_acq_rel);
+        if (!work_queue::post([st_ptr]() {
+                worker_thread_func(*st_ptr);
+                st_ptr->active_worker_count.fetch_sub(1, std::memory_order_acq_rel);
+            }))
+        {
+            st.active_worker_count.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    }
 }
 
 void shutdown() {
@@ -1771,11 +1790,10 @@ void shutdown() {
     st.proxy_alive.store(false);
     st.work_cv.notify_all();
     st.proxy_start_cv.notify_all();
-    for (auto& t : st.worker_threads)
-        if (t.joinable()) t.join();
-    st.worker_threads.clear();
-    if (st.listener_thread.joinable())
-        st.listener_thread.join();
+    while (st.active_worker_count.load(std::memory_order_acquire) > 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    while (!st.listener_done.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
 
 std::vector<http_exchange> get_history(size_t max_count) {

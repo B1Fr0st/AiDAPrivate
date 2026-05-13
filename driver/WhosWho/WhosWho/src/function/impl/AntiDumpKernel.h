@@ -520,7 +520,8 @@ namespace continuous_anti_dump {
         if (_InterlockedCompareExchange(&g_active, 1, 0) != 0) {
             _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_target_pid),
                 static_cast<LONG>(pid));
-            WW_LOG("continuous_admp: retarget pid=%u (was already active)", pid);
+            _InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_cycle_count), 0);
+            WW_LOG("continuous_admp: retarget pid=%u cycle_reset (was already active)", pid);
             return;
         }
 

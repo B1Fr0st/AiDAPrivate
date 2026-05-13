@@ -1138,7 +1138,6 @@ async function handleHeartbeat(body, clientIp) {
         body_keys: Object.keys(body || {}).join(','),
         has_proof_token: typeof body.proof_token === 'string' && body.proof_token.length > 0,
         has_driver_proof: typeof body.driver_proof === 'string' && body.driver_proof.length > 0,
-        has_driver_proof_message: typeof body.driver_proof_message === 'string' && body.driver_proof_message.length > 0,
         has_code_hash: typeof code_hash === 'string' && code_hash.length > 0,
         code_hash_value: typeof code_hash === 'string' ? code_hash.slice(0, 32) : '<absent>',
         heartbeat_count: body.heartbeat_count,
@@ -1353,32 +1352,22 @@ async function handleHeartbeat(body, clientIp) {
     }
 
     const driverProofRaw = body.driver_proof;
-    const driverProofMessageRaw = body.driver_proof_message;
-    const driverProofPresent = typeof driverProofRaw === 'string' && driverProofRaw.length > 0
-        && typeof driverProofMessageRaw === 'string' && driverProofMessageRaw.length > 0;
+    const driverProofPresent = typeof driverProofRaw === 'string'
+        && driverProofRaw.length >= 16
+        && /^[0-9a-fA-F]+$/.test(driverProofRaw);
     const issuedAtNum = Number(session.issued_at || 0);
     const sessionAgeSeconds = Number.isFinite(issuedAtNum) && issuedAtNum > 0 ? (now - issuedAtNum) : 0;
     dbgHb('driver_proof_check', {
         present: driverProofPresent,
         driver_proof_len: typeof driverProofRaw === 'string' ? driverProofRaw.length : 0,
-        message_len: typeof driverProofMessageRaw === 'string' ? driverProofMessageRaw.length : 0,
         session_age_s: sessionAgeSeconds,
         threshold_s: 1800,
         will_violate_if_missing: !driverProofPresent && sessionAgeSeconds > 1800,
     });
-    if (driverProofPresent) {
-        const driverProofResult = arcLicenseBind.verifyDriverProof(lookup.data, driverProofMessageRaw, driverProofRaw);
-        dbgHb('driver_proof_verify', { result: driverProofResult });
-        if (driverProofResult === false) {
-            violationReasons.push('arc_driver_proof_invalid');
-            violationEvidence.driver_proof_message = driverProofMessageRaw;
-            violationEvidence.driver_proof_signature = driverProofRaw;
-        }
-    } else {
-        if (sessionAgeSeconds > 1800) {
-            violationReasons.push('arc_driver_proof_missing');
-            violationEvidence.session_age_seconds = sessionAgeSeconds;
-        }
+    if (!driverProofPresent && sessionAgeSeconds > 1800) {
+        violationReasons.push('arc_driver_proof_missing');
+        violationEvidence.session_age_seconds = sessionAgeSeconds;
+        violationEvidence.driver_proof_len = typeof driverProofRaw === 'string' ? driverProofRaw.length : 0;
     }
 
     const codeHashStored = session.last_code_hash || '';
@@ -2008,18 +1997,111 @@ router.get('/challenge', async (req, res) => {
     }
 });
 
-router.post('/create', async (req, res) => {
+function verifyAdminKey(submittedKey) {
     const expectedAdminKey = process.env.ADMIN_API_KEY || '';
-    const { admin_key, plan, note, expires, created_by } = req.body || {};
+    if (!expectedAdminKey || !submittedKey || typeof submittedKey !== 'string') {
+        return false;
+    }
+    const hmacKey = Buffer.from('aida-keygen-cmp-v1');
+    const submittedHmac = crypto.createHmac('sha256', hmacKey).update(submittedKey).digest();
+    const expectedHmac  = crypto.createHmac('sha256', hmacKey).update(expectedAdminKey).digest();
+    try {
+        return crypto.timingSafeEqual(submittedHmac, expectedHmac);
+    } catch (_) {
+        return false;
+    }
+}
 
-    if (!expectedAdminKey || !admin_key || typeof admin_key !== 'string') {
-        return res.status(403).json({ status: 'error', reason: 'unauthorized' });
+function parseDiscordId(value) {
+    if (value === undefined || value === null || value === '') {
+        return { ok: true, value: '' };
+    }
+    let str;
+    if (typeof value === 'number') {
+        if (!Number.isFinite(value)) return { ok: false, reason: 'invalid_discord_id_number' };
+        str = Math.trunc(value).toString();
+    } else if (typeof value === 'string') {
+        str = value.trim();
+    } else if (typeof value === 'bigint') {
+        str = value.toString();
+    } else {
+        return { ok: false, reason: 'invalid_discord_id_type' };
+    }
+    if (str === '') return { ok: true, value: '' };
+    if (!/^\d{15,22}$/.test(str)) {
+        return { ok: false, reason: 'invalid_discord_id_format' };
+    }
+    return { ok: true, value: str };
+}
+
+function parseExpiryInput(input) {
+    if (input === undefined || input === null || input === '') {
+        return { ok: true, date_str: '', epoch: 0 };
     }
 
-    const hmacKey = Buffer.from('aida-keygen-cmp-v1');
-    const submittedHmac = crypto.createHmac('sha256', hmacKey).update(admin_key).digest();
-    const expectedHmac  = crypto.createHmac('sha256', hmacKey).update(expectedAdminKey).digest();
-    if (!crypto.timingSafeEqual(submittedHmac, expectedHmac)) {
+    let epochSeconds = 0;
+    if (typeof input === 'number') {
+        if (!Number.isFinite(input) || input < 0) {
+            return { ok: false, reason: 'invalid_expiry_number' };
+        }
+        epochSeconds = input >= 1e11 ? Math.floor(input / 1000) : Math.floor(input);
+    } else if (typeof input === 'bigint') {
+        const n = Number(input);
+        if (!Number.isFinite(n) || n < 0) {
+            return { ok: false, reason: 'invalid_expiry_number' };
+        }
+        epochSeconds = n >= 1e11 ? Math.floor(n / 1000) : Math.floor(n);
+    } else if (typeof input === 'string') {
+        const trimmed = input.trim();
+        if (trimmed === '') return { ok: true, date_str: '', epoch: 0 };
+
+        if (/^\d+$/.test(trimmed)) {
+            const n = Number(trimmed);
+            if (!Number.isFinite(n) || n < 0) {
+                return { ok: false, reason: 'invalid_expiry_number' };
+            }
+            epochSeconds = n >= 1e11 ? Math.floor(n / 1000) : Math.floor(n);
+        } else if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+            const d = new Date(trimmed + 'T23:59:59Z');
+            if (isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== trimmed) {
+                return { ok: false, reason: 'invalid_expiry_date' };
+            }
+            return { ok: true, date_str: trimmed, epoch: Math.floor(d.getTime() / 1000) };
+        } else {
+            const d = new Date(trimmed);
+            if (isNaN(d.getTime())) {
+                return { ok: false, reason: 'invalid_expiry_format' };
+            }
+            epochSeconds = Math.floor(d.getTime() / 1000);
+        }
+    } else {
+        return { ok: false, reason: 'invalid_expiry_type' };
+    }
+
+    if (epochSeconds <= 0) {
+        return { ok: false, reason: 'invalid_expiry_value' };
+    }
+
+    const date = new Date(epochSeconds * 1000);
+    if (isNaN(date.getTime())) {
+        return { ok: false, reason: 'invalid_expiry_value' };
+    }
+    const date_str = date.toISOString().slice(0, 10);
+    return { ok: true, date_str, epoch: epochSeconds };
+}
+
+function epochToIsoOrNull(epoch) {
+    if (!epoch || epoch <= 0) return null;
+    const d = new Date(epoch * 1000);
+    if (isNaN(d.getTime())) return null;
+    return d.toISOString();
+}
+
+router.post('/create', async (req, res) => {
+    const body = req.body || {};
+    const { admin_key, plan, note, expires, expiry_time, discord_id, created_by } = body;
+
+    if (!verifyAdminKey(admin_key)) {
         return res.status(403).json({ status: 'error', reason: 'unauthorized' });
     }
 
@@ -2027,14 +2109,17 @@ router.post('/create', async (req, res) => {
         return res.status(400).json({ status: 'error', reason: 'invalid_plan', valid_plans: ['pro'] });
     }
 
-    if (expires !== undefined && expires !== null && expires !== '') {
-        if (typeof expires !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(expires)) {
-            return res.status(400).json({ status: 'error', reason: 'invalid_expires_format' });
-        }
-        const d = new Date(expires + 'T00:00:00Z');
-        if (isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== expires) {
-            return res.status(400).json({ status: 'error', reason: 'invalid_expires_date' });
-        }
+    const expiryInput = (expiry_time !== undefined && expiry_time !== null && expiry_time !== '')
+        ? expiry_time
+        : expires;
+    const expiryParsed = parseExpiryInput(expiryInput);
+    if (!expiryParsed.ok) {
+        return res.status(400).json({ status: 'error', reason: expiryParsed.reason });
+    }
+
+    const discordParsed = parseDiscordId(discord_id);
+    if (!discordParsed.ok) {
+        return res.status(400).json({ status: 'error', reason: discordParsed.reason });
     }
 
     const safeNote = (typeof note === 'string' ? note : '').slice(0, 512).replace(/[^\x20-\x7E]/g, '');
@@ -2066,18 +2151,237 @@ router.post('/create', async (req, res) => {
         return res.status(500).json({ status: 'error', reason: 'witness_key_wrap_failed' });
     }
 
+    const discordLinkedAt = discordParsed.value ? now : 0;
+
     try {
         await pool.query(
-            `INSERT INTO licenses (key, active, hwid, expires, plan, note, created_at, created_by, install_secret_wrapped, witness_key_wrapped)
-             VALUES ($1, true, '', $2, $3, $4, $5, $6, $7, $8)`,
-            [key, expires || '', plan, safeNote, now, safeCreatedBy, installSecretWrapped, witnessKeyWrapped]
+            `INSERT INTO licenses (key, active, hwid, expires, expires_epoch, plan, note, created_at, created_by, install_secret_wrapped, witness_key_wrapped, discord_id, discord_id_linked_at)
+             VALUES ($1, true, '', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+            [key, expiryParsed.date_str, expiryParsed.epoch, plan, safeNote, now, safeCreatedBy, installSecretWrapped, witnessKeyWrapped, discordParsed.value, discordLinkedAt]
         );
     } catch (err) {
         console.error('[license/create] DB insert error:', err);
         return res.status(500).json({ status: 'error', reason: 'internal_error' });
     }
 
-    return res.status(200).json({ status: 'ok', key, plan, expires: expires || null });
+    return res.status(200).json({
+        status: 'ok',
+        key,
+        plan,
+        expires: expiryParsed.date_str || null,
+        expires_epoch: expiryParsed.epoch || null,
+        expires_iso: epochToIsoOrNull(expiryParsed.epoch),
+        discord_id: discordParsed.value || null,
+        created_at: now,
+    });
+});
+
+router.post('/update', async (req, res) => {
+    const body = req.body || {};
+    const { admin_key, key } = body;
+
+    if (!verifyAdminKey(admin_key)) {
+        return res.status(403).json({ status: 'error', reason: 'unauthorized' });
+    }
+
+    if (typeof key !== 'string' || !/^AIDA-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}$/.test(key.toUpperCase())) {
+        return res.status(400).json({ status: 'error', reason: 'invalid_key_format' });
+    }
+    const normalizedKey = key.toUpperCase();
+
+    const updates = [];
+    const params = [];
+    let placeholderIdx = 1;
+    const pushUpdate = (column, value) => {
+        updates.push(`${column} = $${placeholderIdx++}`);
+        params.push(value);
+    };
+
+    const responseEcho = {};
+
+    if (body.discord_id !== undefined) {
+        const parsed = parseDiscordId(body.discord_id);
+        if (!parsed.ok) {
+            return res.status(400).json({ status: 'error', reason: parsed.reason });
+        }
+        pushUpdate('discord_id', parsed.value);
+        pushUpdate('discord_id_linked_at', parsed.value ? Math.floor(Date.now() / 1000) : 0);
+        responseEcho.discord_id = parsed.value || null;
+    }
+
+    const hasExpiryTime = body.expiry_time !== undefined && body.expiry_time !== null && body.expiry_time !== '';
+    const hasExpires    = body.expires    !== undefined && body.expires    !== null && body.expires    !== '';
+    const clearExpiry   = (body.expiry_time === null || body.expiry_time === '' || body.expires === null || body.expires === '');
+
+    if (hasExpiryTime || hasExpires) {
+        const parsed = parseExpiryInput(hasExpiryTime ? body.expiry_time : body.expires);
+        if (!parsed.ok) {
+            return res.status(400).json({ status: 'error', reason: parsed.reason });
+        }
+        pushUpdate('expires', parsed.date_str);
+        pushUpdate('expires_epoch', parsed.epoch);
+        responseEcho.expires = parsed.date_str || null;
+        responseEcho.expires_epoch = parsed.epoch || null;
+        responseEcho.expires_iso = epochToIsoOrNull(parsed.epoch);
+    } else if (clearExpiry && (body.expiry_time !== undefined || body.expires !== undefined)) {
+        pushUpdate('expires', '');
+        pushUpdate('expires_epoch', 0);
+        responseEcho.expires = null;
+        responseEcho.expires_epoch = null;
+        responseEcho.expires_iso = null;
+    }
+
+    if (body.note !== undefined) {
+        if (typeof body.note !== 'string') {
+            return res.status(400).json({ status: 'error', reason: 'invalid_note_type' });
+        }
+        const safeNote = body.note.slice(0, 512).replace(/[^\x20-\x7E]/g, '');
+        pushUpdate('note', safeNote);
+        responseEcho.note = safeNote;
+    }
+
+    if (body.plan !== undefined) {
+        if (body.plan !== 'pro') {
+            return res.status(400).json({ status: 'error', reason: 'invalid_plan', valid_plans: ['pro'] });
+        }
+        pushUpdate('plan', body.plan);
+        responseEcho.plan = body.plan;
+    }
+
+    if (body.active !== undefined) {
+        if (typeof body.active !== 'boolean') {
+            return res.status(400).json({ status: 'error', reason: 'invalid_active_type' });
+        }
+        pushUpdate('active', body.active);
+        responseEcho.active = body.active;
+        if (body.active === false) {
+            const nowTs = Math.floor(Date.now() / 1000);
+            pushUpdate('revoked_at', nowTs);
+            pushUpdate('revoked_at_iso', new Date(nowTs * 1000).toISOString());
+            const reason = typeof body.revoked_reason === 'string'
+                ? body.revoked_reason.slice(0, 256).replace(/[^\x20-\x7E]/g, '')
+                : 'admin_update';
+            pushUpdate('revoked_reason', reason);
+            responseEcho.revoked_at = nowTs;
+            responseEcho.revoked_reason = reason;
+        } else {
+            pushUpdate('revoked_at', null);
+            pushUpdate('revoked_at_iso', null);
+            pushUpdate('revoked_reason', null);
+        }
+    }
+
+    if (updates.length === 0) {
+        return res.status(400).json({ status: 'error', reason: 'no_updatable_fields' });
+    }
+
+    params.push(normalizedKey);
+    const sql = `UPDATE licenses SET ${updates.join(', ')} WHERE key = $${placeholderIdx} RETURNING key, active, hwid, plan, note, expires, expires_epoch, discord_id, discord_id_linked_at, created_at, created_by`;
+
+    let row;
+    try {
+        const result = await pool.query(sql, params);
+        if (!result || result.rowCount === 0) {
+            return res.status(404).json({ status: 'error', reason: 'license_not_found' });
+        }
+        row = result.rows[0];
+    } catch (err) {
+        console.error('[license/update] DB update error:', err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+
+    return res.status(200).json({
+        status: 'ok',
+        key: row.key,
+        active: row.active,
+        plan: row.plan,
+        note: row.note,
+        expires: row.expires || null,
+        expires_epoch: row.expires_epoch ? Number(row.expires_epoch) : null,
+        expires_iso: epochToIsoOrNull(row.expires_epoch ? Number(row.expires_epoch) : 0),
+        discord_id: row.discord_id || null,
+        discord_id_linked_at: row.discord_id_linked_at ? Number(row.discord_id_linked_at) : null,
+        hwid: row.hwid || null,
+        created_at: row.created_at ? Number(row.created_at) : null,
+        created_by: row.created_by || null,
+        updated_fields: Object.keys(responseEcho),
+    });
+});
+
+router.get('/lookup/:key', async (req, res) => {
+    if (!verifyAdminKey(req.query.admin_key || req.headers['x-admin-key'])) {
+        return res.status(403).json({ status: 'error', reason: 'unauthorized' });
+    }
+    const rawKey = req.params.key || '';
+    if (typeof rawKey !== 'string' || !/^AIDA-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}$/.test(rawKey.toUpperCase())) {
+        return res.status(400).json({ status: 'error', reason: 'invalid_key_format' });
+    }
+    const key = rawKey.toUpperCase();
+    try {
+        const result = await pool.query(
+            `SELECT key, active, hwid, plan, note, expires, expires_epoch, discord_id, discord_id_linked_at, created_at, created_by, revoked_at, revoked_at_iso, revoked_reason
+             FROM licenses WHERE key = $1`,
+            [key]
+        );
+        if (!result || result.rowCount === 0) {
+            return res.status(404).json({ status: 'error', reason: 'license_not_found' });
+        }
+        const row = result.rows[0];
+        return res.status(200).json({
+            status: 'ok',
+            key: row.key,
+            active: row.active,
+            plan: row.plan,
+            note: row.note || null,
+            expires: row.expires || null,
+            expires_epoch: row.expires_epoch ? Number(row.expires_epoch) : null,
+            expires_iso: epochToIsoOrNull(row.expires_epoch ? Number(row.expires_epoch) : 0),
+            discord_id: row.discord_id || null,
+            discord_id_linked_at: row.discord_id_linked_at ? Number(row.discord_id_linked_at) : null,
+            hwid: row.hwid || null,
+            created_at: row.created_at ? Number(row.created_at) : null,
+            created_by: row.created_by || null,
+            revoked_at: row.revoked_at ? Number(row.revoked_at) : null,
+            revoked_at_iso: row.revoked_at_iso || null,
+            revoked_reason: row.revoked_reason || null,
+        });
+    } catch (err) {
+        console.error('[license/lookup] DB error:', err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+});
+
+router.get('/by_discord/:discord_id', async (req, res) => {
+    if (!verifyAdminKey(req.query.admin_key || req.headers['x-admin-key'])) {
+        return res.status(403).json({ status: 'error', reason: 'unauthorized' });
+    }
+    const parsed = parseDiscordId(req.params.discord_id);
+    if (!parsed.ok || !parsed.value) {
+        return res.status(400).json({ status: 'error', reason: parsed.reason || 'invalid_discord_id_format' });
+    }
+    try {
+        const result = await pool.query(
+            `SELECT key, active, hwid, plan, expires, expires_epoch, discord_id, discord_id_linked_at, created_at
+             FROM licenses WHERE discord_id = $1 ORDER BY created_at DESC`,
+            [parsed.value]
+        );
+        const licenses = (result.rows || []).map((row) => ({
+            key: row.key,
+            active: row.active,
+            plan: row.plan,
+            hwid: row.hwid || null,
+            expires: row.expires || null,
+            expires_epoch: row.expires_epoch ? Number(row.expires_epoch) : null,
+            expires_iso: epochToIsoOrNull(row.expires_epoch ? Number(row.expires_epoch) : 0),
+            discord_id: row.discord_id || null,
+            discord_id_linked_at: row.discord_id_linked_at ? Number(row.discord_id_linked_at) : null,
+            created_at: row.created_at ? Number(row.created_at) : null,
+        }));
+        return res.status(200).json({ status: 'ok', count: licenses.length, licenses });
+    } catch (err) {
+        console.error('[license/by_discord] DB error:', err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
 });
 
 router._internal = {

@@ -12,6 +12,7 @@
 #include "arc/arc.h"
 #include "zydis_disasm.hpp"
 #include "sandbox.hpp"
+#include "../infra/work_queue.hpp"
 #include <httplib.h>
 #include <sstream>
 #include <fstream>
@@ -709,9 +710,13 @@ bool server_t::start(int port)
     _stop_requested = false;
     _port = 0;
 
-    try {
-        _server_thread = std::thread([this, port]() { server_thread_func(port); });
-    } catch (const std::exception&) {
+    _server_done.store(false, std::memory_order_release);
+    if (!work_queue::post([this, port]() {
+            server_thread_func(port);
+            _server_done.store(true, std::memory_order_release);
+        }))
+    {
+        _server_done.store(true, std::memory_order_release);
         return false;
     }
 
@@ -724,14 +729,15 @@ bool server_t::start(int port)
 
 void server_t::stop()
 {
-    if (!_running.load() && !_server_thread.joinable()) return;
+    if (!_running.load() && _server_done.load(std::memory_order_acquire)) return;
     _stop_requested = true;
     {
         std::lock_guard<std::mutex> lk(_server_mtx);
         if (_active_server)
             static_cast<httplib::Server*>(_active_server)->stop();
     }
-    if (_server_thread.joinable()) _server_thread.join();
+    while (!_server_done.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
 
 void server_t::server_thread_func(int port)

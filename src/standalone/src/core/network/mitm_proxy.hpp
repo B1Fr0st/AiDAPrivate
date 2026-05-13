@@ -134,10 +134,10 @@ struct state_t {
     std::atomic<bool>  proxy_alive{false};
     std::mutex         proxy_start_mtx;
     std::condition_variable proxy_start_cv;
-    std::thread        listener_thread;
+    std::atomic<bool>  listener_done{true};
 
 
-    std::vector<std::thread>      worker_threads;
+    std::atomic<uint32_t>         active_worker_count{0};
     std::queue<work_item>         work_queue;
     std::mutex                    work_mutex;
     std::condition_variable       work_cv;

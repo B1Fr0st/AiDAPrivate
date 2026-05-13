@@ -42,6 +42,8 @@
 #include "source_reconstruct_view.hpp"
 #include "work_queue.hpp"
 #include "functions_panel.hpp"
+#include "function_index.hpp"
+#include "xref_index.hpp"
 #include "binary_map_view.hpp"
 #include "agent_picker_view.hpp"
 #include <atomic>
@@ -60,7 +62,6 @@ namespace {
 	std::atomic<bool>          g_settings_dirty{false};
 	std::condition_variable    g_settings_cv;
 	std::mutex                 g_settings_cv_mtx;
-	std::thread                g_settings_saver;
 	std::atomic<bool>          g_settings_saver_running{false};
 	std::atomic<bool>          g_settings_saver_started{false};
 
@@ -88,8 +89,10 @@ namespace {
 		bool expected = false;
 		if (g_settings_saver_started.compare_exchange_strong(expected, true)) {
 			g_settings_saver_running.store(true);
-			g_settings_saver = std::thread(settings_saver_loop);
-			g_settings_saver.detach();
+			if (!work_queue::post([]() { settings_saver_loop(); })) {
+				g_settings_saver_running.store(false);
+				g_settings_saver_started.store(false);
+			}
 		}
 		g_settings_cv.notify_one();
 	}
@@ -728,6 +731,57 @@ void helpers::render_title()
 	}
 	globals::ui::accent = themes::resolved.accent;
 
+	{
+		static int s_last_applied_theme_idx = -1;
+		static int s_last_applied_custom_idx = -2;
+		int target_custom = custom_themes::active_custom;
+		int target_idx = themes::active;
+		if (target_custom != s_last_applied_custom_idx || target_idx != s_last_applied_theme_idx) {
+			bool first_apply = (s_last_applied_theme_idx == -1 && s_last_applied_custom_idx == -2);
+			s_last_applied_custom_idx = target_custom;
+			s_last_applied_theme_idx  = target_idx;
+			if (target_custom >= 0 && target_custom < (int)custom_themes::list.size()) {
+				auto& ct = custom_themes::list[target_custom];
+				aida::ui::theme_t base = aida::ui::make_theme_for_index(target_idx);
+				base.accent          = ImVec4(ct.accent[0], ct.accent[1], ct.accent[2], 1.f);
+				int ar = (int)(ct.accent[0] * 255.f);
+				int ag = (int)(ct.accent[1] * 255.f);
+				int ab = (int)(ct.accent[2] * 255.f);
+				base.accent_u32      = IM_COL32(ar, ag, ab, 255);
+				base.accent_hover    = IM_COL32(
+					(std::min)(ar + 24, 255),
+					(std::min)(ag + 24, 255),
+					(std::min)(ab + 24, 255), 255);
+				base.accent_dim      = IM_COL32(ar, ag, ab, 130);
+				base.accent_glow     = IM_COL32(ar, ag, ab, 50);
+				base.accent_grad_top = IM_COL32(
+					(std::min)(ar + 18, 255),
+					(std::min)(ag + 14, 255),
+					(std::min)(ab + 14, 255), 255);
+				base.accent_grad_bot = IM_COL32(
+					(std::max)(ar - 22, 0),
+					(std::max)(ag - 18, 0),
+					(std::max)(ab - 18, 0), 255);
+				base.border_focus    = IM_COL32(ar, ag, ab, 210);
+				base.selection       = IM_COL32(ar, ag, ab, 70);
+				base.selection_strong= IM_COL32(ar, ag, ab, 130);
+				base.bg_base         = ct.bg_base;
+				base.panel_bg        = ct.panel_bg;
+				base.panel_header    = ct.panel_header;
+				base.title_bar       = ct.title_bar;
+				base.text_primary    = ct.text_primary;
+				base.text_secondary  = ct.text_secondary;
+				base.text_dim        = ct.text_dim;
+				base.acrylic_color   = ct.acrylic_color;
+				base.name            = ct.name;
+				if (first_apply) aida::ui::apply_immediate(base);
+				else             aida::ui::apply(base);
+			} else {
+				aida::ui::apply_for_index(target_idx, !first_apply);
+			}
+		}
+	}
+
 	const int th_ph_r = (themes::resolved.panel_header >>  0) & 0xFF;
 	const int th_ph_g = (themes::resolved.panel_header >>  8) & 0xFF;
 	const int th_ph_b = (themes::resolved.panel_header >> 16) & 0xFF;
@@ -1236,10 +1290,10 @@ void helpers::render_title()
 		phase_swap.tick(dt);
 		float swap_e = phase_swap.eased();
 
-		ImFont* cap = aida::ui::fonts::caption();
+		ImFont* cap = aida::ui::fonts::body();
 		if (!cap) cap = ImGui::GetFont();
-		float cap_size = 12.f;
-		float ph_y = bar_y - 22.f;
+		float cap_size = cap->FontSize;
+		float ph_y = bar_y - cap_size - 8.f;
 
 		ImU32 ph_col = aida::ui::with_alpha(th.text_secondary, vis);
 		if (!phase_swap.is_finished() && prev_phase_label) {
@@ -1260,8 +1314,9 @@ void helpers::render_title()
 
 		char step_buf[32];
 		snprintf(step_buf, sizeof(step_buf), "%d / %d", cur_step, total_steps);
-		ImVec2 sb_ts = cap->CalcTextSizeA(14.f, FLT_MAX, 0.f, step_buf);
-		dl->AddText(cap, 14.f, ImVec2(cx + bar_w * 0.5f - sb_ts.x, bar_y + bar_h + 10.f),
+		float step_sz = cap->FontSize;
+		ImVec2 sb_ts = cap->CalcTextSizeA(step_sz, FLT_MAX, 0.f, step_buf);
+		dl->AddText(cap, step_sz, ImVec2(cx + bar_w * 0.5f - sb_ts.x, bar_y + bar_h + 12.f),
 			aida::ui::with_alpha(th.text_dim, vis), step_buf);
 
 		static POINT drag_start_wnd   = {};
@@ -1353,10 +1408,11 @@ void helpers::render_title()
 		{
 			ImFont* body = aida::ui::fonts::body();
 			if (!body) body = ImGui::GetFont();
+			float tag_sz = body->FontSize;
 			const char* tagline = "Reverse engineering, reimagined.";
-			ImVec2 ts_t = body->CalcTextSizeA(14.f, FLT_MAX, 0.f, tagline);
-			dl->AddText(body, 14.f,
-				ImVec2(cx - ts_t.x * 0.5f, wm_y + 32.f + 14.f),
+			ImVec2 ts_t = body->CalcTextSizeA(tag_sz, FLT_MAX, 0.f, tagline);
+			dl->AddText(body, tag_sz,
+				ImVec2(cx - ts_t.x * 0.5f, wm_y + 32.f + tag_sz),
 				aida::ui::with_alpha(th.text_secondary, sub_a), tagline);
 
 			float msg_a = std::min(std::max(t - 1.4f, 0.f) / 0.5f, 1.f) * fade_out;
@@ -1365,9 +1421,10 @@ void helpers::render_title()
 				const char* msg = license::validated
 					? "Your session is ready."
 					: "Enter your license key to continue.";
-				ImVec2 ts_m = body->CalcTextSizeA(13.f, FLT_MAX, 0.f, msg);
-				dl->AddText(body, 13.f,
-					ImVec2(cx - ts_m.x * 0.5f, wm_y + 32.f + 14.f + 22.f),
+				float msg_sz = body->FontSize;
+				ImVec2 ts_m = body->CalcTextSizeA(msg_sz, FLT_MAX, 0.f, msg);
+				dl->AddText(body, msg_sz,
+					ImVec2(cx - ts_m.x * 0.5f, wm_y + 32.f + tag_sz + 28.f),
 					aida::ui::with_alpha(th.text_dim, msg_a), msg);
 			}
 		}
@@ -1433,8 +1490,8 @@ void helpers::render_title()
 				aida::ui::with_alpha(th.accent_glow, fa), 64);
 		}
 
-		float card_w = std::min(ww - 80.f, 420.f);
-		float card_h = std::min(wh - 80.f, 320.f);
+		float card_w = std::min(ww - 80.f, 460.f);
+		float card_h = std::min(wh - 80.f, 380.f);
 		card_w *= intro_scale;
 		card_h *= intro_scale;
 
@@ -1484,24 +1541,25 @@ void helpers::render_title()
 		if (!body_em) body_em = ImGui::GetFont();
 
 		float gs = ImGui::GetIO().FontGlobalScale;
+		(void)gs;
 		const char* title = "Welcome to AiDA";
-		float title_size = 22.f;
+		float title_size = 26.f;
 		ImVec2 title_ts = h1f->CalcTextSizeA(title_size, FLT_MAX, 0.f, title);
 		dl->AddText(h1f, title_size,
 			ImVec2(cx - title_ts.x * 0.5f + shake_x, content_y + 70.f),
 			aida::ui::with_alpha(th.text_primary, la), title);
 
 		const char* sub = "Enter your license key to continue.";
-		float sub_size = 14.f;
+		float sub_size = body->FontSize;
 		ImVec2 sub_ts = body->CalcTextSizeA(sub_size, FLT_MAX, 0.f, sub);
 		dl->AddText(body, sub_size,
-			ImVec2(cx - sub_ts.x * 0.5f + shake_x, content_y + 70.f + 30.f),
+			ImVec2(cx - sub_ts.x * 0.5f + shake_x, content_y + 70.f + title_size + 12.f),
 			aida::ui::with_alpha(th.text_secondary, la), sub);
 
 		float input_w = inner_w;
-		float input_h = 42.f;
+		float input_h = 48.f;
 		float input_x_screen = content_x;
-		float input_y_screen = content_y + 134.f;
+		float input_y_screen = content_y + 70.f + title_size + 12.f + sub_size + 18.f;
 
 		ImVec2 in_a(input_x_screen, input_y_screen);
 		ImVec2 in_b(input_x_screen + input_w, input_y_screen + input_h);
@@ -1584,29 +1642,28 @@ void helpers::render_title()
 		ImU32 ring = aida::ui::mix(th.border_subtle, th.border_focus, focus_v);
 		dl->AddRect(in_a, in_b, aida::ui::with_alpha(ring, la), input_radius, 0, ring_thick);
 
+		ImFont* code = aida::ui::fonts::code();
+		if (!code) code = ImGui::GetFont();
+		float key_sz = 18.f;
 		if (license::key_buf[0] == '\0' && !input_active) {
-			ImFont* code = aida::ui::fonts::code();
-			if (!code) code = ImGui::GetFont();
-			dl->AddText(code, 15.f,
-				ImVec2(in_a.x + 16.f, in_a.y + (input_h - 15.f) * 0.5f),
+			dl->AddText(code, key_sz,
+				ImVec2(in_a.x + 16.f, in_a.y + (input_h - key_sz) * 0.5f),
 				aida::ui::with_alpha(th.text_dim, la), "AiDA-XXXX-XXXX-XXXX-XXXX");
 		} else {
-			ImFont* code = aida::ui::fonts::code();
-			if (!code) code = ImGui::GetFont();
-			dl->AddText(code, 15.f,
-				ImVec2(in_a.x + 16.f, in_a.y + (input_h - 15.f) * 0.5f),
+			dl->AddText(code, key_sz,
+				ImVec2(in_a.x + 16.f, in_a.y + (input_h - key_sz) * 0.5f),
 				aida::ui::with_alpha(th.text_primary, la), license::key_buf);
 			if (input_active) {
 				float caret_a = aida::ui::clock::pulse(2.0f, 0.3f, 1.0f);
-				float text_w = code->CalcTextSizeA(15.f, FLT_MAX, 0.f, license::key_buf).x;
+				float text_w = code->CalcTextSizeA(key_sz, FLT_MAX, 0.f, license::key_buf).x;
 				float cax = in_a.x + 16.f + text_w + 1.f;
 				dl->AddLine(ImVec2(cax, in_a.y + 10.f), ImVec2(cax, in_b.y - 10.f),
 					aida::ui::with_alpha(th.text_primary, la * caret_a), 1.7f);
 			}
 		}
 
-		float btn_h = 42.f;
-		float btn_y_screen = input_y_screen + input_h + 16.f;
+		float btn_h = 48.f;
+		float btn_y_screen = input_y_screen + input_h + 18.f;
 		ImVec2 btn_a(input_x_screen, btn_y_screen);
 		ImVec2 btn_b(input_x_screen + input_w, btn_y_screen + btn_h);
 
@@ -1681,7 +1738,7 @@ void helpers::render_title()
 			ImFont* h2f = aida::ui::fonts::h2();
 			if (!h2f) h2f = ImGui::GetFont();
 			const char* btn_label = "Activate";
-			float lbl_size = 16.f;
+			float lbl_size = 18.f;
 			ImVec2 ts = h2f->CalcTextSizeA(lbl_size, FLT_MAX, 0.f, btn_label);
 			dl->AddText(h2f, lbl_size,
 				ImVec2((cb_a.x + cb_b.x) * 0.5f - ts.x * 0.5f, (cb_a.y + cb_b.y) * 0.5f - ts.y * 0.5f),
@@ -1722,8 +1779,8 @@ void helpers::render_title()
 			float sw = act_swap.eased();
 			ImFont* phase_font = aida::ui::fonts::body();
 			if (!phase_font) phase_font = ImGui::GetFont();
-			float phase_size = 16.f;
-			float lbl_y = pb_y + 14.f;
+			float phase_size = phase_font->FontSize;
+			float lbl_y = pb_y + 16.f;
 			if (!act_swap.is_finished() && prev_lbl) {
 				ImVec2 ts_p = phase_font->CalcTextSizeA(phase_size, FLT_MAX, 0.f, prev_lbl);
 				dl->AddText(phase_font, phase_size,
@@ -1746,11 +1803,11 @@ void helpers::render_title()
 			ImFont* arc_font = aida::ui::fonts::body();
 			if (!arc_font) arc_font = ImGui::GetFont();
 			const char* msg = "Decrypting runtime core...";
-			float arc_size = 16.f;
+			float arc_size = arc_font->FontSize;
 			float pill_y = card_b.y + 18.f;
 			ImVec2 ts = arc_font->CalcTextSizeA(arc_size, FLT_MAX, 0.f, msg);
 			float pill_w = ts.x + 56.f;
-			float pill_h = 34.f;
+			float pill_h = arc_size + 16.f;
 			ImVec2 pa(cx - pill_w * 0.5f, pill_y);
 			ImVec2 pb(pa.x + pill_w, pa.y + pill_h);
 			dl->AddRectFilled(pa, pb, aida::ui::with_alpha(th.info_soft, la), pill_h * 0.5f);
@@ -1768,6 +1825,12 @@ void helpers::render_title()
 			license::check_failed = false;
 			license::error_msg.clear();
 			globals::ui::license_activation_phase.store(0, std::memory_order_release);
+
+			diag::log_tagged_fmt("license",
+				"DIAG_DIALOG_SUBMIT enter=%d click=%d key_len=%llu frame=%d",
+				enter ? 1 : 0, btn_clicked ? 1 : 0,
+				static_cast<unsigned long long>(strlen(license::key_buf)),
+				ImGui::GetFrameCount());
 
 			std::string key_copy(license::key_buf);
 			work_queue::post([key_copy]() {
@@ -1809,19 +1872,24 @@ void helpers::render_title()
 		{
 			ImFont* err_font = aida::ui::fonts::body();
 			if (!err_font) err_font = ImGui::GetFont();
-			float err_font_size = 14.f;
-			float err_y = btn_y_screen + btn_h + 22.f;
+			float err_font_size = err_font->FontSize;
+			float err_y = btn_y_screen + btn_h + 24.f;
 
 			float ic_x = card_a.x + pad;
-			float ic_y = err_y + 4.f;
-			ImVec2 ic_c(ic_x + 9.f, ic_y + 9.f);
-			dl->AddCircleFilled(ic_c, 9.f, aida::ui::with_alpha(th.error_soft, la), 16);
-			dl->AddCircle(ic_c, 9.f, aida::ui::with_alpha(th.error, la), 16, 1.2f);
-			dl->AddText(err_font, 13.f, ImVec2(ic_c.x - 2.f, ic_c.y - 7.f),
+			float ic_y = err_y + 2.f;
+			ImVec2 ic_c(ic_x + 11.f, ic_y + 11.f);
+			dl->AddCircleFilled(ic_c, 11.f, aida::ui::with_alpha(th.error_soft, la), 16);
+			dl->AddCircle(ic_c, 11.f, aida::ui::with_alpha(th.error, la), 16, 1.3f);
+			ImFont* bang_font = aida::ui::fonts::body_em();
+			if (!bang_font) bang_font = err_font;
+			dl->AddText(bang_font, bang_font->FontSize,
+				ImVec2(ic_c.x - 3.f, ic_c.y - bang_font->FontSize * 0.5f),
 				aida::ui::with_alpha(th.error, la), "!");
 
-			float msg_x = ic_x + 26.f;
-			float msg_w = inner_w - 26.f - 110.f;
+			float btn_w_disc = 124.f;
+			float btn_h_disc = 34.f;
+			float msg_x = ic_x + 30.f;
+			float msg_w = inner_w - 30.f - btn_w_disc - 8.f;
 			std::string mapped = license::error_msg;
 			if (mapped.find("not_found") != std::string::npos) {
 				mapped = "This license/session is no longer present on the server. Activate the current key.";
@@ -1830,18 +1898,18 @@ void helpers::render_title()
 				aida::ui::with_alpha(th.error, la),
 				mapped.c_str(), nullptr, msg_w);
 
-			ImVec2 disc_a(card_b.x - pad - 108.f, err_y - 4.f);
-			ImVec2 disc_b(disc_a.x + 108.f, err_y - 4.f + 30.f);
+			ImVec2 disc_a(card_b.x - pad - btn_w_disc, err_y - 6.f);
+			ImVec2 disc_b(disc_a.x + btn_w_disc, disc_a.y + btn_h_disc);
 			static aida::ui::hover_state_t disc_h;
 			bool disc_hov = ImGui::IsMouseHoveringRect(disc_a, disc_b);
 			float dhv = disc_h.tick(disc_hov, dt, aida::motion::spring::balanced);
 			ImGui::SetCursorScreenPos(disc_a);
-			ImGui::InvisibleButton("##disc_btn", ImVec2(108.f, 30.f));
+			ImGui::InvisibleButton("##disc_btn", ImVec2(btn_w_disc, btn_h_disc));
 			bool disc_clk = ImGui::IsItemDeactivated() && ImGui::IsItemHovered();
 			float disc_radius = 10.f;
 			aida::ui::blur::layer_request_t disc_req;
 			disc_req.pos = disc_a;
-			disc_req.size = ImVec2(108.f, 30.f);
+			disc_req.size = ImVec2(btn_w_disc, btn_h_disc);
 			disc_req.radius = disc_radius;
 			disc_req.strength = 0.55f;
 			disc_req.alpha = la;
@@ -1850,9 +1918,9 @@ void helpers::render_title()
 			dl->AddRectFilled(disc_a, disc_b, disc_fill, disc_radius);
 			ImU32 disc_border = aida::ui::with_alpha(th.border_subtle, la * (0.7f + 0.5f * dhv));
 			dl->AddRect(disc_a, disc_b, disc_border, disc_radius, 0, 1.2f);
-			ImFont* sm_font = aida::ui::fonts::caption();
+			ImFont* sm_font = aida::ui::fonts::body_em();
 			if (!sm_font) sm_font = ImGui::GetFont();
-			float disc_lbl = 13.f;
+			float disc_lbl = sm_font->FontSize;
 			ImVec2 dts = sm_font->CalcTextSizeA(disc_lbl, FLT_MAX, 0.f, "Get a key");
 			dl->AddText(sm_font, disc_lbl,
 				ImVec2((disc_a.x + disc_b.x) * 0.5f - dts.x * 0.5f, (disc_a.y + disc_b.y) * 0.5f - dts.y * 0.5f),
@@ -2939,6 +3007,8 @@ void helpers::render_title()
 							if (!fpath.empty()) {
 								g_disasm.file = DisasmFile{};
 								disasm::load_pe(fpath, g_disasm.file);
+								function_index::on_file_loaded();
+								xref_index::on_file_loaded();
 								if (g_disasm.file.loaded) disasm::decode_section_async(g_disasm.file);
 							}
 						}
@@ -3666,18 +3736,176 @@ void helpers::render_title()
 	{
 
 
+		bool row2_has_vt_btn = g_disasm.file.loaded;
+		float row2_vt_btn_w = 0.f;
+		if (row2_has_vt_btn) {
+			bool is_hex_view_pre = (globals::ui::active_center_view == center_view_t::hex_view);
+			const char* vt_label_pre = is_hex_view_pre ? "View Disassembly" : "View Hex";
+			row2_vt_btn_w = ImGui::CalcTextSize(vt_label_pre).x + 22.f;
+		}
+		const float row2_right_anchor = rbtn_x0 - (row2_has_vt_btn ? (row2_vt_btn_w + 8.f) : 0.f);
+
+		const float strip_chev_w = 18.f;
+		const float strip_drop_w = 22.f;
+		const float strip_div_w  = 1.f;
+		const float strip_lchev_x0 = hx0 + hdr_pad;
+		const float strip_lchev_x1 = strip_lchev_x0 + strip_chev_w;
+		const float strip_div1_x   = strip_lchev_x1;
+		const float strip_tabs_x0  = strip_div1_x + strip_div_w + 4.f;
+
+		const float strip_right_edge = row2_right_anchor - 10.f;
+		const float strip_drop_x1  = strip_right_edge;
+		const float strip_drop_x0  = strip_drop_x1 - strip_drop_w;
+		const float strip_div3_x   = strip_drop_x0 - 2.f;
+		const float strip_rchev_x1 = strip_div3_x - strip_div_w;
+		const float strip_rchev_x0 = strip_rchev_x1 - strip_chev_w;
+		const float strip_div2_x   = strip_rchev_x0 - 2.f;
+		const float strip_tabs_x1  = strip_div2_x - strip_div_w - 4.f;
+
+		ImGuiStorage* strip_st = ImGui::GetStateStorage();
+		const ImGuiID strip_id_scroll        = ImGui::GetID("##strip_scroll");
+		const ImGuiID strip_id_scroll_target = ImGui::GetID("##strip_scroll_target");
+		const ImGuiID strip_id_active_sig    = ImGui::GetID("##strip_active_sig");
+		float strip_scroll = strip_st->GetFloat(strip_id_scroll, 0.f);
+		float strip_scroll_target = strip_st->GetFloat(strip_id_scroll_target, 0.f);
+
+		const float tab_h_strip   = row_h - 2.f;
+		const float strip_tab_y0  = r2_cy - tab_h_strip * 0.5f;
+		const float strip_tab_y1  = strip_tab_y0 + tab_h_strip;
+
+		struct strip_entry_t {
+			std::string label;
+			int  kind = 0;
+			int  idx  = -1;
+			uint64_t addr = 0;
+			bool is_active = false;
+			bool dirty = false;
+			bool error = false;
+			float width = 0.f;
+		};
+		std::vector<strip_entry_t> strip_entries;
+		strip_entries.reserve(file_tabs::tabs.size() + 8);
+
+		const float tab_pad_x_strip = 10.f;
+		const float close_sz_strip  = 10.f;
+
+		auto strip_calc_w = [&](const std::string& label) -> float {
+			ImVec2 ts = ImGui::CalcTextSize(label.c_str());
+			return tab_pad_x_strip * 2.f + ts.x + close_sz_strip + 12.f;
+		};
+
+		for (int ti = 0; ti < (int)file_tabs::tabs.size(); ti++) {
+			auto& tab = file_tabs::tabs[ti];
+			strip_entry_t e;
+			e.label = tab.filename + (tab.dirty ? " *" : "");
+			e.kind = 0;
+			e.idx = ti;
+			e.is_active = ((ti == file_tabs::active_tab) && code_editor::active &&
+			              globals::ui::active_center_view == center_view_t::code_editor);
+			e.dirty = tab.dirty;
+			e.width = strip_calc_w(e.label);
+			strip_entries.push_back(std::move(e));
+		}
+
+		if (g_disasm.file.loaded && !g_disasm.file.filename.empty()) {
+			strip_entry_t e;
+			e.label = g_disasm.file.filename;
+			e.kind = 1;
+			e.is_active = (!code_editor::active || code_editor::buffer.empty()) &&
+			              g_disasm.file.loaded && (g_disasm.live_mode || !g_disasm.file.instrs.empty()) &&
+			              globals::ui::active_center_view == center_view_t::disassembly;
+			e.width = strip_calc_w(e.label);
+			strip_entries.push_back(std::move(e));
+		}
+
+		{
+			auto psv_tabs_for_strip = pseudocode_view::snapshot_tabs();
+			bool psv_view_active = (globals::ui::active_center_view == center_view_t::pseudocode);
+			uint64_t active_psv_addr = pseudocode_view::active_tab_address();
+			for (auto& pt : psv_tabs_for_strip) {
+				strip_entry_t e;
+				if (pt.loaded && !pt.function_name.empty()) e.label = pt.function_name;
+				else if (!pt.label.empty()) e.label = pt.label;
+				else {
+					char nm[64];
+					std::snprintf(nm, sizeof(nm), "sub_%llX",
+						static_cast<unsigned long long>(pt.addr));
+					e.label = nm;
+				}
+				if (pt.decompiling) e.label += " ...";
+				e.kind = 2;
+				e.addr = pt.addr;
+				e.error = pt.is_error;
+				e.is_active = (psv_view_active && pt.addr == active_psv_addr);
+				e.width = strip_calc_w(e.label);
+				strip_entries.push_back(std::move(e));
+			}
+		}
+
+		if (hex_view::g_state.active) {
+			strip_entry_t e;
+			e.label = hex_view::g_state.source_name.empty()
+				? std::string("Hex View")
+				: hex_view::g_state.source_name + " (Hex)";
+			e.kind = 3;
+			e.is_active = (globals::ui::active_center_view == center_view_t::hex_view);
+			e.width = strip_calc_w(e.label);
+			strip_entries.push_back(std::move(e));
+		}
+
+		float strip_total_w = 0.f;
+		for (auto& e : strip_entries) strip_total_w += e.width + 2.f;
+		if (strip_total_w > 0.f) strip_total_w -= 2.f;
+
+		const float strip_visible_w = std::max(20.f, strip_tabs_x1 - strip_tabs_x0);
+		const bool  strip_has_overflow = (strip_total_w > strip_visible_w + 0.5f);
+		const float strip_max_scroll = strip_has_overflow ? (strip_total_w - strip_visible_w) : 0.f;
+
+		{
+			float ax_running = 0.f;
+			int active_idx = -1;
+			for (int i = 0; i < (int)strip_entries.size(); i++) {
+				auto& e = strip_entries[i];
+				if (e.is_active) { active_idx = i; break; }
+				ax_running += e.width + 2.f;
+			}
+			if (active_idx >= 0 && strip_has_overflow) {
+				char sig_buf[64];
+				std::snprintf(sig_buf, sizeof(sig_buf), "%d|%s",
+					active_idx, strip_entries[active_idx].label.c_str());
+				ImGuiID sig_id = ImGui::GetID(sig_buf);
+				ImGuiID prev_sig_id = (ImGuiID)strip_st->GetInt(strip_id_active_sig, 0);
+				if (sig_id != prev_sig_id) {
+					float aw = strip_entries[active_idx].width;
+					float min_off = ax_running + aw - strip_visible_w + 12.f;
+					float max_off = ax_running - 12.f;
+					if (strip_scroll_target < min_off) strip_scroll_target = min_off;
+					if (strip_scroll_target > max_off) strip_scroll_target = max_off;
+					strip_st->SetInt(strip_id_active_sig, (int)sig_id);
+				}
+			}
+		}
+
+		if (strip_scroll_target < 0.f) strip_scroll_target = 0.f;
+		if (strip_scroll_target > strip_max_scroll) strip_scroll_target = strip_max_scroll;
+		strip_scroll = aida::motion::smooth_lerp(strip_scroll, strip_scroll_target, 18.f, dt);
+		if (strip_scroll < 0.f) strip_scroll = 0.f;
+		if (strip_scroll > strip_max_scroll) strip_scroll = strip_max_scroll;
+
+		wdl->PushClipRect(ImVec2(strip_tabs_x0 - 2.f, strip_tab_y0 - 8.f),
+			ImVec2(strip_tabs_x1 + 2.f, strip_tab_y1 + 8.f), true);
+
 		if (!file_tabs::tabs.empty()) {
 			const float tab_pad_x = 10.f;
 			const float tab_gap   = 2.f;
 			const float close_sz  = 10.f;
 			const float tab_h     = row_h - 2.f;
-			float tab_x = hx0 + hdr_pad;
-			float tab_y = r1_cy - tab_h * 0.5f;
-			float max_tab_x = rbtn_x0 - 8.f;
+			float tab_x = strip_tabs_x0 - strip_scroll;
+			float tab_y = r2_cy - tab_h * 0.5f;
 
 			int close_idx = -1;
 			int click_idx = -1;
-			float active_tx0 = -1.f, active_tx1 = -1.f, active_ty1 = 0.f;
+			float active_tx0 = -1.f, active_tx1 = -1.f, active_ty0 = 0.f;
 
 			for (int ti = 0; ti < (int)file_tabs::tabs.size(); ti++) {
 				auto& tab = file_tabs::tabs[ti];
@@ -3690,21 +3918,26 @@ void helpers::render_title()
 				ImVec2 lts = ImGui::CalcTextSize(label.c_str());
 				float tw = tab_pad_x * 2.f + lts.x + close_sz + 6.f;
 
-
-				if (tab_x + tw > max_tab_x) break;
-
 				float tx0 = tab_x, ty0 = tab_y;
 				float tx1 = tab_x + tw, ty1 = tab_y + tab_h;
 
-				bool tab_hov = ImGui::IsMouseHoveringRect(ImVec2(tx0, ty0), ImVec2(tx1, ty1), false);
+				bool tx_in_view = (tx1 >= strip_tabs_x0 - 2.f) && (tx0 <= strip_tabs_x1 + 2.f);
+				bool mouse_in_strip = ImGui::IsMouseHoveringRect(
+					ImVec2(strip_tabs_x0, strip_tab_y0 - 4.f),
+					ImVec2(strip_tabs_x1, strip_tab_y1 + 4.f), false);
+				(void)tx_in_view;
+
+				bool tab_hov = mouse_in_strip &&
+					ImGui::IsMouseHoveringRect(ImVec2(tx0, ty0), ImVec2(tx1, ty1), false);
 
 
 				if (is_active) {
 					wdl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1),
-						IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
+						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(22*a)),
+						4.f, ImDrawFlags_RoundCornersTop);
 					active_tx0 = tx0 + 2.f;
 					active_tx1 = tx1 - 2.f;
-					active_ty1 = ty1;
+					active_ty0 = ty0;
 				} else if (tab_hov) {
 					wdl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1),
 						IM_COL32(255,255,255,(int)(8*a)), 4.f, ImDrawFlags_RoundCornersTop);
@@ -3720,7 +3953,8 @@ void helpers::render_title()
 				float cx0 = tx1 - tab_pad_x - close_sz;
 				float cy0 = ty0 + (tab_h - close_sz) * 0.5f;
 				float cx1 = cx0 + close_sz, cy1 = cy0 + close_sz;
-				bool close_hov = ImGui::IsMouseHoveringRect(ImVec2(cx0, cy0), ImVec2(cx1, cy1), false);
+				bool close_hov = mouse_in_strip &&
+					ImGui::IsMouseHoveringRect(ImVec2(cx0, cy0), ImVec2(cx1, cy1), false);
 				if (close_hov) {
 					wdl->AddRectFilled(ImVec2(cx0 - 1, cy0 - 1), ImVec2(cx1 + 1, cy1 + 1),
 						IM_COL32(255,80,80,(int)(40*a)), 3.f);
@@ -3736,7 +3970,7 @@ void helpers::render_title()
 
 				if (close_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 					close_idx = ti;
-				else if (tab_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+				else if (tab_hov && !close_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 					click_idx = ti;
 
 
@@ -3785,25 +4019,19 @@ void helpers::render_title()
 				ct_w += (tgt_w - ct_w) * std::min(14.f * dt, 1.f);
 				ImGui::GetStateStorage()->SetFloat(ct_ulx, ct_x);
 				ImGui::GetStateStorage()->SetFloat(ct_ulw, ct_w);
-				wdl->AddLine(ImVec2(ct_x - 2.f, active_ty1), ImVec2(ct_x + ct_w + 2.f, active_ty1),
-					IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(50*a)), 4.f);
-				wdl->AddLine(ImVec2(ct_x, active_ty1), ImVec2(ct_x + ct_w, active_ty1),
-					IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(200*a)), 2.f);
+				float stripe_y = active_ty0 + 1.f;
+				wdl->AddLine(ImVec2(ct_x - 2.f, stripe_y), ImVec2(ct_x + ct_w + 2.f, stripe_y),
+					IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(60*a)), 4.f);
+				wdl->AddLine(ImVec2(ct_x, stripe_y), ImVec2(ct_x + ct_w, stripe_y),
+					IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(230*a)), 2.f);
 			}
 
-		} else if (!(g_disasm.file.loaded && !g_disasm.file.filename.empty()) && !hex_view::g_state.active) {
-
-			const char* fn_disp = "No file open";
-			ImVec2 fn_ts = ImGui::CalcTextSize(fn_disp);
-			float  fn_y  = r1_cy - fn_ts.y * 0.5f;
-			wdl->AddText(ImVec2(hx0 + hdr_pad, fn_y),
-				IM_COL32(150,150,170,(int)(170*a)), fn_disp);
 		}
 
 
-		float next_tab_x_after_disasm = hx0 + hdr_pad;
+		float next_tab_x_after_disasm = strip_tabs_x0 - strip_scroll;
 		if (!file_tabs::tabs.empty()) {
-			float last_tab_end = hx0 + hdr_pad;
+			float last_tab_end = strip_tabs_x0 - strip_scroll;
 			for (int ti = 0; ti < (int)file_tabs::tabs.size(); ti++) {
 				auto& tab = file_tabs::tabs[ti];
 				std::string label = tab.filename;
@@ -3825,18 +4053,26 @@ void helpers::render_title()
 			float tab_h2 = row_h - 2.f;
 
 			float dtx0 = next_tab_x_after_disasm;
-			if (dtx0 + dtw < rbtn_x0 - 8.f) {
-				float dty0 = r1_cy - tab_h2 * 0.5f;
+			{
+				float dty0 = r2_cy - tab_h2 * 0.5f;
 				float dtx1 = dtx0 + dtw;
 				float dty1 = dty0 + tab_h2;
 
-				bool dtab_hov = ImGui::IsMouseHoveringRect(ImVec2(dtx0, dty0), ImVec2(dtx1, dty1), false);
+				bool dtab_in_view = (dtx1 >= strip_tabs_x0 - 2.f) && (dtx0 <= strip_tabs_x1 + 2.f);
+				bool dtab_mouse_in_strip = ImGui::IsMouseHoveringRect(
+					ImVec2(strip_tabs_x0, strip_tab_y0 - 4.f),
+					ImVec2(strip_tabs_x1, strip_tab_y1 + 4.f), false);
+				bool dtab_hov = dtab_mouse_in_strip &&
+					ImGui::IsMouseHoveringRect(ImVec2(dtx0, dty0), ImVec2(dtx1, dty1), false);
 
 				if (disasm_is_active) {
 					wdl->AddRectFilled(ImVec2(dtx0, dty0), ImVec2(dtx1, dty1),
-						IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
-					wdl->AddLine(ImVec2(dtx0 + 2.f, dty1), ImVec2(dtx1 - 2.f, dty1),
-						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(200*a)), 2.f);
+						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(22*a)),
+						4.f, ImDrawFlags_RoundCornersTop);
+					wdl->AddLine(ImVec2(dtx0 + 2.f, dty0 + 1.f), ImVec2(dtx1 - 2.f, dty0 + 1.f),
+						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(60*a)), 4.f);
+					wdl->AddLine(ImVec2(dtx0 + 4.f, dty0 + 1.f), ImVec2(dtx1 - 4.f, dty0 + 1.f),
+						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(230*a)), 2.f);
 				} else if (dtab_hov) {
 					wdl->AddRectFilled(ImVec2(dtx0, dty0), ImVec2(dtx1, dty1),
 						IM_COL32(255,255,255,(int)(8*a)), 4.f, ImDrawFlags_RoundCornersTop);
@@ -3852,7 +4088,8 @@ void helpers::render_title()
 				float cy0 = dty0 + (tab_h2 - close_sz) * 0.5f;
 				float cx1 = cx0 + close_sz;
 				float cy1 = cy0 + close_sz;
-				bool close_hov = ImGui::IsMouseHoveringRect(ImVec2(cx0 - 2, cy0 - 2), ImVec2(cx1 + 2, cy1 + 2), false);
+				bool close_hov = dtab_mouse_in_strip &&
+					ImGui::IsMouseHoveringRect(ImVec2(cx0 - 2, cy0 - 2), ImVec2(cx1 + 2, cy1 + 2), false);
 				if (close_hov) {
 					wdl->AddRectFilled(ImVec2(cx0 - 1, cy0 - 1), ImVec2(cx1 + 1, cy1 + 1),
 						IM_COL32(255,80,80,(int)(40*a)), 3.f);
@@ -3874,6 +4111,7 @@ void helpers::render_title()
 				} else if (dtab_hov && !close_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 					globals::ui::active_center_view = center_view_t::disassembly;
 				}
+				(void)dtab_in_view;
 
 				next_tab_x_after_disasm = dtx1 + 6.f;
 			}
@@ -3889,6 +4127,10 @@ void helpers::render_title()
 				float tab_h_p = row_h - 2.f;
 				uint64_t to_activate_addr = 0;
 				uint64_t to_close_addr = 0;
+
+				bool psv_mouse_in_strip = ImGui::IsMouseHoveringRect(
+					ImVec2(strip_tabs_x0, strip_tab_y0 - 4.f),
+					ImVec2(strip_tabs_x1, strip_tab_y1 + 4.f), false);
 
 				for (auto& pt : psv_tabs) {
 					std::string lbl;
@@ -3907,19 +4149,22 @@ void helpers::render_title()
 					ImVec2 plts = ImGui::CalcTextSize(lbl.c_str());
 					float ptw = 10.f * 2.f + plts.x + p_close_sz + 12.f;
 					float ptx0 = next_tab_x_after_disasm;
-					if (ptx0 + ptw > rbtn_x0 - 8.f) break;
 					float ptx1 = ptx0 + ptw;
-					float pty0 = r1_cy - tab_h_p * 0.5f;
+					float pty0 = r2_cy - tab_h_p * 0.5f;
 					float pty1 = pty0 + tab_h_p;
 
 					bool ptab_active = (psv_view_active && pt.addr == active_psv_addr);
-					bool ptab_hov = ImGui::IsMouseHoveringRect(ImVec2(ptx0, pty0), ImVec2(ptx1, pty1), false);
+					bool ptab_hov = psv_mouse_in_strip &&
+						ImGui::IsMouseHoveringRect(ImVec2(ptx0, pty0), ImVec2(ptx1, pty1), false);
 
 					if (ptab_active) {
 						wdl->AddRectFilled(ImVec2(ptx0, pty0), ImVec2(ptx1, pty1),
-							IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
-						wdl->AddLine(ImVec2(ptx0 + 2.f, pty1), ImVec2(ptx1 - 2.f, pty1),
-							IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(200*a)), 2.f);
+							IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(22*a)),
+							4.f, ImDrawFlags_RoundCornersTop);
+						wdl->AddLine(ImVec2(ptx0 + 2.f, pty0 + 1.f), ImVec2(ptx1 - 2.f, pty0 + 1.f),
+							IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(60*a)), 4.f);
+						wdl->AddLine(ImVec2(ptx0 + 4.f, pty0 + 1.f), ImVec2(ptx1 - 4.f, pty0 + 1.f),
+							IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(230*a)), 2.f);
 					} else if (ptab_hov) {
 						wdl->AddRectFilled(ImVec2(ptx0, pty0), ImVec2(ptx1, pty1),
 							IM_COL32(255,255,255,(int)(8*a)), 4.f, ImDrawFlags_RoundCornersTop);
@@ -3931,13 +4176,15 @@ void helpers::render_title()
 					                  : IM_COL32(170, 175, 190, (int)((ptab_hov ? 220.f : 160.f)*a)));
 					wdl->AddText(ImVec2(ptx0 + 10.f, pty0 + (tab_h_p - plts.y) * 0.5f),
 						ptab_col, lbl.c_str());
+					(void)pty1;
 
 					float pcx0 = ptx1 - p_close_sz - 6.f;
 					float pcy0 = pty0 + (tab_h_p - p_close_sz) * 0.5f;
 					float pcx1 = pcx0 + p_close_sz;
 					float pcy1 = pcy0 + p_close_sz;
-					bool pclose_hov = ImGui::IsMouseHoveringRect(ImVec2(pcx0 - 2, pcy0 - 2),
-						ImVec2(pcx1 + 2, pcy1 + 2), false);
+					bool pclose_hov = psv_mouse_in_strip &&
+						ImGui::IsMouseHoveringRect(ImVec2(pcx0 - 2, pcy0 - 2),
+							ImVec2(pcx1 + 2, pcy1 + 2), false);
 					if (pclose_hov) {
 						wdl->AddRectFilled(ImVec2(pcx0 - 1, pcy0 - 1), ImVec2(pcx1 + 1, pcy1 + 1),
 							IM_COL32(255,80,80,(int)(40*a)), 3.f);
@@ -3985,18 +4232,25 @@ void helpers::render_title()
 			float tab_h3 = row_h - 2.f;
 
 			float htx0 = next_tab_x_after_disasm;
-
 			float htx1 = htx0 + htw;
-			if (htx1 < rbtn_x0 - 8.f) {
-				float hty0 = r1_cy - tab_h3 * 0.5f;
+			{
+				float hty0 = r2_cy - tab_h3 * 0.5f;
 				float hty1 = hty0 + tab_h3;
-				bool htab_hov = ImGui::IsMouseHoveringRect(ImVec2(htx0, hty0), ImVec2(htx1, hty1), false);
+
+				bool hex_mouse_in_strip = ImGui::IsMouseHoveringRect(
+					ImVec2(strip_tabs_x0, strip_tab_y0 - 4.f),
+					ImVec2(strip_tabs_x1, strip_tab_y1 + 4.f), false);
+				bool htab_hov = hex_mouse_in_strip &&
+					ImGui::IsMouseHoveringRect(ImVec2(htx0, hty0), ImVec2(htx1, hty1), false);
 
 				if (hex_is_active) {
 					wdl->AddRectFilled(ImVec2(htx0, hty0), ImVec2(htx1, hty1),
-						IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
-					wdl->AddLine(ImVec2(htx0 + 2.f, hty1), ImVec2(htx1 - 2.f, hty1),
-						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(200*a)), 2.f);
+						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(22*a)),
+						4.f, ImDrawFlags_RoundCornersTop);
+					wdl->AddLine(ImVec2(htx0 + 2.f, hty0 + 1.f), ImVec2(htx1 - 2.f, hty0 + 1.f),
+						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(60*a)), 4.f);
+					wdl->AddLine(ImVec2(htx0 + 4.f, hty0 + 1.f), ImVec2(htx1 - 4.f, hty0 + 1.f),
+						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(230*a)), 2.f);
 				} else if (htab_hov) {
 					wdl->AddRectFilled(ImVec2(htx0, hty0), ImVec2(htx1, hty1),
 						IM_COL32(255,255,255,(int)(8*a)), 4.f, ImDrawFlags_RoundCornersTop);
@@ -4006,13 +4260,15 @@ void helpers::render_title()
 				               : IM_COL32(170, 175, 190, (int)((htab_hov ? 220.f : 160.f)*a));
 				wdl->AddText(ImVec2(htx0 + 10.f, hty0 + (tab_h3 - hts.y) * 0.5f),
 					htab_col, hex_label);
+				(void)hty1;
 
 
 				float hcx0 = htx1 - hex_close_sz - 6.f;
 				float hcy0 = hty0 + (tab_h3 - hex_close_sz) * 0.5f;
 				float hcx1 = hcx0 + hex_close_sz;
 				float hcy1 = hcy0 + hex_close_sz;
-				bool hclose_hov = ImGui::IsMouseHoveringRect(ImVec2(hcx0 - 2, hcy0 - 2), ImVec2(hcx1 + 2, hcy1 + 2), false);
+				bool hclose_hov = hex_mouse_in_strip &&
+					ImGui::IsMouseHoveringRect(ImVec2(hcx0 - 2, hcy0 - 2), ImVec2(hcx1 + 2, hcy1 + 2), false);
 				if (hclose_hov) {
 					wdl->AddRectFilled(ImVec2(hcx0 - 1, hcy0 - 1), ImVec2(hcx1 + 1, hcy1 + 1),
 						IM_COL32(255,80,80,(int)(40*a)), 3.f);
@@ -4034,6 +4290,275 @@ void helpers::render_title()
 				} else if (htab_hov && !hclose_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 					globals::ui::active_center_view = center_view_t::hex_view;
 				}
+			}
+		}
+
+		wdl->PopClipRect();
+
+		const bool strip_has_any_entry = !strip_entries.empty();
+
+		if (!strip_has_any_entry) {
+			const char* fn_disp = "No file open";
+			ImVec2 fn_ts = ImGui::CalcTextSize(fn_disp);
+			float  fn_y  = r2_cy - fn_ts.y * 0.5f;
+			wdl->AddText(ImVec2(strip_tabs_x0, fn_y),
+				IM_COL32(150,150,170,(int)(160*a)), fn_disp);
+		}
+
+		bool strip_show_nav = strip_has_overflow || strip_has_any_entry;
+
+		auto strip_draw_chevron = [&](float cx, float cy, bool point_right, ImU32 col) {
+			float w = 4.f, h = 6.f;
+			if (point_right) {
+				wdl->AddLine(ImVec2(cx - w * 0.5f, cy - h * 0.5f),
+					ImVec2(cx + w * 0.5f, cy), col, 1.4f);
+				wdl->AddLine(ImVec2(cx + w * 0.5f, cy),
+					ImVec2(cx - w * 0.5f, cy + h * 0.5f), col, 1.4f);
+			} else {
+				wdl->AddLine(ImVec2(cx + w * 0.5f, cy - h * 0.5f),
+					ImVec2(cx - w * 0.5f, cy), col, 1.4f);
+				wdl->AddLine(ImVec2(cx - w * 0.5f, cy),
+					ImVec2(cx + w * 0.5f, cy + h * 0.5f), col, 1.4f);
+			}
+		};
+
+		if (strip_show_nav) {
+			float chev_y0 = strip_tab_y0 + 2.f;
+			float chev_y1 = strip_tab_y1 - 2.f;
+			float chev_cy = (chev_y0 + chev_y1) * 0.5f;
+
+			bool strip_mouse_in_chrome = ImGui::IsMouseHoveringRect(
+				ImVec2(strip_lchev_x0, strip_tab_y0 - 6.f),
+				ImVec2(strip_drop_x1, strip_tab_y1 + 6.f), false);
+
+			bool lchev_enabled = (strip_scroll_target > 0.5f);
+			bool lchev_hov = strip_mouse_in_chrome && lchev_enabled &&
+				ImGui::IsMouseHoveringRect(
+					ImVec2(strip_lchev_x0, chev_y0),
+					ImVec2(strip_lchev_x1, chev_y1), false);
+			ImU32 lchev_col = lchev_enabled
+				? IM_COL32(200, 205, 220, (int)((lchev_hov ? 240.f : 170.f) * a))
+				: IM_COL32(130, 130, 145, (int)(80 * a));
+			if (lchev_hov) {
+				wdl->AddRectFilled(
+					ImVec2(strip_lchev_x0, chev_y0),
+					ImVec2(strip_lchev_x1, chev_y1),
+					IM_COL32(255,255,255,(int)(10*a)), 3.f);
+			}
+			strip_draw_chevron(
+				(strip_lchev_x0 + strip_lchev_x1) * 0.5f, chev_cy, false, lchev_col);
+			if (lchev_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+				float step = std::max(80.f, strip_visible_w * 0.5f);
+				strip_scroll_target -= step;
+				if (strip_scroll_target < 0.f) strip_scroll_target = 0.f;
+			}
+
+			wdl->AddLine(
+				ImVec2(strip_div1_x + 0.5f, strip_tab_y0 + 4.f),
+				ImVec2(strip_div1_x + 0.5f, strip_tab_y1 - 4.f),
+				IM_COL32(255, 255, 255, (int)(14 * a)), 1.f);
+
+			wdl->AddLine(
+				ImVec2(strip_div2_x + strip_div_w * 0.5f, strip_tab_y0 + 4.f),
+				ImVec2(strip_div2_x + strip_div_w * 0.5f, strip_tab_y1 - 4.f),
+				IM_COL32(255, 255, 255, (int)(14 * a)), 1.f);
+
+			bool rchev_enabled = (strip_scroll_target < strip_max_scroll - 0.5f);
+			bool rchev_hov = strip_mouse_in_chrome && rchev_enabled &&
+				ImGui::IsMouseHoveringRect(
+					ImVec2(strip_rchev_x0, chev_y0),
+					ImVec2(strip_rchev_x1, chev_y1), false);
+			ImU32 rchev_col = rchev_enabled
+				? IM_COL32(200, 205, 220, (int)((rchev_hov ? 240.f : 170.f) * a))
+				: IM_COL32(130, 130, 145, (int)(80 * a));
+			if (rchev_hov) {
+				wdl->AddRectFilled(
+					ImVec2(strip_rchev_x0, chev_y0),
+					ImVec2(strip_rchev_x1, chev_y1),
+					IM_COL32(255,255,255,(int)(10*a)), 3.f);
+			}
+			strip_draw_chevron(
+				(strip_rchev_x0 + strip_rchev_x1) * 0.5f, chev_cy, true, rchev_col);
+			if (rchev_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+				float step = std::max(80.f, strip_visible_w * 0.5f);
+				strip_scroll_target += step;
+				if (strip_scroll_target > strip_max_scroll)
+					strip_scroll_target = strip_max_scroll;
+			}
+
+			wdl->AddLine(
+				ImVec2(strip_div3_x + strip_div_w * 0.5f, strip_tab_y0 + 4.f),
+				ImVec2(strip_div3_x + strip_div_w * 0.5f, strip_tab_y1 - 4.f),
+				IM_COL32(255, 255, 255, (int)(14 * a)), 1.f);
+
+			bool drop_hov = strip_mouse_in_chrome &&
+				ImGui::IsMouseHoveringRect(
+					ImVec2(strip_drop_x0, chev_y0),
+					ImVec2(strip_drop_x1, chev_y1), false);
+			ImU32 drop_col = IM_COL32(200, 205, 220, (int)((drop_hov ? 240.f : 170.f) * a));
+			if (drop_hov) {
+				wdl->AddRectFilled(
+					ImVec2(strip_drop_x0, chev_y0),
+					ImVec2(strip_drop_x1, chev_y1),
+					IM_COL32(255,255,255,(int)(10*a)), 3.f);
+			}
+			float drop_cx = (strip_drop_x0 + strip_drop_x1) * 0.5f;
+			float drop_cy = chev_cy;
+			float drop_w_icon = 10.f;
+			for (int li = 0; li < 3; li++) {
+				float ly = drop_cy - 3.f + li * 3.f;
+				wdl->AddLine(
+					ImVec2(drop_cx - drop_w_icon * 0.5f, ly),
+					ImVec2(drop_cx + drop_w_icon * 0.5f, ly),
+					drop_col, 1.2f);
+			}
+			if (drop_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+				ImGui::OpenPopup("##tab_strip_dropdown");
+			}
+
+			ImGui::SetNextWindowPos(ImVec2(strip_drop_x1 - 280.f, strip_tab_y1 + 4.f),
+				ImGuiCond_Always);
+			if (ImGui::BeginPopup("##tab_strip_dropdown",
+				ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+				ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize)) {
+
+				float pop_w = 280.f;
+				float row_h_pop = 26.f;
+				ImVec2 pwp = ImGui::GetWindowPos();
+				ImDrawList* pdl = ImGui::GetWindowDrawList();
+				const auto& th_pp = aida::ui::resolved();
+
+				ImGui::TextUnformatted("Open Tabs");
+				ImGui::Dummy(ImVec2(pop_w, 1.f));
+				pdl->AddLine(
+					ImVec2(pwp.x + 6.f, ImGui::GetCursorScreenPos().y),
+					ImVec2(pwp.x + pop_w - 6.f, ImGui::GetCursorScreenPos().y),
+					IM_COL32(255,255,255,28), 1.f);
+				ImGui::Dummy(ImVec2(pop_w, 2.f));
+
+				int chosen_kind = -1;
+				int chosen_idx = -1;
+				uint64_t chosen_addr = 0;
+
+				for (int ei = 0; ei < (int)strip_entries.size(); ei++) {
+					auto& e = strip_entries[ei];
+					ImVec2 cp = ImGui::GetCursorScreenPos();
+					ImVec2 rmin(cp.x, cp.y);
+					ImVec2 rmax(cp.x + pop_w, cp.y + row_h_pop);
+					bool rhov = ImGui::IsMouseHoveringRect(rmin, rmax, false);
+					if (e.is_active) {
+						pdl->AddRectFilled(rmin, rmax,
+							IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),34), 6.f);
+					} else if (rhov) {
+						pdl->AddRectFilled(rmin, rmax,
+							aida::ui::with_alpha(th_pp.hover_wash, 1.f), 6.f);
+					}
+					const char* kind_tag = "";
+					ImU32 kind_col = IM_COL32(140, 145, 160, 200);
+					switch (e.kind) {
+						case 0: kind_tag = "TXT"; kind_col = IM_COL32(140, 200, 150, 220); break;
+						case 1: kind_tag = "ASM"; kind_col = IM_COL32(200, 165, 130, 220); break;
+						case 2: kind_tag = "C  "; kind_col = IM_COL32(150, 180, 230, 220); break;
+						case 3: kind_tag = "HEX"; kind_col = IM_COL32(220, 140, 200, 220); break;
+					}
+					pdl->AddText(ImVec2(cp.x + 10.f, cp.y + (row_h_pop - ImGui::GetFontSize()) * 0.5f),
+						kind_col, kind_tag);
+					ImU32 label_col = e.is_active
+						? IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),255)
+						: IM_COL32(220, 222, 232, 235);
+					if (e.error) label_col = IM_COL32(255, 130, 130, 235);
+					pdl->AddText(ImVec2(cp.x + 50.f, cp.y + (row_h_pop - ImGui::GetFontSize()) * 0.5f),
+						label_col, e.label.c_str());
+					if (e.dirty) {
+						pdl->AddCircleFilled(
+							ImVec2(cp.x + pop_w - 14.f, cp.y + row_h_pop * 0.5f), 3.f,
+							IM_COL32(255, 200, 120, 230));
+					}
+					ImGui::Dummy(ImVec2(pop_w, row_h_pop));
+					if (rhov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+						chosen_kind = e.kind;
+						chosen_idx = e.idx;
+						chosen_addr = e.addr;
+					}
+				}
+
+				if (chosen_kind >= 0) {
+					if (chosen_kind == 0 && chosen_idx >= 0 && chosen_idx < (int)file_tabs::tabs.size()) {
+						file_tabs::active_tab = chosen_idx;
+						auto& t = file_tabs::tabs[chosen_idx];
+						std::string content;
+						FILE* f = nullptr;
+						fopen_s(&f, t.filepath.c_str(), "rb");
+						if (f) {
+							fseek(f, 0, SEEK_END);
+							long sz = ftell(f);
+							fseek(f, 0, SEEK_SET);
+							content.resize(sz);
+							fread(&content[0], 1, sz, f);
+							fclose(f);
+						}
+						code_editor::load(content, t.filename, t.filepath);
+						globals::ui::active_center_view = center_view_t::code_editor;
+					} else if (chosen_kind == 1) {
+						globals::ui::active_center_view = center_view_t::disassembly;
+					} else if (chosen_kind == 2 && chosen_addr != 0) {
+						pseudocode_view::activate_tab_by_addr(chosen_addr);
+						globals::ui::active_center_view = center_view_t::pseudocode;
+					} else if (chosen_kind == 3) {
+						globals::ui::active_center_view = center_view_t::hex_view;
+					}
+					ImGui::CloseCurrentPopup();
+				}
+
+				ImGui::EndPopup();
+			}
+		}
+
+		strip_st->SetFloat(strip_id_scroll, strip_scroll);
+		strip_st->SetFloat(strip_id_scroll_target, strip_scroll_target);
+
+		{
+			std::string ctx_label;
+			ImU32 ctx_icon_col = IM_COL32(170, 175, 200, (int)(180*a));
+			ImU32 ctx_text_col = IM_COL32(190, 195, 220, (int)(190*a));
+			if (g_disasm.file.loaded && !g_disasm.file.filename.empty()) {
+				ctx_label = g_disasm.file.filename;
+				ctx_icon_col = IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(220*a));
+			} else if (hex_view::g_state.active && !hex_view::g_state.source_name.empty()) {
+				ctx_label = hex_view::g_state.source_name;
+			} else if (code_editor::active && file_tabs::active_tab >= 0 &&
+			           file_tabs::active_tab < (int)file_tabs::tabs.size()) {
+				ctx_label = file_tabs::tabs[file_tabs::active_tab].filename;
+			}
+			if (!ctx_label.empty()) {
+				ImVec2 cl_ts = ImGui::CalcTextSize(ctx_label.c_str());
+				float ctx_x = hx0 + hdr_pad;
+				float ctx_y_center = r1_cy;
+				float ctx_text_y = ctx_y_center - cl_ts.y * 0.5f;
+				float icon_sz = 10.f;
+				float icon_cx = ctx_x + icon_sz * 0.5f;
+				wdl->AddRect(
+					ImVec2(icon_cx - icon_sz * 0.5f, ctx_y_center - icon_sz * 0.5f),
+					ImVec2(icon_cx + icon_sz * 0.5f, ctx_y_center + icon_sz * 0.5f),
+					ctx_icon_col, 2.f, 0, 1.2f);
+				wdl->AddLine(
+					ImVec2(icon_cx - icon_sz * 0.25f, ctx_y_center - icon_sz * 0.5f - 1.5f),
+					ImVec2(icon_cx - icon_sz * 0.25f, ctx_y_center - icon_sz * 0.5f),
+					ctx_icon_col, 1.2f);
+				wdl->AddLine(
+					ImVec2(icon_cx + icon_sz * 0.25f, ctx_y_center - icon_sz * 0.5f - 1.5f),
+					ImVec2(icon_cx + icon_sz * 0.25f, ctx_y_center - icon_sz * 0.5f),
+					ctx_icon_col, 1.2f);
+				wdl->AddLine(
+					ImVec2(icon_cx - icon_sz * 0.25f, ctx_y_center + icon_sz * 0.5f),
+					ImVec2(icon_cx - icon_sz * 0.25f, ctx_y_center + icon_sz * 0.5f + 1.5f),
+					ctx_icon_col, 1.2f);
+				wdl->AddLine(
+					ImVec2(icon_cx + icon_sz * 0.25f, ctx_y_center + icon_sz * 0.5f),
+					ImVec2(icon_cx + icon_sz * 0.25f, ctx_y_center + icon_sz * 0.5f + 1.5f),
+					ctx_icon_col, 1.2f);
+				wdl->AddText(ImVec2(ctx_x + icon_sz + 8.f, ctx_text_y),
+					ctx_text_col, ctx_label.c_str());
 			}
 		}
 
@@ -4063,7 +4588,8 @@ void helpers::render_title()
 
 				if (net_is_active) {
 					wdl->AddRectFilled(ImVec2(ntx0, nty0), ImVec2(ntx1, nty1),
-						IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
+						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(28*a)),
+						4.f, ImDrawFlags_RoundCornersAll);
 					hub_active_x0 = ntx0; hub_active_x1 = ntx1; hub_active_y1 = nty1;
 					hub_has_active = true;
 				} else if (ntab_hov) {
@@ -4113,7 +4639,8 @@ void helpers::render_title()
 
 				if (scan_is_active) {
 					wdl->AddRectFilled(ImVec2(stx0, sty0), ImVec2(stx1, sty1),
-						IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
+						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(28*a)),
+						4.f, ImDrawFlags_RoundCornersAll);
 					hub_active_x0 = stx0; hub_active_x1 = stx1; hub_active_y1 = sty1;
 					hub_has_active = true;
 				} else if (stab_hov) {
@@ -4157,7 +4684,8 @@ void helpers::render_title()
 
 				if (dbg_is_active) {
 					wdl->AddRectFilled(ImVec2(dtx0, dty0), ImVec2(dtx1, dty1),
-						IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
+						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(28*a)),
+						4.f, ImDrawFlags_RoundCornersAll);
 					hub_active_x0 = dtx0; hub_active_x1 = dtx1; hub_active_y1 = dty1;
 					hub_has_active = true;
 				} else if (dtab_hov) {
@@ -4208,7 +4736,8 @@ void helpers::render_title()
 					bool hov = ImGui::IsMouseHoveringRect(ImVec2(tx0, ty0), ImVec2(tx1, ty1), false);
 					if (is_active) {
 						wdl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1),
-							IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
+							IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(28*a)),
+							4.f, ImDrawFlags_RoundCornersAll);
 						hub_active_x0 = tx0; hub_active_x1 = tx1; hub_active_y1 = ty1;
 						hub_has_active = true;
 					} else if (hov) {
@@ -4364,6 +4893,8 @@ void helpers::render_title()
 			if (!fpath.empty()) {
 			g_disasm.file = DisasmFile{};
 				disasm::load_pe(fpath, g_disasm.file);
+				function_index::on_file_loaded();
+				xref_index::on_file_loaded();
 				if (g_disasm.file.loaded)
 					disasm::decode_section_async(g_disasm.file);
 			}
@@ -4376,18 +4907,6 @@ void helpers::render_title()
 
 
 	{
-
-
-		const char* desc_text = "";
-		if (code_editor::active) desc_text = "Code Editor";
-		else if (hex_view::g_state.active) desc_text = "Hex View";
-		else if (g_disasm.file.loaded) desc_text = "Disassembly";
-		if (desc_text[0]) {
-			ImVec2 dt_ts = ImGui::CalcTextSize(desc_text);
-			float  dt_ty = r2_cy - dt_ts.y * 0.5f;
-			wdl->AddText(ImVec2(hx0 + hdr_pad, dt_ty),
-				IM_COL32(255,255,255,(int)(0.35f*a*255)), desc_text);
-		}
 
 		if (g_disasm.file.loaded) {
 			bool is_hex_view = (globals::ui::active_center_view == center_view_t::hex_view);
@@ -4432,7 +4951,7 @@ void helpers::render_title()
 				s_sandbox_running = true;
 				output_log::push(bottom_tab_t::sandbox_log, "[Sandbox] Starting: " + exe_path);
 
-				std::thread([exe_path, work_dir]() {
+				work_queue::post([exe_path, work_dir]() {
 
 					auto to_wide = [](const std::string& s) -> std::wstring {
 						if (s.empty()) return {};
@@ -4464,7 +4983,7 @@ void helpers::render_title()
 							output_log::push(bottom_tab_t::sandbox_log, "[stderr] " + result.stderr_data);
 					}
 					s_sandbox_running = false;
-				}).detach();
+				});
 			} else {
 				output_log::push(bottom_tab_t::sandbox_log, "[Sandbox] No file to run. Open a PE or file first.");
 			}
@@ -6163,8 +6682,16 @@ void helpers::render_title()
 				bool chov = ImGui::IsMouseHoveringRect(cmin, cmax);
 				if (chov) bdl->AddRectFilled(cmin, cmax, IM_COL32(255, 255, 255, (int)(12 * a)), 3.f);
 				bdl->AddText(ImVec2(cmin.x + 4.f, cmin.y + 1.f), IM_COL32(160, 160, 175, (int)((chov ? 220 : 140) * a)), clr);
-				if (chov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-					output_log::clear(globals::ui::active_bottom_tab);
+				if (chov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+					if (globals::ui::active_bottom_tab == bottom_tab_t::terminal) {
+						auto& tmgr_clear = globals::terminal_mgr;
+						if (!tmgr_clear.sessions.empty() && tmgr_clear.sessions[0]) {
+							terminal_view::clear_session(*tmgr_clear.sessions[0]);
+						}
+					} else {
+						output_log::clear(globals::ui::active_bottom_tab);
+					}
+				}
 			}
 
 
@@ -6237,6 +6764,24 @@ void helpers::render_title()
 								terminal_view::send_input(*ts, "\t", 1);
 							if (ImGui::IsKeyPressed(ImGuiKey_Escape, false))
 								terminal_view::send_input(*ts, "\x1b", 1);
+							if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, false))
+								terminal_view::send_input(*ts, "\x1b[A", 3);
+							if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, false))
+								terminal_view::send_input(*ts, "\x1b[B", 3);
+							if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, false))
+								terminal_view::send_input(*ts, "\x1b[C", 3);
+							if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false))
+								terminal_view::send_input(*ts, "\x1b[D", 3);
+							if (ImGui::IsKeyPressed(ImGuiKey_Home, false))
+								terminal_view::send_input(*ts, "\x1b[H", 3);
+							if (ImGui::IsKeyPressed(ImGuiKey_End, false))
+								terminal_view::send_input(*ts, "\x1b[F", 3);
+							if (ImGui::IsKeyPressed(ImGuiKey_Delete, false))
+								terminal_view::send_input(*ts, "\x1b[3~", 4);
+							if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false))
+								terminal_view::send_input(*ts, "\x04", 1);
+							if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false))
+								terminal_view::send_input(*ts, "\x1a", 1);
 						}
 
 
@@ -6341,6 +6886,9 @@ void helpers::render_title()
 				license::validated = false;
 				license::error_msg = standalone_license::last_error();
 				output_log::push(bottom_tab_t::output, "[license] Session invalidated: " + license::error_msg);
+				diag::log_tagged_fmt("license",
+					"DIAG_DIALOG_TRIGGER source=periodic_check_120f frame=%d err=%.200s",
+					ImGui::GetFrameCount(), license::error_msg.c_str());
 			}
 		}
 	}

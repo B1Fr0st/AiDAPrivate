@@ -793,11 +793,10 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 		? detail::resolve_arch(file_fallback)
 		: aida_ghidra::detect_arch_default_x64();
 
-	std::vector<std::thread> workers;
-	workers.reserve(num_threads);
+	std::atomic<unsigned int> workers_remaining{num_threads};
 
 	for (unsigned int t = 0; t < num_threads; ++t) {
-		workers.emplace_back([&, t]() {
+		if (!work_queue::post([&, t]() {
 			auto& my_indices = partitions[t];
 			if (my_indices.empty())
 				return;
@@ -853,11 +852,15 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 				if (progress)
 					progress->fetch_add(1, std::memory_order_relaxed);
 			}
-		});
+			workers_remaining.fetch_sub(1, std::memory_order_acq_rel);
+		}))
+		{
+			workers_remaining.fetch_sub(1, std::memory_order_acq_rel);
+		}
 	}
 
-	for (auto& w : workers)
-		w.join();
+	while (workers_remaining.load(std::memory_order_acquire) > 0)
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
 
 inline std::string last_error() {

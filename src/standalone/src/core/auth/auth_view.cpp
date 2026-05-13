@@ -165,9 +165,9 @@ namespace auth_view {
 			std::atomic<int> copilot_poll_result{ static_cast<int>(exchange_result_t::pending) };
 			std::atomic<int> claude_code_exchange_result{ static_cast<int>(exchange_result_t::pending) };
 
-			std::thread codex_start_thread;
-			std::thread copilot_start_thread;
-			std::thread claude_code_start_thread;
+			std::atomic<bool> codex_start_done{true};
+			std::atomic<bool> copilot_start_done{true};
+			std::atomic<bool> claude_code_start_done{true};
 
 			std::string err;
 
@@ -275,12 +275,9 @@ namespace auth_view {
 		{
 			if (g_state.codex_starting.exchange(true)) return;
 
-			std::thread prior;
 			std::shared_ptr<aida::auth::codex::codex_login_state_t> previous;
 			{
 				std::lock_guard<std::mutex> lk(g_state.mtx);
-				if (g_state.codex_start_thread.joinable())
-					prior = std::move(g_state.codex_start_thread);
 				previous = g_state.codex_state;
 				g_state.codex_state = std::make_shared<aida::auth::codex::codex_login_state_t>();
 				g_state.codex_modal_open.store(true);
@@ -289,42 +286,44 @@ namespace auth_view {
 			}
 			if (previous)
 				aida::auth::codex::cancel_login(*previous);
-			if (prior.joinable()) prior.join();
+			while (!g_state.codex_start_done.load(std::memory_order_acquire))
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
 			std::shared_ptr<aida::auth::codex::codex_login_state_t> codex_ref;
 			{
 				std::lock_guard<std::mutex> lk(g_state.mtx);
 				codex_ref = g_state.codex_state;
 			}
-			std::thread t([codex_ref]() {
-				if (!codex_ref) {
-					g_state.codex_starting.store(false);
-					return;
-				}
-				const bool ok = aida::auth::codex::start_login(*codex_ref);
-				{
-					std::lock_guard<std::mutex> lk(g_state.mtx);
-					if (!ok) {
-						codex_ref->error = aida::auth::codex::last_error();
-						codex_ref->done.store(true);
-						set_err_locked(codex_ref->error);
+			g_state.codex_start_done.store(false, std::memory_order_release);
+			if (!work_queue::post([codex_ref]() {
+					if (!codex_ref) {
+						g_state.codex_starting.store(false);
+						g_state.codex_start_done.store(true, std::memory_order_release);
+						return;
 					}
-				}
+					const bool ok = aida::auth::codex::start_login(*codex_ref);
+					{
+						std::lock_guard<std::mutex> lk(g_state.mtx);
+						if (!ok) {
+							codex_ref->error = aida::auth::codex::last_error();
+							codex_ref->done.store(true);
+							set_err_locked(codex_ref->error);
+						}
+					}
+					g_state.codex_starting.store(false);
+					g_state.codex_start_done.store(true, std::memory_order_release);
+				}))
+			{
 				g_state.codex_starting.store(false);
-			});
-
-			std::lock_guard<std::mutex> lk(g_state.mtx);
-			g_state.codex_start_thread = std::move(t);
+				g_state.codex_start_done.store(true, std::memory_order_release);
+			}
 		}
 
 		static void open_copilot_modal()
 		{
-			std::thread prior;
 			std::shared_ptr<aida::auth::copilot::copilot_login_state_t> previous;
 			{
 				std::lock_guard<std::mutex> lk(g_state.mtx);
-				if (g_state.copilot_start_thread.joinable())
-					prior = std::move(g_state.copilot_start_thread);
 				previous = g_state.copilot_state;
 				g_state.copilot_state = std::make_shared<aida::auth::copilot::copilot_login_state_t>();
 				g_state.copilot_modal_open.store(true);
@@ -345,7 +344,8 @@ namespace auth_view {
 			}
 			if (previous)
 				aida::auth::copilot::cancel_login(*previous);
-			if (prior.joinable()) prior.join();
+			while (!g_state.copilot_start_done.load(std::memory_order_acquire))
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		}
 
 		static void start_copilot_flow(std::optional<std::string> enterprise_url)
@@ -358,37 +358,40 @@ namespace auth_view {
 				std::lock_guard<std::mutex> lk(g_state.mtx);
 				copilot_ref = g_state.copilot_state;
 			}
-			std::thread t([copilot_ref, enterprise_url]() {
-				if (!copilot_ref) {
-					g_state.copilot_starting.store(false);
-					return;
-				}
-				const bool ok = aida::auth::copilot::start_login(*copilot_ref, enterprise_url);
-				{
-					std::lock_guard<std::mutex> lk(g_state.mtx);
-					if (!ok) {
-						copilot_ref->error = aida::auth::copilot::last_error();
-						copilot_ref->done.store(true);
-						set_err_locked(copilot_ref->error);
+			while (!g_state.copilot_start_done.load(std::memory_order_acquire))
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			g_state.copilot_start_done.store(false, std::memory_order_release);
+			if (!work_queue::post([copilot_ref, enterprise_url]() {
+					if (!copilot_ref) {
+						g_state.copilot_starting.store(false);
+						g_state.copilot_start_done.store(true, std::memory_order_release);
+						return;
 					}
-				}
+					const bool ok = aida::auth::copilot::start_login(*copilot_ref, enterprise_url);
+					{
+						std::lock_guard<std::mutex> lk(g_state.mtx);
+						if (!ok) {
+							copilot_ref->error = aida::auth::copilot::last_error();
+							copilot_ref->done.store(true);
+							set_err_locked(copilot_ref->error);
+						}
+					}
+					g_state.copilot_starting.store(false);
+					g_state.copilot_start_done.store(true, std::memory_order_release);
+				}))
+			{
 				g_state.copilot_starting.store(false);
-			});
-
-			std::lock_guard<std::mutex> lk(g_state.mtx);
-			g_state.copilot_start_thread = std::move(t);
+				g_state.copilot_start_done.store(true, std::memory_order_release);
+			}
 		}
 
 		static void start_claude_code_login()
 		{
 			if (g_state.claude_code_starting.exchange(true)) return;
 
-			std::thread prior;
 			std::shared_ptr<aida::auth::claude_code::claude_code_login_state_t> previous;
 			{
 				std::lock_guard<std::mutex> lk(g_state.mtx);
-				if (g_state.claude_code_start_thread.joinable())
-					prior = std::move(g_state.claude_code_start_thread);
 				previous = g_state.claude_code_state;
 				g_state.claude_code_state = std::make_shared<aida::auth::claude_code::claude_code_login_state_t>();
 				g_state.claude_code_modal_open.store(true);
@@ -397,32 +400,37 @@ namespace auth_view {
 			}
 			if (previous)
 				aida::auth::claude_code::cancel_login(*previous);
-			if (prior.joinable()) prior.join();
+			while (!g_state.claude_code_start_done.load(std::memory_order_acquire))
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
 			std::shared_ptr<aida::auth::claude_code::claude_code_login_state_t> claude_ref;
 			{
 				std::lock_guard<std::mutex> lk(g_state.mtx);
 				claude_ref = g_state.claude_code_state;
 			}
-			std::thread t([claude_ref]() {
-				if (!claude_ref) {
-					g_state.claude_code_starting.store(false);
-					return;
-				}
-				const bool ok = aida::auth::claude_code::start_login(*claude_ref);
-				{
-					std::lock_guard<std::mutex> lk(g_state.mtx);
-					if (!ok) {
-						claude_ref->error = aida::auth::claude_code::last_error();
-						claude_ref->done.store(true);
-						set_err_locked(claude_ref->error);
+			g_state.claude_code_start_done.store(false, std::memory_order_release);
+			if (!work_queue::post([claude_ref]() {
+					if (!claude_ref) {
+						g_state.claude_code_starting.store(false);
+						g_state.claude_code_start_done.store(true, std::memory_order_release);
+						return;
 					}
-				}
+					const bool ok = aida::auth::claude_code::start_login(*claude_ref);
+					{
+						std::lock_guard<std::mutex> lk(g_state.mtx);
+						if (!ok) {
+							claude_ref->error = aida::auth::claude_code::last_error();
+							claude_ref->done.store(true);
+							set_err_locked(claude_ref->error);
+						}
+					}
+					g_state.claude_code_starting.store(false);
+					g_state.claude_code_start_done.store(true, std::memory_order_release);
+				}))
+			{
 				g_state.claude_code_starting.store(false);
-			});
-
-			std::lock_guard<std::mutex> lk(g_state.mtx);
-			g_state.claude_code_start_thread = std::move(t);
+				g_state.claude_code_start_done.store(true, std::memory_order_release);
+			}
 		}
 
 		static void close_codex_modal_immediate()
@@ -2181,12 +2189,12 @@ namespace auth_view {
 			SecureZeroMemory(g_state.copilot_ghe_buf, sizeof(g_state.copilot_ghe_buf));
 		}
 
-		if (g_state.codex_start_thread.joinable())
-			g_state.codex_start_thread.join();
-		if (g_state.copilot_start_thread.joinable())
-			g_state.copilot_start_thread.join();
-		if (g_state.claude_code_start_thread.joinable())
-			g_state.claude_code_start_thread.join();
+		while (!g_state.codex_start_done.load(std::memory_order_acquire))
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		while (!g_state.copilot_start_done.load(std::memory_order_acquire))
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		while (!g_state.claude_code_start_done.load(std::memory_order_acquire))
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
 		using namespace std::chrono_literals;
 		const auto deadline = std::chrono::steady_clock::now() + 35s;

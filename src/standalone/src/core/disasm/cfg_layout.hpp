@@ -15,6 +15,7 @@ struct node_t {
 	float width = 200.f;
 	float height = 100.f;
 	int   layer = -1;
+	bool  is_entry = false;
 };
 
 struct edge_t {
@@ -76,7 +77,11 @@ inline void layout(graph_t& graph, float node_spacing_x, float node_spacing_y)
 	for (auto& n : graph.nodes)
 		n.layer = -1;
 
-	int entry_idx = detail::find_node_index(graph, 0);
+	int entry_idx = -1;
+	for (int i = 0; i < static_cast<int>(graph.nodes.size()); ++i) {
+		if (graph.nodes[i].is_entry) { entry_idx = i; break; }
+	}
+	if (entry_idx < 0) entry_idx = detail::find_node_index(graph, 0);
 	if (entry_idx < 0) entry_idx = 0;
 	graph.nodes[entry_idx].layer = 0;
 
@@ -106,12 +111,20 @@ inline void layout(graph_t& graph, float node_spacing_x, float node_spacing_y)
 		}
 	}
 
+	int max_layer = 0;
 	for (auto& n : graph.nodes) {
-		if (n.layer < 0)
-			n.layer = 0;
+		if (n.layer > max_layer)
+			max_layer = n.layer;
 	}
 
-	int max_layer = 0;
+	int next_layer = max_layer + 1;
+	for (auto& n : graph.nodes) {
+		if (n.layer < 0) {
+			n.layer = next_layer++;
+		}
+	}
+
+	max_layer = 0;
 	for (auto& n : graph.nodes) {
 		if (n.layer > max_layer)
 			max_layer = n.layer;
@@ -148,6 +161,19 @@ inline void layout(graph_t& graph, float node_spacing_x, float node_spacing_y)
 			ids.push_back(s.second);
 	}
 
+	std::vector<float> layer_max_h(max_layer + 1, 0.f);
+	for (auto& n : graph.nodes) {
+		if (layer_max_h[n.layer] < n.height)
+			layer_max_h[n.layer] = n.height;
+	}
+
+	std::vector<float> layer_y(max_layer + 1, 0.f);
+	float cum_y = 0.f;
+	for (int l = 0; l <= max_layer; ++l) {
+		layer_y[l] = cum_y;
+		cum_y += layer_max_h[l] + node_spacing_y;
+	}
+
 	for (int layer = 0; layer <= max_layer; ++layer) {
 		auto& ids = layers[layer];
 		int count = static_cast<int>(ids.size());
@@ -164,7 +190,7 @@ inline void layout(graph_t& graph, float node_spacing_x, float node_spacing_y)
 		for (int nid : ids) {
 			int idx = id_to_idx[nid];
 			graph.nodes[idx].x = cur_x + graph.nodes[idx].width * 0.5f;
-			graph.nodes[idx].y = static_cast<float>(layer) * node_spacing_y;
+			graph.nodes[idx].y = layer_y[layer];
 			cur_x += graph.nodes[idx].width + node_spacing_x;
 		}
 	}
@@ -195,6 +221,38 @@ inline void layout(graph_t& graph, float node_spacing_x, float node_spacing_y)
 				avg_x /= static_cast<float>(succs.size());
 				int idx = id_to_idx[nid];
 				graph.nodes[idx].x = graph.nodes[idx].x * 0.5f + avg_x * 0.5f;
+			}
+		}
+
+		for (int layer = 0; layer <= max_layer; ++layer) {
+			auto& ids = layers[layer];
+			if (ids.size() < 2) continue;
+			std::sort(ids.begin(), ids.end(), [&](int a, int b) {
+				return graph.nodes[id_to_idx[a]].x < graph.nodes[id_to_idx[b]].x;
+			});
+			for (int i = 1; i < static_cast<int>(ids.size()); ++i) {
+				int prev_idx = id_to_idx[ids[i - 1]];
+				int cur_idx  = id_to_idx[ids[i]];
+				float prev_right = graph.nodes[prev_idx].x + graph.nodes[prev_idx].width * 0.5f;
+				float cur_left   = graph.nodes[cur_idx].x  - graph.nodes[cur_idx].width  * 0.5f;
+				float min_gap = node_spacing_x;
+				float gap = cur_left - prev_right;
+				if (gap < min_gap) {
+					float push = min_gap - gap;
+					graph.nodes[cur_idx].x += push;
+				}
+			}
+			for (int i = static_cast<int>(ids.size()) - 2; i >= 0; --i) {
+				int next_idx = id_to_idx[ids[i + 1]];
+				int cur_idx  = id_to_idx[ids[i]];
+				float next_left  = graph.nodes[next_idx].x - graph.nodes[next_idx].width * 0.5f;
+				float cur_right  = graph.nodes[cur_idx].x  + graph.nodes[cur_idx].width  * 0.5f;
+				float min_gap = node_spacing_x;
+				float gap = next_left - cur_right;
+				if (gap < min_gap) {
+					float pull = min_gap - gap;
+					graph.nodes[cur_idx].x -= pull * 0.5f;
+				}
 			}
 		}
 	}

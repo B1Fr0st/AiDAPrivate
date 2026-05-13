@@ -79,18 +79,18 @@ namespace aida::ui::components {
 		inline float sz_font(size_t_ s) {
 			switch (s) {
 				case size_t_::sm: return 14.f;
-				case size_t_::md: return 15.f;
-				case size_t_::lg: return 17.f;
+				case size_t_::md: return 16.f;
+				case size_t_::lg: return 18.f;
 			}
-			return 15.f;
+			return 16.f;
 		}
 		inline float sz_height(size_t_ s) {
 			switch (s) {
-				case size_t_::sm: return 28.f;
-				case size_t_::md: return 34.f;
-				case size_t_::lg: return 42.f;
+				case size_t_::sm: return 30.f;
+				case size_t_::md: return 36.f;
+				case size_t_::lg: return 44.f;
 			}
-			return 34.f;
+			return 36.f;
 		}
 	}
 
@@ -141,42 +141,55 @@ namespace aida::ui::components {
 		ImU32 hover_top = t.accent_grad_top;
 		ImU32 hover_bot = t.accent_grad_bot;
 
+		bool primary_or_accent = (kind == button_kind_t::primary ||
+		                          kind == button_kind_t::accent_gradient);
+
 		switch (kind) {
 			case button_kind_t::primary:
-				fill = aida::ui::mix(t.accent_grad_top, t.accent_grad_bot, 0.5f);
-				border = aida::ui::with_alpha(t.accent_hover, 1.f);
-				text_col = IM_COL32(255, 255, 255, 245);
+			case button_kind_t::accent_gradient: {
+				radius = 6.f;
+				ImU32 idle_top = aida::ui::with_alpha(t.accent_dim, 0.55f);
+				ImU32 idle_bot = aida::ui::with_alpha(t.accent_dim, 0.30f);
+				ImU32 hov_top  = aida::ui::with_alpha(t.accent_grad_top, 0.95f);
+				ImU32 hov_bot  = aida::ui::with_alpha(t.accent_grad_bot, 0.95f);
+				ImU32 cur_top  = aida::ui::mix(idle_top, hov_top, hov);
+				ImU32 cur_bot  = aida::ui::mix(idle_bot, hov_bot, hov);
+				ImU32 flat     = aida::ui::mix(cur_top, cur_bot, 0.5f);
+				dl->AddRectFilled(ca, cb, aida::ui::with_alpha(flat, alpha), radius);
+				ImU32 b_idle = aida::ui::with_alpha(t.accent_dim, 0.75f);
+				ImU32 b_hov  = aida::ui::with_alpha(t.accent_hover, 0.92f);
+				border = aida::ui::mix(b_idle, b_hov, hov);
+				ImU32 tc_idle = aida::ui::with_alpha(t.text_primary, 0.92f);
+				ImU32 tc_hov  = aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), 0.96f);
+				text_col = aida::ui::mix(tc_idle, tc_hov, hov);
 				break;
+			}
 			case button_kind_t::secondary:
 				fill = t.panel_header;
 				border = t.border_subtle;
 				text_col = t.text_primary;
 				break;
 			case button_kind_t::ghost:
-				fill = aida::ui::with_alpha(t.panel_header, 0.f);
-				border = aida::ui::with_alpha(t.border_subtle, 0.f);
-				text_col = t.text_secondary;
+				fill = aida::ui::with_alpha(t.panel_header, 0.45f);
+				border = aida::ui::with_alpha(t.border_subtle, 0.85f);
+				text_col = t.text_primary;
 				break;
 			case button_kind_t::destructive:
 				fill = aida::ui::with_alpha(t.error, 0.18f);
 				border = aida::ui::with_alpha(t.error, 0.55f);
 				text_col = t.error;
 				break;
-			case button_kind_t::accent_gradient: {
-				ImU32 grad_flat = aida::ui::mix(t.accent_grad_top, t.accent_grad_bot, 0.5f);
-				dl->AddRectFilled(ca, cb, aida::ui::with_alpha(grad_flat, alpha), radius);
-				break;
-			}
 		}
 
-		if (kind != button_kind_t::accent_gradient) {
+		if (!primary_or_accent) {
 			ImU32 hover_blend_top = aida::ui::mix(fill, hover_top, hov * 0.55f);
 			ImU32 hover_blend_bot = aida::ui::mix(fill, hover_bot, hov * 0.55f);
 			ImU32 fill_flat = aida::ui::mix(hover_blend_top, hover_blend_bot, 0.5f);
 			dl->AddRectFilled(ca, cb, aida::ui::with_alpha(fill_flat, alpha), radius);
 		}
 
-		dl->AddRect(ca, cb, aida::ui::with_alpha(border, alpha * (1.f + hov * 0.5f)), radius, 0, 1.f);
+		float border_thickness = primary_or_accent ? 1.0f : 1.f;
+		dl->AddRect(ca, cb, aida::ui::with_alpha(border, alpha * (primary_or_accent ? 1.f : (1.f + hov * 0.5f))), radius, 0, border_thickness);
 
 		if (flash > 0.f) {
 			ImU32 flash_col = aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), flash * 0.20f);

@@ -104,9 +104,20 @@ if (OWNER_IDS.size === 0) {
 
 // ─── PostgreSQL connection pool ───────────────────────────────────────────────
 
+const _dbUrl                = DATABASE_URL || '';
+const _isLocalDb            = /(@|\/\/)(localhost|127\.0\.0\.1)\b/i.test(_dbUrl);
+const _sslModeMatch         = _dbUrl.match(/[?&]sslmode=([a-zA-Z-]+)/);
+const _sslModeFromUrl       = _sslModeMatch ? _sslModeMatch[1].toLowerCase() : '';
+const _sslExplicitlyDisabled = _sslModeFromUrl === 'disable';
+const _sslVerify            = String(process.env.AIDA_BOT_PG_SSL_VERIFY || '0') === '1';
+const _poolSsl =
+    _sslExplicitlyDisabled ? false :
+    _isLocalDb             ? false :
+                             { rejectUnauthorized: _sslVerify };
+
 const pool = new Pool({
     connectionString: DATABASE_URL,
-    ssl: false,
+    ssl: _poolSsl,
     max: 5,
     idleTimeoutMillis: 30000,
 });
@@ -609,10 +620,13 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (!interaction.isChatInputCommand()) return;
-    if (!isOwner(interaction)) return ownerDenied(interaction);
 
     const { commandName } = interaction;
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    if (!isOwner(interaction)) {
+        return interaction.editReply('❌ Only the bot owner can use this command.');
+    }
 
     try {
 

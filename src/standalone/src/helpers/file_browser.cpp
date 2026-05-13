@@ -4,6 +4,8 @@
 
 #include "globals.h"
 #include "zydis_disasm.hpp"
+#include "function_index.hpp"
+#include "xref_index.hpp"
 #include "standalone_license.hpp"
 #include "hex_view.hpp"
 
@@ -185,6 +187,8 @@ void file_browser::open_file(int idx)
             code_editor::filepath.clear();
             g_disasm.file = DisasmFile{};
             disasm::load_pe(ent.full_path, g_disasm.file);
+            function_index::on_file_loaded();
+            xref_index::on_file_loaded();
             if (g_disasm.file.loaded) {
                 disasm::decode_section(g_disasm.file);
                 globals::ui::active_center_view = center_view_t::disassembly;
