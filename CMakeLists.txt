@@ -1067,6 +1067,7 @@ if(WIN32)
             src/emulation_engine.cpp
             "${STANDALONE_ROOT}/core/network/tls_exporter.cpp"
             "${STANDALONE_ROOT}/core/auth/auth_store.cpp"
+            "${STANDALONE_ROOT}/core/auth/auth_http.cpp"
             "${STANDALONE_ROOT}/core/auth/auth_codex.cpp"
             "${STANDALONE_ROOT}/core/auth/auth_copilot.cpp"
             "${STANDALONE_ROOT}/core/auth/auth_claude_code.cpp"

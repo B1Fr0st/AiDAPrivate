@@ -128,17 +128,17 @@ namespace detail {
 
 inline ImU32 state_color(const std::string& state, float alpha)
 {
-	if (state == "Running")   return IM_COL32(80, 200, 80, static_cast<int>(200 * alpha));
-	if (state == "Waiting")   return IM_COL32(220, 200, 60, static_cast<int>(200 * alpha));
-	if (state == "Suspended") return IM_COL32(220, 140, 40, static_cast<int>(200 * alpha));
-	return IM_COL32(180, 180, 190, static_cast<int>(180 * alpha));
+	if (state == "Running")   return aida::ui::with_alpha(aida::ui::resolved().success, alpha);
+	if (state == "Waiting")   return aida::ui::with_alpha(aida::ui::resolved().warning, alpha);
+	if (state == "Suspended") return aida::ui::with_alpha(aida::ui::darken(aida::ui::resolved().warning, 20), alpha);
+	return aida::ui::with_alpha(aida::ui::resolved().text_secondary, alpha);
 }
 
 inline ImU32 priority_color(int prio, float alpha)
 {
-	if (prio > 0) return IM_COL32(220, 160, 60, static_cast<int>(200 * alpha));
-	if (prio < 0) return IM_COL32(100, 140, 200, static_cast<int>(200 * alpha));
-	return IM_COL32(180, 180, 190, static_cast<int>(200 * alpha));
+	if (prio > 0) return aida::ui::with_alpha(aida::ui::resolved().warning, alpha);
+	if (prio < 0) return aida::ui::with_alpha(aida::ui::resolved().info, alpha);
+	return aida::ui::with_alpha(aida::ui::resolved().text_secondary, alpha);
 }
 
 }
@@ -211,9 +211,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		std::snprintf(wait_buf, sizeof(wait_buf), "%d", waiting);
 		std::snprintf(susp_buf, sizeof(susp_buf), "%d", suspended);
 
-		ImU32 run_col  = IM_COL32(120, 200, 130, 255);
-		ImU32 wait_col = IM_COL32(220, 200, 80, 255);
-		ImU32 susp_col = suspended > 0 ? IM_COL32(230, 140, 80, 255) : IM_COL32(180, 185, 200, 255);
+		ImU32 run_col  = aida::ui::resolved().success;
+		ImU32 wait_col = aida::ui::resolved().warning;
+		ImU32 susp_col = suspended > 0 ? aida::ui::darken(aida::ui::resolved().warning, 20) : aida::ui::resolved().text_secondary;
 
 		ui_anim::stat_strip_item_t items[4];
 		items[0] = { "Threads",   tot_buf,  nullptr, 0, nullptr, 0, 0 };

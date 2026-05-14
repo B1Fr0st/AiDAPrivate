@@ -3,6 +3,7 @@
 #include <intrin.h>
 
 #include "work_queue.hpp"
+#include "theme.hpp"
 #include "mcp_standalone.hpp"
 #include "mcp_client.hpp"
 #include "mcp_marketplace.hpp"
@@ -2144,8 +2145,8 @@ void render_tool_approval_dialog()
     ImGui::SetNextWindowPos(ImVec2((ww - pw) * 0.5f, (wh - ph) * 0.5f), ImGuiCond_Appearing);
     ImGui::SetNextWindowSize(ImVec2(pw, ph), ImGuiCond_Always);
 
-    ImGui::PushStyleColor(ImGuiCol_PopupBg, IM_COL32(28, 28, 36, 245));
-    ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(70, 70, 100, 180));
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::resolved().bg_elevated);
+    ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::resolved().border_strong);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16, 12));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
 
@@ -2163,12 +2164,12 @@ void render_tool_approval_dialog()
         ImGui::Spacing();
 
         ImGui::Text("The AI wants to execute:");
-        ImGui::TextColored(ImVec4(1.f, 0.9f, 0.6f, 1.f), "  %s", name.c_str());
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::resolved().warning), "  %s", name.c_str());
         ImGui::Spacing();
 
         if (!args_preview.empty()) {
             ImGui::Text("Arguments:");
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(18, 18, 24, 200));
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, aida::ui::with_alpha(aida::ui::resolved().bg_base, 0.78f));
             ImGui::BeginChild("##tool_args", ImVec2(-1, 100.f), ImGuiChildFlags_Borders);
             ImGui::TextWrapped("%s", args_preview.c_str());
             ImGui::EndChild();
@@ -2301,23 +2302,23 @@ void plan_build_pill_meta(std::string& label, std::string& glyph, ImU32& bg, ImU
     if (active == "plan") {
         glyph = "PLAN";
         label = "PLAN";
-        bg = IM_COL32(38, 56, 96, 230);
-        fg = IM_COL32(190, 220, 255, 245);
+        bg = aida::ui::with_alpha(aida::ui::resolved().info, 0.9f);
+        fg = aida::ui::is_dark() ? IM_COL32(245, 246, 252, 245) : IM_COL32(20, 22, 30, 245);
         return;
     }
     if (active == "build") {
         glyph = "BUILD";
         label = "BUILD";
-        bg = IM_COL32(38, 80, 56, 230);
-        fg = IM_COL32(190, 235, 200, 245);
+        bg = aida::ui::with_alpha(aida::ui::resolved().success, 0.9f);
+        fg = aida::ui::is_dark() ? IM_COL32(245, 246, 252, 245) : IM_COL32(20, 22, 30, 245);
         return;
     }
     glyph = active.empty() ? std::string("?") : active.substr(0, 1);
     label = active.empty() ? std::string("agent") : active;
     const aida::agent::agent_info_t* info = aida::agent::get(active);
     ImU32 col = info != nullptr
-        ? hex_to_imu32_or_default(info->color, IM_COL32(96, 110, 150, 230))
-        : IM_COL32(96, 110, 150, 230);
+        ? hex_to_imu32_or_default(info->color, aida::ui::with_alpha(aida::ui::resolved().text_secondary, 0.9f))
+        : aida::ui::with_alpha(aida::ui::resolved().text_secondary, 0.9f);
     bg = col;
     int rr = (col >> 0) & 0xFF;
     int gg = (col >> 8) & 0xFF;
@@ -2390,18 +2391,19 @@ void chat_render_agent_pill(float anchor_x, float anchor_y, float alpha)
         static_cast<int>(((bg >> 24) & 0xFF) * alpha));
     dl->AddRectFilled(pmin, pmax, hov ? fill_hov : fill, pill_h * 0.5f);
     dl->AddRect(pmin, pmax,
-        IM_COL32(255, 255, 255, static_cast<int>((hov ? 70 : 30) * alpha)),
+        aida::ui::with_alpha(aida::ui::resolved().border_strong, (hov ? 1.f : 0.5f) * alpha),
         pill_h * 0.5f, 0, 1.f);
+
+    int fr = (fg >> 0) & 0xFF;
+    int fg_g = (fg >> 8) & 0xFF;
+    int fb = (fg >> 16) & 0xFF;
 
     float dot_cx = pmin.x + pad_x + dot_r * 0.5f;
     float dot_cy = pmin.y + pill_h * 0.5f;
     dl->AddCircleFilled(ImVec2(dot_cx, dot_cy), dot_r,
-        IM_COL32(255, 255, 255, static_cast<int>(220 * alpha)), 18);
+        IM_COL32(fr, fg_g, fb, static_cast<int>(((fg >> 24) & 0xFF) * alpha)), 18);
 
     float text_x = dot_cx + dot_r + gap;
-    int fr = (fg >> 0) & 0xFF;
-    int fg_g = (fg >> 8) & 0xFF;
-    int fb = (fg >> 16) & 0xFF;
     ImU32 fg_a = IM_COL32(fr, fg_g, fb, static_cast<int>(((fg >> 24) & 0xFF) * alpha));
     dl->AddText(ImVec2(text_x, pmin.y + (pill_h - ts.y) * 0.5f), fg_a, label.c_str());
 

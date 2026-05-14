@@ -272,11 +272,11 @@ namespace agent_manager {
 		{
 			const auto& th = aida::ui::resolved();
 			ImFont* font = aida::ui::fonts::body_strong();
-			float fs = 13.f;
+			float fs = aida::ui::components::detail::ui_fs() * 0.98f;
 
 			ImVec2 pos = ImGui::GetCursorScreenPos();
 			float w = ImGui::GetContentRegionAvail().x;
-			float h = 30.f;
+			float h = (std::max)(32.f, fs + 16.f);
 
 			ImGui::PushID(title);
 			ImGui::InvisibleButton("##sec_hdr", ImVec2(w, h));
@@ -427,7 +427,7 @@ namespace agent_manager {
 			}
 
 			const bool selected_now = (a.name == st.selected_name);
-			const float row_h = 56.f;
+			const float row_h = 62.f;
 			const float row_w = left_w - 16.f;
 
 			ImVec2 row_pos = ImGui::GetCursorScreenPos();
@@ -466,17 +466,18 @@ namespace agent_manager {
 				aida::ui::avatar::kind_t::gradient, true, 1.f,
 				aida::ui::fonts::body_strong());
 
-			ldl->AddText(aida::ui::fonts::body_strong(), 13.f,
-				ImVec2(av_c.x + av_r + 10.f, ra2.y + 8.f),
+			ldl->AddText(aida::ui::fonts::body_strong(),
+				aida::ui::components::detail::ui_fs() * 1.02f,
+				ImVec2(av_c.x + av_r + 10.f, ra2.y + 7.f),
 				th.text_primary, a.name.c_str());
 
-			ImGui::SetCursorScreenPos(ImVec2(av_c.x + av_r + 10.f, ra2.y + 26.f));
+			ImGui::SetCursorScreenPos(ImVec2(av_c.x + av_r + 10.f, ra2.y + 28.f));
 			aida::ui::pill_kind(a.native ? "native" : "custom",
 				a.native ? aida::ui::pill_kind_t::info : aida::ui::pill_kind_t::warning,
 				aida::ui::size_t_::sm, false);
 
 			if (a.hidden) {
-				ImGui::SetCursorScreenPos(ImVec2(rb2.x - 78.f, ra2.y + 8.f));
+				ImGui::SetCursorScreenPos(ImVec2(rb2.x - 84.f, ra2.y + 7.f));
 				aida::ui::badge("hidden", aida::ui::with_alpha(th.text_dim, 0.85f), 4.f);
 			}
 
@@ -533,8 +534,9 @@ namespace agent_manager {
 				aida::ui::avatar::kind_t::gradient, true, 1.f,
 				aida::ui::fonts::body_strong());
 
-			dl->AddText(aida::ui::fonts::h2(), 18.f,
-				ImVec2(av_c.x + av_r + 14.f, ha.y + 10.f),
+			dl->AddText(aida::ui::fonts::h2(),
+				aida::ui::components::detail::ui_fs() * 1.28f,
+				ImVec2(av_c.x + av_r + 14.f, ha.y + 9.f),
 				th.text_primary, st.selected_name.c_str());
 
 			ImGui::SetCursorScreenPos(ImVec2(av_c.x + av_r + 14.f, ha.y + 32.f));
@@ -556,7 +558,7 @@ namespace agent_manager {
 			ImGui::SetCursorScreenPos(ImVec2(hdr_pos.x, hdr_pos.y + hdr_h + 12.f));
 
 			if (is_native) {
-				ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f),
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
 					"Built-in agents are read-only. Click \"Duplicate as custom\" to override.");
 				ImGui::Spacing();
 			}
@@ -564,7 +566,7 @@ namespace agent_manager {
 			ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 6.f));
 
-			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Name");
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Name");
 			ImGui::SetNextItemWidth(-FLT_MIN);
 			if (ImGui::InputText("##agent_name", st.edit_name, sizeof(st.edit_name),
 				is_native ? ImGuiInputTextFlags_ReadOnly : ImGuiInputTextFlags_None)) {
@@ -572,7 +574,7 @@ namespace agent_manager {
 			}
 
 			ImGui::Spacing();
-			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Description");
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Description");
 			ImGui::SetNextItemWidth(-FLT_MIN);
 			if (ImGui::InputTextMultiline("##agent_desc", st.edit_description,
 				sizeof(st.edit_description), ImVec2(0, ImGui::GetFontSize() * 2.2f + 8.f),
@@ -581,7 +583,7 @@ namespace agent_manager {
 			}
 
 			ImGui::Spacing();
-			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Color");
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Color");
 			ImGui::SetNextItemWidth(120.f);
 			if (ImGui::InputText("##agent_color", st.edit_color, sizeof(st.edit_color),
 				is_native ? ImGuiInputTextFlags_ReadOnly : ImGuiInputTextFlags_None)) {
@@ -625,11 +627,11 @@ namespace agent_manager {
 			}
 
 			ImGui::Spacing();
-			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Mode");
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Mode");
 			ImGui::SetNextItemWidth(180.f);
 			const char* modes[] = { "primary", "subagent", "all" };
 			if (is_native) {
-				ImGui::TextColored(ImVec4(0.78f, 0.8f, 0.9f, 1.f), "%s", detail::mode_label(st.mode_index));
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "%s", detail::mode_label(st.mode_index));
 			} else {
 				if (ImGui::Combo("##agent_mode", &st.mode_index, modes, IM_ARRAYSIZE(modes))) {
 					detail::mark_dirty_locked();
@@ -703,20 +705,20 @@ namespace agent_manager {
 				}
 
 				ImGui::Spacing();
-				ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Temperature");
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Temperature");
 				ImGui::SetNextItemWidth(220.f);
 				if (ImGui::SliderFloat("##agent_temp", &st.temperature, 0.f, 2.f, "%.2f")) {
 					detail::mark_dirty_locked();
 				}
 				ImGui::SameLine(0.f, 12.f);
-				ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Top-p");
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Top-p");
 				ImGui::SameLine();
 				ImGui::SetNextItemWidth(180.f);
 				if (ImGui::SliderFloat("##agent_topp", &st.top_p, 0.f, 1.f, "%.2f")) {
 					detail::mark_dirty_locked();
 				}
 				ImGui::SameLine(0.f, 12.f);
-				ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Max steps");
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Max steps");
 				ImGui::SameLine();
 				ImGui::SetNextItemWidth(120.f);
 				if (ImGui::InputInt("##agent_max_steps", &st.max_steps, 1, 8,
@@ -758,7 +760,7 @@ namespace agent_manager {
 						const char* actions[] = { "allow", "deny", "ask" };
 						ImGui::SetNextItemWidth(-FLT_MIN);
 						if (is_native) {
-							ImGui::TextColored(ImVec4(0.8f, 0.82f, 0.9f, 1.f), "%s",
+							ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "%s",
 								actions[std::clamp(st.rules[i].action, 0, 2)]);
 						} else {
 							if (ImGui::Combo("##ra", &st.rules[i].action, actions, IM_ARRAYSIZE(actions))) {
@@ -812,7 +814,7 @@ namespace agent_manager {
 					st.section_tools_anim, th.accent_u32)) {
 				auto chip_strip = [&](const char* label, std::vector<std::string>& chips,
 					detail::chip_input_t& input, const char* hint, ImU32 chip_col) {
-					ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "%s", label);
+					ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "%s", label);
 					int remove_idx = -1;
 					float chip_x_start = ImGui::GetCursorScreenPos().x;
 					float chip_avail = ImGui::GetContentRegionAvail().x;
@@ -822,12 +824,12 @@ namespace agent_manager {
 					for (size_t i = 0; i < chips.size(); ++i) {
 						ImGui::PushID(static_cast<int>(i + 1000));
 						ImFont* font = ImGui::GetFont();
-						float fs = 14.f;
+						float fs = aida::ui::components::detail::sz_font(aida::ui::size_t_::sm);
 						float text_w = font->CalcTextSizeA(fs, FLT_MAX, 0.f, chips[i].c_str()).x;
-						float chip_w = text_w + 30.f;
+						float chip_w = text_w + 34.f;
 						if (chip_x - chip_x_start + chip_w > chip_avail) {
 							chip_x = chip_x_start;
-							chip_y += 26.f;
+							chip_y += 30.f;
 						}
 						ImGui::SetCursorScreenPos(ImVec2(chip_x, chip_y));
 						bool removed = false;

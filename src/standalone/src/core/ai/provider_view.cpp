@@ -850,13 +850,14 @@ namespace {
 		const float middle_x = glyph_cx + glyph_radius + 14.f;
 		const float middle_w = card_w * 0.36f;
 
+		const float card_fs = aida::ui::components::detail::ui_fs();
 		const std::string display_name = provider.name.empty() ? provider.id : provider.name;
-		dl->AddText(aida::ui::fonts::body_strong(), 14.f,
-			ImVec2(middle_x, card_a.y + 10.f),
+		dl->AddText(aida::ui::fonts::body_strong(), card_fs * 1.06f,
+			ImVec2(middle_x, card_a.y + 12.f),
 			aida::ui::with_alpha(th.text_primary, alpha), display_name.c_str());
 
 		status_summary_t status = status_for(provider.id);
-		ImGui::SetCursorScreenPos(ImVec2(middle_x, card_a.y + 30.f));
+		ImGui::SetCursorScreenPos(ImVec2(middle_x, card_a.y + 38.f));
 		aida::ui::pill_kind(status.label.c_str(), status.kind,
 			aida::ui::size_t_::sm, status.dot_pulse);
 
@@ -872,9 +873,9 @@ namespace {
 			char count_buf[64];
 			std::snprintf(count_buf, sizeof(count_buf), "%d models",
 				static_cast<int>(provider.model_ids.size()));
-			dl->AddText(aida::ui::fonts::caption(), 13.f,
-				ImVec2(middle_x, card_a.y + card_h - 22.f),
-				aida::ui::with_alpha(th.text_dim, alpha), count_buf);
+			dl->AddText(aida::ui::fonts::caption(), card_fs * 0.86f,
+				ImVec2(middle_x, card_a.y + card_h - 24.f),
+				aida::ui::with_alpha(th.text_secondary, alpha), count_buf);
 		}
 
 		const float right_x = middle_x + middle_w + 14.f;
@@ -917,7 +918,8 @@ namespace {
 		}
 		ImGui::PopItemWidth();
 
-		const float info_y = card_a.y + 36.f;
+		const float info_y = card_a.y + 40.f;
+		const float info_fs = card_fs * 0.86f;
 		double total_cost = 0.0;
 		if (current_model) {
 			total_cost = current_model->cost.input_per_million + current_model->cost.output_per_million;
@@ -925,14 +927,14 @@ namespace {
 				current_model->cost.input_per_million,
 				current_model->cost.output_per_million);
 			std::string ctx_label = "ctx: " + format_context(current_model->limit.context);
-			dl->AddText(aida::ui::fonts::caption(), 13.f,
+			dl->AddText(aida::ui::fonts::caption(), info_fs,
 				ImVec2(right_x, info_y),
-				aida::ui::with_alpha(th.text_dim, alpha), cost_label.c_str());
-			dl->AddText(aida::ui::fonts::caption(), 13.f,
-				ImVec2(right_x, info_y + 14.f),
-				aida::ui::with_alpha(th.text_dim, alpha), ctx_label.c_str());
+				aida::ui::with_alpha(th.text_secondary, alpha), cost_label.c_str());
+			dl->AddText(aida::ui::fonts::caption(), info_fs,
+				ImVec2(right_x, info_y + info_fs + 4.f),
+				aida::ui::with_alpha(th.text_secondary, alpha), ctx_label.c_str());
 
-			const float bar_y = info_y + 30.f;
+			const float bar_y = info_y + (info_fs + 4.f) * 2.f + 4.f;
 			const float bar_w = right_w * 0.6f;
 			const float bar_h = 4.f;
 			float ratio = static_cast<float>(total_cost / max_total_cost);
@@ -1027,8 +1029,8 @@ namespace {
 			} else {
 				std::snprintf(buf, sizeof(buf), "FAIL: %s", truncate_text(test_res.message, 90).c_str());
 			}
-			dl->AddText(aida::ui::fonts::caption(), 12.f,
-				ImVec2(right_x, card_b.y - 50.f), res_col, buf);
+			dl->AddText(aida::ui::fonts::caption(), card_fs * 0.84f,
+				ImVec2(right_x, card_b.y - 52.f), res_col, buf);
 		}
 
 		if (clicked) {
@@ -1075,12 +1077,13 @@ namespace {
 		}
 
 		ImGui::PushID("provider_detail_pane");
+		const float detail_fs = aida::ui::components::detail::ui_fs();
 		const std::string title = std::string("Details: ") + (prov->name.empty() ? prov->id : prov->name);
-		dl->AddText(aida::ui::fonts::h2(), 16.f, ImVec2(a.x + 14.f, a.y + 10.f),
+		dl->AddText(aida::ui::fonts::h2(), detail_fs * 1.2f, ImVec2(a.x + 14.f, a.y + 10.f),
 			aida::ui::with_alpha(th.text_primary, alpha), title.c_str());
 
 		ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 40.f));
-		dl->AddText(aida::ui::fonts::body_em(), 14.f,
+		dl->AddText(aida::ui::fonts::body_em(), detail_fs * 0.96f,
 			ImVec2(a.x + 14.f, a.y + 40.f),
 			aida::ui::with_alpha(th.text_secondary, alpha), "Base URL");
 
@@ -1090,7 +1093,7 @@ namespace {
 			"https://api.host", false, ImVec2(pane_w - 28.f, 32.f));
 
 		ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 100.f));
-		dl->AddText(aida::ui::fonts::body_em(), 14.f,
+		dl->AddText(aida::ui::fonts::body_em(), detail_fs * 0.96f,
 			ImVec2(a.x + 14.f, a.y + 100.f),
 			aida::ui::with_alpha(th.text_secondary, alpha), "Extra headers JSON");
 
@@ -1270,7 +1273,7 @@ void render(float panel_w, float panel_h)
 
 	const float list_inner_w = list_w - pad * 2.f;
 	const float card_w = list_inner_w;
-	const float card_h = 108.f;
+	const float card_h = 128.f;
 	const float gap = 12.f;
 
 	if (filtered.empty()) {

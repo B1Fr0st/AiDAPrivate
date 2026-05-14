@@ -1,4 +1,5 @@
 #include "blur.h"
+#include "../core/ui/theme.hpp"
 
 ID3D11Device* Blur::s_device = nullptr;
 ID3D11DeviceContext* Blur::s_ctx = nullptr;
@@ -179,9 +180,10 @@ void Blur::Draw(ImDrawList* dl, ImVec2 min, ImVec2 max)
     dl->AddImage((ImTextureID)s_srv[2], min, max);
     dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
 
-    dl->AddRectFilled(min, max, IM_COL32(15, 15, 25, 120), 8.0f);
-    dl->AddRect(min, max, IM_COL32(255, 255, 255, 30), 8.0f);
-    dl->AddLine(ImVec2(min.x + 2, min.y + 1), ImVec2(max.x - 2, min.y + 1), IM_COL32(255, 255, 255, 60));
+    const auto& th = aida::ui::resolved();
+    dl->AddRectFilled(min, max, aida::ui::with_alpha(th.glass_tint, 2.0f), 8.0f);
+    dl->AddRect(min, max, th.border_subtle, 8.0f);
+    dl->AddLine(ImVec2(min.x + 2, min.y + 1), ImVec2(max.x - 2, min.y + 1), aida::ui::with_alpha(th.border_strong, 1.5f));
 }
 
 void Blur::Resize(int w, int h)

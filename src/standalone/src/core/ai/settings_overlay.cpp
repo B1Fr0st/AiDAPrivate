@@ -408,15 +408,18 @@ namespace settings_overlay {
 				dl->AddRectFilled(a, b, bg, 8.f);
 			}
 
-			float gx = a.x + 18.f;
+			const float base_fs = aida::ui::components::detail::ui_fs();
+			float glyph_r = base_fs * 0.72f;
+			float gx = a.x + 14.f + glyph_r;
 			float gy = (a.y + b.y) * 0.5f;
 			ImU32 ic = is_active ? active_text : dim_text;
-			draw_tab_glyph(dl, ImVec2(gx, gy), 9.f, idx, ic);
+			draw_tab_glyph(dl, ImVec2(gx, gy), glyph_r, idx, ic);
 
 			ImFont* font = is_active ? aida::ui::fonts::body_strong() : aida::ui::fonts::body();
-			float fs = 13.f;
+			float fs = base_fs * 0.95f;
+			float label_x = gx + glyph_r + 10.f;
 			ImVec2 sz = font->CalcTextSizeA(fs, FLT_MAX, 0.f, label);
-			dl->AddText(font, fs, ImVec2(a.x + 36.f, a.y + (row_h - 4.f - sz.y) * 0.5f),
+			dl->AddText(font, fs, ImVec2(label_x, a.y + (row_h - 4.f - sz.y) * 0.5f),
 				is_active ? active_text : dim_text, label);
 
 			if (clicked) {
@@ -619,7 +622,8 @@ namespace settings_overlay {
 				aida::ui::status_dot(ImVec2(a.x + 14.f, (a.y + b.y) * 0.5f),
 					4.5f, dot_col, pulsing, 1.4f);
 
-				dl->AddText(aida::ui::fonts::body_strong(), 16.f,
+				dl->AddText(aida::ui::fonts::body_strong(),
+					aida::ui::components::detail::ui_fs() * 1.05f,
 					ImVec2(a.x + 32.f, a.y + 8.f), th.text_primary, srv.name.c_str());
 
 				ImGui::SetCursorScreenPos(ImVec2(a.x + 32.f, a.y + 30.f));
@@ -669,7 +673,8 @@ namespace settings_overlay {
 
 			ImDrawList* ddl = ImGui::GetWindowDrawList();
 			ImVec2 dp = ImGui::GetCursorScreenPos();
-			ddl->AddText(aida::ui::fonts::body_strong(), 19.f,
+			ddl->AddText(aida::ui::fonts::body_strong(),
+				aida::ui::components::detail::ui_fs() * 1.25f,
 				ImVec2(dp.x + 8.f, dp.y + 4.f),
 				th.text_primary, "Server Configuration");
 			ImGui::Dummy(ImVec2(0.f, 30.f));
@@ -677,32 +682,32 @@ namespace settings_overlay {
 			ImGui::Dummy(ImVec2(0.f, 4.f));
 
 			if (s_sel_index >= 0 && s_sel_index < static_cast<int>(servers.size())) {
-				ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Name");
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Name");
 				aida::ui::input_text("##mcp_name", s_name, sizeof(s_name),
 					"Server name", false, ImVec2(0.f, 36.f));
 
 				ImGui::Dummy(ImVec2(0.f, 4.f));
 				const char* transports[] = { "HTTP/SSE", "Stdio" };
-				ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Transport");
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Transport");
 				ImGui::SetNextItemWidth(-12.f);
 				ImGui::Combo("##mcp_transport", &s_transport, transports, 2);
 
 				if (s_transport == 0) {
 					ImGui::Dummy(ImVec2(0.f, 4.f));
-					ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "URL");
+					ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "URL");
 					aida::ui::input_text("##mcp_url", s_url, sizeof(s_url),
 						"https://server", false, ImVec2(0.f, 36.f));
 					ImGui::Dummy(ImVec2(0.f, 4.f));
-					ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "API Key");
+					ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "API Key");
 					aida::ui::input_text("##mcp_key", s_key, sizeof(s_key),
 						"secret", true, ImVec2(0.f, 36.f));
 				} else {
 					ImGui::Dummy(ImVec2(0.f, 4.f));
-					ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Command");
+					ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Command");
 					aida::ui::input_text("##mcp_cmd", s_cmd, sizeof(s_cmd),
 						"node server.js", false, ImVec2(0.f, 36.f));
 					ImGui::Dummy(ImVec2(0.f, 4.f));
-					ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Args");
+					ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Args");
 					aida::ui::input_text("##mcp_args", s_args, sizeof(s_args),
 						"--port 3001", false, ImVec2(0.f, 36.f));
 				}
@@ -842,20 +847,20 @@ namespace settings_overlay {
 			ImGui::Separator();
 			ImGui::Dummy(ImVec2(0.f, 6.f));
 
-			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f),
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
 				"Per-task request cap (0 = unlimited)");
 			ImGui::SetNextItemWidth(240.f);
 			changed |= ImGui::InputInt("##perm_max_req",
 				&g_sa_settings.auto_approve_max_requests, 0, 0);
 			ImGui::SameLine(0.f, 16.f);
-			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f),
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
 				"Per-task cost cap USD (0 = unlimited)");
 			ImGui::SetNextItemWidth(240.f);
 			changed |= ImGui::InputDouble("##perm_max_cost",
 				&g_sa_settings.auto_approve_max_cost, 0.0, 0.0, "%.2f");
 
 			ImGui::Dummy(ImVec2(0.f, 4.f));
-			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f),
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
 				"Allowed shell commands (CSV - prefixes ok)");
 			if (aida::ui::input_text("##perm_allow",
 					s.perm_allowed_commands, sizeof(s.perm_allowed_commands),
@@ -863,7 +868,7 @@ namespace settings_overlay {
 				changed = true;
 
 			ImGui::Dummy(ImVec2(0.f, 4.f));
-			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f),
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
 				"Denied shell commands (CSV)");
 			if (aida::ui::input_text("##perm_deny",
 					s.perm_denied_commands, sizeof(s.perm_denied_commands),
@@ -890,11 +895,12 @@ namespace settings_overlay {
 				aida::ui::with_alpha(th.panel_header, 0.85f * fade), 10.f);
 			dl->AddRect(a, b,
 				aida::ui::with_alpha(th.border_subtle, fade), 10.f, 0, 1.f);
-			dl->AddText(aida::ui::fonts::caption(), 13.f,
+			const float card_fs = aida::ui::components::detail::ui_fs();
+			dl->AddText(aida::ui::fonts::caption(), card_fs * 0.88f,
 				ImVec2(a.x + 14.f, a.y + 12.f),
 				aida::ui::with_alpha(th.text_dim, fade), title);
-			dl->AddText(aida::ui::fonts::display(), 28.f,
-				ImVec2(a.x + 14.f, a.y + 30.f),
+			dl->AddText(aida::ui::fonts::display(), card_fs * 1.7f,
+				ImVec2(a.x + 14.f, a.y + 32.f),
 				aida::ui::with_alpha(th.text_primary, fade), value);
 		}
 
@@ -932,20 +938,20 @@ namespace settings_overlay {
 			ImGui::Dummy(ImVec2(0.f, 32.f));
 
 			bool changed = false;
-			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f),
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
 				"Trigger when used / context >= ratio");
 			ImGui::SetNextItemWidth(-12.f);
 			changed |= ImGui::SliderFloat("##compact_ratio", &s.compaction_trigger_ratio,
 				0.50f, 0.98f, "%.2f");
 
 			ImGui::Dummy(ImVec2(0.f, 4.f));
-			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f),
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
 				"Preserve recent N messages (always keep)");
 			ImGui::SetNextItemWidth(240.f);
 			changed |= ImGui::InputInt("##compact_msg", &s.compaction_preserve_messages, 0, 0);
 			s.compaction_preserve_messages = (std::max)(0, s.compaction_preserve_messages);
 			ImGui::SameLine(0.f, 16.f);
-			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f),
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
 				"Preserve recent tokens budget");
 			ImGui::SetNextItemWidth(240.f);
 			changed |= ImGui::InputInt("##compact_tok", &s.compaction_preserve_tokens, 0, 0);
@@ -1007,12 +1013,12 @@ namespace settings_overlay {
 					static_cast<long long>(s.compaction_session_input),
 					static_cast<long long>(s.compaction_session_output),
 					static_cast<long long>(s.compaction_session_reasoning));
-				ImGui::TextColored(ImVec4(0.66f, 0.66f, 0.78f, 0.95f), "%s", det_buf);
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "%s", det_buf);
 				std::snprintf(det_buf, sizeof(det_buf),
 					"cache read: %lld   cache write: %lld",
 					static_cast<long long>(s.compaction_session_cache_read),
 					static_cast<long long>(s.compaction_session_cache_write));
-				ImGui::TextColored(ImVec4(0.66f, 0.66f, 0.78f, 0.95f), "%s", det_buf);
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "%s", det_buf);
 
 				ImGui::Dummy(ImVec2(0.f, 6.f));
 				if (aida::ui::button("Run /compact now",
@@ -1100,7 +1106,7 @@ namespace settings_overlay {
 				"the AiDA plugin into it. The AiDA plugin DLL is never written to disk.");
 			ImGui::Dummy(ImVec2(0.f, 6.f));
 
-			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "IDA executable path");
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "IDA executable path");
 			if (aida::ui::input_text("##ida_pro_path",
 					s_path_buf, sizeof(s_path_buf),
 					"C:\\Program Files\\IDA Pro\\ida.exe", false,
@@ -1213,7 +1219,7 @@ namespace settings_overlay {
 			if (busy)
 			{
 				ImGui::SameLine(0.f, 12.f);
-				ImGui::TextColored(ImVec4(0.85f, 0.75f, 0.40f, 1.f), "Working...");
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.warning), "Working...");
 			}
 
 			std::string status_snap = snapshot_ida_status();
@@ -1247,12 +1253,12 @@ namespace settings_overlay {
 			ImGui::Dummy(ImVec2(0.f, 32.f));
 
 			bool changed = false;
-			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Tab size");
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Tab size");
 			ImGui::SetNextItemWidth(240.f);
 			changed |= ImGui::InputInt("##ed_tab", &s.ed_tab_size, 0, 0);
 			s.ed_tab_size = (std::max)(s.ed_tab_size, 1);
 
-			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Font size");
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Font size");
 			ImGui::SetNextItemWidth(240.f);
 			changed |= ImGui::SliderFloat("##ed_font", &s.ed_font_size, 9.f, 32.f, "%.0f");
 
@@ -1273,8 +1279,8 @@ namespace settings_overlay {
 				th.text_primary, "Theme");
 			ImGui::Dummy(ImVec2(0.f, 32.f));
 
-			static const char* theme_names[] = { "Mio", "Claude Dark", "Claude Light" };
-			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f), "Active theme");
+			static const char* theme_names[] = { "AiDA Dark", "AiDA Light", "Claude Dark", "Claude Light" };
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Active theme");
 			ImGui::SetNextItemWidth(240.f);
 			int prev_idx = g_sa_settings.active_theme_idx;
 			if (ImGui::Combo("##theme_idx", &g_sa_settings.active_theme_idx, theme_names,
@@ -1301,7 +1307,7 @@ namespace settings_overlay {
 				&g_sa_settings.auto_save_enabled, aida::ui::size_t_::md);
 			ImGui::Dummy(ImVec2(0.f, 4.f));
 			if (!g_sa_settings.auto_save_enabled) ImGui::BeginDisabled();
-			ImGui::TextColored(ImVec4(0.7f, 0.72f, 0.85f, 1.f),
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
 				"Auto-save interval (seconds)");
 			ImGui::SetNextItemWidth(240.f);
 			autosave_changed |= ImGui::InputInt("##autosave_int",
@@ -1426,7 +1432,7 @@ namespace settings_overlay {
 			ImVec2(wp.x + 44.f, wp.y + 11.f),
 			th.text_primary, "Settings");
 
-		const float side_w = 152.f;
+		const float side_w = 190.f;
 		const float content_y = header_h + 4.f;
 		const float content_h = panel_h - content_y - 8.f;
 		const float content_w = panel_w - side_w - 8.f;
@@ -1446,7 +1452,7 @@ namespace settings_overlay {
 				"Editor",
 				"IDA Pro"
 			};
-			const float row_h = 36.f;
+			const float row_h = 44.f;
 			ImGui::Dummy(ImVec2(0, 8.f));
 			for (int i = 0; i < tab_count; ++i) {
 				detail::render_tab_label(i, tab_labels[i], side_w, row_h,

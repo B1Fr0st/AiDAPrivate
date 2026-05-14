@@ -162,7 +162,7 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a)
 		dl->AddCircleFilled(ImVec2(knob_x, knob_y), knob_r,
 			on ? aida::ui::with_alpha(t.accent_u32, a)
 			   : aida::ui::with_alpha(t.text_dim, a * 0.85f), 24);
-		ImU32 lbl_col = on ? aida::ui::with_alpha(IM_COL32(255, 255, 255, 250), a)
+		ImU32 lbl_col = on ? aida::ui::with_alpha(t.text_primary, a)
 		                   : aida::ui::with_alpha(t.text_secondary, a);
 		float lbl_x = on ? (cx + 12.f) : (cx + pill_w - lbl_w - 14.f);
 		dl->AddText(hex_fn, hex_fn->FontSize,
@@ -362,7 +362,7 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 				aida::ui::with_alpha(t.hover_wash, a * row_entrance));
 		} else if (i & 1) {
 			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + row_h),
-				aida::ui::with_alpha(IM_COL32(255, 255, 255, 4), a * row_entrance));
+				aida::ui::with_alpha(t.hover_wash, 0.22f * a * row_entrance));
 		}
 
 		float flash = (i < static_cast<int>(ui.row_flash.size())) ? ui.row_flash[static_cast<size_t>(i)] : 0.f;
@@ -592,7 +592,7 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 				aida::ui::with_alpha(t.hover_wash, a));
 		} else if (i & 1) {
 			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + row_h),
-				aida::ui::with_alpha(IM_COL32(255, 255, 255, 4), a));
+				aida::ui::with_alpha(t.hover_wash, 0.22f * a));
 		}
 
 		auto& e = sc.address_list[static_cast<size_t>(i)];

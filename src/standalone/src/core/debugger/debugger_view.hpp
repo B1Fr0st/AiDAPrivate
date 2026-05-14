@@ -56,6 +56,7 @@ struct ui_state_t {
 
 	float tab_scroll_x        = 0.f;
 	float tab_target_scroll_x = 0.f;
+	int   tab_last_ensured    = -1;
 	float underline_x         = 0.f;
 	float underline_w         = 0.f;
 	float underline_vel       = 0.f;

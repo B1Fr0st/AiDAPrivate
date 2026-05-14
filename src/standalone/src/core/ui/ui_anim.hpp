@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include "imgui/imgui.h"
+#include "theme.hpp"
 
 namespace ui_anim {
 
@@ -105,13 +106,13 @@ inline void render_custom_scrollbar(ImDrawList* dl, float ox, float oy, float ba
 	float thumb_y = oy + track_range * scroll_ratio;
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + bar_w, oy + bar_h),
-					  IM_COL32(20, 22, 28, static_cast<int>(60 * alpha)), 2.f);
+					  theme_alpha(aida::ui::resolved().bg_base, 0.24f * alpha), 2.f);
 
 	ImVec2 thumb_min(ox, thumb_y);
 	ImVec2 thumb_max(ox + bar_w, thumb_y + thumb_h);
 	bool hovered = ImGui::IsMouseHoveringRect(thumb_min, thumb_max, false);
 
-	ImU32 thumb_col = IM_COL32(80, 85, 100, static_cast<int>((dragging ? 180 : hovered ? 140 : 90) * alpha));
+	ImU32 thumb_col = theme_alpha(aida::ui::resolved().accent_dim, (dragging ? 1.f : hovered ? 0.78f : 0.5f) * alpha);
 	dl->AddRectFilled(thumb_min, thumb_max, thumb_col, 2.f);
 
 	if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -213,7 +214,7 @@ inline bool row_hover_select(ImDrawList* dl, float x, float y, float w, float h,
 			IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
 					 static_cast<int>(ab * 255), static_cast<int>(30 * alpha)));
 	} else if (hovered) {
-		dl->AddRectFilled(rmin, rmax, IM_COL32(255, 255, 255, static_cast<int>(8 * alpha)));
+		dl->AddRectFilled(rmin, rmax, theme_alpha(aida::ui::resolved().hover_wash, 0.45f * alpha));
 	}
 
 	if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -296,6 +297,29 @@ inline void render_gradient_header(ImDrawList* dl, float x, float y, float w, fl
 		left, right, right, left);
 }
 
+inline void render_tab_underline_glow(ImDrawList* dl, float underline_x, float underline_w,
+									   float baseline_y, float alpha)
+{
+	if (underline_w <= 0.5f) return;
+	const auto& t = aida::ui::resolved();
+	for (int g = 0; g < 3; ++g) {
+		float spread = 2.f + static_cast<float>(g) * 2.f;
+		float ga = (0.20f - static_cast<float>(g) * 0.06f) * alpha;
+		dl->AddRectFilled(
+			ImVec2(underline_x - spread, baseline_y - spread),
+			ImVec2(underline_x + underline_w + spread, baseline_y + 2.f + spread),
+			aida::ui::with_alpha(t.accent_glow, ga * 4.f),
+			3.f + static_cast<float>(g));
+	}
+	dl->AddRectFilledMultiColor(
+		ImVec2(underline_x, baseline_y),
+		ImVec2(underline_x + underline_w, baseline_y + 2.5f),
+		aida::ui::with_alpha(t.accent_grad_top, alpha),
+		aida::ui::with_alpha(t.accent_grad_bot, alpha),
+		aida::ui::with_alpha(t.accent_grad_bot, alpha),
+		aida::ui::with_alpha(t.accent_grad_top, alpha));
+}
+
 inline void render_status_dot(ImDrawList* dl, float cx, float cy, float radius,
 							  ImU32 color, float time, bool pulsing)
 {
@@ -311,24 +335,24 @@ inline void render_status_dot(ImDrawList* dl, float cx, float cy, float radius,
 
 inline ImU32 http_method_color(const char* method, float alpha)
 {
-	if (!method || !method[0]) return IM_COL32(180, 180, 180, static_cast<int>(alpha * 255));
+	if (!method || !method[0]) return theme_alpha(aida::ui::resolved().text_secondary, alpha);
 	char c0 = method[0];
 	char c1 = method[1] ? method[1] : 0;
-	if (c0 == 'G') return IM_COL32(80, 200, 120, static_cast<int>(alpha * 255));
-	if (c0 == 'P' && c1 == 'O') return IM_COL32(100, 150, 255, static_cast<int>(alpha * 255));
-	if (c0 == 'P' && c1 == 'U') return IM_COL32(240, 170, 60, static_cast<int>(alpha * 255));
-	if (c0 == 'P' && c1 == 'A') return IM_COL32(180, 120, 255, static_cast<int>(alpha * 255));
-	if (c0 == 'D') return IM_COL32(230, 70, 70, static_cast<int>(alpha * 255));
-	if (c0 == 'H') return IM_COL32(200, 200, 200, static_cast<int>(alpha * 255));
-	if (c0 == 'O') return IM_COL32(170, 200, 230, static_cast<int>(alpha * 255));
-	return IM_COL32(180, 180, 180, static_cast<int>(alpha * 255));
+	if (c0 == 'G') return theme_alpha(aida::ui::resolved().success, alpha);
+	if (c0 == 'P' && c1 == 'O') return theme_alpha(aida::ui::resolved().info, alpha);
+	if (c0 == 'P' && c1 == 'U') return theme_alpha(aida::ui::resolved().warning, alpha);
+	if (c0 == 'P' && c1 == 'A') return theme_alpha(aida::ui::resolved().syn_keyword, alpha);
+	if (c0 == 'D') return theme_alpha(aida::ui::resolved().error, alpha);
+	if (c0 == 'H') return theme_alpha(aida::ui::resolved().text_secondary, alpha);
+	if (c0 == 'O') return theme_alpha(aida::ui::resolved().info, alpha);
+	return theme_alpha(aida::ui::resolved().text_secondary, alpha);
 }
 
 inline ImU32 value_change_color(int64_t curr, int64_t prev, float alpha)
 {
-	if (curr > prev) return IM_COL32(80, 220, 100, static_cast<int>(alpha * 255));
-	if (curr < prev) return IM_COL32(230, 80, 80, static_cast<int>(alpha * 255));
-	return IM_COL32(200, 200, 200, static_cast<int>(alpha * 255));
+	if (curr > prev) return theme_alpha(aida::ui::resolved().success, alpha);
+	if (curr < prev) return theme_alpha(aida::ui::resolved().error, alpha);
+	return theme_alpha(aida::ui::resolved().text_secondary, alpha);
 }
 
 inline ImU32 byte_heat_color(uint8_t val, float alpha)
@@ -436,10 +460,10 @@ inline void render_toolbar(ImDrawList* dl, float x, float y, float w, float h,
 						   float ar, float ag, float ab, float alpha)
 {
 	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
-		IM_COL32(22, 24, 32, static_cast<int>(230 * alpha)));
+		theme_alpha(aida::ui::resolved().panel_bg, 0.9f * alpha));
 	render_gradient_header(dl, x, y, w, h, ar, ag, ab, alpha * 0.4f);
 	dl->AddLine(ImVec2(x, y + h - 1.f), ImVec2(x + w, y + h - 1.f),
-		IM_COL32(60, 65, 80, static_cast<int>(120 * alpha)));
+		theme_alpha(aida::ui::resolved().border_strong, 0.47f * alpha));
 	dl->AddRectFilledMultiColor(
 		ImVec2(x, y + h), ImVec2(x + w, y + h + 3.f),
 		IM_COL32(0, 0, 0, static_cast<int>(25 * alpha)),
@@ -452,7 +476,7 @@ inline void render_section_header(ImDrawList* dl, float x, float y, float w, flo
 								  int badge_count = -1)
 {
 	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
-		IM_COL32(25, 27, 36, static_cast<int>(220 * alpha)));
+		theme_alpha(aida::ui::resolved().panel_bg, 0.86f * alpha));
 	render_gradient_header(dl, x, y, w, h, ar, ag, ab, alpha * 0.3f);
 
 	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + 3.f, y + h),
@@ -476,7 +500,7 @@ inline void render_section_header(ImDrawList* dl, float x, float y, float w, flo
 	}
 
 	dl->AddLine(ImVec2(x, y + h - 1.f), ImVec2(x + w, y + h - 1.f),
-		IM_COL32(60, 65, 80, static_cast<int>(100 * alpha)));
+		theme_alpha(aida::ui::resolved().border_strong, 0.39f * alpha));
 }
 
 inline void render_empty_state(ImDrawList* dl, float x, float y, float w, float h,
@@ -506,7 +530,7 @@ inline void render_empty_state(ImDrawList* dl, float x, float y, float w, float 
 	dl->AddLine(ImVec2(dcx - 7.f, dcy + 7.f), ImVec2(dcx + 7.f, dcy - 7.f), line_col, 2.f);
 
 	dl->AddText(ImVec2(text_x, text_y),
-		IM_COL32(180, 185, 195, static_cast<int>(text_a * alpha * 255)), message);
+		theme_alpha(aida::ui::resolved().text_secondary, text_a * alpha), message);
 }
 
 inline void render_stat_card(ImDrawList* dl, float x, float y, float w, float h,
@@ -515,9 +539,9 @@ inline void render_stat_card(ImDrawList* dl, float x, float y, float w, float h,
 							 ImU32 value_col = 0)
 {
 	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
-		IM_COL32(28, 30, 40, static_cast<int>(200 * alpha)), 6.f);
+		theme_alpha(aida::ui::resolved().panel_bg, 0.78f * alpha), 6.f);
 	dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h),
-		IM_COL32(50, 55, 70, static_cast<int>(100 * alpha)), 6.f);
+		theme_alpha(aida::ui::resolved().border_strong, 0.39f * alpha), 6.f);
 
 	ImU32 top_line = IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
 							   static_cast<int>(ab * 255), static_cast<int>(alpha * 120));
@@ -525,10 +549,10 @@ inline void render_stat_card(ImDrawList* dl, float x, float y, float w, float h,
 
 	ImVec2 lsz = ImGui::CalcTextSize(label);
 	dl->AddText(ImVec2(x + (w - lsz.x) * 0.5f, y + 6.f),
-		IM_COL32(140, 145, 160, static_cast<int>(alpha * 200)), label);
+		theme_alpha(aida::ui::resolved().text_dim, alpha), label);
 
 	if (value_col == 0)
-		value_col = IM_COL32(220, 225, 235, static_cast<int>(alpha * 255));
+		value_col = theme_alpha(aida::ui::resolved().text_primary, alpha);
 	else
 		value_col = theme_alpha(value_col, alpha);
 
@@ -561,7 +585,7 @@ inline void render_progress_bar_animated(ImDrawList* dl, float x, float y, float
 										 float time)
 {
 	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
-		IM_COL32(20, 22, 30, static_cast<int>(200 * alpha)), h * 0.5f);
+		theme_alpha(aida::ui::resolved().bg_base, 0.78f * alpha), h * 0.5f);
 
 	float fill_w = w * std::clamp(progress, 0.f, 1.f);
 	if (fill_w > 1.f) {
@@ -600,7 +624,7 @@ inline void render_progress_bar_animated(ImDrawList* dl, float x, float y, float
 	ImVec2 psz = ImGui::CalcTextSize(pct);
 	if (psz.x + 4.f < w)
 		dl->AddText(ImVec2(x + (w - psz.x) * 0.5f, y + (h - psz.y) * 0.5f),
-			IM_COL32(255, 255, 255, static_cast<int>(alpha * 200)), pct);
+			theme_alpha(aida::ui::resolved().text_primary, alpha), pct);
 }
 
 inline void render_glow_rect(ImDrawList* dl, float x, float y, float w, float h,
@@ -647,7 +671,7 @@ inline bool render_pill_button(ImDrawList* dl, const char* label, float x, float
 	}
 
 	dl->AddText(ImVec2(x + pad, y + 4.f),
-		IM_COL32(255, 255, 255, static_cast<int>(alpha * (200 + hover_anim * 55))), label);
+		theme_alpha(aida::ui::resolved().text_primary, alpha * (0.78f + hover_anim * 0.22f)), label);
 
 	return clicked;
 }
@@ -662,7 +686,7 @@ inline void render_toggle_switch(ImDrawList* dl, float x, float y, bool active, 
 	float target = active ? 1.f : 0.f;
 	anim = smooth_lerp(anim, target, 12.f, dt);
 
-	ImU32 bg_off = IM_COL32(60, 62, 72, static_cast<int>(200 * alpha));
+	ImU32 bg_off = theme_alpha(aida::ui::resolved().panel_header, 0.78f * alpha);
 	ImU32 bg_on = IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
 						    static_cast<int>(ab * 255), static_cast<int>(200 * alpha));
 	ImU32 bg = color_lerp(bg_off, bg_on, anim);
@@ -761,7 +785,7 @@ inline void render_hub_tab_bar(ImDrawList* dl, ImVec2 origin, float x, float y, 
 		ImVec2 ts = ImGui::CalcTextSize(names[i]);
 		float text_alpha = is_active ? 0.95f : (hovered ? 0.7f : 0.5f);
 		dl->AddText(ImVec2(bx0 + (tab_widths[i] - ts.x) * 0.5f, by0 + (tab_h - ts.y) * 0.5f),
-			IM_COL32(255, 255, 255, static_cast<int>(text_alpha * alpha * 255)),
+			theme_alpha(aida::ui::resolved().text_primary, text_alpha * alpha),
 			names[i]);
 	}
 
@@ -783,23 +807,23 @@ inline void render_hub_tab_bar(ImDrawList* dl, ImVec2 origin, float x, float y, 
 	if (scroll_x > 1.f) {
 		dl->AddRectFilledMultiColor(
 			ImVec2(clip_x0, clip_y0), ImVec2(clip_x0 + 30.f, clip_y1),
-			IM_COL32(18, 20, 26, static_cast<int>(240 * alpha)),
-			IM_COL32(18, 20, 26, 0),
-			IM_COL32(18, 20, 26, 0),
-			IM_COL32(18, 20, 26, static_cast<int>(240 * alpha)));
+			theme_alpha(aida::ui::resolved().bg_base, 0.94f * alpha),
+			theme_alpha(aida::ui::resolved().bg_base, 0.f),
+			theme_alpha(aida::ui::resolved().bg_base, 0.f),
+			theme_alpha(aida::ui::resolved().bg_base, 0.94f * alpha));
 	}
 	if (scroll_x < max_scroll - 1.f) {
 		dl->AddRectFilledMultiColor(
 			ImVec2(clip_x1 - 30.f, clip_y0), ImVec2(clip_x1, clip_y1),
-			IM_COL32(18, 20, 26, 0),
-			IM_COL32(18, 20, 26, static_cast<int>(240 * alpha)),
-			IM_COL32(18, 20, 26, static_cast<int>(240 * alpha)),
-			IM_COL32(18, 20, 26, 0));
+			theme_alpha(aida::ui::resolved().bg_base, 0.f),
+			theme_alpha(aida::ui::resolved().bg_base, 0.94f * alpha),
+			theme_alpha(aida::ui::resolved().bg_base, 0.94f * alpha),
+			theme_alpha(aida::ui::resolved().bg_base, 0.f));
 	}
 
 	dl->AddLine(ImVec2(origin.x + x, origin.y + y + tab_h),
 		ImVec2(origin.x + x + w, origin.y + y + tab_h),
-		IM_COL32(80, 80, 100, static_cast<int>(0.3f * alpha * 255)));
+		theme_alpha(aida::ui::resolved().border_strong, 0.3f * alpha));
 	dl->AddRectFilledMultiColor(
 		ImVec2(origin.x + x, origin.y + y + tab_h + 1.f),
 		ImVec2(origin.x + x + w, origin.y + y + tab_h + 4.f),
@@ -834,10 +858,10 @@ inline void render_table_header(ImDrawList* dl, float x, float y, float w, float
 								float ar, float ag, float ab, float alpha)
 {
 	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + row_h),
-		IM_COL32(30, 32, 44, static_cast<int>(230 * alpha)));
+		theme_alpha(aida::ui::resolved().panel_bg, 0.9f * alpha));
 	render_gradient_header(dl, x, y, w, row_h, ar, ag, ab, alpha * 0.25f);
 	dl->AddLine(ImVec2(x, y + row_h - 1.f), ImVec2(x + w, y + row_h - 1.f),
-		IM_COL32(60, 65, 80, static_cast<int>(120 * alpha)));
+		theme_alpha(aida::ui::resolved().border_strong, 0.47f * alpha));
 
 	ImU32 hdr_col = IM_COL32(static_cast<int>(ar * 180 + 60), static_cast<int>(ag * 180 + 60),
 							  static_cast<int>(ab * 180 + 60), static_cast<int>(220 * alpha));
@@ -848,7 +872,7 @@ inline void render_table_header(ImDrawList* dl, float x, float y, float w, float
 		cx += cols[i].width;
 		if (i < col_count - 1)
 			dl->AddLine(ImVec2(cx - 4.f, y + 4.f), ImVec2(cx - 4.f, y + row_h - 4.f),
-				IM_COL32(60, 65, 80, static_cast<int>(50 * alpha)));
+				theme_alpha(aida::ui::resolved().border_subtle, 0.6f * alpha));
 	}
 }
 
@@ -888,9 +912,9 @@ inline void render_panel_card(ImDrawList* dl, float x, float y, float w, float h
 							  float rounding = 6.f, bool header_stripe = true)
 {
 	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
-		IM_COL32(24, 26, 36, static_cast<int>(210 * alpha)), rounding);
+		theme_alpha(aida::ui::resolved().panel_bg, 0.82f * alpha), rounding);
 	dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h),
-		IM_COL32(50, 55, 70, static_cast<int>(80 * alpha)), rounding);
+		theme_alpha(aida::ui::resolved().border_strong, 0.31f * alpha), rounding);
 	if (header_stripe) {
 		dl->AddLine(ImVec2(x + rounding, y), ImVec2(x + w - rounding, y),
 			IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
@@ -953,7 +977,7 @@ inline void render_popup_frame(ImDrawList* dl, float cx, float cy, float w, floa
 	}
 
 	dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
-		IM_COL32(20, 22, 30, static_cast<int>(248 * fa)), 8.f);
+		theme_alpha(aida::ui::resolved().bg_elevated, 0.97f * fa), 8.f);
 	dl->AddRect(ImVec2(px, py), ImVec2(px + pw, py + ph),
 		IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
 				 static_cast<int>(ab * 255), static_cast<int>(70 * fa)), 8.f, 0, 1.5f);
@@ -963,7 +987,7 @@ inline void render_popup_header(ImDrawList* dl, float px, float py, float pw, fl
 								const char* title, float ar, float ag, float ab, float fa)
 {
 	dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + h),
-		IM_COL32(28, 30, 40, static_cast<int>(220 * fa)), 8.f, ImDrawFlags_RoundCornersTop);
+		theme_alpha(aida::ui::resolved().panel_header, 0.86f * fa), 8.f, ImDrawFlags_RoundCornersTop);
 	render_gradient_header(dl, px, py, pw, h, ar, ag, ab, fa * 0.35f);
 	dl->AddLine(ImVec2(px, py + h), ImVec2(px + pw, py + h),
 		IM_COL32(static_cast<int>(ar * 100), static_cast<int>(ag * 100),
@@ -988,12 +1012,12 @@ inline bool render_popup_close_button(ImDrawList* dl, float px, float py, float 
 
 	if (hover_anim > 0.01f)
 		dl->AddRectFilled(rmin, rmax,
-			IM_COL32(200, 60, 60, static_cast<int>(hover_anim * 80 * fa)), 4.f);
+			theme_alpha(aida::ui::resolved().error, hover_anim * 0.31f * fa), 4.f);
 
 	float cx = bx + btn_sz * 0.5f;
 	float cy = by + btn_sz * 0.5f;
 	float s = 5.f;
-	ImU32 xc = IM_COL32(180, 180, 200, static_cast<int>((140 + hover_anim * 115) * fa));
+	ImU32 xc = theme_alpha(aida::ui::resolved().text_secondary, (0.55f + hover_anim * 0.45f) * fa);
 	dl->AddLine(ImVec2(cx - s, cy - s), ImVec2(cx + s, cy + s), xc, 1.5f);
 	dl->AddLine(ImVec2(cx + s, cy - s), ImVec2(cx - s, cy + s), xc, 1.5f);
 
@@ -1028,7 +1052,7 @@ inline void render_donut_chart(ImDrawList* dl, float cx, float cy, float radius,
 	if (center_label) {
 		ImVec2 tsz = ImGui::CalcTextSize(center_label);
 		dl->AddText(ImVec2(cx - tsz.x * 0.5f, cy - tsz.y * 0.5f),
-			IM_COL32(200, 205, 220, static_cast<int>(200 * alpha)), center_label);
+			theme_alpha(aida::ui::resolved().text_secondary, alpha), center_label);
 	}
 }
 
@@ -1114,10 +1138,10 @@ inline void render_collapsible_header(ImDrawList* dl, float x, float y, float w,
 	arrow_anim = smooth_lerp(arrow_anim, expanded ? 1.f : 0.f, 12.f, dt);
 
 	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
-		IM_COL32(28, 30, 42, static_cast<int>(220 * alpha)));
+		theme_alpha(aida::ui::resolved().panel_header, 0.86f * alpha));
 	render_gradient_header(dl, x, y, w, h, ar, ag, ab, alpha * 0.2f);
 	dl->AddLine(ImVec2(x, y + h - 1.f), ImVec2(x + w, y + h - 1.f),
-		IM_COL32(50, 55, 70, static_cast<int>(80 * alpha)));
+		theme_alpha(aida::ui::resolved().border_strong, 0.31f * alpha));
 
 	float arrow_cx = x + 14.f;
 	float arrow_cy = y + h * 0.5f;
@@ -1136,7 +1160,7 @@ inline void render_collapsible_header(ImDrawList* dl, float x, float y, float w,
 	dl->AddTriangleFilled(p0, p1, p2, arrow_col);
 
 	dl->AddText(ImVec2(x + 28.f, y + (h - ImGui::CalcTextSize(title).y) * 0.5f),
-		IM_COL32(220, 225, 235, static_cast<int>(220 * alpha)), title);
+		theme_alpha(aida::ui::resolved().text_primary, alpha), title);
 }
 
 inline void render_color_legend(ImDrawList* dl, float x, float y,
@@ -1153,7 +1177,7 @@ inline void render_color_legend(ImDrawList* dl, float x, float y,
 		cx += dot_r * 2.f + spacing;
 		ImVec2 tsz = ImGui::CalcTextSize(labels[i]);
 		dl->AddText(ImVec2(cx, y),
-			IM_COL32(180, 185, 195, static_cast<int>(180 * alpha)), labels[i]);
+			theme_alpha(aida::ui::resolved().text_secondary, alpha), labels[i]);
 		cx += tsz.x + item_gap;
 	}
 }
@@ -1162,17 +1186,17 @@ inline void render_confidence_bar(ImDrawList* dl, float x, float y, float w, flo
 								  float confidence, float alpha)
 {
 	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
-		IM_COL32(30, 32, 40, static_cast<int>(180 * alpha)), h * 0.5f);
+		theme_alpha(aida::ui::resolved().bg_base, 0.7f * alpha), h * 0.5f);
 
 	float fill = w * std::clamp(confidence, 0.f, 1.f);
 	if (fill > 1.f) {
 		ImU32 col;
 		if (confidence > 0.75f)
-			col = IM_COL32(80, 200, 120, static_cast<int>(200 * alpha));
+			col = theme_alpha(aida::ui::resolved().success, alpha);
 		else if (confidence > 0.5f)
-			col = IM_COL32(220, 200, 80, static_cast<int>(200 * alpha));
+			col = theme_alpha(aida::ui::resolved().warning, alpha);
 		else
-			col = IM_COL32(230, 120, 80, static_cast<int>(200 * alpha));
+			col = theme_alpha(aida::ui::resolved().error, alpha);
 		dl->AddRectFilled(ImVec2(x, y), ImVec2(x + fill, y + h), col, h * 0.5f);
 	}
 }
@@ -1204,16 +1228,16 @@ inline void render_severity_badge(ImDrawList* dl, float x, float y, int severity
 {
 	const char* labels[] = { "LOW", "MED", "HIGH", "CRIT" };
 	ImU32 colors[] = {
-		IM_COL32(80, 200, 120, static_cast<int>(200 * alpha)),
-		IM_COL32(220, 200, 80, static_cast<int>(200 * alpha)),
-		IM_COL32(240, 140, 60, static_cast<int>(200 * alpha)),
-		IM_COL32(230, 70, 70, static_cast<int>(200 * alpha))
+		theme_alpha(aida::ui::resolved().success, alpha),
+		theme_alpha(aida::ui::resolved().warning, alpha),
+		theme_alpha(aida::ui::resolved().warning, 0.78f * alpha),
+		theme_alpha(aida::ui::resolved().error, alpha)
 	};
 	ImU32 bg_colors[] = {
-		IM_COL32(80, 200, 120, static_cast<int>(30 * alpha)),
-		IM_COL32(220, 200, 80, static_cast<int>(30 * alpha)),
-		IM_COL32(240, 140, 60, static_cast<int>(30 * alpha)),
-		IM_COL32(230, 70, 70, static_cast<int>(30 * alpha))
+		theme_alpha(aida::ui::resolved().success, 0.12f * alpha),
+		theme_alpha(aida::ui::resolved().warning, 0.12f * alpha),
+		theme_alpha(aida::ui::resolved().warning, 0.12f * alpha),
+		theme_alpha(aida::ui::resolved().error, 0.12f * alpha)
 	};
 	int idx = std::clamp(severity, 0, 3);
 	render_badge(dl, labels[idx], x, y, bg_colors[idx], colors[idx]);
@@ -1228,20 +1252,20 @@ inline void render_protection_badge(ImDrawList* dl, float x, float y, uint32_t p
 	float cx = x;
 	if (read) {
 		render_badge(dl, "R", cx, y,
-			IM_COL32(80, 140, 220, static_cast<int>(30 * alpha)),
-			IM_COL32(80, 140, 220, static_cast<int>(200 * alpha)));
+			theme_alpha(aida::ui::resolved().info, 0.12f * alpha),
+			theme_alpha(aida::ui::resolved().info, alpha));
 		cx += ImGui::CalcTextSize("R").x + 14.f;
 	}
 	if (write) {
 		render_badge(dl, "W", cx, y,
-			IM_COL32(80, 200, 80, static_cast<int>(30 * alpha)),
-			IM_COL32(80, 200, 80, static_cast<int>(200 * alpha)));
+			theme_alpha(aida::ui::resolved().success, 0.12f * alpha),
+			theme_alpha(aida::ui::resolved().success, alpha));
 		cx += ImGui::CalcTextSize("W").x + 14.f;
 	}
 	if (exec) {
 		render_badge(dl, "X", cx, y,
-			IM_COL32(220, 80, 80, static_cast<int>(30 * alpha)),
-			IM_COL32(220, 80, 80, static_cast<int>(200 * alpha)));
+			theme_alpha(aida::ui::resolved().error, 0.12f * alpha),
+			theme_alpha(aida::ui::resolved().error, alpha));
 	}
 }
 
@@ -1259,7 +1283,7 @@ inline void render_formatted_size(ImDrawList* dl, float x, float y, uint64_t byt
 		std::snprintf(buf, sizeof(buf), "%llu B", static_cast<unsigned long long>(bytes));
 
 	dl->AddText(ImVec2(x, y),
-		IM_COL32(200, 205, 220, static_cast<int>(200 * alpha)), buf);
+		theme_alpha(aida::ui::resolved().text_secondary, alpha), buf);
 }
 
 inline void render_hex_address(ImDrawList* dl, float x, float y, uint64_t addr, float alpha,
@@ -1268,7 +1292,7 @@ inline void render_hex_address(ImDrawList* dl, float x, float y, uint64_t addr, 
 	char buf[20];
 	std::snprintf(buf, sizeof(buf), "%016llX", static_cast<unsigned long long>(addr));
 	if (color == 0)
-		color = IM_COL32(229, 192, 123, static_cast<int>(220 * alpha));
+		color = theme_alpha(aida::ui::resolved().text_address, alpha);
 	else
 		color = theme_alpha(color, alpha);
 	dl->AddText(ImVec2(x, y), color, buf);
@@ -1288,9 +1312,9 @@ inline void render_context_menu_bg(ImDrawList* dl, float x, float y, float w, fl
 	dl->AddRectFilled(ImVec2(px - 2.f, py + 2.f), ImVec2(px + pw + 2.f, py + ph + 4.f),
 		IM_COL32(0, 0, 0, static_cast<int>(60 * fa)), 8.f);
 	dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
-		IM_COL32(26, 28, 38, static_cast<int>(245 * fa)), 6.f);
+		theme_alpha(aida::ui::resolved().bg_overlay, 0.96f * fa), 6.f);
 	dl->AddRect(ImVec2(px, py), ImVec2(px + pw, py + ph),
-		IM_COL32(60, 65, 80, static_cast<int>(100 * fa)), 6.f, 0, 1.f);
+		theme_alpha(aida::ui::resolved().border_strong, 0.39f * fa), 6.f, 0, 1.f);
 }
 
 enum class callout_kind_t { info, warn, success, error };
@@ -1304,28 +1328,28 @@ inline void render_inline_callout(ImDrawList* dl, float x, float y, float w, flo
 	const char* glyph = "";
 	switch (kind) {
 	case callout_kind_t::info:
-		accent_col = IM_COL32(100, 160, 230, static_cast<int>(230 * alpha));
-		fill_col   = IM_COL32(100, 160, 230, static_cast<int>(22 * alpha));
+		accent_col = theme_alpha(aida::ui::resolved().info, 0.9f * alpha);
+		fill_col   = theme_alpha(aida::ui::resolved().info, 0.086f * alpha);
 		glyph = "i";
 		break;
 	case callout_kind_t::warn:
-		accent_col = IM_COL32(230, 180, 80, static_cast<int>(230 * alpha));
-		fill_col   = IM_COL32(230, 180, 80, static_cast<int>(22 * alpha));
+		accent_col = theme_alpha(aida::ui::resolved().warning, 0.9f * alpha);
+		fill_col   = theme_alpha(aida::ui::resolved().warning, 0.086f * alpha);
 		glyph = "!";
 		break;
 	case callout_kind_t::success:
-		accent_col = IM_COL32(120, 200, 130, static_cast<int>(230 * alpha));
-		fill_col   = IM_COL32(120, 200, 130, static_cast<int>(22 * alpha));
+		accent_col = theme_alpha(aida::ui::resolved().success, 0.9f * alpha);
+		fill_col   = theme_alpha(aida::ui::resolved().success, 0.086f * alpha);
 		glyph = "+";
 		break;
 	case callout_kind_t::error:
-		accent_col = IM_COL32(230, 90, 90, static_cast<int>(230 * alpha));
-		fill_col   = IM_COL32(230, 90, 90, static_cast<int>(22 * alpha));
+		accent_col = theme_alpha(aida::ui::resolved().error, 0.9f * alpha);
+		fill_col   = theme_alpha(aida::ui::resolved().error, 0.086f * alpha);
 		glyph = "x";
 		break;
 	default:
-		accent_col = IM_COL32(180, 180, 200, static_cast<int>(200 * alpha));
-		fill_col   = IM_COL32(180, 180, 200, static_cast<int>(20 * alpha));
+		accent_col = theme_alpha(aida::ui::resolved().text_secondary, alpha);
+		fill_col   = theme_alpha(aida::ui::resolved().text_secondary, 0.08f * alpha);
 		glyph = "?";
 		break;
 	}
@@ -1349,12 +1373,12 @@ inline void render_inline_callout(ImDrawList* dl, float x, float y, float w, flo
 		theme_alpha(accent_col, 0.6f), 16);
 	ImVec2 gs = ImGui::CalcTextSize(glyph);
 	dl->AddText(ImVec2(glyph_cx - gs.x * 0.5f, glyph_cy - gs.y * 0.5f),
-		IM_COL32(20, 22, 28, static_cast<int>(240 * alpha)), glyph);
+		theme_alpha(aida::ui::resolved().bg_base, 0.94f * alpha), glyph);
 
 	if (text) {
 		ImVec2 ts = ImGui::CalcTextSize(text);
 		dl->AddText(ImVec2(x + 34.f, y + (h - ts.y) * 0.5f),
-			IM_COL32(220, 225, 235, static_cast<int>(230 * alpha)), text);
+			theme_alpha(aida::ui::resolved().text_primary, 0.9f * alpha), text);
 	}
 }
 
@@ -1370,14 +1394,14 @@ inline float render_kbd_chip(ImDrawList* dl, float x, float y, const char* label
 	dl->AddRectFilled(ImVec2(x, y + 1.f), ImVec2(x + w, y + h + 1.f),
 		IM_COL32(0, 0, 0, static_cast<int>(55 * alpha)), rounding);
 	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
-		IM_COL32(40, 44, 58, static_cast<int>(230 * alpha)), rounding);
+		theme_alpha(aida::ui::resolved().panel_header, 0.9f * alpha), rounding);
 	dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h),
-		IM_COL32(90, 98, 118, static_cast<int>(180 * alpha)), rounding, 0, 1.f);
+		theme_alpha(aida::ui::resolved().border_strong, 0.7f * alpha), rounding, 0, 1.f);
 	dl->AddLine(ImVec2(x + rounding, y + 1.f), ImVec2(x + w - rounding, y + 1.f),
 		IM_COL32(255, 255, 255, static_cast<int>(28 * alpha)), 1.f);
 
 	dl->AddText(ImVec2(x + pad_x, y + 2.f),
-		IM_COL32(215, 220, 235, static_cast<int>(230 * alpha)), label);
+		theme_alpha(aida::ui::resolved().text_primary, 0.9f * alpha), label);
 
 	return w;
 }
@@ -1386,16 +1410,16 @@ inline bool render_filter_input_chip(const char* id, char* buf, size_t bufsz,
 									 const char* placeholder, float width,
 									 float ar, float ag, float ab, float alpha)
 {
-	ImU32 frame_bg = IM_COL32(26, 28, 38, static_cast<int>(220 * alpha));
+	ImU32 frame_bg = theme_alpha(aida::ui::resolved().panel_header, 0.86f * alpha);
 	ImU32 frame_hov = IM_COL32(
 		static_cast<int>(ar * 70 + 30), static_cast<int>(ag * 70 + 30),
 		static_cast<int>(ab * 70 + 30), static_cast<int>(230 * alpha));
 	ImU32 frame_active = IM_COL32(
 		static_cast<int>(ar * 120 + 25), static_cast<int>(ag * 120 + 25),
 		static_cast<int>(ab * 120 + 25), static_cast<int>(240 * alpha));
-	ImU32 text_col = IM_COL32(225, 230, 240, static_cast<int>(240 * alpha));
-	ImU32 hint_col = IM_COL32(140, 145, 160, static_cast<int>(180 * alpha));
-	ImU32 border_col = IM_COL32(60, 66, 82, static_cast<int>(150 * alpha));
+	ImU32 text_col = theme_alpha(aida::ui::resolved().text_primary, 0.94f * alpha);
+	ImU32 hint_col = theme_alpha(aida::ui::resolved().text_dim, alpha);
+	ImU32 border_col = theme_alpha(aida::ui::resolved().border_strong, 0.59f * alpha);
 
 	ImGui::PushStyleColor(ImGuiCol_FrameBg, frame_bg);
 	ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, frame_hov);
@@ -1446,9 +1470,9 @@ inline void render_stat_strip(ImDrawList* dl, float x, float y, float w, float h
 		const auto& it = items[i];
 
 		dl->AddRectFilled(ImVec2(ix, iy), ImVec2(ix + item_w, iy + h),
-			IM_COL32(28, 30, 40, static_cast<int>(200 * alpha)), 6.f);
+			theme_alpha(aida::ui::resolved().panel_bg, 0.78f * alpha), 6.f);
 		dl->AddRect(ImVec2(ix, iy), ImVec2(ix + item_w, iy + h),
-			IM_COL32(50, 55, 70, static_cast<int>(90 * alpha)), 6.f, 0, 1.f);
+			theme_alpha(aida::ui::resolved().border_strong, 0.35f * alpha), 6.f, 0, 1.f);
 
 		ImU32 accent_top = IM_COL32(
 			static_cast<int>(ar * 255), static_cast<int>(ag * 255),
@@ -1458,13 +1482,13 @@ inline void render_stat_strip(ImDrawList* dl, float x, float y, float w, float h
 
 		if (it.label) {
 			dl->AddText(ImVec2(ix + 10.f, iy + 6.f),
-				IM_COL32(150, 155, 170, static_cast<int>(200 * alpha)), it.label);
+				theme_alpha(aida::ui::resolved().text_dim, alpha), it.label);
 		}
 
 		float value_baseline_y = iy + h - 8.f;
 		if (it.value) {
 			ImU32 vc = it.value_color ? theme_alpha(it.value_color, alpha)
-									  : IM_COL32(225, 230, 240, static_cast<int>(alpha * 255));
+									  : theme_alpha(aida::ui::resolved().text_primary, alpha);
 			ImVec2 vs = ImGui::CalcTextSize(it.value);
 			float vy = value_baseline_y - vs.y;
 			dl->AddText(ImVec2(ix + 10.f, vy), vc, it.value);
@@ -1472,11 +1496,11 @@ inline void render_stat_strip(ImDrawList* dl, float x, float y, float w, float h
 			if (it.delta) {
 				ImU32 dc;
 				if (it.delta_sign > 0)
-					dc = IM_COL32(120, 200, 130, static_cast<int>(220 * alpha));
+					dc = theme_alpha(aida::ui::resolved().success, alpha);
 				else if (it.delta_sign < 0)
-					dc = IM_COL32(230, 120, 120, static_cast<int>(220 * alpha));
+					dc = theme_alpha(aida::ui::resolved().error, alpha);
 				else
-					dc = IM_COL32(180, 185, 200, static_cast<int>(180 * alpha));
+					dc = theme_alpha(aida::ui::resolved().text_secondary, alpha);
 				dl->AddText(ImVec2(ix + 10.f + vs.x + 8.f, vy + 1.f), dc, it.delta);
 			}
 		}
@@ -1514,7 +1538,7 @@ inline void render_graph_node_card(ImDrawList* dl, float x, float y, float w, fl
 		IM_COL32(0, 0, 0, static_cast<int>(70 * alpha)), rounding);
 
 	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
-		IM_COL32(22, 24, 32, static_cast<int>(240 * alpha)), rounding);
+		theme_alpha(aida::ui::resolved().panel_bg, 0.94f * alpha), rounding);
 
 	ImU32 hdr_left;
 	ImU32 hdr_right;
@@ -1526,8 +1550,8 @@ inline void render_graph_node_card(ImDrawList* dl, float x, float y, float w, fl
 			static_cast<int>(ar * 140), static_cast<int>(ag * 140),
 			static_cast<int>(ab * 140), static_cast<int>(200 * alpha));
 	} else {
-		hdr_left  = IM_COL32(42, 46, 60, static_cast<int>(240 * alpha));
-		hdr_right = IM_COL32(30, 33, 44, static_cast<int>(225 * alpha));
+		hdr_left  = theme_alpha(aida::ui::resolved().panel_header, 0.94f * alpha);
+		hdr_right = theme_alpha(aida::ui::resolved().bg_overlay, 0.88f * alpha);
 	}
 	int hdr_lr = (hdr_left >> IM_COL32_R_SHIFT) & 0xFF;
 	int hdr_lg = (hdr_left >> IM_COL32_G_SHIFT) & 0xFF;
@@ -1557,7 +1581,7 @@ inline void render_graph_node_card(ImDrawList* dl, float x, float y, float w, fl
 		float scaled_font_size = base_font_size * font_scale;
 		ImVec2 ts = fnt->CalcTextSizeA(scaled_font_size, FLT_MAX, 0.f, header_text);
 		ImU32 title_col = is_entry
-			? IM_COL32(18, 20, 28, static_cast<int>(alpha * 245))
+			? theme_alpha(aida::ui::resolved().bg_base, 0.96f * alpha)
 			: IM_COL32(
 				static_cast<int>(ar * 200 + 55), static_cast<int>(ag * 200 + 55),
 				static_cast<int>(ab * 200 + 55), static_cast<int>(alpha * 240));
@@ -1579,7 +1603,7 @@ inline void render_graph_node_card(ImDrawList* dl, float x, float y, float w, fl
 		dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h), ring_core, rounding, 0, 1.8f * font_scale);
 	} else {
 		dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h),
-			IM_COL32(60, 66, 82, static_cast<int>(160 * alpha)), rounding, 0, 1.f * font_scale);
+			theme_alpha(aida::ui::resolved().border_strong, 0.63f * alpha), rounding, 0, 1.f * font_scale);
 	}
 }
 

@@ -472,16 +472,20 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 			ui.tab_scroll_x = ui.tab_target_scroll_x;
 
 		int active_i = static_cast<int>(ui.active_tab);
-		float active_left = tab_positions[active_i] - ui.tab_scroll_x + ox;
-		float active_right = active_left + tab_widths[active_i];
-		if (active_left < ox + 10.f)
-			ui.tab_target_scroll_x = tab_positions[active_i] - 10.f;
-		else if (active_right > ox + visible_w - 10.f)
-			ui.tab_target_scroll_x = tab_positions[active_i] + tab_widths[active_i] - visible_w + 10.f;
-		ui.tab_target_scroll_x = std::clamp(ui.tab_target_scroll_x, 0.f, max_scroll);
+		if (ui.tab_last_ensured != active_i) {
+			float active_left = tab_positions[active_i] - ui.tab_scroll_x + ox;
+			float active_right = active_left + tab_widths[active_i];
+			if (active_left < ox + 10.f)
+				ui.tab_target_scroll_x = tab_positions[active_i] - 10.f;
+			else if (active_right > ox + visible_w - 10.f)
+				ui.tab_target_scroll_x = tab_positions[active_i] + tab_widths[active_i] - visible_w + 10.f;
+			ui.tab_target_scroll_x = std::clamp(ui.tab_target_scroll_x, 0.f, max_scroll);
+			ui.tab_last_ensured = active_i;
+		}
 	} else {
 		ui.tab_scroll_x = 0.f;
 		ui.tab_target_scroll_x = 0.f;
+		ui.tab_last_ensured = -1;
 	}
 
 	ImGui::PushClipRect(ImVec2(ox, oy), ImVec2(ox + visible_w, oy + TAB_HEIGHT), true);
@@ -545,25 +549,8 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 		}
 	}
 
-	if (ui.underline_w > 0.5f) {
-		float ul_y = oy + TAB_HEIGHT - 3.f;
-		for (int g = 0; g < 3; ++g) {
-			float spread = 2.f + static_cast<float>(g) * 2.f;
-			float ga = (0.20f - static_cast<float>(g) * 0.06f) * a;
-			dl->AddRectFilled(
-				ImVec2(ui.underline_x - spread, ul_y - spread),
-				ImVec2(ui.underline_x + ui.underline_w + spread, ul_y + 2.f + spread),
-				with_a(t.accent_glow, ga * 4.f),
-				3.f + static_cast<float>(g));
-		}
-		dl->AddRectFilledMultiColor(
-			ImVec2(ui.underline_x, ul_y),
-			ImVec2(ui.underline_x + ui.underline_w, ul_y + 2.5f),
-			with_a(t.accent_grad_top, a),
-			with_a(t.accent_grad_bot, a),
-			with_a(t.accent_grad_bot, a),
-			with_a(t.accent_grad_top, a));
-	}
+	ui_anim::render_tab_underline_glow(dl, ui.underline_x, ui.underline_w,
+		oy + TAB_HEIGHT - 3.f, a);
 
 	ImGui::PopClipRect();
 

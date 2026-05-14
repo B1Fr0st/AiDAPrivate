@@ -63,9 +63,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	const ImU32 row_odd   = _ta(ui_anim::lighten(_t.panel_bg, 8));
 	const ImU32 row_hover = _ta(ui_anim::lighten(_t.panel_header, 14));
 	const ImU32 sel_col   = _ta(ui_anim::lighten(_t.panel_header, 10));
-	const ImU32 red_col   = IM_COL32(224, 108, 117, static_cast<int>(alpha * 255));
-	const ImU32 green_col = IM_COL32(152, 195, 121, static_cast<int>(alpha * 255));
-	const ImU32 yellow_col = IM_COL32(229, 192, 123, static_cast<int>(alpha * 255));
+	const ImU32 red_col   = _ta(_t.error);
+	const ImU32 green_col = _ta(_t.success);
+	const ImU32 yellow_col = _ta(_t.warning);
 
 	dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + width, cy + height), bg);
 
@@ -176,8 +176,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		std::snprintf(neut_buf, sizeof(neut_buf), "%d", neutralized_c);
 		std::snprintf(rps_buf, sizeof(rps_buf), "%.1f/s", avg_rps);
 
-		ImU32 active_col = active_c > 0 ? IM_COL32(230, 120, 120, 255) : IM_COL32(120, 200, 130, 255);
-		ImU32 neut_col   = neutralized_c > 0 ? IM_COL32(120, 200, 130, 255) : IM_COL32(180, 185, 200, 255);
+		ImU32 active_col = active_c > 0 ? _t.error : _t.success;
+		ImU32 neut_col   = neutralized_c > 0 ? _t.success : _t.text_secondary;
 
 		ui_anim::stat_strip_item_t items[4];
 		items[0] = { "Checkers",    found_buf,  nullptr, 0, nullptr, 0, 0 };

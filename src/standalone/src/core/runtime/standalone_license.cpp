@@ -2191,6 +2191,37 @@ namespace
         s_arc_fetch_deferred.store(true, std::memory_order_release);
     }
 
+    std::mutex s_driver_proof_cache_mtx;
+    uint64_t s_driver_proof_cache_value = 0;
+    std::string s_driver_proof_cache_nonce;
+    uint64_t s_driver_proof_cache_ms = 0;
+
+    constexpr uint64_t kDriverProofCacheMaxAgeMs = 180000;
+
+    void store_driver_proof_cache(uint64_t proof, const std::string& nonce_str)
+    {
+        if (proof == 0)
+            return;
+        std::lock_guard<std::mutex> lk(s_driver_proof_cache_mtx);
+        s_driver_proof_cache_value = proof;
+        s_driver_proof_cache_nonce = nonce_str;
+        s_driver_proof_cache_ms = license_now_ms();
+    }
+
+    bool load_driver_proof_cache(uint64_t* out_proof, std::string* out_nonce, uint64_t* out_age_ms)
+    {
+        std::lock_guard<std::mutex> lk(s_driver_proof_cache_mtx);
+        if (s_driver_proof_cache_value == 0 || s_driver_proof_cache_ms == 0)
+            return false;
+        uint64_t age = license_now_ms() - s_driver_proof_cache_ms;
+        if (age > kDriverProofCacheMaxAgeMs)
+            return false;
+        if (out_proof) *out_proof = s_driver_proof_cache_value;
+        if (out_nonce) *out_nonce = s_driver_proof_cache_nonce;
+        if (out_age_ms) *out_age_ms = age;
+        return true;
+    }
+
     bool relay_server_token_v2_if_ready(uint32_t token_hash, uint64_t server_nonce, uint64_t* out_driver_proof)
     {
         if (!driver_bridge::sentinel_bridge_ready())
@@ -3410,6 +3441,8 @@ namespace
                 bool relay_ok = false;
                 uint64_t relay_driver_proof = 0;
                 std::string srv_nonce_for_log;
+                const char* proof_source = "none";
+                uint64_t proof_cache_age_ms = 0;
                 if (drv_loaded && drv_kernel)
                 {
                     std::string srv_nonce_str = settings.license_server_nonce;
@@ -3434,13 +3467,38 @@ namespace
                         relay_called = true;
                         relay_ok = relay_server_token_v2_if_ready(token_hash, srv_nonce_val, &driver_proof);
                         relay_driver_proof = driver_proof;
-                        if (relay_ok)
+
+                        std::string proof_nonce_str = srv_nonce_str;
+                        bool have_proof = false;
+                        if (relay_ok && driver_proof != 0)
+                        {
+                            store_driver_proof_cache(driver_proof, srv_nonce_str);
+                            proof_source = "live";
+                            have_proof = true;
+                        }
+                        else
+                        {
+                            uint64_t cached_proof = 0;
+                            std::string cached_nonce;
+                            uint64_t cached_age = 0;
+                            if (load_driver_proof_cache(&cached_proof, &cached_nonce, &cached_age))
+                            {
+                                driver_proof = cached_proof;
+                                relay_driver_proof = cached_proof;
+                                proof_nonce_str = cached_nonce.empty() ? srv_nonce_str : cached_nonce;
+                                proof_cache_age_ms = cached_age;
+                                proof_source = "cache";
+                                have_proof = true;
+                            }
+                        }
+
+                        if (have_proof)
                         {
                             char dp_buf[32];
                             snprintf(dp_buf, sizeof(dp_buf), "%016llX",
                                 static_cast<unsigned long long>(driver_proof));
                             body["driver_proof"] = dp_buf;
-                            body["server_nonce"] = srv_nonce_str;
+                            body["server_nonce"] = proof_nonce_str;
                             drv_proof_added = true;
 
                             uint64_t tsc_now = __rdtsc();
@@ -3450,10 +3508,11 @@ namespace
                     }
                 }
                 {
-                    char dbg_drv[384];
+                    char dbg_drv[448];
                     _snprintf_s(dbg_drv, sizeof(dbg_drv), _TRUNCATE,
                         "heartbeat_compose_driver loaded=%d kernel=%d srv_nonce_present=%d srv_nonce_len=%zu "
-                        "relay_called=%d relay_ok=%d driver_proof=0x%016llX added_to_body=%d",
+                        "relay_called=%d relay_ok=%d driver_proof=0x%016llX added_to_body=%d "
+                        "proof_source=%s cache_age_ms=%llu",
                         drv_loaded ? 1 : 0,
                         drv_kernel ? 1 : 0,
                         srv_nonce_for_log.empty() ? 0 : 1,
@@ -3461,7 +3520,9 @@ namespace
                         relay_called ? 1 : 0,
                         relay_ok ? 1 : 0,
                         static_cast<unsigned long long>(relay_driver_proof),
-                        drv_proof_added ? 1 : 0);
+                        drv_proof_added ? 1 : 0,
+                        proof_source,
+                        static_cast<unsigned long long>(proof_cache_age_ms));
                     lic_log(dbg_drv);
                 }
 
@@ -5365,7 +5426,8 @@ namespace
                 fnv1a_str(settings->license_session_token) & 0xFFFFFFFF);
 
             uint64_t driver_proof = 0;
-            relay_server_token_v2_if_ready(token_hash, srv_nonce_val, &driver_proof);
+            if (relay_server_token_v2_if_ready(token_hash, srv_nonce_val, &driver_proof) && driver_proof != 0)
+                store_driver_proof_cache(driver_proof, srv_nonce_str);
         }
     }
 

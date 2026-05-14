@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include "work_queue.hpp"
+#include "theme.hpp"
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -206,33 +207,33 @@ inline const char* field_type_name(field_type_t t)
 
 inline ImU32 field_type_color(field_type_t t, float alpha)
 {
-	int a = static_cast<int>(alpha * 255);
+	const auto& th = aida::ui::resolved();
 	switch (t) {
 	case field_type_t::int8:
 	case field_type_t::int16:
 	case field_type_t::int32:
-	case field_type_t::int64:        return IM_COL32(86, 182, 194, a);
+	case field_type_t::int64:        return aida::ui::with_alpha(th.syn_type, alpha);
 	case field_type_t::uint8:
 	case field_type_t::uint16:
 	case field_type_t::uint32:
-	case field_type_t::uint64:       return IM_COL32(209, 154, 102, a);
+	case field_type_t::uint64:       return aida::ui::with_alpha(th.syn_number, alpha);
 	case field_type_t::float32:
-	case field_type_t::float64:      return IM_COL32(229, 192, 123, a);
-	case field_type_t::pointer:      return IM_COL32(152, 195, 121, a);
-	case field_type_t::vtable_ptr:   return IM_COL32(224, 108, 117, a);
+	case field_type_t::float64:      return aida::ui::with_alpha(th.syn_number, alpha);
+	case field_type_t::pointer:      return aida::ui::with_alpha(th.syn_string, alpha);
+	case field_type_t::vtable_ptr:   return aida::ui::with_alpha(th.error, alpha);
 	case field_type_t::c_string:
-	case field_type_t::wide_string:  return IM_COL32(152, 195, 121, a);
-	case field_type_t::padding:      return IM_COL32(100, 100, 100, a);
+	case field_type_t::wide_string:  return aida::ui::with_alpha(th.syn_string, alpha);
+	case field_type_t::padding:      return aida::ui::with_alpha(th.text_dim, alpha);
 	case field_type_t::vec2:
 	case field_type_t::vec3:
-	case field_type_t::vec4:         return IM_COL32(255, 165, 0, a);
-	case field_type_t::mat4x4:       return IM_COL32(255, 140, 50, a);
-	case field_type_t::color_rgba:   return IM_COL32(255, 105, 180, a);
-	case field_type_t::bitfield:     return IM_COL32(198, 120, 221, a);
-	case field_type_t::utf8_string:  return IM_COL32(126, 211, 33, a);
-	case field_type_t::utf16_string: return IM_COL32(126, 211, 33, a);
-	case field_type_t::bool8:        return IM_COL32(198, 120, 221, a);
-	default: return IM_COL32(171, 178, 191, a);
+	case field_type_t::vec4:         return aida::ui::with_alpha(th.warning, alpha);
+	case field_type_t::mat4x4:       return aida::ui::with_alpha(th.warning, alpha);
+	case field_type_t::color_rgba:   return aida::ui::with_alpha(th.syn_keyword, alpha);
+	case field_type_t::bitfield:     return aida::ui::with_alpha(th.syn_keyword, alpha);
+	case field_type_t::utf8_string:  return aida::ui::with_alpha(th.syn_string, alpha);
+	case field_type_t::utf16_string: return aida::ui::with_alpha(th.syn_string, alpha);
+	case field_type_t::bool8:        return aida::ui::with_alpha(th.syn_keyword, alpha);
+	default: return aida::ui::with_alpha(th.syn_identifier, alpha);
 	}
 }
 

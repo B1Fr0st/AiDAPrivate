@@ -12,7 +12,7 @@
 namespace aida::ui {
 
 	struct theme_t {
-		std::string name = "Midnight";
+		std::string name = "AiDA Dark";
 		bool        is_dark = true;
 
 		ImU32 bg_base;
@@ -73,63 +73,123 @@ namespace aida::ui {
 
 		inline ImU32 from_rgba(int r, int g, int b, int a) { return IM_COL32(r, g, b, a); }
 
-		inline theme_t make_midnight_dark() {
+		inline theme_t make_aida_dark() {
 			theme_t t;
-			t.name = "Midnight";
+			t.name = "AiDA Dark";
 			t.is_dark = true;
 
-			t.bg_base       = IM_COL32(10, 10, 20, 255);
-			t.bg_elevated   = IM_COL32(18, 18, 30, 255);
-			t.bg_overlay    = IM_COL32(26, 26, 40, 255);
-			t.panel_bg      = IM_COL32(22, 22, 32, 210);
-			t.panel_header  = IM_COL32(34, 34, 48, 230);
-			t.glass_tint    = IM_COL32(20, 18, 40, 60);
-			t.title_bar     = IM_COL32(16, 16, 24, 230);
-			t.acrylic_color = (uint32_t)((5) | (12 << 8) | (65 << 16) | (0x70 << 24));
+			t.bg_base       = IM_COL32(10, 14, 26, 255);
+			t.bg_elevated   = IM_COL32(16, 22, 40, 255);
+			t.bg_overlay    = IM_COL32(24, 32, 56, 255);
+			t.panel_bg      = IM_COL32(15, 21, 38, 214);
+			t.panel_header  = IM_COL32(26, 35, 60, 232);
+			t.glass_tint    = IM_COL32(22, 40, 86, 64);
+			t.title_bar     = IM_COL32(12, 17, 31, 232);
+			t.acrylic_color = (uint32_t)((10) | (17 << 8) | (44 << 16) | (0x7A << 24));
 
-			t.border_subtle = IM_COL32(255, 255, 255, 12);
-			t.border_strong = IM_COL32(255, 255, 255, 32);
-			t.border_focus  = IM_COL32(134, 136, 254, 200);
+			t.border_subtle = IM_COL32(138, 170, 255, 16);
+			t.border_strong = IM_COL32(138, 170, 255, 40);
+			t.border_focus  = IM_COL32(56, 134, 240, 205);
 
-			t.text_primary   = IM_COL32(230, 228, 255, 240);
-			t.text_secondary = IM_COL32(170, 168, 194, 200);
-			t.text_dim       = IM_COL32(118, 115, 157, 180);
-			t.text_address   = IM_COL32(91, 123, 201, 220);
-			t.text_lineno    = IM_COL32(84, 87, 124, 160);
+			t.text_primary   = IM_COL32(226, 234, 250, 242);
+			t.text_secondary = IM_COL32(158, 174, 206, 206);
+			t.text_dim       = IM_COL32(108, 124, 160, 182);
+			t.text_address   = IM_COL32(99, 158, 236, 224);
+			t.text_lineno    = IM_COL32(72, 88, 126, 165);
 
-			t.hover_wash       = IM_COL32(255, 255, 255, 18);
-			t.selection        = IM_COL32(134, 136, 254, 70);
-			t.selection_strong = IM_COL32(134, 136, 254, 130);
+			t.hover_wash       = IM_COL32(120, 166, 255, 20);
+			t.selection        = IM_COL32(56, 134, 240, 74);
+			t.selection_strong = IM_COL32(56, 134, 240, 134);
 			t.disabled_alpha   = 0.42f;
 
-			t.accent          = ImVec4(134.f/255.f, 136.f/255.f, 254.f/255.f, 1.f);
-			t.accent_u32      = IM_COL32(134, 136, 254, 255);
-			t.accent_hover    = IM_COL32(157, 158, 255, 255);
-			t.accent_dim      = IM_COL32(134, 136, 254, 130);
-			t.accent_glow     = IM_COL32(134, 136, 254, 50);
-			t.accent_grad_top = IM_COL32(152, 147, 255, 255);
-			t.accent_grad_bot = IM_COL32(115, 120, 228, 255);
+			t.accent          = ImVec4(56.f/255.f, 134.f/255.f, 240.f/255.f, 1.f);
+			t.accent_u32      = IM_COL32(56, 134, 240, 255);
+			t.accent_hover    = IM_COL32(95, 165, 255, 255);
+			t.accent_dim      = IM_COL32(56, 134, 240, 130);
+			t.accent_glow     = IM_COL32(56, 134, 240, 54);
+			t.accent_grad_top = IM_COL32(92, 168, 255, 255);
+			t.accent_grad_bot = IM_COL32(36, 98, 214, 255);
 
-			t.success      = IM_COL32(91, 209, 139, 255);
-			t.success_soft = IM_COL32(91, 209, 139, 30);
-			t.warning      = IM_COL32(242, 194, 92, 255);
-			t.warning_soft = IM_COL32(242, 194, 92, 30);
-			t.error        = IM_COL32(255, 107, 122, 255);
-			t.error_soft   = IM_COL32(255, 107, 122, 30);
-			t.info         = IM_COL32(91, 172, 224, 255);
-			t.info_soft    = IM_COL32(91, 172, 224, 30);
+			t.success      = IM_COL32(74, 206, 156, 255);
+			t.success_soft = IM_COL32(74, 206, 156, 30);
+			t.warning      = IM_COL32(238, 190, 96, 255);
+			t.warning_soft = IM_COL32(238, 190, 96, 30);
+			t.error        = IM_COL32(255, 104, 122, 255);
+			t.error_soft   = IM_COL32(255, 104, 122, 30);
+			t.info         = IM_COL32(74, 152, 236, 255);
+			t.info_soft    = IM_COL32(74, 152, 236, 30);
 
-			t.syn_keyword      = IM_COL32(197, 134, 224, 255);
-			t.syn_type         = IM_COL32(98, 200, 214, 255);
-			t.syn_string       = IM_COL32(156, 208, 141, 255);
-			t.syn_number       = IM_COL32(224, 168, 124, 255);
-			t.syn_comment      = IM_COL32(102, 107, 130, 255);
-			t.syn_function     = IM_COL32(107, 186, 239, 255);
-			t.syn_identifier   = IM_COL32(209, 210, 220, 255);
-			t.syn_register     = IM_COL32(232, 156, 156, 255);
-			t.syn_address      = IM_COL32(91, 123, 201, 255);
-			t.syn_preprocessor = IM_COL32(197, 134, 224, 255);
-			t.syn_operator     = IM_COL32(171, 178, 191, 255);
+			t.syn_keyword      = IM_COL32(167, 150, 238, 255);
+			t.syn_type         = IM_COL32(102, 198, 220, 255);
+			t.syn_string       = IM_COL32(150, 206, 156, 255);
+			t.syn_number       = IM_COL32(226, 174, 132, 255);
+			t.syn_comment      = IM_COL32(98, 110, 142, 255);
+			t.syn_function     = IM_COL32(96, 168, 252, 255);
+			t.syn_identifier   = IM_COL32(206, 214, 230, 255);
+			t.syn_register     = IM_COL32(230, 150, 158, 255);
+			t.syn_address      = IM_COL32(99, 158, 236, 255);
+			t.syn_preprocessor = IM_COL32(167, 150, 238, 255);
+			t.syn_operator     = IM_COL32(150, 166, 196, 255);
+			return t;
+		}
+
+		inline theme_t make_aida_light() {
+			theme_t t;
+			t.name = "AiDA Light";
+			t.is_dark = false;
+
+			t.bg_base       = IM_COL32(244, 246, 251, 255);
+			t.bg_elevated   = IM_COL32(251, 252, 255, 255);
+			t.bg_overlay    = IM_COL32(232, 238, 248, 255);
+			t.panel_bg      = IM_COL32(251, 252, 255, 232);
+			t.panel_header  = IM_COL32(231, 237, 248, 234);
+			t.glass_tint    = IM_COL32(226, 235, 250, 64);
+			t.title_bar     = IM_COL32(231, 237, 248, 232);
+			t.acrylic_color = (uint32_t)((240) | (244 << 8) | (251 << 16) | (0xA8 << 24));
+
+			t.border_subtle = IM_COL32(86, 112, 162, 60);
+			t.border_strong = IM_COL32(86, 112, 162, 132);
+			t.border_focus  = IM_COL32(42, 104, 216, 210);
+
+			t.text_primary   = IM_COL32(22, 28, 44, 252);
+			t.text_secondary = IM_COL32(78, 92, 122, 232);
+			t.text_dim       = IM_COL32(140, 152, 178, 220);
+			t.text_address   = IM_COL32(40, 100, 208, 230);
+			t.text_lineno    = IM_COL32(150, 162, 188, 220);
+
+			t.hover_wash       = IM_COL32(42, 104, 216, 20);
+			t.selection        = IM_COL32(42, 104, 216, 46);
+			t.selection_strong = IM_COL32(42, 104, 216, 104);
+			t.disabled_alpha   = 0.45f;
+
+			t.accent          = ImVec4(42.f/255.f, 104.f/255.f, 216.f/255.f, 1.f);
+			t.accent_u32      = IM_COL32(42, 104, 216, 255);
+			t.accent_hover    = IM_COL32(58, 124, 236, 255);
+			t.accent_dim      = IM_COL32(42, 104, 216, 130);
+			t.accent_glow     = IM_COL32(42, 104, 216, 46);
+			t.accent_grad_top = IM_COL32(58, 124, 236, 255);
+			t.accent_grad_bot = IM_COL32(28, 78, 178, 255);
+
+			t.success      = IM_COL32(26, 131, 90, 255);
+			t.success_soft = IM_COL32(26, 131, 90, 26);
+			t.warning      = IM_COL32(168, 110, 18, 255);
+			t.warning_soft = IM_COL32(168, 110, 18, 26);
+			t.error        = IM_COL32(196, 50, 62, 255);
+			t.error_soft   = IM_COL32(196, 50, 62, 26);
+			t.info         = IM_COL32(42, 104, 216, 255);
+			t.info_soft    = IM_COL32(42, 104, 216, 26);
+
+			t.syn_keyword      = IM_COL32(124, 58, 178, 255);
+			t.syn_type         = IM_COL32(20, 122, 138, 255);
+			t.syn_string       = IM_COL32(38, 122, 40, 255);
+			t.syn_number       = IM_COL32(170, 96, 36, 255);
+			t.syn_comment      = IM_COL32(132, 142, 162, 255);
+			t.syn_function     = IM_COL32(36, 96, 200, 255);
+			t.syn_identifier   = IM_COL32(28, 34, 50, 255);
+			t.syn_register     = IM_COL32(178, 58, 70, 255);
+			t.syn_address      = IM_COL32(36, 96, 200, 255);
+			t.syn_preprocessor = IM_COL32(124, 58, 178, 255);
+			t.syn_operator     = IM_COL32(86, 100, 126, 255);
 			return t;
 		}
 
@@ -313,14 +373,15 @@ namespace aida::ui {
 			return t;
 		}
 
-		inline theme_t  s_resolved = make_midnight_dark();
-		inline theme_t  s_target   = make_midnight_dark();
-		inline theme_t  s_source   = make_midnight_dark();
+		inline theme_t  s_resolved = make_aida_dark();
+		inline theme_t  s_target   = make_aida_dark();
+		inline theme_t  s_source   = make_aida_dark();
 		inline transition_t s_swap_anim;
 
 		inline std::atomic<bool> s_dark_pref_dark{ true };
 		inline std::atomic<bool> s_user_override { false };
 		inline std::atomic<bool> s_swap_pending  { false };
+		inline std::atomic<uint32_t> s_theme_generation{ 1 };
 
 		inline ImU32 lerp_u32(ImU32 a, ImU32 b, float t) {
 			float ar = (float)((a >> IM_COL32_R_SHIFT) & 0xFF);
@@ -398,6 +459,10 @@ namespace aida::ui {
 	}
 
 	inline const theme_t& resolved() { return detail::s_resolved; }
+
+	inline uint32_t theme_generation() {
+		return detail::s_theme_generation.load(std::memory_order_acquire);
+	}
 
 	inline void apply_imgui_style(const theme_t& t) {
 		ImGuiStyle& s = ImGui::GetStyle();
@@ -495,6 +560,7 @@ namespace aida::ui {
 		detail::s_source = detail::s_resolved;
 		detail::s_swap_anim.start(0.240f, aida::motion::ease::in_out_cubic);
 		detail::s_swap_pending = true;
+		detail::s_theme_generation.fetch_add(1u, std::memory_order_release);
 	}
 
 	inline void apply_immediate(const theme_t& t) {
@@ -504,6 +570,7 @@ namespace aida::ui {
 		detail::s_swap_anim.reset();
 		detail::s_swap_pending = false;
 		apply_imgui_style(t);
+		detail::s_theme_generation.fetch_add(1u, std::memory_order_release);
 	}
 
 	inline void tick_theme_animation(float dt) {
@@ -520,15 +587,16 @@ namespace aida::ui {
 		}
 	}
 
-	inline void use_dark()  { apply(detail::make_midnight_dark()); }
+	inline void use_dark()  { apply(detail::make_aida_dark()); }
 	inline void use_light() { apply(detail::make_midnight_light()); }
 
 	inline theme_t make_theme_for_index(int idx) {
 		switch (idx) {
-			case 0:  return detail::make_midnight_dark();
-			case 1:  return detail::make_claude_dark();
-			case 2:  return detail::make_claude_light();
-			default: return detail::make_midnight_dark();
+			case 0:  return detail::make_aida_dark();
+			case 1:  return detail::make_aida_light();
+			case 2:  return detail::make_claude_dark();
+			case 3:  return detail::make_claude_light();
+			default: return detail::make_aida_dark();
 		}
 	}
 

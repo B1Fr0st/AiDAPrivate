@@ -784,7 +784,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImVec2 box_a(lx - pad_x, ly - pad_y);
 			ImVec2 box_b(lx + lts.x + pad_x, ly + lts.y + pad_y);
 			dl->AddRectFilled(box_a, box_b,
-				aida::ui::with_alpha(IM_COL32(14, 16, 22, 240), alpha), 3.f);
+				aida::ui::with_alpha(aida::ui::resolved().bg_base, 0.94f * alpha), 3.f);
 			dl->AddRect(box_a, box_b, edge_col, 3.f, 0, 1.f);
 			dl->AddText(ImVec2(lx, ly), edge_col, label);
 		}

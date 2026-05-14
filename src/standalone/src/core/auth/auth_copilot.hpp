@@ -9,7 +9,7 @@ namespace aida {
 namespace auth {
 namespace copilot {
 
-	constexpr const char* COPILOT_CLIENT_ID = "Ov23li8tweQw6odWQebz";
+	constexpr const char* COPILOT_CLIENT_ID = "Iv1.b507a08c87ecfe98";
 	constexpr int COPILOT_POLLING_SAFETY_MARGIN_MS = 3000;
 
 	struct copilot_login_state_t {

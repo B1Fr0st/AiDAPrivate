@@ -12,11 +12,14 @@
 #include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <regex>
 #include <string>
 #include <thread>
 #include <vector>
+#include <unordered_set>
+#include <unordered_map>
 #include "theme.hpp"
 #include "motion.hpp"
 #include "clock.hpp"
@@ -93,6 +96,18 @@ bool s_request_find = false;
 bool s_request_replace = false;
 
 std::string s_last_error;
+
+
+std::mutex                          s_diff_mtx;
+code_editor_widget::pending_diff_t   s_diff;
+int                                 s_diff_hover_hunk = -1;
+float                               s_diff_scroll_target = -1.f;
+
+
+double s_last_edit_time   = 0.0;
+int    s_last_edit_line   = -1;
+int    s_last_edit_col    = -1;
+int    s_undo_kind        = 0;
 
 
 void rebuild_lines() {
@@ -212,7 +227,19 @@ std::string get_selected_text() {
     return result;
 }
 
-void push_undo() {
+void push_undo(int coalesce_kind = 0) {
+    if (coalesce_kind != 0 && coalesce_kind == s_undo_kind && !s_undo.empty()) {
+        double now = ImGui::GetTime();
+        bool adjacent = (s_last_edit_line == s_sel.caret_line) &&
+                        (std::abs(s_sel.caret_col - s_last_edit_col) <= 1);
+        if (adjacent && (now - s_last_edit_time) < 1.2) {
+            s_last_edit_time = now;
+            s_last_edit_line = s_sel.caret_line;
+            s_last_edit_col  = s_sel.caret_col;
+            s_redo.clear();
+            return;
+        }
+    }
     code_editor_widget::undo_entry_t e;
     e.text = code_editor::buffer.data();
     e.caret_line = s_sel.caret_line;
@@ -220,6 +247,16 @@ void push_undo() {
     s_undo.push_back(std::move(e));
     if (static_cast<int>(s_undo.size()) > UNDO_MAX) s_undo.erase(s_undo.begin());
     s_redo.clear();
+    s_undo_kind      = coalesce_kind;
+    s_last_edit_time = ImGui::GetTime();
+    s_last_edit_line = s_sel.caret_line;
+    s_last_edit_col  = s_sel.caret_col;
+}
+
+void break_undo_coalescing() {
+    s_undo_kind      = 0;
+    s_last_edit_line = -1;
+    s_last_edit_col  = -1;
 }
 
 void delete_selection() {
@@ -247,9 +284,9 @@ void delete_selection() {
     rebuild_buffer_from_lines();
 }
 
-void insert_text_at_caret(const std::string& text) {
-    if (s_sel.has_selection()) delete_selection();
-    else push_undo();
+void insert_text_at_caret(const std::string& text, int coalesce_kind = 0) {
+    if (s_sel.has_selection()) { delete_selection(); break_undo_coalescing(); }
+    else push_undo(coalesce_kind);
 
     int line = s_sel.caret_line;
     int col  = clamp_col(line, s_sel.caret_col);
@@ -352,6 +389,7 @@ std::string clipboard_paste() {
 
 void do_undo() {
     if (s_undo.empty()) return;
+    break_undo_coalescing();
     auto& e = s_undo.back();
 
     code_editor_widget::undo_entry_t redo_e;
@@ -375,6 +413,7 @@ void do_undo() {
 
 void do_redo() {
     if (s_redo.empty()) return;
+    break_undo_coalescing();
     auto& e = s_redo.back();
     code_editor_widget::undo_entry_t undo_e;
     undo_e.text = code_editor::buffer.data();
@@ -394,12 +433,30 @@ void do_redo() {
     s_cache.dirty = true;
 }
 
+float s_view_char_w   = 8.f;
+float s_view_text_w   = 0.f;
+float s_max_scroll_x  = 0.f;
+
 void ensure_caret_visible(float vis_h, float line_h) {
     float caret_y = s_sel.caret_line * line_h;
     if (caret_y < s_scroll_y)
         s_target_scroll_y = caret_y;
     else if (caret_y + line_h > s_scroll_y + vis_h)
         s_target_scroll_y = caret_y - vis_h + line_h * 2.f;
+
+    if (editor_config::word_wrap) {
+        s_scroll_x = 0.f;
+        return;
+    }
+    if (s_view_text_w <= 0.f) return;
+    float caret_x = s_sel.caret_col * s_view_char_w;
+    float pad = s_view_char_w * 4.f;
+    if (caret_x - pad < s_scroll_x)
+        s_scroll_x = std::max(0.f, caret_x - pad);
+    else if (caret_x + pad > s_scroll_x + s_view_text_w)
+        s_scroll_x = caret_x + pad - s_view_text_w;
+    if (s_scroll_x > s_max_scroll_x) s_scroll_x = s_max_scroll_x;
+    if (s_scroll_x < 0.f) s_scroll_x = 0.f;
 }
 
 
@@ -578,6 +635,467 @@ void replace_all() {
     find_all_matches();
 }
 
+
+char matching_close_bracket(char open) {
+    switch (open) {
+        case '(': return ')';
+        case '[': return ']';
+        case '{': return '}';
+        case '"': return '"';
+        case '\'': return '\'';
+        default:  return 0;
+    }
+}
+
+bool is_open_bracket(char c) {
+    return c == '(' || c == '[' || c == '{';
+}
+
+bool is_close_bracket(char c) {
+    return c == ')' || c == ']' || c == '}';
+}
+
+bool find_matching_bracket(int line, int col, int& out_line, int& out_col, char& out_ch) {
+    const std::string& cur = line_at(line);
+    char here = (col >= 0 && col < static_cast<int>(cur.size())) ? cur[col] : 0;
+    char before = (col > 0 && col - 1 < static_cast<int>(cur.size())) ? cur[col - 1] : 0;
+
+    int probe_line = line;
+    int probe_col  = col;
+    char open_ch   = 0;
+    bool forward   = true;
+
+    if (is_open_bracket(here) || is_close_bracket(here)) {
+        open_ch  = here;
+        forward  = is_open_bracket(here);
+    } else if (is_open_bracket(before) || is_close_bracket(before)) {
+        open_ch  = before;
+        probe_col = col - 1;
+        forward  = is_open_bracket(before);
+    } else {
+        return false;
+    }
+
+    char want_open  = forward ? open_ch : 0;
+    char want_close = 0;
+    if (forward) {
+        want_close = matching_close_bracket(open_ch);
+    } else {
+        if (open_ch == ')') { want_open = '('; want_close = ')'; }
+        else if (open_ch == ']') { want_open = '['; want_close = ']'; }
+        else if (open_ch == '}') { want_open = '{'; want_close = '}'; }
+    }
+    if (want_open == 0 || want_close == 0) return false;
+
+    int depth = 0;
+    if (forward) {
+        for (int li = probe_line; li < line_count(); ++li) {
+            const std::string& ln = line_at(li);
+            int start = (li == probe_line) ? probe_col : 0;
+            for (int ci = start; ci < static_cast<int>(ln.size()); ++ci) {
+                char c = ln[ci];
+                if (c == want_open) depth++;
+                else if (c == want_close) {
+                    depth--;
+                    if (depth == 0) {
+                        out_line = li; out_col = ci; out_ch = c;
+                        return true;
+                    }
+                }
+            }
+        }
+    } else {
+        for (int li = probe_line; li >= 0; --li) {
+            const std::string& ln = line_at(li);
+            int start = (li == probe_line) ? probe_col : static_cast<int>(ln.size()) - 1;
+            for (int ci = start; ci >= 0; --ci) {
+                char c = ln[ci];
+                if (c == want_close) depth++;
+                else if (c == want_open) {
+                    depth--;
+                    if (depth == 0) {
+                        out_line = li; out_col = ci; out_ch = c;
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+
+void collect_buffer_identifiers(std::vector<std::string>& out, int around_line) {
+    out.clear();
+    std::unordered_set<std::string> seen;
+    int total = line_count();
+    int lo = std::max(0, around_line - 1500);
+    int hi = std::min(total, around_line + 1500);
+    for (int i = lo; i < hi; ++i) {
+        const std::string& ln = s_cache.lines[i];
+        size_t j = 0;
+        while (j < ln.size()) {
+            unsigned char c = static_cast<unsigned char>(ln[j]);
+            bool starts = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+            if (!starts) { j++; continue; }
+            size_t s = j;
+            while (j < ln.size()) {
+                unsigned char d = static_cast<unsigned char>(ln[j]);
+                bool cont = (d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z') ||
+                            (d >= '0' && d <= '9') || d == '_';
+                if (!cont) break;
+                j++;
+            }
+            if (j - s >= 3 && j - s <= 80) {
+                std::string word = ln.substr(s, j - s);
+                if (seen.insert(word).second)
+                    out.push_back(std::move(word));
+            }
+        }
+    }
+}
+
+bool fuzzy_subsequence_score(const std::string& lower_pat, const std::string& lower_cand, int& score) {
+    if (lower_pat.empty()) { score = 0; return true; }
+    size_t pi = 0;
+    int s = 0;
+    int prev_match = -2;
+    int consecutive = 0;
+    for (size_t ci = 0; ci < lower_cand.size() && pi < lower_pat.size(); ++ci) {
+        if (lower_cand[ci] == lower_pat[pi]) {
+            if (static_cast<int>(ci) == prev_match + 1) {
+                consecutive++;
+                s += 6 + consecutive * 2;
+            } else {
+                consecutive = 0;
+                s += 2;
+            }
+            if (ci == 0) s += 12;
+            else {
+                char p = lower_cand[ci - 1];
+                if (p == '_' || p == ':' || p == '.') s += 8;
+            }
+            prev_match = static_cast<int>(ci);
+            pi++;
+        }
+    }
+    if (pi != lower_pat.size()) return false;
+    if (lower_cand.size() == lower_pat.size()) s += 4;
+    s -= static_cast<int>(lower_cand.size()) / 4;
+    score = s;
+    return true;
+}
+
+void rebuild_autocomplete(const std::string& partial, int caret_line) {
+    autocomplete::matches.clear();
+    autocomplete::selected = 0;
+    if (partial.size() < 2) {
+        autocomplete::popup_visible = false;
+        return;
+    }
+
+    std::string lower_pat = partial;
+    for (auto& c : lower_pat) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+
+    struct cand_t { std::string text; int score; };
+    std::vector<cand_t> cands;
+    std::unordered_set<std::string> seen;
+    seen.insert(partial);
+
+    for (const auto& kw : autocomplete::keywords()) {
+        if (kw == partial) continue;
+        std::string lk = kw;
+        for (auto& c : lk) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        int sc = 0;
+        if (fuzzy_subsequence_score(lower_pat, lk, sc)) {
+            if (seen.insert(kw).second)
+                cands.push_back({ kw, sc + 6 });
+        }
+    }
+
+    std::vector<std::string> idents;
+    collect_buffer_identifiers(idents, caret_line);
+    for (const auto& id : idents) {
+        if (id == partial) continue;
+        std::string li = id;
+        for (auto& c : li) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        int sc = 0;
+        if (fuzzy_subsequence_score(lower_pat, li, sc)) {
+            if (seen.insert(id).second)
+                cands.push_back({ id, sc });
+        }
+    }
+
+    std::stable_sort(cands.begin(), cands.end(),
+        [](const cand_t& a, const cand_t& b) { return a.score > b.score; });
+
+    int cap = static_cast<int>(cands.size());
+    if (cap > 12) cap = 12;
+    for (int i = 0; i < cap; ++i)
+        autocomplete::matches.push_back(cands[i].text);
+
+    autocomplete::partial      = partial;
+    autocomplete::popup_visible = !autocomplete::matches.empty();
+    autocomplete::cursor_line  = caret_line;
+}
+
+
+std::vector<std::string> split_to_lines(std::string_view text) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '\n') {
+            size_t end = i;
+            if (end > start && text[end - 1] == '\r') end--;
+            out.emplace_back(text.substr(start, end - start));
+            start = i + 1;
+        }
+    }
+    size_t end = text.size();
+    if (end > start && text[end - 1] == '\r') end--;
+    out.emplace_back(text.substr(start, end - start));
+    return out;
+}
+
+
+void compute_lcs_diff(const std::vector<std::string>& a,
+                      const std::vector<std::string>& b,
+                      code_editor_widget::pending_diff_t& diff)
+{
+    const int n = static_cast<int>(a.size());
+    const int m = static_cast<int>(b.size());
+
+    int pre = 0;
+    while (pre < n && pre < m && a[pre] == b[pre]) pre++;
+    int suf = 0;
+    while (suf < (n - pre) && suf < (m - pre) &&
+           a[n - 1 - suf] == b[m - 1 - suf]) suf++;
+
+    const int an = n - pre - suf;
+    const int bm = m - pre - suf;
+
+    struct op_t { int kind; std::string text; int old_line; int new_line; };
+    std::vector<op_t> ops;
+
+    for (int i = 0; i < pre; ++i)
+        ops.push_back({ 0, a[i], i, i });
+
+    const long long dp_cells =
+        static_cast<long long>(an + 1) * static_cast<long long>(bm + 1);
+    const long long dp_cap = 6000000;
+
+    if (dp_cells > dp_cap) {
+        for (int i = 0; i < an; ++i)
+            ops.push_back({ 2, a[pre + i], pre + i, -1 });
+        for (int j = 0; j < bm; ++j)
+            ops.push_back({ 1, b[pre + j], -1, pre + j });
+    } else {
+        std::vector<std::vector<int>> dp(an + 1, std::vector<int>(bm + 1, 0));
+        for (int i = an - 1; i >= 0; --i) {
+            for (int j = bm - 1; j >= 0; --j) {
+                if (a[pre + i] == b[pre + j])
+                    dp[i][j] = dp[i + 1][j + 1] + 1;
+                else
+                    dp[i][j] = std::max(dp[i + 1][j], dp[i][j + 1]);
+            }
+        }
+
+        int i = 0, j = 0;
+        while (i < an && j < bm) {
+            if (a[pre + i] == b[pre + j]) {
+                ops.push_back({ 0, a[pre + i], pre + i, pre + j });
+                i++; j++;
+            } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+                ops.push_back({ 2, a[pre + i], pre + i, -1 });
+                i++;
+            } else {
+                ops.push_back({ 1, b[pre + j], -1, pre + j });
+                j++;
+            }
+        }
+        while (i < an) { ops.push_back({ 2, a[pre + i], pre + i, -1 }); i++; }
+        while (j < bm) { ops.push_back({ 1, b[pre + j], -1, pre + j }); j++; }
+    }
+
+    for (int i = 0; i < suf; ++i)
+        ops.push_back({ 0, a[n - suf + i], n - suf + i, m - suf + i });
+
+    diff.hunks.clear();
+    diff.total_added   = 0;
+    diff.total_removed = 0;
+
+    size_t idx = 0;
+    while (idx < ops.size()) {
+        if (ops[idx].kind == 0) { idx++; continue; }
+
+        code_editor_widget::diff_hunk_t hunk;
+        hunk.state = code_editor_widget::diff_hunk_state_t::pending;
+        size_t hs = idx;
+        int ctx_run = 0;
+        size_t he = idx;
+        while (he < ops.size()) {
+            if (ops[he].kind == 0) {
+                ctx_run++;
+                if (ctx_run > 2) break;
+            } else {
+                ctx_run = 0;
+            }
+            he++;
+        }
+        while (he > hs && ops[he - 1].kind == 0) he--;
+
+        int first_old = -1, first_new = -1, last_old = -1, last_new = -1;
+        for (size_t k = hs; k < he; ++k) {
+            const op_t& o = ops[k];
+            code_editor_widget::diff_line_t dl;
+            dl.text     = o.text;
+            dl.old_line = o.old_line;
+            dl.new_line = o.new_line;
+            if (o.kind == 0)      dl.kind = code_editor_widget::diff_line_kind_t::context;
+            else if (o.kind == 1) { dl.kind = code_editor_widget::diff_line_kind_t::added;   hunk.added++; }
+            else                  { dl.kind = code_editor_widget::diff_line_kind_t::removed; hunk.removed++; }
+
+            if (o.old_line >= 0) {
+                if (first_old < 0) first_old = o.old_line;
+                last_old = o.old_line;
+            }
+            if (o.new_line >= 0) {
+                if (first_new < 0) first_new = o.new_line;
+                last_new = o.new_line;
+            }
+            hunk.lines.push_back(std::move(dl));
+        }
+
+        hunk.old_start = first_old < 0 ? 0 : first_old;
+        hunk.new_start = first_new < 0 ? 0 : first_new;
+        hunk.old_count = (first_old < 0) ? 0 : (last_old - first_old + 1);
+        hunk.new_count = (first_new < 0) ? 0 : (last_new - first_new + 1);
+
+        diff.total_added   += hunk.added;
+        diff.total_removed += hunk.removed;
+        diff.hunks.push_back(std::move(hunk));
+        idx = he;
+    }
+}
+
+
+void rebuild_buffer_from_external(const std::string& text) {
+    s_cache.lines = split_to_lines(text);
+    if (s_cache.lines.empty()) s_cache.lines.push_back("");
+    s_cache.tokens.assign(s_cache.lines.size(), {});
+    for (size_t i = 0; i < s_cache.lines.size(); ++i)
+        syntax::tokenize(s_cache.lines[i], s_lang, s_cache.tokens[i]);
+
+    size_t needed = text.size() + 1024 * 64;
+    if (code_editor::buffer.size() < needed)
+        code_editor::buffer.resize(needed);
+    memcpy(code_editor::buffer.data(), text.c_str(), text.size());
+    code_editor::buffer[text.size()] = '\0';
+    code_editor::dirty = true;
+    s_cache.dirty = false;
+}
+
+
+void rebuild_pending_from_proposal(const std::string& origin,
+                                   const std::vector<std::string>& old_lines,
+                                   const std::vector<std::string>& new_lines)
+{
+    std::lock_guard<std::mutex> lk(s_diff_mtx);
+    s_diff.active        = true;
+    s_diff.origin        = origin;
+    s_diff.old_lines     = old_lines;
+    s_diff.new_lines     = new_lines;
+    compute_lcs_diff(old_lines, new_lines, s_diff);
+    s_diff_hover_hunk    = -1;
+}
+
+
+std::string compose_resolved_text() {
+    std::vector<std::string> result;
+    result.reserve(s_diff.new_lines.size() + s_diff.old_lines.size());
+
+    size_t old_idx = 0;
+    size_t hi = 0;
+
+    auto emit_context_until = [&](int old_target) {
+        while (static_cast<int>(old_idx) < old_target &&
+               old_idx < s_diff.old_lines.size()) {
+            result.push_back(s_diff.old_lines[old_idx]);
+            old_idx++;
+        }
+    };
+
+    while (hi < s_diff.hunks.size()) {
+        const code_editor_widget::diff_hunk_t& h = s_diff.hunks[hi];
+
+        int hunk_old_begin = h.old_count > 0 ? h.old_start : static_cast<int>(old_idx);
+        if (h.old_count == 0) {
+            for (const auto& dl : h.lines) {
+                if (dl.kind == code_editor_widget::diff_line_kind_t::context &&
+                    dl.old_line >= 0) {
+                    hunk_old_begin = dl.old_line;
+                    break;
+                }
+            }
+        }
+        emit_context_until(hunk_old_begin);
+
+        if (h.state == code_editor_widget::diff_hunk_state_t::accepted) {
+            for (const auto& dl : h.lines) {
+                if (dl.kind == code_editor_widget::diff_line_kind_t::added ||
+                    dl.kind == code_editor_widget::diff_line_kind_t::context)
+                    result.push_back(dl.text);
+            }
+        } else {
+            for (const auto& dl : h.lines) {
+                if (dl.kind == code_editor_widget::diff_line_kind_t::removed ||
+                    dl.kind == code_editor_widget::diff_line_kind_t::context)
+                    result.push_back(dl.text);
+            }
+        }
+
+        int consumed_old = 0;
+        for (const auto& dl : h.lines)
+            if (dl.old_line >= 0) consumed_old++;
+        old_idx = static_cast<size_t>(hunk_old_begin) + consumed_old;
+        hi++;
+    }
+
+    emit_context_until(static_cast<int>(s_diff.old_lines.size()));
+
+    std::string joined;
+    for (size_t i = 0; i < result.size(); ++i) {
+        if (i > 0) joined += '\n';
+        joined += result[i];
+    }
+    return joined;
+}
+
+
+void apply_resolved_diff_to_buffer() {
+    std::string text = compose_resolved_text();
+    int caret_l = std::min(s_sel.caret_line, std::max(0, static_cast<int>(split_to_lines(text).size()) - 1));
+    rebuild_buffer_from_external(text);
+    s_sel.caret_line = s_sel.anchor_line = clamp_line(caret_l);
+    s_sel.caret_col  = s_sel.anchor_col  = clamp_col(s_sel.caret_line, s_sel.caret_col);
+    s_sel.active = false;
+}
+
+
+void finalize_diff_if_resolved_locked() {
+    if (!s_diff.active) return;
+    if (!s_diff.fully_resolved()) return;
+    apply_resolved_diff_to_buffer();
+    s_diff = code_editor_widget::pending_diff_t{};
+    s_diff.active = false;
+    s_diff_hover_hunk = -1;
+    s_diff_scroll_target = -1.f;
+    s_scroll_y = s_scroll_x = s_target_scroll_y = 0.f;
+    s_undo.clear();
+    s_redo.clear();
+    break_undo_coalescing();
+}
+
 }
 
 
@@ -590,6 +1108,13 @@ void code_editor_widget::init() {
     s_redo.clear();
     s_scroll_y = s_scroll_x = s_target_scroll_y = 0.f;
     s_lang_set = false;
+    {
+        std::lock_guard<std::mutex> lk(s_diff_mtx);
+        s_diff = code_editor_widget::pending_diff_t{};
+        s_diff_hover_hunk = -1;
+        s_diff_scroll_target = -1.f;
+    }
+    break_undo_coalescing();
 }
 
 void code_editor_widget::on_text_changed() {
@@ -600,6 +1125,13 @@ void code_editor_widget::on_text_changed() {
     s_scroll_y = s_scroll_x = s_target_scroll_y = 0.f;
     s_blink_timer = 0.f;
     s_blink_on = true;
+    {
+        std::lock_guard<std::mutex> lk(s_diff_mtx);
+        s_diff = code_editor_widget::pending_diff_t{};
+        s_diff_hover_hunk = -1;
+        s_diff_scroll_target = -1.f;
+    }
+    break_undo_coalescing();
 
 
     if (!code_editor::filename.empty()) {
@@ -623,6 +1155,126 @@ std::string code_editor_widget::last_error() {
 }
 
 
+bool code_editor_widget::begin_agent_edit(std::string_view origin) {
+    if (!code_editor::active) {
+        s_last_error = "code_editor: begin_agent_edit called with no active document";
+        return false;
+    }
+    std::vector<std::string> base = split_to_lines(code_editor::get_content());
+    std::lock_guard<std::mutex> lk(s_diff_mtx);
+    s_diff = code_editor_widget::pending_diff_t{};
+    s_diff.active = true;
+    s_diff.origin = std::string(origin);
+    s_diff.old_lines = base;
+    s_diff.new_lines = base;
+    s_diff_hover_hunk = -1;
+    return true;
+}
+
+bool code_editor_widget::propose_full_content(std::string_view new_content) {
+    if (!code_editor::active) {
+        s_last_error = "code_editor: propose_full_content called with no active document";
+        return false;
+    }
+    std::vector<std::string> old_lines = split_to_lines(code_editor::get_content());
+    std::vector<std::string> new_lines = split_to_lines(new_content);
+    std::string origin;
+    {
+        std::lock_guard<std::mutex> lk(s_diff_mtx);
+        origin = s_diff.active ? s_diff.origin : std::string("agent");
+    }
+    rebuild_pending_from_proposal(origin, old_lines, new_lines);
+    return true;
+}
+
+bool code_editor_widget::propose_replace_range(int start_line, int end_line,
+                                               std::string_view replacement) {
+    if (!code_editor::active) {
+        s_last_error = "code_editor: propose_replace_range called with no active document";
+        return false;
+    }
+
+    std::vector<std::string> old_lines = split_to_lines(code_editor::get_content());
+    int n = static_cast<int>(old_lines.size());
+    if (start_line < 0) start_line = 0;
+    if (end_line < start_line) end_line = start_line;
+    if (start_line > n) start_line = n;
+    if (end_line > n) end_line = n;
+
+    std::vector<std::string> repl = split_to_lines(replacement);
+    if (replacement.empty()) repl.clear();
+
+    std::vector<std::string> new_lines;
+    new_lines.reserve(old_lines.size());
+    for (int i = 0; i < start_line && i < n; ++i)
+        new_lines.push_back(old_lines[i]);
+    for (auto& r : repl)
+        new_lines.push_back(std::move(r));
+    for (int i = end_line; i < n; ++i)
+        new_lines.push_back(old_lines[i]);
+    if (new_lines.empty()) new_lines.push_back("");
+
+    std::string origin;
+    {
+        std::lock_guard<std::mutex> lk(s_diff_mtx);
+        origin = s_diff.active ? s_diff.origin : std::string("agent");
+    }
+    rebuild_pending_from_proposal(origin, old_lines, new_lines);
+    return true;
+}
+
+bool code_editor_widget::has_pending_diff() {
+    std::lock_guard<std::mutex> lk(s_diff_mtx);
+    return s_diff.active && !s_diff.hunks.empty();
+}
+
+const code_editor_widget::pending_diff_t& code_editor_widget::pending_diff() {
+    return s_diff;
+}
+
+int code_editor_widget::pending_hunk_count() {
+    std::lock_guard<std::mutex> lk(s_diff_mtx);
+    return static_cast<int>(s_diff.hunks.size());
+}
+
+bool code_editor_widget::accept_hunk(int index) {
+    std::lock_guard<std::mutex> lk(s_diff_mtx);
+    if (!s_diff.active || index < 0 || index >= static_cast<int>(s_diff.hunks.size()))
+        return false;
+    s_diff.hunks[index].state = code_editor_widget::diff_hunk_state_t::accepted;
+    return true;
+}
+
+bool code_editor_widget::reject_hunk(int index) {
+    std::lock_guard<std::mutex> lk(s_diff_mtx);
+    if (!s_diff.active || index < 0 || index >= static_cast<int>(s_diff.hunks.size()))
+        return false;
+    s_diff.hunks[index].state = code_editor_widget::diff_hunk_state_t::rejected;
+    return true;
+}
+
+void code_editor_widget::accept_all() {
+    std::lock_guard<std::mutex> lk(s_diff_mtx);
+    if (!s_diff.active) return;
+    for (auto& h : s_diff.hunks)
+        h.state = code_editor_widget::diff_hunk_state_t::accepted;
+}
+
+void code_editor_widget::reject_all() {
+    std::lock_guard<std::mutex> lk(s_diff_mtx);
+    if (!s_diff.active) return;
+    for (auto& h : s_diff.hunks)
+        h.state = code_editor_widget::diff_hunk_state_t::rejected;
+}
+
+void code_editor_widget::cancel_agent_edit() {
+    std::lock_guard<std::mutex> lk(s_diff_mtx);
+    s_diff = code_editor_widget::pending_diff_t{};
+    s_diff.active = false;
+    s_diff_hover_hunk = -1;
+}
+
+
 void code_editor_widget::render(float pos_x, float pos_y, float width, float height,
                                  float alpha, float accent_r, float accent_g, float accent_b)
 {
@@ -630,7 +1282,20 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     if (!code_editor::active || code_editor::buffer.empty())
         return;
 
-    if (g_code_font) ImGui::PushFont(g_code_font);
+    ImFont* code_font = aida::ui::fonts::code() ? aida::ui::fonts::code() : g_code_font;
+    if (code_font) ImGui::PushFont(code_font);
+
+    ImGuiWindow* editor_win = ImGui::GetCurrentWindow();
+    float prev_font_scale = editor_win ? editor_win->FontWindowScale : 1.f;
+    {
+        float want = editor_config::font_size;
+        if (want < 8.f)  want = 8.f;
+        if (want > 48.f) want = 48.f;
+        float scale = want / 14.f;
+        if (scale < 0.5f) scale = 0.5f;
+        if (scale > 3.f)  scale = 3.f;
+        ImGui::SetWindowFontScale(scale);
+    }
 
     if (s_request_undo)   { do_undo();   s_request_undo = false; }
     if (s_request_redo)   { do_redo();   s_request_redo = false; }
@@ -677,7 +1342,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
     const float goto_bar_h = s_goto.visible ? 36.f : 0.f;
     const float breadcrumb_h = 28.f;
-    const float minimap_w = (width > 600.f) ? 64.f : 0.f;
+    const float minimap_w = (editor_config::minimap && width > 360.f) ? 64.f : 0.f;
     const float overlay_h = goto_bar_h + breadcrumb_h;
     const float editor_y0 = pos_y + overlay_h;
     const float editor_h  = height - overlay_h;
@@ -690,6 +1355,28 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     float max_scroll = std::max(0.f, n_lines * line_h - editor_h + line_h);
     s_target_scroll_y = std::max(0.f, std::min(s_target_scroll_y, max_scroll));
     s_scroll_y = std::max(0.f, std::min(s_scroll_y, max_scroll));
+
+    int longest_line_chars = 0;
+    {
+        int probe_lo = std::max(0, static_cast<int>(s_scroll_y / line_h) - 4);
+        int probe_hi = std::min(n_lines - 1,
+                                static_cast<int>((s_scroll_y + editor_h) / line_h) + 4);
+        for (int i = probe_lo; i <= probe_hi; ++i)
+            longest_line_chars = std::max(longest_line_chars, line_length(i));
+    }
+    const float h_scrollbar_h = 9.f;
+    const bool  word_wrap_on  = editor_config::word_wrap;
+    s_view_char_w = char_w;
+    s_view_text_w = (code_w - text_x0 - 14.f);
+    if (s_view_text_w < char_w) s_view_text_w = char_w;
+    {
+        float content_w = longest_line_chars * char_w + char_w * 2.f;
+        s_max_scroll_x = word_wrap_on ? 0.f
+                                      : std::max(0.f, content_w - s_view_text_w);
+    }
+    if (word_wrap_on) s_scroll_x = 0.f;
+    if (s_scroll_x > s_max_scroll_x) s_scroll_x = s_max_scroll_x;
+    if (s_scroll_x < 0.f) s_scroll_x = 0.f;
 
     s_blink_timer += dt;
 
@@ -797,7 +1484,370 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     s_widget_id = id;
     ImRect bb(ImVec2(ox, oy), ImVec2(ox + width, oy + editor_h));
     ImGui::ItemSize(ImVec2(width, height));
-    if (!ImGui::ItemAdd(bb, id)) { if (g_code_font) ImGui::PopFont(); return; }
+    if (!ImGui::ItemAdd(bb, id)) {
+        ImGui::SetWindowFontScale(prev_font_scale);
+        if (code_font) ImGui::PopFont();
+        return;
+    }
+
+    bool diff_active = false;
+    {
+        std::lock_guard<std::mutex> lk(s_diff_mtx);
+        diff_active = s_diff.active && !s_diff.hunks.empty();
+    }
+
+    if (diff_active) {
+        std::lock_guard<std::mutex> lk(s_diff_mtx);
+        s_scroll_x = 0.f;
+
+        const float hdr_h = 40.f;
+        ImVec2 hdr_min(ox, oy);
+        ImVec2 hdr_max(ox + width, oy + hdr_h);
+        dl->AddRectFilled(hdr_min, hdr_max, aida::ui::with_alpha(th.panel_header, a));
+        dl->AddLine(ImVec2(hdr_min.x, hdr_max.y - 1.f), ImVec2(hdr_max.x, hdr_max.y - 1.f),
+                    aida::ui::with_alpha(th.border_subtle, a), 1.f);
+
+        ImFont* hdr_font = aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont();
+        {
+            std::string title = "AI Edit";
+            if (!s_diff.origin.empty()) title += "  -  " + s_diff.origin;
+            dl->AddText(hdr_font, 14.f, ImVec2(hdr_min.x + 14.f, hdr_min.y + 6.f),
+                        aida::ui::with_alpha(th.text_primary, a), title.c_str());
+
+            char stats[96];
+            int pend = 0;
+            for (const auto& h : s_diff.hunks)
+                if (h.state == code_editor_widget::diff_hunk_state_t::pending) pend++;
+            snprintf(stats, sizeof(stats), "+%d  -%d   %d hunk%s   %d pending",
+                     s_diff.total_added, s_diff.total_removed,
+                     static_cast<int>(s_diff.hunks.size()),
+                     s_diff.hunks.size() == 1 ? "" : "s", pend);
+            dl->AddText(hdr_font, 12.f, ImVec2(hdr_min.x + 14.f, hdr_min.y + 22.f),
+                        aida::ui::with_alpha(th.text_secondary, a), stats);
+        }
+
+        bool want_accept_all = false;
+        bool want_reject_all = false;
+        {
+            ImGui::PushID("##diff_hdr_actions");
+            const float bw = 88.f;
+            const float bh = 24.f;
+            float by = hdr_min.y + (hdr_h - bh) * 0.5f;
+            float bx_reject = hdr_max.x - 14.f - bw;
+            float bx_accept = bx_reject - 8.f - bw;
+
+            ImVec2 mp = ImGui::GetIO().MousePos;
+            auto hdr_button = [&](const char* label, float bx, ImU32 base, bool& out) {
+                ImVec2 mn(bx, by), mx(bx + bw, by + bh);
+                bool hov = (mp.x >= mn.x && mp.x <= mx.x && mp.y >= mn.y && mp.y <= mx.y);
+                dl->AddRectFilled(mn, mx, aida::ui::with_alpha(base, (hov ? 0.32f : 0.20f) * a), 6.f);
+                dl->AddRect(mn, mx, aida::ui::with_alpha(base, (hov ? 0.95f : 0.55f) * a), 6.f, 0, 1.f);
+                float tw = hdr_font->CalcTextSizeA(12.f, FLT_MAX, 0.f, label).x;
+                dl->AddText(hdr_font, 12.f,
+                            ImVec2(mn.x + (bw - tw) * 0.5f, mn.y + (bh - 12.f) * 0.5f),
+                            aida::ui::with_alpha(base, a), label);
+                if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) out = true;
+            };
+            hdr_button("Accept All", bx_accept, th.success, want_accept_all);
+            hdr_button("Reject All", bx_reject, th.error, want_reject_all);
+            ImGui::PopID();
+        }
+
+        struct vis_row_t {
+            int hunk = -1;
+            int line_in_hunk = -1;
+            bool is_hunk_head = false;
+            code_editor_widget::diff_line_kind_t kind = code_editor_widget::diff_line_kind_t::context;
+            const std::string* text = nullptr;
+            int old_no = -1;
+            int new_no = -1;
+        };
+        std::vector<vis_row_t> rows;
+        rows.reserve(s_diff.old_lines.size() + s_diff.total_added + s_diff.hunks.size());
+
+        {
+            int old_idx = 0;
+            int gap_ctx = 3;
+            for (int hi = 0; hi < static_cast<int>(s_diff.hunks.size()); ++hi) {
+                const code_editor_widget::diff_hunk_t& h = s_diff.hunks[hi];
+
+                int hunk_old_begin = h.old_count > 0 ? h.old_start : old_idx;
+                if (h.old_count == 0) {
+                    for (const auto& dl2 : h.lines)
+                        if (dl2.kind == code_editor_widget::diff_line_kind_t::context && dl2.old_line >= 0) {
+                            hunk_old_begin = dl2.old_line; break;
+                        }
+                }
+
+                int ctx_from = std::max(old_idx, hunk_old_begin - gap_ctx);
+                if (hi == 0) ctx_from = std::max(0, hunk_old_begin - gap_ctx);
+                if (ctx_from > old_idx && old_idx > 0) {
+                    vis_row_t sep;
+                    sep.kind = code_editor_widget::diff_line_kind_t::context;
+                    rows.push_back(sep);
+                }
+                for (int li = ctx_from; li < hunk_old_begin &&
+                                          li < static_cast<int>(s_diff.old_lines.size()); ++li) {
+                    vis_row_t r;
+                    r.kind = code_editor_widget::diff_line_kind_t::context;
+                    r.text = &s_diff.old_lines[li];
+                    r.old_no = li + 1;
+                    r.new_no = -1;
+                    rows.push_back(r);
+                }
+
+                vis_row_t head;
+                head.hunk = hi;
+                head.is_hunk_head = true;
+                rows.push_back(head);
+
+                for (int k = 0; k < static_cast<int>(h.lines.size()); ++k) {
+                    const code_editor_widget::diff_line_t& dl2 = h.lines[k];
+                    vis_row_t r;
+                    r.hunk = hi;
+                    r.line_in_hunk = k;
+                    r.kind = dl2.kind;
+                    r.text = &dl2.text;
+                    r.old_no = dl2.old_line >= 0 ? dl2.old_line + 1 : -1;
+                    r.new_no = dl2.new_line >= 0 ? dl2.new_line + 1 : -1;
+                    rows.push_back(r);
+                }
+
+                int consumed = 0;
+                for (const auto& dl2 : h.lines)
+                    if (dl2.old_line >= 0) consumed++;
+                old_idx = hunk_old_begin + consumed;
+            }
+
+            int tail_to = std::min(static_cast<int>(s_diff.old_lines.size()), old_idx + gap_ctx);
+            if (old_idx < static_cast<int>(s_diff.old_lines.size())) {
+                for (int li = old_idx; li < tail_to; ++li) {
+                    vis_row_t r;
+                    r.kind = code_editor_widget::diff_line_kind_t::context;
+                    r.text = &s_diff.old_lines[li];
+                    r.old_no = li + 1;
+                    rows.push_back(r);
+                }
+            }
+        }
+
+        const float body_y0 = oy + hdr_h;
+        const float body_h  = editor_h - hdr_h;
+        const float diff_gutter_w = char_w * 11.f + 16.f;
+        const float sign_x = ox + diff_gutter_w + 4.f;
+        const float diff_text_x = sign_x + char_w * 1.6f;
+
+        float content_h = rows.size() * line_h;
+        float diff_max_scroll = std::max(0.f, content_h - body_h + line_h);
+        if (s_diff_scroll_target < 0.f) s_diff_scroll_target = 0.f;
+
+        bool body_hovered = ImGui::IsMouseHoveringRect(
+            ImVec2(ox, body_y0), ImVec2(ox + width, body_y0 + body_h));
+        if (body_hovered) {
+            float wheel = ImGui::GetIO().MouseWheel;
+            if (wheel != 0.f) s_diff_scroll_target -= wheel * line_h * 3.f;
+        }
+        s_diff_scroll_target = std::max(0.f, std::min(s_diff_scroll_target, diff_max_scroll));
+        s_scroll_y = aida::motion::smooth_lerp(s_scroll_y, s_diff_scroll_target, 20.f, dt);
+        if (std::abs(s_diff_scroll_target - s_scroll_y) < 0.5f) s_scroll_y = s_diff_scroll_target;
+        s_scroll_y = std::max(0.f, std::min(s_scroll_y, diff_max_scroll));
+
+        dl->PushClipRect(ImVec2(ox, body_y0), ImVec2(ox + width, body_y0 + body_h), true);
+
+        int diff_first = std::max(0, static_cast<int>(s_scroll_y / line_h) - 1);
+        int diff_last  = std::min(static_cast<int>(rows.size()) - 1,
+                                  static_cast<int>((s_scroll_y + body_h) / line_h) + 1);
+
+        ImVec2 mp = ImGui::GetIO().MousePos;
+        int new_hover_hunk = -1;
+        std::vector<int> accept_clicked;
+        std::vector<int> reject_clicked;
+
+        for (int ri = diff_first; ri <= diff_last; ++ri) {
+            const vis_row_t& r = rows[ri];
+            float ry = body_y0 + ri * line_h - s_scroll_y;
+
+            if (r.is_hunk_head) {
+                const code_editor_widget::diff_hunk_t& h = s_diff.hunks[r.hunk];
+                dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + code_w, ry + line_h),
+                                  aida::ui::with_alpha(th.accent_glow, 0.6f * a));
+                char hb[64];
+                snprintf(hb, sizeof(hb), "@@ -%d,%d +%d,%d @@",
+                         h.old_start + 1, h.old_count, h.new_start + 1, h.new_count);
+                dl->AddText(ImVec2(ox + 10.f, ry + 1.f),
+                            aida::ui::with_alpha(th.accent_u32, a), hb);
+
+                const char* state_label =
+                    h.state == code_editor_widget::diff_hunk_state_t::accepted ? "ACCEPTED" :
+                    h.state == code_editor_widget::diff_hunk_state_t::rejected ? "REJECTED" : nullptr;
+
+                const float hbw = char_w * 7.f + 10.f;
+                const float hbh = line_h - 4.f;
+                float hby = ry + 2.f;
+                float hbx_rej = ox + code_w - 12.f - hbw;
+                float hbx_acc = hbx_rej - 6.f - hbw;
+
+                if (state_label) {
+                    ImU32 sc = h.state == code_editor_widget::diff_hunk_state_t::accepted
+                                   ? th.success : th.error;
+                    float tw = ImGui::CalcTextSize(state_label).x;
+                    dl->AddText(ImVec2(ox + code_w - 12.f - tw, ry + 1.f),
+                                aida::ui::with_alpha(sc, a), state_label);
+                    if (mp.x >= ox && mp.x <= ox + code_w && mp.y >= ry && mp.y < ry + line_h)
+                        new_hover_hunk = r.hunk;
+                } else {
+                    auto mini_btn = [&](const char* lbl, float bx, ImU32 base) -> bool {
+                        ImVec2 mn(bx, hby), mx(bx + hbw, hby + hbh);
+                        bool hov = (mp.x >= mn.x && mp.x <= mx.x && mp.y >= mn.y && mp.y <= mx.y);
+                        dl->AddRectFilled(mn, mx, aida::ui::with_alpha(base, (hov ? 0.35f : 0.18f) * a), 4.f);
+                        dl->AddRect(mn, mx, aida::ui::with_alpha(base, (hov ? 1.f : 0.5f) * a), 4.f, 0, 1.f);
+                        float tw = ImGui::CalcTextSize(lbl).x;
+                        dl->AddText(ImVec2(mn.x + (hbw - tw) * 0.5f, mn.y + (hbh - ImGui::GetFontSize()) * 0.5f),
+                                    aida::ui::with_alpha(base, a), lbl);
+                        return hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+                    };
+                    if (mini_btn("Accept", hbx_acc, th.success)) accept_clicked.push_back(r.hunk);
+                    if (mini_btn("Reject", hbx_rej, th.error))   reject_clicked.push_back(r.hunk);
+                    if (mp.x >= ox && mp.x <= ox + code_w && mp.y >= ry && mp.y < ry + line_h)
+                        new_hover_hunk = r.hunk;
+                }
+                continue;
+            }
+
+            if (!r.text) {
+                float midy = ry + line_h * 0.5f;
+                for (float dx = ox + 12.f; dx < ox + code_w - 12.f; dx += 8.f)
+                    dl->AddLine(ImVec2(dx, midy), ImVec2(dx + 3.f, midy),
+                                aida::ui::with_alpha(th.border_subtle, a), 1.f);
+                continue;
+            }
+
+            bool is_add = r.kind == code_editor_widget::diff_line_kind_t::added;
+            bool is_rem = r.kind == code_editor_widget::diff_line_kind_t::removed;
+
+            bool hunk_resolved = false;
+            ImU32 wash = 0;
+            ImU32 bar  = 0;
+            if (is_add) {
+                wash = aida::ui::with_alpha(th.success, 0.14f * a);
+                bar  = aida::ui::with_alpha(th.success, 0.9f * a);
+            } else if (is_rem) {
+                wash = aida::ui::with_alpha(th.error, 0.14f * a);
+                bar  = aida::ui::with_alpha(th.error, 0.9f * a);
+            }
+            if (r.hunk >= 0) {
+                const code_editor_widget::diff_hunk_t& h = s_diff.hunks[r.hunk];
+                hunk_resolved = h.state != code_editor_widget::diff_hunk_state_t::pending;
+                if (h.state == code_editor_widget::diff_hunk_state_t::rejected && is_add) {
+                    wash = aida::ui::with_alpha(th.text_dim, 0.06f * a);
+                    bar  = aida::ui::with_alpha(th.text_dim, 0.4f * a);
+                } else if (h.state == code_editor_widget::diff_hunk_state_t::accepted && is_rem) {
+                    wash = aida::ui::with_alpha(th.text_dim, 0.06f * a);
+                    bar  = aida::ui::with_alpha(th.text_dim, 0.4f * a);
+                }
+            }
+
+            if (wash) dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + code_w, ry + line_h), wash);
+            if (bar)  dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + 3.f, ry + line_h), bar);
+
+            if (r.hunk >= 0 && r.hunk == s_diff_hover_hunk && !hunk_resolved)
+                dl->AddRectFilled(ImVec2(ox + 3.f, ry), ImVec2(ox + code_w, ry + line_h),
+                                  aida::ui::with_alpha(th.accent_u32, 0.05f * a));
+
+            char numbuf[24];
+            if (r.old_no > 0)
+                snprintf(numbuf, sizeof(numbuf), "%5d", r.old_no);
+            else
+                snprintf(numbuf, sizeof(numbuf), "     ");
+            dl->AddText(ImVec2(ox + 6.f, ry + 1.f),
+                        aida::ui::with_alpha(th.text_lineno, a), numbuf);
+            if (r.new_no > 0)
+                snprintf(numbuf, sizeof(numbuf), "%5d", r.new_no);
+            else
+                snprintf(numbuf, sizeof(numbuf), "     ");
+            dl->AddText(ImVec2(ox + 6.f + char_w * 5.5f, ry + 1.f),
+                        aida::ui::with_alpha(th.text_lineno, a), numbuf);
+
+            const char* sign = is_add ? "+" : (is_rem ? "-" : " ");
+            ImU32 sign_col = is_add ? aida::ui::with_alpha(th.success, a)
+                          : is_rem ? aida::ui::with_alpha(th.error, a)
+                          : aida::ui::with_alpha(th.text_dim, a);
+            dl->AddText(ImVec2(sign_x, ry + 1.f), sign_col, sign);
+
+            std::vector<syntax::token_t> toks;
+            syntax::tokenize(*r.text, s_lang, toks);
+            float tx = diff_text_x - s_scroll_x;
+            float dim = (is_rem ? 0.92f : 1.f) * (hunk_resolved ? 0.55f : 1.f);
+            for (const auto& tk : toks) {
+                if (tk.type == syntax::token_type::whitespace) {
+                    for (uint32_t kk = 0; kk < tk.length; ++kk) {
+                        char c = (*r.text)[tk.start + kk];
+                        tx += (c == '\t') ? char_w * editor_config::tab_size : char_w;
+                    }
+                    continue;
+                }
+                if (tk.start + tk.length > static_cast<uint32_t>(r.text->size())) continue;
+                ImU32 col = tok_colors[static_cast<int>(tk.type)];
+                col = aida::ui::with_alpha(col, dim);
+                const char* ts = r.text->c_str() + tk.start;
+                dl->AddText(ImVec2(tx, ry + 1.f), col, ts, ts + tk.length);
+                if (is_rem)
+                    dl->AddLine(ImVec2(tx, ry + line_h * 0.5f + 1.f),
+                                ImVec2(tx + tk.length * char_w, ry + line_h * 0.5f + 1.f),
+                                aida::ui::with_alpha(th.error, 0.5f * a), 1.f);
+                tx += tk.length * char_w;
+            }
+        }
+
+        dl->AddLine(ImVec2(ox + diff_gutter_w, body_y0),
+                    ImVec2(ox + diff_gutter_w, body_y0 + body_h),
+                    aida::ui::with_alpha(th.border_subtle, a), 1.f);
+
+        dl->PopClipRect();
+
+        if (content_h > body_h) {
+            const float sb_w = 10.f;
+            float track_x = ox + code_w - sb_w - 2.f;
+            float track_y0 = body_y0 + 2.f;
+            float track_h = body_h - 4.f;
+            float ratio = body_h / content_h;
+            float thumb_h = std::max(24.f, track_h * ratio);
+            float range = content_h - body_h;
+            float thumb_y = track_y0 + (range > 0.f ? (s_scroll_y / range) * (track_h - thumb_h) : 0.f);
+            dl->AddRectFilled(ImVec2(track_x, thumb_y), ImVec2(track_x + sb_w, thumb_y + thumb_h),
+                              aida::ui::with_alpha(th.text_secondary, 0.35f * a), 3.f);
+        }
+
+        s_diff_hover_hunk = new_hover_hunk;
+
+        for (int hi : accept_clicked)
+            if (hi >= 0 && hi < static_cast<int>(s_diff.hunks.size()))
+                s_diff.hunks[hi].state = code_editor_widget::diff_hunk_state_t::accepted;
+        for (int hi : reject_clicked)
+            if (hi >= 0 && hi < static_cast<int>(s_diff.hunks.size()))
+                s_diff.hunks[hi].state = code_editor_widget::diff_hunk_state_t::rejected;
+        if (want_accept_all)
+            for (auto& h : s_diff.hunks) h.state = code_editor_widget::diff_hunk_state_t::accepted;
+        if (want_reject_all)
+            for (auto& h : s_diff.hunks) h.state = code_editor_widget::diff_hunk_state_t::rejected;
+
+        {
+            char buf[160];
+            snprintf(buf, sizeof(buf), "%s%s  -  AI Edit (+%d -%d)",
+                     code_editor::filename.empty() ? "Untitled" : code_editor::filename.c_str(),
+                     code_editor::dirty ? " *" : "",
+                     s_diff.total_added, s_diff.total_removed);
+            globals::ui::status_file_info = buf;
+        }
+
+        finalize_diff_if_resolved_locked();
+
+        ImGui::SetWindowFontScale(prev_font_scale);
+        if (code_font) ImGui::PopFont();
+        return;
+    }
+
+    s_diff_scroll_target = -1.f;
 
     bool mouse_over_find_bar = false;
     if (s_find.visible) {
@@ -841,13 +1891,24 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
     if (hovered) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
-        float wheel = ImGui::GetIO().MouseWheel;
-        if (wheel != 0.f)
+        float wheel  = ImGui::GetIO().MouseWheel;
+        float wheelh = ImGui::GetIO().MouseWheelH;
+        bool  h_intent = ImGui::GetIO().KeyShift;
+        if (h_intent && wheel != 0.f && !word_wrap_on) {
+            s_scroll_x -= wheel * char_w * 6.f;
+        } else if (wheel != 0.f) {
             s_target_scroll_y -= wheel * line_h * 3.f;
+        }
+        if (wheelh != 0.f && !word_wrap_on)
+            s_scroll_x -= wheelh * char_w * 6.f;
+        if (s_scroll_x > s_max_scroll_x) s_scroll_x = s_max_scroll_x;
+        if (s_scroll_x < 0.f) s_scroll_x = 0.f;
     }
 
     int first_row = std::max(0, static_cast<int>(s_scroll_y / line_h) - 1);
     int last_row  = std::min(n_lines - 1, static_cast<int>((s_scroll_y + editor_h) / line_h) + 1);
+
+    dl->PushClipRect(ImVec2(ox, oy), ImVec2(ox + code_w, oy + editor_h), true);
 
     if (show_ln) {
         dl->AddLine(ImVec2(ox + gutter_w, oy),
@@ -1038,6 +2099,39 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     }
 
 
+    if (editor_config::bracket_match && s_has_focus && !s_sel.has_selection()) {
+        int br_open_line = -1, br_open_col = -1;
+        const std::string& cl = line_at(s_sel.caret_line);
+        char here   = (s_sel.caret_col >= 0 && s_sel.caret_col < static_cast<int>(cl.size()))
+                          ? cl[s_sel.caret_col] : 0;
+        char before = (s_sel.caret_col > 0 && s_sel.caret_col - 1 < static_cast<int>(cl.size()))
+                          ? cl[s_sel.caret_col - 1] : 0;
+        if (is_open_bracket(here) || is_close_bracket(here)) {
+            br_open_line = s_sel.caret_line; br_open_col = s_sel.caret_col;
+        } else if (is_open_bracket(before) || is_close_bracket(before)) {
+            br_open_line = s_sel.caret_line; br_open_col = s_sel.caret_col - 1;
+        }
+        if (br_open_line >= 0) {
+            int mline = -1, mcol = -1;
+            char mch = 0;
+            bool found = find_matching_bracket(br_open_line, br_open_col, mline, mcol, mch);
+            ImU32 box_col = found ? aida::ui::with_alpha(th.accent_u32, 0.55f * a)
+                                  : aida::ui::with_alpha(th.error, 0.55f * a);
+            ImU32 fill_col = found ? aida::ui::with_alpha(th.accent_glow, a)
+                                   : aida::ui::with_alpha(th.error, 0.18f * a);
+            auto draw_box = [&](int bl, int bc) {
+                float bx = ox + text_x0 + bc * char_w - s_scroll_x;
+                float by = oy + bl * line_h - s_scroll_y;
+                if (by < oy - line_h || by > oy + editor_h) return;
+                dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + char_w, by + line_h), fill_col, 2.f);
+                dl->AddRect(ImVec2(bx, by), ImVec2(bx + char_w, by + line_h), box_col, 2.f, 0, 1.f);
+            };
+            draw_box(br_open_line, br_open_col);
+            if (found) draw_box(mline, mcol);
+        }
+    }
+
+
     if (s_has_focus) {
         float caret_alpha_pulse = aida::ui::clock::pulse(2.0f, 0.30f, 1.0f);
         float cx = ox + text_x0 + s_sel.caret_col * char_w - s_scroll_x;
@@ -1215,6 +2309,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                 s_mouse_selecting = true;
             }
             s_blink_timer = 0.f; s_blink_on = true;
+            break_undo_coalescing();
         }
 
         if (s_mouse_selecting && !s_sb_dragging && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
@@ -1305,6 +2400,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             s_sel.caret_line = new_line;
             s_sel.caret_col  = new_col;
             s_blink_timer = 0.f; s_blink_on = true;
+            break_undo_coalescing();
             ensure_caret_visible(editor_h, line_h);
         };
 
@@ -1390,14 +2486,36 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             !(autocomplete::popup_visible && !autocomplete::matches.empty())) {
 
             std::string indent;
+            char prev_ch = 0;
+            char next_ch = 0;
             if (s_sel.caret_line < static_cast<int>(s_cache.lines.size())) {
                 auto& ln = s_cache.lines[s_sel.caret_line];
                 for (char c : ln) {
                     if (c == ' ' || c == '\t') indent += c;
                     else break;
                 }
+                int cc = clamp_col(s_sel.caret_line, s_sel.caret_col);
+                if (cc > 0 && cc - 1 < static_cast<int>(ln.size())) prev_ch = ln[cc - 1];
+                if (cc < static_cast<int>(ln.size())) next_ch = ln[cc];
             }
-            insert_text_at_caret("\n" + indent);
+            bool between_pair = (prev_ch == '{' && next_ch == '}') ||
+                                (prev_ch == '(' && next_ch == ')') ||
+                                (prev_ch == '[' && next_ch == ']');
+            break_undo_coalescing();
+            if (between_pair) {
+                std::string extra(std::max(1, editor_config::tab_size), ' ');
+                insert_text_at_caret("\n" + indent + extra + "\n" + indent);
+                int target_line = s_sel.caret_line - 1;
+                s_sel.caret_line = s_sel.anchor_line = clamp_line(target_line);
+                s_sel.caret_col  = s_sel.anchor_col  =
+                    static_cast<int>(indent.size()) + static_cast<int>(extra.size());
+                s_sel.active = false;
+            } else {
+                if (prev_ch == '{' || prev_ch == '(' || prev_ch == '[' ||
+                    prev_ch == ':')
+                    indent += std::string(std::max(1, editor_config::tab_size), ' ');
+                insert_text_at_caret("\n" + indent);
+            }
             ensure_caret_visible(editor_h, line_h);
         }
         else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Backspace, true)) {
@@ -1439,15 +2557,27 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         else if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_Backspace, true)) {
             if (s_sel.has_selection()) {
                 delete_selection();
+                break_undo_coalescing();
             } else if (s_sel.caret_col > 0) {
                 push_undo();
+                break_undo_coalescing();
                 auto& ln = s_cache.lines[s_sel.caret_line];
                 int del_start = s_sel.caret_col - 1;
                 while (del_start > 0 &&
                        (static_cast<unsigned char>(ln[del_start]) & 0xC0) == 0x80)
                     del_start--;
                 int del_len = s_sel.caret_col - del_start;
-                ln.erase(del_start, del_len);
+                char prev_c = ln[del_start];
+                char next_c = (s_sel.caret_col < static_cast<int>(ln.size()))
+                                  ? ln[s_sel.caret_col] : 0;
+                bool pair = editor_config::bracket_match &&
+                            ((prev_c == '(' && next_c == ')') ||
+                             (prev_c == '[' && next_c == ']') ||
+                             (prev_c == '{' && next_c == '}') ||
+                             (prev_c == '"' && next_c == '"') ||
+                             (prev_c == '\'' && next_c == '\''));
+                if (pair) ln.erase(del_start, del_len + 1);
+                else      ln.erase(del_start, del_len);
                 s_sel.caret_col = s_sel.anchor_col = del_start;
                 rebuild_buffer_from_lines();
             } else if (s_sel.caret_line > 0) {
@@ -1484,12 +2614,83 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                 rebuild_buffer_from_lines();
             }
         }
+        else if (!ctrl && shift && !ghost_consumed_tab &&
+                 !(autocomplete::popup_visible && !autocomplete::matches.empty()) &&
+                 ImGui::IsKeyPressed(ImGuiKey_Tab, true)) {
+
+            int tab = std::max(1, editor_config::tab_size);
+            if (s_sel.has_selection()) {
+                int l0, c0, l1, c1;
+                selection_ordered(l0, c0, l1, c1);
+                (void)c0;
+                int end_line = (c1 == 0 && l1 > l0) ? l1 - 1 : l1;
+                push_undo();
+                break_undo_coalescing();
+                for (int li = l0; li <= end_line && li < line_count(); ++li) {
+                    std::string& ln = s_cache.lines[li];
+                    int removed = 0;
+                    if (!ln.empty() && ln[0] == '\t') { ln.erase(0, 1); removed = 1; }
+                    else {
+                        while (removed < tab && !ln.empty() && ln[0] == ' ') {
+                            ln.erase(0, 1);
+                            removed++;
+                        }
+                    }
+                    if (li == s_sel.anchor_line)
+                        s_sel.anchor_col = std::max(0, s_sel.anchor_col - removed);
+                    if (li == s_sel.caret_line)
+                        s_sel.caret_col = std::max(0, s_sel.caret_col - removed);
+                }
+                rebuild_buffer_from_lines();
+            } else {
+                std::string& ln = s_cache.lines[s_sel.caret_line];
+                int removed = 0;
+                if (!ln.empty() && ln[0] == '\t') { ln.erase(0, 1); removed = 1; }
+                else {
+                    while (removed < tab && !ln.empty() && ln[0] == ' ') {
+                        ln.erase(0, 1);
+                        removed++;
+                    }
+                }
+                if (removed > 0) {
+                    push_undo();
+                    break_undo_coalescing();
+                    s_sel.caret_col = s_sel.anchor_col = std::max(0, s_sel.caret_col - removed);
+                    rebuild_buffer_from_lines();
+                }
+            }
+            ensure_caret_visible(editor_h, line_h);
+        }
         else if (!ctrl && !ghost_consumed_tab &&
                  !(autocomplete::popup_visible && !autocomplete::matches.empty()) &&
                  ImGui::IsKeyPressed(ImGuiKey_Tab, true)) {
 
-            std::string spaces(editor_config::tab_size, ' ');
-            insert_text_at_caret(spaces);
+            int tab = std::max(1, editor_config::tab_size);
+            if (s_sel.has_selection() &&
+                s_sel.anchor_line != s_sel.caret_line) {
+                int l0, c0, l1, c1;
+                selection_ordered(l0, c0, l1, c1);
+                (void)c0;
+                int end_line = (c1 == 0 && l1 > l0) ? l1 - 1 : l1;
+                push_undo();
+                break_undo_coalescing();
+                std::string pad(tab, ' ');
+                for (int li = l0; li <= end_line && li < line_count(); ++li) {
+                    if (s_cache.lines[li].empty()) continue;
+                    s_cache.lines[li].insert(0, pad);
+                    if (li == s_sel.anchor_line) s_sel.anchor_col += tab;
+                    if (li == s_sel.caret_line)  s_sel.caret_col  += tab;
+                }
+                rebuild_buffer_from_lines();
+            } else {
+                int col = clamp_col(s_sel.caret_line, s_sel.caret_col);
+                int to_next = tab - (col % tab);
+                if (to_next <= 0) to_next = tab;
+                std::string spaces(to_next, ' ');
+                insert_text_at_caret(spaces);
+                break_undo_coalescing();
+            }
+            ensure_caret_visible(editor_h, line_h);
         }
         else if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
             if (s_find.visible) s_find.visible = false;
@@ -1524,22 +2725,76 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                 } else {
                     continue;
                 }
-                insert_text_at_caret(utf8);
+
+                char ascii = (cp < 0x80) ? static_cast<char>(cp) : 0;
+                bool handled_bracket = false;
+
+                if (editor_config::bracket_match && ascii != 0) {
+                    const std::string& cl = line_at(s_sel.caret_line);
+                    char next_ch = (s_sel.caret_col < static_cast<int>(cl.size()))
+                                       ? cl[s_sel.caret_col] : 0;
+
+                    if (is_close_bracket(ascii) && next_ch == ascii && !s_sel.has_selection()) {
+                        s_sel.caret_col = s_sel.anchor_col = s_sel.caret_col + 1;
+                        s_sel.active = false;
+                        handled_bracket = true;
+                        break_undo_coalescing();
+                    } else if (ascii == '"' && next_ch == '"' && !s_sel.has_selection()) {
+                        s_sel.caret_col = s_sel.anchor_col = s_sel.caret_col + 1;
+                        s_sel.active = false;
+                        handled_bracket = true;
+                        break_undo_coalescing();
+                    } else if (is_open_bracket(ascii) ||
+                               (ascii == '"' &&
+                                (next_ch == 0 || next_ch == ')' || next_ch == ']' ||
+                                 next_ch == '}' || next_ch == ' ' || next_ch == '\t' ||
+                                 next_ch == ','))) {
+                        if (s_sel.has_selection()) {
+                            std::string sel = get_selected_text();
+                            char close = (ascii == '"') ? '"' : matching_close_bracket(ascii);
+                            insert_text_at_caret(std::string(1, ascii) + sel + std::string(1, close));
+                            break_undo_coalescing();
+                        } else {
+                            char close = (ascii == '"') ? '"' : matching_close_bracket(ascii);
+                            insert_text_at_caret(std::string(1, ascii) + std::string(1, close));
+                            s_sel.caret_col = s_sel.anchor_col = s_sel.caret_col - 1;
+                            break_undo_coalescing();
+                        }
+                        handled_bracket = true;
+                    }
+                }
+
+                if (!handled_bracket) {
+                    int kind = 0;
+                    if (ascii != 0) {
+                        bool word = (ascii >= 'a' && ascii <= 'z') ||
+                                    (ascii >= 'A' && ascii <= 'Z') ||
+                                    (ascii >= '0' && ascii <= '9') || ascii == '_';
+                        kind = word ? 1 : 2;
+                    }
+                    insert_text_at_caret(utf8, kind);
+                    if (kind == 2) break_undo_coalescing();
+                }
                 ensure_caret_visible(editor_h, line_h);
 
 
-                if (editor_config::auto_complete && autocomplete::enabled && cp < 0x80) {
-                    int cursor = s_sel.caret_col;
-                    int ws = cursor;
-                    auto& ln = s_cache.lines[s_sel.caret_line];
-                    while (ws > 0 && (isalnum(static_cast<unsigned char>(ln[ws-1])) || ln[ws-1] == '_'))
-                        ws--;
-                    if (cursor > ws) {
-                        autocomplete::partial = ln.substr(ws, cursor - ws);
-                        autocomplete::find_matches(autocomplete::partial);
-                        autocomplete::popup_visible = !autocomplete::matches.empty();
-                        autocomplete::cursor_line = s_sel.caret_line;
-                        autocomplete::cursor_col  = s_sel.caret_col;
+                if (editor_config::auto_complete && autocomplete::enabled && ascii != 0) {
+                    bool word_ch = (ascii >= 'a' && ascii <= 'z') ||
+                                   (ascii >= 'A' && ascii <= 'Z') ||
+                                   (ascii >= '0' && ascii <= '9') || ascii == '_';
+                    if (word_ch) {
+                        int cursor = s_sel.caret_col;
+                        int ws = cursor;
+                        auto& ln = s_cache.lines[s_sel.caret_line];
+                        while (ws > 0 && (isalnum(static_cast<unsigned char>(ln[ws-1])) || ln[ws-1] == '_'))
+                            ws--;
+                        if (cursor > ws) {
+                            rebuild_autocomplete(ln.substr(ws, cursor - ws), s_sel.caret_line);
+                            autocomplete::cursor_col = s_sel.caret_col;
+                        } else {
+                            autocomplete::popup_visible = false;
+                            autocomplete::matches.clear();
+                        }
                     } else {
                         autocomplete::popup_visible = false;
                         autocomplete::matches.clear();
@@ -1566,9 +2821,11 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                     while (ws > 0 && (isalnum(static_cast<unsigned char>(ln[ws - 1])) || ln[ws - 1] == '_'))
                         ws--;
                     push_undo();
+                    break_undo_coalescing();
+                    const std::string& chosen = autocomplete::matches[autocomplete::selected];
                     ln.erase(ws, cursor - ws);
-                    ln.insert(ws, autocomplete::matches[autocomplete::selected]);
-                    s_sel.caret_col = s_sel.anchor_col = ws + static_cast<int>(autocomplete::matches[autocomplete::selected].size());
+                    ln.insert(ws, chosen);
+                    s_sel.caret_col = s_sel.anchor_col = ws + static_cast<int>(chosen.size());
                     rebuild_buffer_from_lines();
                 }
                 autocomplete::popup_visible = false;
@@ -1576,6 +2833,9 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             }
         }
     }
+
+
+    dl->PopClipRect();
 
 
     {
@@ -1593,14 +2853,27 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
 
     if (autocomplete::popup_visible && !autocomplete::matches.empty() && s_has_focus) {
-        float popup_w = 240.f;
-        float ac_item_h = 24.f;
-        float popup_h = std::min(static_cast<float>(autocomplete::matches.size()), 8.f) * ac_item_h + 10.f;
+        const int   total = static_cast<int>(autocomplete::matches.size());
+        const int   max_visible = 8;
+        const float popup_w = 280.f;
+        const float ac_item_h = 24.f;
+        const int   visible = std::min(total, max_visible);
+        const float popup_h = visible * ac_item_h + 10.f;
+
+        int sel = autocomplete::selected;
+        if (sel < 0) sel = 0;
+        if (sel >= total) sel = total - 1;
+        autocomplete::selected = sel;
+        int top = 0;
+        if (sel >= max_visible) top = sel - max_visible + 1;
+        if (top > total - visible) top = std::max(0, total - visible);
+
         float sx = ox + text_x0 + autocomplete::cursor_col * char_w - s_scroll_x;
         float sy = oy + (autocomplete::cursor_line + 1) * line_h - s_scroll_y + 4.f;
-
         if (sx + popup_w > ox + code_w) sx = ox + code_w - popup_w - 4.f;
-        if (sy + popup_h > oy + editor_h) sy = oy + autocomplete::cursor_line * line_h - s_scroll_y - popup_h;
+        if (sx < ox + text_x0) sx = ox + text_x0;
+        if (sy + popup_h > oy + editor_h)
+            sy = oy + autocomplete::cursor_line * line_h - s_scroll_y - popup_h;
 
         ImDrawList* fdl = ImGui::GetForegroundDrawList();
         ImVec2 pmin(sx, sy);
@@ -1609,31 +2882,89 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         aida::ui::blur::render_glass_fill(fdl, pmin, pmax, 10.f, a);
         aida::ui::blur::render_glass_border(fdl, pmin, pmax, 10.f, a, 1.f);
 
-        for (int mi = 0; mi < static_cast<int>(autocomplete::matches.size()) && mi < 8; mi++) {
-            float iy = sy + 5.f + mi * ac_item_h;
+        std::string lower_pat = autocomplete::partial;
+        for (auto& c : lower_pat) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+
+        const auto& kws = autocomplete::keywords();
+        std::unordered_set<std::string> kw_set(kws.begin(), kws.end());
+
+        int accepted_idx = -1;
+        ImVec2 mp = ImGui::GetIO().MousePos;
+
+        for (int row = 0; row < visible; ++row) {
+            int mi = top + row;
+            float iy = sy + 5.f + row * ac_item_h;
             float text_y = iy + (ac_item_h - ImGui::GetFontSize()) * 0.5f;
+            const std::string& match = autocomplete::matches[mi];
+
+            ImVec2 row_min(sx + 3.f, iy);
+            ImVec2 row_max(sx + popup_w - 3.f, iy + ac_item_h);
+            bool row_hov = (mp.x >= row_min.x && mp.x <= row_max.x &&
+                            mp.y >= row_min.y && mp.y <= row_max.y);
+            if (row_hov) autocomplete::selected = mi;
+
             if (mi == autocomplete::selected) {
-                fdl->AddRectFilled(ImVec2(sx + 3.f, iy), ImVec2(sx + popup_w - 3.f, iy + ac_item_h),
+                fdl->AddRectFilled(row_min, row_max,
                     aida::ui::with_alpha(th.accent_dim, 0.55f * a), 6.f);
                 fdl->AddRectFilled(ImVec2(sx + 3.f, iy), ImVec2(sx + 5.f, iy + ac_item_h),
                     aida::ui::with_alpha(th.accent_u32, a), 1.f);
+            } else if (row_hov) {
+                fdl->AddRectFilled(row_min, row_max,
+                    aida::ui::with_alpha(th.hover_wash, 1.4f * a), 6.f);
             }
 
-            auto& match = autocomplete::matches[mi];
-            size_t plen = autocomplete::partial.size();
-            if (plen > 0 && plen <= match.size()) {
-                fdl->AddText(ImVec2(sx + 12.f, text_y),
-                    aida::ui::with_alpha(th.accent_u32, a),
-                    match.c_str(), match.c_str() + plen);
-                float prefix_w = ImGui::CalcTextSize(match.c_str(), match.c_str() + plen).x;
-                fdl->AddText(ImVec2(sx + 12.f + prefix_w, text_y),
-                    aida::ui::with_alpha(th.text_primary, 0.90f * a),
-                    match.c_str() + plen);
-            } else {
-                fdl->AddText(ImVec2(sx + 12.f, text_y),
-                    aida::ui::with_alpha(th.text_primary, 0.90f * a),
-                    match.c_str());
+            float tx = sx + 14.f;
+            size_t pi = 0;
+            for (size_t ci = 0; ci < match.size(); ++ci) {
+                char glyph[2] = { match[ci], 0 };
+                char lc = static_cast<char>(tolower(static_cast<unsigned char>(match[ci])));
+                bool hit = (pi < lower_pat.size() && lc == lower_pat[pi]);
+                ImU32 col = hit ? aida::ui::with_alpha(th.accent_u32, a)
+                                : aida::ui::with_alpha(th.text_primary, 0.90f * a);
+                if (hit) pi++;
+                fdl->AddText(ImVec2(tx, text_y), col, glyph);
+                tx += ImGui::CalcTextSize(glyph).x;
             }
+
+            const char* kind = kw_set.count(match) ? "kw" : "id";
+            ImU32 kind_col = kw_set.count(match)
+                ? aida::ui::with_alpha(th.syn_keyword, 0.85f * a)
+                : aida::ui::with_alpha(th.text_dim, 0.85f * a);
+            float kw_w = ImGui::CalcTextSize(kind).x;
+            fdl->AddText(ImVec2(sx + popup_w - 12.f - kw_w, text_y), kind_col, kind);
+
+            if (row_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                accepted_idx = mi;
+        }
+
+        if (total > visible) {
+            float track_x = sx + popup_w - 6.f;
+            float track_y0 = sy + 5.f;
+            float track_h = visible * ac_item_h;
+            float thumb_h = std::max(16.f, track_h * static_cast<float>(visible) / total);
+            float thumb_y = track_y0 +
+                (track_h - thumb_h) * static_cast<float>(top) /
+                std::max(1, total - visible);
+            fdl->AddRectFilled(ImVec2(track_x, thumb_y),
+                ImVec2(track_x + 3.f, thumb_y + thumb_h),
+                aida::ui::with_alpha(th.text_secondary, 0.4f * a), 2.f);
+        }
+
+        if (accepted_idx >= 0 && accepted_idx < total) {
+            int cursor = s_sel.caret_col;
+            int ws = cursor;
+            auto& ln = s_cache.lines[s_sel.caret_line];
+            while (ws > 0 && (isalnum(static_cast<unsigned char>(ln[ws - 1])) || ln[ws - 1] == '_'))
+                ws--;
+            push_undo();
+            break_undo_coalescing();
+            const std::string& chosen = autocomplete::matches[accepted_idx];
+            ln.erase(ws, cursor - ws);
+            ln.insert(ws, chosen);
+            s_sel.caret_col = s_sel.anchor_col = ws + static_cast<int>(chosen.size());
+            rebuild_buffer_from_lines();
+            autocomplete::popup_visible = false;
+            autocomplete::matches.clear();
         }
     }
 
@@ -1979,6 +3310,69 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         }
     }
 
+    if (!word_wrap_on && s_max_scroll_x > 0.5f) {
+        static bool  s_hsb_dragging = false;
+        static float s_hsb_drag_offset = 0.f;
+
+        const float sb_h   = h_scrollbar_h;
+        const float sb_pad = 2.f;
+        float track_x0 = ox + text_x0;
+        float track_y  = oy + editor_h - sb_h - sb_pad;
+        float track_w  = code_w - text_x0 - 14.f;
+        if (track_w < 30.f) track_w = 30.f;
+
+        float total_w   = s_max_scroll_x + track_w;
+        float ratio     = track_w / total_w;
+        float thumb_w   = std::max(28.f, track_w * ratio);
+        float thumb_x   = track_x0 + (s_max_scroll_x > 0.f
+            ? (s_scroll_x / s_max_scroll_x) * (track_w - thumb_w) : 0.f);
+
+        bool hsb_hov = ImGui::IsMouseHoveringRect(
+            ImVec2(track_x0, track_y - 3.f),
+            ImVec2(track_x0 + track_w, track_y + sb_h + 3.f));
+
+        ImGuiID hsb_id = ImGui::GetID("##code_hsb_hov");
+        float hsb_a = ImGui::GetStateStorage()->GetFloat(hsb_id, 0.f);
+        hsb_a = aida::motion::smooth_lerp(hsb_a, (hsb_hov || s_hsb_dragging) ? 1.f : 0.f, 14.f, dt);
+        ImGui::GetStateStorage()->SetFloat(hsb_id, hsb_a);
+
+        if (hsb_a > 0.01f) {
+            dl->AddRectFilled(ImVec2(track_x0, track_y),
+                ImVec2(track_x0 + track_w, track_y + sb_h),
+                aida::ui::with_alpha(th.text_primary, 0.04f * hsb_a * a), 3.f);
+            bool thumb_hov = ImGui::IsMouseHoveringRect(
+                ImVec2(thumb_x, track_y - 2.f),
+                ImVec2(thumb_x + thumb_w, track_y + sb_h + 2.f));
+            ImU32 thumb_col = aida::ui::with_alpha(
+                (thumb_hov || s_hsb_dragging) ? th.accent_u32 : th.text_secondary,
+                (thumb_hov || s_hsb_dragging ? 0.55f : 0.30f) * hsb_a * a);
+            dl->AddRectFilled(ImVec2(thumb_x, track_y),
+                ImVec2(thumb_x + thumb_w, track_y + sb_h), thumb_col, 3.f);
+        }
+
+        if (hsb_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            float mx = ImGui::GetIO().MousePos.x;
+            if (mx < thumb_x || mx > thumb_x + thumb_w) {
+                float click_ratio = (mx - track_x0 - thumb_w * 0.5f) / (track_w - thumb_w);
+                click_ratio = std::max(0.f, std::min(1.f, click_ratio));
+                s_scroll_x = click_ratio * s_max_scroll_x;
+            }
+            s_hsb_dragging = true;
+            s_hsb_drag_offset = ImGui::GetIO().MousePos.x - thumb_x;
+        }
+        if (s_hsb_dragging) {
+            if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                float mx = ImGui::GetIO().MousePos.x - s_hsb_drag_offset;
+                float drag_ratio = (track_w - thumb_w) > 0.f
+                    ? (mx - track_x0) / (track_w - thumb_w) : 0.f;
+                drag_ratio = std::max(0.f, std::min(1.f, drag_ratio));
+                s_scroll_x = drag_ratio * s_max_scroll_x;
+            } else {
+                s_hsb_dragging = false;
+            }
+        }
+    }
+
     if (minimap_w > 0.f && n_lines > 1) {
         float mm_x = ox + code_w;
         float mm_y = oy;
@@ -2070,5 +3464,6 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         }
     }
 
-    if (g_code_font) ImGui::PopFont();
+    ImGui::SetWindowFontScale(prev_font_scale);
+    if (code_font) ImGui::PopFont();
 }

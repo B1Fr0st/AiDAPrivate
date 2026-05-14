@@ -23,6 +23,8 @@ const NONCE_REPLAY_TTL_SECONDS = parseInt(process.env.NONCE_REPLAY_TTL_SECONDS |
 const CHALLENGE_REQUIRED = (process.env.CHALLENGE_REQUIRED || '1') !== '0';
 const HEARTBEAT_NONCE_MAX_AGE_SECONDS = 60;
 const BIND_PROOF_HISTORY_LIMIT = 32;
+const DRIVER_PROOF_REQUIRED_AFTER_SECONDS = 1800;
+const DRIVER_PROOF_ABSENT_KILL_STREAK = 3;
 const ENTERPRISE_PLAN_TIER = 'enterprise';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 const TELEGRAM_BOT_TOKEN  = process.env.TELEGRAM_BOT_TOKEN || '';
@@ -662,8 +664,8 @@ async function storeSession(licenseKey, sessionData) {
     const sessionTokenWrapped = encryptSessionToken(sessionUuid, sessionData.session_token);
     const authHmacKey = crypto.randomBytes(32);
     await pool.query(`
-        INSERT INTO sessions (license_key, session_token, server_nonce, issued_at, ttl, hwid, ip, plugin_version, last_heartbeat, kill_flag, heartbeat_count, last_proof_token, last_code_hash, ip_history, heartbeat_times, honeypot_export, challenge_id, last_chain_tag, session_uuid, column_crypt_version, auth_hmac_key, anomaly_score)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, 0, '', '', ARRAY[$7]::TEXT[], ARRAY[]::BIGINT[], $10, $11, '', $12, 1, $13, 0)
+        INSERT INTO sessions (license_key, session_token, server_nonce, issued_at, ttl, hwid, ip, plugin_version, last_heartbeat, kill_flag, heartbeat_count, last_proof_token, last_code_hash, ip_history, heartbeat_times, honeypot_export, challenge_id, last_chain_tag, session_uuid, column_crypt_version, auth_hmac_key, anomaly_score, driver_proof_absent_streak)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, 0, '', '', ARRAY[$7]::TEXT[], ARRAY[]::BIGINT[], $10, $11, '', $12, 1, $13, 0, 0)
         ON CONFLICT (license_key) DO UPDATE SET
             session_token        = EXCLUDED.session_token,
             server_nonce         = EXCLUDED.server_nonce,
@@ -686,7 +688,8 @@ async function storeSession(licenseKey, sessionData) {
             session_uuid         = EXCLUDED.session_uuid,
             column_crypt_version = 1,
             auth_hmac_key        = EXCLUDED.auth_hmac_key,
-            anomaly_score        = 0
+            anomaly_score        = 0,
+            driver_proof_absent_streak = 0
     `, [
         licenseKey,
         sessionTokenWrapped,
@@ -1357,17 +1360,28 @@ async function handleHeartbeat(body, clientIp) {
         && /^[0-9a-fA-F]+$/.test(driverProofRaw);
     const issuedAtNum = Number(session.issued_at || 0);
     const sessionAgeSeconds = Number.isFinite(issuedAtNum) && issuedAtNum > 0 ? (now - issuedAtNum) : 0;
+    const prevDriverProofAbsentStreak = Math.max(0, Math.floor(Number(session.driver_proof_absent_streak || 0)) || 0);
+    let driverProofAbsentStreak = 0;
+    if (sessionAgeSeconds > DRIVER_PROOF_REQUIRED_AFTER_SECONDS) {
+        driverProofAbsentStreak = driverProofPresent ? 0 : (prevDriverProofAbsentStreak + 1);
+    }
+    const driverProofMissingConfirmed = !driverProofPresent
+        && sessionAgeSeconds > DRIVER_PROOF_REQUIRED_AFTER_SECONDS
+        && driverProofAbsentStreak >= DRIVER_PROOF_ABSENT_KILL_STREAK;
     dbgHb('driver_proof_check', {
         present: driverProofPresent,
         driver_proof_len: typeof driverProofRaw === 'string' ? driverProofRaw.length : 0,
         session_age_s: sessionAgeSeconds,
-        threshold_s: 1800,
-        will_violate_if_missing: !driverProofPresent && sessionAgeSeconds > 1800,
+        threshold_s: DRIVER_PROOF_REQUIRED_AFTER_SECONDS,
+        absent_streak: driverProofAbsentStreak,
+        kill_streak: DRIVER_PROOF_ABSENT_KILL_STREAK,
+        will_violate_if_missing: driverProofMissingConfirmed,
     });
-    if (!driverProofPresent && sessionAgeSeconds > 1800) {
+    if (driverProofMissingConfirmed) {
         violationReasons.push('arc_driver_proof_missing');
         violationEvidence.session_age_seconds = sessionAgeSeconds;
         violationEvidence.driver_proof_len = typeof driverProofRaw === 'string' ? driverProofRaw.length : 0;
+        violationEvidence.driver_proof_absent_streak = driverProofAbsentStreak;
     }
 
     const codeHashStored = session.last_code_hash || '';
@@ -1462,7 +1476,8 @@ async function handleHeartbeat(body, clientIp) {
             last_code_hash    = $3,
             ip_history        = $4,
             heartbeat_times   = $5,
-            last_gate_bitmap  = $7
+            last_gate_bitmap  = $7,
+            driver_proof_absent_streak = $8
         WHERE license_key = $6
     `, [
         now,
@@ -1472,6 +1487,7 @@ async function handleHeartbeat(body, clientIp) {
         newHbTimes,
         license_key,
         gateBitmapToStore,
+        driverProofAbsentStreak,
     ]);
 
     const anomalyEffectiveHwid = hwid || session.hwid || '';

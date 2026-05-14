@@ -365,7 +365,7 @@ static bool os_prefers_dark()
 
 static void apply_initial_theme()
 {
-    aida::ui::apply_immediate(aida::ui::detail::make_midnight_dark());
+    aida::ui::apply_immediate(aida::ui::detail::make_aida_dark());
 }
 
 static void apply_os_theme_animated()

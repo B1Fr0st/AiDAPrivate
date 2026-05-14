@@ -8,8 +8,10 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -25,6 +27,8 @@ static std::atomic<bool>             g_initialized{false};
 static std::map<std::string, script_info> g_scripts;
 static std::deque<log_entry>         g_log;
 static constexpr size_t              MAX_LOG_ENTRIES = 4096;
+static bool                          g_init_logged = false;
+static std::array<size_t, static_cast<size_t>(hook_type::COUNT)> g_hook_counts{};
 
 
 static uint64_t now_ms() {
@@ -33,14 +37,31 @@ static uint64_t now_ms() {
             std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+static uint64_t wall_now_seconds() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+}
 
-static void add_log(const std::string& script, const std::string& level,
+
+static void add_log(const std::string& script, log_level level,
                     const std::string& msg) {
+    if (!g_log.empty()) {
+        log_entry& last = g_log.back();
+        if (last.level == level && last.script_name == script && last.message == msg) {
+            if (last.repeat_count < 0xFFFFFFFFu) last.repeat_count++;
+            last.timestamp    = now_ms();
+            last.wall_seconds = wall_now_seconds();
+            return;
+        }
+    }
     log_entry e;
-    e.timestamp   = now_ms();
-    e.script_name = script;
-    e.level       = level;
-    e.message     = msg;
+    e.timestamp    = now_ms();
+    e.wall_seconds = wall_now_seconds();
+    e.script_name  = script;
+    e.level        = level;
+    e.message      = msg;
+    e.repeat_count = 1;
     g_log.push_back(std::move(e));
     while (g_log.size() > MAX_LOG_ENTRIES) g_log.pop_front();
 }
@@ -49,15 +70,23 @@ static void add_log(const std::string& script, const std::string& level,
 static std::string current_script_context;
 
 static void lua_log_info(const std::string& msg) {
-    add_log(current_script_context, "info", msg);
+    add_log(current_script_context, log_level::info, msg);
 }
 
 static void lua_log_warn(const std::string& msg) {
-    add_log(current_script_context, "warn", msg);
+    add_log(current_script_context, log_level::warn, msg);
 }
 
 static void lua_log_error(const std::string& msg) {
-    add_log(current_script_context, "error", msg);
+    add_log(current_script_context, log_level::error, msg);
+}
+
+static void lua_log_debug(const std::string& msg) {
+    add_log(current_script_context, log_level::debug, msg);
+}
+
+static void lua_log_output(const std::string& msg) {
+    add_log(current_script_context, log_level::output, msg);
 }
 
 
@@ -437,35 +466,114 @@ static void register_usertypes(sol::state& lua) {
 }
 
 
+static std::string format_lua_number(double value) {
+    double rounded = std::floor(value);
+    if (rounded == value && value >= -9.007199254740992e15 &&
+        value <= 9.007199254740992e15) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(value));
+        return std::string(buf);
+    }
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.14g", value);
+    return std::string(buf);
+}
+
+static std::string lua_value_to_string(const sol::stack_proxy& v) {
+    switch (v.get_type()) {
+        case sol::type::string: {
+            sol::optional<std::string> s = v.as<sol::optional<std::string>>();
+            return s ? *s : std::string();
+        }
+        case sol::type::number: {
+            sol::optional<double> d = v.as<sol::optional<double>>();
+            return d ? format_lua_number(*d) : std::string("0");
+        }
+        case sol::type::boolean: {
+            sol::optional<bool> b = v.as<sol::optional<bool>>();
+            return (b && *b) ? std::string("true") : std::string("false");
+        }
+        case sol::type::lua_nil:
+        case sol::type::none:
+            return std::string("nil");
+        case sol::type::table:
+            return std::string("table");
+        case sol::type::function:
+            return std::string("function");
+        case sol::type::thread:
+            return std::string("thread");
+        case sol::type::userdata:
+        case sol::type::lightuserdata:
+            return std::string("userdata");
+        default:
+            return std::string("value");
+    }
+}
+
+static int hook_type_index(const std::string& name) {
+    for (int i = 0; i < static_cast<int>(hook_type::COUNT); ++i) {
+        if (name == hook_type_name(static_cast<hook_type>(i)))
+            return i;
+    }
+    return -1;
+}
+
+static void reset_hook_table() {
+    if (!g_lua) return;
+    (*g_lua)["_hooks"] = g_lua->create_table();
+    g_hook_counts.fill(0);
+}
+
+static bool register_hook_named(const std::string& hook_name,
+                                const sol::protected_function& fn) {
+    if (!g_lua) return false;
+    if (!fn.valid()) {
+        add_log(current_script_context, log_level::error,
+                "register_hook('" + hook_name + "') ignored: callback is not a function");
+        return false;
+    }
+    int idx = hook_type_index(hook_name);
+    if (idx < 0) {
+        add_log(current_script_context, log_level::error,
+                "register_hook('" + hook_name + "') ignored: unknown hook name");
+        return false;
+    }
+    sol::table hooks = (*g_lua)["_hooks"];
+    if (!hooks.valid()) {
+        reset_hook_table();
+        hooks = (*g_lua)["_hooks"];
+    }
+    sol::object list_obj = hooks[hook_name];
+    sol::table hook_list;
+    if (list_obj.valid() && list_obj.get_type() == sol::type::table) {
+        hook_list = list_obj.as<sol::table>();
+    } else {
+        hook_list = g_lua->create_table();
+        hooks[hook_name] = hook_list;
+    }
+    hook_list[hook_list.size() + 1] = fn;
+    g_hook_counts[static_cast<size_t>(idx)]++;
+    add_log(current_script_context, log_level::debug,
+            "Registered " + hook_name + " hook");
+    return true;
+}
+
+
 static void register_api(sol::state& lua) {
 
     lua.set_function("log",   lua_log_info);
     lua.set_function("warn",  lua_log_warn);
     lua.set_function("error_log", lua_log_error);
+    lua.set_function("debug_log", lua_log_debug);
 
 
     lua.set_function("print", [](sol::variadic_args va) {
         std::string msg;
         for (auto v : va) {
             if (!msg.empty()) msg += "\t";
-            sol::optional<std::string> s = v.as<sol::optional<std::string>>();
-            if (s) {
-                msg += *s;
-                continue;
-            }
-            sol::optional<double> d = v.as<sol::optional<double>>();
-            if (d) {
-                msg += std::to_string(*d);
-                continue;
-            }
-            sol::optional<bool> b = v.as<sol::optional<bool>>();
-            if (b) {
-                msg += *b ? "true" : "false";
-                continue;
-            }
-            msg += "[?]";
+            msg += lua_value_to_string(v);
         }
-        lua_log_info(msg);
+        lua_log_output(msg);
     });
 
 
@@ -561,28 +669,17 @@ static void register_api(sol::state& lua) {
 
     lua["_hooks"] = lua.create_table();
 
-    lua.set_function("register_hook", [](const std::string& hook_name, sol::function fn) {
-        if (!g_lua) return;
-        sol::table hooks = (*g_lua)["_hooks"];
-        if (!hooks[hook_name].valid() || hooks[hook_name].get_type() != sol::type::table) {
-            hooks[hook_name] = g_lua->create_table();
-        }
-        sol::table hook_list = hooks[hook_name];
-        hook_list[hook_list.size() + 1] = fn;
+    lua.set_function("register_hook", [](const std::string& hook_name,
+                                         sol::protected_function fn) -> bool {
+        return register_hook_named(hook_name, fn);
     });
 
 
     for (int i = 0; i < static_cast<int>(hook_type::COUNT); ++i) {
         auto ht = static_cast<hook_type>(i);
         std::string name = hook_type_name(ht);
-        lua.set_function(name, [name](sol::function fn) {
-            if (!g_lua) return;
-            sol::table hooks = (*g_lua)["_hooks"];
-            if (!hooks[name].valid() || hooks[name].get_type() != sol::type::table) {
-                hooks[name] = g_lua->create_table();
-            }
-            sol::table hook_list = hooks[name];
-            hook_list[hook_list.size() + 1] = fn;
+        lua.set_function(name, [name](sol::protected_function fn) -> bool {
+            return register_hook_named(name, fn);
         });
     }
 }
@@ -607,6 +704,28 @@ static void apply_sandbox(sol::state& lua) {
 }
 
 
+static void rebuild_hook_table_locked() {
+    if (!g_lua) return;
+    reset_hook_table();
+    std::string saved_context = current_script_context;
+    for (auto& kv : g_scripts) {
+        script_info& sinfo = kv.second;
+        if (!sinfo.enabled || !sinfo.loaded) continue;
+        current_script_context = sinfo.name;
+        sol::protected_function_result result =
+            g_lua->safe_script(sinfo.source, sol::script_pass_on_error);
+        if (!result.valid()) {
+            sol::error err = result;
+            sinfo.last_error = err.what();
+            sinfo.loaded = false;
+            add_log(sinfo.name, log_level::error,
+                    "Rebuild failed: " + sinfo.last_error);
+        }
+    }
+    current_script_context = saved_context;
+}
+
+
 bool initialize() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_initialized.load()) return true;
@@ -624,9 +743,13 @@ bool initialize() {
     register_usertypes(*g_lua);
     register_api(*g_lua);
     apply_sandbox(*g_lua);
+    reset_hook_table();
 
     g_initialized.store(true);
-    add_log("engine", "info", "Script engine initialized (Lua 5.4 + sol2)");
+    if (!g_init_logged) {
+        add_log("engine", log_level::info, "Script engine initialized (Lua 5.4 + sol2)");
+        g_init_logged = true;
+    }
     return true;
 }
 
@@ -636,6 +759,8 @@ void shutdown() {
 
     g_scripts.clear();
     g_log.clear();
+    g_hook_counts.fill(0);
+    g_init_logged = false;
     g_lua.reset();
     g_initialized.store(false);
 }
@@ -644,85 +769,58 @@ bool is_initialized() {
     return g_initialized.load();
 }
 
-bool load_script(const std::string& path) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+static bool install_script_locked(const std::string& name, const std::string& path,
+                                  const std::string& source, const std::string& origin) {
     if (!g_lua) return false;
 
-
-    std::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) return false;
-    std::string source((std::istreambuf_iterator<char>(file)),
-                        std::istreambuf_iterator<char>());
-    file.close();
-
-
-    std::filesystem::path p(path);
-    std::string name = p.stem().string();
-
-    auto existing_it = g_scripts.find(name);
-    if (existing_it != g_scripts.end()) {
-        g_scripts.erase(existing_it);
-        (*g_lua)["_hooks"] = g_lua->create_table();
-        for (auto& [sname, sinfo] : g_scripts) {
-            if (!sinfo.enabled || !sinfo.loaded) continue;
-            auto rebind = g_lua->safe_script(sinfo.source, sol::script_pass_on_error);
-            if (!rebind.valid()) {
-                sol::error rerr = rebind;
-                sinfo.last_error = rerr.what();
-                sinfo.loaded = false;
-            }
-        }
-        add_log(name, "info", "Reloading existing script");
-    }
+    if (g_scripts.find(name) != g_scripts.end())
+        add_log(name, log_level::info, "Reloading existing script");
 
     script_info info;
     info.name      = name;
     info.path      = path;
     info.source    = source;
     info.enabled   = true;
+    info.loaded    = true;
     info.load_time = now_ms();
+    g_scripts[name] = std::move(info);
 
+    rebuild_hook_table_locked();
 
-    auto result = g_lua->safe_script(source, sol::script_pass_on_error);
-    if (!result.valid()) {
-        sol::error err = result;
-        info.last_error = err.what();
-        info.loaded = false;
-        g_scripts[name] = std::move(info);
-        add_log(name, "error", "Failed to load: " + info.last_error);
+    script_info& stored = g_scripts[name];
+    if (!stored.loaded) {
+        add_log(name, log_level::error,
+                "Failed to load: " + stored.last_error);
         return false;
     }
-
-    info.loaded = true;
-    g_scripts[name] = std::move(info);
-    add_log(name, "info", "Loaded from " + path);
+    add_log(name, log_level::info, "Loaded from " + origin);
     return true;
+}
+
+bool load_script(const std::string& path) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_lua) return false;
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        std::filesystem::path fp(path);
+        add_log(fp.stem().string(), log_level::error,
+                "Cannot open file: " + path);
+        return false;
+    }
+    std::string source((std::istreambuf_iterator<char>(file)),
+                        std::istreambuf_iterator<char>());
+    file.close();
+
+    std::filesystem::path p(path);
+    std::string name = p.stem().string();
+    return install_script_locked(name, path, source, path);
 }
 
 bool load_script_source(const std::string& name, const std::string& source) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_lua) return false;
-
-    script_info info;
-    info.name      = name;
-    info.source    = source;
-    info.enabled   = true;
-    info.load_time = now_ms();
-
-    auto result = g_lua->safe_script(source, sol::script_pass_on_error);
-    if (!result.valid()) {
-        sol::error err = result;
-        info.last_error = err.what();
-        info.loaded = false;
-        g_scripts[name] = std::move(info);
-        add_log(name, "error", "Failed to load: " + info.last_error);
-        return false;
-    }
-
-    info.loaded = true;
-    g_scripts[name] = std::move(info);
-    add_log(name, "info", "Loaded from source");
-    return true;
+    return install_script_locked(name, std::string(), source, "source");
 }
 
 bool unload_script(const std::string& name) {
@@ -731,20 +829,10 @@ bool unload_script(const std::string& name) {
     auto it = g_scripts.find(name);
     if (it == g_scripts.end()) return false;
 
-    (*g_lua)["_hooks"] = g_lua->create_table();
     g_scripts.erase(it);
+    rebuild_hook_table_locked();
 
-    for (auto& [sname, sinfo] : g_scripts) {
-        if (!sinfo.enabled || !sinfo.loaded) continue;
-        auto result = g_lua->safe_script(sinfo.source, sol::script_pass_on_error);
-        if (!result.valid()) {
-            sol::error err = result;
-            sinfo.last_error = err.what();
-            sinfo.loaded = false;
-        }
-    }
-
-    add_log(name, "info", "Unloaded");
+    add_log(name, log_level::info, "Unloaded");
     return true;
 }
 
@@ -754,7 +842,7 @@ bool reload_script(const std::string& name) {
     auto it = g_scripts.find(name);
     if (it == g_scripts.end()) return false;
 
-    auto& info = it->second;
+    script_info& info = it->second;
 
     if (!info.path.empty()) {
         std::ifstream file(info.path, std::ios::binary);
@@ -762,25 +850,23 @@ bool reload_script(const std::string& name) {
             info.source = std::string((std::istreambuf_iterator<char>(file)),
                                        std::istreambuf_iterator<char>());
             file.close();
-        }
-    }
-
-    (*g_lua)["_hooks"] = g_lua->create_table();
-    for (auto& [sname, sinfo] : g_scripts) {
-        if (!sinfo.enabled) continue;
-        auto result = g_lua->safe_script(sinfo.source, sol::script_pass_on_error);
-        if (!result.valid()) {
-            sol::error err = result;
-            sinfo.last_error = err.what();
-            sinfo.loaded = false;
         } else {
-            sinfo.loaded = true;
-            sinfo.last_error.clear();
+            add_log(name, log_level::warn,
+                    "Reload could not reopen file, using cached source");
         }
     }
 
+    info.loaded = true;
+    info.last_error.clear();
     info.load_time = now_ms();
-    add_log(name, "info", "Reloaded");
+
+    rebuild_hook_table_locked();
+
+    if (!info.loaded) {
+        add_log(name, log_level::error, "Reload failed: " + info.last_error);
+        return false;
+    }
+    add_log(name, log_level::info, "Reloaded");
     return true;
 }
 
@@ -788,16 +874,11 @@ void set_script_enabled(const std::string& name, bool enabled) {
     std::lock_guard<std::mutex> lock(g_mutex);
     auto it = g_scripts.find(name);
     if (it == g_scripts.end()) return;
+    if (it->second.enabled == enabled) return;
     it->second.enabled = enabled;
 
-
-    if (g_lua) {
-        (*g_lua)["_hooks"] = g_lua->create_table();
-        for (auto& [sname, sinfo] : g_scripts) {
-            if (!sinfo.enabled || !sinfo.loaded) continue;
-            g_lua->safe_script(sinfo.source, sol::script_pass_on_error);
-        }
-    }
+    rebuild_hook_table_locked();
+    add_log(name, log_level::info, enabled ? "Enabled" : "Paused");
 }
 
 std::vector<script_info> get_scripts() {
@@ -819,10 +900,13 @@ template <typename T>
 static bool invoke_hook_impl(hook_type type, T& data) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_lua || !g_initialized.load()) return false;
+    if (type < hook_type::on_request || type >= hook_type::COUNT) return false;
 
     std::string hook_name = hook_type_name(type);
-    sol::table hooks = (*g_lua)["_hooks"];
-    if (!hooks.valid()) return false;
+    sol::object hooks_obj = (*g_lua)["_hooks"];
+    if (!hooks_obj.valid() || hooks_obj.get_type() != sol::type::table)
+        return false;
+    sol::table hooks = hooks_obj.as<sol::table>();
 
     sol::object hook_list_obj = hooks[hook_name];
     if (!hook_list_obj.valid() || hook_list_obj.get_type() != sol::type::table)
@@ -830,21 +914,27 @@ static bool invoke_hook_impl(hook_type type, T& data) {
 
     sol::table hook_list = hook_list_obj.as<sol::table>();
 
-    for (auto& [idx, fn_obj] : hook_list) {
-        if (fn_obj.get_type() != sol::type::function) continue;
-        sol::protected_function fn = fn_obj.as<sol::protected_function>();
+    std::string saved_context = current_script_context;
+    bool invoked_any = false;
+
+    for (auto& kv : hook_list) {
+        if (kv.second.get_type() != sol::type::function) continue;
+        sol::protected_function fn = kv.second.as<sol::protected_function>();
         if (!fn.valid()) continue;
 
         current_script_context = hook_name;
+        invoked_any = true;
 
         sol::protected_function_result result = fn(std::ref(data));
         if (!result.valid()) {
             sol::error err = result;
-            add_log(hook_name, "error", "Hook error: " + std::string(err.what()));
+            add_log(hook_name, log_level::error,
+                    "Hook error: " + std::string(err.what()));
         }
     }
 
-    return true;
+    current_script_context = saved_context;
+    return invoked_any;
 }
 
 bool invoke_hook(hook_type type, hook_request_data& data)    { return invoke_hook_impl(type, data); }
@@ -854,36 +944,102 @@ bool invoke_hook(hook_type type, hook_packet_data& data)     { return invoke_hoo
 bool invoke_hook(hook_type type, hook_dns_data& data)        { return invoke_hook_impl(type, data); }
 bool invoke_hook(hook_type type, hook_connection_data& data) { return invoke_hook_impl(type, data); }
 
+bool dispatch_request(hook_request_data& data) {
+    return invoke_hook_impl(hook_type::on_request, data);
+}
+bool dispatch_response(hook_response_data& data) {
+    return invoke_hook_impl(hook_type::on_response, data);
+}
+bool dispatch_websocket_frame(hook_ws_frame_data& data) {
+    return invoke_hook_impl(hook_type::on_websocket_frame, data);
+}
+bool dispatch_packet(hook_packet_data& data) {
+    return invoke_hook_impl(hook_type::on_packet, data);
+}
+bool dispatch_dns(hook_dns_data& data) {
+    return invoke_hook_impl(hook_type::on_dns, data);
+}
+bool dispatch_connection(hook_connection_data& data) {
+    return invoke_hook_impl(hook_type::on_connection, data);
+}
+bool dispatch_connection_close(hook_connection_data& data) {
+    return invoke_hook_impl(hook_type::on_connection_close, data);
+}
+
+size_t registered_hook_count(hook_type type) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (type < hook_type::on_request || type >= hook_type::COUNT) return 0;
+    return g_hook_counts[static_cast<size_t>(type)];
+}
+
+size_t registered_hook_count() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    size_t total = 0;
+    for (size_t c : g_hook_counts) total += c;
+    return total;
+}
+
+
+static std::string stringify_result(const sol::protected_function_result& result) {
+    int count = result.return_count();
+    if (count <= 0) return std::string();
+    std::string out;
+    for (int i = 0; i < count; ++i) {
+        sol::stack_proxy obj = result[i];
+        if (i > 0) out += "\t";
+        out += lua_value_to_string(obj);
+    }
+    return out;
+}
 
 std::string execute(const std::string& code) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_lua) return "[error: engine not initialized]";
 
-    current_script_context = "console";
+    std::string trimmed = code;
+    size_t first = trimmed.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return std::string();
+    size_t last = trimmed.find_last_not_of(" \t\r\n");
+    trimmed = trimmed.substr(first, last - first + 1);
 
-    auto result = g_lua->safe_script(code, sol::script_pass_on_error);
+    std::string saved_context = current_script_context;
+    current_script_context = "console";
+    add_log("console", log_level::command, trimmed);
+
+    sol::load_result expr_chunk = g_lua->load("return " + trimmed);
+    bool used_expr = expr_chunk.valid();
+
+    sol::protected_function_result result;
+    if (used_expr) {
+        sol::protected_function expr_fn = expr_chunk;
+        result = expr_fn();
+    } else {
+        sol::load_result stmt_chunk = g_lua->load(trimmed);
+        if (!stmt_chunk.valid()) {
+            sol::error err = stmt_chunk;
+            std::string msg = std::string("[error: ") + err.what() + "]";
+            add_log("console", log_level::error, msg);
+            current_script_context = saved_context;
+            return msg;
+        }
+        sol::protected_function stmt_fn = stmt_chunk;
+        result = stmt_fn();
+    }
+
     if (!result.valid()) {
         sol::error err = result;
-        return std::string("[error: ") + err.what() + "]";
+        std::string msg = std::string("[error: ") + err.what() + "]";
+        add_log("console", log_level::error, msg);
+        current_script_context = saved_context;
+        return msg;
     }
 
+    std::string out = stringify_result(result);
+    if (!out.empty())
+        add_log("console", log_level::output, out);
 
-    sol::type rt = result.get_type();
-    if (rt == sol::type::lua_nil) return "";
-    sol::object obj = result;
-    if (rt == sol::type::string) {
-        sol::optional<std::string> s = obj.as<sol::optional<std::string>>();
-        if (s) return *s;
-    }
-    if (rt == sol::type::number) {
-        sol::optional<double> d = obj.as<sol::optional<double>>();
-        if (d) return std::to_string(*d);
-    }
-    if (rt == sol::type::boolean) {
-        sol::optional<bool> b = obj.as<sol::optional<bool>>();
-        if (b) return *b ? "true" : "false";
-    }
-    return std::string("[") + sol::type_name(g_lua->lua_state(), rt) + "]";
+    current_script_context = saved_context;
+    return out;
 }
 
 
@@ -905,7 +1061,8 @@ std::vector<api_function> get_api_listing() {
         { "log",            "log(msg)",                         "Log an info message" },
         { "warn",           "warn(msg)",                        "Log a warning message" },
         { "error_log",      "error_log(msg)",                   "Log an error message" },
-        { "print",          "print(...)",                       "Print values (goes to script log)" },
+        { "debug_log",      "debug_log(msg)",                   "Log a debug message" },
+        { "print",          "print(...)",                       "Print values (goes to engine log)" },
         { "base64_encode",  "base64_encode(str) -> str",        "Base64 encode a string" },
         { "base64_decode",  "base64_decode(str) -> str",        "Base64 decode a string" },
         { "hex_encode",     "hex_encode(str) -> str",           "Hex encode bytes" },
@@ -924,13 +1081,14 @@ std::vector<api_function> get_api_listing() {
         { "string_to_bytes","string_to_bytes(str) -> bytes",    "Convert string to byte array" },
         { "decode",         "decode(id, input, params?) -> str", "Run decoder pipeline transform" },
         { "time_ms",        "time_ms() -> number",              "Current time in milliseconds" },
-        { "register_hook",  "register_hook(name, fn)",          "Register a hook callback" },
-        { "on_request",     "on_request(fn(req))",              "Hook: HTTP request intercepted" },
-        { "on_response",    "on_response(fn(resp))",            "Hook: HTTP response received" },
-        { "on_websocket_frame","on_websocket_frame(fn(frame))", "Hook: WebSocket frame" },
-        { "on_packet",      "on_packet(fn(pkt))",               "Hook: Raw packet captured" },
-        { "on_dns",         "on_dns(fn(dns))",                  "Hook: DNS query/response" },
-        { "on_connection",  "on_connection(fn(conn))",          "Hook: New connection" },
+        { "register_hook",  "register_hook(name, fn) -> bool",  "Register a hook callback by name" },
+        { "on_request",     "on_request(fn(req)) -> bool",      "Hook: HTTP request intercepted" },
+        { "on_response",    "on_response(fn(resp)) -> bool",    "Hook: HTTP response received" },
+        { "on_websocket_frame","on_websocket_frame(fn(frame)) -> bool", "Hook: WebSocket frame" },
+        { "on_packet",      "on_packet(fn(pkt)) -> bool",       "Hook: Raw packet captured" },
+        { "on_dns",         "on_dns(fn(dns)) -> bool",          "Hook: DNS query/response" },
+        { "on_connection",  "on_connection(fn(conn)) -> bool",  "Hook: New connection" },
+        { "on_connection_close","on_connection_close(fn(conn)) -> bool", "Hook: Connection closed" },
     };
 }
 

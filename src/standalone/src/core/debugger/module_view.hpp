@@ -441,7 +441,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 						_ta(_t.text_secondary), ord_buf);
 
 			ImU32 name_col = exp.is_forwarded
-				? IM_COL32(200, 180, 80, static_cast<int>(alpha * 200))
+				? _ta(_t.warning)
 				: _ta(_t.text_primary);
 			dl->AddText(ImVec2(ec_name, ry + 2.f), name_col,
 						exp.name.empty() ? "(unnamed)" : exp.name.c_str());

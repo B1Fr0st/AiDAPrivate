@@ -1,15 +1,15 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "auth_copilot.hpp"
 
 #include "auth_store.hpp"
+#include "auth_http.hpp"
+#include "auth_browser_launch.hpp"
 #include "anti-tamper/webhook.hpp"
 
 #include <windows.h>
 #include <shellapi.h>
 
-#include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <chrono>
@@ -74,55 +74,35 @@ namespace copilot {
 			return COPILOT_CLIENT_ID;
 		}
 
-		bool open_browser(const std::string& url)
-		{
-			const int wlen = MultiByteToWideChar(CP_UTF8, 0, url.c_str(),
-				static_cast<int>(url.size()), nullptr, 0);
-			if (wlen <= 0)
-				return false;
-			std::wstring wurl(static_cast<size_t>(wlen), L'\0');
-			MultiByteToWideChar(CP_UTF8, 0, url.c_str(), static_cast<int>(url.size()),
-				wurl.data(), wlen);
-			HINSTANCE rc = ShellExecuteW(nullptr, L"open", wurl.c_str(), nullptr,
-				nullptr, SW_SHOWNORMAL);
-			return reinterpret_cast<INT_PTR>(rc) > 32;
-		}
-
 		bool github_post(const std::string& host, const std::string& path,
 			const std::string& json_body, nlohmann::json& json_out, std::string& err_out)
 		{
-			httplib::Client cli(host);
-			cli.set_connection_timeout(30);
-			cli.set_read_timeout(30);
-			cli.set_follow_location(true);
-			cli.enable_server_certificate_verification(true);
-
-			httplib::Headers headers = {
+			const aida::auth::http::header_list_t headers = {
 				{ "Accept", "application/json" },
 				{ "User-Agent", "GithubCopilot/1.155.0" },
 				{ "Editor-Version", "AiDA/1.0" },
 				{ "Editor-Plugin-Version", "copilot-aida/1.0.0" },
 			};
-			auto res = cli.Post(path.c_str(), headers, json_body, "application/json");
-			if (!res) {
-				err_out = "request to " + host + path + " failed: "
-					+ httplib::to_string(res.error());
+			const aida::auth::http::response_t res = aida::auth::http::request(
+				"POST", host + path, headers, json_body, "application/json", 30);
+			if (!res.ok) {
+				err_out = "request to " + host + path + " failed: " + res.error;
 				return false;
 			}
-			if (res->status < 200 || res->status >= 300) {
-				err_out = host + path + " status=" + std::to_string(res->status)
-					+ " body=" + res->body.substr(0, 256);
+			if (res.status < 200 || res.status >= 300) {
+				err_out = host + path + " status=" + std::to_string(res.status)
+					+ " body=" + res.body.substr(0, 256);
 				return false;
 			}
 			try {
-				json_out = nlohmann::json::parse(res->body);
+				json_out = nlohmann::json::parse(res.body);
 				if (!json_out.is_object()) {
 					err_out = "non-object response";
 					return false;
 				}
 				return true;
 			} catch (...) {
-				err_out = "json parse failed: body=" + res->body.substr(0, 256);
+				err_out = "json parse failed: body=" + res.body.substr(0, 256);
 				return false;
 			}
 		}
@@ -141,32 +121,26 @@ namespace copilot {
 				path = "/copilot_internal/v2/token";
 			}
 
-			httplib::Client cli(host);
-			cli.set_connection_timeout(30);
-			cli.set_read_timeout(30);
-			cli.set_follow_location(true);
-			cli.enable_server_certificate_verification(true);
-
-			httplib::Headers headers = {
-				{ "Authorization", "Bearer " + long_lived_token },
+			const aida::auth::http::header_list_t headers = {
+				{ "Authorization", "token " + long_lived_token },
 				{ "Accept", "application/json" },
 				{ "User-Agent", "GithubCopilot/1.155.0" },
 				{ "Editor-Version", "AiDA/1.0" },
 				{ "Editor-Plugin-Version", "copilot-aida/1.0.0" },
 			};
-			auto res = cli.Get(path.c_str(), headers);
-			if (!res) {
-				err_out = host + path + " unreachable: "
-					+ httplib::to_string(res.error());
+			const aida::auth::http::response_t res = aida::auth::http::request(
+				"GET", host + path, headers, std::string(), std::string(), 30);
+			if (!res.ok) {
+				err_out = host + path + " unreachable: " + res.error;
 				return false;
 			}
-			if (res->status < 200 || res->status >= 300) {
+			if (res.status < 200 || res.status >= 300) {
 				err_out = host + path + " status="
-					+ std::to_string(res->status) + " body=" + res->body.substr(0, 256);
+					+ std::to_string(res.status) + " body=" + res.body.substr(0, 256);
 				return false;
 			}
 			try {
-				const auto j = nlohmann::json::parse(res->body);
+				const auto j = nlohmann::json::parse(res.body);
 				if (!j.is_object()) {
 					err_out = host + path + " non-object response";
 					return false;
@@ -232,9 +206,9 @@ namespace copilot {
 		state.next_poll_unix = static_cast<int64_t>(std::time(nullptr))
 			+ state.interval + (COPILOT_POLLING_SAFETY_MARGIN_MS / 1000);
 
-		if (!open_browser(state.verification_uri))
+		if (!aida::auth::open_url_external(state.verification_uri))
 			anti_tamper::webhook::write_log("auth.copilot",
-				"[aida.auth.copilot] ShellExecuteW open browser failed; user must open verification_uri manually");
+				"[aida.auth.copilot] open browser failed; user must open verification_uri manually");
 
 		set_last_error({});
 		return true;

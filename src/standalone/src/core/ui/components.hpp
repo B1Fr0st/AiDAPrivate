@@ -9,6 +9,7 @@
 #include "blur_layer.hpp"
 #include "brand.hpp"
 #include "avatar.hpp"
+#include <algorithm>
 #include <string>
 #include <string_view>
 #include <cstdio>
@@ -68,29 +69,35 @@ namespace aida::ui::components {
 			dl->AddText(font, fs, pos, color, label, end);
 		}
 
+		inline float ui_fs() {
+			float fs = ImGui::GetFontSize();
+			return (fs > 1.f) ? fs : 16.f;
+		}
 		inline ImVec2 sz_pad(size_t_ s) {
 			switch (s) {
-				case size_t_::sm: return ImVec2(12.f, 7.f);
-				case size_t_::md: return ImVec2(16.f, 10.f);
-				case size_t_::lg: return ImVec2(20.f, 14.f);
+				case size_t_::sm: return ImVec2(13.f, 7.f);
+				case size_t_::md: return ImVec2(17.f, 10.f);
+				case size_t_::lg: return ImVec2(22.f, 14.f);
 			}
-			return ImVec2(16.f, 10.f);
+			return ImVec2(17.f, 10.f);
 		}
 		inline float sz_font(size_t_ s) {
+			float fs = ui_fs();
 			switch (s) {
-				case size_t_::sm: return 14.f;
-				case size_t_::md: return 16.f;
-				case size_t_::lg: return 18.f;
+				case size_t_::sm: return fs * 0.94f;
+				case size_t_::md: return fs * 1.02f;
+				case size_t_::lg: return fs * 1.16f;
 			}
-			return 16.f;
+			return fs;
 		}
 		inline float sz_height(size_t_ s) {
+			float fs = ui_fs();
 			switch (s) {
-				case size_t_::sm: return 30.f;
-				case size_t_::md: return 36.f;
-				case size_t_::lg: return 44.f;
+				case size_t_::sm: return (std::max)(30.f, fs + 14.f);
+				case size_t_::md: return (std::max)(36.f, fs + 18.f);
+				case size_t_::lg: return (std::max)(44.f, fs + 24.f);
 			}
-			return 36.f;
+			return (std::max)(36.f, fs + 18.f);
 		}
 	}
 
@@ -165,18 +172,18 @@ namespace aida::ui::components {
 				break;
 			}
 			case button_kind_t::secondary:
-				fill = t.panel_header;
-				border = t.border_subtle;
+				fill = aida::ui::lighten(t.panel_header, t.is_dark ? 10 : -6);
+				border = t.border_strong;
 				text_col = t.text_primary;
 				break;
 			case button_kind_t::ghost:
-				fill = aida::ui::with_alpha(t.panel_header, 0.45f);
-				border = aida::ui::with_alpha(t.border_subtle, 0.85f);
+				fill = aida::ui::with_alpha(t.panel_header, 0.62f);
+				border = aida::ui::with_alpha(t.border_strong, 0.85f);
 				text_col = t.text_primary;
 				break;
 			case button_kind_t::destructive:
-				fill = aida::ui::with_alpha(t.error, 0.18f);
-				border = aida::ui::with_alpha(t.error, 0.55f);
+				fill = aida::ui::with_alpha(t.error, 0.20f);
+				border = aida::ui::with_alpha(t.error, 0.70f);
 				text_col = t.error;
 				break;
 		}
@@ -186,10 +193,14 @@ namespace aida::ui::components {
 			ImU32 hover_blend_bot = aida::ui::mix(fill, hover_bot, hov * 0.55f);
 			ImU32 fill_flat = aida::ui::mix(hover_blend_top, hover_blend_bot, 0.5f);
 			dl->AddRectFilled(ca, cb, aida::ui::with_alpha(fill_flat, alpha), radius);
+			ImU32 top_hi = aida::ui::with_alpha(IM_COL32(255, 255, 255, t.is_dark ? 26 : 60),
+			                                    alpha * (0.7f + hov * 0.3f));
+			dl->AddLine(ImVec2(ca.x + radius * 0.5f, ca.y + 1.f),
+			            ImVec2(cb.x - radius * 0.5f, ca.y + 1.f), top_hi, 1.f);
 		}
 
-		float border_thickness = primary_or_accent ? 1.0f : 1.f;
-		dl->AddRect(ca, cb, aida::ui::with_alpha(border, alpha * (primary_or_accent ? 1.f : (1.f + hov * 0.5f))), radius, 0, border_thickness);
+		float border_thickness = primary_or_accent ? 1.0f : 1.25f;
+		dl->AddRect(ca, cb, aida::ui::with_alpha(border, alpha * (primary_or_accent ? 1.f : (1.f + hov * 0.45f))), radius, 0, border_thickness);
 
 		if (flash > 0.f) {
 			ImU32 flash_col = aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), flash * 0.20f);
@@ -232,8 +243,9 @@ namespace aida::ui::components {
 	                  bool leading_dot = true) {
 		ImFont* font = ImGui::GetFont();
 		float fs = detail::sz_font(size);
-		float pad_x = size == size_t_::sm ? 10.f : 12.f;
-		float h     = size == size_t_::sm ? 22.f : 26.f;
+		float pad_x = size == size_t_::sm ? 11.f : 13.f;
+		float h     = size == size_t_::sm ? (std::max)(24.f, fs + 9.f)
+		                                  : (std::max)(28.f, fs + 12.f);
 
 		float text_w = detail::calc_display_text_width(font, fs, label);
 		float dot_w = leading_dot ? 10.f : 0.f;
@@ -286,9 +298,9 @@ namespace aida::ui::components {
 
 	inline void badge(const char* label, ImU32 color, float radius = 4.f) {
 		ImFont* font = ImGui::GetFont();
-		float fs = 13.f;
+		float fs = detail::sz_font(size_t_::sm) * 0.86f;
 		float pad_x = 8.f;
-		float h = 20.f;
+		float h = (std::max)(20.f, fs + 8.f);
 		float text_w = detail::calc_display_text_width(font, fs, label);
 		float w = text_w + pad_x * 2.f;
 		ImVec2 pos = ImGui::GetCursorScreenPos();
@@ -308,9 +320,9 @@ namespace aida::ui::components {
 
 	inline bool chip(const char* label, ImU32 color, bool removable = false, bool* removed = nullptr) {
 		ImFont* font = ImGui::GetFont();
-		float fs = 14.f;
+		float fs = detail::sz_font(size_t_::sm);
 		float pad_x = 10.f;
-		float h = 26.f;
+		float h = (std::max)(26.f, fs + 11.f);
 		float text_w = detail::calc_display_text_width(font, fs, label);
 		float remove_w = removable ? 14.f : 0.f;
 		float w = text_w + remove_w + pad_x * 2.f;
@@ -395,7 +407,46 @@ namespace aida::ui::components {
 			dl->PopClipRect();
 		}
 
-		ImGui::SetCursorScreenPos(ImVec2(pos.x, pos.y + h + 4.f));
+		ImGui::SetCursorScreenPos(pos);
+		ImGui::Dummy(ImVec2(w, h));
+		ImGui::PopID();
+		return changed;
+	}
+
+	inline bool input_int(const char* label, int* value, ImVec2 size = ImVec2(0.f, 0.f)) {
+		if (!value) return false;
+		const auto& t = aida::ui::resolved();
+		float h = size.y > 0.f ? size.y : 36.f;
+		float w = size.x > 0.f ? size.x : ImGui::GetContentRegionAvail().x;
+
+		ImGui::PushID(label);
+		ImGuiID id = ImGui::GetID(label);
+		auto& hov = detail::hstate(id);
+
+		ImVec2 pos = ImGui::GetCursorScreenPos();
+		ImVec2 a = pos;
+		ImVec2 b = ImVec2(pos.x + w, pos.y + h);
+
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		dl->AddRectFilled(a, b, t.panel_header, 8.f);
+
+		bool active = ImGui::GetActiveID() == ImGui::GetID("##ii");
+		float focus_v = hov.tick(active, aida::ui::clock::dt(), aida::motion::spring::balanced);
+		ImU32 border = aida::ui::mix(t.border_subtle, t.border_focus, focus_v);
+		dl->AddRect(a, b, border, 8.f, 0, 1.f + focus_v * 0.8f);
+
+		ImGui::SetCursorScreenPos(ImVec2(a.x + 12.f, a.y + (h - ImGui::GetFontSize()) * 0.5f));
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0,0,0,0));
+		ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0,0,0,0));
+		ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0,0,0,0));
+		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.f, 0.f));
+		ImGui::SetNextItemWidth(w - 24.f);
+		bool changed = ImGui::InputInt("##ii", value, 0, 0);
+		ImGui::PopStyleVar();
+		ImGui::PopStyleColor(3);
+
+		ImGui::SetCursorScreenPos(pos);
+		ImGui::Dummy(ImVec2(w, h));
 		ImGui::PopID();
 		return changed;
 	}
@@ -404,11 +455,11 @@ namespace aida::ui::components {
 	                            const char* action_label = nullptr, bool* action_clicked = nullptr) {
 		const auto& t = aida::ui::resolved();
 		ImFont* font = ImGui::GetFont();
-		float fs = 15.f;
+		float fs = detail::sz_font(size_t_::md);
 
 		ImVec2 pos = ImGui::GetCursorScreenPos();
 		float w = ImGui::GetContentRegionAvail().x;
-		float h = 32.f;
+		float h = (std::max)(32.f, fs + 14.f);
 
 		ImDrawList* dl = ImGui::GetWindowDrawList();
 		ImVec2 a = pos;
@@ -451,9 +502,9 @@ namespace aida::ui::components {
 	inline bool toggle_switch(const char* label, bool* state, size_t_ size = size_t_::sm) {
 		if (!state) return false;
 		const auto& t = aida::ui::resolved();
-		float track_w = size == size_t_::sm ? 36.f : 44.f;
-		float track_h = size == size_t_::sm ? 20.f : 24.f;
-		float fs = size == size_t_::sm ? 14.f : 15.f;
+		float track_w = size == size_t_::sm ? 38.f : 46.f;
+		float track_h = size == size_t_::sm ? 21.f : 25.f;
+		float fs = detail::sz_font(size);
 		ImFont* font = ImGui::GetFont();
 
 		const char* disp_end = detail::display_end(label);
@@ -647,7 +698,7 @@ namespace aida::ui::components {
 	inline void kbd_chip(const char* label) {
 		const auto& t = aida::ui::resolved();
 		ImFont* font = ImGui::GetFont();
-		float fs = 13.f;
+		float fs = detail::sz_font(size_t_::sm) * 0.9f;
 		float pad_x = 8.f;
 		float pad_y = 3.f;
 		float text_w = detail::calc_display_text_width(font, fs, label);
@@ -663,6 +714,73 @@ namespace aida::ui::components {
 		detail::add_display_text(dl, font, fs, ImVec2(a.x + pad_x, a.y + pad_y), t.text_secondary, label);
 	}
 
+	inline bool radio_button(const char* label, int* v, int btn_v) {
+		if (!v) return false;
+		const auto& t = aida::ui::resolved();
+		ImFont* font = ImGui::GetFont();
+		float fs = detail::sz_font(size_t_::sm);
+		float ring_r = fs * 0.52f;
+		float diam = ring_r * 2.f;
+		float gap = 7.f;
+
+		const char* disp_end = detail::display_end(label);
+		bool has_label = label && (disp_end == nullptr ? (*label != '\0') : (label != disp_end));
+		float text_w = has_label
+			? font->CalcTextSizeA(fs, FLT_MAX, 0.f, label, disp_end).x
+			: 0.f;
+		float total_w = diam + (has_label ? gap + text_w : 0.f);
+		float total_h = ((diam > fs) ? diam : fs) + 4.f;
+
+		ImGui::PushID(label);
+		ImGuiID id = ImGui::GetID(label);
+		auto& hov = detail::hstate(id);
+
+		ImVec2 pos = ImGui::GetCursorScreenPos();
+		ImGui::InvisibleButton("##radio", ImVec2(total_w, total_h));
+		bool hovered = ImGui::IsItemHovered();
+		bool clicked = ImGui::IsItemClicked();
+		bool selected = (*v == btn_v);
+		if (clicked) *v = btn_v;
+
+		float hv = hov.tick(hovered, aida::ui::clock::dt(), aida::motion::spring::balanced);
+
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		float cx = pos.x + ring_r;
+		float cy = pos.y + total_h * 0.5f;
+
+		ImU32 base_fill = t.is_dark
+			? aida::ui::lighten(t.panel_header, 16)
+			: aida::ui::darken(t.bg_elevated, 8);
+		dl->AddCircleFilled(ImVec2(cx, cy), ring_r, base_fill, 28);
+
+		ImU32 ring_lit = aida::ui::mix(t.border_strong, t.accent_u32, 0.55f + 0.45f * hv);
+		ImU32 ring_col = selected ? t.accent_u32 : aida::ui::mix(t.border_strong, ring_lit, hv);
+		dl->AddCircle(ImVec2(cx, cy), ring_r, ring_col, 28, selected ? 2.0f : 1.6f);
+
+		if (hv > 0.01f && !selected) {
+			dl->AddCircle(ImVec2(cx, cy), ring_r + 1.6f,
+			              aida::ui::with_alpha(t.accent_glow, hv), 28, 1.f);
+		}
+
+		if (selected) {
+			dl->AddCircleFilled(ImVec2(cx, cy), ring_r * 0.5f, t.accent_u32, 24);
+		} else if (hv > 0.01f) {
+			dl->AddCircleFilled(ImVec2(cx, cy), ring_r * 0.42f,
+			                    aida::ui::with_alpha(t.accent_dim, hv * 0.55f), 24);
+		}
+
+		if (has_label) {
+			ImU32 tc = selected
+				? t.text_primary
+				: aida::ui::mix(t.text_secondary, t.text_primary, hv);
+			detail::add_display_text(dl, font, fs,
+				ImVec2(pos.x + diam + gap, cy - fs * 0.5f), tc, label);
+		}
+
+		ImGui::PopID();
+		return clicked;
+	}
+
 }
 
 namespace aida::ui {
@@ -672,8 +790,10 @@ namespace aida::ui {
 	using components::badge;
 	using components::chip;
 	using components::input_text;
+	using components::input_int;
 	using components::section_header;
 	using components::toggle_switch;
+	using components::radio_button;
 	using components::status_dot;
 	using components::glass_card_begin;
 	using components::glass_card_end;

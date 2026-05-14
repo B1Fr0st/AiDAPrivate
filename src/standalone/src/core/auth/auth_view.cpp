@@ -37,6 +37,8 @@
 #include <windows.h>
 #include <shellapi.h>
 
+#include "auth_browser_launch.hpp"
+
 namespace aida {
 namespace auth_view {
 
@@ -185,11 +187,6 @@ namespace auth_view {
 			char api_key_buf[5][1024]{};
 			bool api_key_show[5]{};
 
-			char custom_client_id_buf[3][512]{};
-			char custom_redirect_uri_buf[3][512]{};
-			char custom_scopes_buf[3][512]{};
-			bool custom_loaded[3]{};
-
 			char copilot_ghe_buf[256]{};
 			std::atomic<bool> copilot_flow_started{ false };
 
@@ -199,8 +196,6 @@ namespace auth_view {
 
 			aida::ui::flash_t copilot_copy_flash;
 			std::vector<aida::ui::hover_state_t> row_hover;
-
-			int active_top_tab = 0;
 		};
 
 		static view_state_t g_state;
@@ -254,12 +249,7 @@ namespace auth_view {
 
 		static void open_url_in_browser(const std::string& url)
 		{
-			int wlen = MultiByteToWideChar(CP_UTF8, 0, url.c_str(), -1, nullptr, 0);
-			if (wlen <= 0) return;
-			std::wstring wurl(static_cast<size_t>(wlen), L'\0');
-			MultiByteToWideChar(CP_UTF8, 0, url.c_str(), -1, &wurl[0], wlen);
-			if (!wurl.empty() && wurl.back() == L'\0') wurl.pop_back();
-			ShellExecuteW(nullptr, L"open", wurl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+			aida::auth::open_url_external(url);
 		}
 
 		static const row_def_t& row_def_for(row_kind_t k)
@@ -809,16 +799,8 @@ namespace auth_view {
 			const row_kind_t kind_copy = def.kind;
 			std::string captured_access = info.access;
 			std::string captured_refresh = info.refresh;
-			std::string captured_client_id = info.custom_client_id;
-
-			std::string saved_client = info.custom_client_id;
-			std::string saved_redirect = info.custom_redirect_uri;
-			std::vector<std::string> saved_scopes = info.custom_scopes;
 
 			info = aida::auth::auth_info_t{};
-			info.custom_client_id = std::move(saved_client);
-			info.custom_redirect_uri = std::move(saved_redirect);
-			info.custom_scopes = std::move(saved_scopes);
 
 			if (!aida::auth::store::set(def.store_key, info)) {
 				toast_notification::push("Failed to clear credentials",
@@ -829,17 +811,16 @@ namespace auth_view {
 			if (revoke_needed) {
 				work_queue::post([kind_copy,
 					access = std::move(captured_access),
-					refresh = std::move(captured_refresh),
-					client = std::move(captured_client_id)]() {
+					refresh = std::move(captured_refresh)]() {
 					switch (kind_copy) {
 					case row_kind_t::oauth_claude_code:
-						aida::auth::claude_code::revoke_tokens(access, refresh, client);
+						aida::auth::claude_code::revoke_tokens(access, refresh, std::string());
 						break;
 					case row_kind_t::oauth_codex:
-						aida::auth::codex::revoke_tokens(access, refresh, client);
+						aida::auth::codex::revoke_tokens(access, refresh, std::string());
 						break;
 					case row_kind_t::oauth_copilot:
-						aida::auth::copilot::revoke_tokens(access, refresh, client);
+						aida::auth::copilot::revoke_tokens(access, refresh, std::string());
 						break;
 					default:
 						break;
@@ -875,6 +856,71 @@ namespace auth_view {
 			}
 		}
 
+		static bool eye_toggle_button(const char* id, bool* shown, ImVec2 size)
+		{
+			if (!shown) return false;
+			const auto& th = aida::ui::resolved();
+
+			ImGui::PushID(id);
+			ImGuiID iid = ImGui::GetID("##eye");
+			auto& hov = aida::ui::components::detail::hstate(iid);
+
+			ImVec2 pos = ImGui::GetCursorScreenPos();
+			ImGui::InvisibleButton("##eye", size);
+			bool hovered = ImGui::IsItemHovered();
+			bool clicked = ImGui::IsItemClicked();
+			if (clicked) *shown = !*shown;
+			if (hovered) ImGui::SetTooltip(*shown ? "Hide key" : "Reveal key");
+
+			float hv = hov.tick(hovered, aida::ui::clock::dt(), aida::motion::spring::balanced);
+
+			ImDrawList* dl = ImGui::GetWindowDrawList();
+			ImVec2 a = pos;
+			ImVec2 b = ImVec2(pos.x + size.x, pos.y + size.y);
+			dl->AddRectFilled(a, b, th.panel_header, 6.f);
+			ImU32 border = aida::ui::mix(th.border_subtle, th.border_focus, hv);
+			dl->AddRect(a, b, border, 6.f, 0, 1.f + hv * 0.6f);
+
+			ImVec2 c = ImVec2((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f);
+			float ew = size.x * 0.34f;
+			float eh = size.y * 0.20f;
+			ImU32 glyph = *shown
+				? th.accent_u32
+				: aida::ui::mix(th.text_secondary, th.text_primary, hv);
+
+			float arc_r = (ew * ew + eh * eh) / (2.f * eh);
+			float sin_arg = ew / arc_r;
+			if (sin_arg > 1.f) sin_arg = 1.f;
+			float span = asinf(sin_arg);
+			float thick = size.y * 0.055f;
+			if (thick < 1.4f) thick = 1.4f;
+
+			ImVec2 top_center = ImVec2(c.x, c.y + (arc_r - eh));
+			dl->PathArcTo(top_center, arc_r, -1.5707963f - span, -1.5707963f + span, 20);
+			dl->PathStroke(glyph, 0, thick);
+
+			ImVec2 bot_center = ImVec2(c.x, c.y - (arc_r - eh));
+			dl->PathArcTo(bot_center, arc_r, 1.5707963f - span, 1.5707963f + span, 20);
+			dl->PathStroke(glyph, 0, thick);
+
+			float iris_r = eh * 0.78f;
+			if (*shown) {
+				dl->AddCircleFilled(c, iris_r, glyph, 16);
+			} else {
+				dl->AddCircle(c, iris_r, glyph, 16, thick);
+			}
+
+			if (!*shown) {
+				float sx = ew + 2.f;
+				float sy = ew + 2.f;
+				dl->AddLine(ImVec2(c.x - sx * 0.7f, c.y - sy * 0.55f),
+					ImVec2(c.x + sx * 0.7f, c.y + sy * 0.55f), glyph, thick + 0.4f);
+			}
+
+			ImGui::PopID();
+			return clicked;
+		}
+
 		static void render_provider_row(const row_def_t& def, float row_w, int idx)
 		{
 			const auto& th = aida::ui::resolved();
@@ -906,19 +952,18 @@ namespace auth_view {
 				ctrl_w_full = api_input_pref + 6.f + api_check_w + 8.f + api_save_w + api_clear_w;
 			}
 
-			const float ctrl_w_min = def.is_oauth
-				? ((status.logged_in || status.expired) ? 200.f : 188.f)
-				: 220.f;
 			const float text_min_room = 220.f;
-			const bool stack_layout = (row_w - text_offset_x - right_pad - 12.f - text_min_room) < ctrl_w_min;
+			const bool stack_layout =
+				(row_w - text_offset_x - right_pad - 16.f - text_min_room) < ctrl_w_full;
 
-			const float row_h = stack_layout ? 124.f : 72.f;
+			const float row_h = stack_layout ? 140.f : 84.f;
 
 			ImVec2 origin = ImGui::GetCursorScreenPos();
 			ImDrawList* dl = ImGui::GetWindowDrawList();
 
 			ImGui::PushID(idx);
 			ImGui::SetCursorScreenPos(origin);
+			ImGui::SetNextItemAllowOverlap();
 			ImGui::InvisibleButton("##row_bg", ImVec2(row_w, row_h));
 			bool row_hovered = ImGui::IsItemHovered();
 			float hov = hov_state.tick(row_hovered, aida::ui::clock::dt(),
@@ -939,6 +984,19 @@ namespace auth_view {
 			ImU32 border = aida::ui::mix(th.border_subtle, th.accent_dim, hov * 0.55f);
 			dl->AddRect(a, b, border, 10.f, 0, 1.f);
 
+			float ctrl_x;
+			float ctrl_avail;
+			if (stack_layout) {
+				ctrl_x = a.x + left_pad;
+				ctrl_avail = row_w - left_pad - right_pad;
+			} else {
+				ctrl_x = a.x + row_w - ctrl_w_full - right_pad;
+				ctrl_avail = ctrl_w_full;
+			}
+			float text_clip_right = stack_layout
+				? (b.x - right_pad)
+				: (ctrl_x - 14.f);
+
 			float avatar_cx = a.x + left_pad + avatar_radius;
 			float avatar_cy = stack_layout ? (a.y + 12.f + avatar_radius) : (a.y + row_h * 0.5f);
 
@@ -950,9 +1008,13 @@ namespace auth_view {
 			ImFont* f_strong = aida::ui::fonts::body_strong();
 			ImFont* f_body = aida::ui::fonts::body();
 			ImFont* f_caption = aida::ui::fonts::caption();
-			float fs_title = 14.f;
-			float fs_sub = 14.f;
-			float fs_detail = 13.f;
+			const float row_fs = aida::ui::components::detail::ui_fs();
+			float fs_title = row_fs * 1.08f;
+			float fs_sub = row_fs * 0.96f;
+			float fs_detail = row_fs * 0.88f;
+
+			dl->PushClipRect(ImVec2(text_x - 2.f, a.y),
+				ImVec2(text_clip_right, b.y), true);
 
 			dl->AddText(f_strong, fs_title, ImVec2(text_x, text_y),
 				th.text_primary, def.display_name);
@@ -976,18 +1038,11 @@ namespace auth_view {
 					th.text_dim, status.detail_text.c_str());
 			}
 
-			float ctrl_x;
-			float ctrl_y;
-			float ctrl_avail;
-			if (stack_layout) {
-				ctrl_x = a.x + left_pad;
-				ctrl_y = pill_y + 26.f;
-				ctrl_avail = row_w - left_pad - right_pad;
-			} else {
-				ctrl_x = a.x + row_w - ctrl_w_full - right_pad;
-				ctrl_y = a.y + (row_h - 32.f) * 0.5f;
-				ctrl_avail = ctrl_w_full;
-			}
+			dl->PopClipRect();
+
+			float ctrl_y = stack_layout
+				? (pill_y + 26.f)
+				: (a.y + (row_h - 32.f) * 0.5f);
 
 			ImGui::SetCursorScreenPos(ImVec2(ctrl_x, ctrl_y));
 
@@ -1070,8 +1125,8 @@ namespace auth_view {
 				ImGui::PopStyleColor();
 
 				ImGui::SameLine(0.f, gap_input_check);
-				ImGui::Checkbox("##show", &g_state.api_key_show[b_idx]);
-				if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reveal key");
+				eye_toggle_button("##api_key_reveal", &g_state.api_key_show[b_idx],
+					ImVec2(check_w, 32.f));
 
 				ImGui::SameLine(0.f, gap_check_save);
 				ImVec2 save_pos = ImGui::GetCursorScreenPos();
@@ -1111,231 +1166,6 @@ namespace auth_view {
 			}
 		}
 
-		static void load_custom_buf(int b_idx)
-		{
-			if (b_idx < 0 || b_idx >= 3) return;
-			if (g_state.custom_loaded[b_idx]) return;
-
-			const char* keys[3] = { "anthropic", "openai", "github-copilot" };
-			aida::auth::auth_info_t info;
-			aida::auth::store::get(keys[b_idx], info);
-
-			std::strncpy(g_state.custom_client_id_buf[b_idx],
-				info.custom_client_id.c_str(),
-				sizeof(g_state.custom_client_id_buf[b_idx]) - 1);
-			g_state.custom_client_id_buf[b_idx][sizeof(g_state.custom_client_id_buf[b_idx]) - 1] = '\0';
-
-			std::strncpy(g_state.custom_redirect_uri_buf[b_idx],
-				info.custom_redirect_uri.c_str(),
-				sizeof(g_state.custom_redirect_uri_buf[b_idx]) - 1);
-			g_state.custom_redirect_uri_buf[b_idx][sizeof(g_state.custom_redirect_uri_buf[b_idx]) - 1] = '\0';
-
-			std::string scopes_joined;
-			for (size_t i = 0; i < info.custom_scopes.size(); ++i) {
-				if (i > 0) scopes_joined += ",";
-				scopes_joined += info.custom_scopes[i];
-			}
-			std::strncpy(g_state.custom_scopes_buf[b_idx],
-				scopes_joined.c_str(),
-				sizeof(g_state.custom_scopes_buf[b_idx]) - 1);
-			g_state.custom_scopes_buf[b_idx][sizeof(g_state.custom_scopes_buf[b_idx]) - 1] = '\0';
-
-			g_state.custom_loaded[b_idx] = true;
-		}
-
-		static void save_custom_buf(int b_idx)
-		{
-			if (b_idx < 0 || b_idx >= 3) return;
-			const char* keys[3] = { "anthropic", "openai", "github-copilot" };
-			aida::auth::auth_info_t info;
-			aida::auth::store::get(keys[b_idx], info);
-
-			info.custom_client_id = g_state.custom_client_id_buf[b_idx];
-			info.custom_redirect_uri = g_state.custom_redirect_uri_buf[b_idx];
-
-			info.custom_scopes.clear();
-			std::string raw = g_state.custom_scopes_buf[b_idx];
-			std::string token;
-			for (char c : raw) {
-				if (c == ',' || c == ' ' || c == ';') {
-					if (!token.empty()) {
-						info.custom_scopes.push_back(token);
-						token.clear();
-					}
-				} else {
-					token.push_back(c);
-				}
-			}
-			if (!token.empty()) info.custom_scopes.push_back(token);
-
-			if (!aida::auth::store::set(keys[b_idx], info)) {
-				toast_notification::push("Failed to save custom OAuth config",
-					toast_notification::toast_type_t::error, 5.0f);
-				return;
-			}
-			toast_notification::push("Custom OAuth saved",
-				toast_notification::toast_type_t::info, 3.5f);
-		}
-
-		static void reset_custom_buf(int b_idx)
-		{
-			if (b_idx < 0 || b_idx >= 3) return;
-			std::memset(g_state.custom_client_id_buf[b_idx], 0,
-				sizeof(g_state.custom_client_id_buf[b_idx]));
-			std::memset(g_state.custom_redirect_uri_buf[b_idx], 0,
-				sizeof(g_state.custom_redirect_uri_buf[b_idx]));
-			std::memset(g_state.custom_scopes_buf[b_idx], 0,
-				sizeof(g_state.custom_scopes_buf[b_idx]));
-
-			const char* keys[3] = { "anthropic", "openai", "github-copilot" };
-			aida::auth::auth_info_t info;
-			aida::auth::store::get(keys[b_idx], info);
-			info.custom_client_id.clear();
-			info.custom_redirect_uri.clear();
-			info.custom_scopes.clear();
-			aida::auth::store::set(keys[b_idx], info);
-			toast_notification::push("Reset to AiDA default OAuth app",
-				toast_notification::toast_type_t::info, 3.5f);
-		}
-
-		static void render_custom_provider_card(const char* title, int b_idx,
-			const char* default_redirect, const char* default_scopes_hint,
-			const row_def_t& def_for_glyph)
-		{
-			ImGui::PushID(b_idx + 100);
-			const auto& th = aida::ui::resolved();
-
-			ImVec2 cur = ImGui::GetCursorScreenPos();
-			ImDrawList* dl = ImGui::GetWindowDrawList();
-			float card_w = ImGui::GetContentRegionAvail().x;
-			float card_h = 220.f;
-
-			static aida::ui::hover_state_t s_hovers[3];
-			ImGui::SetCursorScreenPos(cur);
-			ImGui::InvisibleButton("##card_hit", ImVec2(card_w, card_h));
-			bool card_hov = ImGui::IsItemHovered();
-			float hv = s_hovers[b_idx].tick(card_hov, aida::ui::clock::dt(),
-				aida::motion::spring::balanced);
-
-			float lift = hv * 2.f;
-			ImVec2 a = ImVec2(cur.x, cur.y - lift);
-			ImVec2 b = ImVec2(cur.x + card_w, cur.y + card_h - lift);
-
-			aida::ui::blur::render_drop_shadow(dl, a, b, 12.f, 4,
-				0.22f + 0.18f * hv, ImVec2(0.f, 4.f + 2.f * hv));
-			aida::ui::blur::render_glass_fill(dl, a, b, 12.f, 1.f);
-			aida::ui::blur::render_glass_border(dl, a, b, 12.f, 1.f, 1.f);
-
-			ImU32 stripe_top = th.accent_grad_top;
-			ImU32 stripe_bot = th.accent_grad_bot;
-			dl->AddRectFilledMultiColor(a, ImVec2(b.x, a.y + 3.f),
-				stripe_top, stripe_bot, stripe_bot, stripe_top);
-
-			float glyph_x = a.x + 18.f;
-			float glyph_y = a.y + 18.f;
-			float glyph_r = 18.f;
-			brand_glyph::render(dl, def_for_glyph.glyph_kind,
-				ImVec2(glyph_x + glyph_r, glyph_y + glyph_r), glyph_r,
-				def_for_glyph.grad_top, def_for_glyph.grad_bot, def_for_glyph.ring, 1.f);
-
-			ImFont* f_h2 = aida::ui::fonts::h2();
-			ImFont* f_caption = aida::ui::fonts::caption();
-			dl->AddText(f_h2, 15.f,
-				ImVec2(glyph_x + glyph_r * 2.f + 12.f, glyph_y + 4.f),
-				th.text_primary, title);
-			dl->AddText(f_caption, 13.f,
-				ImVec2(glyph_x + glyph_r * 2.f + 12.f, glyph_y + 22.f),
-				th.text_dim, "Custom OAuth client");
-
-			ImGui::SetCursorScreenPos(ImVec2(a.x + 16.f, a.y + 64.f));
-			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_dim), "client_id");
-			ImGui::SetCursorScreenPos(ImVec2(a.x + 16.f, a.y + 80.f));
-			ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(th.panel_header));
-			ImGui::PushStyleColor(ImGuiCol_Border, ImGui::ColorConvertU32ToFloat4(th.border_subtle));
-			ImGui::SetNextItemWidth(card_w - 32.f);
-			ImGui::InputTextWithHint("##cid", "Custom OAuth client_id",
-				g_state.custom_client_id_buf[b_idx],
-				sizeof(g_state.custom_client_id_buf[b_idx]));
-			ImGui::PopStyleColor(2);
-
-			ImGui::SetCursorScreenPos(ImVec2(a.x + 16.f, a.y + 116.f));
-			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_dim), "redirect_uri");
-			ImGui::SetCursorScreenPos(ImVec2(a.x + 16.f, a.y + 132.f));
-			ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(th.panel_header));
-			ImGui::SetNextItemWidth((card_w - 32.f) * 0.55f);
-			ImGui::InputTextWithHint("##ruri", default_redirect,
-				g_state.custom_redirect_uri_buf[b_idx],
-				sizeof(g_state.custom_redirect_uri_buf[b_idx]));
-			ImGui::PopStyleColor();
-
-			float right_x = a.x + 16.f + (card_w - 32.f) * 0.55f + 10.f;
-			ImGui::SetCursorScreenPos(ImVec2(right_x, a.y + 116.f));
-			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_dim),
-				"scopes (comma-separated)");
-			ImGui::SetCursorScreenPos(ImVec2(right_x, a.y + 132.f));
-			ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(th.panel_header));
-			ImGui::SetNextItemWidth((card_w - 32.f) * 0.45f - 10.f);
-			ImGui::InputTextWithHint("##scp", default_scopes_hint,
-				g_state.custom_scopes_buf[b_idx],
-				sizeof(g_state.custom_scopes_buf[b_idx]));
-			ImGui::PopStyleColor();
-
-			ImGui::SetCursorScreenPos(ImVec2(a.x + 16.f, a.y + 172.f));
-			if (aida::ui::button("Save", aida::ui::button_kind_t::primary,
-					aida::ui::size_t_::md, ImVec2(96.f, 32.f))) {
-				save_custom_buf(b_idx);
-			}
-
-			ImGui::SetCursorScreenPos(ImVec2(a.x + 16.f + 96.f + 8.f, a.y + 172.f));
-			if (aida::ui::button("Reset to default", aida::ui::button_kind_t::secondary,
-					aida::ui::size_t_::md, ImVec2(160.f, 32.f))) {
-				reset_custom_buf(b_idx);
-				g_state.custom_loaded[b_idx] = false;
-				load_custom_buf(b_idx);
-			}
-
-			ImGui::SetCursorScreenPos(ImVec2(cur.x, cur.y + card_h + 14.f));
-			ImGui::PopID();
-		}
-
-		static void render_custom_oauth_tab(float panel_w, float panel_h)
-		{
-			(void)panel_h;
-			(void)panel_w;
-
-			for (int i = 0; i < 3; ++i) load_custom_buf(i);
-
-			ImGui::Dummy(ImVec2(0.f, 6.f));
-
-			float ar = globals::ui::accent.x;
-			float ag = globals::ui::accent.y;
-			float ab = globals::ui::accent.z;
-
-			ImVec2 cur = ImGui::GetCursorScreenPos();
-			ImDrawList* dl = ImGui::GetWindowDrawList();
-			float w = ImGui::GetContentRegionAvail().x;
-			ui_anim::render_inline_callout(dl,
-				cur.x, cur.y, w, 40.f,
-				"If you've registered your own AiDA OAuth app, paste your credentials here. Leave blank to use AiDA's default app.",
-				ui_anim::callout_kind_t::info, ar, ag, ab, 1.f);
-			ImGui::Dummy(ImVec2(0.f, 50.f));
-
-			render_custom_provider_card("Anthropic (Claude Code)", 0,
-				"http://localhost:0/callback",
-				"org:create_api_key,user:profile,user:inference,user:sessions:claude_code,user:mcp_servers,user:file_upload",
-				row_def_for(row_kind_t::oauth_claude_code));
-
-			render_custom_provider_card("OpenAI (Codex / ChatGPT)", 1,
-				"http://127.0.0.1:1455/auth/callback",
-				"openid,profile,email,offline_access",
-				row_def_for(row_kind_t::oauth_codex));
-
-			render_custom_provider_card("GitHub Copilot", 2,
-				"(device-code flow ignores redirect_uri)",
-				"read:user,read:org",
-				row_def_for(row_kind_t::oauth_copilot));
-		}
-
 		static void render_phase_chips(ImDrawList* fdl, float x, float y, float w,
 									   flow_phase_t phase, float alpha,
 									   ImU32 accent_top, ImU32 accent_bot, bool is_device_flow)
@@ -1364,9 +1194,9 @@ namespace auth_view {
 			}
 
 			ImFont* f = aida::ui::fonts::caption();
-			float fs = 10.5f;
+			float fs = aida::ui::components::detail::ui_fs() * 0.82f;
 
-			float chip_h = 26.f;
+			float chip_h = 28.f;
 			float gap = 8.f;
 			float chip_w = (w - gap * 2.f) / 3.f;
 
@@ -1580,7 +1410,7 @@ namespace auth_view {
 			}
 
 			ImFont* f = aida::ui::fonts::body_em();
-			float fs = 13.f;
+			float fs = aida::ui::components::detail::ui_fs() * 0.98f;
 			ImVec2 ts = f->CalcTextSizeA(fs, FLT_MAX, 0.f, label);
 			fdl->AddText(f, fs,
 				ImVec2(a.x + (bw - ts.x) * 0.5f, a.y + (bh - ts.y) * 0.5f),
@@ -1603,13 +1433,14 @@ namespace auth_view {
 
 			ImFont* f_h2 = aida::ui::fonts::h2();
 			ImFont* f_caption = aida::ui::fonts::caption();
-			fdl->AddText(f_h2, 16.f,
-				ImVec2(glyph_cx + glyph_r + 14.f, glyph_cy - 13.f),
+			const float base_fs = aida::ui::components::detail::ui_fs();
+			fdl->AddText(f_h2, base_fs * 1.18f,
+				ImVec2(glyph_cx + glyph_r + 14.f, glyph_cy - base_fs * 0.95f),
 				aida::ui::with_alpha(th.text_primary, alpha), title);
 
-			fdl->AddText(f_caption, 13.f,
+			fdl->AddText(f_caption, base_fs * 0.88f,
 				ImVec2(glyph_cx + glyph_r + 14.f, glyph_cy + 4.f),
-				aida::ui::with_alpha(th.text_dim, alpha), def.subtitle);
+				aida::ui::with_alpha(th.text_secondary, alpha), def.subtitle);
 		}
 
 		static flow_phase_t derive_phase_codex(const aida::auth::codex::codex_login_state_t* sp,
@@ -1738,8 +1569,9 @@ namespace auth_view {
 			else if (phase == flow_phase_t::callback) status = "Received callback, exchanging code";
 
 			ImFont* f_body = aida::ui::fonts::body();
-			ImVec2 ss = f_body->CalcTextSizeA(13.f, FLT_MAX, 0.f, status.c_str());
-			fdl->AddText(f_body, 13.f,
+			const float status_fs = aida::ui::components::detail::ui_fs() * 0.95f;
+			ImVec2 ss = f_body->CalcTextSizeA(status_fs, FLT_MAX, 0.f, status.c_str());
+			fdl->AddText(f_body, status_fs,
 				ImVec2(sl.px + (sl.pw - ss.x) * 0.5f, sl.py + 198.f),
 				aida::ui::with_alpha(th.text_secondary, sl.alpha * 0.95f), status.c_str());
 
@@ -1825,8 +1657,9 @@ namespace auth_view {
 			else if (phase == flow_phase_t::callback) status = "Received callback, exchanging code";
 
 			ImFont* f_body = aida::ui::fonts::body();
-			ImVec2 ss = f_body->CalcTextSizeA(13.f, FLT_MAX, 0.f, status.c_str());
-			fdl->AddText(f_body, 13.f,
+			const float status_fs = aida::ui::components::detail::ui_fs() * 0.95f;
+			ImVec2 ss = f_body->CalcTextSizeA(status_fs, FLT_MAX, 0.f, status.c_str());
+			fdl->AddText(f_body, status_fs,
 				ImVec2(sl.px + (sl.pw - ss.x) * 0.5f, sl.py + 198.f),
 				aida::ui::with_alpha(th.text_secondary, sl.alpha * 0.95f), status.c_str());
 
@@ -1879,16 +1712,17 @@ namespace auth_view {
 
 				const char* prompt = "Optional: enter your GitHub Enterprise URL, "
 					"or leave blank to use github.com.";
-				ImVec2 ps = f_body->CalcTextSizeA(13.f, FLT_MAX, sl.pw - 44.f, prompt);
-				fdl->AddText(f_body, 13.f,
+				const float prompt_fs = aida::ui::components::detail::ui_fs() * 0.95f;
+				ImVec2 ps = f_body->CalcTextSizeA(prompt_fs, FLT_MAX, sl.pw - 44.f, prompt);
+				fdl->AddText(f_body, prompt_fs,
 					ImVec2(sl.px + 22.f, sl.py + 84.f),
 					aida::ui::with_alpha(th.text_secondary, sl.alpha * 0.95f),
 					prompt, nullptr, sl.pw - 44.f);
 
 				float label_y = sl.py + 84.f + ps.y + 12.f;
-				fdl->AddText(f_caption, 12.f,
+				fdl->AddText(f_caption, aida::ui::components::detail::ui_fs() * 0.85f,
 					ImVec2(sl.px + 22.f, label_y),
-					aida::ui::with_alpha(th.text_dim, sl.alpha),
+					aida::ui::with_alpha(th.text_secondary, sl.alpha),
 					"GitHub Enterprise URL (optional)");
 
 				float input_x = sl.px + 22.f;
@@ -2020,7 +1854,7 @@ namespace auth_view {
 
 			if (have_code) {
 				ImFont* fdisp = aida::ui::fonts::display();
-				float code_size = 24.f;
+				float code_size = aida::ui::components::detail::ui_fs() * 1.5f;
 				float chip_h = 56.f;
 				float chip_pad_x = 24.f;
 				ImVec2 code_ts = fdisp->CalcTextSizeA(code_size, FLT_MAX, 0.f, user_code.c_str());
@@ -2059,8 +1893,9 @@ namespace auth_view {
 				fdl->AddRect(ImVec2(copy_x, copy_y), ImVec2(copy_x + copy_w, copy_y + copy_h),
 					aida::ui::with_alpha(IM_COL32(255, 255, 255, 120), sl.alpha), 6.f, 0, 1.f);
 				ImFont* f_em = aida::ui::fonts::body_em();
-				ImVec2 cs = f_em->CalcTextSizeA(12.f, FLT_MAX, 0.f, "Copy");
-				fdl->AddText(f_em, 14.f,
+				const float copy_fs = aida::ui::components::detail::ui_fs() * 0.95f;
+				ImVec2 cs = f_em->CalcTextSizeA(copy_fs, FLT_MAX, 0.f, "Copy");
+				fdl->AddText(f_em, copy_fs,
 					ImVec2(copy_x + (copy_w - cs.x) * 0.5f, copy_y + (copy_h - cs.y) * 0.5f),
 					aida::ui::with_alpha(IM_COL32(255, 255, 255, 250), sl.alpha), "Copy");
 
@@ -2098,8 +1933,9 @@ namespace auth_view {
 			else if (have_code) status_text = "Polling GitHub for completion";
 
 			ImFont* f_body = aida::ui::fonts::body();
-			ImVec2 ss = f_body->CalcTextSizeA(13.f, FLT_MAX, 0.f, status_text.c_str());
-			fdl->AddText(f_body, 13.f,
+			const float status_fs = aida::ui::components::detail::ui_fs() * 0.95f;
+			ImVec2 ss = f_body->CalcTextSizeA(status_fs, FLT_MAX, 0.f, status_text.c_str());
+			fdl->AddText(f_body, status_fs,
 				ImVec2(sl.px + (sl.pw - ss.x) * 0.5f, sl.py + ph - 88.f),
 				aida::ui::with_alpha(th.text_secondary, sl.alpha * 0.95f), status_text.c_str());
 
@@ -2253,28 +2089,11 @@ namespace auth_view {
 		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f);
 		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 6.f));
 
-		if (ImGui::BeginTabBar("##auth_view_tabs",
-				ImGuiTabBarFlags_FittingPolicyScroll | ImGuiTabBarFlags_NoTabListScrollingButtons)) {
-			if (ImGui::BeginTabItem("Providers")) {
-				g_state.active_top_tab = 0;
-				ImGui::BeginChild("##auth_providers_child",
-					ImVec2(0, ImGui::GetContentRegionAvail().y), false);
-				render_providers_tab(ImGui::GetContentRegionAvail().x,
-					ImGui::GetContentRegionAvail().y);
-				ImGui::EndChild();
-				ImGui::EndTabItem();
-			}
-			if (ImGui::BeginTabItem("Custom OAuth")) {
-				g_state.active_top_tab = 1;
-				ImGui::BeginChild("##auth_custom_child",
-					ImVec2(0, ImGui::GetContentRegionAvail().y), false);
-				render_custom_oauth_tab(ImGui::GetContentRegionAvail().x,
-					ImGui::GetContentRegionAvail().y);
-				ImGui::EndChild();
-				ImGui::EndTabItem();
-			}
-			ImGui::EndTabBar();
-		}
+		ImGui::BeginChild("##auth_providers_child",
+			ImVec2(0, ImGui::GetContentRegionAvail().y), false);
+		render_providers_tab(ImGui::GetContentRegionAvail().x,
+			ImGui::GetContentRegionAvail().y);
+		ImGui::EndChild();
 
 		ImGui::PopStyleVar(2);
 

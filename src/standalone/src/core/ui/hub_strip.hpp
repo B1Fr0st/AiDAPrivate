@@ -8,6 +8,7 @@
 #include "clock.hpp"
 #include "blur_layer.hpp"
 #include "fonts.hpp"
+#include "ui_anim.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -25,6 +26,7 @@ namespace aida::ui::hub_strip {
 		int   active = 0;
 		int   prev = 0;
 		int   render_active = 0;
+		int   last_ensured_active = -1;
 		bool  swap_pending = false;
 		float swap_progress = 1.f;
 		float direction_sign = 1.f;
@@ -33,7 +35,6 @@ namespace aida::ui::hub_strip {
 		float underline_x = 0.f;
 		float underline_w = 0.f;
 		float underline_vel = 0.f;
-		float halo_phase = 0.f;
 		float hover_v[32] = {};
 	};
 
@@ -77,12 +78,10 @@ namespace aida::ui::hub_strip {
 		if (count > max_tabs) count = max_tabs;
 		const auto& t = aida::ui::resolved();
 		float dt = aida::ui::clock::dt();
-		st.halo_phase += dt;
 
 		const float tab_h = 30.f;
 		const float pad_x = 16.f;
 		const float gap = 4.f;
-		const float pill_h = tab_h - 8.f;
 
 		float clip_x0 = origin.x + pos_x;
 		float clip_y0 = origin.y + pos_y;
@@ -99,7 +98,7 @@ namespace aida::ui::hub_strip {
 
 		ImFont* font = aida::ui::fonts::body_em();
 		if (!font) font = ImGui::GetFont();
-		const float font_size = 13.f;
+		const float font_size = (font->FontSize > 0.f) ? font->FontSize : 13.f;
 
 		float widths[max_tabs] = {};
 		float offsets[max_tabs] = {};
@@ -123,16 +122,21 @@ namespace aida::ui::hub_strip {
 		int active_idx = st.active;
 		if (active_idx < 0 || active_idx >= count) active_idx = 0;
 
-		float active_left = offsets[active_idx] - st.scroll_x;
-		float active_right = active_left + widths[active_idx];
-		if (active_left < 0.f) {
-			st.target_scroll_x = offsets[active_idx];
-		} else if (active_right > width) {
-			st.target_scroll_x = offsets[active_idx] + widths[active_idx] - width;
+		if (st.last_ensured_active != active_idx) {
+			float active_left = offsets[active_idx] - st.scroll_x;
+			float active_right = active_left + widths[active_idx];
+			if (active_left < 0.f) {
+				st.target_scroll_x = offsets[active_idx];
+			} else if (active_right > width) {
+				st.target_scroll_x = offsets[active_idx] + widths[active_idx] - width;
+			}
+			if (st.target_scroll_x < 0.f) st.target_scroll_x = 0.f;
+			if (st.target_scroll_x > max_scroll) st.target_scroll_x = max_scroll;
+			st.last_ensured_active = active_idx;
 		}
 
-		float target_ux = clip_x0 + offsets[active_idx] - st.scroll_x + 4.f;
-		float target_uw = widths[active_idx] - 8.f;
+		float target_ux = clip_x0 + offsets[active_idx] - st.scroll_x + 6.f;
+		float target_uw = widths[active_idx] - 12.f;
 		if (st.underline_w < 0.5f) {
 			st.underline_x = target_ux;
 			st.underline_w = target_uw;
@@ -140,13 +144,6 @@ namespace aida::ui::hub_strip {
 		st.underline_x = aida::motion::spring_step(st.underline_x, target_ux,
 			st.underline_vel, aida::motion::spring::balanced, dt);
 		st.underline_w = aida::motion::smooth_lerp(st.underline_w, target_uw, 16.f, dt);
-
-		float halo_phase = st.halo_phase * 0.45f;
-		float halo_offset = sinf(halo_phase) * 6.f;
-		ImU32 halo_col = aida::ui::with_alpha(t.accent_glow, alpha * 0.42f);
-		dl->AddRectFilled(ImVec2(st.underline_x - 18.f + halo_offset, clip_y0 + 4.f),
-			ImVec2(st.underline_x + st.underline_w + 18.f + halo_offset, clip_y1 - 4.f),
-			halo_col, pill_h * 0.5f + 6.f);
 
 		dl->PushClipRect(ImVec2(clip_x0, clip_y0), ImVec2(clip_x1, clip_y1), true);
 
@@ -160,34 +157,23 @@ namespace aida::ui::hub_strip {
 			bool hovered = (mp.x >= bx0 && mp.x < bx1 && mp.y >= by0 && mp.y < by1);
 			bool clicked = hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
 
-			float target_h = hovered ? 1.f : 0.f;
+			bool is_active = (i == active_idx);
+			float target_h = is_active ? 1.f : (hovered ? 0.55f : 0.f);
 			st.hover_v[i] = aida::motion::smooth_lerp(st.hover_v[i], target_h, 14.f, dt);
 
-			bool is_active = (i == active_idx);
-
-			if (is_active) {
-				ImU32 pill_top = aida::ui::with_alpha(t.accent_grad_top, alpha * 0.95f);
-				ImU32 pill_bot = aida::ui::with_alpha(t.accent_grad_bot, alpha * 0.95f);
-				ImU32 pill_flat = aida::ui::mix(pill_top, pill_bot, 0.5f);
-				dl->AddRectFilled(ImVec2(bx0 + 4.f, by0), ImVec2(bx1 - 4.f, by1),
-					pill_flat, pill_h * 0.5f);
-				ImU32 ring = aida::ui::with_alpha(t.accent_hover, alpha * 0.35f);
-				dl->AddRect(ImVec2(bx0 + 4.f, by0), ImVec2(bx1 - 4.f, by1),
-					ring, pill_h * 0.5f, 0, 1.f);
-			} else if (st.hover_v[i] > 0.01f) {
-				ImU32 hov_fill = aida::ui::with_alpha(t.hover_wash, alpha * st.hover_v[i]);
-				dl->AddRectFilled(ImVec2(bx0 + 4.f, by0), ImVec2(bx1 - 4.f, by1),
-					hov_fill, pill_h * 0.5f);
+			if (st.hover_v[i] > 0.01f) {
+				ImU32 wash = aida::ui::mix(t.hover_wash, t.accent_glow, st.hover_v[i] * 0.6f);
+				dl->AddRectFilled(ImVec2(bx0 + 3.f, by0 + 1.f),
+					ImVec2(bx1 - 3.f, by1 - 1.f),
+					aida::ui::with_alpha(wash, st.hover_v[i] * alpha), 6.f);
 			}
 
 			ImU32 text_col;
 			if (is_active) {
-				text_col = aida::ui::with_alpha(IM_COL32(255, 255, 255, 245), alpha);
+				text_col = aida::ui::with_alpha(t.accent_hover, alpha);
 			} else {
-				ImU32 base_text = t.text_secondary;
-				ImU32 hov_text = t.text_primary;
-				text_col = aida::ui::mix(base_text, hov_text, st.hover_v[i]);
-				text_col = aida::ui::with_alpha(text_col, alpha);
+				text_col = aida::ui::with_alpha(
+					aida::ui::mix(t.text_secondary, t.text_primary, st.hover_v[i]), alpha);
 			}
 
 			float tw = font->CalcTextSizeA(font_size, FLT_MAX, 0.f, tabs[i].label).x;
@@ -199,6 +185,9 @@ namespace aida::ui::hub_strip {
 				notify_select(st, i);
 			}
 		}
+
+		ui_anim::render_tab_underline_glow(dl, st.underline_x, st.underline_w,
+			clip_y1 - 3.f, alpha);
 
 		dl->PopClipRect();
 

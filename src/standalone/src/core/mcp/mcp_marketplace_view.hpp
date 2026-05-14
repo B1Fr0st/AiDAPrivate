@@ -625,7 +625,7 @@ namespace aida::mcp_marketplace_view {
 			for (const auto& ln : lines) {
 				if (ly + 14.f > lg_b.y) break;
 				dl->AddText(aida::ui::fonts::code(), 13.f, ImVec2(lg_a.x + 8.f, ly),
-					IM_COL32(180, 220, 180, 245), ln.c_str());
+					aida::ui::with_alpha(aida::ui::resolved().success, 0.96f), ln.c_str());
 				ly += 14.f;
 			}
 

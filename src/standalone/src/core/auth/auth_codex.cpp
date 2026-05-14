@@ -1,6 +1,5 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "auth_codex.hpp"
 
 #include "auth_store.hpp"
@@ -14,7 +13,9 @@
 #include <bcrypt.h>
 #include <wincrypt.h>
 
-#include <httplib.h>
+#include "auth_http.hpp"
+#include "auth_browser_launch.hpp"
+
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 
@@ -497,20 +498,6 @@ namespace codex {
 			return true;
 		}
 
-		bool open_browser(const std::string& url)
-		{
-			const int wlen = MultiByteToWideChar(CP_UTF8, 0, url.c_str(),
-				static_cast<int>(url.size()), nullptr, 0);
-			if (wlen <= 0)
-				return false;
-			std::wstring wurl(static_cast<size_t>(wlen), L'\0');
-			MultiByteToWideChar(CP_UTF8, 0, url.c_str(), static_cast<int>(url.size()),
-				wurl.data(), wlen);
-			HINSTANCE rc = ShellExecuteW(nullptr, L"open", wurl.c_str(), nullptr,
-				nullptr, SW_SHOWNORMAL);
-			return reinterpret_cast<INT_PTR>(rc) > 32;
-		}
-
 		bool jwt_parse_claims(const std::string& token, nlohmann::json& claims_out)
 		{
 			const size_t first_dot = token.find('.');
@@ -576,30 +563,24 @@ namespace codex {
 
 		bool token_post(const std::string& form_body, nlohmann::json& json_out, std::string& err_out)
 		{
-			httplib::Client cli(CODEX_ISSUER);
-			cli.set_connection_timeout(30);
-			cli.set_read_timeout(30);
-			cli.set_follow_location(true);
-			cli.enable_server_certificate_verification(true);
-
-			httplib::Headers headers = {
+			const aida::auth::http::header_list_t headers = {
 				{ "User-Agent", "AiDA/1.0" },
 				{ "Accept", "application/json" },
 			};
-			auto res = cli.Post("/oauth/token", headers, form_body,
-				"application/x-www-form-urlencoded");
-			if (!res) {
-				err_out = "token endpoint unreachable: "
-					+ httplib::to_string(res.error());
+			const aida::auth::http::response_t res = aida::auth::http::request(
+				"POST", std::string(CODEX_ISSUER) + "/oauth/token", headers,
+				form_body, "application/x-www-form-urlencoded", 30);
+			if (!res.ok) {
+				err_out = "token endpoint unreachable: " + res.error;
 				return false;
 			}
-			if (res->status < 200 || res->status >= 300) {
-				err_out = "token endpoint status=" + std::to_string(res->status)
-					+ " body=" + res->body.substr(0, 256);
+			if (res.status < 200 || res.status >= 300) {
+				err_out = "token endpoint status=" + std::to_string(res.status)
+					+ " body=" + res.body.substr(0, 256);
 				return false;
 			}
 			try {
-				json_out = nlohmann::json::parse(res->body);
+				json_out = nlohmann::json::parse(res.body);
 				if (!json_out.is_object()) {
 					err_out = "token response not object";
 					return false;
@@ -716,9 +697,9 @@ namespace codex {
 		state.auth_url = build_authorize_url(redirect_uri, state.challenge,
 			state.state, client_id);
 
-		if (!open_browser(state.auth_url))
+		if (!aida::auth::open_url_external(state.auth_url))
 			anti_tamper::webhook::write_log("auth.codex",
-				"[aida.auth.codex] ShellExecuteW open browser failed; user must open auth_url manually");
+				"[aida.auth.codex] open browser failed; user must open auth_url manually");
 
 		set_last_error({});
 		return true;
@@ -835,14 +816,7 @@ namespace codex {
 		const std::string client_id = client_id_override.empty()
 			? std::string(CODEX_CLIENT_ID) : client_id_override;
 
-		httplib::Client cli(CODEX_ISSUER);
-		cli.set_connection_timeout(10);
-		cli.set_read_timeout(10);
-		cli.set_write_timeout(10);
-		cli.set_follow_location(true);
-		cli.enable_server_certificate_verification(true);
-
-		httplib::Headers headers = {
+		const aida::auth::http::header_list_t headers = {
 			{ "User-Agent", "AiDA/1.0" },
 			{ "Accept", "application/json" },
 		};
@@ -858,19 +832,20 @@ namespace codex {
 			body += "&token_type_hint=";
 			body += hint;
 			body += "&client_id=" + url_encode(client_id);
-			auto res = cli.Post("/oauth/revoke", headers, body,
-				"application/x-www-form-urlencoded");
-			if (!res) {
+			const aida::auth::http::response_t res = aida::auth::http::request(
+				"POST", std::string(CODEX_ISSUER) + "/oauth/revoke", headers,
+				body, "application/x-www-form-urlencoded", 10);
+			if (!res.ok) {
 				last_failure = std::string("revoke ") + hint + " unreachable: "
-					+ httplib::to_string(res.error());
+					+ res.error;
 				return false;
 			}
-			if (res->status >= 200 && res->status < 300)
+			if (res.status >= 200 && res.status < 300)
 				return true;
-			if (res->status == 400 || res->status == 401)
+			if (res.status == 400 || res.status == 401)
 				return true;
 			last_failure = std::string("revoke ") + hint + " status="
-				+ std::to_string(res->status);
+				+ std::to_string(res.status);
 			return false;
 		};
 

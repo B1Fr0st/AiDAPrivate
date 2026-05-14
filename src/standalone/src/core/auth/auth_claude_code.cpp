@@ -1,6 +1,5 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "auth_claude_code.hpp"
 
 #include "auth_store.hpp"
@@ -14,7 +13,9 @@
 #include <bcrypt.h>
 #include <wincrypt.h>
 
-#include <httplib.h>
+#include "auth_http.hpp"
+#include "auth_browser_launch.hpp"
+
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 
@@ -771,68 +772,27 @@ namespace claude_code {
 			return true;
 		}
 
-		bool open_browser(const std::string& url)
-		{
-			const int wlen = MultiByteToWideChar(CP_UTF8, 0, url.c_str(),
-				static_cast<int>(url.size()), nullptr, 0);
-			if (wlen <= 0)
-				return false;
-			std::wstring wurl(static_cast<size_t>(wlen), L'\0');
-			MultiByteToWideChar(CP_UTF8, 0, url.c_str(), static_cast<int>(url.size()),
-				wurl.data(), wlen);
-			HINSTANCE rc = ShellExecuteW(nullptr, L"open", wurl.c_str(), nullptr,
-				nullptr, SW_SHOWNORMAL);
-			return reinterpret_cast<INT_PTR>(rc) > 32;
-		}
-
-		void parse_token_url(std::string& host_out, std::string& path_out)
-		{
-			std::string url = CLAUDE_CODE_TOKEN_URL;
-			if (url.rfind("https://", 0) == 0)
-				url.erase(0, 8);
-			else if (url.rfind("http://", 0) == 0)
-				url.erase(0, 7);
-			const size_t slash = url.find('/');
-			if (slash == std::string::npos) {
-				host_out = "https://" + url;
-				path_out = "/";
-			} else {
-				host_out = "https://" + url.substr(0, slash);
-				path_out = url.substr(slash);
-			}
-		}
-
 		bool token_post(const nlohmann::json& body, nlohmann::json& json_out, std::string& err_out)
 		{
-			std::string host;
-			std::string path;
-			parse_token_url(host, path);
-
-			httplib::Client cli(host);
-			cli.set_connection_timeout(15);
-			cli.set_read_timeout(15);
-			cli.set_write_timeout(15);
-			cli.set_follow_location(true);
-			cli.enable_server_certificate_verification(true);
-
-			httplib::Headers headers = {
+			const aida::auth::http::header_list_t headers = {
 				{ "User-Agent", "AiDA/1.0" },
 				{ "Accept", "application/json" },
 			};
 			const std::string body_str = body.dump();
-			auto res = cli.Post(path.c_str(), headers, body_str, "application/json");
-			if (!res) {
-				err_out = "anthropic token endpoint unreachable: "
-					+ httplib::to_string(res.error());
+			const aida::auth::http::response_t res = aida::auth::http::request(
+				"POST", CLAUDE_CODE_TOKEN_URL, headers, body_str,
+				"application/json", 15);
+			if (!res.ok) {
+				err_out = "anthropic token endpoint unreachable: " + res.error;
 				return false;
 			}
-			if (res->status < 200 || res->status >= 300) {
+			if (res.status < 200 || res.status >= 300) {
 				err_out = "anthropic token endpoint status="
-					+ std::to_string(res->status) + " body=" + res->body.substr(0, 256);
+					+ std::to_string(res.status) + " body=" + res.body.substr(0, 256);
 				return false;
 			}
 			try {
-				json_out = nlohmann::json::parse(res->body);
+				json_out = nlohmann::json::parse(res.body);
 				if (!json_out.is_object()) {
 					err_out = "anthropic token response not object";
 					return false;
@@ -846,32 +806,26 @@ namespace claude_code {
 
 		bool profile_get(const std::string& access_token, nlohmann::json& json_out, std::string& err_out)
 		{
-			httplib::Client cli(CLAUDE_CODE_BASE_API_URL);
-			cli.set_connection_timeout(10);
-			cli.set_read_timeout(10);
-			cli.set_write_timeout(10);
-			cli.set_follow_location(true);
-			cli.enable_server_certificate_verification(true);
-
-			httplib::Headers headers = {
+			const aida::auth::http::header_list_t headers = {
 				{ "User-Agent", "AiDA/1.0" },
 				{ "Accept", "application/json" },
 				{ "Content-Type", "application/json" },
 				{ "Authorization", std::string("Bearer ") + access_token },
 			};
-			auto res = cli.Get(CLAUDE_CODE_PROFILE_PATH, headers);
-			if (!res) {
-				err_out = "anthropic profile endpoint unreachable: "
-					+ httplib::to_string(res.error());
+			const aida::auth::http::response_t res = aida::auth::http::request(
+				"GET", std::string(CLAUDE_CODE_BASE_API_URL) + CLAUDE_CODE_PROFILE_PATH,
+				headers, std::string(), std::string(), 10);
+			if (!res.ok) {
+				err_out = "anthropic profile endpoint unreachable: " + res.error;
 				return false;
 			}
-			if (res->status < 200 || res->status >= 300) {
+			if (res.status < 200 || res.status >= 300) {
 				err_out = "anthropic profile endpoint status="
-					+ std::to_string(res->status) + " body=" + res->body.substr(0, 256);
+					+ std::to_string(res.status) + " body=" + res.body.substr(0, 256);
 				return false;
 			}
 			try {
-				json_out = nlohmann::json::parse(res->body);
+				json_out = nlohmann::json::parse(res.body);
 				if (!json_out.is_object()) {
 					err_out = "anthropic profile response not object";
 					return false;
@@ -1003,9 +957,9 @@ namespace claude_code {
 		state.auth_url = build_authorize_url(redirect_uri, state.challenge,
 			state.state, client_id, scopes);
 
-		if (!open_browser(state.auth_url))
+		if (!aida::auth::open_url_external(state.auth_url))
 			anti_tamper::webhook::write_log("auth.claude_code",
-				"[aida.auth.claude_code] ShellExecuteW open browser failed; user must open auth_url manually");
+				"[aida.auth.claude_code] open browser failed; user must open auth_url manually");
 
 		set_last_error({});
 		return true;
@@ -1164,14 +1118,7 @@ namespace claude_code {
 		else
 			revoke_path += "/revoke";
 
-		httplib::Client cli(host);
-		cli.set_connection_timeout(10);
-		cli.set_read_timeout(10);
-		cli.set_write_timeout(10);
-		cli.set_follow_location(true);
-		cli.enable_server_certificate_verification(true);
-
-		httplib::Headers headers = {
+		const aida::auth::http::header_list_t headers = {
 			{ "User-Agent", "AiDA/1.0" },
 			{ "Accept", "application/json" },
 		};
@@ -1189,19 +1136,20 @@ namespace claude_code {
 				{ "client_id", client_id },
 			};
 			const std::string body_str = body.dump();
-			auto res = cli.Post(revoke_path.c_str(), headers, body_str,
-				"application/json");
-			if (!res) {
+			const aida::auth::http::response_t res = aida::auth::http::request(
+				"POST", host + revoke_path, headers, body_str,
+				"application/json", 10);
+			if (!res.ok) {
 				last_failure = std::string("revoke ") + hint + " unreachable: "
-					+ httplib::to_string(res.error());
+					+ res.error;
 				return false;
 			}
-			if (res->status >= 200 && res->status < 300)
+			if (res.status >= 200 && res.status < 300)
 				return true;
-			if (res->status == 400 || res->status == 401)
+			if (res.status == 400 || res.status == 401)
 				return true;
 			last_failure = std::string("revoke ") + hint + " status="
-				+ std::to_string(res->status);
+				+ std::to_string(res.status);
 			return false;
 		};
 

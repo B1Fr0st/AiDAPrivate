@@ -55,11 +55,34 @@ struct script_info {
 };
 
 
+enum class log_level {
+    info,
+    warn,
+    error,
+    debug,
+    output,
+    command
+};
+
+inline const char* log_level_name(log_level lv) {
+    switch (lv) {
+        case log_level::info:    return "info";
+        case log_level::warn:    return "warn";
+        case log_level::error:   return "error";
+        case log_level::debug:   return "debug";
+        case log_level::output:  return "output";
+        case log_level::command: return "command";
+        default:                 return "info";
+    }
+}
+
 struct log_entry {
     uint64_t    timestamp = 0;
+    uint64_t    wall_seconds = 0;
     std::string script_name;
-    std::string level;
+    log_level   level = log_level::info;
     std::string message;
+    uint32_t    repeat_count = 1;
 };
 
 
@@ -181,6 +204,19 @@ bool invoke_hook(hook_type type, hook_ws_frame_data& data);
 bool invoke_hook(hook_type type, hook_packet_data& data);
 bool invoke_hook(hook_type type, hook_dns_data& data);
 bool invoke_hook(hook_type type, hook_connection_data& data);
+
+
+bool dispatch_request(hook_request_data& data);
+bool dispatch_response(hook_response_data& data);
+bool dispatch_websocket_frame(hook_ws_frame_data& data);
+bool dispatch_packet(hook_packet_data& data);
+bool dispatch_dns(hook_dns_data& data);
+bool dispatch_connection(hook_connection_data& data);
+bool dispatch_connection_close(hook_connection_data& data);
+
+
+size_t registered_hook_count(hook_type type);
+size_t registered_hook_count();
 
 
 std::string execute(const std::string& code);

@@ -227,8 +227,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		std::snprintf(mod_buf, sizeof(mod_buf), "%d", distinct_modules);
 
 		ImU32 unres_col = unresolved > 0
-			? IM_COL32(230, 140, 80, 255)
-			: IM_COL32(120, 200, 130, 255);
+			? _t.warning
+			: _t.success;
 
 		ui_anim::stat_strip_item_t items[3];
 		items[0] = { "Chain Depth", depth_buf, nullptr, 0, nullptr, 0, 0 };

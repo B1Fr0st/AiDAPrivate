@@ -97,4 +97,6 @@ test('storeSession upsert resets last_gate_bitmap to prevent cross-session regre
         'ON CONFLICT DO UPDATE clause must reset last_gate_bitmap to 0 — otherwise a stale bitmap from a previous session causes a false-positive heartbeat_gate_bitmap_regression on the next activation');
     assert.match(updateClause, /heartbeat_count\s*=\s*0/,
         'ON CONFLICT DO UPDATE clause must reset heartbeat_count alongside last_gate_bitmap so all monotonic per-session fields are zeroed together');
+    assert.match(updateClause, /driver_proof_absent_streak\s*=\s*0/,
+        'ON CONFLICT DO UPDATE clause must reset driver_proof_absent_streak to 0 — a stale streak from a previous session would let a single early proofless heartbeat trip arc_driver_proof_missing');
 });

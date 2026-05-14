@@ -56,6 +56,57 @@ struct goto_state_t {
 };
 
 
+enum class diff_line_kind_t : int {
+    context = 0,
+    added,
+    removed
+};
+
+
+struct diff_line_t {
+    diff_line_kind_t kind = diff_line_kind_t::context;
+    std::string      text;
+    int              old_line = -1;
+    int              new_line = -1;
+};
+
+
+enum class diff_hunk_state_t : int {
+    pending = 0,
+    accepted,
+    rejected
+};
+
+
+struct diff_hunk_t {
+    int               old_start   = 0;
+    int               old_count   = 0;
+    int               new_start   = 0;
+    int               new_count   = 0;
+    int               added       = 0;
+    int               removed     = 0;
+    diff_hunk_state_t state       = diff_hunk_state_t::pending;
+    std::vector<diff_line_t> lines;
+};
+
+
+struct pending_diff_t {
+    bool                     active   = false;
+    std::string              origin;
+    std::vector<std::string> old_lines;
+    std::vector<std::string> new_lines;
+    std::vector<diff_hunk_t> hunks;
+    int                      total_added   = 0;
+    int                      total_removed = 0;
+
+    bool fully_resolved() const {
+        for (const auto& h : hunks)
+            if (h.state == diff_hunk_state_t::pending) return false;
+        return true;
+    }
+};
+
+
 void init();
 
 
@@ -75,5 +126,28 @@ void open_find();
 void open_replace();
 
 std::string last_error();
+
+
+bool begin_agent_edit(std::string_view origin);
+
+bool propose_full_content(std::string_view new_content);
+
+bool propose_replace_range(int start_line, int end_line, std::string_view replacement);
+
+bool has_pending_diff();
+
+const pending_diff_t& pending_diff();
+
+int  pending_hunk_count();
+
+bool accept_hunk(int index);
+
+bool reject_hunk(int index);
+
+void accept_all();
+
+void reject_all();
+
+void cancel_agent_edit();
 
 }

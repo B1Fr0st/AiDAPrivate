@@ -3266,8 +3266,8 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
     {
         const auto& th_pop = aida::ui::resolved();
         ImU32 dim_col = th_pop.is_dark
-            ? IM_COL32(6, 8, 12, static_cast<int>(238 * fa))
-            : IM_COL32(0x1F, 0x1E, 0x1D, static_cast<int>(160 * fa));
+            ? IM_COL32(0, 0, 0, static_cast<int>(238 * fa))
+            : aida::ui::with_alpha(th_pop.text_primary, 0.63f * fa);
         fdl->AddRectFilled(ImVec2(vp_px, vp_py), ImVec2(vp_px + vp_pw, vp_py + vp_ph),
             dim_col);
     }
@@ -3773,6 +3773,15 @@ void render(float pos_x, float pos_y, float width, float height,
     ensure_pdb_event_subscriptions();
 
     auto& st    = g_state;
+
+    {
+        static uint32_t s_last_theme_gen = 0u;
+        const uint32_t cur_theme_gen = aida::ui::theme_generation();
+        if (cur_theme_gen != s_last_theme_gen) {
+            s_last_theme_gen = cur_theme_gen;
+            bump_format_generation();
+        }
+    }
 
     {
         const uint32_t cur_pid = driver_bridge::attached_pid();
