@@ -23,6 +23,8 @@
 #include "ghidra_decompiler.hpp"
 #include "ghidra_adapters/aida_code_xml_parse.hpp"
 #include "function_index.hpp"
+#include "../analysis/pdb_events.hpp"
+#include "../infra/event_bus.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -413,7 +415,11 @@ inline void cancel_decompile()
 	diag::log_tagged_critical("dec", "cancel_decompile_exit");
 }
 
+inline void ensure_pdb_subscription();
+
 inline void decompile_function_native(uint64_t func_addr, const DisasmFile* file_fallback = nullptr) {
+	ensure_pdb_subscription();
+
 	uint32_t dfn_pid = driver_bridge::attached_pid();
 	diag::log_tagged_critical_fmt("dec", "decompile_function_native_enter addr=0x%llX pid=%u file_fallback=%p",
 		static_cast<unsigned long long>(func_addr), dfn_pid,
@@ -699,6 +705,53 @@ inline void clear_cache()
 	g_state.cache.clear();
 	g_state.cache_lru_order.clear();
 	g_state.cache_lru_iters.clear();
+}
+
+namespace detail {
+
+inline std::atomic<bool>& pdb_subscription_armed_flag()
+{
+	static std::atomic<bool> armed{false};
+	return armed;
+}
+
+inline aida::events::subscription_handle_t& pdb_subscription_slot()
+{
+	static aida::events::subscription_handle_t slot;
+	return slot;
+}
+
+inline void on_pdb_loaded_cache_invalidate(const aida::events::event_pdb_loaded& ev)
+{
+	if (!ev.success) return;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.cache.clear();
+		g_state.cache_lru_order.clear();
+		g_state.cache_lru_iters.clear();
+	}
+	diag::log_tagged_critical_fmt("dec",
+		"pdb_loaded_cache_cleared module=%s symbols=%u",
+		ev.module_name.c_str(),
+		static_cast<unsigned>(ev.symbol_count));
+}
+
+}
+
+inline void ensure_pdb_subscription()
+{
+	auto& armed = detail::pdb_subscription_armed_flag();
+	if (armed.load(std::memory_order_acquire)) return;
+	bool expected = false;
+	if (!armed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+	detail::pdb_subscription_slot() = aida::events::subscribe(
+		aida::events::event_pdb_loaded_def,
+		[](const aida::events::event_pdb_loaded& ev) {
+			detail::on_pdb_loaded_cache_invalidate(ev);
+		});
+	if (!detail::pdb_subscription_slot().valid()) {
+		armed.store(false, std::memory_order_release);
+	}
 }
 
 inline void erase_cache_entry(uint64_t addr)

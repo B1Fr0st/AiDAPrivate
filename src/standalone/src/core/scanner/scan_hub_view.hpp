@@ -8,7 +8,6 @@
 #include "decrypt_oracle_view.hpp"
 #include "pointer_scanner_view.hpp"
 #include "snapshot_diff.hpp"
-#include "xref_db_view.hpp"
 #include "integrity_hunter_view.hpp"
 
 #include "imgui/imgui.h"
@@ -26,7 +25,6 @@ enum class sub_tab_t : int {
 	decrypt,
 	pointers,
 	snapshots,
-	xrefs,
 	integrity,
 	COUNT
 };
@@ -50,7 +48,6 @@ inline constexpr aida::ui::hub_strip::tab_t s_tabs[] = {
 	{ "Decrypt",    "decrypt oracle" },
 	{ "Pointers",   "pointer scanner" },
 	{ "Snapshots",  "memory snapshot diff" },
-	{ "XRefs",      "cross-reference database" },
 	{ "Integrity",  "integrity hunter" },
 };
 
@@ -74,9 +71,6 @@ inline void render_active(int idx, float cw, float ch, float fa, float ar, float
 			break;
 		case sub_tab_t::snapshots:
 			snapshot_diff::render(0.f, 0.f, cw, ch, fa, ar, ag, ab);
-			break;
-		case sub_tab_t::xrefs:
-			xref_db_view::render(0.f, 0.f, cw, ch, fa, ar, ag, ab);
 			break;
 		case sub_tab_t::integrity:
 			integrity_hunter_view::render(0.f, 0.f, cw, ch, fa, ar, ag, ab);

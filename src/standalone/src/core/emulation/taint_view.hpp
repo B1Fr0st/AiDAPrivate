@@ -331,7 +331,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + width, cy + height),
 		aida::ui::with_alpha(t.bg_base, alpha));
 
-	const float toolbar_h = 84.f;
+	const float toolbar_h = 96.f;
 	const float pad = 12.f;
 	const float row_h = 22.f;
 
@@ -351,34 +351,33 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PopStyleColor();
 
 	ImGui::SameLine();
-	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 56.f, input_y));
-	ImGui::SetNextItemWidth(140.f);
+	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 52.f, input_y));
+	ImGui::SetNextItemWidth(120.f);
 	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, alpha));
 	ImGui::PushFont(aida::ui::fonts::code());
 	ImGui::InputText("##taint_addr", st.addr_buf, sizeof(st.addr_buf));
 	ImGui::PopFont();
 	ImGui::PopStyleColor();
 
-	ImGui::SameLine();
-	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 208.f, input_y + 4.f));
+	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 184.f, input_y + 4.f));
 	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_secondary, alpha));
 	ImGui::TextUnformatted("End");
 	ImGui::PopStyleColor();
 
-	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 248.f, input_y));
-	ImGui::SetNextItemWidth(140.f);
+	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 220.f, input_y));
+	ImGui::SetNextItemWidth(120.f);
 	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, alpha));
 	ImGui::PushFont(aida::ui::fonts::code());
 	ImGui::InputText("##taint_end", st.end_addr_buf, sizeof(st.end_addr_buf));
 	ImGui::PopFont();
 	ImGui::PopStyleColor();
 
-	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 400.f, input_y + 4.f));
+	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 352.f, input_y + 4.f));
 	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_secondary, alpha));
 	ImGui::TextUnformatted("Taint");
 	ImGui::PopStyleColor();
 
-	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 446.f, input_y));
+	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 398.f, input_y));
 	ImGui::SetNextItemWidth(140.f);
 	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, alpha));
 	ImGui::PushFont(aida::ui::fonts::code());
@@ -386,23 +385,37 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PopFont();
 	ImGui::PopStyleColor();
 
-	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 600.f, input_y + 4.f));
+	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 552.f, input_y + 4.f));
 	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_secondary, alpha));
 	ImGui::TextUnformatted("Mem");
 	ImGui::PopStyleColor();
 
-	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 638.f, input_y));
-	ImGui::SetNextItemWidth(120.f);
+	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 590.f, input_y));
+	ImGui::SetNextItemWidth(110.f);
 	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, alpha));
 	ImGui::PushFont(aida::ui::fonts::code());
 	ImGui::InputText("##taint_mem", st.taint_mem_buf, sizeof(st.taint_mem_buf));
 	ImGui::PopFont();
 	ImGui::PopStyleColor();
 
+	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 714.f, input_y + 4.f));
+	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_secondary, alpha));
+	ImGui::TextUnformatted("Max");
+	ImGui::PopStyleColor();
+
+	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 752.f, input_y + 2.f));
+	ImGui::SetNextItemWidth(110.f);
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(t.panel_header, alpha));
+	ImGui::PushStyleColor(ImGuiCol_SliderGrab, aida::ui::with_alpha(t.accent_u32, alpha));
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
+	ImGui::SliderInt("##taint_max", &st.max_insns, 100, 100000);
+	ImGui::PopStyleVar();
+	ImGui::PopStyleColor(2);
+
 	ImGui::PopStyleVar(2);
 	ImGui::PopStyleColor(2);
 
-	float ctrl_y = cy + 48.f;
+	float ctrl_y = cy + 54.f;
 	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 8.f, ctrl_y));
 
 	bool busy = symbolic_engine::g_state.processing.load();
@@ -411,26 +424,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		busy ? aida::ui::components::button_kind_t::secondary
 		     : aida::ui::components::button_kind_t::primary,
 		aida::ui::components::size_t_::sm,
-		ImVec2(0.f, 26.f), busy, nullptr, busy)) {
+		ImVec2(118.f, 30.f), busy, nullptr, busy)) {
 		if (!busy) detail::start_taint_trace(st);
 	}
 
-	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 130.f, ctrl_y + 4.f));
-	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_secondary, alpha));
-	ImGui::TextUnformatted("Max");
-	ImGui::PopStyleColor();
-
-	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 168.f, ctrl_y + 2.f));
-	ImGui::SetNextItemWidth(120.f);
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(t.panel_header, alpha));
-	ImGui::PushStyleColor(ImGuiCol_SliderGrab, aida::ui::with_alpha(t.accent_u32, alpha));
-	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
-	ImGui::SliderInt("##taint_max", &st.max_insns, 100, 100000);
-	ImGui::PopStyleVar();
-	ImGui::PopStyleColor(2);
-
 	const char* mode_labels[2] = { "Table", "Flow" };
-	float mode_x = cx + pad + 304.f;
+	float mode_x = cx + pad + 8.f + 134.f;
 	for (int i = 0; i < 2; ++i) {
 		bool active = (st.view_mode == i);
 		ImGui::SetCursorScreenPos(ImVec2(mode_x, ctrl_y));
@@ -438,24 +437,24 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			active ? aida::ui::components::button_kind_t::primary
 			       : aida::ui::components::button_kind_t::ghost,
 			aida::ui::components::size_t_::sm,
-			ImVec2(70.f, 26.f))) {
+			ImVec2(86.f, 30.f))) {
 			if (st.view_mode != i) {
 				st.mode_swap.start(aida::motion::dur::md, aida::motion::ease::out_cubic);
 				st.view_mode = i;
 			}
 		}
-		mode_x += 76.f;
+		mode_x += 96.f;
 	}
 
 	st.mode_swap.tick(dt);
 
 	if (busy) {
-		float pb_x = cx + pad + 460.f;
-		float pb_y = ctrl_y + 6.f;
+		float pb_x = cx + pad + 8.f + 134.f + 96.f * 2.f + 24.f;
+		float pb_y = ctrl_y + 9.f;
 		uint32_t cur = symbolic_engine::g_state.progress_current.load();
 		uint32_t tot = symbolic_engine::g_state.progress_total.load();
 		float frac = (tot > 0) ? static_cast<float>(cur) / static_cast<float>(tot) : 0.f;
-		aida::ui::components::render_progress_bar(ImVec2(pb_x, pb_y), 200.f, 12.f, frac,
+		aida::ui::components::render_progress_bar(ImVec2(pb_x, pb_y), 220.f, 12.f, frac,
 			tot == 0, true);
 	}
 

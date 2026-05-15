@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -48,5 +49,11 @@ unsigned long get_attached_pid();
 void chat_handle_agent_shortcuts();
 void chat_render_agent_pill(float anchor_x, float anchor_y, float alpha);
 float chat_agent_pill_width();
+void chat_render_model_pill(float anchor_x, float anchor_y, float alpha);
+float chat_model_pill_width();
+void chat_render_skills_pill(float anchor_x, float anchor_y, float alpha, char* chat_buf, std::size_t chat_buf_size);
+float chat_skills_pill_width();
+void chat_render_mcp_pill(float anchor_x, float anchor_y, float alpha);
+float chat_mcp_pill_width();
 
 extern bool g_settings_open;

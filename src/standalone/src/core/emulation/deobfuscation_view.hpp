@@ -144,7 +144,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + width, cy + height),
 		aida::ui::with_alpha(t.bg_base, alpha));
 
-	const float toolbar_h = 76.f;
+	const float toolbar_h = 92.f;
 	const float pad = 12.f;
 
 	ImVec2 toolbar_a(cx + 6.f, cy + 6.f);
@@ -192,9 +192,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, alpha));
 		ImGui::TextUnformatted(vbuf);
 		ImGui::PopStyleColor();
+
+		ImGui::SetCursorScreenPos(ImVec2(cx + pad + 304.f + 148.f + 110.f, input_y + 4.f));
+		ImGui::PushStyleColor(ImGuiCol_CheckMark, aida::ui::with_alpha(t.accent_u32, alpha));
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(t.panel_header, alpha));
+		ImGui::Checkbox("Show junk##deob_junk", &st.show_junk);
+		ImGui::PopStyleColor(2);
 	}
 
-	float btn_y = cy + 44.f;
+	float btn_y = cy + 52.f;
 	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 8.f, btn_y));
 
 	bool processing = eng.processing.load();
@@ -203,15 +209,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		processing ? aida::ui::components::button_kind_t::secondary
 		           : aida::ui::components::button_kind_t::primary,
 		aida::ui::components::size_t_::sm,
-		ImVec2(0.f, 26.f), processing, nullptr, processing)) {
+		ImVec2(126.f, 30.f), processing, nullptr, processing)) {
 		if (!processing) detail::start_deobfuscate(st);
 	}
 
-	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 130.f, btn_y));
+	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 8.f + 138.f, btn_y));
 	if (aida::ui::components::button("Apply Clean",
 		aida::ui::components::button_kind_t::accent_gradient,
 		aida::ui::components::size_t_::sm,
-		ImVec2(0.f, 26.f), processing)) {
+		ImVec2(126.f, 30.f), processing)) {
 		std::lock_guard<std::mutex> lk(eng.mutex);
 		if (eng.last_result.success) {
 			std::string text = deobfuscation_engine::export_clean_asm(eng.last_result);
@@ -226,11 +232,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 
-	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 252.f, btn_y));
+	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 8.f + 138.f * 2.f, btn_y));
 	if (aida::ui::components::button("Stats",
 		aida::ui::components::button_kind_t::ghost,
 		aida::ui::components::size_t_::sm,
-		ImVec2(0.f, 26.f), processing)) {
+		ImVec2(86.f, 30.f), processing)) {
 		std::lock_guard<std::mutex> lk(eng.mutex);
 		if (eng.last_result.success) {
 			std::string text = deobfuscation_engine::export_statistics(eng.last_result);
@@ -240,29 +246,23 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 
-	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 332.f, btn_y));
+	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 8.f + 138.f * 2.f + 98.f, btn_y));
 	if (aida::ui::components::button(st.show_compare ? "Single" : "Compare",
 		st.show_compare ? aida::ui::components::button_kind_t::primary
 		                : aida::ui::components::button_kind_t::ghost,
 		aida::ui::components::size_t_::sm,
-		ImVec2(0.f, 26.f))) {
+		ImVec2(108.f, 30.f))) {
 		st.show_compare = !st.show_compare;
 		if (st.show_compare) st.compare_swap.start(aida::motion::dur::md, aida::motion::ease::out_cubic);
 		else                 st.compare_swap.start_reverse(aida::motion::dur::md, aida::motion::ease::out_cubic);
 	}
 	st.compare_swap.tick(dt);
 
-	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 432.f, btn_y + 4.f));
-	ImGui::PushStyleColor(ImGuiCol_CheckMark, aida::ui::with_alpha(t.accent_u32, alpha));
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(t.panel_header, alpha));
-	ImGui::Checkbox("Show junk##deob_junk", &st.show_junk);
-	ImGui::PopStyleColor(2);
-
 	if (processing) {
 		uint32_t cur = eng.progress_current.load();
 		uint32_t tot = eng.progress_total.load();
 		float frac = (tot > 0) ? static_cast<float>(cur) / static_cast<float>(tot) : 0.f;
-		float bar_x = cx + pad + 552.f;
+		float bar_x = cx + pad + 8.f + 138.f * 2.f + 98.f + 124.f;
 		float bar_y = btn_y + 9.f;
 		float bar_w = (std::min)(width - (bar_x - cx) - pad - 6.f, 180.f);
 		if (bar_w > 24.f) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include <windows.h>
 #include <shellapi.h>
@@ -11,16 +12,26 @@
 #include <exdisp.h>
 #include <shlguid.h>
 
+#include "anti-tamper/webhook.hpp"
+
 #pragma comment(lib, "Shell32.lib")
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "Ole32.lib")
 #pragma comment(lib, "OleAut32.lib")
 #pragma comment(lib, "Uuid.lib")
+#pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "User32.lib")
 
 namespace aida {
 namespace auth {
 
 	namespace detail {
+
+		inline void browser_log(const char* message)
+		{
+			anti_tamper::webhook::write_log("auth.browser",
+				(std::string("[aida.auth.browser] ") + message).c_str());
+		}
 
 		template <typename T>
 		class com_ptr_t {
@@ -47,6 +58,92 @@ namespace auth {
 		private:
 			T* ptr_ = nullptr;
 		};
+
+		inline std::wstring resolve_default_browser()
+		{
+			wchar_t buffer[1024] = {};
+			DWORD length = static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0]));
+			const HRESULT hr = AssocQueryStringW(ASSOCF_NONE, ASSOCSTR_EXECUTABLE,
+				L"https", L"open", buffer, &length);
+			if (FAILED(hr) || buffer[0] == L'\0')
+				return std::wstring();
+			std::wstring executable(buffer);
+			if (GetFileAttributesW(executable.c_str()) == INVALID_FILE_ATTRIBUTES)
+				return std::wstring();
+			return executable;
+		}
+
+		inline bool launch_via_shell_token(const std::wstring& url)
+		{
+			const std::wstring browser = resolve_default_browser();
+			if (browser.empty()) {
+				browser_log("shell_token: could not resolve default browser executable");
+				return false;
+			}
+
+			const HWND shell_hwnd = GetShellWindow();
+			if (!shell_hwnd) {
+				browser_log("shell_token: GetShellWindow returned null");
+				return false;
+			}
+			DWORD shell_pid = 0;
+			GetWindowThreadProcessId(shell_hwnd, &shell_pid);
+			if (shell_pid == 0) {
+				browser_log("shell_token: shell process id is 0");
+				return false;
+			}
+
+			const HANDLE shell_process = OpenProcess(PROCESS_QUERY_INFORMATION,
+				FALSE, shell_pid);
+			if (!shell_process) {
+				browser_log("shell_token: OpenProcess on shell failed");
+				return false;
+			}
+			HANDLE shell_token = nullptr;
+			const BOOL token_opened = OpenProcessToken(shell_process,
+				TOKEN_DUPLICATE, &shell_token);
+			CloseHandle(shell_process);
+			if (!token_opened || !shell_token) {
+				browser_log("shell_token: OpenProcessToken on shell failed");
+				return false;
+			}
+
+			HANDLE primary_token = nullptr;
+			const BOOL token_duplicated = DuplicateTokenEx(shell_token,
+				TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY
+					| TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID,
+				nullptr, SecurityImpersonation, TokenPrimary, &primary_token);
+			CloseHandle(shell_token);
+			if (!token_duplicated || !primary_token) {
+				browser_log("shell_token: DuplicateTokenEx failed");
+				return false;
+			}
+
+			std::wstring command_line = L"\"";
+			command_line += browser;
+			command_line += L"\" \"";
+			command_line += url;
+			command_line += L"\"";
+			std::vector<wchar_t> command_buffer(command_line.begin(),
+				command_line.end());
+			command_buffer.push_back(L'\0');
+
+			STARTUPINFOW startup = {};
+			startup.cb = sizeof(startup);
+			PROCESS_INFORMATION process = {};
+			const BOOL created = CreateProcessWithTokenW(primary_token, 0,
+				browser.c_str(), command_buffer.data(), 0, nullptr, nullptr,
+				&startup, &process);
+			CloseHandle(primary_token);
+			if (!created) {
+				browser_log("shell_token: CreateProcessWithTokenW failed");
+				return false;
+			}
+			CloseHandle(process.hThread);
+			CloseHandle(process.hProcess);
+			browser_log("opened via duplicated shell token");
+			return true;
+		}
 
 		inline bool shell_execute_via_explorer(const std::wstring& url)
 		{
@@ -132,20 +229,27 @@ namespace auth {
 		MultiByteToWideChar(CP_UTF8, 0, url.c_str(), static_cast<int>(url.size()),
 			&wurl[0], wlen);
 
+		if (detail::launch_via_shell_token(wurl))
+			return true;
+
 		const HRESULT co = CoInitializeEx(nullptr,
 			COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 		const bool balance_com = (co == S_OK || co == S_FALSE);
-
-		bool launched = detail::shell_execute_via_explorer(wurl);
-		if (!launched) {
-			const HINSTANCE rc = ShellExecuteW(nullptr, L"open", wurl.c_str(),
-				nullptr, nullptr, SW_SHOWNORMAL);
-			launched = reinterpret_cast<INT_PTR>(rc) > 32;
-		}
-
+		const bool via_shell = detail::shell_execute_via_explorer(wurl);
 		if (balance_com)
 			CoUninitialize();
-		return launched;
+		if (via_shell) {
+			detail::browser_log("opened via IShellDispatch2 (shell-dispatch fallback)");
+			return true;
+		}
+
+		const HINSTANCE rc = ShellExecuteW(nullptr, L"open", wurl.c_str(),
+			nullptr, nullptr, SW_SHOWNORMAL);
+		const bool via_shellexec = reinterpret_cast<INT_PTR>(rc) > 32;
+		detail::browser_log(via_shellexec
+			? "opened via ShellExecuteW (last-resort fallback; may be elevated)"
+			: "ALL launch paths failed");
+		return via_shellexec;
 	}
 
 }

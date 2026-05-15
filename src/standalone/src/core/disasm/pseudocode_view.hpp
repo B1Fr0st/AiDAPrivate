@@ -28,6 +28,7 @@ void close_tab_by_addr(uint64_t addr);
 void activate_tab_by_addr(uint64_t addr);
 void cancel_active_decompile();
 void refresh_active_tab();
+void refresh_all_tabs();
 
 bool has_active_tab();
 bool has_tab_for(uint64_t addr);

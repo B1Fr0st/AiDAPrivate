@@ -20,8 +20,10 @@
 #include "empty_state.hpp"
 #include "skeleton.hpp"
 #include "fonts.hpp"
+#include "hex_view.hpp"
 
 #include "imgui.h"
+#include "imgui_internal.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -29,6 +31,10 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <cmath>
+#include <string>
+#include <vector>
+
+extern DisasmState g_disasm;
 
 namespace debugger_view {
 
@@ -141,27 +147,6 @@ inline ImU32 handle_type_color(const std::string& type, const aida::ui::theme_t&
 	if (type == "Key")     return t.success;
 	if (type == "Event" || type == "Semaphore") return t.warning;
 	return t.text_secondary;
-}
-
-inline bool handle_list_scroll(float* scroll_y, float* target, float content_h,
-                               float visible_h, float row_h, float ox, float oy,
-                               float ow, float dt) {
-	if (content_h <= visible_h) {
-		*target = 0.f;
-		*scroll_y = 0.f;
-		return false;
-	}
-	if (ImGui::IsMouseHoveringRect(ImVec2(ox, oy), ImVec2(ox + ow, oy + visible_h), false)) {
-		float wheel = ImGui::GetIO().MouseWheel;
-		if (wheel != 0.f)
-			*target -= wheel * row_h * 3.f;
-	}
-	float max_sc = content_h - visible_h;
-	if (max_sc < 0.f) max_sc = 0.f;
-	if (*target < 0.f) *target = 0.f;
-	if (*target > max_sc) *target = max_sc;
-	*scroll_y = ui_anim::smooth_lerp(*scroll_y, *target, 16.f, dt);
-	return true;
 }
 
 inline void draw_glass_card(ImDrawList* dl, ImVec2 a, ImVec2 b, float radius,
@@ -287,11 +272,11 @@ inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float w,
 	              + static_cast<float>(5) * TOOLBAR_BTN_GAP
 	              + 16.f;
 	float pad_y = (TOOLBAR_H - 28.f) * 0.5f;
-	float bx = ox + w - total_w - 8.f;
+	float bx = ox + 12.f;
 	float by = oy + pad_y;
 
 	ImVec2 a = ImVec2(bx - 6.f, by - 4.f);
-	ImVec2 b = ImVec2(ox + w - 8.f, by + 28.f + 4.f);
+	ImVec2 b = ImVec2(bx + total_w - 8.f, by + 28.f + 4.f);
 	draw_glass_card(dl, a, b, 10.f, alpha);
 
 	ImFont* font = aida::ui::fonts::body();
@@ -399,7 +384,7 @@ inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float w,
 		ImFont* sf = aida::ui::fonts::caption();
 		if (!sf) sf = ImGui::GetFont();
 		ImVec2 sl_sz = sf->CalcTextSizeA(sf->FontSize, FLT_MAX, 0.f, status_label);
-		float sx = bx - sl_sz.x - 26.f;
+		float sx = bx + total_w + 6.f;
 		float sy = by + (28.f - 16.f) * 0.5f;
 		ImU32 col;
 		switch (kind) {
@@ -418,6 +403,129 @@ inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float w,
 		dl->AddText(sf, sf->FontSize, ImVec2(sx + 14.f, sy + (16.f - sf->FontSize) * 0.5f),
 		            with_a(col, alpha), status_label);
 	}
+}
+
+inline bool jump_to_disasm(uint64_t addr) {
+	if (addr == 0) return false;
+	globals::ui::active_center_view = center_view_t::disassembly;
+	disasm_view::goto_address(addr, g_disasm);
+	return true;
+}
+
+inline bool jump_to_hex(uint64_t addr, size_t bytes) {
+	if (addr == 0) return false;
+	hex_view::read_from_process(addr, bytes);
+	globals::ui::active_center_view = center_view_t::hex_view;
+	return true;
+}
+
+inline void copy_to_clipboard(const char* s) {
+	if (!s || !*s) return;
+	ImGui::SetClipboardText(s);
+}
+
+inline void copy_addr_to_clipboard(uint64_t addr) {
+	char buf[20];
+	std::snprintf(buf, sizeof(buf), "0x%016" PRIX64, addr);
+	copy_to_clipboard(buf);
+}
+
+inline uint64_t parse_hex_address(const char* s) {
+	if (!s || !*s) return 0;
+	while (*s == ' ' || *s == '\t') ++s;
+	if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+	uint64_t v = 0;
+	for (; *s; ++s) {
+		char c = *s;
+		uint8_t d;
+		if (c >= '0' && c <= '9') d = static_cast<uint8_t>(c - '0');
+		else if (c >= 'a' && c <= 'f') d = static_cast<uint8_t>(10 + (c - 'a'));
+		else if (c >= 'A' && c <= 'F') d = static_cast<uint8_t>(10 + (c - 'A'));
+		else break;
+		v = (v << 4) | d;
+	}
+	return v;
+}
+
+inline uint64_t resolve_register_token(const std::string& tok,
+                                       const debugger_engine::register_set_t& r) {
+	std::string n;
+	n.reserve(tok.size());
+	for (char c : tok) n.push_back(static_cast<char>(::toupper(static_cast<unsigned char>(c))));
+	if (n == "RAX") return r.rax; if (n == "RBX") return r.rbx;
+	if (n == "RCX") return r.rcx; if (n == "RDX") return r.rdx;
+	if (n == "RSI") return r.rsi; if (n == "RDI") return r.rdi;
+	if (n == "RBP") return r.rbp; if (n == "RSP") return r.rsp;
+	if (n == "R8")  return r.r8;  if (n == "R9")  return r.r9;
+	if (n == "R10") return r.r10; if (n == "R11") return r.r11;
+	if (n == "R12") return r.r12; if (n == "R13") return r.r13;
+	if (n == "R14") return r.r14; if (n == "R15") return r.r15;
+	if (n == "RIP") return r.rip; if (n == "RFLAGS") return r.rflags;
+	if (n == "CS")  return r.cs;  if (n == "SS")  return r.ss;
+	if (n == "DS")  return r.ds;  if (n == "ES")  return r.es;
+	if (n == "FS")  return r.fs;  if (n == "GS")  return r.gs;
+	return 0;
+}
+
+inline uint64_t evaluate_watch_expression(const std::string& expr,
+                                          const debugger_engine::register_set_t& r,
+                                          bool& deref_out, bool& valid_out) {
+	deref_out = false;
+	valid_out = false;
+	std::string s = expr;
+	while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
+	while (!s.empty() && (s.back()  == ' ' || s.back()  == '\t')) s.pop_back();
+	if (s.empty()) return 0;
+	bool deref = false;
+	if (s.front() == '[' && s.back() == ']') {
+		deref = true;
+		s = s.substr(1, s.size() - 2);
+		while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
+		while (!s.empty() && (s.back()  == ' ' || s.back()  == '\t')) s.pop_back();
+	}
+	uint64_t total = 0;
+	bool subtract = false;
+	bool any_token = false;
+	std::string cur;
+	auto consume = [&]() {
+		while (!cur.empty() && (cur.front() == ' ' || cur.front() == '\t')) cur.erase(cur.begin());
+		while (!cur.empty() && (cur.back()  == ' ' || cur.back()  == '\t')) cur.pop_back();
+		if (cur.empty()) return;
+		uint64_t v = 0;
+		bool numeric = (cur[0] == '0' && (cur.size() > 1 && (cur[1] == 'x' || cur[1] == 'X')));
+		if (!numeric) {
+			bool all_hex_digits = true;
+			for (char c : cur) {
+				if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+					all_hex_digits = false; break;
+				}
+			}
+			if (all_hex_digits && cur.size() >= 4) numeric = true;
+		}
+		if (numeric) v = parse_hex_address(cur.c_str());
+		else v = resolve_register_token(cur, r);
+		if (subtract) total -= v;
+		else          total += v;
+		any_token = true;
+		cur.clear();
+	};
+	for (size_t i = 0; i < s.size(); ++i) {
+		char c = s[i];
+		if (c == '+') { consume(); subtract = false; continue; }
+		if (c == '-') { consume(); subtract = true;  continue; }
+		cur.push_back(c);
+	}
+	consume();
+	if (!any_token) return 0;
+	deref_out = deref;
+	valid_out = true;
+	return total;
+}
+
+inline std::string format_value_hex(uint64_t v) {
+	char buf[20];
+	std::snprintf(buf, sizeof(buf), "0x%016" PRIX64, v);
+	return buf;
 }
 
 }
@@ -637,666 +745,806 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 }
 
 
-static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h, float a) {
+static void render_mini_disasm(ImDrawList* dl, float px, float py, float pw, float ph,
+                               float a, uint64_t rip, bool attached) {
+	const auto& t = aida::ui::resolved();
 	auto& ui = g_ui;
 	float dt = aida::ui::clock::dt();
+
+	dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
+	                  with_a(t.bg_base, a));
+	draw_panel_header(dl, px, py, pw, "INSTRUCTIONS AT RIP", a);
+
+	{
+		const char* hint = "double-click row to jump to disasm view";
+		ImFont* hf = aida::ui::fonts::caption();
+		if (!hf) hf = ImGui::GetFont();
+		ImVec2 hs = hf->CalcTextSizeA(hf->FontSize, FLT_MAX, 0.f, hint);
+		dl->AddText(hf, hf->FontSize,
+			ImVec2(px + pw - hs.x - 12.f, py + (HEADER_H - hf->FontSize) * 0.5f),
+			with_a(t.text_dim, a * 0.85f), hint);
+	}
+
+	if (rip != ui.prev_rip && rip != 0) {
+		ui.rip_flash = 1.f;
+		ui.prev_rip = rip;
+	}
+	ui_anim::decay_flash(ui.rip_flash, 3.f, dt);
+
+	if (!attached || rip == 0) {
+		aida::ui::empty_state::config_t es;
+		es.glyph = aida::ui::empty_state::glyph_t::cpu;
+		if (attached) {
+			es.title = "Waiting for RIP snapshot";
+			es.body  = "Resuming or pausing the target will populate the instruction window.";
+		} else {
+			es.title = "No process attached";
+			es.body  = "Attach to a process to view the live instruction stream.";
+		}
+		aida::ui::empty_state::render(ImVec2(px, py + HEADER_H),
+			ImVec2(pw, ph - HEADER_H), es);
+		return;
+	}
+
+	debugger_engine::request_disasm_refresh(rip, 100);
+	uint64_t base = 0;
+	std::vector<uint8_t> code = debugger_engine::cached_disasm_window(base);
+	if (code.empty()) {
+		aida::ui::empty_state::config_t es;
+		es.glyph = aida::ui::empty_state::glyph_t::cpu;
+		es.title = "Decoding instruction window";
+		es.body  = "Reading code bytes from the target.";
+		aida::ui::empty_state::render(ImVec2(px, py + HEADER_H),
+			ImVec2(pw, ph - HEADER_H), es);
+		return;
+	}
+
+	std::vector<AsmInstr> insns;
+	const uint8_t* data = code.data();
+	int sz = static_cast<int>(code.size());
+	int off = 0;
+	while (off < sz && insns.size() < 64) {
+		int remaining = sz - off;
+		int avail = (remaining < 15) ? remaining : 15;
+		insns.push_back(zydis_decode_one(data + off, avail, base + static_cast<uint64_t>(off)));
+		off += insns.back().len;
+	}
+
+	int rip_idx = -1;
+	for (size_t i = 0; i < insns.size(); ++i) {
+		if (insns[i].addr == rip) { rip_idx = static_cast<int>(i); break; }
+	}
+
+	int max_rows = 24;
+	int half = max_rows / 2;
+	int start = 0, count = static_cast<int>(insns.size());
+	if (rip_idx >= 0) {
+		start = std::max(0, rip_idx - half);
+		int end = std::min(count, start + max_rows);
+		start = std::max(0, end - max_rows);
+		count = end - start;
+	} else {
+		count = std::min(max_rows, count);
+	}
+
+	float content_y = py + HEADER_H;
+	float content_h = ph - HEADER_H;
+	int   visible_rows = std::max(1, static_cast<int>(content_h / ROW_HEIGHT));
+	if (count > visible_rows) count = visible_rows;
+
+	ImGui::PushClipRect(ImVec2(px, content_y), ImVec2(px + pw, py + ph), true);
+
+	ImFont* code_font = aida::ui::fonts::code();
+	if (!code_font) code_font = ImGui::GetFont();
+
+	for (int i = 0; i < count; ++i) {
+		int ii = start + i;
+		if (ii >= static_cast<int>(insns.size())) break;
+		float ry = content_y + static_cast<float>(i) * ROW_HEIGHT;
+		bool is_rip = (insns[ii].addr == rip);
+
+		bool hov = ImGui::IsMouseHoveringRect(ImVec2(px, ry),
+			ImVec2(px + pw, ry + ROW_HEIGHT), false);
+
+		if (is_rip) {
+			float rip_a = 0.10f + ui.rip_flash * 0.12f;
+			dl->AddRectFilled(ImVec2(px, ry), ImVec2(px + pw, ry + ROW_HEIGHT),
+			                  with_a(t.accent_glow, a * rip_a * 4.f));
+			dl->AddRectFilled(ImVec2(px, ry), ImVec2(px + 3.f, ry + ROW_HEIGHT),
+			                  with_a(t.accent_u32, a * 0.95f));
+			dl->AddTriangleFilled(
+				ImVec2(px + 6.f, ry + 5.f),
+				ImVec2(px + 6.f, ry + ROW_HEIGHT - 5.f),
+				ImVec2(px + 13.f, ry + ROW_HEIGHT * 0.5f),
+				with_a(t.accent_grad_top, a));
+			if (ui.rip_flash > 0.01f) {
+				for (int fg = 0; fg < 2; ++fg) {
+					float fga = ui.rip_flash * (0.18f - static_cast<float>(fg) * 0.07f) * a;
+					dl->AddRect(ImVec2(px - static_cast<float>(fg + 1),
+					                    ry - static_cast<float>(fg + 1)),
+					            ImVec2(px + pw + static_cast<float>(fg + 1),
+					                    ry + ROW_HEIGHT + static_cast<float>(fg + 1)),
+					            with_a(t.accent_glow, fga * 4.f),
+					            2.f, 0, 1.f);
+				}
+			}
+		} else if (hov) {
+			dl->AddRectFilled(ImVec2(px, ry), ImVec2(px + pw, ry + ROW_HEIGHT),
+			                  with_a(t.hover_wash, a), 4.f);
+			dl->AddRectFilled(ImVec2(px, ry), ImVec2(px + 2.f, ry + ROW_HEIGHT),
+			                  with_a(t.accent_dim, a));
+		}
+
+		char abuf[20];
+		std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, insns[ii].addr);
+		dl->AddText(code_font, code_font->FontSize, ImVec2(px + 18.f, ry + 4.f),
+		            with_a(t.text_address, a), abuf);
+
+		char bytes_buf[32];
+		int bn = 0;
+		for (int b = 0; b < insns[ii].len && b < 8; ++b) {
+			bn += std::snprintf(bytes_buf + bn, sizeof(bytes_buf) - static_cast<size_t>(bn),
+				"%02X ", insns[ii].raw[b]);
+		}
+		if (insns[ii].len > 8) {
+			std::snprintf(bytes_buf + bn, sizeof(bytes_buf) - static_cast<size_t>(bn), "+");
+		}
+		dl->AddText(code_font, code_font->FontSize, ImVec2(px + 162.f, ry + 4.f),
+		            with_a(t.text_dim, a * 0.85f), bytes_buf);
+
+		char textbuf[164];
+		if (insns[ii].ops[0])
+			std::snprintf(textbuf, sizeof(textbuf), "%s %s",
+				insns[ii].mnem, insns[ii].ops);
+		else
+			std::snprintf(textbuf, sizeof(textbuf), "%s", insns[ii].mnem);
+		ImU32 mcol = insns[ii].is_call ? t.error
+			: (insns[ii].is_branch ? t.warning : t.syn_keyword);
+		dl->AddText(code_font, code_font->FontSize, ImVec2(px + 322.f, ry + 4.f),
+		            with_a(mcol, a), textbuf);
+
+		if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+			jump_to_disasm(insns[ii].addr);
+		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+			copy_addr_to_clipboard(insns[ii].addr);
+	}
+
+	ImGui::PopClipRect();
+}
+
+static void render_register_grid(ImDrawList* dl, float px, float py, float pw, float ph,
+                                 float a, bool attached) {
+	const auto& t = aida::ui::resolved();
+	auto& ui = g_ui;
+	float dt = aida::ui::clock::dt();
+
+	dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
+	                  with_a(t.bg_base, a));
+	draw_panel_header(dl, px, py, pw, "REGISTERS", a);
+
+	if (!attached) {
+		aida::ui::empty_state::config_t es;
+		es.glyph = aida::ui::empty_state::glyph_t::cpu;
+		es.title = "No process attached";
+		es.body  = "Attach to a process to populate registers.";
+		aida::ui::empty_state::render(ImVec2(px, py + HEADER_H),
+			ImVec2(pw, ph - HEADER_H), es);
+		return;
+	}
+
+	auto regs = debugger_engine::cached_registers();
+
+	struct reg_info { const char* name; uint64_t val; int idx; };
+	reg_info gprs[18] = {
+		{"RAX", regs.rax, 0},  {"RBX", regs.rbx, 1},  {"RCX", regs.rcx, 2},  {"RDX", regs.rdx, 3},
+		{"RSI", regs.rsi, 4},  {"RDI", regs.rdi, 5},  {"RBP", regs.rbp, 6},  {"RSP", regs.rsp, 7},
+		{"R8",  regs.r8,  8},  {"R9",  regs.r9,  9},  {"R10", regs.r10, 10}, {"R11", regs.r11, 11},
+		{"R12", regs.r12, 12}, {"R13", regs.r13, 13}, {"R14", regs.r14, 14}, {"R15", regs.r15, 15},
+		{"RIP", regs.rip, 16}, {"RFLAGS", regs.rflags, 17},
+	};
+
+	for (auto& ri : gprs) {
+		auto& cell = ui.reg_cells[ri.idx];
+		if (ri.val != ui.prev_regs[ri.idx]) {
+			ui.reg_flash[ri.idx] = 1.f;
+			ui.prev_regs[ri.idx] = ri.val;
+			cell.target_value = ri.val;
+			cell.change_anim = 1.f;
+			cell.edge_intensity = 1.f;
+		}
+		ui_anim::decay_flash(ui.reg_flash[ri.idx], 2.f, dt);
+		cell.change_anim = ui_anim::smooth_lerp(cell.change_anim, 0.f, 4.2f, dt);
+		cell.edge_intensity = ui_anim::smooth_lerp(cell.edge_intensity, 0.f, 2.4f, dt);
+		float roll_t = 1.f - cell.change_anim;
+		float ease = aida::motion::ease::out_cubic(roll_t);
+		if (ease >= 0.999f) cell.shown_value = cell.target_value;
+	}
+
+	struct seg_info { const char* name; uint64_t val; int idx; };
+	seg_info segs[6] = {
+		{"CS", regs.cs, 18}, {"SS", regs.ss, 19}, {"DS", regs.ds, 20},
+		{"ES", regs.es, 21}, {"FS", regs.fs, 22}, {"GS", regs.gs, 23},
+	};
+	for (auto& ri : segs) {
+		if (ri.val != ui.prev_regs[ri.idx]) {
+			ui.reg_flash[ri.idx] = 1.f;
+			ui.prev_regs[ri.idx] = ri.val;
+			ui.reg_cells[ri.idx].edge_intensity = 1.f;
+		}
+		ui_anim::decay_flash(ui.reg_flash[ri.idx], 2.f, dt);
+		ui.reg_cells[ri.idx].edge_intensity = ui_anim::smooth_lerp(
+			ui.reg_cells[ri.idx].edge_intensity, 0.f, 2.4f, dt);
+	}
+
+	struct dbg_info { const char* name; uint64_t val; int idx; };
+	dbg_info dbgs[6] = {
+		{"DR0", regs.dr0, 24}, {"DR1", regs.dr1, 25}, {"DR2", regs.dr2, 26},
+		{"DR3", regs.dr3, 27}, {"DR6", regs.dr6, 28}, {"DR7", regs.dr7, 29},
+	};
+	for (auto& ri : dbgs) {
+		if (ri.val != ui.prev_regs[ri.idx]) {
+			ui.reg_flash[ri.idx] = 1.f;
+			ui.prev_regs[ri.idx] = ri.val;
+			ui.reg_cells[ri.idx].edge_intensity = 1.f;
+		}
+		ui_anim::decay_flash(ui.reg_flash[ri.idx], 2.f, dt);
+		ui.reg_cells[ri.idx].edge_intensity = ui_anim::smooth_lerp(
+			ui.reg_cells[ri.idx].edge_intensity, 0.f, 2.4f, dt);
+	}
+
+	float grid_x = px + 8.f;
+	float grid_y = py + HEADER_H + 6.f;
+	float gw = pw - 16.f;
+	int cols = 2;
+	float gap = 6.f;
+	float cell_w = (gw - static_cast<float>(cols - 1) * gap) / static_cast<float>(cols);
+	float cell_h = 34.f;
+	float row_gap = 4.f;
+
+	ImFont* lbl_font = aida::ui::fonts::caption();
+	if (!lbl_font) lbl_font = ImGui::GetFont();
+	ImFont* val_font = aida::ui::fonts::code_em();
+	if (!val_font) val_font = ImGui::GetFont();
+	ImFont* code_font = aida::ui::fonts::code();
+	if (!code_font) code_font = ImGui::GetFont();
+	ImFont* body_font = aida::ui::fonts::body();
+	if (!body_font) body_font = ImGui::GetFont();
+
+	ImGui::PushClipRect(ImVec2(px, py + HEADER_H), ImVec2(px + pw, py + ph), true);
+
+	auto draw_reg_cell = [&](ImVec2 ca, ImVec2 cb, const char* name, uint64_t val,
+	                         int idx, ImU32 base_color, bool clickable_addr) {
+		bool hov = ImGui::IsMouseHoveringRect(ca, cb, false);
+		dl->AddRectFilled(ca, cb, with_a(t.panel_bg, a * 0.85f), 6.f);
+		if (hov) {
+			dl->AddRectFilled(ca, cb, with_a(t.hover_wash, a), 6.f);
+		}
+		dl->AddRect(ca, cb, with_a(t.border_subtle, a), 6.f, 0, 1.f);
+
+		float edge = (idx >= 0 && idx < 32) ? ui.reg_cells[idx].edge_intensity : 0.f;
+		if (edge > 0.001f) {
+			dl->AddRectFilled(ImVec2(ca.x, ca.y),
+			                  ImVec2(ca.x + 2.f, cb.y),
+			                  with_a(t.accent_u32, a * edge), 1.f);
+			for (int g = 0; g < 3; ++g) {
+				float spread = static_cast<float>(g + 1) * 1.5f;
+				dl->AddRect(ImVec2(ca.x - spread, ca.y - spread),
+				            ImVec2(cb.x + spread, cb.y + spread),
+				            with_a(t.accent_glow,
+					a * edge * (0.32f - static_cast<float>(g) * 0.10f) * 4.f),
+				            6.f + spread, 0, 1.f);
+			}
+		}
+
+		dl->AddText(lbl_font, lbl_font->FontSize, ImVec2(ca.x + 8.f, ca.y + 4.f),
+		            with_a(t.text_dim, a), name);
+
+		char vbuf[20];
+		std::snprintf(vbuf, sizeof(vbuf), "%016" PRIX64, val);
+		float roll_anim = (idx >= 0 && idx < 32) ? ui.reg_cells[idx].change_anim : 0.f;
+		float vy = ca.y + 16.f - roll_anim * 6.f;
+		float val_alpha = a * (1.f - roll_anim * 0.3f);
+
+		ImU32 vcol = (edge > 0.01f)
+			? aida::ui::mix(t.accent_grad_top, base_color, 1.f - edge)
+			: base_color;
+
+		dl->AddText(val_font, val_font->FontSize, ImVec2(ca.x + 8.f, vy),
+		            with_a(vcol, val_alpha), vbuf);
+
+		if (roll_anim > 0.01f) {
+			char prev_buf[20];
+			std::snprintf(prev_buf, sizeof(prev_buf), "%016" PRIX64,
+				ui.reg_cells[idx].shown_value);
+			float py2 = ca.y + 16.f + (1.f - roll_anim) * 6.f;
+			dl->AddText(val_font, val_font->FontSize, ImVec2(ca.x + 8.f, py2),
+			            with_a(t.text_dim, a * roll_anim * 0.5f), prev_buf);
+		}
+
+		if (hov && clickable_addr && val != 0) {
+			if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+				jump_to_disasm(val);
+			if (ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+				copy_addr_to_clipboard(val);
+			if (ImGui::IsMouseClicked(ImGuiMouseButton_Middle))
+				jump_to_hex(val, 256);
+		}
+	};
+
+	for (int i = 0; i < 16; ++i) {
+		int rr = i / cols;
+		int cc = i % cols;
+		float cx = grid_x + static_cast<float>(cc) * (cell_w + gap);
+		float cy = grid_y + static_cast<float>(rr) * (cell_h + row_gap);
+		if (cy + cell_h > py + ph - 4.f) break;
+		ImVec2 ca(cx, cy);
+		ImVec2 cb(cx + cell_w, cy + cell_h);
+		draw_reg_cell(ca, cb, gprs[i].name, gprs[i].val, gprs[i].idx,
+			t.syn_register, true);
+	}
+
+	float rip_y = grid_y + 8.f * (cell_h + row_gap);
+	if (rip_y + cell_h * 2.f + 20.f <= py + ph - 4.f) {
+		ImVec2 ra(grid_x, rip_y);
+		ImVec2 rb(grid_x + gw, rip_y + cell_h);
+		draw_reg_cell(ra, rb, "RIP", regs.rip, 16, t.accent_u32, true);
+
+		rip_y += cell_h + row_gap;
+		float rflags_h = 38.f;
+		ImVec2 fa(grid_x, rip_y);
+		ImVec2 fb(grid_x + gw, rip_y + rflags_h);
+		bool hov = ImGui::IsMouseHoveringRect(fa, fb, false);
+		dl->AddRectFilled(fa, fb, with_a(t.panel_bg, a * 0.85f), 6.f);
+		if (hov)
+			dl->AddRectFilled(fa, fb, with_a(t.hover_wash, a), 6.f);
+		dl->AddRect(fa, fb, with_a(t.border_subtle, a), 6.f, 0, 1.f);
+
+		dl->AddText(lbl_font, lbl_font->FontSize, ImVec2(fa.x + 8.f, fa.y + 4.f),
+		            with_a(t.text_dim, a), "RFLAGS");
+
+		char rfbuf[20];
+		std::snprintf(rfbuf, sizeof(rfbuf), "%016" PRIX64, regs.rflags);
+		dl->AddText(val_font, val_font->FontSize,
+		            ImVec2(fa.x + 72.f, fa.y + 4.f),
+		            with_a(t.text_primary, a), rfbuf);
+
+		struct flag_info { const char* name; uint64_t bit; };
+		flag_info flags[] = {
+			{"CF", 0x0001}, {"PF", 0x0004}, {"AF", 0x0010}, {"ZF", 0x0040},
+			{"SF", 0x0080}, {"TF", 0x0100}, {"IF", 0x0200}, {"DF", 0x0400},
+			{"OF", 0x0800},
+		};
+		if (regs.rflags != ui.prev_rflags) {
+			for (int fi = 0; fi < 9; ++fi) {
+				bool was_set = (ui.prev_rflags & flags[fi].bit) != 0;
+				bool is_set  = (regs.rflags    & flags[fi].bit) != 0;
+				if (was_set != is_set) ui.flag_flash[fi] = 1.f;
+			}
+			ui.prev_rflags = regs.rflags;
+		}
+		float fx = fa.x + 8.f;
+		float fy = fa.y + 20.f;
+		float fp = 6.f;
+		for (int fi = 0; fi < 9; ++fi) {
+			ui_anim::decay_flash(ui.flag_flash[fi], 2.f, dt);
+			bool set = (regs.rflags & flags[fi].bit) != 0;
+			ImU32 fc = set ? t.success : t.text_dim;
+			ImVec2 fs = body_font->CalcTextSizeA(body_font->FontSize, FLT_MAX, 0.f, flags[fi].name);
+			float bw = fs.x + 14.f;
+			float bh = 16.f;
+			float fbx = fx;
+			float fby = fy;
+			dl->AddRectFilled(ImVec2(fbx, fby), ImVec2(fbx + bw, fby + bh),
+			                  with_a(fc, a * (set ? 0.32f : 0.10f)), bh * 0.5f);
+			dl->AddRect(ImVec2(fbx, fby), ImVec2(fbx + bw, fby + bh),
+			            with_a(fc, a * (set ? 0.85f : 0.40f)), bh * 0.5f, 0, 1.f);
+			if (ui.flag_flash[fi] > 0.01f) {
+				for (int g = 0; g < 3; ++g) {
+					float spread = static_cast<float>(g + 1) * 1.5f;
+					dl->AddRect(ImVec2(fbx - spread, fby - spread),
+					            ImVec2(fbx + bw + spread, fby + bh + spread),
+					            with_a(t.accent_glow, a * ui.flag_flash[fi]
+					                                  * (0.32f - static_cast<float>(g) * 0.10f) * 4.f),
+					            bh * 0.5f + spread, 0, 1.f);
+				}
+			}
+			dl->AddText(body_font, body_font->FontSize,
+			            ImVec2(fbx + 7.f, fby + (bh - 11.f) * 0.5f),
+			            with_a(fc, a), flags[fi].name);
+			fx += bw + fp;
+		}
+
+		rip_y += rflags_h + row_gap + 6.f;
+		if (rip_y + cell_h * 3.f + 4.f <= py + ph - 4.f) {
+			float seg_cell_h = 28.f;
+			float seg_cell_w = (gw - 5.f * 4.f) / 6.f;
+			for (int i = 0; i < 6; ++i) {
+				float scx = grid_x + static_cast<float>(i) * (seg_cell_w + 4.f);
+				float scy = rip_y;
+				ImVec2 sa(scx, scy);
+				ImVec2 sb(scx + seg_cell_w, scy + seg_cell_h);
+				dl->AddRectFilled(sa, sb, with_a(t.panel_bg, a * 0.85f), 4.f);
+				dl->AddRect(sa, sb, with_a(t.border_subtle, a), 4.f, 0, 1.f);
+				float edge = ui.reg_cells[segs[i].idx].edge_intensity;
+				if (edge > 0.001f) {
+					dl->AddRect(sa, sb, with_a(t.accent_glow, a * edge * 4.f),
+					            4.f, 0, 1.f);
+				}
+				dl->AddText(lbl_font, lbl_font->FontSize,
+				            ImVec2(sa.x + 6.f, sa.y + 3.f),
+				            with_a(t.text_dim, a), segs[i].name);
+				char sbuf[8];
+				std::snprintf(sbuf, sizeof(sbuf), "%04X", static_cast<unsigned>(segs[i].val & 0xFFFFu));
+				dl->AddText(code_font, code_font->FontSize,
+				            ImVec2(sa.x + 6.f, sa.y + 13.f),
+				            with_a(t.text_secondary, a), sbuf);
+			}
+			rip_y += seg_cell_h + row_gap;
+
+			float dbg_cell_h = 30.f;
+			float dbg_cell_w = (gw - 2.f * gap) / 3.f;
+			for (int i = 0; i < 6; ++i) {
+				int rrr = i / 3;
+				int ccc = i % 3;
+				float dcx = grid_x + static_cast<float>(ccc) * (dbg_cell_w + gap);
+				float dcy = rip_y + static_cast<float>(rrr) * (dbg_cell_h + row_gap);
+				if (dcy + dbg_cell_h > py + ph - 4.f) break;
+				ImVec2 da(dcx, dcy);
+				ImVec2 db(dcx + dbg_cell_w, dcy + dbg_cell_h);
+				dl->AddRectFilled(da, db, with_a(t.panel_bg, a * 0.85f), 4.f);
+				dl->AddRect(da, db, with_a(t.border_subtle, a), 4.f, 0, 1.f);
+				float edge = ui.reg_cells[dbgs[i].idx].edge_intensity;
+				if (edge > 0.001f) {
+					dl->AddRect(da, db, with_a(t.accent_glow, a * edge * 4.f),
+					            4.f, 0, 1.f);
+				}
+				dl->AddText(lbl_font, lbl_font->FontSize,
+				            ImVec2(da.x + 6.f, da.y + 3.f),
+				            with_a(t.text_dim, a), dbgs[i].name);
+				char dbuf[20];
+				std::snprintf(dbuf, sizeof(dbuf), "%016" PRIX64, dbgs[i].val);
+				dl->AddText(code_font, code_font->FontSize,
+				            ImVec2(da.x + 6.f, da.y + 13.f),
+				            with_a(t.text_secondary, a), dbuf);
+				bool dhov = ImGui::IsMouseHoveringRect(da, db, false);
+				if (dhov && dbgs[i].val != 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+					copy_addr_to_clipboard(dbgs[i].val);
+			}
+		}
+	}
+
+	ImGui::PopClipRect();
+}
+
+static void render_live_stack(ImDrawList* dl, float px, float py, float pw, float ph,
+                              float a, bool attached) {
 	const auto& t = aida::ui::resolved();
 
-	ui.panel_sep_phase += dt * 1.8f;
-	if (ui.panel_sep_phase > 6.283185f) ui.panel_sep_phase -= 6.283185f;
+	dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
+	                  with_a(t.bg_base, a));
+	draw_panel_header(dl, px, py, pw, "STACK @ RSP", a);
 
-	float left_w = w * 0.65f;
-	float right_w = w - left_w;
-	float top_h = h * 0.55f;
-	float bot_h = h - top_h;
+	if (!attached) {
+		aida::ui::empty_state::config_t es;
+		es.glyph = aida::ui::empty_state::glyph_t::layers;
+		es.title = "No process attached";
+		es.body  = "Attach to a process to inspect the stack.";
+		aida::ui::empty_state::render(ImVec2(px, py + HEADER_H),
+			ImVec2(pw, ph - HEADER_H), es);
+		return;
+	}
 
-	auto draw_separator_v = [&](float sx, float sy, float sh) {
-		float pulse = (sinf(ui.panel_sep_phase) * 0.5f + 0.5f) * 0.4f + 0.4f;
-		ImU32 c = with_a(t.accent_dim, a * pulse * 0.6f);
-		dl->AddLine(ImVec2(sx, sy), ImVec2(sx, sy + sh), c, 1.f);
-	};
-	auto draw_separator_h = [&](float sx, float sy, float sw) {
-		float pulse = (sinf(ui.panel_sep_phase) * 0.5f + 0.5f) * 0.4f + 0.4f;
-		ImU32 c = with_a(t.accent_dim, a * pulse * 0.6f);
-		dl->AddLine(ImVec2(sx, sy), ImVec2(sx + sw, sy), c, 1.f);
-	};
+	auto regs = debugger_engine::cached_registers();
+	uint64_t rsp = regs.rsp;
+	if (rsp == 0) {
+		aida::ui::empty_state::config_t es;
+		es.glyph = aida::ui::empty_state::glyph_t::layers;
+		es.title = "Synchronizing stack pointer";
+		es.body  = "Waiting for the first RSP snapshot.";
+		aida::ui::empty_state::render(ImVec2(px, py + HEADER_H),
+			ImVec2(pw, ph - HEADER_H), es);
+		return;
+	}
+
+	int rows = std::max(1, static_cast<int>((ph - HEADER_H) / ROW_HEIGHT));
+	size_t total = static_cast<size_t>(rows) * 8;
+	debugger_engine::request_stack_refresh(rsp, total, 100);
+	uint64_t cached_rsp = 0;
+	std::vector<uint8_t> buf = debugger_engine::cached_stack_bytes(cached_rsp);
+	if (cached_rsp != rsp) buf.clear();
+
+	float dy = py + HEADER_H;
+	ImGui::PushClipRect(ImVec2(px, dy), ImVec2(px + pw, py + ph), true);
+
+	ImFont* code_font = aida::ui::fonts::code();
+	if (!code_font) code_font = ImGui::GetFont();
+	ImFont* body_font = aida::ui::fonts::body();
+	if (!body_font) body_font = ImGui::GetFont();
+
+	for (int r = 0; r < rows && static_cast<size_t>(r) * 8 + 8 <= buf.size(); ++r) {
+		float ry = dy + static_cast<float>(r) * ROW_HEIGHT;
+		uint64_t addr = rsp + static_cast<uint64_t>(r) * 8;
+		uint64_t val;
+		std::memcpy(&val, buf.data() + static_cast<size_t>(r) * 8, 8);
+		char abuf[20], vbuf[20];
+		std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, addr);
+		std::snprintf(vbuf, sizeof(vbuf), "%016" PRIX64, val);
+
+		bool is_rsp = (r == 0);
+		bool hov = ImGui::IsMouseHoveringRect(ImVec2(px, ry),
+			ImVec2(px + pw, ry + ROW_HEIGHT), false);
+		if (is_rsp) {
+			dl->AddRectFilled(ImVec2(px, ry), ImVec2(px + pw, ry + ROW_HEIGHT),
+			                  with_a(t.accent_glow, a * 0.32f));
+			dl->AddRectFilled(ImVec2(px, ry), ImVec2(px + 3.f, ry + ROW_HEIGHT),
+			                  with_a(t.accent_u32, a));
+		} else if (hov) {
+			dl->AddRectFilled(ImVec2(px, ry), ImVec2(px + pw, ry + ROW_HEIGHT),
+			                  with_a(t.hover_wash, a), 4.f);
+		}
+
+		dl->AddText(code_font, code_font->FontSize, ImVec2(px + 8.f, ry + 4.f),
+		            with_a(t.text_address, a), abuf);
+		dl->AddText(code_font, code_font->FontSize, ImVec2(px + 154.f, ry + 4.f),
+		            with_a(t.text_primary, a), vbuf);
+
+		if (is_rsp) {
+			ImVec2 ts = body_font->CalcTextSizeA(body_font->FontSize, FLT_MAX, 0.f, "RSP");
+			float bw = ts.x + 14.f;
+			float bh = 16.f;
+			float bx = px + pw - bw - 8.f;
+			float by = ry + (ROW_HEIGHT - bh) * 0.5f;
+			dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh),
+			                  with_a(t.accent_u32, a * 0.85f), bh * 0.5f);
+			dl->AddText(body_font, body_font->FontSize,
+				ImVec2(bx + 7.f, by + (bh - 11.f) * 0.5f),
+				with_a(IM_COL32(255, 255, 255, 245), a), "RSP");
+		}
+
+		if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+			jump_to_disasm(val);
+		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+			copy_addr_to_clipboard(val);
+	}
+	ImGui::PopClipRect();
+}
+
+static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h, float a) {
+	const auto& t = aida::ui::resolved();
 
 	debugger_engine::request_refresh(100);
 	bool attached = driver_bridge::attached_pid() != 0;
-	{
-		float px = ox, py = oy, pw = left_w - 1.f, ph = top_h - 1.f;
-		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
-		                  with_a(t.bg_base, a));
-		draw_panel_header(dl, px, py, pw, "DISASSEMBLY", a);
+	auto regs = debugger_engine::cached_registers();
 
-		auto regs = debugger_engine::cached_registers();
-		uint64_t rip = regs.rip;
+	float pad = 8.f;
+	float left_w = w * 0.46f;
+	float right_w = w - left_w - pad;
+	float top_h = h * 0.50f;
+	float bot_h = h - top_h - pad;
 
-		if (rip != ui.prev_rip && rip != 0) {
-			ui.rip_flash = 1.f;
-			ui.prev_rip = rip;
-		}
-		ui_anim::decay_flash(ui.rip_flash, 3.f, dt);
-
-		if (attached && rip != 0) {
-			debugger_engine::request_disasm_refresh(rip, 100);
-			uint64_t base = 0;
-			std::vector<uint8_t> code = debugger_engine::cached_disasm_window(base);
-			if (!code.empty()) {
-				std::vector<AsmInstr> insns;
-				const uint8_t* data = code.data();
-				int sz = static_cast<int>(code.size());
-				int off = 0;
-				while (off < sz && insns.size() < 128) {
-					int remaining = sz - off;
-					int avail = (remaining < 15) ? remaining : 15;
-					insns.push_back(zydis_decode_one(data + off, avail, base + static_cast<uint64_t>(off)));
-					off += insns.back().len;
-				}
-
-				float dy = py + HEADER_H;
-				ImGui::PushClipRect(ImVec2(px, dy), ImVec2(px + pw, py + ph), true);
-
-				ImFont* code_font = aida::ui::fonts::code();
-				if (!code_font) code_font = ImGui::GetFont();
-
-				for (size_t i = 0; i < insns.size(); ++i) {
-					float ry = dy + static_cast<float>(i) * ROW_HEIGHT;
-					if (ry + ROW_HEIGHT < dy || ry > py + ph) continue;
-
-					bool is_rip = (insns[i].addr == rip);
-					bool sel = (ui.disasm_selected == static_cast<int>(i));
-
-					if (is_rip) {
-						float rip_a = 0.10f + ui.rip_flash * 0.12f;
-						dl->AddRectFilled(ImVec2(px, ry), ImVec2(px + pw, ry + ROW_HEIGHT),
-						                  with_a(t.accent_glow, a * rip_a * 4.f));
-						dl->AddRectFilled(ImVec2(px, ry), ImVec2(px + 3.f, ry + ROW_HEIGHT),
-						                  with_a(t.accent_u32, a * 0.95f));
-						dl->AddTriangleFilled(
-							ImVec2(px + 6.f, ry + 5.f),
-							ImVec2(px + 6.f, ry + ROW_HEIGHT - 5.f),
-							ImVec2(px + 13.f, ry + ROW_HEIGHT * 0.5f),
-							with_a(t.accent_grad_top, a));
-
-						if (ui.rip_flash > 0.01f) {
-							for (int fg = 0; fg < 2; ++fg) {
-								float fga = ui.rip_flash * (0.18f - static_cast<float>(fg) * 0.07f) * a;
-								dl->AddRect(ImVec2(px - static_cast<float>(fg + 1),
-								                    ry - static_cast<float>(fg + 1)),
-								            ImVec2(px + pw + static_cast<float>(fg + 1),
-								                    ry + ROW_HEIGHT + static_cast<float>(fg + 1)),
-								            with_a(t.accent_glow, fga * 4.f),
-								            2.f, 0, 1.f);
-							}
-						}
-					} else {
-						draw_row_bg(dl, px, ry, pw, ROW_HEIGHT, sel, false,
-							static_cast<int>(i), 1.f, a);
-					}
-
-					char abuf[20];
-					std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, insns[i].addr);
-					dl->AddText(code_font, code_font->FontSize, ImVec2(px + 18.f, ry + 4.f),
-					            with_a(t.text_address, a), abuf);
-
-					char textbuf[164];
-					if (insns[i].ops[0])
-						std::snprintf(textbuf, sizeof(textbuf), "%s %s",
-							insns[i].mnem, insns[i].ops);
-					else
-						std::snprintf(textbuf, sizeof(textbuf), "%s", insns[i].mnem);
-					ImU32 mcol = insns[i].is_call ? t.error
-						: (insns[i].is_branch ? t.warning : t.syn_keyword);
-					dl->AddText(code_font, code_font->FontSize, ImVec2(px + 162.f, ry + 4.f),
-					            with_a(mcol, a), textbuf);
-
-					auto comment = debugger_engine::get_comment(insns[i].addr);
-					if (!comment.empty()) {
-						ImVec2 cs = code_font->CalcTextSizeA(code_font->FontSize, FLT_MAX, 0.f, comment.c_str());
-						float cx = px + pw - cs.x - 10.f;
-						dl->AddText(code_font, code_font->FontSize, ImVec2(cx, ry + 4.f),
-						            with_a(t.syn_comment, a), comment.c_str());
-					}
-
-					bool hov = ImGui::IsMouseHoveringRect(ImVec2(px, ry),
-						ImVec2(px + pw, ry + ROW_HEIGHT), false);
-					if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-						ui.disasm_selected = static_cast<int>(i);
-				}
-
-				for (size_t bi = 0; bi < insns.size(); ++bi) {
-					if (!insns[bi].is_branch && !insns[bi].is_call) continue;
-					if (insns[bi].ops[0] != '0' || insns[bi].ops[1] != 'x') continue;
-					uint64_t target = std::strtoull(insns[bi].ops, nullptr, 16);
-					if (target == 0) continue;
-
-					float from_y = dy + static_cast<float>(bi) * ROW_HEIGHT + ROW_HEIGHT * 0.5f;
-					if (from_y < dy || from_y > py + ph) continue;
-
-					bool found_target = false;
-					float to_y = 0.f;
-					for (size_t ti = 0; ti < insns.size(); ++ti) {
-						if (insns[ti].addr == target) {
-							to_y = dy + static_cast<float>(ti) * ROW_HEIGHT + ROW_HEIGHT * 0.5f;
-							if (to_y >= dy && to_y <= py + ph) found_target = true;
-							break;
-						}
-					}
-					if (!found_target) continue;
-
-					ImU32 arrow_col;
-					if (insns[bi].is_call)
-						arrow_col = with_a(t.error, a);
-					else if (std::strcmp(insns[bi].mnem, "jmp") == 0)
-						arrow_col = with_a(t.accent_u32, a);
-					else
-						arrow_col = with_a(t.success, a);
-
-					ui_anim::render_branch_arrow(dl, px + 1.f, from_y, to_y, 13.f, arrow_col, 1.f);
-				}
-
-				ImGui::PopClipRect();
-			}
-		} else {
-			aida::ui::empty_state::config_t es;
-			es.glyph = aida::ui::empty_state::glyph_t::cpu;
-			if (attached) {
-				es.title = "Synchronizing thread context";
-				es.body  = "Waiting for the first register snapshot from the target.";
-			} else {
-				es.title = "No process attached";
-				es.body  = "Attach to a process to view live disassembly.";
-			}
-			aida::ui::empty_state::render(ImVec2(px, py + HEADER_H),
-				ImVec2(pw, ph - HEADER_H), es);
-		}
-	}
-
-	draw_separator_v(ox + left_w - 0.5f, oy, top_h);
+	render_mini_disasm(dl, ox, oy, left_w, top_h, a, regs.rip, attached);
 
 	{
-		float px = ox + left_w, py = oy, pw = right_w, ph = top_h - 1.f;
-		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
-		                  with_a(t.bg_base, a));
-		draw_panel_header(dl, px, py, pw, "REGISTERS", a);
-
-		if (attached) {
-			auto regs = debugger_engine::cached_registers();
-			struct reg_info { const char* name; uint64_t val; int idx; };
-			reg_info regs_list[] = {
-				{"RAX", regs.rax, 0}, {"RBX", regs.rbx, 1}, {"RCX", regs.rcx, 2}, {"RDX", regs.rdx, 3},
-				{"RSI", regs.rsi, 4}, {"RDI", regs.rdi, 5}, {"RBP", regs.rbp, 6}, {"RSP", regs.rsp, 7},
-				{"R8",  regs.r8,  8}, {"R9",  regs.r9,  9}, {"R10", regs.r10, 10}, {"R11", regs.r11, 11},
-				{"R12", regs.r12, 12}, {"R13", regs.r13, 13}, {"R14", regs.r14, 14}, {"R15", regs.r15, 15},
-				{"RIP", regs.rip, 16}, {"RFLAGS", regs.rflags, 17},
-			};
-
-			for (const auto& ri : regs_list) {
-				auto& cell = ui.reg_cells[ri.idx];
-				if (ri.val != ui.prev_regs[ri.idx]) {
-					ui.reg_flash[ri.idx] = 1.f;
-					ui.prev_regs[ri.idx] = ri.val;
-					cell.target_value = ri.val;
-					cell.change_anim = 1.f;
-					cell.edge_intensity = 1.f;
-				}
-				ui_anim::decay_flash(ui.reg_flash[ri.idx], 2.f, dt);
-				cell.change_anim = ui_anim::smooth_lerp(cell.change_anim, 0.f, 4.2f, dt);
-				cell.edge_intensity = ui_anim::smooth_lerp(cell.edge_intensity, 0.f, 2.4f, dt);
-
-				float roll_t = 1.f - cell.change_anim;
-				float ease = aida::motion::ease::out_cubic(roll_t);
-				if (ease >= 0.999f) cell.shown_value = cell.target_value;
-			}
-
-			float grid_x = px + 8.f;
-			float grid_y = py + HEADER_H + 6.f;
-			float gw = pw - 16.f;
-			int cols = 2;
-			float gap = 6.f;
-			float cell_w = (gw - static_cast<float>(cols - 1) * gap) / static_cast<float>(cols);
-			float cell_h = 36.f;
-
-			ImFont* lbl_font = aida::ui::fonts::caption();
-			if (!lbl_font) lbl_font = ImGui::GetFont();
-			ImFont* val_font = aida::ui::fonts::code_em();
-			if (!val_font) val_font = ImGui::GetFont();
-
-			ImGui::PushClipRect(ImVec2(px, py + HEADER_H), ImVec2(px + pw, py + ph), true);
-
-			for (int i = 0; i < 18; ++i) {
-				const auto& ri = regs_list[i];
-				int rr = i / cols;
-				int cc = i % cols;
-				float cx = grid_x + static_cast<float>(cc) * (cell_w + gap);
-				float cy = grid_y + static_cast<float>(rr) * (cell_h + 4.f);
-				if (cy + cell_h > py + ph) break;
-
-				ImVec2 ca(cx, cy);
-				ImVec2 cb(cx + cell_w, cy + cell_h);
-
-				bool hov = ImGui::IsMouseHoveringRect(ca, cb, false);
-
-				dl->AddRectFilled(ca, cb, with_a(t.panel_bg, a * 0.85f), 6.f);
-				if (hov) {
-					dl->AddRectFilled(ca, cb, with_a(t.hover_wash, a), 6.f);
-				}
-				dl->AddRect(ca, cb, with_a(t.border_subtle, a), 6.f, 0, 1.f);
-
-				float edge = ui.reg_cells[ri.idx].edge_intensity;
-				if (edge > 0.001f) {
-					dl->AddRectFilled(ImVec2(ca.x, ca.y),
-					                  ImVec2(ca.x + 2.f, cb.y),
-					                  with_a(t.accent_u32, a * edge), 1.f);
-					for (int g = 0; g < 3; ++g) {
-						float spread = static_cast<float>(g + 1) * 1.5f;
-						dl->AddRect(ImVec2(ca.x - spread, ca.y - spread),
-						            ImVec2(cb.x + spread, cb.y + spread),
-						            with_a(t.accent_glow,
-							a * edge * (0.32f - static_cast<float>(g) * 0.10f) * 4.f),
-						            6.f + spread, 0, 1.f);
-					}
-				}
-
-				dl->AddText(lbl_font, lbl_font->FontSize, ImVec2(ca.x + 8.f, ca.y + 4.f),
-				            with_a(t.text_dim, a), ri.name);
-
-				char vbuf[20];
-				std::snprintf(vbuf, sizeof(vbuf), "%016" PRIX64, ri.val);
-				float roll_anim = ui.reg_cells[ri.idx].change_anim;
-				float vy = ca.y + 17.f - roll_anim * 6.f;
-				float val_alpha = a * (1.f - roll_anim * 0.3f);
-
-				ImU32 vcol = (edge > 0.01f)
-					? aida::ui::mix(t.accent_grad_top, t.text_primary, 1.f - edge)
-					: t.syn_register;
-
-				dl->AddText(val_font, val_font->FontSize, ImVec2(ca.x + 8.f, vy),
-				            with_a(vcol, val_alpha), vbuf);
-
-				if (roll_anim > 0.01f) {
-					char prev_buf[20];
-					std::snprintf(prev_buf, sizeof(prev_buf), "%016" PRIX64,
-						ui.reg_cells[ri.idx].shown_value);
-					float py2 = ca.y + 17.f + (1.f - roll_anim) * 6.f;
-					dl->AddText(val_font, val_font->FontSize, ImVec2(ca.x + 8.f, py2),
-					            with_a(t.text_dim, a * roll_anim * 0.5f), prev_buf);
-				}
-			}
-
-			ImGui::PopClipRect();
-		} else {
-			aida::ui::empty_state::config_t es;
-			es.glyph = aida::ui::empty_state::glyph_t::cpu;
-			es.title = "No process attached";
-			es.body  = "Attach to a process to populate registers.";
-			aida::ui::empty_state::render(ImVec2(px, py + HEADER_H),
-				ImVec2(pw, ph - HEADER_H), es);
-		}
+		float px = ox + left_w + pad;
+		float py = oy;
+		float pw = right_w;
+		float ph = h;
+		render_register_grid(dl, px, py, pw, ph, a, attached);
 	}
 
-	draw_separator_h(ox, oy + top_h - 0.5f, left_w);
+	render_live_stack(dl, ox, oy + top_h + pad, left_w, bot_h, a, attached);
 
-	{
-		float px = ox, py = oy + top_h, pw = left_w - 1.f, ph = bot_h;
-		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
-		                  with_a(t.bg_base, a));
-		draw_panel_header(dl, px, py, pw, "MEMORY DUMP", a);
-
-		uint64_t dump_addr = ui.dump_address;
-		if (dump_addr == 0) {
-			auto regs = debugger_engine::cached_registers();
-			dump_addr = regs.rsp;
-		}
-
-		if (ImGui::IsMouseHoveringRect(ImVec2(px, py + HEADER_H), ImVec2(px + pw, py + ph), false)) {
-			float wheel = ImGui::GetIO().MouseWheel;
-			if (wheel != 0.f) {
-				int64_t byte_delta = static_cast<int64_t>(-wheel) * 16LL * 3LL;
-				if (byte_delta < 0) {
-					uint64_t abs_d = static_cast<uint64_t>(-byte_delta);
-					ui.dump_address = (dump_addr > abs_d) ? (dump_addr - abs_d) : 0;
-				} else {
-					ui.dump_address = dump_addr + static_cast<uint64_t>(byte_delta);
-				}
-				dump_addr = ui.dump_address;
-				if (dump_addr == 0) {
-					auto regs = debugger_engine::cached_registers();
-					dump_addr = regs.rsp;
-				}
-			}
-		}
-
-		if (attached && dump_addr != 0) {
-			int rows = static_cast<int>((ph - HEADER_H - ROW_HEIGHT) / ROW_HEIGHT);
-			size_t bytes_per_row = 16;
-			size_t total_bytes = static_cast<size_t>(rows) * bytes_per_row;
-
-			debugger_engine::request_dump_refresh(dump_addr, total_bytes, 100);
-			uint64_t cached_addr = 0;
-			size_t   cached_size = 0;
-			std::vector<uint8_t> buf = debugger_engine::cached_dump_bytes(cached_addr, cached_size);
-			if (cached_addr != dump_addr || cached_size != total_bytes)
-				buf.clear();
-
-			static std::vector<uint8_t> prev_dump;
-			static std::vector<float> dump_byte_flash;
-			static std::vector<float> dump_row_flash;
-			static uint64_t prev_dump_addr = 0;
-
-			float ddt = aida::ui::clock::dt();
-			if (prev_dump_addr != dump_addr || prev_dump.size() != buf.size()) {
-				prev_dump = buf;
-				prev_dump_addr = dump_addr;
-				dump_byte_flash.assign(buf.size(), 0.f);
-				dump_row_flash.assign(static_cast<size_t>(rows), 0.f);
-			} else {
-				for (size_t di = 0; di < buf.size() && di < prev_dump.size(); ++di) {
-					if (buf[di] != prev_dump[di]) {
-						dump_byte_flash[di] = 1.f;
-						size_t row_idx = di / bytes_per_row;
-						if (row_idx < dump_row_flash.size())
-							dump_row_flash[row_idx] = 1.f;
-						prev_dump[di] = buf[di];
-					}
-					ui_anim::decay_flash(dump_byte_flash[di], 1.5f, ddt);
-				}
-				for (auto& f : dump_row_flash)
-					ui_anim::decay_flash(f, 0.5f, ddt);
-			}
-
-			float dy = py + HEADER_H;
-			ImGui::PushClipRect(ImVec2(px, dy), ImVec2(px + pw, py + ph), true);
-
-			ImFont* code_font = aida::ui::fonts::code();
-			if (!code_font) code_font = ImGui::GetFont();
-
-			{
-				float hhx = px + 150.f;
-				for (size_t c = 0; c < bytes_per_row; ++c) {
-					char hc[4];
-					std::snprintf(hc, sizeof(hc), "%X", static_cast<int>(c));
-					dl->AddText(code_font, code_font->FontSize, ImVec2(hhx + 4.f, dy + 5.f),
-					            with_a(t.text_dim, a), hc);
-					hhx += 22.f;
-					if (c == 7) hhx += 6.f;
-				}
-				dy += ROW_HEIGHT;
-			}
-
-			for (int r = 0; r < rows
-			              && r * static_cast<int>(bytes_per_row) < static_cast<int>(buf.size()); ++r) {
-				float ry = dy + static_cast<float>(r) * ROW_HEIGHT;
-
-				float row_heat = (r < static_cast<int>(dump_row_flash.size()))
-					? dump_row_flash[r] : 0.f;
-				if (row_heat > 0.01f) {
-					dl->AddRectFilled(ImVec2(px, ry), ImVec2(px + pw, ry + ROW_HEIGHT),
-					                  with_a(t.accent_glow, a * row_heat * 0.18f * 4.f));
-				}
-
-				char abuf[20];
-				std::snprintf(abuf, sizeof(abuf), "%016" PRIX64,
-					dump_addr + static_cast<uint64_t>(r) * bytes_per_row);
-				dl->AddText(code_font, code_font->FontSize, ImVec2(px + 6.f, ry + 4.f),
-				            with_a(t.text_address, a), abuf);
-
-				float hx = px + 150.f;
-				size_t off = static_cast<size_t>(r) * bytes_per_row;
-				for (size_t b = 0; b < bytes_per_row && off + b < buf.size(); ++b) {
-					size_t byte_idx = off + b;
-					float bf = (byte_idx < dump_byte_flash.size()) ? dump_byte_flash[byte_idx] : 0.f;
-					if (bf > 0.01f) {
-						ImU32 flash_col = aida::ui::mix(t.warning, t.accent_u32, bf * 0.5f);
-						dl->AddRectFilled(
-							ImVec2(hx - 1.f, ry + 1.f),
-							ImVec2(hx + 17.f, ry + ROW_HEIGHT - 1.f),
-							with_a(flash_col, a * bf * 0.55f), 3.f);
-					}
-					char hbuf[4];
-					std::snprintf(hbuf, sizeof(hbuf), "%02X", buf[off + b]);
-					ImU32 byte_col = (bf > 0.01f)
-						? aida::ui::mix(t.text_primary, t.accent_grad_top, bf)
-						: t.text_primary;
-					dl->AddText(code_font, code_font->FontSize, ImVec2(hx, ry + 4.f),
-					            with_a(byte_col, a), hbuf);
-					hx += 22.f;
-					if (b == 7) hx += 6.f;
-				}
-
-				float ax = hx + 10.f;
-				for (size_t b = 0; b < bytes_per_row && off + b < buf.size(); ++b) {
-					char ch = (buf[off + b] >= 0x20 && buf[off + b] <= 0x7e)
-						? static_cast<char>(buf[off + b]) : '.';
-					char cbuf[2] = {ch, 0};
-					dl->AddText(code_font, code_font->FontSize, ImVec2(ax, ry + 4.f),
-					            with_a(t.text_secondary, a), cbuf);
-					ax += 8.f;
-				}
-			}
-
-			ImGui::PopClipRect();
-		} else {
-			aida::ui::empty_state::config_t es;
-			es.glyph = aida::ui::empty_state::glyph_t::memory;
-			if (attached) {
-				es.title = "Synchronizing memory window";
-				es.body  = "Waiting for the first stack pointer snapshot.";
-			} else {
-				es.title = "No process attached";
-				es.body  = "Attach to a process to dump memory.";
-			}
-			aida::ui::empty_state::render(ImVec2(px, py + HEADER_H),
-				ImVec2(pw, ph - HEADER_H), es);
-		}
-	}
-
-	draw_separator_h(ox + left_w, oy + top_h - 0.5f, right_w);
-	draw_separator_v(ox + left_w - 0.5f, oy + top_h, bot_h);
-
-	{
-		float px = ox + left_w, py = oy + top_h, pw = right_w, ph = bot_h;
-		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
-		                  with_a(t.bg_base, a));
-		draw_panel_header(dl, px, py, pw, "STACK", a);
-
-		auto regs = debugger_engine::cached_registers();
-		uint64_t rsp = regs.rsp;
-		if (attached && rsp != 0) {
-			int rows = static_cast<int>((ph - HEADER_H) / ROW_HEIGHT);
-			size_t total = static_cast<size_t>(rows) * 8;
-			debugger_engine::request_stack_refresh(rsp, total, 100);
-			uint64_t cached_rsp = 0;
-			std::vector<uint8_t> buf = debugger_engine::cached_stack_bytes(cached_rsp);
-			if (cached_rsp != rsp) buf.clear();
-
-			float dy = py + HEADER_H;
-			ImGui::PushClipRect(ImVec2(px, dy), ImVec2(px + pw, py + ph), true);
-
-			ImFont* code_font = aida::ui::fonts::code();
-			if (!code_font) code_font = ImGui::GetFont();
-
-			for (int r = 0; r < rows && static_cast<size_t>(r) * 8 + 8 <= buf.size(); ++r) {
-				float ry = dy + static_cast<float>(r) * ROW_HEIGHT;
-				uint64_t addr = rsp + static_cast<uint64_t>(r) * 8;
-				uint64_t val;
-				std::memcpy(&val, buf.data() + static_cast<size_t>(r) * 8, 8);
-				char abuf[20], vbuf[20];
-				std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, addr);
-				std::snprintf(vbuf, sizeof(vbuf), "%016" PRIX64, val);
-
-				bool is_rsp = (r == 0);
-				if (is_rsp) {
-					dl->AddRectFilled(ImVec2(px, ry), ImVec2(px + pw, ry + ROW_HEIGHT),
-					                  with_a(t.accent_glow, a * 0.32f));
-					dl->AddRectFilled(ImVec2(px, ry), ImVec2(px + 3.f, ry + ROW_HEIGHT),
-					                  with_a(t.accent_u32, a));
-				}
-
-				dl->AddText(code_font, code_font->FontSize, ImVec2(px + 8.f, ry + 4.f),
-				            with_a(t.text_address, a), abuf);
-				dl->AddText(code_font, code_font->FontSize, ImVec2(px + 154.f, ry + 4.f),
-				            with_a(t.text_primary, a), vbuf);
-			}
-			ImGui::PopClipRect();
-		} else {
-			aida::ui::empty_state::config_t es;
-			es.glyph = aida::ui::empty_state::glyph_t::layers;
-			if (attached) {
-				es.title = "Synchronizing stack pointer";
-				es.body  = "Waiting for the first RSP snapshot from the target.";
-			} else {
-				es.title = "No process attached";
-				es.body  = "Attach to a process to inspect the stack.";
-			}
-			aida::ui::empty_state::render(ImVec2(px, py + HEADER_H),
-				ImVec2(pw, ph - HEADER_H), es);
-		}
-	}
+	dl->AddLine(ImVec2(ox + left_w + pad * 0.5f, oy),
+	            ImVec2(ox + left_w + pad * 0.5f, oy + h),
+	            with_a(t.border_subtle, a * 0.5f), 1.f);
+	dl->AddLine(ImVec2(ox, oy + top_h + pad * 0.5f),
+	            ImVec2(ox + left_w, oy + top_h + pad * 0.5f),
+	            with_a(t.border_subtle, a * 0.5f), 1.f);
 }
 
+
+static void render_breakpoint_actions(ImDrawList* dl, float ox, float oy, float w, float a) {
+	const auto& t = aida::ui::resolved();
+	auto& ui = g_ui;
+	(void)dl; (void)t;
+
+	float bar_h = 40.f;
+	float pad = 8.f;
+	float input_w = w * 0.42f;
+	float btn_gap = 6.f;
+
+	ImGui::SetCursorScreenPos(ImVec2(ox + pad, oy + 2.f));
+	ImGui::PushID("##bp_actions");
+
+	ImGui::SetNextItemWidth(input_w);
+	aida::ui::input_text("##bp_addr", ui.add_bp_addr_buf, sizeof(ui.add_bp_addr_buf),
+		"0x... breakpoint address",
+		false, ImVec2(input_w, bar_h - 8.f));
+
+	ImGui::SameLine(0.f, btn_gap);
+
+	bool add_clicked = aida::ui::button("Add SW BP", aida::ui::button_kind_t::primary,
+		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
+	if (add_clicked) {
+		uint64_t addr = parse_hex_address(ui.add_bp_addr_buf);
+		if (addr != 0) {
+			debugger_engine::add_breakpoint(addr,
+				debugger_engine::bp_type_t::software, "", "", 1);
+			ui.add_bp_addr_buf[0] = '\0';
+		}
+	}
+	ImGui::SameLine(0.f, btn_gap);
+
+	bool add_hw_clicked = aida::ui::button("Add HW Exec",
+		aida::ui::button_kind_t::secondary,
+		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
+	if (add_hw_clicked) {
+		uint64_t addr = parse_hex_address(ui.add_bp_addr_buf);
+		if (addr != 0) {
+			debugger_engine::add_breakpoint(addr,
+				debugger_engine::bp_type_t::hardware_execute, "", "", 1);
+			ui.add_bp_addr_buf[0] = '\0';
+		}
+	}
+	ImGui::SameLine(0.f, btn_gap);
+
+	bool clear_clicked = aida::ui::button("Clear All",
+		aida::ui::button_kind_t::destructive,
+		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
+	if (clear_clicked) {
+		debugger_engine::clear_all_breakpoints();
+	}
+
+	ImGui::PopID();
+}
 
 static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, float h, float a) {
 	auto& st = debugger_engine::g_state;
 	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
-	float dt = aida::ui::clock::dt();
 
+	float bar_h = 40.f;
+	render_breakpoint_actions(dl, ox, oy, w, a);
+
+	float table_y = oy + bar_h;
 	{
 		ui_anim::table_col_t cols[] = {
 			{"#", 26.f}, {"State", 70.f}, {"Address", 170.f},
-			{"Type", 110.f}, {"Name", 240.f}
+			{"Type", 110.f}, {"Hits", 70.f}, {"Name", 240.f}
 		};
-		draw_table_header(dl, ox, oy, w, cols, 5, a);
+		draw_table_header(dl, ox, table_y, w, cols, 6, a);
 	}
 
-	std::lock_guard<std::mutex> lk(st.bp_mutex);
-	float total = static_cast<float>(st.breakpoints.size()) * ROW_HEIGHT;
-	float visible_h = h - HEADER_H;
-	float content_y = oy + HEADER_H;
+	std::vector<debugger_engine::breakpoint_t> snapshot;
+	{
+		std::lock_guard<std::mutex> lk(st.bp_mutex);
+		snapshot = st.breakpoints;
+	}
+	int total_n = static_cast<int>(snapshot.size());
+	float content_y = table_y + HEADER_H;
+	float visible_h = h - bar_h - HEADER_H;
 
-	handle_list_scroll(&ui.bp_panel.scroll_y, &ui.bp_panel.target_scroll_y,
-		total, visible_h, ROW_HEIGHT, ox, content_y, w, dt);
-
-	ImGui::PushClipRect(ImVec2(ox, content_y), ImVec2(ox + w, content_y + visible_h), true);
+	ImGui::SetCursorScreenPos(ImVec2(ox, content_y));
+	ImGui::PushID("##bp_list");
+	ImGui::BeginChild("##bp_list_child", ImVec2(w, visible_h), false,
+		ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
 	ImFont* body_font = aida::ui::fonts::body();
 	if (!body_font) body_font = ImGui::GetFont();
 	ImFont* code_font = aida::ui::fonts::code();
 	if (!code_font) code_font = ImGui::GetFont();
 
-	for (int i = 0; i < static_cast<int>(st.breakpoints.size()); ++i) {
-		float ry = content_y + static_cast<float>(i) * ROW_HEIGHT - ui.bp_panel.scroll_y;
-		if (ry + ROW_HEIGHT < content_y) continue;
-		if (ry > content_y + visible_h) break;
-		auto& bp = st.breakpoints[static_cast<size_t>(i)];
-		bool sel = (ui.bp_panel.selected == i);
-		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry),
-			ImVec2(ox + w, ry + ROW_HEIGHT), false);
-		float row_a = ui_anim::render_row_entrance(i,
-			aida::ui::clock::seconds(), 0.012f, 0.30f);
-		draw_row_bg(dl, ox, ry, w, ROW_HEIGHT, sel, hov, i, row_a, a);
+	ImGuiListClipper clipper;
+	clipper.Begin(total_n, ROW_HEIGHT);
+	while (clipper.Step()) {
+		for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+			ImGui::SetCursorScreenPos(ImVec2(ox, content_y + static_cast<float>(i) * ROW_HEIGHT
+				- ImGui::GetScrollY()));
+			ImVec2 row_min = ImGui::GetCursorScreenPos();
+			ImGui::PushID(i);
+			ImGui::InvisibleButton("##br", ImVec2(w - 18.f, ROW_HEIGHT));
+			bool hov = ImGui::IsItemHovered();
+			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+			bool dclicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && hov;
+			ImGui::PopID();
 
-		char ibuf[8];
-		std::snprintf(ibuf, sizeof(ibuf), "%d", i);
-		dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 8.f, ry + 5.f),
-		            with_a(t.text_dim, a * row_a), ibuf);
+			float ry = row_min.y;
+			auto& bp = snapshot[static_cast<size_t>(i)];
+			bool sel = (ui.bp_panel.selected == i);
 
-		bool enabled = (bp.state == debugger_engine::bp_state_t::enabled);
-		ImU32 dot_col = enabled ? t.success : t.error;
-		float dot_pulse = enabled ? aida::ui::clock::pulse(1.4f, 0.55f, 1.f) : 0.55f;
-		dl->AddCircleFilled(ImVec2(ox + 40.f, ry + ROW_HEIGHT * 0.5f), 5.f,
-		                    with_a(dot_col, a * row_a * 0.20f), 16);
-		dl->AddCircleFilled(ImVec2(ox + 40.f, ry + ROW_HEIGHT * 0.5f), 3.f,
-		                    with_a(dot_col, a * row_a * dot_pulse), 16);
+			draw_row_bg(dl, ox, ry, w, ROW_HEIGHT, sel, hov, i, 1.f, a);
 
-		{
+			char ibuf[8];
+			std::snprintf(ibuf, sizeof(ibuf), "%d", i);
+			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 8.f, ry + 5.f),
+			            with_a(t.text_dim, a), ibuf);
+
+			bool enabled = (bp.state == debugger_engine::bp_state_t::enabled);
+			ImU32 dot_col = enabled ? t.success : t.error;
+			float dot_pulse = enabled ? aida::ui::clock::pulse(1.4f, 0.55f, 1.f) : 0.55f;
+			dl->AddCircleFilled(ImVec2(ox + 40.f, ry + ROW_HEIGHT * 0.5f), 5.f,
+			                    with_a(dot_col, a * 0.20f), 16);
+			dl->AddCircleFilled(ImVec2(ox + 40.f, ry + ROW_HEIGHT * 0.5f), 3.f,
+			                    with_a(dot_col, a * dot_pulse), 16);
+
 			const char* state_str = enabled ? "ON" : "OFF";
 			ImU32 pcol = enabled ? t.info : t.text_secondary;
 			ImVec2 sts = body_font->CalcTextSizeA(body_font->FontSize, FLT_MAX, 0.f, state_str);
 			float pw = sts.x + 14.f;
 			float ph = 16.f;
-			float py = ry + (ROW_HEIGHT - ph) * 0.5f;
-			dl->AddRectFilled(ImVec2(ox + 50.f, py),
-			                  ImVec2(ox + 50.f + pw, py + ph),
-			                  with_a(pcol, a * row_a * 0.25f), ph * 0.5f);
-			dl->AddRect(ImVec2(ox + 50.f, py),
-			            ImVec2(ox + 50.f + pw, py + ph),
-			            with_a(pcol, a * row_a * 0.55f), ph * 0.5f, 0, 1.f);
+			float pyy = ry + (ROW_HEIGHT - ph) * 0.5f;
+			dl->AddRectFilled(ImVec2(ox + 50.f, pyy),
+			                  ImVec2(ox + 50.f + pw, pyy + ph),
+			                  with_a(pcol, a * 0.25f), ph * 0.5f);
+			dl->AddRect(ImVec2(ox + 50.f, pyy),
+			            ImVec2(ox + 50.f + pw, pyy + ph),
+			            with_a(pcol, a * 0.55f), ph * 0.5f, 0, 1.f);
 			dl->AddText(body_font, body_font->FontSize,
-				ImVec2(ox + 57.f, py + (ph - 11.f) * 0.5f),
-				with_a(pcol, a * row_a), state_str);
-		}
+				ImVec2(ox + 57.f, pyy + (ph - 11.f) * 0.5f),
+				with_a(pcol, a), state_str);
 
-		char abuf[20];
-		std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, bp.address);
-		dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 100.f, ry + 5.f),
-		            with_a(t.text_address, a * row_a), abuf);
+			char abuf[20];
+			std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, bp.address);
+			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 130.f, ry + 5.f),
+			            with_a(t.text_address, a), abuf);
 
-		static const char* type_names[] = {"SW", "HW_EXEC", "HW_WRITE", "HW_READ", "MEM"};
-		static const aida::ui::pill_kind_t type_kinds[] = {
-			aida::ui::pill_kind_t::neutral,
-			aida::ui::pill_kind_t::accent,
-			aida::ui::pill_kind_t::warning,
-			aida::ui::pill_kind_t::info,
-			aida::ui::pill_kind_t::success
-		};
-		int ti = static_cast<int>(bp.type);
-		if (ti < 0) ti = 0;
-		if (ti >= 5) ti = 0;
-		ImU32 type_col;
-		switch (type_kinds[ti]) {
-			case aida::ui::pill_kind_t::accent:  type_col = t.accent_u32; break;
-			case aida::ui::pill_kind_t::warning: type_col = t.warning;    break;
-			case aida::ui::pill_kind_t::info:    type_col = t.info;       break;
-			case aida::ui::pill_kind_t::success: type_col = t.success;    break;
-			default:                             type_col = t.text_secondary; break;
-		}
-		{
+			static const char* type_names[] = {"SW", "HW_EXEC", "HW_WRITE", "HW_READ", "MEM"};
+			int ti = static_cast<int>(bp.type);
+			if (ti < 0 || ti >= 5) ti = 0;
+			ImU32 type_col = t.accent_u32;
+			switch (ti) {
+				case 0: type_col = t.text_secondary; break;
+				case 1: type_col = t.accent_u32;     break;
+				case 2: type_col = t.warning;        break;
+				case 3: type_col = t.info;           break;
+				case 4: type_col = t.success;        break;
+			}
 			const char* lbl = type_names[ti];
-			ImVec2 ts = body_font->CalcTextSizeA(body_font->FontSize, FLT_MAX, 0.f, lbl);
-			float bw = ts.x + 12.f;
+			ImVec2 tssz = body_font->CalcTextSizeA(body_font->FontSize, FLT_MAX, 0.f, lbl);
+			float bw = tssz.x + 12.f;
 			float bh = 16.f;
-			float bx = ox + 270.f;
+			float bx = ox + 300.f;
 			float by = ry + (ROW_HEIGHT - bh) * 0.5f;
 			dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh),
-			                  with_a(type_col, a * row_a * 0.85f), 4.f);
-			ImU32 tx_col = with_a(IM_COL32(255, 255, 255, 245), a * row_a);
+			                  with_a(type_col, a * 0.85f), 4.f);
 			dl->AddText(body_font, body_font->FontSize,
 				ImVec2(bx + 6.f, by + (bh - 11.f) * 0.5f),
-				tx_col, lbl);
+				with_a(IM_COL32(255, 255, 255, 245), a), lbl);
+
+			char hits_buf[16];
+			std::snprintf(hits_buf, sizeof(hits_buf), "%d", bp.hit_count);
+			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 420.f, ry + 5.f),
+			            with_a(t.text_secondary, a), hits_buf);
+
+			if (!bp.name.empty())
+				dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 490.f, ry + 5.f),
+				            with_a(t.text_primary, a), bp.name.c_str());
+
+			if (clicked) ui.bp_panel.selected = i;
+			if (dclicked) debugger_engine::toggle_breakpoint(i);
+			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+				copy_addr_to_clipboard(bp.address);
+			if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Right))
+				jump_to_disasm(bp.address);
 		}
-
-		if (!bp.name.empty())
-			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 390.f, ry + 5.f),
-			            with_a(t.text_primary, a * row_a), bp.name.c_str());
-
-		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-			ui.bp_panel.selected = i;
-		if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-			debugger_engine::toggle_breakpoint(i);
 	}
+	clipper.End();
 
-	ImGui::PopClipRect();
+	ImGui::EndChild();
+	ImGui::PopID();
 
-	if (total > visible_h) {
-		ui_anim::render_custom_scrollbar(dl, ox + w - 8.f, content_y, 8.f, visible_h,
-			ui.bp_panel.scroll_y, total, visible_h, a,
-			ui.bp_panel.scrollbar_dragging, ui.bp_panel.scrollbar_drag_offset);
-	}
-
-	if (st.breakpoints.empty()) {
+	if (snapshot.empty()) {
 		aida::ui::empty_state::config_t es;
 		es.glyph = aida::ui::empty_state::glyph_t::shield;
 		es.title = "No breakpoints set";
-		es.body  = "Double-click in the disassembly view to set a breakpoint.";
+		es.body  = "Type an address above and click Add to set a software breakpoint.";
 		aida::ui::empty_state::render(ImVec2(ox, content_y), ImVec2(w, visible_h), es);
 	}
 }
 
 
 static void render_memmap(ImDrawList* dl, float ox, float oy, float w, float h, float a) {
+	(void)dl;
 	memory_map_view::render(ox, oy, w, h, a,
 		aida::ui::resolved().accent.x,
 		aida::ui::resolved().accent.y,
@@ -1308,7 +1556,6 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 	auto& st = debugger_engine::g_state;
 	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
-	float dt = aida::ui::clock::dt();
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + HEADER_H),
 	                  with_a(t.panel_header, a));
@@ -1316,23 +1563,37 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 	if (!cap_font) cap_font = ImGui::GetFont();
 	dl->AddText(cap_font, cap_font->FontSize, ImVec2(ox + 12.f, oy + (HEADER_H - cap_font->FontSize) * 0.5f),
 	            with_a(t.text_dim, a), "CALL STACK");
+	const char* hint = "double-click to jump, right-click to copy address";
+	ImVec2 hs = cap_font->CalcTextSizeA(cap_font->FontSize, FLT_MAX, 0.f, hint);
+	dl->AddText(cap_font, cap_font->FontSize,
+		ImVec2(ox + w - hs.x - 12.f, oy + (HEADER_H - cap_font->FontSize) * 0.5f),
+		with_a(t.text_dim, a * 0.8f), hint);
 	dl->AddLine(ImVec2(ox, oy + HEADER_H - 0.5f),
 	            ImVec2(ox + w, oy + HEADER_H - 0.5f),
 	            with_a(t.border_subtle, a));
 
-	std::lock_guard<std::mutex> lk(st.stack_mutex);
+	std::vector<debugger_engine::stack_frame_t> snapshot;
+	{
+		std::lock_guard<std::mutex> lk(st.stack_mutex);
+		snapshot = st.call_stack;
+	}
 
 	float card_pad = 10.f;
 	float card_h = 56.f;
 	float gap = 6.f;
+	float row_h = card_h + gap;
 	float content_y = oy + HEADER_H + card_pad;
-	float content_total = static_cast<float>(st.call_stack.size()) * (card_h + gap);
 	float visible_h = h - HEADER_H - card_pad * 2.f;
+	int total_n = static_cast<int>(snapshot.size());
 
-	handle_list_scroll(&ui.callstack_panel.scroll_y, &ui.callstack_panel.target_scroll_y,
-		content_total, visible_h, card_h + gap, ox, content_y, w, dt);
+	std::map<std::string, int> recurse_count;
+	for (const auto& f : snapshot)
+		++recurse_count[f.module_name + "!" + f.function_name];
 
-	ImGui::PushClipRect(ImVec2(ox, content_y), ImVec2(ox + w, content_y + visible_h), true);
+	ImGui::SetCursorScreenPos(ImVec2(ox, content_y));
+	ImGui::PushID("##cs_list");
+	ImGui::BeginChild("##cs_list_child", ImVec2(w, visible_h), false,
+		ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
 	ImFont* body_font = aida::ui::fonts::body_em();
 	if (!body_font) body_font = ImGui::GetFont();
@@ -1341,105 +1602,102 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 	ImFont* dim_font = aida::ui::fonts::caption();
 	if (!dim_font) dim_font = ImGui::GetFont();
 
-	std::map<std::string, int> recurse_count;
-	for (const auto& f : st.call_stack)
-		++recurse_count[f.module_name + "!" + f.function_name];
+	ImGuiListClipper clipper;
+	clipper.Begin(total_n, row_h);
+	while (clipper.Step()) {
+		for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+			auto& f = snapshot[static_cast<size_t>(i)];
+			float cy = content_y + static_cast<float>(i) * row_h - ImGui::GetScrollY();
 
-	for (int i = 0; i < static_cast<int>(st.call_stack.size()); ++i) {
-		auto& f = st.call_stack[static_cast<size_t>(i)];
-		float cy = content_y + static_cast<float>(i) * (card_h + gap) - ui.callstack_panel.scroll_y;
-		if (cy + card_h < content_y) continue;
-		if (cy > content_y + visible_h) break;
+			float card_x = ox + 12.f;
+			float card_w = w - 36.f;
 
-		bool sel = (ui.callstack_panel.selected == i);
-		float card_x = ox + 12.f;
-		float card_w = w - 24.f;
-		ImVec2 ca(card_x, cy);
-		ImVec2 cb(card_x + card_w, cy + card_h);
+			ImGui::SetCursorScreenPos(ImVec2(card_x, cy));
+			ImGui::PushID(i);
+			ImGui::InvisibleButton("##cs_card", ImVec2(card_w, card_h));
+			bool hov = ImGui::IsItemHovered();
+			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+			bool dclicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && hov;
+			ImGui::PopID();
 
-		bool hov = ImGui::IsMouseHoveringRect(ca, cb, false);
-		float row_a = ui_anim::render_row_entrance(i,
-			aida::ui::clock::seconds(), 0.014f, 0.32f);
-		float lift = hov ? 2.f : 0.f;
-		ca.y -= lift; cb.y -= lift;
+			bool sel = (ui.callstack_panel.selected == i);
+			ImVec2 ca(card_x, cy);
+			ImVec2 cb(card_x + card_w, cy + card_h);
 
-		if (hov) {
-			for (int g = 0; g < 4; ++g) {
-				float spread = static_cast<float>(g + 1) * 1.5f;
-				dl->AddRectFilled(
-					ImVec2(ca.x - spread, ca.y - spread + 3.f),
-					ImVec2(cb.x + spread, cb.y + spread + 3.f),
-					IM_COL32(0, 0, 0, static_cast<int>(15 * a * row_a * (1.f - static_cast<float>(g) / 4.f))),
-					8.f + spread);
+			float lift = hov ? 2.f : 0.f;
+			ca.y -= lift; cb.y -= lift;
+
+			if (hov) {
+				for (int g = 0; g < 4; ++g) {
+					float spread = static_cast<float>(g + 1) * 1.5f;
+					dl->AddRectFilled(
+						ImVec2(ca.x - spread, ca.y - spread + 3.f),
+						ImVec2(cb.x + spread, cb.y + spread + 3.f),
+						IM_COL32(0, 0, 0, static_cast<int>(15 * a * (1.f - static_cast<float>(g) / 4.f))),
+						8.f + spread);
+				}
 			}
-		}
 
-		ImU32 fill = aida::ui::mix(t.panel_bg, t.accent_glow, hov ? 0.20f : 0.f);
-		dl->AddRectFilled(ca, cb, with_a(fill, a * row_a * 0.95f), 8.f);
-		dl->AddRectFilled(ca, cb, with_a(t.glass_tint, a * row_a * 0.55f), 8.f);
-		ImU32 border = sel ? t.accent_u32 : t.border_subtle;
-		dl->AddRect(ca, cb, with_a(border, a * row_a * (sel ? 0.95f : 0.7f)), 8.f, 0,
-			sel ? 1.5f : 1.f);
+			ImU32 fill = aida::ui::mix(t.panel_bg, t.accent_glow, hov ? 0.20f : 0.f);
+			dl->AddRectFilled(ca, cb, with_a(fill, a * 0.95f), 8.f);
+			dl->AddRectFilled(ca, cb, with_a(t.glass_tint, a * 0.55f), 8.f);
+			ImU32 border = sel ? t.accent_u32 : t.border_subtle;
+			dl->AddRect(ca, cb, with_a(border, a * (sel ? 0.95f : 0.7f)), 8.f, 0,
+				sel ? 1.5f : 1.f);
 
-		if (sel) {
-			dl->AddRectFilled(ImVec2(ca.x, ca.y), ImVec2(ca.x + 3.f, cb.y),
-			                  with_a(t.accent_u32, a * row_a), 1.f);
-		}
+			if (sel) {
+				dl->AddRectFilled(ImVec2(ca.x, ca.y), ImVec2(ca.x + 3.f, cb.y),
+				                  with_a(t.accent_u32, a), 1.f);
+			}
 
-		char idx_buf[12];
-		std::snprintf(idx_buf, sizeof(idx_buf), "#%d", i);
-		dl->AddText(dim_font, dim_font->FontSize, ImVec2(ca.x + 12.f, ca.y + 8.f),
-		            with_a(t.text_dim, a * row_a), idx_buf);
+			char idx_buf[12];
+			std::snprintf(idx_buf, sizeof(idx_buf), "#%d", i);
+			dl->AddText(dim_font, dim_font->FontSize, ImVec2(ca.x + 12.f, ca.y + 8.f),
+			            with_a(t.text_dim, a), idx_buf);
 
-		std::string mod_label = f.module_name.empty() ? std::string("<unknown>") : f.module_name;
-		dl->AddText(body_font, body_font->FontSize, ImVec2(ca.x + 44.f, ca.y + 6.f),
-		            with_a(t.text_primary, a * row_a), mod_label.c_str());
+			std::string mod_label = f.module_name.empty() ? std::string("<unknown>") : f.module_name;
+			dl->AddText(body_font, body_font->FontSize, ImVec2(ca.x + 44.f, ca.y + 6.f),
+			            with_a(t.text_primary, a), mod_label.c_str());
 
-		std::string func = f.function_name.empty() ? std::string("?") : f.function_name;
-		char fn_buf[256];
-		std::snprintf(fn_buf, sizeof(fn_buf), "%s + 0x%" PRIX64,
-			func.c_str(), f.module_offset);
-		dl->AddText(code_font, code_font->FontSize, ImVec2(ca.x + 44.f, ca.y + 24.f),
-		            with_a(t.syn_function, a * row_a), fn_buf);
+			std::string func = f.function_name.empty() ? std::string("?") : f.function_name;
+			char fn_buf[256];
+			std::snprintf(fn_buf, sizeof(fn_buf), "%s + 0x%" PRIX64,
+				func.c_str(), f.module_offset);
+			dl->AddText(code_font, code_font->FontSize, ImVec2(ca.x + 44.f, ca.y + 24.f),
+			            with_a(t.syn_function, a), fn_buf);
 
-		char abuf[24];
-		std::snprintf(abuf, sizeof(abuf), "0x%016" PRIX64, f.address);
-		dl->AddText(code_font, code_font->FontSize, ImVec2(ca.x + 44.f, ca.y + 40.f),
-		            with_a(t.text_address, a * row_a), abuf);
+			char abuf[24];
+			std::snprintf(abuf, sizeof(abuf), "0x%016" PRIX64, f.address);
+			dl->AddText(code_font, code_font->FontSize, ImVec2(ca.x + 44.f, ca.y + 40.f),
+			            with_a(t.text_address, a), abuf);
 
-		std::string key = f.module_name + "!" + f.function_name;
-		int rec = recurse_count[key];
-		if (rec > 1) {
-			char rec_buf[24];
-			std::snprintf(rec_buf, sizeof(rec_buf), "x%d recursive", rec);
-			ImVec2 rs = body_font->CalcTextSizeA(body_font->FontSize, FLT_MAX, 0.f, rec_buf);
-			float rx = cb.x - rs.x - 22.f;
-			float ry2 = ca.y + 6.f;
-			dl->AddRectFilled(ImVec2(rx - 6.f, ry2 - 1.f),
-			                  ImVec2(rx + rs.x + 6.f, ry2 + 14.f),
-			                  with_a(t.warning, a * row_a * 0.18f), 4.f);
-			dl->AddText(body_font, body_font->FontSize, ImVec2(rx, ry2),
-			            with_a(t.warning, a * row_a), rec_buf);
-		}
+			std::string key = f.module_name + "!" + f.function_name;
+			int rec = recurse_count[key];
+			if (rec > 1) {
+				char rec_buf[24];
+				std::snprintf(rec_buf, sizeof(rec_buf), "x%d recursive", rec);
+				ImVec2 rs = body_font->CalcTextSizeA(body_font->FontSize, FLT_MAX, 0.f, rec_buf);
+				float rx = cb.x - rs.x - 22.f;
+				float ry2 = ca.y + 6.f;
+				dl->AddRectFilled(ImVec2(rx - 6.f, ry2 - 1.f),
+				                  ImVec2(rx + rs.x + 6.f, ry2 + 14.f),
+				                  with_a(t.warning, a * 0.18f), 4.f);
+				dl->AddText(body_font, body_font->FontSize, ImVec2(rx, ry2),
+				            with_a(t.warning, a), rec_buf);
+			}
 
-		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-			ui.callstack_panel.selected = i;
-		if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-			globals::ui::active_center_view = center_view_t::disassembly;
-			disasm_view::goto_address(f.address, g_disasm);
+			if (clicked) ui.callstack_panel.selected = i;
+			if (dclicked) jump_to_disasm(f.address);
+			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+				copy_addr_to_clipboard(f.address);
 		}
 	}
+	clipper.End();
 
-	ImGui::PopClipRect();
+	ImGui::EndChild();
+	ImGui::PopID();
 
-	if (content_total > visible_h) {
-		ui_anim::render_custom_scrollbar(dl, ox + w - 8.f, content_y, 8.f, visible_h,
-			ui.callstack_panel.scroll_y, content_total, visible_h, a,
-			ui.callstack_panel.scrollbar_dragging,
-			ui.callstack_panel.scrollbar_drag_offset);
-	}
-
-	if (st.call_stack.empty()) {
+	if (snapshot.empty()) {
 		aida::ui::empty_state::config_t es;
 		es.glyph = aida::ui::empty_state::glyph_t::layers;
 		es.title = "No call stack";
@@ -1456,119 +1714,139 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 
 	{
 		ui_anim::table_col_t cols[] = {
-			{"TID", 80.f}, {"Owner PID", 110.f}, {"Priority", 100.f},
-			{"State", 110.f}, {"RIP", 200.f}
+			{"TID", 90.f}, {"Priority", 80.f}, {"State", 110.f},
+			{"RIP", 200.f}, {"Actions", 0.f}
 		};
 		draw_table_header(dl, ox, oy, w, cols, 5, a);
 	}
 
 	debugger_engine::request_thread_refresh(250);
 	auto threads = debugger_engine::cached_thread_list();
+	int total_n = static_cast<int>(threads.size());
 	float content_y = oy + HEADER_H;
 	float visible_h = h - HEADER_H;
-	float total = static_cast<float>(threads.size()) * ROW_HEIGHT;
 
-	handle_list_scroll(&ui.threads_panel.scroll_y, &ui.threads_panel.target_scroll_y,
-		total, visible_h, ROW_HEIGHT, ox, content_y, w, dt);
-
-	ImGui::PushClipRect(ImVec2(ox, content_y), ImVec2(ox + w, content_y + visible_h), true);
+	ImGui::SetCursorScreenPos(ImVec2(ox, content_y));
+	ImGui::PushID("##th_list");
+	ImGui::BeginChild("##th_list_child", ImVec2(w, visible_h), false,
+		ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
 	ImFont* body_font = aida::ui::fonts::body();
 	if (!body_font) body_font = ImGui::GetFont();
 	ImFont* code_font = aida::ui::fonts::code();
 	if (!code_font) code_font = ImGui::GetFont();
 
-	for (int ti = 0; ti < static_cast<int>(threads.size()); ++ti) {
-		float ry = content_y + static_cast<float>(ti) * ROW_HEIGHT - ui.threads_panel.scroll_y;
-		if (ry + ROW_HEIGHT < content_y) continue;
-		if (ry > content_y + visible_h) break;
+	float row_h = ROW_HEIGHT + 4.f;
 
-		auto& th = threads[static_cast<size_t>(ti)];
-		bool sel = (ui.threads_panel.selected == ti);
-		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry),
-			ImVec2(ox + w, ry + ROW_HEIGHT), false);
-		float row_a = ui_anim::render_row_entrance(ti,
-			aida::ui::clock::seconds(), 0.012f, 0.30f);
-		draw_row_bg(dl, ox, ry, w, ROW_HEIGHT, sel, hov, ti, row_a, a);
+	ImGuiListClipper clipper;
+	clipper.Begin(total_n, row_h);
+	while (clipper.Step()) {
+		for (int ti = clipper.DisplayStart; ti < clipper.DisplayEnd; ++ti) {
+			float ry = content_y + static_cast<float>(ti) * row_h - ImGui::GetScrollY();
 
-		if (ti < 256 && th.state != ui.prev_thread_state[ti]) {
-			ui.thread_state_flash[ti] = 1.f;
-			ui.prev_thread_state[ti] = th.state;
+			ImGui::SetCursorScreenPos(ImVec2(ox, ry));
+			ImGui::PushID(ti);
+			ImGui::InvisibleButton("##th_row", ImVec2(w - 18.f - 180.f, row_h));
+			bool hov = ImGui::IsItemHovered();
+			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+			ImGui::PopID();
+
+			auto& th = threads[static_cast<size_t>(ti)];
+			bool sel = (ui.threads_panel.selected == ti);
+
+			draw_row_bg(dl, ox, ry, w, row_h, sel, hov, ti, 1.f, a);
+
+			if (ti < 256 && th.state != ui.prev_thread_state[ti]) {
+				ui.thread_state_flash[ti] = 1.f;
+				ui.prev_thread_state[ti] = th.state;
+			}
+			if (ti < 256)
+				ui_anim::decay_flash(ui.thread_state_flash[ti], 1.5f, dt);
+
+			char tbuf[12];
+			std::snprintf(tbuf, sizeof(tbuf), "%u", th.tid);
+			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 8.f, ry + 7.f),
+			            with_a(t.text_address, a), tbuf);
+
+			char prbuf[12];
+			std::snprintf(prbuf, sizeof(prbuf), "%d", th.priority);
+			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 100.f, ry + 7.f),
+			            with_a(t.text_secondary, a), prbuf);
+
+			const char* state_str;
+			ImU32 pcol = t.text_secondary;
+			switch (th.state) {
+				case 0: state_str = "INITIALIZED"; pcol = t.info;    break;
+				case 1: state_str = "READY";       pcol = t.info;    break;
+				case 2: state_str = "RUNNING";     pcol = t.success; break;
+				case 3: state_str = "STANDBY";     pcol = t.info;    break;
+				case 4: state_str = "TERMINATED";  pcol = t.error;   break;
+				case 5: state_str = "WAITING";     pcol = t.warning; break;
+				case 6: state_str = "TRANSITION";  pcol = t.warning; break;
+				default: state_str = "UNKNOWN";    pcol = t.text_secondary; break;
+			}
+			ImVec2 ss = body_font->CalcTextSizeA(body_font->FontSize, FLT_MAX, 0.f, state_str);
+			float pw = ss.x + 22.f;
+			float ph = 16.f;
+			float pyy = ry + (row_h - ph) * 0.5f;
+			float px = ox + 180.f;
+			dl->AddRectFilled(ImVec2(px, pyy), ImVec2(px + pw, pyy + ph),
+			                  with_a(pcol, a * 0.22f), ph * 0.5f);
+			dl->AddRect(ImVec2(px, pyy), ImVec2(px + pw, pyy + ph),
+			            with_a(pcol, a * 0.55f), ph * 0.5f, 0, 1.f);
+			float dot_pulse = (ti < 256) ? (0.5f + ui.thread_state_flash[ti] * 0.5f) : 0.55f;
+			dot_pulse += aida::ui::clock::pulse(1.6f, 0.f, 0.4f);
+			if (dot_pulse > 1.f) dot_pulse = 1.f;
+			dl->AddCircleFilled(ImVec2(px + 9.f, pyy + ph * 0.5f), 3.f,
+			                    with_a(pcol, a * dot_pulse), 14);
+			dl->AddText(body_font, body_font->FontSize,
+				ImVec2(px + 16.f, pyy + (ph - 11.f) * 0.5f),
+				with_a(pcol, a), state_str);
+
+			if (th.rip != 0) {
+				char rbuf[20];
+				std::snprintf(rbuf, sizeof(rbuf), "0x%016" PRIX64, th.rip);
+				dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 300.f, ry + 7.f),
+				            with_a(t.text_address, a * 0.85f), rbuf);
+			}
+
+			float actions_x = ox + 500.f;
+			float btn_w = 56.f;
+			float btn_h = 22.f;
+			float btn_y = ry + (row_h - btn_h) * 0.5f;
+			float btn_g = 4.f;
+
+			ImGui::SetCursorScreenPos(ImVec2(actions_x, btn_y));
+			ImGui::PushID(ti + 0x20000);
+			bool susp = aida::ui::button("Susp", aida::ui::button_kind_t::secondary,
+				aida::ui::size_t_::sm, ImVec2(btn_w, btn_h));
+			ImGui::PopID();
+			if (susp) {
+				uint32_t prev = 0;
+				driver_bridge::suspend_thread(th.tid, &prev);
+			}
+
+			ImGui::SetCursorScreenPos(ImVec2(actions_x + btn_w + btn_g, btn_y));
+			ImGui::PushID(ti + 0x30000);
+			bool res = aida::ui::button("Resume", aida::ui::button_kind_t::secondary,
+				aida::ui::size_t_::sm, ImVec2(btn_w + 6.f, btn_h));
+			ImGui::PopID();
+			if (res) {
+				uint32_t prev = 0;
+				driver_bridge::resume_thread(th.tid, &prev);
+			}
+
+			if (clicked) ui.threads_panel.selected = ti;
+			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && th.rip != 0)
+				copy_addr_to_clipboard(th.rip);
+			if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && th.rip != 0)
+				jump_to_disasm(th.rip);
 		}
-		if (ti < 256)
-			ui_anim::decay_flash(ui.thread_state_flash[ti], 1.5f, dt);
-
-		char tbuf[12];
-		std::snprintf(tbuf, sizeof(tbuf), "%u", th.tid);
-		dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 8.f, ry + 5.f),
-		            with_a(t.text_address, a * row_a), tbuf);
-
-		char pbuf[12];
-		std::snprintf(pbuf, sizeof(pbuf), "%u", th.owner_pid);
-		dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 90.f, ry + 5.f),
-		            with_a(t.text_primary, a * row_a), pbuf);
-
-		char prbuf[12];
-		std::snprintf(prbuf, sizeof(prbuf), "%d", th.priority);
-		dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 200.f, ry + 5.f),
-		            with_a(t.text_secondary, a * row_a), prbuf);
-
-		const char* state_str;
-		aida::ui::pill_kind_t kind;
-		switch (th.state) {
-			case 0: state_str = "INITIALIZED"; kind = aida::ui::pill_kind_t::info; break;
-			case 1: state_str = "READY";       kind = aida::ui::pill_kind_t::info; break;
-			case 2: state_str = "RUNNING";     kind = aida::ui::pill_kind_t::success; break;
-			case 3: state_str = "STANDBY";     kind = aida::ui::pill_kind_t::info; break;
-			case 4: state_str = "TERMINATED";  kind = aida::ui::pill_kind_t::error; break;
-			case 5: state_str = "WAITING";     kind = aida::ui::pill_kind_t::warning; break;
-			case 6: state_str = "TRANSITION";  kind = aida::ui::pill_kind_t::warning; break;
-			default: state_str = "UNKNOWN";    kind = aida::ui::pill_kind_t::neutral; break;
-		}
-		ImU32 pcol;
-		switch (kind) {
-			case aida::ui::pill_kind_t::success: pcol = t.success; break;
-			case aida::ui::pill_kind_t::warning: pcol = t.warning; break;
-			case aida::ui::pill_kind_t::error:   pcol = t.error;   break;
-			case aida::ui::pill_kind_t::info:    pcol = t.info;    break;
-			default:                             pcol = t.text_secondary; break;
-		}
-		ImVec2 ss = body_font->CalcTextSizeA(body_font->FontSize, FLT_MAX, 0.f, state_str);
-		float pw = ss.x + 22.f;
-		float ph = 16.f;
-		float py = ry + (ROW_HEIGHT - ph) * 0.5f;
-		float px = ox + 290.f;
-		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
-		                  with_a(pcol, a * row_a * 0.22f), ph * 0.5f);
-		dl->AddRect(ImVec2(px, py), ImVec2(px + pw, py + ph),
-		            with_a(pcol, a * row_a * 0.55f), ph * 0.5f, 0, 1.f);
-		float dot_pulse = (ti < 256) ? (0.5f + ui.thread_state_flash[ti] * 0.5f) : 0.55f;
-		dot_pulse += aida::ui::clock::pulse(1.6f, 0.f, 0.4f);
-		if (dot_pulse > 1.f) dot_pulse = 1.f;
-		dl->AddCircleFilled(ImVec2(px + 9.f, py + ph * 0.5f), 3.f,
-		                    with_a(pcol, a * row_a * dot_pulse), 14);
-		dl->AddText(body_font, body_font->FontSize,
-			ImVec2(px + 16.f, py + (ph - 11.f) * 0.5f),
-			with_a(pcol, a * row_a), state_str);
-
-		if (th.rip != 0) {
-			char rbuf[20];
-			std::snprintf(rbuf, sizeof(rbuf), "0x%016" PRIX64, th.rip);
-			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 410.f, ry + 5.f),
-			            with_a(t.text_address, a * row_a * 0.85f), rbuf);
-		}
-
-		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-			ui.threads_panel.selected = ti;
 	}
+	clipper.End();
 
-	ImGui::PopClipRect();
-
-	if (total > visible_h) {
-		ui_anim::render_custom_scrollbar(dl, ox + w - 8.f, content_y, 8.f, visible_h,
-			ui.threads_panel.scroll_y, total, visible_h, a,
-			ui.threads_panel.scrollbar_dragging, ui.threads_panel.scrollbar_drag_offset);
-	}
+	ImGui::EndChild();
+	ImGui::PopID();
 
 	if (threads.empty()) {
 		aida::ui::empty_state::config_t es;
@@ -1584,68 +1862,129 @@ static void render_watches(ImDrawList* dl, float ox, float oy, float w, float h,
 	auto& st = debugger_engine::g_state;
 	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
-	float dt = aida::ui::clock::dt();
 
+	float bar_h = 40.f;
+	float input_w = w * 0.55f;
+	float btn_gap = 6.f;
+	ImGui::SetCursorScreenPos(ImVec2(ox + 8.f, oy + 2.f));
+	ImGui::PushID("##w_actions");
+	aida::ui::input_text("##w_expr", ui.add_watch_buf, sizeof(ui.add_watch_buf),
+		"watch: RAX, [RBX+0x10], or 0x...",
+		false, ImVec2(input_w, bar_h - 8.f));
+	ImGui::SameLine(0.f, btn_gap);
+	bool add_clicked = aida::ui::button("Add Watch", aida::ui::button_kind_t::primary,
+		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
+	if (add_clicked && ui.add_watch_buf[0]) {
+		debugger_engine::add_watch(ui.add_watch_buf);
+		ui.add_watch_buf[0] = '\0';
+	}
+	ImGui::SameLine(0.f, btn_gap);
+	bool refresh_clicked = aida::ui::button("Refresh", aida::ui::button_kind_t::secondary,
+		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
+	if (refresh_clicked) {
+		debugger_engine::refresh_watches();
+	}
+	ImGui::PopID();
+
+	float table_y = oy + bar_h;
 	{
-		ui_anim::table_col_t cols[] = {{"Expression", 220.f}, {"Type", 120.f}, {"Value", 280.f}};
-		draw_table_header(dl, ox, oy, w, cols, 3, a);
+		ui_anim::table_col_t cols[] = {
+			{"Expression", 220.f}, {"Resolved Address", 180.f},
+			{"Value", 220.f}, {"Actions", 0.f}
+		};
+		draw_table_header(dl, ox, table_y, w, cols, 4, a);
 	}
 
-	std::lock_guard<std::mutex> lk(st.watch_mutex);
-	float content_y = oy + HEADER_H;
-	float visible_h = h - HEADER_H;
-	float total = static_cast<float>(st.watches.size()) * ROW_HEIGHT;
+	std::vector<debugger_engine::watch_entry_t> snapshot;
+	{
+		std::lock_guard<std::mutex> lk(st.watch_mutex);
+		snapshot = st.watches;
+	}
+	int total_n = static_cast<int>(snapshot.size());
+	float content_y = table_y + HEADER_H;
+	float visible_h = h - bar_h - HEADER_H;
 
-	handle_list_scroll(&ui.watch_panel.scroll_y, &ui.watch_panel.target_scroll_y,
-		total, visible_h, ROW_HEIGHT, ox, content_y, w, dt);
+	auto regs = debugger_engine::cached_registers();
 
-	ImGui::PushClipRect(ImVec2(ox, content_y), ImVec2(ox + w, content_y + visible_h), true);
+	ImGui::SetCursorScreenPos(ImVec2(ox, content_y));
+	ImGui::PushID("##w_list");
+	ImGui::BeginChild("##w_list_child", ImVec2(w, visible_h), false,
+		ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
 	ImFont* body_font = aida::ui::fonts::body();
 	if (!body_font) body_font = ImGui::GetFont();
 	ImFont* code_font = aida::ui::fonts::code();
 	if (!code_font) code_font = ImGui::GetFont();
 
-	for (int i = 0; i < static_cast<int>(st.watches.size()); ++i) {
-		float ry = content_y + static_cast<float>(i) * ROW_HEIGHT - ui.watch_panel.scroll_y;
-		if (ry + ROW_HEIGHT < content_y) continue;
-		if (ry > content_y + visible_h) break;
-		auto& w_entry = st.watches[static_cast<size_t>(i)];
-		bool sel = (ui.watch_panel.selected == i);
-		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry),
-			ImVec2(ox + w, ry + ROW_HEIGHT), false);
-		float row_a = ui_anim::render_row_entrance(i,
-			aida::ui::clock::seconds(), 0.012f, 0.30f);
-		draw_row_bg(dl, ox, ry, w, ROW_HEIGHT, sel, hov, i, row_a, a);
+	float row_h = ROW_HEIGHT + 4.f;
+	ImGuiListClipper clipper;
+	clipper.Begin(total_n, row_h);
+	while (clipper.Step()) {
+		for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+			float ry = content_y + static_cast<float>(i) * row_h - ImGui::GetScrollY();
+			auto& w_entry = snapshot[static_cast<size_t>(i)];
+			bool sel = (ui.watch_panel.selected == i);
 
-		dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 10.f, ry + 5.f),
-		            with_a(t.text_primary, a * row_a), w_entry.expression.c_str());
-		dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 230.f, ry + 5.f),
-		            with_a(t.syn_type, a * row_a), w_entry.type.c_str());
-		ImU32 vcol = w_entry.valid ? t.success : t.error;
-		const char* value_text = w_entry.valid
-			? w_entry.value.c_str()
-			: (w_entry.error.empty() ? "<error>" : w_entry.error.c_str());
-		dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 350.f, ry + 5.f),
-		            with_a(vcol, a * row_a), value_text);
+			ImGui::SetCursorScreenPos(ImVec2(ox, ry));
+			ImGui::PushID(i);
+			ImGui::InvisibleButton("##w_row", ImVec2(w - 18.f - 90.f, row_h));
+			bool hov = ImGui::IsItemHovered();
+			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+			ImGui::PopID();
 
-		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-			ui.watch_panel.selected = i;
+			draw_row_bg(dl, ox, ry, w, row_h, sel, hov, i, 1.f, a);
+
+			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 10.f, ry + 7.f),
+			            with_a(t.text_primary, a), w_entry.expression.c_str());
+
+			bool deref = false;
+			bool ok = false;
+			uint64_t resolved = evaluate_watch_expression(w_entry.expression, regs, deref, ok);
+			char addr_buf[32];
+			if (ok) {
+				std::snprintf(addr_buf, sizeof(addr_buf), "%s0x%016" PRIX64,
+					deref ? "[*] " : "", resolved);
+			} else {
+				std::snprintf(addr_buf, sizeof(addr_buf), "?");
+			}
+			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 230.f, ry + 7.f),
+			            with_a(t.text_address, a), addr_buf);
+
+			ImU32 vcol = w_entry.valid ? t.success : t.error;
+			const char* value_text = w_entry.valid
+				? w_entry.value.c_str()
+				: (w_entry.error.empty() ? "<error>" : w_entry.error.c_str());
+			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 410.f, ry + 7.f),
+			            with_a(vcol, a), value_text);
+
+			float btn_x = ox + w - 84.f;
+			float btn_w = 64.f;
+			float btn_h = 22.f;
+			float btn_y = ry + (row_h - btn_h) * 0.5f;
+			ImGui::SetCursorScreenPos(ImVec2(btn_x, btn_y));
+			ImGui::PushID(i + 0x40000);
+			bool rm = aida::ui::button("Remove", aida::ui::button_kind_t::destructive,
+				aida::ui::size_t_::sm, ImVec2(btn_w, btn_h));
+			ImGui::PopID();
+			if (rm) debugger_engine::remove_watch(i);
+
+			if (clicked) ui.watch_panel.selected = i;
+			if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && ok && resolved != 0)
+				jump_to_hex(resolved, 256);
+			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && ok)
+				copy_addr_to_clipboard(resolved);
+		}
 	}
+	clipper.End();
 
-	ImGui::PopClipRect();
+	ImGui::EndChild();
+	ImGui::PopID();
 
-	if (total > visible_h) {
-		ui_anim::render_custom_scrollbar(dl, ox + w - 8.f, content_y, 8.f, visible_h,
-			ui.watch_panel.scroll_y, total, visible_h, a,
-			ui.watch_panel.scrollbar_dragging, ui.watch_panel.scrollbar_drag_offset);
-	}
-
-	if (st.watches.empty()) {
+	if (snapshot.empty()) {
 		aida::ui::empty_state::config_t es;
 		es.glyph = aida::ui::empty_state::glyph_t::dots;
 		es.title = "No watches added";
-		es.body  = "Add expressions to monitor while the target is paused.";
+		es.body  = "Add expressions like RAX, [RSP+8], or absolute addresses to monitor.";
 		aida::ui::empty_state::render(ImVec2(ox, content_y), ImVec2(w, visible_h), es);
 	}
 }
@@ -1657,43 +1996,59 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h, f
 	const auto& t = aida::ui::resolved();
 	float dt = aida::ui::clock::dt();
 
+	float bar_h = 40.f;
+	float input_w = w * 0.40f;
+	float btn_gap = 6.f;
+	ImGui::SetCursorScreenPos(ImVec2(ox + 8.f, oy + 2.f));
+	ImGui::PushID("##tr_actions");
+	aida::ui::input_text("##tr_filter", ui.trace_filter_buf, sizeof(ui.trace_filter_buf),
+		"filter trace by mnemonic or hex address",
+		false, ImVec2(input_w, bar_h - 8.f));
+	ImGui::SameLine(0.f, btn_gap);
+	bool tracing = st.tracing.load();
+	bool start_clicked = aida::ui::button(tracing ? "Stop Trace" : "Start Trace",
+		tracing ? aida::ui::button_kind_t::destructive : aida::ui::button_kind_t::primary,
+		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
+	if (start_clicked) {
+		if (tracing) debugger_engine::stop_trace();
+		else         debugger_engine::start_trace();
+	}
+	ImGui::SameLine(0.f, btn_gap);
+	bool clear_clicked = aida::ui::button("Clear",
+		aida::ui::button_kind_t::secondary,
+		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
+	if (clear_clicked) {
+		std::lock_guard<std::mutex> lk(st.trace_mutex);
+		st.trace_log.clear();
+	}
+	ImGui::PopID();
+
+	float table_y = oy + bar_h;
 	{
 		ui_anim::table_col_t cols[] = {{"#", 60.f}, {"Address", 170.f}, {"Instruction", 360.f}};
-		draw_table_header(dl, ox, oy, w, cols, 3, a);
+		draw_table_header(dl, ox, table_y, w, cols, 3, a);
 	}
 
-	bool tracing = st.tracing.load();
 	if (tracing) ui.record_pulse = ui_anim::smooth_lerp(ui.record_pulse, 1.f, 6.f, dt);
 	else         ui.record_pulse = ui_anim::smooth_lerp(ui.record_pulse, 0.f, 4.f, dt);
 
 	{
 		const char* status = tracing ? "REC" : "STOPPED";
-		aida::ui::pill_kind_t kind = tracing
-			? aida::ui::pill_kind_t::error
-			: aida::ui::pill_kind_t::neutral;
-		ImU32 pcol;
-		switch (kind) {
-			case aida::ui::pill_kind_t::error: pcol = t.error; break;
-			default:                           pcol = t.text_secondary; break;
-		}
+		ImU32 pcol = tracing ? t.error : t.text_secondary;
 		ImFont* sf = aida::ui::fonts::body_em();
 		if (!sf) sf = ImGui::GetFont();
 		ImVec2 sts = sf->CalcTextSizeA(sf->FontSize, FLT_MAX, 0.f, status);
 		float pw = sts.x + 32.f;
 		float ph = 18.f;
 		float px = ox + w - pw - 10.f;
-		float py = oy + (HEADER_H - ph) * 0.5f;
-
+		float py = table_y + (HEADER_H - ph) * 0.5f;
 		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
 		                  with_a(pcol, a * 0.22f), ph * 0.5f);
 		dl->AddRect(ImVec2(px, py), ImVec2(px + pw, py + ph),
 		            with_a(pcol, a * 0.55f), ph * 0.5f, 0, 1.f);
-
 		float pulse = aida::ui::clock::pulse(1.4f, 0.40f, 1.f);
 		float dot_a = tracing ? pulse : 0.55f;
-		float ring_progress = tracing
-			? aida::ui::clock::saw(2.0f)
-			: 0.f;
+		float ring_progress = tracing ? aida::ui::clock::saw(2.0f) : 0.f;
 		ImVec2 dc(px + 10.f, py + ph * 0.5f);
 		dl->AddCircle(dc, 6.f, with_a(pcol, a * 0.30f), 18, 1.f);
 		if (ring_progress > 0.001f) {
@@ -1708,68 +2063,88 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h, f
 			with_a(pcol, a), status);
 	}
 
-	std::lock_guard<std::mutex> lk(st.trace_mutex);
-	float content_y = oy + HEADER_H;
-	float visible_h = h - HEADER_H;
-	float total = static_cast<float>(st.trace_log.size()) * ROW_HEIGHT;
+	std::vector<debugger_engine::trace_record_t> snapshot;
+	{
+		std::lock_guard<std::mutex> lk(st.trace_mutex);
+		snapshot.reserve(st.trace_log.size());
+		std::string filter = ui.trace_filter_buf;
+		std::string filt_l;
+		for (char c : filter) filt_l.push_back(static_cast<char>(::tolower(static_cast<unsigned char>(c))));
+		for (auto& tr : st.trace_log) {
+			if (filt_l.empty()) {
+				snapshot.push_back(tr);
+				continue;
+			}
+			std::string text_l;
+			for (char c : tr.disasm_text) text_l.push_back(static_cast<char>(::tolower(static_cast<unsigned char>(c))));
+			char addr_buf[20];
+			std::snprintf(addr_buf, sizeof(addr_buf), "%" PRIx64, tr.address);
+			if (text_l.find(filt_l) != std::string::npos ||
+				std::strstr(addr_buf, filt_l.c_str()) != nullptr) {
+				snapshot.push_back(tr);
+			}
+		}
+	}
 
-	handle_list_scroll(&ui.trace_panel.scroll_y, &ui.trace_panel.target_scroll_y,
-		total, visible_h, ROW_HEIGHT, ox, content_y, w, dt);
+	int total_n = static_cast<int>(snapshot.size());
+	float content_y = table_y + HEADER_H;
+	float visible_h = h - bar_h - HEADER_H;
 
-	ImGui::PushClipRect(ImVec2(ox, content_y), ImVec2(ox + w, content_y + visible_h), true);
+	ImGui::SetCursorScreenPos(ImVec2(ox, content_y));
+	ImGui::PushID("##tr_list");
+	ImGui::BeginChild("##tr_list_child", ImVec2(w, visible_h), false,
+		ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
 	ImFont* body_font = aida::ui::fonts::body();
 	if (!body_font) body_font = ImGui::GetFont();
 	ImFont* code_font = aida::ui::fonts::code();
 	if (!code_font) code_font = ImGui::GetFont();
 
-	int total_n = static_cast<int>(st.trace_log.size());
-	int first = static_cast<int>(ui.trace_panel.scroll_y / ROW_HEIGHT);
-	if (first < 0) first = 0;
-	int last = std::min(total_n, first + static_cast<int>(visible_h / ROW_HEIGHT) + 2);
+	ImGuiListClipper clipper;
+	clipper.Begin(total_n, ROW_HEIGHT);
+	while (clipper.Step()) {
+		for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+			float ry = content_y + static_cast<float>(i) * ROW_HEIGHT - ImGui::GetScrollY();
+			auto& tr = snapshot[static_cast<size_t>(i)];
+			bool sel = (ui.trace_panel.selected == i);
 
-	for (int i = first; i < last; ++i) {
-		float ry = content_y + static_cast<float>(i) * ROW_HEIGHT - ui.trace_panel.scroll_y;
-		if (ry + ROW_HEIGHT < content_y) continue;
-		if (ry > content_y + visible_h) break;
+			ImGui::SetCursorScreenPos(ImVec2(ox, ry));
+			ImGui::PushID(i);
+			ImGui::InvisibleButton("##tr_row", ImVec2(w - 18.f, ROW_HEIGHT));
+			bool hov = ImGui::IsItemHovered();
+			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+			ImGui::PopID();
+			draw_row_bg(dl, ox, ry, w, ROW_HEIGHT, sel, hov, i, 1.f, a);
 
-		auto& tr = st.trace_log[static_cast<size_t>(i)];
-		bool sel = (ui.trace_panel.selected == i);
-		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry),
-			ImVec2(ox + w, ry + ROW_HEIGHT), false);
-		float row_a = ui_anim::render_row_entrance(i - first,
-			aida::ui::clock::seconds(), 0.010f, 0.28f);
-		draw_row_bg(dl, ox, ry, w, ROW_HEIGHT, sel, hov, i, row_a, a);
+			char ibuf[12];
+			std::snprintf(ibuf, sizeof(ibuf), "%d", tr.index);
+			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 8.f, ry + 5.f),
+			            with_a(t.text_dim, a), ibuf);
 
-		char ibuf[12];
-		std::snprintf(ibuf, sizeof(ibuf), "%d", tr.index);
-		dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 8.f, ry + 5.f),
-		            with_a(t.text_dim, a * row_a), ibuf);
+			char abuf[20];
+			std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, tr.address);
+			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 70.f, ry + 5.f),
+			            with_a(t.text_address, a), abuf);
+			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 240.f, ry + 5.f),
+			            with_a(t.text_primary, a), tr.disasm_text.c_str());
 
-		char abuf[20];
-		std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, tr.address);
-		dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 70.f, ry + 5.f),
-		            with_a(t.text_address, a * row_a), abuf);
-		dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 240.f, ry + 5.f),
-		            with_a(t.text_primary, a * row_a), tr.disasm_text.c_str());
-
-		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-			ui.trace_panel.selected = i;
+			if (clicked) ui.trace_panel.selected = i;
+			if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+				jump_to_disasm(tr.address);
+			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+				copy_addr_to_clipboard(tr.address);
+		}
 	}
+	clipper.End();
 
-	ImGui::PopClipRect();
+	ImGui::EndChild();
+	ImGui::PopID();
 
-	if (total > visible_h) {
-		ui_anim::render_custom_scrollbar(dl, ox + w - 8.f, content_y, 8.f, visible_h,
-			ui.trace_panel.scroll_y, total, visible_h, a,
-			ui.trace_panel.scrollbar_dragging, ui.trace_panel.scrollbar_drag_offset);
-	}
-
-	if (st.trace_log.empty() && !tracing) {
+	if (snapshot.empty() && !tracing) {
 		aida::ui::empty_state::config_t es;
 		es.glyph = aida::ui::empty_state::glyph_t::flow;
 		es.title = "Trace not recording";
-		es.body  = "Start a trace to capture executed instructions.";
+		es.body  = "Click Start Trace to capture executed instructions.";
 		aida::ui::empty_state::render(ImVec2(ox, content_y), ImVec2(w, visible_h), es);
 	}
 }
@@ -1779,79 +2154,109 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 	auto& st = debugger_engine::g_state;
 	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
-	float dt = aida::ui::clock::dt();
 
+	float bar_h = 40.f;
+	float input_w = w * 0.45f;
+	float btn_gap = 6.f;
+	ImGui::SetCursorScreenPos(ImVec2(ox + 8.f, oy + 2.f));
+	ImGui::PushID("##s_actions");
+	aida::ui::input_text("##s_filter", ui.string_filter, sizeof(ui.string_filter),
+		"filter strings by substring",
+		false, ImVec2(input_w, bar_h - 8.f));
+	ImGui::SameLine(0.f, btn_gap);
+	bool scan_clicked = aida::ui::button("Scan Strings",
+		aida::ui::button_kind_t::primary,
+		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
+	if (scan_clicked) {
+		debugger_engine::find_strings(static_cast<size_t>(std::max(2, ui.string_min_len)));
+	}
+	ImGui::PopID();
+
+	float table_y = oy + bar_h;
 	{
 		ui_anim::table_col_t cols[] = {
 			{"Address", 170.f}, {"String", 480.f}, {"Module", 140.f}
 		};
-		draw_table_header(dl, ox, oy, w, cols, 3, a);
+		draw_table_header(dl, ox, table_y, w, cols, 3, a);
 	}
 
-	std::lock_guard<std::mutex> lk(st.strings_mutex);
-	float content_y = oy + HEADER_H;
-	float visible_h = h - HEADER_H;
-	float total = static_cast<float>(st.strings.size()) * ROW_HEIGHT;
+	std::vector<debugger_engine::string_ref_t> snapshot;
+	{
+		std::lock_guard<std::mutex> lk(st.strings_mutex);
+		std::string filt;
+		for (char c : std::string(ui.string_filter))
+			filt.push_back(static_cast<char>(::tolower(static_cast<unsigned char>(c))));
+		snapshot.reserve(st.strings.size());
+		for (auto& sr : st.strings) {
+			if (filt.empty()) { snapshot.push_back(sr); continue; }
+			std::string v_l;
+			for (char c : sr.value) v_l.push_back(static_cast<char>(::tolower(static_cast<unsigned char>(c))));
+			if (v_l.find(filt) != std::string::npos)
+				snapshot.push_back(sr);
+		}
+	}
 
-	handle_list_scroll(&ui.strings_panel.scroll_y, &ui.strings_panel.target_scroll_y,
-		total, visible_h, ROW_HEIGHT, ox, content_y, w, dt);
+	int total_n = static_cast<int>(snapshot.size());
+	float content_y = table_y + HEADER_H;
+	float visible_h = h - bar_h - HEADER_H;
 
-	ImGui::PushClipRect(ImVec2(ox, content_y), ImVec2(ox + w, content_y + visible_h), true);
+	ImGui::SetCursorScreenPos(ImVec2(ox, content_y));
+	ImGui::PushID("##s_list");
+	ImGui::BeginChild("##s_list_child", ImVec2(w, visible_h), false,
+		ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
 	ImFont* body_font = aida::ui::fonts::body();
 	if (!body_font) body_font = ImGui::GetFont();
 	ImFont* code_font = aida::ui::fonts::code();
 	if (!code_font) code_font = ImGui::GetFont();
 
-	int total_n = static_cast<int>(st.strings.size());
-	int first = static_cast<int>(ui.strings_panel.scroll_y / ROW_HEIGHT);
-	if (first < 0) first = 0;
-	int last = std::min(total_n, first + static_cast<int>(visible_h / ROW_HEIGHT) + 2);
+	ImGuiListClipper clipper;
+	clipper.Begin(total_n, ROW_HEIGHT);
+	while (clipper.Step()) {
+		for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+			float ry = content_y + static_cast<float>(i) * ROW_HEIGHT - ImGui::GetScrollY();
+			auto& sr = snapshot[static_cast<size_t>(i)];
+			bool sel = (ui.strings_panel.selected == i);
 
-	for (int i = first; i < last; ++i) {
-		float ry = content_y + static_cast<float>(i) * ROW_HEIGHT - ui.strings_panel.scroll_y;
-		if (ry + ROW_HEIGHT < content_y) continue;
-		if (ry > content_y + visible_h) break;
+			ImGui::SetCursorScreenPos(ImVec2(ox, ry));
+			ImGui::PushID(i);
+			ImGui::InvisibleButton("##s_row", ImVec2(w - 18.f, ROW_HEIGHT));
+			bool hov = ImGui::IsItemHovered();
+			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+			ImGui::PopID();
+			draw_row_bg(dl, ox, ry, w, ROW_HEIGHT, sel, hov, i, 1.f, a);
 
-		auto& sr = st.strings[static_cast<size_t>(i)];
-		bool sel = (ui.strings_panel.selected == i);
-		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry),
-			ImVec2(ox + w, ry + ROW_HEIGHT), false);
-		float row_a = ui_anim::render_row_entrance(i - first,
-			aida::ui::clock::seconds(), 0.010f, 0.28f);
-		draw_row_bg(dl, ox, ry, w, ROW_HEIGHT, sel, hov, i, row_a, a);
+			char abuf[20];
+			std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, sr.address);
+			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 8.f, ry + 5.f),
+			            with_a(t.text_address, a), abuf);
 
-		char abuf[20];
-		std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, sr.address);
-		dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 8.f, ry + 5.f),
-		            with_a(t.text_address, a * row_a), abuf);
+			std::string display = sr.value;
+			if (display.size() > 96) display = display.substr(0, 96) + "...";
+			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 180.f, ry + 5.f),
+			            with_a(t.syn_string, a), display.c_str());
 
-		std::string display = sr.value;
-		if (display.size() > 96) display = display.substr(0, 96) + "...";
-		dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 180.f, ry + 5.f),
-		            with_a(t.syn_string, a * row_a), display.c_str());
+			if (!sr.module_name.empty())
+				dl->AddText(body_font, body_font->FontSize, ImVec2(ox + w - 150.f, ry + 5.f),
+				            with_a(t.text_dim, a), sr.module_name.c_str());
 
-		if (!sr.module_name.empty())
-			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + w - 150.f, ry + 5.f),
-			            with_a(t.text_dim, a * row_a), sr.module_name.c_str());
-
-		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-			ui.strings_panel.selected = i;
+			if (clicked) ui.strings_panel.selected = i;
+			if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+				jump_to_hex(sr.address, 256);
+			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+				copy_addr_to_clipboard(sr.address);
+		}
 	}
+	clipper.End();
 
-	ImGui::PopClipRect();
+	ImGui::EndChild();
+	ImGui::PopID();
 
-	if (total > visible_h) {
-		ui_anim::render_custom_scrollbar(dl, ox + w - 8.f, content_y, 8.f, visible_h,
-			ui.strings_panel.scroll_y, total, visible_h, a,
-			ui.strings_panel.scrollbar_dragging, ui.strings_panel.scrollbar_drag_offset);
-	}
-
-	if (st.strings.empty()) {
+	if (snapshot.empty()) {
 		aida::ui::empty_state::config_t es;
 		es.glyph = aida::ui::empty_state::glyph_t::search;
 		es.title = "No strings indexed";
-		es.body  = "Run the string scanner to enumerate the target's strings.";
+		es.body  = "Click Scan Strings to enumerate the target's printable strings.";
 		aida::ui::empty_state::render(ImVec2(ox, content_y), ImVec2(w, visible_h), es);
 	}
 }
@@ -1861,74 +2266,124 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 	auto& st = debugger_engine::g_state;
 	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
-	float dt = aida::ui::clock::dt();
 
+	float bar_h = 40.f;
+	float addr_w = w * 0.22f;
+	float lbl_w  = w * 0.32f;
+	float btn_gap = 6.f;
+	ImGui::SetCursorScreenPos(ImVec2(ox + 8.f, oy + 2.f));
+	ImGui::PushID("##bm_actions");
+	aida::ui::input_text("##bm_addr", ui.add_bookmark_buf, sizeof(ui.add_bookmark_buf),
+		"0x... address",
+		false, ImVec2(addr_w, bar_h - 8.f));
+	ImGui::SameLine(0.f, btn_gap);
+	aida::ui::input_text("##bm_label", ui.add_bookmark_label_buf,
+		sizeof(ui.add_bookmark_label_buf),
+		"label (optional)",
+		false, ImVec2(lbl_w, bar_h - 8.f));
+	ImGui::SameLine(0.f, btn_gap);
+	bool add_clicked = aida::ui::button("Add Bookmark",
+		aida::ui::button_kind_t::primary,
+		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
+	if (add_clicked) {
+		uint64_t addr = parse_hex_address(ui.add_bookmark_buf);
+		if (addr != 0) {
+			debugger_engine::toggle_bookmark(addr);
+			if (ui.add_bookmark_label_buf[0])
+				debugger_engine::set_label(addr, ui.add_bookmark_label_buf);
+			ui.add_bookmark_buf[0] = '\0';
+			ui.add_bookmark_label_buf[0] = '\0';
+		}
+	}
+	ImGui::PopID();
+
+	float table_y = oy + bar_h;
 	{
-		ui_anim::table_col_t cols[] = {{"#", 26.f}, {"Address", 170.f}, {"Label", 320.f}};
-		draw_table_header(dl, ox, oy, w, cols, 3, a);
+		ui_anim::table_col_t cols[] = {{"#", 36.f}, {"Address", 200.f},
+			{"Label", 280.f}, {"Actions", 0.f}};
+		draw_table_header(dl, ox, table_y, w, cols, 4, a);
 	}
 
-	std::lock_guard<std::mutex> lk(st.anno_mutex);
-	float content_y = oy + HEADER_H;
-	float visible_h = h - HEADER_H;
-	float total = static_cast<float>(st.bookmarks.size()) * ROW_HEIGHT;
+	std::vector<uint64_t> snapshot;
+	std::map<uint64_t, std::string> labels_snapshot;
+	{
+		std::lock_guard<std::mutex> lk(st.anno_mutex);
+		snapshot = st.bookmarks;
+		for (auto& kv : st.labels)
+			labels_snapshot[kv.first] = kv.second.text;
+	}
+	int total_n = static_cast<int>(snapshot.size());
+	float content_y = table_y + HEADER_H;
+	float visible_h = h - bar_h - HEADER_H;
 
-	handle_list_scroll(&ui.bookmark_panel.scroll_y, &ui.bookmark_panel.target_scroll_y,
-		total, visible_h, ROW_HEIGHT, ox, content_y, w, dt);
-
-	ImGui::PushClipRect(ImVec2(ox, content_y), ImVec2(ox + w, content_y + visible_h), true);
+	ImGui::SetCursorScreenPos(ImVec2(ox, content_y));
+	ImGui::PushID("##bm_list");
+	ImGui::BeginChild("##bm_list_child", ImVec2(w, visible_h), false,
+		ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
 	ImFont* body_font = aida::ui::fonts::body();
 	if (!body_font) body_font = ImGui::GetFont();
 	ImFont* code_font = aida::ui::fonts::code();
 	if (!code_font) code_font = ImGui::GetFont();
 
-	for (int i = 0; i < static_cast<int>(st.bookmarks.size()); ++i) {
-		float ry = content_y + static_cast<float>(i) * ROW_HEIGHT - ui.bookmark_panel.scroll_y;
-		if (ry + ROW_HEIGHT < content_y) continue;
-		if (ry > content_y + visible_h) break;
-		uint64_t addr = st.bookmarks[static_cast<size_t>(i)];
-		bool sel = (ui.bookmark_panel.selected == i);
-		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry),
-			ImVec2(ox + w, ry + ROW_HEIGHT), false);
-		float row_a = ui_anim::render_row_entrance(i,
-			aida::ui::clock::seconds(), 0.012f, 0.30f);
-		draw_row_bg(dl, ox, ry, w, ROW_HEIGHT, sel, hov, i, row_a, a);
+	float row_h = ROW_HEIGHT + 4.f;
+	ImGuiListClipper clipper;
+	clipper.Begin(total_n, row_h);
+	while (clipper.Step()) {
+		for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+			float ry = content_y + static_cast<float>(i) * row_h - ImGui::GetScrollY();
+			uint64_t addr = snapshot[static_cast<size_t>(i)];
+			bool sel = (ui.bookmark_panel.selected == i);
 
-		char ibuf[8], abuf[20];
-		std::snprintf(ibuf, sizeof(ibuf), "%d", i);
-		std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, addr);
-		dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 8.f, ry + 5.f),
-		            with_a(t.text_dim, a * row_a), ibuf);
-		dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 36.f, ry + 5.f),
-		            with_a(t.text_address, a * row_a), abuf);
+			ImGui::SetCursorScreenPos(ImVec2(ox, ry));
+			ImGui::PushID(i);
+			ImGui::InvisibleButton("##bm_row", ImVec2(w - 18.f - 84.f, row_h));
+			bool hov = ImGui::IsItemHovered();
+			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+			bool dclicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && hov;
+			ImGui::PopID();
+			draw_row_bg(dl, ox, ry, w, row_h, sel, hov, i, 1.f, a);
 
-		auto it = st.labels.find(addr);
-		if (it != st.labels.end())
-			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 200.f, ry + 5.f),
-			            with_a(t.text_primary, a * row_a), it->second.text.c_str());
+			char ibuf[8], abuf[20];
+			std::snprintf(ibuf, sizeof(ibuf), "%d", i);
+			std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, addr);
+			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 8.f, ry + 7.f),
+			            with_a(t.text_dim, a), ibuf);
+			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 46.f, ry + 7.f),
+			            with_a(t.text_address, a), abuf);
 
-		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-			ui.bookmark_panel.selected = i;
-		if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-			globals::ui::active_center_view = center_view_t::disassembly;
-			disasm_view::goto_address(addr, g_disasm);
+			auto it = labels_snapshot.find(addr);
+			if (it != labels_snapshot.end())
+				dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 246.f, ry + 7.f),
+				            with_a(t.text_primary, a), it->second.c_str());
+
+			float btn_x = ox + w - 84.f;
+			float btn_w = 64.f;
+			float btn_h = 22.f;
+			float btn_y = ry + (row_h - btn_h) * 0.5f;
+			ImGui::SetCursorScreenPos(ImVec2(btn_x, btn_y));
+			ImGui::PushID(i + 0x50000);
+			bool rm = aida::ui::button("Remove", aida::ui::button_kind_t::destructive,
+				aida::ui::size_t_::sm, ImVec2(btn_w, btn_h));
+			ImGui::PopID();
+			if (rm) debugger_engine::toggle_bookmark(addr);
+
+			if (clicked) ui.bookmark_panel.selected = i;
+			if (dclicked) jump_to_disasm(addr);
+			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+				copy_addr_to_clipboard(addr);
 		}
 	}
+	clipper.End();
 
-	ImGui::PopClipRect();
+	ImGui::EndChild();
+	ImGui::PopID();
 
-	if (total > visible_h) {
-		ui_anim::render_custom_scrollbar(dl, ox + w - 8.f, content_y, 8.f, visible_h,
-			ui.bookmark_panel.scroll_y, total, visible_h, a,
-			ui.bookmark_panel.scrollbar_dragging, ui.bookmark_panel.scrollbar_drag_offset);
-	}
-
-	if (st.bookmarks.empty()) {
+	if (snapshot.empty()) {
 		aida::ui::empty_state::config_t es;
 		es.glyph = aida::ui::empty_state::glyph_t::dots;
 		es.title = "No bookmarks";
-		es.body  = "Add bookmarks from the disassembly view.";
+		es.body  = "Add a bookmark by entering an address above.";
 		aida::ui::empty_state::render(ImVec2(ox, content_y), ImVec2(w, visible_h), es);
 	}
 }
@@ -1938,84 +2393,100 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 	auto& st = debugger_engine::g_state;
 	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
-	float dt = aida::ui::clock::dt();
 
+	float bar_h = 40.f;
+	ImGui::SetCursorScreenPos(ImVec2(ox + 8.f, oy + 2.f));
+	ImGui::PushID("##h_actions");
+	bool refresh_clicked = aida::ui::button("Enumerate Handles",
+		aida::ui::button_kind_t::primary,
+		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
+	if (refresh_clicked) debugger_engine::enumerate_handles();
+	ImGui::PopID();
+
+	float table_y = oy + bar_h;
 	{
 		ui_anim::table_col_t cols[] = {
-			{"Handle", 110.f}, {"Type", 160.f}, {"Name", 320.f}
+			{"Handle", 110.f}, {"Type", 160.f}, {"Access", 110.f}, {"Name", 320.f}
 		};
-		draw_table_header(dl, ox, oy, w, cols, 3, a);
+		draw_table_header(dl, ox, table_y, w, cols, 4, a);
 	}
 
-	std::lock_guard<std::mutex> lk(st.handle_mutex);
-	float content_y = oy + HEADER_H;
-	float visible_h = h - HEADER_H;
-	int total_n = static_cast<int>(st.handles.size());
-	float total = static_cast<float>(total_n) * ROW_HEIGHT;
+	std::vector<debugger_engine::handle_info_t> snapshot;
+	{
+		std::lock_guard<std::mutex> lk(st.handle_mutex);
+		snapshot = st.handles;
+	}
+	int total_n = static_cast<int>(snapshot.size());
+	float content_y = table_y + HEADER_H;
+	float visible_h = h - bar_h - HEADER_H;
 
-	handle_list_scroll(&ui.handle_panel.scroll_y, &ui.handle_panel.target_scroll_y,
-		total, visible_h, ROW_HEIGHT, ox, content_y, w, dt);
-
-	ImGui::PushClipRect(ImVec2(ox, content_y), ImVec2(ox + w, content_y + visible_h), true);
+	ImGui::SetCursorScreenPos(ImVec2(ox, content_y));
+	ImGui::PushID("##h_list");
+	ImGui::BeginChild("##h_list_child", ImVec2(w, visible_h), false,
+		ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
 	ImFont* body_font = aida::ui::fonts::body();
 	if (!body_font) body_font = ImGui::GetFont();
 	ImFont* code_font = aida::ui::fonts::code();
 	if (!code_font) code_font = ImGui::GetFont();
 
-	for (int hi = 0; hi < total_n; ++hi) {
-		float ry = content_y + static_cast<float>(hi) * ROW_HEIGHT - ui.handle_panel.scroll_y;
-		if (ry + ROW_HEIGHT < content_y) continue;
-		if (ry > content_y + visible_h) break;
+	ImGuiListClipper clipper;
+	clipper.Begin(total_n, ROW_HEIGHT);
+	while (clipper.Step()) {
+		for (int hi = clipper.DisplayStart; hi < clipper.DisplayEnd; ++hi) {
+			float ry = content_y + static_cast<float>(hi) * ROW_HEIGHT - ImGui::GetScrollY();
+			auto& he = snapshot[static_cast<size_t>(hi)];
+			bool sel = (ui.handle_panel.selected == hi);
 
-		auto& he = st.handles[static_cast<size_t>(hi)];
-		bool sel = (ui.handle_panel.selected == hi);
-		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry),
-			ImVec2(ox + w, ry + ROW_HEIGHT), false);
-		float row_a = ui_anim::render_row_entrance(hi,
-			aida::ui::clock::seconds(), 0.012f, 0.30f);
-		draw_row_bg(dl, ox, ry, w, ROW_HEIGHT, sel, hov, hi, row_a, a);
+			ImGui::SetCursorScreenPos(ImVec2(ox, ry));
+			ImGui::PushID(hi);
+			ImGui::InvisibleButton("##h_row", ImVec2(w - 18.f, ROW_HEIGHT));
+			bool hov = ImGui::IsItemHovered();
+			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+			ImGui::PopID();
+			draw_row_bg(dl, ox, ry, w, ROW_HEIGHT, sel, hov, hi, 1.f, a);
 
-		char hbuf[12];
-		std::snprintf(hbuf, sizeof(hbuf), "0x%X", static_cast<unsigned>(he.handle));
-		dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 8.f, ry + 5.f),
-		            with_a(t.text_primary, a * row_a), hbuf);
+			char hbuf[12];
+			std::snprintf(hbuf, sizeof(hbuf), "0x%X", static_cast<unsigned>(he.handle));
+			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 8.f, ry + 5.f),
+			            with_a(t.text_primary, a), hbuf);
 
-		ImU32 type_col = handle_type_color(he.type_name, t);
-		{
+			ImU32 type_col = handle_type_color(he.type_name, t);
 			ImVec2 ts = body_font->CalcTextSizeA(body_font->FontSize, FLT_MAX, 0.f, he.type_name.c_str());
 			float bw = ts.x + 12.f;
 			float bh = 16.f;
 			float bx = ox + 120.f;
 			float by = ry + (ROW_HEIGHT - bh) * 0.5f;
 			dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh),
-			                  with_a(type_col, a * row_a * 0.85f), 4.f);
+			                  with_a(type_col, a * 0.85f), 4.f);
 			dl->AddText(body_font, body_font->FontSize,
 				ImVec2(bx + 6.f, by + (bh - 11.f) * 0.5f),
-				with_a(IM_COL32(255, 255, 255, 245), a * row_a),
+				with_a(IM_COL32(255, 255, 255, 245), a),
 				he.type_name.c_str());
+
+			char acc_buf[16];
+			std::snprintf(acc_buf, sizeof(acc_buf), "0x%08X", he.access);
+			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 280.f, ry + 5.f),
+			            with_a(t.text_secondary, a), acc_buf);
+
+			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 390.f, ry + 5.f),
+			            with_a(t.text_primary, a), he.name.c_str());
+
+			if (clicked) ui.handle_panel.selected = hi;
+			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+				copy_to_clipboard(he.name.c_str());
 		}
-
-		dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 290.f, ry + 5.f),
-		            with_a(t.text_primary, a * row_a), he.name.c_str());
-
-		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-			ui.handle_panel.selected = hi;
 	}
+	clipper.End();
 
-	ImGui::PopClipRect();
+	ImGui::EndChild();
+	ImGui::PopID();
 
-	if (total > visible_h) {
-		ui_anim::render_custom_scrollbar(dl, ox + w - 8.f, content_y, 8.f, visible_h,
-			ui.handle_panel.scroll_y, total, visible_h, a,
-			ui.handle_panel.scrollbar_dragging, ui.handle_panel.scrollbar_drag_offset);
-	}
-
-	if (st.handles.empty()) {
+	if (snapshot.empty()) {
 		aida::ui::empty_state::config_t es;
 		es.glyph = aida::ui::empty_state::glyph_t::key;
 		es.title = "No handles enumerated";
-		es.body  = "Attach to a process to enumerate its handles.";
+		es.body  = "Click Enumerate Handles to capture the target's handle table.";
 		aida::ui::empty_state::render(ImVec2(ox, content_y), ImVec2(w, visible_h), es);
 	}
 }
@@ -2024,7 +2495,6 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h, float a) {
 	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
-	float dt = aida::ui::clock::dt();
 
 	{
 		ui_anim::table_col_t cols[] = {
@@ -2034,110 +2504,108 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 		draw_table_header(dl, ox, oy, w, cols, 6, a);
 	}
 
-	std::lock_guard<std::mutex> plk(code_patcher::g_state.mtx);
-	auto& patches = code_patcher::g_state.patches;
-	int total_n = static_cast<int>(patches.size());
+	std::vector<code_patcher::patch_entry_t> snapshot;
+	{
+		std::lock_guard<std::mutex> plk(code_patcher::g_state.mtx);
+		snapshot = code_patcher::g_state.patches;
+	}
+	int total_n = static_cast<int>(snapshot.size());
 	float content_y = oy + HEADER_H;
 	float visible_h = h - HEADER_H;
-	float total = static_cast<float>(total_n) * ROW_HEIGHT;
 
-	handle_list_scroll(&ui.patches_panel.scroll_y, &ui.patches_panel.target_scroll_y,
-		total, visible_h, ROW_HEIGHT, ox, content_y, w, dt);
-
-	ImGui::PushClipRect(ImVec2(ox, content_y), ImVec2(ox + w, content_y + visible_h), true);
+	ImGui::SetCursorScreenPos(ImVec2(ox, content_y));
+	ImGui::PushID("##p_list");
+	ImGui::BeginChild("##p_list_child", ImVec2(w, visible_h), false,
+		ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
 	ImFont* body_font = aida::ui::fonts::body();
 	if (!body_font) body_font = ImGui::GetFont();
 	ImFont* code_font = aida::ui::fonts::code();
 	if (!code_font) code_font = ImGui::GetFont();
 
-	for (int i = 0; i < total_n; ++i) {
-		float ry = content_y + static_cast<float>(i) * ROW_HEIGHT - ui.patches_panel.scroll_y;
-		if (ry + ROW_HEIGHT < content_y) continue;
-		if (ry > content_y + visible_h) break;
+	ImGuiListClipper clipper;
+	clipper.Begin(total_n, ROW_HEIGHT);
+	while (clipper.Step()) {
+		for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+			float ry = content_y + static_cast<float>(i) * ROW_HEIGHT - ImGui::GetScrollY();
+			auto& p = snapshot[static_cast<size_t>(i)];
+			bool sel = (ui.patches_panel.selected == i);
 
-		auto& p = patches[static_cast<size_t>(i)];
-		bool sel = (ui.patches_panel.selected == i);
-		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry),
-			ImVec2(ox + w, ry + ROW_HEIGHT), false);
-		float row_a = ui_anim::render_row_entrance(i,
-			aida::ui::clock::seconds(), 0.012f, 0.30f);
-		draw_row_bg(dl, ox, ry, w, ROW_HEIGHT, sel, hov, i, row_a, a);
+			ImGui::SetCursorScreenPos(ImVec2(ox, ry));
+			ImGui::PushID(i);
+			ImGui::InvisibleButton("##p_row", ImVec2(w - 80.f, ROW_HEIGHT));
+			bool hov = ImGui::IsItemHovered();
+			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+			ImGui::PopID();
+			draw_row_bg(dl, ox, ry, w, ROW_HEIGHT, sel, hov, i, 1.f, a);
 
-		char ibuf[8], abuf[20];
-		std::snprintf(ibuf, sizeof(ibuf), "%d", i);
-		std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, p.address);
-		dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 8.f, ry + 5.f),
-		            with_a(t.text_dim, a * row_a), ibuf);
-		dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 36.f, ry + 5.f),
-		            with_a(t.text_address, a * row_a), abuf);
+			char ibuf[8], abuf[20];
+			std::snprintf(ibuf, sizeof(ibuf), "%d", i);
+			std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, p.address);
+			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 8.f, ry + 5.f),
+			            with_a(t.text_dim, a), ibuf);
+			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 36.f, ry + 5.f),
+			            with_a(t.text_address, a), abuf);
 
-		std::string oh = code_patcher::format_bytes(p.original_bytes);
-		std::string ph = code_patcher::format_bytes(p.patched_bytes);
-		if (oh.size() > 22) oh = oh.substr(0, 22) + "...";
-		if (ph.size() > 22) ph = ph.substr(0, 22) + "...";
+			std::string oh = code_patcher::format_bytes(p.original_bytes);
+			std::string ph = code_patcher::format_bytes(p.patched_bytes);
+			if (oh.size() > 22) oh = oh.substr(0, 22) + "...";
+			if (ph.size() > 22) ph = ph.substr(0, 22) + "...";
 
-		{
-			ImVec2 sz = code_font->CalcTextSizeA(code_font->FontSize, FLT_MAX, 0.f, oh.c_str());
+			ImVec2 osz = code_font->CalcTextSizeA(code_font->FontSize, FLT_MAX, 0.f, oh.c_str());
 			float bx = ox + 200.f;
 			float by = ry + 3.f;
 			dl->AddRectFilled(ImVec2(bx - 4.f, by),
-			                  ImVec2(bx + sz.x + 8.f, by + 16.f),
-			                  with_a(t.text_dim, a * row_a * 0.18f), 4.f);
+			                  ImVec2(bx + osz.x + 8.f, by + 16.f),
+			                  with_a(t.text_dim, a * 0.18f), 4.f);
 			dl->AddText(code_font, code_font->FontSize, ImVec2(bx, ry + 5.f),
-			            with_a(t.text_secondary, a * row_a), oh.c_str());
-		}
-		{
-			ImVec2 sz = code_font->CalcTextSizeA(code_font->FontSize, FLT_MAX, 0.f, ph.c_str());
-			float bx = ox + 400.f;
-			float by = ry + 3.f;
+			            with_a(t.text_secondary, a), oh.c_str());
+
+			ImVec2 psz = code_font->CalcTextSizeA(code_font->FontSize, FLT_MAX, 0.f, ph.c_str());
+			float bx2 = ox + 400.f;
 			ImU32 pc = p.active ? t.success : t.warning;
-			dl->AddRectFilled(ImVec2(bx - 4.f, by),
-			                  ImVec2(bx + sz.x + 8.f, by + 16.f),
-			                  with_a(pc, a * row_a * 0.20f), 4.f);
-			dl->AddText(code_font, code_font->FontSize, ImVec2(bx, ry + 5.f),
-			            with_a(pc, a * row_a), ph.c_str());
-		}
+			dl->AddRectFilled(ImVec2(bx2 - 4.f, by),
+			                  ImVec2(bx2 + psz.x + 8.f, by + 16.f),
+			                  with_a(pc, a * 0.20f), 4.f);
+			dl->AddText(code_font, code_font->FontSize, ImVec2(bx2, ry + 5.f),
+			            with_a(pc, a), ph.c_str());
 
-		dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 600.f, ry + 5.f),
-		            with_a(t.text_primary, a * row_a), p.description.c_str());
+			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 600.f, ry + 5.f),
+			            with_a(t.text_primary, a), p.description.c_str());
 
-		bool active_state = p.active;
-		float track_w = 28.f;
-		float track_h = 14.f;
-		float tx = ox + w - track_w - 16.f;
-		float ty = ry + (ROW_HEIGHT - track_h) * 0.5f;
-		ImGui::SetCursorScreenPos(ImVec2(tx, ty));
-		ImGui::PushID(i + 0x70000);
-		ImGui::InvisibleButton("##patch_tog", ImVec2(track_w, track_h));
-		bool clicked = ImGui::IsItemClicked();
-		ImGui::PopID();
-		ImU32 track_col = aida::ui::mix(t.panel_header, t.accent_u32, active_state ? 1.f : 0.f);
-		dl->AddRectFilled(ImVec2(tx, ty), ImVec2(tx + track_w, ty + track_h),
-		                  with_a(track_col, a * row_a), track_h * 0.5f);
-		float knob_r = (track_h - 4.f) * 0.5f;
-		float knob_x = tx + 2.f + knob_r + (track_w - 4.f - knob_r * 2.f) * (active_state ? 1.f : 0.f);
-		float knob_y = (ty + ty + track_h) * 0.5f;
-		dl->AddCircleFilled(ImVec2(knob_x, knob_y), knob_r,
-		                    with_a(IM_COL32(255, 255, 255, 240), a * row_a), 16);
-		if (clicked) {
-			code_patcher::toggle_patch(i);
-		}
+			bool active_state = p.active;
+			float track_w = 28.f;
+			float track_h = 14.f;
+			float tx = ox + w - track_w - 16.f;
+			float ty = ry + (ROW_HEIGHT - track_h) * 0.5f;
+			ImGui::SetCursorScreenPos(ImVec2(tx, ty));
+			ImGui::PushID(i + 0x70000);
+			ImGui::InvisibleButton("##patch_tog", ImVec2(track_w, track_h));
+			bool tog_clicked = ImGui::IsItemClicked();
+			ImGui::PopID();
+			ImU32 track_col = aida::ui::mix(t.panel_header, t.accent_u32, active_state ? 1.f : 0.f);
+			dl->AddRectFilled(ImVec2(tx, ty), ImVec2(tx + track_w, ty + track_h),
+			                  with_a(track_col, a), track_h * 0.5f);
+			float knob_r = (track_h - 4.f) * 0.5f;
+			float knob_x = tx + 2.f + knob_r + (track_w - 4.f - knob_r * 2.f) * (active_state ? 1.f : 0.f);
+			float knob_y = (ty + ty + track_h) * 0.5f;
+			dl->AddCircleFilled(ImVec2(knob_x, knob_y), knob_r,
+			                    with_a(IM_COL32(255, 255, 255, 240), a), 16);
+			if (tog_clicked) code_patcher::toggle_patch(i);
 
-		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-			ui.patches_panel.selected = i;
+			if (clicked) ui.patches_panel.selected = i;
+			if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+				jump_to_disasm(p.address);
+			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+				copy_addr_to_clipboard(p.address);
 		}
 	}
+	clipper.End();
 
-	ImGui::PopClipRect();
+	ImGui::EndChild();
+	ImGui::PopID();
 
-	if (total > visible_h) {
-		ui_anim::render_custom_scrollbar(dl, ox + w - 8.f, content_y, 8.f, visible_h,
-			ui.patches_panel.scroll_y, total, visible_h, a,
-			ui.patches_panel.scrollbar_dragging, ui.patches_panel.scrollbar_drag_offset);
-	}
-
-	if (patches.empty()) {
+	if (snapshot.empty()) {
 		aida::ui::empty_state::config_t es;
 		es.glyph = aida::ui::empty_state::glyph_t::flask;
 		es.title = "No patches applied";
@@ -2204,7 +2672,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
 	switch (ui.active_tab) {
 		case sub_tab_t::cpu:
-			render_cpu(dl, panel_x, panel_y, panel_w, panel_h, content_alpha);
+			render_cpu(dl, panel_x + 8.f, panel_y + 4.f, panel_w - 16.f, panel_h - 8.f, content_alpha);
 			break;
 		case sub_tab_t::breakpoints:
 			render_breakpoints(dl, panel_x, panel_y, panel_w, panel_h, content_alpha);

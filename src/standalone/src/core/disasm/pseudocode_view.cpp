@@ -9,6 +9,8 @@
 #include "comment_dialog.hpp"
 #include "../../helpers/globals.h"
 #include "../../helpers/diag_log.hpp"
+#include "../analysis/pdb_events.hpp"
+#include "../infra/event_bus.hpp"
 #include "../infra/work_queue.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/motion.hpp"
@@ -107,6 +109,40 @@ inline std::mutex& state_mutex()
 {
 	static std::mutex m;
 	return m;
+}
+
+inline std::atomic<bool>& pdb_subscription_armed_flag()
+{
+	static std::atomic<bool> armed{false};
+	return armed;
+}
+
+inline aida::events::subscription_handle_t& pdb_subscription_slot()
+{
+	static aida::events::subscription_handle_t slot;
+	return slot;
+}
+
+inline void on_pdb_loaded_invalidate(const aida::events::event_pdb_loaded& ev)
+{
+	if (!ev.success) return;
+	pseudocode_view::refresh_all_tabs();
+}
+
+inline void ensure_pdb_subscription()
+{
+	auto& armed = pdb_subscription_armed_flag();
+	if (armed.load(std::memory_order_acquire)) return;
+	bool expected = false;
+	if (!armed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+	pdb_subscription_slot() = aida::events::subscribe(
+		aida::events::event_pdb_loaded_def,
+		[](const aida::events::event_pdb_loaded& ev) {
+			on_pdb_loaded_invalidate(ev);
+		});
+	if (!pdb_subscription_slot().valid()) {
+		armed.store(false, std::memory_order_release);
+	}
 }
 
 std::shared_ptr<tab_t> find_tab_for_addr_locked(uint64_t addr)
@@ -856,6 +892,8 @@ void request_decompile(uint64_t addr, const DisasmFile* file)
 {
 	if (addr == 0) return;
 
+	ensure_pdb_subscription();
+
 	bool need_dispatch = false;
 	bool suppress_new_log = false;
 	std::string log_label;
@@ -1042,6 +1080,36 @@ void refresh_active_tab()
 	globals::ui::decompile_popup_addr.store(addr, std::memory_order_release);
 	globals::ui::decompile_popup_active.store(true, std::memory_order_release);
 	decompiler_engine::decompile_function_native(addr, &g_disasm.file);
+}
+
+void refresh_all_tabs()
+{
+	std::vector<uint64_t> addrs;
+	uint64_t active_addr = 0;
+	{
+		std::lock_guard<std::mutex> guard(state_mutex());
+		auto& s = state();
+		addrs.reserve(s.tabs.size());
+		for (auto& t : s.tabs) {
+			if (!t) continue;
+			t->pending = true;
+			t->decompiling = true;
+			t->loaded = false;
+			t->is_error = false;
+			t->error_text.clear();
+			addrs.push_back(t->addr);
+		}
+		auto at = active_tab_locked();
+		if (at) active_addr = at->addr;
+	}
+	for (uint64_t a : addrs) {
+		decompiler_engine::erase_cache_entry(a);
+	}
+	if (active_addr != 0) {
+		globals::ui::decompile_popup_addr.store(active_addr, std::memory_order_release);
+		globals::ui::decompile_popup_active.store(true, std::memory_order_release);
+		decompiler_engine::decompile_function_native(active_addr, &g_disasm.file);
+	}
 }
 
 bool has_active_tab()

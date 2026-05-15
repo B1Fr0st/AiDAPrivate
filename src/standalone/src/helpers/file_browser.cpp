@@ -8,6 +8,7 @@
 #include "xref_index.hpp"
 #include "standalone_license.hpp"
 #include "hex_view.hpp"
+#include "initial_analysis.hpp"
 
 #include <filesystem>
 #include <algorithm>
@@ -192,6 +193,7 @@ void file_browser::open_file(int idx)
             if (g_disasm.file.loaded) {
                 disasm::decode_section(g_disasm.file);
                 globals::ui::active_center_view = center_view_t::disassembly;
+                initial_analysis::run_initial_analysis_for_loaded_file();
             } else {
                 hex_view::load_from_file(ent.full_path, 0, 0);
                 globals::ui::active_center_view = center_view_t::hex_view;

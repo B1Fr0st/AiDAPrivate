@@ -1060,6 +1060,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/analysis/struct_recon_view.cpp"
             "${STANDALONE_ROOT}/core/analysis/fuzzer_view.cpp"
             "${STANDALONE_ROOT}/core/analysis/analysis_tools_standalone.cpp"
+            "${STANDALONE_ROOT}/core/analysis/pdb_downloader.cpp"
             "${STANDALONE_ROOT}/core/runtime/arc_loader.cpp"
             src/driver_loader.cpp
             driver/comm.cpp

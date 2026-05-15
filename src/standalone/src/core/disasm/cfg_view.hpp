@@ -16,11 +16,15 @@
 #include "imgui/imgui_internal.h"
 #include "cfg_layout.hpp"
 #include "standalone_driver.hpp"
+#include "symbol_classifier.hpp"
 #include "zydis_disasm.hpp"
 #include "debugger_engine.hpp"
 #include "disasm_view.hpp"
 #include "ui_anim.hpp"
 #include "work_queue.hpp"
+#include "../analysis/pdb_events.hpp"
+#include "../analysis/symbol_store.hpp"
+#include "../infra/event_bus.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/motion.hpp"
 #include "../ui/clock.hpp"
@@ -93,6 +97,53 @@ struct cfg_state_t {
 };
 
 inline cfg_state_t g_state;
+
+inline void build_cfg(uint64_t entry_address);
+
+namespace detail {
+
+inline std::atomic<bool>&                    pdb_subscription_armed_flag()
+{
+	static std::atomic<bool> armed{false};
+	return armed;
+}
+
+inline aida::events::subscription_handle_t& pdb_subscription_slot()
+{
+	static aida::events::subscription_handle_t slot;
+	return slot;
+}
+
+inline void rebuild_on_pdb_load(const aida::events::event_pdb_loaded& ev)
+{
+	if (!ev.success) return;
+	uint64_t entry = 0;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		if (!g_state.built) return;
+		entry = g_state.entry_addr;
+	}
+	if (entry == 0) return;
+	build_cfg(entry);
+}
+
+inline void ensure_pdb_subscription()
+{
+	auto& armed = pdb_subscription_armed_flag();
+	if (armed.load(std::memory_order_acquire)) return;
+	bool expected = false;
+	if (!armed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+	pdb_subscription_slot() = aida::events::subscribe(
+		aida::events::event_pdb_loaded_def,
+		[](const aida::events::event_pdb_loaded& ev) {
+			rebuild_on_pdb_load(ev);
+		});
+	if (!pdb_subscription_slot().valid()) {
+		armed.store(false, std::memory_order_release);
+	}
+}
+
+}
 
 inline void clear()
 {
@@ -239,6 +290,50 @@ inline float render_colored_insn(ImDrawList* dl, float x, float y,
 	return cur_x;
 }
 
+inline std::string resolve_branch_symbol_for_cfg(uint64_t target)
+{
+	if (target == 0) return std::string();
+	std::string sym = symbol_store::resolve_symbol_exact(target);
+	if (!sym.empty()) {
+		auto bang = sym.find('!');
+		if (bang != std::string::npos) sym = sym.substr(bang + 1);
+		return sym;
+	}
+	sym = symbol_store::resolve_symbol(target);
+	if (!sym.empty()) {
+		auto bang = sym.find('!');
+		if (bang != std::string::npos) sym = sym.substr(bang + 1);
+		return sym;
+	}
+	return std::string();
+}
+
+inline std::string substitute_branch_operand(const std::string& ops, uint64_t target)
+{
+	if (target == 0) return ops;
+	std::string sym = resolve_branch_symbol_for_cfg(target);
+	if (sym.empty()) return ops;
+	symbol_classifier::kind_t k = symbol_classifier::classify(target);
+	if (k == symbol_classifier::kind_t::external_import) {
+		if (sym.compare(0, 6, "__imp_") != 0)
+			sym = "__imp_" + sym;
+	}
+	char hex_buf[32];
+	std::snprintf(hex_buf, sizeof(hex_buf), "0x%llX", static_cast<unsigned long long>(target));
+	size_t pos = ops.find(hex_buf);
+	if (pos == std::string::npos) {
+		std::snprintf(hex_buf, sizeof(hex_buf), "0x%llx", static_cast<unsigned long long>(target));
+		pos = ops.find(hex_buf);
+	}
+	if (pos == std::string::npos) {
+		std::snprintf(hex_buf, sizeof(hex_buf), "%llXh", static_cast<unsigned long long>(target));
+		pos = ops.find(hex_buf);
+	}
+	if (pos == std::string::npos) return ops;
+	std::string out = ops.substr(0, pos) + sym + ops.substr(pos + std::strlen(hex_buf));
+	return out;
+}
+
 }
 
 inline void fit_to_view(float view_width, float view_height)
@@ -294,6 +389,8 @@ inline void center_on_address(uint64_t addr)
 
 inline void build_cfg(uint64_t entry_address)
 {
+	detail::ensure_pdb_subscription();
+
 	if (g_state.building.load())
 		return;
 
@@ -396,9 +493,14 @@ inline void build_cfg(uint64_t entry_address)
 
 			instruction_line_t line;
 			line.addr = d.ins.addr;
-			char buf[192];
-			snprintf(buf, sizeof(buf), "%s %s", d.ins.mnem, d.ins.ops);
-			line.text = buf;
+			std::string ops_text = d.ins.ops;
+			if ((d.ins.is_branch || d.ins.is_call) && d.ins.branch_target != 0) {
+				ops_text = detail::substitute_branch_operand(ops_text, d.ins.branch_target);
+			}
+			line.text.reserve(std::strlen(d.ins.mnem) + 1 + ops_text.size());
+			line.text.assign(d.ins.mnem);
+			line.text.push_back(' ');
+			line.text.append(ops_text);
 			blocks[cur_block].instructions.push_back(std::move(line));
 			blocks[cur_block].end_addr = d.ins.addr + d.ins.len;
 

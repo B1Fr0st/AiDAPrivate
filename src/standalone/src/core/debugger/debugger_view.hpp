@@ -102,9 +102,9 @@ struct ui_state_t {
 	char  string_filter[128] = {};
 	int   string_min_len = 4;
 
-	uint64_t prev_regs[18] = {};
-	float    reg_flash[18] = {};
-	register_cell_t reg_cells[18] = {};
+	uint64_t prev_regs[32] = {};
+	float    reg_flash[32] = {};
+	register_cell_t reg_cells[32] = {};
 
 	uint64_t prev_rip = 0;
 	float    rip_flash = 0.f;
@@ -126,6 +126,17 @@ struct ui_state_t {
 	float    thread_state_flash[256] = {};
 
 	float    record_pulse = 0.f;
+
+	char     add_bp_addr_buf[24] = {};
+	char     add_watch_buf[96] = {};
+	char     add_bookmark_buf[24] = {};
+	char     add_bookmark_label_buf[64] = {};
+	char     trace_filter_buf[96] = {};
+
+	int      cpu_panel_mode = 0;
+
+	float    flag_flash[16] = {};
+	uint64_t prev_rflags = 0;
 };
 
 inline ui_state_t g_ui;

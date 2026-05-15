@@ -566,6 +566,7 @@ inline void populate_symbols(aida_ghidra::architecture_t& arch,
 		db.is_pe = false;
 	}
 	aida_ghidra::populate_from_driver(db, base);
+	aida_ghidra::populate_from_symbol_store(db);
 	aida_ghidra::populate_default_noreturn(db);
 }
 

@@ -71,7 +71,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		aida::ui::with_alpha(th.bg_base, alpha));
 
 	const float toolbar_h = 64.f;
-	const float strip_h = 56.f;
+	const float strip_h = 72.f;
 	const float pad = 12.f;
 
 	ImU32 bar_top = aida::ui::with_alpha(th.panel_header, alpha * 0.85f);
@@ -93,22 +93,23 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		aida::ui::with_alpha(th.text_primary, alpha)));
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
+	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 6.f));
 	ImGui::PushItemWidth(190.f);
 	ImGui::InputTextWithHint("##do_addr", "Encrypted region (hex)",
 		oracle.address_input, sizeof(oracle.address_input));
 	ImGui::PopItemWidth();
-	ImGui::SameLine();
+	ImGui::SameLine(0.f, 10.f);
 	ImGui::PushItemWidth(90.f);
 	ImGui::InputTextWithHint("##do_size", "Size", oracle.size_input, sizeof(oracle.size_input));
 	ImGui::PopItemWidth();
-	ImGui::PopStyleVar(2);
+	ImGui::PopStyleVar(3);
 	ImGui::PopStyleColor(3);
 
-	ImGui::SameLine();
+	ImGui::SameLine(0.f, 14.f);
 	bool scanning = oracle.scanning.load();
 	if (!scanning) {
 		if (aida::ui::button("Scan & Decrypt", aida::ui::button_kind_t::primary,
-			aida::ui::size_t_::sm, ImVec2(126.f, 28.f))) {
+			aida::ui::size_t_::sm, ImVec2(132.f, 32.f))) {
 			uint64_t addr = 0;
 			uint64_t sz = 4096;
 			if (oracle.address_input[0]) addr = std::strtoull(oracle.address_input, nullptr, 16);
@@ -117,12 +118,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	} else {
 		if (aida::ui::button("Cancel", aida::ui::button_kind_t::destructive,
-			aida::ui::size_t_::sm, ImVec2(86.f, 28.f))) {
+			aida::ui::size_t_::sm, ImVec2(90.f, 32.f))) {
 			oracle.cancel.store(true);
 		}
 	}
 
-	ty += 28.f;
+	ty += 32.f;
 
 	if (scanning) {
 		float prog = oracle.progress.load();
@@ -190,14 +191,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		auto draw_stat = [&](float x_pos, const char* label, const char* value, ImU32 col) {
 			ImFont* num = aida::ui::fonts::body_strong();
 			if (!num) num = ImGui::GetFont();
-			dl->AddText(num, 18.f, ImVec2(x_pos, sa.y + 6.f), col, value);
-			dl->AddText(aida::ui::fonts::caption() ? aida::ui::fonts::caption() : ImGui::GetFont(),
-				10.f, ImVec2(x_pos, sa.y + 28.f),
+			dl->AddText(num, 22.f, ImVec2(x_pos, sa.y + 10.f), col, value);
+			ImFont* lblf = aida::ui::fonts::body();
+			if (!lblf) lblf = ImGui::GetFont();
+			dl->AddText(lblf, 13.f, ImVec2(x_pos, sa.y + 40.f),
 				aida::ui::with_alpha(th.text_dim, alpha), label);
 		};
 
-		float cell_w = (width - 24.f) / 4.f;
-		float sx = sa.x + 12.f;
+		float cell_w = (width - 32.f) / 4.f;
+		float sx = sa.x + 16.f;
 
 		char fb[16], ab[16], sb_buf[16], lb[24];
 		std::snprintf(fb, sizeof(fb), "%d", found);

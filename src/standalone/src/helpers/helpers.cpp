@@ -46,6 +46,8 @@
 #include "xref_index.hpp"
 #include "binary_map_view.hpp"
 #include "agent_picker_view.hpp"
+#include "initial_analysis.hpp"
+#include "initial_analysis_view.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -948,8 +950,7 @@ void helpers::render_title()
 		}
 
 		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_X, false)) {
-			scan_hub_view::set_sub_tab(scan_hub_view::sub_tab_t::xrefs);
-			globals::ui::active_center_view = center_view_t::scan_hub;
+			globals::ui::active_center_view = center_view_t::xref_browser;
 		}
 
 		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
@@ -2756,8 +2757,14 @@ void helpers::render_title()
 			float btn_w = ts.x + 24.f;
 			ImVec2 bmin(mx_cursor, my0 + 3.f);
 			ImVec2 bmax(mx_cursor + btn_w, my1 - 3.f);
-			bool hov = ImGui::IsMouseHoveringRect(bmin, bmax);
 			bool is_open = (menu_bar::open_menu == i);
+
+			ImGui::PushID(menus[i].label);
+			ImGui::SetCursorScreenPos(bmin);
+			ImGui::InvisibleButton("##mb_top", ImVec2(btn_w, bmax.y - bmin.y));
+			bool hov = ImGui::IsItemHovered();
+			bool clicked_btn = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+			ImGui::PopID();
 
 			ImGuiID mb_hov_id = ImGui::GetID(menus[i].label);
 			float h_v = mb_storage->GetFloat(mb_hov_id, 0.f);
@@ -2775,7 +2782,7 @@ void helpers::render_title()
 				ImVec2(mx_cursor + 12.f, my0 + (menu_h - mb_label_size) * 0.5f),
 				aida::ui::with_alpha(tcol, a), menus[i].label);
 
-			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			if (clicked_btn) {
 				menu_bar::open_menu = is_open ? -1 : i;
 				menu_bar::any_open = (menu_bar::open_menu >= 0);
 			}
@@ -2820,9 +2827,13 @@ void helpers::render_title()
 					auto menu_item = [&](const char* label, const char* shortcut, bool enabled = true) -> bool {
 						const auto& th_p = aida::ui::resolved();
 						ImVec2 cp = ImGui::GetCursorScreenPos();
+						ImGui::PushID(label);
+						ImGui::InvisibleButton("##mi", ImVec2(mw, ih));
+						bool mhov = enabled && ImGui::IsItemHovered();
+						bool clicked = enabled && ImGui::IsItemClicked(ImGuiMouseButton_Left);
+						ImGui::PopID();
 						ImVec2 rmin = cp;
 						ImVec2 rmax(cp.x + mw, cp.y + ih);
-						bool mhov = enabled && ImGui::IsMouseHoveringRect(rmin, rmax);
 						ImDrawList* idl = ImGui::GetWindowDrawList();
 						if (mhov) idl->AddRectFilled(rmin, rmax,
 							aida::ui::with_alpha(th_p.hover_wash, 1.f), 8.f);
@@ -2842,8 +2853,6 @@ void helpers::render_title()
 								ImVec2(cp.x + mw - sts.x - 14.f, cp.y + (ih - short_sz) * 0.5f),
 								aida::ui::with_alpha(th_p.text_dim, 1.f), shortcut);
 						}
-						ImGui::Dummy(ImVec2(mw, ih));
-						bool clicked = mhov && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
 						if (clicked) { menu_bar::open_menu = -1; menu_bar::any_open = false; ImGui::CloseCurrentPopup(); }
 						return clicked;
 					};
@@ -3005,7 +3014,10 @@ void helpers::render_title()
 								disasm::load_pe(fpath, g_disasm.file);
 								function_index::on_file_loaded();
 								xref_index::on_file_loaded();
-								if (g_disasm.file.loaded) disasm::decode_section_async(g_disasm.file);
+								if (g_disasm.file.loaded) {
+									disasm::decode_section_async(g_disasm.file);
+									initial_analysis::run_initial_analysis_for_loaded_file();
+								}
 							}
 						}
 						if (menu_item("Attach to Process...", "")) {
@@ -4888,12 +4900,14 @@ void helpers::render_title()
 		if (cf_clicked) {
 			std::string fpath = disasm::open_file_dialog(g_hwnd);
 			if (!fpath.empty()) {
-			g_disasm.file = DisasmFile{};
+				g_disasm.file = DisasmFile{};
 				disasm::load_pe(fpath, g_disasm.file);
 				function_index::on_file_loaded();
 				xref_index::on_file_loaded();
-				if (g_disasm.file.loaded)
+				if (g_disasm.file.loaded) {
 					disasm::decode_section_async(g_disasm.file);
+					initial_analysis::run_initial_analysis_for_loaded_file();
+				}
 			}
 		}
 
@@ -5271,7 +5285,7 @@ void helpers::render_title()
 
 		float line_h     = ImGui::GetFontSize();
 		float input_pad  = 10.f;
-		float pill_zone_h = 28.f;
+		float pill_strip_total_h = 34.f;
 		int   num_lines  = 1;
 		{
 			for (const char* p = g_chat_buf; *p; ++p)
@@ -5286,10 +5300,10 @@ void helpers::render_title()
 		}
 		int   max_lines  = 8;
 		int   vis_lines  = std::max(1, std::min(num_lines, max_lines));
-		float input_h    = vis_lines * line_h + input_pad * 2.f + pill_zone_h;
-		float bot_pad    = 4.f;
+		float input_h    = vis_lines * line_h + input_pad * 2.f;
+		float bot_pad    = 6.f;
 		float input_y    = ch - input_h - bot_pad;
-		float chat_sep_y = input_y - 6.f;
+		float chat_sep_y = input_y - pill_strip_total_h - 4.f;
 		float msg_area_h = chat_sep_y - 24.f;
 
 
@@ -5300,17 +5314,73 @@ void helpers::render_title()
 			float gear_sz = 28.f;
 			float btn_gap = 6.f;
 			float btn_area = gear_sz * 3.f + btn_gap * 2.f + 8.f;
+			float hdr_y = 4.f;
+			float hdr_h = 28.f;
 			float bx = cw - btn_area;
 			if (bx < 4.f) bx = 4.f;
 
 			ImGuiStorage* hs = ImGui::GetStateStorage();
+
+			{
+				std::string title;
+				for (const auto& cs : conversations::history) {
+					if (cs.id == conversations::current_id) { title = cs.title; break; }
+				}
+				if (title.empty()) {
+					title = conversations::current_id.empty() ? std::string("New chat") : std::string("Untitled");
+				}
+
+				ImFont* tf = aida::ui::fonts::body_strong() ? aida::ui::fonts::body_strong() : ImGui::GetFont();
+				float tf_size = tf->FontSize > 0.f ? tf->FontSize : 14.f;
+				float title_x = 8.f;
+				float title_max_w = bx - title_x - 12.f;
+				if (title_max_w < 40.f) title_max_w = 40.f;
+
+				ImVec2 ts = tf->CalcTextSizeA(tf_size, FLT_MAX, 0.f, title.c_str());
+				if (ts.x > title_max_w) {
+					while (title.size() > 1) {
+						title.pop_back();
+						std::string cand = title + "...";
+						if (tf->CalcTextSizeA(tf_size, FLT_MAX, 0.f, cand.c_str()).x <= title_max_w) {
+							title = cand;
+							break;
+						}
+					}
+					ts = tf->CalcTextSizeA(tf_size, FLT_MAX, 0.f, title.c_str());
+				}
+				hdr_dl->AddText(tf, tf_size,
+					ImVec2(wpos_ch.x + title_x, wpos_ch.y + hdr_y + (hdr_h - tf_size) * 0.5f),
+					aida::ui::with_alpha(th_ch.text_primary, 0.92f * a),
+					title.c_str());
+
+				ImFont* cf2 = aida::ui::fonts::caption() ? aida::ui::fonts::caption() : ImGui::GetFont();
+				float cf2_size = cf2->FontSize > 0.f ? cf2->FontSize : 12.f;
+				int msg_count = static_cast<int>(g_chat_messages.size());
+				char meta_buf[64];
+				if (msg_count <= 0) std::snprintf(meta_buf, sizeof(meta_buf), "Ready");
+				else if (msg_count == 1) std::snprintf(meta_buf, sizeof(meta_buf), "1 message");
+				else std::snprintf(meta_buf, sizeof(meta_buf), "%d messages", msg_count);
+				ImVec2 meta_ts = cf2->CalcTextSizeA(cf2_size, FLT_MAX, 0.f, meta_buf);
+				float meta_x = wpos_ch.x + title_x + ts.x + 12.f;
+				if (meta_x + meta_ts.x < wpos_ch.x + bx - 12.f) {
+					hdr_dl->AddText(cf2, cf2_size,
+						ImVec2(meta_x, wpos_ch.y + hdr_y + (hdr_h - cf2_size) * 0.5f),
+						aida::ui::with_alpha(th_ch.text_dim, 0.85f * a),
+						meta_buf);
+				}
+			}
+
 			auto draw_circle_btn = [&](const char* label, const char* tip,
 				const char* icon_render, float bx_local, float by_local,
 				ImU32 icon_col_resting) -> bool
 			{
 				ImVec2 ba(wpos_ch.x + bx_local, wpos_ch.y + by_local);
 				ImVec2 bb(ba.x + gear_sz, ba.y + gear_sz);
-				bool hov = ImGui::IsMouseHoveringRect(ba, bb);
+				ImGui::SetCursorPos(ImVec2(bx_local, by_local));
+				ImGui::SetNextItemAllowOverlap();
+				ImGui::InvisibleButton(label, ImVec2(gear_sz, gear_sz));
+				bool hov = ImGui::IsItemHovered();
+				bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 				ImGuiID hid = ImGui::GetID(label);
 				float hv = hs->GetFloat(hid, 0.f);
 				hv += ((hov ? 1.f : 0.f) - hv) * std::min(12.f * dt, 1.f);
@@ -5325,27 +5395,26 @@ void helpers::render_title()
 					ImVec2((ba.x + bb.x) * 0.5f - ic_ts.x * 0.5f,
 					       (ba.y + bb.y) * 0.5f - ic_ts.y * 0.5f),
 					aida::ui::with_alpha(ic, a), icon_render);
-
-				ImGui::SetCursorPos(ImVec2(bx_local, by_local));
-				ImGui::InvisibleButton(label, ImVec2(gear_sz, gear_sz));
-				bool clicked = ImGui::IsItemDeactivated() && ImGui::IsItemHovered();
-				if (ImGui::IsItemHovered() && tip) ImGui::SetTooltip("%s", tip);
+				if (hov) {
+					ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+					if (tip) ImGui::SetTooltip("%s", tip);
+				}
 				return clicked;
 			};
 
-			if (draw_circle_btn("##chat_history", "Conversation history", "H", bx, 4.f, th_ch.text_primary)) {
+			if (draw_circle_btn("##chat_history", "Conversation history", "H", bx, hdr_y, th_ch.text_primary)) {
 				conversations::refresh_history();
 				conversations::browser_open = !conversations::browser_open;
 			}
 			bx += gear_sz + btn_gap;
-			if (draw_circle_btn("##new_chat", "New chat", "+", bx, 4.f, th_ch.text_primary)) {
+			if (draw_circle_btn("##new_chat", "New chat", "+", bx, hdr_y, th_ch.text_primary)) {
 				conversations::new_chat();
 			}
 			bx += gear_sz + btn_gap;
-			if (draw_circle_btn("##chat_settings", "AI Settings", ICON_COG, bx, 4.f, th_ch.text_primary)) {
+			if (draw_circle_btn("##chat_settings", "AI Settings", ICON_COG, bx, hdr_y, th_ch.text_primary)) {
 				g_settings_open = true;
 			}
-			ImGui::SetCursorPosY(28.f);
+			ImGui::SetCursorPosY(hdr_y + hdr_h);
 		}
 
 
@@ -6152,11 +6221,33 @@ void helpers::render_title()
 			float igap   = 4.f;
 
 			float pill_strip_h = 26.f;
-			float pill_strip_x = 4.f;
-			ImVec2 pill_anchor_window = ImVec2(pill_strip_x, input_y - pill_strip_h - 2.f);
-			ImVec2 pill_anchor_screen = ImVec2(ImGui::GetWindowPos().x + pill_anchor_window.x,
-				ImGui::GetWindowPos().y + pill_anchor_window.y);
-			chat_render_agent_pill(pill_anchor_screen.x, pill_anchor_screen.y, a);
+			float pill_strip_x = 6.f;
+			float pill_strip_gap = 6.f;
+			float pill_strip_y = input_y - pill_strip_h - 4.f;
+			float pill_cursor_x = pill_strip_x;
+			ImVec2 chat_wp = ImGui::GetWindowPos();
+
+			{
+				float w_model = chat_model_pill_width();
+				chat_render_model_pill(chat_wp.x + pill_cursor_x, chat_wp.y + pill_strip_y, a);
+				pill_cursor_x += w_model + pill_strip_gap;
+			}
+			{
+				float w_agent = chat_agent_pill_width();
+				chat_render_agent_pill(chat_wp.x + pill_cursor_x, chat_wp.y + pill_strip_y, a);
+				pill_cursor_x += w_agent + pill_strip_gap;
+			}
+			{
+				float w_skills = chat_skills_pill_width();
+				chat_render_skills_pill(chat_wp.x + pill_cursor_x, chat_wp.y + pill_strip_y, a,
+					g_chat_buf, sizeof(g_chat_buf));
+				pill_cursor_x += w_skills + pill_strip_gap;
+			}
+			{
+				float w_mcp = chat_mcp_pill_width();
+				chat_render_mcp_pill(chat_wp.x + pill_cursor_x, chat_wp.y + pill_strip_y, a);
+				pill_cursor_x += w_mcp + pill_strip_gap;
+			}
 
 
 			ImGui::SetCursorPos(ImVec2(0.f, input_y));
@@ -6185,6 +6276,7 @@ void helpers::render_title()
 			};
 
 			float input_w = cw - btn_sz - igap;
+			ImGui::SetNextItemAllowOverlap();
 			ImGui::SetNextItemWidth(input_w);
 			ImGui::InputTextMultiline("##chatinput", g_chat_buf, sizeof(g_chat_buf),
 				ImVec2(input_w, input_h),
@@ -6196,6 +6288,8 @@ void helpers::render_title()
 			bool input_active = ImGui::IsItemActive();
 			ImVec2 input_min  = ImGui::GetItemRectMin();
 			ImVec2 input_max  = ImGui::GetItemRectMax();
+			(void)input_max;
+			(void)input_bg_col;
 			ImGui::PopStyleVar(2);
 			ImGui::PopStyleColor(3);
 
@@ -6208,138 +6302,6 @@ void helpers::render_title()
 				float ph_y = input_min.y + input_pad;
 				dl->AddText(ImVec2(input_min.x + 8.f, ph_y),
 					aida::ui::with_alpha(aida::ui::resolved().text_dim, 0.7f * a), "Ask anything...");
-			}
-
-			{
-				static float popup_alpha = 0.f;
-				auto* active_profile = g_sa_settings.get_active_profile();
-				std::string provider = active_profile ? active_profile->display_name : "No profile";
-				std::string model    = active_profile ? active_profile->model : "No model";
-
-				if (model.empty()) model = "Select model";
-				std::string pill_text = model;
-
-				float max_pill_w = (input_max.x - input_min.x) * 0.85f;
-				ImVec2 pill_ts = ImGui::CalcTextSize(pill_text.c_str());
-				if (pill_ts.x > max_pill_w) {
-					while (pill_text.size() > 6) {
-						pill_text.pop_back();
-						std::string candidate = pill_text + "...";
-						ImVec2 cts = ImGui::CalcTextSize(candidate.c_str());
-						if (cts.x <= max_pill_w) {
-							pill_text = candidate;
-							break;
-						}
-					}
-				}
-				pill_ts = ImGui::CalcTextSize(pill_text.c_str());
-
-				float pill_h  = 22.f;
-				float pill_w  = pill_ts.x + 24.f;
-				float pill_x  = input_min.x + 8.f;
-				float pill_y_abs = input_max.y - pill_h - 4.f;
-
-				ImVec2 pmin(pill_x, pill_y_abs);
-				ImVec2 pmax(pill_x + pill_w, pill_y_abs + pill_h);
-
-				bool pill_hov = ImGui::IsMouseHoveringRect(pmin, pmax);
-				static float pill_ht = 0.f;
-				pill_ht += ((pill_hov ? 1.f : 0.f) - pill_ht) * std::min(10.f * dt, 1.f);
-
-				dl->AddRectFilled(pmin, pmax,
-					aida::ui::with_alpha(aida::ui::resolved().bg_overlay, (0.63f + 0.16f * pill_ht) * a), 11.f);
-				dl->AddRect(pmin, pmax,
-					aida::ui::with_alpha(aida::ui::resolved().border_strong, (0.5f + 0.5f * pill_ht) * a), 11.f, 0, 0.75f);
-				dl->AddText(ImVec2(pmin.x + 12.f, pmin.y + (pill_h - pill_ts.y) * 0.5f),
-					aida::ui::with_alpha(aida::ui::resolved().text_secondary, (0.85f + 0.15f * pill_ht) * a), pill_text.c_str());
-
-				ImVec2 wp = ImGui::GetWindowPos();
-				ImGui::SetCursorPos(ImVec2(pmin.x - wp.x, pmin.y - wp.y));
-				ImGui::InvisibleButton("##model_pill", ImVec2(pill_w, pill_h));
-				if (ImGui::IsItemClicked())
-					ImGui::OpenPopup("##model_popup");
-				if (ImGui::IsItemHovered())
-					ImGui::SetTooltip("Click to change model");
-
-				bool popup_open = ImGui::IsPopupOpen("##model_popup");
-				float popup_target = popup_open ? 1.f : 0.f;
-				popup_alpha += (popup_target - popup_alpha) * std::min(12.f * dt, 1.f);
-				if (popup_alpha < 0.01f) popup_alpha = 0.f;
-
-				ImGui::SetNextWindowPos(ImVec2(pmin.x, pmin.y - 6.f * std::min(popup_alpha * 2.f, 1.f)), ImGuiCond_Always, ImVec2(0.f, 1.f));
-				ImGui::SetNextWindowSizeConstraints(ImVec2(260.f, 60.f), ImVec2(380.f, 400.f));
-				ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
-				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.f, 6.f));
-				ImGui::PushStyleVar(ImGuiStyleVar_Alpha, std::min(popup_alpha * 2.f, 1.f));
-				ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(th_ph_r/255.f, th_ph_g/255.f, th_ph_b/255.f, 0.96f));
-				ImGui::PushStyleColor(ImGuiCol_Border, ImGui::ColorConvertU32ToFloat4(aida::ui::resolved().border_strong));
-
-				if (ImGui::BeginPopup("##model_popup", ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-					ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings))
-				{
-					static char model_filter[64] = {};
-					ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
-					ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 4.f));
-					ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(aida::ui::resolved().bg_base));
-					ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
-					ImGui::InputTextWithHint("##model_search", "Search models...", model_filter, sizeof(model_filter));
-					ImGui::PopStyleColor();
-					ImGui::PopStyleVar(2);
-
-					ImGui::Spacing();
-					std::string filter_lower;
-					for (const char* p = model_filter; *p; p++)
-						filter_lower += (char)tolower(*p);
-
-					ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::resolved().text_secondary), "Providers");
-					ImGui::Separator();
-					for (auto& profile : g_sa_settings.provider_profiles) {
-						if (!filter_lower.empty()) {
-							std::string pname_lower;
-							for (char ch : profile.display_name)
-								pname_lower += (char)tolower(ch);
-							if (pname_lower.find(filter_lower) == std::string::npos)
-								continue;
-						}
-						bool is_active = (profile.id == g_sa_settings.active_provider_profile_id);
-						if (is_active) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ax3, ay3, az3, 1.f));
-						if (ImGui::Selectable(profile.display_name.c_str(), is_active, 0, ImVec2(200.f, 0.f))) {
-							g_sa_settings.active_provider_profile_id = profile.id;
-							g_sa_settings.sync_legacy_fields_from_active_profile();
-							g_sa_settings_request_save();
-						}
-						if (is_active) ImGui::PopStyleColor();
-					}
-
-					ImGui::Spacing();
-					ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::resolved().text_secondary), "Models");
-					ImGui::Separator();
-
-					if (auto* current_profile = g_sa_settings.get_active_profile()) {
-						const auto& model_list = settings_sa_t::models_for_kind(current_profile->kind);
-						for (const auto& m : model_list) {
-							if (!filter_lower.empty()) {
-								std::string m_lower;
-								for (char ch : m)
-									m_lower += (char)tolower(ch);
-								if (m_lower.find(filter_lower) == std::string::npos)
-									continue;
-							}
-							bool is_sel = (current_profile->model == m);
-							if (is_sel) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ax3, ay3, az3, 1.f));
-							if (ImGui::Selectable(m.c_str(), is_sel, 0, ImVec2(260.f, 0.f))) {
-								current_profile->model = m;
-								g_sa_settings.sync_legacy_fields_from_active_profile();
-								g_sa_settings_request_save();
-								ImGui::CloseCurrentPopup();
-							}
-							if (is_sel) ImGui::PopStyleColor();
-						}
-					}
-					ImGui::EndPopup();
-				}
-				ImGui::PopStyleColor(2);
-				ImGui::PopStyleVar(3);
 			}
 
 
@@ -6634,8 +6596,14 @@ void helpers::render_title()
 				float btw = bts.x + 16.f;
 				ImVec2 btmin(bwp.x + btab_x, bwp.y + 2.f);
 				ImVec2 btmax(btmin.x + btw, btmin.y + btab_h - 2.f);
-				bool bthov = ImGui::IsMouseHoveringRect(btmin, btmax);
 				bool btact = (static_cast<int>(globals::ui::active_bottom_tab) == bt);
+
+				ImGui::PushID(btab_names[bt]);
+				ImGui::SetCursorScreenPos(btmin);
+				ImGui::InvisibleButton("##btab", ImVec2(btw, btab_h - 2.f));
+				bool bthov = ImGui::IsItemHovered();
+				bool btclick = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+				ImGui::PopID();
 
 				if (btact)
 					bdl->AddRectFilled(btmin, btmax, aida::ui::with_alpha(th_lp.border_subtle, a), 3.f);
@@ -6651,7 +6619,7 @@ void helpers::render_title()
 				                  : aida::ui::with_alpha(th_lp.text_secondary, a);
 				bdl->AddText(ImVec2(btmin.x + 8.f, btmin.y + (btab_h - 2.f - bts.y) * 0.5f), btc, btab_names[bt]);
 
-				if (bthov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+				if (btclick)
 					globals::ui::active_bottom_tab = static_cast<bottom_tab_t>(bt);
 
 				btab_x += btw + 2.f;
@@ -6677,10 +6645,15 @@ void helpers::render_title()
 				ImVec2 cts = ImGui::CalcTextSize(clr);
 				ImVec2 cmin(bwp.x + bfw - cts.x - 16.f, bwp.y + 4.f);
 				ImVec2 cmax(cmin.x + cts.x + 8.f, cmin.y + btab_h - 6.f);
-				bool chov = ImGui::IsMouseHoveringRect(cmin, cmax);
+				ImGui::PushID("##bottom_clear");
+				ImGui::SetCursorScreenPos(cmin);
+				ImGui::InvisibleButton("##bclear", ImVec2(cmax.x - cmin.x, cmax.y - cmin.y));
+				bool chov = ImGui::IsItemHovered();
+				bool cclick = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+				ImGui::PopID();
 				if (chov) bdl->AddRectFilled(cmin, cmax, aida::ui::with_alpha(th_lp.hover_wash, a), 3.f);
 				bdl->AddText(ImVec2(cmin.x + 4.f, cmin.y + 1.f), aida::ui::with_alpha(th_lp.text_secondary, (chov ? 1.f : 0.64f) * a), clr);
-				if (chov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+				if (cclick) {
 					if (globals::ui::active_bottom_tab == bottom_tab_t::terminal) {
 						auto& tmgr_clear = globals::terminal_mgr;
 						if (!tmgr_clear.sessions.empty() && tmgr_clear.sessions[0]) {
@@ -6688,6 +6661,51 @@ void helpers::render_title()
 						}
 					} else {
 						output_log::clear(globals::ui::active_bottom_tab);
+					}
+				}
+
+				const char* cpy = "Copy";
+				ImVec2 yts = ImGui::CalcTextSize(cpy);
+				ImVec2 ymin(cmin.x - yts.x - 22.f, cmin.y);
+				ImVec2 ymax(ymin.x + yts.x + 8.f, cmin.y + btab_h - 6.f);
+				ImGui::PushID("##bottom_copy");
+				ImGui::SetCursorScreenPos(ymin);
+				ImGui::InvisibleButton("##bcopy", ImVec2(ymax.x - ymin.x, ymax.y - ymin.y));
+				bool yhov = ImGui::IsItemHovered();
+				bool yclick = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+				ImGui::PopID();
+				if (yhov) bdl->AddRectFilled(ymin, ymax, aida::ui::with_alpha(th_lp.hover_wash, a), 3.f);
+				bdl->AddText(ImVec2(ymin.x + 4.f, ymin.y + 1.f), aida::ui::with_alpha(th_lp.text_secondary, (yhov ? 1.f : 0.64f) * a), cpy);
+				if (yclick) {
+					if (globals::ui::active_bottom_tab == bottom_tab_t::terminal) {
+						auto& tmgr_cpy = globals::terminal_mgr;
+						if (!tmgr_cpy.sessions.empty() && tmgr_cpy.sessions[0]) {
+							auto* ts_cpy = tmgr_cpy.sessions[0];
+							std::string all_text;
+							{
+								std::lock_guard<std::mutex> lk(ts_cpy->buffer_mtx);
+								for (auto& row : ts_cpy->lines) {
+									for (auto& cell : row)
+										all_text += cell.ch;
+									while (!all_text.empty() && all_text.back() == ' ')
+										all_text.pop_back();
+									all_text += '\n';
+								}
+							}
+							if (!all_text.empty())
+								ImGui::SetClipboardText(all_text.c_str());
+						}
+					} else {
+						int tab_idx_cpy = static_cast<int>(globals::ui::active_bottom_tab);
+						auto& log_lines_cpy = output_log::lines[tab_idx_cpy];
+						std::string all_text;
+						all_text.reserve(log_lines_cpy.size() * 80);
+						for (const auto& ln : log_lines_cpy) {
+							all_text += ln;
+							all_text += '\n';
+						}
+						if (!all_text.empty())
+							ImGui::SetClipboardText(all_text.c_str());
 					}
 				}
 			}
@@ -6802,71 +6820,44 @@ void helpers::render_title()
 
 				int tab_idx = static_cast<int>(globals::ui::active_bottom_tab);
 				auto& log_lines = output_log::lines[tab_idx];
-				float line_h = ImGui::GetFontSize() + 2.f;
-				ImDrawList* ldl = ImGui::GetWindowDrawList();
-				ImVec2 lorig = ImGui::GetWindowPos();
-				float scroll_y = ImGui::GetScrollY();
-				float vis_h = ImGui::GetWindowHeight();
 
+				static std::string s_log_joined[static_cast<int>(bottom_tab_t::COUNT)];
+				static size_t s_log_last_size[static_cast<int>(bottom_tab_t::COUNT)] = { 0, 0, 0, 0, 0 };
+				static size_t s_log_last_back_hash[static_cast<int>(bottom_tab_t::COUNT)] = { 0, 0, 0, 0, 0 };
 
-				bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
-				if (focused) {
-					auto& io = ImGui::GetIO();
-					if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A, false))
-						output_log::select_all[tab_idx] = true;
-					if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false) && output_log::select_all[tab_idx]) {
-						std::string all_text;
-						all_text.reserve(log_lines.size() * 80);
-						for (const auto& ln : log_lines) {
-							all_text += ln;
-							all_text += '\n';
-						}
-						if (!all_text.empty())
-							ImGui::SetClipboardText(all_text.c_str());
+				size_t cur_size = log_lines.size();
+				size_t back_hash = log_lines.empty() ? 0u : std::hash<std::string>{}(log_lines.back());
+				if (cur_size != s_log_last_size[tab_idx] || back_hash != s_log_last_back_hash[tab_idx]) {
+					s_log_joined[tab_idx].clear();
+					s_log_joined[tab_idx].reserve(cur_size * 80);
+					for (const auto& ln : log_lines) {
+						s_log_joined[tab_idx] += ln;
+						s_log_joined[tab_idx] += '\n';
 					}
-
-					if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-						output_log::select_all[tab_idx] = false;
-				} else {
-					output_log::select_all[tab_idx] = false;
+					s_log_last_size[tab_idx] = cur_size;
+					s_log_last_back_hash[tab_idx] = back_hash;
 				}
 
-				int first = std::max(0, (int)(scroll_y / line_h) - 1);
-				int last = std::min((int)log_lines.size() - 1, (int)((scroll_y + vis_h) / line_h) + 1);
+				ImVec2 mt_size(bfw - 4.f, bfh - log_y - 4.f);
+				ImGui::PushFont(aida::ui::fonts::code());
+				ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(0, 0, 0, 0));
+				ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, IM_COL32(0, 0, 0, 0));
+				ImGui::PushStyleColor(ImGuiCol_FrameBgActive, IM_COL32(0, 0, 0, 0));
+				ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(0, 0, 0, 0));
+				ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(th_lp.text_secondary, a));
+				ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, aida::ui::with_alpha(th_lp.selection_strong, a * 0.75f));
+				ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.f);
+				ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 4.f));
 
-				for (int li = first; li <= last; li++) {
-					float ly = lorig.y + li * line_h - scroll_y;
+				std::string& buf = s_log_joined[tab_idx];
+				size_t cap = buf.size() + 1;
+				ImGui::InputTextMultiline("##log_view", const_cast<char*>(buf.c_str()),
+					cap, mt_size,
+					ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_NoUndoRedo);
 
-
-					if (output_log::select_all[tab_idx])
-						ldl->AddRectFilled(ImVec2(lorig.x, ly), ImVec2(lorig.x + bfw, ly + line_h),
-							IM_COL32((int)(bax * 0.3f), (int)(bay * 0.3f), (int)(baz * 0.3f), (int)(50 * a)));
-					else if (li & 1)
-						ldl->AddRectFilled(ImVec2(lorig.x, ly), ImVec2(lorig.x + bfw, ly + line_h),
-							aida::ui::with_alpha(th_lp.hover_wash, 0.18f * a));
-
-
-					const auto& ln = log_lines[li];
-					ImU32 lc = aida::ui::with_alpha(th_lp.text_secondary, a);
-					if (ln.find("Error") != std::string::npos || ln.find("ERR") != std::string::npos)
-						lc = aida::ui::with_alpha(th_lp.error, a);
-					else if (ln.find("[init]") != std::string::npos)
-						lc = aida::ui::with_alpha(th_lp.success, a);
-					else if (ln.find("[tool]") != std::string::npos || ln.find("[mcp") != std::string::npos)
-						lc = IM_COL32((int)(bax*0.6f+100), (int)(bay*0.6f+100), (int)(baz*0.6f+100), (int)(210 * a));
-					else if (ln.find("[ai]") != std::string::npos)
-						lc = aida::ui::with_alpha(th_lp.info, a);
-					else if (ln.find("[driver]") != std::string::npos)
-						lc = aida::ui::with_alpha(th_lp.warning, a);
-
-					ldl->AddText(ImVec2(lorig.x + 8.f, ly + 1.f), lc, ln.c_str());
-				}
-
-				ImGui::SetCursorPosY((float)log_lines.size() * line_h);
-				ImGui::Dummy(ImVec2(1.f, 1.f));
-
-				if (output_log::auto_scroll[tab_idx] && !log_lines.empty())
-					ImGui::SetScrollHereY(1.f);
+				ImGui::PopStyleVar(2);
+				ImGui::PopStyleColor(6);
+				ImGui::PopFont();
 			}
 			}
 			ImGui::EndChild();
@@ -7604,6 +7595,9 @@ void helpers::render_title()
 		ImGui::PopStyleVar(2);
 		ImGui::PopStyleColor(2);
 	}
+
+	g_render_section = "popups_initial_analysis";
+	initial_analysis_view::render_frame();
 
 	g_render_section = "popups_tool_approval";
 	render_tool_approval_dialog();

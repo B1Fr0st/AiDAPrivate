@@ -62,7 +62,7 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a)
 	cx += 104.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy + 4.f));
-	ImGui::PushItemWidth(120.f);
+	ImGui::PushItemWidth(186.f);
 	ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(t.panel_bg, a));
 	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, a));
 	ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::with_alpha(t.bg_overlay, 1.f));
@@ -81,7 +81,7 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a)
 	ImGui::PopStyleVar(2);
 	ImGui::PopStyleColor(4);
 	ImGui::PopItemWidth();
-	cx += 130.f;
+	cx += 196.f;
 
 	bool needs_value = (sc.config.scan_mode != memory_scanner::scan_mode_t::changed &&
 						sc.config.scan_mode != memory_scanner::scan_mode_t::unchanged &&

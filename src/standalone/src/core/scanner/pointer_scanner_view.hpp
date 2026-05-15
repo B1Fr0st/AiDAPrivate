@@ -344,8 +344,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + width, y0 + height),
 		aida::ui::with_alpha(t.bg_base, a));
 
-	float toolbar_h = 48.f;
-	float config_panel_w = 280.f;
+	float toolbar_h = 56.f;
+	float config_panel_w = 340.f;
 	float row_h = 28.f;
 
 	dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + width, y0 + toolbar_h),
@@ -353,9 +353,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	dl->AddLine(ImVec2(x0, y0 + toolbar_h), ImVec2(x0 + width, y0 + toolbar_h),
 		aida::ui::with_alpha(t.border_subtle, a), 1.f);
 
-	dl->AddText(aida::ui::fonts::body_em(), 14.f,
-		ImVec2(x0 + 16.f, y0 + (toolbar_h - 14.f) * 0.5f),
-		aida::ui::with_alpha(t.text_primary, a), "Pointer Chain Scanner");
+	{
+		ImFont* hdr_fn = aida::ui::fonts::body_em();
+		float hdr_fs = hdr_fn ? hdr_fn->FontSize : 16.f;
+		dl->AddText(hdr_fn, hdr_fs,
+			ImVec2(x0 + 16.f, y0 + (toolbar_h - hdr_fs) * 0.5f),
+			aida::ui::with_alpha(t.text_primary, a), "Pointer Chain Scanner");
+	}
 
 	{
 		char status_buf[160];
@@ -370,9 +374,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			res_count = st.results.size();
 		}
 		snprintf(status_buf, sizeof(status_buf), "Map: %zu  ·  Chains: %zu", entries, res_count);
+		ImFont* sf = aida::ui::fonts::body();
+		float sfs = sf ? sf->FontSize : ImGui::GetFontSize();
 		ImVec2 ts = ImGui::CalcTextSize(status_buf);
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
-			ImVec2(x0 + width - ts.x - 16.f, y0 + (toolbar_h - 12.f) * 0.5f),
+		dl->AddText(sf, sfs,
+			ImVec2(x0 + width - ts.x - 16.f, y0 + (toolbar_h - sfs) * 0.5f),
 			aida::ui::with_alpha(t.text_secondary, a), status_buf);
 	}
 
@@ -385,37 +391,54 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	dl->AddLine(ImVec2(cfg_x + config_panel_w, cfg_y), ImVec2(cfg_x + config_panel_w, cfg_y + cfg_h),
 		aida::ui::with_alpha(t.border_subtle, a), 1.f);
 
-	float cy = cfg_y + 16.f;
-	float cx = cfg_x + 16.f;
-	float field_w = config_panel_w - 32.f;
+	float cy = cfg_y + 18.f;
+	float cx = cfg_x + 18.f;
+	float field_w = config_panel_w - 36.f;
 
-	dl->AddText(aida::ui::fonts::body_em(), 13.f,
-		ImVec2(cx, cy), aida::ui::with_alpha(t.text_primary, a), "Configuration");
-	cy += 24.f;
+	{
+		ImFont* hfn = aida::ui::fonts::body_em();
+		float hfs = hfn ? hfn->FontSize : 14.f;
+		dl->AddText(hfn, hfs,
+			ImVec2(cx, cy), aida::ui::with_alpha(t.text_primary, a), "Configuration");
+		cy += hfs + 12.f;
+	}
 
-	dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
-		ImVec2(cx, cy), aida::ui::with_alpha(t.text_dim, a), "Target Address");
-	cy += 16.f;
+	{
+		ImFont* lblf = aida::ui::fonts::body();
+		float lblfs = lblf ? lblf->FontSize : ImGui::GetFontSize();
+		dl->AddText(lblf, lblfs,
+			ImVec2(cx, cy), aida::ui::with_alpha(t.text_dim, a), "Target Address");
+		cy += lblfs + 6.f;
+	}
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 	aida::ui::input_text("##ptr_addr", st.addr_buf, sizeof(st.addr_buf),
 		"e.g. 7FF60012A440", false, ImVec2(field_w, 32.f));
-	cy += 38.f;
+	cy += 44.f;
 
 	auto draw_label_and_value = [&](const char* lbl, int value) {
-		ImFont* lblf = aida::ui::fonts::caption();
+		ImFont* lblf = aida::ui::fonts::body();
 		if (!lblf) lblf = ImGui::GetFont();
 		ImFont* valf = aida::ui::fonts::body_em();
 		if (!valf) valf = ImGui::GetFont();
-		dl->AddText(lblf, lblf->FontSize,
+		float lblfs = lblf->FontSize;
+		float valfs = valf->FontSize;
+		dl->AddText(lblf, lblfs,
 			ImVec2(cx, cy), aida::ui::with_alpha(t.text_dim, a), lbl);
 		char vbuf[32];
 		std::snprintf(vbuf, sizeof(vbuf), "%d", value);
-		ImVec2 vts = valf->CalcTextSizeA(valf->FontSize, FLT_MAX, 0.f, vbuf);
-		dl->AddText(valf, valf->FontSize,
-			ImVec2(cx + field_w - vts.x, cy),
+		ImVec2 vts = valf->CalcTextSizeA(valfs, FLT_MAX, 0.f, vbuf);
+		float chip_pad_x = 8.f;
+		float chip_w = vts.x + chip_pad_x * 2.f;
+		float chip_h = valfs + 6.f;
+		float chip_x = cx + field_w - chip_w;
+		float chip_y = cy - 2.f;
+		dl->AddRectFilled(ImVec2(chip_x, chip_y), ImVec2(chip_x + chip_w, chip_y + chip_h),
+			aida::ui::with_alpha(t.panel_header, a * 0.9f), chip_h * 0.5f);
+		dl->AddText(valf, valfs,
+			ImVec2(chip_x + chip_pad_x, chip_y + 3.f),
 			aida::ui::with_alpha(t.text_primary, a), vbuf);
-		cy += 16.f;
+		cy += lblfs + 6.f;
 	};
 
 	draw_label_and_value("Max Depth", st.config.max_depth);
@@ -431,7 +454,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PopStyleVar();
 	ImGui::PopStyleColor(4);
 	ImGui::PopItemWidth();
-	cy += 32.f;
+	cy += 36.f;
 
 	int max_off = static_cast<int>(st.config.max_offset);
 	draw_label_and_value("Max Offset", max_off);
@@ -448,7 +471,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PopStyleVar();
 	ImGui::PopStyleColor(4);
 	ImGui::PopItemWidth();
-	cy += 32.f;
+	cy += 36.f;
 
 	int struct_sz = static_cast<int>(st.config.struct_size);
 	draw_label_and_value("Struct Size", struct_sz);
@@ -465,26 +488,26 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PopStyleVar();
 	ImGui::PopStyleColor(4);
 	ImGui::PopItemWidth();
-	cy += 36.f;
+	cy += 40.f;
 
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		bool n = st.config.negative_offsets;
 		aida::ui::toggle_switch("Negative Offsets##neg", &n, aida::ui::size_t_::sm);
 		st.config.negative_offsets = n;
-		cy += 24.f;
+		cy += 28.f;
 	}
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		bool s = st.config.only_static_bases;
 		aida::ui::toggle_switch("Static Bases Only##sb", &s, aida::ui::size_t_::sm);
 		st.config.only_static_bases = s;
-		cy += 30.f;
+		cy += 34.f;
 	}
 
 	dl->AddLine(ImVec2(cx, cy), ImVec2(cx + field_w, cy),
 		aida::ui::with_alpha(t.border_subtle, a), 1.f);
-	cy += 12.f;
+	cy += 14.f;
 
 	bool building = st.map_building.load();
 	bool scanning = st.scanning.load();
@@ -494,20 +517,20 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
 			ImVec2(cx, cy), aida::ui::with_alpha(t.text_dim, a), "Building reverse map...");
 		aida::ui::render_progress_bar(ImVec2(cx, cy + 18.f), field_w, 6.f, prog, false, true);
-		cy += 32.f;
+		cy += 34.f;
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		if (aida::ui::button("Cancel", aida::ui::button_kind_t::destructive,
 				aida::ui::size_t_::md, ImVec2(field_w, 0.f))) {
 			pointer_scanner::cancel_all();
 		}
-		cy += 38.f;
+		cy += 44.f;
 	} else {
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		if (aida::ui::button("Build Pointer Map", aida::ui::button_kind_t::primary,
 				aida::ui::size_t_::md, ImVec2(field_w, 0.f))) {
 			pointer_scanner::build_reverse_map();
 		}
-		cy += 40.f;
+		cy += 46.f;
 	}
 
 	if (scanning) {
@@ -515,13 +538,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
 			ImVec2(cx, cy), aida::ui::with_alpha(t.text_dim, a), "Scanning chains...");
 		aida::ui::render_progress_bar(ImVec2(cx, cy + 18.f), field_w, 6.f, prog, false, true);
-		cy += 32.f;
+		cy += 34.f;
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		if (aida::ui::button("Cancel", aida::ui::button_kind_t::destructive,
 				aida::ui::size_t_::md, ImVec2(field_w, 0.f))) {
 			st.scan_cancel.store(true);
 		}
-		cy += 38.f;
+		cy += 44.f;
 	} else {
 		bool can_scan = !building && st.map_entry_count > 0;
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
@@ -530,26 +553,26 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			st.config.target_address = strtoull(st.addr_buf, nullptr, 16);
 			pointer_scanner::start_scan();
 		}
-		cy += 40.f;
+		cy += 46.f;
 	}
 
 	dl->AddLine(ImVec2(cx, cy), ImVec2(cx + field_w, cy),
 		aida::ui::with_alpha(t.border_subtle, a), 1.f);
-	cy += 12.f;
+	cy += 14.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 	if (aida::ui::button("Validate All", aida::ui::button_kind_t::secondary,
 			aida::ui::size_t_::md, ImVec2(field_w, 0.f))) {
 		pointer_scanner::validate_all_results();
 	}
-	cy += 38.f;
+	cy += 44.f;
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 	if (aida::ui::button("Clear Results", aida::ui::button_kind_t::ghost,
 			aida::ui::size_t_::md, ImVec2(field_w, 0.f))) {
 		pointer_scanner::clear_results();
 		view.chain_anims.clear();
 	}
-	cy += 38.f;
+	cy += 44.f;
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 	if (aida::ui::button("Clear Map", aida::ui::button_kind_t::ghost,
 			aida::ui::size_t_::md, ImVec2(field_w, 0.f))) {

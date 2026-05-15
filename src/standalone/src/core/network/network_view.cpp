@@ -1054,28 +1054,27 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
         snprintf(count_buf, sizeof(count_buf), "%zu packets", pkt_count);
         float count_w = ImGui::CalcTextSize(count_buf).x;
         float row_avail = ImGui::GetContentRegionAvail().x;
-        float pad = 12.f;
-        if (row_avail > count_w + pad) {
+        float right_pad = 12.f;
+        float gap = 14.f;
+        float reserved_right = count_w + right_pad + gap;
+        float input_min = 200.f;
+        float input_max = 640.f;
+        float input_w = row_avail - reserved_right;
+        if (input_w < input_min) input_w = input_min;
+        if (input_w > input_max) input_w = input_max;
+
+        ImGui::SameLine(0.f, gap);
+        aida::ui::input_text("##cap_filter", state.cap_filter_text, sizeof(state.cap_filter_text),
+                              "Filter packets...", false, ImVec2(input_w, 28.f));
+
+        if (row_avail > input_w + reserved_right) {
             ImGui::SameLine();
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (row_avail - count_w - pad));
+            float row_x = ImGui::GetCursorPosX();
+            ImGui::SetCursorPosX(row_x + (row_avail - input_w - count_w - right_pad - gap));
             ImGui::AlignTextToFramePadding();
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
                                "%s", count_buf);
         }
-    }
-
-    ImGui::Spacing();
-
-    {
-        float row_avail = ImGui::GetContentRegionAvail().x;
-        float min_input_w = 200.f;
-        float max_input_w = 640.f;
-        float input_w = row_avail - 8.f;
-        if (input_w < min_input_w) input_w = min_input_w;
-        if (input_w > max_input_w) input_w = max_input_w;
-
-        aida::ui::input_text("##cap_filter", state.cap_filter_text, sizeof(state.cap_filter_text),
-                              "Filter packets...", false, ImVec2(input_w, 28.f));
     }
 
     ImGui::Spacing();
@@ -3420,32 +3419,43 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
     ImGui::Spacing();
 
 
+    ImGui::AlignTextToFramePadding();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
                        "Threads:");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(80.f);
-    ImGui::InputInt("##fuzz_threads", &cfg.thread_count, 1, 4);
+    {
+        int v = cfg.thread_count;
+        if (aida::ui::input_int("##fuzz_threads", &v, ImVec2(120.f, 32.f))) cfg.thread_count = v;
+    }
     cfg.thread_count = std::max(1, std::min(32, cfg.thread_count));
-    ImGui::SameLine();
+    ImGui::SameLine(0.f, 18.f);
+    ImGui::AlignTextToFramePadding();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
                        "Delay (ms):");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(80.f);
-    ImGui::InputInt("##fuzz_delay", &cfg.delay_ms, 0, 0);
+    {
+        int v = cfg.delay_ms;
+        if (aida::ui::input_int("##fuzz_delay", &v, ImVec2(120.f, 32.f))) cfg.delay_ms = v;
+    }
     cfg.delay_ms = std::max(0, cfg.delay_ms);
 
 
+    ImGui::AlignTextToFramePadding();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
                        "Match Status:");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(80.f);
-    ImGui::InputInt("##fuzz_ms", &cfg.match_status, 0, 0);
-    ImGui::SameLine();
+    {
+        int v = cfg.match_status;
+        if (aida::ui::input_int("##fuzz_ms", &v, ImVec2(120.f, 32.f))) cfg.match_status = v;
+    }
+    ImGui::SameLine(0.f, 10.f);
+    ImGui::AlignTextToFramePadding();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
                        "(0=any)");
-    ImGui::SameLine();
+    ImGui::SameLine(0.f, 18.f);
     aida::ui::toggle_switch("##fuzz_stop_match", &cfg.stop_on_match);
-    ImGui::SameLine();
+    ImGui::SameLine(0.f, 10.f);
+    ImGui::AlignTextToFramePadding();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
                        "Stop on match");
 

@@ -375,6 +375,7 @@ namespace aida::ui::components {
 		ImGui::PushID(label);
 		ImGuiID id = ImGui::GetID(label);
 		auto& hov = detail::hstate(id);
+		auto& act = detail::hstate(id ^ 0x9E3779B9u);
 
 		ImVec2 pos = ImGui::GetCursorScreenPos();
 		ImVec2 a = pos;
@@ -384,9 +385,12 @@ namespace aida::ui::components {
 		dl->AddRectFilled(a, b, t.panel_header, 8.f);
 
 		bool active = ImGui::GetActiveID() == ImGui::GetID("##in");
-		float focus_v = hov.tick(active, aida::ui::clock::dt(), aida::motion::spring::balanced);
+		bool hovered = !active && ImGui::IsMouseHoveringRect(a, b, false);
+		float hover_v = hov.tick(hovered, aida::ui::clock::dt(), aida::motion::spring::balanced);
+		float active_v = act.tick(active, aida::ui::clock::dt(), aida::motion::spring::balanced);
+		float focus_v = active_v > hover_v * 0.55f ? active_v : hover_v * 0.55f;
 		ImU32 border = aida::ui::mix(t.border_subtle, t.border_focus, focus_v);
-		dl->AddRect(a, b, border, 8.f, 0, 1.f + focus_v * 0.8f);
+		dl->AddRect(a, b, border, 8.f, 0, 1.f + active_v * 0.8f);
 
 		ImGui::SetCursorScreenPos(ImVec2(a.x + 12.f, a.y + (h - ImGui::GetFontSize()) * 0.5f));
 		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0,0,0,0));
@@ -422,6 +426,7 @@ namespace aida::ui::components {
 		ImGui::PushID(label);
 		ImGuiID id = ImGui::GetID(label);
 		auto& hov = detail::hstate(id);
+		auto& act = detail::hstate(id ^ 0x9E3779B9u);
 
 		ImVec2 pos = ImGui::GetCursorScreenPos();
 		ImVec2 a = pos;
@@ -431,9 +436,12 @@ namespace aida::ui::components {
 		dl->AddRectFilled(a, b, t.panel_header, 8.f);
 
 		bool active = ImGui::GetActiveID() == ImGui::GetID("##ii");
-		float focus_v = hov.tick(active, aida::ui::clock::dt(), aida::motion::spring::balanced);
+		bool hovered = !active && ImGui::IsMouseHoveringRect(a, b, false);
+		float hover_v = hov.tick(hovered, aida::ui::clock::dt(), aida::motion::spring::balanced);
+		float active_v = act.tick(active, aida::ui::clock::dt(), aida::motion::spring::balanced);
+		float focus_v = active_v > hover_v * 0.55f ? active_v : hover_v * 0.55f;
 		ImU32 border = aida::ui::mix(t.border_subtle, t.border_focus, focus_v);
-		dl->AddRect(a, b, border, 8.f, 0, 1.f + focus_v * 0.8f);
+		dl->AddRect(a, b, border, 8.f, 0, 1.f + active_v * 0.8f);
 
 		ImGui::SetCursorScreenPos(ImVec2(a.x + 12.f, a.y + (h - ImGui::GetFontSize()) * 0.5f));
 		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0,0,0,0));

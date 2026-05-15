@@ -295,6 +295,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	bool scanning = cs.scanning.load();
 	bool analyzing = cs.analyzing.load();
 
+	const float btn_gap = 14.f;
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		const char* lbl = scanning ? "Cancel" : "Scan Process";
@@ -304,7 +305,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (scanning) crypto_scanner::cancel();
 			else          crypto_scanner::scan_process();
 		}
-		cx += 130.f;
+		cx = ImGui::GetItemRectMax().x + btn_gap;
 	}
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
@@ -313,7 +314,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), scanning || fl)) {
 			crypto_scanner::scan_file(g_disasm.file);
 		}
-		cx += 110.f;
+		cx = ImGui::GetItemRectMax().x + btn_gap;
 	}
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
@@ -321,7 +322,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), scanning)) {
 			crypto_scanner::scan_entropy();
 		}
-		cx += 100.f;
+		cx = ImGui::GetItemRectMax().x + btn_gap;
 	}
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
@@ -337,7 +338,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				(rp.x - lp.x) * 0.5f + 4.f,
 				aida::ui::with_alpha(t.accent_u32, alpha));
 		}
-		cx += 122.f;
+		cx = ImGui::GetItemRectMax().x + btn_gap + 6.f;
 	}
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
@@ -352,7 +353,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				crypto_scanner::export_results_json(path);
 			}
 		}
-		cx += 80.f;
+		cx = ImGui::GetItemRectMax().x + btn_gap;
 	}
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
@@ -412,15 +413,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			}
 		}
 
-		float pill_x = ox + 16.f + 290.f + 170.f + 12.f;
+		float pill_x = ox + 16.f + 290.f + 170.f + 20.f;
 		float pill_y = cy + 6.f;
 		auto chip = [&](const char* label, int n, aida::ui::components::pill_kind_t k) {
 			char buf[48];
 			snprintf(buf, sizeof(buf), "%s · %d", label, n);
 			ImGui::SetCursorScreenPos(ImVec2(pill_x, pill_y));
 			aida::ui::pill_kind(buf, k, aida::ui::size_t_::sm, true);
-			ImVec2 ts = ImGui::CalcTextSize(buf);
-			pill_x += ts.x + 24.f;
+			pill_x = ImGui::GetItemRectMax().x + 12.f;
 		};
 		chip("hits", total, aida::ui::components::pill_kind_t::accent);
 		chip("ciph", sym, aida::ui::components::pill_kind_t::info);
@@ -506,8 +506,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		ImU32 lc = hov ? aida::ui::with_alpha(t.text_primary, alpha)
 		               : aida::ui::with_alpha(t.text_dim, alpha);
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
-			ImVec2(hx + 4.f, cy + (hdr_h - 11.f) * 0.5f), lc, col_names[c]);
+		ImFont* hdr_fn = aida::ui::fonts::body();
+		float hdr_fs = hdr_fn ? hdr_fn->FontSize : ImGui::GetFontSize();
+		dl->AddText(hdr_fn, hdr_fs,
+			ImVec2(hx + 4.f, cy + (hdr_h - hdr_fs) * 0.5f), lc, col_names[c]);
 		ImVec2 ts = ImGui::CalcTextSize(col_names[c]);
 
 		if (st.sort_column == c) {

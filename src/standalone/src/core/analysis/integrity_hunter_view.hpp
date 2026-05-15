@@ -153,7 +153,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	float strip_y = cy + toolbar_h + 2.f;
-	const float strip_h = 44.f;
+	const float strip_h = 64.f;
 	{
 		int found = 0, neutralized_c = 0, active_c = 0;
 		double avg_rps = 0.0;

@@ -14,6 +14,7 @@
 
 #include "pdb_events.hpp"
 #include "pdb_parser.hpp"
+#include "pdb_downloader.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_settings.hpp"
 
@@ -29,6 +30,10 @@ struct module_symbols_t {
 	bool                                      loading = false;
 	bool                                      failed = false;
 	std::string                               status_text;
+	uint64_t                                  download_total = 0;
+	uint64_t                                  download_received = 0;
+	int                                       download_percent = 0;
+	bool                                      downloading = false;
 };
 
 struct state_t {
@@ -222,6 +227,146 @@ inline void load_pdb_for_module(const std::string& module_name, uint64_t base, u
 		if (publish_event) {
 			aida::events::publish(aida::events::event_pdb_loaded_def, ev_payload);
 		}
+	});
+}
+
+inline void load_pdb_with_hint(const std::string& module_name, uint64_t base, uint64_t size,
+                               const std::string& pdb_name, const std::string& pdb_guid,
+                               uint32_t pdb_age, const std::string& symbol_server_base)
+{
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		auto it = g_state.modules.find(module_name);
+		if (it != g_state.modules.end()) {
+			if (it->second.pdb.loaded || it->second.loading)
+				return;
+		}
+
+		auto& ms = g_state.modules[module_name];
+		ms.module_name = module_name;
+		ms.base = base;
+		ms.size = size;
+		ms.loading = true;
+		ms.failed = false;
+		ms.downloading = false;
+		ms.download_total = 0;
+		ms.download_received = 0;
+		ms.download_percent = 0;
+		ms.status_text = "Resolving PDB...";
+	}
+
+	std::string mod_copy = module_name;
+	std::string pdb_name_copy = pdb_name;
+	std::string pdb_guid_copy = pdb_guid;
+	std::string server_copy = symbol_server_base;
+
+	work_queue::post([mod_copy, pdb_name_copy, pdb_guid_copy, pdb_age, server_copy]() {
+		std::string cache_root = detail::get_cache_dir().string();
+
+		pdb_downloader::download_request_t req;
+		req.pdb_name = pdb_name_copy;
+		req.pdb_guid = pdb_guid_copy;
+		req.pdb_age = pdb_age;
+		req.cache_root = cache_root;
+		req.server_base = server_copy.empty()
+			? std::string("http://msdl.microsoft.com/download/symbols")
+			: server_copy;
+
+		std::string local_path;
+		bool from_cache = pdb_downloader::resolve_cache_path(req, local_path);
+
+		if (!from_cache) {
+			{
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				auto& ms = g_state.modules[mod_copy];
+				ms.downloading = true;
+				ms.status_text = "Downloading PDB...";
+			}
+
+			pdb_downloader::download_result_t result;
+			auto on_progress = [&mod_copy](const pdb_downloader::progress_t& p) {
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				auto it = g_state.modules.find(mod_copy);
+				if (it == g_state.modules.end()) return;
+				it->second.download_percent = p.percent;
+				it->second.download_received = p.bytes_received;
+				it->second.download_total = p.bytes_total;
+				char buf[96];
+				if (p.bytes_total > 0) {
+					snprintf(buf, sizeof(buf), "Downloading PDB: %d%% (%llu / %llu bytes)",
+					         p.percent,
+					         static_cast<unsigned long long>(p.bytes_received),
+					         static_cast<unsigned long long>(p.bytes_total));
+				} else {
+					snprintf(buf, sizeof(buf), "Downloading PDB: %llu bytes",
+					         static_cast<unsigned long long>(p.bytes_received));
+				}
+				it->second.status_text = buf;
+			};
+
+			bool dl_ok = pdb_downloader::download_pdb_sync(req, on_progress, nullptr, result);
+
+			if (!dl_ok) {
+				aida::events::event_pdb_loaded ev_payload;
+				{
+					std::lock_guard<std::mutex> lk(g_state.mutex);
+					auto& ms = g_state.modules[mod_copy];
+					ms.loading = false;
+					ms.downloading = false;
+					ms.failed = true;
+					ms.status_text = "Download failed: " + result.error;
+					ev_payload.module_name = ms.module_name;
+					ev_payload.base = ms.base;
+					ev_payload.size = ms.size;
+					ev_payload.success = false;
+				}
+				aida::events::publish(aida::events::event_pdb_loaded_def, ev_payload);
+				return;
+			}
+
+			local_path = result.local_path;
+		}
+
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			auto& ms = g_state.modules[mod_copy];
+			ms.downloading = false;
+			ms.download_percent = 100;
+			ms.status_text = from_cache ? "Parsing cached PDB..." : "Parsing PDB...";
+		}
+
+		pdb_parser::pdb_info_t info;
+		std::atomic<float> parse_progress{0.f};
+		bool parse_ok = pdb_parser::parse_pdb(local_path, "", info, &parse_progress);
+
+		aida::events::event_pdb_loaded ev_payload;
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			auto& ms = g_state.modules[mod_copy];
+			ms.loading = false;
+			if (parse_ok) {
+				ms.pdb = std::move(info);
+				char buf[96];
+				snprintf(buf, sizeof(buf), "Loaded: %zu symbols, %zu types",
+				         ms.pdb.symbols.size(), ms.pdb.structs.size());
+				ms.status_text = buf;
+				ev_payload.module_name = ms.module_name;
+				ev_payload.base = ms.base;
+				ev_payload.size = ms.size;
+				ev_payload.success = true;
+				ev_payload.symbol_count = static_cast<uint32_t>(ms.pdb.symbols.size());
+				ev_payload.struct_count = static_cast<uint32_t>(ms.pdb.structs.size());
+				ev_payload.enum_count = static_cast<uint32_t>(ms.pdb.enums.size());
+			} else {
+				ms.failed = true;
+				ms.status_text = "Failed to parse PDB";
+				ev_payload.module_name = ms.module_name;
+				ev_payload.base = ms.base;
+				ev_payload.size = ms.size;
+				ev_payload.success = false;
+			}
+		}
+		aida::events::publish(aida::events::event_pdb_loaded_def, ev_payload);
 	});
 }
 

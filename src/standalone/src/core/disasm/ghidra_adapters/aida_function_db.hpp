@@ -59,6 +59,8 @@ void populate_from_pe(function_db_t& db,
 
 void populate_from_driver(function_db_t& db, uint64_t module_base);
 
+void populate_from_symbol_store(function_db_t& db);
+
 void populate_default_noreturn(function_db_t& db);
 
 }

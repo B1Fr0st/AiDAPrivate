@@ -74,92 +74,92 @@ namespace disasm_theme {
 
 	inline bool is_dark_theme() { return aida::ui::resolved().is_dark; }
 
-	inline ImU32 pick(ImU32 dark, ImU32 light) {
-		return is_dark_theme() ? dark : light;
+	inline ImU32 with_a(ImU32 c, int a) {
+		return (c & 0x00FFFFFFu) | (static_cast<ImU32>(a & 0xFF) << 24);
 	}
 
-	inline ImU32 segment()           { return pick(IM_COL32(184, 168, 152, 255), IM_COL32(111, 111, 120, 255)); }
-	inline ImU32 address()           { return pick(IM_COL32(0xF4, 0x84, 0x5F, 255), IM_COL32(0xC1, 0x5F, 0x3C, 255)); }
-	inline ImU32 bytes()             { return pick(IM_COL32(132, 130, 122, 255), IM_COL32(154, 150, 142, 255)); }
-	inline ImU32 mnemonic()          { return pick(IM_COL32(0xF4, 0x84, 0x5F, 255), IM_COL32(0xC1, 0x5F, 0x3C, 255)); }
-	inline ImU32 reg()               { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
-	inline ImU32 reg_ptr()           { return pick(IM_COL32(0xF0, 0xD2, 0x98, 255), IM_COL32(0x9F, 0x60, 0xD8, 255)); }
-	inline ImU32 immediate_num()     { return pick(IM_COL32(0x7C, 0xE8, 0xD4, 255), IM_COL32(0x2D, 0x8F, 0x8F, 255)); }
-	inline ImU32 immediate_offset()  { return pick(IM_COL32(0xD8, 0xD4, 0xCC, 255), IM_COL32(0x4A, 0x49, 0x48, 255)); }
-	inline ImU32 string_ref()        { return pick(IM_COL32(0x7E, 0xC6, 0x99, 255), IM_COL32(0x26, 0x83, 0x1A, 255)); }
-	inline ImU32 imp_func()          { return pick(IM_COL32(0xD7, 0x3A, 0x83, 255), IM_COL32(0xC1, 0x2F, 0x6B, 255)); }
-	inline ImU32 external_func()     { return pick(IM_COL32(0xD7, 0x3A, 0x83, 255), IM_COL32(0xC1, 0x2F, 0x6B, 255)); }
-	inline ImU32 library_func()      { return pick(IM_COL32(0x1F, 0x6F, 0xE4, 255), IM_COL32(0x1C, 0x6B, 0xBB, 255)); }
-	inline ImU32 lumina_func()       { return pick(IM_COL32(0x7E, 0xC6, 0x99, 255), IM_COL32(0x26, 0x83, 0x1A, 255)); }
-	inline ImU32 sub_label()         { return pick(IM_COL32(0x1F, 0x6F, 0xE4, 255), IM_COL32(0x1C, 0x6B, 0xBB, 255)); }
-	inline ImU32 loc_label()         { return pick(IM_COL32(0x4D, 0x95, 0xEC, 255), IM_COL32(0x2A, 0x7A, 0xCB, 255)); }
-	inline ImU32 func_name()         { return pick(IM_COL32(0x1F, 0x6F, 0xE4, 255), IM_COL32(0x1C, 0x6B, 0xBB, 255)); }
-	inline ImU32 data_ref()          { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
-	inline ImU32 comment()           { return pick(IM_COL32(0x88, 0x88, 0x88, 255), IM_COL32(0x88, 0x88, 0x88, 255)); }
-	inline ImU32 xref()              { return pick(IM_COL32(0x7E, 0xC6, 0x99, 235), IM_COL32(0x26, 0x83, 0x1A, 235)); }
-	inline ImU32 separator()         { return pick(IM_COL32(0x44, 0x44, 0x42, 255), IM_COL32(0xB1, 0xAD, 0xA1, 255)); }
-	inline ImU32 banner()            { return pick(IM_COL32(0xF4, 0x84, 0x5F, 255), IM_COL32(0xC1, 0x5F, 0x3C, 255)); }
-	inline ImU32 var_decl()          { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
-	inline ImU32 var_use()           { return pick(IM_COL32(0xEC, 0xCB, 0x88, 255), IM_COL32(0x9A, 0x58, 0xD6, 255)); }
-	inline ImU32 keyword()           { return pick(IM_COL32(0xD7, 0x3A, 0x83, 255), IM_COL32(0xD7, 0x3A, 0x83, 255)); }
-	inline ImU32 directive()         { return pick(IM_COL32(0xD7, 0x3A, 0x83, 255), IM_COL32(0xD7, 0x3A, 0x83, 255)); }
-	inline ImU32 selection_bg()      { return pick(IM_COL32(0xF4, 0x84, 0x5F, 80), IM_COL32(0xC1, 0x5F, 0x3C, 60)); }
-	inline ImU32 cursor_line_bg()    { return pick(IM_COL32(0xF4, 0x84, 0x5F, 36), IM_COL32(0xC1, 0x5F, 0x3C, 32)); }
-	inline ImU32 gutter_bg()         { return pick(IM_COL32(0x1E, 0x1E, 0x1C, 255), IM_COL32(0xE9, 0xEC, 0xEC, 255)); }
-	inline ImU32 panel_bg()          { return pick(IM_COL32(0x1A, 0x1A, 0x18, 255), IM_COL32(0xF4, 0xF3, 0xEE, 255)); }
-	inline ImU32 arrow_up()          { return pick(IM_COL32(0x7E, 0xC6, 0x99, 255), IM_COL32(0x26, 0x83, 0x1A, 255)); }
-	inline ImU32 arrow_down()        { return pick(IM_COL32(0xF4, 0x84, 0x5F, 255), IM_COL32(0xC1, 0x5F, 0x3C, 255)); }
+	inline ImU32 segment()           { return aida::ui::resolved().text_dim; }
+	inline ImU32 address()           { return aida::ui::resolved().syn_address; }
+	inline ImU32 bytes()             { return aida::ui::resolved().text_dim; }
+	inline ImU32 mnemonic()          { return aida::ui::resolved().syn_keyword; }
+	inline ImU32 reg()               { return aida::ui::resolved().syn_register; }
+	inline ImU32 reg_ptr()           { return aida::ui::resolved().syn_register; }
+	inline ImU32 immediate_num()     { return aida::ui::resolved().syn_number; }
+	inline ImU32 immediate_offset()  { return aida::ui::resolved().text_secondary; }
+	inline ImU32 string_ref()        { return aida::ui::resolved().syn_string; }
+	inline ImU32 imp_func()          { return aida::ui::resolved().error; }
+	inline ImU32 external_func()     { return aida::ui::resolved().error; }
+	inline ImU32 library_func()      { return aida::ui::resolved().info; }
+	inline ImU32 lumina_func()       { return aida::ui::resolved().success; }
+	inline ImU32 sub_label()         { return aida::ui::resolved().syn_function; }
+	inline ImU32 loc_label()         { return aida::ui::resolved().syn_function; }
+	inline ImU32 func_name()         { return aida::ui::resolved().syn_function; }
+	inline ImU32 data_ref()          { return aida::ui::resolved().syn_register; }
+	inline ImU32 comment()           { return aida::ui::resolved().syn_comment; }
+	inline ImU32 xref()              { return with_a(aida::ui::resolved().success, 235); }
+	inline ImU32 separator()         { return aida::ui::resolved().border_subtle; }
+	inline ImU32 banner()            { return aida::ui::resolved().accent_u32; }
+	inline ImU32 var_decl()          { return aida::ui::resolved().syn_register; }
+	inline ImU32 var_use()           { return aida::ui::resolved().syn_identifier; }
+	inline ImU32 keyword()           { return aida::ui::resolved().syn_keyword; }
+	inline ImU32 directive()         { return aida::ui::resolved().syn_preprocessor; }
+	inline ImU32 selection_bg()      { return aida::ui::resolved().selection; }
+	inline ImU32 cursor_line_bg()    { return aida::ui::resolved().hover_wash; }
+	inline ImU32 gutter_bg()         { return aida::ui::resolved().bg_elevated; }
+	inline ImU32 panel_bg()          { return aida::ui::resolved().bg_base; }
+	inline ImU32 arrow_up()          { return aida::ui::resolved().success; }
+	inline ImU32 arrow_down()        { return aida::ui::resolved().warning; }
 
-	inline ImU32 data_byte()         { return pick(IM_COL32(0x7C, 0xE8, 0xD4, 255), IM_COL32(0x2D, 0x8F, 0x8F, 255)); }
-	inline ImU32 data_word()         { return pick(IM_COL32(0x8E, 0xE6, 0xCE, 255), IM_COL32(0x35, 0x9F, 0x9F, 255)); }
-	inline ImU32 data_dword()        { return pick(IM_COL32(0xA0, 0xE2, 0xC4, 255), IM_COL32(0x3D, 0xAA, 0xA5, 255)); }
-	inline ImU32 data_qword()        { return pick(IM_COL32(0xB4, 0xDE, 0xB0, 255), IM_COL32(0x45, 0xA6, 0x88, 255)); }
-	inline ImU32 data_xmmword()      { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
-	inline ImU32 data_ymmword()      { return pick(IM_COL32(0xEC, 0xCB, 0x88, 255), IM_COL32(0x9A, 0x58, 0xD6, 255)); }
-	inline ImU32 data_zmmword()      { return pick(IM_COL32(0xF0, 0xD2, 0x98, 255), IM_COL32(0xAB, 0x6B, 0xDE, 255)); }
-	inline ImU32 data_tbyte()        { return pick(IM_COL32(0xE8, 0xB0, 0x82, 255), IM_COL32(0xB0, 0x60, 0x44, 255)); }
-	inline ImU32 data_fword()        { return pick(IM_COL32(0xE8, 0xBC, 0x94, 255), IM_COL32(0xB8, 0x70, 0x50, 255)); }
-	inline ImU32 string_ascii()      { return pick(IM_COL32(0x7E, 0xC6, 0x99, 255), IM_COL32(0x26, 0x83, 0x1A, 255)); }
-	inline ImU32 string_unicode()    { return pick(IM_COL32(0x96, 0xD2, 0xA6, 255), IM_COL32(0x35, 0x9A, 0x2A, 255)); }
-	inline ImU32 struct_ref()        { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
-	inline ImU32 array_ref()         { return pick(IM_COL32(0xEC, 0xCB, 0x88, 255), IM_COL32(0x9A, 0x58, 0xD6, 255)); }
-	inline ImU32 offset_ref()        { return pick(IM_COL32(0xD8, 0xD4, 0xCC, 255), IM_COL32(0x4A, 0x49, 0x48, 255)); }
-	inline ImU32 segment_ref()       { return pick(IM_COL32(184, 168, 152, 255), IM_COL32(111, 111, 120, 255)); }
-	inline ImU32 pointer_ref()       { return pick(IM_COL32(0x1F, 0x6F, 0xE4, 255), IM_COL32(0x1C, 0x6B, 0xBB, 255)); }
-	inline ImU32 data_unknown()      { return pick(IM_COL32(0xB8, 0xB1, 0xA4, 255), IM_COL32(0x6F, 0x6F, 0x78, 255)); }
-	inline ImU32 align_directive()   { return pick(IM_COL32(0x88, 0x88, 0x88, 255), IM_COL32(0xA0, 0x9A, 0x90, 255)); }
-	inline ImU32 jump_thunk()        { return pick(IM_COL32(0xD7, 0x3A, 0x83, 255), IM_COL32(0xC1, 0x2F, 0x6B, 255)); }
-	inline ImU32 case_label()        { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
-	inline ImU32 default_case()      { return pick(IM_COL32(0xE0, 0xB0, 0x70, 255), IM_COL32(0x70, 0x38, 0xA8, 255)); }
-	inline ImU32 stack_var()         { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
-	inline ImU32 stack_arg()         { return pick(IM_COL32(0xEC, 0xCB, 0x88, 255), IM_COL32(0x9A, 0x58, 0xD6, 255)); }
-	inline ImU32 saved_reg()         { return pick(IM_COL32(0xB8, 0xB1, 0xA4, 255), IM_COL32(0x70, 0x70, 0x78, 255)); }
-	inline ImU32 restored_reg()      { return pick(IM_COL32(0xC8, 0xC2, 0xB4, 255), IM_COL32(0x80, 0x80, 0x88, 255)); }
-	inline ImU32 section_text()      { return pick(IM_COL32(0x1F, 0x6F, 0xE4, 255), IM_COL32(0x1C, 0x6B, 0xBB, 255)); }
-	inline ImU32 section_data()      { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
-	inline ImU32 section_rdata()     { return pick(IM_COL32(0xF0, 0xCC, 0x88, 255), IM_COL32(0x9A, 0x58, 0xD6, 255)); }
-	inline ImU32 section_bss()       { return pick(IM_COL32(0xE8, 0xB0, 0x82, 255), IM_COL32(0xB0, 0x60, 0x44, 255)); }
-	inline ImU32 section_rsrc()      { return pick(IM_COL32(0xD7, 0x3A, 0x83, 255), IM_COL32(0xC1, 0x2F, 0x6B, 255)); }
-	inline ImU32 section_other()     { return pick(IM_COL32(0xB8, 0xB1, 0xA4, 255), IM_COL32(0x6F, 0x6F, 0x78, 255)); }
-	inline ImU32 custom_struct()     { return pick(IM_COL32(0x7C, 0xE8, 0xD4, 255), IM_COL32(0x2D, 0x8F, 0x8F, 255)); }
-	inline ImU32 enum_value()        { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
-	inline ImU32 typelib_type()      { return pick(IM_COL32(0x7E, 0xC6, 0x99, 255), IM_COL32(0x26, 0x83, 0x1A, 255)); }
-	inline ImU32 mnem_branch()       { return pick(IM_COL32(0xD7, 0x3A, 0x83, 255), IM_COL32(0xC1, 0x2F, 0x6B, 255)); }
-	inline ImU32 mnem_call()         { return pick(IM_COL32(0xF4, 0x84, 0x5F, 255), IM_COL32(0xC1, 0x5F, 0x3C, 255)); }
-	inline ImU32 mnem_ret()          { return pick(IM_COL32(0xE8, 0x6F, 0x6C, 255), IM_COL32(0xC0, 0x39, 0x2A, 255)); }
-	inline ImU32 mnem_arith()        { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
-	inline ImU32 mnem_logic()        { return pick(IM_COL32(0xEC, 0xCB, 0x88, 255), IM_COL32(0x9A, 0x58, 0xD6, 255)); }
-	inline ImU32 mnem_data()         { return pick(IM_COL32(0xB8, 0xB1, 0xA4, 255), IM_COL32(0x6F, 0x6F, 0x78, 255)); }
-	inline ImU32 mnem_sse()          { return pick(IM_COL32(0x7C, 0xE8, 0xD4, 255), IM_COL32(0x2D, 0x8F, 0x8F, 255)); }
-	inline ImU32 mnem_string()       { return pick(IM_COL32(0x7E, 0xC6, 0x99, 255), IM_COL32(0x26, 0x83, 0x1A, 255)); }
-	inline ImU32 mnem_priv()         { return pick(IM_COL32(0xD7, 0x3A, 0x83, 255), IM_COL32(0xC1, 0x2F, 0x6B, 255)); }
-	inline ImU32 mnem_nop()          { return pick(IM_COL32(0x6F, 0x6F, 0x6A, 255), IM_COL32(0xA0, 0x9A, 0x90, 255)); }
-	inline ImU32 mnem_int()          { return pick(IM_COL32(0xE8, 0x6F, 0x6C, 255), IM_COL32(0xC0, 0x39, 0x2A, 255)); }
-	inline ImU32 mnem_other()        { return pick(IM_COL32(0xF4, 0x84, 0x5F, 255), IM_COL32(0xC1, 0x5F, 0x3C, 255)); }
-	inline ImU32 entry_point()       { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
-	inline ImU32 main_function()     { return pick(IM_COL32(0xF0, 0xD2, 0x98, 255), IM_COL32(0x9A, 0x58, 0xD6, 255)); }
-	inline ImU32 winmain_function()  { return pick(IM_COL32(0xE8, 0xC4, 0x7C, 255), IM_COL32(0x8A, 0x46, 0xCE, 255)); }
-	inline ImU32 dllmain_function()  { return pick(IM_COL32(0x7E, 0xC6, 0x99, 255), IM_COL32(0x26, 0x83, 0x1A, 255)); }
+	inline ImU32 data_byte()         { return aida::ui::resolved().syn_number; }
+	inline ImU32 data_word()         { return aida::ui::resolved().syn_number; }
+	inline ImU32 data_dword()        { return aida::ui::resolved().syn_number; }
+	inline ImU32 data_qword()        { return aida::ui::resolved().syn_number; }
+	inline ImU32 data_xmmword()      { return aida::ui::resolved().syn_type; }
+	inline ImU32 data_ymmword()      { return aida::ui::resolved().syn_type; }
+	inline ImU32 data_zmmword()      { return aida::ui::resolved().syn_type; }
+	inline ImU32 data_tbyte()        { return aida::ui::resolved().warning; }
+	inline ImU32 data_fword()        { return aida::ui::resolved().warning; }
+	inline ImU32 string_ascii()      { return aida::ui::resolved().syn_string; }
+	inline ImU32 string_unicode()    { return aida::ui::resolved().syn_string; }
+	inline ImU32 struct_ref()        { return aida::ui::resolved().syn_type; }
+	inline ImU32 array_ref()         { return aida::ui::resolved().syn_type; }
+	inline ImU32 offset_ref()        { return aida::ui::resolved().text_secondary; }
+	inline ImU32 segment_ref()       { return aida::ui::resolved().text_dim; }
+	inline ImU32 pointer_ref()       { return aida::ui::resolved().info; }
+	inline ImU32 data_unknown()      { return aida::ui::resolved().text_dim; }
+	inline ImU32 align_directive()   { return aida::ui::resolved().syn_comment; }
+	inline ImU32 jump_thunk()        { return aida::ui::resolved().error; }
+	inline ImU32 case_label()        { return aida::ui::resolved().syn_register; }
+	inline ImU32 default_case()      { return aida::ui::resolved().warning; }
+	inline ImU32 stack_var()         { return aida::ui::resolved().syn_register; }
+	inline ImU32 stack_arg()         { return aida::ui::resolved().syn_identifier; }
+	inline ImU32 saved_reg()         { return aida::ui::resolved().text_dim; }
+	inline ImU32 restored_reg()      { return aida::ui::resolved().text_secondary; }
+	inline ImU32 section_text()      { return aida::ui::resolved().info; }
+	inline ImU32 section_data()      { return aida::ui::resolved().syn_register; }
+	inline ImU32 section_rdata()     { return aida::ui::resolved().syn_type; }
+	inline ImU32 section_bss()       { return aida::ui::resolved().text_dim; }
+	inline ImU32 section_rsrc()      { return aida::ui::resolved().warning; }
+	inline ImU32 section_other()     { return aida::ui::resolved().text_secondary; }
+	inline ImU32 custom_struct()     { return aida::ui::resolved().syn_type; }
+	inline ImU32 enum_value()        { return aida::ui::resolved().syn_number; }
+	inline ImU32 typelib_type()      { return aida::ui::resolved().syn_type; }
+	inline ImU32 mnem_branch()       { return aida::ui::resolved().warning; }
+	inline ImU32 mnem_call()         { return aida::ui::resolved().syn_keyword; }
+	inline ImU32 mnem_ret()          { return aida::ui::resolved().error; }
+	inline ImU32 mnem_arith()        { return aida::ui::resolved().syn_keyword; }
+	inline ImU32 mnem_logic()        { return aida::ui::resolved().syn_keyword; }
+	inline ImU32 mnem_data()         { return aida::ui::resolved().syn_keyword; }
+	inline ImU32 mnem_sse()          { return aida::ui::resolved().syn_type; }
+	inline ImU32 mnem_string()       { return aida::ui::resolved().syn_string; }
+	inline ImU32 mnem_priv()         { return aida::ui::resolved().warning; }
+	inline ImU32 mnem_nop()          { return aida::ui::resolved().text_dim; }
+	inline ImU32 mnem_int()          { return aida::ui::resolved().error; }
+	inline ImU32 mnem_other()        { return aida::ui::resolved().syn_keyword; }
+	inline ImU32 entry_point()       { return aida::ui::resolved().accent_u32; }
+	inline ImU32 main_function()     { return aida::ui::resolved().success; }
+	inline ImU32 winmain_function()  { return aida::ui::resolved().success; }
+	inline ImU32 dllmain_function()  { return aida::ui::resolved().success; }
 
 	inline ImU32 color_for_kind(int kind) {
 		switch (kind) {

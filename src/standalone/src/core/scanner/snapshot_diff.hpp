@@ -717,7 +717,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + width, y0 + height),
 		aida::ui::with_alpha(t.bg_base, a));
 
-	float toolbar_h = 48.f;
+	float toolbar_h = 52.f;
 	dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + width, y0 + toolbar_h),
 		aida::ui::with_alpha(t.panel_header, a));
 	dl->AddLine(ImVec2(x0, y0 + toolbar_h), ImVec2(x0 + width, y0 + toolbar_h),
@@ -726,10 +726,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float cx = x0 + 16.f;
 	float cy = y0 + (toolbar_h - 32.f) * 0.5f;
 
-	dl->AddText(aida::ui::fonts::body_em(), 14.f,
-		ImVec2(cx, y0 + (toolbar_h - 14.f) * 0.5f),
-		aida::ui::with_alpha(t.text_primary, a), "Snapshot Diff");
-	cx += 130.f;
+	{
+		ImFont* hdr_fn = aida::ui::fonts::body_em();
+		float hdr_fs = hdr_fn ? hdr_fn->FontSize : 14.f;
+		dl->AddText(hdr_fn, hdr_fs,
+			ImVec2(cx, y0 + (toolbar_h - hdr_fs) * 0.5f),
+			aida::ui::with_alpha(t.text_primary, a), "Snapshot Diff");
+		ImVec2 ts = ImGui::CalcTextSize("Snapshot Diff");
+		cx += ts.x + 24.f;
+	}
+
+	const float btn_gap = 14.f;
 
 	bool busy = g_state.capturing.load() || g_state.comparing.load() || g_state.loading.load();
 	bool taking = g_state.capturing.load();
@@ -743,7 +750,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), busy, nullptr, taking)) {
 			take_snapshot();
 		}
-		cx += 150.f;
+		cx = ImGui::GetItemRectMax().x + btn_gap;
 	}
 
 	int snap_count = 0;
@@ -763,44 +770,44 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), !can_compare, nullptr, comparing)) {
 			compare_snapshots(g_state.snap_a_id, g_state.snap_b_id);
 		}
-		cx += 110.f;
+		cx = ImGui::GetItemRectMax().x + btn_gap;
 	}
 
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		if (aida::ui::button("Clear All", aida::ui::button_kind_t::destructive,
-				aida::ui::size_t_::sm, ImVec2(0.f, 0.f), busy || snap_count == 0)) {
+				aida::ui::size_t_::md, ImVec2(0.f, 0.f), busy || snap_count == 0)) {
 			clear_snapshots();
 		}
-		cx += 100.f;
+		cx = ImGui::GetItemRectMax().x + btn_gap;
 	}
 
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		const char* lbl_load = loading ? "Loading..." : "Load";
 		if (aida::ui::button(lbl_load, aida::ui::button_kind_t::secondary,
-				aida::ui::size_t_::sm, ImVec2(0.f, 0.f), busy, nullptr, loading)) {
+				aida::ui::size_t_::md, ImVec2(0.f, 0.f), busy, nullptr, loading)) {
 			auto initial_dir = detail::snapshot_dir();
 			std::error_code ec;
 			std::filesystem::create_directories(initial_dir, ec);
 			std::string initial_dir_str = initial_dir.string();
-
-			char path_buf[MAX_PATH] = {};
-			OPENFILENAMEA ofn = {};
-			ofn.lStructSize = sizeof(ofn);
-			ofn.hwndOwner = g_hwnd;
-			ofn.lpstrFile = path_buf;
-			ofn.nMaxFile = MAX_PATH;
-			ofn.lpstrFilter = "Snapshot (*.bin)\0*.bin\0All files\0*.*\0\0";
-			ofn.lpstrDefExt = "bin";
-			ofn.lpstrInitialDir = initial_dir_str.c_str();
-			ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-
-			if (GetOpenFileNameA(&ofn)) {
-				load_from_disk(std::string(path_buf));
-			}
+			work_queue::post([initial_dir_str]() {
+				char path_buf[MAX_PATH] = {};
+				OPENFILENAMEA ofn = {};
+				ofn.lStructSize = sizeof(ofn);
+				ofn.hwndOwner = g_hwnd;
+				ofn.lpstrFile = path_buf;
+				ofn.nMaxFile = MAX_PATH;
+				ofn.lpstrFilter = "Snapshot (*.bin)\0*.bin\0All files\0*.*\0\0";
+				ofn.lpstrDefExt = "bin";
+				ofn.lpstrInitialDir = initial_dir_str.c_str();
+				ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+				if (GetOpenFileNameA(&ofn)) {
+					load_from_disk(std::string(path_buf));
+				}
+			});
 		}
-		cx += 90.f;
+		cx = ImGui::GetItemRectMax().x + btn_gap;
 	}
 
 	{

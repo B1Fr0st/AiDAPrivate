@@ -2958,6 +2958,132 @@ void navigate_forward() {
     st.target_scroll_y = layout_instr_target_scroll_y(st.selected_row, 18.f);
 }
 
+static int xref_type_from_annotation(const xref_index::annotation_t& ann,
+                                     const AsmInstr* decoded)
+{
+    if (decoded && decoded->len > 0) {
+        xref_engine::xref_type_t t = xref_engine::detail::classify_instruction(*decoded);
+        return static_cast<int>(t);
+    }
+    if (ann.kind == xref_index::kind_t::data) {
+        return static_cast<int>(xref_engine::xref_type_t::data_ref);
+    }
+    switch (ann.edge) {
+    case xref_index::edge_t::call_proc:
+        return static_cast<int>(xref_engine::xref_type_t::call);
+    case xref_index::edge_t::jump:
+        return static_cast<int>(xref_engine::xref_type_t::jump);
+    case xref_index::edge_t::offset_ref:
+    default:
+        return static_cast<int>(xref_engine::xref_type_t::lea);
+    }
+}
+
+static bool try_instant_xref_lookup(uint64_t addr, uint64_t func_start)
+{
+    auto& st = g_state;
+
+    if (addr == 0) return false;
+
+    const size_t limit = 4096;
+    std::vector<xref_index::annotation_t> primary = xref_index::query_to(addr, limit);
+    std::vector<xref_index::annotation_t> secondary;
+    if (func_start != 0 && func_start != addr) {
+        secondary = xref_index::query_to(func_start, limit);
+    }
+
+    if (primary.empty() && secondary.empty()) {
+        return false;
+    }
+
+    std::string mod_name_for_module;
+    {
+        auto cached = xref_index::detail::lookup_cached_module(addr);
+        if (!cached && func_start != 0) {
+            cached = xref_index::detail::lookup_cached_module(func_start);
+        }
+        if (cached) mod_name_for_module = cached->name;
+    }
+
+    auto append_entries = [&](const std::vector<xref_index::annotation_t>& anns,
+                              std::vector<xref_popup_entry_t>& out)
+    {
+        for (const auto& ann : anns) {
+            if (ann.source_addr == 0) continue;
+
+            std::vector<uint8_t> bytes;
+            bool got = false;
+            if (driver_bridge::attached_pid() != 0) {
+                got = driver_bridge::read_memory(ann.source_addr, 16, bytes);
+            }
+            if (!got) {
+                got = static_analysis::read_bytes_from_pe(g_disasm.file, ann.source_addr, 16, bytes);
+            }
+
+            AsmInstr ins{};
+            ins.len = 0;
+            if (got && !bytes.empty()) {
+                int avail = static_cast<int>(bytes.size());
+                if (avail > 15) avail = 15;
+                ins = zydis_decode_one(bytes.data(), avail, ann.source_addr);
+            }
+
+            xref_popup_entry_t e;
+            e.addr = ann.source_addr;
+            e.type = xref_type_from_annotation(ann, ins.len > 0 ? &ins : nullptr);
+            if (ins.len > 0) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf), "%s %s", ins.mnem, ins.ops);
+                e.disasm_text = buf;
+            }
+            e.module_name = mod_name_for_module;
+            {
+                std::string rn = rename_store::get(ann.source_addr);
+                if (!rn.empty()) {
+                    e.function_name = rn;
+                } else {
+                    std::string sym = symbol_store::resolve_symbol(ann.source_addr);
+                    if (!sym.empty()) {
+                        e.function_name = sym;
+                    } else if (!ann.source_label.empty()) {
+                        e.function_name = ann.source_label;
+                    }
+                }
+            }
+            out.push_back(std::move(e));
+        }
+    };
+
+    std::vector<xref_popup_entry_t> results;
+    results.reserve(primary.size() + secondary.size());
+    append_entries(primary, results);
+    append_entries(secondary, results);
+
+    std::sort(results.begin(), results.end(),
+        [](const xref_popup_entry_t& a, const xref_popup_entry_t& b) {
+            return a.addr < b.addr;
+        });
+    results.erase(std::unique(results.begin(), results.end(),
+        [](const xref_popup_entry_t& a, const xref_popup_entry_t& b) {
+            return a.addr == b.addr;
+        }), results.end());
+
+    {
+        std::lock_guard<std::mutex> lk(st.xref_mutex);
+        st.xref_results = std::move(results);
+    }
+    st.xref_scanning.store(false);
+
+    diag::log_tagged_critical_fmt("xref",
+        "instant_xref_index_hit addr=0x%llX func_start=0x%llX primary=%zu secondary=%zu",
+        static_cast<unsigned long long>(addr),
+        static_cast<unsigned long long>(func_start),
+        primary.size(),
+        secondary.size());
+
+    return true;
+}
+
 static void launch_xref_scan(uint64_t addr, uint64_t func_start = 0)
 {
     auto& st = g_state;
@@ -5676,7 +5802,9 @@ void render(float pos_x, float pos_y, float width, float height,
                             std::lock_guard<std::mutex> lk(st.xref_mutex);
                             st.xref_results.clear();
                         }
-                        launch_xref_scan(addr, func_start);
+                        if (!try_instant_xref_lookup(addr, func_start)) {
+                            launch_xref_scan(addr, func_start);
+                        }
                     }
                 } else {
                     diag::log_tagged_critical_fmt("xref",

@@ -191,19 +191,26 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		bool aw = gen.auto_wildcard;
 		aida::ui::toggle_switch("##aw", &aw, aida::ui::size_t_::sm);
 		gen.auto_wildcard = aw;
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
-			ImVec2(cx + 40.f, cy + 4.f),
+		ImFont* lbl_fn = aida::ui::fonts::body();
+		float lbl_fs = lbl_fn ? lbl_fn->FontSize : ImGui::GetFontSize();
+		float toggle_w = ImGui::GetItemRectSize().x;
+		float aw_lbl_x = cx + toggle_w + 14.f;
+		ImVec2 aw_ts = ImGui::CalcTextSize("Auto-wildcard");
+		dl->AddText(lbl_fn, lbl_fs,
+			ImVec2(aw_lbl_x, cy + 4.f),
 			aida::ui::with_alpha(t.text_secondary, alpha), "Auto-wildcard");
 
-		ImGui::SetCursorScreenPos(ImVec2(cx + 160.f, cy));
+		float vu_x = aw_lbl_x + aw_ts.x + 30.f;
+		ImGui::SetCursorScreenPos(ImVec2(vu_x, cy));
 		bool vu = gen.validate_uniqueness;
 		aida::ui::toggle_switch("##vu", &vu, aida::ui::size_t_::sm);
 		gen.validate_uniqueness = vu;
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
-			ImVec2(cx + 200.f, cy + 4.f),
+		float vu_toggle_w = ImGui::GetItemRectSize().x;
+		dl->AddText(lbl_fn, lbl_fs,
+			ImVec2(vu_x + vu_toggle_w + 14.f, cy + 4.f),
 			aida::ui::with_alpha(t.text_secondary, alpha), "Validate uniqueness");
 	}
-	cy += 30.f;
+	cy += 32.f;
 
 	{
 		bool generating = gen.generating.load();
@@ -218,14 +225,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				aob_generator::generate_from_address(addr, gen.instruction_count, gen.auto_wildcard);
 			}
 		}
+		float btn_gap = 14.f;
+		float run_x = ImGui::GetItemRectMax().x + btn_gap;
 
-		ImGui::SetCursorScreenPos(ImVec2(cx + 100.f, cy));
+		ImGui::SetCursorScreenPos(ImVec2(run_x, cy));
 		if (aida::ui::button("Save", aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::md)) {
 			aob_generator::save_current();
 		}
+		run_x = ImGui::GetItemRectMax().x + btn_gap;
 
-		ImGui::SetCursorScreenPos(ImVec2(cx + 174.f, cy));
+		ImGui::SetCursorScreenPos(ImVec2(run_x, cy));
 		if (aida::ui::button("Optimize", aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::md)) {
 			aob_generator::signature_t to_optimize;
@@ -240,18 +250,19 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					aob_generator::g_state.current = std::move(to_optimize);
 			});
 		}
+		run_x = ImGui::GetItemRectMax().x + btn_gap + 6.f;
 
 		bool batch_running = gen.batch_generating.load();
 		if (batch_running) {
 			char batch_buf[32];
 			std::snprintf(batch_buf, sizeof(batch_buf), "Batch %d/%d",
 			              gen.batch_done.load(), gen.batch_total.load());
-			ImGui::SetCursorScreenPos(ImVec2(cx + 268.f, cy));
+			ImGui::SetCursorScreenPos(ImVec2(run_x, cy + 4.f));
 			aida::ui::pill_kind(batch_buf, aida::ui::components::pill_kind_t::accent,
 				aida::ui::size_t_::sm, true);
 		}
 	}
-	cy += 40.f;
+	cy += 42.f;
 
 	aob_generator::signature_t current_copy;
 	{

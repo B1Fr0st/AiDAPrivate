@@ -1,9 +1,11 @@
 #include "aida_function_db.hpp"
 #include "../zydis_disasm.hpp"
+#include "../../analysis/symbol_store.hpp"
 #include "standalone_driver.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <mutex>
 
 namespace aida_ghidra {
 
@@ -229,6 +231,47 @@ void populate_from_driver(function_db_t& db, uint64_t module_base)
 			db.image_size = m.size;
 			db.is_pe = true;
 			break;
+		}
+	}
+}
+
+void populate_from_symbol_store(function_db_t& db)
+{
+	std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
+	for (const auto& kv : symbol_store::g_state.modules) {
+		const auto& ms = kv.second;
+		if (!ms.pdb.loaded) continue;
+		if (ms.base == 0 || ms.size == 0) continue;
+
+		bool image_overlap = true;
+		if (db.image_base != 0 && db.image_size != 0) {
+			uint64_t image_end = db.image_base + db.image_size;
+			uint64_t mod_end = ms.base + ms.size;
+			if (mod_end <= db.image_base || ms.base >= image_end)
+				image_overlap = false;
+		}
+		if (!image_overlap) continue;
+
+		for (const auto& sym : ms.pdb.symbols) {
+			if (!sym.is_function) continue;
+			if (sym.name.empty()) continue;
+			uint64_t va = ms.base + sym.rva;
+			if (va == 0) continue;
+			if (db.image_base != 0 && db.image_size != 0) {
+				if (va < db.image_base || va >= db.image_base + db.image_size)
+					continue;
+			}
+			symbol_record_t rec;
+			rec.address = va;
+			rec.size = sym.size;
+			rec.name = sanitize_symbol_name(sym.name);
+			rec.display_name = sym.name;
+			rec.module_name = ms.module_name;
+			rec.kind = symbol_kind_t::function;
+			rec.is_external = false;
+			rec.is_thunk = false;
+			rec.is_noreturn = name_is_noreturn_default(sym.name);
+			db.add_symbol(std::move(rec));
 		}
 	}
 }

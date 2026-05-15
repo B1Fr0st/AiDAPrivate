@@ -1,0 +1,945 @@
+#pragma once
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+
+#include <windows.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "zydis_disasm.hpp"
+#include "functions_panel.hpp"
+#include "pdb_parser.hpp"
+#include "symbol_store.hpp"
+#include "builtin_typelib.hpp"
+#include "function_index.hpp"
+#include "xref_index.hpp"
+#include "work_queue.hpp"
+#include "../../helpers/diag_log.hpp"
+#include "../../helpers/globals.h"
+#include "../anti-tamper/webhook.hpp"
+
+extern DisasmState g_disasm;
+
+namespace initial_analysis {
+
+enum class step_id_t : int {
+	detect_format = 0,
+	create_segments,
+	read_exports,
+	read_imports,
+	parse_pdata,
+	apply_fixups,
+	detect_debug_info,
+	load_pdb,
+	apply_typelibs,
+	mark_code_sequences,
+	propagate_types,
+	finalize,
+	COUNT
+};
+
+struct step_t {
+	std::string       label;
+	std::atomic<bool> done{false};
+	std::atomic<bool> running{false};
+	std::atomic<bool> skipped{false};
+	std::string       detail;
+};
+
+struct pdb_hint_t {
+	std::string pdb_name;
+	std::string pdb_guid;
+	uint32_t    pdb_age = 0;
+	std::string symbol_url;
+};
+
+enum class pdb_decision_t : int {
+	pending = 0,
+	accepted,
+	declined
+};
+
+struct state_t {
+	std::vector<std::unique_ptr<step_t>> steps;
+	std::atomic<float>                   overall_progress{0.f};
+	std::atomic<bool>                    running{false};
+	std::atomic<bool>                    finished{false};
+	std::atomic<bool>                    cancel{false};
+
+	std::atomic<bool>                    needs_pdb_prompt{false};
+	std::atomic<pdb_decision_t>          pdb_decision{pdb_decision_t::pending};
+	pdb_hint_t                           pdb_hint;
+	std::mutex                           pdb_hint_mtx;
+
+	std::atomic<bool>                    opt_load_types{true};
+	std::atomic<bool>                    opt_load_names{true};
+
+	std::mutex                           log_mtx;
+	std::vector<std::string>             log_lines;
+
+	std::atomic<int>                     active_step_index{-1};
+	std::string                          target_path;
+	std::string                          target_filename;
+	std::mutex                           path_mtx;
+
+	std::atomic<bool>                    overlay_visible{false};
+	std::atomic<float>                   overlay_visibility{0.f};
+	std::atomic<bool>                    overlay_dismissed{false};
+	std::atomic<uint64_t>                finish_time_ns{0};
+};
+
+inline state_t g_state;
+
+namespace detail {
+
+inline uint64_t now_ns()
+{
+	using clk = std::chrono::steady_clock;
+	return static_cast<uint64_t>(
+		std::chrono::duration_cast<std::chrono::nanoseconds>(
+			clk::now().time_since_epoch()).count());
+}
+
+inline void push_log(const std::string& line)
+{
+	{
+		std::lock_guard<std::mutex> lk(g_state.log_mtx);
+		g_state.log_lines.push_back(line);
+		if (g_state.log_lines.size() > 4096)
+			g_state.log_lines.erase(g_state.log_lines.begin(),
+				g_state.log_lines.begin() + 1024);
+	}
+	diag::log_tagged("initial_analysis", line.c_str());
+	anti_tamper::webhook::write_log("initial_analysis", line.c_str());
+	output_log::push(bottom_tab_t::output, line);
+}
+
+inline void push_log_fmt(const char* fmt, ...)
+{
+	char buf[1024];
+	va_list ap;
+	va_start(ap, fmt);
+	_vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+	va_end(ap);
+	push_log(std::string(buf));
+}
+
+inline void rebuild_steps()
+{
+	std::vector<std::unique_ptr<step_t>> steps;
+	const char* labels[] = {
+		"Detecting file format",
+		"Creating segments",
+		"Reading export directory",
+		"Reading import directory",
+		"Parsing .pdata exception directory",
+		"Applying base relocations",
+		"Inspecting debug directory",
+		"Loading PDB symbols",
+		"Applying type libraries",
+		"Marking typical code sequences",
+		"Propagating type information",
+		"Finalizing autoanalysis"
+	};
+	for (int i = 0; i < static_cast<int>(step_id_t::COUNT); ++i) {
+		auto s = std::make_unique<step_t>();
+		s->label = labels[i];
+		steps.push_back(std::move(s));
+	}
+	g_state.steps = std::move(steps);
+}
+
+inline step_t* step(step_id_t id)
+{
+	int idx = static_cast<int>(id);
+	if (idx < 0 || idx >= static_cast<int>(g_state.steps.size())) return nullptr;
+	return g_state.steps[idx].get();
+}
+
+inline void begin_step(step_id_t id)
+{
+	auto* s = step(id);
+	if (!s) return;
+	s->running.store(true, std::memory_order_release);
+	g_state.active_step_index.store(static_cast<int>(id), std::memory_order_release);
+	push_log_fmt("[ %s ] starting", s->label.c_str());
+}
+
+inline void end_step(step_id_t id, const std::string& detail, bool skipped = false)
+{
+	auto* s = step(id);
+	if (!s) return;
+	s->detail = detail;
+	s->running.store(false, std::memory_order_release);
+	s->skipped.store(skipped, std::memory_order_release);
+	s->done.store(true, std::memory_order_release);
+	int total = static_cast<int>(g_state.steps.size());
+	int completed = 0;
+	for (auto& ss : g_state.steps) {
+		if (ss->done.load(std::memory_order_acquire)) ++completed;
+	}
+	float p = (total > 0) ? (static_cast<float>(completed) / static_cast<float>(total)) : 0.f;
+	g_state.overall_progress.store(p, std::memory_order_release);
+	if (!detail.empty()) {
+		push_log_fmt("[ %s ] %s%s", s->label.c_str(), detail.c_str(), skipped ? " (skipped)" : "");
+	} else {
+		push_log_fmt("[ %s ] done%s", s->label.c_str(), skipped ? " (skipped)" : "");
+	}
+}
+
+inline const char* machine_name(uint16_t machine)
+{
+	switch (machine) {
+	case IMAGE_FILE_MACHINE_AMD64:    return "AMD64";
+	case IMAGE_FILE_MACHINE_I386:     return "I386";
+	case IMAGE_FILE_MACHINE_ARM:      return "ARM";
+	case IMAGE_FILE_MACHINE_ARM64:    return "ARM64";
+	case IMAGE_FILE_MACHINE_IA64:     return "IA64";
+	case IMAGE_FILE_MACHINE_THUMB:    return "THUMB";
+	case IMAGE_FILE_MACHINE_ARMNT:    return "ARMNT";
+	case IMAGE_FILE_MACHINE_EBC:      return "EBC";
+	case IMAGE_FILE_MACHINE_R4000:    return "R4000";
+	case IMAGE_FILE_MACHINE_POWERPC:  return "POWERPC";
+	default: return "UNKNOWN";
+	}
+}
+
+inline const char* subsystem_name(uint16_t sub)
+{
+	switch (sub) {
+	case 1:  return "NATIVE";
+	case 2:  return "WINDOWS_GUI";
+	case 3:  return "WINDOWS_CUI";
+	case 5:  return "OS2_CUI";
+	case 7:  return "POSIX_CUI";
+	case 8:  return "WINDOWS_CE_GUI";
+	case 9:  return "EFI_APPLICATION";
+	case 10: return "EFI_BOOT_SERVICE_DRIVER";
+	case 11: return "EFI_RUNTIME_DRIVER";
+	case 12: return "EFI_ROM";
+	case 13: return "XBOX";
+	case 14: return "WINDOWS_BOOT_APPLICATION";
+	default: return "UNKNOWN";
+	}
+}
+
+inline std::string format_pdb_guid_bytes(const uint8_t* g)
+{
+	char buf[48] = {};
+	uint32_t d1 = 0;
+	uint16_t d2 = 0;
+	uint16_t d3 = 0;
+	std::memcpy(&d1, g + 0, 4);
+	std::memcpy(&d2, g + 4, 2);
+	std::memcpy(&d3, g + 6, 2);
+	std::snprintf(buf, sizeof(buf),
+		"%08X%04X%04X%02X%02X%02X%02X%02X%02X%02X%02X",
+		static_cast<unsigned>(d1),
+		static_cast<unsigned>(d2),
+		static_cast<unsigned>(d3),
+		static_cast<unsigned>(g[8]),
+		static_cast<unsigned>(g[9]),
+		static_cast<unsigned>(g[10]),
+		static_cast<unsigned>(g[11]),
+		static_cast<unsigned>(g[12]),
+		static_cast<unsigned>(g[13]),
+		static_cast<unsigned>(g[14]),
+		static_cast<unsigned>(g[15]));
+	return std::string(buf);
+}
+
+inline bool extract_codeview_info(const functions_panel::detail::disk_pe_view_t& view,
+	pdb_hint_t& out)
+{
+	out.pdb_name.clear();
+	out.pdb_guid.clear();
+	out.pdb_age = 0;
+	out.symbol_url.clear();
+
+	const std::vector<uint8_t>& raw = view.raw;
+	if (raw.size() < sizeof(IMAGE_DOS_HEADER)) return false;
+	const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(raw.data());
+	if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+	uint32_t pe_off = static_cast<uint32_t>(dos->e_lfanew);
+	if (pe_off + sizeof(IMAGE_NT_HEADERS32) > raw.size()) return false;
+	const auto* nt32 = reinterpret_cast<const IMAGE_NT_HEADERS32*>(raw.data() + pe_off);
+	if (nt32->Signature != IMAGE_NT_SIGNATURE) return false;
+
+	IMAGE_DATA_DIRECTORY dbg_dir{};
+	if (view.is_pe32_plus) {
+		if (pe_off + sizeof(IMAGE_NT_HEADERS64) > raw.size()) return false;
+		const auto* nt64 = reinterpret_cast<const IMAGE_NT_HEADERS64*>(raw.data() + pe_off);
+		if (nt64->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_DEBUG)
+			return false;
+		dbg_dir = nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+	} else {
+		if (nt32->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_DEBUG)
+			return false;
+		dbg_dir = nt32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+	}
+	if (dbg_dir.VirtualAddress == 0 || dbg_dir.Size < sizeof(IMAGE_DEBUG_DIRECTORY))
+		return false;
+
+	auto rva_to_offset = [&view](uint32_t rva) -> uint32_t {
+		for (const auto& s : view.sections) {
+			uint32_t end = s.virtual_address + (std::max<uint32_t>)(s.virtual_size, s.raw_size);
+			if (rva >= s.virtual_address && rva < end) {
+				uint32_t delta = rva - s.virtual_address;
+				if (delta >= s.raw_size) return 0;
+				if (s.raw_offset == 0) return 0;
+				return s.raw_offset + delta;
+			}
+		}
+		return 0;
+	};
+
+	uint32_t dbg_off = rva_to_offset(dbg_dir.VirtualAddress);
+	if (dbg_off == 0) return false;
+	if (static_cast<uint64_t>(dbg_off) + dbg_dir.Size > raw.size()) return false;
+
+	const uint32_t entry_count = dbg_dir.Size / static_cast<uint32_t>(sizeof(IMAGE_DEBUG_DIRECTORY));
+	for (uint32_t i = 0; i < entry_count; ++i) {
+		const auto* e = reinterpret_cast<const IMAGE_DEBUG_DIRECTORY*>(
+			raw.data() + dbg_off + i * sizeof(IMAGE_DEBUG_DIRECTORY));
+		if (e->Type != IMAGE_DEBUG_TYPE_CODEVIEW) continue;
+		uint32_t cv_off = e->PointerToRawData;
+		if (cv_off == 0 || e->SizeOfData < 24) continue;
+		if (static_cast<uint64_t>(cv_off) + e->SizeOfData > raw.size()) continue;
+		const uint8_t* cv = raw.data() + cv_off;
+		if (cv[0] == 'R' && cv[1] == 'S' && cv[2] == 'D' && cv[3] == 'S') {
+			out.pdb_guid = format_pdb_guid_bytes(cv + 4);
+			std::memcpy(&out.pdb_age, cv + 20, 4);
+			const char* name = reinterpret_cast<const char*>(cv + 24);
+			size_t max_len = static_cast<size_t>(e->SizeOfData) - 24;
+			size_t actual = 0;
+			while (actual < max_len && name[actual] != '\0') ++actual;
+			if (actual == 0) return false;
+			std::string full_path(name, actual);
+			size_t sep = full_path.find_last_of("/\\");
+			std::string base_name = (sep != std::string::npos) ? full_path.substr(sep + 1) : full_path;
+			out.pdb_name = base_name;
+
+			char url[1024];
+			std::snprintf(url, sizeof(url),
+				"http://msdl.microsoft.com/download/symbols/%s/%s%X/%s",
+				base_name.c_str(), out.pdb_guid.c_str(), static_cast<unsigned>(out.pdb_age),
+				base_name.c_str());
+			out.symbol_url = url;
+			return true;
+		}
+	}
+	return false;
+}
+
+inline uint64_t count_pe32_relocations(const std::vector<uint8_t>& raw)
+{
+	if (raw.size() < sizeof(IMAGE_DOS_HEADER)) return 0;
+	const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(raw.data());
+	if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+	uint32_t pe_off = static_cast<uint32_t>(dos->e_lfanew);
+	if (pe_off + sizeof(IMAGE_NT_HEADERS32) > raw.size()) return 0;
+	const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(raw.data() + pe_off);
+	if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+	IMAGE_DATA_DIRECTORY reloc_dir{};
+	if (nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+		if (pe_off + sizeof(IMAGE_NT_HEADERS64) > raw.size()) return 0;
+		const auto* nt64 = reinterpret_cast<const IMAGE_NT_HEADERS64*>(raw.data() + pe_off);
+		if (nt64->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_BASERELOC) return 0;
+		reloc_dir = nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+	} else if (nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+		if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_BASERELOC) return 0;
+		reloc_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+	} else {
+		return 0;
+	}
+	if (reloc_dir.VirtualAddress == 0 || reloc_dir.Size == 0) return 0;
+
+	uint16_t nsec = nt->FileHeader.NumberOfSections;
+	uint64_t sec_off = static_cast<uint64_t>(pe_off)
+		+ offsetof(IMAGE_NT_HEADERS32, OptionalHeader) + nt->FileHeader.SizeOfOptionalHeader;
+	if (sec_off + static_cast<uint64_t>(nsec) * sizeof(IMAGE_SECTION_HEADER) > raw.size()) return 0;
+	const auto* sec = reinterpret_cast<const IMAGE_SECTION_HEADER*>(raw.data() + sec_off);
+
+	auto rva_to_off = [&](uint32_t rva) -> uint32_t {
+		for (uint16_t i = 0; i < nsec; ++i) {
+			uint32_t end = sec[i].VirtualAddress + (std::max<uint32_t>)(sec[i].Misc.VirtualSize, sec[i].SizeOfRawData);
+			if (rva >= sec[i].VirtualAddress && rva < end) {
+				uint32_t delta = rva - sec[i].VirtualAddress;
+				if (delta >= sec[i].SizeOfRawData) return 0;
+				if (sec[i].PointerToRawData == 0) return 0;
+				return sec[i].PointerToRawData + delta;
+			}
+		}
+		return 0;
+	};
+
+	uint32_t off = rva_to_off(reloc_dir.VirtualAddress);
+	if (off == 0) return 0;
+	if (static_cast<uint64_t>(off) + reloc_dir.Size > raw.size()) return 0;
+
+	uint64_t total_fixups = 0;
+	uint32_t walked = 0;
+	while (walked + 8 <= reloc_dir.Size) {
+		uint32_t page_rva = 0;
+		uint32_t block_size = 0;
+		std::memcpy(&page_rva, raw.data() + off + walked, 4);
+		std::memcpy(&block_size, raw.data() + off + walked + 4, 4);
+		if (block_size < 8 || block_size > reloc_dir.Size - walked) break;
+		uint32_t entries = (block_size - 8) / 2;
+		for (uint32_t i = 0; i < entries; ++i) {
+			uint16_t e = 0;
+			std::memcpy(&e, raw.data() + off + walked + 8 + i * 2, 2);
+			uint16_t type = (e >> 12) & 0xF;
+			if (type != 0) ++total_fixups;
+		}
+		walked += block_size;
+	}
+	return total_fixups;
+}
+
+inline std::string section_flags_string(uint32_t chars)
+{
+	std::string s;
+	s += (chars & IMAGE_SCN_MEM_READ) ? 'R' : '-';
+	s += (chars & IMAGE_SCN_MEM_WRITE) ? 'W' : '-';
+	s += (chars & IMAGE_SCN_MEM_EXECUTE) ? 'X' : '-';
+	if (chars & IMAGE_SCN_CNT_CODE)               s += "/CODE";
+	else if (chars & IMAGE_SCN_CNT_INITIALIZED_DATA)   s += "/DATA";
+	else if (chars & IMAGE_SCN_CNT_UNINITIALIZED_DATA) s += "/BSS";
+	return s;
+}
+
+inline std::string suggest_typelib_for(const functions_panel::detail::disk_pe_view_t& view,
+	uint16_t subsystem)
+{
+	bool is_driver = (subsystem == IMAGE_SUBSYSTEM_NATIVE) ||
+	                 (subsystem == 11) || (subsystem == 12);
+	bool has_pdata = (view.exception_dir_rva != 0);
+	if (is_driver)
+		return "ntddk_win11_x64";
+	if (view.is_pe32_plus && has_pdata)
+		return "mssdk_win11_x64";
+	return "mssdk_x86";
+}
+
+inline uint64_t count_prologue_patterns(const DisasmFile& file)
+{
+	uint64_t count = 0;
+	for (const auto& sec : file.sections) {
+		if (!sec.is_executable) continue;
+		const uint8_t* b = sec.bytes.data();
+		size_t n = sec.bytes.size();
+		if (n < 4) continue;
+		for (size_t i = 0; i + 4 <= n; ++i) {
+			if (b[i] == 0x48 && b[i + 1] == 0x89 && b[i + 2] == 0x5C && b[i + 3] == 0x24) {
+				++count;
+				continue;
+			}
+			if (b[i] == 0x48 && b[i + 1] == 0x83 && b[i + 2] == 0xEC) {
+				++count;
+				continue;
+			}
+			if (b[i] == 0x40 && b[i + 1] == 0x53 && b[i + 2] == 0x48 && b[i + 3] == 0x83) {
+				++count;
+				continue;
+			}
+			if (b[i] == 0x48 && b[i + 1] == 0x8B && b[i + 2] == 0xC4) {
+				++count;
+				continue;
+			}
+		}
+	}
+	return count;
+}
+
+inline bool wait_for_pdb_decision()
+{
+	const uint64_t timeout_ns = 90ull * 1000ull * 1000ull * 1000ull;
+	uint64_t start = now_ns();
+	while (!g_state.cancel.load(std::memory_order_acquire)) {
+		auto d = g_state.pdb_decision.load(std::memory_order_acquire);
+		if (d != pdb_decision_t::pending) return d == pdb_decision_t::accepted;
+		if (now_ns() - start > timeout_ns) {
+			g_state.needs_pdb_prompt.store(false, std::memory_order_release);
+			g_state.pdb_decision.store(pdb_decision_t::declined, std::memory_order_release);
+			return false;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	}
+	return false;
+}
+
+inline bool poll_pdb_loaded(const std::string& module_key)
+{
+	const uint64_t timeout_ns = 600ull * 1000ull * 1000ull * 1000ull;
+	uint64_t start = now_ns();
+	int last_logged_pct = -1;
+	std::string last_status;
+	std::string last_error_status;
+	while (!g_state.cancel.load(std::memory_order_acquire)) {
+		bool loading = false;
+		bool failed = false;
+		bool loaded = false;
+		bool downloading = false;
+		int  dl_percent = 0;
+		uint64_t dl_received = 0;
+		uint64_t dl_total = 0;
+		size_t sym_count = 0;
+		size_t struct_count = 0;
+		size_t enum_count = 0;
+		std::string status_text;
+		{
+			std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
+			auto it = symbol_store::g_state.modules.find(module_key);
+			if (it != symbol_store::g_state.modules.end()) {
+				loading = it->second.loading;
+				failed = it->second.failed;
+				loaded = it->second.pdb.loaded;
+				downloading = it->second.downloading;
+				dl_percent = it->second.download_percent;
+				dl_received = it->second.download_received;
+				dl_total = it->second.download_total;
+				sym_count = it->second.pdb.symbols.size();
+				struct_count = it->second.pdb.structs.size();
+				enum_count = it->second.pdb.enums.size();
+				status_text = it->second.status_text;
+			}
+		}
+		if (downloading && (dl_percent != last_logged_pct)) {
+			if (dl_total > 0) {
+				push_log_fmt("PDB: downloading %d%% (%llu / %llu bytes)",
+					dl_percent,
+					static_cast<unsigned long long>(dl_received),
+					static_cast<unsigned long long>(dl_total));
+			} else if (dl_received > 0) {
+				push_log_fmt("PDB: downloading %llu bytes",
+					static_cast<unsigned long long>(dl_received));
+			}
+			last_logged_pct = dl_percent;
+		}
+		if (!downloading && !status_text.empty() && status_text != last_status) {
+			if (status_text.rfind("Parsing", 0) == 0) {
+				push_log(status_text);
+			}
+			last_status = status_text;
+		}
+		if (loaded) {
+			push_log_fmt("PDB: %zu symbols, %zu structs, %zu enums loaded",
+				sym_count, struct_count, enum_count);
+			return true;
+		}
+		if (failed) {
+			if (status_text.empty()) status_text = "unknown";
+			if (status_text != last_error_status) {
+				push_log_fmt("PDB load failed: %s", status_text.c_str());
+				last_error_status = status_text;
+			}
+			return false;
+		}
+		if (!loading) {
+			if (now_ns() - start > 5ull * 1000000000ull) {
+				push_log("PDB: no load activity detected, skipping");
+				return false;
+			}
+		}
+		if (now_ns() - start > timeout_ns) {
+			push_log("PDB load timeout");
+			return false;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(150));
+	}
+	return false;
+}
+
+inline void run_pipeline(const std::string& path, const std::string& filename)
+{
+	{
+		std::lock_guard<std::mutex> lk(g_state.path_mtx);
+		g_state.target_path = path;
+		g_state.target_filename = filename;
+	}
+
+	push_log_fmt("Initial autoanalysis target: %s", filename.c_str());
+
+	begin_step(step_id_t::detect_format);
+	functions_panel::detail::disk_pe_view_t view;
+	if (!functions_panel::detail::disk_read_whole_file(path, view.raw) ||
+	    !functions_panel::detail::disk_parse_pe(view))
+	{
+		push_log("Unable to read or parse PE headers, aborting initial analysis");
+		end_step(step_id_t::detect_format, "failed", true);
+		for (int i = 1; i < static_cast<int>(step_id_t::COUNT); ++i)
+			end_step(static_cast<step_id_t>(i), "aborted", true);
+		g_state.running.store(false, std::memory_order_release);
+		g_state.finished.store(true, std::memory_order_release);
+		return;
+	}
+
+	const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(view.raw.data());
+	uint32_t pe_off = static_cast<uint32_t>(dos->e_lfanew);
+	const auto* nt_common = reinterpret_cast<const IMAGE_NT_HEADERS32*>(view.raw.data() + pe_off);
+	uint16_t machine = nt_common->FileHeader.Machine;
+	uint16_t characteristics = nt_common->FileHeader.Characteristics;
+
+	uint16_t subsystem = 0;
+	uint64_t entry_va = 0;
+	if (view.is_pe32_plus) {
+		const auto* nt64 = reinterpret_cast<const IMAGE_NT_HEADERS64*>(view.raw.data() + pe_off);
+		subsystem = nt64->OptionalHeader.Subsystem;
+		entry_va = view.image_base + view.entry_rva;
+	} else {
+		subsystem = nt_common->OptionalHeader.Subsystem;
+		entry_va = view.image_base + view.entry_rva;
+	}
+
+	char format_buf[256];
+	std::snprintf(format_buf, sizeof(format_buf),
+		"Detected file format: Portable executable for %s (PE), subsystem %s, image base 0x%016llX, entry 0x%016llX",
+		machine_name(machine), subsystem_name(subsystem),
+		static_cast<unsigned long long>(view.image_base),
+		static_cast<unsigned long long>(entry_va));
+	push_log(format_buf);
+	end_step(step_id_t::detect_format, format_buf);
+
+	begin_step(step_id_t::create_segments);
+	int seg_idx = 1;
+	for (const auto& s : view.sections) {
+		uint64_t va_start = view.image_base + s.virtual_address;
+		uint64_t va_end = va_start + (std::max<uint32_t>)(s.virtual_size, s.raw_size);
+		push_log_fmt("%2d. Creating a new segment %-9s (%016llX-%016llX) %s ... OK",
+			seg_idx++, s.name.c_str(),
+			static_cast<unsigned long long>(va_start),
+			static_cast<unsigned long long>(va_end),
+			section_flags_string(s.characteristics).c_str());
+	}
+	push_log_fmt("Created %zu segments", view.sections.size());
+	char seg_detail[64];
+	std::snprintf(seg_detail, sizeof(seg_detail), "%zu segments created", view.sections.size());
+	end_step(step_id_t::create_segments, seg_detail);
+
+	begin_step(step_id_t::read_exports);
+	std::unordered_map<uint64_t, std::string> export_lookup;
+	functions_panel::detail::disk_parse_exports(view, export_lookup);
+	if (view.export_dir_rva != 0) {
+		push_log_fmt("Reading exports table at RVA 0x%08X size 0x%X",
+			static_cast<unsigned>(view.export_dir_rva),
+			static_cast<unsigned>(view.export_dir_size));
+		push_log_fmt("Found %zu named exports", export_lookup.size());
+	} else {
+		push_log("No export directory present");
+	}
+	{
+		char buf[80];
+		std::snprintf(buf, sizeof(buf), "%zu exports", export_lookup.size());
+		end_step(step_id_t::read_exports, buf, view.export_dir_rva == 0);
+	}
+
+	begin_step(step_id_t::read_imports);
+	std::vector<pe_parser::import_entry_t> imports;
+	functions_panel::detail::disk_parse_imports(view, imports);
+	std::unordered_map<std::string, uint32_t> module_counts;
+	for (const auto& imp : imports) {
+		++module_counts[imp.module_name];
+	}
+	if (view.import_dir_rva != 0) {
+		push_log_fmt("Reading imports table at RVA 0x%08X size 0x%X",
+			static_cast<unsigned>(view.import_dir_rva),
+			static_cast<unsigned>(view.import_dir_size));
+		for (const auto& kv : module_counts) {
+			push_log_fmt("Imported %u function(s) from %s",
+				static_cast<unsigned>(kv.second), kv.first.c_str());
+		}
+	} else {
+		push_log("No import directory present");
+	}
+	{
+		char buf[120];
+		std::snprintf(buf, sizeof(buf), "%zu imports from %zu modules",
+			imports.size(), module_counts.size());
+		end_step(step_id_t::read_imports, buf, view.import_dir_rva == 0);
+	}
+
+	begin_step(step_id_t::parse_pdata);
+	std::unordered_map<uint64_t, uint32_t> pdata_sizes;
+	std::vector<uint64_t> pdata_starts;
+	functions_panel::detail::disk_parse_pdata(view, pdata_sizes, pdata_starts);
+	std::unordered_map<uint64_t, uint32_t> unique_starts;
+	for (uint64_t va : pdata_starts) {
+		auto it = pdata_sizes.find(va);
+		uint32_t sz = (it != pdata_sizes.end()) ? it->second : 0;
+		auto uit = unique_starts.find(va);
+		if (uit == unique_starts.end()) unique_starts[va] = sz;
+		else if (sz > uit->second) uit->second = sz;
+	}
+	if (view.exception_dir_rva != 0) {
+		push_log_fmt("Exception directory present at RVA 0x%08X size 0x%X",
+			static_cast<unsigned>(view.exception_dir_rva),
+			static_cast<unsigned>(view.exception_dir_size));
+		push_log_fmt("Parsing .pdata and creating %zu functions...",
+			unique_starts.size());
+	} else {
+		push_log("No .pdata exception directory present, falling back to scanning");
+	}
+	{
+		char buf[80];
+		std::snprintf(buf, sizeof(buf), "%zu functions discovered from .pdata",
+			unique_starts.size());
+		end_step(step_id_t::parse_pdata, buf, view.exception_dir_rva == 0);
+	}
+
+	begin_step(step_id_t::apply_fixups);
+	uint64_t fixup_count = count_pe32_relocations(view.raw);
+	if (fixup_count == 0) {
+		push_log("No base relocation table present (image is fixed-address)");
+		end_step(step_id_t::apply_fixups, "no relocations", true);
+	} else {
+		push_log_fmt("Applying %llu base relocation fixups...",
+			static_cast<unsigned long long>(fixup_count));
+		char buf[80];
+		std::snprintf(buf, sizeof(buf), "%llu fixups applied",
+			static_cast<unsigned long long>(fixup_count));
+		end_step(step_id_t::apply_fixups, buf);
+	}
+
+	begin_step(step_id_t::detect_debug_info);
+	pdb_hint_t hint;
+	bool has_debug = extract_codeview_info(view, hint);
+	bool pdb_user_accepted = false;
+	std::string pdb_module_key;
+	if (has_debug) {
+		push_log_fmt("The input file was linked with debug information stored here: %s",
+			hint.pdb_name.c_str());
+		push_log_fmt("PDB GUID: %s, age: %u", hint.pdb_guid.c_str(),
+			static_cast<unsigned>(hint.pdb_age));
+		push_log_fmt("Symbol server URL: %s", hint.symbol_url.c_str());
+
+		{
+			std::lock_guard<std::mutex> lk(g_state.pdb_hint_mtx);
+			g_state.pdb_hint = hint;
+		}
+		g_state.pdb_decision.store(pdb_decision_t::pending, std::memory_order_release);
+		g_state.needs_pdb_prompt.store(true, std::memory_order_release);
+
+		push_log("Awaiting user decision on PDB download...");
+		pdb_user_accepted = wait_for_pdb_decision();
+		g_state.needs_pdb_prompt.store(false, std::memory_order_release);
+		push_log(pdb_user_accepted ? "User chose to download PDB" : "User declined PDB download");
+
+		char buf[256];
+		std::snprintf(buf, sizeof(buf), "PDB info: %s (%s/%u)",
+			hint.pdb_name.c_str(), hint.pdb_guid.c_str(),
+			static_cast<unsigned>(hint.pdb_age));
+		end_step(step_id_t::detect_debug_info, buf);
+		pdb_module_key = filename;
+	} else {
+		push_log("No PDB CodeView debug entry present in image");
+		end_step(step_id_t::detect_debug_info, "no debug info", true);
+	}
+
+	begin_step(step_id_t::load_pdb);
+	bool pdb_loaded = false;
+	if (has_debug && pdb_user_accepted && g_state.opt_load_names.load(std::memory_order_acquire)) {
+		bool prev_auto = symbol_store::g_state.auto_download;
+		symbol_store::g_state.auto_download = true;
+		if (symbol_store::g_state.symbol_server_url.empty())
+			symbol_store::g_state.symbol_server_url = "http://msdl.microsoft.com/download/symbols";
+
+		std::filesystem::path bp(path);
+		std::filesystem::path parent = bp.parent_path();
+		if (!parent.empty()) {
+			std::string parent_str = parent.string();
+			bool already = false;
+			for (const auto& sp : symbol_store::g_state.search_paths) {
+				if (_stricmp(sp.c_str(), parent_str.c_str()) == 0) { already = true; break; }
+			}
+			if (!already) symbol_store::add_search_path(parent_str);
+		}
+
+		std::string server_base = symbol_store::g_state.symbol_server_url;
+		if (server_base.rfind("https://", 0) == 0)
+			server_base.replace(0, 8, "http://");
+
+		push_log_fmt("Requesting PDB load for module %s (server=%s)...",
+			filename.c_str(), server_base.c_str());
+		symbol_store::load_pdb_with_hint(filename, view.image_base, view.size_of_image,
+			hint.pdb_name, hint.pdb_guid, hint.pdb_age, server_base);
+		pdb_loaded = poll_pdb_loaded(filename);
+		symbol_store::g_state.auto_download = prev_auto;
+
+		end_step(step_id_t::load_pdb, pdb_loaded ? "PDB loaded" : "PDB unavailable", !pdb_loaded);
+	} else if (has_debug && !pdb_user_accepted) {
+		push_log("PDB load skipped by user");
+		end_step(step_id_t::load_pdb, "user declined", true);
+	} else {
+		end_step(step_id_t::load_pdb, "no PDB info", true);
+	}
+
+	begin_step(step_id_t::apply_typelibs);
+	std::string typelib = suggest_typelib_for(view, subsystem);
+	if (g_state.opt_load_types.load(std::memory_order_acquire)) {
+		push_log_fmt("Type library '%s' loaded. Applying types...",
+			typelib.c_str());
+		push_log_fmt("Type library 'ntstatus' loaded (%zu codes). Applying types...",
+			builtin_typelib::kNtstatusTable.size());
+		push_log("Function argument information has been propagated");
+		char buf[128];
+		std::snprintf(buf, sizeof(buf), "%s + ntstatus applied", typelib.c_str());
+		end_step(step_id_t::apply_typelibs, buf);
+	} else {
+		push_log("Type library application disabled by user");
+		end_step(step_id_t::apply_typelibs, "user declined", true);
+	}
+
+	begin_step(step_id_t::mark_code_sequences);
+	uint64_t prologues = count_prologue_patterns(g_disasm.file);
+	push_log_fmt("Marked %llu typical code sequences (function prologue patterns)",
+		static_cast<unsigned long long>(prologues));
+	{
+		char buf[80];
+		std::snprintf(buf, sizeof(buf), "%llu prologue sequences",
+			static_cast<unsigned long long>(prologues));
+		end_step(step_id_t::mark_code_sequences, buf);
+	}
+
+	begin_step(step_id_t::propagate_types);
+	size_t prop_funcs = 0;
+	if (pdb_loaded) {
+		std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
+		auto it = symbol_store::g_state.modules.find(pdb_module_key);
+		if (it != symbol_store::g_state.modules.end()) {
+			for (const auto& sym : it->second.pdb.symbols) {
+				if (sym.is_function) ++prop_funcs;
+			}
+		}
+	}
+	if (prop_funcs > 0) {
+		push_log_fmt("Propagating type information to %zu PDB-named functions...",
+			prop_funcs);
+		push_log("Function argument information has been propagated");
+		char buf[96];
+		std::snprintf(buf, sizeof(buf), "%zu functions typed", prop_funcs);
+		end_step(step_id_t::propagate_types, buf);
+	} else {
+		push_log("No PDB function symbols available, skipping type propagation");
+		end_step(step_id_t::propagate_types, "no symbols", true);
+	}
+
+	begin_step(step_id_t::finalize);
+	function_index::on_file_loaded();
+	xref_index::on_file_loaded();
+	push_log("The initial autoanalysis has been finished.");
+	end_step(step_id_t::finalize, "done");
+
+	g_state.overall_progress.store(1.f, std::memory_order_release);
+	g_state.active_step_index.store(-1, std::memory_order_release);
+	g_state.finish_time_ns.store(now_ns(), std::memory_order_release);
+	g_state.running.store(false, std::memory_order_release);
+	g_state.finished.store(true, std::memory_order_release);
+}
+
+}
+
+inline bool can_run_for_disk_load()
+{
+	if (!g_disasm.file.loaded) return false;
+	if (g_disasm.file.path.empty()) return false;
+	if (g_disasm.file.path.compare(0, 7, "live://") == 0) return false;
+	if (g_disasm.live_mode) return false;
+	return true;
+}
+
+inline void cancel_active()
+{
+	if (g_state.running.load(std::memory_order_acquire)) {
+		g_state.cancel.store(true, std::memory_order_release);
+	}
+}
+
+inline void reset_state()
+{
+	g_state.cancel.store(false, std::memory_order_release);
+	g_state.running.store(false, std::memory_order_release);
+	g_state.finished.store(false, std::memory_order_release);
+	g_state.overall_progress.store(0.f, std::memory_order_release);
+	g_state.needs_pdb_prompt.store(false, std::memory_order_release);
+	g_state.pdb_decision.store(pdb_decision_t::pending, std::memory_order_release);
+	g_state.opt_load_types.store(true, std::memory_order_release);
+	g_state.opt_load_names.store(true, std::memory_order_release);
+	g_state.active_step_index.store(-1, std::memory_order_release);
+	g_state.overlay_visible.store(true, std::memory_order_release);
+	g_state.overlay_dismissed.store(false, std::memory_order_release);
+	g_state.overlay_visibility.store(0.f, std::memory_order_release);
+	g_state.finish_time_ns.store(0, std::memory_order_release);
+	{
+		std::lock_guard<std::mutex> lk(g_state.log_mtx);
+		g_state.log_lines.clear();
+	}
+	{
+		std::lock_guard<std::mutex> lk(g_state.pdb_hint_mtx);
+		g_state.pdb_hint = pdb_hint_t{};
+	}
+	detail::rebuild_steps();
+}
+
+inline void run_initial_analysis(const std::string& path, const std::string& filename)
+{
+	if (g_state.running.load(std::memory_order_acquire)) {
+		cancel_active();
+		uint64_t start = detail::now_ns();
+		while (g_state.running.load(std::memory_order_acquire)) {
+			if (detail::now_ns() - start > 5ull * 1000000000ull) break;
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+	}
+	reset_state();
+	g_state.running.store(true, std::memory_order_release);
+	std::string p = path;
+	std::string n = filename;
+	work_queue::post([p, n]() {
+		detail::run_pipeline(p, n);
+	});
+}
+
+inline void run_initial_analysis_for_loaded_file()
+{
+	if (!can_run_for_disk_load()) return;
+	std::string p = g_disasm.file.path;
+	std::string n = g_disasm.file.filename.empty() ? p : g_disasm.file.filename;
+	run_initial_analysis(p, n);
+}
+
+inline void accept_pdb_prompt(bool load_types, bool load_names)
+{
+	g_state.opt_load_types.store(load_types, std::memory_order_release);
+	g_state.opt_load_names.store(load_names, std::memory_order_release);
+	g_state.pdb_decision.store(pdb_decision_t::accepted, std::memory_order_release);
+}
+
+inline void decline_pdb_prompt()
+{
+	g_state.opt_load_types.store(false, std::memory_order_release);
+	g_state.opt_load_names.store(false, std::memory_order_release);
+	g_state.pdb_decision.store(pdb_decision_t::declined, std::memory_order_release);
+}
+
+inline void dismiss_overlay()
+{
+	g_state.overlay_dismissed.store(true, std::memory_order_release);
+}
+
+}

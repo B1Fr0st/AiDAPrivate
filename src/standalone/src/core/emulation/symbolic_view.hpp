@@ -336,7 +336,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + width, cy + height),
 		aida::ui::with_alpha(t.bg_base, alpha));
 
-	const float toolbar_h = 116.f;
+	const float toolbar_h = 96.f;
 	const float pad = 12.f;
 	const float row_h = 22.f;
 
@@ -371,18 +371,16 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	float row1_y = cy + 14.f;
 	label_at(cx + pad + 8.f, row1_y + 6.f, "Entry");
-	input_at(cx + pad + 60.f, row1_y, 150.f, "##sym_addr", st.addr_buf, sizeof(st.addr_buf));
-	label_at(cx + pad + 224.f, row1_y + 6.f, "End/Target");
-	input_at(cx + pad + 300.f, row1_y, 150.f, "##sym_end", st.end_addr_buf, sizeof(st.end_addr_buf));
-	label_at(cx + pad + 462.f, row1_y + 6.f, "Target Reg");
-	input_at(cx + pad + 540.f, row1_y, 90.f, "##sym_treg", st.target_reg_buf, sizeof(st.target_reg_buf));
-
-	float row2_y = cy + 48.f;
-	label_at(cx + pad + 8.f, row2_y + 6.f, "Symbolic Regs");
-	input_at(cx + pad + 110.f, row2_y, 220.f, "##sym_regs", st.sym_regs_buf, sizeof(st.sym_regs_buf));
-	label_at(cx + pad + 344.f, row2_y + 6.f, "Max");
-	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 388.f, row2_y + 2.f));
-	ImGui::SetNextItemWidth(120.f);
+	input_at(cx + pad + 56.f, row1_y, 130.f, "##sym_addr", st.addr_buf, sizeof(st.addr_buf));
+	label_at(cx + pad + 198.f, row1_y + 6.f, "End");
+	input_at(cx + pad + 232.f, row1_y, 130.f, "##sym_end", st.end_addr_buf, sizeof(st.end_addr_buf));
+	label_at(cx + pad + 374.f, row1_y + 6.f, "Target");
+	input_at(cx + pad + 426.f, row1_y, 90.f, "##sym_treg", st.target_reg_buf, sizeof(st.target_reg_buf));
+	label_at(cx + pad + 528.f, row1_y + 6.f, "Sym Regs");
+	input_at(cx + pad + 600.f, row1_y, 150.f, "##sym_regs", st.sym_regs_buf, sizeof(st.sym_regs_buf));
+	label_at(cx + pad + 762.f, row1_y + 6.f, "Max");
+	ImGui::SetCursorScreenPos(ImVec2(cx + pad + 800.f, row1_y + 2.f));
+	ImGui::SetNextItemWidth(110.f);
 	ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(t.panel_header, alpha));
 	ImGui::PushStyleColor(ImGuiCol_SliderGrab, aida::ui::with_alpha(t.accent_u32, alpha));
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f);
@@ -393,7 +391,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	{
 		char vbuf[24];
 		std::snprintf(vbuf, sizeof(vbuf), "%d", st.max_insns);
-		ImGui::SetCursorScreenPos(ImVec2(cx + pad + 388.f + 128.f, row2_y + 6.f));
+		ImGui::SetCursorScreenPos(ImVec2(cx + pad + 800.f + 118.f, row1_y + 6.f));
 		ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, alpha));
 		ImGui::TextUnformatted(vbuf);
 		ImGui::PopStyleColor();
@@ -402,7 +400,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	bool busy = symbolic_engine::g_state.processing.load() ||
 		deobfuscation_engine::g_state.processing.load();
 
-	float btn_y = cy + 80.f;
+	float btn_y = cy + 52.f;
 	float btn_x = cx + pad + 8.f;
 
 	auto run_btn = [&](const char* label, int target_tab, void (*starter)(local_state_t&)) {
@@ -411,14 +409,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			busy ? aida::ui::components::button_kind_t::secondary
 			     : aida::ui::components::button_kind_t::primary,
 			aida::ui::components::size_t_::sm,
-			ImVec2(108.f, 26.f), busy, nullptr, busy);
+			ImVec2(118.f, 30.f), busy, nullptr, busy);
 		if (clicked && !busy) {
 			starter(st);
 			st.prev_tab = st.active_tab;
 			st.active_tab = target_tab;
 			st.content_swap.start(aida::motion::dur::md, aida::motion::ease::out_cubic);
 		}
-		btn_x += 116.f;
+		btn_x += 130.f;
 	};
 
 	run_btn("Symbolize", 0, &detail::start_symbolic_exec);
@@ -464,13 +462,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float target_ux = cx + pad;
 	float target_uw = 0.f;
 
+	ImFont* tab_fn = aida::ui::fonts::body_em();
+	float tab_fs = tab_fn ? tab_fn->FontSize : ImGui::GetFontSize();
 	for (int i = 0; i < tab_count; ++i) {
-		ImVec2 lsz = aida::ui::fonts::body()->CalcTextSizeA(13.f, FLT_MAX, 0.f, tab_labels[i]);
-		float tab_btn_w = lsz.x + 24.f;
+		ImVec2 lsz = tab_fn->CalcTextSizeA(tab_fs, FLT_MAX, 0.f, tab_labels[i]);
+		float tab_btn_w = lsz.x + 28.f;
 		if (i == st.active_tab) { target_ux = tab_x; target_uw = tab_btn_w; }
 
 		ImGui::SetCursorScreenPos(ImVec2(tab_x, tab_strip_y));
-		ImGui::InvisibleButton(tab_labels[i], ImVec2(tab_btn_w, 28.f));
+		ImGui::InvisibleButton(tab_labels[i], ImVec2(tab_btn_w, 30.f));
 		bool hov = ImGui::IsItemHovered();
 		bool clicked = ImGui::IsItemClicked();
 		if (clicked) {
@@ -483,12 +483,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		if (hov && st.active_tab != i) {
 			dl->AddRectFilled(ImVec2(tab_x, tab_strip_y),
-				ImVec2(tab_x + tab_btn_w, tab_strip_y + 28.f),
+				ImVec2(tab_x + tab_btn_w, tab_strip_y + 30.f),
 				aida::ui::with_alpha(t.hover_wash, alpha), 6.f, ImDrawFlags_RoundCornersTop);
 		}
 
-		dl->AddText(aida::ui::fonts::body_em(), 13.f,
-			ImVec2(tab_x + 12.f, tab_strip_y + 7.f),
+		dl->AddText(tab_fn, tab_fs,
+			ImVec2(tab_x + 14.f, tab_strip_y + (30.f - tab_fs) * 0.5f),
 			aida::ui::with_alpha(t.text_primary, text_alpha_val * alpha), tab_labels[i]);
 
 		tab_x += tab_btn_w + 4.f;
@@ -504,13 +504,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	st.tab_underline_w = aida::motion::spring_step(st.tab_underline_w, target_uw,
 		dummy_v, aida::motion::spring::balanced, dt);
 
-	dl->AddRectFilledMultiColor(
-		ImVec2(st.tab_underline_x + 4.f, tab_strip_y + 26.f),
-		ImVec2(st.tab_underline_x + st.tab_underline_w - 4.f, tab_strip_y + 30.f),
-		aida::ui::with_alpha(t.accent_grad_top, alpha),
-		aida::ui::with_alpha(t.accent_grad_bot, alpha),
-		aida::ui::with_alpha(t.accent_grad_bot, alpha),
-		aida::ui::with_alpha(t.accent_grad_top, alpha));
+	ui_anim::render_tab_underline_glow(dl, st.tab_underline_x, st.tab_underline_w,
+		tab_strip_y + 28.f, alpha);
 
 	st.content_swap.tick(dt);
 
