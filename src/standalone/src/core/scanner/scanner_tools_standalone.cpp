@@ -6,6 +6,7 @@
 #include "memory_scanner.hpp"
 #include "obfuscation.hpp"
 #include "struct_dissector.hpp"
+#include "../helpers/diag_log.hpp"
 
 #include <cinttypes>
 #include <sstream>
@@ -93,14 +94,24 @@ static tool_result_t handle_first_scan(const json& params) {
 	if (params.contains("alignment") && params["alignment"].is_number())
 		cfg.alignment = params["alignment"].get<size_t>();
 
-	if (!memory_scanner::first_scan(cfg))
+	diag::log_tagged_fmt("scanner", "mcp first_scan request value='%s' type=%s mode=%s",
+		cfg.value_text.c_str(),
+		memory_scanner::value_type_name(cfg.value_type),
+		memory_scanner::scan_mode_name(cfg.scan_mode));
+
+	if (!memory_scanner::first_scan(cfg)) {
+		diag::log_tagged("scanner", "mcp first_scan refused");
 		return tool_result_t::error(OBFSTR("Scanner busy or not attached to a process."));
+	}
 
 
 	for (int i = 0; i < 300; ++i) {
 		if (!memory_scanner::g_state.scanning.load()) break;
 		Sleep(100);
 	}
+
+	diag::log_tagged_fmt("scanner", "mcp first_scan completed total=%zu",
+		memory_scanner::g_state.total_found);
 
 	return tool_result_t::ok(results_to_json());
 }
@@ -116,13 +127,21 @@ static tool_result_t handle_next_scan(const json& params) {
 	if (params.contains("value2"))
 		val2 = params["value2"].get<std::string>();
 
-	if (!memory_scanner::next_scan(mode, val, val2))
+	diag::log_tagged_fmt("scanner", "mcp next_scan request mode=%s val='%s'",
+		memory_scanner::scan_mode_name(mode), val.c_str());
+
+	if (!memory_scanner::next_scan(mode, val, val2)) {
+		diag::log_tagged("scanner", "mcp next_scan refused");
 		return tool_result_t::error(OBFSTR("Scanner busy or no initial scan performed."));
+	}
 
 	for (int i = 0; i < 300; ++i) {
 		if (!memory_scanner::g_state.scanning.load()) break;
 		Sleep(100);
 	}
+
+	diag::log_tagged_fmt("scanner", "mcp next_scan completed total=%zu",
+		memory_scanner::g_state.total_found);
 
 	return tool_result_t::ok(results_to_json());
 }
@@ -266,6 +285,9 @@ static tool_result_t handle_pointer_scan(const json& params) {
 	if (params.contains("max_offset") && params["max_offset"].is_number())
 		max_offset = params["max_offset"].get<int>();
 
+	diag::log_tagged_fmt("scanner", "mcp pointer_scan request addr=0x%llX depth=%d offset=0x%X",
+		static_cast<unsigned long long>(addr), max_depth, max_offset);
+
 	memory_scanner::start_pointer_scan(addr, max_depth, max_offset);
 
 	for (int i = 0; i < 600; ++i) {
@@ -335,7 +357,7 @@ static tool_result_t handle_write_value(const json& params) {
 void register_scanner_tools(mcp_standalone::server_t& srv) {
 
 	register_compat(srv, {OBFSTR("scanner_first_scan"), OBFSTR("memory_scanner"),
-		OBFSTR("Start a new memory scan. Scans all committed memory of the attached process for values matching the criteria."),
+		OBFSTR("Start a new memory scan. Scans all committed memory of the attached process for values matching the criteria. Operates on the currently active binary_id session; pass binary_id explicitly in multi-target sessions."),
 		{{OBFSTR("value"), OBFSTR("string"), OBFSTR("Value to search for"), true},
 		 {OBFSTR("value_type"), OBFSTR("string"), OBFSTR("Type: byte/int16/int32/int64/float/double/ascii/utf16/aob"), false},
 		 {OBFSTR("scan_mode"), OBFSTR("string"), OBFSTR("Mode: exact/bigger/smaller/between/unknown"), false},
@@ -402,7 +424,7 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 		{}, handle_get_address_list, true});
 
 	register_compat(srv, {OBFSTR("scanner_pointer_scan"), OBFSTR("memory_scanner"),
-		OBFSTR("Perform a pointer scan to find pointer chains that lead to the target address. Useful for finding stable pointers."),
+		OBFSTR("Perform a pointer scan to find pointer chains that lead to the target address. Useful for finding stable pointers. Operates on the currently active binary_id session; pass binary_id explicitly in multi-target sessions."),
 		{{OBFSTR("address"), OBFSTR("string"), OBFSTR("Target address to find pointers to"), true},
 		 {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum pointer chain depth (1-7, default 4)"), false},
 		 {OBFSTR("max_offset"), OBFSTR("number"), OBFSTR("Maximum offset from pointer base (default 0x1000)"), false}},

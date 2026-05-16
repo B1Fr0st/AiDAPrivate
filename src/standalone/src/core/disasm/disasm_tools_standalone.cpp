@@ -1,0 +1,947 @@
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+
+#include "standalone_compat.hpp"
+#include "zydis_disasm.hpp"
+#include "disasm_view.hpp"
+#include "function_index.hpp"
+#include "rename_store.hpp"
+#include "comment_store.hpp"
+#include "xref_db.hpp"
+#include "xref_engine.hpp"
+#include "pe_parser.hpp"
+#include "hex_view.hpp"
+#include "standalone_driver.hpp"
+#include "../helpers/globals.h"
+
+#include <algorithm>
+#include <cctype>
+#include <cinttypes>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <shared_mutex>
+#include <sstream>
+#include <string>
+#include <vector>
+
+using json = nlohmann::json;
+using tool_result_t = mcp_standalone::tool_result_t;
+
+extern DisasmState g_disasm;
+
+namespace disasm_tools {
+
+static std::string hex_u64(uint64_t value)
+{
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(value));
+    return buf;
+}
+
+static bool parse_address_param(const json& params, const char* key, uint64_t& out)
+{
+    if (!params.contains(key))
+        return false;
+    const auto& v = params[key];
+    if (v.is_string()) {
+        auto parsed = sa_parse_address(v.get<std::string>());
+        if (!parsed) return false;
+        out = *parsed;
+        return true;
+    }
+    if (v.is_number_unsigned()) {
+        out = v.get<uint64_t>();
+        return true;
+    }
+    if (v.is_number_integer()) {
+        int64_t s = v.get<int64_t>();
+        if (s < 0) return false;
+        out = static_cast<uint64_t>(s);
+        return true;
+    }
+    return false;
+}
+
+static std::string lower_copy(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
+}
+
+static int find_instr_index(const DisasmFile& file, uint64_t addr)
+{
+    int lo = 0;
+    int hi = static_cast<int>(file.instrs.size()) - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        uint64_t a = file.instrs[static_cast<size_t>(mid)].addr;
+        if (a == addr) return mid;
+        if (a < addr) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return -1;
+}
+
+static std::string bytes_to_hex(const uint8_t* data, int len)
+{
+    if (len <= 0) return std::string();
+    std::string out;
+    out.reserve(static_cast<size_t>(len) * 3);
+    char buf[4];
+    for (int i = 0; i < len; ++i) {
+        std::snprintf(buf, sizeof(buf), "%02X", static_cast<unsigned>(data[i]));
+        if (i > 0) out.push_back(' ');
+        out.append(buf, 2);
+    }
+    return out;
+}
+
+static const char* xref_type_label(int t)
+{
+    switch (t) {
+    case static_cast<int>(xref_engine::xref_type_t::call):             return "call";
+    case static_cast<int>(xref_engine::xref_type_t::jump):             return "jump";
+    case static_cast<int>(xref_engine::xref_type_t::conditional_jump): return "conditional_jump";
+    case static_cast<int>(xref_engine::xref_type_t::lea):              return "lea";
+    case static_cast<int>(xref_engine::xref_type_t::data_ref):         return "data_ref";
+    default: return "unknown";
+    }
+}
+
+static tool_result_t handle_jump_to_address(const json& params)
+{
+    uint64_t addr = 0;
+    if (!parse_address_param(params, "address", addr))
+        return tool_result_t::error("'address' is required (hex string or integer).");
+
+    int idx = find_instr_index(g_disasm.file, addr);
+    if (idx < 0)
+        return tool_result_t::error("Address not found in current disassembly listing.");
+
+    globals::ui::active_center_view = center_view_t::disassembly;
+    disasm_view::goto_address(addr, g_disasm);
+
+    json result;
+    result["address"] = hex_u64(addr);
+    result["row_index"] = idx;
+    result["active_center_view"] = "disassembly";
+    return tool_result_t::ok(result);
+}
+
+static tool_result_t handle_get_instruction(const json& params)
+{
+    uint64_t addr = 0;
+    if (!parse_address_param(params, "address", addr))
+        return tool_result_t::error("'address' is required.");
+
+    int idx = find_instr_index(g_disasm.file, addr);
+    if (idx < 0)
+        return tool_result_t::error("Address not found in disassembly listing.");
+
+    const AsmInstr& ins = g_disasm.file.instrs[static_cast<size_t>(idx)];
+
+    json result;
+    result["address"]  = hex_u64(ins.addr);
+    result["mnemonic"] = std::string(ins.mnem);
+    result["operands"] = std::string(ins.ops);
+    result["length"]   = ins.len;
+    result["bytes"]    = bytes_to_hex(ins.raw, std::min(ins.len, 15));
+    result["is_branch"]= ins.is_branch;
+    result["is_call"]  = ins.is_call;
+    result["is_ret"]   = ins.is_ret;
+    std::string c = comment_store::get(addr);
+    if (!c.empty()) result["comment"] = c;
+    return tool_result_t::ok(result);
+}
+
+static tool_result_t handle_get_function_bounds(const json& params)
+{
+    uint64_t addr = 0;
+    if (!parse_address_param(params, "address", addr))
+        return tool_result_t::error("'address' is required.");
+
+    auto& c = function_index::detail::cache();
+    uint64_t start = 0;
+    uint64_t end = 0;
+    std::string name;
+    std::string section;
+    bool found = false;
+    {
+        std::shared_lock<std::shared_mutex> lk(c.mutex);
+        auto m = c.addr_to_func_start.find(addr);
+        if (m != c.addr_to_func_start.end()) {
+            start = m->second;
+        } else {
+            auto& sorted = c.sorted_starts;
+            auto it = std::upper_bound(sorted.begin(), sorted.end(), addr);
+            if (it == sorted.begin())
+                return tool_result_t::error("No function found containing this address.");
+            --it;
+            start = *it;
+        }
+        auto r = c.by_start.find(start);
+        if (r != c.by_start.end()) {
+            end = r->second.end;
+            name = r->second.display_name;
+            section = r->second.section;
+            found = true;
+        }
+    }
+    if (!found)
+        return tool_result_t::error("Function record missing for resolved start address.");
+    if (addr < start || (end > 0 && addr >= end))
+        return tool_result_t::error("Address is not within the resolved function bounds.");
+
+    if (name.empty()) name = function_index::synthetic_name(start);
+
+    json result;
+    result["start"]   = hex_u64(start);
+    result["end"]     = hex_u64(end);
+    result["size"]    = (end > start) ? (end - start) : 0;
+    result["name"]    = name;
+    result["section"] = section;
+    return tool_result_t::ok(result);
+}
+
+static tool_result_t handle_get_function_disassembly(const json& params)
+{
+    uint64_t addr = 0;
+    if (!parse_address_param(params, "address", addr))
+        return tool_result_t::error("'address' is required.");
+
+    int max_instrs = 256;
+    if (params.contains("max_instrs") && params["max_instrs"].is_number_integer()) {
+        int v = params["max_instrs"].get<int>();
+        if (v > 0 && v <= 8192) max_instrs = v;
+    }
+
+    auto& c = function_index::detail::cache();
+    uint64_t start = 0;
+    uint64_t end = 0;
+    {
+        std::shared_lock<std::shared_mutex> lk(c.mutex);
+        auto m = c.addr_to_func_start.find(addr);
+        if (m != c.addr_to_func_start.end()) {
+            start = m->second;
+        } else {
+            auto& sorted = c.sorted_starts;
+            auto it = std::upper_bound(sorted.begin(), sorted.end(), addr);
+            if (it == sorted.begin())
+                return tool_result_t::error("No function found containing this address.");
+            --it;
+            start = *it;
+        }
+        auto r = c.by_start.find(start);
+        if (r != c.by_start.end()) end = r->second.end;
+    }
+    if (end == 0 || end <= start)
+        return tool_result_t::error("Resolved function has no valid end address.");
+
+    int first = find_instr_index(g_disasm.file, start);
+    if (first < 0)
+        return tool_result_t::error("Function start not found in disassembly listing.");
+
+    json arr = json::array();
+    int emitted = 0;
+    for (size_t i = static_cast<size_t>(first); i < g_disasm.file.instrs.size() && emitted < max_instrs; ++i) {
+        const AsmInstr& ins = g_disasm.file.instrs[i];
+        if (ins.addr >= end) break;
+        json entry;
+        entry["address"]  = hex_u64(ins.addr);
+        entry["mnemonic"] = std::string(ins.mnem);
+        entry["operands"] = std::string(ins.ops);
+        entry["length"]   = ins.len;
+        entry["bytes"]    = bytes_to_hex(ins.raw, std::min(ins.len, 15));
+        if (ins.is_branch) entry["is_branch"] = true;
+        if (ins.is_call)   entry["is_call"]   = true;
+        if (ins.is_ret)    entry["is_ret"]    = true;
+        std::string c2 = comment_store::get(ins.addr);
+        if (!c2.empty()) entry["comment"] = c2;
+        arr.push_back(std::move(entry));
+        ++emitted;
+    }
+
+    json result;
+    result["function_start"] = hex_u64(start);
+    result["function_end"]   = hex_u64(end);
+    result["function_name"]  = function_index::synthetic_name(start);
+    result["instruction_count"] = emitted;
+    result["truncated"] = (emitted >= max_instrs);
+    result["instructions"] = std::move(arr);
+    return tool_result_t::ok(result);
+}
+
+static tool_result_t handle_list_functions(const json& params)
+{
+    std::string filter;
+    if (params.contains("filter") && params["filter"].is_string())
+        filter = lower_copy(params["filter"].get<std::string>());
+
+    size_t offset = 0;
+    if (params.contains("offset") && params["offset"].is_number_unsigned())
+        offset = params["offset"].get<size_t>();
+
+    size_t limit = 200;
+    if (params.contains("limit") && params["limit"].is_number_unsigned()) {
+        size_t v = params["limit"].get<size_t>();
+        if (v > 0 && v <= 5000) limit = v;
+    }
+
+    auto& c = function_index::detail::cache();
+    std::vector<uint64_t> starts;
+    std::vector<std::string> names;
+    std::vector<uint64_t>    ends;
+    std::vector<std::string> kinds;
+    std::vector<std::string> sections;
+    {
+        std::shared_lock<std::shared_mutex> lk(c.mutex);
+        starts.reserve(c.sorted_starts.size());
+        names.reserve(c.sorted_starts.size());
+        ends.reserve(c.sorted_starts.size());
+        kinds.reserve(c.sorted_starts.size());
+        sections.reserve(c.sorted_starts.size());
+        for (uint64_t s : c.sorted_starts) {
+            auto r = c.by_start.find(s);
+            uint64_t e = 0;
+            std::string n;
+            std::string kind = "function";
+            std::string sec;
+            if (r != c.by_start.end()) {
+                e = r->second.end;
+                n = r->second.display_name;
+                if (r->second.is_thunk)        kind = "thunk";
+                else if (r->second.is_library) kind = "library";
+                else if (r->second.is_entry_stub) kind = "entry";
+                sec = r->second.section;
+            }
+            starts.push_back(s);
+            ends.push_back(e);
+            names.push_back(n.empty() ? function_index::synthetic_name(s) : n);
+            kinds.push_back(std::move(kind));
+            sections.push_back(std::move(sec));
+        }
+    }
+
+    json arr = json::array();
+    size_t total_matching = 0;
+    size_t skipped = 0;
+    size_t emitted = 0;
+    for (size_t i = 0; i < starts.size(); ++i) {
+        if (!filter.empty()) {
+            if (lower_copy(names[i]).find(filter) == std::string::npos)
+                continue;
+        }
+        if (skipped < offset) { ++skipped; ++total_matching; continue; }
+        ++total_matching;
+        if (emitted >= limit) continue;
+        json entry;
+        entry["address"] = hex_u64(starts[i]);
+        entry["name"]    = names[i];
+        entry["size"]    = (ends[i] > starts[i]) ? (ends[i] - starts[i]) : 0;
+        entry["kind"]    = kinds[i];
+        if (!sections[i].empty()) entry["section"] = sections[i];
+        arr.push_back(std::move(entry));
+        ++emitted;
+    }
+
+    json result;
+    result["total"]    = total_matching;
+    result["offset"]   = offset;
+    result["returned"] = emitted;
+    result["functions"] = std::move(arr);
+    return tool_result_t::ok(result);
+}
+
+static tool_result_t handle_get_xrefs_to(const json& params)
+{
+    uint64_t addr = 0;
+    if (!parse_address_param(params, "address", addr))
+        return tool_result_t::error("'address' is required.");
+
+    json arr = json::array();
+    {
+        std::lock_guard<std::mutex> lk(xref_db::g_state.mutex);
+        for (auto& kv : xref_db::g_state.modules) {
+            const auto& mod = kv.second;
+            if (!mod.built) continue;
+            auto it = mod.to_index.find(addr);
+            if (it == mod.to_index.end()) continue;
+            for (const auto& e : it->second) {
+                json o;
+                o["from_address"] = hex_u64(e.from_addr);
+                o["to_address"]   = hex_u64(e.to_addr);
+                o["type"]         = xref_type_label(static_cast<int>(e.type));
+                o["disasm"]       = e.disasm_text;
+                o["module"]       = mod.name;
+                arr.push_back(std::move(o));
+            }
+        }
+    }
+
+    json result;
+    result["address"] = hex_u64(addr);
+    result["count"]   = arr.size();
+    result["xrefs"]   = std::move(arr);
+    if (result["count"] == 0) {
+        result["note"] = "No cached xrefs to this address. The module may not be indexed; open the Xref DB panel and click Index.";
+    }
+    return tool_result_t::ok(result);
+}
+
+static tool_result_t handle_get_xrefs_from(const json& params)
+{
+    uint64_t addr = 0;
+    if (!parse_address_param(params, "address", addr))
+        return tool_result_t::error("'address' is required.");
+
+    json arr = json::array();
+    {
+        std::lock_guard<std::mutex> lk(xref_db::g_state.mutex);
+        for (auto& kv : xref_db::g_state.modules) {
+            const auto& mod = kv.second;
+            if (!mod.built) continue;
+            auto it = mod.from_index.find(addr);
+            if (it == mod.from_index.end()) continue;
+            for (const auto& e : it->second) {
+                json o;
+                o["from_address"] = hex_u64(e.from_addr);
+                o["to_address"]   = hex_u64(e.to_addr);
+                o["type"]         = xref_type_label(static_cast<int>(e.type));
+                o["disasm"]       = e.disasm_text;
+                o["module"]       = mod.name;
+                arr.push_back(std::move(o));
+            }
+        }
+    }
+
+    json result;
+    result["address"] = hex_u64(addr);
+    result["count"]   = arr.size();
+    result["xrefs"]   = std::move(arr);
+    if (result["count"] == 0)
+        result["note"] = "No cached xrefs originating at this address. Index the module via the Xref DB panel.";
+    return tool_result_t::ok(result);
+}
+
+static tool_result_t handle_set_comment(const json& params)
+{
+    uint64_t addr = 0;
+    if (!parse_address_param(params, "address", addr))
+        return tool_result_t::error("'address' is required.");
+    std::string text;
+    if (params.contains("comment") && params["comment"].is_string())
+        text = params["comment"].get<std::string>();
+    comment_store::set(addr, text);
+    json result;
+    result["address"] = hex_u64(addr);
+    result["action"]  = text.empty() ? "deleted" : "set";
+    return tool_result_t::ok(result);
+}
+
+static tool_result_t handle_get_comment(const json& params)
+{
+    uint64_t addr = 0;
+    if (!parse_address_param(params, "address", addr))
+        return tool_result_t::error("'address' is required.");
+    json result;
+    result["address"] = hex_u64(addr);
+    result["comment"] = comment_store::get(addr);
+    return tool_result_t::ok(result);
+}
+
+static tool_result_t handle_rename_function(const json& params)
+{
+    uint64_t addr = 0;
+    if (!parse_address_param(params, "address", addr))
+        return tool_result_t::error("'address' is required.");
+    std::string new_name;
+    if (params.contains("new_name") && params["new_name"].is_string())
+        new_name = params["new_name"].get<std::string>();
+    rename_store::set(addr, new_name);
+    disasm_view::bump_format_generation();
+    json result;
+    result["address"]  = hex_u64(addr);
+    result["new_name"] = new_name;
+    result["action"]   = new_name.empty() ? "cleared" : "renamed";
+    return tool_result_t::ok(result);
+}
+
+static tool_result_t handle_get_section_info(const json&)
+{
+    json arr = json::array();
+    for (const PESection& sec : g_disasm.file.sections) {
+        json o;
+        o["va"]       = hex_u64(sec.va);
+        o["size"]     = sec.bytes.size();
+        o["end"]      = hex_u64(sec.va + sec.bytes.size());
+        arr.push_back(std::move(o));
+    }
+    json result;
+    result["image_base"] = hex_u64(g_disasm.file.image_base);
+    result["text_va"]    = hex_u64(g_disasm.file.text_va);
+    result["filename"]   = g_disasm.file.filename;
+    result["section_count"] = arr.size();
+    result["sections"]   = std::move(arr);
+    return tool_result_t::ok(result);
+}
+
+static bool parse_hex_pattern(const std::string& in, std::vector<uint8_t>& bytes,
+                              std::vector<bool>& wildmask)
+{
+    bytes.clear();
+    wildmask.clear();
+    std::string cur;
+    auto flush = [&](const std::string& tok) -> bool {
+        if (tok.empty()) return true;
+        if (tok == "??" || tok == "?") {
+            bytes.push_back(0);
+            wildmask.push_back(true);
+            return true;
+        }
+        if (tok.size() != 2) return false;
+        auto hex_nibble = [](char c, int& out) -> bool {
+            if (c >= '0' && c <= '9') { out = c - '0'; return true; }
+            if (c >= 'a' && c <= 'f') { out = 10 + (c - 'a'); return true; }
+            if (c >= 'A' && c <= 'F') { out = 10 + (c - 'A'); return true; }
+            return false;
+        };
+        int hi = 0, lo = 0;
+        if (!hex_nibble(tok[0], hi) || !hex_nibble(tok[1], lo))
+            return false;
+        bytes.push_back(static_cast<uint8_t>((hi << 4) | lo));
+        wildmask.push_back(false);
+        return true;
+    };
+    for (char c : in) {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ',') {
+            if (!flush(cur)) return false;
+            cur.clear();
+            continue;
+        }
+        cur.push_back(c);
+        if (cur.size() == 2) {
+            if (!flush(cur)) return false;
+            cur.clear();
+        }
+    }
+    if (!cur.empty() && !flush(cur)) return false;
+    return !bytes.empty();
+}
+
+static tool_result_t handle_search_bytes(const json& params)
+{
+    if (!params.contains("pattern") || !params["pattern"].is_string())
+        return tool_result_t::error("'pattern' is required (hex string, supports '??' wildcards).");
+
+    std::vector<uint8_t> needle;
+    std::vector<bool>    wildmask;
+    if (!parse_hex_pattern(params["pattern"].get<std::string>(), needle, wildmask))
+        return tool_result_t::error("Invalid hex pattern.");
+
+    size_t max_hits = 256;
+    if (params.contains("max_hits") && params["max_hits"].is_number_unsigned()) {
+        size_t v = params["max_hits"].get<size_t>();
+        if (v > 0 && v <= 4096) max_hits = v;
+    }
+
+    json arr = json::array();
+    size_t total_hits = 0;
+    for (const PESection& sec : g_disasm.file.sections) {
+        if (sec.bytes.size() < needle.size()) continue;
+        const uint8_t* base = sec.bytes.data();
+        size_t bsz = sec.bytes.size();
+        for (size_t i = 0; i + needle.size() <= bsz; ++i) {
+            bool ok = true;
+            for (size_t j = 0; j < needle.size(); ++j) {
+                if (!wildmask[j] && base[i + j] != needle[j]) { ok = false; break; }
+            }
+            if (!ok) continue;
+            ++total_hits;
+            if (arr.size() < max_hits) {
+                json o;
+                o["address"] = hex_u64(sec.va + i);
+                arr.push_back(std::move(o));
+            }
+        }
+    }
+
+    json result;
+    result["pattern"]    = params["pattern"].get<std::string>();
+    result["total_hits"] = total_hits;
+    result["returned"]   = arr.size();
+    result["matches"]    = std::move(arr);
+    if (total_hits == 0)
+        result["note"] = "Searched executable sections only. For .rdata/.data scans attach to a process and use debugger_read_memory ranges.";
+    return tool_result_t::ok(result);
+}
+
+static bool is_printable_ascii(uint8_t b)
+{
+    return (b >= 0x20 && b <= 0x7E) || b == '\t';
+}
+
+static tool_result_t handle_get_strings(const json& params)
+{
+    size_t min_len = 4;
+    if (params.contains("min_length") && params["min_length"].is_number_unsigned()) {
+        size_t v = params["min_length"].get<size_t>();
+        if (v >= 2 && v <= 128) min_len = v;
+    }
+    std::string encoding = "ascii";
+    if (params.contains("encoding") && params["encoding"].is_string())
+        encoding = lower_copy(params["encoding"].get<std::string>());
+
+    bool want_ascii = (encoding == "ascii" || encoding == "both");
+    bool want_utf16 = (encoding == "utf16" || encoding == "both");
+    if (!want_ascii && !want_utf16)
+        return tool_result_t::error("encoding must be one of: ascii, utf16, both");
+
+    size_t max_results = 2048;
+    if (params.contains("limit") && params["limit"].is_number_unsigned()) {
+        size_t v = params["limit"].get<size_t>();
+        if (v > 0 && v <= 8192) max_results = v;
+    }
+
+    json arr = json::array();
+    size_t total_found = 0;
+    size_t per_section_limit = 65536;
+
+    for (const PESection& sec : g_disasm.file.sections) {
+        const uint8_t* p = sec.bytes.data();
+        size_t sz = sec.bytes.size();
+        if (sz > per_section_limit * 1024) continue;
+
+        if (want_ascii) {
+            size_t run_start = 0;
+            size_t run_len = 0;
+            for (size_t i = 0; i < sz; ++i) {
+                if (is_printable_ascii(p[i])) {
+                    if (run_len == 0) run_start = i;
+                    ++run_len;
+                } else {
+                    if (p[i] == 0 && run_len >= min_len) {
+                        ++total_found;
+                        if (arr.size() < max_results) {
+                            json o;
+                            o["address"]  = hex_u64(sec.va + run_start);
+                            o["encoding"] = "ascii";
+                            o["length"]   = run_len;
+                            o["text"]     = std::string(
+                                reinterpret_cast<const char*>(p + run_start), run_len);
+                            arr.push_back(std::move(o));
+                        }
+                    }
+                    run_len = 0;
+                }
+            }
+        }
+
+        if (want_utf16) {
+            size_t run_start = 0;
+            size_t run_chars = 0;
+            for (size_t i = 0; i + 1 < sz; i += 2) {
+                uint8_t lo = p[i];
+                uint8_t hi = p[i + 1];
+                if (hi == 0 && is_printable_ascii(lo)) {
+                    if (run_chars == 0) run_start = i;
+                    ++run_chars;
+                } else {
+                    if (hi == 0 && lo == 0 && run_chars >= min_len) {
+                        ++total_found;
+                        if (arr.size() < max_results) {
+                            std::string s;
+                            s.reserve(run_chars);
+                            for (size_t k = 0; k < run_chars; ++k)
+                                s.push_back(static_cast<char>(p[run_start + k * 2]));
+                            json o;
+                            o["address"]  = hex_u64(sec.va + run_start);
+                            o["encoding"] = "utf16";
+                            o["length"]   = run_chars;
+                            o["text"]     = std::move(s);
+                            arr.push_back(std::move(o));
+                        }
+                    }
+                    run_chars = 0;
+                }
+            }
+        }
+    }
+
+    json result;
+    result["total_found"] = total_found;
+    result["returned"]    = arr.size();
+    result["min_length"]  = min_len;
+    result["encoding"]    = encoding;
+    result["strings"]     = std::move(arr);
+    return tool_result_t::ok(result);
+}
+
+static tool_result_t handle_ui_set_active_view(const json& params)
+{
+    if (!params.contains("view") || !params["view"].is_string())
+        return tool_result_t::error("'view' is required.");
+    std::string name = lower_copy(params["view"].get<std::string>());
+
+    struct entry_t { const char* key; center_view_t v; };
+    static const entry_t table[] = {
+        {"code_editor",     center_view_t::code_editor},
+        {"disassembly",     center_view_t::disassembly},
+        {"hex_view",        center_view_t::hex_view},
+        {"welcome",         center_view_t::welcome},
+        {"settings",        center_view_t::settings_view},
+        {"settings_view",   center_view_t::settings_view},
+        {"network",         center_view_t::network_view},
+        {"network_view",    center_view_t::network_view},
+        {"memory_scanner",  center_view_t::memory_scanner},
+        {"debugger",        center_view_t::debugger_view},
+        {"debugger_view",   center_view_t::debugger_view},
+        {"pseudocode",      center_view_t::pseudocode},
+        {"struct_recon",    center_view_t::struct_recon},
+        {"crypto_scanner",  center_view_t::crypto_scanner},
+        {"aob_generator",   center_view_t::aob_generator},
+        {"fuzzer",          center_view_t::fuzzer_view},
+        {"xref_browser",    center_view_t::xref_browser},
+        {"snapshot_diff",   center_view_t::snapshot_diff},
+        {"pointer_scanner", center_view_t::pointer_scanner},
+        {"decrypt_oracle",  center_view_t::decrypt_oracle},
+        {"integrity_hunter",center_view_t::integrity_hunter},
+        {"symbolic",        center_view_t::symbolic_view},
+        {"taint",           center_view_t::taint_view},
+        {"deobfuscation",   center_view_t::deobfuscation_view},
+        {"stealth",         center_view_t::stealth_view},
+        {"scan_hub",        center_view_t::scan_hub},
+        {"types_hub",       center_view_t::types_hub},
+        {"analysis_hub",    center_view_t::analysis_hub},
+        {"binary_map",      center_view_t::binary_map},
+        {"graph",           center_view_t::graph_view},
+        {"graph_view",      center_view_t::graph_view},
+    };
+
+    for (const entry_t& e : table) {
+        if (name == e.key) {
+            globals::ui::active_center_view = e.v;
+            json result;
+            result["view"]   = e.key;
+            result["status"] = "activated";
+            return tool_result_t::ok(result);
+        }
+    }
+    return tool_result_t::error("Unknown view name. Accepted: code_editor, disassembly, hex_view, welcome, settings, network, memory_scanner, debugger, pseudocode, struct_recon, crypto_scanner, aob_generator, fuzzer, xref_browser, snapshot_diff, pointer_scanner, decrypt_oracle, integrity_hunter, symbolic, taint, deobfuscation, stealth, scan_hub, types_hub, analysis_hub, binary_map, graph.");
+}
+
+static tool_result_t handle_bookmarks_add(const json& params)
+{
+    uint64_t addr = 0;
+    if (!parse_address_param(params, "address", addr))
+        return tool_result_t::error("'address' is required.");
+    std::string label;
+    if (params.contains("label") && params["label"].is_string())
+        label = params["label"].get<std::string>();
+
+    auto& bms = disasm_view::g_state.bookmarks;
+    for (auto& bm : bms) {
+        if (bm.addr == addr) {
+            if (!label.empty()) bm.label = label;
+            json result;
+            result["address"] = hex_u64(addr);
+            result["label"]   = bm.label;
+            result["status"]  = "updated";
+            return tool_result_t::ok(result);
+        }
+    }
+    disasm_view::bookmark_t b;
+    b.addr  = addr;
+    b.label = label;
+    bms.push_back(std::move(b));
+    json result;
+    result["address"] = hex_u64(addr);
+    result["label"]   = label;
+    result["status"]  = "added";
+    return tool_result_t::ok(result);
+}
+
+static tool_result_t handle_bookmarks_remove(const json& params)
+{
+    uint64_t addr = 0;
+    if (!parse_address_param(params, "address", addr))
+        return tool_result_t::error("'address' is required.");
+    auto& bms = disasm_view::g_state.bookmarks;
+    for (auto it = bms.begin(); it != bms.end(); ++it) {
+        if (it->addr == addr) {
+            bms.erase(it);
+            json result;
+            result["address"] = hex_u64(addr);
+            result["status"]  = "removed";
+            return tool_result_t::ok(result);
+        }
+    }
+    return tool_result_t::error("Bookmark not found at this address.");
+}
+
+static tool_result_t handle_bookmarks_list(const json&)
+{
+    json arr = json::array();
+    for (const auto& bm : disasm_view::g_state.bookmarks) {
+        json o;
+        o["address"] = hex_u64(bm.addr);
+        o["label"]   = bm.label;
+        arr.push_back(std::move(o));
+    }
+    json result;
+    result["count"]     = arr.size();
+    result["bookmarks"] = std::move(arr);
+    return tool_result_t::ok(result);
+}
+
+static tool_result_t handle_hex_view_open(const json& params)
+{
+    uint64_t addr = 0;
+    if (!parse_address_param(params, "address", addr))
+        return tool_result_t::error("'address' is required.");
+    size_t size = 0x1000;
+    if (params.contains("size") && params["size"].is_number_unsigned()) {
+        size_t v = params["size"].get<size_t>();
+        if (v == 0) return tool_result_t::error("'size' must be > 0.");
+        if (v > (1u << 20)) v = (1u << 20);
+        size = v;
+    }
+    if (!hex_view::read_from_process(addr, size)) {
+        std::string err = hex_view::last_error();
+        if (err.empty()) err = "hex_view::read_from_process failed.";
+        return tool_result_t::error(err);
+    }
+    globals::ui::active_center_view = center_view_t::hex_view;
+    json result;
+    result["address"] = hex_u64(addr);
+    result["size"]    = size;
+    result["status"]  = "opened";
+    return tool_result_t::ok(result);
+}
+
+void register_disasm_tools(mcp_standalone::server_t& srv)
+{
+    srv.register_tool({
+        "disasm_jump_to_address",
+        "Navigate the central Disassembly view to an address. Switches the active center view to disassembly and scrolls the cursor to the requested address.",
+        {{"address", "string", "Target address (hex string or integer)", true}},
+        false, handle_jump_to_address});
+
+    srv.register_tool({
+        "disasm_get_instruction",
+        "Return the decoded instruction at an address: mnemonic, operands, length, raw bytes, comment, and branch/call/ret flags.",
+        {{"address", "string", "Instruction address (hex string or integer)", true}},
+        true, handle_get_instruction});
+
+    srv.register_tool({
+        "disasm_get_function_bounds",
+        "Return the bounding function metadata (start, end, size, display name, section) for the function that contains a given address.",
+        {{"address", "string", "Any address inside the function (hex string or integer)", true}},
+        true, handle_get_function_bounds});
+
+    srv.register_tool({
+        "disasm_get_function_disassembly",
+        "Return the decoded instruction list of the function containing the address, up to max_instrs (default 256, max 8192).",
+        {{"address", "string", "Any address inside the function (hex string or integer)", true},
+         {"max_instrs", "number", "Maximum instructions to return (default 256, max 8192)", false}},
+        true, handle_get_function_disassembly});
+
+    srv.register_tool({
+        "disasm_list_functions",
+        "List functions known to the analysis function index. Supports case-insensitive substring filter on the display name and offset/limit paging.",
+        {{"filter", "string", "Optional case-insensitive substring filter applied to the function name", false},
+         {"offset", "number", "Number of matches to skip (default 0)", false},
+         {"limit",  "number", "Maximum matches to return (default 200, max 5000)", false}},
+        true, handle_list_functions});
+
+    srv.register_tool({
+        "disasm_get_xrefs_to",
+        "Return cached cross-references that target an address from the xref_db (call/jump/data_ref). Requires the containing module to have been indexed via the Xref DB panel.",
+        {{"address", "string", "Target address (hex string or integer)", true}},
+        true, handle_get_xrefs_to});
+
+    srv.register_tool({
+        "disasm_get_xrefs_from",
+        "Return cached cross-references that originate at an address from the xref_db. Requires the containing module to have been indexed.",
+        {{"address", "string", "Source address (hex string or integer)", true}},
+        true, handle_get_xrefs_from});
+
+    srv.register_tool({
+        "disasm_set_comment",
+        "Attach (or clear) a comment string for an instruction address. Empty comment deletes the entry.",
+        {{"address", "string", "Address (hex string or integer)", true},
+         {"comment", "string", "Comment text (empty string clears the comment)", false}},
+        false, handle_set_comment});
+
+    srv.register_tool({
+        "disasm_get_comment",
+        "Return the comment string previously stored for an address (empty when none).",
+        {{"address", "string", "Address (hex string or integer)", true}},
+        true, handle_get_comment});
+
+    srv.register_tool({
+        "disasm_rename_function",
+        "Set (or clear) the user-visible name of a function at an address. Empty name clears the rename and falls back to PDB/synthetic naming. Triggers a disasm view format refresh.",
+        {{"address", "string", "Function start (hex string or integer)", true},
+         {"new_name", "string", "New display name (empty to clear)", false}},
+        false, handle_rename_function});
+
+    srv.register_tool({
+        "disasm_get_section_info",
+        "Return the executable section table of the currently loaded disassembly file (va, size, image_base, text_va).",
+        {},
+        true, handle_get_section_info});
+
+    srv.register_tool({
+        "disasm_search_bytes",
+        "Scan executable sections of the loaded file for a hex byte pattern. Pattern accepts hex bytes separated by spaces or commas; '??' is a single-byte wildcard.",
+        {{"pattern", "string", "Hex pattern (e.g. '48 8B 05 ?? ?? ?? ??')", true},
+         {"max_hits","number", "Maximum match addresses to return (default 256, max 4096)", false}},
+        true, handle_search_bytes});
+
+    srv.register_tool({
+        "disasm_get_strings",
+        "Extract printable string literals from the loaded disassembly file. Streams ASCII and/or UTF-16LE runs from the data sections.",
+        {{"min_length", "number", "Minimum run length in characters (default 4)", false},
+         {"encoding",   "string", "ascii, utf16, or both (default ascii)", false},
+         {"limit",      "number", "Maximum strings to return (default 2048, max 8192)", false}},
+        true, handle_get_strings});
+
+    srv.register_tool({
+        "ui_set_active_view",
+        "Switch the central view to a named panel (disassembly, hex_view, debugger, pseudocode, settings, analysis_hub, etc.).",
+        {{"view", "string", "View name (case-insensitive)", true}},
+        false, handle_ui_set_active_view});
+
+    srv.register_tool({
+        "bookmarks_add",
+        "Add an address to the Disassembly bookmark list with an optional label.",
+        {{"address", "string", "Bookmark address (hex string or integer)", true},
+         {"label",   "string", "Optional descriptive label", false}},
+        false, handle_bookmarks_add});
+
+    srv.register_tool({
+        "bookmarks_remove",
+        "Remove the bookmark at the given address.",
+        {{"address", "string", "Bookmark address (hex string or integer)", true}},
+        false, handle_bookmarks_remove});
+
+    srv.register_tool({
+        "bookmarks_list",
+        "List all addresses currently bookmarked in the Disassembly view.",
+        {},
+        true, handle_bookmarks_list});
+
+    srv.register_tool({
+        "hex_view_open",
+        "Read a range of bytes from the attached process via the kernel driver and open them in the Hex View (size capped to 1 MiB).",
+        {{"address", "string", "Source address (hex string or integer)", true},
+         {"size",    "number", "Number of bytes to read (default 4096, max 1048576)", false}},
+        false, handle_hex_view_open});
+}
+
+}

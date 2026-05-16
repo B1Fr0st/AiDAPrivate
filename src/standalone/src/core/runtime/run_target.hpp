@@ -1,0 +1,52 @@
+#pragma once
+
+#include <cstdint>
+#include <string>
+
+namespace run_target {
+
+enum class isolation_t : int {
+	same_desktop_jobbed = 0,
+	appcontainer = 1,
+	windows_sandbox = 2,
+};
+
+struct launch_options_t {
+	std::wstring exe_path;
+	std::wstring args;
+	std::wstring working_dir;
+
+	isolation_t  isolation = isolation_t::same_desktop_jobbed;
+
+	bool         block_network = true;
+	bool         kill_on_host_exit = true;
+	bool         attach_after_resume = true;
+
+	uint32_t     memory_cap_mb = 0;
+	uint32_t     auto_terminate_sec = 0;
+};
+
+struct launch_result_t {
+	bool        ok = false;
+	uint32_t    pid = 0;
+	uintptr_t   process_handle = 0;
+	uintptr_t   thread_handle = 0;
+	uintptr_t   job_handle = 0;
+	std::string firewall_rule_name;
+	std::string error;
+};
+
+struct capability_probe_t {
+	bool     has_jobobject = false;
+	bool     has_appcontainer = false;
+	bool     has_firewall_inet = false;
+	bool     has_windows_sandbox = false;
+	uint32_t windows_build = 0;
+};
+
+bool launch(const launch_options_t& opts, launch_result_t& out);
+bool cleanup(launch_result_t& result);
+
+capability_probe_t probe_capabilities();
+
+}

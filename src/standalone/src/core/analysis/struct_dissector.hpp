@@ -1,8 +1,11 @@
 #pragma once
 
 #include "standalone_driver.hpp"
+#include "../infra/work_queue.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -66,6 +69,9 @@ struct state_t {
 	bool                      auto_refresh = false;
 	float                     refresh_interval = 0.5f;
 	float                     refresh_timer = 0.f;
+	std::atomic<bool>         refresh_in_flight{false};
+	std::atomic<uint64_t>     refresh_seq{0};
+	std::atomic<uint64_t>     last_completed_seq{0};
 };
 
 inline state_t g_state;
@@ -230,90 +236,205 @@ inline void recalc_total_size(struct_def_t& sd) {
 }
 
 inline int create_struct(const std::string& name) {
-	std::lock_guard<std::mutex> lk(g_state.mtx);
-	struct_def_t sd;
-	sd.name = name;
-	sd.total_size = 0;
-	g_state.structs.push_back(std::move(sd));
-	return static_cast<int>(g_state.structs.size()) - 1;
+	int idx = -1;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mtx);
+		struct_def_t sd;
+		sd.name = name;
+		sd.total_size = 0;
+		g_state.structs.push_back(std::move(sd));
+		idx = static_cast<int>(g_state.structs.size()) - 1;
+	}
+	diag::log_tagged_fmt("dissector",
+		"create_struct name='%s' idx=%d total=%zu",
+		name.c_str(), idx, static_cast<size_t>(idx + 1));
+	return idx;
 }
 
 inline int add_field(int struct_idx, const field_def_t& field) {
-	std::lock_guard<std::mutex> lk(g_state.mtx);
-	if (struct_idx < 0 || struct_idx >= static_cast<int>(g_state.structs.size()))
-		return -1;
-	auto& sd = g_state.structs[struct_idx];
-	field_def_t f = field;
-	if (f.size == 0) {
-		size_t ts = field_type_size(f.type);
-		f.size = static_cast<uint32_t>(ts > 0 ? ts : 1);
+	int idx = -1;
+	uint32_t total_after = 0;
+	std::string sd_name;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mtx);
+		if (struct_idx < 0 || struct_idx >= static_cast<int>(g_state.structs.size())) {
+			diag::log_tagged_fmt("dissector",
+				"add_field rejected reason='bad_struct_idx' idx=%d", struct_idx);
+			return -1;
+		}
+		auto& sd = g_state.structs[struct_idx];
+		field_def_t f = field;
+		if (f.size == 0) {
+			size_t ts = field_type_size(f.type);
+			f.size = static_cast<uint32_t>(ts > 0 ? ts : 1);
+		}
+		idx = static_cast<int>(sd.fields.size());
+		if (f.parent_idx >= 0 && f.parent_idx < static_cast<int>(sd.fields.size()))
+			sd.fields[f.parent_idx].children.push_back(idx);
+		sd.fields.push_back(std::move(f));
+		recalc_total_size(sd);
+		total_after = sd.total_size;
+		sd_name = sd.name;
 	}
-	int idx = static_cast<int>(sd.fields.size());
-	if (f.parent_idx >= 0 && f.parent_idx < static_cast<int>(sd.fields.size()))
-		sd.fields[f.parent_idx].children.push_back(idx);
-	sd.fields.push_back(std::move(f));
-	recalc_total_size(sd);
+	diag::log_tagged_fmt("dissector",
+		"add_field struct='%s' field='%s' offset=0x%X size=%u type=%s field_idx=%d total=%u",
+		sd_name.c_str(),
+		field.name.c_str(),
+		field.offset,
+		field.size,
+		field_type_name(field.type),
+		idx,
+		total_after);
 	return idx;
 }
 
 inline bool remove_field(int struct_idx, int field_idx) {
-	std::lock_guard<std::mutex> lk(g_state.mtx);
-	if (struct_idx < 0 || struct_idx >= static_cast<int>(g_state.structs.size()))
-		return false;
-	auto& sd = g_state.structs[struct_idx];
-	if (field_idx < 0 || field_idx >= static_cast<int>(sd.fields.size()))
-		return false;
-	int parent = sd.fields[field_idx].parent_idx;
-	if (parent >= 0 && parent < static_cast<int>(sd.fields.size())) {
-		auto& pc = sd.fields[parent].children;
-		pc.erase(std::remove(pc.begin(), pc.end(), field_idx), pc.end());
-	}
-	sd.fields.erase(sd.fields.begin() + field_idx);
-	for (auto& f : sd.fields) {
-		if (f.parent_idx > field_idx) --f.parent_idx;
-		else if (f.parent_idx == field_idx) f.parent_idx = -1;
-		for (auto& ci : f.children) {
-			if (ci > field_idx) --ci;
+	std::string removed_name;
+	std::string sd_name;
+	uint32_t total_after = 0;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mtx);
+		if (struct_idx < 0 || struct_idx >= static_cast<int>(g_state.structs.size())) {
+			diag::log_tagged_fmt("dissector",
+				"remove_field rejected reason='bad_struct_idx' idx=%d", struct_idx);
+			return false;
 		}
-		f.children.erase(
-			std::remove_if(f.children.begin(), f.children.end(),
-				[&](int c) { return c < 0 || c >= static_cast<int>(sd.fields.size()); }),
-			f.children.end());
+		auto& sd = g_state.structs[struct_idx];
+		if (field_idx < 0 || field_idx >= static_cast<int>(sd.fields.size())) {
+			diag::log_tagged_fmt("dissector",
+				"remove_field rejected reason='bad_field_idx' struct='%s' field_idx=%d field_count=%zu",
+				sd.name.c_str(), field_idx, sd.fields.size());
+			return false;
+		}
+		removed_name = sd.fields[field_idx].name;
+		sd_name = sd.name;
+		int parent = sd.fields[field_idx].parent_idx;
+		if (parent >= 0 && parent < static_cast<int>(sd.fields.size())) {
+			auto& pc = sd.fields[parent].children;
+			pc.erase(std::remove(pc.begin(), pc.end(), field_idx), pc.end());
+		}
+		sd.fields.erase(sd.fields.begin() + field_idx);
+		for (auto& f : sd.fields) {
+			if (f.parent_idx > field_idx) --f.parent_idx;
+			else if (f.parent_idx == field_idx) f.parent_idx = -1;
+			for (auto& ci : f.children) {
+				if (ci > field_idx) --ci;
+			}
+			f.children.erase(
+				std::remove_if(f.children.begin(), f.children.end(),
+					[&](int c) { return c < 0 || c >= static_cast<int>(sd.fields.size()); }),
+				f.children.end());
+		}
+		recalc_total_size(sd);
+		total_after = sd.total_size;
 	}
-	recalc_total_size(sd);
+	diag::log_tagged_fmt("dissector",
+		"remove_field struct='%s' field='%s' idx=%d total=%u",
+		sd_name.c_str(), removed_name.c_str(), field_idx, total_after);
 	return true;
 }
 
 inline void refresh_values() {
-	if (!driver_bridge::is_loaded()) return;
-	std::lock_guard<std::mutex> lk(g_state.mtx);
-	if (g_state.active_struct < 0 ||
-		g_state.active_struct >= static_cast<int>(g_state.structs.size()))
+	if (!driver_bridge::is_loaded()) {
+		diag::log_tagged_fmt("dissector",
+			"refresh_values skipped reason='driver_not_loaded'");
 		return;
-	if (g_state.base_address == 0) return;
-
-	const auto& sd = g_state.structs[g_state.active_struct];
-	if (sd.total_size == 0) return;
-
-	std::vector<uint8_t> block;
-	if (!driver_bridge::read_memory(g_state.base_address, sd.total_size, block))
-		return;
-
-	g_state.cached_values.resize(sd.fields.size());
-	for (size_t i = 0; i < sd.fields.size(); ++i) {
-		const auto& f = sd.fields[i];
-		uint32_t fsz = f.size * f.array_count;
-		if (f.offset + fsz > static_cast<uint32_t>(block.size())) {
-			g_state.cached_values[i].display_text = "<out of range>";
-			g_state.cached_values[i].changed = false;
-			continue;
-		}
-		std::vector<uint8_t> raw(block.begin() + f.offset, block.begin() + f.offset + fsz);
-		bool changed = (raw != g_state.cached_values[i].raw_bytes);
-		g_state.cached_values[i].raw_bytes = std::move(raw);
-		g_state.cached_values[i].display_text = format_field_value(g_state.cached_values[i].raw_bytes, f.type);
-		g_state.cached_values[i].changed = changed;
 	}
+
+	bool expected = false;
+	if (!g_state.refresh_in_flight.compare_exchange_strong(expected, true)) {
+		diag::log_tagged_fmt("dissector",
+			"refresh_values skipped reason='in_flight'");
+		return;
+	}
+
+	uint64_t base = 0;
+	uint32_t total_size = 0;
+	int active = -1;
+	size_t field_count = 0;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mtx);
+		active = g_state.active_struct;
+		if (active < 0 || active >= static_cast<int>(g_state.structs.size())) {
+			g_state.refresh_in_flight.store(false);
+			diag::log_tagged_fmt("dissector",
+				"refresh_values skipped reason='no_active_struct'");
+			return;
+		}
+		if (g_state.base_address == 0) {
+			g_state.refresh_in_flight.store(false);
+			diag::log_tagged_fmt("dissector",
+				"refresh_values skipped reason='base_addr_zero' active=%d", active);
+			return;
+		}
+		const auto& sd = g_state.structs[active];
+		if (sd.total_size == 0) {
+			g_state.refresh_in_flight.store(false);
+			diag::log_tagged_fmt("dissector",
+				"refresh_values skipped reason='total_size_zero' name='%s'",
+				sd.name.c_str());
+			return;
+		}
+		base = g_state.base_address;
+		total_size = sd.total_size;
+		field_count = sd.fields.size();
+	}
+
+	uint64_t seq = g_state.refresh_seq.fetch_add(1) + 1;
+
+	work_queue::post([base, total_size, active, seq, field_count]() {
+		std::vector<uint8_t> block;
+		bool ok = driver_bridge::read_memory(base, total_size, block);
+		if (!ok || block.empty()) {
+			g_state.refresh_in_flight.store(false);
+			diag::log_tagged_fmt("dissector",
+				"refresh_values_read_failed base=0x%llX size=%u",
+				static_cast<unsigned long long>(base), total_size);
+			return;
+		}
+
+		size_t changed_count = 0;
+		size_t oor_count = 0;
+		{
+			std::lock_guard<std::mutex> lk(g_state.mtx);
+			if (active < 0 || active >= static_cast<int>(g_state.structs.size())) {
+				g_state.refresh_in_flight.store(false);
+				return;
+			}
+			if (g_state.last_completed_seq.load() > seq) {
+				g_state.refresh_in_flight.store(false);
+				return;
+			}
+			const auto& sd = g_state.structs[active];
+			g_state.cached_values.resize(sd.fields.size());
+			for (size_t i = 0; i < sd.fields.size(); ++i) {
+				const auto& f = sd.fields[i];
+				uint32_t fsz = f.size * f.array_count;
+				if (static_cast<uint64_t>(f.offset) + static_cast<uint64_t>(fsz) > block.size()) {
+					g_state.cached_values[i].display_text = "<out of range>";
+					g_state.cached_values[i].changed = false;
+					++oor_count;
+					continue;
+				}
+				std::vector<uint8_t> raw(block.begin() + f.offset,
+					block.begin() + f.offset + fsz);
+				bool changed = (raw != g_state.cached_values[i].raw_bytes);
+				g_state.cached_values[i].raw_bytes = std::move(raw);
+				g_state.cached_values[i].display_text =
+					format_field_value(g_state.cached_values[i].raw_bytes, f.type);
+				g_state.cached_values[i].changed = changed;
+				if (changed) ++changed_count;
+			}
+			g_state.last_completed_seq.store(seq);
+		}
+
+		g_state.refresh_in_flight.store(false);
+		diag::log_tagged_fmt("dissector",
+			"refresh_values_done base=0x%llX size=%u fields=%zu changed=%zu oor=%zu seq=%llu",
+			static_cast<unsigned long long>(base), total_size,
+			field_count, changed_count, oor_count,
+			static_cast<unsigned long long>(seq));
+	});
 }
 
 inline std::string auto_detect_type(uint64_t address, size_t size) {
@@ -356,8 +477,11 @@ inline std::string auto_detect_type(uint64_t address, size_t size) {
 
 inline std::string export_to_c(int struct_idx) {
 	std::lock_guard<std::mutex> lk(g_state.mtx);
-	if (struct_idx < 0 || struct_idx >= static_cast<int>(g_state.structs.size()))
+	if (struct_idx < 0 || struct_idx >= static_cast<int>(g_state.structs.size())) {
+		diag::log_tagged_fmt("dissector",
+			"export_to_c rejected reason='bad_idx' idx=%d", struct_idx);
 		return {};
+	}
 	const auto& sd = g_state.structs[struct_idx];
 	std::string out;
 	out += "typedef struct {\n";
@@ -398,6 +522,9 @@ inline std::string export_to_c(int struct_idx) {
 		out += "\n";
 	}
 	out += "} " + sd.name + "_t;\n";
+	diag::log_tagged_fmt("dissector",
+		"export_to_c name='%s' fields=%zu bytes=%zu",
+		sd.name.c_str(), sd.fields.size(), out.size());
 	return out;
 }
 

@@ -320,6 +320,29 @@ inline void render_tab_underline_glow(ImDrawList* dl, float underline_x, float u
 		aida::ui::with_alpha(t.accent_grad_top, alpha));
 }
 
+inline void render_tab_underline_glow_vertical(ImDrawList* dl, float baseline_x, float underline_y,
+												float underline_h, float alpha)
+{
+	if (underline_h <= 0.5f) return;
+	const auto& t = aida::ui::resolved();
+	for (int g = 0; g < 3; ++g) {
+		float spread = 2.f + static_cast<float>(g) * 2.f;
+		float ga = (0.20f - static_cast<float>(g) * 0.06f) * alpha;
+		dl->AddRectFilled(
+			ImVec2(baseline_x - spread, underline_y - spread),
+			ImVec2(baseline_x + 2.f + spread, underline_y + underline_h + spread),
+			aida::ui::with_alpha(t.accent_glow, ga * 4.f),
+			3.f + static_cast<float>(g));
+	}
+	dl->AddRectFilledMultiColor(
+		ImVec2(baseline_x, underline_y),
+		ImVec2(baseline_x + 2.5f, underline_y + underline_h),
+		aida::ui::with_alpha(t.accent_grad_top, alpha),
+		aida::ui::with_alpha(t.accent_grad_top, alpha),
+		aida::ui::with_alpha(t.accent_grad_bot, alpha),
+		aida::ui::with_alpha(t.accent_grad_bot, alpha));
+}
+
 inline void render_status_dot(ImDrawList* dl, float cx, float cy, float radius,
 							  ImU32 color, float time, bool pulsing)
 {

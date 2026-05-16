@@ -38,6 +38,7 @@
 #include "agent_picker_view.hpp"
 #include "settings_overlay.hpp"
 #include "work_queue.hpp"
+#include "core/session/session_health.hpp"
 #include "helpers/stb_image.h"
 
 #include "embedded_resources.hpp"
@@ -45,6 +46,8 @@
 #include "hardware_id/hardware_id.hpp"
 #include "core/anti-tamper/cff.hpp"
 #include "core/anti-tamper/virtualizer.hpp"
+#include "core/disasm/function_index.hpp"
+#include "core/auth/auth_http.hpp"
 
 extern "C" {
 #include <openssl/applink.c>
@@ -1023,6 +1026,14 @@ int main(int, char**)
 
     {
         bool settings_loaded = g_sa_settings.load();
+        g_sa_settings.editor_line_numbers   = true;
+        g_sa_settings.editor_word_wrap      = true;
+        g_sa_settings.editor_minimap        = true;
+        g_sa_settings.editor_bracket_match  = true;
+        g_sa_settings.editor_highlight_line = true;
+        g_sa_settings.editor_auto_complete  = true;
+        g_sa_settings.ghost_text_enabled    = true;
+        g_sa_settings.auto_save_enabled     = true;
         crash_log_fmt("startup_settings_loaded=%d", settings_loaded ? 1 : 0);
         std::string ban_reason;
         std::string ban_message;
@@ -1194,6 +1205,10 @@ int main(int, char**)
             diag::log_tagged_fmt("bg_init", "anti_tamper_initialize_seh code=0x%08X last_err=%lu", seh_at, GetLastError());
         diag::log_tagged_fmt("bg_init", "anti_tamper_initialize_result=%d", at_result ? 1 : 0);
         globals::ui::bg_init_step.store(7, std::memory_order_release);
+
+        diag::log_tagged("bg_init", "session_health_init_start");
+        (void)session_health::initialize();
+        diag::log_tagged("bg_init", "session_health_init_ok");
 
         bg_init_done.store(true, std::memory_order_release);
         diag::log_tagged("bg_init", "thread_exit");
@@ -1544,6 +1559,50 @@ int main(int, char**)
         if (frame_number < 5)
             crash_log_fmt("frame_end #%llu", frame_number);
         frame_number++;
+
+        {
+            static uint64_t s_last_interaction_ms = 0;
+            static ImVec2   s_last_mouse_pos = ImVec2(-1.f, -1.f);
+            const uint64_t now_ms = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            ImGuiIO& io = ImGui::GetIO();
+            bool interacted = false;
+            if (io.MouseDelta.x != 0.f || io.MouseDelta.y != 0.f) interacted = true;
+            if (s_last_mouse_pos.x != io.MousePos.x || s_last_mouse_pos.y != io.MousePos.y) {
+                s_last_mouse_pos = io.MousePos;
+                interacted = true;
+            }
+            if (io.MouseWheel != 0.f || io.MouseWheelH != 0.f) interacted = true;
+            for (int b = 0; b < IM_ARRAYSIZE(io.MouseDown); ++b) {
+                if (io.MouseDown[b]) { interacted = true; break; }
+            }
+            if (io.WantTextInput || io.WantCaptureKeyboard) interacted = true;
+            if (ImGui::IsAnyItemActive() || ImGui::IsAnyItemFocused()) interacted = true;
+            if (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 1.0f)
+                || ImGui::IsMouseDragging(ImGuiMouseButton_Right, 1.0f)
+                || ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 1.0f))
+                interacted = true;
+            if (io.KeyCtrl || io.KeyShift || io.KeyAlt || io.KeySuper) interacted = true;
+            if (g_ResizeWidth != 0 || g_ResizeHeight != 0) interacted = true;
+            if (interacted) s_last_interaction_ms = now_ms;
+
+            const bool bulk_busy = function_index::static_bulk_in_progress();
+            const uint64_t since_interaction_ms = (now_ms > s_last_interaction_ms)
+                ? (now_ms - s_last_interaction_ms) : 0ull;
+            const bool foreground = (g_hwnd && ::GetForegroundWindow() == g_hwnd);
+
+            bool may_sleep = true;
+            if (bulk_busy) may_sleep = false;
+            if (since_interaction_ms < 500ull) may_sleep = false;
+            if (io.WantTextInput || io.WantCaptureKeyboard) may_sleep = false;
+            if (ImGui::IsAnyItemActive()) may_sleep = false;
+            if (!foreground) may_sleep = true;
+
+            if (may_sleep) {
+                ::Sleep(foreground ? 33u : 50u);
+            }
+        }
     }
 
 
@@ -1554,6 +1613,7 @@ int main(int, char**)
     script_engine::shutdown();
     workflow_tools::shutdown_services();
     shutdown_standalone_chat();
+    aida::auth::http::cleanup();
     Blur::Shutdown();
     ImGui_ImplDX11_Shutdown();
 

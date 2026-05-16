@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -72,6 +73,64 @@ struct state_t {
 };
 
 inline state_t g_state;
+
+struct snapshot_t {
+	std::unordered_map<std::string, module_index_t> modules;
+	bool                building = false;
+	float               progress = 0.f;
+	bool                cancel = false;
+	std::string         building_module;
+	std::vector<xref_entry_t> query_results;
+	bool                      query_is_to = true;
+	uint64_t                  query_addr = 0;
+	std::string filter_text;
+	int         filter_type = -1;
+	std::unordered_map<uint64_t, call_graph_node_t> call_graph;
+};
+
+inline std::unique_ptr<snapshot_t> detach_snapshot() {
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	auto out = std::make_unique<snapshot_t>();
+	out->modules = std::move(g_state.modules);
+	out->building = g_state.building.load(std::memory_order_acquire);
+	out->progress = g_state.progress.load(std::memory_order_acquire);
+	out->cancel = g_state.cancel.load(std::memory_order_acquire);
+	out->building_module = std::move(g_state.building_module);
+	out->query_results = std::move(g_state.query_results);
+	out->query_is_to = g_state.query_is_to;
+	out->query_addr = g_state.query_addr;
+	out->filter_text = std::move(g_state.filter_text);
+	out->filter_type = g_state.filter_type;
+	out->call_graph = std::move(g_state.call_graph);
+	g_state.modules.clear();
+	g_state.building.store(false, std::memory_order_release);
+	g_state.progress.store(0.f, std::memory_order_release);
+	g_state.cancel.store(false, std::memory_order_release);
+	g_state.building_module.clear();
+	g_state.query_results.clear();
+	g_state.query_is_to = true;
+	g_state.query_addr = 0;
+	g_state.filter_text.clear();
+	g_state.filter_type = -1;
+	g_state.call_graph.clear();
+	return out;
+}
+
+inline void attach_snapshot(std::unique_ptr<snapshot_t> snap) {
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	if (!snap) snap = std::make_unique<snapshot_t>();
+	g_state.modules = std::move(snap->modules);
+	g_state.building.store(snap->building, std::memory_order_release);
+	g_state.progress.store(snap->progress, std::memory_order_release);
+	g_state.cancel.store(snap->cancel, std::memory_order_release);
+	g_state.building_module = std::move(snap->building_module);
+	g_state.query_results = std::move(snap->query_results);
+	g_state.query_is_to = snap->query_is_to;
+	g_state.query_addr = snap->query_addr;
+	g_state.filter_text = std::move(snap->filter_text);
+	g_state.filter_type = snap->filter_type;
+	g_state.call_graph = std::move(snap->call_graph);
+}
 
 namespace detail {
 

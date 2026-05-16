@@ -26,6 +26,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #pragma comment(lib, "psapi.lib")
@@ -52,6 +53,26 @@ namespace
     bool            g_kernel_mode = false;
     bool            g_has_vm_read = false;
     bool            g_kernel_attached = false;
+
+    struct process_ctx_t {
+        HANDLE      h_process = nullptr;
+        bool        kernel_attached = false;
+        bool        has_vm_read = false;
+        std::string name;
+        uint64_t    cached_image_base = 0;
+        uint64_t    cached_dtb = 0;
+        uint64_t    cached_kernel_dtb = 0;
+    };
+
+    std::unordered_map<uint32_t, process_ctx_t> g_processes;
+
+    void release_ctx_handle(process_ctx_t& ctx)
+    {
+        if (ctx.h_process) {
+            CloseHandle(ctx.h_process);
+            ctx.h_process = nullptr;
+        }
+    }
 
     struct handle_closer
     {
@@ -540,6 +561,14 @@ namespace driver_bridge
         if (!refresh_process_name_locked())
             g_process_name = process_name_from_pid(pid);
 
+        {
+            auto it = g_processes.find(pid);
+            if (it != g_processes.end()) {
+                release_ctx_handle(it->second);
+                g_processes.erase(it);
+            }
+        }
+
         bool kernel_ok = g_kernel_mode && device && device->is_connected();
         diag::log_tagged_critical_fmt("driver", "attach_kernel_check kernel_mode=%d device=%p connected=%d kernel_ok=%d",
             g_kernel_mode ? 1 : 0, device.get(),
@@ -619,6 +648,19 @@ namespace driver_bridge
             logf("AiDA Standalone: Attached to PID %u (%s) via limited handle (query-only).\n",
                  g_pid, g_process_name.empty() ? "unknown" : g_process_name.c_str());
         }
+
+        {
+            process_ctx_t ctx;
+            ctx.h_process = nullptr;
+            ctx.kernel_attached = g_kernel_attached;
+            ctx.has_vm_read = g_has_vm_read;
+            ctx.name = g_process_name;
+            ctx.cached_image_base = (g_kernel_attached && device) ? device->find_image() : 0;
+            ctx.cached_dtb = (g_kernel_attached && device) ? device->get_dtb() : 0;
+            ctx.cached_kernel_dtb = (g_kernel_attached && device) ? device->get_kernel_dtb() : 0;
+            g_processes[pid] = std::move(ctx);
+        }
+
         diag::log_tagged_critical_fmt("driver", "attach_exit_ok pid=%u kernel_ok=%d has_vm_read=%d",
             pid, kernel_ok ? 1 : 0, has_vm_read ? 1 : 0);
         return true;
@@ -664,6 +706,7 @@ namespace driver_bridge
         }
 
         std::lock_guard<std::mutex> lk(g_state_mtx);
+        uint32_t prev_pid = g_pid;
         close_process_handle_locked();
         g_pid = 0;
         g_process_name.clear();
@@ -677,7 +720,203 @@ namespace driver_bridge
                 device->clear_process_context();
             }
         }
+        if (prev_pid != 0) {
+            auto it = g_processes.find(prev_pid);
+            if (it != g_processes.end()) {
+                release_ctx_handle(it->second);
+                g_processes.erase(it);
+            }
+        }
         set_last_error_locked({});
+    }
+
+    bool attach_additional(uint32_t pid)
+    {
+        if (pid == 0)
+            return false;
+        if (pid == static_cast<uint32_t>(GetCurrentProcessId()))
+            return false;
+
+        std::lock_guard<std::mutex> lk(g_state_mtx);
+        if (g_processes.find(pid) != g_processes.end()) {
+            return true;
+        }
+
+        DWORD access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ;
+        unique_handle process(OpenProcess(access, FALSE, pid));
+        bool has_vm_read = true;
+        if (!process) {
+            has_vm_read = false;
+            access = PROCESS_QUERY_LIMITED_INFORMATION;
+            process.reset(OpenProcess(access, FALSE, pid));
+            if (!process) {
+                set_last_error_locked("OpenProcess failed for PID " + std::to_string(pid) +
+                                      " (error " + std::to_string(GetLastError()) + ")");
+                return false;
+            }
+        }
+
+        process_ctx_t ctx;
+        ctx.h_process = process.release();
+        ctx.has_vm_read = has_vm_read;
+        ctx.kernel_attached = false;
+        ctx.name = process_name_from_pid(pid);
+        ctx.cached_image_base = 0;
+        ctx.cached_dtb = 0;
+        ctx.cached_kernel_dtb = 0;
+        g_processes[pid] = std::move(ctx);
+
+        diag::log_tagged_fmt("driver", "attach_additional_ok pid=%u has_vm_read=%d", pid, has_vm_read ? 1 : 0);
+        return true;
+    }
+
+    bool set_active_pid(uint32_t pid)
+    {
+        if (pid == 0)
+            return false;
+
+        std::lock_guard<std::mutex> lk(g_state_mtx);
+        if (g_pid == pid)
+            return true;
+
+        auto it = g_processes.find(pid);
+        if (it == g_processes.end()) {
+            set_last_error_locked("set_active_pid: pid " + std::to_string(pid) + " not in attached set");
+            return false;
+        }
+        process_ctx_t& target = it->second;
+
+        if (g_pid != 0) {
+            auto cur_it = g_processes.find(g_pid);
+            if (cur_it != g_processes.end()) {
+                cur_it->second.kernel_attached = g_kernel_attached;
+                cur_it->second.has_vm_read = g_has_vm_read;
+                cur_it->second.name = g_process_name;
+                if (g_kernel_attached && device) {
+                    cur_it->second.cached_image_base = device->find_image();
+                    cur_it->second.cached_dtb = device->get_dtb();
+                    cur_it->second.cached_kernel_dtb = device->get_kernel_dtb();
+                }
+                if (cur_it->second.h_process == nullptr && g_process != nullptr) {
+                    cur_it->second.h_process = g_process;
+                    g_process = nullptr;
+                }
+            }
+        }
+
+        close_process_handle_locked();
+        g_pid = pid;
+        g_process_name = target.name;
+        g_has_vm_read = target.has_vm_read;
+        g_kernel_attached = target.kernel_attached;
+        g_process = target.h_process;
+        target.h_process = nullptr;
+
+        bool kernel_mode = g_kernel_mode && device && device->is_connected();
+        if (kernel_mode) {
+            const auto* vtable = get_arc_vtable();
+            if (vtable && vtable->set_process_id)
+                vtable->set_process_id(pid);
+            device->set_process_id(pid);
+            if (target.cached_image_base != 0) {
+                device->set_base_address(target.cached_image_base);
+                if (vtable && vtable->set_base_address)
+                    vtable->set_base_address(target.cached_image_base);
+            }
+            bool needs_resolve = !g_kernel_attached || target.cached_dtb == 0;
+            if (needs_resolve) {
+                device->solve_dtb();
+                if (device->get_dtb() != 0) {
+                    g_kernel_attached = true;
+                    const auto image_base = device->find_image();
+                    if (image_base != 0) {
+                        device->set_base_address(image_base);
+                        target.cached_image_base = image_base;
+                    }
+                    target.cached_dtb = device->get_dtb();
+                    device->solve_kernel_dtb();
+                    target.cached_kernel_dtb = device->get_kernel_dtb();
+                }
+            }
+        }
+        diag::log_tagged_fmt("driver", "set_active_pid_ok pid=%u kernel_attached=%d", pid, g_kernel_attached ? 1 : 0);
+        return true;
+    }
+
+    bool detach_one(uint32_t pid)
+    {
+        if (pid == 0)
+            return false;
+
+        std::lock_guard<std::mutex> lk(g_state_mtx);
+        auto it = g_processes.find(pid);
+        if (it == g_processes.end())
+            return false;
+
+        if (g_pid == pid) {
+            close_process_handle_locked();
+            g_pid = 0;
+            g_process_name.clear();
+            g_has_vm_read = false;
+            g_kernel_attached = false;
+            if (g_kernel_mode && device && device->is_connected()) {
+                const auto* vtable = get_arc_vtable();
+                if (vtable && vtable->clear_process_context)
+                    vtable->clear_process_context();
+                else
+                    device->clear_process_context();
+            }
+        } else {
+            release_ctx_handle(it->second);
+        }
+        g_processes.erase(it);
+        diag::log_tagged_fmt("driver", "detach_one_ok pid=%u", pid);
+        return true;
+    }
+
+    bool clear_active_pid()
+    {
+        std::lock_guard<std::mutex> lk(g_state_mtx);
+        if (g_pid == 0)
+            return true;
+        auto it = g_processes.find(g_pid);
+        if (it != g_processes.end()) {
+            if (it->second.h_process == nullptr && g_process != nullptr) {
+                it->second.h_process = g_process;
+                g_process = nullptr;
+            }
+            it->second.kernel_attached = g_kernel_attached;
+            it->second.has_vm_read = g_has_vm_read;
+            it->second.name = g_process_name;
+            if (g_kernel_attached && device) {
+                it->second.cached_image_base = device->find_image();
+                it->second.cached_dtb = device->get_dtb();
+                it->second.cached_kernel_dtb = device->get_kernel_dtb();
+            }
+        }
+        close_process_handle_locked();
+        g_pid = 0;
+        g_process_name.clear();
+        g_has_vm_read = false;
+        g_kernel_attached = false;
+        if (g_kernel_mode && device && device->is_connected()) {
+            const auto* vtable = get_arc_vtable();
+            if (vtable && vtable->clear_process_context)
+                vtable->clear_process_context();
+            else
+                device->clear_process_context();
+        }
+        return true;
+    }
+
+    std::vector<uint32_t> attached_pids()
+    {
+        std::vector<uint32_t> out;
+        std::lock_guard<std::mutex> lk(g_state_mtx);
+        out.reserve(g_processes.size());
+        for (const auto& kv : g_processes)
+            out.push_back(kv.first);
+        return out;
     }
 
     std::string status()
@@ -1328,6 +1567,145 @@ namespace driver_bridge
             out.push_back(static_cast<char>(b));
         }
         return !out.empty();
+    }
+
+}
+
+namespace driver_bridge_pid_call
+{
+    std::recursive_mutex g_call_mtx;
+
+    struct pid_scope_t
+    {
+        bool     ok = false;
+        bool     swapped = false;
+        uint32_t prev_pid = 0;
+        uint32_t target_pid = 0;
+        std::unique_lock<std::recursive_mutex> lk;
+
+        pid_scope_t() = default;
+        pid_scope_t(const pid_scope_t&) = delete;
+        pid_scope_t& operator=(const pid_scope_t&) = delete;
+
+        ~pid_scope_t()
+        {
+            if (!ok) return;
+            if (swapped && prev_pid != 0 && prev_pid != target_pid) {
+                (void)driver_bridge::set_active_pid(prev_pid);
+            } else if (swapped && prev_pid == 0) {
+                (void)driver_bridge::clear_active_pid();
+            }
+        }
+    };
+
+    inline bool enter(pid_scope_t& scope, uint32_t pid)
+    {
+        if (pid == 0)
+            return false;
+        scope.lk = std::unique_lock<std::recursive_mutex>(g_call_mtx);
+        scope.prev_pid = driver_bridge::attached_pid();
+        scope.target_pid = pid;
+        if (scope.prev_pid == pid) {
+            scope.ok = true;
+            scope.swapped = false;
+            return true;
+        }
+        const auto pids = driver_bridge::attached_pids();
+        bool in_map = false;
+        for (auto p : pids) { if (p == pid) { in_map = true; break; } }
+        if (!in_map) {
+            if (!driver_bridge::attach_additional(pid))
+                return false;
+        }
+        if (!driver_bridge::set_active_pid(pid))
+            return false;
+        scope.ok = true;
+        scope.swapped = true;
+        return true;
+    }
+}
+
+namespace driver_bridge
+{
+    bool read_memory_for(uint32_t pid, uint64_t address, size_t size, std::vector<uint8_t>& out)
+    {
+        driver_bridge_pid_call::pid_scope_t scope;
+        if (!driver_bridge_pid_call::enter(scope, pid)) {
+            diag::log_tagged_fmt("driver_bridge",
+                "read_memory_for pid=%u addr=0x%llX size=%zu enter_failed",
+                pid, static_cast<unsigned long long>(address), size);
+            return false;
+        }
+        bool ok = read_memory(address, size, out);
+        diag::log_tagged_fmt("driver_bridge",
+            "read_memory_for pid=%u addr=0x%llX size=%zu ok=%d bytes=%zu",
+            pid, static_cast<unsigned long long>(address), size, ok ? 1 : 0, out.size());
+        return ok;
+    }
+
+    bool write_memory_for(uint32_t pid, uint64_t address, const std::vector<uint8_t>& data)
+    {
+        driver_bridge_pid_call::pid_scope_t scope;
+        if (!driver_bridge_pid_call::enter(scope, pid)) {
+            diag::log_tagged_fmt("driver_bridge",
+                "write_memory_for pid=%u addr=0x%llX size=%zu enter_failed",
+                pid, static_cast<unsigned long long>(address), data.size());
+            return false;
+        }
+        bool ok = write_memory(address, data);
+        diag::log_tagged_fmt("driver_bridge",
+            "write_memory_for pid=%u addr=0x%llX size=%zu ok=%d",
+            pid, static_cast<unsigned long long>(address), data.size(), ok ? 1 : 0);
+        return ok;
+    }
+
+    bool query_memory_for(uint32_t pid, uint64_t address, memory_region_t& region)
+    {
+        driver_bridge_pid_call::pid_scope_t scope;
+        if (!driver_bridge_pid_call::enter(scope, pid))
+            return false;
+        return query_memory(address, region);
+    }
+
+    bool protect_memory_for(uint32_t pid, uint64_t address, uint64_t size,
+                            uint32_t new_protect, uint32_t* old_protect)
+    {
+        driver_bridge_pid_call::pid_scope_t scope;
+        if (!driver_bridge_pid_call::enter(scope, pid))
+            return false;
+        return protect_memory(address, size, new_protect, old_protect);
+    }
+
+    std::vector<module_info_t> enumerate_modules_for(uint32_t pid)
+    {
+        driver_bridge_pid_call::pid_scope_t scope;
+        if (!driver_bridge_pid_call::enter(scope, pid))
+            return {};
+        return enumerate_modules();
+    }
+
+    std::vector<thread_info_t> enumerate_threads_for(uint32_t pid)
+    {
+        driver_bridge_pid_call::pid_scope_t scope;
+        if (!driver_bridge_pid_call::enter(scope, pid))
+            return {};
+        return enumerate_threads();
+    }
+
+    std::vector<memory_region_t> enumerate_memory_regions_for(uint32_t pid, size_t max_regions)
+    {
+        driver_bridge_pid_call::pid_scope_t scope;
+        if (!driver_bridge_pid_call::enter(scope, pid))
+            return {};
+        return enumerate_memory_regions(max_regions);
+    }
+
+    bool read_peb_for(uint32_t pid, peb_info_t& out)
+    {
+        driver_bridge_pid_call::pid_scope_t scope;
+        if (!driver_bridge_pid_call::enter(scope, pid))
+            return false;
+        return read_peb(out);
     }
 
 

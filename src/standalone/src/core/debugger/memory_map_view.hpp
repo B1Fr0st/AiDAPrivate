@@ -34,6 +34,8 @@
 #include "fonts.hpp"
 #include "../helpers/globals.h"
 #include "../helpers/helpers.h"
+#include "../helpers/diag_log.hpp"
+#include "../helpers/win32_dialog.hpp"
 
 extern DisasmState g_disasm;
 
@@ -90,19 +92,33 @@ inline ui_state_t g_ui;
 
 inline void refresh()
 {
-	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0)
+	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) {
+		diag::log_tagged_fmt("memmap",
+			"memmap_refresh_skipped driver_loaded=%d attached_pid=%u",
+			driver_bridge::is_loaded() ? 1 : 0,
+			static_cast<unsigned>(driver_bridge::attached_pid()));
 		return;
+	}
 
 	bool expected = false;
-	if (!g_ui.refreshing.compare_exchange_strong(expected, true))
+	if (!g_ui.refreshing.compare_exchange_strong(expected, true)) {
+		diag::log_tagged_fmt("memmap",
+			"memmap_refresh_already_in_flight");
 		return;
+	}
 
+	diag::log_tagged_fmt("memmap",
+		"memmap_refresh_request attached_pid=%u",
+		static_cast<unsigned>(driver_bridge::attached_pid()));
 	work_queue::post([]() {
 		auto map = debugger_engine::get_memory_map();
+		size_t n = map.size();
 		{
 			std::lock_guard<std::mutex> lk(g_ui.regions_mutex);
 			g_ui.regions = std::move(map);
 		}
+		diag::log_tagged_fmt("memmap",
+			"memmap_refresh_done regions=%zu", n);
 		g_ui.refreshing.store(false);
 	});
 }
@@ -804,6 +820,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (find_region_by_base(g_ui.context_addr, r)) {
 				const size_t cap = static_cast<size_t>(1024ULL * 1024ULL);
 				size_t req = static_cast<size_t>(std::min<uint64_t>(r.size, static_cast<uint64_t>(cap)));
+				diag::log_tagged_fmt("memmap",
+					"memmap_go_hex base=0x%llx size=%zu",
+					static_cast<unsigned long long>(r.base), req);
 				if (req == 0) {
 					toast_notification::push("Region has zero size.", toast_notification::toast_type_t::error);
 				}
@@ -822,6 +841,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (ImGui::MenuItem("Go to Disassembly")) {
 			debugger_engine::memory_region_t r{};
 			if (find_region_by_base(g_ui.context_addr, r)) {
+				diag::log_tagged_fmt("memmap",
+					"memmap_go_disasm base=0x%llx",
+					static_cast<unsigned long long>(r.base));
 				globals::ui::active_center_view = center_view_t::disassembly;
 				disasm_view::goto_address(r.base, g_disasm);
 			}
@@ -864,16 +886,20 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					char path_buf[MAX_PATH] = {};
 					std::strncpy(path_buf, default_name, sizeof(path_buf) - 1);
 
-					OPENFILENAMEA sfn = {};
-					sfn.lStructSize = sizeof(sfn);
-					sfn.hwndOwner = g_hwnd;
-					sfn.lpstrFile = path_buf;
-					sfn.nMaxFile = MAX_PATH;
-					sfn.lpstrFilter = "Binary\0*.bin\0All files\0*.*\0\0";
-					sfn.lpstrDefExt = "bin";
-					sfn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST;
-
-					if (GetSaveFileNameA(&sfn)) {
+					static const char k_mem_dump_filter[] =
+						"Binary (*.bin)\0*.bin\0"
+						"All files (*.*)\0*.*\0\0";
+					if (win32_dialog::show_save_file_dialog(g_hwnd,
+							"Dump Region",
+							k_mem_dump_filter,
+							"bin",
+							path_buf, sizeof(path_buf),
+							"memory_map_view::dump_region")) {
+						diag::log_tagged_critical_fmt("memmap",
+							"memmap_dump_request base=0x%llx size=%llu path='%s'",
+							static_cast<unsigned long long>(r.base),
+							static_cast<unsigned long long>(r.size),
+							path_buf);
 						std::vector<uint8_t> buf;
 						size_t req = static_cast<size_t>(r.size);
 						if (driver_bridge::read_memory(r.base, req, buf) && !buf.empty()) {
@@ -882,16 +908,24 @@ inline void render(float pos_x, float pos_y, float width, float height,
 								ofs.write(reinterpret_cast<const char*>(buf.data()),
 									static_cast<std::streamsize>(buf.size()));
 								ofs.close();
+								diag::log_tagged_critical_fmt("memmap",
+									"memmap_dump_done bytes=%zu path='%s'",
+									buf.size(), path_buf);
 								char msg[MAX_PATH + 64];
 								std::snprintf(msg, sizeof(msg), "Dumped %llu bytes to %s",
 									static_cast<unsigned long long>(buf.size()), path_buf);
 								toast_notification::push(msg, toast_notification::toast_type_t::info);
 							}
 							else {
+								diag::log_tagged_fmt("memmap",
+									"memmap_dump_FAILED_open path='%s'", path_buf);
 								toast_notification::push("Failed to open dump file for writing.", toast_notification::toast_type_t::error);
 							}
 						}
 						else {
+							diag::log_tagged_fmt("memmap",
+								"memmap_dump_FAILED_read base=0x%llx",
+								static_cast<unsigned long long>(r.base));
 							toast_notification::push("Failed to read region memory.", toast_notification::toast_type_t::error);
 						}
 					}
@@ -936,7 +970,19 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (ImGui::Button("Apply", ImVec2(100.f, 0.f))) {
 			uint32_t new_protect = values[g_ui.change_protect_choice];
 			uint32_t old_protect = 0;
-			if (driver_bridge::protect_memory(g_ui.change_protect_addr, g_ui.change_protect_size, new_protect, &old_protect)) {
+			diag::log_tagged_critical_fmt("memmap",
+				"memmap_protect_request addr=0x%llx size=%llu new=0x%X",
+				static_cast<unsigned long long>(g_ui.change_protect_addr),
+				static_cast<unsigned long long>(g_ui.change_protect_size),
+				static_cast<unsigned>(new_protect));
+			bool ok = driver_bridge::protect_memory(g_ui.change_protect_addr, g_ui.change_protect_size, new_protect, &old_protect);
+			diag::log_tagged_critical_fmt("memmap",
+				"memmap_protect_done addr=0x%llx ok=%d old=0x%X new=0x%X",
+				static_cast<unsigned long long>(g_ui.change_protect_addr),
+				ok ? 1 : 0,
+				static_cast<unsigned>(old_protect),
+				static_cast<unsigned>(new_protect));
+			if (ok) {
 				char msg[96];
 				std::snprintf(msg, sizeof(msg), "Protection changed 0x%X -> 0x%X", old_protect, new_protect);
 				toast_notification::push(msg, toast_notification::toast_type_t::info);

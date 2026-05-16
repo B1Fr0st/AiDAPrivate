@@ -3,11 +3,14 @@
 #include "ui/hub_strip.hpp"
 #include "ui/theme.hpp"
 #include "ui/clock.hpp"
+#include "ui/no_target_overlay.hpp"
+#include "ui/empty_state.hpp"
 #include "symbolic_view.hpp"
 #include "taint_view.hpp"
 #include "deobfuscation_view.hpp"
 #include "stealth_view.hpp"
 #include "fuzzer_view.hpp"
+#include "../session/analysis_session.hpp"
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -73,6 +76,17 @@ inline void render_active(int idx, float cw, float ch,
 inline void render(float pos_x, float pos_y, float width, float height,
 				   float alpha, float accent_r, float accent_g, float accent_b)
 {
+	if (!analysis_session::has_active_target()) {
+		ImVec2 wp = ImGui::GetWindowPos();
+		aida::ui::no_target_overlay::render(
+			ImVec2(wp.x + pos_x, wp.y + pos_y),
+			ImVec2(width, height),
+			"No binary open",
+			"Symbolic execution, taint, deobfuscation, fuzzing and stealth checks operate on an open binary. Open a file or attach to a process to start.",
+			alpha, aida::ui::empty_state::glyph_t::cpu);
+		return;
+	}
+
 	float dt = aida::ui::clock::dt();
 	aida::ui::hub_strip::tick_swap(g_state.strip, dt);
 

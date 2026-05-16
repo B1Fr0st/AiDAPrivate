@@ -1283,7 +1283,7 @@ chat_render::render_result_t chat_render::render_rich_message(
     float h3_fs     = body_fs * 1.12f;
     float code_fs   = code_font->FontSize > 0.f ? code_font->FontSize : body_fs;
 
-    float card_pad_x = 14.f;
+    float card_pad_x = 2.f;
     float card_pad_y = 12.f;
     float wrap_w     = max_w - card_pad_x * 2.f;
     if (wrap_w < 40.f) wrap_w = 40.f;
@@ -1667,18 +1667,6 @@ chat_render::render_result_t chat_render::render_rich_message(
     float card_y_off = -lift_amt * 1.f;
     ImVec2 card_a(origin.x, origin.y + card_y_off);
     ImVec2 card_b(origin.x + card_w, origin.y + content_h + card_y_off);
-
-    float shadow_strength = 0.18f + lift_amt * 0.10f;
-    aida::ui::blur::render_drop_shadow(dl, card_a, card_b, 14.f, 4, shadow_strength,
-        ImVec2(0.f, 3.f + lift_amt * 1.5f));
-    aida::ui::blur::render_glass_fill(dl, card_a, card_b, 14.f, alpha);
-    aida::ui::blur::render_glass_border(dl, card_a, card_b, 14.f, alpha, 1.f);
-
-    ImU32 left_bar = aida::ui::with_alpha(th.accent_dim, alpha);
-    dl->AddRectFilled(
-        ImVec2(card_a.x + 0.5f, card_a.y + 1.f),
-        ImVec2(card_a.x + 2.5f, card_b.y - 1.f),
-        left_bar, 1.5f);
 
     if (is_streaming) {
         float blink_a = aida::ui::clock::pulse(2.0f, 0.30f, 1.0f);

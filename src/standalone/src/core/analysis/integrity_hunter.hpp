@@ -14,6 +14,7 @@
 #include "page_guard_engine.hpp"
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
+#include "../../helpers/diag_log.hpp"
 
 namespace integrity_hunter {
 
@@ -208,10 +209,18 @@ inline std::vector<uint64_t> walk_callstack(uint64_t rbp, int max_depth)
 
 inline void start_hunt(uint64_t target_address, uint64_t target_size)
 {
-	if (g_state.hunting.load()) return;
+	if (g_state.hunting.load()) {
+		diag::log_tagged("integrity_hunter", "start_skip reason=already_hunting");
+		return;
+	}
 
 	uint32_t pid = driver_bridge::attached_pid();
-	if (pid == 0) return;
+	if (pid == 0) {
+		diag::log_tagged("integrity_hunter", "start_reject reason=no_attached_pid");
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.status_text = "Attach to a process first";
+		return;
+	}
 
 	g_state.hunting.store(true);
 	g_state.cancel.store(false);
@@ -226,6 +235,11 @@ inline void start_hunt(uint64_t target_address, uint64_t target_size)
 		g_state.status_text = "Installing page guard...";
 	}
 
+	diag::log_tagged_fmt("integrity_hunter",
+		"start_hunt pid=%u target=0x%llX size=0x%llX",
+		pid, static_cast<unsigned long long>(target_address),
+		static_cast<unsigned long long>(target_size));
+
 	work_queue::post([target_address, target_size, pid]() {
 		uint64_t page_base = target_address & ~0xFFFULL;
 		uint64_t page_end = (target_address + target_size + 0xFFF) & ~0xFFFULL;
@@ -233,11 +247,21 @@ inline void start_hunt(uint64_t target_address, uint64_t target_size)
 
 		uint32_t pg_session = page_guard_engine::g_pg_engine.install(pid, page_base, region_size);
 		if (pg_session == 0) {
+			diag::log_tagged_fmt("integrity_hunter",
+				"page_guard_install_fail target=0x%llX page_base=0x%llX size=0x%llX",
+				static_cast<unsigned long long>(target_address),
+				static_cast<unsigned long long>(page_base),
+				static_cast<unsigned long long>(region_size));
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			g_state.status_text = "Failed to install page guard";
 			g_state.hunting.store(false);
 			return;
 		}
+
+		diag::log_tagged_fmt("integrity_hunter",
+			"page_guard_installed session=%u page_base=0x%llX size=0x%llX",
+			pg_session, static_cast<unsigned long long>(page_base),
+			static_cast<unsigned long long>(region_size));
 
 		g_state.pg_session_id = pg_session;
 
@@ -344,10 +368,17 @@ inline void start_hunt(uint64_t target_address, uint64_t target_size)
 		page_guard_engine::g_pg_engine.uninstall(pg_session);
 		g_state.pg_session_id = 0;
 
+		size_t final_nodes = 0;
+		uint64_t final_reads = g_state.total_reads.load();
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
-			g_state.status_text = "Stopped. Found " + std::to_string(g_state.nodes.size()) + " integrity checkers.";
+			final_nodes = g_state.nodes.size();
+			g_state.status_text = "Stopped. Found " + std::to_string(final_nodes) + " integrity checkers.";
 		}
+
+		diag::log_tagged_fmt("integrity_hunter",
+			"hunt_done nodes=%zu total_reads=%llu",
+			final_nodes, static_cast<unsigned long long>(final_reads));
 
 		g_state.hunting.store(false);
 	});
@@ -355,6 +386,7 @@ inline void start_hunt(uint64_t target_address, uint64_t target_size)
 
 inline void stop_hunt()
 {
+	diag::log_tagged("integrity_hunter", "stop_hunt_requested");
 	g_state.cancel.store(true);
 }
 
@@ -362,18 +394,31 @@ inline bool neutralize(int node_index)
 {
 	std::lock_guard<std::mutex> lk(g_state.mutex);
 
-	if (node_index < 0 || node_index >= static_cast<int>(g_state.nodes.size()))
+	if (node_index < 0 || node_index >= static_cast<int>(g_state.nodes.size())) {
+		diag::log_tagged_fmt("integrity_hunter",
+			"neutralize_reject reason=bad_index index=%d size=%zu",
+			node_index, g_state.nodes.size());
 		return false;
+	}
 
 	auto& node = g_state.nodes[static_cast<size_t>(node_index)];
-	if (node.neutralized) return true;
+	if (node.neutralized) {
+		diag::log_tagged_fmt("integrity_hunter",
+			"neutralize_skip reason=already_neutralized index=%d", node_index);
+		return true;
+	}
 
 	uint64_t patch_addr = node.hash_compare_addr;
 	if (patch_addr == 0) patch_addr = node.reader_rip;
 
 	std::vector<uint8_t> code;
 	driver_bridge::read_memory(patch_addr, 32, code);
-	if (code.empty()) return false;
+	if (code.empty()) {
+		diag::log_tagged_fmt("integrity_hunter",
+			"neutralize_fail reason=read_failed addr=0x%llX",
+			static_cast<unsigned long long>(patch_addr));
+		return false;
+	}
 
 	uint64_t scan_addr = patch_addr;
 	int pos = 0;
@@ -394,12 +439,28 @@ inline bool neutralize(int node_index)
 			node.original_bytes.assign(code.data() + pos, code.data() + pos + ins.len);
 			node.patch_addr = scan_addr;
 
-			if (ins.len < 2 || ins.len > 6) return false;
+			if (ins.len < 2 || ins.len > 6) {
+				diag::log_tagged_fmt("integrity_hunter",
+					"neutralize_fail reason=bad_jcc_len addr=0x%llX len=%d",
+					static_cast<unsigned long long>(scan_addr), ins.len);
+				return false;
+			}
 
 			std::vector<uint8_t> patch(static_cast<size_t>(ins.len), 0x90);
-			if (!driver_bridge::write_memory(scan_addr, patch)) return false;
+			if (!driver_bridge::write_memory(scan_addr, patch)) {
+				diag::log_tagged_fmt("integrity_hunter",
+					"neutralize_fail reason=write_failed addr=0x%llX len=%d",
+					static_cast<unsigned long long>(scan_addr), ins.len);
+				return false;
+			}
 
 			node.neutralized = true;
+			diag::log_tagged_fmt("integrity_hunter",
+				"integrity_hunter_hit kind=patched_jcc index=%d addr=0x%llX rip=0x%llX len=%d module='%s'",
+				node_index,
+				static_cast<unsigned long long>(scan_addr),
+				static_cast<unsigned long long>(node.reader_rip),
+				ins.len, node.module_name.c_str());
 			return true;
 		}
 
@@ -408,6 +469,9 @@ inline bool neutralize(int node_index)
 		++count;
 	}
 
+	diag::log_tagged_fmt("integrity_hunter",
+		"neutralize_fail reason=no_jcc_found index=%d start=0x%llX",
+		node_index, static_cast<unsigned long long>(patch_addr));
 	return false;
 }
 

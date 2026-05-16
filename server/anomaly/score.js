@@ -4,8 +4,13 @@ const crypto = require('crypto');
 const { getDefaultModel, METRIC_NAMES } = require('./model');
 
 const FLAG_THRESHOLD = parseFloat(process.env.ANOMALY_FLAG_THRESHOLD || '2.5');
-const REVOKE_THRESHOLD = parseFloat(process.env.ANOMALY_REVOKE_THRESHOLD || '4.0');
+const REVOKE_THRESHOLD = parseFloat(process.env.ANOMALY_REVOKE_THRESHOLD || '6.0');
+const REVOKE_SUSTAINED_THRESHOLD = parseFloat(process.env.ANOMALY_REVOKE_SUSTAINED_THRESHOLD || '4.0');
+const REVOKE_SUSTAINED_CONSECUTIVE = parseInt(process.env.ANOMALY_REVOKE_SUSTAINED_CONSECUTIVE || '6', 10);
 const MIN_BASELINE_SAMPLES = parseInt(process.env.ANOMALY_MIN_SAMPLES || '32', 10);
+const MIN_REVOKE_BASELINE_SAMPLES = parseInt(process.env.ANOMALY_REVOKE_MIN_SAMPLES || '1000', 10);
+const CADENCE_SLOW_GRACE_MS = parseInt(process.env.ANOMALY_CADENCE_SLOW_GRACE_MS || '300000', 10);
+const CADENCE_FAST_AUTOMATION_RATIO = parseFloat(process.env.ANOMALY_CADENCE_FAST_RATIO || '0.25');
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || '';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 
@@ -182,8 +187,14 @@ class AnomalyScoringEngine {
         this.model = opts.model || getDefaultModel();
         this.flagThreshold = Number.isFinite(opts.flagThreshold) ? opts.flagThreshold : FLAG_THRESHOLD;
         this.revokeThreshold = Number.isFinite(opts.revokeThreshold) ? opts.revokeThreshold : REVOKE_THRESHOLD;
+        this.revokeSustainedThreshold = Number.isFinite(opts.revokeSustainedThreshold) ? opts.revokeSustainedThreshold : REVOKE_SUSTAINED_THRESHOLD;
+        this.revokeSustainedConsecutive = Number.isFinite(opts.revokeSustainedConsecutive) ? opts.revokeSustainedConsecutive : REVOKE_SUSTAINED_CONSECUTIVE;
         this.minBaselineSamples = Number.isFinite(opts.minBaselineSamples) ? opts.minBaselineSamples : MIN_BASELINE_SAMPLES;
+        this.minRevokeBaselineSamples = Number.isFinite(opts.minRevokeBaselineSamples) ? opts.minRevokeBaselineSamples : MIN_REVOKE_BASELINE_SAMPLES;
+        this.cadenceSlowGraceMs = Number.isFinite(opts.cadenceSlowGraceMs) ? opts.cadenceSlowGraceMs : CADENCE_SLOW_GRACE_MS;
+        this.cadenceFastAutomationRatio = Number.isFinite(opts.cadenceFastAutomationRatio) ? opts.cadenceFastAutomationRatio : CADENCE_FAST_AUTOMATION_RATIO;
         this.lastDecisionByLicense = new Map();
+        this.consecutiveAnomalousByLicense = new Map();
         this.recentDecisions = [];
         this.maxRecentDecisions = opts.maxRecentDecisions || 64;
         this.alerter = opts.alerter || null;
@@ -193,20 +204,83 @@ class AnomalyScoringEngine {
         this.model.addSample(licenseKey, metrics, ts);
     }
 
+    classifyCadenceDirection(scoreResult) {
+        const m = scoreResult && scoreResult.perMetric ? scoreResult.perMetric.cadenceMs : null;
+        if (!m || !Number.isFinite(m.z) || !Number.isFinite(m.value) || !Number.isFinite(m.mean)) {
+            return { direction: 'unknown', fast: false, slow: false, withinSlowGrace: false, withinFastAutomation: false };
+        }
+        const slow = m.value > m.mean;
+        const fast = m.value < m.mean;
+        const withinSlowGrace = slow && m.value < this.cadenceSlowGraceMs;
+        const withinFastAutomation = fast && (m.mean > 0) && (m.value < m.mean * this.cadenceFastAutomationRatio);
+        return {
+            direction: slow ? 'slow' : (fast ? 'fast' : 'equal'),
+            fast, slow, withinSlowGrace, withinFastAutomation,
+        };
+    }
+
+    isMaxMetricCadence(scoreResult) {
+        if (!scoreResult || !scoreResult.perMetric) return false;
+        const cad = scoreResult.perMetric.cadenceMs;
+        if (!cad || !Number.isFinite(cad.z)) return false;
+        for (const name of METRIC_NAMES) {
+            if (name === 'cadenceMs') continue;
+            const m = scoreResult.perMetric[name];
+            if (!m || !Number.isFinite(m.z)) continue;
+            if (m.z > cad.z) return false;
+        }
+        return true;
+    }
+
     evaluate(licenseKey, metrics) {
         const scoreResult = this.model.score(licenseKey, metrics);
         let action = 'observe';
         let reason = 'normal';
+        let suppression = null;
+
+        const cadenceClass = this.classifyCadenceDirection(scoreResult);
+        const cadenceIsMax = this.isMaxMetricCadence(scoreResult);
+        const slowCadenceOnlyAnomaly = cadenceIsMax && cadenceClass.slow && cadenceClass.withinSlowGrace;
+
         if (scoreResult.warmup || scoreResult.sampleCount < this.minBaselineSamples) {
             action = 'warmup';
             reason = 'insufficient_baseline';
-        } else if (scoreResult.score >= this.revokeThreshold) {
+        } else if (slowCadenceOnlyAnomaly) {
+            action = 'observe';
+            reason = `cadence_slow_grace:${Math.round(cadenceClass.direction === 'slow' ? scoreResult.perMetric.cadenceMs.value : 0)}ms`;
+            suppression = 'slow_cadence_within_grace';
+        } else if (scoreResult.score >= this.revokeThreshold && scoreResult.sampleCount >= this.minRevokeBaselineSamples) {
             action = 'revoke';
             reason = `score_exceeds_revoke:${scoreResult.score.toFixed(3)}`;
+        } else if (scoreResult.score >= this.revokeThreshold && scoreResult.sampleCount < this.minRevokeBaselineSamples) {
+            action = 'flag';
+            reason = `score_exceeds_revoke_insufficient_revoke_baseline:${scoreResult.score.toFixed(3)}:${scoreResult.sampleCount}<${this.minRevokeBaselineSamples}`;
+            suppression = 'revoke_baseline_immature';
         } else if (scoreResult.score >= this.flagThreshold) {
             action = 'flag';
             reason = `score_exceeds_flag:${scoreResult.score.toFixed(3)}`;
         }
+
+        let consecutive = this.consecutiveAnomalousByLicense.get(licenseKey) || 0;
+        if (action === 'warmup') {
+            consecutive = 0;
+        } else if (scoreResult.score >= this.revokeSustainedThreshold) {
+            consecutive += 1;
+        } else {
+            consecutive = 0;
+        }
+        this.consecutiveAnomalousByLicense.set(licenseKey, consecutive);
+
+        if (action !== 'revoke' && action !== 'warmup'
+            && consecutive >= this.revokeSustainedConsecutive
+            && scoreResult.sampleCount >= this.minRevokeBaselineSamples
+            && !slowCadenceOnlyAnomaly
+            && (!cadenceIsMax || cadenceClass.withinFastAutomation || !cadenceClass.slow)) {
+            action = 'revoke';
+            reason = `score_sustained_revoke:${scoreResult.score.toFixed(3)}:consecutive=${consecutive}`;
+            suppression = null;
+        }
+
         const decision = {
             licenseKey,
             score: scoreResult.score,
@@ -216,6 +290,11 @@ class AnomalyScoringEngine {
             perMetric: scoreResult.perMetric,
             metrics,
             ts: Date.now(),
+            consecutiveAnomalous: consecutive,
+            cadenceDirection: cadenceClass.direction,
+            cadenceWithinSlowGrace: cadenceClass.withinSlowGrace,
+            cadenceWithinFastAutomation: cadenceClass.withinFastAutomation,
+            suppression,
         };
         this.lastDecisionByLicense.set(licenseKey, decision);
         this.recentDecisions.push(decision);
@@ -301,5 +380,10 @@ module.exports = {
     syntheticHash,
     FLAG_THRESHOLD,
     REVOKE_THRESHOLD,
+    REVOKE_SUSTAINED_THRESHOLD,
+    REVOKE_SUSTAINED_CONSECUTIVE,
+    MIN_REVOKE_BASELINE_SAMPLES,
+    CADENCE_SLOW_GRACE_MS,
+    CADENCE_FAST_AUTOMATION_RATIO,
     METRIC_NAMES,
 };

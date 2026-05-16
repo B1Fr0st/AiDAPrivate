@@ -15,8 +15,10 @@
 #include "standalone_driver.hpp"
 #include "pe_parser.hpp"
 #include "ui_anim.hpp"
+#include "motion.hpp"
 #include "event_bus.hpp"
 #include "../helpers/globals.h"
+#include "../helpers/diag_log.hpp"
 
 namespace module_view {
 
@@ -44,25 +46,39 @@ struct ui_state_t {
 	bool                                      detail_scrollbar_dragging = false;
 	float                                     detail_scrollbar_drag_offset = 0.f;
 	float                                     sub_tab_anim[2] = {1.f, 0.f};
+	float                                     sub_underline_x = 0.f;
+	float                                     sub_underline_w = 0.f;
+	float                                     sub_underline_vel = 0.f;
 };
 
 inline ui_state_t g_ui;
 
 inline void refresh()
 {
-	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0)
+	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) {
+		diag::log_tagged_fmt("modules",
+			"modules_refresh_skipped driver_loaded=%d attached_pid=%u",
+			driver_bridge::is_loaded() ? 1 : 0,
+			static_cast<unsigned>(driver_bridge::attached_pid()));
 		return;
+	}
 
 	bool expected = false;
 	if (!g_ui.loading.compare_exchange_strong(expected, true))
 		return;
 
+	diag::log_tagged_fmt("modules",
+		"modules_refresh_request attached_pid=%u",
+		static_cast<unsigned>(driver_bridge::attached_pid()));
 	work_queue::post([]() {
 		auto mods = driver_bridge::enumerate_modules();
+		size_t n = mods.size();
 		{
 			std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
 			g_ui.modules = std::move(mods);
 		}
+		diag::log_tagged_fmt("modules",
+			"modules_refresh_done count=%zu", n);
 		g_ui.loading.store(false);
 	});
 }
@@ -106,9 +122,14 @@ inline void load_module_details_by_base(uint64_t base)
 	if (!g_ui.loading.compare_exchange_strong(expected, true))
 		return;
 
+	diag::log_tagged_fmt("modules",
+		"module_details_request base=0x%llx",
+		static_cast<unsigned long long>(base));
 	work_queue::post([base]() {
 		pe_parser::pe_info_t pe;
 		pe_parser::parse(base, pe);
+		size_t exp_n = pe.exports.size();
+		size_t imp_n = pe.imports.size();
 		{
 			std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
 			g_ui.exports = std::move(pe.exports);
@@ -117,6 +138,9 @@ inline void load_module_details_by_base(uint64_t base)
 			g_ui.detail_scroll_y = 0.f;
 			g_ui.detail_target_scroll_y = 0.f;
 		}
+		diag::log_tagged_fmt("modules",
+			"module_details_loaded base=0x%llx exports=%zu imports=%zu",
+			static_cast<unsigned long long>(base), exp_n, imp_n);
 		g_ui.loading.store(false);
 	});
 }
@@ -198,12 +222,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float ul_x = pos_x + 12.f;
 		float ul_y = pos_y + header_h - 3.f;
 		float ul_w = mods_lbl_sz.x;
-		ImU32 ul_top = aida::ui::with_alpha(_t.accent_grad_top, alpha * 0.95f);
-		ImU32 ul_bot = aida::ui::with_alpha(_t.accent_grad_bot, alpha * 0.95f);
-		dl->AddRectFilledMultiColor(ImVec2(ul_x, ul_y), ImVec2(ul_x + ul_w, ul_y + 2.f),
-								   ul_top, ul_top, ul_bot, ul_bot);
-		dl->AddRectFilled(ImVec2(ul_x - 4.f, ul_y - 2.f), ImVec2(ul_x + ul_w + 4.f, ul_y + 4.f),
-		                  aida::ui::with_alpha(_t.accent_glow, alpha * 0.40f), 1.f);
+		ui_anim::render_tab_underline_glow(dl, ul_x, ul_w, ul_y, alpha);
 	}
 
 	float refresh_w = 78.f;
@@ -353,6 +372,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	const char* sub_labels[] = {"Exports", "Imports"};
 	float tab_x = right_x + 10.f;
+	float active_ul_x = 0.f;
+	float active_ul_w = 0.f;
 	for (int i = 0; i < 2; ++i) {
 		ImVec2 tsz = ImGui::CalcTextSize(sub_labels[i]);
 		float tw = tsz.x + 20.f;
@@ -371,9 +392,22 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			? _ta(_t.text_primary)
 			: _ta(_t.text_dim);
 		dl->AddText(ImVec2(tab_x + 10.f, pos_y + 7.f), tab_text_col, sub_labels[i]);
-		ui_anim::render_tab_underline(dl, tab_x, pos_y + header_h - 2.f, tw,
-									  g_ui.sub_tab_anim[i], i == g_ui.active_sub, dt, ar, ag, ab, alpha);
+		if (i == g_ui.active_sub) {
+			active_ul_x = tab_x + 4.f;
+			active_ul_w = tw - 8.f;
+		}
 		tab_x += tw + 4.f;
+	}
+	if (active_ul_w > 0.5f) {
+		if (g_ui.sub_underline_w < 0.5f) {
+			g_ui.sub_underline_x = active_ul_x;
+			g_ui.sub_underline_w = active_ul_w;
+		}
+		g_ui.sub_underline_x = aida::motion::spring_step(g_ui.sub_underline_x, active_ul_x,
+			g_ui.sub_underline_vel, aida::motion::spring::balanced, dt);
+		g_ui.sub_underline_w = aida::motion::smooth_lerp(g_ui.sub_underline_w, active_ul_w, 16.f, dt);
+		ui_anim::render_tab_underline_glow(dl, g_ui.sub_underline_x, g_ui.sub_underline_w,
+			pos_y + header_h - 3.f, alpha);
 	}
 
 	float filter_x = right_x + right_w - 220.f;

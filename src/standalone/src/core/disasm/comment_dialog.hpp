@@ -5,6 +5,7 @@
 #include <string>
 
 #include "comment_store.hpp"
+#include "disasm_view.hpp"
 #include "imgui/imgui.h"
 #include "../ui/components.hpp"
 #include "../ui/theme.hpp"
@@ -126,6 +127,7 @@ inline void render() {
         if (save_now) {
             std::string trimmed = detail::trim_trailing(detail::buffer());
             comment_store::set(detail::target_addr(), trimmed);
+            disasm_view::bump_format_generation();
             ImGui::CloseCurrentPopup();
             detail::open_flag() = false;
         } else if (cancel_now || !open_flag_local) {

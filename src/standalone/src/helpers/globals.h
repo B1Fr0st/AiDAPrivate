@@ -14,8 +14,14 @@
 #include <functional>
 #include <atomic>
 #include <mutex>
+#include <chrono>
+#include <unordered_map>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <system_error>
+#include <shlobj.h>
+#include <objbase.h>
 
 
 enum class center_view_t : int {
@@ -52,7 +58,7 @@ enum class center_view_t : int {
 enum class activity_item_t : int {
 	explorer = 0,
 	search,
-	functions,
+	recent,
 	COUNT
 };
 
@@ -249,9 +255,16 @@ namespace file_browser
 	inline bool                          needs_refresh = true;
 	inline char                          path_buf[512] = {};
 
+	inline std::string                   pending_open_path;
+	inline std::string                   pending_open_filename;
+	inline bool                          pending_open_modal_visible = false;
+	inline bool                          pending_open_should_open   = false;
+
 	void refresh(const std::string& dir = "");
 	void toggle_dir(int idx);
 	void open_file(int idx);
+	void render_pending_confirm_modal();
+	void record_recent_workspace(const std::string& path);
 }
 
 
@@ -286,30 +299,7 @@ namespace code_editor
 	}
 
 
-	inline bool save() {
-		if (filepath.empty() || buffer.empty()) return false;
-
-
-		if (!standalone_license::is_valid()) return false;
-
-
-		{
-			uint64_t gt = standalone_license::inline_gate_check(
-				standalone_license::gate_editor_save);
-			if (standalone_license::verify_gate_token(
-					standalone_license::gate_editor_save, gt) < 0.5)
-				return false;
-		}
-
-		FILE* f = nullptr;
-		fopen_s(&f, filepath.c_str(), "wb");
-		if (!f) return false;
-		size_t len = strlen(buffer.data());
-		fwrite(buffer.data(), 1, len, f);
-		fclose(f);
-		dirty = false;
-		return true;
-	}
+	inline bool save();
 }
 
 
@@ -703,7 +693,9 @@ namespace cost_tracking {
 struct OpenTab {
 	std::string filename;
 	std::string filepath;
-	bool dirty  = false;
+	std::string buffer;
+	bool        buffer_loaded = false;
+	bool        dirty          = false;
 };
 
 namespace file_tabs {
@@ -714,69 +706,253 @@ namespace file_tabs {
 	inline float close_confirm_anim = 0.f;
 	inline int   close_confirm_hovered = -1;
 
+	inline std::string hot_exit_dir() {
+		wchar_t* appdata = nullptr;
+		if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata))) {
+			auto p = std::filesystem::path(appdata) / L"AiDA" / L"Standalone" / L"hot_exit";
+			CoTaskMemFree(appdata);
+			std::error_code ec;
+			std::filesystem::create_directories(p, ec);
+			return p.string();
+		}
+		return {};
+	}
+
+	inline std::string hot_exit_key_for_path(const std::string& fpath) {
+		uint64_t h = 0xCBF29CE484222325ULL;
+		for (unsigned char c : fpath) {
+			h ^= c;
+			h *= 0x100000001B3ULL;
+		}
+		char buf[40];
+		std::snprintf(buf, sizeof(buf), "%016llx.snapshot",
+		              static_cast<unsigned long long>(h));
+		return buf;
+	}
+
+	inline bool try_load_hot_exit(const std::string& fpath, std::string& out_buffer) {
+		if (fpath.empty()) return false;
+		std::string dir = hot_exit_dir();
+		if (dir.empty()) return false;
+		auto p = std::filesystem::path(dir) / hot_exit_key_for_path(fpath);
+		std::error_code ec;
+		if (!std::filesystem::exists(p, ec) || ec) return false;
+		std::ifstream ifs(p, std::ios::binary);
+		if (!ifs.is_open()) return false;
+		std::ostringstream ss;
+		ss << ifs.rdbuf();
+		out_buffer = ss.str();
+		ifs.close();
+		std::filesystem::remove(p, ec);
+		return true;
+	}
+
+	inline bool write_hot_exit_entry(const std::string& fpath, const std::string& contents) {
+		if (fpath.empty()) return false;
+		std::string dir = hot_exit_dir();
+		if (dir.empty()) return false;
+		auto p = std::filesystem::path(dir) / hot_exit_key_for_path(fpath);
+		std::ofstream ofs(p, std::ios::binary | std::ios::trunc);
+		if (!ofs.is_open()) return false;
+		ofs.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+		return ofs.good();
+	}
+
+	inline void clear_all_hot_exit() {
+		std::string dir = hot_exit_dir();
+		if (dir.empty()) return;
+		std::error_code ec;
+		for (auto& e : std::filesystem::directory_iterator(dir, ec)) {
+			if (ec) break;
+			std::filesystem::remove(e.path(), ec);
+		}
+	}
+
+	inline std::string read_file_contents(const std::string& fpath) {
+		std::string out;
+		if (fpath.empty()) return out;
+		std::error_code ec;
+		uintmax_t fsize = std::filesystem::file_size(fpath, ec);
+		if (ec) return out;
+		if (fsize > (8ULL * 1024ULL * 1024ULL)) return out;
+		FILE* f = nullptr;
+		fopen_s(&f, fpath.c_str(), "rb");
+		if (!f) return out;
+		fseek(f, 0, SEEK_END);
+		long sz = ftell(f);
+		fseek(f, 0, SEEK_SET);
+		if (sz > 0) {
+			out.resize(static_cast<size_t>(sz));
+			fread(&out[0], 1, static_cast<size_t>(sz), f);
+		}
+		fclose(f);
+		return out;
+	}
+
+	inline void snapshot_active_to_tab() {
+		if (active_tab < 0 || active_tab >= (int)tabs.size()) return;
+		if (!code_editor::active) return;
+		auto& t = tabs[active_tab];
+		if (t.filepath != code_editor::filepath) return;
+		t.buffer = code_editor::get_content();
+		t.buffer_loaded = true;
+		t.dirty = code_editor::dirty;
+	}
+
+	inline void load_tab_into_editor(int idx) {
+		if (idx < 0 || idx >= (int)tabs.size()) return;
+		auto& t = tabs[idx];
+		if (t.buffer_loaded) {
+			code_editor::load(t.buffer, t.filename, t.filepath);
+			code_editor::dirty = t.dirty;
+			return;
+		}
+		std::error_code ec;
+		uintmax_t fsize = t.filepath.empty() ? 0 : std::filesystem::file_size(t.filepath, ec);
+		if (ec) fsize = 0;
+		if (fsize <= (256ULL * 1024ULL)) {
+			std::string content = read_file_contents(t.filepath);
+			t.buffer = content;
+			t.buffer_loaded = true;
+			t.dirty = false;
+			code_editor::load(content, t.filename, t.filepath);
+		} else {
+			std::string fname = t.filename;
+			std::string fpath = t.filepath;
+			code_editor::load(std::string("Loading..."), fname, fpath);
+			work_queue::post([fname, fpath]() {
+				std::string c = read_file_contents(fpath);
+				for (auto& tab : tabs) {
+					if (tab.filepath == fpath) {
+						tab.buffer = c;
+						tab.buffer_loaded = true;
+						tab.dirty = false;
+						break;
+					}
+				}
+				code_editor::load(c, fname, fpath);
+			});
+		}
+	}
+
+	inline void switch_to(int idx) {
+		if (idx < 0 || idx >= (int)tabs.size()) return;
+		if (idx == active_tab && code_editor::active &&
+		    code_editor::filepath == tabs[idx].filepath) {
+			return;
+		}
+		snapshot_active_to_tab();
+		active_tab = idx;
+		load_tab_into_editor(idx);
+	}
+
+	inline bool save_tab_to_disk(int idx) {
+		if (idx < 0 || idx >= (int)tabs.size()) return false;
+		auto& t = tabs[idx];
+		if (t.filepath.empty()) return false;
+		if (!standalone_license::is_valid()) return false;
+		{
+			uint64_t gt = standalone_license::inline_gate_check(
+				standalone_license::gate_editor_save);
+			if (standalone_license::verify_gate_token(
+					standalone_license::gate_editor_save, gt) < 0.5)
+				return false;
+		}
+		if (idx == active_tab && code_editor::active &&
+		    code_editor::filepath == t.filepath) {
+			t.buffer = code_editor::get_content();
+			t.buffer_loaded = true;
+		}
+		if (!t.buffer_loaded) return false;
+		FILE* f = nullptr;
+		fopen_s(&f, t.filepath.c_str(), "wb");
+		if (!f) return false;
+		fwrite(t.buffer.data(), 1, t.buffer.size(), f);
+		fclose(f);
+		t.dirty = false;
+		if (idx == active_tab && code_editor::active &&
+		    code_editor::filepath == t.filepath) {
+			code_editor::dirty = false;
+		}
+		return true;
+	}
+
+	inline bool save_active_to_disk() {
+		return save_tab_to_disk(active_tab);
+	}
+
 	inline void open_or_focus(const std::string& fpath, const std::string& fname,
 	                          const std::string& content) {
 		for (int i = 0; i < (int)tabs.size(); i++) {
-			if (tabs[i].filepath == fpath) {
-				active_tab = i;
-				code_editor::load(content, fname, fpath);
+			if (tabs[i].filepath == fpath && !fpath.empty()) {
+				switch_to(i);
 				return;
 			}
 		}
+		snapshot_active_to_tab();
 		OpenTab t;
 		t.filename = fname;
 		t.filepath = fpath;
+		std::string snap;
+		if (!fpath.empty() && try_load_hot_exit(fpath, snap)) {
+			t.buffer = snap;
+			t.buffer_loaded = true;
+			t.dirty = (snap != content);
+		} else {
+			t.buffer = content;
+			t.buffer_loaded = true;
+			t.dirty = false;
+		}
 		tabs.push_back(std::move(t));
 		active_tab = (int)tabs.size() - 1;
-		code_editor::load(content, fname, fpath);
+		auto& nt = tabs[active_tab];
+		code_editor::load(nt.buffer, nt.filename, nt.filepath);
+		code_editor::dirty = nt.dirty;
 	}
 
 	inline void close_tab(int idx) {
 		if (idx < 0 || idx >= (int)tabs.size()) return;
+		bool was_active = (idx == active_tab);
 		tabs.erase(tabs.begin() + idx);
 		if (active_tab >= (int)tabs.size()) active_tab = (int)tabs.size() - 1;
+		else if (idx < active_tab) active_tab--;
 		if (active_tab >= 0 && active_tab < (int)tabs.size()) {
-			auto& t = tabs[active_tab];
-			std::error_code _ec;
-			uintmax_t fsize = t.filepath.empty() ? 0 : std::filesystem::file_size(t.filepath, _ec);
-			if (_ec) fsize = 0;
-			std::string content;
-			if (fsize <= (256ULL * 1024ULL)) {
-				FILE* f = nullptr;
-				fopen_s(&f, t.filepath.c_str(), "rb");
-				if (f) {
-					fseek(f, 0, SEEK_END);
-					long sz = ftell(f);
-					fseek(f, 0, SEEK_SET);
-					content.resize(sz);
-					fread(&content[0], 1, sz, f);
-					fclose(f);
-				}
-				code_editor::load(content, t.filename, t.filepath);
-			} else {
-				std::string fname = t.filename;
-				std::string fpath = t.filepath;
-				code_editor::load(std::string("Loading..."), fname, fpath);
-				work_queue::post([fname, fpath]() {
-					std::string c;
-					FILE* f = nullptr;
-					fopen_s(&f, fpath.c_str(), "rb");
-					if (f) {
-						fseek(f, 0, SEEK_END);
-						long sz = ftell(f);
-						fseek(f, 0, SEEK_SET);
-						c.resize(sz);
-						fread(&c[0], 1, sz, f);
-						fclose(f);
-					}
-					code_editor::load(c, fname, fpath);
-				});
-			}
+			if (was_active || code_editor::filepath != tabs[active_tab].filepath)
+				load_tab_into_editor(active_tab);
 		} else {
 			code_editor::active = false;
 			code_editor::buffer.clear();
 			code_editor::filename.clear();
 			code_editor::filepath.clear();
+			code_editor::dirty = false;
 		}
+	}
+
+	inline void write_hot_exit_snapshot_all() {
+		snapshot_active_to_tab();
+		std::string dir = hot_exit_dir();
+		if (dir.empty()) return;
+		std::error_code ec;
+		for (auto& e : std::filesystem::directory_iterator(dir, ec)) {
+			if (ec) break;
+			std::filesystem::remove(e.path(), ec);
+		}
+		for (const auto& t : tabs) {
+			if (!t.dirty || t.filepath.empty() || !t.buffer_loaded) continue;
+			write_hot_exit_entry(t.filepath, t.buffer);
+		}
+	}
+}
+
+namespace code_editor
+{
+	inline bool save() {
+		if (file_tabs::active_tab < 0 ||
+		    file_tabs::active_tab >= (int)file_tabs::tabs.size())
+			return false;
+		auto& t = file_tabs::tabs[file_tabs::active_tab];
+		if (t.filepath != code_editor::filepath || code_editor::filepath.empty())
+			return false;
+		return file_tabs::save_tab_to_disk(file_tabs::active_tab);
 	}
 }

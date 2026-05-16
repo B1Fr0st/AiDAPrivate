@@ -8,6 +8,7 @@
 #include "comm.h"
 #include "obfuscation.hpp"
 #include "pro.h"
+#include "../runtime/standalone_driver.hpp"
 #include "zydis_disasm.hpp"
 #include "xref_engine.hpp"
 #include "cfg_view.hpp"
@@ -52,7 +53,7 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
 
     std::uint32_t requested_pid = 0;
-    for (const char* key : {"process_id", "pid"})
+    for (const char* key : {"target_pid", "process_id", "pid"})
     {
         if (!params.contains(key))
             continue;
@@ -66,33 +67,50 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
             auto addr = sa_parse_address(v.get<std::string>());
             if (addr) requested_pid = static_cast<std::uint32_t>(*addr);
         }
-        break;
+        if (requested_pid != 0)
+            break;
     }
 
-    const std::uint32_t current_pid = device->get_process_id();
+    const std::uint32_t current_pid = driver_bridge::attached_pid();
     if (requested_pid != 0 && requested_pid != current_pid)
     {
         if (!is_process_alive(requested_pid))
-            return tool_result_t::error(OBFSTR("process_id ") + std::to_string(requested_pid) + OBFSTR(" is not alive."));
-        device->clear_process_context();
-        device->set_process_id(requested_pid);
-        (void)device->find_image();
-        device->solve_dtb();
+            return tool_result_t::error(OBFSTR("target_pid ") + std::to_string(requested_pid) + OBFSTR(" is not alive."));
+
+        const auto attached = driver_bridge::attached_pids();
+        bool in_map = false;
+        for (auto p : attached) { if (p == requested_pid) { in_map = true; break; } }
+        if (!in_map)
+        {
+            if (!driver_bridge::attach_additional(requested_pid))
+            {
+                return tool_result_t::error(
+                    OBFSTR("attach_additional failed for target_pid ") + std::to_string(requested_pid) +
+                    OBFSTR(": ") + driver_bridge::last_error());
+            }
+        }
+
+        if (!driver_bridge::set_active_pid(requested_pid))
+            return tool_result_t::error(
+                OBFSTR("set_active_pid failed for target_pid ") + std::to_string(requested_pid) +
+                OBFSTR(": ") + driver_bridge::last_error());
+
         if (device->get_dtb() == 0)
         {
-            device->clear_process_context();
-            return tool_result_t::error(
-                OBFSTR("Failed to solve DTB for process_id ") +
-                std::to_string(requested_pid) + OBFSTR(". Reattach by name with driver_attach."));
+            device->solve_dtb();
+            if (device->get_dtb() == 0)
+                return tool_result_t::error(
+                    OBFSTR("Failed to solve DTB for target_pid ") +
+                    std::to_string(requested_pid) + OBFSTR("."));
         }
     }
 
-    if (device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Not attached. Call driver_attach first or pass process_id."));
+    if (driver_bridge::attached_pid() == 0)
+        return tool_result_t::error(OBFSTR("Not attached. Call driver_attach first or pass target_pid."));
 
-    if (!is_process_alive(device->get_process_id()))
+    if (!is_process_alive(driver_bridge::attached_pid()))
     {
-        const std::uint32_t dead_pid = device->get_process_id();
+        const std::uint32_t dead_pid = driver_bridge::attached_pid();
         device->clear_process_context();
         return tool_result_t::error(
             OBFSTR("Attached process PID ") + std::to_string(dead_pid) +
@@ -964,7 +982,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                "a vectored exception handler is installed — use driver_set_hw_breakpoint for "
                "transparent breakpoints that don't modify code bytes."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Target address (hex)"), true},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         dbg_set_breakpoint, false});
 
     register_compat(srv, {
@@ -972,7 +990,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Remove a software breakpoint by restoring the original byte at the address. "
                "Only works for breakpoints set via dbg_set_breakpoint (original byte must be tracked)."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Breakpoint address to remove (hex)"), true},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         dbg_remove_breakpoint, false});
 
     register_compat(srv, {
@@ -992,7 +1010,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                "the return address and a Zydis disassembly of the instruction at that address."),
         {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
          {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum stack frames to unwind (default 64, max 256)"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         dbg_get_callstack, true});
 
 
@@ -1011,7 +1029,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                             {"size", json::object({{"type", "number"}})}
                         })}
           })},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         dbg_snapshot_state, false});
 
     register_compat(srv, {
@@ -1034,7 +1052,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                "common VM handler idioms. Returns a confidence score and detailed indicators."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address to analyze (hex)"), true},
          {OBFSTR("size"), OBFSTR("number"), OBFSTR("Bytes to analyze (default 512, max 16384)"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         dbg_detect_vm_handler, true});
 
     register_compat(srv, {
@@ -1050,14 +1068,14 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {OBFSTR("relative"), OBFSTR("boolean"), OBFSTR("If true, entries are relative offsets from image_base (default false = absolute pointers)"), false},
          {OBFSTR("image_base"), OBFSTR("string"), OBFSTR("Base address for resolving relative offsets (default: attached process image base)"), false},
          {OBFSTR("preview_instructions"), OBFSTR("number"), OBFSTR("Instructions to disassemble per handler (default 5, max 32)"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         dbg_map_vm_handlers, true});
 
 
     register_compat(srv, {
         OBFSTR("dbg_run"), OBFSTR("debugger"),
         OBFSTR("Resume execution of the attached process (set debugger state to running)."),
-        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
             if (auto err = ensure_attached(params)) return *err;
             debugger_engine::run_target();
@@ -1067,7 +1085,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
     register_compat(srv, {
         OBFSTR("dbg_pause"), OBFSTR("debugger"),
         OBFSTR("Pause (break) the attached process."),
-        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
             if (auto err = ensure_attached(params)) return *err;
             debugger_engine::pause_target();
@@ -1078,7 +1096,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("dbg_step_into"), OBFSTR("debugger"),
         OBFSTR("Single-step into the next instruction (follows calls)."),
         {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
             if (auto err = ensure_attached(params)) return *err;
             auto tid = parse_tid(params);
@@ -1092,7 +1110,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("dbg_step_over"), OBFSTR("debugger"),
         OBFSTR("Step over the next instruction (does not follow calls)."),
         {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
             if (auto err = ensure_attached(params)) return *err;
             auto tid = parse_tid(params);
@@ -1106,7 +1124,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("dbg_step_out"), OBFSTR("debugger"),
         OBFSTR("Step out of the current function (run until return)."),
         {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
             if (auto err = ensure_attached(params)) return *err;
             auto tid = parse_tid(params);
@@ -1120,7 +1138,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("dbg_run_to_address"), OBFSTR("debugger"),
         OBFSTR("Run until execution reaches a specific address."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Target address (hex)"), true},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
             if (auto err = ensure_attached(params)) return *err;
             if (!params.contains("address") || !params["address"].is_string())
@@ -1131,12 +1149,637 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             return tool_result_t::ok(OBFSTR("Running to ") + sa_format_address(*addr));
         }, false});
 
+    srv.register_tool({
+        "debugger_get_attached",
+        "Report whether a process is currently attached, its PID, name, image base and image size.",
+        {},
+        true,
+        [](const json&) -> tool_result_t {
+            json result;
+            result["driver_connected"] = device->is_connected();
+            uint32_t pid = device->is_connected() ? device->get_process_id() : 0u;
+            result["is_attached"] = (pid != 0);
+            result["pid"] = pid;
+            if (pid != 0) {
+                uint64_t base = device->find_image();
+                result["name"] = driver_bridge::attached_process_name();
+                result["base_address"] = sa_format_address(base);
+                auto mods = driver_bridge::enumerate_modules();
+                uint64_t image_size = 0;
+                for (const auto& m : mods) {
+                    if (m.base == base) { image_size = m.size; break; }
+                }
+                if (image_size == 0 && !mods.empty()) image_size = mods.front().size;
+                result["image_size"] = image_size;
+            }
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_get_registers",
+        "Snapshot the cached register set for the active debugger thread (RAX..R15, RIP, RFLAGS, segment regs, DR0..DR7).",
+        {},
+        true,
+        [](const json&) -> tool_result_t {
+            auto regs = debugger_engine::get_registers();
+            json result;
+            result["rax"] = sa_format_address(regs.rax);
+            result["rbx"] = sa_format_address(regs.rbx);
+            result["rcx"] = sa_format_address(regs.rcx);
+            result["rdx"] = sa_format_address(regs.rdx);
+            result["rsi"] = sa_format_address(regs.rsi);
+            result["rdi"] = sa_format_address(regs.rdi);
+            result["rbp"] = sa_format_address(regs.rbp);
+            result["rsp"] = sa_format_address(regs.rsp);
+            result["r8"]  = sa_format_address(regs.r8);
+            result["r9"]  = sa_format_address(regs.r9);
+            result["r10"] = sa_format_address(regs.r10);
+            result["r11"] = sa_format_address(regs.r11);
+            result["r12"] = sa_format_address(regs.r12);
+            result["r13"] = sa_format_address(regs.r13);
+            result["r14"] = sa_format_address(regs.r14);
+            result["r15"] = sa_format_address(regs.r15);
+            result["rip"] = sa_format_address(regs.rip);
+            result["rflags"] = sa_format_address(regs.rflags);
+            result["flags_decoded"] = debugger_engine::format_flags(regs.rflags);
+            result["dr0"] = sa_format_address(regs.dr0);
+            result["dr1"] = sa_format_address(regs.dr1);
+            result["dr2"] = sa_format_address(regs.dr2);
+            result["dr3"] = sa_format_address(regs.dr3);
+            result["dr6"] = sa_format_address(regs.dr6);
+            result["dr7"] = sa_format_address(regs.dr7);
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_get_breakpoints",
+        "List every breakpoint tracked by the debugger engine, including disabled and one-shot entries.",
+        {},
+        true,
+        [](const json&) -> tool_result_t {
+            std::lock_guard<std::mutex> lk(debugger_engine::g_state.bp_mutex);
+            json arr = json::array();
+            for (size_t i = 0; i < debugger_engine::g_state.breakpoints.size(); ++i) {
+                const auto& bp = debugger_engine::g_state.breakpoints[i];
+                json e;
+                e["index"]   = static_cast<int>(i);
+                e["address"] = sa_format_address(bp.address);
+                e["type"]    = static_cast<int>(bp.type);
+                e["state"]   = static_cast<int>(bp.state);
+                e["size"]    = bp.size;
+                e["hit_count"] = bp.hit_count;
+                e["byte_written"] = bp.byte_written;
+                e["original_byte"] = static_cast<unsigned>(bp.original_byte);
+                if (!bp.name.empty())      e["name"]      = bp.name;
+                if (!bp.condition.empty()) e["condition"] = bp.condition;
+                if (!bp.log_text.empty())  e["log_text"]  = bp.log_text;
+                arr.push_back(std::move(e));
+            }
+            json result;
+            result["count"]       = arr.size();
+            result["breakpoints"] = std::move(arr);
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_get_memory_map",
+        "Snapshot the virtual memory map of the attached process (alias of dbg_get_memory_map).",
+        {},
+        true,
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            auto regions = debugger_engine::get_memory_map();
+            json arr = json::array();
+            for (const auto& r : regions) {
+                json o;
+                o["base"]    = sa_format_address(r.base);
+                o["size"]    = r.size;
+                o["protect"] = debugger_engine::format_protect(r.protect);
+                o["state"]   = r.state;
+                o["type"]    = r.type;
+                if (!r.module_name.empty()) o["module"] = r.module_name;
+                arr.push_back(std::move(o));
+            }
+            json result;
+            result["count"]   = arr.size();
+            result["regions"] = std::move(arr);
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_get_callstack",
+        "Return the cached call stack of the active debugger thread (each frame: address, return_addr, module, function_name, module_offset).",
+        {},
+        true,
+        [](const json&) -> tool_result_t {
+            auto frames = debugger_engine::get_call_stack();
+            json arr = json::array();
+            for (const auto& f : frames) {
+                json o;
+                o["address"]     = sa_format_address(f.address);
+                o["return_addr"] = sa_format_address(f.return_addr);
+                if (!f.module_name.empty())   o["module"]        = f.module_name;
+                if (!f.function_name.empty()) o["function_name"] = f.function_name;
+                o["module_offset"] = sa_format_address(f.module_offset);
+                arr.push_back(std::move(o));
+            }
+            json result;
+            result["count"]  = arr.size();
+            result["frames"] = std::move(arr);
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_get_threads",
+        "Enumerate the threads of the attached process via the kernel driver.",
+        {},
+        true,
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            auto threads = driver_bridge::enumerate_threads();
+            json arr = json::array();
+            for (const auto& t : threads) {
+                json o;
+                o["tid"]      = t.tid;
+                o["owner_pid"] = t.owner_pid;
+                o["priority"] = t.priority;
+                o["state"]    = t.state;
+                o["rip"]      = sa_format_address(t.rip);
+                arr.push_back(std::move(o));
+            }
+            json result;
+            result["count"]   = arr.size();
+            result["threads"] = std::move(arr);
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_get_handles",
+        "Enumerate kernel handles owned by the attached process via the debugger engine's handle table.",
+        {},
+        true,
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            debugger_engine::enumerate_handles();
+            std::lock_guard<std::mutex> lk(debugger_engine::g_state.handle_mutex);
+            json arr = json::array();
+            for (const auto& h : debugger_engine::g_state.handles) {
+                json o;
+                o["handle"]     = sa_format_address(h.handle);
+                o["type_index"] = h.type_index;
+                if (!h.type_name.empty()) o["type"] = h.type_name;
+                if (!h.name.empty())      o["name"] = h.name;
+                o["access"]     = sa_format_address(static_cast<uint64_t>(h.access));
+                arr.push_back(std::move(o));
+            }
+            json result;
+            result["count"]   = arr.size();
+            result["handles"] = std::move(arr);
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_get_modules",
+        "List loaded modules (DLLs / EXEs) of the attached process: name, base address, size, and full path.",
+        {},
+        true,
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            auto modules = driver_bridge::enumerate_modules();
+            json arr = json::array();
+            for (const auto& m : modules) {
+                json o;
+                o["name"] = m.name;
+                o["path"] = m.path;
+                o["base"] = sa_format_address(m.base);
+                o["size"] = m.size;
+                arr.push_back(std::move(o));
+            }
+            json result;
+            result["count"]   = arr.size();
+            result["modules"] = std::move(arr);
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_get_seh_chain",
+        "Refresh and return the SEH exception handler chain for the active thread of the attached process.",
+        {},
+        true,
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            seh_view::refresh();
+            for (int i = 0; i < 100; ++i) {
+                if (!seh_view::g_ui.refreshing.load()) break;
+                Sleep(20);
+            }
+            std::lock_guard<std::mutex> lk(seh_view::g_ui.mutex);
+            json arr = json::array();
+            for (const auto& e : seh_view::g_ui.entries) {
+                json o;
+                o["index"]         = e.index;
+                o["frame_addr"]    = sa_format_address(e.frame_addr);
+                o["handler_addr"]  = sa_format_address(e.handler_addr);
+                o["filter_addr"]   = sa_format_address(e.filter_addr);
+                if (!e.module_name.empty())  o["module"]       = e.module_name;
+                if (!e.handler_name.empty()) o["handler_name"] = e.handler_name;
+                arr.push_back(std::move(o));
+            }
+            json result;
+            result["count"]   = arr.size();
+            result["entries"] = std::move(arr);
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_get_patches",
+        "List active byte-patches tracked by the code patcher (address, description, original/patched bytes, active flag, timestamp).",
+        {},
+        true,
+        [](const json&) -> tool_result_t {
+            std::lock_guard<std::mutex> lk(code_patcher::g_state.mtx);
+            json arr = json::array();
+            for (size_t i = 0; i < code_patcher::g_state.patches.size(); ++i) {
+                const auto& p = code_patcher::g_state.patches[i];
+                json o;
+                o["index"]          = static_cast<int>(i);
+                o["address"]        = sa_format_address(p.address);
+                o["description"]    = p.description;
+                o["active"]         = p.active;
+                o["timestamp"]      = p.timestamp;
+                o["original_bytes"] = code_patcher::format_bytes(p.original_bytes);
+                o["patched_bytes"]  = code_patcher::format_bytes(p.patched_bytes);
+                o["size"]           = p.patched_bytes.size();
+                arr.push_back(std::move(o));
+            }
+            json result;
+            result["count"]   = arr.size();
+            result["patches"] = std::move(arr);
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_set_breakpoint",
+        "Install a breakpoint via the debugger engine. type=exec (software int3), read/write (hardware DR breakpoint), size=1/2/4/8.",
+        {{"address", "string", "Breakpoint address (hex)", true},
+         {"type",    "string", "exec (software), read, write, access (default exec)", false},
+         {"size",    "number", "Breakpoint size 1/2/4/8 (default 1)", false},
+         {"name",    "string", "Optional label", false},
+         {"condition", "string", "Optional condition expression", false}},
+        false,
+        [](const json& params) -> tool_result_t {
+            if (!device->is_connected())
+                return tool_result_t::error("Driver not connected. Call driver_load first.");
+            uint64_t addr = 0;
+            if (params.contains("address") && params["address"].is_string()) {
+                auto p = sa_parse_address(params["address"].get<std::string>());
+                if (!p) return tool_result_t::error("Invalid address.");
+                addr = *p;
+            } else {
+                return tool_result_t::error("'address' is required.");
+            }
+            std::string type_str = "exec";
+            if (params.contains("type") && params["type"].is_string())
+                type_str = params["type"].get<std::string>();
+            debugger_engine::bp_type_t bp_type = debugger_engine::bp_type_t::software;
+            if (type_str == "exec" || type_str == "software")          bp_type = debugger_engine::bp_type_t::software;
+            else if (type_str == "hw_exec" || type_str == "hardware") bp_type = debugger_engine::bp_type_t::hardware_execute;
+            else if (type_str == "read")   bp_type = debugger_engine::bp_type_t::hardware_read;
+            else if (type_str == "write")  bp_type = debugger_engine::bp_type_t::hardware_write;
+            else if (type_str == "access") bp_type = debugger_engine::bp_type_t::memory_access;
+            else return tool_result_t::error("Unknown 'type': use exec, read, write, access, or hw_exec.");
+            int size = 1;
+            if (params.contains("size") && params["size"].is_number_integer())
+                size = params["size"].get<int>();
+            std::string name;
+            if (params.contains("name") && params["name"].is_string())
+                name = params["name"].get<std::string>();
+            std::string cond;
+            if (params.contains("condition") && params["condition"].is_string())
+                cond = params["condition"].get<std::string>();
+            int idx = debugger_engine::add_breakpoint(addr, bp_type, name, cond, size);
+            if (idx < 0)
+                return tool_result_t::error("debugger_engine::add_breakpoint failed: " +
+                                            debugger_engine::last_error());
+            json result;
+            result["index"]   = idx;
+            result["address"] = sa_format_address(addr);
+            result["type"]    = type_str;
+            result["size"]    = size;
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_remove_breakpoint",
+        "Remove a breakpoint tracked by the debugger engine by index OR by address.",
+        {{"index",   "number", "Breakpoint index from debugger_get_breakpoints", false},
+         {"address", "string", "Breakpoint address (hex). Used when index is absent.", false}},
+        false,
+        [](const json& params) -> tool_result_t {
+            int idx = -1;
+            if (params.contains("index") && params["index"].is_number_integer()) {
+                idx = params["index"].get<int>();
+            } else if (params.contains("address") && params["address"].is_string()) {
+                auto p = sa_parse_address(params["address"].get<std::string>());
+                if (!p) return tool_result_t::error("Invalid address.");
+                std::lock_guard<std::mutex> lk(debugger_engine::g_state.bp_mutex);
+                for (size_t i = 0; i < debugger_engine::g_state.breakpoints.size(); ++i) {
+                    if (debugger_engine::g_state.breakpoints[i].address == *p) {
+                        idx = static_cast<int>(i);
+                        break;
+                    }
+                }
+                if (idx < 0) return tool_result_t::error("No breakpoint exists at that address.");
+            } else {
+                return tool_result_t::error("Provide 'index' or 'address'.");
+            }
+            if (!debugger_engine::remove_breakpoint(idx))
+                return tool_result_t::error("debugger_engine::remove_breakpoint failed: " +
+                                            debugger_engine::last_error());
+            json result;
+            result["index"]  = idx;
+            result["status"] = "removed";
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_step_over",
+        "Step over the next instruction (alias of dbg_step_over without requiring a tid override).",
+        {{"tid", "string", "Optional thread ID; otherwise current active_tid is used", false}},
+        false,
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            if (params.contains("tid")) {
+                auto tid = parse_tid(params);
+                if (tid) debugger_engine::g_state.active_tid = *tid;
+            }
+            bool ok = debugger_engine::step_over();
+            json result;
+            result["status"] = ok ? "stepped" : "failed";
+            if (!ok) result["error"] = debugger_engine::last_error();
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_step_into",
+        "Single-step into the next instruction.",
+        {{"tid", "string", "Optional thread ID; otherwise current active_tid is used", false}},
+        false,
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            if (params.contains("tid")) {
+                auto tid = parse_tid(params);
+                if (tid) debugger_engine::g_state.active_tid = *tid;
+            }
+            bool ok = debugger_engine::step_into();
+            json result;
+            result["status"] = ok ? "stepped" : "failed";
+            if (!ok) result["error"] = debugger_engine::last_error();
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_step_out",
+        "Run until the current function returns.",
+        {{"tid", "string", "Optional thread ID; otherwise current active_tid is used", false}},
+        false,
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            if (params.contains("tid")) {
+                auto tid = parse_tid(params);
+                if (tid) debugger_engine::g_state.active_tid = *tid;
+            }
+            bool ok = debugger_engine::step_out();
+            json result;
+            result["status"] = ok ? "stepped" : "failed";
+            if (!ok) result["error"] = debugger_engine::last_error();
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_continue",
+        "Resume the attached process (alias of dbg_run).",
+        {},
+        false,
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            bool ok = debugger_engine::run_target();
+            json result;
+            result["status"] = ok ? "running" : "failed";
+            if (!ok) result["error"] = debugger_engine::last_error();
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_pause",
+        "Pause / break the attached process (alias of dbg_pause).",
+        {},
+        false,
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            bool ok = debugger_engine::pause_target();
+            json result;
+            result["status"] = ok ? "paused" : "failed";
+            if (!ok) result["error"] = debugger_engine::last_error();
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_read_memory",
+        "Read up to 65536 bytes from the attached process via driver_bridge::read_memory.",
+        {{"address", "string", "Source address (hex)", true},
+         {"size",    "number", "Bytes to read (default 256, max 65536)", false}},
+        true,
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            if (!params.contains("address") || !params["address"].is_string())
+                return tool_result_t::error("'address' is required.");
+            auto a = sa_parse_address(params["address"].get<std::string>());
+            if (!a) return tool_result_t::error("Invalid address.");
+            size_t size = 256;
+            if (params.contains("size") && params["size"].is_number_unsigned()) {
+                size_t v = params["size"].get<size_t>();
+                if (v == 0) return tool_result_t::error("'size' must be > 0.");
+                if (v > 65536) v = 65536;
+                size = v;
+            }
+            std::vector<uint8_t> bytes;
+            if (!driver_bridge::read_memory(*a, size, bytes))
+                return tool_result_t::error("driver_bridge::read_memory failed.");
+            std::string hex;
+            hex.reserve(bytes.size() * 3);
+            char buf[4];
+            for (size_t i = 0; i < bytes.size(); ++i) {
+                if (i > 0) hex.push_back(' ');
+                std::snprintf(buf, sizeof(buf), "%02X", static_cast<unsigned>(bytes[i]));
+                hex.append(buf, 2);
+            }
+            json result;
+            result["address"] = sa_format_address(*a);
+            result["size"]    = bytes.size();
+            result["bytes"]   = hex;
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_write_memory",
+        "Write hex-encoded bytes to the attached process via driver_bridge::write_memory (capped at 65536 bytes).",
+        {{"address",   "string", "Destination address (hex)", true},
+         {"hex_bytes", "string", "Hex byte sequence (whitespace/comma separated, e.g. 'CC 90 90')", true}},
+        false,
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            if (!params.contains("address") || !params["address"].is_string())
+                return tool_result_t::error("'address' is required.");
+            if (!params.contains("hex_bytes") || !params["hex_bytes"].is_string())
+                return tool_result_t::error("'hex_bytes' is required.");
+            auto a = sa_parse_address(params["address"].get<std::string>());
+            if (!a) return tool_result_t::error("Invalid address.");
+            std::string hex = params["hex_bytes"].get<std::string>();
+            std::vector<uint8_t> bytes;
+            std::string cur;
+            auto flush = [&](const std::string& tok) -> bool {
+                if (tok.empty()) return true;
+                if (tok.size() != 2) return false;
+                auto nib = [](char c, int& out) {
+                    if (c >= '0' && c <= '9') { out = c - '0'; return true; }
+                    if (c >= 'a' && c <= 'f') { out = 10 + (c - 'a'); return true; }
+                    if (c >= 'A' && c <= 'F') { out = 10 + (c - 'A'); return true; }
+                    return false;
+                };
+                int hi = 0, lo = 0;
+                if (!nib(tok[0], hi) || !nib(tok[1], lo)) return false;
+                bytes.push_back(static_cast<uint8_t>((hi << 4) | lo));
+                return true;
+            };
+            for (char c : hex) {
+                if (c == ' ' || c == '\t' || c == ',' || c == '\r' || c == '\n') {
+                    if (!flush(cur)) return tool_result_t::error("Invalid hex token in 'hex_bytes'.");
+                    cur.clear();
+                    continue;
+                }
+                cur.push_back(c);
+                if (cur.size() == 2) {
+                    if (!flush(cur)) return tool_result_t::error("Invalid hex byte.");
+                    cur.clear();
+                }
+            }
+            if (!cur.empty() && !flush(cur))
+                return tool_result_t::error("Invalid trailing hex token.");
+            if (bytes.empty())
+                return tool_result_t::error("Decoded byte sequence is empty.");
+            if (bytes.size() > 65536)
+                return tool_result_t::error("Write exceeds 64 KiB cap.");
+            if (!driver_bridge::write_memory(*a, bytes))
+                return tool_result_t::error("driver_bridge::write_memory failed.");
+            json result;
+            result["address"] = sa_format_address(*a);
+            result["bytes_written"] = bytes.size();
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_protect_memory",
+        "Change protection on a memory region via driver_bridge::protect_memory. new_protect uses Win32 PAGE_* constants (0x01..0x80).",
+        {{"address",     "string", "Region address (hex)", true},
+         {"size",        "number", "Region size in bytes", true},
+         {"new_protect", "number", "PAGE_* constant (e.g. 0x40 for PAGE_EXECUTE_READWRITE)", true}},
+        false,
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            if (!params.contains("address") || !params["address"].is_string())
+                return tool_result_t::error("'address' is required.");
+            auto a = sa_parse_address(params["address"].get<std::string>());
+            if (!a) return tool_result_t::error("Invalid address.");
+            if (!params.contains("size") || !params["size"].is_number_unsigned())
+                return tool_result_t::error("'size' is required.");
+            if (!params.contains("new_protect") || !params["new_protect"].is_number_integer())
+                return tool_result_t::error("'new_protect' is required (PAGE_* constant).");
+            uint64_t size = params["size"].get<uint64_t>();
+            uint32_t new_prot = static_cast<uint32_t>(params["new_protect"].get<int>());
+            uint32_t old_prot = 0;
+            if (!driver_bridge::protect_memory(*a, size, new_prot, &old_prot))
+                return tool_result_t::error("driver_bridge::protect_memory failed.");
+            json result;
+            result["address"]      = sa_format_address(*a);
+            result["size"]         = size;
+            result["new_protect"]  = debugger_engine::format_protect(new_prot);
+            result["old_protect"]  = debugger_engine::format_protect(old_prot);
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_attach_to_process",
+        "Attach the kernel driver to a target process by PID or by process name (alias of driver_attach for the debugger domain).",
+        {{"pid",  "number", "Target PID (preferred when known)", false},
+         {"name", "string", "Process name (e.g. 'notepad.exe')", false}},
+        false,
+        [](const json& params) -> tool_result_t {
+            if (!device->is_connected()) {
+                if (!device->connect())
+                    return tool_result_t::error("Cannot connect to kernel driver.");
+            }
+            uint32_t pid = 0;
+            if (params.contains("pid") && params["pid"].is_number_unsigned()) {
+                pid = params["pid"].get<uint32_t>();
+            } else if (params.contains("name") && params["name"].is_string()) {
+                std::string n = params["name"].get<std::string>();
+                pid = device->find_process(n.c_str());
+                if (pid == 0)
+                    return tool_result_t::error("Process not found: " + n);
+            } else {
+                return tool_result_t::error("Provide 'pid' or 'name'.");
+            }
+            if (!driver_bridge::attach(pid))
+                return tool_result_t::error("driver_bridge::attach failed: " +
+                                            driver_bridge::last_error());
+            uint64_t base = device->find_image();
+            device->solve_dtb();
+            json result;
+            result["pid"]          = pid;
+            result["base_address"] = sa_format_address(base);
+            result["name"]         = driver_bridge::attached_process_name();
+            return tool_result_t::ok(result);
+        }
+    });
+
+    srv.register_tool({
+        "debugger_detach",
+        "Detach the kernel driver from the current target process.",
+        {},
+        false,
+        [](const json&) -> tool_result_t {
+            driver_bridge::detach();
+            return tool_result_t::ok("Detached.");
+        }
+    });
+
     register_compat(srv, {
         OBFSTR("dbg_get_registers"), OBFSTR("debugger"),
         OBFSTR("Read all general-purpose registers, RIP, RFLAGS, segment and debug registers "
                "of a thread in the attached process."),
         {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID (default: first thread)"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
             if (auto err = ensure_attached(params)) return *err;
             auto tid = parse_tid(params);
@@ -1172,7 +1815,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
          {OBFSTR("register"), OBFSTR("string"), OBFSTR("Register name (e.g. rax, rip, r8)"), true},
          {OBFSTR("value"), OBFSTR("string"), OBFSTR("New value (hex)"), true},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
             if (auto err = ensure_attached(params)) return *err;
             auto tid = parse_tid(params);
@@ -1190,7 +1833,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("dbg_get_memory_map"), OBFSTR("debugger"),
         OBFSTR("Get the full virtual memory map of the attached process, including base address, "
                "size, protection flags, and module name for each region."),
-        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
             if (auto err = ensure_attached(params)) return *err;
             auto regions = debugger_engine::get_memory_map();
@@ -1260,7 +1903,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Start instruction tracing on the attached process. Each step records address, "
                "disassembly, and register state."),
         {{OBFSTR("max_records"), OBFSTR("number"), OBFSTR("Maximum trace records to keep (default 50000)"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
             if (auto err = ensure_attached(params)) return *err;
             int max_records = params.value("max_records", 50000);
@@ -1351,7 +1994,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Find ASCII strings in the memory of the attached process. Results include address, "
                "string value, and containing module."),
         {{OBFSTR("min_length"), OBFSTR("number"), OBFSTR("Minimum string length (default 4)"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
             if (auto err = ensure_attached(params)) return *err;
             int min_len = params.value("min_length", 4);
@@ -1379,7 +2022,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
     register_compat(srv, {
         OBFSTR("dbg_enumerate_handles"), OBFSTR("debugger"),
         OBFSTR("Enumerate open handles in the attached process (requires NtQuerySystemInformation)."),
-        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
             if (auto err = ensure_attached(params)) return *err;
             debugger_engine::enumerate_handles();
@@ -1408,7 +2051,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (hex)"), true},
          {OBFSTR("type"), OBFSTR("string"), OBFSTR("Type: 'execute', 'write', 'read' (default 'execute')"), false},
          {OBFSTR("size"), OBFSTR("number"), OBFSTR("Watch granularity in bytes: 1, 2, 4, or 8 (default 1; ignored for 'execute')"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
             if (auto err = ensure_attached(params)) return *err;
             if (!params.contains("address") || !params["address"].is_string())

@@ -23,6 +23,8 @@
 #include "ui_anim.hpp"
 #include "../helpers/globals.h"
 #include "../helpers/helpers.h"
+#include "../helpers/diag_log.hpp"
+#include "../helpers/win32_dialog.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
 #include "../ui/clock.hpp"
@@ -316,8 +318,16 @@ inline bool load_snapshot(const std::string& path, snapshot_t& out)
 
 inline void take_snapshot(const std::string& name = "")
 {
-	if (g_state.capturing.load())
+	if (g_state.capturing.load()) {
+		diag::log_tagged("snapshot_diff", "take_snapshot refused already_capturing");
 		return;
+	}
+	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) {
+		diag::log_tagged_fmt("snapshot_diff", "take_snapshot refused not_attached driver_loaded=%d pid=%u",
+			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
+		g_state.last_error = "take_snapshot: no process attached";
+		return;
+	}
 
 	g_state.capturing.store(true);
 	g_state.cancel.store(false);
@@ -331,7 +341,11 @@ inline void take_snapshot(const std::string& name = "")
 		snap_name = buf;
 	}
 
+	diag::log_tagged_fmt("snapshot_diff", "take_snapshot start name='%s' pid=%u",
+		snap_name.c_str(), driver_bridge::attached_pid());
+
 	work_queue::post([snap_name]() {
+		auto t_start = std::chrono::steady_clock::now();
 		snapshot_t snap;
 		snap.id = g_state.next_snap_id.fetch_add(1);
 		snap.name = snap_name;
@@ -375,6 +389,8 @@ inline void take_snapshot(const std::string& name = "")
 
 		detail::save_snapshot(snap);
 
+		size_t region_count = snap.regions.size();
+		uint64_t total_bytes = snap.total_bytes;
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			if (g_state.snapshots.size() >= 10) {
@@ -382,21 +398,37 @@ inline void take_snapshot(const std::string& name = "")
 				g_state.snapshots.erase(g_state.snapshots.begin());
 				if (g_state.snap_a_id == evicted_id) g_state.snap_a_id = 0;
 				if (g_state.snap_b_id == evicted_id) g_state.snap_b_id = 0;
+				diag::log_tagged_fmt("snapshot_diff", "take_snapshot evicted_oldest id=%llu",
+					static_cast<unsigned long long>(evicted_id));
 			}
 			g_state.snapshots.push_back(std::move(snap));
 		}
 
+		auto t_end = std::chrono::steady_clock::now();
+		uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+		diag::log_tagged_fmt("snapshot_diff", "take_snapshot done name='%s' regions=%zu bytes=%llu duration_ms=%llu cancelled=%d",
+			snap_name.c_str(), region_count,
+			static_cast<unsigned long long>(total_bytes),
+			static_cast<unsigned long long>(dur_ms),
+			static_cast<int>(g_state.cancel.load()));
+
+		g_state.progress.store(1.f);
 		g_state.capturing.store(false);
 	});
 }
 
 inline void load_from_disk(const std::string& path)
 {
-	if (g_state.loading.load() || g_state.capturing.load())
+	if (g_state.loading.load() || g_state.capturing.load()) {
+		diag::log_tagged_fmt("snapshot_diff", "load_from_disk refused busy loading=%d capturing=%d",
+			static_cast<int>(g_state.loading.load()),
+			static_cast<int>(g_state.capturing.load()));
 		return;
+	}
 
 	g_state.loading.store(true);
 	g_state.cancel.store(false);
+	g_state.progress.store(0.f);
 
 	std::string fallback_name;
 	{
@@ -406,10 +438,16 @@ inline void load_from_disk(const std::string& path)
 		fallback_name = buf;
 	}
 
+	diag::log_tagged_fmt("snapshot_diff", "load_from_disk start path='%s'", path.c_str());
+
 	std::string path_copy = path;
 	work_queue::post([path_copy, fallback_name]() {
+		auto t_start = std::chrono::steady_clock::now();
 		snapshot_t snap;
 		if (!detail::load_snapshot(path_copy, snap)) {
+			diag::log_tagged_fmt("snapshot_diff", "load_from_disk failed path='%s' err='%s'",
+				path_copy.c_str(), g_state.last_error.c_str());
+			g_state.progress.store(1.f);
 			g_state.loading.store(false);
 			return;
 		}
@@ -419,6 +457,9 @@ inline void load_from_disk(const std::string& path)
 			snap.name = fallback_name;
 		}
 
+		size_t region_count = snap.regions.size();
+		uint64_t total_bytes = snap.total_bytes;
+		std::string snap_name = snap.name;
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			if (g_state.snapshots.size() >= 10) {
@@ -426,18 +467,40 @@ inline void load_from_disk(const std::string& path)
 				g_state.snapshots.erase(g_state.snapshots.begin());
 				if (g_state.snap_a_id == evicted_id) g_state.snap_a_id = 0;
 				if (g_state.snap_b_id == evicted_id) g_state.snap_b_id = 0;
+				diag::log_tagged_fmt("snapshot_diff", "load_from_disk evicted_oldest id=%llu",
+					static_cast<unsigned long long>(evicted_id));
 			}
 			g_state.snapshots.push_back(std::move(snap));
 		}
 
+		auto t_end = std::chrono::steady_clock::now();
+		uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+		diag::log_tagged_fmt("snapshot_diff", "load_from_disk done path='%s' name='%s' regions=%zu bytes=%llu duration_ms=%llu",
+			path_copy.c_str(), snap_name.c_str(), region_count,
+			static_cast<unsigned long long>(total_bytes),
+			static_cast<unsigned long long>(dur_ms));
+
+		g_state.progress.store(1.f);
 		g_state.loading.store(false);
 	});
 }
 
 inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 {
-	if (g_state.comparing.load())
+	if (g_state.comparing.load()) {
+		diag::log_tagged("snapshot_diff", "compare_snapshots refused already_comparing");
 		return;
+	}
+	if (id_a == 0 || id_b == 0 || id_a == id_b) {
+		diag::log_tagged_fmt("snapshot_diff", "compare_snapshots refused invalid_ids a=%llu b=%llu",
+			static_cast<unsigned long long>(id_a),
+			static_cast<unsigned long long>(id_b));
+		return;
+	}
+
+	diag::log_tagged_fmt("snapshot_diff", "compare_snapshots start a=%llu b=%llu",
+		static_cast<unsigned long long>(id_a),
+		static_cast<unsigned long long>(id_b));
 
 	g_state.comparing.store(true);
 	g_state.cancel.store(false);
@@ -446,6 +509,7 @@ inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 	g_state.compare_cursor_t = 0.f;
 
 	work_queue::post([id_a, id_b]() {
+		auto t_start = std::chrono::steady_clock::now();
 		diff_result_t result;
 
 		snapshot_t snap_a, snap_b;
@@ -531,6 +595,9 @@ inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 			g_state.progress.store(static_cast<float>(done) / static_cast<float>(total));
 		}
 
+		size_t changes_count = result.changes.size();
+		uint64_t changed_bytes = result.total_changed_bytes;
+		size_t changed_pages = result.changed_page_count;
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			g_state.diff = std::move(result);
@@ -538,14 +605,27 @@ inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 			g_state.row_flash.clear();
 		}
 
+		auto t_end = std::chrono::steady_clock::now();
+		uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+		diag::log_tagged_fmt("snapshot_diff", "compare_snapshots done a=%llu b=%llu changes=%zu changed_pages=%zu changed_bytes=%llu duration_ms=%llu cancelled=%d",
+			static_cast<unsigned long long>(id_a),
+			static_cast<unsigned long long>(id_b),
+			changes_count, changed_pages,
+			static_cast<unsigned long long>(changed_bytes),
+			static_cast<unsigned long long>(dur_ms),
+			static_cast<int>(g_state.cancel.load()));
+
+		g_state.progress.store(1.f);
 		g_state.comparing.store(false);
 	});
 }
 
 inline void clear_snapshots()
 {
+	diag::log_tagged("snapshot_diff", "clear_snapshots signalled");
 	g_state.cancel.store(true);
 	std::lock_guard<std::mutex> lk(g_state.mutex);
+	size_t had = g_state.snapshots.size();
 	g_state.snapshots.clear();
 	g_state.diff = {};
 	g_state.snap_a_id = 0;
@@ -554,6 +634,7 @@ inline void clear_snapshots()
 	g_state.prev_change_keys.clear();
 	g_state.row_flash.clear();
 	g_state.selected_change = -1;
+	diag::log_tagged_fmt("snapshot_diff", "clear_snapshots cleared=%zu", had);
 }
 
 namespace detail {
@@ -791,21 +872,21 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			std::error_code ec;
 			std::filesystem::create_directories(initial_dir, ec);
 			std::string initial_dir_str = initial_dir.string();
-			work_queue::post([initial_dir_str]() {
-				char path_buf[MAX_PATH] = {};
-				OPENFILENAMEA ofn = {};
-				ofn.lStructSize = sizeof(ofn);
-				ofn.hwndOwner = g_hwnd;
-				ofn.lpstrFile = path_buf;
-				ofn.nMaxFile = MAX_PATH;
-				ofn.lpstrFilter = "Snapshot (*.bin)\0*.bin\0All files\0*.*\0\0";
-				ofn.lpstrDefExt = "bin";
-				ofn.lpstrInitialDir = initial_dir_str.c_str();
-				ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-				if (GetOpenFileNameA(&ofn)) {
-					load_from_disk(std::string(path_buf));
-				}
-			});
+			char path_buf[MAX_PATH] = {};
+			static const char k_snapshot_filter[] =
+				"Snapshot (*.bin)\0*.bin\0"
+				"All files (*.*)\0*.*\0\0";
+			if (win32_dialog::show_open_file_dialog_ex(g_hwnd,
+					"Load Snapshot",
+					k_snapshot_filter,
+					initial_dir_str.c_str(),
+					path_buf, sizeof(path_buf),
+					"snapshot_diff::load")) {
+				std::string picked(path_buf);
+				work_queue::post([picked]() {
+					load_from_disk(picked);
+				});
+			}
 		}
 		cx = ImGui::GetItemRectMax().x + btn_gap;
 	}

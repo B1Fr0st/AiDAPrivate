@@ -18,6 +18,7 @@
 #include "network_view.hpp"
 #include "mitm_proxy.hpp"
 #include "../infra/work_queue.hpp"
+#include "helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -131,7 +132,10 @@ tool_result_t network_enumerate_connections(const json& params)
         filter_protocol = params["protocol"].get<std::uint32_t>();
     }
 
+    diag::log_tagged_fmt("network", "mcp_enumerate_connections filter_pid=%u filter_proto=%u",
+        filter_pid, filter_protocol);
     auto conns = driver_bridge::enumerate_connections(filter_pid, filter_protocol);
+    diag::log_tagged_fmt("network", "mcp_enumerate_connections_done count=%zu", conns.size());
 
     json arr = json::array();
     for (const auto& c : conns) {

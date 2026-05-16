@@ -188,28 +188,36 @@ namespace auth {
 			if (FAILED(folder_view->get_Application(app_disp.put())) || !app_disp)
 				return false;
 
-			com_ptr_t<IShellDispatch2> shell_dispatch;
-			if (FAILED(app_disp->QueryInterface(IID_IShellDispatch2,
+			com_ptr_t<IDispatch> shell_dispatch;
+			if (FAILED(app_disp->QueryInterface(IID_IDispatch,
 					shell_dispatch.put_void())) || !shell_dispatch)
+				return false;
+
+			OLECHAR* method_name = const_cast<OLECHAR*>(L"ShellExecute");
+			DISPID dispid_shell_execute = 0;
+			if (FAILED(shell_dispatch->GetIDsOfNames(IID_NULL, &method_name, 1,
+					LOCALE_USER_DEFAULT, &dispid_shell_execute)))
 				return false;
 
 			BSTR file = SysAllocString(url.c_str());
 			if (!file)
 				return false;
 
-			VARIANT v_args;
-			VariantInit(&v_args);
-			VARIANT v_dir;
-			VariantInit(&v_dir);
-			VARIANT v_op;
-			VariantInit(&v_op);
-			VARIANT v_show;
-			VariantInit(&v_show);
-			v_show.vt = VT_I4;
-			v_show.lVal = SW_SHOWNORMAL;
+			VARIANT args[5];
+			for (int idx = 0; idx < 5; ++idx)
+				VariantInit(&args[idx]);
+			args[4].vt = VT_BSTR;
+			args[4].bstrVal = file;
+			args[0].vt = VT_I4;
+			args[0].lVal = SW_SHOWNORMAL;
 
-			const HRESULT exec_hr = shell_dispatch->ShellExecute(file, v_args, v_dir,
-				v_op, v_show);
+			DISPPARAMS params = {};
+			params.rgvarg = args;
+			params.cArgs = 5;
+
+			const HRESULT exec_hr = shell_dispatch->Invoke(dispid_shell_execute,
+				IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_METHOD, &params,
+				nullptr, nullptr, nullptr);
 			SysFreeString(file);
 			return SUCCEEDED(exec_hr);
 		}

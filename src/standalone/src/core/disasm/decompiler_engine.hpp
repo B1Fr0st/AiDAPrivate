@@ -85,6 +85,119 @@ struct state_t {
 
 inline state_t g_state;
 
+struct snapshot_t {
+	decompile_result_t current;
+	bool               active = false;
+	std::vector<history_entry_t> history;
+	int  history_pos = -1;
+	float scroll_y = 0.f;
+	float target_scroll_y = 0.f;
+	std::unordered_map<uint64_t, decompile_result_t> cache;
+	std::list<uint64_t> cache_lru_order;
+	std::unordered_map<uint64_t, std::list<uint64_t>::iterator> cache_lru_iters;
+	uint32_t cache_max_entries = 256;
+	std::vector<uint64_t> batch_queue;
+	int batch_total = 0;
+	int batch_done = 0;
+	bool batch_running = false;
+	bool decompiling = false;
+	bool cancel = false;
+	bool init_progress_active = false;
+};
+
+inline std::unique_ptr<snapshot_t> detach_snapshot() {
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	auto out = std::make_unique<snapshot_t>();
+	out->current = std::move(g_state.current);
+	out->active = g_state.active;
+	out->history = std::move(g_state.history);
+	out->history_pos = g_state.history_pos;
+	out->scroll_y = g_state.scroll_y;
+	out->target_scroll_y = g_state.target_scroll_y;
+	out->cache = std::move(g_state.cache);
+	out->cache_lru_order = std::move(g_state.cache_lru_order);
+	out->cache_lru_iters = std::move(g_state.cache_lru_iters);
+	out->cache_max_entries = g_state.cache_max_entries;
+	out->batch_queue = std::move(g_state.batch_queue);
+	out->batch_total = g_state.batch_total.load(std::memory_order_acquire);
+	out->batch_done = g_state.batch_done.load(std::memory_order_acquire);
+	out->batch_running = g_state.batch_running.load(std::memory_order_acquire);
+	out->decompiling = g_state.decompiling.load(std::memory_order_acquire);
+	out->cancel = g_state.cancel.load(std::memory_order_acquire);
+	out->init_progress_active = g_state.init_progress_active.load(std::memory_order_acquire);
+	g_state.current = decompile_result_t{};
+	g_state.active = false;
+	g_state.history.clear();
+	g_state.history_pos = -1;
+	g_state.scroll_y = 0.f;
+	g_state.target_scroll_y = 0.f;
+	g_state.cache.clear();
+	g_state.cache_lru_order.clear();
+	g_state.cache_lru_iters.clear();
+	g_state.cache_max_entries = 256;
+	g_state.batch_queue.clear();
+	g_state.batch_total.store(0, std::memory_order_release);
+	g_state.batch_done.store(0, std::memory_order_release);
+	g_state.batch_running.store(false, std::memory_order_release);
+	g_state.decompiling.store(false, std::memory_order_release);
+	g_state.cancel.store(false, std::memory_order_release);
+	g_state.init_progress_active.store(false, std::memory_order_release);
+	g_state.file_fallback.store(nullptr, std::memory_order_release);
+	g_state.next_pending.store(false, std::memory_order_release);
+	g_state.next_addr.store(0, std::memory_order_release);
+	g_state.next_file.store(nullptr, std::memory_order_release);
+	return out;
+}
+
+inline void attach_snapshot(std::unique_ptr<snapshot_t> snap) {
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	if (!snap) {
+		g_state.current = decompile_result_t{};
+		g_state.active = false;
+		g_state.history.clear();
+		g_state.history_pos = -1;
+		g_state.scroll_y = 0.f;
+		g_state.target_scroll_y = 0.f;
+		g_state.cache.clear();
+		g_state.cache_lru_order.clear();
+		g_state.cache_lru_iters.clear();
+		g_state.cache_max_entries = 256;
+		g_state.batch_queue.clear();
+		g_state.batch_total.store(0, std::memory_order_release);
+		g_state.batch_done.store(0, std::memory_order_release);
+		g_state.batch_running.store(false, std::memory_order_release);
+		g_state.decompiling.store(false, std::memory_order_release);
+		g_state.cancel.store(false, std::memory_order_release);
+		g_state.init_progress_active.store(false, std::memory_order_release);
+		g_state.file_fallback.store(nullptr, std::memory_order_release);
+		g_state.next_pending.store(false, std::memory_order_release);
+		g_state.next_addr.store(0, std::memory_order_release);
+		g_state.next_file.store(nullptr, std::memory_order_release);
+		return;
+	}
+	g_state.current = std::move(snap->current);
+	g_state.active = snap->active;
+	g_state.history = std::move(snap->history);
+	g_state.history_pos = snap->history_pos;
+	g_state.scroll_y = snap->scroll_y;
+	g_state.target_scroll_y = snap->target_scroll_y;
+	g_state.cache = std::move(snap->cache);
+	g_state.cache_lru_order = std::move(snap->cache_lru_order);
+	g_state.cache_lru_iters = std::move(snap->cache_lru_iters);
+	g_state.cache_max_entries = snap->cache_max_entries;
+	g_state.batch_queue = std::move(snap->batch_queue);
+	g_state.batch_total.store(snap->batch_total, std::memory_order_release);
+	g_state.batch_done.store(snap->batch_done, std::memory_order_release);
+	g_state.batch_running.store(snap->batch_running, std::memory_order_release);
+	g_state.decompiling.store(snap->decompiling, std::memory_order_release);
+	g_state.cancel.store(snap->cancel, std::memory_order_release);
+	g_state.init_progress_active.store(snap->init_progress_active, std::memory_order_release);
+	g_state.file_fallback.store(nullptr, std::memory_order_release);
+	g_state.next_pending.store(false, std::memory_order_release);
+	g_state.next_addr.store(0, std::memory_order_release);
+	g_state.next_file.store(nullptr, std::memory_order_release);
+}
+
 namespace detail {
 
 inline uint32_t crc32_byte(uint32_t c) {

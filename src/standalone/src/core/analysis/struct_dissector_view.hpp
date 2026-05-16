@@ -14,6 +14,7 @@
 #include "ui/fonts.hpp"
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
+#include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -188,8 +189,19 @@ inline void render(float pos_x, float pos_y, float width, float height,
 						 ImGuiInputTextFlags_CharsHexadecimal | ImGuiInputTextFlags_EnterReturnsTrue)) {
 		uint64_t addr = 0;
 		if (std::sscanf(ui.addr_buf, "%llx", reinterpret_cast<unsigned long long*>(&addr)) == 1) {
-			std::lock_guard<std::mutex> lk(st.mtx);
-			st.base_address = addr;
+			uint64_t prev = 0;
+			{
+				std::lock_guard<std::mutex> lk(st.mtx);
+				prev = st.base_address;
+				st.base_address = addr;
+			}
+			diag::log_tagged_fmt("dissector",
+				"base_address_changed prev=0x%llX new=0x%llX",
+				static_cast<unsigned long long>(prev),
+				static_cast<unsigned long long>(addr));
+		} else {
+			diag::log_tagged_fmt("dissector",
+				"base_address_parse_failed input='%s'", ui.addr_buf);
 		}
 	}
 	ImGui::PopItemWidth();
@@ -200,6 +212,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::SetCursorScreenPos(ImVec2(bx, by));
 	if (aida::ui::button("Refresh", aida::ui::button_kind_t::primary,
 		aida::ui::size_t_::sm, ImVec2(96.f, 28.f))) {
+		diag::log_tagged_fmt("dissector", "refresh_clicked manual=1");
 		struct_dissector::refresh_values();
 	}
 	bx += 92.f;
@@ -230,13 +243,36 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			std::lock_guard<std::mutex> lk(st.mtx);
 			aidx = st.active_struct;
 		}
-		if (aidx >= 0) struct_dissector::export_to_c(aidx);
+		if (aidx >= 0) {
+			std::string c_src = struct_dissector::export_to_c(aidx);
+			if (!c_src.empty()) {
+				ImGui::SetClipboardText(c_src.c_str());
+				diag::log_tagged_fmt("dissector",
+					"export_to_c_clipboard idx=%d bytes=%zu",
+					aidx, c_src.size());
+			}
+		} else {
+			diag::log_tagged_fmt("dissector",
+				"export_to_c_clicked_no_active");
+		}
 	}
 
-	if (st.auto_refresh) {
-		st.refresh_timer += dt;
-		if (st.refresh_timer >= st.refresh_interval) {
-			st.refresh_timer = 0.f;
+	{
+		bool auto_now_snap = false;
+		{
+			std::lock_guard<std::mutex> lk(st.mtx);
+			auto_now_snap = st.auto_refresh;
+			if (auto_now_snap) {
+				st.refresh_timer += dt;
+				if (st.refresh_timer >= st.refresh_interval) {
+					st.refresh_timer = 0.f;
+					auto_now_snap = true;
+				} else {
+					auto_now_snap = false;
+				}
+			}
+		}
+		if (auto_now_snap) {
 			struct_dissector::refresh_values();
 		}
 	}
@@ -310,10 +346,18 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			}
 
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-				std::lock_guard<std::mutex> lk(st.mtx);
-				st.active_struct = i;
-				ui.selected_field = -1;
-				ui.editing_field = -1;
+				std::string sel_name;
+				{
+					std::lock_guard<std::mutex> lk(st.mtx);
+					st.active_struct = i;
+					if (i >= 0 && i < static_cast<int>(st.structs.size())) {
+						sel_name = st.structs[i].name;
+					}
+					ui.selected_field = -1;
+					ui.editing_field = -1;
+				}
+				diag::log_tagged_fmt("dissector",
+					"struct_selected idx=%d name='%s'", i, sel_name.c_str());
 			}
 
 			dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
@@ -349,17 +393,33 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (ui.name_buf[0] != '\0') {
 				struct_dissector::create_struct(ui.name_buf);
 				ui.name_buf[0] = '\0';
+			} else {
+				diag::log_tagged_fmt("dissector",
+					"create_struct_skipped reason='empty_name'");
 			}
 		}
 		ImGui::SameLine();
 		if (aida::ui::button("-", aida::ui::button_kind_t::destructive,
 			aida::ui::size_t_::sm, ImVec2(28.f, 28.f))) {
-			std::lock_guard<std::mutex> lk(st.mtx);
-			if (st.active_struct >= 0 && st.active_struct < static_cast<int>(st.structs.size())) {
-				st.structs.erase(st.structs.begin() + st.active_struct);
-				if (st.active_struct >= static_cast<int>(st.structs.size()))
-					st.active_struct = static_cast<int>(st.structs.size()) - 1;
-				ui.selected_field = -1;
+			std::string deleted_name;
+			int removed_idx = -1;
+			{
+				std::lock_guard<std::mutex> lk(st.mtx);
+				if (st.active_struct >= 0 && st.active_struct < static_cast<int>(st.structs.size())) {
+					removed_idx = st.active_struct;
+					deleted_name = st.structs[st.active_struct].name;
+					st.structs.erase(st.structs.begin() + st.active_struct);
+					if (st.active_struct >= static_cast<int>(st.structs.size()))
+						st.active_struct = static_cast<int>(st.structs.size()) - 1;
+					ui.selected_field = -1;
+				}
+			}
+			if (removed_idx >= 0) {
+				diag::log_tagged_fmt("dissector",
+					"delete_struct idx=%d name='%s'", removed_idx, deleted_name.c_str());
+			} else {
+				diag::log_tagged_fmt("dissector",
+					"delete_struct_skipped reason='no_active'");
 			}
 		}
 	}
@@ -548,16 +608,53 @@ inline void render(float pos_x, float pos_y, float width, float height,
 							ImGui::PopStyleColor(2);
 							if (committed) {
 								uint64_t write_addr = st.base_address + f.offset;
+								memory_scanner::value_type_t scanner_type = memory_scanner::value_type_t::int32_val;
+								bool hex_input = false;
+								switch (f.type) {
+								case struct_dissector::field_type_t::int8:
+								case struct_dissector::field_type_t::uint8:
+									scanner_type = memory_scanner::value_type_t::byte_val; break;
+								case struct_dissector::field_type_t::int16:
+								case struct_dissector::field_type_t::uint16:
+									scanner_type = memory_scanner::value_type_t::int16_val; break;
+								case struct_dissector::field_type_t::int32:
+								case struct_dissector::field_type_t::uint32:
+									scanner_type = memory_scanner::value_type_t::int32_val; break;
+								case struct_dissector::field_type_t::int64:
+								case struct_dissector::field_type_t::uint64:
+								case struct_dissector::field_type_t::pointer:
+									scanner_type = memory_scanner::value_type_t::int64_val;
+									hex_input = (f.type == struct_dissector::field_type_t::pointer);
+									break;
+								case struct_dissector::field_type_t::float32:
+									scanner_type = memory_scanner::value_type_t::float_val; break;
+								case struct_dissector::field_type_t::float64:
+									scanner_type = memory_scanner::value_type_t::double_val; break;
+								case struct_dissector::field_type_t::ascii_string:
+									scanner_type = memory_scanner::value_type_t::string_ascii; break;
+								case struct_dissector::field_type_t::utf16_string:
+									scanner_type = memory_scanner::value_type_t::string_utf16; break;
+								default:
+									scanner_type = memory_scanner::value_type_t::byte_array;
+									hex_input = true;
+									break;
+								}
 								auto bytes = memory_scanner::parse_value(ui.edit_value_buf,
-									static_cast<memory_scanner::value_type_t>(
-										std::min(static_cast<int>(f.type),
-												 static_cast<int>(memory_scanner::value_type_t::double_val))),
-									false);
+									scanner_type, hex_input);
+								bool wrote_ok = false;
 								if (!bytes.empty()) {
-									if (driver_bridge::write_memory(write_addr, bytes)) {
+									wrote_ok = driver_bridge::write_memory(write_addr, bytes);
+									if (wrote_ok) {
 										fa.write_success.trigger();
 									}
 								}
+								diag::log_tagged_fmt("dissector",
+									"write_field addr=0x%llX type=%s input='%s' bytes=%zu ok=%d",
+									static_cast<unsigned long long>(write_addr),
+									struct_dissector::field_type_name(f.type),
+									ui.edit_value_buf,
+									bytes.size(),
+									wrote_ok ? 1 : 0);
 								ui.editing_field = -1;
 							}
 							if (!ImGui::IsItemActive() && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
@@ -651,6 +748,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				struct_dissector::add_field(active_idx, fd);
 				ui.field_name_buf[0] = '\0';
 				ui.offset_buf[0] = '\0';
+			} else {
+				diag::log_tagged_fmt("dissector",
+					"add_field_skipped reason='empty_name'");
 			}
 		}
 		ImGui::SameLine();
@@ -660,6 +760,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				struct_dissector::remove_field(active_idx, ui.selected_field);
 				ui.selected_field = -1;
 				ui.editing_field = -1;
+			} else {
+				diag::log_tagged_fmt("dissector",
+					"remove_field_skipped reason='no_selection'");
 			}
 		}
 	}

@@ -16,10 +16,13 @@
 #include "../ui/skeleton.hpp"
 #include "../ui/brand.hpp"
 #include "../ui/fonts.hpp"
+#include "../ui/toast_notification.hpp"
+#include "../../helpers/diag_log.hpp"
 
 extern DisasmState g_disasm;
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -87,7 +90,12 @@ inline std::string lower_copy(const std::string& s) {
 
 inline void start_taint_trace(local_state_t& st) {
 	uint64_t addr = std::strtoull(st.addr_buf, nullptr, 16);
-	if (addr == 0) return;
+	if (addr == 0) {
+		diag::log_tagged_fmt("taint", "start_taint_trace_reject reason=zero_entry_addr buf='%s'", st.addr_buf);
+		toast_notification::push("Enter a valid start address (hex)",
+			toast_notification::toast_type_t::warning, 3.0f);
+		return;
+	}
 	uint64_t end = st.end_addr_buf[0] ? std::strtoull(st.end_addr_buf, nullptr, 16) : 0;
 	auto regs = parse_list(st.taint_regs_buf);
 
@@ -99,9 +107,28 @@ inline void start_taint_trace(local_state_t& st) {
 		}
 	}
 
-	if (symbolic_engine::g_state.processing.load()) return;
+	if (regs.empty() && mem_ranges.empty()) {
+		diag::log_tagged("taint", "start_taint_trace_reject reason=no_taint_sources");
+		toast_notification::push("Add at least one tainted register or memory source",
+			toast_notification::toast_type_t::warning, 3.0f);
+		return;
+	}
+
+	if (symbolic_engine::g_state.processing.load()) {
+		diag::log_tagged("taint", "start_taint_trace_reject reason=engine_busy");
+		return;
+	}
+
+	diag::log_tagged_fmt("taint",
+		"start_taint_trace entry=0x%llX end=0x%llX regs=%zu mem=%zu max=%u",
+		static_cast<unsigned long long>(addr),
+		static_cast<unsigned long long>(end),
+		regs.size(), mem_ranges.size(),
+		static_cast<uint32_t>(st.max_insns));
+
 	symbolic_engine::g_state.processing.store(true);
-	work_queue::post([addr, end, max_i = static_cast<uint32_t>(st.max_insns), regs, mem_ranges]() {
+	auto t0 = std::chrono::steady_clock::now();
+	work_queue::post([addr, end, max_i = static_cast<uint32_t>(st.max_insns), regs, mem_ranges, t0]() {
 		symbolic_engine::taint_result_t result;
 		try {
 			result = symbolic_engine::taint_trace(addr, end, max_i, regs, mem_ranges);
@@ -111,6 +138,21 @@ inline void start_taint_trace(local_state_t& st) {
 		} catch (...) {
 			result.success = false;
 			result.error = "Taint trace aborted by unknown exception";
+		}
+		auto t1 = std::chrono::steady_clock::now();
+		auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+		if (result.success) {
+			diag::log_tagged_fmt("taint",
+				"taint_trace_done entry=0x%llX processed=%u tainted=%u tainted_regs=%zu tainted_mem=%zu duration_ms=%lld",
+				static_cast<unsigned long long>(addr),
+				result.total_processed, result.tainted_count,
+				result.tainted_registers.size(), result.tainted_memory_addresses.size(),
+				static_cast<long long>(dur));
+		} else {
+			diag::log_tagged_fmt("taint",
+				"taint_trace_fail entry=0x%llX error='%s' duration_ms=%lld",
+				static_cast<unsigned long long>(addr),
+				result.error.c_str(), static_cast<long long>(dur));
 		}
 		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
 		symbolic_engine::g_state.last_taint = std::move(result);

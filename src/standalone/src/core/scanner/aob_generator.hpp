@@ -3,6 +3,7 @@
 #include <algorithm>
 #include "work_queue.hpp"
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -16,6 +17,7 @@
 
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
+#include "../helpers/diag_log.hpp"
 
 #ifdef AIDA_STANDALONE
 #include <Zydis/Zydis.h>
@@ -312,10 +314,25 @@ inline const char* score_grade(float score)
 inline void generate_from_address(uint64_t address, int num_instructions, bool auto_wildcard)
 {
 #ifdef AIDA_STANDALONE
-	if (g_state.generating.load()) return;
+	if (g_state.generating.load()) {
+		diag::log_tagged("aob", "generate_from_address refused already_generating");
+		return;
+	}
+	if (address == 0) {
+		diag::log_tagged("aob", "generate_from_address refused zero_address");
+		return;
+	}
+	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) {
+		diag::log_tagged_fmt("aob", "generate_from_address refused not_attached driver_loaded=%d pid=%u",
+			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
+		return;
+	}
+	diag::log_tagged_fmt("aob", "generate_from_address start addr=0x%llX instructions=%d auto_wildcard=%d",
+		static_cast<unsigned long long>(address), num_instructions, static_cast<int>(auto_wildcard));
 	g_state.generating.store(true);
 
 	work_queue::post([address, num_instructions, auto_wildcard]() {
+		auto t_start = std::chrono::steady_clock::now();
 		signature_t sig;
 		sig.id = allocate_signature_id();
 		sig.address = address;
@@ -332,6 +349,8 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 		std::vector<uint8_t> code;
 		driver_bridge::read_memory(address, read_size, code);
 		if (code.empty()) {
+			diag::log_tagged_fmt("aob", "generate_from_address read_memory_failed addr=0x%llX size=%zu",
+				static_cast<unsigned long long>(address), read_size);
 			g_state.generating.store(false);
 			return;
 		}
@@ -375,13 +394,23 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 			}
 		}
 
+		size_t pattern_size = pattern.size();
+		size_t decoded_instrs = instrs.size();
+		float qs = 0.f;
 		sig.bytes = std::move(pattern);
 		sig.quality_score = compute_quality_score(sig);
+		qs = sig.quality_score;
 
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			g_state.current = std::move(sig);
 		}
+
+		auto t_end = std::chrono::steady_clock::now();
+		uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+		diag::log_tagged_fmt("aob", "generate_from_address done addr=0x%llX decoded=%zu bytes=%zu quality=%.2f duration_ms=%llu",
+			static_cast<unsigned long long>(address), decoded_instrs, pattern_size,
+			static_cast<double>(qs), static_cast<unsigned long long>(dur_ms));
 
 		g_state.generating.store(false);
 	});
@@ -483,8 +512,13 @@ inline void generate_from_file(const DisasmFile& file, uint64_t address, int num
 
 inline void validate_uniqueness_process(signature_t& sig)
 {
-	if (g_state.validating.load()) return;
+	if (g_state.validating.load()) {
+		diag::log_tagged("aob", "validate_uniqueness_process refused already_validating");
+		return;
+	}
 	if (sig.id == 0) sig.id = allocate_signature_id();
+	diag::log_tagged_fmt("aob", "validate_uniqueness_process start id=%llu bytes=%zu",
+		static_cast<unsigned long long>(sig.id), sig.bytes.size());
 	g_state.validating.store(true);
 
 	work_queue::post([sig_copy = sig]() mutable {
@@ -509,6 +543,9 @@ inline void validate_uniqueness_process(signature_t& sig)
 		sig_copy.unique = (total_count == 1);
 		sig_copy.uniqueness_count = total_count;
 		sig_copy.quality_score = compute_quality_score(sig_copy);
+		diag::log_tagged_fmt("aob", "validate_uniqueness_process result id=%llu count=%d unique=%d quality=%.2f",
+			static_cast<unsigned long long>(sig_copy.id), total_count,
+			static_cast<int>(sig_copy.unique), static_cast<double>(sig_copy.quality_score));
 
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -549,7 +586,10 @@ inline void validate_uniqueness_file(const DisasmFile& file, signature_t& sig)
 inline void save_current()
 {
 	std::lock_guard<std::mutex> lk(g_state.mutex);
-	if (g_state.current.bytes.empty()) return;
+	if (g_state.current.bytes.empty()) {
+		diag::log_tagged("aob", "save_current refused empty_current");
+		return;
+	}
 	if (g_state.name_input[0])
 		g_state.current.name = g_state.name_input;
 	else {
@@ -559,19 +599,33 @@ inline void save_current()
 	}
 	signature_t copy = g_state.current;
 	if (copy.id == 0) copy.id = allocate_signature_id();
+	std::string saved_name = copy.name;
+	size_t bytes_count = copy.bytes.size();
 	g_state.saved_signatures.push_back(std::move(copy));
+	diag::log_tagged_fmt("aob", "save_current saved name='%s' bytes=%zu total_saved=%zu",
+		saved_name.c_str(), bytes_count, g_state.saved_signatures.size());
 }
 
 inline void generate_batch(const std::vector<uint64_t>& addresses, int num_instructions, bool auto_wildcard)
 {
 #ifdef AIDA_STANDALONE
-	if (g_state.batch_generating.load()) return;
+	if (g_state.batch_generating.load()) {
+		diag::log_tagged("aob", "generate_batch refused already_running");
+		return;
+	}
+	if (addresses.empty()) {
+		diag::log_tagged("aob", "generate_batch refused empty_address_list");
+		return;
+	}
+	diag::log_tagged_fmt("aob", "generate_batch start count=%zu instructions=%d auto_wildcard=%d",
+		addresses.size(), num_instructions, static_cast<int>(auto_wildcard));
 	g_state.batch_generating.store(true);
 	g_state.batch_total.store(static_cast<int>(addresses.size()));
 	g_state.batch_done.store(0);
 
 	auto addrs = addresses;
 	work_queue::post([addrs, num_instructions, auto_wildcard]() {
+		auto t_start = std::chrono::steady_clock::now();
 		ZydisDecoder decoder;
 		ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
 
@@ -650,6 +704,10 @@ inline void generate_batch(const std::vector<uint64_t>& addresses, int num_instr
 			g_state.batch_done.fetch_add(1);
 		}
 
+		auto t_end = std::chrono::steady_clock::now();
+		uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+		diag::log_tagged_fmt("aob", "generate_batch done total=%zu done=%d duration_ms=%llu",
+			addrs.size(), g_state.batch_done.load(), static_cast<unsigned long long>(dur_ms));
 		g_state.batch_generating.store(false);
 	});
 #else
@@ -662,7 +720,13 @@ inline void generate_batch(const std::vector<uint64_t>& addresses, int num_instr
 inline void optimize_signature(signature_t& sig)
 {
 #ifdef AIDA_STANDALONE
-	if (sig.bytes.size() < 4) return;
+	if (sig.bytes.size() < 4) {
+		diag::log_tagged_fmt("aob", "optimize_signature refused too_short bytes=%zu",
+			sig.bytes.size());
+		return;
+	}
+	diag::log_tagged_fmt("aob", "optimize_signature start id=%llu bytes=%zu",
+		static_cast<unsigned long long>(sig.id), sig.bytes.size());
 
 	std::vector<uint8_t> concrete;
 	concrete.reserve(sig.bytes.size());
@@ -731,12 +795,17 @@ inline void optimize_signature(signature_t& sig)
 	}
 
 	if (best_len < sig.bytes.size()) {
+		size_t old_size = sig.bytes.size();
 		std::vector<aob_byte_t> optimized(sig.bytes.begin() + best_start,
 										  sig.bytes.begin() + best_start + best_len);
 		sig.bytes = std::move(optimized);
 		sig.unique = true;
 		sig.uniqueness_count = 1;
 		sig.quality_score = compute_quality_score(sig);
+		diag::log_tagged_fmt("aob", "optimize_signature done from=%zu to=%zu start=%zu quality=%.2f",
+			old_size, best_len, best_start, static_cast<double>(sig.quality_score));
+	} else {
+		diag::log_tagged_fmt("aob", "optimize_signature no_improvement keep=%zu", sig.bytes.size());
 	}
 #else
 	(void)sig;
@@ -787,14 +856,23 @@ inline void export_signatures_json(const std::string& path)
 	}
 
 	std::ofstream f(path);
-	if (f.is_open()) f << arr.dump(2);
+	if (f.is_open()) {
+		f << arr.dump(2);
+		diag::log_tagged_fmt("aob", "export_signatures_json ok path='%s' count=%zu",
+			path.c_str(), arr.size());
+	} else {
+		diag::log_tagged_fmt("aob", "export_signatures_json failed path='%s'", path.c_str());
+	}
 }
 
 inline void export_signatures_header(const std::string& path)
 {
 	std::lock_guard<std::mutex> lk(g_state.mutex);
 	std::ofstream f(path);
-	if (!f.is_open()) return;
+	if (!f.is_open()) {
+		diag::log_tagged_fmt("aob", "export_signatures_header failed path='%s'", path.c_str());
+		return;
+	}
 
 	f << "#pragma once\n\n";
 	f << "#include <cstdint>\n\n";
@@ -816,32 +894,46 @@ inline void export_signatures_header(const std::string& path)
 	}
 
 	f << "\n}\n";
+	diag::log_tagged_fmt("aob", "export_signatures_header ok path='%s' count=%zu",
+		path.c_str(), g_state.saved_signatures.size());
 }
 
 inline void export_signatures_yara(const std::string& path)
 {
 	std::lock_guard<std::mutex> lk(g_state.mutex);
 	std::ofstream f(path);
-	if (!f.is_open()) return;
+	if (!f.is_open()) {
+		diag::log_tagged_fmt("aob", "export_signatures_yara failed path='%s'", path.c_str());
+		return;
+	}
 
 	for (auto& sig : g_state.saved_signatures) {
 		f << format_yara_rule(sig) << "\n";
 	}
+	diag::log_tagged_fmt("aob", "export_signatures_yara ok path='%s' count=%zu",
+		path.c_str(), g_state.saved_signatures.size());
 }
 
 inline void import_signatures_json(const std::string& path)
 {
 	std::ifstream f(path);
-	if (!f.is_open()) return;
+	if (!f.is_open()) {
+		diag::log_tagged_fmt("aob", "import_signatures_json failed_to_open path='%s'", path.c_str());
+		return;
+	}
 
 	nlohmann::json arr;
 	try {
 		f >> arr;
 	} catch (...) {
+		diag::log_tagged_fmt("aob", "import_signatures_json parse_failed path='%s'", path.c_str());
 		return;
 	}
 
-	if (!arr.is_array()) return;
+	if (!arr.is_array()) {
+		diag::log_tagged_fmt("aob", "import_signatures_json not_an_array path='%s'", path.c_str());
+		return;
+	}
 
 	std::lock_guard<std::mutex> lk(g_state.mutex);
 	for (auto& obj : arr) {
@@ -879,18 +971,31 @@ inline void import_signatures_json(const std::string& path)
 inline void save_signatures_to_disk()
 {
 	auto dir = get_aob_cache_dir();
-	if (dir.empty()) return;
-	std::filesystem::create_directories(dir);
-	export_signatures_json(dir + "\\saved.json");
+	if (dir.empty()) {
+		diag::log_tagged("aob", "save_signatures_to_disk no_appdata");
+		return;
+	}
+	std::error_code ec;
+	std::filesystem::create_directories(dir, ec);
+	std::string path = dir + "\\saved.json";
+	export_signatures_json(path);
 }
 
 inline void load_signatures_from_disk()
 {
 	auto dir = get_aob_cache_dir();
-	if (dir.empty()) return;
+	if (dir.empty()) {
+		diag::log_tagged("aob", "load_signatures_from_disk no_appdata");
+		return;
+	}
 	std::string path = dir + "\\saved.json";
-	if (!std::filesystem::exists(path)) return;
+	if (!std::filesystem::exists(path)) {
+		diag::log_tagged_fmt("aob", "load_signatures_from_disk missing path='%s'", path.c_str());
+		return;
+	}
 	import_signatures_json(path);
+	diag::log_tagged_fmt("aob", "load_signatures_from_disk loaded path='%s' total=%zu",
+		path.c_str(), g_state.saved_signatures.size());
 }
 
 struct comparison_result_t {
@@ -906,6 +1011,9 @@ inline std::vector<comparison_result_t> compare_signatures_against_process(
 {
 #ifdef AIDA_STANDALONE
 	std::vector<comparison_result_t> results;
+	auto t_start = std::chrono::steady_clock::now();
+	diag::log_tagged_fmt("aob", "compare_signatures_against_process start count=%zu pid=%u",
+		sigs.size(), driver_bridge::attached_pid());
 
 	auto regions = driver_bridge::enumerate_memory_regions(4096);
 	std::vector<uint8_t> all_data;
@@ -966,6 +1074,13 @@ inline std::vector<comparison_result_t> compare_signatures_against_process(
 		cr.still_found = (cr.match_count > 0);
 		results.push_back(cr);
 	}
+
+	auto t_end = std::chrono::steady_clock::now();
+	uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+	size_t still_found = 0;
+	for (auto& r : results) if (r.still_found) ++still_found;
+	diag::log_tagged_fmt("aob", "compare_signatures_against_process done total=%zu still_found=%zu duration_ms=%llu",
+		results.size(), still_found, static_cast<unsigned long long>(dur_ms));
 
 	return results;
 #else

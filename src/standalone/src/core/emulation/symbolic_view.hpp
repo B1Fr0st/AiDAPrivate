@@ -17,9 +17,11 @@
 #include "../ui/brand.hpp"
 #include "../ui/fonts.hpp"
 #include "../ui/toast_notification.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -99,8 +101,23 @@ inline void start_symbolic_exec(local_state_t& st) {
 	uint64_t end = st.end_addr_buf[0] ? std::strtoull(st.end_addr_buf, nullptr, 16) : 0;
 	auto regs = parse_reg_list(st.sym_regs_buf);
 
+	if (addr == 0) {
+		diag::log_tagged_fmt("symbolic", "start_symbolic_exec_reject reason=zero_entry_addr buf='%s'", st.addr_buf);
+		toast_notification::push("Enter a valid entry address (hex)",
+			toast_notification::toast_type_t::warning, 3.0f);
+		return;
+	}
+
+	diag::log_tagged_fmt("symbolic",
+		"start_symbolic_exec entry=0x%llX end=0x%llX max=%u regs=%zu",
+		static_cast<unsigned long long>(addr),
+		static_cast<unsigned long long>(end),
+		static_cast<uint32_t>(st.max_insns),
+		regs.size());
+
 	symbolic_engine::g_state.processing.store(true);
-	work_queue::post([addr, end, max_i = static_cast<uint32_t>(st.max_insns), regs]() {
+	auto t0 = std::chrono::steady_clock::now();
+	work_queue::post([addr, end, max_i = static_cast<uint32_t>(st.max_insns), regs, t0]() {
 		symbolic_engine::symbolic_result_t result;
 		try {
 			result = symbolic_engine::execute_symbolic(addr, end, max_i, regs, {});
@@ -111,6 +128,21 @@ inline void start_symbolic_exec(local_state_t& st) {
 			result.success = false;
 			result.error = "Symbolic execution aborted by unknown exception";
 		}
+		auto t1 = std::chrono::steady_clock::now();
+		auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+		if (result.success) {
+			diag::log_tagged_fmt("symbolic",
+				"symbolic_exec_done entry=0x%llX insns=%u tainted=%u opaque=%u const=%u duration_ms=%lld",
+				static_cast<unsigned long long>(addr),
+				result.total_instructions, result.tainted_count,
+				result.opaque_count, result.constants_count,
+				static_cast<long long>(dur));
+		} else {
+			diag::log_tagged_fmt("symbolic",
+				"symbolic_exec_fail entry=0x%llX error='%s' duration_ms=%lld",
+				static_cast<unsigned long long>(addr),
+				result.error.c_str(), static_cast<long long>(dur));
+		}
 		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
 		symbolic_engine::g_state.last_result = std::move(result);
 		symbolic_engine::g_state.processing.store(false);
@@ -120,8 +152,20 @@ inline void start_symbolic_exec(local_state_t& st) {
 inline void start_deobfuscate(local_state_t& st) {
 	uint64_t addr = std::strtoull(st.addr_buf, nullptr, 16);
 
+	if (addr == 0) {
+		diag::log_tagged_fmt("deobf", "start_deobfuscate_reject reason=zero_entry_addr buf='%s'", st.addr_buf);
+		toast_notification::push("Enter a valid function address (hex)",
+			toast_notification::toast_type_t::warning, 3.0f);
+		return;
+	}
+
+	diag::log_tagged_fmt("deobf",
+		"start_deobfuscate_from_symbolic entry=0x%llX max=%u",
+		static_cast<unsigned long long>(addr), static_cast<uint32_t>(st.max_insns));
+
 	deobfuscation_engine::g_state.processing.store(true);
-	work_queue::post([addr, max_i = static_cast<uint32_t>(st.max_insns)]() {
+	auto t0 = std::chrono::steady_clock::now();
+	work_queue::post([addr, max_i = static_cast<uint32_t>(st.max_insns), t0]() {
 		deobfuscation_engine::deobfuscated_result_t result;
 		try {
 			result = deobfuscation_engine::deobfuscate_function(addr, max_i);
@@ -131,6 +175,21 @@ inline void start_deobfuscate(local_state_t& st) {
 		} catch (...) {
 			result.success = false;
 			result.error = "Deobfuscation aborted by unknown exception";
+		}
+		auto t1 = std::chrono::steady_clock::now();
+		auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+		if (result.success) {
+			diag::log_tagged_fmt("deobf",
+				"deobfuscate_done entry=0x%llX original=%u clean=%u junk=%u opaques=%u const=%u states=%u duration_ms=%lld",
+				static_cast<unsigned long long>(addr),
+				result.total_original, result.total_clean, result.removed_junk,
+				result.opaque_predicates_found, result.constants_resolved,
+				result.dispatcher_states_resolved, static_cast<long long>(dur));
+		} else {
+			diag::log_tagged_fmt("deobf",
+				"deobfuscate_fail entry=0x%llX error='%s' duration_ms=%lld",
+				static_cast<unsigned long long>(addr), result.error.c_str(),
+				static_cast<long long>(dur));
 		}
 		std::lock_guard<std::mutex> lk(deobfuscation_engine::g_state.mutex);
 		deobfuscation_engine::g_state.last_result = std::move(result);
@@ -143,8 +202,28 @@ inline void start_slice(local_state_t& st) {
 	uint64_t end = st.end_addr_buf[0] ? std::strtoull(st.end_addr_buf, nullptr, 16) : 0;
 	std::string target(st.target_reg_buf);
 
+	if (addr == 0) {
+		diag::log_tagged_fmt("symbolic", "start_slice_reject reason=zero_entry_addr buf='%s'", st.addr_buf);
+		toast_notification::push("Enter a valid entry address (hex)",
+			toast_notification::toast_type_t::warning, 3.0f);
+		return;
+	}
+	if (target.empty()) {
+		diag::log_tagged("symbolic", "start_slice_reject reason=empty_target_reg");
+		toast_notification::push("Enter a target register (e.g. rax)",
+			toast_notification::toast_type_t::warning, 3.0f);
+		return;
+	}
+
+	diag::log_tagged_fmt("symbolic",
+		"start_slice entry=0x%llX end=0x%llX target='%s' max=%u",
+		static_cast<unsigned long long>(addr),
+		static_cast<unsigned long long>(end),
+		target.c_str(), static_cast<uint32_t>(st.max_insns));
+
 	symbolic_engine::g_state.processing.store(true);
-	work_queue::post([addr, end, max_i = static_cast<uint32_t>(st.max_insns), target]() {
+	auto t0 = std::chrono::steady_clock::now();
+	work_queue::post([addr, end, max_i = static_cast<uint32_t>(st.max_insns), target, t0]() {
 		symbolic_engine::slice_result_t result;
 		try {
 			result = symbolic_engine::slice_to_register(addr, end, max_i, target);
@@ -154,6 +233,20 @@ inline void start_slice(local_state_t& st) {
 		} catch (...) {
 			result.success = false;
 			result.error = "Slice aborted by unknown exception";
+		}
+		auto t1 = std::chrono::steady_clock::now();
+		auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+		if (result.success) {
+			diag::log_tagged_fmt("symbolic",
+				"slice_done entry=0x%llX target='%s' total=%u effective=%u removed=%u duration_ms=%lld",
+				static_cast<unsigned long long>(addr), target.c_str(),
+				result.total_instructions, result.effective_count, result.removed_count,
+				static_cast<long long>(dur));
+		} else {
+			diag::log_tagged_fmt("symbolic",
+				"slice_fail entry=0x%llX target='%s' error='%s' duration_ms=%lld",
+				static_cast<unsigned long long>(addr), target.c_str(),
+				result.error.c_str(), static_cast<long long>(dur));
 		}
 		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
 		symbolic_engine::g_state.last_slice = std::move(result);
@@ -166,8 +259,28 @@ inline void start_solve(local_state_t& st) {
 	uint64_t target = st.end_addr_buf[0] ? std::strtoull(st.end_addr_buf, nullptr, 16) : 0;
 	auto regs = parse_reg_list(st.sym_regs_buf);
 
+	if (addr == 0) {
+		diag::log_tagged_fmt("symbolic", "start_solve_reject reason=zero_entry_addr buf='%s'", st.addr_buf);
+		toast_notification::push("Enter a valid entry address (hex)",
+			toast_notification::toast_type_t::warning, 3.0f);
+		return;
+	}
+	if (target == 0) {
+		diag::log_tagged_fmt("symbolic", "start_solve_reject reason=zero_target_addr buf='%s'", st.end_addr_buf);
+		toast_notification::push("Enter a target address in 'End' field",
+			toast_notification::toast_type_t::warning, 3.0f);
+		return;
+	}
+
+	diag::log_tagged_fmt("symbolic",
+		"start_solve entry=0x%llX target=0x%llX max=%u regs=%zu",
+		static_cast<unsigned long long>(addr),
+		static_cast<unsigned long long>(target),
+		static_cast<uint32_t>(st.max_insns), regs.size());
+
 	symbolic_engine::g_state.processing.store(true);
-	work_queue::post([addr, target, max_i = static_cast<uint32_t>(st.max_insns), regs]() {
+	auto t0 = std::chrono::steady_clock::now();
+	work_queue::post([addr, target, max_i = static_cast<uint32_t>(st.max_insns), regs, t0]() {
 		symbolic_engine::solve_result_t result;
 		try {
 			result = symbolic_engine::solve_for_path(addr, target, max_i, regs);
@@ -177,6 +290,22 @@ inline void start_solve(local_state_t& st) {
 		} catch (...) {
 			result.success = false;
 			result.error = "Solver aborted by unknown exception";
+		}
+		auto t1 = std::chrono::steady_clock::now();
+		auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+		if (result.success) {
+			diag::log_tagged_fmt("symbolic",
+				"solve_done entry=0x%llX target=0x%llX sat=%d vars=%zu solve_ms=%u total_ms=%lld",
+				static_cast<unsigned long long>(addr),
+				static_cast<unsigned long long>(target),
+				result.satisfiable ? 1 : 0, result.variable_values.size(),
+				result.solving_time_ms, static_cast<long long>(dur));
+		} else {
+			diag::log_tagged_fmt("symbolic",
+				"solve_fail entry=0x%llX target=0x%llX error='%s' duration_ms=%lld",
+				static_cast<unsigned long long>(addr),
+				static_cast<unsigned long long>(target),
+				result.error.c_str(), static_cast<long long>(dur));
 		}
 		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
 		symbolic_engine::g_state.last_solve = std::move(result);

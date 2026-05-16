@@ -18,7 +18,9 @@
 
 #include "standalone_driver.hpp"
 #include "../analysis/pe_parser.hpp"
+#include "../infra/event_bus.hpp"
 #include "../../helpers/diag_log.hpp"
+#include "../../helpers/win32_dialog.hpp"
 
 
 struct mem_op_snapshot_t
@@ -278,15 +280,14 @@ namespace disasm
     inline std::string open_file_dialog(HWND owner)
     {
         char buf[MAX_PATH] = {};
-        OPENFILENAMEA ofn   = {};
-        ofn.lStructSize     = sizeof(ofn);
-        ofn.hwndOwner       = owner;
-        ofn.lpstrFile       = buf;
-        ofn.nMaxFile        = MAX_PATH;
-        ofn.lpstrFilter     = "PE Files\0*.exe;*.dll;*.sys\0All Files\0*.*\0\0";
-        ofn.nFilterIndex    = 1;
-        ofn.Flags           = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-        if (GetOpenFileNameA(&ofn))
+        static const char k_filter[] =
+            "PE Files (*.exe;*.dll;*.sys;*.bin)\0*.exe;*.dll;*.sys;*.bin\0"
+            "All files (*.*)\0*.*\0\0";
+        if (win32_dialog::show_open_file_dialog(owner,
+                "Open PE File",
+                k_filter,
+                buf, sizeof(buf),
+                "disasm::open_file_dialog"))
             return std::string(buf);
         return {};
     }
@@ -679,6 +680,14 @@ namespace disasm
         state.file.text_va    = state.live_view_addr;
         state.file.sections   = std::move(snapshot_sections);
         state.file.loaded     = true;
+
+        {
+            aida::events::binary_loaded_t payload;
+            payload.binary_path = state.file.path;
+            payload.image_base = base;
+            payload.image_size = (size > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(size);
+            aida::events::publish(aida::events::event_binary_loaded, payload);
+        }
 
         diag::log_tagged_critical("disasm", "start_live_pre_request_live_decode");
         request_live_decode(state);

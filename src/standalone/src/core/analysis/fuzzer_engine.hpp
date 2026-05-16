@@ -19,6 +19,7 @@
 #include "standalone_ai_client.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_settings.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -545,12 +546,23 @@ inline void start_fuzzing()
 		auto& cfg = g_state.config;
 		auto& stats = g_state.stats;
 
+		diag::log_tagged_fmt("fuzzer",
+			"worker_begin pid=%u tid=%u target=0x%llX input=0x%llX size=%d iters=%u",
+			cfg.pid, cfg.tid,
+			static_cast<unsigned long long>(cfg.target_address),
+			static_cast<unsigned long long>(cfg.input_address),
+			cfg.input_size, cfg.max_iterations);
+
 		std::mt19937 rng(static_cast<uint32_t>(
 			std::chrono::high_resolution_clock::now().time_since_epoch().count()));
 
 		std::vector<uint8_t> seed_input(static_cast<size_t>(cfg.input_size), 0);
 		if (cfg.input_address != 0) {
-			driver_bridge::read_memory(cfg.input_address, seed_input.size(), seed_input);
+			bool seed_ok = driver_bridge::read_memory(cfg.input_address, seed_input.size(), seed_input);
+			diag::log_tagged_fmt("fuzzer",
+				"seed_read addr=0x%llX size=%zu ok=%d",
+				static_cast<unsigned long long>(cfg.input_address),
+				seed_input.size(), seed_ok ? 1 : 0);
 		}
 
 		{
@@ -668,15 +680,26 @@ inline void start_fuzzing()
 				crash.crash_hash = detail::compute_crash_hash(crash.rip, crash.type);
 				crash.score = detail::compute_exploit_score(crash);
 
-				std::lock_guard<std::mutex> lk(g_state.mutex);
-				stats.total_crashes++;
-				g_state.crashes.push_back(crash);
+				bool is_unique = false;
+				{
+					std::lock_guard<std::mutex> lk(g_state.mutex);
+					stats.total_crashes++;
+					g_state.crashes.push_back(crash);
 
-				if (g_state.crash_hashes.find(crash.crash_hash) == g_state.crash_hashes.end()) {
-					g_state.crash_hashes.insert(crash.crash_hash);
-					stats.total_unique_crashes++;
-					g_state.unique_crashes.push_back(crash);
+					if (g_state.crash_hashes.find(crash.crash_hash) == g_state.crash_hashes.end()) {
+						g_state.crash_hashes.insert(crash.crash_hash);
+						stats.total_unique_crashes++;
+						g_state.unique_crashes.push_back(crash);
+						is_unique = true;
+					}
 				}
+				diag::log_tagged_fmt("fuzzer",
+					"crash type=%s score=%s rip=0x%llX unique=%d iter=%llu",
+					crash_type_name(crash.type),
+					exploit_score_name(crash.score),
+					static_cast<unsigned long long>(crash.rip),
+					is_unique ? 1 : 0,
+					static_cast<unsigned long long>(iter));
 			}
 
 			uint8_t trace_bitmap[65536] = {};
@@ -713,24 +736,53 @@ inline void start_fuzzing()
 			auto now = std::chrono::high_resolution_clock::now();
 			auto rate_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_rate_update).count();
 			if (rate_elapsed >= 1000) {
-				std::lock_guard<std::mutex> lk(g_state.mutex);
-				uint64_t execs_since = stats.total_executions - last_rate_execs;
-				stats.executions_per_second = (execs_since * 1000) / static_cast<uint64_t>(rate_elapsed);
-				stats.exec_rate_history.push_back(stats.executions_per_second);
-				if (stats.exec_rate_history.size() > 120) {
-					stats.exec_rate_history.erase(stats.exec_rate_history.begin());
+				uint64_t crashes_snap = 0, unique_snap = 0, eps_snap = 0;
+				uint32_t cov_snap = 0, corp_snap = 0;
+				{
+					std::lock_guard<std::mutex> lk(g_state.mutex);
+					uint64_t execs_since = stats.total_executions - last_rate_execs;
+					stats.executions_per_second = (execs_since * 1000) / static_cast<uint64_t>(rate_elapsed);
+					stats.exec_rate_history.push_back(stats.executions_per_second);
+					if (stats.exec_rate_history.size() > 120) {
+						stats.exec_rate_history.erase(stats.exec_rate_history.begin());
+					}
+					last_rate_execs = stats.total_executions;
+					last_rate_update = now;
+					stats.elapsed_seconds = std::chrono::duration<double>(now - start_time).count();
+					crashes_snap = stats.total_crashes;
+					unique_snap = stats.total_unique_crashes;
+					eps_snap = stats.executions_per_second;
+					cov_snap = stats.edge_coverage;
+					corp_snap = stats.corpus_size;
 				}
-				last_rate_execs = stats.total_executions;
-				last_rate_update = now;
-				stats.elapsed_seconds = std::chrono::duration<double>(now - start_time).count();
+				diag::log_tagged_fmt("fuzzer",
+					"progress iter=%llu eps=%llu crashes=%llu unique=%llu edges=%u corpus=%u",
+					static_cast<unsigned long long>(iter),
+					static_cast<unsigned long long>(eps_snap),
+					static_cast<unsigned long long>(crashes_snap),
+					static_cast<unsigned long long>(unique_snap),
+					cov_snap, corp_snap);
 			}
 		}
 
+		uint64_t final_execs = 0, final_crashes = 0, final_unique = 0;
+		double final_elapsed = 0.0;
 		{
 			auto now = std::chrono::high_resolution_clock::now();
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			stats.elapsed_seconds = std::chrono::duration<double>(now - start_time).count();
+			final_execs = stats.total_executions;
+			final_crashes = stats.total_crashes;
+			final_unique = stats.total_unique_crashes;
+			final_elapsed = stats.elapsed_seconds;
 		}
+
+		diag::log_tagged_fmt("fuzzer",
+			"worker_done execs=%llu crashes=%llu unique=%llu elapsed_s=%.1f cancelled=%d",
+			static_cast<unsigned long long>(final_execs),
+			static_cast<unsigned long long>(final_crashes),
+			static_cast<unsigned long long>(final_unique),
+			final_elapsed, g_state.cancel.load() ? 1 : 0);
 
 		g_state.running.store(false);
 	});
@@ -821,18 +873,31 @@ inline void ai_analyze_crash(int crash_index)
 
 		auto ai = std::make_unique<standalone_ai_client_t>(g_sa_settings);
 		if (!ai->is_available()) {
+			diag::log_tagged_fmt("fuzzer", "ai_analyze_unavailable crash_index=%d", crash_index);
 			g_state.analyzing_crash.store(false);
 			return;
 		}
 
+		diag::log_tagged_fmt("fuzzer",
+			"ai_analyze_request crash_index=%d rip=0x%llX prompt_bytes=%zu",
+			crash_index, static_cast<unsigned long long>(target_crash.rip),
+			prompt.size());
+
 		std::vector<std::pair<std::string, std::string>> history;
+		auto t_ai0 = std::chrono::steady_clock::now();
 		std::string result = ai->chat_blocking(prompt, history, nullptr, nullptr);
+		auto t_ai1 = std::chrono::steady_clock::now();
 
 		if (!result.empty()) {
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			if (crash_index < static_cast<int>(g_state.unique_crashes.size()))
 				g_state.unique_crashes[crash_index].ai_analysis = result;
 		}
+
+		diag::log_tagged_fmt("fuzzer",
+			"ai_analyze_done crash_index=%d result_bytes=%zu duration_ms=%lld",
+			crash_index, result.size(),
+			static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(t_ai1 - t_ai0).count()));
 
 		g_state.analyzing_crash.store(false);
 	});
@@ -925,6 +990,7 @@ inline void minimize_crash(int crash_index)
 				current[i] = orig;
 		}
 
+		size_t orig_size = target_crash.input.size();
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			if (crash_index < static_cast<int>(g_state.unique_crashes.size())) {
@@ -932,6 +998,11 @@ inline void minimize_crash(int crash_index)
 				g_state.unique_crashes[crash_index].is_minimized = true;
 			}
 		}
+
+		diag::log_tagged_fmt("fuzzer",
+			"minimize_done crash_index=%d original_bytes=%zu minimized_bytes=%zu cancelled=%d",
+			crash_index, orig_size, current.size(),
+			g_state.cancel.load() ? 1 : 0);
 
 		g_state.minimizing.store(false);
 	});
@@ -950,13 +1021,24 @@ inline std::string get_crash_export_dir()
 inline void export_crashes()
 {
 	std::string dir = get_crash_export_dir();
-	if (dir.empty()) return;
+	if (dir.empty()) {
+		diag::log_tagged("fuzzer", "export_fail reason=no_appdata");
+		return;
+	}
 
 	std::error_code ec;
 	std::filesystem::create_directories(dir, ec);
-	if (ec) return;
+	if (ec) {
+		diag::log_tagged_fmt("fuzzer",
+			"export_fail reason=mkdir_failed dir='%s' err='%s'",
+			dir.c_str(), ec.message().c_str());
+		return;
+	}
 
 	std::lock_guard<std::mutex> lk(g_state.mutex);
+	size_t written = g_state.unique_crashes.size();
+	diag::log_tagged_fmt("fuzzer",
+		"export_begin dir='%s' unique=%zu", dir.c_str(), written);
 	for (size_t i = 0; i < g_state.unique_crashes.size(); ++i) {
 		auto& crash = g_state.unique_crashes[i];
 
@@ -1003,18 +1085,28 @@ inline void export_crashes()
 
 		std::ofstream ofs(fname);
 		if (ofs.is_open()) ofs << j.dump(2);
+		else diag::log_tagged_fmt("fuzzer", "export_write_fail path='%s'", fname);
 	}
+	diag::log_tagged_fmt("fuzzer", "export_done unique=%zu dir='%s'", written, dir.c_str());
 }
 
 inline void import_crashes()
 {
 	std::string dir = get_crash_export_dir();
-	if (dir.empty()) return;
+	if (dir.empty()) {
+		diag::log_tagged("fuzzer", "import_fail reason=no_appdata");
+		return;
+	}
 
 	std::error_code ec;
-	if (!std::filesystem::exists(dir, ec)) return;
+	if (!std::filesystem::exists(dir, ec)) {
+		diag::log_tagged_fmt("fuzzer", "import_fail reason=dir_missing dir='%s'", dir.c_str());
+		return;
+	}
 
 	std::lock_guard<std::mutex> lk(g_state.mutex);
+	size_t loaded = 0;
+	size_t skipped = 0;
 
 	for (auto& entry : std::filesystem::directory_iterator(dir, ec)) {
 		if (ec) break;
@@ -1063,8 +1155,14 @@ inline void import_crashes()
 		if (g_state.crash_hashes.find(crash.crash_hash) == g_state.crash_hashes.end()) {
 			g_state.crash_hashes.insert(crash.crash_hash);
 			g_state.unique_crashes.push_back(std::move(crash));
+			++loaded;
+		} else {
+			++skipped;
 		}
 	}
+	diag::log_tagged_fmt("fuzzer",
+		"import_done dir='%s' loaded=%zu skipped_dupe=%zu",
+		dir.c_str(), loaded, skipped);
 }
 
 }

@@ -6,8 +6,7 @@
 namespace debugger_view {
 
 enum class sub_tab_t : int {
-	cpu = 0,
-	breakpoints,
+	breakpoints = 0,
 	memory_map,
 	call_stack,
 	threads,
@@ -32,8 +31,8 @@ struct list_panel_state_t {
 };
 
 struct toolbar_state_t {
-	aida::ui::hover_state_t hover[6];
-	aida::ui::press_state_t press[6];
+	aida::ui::hover_state_t hover[8];
+	aida::ui::press_state_t press[8];
 };
 
 struct tab_animator_t {
@@ -41,16 +40,9 @@ struct tab_animator_t {
 	aida::ui::transition_t slide;
 };
 
-struct register_cell_t {
-	float   change_anim = 0.f;
-	float   edge_intensity = 0.f;
-	uint64_t shown_value = 0;
-	uint64_t target_value = 0;
-};
-
 struct ui_state_t {
-	sub_tab_t active_tab = sub_tab_t::cpu;
-	sub_tab_t prev_tab   = sub_tab_t::cpu;
+	sub_tab_t active_tab = sub_tab_t::breakpoints;
+	sub_tab_t prev_tab   = sub_tab_t::breakpoints;
 
 	float tab_anim[static_cast<int>(sub_tab_t::COUNT)] = {};
 
@@ -63,17 +55,6 @@ struct ui_state_t {
 	float content_fade        = 1.f;
 
 	tab_animator_t tab_animator;
-
-	float disasm_scroll_y = 0.f;
-	float disasm_target_scroll_y = 0.f;
-	int   disasm_selected = -1;
-
-	float reg_scroll_y = 0.f;
-	float dump_scroll_y = 0.f;
-	float stack_scroll_y = 0.f;
-
-	uint64_t dump_address = 0;
-	char     dump_goto_buf[20] = {};
 
 	list_panel_state_t bp_panel;
 	list_panel_state_t callstack_panel;
@@ -102,13 +83,6 @@ struct ui_state_t {
 	char  string_filter[128] = {};
 	int   string_min_len = 4;
 
-	uint64_t prev_regs[32] = {};
-	float    reg_flash[32] = {};
-	register_cell_t reg_cells[32] = {};
-
-	uint64_t prev_rip = 0;
-	float    rip_flash = 0.f;
-
 	float panel_sep_phase = 0.f;
 	float empty_phase = 0.f;
 
@@ -133,10 +107,6 @@ struct ui_state_t {
 	char     add_bookmark_label_buf[64] = {};
 	char     trace_filter_buf[96] = {};
 
-	int      cpu_panel_mode = 0;
-
-	float    flag_flash[16] = {};
-	uint64_t prev_rflags = 0;
 };
 
 inline ui_state_t g_ui;

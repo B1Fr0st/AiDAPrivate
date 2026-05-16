@@ -3,6 +3,7 @@
 #include <algorithm>
 #include "work_queue.hpp"
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include "standalone_driver.hpp"
+#include "../helpers/diag_log.hpp"
 
 namespace pointer_scanner {
 
@@ -55,6 +57,9 @@ struct state_t {
 	std::atomic<bool>                                scanning{false};
 	std::atomic<float>                               scan_progress{0.f};
 	std::atomic<bool>                                scan_cancel{false};
+
+	std::atomic<bool>                                validating{false};
+	std::atomic<float>                               validate_progress{0.f};
 
 	scan_config_t                                    config;
 	std::vector<driver_bridge::module_info_t>         cached_modules;
@@ -193,14 +198,24 @@ inline void rscan(rscan_context_t& ctx, uint64_t value_to_find, int level)
 
 inline void build_reverse_map()
 {
-	if (g_state.map_building.load())
+	if (g_state.map_building.load()) {
+		diag::log_tagged("pointer_scan", "build_reverse_map refused already_building");
 		return;
+	}
+	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) {
+		diag::log_tagged_fmt("pointer_scan", "build_reverse_map refused not_attached driver_loaded=%d pid=%u",
+			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
+		return;
+	}
+	diag::log_tagged_fmt("pointer_scan", "build_reverse_map start pid=%u",
+		driver_bridge::attached_pid());
 
 	g_state.map_building.store(true);
 	g_state.map_cancel.store(false);
 	g_state.map_progress.store(0.f);
 
 	work_queue::post([]() {
+		auto t_start = std::chrono::steady_clock::now();
 		auto modules = driver_bridge::enumerate_modules();
 		auto regions = driver_bridge::enumerate_memory_regions(4096);
 
@@ -274,6 +289,8 @@ inline void build_reverse_map()
 			}
 		}
 
+		size_t module_count = modules.size();
+		size_t region_count = readable.size();
 		{
 			std::lock_guard<std::mutex> lk(g_state.map_mutex);
 			g_state.reverse_map = std::move(new_map);
@@ -281,27 +298,60 @@ inline void build_reverse_map()
 			g_state.cached_modules = std::move(modules);
 		}
 
+		auto t_end = std::chrono::steady_clock::now();
+		uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+		diag::log_tagged_fmt("pointer_scan", "build_reverse_map done entries=%zu modules=%zu regions=%zu bytes=%llu duration_ms=%llu cancelled=%d",
+			entry_count, module_count, region_count,
+			static_cast<unsigned long long>(total_bytes),
+			static_cast<unsigned long long>(dur_ms),
+			static_cast<int>(g_state.map_cancel.load()));
+
 		g_state.map_building.store(false);
 	});
 }
 
 inline void start_scan()
 {
-	if (g_state.scanning.load() || g_state.map_building.load())
+	if (g_state.scanning.load() || g_state.map_building.load()) {
+		diag::log_tagged_fmt("pointer_scan", "start_scan refused busy scanning=%d building=%d",
+			static_cast<int>(g_state.scanning.load()),
+			static_cast<int>(g_state.map_building.load()));
 		return;
+	}
 
 	{
 		std::lock_guard<std::mutex> lk(g_state.map_mutex);
-		if (g_state.reverse_map.empty()) return;
+		if (g_state.reverse_map.empty()) {
+			diag::log_tagged("pointer_scan", "start_scan refused map_empty");
+			return;
+		}
 	}
 
-	if (g_state.config.target_address == 0) return;
+	if (g_state.config.target_address == 0) {
+		diag::log_tagged("pointer_scan", "start_scan refused zero_target");
+		return;
+	}
+
+	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) {
+		diag::log_tagged_fmt("pointer_scan", "start_scan refused not_attached driver_loaded=%d pid=%u",
+			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
+		return;
+	}
+
+	diag::log_tagged_fmt("pointer_scan", "start_scan target=0x%llX depth=%d max_offset=%lld struct=%lld neg=%d static_only=%d",
+		static_cast<unsigned long long>(g_state.config.target_address),
+		g_state.config.max_depth,
+		static_cast<long long>(g_state.config.max_offset),
+		static_cast<long long>(g_state.config.struct_size),
+		static_cast<int>(g_state.config.negative_offsets),
+		static_cast<int>(g_state.config.only_static_bases));
 
 	g_state.scanning.store(true);
 	g_state.scan_cancel.store(false);
 	g_state.scan_progress.store(0.f);
 
 	work_queue::post([]() {
+		auto t_start = std::chrono::steady_clock::now();
 		std::vector<pointer_chain_t> results;
 		std::mutex results_mutex;
 
@@ -321,11 +371,20 @@ inline void start_scan()
 			return a.module_name < b.module_name;
 		});
 
+		size_t chain_count = results.size();
 		{
 			std::lock_guard<std::mutex> lk(g_state.results_mutex);
 			g_state.results = std::move(results);
 			g_state.selected_result = -1;
 		}
+
+		g_state.scan_progress.store(1.f);
+
+		auto t_end = std::chrono::steady_clock::now();
+		uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+		diag::log_tagged_fmt("pointer_scan", "start_scan done chains=%zu duration_ms=%llu cancelled=%d",
+			chain_count, static_cast<unsigned long long>(dur_ms),
+			static_cast<int>(g_state.scan_cancel.load()));
 
 		g_state.scanning.store(false);
 	});
@@ -368,10 +427,66 @@ inline bool validate_chain(const pointer_chain_t& chain)
 
 inline void validate_all_results()
 {
-	std::lock_guard<std::mutex> lk(g_state.results_mutex);
-	for (auto& chain : g_state.results) {
-		chain.validated = validate_chain(chain);
+	if (g_state.validating.load()) {
+		diag::log_tagged("pointer_scan", "validate_all_results refused already_validating");
+		return;
 	}
+	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) {
+		diag::log_tagged_fmt("pointer_scan", "validate_all_results refused not_attached driver_loaded=%d pid=%u",
+			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
+		return;
+	}
+
+	size_t pending = 0;
+	{
+		std::lock_guard<std::mutex> lk(g_state.results_mutex);
+		pending = g_state.results.size();
+	}
+	if (pending == 0) {
+		diag::log_tagged("pointer_scan", "validate_all_results no_results");
+		return;
+	}
+
+	diag::log_tagged_fmt("pointer_scan", "validate_all_results start pending=%zu", pending);
+
+	g_state.validating.store(true);
+	g_state.validate_progress.store(0.f);
+
+	work_queue::post([]() {
+		auto t_start = std::chrono::steady_clock::now();
+		std::vector<pointer_chain_t> work;
+		{
+			std::lock_guard<std::mutex> lk(g_state.results_mutex);
+			work = g_state.results;
+		}
+
+		size_t total = work.size();
+		size_t valid_count = 0;
+		for (size_t i = 0; i < work.size(); ++i) {
+			if (g_state.scan_cancel.load()) break;
+			work[i].validated = validate_chain(work[i]);
+			if (work[i].validated) ++valid_count;
+			if ((i & 0x3F) == 0 && total > 0)
+				g_state.validate_progress.store(static_cast<float>(i + 1) / static_cast<float>(total));
+		}
+
+		{
+			std::lock_guard<std::mutex> lk(g_state.results_mutex);
+			if (g_state.results.size() == work.size()) {
+				for (size_t i = 0; i < work.size(); ++i) {
+					g_state.results[i].validated = work[i].validated;
+				}
+			}
+		}
+
+		auto t_end = std::chrono::steady_clock::now();
+		uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+		diag::log_tagged_fmt("pointer_scan", "validate_all_results done total=%zu valid=%zu duration_ms=%llu",
+			total, valid_count, static_cast<unsigned long long>(dur_ms));
+
+		g_state.validate_progress.store(1.f);
+		g_state.validating.store(false);
+	});
 }
 
 inline std::string chain_to_string(const pointer_chain_t& chain)
@@ -471,6 +586,7 @@ inline std::string export_results_json()
 
 inline void cancel_all()
 {
+	diag::log_tagged("pointer_scan", "cancel_all signalled");
 	g_state.map_cancel.store(true);
 	g_state.scan_cancel.store(true);
 }
@@ -478,15 +594,19 @@ inline void cancel_all()
 inline void clear_results()
 {
 	std::lock_guard<std::mutex> lk(g_state.results_mutex);
+	size_t had = g_state.results.size();
 	g_state.results.clear();
 	g_state.selected_result = -1;
+	diag::log_tagged_fmt("pointer_scan", "clear_results cleared=%zu", had);
 }
 
 inline void clear_map()
 {
 	std::lock_guard<std::mutex> lk(g_state.map_mutex);
+	size_t had = g_state.map_entry_count;
 	g_state.reverse_map.clear();
 	g_state.map_entry_count = 0;
+	diag::log_tagged_fmt("pointer_scan", "clear_map cleared=%zu", had);
 }
 
 }

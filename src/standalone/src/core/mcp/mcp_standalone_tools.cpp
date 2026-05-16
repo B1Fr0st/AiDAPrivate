@@ -1294,6 +1294,9 @@ namespace mcp_standalone
         workflow_tools::register_workflow_tools(srv);
         scanner_tools::register_scanner_tools(srv);
         analysis_tools::register_analysis_tools(srv);
+        disasm_tools::register_disasm_tools(srv);
+        decompile_tools::register_decompile_tools(srv);
+        session_tools_ext::register_tools(srv);
 
 
         srv.register_tool({"reconstruct_source",

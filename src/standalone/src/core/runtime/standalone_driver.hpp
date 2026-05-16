@@ -306,6 +306,12 @@ namespace driver_bridge
     bool attach_by_name(const std::string& process_name);
     void detach();
 
+    bool attach_additional(uint32_t pid);
+    bool set_active_pid(uint32_t pid);
+    bool detach_one(uint32_t pid);
+    bool clear_active_pid();
+    std::vector<uint32_t> attached_pids();
+
     std::string status();
     std::string last_error();
     uint32_t attached_pid();
@@ -320,6 +326,15 @@ namespace driver_bridge
     bool read_memory(uint64_t address, size_t size, std::vector<uint8_t>& out);
     bool write_memory(uint64_t address, const std::vector<uint8_t>& data);
     bool read_string(uint64_t address, size_t max_length, std::string& out);
+
+    bool read_memory_for(uint32_t pid, uint64_t address, size_t size, std::vector<uint8_t>& out);
+    bool write_memory_for(uint32_t pid, uint64_t address, const std::vector<uint8_t>& data);
+    bool query_memory_for(uint32_t pid, uint64_t address, memory_region_t& region);
+    bool protect_memory_for(uint32_t pid, uint64_t address, uint64_t size, uint32_t new_protect, uint32_t* old_protect = nullptr);
+    std::vector<module_info_t>   enumerate_modules_for(uint32_t pid);
+    std::vector<thread_info_t>   enumerate_threads_for(uint32_t pid);
+    std::vector<memory_region_t> enumerate_memory_regions_for(uint32_t pid, size_t max_regions = 512);
+    bool read_peb_for(uint32_t pid, peb_info_t& out);
 
     bool read_kernel_memory(uint64_t address, size_t size, std::vector<uint8_t>& out);
     bool write_kernel_memory(uint64_t address, const std::vector<uint8_t>& data);

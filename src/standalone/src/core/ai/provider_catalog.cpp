@@ -1,8 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#define CPPHTTPLIB_OPENSSL_SUPPORT
 
 #include "provider_catalog.hpp"
+#include "../auth/auth_http.hpp"
 #include "../infra/work_queue.hpp"
 
 #include <windows.h>
@@ -21,7 +21,6 @@
 #include <thread>
 #include <vector>
 
-#include <httplib.h>
 #include <nlohmann/json.hpp>
 
 namespace aida {
@@ -286,46 +285,39 @@ bool fetch_and_cache(int timeout_ms)
 {
 	std::lock_guard<std::mutex> lk(s_mtx);
 
-	httplib::Client client("https://models.dev");
-	client.set_address_family(AF_INET);
-	const int connect_secs = (timeout_ms / 1000) > 0 ? (timeout_ms / 1000) : 5;
-	const int read_secs = (timeout_ms / 1000) > 0 ? (timeout_ms / 1000) : 10;
-	client.set_connection_timeout(connect_secs);
-	client.set_read_timeout(read_secs);
-	client.set_write_timeout(connect_secs);
-	client.set_keep_alive(false);
-	client.set_decompress(true);
-	client.set_follow_location(true);
-	client.enable_server_certificate_verification(true);
+	const int timeout_secs = (timeout_ms / 1000) > 0 ? (timeout_ms / 1000) : 14;
 
-	httplib::Headers headers = {
-		{ "User-Agent", "AiDAStandalone/1.0" },
-		{ "Accept", "application/json" },
-	};
+	aida::auth::http::header_list_t headers;
+	headers.emplace_back("User-Agent", "AiDAStandalone/1.0");
+	headers.emplace_back("Accept", "application/json");
 
-	auto res = client.Get("/api.json", headers);
-	if (!res) {
-		const auto err = res.error();
+	aida::auth::http::response_t res = aida::auth::http::get(
+		std::string("https://models.dev/api.json"), headers, timeout_secs);
+
+	if (!res.ok && res.status == 0) {
 		std::ostringstream oss;
-		oss << "models.dev unreachable: " << httplib::to_string(err);
+		oss << "models.dev unreachable: "
+			<< (res.error.empty() ? std::string("transport error") : res.error);
 		set_error(oss.str());
 		return false;
 	}
-	if (res->status < 200 || res->status >= 300) {
+	if (res.status < 200 || res.status >= 300) {
 		std::ostringstream oss;
-		oss << "models.dev returned HTTP " << res->status;
+		oss << "models.dev returned HTTP " << res.status;
+		if (!res.error.empty())
+			oss << " (" << res.error << ")";
 		set_error(oss.str());
 		return false;
 	}
-	if (res->body.empty()) {
+	if (res.body.empty()) {
 		set_error("models.dev returned empty body");
 		return false;
 	}
 
-	if (!parse_and_replace(res->body))
+	if (!parse_and_replace(res.body))
 		return false;
 
-	if (!write_cache_file(res->body)) {
+	if (!write_cache_file(res.body)) {
 		set_error("failed to write models cache file");
 		return true;
 	}

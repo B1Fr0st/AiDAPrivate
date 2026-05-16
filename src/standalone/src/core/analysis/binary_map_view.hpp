@@ -3,8 +3,10 @@
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 
+#include "../../helpers/diag_log.hpp"
 #include "../helpers/globals.h"
 #include "binary_map.hpp"
+#include "../editor/hex_view.hpp"
 #include "disasm_view.hpp"
 #include "event_bus.hpp"
 #include "toast_notification.hpp"
@@ -15,8 +17,11 @@
 #include "ui/components.hpp"
 #include "ui/blur_layer.hpp"
 #include "ui/empty_state.hpp"
+#include "ui/no_target_overlay.hpp"
 #include "ui/skeleton.hpp"
 #include "ui/fonts.hpp"
+#include "work_queue.hpp"
+#include "../session/analysis_session.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -191,29 +196,73 @@ namespace binary_map_view {
 
 		inline void perform_refresh(view_state_t& s)
 		{
-			if (s.refreshing.exchange(true)) return;
+			if (s.refreshing.exchange(true)) {
+				diag::log_tagged_fmt("binary_map",
+					"refresh SKIPPED already_in_flight");
+				return;
+			}
 
-			binary_map::clear_cache();
-
-			binary_map::map_t fresh;
 			binary_map::map_options_t opts_copy;
 			{
 				std::lock_guard<std::mutex> g(s.mutex);
 				opts_copy = s.opts;
 			}
 
-			const bool ok = binary_map::generate(opts_copy, fresh);
+			diag::log_tagged_fmt("binary_map",
+				"refresh START max_functions=%d max_globals=%d max_callees=%d imp=%d exp=%d",
+				opts_copy.max_functions, opts_copy.max_globals,
+				opts_copy.max_callees_per_function,
+				opts_copy.include_imports ? 1 : 0,
+				opts_copy.include_exports ? 1 : 0);
 
-			std::lock_guard<std::mutex> g(s.mutex);
-			if (ok) {
-				s.map = std::move(fresh);
-				s.has_map.store(true);
-				s.last_error.clear();
-				rebuild_text_locked(s);
-			} else {
-				s.last_error = binary_map::last_error();
+			const bool posted = work_queue::post([&s, opts_copy]() {
+				binary_map::clear_cache();
+
+				binary_map::map_t fresh;
+				const bool ok = binary_map::generate(opts_copy, fresh);
+				std::string err_copy;
+				if (!ok) err_copy = binary_map::last_error();
+
+				size_t f = 0, g_count = 0, i = 0, e = 0, sec = 0;
+				std::string mod;
+				if (ok) {
+					f = fresh.functions.size();
+					g_count = fresh.globals.size();
+					i = fresh.imports.size();
+					e = fresh.exports.size();
+					sec = fresh.sections.size();
+					mod = fresh.module_name;
+				}
+
+				{
+					std::lock_guard<std::mutex> g(s.mutex);
+					if (ok) {
+						s.map = std::move(fresh);
+						s.has_map.store(true);
+						s.last_error.clear();
+						rebuild_text_locked(s);
+					} else {
+						s.last_error = std::move(err_copy);
+					}
+				}
+				s.refreshing.store(false);
+
+				if (ok) {
+					diag::log_tagged_fmt("binary_map",
+						"refresh DONE module='%s' sections=%zu funcs=%zu globals=%zu imports=%zu exports=%zu",
+						mod.c_str(), sec, f, g_count, i, e);
+				} else {
+					diag::log_tagged_fmt("binary_map",
+						"refresh FAILED err='%s'",
+						s.last_error.c_str());
+				}
+			});
+
+			if (!posted) {
+				s.refreshing.store(false);
+				diag::log_tagged_fmt("binary_map",
+					"refresh FAILED post rejected by work_queue");
 			}
-			s.refreshing.store(false);
 		}
 
 		inline void ensure_subscription(view_state_t& s)
@@ -221,17 +270,54 @@ namespace binary_map_view {
 			if (s.subscription.valid()) return;
 			s.subscription = aida::events::subscribe(
 				aida::events::event_binary_loaded,
-				[](const aida::events::binary_loaded_t&)
+				[](const aida::events::binary_loaded_t& payload)
 				{
-					state().refresh_requested.store(true);
+					view_state_t& vs = state();
+					vs.refresh_requested.store(true);
+					vs.auto_refreshed_once = false;
+					{
+						std::lock_guard<std::mutex> g(vs.mutex);
+						vs.collapsed_groups.clear();
+						vs.expanded_imports.clear();
+						vs.rendered_text.clear();
+						vs.fn_pulses.clear();
+					}
+					vs.selected_va.store(0);
+					vs.hover_function_va = 0;
+					diag::log_tagged_fmt("binary_map",
+						"event_binary_loaded path='%s' image_base=0x%llX -> refresh_requested",
+						payload.binary_path.c_str(),
+						static_cast<unsigned long long>(payload.image_base));
 				});
 		}
 
 		inline void jump_to_address(uint64_t va)
 		{
-			if (va == 0) return;
+			if (va == 0) {
+				diag::log_tagged_fmt("binary_map",
+					"jump_to_address SKIPPED va=0x0");
+				return;
+			}
 			globals::ui::active_center_view = center_view_t::disassembly;
 			disasm_view::goto_address(va, g_disasm);
+			diag::log_tagged_fmt("binary_map",
+				"jump_to_disasm va=0x%llX",
+				static_cast<unsigned long long>(va));
+		}
+
+		inline void jump_to_hex(uint64_t va, size_t size)
+		{
+			if (va == 0) {
+				diag::log_tagged_fmt("binary_map",
+					"jump_to_hex SKIPPED va=0x0");
+				return;
+			}
+			if (size == 0) size = 0x200;
+			hex_view::read_from_process(va, size);
+			globals::ui::active_center_view = center_view_t::hex_view;
+			diag::log_tagged_fmt("binary_map",
+				"jump_to_hex va=0x%llX size=%zu",
+				static_cast<unsigned long long>(va), size);
 		}
 
 		inline std::string make_function_chat_payload(const binary_map::map_function_t& f)
@@ -374,7 +460,22 @@ namespace binary_map_view {
 					ImGui::PopStyleVar();
 				}
 				if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+					diag::log_tagged_fmt("binary_map",
+						"section_strip_click name='%s' va=0x%llX size=%llu perm=%s",
+						s.name.c_str(),
+						static_cast<unsigned long long>(s.va),
+						static_cast<unsigned long long>(s.size),
+						section_perm_string(s).c_str());
 					detail::jump_to_address(s.va);
+				}
+				if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+					diag::log_tagged_fmt("binary_map",
+						"section_strip_right_click name='%s' va=0x%llX",
+						s.name.c_str(),
+						static_cast<unsigned long long>(s.va));
+					ImGui::SetClipboardText(s.name.c_str());
+					toast_notification::push("Section name copied to clipboard",
+						toast_notification::toast_type_t::info, 2.5f);
 				}
 				ImGui::PopID();
 
@@ -467,8 +568,15 @@ namespace binary_map_view {
 				if (entrance > 1.f) entrance = 1.f;
 				float scale = 0.7f + 0.3f * aida::motion::ease::out_back(entrance);
 
-				ImVec2 mp = ImGui::GetMousePos();
-				bool hovered = (mp.x >= ax && mp.x < ax + cell_size && mp.y >= ay && mp.y < ay + cell_size);
+				ImGui::SetCursorScreenPos(ImVec2(ax, ay));
+				ImGui::PushID(static_cast<int>(0x10000000 | i));
+				ImGui::InvisibleButton("##bm_heat_cell", ImVec2(cell_size, cell_size));
+				const bool hovered = ImGui::IsItemHovered();
+				const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+				const bool double_clicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)
+					&& ImGui::IsItemHovered();
+				const bool right_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+				ImGui::PopID();
 
 				bool selected = (selected_va == fn.va) && (fn.va != 0);
 				ImU32 fill = heatmap_color(fn.xref_count, max_xrefs, alpha * entrance);
@@ -501,6 +609,7 @@ namespace binary_map_view {
 
 				if (hovered) {
 					vs.hover_function_va = fn.va;
+					const ImVec2 mp = ImGui::GetMousePos();
 					ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f, 6.f));
 					ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(t.bg_overlay));
 					ImGui::SetNextWindowPos(ImVec2(mp.x + 14.f, mp.y + 14.f));
@@ -524,12 +633,28 @@ namespace binary_map_view {
 					ImGui::End();
 					ImGui::PopStyleColor();
 					ImGui::PopStyleVar();
-					if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-						vs.selected_va.store(fn.va);
-					}
-					if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-						jump_to_address(fn.va);
-					}
+				}
+				if (clicked) {
+					vs.selected_va.store(fn.va);
+					diag::log_tagged_fmt("binary_map",
+						"heatmap_select name='%s' va=0x%llX xrefs=%d callees=%d",
+						fn.name.c_str(),
+						static_cast<unsigned long long>(fn.va),
+						fn.xref_count, fn.callee_count);
+				}
+				if (double_clicked) {
+					diag::log_tagged_fmt("binary_map",
+						"heatmap_double_click name='%s' va=0x%llX",
+						fn.name.c_str(),
+						static_cast<unsigned long long>(fn.va));
+					jump_to_address(fn.va);
+				}
+				if (right_clicked) {
+					diag::log_tagged_fmt("binary_map",
+						"heatmap_right_click name='%s' va=0x%llX",
+						fn.name.c_str(),
+						static_cast<unsigned long long>(fn.va));
+					vs.selected_va.store(fn.va);
 				}
 			}
 		}
@@ -630,6 +755,10 @@ namespace binary_map_view {
 		s.opts.include_exports = true;
 		detail::ensure_subscription(s);
 		s.initialized = true;
+		diag::log_tagged_fmt("binary_map",
+			"view_initialize max_functions=%d max_globals=%d max_chars=%zu include_imp=%d include_exp=%d",
+			s.opts.max_functions, s.opts.max_globals, s.opts.max_chars,
+			s.opts.include_imports ? 1 : 0, s.opts.include_exports ? 1 : 0);
 	}
 
 	inline void shutdown()
@@ -677,6 +806,16 @@ namespace binary_map_view {
 
 		ImGui::BeginChild("##binary_map_view", ImVec2(w, h), false,
 			ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
+
+		if (!analysis_session::has_active_target()) {
+			ImVec2 wp = ImGui::GetWindowPos();
+			aida::ui::no_target_overlay::render(wp, ImVec2(w, h),
+				"No binary open",
+				"The Binary Map shows functions, imports, exports and section layout. Open a file, attach to a running process, or launch a binary to begin.",
+				a, aida::ui::empty_state::glyph_t::binary_file);
+			ImGui::EndChild();
+			return;
+		}
 
 		ImDrawList* dl = ImGui::GetWindowDrawList();
 		ImVec2 wp = ImGui::GetWindowPos();
@@ -805,7 +944,12 @@ namespace binary_map_view {
 			aida::ui::size_t_::md,
 			ImVec2(btn_w, btn_h),
 			refreshing, nullptr, refreshing)) {
-			if (!refreshing) s.refresh_requested.store(true);
+			if (!refreshing) {
+				diag::log_tagged_fmt("binary_map",
+					"toolbar refresh_clicked module='%s'",
+					module_name.c_str());
+				s.refresh_requested.store(true);
+			}
 		}
 
 		ImGui::SetCursorScreenPos(ImVec2(btn_right_anchor - btn_w * 2.f - btn_gap, btn_y));
@@ -817,7 +961,15 @@ namespace binary_map_view {
 				if (s.rendered_text.empty()) detail::rebuild_text_locked(s);
 				payload = s.rendered_text;
 			}
-			detail::inject_to_chat(payload);
+			diag::log_tagged_fmt("binary_map",
+				"toolbar to_chat bytes=%zu module='%s'",
+				payload.size(), module_name.c_str());
+			if (payload.empty()) {
+				toast_notification::push("Binary map is empty; refresh first",
+					toast_notification::toast_type_t::warning, 3.0f);
+			} else {
+				detail::inject_to_chat(payload);
+			}
 		}
 
 		ImGui::SetCursorScreenPos(ImVec2(btn_right_anchor - btn_w * 3.f - btn_gap * 2.f, btn_y));
@@ -829,6 +981,9 @@ namespace binary_map_view {
 				if (s.rendered_text.empty()) detail::rebuild_text_locked(s);
 				payload = s.rendered_text;
 			}
+			diag::log_tagged_fmt("binary_map",
+				"toolbar copy bytes=%zu module='%s'",
+				payload.size(), module_name.c_str());
 			ImGui::SetClipboardText(payload.c_str());
 			toast_notification::push("Binary map copied to clipboard",
 				toast_notification::toast_type_t::info, 3.0f);
@@ -848,16 +1003,23 @@ namespace binary_map_view {
 		ImGui::SetCursorScreenPos(ImVec2(split_x - 4.f, content_y));
 		ImGui::InvisibleButton("##bm_splitter", ImVec2(8.f, content_h));
 		bool splitter_hov = ImGui::IsItemHovered();
+		bool splitter_active = ImGui::IsItemActive();
+		bool splitter_released = ImGui::IsItemDeactivated();
 		if (splitter_hov) {
 			ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 			splitter_target = 1.f;
 		}
-		if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+		if (splitter_active && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
 			float dx = ImGui::GetIO().MouseDelta.x;
 			float new_left = left_w + dx;
 			if (new_left >= min_left && new_left <= w - 280.f)
 				s.left_split = new_left / std::max(1.f, w);
 			splitter_target = 1.f;
+		}
+		if (splitter_released) {
+			diag::log_tagged_fmt("binary_map",
+				"splitter_release left_split=%.3f left_w=%.1f total_w=%.1f",
+				s.left_split, left_w, w);
 		}
 		s.splitter_hover_v = aida::motion::smooth_lerp(s.splitter_hover_v, splitter_target, 16.f, dt);
 
@@ -887,6 +1049,7 @@ namespace binary_map_view {
 		std::vector<binary_map::map_global_t> globals_copy;
 		std::vector<std::string> imports_copy;
 		std::vector<std::string> exports_copy;
+		std::string last_error_copy;
 		{
 			std::lock_guard<std::mutex> g(s.mutex);
 			sections_copy = s.map.sections;
@@ -894,6 +1057,7 @@ namespace binary_map_view {
 			globals_copy   = s.map.globals;
 			imports_copy   = s.map.imports;
 			exports_copy   = s.map.exports;
+			last_error_copy = s.last_error;
 		}
 		detail::render_section_strip(dl, ImVec2(panel_x, strip_top), panel_w,
 			sections_copy, image_size, a, s.row_anim_time);
@@ -959,6 +1123,9 @@ namespace binary_map_view {
 				if (s.rendered_text.empty()) detail::rebuild_text_locked(s);
 				payload = s.rendered_text;
 			}
+			diag::log_tagged_fmt("binary_map",
+				"preview copy bytes=%zu module='%s'",
+				payload.size(), module_name.c_str());
 			ImGui::SetClipboardText(payload.c_str());
 			toast_notification::push("Preview copied to clipboard",
 				toast_notification::toast_type_t::info, 3.0f);
@@ -1021,6 +1188,9 @@ namespace binary_map_view {
 				aida::ui::with_alpha(t.text_primary, a), hbuf);
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 				detail::toggle_group(s, key);
+				diag::log_tagged_fmt("binary_map",
+					"group_toggle key='%s' now_collapsed=%d",
+					key.c_str(), (!collapsed) ? 1 : 0);
 			}
 			ImGui::Dummy(ImVec2(row_w, row_h + 6.f));
 			return !collapsed;
@@ -1040,7 +1210,13 @@ namespace binary_map_view {
 				ImVec2 cp = ImGui::GetCursorScreenPos();
 				float row_w = ImGui::GetContentRegionAvail().x;
 				float row_h = 28.f;
-				bool hov = ImGui::IsMouseHoveringRect(cp, ImVec2(cp.x + row_w, cp.y + row_h), true);
+				ImGui::PushID(static_cast<int>(0x30000000 | idx));
+				ImGui::InvisibleButton("##bm_sec_row", ImVec2(row_w, row_h));
+				bool hov = ImGui::IsItemHovered();
+				bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+				bool right_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+				bool double_clicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)
+					&& ImGui::IsItemHovered();
 				if (hov) {
 					dl->AddRectFilled(cp, ImVec2(cp.x + row_w, cp.y + row_h),
 						aida::ui::with_alpha(t.hover_wash, a), 4.f);
@@ -1066,7 +1242,59 @@ namespace binary_map_view {
 				dl->AddText(sec_perm_font, sec_perm_fs,
 					ImVec2(cp.x + row_w - perm_sz.x - 12.f, perm_y),
 					aida::ui::with_alpha(t.text_dim, a), p.c_str());
-				ImGui::Dummy(ImVec2(row_w, row_h));
+				if (clicked) {
+					diag::log_tagged_fmt("binary_map",
+						"section_row_click name='%s' va=0x%llX size=%llu perm=%s",
+						sec.name.c_str(),
+						static_cast<unsigned long long>(sec.va),
+						static_cast<unsigned long long>(sec.size),
+						p.c_str());
+					detail::jump_to_address(sec.va);
+				}
+				if (double_clicked) {
+					diag::log_tagged_fmt("binary_map",
+						"section_row_double_click name='%s' va=0x%llX (jump_to_hex)",
+						sec.name.c_str(),
+						static_cast<unsigned long long>(sec.va));
+					detail::jump_to_hex(sec.va, static_cast<size_t>(sec.size));
+				}
+				if (right_clicked) {
+					ImGui::OpenPopup("##bm_sec_ctx");
+				}
+				if (ImGui::BeginPopup("##bm_sec_ctx")) {
+					if (ImGui::MenuItem("Jump to disassembly")) {
+						diag::log_tagged_fmt("binary_map",
+							"section_ctx jump_to_disasm name='%s' va=0x%llX",
+							sec.name.c_str(),
+							static_cast<unsigned long long>(sec.va));
+						const uint64_t va_local = sec.va;
+						ImGui::CloseCurrentPopup();
+						detail::jump_to_address(va_local);
+					}
+					if (ImGui::MenuItem("Open in hex view")) {
+						diag::log_tagged_fmt("binary_map",
+							"section_ctx jump_to_hex name='%s' va=0x%llX size=%llu",
+							sec.name.c_str(),
+							static_cast<unsigned long long>(sec.va),
+							static_cast<unsigned long long>(sec.size));
+						const uint64_t va_local = sec.va;
+						const size_t sz_local = static_cast<size_t>(sec.size);
+						ImGui::CloseCurrentPopup();
+						detail::jump_to_hex(va_local, sz_local);
+					}
+					if (ImGui::MenuItem("Copy section name")) {
+						ImGui::SetClipboardText(sec.name.c_str());
+						toast_notification::push("Section name copied",
+							toast_notification::toast_type_t::info, 2.0f);
+					}
+					if (ImGui::MenuItem("Copy section VA")) {
+						ImGui::SetClipboardText(addr_buf);
+						toast_notification::push("Section VA copied",
+							toast_notification::toast_type_t::info, 2.0f);
+					}
+					ImGui::EndPopup();
+				}
+				ImGui::PopID();
 				++idx;
 			}
 		}
@@ -1115,10 +1343,17 @@ namespace binary_map_view {
 				ImGui::SetCursorScreenPos(ImVec2(cp.x + 4.f, cp.y));
 				ImGui::PushID(static_cast<int>(idx));
 				if (ImGui::InvisibleButton("##bm_pin_btn", ImVec2(24.f, row_h))) {
-					if (fn.pinned) binary_map::unpin_function(fn.va);
-					else           binary_map::pin_function(fn.va);
+					const bool was_pinned = fn.pinned;
+					if (was_pinned) binary_map::unpin_function(fn.va);
+					else            binary_map::pin_function(fn.va);
 					flash.trigger();
 					refresh_after_pin = true;
+					diag::log_tagged_fmt("binary_map",
+						"pin_btn_click name='%s' va=0x%llX was_pinned=%d action=%s",
+						fn.name.c_str(),
+						static_cast<unsigned long long>(fn.va),
+						was_pinned ? 1 : 0,
+						was_pinned ? "unpin" : "pin");
 				}
 				ImGui::PopID();
 
@@ -1163,30 +1398,81 @@ namespace binary_map_view {
 				ImGui::InvisibleButton("##bm_fn_row", ImVec2(row_w - 30.f, row_h));
 				if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
 					s.selected_va.store(fn.va);
+					diag::log_tagged_fmt("binary_map",
+						"function_row_click name='%s' va=0x%llX xrefs=%d callees=%d pinned=%d",
+						fn.name.c_str(),
+						static_cast<unsigned long long>(fn.va),
+						fn.xref_count, fn.callee_count,
+						fn.pinned ? 1 : 0);
 				}
 				if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
 					s.ctx_target.store(idx);
 					s.ctx_va = fn.va;
+					diag::log_tagged_fmt("binary_map",
+						"function_row_right_click name='%s' va=0x%llX",
+						fn.name.c_str(),
+						static_cast<unsigned long long>(fn.va));
 					ImGui::OpenPopup("##bm_fn_ctx");
 				}
 				if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && ImGui::IsItemHovered()) {
+					diag::log_tagged_fmt("binary_map",
+						"function_row_double_click name='%s' va=0x%llX",
+						fn.name.c_str(),
+						static_cast<unsigned long long>(fn.va));
 					detail::jump_to_address(fn.va);
 				}
 				if (ImGui::BeginPopup("##bm_fn_ctx")) {
 					if (ImGui::MenuItem("Copy summary to chat")) {
 						std::string payload = detail::make_function_chat_payload(fn);
+						diag::log_tagged_fmt("binary_map",
+							"function_ctx copy_to_chat name='%s' va=0x%llX bytes=%zu",
+							fn.name.c_str(),
+							static_cast<unsigned long long>(fn.va),
+							payload.size());
 						detail::inject_to_chat(payload);
 					}
 					if (ImGui::MenuItem(fn.pinned ? "Unpin" : "Pin")) {
-						if (fn.pinned) binary_map::unpin_function(fn.va);
-						else           binary_map::pin_function(fn.va);
+						const bool was_pinned = fn.pinned;
+						if (was_pinned) binary_map::unpin_function(fn.va);
+						else            binary_map::pin_function(fn.va);
 						flash.trigger();
 						refresh_after_pin = true;
+						diag::log_tagged_fmt("binary_map",
+							"function_ctx pin_toggle name='%s' va=0x%llX was_pinned=%d",
+							fn.name.c_str(),
+							static_cast<unsigned long long>(fn.va),
+							was_pinned ? 1 : 0);
 					}
-					if (ImGui::MenuItem("Jump to address")) {
+					if (ImGui::MenuItem("Jump to disassembly")) {
 						const uint64_t va = fn.va;
+						diag::log_tagged_fmt("binary_map",
+							"function_ctx jump_to_disasm name='%s' va=0x%llX",
+							fn.name.c_str(),
+							static_cast<unsigned long long>(va));
 						ImGui::CloseCurrentPopup();
 						detail::jump_to_address(va);
+					}
+					if (ImGui::MenuItem("Open in hex view")) {
+						const uint64_t va = fn.va;
+						diag::log_tagged_fmt("binary_map",
+							"function_ctx jump_to_hex name='%s' va=0x%llX",
+							fn.name.c_str(),
+							static_cast<unsigned long long>(va));
+						ImGui::CloseCurrentPopup();
+						detail::jump_to_hex(va, 0x400);
+					}
+					if (ImGui::MenuItem("Copy VA")) {
+						char buf[32];
+						std::snprintf(buf, sizeof(buf), "0x%llX",
+							static_cast<unsigned long long>(fn.va));
+						ImGui::SetClipboardText(buf);
+						toast_notification::push("Function VA copied",
+							toast_notification::toast_type_t::info, 2.0f);
+					}
+					if (ImGui::MenuItem("Copy name")) {
+						ImGui::SetClipboardText(fn.name.c_str());
+						toast_notification::push("Function name copied",
+							toast_notification::toast_type_t::info, 2.0f);
 					}
 					ImGui::EndPopup();
 				}
@@ -1248,18 +1534,68 @@ namespace binary_map_view {
 				ImGui::SetCursorScreenPos(cp);
 				ImGui::PushID(static_cast<int>(0x50000000 | idx));
 				ImGui::InvisibleButton("##bm_gl_row", ImVec2(row_w, row_h));
+				if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+					diag::log_tagged_fmt("binary_map",
+						"global_row_click name='%s' va=0x%llX xrefs=%d writable=%d",
+						gl.name.c_str(),
+						static_cast<unsigned long long>(gl.va),
+						gl.xref_count,
+						gl.writable ? 1 : 0);
+					detail::jump_to_hex(gl.va, 0x200);
+				}
+				if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && ImGui::IsItemHovered()) {
+					diag::log_tagged_fmt("binary_map",
+						"global_row_double_click name='%s' va=0x%llX",
+						gl.name.c_str(),
+						static_cast<unsigned long long>(gl.va));
+					detail::jump_to_address(gl.va);
+				}
 				if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+					diag::log_tagged_fmt("binary_map",
+						"global_row_right_click name='%s' va=0x%llX",
+						gl.name.c_str(),
+						static_cast<unsigned long long>(gl.va));
 					ImGui::OpenPopup("##bm_gl_ctx");
 				}
 				if (ImGui::BeginPopup("##bm_gl_ctx")) {
 					if (ImGui::MenuItem("Copy summary to chat")) {
 						std::string payload = detail::make_global_chat_payload(gl);
+						diag::log_tagged_fmt("binary_map",
+							"global_ctx copy_to_chat name='%s' va=0x%llX",
+							gl.name.c_str(),
+							static_cast<unsigned long long>(gl.va));
 						detail::inject_to_chat(payload);
 					}
-					if (ImGui::MenuItem("Jump to address")) {
+					if (ImGui::MenuItem("Open in hex view")) {
 						const uint64_t va = gl.va;
+						diag::log_tagged_fmt("binary_map",
+							"global_ctx jump_to_hex name='%s' va=0x%llX",
+							gl.name.c_str(),
+							static_cast<unsigned long long>(va));
+						ImGui::CloseCurrentPopup();
+						detail::jump_to_hex(va, 0x200);
+					}
+					if (ImGui::MenuItem("Jump to disassembly")) {
+						const uint64_t va = gl.va;
+						diag::log_tagged_fmt("binary_map",
+							"global_ctx jump_to_disasm name='%s' va=0x%llX",
+							gl.name.c_str(),
+							static_cast<unsigned long long>(va));
 						ImGui::CloseCurrentPopup();
 						detail::jump_to_address(va);
+					}
+					if (ImGui::MenuItem("Copy VA")) {
+						char buf[32];
+						std::snprintf(buf, sizeof(buf), "0x%llX",
+							static_cast<unsigned long long>(gl.va));
+						ImGui::SetClipboardText(buf);
+						toast_notification::push("Global VA copied",
+							toast_notification::toast_type_t::info, 2.0f);
+					}
+					if (ImGui::MenuItem("Copy name")) {
+						ImGui::SetClipboardText(gl.name.c_str());
+						toast_notification::push("Global name copied",
+							toast_notification::toast_type_t::info, 2.0f);
 					}
 					ImGui::EndPopup();
 				}
@@ -1344,21 +1680,92 @@ namespace binary_map_view {
 				ImGui::PushID(static_cast<int>(0x60000000 | imp_idx));
 				ImGui::InvisibleButton("##bm_imp_hdr", ImVec2(row_w, row_h));
 				if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+					diag::log_tagged_fmt("binary_map",
+						"import_dll_toggle dll='%s' funcs=%zu now_collapsed=%d",
+						dll.c_str(), funcs.size(), (!collapsed) ? 1 : 0);
 					detail::toggle_group(s, key);
+				}
+				if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+					ImGui::OpenPopup("##bm_imp_hdr_ctx");
+				}
+				if (ImGui::BeginPopup("##bm_imp_hdr_ctx")) {
+					if (ImGui::MenuItem("Copy DLL name")) {
+						ImGui::SetClipboardText(dll.c_str());
+						toast_notification::push("DLL name copied",
+							toast_notification::toast_type_t::info, 2.0f);
+					}
+					if (ImGui::MenuItem("Copy function list")) {
+						std::string joined;
+						for (size_t fi = 0; fi < funcs.size(); ++fi) {
+							if (fi) joined += "\n";
+							joined += funcs[fi];
+						}
+						ImGui::SetClipboardText(joined.c_str());
+						diag::log_tagged_fmt("binary_map",
+							"import_ctx copy_function_list dll='%s' funcs=%zu",
+							dll.c_str(), funcs.size());
+						toast_notification::push("Function list copied",
+							toast_notification::toast_type_t::info, 2.0f);
+					}
+					ImGui::EndPopup();
 				}
 				ImGui::PopID();
 
 				if (!collapsed) {
 					const float imp_fn_fs = code_font->FontSize > 0.f ? code_font->FontSize : 14.f;
 					const float imp_row_h = imp_fn_fs + 10.f;
+					int fn_idx = 0;
 					for (const auto& fn : funcs) {
 						if (!detail::filter_matches(filter_lower, fn) &&
-							!detail::filter_matches(filter_lower, dll)) continue;
+							!detail::filter_matches(filter_lower, dll)) { ++fn_idx; continue; }
 						ImVec2 ip = ImGui::GetCursorScreenPos();
+						bool fn_hov = ImGui::IsMouseHoveringRect(ip,
+							ImVec2(ip.x + row_w, ip.y + imp_row_h), true);
+						if (fn_hov) {
+							dl->AddRectFilled(ip, ImVec2(ip.x + row_w, ip.y + imp_row_h),
+								aida::ui::with_alpha(t.hover_wash, a * 0.7f), 3.f);
+						}
 						dl->AddText(code_font, imp_fn_fs,
 							ImVec2(ip.x + 36.f, ip.y + (imp_row_h - imp_fn_fs) * 0.5f),
 							aida::ui::with_alpha(t.text_secondary, a), fn.c_str());
+						ImGui::SetCursorScreenPos(ip);
+						ImGui::PushID(static_cast<int>(0x70000000 | (imp_idx * 4096 + fn_idx)));
+						ImGui::InvisibleButton("##bm_imp_fn", ImVec2(row_w, imp_row_h));
+						if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+							diag::log_tagged_fmt("binary_map",
+								"import_fn_click dll='%s' fn='%s'",
+								dll.c_str(), fn.c_str());
+							std::string clip = dll + "!" + fn;
+							ImGui::SetClipboardText(clip.c_str());
+							toast_notification::push("Import symbol copied",
+								toast_notification::toast_type_t::info, 2.0f);
+						}
+						if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+							ImGui::OpenPopup("##bm_imp_fn_ctx");
+						}
+						if (ImGui::BeginPopup("##bm_imp_fn_ctx")) {
+							if (ImGui::MenuItem("Copy DLL!fn")) {
+								std::string clip = dll + "!" + fn;
+								ImGui::SetClipboardText(clip.c_str());
+								diag::log_tagged_fmt("binary_map",
+									"import_fn_ctx copy dll='%s' fn='%s'",
+									dll.c_str(), fn.c_str());
+								toast_notification::push("Import symbol copied",
+									toast_notification::toast_type_t::info, 2.0f);
+							}
+							if (ImGui::MenuItem("Copy function name")) {
+								ImGui::SetClipboardText(fn.c_str());
+							}
+							if (ImGui::MenuItem("Find in disassembly")) {
+								diag::log_tagged_fmt("binary_map",
+									"import_fn_ctx find_in_disasm dll='%s' fn='%s'",
+									dll.c_str(), fn.c_str());
+							}
+							ImGui::EndPopup();
+						}
+						ImGui::PopID();
 						ImGui::Dummy(ImVec2(row_w, imp_row_h));
+						++fn_idx;
 					}
 				}
 				++imp_idx;
@@ -1373,7 +1780,11 @@ namespace binary_map_view {
 				if (!detail::filter_matches(filter_lower, ex)) continue;
 				ImVec2 cp = ImGui::GetCursorScreenPos();
 				float row_w = ImGui::GetContentRegionAvail().x;
-				bool hov = ImGui::IsMouseHoveringRect(cp, ImVec2(cp.x + row_w, cp.y + exp_row_h), true);
+				ImGui::PushID(static_cast<int>(0x7E000000 | (idx & 0x00FFFFFF)));
+				ImGui::InvisibleButton("##bm_exp_row", ImVec2(row_w, exp_row_h));
+				bool hov = ImGui::IsItemHovered();
+				bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+				bool right_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Right);
 				if (hov) {
 					dl->AddRectFilled(cp, ImVec2(cp.x + row_w, cp.y + exp_row_h),
 						aida::ui::with_alpha(t.hover_wash, a), 3.f);
@@ -1381,6 +1792,50 @@ namespace binary_map_view {
 				dl->AddText(code_font, exp_fs,
 					ImVec2(cp.x + 18.f, cp.y + (exp_row_h - exp_fs) * 0.5f),
 					aida::ui::with_alpha(t.text_primary, a), ex.c_str());
+				uint64_t resolved_va = 0;
+				{
+					std::lock_guard<std::mutex> gl(s.mutex);
+					for (const auto& fn : s.map.functions) {
+						if (fn.name == ex) { resolved_va = fn.va; break; }
+					}
+				}
+				if (clicked) {
+					diag::log_tagged_fmt("binary_map",
+						"export_row_click name='%s' resolved_va=0x%llX",
+						ex.c_str(),
+						static_cast<unsigned long long>(resolved_va));
+					if (resolved_va != 0) {
+						detail::jump_to_address(resolved_va);
+					} else {
+						ImGui::SetClipboardText(ex.c_str());
+						toast_notification::push("Export name copied (no VA resolved)",
+							toast_notification::toast_type_t::info, 2.5f);
+					}
+				}
+				if (right_clicked) {
+					ImGui::OpenPopup("##bm_exp_ctx");
+				}
+				if (ImGui::BeginPopup("##bm_exp_ctx")) {
+					if (resolved_va != 0 && ImGui::MenuItem("Jump to disassembly")) {
+						const uint64_t va_local = resolved_va;
+						diag::log_tagged_fmt("binary_map",
+							"export_ctx jump_to_disasm name='%s' va=0x%llX",
+							ex.c_str(),
+							static_cast<unsigned long long>(va_local));
+						ImGui::CloseCurrentPopup();
+						detail::jump_to_address(va_local);
+					}
+					if (ImGui::MenuItem("Copy export name")) {
+						ImGui::SetClipboardText(ex.c_str());
+						diag::log_tagged_fmt("binary_map",
+							"export_ctx copy_name name='%s'",
+							ex.c_str());
+						toast_notification::push("Export name copied",
+							toast_notification::toast_type_t::info, 2.0f);
+					}
+					ImGui::EndPopup();
+				}
+				ImGui::PopID();
 				ImGui::Dummy(ImVec2(row_w, exp_row_h));
 				++idx;
 			}
@@ -1392,9 +1847,9 @@ namespace binary_map_view {
 			aida::ui::empty_state::config_t cfg;
 			cfg.glyph = aida::ui::empty_state::glyph_t::binary_file;
 			cfg.title = "No binary loaded";
-			cfg.body = s.last_error.empty()
+			cfg.body = last_error_copy.empty()
 				? "Open a binary or press Refresh to build the map."
-				: s.last_error;
+				: last_error_copy;
 			cfg.max_width = 320.f;
 			aida::ui::empty_state::render(cp, sz, cfg);
 		}

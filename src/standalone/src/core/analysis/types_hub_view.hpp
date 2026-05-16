@@ -5,6 +5,7 @@
 #include "ui/theme.hpp"
 #include "ui/components.hpp"
 #include "ui/empty_state.hpp"
+#include "ui/no_target_overlay.hpp"
 #include "ui/motion.hpp"
 #include "ui/fonts.hpp"
 #include "struct_recon_view.hpp"
@@ -12,16 +13,25 @@
 #include "struct_dissector.hpp"
 #include "pdb_parser.hpp"
 #include "symbol_store.hpp"
+#include "builtin_typelib.hpp"
+#include "functions_panel.hpp"
 #include "../infra/work_queue.hpp"
 #include "../disasm/disasm_view.hpp"
 #include "../disasm/zydis_disasm.hpp"
+#include "../disasm/function_index.hpp"
 #include "../../helpers/globals.h"
+#include "../../helpers/diag_log.hpp"
+#include "../../helpers/win32_dialog.hpp"
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 
 #include <windows.h>
 #include <commdlg.h>
+
+namespace analysis_session {
+bool has_active_target();
+}
 
 #include <algorithm>
 #include <atomic>
@@ -33,7 +43,9 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 extern HWND g_hwnd;
@@ -113,6 +125,565 @@ struct state_t {
 
 inline state_t g_state;
 
+struct snapshot_t {
+	aida::ui::hub_strip::state_t strip;
+
+	char  search_struct[96] = {};
+	char  search_union[96] = {};
+	char  search_enum[96] = {};
+	char  search_typedef[96] = {};
+	char  search_function[96] = {};
+	char  apply_addr_buf[20] = {};
+
+	int   sel_struct = -1;
+	int   sel_union = -1;
+	int   sel_enum = -1;
+	int   sel_typedef = -1;
+	int   sel_function = -1;
+
+	float scroll_list = 0.f;
+	float target_scroll_list = 0.f;
+	float scroll_detail = 0.f;
+	float target_scroll_detail = 0.f;
+
+	int   last_sel_tab = -1;
+	std::string flash_message;
+	float       flash_remaining = 0.f;
+	uint32_t    flash_color = 0;
+
+	std::vector<size_t> visible_struct_idx;
+	std::vector<size_t> visible_union_idx;
+	std::vector<size_t> visible_enum_idx;
+	std::vector<size_t> visible_typedef_idx;
+	std::vector<size_t> visible_function_idx;
+
+	std::shared_ptr<loading_job_t> manual_job;
+};
+
+inline std::unique_ptr<snapshot_t> detach_snapshot() {
+	auto out = std::make_unique<snapshot_t>();
+	out->strip = g_state.strip;
+	std::memcpy(out->search_struct, g_state.search_struct, sizeof(out->search_struct));
+	std::memcpy(out->search_union, g_state.search_union, sizeof(out->search_union));
+	std::memcpy(out->search_enum, g_state.search_enum, sizeof(out->search_enum));
+	std::memcpy(out->search_typedef, g_state.search_typedef, sizeof(out->search_typedef));
+	std::memcpy(out->search_function, g_state.search_function, sizeof(out->search_function));
+	std::memcpy(out->apply_addr_buf, g_state.apply_addr_buf, sizeof(out->apply_addr_buf));
+	out->sel_struct = g_state.sel_struct;
+	out->sel_union = g_state.sel_union;
+	out->sel_enum = g_state.sel_enum;
+	out->sel_typedef = g_state.sel_typedef;
+	out->sel_function = g_state.sel_function;
+	out->scroll_list = g_state.scroll_list;
+	out->target_scroll_list = g_state.target_scroll_list;
+	out->scroll_detail = g_state.scroll_detail;
+	out->target_scroll_detail = g_state.target_scroll_detail;
+	out->last_sel_tab = g_state.last_sel_tab;
+	out->flash_message = std::move(g_state.flash_message);
+	out->flash_remaining = g_state.flash_remaining;
+	out->flash_color = g_state.flash_color;
+	out->visible_struct_idx = std::move(g_state.visible_struct_idx);
+	out->visible_union_idx = std::move(g_state.visible_union_idx);
+	out->visible_enum_idx = std::move(g_state.visible_enum_idx);
+	out->visible_typedef_idx = std::move(g_state.visible_typedef_idx);
+	out->visible_function_idx = std::move(g_state.visible_function_idx);
+	out->manual_job = std::move(g_state.manual_job);
+	g_state = state_t{};
+	return out;
+}
+
+inline void attach_snapshot(std::unique_ptr<snapshot_t> snap) {
+	if (!snap) {
+		g_state = state_t{};
+		return;
+	}
+	g_state.strip = snap->strip;
+	std::memcpy(g_state.search_struct, snap->search_struct, sizeof(g_state.search_struct));
+	std::memcpy(g_state.search_union, snap->search_union, sizeof(g_state.search_union));
+	std::memcpy(g_state.search_enum, snap->search_enum, sizeof(g_state.search_enum));
+	std::memcpy(g_state.search_typedef, snap->search_typedef, sizeof(g_state.search_typedef));
+	std::memcpy(g_state.search_function, snap->search_function, sizeof(g_state.search_function));
+	std::memcpy(g_state.apply_addr_buf, snap->apply_addr_buf, sizeof(g_state.apply_addr_buf));
+	g_state.sel_struct = snap->sel_struct;
+	g_state.sel_union = snap->sel_union;
+	g_state.sel_enum = snap->sel_enum;
+	g_state.sel_typedef = snap->sel_typedef;
+	g_state.sel_function = snap->sel_function;
+	g_state.scroll_list = snap->scroll_list;
+	g_state.target_scroll_list = snap->target_scroll_list;
+	g_state.scroll_detail = snap->scroll_detail;
+	g_state.target_scroll_detail = snap->target_scroll_detail;
+	g_state.last_sel_tab = snap->last_sel_tab;
+	g_state.flash_message = std::move(snap->flash_message);
+	g_state.flash_remaining = snap->flash_remaining;
+	g_state.flash_color = snap->flash_color;
+	g_state.visible_struct_idx = std::move(snap->visible_struct_idx);
+	g_state.visible_union_idx = std::move(snap->visible_union_idx);
+	g_state.visible_enum_idx = std::move(snap->visible_enum_idx);
+	g_state.visible_typedef_idx = std::move(snap->visible_typedef_idx);
+	g_state.visible_function_idx = std::move(snap->visible_function_idx);
+	g_state.manual_job = std::move(snap->manual_job);
+}
+
+enum class origin_t : int {
+	pdb = 0,
+	builtin,
+	synthesized,
+};
+
+inline const char* origin_badge_label(origin_t o)
+{
+	switch (o) {
+		case origin_t::pdb:         return "PDB";
+		case origin_t::builtin:     return "BUILTIN";
+		case origin_t::synthesized: return "SYNTH";
+	}
+	return "";
+}
+
+inline ImU32 origin_badge_color(origin_t o, const aida::ui::theme_t& th)
+{
+	switch (o) {
+		case origin_t::pdb:         return th.success;
+		case origin_t::builtin:     return th.syn_type;
+		case origin_t::synthesized: return th.warning;
+	}
+	return th.text_dim;
+}
+
+struct merged_struct_entry_t {
+	pdb_parser::struct_def_t def;
+	origin_t                 origin = origin_t::pdb;
+	std::string              lib_tag;
+};
+
+struct merged_enum_entry_t {
+	pdb_parser::enum_def_t def;
+	origin_t               origin = origin_t::pdb;
+	std::string            lib_tag;
+};
+
+struct merged_typedef_entry_t {
+	std::string name;
+	std::string target;
+	std::string lib_tag;
+	uint32_t    size = 0;
+	origin_t    origin = origin_t::builtin;
+};
+
+struct merged_function_entry_t {
+	std::string name;
+	std::string signature;
+	std::string module_tag;
+	uint64_t    rva = 0;
+	uint32_t    size = 0;
+	uint32_t    type_index = 0;
+	origin_t    origin = origin_t::pdb;
+};
+
+struct merged_types_t {
+	std::vector<merged_struct_entry_t>   structs;
+	std::vector<merged_struct_entry_t>   unions;
+	std::vector<merged_enum_entry_t>     enums;
+	std::vector<merged_typedef_entry_t>  typedefs;
+	std::vector<merged_function_entry_t> functions;
+	size_t pdb_struct_count = 0;
+	size_t pdb_enum_count = 0;
+	size_t pdb_function_count = 0;
+	size_t builtin_struct_count = 0;
+	size_t builtin_enum_count = 0;
+	size_t builtin_typedef_count = 0;
+	size_t synthesized_function_count = 0;
+	bool   any_pdb_loaded = false;
+	bool   any_pdb_loading = false;
+	bool   any_pdb_failed = false;
+	std::string pdb_status_text;
+	std::string pdb_module_name;
+	std::string pdb_file_path;
+};
+
+inline pdb_parser::struct_def_t build_struct_def_from_builtin(const builtin_typelib::struct_desc_t& src)
+{
+	pdb_parser::struct_def_t def;
+	def.name = src.name;
+	def.size = src.size;
+	def.type_index = 0;
+	def.is_union = src.is_union;
+	def.members.reserve(src.member_count);
+	for (size_t i = 0; i < src.member_count; ++i) {
+		const auto& m = src.members[i];
+		pdb_parser::struct_member_t mm;
+		mm.name = m.name;
+		mm.type_name = m.type_name;
+		mm.offset = m.offset;
+		mm.size = m.size;
+		mm.type_index = 0;
+		mm.bit_offset = -1;
+		mm.bit_size = -1;
+		mm.is_pointer = m.is_pointer;
+		mm.pointer_depth = m.is_pointer ? 1 : 0;
+		mm.is_array = m.is_array;
+		mm.array_count = m.array_count;
+		def.members.push_back(std::move(mm));
+	}
+	return def;
+}
+
+inline pdb_parser::enum_def_t build_enum_def_from_builtin(const builtin_typelib::enum_desc_t& src)
+{
+	pdb_parser::enum_def_t def;
+	def.name = src.name;
+	def.type_index = 0;
+	def.members.reserve(src.value_count);
+	for (size_t i = 0; i < src.value_count; ++i) {
+		pdb_parser::enum_member_t em;
+		em.name = src.values[i].name;
+		em.value = src.values[i].value;
+		def.members.push_back(std::move(em));
+	}
+	return def;
+}
+
+inline pdb_parser::enum_def_t build_enum_def_from_status_table(const char* enum_name,
+	const builtin_typelib::entry_t* table, size_t count)
+{
+	pdb_parser::enum_def_t def;
+	def.name = enum_name;
+	def.type_index = 0;
+	def.members.reserve(count);
+	for (size_t i = 0; i < count; ++i) {
+		pdb_parser::enum_member_t em;
+		em.name = table[i].second;
+		em.value = static_cast<int64_t>(static_cast<int32_t>(static_cast<uint32_t>(table[i].first)));
+		def.members.push_back(std::move(em));
+	}
+	return def;
+}
+
+inline std::string strip_imp_prefix(const std::string& s)
+{
+	if (s.size() >= 6 && s.compare(0, 6, "__imp_") == 0) return s.substr(6);
+	if (s.size() >= 5 && s.compare(0, 5, "__imp") == 0) return s.substr(5);
+	return s;
+}
+
+inline std::string synthesize_prototype_signature(const std::string& fn_name)
+{
+	std::string stripped = strip_imp_prefix(fn_name);
+	const function_index::detail::prototype_entry_t* proto =
+		function_index::detail::lookup_prototype_entry(stripped);
+	std::string out;
+	out.reserve(stripped.size() + 64);
+	out += stripped;
+	out += "(";
+	if (proto) {
+		bool any = false;
+		for (size_t i = 0; i < sizeof(proto->params) / sizeof(proto->params[0]); ++i) {
+			const char* pn = proto->params[i];
+			if (!pn) break;
+			if (any) out += ", ";
+			out += "__int64 ";
+			out += pn;
+			any = true;
+		}
+		if (!any) {
+			out += "void";
+		}
+	} else {
+		out += "__int64 a1, __int64 a2, __int64 a3, __int64 a4";
+	}
+	out += ")";
+	return out;
+}
+
+struct import_snapshot_entry_t {
+	std::string function_name;
+	std::string module_name;
+};
+
+inline std::vector<import_snapshot_entry_t> snapshot_iat_entries()
+{
+	std::vector<import_snapshot_entry_t> snap;
+	auto& fc = function_index::detail::cache();
+	std::shared_lock<std::shared_mutex> lk(fc.mutex);
+	snap.reserve(fc.iat_lookup.size());
+	for (const auto& kv : fc.iat_lookup) {
+		const auto& e = kv.second;
+		if (e.function_name.empty()) continue;
+		import_snapshot_entry_t s;
+		s.function_name = e.function_name;
+		s.module_name = e.module_name;
+		snap.push_back(std::move(s));
+	}
+	return snap;
+}
+
+inline void append_synthesized_imports(std::vector<merged_function_entry_t>& out,
+	std::unordered_set<std::string>& taken_names,
+	const std::vector<import_snapshot_entry_t>& iat)
+{
+	out.reserve(out.size() + iat.size());
+	for (const auto& e : iat) {
+		std::string stripped = strip_imp_prefix(e.function_name);
+		if (stripped.empty()) continue;
+		if (!taken_names.insert(stripped).second) continue;
+		merged_function_entry_t mfe;
+		mfe.name = stripped;
+		mfe.signature = synthesize_prototype_signature(stripped);
+		mfe.module_tag = e.module_name;
+		mfe.rva = 0;
+		mfe.size = 0;
+		mfe.type_index = 0;
+		mfe.origin = origin_t::synthesized;
+		out.push_back(std::move(mfe));
+	}
+}
+
+inline void build_merged_types_locked(merged_types_t& out,
+	const std::vector<import_snapshot_entry_t>& iat_snapshot)
+{
+	const pdb_parser::pdb_info_t* best = nullptr;
+	for (auto& kv : symbol_store::g_state.modules) {
+		auto& ms = kv.second;
+		if (ms.loading) {
+			out.any_pdb_loading = true;
+			if (out.pdb_status_text.empty()) {
+				out.pdb_status_text = ms.status_text;
+				out.pdb_module_name = ms.module_name;
+			}
+		}
+		if (ms.failed) {
+			out.any_pdb_failed = true;
+			if (out.pdb_status_text.empty()) {
+				out.pdb_status_text = ms.status_text;
+				out.pdb_module_name = ms.module_name;
+			}
+		}
+		if (ms.pdb.loaded) {
+			out.any_pdb_loaded = true;
+			if (!best || ms.pdb.structs.size() > best->structs.size())
+				best = &ms.pdb;
+		}
+	}
+
+	std::unordered_set<std::string> struct_names;
+	std::unordered_set<std::string> union_names;
+	std::unordered_set<std::string> enum_names;
+	std::unordered_set<std::string> typedef_names;
+	std::unordered_set<std::string> function_names;
+
+	if (best) {
+		out.pdb_module_name = best->module_name;
+		out.pdb_file_path = best->file_path;
+		for (const auto& s : best->structs) {
+			merged_struct_entry_t e;
+			e.def = s;
+			e.origin = origin_t::pdb;
+			e.lib_tag = best->module_name.empty() ? std::string("PDB") : best->module_name;
+			if (s.is_union) {
+				union_names.insert(s.name);
+				out.unions.push_back(std::move(e));
+			} else {
+				struct_names.insert(s.name);
+				out.structs.push_back(std::move(e));
+			}
+			++out.pdb_struct_count;
+		}
+		for (const auto& en : best->enums) {
+			merged_enum_entry_t e;
+			e.def = en;
+			e.origin = origin_t::pdb;
+			e.lib_tag = best->module_name.empty() ? std::string("PDB") : best->module_name;
+			enum_names.insert(en.name);
+			out.enums.push_back(std::move(e));
+			++out.pdb_enum_count;
+		}
+		for (const auto& sym : best->symbols) {
+			if (!sym.is_function) continue;
+			merged_function_entry_t mfe;
+			mfe.name = sym.name;
+			mfe.signature = sym.name + "()";
+			mfe.module_tag = best->module_name;
+			mfe.rva = sym.rva;
+			mfe.size = sym.size;
+			mfe.type_index = sym.type_index;
+			mfe.origin = origin_t::pdb;
+			function_names.insert(sym.name);
+			out.functions.push_back(std::move(mfe));
+			++out.pdb_function_count;
+		}
+	}
+
+	for (const auto& bs : builtin_typelib::kBuiltinStructs) {
+		if (bs.is_union) {
+			if (!union_names.insert(bs.name).second) continue;
+			merged_struct_entry_t e;
+			e.def = build_struct_def_from_builtin(bs);
+			e.origin = origin_t::builtin;
+			e.lib_tag = bs.lib ? bs.lib : "builtin";
+			out.unions.push_back(std::move(e));
+		} else {
+			if (!struct_names.insert(bs.name).second) continue;
+			merged_struct_entry_t e;
+			e.def = build_struct_def_from_builtin(bs);
+			e.origin = origin_t::builtin;
+			e.lib_tag = bs.lib ? bs.lib : "builtin";
+			out.structs.push_back(std::move(e));
+		}
+		++out.builtin_struct_count;
+	}
+
+	for (const auto& be : builtin_typelib::kBuiltinEnums) {
+		if (!enum_names.insert(be.name).second) continue;
+		merged_enum_entry_t e;
+		e.def = build_enum_def_from_builtin(be);
+		e.origin = origin_t::builtin;
+		e.lib_tag = be.lib ? be.lib : "builtin";
+		out.enums.push_back(std::move(e));
+		++out.builtin_enum_count;
+	}
+
+	if (enum_names.insert("NTSTATUS_VALUES").second) {
+		merged_enum_entry_t e;
+		e.def = build_enum_def_from_status_table("NTSTATUS_VALUES",
+			builtin_typelib::kNtstatusTable.data(), builtin_typelib::kNtstatusTable.size());
+		e.origin = origin_t::builtin;
+		e.lib_tag = "ntstatus";
+		out.enums.push_back(std::move(e));
+		++out.builtin_enum_count;
+	}
+	if (enum_names.insert("HRESULT_VALUES").second) {
+		merged_enum_entry_t e;
+		e.def = build_enum_def_from_status_table("HRESULT_VALUES",
+			builtin_typelib::kHresultTable.data(), builtin_typelib::kHresultTable.size());
+		e.origin = origin_t::builtin;
+		e.lib_tag = "mssdk";
+		out.enums.push_back(std::move(e));
+		++out.builtin_enum_count;
+	}
+
+	for (const auto& td : builtin_typelib::kBuiltinTypedefs) {
+		if (!typedef_names.insert(td.name).second) continue;
+		merged_typedef_entry_t e;
+		e.name = td.name;
+		e.target = td.target ? td.target : "";
+		e.lib_tag = td.lib ? td.lib : "builtin";
+		e.size = td.size;
+		e.origin = origin_t::builtin;
+		out.typedefs.push_back(std::move(e));
+		++out.builtin_typedef_count;
+	}
+
+	append_synthesized_imports(out.functions, function_names, iat_snapshot);
+	for (const auto& f : out.functions) {
+		if (f.origin == origin_t::synthesized) ++out.synthesized_function_count;
+	}
+
+	std::sort(out.structs.begin(), out.structs.end(),
+		[](const merged_struct_entry_t& a, const merged_struct_entry_t& b) {
+			return a.def.name < b.def.name;
+		});
+	std::sort(out.unions.begin(), out.unions.end(),
+		[](const merged_struct_entry_t& a, const merged_struct_entry_t& b) {
+			return a.def.name < b.def.name;
+		});
+	std::sort(out.enums.begin(), out.enums.end(),
+		[](const merged_enum_entry_t& a, const merged_enum_entry_t& b) {
+			return a.def.name < b.def.name;
+		});
+	std::sort(out.typedefs.begin(), out.typedefs.end(),
+		[](const merged_typedef_entry_t& a, const merged_typedef_entry_t& b) {
+			return a.name < b.name;
+		});
+	std::sort(out.functions.begin(), out.functions.end(),
+		[](const merged_function_entry_t& a, const merged_function_entry_t& b) {
+			if (a.origin != b.origin)
+				return static_cast<int>(a.origin) < static_cast<int>(b.origin);
+			return a.name < b.name;
+		});
+}
+
+inline merged_types_t build_merged_types_snapshot()
+{
+	std::vector<import_snapshot_entry_t> iat_snap = snapshot_iat_entries();
+	merged_types_t out;
+	{
+		std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
+		build_merged_types_locked(out, iat_snap);
+	}
+	return out;
+}
+
+struct merged_cache_t {
+	std::shared_ptr<merged_types_t> data;
+	uint64_t                        last_built_ms = 0;
+	std::mutex                      mtx;
+};
+
+inline merged_cache_t& merged_cache()
+{
+	static merged_cache_t s_cache;
+	return s_cache;
+}
+
+inline std::shared_ptr<const merged_types_t> get_merged_types_cached()
+{
+	auto& mc = merged_cache();
+	uint64_t now = GetTickCount64();
+	std::shared_ptr<merged_types_t> cached;
+	uint64_t last_built = 0;
+	{
+		std::lock_guard<std::mutex> lk(mc.mtx);
+		cached = mc.data;
+		last_built = mc.last_built_ms;
+	}
+	bool stale = (!cached) || (now - last_built >= 350);
+	if (!stale) return cached;
+
+	auto fresh = std::make_shared<merged_types_t>(build_merged_types_snapshot());
+	{
+		std::lock_guard<std::mutex> lk(mc.mtx);
+		mc.data = fresh;
+		mc.last_built_ms = now;
+	}
+	diag::log_tagged_fmt("types",
+		"merged_cache_rebuilt structs=%zu unions=%zu enums=%zu typedefs=%zu funcs=%zu pdb_loaded=%d",
+		fresh->structs.size(),
+		fresh->unions.size(),
+		fresh->enums.size(),
+		fresh->typedefs.size(),
+		fresh->functions.size(),
+		fresh->any_pdb_loaded ? 1 : 0);
+	return fresh;
+}
+
+inline void render_origin_badge(ImDrawList* dl, ImFont* font, ImVec2 pos,
+	origin_t origin, const std::string& lib_tag, float alpha)
+{
+	const auto& th = aida::ui::resolved();
+	const char* label = origin_badge_label(origin);
+	ImU32 col = origin_badge_color(origin, th);
+	ImVec2 ts = font->CalcTextSizeA(10.f, FLT_MAX, 0.f, label);
+	float pad_x = 6.f;
+	float pad_y = 2.f;
+	ImVec2 a = pos;
+	ImVec2 b = ImVec2(pos.x + ts.x + pad_x * 2.f, pos.y + ts.y + pad_y * 2.f);
+	dl->AddRectFilled(a, b, aida::ui::with_alpha(col, alpha * 0.18f), 4.f);
+	dl->AddRect(a, b, aida::ui::with_alpha(col, alpha * 0.55f), 4.f, 0, 1.f);
+	dl->AddText(font, 10.f, ImVec2(a.x + pad_x, a.y + pad_y),
+		aida::ui::with_alpha(col, alpha), label);
+	if (!lib_tag.empty()) {
+		ImVec2 lt = font->CalcTextSizeA(10.f, FLT_MAX, 0.f, lib_tag.c_str());
+		float lx = b.x + 6.f;
+		ImVec2 la = ImVec2(lx, a.y);
+		ImVec2 lb = ImVec2(lx + lt.x + pad_x * 2.f, b.y);
+		dl->AddRectFilled(la, lb, aida::ui::with_alpha(th.panel_header, alpha * 0.45f), 4.f);
+		dl->AddRect(la, lb, aida::ui::with_alpha(th.border_subtle, alpha * 0.55f), 4.f, 0, 1.f);
+		dl->AddText(font, 10.f, ImVec2(la.x + pad_x, la.y + pad_y),
+			aida::ui::with_alpha(th.text_secondary, alpha), lib_tag.c_str());
+	}
+}
+
 inline void set_sub_tab(sub_tab_t tab)
 {
 	int idx = static_cast<int>(tab);
@@ -155,115 +726,84 @@ inline std::string format_size_short(uint64_t bytes)
 	return std::string(buf);
 }
 
-inline std::string typedef_target_name(const pdb_parser::pdb_info_t& pdb, uint32_t ti)
-{
-	(void)pdb;
-	char buf[32];
-	std::snprintf(buf, sizeof(buf), "ti_%u", ti);
-	return buf;
-}
-
-inline std::string function_signature_for(const pdb_parser::pdb_info_t& pdb, const pdb_parser::pdb_symbol_t& sym)
-{
-	(void)pdb;
-	std::string out;
-	out.reserve(sym.name.size() + 16);
-	out += sym.name;
-	out += "()";
-	return out;
-}
-
-inline stats_t snapshot_active_pdb()
+inline stats_t snapshot_active_pdb(const merged_types_t& merged)
 {
 	stats_t st;
-	std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
+	st.module_name = merged.pdb_module_name;
+	st.pdb_path = merged.pdb_file_path;
 
-	const symbol_store::module_symbols_t* best = nullptr;
-	for (auto& kv : symbol_store::g_state.modules) {
-		auto& ms = kv.second;
-		if (ms.pdb.loaded) {
-			if (!best || ms.pdb.structs.size() > best->pdb.structs.size())
-				best = &ms;
-		}
+	size_t struct_total = 0;
+	size_t union_total = 0;
+	for (const auto& e : merged.structs) {
+		(void)e;
+		++struct_total;
 	}
+	for (const auto& e : merged.unions) {
+		(void)e;
+		++union_total;
+	}
+	st.struct_count = struct_total;
+	st.union_count = union_total;
+	st.enum_count = merged.enums.size();
+	st.typedef_count = merged.typedefs.size();
+	st.function_count = merged.functions.size();
+	st.symbol_count = merged.pdb_function_count;
 
-	if (!best) {
-		for (auto& kv : symbol_store::g_state.modules) {
-			auto& ms = kv.second;
-			if (ms.loading) {
-				st.loading = true;
-				st.status_text = ms.status_text;
-				st.module_name = ms.module_name;
-				return st;
-			}
-		}
-		for (auto& kv : symbol_store::g_state.modules) {
-			auto& ms = kv.second;
-			if (ms.failed) {
-				st.failed = true;
-				st.status_text = ms.status_text;
-				st.module_name = ms.module_name;
-				return st;
-			}
-		}
-		return st;
-	}
+	st.loaded = merged.any_pdb_loaded
+		|| !merged.structs.empty()
+		|| !merged.unions.empty()
+		|| !merged.enums.empty()
+		|| !merged.typedefs.empty()
+		|| !merged.functions.empty();
+	st.loading = merged.any_pdb_loading;
+	st.failed = !merged.any_pdb_loaded && merged.any_pdb_failed;
+	st.status_text = merged.pdb_status_text;
 
-	st.module_name = best->module_name;
-	st.pdb_path = best->pdb.file_path;
-	st.symbol_count = best->pdb.symbols.size();
-	st.struct_count = 0;
-	st.union_count = 0;
-	st.function_count = 0;
-	for (auto& s : best->pdb.structs) {
-		if (s.is_union) ++st.union_count;
-		else ++st.struct_count;
+	char buf[160];
+	if (merged.any_pdb_loaded) {
+		std::snprintf(buf, sizeof(buf),
+			"%zu types (PDB %zu / builtin %zu) %zu enums %zu typedefs %zu funcs",
+			struct_total + union_total,
+			merged.pdb_struct_count,
+			merged.builtin_struct_count,
+			st.enum_count, st.typedef_count, st.function_count);
+	} else {
+		std::snprintf(buf, sizeof(buf),
+			"no PDB: %zu builtin types %zu enums %zu typedefs %zu synthesized funcs",
+			merged.builtin_struct_count,
+			st.enum_count, st.typedef_count, merged.synthesized_function_count);
 	}
-	for (auto& s : best->pdb.symbols) {
-		if (s.is_function) ++st.function_count;
-	}
-	st.enum_count = best->pdb.enums.size();
-	st.typedef_count = 0;
-	st.loaded = true;
-	char buf[96];
-	std::snprintf(buf, sizeof(buf), "%zu structs, %zu enums, %zu symbols",
-		st.struct_count + st.union_count, st.enum_count, st.symbol_count);
 	st.status_text = buf;
 	return st;
-}
-
-inline const pdb_parser::pdb_info_t* active_pdb_locked()
-{
-	const pdb_parser::pdb_info_t* best = nullptr;
-	for (auto& kv : symbol_store::g_state.modules) {
-		auto& ms = kv.second;
-		if (ms.pdb.loaded) {
-			if (!best || ms.pdb.structs.size() > best->structs.size())
-				best = &ms.pdb;
-		}
-	}
-	return best;
 }
 
 inline std::string browse_for_pdb()
 {
 	char buf[MAX_PATH] = {};
-	OPENFILENAMEA ofn = {};
-	ofn.lStructSize  = sizeof(ofn);
-	ofn.hwndOwner    = g_hwnd;
-	ofn.lpstrFile    = buf;
-	ofn.nMaxFile     = MAX_PATH;
-	ofn.lpstrFilter  = "PDB Symbol Files\0*.pdb\0All Files\0*.*\0\0";
-	ofn.nFilterIndex = 1;
-	ofn.Flags        = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-	if (GetOpenFileNameA(&ofn))
+	static const char k_pdb_filter[] =
+		"PDB Symbol Files (*.pdb)\0*.pdb\0"
+		"All files (*.*)\0*.*\0\0";
+	bool ok = win32_dialog::show_open_file_dialog(g_hwnd,
+			"Load PDB",
+			k_pdb_filter,
+			buf, sizeof(buf),
+			"types_hub_view::browse_for_pdb");
+	if (ok) {
+		diag::log_tagged_fmt("pdb",
+			"browse_for_pdb selected path='%s'", buf);
 		return std::string(buf);
+	}
+	diag::log_tagged_fmt("pdb",
+		"browse_for_pdb cancelled");
 	return {};
 }
 
 inline void start_manual_pdb_load(const std::string& pdb_path)
 {
-	if (pdb_path.empty()) return;
+	if (pdb_path.empty()) {
+		diag::log_tagged_fmt("pdb", "manual_load_skipped reason='empty_path'");
+		return;
+	}
 
 	auto job = std::make_shared<loading_job_t>();
 	job->info = std::make_shared<pdb_parser::pdb_info_t>();
@@ -277,12 +817,28 @@ inline void start_manual_pdb_load(const std::string& pdb_path)
 
 	g_state.manual_job = job;
 
+	diag::log_tagged_fmt("pdb",
+		"manual_load_begin path='%s' module='%s'",
+		pdb_path.c_str(), job->module_key.c_str());
+
 	work_queue::post([job]() {
+		uint64_t t0 = GetTickCount64();
 		bool ok = pdb_parser::parse_pdb(job->pdb_path, std::string{}, *job->info, job->progress.get());
+		uint64_t elapsed_ms = GetTickCount64() - t0;
 		job->ok->store(ok, std::memory_order_release);
 		job->done->store(true, std::memory_order_release);
 
-		if (!ok) return;
+		if (!ok) {
+			diag::log_tagged_fmt("pdb",
+				"manual_load_failed path='%s' elapsed_ms=%llu",
+				job->pdb_path.c_str(),
+				static_cast<unsigned long long>(elapsed_ms));
+			return;
+		}
+
+		size_t sym_count = job->info->symbols.size();
+		size_t struct_count = job->info->structs.size();
+		size_t enum_count = job->info->enums.size();
 
 		symbol_store::module_symbols_t ms;
 		ms.module_name = job->module_key;
@@ -299,7 +855,22 @@ inline void start_manual_pdb_load(const std::string& pdb_path)
 			std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
 			symbol_store::g_state.modules[ms.module_name] = std::move(ms);
 		}
+
+		diag::log_tagged_fmt("pdb",
+			"manual_load_done path='%s' module='%s' syms=%zu structs=%zu enums=%zu elapsed_ms=%llu",
+			job->pdb_path.c_str(),
+			job->module_key.c_str(),
+			sym_count, struct_count, enum_count,
+			static_cast<unsigned long long>(elapsed_ms));
 	});
+}
+
+inline void invalidate_merged_cache()
+{
+	auto& mc = merged_cache();
+	std::lock_guard<std::mutex> lk(mc.mtx);
+	mc.data.reset();
+	mc.last_built_ms = 0;
 }
 
 inline void poll_manual_job()
@@ -307,10 +878,17 @@ inline void poll_manual_job()
 	if (!g_state.manual_job) return;
 	if (!g_state.manual_job->done->load(std::memory_order_acquire)) return;
 
-	if (g_state.manual_job->ok->load(std::memory_order_acquire)) {
-		flash("PDB loaded: " + g_state.manual_job->module_key, aida::ui::resolved().success);
+	bool ok = g_state.manual_job->ok->load(std::memory_order_acquire);
+	std::string mod_key = g_state.manual_job->module_key;
+	if (ok) {
+		flash("PDB loaded: " + mod_key, aida::ui::resolved().success);
+		diag::log_tagged_fmt("pdb",
+			"manual_job_polled status='ok' module='%s'", mod_key.c_str());
+		invalidate_merged_cache();
 	} else {
 		flash("Failed to parse PDB", aida::ui::resolved().error);
+		diag::log_tagged_fmt("pdb",
+			"manual_job_polled status='fail' module='%s'", mod_key.c_str());
 	}
 	g_state.manual_job.reset();
 }
@@ -442,68 +1020,9 @@ inline void render_search_bar(float origin_x, float origin_y, float width,
 	ImGui::PopStyleColor(3);
 }
 
-inline void render_empty_pdb_state(ImVec2 region_pos, ImVec2 region_size, bool loading, bool failed,
-                                    const std::string& status_text, float progress_value)
-{
-	const auto& th = aida::ui::resolved();
-	ImDrawList* dl = ImGui::GetWindowDrawList();
-
-	ImVec2 center = ImVec2(region_pos.x + region_size.x * 0.5f,
-	                        region_pos.y + region_size.y * 0.5f);
-	float glyph_size = 64.f;
-
-	ImU32 glyph_col = th.accent_dim;
-	if (failed) glyph_col = th.error;
-	if (loading) glyph_col = th.warning;
-
-	aida::ui::empty_state::render_glyph(
-		loading ? aida::ui::empty_state::glyph_t::cpu
-		        : (failed ? aida::ui::empty_state::glyph_t::shield
-		                  : aida::ui::empty_state::glyph_t::binary_file),
-		dl, ImVec2(center.x, center.y - 80.f), glyph_size, glyph_col, 1.f);
-
-	ImFont* title_font = aida::ui::fonts::body_strong();
-	if (!title_font) title_font = ImGui::GetFont();
-	ImFont* body_font = ImGui::GetFont();
-
-	const char* title;
-	if (loading) title = "Parsing PDB symbols";
-	else if (failed) title = "PDB load failed";
-	else title = "No symbol database available";
-
-	ImVec2 tsz = title_font->CalcTextSizeA(20.f, FLT_MAX, 0.f, title);
-	dl->AddText(title_font, 20.f, ImVec2(center.x - tsz.x * 0.5f, center.y - 30.f),
-		th.text_primary, title);
-
-	const char* body;
-	if (loading) body = "Walking type records, this can take a few seconds for large modules.";
-	else if (failed) body = status_text.empty()
-		? "DbgHelp could not parse the file. Verify the path and try a different PDB."
-		: status_text.c_str();
-	else body = "Load a PDB to browse structures, unions, enumerations, typedefs and function signatures discovered in the target binary.";
-
-	float wrap = 460.f;
-	ImVec2 bsz = body_font->CalcTextSizeA(14.f, FLT_MAX, wrap, body);
-	dl->AddText(body_font, 14.f, ImVec2(center.x - bsz.x * 0.5f, center.y + 2.f),
-		th.text_secondary, body, nullptr, wrap);
-
-	if (loading) {
-		float bar_w = 280.f;
-		aida::ui::render_progress_bar(ImVec2(center.x - bar_w * 0.5f, center.y + 60.f),
-			bar_w, 6.f, progress_value, progress_value <= 0.f, true);
-	} else {
-		float btn_w = 180.f;
-		ImGui::SetCursorScreenPos(ImVec2(center.x - btn_w * 0.5f, center.y + 64.f));
-		if (aida::ui::button("Load PDB", aida::ui::button_kind_t::primary,
-			aida::ui::size_t_::md, ImVec2(btn_w, 0.f))) {
-			std::string p = browse_for_pdb();
-			if (!p.empty()) start_manual_pdb_load(p);
-		}
-	}
-}
-
 inline void render_struct_detail(const pdb_parser::struct_def_t& def, float origin_x, float origin_y,
-                                  float width, float height, float alpha)
+                                  float width, float height, float alpha,
+                                  origin_t origin, const std::string& lib_tag)
 {
 	const auto& th = aida::ui::resolved();
 	ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -527,6 +1046,10 @@ inline void render_struct_detail(const pdb_parser::struct_def_t& def, float orig
 	dl->AddText(head, 16.f, ImVec2(a.x + 14.f, a.y + 8.f),
 		aida::ui::with_alpha(th.text_primary, alpha), def.name.c_str());
 
+	ImVec2 name_sz = head->CalcTextSizeA(16.f, FLT_MAX, 0.f, def.name.c_str());
+	render_origin_badge(dl, code, ImVec2(a.x + 14.f + name_sz.x + 10.f, a.y + 12.f),
+		origin, lib_tag, alpha);
+
 	char meta[96];
 	std::snprintf(meta, sizeof(meta), "%s  %llu bytes  (0x%llX)  %zu fields  ti=%u",
 		def.is_union ? "union" : "struct",
@@ -543,6 +1066,9 @@ inline void render_struct_detail(const pdb_parser::struct_def_t& def, float orig
 		std::string cpp = pdb_parser::struct_to_cpp(def);
 		ImGui::SetClipboardText(cpp.c_str());
 		flash("Copied " + def.name + " as C", th.success);
+		diag::log_tagged_fmt("types",
+			"copy_struct_c name='%s' bytes=%zu",
+			def.name.c_str(), cpp.size());
 	}
 	ImGui::SameLine();
 	if (aida::ui::button("To Dissector", aida::ui::button_kind_t::secondary,
@@ -563,11 +1089,15 @@ inline void render_struct_detail(const pdb_parser::struct_def_t& def, float orig
 			struct_dissector::add_field(idx, fd);
 		}
 		flash("Pushed " + def.name + " into dissector (" + std::to_string(def.members.size()) + " fields)", th.success);
+		diag::log_tagged_fmt("types",
+			"push_to_dissector name='%s' fields=%zu dissector_idx=%d",
+			def.name.c_str(), def.members.size(), idx);
 	}
 	ImGui::SameLine();
 	if (aida::ui::button("Open Dissector", aida::ui::button_kind_t::primary,
 		aida::ui::size_t_::sm, ImVec2(122.f, 28.f))) {
 		set_sub_tab(sub_tab_t::dissector);
+		diag::log_tagged_fmt("types", "open_dissector_tab");
 	}
 
 	float body_y = a.y + top_h + 10.f;
@@ -685,7 +1215,8 @@ inline void render_struct_detail(const pdb_parser::struct_def_t& def, float orig
 }
 
 inline void render_enum_detail(const pdb_parser::enum_def_t& def, float origin_x, float origin_y,
-                                float width, float height, float alpha)
+                                float width, float height, float alpha,
+                                origin_t origin, const std::string& lib_tag)
 {
 	const auto& th = aida::ui::resolved();
 	ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -708,6 +1239,11 @@ inline void render_enum_detail(const pdb_parser::enum_def_t& def, float origin_x
 
 	dl->AddText(head, 16.f, ImVec2(a.x + 14.f, a.y + 8.f),
 		aida::ui::with_alpha(th.text_primary, alpha), def.name.c_str());
+
+	ImVec2 name_sz = head->CalcTextSizeA(16.f, FLT_MAX, 0.f, def.name.c_str());
+	render_origin_badge(dl, code, ImVec2(a.x + 14.f + name_sz.x + 10.f, a.y + 12.f),
+		origin, lib_tag, alpha);
+
 	char meta[64];
 	std::snprintf(meta, sizeof(meta), "enum  %zu members  ti=%u",
 		def.members.size(), def.type_index);
@@ -727,6 +1263,9 @@ inline void render_enum_detail(const pdb_parser::enum_def_t& def, float origin_x
 		out += "};\n";
 		ImGui::SetClipboardText(out.c_str());
 		flash("Copied " + def.name + " as C", th.success);
+		diag::log_tagged_fmt("types",
+			"copy_enum_c name='%s' members=%zu bytes=%zu",
+			def.name.c_str(), def.members.size(), out.size());
 	}
 
 	float list_y = a.y + top_h + 8.f;
@@ -760,8 +1299,7 @@ inline void render_enum_detail(const pdb_parser::enum_def_t& def, float origin_x
 	ImGui::PopClipRect();
 }
 
-inline void render_function_detail(const pdb_parser::pdb_info_t& pdb,
-                                    const pdb_parser::pdb_symbol_t& sym,
+inline void render_function_detail(const merged_function_entry_t& mfe,
                                     float origin_x, float origin_y, float width, float height,
                                     float alpha)
 {
@@ -778,53 +1316,138 @@ inline void render_function_detail(const pdb_parser::pdb_info_t& pdb,
 	dl->AddRect(a, b, aida::ui::with_alpha(th.border_subtle, alpha), 8.f, 0, 1.f);
 
 	dl->AddText(head, 15.f, ImVec2(a.x + 14.f, a.y + 12.f),
-		aida::ui::with_alpha(th.text_primary, alpha), sym.name.c_str());
+		aida::ui::with_alpha(th.text_primary, alpha), mfe.name.c_str());
 
-	char meta[128];
-	std::snprintf(meta, sizeof(meta), "rva=0x%llX  size=%u  ti=%u  module=%s",
-		static_cast<unsigned long long>(sym.rva), sym.size, sym.type_index,
-		pdb.module_name.c_str());
+	ImVec2 name_sz = head->CalcTextSizeA(15.f, FLT_MAX, 0.f, mfe.name.c_str());
+	render_origin_badge(dl, code, ImVec2(a.x + 14.f + name_sz.x + 10.f, a.y + 14.f),
+		mfe.origin, mfe.module_tag, alpha);
+
+	char meta[160];
+	if (mfe.origin == origin_t::pdb) {
+		std::snprintf(meta, sizeof(meta), "rva=0x%llX  size=%u  ti=%u  module=%s",
+			static_cast<unsigned long long>(mfe.rva), mfe.size, mfe.type_index,
+			mfe.module_tag.c_str());
+	} else {
+		std::snprintf(meta, sizeof(meta), "synthesized prototype  imports from %s",
+			mfe.module_tag.empty() ? "unknown" : mfe.module_tag.c_str());
+	}
 	dl->AddText(code, 12.f, ImVec2(a.x + 14.f, a.y + 34.f),
 		aida::ui::with_alpha(th.text_dim, alpha), meta);
 
-	std::string sig = function_signature_for(pdb, sym);
 	dl->AddText(code, 14.f, ImVec2(a.x + 14.f, a.y + 60.f),
-		aida::ui::with_alpha(th.syn_function, alpha), sig.c_str());
+		aida::ui::with_alpha(th.syn_function, alpha), mfe.signature.c_str());
 
 	ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 90.f));
 	if (aida::ui::button("Copy name", aida::ui::button_kind_t::ghost,
 		aida::ui::size_t_::sm, ImVec2(108.f, 28.f))) {
-		ImGui::SetClipboardText(sym.name.c_str());
+		ImGui::SetClipboardText(mfe.name.c_str());
 		flash("Copied symbol name", th.success);
+		diag::log_tagged_fmt("types",
+			"copy_function_name name='%s'", mfe.name.c_str());
 	}
 	ImGui::SameLine();
-	if (aida::ui::button("Copy RVA", aida::ui::button_kind_t::ghost,
-		aida::ui::size_t_::sm, ImVec2(96.f, 28.f))) {
-		char rb[24];
-		std::snprintf(rb, sizeof(rb), "0x%llX", static_cast<unsigned long long>(sym.rva));
-		ImGui::SetClipboardText(rb);
-		flash("Copied RVA", th.success);
+	if (aida::ui::button("Copy signature", aida::ui::button_kind_t::ghost,
+		aida::ui::size_t_::sm, ImVec2(132.f, 28.f))) {
+		ImGui::SetClipboardText(mfe.signature.c_str());
+		flash("Copied signature", th.success);
+		diag::log_tagged_fmt("types",
+			"copy_function_signature name='%s' bytes=%zu",
+			mfe.name.c_str(), mfe.signature.size());
 	}
-	ImGui::SameLine();
-	if (aida::ui::button("Jump", aida::ui::button_kind_t::primary,
-		aida::ui::size_t_::sm, ImVec2(96.f, 28.f))) {
-		uint64_t addr = symbol_store::resolve_name_to_addr(sym.name);
-		if (addr == 0 && g_disasm.file.image_base != 0) {
-			addr = g_disasm.file.image_base + sym.rva;
+	if (mfe.origin == origin_t::pdb) {
+		ImGui::SameLine();
+		if (aida::ui::button("Copy RVA", aida::ui::button_kind_t::ghost,
+			aida::ui::size_t_::sm, ImVec2(96.f, 28.f))) {
+			char rb[24];
+			std::snprintf(rb, sizeof(rb), "0x%llX", static_cast<unsigned long long>(mfe.rva));
+			ImGui::SetClipboardText(rb);
+			flash("Copied RVA", th.success);
+			diag::log_tagged_fmt("types",
+				"copy_function_rva name='%s' rva=0x%llX",
+				mfe.name.c_str(),
+				static_cast<unsigned long long>(mfe.rva));
 		}
-		if (addr != 0) {
-			globals::ui::active_center_view = center_view_t::disassembly;
-			disasm_view::goto_address(addr, g_disasm);
-			flash("Jumped to disassembly", th.success);
-		} else {
-			flash("No active disassembly target", th.error);
+		ImGui::SameLine();
+		if (aida::ui::button("Jump", aida::ui::button_kind_t::primary,
+			aida::ui::size_t_::sm, ImVec2(96.f, 28.f))) {
+			uint64_t addr = symbol_store::resolve_name_to_addr(mfe.name);
+			bool via_symbol = (addr != 0);
+			if (addr == 0 && g_disasm.file.image_base != 0) {
+				addr = g_disasm.file.image_base + mfe.rva;
+			}
+			if (addr != 0) {
+				globals::ui::active_center_view = center_view_t::disassembly;
+				disasm_view::goto_address(addr, g_disasm);
+				flash("Jumped to disassembly", th.success);
+				diag::log_tagged_fmt("types",
+					"jump_function name='%s' rva=0x%llX addr=0x%llX via_symbol=%d",
+					mfe.name.c_str(),
+					static_cast<unsigned long long>(mfe.rva),
+					static_cast<unsigned long long>(addr),
+					via_symbol ? 1 : 0);
+			} else {
+				flash("No active disassembly target", th.error);
+				diag::log_tagged_fmt("types",
+					"jump_function_failed name='%s' rva=0x%llX reason='no_base'",
+					mfe.name.c_str(),
+					static_cast<unsigned long long>(mfe.rva));
+			}
 		}
+	}
+}
+
+inline void render_typedef_detail(const merged_typedef_entry_t& td,
+                                   float origin_x, float origin_y, float width, float height,
+                                   float alpha)
+{
+	const auto& th = aida::ui::resolved();
+	ImDrawList* dl = ImGui::GetWindowDrawList();
+	ImFont* head = aida::ui::fonts::body_em();
+	if (!head) head = ImGui::GetFont();
+	ImFont* code = aida::ui::fonts::code();
+	if (!code) code = ImGui::GetFont();
+
+	ImVec2 a = ImVec2(origin_x, origin_y);
+	ImVec2 b = ImVec2(origin_x + width, origin_y + height);
+	dl->AddRectFilled(a, b, aida::ui::with_alpha(th.panel_bg, alpha * 0.55f), 8.f);
+	dl->AddRect(a, b, aida::ui::with_alpha(th.border_subtle, alpha), 8.f, 0, 1.f);
+
+	dl->AddText(head, 16.f, ImVec2(a.x + 14.f, a.y + 12.f),
+		aida::ui::with_alpha(th.text_primary, alpha), td.name.c_str());
+
+	ImVec2 name_sz = head->CalcTextSizeA(16.f, FLT_MAX, 0.f, td.name.c_str());
+	render_origin_badge(dl, code, ImVec2(a.x + 14.f + name_sz.x + 10.f, a.y + 14.f),
+		td.origin, td.lib_tag, alpha);
+
+	char meta[96];
+	std::snprintf(meta, sizeof(meta), "typedef  size=%u byte%s",
+		td.size, td.size == 1 ? "" : "s");
+	dl->AddText(code, 12.f, ImVec2(a.x + 14.f, a.y + 34.f),
+		aida::ui::with_alpha(th.text_dim, alpha), meta);
+
+	std::string decl = "typedef ";
+	decl += td.target;
+	decl += " ";
+	decl += td.name;
+	decl += ";";
+	dl->AddText(code, 14.f, ImVec2(a.x + 14.f, a.y + 60.f),
+		aida::ui::with_alpha(th.syn_type, alpha), decl.c_str());
+
+	ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 96.f));
+	if (aida::ui::button("Copy C", aida::ui::button_kind_t::ghost,
+		aida::ui::size_t_::sm, ImVec2(84.f, 28.f))) {
+		ImGui::SetClipboardText(decl.c_str());
+		flash("Copied typedef", th.success);
+		diag::log_tagged_fmt("types",
+			"copy_typedef name='%s' target='%s'",
+			td.name.c_str(), td.target.c_str());
 	}
 }
 
 inline void render_list_pane(float origin_x, float origin_y, float width, float height,
                               const std::vector<std::string>& labels,
                               const std::vector<std::string>& sublabels,
+                              const std::vector<origin_t>& origins,
                               int& selection, float alpha)
 {
 	const auto& th = aida::ui::resolved();
@@ -887,11 +1510,19 @@ inline void render_list_pane(float origin_x, float origin_y, float width, float 
 			g_state.target_scroll_detail = 0.f;
 		}
 
-		dl->AddText(body, 13.f, ImVec2(ra.x + 10.f, ry + 4.f),
+		origin_t row_origin = (i < static_cast<int>(origins.size()))
+			? origins[static_cast<size_t>(i)]
+			: origin_t::pdb;
+		ImU32 dot_col = origin_badge_color(row_origin, th);
+		dl->AddRectFilled(ImVec2(ra.x + 6.f, ry + row_h * 0.5f - 3.f),
+			ImVec2(ra.x + 10.f, ry + row_h * 0.5f + 3.f),
+			aida::ui::with_alpha(dot_col, alpha * 0.85f), 1.5f);
+
+		dl->AddText(body, 13.f, ImVec2(ra.x + 18.f, ry + 4.f),
 			aida::ui::with_alpha(sel ? th.text_primary : th.text_secondary, alpha),
 			labels[static_cast<size_t>(i)].c_str());
 		if (i < static_cast<int>(sublabels.size()) && !sublabels[static_cast<size_t>(i)].empty()) {
-			dl->AddText(code, 11.f, ImVec2(ra.x + 10.f, ry + 17.f),
+			dl->AddText(code, 11.f, ImVec2(ra.x + 18.f, ry + 17.f),
 				aida::ui::with_alpha(th.text_dim, alpha),
 				sublabels[static_cast<size_t>(i)].c_str());
 		}
@@ -913,7 +1544,8 @@ inline void render_list_pane(float origin_x, float origin_y, float width, float 
 	}
 }
 
-inline void render_browser_pane(sub_tab_t tab, float origin_x, float origin_y,
+inline void render_browser_pane(sub_tab_t tab, const merged_types_t& merged,
+                                 float origin_x, float origin_y,
                                  float width, float height, float alpha)
 {
 	const auto& th = aida::ui::resolved();
@@ -949,144 +1581,134 @@ inline void render_browser_pane(sub_tab_t tab, float origin_x, float origin_y,
 
 	std::vector<std::string> labels;
 	std::vector<std::string> sublabels;
+	std::vector<origin_t>    origins;
 	int* selection = nullptr;
 
-	const pdb_parser::struct_def_t* sel_struct_ref = nullptr;
-	const pdb_parser::enum_def_t*   sel_enum_ref = nullptr;
-	pdb_parser::pdb_symbol_t        sel_function_copy;
-	const pdb_parser::pdb_info_t*   pdb_for_detail = nullptr;
-	bool have_function = false;
+	const merged_struct_entry_t*   sel_struct_ref = nullptr;
+	const merged_enum_entry_t*     sel_enum_ref = nullptr;
+	const merged_typedef_entry_t*  sel_typedef_ref = nullptr;
+	const merged_function_entry_t* sel_function_ref = nullptr;
 
+	auto build_struct_view = [&](const std::vector<merged_struct_entry_t>& src,
+		std::vector<size_t>& visible_idx, int& sel)
 	{
-		std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
-		const pdb_parser::pdb_info_t* pdb = active_pdb_locked();
-		if (pdb) {
-			pdb_for_detail = pdb;
-
-			if (tab == sub_tab_t::structs) {
-				g_state.visible_struct_idx.clear();
-				labels.reserve(pdb->structs.size());
-				sublabels.reserve(pdb->structs.size());
-				for (size_t i = 0; i < pdb->structs.size(); ++i) {
-					const auto& s = pdb->structs[i];
-					if (s.is_union) continue;
-					if (!ci_contains(s.name, buf)) continue;
-					g_state.visible_struct_idx.push_back(i);
-					labels.push_back(s.name);
-					char sub[64];
-					std::snprintf(sub, sizeof(sub), "%llu B  %zu fields",
-						static_cast<unsigned long long>(s.size), s.members.size());
-					sublabels.push_back(sub);
-				}
-				selection = &g_state.sel_struct;
-				if (*selection >= static_cast<int>(g_state.visible_struct_idx.size())) *selection = -1;
-				if (*selection >= 0) {
-					size_t i = g_state.visible_struct_idx[static_cast<size_t>(*selection)];
-					sel_struct_ref = &pdb->structs[i];
-				}
-			}
-			else if (tab == sub_tab_t::unions) {
-				g_state.visible_union_idx.clear();
-				for (size_t i = 0; i < pdb->structs.size(); ++i) {
-					const auto& s = pdb->structs[i];
-					if (!s.is_union) continue;
-					if (!ci_contains(s.name, buf)) continue;
-					g_state.visible_union_idx.push_back(i);
-					labels.push_back(s.name);
-					char sub[64];
-					std::snprintf(sub, sizeof(sub), "%llu B  %zu fields",
-						static_cast<unsigned long long>(s.size), s.members.size());
-					sublabels.push_back(sub);
-				}
-				selection = &g_state.sel_union;
-				if (*selection >= static_cast<int>(g_state.visible_union_idx.size())) *selection = -1;
-				if (*selection >= 0) {
-					size_t i = g_state.visible_union_idx[static_cast<size_t>(*selection)];
-					sel_struct_ref = &pdb->structs[i];
-				}
-			}
-			else if (tab == sub_tab_t::enums) {
-				g_state.visible_enum_idx.clear();
-				for (size_t i = 0; i < pdb->enums.size(); ++i) {
-					const auto& e = pdb->enums[i];
-					if (!ci_contains(e.name, buf)) continue;
-					g_state.visible_enum_idx.push_back(i);
-					labels.push_back(e.name);
-					char sub[48];
-					std::snprintf(sub, sizeof(sub), "%zu values", e.members.size());
-					sublabels.push_back(sub);
-				}
-				selection = &g_state.sel_enum;
-				if (*selection >= static_cast<int>(g_state.visible_enum_idx.size())) *selection = -1;
-				if (*selection >= 0) {
-					size_t i = g_state.visible_enum_idx[static_cast<size_t>(*selection)];
-					sel_enum_ref = &pdb->enums[i];
-				}
-			}
-			else if (tab == sub_tab_t::typedefs) {
-				g_state.visible_typedef_idx.clear();
-				selection = &g_state.sel_typedef;
-				*selection = -1;
-			}
-			else if (tab == sub_tab_t::functions) {
-				g_state.visible_function_idx.clear();
-				for (size_t i = 0; i < pdb->symbols.size(); ++i) {
-					const auto& s = pdb->symbols[i];
-					if (!s.is_function) continue;
-					if (!ci_contains(s.name, buf)) continue;
-					g_state.visible_function_idx.push_back(i);
-				}
-				labels.reserve(g_state.visible_function_idx.size());
-				sublabels.reserve(g_state.visible_function_idx.size());
-				for (size_t idx : g_state.visible_function_idx) {
-					const auto& s = pdb->symbols[idx];
-					labels.push_back(s.name);
-					char sub[48];
-					std::snprintf(sub, sizeof(sub), "rva=0x%llX  %u B",
-						static_cast<unsigned long long>(s.rva), s.size);
-					sublabels.push_back(sub);
-				}
-				selection = &g_state.sel_function;
-				if (*selection >= static_cast<int>(g_state.visible_function_idx.size())) *selection = -1;
-				if (*selection >= 0) {
-					size_t i = g_state.visible_function_idx[static_cast<size_t>(*selection)];
-					sel_function_copy = pdb->symbols[i];
-					have_function = true;
-				}
-			}
+		visible_idx.clear();
+		labels.reserve(src.size());
+		sublabels.reserve(src.size());
+		origins.reserve(src.size());
+		for (size_t i = 0; i < src.size(); ++i) {
+			const auto& s = src[i];
+			if (!ci_contains(s.def.name, buf)) continue;
+			visible_idx.push_back(i);
+			labels.push_back(s.def.name);
+			char sub[96];
+			std::snprintf(sub, sizeof(sub), "%llu B  %zu fields  %s",
+				static_cast<unsigned long long>(s.def.size),
+				s.def.members.size(),
+				s.lib_tag.c_str());
+			sublabels.push_back(sub);
+			origins.push_back(s.origin);
 		}
+		if (sel >= static_cast<int>(visible_idx.size())) sel = -1;
+		if (sel >= 0) sel_struct_ref = &src[visible_idx[static_cast<size_t>(sel)]];
+	};
+
+	if (tab == sub_tab_t::structs) {
+		build_struct_view(merged.structs, g_state.visible_struct_idx, g_state.sel_struct);
+		selection = &g_state.sel_struct;
+	}
+	else if (tab == sub_tab_t::unions) {
+		build_struct_view(merged.unions, g_state.visible_union_idx, g_state.sel_union);
+		selection = &g_state.sel_union;
+	}
+	else if (tab == sub_tab_t::enums) {
+		g_state.visible_enum_idx.clear();
+		labels.reserve(merged.enums.size());
+		sublabels.reserve(merged.enums.size());
+		origins.reserve(merged.enums.size());
+		for (size_t i = 0; i < merged.enums.size(); ++i) {
+			const auto& e = merged.enums[i];
+			if (!ci_contains(e.def.name, buf)) continue;
+			g_state.visible_enum_idx.push_back(i);
+			labels.push_back(e.def.name);
+			char sub[80];
+			std::snprintf(sub, sizeof(sub), "%zu values  %s",
+				e.def.members.size(), e.lib_tag.c_str());
+			sublabels.push_back(sub);
+			origins.push_back(e.origin);
+		}
+		selection = &g_state.sel_enum;
+		if (*selection >= static_cast<int>(g_state.visible_enum_idx.size())) *selection = -1;
+		if (*selection >= 0)
+			sel_enum_ref = &merged.enums[g_state.visible_enum_idx[static_cast<size_t>(*selection)]];
+	}
+	else if (tab == sub_tab_t::typedefs) {
+		g_state.visible_typedef_idx.clear();
+		labels.reserve(merged.typedefs.size());
+		sublabels.reserve(merged.typedefs.size());
+		origins.reserve(merged.typedefs.size());
+		for (size_t i = 0; i < merged.typedefs.size(); ++i) {
+			const auto& t = merged.typedefs[i];
+			if (!ci_contains(t.name, buf)) continue;
+			g_state.visible_typedef_idx.push_back(i);
+			labels.push_back(t.name);
+			std::string sub = t.target;
+			sub += "  ";
+			sub += t.lib_tag;
+			sublabels.push_back(std::move(sub));
+			origins.push_back(t.origin);
+		}
+		selection = &g_state.sel_typedef;
+		if (*selection >= static_cast<int>(g_state.visible_typedef_idx.size())) *selection = -1;
+		if (*selection >= 0)
+			sel_typedef_ref = &merged.typedefs[g_state.visible_typedef_idx[static_cast<size_t>(*selection)]];
+	}
+	else if (tab == sub_tab_t::functions) {
+		g_state.visible_function_idx.clear();
+		labels.reserve(merged.functions.size());
+		sublabels.reserve(merged.functions.size());
+		origins.reserve(merged.functions.size());
+		for (size_t i = 0; i < merged.functions.size(); ++i) {
+			const auto& f = merged.functions[i];
+			if (!ci_contains(f.name, buf) && !ci_contains(f.signature, buf)) continue;
+			g_state.visible_function_idx.push_back(i);
+			labels.push_back(f.name);
+			char sub[120];
+			if (f.origin == origin_t::pdb) {
+				std::snprintf(sub, sizeof(sub), "rva=0x%llX  %u B  %s",
+					static_cast<unsigned long long>(f.rva), f.size,
+					f.module_tag.c_str());
+			} else {
+				std::snprintf(sub, sizeof(sub), "synthesized  %s",
+					f.module_tag.c_str());
+			}
+			sublabels.push_back(sub);
+			origins.push_back(f.origin);
+		}
+		selection = &g_state.sel_function;
+		if (*selection >= static_cast<int>(g_state.visible_function_idx.size())) *selection = -1;
+		if (*selection >= 0)
+			sel_function_ref = &merged.functions[g_state.visible_function_idx[static_cast<size_t>(*selection)]];
 	}
 
 	int fake = -1;
 	int* sel_ptr = selection ? selection : &fake;
-	render_list_pane(origin_x, list_y, list_w, list_h, labels, sublabels, *sel_ptr, alpha);
+	render_list_pane(origin_x, list_y, list_w, list_h, labels, sublabels, origins, *sel_ptr, alpha);
 
 	float detail_x = origin_x + list_w + gutter;
 	float detail_y = origin_y;
 	float detail_h = height;
 
-	if (tab == sub_tab_t::typedefs) {
-		const auto& th2 = aida::ui::resolved();
-		ImDrawList* dl = ImGui::GetWindowDrawList();
-		ImVec2 a = ImVec2(detail_x, detail_y);
-		ImVec2 b = ImVec2(detail_x + detail_w, detail_y + detail_h);
-		dl->AddRectFilled(a, b, aida::ui::with_alpha(th2.panel_bg, alpha * 0.55f), 8.f);
-		dl->AddRect(a, b, aida::ui::with_alpha(th2.border_subtle, alpha), 8.f, 0, 1.f);
-		aida::ui::empty_state::config_t cfg;
-		cfg.glyph = aida::ui::empty_state::glyph_t::layers;
-		cfg.title = "Typedefs";
-		cfg.body = "DbgHelp exposes typedefs as resolved type names on each field rather than as standalone records. Use Structures and Enums to inspect alias targets in context.";
-		cfg.max_width = 380.f;
-		aida::ui::empty_state::render(a, ImVec2(detail_w, detail_h), cfg);
-		return;
-	}
-
 	if (sel_struct_ref) {
-		render_struct_detail(*sel_struct_ref, detail_x, detail_y, detail_w, detail_h, alpha);
+		render_struct_detail(sel_struct_ref->def, detail_x, detail_y, detail_w, detail_h,
+			alpha, sel_struct_ref->origin, sel_struct_ref->lib_tag);
 	} else if (sel_enum_ref) {
-		render_enum_detail(*sel_enum_ref, detail_x, detail_y, detail_w, detail_h, alpha);
-	} else if (have_function && pdb_for_detail) {
-		render_function_detail(*pdb_for_detail, sel_function_copy, detail_x, detail_y, detail_w, detail_h, alpha);
+		render_enum_detail(sel_enum_ref->def, detail_x, detail_y, detail_w, detail_h,
+			alpha, sel_enum_ref->origin, sel_enum_ref->lib_tag);
+	} else if (sel_typedef_ref) {
+		render_typedef_detail(*sel_typedef_ref, detail_x, detail_y, detail_w, detail_h, alpha);
+	} else if (sel_function_ref) {
+		render_function_detail(*sel_function_ref, detail_x, detail_y, detail_w, detail_h, alpha);
 	} else {
 		const auto& th2 = aida::ui::resolved();
 		ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1103,12 +1725,25 @@ inline void render_browser_pane(sub_tab_t tab, float origin_x, float origin_y,
 	}
 }
 
+inline const merged_types_t*& active_merged_ptr()
+{
+	static thread_local const merged_types_t* p = nullptr;
+	return p;
+}
+
 inline void render_active(int idx, float cw, float ch, float fa, float ar, float ag, float ab)
 {
 	(void)ar; (void)ag; (void)ab;
 	auto tab = static_cast<sub_tab_t>(idx);
 
-	stats_t st = snapshot_active_pdb();
+	const merged_types_t* mp = active_merged_ptr();
+	merged_types_t fallback;
+	if (!mp) {
+		fallback = build_merged_types_snapshot();
+		mp = &fallback;
+	}
+	const merged_types_t& merged = *mp;
+	stats_t st = snapshot_active_pdb(merged);
 	bool manual_busy = (g_state.manual_job && !g_state.manual_job->done->load(std::memory_order_acquire));
 	if (manual_busy) {
 		st.loading = true;
@@ -1123,11 +1758,12 @@ inline void render_active(int idx, float cw, float ch, float fa, float ar, float
 	render_stat_bar(dl, ImVec2(win_pos.x + 8.f, win_pos.y + 4.f),
 		cw - 16.f, stat_h, st, fa);
 
-	if (st.loaded) {
+	{
 		float pdb_btn_x = win_pos.x + cw - 8.f - 124.f;
 		ImGui::SetCursorScreenPos(ImVec2(pdb_btn_x, win_pos.y + 4.f + stat_h - 36.f));
 		if (aida::ui::button("Load PDB...", aida::ui::button_kind_t::ghost,
 			aida::ui::size_t_::sm, ImVec2(118.f, 28.f))) {
+			diag::log_tagged_fmt("pdb", "load_pdb_button_clicked");
 			std::string p = browse_for_pdb();
 			if (!p.empty()) start_manual_pdb_load(p);
 		}
@@ -1136,11 +1772,6 @@ inline void render_active(int idx, float cw, float ch, float fa, float ar, float
 	float body_y = 4.f + stat_h + stat_gap;
 	float body_h = ch - body_y - 8.f;
 	if (body_h < 80.f) body_h = 80.f;
-
-	float manual_progress = 0.f;
-	if (g_state.manual_job) {
-		manual_progress = g_state.manual_job->progress->load(std::memory_order_relaxed);
-	}
 
 	if (tab == sub_tab_t::inferred) {
 		struct_recon_view::render(8.f, body_y, cw - 16.f, body_h, fa, ar, ag, ab);
@@ -1151,18 +1782,16 @@ inline void render_active(int idx, float cw, float ch, float fa, float ar, float
 		return;
 	}
 
-	if (!st.loaded) {
-		ImGui::SetCursorPos(ImVec2(8.f, body_y));
-		ImGui::BeginChild("##types_empty_region", ImVec2(cw - 16.f, body_h), false,
-			ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
-		ImVec2 wp = ImGui::GetWindowPos();
-		render_empty_pdb_state(wp, ImVec2(cw - 16.f, body_h),
-			st.loading || manual_busy, st.failed, st.status_text, manual_progress);
-		ImGui::EndChild();
-		return;
-	}
-
 	if (g_state.last_sel_tab != idx) {
+		const char* tab_names[] = {
+			"structs", "unions", "enums", "typedefs",
+			"functions", "inferred", "dissector"
+		};
+		const char* tn = (idx >= 0 && idx < static_cast<int>(sizeof(tab_names)/sizeof(tab_names[0])))
+			? tab_names[idx] : "unknown";
+		diag::log_tagged_fmt("types",
+			"subtab_changed prev=%d new=%d name='%s'",
+			g_state.last_sel_tab, idx, tn);
 		g_state.last_sel_tab = idx;
 		g_state.target_scroll_list = 0.f;
 		g_state.target_scroll_detail = 0.f;
@@ -1172,12 +1801,23 @@ inline void render_active(int idx, float cw, float ch, float fa, float ar, float
 
 	float pane_x = win_pos.x + 8.f;
 	float pane_y = win_pos.y + body_y;
-	render_browser_pane(tab, pane_x, pane_y, cw - 16.f, body_h, fa);
+	render_browser_pane(tab, merged, pane_x, pane_y, cw - 16.f, body_h, fa);
 }
 
 inline void render(float pos_x, float pos_y, float width, float height,
                    float alpha, float accent_r, float accent_g, float accent_b)
 {
+	if (!analysis_session::has_active_target()) {
+		ImVec2 wp = ImGui::GetWindowPos();
+		aida::ui::no_target_overlay::render(
+			ImVec2(wp.x + pos_x, wp.y + pos_y),
+			ImVec2(width, height),
+			"No binary open",
+			"The Types Hub explores PDB types, builtin typelibs and struct reconstruction. Open a file or attach to a process to begin.",
+			alpha, aida::ui::empty_state::glyph_t::layers);
+		return;
+	}
+
 	float dt = aida::ui::clock::dt();
 	aida::ui::hub_strip::tick_swap(g_state.strip, dt);
 
@@ -1210,10 +1850,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	int prev_idx = g_state.strip.prev;
 	int new_idx  = g_state.strip.active;
 
+	auto cached_merged = get_merged_types_cached();
+	active_merged_ptr() = cached_merged.get();
+
 	aida::ui::hub_strip::render_swap_content(g_state.strip, cw,
 		[&]() { render_active(prev_idx, cw, ch, alpha, accent_r, accent_g, accent_b); },
 		[&]() { render_active(new_idx,  cw, ch, alpha, accent_r, accent_g, accent_b); }
 	);
+
+	active_merged_ptr() = nullptr;
 
 	ImGui::EndChild();
 

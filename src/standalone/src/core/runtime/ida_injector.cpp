@@ -28,6 +28,7 @@
 
 #include "../settings/standalone_settings.hpp"
 #include "../helpers/diag_log.hpp"
+#include "../helpers/win32_dialog.hpp"
 #include "../infra/work_queue.hpp"
 #include "standalone_driver.hpp"
 #include "../../../../aida_manual_map_proof.hpp"
@@ -330,17 +331,16 @@ namespace
     std::string prompt_for_ida_exe(HWND owner)
     {
         char buf[MAX_PATH] = {};
-        OPENFILENAMEA ofn = {};
-        ofn.lStructSize = sizeof(ofn);
-        ofn.hwndOwner = owner;
-        ofn.lpstrTitle = "Select ida.exe / ida64.exe";
-        ofn.lpstrFile = buf;
-        ofn.nMaxFile = MAX_PATH;
-        ofn.lpstrFilter = "IDA executable\0ida.exe;ida64.exe;idat.exe;idat64.exe\0All files (*.*)\0*.*\0";
-        ofn.nFilterIndex = 1;
-        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-        if (!GetOpenFileNameA(&ofn))
+        static const char k_ida_filter[] =
+            "IDA executable\0ida.exe;ida64.exe;idat.exe;idat64.exe\0"
+            "All files (*.*)\0*.*\0\0";
+        if (!win32_dialog::show_open_file_dialog(owner,
+                "Select ida.exe / ida64.exe",
+                k_ida_filter,
+                buf, sizeof(buf),
+                "ida_injector::prompt_for_ida_exe")) {
             return {};
+        }
         return std::string(buf);
     }
 

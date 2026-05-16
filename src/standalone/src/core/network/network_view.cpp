@@ -15,10 +15,14 @@
 #include "../ui/transition.hpp"
 #include "../ui/components.hpp"
 #include "../ui/empty_state.hpp"
+#include "../ui/no_target_overlay.hpp"
 #include "../ui/skeleton.hpp"
 #include "../ui/blur_layer.hpp"
 #include "../ui/fonts.hpp"
 #include "../helpers/helpers.h"
+#include "../helpers/diag_log.hpp"
+#include "../helpers/win32_dialog.hpp"
+#include "../session/analysis_session.hpp"
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -268,12 +272,13 @@ static bool filter_text_match(const char* filter, const std::string& text) {
 
 
 static void connection_poll_thread(state_t& state) {
-    driver_bridge::debug_log("[network] connection_poll_thread STARTED\n");
+    diag::log_tagged_fmt("network", "connection_poll_thread_started auto_refresh=%d filter_pid=%u filter_proto=%u",
+        state.conn_auto_refresh ? 1 : 0, state.conn_filter_pid, state.conn_filter_protocol);
     int poll_iter = 0;
     while (state.conn_polling.load()) {
         bool drv_ok = driver_bridge::using_kernel_driver();
         ++poll_iter;
-        if (drv_ok) {
+        if (drv_ok && state.conn_auto_refresh) {
             auto raw_conns = driver_bridge::enumerate_connections(
                 state.conn_filter_pid, state.conn_filter_protocol);
 
@@ -292,10 +297,17 @@ static void connection_poll_thread(state_t& state) {
                 entries.push_back(std::move(e));
             }
 
+            size_t count = entries.size();
             {
                 std::lock_guard<std::mutex> lock(state.conn_mutex);
                 state.connections = std::move(entries);
             }
+            if (poll_iter <= 3 || (poll_iter % 60) == 0) {
+                diag::log_tagged_fmt("network", "connection_poll iter=%d drv_ok=1 count=%zu", poll_iter, count);
+            }
+        } else if (poll_iter <= 3 || (poll_iter % 60) == 0) {
+            diag::log_tagged_fmt("network", "connection_poll iter=%d drv_ok=%d auto_refresh=%d skipped",
+                poll_iter, drv_ok ? 1 : 0, state.conn_auto_refresh ? 1 : 0);
         }
 
         std::unique_lock<std::mutex> lk(state.conn_cv_mutex);
@@ -303,10 +315,11 @@ static void connection_poll_thread(state_t& state) {
             return !state.conn_polling.load();
         });
     }
+    diag::log_tagged("network", "connection_poll_thread_exited");
 }
 
 static void capture_poll_thread(state_t& state) {
-    driver_bridge::debug_log("[network] capture_poll_thread STARTED\n");
+    diag::log_tagged("network", "capture_poll_thread_started");
     state.cap_thread_alive.store(true);
     int poll_iter = 0;
     while (true) {
@@ -319,21 +332,18 @@ static void capture_poll_thread(state_t& state) {
         if (!state.cap_thread_alive.load())
             break;
         poll_iter = 0;
+        diag::log_tagged("network", "capture_poll_loop_armed");
         while (state.cap_polling.load()) {
             bool drv_ok = driver_bridge::using_kernel_driver();
             if (poll_iter < 5 || (poll_iter % 100) == 0) {
-                char dbg[128];
-                snprintf(dbg, sizeof(dbg), "[network] capture_poll iter=%d drv_ok=%d\n", poll_iter, drv_ok ? 1 : 0);
-                driver_bridge::debug_log(dbg);
+                diag::log_tagged_fmt("network", "capture_poll iter=%d drv_ok=%d", poll_iter, drv_ok ? 1 : 0);
             }
             ++poll_iter;
             if (drv_ok) {
                 auto raw_packets = driver_bridge::get_captured_packets(64);
 
                 if (!raw_packets.empty()) {
-                    char dbg[128];
-                    snprintf(dbg, sizeof(dbg), "[network] capture_poll got %zu packets\n", raw_packets.size());
-                    driver_bridge::debug_log(dbg);
+                    size_t batch_n = raw_packets.size();
                     std::lock_guard<std::mutex> lock(state.cap_mutex);
                     for (auto& p : raw_packets) {
                         packet_entry_t entry;
@@ -359,17 +369,23 @@ static void capture_poll_thread(state_t& state) {
                         while (state.captured_packets.size() > state.cap_max_packets)
                             state.captured_packets.pop_front();
                     }
+                    if (poll_iter <= 5 || (poll_iter % 50) == 0) {
+                        diag::log_tagged_fmt("network", "capture_poll_batch packets=%zu total_buffered=%zu",
+                            batch_n, state.captured_packets.size());
+                    }
                 }
             }
 
             for (int i = 0; i < 10 && state.cap_polling.load(); i++)
                 Sleep(10);
         }
+        diag::log_tagged_fmt("network", "capture_poll_loop_idle iter=%d", poll_iter);
     }
+    diag::log_tagged("network", "capture_poll_thread_exited");
 }
 
 static void dns_poll_thread(state_t& state) {
-    driver_bridge::debug_log("[network] dns_poll_thread STARTED\n");
+    diag::log_tagged("network", "dns_poll_thread_started");
     state.dns_thread_alive.store(true);
     int poll_iter = 0;
     while (true) {
@@ -382,21 +398,19 @@ static void dns_poll_thread(state_t& state) {
         if (!state.dns_thread_alive.load())
             break;
         poll_iter = 0;
+        diag::log_tagged("network", "dns_poll_loop_armed");
         while (state.dns_polling.load()) {
             bool drv_ok = driver_bridge::using_kernel_driver();
             if (poll_iter < 5 || (poll_iter % 100) == 0) {
-                char dbg[128];
-                snprintf(dbg, sizeof(dbg), "[network] dns_poll iter=%d drv_ok=%d\n", poll_iter, drv_ok ? 1 : 0);
-                driver_bridge::debug_log(dbg);
+                diag::log_tagged_fmt("network", "dns_poll iter=%d drv_ok=%d filter_pid=%u",
+                    poll_iter, drv_ok ? 1 : 0, state.dns_filter_pid);
             }
             ++poll_iter;
             if (drv_ok) {
                 auto raw_dns = driver_bridge::get_dns_queries(state.dns_filter_pid);
 
                 if (!raw_dns.empty()) {
-                    char dbg[128];
-                    snprintf(dbg, sizeof(dbg), "[network] dns_poll got %zu entries\n", raw_dns.size());
-                    driver_bridge::debug_log(dbg);
+                    size_t added = 0;
                     std::lock_guard<std::mutex> lock(state.dns_mutex);
                     for (auto& d : raw_dns) {
                         bool duplicate = false;
@@ -418,21 +432,30 @@ static void dns_poll_thread(state_t& state) {
                             e.response_code = d.response_code;
                             e.ttl = d.ttl;
                             state.dns_entries.push_back(std::move(e));
+                            ++added;
                         }
                     }
                     while (state.dns_entries.size() > state.dns_max_entries)
                         state.dns_entries.pop_front();
+                    if (added > 0) {
+                        diag::log_tagged_fmt("network", "dns_poll_batch raw=%zu added=%zu total=%zu",
+                            raw_dns.size(), added, state.dns_entries.size());
+                    }
                 }
             }
 
             for (int i = 0; i < 50 && state.dns_polling.load(); i++)
                 Sleep(10);
         }
+        diag::log_tagged_fmt("network", "dns_poll_loop_idle iter=%d", poll_iter);
     }
+    diag::log_tagged("network", "dns_poll_thread_exited");
 }
 
 static void bandwidth_poll_thread(state_t& state) {
+    diag::log_tagged("network", "bandwidth_poll_thread_started");
     state.bw_thread_alive.store(true);
+    int poll_iter = 0;
     while (true) {
         {
             std::unique_lock<std::mutex> lk(state.bw_cv_mutex);
@@ -442,9 +465,15 @@ static void bandwidth_poll_thread(state_t& state) {
         }
         if (!state.bw_thread_alive.load())
             break;
+        poll_iter = 0;
+        diag::log_tagged("network", "bandwidth_poll_loop_armed");
         while (state.bw_polling.load()) {
+            ++poll_iter;
             if (driver_bridge::using_kernel_driver()) {
                 auto raw_bw = driver_bridge::get_bw_per_process();
+                if (poll_iter <= 3 || (poll_iter % 60) == 0) {
+                    diag::log_tagged_fmt("network", "bandwidth_poll iter=%d processes=%zu", poll_iter, raw_bw.size());
+                }
 
             std::vector<bw_entry_t> old_entries;
             {
@@ -491,7 +520,9 @@ static void bandwidth_poll_thread(state_t& state) {
             for (int i = 0; i < 50 && state.bw_polling.load(); i++)
                 Sleep(10);
         }
+        diag::log_tagged_fmt("network", "bandwidth_poll_loop_idle iter=%d", poll_iter);
     }
+    diag::log_tagged("network", "bandwidth_poll_thread_exited");
 }
 
 
@@ -499,6 +530,7 @@ static void run_fuzzer_thread(state_t& state);
 
 void initialize() {
     g_state.active = true;
+    diag::log_tagged("network", "initialize_begin");
 
     work_queue::initialize();
 
@@ -545,6 +577,7 @@ void initialize() {
     g_state.fuzz_thread_alive.store(true);
     g_state.fuzz_thread_done.store(false, std::memory_order_release);
     if (!work_queue::post([]() {
+            diag::log_tagged("network", "fuzzer_thread_started");
             while (true) {
                 {
                     std::unique_lock<std::mutex> lk(g_state.fuzz_cv_mutex);
@@ -557,13 +590,17 @@ void initialize() {
                 run_fuzzer_thread(g_state);
             }
             g_state.fuzz_thread_done.store(true, std::memory_order_release);
+            diag::log_tagged("network", "fuzzer_thread_exited");
         }))
     {
         g_state.fuzz_thread_done.store(true, std::memory_order_release);
+        diag::log_tagged("network", "fuzzer_thread_post_failed");
     }
+    diag::log_tagged("network", "initialize_complete");
 }
 
 void shutdown() {
+    diag::log_tagged("network", "shutdown_begin");
     g_state.conn_polling.store(false);
     g_state.conn_cv.notify_all();
     g_state.bw_polling.store(false);
@@ -597,6 +634,7 @@ void shutdown() {
     mitm_proxy::stop();
     ssl_keylog::stop_watching();
     g_state.active = false;
+    diag::log_tagged("network", "shutdown_complete");
 }
 
 
@@ -758,11 +796,20 @@ static void render_connections(state_t& state, float x, float y, float w, float 
                           "Filter by PID, host, port...", false, ImVec2(280.f, 32.f));
     ImGui::SameLine();
     if (!driver_ok) ImGui::BeginDisabled();
+    bool prev_auto = state.conn_auto_refresh;
     aida::ui::toggle_switch("Auto refresh##conn_auto", &state.conn_auto_refresh);
+    if (prev_auto != state.conn_auto_refresh) {
+        diag::log_tagged_fmt("network", "connections_auto_refresh_toggled enabled=%d",
+            state.conn_auto_refresh ? 1 : 0);
+        state.conn_cv.notify_all();
+    }
     ImGui::SameLine();
     if (aida::ui::button("Refresh##conn_refresh", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+        diag::log_tagged_fmt("network", "connections_refresh_clicked drv_ok=%d filter_pid=%u filter_proto=%u",
+            driver_ok ? 1 : 0, state.conn_filter_pid, state.conn_filter_protocol);
         if (driver_ok) {
             auto raw = driver_bridge::enumerate_connections(state.conn_filter_pid, state.conn_filter_protocol);
+            size_t n = raw.size();
             std::lock_guard<std::mutex> lock(state.conn_mutex);
             state.connections.clear();
             for (auto& c : raw) {
@@ -777,6 +824,7 @@ static void render_connections(state_t& state, float x, float y, float w, float 
                 memcpy(e.remote_addr, c.remote_addr, 16);
                 state.connections.push_back(std::move(e));
             }
+            diag::log_tagged_fmt("network", "connections_refresh_done count=%zu", n);
         }
     }
     if (!driver_ok) ImGui::EndDisabled();
@@ -1012,28 +1060,23 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
 
     if (!state.cap_running) {
         if (aida::ui::button("Start Capture", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
-            char dbg[256];
-            snprintf(dbg, sizeof(dbg), "[network] START_CAPTURE clicked: filter_pid=%u filter_port=%u filter_proto=%u drv_ok=%d\n",
+            diag::log_tagged_fmt("network", "start_capture_clicked filter_pid=%u filter_port=%u filter_proto=%u drv_ok=%d",
                 state.cap_filter_pid, state.cap_filter_port, state.cap_filter_protocol,
                 driver_bridge::using_kernel_driver() ? 1 : 0);
-            driver_bridge::debug_log(dbg);
             if (driver_bridge::start_capture(state.cap_filter_pid, state.cap_filter_port,
                                        state.cap_filter_protocol, nullptr)) {
-                driver_bridge::debug_log("[network] start_capture returned TRUE, signaling poll thread\n");
+                diag::log_tagged("network", "start_capture_ok poll_thread_signaled");
                 state.cap_running = true;
                 state.cap_polling.store(true);
                 state.cap_cv.notify_all();
             } else {
-                driver_bridge::debug_log("[network] start_capture returned FALSE — driver IOCTL may have failed or capture_active=0\n");
-                char fail_msg[256];
-                snprintf(fail_msg, sizeof(fail_msg),
-                    "[network] start_capture FAILED (kernel_mode=%d). Check driver capture/WFP support.",
+                diag::log_tagged_fmt("network", "start_capture_failed kernel_mode=%d",
                     driver_bridge::using_kernel_driver() ? 1 : 0);
-                driver_bridge::debug_log(fail_msg);
             }
         }
     } else {
         if (aida::ui::button("Stop Capture", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+            diag::log_tagged("network", "stop_capture_clicked");
             driver_bridge::stop_capture();
             state.cap_running = false;
             state.cap_polling.store(false);
@@ -1045,8 +1088,10 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
     ImGui::SameLine();
     if (aida::ui::button("Clear", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
         std::lock_guard<std::mutex> lock(state.cap_mutex);
+        size_t prev = state.captured_packets.size();
         state.captured_packets.clear();
         state.cap_selected = -1;
+        diag::log_tagged_fmt("network", "capture_cleared prev_packet_count=%zu", prev);
     }
 
     {
@@ -1337,18 +1382,24 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
 
     if (!state.dns_polling.load()) {
         if (aida::ui::button("Start DNS Monitor", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
+            diag::log_tagged_fmt("network", "dns_monitor_start_clicked filter_pid=%u drv_ok=%d",
+                state.dns_filter_pid, driver_ok ? 1 : 0);
             state.dns_polling.store(true);
             state.dns_cv.notify_all();
         }
     } else {
         if (aida::ui::button("Stop DNS Monitor", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+            diag::log_tagged("network", "dns_monitor_stop_clicked");
             state.dns_polling.store(false);
         }
     }
     ImGui::SameLine();
     if (aida::ui::button("Refresh", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+        diag::log_tagged_fmt("network", "dns_refresh_clicked drv_ok=%d filter_pid=%u",
+            driver_ok ? 1 : 0, state.dns_filter_pid);
         if (driver_ok) {
             auto raw = driver_bridge::get_dns_queries(state.dns_filter_pid);
+            size_t added = 0;
             std::lock_guard<std::mutex> lock(state.dns_mutex);
             for (auto& d : raw) {
                 bool duplicate = false;
@@ -1370,10 +1421,13 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
                     e.response_code = d.response_code;
                     e.ttl = d.ttl;
                     state.dns_entries.push_back(std::move(e));
+                    ++added;
                 }
             }
             while (state.dns_entries.size() > state.dns_max_entries)
                 state.dns_entries.pop_front();
+            diag::log_tagged_fmt("network", "dns_refresh_done raw=%zu added=%zu total=%zu",
+                raw.size(), added, state.dns_entries.size());
         }
     }
 
@@ -1567,7 +1621,11 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
             cfg.bind_addr = state.proxy_bind_addr;
             cfg.bind_port = static_cast<uint16_t>(state.proxy_port);
             cfg.decode_tls = state.proxy_decode_tls;
-            mitm_proxy::start(cfg);
+            diag::log_tagged_fmt("network", "proxy_start_clicked bind=%s:%u decode_tls=%d",
+                state.proxy_bind_addr, state.proxy_port, state.proxy_decode_tls ? 1 : 0);
+            bool ok = mitm_proxy::start(cfg);
+            diag::log_tagged_fmt("network", "proxy_start_result ok=%d running=%d",
+                ok ? 1 : 0, mitm_proxy::is_running() ? 1 : 0);
         }
     } else {
         auto stats = mitm_proxy::get_stats();
@@ -1601,11 +1659,16 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
             format_bytes(stats.total_bytes_out).c_str());
 
         ImGui::SameLine();
-        if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm))
+        if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+            diag::log_tagged("network", "proxy_stop_clicked");
             mitm_proxy::stop();
+        }
         ImGui::SameLine();
-        if (aida::ui::button("Clear History", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm))
+        if (aida::ui::button("Clear History", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+            size_t prev = mitm_proxy::history_count();
             mitm_proxy::clear_history();
+            diag::log_tagged_fmt("network", "proxy_history_cleared prev_count=%zu", prev);
+        }
     }
 
     ImGui::SameLine();
@@ -1621,6 +1684,8 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         aida::ui::pill_kind(pin_buf, aida::ui::pill_kind_t::success, aida::ui::size_t_::sm, false);
         ImGui::SameLine();
         if (aida::ui::button("Revert Bypasses", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+            diag::log_tagged_fmt("network", "cert_pin_revert_clicked patches=%zu",
+                cert_pin_bypass::get_active_bypasses().size());
             cert_pin_bypass::revert_all_bypasses();
         }
     }
@@ -1844,6 +1909,9 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
             rep->port = ex.target_port;
             rep->use_tls = ex.is_tls;
             rep->raw_request = std::string(ex.raw_request.begin(), ex.raw_request.end());
+            diag::log_tagged_fmt("network", "proxy_send_to_repeater id=%llu host=%s:%u tls=%d size=%zu",
+                static_cast<unsigned long long>(ex.id), ex.target_host.c_str(), ex.target_port,
+                ex.is_tls ? 1 : 0, rep->raw_request.size());
             state.repeater_entries.push_back(std::move(rep));
             state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
         }
@@ -1909,17 +1977,40 @@ static void render_filters(state_t& state, float x, float y, float w, float h,
             inet_pton(AF_INET, state.nf_ip, ip_bytes);
         }
 
-        driver_bridge::add_filter_rule(
+        uint32_t out_rule_id = 0;
+        bool added = driver_bridge::add_filter_rule(
             static_cast<uint32_t>(state.nf_action),
             static_cast<uint32_t>(state.nf_direction),
             static_cast<uint32_t>(state.nf_protocol),
-            pid, port, ip_bytes, nullptr, nullptr);
+            pid, port, ip_bytes, nullptr, &out_rule_id);
+        diag::log_tagged_fmt("network", "filter_add_rule action=%d dir=%d proto=%d pid=%u port=%u ip='%s' added=%d rule_id=%u",
+            state.nf_action, state.nf_direction, state.nf_protocol, pid, port,
+            state.nf_ip, added ? 1 : 0, out_rule_id);
+        if (added) {
+            filter_entry_t fe;
+            fe.rule_id = out_rule_id;
+            fe.action = static_cast<uint8_t>(state.nf_action);
+            fe.direction = static_cast<uint8_t>(state.nf_direction);
+            fe.protocol = static_cast<uint8_t>(state.nf_protocol);
+            fe.pid = pid;
+            fe.port = port;
+            fe.ip_addr = state.nf_ip;
+            fe.active = true;
+            state.filters.push_back(std::move(fe));
+            toast_notification::push("Filter rule added", toast_notification::toast_type_t::info);
+        } else {
+            toast_notification::push("Failed to add filter rule",
+                toast_notification::toast_type_t::error);
+        }
     }
 
     ImGui::SameLine();
     if (aida::ui::button("Clear All", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
-        driver_bridge::clear_filter_rules();
+        size_t prev_n = state.filters.size();
+        bool cleared = driver_bridge::clear_filter_rules();
         state.filters.clear();
+        diag::log_tagged_fmt("network", "filter_clear_all prev_count=%zu driver_cleared=%d",
+            prev_n, cleared ? 1 : 0);
     }
     if (!driver_ok) ImGui::EndDisabled();
 
@@ -1935,10 +2026,12 @@ static void render_filters(state_t& state, float x, float y, float w, float h,
                            "No active filter rules.");
     }
 
+    int remove_idx = -1;
     for (int i = 0; i < static_cast<int>(state.filters.size()); i++) {
         auto& f = state.filters[static_cast<size_t>(i)];
-        char rule_buf[160];
-        snprintf(rule_buf, sizeof(rule_buf), "%s  %s %s  PID:%u  Port:%u  %s",
+        char rule_buf[192];
+        snprintf(rule_buf, sizeof(rule_buf), "#%u  %s  %s %s  PID:%u  Port:%u  %s",
+                 f.rule_id,
                  f.action == 0 ? "BLOCK" : "ALLOW",
                  f.direction == 0 ? "IN" : f.direction == 1 ? "OUT" : "BOTH",
                  f.protocol == 6 ? "TCP" : f.protocol == 17 ? "UDP" : "ANY",
@@ -1947,6 +2040,18 @@ static void render_filters(state_t& state, float x, float y, float w, float h,
             ? aida::ui::pill_kind_t::error
             : aida::ui::pill_kind_t::success;
         aida::ui::pill_kind(rule_buf, kind, aida::ui::size_t_::sm, true);
+        ImGui::SameLine();
+        ImGui::PushID(i);
+        if (aida::ui::button("Remove", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm))
+            remove_idx = i;
+        ImGui::PopID();
+    }
+    if (remove_idx >= 0 && remove_idx < static_cast<int>(state.filters.size())) {
+        auto& f = state.filters[static_cast<size_t>(remove_idx)];
+        bool drv_removed = driver_bridge::remove_filter_rule(f.rule_id);
+        diag::log_tagged_fmt("network", "filter_remove_rule rule_id=%u drv_removed=%d", f.rule_id,
+            drv_removed ? 1 : 0);
+        state.filters.erase(state.filters.begin() + remove_idx);
     }
 
     ImGui::EndChild();
@@ -1966,14 +2071,18 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
 
     if (!state.bw_polling.load()) {
         if (aida::ui::button("Start Monitoring", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
-            driver_bridge::bw_monitor_op(0);
+            bool drv_started = driver_bridge::bw_monitor_op(0);
+            diag::log_tagged_fmt("network", "bandwidth_monitor_start_clicked drv_ok=%d drv_started=%d",
+                driver_ok ? 1 : 0, drv_started ? 1 : 0);
             state.bw_monitoring = true;
             state.bw_polling.store(true);
             state.bw_cv.notify_one();
         }
     } else {
         if (aida::ui::button("Stop Monitoring", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
-            driver_bridge::bw_monitor_op(1);
+            bool drv_stopped = driver_bridge::bw_monitor_op(1);
+            diag::log_tagged_fmt("network", "bandwidth_monitor_stop_clicked drv_stopped=%d",
+                drv_stopped ? 1 : 0);
             state.bw_monitoring = false;
             state.bw_polling.store(false);
         }
@@ -2169,6 +2278,8 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
         rep->port = static_cast<uint16_t>(state.rep_port);
         rep->use_tls = state.rep_use_tls;
         rep->raw_request = "GET / HTTP/1.1\r\nHost: " + std::string(state.rep_host) + "\r\n\r\n";
+        diag::log_tagged_fmt("network", "repeater_new_entry host=%s:%d tls=%d",
+            state.rep_host, state.rep_port, state.rep_use_tls ? 1 : 0);
         state.repeater_entries.push_back(std::move(rep));
         state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
     }
@@ -2184,8 +2295,26 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
             aida::ui::button_kind_t kk = is_sel
                 ? aida::ui::button_kind_t::primary
                 : aida::ui::button_kind_t::secondary;
-            if (aida::ui::button(label, kk, aida::ui::size_t_::sm))
+            if (aida::ui::button(label, kk, aida::ui::size_t_::sm)) {
+                if (state.repeater_selected != i)
+                    diag::log_tagged_fmt("network", "repeater_tab_switched from=%d to=%d",
+                        state.repeater_selected, i);
                 state.repeater_selected = i;
+            }
+        }
+
+        ImGui::SameLine();
+        if (state.repeater_selected >= 0 &&
+            state.repeater_selected < static_cast<int>(state.repeater_entries.size())) {
+            if (aida::ui::button("Close##rep_close", aida::ui::button_kind_t::ghost,
+                                  aida::ui::size_t_::sm)) {
+                int idx = state.repeater_selected;
+                diag::log_tagged_fmt("network", "repeater_entry_closed idx=%d", idx);
+                state.repeater_entries.erase(
+                    state.repeater_entries.begin() + static_cast<ptrdiff_t>(idx));
+                if (state.repeater_selected >= static_cast<int>(state.repeater_entries.size()))
+                    state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
+            }
         }
 
         ImGui::Spacing();
@@ -2203,31 +2332,56 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                                "Request");
 
             static char req_buf[65536] = {};
-            if (rep.raw_request.size() < sizeof(req_buf)) {
-                memcpy(req_buf, rep.raw_request.data(), rep.raw_request.size());
-                req_buf[rep.raw_request.size()] = '\0';
+            static const repeater_entry_t* req_buf_owner = nullptr;
+            static bool req_buf_dirty = false;
+            if (req_buf_owner != &rep) {
+                size_t copy_n = rep.raw_request.size() < (sizeof(req_buf) - 1)
+                    ? rep.raw_request.size()
+                    : (sizeof(req_buf) - 1);
+                memcpy(req_buf, rep.raw_request.data(), copy_n);
+                req_buf[copy_n] = '\0';
+                req_buf_owner = &rep;
+                req_buf_dirty = false;
             }
             if (ImGui::InputTextMultiline("##rep_req_edit", req_buf, sizeof(req_buf),
                 ImVec2(half_w - 4.f, panel_h - 78.f))) {
                 rep.raw_request = req_buf;
+                req_buf_dirty = true;
             }
 
             if (!rep.in_progress) {
                 if (aida::ui::button("Send", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
+                    if (req_buf_dirty) {
+                        rep.raw_request = req_buf;
+                        req_buf_dirty = false;
+                    }
                     rep.in_progress = true;
                     std::shared_ptr<repeater_entry_t> entry = rep_ptr;
+                    diag::log_tagged_fmt("network", "repeater_send_clicked host=%s:%u tls=%d req_size=%zu",
+                        entry->host.c_str(), entry->port, entry->use_tls ? 1 : 0,
+                        entry->raw_request.size());
                     work_queue::post([entry]() {
                         std::vector<uint8_t> raw(entry->raw_request.begin(), entry->raw_request.end());
+                        auto t0 = GetTickCount64();
                         auto result = mitm_proxy::repeat_request(
                             entry->host, entry->port, entry->use_tls, raw);
+                        uint64_t elapsed = GetTickCount64() - t0;
                         if (result.success) {
                             entry->raw_response = std::string(result.exchange.raw_response.begin(),
                                 result.exchange.raw_response.end());
                             entry->status_code = result.exchange.response.status_code;
                             entry->latency_ms = result.exchange.latency_ms;
+                            diag::log_tagged_fmt("network", "repeater_send_ok host=%s:%u status=%d size=%zu latency_ms=%llu wall_ms=%llu",
+                                entry->host.c_str(), entry->port, entry->status_code,
+                                entry->raw_response.size(),
+                                static_cast<unsigned long long>(entry->latency_ms),
+                                static_cast<unsigned long long>(elapsed));
                         } else {
                             entry->raw_response = "Error: " + result.error;
                             entry->status_code = 0;
+                            diag::log_tagged_fmt("network", "repeater_send_failed host=%s:%u err='%s' wall_ms=%llu",
+                                entry->host.c_str(), entry->port, result.error.c_str(),
+                                static_cast<unsigned long long>(elapsed));
                         }
                         entry->in_progress = false;
                     });
@@ -2296,20 +2450,28 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
         return;
     }
 
-    aida::ui::toggle_switch("##intercept_en", &state.intercept_enabled);
-    if (ImGui::IsItemActivated()) mitm_proxy::set_intercept_enabled(state.intercept_enabled);
+    bool intercept_changed = aida::ui::toggle_switch("##intercept_en", &state.intercept_enabled);
+    if (intercept_changed) {
+        diag::log_tagged_fmt("network", "intercept_enabled_toggled new=%d",
+            state.intercept_enabled ? 1 : 0);
+        mitm_proxy::set_intercept_enabled(state.intercept_enabled);
+    }
     ImGui::SameLine();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_primary, alpha)),
                        "Intercept Enabled");
     ImGui::SameLine();
 
-    if (aida::ui::button("Forward All", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm))
+    if (aida::ui::button("Forward All", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
+        diag::log_tagged("network", "intercept_forward_all_clicked");
         mitm_proxy::forward_all();
+    }
     ImGui::SameLine();
     aida::ui::kbd_chip("Shift+F");
     ImGui::SameLine();
-    if (aida::ui::button("Drop All", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm))
+    if (aida::ui::button("Drop All", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+        diag::log_tagged("network", "intercept_drop_all_clicked");
         mitm_proxy::drop_all();
+    }
     ImGui::SameLine();
     aida::ui::kbd_chip("Shift+D");
 
@@ -2338,14 +2500,28 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
 
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows)) {
         bool shift = ImGui::GetIO().KeyShift;
-        if (shift && ImGui::IsKeyPressed(ImGuiKey_F)) mitm_proxy::forward_all();
-        if (shift && ImGui::IsKeyPressed(ImGuiKey_D)) mitm_proxy::drop_all();
+        if (shift && ImGui::IsKeyPressed(ImGuiKey_F)) {
+            diag::log_tagged("network", "intercept_forward_all_shortcut");
+            mitm_proxy::forward_all();
+        }
+        if (shift && ImGui::IsKeyPressed(ImGuiKey_D)) {
+            diag::log_tagged("network", "intercept_drop_all_shortcut");
+            mitm_proxy::drop_all();
+        }
 
 
         if (state.intercept_selected >= 0 && state.intercept_selected < static_cast<int>(held.size())) {
             auto& sel = held[static_cast<size_t>(state.intercept_selected)];
-            if (ImGui::IsKeyPressed(ImGuiKey_F)) mitm_proxy::forward_exchange(sel.id);
-            if (ImGui::IsKeyPressed(ImGuiKey_D)) mitm_proxy::drop_exchange(sel.id);
+            if (!shift && ImGui::IsKeyPressed(ImGuiKey_F)) {
+                diag::log_tagged_fmt("network", "intercept_forward_shortcut id=%llu",
+                    static_cast<unsigned long long>(sel.id));
+                mitm_proxy::forward_exchange(sel.id);
+            }
+            if (!shift && ImGui::IsKeyPressed(ImGuiKey_D)) {
+                diag::log_tagged_fmt("network", "intercept_drop_shortcut id=%llu",
+                    static_cast<unsigned long long>(sel.id));
+                mitm_proxy::drop_exchange(sel.id);
+            }
         }
     }
 
@@ -2459,13 +2635,19 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
         }
 
         ImGui::Spacing();
-        if (aida::ui::button("Forward", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm))
+        if (aida::ui::button("Forward", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
+            diag::log_tagged_fmt("network", "intercept_forward_clicked id=%llu",
+                static_cast<unsigned long long>(sel.id));
             mitm_proxy::forward_exchange(sel.id);
+        }
         ImGui::SameLine();
         aida::ui::kbd_chip("F");
         ImGui::SameLine();
-        if (aida::ui::button("Drop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm))
+        if (aida::ui::button("Drop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+            diag::log_tagged_fmt("network", "intercept_drop_clicked id=%llu",
+                static_cast<unsigned long long>(sel.id));
             mitm_proxy::drop_exchange(sel.id);
+        }
         ImGui::SameLine();
         aida::ui::kbd_chip("D");
         ImGui::SameLine();
@@ -2473,8 +2655,12 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
             size_t len = strlen(mod_buf);
             if (len > 0) {
                 std::vector<uint8_t> mod_data(mod_buf, mod_buf + len);
+                diag::log_tagged_fmt("network", "intercept_forward_modified id=%llu new_size=%zu",
+                    static_cast<unsigned long long>(sel.id), len);
                 mitm_proxy::forward_modified(sel.id, mod_data);
             } else {
+                diag::log_tagged_fmt("network", "intercept_forward_modified id=%llu empty_buf_fallback_forward",
+                    static_cast<unsigned long long>(sel.id));
                 mitm_proxy::forward_exchange(sel.id);
             }
         }
@@ -2487,7 +2673,11 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
             rep->port = sel.target_port;
             rep->use_tls = sel.is_tls;
             rep->raw_request = std::string(sel.raw_request.begin(), sel.raw_request.end());
+            diag::log_tagged_fmt("network", "intercept_send_to_repeater id=%llu host=%s:%u size=%zu",
+                static_cast<unsigned long long>(sel.id), sel.target_host.c_str(), sel.target_port,
+                rep->raw_request.size());
             state.repeater_entries.push_back(std::move(rep));
+            state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
         }
         ImGui::SameLine();
         if (aida::ui::button("Send to Fuzzer", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
@@ -2495,6 +2685,9 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
             state.fuzz_config.port = sel.target_port;
             state.fuzz_config.use_tls = sel.is_tls;
             state.fuzz_config.base_request = std::string(sel.raw_request.begin(), sel.raw_request.end());
+            diag::log_tagged_fmt("network", "intercept_send_to_fuzzer id=%llu host=%s:%u size=%zu",
+                static_cast<unsigned long long>(sel.id), sel.target_host.c_str(), sel.target_port,
+                state.fuzz_config.base_request.size());
             state.active_tab = sub_tab_t::fuzzer;
         }
 
@@ -2567,9 +2760,19 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
 
     if (!ssl_keylog::g_state.watching.load()) {
         if (aida::ui::button("Launch & Watch", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
+            diag::log_tagged_fmt("network", "keylog_launch_clicked exe='%s' args='%s'",
+                state.kl_exe_path, state.kl_args);
             auto result = ssl_keylog::launch_with_keylog(state.kl_exe_path, state.kl_args);
             if (result.success) {
+                diag::log_tagged_fmt("network", "keylog_launch_ok pid=%u keylog='%s'",
+                    result.pid, result.keylog_path.c_str());
                 ssl_keylog::start_watching(result.keylog_path);
+                toast_notification::push("SSL keylog: process launched, watching key file",
+                    toast_notification::toast_type_t::info);
+            } else {
+                diag::log_tagged_fmt("network", "keylog_launch_failed err='%s'", result.error.c_str());
+                toast_notification::push(std::string("Failed to launch: ") + result.error,
+                    toast_notification::toast_type_t::error);
             }
         }
         ImGui::SameLine();
@@ -2577,6 +2780,7 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
             char path[MAX_PATH] = {};
             GetTempPathA(MAX_PATH, path);
             std::string kpath = std::string(path) + "aida_sslkeylog_" + std::to_string(GetCurrentProcessId()) + ".log";
+            diag::log_tagged_fmt("network", "keylog_watch_file_clicked path='%s'", kpath.c_str());
             ssl_keylog::start_watching(kpath);
         }
     } else {
@@ -2584,11 +2788,17 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
         snprintf(watch_buf, sizeof(watch_buf), "Watching: %s", ssl_keylog::g_state.keylog_path.c_str());
         aida::ui::pill_kind(watch_buf, aida::ui::pill_kind_t::accent, aida::ui::size_t_::sm, true);
         ImGui::SameLine();
-        if (aida::ui::button("Stop Watching", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm))
+        if (aida::ui::button("Stop Watching", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+            diag::log_tagged_fmt("network", "keylog_stop_watching path='%s' entries=%zu",
+                ssl_keylog::g_state.keylog_path.c_str(), ssl_keylog::entry_count());
             ssl_keylog::stop_watching();
+        }
         ImGui::SameLine();
-        if (aida::ui::button("Clear", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm))
+        if (aida::ui::button("Clear", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+            size_t prev = ssl_keylog::entry_count();
             ssl_keylog::clear_entries();
+            diag::log_tagged_fmt("network", "keylog_cleared prev_entry_count=%zu", prev);
+        }
     }
 
     ImGui::Spacing();
@@ -2901,10 +3111,14 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
             auto* written_count = &state.pcap_written_count;
             auto* writing_flag = &state.pcap_writing;
 
+            diag::log_tagged_fmt("network", "pcap_export_clicked path='%s' filter_pid=%u filter_proto=%u source_packets=%zu",
+                path.c_str(), filter_pid, filter_proto, packets_copy.size());
+
             work_queue::post([packets_copy = std::move(packets_copy), path, filter_pid, filter_proto,
                          written_count, writing_flag]() {
                 std::ofstream f(path, std::ios::binary);
                 if (!f.is_open()) {
+                    diag::log_tagged_fmt("network", "pcap_export_failed_open path='%s'", path.c_str());
                     *writing_flag = false;
                     return;
                 }
@@ -2920,6 +3134,8 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
                 *written_count = count;
                 f.close();
                 *writing_flag = false;
+                diag::log_tagged_fmt("network", "pcap_export_done path='%s' written=%u",
+                    path.c_str(), count);
             });
         }
     } else {
@@ -2953,10 +3169,15 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
         std::string har_path = std::string(temp) + "aida_proxy_export.har";
 
         auto history = mitm_proxy::get_history(0);
+        diag::log_tagged_fmt("network", "har_export_clicked path='%s' history_count=%zu",
+            har_path.c_str(), history.size());
         work_queue::post([history = std::move(history), har_path]() {
 
             std::ofstream f(har_path);
-            if (!f.is_open()) return;
+            if (!f.is_open()) {
+                diag::log_tagged_fmt("network", "har_export_failed_open path='%s'", har_path.c_str());
+                return;
+            }
 
             f << "{\n  \"log\": {\n    \"version\": \"1.2\",\n    \"entries\": [\n";
             for (size_t i = 0; i < history.size(); i++) {
@@ -2980,6 +3201,8 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
             }
             f << "\n    ]\n  }\n}\n";
             f.close();
+            diag::log_tagged_fmt("network", "har_export_done path='%s' entries=%zu",
+                har_path.c_str(), history.size());
         });
     }
 
@@ -3160,7 +3383,12 @@ static void run_fuzzer_thread(state_t& state) {
         }
     }
 
-    if (combos.empty()) { state.fuzz_running.store(false); return; }
+    if (combos.empty()) {
+        diag::log_tagged_fmt("network", "fuzzer_no_combos attack_mode=%d sets=%zu",
+            static_cast<int>(cfg.attack_mode), cfg.payload_sets.size());
+        state.fuzz_running.store(false);
+        return;
+    }
 
     state.fuzz_total.store(static_cast<int>(combos.size()));
     state.fuzz_progress.store(0);
@@ -3168,6 +3396,9 @@ static void run_fuzzer_thread(state_t& state) {
     std::atomic<int> next_index{0};
     int total   = static_cast<int>(combos.size());
     int threads = std::min(std::max(cfg.thread_count, 1), 32);
+    diag::log_tagged_fmt("network", "fuzzer_run_start host=%s:%u tls=%d mode=%d combos=%d threads=%d",
+        cfg.host.c_str(), cfg.port, cfg.use_tls ? 1 : 0,
+        static_cast<int>(cfg.attack_mode), total, threads);
 
     auto worker = [&]() {
         while (state.fuzz_running.load()) {
@@ -3233,6 +3464,17 @@ static void run_fuzzer_thread(state_t& state) {
         std::unique_lock<std::mutex> lk(done_mtx);
         done_cv.wait(lk, [&remaining]() { return remaining.load() == 0; });
     }
+
+    int final_progress = state.fuzz_progress.load();
+    size_t result_count = 0;
+    int match_count = 0;
+    {
+        std::lock_guard<std::mutex> lk(state.fuzz_mutex);
+        result_count = state.fuzz_results.size();
+        for (auto& fr : state.fuzz_results) if (fr.match) match_count++;
+    }
+    diag::log_tagged_fmt("network", "fuzzer_run_complete combos=%d processed=%d results=%zu matches=%d",
+        total, final_progress, result_count, match_count);
 
     state.fuzz_running.store(false);
 }
@@ -3490,13 +3732,19 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
             }
             state.fuzz_progress.store(0);
             state.fuzz_total.store(0);
+            diag::log_tagged_fmt("network", "fuzzer_start_clicked host=%s:%u tls=%d mode=%d threads=%d delay_ms=%d match_status=%d stop_on_match=%d sets=%zu",
+                cfg.host.c_str(), cfg.port, cfg.use_tls ? 1 : 0,
+                static_cast<int>(cfg.attack_mode), cfg.thread_count, cfg.delay_ms,
+                cfg.match_status, cfg.stop_on_match ? 1 : 0, cfg.payload_sets.size());
             state.fuzz_running.store(true);
             state.fuzz_cv.notify_one();
         }
         ImGui::SameLine();
         if (aida::ui::button("Clear Results", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
             std::lock_guard<std::mutex> lk(state.fuzz_mutex);
+            size_t prev = state.fuzz_results.size();
             state.fuzz_results.clear();
+            diag::log_tagged_fmt("network", "fuzzer_results_cleared prev=%zu", prev);
         }
     } else {
         int prog = state.fuzz_progress.load();
@@ -3517,8 +3765,10 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
         aida::ui::render_progress_bar(pb_pos, 320.f, 8.f, frac, false, true);
         ImGui::Dummy(ImVec2(320.f, 12.f));
         ImGui::SameLine();
-        if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm))
+        if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+            diag::log_tagged_fmt("network", "fuzzer_stop_clicked progress=%d total=%d", prog, tot);
             state.fuzz_running.store(false);
+        }
     }
 
     ImGui::Spacing();
@@ -3677,8 +3927,10 @@ static void render_websocket(state_t& state, float x, float y, float w, float h,
     if (aida::ui::button("Clear", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm,
                          ImVec2(0.f, 28.f))) {
         std::lock_guard<std::mutex> lock(state.ws_mutex);
+        size_t prev = state.ws_frames.size();
         state.ws_frames.clear();
         state.ws_selected = -1;
+        diag::log_tagged_fmt("network", "ws_frames_cleared prev=%zu", prev);
     }
     ImGui::SameLine();
     aida::ui::toggle_switch("##ws_auto", &state.ws_auto_scroll);
@@ -3956,19 +4208,19 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
 
     auto load_script_from_dialog = [&state]() {
         char path_buf[MAX_PATH] = {};
-        OPENFILENAMEA ofn = {};
-        ofn.lStructSize = sizeof(ofn);
-        ofn.hwndOwner = g_hwnd;
-        ofn.lpstrFile = path_buf;
-        ofn.nMaxFile = MAX_PATH;
-        ofn.lpstrFilter = "Lua Scripts\0*.lua\0All files\0*.*\0\0";
-        ofn.lpstrDefExt = "lua";
-        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-
-        if (!GetOpenFileNameA(&ofn))
+        static const char k_lua_open_filter[] =
+            "Lua Scripts (*.lua)\0*.lua\0"
+            "All files (*.*)\0*.*\0\0";
+        if (!win32_dialog::show_open_file_dialog(g_hwnd,
+                "Load Lua Script",
+                k_lua_open_filter,
+                path_buf, sizeof(path_buf),
+                "network_view::load_script")) {
             return;
+        }
 
         std::string path_str(path_buf);
+        diag::log_tagged_fmt("network", "script_load_dialog_pick path='%s'", path_str.c_str());
         if (script_engine::load_script(path_str)) {
             std::filesystem::path fp(path_str);
             std::string stem = fp.stem().string();
@@ -3992,10 +4244,13 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
                 state.scripts.push_back(std::move(ne));
                 state.script_selected = static_cast<int>(state.scripts.size()) - 1;
             }
+            diag::log_tagged_fmt("network", "script_load_ok name='%s' path='%s' total_loaded=%zu",
+                stem.c_str(), path_str.c_str(), state.scripts.size());
             toast_notification::push(std::string("Loaded script: ") + stem,
                                      toast_notification::toast_type_t::info);
         }
         else {
+            diag::log_tagged_fmt("network", "script_load_failed path='%s'", path_str.c_str());
             toast_notification::push(std::string("Failed to load script: ") + path_str,
                                      toast_notification::toast_type_t::error);
         }
@@ -4171,6 +4426,7 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
                              aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm,
                              ImVec2(fbtn_w, 30.f), !can_unload) && can_unload) {
             auto& s = state.scripts[static_cast<size_t>(state.script_selected)];
+            diag::log_tagged_fmt("network", "script_unload_clicked name='%s'", s.name.c_str());
             script_engine::unload_script(s.name);
             s.loaded = false;
         }
@@ -4181,6 +4437,8 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
                              ImVec2(fbtn_w, 30.f), !has_sel) && has_sel) {
             auto& s = state.scripts[static_cast<size_t>(state.script_selected)];
             s.enabled = !s.enabled;
+            diag::log_tagged_fmt("network", "script_toggle_enabled name='%s' enabled=%d",
+                s.name.c_str(), s.enabled ? 1 : 0);
             script_engine::set_script_enabled(s.name, s.enabled);
         }
 
@@ -4273,8 +4531,11 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
         if (aida::ui::button("Run Script", aida::ui::button_kind_t::primary,
                              aida::ui::size_t_::sm, ImVec2(112.f, 30.f), !has_src) && has_src) {
             std::string src(state.script_editor_buf);
+            diag::log_tagged_fmt("network", "script_editor_run size=%zu", src.size());
             work_queue::post([src]() {
-                script_engine::load_script_source("_editor_", src);
+                bool ok = script_engine::load_script_source("_editor_", src);
+                diag::log_tagged_fmt("network", "script_editor_run_result ok=%d size=%zu",
+                    ok ? 1 : 0, src.size());
             });
         }
         ImGui::SameLine(0.f, 8.f);
@@ -4338,8 +4599,11 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
         if (exec || enter) {
             std::string cmd(state.script_console_buf);
             if (!cmd.empty()) {
+                diag::log_tagged_fmt("network", "script_console_exec size=%zu", cmd.size());
                 work_queue::post([cmd]() {
-                    script_engine::execute(cmd);
+                    std::string out = script_engine::execute(cmd);
+                    diag::log_tagged_fmt("network", "script_console_exec_done out_size=%zu",
+                        out.size());
                 });
                 memset(state.script_console_buf, 0, sizeof(state.script_console_buf));
             }
@@ -4499,12 +4763,15 @@ static void render_decoder(state_t& state, float x, float y, float w, float h,
 
 
     static std::string combo_str;
-    if (combo_str.empty()) {
+    static size_t combo_str_count = 0;
+    if (combo_str.empty() || combo_str_count != transforms.size()) {
+        combo_str.clear();
         for (const auto& t : transforms) {
             combo_str += t->name;
             combo_str += '\0';
         }
         combo_str += '\0';
+        combo_str_count = transforms.size();
     }
 
     ImGui::PushItemWidth(pipe_w - 90.f);
@@ -4516,6 +4783,8 @@ static void render_decoder(state_t& state, float x, float y, float w, float h,
             state.decoder_add_transform < static_cast<int>(transforms.size())) {
             state_t::decoder_step_t step;
             step.transform_name = transforms[static_cast<size_t>(state.decoder_add_transform)]->id;
+            diag::log_tagged_fmt("network", "decoder_step_added name='%s' pipeline_size=%zu",
+                step.transform_name.c_str(), state.decoder_pipeline.size() + 1);
             state.decoder_pipeline.push_back(std::move(step));
         }
     }
@@ -4571,6 +4840,8 @@ static void render_decoder(state_t& state, float x, float y, float w, float h,
 
     ImGui::SetCursorPos(ImVec2(4.f, py + 8.f));
     if (aida::ui::button("Clear Pipeline", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+        diag::log_tagged_fmt("network", "decoder_pipeline_cleared prev_size=%zu",
+            state.decoder_pipeline.size());
         state.decoder_pipeline.clear();
         state.decoder_selected_step = -1;
     }
@@ -4579,7 +4850,10 @@ static void render_decoder(state_t& state, float x, float y, float w, float h,
 
         std::string input(state.decoder_input);
         std::vector<uint8_t> data(input.begin(), input.end());
+        diag::log_tagged_fmt("network", "decoder_execute steps=%zu input_size=%zu",
+            state.decoder_pipeline.size(), data.size());
 
+        bool failed = false;
         for (const auto& step : state.decoder_pipeline) {
 
             std::map<std::string, std::string> params;
@@ -4590,9 +4864,15 @@ static void render_decoder(state_t& state, float x, float y, float w, float h,
                 data = std::move(result.data);
             else {
                 state.decoder_output = "Error at '" + step.transform_name + "': " + result.error;
+                diag::log_tagged_fmt("network", "decoder_execute_step_failed step='%s' err='%s'",
+                    step.transform_name.c_str(), result.error.c_str());
                 data.clear();
+                failed = true;
                 break;
             }
+        }
+        if (!failed) {
+            diag::log_tagged_fmt("network", "decoder_execute_done out_size=%zu", data.size());
         }
 
         if (!data.empty()) {
@@ -4695,6 +4975,17 @@ void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b) {
     float dt = ImGui::GetIO().DeltaTime;
     const auto& th = aida::ui::resolved();
+
+    if (!analysis_session::has_active_target()) {
+        ImVec2 wp = ImGui::GetWindowPos();
+        aida::ui::no_target_overlay::render(
+            ImVec2(wp.x + pos_x, wp.y + pos_y),
+            ImVec2(width, height),
+            "No target attached",
+            "The Network panel needs an attached process to enumerate connections, capture packets and run DPI. Attach to a running process or launch a binary to begin.",
+            alpha, aida::ui::empty_state::glyph_t::network);
+        return;
+    }
 
 
     float tab_h = 32.f;

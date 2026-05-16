@@ -26,10 +26,10 @@
 #include <shlobj.h>
 
 #include "imgui/imgui.h"
-#include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include "auth_store.hpp"
+#include "../auth/auth_http.hpp"
 #include "event_bus.hpp"
 #include "provider_catalog.hpp"
 #include "provider_transforms.hpp"
@@ -527,24 +527,26 @@ namespace {
 
 			path = compose_test_path(job->provider_id, job->model_id, path);
 
-			httplib::Client cli(host.c_str());
-			cli.set_connection_timeout(15);
-			cli.set_read_timeout(15);
-			cli.set_write_timeout(10);
-			cli.set_follow_location(true);
-			cli.enable_server_certificate_verification(true);
-
-			httplib::Headers hpp_headers;
-			hpp_headers.emplace("User-Agent", "AiDAStandalone/1.0");
-			hpp_headers.emplace("Accept", "application/json");
+			aida::auth::http::header_list_t test_headers;
+			test_headers.reserve(headers.size() + 2);
+			test_headers.emplace_back("User-Agent", "AiDAStandalone/1.0");
+			test_headers.emplace_back("Accept", "application/json");
 			for (const auto& kv : headers)
-				hpp_headers.emplace(kv.first, kv.second);
+				test_headers.emplace_back(kv.first, kv.second);
 
 			const nlohmann::json body = build_test_body(job->provider_id, job->model_id);
 			const std::string body_str = body.dump();
 
+			std::string post_host = host;
+			while (!post_host.empty() && post_host.back() == '/')
+				post_host.pop_back();
+			const std::string test_url = post_host
+				+ (path.empty() ? std::string("/") : (path.front() == '/' ? path : std::string("/") + path));
+
 			const auto t0 = std::chrono::steady_clock::now();
-			auto res = cli.Post(path.c_str(), hpp_headers, body_str, "application/json");
+			aida::auth::http::response_t res = aida::auth::http::post(
+				test_url, test_headers, body_str,
+				std::string("application/json"), 20);
 			const auto t1 = std::chrono::steady_clock::now();
 			result.latency_ms = static_cast<int>(
 				std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
@@ -558,24 +560,25 @@ namespace {
 				return;
 			}
 
-			if (!res) {
+			if (!res.ok && res.status == 0) {
 				result.success = false;
-				result.message = std::string("transport error: ") + httplib::to_string(res.error());
+				result.message = std::string("transport error: ")
+					+ (res.error.empty() ? std::string("connection failed") : res.error);
 			} else {
-				result.http_status = res->status;
-				if (res->status >= 200 && res->status < 300) {
+				result.http_status = res.status;
+				if (res.status >= 200 && res.status < 300) {
 					result.success = true;
-					result.message = std::string("HTTP ") + std::to_string(res->status);
-				} else if (res->status == 400 || res->status == 422) {
+					result.message = std::string("HTTP ") + std::to_string(res.status);
+				} else if (res.status == 400 || res.status == 422) {
 					result.success = true;
-					result.message = std::string("HTTP ") + std::to_string(res->status) + " (auth ok, body rejected)";
-				} else if (res->status == 401 || res->status == 403) {
+					result.message = std::string("HTTP ") + std::to_string(res.status) + " (auth ok, body rejected)";
+				} else if (res.status == 401 || res.status == 403) {
 					result.success = false;
-					result.message = std::string("HTTP ") + std::to_string(res->status) + " (auth rejected)";
+					result.message = std::string("HTTP ") + std::to_string(res.status) + " (auth rejected)";
 				} else {
 					result.success = false;
-					std::string snippet = res->body.substr(0, 200);
-					result.message = std::string("HTTP ") + std::to_string(res->status) + ": " + snippet;
+					std::string snippet = res.body.substr(0, 200);
+					result.message = std::string("HTTP ") + std::to_string(res.status) + ": " + snippet;
 				}
 			}
 
@@ -904,15 +907,18 @@ namespace {
 			for (const auto* m : models) {
 				const bool is_sel = (current_model_id == m->id);
 				char label[160];
-				std::snprintf(label, sizeof(label), "%s  -  %s",
+				std::snprintf(label, sizeof(label), "%s  -  %s##%s",
 					m->name.c_str(),
-					format_cost_pair(m->cost.input_per_million, m->cost.output_per_million).c_str());
+					format_cost_pair(m->cost.input_per_million, m->cost.output_per_million).c_str(),
+					m->id.c_str());
+				ImGui::PushID(m->id.c_str());
 				if (ImGui::Selectable(label, is_sel)) {
 					set_preferred_model_for(provider.id, m->id);
 					g_sa_settings.save();
 				}
 				if (is_sel)
 					ImGui::SetItemDefaultFocus();
+				ImGui::PopID();
 			}
 			ImGui::EndCombo();
 		}

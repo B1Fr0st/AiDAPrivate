@@ -11,8 +11,10 @@
 #include "ui/skeleton.hpp"
 #include "ui/fonts.hpp"
 #include "ui/hub_strip.hpp"
+#include "ui/toast_notification.hpp"
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
+#include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -97,11 +99,13 @@ inline void render_protection_scan(float pos_x, float pos_y, float w, float h,
 	if (!scanning) {
 		if (aida::ui::button("Scan", aida::ui::button_kind_t::primary,
 			aida::ui::size_t_::sm, ImVec2(76.f, 28.f))) {
+			diag::log_tagged("stealth", "view_scan_request");
 			stealth_engine::run_protection_scan();
 		}
 	} else {
 		if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive,
 			aida::ui::size_t_::sm, ImVec2(76.f, 28.f))) {
+			diag::log_tagged("stealth", "view_scan_stop");
 			stealth_engine::stop_protection_scan();
 		}
 	}
@@ -109,9 +113,11 @@ inline void render_protection_scan(float pos_x, float pos_y, float w, float h,
 	if (aida::ui::button("Clear", aida::ui::button_kind_t::ghost,
 		aida::ui::size_t_::sm, ImVec2(76.f, 28.f))) {
 		std::lock_guard<std::mutex> lk(stealth_engine::g_scan.mutex);
+		size_t cleared = stealth_engine::g_scan.findings.size();
 		stealth_engine::g_scan.findings.clear();
 		stealth_engine::g_scan.scan_status.clear();
 		st.selected_finding = -1;
+		diag::log_tagged_fmt("stealth", "view_findings_cleared count=%zu", cleared);
 	}
 	ImGui::SameLine();
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
@@ -436,11 +442,30 @@ inline void render_stealth_controls(float pos_x, float pos_y, float w, float h,
 			if (st.pid_input[0])
 				pid = static_cast<uint32_t>(std::strtoul(st.pid_input, nullptr, 10));
 			if (pid == 0) pid = driver_bridge::attached_pid();
-			if (pid != 0) stealth_engine::enable_stealth(pid);
+			if (pid == 0) {
+				diag::log_tagged("stealth", "view_enable_reject reason=no_pid");
+				toast_notification::push("Attach to a process or enter a PID first",
+					toast_notification::toast_type_t::warning, 3.0f);
+			} else {
+				stealth_engine::stealth_options_t opts;
+				opts.spoof_peb = st.opt_peb;
+				opts.hook_rdtsc = st.opt_rdtsc;
+				opts.scrub_context = st.opt_context;
+				diag::log_tagged_fmt("stealth",
+					"view_enable_request pid=%u peb=%d rdtsc=%d ctx=%d",
+					pid, st.opt_peb ? 1 : 0, st.opt_rdtsc ? 1 : 0,
+					st.opt_context ? 1 : 0);
+				bool ok = stealth_engine::enable_stealth(pid, opts);
+				if (!ok) {
+					toast_notification::push("Failed to start stealth (see aida_debug.log)",
+						toast_notification::toast_type_t::error, 3.0f);
+				}
+			}
 		}
 	} else {
 		if (aida::ui::button("Stop Stealth", aida::ui::button_kind_t::destructive,
 			aida::ui::size_t_::sm, ImVec2(120.f, 28.f))) {
+			diag::log_tagged("stealth", "view_disable_request");
 			stealth_engine::disable_stealth();
 		}
 	}

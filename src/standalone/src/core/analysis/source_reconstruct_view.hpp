@@ -16,6 +16,7 @@
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
 #include "../helpers/helpers.h"
+#include "../helpers/win32_dialog.hpp"
 #include "source_reconstructor.hpp"
 #include "ui_anim.hpp"
 #include "theme.hpp"
@@ -76,44 +77,17 @@ inline void close() {
 
 inline bool pick_output_directory(HWND owner, char* buf, size_t buf_size) {
 	if (!buf || buf_size < 4) return false;
-	HRESULT co_init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-	bool need_uninit = SUCCEEDED(co_init);
-
-	IFileOpenDialog* dialog = nullptr;
-	HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
-		IID_IFileOpenDialog, reinterpret_cast<void**>(&dialog));
-	if (FAILED(hr) || !dialog) {
-		if (need_uninit) CoUninitialize();
+	std::string picked;
+	if (!win32_dialog::show_open_folder_dialog(owner,
+			L"Select Output Directory",
+			picked,
+			"source_reconstruct_view::pick_output_directory")) {
 		return false;
 	}
-
-	DWORD options = 0;
-	if (SUCCEEDED(dialog->GetOptions(&options))) {
-		dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_PATHMUSTEXIST | FOS_FORCEFILESYSTEM);
-	}
-	dialog->SetTitle(L"Select Output Directory");
-
-	bool ok = false;
-	hr = dialog->Show(owner);
-	if (SUCCEEDED(hr)) {
-		IShellItem* item = nullptr;
-		if (SUCCEEDED(dialog->GetResult(&item)) && item) {
-			PWSTR path = nullptr;
-			if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
-				int needed = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr, nullptr);
-				if (needed > 0 && static_cast<size_t>(needed) <= buf_size) {
-					WideCharToMultiByte(CP_UTF8, 0, path, -1, buf,
-						static_cast<int>(buf_size), nullptr, nullptr);
-					ok = true;
-				}
-				CoTaskMemFree(path);
-			}
-			item->Release();
-		}
-	}
-	dialog->Release();
-	if (need_uninit) CoUninitialize();
-	return ok;
+	if (picked.empty() || picked.size() + 1 > buf_size) return false;
+	std::memcpy(buf, picked.data(), picked.size());
+	buf[picked.size()] = '\0';
+	return true;
 }
 
 inline void render(float alpha, float ar, float ag, float ab) {

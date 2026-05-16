@@ -21,6 +21,18 @@ cmd /c "\"C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliar
 
 If a header was edited but the build reports "no work to do", touch the dependent source files (`(Get-Item path).LastWriteTime = Get-Date`) to force a recompile — header-only changes don't always trigger Ninja invalidation. A "compiles in my head" review is not a substitute for an actual build — protected-binary header changes and ScopeInternal-style access-control issues only surface at link/compile time.
 
+## Subagent policy (HARD RULE — NEVER BREAK)
+
+**For very massive tasks (large refactors, multi-file redesigns, UI overhauls, cross-module implementations), the host AI MUST dispatch implementer/designer subagents.** Solo inline-editing on big jobs is wrong; parallel Opus implementer/designer subagents with surgical briefs is the default.
+
+**SUBAGENTS ARE FORBIDDEN FROM BUILDING. NEVER. UNDER ANY CIRCUMSTANCE.**
+
+- A full protected build takes **~20 minutes**. A subagent that builds wastes that 20 minutes on a process that the host AI cannot observe in real time, and the user cannot cancel without killing the subagent's whole session.
+- Subagents are scoped to: **implement / code / think / investigate / design / audit / research**. That is the entire allowed surface.
+- Subagents must NOT be granted Bash permissions for `cmake --build`, `cmake --preset`, `msbuild`, `ninja`, `vcvars64.bat`, or any wrapper that triggers a compile/link. When dispatching, explicitly tell the subagent: "**Do not build. Do not run cmake, msbuild, ninja, or vcvars. The host AI will build after you finish.**"
+- The **host AI (this Claude instance) is the sole builder.** After every subagent finishes implementing, the host AI runs the canonical build command itself and validates exit code + zero new warnings before reporting the task complete.
+- This rule has no exceptions — not "just to check it compiles", not "just a quick sanity build", not "the subagent has a worktree". The build belongs to the host.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Repository shape

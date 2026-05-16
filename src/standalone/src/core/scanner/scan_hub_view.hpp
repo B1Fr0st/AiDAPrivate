@@ -2,6 +2,8 @@
 
 #include "ui/hub_strip.hpp"
 #include "ui/clock.hpp"
+#include "ui/no_target_overlay.hpp"
+#include "ui/empty_state.hpp"
 #include "memory_scanner_view.hpp"
 #include "crypto_scanner_view.hpp"
 #include "aob_view.hpp"
@@ -9,6 +11,7 @@
 #include "pointer_scanner_view.hpp"
 #include "snapshot_diff.hpp"
 #include "integrity_hunter_view.hpp"
+#include "../session/analysis_session.hpp"
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -83,6 +86,17 @@ inline void render_active(int idx, float cw, float ch, float fa, float ar, float
 inline void render(float pos_x, float pos_y, float width, float height,
 				   float alpha, float accent_r, float accent_g, float accent_b)
 {
+	if (!analysis_session::has_active_target()) {
+		ImVec2 wp = ImGui::GetWindowPos();
+		aida::ui::no_target_overlay::render(
+			ImVec2(wp.x + pos_x, wp.y + pos_y),
+			ImVec2(width, height),
+			"No binary open",
+			"Memory scanning, crypto-constant hunting, AOB, decrypt oracle, pointer scanning, snapshots and integrity checks need an attached process or a loaded binary. Start one to begin.",
+			alpha, aida::ui::empty_state::glyph_t::search);
+		return;
+	}
+
 	float dt = aida::ui::clock::dt();
 	aida::ui::hub_strip::tick_swap(g_state.strip, dt);
 

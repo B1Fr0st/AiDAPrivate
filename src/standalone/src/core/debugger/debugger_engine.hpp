@@ -11,6 +11,8 @@
 #include <thread>
 #include <vector>
 
+#include "../runtime/run_target.hpp"
+
 namespace debugger_engine {
 
 
@@ -188,6 +190,10 @@ struct state_t {
 
 	std::mutex                   strings_mutex;
 	std::vector<string_ref_t>    strings;
+	std::atomic<bool>            strings_scanning{false};
+	std::atomic<bool>            strings_cancel{false};
+	std::atomic<uint64_t>        strings_pages_scanned{0};
+	std::atomic<uint64_t>        strings_found_so_far{0};
 
 
 	std::atomic<bool>            worker_thread_done{true};
@@ -264,6 +270,15 @@ bool step_over();
 bool step_out();
 bool run_to_address(uint64_t address, bool wait_for_completion = false, uint32_t timeout_ms = 30000);
 
+bool spawn_and_attach_target(const std::wstring& exe_path,
+                             const std::wstring& args,
+                             const std::wstring& working_dir,
+                             uint32_t* out_pid);
+
+bool spawn_and_attach_target(const run_target::launch_options_t& opts,
+                             uint32_t* out_pid,
+                             run_target::launch_result_t* out_result = nullptr);
+
 
 register_set_t get_registers();
 bool set_register(const std::string& name, uint64_t value);
@@ -311,9 +326,17 @@ std::string get_label(uint64_t address);
 
 void enumerate_handles();
 void find_strings(size_t min_length = 4);
+void find_strings_async(size_t min_length = 4);
+void request_strings_cancel();
 
 
 std::string format_flags(uint64_t rflags);
 std::string format_protect(uint32_t protect);
+
+std::vector<breakpoint_t> snapshot_breakpoints();
+std::vector<watch_entry_t> snapshot_watches();
+void restore_breakpoints_and_watches(std::vector<breakpoint_t> bps,
+									 std::vector<watch_entry_t> ws);
+void clear_breakpoints_and_watches();
 
 }

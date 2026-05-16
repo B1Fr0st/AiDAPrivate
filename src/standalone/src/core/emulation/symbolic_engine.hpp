@@ -5,6 +5,7 @@
 
 #include "emulation_engine.hpp"
 #include "comm.h"
+#include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -226,6 +227,9 @@ inline symbolic_result_t execute_symbolic(
 
 	if (!device || !device->is_connected() || device->get_process_id() == 0) {
 		result.error = "Driver not connected or no process attached";
+		diag::log_tagged_fmt("symbolic",
+			"engine_execute_reject reason=no_attach entry=0x%llX",
+			static_cast<unsigned long long>(start_addr));
 		return result;
 	}
 

@@ -194,9 +194,13 @@ namespace function_index {
 			std::atomic<uint64_t>                                          static_bulk_last_progress_ns{0};
 		};
 
+		inline std::unique_ptr<cache_t>& cache_holder() {
+			static std::unique_ptr<cache_t> h = std::make_unique<cache_t>();
+			return h;
+		}
+
 		inline cache_t& cache() {
-			static cache_t c;
-			return c;
+			return *cache_holder();
 		}
 
 		inline std::string format_hex_upper(uint64_t v) {
@@ -2971,6 +2975,43 @@ namespace function_index {
 			});
 		}
 
+		struct bulk_dispatch_state_t {
+			std::shared_ptr<std::vector<std::pair<uint64_t,
+				std::shared_ptr<func_status_t>>>> targets;
+			std::shared_ptr<std::string>         mod_name;
+			std::atomic<size_t>                  cursor{0};
+			std::atomic<size_t>                  in_flight{0};
+		};
+
+		inline void post_bulk_chunk(std::shared_ptr<bulk_dispatch_state_t> state);
+
+		inline void post_bulk_chunk(std::shared_ptr<bulk_dispatch_state_t> state) {
+			if (!state || !state->targets) return;
+			constexpr size_t kChunkSize = 256;
+			const size_t total = state->targets->size();
+			size_t start = state->cursor.fetch_add(kChunkSize, std::memory_order_acq_rel);
+			if (start >= total) return;
+			size_t end = start + kChunkSize;
+			if (end > total) end = total;
+			state->in_flight.fetch_add(end - start, std::memory_order_acq_rel);
+			for (size_t i = start; i < end; ++i) {
+				auto& kv = (*state->targets)[i];
+				auto status = kv.second;
+				uint64_t func_start = kv.first;
+				auto state_ref = state;
+				work_queue::post([func_start, status, state_ref]() {
+					schedule_function_build(func_start, status, *state_ref->mod_name);
+					size_t left = state_ref->in_flight.fetch_sub(1u,
+						std::memory_order_acq_rel) - 1u;
+					if (left == 0) {
+						work_queue::post([state_ref]() {
+							post_bulk_chunk(state_ref);
+						});
+					}
+				});
+			}
+		}
+
 		inline void schedule_bounds_rebuild() {
 			cache_t& c = cache();
 			uint32_t cur = c.bounds_state.load(std::memory_order_acquire);
@@ -3045,28 +3086,30 @@ namespace function_index {
 					std::memory_order_release);
 
 				if (live || static_pe_active()) {
-					std::vector<std::pair<uint64_t, std::shared_ptr<func_status_t>>> all_targets;
+					auto all_targets = std::make_shared<
+						std::vector<std::pair<uint64_t, std::shared_ptr<func_status_t>>>>();
 					std::string mod_name;
 					{
 						std::shared_lock<std::shared_mutex> lk(c2.mutex);
 						mod_name = c2.cached_module_name;
-						all_targets.reserve(c2.sorted_starts.size());
+						all_targets->reserve(c2.sorted_starts.size());
 						for (uint64_t start : c2.sorted_starts) {
 							auto sit = c2.status_by_start.find(start);
 							if (sit == c2.status_by_start.end() || !sit->second) continue;
 							uint32_t st = sit->second->state.load(std::memory_order_acquire);
 							if (st != static_cast<uint32_t>(func_state_t::idle)) continue;
-							all_targets.emplace_back(start, sit->second);
+							all_targets->emplace_back(start, sit->second);
 						}
 					}
-					if (!all_targets.empty()) {
-						c2.static_bulk_pending.store(static_cast<uint32_t>(all_targets.size()),
+					if (!all_targets->empty()) {
+						c2.static_bulk_pending.store(static_cast<uint32_t>(all_targets->size()),
 							std::memory_order_release);
 						c2.static_bulk_last_progress_ns.store(0ull,
 							std::memory_order_release);
-						for (auto& kv : all_targets) {
-							schedule_function_build(kv.first, kv.second, mod_name);
-						}
+						auto state = std::make_shared<bulk_dispatch_state_t>();
+						state->targets = all_targets;
+						state->mod_name = std::make_shared<std::string>(std::move(mod_name));
+						post_bulk_chunk(state);
 					}
 				}
 			});
@@ -3665,6 +3708,27 @@ namespace function_index {
 		auto it = c.by_start.find(func_start);
 		if (it == c.by_start.end()) return false;
 		return it->second.is_library;
+	}
+
+	inline std::unique_ptr<detail::cache_t> detach_snapshot() {
+		auto& h = detail::cache_holder();
+		{
+			std::unique_lock<std::shared_mutex> drain(h->mutex);
+			(void)drain;
+		}
+		std::unique_ptr<detail::cache_t> out = std::move(h);
+		h = std::make_unique<detail::cache_t>();
+		return out;
+	}
+
+	inline void attach_snapshot(std::unique_ptr<detail::cache_t> snap) {
+		auto& h = detail::cache_holder();
+		if (!snap) snap = std::make_unique<detail::cache_t>();
+		{
+			std::unique_lock<std::shared_mutex> drain(h->mutex);
+			(void)drain;
+		}
+		h = std::move(snap);
 	}
 
 }

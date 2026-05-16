@@ -4,8 +4,10 @@
 #include "memory_scanner.hpp"
 #include "work_queue.hpp"
 #include "standalone_driver.hpp"
+#include "../helpers/diag_log.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -259,7 +261,13 @@ static void first_scan_thread(scan_config_t config) {
 	auto& st = g_state;
 	st.scan_progress.store(0.f);
 
+	auto t_start = std::chrono::steady_clock::now();
 	auto regions = driver_bridge::enumerate_memory_regions(4096);
+	diag::log_tagged_fmt("mem_scanner", "first_scan_thread enter pid=%u regions=%zu val_type=%s mode=%s writable_only=%d exec_exclude=%d hex=%d align=%zu",
+		driver_bridge::attached_pid(), regions.size(),
+		value_type_name(config.value_type), scan_mode_name(config.scan_mode),
+		static_cast<int>(config.writable_only), static_cast<int>(config.executable_exclude),
+		static_cast<int>(config.hex_input), config.alignment);
 
 	std::vector<driver_bridge::memory_region_t> scan_regions;
 	for (const auto& r : regions) {
@@ -274,6 +282,8 @@ static void first_scan_thread(scan_config_t config) {
 	}
 
 	if (scan_regions.empty()) {
+		diag::log_tagged_fmt("mem_scanner", "first_scan_thread no_eligible_regions raw=%zu filtered=0", regions.size());
+		st.scan_progress.store(1.f);
 		st.scanning.store(false);
 		return;
 	}
@@ -300,11 +310,15 @@ static void first_scan_thread(scan_config_t config) {
 	if (align == 0) align = 1;
 
 	if (!is_unknown && (val_sz == 0 || target_val.size() < val_sz)) {
+		diag::log_tagged_fmt("mem_scanner", "first_scan_thread invalid_target_val val_sz=%zu got=%zu text='%s'",
+			val_sz, target_val.size(), config.value_text.c_str());
 		st.scanning.store(false);
 		st.scan_progress.store(1.f);
 		return;
 	}
 	if (config.scan_mode == scan_mode_t::value_between && target_val2.size() < val_sz) {
+		diag::log_tagged_fmt("mem_scanner", "first_scan_thread invalid_value2 val_sz=%zu got=%zu text2='%s'",
+			val_sz, target_val2.size(), config.value_text2.c_str());
 		st.scanning.store(false);
 		st.scan_progress.store(1.f);
 		return;
@@ -431,8 +445,11 @@ static void first_scan_thread(scan_config_t config) {
 
 	constexpr size_t MAX_RESULTS = 5000000;
 	size_t total = all_results.size();
-	if (all_results.size() > MAX_RESULTS)
+	if (all_results.size() > MAX_RESULTS) {
+		diag::log_tagged_fmt("mem_scanner", "first_scan_thread result_truncated raw=%zu kept=%zu",
+			total, static_cast<size_t>(MAX_RESULTS));
 		all_results.resize(MAX_RESULTS);
+	}
 
 	annotate_modules(all_results);
 
@@ -444,6 +461,11 @@ static void first_scan_thread(scan_config_t config) {
 		st.scan_count = 1;
 	}
 
+	auto t_end = std::chrono::steady_clock::now();
+	uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+	diag::log_tagged_fmt("mem_scanner", "first_scan_thread done regions=%zu bytes=%zu hits=%zu duration_ms=%llu",
+		scan_regions.size(), total_bytes, total, static_cast<unsigned long long>(dur_ms));
+
 	st.scan_progress.store(1.f);
 	st.scanning.store(false);
 }
@@ -452,6 +474,7 @@ static void first_scan_thread(scan_config_t config) {
 static void next_scan_thread(scan_mode_t mode, std::string value_text, std::string value_text2) {
 	auto& st = g_state;
 	st.scan_progress.store(0.f);
+	auto t_start = std::chrono::steady_clock::now();
 
 	std::vector<scan_result_t> prev;
 	value_type_t vtype;
@@ -463,7 +486,12 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 		hex_input = st.config.hex_input;
 	}
 
+	diag::log_tagged_fmt("mem_scanner", "next_scan_thread enter mode=%s prev_count=%zu val='%s' val2='%s' vtype=%s",
+		scan_mode_name(mode), prev.size(), value_text.c_str(), value_text2.c_str(), value_type_name(vtype));
+
 	if (prev.empty()) {
+		diag::log_tagged("mem_scanner", "next_scan_thread no_prev_results");
+		st.scan_progress.store(1.f);
 		st.scanning.store(false);
 		return;
 	}
@@ -490,16 +518,21 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 	}
 
 	if (val_sz == 0) {
+		diag::log_tagged("mem_scanner", "next_scan_thread val_sz_zero");
 		st.scanning.store(false);
 		st.scan_progress.store(1.f);
 		return;
 	}
 	if (needs_value && target_val.size() < val_sz) {
+		diag::log_tagged_fmt("mem_scanner", "next_scan_thread invalid_value val_sz=%zu got=%zu",
+			val_sz, target_val.size());
 		st.scanning.store(false);
 		st.scan_progress.store(1.f);
 		return;
 	}
 	if (mode == scan_mode_t::value_between && target_val2_bytes.size() < val_sz) {
+		diag::log_tagged_fmt("mem_scanner", "next_scan_thread invalid_value2 val_sz=%zu got=%zu",
+			val_sz, target_val2_bytes.size());
 		st.scanning.store(false);
 		st.scan_progress.store(1.f);
 		return;
@@ -630,12 +663,18 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 			st.scan_progress.store(static_cast<float>(i) / static_cast<float>(prev.size()));
 	}
 
+	size_t hits = new_results.size();
 	{
 		std::lock_guard<std::mutex> lk(st.results_mutex);
-		st.total_found = new_results.size();
+		st.total_found = hits;
 		st.results = std::move(new_results);
 		st.scan_count++;
 	}
+
+	auto t_end = std::chrono::steady_clock::now();
+	uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+	diag::log_tagged_fmt("mem_scanner", "next_scan_thread done prev=%zu hits=%zu duration_ms=%llu scan_count=%d",
+		prev.size(), hits, static_cast<unsigned long long>(dur_ms), g_state.scan_count);
 
 	st.scan_progress.store(1.f);
 	st.scanning.store(false);
@@ -644,7 +683,10 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 
 static void freeze_loop() {
 	auto& st = g_state;
+	diag::log_tagged("mem_scanner", "freeze_loop start");
 	std::vector<std::pair<uint64_t, std::vector<uint8_t>>> snapshot;
+	uint64_t last_logged_count = static_cast<uint64_t>(-1);
+	auto last_log_time = std::chrono::steady_clock::now();
 	while (st.freeze_active.load()) {
 		snapshot.clear();
 		{
@@ -654,6 +696,16 @@ static void freeze_loop() {
 					snapshot.emplace_back(entry.address, entry.freeze_value);
 			}
 		}
+		auto now = std::chrono::steady_clock::now();
+		uint64_t count = snapshot.size();
+		bool count_changed = (count != last_logged_count);
+		bool throttle_elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 30;
+		if (count_changed || (count > 0 && throttle_elapsed)) {
+			diag::log_tagged_fmt("mem_scanner", "freeze_loop tick count=%llu",
+				static_cast<unsigned long long>(count));
+			last_logged_count = count;
+			last_log_time = now;
+		}
 		for (auto& p : snapshot) {
 			if (!st.freeze_active.load()) break;
 			driver_bridge::write_memory(p.first, p.second);
@@ -661,6 +713,7 @@ static void freeze_loop() {
 		if (!snapshot.empty()) Sleep(10);
 		else Sleep(100);
 	}
+	diag::log_tagged("mem_scanner", "freeze_loop stop");
 }
 
 
@@ -761,9 +814,14 @@ static void pointer_dfs(const std::multimap<uint64_t, pointer_entry_t>& reverse_
 static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_offset) {
 	auto& st = g_state;
 	st.pointer_progress.store(0.f);
+	auto t_start = std::chrono::steady_clock::now();
 
 	auto modules = driver_bridge::enumerate_modules();
 	auto regions = driver_bridge::enumerate_memory_regions(4096);
+
+	diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread enter target=0x%llX max_depth=%d max_offset=0x%X modules=%zu regions=%zu",
+		static_cast<unsigned long long>(target_address), max_depth, max_offset,
+		modules.size(), regions.size());
 
 	if (max_depth < 1) max_depth = 4;
 	if (max_depth > 7) max_depth = 7;
@@ -886,12 +944,17 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 	}
 
 	if (seed_values.empty()) {
+		diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread no_seeds map_entries=%zu",
+			reverse_map.size());
 		std::lock_guard<std::mutex> lk(st.pointer_mutex);
 		st.pointer_results.clear();
 		st.pointer_progress.store(1.f);
 		st.pointer_scanning.store(false);
 		return;
 	}
+
+	diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread map_built entries=%zu seeds=%zu",
+		reverse_map.size(), seed_values.size());
 
 	std::atomic<size_t> seed_idx{0};
 	std::atomic<bool> dfs_cancel{false};
@@ -979,10 +1042,18 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 	if (results.size() > MAX_RESULTS)
 		results.resize(MAX_RESULTS);
 
+	size_t final_count = results.size();
 	{
 		std::lock_guard<std::mutex> lk(st.pointer_mutex);
 		st.pointer_results = std::move(results);
 	}
+
+	auto t_end = std::chrono::steady_clock::now();
+	uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+	diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread done chains=%zu duration_ms=%llu cancelled=%d",
+		final_count, static_cast<unsigned long long>(dur_ms),
+		static_cast<int>(!st.pointer_scanning.load()));
+
 	st.pointer_progress.store(1.f);
 	st.pointer_scanning.store(false);
 }
@@ -992,16 +1063,19 @@ void initialize() {
 	auto& st = g_state;
 	st.freeze_active.store(true);
 	st.freeze_thread_done.store(false, std::memory_order_release);
+	diag::log_tagged("mem_scanner", "initialize posting_freeze_loop");
 	if (!work_queue::post([]() {
 			freeze_loop();
 			g_state.freeze_thread_done.store(true, std::memory_order_release);
 		}))
 	{
+		diag::log_tagged("mem_scanner", "initialize freeze_loop_post_failed");
 		st.freeze_thread_done.store(true, std::memory_order_release);
 	}
 }
 
 void shutdown() {
+	diag::log_tagged("mem_scanner", "shutdown enter");
 	auto& st = g_state;
 	st.scanning.store(false);
 	st.pointer_scanning.store(false);
@@ -1014,12 +1088,24 @@ void shutdown() {
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	while (!st.freeze_thread_done.load(std::memory_order_acquire))
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	diag::log_tagged("mem_scanner", "shutdown done");
 }
 
 bool first_scan(const scan_config_t& config) {
 	auto& st = g_state;
-	if (st.scanning.load()) return false;
-	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) return false;
+	if (st.scanning.load()) {
+		diag::log_tagged("mem_scanner", "first_scan refused already_scanning");
+		return false;
+	}
+	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) {
+		diag::log_tagged_fmt("mem_scanner", "first_scan refused not_attached driver_loaded=%d pid=%u",
+			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
+		return false;
+	}
+	diag::log_tagged_fmt("mem_scanner", "first_scan start type=%s mode=%s val='%s' val2='%s' hex=%d",
+		value_type_name(config.value_type), scan_mode_name(config.scan_mode),
+		config.value_text.c_str(), config.value_text2.c_str(),
+		static_cast<int>(config.hex_input));
 
 	{
 		std::lock_guard<std::mutex> lk(st.results_mutex);
@@ -1049,9 +1135,21 @@ bool first_scan(const scan_config_t& config) {
 
 bool next_scan(scan_mode_t mode, const std::string& value_text, const std::string& value_text2) {
 	auto& st = g_state;
-	if (st.scanning.load()) return false;
-	if (!st.has_initial_scan) return false;
-	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) return false;
+	if (st.scanning.load()) {
+		diag::log_tagged("mem_scanner", "next_scan refused already_scanning");
+		return false;
+	}
+	if (!st.has_initial_scan) {
+		diag::log_tagged("mem_scanner", "next_scan refused no_initial_scan");
+		return false;
+	}
+	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) {
+		diag::log_tagged_fmt("mem_scanner", "next_scan refused not_attached driver_loaded=%d pid=%u",
+			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
+		return false;
+	}
+	diag::log_tagged_fmt("mem_scanner", "next_scan start mode=%s val='%s' val2='%s'",
+		scan_mode_name(mode), value_text.c_str(), value_text2.c_str());
 
 	st.scanning.store(true);
 	while (!st.scan_thread_done.load(std::memory_order_acquire))
@@ -1071,44 +1169,72 @@ bool next_scan(scan_mode_t mode, const std::string& value_text, const std::strin
 
 void undo_scan() {
 	auto& st = g_state;
-	if (st.scanning.load()) return;
+	if (st.scanning.load()) {
+		diag::log_tagged("mem_scanner", "undo_scan refused scanning_in_progress");
+		return;
+	}
 	std::lock_guard<std::mutex> lk(st.results_mutex);
-	if (st.scan_history.empty()) return;
+	if (st.scan_history.empty()) {
+		diag::log_tagged("mem_scanner", "undo_scan refused history_empty");
+		return;
+	}
 	st.results = std::move(st.scan_history.back());
 	st.scan_history.pop_back();
 	st.total_found = st.results.size();
 	if (st.scan_count > 0) st.scan_count--;
 	if (st.scan_count == 0) st.has_initial_scan = false;
+	diag::log_tagged_fmt("mem_scanner", "undo_scan restored=%zu scan_count=%d",
+		st.total_found, st.scan_count);
 }
 
 void reset_scan() {
 	auto& st = g_state;
-	if (st.scanning.load()) return;
+	if (st.scanning.load()) {
+		diag::log_tagged("mem_scanner", "reset_scan refused scanning_in_progress");
+		return;
+	}
 	std::lock_guard<std::mutex> lk(st.results_mutex);
+	size_t had = st.results.size();
 	st.results.clear();
 	st.scan_history.clear();
 	st.total_found = 0;
 	st.has_initial_scan = false;
 	st.scan_count = 0;
+	diag::log_tagged_fmt("mem_scanner", "reset_scan cleared=%zu", had);
 }
 
 void add_address(uint64_t address, const std::string& description, value_type_t type) {
 	auto& st = g_state;
 	std::lock_guard<std::mutex> lk(st.address_mutex);
-	for (const auto& e : st.address_list)
-		if (e.address == address) return;
+	for (const auto& e : st.address_list) {
+		if (e.address == address) {
+			diag::log_tagged_fmt("mem_scanner", "add_address skipped_duplicate addr=0x%llX",
+				static_cast<unsigned long long>(address));
+			return;
+		}
+	}
 	address_entry_t entry;
 	entry.address = address;
 	entry.description = description;
 	entry.value_type = type;
 	st.address_list.push_back(std::move(entry));
+	diag::log_tagged_fmt("mem_scanner", "add_address addr=0x%llX type=%s desc='%s' total=%zu",
+		static_cast<unsigned long long>(address), value_type_name(type),
+		description.c_str(), st.address_list.size());
 }
 
 void remove_address(size_t index) {
 	auto& st = g_state;
 	std::lock_guard<std::mutex> lk(st.address_mutex);
-	if (index < st.address_list.size())
+	if (index < st.address_list.size()) {
+		uint64_t addr = st.address_list[index].address;
 		st.address_list.erase(st.address_list.begin() + static_cast<ptrdiff_t>(index));
+		diag::log_tagged_fmt("mem_scanner", "remove_address index=%zu addr=0x%llX remaining=%zu",
+			index, static_cast<unsigned long long>(addr), st.address_list.size());
+	} else {
+		diag::log_tagged_fmt("mem_scanner", "remove_address out_of_range index=%zu size=%zu",
+			index, st.address_list.size());
+	}
 }
 
 void freeze_address(size_t index, bool enable) {
@@ -1119,13 +1245,26 @@ void freeze_address(size_t index, bool enable) {
 		e.frozen = enable;
 		if (enable && !e.last_value.empty())
 			e.freeze_value = e.last_value;
+		diag::log_tagged_fmt("mem_scanner", "freeze_address addr=0x%llX enable=%d has_value=%d",
+			static_cast<unsigned long long>(e.address), static_cast<int>(enable),
+			static_cast<int>(!e.freeze_value.empty()));
+	} else {
+		diag::log_tagged_fmt("mem_scanner", "freeze_address out_of_range index=%zu size=%zu",
+			index, st.address_list.size());
 	}
 }
 
 void write_value(uint64_t address, value_type_t type, const std::string& value_text, bool hex) {
 	auto bytes = parse_value(value_text, type, hex);
-	if (!bytes.empty())
-		driver_bridge::write_memory(address, bytes);
+	if (bytes.empty()) {
+		diag::log_tagged_fmt("mem_scanner", "write_value parse_failed addr=0x%llX text='%s' hex=%d",
+			static_cast<unsigned long long>(address), value_text.c_str(), static_cast<int>(hex));
+		return;
+	}
+	bool ok = driver_bridge::write_memory(address, bytes);
+	diag::log_tagged_fmt("mem_scanner", "write_value addr=0x%llX size=%zu type=%s ok=%d",
+		static_cast<unsigned long long>(address), bytes.size(),
+		value_type_name(type), static_cast<int>(ok));
 }
 
 std::string read_value_string(uint64_t address, value_type_t type) {
@@ -1161,8 +1300,17 @@ void refresh_address_list() {
 
 void start_pointer_scan(uint64_t target_address, int max_depth, int max_offset) {
 	auto& st = g_state;
-	if (st.pointer_scanning.load()) return;
-	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) return;
+	if (st.pointer_scanning.load()) {
+		diag::log_tagged("pointer_scan", "start_pointer_scan refused already_scanning");
+		return;
+	}
+	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) {
+		diag::log_tagged_fmt("pointer_scan", "start_pointer_scan refused not_attached driver_loaded=%d pid=%u",
+			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
+		return;
+	}
+	diag::log_tagged_fmt("pointer_scan", "start_pointer_scan target=0x%llX depth=%d offset=0x%X",
+		static_cast<unsigned long long>(target_address), max_depth, max_offset);
 	st.pointer_scanning.store(true);
 	{
 		std::lock_guard<std::mutex> lk(st.pointer_mutex);
@@ -1182,6 +1330,7 @@ void start_pointer_scan(uint64_t target_address, int max_depth, int max_offset) 
 }
 
 void cancel_pointer_scan() {
+	diag::log_tagged("pointer_scan", "cancel_pointer_scan signalled");
 	g_state.pointer_scanning.store(false);
 }
 

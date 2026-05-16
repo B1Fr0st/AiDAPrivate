@@ -19,6 +19,7 @@
 #include "disasm_view.hpp"
 #include "ui_anim.hpp"
 #include "../helpers/globals.h"
+#include "../helpers/diag_log.hpp"
 
 extern DisasmState g_disasm;
 
@@ -71,6 +72,10 @@ inline void refresh()
 	bool expected = false;
 	if (!g_ui.refreshing.compare_exchange_strong(expected, true))
 		return;
+	diag::log_tagged_fmt("seh",
+		"seh_refresh_request attached_pid=%u active_tid=%u",
+		static_cast<unsigned>(driver_bridge::attached_pid()),
+		static_cast<unsigned>(debugger_engine::g_state.active_tid));
 	work_queue::post([]() {
 		std::vector<seh_entry_t> entries;
 
@@ -155,10 +160,13 @@ inline void refresh()
 			}
 		}
 
+		size_t n = entries.size();
 		{
 			std::lock_guard<std::mutex> lk(g_ui.mutex);
 			g_ui.entries = std::move(entries);
 		}
+		diag::log_tagged_fmt("seh",
+			"seh_refresh_done chain_depth=%zu", n);
 		g_ui.refreshing.store(false);
 	});
 }
@@ -334,6 +342,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (ImGui::BeginPopup("##seh_ctx")) {
 		if (g_ui.selected >= 0 && g_ui.selected < static_cast<int>(snapshot.size())) {
 			if (ImGui::MenuItem("Go to Handler")) {
+				diag::log_tagged_fmt("seh",
+					"seh_go_handler idx=%d handler=0x%llx",
+					g_ui.selected,
+					static_cast<unsigned long long>(snapshot[g_ui.selected].handler_addr));
 				globals::ui::active_center_view = center_view_t::disassembly;
 				disasm_view::goto_address(snapshot[g_ui.selected].handler_addr, g_disasm);
 			}

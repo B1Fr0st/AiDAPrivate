@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include "work_queue.hpp"
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -11,8 +12,15 @@
 
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
+#include "../../helpers/diag_log.hpp"
 
 namespace stealth_engine {
+
+struct stealth_options_t {
+	bool spoof_peb = true;
+	bool hook_rdtsc = true;
+	bool scrub_context = false;
+};
 
 struct hook_entry_t {
 	uint64_t target_addr = 0;
@@ -146,68 +154,140 @@ inline void remove_hook(hook_entry_t& hook)
 
 }
 
-inline bool enable_stealth(uint32_t pid)
+inline bool enable_stealth(uint32_t pid, const stealth_options_t& opts)
 {
-	if (g_state.active.load()) return true;
+	if (g_state.active.load()) {
+		diag::log_tagged_fmt("stealth", "enable_skip reason=already_active pid=%u", pid);
+		return true;
+	}
+
+	if (pid == 0) {
+		diag::log_tagged("stealth", "enable_reject reason=zero_pid");
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.status = "Stealth start failed: no target PID";
+		return false;
+	}
+
+	diag::log_tagged_fmt("stealth",
+		"enable_start pid=%u opt_peb=%d opt_rdtsc=%d opt_context=%d",
+		pid, opts.spoof_peb ? 1 : 0,
+		opts.hook_rdtsc ? 1 : 0,
+		opts.scrub_context ? 1 : 0);
 
 	std::lock_guard<std::mutex> lk(g_state.mutex);
 
 	g_state.session = {};
 	g_state.session.pid = pid;
 
-	bool peb_ok = detail::spoof_peb_flags();
-	g_state.session.peb_spoofed = peb_ok;
-
 	std::string status_parts;
-	if (peb_ok) {
-		status_parts = "PEB spoofed";
+	bool peb_ok = false;
+	if (opts.spoof_peb) {
+		peb_ok = detail::spoof_peb_flags();
+		g_state.session.peb_spoofed = peb_ok;
+		status_parts = peb_ok ? "PEB spoofed" : "PEB spoof failed";
+		diag::log_tagged_fmt("stealth", "peb_spoof ok=%d", peb_ok ? 1 : 0);
 	} else {
-		status_parts = "PEB spoof failed";
+		status_parts = "PEB skipped";
+		diag::log_tagged("stealth", "peb_spoof skipped_by_user");
 	}
 
-	auto modules = driver_bridge::enumerate_modules();
-	driver_bridge::module_info_t main_module{};
-	bool found_main = false;
-	for (auto& m : modules) {
-		if (m.base != 0 && !m.name.empty()) {
-			std::string lower_name = m.name;
-			for (auto& c : lower_name) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-			if (lower_name.find(".exe") != std::string::npos) {
-				main_module = m;
-				found_main = true;
-				break;
+	if (opts.hook_rdtsc) {
+		auto modules = driver_bridge::enumerate_modules();
+		driver_bridge::module_info_t main_module{};
+		bool found_main = false;
+		for (auto& m : modules) {
+			if (m.base != 0 && !m.name.empty()) {
+				std::string lower_name = m.name;
+				for (auto& c : lower_name) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+				if (lower_name.find(".exe") != std::string::npos) {
+					main_module = m;
+					found_main = true;
+					break;
+				}
 			}
 		}
+
+		if (found_main && main_module.size > 0) {
+			auto rdtsc_sites = detail::find_rdtsc_sites(main_module.base, main_module.size, 16);
+			int hooked = 0;
+			for (auto addr : rdtsc_sites) {
+				if (detail::install_rdtsc_hook(addr, pid, g_state.session)) {
+					++hooked;
+				}
+			}
+			if (hooked > 0) {
+				g_state.session.rdtsc_hooked = true;
+				status_parts += ", " + std::to_string(hooked) + " RDTSC hooks";
+			}
+			diag::log_tagged_fmt("stealth",
+				"rdtsc_hook module='%s' base=0x%llX size=0x%X sites=%zu hooked=%d",
+				main_module.name.c_str(),
+				static_cast<unsigned long long>(main_module.base),
+				main_module.size, rdtsc_sites.size(), hooked);
+		} else {
+			diag::log_tagged("stealth", "rdtsc_hook skipped reason=no_main_module");
+			status_parts += ", no .exe module";
+		}
+	} else {
+		diag::log_tagged("stealth", "rdtsc_hook skipped_by_user");
 	}
 
-	if (found_main && main_module.size > 0) {
-		auto rdtsc_sites = detail::find_rdtsc_sites(main_module.base, main_module.size, 16);
-		int hooked = 0;
-		for (auto addr : rdtsc_sites) {
-			if (detail::install_rdtsc_hook(addr, pid, g_state.session)) {
-				++hooked;
-			}
+	if (opts.scrub_context) {
+		auto threads = driver_bridge::enumerate_threads();
+		int scrubbed = 0;
+		for (auto& thr : threads) {
+			driver_bridge::thread_context_t ctx{};
+			if (!driver_bridge::get_thread_context(thr.tid, ctx)) continue;
+			ctx.dr0 = 0; ctx.dr1 = 0; ctx.dr2 = 0; ctx.dr3 = 0;
+			ctx.dr6 = 0; ctx.dr7 = 0;
+			const uint64_t kCtxDebug = (1ULL << 18) | (1ULL << 19) | (1ULL << 20) | (1ULL << 21) | (1ULL << 22) | (1ULL << 23);
+			if (driver_bridge::set_thread_context(thr.tid, ctx, kCtxDebug)) ++scrubbed;
 		}
-		if (hooked > 0) {
-			g_state.session.rdtsc_hooked = true;
-			status_parts += ", " + std::to_string(hooked) + " RDTSC hooks";
+		g_state.session.context_hooked = scrubbed > 0;
+		if (scrubbed > 0) {
+			status_parts += ", " + std::to_string(scrubbed) + " contexts scrubbed";
+		} else {
+			status_parts += ", context scrub failed";
 		}
+		diag::log_tagged_fmt("stealth",
+			"context_scrub threads=%zu scrubbed=%d", threads.size(), scrubbed);
 	}
 
 	g_state.status = "Stealth active: " + status_parts;
 	g_state.active.store(true);
+	diag::log_tagged_fmt("stealth",
+		"enable_done pid=%u peb=%d rdtsc=%d context=%d hooks=%zu",
+		pid,
+		g_state.session.peb_spoofed ? 1 : 0,
+		g_state.session.rdtsc_hooked ? 1 : 0,
+		g_state.session.context_hooked ? 1 : 0,
+		g_state.session.hooks.size());
 	return true;
+}
+
+inline bool enable_stealth(uint32_t pid)
+{
+	stealth_options_t opts;
+	return enable_stealth(pid, opts);
 }
 
 inline void disable_stealth()
 {
-	if (!g_state.active.load()) return;
+	if (!g_state.active.load()) {
+		diag::log_tagged("stealth", "disable_skip reason=not_active");
+		return;
+	}
 
 	std::lock_guard<std::mutex> lk(g_state.mutex);
 
+	size_t hooks = g_state.session.hooks.size();
 	for (auto& hook : g_state.session.hooks) {
 		detail::remove_hook(hook);
 	}
+
+	diag::log_tagged_fmt("stealth",
+		"disable_done pid=%u removed_hooks=%zu",
+		g_state.session.pid, hooks);
 
 	g_state.session = {};
 	g_state.status = "Stealth disabled";
@@ -549,12 +629,19 @@ inline void scan_wfp_callbacks(std::vector<finding_t>& out, std::atomic<bool>& c
 
 inline void run_protection_scan()
 {
-	if (g_scan.scanning.load()) return;
+	if (g_scan.scanning.load()) {
+		diag::log_tagged("stealth", "scan_skip reason=already_scanning");
+		return;
+	}
 	g_scan.scanning.store(true);
 	g_scan.cancel.store(false);
 	g_scan.progress.store(0.f);
 
+	uint32_t pid_at_start = driver_bridge::attached_pid();
+	diag::log_tagged_fmt("stealth", "scan_begin pid=%u", pid_at_start);
+
 	work_queue::post([] {
+		auto t0 = std::chrono::steady_clock::now();
 		{
 			std::lock_guard<std::mutex> lk(g_scan.mutex);
 			g_scan.findings.clear();
@@ -605,13 +692,28 @@ inline void run_protection_scan()
 			return static_cast<int>(a.severity) > static_cast<int>(b.severity);
 		});
 
+		size_t finding_count = 0;
+		int crit_n = 0, hi_n = 0, med_n = 0;
+		for (auto& f : results) {
+			if (f.severity == finding_severity_t::critical) ++crit_n;
+			else if (f.severity == finding_severity_t::high) ++hi_n;
+			else if (f.severity == finding_severity_t::medium) ++med_n;
+		}
 		{
 			std::lock_guard<std::mutex> lk(g_scan.mutex);
+			finding_count = results.size();
 			g_scan.findings = std::move(results);
 			char buf[64];
 			std::snprintf(buf, sizeof(buf), "Scan complete: %zu findings", g_scan.findings.size());
 			g_scan.scan_status = buf;
 		}
+
+		auto t1 = std::chrono::steady_clock::now();
+		auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+		diag::log_tagged_fmt("stealth",
+			"scan_done findings=%zu critical=%d high=%d medium=%d duration_ms=%lld cancelled=%d",
+			finding_count, crit_n, hi_n, med_n,
+			static_cast<long long>(dur), g_scan.cancel.load() ? 1 : 0);
 
 		g_scan.progress.store(1.f);
 		g_scan.scanning.store(false);
@@ -620,6 +722,7 @@ inline void run_protection_scan()
 
 inline void stop_protection_scan()
 {
+	diag::log_tagged("stealth", "scan_stop_requested");
 	g_scan.cancel.store(true);
 }
 

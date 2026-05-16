@@ -2,11 +2,13 @@
 
 #include <atomic>
 #include "work_queue.hpp"
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -18,6 +20,7 @@
 #include "standalone_settings.hpp"
 #include "xref_engine.hpp"
 #include "zydis_disasm.hpp"
+#include "../helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -52,7 +55,6 @@ struct crypto_hit_t {
 	std::string   module_name;
 	uint64_t      module_offset = 0;
 	std::vector<uint64_t> referencing_functions;
-	std::string   ai_analysis;
 };
 
 struct entropy_region_t {
@@ -76,7 +78,6 @@ struct scan_state_t {
 	std::vector<custom_signature_t> custom_sigs;
 	std::mutex                mutex;
 	std::atomic<bool>         scanning{false};
-	std::atomic<bool>         analyzing{false};
 	std::atomic<float>        progress{0.f};
 	std::atomic<bool>         cancel{false};
 	bool                      active = false;
@@ -85,6 +86,56 @@ struct scan_state_t {
 };
 
 inline scan_state_t g_state;
+
+struct snapshot_t {
+	std::vector<crypto_hit_t> results;
+	std::vector<entropy_region_t> entropy_map;
+	std::vector<custom_signature_t> custom_sigs;
+	bool                      scanning = false;
+	float                     progress = 0.f;
+	bool                      cancel = false;
+	bool                      active = false;
+	std::unordered_map<uint64_t, std::string> function_labels;
+	float                     entropy_threshold = 7.0f;
+};
+
+inline std::unique_ptr<snapshot_t> detach_snapshot() {
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	auto out = std::make_unique<snapshot_t>();
+	out->results = std::move(g_state.results);
+	out->entropy_map = std::move(g_state.entropy_map);
+	out->custom_sigs = std::move(g_state.custom_sigs);
+	out->scanning = g_state.scanning.load(std::memory_order_acquire);
+	out->progress = g_state.progress.load(std::memory_order_acquire);
+	out->cancel = g_state.cancel.load(std::memory_order_acquire);
+	out->active = g_state.active;
+	out->function_labels = std::move(g_state.function_labels);
+	out->entropy_threshold = g_state.entropy_threshold;
+	g_state.results.clear();
+	g_state.entropy_map.clear();
+	g_state.custom_sigs.clear();
+	g_state.scanning.store(false, std::memory_order_release);
+	g_state.progress.store(0.f, std::memory_order_release);
+	g_state.cancel.store(false, std::memory_order_release);
+	g_state.active = false;
+	g_state.function_labels.clear();
+	g_state.entropy_threshold = 7.0f;
+	return out;
+}
+
+inline void attach_snapshot(std::unique_ptr<snapshot_t> snap) {
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	if (!snap) snap = std::make_unique<snapshot_t>();
+	g_state.results = std::move(snap->results);
+	g_state.entropy_map = std::move(snap->entropy_map);
+	g_state.custom_sigs = std::move(snap->custom_sigs);
+	g_state.scanning.store(snap->scanning, std::memory_order_release);
+	g_state.progress.store(snap->progress, std::memory_order_release);
+	g_state.cancel.store(snap->cancel, std::memory_order_release);
+	g_state.active = snap->active;
+	g_state.function_labels = std::move(snap->function_labels);
+	g_state.entropy_threshold = snap->entropy_threshold;
+}
 
 namespace constants {
 
@@ -504,7 +555,16 @@ inline void auto_label_references();
 
 inline void scan_process()
 {
-	if (g_state.scanning.load()) return;
+	if (g_state.scanning.load()) {
+		diag::log_tagged("crypto_scan", "scan_process refused already_scanning");
+		return;
+	}
+	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) {
+		diag::log_tagged_fmt("crypto_scan", "scan_process refused not_attached driver_loaded=%d pid=%u",
+			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
+		return;
+	}
+	diag::log_tagged_fmt("crypto_scan", "scan_process start pid=%u", driver_bridge::attached_pid());
 
 	g_state.scanning.store(true);
 	g_state.cancel.store(false);
@@ -516,6 +576,7 @@ inline void scan_process()
 	}
 
 	work_queue::post([]() {
+		auto t_start = std::chrono::steady_clock::now();
 		auto signatures = get_signatures();
 
 		std::vector<custom_signature_t> custom_copy;
@@ -590,6 +651,12 @@ inline void scan_process()
 					hit.module_name = mod_name;
 					hit.module_offset = mod_offset;
 
+					diag::log_tagged_fmt("crypto_scan", "scan_process hit name='%s' algo='%s' addr=0x%llX module='%s'+0x%llX",
+						sig.name, sig.algorithm,
+						static_cast<unsigned long long>(hit_addr),
+						mod_name.c_str(),
+						static_cast<unsigned long long>(mod_offset));
+
 					std::lock_guard<std::mutex> lk(g_state.mutex);
 					g_state.results.push_back(std::move(hit));
 				}
@@ -600,13 +667,35 @@ inline void scan_process()
 		}
 
 		auto_label_references();
+
+		auto t_end = std::chrono::steady_clock::now();
+		uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+		size_t hit_count = 0;
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			hit_count = g_state.results.size();
+		}
+		diag::log_tagged_fmt("crypto_scan", "scan_process done sigs=%zu regions=%zu bytes=%llu hits=%zu duration_ms=%llu cancelled=%d",
+			signatures.size(), scan_regions.size(), static_cast<unsigned long long>(total_bytes),
+			hit_count, static_cast<unsigned long long>(dur_ms),
+			static_cast<int>(g_state.cancel.load()));
+
 		g_state.scanning.store(false);
 	});
 }
 
 inline void scan_file(const DisasmFile& file)
 {
-	if (g_state.scanning.load()) return;
+	if (g_state.scanning.load()) {
+		diag::log_tagged("crypto_scan", "scan_file refused already_scanning");
+		return;
+	}
+	if (!file.loaded) {
+		diag::log_tagged("crypto_scan", "scan_file refused file_not_loaded");
+		return;
+	}
+	diag::log_tagged_fmt("crypto_scan", "scan_file start filename='%s' sections=%zu",
+		file.filename.c_str(), file.sections.size());
 
 	g_state.scanning.store(true);
 	g_state.cancel.store(false);
@@ -618,6 +707,7 @@ inline void scan_file(const DisasmFile& file)
 	}
 
 	work_queue::post([file]() {
+		auto t_start = std::chrono::steady_clock::now();
 		auto signatures = get_signatures();
 
 		size_t total_bytes = 0;
@@ -656,6 +746,19 @@ inline void scan_file(const DisasmFile& file)
 		}
 
 		auto_label_references();
+
+		auto t_end = std::chrono::steady_clock::now();
+		uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+		size_t hit_count = 0;
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			hit_count = g_state.results.size();
+		}
+		diag::log_tagged_fmt("crypto_scan", "scan_file done filename='%s' sigs=%zu bytes=%zu hits=%zu duration_ms=%llu cancelled=%d",
+			file.filename.c_str(), signatures.size(), total_bytes,
+			hit_count, static_cast<unsigned long long>(dur_ms),
+			static_cast<int>(g_state.cancel.load()));
+
 		g_state.scanning.store(false);
 	});
 }
@@ -773,6 +876,7 @@ inline std::string get_function_label(uint64_t addr)
 
 inline void cancel()
 {
+	diag::log_tagged("crypto_scan", "cancel signalled");
 	g_state.cancel.store(true);
 }
 
@@ -799,13 +903,28 @@ inline float compute_shannon_entropy(const uint8_t* data, size_t len)
 
 inline void scan_entropy()
 {
-	if (g_state.scanning.load()) return;
+	if (g_state.scanning.load()) {
+		diag::log_tagged("crypto_scan", "scan_entropy refused already_scanning");
+		return;
+	}
+	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) {
+		diag::log_tagged_fmt("crypto_scan", "scan_entropy refused not_attached driver_loaded=%d pid=%u",
+			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
+		return;
+	}
+	diag::log_tagged_fmt("crypto_scan", "scan_entropy start pid=%u threshold=%.2f",
+		driver_bridge::attached_pid(), static_cast<double>(g_state.entropy_threshold));
 
 	g_state.scanning.store(true);
 	g_state.cancel.store(false);
 	g_state.progress.store(0.f);
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.active = true;
+	}
 
 	work_queue::post([]() {
+		auto t_start = std::chrono::steady_clock::now();
 		auto regions = driver_bridge::enumerate_memory_regions(4096);
 		auto modules = driver_bridge::enumerate_modules();
 
@@ -863,10 +982,18 @@ inline void scan_entropy()
 			g_state.progress.store(static_cast<float>(scanned) / static_cast<float>(total_bytes));
 		}
 
+		size_t found = high_entropy.size();
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			g_state.entropy_map = std::move(high_entropy);
 		}
+
+		auto t_end = std::chrono::steady_clock::now();
+		uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+		diag::log_tagged_fmt("crypto_scan", "scan_entropy done regions=%zu bytes=%llu high_entropy=%zu duration_ms=%llu cancelled=%d",
+			scan_regions.size(), static_cast<unsigned long long>(total_bytes),
+			found, static_cast<unsigned long long>(dur_ms),
+			static_cast<int>(g_state.cancel.load()));
 
 		g_state.scanning.store(false);
 	});
@@ -876,6 +1003,11 @@ inline void add_custom_signature(const std::string& name, const std::string& alg
                                   const std::string& description, crypto_category_t cat,
                                   const std::vector<uint8_t>& pattern)
 {
+	if (pattern.empty()) {
+		diag::log_tagged_fmt("crypto_scan", "add_custom_signature refused empty_pattern name='%s'",
+			name.c_str());
+		return;
+	}
 	custom_signature_t sig;
 	sig.name = name;
 	sig.algorithm = algorithm;
@@ -885,101 +1017,22 @@ inline void add_custom_signature(const std::string& name, const std::string& alg
 
 	std::lock_guard<std::mutex> lk(g_state.mutex);
 	g_state.custom_sigs.push_back(std::move(sig));
+	diag::log_tagged_fmt("crypto_scan", "add_custom_signature name='%s' algo='%s' bytes=%zu total=%zu",
+		name.c_str(), algorithm.c_str(), pattern.size(), g_state.custom_sigs.size());
 }
 
 inline void remove_custom_signature(int index)
 {
 	std::lock_guard<std::mutex> lk(g_state.mutex);
-	if (index >= 0 && index < static_cast<int>(g_state.custom_sigs.size()))
+	if (index >= 0 && index < static_cast<int>(g_state.custom_sigs.size())) {
+		std::string nm = g_state.custom_sigs[static_cast<size_t>(index)].name;
 		g_state.custom_sigs.erase(g_state.custom_sigs.begin() + index);
-}
-
-inline void ai_analyze_results()
-{
-	if (g_state.analyzing.load()) return;
-
-	std::vector<crypto_hit_t> results_copy;
-	std::vector<entropy_region_t> entropy_copy;
-	{
-		std::lock_guard<std::mutex> lk(g_state.mutex);
-		results_copy = g_state.results;
-		entropy_copy = g_state.entropy_map;
+		diag::log_tagged_fmt("crypto_scan", "remove_custom_signature index=%d name='%s'",
+			index, nm.c_str());
+	} else {
+		diag::log_tagged_fmt("crypto_scan", "remove_custom_signature out_of_range index=%d size=%zu",
+			index, g_state.custom_sigs.size());
 	}
-
-	if (results_copy.empty() && entropy_copy.empty()) return;
-
-	g_state.analyzing.store(true);
-
-	work_queue::post([results_copy, entropy_copy]() {
-		std::string prompt = "You are analyzing cryptographic usage in a binary. ";
-		prompt += "The following crypto constants/tables were found in process memory:\n\n";
-
-		std::map<std::string, int> algo_counts;
-		for (auto& r : results_copy) algo_counts[r.algorithm]++;
-
-		for (auto& [algo, count] : algo_counts) {
-			prompt += "- " + algo + ": " + std::to_string(count) + " instance(s)\n";
-		}
-
-		prompt += "\nDetailed hits:\n";
-		int shown = 0;
-		for (auto& r : results_copy) {
-			if (shown >= 50) { prompt += "... (truncated)\n"; break; }
-			char buf[256];
-			std::snprintf(buf, sizeof(buf), "  %s at 0x%llX (%s+0x%llX)",
-				r.signature_name.c_str(),
-				static_cast<unsigned long long>(r.address),
-				r.module_name.c_str(),
-				static_cast<unsigned long long>(r.module_offset));
-			prompt += buf;
-			if (!r.referencing_functions.empty()) {
-				char ref[64];
-				std::snprintf(ref, sizeof(ref), " [%zu refs]", r.referencing_functions.size());
-				prompt += ref;
-			}
-			prompt += "\n";
-			++shown;
-		}
-
-		if (!entropy_copy.empty()) {
-			prompt += "\nHigh-entropy regions (potential encrypted data or keys):\n";
-			shown = 0;
-			for (auto& e : entropy_copy) {
-				if (shown >= 30) { prompt += "... (truncated)\n"; break; }
-				char buf[128];
-				std::snprintf(buf, sizeof(buf), "  0x%llX entropy=%.3f (%s)",
-					static_cast<unsigned long long>(e.address), e.entropy, e.module_name.c_str());
-				prompt += buf;
-				prompt += "\n";
-				++shown;
-			}
-		}
-
-		prompt += "\nAnalyze:\n"
-		          "1. What crypto algorithms are being used and why (TLS, DRM, obfuscation, etc.)\n"
-		          "2. Identify any unusual or weak crypto (RC4, DES, MD5)\n"
-		          "3. Map the crypto flow: which functions use which constants\n"
-		          "4. Flag potential custom/proprietary encryption implementations\n"
-		          "5. Identify high-entropy regions that could be keys, IVs, or encrypted data\n"
-		          "Be concise and actionable.";
-
-		auto ai = std::make_unique<standalone_ai_client_t>(g_sa_settings);
-		if (!ai->is_available()) {
-			g_state.analyzing.store(false);
-			return;
-		}
-
-		std::vector<std::pair<std::string, std::string>> history;
-		std::string result = ai->chat_blocking(prompt, history, nullptr, nullptr);
-
-		if (!result.empty()) {
-			std::lock_guard<std::mutex> lk(g_state.mutex);
-			if (!g_state.results.empty())
-				g_state.results[0].ai_analysis = result;
-		}
-
-		g_state.analyzing.store(false);
-	});
 }
 
 inline void export_results_json(const std::string& path)
@@ -1014,7 +1067,13 @@ inline void export_results_json(const std::string& path)
 	j["entropy_regions"] = ent;
 
 	std::ofstream ofs(path);
-	if (ofs.is_open()) ofs << j.dump(2);
+	if (ofs.is_open()) {
+		ofs << j.dump(2);
+		diag::log_tagged_fmt("crypto_scan", "export_results_json ok path='%s' hits=%zu entropy=%zu",
+			path.c_str(), g_state.results.size(), g_state.entropy_map.size());
+	} else {
+		diag::log_tagged_fmt("crypto_scan", "export_results_json failed path='%s'", path.c_str());
+	}
 }
 
 inline void export_results_csv(const std::string& path)
@@ -1022,7 +1081,10 @@ inline void export_results_csv(const std::string& path)
 	std::lock_guard<std::mutex> lk(g_state.mutex);
 
 	std::ofstream ofs(path);
-	if (!ofs.is_open()) return;
+	if (!ofs.is_open()) {
+		diag::log_tagged_fmt("crypto_scan", "export_results_csv failed path='%s'", path.c_str());
+		return;
+	}
 
 	ofs << "Type,Name,Algorithm,Address,Module,Offset,References\n";
 	for (auto& r : g_state.results) {
@@ -1041,6 +1103,8 @@ inline void export_results_csv(const std::string& path)
 			e.entropy, static_cast<unsigned long long>(e.address), e.module_name.c_str());
 		ofs << buf;
 	}
+	diag::log_tagged_fmt("crypto_scan", "export_results_csv ok path='%s' hits=%zu entropy=%zu",
+		path.c_str(), g_state.results.size(), g_state.entropy_map.size());
 }
 
 inline void save_custom_signatures()

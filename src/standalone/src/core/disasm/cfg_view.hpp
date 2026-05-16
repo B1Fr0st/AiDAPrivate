@@ -935,10 +935,26 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		bool is_selected = (n.id == g_state.selected_block);
 		bool is_exit = blk.successors.empty() && !blk.is_entry;
 
-		char header_buf[48];
+		char header_buf[160];
 		const char* kind = blk.is_entry ? "ENTRY" : (is_exit ? "EXIT" : "BLOCK");
-		snprintf(header_buf, sizeof(header_buf), "%s  %llX",
-		         kind, static_cast<unsigned long long>(blk.start_addr));
+		if (blk.is_entry) {
+			std::string fname = detail::resolve_branch_symbol_for_cfg(g_state.entry_addr);
+			if (fname.empty() && g_state.entry_addr != blk.start_addr)
+				fname = detail::resolve_branch_symbol_for_cfg(blk.start_addr);
+			if (!fname.empty()) {
+				size_t avail = sizeof(header_buf) - 12;
+				std::string fn_short = fname.size() > avail
+					? fname.substr(0, avail - 2) + ".." : fname;
+				snprintf(header_buf, sizeof(header_buf), "%s  %s",
+				         kind, fn_short.c_str());
+			} else {
+				snprintf(header_buf, sizeof(header_buf), "%s  %llX",
+				         kind, static_cast<unsigned long long>(blk.start_addr));
+			}
+		} else {
+			snprintf(header_buf, sizeof(header_buf), "%s  %llX",
+			         kind, static_cast<unsigned long long>(blk.start_addr));
+		}
 
 		ui_anim::render_graph_node_card(dl, tl.x, tl.y, nw, nh,
 		                                 header_buf, blk.is_entry, is_selected,

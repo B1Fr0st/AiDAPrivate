@@ -10,6 +10,8 @@
 #include "../../helpers/globals.h"
 #include "../../helpers/diag_log.hpp"
 #include "../analysis/pdb_events.hpp"
+#include "../analysis/symbol_store.hpp"
+#include "rename_store.hpp"
 #include "../infra/event_bus.hpp"
 #include "../infra/work_queue.hpp"
 #include "../ui/theme.hpp"
@@ -105,6 +107,38 @@ inline view_state_t& state()
 	return s;
 }
 
+inline bool is_synthetic_function_label(const std::string& s)
+{
+	if (s.size() < 5) return false;
+	bool sub = (s[0] == 's' || s[0] == 'S') &&
+	           (s[1] == 'u' || s[1] == 'U') &&
+	           (s[2] == 'b' || s[2] == 'B') && s[3] == '_';
+	bool fun = (s[0] == 'F' || s[0] == 'f') &&
+	           (s[1] == 'U' || s[1] == 'u') &&
+	           (s[2] == 'N' || s[2] == 'n') && s[3] == '_';
+	bool ghidra_func = (s.size() >= 4 &&
+	                    (s.rfind("func_0x", 0) == 0 ||
+	                     s.rfind("FUN_", 0) == 0 ||
+	                     s.rfind("sub_", 0) == 0));
+	return sub || fun || ghidra_func;
+}
+
+inline std::string resolve_tab_display_name(uint64_t addr, const std::string& fallback)
+{
+	if (addr == 0) {
+		if (!fallback.empty()) return fallback;
+		return std::string("sub_0");
+	}
+	std::string rn = rename_store::get(addr);
+	if (!rn.empty()) return rn;
+	std::string pdb_name = symbol_store::resolve_function_display_name(addr);
+	if (!pdb_name.empty()) return pdb_name;
+	if (!fallback.empty() && !is_synthetic_function_label(fallback)) return fallback;
+	char buf[40];
+	std::snprintf(buf, sizeof(buf), "sub_%llX", static_cast<unsigned long long>(addr));
+	return std::string(buf);
+}
+
 inline std::mutex& state_mutex()
 {
 	static std::mutex m;
@@ -123,10 +157,12 @@ inline aida::events::subscription_handle_t& pdb_subscription_slot()
 	return slot;
 }
 
+void rebuild_lines(tab_t& t);
+
 inline void on_pdb_loaded_invalidate(const aida::events::event_pdb_loaded& ev)
 {
 	if (!ev.success) return;
-	pseudocode_view::refresh_all_tabs();
+	refresh_all_tabs();
 }
 
 inline void ensure_pdb_subscription()
@@ -169,6 +205,95 @@ std::shared_ptr<tab_t> active_tab_locked()
 	return state().tabs[static_cast<size_t>(idx)];
 }
 
+inline uint64_t resolve_disasm_cursor_addr()
+{
+	const auto& dst = disasm_view::g_state;
+	const auto& instrs = g_disasm.file.instrs;
+	int row = dst.selected_row;
+	int n = static_cast<int>(instrs.size());
+	if (row >= 0 && row < n) return instrs[static_cast<size_t>(row)].addr;
+	if (n > 0) return instrs[0].addr;
+	return 0;
+}
+
+inline uint64_t follow_thunk_chain(uint64_t entry)
+{
+	uint64_t cur = entry;
+	for (int hops = 0; hops < 8; ++hops) {
+		if (cur == 0) break;
+		if (!function_index::is_thunk(cur)) break;
+		uint64_t next = function_index::thunk_target(cur);
+		if (next == 0 || next == cur) break;
+		cur = next;
+	}
+	return cur;
+}
+
+inline bool match_synthetic_function_prefix(const std::string& text, size_t pos,
+                                            size_t& out_prefix_len)
+{
+	if (pos + 4 > text.size()) return false;
+	if (text[pos + 3] != '_') return false;
+	char a = text[pos];
+	char b = text[pos + 1];
+	char c = text[pos + 2];
+	auto eq = [](char x, char y) {
+		if (x >= 'A' && x <= 'Z') x = static_cast<char>(x - 'A' + 'a');
+		if (y >= 'A' && y <= 'Z') y = static_cast<char>(y - 'A' + 'a');
+		return x == y;
+	};
+	if (eq(a, 's') && eq(b, 'u') && eq(c, 'b')) {
+		out_prefix_len = 4;
+		return true;
+	}
+	if (eq(a, 'f') && eq(b, 'u') && eq(c, 'n')) {
+		out_prefix_len = 4;
+		return true;
+	}
+	return false;
+}
+
+inline std::string substitute_synthetic_function_names(const std::string& text)
+{
+	std::string out;
+	out.reserve(text.size());
+	size_t i = 0;
+	while (i < text.size()) {
+		bool token_boundary = (i == 0) ||
+			(!(std::isalnum(static_cast<unsigned char>(text[i - 1])) || text[i - 1] == '_'));
+		size_t prefix_len = 0;
+		if (token_boundary && match_synthetic_function_prefix(text, i, prefix_len)) {
+			size_t hex_start = i + prefix_len;
+			size_t hex_end = hex_start;
+			while (hex_end < text.size() &&
+			       std::isxdigit(static_cast<unsigned char>(text[hex_end])))
+				++hex_end;
+			if (hex_end > hex_start && hex_end - hex_start >= 4 && hex_end - hex_start <= 16) {
+				bool after_ok = (hex_end == text.size()) ||
+					!(std::isalnum(static_cast<unsigned char>(text[hex_end])) || text[hex_end] == '_');
+				if (after_ok) {
+					std::string hex_part = text.substr(hex_start, hex_end - hex_start);
+					char* end = nullptr;
+					uint64_t addr = std::strtoull(hex_part.c_str(), &end, 16);
+					if (end && *end == '\0' && addr != 0) {
+						std::string resolved = rename_store::get(addr);
+						if (resolved.empty())
+							resolved = symbol_store::resolve_function_display_name(addr);
+						if (!resolved.empty()) {
+							out.append(resolved);
+							i = hex_end;
+							continue;
+						}
+					}
+				}
+			}
+		}
+		out.push_back(text[i]);
+		++i;
+	}
+	return out;
+}
+
 void rebuild_lines(tab_t& t)
 {
 	t.lines.clear();
@@ -178,7 +303,8 @@ void rebuild_lines(tab_t& t)
 		size_t end = t.pseudocode.find('\n', start);
 		if (end == std::string::npos) end = t.pseudocode.size();
 		line_info_t li;
-		li.text = t.pseudocode.substr(start, end - start);
+		std::string raw_line = t.pseudocode.substr(start, end - start);
+		li.text = substitute_synthetic_function_names(raw_line);
 		int spaces = 0;
 		for (char c : li.text) {
 			if (c == ' ') ++spaces;
@@ -888,7 +1014,7 @@ void check_popup_dismiss()
 
 }
 
-void request_decompile(uint64_t addr, const DisasmFile* file)
+void request_decompile(uint64_t addr, const DisasmFile* file, bool force_refresh)
 {
 	if (addr == 0) return;
 
@@ -896,6 +1022,7 @@ void request_decompile(uint64_t addr, const DisasmFile* file)
 
 	bool need_dispatch = false;
 	bool suppress_new_log = false;
+	bool cache_busted = false;
 	std::string log_label;
 
 	{
@@ -911,18 +1038,31 @@ void request_decompile(uint64_t addr, const DisasmFile* file)
 					break;
 				}
 			}
-			if (existing->loaded || existing->is_error) {
+			if (force_refresh) {
+				existing->pending = true;
+				existing->decompiling = true;
+				existing->loaded = false;
+				existing->is_error = false;
+				existing->error_text.clear();
+				globals::ui::decompile_popup_addr.store(addr, std::memory_order_release);
+				globals::ui::decompile_popup_active.store(true, std::memory_order_release);
+				need_dispatch = true;
+				suppress_new_log = true;
+				cache_busted = true;
+				log_label = existing->label;
+			} else if (existing->loaded || existing->is_error) {
 				diag::log_tagged_critical_fmt("psv", "request_decompile_existing addr=0x%llX label=%s loaded=%d",
 					static_cast<unsigned long long>(addr),
 					existing->label.c_str(),
 					existing->loaded ? 1 : 0);
 				return;
+			} else {
+				globals::ui::decompile_popup_addr.store(addr, std::memory_order_release);
+				globals::ui::decompile_popup_active.store(true, std::memory_order_release);
+				need_dispatch = true;
+				suppress_new_log = true;
+				log_label = existing->label;
 			}
-			globals::ui::decompile_popup_addr.store(addr, std::memory_order_release);
-			globals::ui::decompile_popup_active.store(true, std::memory_order_release);
-			need_dispatch = true;
-			suppress_new_log = true;
-			log_label = existing->label;
 		} else {
 			auto t = std::make_shared<tab_t>();
 			t->addr = addr;
@@ -937,7 +1077,7 @@ void request_decompile(uint64_t addr, const DisasmFile* file)
 			s.tabs.push_back(t);
 			s.active_index = static_cast<int>(s.tabs.size()) - 1;
 
-			{
+			if (!force_refresh) {
 				auto& st = decompiler_engine::g_state;
 				std::lock_guard<std::mutex> lk(st.mutex);
 				auto it = st.cache.find(addr);
@@ -962,6 +1102,8 @@ void request_decompile(uint64_t addr, const DisasmFile* file)
 						t->label.c_str());
 					return;
 				}
+			} else {
+				cache_busted = true;
 			}
 
 			globals::ui::decompile_popup_addr.store(addr, std::memory_order_release);
@@ -969,6 +1111,13 @@ void request_decompile(uint64_t addr, const DisasmFile* file)
 			need_dispatch = true;
 			log_label = t->label;
 		}
+	}
+
+	if (cache_busted) {
+		decompiler_engine::erase_cache_entry(addr);
+		diag::log_tagged_critical_fmt("psv", "request_decompile_force_refresh addr=0x%llX label=%s",
+			static_cast<unsigned long long>(addr),
+			log_label.c_str());
 	}
 
 	if (need_dispatch) {
@@ -1147,7 +1296,7 @@ std::vector<tab_info_t> snapshot_tabs()
 		tab_info_t ti;
 		ti.addr = t->addr;
 		ti.label = t->label;
-		ti.function_name = t->function_name;
+		ti.function_name = resolve_tab_display_name(t->addr, t->function_name);
 		ti.loaded = t->loaded;
 		ti.decompiling = t->decompiling || t->pending;
 		ti.is_error = t->is_error;
@@ -1164,6 +1313,11 @@ void render(float pos_x, float pos_y, float width, float height,
 	bool deferred_dispatch_native = false;
 	uint64_t deferred_dispatch_addr = 0;
 	const DisasmFile* deferred_dispatch_file = nullptr;
+
+	bool deferred_request_decompile = false;
+	uint64_t deferred_request_addr = 0;
+	const DisasmFile* deferred_request_file = nullptr;
+	bool deferred_request_force = false;
 
 	std::unique_lock<std::mutex> guard(state_mutex());
 	poll_pending_tabs();
@@ -1214,9 +1368,10 @@ void render(float pos_x, float pos_y, float width, float height,
 
 		ImFont* th_font = aida::ui::fonts::body_em();
 		if (!th_font) th_font = ImGui::GetFont();
-		std::string title = active->loaded && !active->function_name.empty()
+		std::string base_title = active->loaded && !active->function_name.empty()
 			? active->function_name
 			: active->label;
+		std::string title = resolve_tab_display_name(active->addr, base_title);
 		dl->AddText(th_font, 15.f,
 			ImVec2(ox + 16.f, oy + (toolbar_h - 15.f) * 0.5f + 6.f),
 			aida::ui::with_alpha(tk.text_primary, alpha), title.c_str());
@@ -1314,16 +1469,40 @@ void render(float pos_x, float pos_y, float width, float height,
 
 			if (!psv_text_lock && !io.KeyCtrl && !io.KeyAlt
 			    && ImGui::IsKeyPressed(ImGuiKey_F5, false)) {
-				active->pending = true;
-				active->decompiling = true;
-				active->loaded = false;
-				active->is_error = false;
-				decompiler_engine::erase_cache_entry(active->addr);
-				globals::ui::decompile_popup_addr.store(active->addr, std::memory_order_release);
-				globals::ui::decompile_popup_active.store(true, std::memory_order_release);
-				deferred_dispatch_native = true;
-				deferred_dispatch_addr = active->addr;
-				deferred_dispatch_file = &g_disasm.file;
+				uint64_t f5_cursor = resolve_disasm_cursor_addr();
+				uint64_t f5_entry = 0;
+				if (f5_cursor != 0) {
+					f5_entry = disasm_view::enclosing_function_start(f5_cursor, g_disasm.file);
+					if (f5_entry == 0) f5_entry = f5_cursor;
+					f5_entry = follow_thunk_chain(f5_entry);
+				}
+				uint64_t f5_active_addr = active->addr;
+				if (f5_entry == 0) {
+					if (!s.error_popup_active) {
+						s.error_popup_active = true;
+						s.error_popup_message = "no cursor address available; place the cursor on an instruction in the disassembly view and press F5 again";
+						s.error_popup_label = active->label;
+						s.error_popup_addr = f5_active_addr;
+						globals::ui::decompile_popup_active.store(false, std::memory_order_release);
+#ifdef _WIN32
+						MessageBeep(MB_ICONERROR);
+#endif
+					}
+					diag::log_tagged_critical_fmt("f5", "psv_f5_no_cursor active_addr=0x%llX",
+						static_cast<unsigned long long>(f5_active_addr));
+				} else {
+					bool same_addr = (f5_entry == f5_active_addr);
+					diag::log_tagged_critical_fmt("f5",
+						"psv_f5_resolved cursor=0x%llX entry=0x%llX active=0x%llX same=%d",
+						static_cast<unsigned long long>(f5_cursor),
+						static_cast<unsigned long long>(f5_entry),
+						static_cast<unsigned long long>(f5_active_addr),
+						same_addr ? 1 : 0);
+					deferred_request_decompile = true;
+					deferred_request_addr = f5_entry;
+					deferred_request_file = &g_disasm.file;
+					deferred_request_force = same_addr;
+				}
 			}
 
 			if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
@@ -1418,6 +1597,10 @@ void render(float pos_x, float pos_y, float width, float height,
 
 	if (deferred_dispatch_native && deferred_dispatch_addr != 0) {
 		decompiler_engine::decompile_function_native(deferred_dispatch_addr, deferred_dispatch_file);
+	}
+
+	if (deferred_request_decompile && deferred_request_addr != 0) {
+		request_decompile(deferred_request_addr, deferred_request_file, deferred_request_force);
 	}
 }
 

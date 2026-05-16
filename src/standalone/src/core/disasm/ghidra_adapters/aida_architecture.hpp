@@ -48,6 +48,12 @@ public:
 	function_db_t& symbol_database() { return symbol_db_; }
 	const function_db_t& symbol_database() const { return symbol_db_; }
 
+	void apply_pdb_types();
+	void apply_pdb_function_prototypes();
+
+	static std::string current_apply_pdb_name();
+	static const char* current_apply_pdb_stage();
+
 	ghidra::ProtoModel* proto_model_from_cc(const std::string& cc) const;
 	ghidra::Address register_address_from_name(const std::string& reg_name) const;
 

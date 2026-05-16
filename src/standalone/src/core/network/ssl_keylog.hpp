@@ -3,6 +3,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "work_queue.hpp"
+#include "helpers/diag_log.hpp"
 
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
@@ -144,6 +145,7 @@ inline void process_new_lines(state_t& state, const std::string& content) {
     std::istringstream iss(content);
     std::string line;
     uint64_t now = GetTickCount64();
+    size_t added = 0;
 
     std::lock_guard<std::mutex> lock(state.entries_mutex);
     while (std::getline(iss, line)) {
@@ -156,10 +158,15 @@ inline void process_new_lines(state_t& state, const std::string& content) {
 
             state.by_client_random[entry.client_random_hex].push_back(entry);
             state.entries.push_back(std::move(entry));
+            ++added;
 
             while (state.entries.size() > state.max_entries)
                 state.entries.pop_front();
         }
+    }
+    if (added > 0) {
+        diag::log_tagged_fmt("network", "ssl_keylog_entries_parsed added=%zu total=%zu",
+            added, state.entries.size());
     }
 }
 
@@ -172,17 +179,22 @@ inline void start_watching(const std::string& keylog_path) {
     g_state.keylog_path = keylog_path;
     g_state.file_pos = 0;
     g_state.watching.store(true);
+    diag::log_tagged_fmt("network", "ssl_keylog_watch_started path='%s'", keylog_path.c_str());
 
     work_queue::post([&state = g_state]() {
+        bool warned_missing = false;
         while (state.watching.load()) {
             std::ifstream file(state.keylog_path, std::ios::binary);
             if (file.is_open()) {
+                warned_missing = false;
                 file.seekg(0, std::ios::end);
                 std::streampos sp = file.tellg();
                 if (sp >= 0) {
                     size_t file_size = static_cast<size_t>(sp);
 
                     if (file_size < state.file_pos) {
+                        diag::log_tagged_fmt("network", "ssl_keylog_file_truncated prev=%zu now=%zu",
+                            state.file_pos, file_size);
                         state.file_pos = 0;
                     }
                     if (file_size > state.file_pos) {
@@ -201,16 +213,24 @@ inline void start_watching(const std::string& keylog_path) {
                     }
                 }
                 file.close();
+            } else if (!warned_missing) {
+                diag::log_tagged_fmt("network", "ssl_keylog_file_missing path='%s'",
+                    state.keylog_path.c_str());
+                warned_missing = true;
             }
 
             for (int i = 0; i < 20 && state.watching.load(); i++)
                 Sleep(10);
         }
+        diag::log_tagged("network", "ssl_keylog_watch_loop_exited");
     });
 }
 
 inline void stop_watching() {
-    g_state.watching.store(false);
+    if (g_state.watching.exchange(false)) {
+        diag::log_tagged_fmt("network", "ssl_keylog_watch_stopping path='%s' entries=%zu",
+            g_state.keylog_path.c_str(), g_state.entries.size());
+    }
 }
 
 

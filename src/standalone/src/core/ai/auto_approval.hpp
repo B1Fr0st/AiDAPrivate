@@ -4,6 +4,7 @@
 #include <vector>
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <regex>
 #include <functional>
 #include <mutex>
@@ -300,6 +301,18 @@ inline tool_category_t categorize_tool(const std::string& tool_name)
         tool_name == "list_checkpoints" || tool_name == "list_processes" ||
         tool_name == "list_modules" || tool_name == "list_threads" ||
         tool_name == "driver_status")
+        return tool_category_t::read_only;
+
+    auto has_prefix = [&](const char* p) {
+        size_t plen = std::strlen(p);
+        return tool_name.size() > plen && tool_name.compare(0, plen, p) == 0;
+    };
+    if (has_prefix("disasm_get_") || has_prefix("disasm_list_") ||
+        has_prefix("disasm_search_") || has_prefix("analysis_get_") ||
+        has_prefix("debugger_get_") || has_prefix("crypto_scanner_get") ||
+        has_prefix("network_get_") || has_prefix("network_capture_status") ||
+        has_prefix("bookmarks_list") || has_prefix("scanner_get_") ||
+        tool_name == "decompile_function" || tool_name == "disasm_get_comment")
         return tool_category_t::read_only;
 
     return tool_category_t::write;

@@ -7,6 +7,7 @@
 #include "aob_generator.hpp"
 #include "ui_anim.hpp"
 #include "../helpers/globals.h"
+#include "../helpers/diag_log.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
 #include "../ui/clock.hpp"
@@ -219,10 +220,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), generating, nullptr, generating)) {
 			uint64_t addr = 0;
 			if (gen.address_input[0]) {
-				addr = std::strtoull(gen.address_input, nullptr, 16);
+				const char* p = gen.address_input;
+				if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+				addr = std::strtoull(p, nullptr, 16);
 			}
 			if (addr != 0) {
 				aob_generator::generate_from_address(addr, gen.instruction_count, gen.auto_wildcard);
+			} else {
+				diag::log_tagged_fmt("aob", "view generate refused parse_failed input='%s'",
+					gen.address_input);
 			}
 		}
 		float btn_gap = 14.f;

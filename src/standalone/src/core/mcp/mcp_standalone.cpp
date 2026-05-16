@@ -13,6 +13,8 @@
 #include "zydis_disasm.hpp"
 #include "sandbox.hpp"
 #include "../infra/work_queue.hpp"
+#include "../session/analysis_session.hpp"
+#include "../../helpers/diag_log.hpp"
 #include <httplib.h>
 #include <sstream>
 #include <fstream>
@@ -283,6 +285,19 @@ server_t::~server_t() { stop(); }
 
 void server_t::register_tool(tool_def_t tool)
 {
+    bool already_has_binary_id = false;
+    for (const auto& p : tool.params) {
+        if (p.name == "binary_id") { already_has_binary_id = true; break; }
+    }
+    bool is_session_tool = tool.name.rfind("sessions_", 0) == 0;
+    if (!already_has_binary_id && !is_session_tool) {
+        tool.params.push_back(tool_param_t{
+            "binary_id",
+            "string",
+            "Optional session id to target (returned by sessions_list). When omitted the active session is used.",
+            false
+        });
+    }
     std::lock_guard<std::mutex> lk(_tools_mtx);
     _tools.push_back(std::move(tool));
 }
@@ -1265,6 +1280,166 @@ void server_t::write_client_configs() const
         if (success) { written.insert(path); ++ok; }
         else ++fail;
     }
+}
+
+
+target_scope_t::target_scope_t(target_scope_t&& other) noexcept
+    : ok(other.ok),
+      swapped(other.swapped),
+      resolved(other.resolved),
+      prev_active_idx(other.prev_active_idx),
+      target_idx(other.target_idx),
+      resolved_id(std::move(other.resolved_id)),
+      err(std::move(other.err))
+{
+    other.ok = false;
+    other.swapped = false;
+    other.resolved = false;
+    other.prev_active_idx = static_cast<size_t>(-1);
+    other.target_idx = static_cast<size_t>(-1);
+}
+
+target_scope_t& target_scope_t::operator=(target_scope_t&& other) noexcept
+{
+    if (this != &other) {
+        ok = other.ok;
+        swapped = other.swapped;
+        resolved = other.resolved;
+        prev_active_idx = other.prev_active_idx;
+        target_idx = other.target_idx;
+        resolved_id = std::move(other.resolved_id);
+        err = std::move(other.err);
+        other.ok = false;
+        other.swapped = false;
+        other.resolved = false;
+        other.prev_active_idx = static_cast<size_t>(-1);
+        other.target_idx = static_cast<size_t>(-1);
+    }
+    return *this;
+}
+
+target_scope_t::~target_scope_t()
+{
+    if (!ok) return;
+    if (!swapped) return;
+    if (prev_active_idx == static_cast<size_t>(-1)) return;
+    if (prev_active_idx >= analysis_session::session_count()) return;
+    (void)analysis_session::switch_session(prev_active_idx);
+    diag::log_tagged_fmt("mcp_standalone",
+        "target_scope_restore restored_idx=%llu",
+        static_cast<unsigned long long>(prev_active_idx));
+}
+
+target_scope_t resolve_target(const json& args, std::string* out_err)
+{
+    target_scope_t scope;
+    scope.ok = true;
+    scope.resolved = false;
+
+    if (args.is_null() || !args.is_object()) {
+        return scope;
+    }
+
+    std::string binary_id;
+    if (args.contains("binary_id") && args["binary_id"].is_string()) {
+        binary_id = args["binary_id"].get<std::string>();
+    } else if (args.contains("session_id") && args["session_id"].is_string()) {
+        binary_id = args["session_id"].get<std::string>();
+    }
+
+    std::string file_path;
+    if (binary_id.empty() && args.contains("file_path") && args["file_path"].is_string()) {
+        file_path = args["file_path"].get<std::string>();
+    }
+
+    uint32_t target_pid = 0;
+    if (binary_id.empty() && file_path.empty()) {
+        for (const char* key : {"target_pid", "process_id", "pid"}) {
+            if (!args.contains(key)) continue;
+            const auto& v = args[key];
+            if (v.is_number_unsigned()) {
+                target_pid = static_cast<uint32_t>(v.get<uint64_t>());
+            } else if (v.is_number_integer()) {
+                int64_t s = v.get<int64_t>();
+                if (s > 0) target_pid = static_cast<uint32_t>(s);
+            } else if (v.is_string()) {
+                std::string s = v.get<std::string>();
+                if (!s.empty()) {
+                    try { target_pid = static_cast<uint32_t>(std::stoul(s, nullptr, 0)); }
+                    catch (...) { target_pid = 0; }
+                }
+            }
+            if (target_pid != 0) break;
+        }
+    }
+
+    size_t resolved_idx = static_cast<size_t>(-1);
+    if (!binary_id.empty()) {
+        size_t idx = 0;
+        if (analysis_session::find_session_by_id(binary_id, &idx)) {
+            resolved_idx = idx;
+        } else {
+            scope.ok = false;
+            scope.err = "binary_id '" + binary_id + "' not found in active sessions";
+            if (out_err) *out_err = scope.err;
+            diag::log_tagged_fmt("mcp_standalone",
+                "resolve_target binary_id='%s' not_found", binary_id.c_str());
+            return scope;
+        }
+    } else if (!file_path.empty()) {
+        size_t idx = 0;
+        if (analysis_session::find_session_by_path(file_path, &idx)) {
+            resolved_idx = idx;
+        } else {
+            scope.ok = false;
+            scope.err = "file_path '" + file_path + "' not found in active sessions";
+            if (out_err) *out_err = scope.err;
+            return scope;
+        }
+    } else if (target_pid != 0) {
+        size_t idx = 0;
+        if (analysis_session::find_session_by_pid(target_pid, &idx)) {
+            resolved_idx = idx;
+        }
+    }
+
+    if (resolved_idx == static_cast<size_t>(-1)) {
+        return scope;
+    }
+
+    size_t cur = analysis_session::active_session_idx();
+    scope.prev_active_idx = cur;
+    scope.target_idx = resolved_idx;
+    scope.resolved = true;
+
+    auto sum = analysis_session::summarize_session_at(resolved_idx);
+    scope.resolved_id = sum.id;
+
+    if (cur == resolved_idx) {
+        diag::log_tagged_fmt("mcp_standalone",
+            "resolve_target id='%s' idx=%llu already_active",
+            scope.resolved_id.c_str(),
+            static_cast<unsigned long long>(resolved_idx));
+        return scope;
+    }
+
+    if (!analysis_session::switch_session(resolved_idx)) {
+        scope.ok = false;
+        scope.err = std::string("switch_session failed: ") + analysis_session::last_error();
+        if (out_err) *out_err = scope.err;
+        diag::log_tagged_fmt("mcp_standalone",
+            "resolve_target switch_failed target_idx=%llu err='%s'",
+            static_cast<unsigned long long>(resolved_idx), scope.err.c_str());
+        return scope;
+    }
+
+    scope.swapped = true;
+    diag::log_tagged_fmt("mcp_standalone",
+        "resolve_target id='%s' resolved_idx=%llu swapped=1 prev_idx=%llu",
+        scope.resolved_id.c_str(),
+        static_cast<unsigned long long>(resolved_idx),
+        static_cast<unsigned long long>(cur));
+    return scope;
 }
 
 

@@ -1,5 +1,14 @@
 #pragma once
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <commdlg.h>
+
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 
@@ -9,10 +18,17 @@
 #include "../ui/fonts.hpp"
 #include "../ui/clock.hpp"
 #include "../ui/blur_layer.hpp"
+#include "../../helpers/diag_log.hpp"
+#include "../../helpers/win32_dialog.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstring>
+#include <filesystem>
 #include <string>
+
+extern HWND g_hwnd;
 
 namespace initial_analysis_view {
 
@@ -374,10 +390,244 @@ inline void render_overlay()
 	fg->PopClipRect();
 }
 
+namespace detail {
+
+inline float& local_pdb_anim()      { static float v = 0.f; return v; }
+inline bool&  local_pdb_closing()   { static bool v = false; return v; }
+inline int&   local_pdb_open_frame(){ static int v = -1; return v; }
+inline bool&  local_pdb_pending()   { static bool v = false; return v; }
+inline std::string& local_pdb_typed_path()
+{
+	static std::string s;
+	return s;
+}
+inline std::array<char, 1024>& local_pdb_typed_buf()
+{
+	static std::array<char, 1024> buf{};
+	return buf;
+}
+
+inline std::string browse_for_pdb_dialog(HWND owner, const std::string& initial_name)
+{
+	char file_buf[1024] = {};
+	if (!initial_name.empty()) {
+		std::strncpy(file_buf, initial_name.c_str(),
+			sizeof(file_buf) - 1);
+	}
+
+	static const char k_initial_pdb_filter[] =
+		"PDB files (*.pdb)\0*.pdb\0"
+		"All files (*.*)\0*.*\0\0";
+	if (!win32_dialog::show_open_file_dialog(owner,
+			"Select PDB file",
+			k_initial_pdb_filter,
+			file_buf, sizeof(file_buf),
+			"initial_analysis_view::browse_for_pdb")) {
+		return std::string();
+	}
+	return std::string(file_buf);
+}
+
+}
+
+inline void render_local_pdb_modal()
+{
+	auto& st = initial_analysis::g_state;
+	bool wants_prompt = st.needs_local_pdb_prompt.load(std::memory_order_acquire);
+
+	float& anim    = detail::local_pdb_anim();
+	bool&  closing = detail::local_pdb_closing();
+	int&   open_fr = detail::local_pdb_open_frame();
+	bool&  pending = detail::local_pdb_pending();
+
+	float dt = ImGui::GetIO().DeltaTime;
+	float target = (wants_prompt && !closing) ? 1.f : 0.f;
+	anim += (target - anim) * (std::min)(dt * 14.f, 1.f);
+	if (std::fabs(anim - target) < 0.003f) anim = target;
+
+	if (pending && anim < 0.01f) {
+		pending = false;
+		closing = false;
+		open_fr = -1;
+		anim = 0.f;
+		return;
+	}
+
+	if (!wants_prompt && anim < 0.005f) {
+		if (open_fr >= 0) open_fr = -1;
+		return;
+	}
+
+	if (open_fr < 0) {
+		open_fr = ImGui::GetFrameCount();
+		{
+			std::lock_guard<std::mutex> lk(st.local_pdb_mtx);
+			std::string seed = st.local_pdb_module_name;
+			auto dot = seed.rfind('.');
+			if (dot != std::string::npos) seed = seed.substr(0, dot);
+			if (!seed.empty()) seed += ".pdb";
+			detail::local_pdb_typed_path() = seed;
+			std::strncpy(detail::local_pdb_typed_buf().data(), seed.c_str(),
+				detail::local_pdb_typed_buf().size() - 1);
+		}
+	}
+
+	ImVec2 vp = ImGui::GetIO().DisplaySize;
+	ImGui::GetForegroundDrawList()->AddRectFilled(ImVec2(0, 0), vp,
+		IM_COL32(0, 0, 0, static_cast<int>(160.f * anim)));
+
+	float pw = 680.f, ph = 360.f;
+	float scale = 0.96f + 0.04f * anim;
+	float sw = pw * scale, sh = ph * scale;
+	float px = (vp.x - sw) * 0.5f, py = (vp.y - sh) * 0.5f;
+
+	if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !closing && wants_prompt) {
+		initial_analysis::decline_local_pdb_prompt();
+		closing = true;
+		pending = true;
+	}
+
+	ImGui::SetNextWindowPos(ImVec2(px, py));
+	ImGui::SetNextWindowSize(ImVec2(sw, sh));
+	ImGui::SetNextWindowFocus();
+	const auto& th = aida::ui::resolved();
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, aida::ui::with_alpha(th.bg_elevated, anim * 0.97f));
+	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(th.border_strong, anim));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.f);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(22, 18));
+
+	ImGui::Begin("Local PDB needed##ia_local_pdb_dlg", nullptr,
+		ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+		ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+
+	std::string reason;
+	std::string module_name;
+	{
+		std::lock_guard<std::mutex> lk(st.local_pdb_mtx);
+		reason = st.local_pdb_reason;
+		module_name = st.local_pdb_module_name;
+	}
+
+	{
+		ImGui::PushFont(aida::ui::fonts::h2());
+		ImVec4 acc = th.accent;
+		ImGui::TextColored(acc, "Local PDB file");
+		ImGui::PopFont();
+
+		ImGui::Dummy(ImVec2(0.f, 4.f));
+		ImGui::PushFont(aida::ui::fonts::body());
+		ImGui::TextWrapped("%s", reason.c_str());
+		if (!module_name.empty()) {
+			ImGui::Dummy(ImVec2(0.f, 6.f));
+			ImGui::PushStyleColor(ImGuiCol_Text, th.text_dim);
+			ImGui::PushFont(aida::ui::fonts::caption());
+			ImGui::TextWrapped("Module: %s", module_name.c_str());
+			ImGui::PopFont();
+			ImGui::PopStyleColor();
+		}
+		ImGui::PopFont();
+	}
+
+	ImGui::Dummy(ImVec2(0.f, 12.f));
+
+	{
+		ImGui::PushFont(aida::ui::fonts::body());
+		ImGui::PushStyleColor(ImGuiCol_Text, th.text_secondary);
+		ImGui::TextUnformatted("Type the absolute path to the PDB, or click Browse...");
+		ImGui::PopStyleColor();
+		ImGui::PopFont();
+
+		ImGui::Dummy(ImVec2(0.f, 6.f));
+		auto& buf = detail::local_pdb_typed_buf();
+		ImGui::PushItemWidth(sw - 44.f - 110.f - 12.f);
+		ImGui::PushFont(aida::ui::fonts::code());
+		if (ImGui::InputText("##ia_local_pdb_path", buf.data(),
+			static_cast<int>(buf.size()),
+			ImGuiInputTextFlags_AutoSelectAll))
+		{
+			detail::local_pdb_typed_path() = buf.data();
+		}
+		ImGui::PopFont();
+		ImGui::PopItemWidth();
+		ImGui::SameLine();
+		if (aida::ui::button("Browse...",
+			aida::ui::button_kind_t::secondary,
+			aida::ui::size_t_::md, ImVec2(108.f, 28.f)))
+		{
+			std::string seed = module_name;
+			auto dot = seed.rfind('.');
+			if (dot != std::string::npos) seed = seed.substr(0, dot);
+			if (!seed.empty()) seed += ".pdb";
+			std::string picked = detail::browse_for_pdb_dialog(g_hwnd, seed);
+			if (!picked.empty()) {
+				detail::local_pdb_typed_path() = picked;
+				std::strncpy(buf.data(), picked.c_str(), buf.size() - 1);
+				buf[buf.size() - 1] = '\0';
+			}
+		}
+	}
+
+	float btn_h = 38.f;
+	float btn_w = 156.f;
+	float btn_spacing = 14.f;
+	float total_w = btn_w * 2.f + btn_spacing;
+	float bx = (sw - total_w) * 0.5f;
+	float by_btn = sh - btn_h - 24.f;
+
+	{
+		ImGui::SetCursorPos(ImVec2(bx, by_btn));
+		bool load_clicked = aida::ui::button("Load this PDB",
+			aida::ui::button_kind_t::primary,
+			aida::ui::size_t_::md, ImVec2(btn_w, btn_h));
+		ImGui::SetCursorPos(ImVec2(bx + btn_w + btn_spacing, by_btn));
+		bool skip_clicked = aida::ui::button("No, skip",
+			aida::ui::button_kind_t::secondary,
+			aida::ui::size_t_::md, ImVec2(btn_w, btn_h));
+
+		if (load_clicked && !closing) {
+			std::string picked = detail::local_pdb_typed_path();
+			while (!picked.empty() && (picked.front() == ' ' || picked.front() == '\t'))
+				picked.erase(picked.begin());
+			while (!picked.empty() && (picked.back() == ' ' || picked.back() == '\t' ||
+			                            picked.back() == '\r' || picked.back() == '\n'))
+				picked.pop_back();
+
+			bool path_ok = !picked.empty() && std::filesystem::exists(picked) &&
+				std::filesystem::is_regular_file(picked);
+			if (path_ok) {
+				initial_analysis::accept_local_pdb_prompt(picked);
+				closing = true;
+				pending = true;
+			} else {
+				std::string seed = module_name;
+				auto dot = seed.rfind('.');
+				if (dot != std::string::npos) seed = seed.substr(0, dot);
+				if (!seed.empty()) seed += ".pdb";
+				std::string browsed = detail::browse_for_pdb_dialog(g_hwnd, seed);
+				if (!browsed.empty()) {
+					initial_analysis::accept_local_pdb_prompt(browsed);
+					closing = true;
+					pending = true;
+				}
+			}
+		}
+		if (skip_clicked && !closing) {
+			initial_analysis::decline_local_pdb_prompt();
+			closing = true;
+			pending = true;
+		}
+	}
+
+	ImGui::End();
+	ImGui::PopStyleVar(2);
+	ImGui::PopStyleColor(2);
+}
+
 inline void render_frame()
 {
 	render_overlay();
 	render_modal();
+	render_local_pdb_modal();
 }
 
 }

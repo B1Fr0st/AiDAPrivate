@@ -25,12 +25,18 @@
 
 #include <nlohmann/json.hpp>
 
+#include "../../helpers/diag_log.hpp"
+
 #include "event_bus.hpp"
 #include "pe_parser.hpp"
 #include "standalone_driver.hpp"
 #include "symbol_store.hpp"
 #include "xref_db.hpp"
 #include "xref_engine.hpp"
+#include "zydis_disasm.hpp"
+#include "function_index.hpp"
+
+extern DisasmState g_disasm;
 
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "Shell32.lib")
@@ -580,17 +586,529 @@ namespace binary_map {
 				duration_cast<seconds>(system_clock::now().time_since_epoch()).count());
 		}
 
+		void parse_static_exports(uint64_t module_base, pe_parser::pe_info_t& pe);
+		void parse_static_imports(uint64_t module_base, pe_parser::pe_info_t& pe);
+
+		bool read_static_mem(uint64_t addr, void* buf, size_t size)
+		{
+			std::vector<uint8_t> tmp;
+			if (!static_analysis::read_bytes_from_pe(g_disasm.file, addr, size, tmp))
+				return false;
+			if (tmp.size() < size)
+				return false;
+			std::memcpy(buf, tmp.data(), size);
+			return true;
+		}
+
+		bool read_static_string_at(uint64_t addr, size_t max_len, std::string& out)
+		{
+			out.clear();
+			std::vector<uint8_t> blob;
+			if (!static_analysis::read_bytes_from_pe(g_disasm.file, addr, max_len, blob))
+				return false;
+			for (size_t i = 0; i < blob.size(); ++i) {
+				if (blob[i] == 0)
+					return true;
+				out.push_back(static_cast<char>(blob[i]));
+			}
+			return !out.empty();
+		}
+
+		bool parse_pe_static(uint64_t module_base, pe_parser::pe_info_t& out)
+		{
+			out = pe_parser::pe_info_t{};
+
+			uint16_t dos_magic = 0;
+			if (!read_static_mem(module_base, &dos_magic, 2)) return false;
+			if (dos_magic != 0x5A4D) return false;
+
+			uint32_t e_lfanew = 0;
+			if (!read_static_mem(module_base + 0x3C, &e_lfanew, 4)) return false;
+			if (e_lfanew > 0x1000) return false;
+
+			uint64_t nt_addr = module_base + e_lfanew;
+			uint32_t nt_sig = 0;
+			if (!read_static_mem(nt_addr, &nt_sig, 4)) return false;
+			if (nt_sig != 0x00004550) return false;
+
+			uint8_t file_header[20];
+			if (!read_static_mem(nt_addr + 4, file_header, 20)) return false;
+
+			uint16_t num_sections = 0;
+			std::memcpy(&num_sections, file_header + 2, 2);
+			std::memcpy(&out.timestamp, file_header + 4, 4);
+			uint16_t opt_header_size = 0;
+			std::memcpy(&opt_header_size, file_header + 16, 2);
+			std::memcpy(&out.characteristics, file_header + 18, 2);
+
+			uint64_t opt_addr = nt_addr + 24;
+			uint16_t opt_magic = 0;
+			if (!read_static_mem(opt_addr, &opt_magic, 2)) return false;
+			out.is_64bit = (opt_magic == 0x020B);
+
+			uint8_t opt_buf[128];
+			size_t to_read = (opt_header_size < 128) ? opt_header_size : 128;
+			if (!read_static_mem(opt_addr, opt_buf, to_read)) return false;
+
+			uint32_t ep_rva = 0;
+			std::memcpy(&ep_rva, opt_buf + 16, 4);
+			if (out.is_64bit) {
+				std::memcpy(&out.image_base, opt_buf + 24, 8);
+				std::memcpy(&out.size_of_image, opt_buf + 56, 4);
+				if (to_read >= 70) std::memcpy(&out.subsystem, opt_buf + 68, 2);
+				if (to_read >= 128) {
+					std::memcpy(&out.export_dir_rva, opt_buf + 112, 4);
+					std::memcpy(&out.export_dir_size, opt_buf + 116, 4);
+					std::memcpy(&out.import_dir_rva, opt_buf + 120, 4);
+					std::memcpy(&out.import_dir_size, opt_buf + 124, 4);
+				}
+			} else {
+				uint32_t image_base_32 = 0;
+				std::memcpy(&image_base_32, opt_buf + 28, 4);
+				out.image_base = image_base_32;
+				std::memcpy(&out.size_of_image, opt_buf + 56, 4);
+				if (to_read >= 70) std::memcpy(&out.subsystem, opt_buf + 68, 2);
+				if (to_read >= 104) {
+					std::memcpy(&out.export_dir_rva, opt_buf + 96, 4);
+					std::memcpy(&out.export_dir_size, opt_buf + 100, 4);
+				}
+				if (to_read >= 112) {
+					std::memcpy(&out.import_dir_rva, opt_buf + 104, 4);
+					std::memcpy(&out.import_dir_size, opt_buf + 108, 4);
+				}
+			}
+			out.entry_point = module_base + ep_rva;
+
+			uint64_t section_start = opt_addr + opt_header_size;
+			if (num_sections > 96) num_sections = 96;
+			for (uint16_t i = 0; i < num_sections; ++i) {
+				uint8_t sec_buf[40];
+				if (!read_static_mem(section_start + i * 40, sec_buf, 40)) break;
+				pe_parser::section_info_t sec;
+				char sec_name[9] = {};
+				std::memcpy(sec_name, sec_buf, 8);
+				sec_name[8] = 0;
+				sec.name = sec_name;
+				std::memcpy(&sec.virtual_size, sec_buf + 8, 4);
+				std::memcpy(&sec.virtual_address, sec_buf + 12, 4);
+				std::memcpy(&sec.raw_size, sec_buf + 16, 4);
+				std::memcpy(&sec.characteristics, sec_buf + 36, 4);
+				out.sections.push_back(std::move(sec));
+			}
+
+			parse_static_exports(module_base, out);
+			parse_static_imports(module_base, out);
+			return true;
+		}
+
+		void parse_static_exports(uint64_t module_base, pe_parser::pe_info_t& pe)
+		{
+			pe.exports.clear();
+			if (pe.export_dir_rva == 0 || pe.export_dir_size == 0) return;
+
+			uint64_t export_dir_addr = module_base + pe.export_dir_rva;
+			uint8_t dir_buf[40];
+			if (!read_static_mem(export_dir_addr, dir_buf, 40)) return;
+
+			uint32_t num_functions = 0;
+			uint32_t num_names = 0;
+			uint32_t addr_table_rva = 0;
+			uint32_t name_table_rva = 0;
+			uint32_t ordinal_table_rva = 0;
+			uint32_t ordinal_base = 0;
+			std::memcpy(&ordinal_base, dir_buf + 16, 4);
+			std::memcpy(&num_functions, dir_buf + 20, 4);
+			std::memcpy(&num_names, dir_buf + 24, 4);
+			std::memcpy(&addr_table_rva, dir_buf + 28, 4);
+			std::memcpy(&name_table_rva, dir_buf + 32, 4);
+			std::memcpy(&ordinal_table_rva, dir_buf + 36, 4);
+
+			if (num_functions == 0 || num_functions > 0x10000) return;
+			if (num_names > num_functions) num_names = num_functions;
+
+			std::vector<uint32_t> addr_table(num_functions);
+			if (!read_static_mem(module_base + addr_table_rva, addr_table.data(), num_functions * 4))
+				return;
+
+			std::vector<uint32_t> name_ptrs(num_names);
+			std::vector<uint16_t> ordinals(num_names);
+			if (num_names > 0) {
+				if (!read_static_mem(module_base + name_table_rva, name_ptrs.data(), num_names * 4)) return;
+				if (!read_static_mem(module_base + ordinal_table_rva, ordinals.data(), num_names * 2)) return;
+			}
+
+			std::vector<std::string> name_lookup(num_functions);
+			for (uint32_t i = 0; i < num_names; ++i) {
+				if (ordinals[i] < num_functions) {
+					std::string fname;
+					read_static_string_at(module_base + name_ptrs[i], 512, fname);
+					name_lookup[ordinals[i]] = std::move(fname);
+				}
+			}
+
+			uint32_t exp_start = pe.export_dir_rva;
+			uint32_t exp_end = pe.export_dir_rva + pe.export_dir_size;
+
+			pe.exports.reserve(num_functions);
+			for (uint32_t i = 0; i < num_functions; ++i) {
+				if (addr_table[i] == 0) continue;
+				pe_parser::export_entry_t entry;
+				entry.ordinal = static_cast<uint16_t>(ordinal_base + i);
+				entry.rva = addr_table[i];
+				entry.address = module_base + addr_table[i];
+				entry.name = name_lookup[i];
+				if (addr_table[i] >= exp_start && addr_table[i] < exp_end) {
+					entry.is_forwarded = true;
+					read_static_string_at(module_base + addr_table[i], 512, entry.forward_name);
+				}
+				pe.exports.push_back(std::move(entry));
+			}
+		}
+
+		void parse_static_imports(uint64_t module_base, pe_parser::pe_info_t& pe)
+		{
+			pe.imports.clear();
+			if (pe.import_dir_rva == 0 || pe.import_dir_size == 0) return;
+
+			uint64_t import_dir_addr = module_base + pe.import_dir_rva;
+			for (uint32_t desc_idx = 0; desc_idx < 4096; ++desc_idx) {
+				uint8_t desc_buf[20];
+				if (!read_static_mem(import_dir_addr + desc_idx * 20, desc_buf, 20)) break;
+
+				uint32_t ilt_rva = 0;
+				uint32_t name_rva = 0;
+				uint32_t iat_rva = 0;
+				std::memcpy(&ilt_rva, desc_buf + 0, 4);
+				std::memcpy(&name_rva, desc_buf + 12, 4);
+				std::memcpy(&iat_rva, desc_buf + 16, 4);
+				if (ilt_rva == 0 && iat_rva == 0) break;
+
+				std::string mod_name;
+				if (name_rva != 0)
+					read_static_string_at(module_base + name_rva, 256, mod_name);
+
+				uint32_t lookup_rva = (ilt_rva != 0) ? ilt_rva : iat_rva;
+				for (uint32_t thunk_idx = 0; thunk_idx < 0x10000; ++thunk_idx) {
+					uint64_t thunk_addr = module_base + lookup_rva
+						+ (pe.is_64bit ? thunk_idx * 8 : thunk_idx * 4);
+					uint64_t thunk_val = 0;
+					if (pe.is_64bit) {
+						if (!read_static_mem(thunk_addr, &thunk_val, 8)) break;
+					} else {
+						uint32_t tmp32 = 0;
+						if (!read_static_mem(thunk_addr, &tmp32, 4)) break;
+						thunk_val = tmp32;
+					}
+					if (thunk_val == 0) break;
+
+					pe_parser::import_entry_t entry;
+					entry.module_name = mod_name;
+					entry.iat_address = module_base + iat_rva
+						+ (pe.is_64bit ? thunk_idx * 8 : thunk_idx * 4);
+					uint64_t iat_val = 0;
+					if (pe.is_64bit) read_static_mem(entry.iat_address, &iat_val, 8);
+					else {
+						uint32_t tmp32 = 0;
+						read_static_mem(entry.iat_address, &tmp32, 4);
+						iat_val = tmp32;
+					}
+					entry.bound_address = iat_val;
+
+					bool is_ordinal = pe.is_64bit
+						? (thunk_val & 0x8000000000000000ULL) != 0
+						: (thunk_val & 0x80000000ULL) != 0;
+					if (is_ordinal) {
+						entry.ordinal = static_cast<uint16_t>(thunk_val & 0xFFFF);
+						char ord_buf[32];
+						snprintf(ord_buf, sizeof(ord_buf), "Ordinal#%u", entry.ordinal);
+						entry.function_name = ord_buf;
+					} else {
+						uint32_t hint_name_rva = static_cast<uint32_t>(thunk_val & 0x7FFFFFFF);
+						uint16_t hint = 0;
+						read_static_mem(module_base + hint_name_rva, &hint, 2);
+						entry.hint = hint;
+						read_static_string_at(module_base + hint_name_rva + 2, 512,
+							entry.function_name);
+					}
+					pe.imports.push_back(std::move(entry));
+				}
+			}
+		}
+
+		bool generate_static_locked(const map_options_t& opts, map_t& out)
+		{
+			out = map_t{};
+
+			if (!function_index::detail::static_pe_active()) {
+				set_last_error_unlocked("binary_map.generate_static: no static PE loaded");
+				return false;
+			}
+
+			pe_parser::pe_info_t pe;
+			const uint64_t image_base = g_disasm.file.image_base;
+			if (!parse_pe_static(image_base, pe)) {
+				set_last_error_unlocked("binary_map.generate_static: PE parse failed");
+				return false;
+			}
+
+			out.module_name = g_disasm.file.filename.empty()
+				? g_disasm.file.path : g_disasm.file.filename;
+			out.module_path = g_disasm.file.path;
+			out.image_base = image_base;
+			out.image_size = (pe.size_of_image != 0)
+				? static_cast<uint64_t>(pe.size_of_image)
+				: static_analysis::total_image_size(g_disasm.file);
+
+			detect_arch_format(pe, out.architecture, out.format);
+
+			out.sections.reserve(pe.sections.size());
+			for (const auto& s : pe.sections) {
+				map_section_t ms;
+				ms.name = s.name;
+				ms.va = image_base + s.virtual_address;
+				ms.size = s.virtual_size;
+				ms.executable = is_section_executable(s.characteristics);
+				ms.writable = is_section_writable(s.characteristics);
+				ms.readable = is_section_readable(s.characteristics);
+				out.sections.push_back(std::move(ms));
+			}
+
+			std::unordered_map<uint64_t, std::string> import_name_lookup;
+			if (opts.include_imports) {
+				out.imports.reserve(pe.imports.size());
+				std::unordered_map<std::string, std::vector<std::string>> by_module;
+				for (const auto& imp : pe.imports) {
+					if (imp.iat_address != 0) {
+						import_name_lookup[imp.iat_address] = imp.module_name + "!" + imp.function_name;
+						if (imp.bound_address != 0)
+							import_name_lookup[imp.bound_address] = imp.module_name + "!" + imp.function_name;
+					}
+					if (!imp.module_name.empty())
+						by_module[imp.module_name].push_back(imp.function_name);
+				}
+				for (auto& kv : by_module) {
+					std::sort(kv.second.begin(), kv.second.end());
+					kv.second.erase(std::unique(kv.second.begin(), kv.second.end()), kv.second.end());
+					std::string line = kv.first + ": ";
+					for (size_t i = 0; i < kv.second.size(); ++i) {
+						if (i != 0) line += ", ";
+						line += kv.second[i];
+					}
+					out.imports.push_back(std::move(line));
+				}
+				std::sort(out.imports.begin(), out.imports.end());
+			}
+
+			if (opts.include_exports) {
+				out.exports.reserve(pe.exports.size());
+				for (const auto& exp : pe.exports) {
+					if (exp.is_forwarded || exp.name.empty())
+						continue;
+					out.exports.push_back(exp.name);
+				}
+				std::sort(out.exports.begin(), out.exports.end());
+				out.exports.erase(std::unique(out.exports.begin(), out.exports.end()), out.exports.end());
+			}
+
+			std::vector<pdb_symbol_snapshot_t> pdb_syms;
+			snapshot_pdb_symbols(out.module_name, pdb_syms);
+
+			std::unordered_map<uint64_t, std::string> function_name_lookup;
+			std::vector<uint64_t> candidate_function_vas;
+			enumerate_functions_from_pdb(pdb_syms, function_name_lookup,
+				candidate_function_vas, image_base);
+
+			for (const auto& exp : pe.exports) {
+				if (exp.is_forwarded || exp.address == 0) continue;
+				if (function_name_lookup.find(exp.address) == function_name_lookup.end()) {
+					if (!exp.name.empty()) function_name_lookup[exp.address] = exp.name;
+				}
+				candidate_function_vas.push_back(exp.address);
+			}
+
+			xref_snapshot_t xref_snap;
+			snapshot_xref_module(out.module_name, xref_snap);
+
+			std::vector<map_global_t> pdb_globals;
+			std::unordered_map<uint64_t, std::string> data_name_lookup;
+			enumerate_globals_from_pdb(pdb_syms, image_base, pdb_globals, data_name_lookup);
+
+			if (xref_snap.available) {
+				seed_function_vas_from_xrefs(xref_snap, out.image_base, out.image_size,
+					candidate_function_vas);
+			}
+
+			std::sort(candidate_function_vas.begin(), candidate_function_vas.end());
+			candidate_function_vas.erase(
+				std::unique(candidate_function_vas.begin(), candidate_function_vas.end()),
+				candidate_function_vas.end());
+
+			std::vector<uint64_t> pinned_snapshot(pin_set().begin(), pin_set().end());
+			for (auto va : pinned_snapshot) {
+				if (va >= out.image_base && va < out.image_base + out.image_size)
+					candidate_function_vas.push_back(va);
+			}
+			std::sort(candidate_function_vas.begin(), candidate_function_vas.end());
+			candidate_function_vas.erase(
+				std::unique(candidate_function_vas.begin(), candidate_function_vas.end()),
+				candidate_function_vas.end());
+
+			std::vector<map_function_t> all_functions;
+			all_functions.reserve(candidate_function_vas.size());
+			const std::set<uint64_t>& pin_view = pin_set();
+
+			for (const auto va : candidate_function_vas) {
+				map_function_t fn;
+				fn.va = va;
+				auto nit = function_name_lookup.find(va);
+				fn.name = (nit != function_name_lookup.end() && !nit->second.empty())
+					? nit->second : default_function_name(va);
+
+				auto xc = xref_snap.to_count.find(va);
+				fn.xref_count = (xc != xref_snap.to_count.end()) ? xc->second : 0;
+
+				std::vector<callee_summary_t> callees;
+				int callee_total = 0;
+				if (xref_snap.available)
+					collect_call_targets(xref_snap, va, callees, callee_total);
+				fn.callee_count = callee_total;
+
+				const int max_top = opts.max_callees_per_function > 0
+					? opts.max_callees_per_function : 5;
+				const int take = (static_cast<int>(callees.size()) < max_top)
+					? static_cast<int>(callees.size()) : max_top;
+				fn.top_callees.reserve(take);
+				for (int i = 0; i < take; ++i) {
+					fn.top_callees.push_back(resolve_callee_name(
+						callees[i].target, function_name_lookup,
+						import_name_lookup, out.image_base, out.image_size));
+				}
+
+				fn.section_name = section_name_for_va(out, va);
+				fn.pinned = pin_view.count(va) != 0;
+				fn.score = score_function(fn.xref_count, fn.callee_count, fn.pinned);
+				all_functions.push_back(std::move(fn));
+			}
+
+			std::sort(all_functions.begin(), all_functions.end(),
+				[](const map_function_t& a, const map_function_t& b) {
+					if (a.score != b.score) return a.score > b.score;
+					if (a.xref_count != b.xref_count) return a.xref_count > b.xref_count;
+					return a.va < b.va;
+				});
+
+			std::vector<map_function_t> selected;
+			std::unordered_set<uint64_t> already;
+			selected.reserve(static_cast<size_t>(opts.max_functions > 0 ? opts.max_functions : 50));
+			for (const auto& fn : all_functions) {
+				if (!fn.pinned) continue;
+				if (already.insert(fn.va).second)
+					selected.push_back(fn);
+			}
+			const int budget = opts.max_functions > 0 ? opts.max_functions : 50;
+			for (const auto& fn : all_functions) {
+				if (static_cast<int>(selected.size()) >= budget) break;
+				if (already.insert(fn.va).second) selected.push_back(fn);
+			}
+			std::sort(selected.begin(), selected.end(),
+				[](const map_function_t& a, const map_function_t& b) {
+					if (a.score != b.score) return a.score > b.score;
+					if (a.xref_count != b.xref_count) return a.xref_count > b.xref_count;
+					return a.va < b.va;
+				});
+			out.functions = std::move(selected);
+
+			std::vector<map_global_t> all_globals;
+			all_globals.reserve(pdb_globals.size());
+			for (auto& g : pdb_globals) {
+				if (g.va < out.image_base || g.va >= out.image_base + out.image_size) continue;
+				auto xc = xref_snap.to_count.find(g.va);
+				g.xref_count = (xc != xref_snap.to_count.end()) ? xc->second : 0;
+				if (g.xref_count <= 0) continue;
+				g.section_name = section_name_for_va(out, g.va);
+				for (const auto& sec : out.sections) {
+					if (g.va >= sec.va && g.va < sec.va + sec.size) {
+						g.writable = sec.writable;
+						break;
+					}
+				}
+				all_globals.push_back(std::move(g));
+			}
+
+			if (xref_snap.available) {
+				for (const auto& kv : xref_snap.to_kinds) {
+					const uint64_t target = kv.first;
+					if (target < out.image_base || target >= out.image_base + out.image_size) continue;
+					bool is_data = true;
+					for (const auto kind : kv.second) {
+						if (kind == xref_engine::xref_type_t::call ||
+							kind == xref_engine::xref_type_t::jump ||
+							kind == xref_engine::xref_type_t::conditional_jump) {
+							is_data = false;
+							break;
+						}
+					}
+					if (!is_data) continue;
+					bool in_writable_or_readonly = false;
+					std::string sec_name;
+					bool sec_writable = false;
+					for (const auto& sec : out.sections) {
+						if (target >= sec.va && target < sec.va + sec.size) {
+							in_writable_or_readonly = !sec.executable;
+							sec_name = sec.name;
+							sec_writable = sec.writable;
+							break;
+						}
+					}
+					if (!in_writable_or_readonly) continue;
+					auto already_has = std::find_if(all_globals.begin(), all_globals.end(),
+						[&](const map_global_t& g) { return g.va == target; });
+					if (already_has != all_globals.end()) continue;
+					map_global_t g;
+					g.va = target;
+					auto dit = data_name_lookup.find(target);
+					g.name = (dit != data_name_lookup.end() && !dit->second.empty())
+						? dit->second : default_global_name(target);
+					g.xref_count = static_cast<int>(kv.second.size());
+					g.section_name = sec_name;
+					g.writable = sec_writable;
+					all_globals.push_back(std::move(g));
+				}
+			}
+
+			std::sort(all_globals.begin(), all_globals.end(),
+				[](const map_global_t& a, const map_global_t& b) {
+					if (a.xref_count != b.xref_count) return a.xref_count > b.xref_count;
+					return a.va < b.va;
+				});
+
+			const int gbudget = opts.max_globals > 0 ? opts.max_globals : 30;
+			if (static_cast<int>(all_globals.size()) > gbudget)
+				all_globals.resize(static_cast<size_t>(gbudget));
+			out.globals = std::move(all_globals);
+
+			out.generated_unix = static_cast<int64_t>(now_unix_seconds());
+			set_last_error_unlocked(std::string());
+			return true;
+		}
+
 		bool generate_locked(const map_options_t& opts, map_t& out)
 		{
 			out = map_t{};
 
 			if (!driver_bridge::is_loaded()) {
-				set_last_error_unlocked("binary_map.generate: no driver/process attached");
+				if (function_index::detail::static_pe_active()) {
+					return generate_static_locked(opts, out);
+				}
+				set_last_error_unlocked("binary_map.generate: no driver/process attached and no static PE loaded");
 				return false;
 			}
 
 			auto modules = driver_bridge::enumerate_modules();
 			if (modules.empty()) {
+				if (function_index::detail::static_pe_active()) {
+					return generate_static_locked(opts, out);
+				}
 				set_last_error_unlocked("binary_map.generate: no modules enumerated");
 				return false;
 			}
@@ -992,6 +1510,7 @@ namespace binary_map {
 	{
 		ensure_invalidation_subscription();
 
+		const auto start_us = std::chrono::steady_clock::now();
 		std::lock_guard<std::mutex> guard(state_mutex());
 
 		std::string canonical_path;
@@ -1004,6 +1523,12 @@ namespace binary_map {
 				std::filesystem::path(main_mod->path), canon_ec).string();
 			if (canon_ec || canonical_path.empty())
 				canonical_path = main_mod->path;
+		} else if (function_index::detail::static_pe_active()) {
+			std::error_code canon_ec;
+			canonical_path = std::filesystem::weakly_canonical(
+				std::filesystem::path(g_disasm.file.path), canon_ec).string();
+			if (canon_ec || canonical_path.empty())
+				canonical_path = g_disasm.file.path;
 		}
 
 		const std::string new_hash = compute_binary_hash(canonical_path);
@@ -1017,12 +1542,36 @@ namespace binary_map {
 		auto& slot = cache_slot();
 		if (slot.valid && !slot.hash.empty() && slot.hash == new_hash) {
 			out = slot.map;
+			diag::log_tagged_fmt("binary_map",
+				"generate cache_hit module='%s' funcs=%zu globals=%zu imports=%zu exports=%zu",
+				slot.map.module_name.c_str(),
+				slot.map.functions.size(),
+				slot.map.globals.size(),
+				slot.map.imports.size(),
+				slot.map.exports.size());
 			return true;
 		}
 
 		map_t fresh;
-		if (!generate_locked(opts, fresh))
+		if (!generate_locked(opts, fresh)) {
+			diag::log_tagged_fmt("binary_map",
+				"generate FAILED canonical='%s' err='%s'",
+				canonical_path.c_str(), last_error_storage().c_str());
 			return false;
+		}
+
+		const auto end_us = std::chrono::steady_clock::now();
+		const auto dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+			end_us - start_us).count();
+		diag::log_tagged_fmt("binary_map",
+			"generate ok module='%s' base=0x%llX size=%llu sections=%zu funcs=%zu globals=%zu imports=%zu exports=%zu duration_ms=%lld",
+			fresh.module_name.c_str(),
+			static_cast<unsigned long long>(fresh.image_base),
+			static_cast<unsigned long long>(fresh.image_size),
+			fresh.sections.size(), fresh.functions.size(),
+			fresh.globals.size(), fresh.imports.size(),
+			fresh.exports.size(),
+			static_cast<long long>(dur_ms));
 
 		out = fresh;
 		slot.hash = new_hash;
@@ -1046,6 +1595,10 @@ namespace binary_map {
 			save_pins_for_hash(current_binary_hash());
 			cache_slot().valid = false;
 		}
+		diag::log_tagged_fmt("binary_map",
+			"pin va=0x%llX inserted=%d total_pins=%zu",
+			static_cast<unsigned long long>(va),
+			inserted ? 1 : 0, pin_set().size());
 		return inserted;
 	}
 
@@ -1057,6 +1610,10 @@ namespace binary_map {
 			save_pins_for_hash(current_binary_hash());
 			cache_slot().valid = false;
 		}
+		diag::log_tagged_fmt("binary_map",
+			"unpin va=0x%llX erased=%d total_pins=%zu",
+			static_cast<unsigned long long>(va),
+			erased ? 1 : 0, pin_set().size());
 		return erased;
 	}
 
@@ -1083,11 +1640,10 @@ namespace binary_map {
 
 	std::string auto_inject_text(size_t max_chars)
 	{
-		if (!driver_bridge::is_loaded())
-			return std::string();
-
-		auto modules = driver_bridge::enumerate_modules();
-		if (modules.empty())
+		const bool has_live = driver_bridge::is_loaded()
+			&& !driver_bridge::enumerate_modules().empty();
+		const bool has_static = function_index::detail::static_pe_active();
+		if (!has_live && !has_static)
 			return std::string();
 
 		map_options_t opts;

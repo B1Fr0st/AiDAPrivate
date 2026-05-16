@@ -9,8 +9,11 @@
 #include "ui/blur_layer.hpp"
 #include "ui/skeleton.hpp"
 #include "ui/fonts.hpp"
+#include "ui/toast_notification.hpp"
 #include "imgui.h"
 #include "../helpers/globals.h"
+#include "../../helpers/diag_log.hpp"
+#include "standalone_driver.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -160,22 +163,55 @@ void render(float pos_x, float pos_y, float width, float height,
 			if (fz.max_iter_str[0]) cfg.max_iterations = static_cast<uint32_t>(std::strtoul(fz.max_iter_str, nullptr, 0));
 			if (cfg.input_size <= 0) cfg.input_size = 256;
 			if (cfg.max_iterations == 0) cfg.max_iterations = 10000;
-			if (cfg.target_address != 0) fuzzer_engine::start_fuzzing();
+
+			uint32_t pid = driver_bridge::attached_pid();
+			uint32_t tid = 0;
+			if (pid != 0) {
+				auto threads = driver_bridge::enumerate_threads();
+				if (!threads.empty()) tid = threads[0].tid;
+			}
+			cfg.pid = pid;
+			cfg.tid = tid;
+
+			bool ok_target = cfg.target_address != 0;
+			bool ok_attached = pid != 0;
+			if (!ok_target) {
+				diag::log_tagged_fmt("fuzzer",
+					"start_reject reason=no_target_address buf='%s'", fz.addr_input);
+				toast_notification::push("Enter a target address (hex)",
+					toast_notification::toast_type_t::warning, 3.0f);
+			} else if (!ok_attached) {
+				diag::log_tagged("fuzzer", "start_reject reason=no_process_attached");
+				toast_notification::push("Attach to a process before starting fuzzer",
+					toast_notification::toast_type_t::warning, 3.0f);
+			} else {
+				diag::log_tagged_fmt("fuzzer",
+					"fuzz_start pid=%u tid=%u target=0x%llX end=0x%llX input=0x%llX input_size=%d iters=%u",
+					pid, tid,
+					static_cast<unsigned long long>(cfg.target_address),
+					static_cast<unsigned long long>(cfg.end_address),
+					static_cast<unsigned long long>(cfg.input_address),
+					cfg.input_size, cfg.max_iterations);
+				fuzzer_engine::start_fuzzing();
+			}
 		}
 	} else {
 		if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive,
 			aida::ui::size_t_::sm, ImVec2(86.f, 28.f))) {
+			diag::log_tagged("fuzzer", "fuzz_stop_requested");
 			fuzzer_engine::stop_fuzzing();
 		}
 	}
 	ImGui::SameLine();
 	if (aida::ui::button("Export", aida::ui::button_kind_t::ghost,
 		aida::ui::size_t_::sm, ImVec2(78.f, 28.f))) {
+		diag::log_tagged("fuzzer", "export_requested");
 		fuzzer_engine::export_crashes();
 	}
 	ImGui::SameLine();
 	if (aida::ui::button("Import", aida::ui::button_kind_t::ghost,
 		aida::ui::size_t_::sm, ImVec2(78.f, 28.f))) {
+		diag::log_tagged("fuzzer", "import_requested");
 		fuzzer_engine::import_crashes();
 	}
 

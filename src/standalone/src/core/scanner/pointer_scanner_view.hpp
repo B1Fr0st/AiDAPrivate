@@ -12,6 +12,7 @@
 #include "hex_view.hpp"
 #include "ui_anim.hpp"
 #include "../helpers/globals.h"
+#include "../helpers/diag_log.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
 #include "../ui/clock.hpp"
@@ -560,10 +561,19 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		aida::ui::with_alpha(t.border_subtle, a), 1.f);
 	cy += 14.f;
 
+	bool validating = st.validating.load();
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
-	if (aida::ui::button("Validate All", aida::ui::button_kind_t::secondary,
-			aida::ui::size_t_::md, ImVec2(field_w, 0.f))) {
-		pointer_scanner::validate_all_results();
+	if (validating) {
+		float prog = st.validate_progress.load();
+		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+			ImVec2(cx, cy - 16.f), aida::ui::with_alpha(t.text_dim, a), "Validating chains...");
+		aida::ui::render_progress_bar(ImVec2(cx, cy + 4.f), field_w, 6.f, prog, false, true);
+	} else {
+		if (aida::ui::button("Validate All", aida::ui::button_kind_t::secondary,
+				aida::ui::size_t_::md, ImVec2(field_w, 0.f),
+				scanning || building || validating)) {
+			pointer_scanner::validate_all_results();
+		}
 	}
 	cy += 44.f;
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));

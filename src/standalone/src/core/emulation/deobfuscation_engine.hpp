@@ -414,6 +414,9 @@ inline deobfuscated_result_t deobfuscate_function(uint64_t entry_addr, uint32_t 
 
 	if (!device || !device->is_connected() || device->get_process_id() == 0) {
 		result.error = "Driver not connected or no process attached";
+		diag::log_tagged_fmt("deobf",
+			"engine_reject reason=no_attach entry=0x%llX",
+			static_cast<unsigned long long>(entry_addr));
 		return result;
 	}
 
@@ -423,8 +426,15 @@ inline deobfuscated_result_t deobfuscate_function(uint64_t entry_addr, uint32_t 
 	auto blocks = detail::recover_cfg_blocks(entry_addr);
 	if (blocks.empty()) {
 		result.error = "Failed to recover CFG blocks";
+		diag::log_tagged_fmt("deobf",
+			"engine_reject reason=cfg_recovery_failed entry=0x%llX",
+			static_cast<unsigned long long>(entry_addr));
 		return result;
 	}
+
+	diag::log_tagged_fmt("deobf",
+		"engine_cfg_recovered entry=0x%llX blocks=%zu",
+		static_cast<unsigned long long>(entry_addr), blocks.size());
 
 	g_state.progress_current.store(1);
 

@@ -157,6 +157,15 @@ struct instr_cache_entry_t {
     float                                          cmt_trimmed_for_width = -1.f;
     bool                                           cmt_truncated = false;
     float                                          cmt_drawn_width = 0.f;
+    bool                                           composed_valid = false;
+    std::string                                    composed_cmt_str;
+    std::string                                    composed_tooltip_str;
+    bool                                           composed_multiline = false;
+    uint64_t                                       composed_branch_target = 0;
+    uint64_t                                       composed_imm = 0;
+    bool                                           composed_has_imm = false;
+    bool                                           composed_has_mnem_override = false;
+    std::string                                    composed_mnem_override_token;
 };
 
 static std::unordered_map<uint64_t, instr_cache_entry_t> s_instr_cache_hot;
@@ -173,10 +182,22 @@ static inline void instr_cache_clear_all() {
 
 static inline void instr_cache_bound_size() {
     constexpr size_t kCap = 65536;
+    constexpr size_t kColdCap = kCap / 2;
     if (s_instr_cache_hot.size() > kCap) {
+        if (!s_instr_cache_cold.empty()) {
+            s_instr_cache_cold.clear();
+        }
         s_instr_cache_cold = std::move(s_instr_cache_hot);
         s_instr_cache_hot.clear();
         s_instr_cache_hot.reserve(kCap / 2);
+    }
+    if (s_instr_cache_cold.size() > kColdCap) {
+        size_t to_drop = s_instr_cache_cold.size() - kColdCap;
+        auto it = s_instr_cache_cold.begin();
+        while (to_drop > 0 && it != s_instr_cache_cold.end()) {
+            it = s_instr_cache_cold.erase(it);
+            --to_drop;
+        }
     }
 }
 
@@ -234,6 +255,15 @@ static inline instr_cache_entry_t& instr_cache_slot(uint64_t addr, uint32_t gen,
         e.cmt_trimmed_for_width = -1.f;
         e.cmt_truncated = false;
         e.cmt_drawn_width = 0.f;
+        e.composed_valid = false;
+        e.composed_cmt_str.clear();
+        e.composed_tooltip_str.clear();
+        e.composed_multiline = false;
+        e.composed_branch_target = 0;
+        e.composed_imm = 0;
+        e.composed_has_imm = false;
+        e.composed_has_mnem_override = false;
+        e.composed_mnem_override_token.clear();
     }
     return e;
 }
@@ -637,7 +667,7 @@ static std::string ida_xref_kind_label(const xref_index::annotation_t& a) {
 }
 
 static const char* ida_xref_arrow_utf8(bool up) {
-    return up ? "\xe2\x86\x91" : "\xe2\x86\x93";
+    return up ? "^" : "v";
 }
 
 static const char* ida_xref_edge_letter(const xref_index::annotation_t& a) {
@@ -1638,7 +1668,7 @@ static void pad_to_visual_col(std::string& s, int target) {
 static std::string addr_prefix(const std::string& seg, uint64_t addr) {
     char buf[40];
     const char* sp = seg.empty() ? ".text" : seg.c_str();
-    std::snprintf(buf, sizeof(buf), "%s:%016llX", sp, static_cast<unsigned long long>(addr));
+    std::snprintf(buf, sizeof(buf), "%s:%08llX", sp, static_cast<unsigned long long>(addr));
     return std::string(buf);
 }
 
@@ -2894,6 +2924,18 @@ uint64_t enclosing_function_start(uint64_t addr, const DisasmFile& file) {
     return find_enclosing_function_start(addr, file);
 }
 
+static uint64_t follow_thunk_chain(uint64_t entry) {
+    uint64_t cur = entry;
+    for (int hops = 0; hops < 8; ++hops) {
+        if (cur == 0) break;
+        if (!function_index::is_thunk(cur)) break;
+        uint64_t next = function_index::thunk_target(cur);
+        if (next == 0 || next == cur) break;
+        cur = next;
+    }
+    return cur;
+}
+
 static thread_local bool s_nav_history_suppress_push = false;
 
 void goto_address(uint64_t addr, DisasmState& disasm) {
@@ -3350,6 +3392,44 @@ static void launch_xref_scan(uint64_t addr, uint64_t func_start = 0)
 static float s_close_btn_anim = 0.f;
 static float s_copy_addr_anim = 0.f;
 static float s_copy_all_anim = 0.f;
+static int   s_xref_hover_row = -1;
+static float s_xref_hover_anim = 0.f;
+
+static const char* xref_strip_module_prefix(const std::string& fn) {
+    size_t pos = fn.find('!');
+    if (pos == std::string::npos) return fn.c_str();
+    return fn.c_str() + pos + 1;
+}
+
+static std::string xref_truncate_to_width(const std::string& s, ImFont* font, float font_size, float max_w) {
+    if (s.empty() || max_w <= 0.f) return std::string();
+    ImVec2 full = font->CalcTextSizeA(font_size, FLT_MAX, 0.f, s.c_str());
+    if (full.x <= max_w) return s;
+    const char* ellipsis = "..";
+    ImVec2 ell_sz = font->CalcTextSizeA(font_size, FLT_MAX, 0.f, ellipsis);
+    float budget = max_w - ell_sz.x;
+    if (budget <= 0.f) return std::string(ellipsis);
+    size_t lo = 0;
+    size_t hi = s.size();
+    while (lo < hi) {
+        size_t mid = (lo + hi + 1) / 2;
+        ImVec2 sz = font->CalcTextSizeA(font_size, FLT_MAX, 0.f, s.c_str(), s.c_str() + mid);
+        if (sz.x <= budget) lo = mid;
+        else hi = mid - 1;
+    }
+    std::string out;
+    out.reserve(lo + 2);
+    out.append(s, 0, lo);
+    out.append(ellipsis);
+    return out;
+}
+
+static void xref_address_split(uint64_t addr, char* hex_buf, size_t hex_cap, int& first_nonzero) {
+    snprintf(hex_buf, hex_cap, "%016llX", static_cast<unsigned long long>(addr));
+    first_nonzero = 0;
+    while (first_nonzero < 15 && hex_buf[first_nonzero] == '0')
+        ++first_nonzero;
+}
 
 static void render_xref_popup(float pos_x, float pos_y, float width, float height,
                                float alpha, float accent_r, float accent_g, float accent_b,
@@ -3390,10 +3470,9 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
     float vp_ph = vp->Size.y;
 
     {
-        const auto& th_pop = aida::ui::resolved();
-        ImU32 dim_col = th_pop.is_dark
+        ImU32 dim_col = tk.is_dark
             ? IM_COL32(0, 0, 0, static_cast<int>(238 * fa))
-            : aida::ui::with_alpha(th_pop.text_primary, 0.63f * fa);
+            : aida::ui::with_alpha(tk.text_primary, 0.63f * fa);
         fdl->AddRectFilled(ImVec2(vp_px, vp_py), ImVec2(vp_px + vp_pw, vp_py + vp_ph),
             dim_col);
     }
@@ -3407,8 +3486,8 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
         popup_w = 520.f;
         popup_h = 220.f;
     } else {
-        popup_w = std::min(780.f, vp_pw * 0.86f);
-        popup_h = std::min(620.f, vp_ph * 0.82f);
+        popup_w = std::min(820.f, vp_pw * 0.86f);
+        popup_h = std::min(640.f, vp_ph * 0.84f);
     }
 
     float max_w = vp_pw - 24.f;
@@ -3446,8 +3525,7 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
 
     float body_fa = fa < 1.f ? std::sqrt(fa) : 1.f;
     {
-        const auto& th_pop_body = aida::ui::resolved();
-        ImU32 body_col = aida::ui::with_alpha(th_pop_body.panel_bg, body_fa);
+        ImU32 body_col = aida::ui::with_alpha(tk.panel_bg, body_fa);
         fdl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
             body_col, 8.f);
     }
@@ -3473,14 +3551,14 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
         st.xref_popup_open = false;
 
     float toolbar_y = py + header_h;
-    float toolbar_h = 30.f;
+    float toolbar_h = 32.f;
     fdl->AddRectFilled(ImVec2(px, toolbar_y), ImVec2(px + pw, toolbar_y + toolbar_h),
         _ta(tk.panel_header));
     fdl->AddLine(ImVec2(px, toolbar_y + toolbar_h - 1.f), ImVec2(px + pw, toolbar_y + toolbar_h - 1.f),
         _ta(tk.border_subtle));
 
     float btn_x = px + 10.f;
-    float btn_y = toolbar_y + 4.f;
+    float btn_y = toolbar_y + 5.f;
 
     if (!has_results) {
         float bw_addr = ui_anim::toolbar_button_width("Copy Address");
@@ -3513,9 +3591,15 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
                                         false, !has_results)) {
         std::string all_text;
         for (auto& e : results_copy) {
-            char line_buf[256];
-            snprintf(line_buf, sizeof(line_buf), "%016llX  %s\n",
-                     static_cast<unsigned long long>(e.addr), e.disasm_text.c_str());
+            const char* fn = e.function_name.empty() ? "" : xref_strip_module_prefix(e.function_name);
+            char line_buf[320];
+            if (fn && *fn) {
+                snprintf(line_buf, sizeof(line_buf), "%016llX  %-40s  %s\n",
+                         static_cast<unsigned long long>(e.addr), fn, e.disasm_text.c_str());
+            } else {
+                snprintf(line_buf, sizeof(line_buf), "%016llX  %s\n",
+                         static_cast<unsigned long long>(e.addr), e.disasm_text.c_str());
+            }
             all_text += line_buf;
         }
         if (!all_text.empty())
@@ -3548,55 +3632,44 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
     }
 
     float toolbar_end = toolbar_y + toolbar_h;
-    const float footer_h = 26.f;
-    float table_y = toolbar_end + 2.f;
-    float table_h = ph - header_h - toolbar_h - 4.f - footer_h;
-    const float row_h = 24.f;
-    float list_y = table_y + row_h;
-    float list_h = table_h - row_h;
+    const float footer_h = 30.f;
+    const float card_h = 56.f;
+    const float card_gap = 6.f;
+    const float row_pitch = card_h + card_gap;
+    const float list_pad_top = 8.f;
+    const float list_pad_x = 10.f;
+    float list_y = toolbar_end + list_pad_top;
+    float list_h = ph - header_h - toolbar_h - list_pad_top - footer_h - 4.f;
     if (list_h < 1.f) list_h = 1.f;
 
     if (has_results) {
-        float col_type_w = 54.f;
-        float col_addr_w = 145.f;
-        float col_func_w = 200.f;
-        float col_disasm_w = pw - col_type_w - col_addr_w - col_func_w - 30.f;
-        if (col_disasm_w < 100.f) col_disasm_w = 100.f;
-
-        ui_anim::table_col_t xref_cols[] = {
-            { "Type", col_type_w }, { "Address", col_addr_w },
-            { "Function", col_func_w }, { "Disassembly", col_disasm_w }
-        };
-        ui_anim::render_table_header(fdl, px, table_y, pw, row_h, xref_cols, 4,
-                                      accent_r, accent_g, accent_b, fa);
-
-        float content_h = static_cast<float>(results_copy.size()) * row_h;
+        float content_h = static_cast<float>(results_copy.size()) * row_pitch;
         int n_results = static_cast<int>(results_copy.size());
 
         bool list_hovered = ImGui::IsMouseHoveringRect(ImVec2(px, list_y), ImVec2(px + pw, list_y + list_h));
         if (list_hovered) {
             float wheel = ImGui::GetIO().MouseWheel;
             if (wheel != 0.f)
-                st.xref_popup_target_scroll -= wheel * row_h * 3.f;
+                st.xref_popup_target_scroll -= wheel * row_pitch * 1.2f;
         }
 
         if (st.xref_popup_open) {
             if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) {
                 st.xref_popup_selected = std::min(st.xref_popup_selected + 1, n_results - 1);
                 if (st.xref_popup_selected < 0) st.xref_popup_selected = 0;
-                float sel_y = static_cast<float>(st.xref_popup_selected) * row_h;
+                float sel_y = static_cast<float>(st.xref_popup_selected) * row_pitch;
                 if (sel_y < st.xref_popup_target_scroll)
                     st.xref_popup_target_scroll = sel_y;
-                if (sel_y + row_h > st.xref_popup_target_scroll + list_h)
-                    st.xref_popup_target_scroll = sel_y + row_h - list_h;
+                if (sel_y + row_pitch > st.xref_popup_target_scroll + list_h)
+                    st.xref_popup_target_scroll = sel_y + row_pitch - list_h;
             }
             if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true)) {
                 st.xref_popup_selected = std::max(st.xref_popup_selected - 1, 0);
-                float sel_y = static_cast<float>(st.xref_popup_selected) * row_h;
+                float sel_y = static_cast<float>(st.xref_popup_selected) * row_pitch;
                 if (sel_y < st.xref_popup_target_scroll)
                     st.xref_popup_target_scroll = sel_y;
-                if (sel_y + row_h > st.xref_popup_target_scroll + list_h)
-                    st.xref_popup_target_scroll = sel_y + row_h - list_h;
+                if (sel_y + row_pitch > st.xref_popup_target_scroll + list_h)
+                    st.xref_popup_target_scroll = sel_y + row_pitch - list_h;
             }
             if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) && st.xref_popup_selected >= 0 &&
                 st.xref_popup_selected < n_results) {
@@ -3609,24 +3682,43 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
         st.xref_popup_target_scroll = std::max(0.f, std::min(st.xref_popup_target_scroll, max_scroll));
         ui_anim::smooth_scroll(st.xref_popup_scroll, st.xref_popup_target_scroll, 16.f, dt);
 
-        fdl->PushClipRect(ImVec2(px + 1.f, list_y), ImVec2(px + pw - 12.f, list_y + list_h), true);
+        fdl->PushClipRect(ImVec2(px + 2.f, list_y), ImVec2(px + pw - 14.f, list_y + list_h), true);
 
-        int first_vis = static_cast<int>(st.xref_popup_scroll / row_h);
-        int last_vis = first_vis + static_cast<int>(list_h / row_h) + 2;
+        int first_vis = static_cast<int>(st.xref_popup_scroll / row_pitch);
+        int last_vis = first_vis + static_cast<int>(list_h / row_pitch) + 2;
         if (first_vis < 0) first_vis = 0;
         if (last_vis > n_results) last_vis = n_results;
 
+        ImFont* code_font = aida::ui::fonts::code();
+        if (!code_font) code_font = ImGui::GetFont();
+        ImFont* body_font = aida::ui::fonts::body();
+        if (!body_font) body_font = ImGui::GetFont();
+        ImFont* body_strong_font = aida::ui::fonts::body_strong();
+        if (!body_strong_font) body_strong_font = body_font;
+        ImFont* caption_font = aida::ui::fonts::caption();
+        if (!caption_font) caption_font = body_font;
+
+        const float addr_font_size = 14.f;
+        const float fn_font_size = 14.f;
+        const float code_font_size = 13.f;
+        const float badge_font_size = 12.5f;
+        const float module_font_size = 13.5f;
+
+        int hovered_now = -1;
+
         for (int i = first_vis; i < last_vis; ++i) {
-            float ry = list_y + static_cast<float>(i) * row_h - st.xref_popup_scroll;
-            if (ry + row_h < list_y || ry > list_y + list_h) continue;
+            float ry = list_y + static_cast<float>(i) * row_pitch - st.xref_popup_scroll;
+            if (ry + card_h < list_y || ry > list_y + list_h) continue;
 
             auto& e = results_copy[static_cast<size_t>(i)];
 
-            ImVec2 rmin(px + 4.f, ry);
-            ImVec2 rmax(px + pw - 14.f, ry + row_h);
+            ImVec2 rmin(px + list_pad_x, ry);
+            ImVec2 rmax(px + pw - 14.f - 4.f, ry + card_h);
 
             bool row_hov = ImGui::IsMouseHoveringRect(rmin, rmax);
             bool row_sel = (st.xref_popup_selected == i);
+
+            if (row_hov) hovered_now = i;
 
             if (row_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
                 st.xref_popup_selected = i;
@@ -3645,69 +3737,229 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
                 row_entrance = t;
             }
             float row_alpha = fa * row_entrance;
+            float entrance_dy = (1.f - row_entrance) * 6.f;
+            rmin.y += entrance_dy;
+            rmax.y += entrance_dy;
 
-            if (row_sel) {
-                fdl->AddRectFilled(rmin, rmax,
-                    aida::ui::with_alpha(tk.selection, row_alpha));
-                fdl->AddRectFilled(ImVec2(rmin.x, rmin.y), ImVec2(rmin.x + 3.f, rmax.y),
-                    aida::ui::with_alpha(tk.accent_u32, row_alpha));
-                fdl->AddLine(ImVec2(rmin.x, rmax.y - 1.f), ImVec2(rmax.x, rmax.y - 1.f),
-                    aida::ui::with_alpha(tk.accent_dim, row_alpha), 1.5f);
-            } else if (row_hov) {
-                fdl->AddRectFilled(rmin, rmax, aida::ui::with_alpha(tk.hover_wash, row_alpha));
-            } else if (i & 1) {
-                fdl->AddRectFilled(rmin, rmax,
-                    aida::ui::with_alpha(IM_COL32(255, 255, 255, 6), row_alpha));
-            }
-
-            float rx = px + 10.f;
-
-            ImU32 type_col;
+            ImU32 type_col_full;
+            ImU32 type_col_soft;
             const char* type_str;
             switch (e.type) {
-            case 0:  type_str = "CALL"; type_col = aida::ui::with_alpha(tk.info,    row_alpha); break;
-            case 1:  type_str = "JMP";  type_col = aida::ui::with_alpha(tk.warning, row_alpha); break;
-            case 2:  type_str = "Jcc";  type_col = aida::ui::with_alpha(tk.warning, row_alpha * 0.85f); break;
-            case 3:  type_str = "LEA";  type_col = aida::ui::with_alpha(tk.success, row_alpha); break;
-            default: type_str = "DATA"; type_col = aida::ui::with_alpha(tk.text_secondary, row_alpha); break;
+            case 0:  type_str = "CALL"; type_col_full = tk.info;          type_col_soft = tk.info_soft;    break;
+            case 1:  type_str = "JMP";  type_col_full = tk.warning;       type_col_soft = tk.warning_soft; break;
+            case 2:  type_str = "Jcc";  type_col_full = tk.warning;       type_col_soft = tk.warning_soft; break;
+            case 3:  type_str = "LEA";  type_col_full = tk.success;       type_col_soft = tk.success_soft; break;
+            default: type_str = "DATA"; type_col_full = tk.text_secondary;type_col_soft = tk.hover_wash;   break;
             }
 
-            ImVec2 tsz = ImGui::CalcTextSize(type_str);
-            float badge_w = tsz.x + 10.f;
-            fdl->AddRectFilled(ImVec2(rx, ry + 3.f), ImVec2(rx + badge_w, ry + row_h - 3.f),
-                aida::ui::with_alpha(type_col, 0.18f), 3.f);
-            fdl->AddText(ImVec2(rx + 5.f, ry + 4.f), type_col, type_str);
-            rx += col_type_w;
+            ImU32 card_bg = row_sel
+                ? aida::ui::with_alpha(tk.selection,  row_alpha * 0.55f)
+                : (row_hov ? aida::ui::with_alpha(tk.hover_wash, row_alpha * 2.0f)
+                           : (tk.is_dark
+                                ? aida::ui::with_alpha(IM_COL32(255, 255, 255, 8), row_alpha)
+                                : aida::ui::with_alpha(IM_COL32(0, 0, 0, 6), row_alpha)));
+            fdl->AddRectFilled(rmin, rmax, card_bg, 7.f);
 
+            ImU32 card_border = row_sel
+                ? aida::ui::with_alpha(tk.accent_u32, row_alpha * 0.70f)
+                : (row_hov ? aida::ui::with_alpha(tk.accent_dim, row_alpha * 0.50f)
+                           : aida::ui::with_alpha(tk.border_subtle, row_alpha));
+            fdl->AddRect(rmin, rmax, card_border, 7.f, 0, row_sel ? 1.4f : 1.f);
+
+            if (row_sel) {
+                fdl->AddRectFilled(
+                    ImVec2(rmin.x - 1.f, rmin.y + 4.f),
+                    ImVec2(rmin.x + 3.f, rmax.y - 4.f),
+                    aida::ui::with_alpha(tk.accent_u32, row_alpha), 2.f);
+            }
+
+            float inner_x = rmin.x + 12.f;
+            float inner_top = rmin.y + 6.f;
+            float inner_bottom = rmax.y - 6.f;
+            float top_y = inner_top + 1.f;
+            float bot_y = inner_top + 26.f;
+
+            ImVec2 tsz = body_strong_font->CalcTextSizeA(badge_font_size, FLT_MAX, 0.f, type_str);
+            float badge_w = tsz.x + 16.f;
+            float badge_h = 20.f;
+            float badge_y = top_y;
+            fdl->AddRectFilled(ImVec2(inner_x, badge_y),
+                ImVec2(inner_x + badge_w, badge_y + badge_h),
+                aida::ui::with_alpha(type_col_soft, row_alpha * 4.5f), 4.f);
+            fdl->AddRect(ImVec2(inner_x, badge_y),
+                ImVec2(inner_x + badge_w, badge_y + badge_h),
+                aida::ui::with_alpha(type_col_full, row_alpha * 0.45f), 4.f, 0, 1.f);
+            fdl->AddText(body_strong_font, badge_font_size,
+                ImVec2(inner_x + 8.f, badge_y + (badge_h - tsz.y) * 0.5f),
+                aida::ui::with_alpha(type_col_full, row_alpha), type_str);
+
+            float addr_x = inner_x + badge_w + 10.f;
             char addr_buf[20];
-            snprintf(addr_buf, sizeof(addr_buf), "%016llX", static_cast<unsigned long long>(e.addr));
-            fdl->AddText(ImVec2(rx, ry + 4.f),
-                aida::ui::with_alpha(tk.text_address, row_alpha), addr_buf);
-            rx += col_addr_w;
-
-            const std::string& fn_text = !e.function_name.empty() ? e.function_name : e.module_name;
-            if (!fn_text.empty()) {
-                size_t max_fn = 28;
-                std::string fn_short = fn_text.size() > max_fn
-                    ? fn_text.substr(0, max_fn - 2) + ".." : fn_text;
-                ImU32 fn_col = !e.function_name.empty()
-                    ? aida::ui::with_alpha(tk.text_primary, row_alpha)
-                    : aida::ui::with_alpha(tk.text_secondary, row_alpha);
-                fdl->AddText(ImVec2(rx, ry + 4.f), fn_col, fn_short.c_str());
-            } else {
-                fdl->AddText(ImVec2(rx, ry + 4.f),
-                    aida::ui::with_alpha(tk.text_dim, row_alpha), "-");
+            int first_nz = 0;
+            xref_address_split(e.addr, addr_buf, sizeof(addr_buf), first_nz);
+            ImU32 addr_dim_col = aida::ui::with_alpha(tk.text_dim, row_alpha * 0.75f);
+            ImU32 addr_strong_col = aida::ui::with_alpha(tk.text_address, row_alpha);
+            char dim_part[20] = {};
+            for (int k = 0; k < first_nz; ++k) dim_part[k] = addr_buf[k];
+            dim_part[first_nz] = 0;
+            ImVec2 addr_text_sz_probe = code_font->CalcTextSizeA(addr_font_size, FLT_MAX, 0.f, "0");
+            float addr_y = top_y + (badge_h - addr_text_sz_probe.y) * 0.5f;
+            if (first_nz > 0) {
+                fdl->AddText(code_font, addr_font_size,
+                    ImVec2(addr_x, addr_y),
+                    addr_dim_col, dim_part);
+                ImVec2 dim_sz = code_font->CalcTextSizeA(addr_font_size, FLT_MAX, 0.f, dim_part);
+                addr_x += dim_sz.x;
             }
-            rx += col_func_w;
+            fdl->AddText(code_font, addr_font_size,
+                ImVec2(addr_x, addr_y),
+                addr_strong_col, addr_buf + first_nz);
+            ImVec2 strong_sz = code_font->CalcTextSizeA(addr_font_size, FLT_MAX, 0.f, addr_buf + first_nz);
+            float addr_end_x = addr_x + strong_sz.x;
 
-            const char* disasm_end = e.disasm_text.c_str() + std::min(e.disasm_text.size(), static_cast<size_t>(60));
-            fdl->AddText(ImVec2(rx, ry + 4.f),
-                aida::ui::with_alpha(tk.text_primary, row_alpha),
-                e.disasm_text.c_str(), disasm_end);
+            float sep_x = addr_end_x + 10.f;
+            fdl->AddLine(ImVec2(sep_x, top_y + 3.f),
+                ImVec2(sep_x, top_y + badge_h - 3.f),
+                aida::ui::with_alpha(tk.border_subtle, row_alpha * 1.5f), 1.f);
 
+            float fn_x = sep_x + 10.f;
+            float right_zone_x = rmax.x - 12.f;
+            float module_pill_w = 0.f;
+            ImVec2 module_sz(0.f, 0.f);
+            bool has_module = !e.module_name.empty();
+            if (has_module) {
+                module_sz = caption_font->CalcTextSizeA(module_font_size, FLT_MAX, 0.f, e.module_name.c_str());
+                module_pill_w = module_sz.x + 16.f;
+                float mp_h = 20.f;
+                float mp_x = right_zone_x - module_pill_w;
+                float mp_y = top_y + (badge_h - mp_h) * 0.5f;
+                fdl->AddRectFilled(ImVec2(mp_x, mp_y),
+                    ImVec2(mp_x + module_pill_w, mp_y + mp_h),
+                    aida::ui::with_alpha(tk.panel_header, row_alpha * 0.80f), mp_h * 0.5f);
+                fdl->AddRect(ImVec2(mp_x, mp_y),
+                    ImVec2(mp_x + module_pill_w, mp_y + mp_h),
+                    aida::ui::with_alpha(tk.border_subtle, row_alpha * 1.8f), mp_h * 0.5f, 0, 1.f);
+                fdl->AddText(caption_font, module_font_size,
+                    ImVec2(mp_x + 8.f, mp_y + (mp_h - module_sz.y) * 0.5f),
+                    aida::ui::with_alpha(tk.text_secondary, row_alpha * 1.0f),
+                    e.module_name.c_str());
+            }
+
+            float fn_avail = (right_zone_x - (has_module ? module_pill_w + 10.f : 0.f)) - fn_x;
+            if (fn_avail < 12.f) fn_avail = 12.f;
+            ImVec2 fn_text_sz_probe = body_strong_font->CalcTextSizeA(fn_font_size, FLT_MAX, 0.f, "Mg");
+            float fn_y = top_y + (badge_h - fn_text_sz_probe.y) * 0.5f;
+            if (!e.function_name.empty()) {
+                const char* fn_clean = xref_strip_module_prefix(e.function_name);
+                std::string fn_str(fn_clean);
+                std::string fn_render = xref_truncate_to_width(fn_str, body_strong_font, fn_font_size, fn_avail);
+                fdl->AddText(body_strong_font, fn_font_size,
+                    ImVec2(fn_x, fn_y),
+                    aida::ui::with_alpha(tk.text_primary, row_alpha),
+                    fn_render.c_str());
+            } else {
+                fdl->AddText(body_font, fn_font_size,
+                    ImVec2(fn_x, fn_y),
+                    aida::ui::with_alpha(tk.text_dim, row_alpha * 0.75f),
+                    "(no enclosing function)");
+            }
+
+            float disasm_x = inner_x;
+            float disasm_y = bot_y;
+            float disasm_avail = rmax.x - 12.f - disasm_x;
+            if (disasm_avail < 12.f) disasm_avail = 12.f;
+            std::string disasm_render = xref_truncate_to_width(e.disasm_text, code_font, code_font_size, disasm_avail);
+            ImU32 disasm_col = row_sel
+                ? aida::ui::with_alpha(tk.text_primary, row_alpha)
+                : aida::ui::with_alpha(tk.text_secondary, row_alpha * 1.05f);
+            fdl->AddText(code_font, code_font_size,
+                ImVec2(disasm_x, disasm_y),
+                disasm_col, disasm_render.c_str());
+
+            (void)inner_bottom;
         }
 
+        s_xref_hover_anim = ui_anim::smooth_lerp(s_xref_hover_anim, hovered_now >= 0 ? 1.f : 0.f, 16.f, dt);
+        s_xref_hover_row = hovered_now;
+
         fdl->PopClipRect();
+
+        if (hovered_now >= 0 && hovered_now < n_results) {
+            const auto& he = results_copy[static_cast<size_t>(hovered_now)];
+            const std::string& full_disasm = he.disasm_text;
+            char tip_addr[40];
+            snprintf(tip_addr, sizeof(tip_addr), "0x%016llX", static_cast<unsigned long long>(he.addr));
+            ImFont* tip_code_font = aida::ui::fonts::code();
+            if (!tip_code_font) tip_code_font = ImGui::GetFont();
+            ImFont* tip_body_font = aida::ui::fonts::body();
+            if (!tip_body_font) tip_body_font = ImGui::GetFont();
+            ImFont* tip_caption = aida::ui::fonts::caption();
+            if (!tip_caption) tip_caption = tip_body_font;
+
+            ImVec2 ms = ImGui::GetIO().MousePos;
+            float tip_pad = 12.f;
+            const float tip_addr_size = 13.f;
+            const float tip_disasm_size = 14.f;
+            const float tip_module_size = 13.5f;
+            ImVec2 addr_sz = tip_code_font->CalcTextSizeA(tip_addr_size, FLT_MAX, 0.f, tip_addr);
+            ImVec2 disasm_sz = tip_code_font->CalcTextSizeA(tip_disasm_size, FLT_MAX, 0.f, full_disasm.c_str());
+            ImVec2 mod_sz_tip(0.f, 0.f);
+            if (!he.module_name.empty())
+                mod_sz_tip = tip_caption->CalcTextSizeA(tip_module_size, FLT_MAX, 0.f, he.module_name.c_str());
+
+            float content_w = std::max(addr_sz.x, disasm_sz.x);
+            content_w = std::max(content_w, mod_sz_tip.x);
+            float min_w = 240.f;
+            float max_tip_w = std::min(vp_pw * 0.6f, 760.f);
+            float tip_w = std::max(min_w, content_w + tip_pad * 2.f);
+            if (tip_w > max_tip_w) tip_w = max_tip_w;
+
+            float line_gap = 6.f;
+            float tip_h = tip_pad * 2.f + addr_sz.y + line_gap + disasm_sz.y;
+            if (!he.module_name.empty()) tip_h += line_gap + mod_sz_tip.y;
+
+            float tip_x = ms.x + 14.f;
+            float tip_y = ms.y + 18.f;
+            if (tip_x + tip_w > vp_px + vp_pw - 6.f) tip_x = vp_px + vp_pw - 6.f - tip_w;
+            if (tip_y + tip_h > vp_py + vp_ph - 6.f) tip_y = ms.y - 12.f - tip_h;
+            if (tip_x < vp_px + 6.f) tip_x = vp_px + 6.f;
+            if (tip_y < vp_py + 6.f) tip_y = vp_py + 6.f;
+
+            float tip_alpha = fa * s_xref_hover_anim;
+            for (int g = 3; g >= 1; --g) {
+                float ex = static_cast<float>(g) * 2.f;
+                int ga = static_cast<int>(36 * tip_alpha / static_cast<float>(g));
+                fdl->AddRect(ImVec2(tip_x - ex, tip_y - ex),
+                    ImVec2(tip_x + tip_w + ex, tip_y + tip_h + ex),
+                    IM_COL32(0, 0, 0, ga), 8.f + ex, 0, 1.f);
+            }
+            fdl->AddRectFilled(ImVec2(tip_x, tip_y),
+                ImVec2(tip_x + tip_w, tip_y + tip_h),
+                aida::ui::with_alpha(tk.panel_header, tip_alpha * 0.97f), 7.f);
+            fdl->AddRect(ImVec2(tip_x, tip_y),
+                ImVec2(tip_x + tip_w, tip_y + tip_h),
+                aida::ui::with_alpha(tk.accent_dim, tip_alpha * 0.85f), 7.f, 0, 1.f);
+
+            fdl->PushClipRect(ImVec2(tip_x, tip_y),
+                ImVec2(tip_x + tip_w, tip_y + tip_h), true);
+            float ty = tip_y + tip_pad;
+            fdl->AddText(tip_code_font, tip_addr_size,
+                ImVec2(tip_x + tip_pad, ty),
+                aida::ui::with_alpha(tk.text_address, tip_alpha), tip_addr);
+            ty += addr_sz.y + line_gap;
+            fdl->AddText(tip_code_font, tip_disasm_size,
+                ImVec2(tip_x + tip_pad, ty),
+                aida::ui::with_alpha(tk.text_primary, tip_alpha),
+                full_disasm.c_str());
+            ty += disasm_sz.y + line_gap;
+            if (!he.module_name.empty()) {
+                fdl->AddText(tip_caption, tip_module_size,
+                    ImVec2(tip_x + tip_pad, ty),
+                    aida::ui::with_alpha(tk.text_secondary, tip_alpha * 0.95f),
+                    he.module_name.c_str());
+            }
+            fdl->PopClipRect();
+        }
 
         if (content_h > list_h && list_h > 0.f) {
             float sb_x = px + pw - 10.f;
@@ -3816,35 +4068,51 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
         const int part_count = static_cast<int>(sizeof(parts) / sizeof(parts[0]));
 
         const float gap_chip_label = 10.f;
-        const float gap_pair_pair = 18.f;
+        const float gap_pair_pair = 20.f;
         const float chip_pad_x = 6.f;
-        const float divider_h = 12.f;
+        const float divider_h = 14.f;
+        const float verb_font_size = 15.5f;
+
+        ImFont* footer_body = aida::ui::fonts::body();
+        if (!footer_body) footer_body = ImGui::GetFont();
+        ImFont* footer_verb = aida::ui::fonts::body_strong();
+        if (!footer_verb) footer_verb = footer_body;
 
         float total_w = 0.f;
         float chip_w_arr[4];
         float lbl_w_arr[4];
+        float chip_h_arr[4];
+        float lbl_h = 0.f;
         for (int i = 0; i < part_count; ++i) {
             ImVec2 cts = ImGui::CalcTextSize(parts[i].chip);
             chip_w_arr[i] = cts.x + chip_pad_x * 2.f;
-            ImVec2 lts = ImGui::CalcTextSize(parts[i].label);
+            chip_h_arr[i] = cts.y + 4.f;
+            ImVec2 lts = footer_verb->CalcTextSizeA(verb_font_size, FLT_MAX, 0.f, parts[i].label);
             lbl_w_arr[i] = lts.x;
+            if (lts.y > lbl_h) lbl_h = lts.y;
             total_w += chip_w_arr[i] + gap_chip_label + lbl_w_arr[i];
             if (i < part_count - 1)
                 total_w += gap_pair_pair;
         }
 
+        float row_h = std::max(lbl_h, chip_h_arr[0]);
         float fx = px + pw - 14.f - total_w;
         if (fx < px + 12.f) fx = px + 12.f;
-        float fy = py + ph - footer_h + 4.f;
+        float fy = py + ph - footer_h + (footer_h - row_h) * 0.5f - 1.f;
 
         for (int i = 0; i < part_count; ++i) {
-            ui_anim::render_kbd_chip(fdl, fx, fy, parts[i].chip, fa);
+            float chip_y = fy + (row_h - chip_h_arr[i]) * 0.5f;
+            ui_anim::render_kbd_chip(fdl, fx, chip_y, parts[i].chip, fa);
             fx += chip_w_arr[i] + gap_chip_label;
-            fdl->AddText(ImVec2(fx, fy + 2.f), _ta(tk.text_dim), parts[i].label);
+            float verb_y = fy + (row_h - lbl_h) * 0.5f;
+            fdl->AddText(footer_verb, verb_font_size,
+                ImVec2(fx, verb_y),
+                aida::ui::with_alpha(tk.text_secondary, fa),
+                parts[i].label);
             fx += lbl_w_arr[i];
             if (i < part_count - 1) {
                 float div_x = fx + gap_pair_pair * 0.5f;
-                float div_y0 = fy + (16.f - divider_h) * 0.5f + 2.f;
+                float div_y0 = fy + (row_h - divider_h) * 0.5f;
                 fdl->AddLine(ImVec2(div_x, div_y0),
                              ImVec2(div_x, div_y0 + divider_h),
                              _ta(tk.text_dim), 1.f);
@@ -3930,6 +4198,28 @@ void render(float pos_x, float pos_y, float width, float height,
     instr_cache_bound_size();
 
     const bool throttled = throttle_active();
+
+    auto sweep_row_keyed_map = [](std::unordered_map<int, aida::ui::hover_state_t>& m,
+                                  int lo, int hi) {
+        if (m.empty()) return;
+        if (m.size() < 256u && (hi - lo) > 0 && static_cast<int>(m.size()) <= (hi - lo) * 2) return;
+        auto it = m.begin();
+        while (it != m.end()) {
+            if (it->first < lo || it->first > hi) it = m.erase(it);
+            else ++it;
+        }
+    };
+
+    auto sweep_row_entrance_map = [](std::unordered_map<int, float>& m,
+                                     int lo, int hi) {
+        if (m.empty()) return;
+        if (m.size() < 256u && (hi - lo) > 0 && static_cast<int>(m.size()) <= (hi - lo) * 2) return;
+        auto it = m.begin();
+        while (it != m.end()) {
+            if (it->first < lo || it->first > hi) it = m.erase(it);
+            else ++it;
+        }
+    };
 
 
     if (disasm.live_mode && disasm.live_pending_ready.load(std::memory_order_acquire)) {
@@ -4271,7 +4561,7 @@ void render(float pos_x, float pos_y, float width, float height,
     const float bytes_chars = 35.f;
     const float mnem_chars = 6.f;
     const float operand_chars = 28.f;
-    const float comment_indent_chars = 78.f;
+    const float comment_indent_chars = static_cast<float>(ida_export::kColComment);
 
     const float x_seg_addr = ox + gutter_w + 4.f;
     const float x_bytes = x_seg_addr + seg_addr_chars * ch_w_safe + 2.f * ch_w_safe;
@@ -4325,6 +4615,26 @@ void render(float pos_x, float pos_y, float width, float height,
         }
     }
 
+    if (n > 0 && first_row <= last_row) {
+        int sweep_lo = first_row - 20;
+        int sweep_hi = last_row + 20;
+        if (sweep_lo < 0) sweep_lo = 0;
+        if (sweep_hi >= n) sweep_hi = n - 1;
+        sweep_row_keyed_map(s_row_hover, sweep_lo, sweep_hi);
+        sweep_row_entrance_map(s_row_entrance, sweep_lo, sweep_hi);
+    }
+    if (banner_lines > 0) {
+        int b_lo = std::max(0, first_vrow - 20);
+        int b_hi = std::min(banner_lines - 1, last_vrow + 20);
+        if (b_hi >= b_lo) {
+            sweep_row_keyed_map(s_banner_row_hover, b_lo, b_hi);
+        } else if (!s_banner_row_hover.empty()) {
+            s_banner_row_hover.clear();
+        }
+    } else if (!s_banner_row_hover.empty()) {
+        s_banner_row_hover.clear();
+    }
+
     const int banner_sel_lo = (st.banner_sel_anchor < 0 || st.banner_sel_extent < 0)
         ? -1 : std::min(st.banner_sel_anchor, st.banner_sel_extent);
     const int banner_sel_hi = (st.banner_sel_anchor < 0 || st.banner_sel_extent < 0)
@@ -4341,7 +4651,7 @@ void render(float pos_x, float pos_y, float width, float height,
                 : ida_export::section_for(banner_addr);
             const std::string seg_part = banner_seg.empty() ? std::string(".text") : banner_seg;
             char addr_buf[24];
-            std::snprintf(addr_buf, sizeof(addr_buf), "%016llX",
+            std::snprintf(addr_buf, sizeof(addr_buf), "%08llX",
                 static_cast<unsigned long long>(banner_addr));
             const float seg_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, seg_part.c_str()).x;
 
@@ -4406,6 +4716,12 @@ void render(float pos_x, float pos_y, float width, float height,
                     st.sel_extent = -1;
                     st.selected_row = -1;
                     st.sel_dragging = false;
+                }
+
+                if (banner_row_hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    if (banner_addr != 0) {
+                        goto_address(banner_addr, disasm);
+                    }
                 }
 
                 if (banner_row_hovered && st.banner_sel_dragging
@@ -4602,6 +4918,26 @@ void render(float pos_x, float pos_y, float width, float height,
                 float y_label = y;
                 float y_directive = y + line_h;
 
+                auto paint_align_row_bg = [&](float yy) {
+                    bool al_in_sel = (sel_lo >= 0 && i >= sel_lo && i <= sel_hi);
+                    bool al_is_cursor = (i == st.selected_row);
+                    if (al_in_sel) {
+                        fill_row_bg(yy, aida::ui::with_alpha(tk.selection, row_a_inner_a));
+                    }
+                    if (al_is_cursor) {
+                        fill_row_bg(yy, aida::ui::with_alpha(disasm_theme::cursor_line_bg(), row_a_inner_a * 0.5f));
+                        dl->AddRectFilled(ImVec2(ox, yy), ImVec2(ox + 3.f, yy + line_h - 1.f),
+                            aida::ui::with_alpha(tk.accent_u32, row_a_inner_a));
+                    }
+                    bool al_hovered = !ctx_input_locked && ImGui::IsMouseHoveringRect(
+                        ImVec2(ox, yy), ImVec2(ox + width, yy + line_h - 1.f), false);
+                    if (al_hovered) {
+                        fill_row_bg(yy, aida::ui::with_alpha(tk.hover_wash, row_a_inner_a * 0.85f));
+                    }
+                };
+                paint_align_row_bg(y_label);
+                paint_align_row_bg(y_directive);
+
                 draw_addr_prefix(y_label, arun.addr, sec_name_a,
                     row_a_inner_a * 0.95f, row_y_off_a);
                 char label_buf[40];
@@ -4642,6 +4978,48 @@ void render(float pos_x, float pos_y, float width, float height,
                 ImU32 align_col = aida::ui::with_alpha(disasm_theme::keyword(),
                     row_a_inner_a);
                 draw_text_at(x_mnem, y_directive, align_col, align_buf, row_y_off_a);
+
+                auto align_hit_test = [&](float yy) {
+                    bool inj_hovered = !ctx_input_locked && ImGui::IsMouseHoveringRect(
+                        ImVec2(ox, yy), ImVec2(ox + width, yy + line_h - 1.f), false);
+                    if (!inj_hovered) return;
+                    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                        if (ImGui::GetIO().KeyShift) {
+                            if (st.sel_anchor < 0) st.sel_anchor = i;
+                            st.sel_extent = i;
+                        } else {
+                            st.sel_anchor = i;
+                            st.sel_extent = i;
+                        }
+                        st.selected_row = i;
+                        st.sel_dragging = false;
+                        st.banner_sel_anchor = -1;
+                        st.banner_sel_extent = -1;
+                        st.banner_selected_row = -1;
+                        st.banner_sel_dragging = false;
+                    }
+                    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        goto_address(arun.addr, disasm);
+                    }
+                    if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                        st.ctx_row = i;
+                        if (i < sel_lo || i > sel_hi) {
+                            st.sel_anchor = i;
+                            st.sel_extent = i;
+                            st.selected_row = i;
+                        }
+                        st.popup_sel_anchor = st.sel_anchor;
+                        st.popup_sel_extent = st.sel_extent;
+                        st.popup_sel_row    = st.selected_row;
+                        st.banner_sel_anchor = -1;
+                        st.banner_sel_extent = -1;
+                        st.banner_selected_row = -1;
+                        st.banner_sel_dragging = false;
+                        ImGui::OpenPopup("##disasm_view_ctx");
+                    }
+                };
+                align_hit_test(y_label);
+                align_hit_test(y_directive);
 
                 align_skip_end = arun.end;
                 continue;
@@ -4849,6 +5227,68 @@ void render(float pos_x, float pos_y, float width, float height,
             draw_text_at(x_mnem, yy, text_col, r.text.c_str(), row_y_off);
         };
 
+        auto paint_injection_row_bg = [&](float yy) {
+            bool injr_in_sel = (sel_lo >= 0 && i >= sel_lo && i <= sel_hi);
+            bool injr_is_cursor = (i == st.selected_row);
+            if (injr_in_sel) {
+                fill_row_bg(yy, aida::ui::with_alpha(tk.selection, row_a_inner));
+            }
+            if (injr_is_cursor) {
+                fill_row_bg(yy, aida::ui::with_alpha(disasm_theme::cursor_line_bg(), row_a_inner * 0.5f));
+                dl->AddRectFilled(ImVec2(ox, yy), ImVec2(ox + 3.f, yy + line_h - 1.f),
+                    aida::ui::with_alpha(tk.accent_u32, row_a_inner));
+            }
+            bool injr_hovered = !ctx_input_locked && ImGui::IsMouseHoveringRect(
+                ImVec2(ox, yy), ImVec2(ox + width, yy + line_h - 1.f), false);
+            if (injr_hovered) {
+                fill_row_bg(yy, aida::ui::with_alpha(tk.hover_wash, row_a_inner * 0.85f));
+            }
+        };
+
+        auto handle_injection_row_input = [&](float yy, uint64_t row_addr) {
+            bool inj_hovered = !ctx_input_locked && ImGui::IsMouseHoveringRect(
+                ImVec2(ox, yy), ImVec2(ox + width, yy + line_h - 1.f), false);
+            if (!inj_hovered) return;
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                if (ImGui::GetIO().KeyShift) {
+                    if (st.sel_anchor < 0) st.sel_anchor = i;
+                    st.sel_extent = i;
+                    st.selected_row = i;
+                    st.sel_dragging = false;
+                } else {
+                    st.sel_anchor = i;
+                    st.sel_extent = i;
+                    st.selected_row = i;
+                    st.sel_dragging = false;
+                }
+                st.banner_sel_anchor = -1;
+                st.banner_sel_extent = -1;
+                st.banner_selected_row = -1;
+                st.banner_sel_dragging = false;
+            }
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                if (row_addr != 0) {
+                    goto_address(row_addr, disasm);
+                }
+            }
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                st.ctx_row = i;
+                if (i < sel_lo || i > sel_hi) {
+                    st.sel_anchor = i;
+                    st.sel_extent = i;
+                    st.selected_row = i;
+                }
+                st.popup_sel_anchor = st.sel_anchor;
+                st.popup_sel_extent = st.sel_extent;
+                st.popup_sel_row    = st.selected_row;
+                st.banner_sel_anchor = -1;
+                st.banner_sel_extent = -1;
+                st.banner_selected_row = -1;
+                st.banner_sel_dragging = false;
+                ImGui::OpenPopup("##disasm_view_ctx");
+            }
+        };
+
         const auto& before_rows_ref = *before_rows_ptr;
         const int before_extent_total = (s_layout.ready && i < static_cast<int>(s_layout.before_extent.size()))
             ? s_layout.before_extent[i]
@@ -4869,6 +5309,7 @@ void render(float pos_x, float pos_y, float width, float height,
             const auto& br = before_rows_ref[bi];
             bool visible = (yy + line_h >= oy_content) && (yy <= oy_content + content_height);
             if (visible) {
+                paint_injection_row_bg(yy);
                 if (br.kind == function_index::injection_t::spacer_line) {
                     draw_addr_prefix_cached(yy, &cache, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
                 } else {
@@ -4877,10 +5318,23 @@ void render(float pos_x, float pos_y, float width, float height,
                 if (br.kind == function_index::injection_t::proc_header && !xrefs_at_func.empty()) {
                     std::string xref_text = ida_format_xref_comment(xrefs_at_func[0],
                         xrefs_more && xrefs_at_func.size() == 1);
-                    draw_text_at(x_comment, yy,
+                    size_t hn_end = 0;
+                    const std::string& ht = br.text;
+                    while (hn_end < ht.size() && ht[hn_end] != ' ' && ht[hn_end] != '\t') ++hn_end;
+                    std::string hn_name = ht.substr(0, hn_end);
+                    std::string hn_tail = ht.substr(hn_end);
+                    float hn_name_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f,
+                        hn_name.c_str()).x;
+                    float hn_tail_w = hn_tail.empty()
+                        ? 0.f
+                        : code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, hn_tail.c_str()).x;
+                    float header_w = hn_name_w + hn_tail_w;
+                    float xref_x = std::max(x_comment, x_mnem + header_w + 4.f * ch_w_safe);
+                    draw_text_at(xref_x, yy,
                         aida::ui::with_alpha(disasm_theme::xref(), row_a_inner * 0.95f),
                         xref_text.c_str(), row_y_off);
                 }
+                handle_injection_row_input(yy, br.addr);
             }
             if (br.kind == function_index::injection_t::proc_header && xrefs_at_func.size() > 1) {
                 const int reserved_proc_xref = (s_layout.ready && i < static_cast<int>(s_layout.proc_xref_extra.size()))
@@ -4891,12 +5345,14 @@ void render(float pos_x, float pos_y, float width, float height,
                     const int x_slot = slot_idx++;
                     float xy = slot_y(x_slot);
                     if (xy + line_h < oy_content || xy > oy_content + content_height) continue;
+                    paint_injection_row_bg(xy);
                     draw_addr_prefix_cached(xy, &cache, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
                     bool last_more = (xi + 1 == xrefs_at_func.size()) && xrefs_more;
                     std::string xt = ida_format_xref_comment(xrefs_at_func[xi], last_more);
                     draw_text_at(x_comment, xy,
                         aida::ui::with_alpha(disasm_theme::xref(), row_a_inner * 0.9f),
                         xt.c_str(), row_y_off);
+                    handle_injection_row_input(xy, br.addr);
                 }
             }
         }
@@ -4905,11 +5361,14 @@ void render(float pos_x, float pos_y, float width, float height,
             const int prefix_slot = slot_idx++;
             float prefix_y = slot_y(prefix_slot);
             if (prefix_y + line_h >= oy_content && prefix_y <= oy_content + content_height) {
+                paint_injection_row_bg(prefix_y);
                 draw_addr_prefix_cached(prefix_y, &cache, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
+                handle_injection_row_input(prefix_y, ins.addr);
             }
             const int label_slot = slot_idx++;
             float label_y = slot_y(label_slot);
             if (label_y + line_h >= oy_content && label_y <= oy_content + content_height) {
+                paint_injection_row_bg(label_y);
                 draw_addr_prefix_cached(label_y, &cache, ins.addr, sec_name, row_a_inner * 0.7f, row_y_off);
                 std::string lbl_text = *inline_label_ptr;
                 if (lbl_text.empty() || lbl_text.back() != ':') lbl_text += ":";
@@ -4924,10 +5383,14 @@ void render(float pos_x, float pos_y, float width, float height,
                 if (!cache.xref_inline.empty()) {
                     bool head_more = cache.xref_inline_more && cache.xref_inline.size() == 1;
                     std::string xt = ida_format_xref_comment(cache.xref_inline[0], head_more);
-                    draw_text_at(x_comment, label_y,
+                    float lbl_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f,
+                        lbl_text.c_str()).x;
+                    float xref_x = std::max(x_comment, x_mnem + lbl_w + 4.f * ch_w_safe);
+                    draw_text_at(xref_x, label_y,
                         aida::ui::with_alpha(disasm_theme::xref(), row_a_inner * 0.9f),
                         xt.c_str(), row_y_off);
                 }
+                handle_injection_row_input(label_y, ins.addr);
             }
             if (cache.xref_inline_valid && cache.xref_inline.size() > 1) {
                 const int reserved_inline_xref = (s_layout.ready && i < static_cast<int>(s_layout.inline_xref_extra.size()))
@@ -4938,12 +5401,14 @@ void render(float pos_x, float pos_y, float width, float height,
                     const int x_slot = slot_idx++;
                     float xy = slot_y(x_slot);
                     if (xy + line_h < oy_content || xy > oy_content + content_height) continue;
+                    paint_injection_row_bg(xy);
                     draw_addr_prefix_cached(xy, &cache, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
                     bool last_more = (xi + 1 == cache.xref_inline.size()) && cache.xref_inline_more;
                     std::string xt = ida_format_xref_comment(cache.xref_inline[xi], last_more);
                     draw_text_at(x_comment, xy,
                         aida::ui::with_alpha(disasm_theme::xref(), row_a_inner * 0.9f),
                         xt.c_str(), row_y_off);
+                    handle_injection_row_input(xy, ins.addr);
                 }
             }
         }
@@ -4960,7 +5425,7 @@ void render(float pos_x, float pos_y, float width, float height,
                     boff += std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff,
                         b ? " %02X" : "%02X", ins.raw[b]);
                 if (ins.len > max_pairs && boff + 4 < static_cast<int>(sizeof(bytes_buf)))
-                    std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff, "\xe2\x80\xa6");
+                    std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff, "..");
                 cache.bytes_str.assign(bytes_buf);
                 cache.bytes_valid = true;
             }
@@ -5139,79 +5604,100 @@ void render(float pos_x, float pos_y, float width, float height,
         std::string composed_tooltip;
         bool composed_multiline = false;
         if (!throttled) {
-            std::string typelib_auto_cmt = auto_comment_store::get(ins.addr);
-            std::string user_cmt = comment_store::has(ins.addr)
-                ? comment_store::get(ins.addr) : std::string();
-            std::string auto_cmt = function_index::inline_comment_at(ins.addr);
+            bool compose_inputs_match = cache.composed_valid
+                && cache.composed_branch_target == ins.branch_target
+                && cache.composed_has_imm == ins.has_imm
+                && cache.composed_imm == ins.imm_unsigned
+                && cache.composed_has_mnem_override == has_mnem_override
+                && cache.composed_mnem_override_token == mnem_override_token;
+            if (compose_inputs_match) {
+                composed_cmt = cache.composed_cmt_str;
+                composed_tooltip = cache.composed_tooltip_str;
+                composed_multiline = cache.composed_multiline;
+            } else {
+                std::string typelib_auto_cmt = auto_comment_store::get(ins.addr);
+                std::string user_cmt = comment_store::has(ins.addr)
+                    ? comment_store::get(ins.addr) : std::string();
+                std::string auto_cmt = function_index::inline_comment_at(ins.addr);
 
-            std::string merged_user_cmt;
-            if (!user_cmt.empty() && !typelib_auto_cmt.empty()) {
-                merged_user_cmt = user_cmt + "; " + typelib_auto_cmt;
-            } else if (!user_cmt.empty()) {
-                merged_user_cmt = user_cmt;
-            } else if (!typelib_auto_cmt.empty()) {
-                merged_user_cmt = typelib_auto_cmt;
-            }
+                std::string merged_user_cmt;
+                if (!user_cmt.empty() && !typelib_auto_cmt.empty()) {
+                    merged_user_cmt = user_cmt + "; " + typelib_auto_cmt;
+                } else if (!user_cmt.empty()) {
+                    merged_user_cmt = user_cmt;
+                } else if (!typelib_auto_cmt.empty()) {
+                    merged_user_cmt = typelib_auto_cmt;
+                }
 
-            std::string thunk_annotation;
-            std::string demangle_annotation;
-            if ((ins.is_branch || ins.is_call) && ins.branch_target != 0) {
-                if (function_index::is_thunk(ins.branch_target)) {
-                    std::string tgt_name = function_index::synthetic_name(ins.branch_target);
-                    if (!tgt_name.empty()) {
-                        if (tgt_name.size() >= 2 && tgt_name[0] == 'j' && tgt_name[1] == '_') {
-                            thunk_annotation = "tail-call to " + tgt_name.substr(2);
-                        } else {
-                            thunk_annotation = "tail-call to " + tgt_name;
+                std::string thunk_annotation;
+                std::string demangle_annotation;
+                if ((ins.is_branch || ins.is_call) && ins.branch_target != 0) {
+                    if (function_index::is_thunk(ins.branch_target)) {
+                        std::string tgt_name = function_index::synthetic_name(ins.branch_target);
+                        if (!tgt_name.empty()) {
+                            if (tgt_name.size() >= 2 && tgt_name[0] == 'j' && tgt_name[1] == '_') {
+                                thunk_annotation = "tail-call to " + tgt_name.substr(2);
+                            } else {
+                                thunk_annotation = "tail-call to " + tgt_name;
+                            }
                         }
                     }
+                    std::string resolved = ida_export::resolve_branch_symbol(ins.branch_target);
+                    std::string demangled = demangle_tail_comment(resolved);
+                    if (demangled.empty()) {
+                        std::string exact = symbol_store::resolve_symbol_exact(ins.branch_target);
+                        exact = strip_module_prefix_fast(exact);
+                        if (!exact.empty() && exact != resolved) {
+                            demangled = demangle_tail_comment(exact);
+                        }
+                    }
+                    if (!demangled.empty()) demangle_annotation = demangled;
                 }
-                std::string resolved = ida_export::resolve_branch_symbol(ins.branch_target);
-                std::string demangled = demangle_tail_comment(resolved);
-                if (demangled.empty()) {
-                    std::string exact = symbol_store::resolve_symbol_exact(ins.branch_target);
-                    exact = strip_module_prefix_fast(exact);
-                    if (!exact.empty() && exact != resolved) {
-                        demangled = demangle_tail_comment(exact);
+
+                std::string parts;
+                std::string full_for_tooltip;
+                if (!merged_user_cmt.empty()) {
+                    size_t nl = merged_user_cmt.find('\n');
+                    std::string first_line = (nl == std::string::npos) ? merged_user_cmt : merged_user_cmt.substr(0, nl);
+                    parts = first_line;
+                    if (nl != std::string::npos) composed_multiline = true;
+                    full_for_tooltip = merged_user_cmt;
+                }
+                auto append_part = [&](const std::string& s) {
+                    if (s.empty()) return;
+                    if (!parts.empty()) parts += " | ";
+                    parts += s;
+                    if (!full_for_tooltip.empty()) full_for_tooltip += "\n";
+                    full_for_tooltip += s;
+                };
+                append_part(auto_cmt);
+                append_part(thunk_annotation);
+                append_part(demangle_annotation);
+                if (has_mnem_override) {
+                    append_part(mnem_override_token);
+                }
+                if (parts.empty() && ins.has_imm) {
+                    uint64_t imm_a = ins.imm_unsigned;
+                    if (imm_a >= 0x20 && imm_a <= 0x7E && imm_a != 0x60) {
+                        char ch_a = static_cast<char>(imm_a);
+                        char ascii_buf[8];
+                        std::snprintf(ascii_buf, sizeof(ascii_buf), "'%c'", ch_a);
+                        append_part(std::string(ascii_buf));
                     }
                 }
-                if (!demangled.empty()) demangle_annotation = demangled;
-            }
-
-            std::string parts;
-            std::string full_for_tooltip;
-            if (!merged_user_cmt.empty()) {
-                size_t nl = merged_user_cmt.find('\n');
-                std::string first_line = (nl == std::string::npos) ? merged_user_cmt : merged_user_cmt.substr(0, nl);
-                parts = first_line;
-                if (nl != std::string::npos) composed_multiline = true;
-                full_for_tooltip = merged_user_cmt;
-            }
-            auto append_part = [&](const std::string& s) {
-                if (s.empty()) return;
-                if (!parts.empty()) parts += " | ";
-                parts += s;
-                if (!full_for_tooltip.empty()) full_for_tooltip += "\n";
-                full_for_tooltip += s;
-            };
-            append_part(auto_cmt);
-            append_part(thunk_annotation);
-            append_part(demangle_annotation);
-            if (has_mnem_override) {
-                append_part(mnem_override_token);
-            }
-            if (parts.empty() && ins.has_imm) {
-                uint64_t imm_a = ins.imm_unsigned;
-                if (imm_a >= 0x20 && imm_a <= 0x7E && imm_a != 0x60) {
-                    char ch_a = static_cast<char>(imm_a);
-                    char ascii_buf[8];
-                    std::snprintf(ascii_buf, sizeof(ascii_buf), "'%c'", ch_a);
-                    append_part(std::string(ascii_buf));
+                if (!parts.empty()) {
+                    composed_cmt = parts;
+                    composed_tooltip = full_for_tooltip;
                 }
-            }
-            if (!parts.empty()) {
-                composed_cmt = parts;
-                composed_tooltip = full_for_tooltip;
+                cache.composed_cmt_str = composed_cmt;
+                cache.composed_tooltip_str = composed_tooltip;
+                cache.composed_multiline = composed_multiline;
+                cache.composed_branch_target = ins.branch_target;
+                cache.composed_imm = ins.imm_unsigned;
+                cache.composed_has_imm = ins.has_imm;
+                cache.composed_has_mnem_override = has_mnem_override;
+                cache.composed_mnem_override_token = mnem_override_token;
+                cache.composed_valid = true;
             }
         }
 
@@ -5265,12 +5751,14 @@ void render(float pos_x, float pos_y, float width, float height,
         if (!throttled && function_index::is_noreturn_call_at(ins.addr)) {
             float yy = y + line_h;
             if (yy + line_h >= oy_content && yy <= oy_content + content_height) {
+                paint_injection_row_bg(yy);
                 draw_addr_prefix(yy, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
                 function_index::injection_row_t sep;
                 sep.kind = function_index::injection_t::endp_separator;
                 sep.addr = ins.addr;
                 sep.text = "; ---------------------------------------------------------------------------";
                 draw_injection_row(yy, sep, sec_name);
+                handle_injection_row_input(yy, ins.addr);
             }
             ++after_row_offset;
         }
@@ -5281,12 +5769,14 @@ void render(float pos_x, float pos_y, float width, float height,
                 float yy = y + static_cast<float>(ai + 1 + after_row_offset) * line_h;
                 if (yy + line_h < oy_content || yy > oy_content + content_height) continue;
                 const auto& ar = after_rows_ref[ai];
+                paint_injection_row_bg(yy);
                 if (ar.kind == function_index::injection_t::spacer_line) {
                     draw_addr_prefix(yy, ar.addr, sec_name, row_a_inner * 0.55f, row_y_off);
                 } else {
                     function_index::injection_row_t copy = ar;
                     draw_injection_row(yy, copy, sec_name);
                 }
+                handle_injection_row_input(yy, ar.addr);
             }
         }
 
@@ -5560,7 +6050,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
             if (ImGui::MenuItem("Copy Address")) {
                 char buf[20];
-                snprintf(buf, sizeof(buf), "%016llX", static_cast<unsigned long long>(ci.addr));
+                snprintf(buf, sizeof(buf), "%08llX", static_cast<unsigned long long>(ci.addr));
                 copy_text_to_clipboard(std::string(buf));
             }
 
@@ -5577,10 +6067,10 @@ void render(float pos_x, float pos_y, float width, float height,
             if (ImGui::MenuItem("Copy Instruction")) {
                 char buf[256];
                 if (ci.ops[0])
-                    snprintf(buf, sizeof(buf), "%016llX  %-8s %s",
+                    snprintf(buf, sizeof(buf), "%08llX  %-8s %s",
                              static_cast<unsigned long long>(ci.addr), ci.mnem, ci.ops);
                 else
-                    snprintf(buf, sizeof(buf), "%016llX  %s",
+                    snprintf(buf, sizeof(buf), "%08llX  %s",
                              static_cast<unsigned long long>(ci.addr), ci.mnem);
                 copy_text_to_clipboard(std::string(buf));
             }
@@ -5679,7 +6169,7 @@ void render(float pos_x, float pos_y, float width, float height,
         char line_buf[640];
         for (int bi = lo; bi <= hi; ++bi) {
             const auto& bl = s_banner_cache[bi];
-            std::snprintf(line_buf, sizeof(line_buf), "%s:%016llX %s",
+            std::snprintf(line_buf, sizeof(line_buf), "%s:%08llX %s",
                 banner_seg2.c_str(),
                 static_cast<unsigned long long>(banner_addr2),
                 bl.text.c_str());
@@ -5715,7 +6205,7 @@ void render(float pos_x, float pos_y, float width, float height,
         if (ImGui::MenuItem("Copy Address")) {
             uint64_t banner_addr2 = instrs.empty() ? file.image_base : instrs.front().addr;
             char addr_buf[24];
-            std::snprintf(addr_buf, sizeof(addr_buf), "%016llX",
+            std::snprintf(addr_buf, sizeof(addr_buf), "%08llX",
                 static_cast<unsigned long long>(banner_addr2));
             copy_text_to_clipboard(std::string(addr_buf));
         }
@@ -5849,12 +6339,24 @@ void render(float pos_x, float pos_y, float width, float height,
                 if (f5_cursor_addr == 0) {
                     output_log::push(bottom_tab_t::output,
                         "[disasm] F5: no cursor address available; aborting decompile.");
+                    diag::log_tagged_critical("f5", "disasm_f5_no_cursor");
                 } else {
                     uint64_t f5_entry = find_enclosing_function_start(f5_cursor_addr, disasm.file);
                     if (f5_entry == 0) f5_entry = f5_cursor_addr;
-                    pseudocode_view::request_decompile(f5_entry, &disasm.file);
-                    diag::log_tagged_critical_fmt("dec_ui", "f5_native_dispatched addr=0x%llX",
-                        static_cast<unsigned long long>(f5_entry));
+                    uint64_t f5_resolved = follow_thunk_chain(f5_entry);
+                    uint64_t f5_active = pseudocode_view::active_tab_address();
+                    bool f5_same = (f5_resolved != 0 && f5_resolved == f5_active);
+                    diag::log_tagged_critical_fmt("f5",
+                        "disasm_f5_resolved cursor=0x%llX entry=0x%llX resolved=0x%llX active=0x%llX same=%d",
+                        static_cast<unsigned long long>(f5_cursor_addr),
+                        static_cast<unsigned long long>(f5_entry),
+                        static_cast<unsigned long long>(f5_resolved),
+                        static_cast<unsigned long long>(f5_active),
+                        f5_same ? 1 : 0);
+                    pseudocode_view::request_decompile(f5_resolved, &disasm.file, f5_same);
+                    diag::log_tagged_critical_fmt("dec_ui", "f5_native_dispatched addr=0x%llX force=%d",
+                        static_cast<unsigned long long>(f5_resolved),
+                        f5_same ? 1 : 0);
                 }
             }
 
@@ -6226,6 +6728,145 @@ void render(float pos_x, float pos_y, float width, float height,
 
     comment_dialog::render();
     rename_dialog::render();
+}
+
+std::unique_ptr<snapshot_t> detach_snapshot()
+{
+    std::lock_guard<std::mutex> lk(g_state.xref_mutex);
+    auto out = std::make_unique<snapshot_t>();
+    out->nav_history = std::move(g_state.nav_history);
+    out->nav_pos = g_state.nav_pos;
+    out->goto_visible = g_state.goto_visible;
+    std::memcpy(out->goto_buf, g_state.goto_buf, sizeof(out->goto_buf));
+    out->addr_format = g_state.addr_format;
+    out->active_section = g_state.active_section;
+    out->show_bytes = g_state.show_bytes;
+    out->bookmarks = std::move(g_state.bookmarks);
+    out->scroll_y = g_state.scroll_y;
+    out->target_scroll_y = g_state.target_scroll_y;
+    out->sb_dragging = g_state.sb_dragging;
+    out->sb_drag_offset = g_state.sb_drag_offset;
+    out->bm_scroll_x = g_state.bm_scroll_x;
+    out->selected_row = g_state.selected_row;
+    out->sel_anchor = g_state.sel_anchor;
+    out->sel_extent = g_state.sel_extent;
+    out->sel_dragging = g_state.sel_dragging;
+    out->banner_selected_row = g_state.banner_selected_row;
+    out->banner_sel_anchor = g_state.banner_sel_anchor;
+    out->banner_sel_extent = g_state.banner_sel_extent;
+    out->banner_sel_dragging = g_state.banner_sel_dragging;
+    out->banner_ctx_row = g_state.banner_ctx_row;
+    out->banner_popup_anchor = g_state.banner_popup_anchor;
+    out->banner_popup_extent = g_state.banner_popup_extent;
+    out->popup_sel_anchor = g_state.popup_sel_anchor;
+    out->popup_sel_extent = g_state.popup_sel_extent;
+    out->popup_sel_row = g_state.popup_sel_row;
+    out->ctx_row = g_state.ctx_row;
+    out->xref_popup_open = g_state.xref_popup_open;
+    out->xref_popup_addr = g_state.xref_popup_addr;
+    out->xref_popup_fade = g_state.xref_popup_fade;
+    out->xref_popup_scroll = g_state.xref_popup_scroll;
+    out->xref_popup_target_scroll = g_state.xref_popup_target_scroll;
+    out->xref_popup_selected = g_state.xref_popup_selected;
+    out->xref_popup_sb_dragging = g_state.xref_popup_sb_dragging;
+    out->xref_popup_sb_drag_offset = g_state.xref_popup_sb_drag_offset;
+    std::memcpy(out->xref_popup_filter, g_state.xref_popup_filter, sizeof(out->xref_popup_filter));
+    out->xref_popup_target_name = std::move(g_state.xref_popup_target_name);
+    out->xref_results = std::move(g_state.xref_results);
+    out->xref_scanning = g_state.xref_scanning.load(std::memory_order_acquire);
+    out->layout_signature = g_state.layout_signature;
+    out->layout_n = g_state.layout_n;
+    g_state.nav_history.clear();
+    g_state.nav_pos = -1;
+    g_state.goto_visible = false;
+    std::memset(g_state.goto_buf, 0, sizeof(g_state.goto_buf));
+    g_state.addr_format = addr_format_t::va;
+    g_state.active_section = 0;
+    g_state.show_bytes = true;
+    g_state.bookmarks.clear();
+    g_state.scroll_y = 0.f;
+    g_state.target_scroll_y = 0.f;
+    g_state.sb_dragging = false;
+    g_state.sb_drag_offset = 0.f;
+    g_state.bm_scroll_x = 0.f;
+    g_state.selected_row = -1;
+    g_state.sel_anchor = -1;
+    g_state.sel_extent = -1;
+    g_state.sel_dragging = false;
+    g_state.banner_selected_row = -1;
+    g_state.banner_sel_anchor = -1;
+    g_state.banner_sel_extent = -1;
+    g_state.banner_sel_dragging = false;
+    g_state.banner_ctx_row = -1;
+    g_state.banner_popup_anchor = -1;
+    g_state.banner_popup_extent = -1;
+    g_state.popup_sel_anchor = -1;
+    g_state.popup_sel_extent = -1;
+    g_state.popup_sel_row = -1;
+    g_state.ctx_row = -1;
+    g_state.xref_popup_open = false;
+    g_state.xref_popup_addr = 0;
+    g_state.xref_popup_fade = 0.f;
+    g_state.xref_popup_scroll = 0.f;
+    g_state.xref_popup_target_scroll = 0.f;
+    g_state.xref_popup_selected = -1;
+    g_state.xref_popup_sb_dragging = false;
+    g_state.xref_popup_sb_drag_offset = 0.f;
+    std::memset(g_state.xref_popup_filter, 0, sizeof(g_state.xref_popup_filter));
+    g_state.xref_popup_target_name.clear();
+    g_state.xref_results.clear();
+    g_state.xref_scanning.store(false, std::memory_order_release);
+    g_state.layout_signature = 0;
+    g_state.layout_n = 0;
+    return out;
+}
+
+void attach_snapshot(std::unique_ptr<snapshot_t> snap)
+{
+    std::lock_guard<std::mutex> lk(g_state.xref_mutex);
+    if (!snap) snap = std::make_unique<snapshot_t>();
+    g_state.nav_history = std::move(snap->nav_history);
+    g_state.nav_pos = snap->nav_pos;
+    g_state.goto_visible = snap->goto_visible;
+    std::memcpy(g_state.goto_buf, snap->goto_buf, sizeof(g_state.goto_buf));
+    g_state.addr_format = snap->addr_format;
+    g_state.active_section = snap->active_section;
+    g_state.show_bytes = snap->show_bytes;
+    g_state.bookmarks = std::move(snap->bookmarks);
+    g_state.scroll_y = snap->scroll_y;
+    g_state.target_scroll_y = snap->target_scroll_y;
+    g_state.sb_dragging = snap->sb_dragging;
+    g_state.sb_drag_offset = snap->sb_drag_offset;
+    g_state.bm_scroll_x = snap->bm_scroll_x;
+    g_state.selected_row = snap->selected_row;
+    g_state.sel_anchor = snap->sel_anchor;
+    g_state.sel_extent = snap->sel_extent;
+    g_state.sel_dragging = snap->sel_dragging;
+    g_state.banner_selected_row = snap->banner_selected_row;
+    g_state.banner_sel_anchor = snap->banner_sel_anchor;
+    g_state.banner_sel_extent = snap->banner_sel_extent;
+    g_state.banner_sel_dragging = snap->banner_sel_dragging;
+    g_state.banner_ctx_row = snap->banner_ctx_row;
+    g_state.banner_popup_anchor = snap->banner_popup_anchor;
+    g_state.banner_popup_extent = snap->banner_popup_extent;
+    g_state.popup_sel_anchor = snap->popup_sel_anchor;
+    g_state.popup_sel_extent = snap->popup_sel_extent;
+    g_state.popup_sel_row = snap->popup_sel_row;
+    g_state.ctx_row = snap->ctx_row;
+    g_state.xref_popup_open = snap->xref_popup_open;
+    g_state.xref_popup_addr = snap->xref_popup_addr;
+    g_state.xref_popup_fade = snap->xref_popup_fade;
+    g_state.xref_popup_scroll = snap->xref_popup_scroll;
+    g_state.xref_popup_target_scroll = snap->xref_popup_target_scroll;
+    g_state.xref_popup_selected = snap->xref_popup_selected;
+    g_state.xref_popup_sb_dragging = snap->xref_popup_sb_dragging;
+    g_state.xref_popup_sb_drag_offset = snap->xref_popup_sb_drag_offset;
+    std::memcpy(g_state.xref_popup_filter, snap->xref_popup_filter, sizeof(g_state.xref_popup_filter));
+    g_state.xref_popup_target_name = std::move(snap->xref_popup_target_name);
+    g_state.xref_results = std::move(snap->xref_results);
+    g_state.xref_scanning.store(snap->xref_scanning, std::memory_order_release);
+    g_state.layout_signature = snap->layout_signature;
+    g_state.layout_n = snap->layout_n;
 }
 
 }

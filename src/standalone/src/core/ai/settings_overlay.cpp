@@ -1,7 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#include <shlobj.h>
 
 #include "settings_overlay.hpp"
 
@@ -11,26 +10,19 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
-#include <iterator>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#include <nlohmann/json.hpp>
-
 #include "imgui/imgui.h"
 
 #include "auth_view.hpp"
-#include "provider_view.hpp"
 #include "agent_manager_view.hpp"
 #include "skill_manager_view.hpp"
 
 #include "mcp_client.hpp"
-#include "compaction.hpp"
-#include "session_store.hpp"
 #include "standalone_settings.hpp"
 #include "toast_notification.hpp"
 
@@ -63,18 +55,6 @@ namespace settings_overlay {
 
 	namespace detail {
 
-		inline std::filesystem::path aida_json_path()
-		{
-			wchar_t* appdata = nullptr;
-			if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata))) {
-				auto root = std::filesystem::path(appdata) / L"AiDA";
-				CoTaskMemFree(appdata);
-				return root / L"aida.json";
-			}
-			return std::filesystem::current_path() / "aida.json";
-		}
-
-
 		struct overlay_state_t
 		{
 			std::mutex mtx;
@@ -98,40 +78,17 @@ namespace settings_overlay {
 			char  filter_buf[128] = {};
 			char  mcp_search_buf[128] = {};
 
-			bool  compaction_loaded = false;
-			float compaction_trigger_ratio = 0.85f;
-			int   compaction_preserve_messages = 2;
-			int   compaction_preserve_tokens = 8000;
-			float compaction_cost_anim = 0.f;
-			float compaction_cost_velocity = 0.f;
-			std::string compaction_session_id;
-			double compaction_session_cost = 0.0;
-			int64_t compaction_session_input = 0;
-			int64_t compaction_session_output = 0;
-			int64_t compaction_session_reasoning = 0;
-			int64_t compaction_session_cache_read = 0;
-			int64_t compaction_session_cache_write = 0;
-			double compaction_last_refresh = 0.0;
-
 			bool editor_loaded = false;
 			int  ed_tab_size = 4;
 			float ed_font_size = 14.0f;
-			bool  ed_line_numbers = true;
-			bool  ed_word_wrap = false;
-			bool  ed_minimap = false;
-			bool  ed_bracket_match = true;
-			bool  ed_highlight_line = true;
-			bool  ed_autocomplete = true;
-			bool  ed_ghost_text = false;
-
-			bool  permissions_loaded = false;
-			char  perm_allowed_commands[1024] = {};
-			char  perm_denied_commands[1024] = {};
 
 			std::unordered_map<std::string, aida::ui::hover_state_t> mcp_row_anims;
 			float anim_input_count = 0.f;
 			float anim_input_velocity = 0.f;
 			float anim_cost_count = 0.f;
+
+			std::mutex pending_focus_mtx;
+			std::string pending_provider_focus;
 		};
 
 
@@ -142,81 +99,12 @@ namespace settings_overlay {
 		}
 
 
-		inline void load_compaction_locked(overlay_state_t& s)
-		{
-			if (s.compaction_loaded) return;
-			s.compaction_loaded = true;
-
-			nlohmann::json root;
-			const auto path = aida_json_path();
-			std::error_code ec;
-			if (std::filesystem::exists(path, ec)) {
-				std::ifstream ifs(path, std::ios::binary);
-				std::string raw((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-				try {
-					root = nlohmann::json::parse(raw);
-					if (!root.is_object()) root = nlohmann::json::object();
-				} catch (...) {
-					root = nlohmann::json::object();
-				}
-			}
-			if (root.contains("compaction") && root["compaction"].is_object()) {
-				const auto& c = root["compaction"];
-				if (c.contains("trigger_ratio") && c["trigger_ratio"].is_number())
-					s.compaction_trigger_ratio = c["trigger_ratio"].get<float>();
-				if (c.contains("preserve_recent_messages") && c["preserve_recent_messages"].is_number_integer())
-					s.compaction_preserve_messages = c["preserve_recent_messages"].get<int>();
-				if (c.contains("preserve_recent_tokens") && c["preserve_recent_tokens"].is_number_integer())
-					s.compaction_preserve_tokens = c["preserve_recent_tokens"].get<int>();
-			} else {
-				s.compaction_trigger_ratio = static_cast<float>(g_sa_settings.condense_threshold);
-			}
-		}
-
-
-		inline void save_compaction_locked(overlay_state_t& s)
-		{
-			nlohmann::json root;
-			const auto path = aida_json_path();
-			std::error_code ec;
-			std::filesystem::create_directories(path.parent_path(), ec);
-			if (std::filesystem::exists(path, ec)) {
-				std::ifstream ifs(path, std::ios::binary);
-				std::string raw((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-				try {
-					root = nlohmann::json::parse(raw);
-					if (!root.is_object()) root = nlohmann::json::object();
-				} catch (...) {
-					root = nlohmann::json::object();
-				}
-			}
-			nlohmann::json c = nlohmann::json::object();
-			c["trigger_ratio"]            = s.compaction_trigger_ratio;
-			c["preserve_recent_messages"] = s.compaction_preserve_messages;
-			c["preserve_recent_tokens"]   = s.compaction_preserve_tokens;
-			root["compaction"] = c;
-
-			std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
-			if (ofs) ofs << root.dump(2);
-
-			g_sa_settings.condense_threshold = static_cast<double>(s.compaction_trigger_ratio);
-			g_sa_settings.save();
-		}
-
-
 		inline void load_editor_locked(overlay_state_t& s)
 		{
 			if (s.editor_loaded) return;
 			s.editor_loaded = true;
 			s.ed_tab_size        = g_sa_settings.editor_tab_size;
 			s.ed_font_size       = g_sa_settings.editor_font_size;
-			s.ed_line_numbers    = g_sa_settings.editor_line_numbers;
-			s.ed_word_wrap       = g_sa_settings.editor_word_wrap;
-			s.ed_minimap         = g_sa_settings.editor_minimap;
-			s.ed_bracket_match   = g_sa_settings.editor_bracket_match;
-			s.ed_highlight_line  = g_sa_settings.editor_highlight_line;
-			s.ed_autocomplete    = g_sa_settings.editor_auto_complete;
-			s.ed_ghost_text      = g_sa_settings.ghost_text_enabled;
 		}
 
 
@@ -224,41 +112,23 @@ namespace settings_overlay {
 		{
 			editor_config::tab_size                = (std::max)(s.ed_tab_size, 1);
 			editor_config::font_size               = s.ed_font_size;
-			editor_config::show_line_numbers       = s.ed_line_numbers;
-			editor_config::word_wrap               = s.ed_word_wrap;
-			editor_config::minimap                 = s.ed_minimap;
-			editor_config::bracket_match           = s.ed_bracket_match;
-			editor_config::highlight_current_line  = s.ed_highlight_line;
-			editor_config::auto_complete           = s.ed_autocomplete;
+			editor_config::show_line_numbers       = true;
+			editor_config::word_wrap               = true;
+			editor_config::minimap                 = true;
+			editor_config::bracket_match           = true;
+			editor_config::highlight_current_line  = true;
+			editor_config::auto_complete           = true;
 
 			g_sa_settings.editor_tab_size          = (std::max)(s.ed_tab_size, 1);
 			g_sa_settings.editor_font_size         = s.ed_font_size;
-			g_sa_settings.editor_line_numbers      = s.ed_line_numbers;
-			g_sa_settings.editor_word_wrap         = s.ed_word_wrap;
-			g_sa_settings.editor_minimap           = s.ed_minimap;
-			g_sa_settings.editor_bracket_match     = s.ed_bracket_match;
-			g_sa_settings.editor_highlight_line    = s.ed_highlight_line;
-			g_sa_settings.editor_auto_complete     = s.ed_autocomplete;
-			g_sa_settings.ghost_text_enabled       = s.ed_ghost_text;
-			g_sa_settings.save();
-		}
-
-
-		inline void load_permissions_locked(overlay_state_t& s)
-		{
-			if (s.permissions_loaded) return;
-			s.permissions_loaded = true;
-			std::snprintf(s.perm_allowed_commands, sizeof(s.perm_allowed_commands), "%s",
-				g_sa_settings.auto_approve_allowed_commands.c_str());
-			std::snprintf(s.perm_denied_commands, sizeof(s.perm_denied_commands), "%s",
-				g_sa_settings.tool_always_deny.c_str());
-		}
-
-
-		inline void persist_permissions_locked(overlay_state_t& s)
-		{
-			g_sa_settings.auto_approve_allowed_commands = s.perm_allowed_commands;
-			g_sa_settings.tool_always_deny              = s.perm_denied_commands;
+			g_sa_settings.editor_line_numbers      = true;
+			g_sa_settings.editor_word_wrap         = true;
+			g_sa_settings.editor_minimap           = true;
+			g_sa_settings.editor_bracket_match     = true;
+			g_sa_settings.editor_highlight_line    = true;
+			g_sa_settings.editor_auto_complete     = true;
+			g_sa_settings.ghost_text_enabled       = true;
+			g_sa_settings.auto_save_enabled        = true;
 			g_sa_settings.save();
 		}
 
@@ -295,15 +165,12 @@ namespace settings_overlay {
 			float th_w = r * 0.16f;
 			switch (tab_idx) {
 			case tab_accounts: {
-				dl->AddCircle(ImVec2(c.x, c.y - r * 0.18f), r * 0.30f, col, 24, th_w);
-				dl->PathArcTo(ImVec2(c.x, c.y + r * 0.45f), r * 0.55f, 3.4f, 5.98f, 24);
+				dl->AddCircle(ImVec2(c.x - r * 0.22f, c.y - r * 0.18f), r * 0.26f, col, 24, th_w);
+				dl->PathArcTo(ImVec2(c.x - r * 0.22f, c.y + r * 0.40f), r * 0.46f, 3.4f, 5.98f, 24);
 				dl->PathStroke(col, 0, th_w);
-				break;
-			}
-			case tab_providers: {
-				dl->AddRect(ImVec2(c.x - r * 0.55f, c.y - r * 0.40f),
-					ImVec2(c.x + r * 0.55f, c.y + r * 0.40f), col, 4.f, 0, th_w);
-				dl->AddLine(ImVec2(c.x, c.y - r * 0.40f), ImVec2(c.x, c.y + r * 0.40f), col, th_w);
+				dl->AddCircle(ImVec2(c.x + r * 0.42f, c.y + r * 0.10f), r * 0.20f, col, 20, th_w);
+				dl->AddLine(ImVec2(c.x + r * 0.42f, c.y + r * 0.30f),
+					ImVec2(c.x + r * 0.42f, c.y + r * 0.55f), col, th_w);
 				break;
 			}
 			case tab_agents: {
@@ -331,23 +198,6 @@ namespace settings_overlay {
 					ImVec2(c.x + r * 0.55f, c.y + r * 0.50f), col, 3.f, 0, th_w);
 				dl->AddCircleFilled(ImVec2(c.x - r * 0.30f, c.y - r * 0.30f), th_w * 0.7f, col, 12);
 				dl->AddCircleFilled(ImVec2(c.x - r * 0.30f, c.y + r * 0.30f), th_w * 0.7f, col, 12);
-				break;
-			}
-			case tab_permissions: {
-				ImVec2 a(c.x - r * 0.45f, c.y - r * 0.10f);
-				ImVec2 b(c.x + r * 0.45f, c.y + r * 0.55f);
-				dl->AddRect(a, b, col, 3.f, 0, th_w);
-				dl->PathArcTo(ImVec2(c.x, c.y - r * 0.10f), r * 0.30f, 3.14159f, 6.28319f, 24);
-				dl->PathStroke(col, 0, th_w);
-				dl->AddCircleFilled(ImVec2(c.x, c.y + r * 0.20f), th_w, col, 12);
-				break;
-			}
-			case tab_compaction_cost: {
-				dl->AddRect(ImVec2(c.x - r * 0.55f, c.y - r * 0.40f),
-					ImVec2(c.x + r * 0.55f, c.y + r * 0.40f), col, 3.f, 0, th_w);
-				dl->AddLine(ImVec2(c.x - r * 0.30f, c.y + r * 0.05f),
-					ImVec2(c.x + r * 0.30f, c.y + r * 0.05f), col, th_w);
-				dl->AddLine(ImVec2(c.x, c.y - r * 0.20f), ImVec2(c.x, c.y + r * 0.30f), col, th_w);
 				break;
 			}
 			case tab_editor_theme: {
@@ -438,7 +288,6 @@ namespace settings_overlay {
 			float row_h, float dt)
 		{
 			auto& s = state();
-			const auto& th = aida::ui::resolved();
 			ImDrawList* dl = ImGui::GetWindowDrawList();
 
 			ImVec2 wp = ImGui::GetWindowPos();
@@ -473,11 +322,8 @@ namespace settings_overlay {
 			}
 
 			float bx = wp.x + 2.f;
-			ImVec2 ba(bx, s.tab_underline_y);
-			ImVec2 bb(bx + 3.f, s.tab_underline_y + s.tab_underline_h);
-			dl->AddRectFilledMultiColor(ba, bb,
-				th.accent_grad_top, th.accent_grad_top,
-				th.accent_grad_bot, th.accent_grad_bot);
+			ui_anim::render_tab_underline_glow_vertical(dl, bx, s.tab_underline_y,
+				s.tab_underline_h, 1.f);
 			(void)side_w;
 		}
 
@@ -485,12 +331,6 @@ namespace settings_overlay {
 		inline void render_tab_accounts(float content_w, float content_h)
 		{
 			aida::auth_view::render(content_w, content_h);
-		}
-
-
-		inline void render_tab_providers(float content_w, float content_h)
-		{
-			aida::provider_view::render(content_w, content_h);
 		}
 
 
@@ -810,243 +650,6 @@ namespace settings_overlay {
 		}
 
 
-		inline void render_tab_permissions(float content_w, float content_h)
-		{
-			(void)content_w; (void)content_h;
-			auto& s = state();
-			const auto& th = aida::ui::resolved();
-			std::lock_guard<std::mutex> lk(s.mtx);
-			load_permissions_locked(s);
-
-			ImGui::PushID("##permissions_tab");
-			ImGui::PushFont(aida::ui::fonts::lg());
-			ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.f, 10.f));
-			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 7.f));
-
-			ImDrawList* dl = ImGui::GetWindowDrawList();
-			ImVec2 hp = ImGui::GetCursorScreenPos();
-			dl->AddText(aida::ui::fonts::h1(), 22.f, hp, th.text_primary,
-				"Auto-approval Policies");
-			ImGui::Dummy(ImVec2(0.f, 32.f));
-
-			bool changed = false;
-			changed |= aida::ui::toggle_switch("Auto-approve read-only operations",
-				&g_sa_settings.auto_approve_read, aida::ui::size_t_::md);
-			changed |= aida::ui::toggle_switch("Auto-approve write operations",
-				&g_sa_settings.auto_approve_write, aida::ui::size_t_::md);
-			changed |= aida::ui::toggle_switch("Auto-approve command execution",
-				&g_sa_settings.auto_approve_execute, aida::ui::size_t_::md);
-			changed |= aida::ui::toggle_switch("Auto-approve MCP tool calls",
-				&g_sa_settings.auto_approve_mcp, aida::ui::size_t_::md);
-			changed |= aida::ui::toggle_switch("Auto-approve mode/agent switches",
-				&g_sa_settings.auto_approve_mode_switch, aida::ui::size_t_::md);
-			changed |= aida::ui::toggle_switch("Auto-approve subtask delegation",
-				&g_sa_settings.auto_approve_subtask, aida::ui::size_t_::md);
-
-			ImGui::Dummy(ImVec2(0.f, 6.f));
-			ImGui::Separator();
-			ImGui::Dummy(ImVec2(0.f, 6.f));
-
-			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
-				"Per-task request cap (0 = unlimited)");
-			ImGui::SetNextItemWidth(240.f);
-			changed |= ImGui::InputInt("##perm_max_req",
-				&g_sa_settings.auto_approve_max_requests, 0, 0);
-			ImGui::SameLine(0.f, 16.f);
-			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
-				"Per-task cost cap USD (0 = unlimited)");
-			ImGui::SetNextItemWidth(240.f);
-			changed |= ImGui::InputDouble("##perm_max_cost",
-				&g_sa_settings.auto_approve_max_cost, 0.0, 0.0, "%.2f");
-
-			ImGui::Dummy(ImVec2(0.f, 4.f));
-			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
-				"Allowed shell commands (CSV - prefixes ok)");
-			if (aida::ui::input_text("##perm_allow",
-					s.perm_allowed_commands, sizeof(s.perm_allowed_commands),
-					"git, npm, cargo", false, ImVec2(0.f, 36.f)))
-				changed = true;
-
-			ImGui::Dummy(ImVec2(0.f, 4.f));
-			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
-				"Denied shell commands (CSV)");
-			if (aida::ui::input_text("##perm_deny",
-					s.perm_denied_commands, sizeof(s.perm_denied_commands),
-					"rm, format, shutdown", false, ImVec2(0.f, 36.f)))
-				changed = true;
-
-			if (changed)
-				persist_permissions_locked(s);
-
-			ImGui::PopStyleVar(2);
-			ImGui::PopFont();
-			ImGui::PopID();
-		}
-
-
-		inline void render_stat_card(ImVec2 pos, ImVec2 size, const char* title,
-			const char* value, float fade)
-		{
-			const auto& th = aida::ui::resolved();
-			ImDrawList* dl = ImGui::GetWindowDrawList();
-			ImVec2 a = pos;
-			ImVec2 b(pos.x + size.x, pos.y + size.y);
-			dl->AddRectFilled(a, b,
-				aida::ui::with_alpha(th.panel_header, 0.85f * fade), 10.f);
-			dl->AddRect(a, b,
-				aida::ui::with_alpha(th.border_subtle, fade), 10.f, 0, 1.f);
-			const float card_fs = aida::ui::components::detail::ui_fs();
-			dl->AddText(aida::ui::fonts::caption(), card_fs * 0.88f,
-				ImVec2(a.x + 14.f, a.y + 12.f),
-				aida::ui::with_alpha(th.text_dim, fade), title);
-			dl->AddText(aida::ui::fonts::display(), card_fs * 1.7f,
-				ImVec2(a.x + 14.f, a.y + 32.f),
-				aida::ui::with_alpha(th.text_primary, fade), value);
-		}
-
-		inline void render_tab_compaction_cost(float content_w, float content_h)
-		{
-			(void)content_w; (void)content_h;
-			auto& s = state();
-			const auto& th = aida::ui::resolved();
-			std::lock_guard<std::mutex> lk(s.mtx);
-			load_compaction_locked(s);
-
-			double now = ImGui::GetTime();
-			std::string sid = ::chat_active_session();
-			if (!sid.empty() && (now - s.compaction_last_refresh > 1.5 || sid != s.compaction_session_id)) {
-				s.compaction_session_id   = sid;
-				s.compaction_session_cost = aida::session::session_cost(sid);
-				auto t = aida::session::session_tokens(sid);
-				s.compaction_session_input       = t.input;
-				s.compaction_session_output      = t.output;
-				s.compaction_session_reasoning   = t.reasoning;
-				s.compaction_session_cache_read  = t.cache_read;
-				s.compaction_session_cache_write = t.cache_write;
-				s.compaction_last_refresh = now;
-			}
-
-			ImGui::PushID("##compact_cost_tab");
-			ImGui::PushFont(aida::ui::fonts::lg());
-			ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.f, 10.f));
-			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 7.f));
-
-			ImDrawList* dl = ImGui::GetWindowDrawList();
-			ImVec2 hp = ImGui::GetCursorScreenPos();
-			dl->AddText(aida::ui::fonts::h1(), 22.f, hp, th.text_primary,
-				"Auto-compaction Threshold");
-			ImGui::Dummy(ImVec2(0.f, 32.f));
-
-			bool changed = false;
-			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
-				"Trigger when used / context >= ratio");
-			ImGui::SetNextItemWidth(-12.f);
-			changed |= ImGui::SliderFloat("##compact_ratio", &s.compaction_trigger_ratio,
-				0.50f, 0.98f, "%.2f");
-
-			ImGui::Dummy(ImVec2(0.f, 4.f));
-			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
-				"Preserve recent N messages (always keep)");
-			ImGui::SetNextItemWidth(240.f);
-			changed |= ImGui::InputInt("##compact_msg", &s.compaction_preserve_messages, 0, 0);
-			s.compaction_preserve_messages = (std::max)(0, s.compaction_preserve_messages);
-			ImGui::SameLine(0.f, 16.f);
-			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
-				"Preserve recent tokens budget");
-			ImGui::SetNextItemWidth(240.f);
-			changed |= ImGui::InputInt("##compact_tok", &s.compaction_preserve_tokens, 0, 0);
-			s.compaction_preserve_tokens = (std::max)(0, s.compaction_preserve_tokens);
-
-			if (changed)
-				save_compaction_locked(s);
-
-			ImGui::Dummy(ImVec2(0.f, 8.f));
-			ImVec2 div_pos = ImGui::GetCursorScreenPos();
-			float div_w = ImGui::GetContentRegionAvail().x;
-			float pulse = aida::ui::clock::pulse(0.4f, 0.4f, 1.f);
-			dl->AddRectFilledMultiColor(
-				ImVec2(div_pos.x, div_pos.y),
-				ImVec2(div_pos.x + div_w, div_pos.y + 1.f),
-				aida::ui::with_alpha(th.accent_grad_top, 0.f),
-				aida::ui::with_alpha(th.accent_grad_top, pulse * 0.5f),
-				aida::ui::with_alpha(th.accent_grad_bot, pulse * 0.5f),
-				aida::ui::with_alpha(th.accent_grad_bot, 0.f));
-			ImGui::Dummy(ImVec2(0.f, 16.f));
-
-			dl->AddText(aida::ui::fonts::h1(), 22.f, ImGui::GetCursorScreenPos(),
-				th.text_primary, "Current Session Cost");
-			ImGui::Dummy(ImVec2(0.f, 32.f));
-
-			if (sid.empty()) {
-				ImVec2 region_pos = ImGui::GetCursorScreenPos();
-				ImVec2 region_size(ImGui::GetContentRegionAvail().x, 180.f);
-				aida::ui::empty_state::config_t cfg;
-				cfg.glyph = aida::ui::empty_state::glyph_t::message;
-				cfg.title = "No active session";
-				cfg.body = "Once a chat is in flight, token usage and cost will appear here.";
-				cfg.max_width = region_size.x * 0.7f;
-				aida::ui::empty_state::render(region_pos, region_size, cfg);
-			} else {
-				const float dt = aida::ui::clock::dt();
-				float target_cost = static_cast<float>(s.compaction_session_cost);
-				s.compaction_cost_anim = aida::motion::critically_damped_step(
-					s.compaction_cost_anim, target_cost,
-					s.compaction_cost_velocity, 0.20f, dt);
-				char val_buf[64];
-				std::snprintf(val_buf, sizeof(val_buf), "$%.4f", s.compaction_cost_anim);
-
-				ImVec2 sp = ImGui::GetCursorScreenPos();
-				float card_w = (ImGui::GetContentRegionAvail().x - 18.f) * 0.5f;
-				float card_h = 92.f;
-				render_stat_card(sp, ImVec2(card_w, card_h), "Total cost", val_buf, 1.f);
-
-				char tok_buf[128];
-				long long total_tk = static_cast<long long>(s.compaction_session_input + s.compaction_session_output);
-				std::snprintf(tok_buf, sizeof(tok_buf), "%lld", total_tk);
-				render_stat_card(ImVec2(sp.x + card_w + 18.f, sp.y),
-					ImVec2(card_w, card_h), "Total tokens", tok_buf, 1.f);
-				ImGui::Dummy(ImVec2(0.f, card_h + 14.f));
-
-				char det_buf[256];
-				std::snprintf(det_buf, sizeof(det_buf),
-					"in: %lld   out: %lld   reasoning: %lld",
-					static_cast<long long>(s.compaction_session_input),
-					static_cast<long long>(s.compaction_session_output),
-					static_cast<long long>(s.compaction_session_reasoning));
-				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "%s", det_buf);
-				std::snprintf(det_buf, sizeof(det_buf),
-					"cache read: %lld   cache write: %lld",
-					static_cast<long long>(s.compaction_session_cache_read),
-					static_cast<long long>(s.compaction_session_cache_write));
-				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "%s", det_buf);
-
-				ImGui::Dummy(ImVec2(0.f, 6.f));
-				if (aida::ui::button("Run /compact now",
-						aida::ui::button_kind_t::primary,
-						aida::ui::size_t_::md,
-						ImVec2(200.f, 36.f))) {
-					aida::compaction::compaction_options_t opts;
-					opts.trigger_ratio              = static_cast<double>(s.compaction_trigger_ratio);
-					opts.preserve_recent_messages   = s.compaction_preserve_messages;
-					opts.preserve_recent_tokens     = s.compaction_preserve_tokens;
-					aida::compaction::compaction_result_t res;
-					if (!aida::compaction::run(sid, opts, res)) {
-						toast_notification::push(std::string("Compaction failed: ") + res.error,
-							toast_notification::toast_type_t::error);
-					} else {
-						char m[160];
-						std::snprintf(m, sizeof(m), "Compacted %d msgs, freed %d tokens",
-							res.messages_summarized, res.tokens_freed);
-						toast_notification::push(m, toast_notification::toast_type_t::info);
-					}
-				}
-			}
-			ImGui::PopStyleVar(2);
-			ImGui::PopFont();
-			ImGui::PopID();
-		}
-
-
 		inline std::mutex& ida_status_mutex()
 		{
 			static std::mutex m;
@@ -1262,15 +865,6 @@ namespace settings_overlay {
 			ImGui::SetNextItemWidth(240.f);
 			changed |= ImGui::SliderFloat("##ed_font", &s.ed_font_size, 9.f, 32.f, "%.0f");
 
-			ImGui::Dummy(ImVec2(0.f, 4.f));
-			changed |= aida::ui::toggle_switch("Show line numbers",       &s.ed_line_numbers,    aida::ui::size_t_::md);
-			changed |= aida::ui::toggle_switch("Word wrap",                &s.ed_word_wrap,      aida::ui::size_t_::md);
-			changed |= aida::ui::toggle_switch("Minimap",                  &s.ed_minimap,        aida::ui::size_t_::md);
-			changed |= aida::ui::toggle_switch("Bracket match",            &s.ed_bracket_match,  aida::ui::size_t_::md);
-			changed |= aida::ui::toggle_switch("Highlight current line",   &s.ed_highlight_line, aida::ui::size_t_::md);
-			changed |= aida::ui::toggle_switch("Auto-complete",            &s.ed_autocomplete,   aida::ui::size_t_::md);
-			changed |= aida::ui::toggle_switch("Ghost text",               &s.ed_ghost_text,     aida::ui::size_t_::md);
-
 			ImGui::Dummy(ImVec2(0.f, 6.f));
 			ImGui::Separator();
 			ImGui::Dummy(ImVec2(0.f, 6.f));
@@ -1294,31 +888,8 @@ namespace settings_overlay {
 				}
 			}
 
-			ImGui::Dummy(ImVec2(0.f, 6.f));
-			ImGui::Separator();
-			ImGui::Dummy(ImVec2(0.f, 6.f));
-
-			dl->AddText(aida::ui::fonts::h1(), 22.f, ImGui::GetCursorScreenPos(),
-				th.text_primary, "Auto-save");
-			ImGui::Dummy(ImVec2(0.f, 32.f));
-
-			bool autosave_changed = false;
-			autosave_changed |= aida::ui::toggle_switch("Auto-save edited files",
-				&g_sa_settings.auto_save_enabled, aida::ui::size_t_::md);
-			ImGui::Dummy(ImVec2(0.f, 4.f));
-			if (!g_sa_settings.auto_save_enabled) ImGui::BeginDisabled();
-			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
-				"Auto-save interval (seconds)");
-			ImGui::SetNextItemWidth(240.f);
-			autosave_changed |= ImGui::InputInt("##autosave_int",
-				&g_sa_settings.auto_save_interval_s, 0, 0);
-			g_sa_settings.auto_save_interval_s = (std::max)(g_sa_settings.auto_save_interval_s, 5);
-			if (!g_sa_settings.auto_save_enabled) ImGui::EndDisabled();
-
 			if (changed)
 				persist_editor_locked(s);
-			if (autosave_changed)
-				g_sa_settings.save();
 
 			ImGui::PopStyleVar(2);
 			ImGui::PopFont();
@@ -1392,6 +963,28 @@ namespace settings_overlay {
 	}
 
 
+	void open_to_provider(const std::string& provider_id)
+	{
+		auto& s = detail::state();
+		{
+			std::lock_guard<std::mutex> lk(s.pending_focus_mtx);
+			s.pending_provider_focus = provider_id;
+		}
+		set_active_tab(tab_accounts);
+		g_settings_open = true;
+	}
+
+
+	std::string consume_pending_provider_focus()
+	{
+		auto& s = detail::state();
+		std::lock_guard<std::mutex> lk(s.pending_focus_mtx);
+		std::string out;
+		out.swap(s.pending_provider_focus);
+		return out;
+	}
+
+
 	void render_inline(float panel_w, float panel_h)
 	{
 		auto& s = detail::state();
@@ -1443,12 +1036,9 @@ namespace settings_overlay {
 		{
 			static const char* tab_labels[tab_count] = {
 				"Accounts",
-				"Providers",
 				"Agents",
 				"Skills",
 				"MCP Servers",
-				"Permissions",
-				"Compaction",
 				"Editor",
 				"IDA Pro"
 			};
@@ -1482,12 +1072,9 @@ namespace settings_overlay {
 			auto draw_tab = [&](int idx) {
 				switch (idx) {
 				case tab_accounts:        detail::render_tab_accounts(content_w, content_h); break;
-				case tab_providers:       detail::render_tab_providers(content_w, content_h); break;
 				case tab_agents:          detail::render_tab_agents(content_w, content_h); break;
 				case tab_skills:          detail::render_tab_skills(content_w, content_h); break;
 				case tab_mcp_servers:     detail::render_tab_mcp_servers(content_w, content_h); break;
-				case tab_permissions:     detail::render_tab_permissions(content_w, content_h); break;
-				case tab_compaction_cost: detail::render_tab_compaction_cost(content_w, content_h); break;
 				case tab_editor_theme:    detail::render_tab_editor_theme(content_w, content_h); break;
 				case tab_ida_pro:         detail::render_tab_ida_pro(content_w, content_h); break;
 				default:                  detail::render_tab_accounts(content_w, content_h); break;

@@ -15,6 +15,8 @@
 #endif
 #include <windows.h>
 
+#include "../../helpers/diag_log.hpp"
+
 namespace pdb_parser {
 
 struct pdb_symbol_t {
@@ -193,7 +195,12 @@ inline bool load_dbghelp()
 	if (g_api.loaded) return true;
 
 	g_api.hmod = LoadLibraryW(L"dbghelp.dll");
-	if (!g_api.hmod) return false;
+	if (!g_api.hmod) {
+		DWORD err = GetLastError();
+		diag::log_tagged_fmt("pdb",
+			"load_dbghelp failed reason='LoadLibrary' err=%lu", err);
+		return false;
+	}
 
 	auto gp = [&](const char* name) -> FARPROC {
 		return GetProcAddress(g_api.hmod, name);
@@ -214,10 +221,18 @@ inline bool load_dbghelp()
 	    !g_api.pSymEnumSymbolsExW || !g_api.pSymGetTypeInfo) {
 		FreeLibrary(g_api.hmod);
 		g_api.hmod = nullptr;
+		diag::log_tagged_fmt("pdb",
+			"load_dbghelp failed reason='missing_export' init=%d cleanup=%d loadmod=%d enumsym=%d gettypeinfo=%d",
+			g_api.pSymInitializeW    ? 1 : 0,
+			g_api.pSymCleanup        ? 1 : 0,
+			g_api.pSymLoadModuleExW  ? 1 : 0,
+			g_api.pSymEnumSymbolsExW ? 1 : 0,
+			g_api.pSymGetTypeInfo    ? 1 : 0);
 		return false;
 	}
 
 	g_api.loaded = true;
+	diag::log_tagged_fmt("pdb", "load_dbghelp ok");
 	return true;
 }
 
@@ -510,7 +525,20 @@ inline bool parse_pdb(const std::string& pdb_path,
                       std::atomic<float>* progress = nullptr,
                       std::atomic<bool>* cancel = nullptr)
 {
-	if (!load_dbghelp()) return false;
+	uint64_t t_begin = GetTickCount64();
+	uint64_t pdb_bytes = 0;
+	{
+		std::error_code ec;
+		auto sz = std::filesystem::file_size(pdb_path, ec);
+		if (!ec) pdb_bytes = static_cast<uint64_t>(sz);
+	}
+
+	if (!load_dbghelp()) {
+		diag::log_tagged_fmt("pdb",
+			"parse_pdb_failed reason='dbghelp_load' path='%s'",
+			pdb_path.c_str());
+		return false;
+	}
 
 	std::lock_guard<std::mutex> dbghelp_lk(g_dbghelp_call_mutex);
 
@@ -530,8 +558,13 @@ inline bool parse_pdb(const std::string& pdb_path,
 	if (g_api.pSymSetOptions) g_api.pSymSetOptions(opts);
 
 	std::wstring wSearchPath = detail::utf8_to_wstr(symbol_search_path);
-	if (!g_api.pSymInitializeW(hFakeProc, wSearchPath.empty() ? nullptr : wSearchPath.c_str(), FALSE))
+	if (!g_api.pSymInitializeW(hFakeProc, wSearchPath.empty() ? nullptr : wSearchPath.c_str(), FALSE)) {
+		DWORD err = GetLastError();
+		diag::log_tagged_fmt("pdb",
+			"parse_pdb_failed reason='SymInitializeW' path='%s' err=%lu",
+			pdb_path.c_str(), err);
 		return false;
+	}
 
 	if (!wSearchPath.empty() && g_api.pSymSetSearchPathW)
 		g_api.pSymSetSearchPathW(hFakeProc, wSearchPath.c_str());
@@ -540,9 +573,19 @@ inline bool parse_pdb(const std::string& pdb_path,
 	DWORD64 modBase = g_api.pSymLoadModuleExW(hFakeProc, nullptr, wPdbPath.c_str(), nullptr,
 	                                           0x10000000, 0x01000000, nullptr, 0);
 	if (!modBase) {
+		DWORD err = GetLastError();
+		diag::log_tagged_fmt("pdb",
+			"parse_pdb_failed reason='SymLoadModuleExW' path='%s' err=%lu",
+			pdb_path.c_str(), err);
 		g_api.pSymCleanup(hFakeProc);
 		return false;
 	}
+
+	diag::log_tagged_fmt("pdb",
+		"parse_pdb_begin path='%s' bytes=%llu module='%s'",
+		pdb_path.c_str(),
+		static_cast<unsigned long long>(pdb_bytes),
+		stem.c_str());
 
 	if (progress) progress->store(0.1f);
 
@@ -557,6 +600,9 @@ inline bool parse_pdb(const std::string& pdb_path,
 	if (cancel && cancel->load()) {
 		g_api.pSymUnloadModule64(hFakeProc, modBase);
 		g_api.pSymCleanup(hFakeProc);
+		diag::log_tagged_fmt("pdb",
+			"parse_pdb_cancelled path='%s' syms=%zu",
+			pdb_path.c_str(), out.symbols.size());
 		return false;
 	}
 
@@ -637,6 +683,21 @@ inline bool parse_pdb(const std::string& pdb_path,
 
 	out.loaded = true;
 	if (progress) progress->store(1.f);
+
+	uint64_t elapsed_ms = GetTickCount64() - t_begin;
+	bool cancelled = (cancel && cancel->load());
+	diag::log_tagged_fmt("pdb",
+		"parse_pdb_done path='%s' bytes=%llu syms=%zu structs=%zu enums=%zu udt=%zu enum_total=%zu cancelled=%d elapsed_ms=%llu",
+		pdb_path.c_str(),
+		static_cast<unsigned long long>(pdb_bytes),
+		out.symbols.size(),
+		out.structs.size(),
+		out.enums.size(),
+		typeCtx.udt_indices.size(),
+		typeCtx.enum_indices.size(),
+		cancelled ? 1 : 0,
+		static_cast<unsigned long long>(elapsed_ms));
+
 	return true;
 }
 

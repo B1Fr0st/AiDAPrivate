@@ -291,7 +291,10 @@ inline ghidra_result_t do_decompile(aida_ghidra::architecture_t* arch,
 	const aida_ghidra::symbol_record_t* known = db.find_by_address(entry_addr);
 
 	std::string func_name;
-	if (known && !known->name.empty()) {
+	bool known_is_callable = known &&
+		(known->kind == aida_ghidra::symbol_kind_t::function ||
+		 known->kind == aida_ghidra::symbol_kind_t::export_);
+	if (known_is_callable && !known->name.empty() && known->name.size() <= 1024) {
 		func_name = known->name;
 	} else {
 		char name_buf[64];
@@ -548,6 +551,26 @@ struct prepared_arch_t {
 	prepared_arch_t& operator=(const prepared_arch_t&) = delete;
 };
 
+__declspec(noinline) inline DWORD seh_apply_pdb_types(aida_ghidra::architecture_t* arch)
+{
+	__try {
+		arch->apply_pdb_types();
+		return 0;
+	} __except(EXCEPTION_EXECUTE_HANDLER) {
+		return GetExceptionCode();
+	}
+}
+
+__declspec(noinline) inline DWORD seh_apply_pdb_function_prototypes(aida_ghidra::architecture_t* arch)
+{
+	__try {
+		arch->apply_pdb_function_prototypes();
+		return 0;
+	} __except(EXCEPTION_EXECUTE_HANDLER) {
+		return GetExceptionCode();
+	}
+}
+
 inline void populate_symbols(aida_ghidra::architecture_t& arch,
                              const uint8_t* data,
                              size_t size,
@@ -568,6 +591,31 @@ inline void populate_symbols(aida_ghidra::architecture_t& arch,
 	aida_ghidra::populate_from_driver(db, base);
 	aida_ghidra::populate_from_symbol_store(db);
 	aida_ghidra::populate_default_noreturn(db);
+
+	diag::log_tagged_critical("dec_pdb", "populate_symbols_pre_apply_pdb_types");
+	DWORD seh_types = seh_apply_pdb_types(&arch);
+	if (seh_types != 0) {
+		std::string last_name = aida_ghidra::architecture_t::current_apply_pdb_name();
+		const char* last_stage = aida_ghidra::architecture_t::current_apply_pdb_stage();
+		diag::log_tagged_critical_fmt("dec_pdb",
+			"populate_symbols_apply_pdb_types_seh_fault code=0x%08X last_stage=%s last_name=%s",
+			seh_types,
+			last_stage ? last_stage : "<null>",
+			last_name.c_str());
+	}
+
+	diag::log_tagged_critical("dec_pdb", "populate_symbols_pre_apply_pdb_function_prototypes");
+	DWORD seh_protos = seh_apply_pdb_function_prototypes(&arch);
+	if (seh_protos != 0) {
+		std::string last_name = aida_ghidra::architecture_t::current_apply_pdb_name();
+		const char* last_stage = aida_ghidra::architecture_t::current_apply_pdb_stage();
+		diag::log_tagged_critical_fmt("dec_pdb",
+			"populate_symbols_apply_pdb_function_prototypes_seh_fault code=0x%08X last_stage=%s last_name=%s",
+			seh_protos,
+			last_stage ? last_stage : "<null>",
+			last_name.c_str());
+	}
+	diag::log_tagged_critical("dec_pdb", "populate_symbols_exit");
 }
 
 }

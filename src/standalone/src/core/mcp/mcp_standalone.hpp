@@ -105,4 +105,24 @@ namespace mcp_standalone
 
     void register_standalone_tools(server_t& server);
 
+    struct target_scope_t
+    {
+        bool        ok = false;
+        bool        swapped = false;
+        bool        resolved = false;
+        size_t      prev_active_idx = static_cast<size_t>(-1);
+        size_t      target_idx      = static_cast<size_t>(-1);
+        std::string resolved_id;
+        std::string err;
+
+        target_scope_t() = default;
+        target_scope_t(const target_scope_t&) = delete;
+        target_scope_t& operator=(const target_scope_t&) = delete;
+        target_scope_t(target_scope_t&&) noexcept;
+        target_scope_t& operator=(target_scope_t&&) noexcept;
+        ~target_scope_t();
+    };
+
+    target_scope_t resolve_target(const json& args, std::string* out_err);
+
 }

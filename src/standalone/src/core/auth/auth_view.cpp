@@ -1,4 +1,6 @@
+#define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+
 #include "auth_view.hpp"
 
 #include "auth_store.hpp"
@@ -17,40 +19,48 @@
 #include "blur_layer.hpp"
 #include "brand.hpp"
 #include "avatar.hpp"
+#include "empty_state.hpp"
 #include "fonts.hpp"
 #include "work_queue.hpp"
 #include "../helpers/globals.h"
 
+#include "provider_catalog.hpp"
+#include "provider_transforms.hpp"
+#include "standalone_settings.hpp"
+#include "settings_overlay.hpp"
+
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <windows.h>
 #include <shellapi.h>
 
+#include <nlohmann/json.hpp>
+
 #include "auth_browser_launch.hpp"
+#include "auth_http.hpp"
+
+extern settings_sa_t g_sa_settings;
 
 namespace aida {
 namespace auth_view {
 
 	namespace {
-
-		enum class row_kind_t : int {
-			oauth_claude_code = 0,
-			oauth_codex,
-			oauth_copilot,
-			api_anthropic,
-			api_openai,
-		};
 
 		enum class flow_phase_t : int {
 			idle = 0,
@@ -61,39 +71,32 @@ namespace auth_view {
 			error_state
 		};
 
-		struct row_def_t {
-			row_kind_t kind;
+		struct modal_brand_t {
 			const char* display_name;
 			const char* subtitle;
-			const char* store_key;
 			brand_glyph::kind_t glyph_kind;
 			ImU32 grad_top;
 			ImU32 grad_bot;
 			ImU32 ring;
-			bool is_oauth;
 		};
 
-		static const row_def_t k_rows[] = {
-			{ row_kind_t::oauth_claude_code, "Claude Code",     "Anthropic OAuth (PKCE)",
-			  "anthropic",      brand_glyph::kind_t::anthropic,
-			  IM_COL32(228, 168, 132, 255), IM_COL32(196, 124, 84, 255),
-			  IM_COL32(255, 200, 168, 220), true  },
-			{ row_kind_t::oauth_codex,       "OpenAI Codex",    "ChatGPT OAuth (PKCE)",
-			  "openai",         brand_glyph::kind_t::openai,
-			  IM_COL32(106, 220, 178, 255), IM_COL32(40, 168, 138, 255),
-			  IM_COL32(160, 240, 210, 220), true  },
-			{ row_kind_t::oauth_copilot,     "GitHub Copilot",  "GitHub Device Code",
-			  "github-copilot", brand_glyph::kind_t::github,
-			  IM_COL32(60, 64, 92, 255),    IM_COL32(28, 32, 52, 255),
-			  IM_COL32(150, 158, 198, 220), true  },
-			{ row_kind_t::api_anthropic,     "Anthropic API",   "Direct API key for api.anthropic.com",
-			  "anthropic",      brand_glyph::kind_t::generic,
-			  IM_COL32(228, 168, 132, 255), IM_COL32(196, 124, 84, 255),
-			  IM_COL32(255, 200, 168, 220), false },
-			{ row_kind_t::api_openai,        "OpenAI API",      "Direct API key for api.openai.com",
-			  "openai",         brand_glyph::kind_t::generic,
-			  IM_COL32(106, 220, 178, 255), IM_COL32(40, 168, 138, 255),
-			  IM_COL32(160, 240, 210, 220), false },
+		static const modal_brand_t k_brand_claude_code = {
+			"Claude Code",     "Anthropic OAuth (PKCE)",
+			brand_glyph::kind_t::anthropic,
+			IM_COL32(228, 168, 132, 255), IM_COL32(196, 124, 84, 255),
+			IM_COL32(255, 200, 168, 220)
+		};
+		static const modal_brand_t k_brand_codex = {
+			"OpenAI Codex",    "ChatGPT OAuth (PKCE)",
+			brand_glyph::kind_t::openai,
+			IM_COL32(106, 220, 178, 255), IM_COL32(40, 168, 138, 255),
+			IM_COL32(160, 240, 210, 220)
+		};
+		static const modal_brand_t k_brand_copilot = {
+			"GitHub Copilot",  "GitHub Device Code",
+			brand_glyph::kind_t::github,
+			IM_COL32(60, 64, 92, 255),    IM_COL32(28, 32, 52, 255),
+			IM_COL32(150, 158, 198, 220)
 		};
 
 		struct modal_anim_t {
@@ -144,6 +147,21 @@ namespace auth_view {
 			failure = 2,
 		};
 
+		struct test_result_t {
+			bool        completed = false;
+			bool        success = false;
+			int         latency_ms = 0;
+			int         http_status = 0;
+			std::string message;
+		};
+
+		struct refresh_state_t {
+			std::atomic<bool> in_flight{ false };
+			std::atomic<bool> completed{ false };
+			std::atomic<bool> success{ false };
+			std::string       message;
+		};
+
 		struct view_state_t {
 			std::mutex mtx;
 
@@ -184,9 +202,6 @@ namespace auth_view {
 			std::string last_failed_error;
 			std::atomic<bool> have_failed_event{ false };
 
-			char api_key_buf[5][1024]{};
-			bool api_key_show[5]{};
-
 			char copilot_ghe_buf[256]{};
 			std::atomic<bool> copilot_flow_started{ false };
 
@@ -195,15 +210,23 @@ namespace auth_view {
 			modal_anim_t claude_code_anim;
 
 			aida::ui::flash_t copilot_copy_flash;
-			std::vector<aida::ui::hover_state_t> row_hover;
+
+			std::string selected_provider_id;
+			refresh_state_t refresh;
+			std::atomic<bool> shutdown_flag{ false };
+
+			std::mutex pending_focus_mtx;
+			std::string pending_focus_provider;
+
+			int  chatbox_active_section = 0;
+			int  chatbox_provider_dropdown_index = 0;
+			char chatbox_key_buf[1024] = {};
+			bool chatbox_key_show = false;
+			std::map<std::string, test_result_t> validate_results;
+			std::map<std::string, std::shared_ptr<std::atomic<bool>>> validate_in_flight;
 		};
 
 		static view_state_t g_state;
-
-		static int row_index(row_kind_t k)
-		{
-			return static_cast<int>(k);
-		}
 
 		static void set_err_locked(const std::string& msg)
 		{
@@ -250,15 +273,6 @@ namespace auth_view {
 		static void open_url_in_browser(const std::string& url)
 		{
 			aida::auth::open_url_external(url);
-		}
-
-		static const row_def_t& row_def_for(row_kind_t k)
-		{
-			int n = static_cast<int>(sizeof(k_rows) / sizeof(k_rows[0]));
-			for (int i = 0; i < n; ++i) {
-				if (k_rows[i].kind == k) return k_rows[i];
-			}
-			return k_rows[0];
 		}
 
 		static void start_codex_login()
@@ -692,170 +706,6 @@ namespace auth_view {
 			}
 		}
 
-		static void render_provider_avatar(ImDrawList* dl, ImVec2 center, float radius,
-										   const row_def_t& def, float alpha)
-		{
-			if (def.is_oauth) {
-				brand_glyph::render(dl, def.glyph_kind, center, radius,
-					def.grad_top, def.grad_bot, def.ring, alpha);
-			} else {
-				aida::ui::avatar::render(dl, center, radius, def.display_name,
-					aida::ui::avatar::kind_t::gradient, true, alpha);
-			}
-		}
-
-		struct row_status_t {
-			std::string pill_text;
-			aida::ui::pill_kind_t pill_kind = aida::ui::pill_kind_t::neutral;
-			std::string detail_text;
-			bool logged_in = false;
-			bool expired = false;
-		};
-
-		static row_status_t compute_status(const row_def_t& def)
-		{
-			row_status_t s;
-			aida::auth::auth_info_t info;
-			bool have = aida::auth::store::get(def.store_key, info);
-
-			if (def.is_oauth) {
-				if (have && info.kind == aida::auth::auth_kind_t::oauth) {
-					int64_t now = now_unix();
-					if (info.expires_unix > 0 && info.expires_unix <= now) {
-						s.expired = true;
-						s.pill_text = "Token expired";
-						s.pill_kind = aida::ui::pill_kind_t::error;
-						s.detail_text = info.email.empty() ? info.account_id : info.email;
-					} else {
-						s.logged_in = true;
-						s.pill_text = info.expires_unix > 0
-							? format_relative_time(info.expires_unix)
-							: std::string("Logged in");
-						s.pill_kind = aida::ui::pill_kind_t::success;
-						s.detail_text = info.email.empty() ? info.account_id : info.email;
-						if (s.detail_text.empty()) s.detail_text = "Signed in";
-					}
-				} else if (have && info.kind == aida::auth::auth_kind_t::api && !info.api_key.empty()) {
-					s.pill_text = "API key active";
-					s.pill_kind = aida::ui::pill_kind_t::info;
-					s.detail_text = "Clear API key to use OAuth";
-				} else {
-					s.pill_text = "Logged out";
-					s.pill_kind = aida::ui::pill_kind_t::neutral;
-					s.detail_text = "Sign in with your account";
-				}
-			} else {
-				if (have && info.kind == aida::auth::auth_kind_t::api && !info.api_key.empty()) {
-					s.logged_in = true;
-					s.pill_text = "API key set";
-					s.pill_kind = aida::ui::pill_kind_t::success;
-					s.detail_text = mask_key(info.api_key);
-				} else if (have && info.kind == aida::auth::auth_kind_t::oauth) {
-					s.pill_text = "OAuth active";
-					s.pill_kind = aida::ui::pill_kind_t::info;
-					s.detail_text = "Sign out of OAuth to use API key";
-				} else {
-					s.pill_text = "Not configured";
-					s.pill_kind = aida::ui::pill_kind_t::neutral;
-					s.detail_text = "Paste your API key to enable";
-				}
-			}
-			return s;
-		}
-
-		static void save_api_key(const row_def_t& def, const std::string& key)
-		{
-			aida::auth::auth_info_t info;
-			aida::auth::store::get(def.store_key, info);
-			info.kind = aida::auth::auth_kind_t::api;
-			info.api_key = key;
-			info.access.clear();
-			info.refresh.clear();
-			info.expires_unix = 0;
-			info.email.clear();
-			info.account_id.clear();
-			if (!aida::auth::store::set(def.store_key, info)) {
-				std::lock_guard<std::mutex> lk(g_state.mtx);
-				set_err_locked("auth_view: failed to persist api key: " + aida::auth::store::last_error());
-				toast_notification::push("Failed to save API key",
-					toast_notification::toast_type_t::error, 5.0f);
-				return;
-			}
-			toast_notification::push(std::string(def.display_name) + " API key saved",
-				toast_notification::toast_type_t::info, 4.0f);
-		}
-
-		static void clear_credentials(const row_def_t& def, bool only_oauth, bool only_api)
-		{
-			aida::auth::auth_info_t info;
-			if (!aida::auth::store::get(def.store_key, info)) {
-				return;
-			}
-			if (only_oauth && info.kind != aida::auth::auth_kind_t::oauth) return;
-			if (only_api && info.kind != aida::auth::auth_kind_t::api) return;
-
-			const bool revoke_needed = info.kind == aida::auth::auth_kind_t::oauth
-				&& (!info.access.empty() || !info.refresh.empty());
-			const row_kind_t kind_copy = def.kind;
-			std::string captured_access = info.access;
-			std::string captured_refresh = info.refresh;
-
-			info = aida::auth::auth_info_t{};
-
-			if (!aida::auth::store::set(def.store_key, info)) {
-				toast_notification::push("Failed to clear credentials",
-					toast_notification::toast_type_t::error, 5.0f);
-				return;
-			}
-
-			if (revoke_needed) {
-				work_queue::post([kind_copy,
-					access = std::move(captured_access),
-					refresh = std::move(captured_refresh)]() {
-					switch (kind_copy) {
-					case row_kind_t::oauth_claude_code:
-						aida::auth::claude_code::revoke_tokens(access, refresh, std::string());
-						break;
-					case row_kind_t::oauth_codex:
-						aida::auth::codex::revoke_tokens(access, refresh, std::string());
-						break;
-					case row_kind_t::oauth_copilot:
-						aida::auth::copilot::revoke_tokens(access, refresh, std::string());
-						break;
-					default:
-						break;
-					}
-				});
-			}
-
-			toast_notification::push(std::string(def.display_name) + " signed out",
-				toast_notification::toast_type_t::info, 3.5f);
-		}
-
-		static bool refresh_token_for(row_kind_t k)
-		{
-			switch (k) {
-			case row_kind_t::oauth_claude_code:
-				return aida::auth::claude_code::refresh_token();
-			case row_kind_t::oauth_codex:
-				return aida::auth::codex::refresh_token();
-			case row_kind_t::oauth_copilot:
-				return aida::auth::copilot::refresh_token();
-			default:
-				return false;
-			}
-		}
-
-		static std::string refresh_last_error_for(row_kind_t k)
-		{
-			switch (k) {
-			case row_kind_t::oauth_claude_code: return aida::auth::claude_code::last_error();
-			case row_kind_t::oauth_codex:       return aida::auth::codex::last_error();
-			case row_kind_t::oauth_copilot:     return aida::auth::copilot::last_error();
-			default: return std::string{};
-			}
-		}
-
 		static bool eye_toggle_button(const char* id, bool* shown, ImVec2 size)
 		{
 			if (!shown) return false;
@@ -921,249 +771,975 @@ namespace auth_view {
 			return clicked;
 		}
 
-		static void render_provider_row(const row_def_t& def, float row_w, int idx)
+
+		struct provider_status_t {
+			std::string label;
+			aida::ui::pill_kind_t kind = aida::ui::pill_kind_t::neutral;
+			bool dot_pulse = false;
+			bool authenticated = false;
+			bool expired = false;
+			std::string detail;
+		};
+
+		static provider_status_t compute_provider_status(const std::string& provider_id)
 		{
-			const auto& th = aida::ui::resolved();
-
-			while ((int)g_state.row_hover.size() <= idx) {
-				g_state.row_hover.emplace_back();
+			provider_status_t s;
+			aida::auth::auth_info_t info;
+			const bool present = aida::auth::store::get(provider_id, info);
+			if (!present || info.kind == aida::auth::auth_kind_t::none) {
+				s.label = "Not connected";
+				s.kind = aida::ui::pill_kind_t::neutral;
+				return s;
 			}
-			auto& hov_state = g_state.row_hover[idx];
-
-			const float left_pad = 16.f;
-			const float avatar_radius = 22.f;
-			const float text_offset_x = left_pad + avatar_radius * 2.f + 16.f;
-			const float right_pad = 14.f;
-
-			row_status_t status = compute_status(def);
-
-			float ctrl_w_full = 0.f;
-			if (def.is_oauth) {
-				if (status.logged_in || status.expired) {
-					ctrl_w_full = 100.f + 8.f + 92.f;
-				} else {
-					ctrl_w_full = 188.f;
+			const int64_t now = now_unix();
+			if (info.kind == aida::auth::auth_kind_t::oauth) {
+				if (info.expires_unix > 0 && info.expires_unix <= now) {
+					s.label = "Token expired";
+					s.kind = aida::ui::pill_kind_t::warning;
+					s.dot_pulse = true;
+					s.expired = true;
+					s.detail = info.email.empty() ? info.account_id : info.email;
+					return s;
 				}
-			} else {
-				const float api_input_pref = 188.f;
-				const float api_check_w = 24.f;
-				const float api_save_w = 64.f;
-				const float api_clear_w = status.logged_in ? (6.f + 72.f) : 0.f;
-				ctrl_w_full = api_input_pref + 6.f + api_check_w + 8.f + api_save_w + api_clear_w;
+				s.label = info.expires_unix > 0 ? format_relative_time(info.expires_unix) : std::string("OAuth");
+				s.kind = aida::ui::pill_kind_t::success;
+				s.dot_pulse = true;
+				s.authenticated = true;
+				s.detail = info.email.empty() ? info.account_id : info.email;
+				if (s.detail.empty()) s.detail = "Signed in";
+				return s;
 			}
-
-			const float text_min_room = 220.f;
-			const bool stack_layout =
-				(row_w - text_offset_x - right_pad - 16.f - text_min_room) < ctrl_w_full;
-
-			const float row_h = stack_layout ? 140.f : 84.f;
-
-			ImVec2 origin = ImGui::GetCursorScreenPos();
-			ImDrawList* dl = ImGui::GetWindowDrawList();
-
-			ImGui::PushID(idx);
-			ImGui::SetCursorScreenPos(origin);
-			ImGui::SetNextItemAllowOverlap();
-			ImGui::InvisibleButton("##row_bg", ImVec2(row_w, row_h));
-			bool row_hovered = ImGui::IsItemHovered();
-			float hov = hov_state.tick(row_hovered, aida::ui::clock::dt(),
-				aida::motion::spring::balanced);
-
-			float lift = hov * 2.f;
-			ImVec2 a = ImVec2(origin.x, origin.y - lift);
-			ImVec2 b = ImVec2(origin.x + row_w, origin.y + row_h - lift);
-
-			if (hov > 0.05f) {
-				aida::ui::blur::render_drop_shadow(dl, a, b, 10.f, 4,
-					0.18f + 0.20f * hov, ImVec2(0.f, 4.f + 2.f * hov));
+			if (info.kind == aida::auth::auth_kind_t::api && !info.api_key.empty()) {
+				s.label = "API key set";
+				s.kind = aida::ui::pill_kind_t::success;
+				s.dot_pulse = false;
+				s.authenticated = true;
+				s.detail = mask_key(info.api_key);
+				return s;
 			}
-
-			ImU32 row_bg = aida::ui::mix(th.bg_elevated, th.panel_header, 0.45f + 0.30f * hov);
-			dl->AddRectFilled(a, b, row_bg, 10.f);
-
-			ImU32 border = aida::ui::mix(th.border_subtle, th.accent_dim, hov * 0.55f);
-			dl->AddRect(a, b, border, 10.f, 0, 1.f);
-
-			float ctrl_x;
-			float ctrl_avail;
-			if (stack_layout) {
-				ctrl_x = a.x + left_pad;
-				ctrl_avail = row_w - left_pad - right_pad;
-			} else {
-				ctrl_x = a.x + row_w - ctrl_w_full - right_pad;
-				ctrl_avail = ctrl_w_full;
+			if (info.kind == aida::auth::auth_kind_t::wellknown) {
+				s.label = "Well-known";
+				s.kind = aida::ui::pill_kind_t::info;
+				s.authenticated = true;
+				s.detail = "Configured";
+				return s;
 			}
-			float text_clip_right = stack_layout
-				? (b.x - right_pad)
-				: (ctrl_x - 14.f);
-
-			float avatar_cx = a.x + left_pad + avatar_radius;
-			float avatar_cy = stack_layout ? (a.y + 12.f + avatar_radius) : (a.y + row_h * 0.5f);
-
-			render_provider_avatar(dl, ImVec2(avatar_cx, avatar_cy), avatar_radius, def, 1.f);
-
-			float text_x = avatar_cx + avatar_radius + 16.f;
-			float text_y = a.y + 12.f;
-
-			ImFont* f_strong = aida::ui::fonts::body_strong();
-			ImFont* f_body = aida::ui::fonts::body();
-			ImFont* f_caption = aida::ui::fonts::caption();
-			const float row_fs = aida::ui::components::detail::ui_fs();
-			float fs_title = row_fs * 1.08f;
-			float fs_sub = row_fs * 0.96f;
-			float fs_detail = row_fs * 0.88f;
-
-			dl->PushClipRect(ImVec2(text_x - 2.f, a.y),
-				ImVec2(text_clip_right, b.y), true);
-
-			dl->AddText(f_strong, fs_title, ImVec2(text_x, text_y),
-				th.text_primary, def.display_name);
-
-			ImVec2 sub_size = f_body->CalcTextSizeA(fs_sub, FLT_MAX, 0.f, def.subtitle);
-			dl->AddText(f_body, fs_sub, ImVec2(text_x, text_y + sub_size.y + 4.f),
-				th.text_secondary, def.subtitle);
-
-			float pill_y = stack_layout
-				? (a.y + 12.f + avatar_radius * 2.f + 6.f)
-				: (a.y + row_h - 26.f);
-			ImGui::SetCursorScreenPos(ImVec2(text_x, pill_y));
-			aida::ui::pill_kind(status.pill_text.c_str(), status.pill_kind,
-				aida::ui::size_t_::sm, true);
-
-			if (!status.detail_text.empty()) {
-				float ps = ImGui::GetItemRectSize().x;
-				float detail_x = text_x + ps + 12.f;
-				dl->AddText(f_caption, fs_detail,
-					ImVec2(detail_x, pill_y + 3.f),
-					th.text_dim, status.detail_text.c_str());
-			}
-
-			dl->PopClipRect();
-
-			float ctrl_y = stack_layout
-				? (pill_y + 26.f)
-				: (a.y + (row_h - 32.f) * 0.5f);
-
-			ImGui::SetCursorScreenPos(ImVec2(ctrl_x, ctrl_y));
-
-			if (def.is_oauth) {
-				if (status.logged_in || status.expired) {
-					float refresh_w = 100.f;
-					float signout_w = 92.f;
-					float gap = 8.f;
-					if (refresh_w + gap + signout_w > ctrl_avail) {
-						float total = ctrl_avail - gap;
-						refresh_w = (total > 0.f) ? (total * 0.5f) : 100.f;
-						signout_w = (total > 0.f) ? (total * 0.5f) : 92.f;
-					}
-					ImGui::SetCursorScreenPos(ImVec2(ctrl_x, ctrl_y));
-					if (aida::ui::button("Refresh", aida::ui::button_kind_t::secondary,
-							aida::ui::size_t_::md, ImVec2(refresh_w, 32.f))) {
-						row_kind_t kind_copy = def.kind;
-						std::string name_copy = def.display_name;
-						work_queue::post([kind_copy, name_copy]() {
-							if (refresh_token_for(kind_copy)) {
-								toast_notification::push(name_copy + " token refreshed",
-									toast_notification::toast_type_t::info, 3.5f);
-							} else {
-								std::string err = refresh_last_error_for(kind_copy);
-								if (err.empty()) err = "refresh failed";
-								toast_notification::push(
-									name_copy + " refresh failed: " + err,
-									toast_notification::toast_type_t::error, 5.0f);
-							}
-						});
-					}
-
-					ImGui::SetCursorScreenPos(ImVec2(ctrl_x + refresh_w + gap, ctrl_y));
-					if (aida::ui::button("Sign out", aida::ui::button_kind_t::destructive,
-							aida::ui::size_t_::md, ImVec2(signout_w, 32.f))) {
-						clear_credentials(def, true, false);
-					}
-				} else {
-					bool busy =
-						(def.kind == row_kind_t::oauth_claude_code && g_state.claude_code_modal_open.load())
-						|| (def.kind == row_kind_t::oauth_codex && g_state.codex_modal_open.load())
-						|| (def.kind == row_kind_t::oauth_copilot && g_state.copilot_modal_open.load());
-					const char* label = busy ? "Signing in" : "Sign in";
-
-					float signin_w = (ctrl_avail < 188.f) ? ctrl_avail : 188.f;
-					ImGui::SetCursorScreenPos(ImVec2(ctrl_x, ctrl_y));
-					if (aida::ui::button(label, aida::ui::button_kind_t::primary,
-							aida::ui::size_t_::md, ImVec2(signin_w, 32.f),
-							busy, nullptr, busy) && !busy) {
-						if (def.kind == row_kind_t::oauth_claude_code) start_claude_code_login();
-						else if (def.kind == row_kind_t::oauth_codex)  start_codex_login();
-						else if (def.kind == row_kind_t::oauth_copilot) open_copilot_modal();
-					}
-				}
-			} else {
-				int b_idx = row_index(def.kind);
-				if (b_idx < 0 || b_idx >= 5) b_idx = 0;
-
-				float check_w = 24.f;
-				float save_w = 64.f;
-				float clear_w = status.logged_in ? 72.f : 0.f;
-				float gap_input_check = 6.f;
-				float gap_check_save = 8.f;
-				float gap_save_clear = status.logged_in ? 6.f : 0.f;
-				float reserved = check_w + save_w + clear_w
-					+ gap_input_check + gap_check_save + gap_save_clear;
-				float input_w = ctrl_avail - reserved;
-				if (input_w > 188.f) input_w = 188.f;
-				if (input_w < 96.f) input_w = 96.f;
-
-				ImGui::SetCursorScreenPos(ImVec2(ctrl_x, ctrl_y));
-				ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(th.panel_header));
-				ImGui::SetNextItemWidth(input_w);
-				ImGuiInputTextFlags flags = ImGuiInputTextFlags_None;
-				if (!g_state.api_key_show[b_idx])
-					flags |= ImGuiInputTextFlags_Password;
-				ImGui::InputTextWithHint("##api_key", "Paste API key",
-					g_state.api_key_buf[b_idx],
-					sizeof(g_state.api_key_buf[b_idx]), flags);
-				ImGui::PopStyleColor();
-
-				ImGui::SameLine(0.f, gap_input_check);
-				eye_toggle_button("##api_key_reveal", &g_state.api_key_show[b_idx],
-					ImVec2(check_w, 32.f));
-
-				ImGui::SameLine(0.f, gap_check_save);
-				ImVec2 save_pos = ImGui::GetCursorScreenPos();
-				ImGui::SetCursorScreenPos(save_pos);
-				if (aida::ui::button("Save", aida::ui::button_kind_t::primary,
-						aida::ui::size_t_::md, ImVec2(save_w, 32.f))) {
-					std::string k = g_state.api_key_buf[b_idx];
-					if (!k.empty()) {
-						save_api_key(def, k);
-						SecureZeroMemory(g_state.api_key_buf[b_idx],
-							sizeof(g_state.api_key_buf[b_idx]));
-					}
-				}
-				if (status.logged_in) {
-					ImGui::SameLine(0.f, gap_save_clear);
-					ImVec2 clr_pos = ImGui::GetCursorScreenPos();
-					ImGui::SetCursorScreenPos(clr_pos);
-					if (aida::ui::button("Clear", aida::ui::button_kind_t::destructive,
-							aida::ui::size_t_::md, ImVec2(clear_w, 32.f))) {
-						clear_credentials(def, false, true);
-					}
-				}
-			}
-
-			ImGui::PopID();
-
-			ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + row_h + 8.f));
+			s.label = "Connected";
+			s.kind = aida::ui::pill_kind_t::success;
+			s.authenticated = true;
+			return s;
 		}
 
-		static void render_providers_tab(float panel_w, float panel_h)
+		static std::string format_cost_pair(double in_per_m, double out_per_m)
 		{
-			(void)panel_h;
-			float row_w = panel_w - 16.f;
-			ImGui::Dummy(ImVec2(0.f, 8.f));
-			for (int i = 0; i < static_cast<int>(sizeof(k_rows) / sizeof(k_rows[0])); ++i) {
-				render_provider_row(k_rows[i], row_w, i);
+			char buf[96];
+			if (in_per_m <= 0.0 && out_per_m <= 0.0) {
+				std::snprintf(buf, sizeof(buf), "free");
+			} else {
+				std::snprintf(buf, sizeof(buf), "$%.2f / $%.2f per M", in_per_m, out_per_m);
 			}
+			return std::string(buf);
+		}
+
+		static std::string format_context_pretty(int64_t context)
+		{
+			if (context <= 0) return std::string("ctx ?");
+			char buf[32];
+			if (context >= 1000)
+				std::snprintf(buf, sizeof(buf), "ctx %lldK", static_cast<long long>(context / 1000));
+			else
+				std::snprintf(buf, sizeof(buf), "ctx %lld", static_cast<long long>(context));
+			return std::string(buf);
+		}
+
+		static std::vector<const aida::provider::model_info_t*> sorted_models_for(const std::string& provider_id)
+		{
+			std::vector<const aida::provider::model_info_t*> out;
+			const auto* prov = aida::provider::catalog::get_provider(provider_id);
+			if (!prov) return out;
+			out.reserve(prov->model_ids.size());
+			for (const auto& mid : prov->model_ids) {
+				const auto* m = aida::provider::catalog::get_model(provider_id, mid);
+				if (m && m->status != aida::provider::model_info_t::status_t::deprecated)
+					out.push_back(m);
+			}
+			std::sort(out.begin(), out.end(),
+				[](const aida::provider::model_info_t* a, const aida::provider::model_info_t* b) {
+					const double ca = a->cost.input_per_million + a->cost.output_per_million;
+					const double cb = b->cost.input_per_million + b->cost.output_per_million;
+					if (ca != cb) return ca < cb;
+					return a->id < b->id;
+				});
+			return out;
+		}
+
+		static std::string preferred_model_id(const std::string& provider_id)
+		{
+			auto& prefs = g_sa_settings.preferred_model_per_provider;
+			auto it = prefs.find(provider_id);
+			if (it != prefs.end() && !it->second.empty()) {
+				if (aida::provider::catalog::get_model(provider_id, it->second) != nullptr)
+					return it->second;
+			}
+			const auto* def = aida::provider::catalog::default_model(provider_id);
+			if (def) return def->id;
+			const auto* p = aida::provider::catalog::get_provider(provider_id);
+			if (p && !p->model_ids.empty()) return p->model_ids.front();
+			return std::string();
+		}
+
+		static void start_refresh_catalog()
+		{
+			if (g_state.shutdown_flag.load()) return;
+			bool expected = false;
+			if (!g_state.refresh.in_flight.compare_exchange_strong(expected, true)) return;
+			g_state.refresh.completed.store(false);
+			g_state.refresh.success.store(false);
+			{
+				std::lock_guard<std::mutex> lk(g_state.mtx);
+				g_state.refresh.message.clear();
+			}
+			const bool posted = work_queue::post([]() {
+				if (g_state.shutdown_flag.load()) {
+					g_state.refresh.in_flight.store(false);
+					g_state.refresh.completed.store(false);
+					return;
+				}
+				const bool ok = aida::provider::catalog::fetch_and_cache(10000);
+				if (g_state.shutdown_flag.load()) {
+					g_state.refresh.in_flight.store(false);
+					g_state.refresh.completed.store(false);
+					return;
+				}
+				{
+					std::lock_guard<std::mutex> lk(g_state.mtx);
+					g_state.refresh.success.store(ok);
+					g_state.refresh.message = ok ? std::string("Catalog updated")
+						: aida::provider::catalog::last_error();
+				}
+				g_state.refresh.completed.store(true);
+				g_state.refresh.in_flight.store(false);
+			});
+			if (!posted) {
+				g_state.refresh.in_flight.store(false);
+				g_state.refresh.completed.store(false);
+			}
+		}
+
+
+
+		static void clear_credentials_for(const std::string& provider_id)
+		{
+			aida::auth::auth_info_t info;
+			if (!aida::auth::store::get(provider_id, info)) return;
+			const bool revoke_oauth = (info.kind == aida::auth::auth_kind_t::oauth)
+				&& (!info.access.empty() || !info.refresh.empty());
+			std::string access = info.access;
+			std::string refresh = info.refresh;
+			info = aida::auth::auth_info_t{};
+			if (!aida::auth::store::set(provider_id, info)) {
+				toast_notification::push("Failed to sign out",
+					toast_notification::toast_type_t::error, 5.0f);
+				return;
+			}
+			if (revoke_oauth) {
+				work_queue::post([provider_id, access, refresh]() {
+					if (provider_id == "anthropic")
+						aida::auth::claude_code::revoke_tokens(access, refresh, std::string());
+					else if (provider_id == "openai")
+						aida::auth::codex::revoke_tokens(access, refresh, std::string());
+					else if (provider_id == "github-copilot")
+						aida::auth::copilot::revoke_tokens(access, refresh, std::string());
+				});
+			}
+			toast_notification::push(provider_id + " signed out",
+				toast_notification::toast_type_t::info, 3.5f);
+		}
+
+		struct chatbox_provider_entry_t;
+		static const chatbox_provider_entry_t* chatbox_entry_for(const std::string& id);
+		static int chatbox_dropdown_index_for(const std::string& provider_id);
+		static void chatbox_load_persisted_key(const std::string& provider_id);
+
+		static void apply_pending_focus()
+		{
+			std::string requested;
+			{
+				std::lock_guard<std::mutex> lk(g_state.pending_focus_mtx);
+				requested.swap(g_state.pending_focus_provider);
+			}
+			if (requested.empty()) {
+				std::string overlay_req = aida::settings_overlay::consume_pending_provider_focus();
+				if (overlay_req.empty()) return;
+				requested = std::move(overlay_req);
+			}
+			g_state.selected_provider_id = requested;
+			if (chatbox_entry_for(requested) != nullptr) {
+				g_state.chatbox_active_section = 0;
+				g_state.chatbox_provider_dropdown_index = chatbox_dropdown_index_for(requested);
+				chatbox_load_persisted_key(requested);
+			} else {
+				g_state.chatbox_active_section = 1;
+			}
+		}
+
+		struct chatbox_provider_entry_t {
+			std::string id;
+			std::string display_name;
+			std::string console_url;
+			std::string fallback_base;
+			std::string models_path;
+			std::string key_header_name;
+			std::string key_header_prefix;
+			std::string key_query_param;
+		};
+
+		static const std::vector<chatbox_provider_entry_t>& chatbox_provider_catalog()
+		{
+			static const std::vector<chatbox_provider_entry_t> entries = {
+				{ "anthropic",  "Anthropic",       "https://console.anthropic.com/settings/keys",
+				  "https://api.anthropic.com",          "/v1/models",
+				  "x-api-key",        "",            ""    },
+				{ "openai",     "OpenAI",          "https://platform.openai.com/api-keys",
+				  "https://api.openai.com",             "/v1/models",
+				  "Authorization",    "Bearer ",     ""    },
+				{ "openrouter", "OpenRouter",      "https://openrouter.ai/settings/keys",
+				  "https://openrouter.ai/api",          "/v1/models",
+				  "Authorization",    "Bearer ",     ""    },
+				{ "google",     "Google Gemini",   "https://aistudio.google.com/app/apikey",
+				  "https://generativelanguage.googleapis.com", "/v1beta/models",
+				  "",                 "",            "key" },
+				{ "mistral",    "Mistral",         "https://console.mistral.ai/api-keys/",
+				  "https://api.mistral.ai",             "/v1/models",
+				  "Authorization",    "Bearer ",     ""    },
+				{ "groq",       "Groq",            "https://console.groq.com/keys",
+				  "https://api.groq.com",               "/openai/v1/models",
+				  "Authorization",    "Bearer ",     ""    },
+				{ "deepseek",   "DeepSeek",        "https://platform.deepseek.com/api_keys",
+				  "https://api.deepseek.com",           "/v1/models",
+				  "Authorization",    "Bearer ",     ""    },
+				{ "xai",        "xAI Grok",        "https://console.x.ai/",
+				  "https://api.x.ai",                   "/v1/models",
+				  "Authorization",    "Bearer ",     ""    },
+				{ "cerebras",   "Cerebras",        "https://cloud.cerebras.ai/?tab=api-keys",
+				  "https://api.cerebras.ai",            "/v1/models",
+				  "Authorization",    "Bearer ",     ""    },
+			};
+			return entries;
+		}
+
+		static int count_models_in_response(const std::string& provider_id, const std::string& body)
+		{
+			if (body.empty()) return 0;
+			try {
+				auto json = nlohmann::json::parse(body);
+				if (provider_id == "anthropic" && json.is_object() && json.contains("data") && json["data"].is_array())
+					return static_cast<int>(json["data"].size());
+				if ((provider_id == "openai" || provider_id == "openrouter" || provider_id == "mistral"
+					|| provider_id == "groq" || provider_id == "deepseek" || provider_id == "xai"
+					|| provider_id == "cerebras")
+					&& json.is_object() && json.contains("data") && json["data"].is_array())
+					return static_cast<int>(json["data"].size());
+				if (provider_id == "google" && json.is_object() && json.contains("models") && json["models"].is_array())
+					return static_cast<int>(json["models"].size());
+				if (json.is_object() && json.contains("data") && json["data"].is_array())
+					return static_cast<int>(json["data"].size());
+				if (json.is_array())
+					return static_cast<int>(json.size());
+			} catch (...) {
+			}
+			return 0;
+		}
+
+		static std::string extract_error_from_body(const std::string& body)
+		{
+			if (body.empty()) return std::string();
+			try {
+				auto json = nlohmann::json::parse(body);
+				if (json.is_object()) {
+					if (json.contains("error")) {
+						const auto& e = json["error"];
+						if (e.is_string()) return e.get<std::string>();
+						if (e.is_object()) {
+							if (e.contains("message") && e["message"].is_string())
+								return e["message"].get<std::string>();
+							if (e.contains("code") && e["code"].is_string())
+								return e["code"].get<std::string>();
+						}
+					}
+					if (json.contains("message") && json["message"].is_string())
+						return json["message"].get<std::string>();
+				}
+			} catch (...) {
+			}
+			std::string snippet = body.substr(0, 200);
+			for (char& c : snippet) if (c == '\n' || c == '\r') c = ' ';
+			return snippet;
+		}
+
+		static const chatbox_provider_entry_t* chatbox_entry_for(const std::string& id)
+		{
+			const auto& cat = chatbox_provider_catalog();
+			for (const auto& e : cat) if (e.id == id) return &e;
+			return nullptr;
+		}
+
+		static void run_chatbox_validate(const std::string& provider_id, const std::string& key)
+		{
+			if (g_state.shutdown_flag.load()) return;
+			const chatbox_provider_entry_t* entry = chatbox_entry_for(provider_id);
+			if (entry == nullptr || key.empty()) return;
+
+			std::shared_ptr<std::atomic<bool>> flag;
+			{
+				std::lock_guard<std::mutex> lk(g_state.mtx);
+				auto it = g_state.validate_in_flight.find(provider_id);
+				if (it != g_state.validate_in_flight.end() && it->second && it->second->load()) return;
+				flag = std::make_shared<std::atomic<bool>>(true);
+				g_state.validate_in_flight[provider_id] = flag;
+				test_result_t pending;
+				pending.completed = false;
+				g_state.validate_results[provider_id] = pending;
+			}
+
+			const std::string captured_id = provider_id;
+			const std::string captured_key = key;
+			chatbox_provider_entry_t entry_copy = *entry;
+
+			const bool posted = work_queue::post([captured_id, captured_key, entry_copy, flag]() {
+				if (g_state.shutdown_flag.load()) {
+					std::lock_guard<std::mutex> lk(g_state.mtx);
+					if (flag) flag->store(false);
+					g_state.validate_in_flight.erase(captured_id);
+					return;
+				}
+
+				std::string base_url;
+				aida::auth::auth_info_t tmp_info;
+				tmp_info.api_key = captured_key;
+				std::string resolved = aida::provider::transforms::resolve_endpoint(
+					captured_id, preferred_model_id(captured_id), tmp_info);
+				if (!resolved.empty() && resolved.rfind("http", 0) == 0)
+					base_url = resolved;
+				if (base_url.empty()) {
+					const auto* prov = aida::provider::catalog::get_provider(captured_id);
+					if (prov && !prov->base_url.empty()) base_url = prov->base_url;
+				}
+				if (base_url.empty()) base_url = entry_copy.fallback_base;
+				while (!base_url.empty() && base_url.back() == '/') base_url.pop_back();
+
+				std::string url = base_url + entry_copy.models_path;
+				if (!entry_copy.key_query_param.empty()) {
+					url += (url.find('?') == std::string::npos ? '?' : '&');
+					url += entry_copy.key_query_param;
+					url += '=';
+					url += captured_key;
+				}
+
+				aida::auth::http::header_list_t headers;
+				headers.emplace_back("User-Agent", "AiDAStandalone/1.0");
+				headers.emplace_back("Accept", "application/json");
+				if (captured_id == "anthropic")
+					headers.emplace_back("anthropic-version", "2023-06-01");
+				if (captured_id == "openrouter") {
+					headers.emplace_back("HTTP-Referer", "https://aida.dev/");
+					headers.emplace_back("X-Title", "AiDA");
+				}
+				if (!entry_copy.key_header_name.empty()) {
+					headers.emplace_back(entry_copy.key_header_name,
+						entry_copy.key_header_prefix + captured_key);
+				}
+
+				const auto t0 = std::chrono::steady_clock::now();
+				aida::auth::http::response_t resp = aida::auth::http::get(url, headers, 14);
+				const auto t1 = std::chrono::steady_clock::now();
+
+				test_result_t result;
+				result.completed = true;
+				result.latency_ms = static_cast<int>(
+					std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+
+				if (g_state.shutdown_flag.load()) {
+					std::lock_guard<std::mutex> lk(g_state.mtx);
+					if (flag) flag->store(false);
+					g_state.validate_in_flight.erase(captured_id);
+					g_state.validate_results.erase(captured_id);
+					return;
+				}
+
+				if (!resp.ok && resp.status == 0) {
+					result.success = false;
+					result.message = resp.error.empty()
+						? std::string("Transport error")
+						: resp.error;
+				} else {
+					result.http_status = resp.status;
+					if (resp.status >= 200 && resp.status < 300) {
+						int n = count_models_in_response(captured_id, resp.body);
+						result.success = true;
+						char buf[96];
+						if (n > 0) {
+							std::snprintf(buf, sizeof(buf), "Connected - %d model%s available",
+								n, n == 1 ? "" : "s");
+						} else {
+							std::snprintf(buf, sizeof(buf), "Connected (HTTP %d)", resp.status);
+						}
+						result.message = buf;
+					} else if (resp.status == 401 || resp.status == 403) {
+						result.success = false;
+						std::string detail = extract_error_from_body(resp.body);
+						char buf[256];
+						std::snprintf(buf, sizeof(buf), "HTTP %d - %s", resp.status,
+							detail.empty() ? "invalid api key" : detail.c_str());
+						result.message = buf;
+					} else {
+						result.success = false;
+						std::string detail = extract_error_from_body(resp.body);
+						char buf[320];
+						std::snprintf(buf, sizeof(buf), "HTTP %d - %s", resp.status,
+							detail.empty() ? "request failed" : detail.c_str());
+						result.message = buf;
+					}
+				}
+
+				if (result.success) {
+					aida::auth::auth_info_t info;
+					aida::auth::store::get(captured_id, info);
+					info.kind = aida::auth::auth_kind_t::api;
+					info.api_key = captured_key;
+					info.access.clear();
+					info.refresh.clear();
+					info.expires_unix = 0;
+					info.email.clear();
+					info.account_id.clear();
+					if (!aida::auth::store::set(captured_id, info)) {
+						result.success = false;
+						result.message = std::string("Connected, but failed to persist key: ")
+							+ aida::auth::store::last_error();
+					} else {
+						const std::string mid = preferred_model_id(captured_id);
+						if (!mid.empty()) {
+							g_sa_settings.set_selection(captured_id, mid);
+							auto* prof = g_sa_settings.get_active_profile();
+							if (prof != nullptr) {
+								prof->model = mid;
+								g_sa_settings.sync_legacy_fields_from_active_profile();
+							}
+							g_sa_settings.save();
+							aida::events::model_changed_t evt;
+							evt.session_id.clear();
+							evt.provider_id = captured_id;
+							evt.model_id = mid;
+							aida::events::publish(aida::events::event_model_changed, evt);
+						}
+					}
+				}
+
+				std::lock_guard<std::mutex> lk(g_state.mtx);
+				g_state.validate_results[captured_id] = result;
+				if (flag) flag->store(false);
+
+				if (result.success) {
+					toast_notification::push(captured_id + " connected",
+						toast_notification::toast_type_t::info, 3.5f);
+				}
+			});
+
+			if (!posted) {
+				std::lock_guard<std::mutex> lk(g_state.mtx);
+				if (flag) flag->store(false);
+				g_state.validate_in_flight.erase(provider_id);
+				g_state.validate_results.erase(provider_id);
+			}
+		}
+
+		static int chatbox_dropdown_index_for(const std::string& provider_id)
+		{
+			const auto& cat = chatbox_provider_catalog();
+			for (size_t i = 0; i < cat.size(); ++i)
+				if (cat[i].id == provider_id) return static_cast<int>(i);
+			return 0;
+		}
+
+		static void chatbox_load_persisted_key(const std::string& provider_id)
+		{
+			aida::auth::auth_info_t info;
+			if (aida::auth::store::get(provider_id, info)
+				&& info.kind == aida::auth::auth_kind_t::api
+				&& !info.api_key.empty()) {
+				std::snprintf(g_state.chatbox_key_buf, sizeof(g_state.chatbox_key_buf),
+					"%s", info.api_key.c_str());
+			} else {
+				g_state.chatbox_key_buf[0] = '\0';
+			}
+			g_state.chatbox_key_show = false;
+		}
+
+		struct oauth_entry_t {
+			const char* provider_id;
+			const char* display_name;
+			const char* description;
+			brand_glyph::kind_t glyph;
+			ImU32 grad_top;
+			ImU32 grad_bot;
+			ImU32 ring;
+		};
+
+		static const std::vector<oauth_entry_t>& oauth_catalog()
+		{
+			static const std::vector<oauth_entry_t> entries = {
+				{ "anthropic",      "Claude Code",     "Anthropic OAuth (PKCE) - claude.com",
+				  brand_glyph::kind_t::anthropic,
+				  IM_COL32(228, 168, 132, 255), IM_COL32(196, 124, 84, 255), IM_COL32(255, 200, 168, 220) },
+				{ "openai",         "OpenAI Codex",    "ChatGPT OAuth (PKCE) - chatgpt.com",
+				  brand_glyph::kind_t::openai,
+				  IM_COL32(106, 220, 178, 255), IM_COL32(40, 168, 138, 255), IM_COL32(160, 240, 210, 220) },
+				{ "github-copilot", "GitHub Copilot",  "GitHub Device Code - github.com/login/device",
+				  brand_glyph::kind_t::github,
+				  IM_COL32(60, 64, 92, 255),    IM_COL32(28, 32, 52, 255),   IM_COL32(150, 158, 198, 220) },
+			};
+			return entries;
+		}
+
+		static void render_chatbox_api_section(float origin_x, float origin_y, float section_w, float section_h)
+		{
+			const auto& th = aida::ui::resolved();
+			ImDrawList* dl = ImGui::GetWindowDrawList();
+			const float pad = 18.f;
+			const auto& cat = chatbox_provider_catalog();
+			if (cat.empty()) return;
+
+			if (g_state.chatbox_provider_dropdown_index < 0
+				|| g_state.chatbox_provider_dropdown_index >= static_cast<int>(cat.size())) {
+				g_state.chatbox_provider_dropdown_index = 0;
+			}
+			static std::string s_last_loaded_for_provider;
+			const std::string current_provider_id =
+				cat[g_state.chatbox_provider_dropdown_index].id;
+			if (s_last_loaded_for_provider != current_provider_id) {
+				s_last_loaded_for_provider = current_provider_id;
+				chatbox_load_persisted_key(current_provider_id);
+			}
+
+			float cy = origin_y + pad;
+
+			dl->AddText(aida::ui::fonts::body_em(),
+				aida::ui::components::detail::ui_fs() * 0.95f,
+				ImVec2(origin_x + pad, cy),
+				th.text_secondary, "Provider");
+			cy += 22.f;
+
+			ImGui::SetCursorScreenPos(ImVec2(origin_x + pad, cy));
+			ImGui::SetNextItemWidth(section_w - pad * 2.f);
+			std::vector<const char*> names_storage;
+			names_storage.reserve(cat.size());
+			for (const auto& e : cat) names_storage.push_back(e.display_name.c_str());
+			int prev_dd = g_state.chatbox_provider_dropdown_index;
+			if (ImGui::Combo("##chatbox_provider_dd",
+					&g_state.chatbox_provider_dropdown_index,
+					names_storage.data(),
+					static_cast<int>(names_storage.size()))) {
+				if (prev_dd != g_state.chatbox_provider_dropdown_index) {
+					chatbox_load_persisted_key(
+						cat[g_state.chatbox_provider_dropdown_index].id);
+					s_last_loaded_for_provider =
+						cat[g_state.chatbox_provider_dropdown_index].id;
+				}
+			}
+			cy += 40.f;
+
+			const chatbox_provider_entry_t& selected = cat[g_state.chatbox_provider_dropdown_index];
+			const provider_status_t status = compute_provider_status(selected.id);
+
+			ImGui::SetCursorScreenPos(ImVec2(origin_x + pad, cy));
+			aida::ui::pill_kind(status.label.c_str(), status.kind,
+				aida::ui::size_t_::sm, status.dot_pulse);
+			if (!status.detail.empty()) {
+				ImGui::SameLine(0.f, 10.f);
+				ImGui::PushStyleColor(ImGuiCol_Text,
+					ImGui::ColorConvertU32ToFloat4(th.text_dim));
+				ImGui::TextUnformatted(status.detail.c_str());
+				ImGui::PopStyleColor();
+			}
+			cy += 32.f;
+
+			dl->AddText(aida::ui::fonts::body_em(),
+				aida::ui::components::detail::ui_fs() * 0.95f,
+				ImVec2(origin_x + pad, cy),
+				th.text_secondary, "API key");
+			cy += 22.f;
+
+			const float eye_w = 36.f;
+			const float input_h = 36.f;
+			const float input_w = section_w - pad * 2.f - eye_w - 8.f;
+			ImGui::SetCursorScreenPos(ImVec2(origin_x + pad, cy));
+			ImGui::PushStyleColor(ImGuiCol_FrameBg,
+				ImGui::ColorConvertU32ToFloat4(th.panel_header));
+			ImGui::SetNextItemWidth(input_w);
+			ImGuiInputTextFlags ifl = ImGuiInputTextFlags_None;
+			if (!g_state.chatbox_key_show) ifl |= ImGuiInputTextFlags_Password;
+			ImGui::InputTextWithHint("##chatbox_api_key", "Paste API key",
+				g_state.chatbox_key_buf, sizeof(g_state.chatbox_key_buf), ifl);
+			ImGui::PopStyleColor();
+			ImGui::SameLine(0.f, 8.f);
+			eye_toggle_button("##chatbox_api_key_eye", &g_state.chatbox_key_show,
+				ImVec2(eye_w, input_h));
+			cy += input_h + 12.f;
+
+			test_result_t cur_res;
+			bool have_res = false;
+			bool busy = false;
+			{
+				std::lock_guard<std::mutex> lk(g_state.mtx);
+				auto it = g_state.validate_in_flight.find(selected.id);
+				if (it != g_state.validate_in_flight.end() && it->second)
+					busy = it->second->load();
+				auto rit = g_state.validate_results.find(selected.id);
+				if (rit != g_state.validate_results.end()) {
+					cur_res = rit->second;
+					have_res = cur_res.completed;
+				}
+			}
+
+			ImGui::SetCursorScreenPos(ImVec2(origin_x + pad, cy));
+			const char* save_label = busy ? "Verifying..." : "Save & verify";
+			if (aida::ui::button(save_label,
+					aida::ui::button_kind_t::accent_gradient,
+					aida::ui::size_t_::md,
+					ImVec2(180.f, 36.f),
+					busy, nullptr, busy)) {
+				if (!busy) {
+					std::string k = g_state.chatbox_key_buf;
+					if (k.empty()) {
+						toast_notification::push("Enter an API key first",
+							toast_notification::toast_type_t::warning, 3.0f);
+					} else {
+						run_chatbox_validate(selected.id, k);
+					}
+				}
+			}
+			ImGui::SameLine(0.f, 10.f);
+			if (status.authenticated) {
+				if (aida::ui::button("Clear",
+						aida::ui::button_kind_t::destructive,
+						aida::ui::size_t_::md,
+						ImVec2(100.f, 36.f))) {
+					clear_credentials_for(selected.id);
+					SecureZeroMemory(g_state.chatbox_key_buf, sizeof(g_state.chatbox_key_buf));
+					g_state.chatbox_key_show = false;
+					std::lock_guard<std::mutex> lk(g_state.mtx);
+					g_state.validate_results.erase(selected.id);
+				}
+				ImGui::SameLine(0.f, 10.f);
+			}
+			if (!selected.console_url.empty()) {
+				if (aida::ui::button("Get key",
+						aida::ui::button_kind_t::secondary,
+						aida::ui::size_t_::md,
+						ImVec2(120.f, 36.f))) {
+					aida::auth::open_url_external(selected.console_url);
+				}
+			}
+			cy += 48.f;
+
+			if (busy) {
+				ImGui::SetCursorScreenPos(ImVec2(origin_x + pad, cy));
+				ImGui::PushStyleColor(ImGuiCol_Text,
+					ImGui::ColorConvertU32ToFloat4(th.text_secondary));
+				ImGui::TextUnformatted("Calling /models endpoint to verify the key...");
+				ImGui::PopStyleColor();
+				cy += 24.f;
+			} else if (have_res) {
+				const ImU32 line_col = cur_res.success ? th.success : th.error;
+				ImGui::SetCursorScreenPos(ImVec2(origin_x + pad, cy));
+				ImGui::PushStyleColor(ImGuiCol_Text,
+					ImGui::ColorConvertU32ToFloat4(line_col));
+				char buf[400];
+				if (cur_res.success) {
+					std::snprintf(buf, sizeof(buf), "%s  (%dms)",
+						cur_res.message.c_str(), cur_res.latency_ms);
+				} else {
+					std::snprintf(buf, sizeof(buf), "Failed: %s",
+						cur_res.message.c_str());
+				}
+				ImGui::PushTextWrapPos(origin_x + section_w - pad);
+				ImGui::TextWrapped("%s", buf);
+				ImGui::PopTextWrapPos();
+				ImGui::PopStyleColor();
+				cy += 56.f;
+			}
+
+			if (status.authenticated) {
+				ImGui::SetCursorScreenPos(ImVec2(origin_x + pad, cy));
+				ImGui::PushStyleColor(ImGuiCol_Text,
+					ImGui::ColorConvertU32ToFloat4(th.text_secondary));
+				ImGui::TextUnformatted("Default model for chat");
+				ImGui::PopStyleColor();
+				cy += 22.f;
+
+				ImGui::SetCursorScreenPos(ImVec2(origin_x + pad, cy));
+				ImGui::SetNextItemWidth(section_w - pad * 2.f);
+				const std::string current_mid = preferred_model_id(selected.id);
+				const auto* current_m = current_mid.empty()
+					? nullptr : aida::provider::catalog::get_model(selected.id, current_mid);
+				const std::string preview = current_m ? current_m->name : std::string("(no model)");
+				if (ImGui::BeginCombo("##chatbox_default_model", preview.c_str())) {
+					const auto models = sorted_models_for(selected.id);
+					for (const auto* m : models) {
+						const bool is_sel = (current_mid == m->id);
+						char label[200];
+						std::snprintf(label, sizeof(label), "%s   %s   %s##chatbox_default_model_%s",
+							m->name.c_str(),
+							format_cost_pair(m->cost.input_per_million, m->cost.output_per_million).c_str(),
+							format_context_pretty(m->limit.context).c_str(),
+							m->id.c_str());
+						ImGui::PushID(m->id.c_str());
+						if (ImGui::Selectable(label, is_sel)) {
+							g_sa_settings.preferred_model_per_provider[selected.id] = m->id;
+							g_sa_settings.set_selection(selected.id, m->id);
+							auto* prof = g_sa_settings.get_active_profile();
+							if (prof != nullptr) {
+								prof->model = m->id;
+								g_sa_settings.sync_legacy_fields_from_active_profile();
+							}
+							g_sa_settings.save();
+							aida::events::model_changed_t evt;
+							evt.session_id.clear();
+							evt.provider_id = selected.id;
+							evt.model_id = m->id;
+							aida::events::publish(aida::events::event_model_changed, evt);
+						}
+						if (is_sel) ImGui::SetItemDefaultFocus();
+						ImGui::PopID();
+					}
+					ImGui::EndCombo();
+				}
+				cy += 44.f;
+			}
+
+			(void)section_h;
+		}
+
+		static void render_chatbox_oauth_section(float origin_x, float origin_y, float section_w, float section_h)
+		{
+			const auto& th = aida::ui::resolved();
+			ImDrawList* dl = ImGui::GetWindowDrawList();
+			const float pad = 18.f;
+			const auto& entries = oauth_catalog();
+
+			float cy = origin_y + pad;
+
+			dl->AddText(aida::ui::fonts::body_em(),
+				aida::ui::components::detail::ui_fs() * 0.95f,
+				ImVec2(origin_x + pad, cy),
+				th.text_secondary,
+				"Sign in with your browser - PKCE tokens stored in DPAPI-protected auth.json.");
+			cy += 28.f;
+
+			const float row_h = 84.f;
+			const float row_gap = 12.f;
+			const float row_w = section_w - pad * 2.f;
+
+			for (size_t i = 0; i < entries.size(); ++i) {
+				const auto& e = entries[i];
+				ImVec2 a(origin_x + pad, cy);
+				ImVec2 b(a.x + row_w, a.y + row_h);
+
+				dl->AddRectFilled(a, b,
+					aida::ui::with_alpha(th.bg_elevated, 0.85f), 12.f);
+				dl->AddRect(a, b,
+					aida::ui::with_alpha(th.border_subtle, 0.85f), 12.f, 0, 1.f);
+
+				float glyph_r = 22.f;
+				ImVec2 gc(a.x + 18.f + glyph_r, (a.y + b.y) * 0.5f);
+				brand_glyph::render(dl, e.glyph, gc, glyph_r,
+					e.grad_top, e.grad_bot, e.ring, 1.f);
+
+				float text_x = gc.x + glyph_r + 16.f;
+				dl->AddText(aida::ui::fonts::body_strong(),
+					aida::ui::components::detail::ui_fs() * 1.08f,
+					ImVec2(text_x, a.y + 14.f),
+					th.text_primary, e.display_name);
+				dl->AddText(aida::ui::fonts::caption(),
+					aida::ui::components::detail::ui_fs() * 0.88f,
+					ImVec2(text_x, a.y + 38.f),
+					th.text_secondary, e.description);
+
+				const provider_status_t st = compute_provider_status(e.provider_id);
+				ImGui::SetCursorScreenPos(ImVec2(text_x, a.y + 58.f));
+				aida::ui::pill_kind(st.label.c_str(), st.kind,
+					aida::ui::size_t_::sm, st.dot_pulse);
+
+				const bool authed = st.authenticated && !st.expired;
+				bool busy = false;
+				if (e.glyph == brand_glyph::kind_t::anthropic)
+					busy = g_state.claude_code_modal_open.load();
+				else if (e.glyph == brand_glyph::kind_t::openai)
+					busy = g_state.codex_modal_open.load();
+				else if (e.glyph == brand_glyph::kind_t::github)
+					busy = g_state.copilot_modal_open.load();
+
+				const float btn_w = 156.f;
+				const float btn_h = 32.f;
+				ImVec2 btn_pos(b.x - btn_w - 14.f, a.y + (row_h - btn_h) * 0.5f);
+				ImGui::SetCursorScreenPos(btn_pos);
+				ImGui::PushID(static_cast<int>(i));
+				if (authed) {
+					if (aida::ui::button("Sign out",
+							aida::ui::button_kind_t::destructive,
+							aida::ui::size_t_::md,
+							ImVec2(btn_w, btn_h))) {
+						clear_credentials_for(e.provider_id);
+					}
+				} else {
+					const char* lbl = busy ? "Signing in..." : "Sign in with browser";
+					if (aida::ui::button(lbl,
+							aida::ui::button_kind_t::primary,
+							aida::ui::size_t_::md,
+							ImVec2(btn_w, btn_h), busy, nullptr, busy)
+						&& !busy) {
+						if (e.glyph == brand_glyph::kind_t::anthropic)
+							start_claude_code_login();
+						else if (e.glyph == brand_glyph::kind_t::openai)
+							start_codex_login();
+						else if (e.glyph == brand_glyph::kind_t::github)
+							open_copilot_modal();
+					}
+				}
+				ImGui::PopID();
+
+				cy += row_h + row_gap;
+			}
+
+			(void)section_h;
+		}
+
+		static void render_combined_view(float panel_w, float panel_h)
+		{
+			apply_pending_focus();
+
+			{
+				if (g_state.refresh.completed.exchange(false)) {
+					if (g_state.refresh.success.load()) {
+						toast_notification::push("Provider catalog refreshed",
+							toast_notification::toast_type_t::info, 3.0f);
+					} else {
+						std::string m;
+						{
+							std::lock_guard<std::mutex> lk(g_state.mtx);
+							m = g_state.refresh.message;
+						}
+						toast_notification::push(std::string("Refresh failed: ") + m,
+							toast_notification::toast_type_t::error, 5.0f);
+					}
+				}
+			}
+
+			const auto& th = aida::ui::resolved();
+			const float pad = 12.f;
+
+			ImGui::BeginChild("##aida_chatbox_root", ImVec2(panel_w, panel_h), false,
+				ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
+
+			const ImVec2 wp = ImGui::GetWindowPos();
+			const float root_x = wp.x;
+			const float root_y = wp.y;
+			const float root_w = panel_w;
+			const float root_h = panel_h;
+
+			ImDrawList* hdl = ImGui::GetWindowDrawList();
+			hdl->AddText(aida::ui::fonts::h2(), 22.f,
+				ImVec2(root_x + pad, root_y + 2.f),
+				th.text_primary, "Accounts");
+
+			const float toolbar_h = 40.f;
+
+			if (!g_state.selected_provider_id.empty()) {
+				const int idx = chatbox_dropdown_index_for(g_state.selected_provider_id);
+				if (idx != g_state.chatbox_provider_dropdown_index) {
+					g_state.chatbox_provider_dropdown_index = idx;
+					chatbox_load_persisted_key(g_state.selected_provider_id);
+				}
+				g_state.selected_provider_id.clear();
+			}
+
+			const float refresh_w = 220.f;
+			const bool refreshing = g_state.refresh.in_flight.load();
+			ImGui::SetCursorScreenPos(ImVec2(root_x + root_w - pad - refresh_w, root_y + 4.f));
+			if (aida::ui::button(refreshing ? "Refreshing catalog..." : "Refresh model catalog",
+					aida::ui::button_kind_t::secondary,
+					aida::ui::size_t_::md,
+					ImVec2(refresh_w, 30.f),
+					false, nullptr, refreshing)) {
+				if (!refreshing) start_refresh_catalog();
+			}
+
+			const float tab_y = root_y + toolbar_h;
+			const float tab_h = 36.f;
+			const float tab_w = 200.f;
+			ImGui::SetCursorScreenPos(ImVec2(root_x + pad, tab_y));
+			ImGui::PushID("##chatbox_section_tabs");
+
+			const char* tab_labels[2] = { "API key (chatbox)", "Browser OAuth" };
+			ImDrawList* tdl = ImGui::GetWindowDrawList();
+			for (int i = 0; i < 2; ++i) {
+				ImVec2 ta(root_x + pad + (tab_w + 6.f) * static_cast<float>(i), tab_y);
+				ImVec2 tb(ta.x + tab_w, ta.y + tab_h);
+				ImGui::SetCursorScreenPos(ta);
+				ImGui::PushID(i);
+				ImGui::InvisibleButton("##chatbox_tab", ImVec2(tb.x - ta.x, tb.y - ta.y));
+				bool hov = ImGui::IsItemHovered();
+				bool clicked = ImGui::IsItemClicked();
+				ImGui::PopID();
+
+				const bool is_sel = (g_state.chatbox_active_section == i);
+				ImU32 bg = is_sel
+					? aida::ui::with_alpha(th.selection, 0.85f)
+					: (hov ? aida::ui::with_alpha(th.hover_wash, 1.f)
+							: aida::ui::with_alpha(th.panel_header, 0.5f));
+				tdl->AddRectFilled(ta, tb, bg, 10.f);
+				tdl->AddRect(ta, tb,
+					is_sel ? th.accent_u32 : aida::ui::with_alpha(th.border_subtle, 0.7f),
+					10.f, 0, is_sel ? 1.6f : 1.f);
+
+				ImFont* lf = is_sel ? aida::ui::fonts::body_strong() : aida::ui::fonts::body();
+				float lfs = aida::ui::components::detail::ui_fs() * 0.98f;
+				ImVec2 lsz = lf->CalcTextSizeA(lfs, FLT_MAX, 0.f, tab_labels[i]);
+				tdl->AddText(lf, lfs,
+					ImVec2(ta.x + ((tb.x - ta.x) - lsz.x) * 0.5f,
+						ta.y + ((tb.y - ta.y) - lsz.y) * 0.5f),
+					is_sel ? th.text_primary : th.text_secondary, tab_labels[i]);
+
+				if (clicked) g_state.chatbox_active_section = i;
+			}
+			ImGui::PopID();
+
+			const float body_y = tab_y + tab_h + 14.f;
+			const float body_h = root_h - (body_y - root_y) - pad;
+			const float body_max_w = 720.f;
+			const float body_w = (std::min)(body_max_w, root_w - pad * 2.f);
+			const float body_x = root_x + ((root_w - body_w) * 0.5f);
+
+			ImVec2 ca(body_x, body_y);
+			ImVec2 cb(body_x + body_w, body_y + body_h);
+			ImDrawList* bdl = ImGui::GetWindowDrawList();
+			bdl->AddRectFilled(ca, cb,
+				aida::ui::with_alpha(th.bg_elevated, 0.55f), 14.f);
+			bdl->AddRect(ca, cb,
+				aida::ui::with_alpha(th.border_subtle, 0.85f), 14.f, 0, 1.f);
+
+			ImGui::SetCursorScreenPos(ImVec2(body_x + 1.f, body_y + 1.f));
+			ImGui::BeginChild("##chatbox_body", ImVec2(body_w - 2.f, body_h - 2.f), false,
+				ImGuiWindowFlags_NoBackground);
+
+			if (g_state.chatbox_active_section == 0) {
+				render_chatbox_api_section(body_x, body_y, body_w, body_h);
+			} else {
+				render_chatbox_oauth_section(body_x, body_y, body_w, body_h);
+			}
+
+			ImGui::EndChild();
+			ImGui::EndChild();
 		}
 
 		static void render_phase_chips(ImDrawList* fdl, float x, float y, float w,
@@ -1420,7 +1996,7 @@ namespace auth_view {
 		}
 
 		static void render_modal_header(ImDrawList* fdl, const sheet_layout_t& sl,
-			const row_def_t& def, const char* title)
+			const modal_brand_t& def, const char* title)
 		{
 			const auto& th = aida::ui::resolved();
 			float alpha = sl.alpha;
@@ -1519,7 +2095,7 @@ namespace auth_view {
 			const float pw = 460.f;
 			const float ph = 320.f;
 
-			const row_def_t& def = row_def_for(row_kind_t::oauth_codex);
+			const modal_brand_t& def = k_brand_codex;
 			sheet_layout_t sl = render_modal_chrome(fdl, g_state.codex_anim, pw, ph,
 				def.grad_top, def.grad_bot);
 
@@ -1607,7 +2183,7 @@ namespace auth_view {
 			const float pw = 460.f;
 			const float ph = 320.f;
 
-			const row_def_t& def = row_def_for(row_kind_t::oauth_claude_code);
+			const modal_brand_t& def = k_brand_claude_code;
 			sheet_layout_t sl = render_modal_chrome(fdl, g_state.claude_code_anim, pw, ph,
 				def.grad_top, def.grad_bot);
 
@@ -1695,7 +2271,7 @@ namespace auth_view {
 			const float pw = 480.f;
 			const float ph = 388.f;
 
-			const row_def_t& def = row_def_for(row_kind_t::oauth_copilot);
+			const modal_brand_t& def = k_brand_copilot;
 			sheet_layout_t sl = render_modal_chrome(fdl, g_state.copilot_anim, pw, ph,
 				def.grad_top, def.grad_bot);
 
@@ -1971,6 +2547,7 @@ namespace auth_view {
 
 	void initialize()
 	{
+		g_state.shutdown_flag.store(false);
 		std::lock_guard<std::mutex> lk(g_state.mtx);
 
 		if (g_state.sub_completed.valid())
@@ -2002,6 +2579,7 @@ namespace auth_view {
 
 	void shutdown()
 	{
+		g_state.shutdown_flag.store(true);
 		std::shared_ptr<aida::auth::codex::codex_login_state_t> codex_local;
 		std::shared_ptr<aida::auth::copilot::copilot_login_state_t> copilot_local;
 		std::shared_ptr<aida::auth::claude_code::claude_code_login_state_t> claude_local;
@@ -2010,6 +2588,11 @@ namespace auth_view {
 			codex_local = g_state.codex_state;
 			copilot_local = g_state.copilot_state;
 			claude_local = g_state.claude_code_state;
+			for (auto& kv : g_state.validate_in_flight) {
+				if (kv.second) kv.second->store(false);
+			}
+			g_state.validate_in_flight.clear();
+			g_state.validate_results.clear();
 
 			if (codex_local)
 				codex_local->cancelled.store(true);
@@ -2077,9 +2660,36 @@ namespace auth_view {
 		return g_state.err;
 	}
 
+	void focus_provider(const std::string& provider_id)
+	{
+		std::lock_guard<std::mutex> lk(g_state.pending_focus_mtx);
+		g_state.pending_focus_provider = provider_id;
+	}
+
+	bool is_provider_authenticated(const std::string& provider_id)
+	{
+		aida::auth::auth_info_t info;
+		if (!aida::auth::store::get(provider_id, info)) return false;
+		if (info.kind == aida::auth::auth_kind_t::none) return false;
+		if (info.kind == aida::auth::auth_kind_t::oauth) {
+			if (info.expires_unix > 0 && info.expires_unix <= now_unix()) return false;
+			return !info.access.empty();
+		}
+		if (info.kind == aida::auth::auth_kind_t::api) return !info.api_key.empty();
+		if (info.kind == aida::auth::auth_kind_t::wellknown) return !info.wellknown_token.empty();
+		return false;
+	}
+
 	void render(float panel_w, float panel_h)
 	{
 		ImGui::PushID("aida_auth_view");
+
+		if (aida::provider::catalog::list_providers().empty()) {
+			work_queue::post([]() {
+				if (g_state.shutdown_flag.load()) return;
+				aida::provider::catalog::load_cached_or_fetch(86400);
+			});
+		}
 
 		float content_h = panel_h > 0.f ? panel_h : ImGui::GetContentRegionAvail().y;
 		ImGui::BeginChild("##auth_view_root", ImVec2(panel_w, content_h),
@@ -2089,11 +2699,8 @@ namespace auth_view {
 		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f);
 		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 6.f));
 
-		ImGui::BeginChild("##auth_providers_child",
-			ImVec2(0, ImGui::GetContentRegionAvail().y), false);
-		render_providers_tab(ImGui::GetContentRegionAvail().x,
+		render_combined_view(ImGui::GetContentRegionAvail().x,
 			ImGui::GetContentRegionAvail().y);
-		ImGui::EndChild();
 
 		ImGui::PopStyleVar(2);
 

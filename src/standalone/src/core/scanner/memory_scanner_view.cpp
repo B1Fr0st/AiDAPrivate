@@ -2,6 +2,7 @@
 #include "memory_scanner.hpp"
 #include "standalone_driver.hpp"
 #include "../helpers/globals.h"
+#include "../helpers/diag_log.hpp"
 #include "ui_anim.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
@@ -176,16 +177,26 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a)
 	bool attached = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
-	if (!sc.has_initial_scan) {
+	if (scanning) {
+		if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive,
+				aida::ui::size_t_::md, ImVec2(0.f, 0.f))) {
+			diag::log_tagged("mem_scanner", "view stop_button clicked");
+			sc.scanning.store(false);
+		}
+	} else if (!sc.has_initial_scan) {
 		if (aida::ui::button("First Scan", aida::ui::button_kind_t::primary,
-				aida::ui::size_t_::md, ImVec2(0.f, 0.f), !(attached && !scanning))) {
+				aida::ui::size_t_::md, ImVec2(0.f, 0.f), !attached)) {
+			diag::log_tagged_fmt("mem_scanner", "view first_scan_button value='%s' value2='%s'",
+				ui.value_buf, ui.value_buf2);
 			sc.config.value_text = ui.value_buf;
 			sc.config.value_text2 = ui.value_buf2;
 			memory_scanner::first_scan(sc.config);
 		}
 	} else {
 		if (aida::ui::button("Next Scan", aida::ui::button_kind_t::primary,
-				aida::ui::size_t_::md, ImVec2(0.f, 0.f), scanning)) {
+				aida::ui::size_t_::md, ImVec2(0.f, 0.f), false)) {
+			diag::log_tagged_fmt("mem_scanner", "view next_scan_button mode=%s value='%s'",
+				memory_scanner::scan_mode_name(sc.config.scan_mode), ui.value_buf);
 			memory_scanner::next_scan(sc.config.scan_mode, std::string(ui.value_buf), std::string(ui.value_buf2));
 		}
 	}
@@ -194,6 +205,7 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a)
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 	if (aida::ui::button("Undo", aida::ui::button_kind_t::secondary,
 			aida::ui::size_t_::md, ImVec2(0.f, 0.f), !(sc.has_initial_scan && !scanning))) {
+		diag::log_tagged("mem_scanner", "view undo_button");
 		memory_scanner::undo_scan();
 	}
 	cx += 78.f;
@@ -201,6 +213,7 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a)
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 	if (aida::ui::button("Reset", aida::ui::button_kind_t::ghost,
 			aida::ui::size_t_::md, ImVec2(0.f, 0.f), scanning)) {
+		diag::log_tagged("mem_scanner", "view reset_button");
 		memory_scanner::reset_scan();
 	}
 	cx += 80.f;
@@ -420,6 +433,8 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 			ui.selected_result = i;
 
 		if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+			diag::log_tagged_fmt("mem_scanner", "view double_click_add_address row=%d addr=0x%016llX",
+				i, static_cast<unsigned long long>(r.address));
 			memory_scanner::add_address(r.address, "", sc.config.value_type);
 		}
 	}
@@ -604,6 +619,9 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 			bool fr = e.frozen;
 			aida::ui::toggle_switch("##fz", &fr, aida::ui::size_t_::sm);
 			if (fr != e.frozen) {
+				e.frozen = fr;
+				if (fr && !e.last_value.empty())
+					e.freeze_value = e.last_value;
 				freeze_toggle_idx = i;
 				freeze_toggle_val = fr;
 			}

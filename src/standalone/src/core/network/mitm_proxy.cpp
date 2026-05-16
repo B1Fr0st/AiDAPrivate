@@ -6,6 +6,7 @@
 #include "http2_session.hpp"
 #include "script_engine.hpp"
 #include "../infra/work_queue.hpp"
+#include "helpers/diag_log.hpp"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -1633,6 +1634,10 @@ static void listener_thread_func(state_t& state) {
             item.client_socket = static_cast<uintptr_t>(client_sock);
             item.client_ip = client_addr.sin_addr.s_addr;
             item.client_port = ntohs(client_addr.sin_port);
+            char addr_buf[INET_ADDRSTRLEN] = {};
+            inet_ntop(AF_INET, &client_addr.sin_addr, addr_buf, sizeof(addr_buf));
+            diag::log_tagged_fmt("network", "mitm_proxy_accept client=%s:%u",
+                addr_buf, item.client_port);
             {
                 std::lock_guard<std::mutex> lock(state.work_mutex);
                 state.work_queue.push(item);
@@ -1644,19 +1649,31 @@ static void listener_thread_func(state_t& state) {
 
 
 bool start(const proxy_config& config) {
-    if (g_state.running.load()) return false;
+    if (g_state.running.load()) {
+        diag::log_tagged("network", "mitm_proxy_start_skip already_running");
+        return false;
+    }
 
-    if (!s_wsa_guard.ok) return false;
+    if (!s_wsa_guard.ok) {
+        diag::log_tagged("network", "mitm_proxy_start_failed wsa_guard_not_ok");
+        return false;
+    }
 
     if (config.decode_tls && !cert_generator::is_ready()) {
-        if (!cert_generator::initialize()) return false;
+        if (!cert_generator::initialize()) {
+            diag::log_tagged("network", "mitm_proxy_start_failed cert_generator_init");
+            return false;
+        }
     }
 
     g_state.config = config;
 
 
     SOCKET listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (listen_sock == INVALID_SOCKET) return false;
+    if (listen_sock == INVALID_SOCKET) {
+        diag::log_tagged_fmt("network", "mitm_proxy_start_failed socket_create err=%d", WSAGetLastError());
+        return false;
+    }
 
 
     int opt = 1;
@@ -1668,11 +1685,16 @@ bool start(const proxy_config& config) {
     inet_pton(AF_INET, config.bind_addr.c_str(), &bind_addr.sin_addr);
 
     if (bind(listen_sock, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        diag::log_tagged_fmt("network", "mitm_proxy_start_failed bind_addr='%s:%u' err=%d",
+            config.bind_addr.c_str(), config.bind_port, err);
         closesocket(listen_sock);
         return false;
     }
 
     if (listen(listen_sock, SOMAXCONN) == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        diag::log_tagged_fmt("network", "mitm_proxy_start_failed listen err=%d", err);
         closesocket(listen_sock);
         return false;
     }
@@ -1680,6 +1702,10 @@ bool start(const proxy_config& config) {
     g_state.listen_socket = static_cast<uintptr_t>(listen_sock);
     g_state.running.store(true);
     g_state.proxy_start_cv.notify_all();
+    diag::log_tagged_fmt("network", "mitm_proxy_started bind=%s:%u decode_tls=%d enable_h2=%d enable_ws=%d wfp_redirect=%d",
+        config.bind_addr.c_str(), config.bind_port, config.decode_tls ? 1 : 0,
+        config.enable_h2 ? 1 : 0, config.enable_websocket ? 1 : 0,
+        config.use_wfp_redirect ? 1 : 0);
 
 
     if (config.use_wfp_redirect) {
@@ -1712,6 +1738,9 @@ bool start(const proxy_config& config) {
 
 void stop() {
     if (!g_state.running.load()) return;
+    diag::log_tagged_fmt("network", "mitm_proxy_stop_begin held_count=%zu history=%zu requests=%llu",
+        g_state.held_waits.size(), g_state.history.size(),
+        static_cast<unsigned long long>(g_state.total_requests.load()));
 
 
     if (g_state.config.wfp_rule_id != 0) {
@@ -1751,6 +1780,7 @@ void stop() {
         closesocket(static_cast<SOCKET>(g_state.listen_socket));
         g_state.listen_socket = ~static_cast<uintptr_t>(0);
     }
+    diag::log_tagged("network", "mitm_proxy_stop_complete");
 }
 
 bool is_running() {
@@ -1854,12 +1884,22 @@ void forward_exchange(uint64_t id) {
         std::lock_guard<std::mutex> lock(g_state.held_mutex);
         wait = lookup_wait_locked(id);
     }
-    if (!wait) return;
+    if (!wait) {
+        diag::log_tagged_fmt("network", "mitm_forward_exchange_no_wait id=%llu",
+            static_cast<unsigned long long>(id));
+        return;
+    }
+    bool delivered = false;
     {
         std::lock_guard<std::mutex> wlock(wait->mtx);
         if (wait->released) return;
         wait->decision = hold_decision_t::forward;
         wait->released = true;
+        delivered = true;
+    }
+    if (delivered) {
+        diag::log_tagged_fmt("network", "mitm_forward_exchange id=%llu",
+            static_cast<unsigned long long>(id));
     }
     wait->cv.notify_all();
 }
@@ -1870,13 +1910,23 @@ void forward_modified(uint64_t id, const std::vector<uint8_t>& modified_request)
         std::lock_guard<std::mutex> lock(g_state.held_mutex);
         wait = lookup_wait_locked(id);
     }
-    if (!wait) return;
+    if (!wait) {
+        diag::log_tagged_fmt("network", "mitm_forward_modified_no_wait id=%llu",
+            static_cast<unsigned long long>(id));
+        return;
+    }
+    bool delivered = false;
     {
         std::lock_guard<std::mutex> wlock(wait->mtx);
         if (wait->released) return;
         wait->modified_request = modified_request;
         wait->decision = hold_decision_t::modified;
         wait->released = true;
+        delivered = true;
+    }
+    if (delivered) {
+        diag::log_tagged_fmt("network", "mitm_forward_modified id=%llu new_size=%zu",
+            static_cast<unsigned long long>(id), modified_request.size());
     }
     wait->cv.notify_all();
 }
@@ -1887,12 +1937,22 @@ void drop_exchange(uint64_t id) {
         std::lock_guard<std::mutex> lock(g_state.held_mutex);
         wait = lookup_wait_locked(id);
     }
-    if (!wait) return;
+    if (!wait) {
+        diag::log_tagged_fmt("network", "mitm_drop_exchange_no_wait id=%llu",
+            static_cast<unsigned long long>(id));
+        return;
+    }
+    bool delivered = false;
     {
         std::lock_guard<std::mutex> wlock(wait->mtx);
         if (wait->released) return;
         wait->decision = hold_decision_t::drop;
         wait->released = true;
+        delivered = true;
+    }
+    if (delivered) {
+        diag::log_tagged_fmt("network", "mitm_drop_exchange id=%llu",
+            static_cast<unsigned long long>(id));
     }
     wait->cv.notify_all();
 }

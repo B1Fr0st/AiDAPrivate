@@ -1,7 +1,6 @@
 
 
 #define NOMINMAX
-#define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "standalone_ai_client.hpp"
 #include "standalone_settings.hpp"
 #include "standalone_license.hpp"
@@ -13,12 +12,12 @@
 #include "../auth/auth_claude_code.hpp"
 #include "../auth/auth_codex.hpp"
 #include "../auth/auth_copilot.hpp"
+#include "../auth/auth_http.hpp"
 #include "../mcp/mcp_client.hpp"
 #include "../session/session_store.hpp"
 #include "../helpers/globals.h"
 #include "../infra/work_queue.hpp"
 
-#include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -282,36 +281,59 @@ bool standalone_ai_client_t::poll()
 void standalone_ai_client_t::cancel()
 {
     _cancelled = true;
-    std::lock_guard<std::mutex> lk(_http_mtx);
-    if (_http) _http->stop();
 }
 
 
-std::shared_ptr<httplib::Client> standalone_ai_client_t::get_or_create_client(
-    const std::string& host)
-{
-    std::lock_guard<std::mutex> lk(_http_mtx);
-    if (!_http || _last_host != host) {
-        _http = std::make_shared<httplib::Client>(host.c_str());
-        _last_host = host;
+namespace {
 
-        _http->set_connection_timeout(15);
-        _http->set_read_timeout(300);
-        _http->set_write_timeout(30);
-        _http->set_tcp_nodelay(true);
-        _http->set_keep_alive(true);
-        _http->set_decompress(true);
-        _http->set_follow_location(true);
-        _http->enable_server_certificate_verification(true);
+constexpr int k_ai_chat_stream_timeout_sec = 300;
+constexpr int k_ai_chat_post_timeout_sec = 60;
+constexpr const char* k_ai_user_agent = "AiDAStandalone/1.0";
+
+std::string join_host_path(const std::string& host, const std::string& path)
+{
+    std::string h = host;
+    while (!h.empty() && h.back() == '/')
+        h.pop_back();
+    if (path.empty() || path[0] != '/')
+        return h + "/" + path;
+    return h + path;
+}
+
+aida::auth::http::header_list_t headers_map_to_list(
+    const std::map<std::string, std::string>& headers,
+    bool inject_user_agent)
+{
+    aida::auth::http::header_list_t out;
+    out.reserve(headers.size() + 2);
+    bool seen_ua = false;
+    for (const auto& kv : headers) {
+        if (kv.first.empty())
+            continue;
+        std::string lk = kv.first;
+        std::transform(lk.begin(), lk.end(), lk.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (lk == "user-agent")
+            seen_ua = true;
+        out.emplace_back(kv.first, kv.second);
     }
-    return _http;
+    if (inject_user_agent && !seen_ua)
+        out.emplace_back("User-Agent", k_ai_user_agent);
+    return out;
 }
 
-void standalone_ai_client_t::reset_client()
+std::string sanitize_transport_error(const std::string& provider,
+    const std::string& host, const std::string& detail)
 {
-    std::lock_guard<std::mutex> lk(_http_mtx);
-    _http.reset();
-    _last_host.clear();
+    std::string msg = "Network transport failed for " + provider;
+    if (!host.empty())
+        msg += " (" + host + ")";
+    if (!detail.empty())
+        msg += ": " + detail;
+    msg += ". Verify your internet connection, proxy, firewall, and API endpoint.";
+    return msg;
+}
+
 }
 
 
@@ -346,55 +368,43 @@ std::string standalone_ai_client_t::simple_post(
     constexpr int MAX_RETRIES = 3;
     constexpr int BASE_DELAY_MS = 2000;
 
+    const std::string url = join_host_path(host, path);
+    auto hdrs = headers_map_to_list(headers, true);
+
     for (int attempt = 0; attempt <= MAX_RETRIES; ++attempt) {
-        try {
-            auto client = get_or_create_client(host);
+        if (_cancelled) return "Error: Operation cancelled.";
 
-            httplib::Headers h;
-            for (auto& [k, v] : headers) h.emplace(k, v);
+        aida::auth::http::response_t res = aida::auth::http::post(
+            url, hdrs, body, std::string("application/json"),
+            k_ai_chat_post_timeout_sec);
 
-            auto res = client->Post(path.c_str(), h, body, "application/json");
+        if (_cancelled) return "Error: Operation cancelled.";
 
-            if (_cancelled) return "Error: Operation cancelled.";
-
-            if (!res) {
-                reset_client();
-                auto err = res.error();
-                if (err == httplib::Error::Canceled)
-                    return "Error: Operation cancelled.";
-                if (attempt < MAX_RETRIES) {
-                    int delay = (std::min)(BASE_DELAY_MS * (1 << attempt), 30000);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(delay));
-                    continue;
-                }
-                return "Error: HTTP request failed: " + httplib::to_string(err);
-            }
-
-            if ((res->status == 429 || res->status == 503) && attempt < MAX_RETRIES) {
+        if (!res.ok && res.status == 0) {
+            if (attempt < MAX_RETRIES) {
                 int delay = (std::min)(BASE_DELAY_MS * (1 << attempt), 30000);
-                reset_client();
                 std::this_thread::sleep_for(std::chrono::milliseconds(delay));
                 continue;
             }
-
-            if (res->status != 200)
-                return "Error: API returned status " + std::to_string(res->status) +
-                       ": " + res->body.substr(0, 600);
-
-            auto j = json::parse(res->body, nullptr, false);
-            if (j.is_discarded())
-                return "Error: API returned invalid JSON.";
-
-            return response_parser(j);
-        } catch (const std::exception& e) {
-            reset_client();
-            if (attempt < MAX_RETRIES) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(
-                    (std::min)(BASE_DELAY_MS * (1 << attempt), 30000)));
-                continue;
-            }
-            return std::string("Error: ") + e.what();
+            return std::string("Error: ")
+                + sanitize_transport_error("API", host, res.error);
         }
+
+        if ((res.status == 429 || res.status == 503) && attempt < MAX_RETRIES) {
+            int delay = (std::min)(BASE_DELAY_MS * (1 << attempt), 30000);
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+            continue;
+        }
+
+        if (res.status < 200 || res.status >= 300)
+            return "Error: API returned status " + std::to_string(res.status) +
+                   ": " + res.body.substr(0, 600);
+
+        auto j = json::parse(res.body, nullptr, false);
+        if (j.is_discarded())
+            return "Error: API returned invalid JSON.";
+
+        return response_parser(j);
     }
     return "Error: All retries exhausted.";
 }
@@ -409,80 +419,61 @@ std::string standalone_ai_client_t::streaming_post(
     ai_stream_chunk_t on_chunk,
     ai_stop_predicate_t stop_check)
 {
-    auto client = get_or_create_client(host);
-
-    httplib::Headers h;
-    for (auto& [k, v] : headers) h.emplace(k, v);
+    const std::string url = join_host_path(host, path);
+    auto hdrs = headers_map_to_list(headers, true);
 
     std::string accumulated;
     std::string sse_buffer;
 
-    httplib::Request req;
-    req.method = "POST";
-    req.path = path;
-    req.headers = h;
-    req.headers.emplace("Content-Type", "application/json");
-    req.body = body;
-    req.content_receiver = [&](const char* data, size_t len, uint64_t, uint64_t) -> bool {
-            if (_cancelled) return false;
+    auto chunk_cb = [&](const char* data, size_t len) -> bool {
+        if (_cancelled) return false;
 
-            sse_buffer.append(data, len);
+        sse_buffer.append(data, len);
 
+        size_t pos = 0;
+        while (pos < sse_buffer.size()) {
+            auto nl = sse_buffer.find('\n', pos);
+            if (nl == std::string::npos) break;
 
-            size_t pos = 0;
-            while (pos < sse_buffer.size()) {
-                auto nl = sse_buffer.find('\n', pos);
-                if (nl == std::string::npos) break;
+            std::string line = sse_buffer.substr(pos, nl - pos);
+            pos = nl + 1;
 
-                std::string line = sse_buffer.substr(pos, nl - pos);
-                pos = nl + 1;
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
 
+            if (line == "data: [DONE]" || line == "data:[DONE]")
+                continue;
 
-                if (!line.empty() && line.back() == '\r')
-                    line.pop_back();
+            if (line.size() >= 5 && line.substr(0, 5) == "data:") {
+                std::string payload = (line.size() > 6 && line[5] == ' ')
+                    ? line.substr(6) : line.substr(5);
+                if (payload.empty()) continue;
 
-                if (line == "data: [DONE]" || line == "data:[DONE]")
-                    continue;
-
-                if (line.substr(0, 6) == "data: " || line.substr(0, 5) == "data:") {
-                    std::string payload = line.substr(0, 5) == "data:" ?
-                        line.substr(5) : line.substr(6);
-                    if (payload.empty()) continue;
-
-                    std::string chunk_text = chunk_parser(payload);
-                    if (!chunk_text.empty()) {
-                        accumulated += chunk_text;
-                        if (on_chunk) on_chunk(chunk_text);
-                        if (stop_check && stop_check(accumulated))
-                            return false;
-                    }
+                std::string chunk_text = chunk_parser(payload);
+                if (!chunk_text.empty()) {
+                    accumulated += chunk_text;
+                    if (on_chunk) on_chunk(chunk_text);
+                    if (stop_check && stop_check(accumulated))
+                        return false;
                 }
             }
-            sse_buffer.erase(0, pos);
-            return true;
-        };
+        }
+        sse_buffer.erase(0, pos);
+        return true;
+    };
 
-    auto res = client->send(req);
-
-
-    if (!res && res.error() == httplib::Error::Connection) {
-        reset_client();
-        client = get_or_create_client(host);
-        sse_buffer.clear();
-        accumulated.clear();
-        res = client->send(req);
-    }
+    aida::auth::http::stream_result_t res = aida::auth::http::stream(
+        "POST", url, hdrs, body, std::string("application/json"),
+        k_ai_chat_stream_timeout_sec, chunk_cb);
 
     if (_cancelled) return "Error: Operation cancelled.";
-    if (!res) {
-        std::string err = "Error: Streaming request failed: " + httplib::to_string(res.error())
-                        + "\nHost: " + host;
-        reset_client();
-        return err;
+    if (res.cancelled) return accumulated;
+
+    if (!res.ok && res.status == 0) {
+        return std::string("Error: ")
+            + sanitize_transport_error("API stream", host, res.error);
     }
-    if (res->status != 200) {
-
-
+    if (res.status < 200 || res.status >= 300) {
         std::string err_detail;
         if (!sse_buffer.empty()) {
             auto ej = json::parse(sse_buffer, nullptr, false);
@@ -496,7 +487,9 @@ std::string standalone_ai_client_t::streaming_post(
                 err_detail = sse_buffer.substr(0, 400);
             }
         }
-        return "Error: API returned status " + std::to_string(res->status)
+        if (err_detail.empty() && !res.error.empty())
+            err_detail = res.error.substr(0, 400);
+        return "Error: API returned status " + std::to_string(res.status)
              + (err_detail.empty() ? "" : ": " + err_detail);
     }
 
@@ -1571,10 +1564,9 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
         headers.erase("x-api-key");
 
 
-    auto client = get_or_create_client(base_url);
-    httplib::Headers h;
-    for (auto& [k, v] : headers) h.emplace(k, v);
-
+    headers["Content-Type"] = "application/json";
+    const std::string url = join_host_path(base_url, "/v1/messages");
+    auto hdrs_list = headers_map_to_list(headers, true);
 
     struct block_state_t {
         int    index = -1;
@@ -1586,14 +1578,9 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
     std::map<int, block_state_t> blocks;
 
     std::string sse_buffer;
+    const std::string request_body = body.dump();
 
-    httplib::Request req;
-    req.method = "POST";
-    req.path   = "/v1/messages";
-    req.headers = h;
-    req.headers.emplace("Content-Type", "application/json");
-    req.body = body.dump();
-    req.content_receiver = [&](const char* data, size_t len, uint64_t, uint64_t) -> bool {
+    auto chunk_cb = [&](const char* data, size_t len) -> bool {
         if (_cancelled) return false;
         sse_buffer.append(data, len);
 
@@ -1698,22 +1685,38 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
         return true;
     };
 
-    auto res = client->send(req);
+    aida::auth::http::stream_result_t res = aida::auth::http::stream(
+        "POST", url, hdrs_list, request_body, std::string("application/json"),
+        k_ai_chat_stream_timeout_sec, chunk_cb);
 
     if (_cancelled) {
         result.is_error = true;
         result.text = "Error: Operation cancelled.";
         return result;
     }
-    if (!res) {
-        result.is_error = true;
-        result.text = "Error: Request failed: " + httplib::to_string(res.error());
+    if (res.cancelled) {
         return result;
     }
-    if (res->status != 200) {
+    if (!res.ok && res.status == 0) {
         result.is_error = true;
-        result.text = "Error: API returned status " + std::to_string(res->status) +
-                      ": " + res->body.substr(0, 800);
+        result.text = std::string("Error: ")
+            + sanitize_transport_error("Anthropic", base_url, res.error);
+        return result;
+    }
+    if (res.status < 200 || res.status >= 300) {
+        result.is_error = true;
+        std::string err_body;
+        if (!sse_buffer.empty()) {
+            auto ej = json::parse(sse_buffer, nullptr, false);
+            if (!ej.is_discarded() && ej.contains("error") && ej["error"].is_object())
+                err_body = ej["error"].value("message", sse_buffer.substr(0, 800));
+            else
+                err_body = sse_buffer.substr(0, 800);
+        }
+        if (err_body.empty() && !res.error.empty())
+            err_body = res.error.substr(0, 800);
+        result.text = "Error: API returned status " + std::to_string(res.status)
+                    + (err_body.empty() ? std::string() : (": " + err_body));
         return result;
     }
 
@@ -1783,23 +1786,20 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
         return result;
     }
 
-    auto client = get_or_create_client(base_url);
-    httplib::Headers hdrs;
-    hdrs.emplace("Content-Type", "application/json");
-    hdrs.emplace("Authorization", "Bearer " + _settings.get_active_api_key());
-
-    for (auto& [k, v] : _settings.get_active_headers()) hdrs.emplace(k, v);
+    std::map<std::string, std::string> openai_headers = _settings.get_active_headers();
+    openai_headers["Content-Type"] = "application/json";
+    openai_headers["Authorization"] = "Bearer " + _settings.get_active_api_key();
 
     if (!oai_store_key.empty()) {
         const std::string provider_id = (oai_kind == "openai_codex") ? std::string("openai-codex") : std::string("openai");
-        std::map<std::string, std::string> overlay_map;
-        apply_oauth_headers(overlay_map, provider_id, oai_store_key, model,
+        apply_oauth_headers(openai_headers, provider_id, oai_store_key, model,
                             build_request_context(&body));
-        for (auto& [k, v] : overlay_map) {
-            hdrs.erase(k);
-            hdrs.emplace(k, v);
-        }
+        if (openai_headers.count("authorization") > 0)
+            openai_headers.erase("Authorization");
     }
+
+    const std::string openai_url = join_host_path(base_url, "/v1/chat/completions");
+    auto openai_hdr_list = headers_map_to_list(openai_headers, true);
 
 
     struct oai_tc_state_t {
@@ -1811,15 +1811,10 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
 
     std::string sse_buffer;
     bool is_streaming = body.contains("stream") && body["stream"].get<bool>();
+    const std::string openai_body = body.dump();
 
     if (is_streaming) {
-        httplib::Request req;
-        req.method  = "POST";
-        req.path    = "/v1/chat/completions";
-        req.headers = hdrs;
-        req.body    = body.dump();
-
-        req.content_receiver = [&](const char* data, size_t len, uint64_t, uint64_t) -> bool {
+        auto chunk_cb = [&](const char* data, size_t len) -> bool {
             if (_cancelled) return false;
             sse_buffer.append(data, len);
 
@@ -1907,11 +1902,20 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
             return true;
         };
 
-        auto res = client->send(req);
+        aida::auth::http::stream_result_t res = aida::auth::http::stream(
+            "POST", openai_url, openai_hdr_list, openai_body,
+            std::string("application/json"),
+            k_ai_chat_stream_timeout_sec, chunk_cb);
 
         if (_cancelled) { result.is_error = true; result.text = "Error: Operation cancelled."; return result; }
-        if (!res) { result.is_error = true; result.text = "Error: Request failed: " + httplib::to_string(res.error()); return result; }
-        if (res->status != 200) {
+        if (res.cancelled) return result;
+        if (!res.ok && res.status == 0) {
+            result.is_error = true;
+            result.text = std::string("Error: ")
+                + sanitize_transport_error("OpenAI", base_url, res.error);
+            return result;
+        }
+        if (res.status < 200 || res.status >= 300) {
             result.is_error = true;
 
             std::string err_body;
@@ -1922,23 +1926,31 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
                 else
                     err_body = sse_buffer.substr(0, 600);
             }
-            result.text = "Error: API returned status " + std::to_string(res->status)
-                        + (err_body.empty() ? "" : ": " + err_body);
+            if (err_body.empty() && !res.error.empty())
+                err_body = res.error.substr(0, 600);
+            result.text = "Error: API returned status " + std::to_string(res.status)
+                        + (err_body.empty() ? std::string() : (": " + err_body));
             return result;
         }
     } else {
 
-        httplib::Headers h2 = hdrs;
-        auto res = client->Post("/v1/chat/completions", h2, body.dump(), "application/json");
+        aida::auth::http::response_t res = aida::auth::http::post(
+            openai_url, openai_hdr_list, openai_body,
+            std::string("application/json"), k_ai_chat_post_timeout_sec);
         if (_cancelled) { result.is_error = true; result.text = "Error: Operation cancelled."; return result; }
-        if (!res) { result.is_error = true; result.text = "Error: Request failed: " + httplib::to_string(res.error()); return result; }
-        if (res->status != 200) {
+        if (!res.ok && res.status == 0) {
             result.is_error = true;
-            result.text = "Error: API returned status " + std::to_string(res->status) + ": " + res->body.substr(0, 800);
+            result.text = std::string("Error: ")
+                + sanitize_transport_error("OpenAI", base_url, res.error);
+            return result;
+        }
+        if (res.status < 200 || res.status >= 300) {
+            result.is_error = true;
+            result.text = "Error: API returned status " + std::to_string(res.status) + ": " + res.body.substr(0, 800);
             return result;
         }
 
-        auto resp = json::parse(res->body, nullptr, false);
+        auto resp = json::parse(res.body, nullptr, false);
         if (resp.is_discarded()) { result.is_error = true; result.text = "Error: Failed to parse response."; return result; }
 
         if (resp.contains("usage") && resp["usage"].is_object()) {
@@ -2055,27 +2067,22 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
     body["generationConfig"] = gen_config;
 
 
-    std::string path = "/v1beta/models/" + model + ":streamGenerateContent?alt=sse&key=" + api_key;
+    const std::string gemini_path = "/v1beta/models/" + model + ":streamGenerateContent?alt=sse&key=" + api_key;
+    const std::string gemini_url = join_host_path(base_url, gemini_path);
 
-    auto client = get_or_create_client(base_url);
-    httplib::Headers hdrs;
-    hdrs.emplace("Content-Type", "application/json");
-    for (auto& [k, v] : _settings.get_active_headers()) hdrs.emplace(k, v);
+    std::map<std::string, std::string> gemini_headers = _settings.get_active_headers();
+    gemini_headers["Content-Type"] = "application/json";
+    auto gemini_hdr_list = headers_map_to_list(gemini_headers, true);
 
     std::string sse_buffer;
     std::string raw_response;
-
-    httplib::Request req;
-    req.method  = "POST";
-    req.path    = path;
-    req.headers = hdrs;
-    req.body    = body.dump();
+    const std::string gemini_body = body.dump();
 
     output_log::push(bottom_tab_t::output, "[ai] Gemini POST model=" + model
         + " tools=" + std::to_string(gem_tools.empty() ? 0 : gem_tools[0].value("functionDeclarations", json::array()).size())
-        + " body=" + std::to_string(req.body.size()) + "B");
+        + " body=" + std::to_string(gemini_body.size()) + "B");
 
-    req.content_receiver = [&](const char* data, size_t len, uint64_t, uint64_t) -> bool {
+    auto chunk_cb = [&](const char* data, size_t len) -> bool {
         if (_cancelled) return false;
         sse_buffer.append(data, len);
         raw_response.append(data, len);
@@ -2149,38 +2156,30 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
         return true;
     };
 
-    auto res = client->send(req);
-
-
-    if (!res && res.error() == httplib::Error::Connection) {
-        output_log::push(bottom_tab_t::output, "[ai] Gemini connection failed, retrying with fresh client...");
-        reset_client();
-        client = get_or_create_client(base_url);
-        sse_buffer.clear();
-        raw_response.clear();
-        result.text.clear();
-        result.thinking.clear();
-        result.tool_calls.clear();
-        res = client->send(req);
-    }
+    aida::auth::http::stream_result_t res = aida::auth::http::stream(
+        "POST", gemini_url, gemini_hdr_list, gemini_body,
+        std::string("application/json"),
+        k_ai_chat_stream_timeout_sec, chunk_cb);
 
     if (_cancelled) { result.is_error = true; result.text = "Error: Operation cancelled."; return result; }
-    if (!res) {
+    if (res.cancelled) return result;
+
+    if (!res.ok && res.status == 0) {
         result.is_error = true;
-        result.text = "Error: Request failed: " + httplib::to_string(res.error())
-                    + "\nHost: " + base_url + "\nCheck your internet connection and API key.";
-        output_log::push(bottom_tab_t::output, "[ai] Gemini connection error: "
-            + httplib::to_string(res.error()) + " host=" + base_url);
-        reset_client();
+        result.text = std::string("Error: ")
+            + sanitize_transport_error("Gemini", base_url, res.error)
+            + "\nCheck your internet connection and API key.";
+        output_log::push(bottom_tab_t::output, "[ai] Gemini transport error: "
+            + res.error + " host=" + base_url);
         return result;
     }
-    if (res->status != 200) {
+    if (res.status < 200 || res.status >= 300) {
         result.is_error = true;
         std::string raw_err;
         if (!raw_response.empty())
             raw_err = raw_response;
-        else if (!res->body.empty())
-            raw_err = res->body;
+        else if (!res.error.empty())
+            raw_err = res.error;
 
         std::string err_body;
         if (!raw_err.empty()) {
@@ -2195,9 +2194,9 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
                 err_body = raw_err.substr(0, 600);
             }
         }
-        result.text = "Error: API returned status " + std::to_string(res->status)
-                    + (err_body.empty() ? "" : ": " + err_body);
-        output_log::push(bottom_tab_t::output, "[ai] Gemini error " + std::to_string(res->status)
+        result.text = "Error: API returned status " + std::to_string(res.status)
+                    + (err_body.empty() ? std::string() : (": " + err_body));
+        output_log::push(bottom_tab_t::output, "[ai] Gemini error " + std::to_string(res.status)
             + ": " + (err_body.empty() ? "(no error body)" : err_body));
         return result;
     }
@@ -2270,28 +2269,21 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
         return result;
     }
 
-    auto client = get_or_create_client(base_url);
-    httplib::Headers hdrs;
-    hdrs.emplace("Content-Type", "application/json");
-
+    std::map<std::string, std::string> generic_headers = _settings.get_active_headers();
+    generic_headers["Content-Type"] = "application/json";
     if (provider == "openrouter") {
-        hdrs.emplace("Authorization", "Bearer " + api_key);
-        hdrs.emplace("HTTP-Referer", "https://aida.dev");
-        hdrs.emplace("X-Title", "AiDA");
+        generic_headers["Authorization"] = "Bearer " + api_key;
+        generic_headers["HTTP-Referer"] = "https://aida.dev";
+        generic_headers["X-Title"] = "AiDA";
     } else {
-        hdrs.emplace("Authorization", "Bearer " + api_key);
+        generic_headers["Authorization"] = "Bearer " + api_key;
     }
 
-    for (auto& [k, v] : _settings.get_active_headers()) hdrs.emplace(k, v);
-
     if (!generic_store_key.empty()) {
-        std::map<std::string, std::string> overlay_map;
-        apply_oauth_headers(overlay_map, generic_store_key, generic_store_key, model,
+        apply_oauth_headers(generic_headers, generic_store_key, generic_store_key, model,
                             build_request_context(&body));
-        for (auto& [k, v] : overlay_map) {
-            hdrs.erase(k);
-            hdrs.emplace(k, v);
-        }
+        if (generic_headers.count("authorization") > 0)
+            generic_headers.erase("Authorization");
     }
 
 
@@ -2313,13 +2305,11 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
     else if (provider == "ollama")
         chat_path = "/api/chat";
 
-    httplib::Request req;
-    req.method  = "POST";
-    req.path    = chat_path;
-    req.headers = hdrs;
-    req.body    = body.dump();
+    const std::string generic_url = join_host_path(base_url, chat_path);
+    auto generic_hdr_list = headers_map_to_list(generic_headers, true);
+    const std::string generic_body = body.dump();
 
-    req.content_receiver = [&](const char* data, size_t len, uint64_t, uint64_t) -> bool {
+    auto chunk_cb = [&](const char* data, size_t len) -> bool {
         if (_cancelled) return false;
         sse_buffer.append(data, len);
 
@@ -2415,11 +2405,24 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
         return true;
     };
 
-    auto res = client->send(req);
+    aida::auth::http::stream_result_t res = aida::auth::http::stream(
+        "POST", generic_url, generic_hdr_list, generic_body,
+        std::string("application/json"),
+        k_ai_chat_stream_timeout_sec, chunk_cb);
 
     if (_cancelled) { result.is_error = true; result.text = "Error: Operation cancelled."; return result; }
-    if (!res) { result.is_error = true; result.text = "Error: Request failed: " + httplib::to_string(res.error()); return result; }
-    if (res->status != 200) {
+    if (res.cancelled) {
+        if (!result.is_error)
+            return result;
+        return result;
+    }
+    if (!res.ok && res.status == 0) {
+        result.is_error = true;
+        result.text = std::string("Error: ")
+            + sanitize_transport_error(provider, base_url, res.error);
+        return result;
+    }
+    if (res.status < 200 || res.status >= 300) {
         result.is_error = true;
 
         std::string err_body;
@@ -2430,8 +2433,10 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
             else
                 err_body = sse_buffer.substr(0, 600);
         }
-        result.text = "Error: API returned status " + std::to_string(res->status)
-                    + (err_body.empty() ? "" : ": " + err_body);
+        if (err_body.empty() && !res.error.empty())
+            err_body = res.error.substr(0, 600);
+        result.text = "Error: API returned status " + std::to_string(res.status)
+                    + (err_body.empty() ? std::string() : (": " + err_body));
         return result;
     }
 

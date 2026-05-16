@@ -11,6 +11,7 @@
 #include "obfuscation.hpp"
 #include "pro.h"
 #include "../infra/work_queue.hpp"
+#include "../runtime/standalone_driver.hpp"
 
 #include <Zydis/Zydis.h>
 #include "zydis_disasm.hpp"
@@ -338,44 +339,55 @@ static std::optional<tool_result_t> ensure_attached_process_context(const json& 
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
 
     std::uint32_t requested_pid = 0;
-    if (params.contains("process_id"))
+    for (const char* key : {"target_pid", "process_id", "pid"})
     {
-        if (!parse_u32_id_value(params["process_id"], requested_pid))
-            return tool_result_t::error(OBFSTR("Invalid process_id. Expected a positive decimal PID or 0x-prefixed hex PID."));
-    }
-    else if (params.contains("pid"))
-    {
-        if (!parse_u32_id_value(params["pid"], requested_pid))
-            return tool_result_t::error(OBFSTR("Invalid pid. Expected a positive decimal PID or 0x-prefixed hex PID."));
+        if (!params.contains(key))
+            continue;
+        if (!parse_u32_id_value(params[key], requested_pid))
+            return tool_result_t::error(std::string(OBFSTR("Invalid ")) + key + OBFSTR(". Expected a positive decimal PID or 0x-prefixed hex PID."));
+        if (requested_pid != 0)
+            break;
     }
 
     if (requested_pid != 0 && is_self_target_pid(requested_pid))
         return tool_result_t::error(OBFSTR("Cannot target AiDA's own process."));
 
-    const std::uint32_t current_pid = device->get_process_id();
+    const std::uint32_t current_pid = driver_bridge::attached_pid();
     if (requested_pid != 0 && requested_pid != current_pid)
     {
         if (!is_process_alive(requested_pid))
-            return tool_result_t::error(OBFSTR("process_id ") + std::to_string(requested_pid) + OBFSTR(" is not alive."));
+            return tool_result_t::error(OBFSTR("target_pid ") + std::to_string(requested_pid) + OBFSTR(" is not alive."));
 
-        device->clear_process_context();
-        device->set_process_id(requested_pid);
-        (void)device->find_image();
-        device->solve_dtb();
+        const auto attached = driver_bridge::attached_pids();
+        bool in_map = false;
+        for (auto p : attached) { if (p == requested_pid) { in_map = true; break; } }
+        if (!in_map)
+        {
+            if (!driver_bridge::attach_additional(requested_pid))
+            {
+                return tool_result_t::error(OBFSTR("attach_additional failed for target_pid ") + std::to_string(requested_pid) +
+                                            OBFSTR(": ") + driver_bridge::last_error());
+            }
+        }
+
+        if (!driver_bridge::set_active_pid(requested_pid))
+            return tool_result_t::error(OBFSTR("set_active_pid failed for target_pid ") + std::to_string(requested_pid) +
+                                        OBFSTR(": ") + driver_bridge::last_error());
 
         if (device->get_dtb() == 0)
         {
-            device->clear_process_context();
-            return tool_result_t::error(OBFSTR("Failed to solve DTB for process_id ") + std::to_string(requested_pid) + OBFSTR(". Reattach by name with driver_attach."));
+            device->solve_dtb();
+            if (device->get_dtb() == 0)
+                return tool_result_t::error(OBFSTR("Failed to solve DTB for target_pid ") + std::to_string(requested_pid) + OBFSTR("."));
         }
     }
 
-    if (device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Not attached. Call driver_attach first or pass process_id."));
+    if (driver_bridge::attached_pid() == 0)
+        return tool_result_t::error(OBFSTR("Not attached. Call driver_attach first or pass target_pid."));
 
-    if (!is_process_alive(device->get_process_id()))
+    if (!is_process_alive(driver_bridge::attached_pid()))
     {
-        const std::uint32_t dead_pid = device->get_process_id();
+        const std::uint32_t dead_pid = driver_bridge::attached_pid();
         device->clear_process_context();
         return tool_result_t::error(OBFSTR("Attached process PID ") + std::to_string(dead_pid) + OBFSTR(" is no longer alive. Call driver_attach again."));
     }
@@ -11580,7 +11592,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Virtual address in target process"), true},
          {OBFSTR("size"), OBFSTR("number"), OBFSTR("Bytes to read (default 256, max 65536)"), false},
           {OBFSTR("patch_idb"), OBFSTR("boolean"), OBFSTR("Write read bytes to IDA database (default false)"), false},
-          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override. If different from attached PID, context is switched safely."), false}},
+          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_read_memory, false});
 
     register_compat(srv, {
@@ -11590,7 +11602,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
              "Accepted bytes formats: 'DE AD BE EF', 'DEADBEEF', [222,173,...], ['DE','AD',...]."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Virtual address in target process"), true},
           {OBFSTR("bytes"), OBFSTR("string"), OBFSTR("Bytes payload in hex string or JSON array."), true},
-          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override. If different from attached PID, context is switched safely."), false}},
+          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_write_memory, false});
 
     register_compat(srv, {
@@ -11633,7 +11645,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
          {OBFSTR("max_length"), OBFSTR("number"), OBFSTR("Maximum string character length (default 512)"), false},
          {OBFSTR("type"), OBFSTR("string"), OBFSTR("String encoding: auto, ascii, wide (default auto)"), false,
                     {OBFSTR("auto"), OBFSTR("ascii"), OBFSTR("wide")}},
-                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
+                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_read_string, false});
 
     register_compat(srv, {
@@ -11645,7 +11657,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
          {OBFSTR("offsets"), OBFSTR("array"),
           OBFSTR("Array of byte offsets to apply after each dereference (e.g. [0, 48, 24])"), false, {},
            json::object({{"type", "number"}})},
-          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
+          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_read_pointer_chain, false});
 
     register_compat(srv, {
@@ -11727,7 +11739,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
                "Requires driver connected and process attached."),
         {{OBFSTR("size"), OBFSTR("string"),
                     OBFSTR("Number of bytes to allocate (max 16777216 = 16MB)"), true},
-                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
+                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_allocate_memory, false});
 
     register_compat(srv, {
@@ -11737,7 +11749,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
                "Requires driver connected and process attached."),
         {{OBFSTR("address"), OBFSTR("string"),
                     OBFSTR("Address of the memory block to free (hex string like '0x...')"), true},
-                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
+                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_free_memory, false});
 
     register_compat(srv, {
@@ -11766,7 +11778,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
          {OBFSTR("allow_unsafe"), OBFSTR("boolean"), OBFSTR("Alias of confirm_unsafe."), false},
          {OBFSTR("unsafe"), OBFSTR("boolean"), OBFSTR("Alias of confirm_unsafe."), false},
                  {OBFSTR("dry_run"), OBFSTR("boolean"), OBFSTR("Preview call metadata without executing."), false},
-                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
+                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_call_function, false});
 
 
@@ -11776,7 +11788,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
                "Returns all general purpose registers (RAX-R15), RIP, RFLAGS, and debug registers (DR0-DR7). "
                "Thread must exist in the attached process. Bypasses all anti-debug since it operates from kernel."),
         {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID. Decimal string recommended; 0x-prefixed hex supported."), true},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_get_thread_context, true});
 
     register_compat(srv, {
@@ -11810,7 +11822,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
          {OBFSTR("dr3"), OBFSTR("string"), OBFSTR("DR3 value"), false},
          {OBFSTR("dr6"), OBFSTR("string"), OBFSTR("DR6 value"), false},
          {OBFSTR("dr7"), OBFSTR("string"), OBFSTR("DR7 value"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_set_thread_context, false});
 
     register_compat(srv, {
@@ -11818,14 +11830,14 @@ void register_driver_tools(mcp_standalone::server_t& srv)
         OBFSTR("Enumerate all threads in the attached process via kernel PsGetNextProcessThread. "
                "Returns each thread's TID. Useful for finding threads to suspend, set breakpoints on, "
                "or inspect context of."),
-        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}}, driver_enumerate_threads, true});
+        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}}, driver_enumerate_threads, true});
 
     register_compat(srv, {
         OBFSTR("driver_suspend_thread"), OBFSTR("driver"),
         OBFSTR("Suspend a thread in the attached process via kernel PsSuspendThread. "
                "Thread execution is paused until resumed. Returns previous suspend count."),
         {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID to suspend. Decimal string recommended; 0x-prefixed hex supported."), true},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_suspend_thread, false});
 
     register_compat(srv, {
@@ -11833,7 +11845,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
         OBFSTR("Resume a suspended thread in the attached process via kernel PsResumeThread. "
                "Returns previous suspend count. Thread resumes execution."),
         {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID to resume. Decimal string recommended; 0x-prefixed hex supported."), true},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_resume_thread, false});
 
     register_compat(srv, {
@@ -11843,7 +11855,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
                "protection (RWX flags), and type (private/mapped/image)."),
         {{OBFSTR("address"), OBFSTR("string"),
                     OBFSTR("Virtual address to query (default: image base)"), false},
-                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
+                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_query_memory, true});
 
     register_compat(srv, {
@@ -11856,7 +11868,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
          {OBFSTR("protect"), OBFSTR("string"),
           OBFSTR("New protection value: 0x40=PAGE_EXECUTE_READWRITE, 0x20=PAGE_EXECUTE_READ, "
              "0x04=PAGE_READWRITE, 0x02=PAGE_READONLY"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_protect_memory, false});
 
     register_compat(srv, {
@@ -11868,7 +11880,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
          {OBFSTR("end"), OBFSTR("string"), OBFSTR("End address (default max user-mode)"), false},
          {OBFSTR("include_all"), OBFSTR("boolean"),
                     OBFSTR("Include free/reserved regions too (default false, only committed)"), false},
-                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
+                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_enumerate_memory_regions, true});
 
     register_compat(srv, {
@@ -11876,7 +11888,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
         OBFSTR("Read the Process Environment Block (PEB) of the attached process via kernel. "
                "Returns PEB address, image base, BeingDebugged flag, NtGlobalFlag, "
                "loader data address, process heap, and heap info."),
-        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}}, driver_read_peb, true});
+        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}}, driver_read_peb, true});
 
     register_compat(srv, {
         OBFSTR("driver_spoof_debug_flags"), OBFSTR("driver"),
@@ -11884,7 +11896,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
                "Zeroes EPROCESS.DebugPort, PEB.BeingDebugged, clears PEB.NtGlobalFlag heap debug flags. "
                "Completely invisible to the target process. Call this before the target's anti-debug "
                "checks run to bypass IsDebuggerPresent, NtQueryInformationProcess, etc."),
-        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}}, driver_spoof_debug_flags, false});
+        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}}, driver_spoof_debug_flags, false});
 
     register_compat(srv, {
         OBFSTR("driver_set_hw_breakpoint"), OBFSTR("driver"),
@@ -11902,7 +11914,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
           {OBFSTR("execute"), OBFSTR("write"), OBFSTR("readwrite")}},
          {OBFSTR("size"), OBFSTR("number"),
                     OBFSTR("Watched region size in bytes: 1 (default), 2, 4, or 8"), false},
-                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
+                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_set_hw_breakpoint, false});
 
     register_compat(srv, {
@@ -11912,7 +11924,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
                 {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID. Decimal string recommended; 0x-prefixed hex supported."), true},
          {OBFSTR("index"), OBFSTR("number"),
                     OBFSTR("Debug register index 0-3 to clear (default 0)"), false},
-                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
+                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_clear_hw_breakpoint, false});
 
     register_compat(srv, {
@@ -11926,7 +11938,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
            OBFSTR("Module base address (default: attached process image base)"), false},
           {OBFSTR("module"), OBFSTR("string"), OBFSTR("Module name/path or base address string. Alias: module_name."), false},
           {OBFSTR("module_name"), OBFSTR("string"), OBFSTR("Alias for module."), false},
-          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
+          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_resolve_export, true});
 
     register_compat(srv, {

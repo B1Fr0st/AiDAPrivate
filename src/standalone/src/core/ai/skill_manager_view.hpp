@@ -478,11 +478,8 @@ namespace skill_manager {
 				aida::motion::spring::balanced, dt);
 		}
 
-		dl->AddRectFilledMultiColor(
-			ImVec2(st.tab_underline_x, y + btn_h - 3.f),
-			ImVec2(st.tab_underline_x + st.tab_underline_w, y + btn_h),
-			th.accent_grad_top, th.accent_grad_top,
-			th.accent_grad_bot, th.accent_grad_bot);
+		ui_anim::render_tab_underline_glow(dl, st.tab_underline_x, st.tab_underline_w,
+			y + btn_h - 3.f, 1.f);
 
 		for (int i = 0; i < 3; ++i) {
 			float bx = x + (btn_w + 4.f) * i;

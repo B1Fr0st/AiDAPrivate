@@ -16,9 +16,11 @@
 #include "../ui/brand.hpp"
 #include "../ui/fonts.hpp"
 #include "../ui/toast_notification.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <mutex>
@@ -60,16 +62,27 @@ inline void start_deobfuscate(local_state_t& st) {
 	if (st.addr_input[0])
 		addr = std::strtoull(st.addr_input, nullptr, 16);
 	if (addr == 0) {
+		diag::log_tagged_fmt("deobf",
+			"deob_view_start_reject reason=zero_addr buf='%s'", st.addr_input);
 		toast_notification::push("Enter a function address (hex)",
 			toast_notification::toast_type_t::warning, 3.0f);
 		return;
 	}
-	if (deobfuscation_engine::g_state.processing.load()) return;
+	if (deobfuscation_engine::g_state.processing.load()) {
+		diag::log_tagged("deobf", "deob_view_start_reject reason=engine_busy");
+		return;
+	}
 	uint32_t max_insn = static_cast<uint32_t>(st.max_instructions);
+
+	diag::log_tagged_fmt("deobf",
+		"deob_view_start entry=0x%llX max=%u",
+		static_cast<unsigned long long>(addr), max_insn);
+
 	deobfuscation_engine::g_state.processing.store(true);
 	deobfuscation_engine::g_state.progress_current.store(0);
 	deobfuscation_engine::g_state.progress_total.store(5);
-	work_queue::post([addr, max_insn]() {
+	auto t0 = std::chrono::steady_clock::now();
+	work_queue::post([addr, max_insn, t0]() {
 		deobfuscation_engine::deobfuscated_result_t result;
 		try {
 			result = deobfuscation_engine::deobfuscate_function(addr, max_insn);
@@ -79,6 +92,21 @@ inline void start_deobfuscate(local_state_t& st) {
 		} catch (...) {
 			result.success = false;
 			result.error = "Deobfuscation aborted by unknown exception";
+		}
+		auto t1 = std::chrono::steady_clock::now();
+		auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+		if (result.success) {
+			diag::log_tagged_fmt("deobf",
+				"deob_view_done entry=0x%llX original=%u clean=%u junk=%u opaques=%u const=%u states=%u duration_ms=%lld",
+				static_cast<unsigned long long>(addr),
+				result.total_original, result.total_clean, result.removed_junk,
+				result.opaque_predicates_found, result.constants_resolved,
+				result.dispatcher_states_resolved, static_cast<long long>(dur));
+		} else {
+			diag::log_tagged_fmt("deobf",
+				"deob_view_fail entry=0x%llX error='%s' duration_ms=%lld",
+				static_cast<unsigned long long>(addr),
+				result.error.c_str(), static_cast<long long>(dur));
 		}
 		std::lock_guard<std::mutex> lk(deobfuscation_engine::g_state.mutex);
 		deobfuscation_engine::g_state.last_result = std::move(result);
@@ -226,7 +254,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			std::snprintf(buf, sizeof(buf), "Applied %u clean instructions",
 				eng.last_result.total_clean);
 			toast_notification::push(buf, toast_notification::toast_type_t::success, 3.0f);
+			diag::log_tagged_fmt("deobf",
+				"apply_clean_copied bytes=%zu insns=%u",
+				text.size(), eng.last_result.total_clean);
 		} else {
+			diag::log_tagged("deobf", "apply_clean_reject reason=no_result");
 			toast_notification::push("No deobfuscation result yet",
 				toast_notification::toast_type_t::warning, 2.5f);
 		}
@@ -243,6 +275,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImGui::SetClipboardText(text.c_str());
 			toast_notification::push("Statistics copied to clipboard",
 				toast_notification::toast_type_t::info, 2.5f);
+			diag::log_tagged_fmt("deobf", "stats_copied bytes=%zu", text.size());
+		} else {
+			diag::log_tagged("deobf", "stats_reject reason=no_result");
 		}
 	}
 

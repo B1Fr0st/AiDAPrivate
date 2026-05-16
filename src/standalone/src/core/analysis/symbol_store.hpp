@@ -6,6 +6,7 @@
 #include <atomic>
 #include "work_queue.hpp"
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -46,6 +47,47 @@ struct state_t {
 };
 
 inline state_t g_state;
+
+struct snapshot_t {
+	std::unordered_map<std::string, module_symbols_t> modules;
+	std::vector<std::string>                          search_paths;
+	std::string                                       cache_dir;
+	bool                                              auto_download = false;
+	std::string                                       symbol_server_url = "https://msdl.microsoft.com/download/symbols";
+};
+
+inline std::unique_ptr<snapshot_t> detach_snapshot() {
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	auto out = std::make_unique<snapshot_t>();
+	out->modules = std::move(g_state.modules);
+	out->search_paths = std::move(g_state.search_paths);
+	out->cache_dir = std::move(g_state.cache_dir);
+	out->auto_download = g_state.auto_download;
+	out->symbol_server_url = std::move(g_state.symbol_server_url);
+	g_state.modules.clear();
+	g_state.search_paths.clear();
+	g_state.cache_dir.clear();
+	g_state.auto_download = false;
+	g_state.symbol_server_url = "https://msdl.microsoft.com/download/symbols";
+	return out;
+}
+
+inline void attach_snapshot(std::unique_ptr<snapshot_t> snap) {
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	if (!snap) {
+		g_state.modules.clear();
+		g_state.search_paths.clear();
+		g_state.cache_dir.clear();
+		g_state.auto_download = false;
+		g_state.symbol_server_url = "https://msdl.microsoft.com/download/symbols";
+		return;
+	}
+	g_state.modules = std::move(snap->modules);
+	g_state.search_paths = std::move(snap->search_paths);
+	g_state.cache_dir = std::move(snap->cache_dir);
+	g_state.auto_download = snap->auto_download;
+	g_state.symbol_server_url = std::move(snap->symbol_server_url);
+}
 
 namespace detail {
 
@@ -370,6 +412,74 @@ inline void load_pdb_with_hint(const std::string& module_name, uint64_t base, ui
 	});
 }
 
+inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t base, uint64_t size,
+                                        const std::string& pdb_path)
+{
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		auto& ms = g_state.modules[module_name];
+		ms.module_name = module_name;
+		ms.base = base;
+		ms.size = size;
+		ms.loading = true;
+		ms.failed = false;
+		ms.downloading = false;
+		ms.download_total = 0;
+		ms.download_received = 0;
+		ms.download_percent = 0;
+		ms.status_text = "Parsing user-supplied PDB...";
+	}
+
+	std::string mod_copy = module_name;
+	std::string path_copy = pdb_path;
+
+	work_queue::post([mod_copy, path_copy]() {
+		pdb_parser::pdb_info_t info;
+		std::atomic<float> parse_progress{0.f};
+		bool parse_ok = pdb_parser::parse_pdb(path_copy, "", info, &parse_progress);
+
+		aida::events::event_pdb_loaded ev_payload;
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			auto& ms = g_state.modules[mod_copy];
+			ms.loading = false;
+			if (parse_ok) {
+				ms.pdb = std::move(info);
+				char buf[128];
+				snprintf(buf, sizeof(buf), "Loaded from %s: %zu symbols, %zu types",
+				         std::filesystem::path(path_copy).filename().string().c_str(),
+				         ms.pdb.symbols.size(), ms.pdb.structs.size());
+				ms.status_text = buf;
+				ev_payload.module_name = ms.module_name;
+				ev_payload.base = ms.base;
+				ev_payload.size = ms.size;
+				ev_payload.success = true;
+				ev_payload.symbol_count = static_cast<uint32_t>(ms.pdb.symbols.size());
+				ev_payload.struct_count = static_cast<uint32_t>(ms.pdb.structs.size());
+				ev_payload.enum_count = static_cast<uint32_t>(ms.pdb.enums.size());
+			} else {
+				ms.failed = true;
+				ms.status_text = "Failed to parse user-supplied PDB";
+				ev_payload.module_name = ms.module_name;
+				ev_payload.base = ms.base;
+				ev_payload.size = ms.size;
+				ev_payload.success = false;
+			}
+		}
+
+		auto parent_dir = std::filesystem::path(path_copy).parent_path().string();
+		if (!parent_dir.empty()) {
+			bool already = false;
+			for (auto& sp : g_state.search_paths) {
+				if (_stricmp(sp.c_str(), parent_dir.c_str()) == 0) { already = true; break; }
+			}
+			if (!already) g_state.search_paths.push_back(parent_dir);
+		}
+
+		aida::events::publish(aida::events::event_pdb_loaded_def, ev_payload);
+	});
+}
+
 inline void auto_load_attached_modules()
 {
 	auto modules = driver_bridge::enumerate_modules();
@@ -423,6 +533,35 @@ inline std::string resolve_symbol(uint64_t address)
 			         static_cast<unsigned long long>(rva - best_rva));
 			return buf;
 		}
+	}
+
+	return {};
+}
+
+inline std::string resolve_function_display_name(uint64_t address)
+{
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+
+	for (auto& [mod_name, ms] : g_state.modules) {
+		if (!ms.pdb.loaded) continue;
+		if (address < ms.base || address >= ms.base + ms.size) continue;
+
+		uint64_t rva = address - ms.base;
+		auto it = ms.pdb.symbol_by_rva.find(rva);
+		if (it != ms.pdb.symbol_by_rva.end())
+			return ms.pdb.symbols[it->second].name;
+
+		const std::string* best_name = nullptr;
+		uint64_t best_rva = 0;
+		for (auto& sym : ms.pdb.symbols) {
+			if (sym.is_function && sym.rva <= rva && sym.rva > best_rva &&
+			    (rva - sym.rva) < 0x10000) {
+				best_rva = sym.rva;
+				best_name = &sym.name;
+			}
+		}
+		if (best_name && best_rva == rva)
+			return *best_name;
 	}
 
 	return {};

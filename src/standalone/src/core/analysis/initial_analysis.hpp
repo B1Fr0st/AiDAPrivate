@@ -86,6 +86,15 @@ struct state_t {
 	pdb_hint_t                           pdb_hint;
 	std::mutex                           pdb_hint_mtx;
 
+	std::atomic<bool>                    needs_local_pdb_prompt{false};
+	std::atomic<pdb_decision_t>          local_pdb_decision{pdb_decision_t::pending};
+	std::string                          local_pdb_path;
+	std::string                          local_pdb_reason;
+	std::string                          local_pdb_module_name;
+	uint64_t                             local_pdb_image_base = 0;
+	uint64_t                             local_pdb_image_size = 0;
+	std::mutex                           local_pdb_mtx;
+
 	std::atomic<bool>                    opt_load_types{true};
 	std::atomic<bool>                    opt_load_names{true};
 
@@ -484,6 +493,46 @@ inline bool wait_for_pdb_decision()
 	return false;
 }
 
+inline void request_local_pdb_prompt(const std::string& module_name,
+                                     uint64_t image_base, uint64_t image_size,
+                                     const std::string& reason)
+{
+	{
+		std::lock_guard<std::mutex> lk(g_state.local_pdb_mtx);
+		g_state.local_pdb_module_name = module_name;
+		g_state.local_pdb_image_base = image_base;
+		g_state.local_pdb_image_size = image_size;
+		g_state.local_pdb_reason = reason;
+		g_state.local_pdb_path.clear();
+	}
+	g_state.local_pdb_decision.store(pdb_decision_t::pending, std::memory_order_release);
+	g_state.needs_local_pdb_prompt.store(true, std::memory_order_release);
+}
+
+inline bool wait_for_local_pdb_decision(std::string& out_path)
+{
+	const uint64_t timeout_ns = 300ull * 1000ull * 1000ull * 1000ull;
+	uint64_t start = now_ns();
+	while (!g_state.cancel.load(std::memory_order_acquire)) {
+		auto d = g_state.local_pdb_decision.load(std::memory_order_acquire);
+		if (d != pdb_decision_t::pending) {
+			if (d == pdb_decision_t::accepted) {
+				std::lock_guard<std::mutex> lk(g_state.local_pdb_mtx);
+				out_path = g_state.local_pdb_path;
+				return !out_path.empty();
+			}
+			return false;
+		}
+		if (now_ns() - start > timeout_ns) {
+			g_state.needs_local_pdb_prompt.store(false, std::memory_order_release);
+			g_state.local_pdb_decision.store(pdb_decision_t::declined, std::memory_order_release);
+			return false;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	}
+	return false;
+}
+
 inline bool poll_pdb_loaded(const std::string& module_key)
 {
 	const uint64_t timeout_ns = 600ull * 1000ull * 1000ull * 1000ull;
@@ -720,6 +769,8 @@ inline void run_pipeline(const std::string& path, const std::string& filename)
 	pdb_hint_t hint;
 	bool has_debug = extract_codeview_info(view, hint);
 	bool pdb_user_accepted = false;
+	bool local_pdb_user_accepted = false;
+	std::string local_pdb_picked_path;
 	std::string pdb_module_key;
 	if (has_debug) {
 		push_log_fmt("The input file was linked with debug information stored here: %s",
@@ -748,7 +799,17 @@ inline void run_pipeline(const std::string& path, const std::string& filename)
 		pdb_module_key = filename;
 	} else {
 		push_log("No PDB CodeView debug entry present in image");
-		end_step(step_id_t::detect_debug_info, "no debug info", true);
+		push_log("Asking user for an externally-supplied PDB file...");
+		request_local_pdb_prompt(filename, view.image_base, view.size_of_image,
+			"This binary does not embed any PDB debug information. Do you have a PDB file for it locally?");
+		local_pdb_user_accepted = wait_for_local_pdb_decision(local_pdb_picked_path);
+		if (local_pdb_user_accepted) {
+			pdb_module_key = filename;
+			push_log_fmt("User supplied PDB: %s", local_pdb_picked_path.c_str());
+			end_step(step_id_t::detect_debug_info, "user-supplied PDB");
+		} else {
+			end_step(step_id_t::detect_debug_info, "no debug info", true);
+		}
 	}
 
 	begin_step(step_id_t::load_pdb);
@@ -781,10 +842,45 @@ inline void run_pipeline(const std::string& path, const std::string& filename)
 		pdb_loaded = poll_pdb_loaded(filename);
 		symbol_store::g_state.auto_download = prev_auto;
 
+		if (!pdb_loaded) {
+			char reason_buf[384];
+			std::snprintf(reason_buf, sizeof(reason_buf),
+				"The PDB file '%s' was not available on the Microsoft Symbol Server (or the download failed). Do you have a local copy of it?",
+				hint.pdb_name.c_str());
+			push_log("Symbol-server PDB unavailable, asking user for a local PDB file...");
+			request_local_pdb_prompt(filename, view.image_base, view.size_of_image, reason_buf);
+			local_pdb_user_accepted = wait_for_local_pdb_decision(local_pdb_picked_path);
+		}
+
+		if (local_pdb_user_accepted && !local_pdb_picked_path.empty()) {
+			push_log_fmt("Loading user-supplied PDB: %s", local_pdb_picked_path.c_str());
+			symbol_store::load_pdb_from_explicit_path(filename, view.image_base,
+				view.size_of_image, local_pdb_picked_path);
+			pdb_loaded = poll_pdb_loaded(filename);
+			pdb_module_key = filename;
+		}
+
 		end_step(step_id_t::load_pdb, pdb_loaded ? "PDB loaded" : "PDB unavailable", !pdb_loaded);
 	} else if (has_debug && !pdb_user_accepted) {
 		push_log("PDB load skipped by user");
 		end_step(step_id_t::load_pdb, "user declined", true);
+	} else if (!has_debug && local_pdb_user_accepted && !local_pdb_picked_path.empty()
+	           && g_state.opt_load_names.load(std::memory_order_acquire)) {
+		std::filesystem::path bp(path);
+		std::filesystem::path parent = bp.parent_path();
+		if (!parent.empty()) {
+			std::string parent_str = parent.string();
+			bool already = false;
+			for (const auto& sp : symbol_store::g_state.search_paths) {
+				if (_stricmp(sp.c_str(), parent_str.c_str()) == 0) { already = true; break; }
+			}
+			if (!already) symbol_store::add_search_path(parent_str);
+		}
+		push_log_fmt("Loading user-supplied PDB: %s", local_pdb_picked_path.c_str());
+		symbol_store::load_pdb_from_explicit_path(filename, view.image_base,
+			view.size_of_image, local_pdb_picked_path);
+		pdb_loaded = poll_pdb_loaded(filename);
+		end_step(step_id_t::load_pdb, pdb_loaded ? "PDB loaded" : "PDB load failed", !pdb_loaded);
 	} else {
 		end_step(step_id_t::load_pdb, "no PDB info", true);
 	}
@@ -878,6 +974,16 @@ inline void reset_state()
 	g_state.overall_progress.store(0.f, std::memory_order_release);
 	g_state.needs_pdb_prompt.store(false, std::memory_order_release);
 	g_state.pdb_decision.store(pdb_decision_t::pending, std::memory_order_release);
+	g_state.needs_local_pdb_prompt.store(false, std::memory_order_release);
+	g_state.local_pdb_decision.store(pdb_decision_t::pending, std::memory_order_release);
+	{
+		std::lock_guard<std::mutex> lk(g_state.local_pdb_mtx);
+		g_state.local_pdb_path.clear();
+		g_state.local_pdb_reason.clear();
+		g_state.local_pdb_module_name.clear();
+		g_state.local_pdb_image_base = 0;
+		g_state.local_pdb_image_size = 0;
+	}
 	g_state.opt_load_types.store(true, std::memory_order_release);
 	g_state.opt_load_names.store(true, std::memory_order_release);
 	g_state.active_step_index.store(-1, std::memory_order_release);
@@ -935,6 +1041,26 @@ inline void decline_pdb_prompt()
 	g_state.opt_load_types.store(false, std::memory_order_release);
 	g_state.opt_load_names.store(false, std::memory_order_release);
 	g_state.pdb_decision.store(pdb_decision_t::declined, std::memory_order_release);
+}
+
+inline void accept_local_pdb_prompt(const std::string& picked_path)
+{
+	{
+		std::lock_guard<std::mutex> lk(g_state.local_pdb_mtx);
+		g_state.local_pdb_path = picked_path;
+	}
+	g_state.needs_local_pdb_prompt.store(false, std::memory_order_release);
+	g_state.local_pdb_decision.store(pdb_decision_t::accepted, std::memory_order_release);
+}
+
+inline void decline_local_pdb_prompt()
+{
+	{
+		std::lock_guard<std::mutex> lk(g_state.local_pdb_mtx);
+		g_state.local_pdb_path.clear();
+	}
+	g_state.needs_local_pdb_prompt.store(false, std::memory_order_release);
+	g_state.local_pdb_decision.store(pdb_decision_t::declined, std::memory_order_release);
 }
 
 inline void dismiss_overlay()

@@ -94,9 +94,13 @@ namespace xref_index {
 			std::atomic<bool>                                                rebuild_in_flight{false};
 		};
 
+		inline std::unique_ptr<registry_t>& registry_holder() {
+			static std::unique_ptr<registry_t> h = std::make_unique<registry_t>();
+			return h;
+		}
+
 		inline registry_t& registry() {
-			static registry_t r;
-			return r;
+			return *registry_holder();
 		}
 
 		inline edge_t classify_edge(xref_engine::xref_type_t t) {
@@ -869,6 +873,27 @@ namespace xref_index {
 				});
 			}
 		}
+	}
+
+	inline std::unique_ptr<detail::registry_t> detach_snapshot() {
+		auto& h = detail::registry_holder();
+		{
+			std::unique_lock<std::shared_mutex> drain(h->rw);
+			(void)drain;
+		}
+		std::unique_ptr<detail::registry_t> out = std::move(h);
+		h = std::make_unique<detail::registry_t>();
+		return out;
+	}
+
+	inline void attach_snapshot(std::unique_ptr<detail::registry_t> snap) {
+		auto& h = detail::registry_holder();
+		if (!snap) snap = std::make_unique<detail::registry_t>();
+		{
+			std::unique_lock<std::shared_mutex> drain(h->rw);
+			(void)drain;
+		}
+		h = std::move(snap);
 	}
 
 }

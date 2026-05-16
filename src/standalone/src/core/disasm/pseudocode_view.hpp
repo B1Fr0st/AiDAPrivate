@@ -20,7 +20,7 @@ struct tab_info_t {
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b);
 
-void request_decompile(uint64_t addr, const DisasmFile* file);
+void request_decompile(uint64_t addr, const DisasmFile* file, bool force_refresh = false);
 
 void close_active_tab();
 void close_all_tabs();

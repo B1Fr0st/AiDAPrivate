@@ -70,7 +70,14 @@ test('AnomalyModel scores anomalous sample > revoke threshold after 30-day clean
     }
 
     let lastDecision = null;
-    const engine = new anomalyScore.AnomalyScoringEngine({ model: m, minBaselineSamples: 32 });
+    const engine = new anomalyScore.AnomalyScoringEngine({
+        model: m,
+        minBaselineSamples: 32,
+        revokeThreshold: 4.0,
+        minRevokeBaselineSamples: 32,
+        revokeSustainedConsecutive: 3,
+        revokeSustainedThreshold: 4.0,
+    });
     const anomalousMetrics = [
         { cadenceMs: 50, rdtscDeltaMean: 1e3, rdtscDeltaStd: 100, exceptionCount: 17, moduleLoadCount: 84, moduleLoadUnique: 84 },
         { cadenceMs: 25, rdtscDeltaMean: 5e2, rdtscDeltaStd: 50, exceptionCount: 22, moduleLoadCount: 100, moduleLoadUnique: 99 },
@@ -89,8 +96,8 @@ test('AnomalyModel scores anomalous sample > revoke threshold after 30-day clean
     }
     assert.ok(lastDecision, 'should have produced a decision');
     assert.equal(lastDecision.action, 'revoke', `expected action=revoke, got ${lastDecision.action} score=${lastDecision.score}`);
-    assert.ok(lastDecision.score >= anomalyScore.REVOKE_THRESHOLD,
-        `expected score>=${anomalyScore.REVOKE_THRESHOLD}, got ${lastDecision.score}`);
+    assert.ok(lastDecision.score >= 4.0,
+        `expected score>=4.0, got ${lastDecision.score}`);
 });
 
 test('AnomalyModel flags slightly-anomalous metrics between flag and revoke thresholds', () => {
@@ -193,7 +200,14 @@ test('AnomalyScoringEngine simulated 30-day baseline + 5 anomalous heartbeats tr
             moduleLoadUnique: 12,
         }, Date.now() - (baselineCount - i) * 3600_000);
     }
-    const engine = new anomalyScore.AnomalyScoringEngine({ model: m, minBaselineSamples: 32 });
+    const engine = new anomalyScore.AnomalyScoringEngine({
+        model: m,
+        minBaselineSamples: 32,
+        revokeThreshold: 4.0,
+        minRevokeBaselineSamples: 32,
+        revokeSustainedConsecutive: 3,
+        revokeSustainedThreshold: 4.0,
+    });
     let revokedAt = -1;
     for (let i = 0; i < 5; i++) {
         const metrics = {
@@ -213,4 +227,162 @@ test('AnomalyScoringEngine simulated 30-day baseline + 5 anomalous heartbeats tr
     }
     console.log('[anomaly-trip-log]\n' + log.join('\n'));
     assert.notEqual(revokedAt, -1, 'expected at least one revoke decision in the 5 anomalous heartbeats');
+});
+
+test('false_positive_slow_cadence_should_not_revoke (regression for production revoke at z=4.116 cadenceMs=36000 mean=21220.41 std=3590.56 samples=676)', () => {
+    const m = new AnomalyModel({ persistEnabled: false });
+    const targetMean = 21220.41;
+    const targetStd = 3590.56;
+    const targetCount = 676;
+    let rngState = 0xC0FFEE42;
+    const rng = () => {
+        rngState = (rngState * 1664525 + 1013904223) >>> 0;
+        return rngState / 0xFFFFFFFF;
+    };
+    const gauss = () => {
+        const u1 = Math.max(rng(), 1e-12);
+        const u2 = rng();
+        return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    };
+    const raw = [];
+    for (let i = 0; i < targetCount; i++) raw.push(gauss());
+    const rawMean = raw.reduce((a, b) => a + b, 0) / raw.length;
+    let rawSumSq = 0;
+    for (const v of raw) rawSumSq += (v - rawMean) * (v - rawMean);
+    const rawStd = Math.sqrt(rawSumSq / (raw.length - 1));
+    const cadenceSeries = raw.map(v => targetMean + ((v - rawMean) / rawStd) * targetStd);
+    const now = Date.now();
+    for (let i = 0; i < targetCount; i++) {
+        m.addSample('LIC-FALSE-POSITIVE', {
+            cadenceMs: cadenceSeries[i],
+            rdtscDeltaMean: 1e9 + (rng() * 1e6),
+            rdtscDeltaStd: 1e5 + (rng() * 200),
+            exceptionCount: 0,
+            moduleLoadCount: 12,
+            moduleLoadUnique: 12,
+        }, now - (targetCount - i) * 60_000);
+    }
+    const summary = m.summary('LIC-FALSE-POSITIVE');
+    assert.ok(summary, 'baseline summary must exist');
+    assert.ok(Math.abs(summary.metrics.cadenceMs.mean - targetMean) < 1.0,
+        `expected baseline mean ~${targetMean}, got ${summary.metrics.cadenceMs.mean}`);
+    assert.ok(Math.abs(summary.metrics.cadenceMs.std - targetStd) < 1.0,
+        `expected baseline std ~${targetStd}, got ${summary.metrics.cadenceMs.std}`);
+    assert.equal(summary.sampleCount, targetCount);
+
+    const engine = new anomalyScore.AnomalyScoringEngine({
+        model: m,
+        minBaselineSamples: 32,
+    });
+    const decision = engine.evaluate('LIC-FALSE-POSITIVE', {
+        cadenceMs: 36000,
+        rdtscDeltaMean: summary.metrics.rdtscDeltaMean.mean,
+        rdtscDeltaStd: summary.metrics.rdtscDeltaStd.mean,
+        exceptionCount: 0,
+        moduleLoadCount: 12,
+        moduleLoadUnique: 12,
+    });
+    assert.ok(decision.score >= 4.0,
+        `raw z must still cross 4.0 for the test premise (got ${decision.score})`);
+    assert.notEqual(decision.action, 'revoke',
+        `slow-cadence outlier (laptop suspend/network blip) must NOT auto-revoke; got action=${decision.action} reason=${decision.reason}`);
+    assert.equal(decision.action, 'observe',
+        `expected action=observe for slow-cadence-only outlier within grace; got ${decision.action} reason=${decision.reason}`);
+    assert.equal(decision.cadenceDirection, 'slow');
+    assert.equal(decision.cadenceWithinSlowGrace, true);
+    assert.equal(decision.suppression, 'slow_cadence_within_grace');
+});
+
+test('sustained_fast_cadence_bot_pattern_should_revoke_after_consecutive_samples (counterpart: bot spamming heartbeats trips even when single sample below z=6)', () => {
+    const m = new AnomalyModel({ persistEnabled: false });
+    const targetMean = 21220.41;
+    const targetStd = 3590.56;
+    const targetCount = 1024;
+    let rngState = 0xBADF00D1;
+    const rng = () => {
+        rngState = (rngState * 1664525 + 1013904223) >>> 0;
+        return rngState / 0xFFFFFFFF;
+    };
+    const gauss = () => {
+        const u1 = Math.max(rng(), 1e-12);
+        const u2 = rng();
+        return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    };
+    const raw = [];
+    for (let i = 0; i < targetCount; i++) raw.push(gauss());
+    const rawMean = raw.reduce((a, b) => a + b, 0) / raw.length;
+    let rawSumSq = 0;
+    for (const v of raw) rawSumSq += (v - rawMean) * (v - rawMean);
+    const rawStd = Math.sqrt(rawSumSq / (raw.length - 1));
+    const cadenceSeries = raw.map(v => targetMean + ((v - rawMean) / rawStd) * targetStd);
+    const now = Date.now();
+    for (let i = 0; i < targetCount; i++) {
+        m.addSample('LIC-BOT', {
+            cadenceMs: cadenceSeries[i],
+            rdtscDeltaMean: 1e9,
+            rdtscDeltaStd: 1e5,
+            exceptionCount: 0,
+            moduleLoadCount: 12,
+            moduleLoadUnique: 12,
+        }, now - (targetCount - i) * 60_000);
+    }
+    const engine = new anomalyScore.AnomalyScoringEngine({
+        model: m,
+        minBaselineSamples: 32,
+    });
+    let revokeAt = -1;
+    let lastDecision = null;
+    for (let i = 0; i < 12; i++) {
+        const fastCadence = 1000;
+        const decision = engine.evaluate('LIC-BOT', {
+            cadenceMs: fastCadence,
+            rdtscDeltaMean: 1e9,
+            rdtscDeltaStd: 1e5,
+            exceptionCount: 0,
+            moduleLoadCount: 12,
+            moduleLoadUnique: 12,
+        });
+        lastDecision = decision;
+        if (decision.action === 'revoke' && revokeAt === -1) {
+            revokeAt = i;
+            break;
+        }
+    }
+    assert.notEqual(revokeAt, -1,
+        `sustained fast-cadence automation MUST eventually revoke; lastDecision=${JSON.stringify(lastDecision && { action: lastDecision.action, reason: lastDecision.reason, score: lastDecision.score, consecutive: lastDecision.consecutiveAnomalous })}`);
+    assert.ok(revokeAt >= anomalyScore.REVOKE_SUSTAINED_CONSECUTIVE - 1,
+        `should not revoke before ${anomalyScore.REVOKE_SUSTAINED_CONSECUTIVE} consecutive anomalous samples; revoked at ${revokeAt}`);
+});
+
+test('single_high_z_below_revoke_threshold_with_low_baseline_should_flag_not_revoke', () => {
+    const m = new AnomalyModel({ persistEnabled: false });
+    const baselineCount = 200;
+    for (let i = 0; i < baselineCount; i++) {
+        m.addSample('LIC-LOW-BASE', {
+            cadenceMs: 5000,
+            rdtscDeltaMean: 1e9,
+            rdtscDeltaStd: 1e5,
+            exceptionCount: 0,
+            moduleLoadCount: 12,
+            moduleLoadUnique: 12,
+        }, Date.now() - (baselineCount - i) * 60_000);
+    }
+    const engine = new anomalyScore.AnomalyScoringEngine({
+        model: m,
+        minBaselineSamples: 32,
+    });
+    const decision = engine.evaluate('LIC-LOW-BASE', {
+        cadenceMs: 50,
+        rdtscDeltaMean: 1,
+        rdtscDeltaStd: 1,
+        exceptionCount: 99,
+        moduleLoadCount: 99,
+        moduleLoadUnique: 99,
+    });
+    assert.ok(decision.score >= anomalyScore.REVOKE_THRESHOLD,
+        `single-sample score must cross immediate-revoke threshold for this test (got ${decision.score})`);
+    assert.notEqual(decision.action, 'revoke',
+        `immature baseline (samples=${decision.sampleCount} < ${anomalyScore.MIN_REVOKE_BASELINE_SAMPLES}) must NOT auto-revoke; got ${decision.action}`);
+    assert.equal(decision.action, 'flag');
+    assert.equal(decision.suppression, 'revoke_baseline_immature');
 });

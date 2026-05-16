@@ -18,3 +18,6 @@ namespace workflow_tools     {
 }
 namespace scanner_tools      { void register_scanner_tools(mcp_standalone::server_t& srv); }
 namespace analysis_tools     { void register_analysis_tools(mcp_standalone::server_t& srv); }
+namespace disasm_tools       { void register_disasm_tools(mcp_standalone::server_t& srv); }
+namespace decompile_tools    { void register_decompile_tools(mcp_standalone::server_t& srv); }
+namespace session_tools_ext  { void register_tools(mcp_standalone::server_t& srv); }

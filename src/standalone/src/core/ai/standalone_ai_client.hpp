@@ -19,8 +19,6 @@
 #include <nlohmann/json.hpp>
 
 
-namespace httplib { class Client; }
-
 struct settings_sa_t;
 namespace mcp_standalone { struct tool_def_t; }
 
@@ -144,11 +142,6 @@ private:
     std::atomic<bool>      _cancelled{false};
 
 
-    std::shared_ptr<httplib::Client> _http;
-    std::mutex                       _http_mtx;
-    std::string                      _last_host;
-
-
     struct pending_result_t { ai_callback_t cb; std::string text; };
     std::mutex                     _result_mtx;
     std::deque<pending_result_t>   _results;
@@ -156,10 +149,6 @@ private:
 
     std::mutex                                 _chunk_mtx;
     std::deque<std::pair<ai_stream_chunk_t, std::string>> _chunks;
-
-
-    std::shared_ptr<httplib::Client> get_or_create_client(const std::string& host);
-    void reset_client();
 
     std::string do_generate(
         const std::string& prompt,

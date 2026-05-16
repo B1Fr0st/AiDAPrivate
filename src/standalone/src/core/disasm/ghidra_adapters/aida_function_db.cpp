@@ -20,6 +20,22 @@ void function_db_t::clear()
 	is_64bit = true;
 }
 
+namespace {
+
+inline bool name_is_safe_for_index(const std::string& n)
+{
+	if (n.empty()) return false;
+	if (n.size() > 1024) return false;
+	for (size_t i = 0; i < n.size(); ++i) {
+		unsigned char c = static_cast<unsigned char>(n[i]);
+		if (c == 0) return false;
+		if (c < 0x20) return false;
+	}
+	return true;
+}
+
+}
+
 void function_db_t::add_symbol(symbol_record_t rec)
 {
 	if (rec.address == 0)
@@ -32,7 +48,8 @@ void function_db_t::add_symbol(symbol_record_t rec)
 			existing.kind = rec.kind;
 		if (existing.name.empty() && !rec.name.empty()) {
 			existing.name = rec.name;
-			by_name[rec.name] = it->second;
+			if (name_is_safe_for_index(existing.name))
+				by_name[existing.name] = it->second;
 		}
 		if (existing.display_name.empty() && !rec.display_name.empty())
 			existing.display_name = rec.display_name;
@@ -53,7 +70,7 @@ void function_db_t::add_symbol(symbol_record_t rec)
 
 	size_t index = symbols.size();
 	by_address[rec.address] = index;
-	if (!rec.name.empty())
+	if (name_is_safe_for_index(rec.name))
 		by_name[rec.name] = index;
 	symbols.push_back(std::move(rec));
 }
@@ -255,16 +272,19 @@ void populate_from_symbol_store(function_db_t& db)
 		for (const auto& sym : ms.pdb.symbols) {
 			if (!sym.is_function) continue;
 			if (sym.name.empty()) continue;
+			if (sym.rva == 0) continue;
 			uint64_t va = ms.base + sym.rva;
 			if (va == 0) continue;
 			if (db.image_base != 0 && db.image_size != 0) {
 				if (va < db.image_base || va >= db.image_base + db.image_size)
 					continue;
 			}
+			std::string sanitized = sanitize_symbol_name(sym.name);
+			if (sanitized.empty()) continue;
 			symbol_record_t rec;
 			rec.address = va;
 			rec.size = sym.size;
-			rec.name = sanitize_symbol_name(sym.name);
+			rec.name = std::move(sanitized);
 			rec.display_name = sym.name;
 			rec.module_name = ms.module_name;
 			rec.kind = symbol_kind_t::function;

@@ -12,6 +12,8 @@
 #include "ui/fonts.hpp"
 #include "imgui.h"
 #include "../helpers/globals.h"
+#include "../../helpers/diag_log.hpp"
+#include "../infra/work_queue.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -205,7 +207,15 @@ void render(float pos_x, float pos_y, float width, float height,
 			if (sr.size_input[0]) sz = static_cast<int>(std::strtol(sr.size_input, nullptr, 0));
 			if (sz <= 0) sz = 256;
 			if (sz > 4096) sz = 4096;
-			if (addr != 0) struct_recon::reconstruct_from_snapshot(addr, sz, sr.name_input);
+			if (addr != 0) {
+				diag::log_tagged_fmt("struct_recon",
+					"snapshot_clicked addr=0x%llX size=%d name='%s'",
+					static_cast<unsigned long long>(addr), sz, sr.name_input);
+				struct_recon::reconstruct_from_snapshot(addr, sz, sr.name_input);
+			} else {
+				diag::log_tagged_fmt("struct_recon",
+					"snapshot_skipped reason='addr_zero' input='%s'", sr.address_input);
+			}
 		}
 		ImGui::SameLine();
 		if (aida::ui::button("HW Monitor", aida::ui::button_kind_t::secondary,
@@ -216,7 +226,15 @@ void render(float pos_x, float pos_y, float width, float height,
 			if (sr.size_input[0]) sz = static_cast<int>(std::strtol(sr.size_input, nullptr, 0));
 			if (sz <= 0) sz = 256;
 			if (sz > 4096) sz = 4096;
-			if (addr != 0) struct_recon::monitor_with_hwbp(addr, sz, sr.name_input);
+			if (addr != 0) {
+				diag::log_tagged_fmt("struct_recon",
+					"hwmon_clicked addr=0x%llX size=%d name='%s'",
+					static_cast<unsigned long long>(addr), sz, sr.name_input);
+				struct_recon::monitor_with_hwbp(addr, sz, sr.name_input);
+			} else {
+				diag::log_tagged_fmt("struct_recon",
+					"hwmon_skipped reason='addr_zero' input='%s'", sr.address_input);
+			}
 		}
 		ImGui::SameLine();
 		bool live_active = struct_monitor::g_state.active.load();
@@ -229,11 +247,23 @@ void render(float pos_x, float pos_y, float width, float height,
 				if (sr.size_input[0]) sz = static_cast<int>(std::strtol(sr.size_input, nullptr, 0));
 				if (sz <= 0) sz = 256;
 				if (sz > 4096) sz = 4096;
-				if (addr != 0) struct_monitor::start(addr, sz, sr.name_input);
+				if (addr != 0) {
+					diag::log_tagged_fmt("struct_recon",
+						"live_monitor_start_clicked addr=0x%llX size=%d name='%s'",
+						static_cast<unsigned long long>(addr), sz, sr.name_input);
+					std::string nm = sr.name_input;
+					work_queue::post([addr, sz, nm]() {
+						struct_monitor::start(addr, sz, nm);
+					});
+				} else {
+					diag::log_tagged_fmt("struct_recon",
+						"live_monitor_skipped reason='addr_zero' input='%s'", sr.address_input);
+				}
 			}
 		} else {
 			if (aida::ui::button("Stop Live", aida::ui::button_kind_t::destructive,
 				aida::ui::size_t_::sm, ImVec2(94.f, 28.f))) {
+				diag::log_tagged_fmt("struct_recon", "live_monitor_stop_clicked");
 				struct_monitor::stop();
 			}
 			ImGui::SameLine();
@@ -252,6 +282,7 @@ void render(float pos_x, float pos_y, float width, float height,
 	} else {
 		if (aida::ui::button("Cancel", aida::ui::button_kind_t::destructive,
 			aida::ui::size_t_::sm, ImVec2(80.f, 28.f))) {
+			diag::log_tagged_fmt("struct_recon", "cancel_clicked");
 			struct_recon::cancel();
 		}
 		ImGui::SameLine();
@@ -265,9 +296,21 @@ void render(float pos_x, float pos_y, float width, float height,
 	ImGui::SameLine();
 	if (aida::ui::button("Export C++", aida::ui::button_kind_t::ghost,
 		aida::ui::size_t_::sm, ImVec2(94.f, 28.f))) {
-		std::lock_guard<std::mutex> lk(sr.mutex);
-		std::string cpp = struct_recon::export_as_cpp(sr.current);
-		ImGui::SetClipboardText(cpp.c_str());
+		std::string cpp;
+		std::string name;
+		size_t field_count = 0;
+		{
+			std::lock_guard<std::mutex> lk(sr.mutex);
+			cpp = struct_recon::export_as_cpp(sr.current);
+			name = sr.current.name;
+			field_count = sr.current.fields.size();
+		}
+		if (!cpp.empty()) {
+			ImGui::SetClipboardText(cpp.c_str());
+		}
+		diag::log_tagged_fmt("struct_recon",
+			"export_cpp_clipboard name='%s' fields=%zu bytes=%zu",
+			name.c_str(), field_count, cpp.size());
 	}
 	ImGui::SameLine();
 	{
@@ -276,22 +319,72 @@ void render(float pos_x, float pos_y, float width, float height,
 			aida::ui::button_kind_t::ghost,
 			aida::ui::size_t_::sm,
 			ImVec2(88.f, 28.f), ai_naming, nullptr, ai_naming);
-		if (clicked && !ai_naming) struct_recon::ai_name_fields();
+		if (clicked && !ai_naming) {
+			diag::log_tagged_fmt("struct_recon", "ai_name_clicked");
+			struct_recon::ai_name_fields();
+		}
 	}
 	ImGui::SameLine();
 	if (aida::ui::button("Save", aida::ui::button_kind_t::ghost,
 		aida::ui::size_t_::sm, ImVec2(64.f, 28.f))) {
-		struct_recon::save_struct_to_disk(sr.current);
+		struct_recon::reconstructed_struct_t snap;
+		{
+			std::lock_guard<std::mutex> lk(sr.mutex);
+			snap = sr.current;
+		}
+		work_queue::post([snap]() {
+			struct_recon::save_struct_to_disk(snap);
+			diag::log_tagged_fmt("struct_recon",
+				"save_disk_done name='%s' fields=%zu",
+				snap.name.c_str(), snap.fields.size());
+		});
+		diag::log_tagged_fmt("struct_recon",
+			"save_clicked name='%s' fields=%zu",
+			snap.name.c_str(), snap.fields.size());
 	}
 	ImGui::SameLine();
 	if (aida::ui::button("Load All", aida::ui::button_kind_t::ghost,
 		aida::ui::size_t_::sm, ImVec2(82.f, 28.f))) {
-		struct_recon::load_structs_from_disk();
+		work_queue::post([]() {
+			struct_recon::load_structs_from_disk();
+			size_t loaded = 0;
+			{
+				std::lock_guard<std::mutex> lk(struct_recon::g_state.mutex);
+				loaded = struct_recon::g_state.saved_structs.size();
+			}
+			diag::log_tagged_fmt("struct_recon",
+				"load_all_done count=%zu", loaded);
+		});
+		diag::log_tagged_fmt("struct_recon", "load_all_clicked");
 	}
 	ImGui::SameLine();
 	if (aida::ui::button("Refresh", aida::ui::button_kind_t::ghost,
 		aida::ui::size_t_::sm, ImVec2(76.f, 28.f))) {
-		struct_recon::refresh_value_history();
+		uint64_t base = 0;
+		bool active = false;
+		bool any_fields = false;
+		{
+			std::lock_guard<std::mutex> lk(sr.mutex);
+			active = sr.active;
+			base = sr.current.base_address;
+			any_fields = !sr.current.fields.empty();
+		}
+		if (active && base != 0 && any_fields) {
+			work_queue::post([]() {
+				struct_recon::refresh_value_history();
+				diag::log_tagged_fmt("struct_recon",
+					"refresh_value_history_done");
+			});
+			diag::log_tagged_fmt("struct_recon",
+				"refresh_clicked base=0x%llX",
+				static_cast<unsigned long long>(base));
+		} else {
+			diag::log_tagged_fmt("struct_recon",
+				"refresh_skipped active=%d base=0x%llX has_fields=%d",
+				active ? 1 : 0,
+				static_cast<unsigned long long>(base),
+				any_fields ? 1 : 0);
+		}
 	}
 
 	cy = oy + toolbar_h + 8.f;

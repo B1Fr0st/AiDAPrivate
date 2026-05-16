@@ -11,5 +11,8 @@ namespace auth_view {
 	bool any_login_in_progress();
 	const std::string& last_error();
 
+	void focus_provider(const std::string& provider_id);
+	bool is_provider_authenticated(const std::string& provider_id);
+
 }
 }

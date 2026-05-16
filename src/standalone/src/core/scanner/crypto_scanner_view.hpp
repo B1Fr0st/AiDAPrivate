@@ -10,6 +10,7 @@
 #include "disasm_view.hpp"
 #include "ui_anim.hpp"
 #include "../helpers/globals.h"
+#include "../helpers/diag_log.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
 #include "../ui/clock.hpp"
@@ -249,17 +250,6 @@ inline void render_glyph(ImDrawList* dl, ImVec2 center, float radius,
 	}
 }
 
-inline void render_orbit_ring(ImDrawList* dl, ImVec2 center, float radius, ImU32 col) {
-	float t = aida::ui::clock::seconds() * 2.0f;
-	for (int i = 0; i < 3; ++i) {
-		float ang = t + (float)i * 2.094395f;
-		float r2 = radius + 4.f;
-		ImVec2 p(center.x + cosf(ang) * r2, center.y + sinf(ang) * r2);
-		dl->AddCircleFilled(p, 2.f, aida::ui::with_alpha(col, 0.85f), 8);
-	}
-	dl->AddCircle(center, radius + 2.f, aida::ui::with_alpha(col, 0.45f), 24, 1.f);
-}
-
 }
 
 inline void render(float pos_x, float pos_y, float width, float height,
@@ -293,7 +283,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	cx += 140.f;
 
 	bool scanning = cs.scanning.load();
-	bool analyzing = cs.analyzing.load();
 
 	const float btn_gap = 14.f;
 	{
@@ -323,22 +312,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			crypto_scanner::scan_entropy();
 		}
 		cx = ImGui::GetItemRectMax().x + btn_gap;
-	}
-	{
-		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
-		if (aida::ui::button("AI Analyze", aida::ui::button_kind_t::accent_gradient,
-				aida::ui::size_t_::md, ImVec2(0.f, 0.f), analyzing, nullptr, analyzing)) {
-			crypto_scanner::ai_analyze_results();
-		}
-		if (analyzing) {
-			ImVec2 lp = ImGui::GetItemRectMin();
-			ImVec2 rp = ImGui::GetItemRectMax();
-			ImVec2 ctr((lp.x + rp.x) * 0.5f, (lp.y + rp.y) * 0.5f);
-			detail::render_orbit_ring(dl, ctr,
-				(rp.x - lp.x) * 0.5f + 4.f,
-				aida::ui::with_alpha(t.accent_u32, alpha));
-		}
-		cx = ImGui::GetItemRectMax().x + btn_gap + 6.f;
 	}
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
@@ -689,15 +662,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				char addr_copy[32];
 				std::snprintf(addr_copy, sizeof(addr_copy), "0x%llX", static_cast<unsigned long long>(ctx_hit.address));
 				ImGui::SetClipboardText(addr_copy);
-			}
-
-			if (!ctx_hit.ai_analysis.empty()) {
-				if (ImGui::BeginMenu("AI Analysis")) {
-					ImGui::PushTextWrapPos(420.f);
-					ImGui::TextUnformatted(ctx_hit.ai_analysis.c_str());
-					ImGui::PopTextWrapPos();
-					ImGui::EndMenu();
-				}
 			}
 		}
 		ImGui::EndPopup();
