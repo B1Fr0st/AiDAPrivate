@@ -29,6 +29,7 @@
 #include "fonts.hpp"
 #include "ui_anim.hpp"
 #include "work_queue.hpp"
+#include "../helpers/diag_log.hpp"
 
 
 namespace {
@@ -1866,7 +1867,6 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         || globals::ui::process_attach_open
         || globals::ui::driver_status_open
         || globals::ui::shortcuts_dialog_open
-        || globals::ui::about_dialog_open
         || globals::ui::mcp_servers_dialog_open
         || globals::ui::command_palette_open;
     if (input_blocked) hovered = false;
@@ -3008,6 +3008,29 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         s_find_has_focus = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
 
 
+        auto draw_instant_tooltip = [&](const char* tooltip) {
+            if (!tooltip || !*tooltip) return;
+            if (!ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNone | ImGuiHoveredFlags_NoSharedDelay |
+                ImGuiHoveredFlags_AllowWhenDisabled | ImGuiHoveredFlags_AllowWhenBlockedByPopup)) return;
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.f, 6.f));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.f);
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted(tooltip);
+            ImGui::EndTooltip();
+            ImGui::PopStyleVar(2);
+        };
+
+
+        auto centered_button = [&](const char* label, const ImVec2& size, ImGuiButtonFlags flags = 0) -> bool {
+            const float text_h = ImGui::GetFontSize();
+            const float pad_y = (size.y - text_h) * 0.5f;
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2.f, pad_y < 0.f ? 0.f : pad_y));
+            bool clicked = ImGui::ButtonEx(label, size, flags);
+            ImGui::PopStyleVar();
+            return clicked;
+        };
+
+
         auto toggle_button = [&](const char* label, bool& state, const char* id_suffix, const char* tooltip) -> bool {
             ImGui::PushID(id_suffix);
             ImVec2 sz(btn_sz, row_h);
@@ -3022,10 +3045,10 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                 ImGui::PushStyleColor(ImGuiCol_Text, txt2);
             }
             ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
-            if (ImGui::Button(label, sz)) state = !state;
+            if (centered_button(label, sz)) state = !state;
             ImGui::PopStyleVar();
             ImGui::PopStyleColor(3);
-            if (tooltip) ImGui::SetItemTooltip("%s", tooltip);
+            draw_instant_tooltip(tooltip);
             ImGui::PopID();
             return state != was;
         };
@@ -3037,10 +3060,10 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(txt_d.x, txt_d.y, txt_d.z, 0.3f));
             ImGui::PushStyleColor(ImGuiCol_Text, txt2);
             ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
-            bool clicked = ImGui::Button(label, ImVec2(w, row_h));
+            bool clicked = centered_button(label, ImVec2(w, row_h));
             ImGui::PopStyleVar();
             ImGui::PopStyleColor(3);
-            if (tooltip) ImGui::SetItemTooltip("%s", tooltip);
+            draw_instant_tooltip(tooltip);
             ImGui::PopID();
             return clicked;
         };
@@ -3392,19 +3415,64 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         dl->AddLine(ImVec2(mm_x, mm_y), ImVec2(mm_x, mm_y + mm_h),
             aida::ui::with_alpha(th.border_subtle, a), 1.f);
 
-        float mm_line_h = (n_lines > 0) ? (mm_h / (float)n_lines) : 1.f;
+        bool tokens_missing = s_cache.tokens.empty() ||
+                              s_cache.tokens.size() < s_cache.lines.size();
+        if (!tokens_missing) {
+            for (size_t i = 0; i < s_cache.tokens.size(); ++i) {
+                if (!s_cache.tokens[i].empty()) break;
+                if (i < s_cache.lines.size() && !s_cache.lines[i].empty()) {
+                    tokens_missing = true;
+                    break;
+                }
+            }
+        }
+        if (tokens_missing && !s_cache.lines.empty()) {
+            s_cache.tokens.assign(s_cache.lines.size(), {});
+            for (size_t i = 0; i < s_cache.lines.size(); ++i)
+                syntax::tokenize(s_cache.lines[i], s_lang, s_cache.tokens[i]);
+        }
+
+        static uint64_t s_minimap_log_signature = 0;
+        uint64_t cur_signature = (uint64_t)code_editor::filename.size() ^
+                                 ((uint64_t)n_lines << 16) ^
+                                 ((uint64_t)s_cache.tokens.size() << 32);
+        if (cur_signature != s_minimap_log_signature) {
+            s_minimap_log_signature = cur_signature;
+            diag::log_tagged_fmt("minimap",
+                "render tokens=%zu lines=%zu w=%.1f h=%.1f file=%s",
+                s_cache.tokens.size(), s_cache.lines.size(),
+                minimap_w, mm_h,
+                code_editor::filename.empty() ? "<unnamed>" : code_editor::filename.c_str());
+        }
+
+        float natural_line_h = (n_lines > 0) ? (mm_h / (float)n_lines) : 1.f;
+        float mm_line_h = natural_line_h;
         if (mm_line_h > 4.f) mm_line_h = 4.f;
         if (mm_line_h < 1.f) mm_line_h = 1.f;
         float mm_char_step = (minimap_w - 8.f) / 80.f;
         if (mm_char_step < 0.6f) mm_char_step = 0.6f;
 
-        int mm_first = 0;
-        int mm_last  = std::min(n_lines - 1, 4000);
+        bool sampled = (natural_line_h < 1.f);
+        int row_count = sampled
+            ? (int)std::ceil(mm_h / mm_line_h)
+            : n_lines;
+        if (row_count < 0) row_count = 0;
 
-        for (int i = mm_first; i <= mm_last; i++) {
+        float base_alpha = 0.75f + mm_hov_v * 0.20f;
+        if (base_alpha < 0.65f) base_alpha = 0.65f;
+        if (base_alpha > 1.f) base_alpha = 1.f;
+
+        for (int row = 0; row < row_count; row++) {
+            int i = sampled
+                ? (int)((((float)row + 0.5f) / (float)row_count) * (float)n_lines)
+                : row;
+            if (i < 0) i = 0;
+            if (i >= n_lines) break;
             if (i >= (int)s_cache.tokens.size()) break;
-            float ly = mm_y + (float)i * mm_line_h;
-            if (ly + mm_line_h < mm_y || ly > mm_y + mm_h) continue;
+
+            float ly = mm_y + (float)row * mm_line_h;
+            if (ly + mm_line_h < mm_y) continue;
+            if (ly > mm_y + mm_h) break;
 
             const auto& toks = s_cache.tokens[i];
             const auto& ln_text = s_cache.lines[i];
@@ -3412,21 +3480,27 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             for (const auto& tok : toks) {
                 if (tok.type == syntax::token_type::whitespace) {
                     for (uint32_t k = 0; k < tok.length; k++) {
+                        if (tok.start + k >= ln_text.size()) break;
                         char c = ln_text[tok.start + k];
                         if (c == '\t') lx += mm_char_step * (float)editor_config::tab_size;
                         else lx += mm_char_step;
                     }
                     continue;
                 }
-                if (tok.start + tok.length > (uint32_t)ln_text.size()) continue;
+                if (tok.length == 0) continue;
+                if (tok.start >= (uint32_t)ln_text.size()) continue;
+                uint32_t eff_len = tok.length;
+                if (tok.start + eff_len > (uint32_t)ln_text.size())
+                    eff_len = (uint32_t)ln_text.size() - tok.start;
+                if (eff_len == 0) continue;
                 ImU32 tc = tok_colors[(int)tok.type];
-                tc = aida::ui::with_alpha(tc, 0.55f * a);
-                float seg_w = (float)tok.length * mm_char_step;
+                tc = aida::ui::with_alpha(tc, base_alpha * a);
+                float seg_w = (float)eff_len * mm_char_step;
                 if (lx + seg_w > mm_max.x - 4.f) seg_w = (mm_max.x - 4.f) - lx;
-                if (seg_w < 0.5f) { lx += seg_w; continue; }
+                if (seg_w < 0.5f) { lx += (float)eff_len * mm_char_step; continue; }
                 dl->AddRectFilled(ImVec2(lx, ly + 0.5f),
                                   ImVec2(lx + seg_w, ly + mm_line_h - 0.5f), tc);
-                lx += (float)tok.length * mm_char_step;
+                lx += (float)eff_len * mm_char_step;
                 if (lx > mm_max.x - 4.f) break;
             }
         }

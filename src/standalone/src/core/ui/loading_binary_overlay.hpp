@@ -24,9 +24,11 @@
 #include "../infra/event_bus.hpp"
 #include "../analysis/initial_analysis.hpp"
 #include "../analysis/symbol_store.hpp"
+#include "../anti-tamper/webhook.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -109,26 +111,62 @@ inline std::string derive_filename(const std::string& path)
 	return (sl != std::string::npos) ? path.substr(sl + 1) : path;
 }
 
+inline uint64_t monotonic_ms_now()
+{
+	auto tp = std::chrono::steady_clock::now().time_since_epoch();
+	return static_cast<uint64_t>(
+		std::chrono::duration_cast<std::chrono::milliseconds>(tp).count());
+}
+
+inline void emit_phase_log(const char* phase, uint64_t elapsed_ms, const char* extra)
+{
+	char buf[512];
+	if (extra && *extra) {
+		std::snprintf(buf, sizeof(buf),
+			"phase=%s elapsed_ms=%llu %s",
+			phase,
+			static_cast<unsigned long long>(elapsed_ms),
+			extra);
+	} else {
+		std::snprintf(buf, sizeof(buf),
+			"phase=%s elapsed_ms=%llu",
+			phase,
+			static_cast<unsigned long long>(elapsed_ms));
+	}
+	diag::log_tagged("pe_load", buf);
+	anti_tamper::webhook::write_log("pe_load", buf);
+}
+
 inline void worker_load(std::string path, completion_action_t action)
 {
 	state_t& s = state();
 
-	diag::log_tagged_fmt("loading_binary_overlay",
-		"worker_load_start path=%s action=%u",
+	const uint64_t t_total_start = monotonic_ms_now();
+
+	diag::log_tagged_fmt("pe_load",
+		"phase=worker_load_start path=%s action=%u",
 		path.c_str(),
 		static_cast<unsigned int>(action));
+	anti_tamper::webhook::write_log("pe_load", "phase=worker_load_start");
 
 	set_milestone(0.05f, "Reading PE header...", 1u);
 
 	g_disasm.file = DisasmFile{};
-	bool ok = disasm::load_pe(path, g_disasm.file);
 
-	diag::log_tagged_fmt("loading_binary_overlay",
-		"worker_load_pe_done loaded=%d image_base=0x%llx sections=%zu err=%s",
-		ok ? 1 : 0,
-		static_cast<unsigned long long>(g_disasm.file.image_base),
-		g_disasm.file.sections.size(),
-		g_disasm.file.err.empty() ? "(none)" : g_disasm.file.err.c_str());
+	const uint64_t t_load_pe_start = monotonic_ms_now();
+	bool ok = disasm::load_pe(path, g_disasm.file);
+	const uint64_t t_load_pe_end = monotonic_ms_now();
+
+	{
+		char extra[256];
+		std::snprintf(extra, sizeof(extra),
+			"loaded=%d image_base=0x%llx sections=%zu err=%s",
+			ok ? 1 : 0,
+			static_cast<unsigned long long>(g_disasm.file.image_base),
+			g_disasm.file.sections.size(),
+			g_disasm.file.err.empty() ? "(none)" : g_disasm.file.err.c_str());
+		emit_phase_log("load_pe", t_load_pe_end - t_load_pe_start, extra);
+	}
 
 	if (!ok) {
 		bool hex_fallback = (action == completion_action_t::switch_to_disassembly_or_hex);
@@ -150,22 +188,65 @@ inline void worker_load(std::string path, completion_action_t action)
 				std::memory_order_release);
 		}
 		s.worker_finished.store(true, std::memory_order_release);
-		diag::log_tagged_fmt("loading_binary_overlay",
-			"worker_load_finished ok=0 hex_fallback=%d",
-			hex_fallback ? 1 : 0);
+		emit_phase_log("worker_load_failed", monotonic_ms_now() - t_total_start,
+			hex_fallback ? "hex_fallback=1" : "hex_fallback=0");
 		return;
 	}
 
-	set_milestone(0.18f, "Parsing sections...", 2u);
+	set_milestone(0.18f, "Mapping sections...", 2u);
 
-	disasm::decode_section(g_disasm.file);
+	const bool live_path = (driver_bridge::attached_pid() != 0)
+		|| (!g_disasm.file.path.empty() && g_disasm.file.path.compare(0, 7, "live://") == 0);
 
-	set_milestone(0.32f, "Decoding instructions...", 3u);
+	if (live_path) {
+		const uint64_t t_decode_start = monotonic_ms_now();
+		disasm::decode_section(g_disasm.file);
+		const uint64_t t_decode_end = monotonic_ms_now();
+		char extra[128];
+		std::snprintf(extra, sizeof(extra),
+			"instrs=%zu live=1",
+			g_disasm.file.instrs.size());
+		emit_phase_log("decode_section_sync", t_decode_end - t_decode_start, extra);
 
-	function_index::on_file_loaded();
-	xref_index::on_file_loaded();
+		set_milestone(0.32f, "Decoding instructions...", 3u);
 
-	set_milestone(0.38f, "Finalizing indexes...", 4u);
+		const uint64_t t_fn_idx_start = monotonic_ms_now();
+		function_index::on_file_loaded();
+		emit_phase_log("function_index_on_file_loaded", monotonic_ms_now() - t_fn_idx_start, "live=1");
+
+		const uint64_t t_xref_idx_start = monotonic_ms_now();
+		xref_index::on_file_loaded();
+		emit_phase_log("xref_index_on_file_loaded", monotonic_ms_now() - t_xref_idx_start, "live=1");
+
+		set_milestone(0.38f, "Finalizing indexes...", 4u);
+	} else {
+		set_milestone(0.20f, "Disassembling sections...", 2u);
+
+		const uint64_t t_decode_start = monotonic_ms_now();
+		disasm::decode_section(g_disasm.file);
+		const uint64_t t_decode_end = monotonic_ms_now();
+		{
+			char extra[160];
+			std::snprintf(extra, sizeof(extra),
+				"instrs=%zu live=0",
+				g_disasm.file.instrs.size());
+			emit_phase_log("decode_section_sync", t_decode_end - t_decode_start, extra);
+		}
+
+		set_milestone(0.28f, "Indexing functions from .pdata...", 3u);
+
+		const uint64_t t_fn_idx_start = monotonic_ms_now();
+		function_index::on_file_loaded();
+		emit_phase_log("function_index_on_file_loaded", monotonic_ms_now() - t_fn_idx_start, "live=0 fast_static");
+
+		set_milestone(0.34f, "Indexing imports and exports...", 4u);
+
+		const uint64_t t_xref_idx_start = monotonic_ms_now();
+		xref_index::on_file_loaded();
+		emit_phase_log("xref_index_on_file_loaded", monotonic_ms_now() - t_xref_idx_start, "live=0 fast_static");
+
+		set_milestone(0.38f, "Finalizing indexes...", 5u);
+	}
 
 	{
 		aida::events::binary_loaded_t payload;
@@ -183,10 +264,15 @@ inline void worker_load(std::string path, completion_action_t action)
 	s.completion_action.store(static_cast<unsigned int>(action), std::memory_order_release);
 	s.worker_finished.store(true, std::memory_order_release);
 
-	diag::log_tagged_fmt("loading_binary_overlay",
-		"worker_load_finished ok=1 image_base=0x%llx sections=%zu",
-		static_cast<unsigned long long>(g_disasm.file.image_base),
-		g_disasm.file.sections.size());
+	{
+		char extra[160];
+		std::snprintf(extra, sizeof(extra),
+			"image_base=0x%llx sections=%zu live_path=%d",
+			static_cast<unsigned long long>(g_disasm.file.image_base),
+			g_disasm.file.sections.size(),
+			live_path ? 1 : 0);
+		emit_phase_log("worker_load_complete", monotonic_ms_now() - t_total_start, extra);
+	}
 }
 
 inline float analysis_phase_floor(int step_idx)

@@ -551,8 +551,8 @@ namespace aida::ui {
 		c[ImGuiCol_DragDropTarget]       = to_v4(t.accent_glow);
 		c[ImGuiCol_NavHighlight]         = to_v4(t.border_focus);
 		c[ImGuiCol_NavWindowingHighlight]= ImVec4(1, 1, 1, 0.7f);
-		c[ImGuiCol_NavWindowingDimBg]    = ImVec4(0, 0, 0, 0.55f);
-		c[ImGuiCol_ModalWindowDimBg]     = ImVec4(0, 0, 0, 0.55f);
+		c[ImGuiCol_NavWindowingDimBg]    = ImVec4(0, 0, 0, 0.0f);
+		c[ImGuiCol_ModalWindowDimBg]     = ImVec4(0, 0, 0, 0.0f);
 	}
 
 	inline void apply(const theme_t& t) {

@@ -36,6 +36,7 @@
 #include "../helpers/helpers.h"
 #include "../helpers/diag_log.hpp"
 #include "../helpers/win32_dialog.hpp"
+#include "../anti-tamper/webhook.hpp"
 
 extern DisasmState g_disasm;
 
@@ -315,8 +316,9 @@ inline void render_hero_map(ImDrawList* dl, float x, float y, float w, float h,
 		ImFont* f = aida::ui::fonts::body();
 		if (!f) f = ImGui::GetFont();
 		const char* msg = "No regions to map. Refresh while attached.";
-		ImVec2 sz = f->CalcTextSizeA(13.f, FLT_MAX, 0.f, msg);
-		dl->AddText(f, 13.f,
+		const float fs_empty_msg = aida::ui::components::detail::ui_fs() * 1.00f;
+		ImVec2 sz = f->CalcTextSizeA(fs_empty_msg, FLT_MAX, 0.f, msg);
+		dl->AddText(f, fs_empty_msg,
 			ImVec2(x + (w - sz.x) * 0.5f, y + (h - sz.y) * 0.5f),
 			aida::ui::with_alpha(t.text_dim, alpha), msg);
 		return;
@@ -427,11 +429,12 @@ inline void render_hero_map(ImDrawList* dl, float x, float y, float w, float h,
 		uint64_t va = low_va + static_cast<uint64_t>(static_cast<double>(high_va - low_va) * frac);
 		char buf[20];
 		std::snprintf(buf, sizeof(buf), "%012" PRIX64, va);
-		ImVec2 sz = code_font->CalcTextSizeA(10.f, FLT_MAX, 0.f, buf);
+		const float fs_tick = aida::ui::components::detail::ui_fs() * 0.85f;
+		ImVec2 sz = code_font->CalcTextSizeA(fs_tick, FLT_MAX, 0.f, buf);
 		float tlx = tx - sz.x * 0.5f;
 		if (tlx < strip_x0) tlx = strip_x0;
 		if (tlx + sz.x > strip_x1) tlx = strip_x1 - sz.x;
-		dl->AddText(code_font, 10.f, ImVec2(tlx, strip_y1 + 10.f),
+		dl->AddText(code_font, fs_tick, ImVec2(tlx, strip_y1 + 12.f),
 		            aida::ui::with_alpha(t.text_dim, alpha), buf);
 	}
 
@@ -493,15 +496,23 @@ inline void render_stat_pod(ImDrawList* dl, float x, float y, float w, float h,
 	ImFont* val_font = aida::ui::fonts::body_em();
 	if (!val_font) val_font = ImGui::GetFont();
 
-	dl->AddText(lab_font, 11.f, ImVec2(x + 12.f, y + 6.f),
+	const float fs_pod_base = aida::ui::components::detail::ui_fs();
+	dl->AddText(lab_font, fs_pod_base * 0.88f, ImVec2(x + 12.f, y + 6.f),
 	            aida::ui::with_alpha(t.text_dim, alpha), label);
-	dl->AddText(val_font, 14.f, ImVec2(x + 12.f, y + 22.f),
+	dl->AddText(val_font, fs_pod_base * 1.18f, ImVec2(x + 12.f, y + 28.f),
 	            aida::ui::with_alpha(t.text_primary, alpha), value);
 }
 
 inline void render(float pos_x, float pos_y, float width, float height,
                    float alpha, float ar, float ag, float ab)
 {
+	{
+		static bool s_mem_map_logged = false;
+		if (!s_mem_map_logged) {
+			s_mem_map_logged = true;
+			anti_tamper::webhook::write_log("mem_map", "[mem_map] scaled");
+		}
+	}
 	(void)ar; (void)ag; (void)ab;
 
 	ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -511,10 +522,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	dl->AddRectFilled(ImVec2(pos_x, pos_y), ImVec2(pos_x + width, pos_y + height),
 	                  aida::ui::with_alpha(t.bg_base, alpha));
 
-	float toolbar_h = 40.f;
+	float toolbar_h = 48.f;
 	float hero_h    = 240.f;
-	float strip_h   = 64.f;
-	float col_header_h = 24.f;
+	float strip_h   = 70.f;
+	float col_header_h = 30.f;
 
 	float toolbar_y = pos_y + 8.f;
 	float hero_y    = toolbar_y + toolbar_h + 8.f;
@@ -525,7 +536,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float tbx = pos_x + 12.f;
 		ImFont* h2 = aida::ui::fonts::h2();
 		if (!h2) h2 = ImGui::GetFont();
-		dl->AddText(h2, 16.f, ImVec2(tbx, toolbar_y + (toolbar_h - 16.f) * 0.5f),
+		const float fs_mm_base   = aida::ui::components::detail::ui_fs();
+		const float fs_mm_title  = fs_mm_base * 1.30f;
+		const float fs_mm_sub    = fs_mm_base * 0.92f;
+		dl->AddText(h2, fs_mm_title, ImVec2(tbx, toolbar_y + (toolbar_h - fs_mm_title) * 0.5f),
 		            aida::ui::with_alpha(t.text_primary, alpha), "Memory Map");
 
 		ImFont* cf = aida::ui::fonts::caption();
@@ -536,29 +550,51 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			std::snprintf(sub, sizeof(sub), "Process %u", pid);
 		else
 			std::snprintf(sub, sizeof(sub), "Not attached");
-		ImVec2 hs = h2->CalcTextSizeA(16.f, FLT_MAX, 0.f, "Memory Map");
-		dl->AddText(cf, 12.f,
-			ImVec2(tbx + hs.x + 12.f, toolbar_y + (toolbar_h - 12.f) * 0.5f + 2.f),
+		ImVec2 hs = h2->CalcTextSizeA(fs_mm_title, FLT_MAX, 0.f, "Memory Map");
+		dl->AddText(cf, fs_mm_sub,
+			ImVec2(tbx + hs.x + 12.f, toolbar_y + (toolbar_h - fs_mm_sub) * 0.5f + 2.f),
 			aida::ui::with_alpha(t.text_dim, alpha), sub);
 
 		float btn_w = 120.f;
-		ImGui::SetCursorScreenPos(ImVec2(pos_x + width - btn_w - 12.f, toolbar_y + 4.f));
+		float min_filter_w = 100.f;
+		float reserved_left = (hs.x + 12.f) + 200.f;
+		float available_right = width - reserved_left - 24.f;
+		bool collapse_refresh = (available_right < (btn_w + min_filter_w + 12.f));
+		float effective_btn_w = collapse_refresh ? 64.f : btn_w;
+		float fw = std::max(min_filter_w,
+			std::min(260.f, available_right - effective_btn_w - 12.f));
+		if (fw < min_filter_w) fw = min_filter_w;
+
+		ImGui::SetCursorScreenPos(ImVec2(pos_x + width - effective_btn_w - 12.f, toolbar_y + 4.f));
 		bool refreshing = g_ui.refreshing.load();
+		const char* refresh_label = collapse_refresh ? "Refr" : "Refresh";
 		bool clicked = aida::ui::components::button(
-			"Refresh",
+			refresh_label,
 			aida::ui::components::button_kind_t::secondary,
 			aida::ui::components::size_t_::sm,
-			ImVec2(btn_w, 28.f),
+			ImVec2(effective_btn_w, 28.f),
 			false, nullptr, refreshing);
+		if (collapse_refresh && ImGui::IsItemHovered()) {
+			aida::ui::components::tooltip_blur("Refresh", 0.35f);
+		}
 		if (clicked && !refreshing)
 			refresh();
 
-		float fw = 260.f;
-		float fx = pos_x + width - btn_w - fw - 24.f;
+		float fx = pos_x + width - effective_btn_w - fw - 24.f;
 		ImGui::SetCursorScreenPos(ImVec2(fx, toolbar_y + 6.f));
 		aida::ui::components::input_text("##memmap_filter", g_ui.filter_buf,
 			sizeof(g_ui.filter_buf), "Filter modules or info...",
 			false, ImVec2(fw, 28.f));
+
+		static bool s_mm_logged_collapse = false;
+		if (collapse_refresh && !s_mm_logged_collapse) {
+			s_mm_logged_collapse = true;
+			::diag::log_tagged_fmt("responsive",
+				"memory_map_view toolbar collapsed avail=%.0f width=%.0f",
+				available_right, width);
+		} else if (!collapse_refresh && s_mm_logged_collapse) {
+			s_mm_logged_collapse = false;
+		}
 	}
 
 	std::vector<debugger_engine::memory_region_t> snapshot;
@@ -644,16 +680,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		const char* labels[] = { "ADDRESS", "SIZE", "PROTECT", "STATE", "TYPE", "MODULE", "INFO" };
 		float fracs[] = { 0.18f, 0.10f, 0.15f, 0.11f, 0.10f, 0.16f, 0.20f };
+		const float fs_col_label = aida::ui::components::detail::ui_fs() * 0.88f;
 		float lx = pos_x + 12.f;
 		for (int i = 0; i < 7; ++i) {
-			dl->AddText(cf, 11.f,
-				ImVec2(lx, table_y + (col_header_h - 11.f) * 0.5f),
+			dl->AddText(cf, fs_col_label,
+				ImVec2(lx, table_y + (col_header_h - fs_col_label) * 0.5f),
 				aida::ui::with_alpha(t.text_dim, alpha), labels[i]);
 			lx += width * fracs[i];
 		}
 	}
 
-	float row_h = 22.f;
+	float row_h = 28.f;
 	float list_y = table_y + col_header_h;
 	float list_h = pos_y + height - list_y;
 	if (list_h <= 0.f) return;
@@ -748,21 +785,23 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			                  aida::ui::with_alpha(t.hover_wash, alpha * row_a * 0.25f));
 		}
 
+		const float fs_mm_row    = aida::ui::components::detail::ui_fs() * 0.92f;
+		const float fs_mm_chip   = aida::ui::components::detail::ui_fs() * 0.85f;
 		char buf[32];
 		std::snprintf(buf, sizeof(buf), "%016" PRIX64, r.base);
-		dl->AddText(code_font, 12.f, ImVec2(col_x[0], ry + 5.f),
+		dl->AddText(code_font, fs_mm_row, ImVec2(col_x[0], ry + 6.f),
 		            aida::ui::with_alpha(t.text_address, alpha * row_a), buf);
 
 		std::string sz_str = detail::format_size(r.size);
-		dl->AddText(body_font, 12.f, ImVec2(col_x[1], ry + 5.f),
+		dl->AddText(body_font, fs_mm_row, ImVec2(col_x[1], ry + 6.f),
 		            aida::ui::with_alpha(t.text_secondary, alpha * row_a), sz_str.c_str());
 
 		std::string prot_str = debugger_engine::format_protect(r.protect);
 		ImU32 prot_col = detail::protect_token(r.protect, t);
 		{
-			ImVec2 ps = body_font->CalcTextSizeA(11.f, FLT_MAX, 0.f, prot_str.c_str());
-			float bw = ps.x + 12.f;
-			float bh = 16.f;
+			ImVec2 ps = body_font->CalcTextSizeA(fs_mm_chip, FLT_MAX, 0.f, prot_str.c_str());
+			float bw = ps.x + 14.f;
+			float bh = 20.f;
 			float bx = col_x[2];
 			float by = ry + (row_h - bh) * 0.5f;
 			dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh),
@@ -771,25 +810,25 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			dl->AddRect(ImVec2(bx, by), ImVec2(bx + bw, by + bh),
 			            aida::ui::with_alpha(prot_col, alpha * row_a * 0.55f),
 			            bh * 0.5f, 0, 1.f);
-			dl->AddText(body_font, 11.f,
-				ImVec2(bx + 6.f, by + (bh - 11.f) * 0.5f),
+			dl->AddText(body_font, fs_mm_chip,
+				ImVec2(bx + 7.f, by + (bh - fs_mm_chip) * 0.5f),
 				aida::ui::with_alpha(prot_col, alpha * row_a), prot_str.c_str());
 		}
 
 		std::string state_str = detail::format_state(r.state);
 		ImU32 state_col = detail::state_color(r.state, t);
-		dl->AddText(body_font, 12.f, ImVec2(col_x[3], ry + 5.f),
+		dl->AddText(body_font, fs_mm_row, ImVec2(col_x[3], ry + 6.f),
 		            aida::ui::with_alpha(state_col, alpha * row_a), state_str.c_str());
 
 		std::string type_str = detail::format_type(r.type);
 		ImU32 type_col = detail::type_color(r.type, t);
-		dl->AddText(body_font, 12.f, ImVec2(col_x[4], ry + 5.f),
+		dl->AddText(body_font, fs_mm_row, ImVec2(col_x[4], ry + 6.f),
 		            aida::ui::with_alpha(type_col, alpha * row_a), type_str.c_str());
 
-		dl->AddText(body_font, 12.f, ImVec2(col_x[5], ry + 5.f),
+		dl->AddText(body_font, fs_mm_row, ImVec2(col_x[5], ry + 6.f),
 		            aida::ui::with_alpha(t.text_secondary, alpha * row_a),
 		            r.module_name.c_str());
-		dl->AddText(body_font, 12.f, ImVec2(col_x[6], ry + 5.f),
+		dl->AddText(body_font, fs_mm_row, ImVec2(col_x[6], ry + 6.f),
 		            aida::ui::with_alpha(t.text_dim, alpha * row_a), r.info.c_str());
 
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {

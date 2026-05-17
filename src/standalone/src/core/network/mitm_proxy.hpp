@@ -119,6 +119,19 @@ struct proxy_config {
 
 using intercept_callback_t = std::function<intercept_action(http_exchange& exchange)>;
 
+struct ws_frame_observed_t {
+    uint64_t                            timestamp = 0;
+    uint64_t                            exchange_id = 0;
+    std::string                         host;
+    uint16_t                            port = 0;
+    bool                                is_outbound = false;
+    bool                                is_text = false;
+    uint8_t                             opcode = 0;
+    std::vector<uint8_t>                payload;
+};
+
+using ws_frame_callback_t = std::function<void(const ws_frame_observed_t& frame)>;
+
 
 static constexpr uint32_t WORKER_POOL_SIZE = 4;
 
@@ -165,6 +178,9 @@ struct state_t {
 
 
     intercept_callback_t intercept_cb;
+
+    std::mutex           ws_observer_mutex;
+    ws_frame_callback_t  ws_observer_cb;
 };
 
 inline state_t g_state;
@@ -186,6 +202,9 @@ size_t history_count();
 void set_intercept_enabled(bool enabled);
 bool is_intercept_enabled();
 void set_intercept_callback(intercept_callback_t cb);
+
+void set_ws_frame_callback(ws_frame_callback_t cb);
+void publish_ws_frame(const ws_frame_observed_t& frame);
 
 
 void forward_exchange(uint64_t id);

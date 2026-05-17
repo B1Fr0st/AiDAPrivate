@@ -35,6 +35,7 @@
 #include "../ui/empty_state.hpp"
 #include "../ui/fonts.hpp"
 #include "../ui/motion.hpp"
+#include "../ui/responsive.hpp"
 #include "../ui/skeleton.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/transition.hpp"
@@ -222,7 +223,7 @@ namespace settings_overlay {
 		}
 
 		inline void render_tab_label(int idx, const char* label, float side_w, float row_h,
-			ImU32 active_text, ImU32 dim_text, float dt)
+			ImU32 active_text, ImU32 dim_text, float dt, bool icon_only)
 		{
 			auto& s = state();
 			const auto& th = aida::ui::resolved();
@@ -242,11 +243,15 @@ namespace settings_overlay {
 			ImGui::InvisibleButton("##tab_btn", ImVec2(side_w, row_h));
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked();
+			if (icon_only && hov && label && *label) {
+				aida::ui::components::tooltip_blur(label, 0.35f);
+			}
 			ImGui::PopID();
 
 			ImDrawList* dl = ImGui::GetWindowDrawList();
-			ImVec2 a(row_pos.x + 6.f, row_pos.y);
-			ImVec2 b(row_pos.x + side_w - 6.f, row_pos.y + row_h - 4.f);
+			float inset = icon_only ? 4.f : 6.f;
+			ImVec2 a(row_pos.x + inset, row_pos.y);
+			ImVec2 b(row_pos.x + side_w - inset, row_pos.y + row_h - 4.f);
 
 			ImU32 bg = aida::ui::with_alpha(th.panel_header, 0.f);
 			if (is_active) {
@@ -260,17 +265,47 @@ namespace settings_overlay {
 
 			const float base_fs = aida::ui::components::detail::ui_fs();
 			float glyph_r = base_fs * 0.72f;
-			float gx = a.x + 14.f + glyph_r;
+			float gx;
 			float gy = (a.y + b.y) * 0.5f;
+			if (icon_only) {
+				gx = (a.x + b.x) * 0.5f;
+			} else {
+				gx = a.x + 14.f + glyph_r;
+			}
 			ImU32 ic = is_active ? active_text : dim_text;
 			draw_tab_glyph(dl, ImVec2(gx, gy), glyph_r, idx, ic);
 
-			ImFont* font = is_active ? aida::ui::fonts::body_strong() : aida::ui::fonts::body();
-			float fs = base_fs * 0.95f;
-			float label_x = gx + glyph_r + 10.f;
-			ImVec2 sz = font->CalcTextSizeA(fs, FLT_MAX, 0.f, label);
-			dl->AddText(font, fs, ImVec2(label_x, a.y + (row_h - 4.f - sz.y) * 0.5f),
-				is_active ? active_text : dim_text, label);
+			if (!icon_only) {
+				ImFont* font = is_active ? aida::ui::fonts::body_strong() : aida::ui::fonts::body();
+				float fs = base_fs * 0.95f;
+				float label_x = gx + glyph_r + 10.f;
+				float label_max_w = (b.x - 8.f) - label_x;
+				ImVec2 sz = font->CalcTextSizeA(fs, FLT_MAX, 0.f, label);
+				if (label_max_w > 0.f && sz.x > label_max_w) {
+					std::string truncated = aida::ui::responsive::truncate_to_width(
+						std::string(label), font, fs, label_max_w);
+					sz = font->CalcTextSizeA(fs, FLT_MAX, 0.f, truncated.c_str());
+					dl->AddText(font, fs,
+						ImVec2(label_x, a.y + (row_h - 4.f - sz.y) * 0.5f),
+						is_active ? active_text : dim_text, truncated.c_str());
+					if (hov && label && *label) {
+						ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f, 6.f));
+						ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(th.bg_overlay));
+						if (ImGui::BeginTooltip()) {
+							ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(th.text_primary));
+							ImGui::TextUnformatted(label);
+							ImGui::PopStyleColor();
+							ImGui::EndTooltip();
+						}
+						ImGui::PopStyleColor();
+						ImGui::PopStyleVar();
+					}
+				} else {
+					dl->AddText(font, fs,
+						ImVec2(label_x, a.y + (row_h - 4.f - sz.y) * 0.5f),
+						is_active ? active_text : dim_text, label);
+				}
+			}
 
 			if (clicked) {
 				int prev = s.active_tab.exchange(idx);
@@ -398,9 +433,26 @@ namespace settings_overlay {
 				if (!servers.empty()) refresh_buf();
 			}
 
+			float avail_w = ImGui::GetContentRegionAvail().x;
 			float left_w = 280.f;
+			float min_detail_w = 260.f;
+			bool stack_vertical = (avail_w - left_w - 8.f) < min_detail_w;
 			float row_h  = 58.f;
-			float list_h = (std::max)(content_h - 130.f, 240.f);
+			float list_h_horiz = (std::max)(content_h - 130.f, 240.f);
+			float list_h = stack_vertical ? (std::max)(content_h * 0.45f, 200.f) : list_h_horiz;
+			if (stack_vertical) {
+				left_w = (std::max)(avail_w - 8.f, 200.f);
+			}
+
+			static bool s_mcp_logged_stack = false;
+			if (stack_vertical && !s_mcp_logged_stack) {
+				s_mcp_logged_stack = true;
+				::diag::log_tagged_fmt("responsive",
+					"settings_overlay mcp panel stacked avail_w=%.0f min_detail_w=%.0f",
+					avail_w, min_detail_w);
+			} else if (!stack_vertical && s_mcp_logged_stack) {
+				s_mcp_logged_stack = false;
+			}
 
 			ImGui::BeginChild("##mcp_list", ImVec2(left_w, list_h), false,
 				ImGuiWindowFlags_NoSavedSettings);
@@ -507,9 +559,14 @@ namespace settings_overlay {
 
 			ImGui::EndChild();
 
-			ImGui::SameLine();
-			ImGui::BeginChild("##mcp_detail", ImVec2(0, list_h), false,
-				ImGuiWindowFlags_NoSavedSettings);
+			float detail_h = list_h;
+			if (stack_vertical) {
+				detail_h = (std::max)(content_h * 0.55f - 4.f, 240.f);
+			} else {
+				ImGui::SameLine();
+			}
+			ImGui::BeginChild("##mcp_detail", ImVec2(0, detail_h), false,
+				ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_HorizontalScrollbar);
 
 			ImDrawList* ddl = ImGui::GetWindowDrawList();
 			ImVec2 dp = ImGui::GetCursorScreenPos();
@@ -581,6 +638,26 @@ namespace settings_overlay {
 
 			ImGui::Dummy(ImVec2(0, 12.f));
 
+			float btn_row_avail = ImGui::GetContentRegionAvail().x;
+			float btn_total_w = 170.f + 10.f + 240.f + 10.f + 170.f + 18.f + 160.f;
+			bool btn_wrap = (btn_row_avail < btn_total_w);
+			float btn_cursor_x = 0.f;
+			float btn_sep = 10.f;
+
+			auto place_button = [&](float bw) -> bool {
+				if (btn_cursor_x <= 0.f) {
+					btn_cursor_x = bw;
+					return false;
+				}
+				if (btn_wrap && (btn_cursor_x + btn_sep + bw) > btn_row_avail) {
+					btn_cursor_x = bw;
+					return false;
+				}
+				btn_cursor_x += btn_sep + bw;
+				return true;
+			};
+
+			if (place_button(170.f)) ImGui::SameLine(0.f, btn_sep);
 			if (aida::ui::button("+ Add Server",
 					aida::ui::button_kind_t::primary,
 					aida::ui::size_t_::md,
@@ -593,7 +670,7 @@ namespace settings_overlay {
 				refresh_buf();
 				g_sa_settings.save();
 			}
-			ImGui::SameLine(0.f, 10.f);
+			if (place_button(240.f)) ImGui::SameLine(0.f, btn_sep);
 			if (aida::ui::button("Apply Connection Changes",
 					aida::ui::button_kind_t::secondary,
 					aida::ui::size_t_::md,
@@ -622,7 +699,7 @@ namespace settings_overlay {
 				mgr.connect_all();
 				g_sa_settings.save();
 			}
-			ImGui::SameLine(0.f, 10.f);
+			if (place_button(170.f)) ImGui::SameLine(0.f, btn_sep);
 			if (aida::ui::button("Remove Selected",
 					aida::ui::button_kind_t::destructive,
 					aida::ui::size_t_::md,
@@ -634,7 +711,7 @@ namespace settings_overlay {
 				refresh_buf();
 				g_sa_settings.save();
 			}
-			ImGui::SameLine(0.f, 18.f);
+			if (place_button(160.f)) ImGui::SameLine(0.f, btn_sep);
 			if (aida::ui::button("Marketplace...",
 					aida::ui::button_kind_t::accent_gradient,
 					aida::ui::size_t_::md,
@@ -710,14 +787,19 @@ namespace settings_overlay {
 			ImGui::Dummy(ImVec2(0.f, 6.f));
 
 			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "IDA executable path");
+			float ida_row_avail = ImGui::GetContentRegionAvail().x;
+			bool ida_path_wrap_browse = (ida_row_avail < (220.f + 10.f + 126.f));
+			float ida_input_w = ida_path_wrap_browse
+				? (std::max)(ida_row_avail - 12.f, 120.f)
+				: (std::max)(ida_row_avail - 136.f, 200.f);
 			if (aida::ui::input_text("##ida_pro_path",
 					s_path_buf, sizeof(s_path_buf),
 					"C:\\Program Files\\IDA Pro\\ida.exe", false,
-					ImVec2(content_w - 150.f, 36.f)))
+					ImVec2(ida_input_w, 36.f)))
 			{
 				g_sa_settings.ida_pro_path = s_path_buf;
 			}
-			ImGui::SameLine(0.f, 10.f);
+			if (!ida_path_wrap_browse) ImGui::SameLine(0.f, 10.f);
 			if (aida::ui::button("Browse...##ida_browse",
 					aida::ui::button_kind_t::secondary,
 					aida::ui::size_t_::md,
@@ -732,6 +814,8 @@ namespace settings_overlay {
 			}
 
 			ImGui::Dummy(ImVec2(0.f, 4.f));
+			float ida_btn_avail = ImGui::GetContentRegionAvail().x;
+			bool ida_btn_wrap = (ida_btn_avail < (112.f + 10.f + 140.f));
 			if (aida::ui::button("Save##ida_save",
 					aida::ui::button_kind_t::secondary,
 					aida::ui::size_t_::md,
@@ -743,7 +827,7 @@ namespace settings_overlay {
 				else
 					set_ida_status("Failed to write settings file.");
 			}
-			ImGui::SameLine(0.f, 10.f);
+			if (!ida_btn_wrap) ImGui::SameLine(0.f, 10.f);
 			if (aida::ui::button("Auto-detect##ida_detect",
 					aida::ui::button_kind_t::secondary,
 					aida::ui::size_t_::md,
@@ -771,10 +855,13 @@ namespace settings_overlay {
 			bool can_launch = !busy && ida_injector::validate_ida_path(g_sa_settings.ida_pro_path);
 			if (!can_launch)
 				ImGui::BeginDisabled();
-			if (aida::ui::button("Launch IDA Pro with AiDA",
+			float launch_avail = ImGui::GetContentRegionAvail().x;
+			float launch_w = (launch_avail < 280.f) ? (std::max)(launch_avail - 12.f, 160.f) : 280.f;
+			const char* launch_label = (launch_w < 220.f) ? "Launch IDA" : "Launch IDA Pro with AiDA";
+			if (aida::ui::button(launch_label,
 					aida::ui::button_kind_t::accent_gradient,
 					aida::ui::size_t_::lg,
-					ImVec2(280.f, 44.f),
+					ImVec2(launch_w, 44.f),
 					false, nullptr, busy))
 			{
 				::diag::log_tagged_critical("ida_launch", "click_received");
@@ -864,6 +951,16 @@ namespace settings_overlay {
 			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Font size");
 			ImGui::SetNextItemWidth(240.f);
 			changed |= ImGui::SliderFloat("##ed_font", &s.ed_font_size, 9.f, 32.f, "%.0f");
+
+			ImGui::Dummy(ImVec2(0.f, 4.f));
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
+				"Disassembly selection");
+			bool full_line_sel = editor_config::disasm_full_line_select;
+			if (ImGui::Checkbox("Full-line selection (highlight entire row)##disasm_full_line_sel",
+				&full_line_sel))
+			{
+				editor_config::disasm_full_line_select = full_line_sel;
+			}
 
 			ImGui::Dummy(ImVec2(0.f, 6.f));
 			ImGui::Separator();
@@ -1025,37 +1122,66 @@ namespace settings_overlay {
 			ImVec2(wp.x + 44.f, wp.y + 11.f),
 			th.text_primary, "Settings");
 
-		const float side_w = 190.f;
+		aida::ui::responsive::sidebar_policy_t side_pol;
+		side_pol.full_width = 190.f;
+		side_pol.icon_only_width = 56.f;
+		side_pol.icon_only_threshold = 150.f;
+		side_pol.hide_threshold = 36.f;
+		side_pol.content_min_w = 280.f;
+		const float min_panel_w = aida::ui::responsive::compute_total_min_width(side_pol);
+		(void)min_panel_w;
+
+		aida::ui::responsive::sidebar_metrics_t side_metrics =
+			aida::ui::responsive::resolve_sidebar(panel_w - 8.f, side_pol);
+		const float side_w = side_metrics.width;
+		const bool side_icon_only = side_metrics.icon_only;
+		const bool side_hidden = side_metrics.hidden;
+
+		static bool s_logged_icon_only = false;
+		if (side_icon_only && !s_logged_icon_only) {
+			s_logged_icon_only = true;
+			::diag::log_tagged_fmt("responsive",
+				"settings_overlay sidebar icon_only_threshold=%.0f panel_w=%.0f",
+				side_pol.icon_only_threshold, panel_w);
+		} else if (!side_icon_only && s_logged_icon_only) {
+			s_logged_icon_only = false;
+		}
+
 		const float content_y = header_h + 4.f;
 		const float content_h = panel_h - content_y - 8.f;
-		const float content_w = panel_w - side_w - 8.f;
+		float content_avail_w = panel_w - side_w - (side_hidden ? 0.f : 8.f);
+		if (content_avail_w < 80.f) content_avail_w = 80.f;
+		float content_w = content_avail_w;
 
-		ImGui::SetCursorPos(ImVec2(0.f, content_y));
-		ImGui::BeginChild("##settings_sidebar", ImVec2(side_w, content_h), false,
-			ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar);
-		{
-			static const char* tab_labels[tab_count] = {
-				"Accounts",
-				"Agents",
-				"Skills",
-				"MCP Servers",
-				"Editor",
-				"IDA Pro"
-			};
-			const float row_h = 44.f;
-			ImGui::Dummy(ImVec2(0, 8.f));
-			for (int i = 0; i < tab_count; ++i) {
-				detail::render_tab_label(i, tab_labels[i], side_w, row_h,
-					th.text_primary, th.text_secondary, dt);
-				ImGui::Dummy(ImVec2(0, 2.f));
+		if (!side_hidden) {
+			ImGui::SetCursorPos(ImVec2(0.f, content_y));
+			ImGui::BeginChild("##settings_sidebar", ImVec2(side_w, content_h), false,
+				ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar);
+			{
+				static const char* tab_labels[tab_count] = {
+					"Accounts",
+					"Agents",
+					"Skills",
+					"MCP Servers",
+					"Editor",
+					"IDA Pro"
+				};
+				const float row_h = 44.f;
+				ImGui::Dummy(ImVec2(0, 8.f));
+				for (int i = 0; i < tab_count; ++i) {
+					detail::render_tab_label(i, tab_labels[i], side_w, row_h,
+						th.text_primary, th.text_secondary, dt, side_icon_only);
+					ImGui::Dummy(ImVec2(0, 2.f));
+				}
+				detail::render_sidebar_underline(side_w, content_y, row_h, dt);
 			}
-			detail::render_sidebar_underline(side_w, content_y, row_h, dt);
+			ImGui::EndChild();
 		}
-		ImGui::EndChild();
 
-		ImGui::SetCursorPos(ImVec2(side_w + 6.f, content_y));
+		float content_x = side_hidden ? 0.f : (side_w + 6.f);
+		ImGui::SetCursorPos(ImVec2(content_x, content_y));
 		ImGui::BeginChild("##settings_content", ImVec2(content_w, content_h), false,
-			ImGuiWindowFlags_NoSavedSettings);
+			ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_HorizontalScrollbar);
 		{
 			s.tab_crossfade_progress = aida::motion::smooth_lerp(
 				s.tab_crossfade_progress, 1.f, 18.f, dt);

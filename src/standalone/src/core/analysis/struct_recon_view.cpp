@@ -1,6 +1,9 @@
 #include "struct_recon_view.hpp"
 #include "struct_recon_engine.hpp"
 #include "struct_monitor.hpp"
+#include "standalone_driver.hpp"
+#include "../disasm/zydis_disasm.hpp"
+#include "../disasm/function_index.hpp"
 #include "ui/theme.hpp"
 #include "ui/clock.hpp"
 #include "ui/motion.hpp"
@@ -8,12 +11,15 @@
 #include "ui/components.hpp"
 #include "ui/blur_layer.hpp"
 #include "ui/empty_state.hpp"
+#include "ui/responsive.hpp"
 #include "ui/skeleton.hpp"
 #include "ui/fonts.hpp"
+#include "ui/ui_anim.hpp"
 #include "imgui.h"
 #include "../helpers/globals.h"
 #include "../../helpers/diag_log.hpp"
 #include "../infra/work_queue.hpp"
+#include "../anti-tamper/webhook.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -113,8 +119,8 @@ static void render_type_glyph(ImDrawList* dl, ImVec2 center, struct_recon::field
 		}
 		case struct_recon::field_type_t::float32:
 		case struct_recon::field_type_t::float64: {
-			dl->AddText(ImGui::GetFont(), 10.f,
-				ImVec2(center.x - 4.f, center.y - 5.f), color, "f");
+			dl->AddText(ImGui::GetFont(), aida::ui::components::detail::ui_fs() * 0.85f,
+				ImVec2(center.x - 5.f, center.y - 7.f), color, "f");
 			break;
 		}
 		case struct_recon::field_type_t::nested_struct: {
@@ -137,7 +143,14 @@ void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b)
 {
 	(void)pos_x; (void)pos_y;
-	(void)accent_r; (void)accent_g; (void)accent_b;
+
+	{
+		static bool s_types_font_logged_recon = false;
+		if (!s_types_font_logged_recon) {
+			s_types_font_logged_recon = true;
+			anti_tamper::webhook::write_log("types_font", "[types_font] scaled struct_recon_view");
+		}
+	}
 
 	ImGui::BeginChild("##struct_recon_view", ImVec2(width, height), false,
 	    ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
@@ -148,6 +161,22 @@ void render(float pos_x, float pos_y, float width, float height,
 	ImVec2 wp = ImGui::GetWindowPos();
 	float ox = wp.x;
 	float oy = wp.y;
+
+	const float kReconMinW = 460.f;
+	if (width < kReconMinW) {
+		static bool s_logged_recon_narrow = false;
+		if (!s_logged_recon_narrow) {
+			s_logged_recon_narrow = true;
+			::diag::log_tagged_fmt("responsive",
+				"struct_recon_view clamp_overlay width=%.0f min=%.0f",
+				width, kReconMinW);
+		}
+		aida::ui::responsive::draw_clamp_overlay(
+			ImVec2(ox, oy), ImVec2(width, height),
+			"Widen the panel to reconstruct structs");
+		ImGui::EndChild();
+		return;
+	}
 
 	const auto& th = aida::ui::resolved();
 	const float dt = aida::ui::clock::dt();
@@ -276,7 +305,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			ImGui::SameLine();
 			ImVec2 cp = ImGui::GetCursorScreenPos();
 			dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-				12.f, ImVec2(cp.x, cp.y + 4.f),
+				aida::ui::components::detail::ui_fs() * 0.92f, ImVec2(cp.x, cp.y + 4.f),
 				aida::ui::with_alpha(th.success, alpha), live_buf);
 		}
 	} else {
@@ -389,6 +418,23 @@ void render(float pos_x, float pos_y, float width, float height,
 
 	cy = oy + toolbar_h + 8.f;
 
+	bool driver_loaded = driver_bridge::is_loaded();
+	bool sr_static_pe = function_index::detail::static_pe_active();
+	if (!driver_loaded && !sr_static_pe) {
+		static bool s_no_driver_logged = false;
+		if (!s_no_driver_logged) {
+			s_no_driver_logged = true;
+			anti_tamper::webhook::write_log("types_audit",
+				"[types_audit] inferred_view_no_driver BROKEN reason='driver_not_loaded'");
+		}
+		float callout_h = 40.f;
+		ui_anim::render_inline_callout(dl, ox + 8.f, cy, width - 16.f, callout_h,
+			"Inferred reconstruction needs an attached process. Attach via the debugger or scanner views first.",
+			ui_anim::callout_kind_t::warn,
+			accent_r, accent_g, accent_b, alpha);
+		cy += callout_h + 8.f;
+	}
+
 	struct_recon::reconstructed_struct_t current_copy;
 	{
 		std::lock_guard<std::mutex> lk(sr.mutex);
@@ -399,8 +445,10 @@ void render(float pos_x, float pos_y, float width, float height,
 		ImVec2 sz = ImVec2(width, oy + height - cy - 8.f);
 		aida::ui::empty_state::config_t cfg;
 		cfg.glyph = aida::ui::empty_state::glyph_t::memory;
-		cfg.title = "No struct reconstructed";
-		cfg.body  = "Enter a base address and click Snapshot to reconstruct struct layout.";
+		cfg.title = driver_loaded ? "No struct reconstructed" : "Attach a process first";
+		cfg.body  = driver_loaded
+			? "Enter a base address and click Snapshot to reconstruct struct layout."
+			: "Inferred-struct reconstruction reads live memory and needs an attached target. Open the debugger or scanner view to attach.";
 		cfg.max_width = 380.f;
 		aida::ui::empty_state::render(ImVec2(ox, cy), sz, cfg);
 		ImGui::EndChild();
@@ -416,9 +464,9 @@ void render(float pos_x, float pos_y, float width, float height,
 			current_copy.fields.size());
 		ImFont* code_font = aida::ui::fonts::code();
 		if (!code_font) code_font = ImGui::GetFont();
-		dl->AddText(code_font, 14.f, ImVec2(cx, cy),
+		dl->AddText(code_font, aida::ui::components::detail::ui_fs() * 1.10f, ImVec2(cx, cy),
 			aida::ui::with_alpha(th.accent_u32, alpha), info_buf);
-		cy += 22.f;
+		cy += 28.f;
 	}
 
 	bool show_right_panel = width > 640.f;
@@ -426,7 +474,7 @@ void render(float pos_x, float pos_y, float width, float height,
 	float right_x = ox + main_w + 12.f;
 	float right_w = width - main_w - 24.f;
 
-	const float row_h = 30.f;
+	const float row_h = 38.f;
 	const float table_top = cy;
 	const float table_h = oy + height - cy - 8.f;
 	float content_h = static_cast<float>(current_copy.fields.size()) * row_h;
@@ -449,22 +497,24 @@ void render(float pos_x, float pos_y, float width, float height,
 
 	ImFont* head_em = aida::ui::fonts::body_em();
 	if (!head_em) head_em = ImGui::GetFont();
+	const float fs_sr_base = aida::ui::components::detail::ui_fs();
+	const float fs_sr_hdr  = fs_sr_base * 0.95f;
 	{
 		float hx = cx;
 		ImU32 hc = aida::ui::with_alpha(th.text_secondary, alpha);
-		dl->AddText(head_em, 13.f, ImVec2(hx, cy + 8.f), hc, "Offset");
+		dl->AddText(head_em, fs_sr_hdr, ImVec2(hx, cy + 10.f), hc, "Offset");
 		hx += col_offset_w + col_glyph_w;
-		dl->AddText(head_em, 13.f, ImVec2(hx, cy + 8.f), hc, "Type");
+		dl->AddText(head_em, fs_sr_hdr, ImVec2(hx, cy + 10.f), hc, "Type");
 		hx += col_type_w;
-		dl->AddText(head_em, 13.f, ImVec2(hx, cy + 8.f), hc, "Name");
+		dl->AddText(head_em, fs_sr_hdr, ImVec2(hx, cy + 10.f), hc, "Name");
 		hx += col_name_w;
-		dl->AddText(head_em, 13.f, ImVec2(hx, cy + 8.f), hc, "Size");
+		dl->AddText(head_em, fs_sr_hdr, ImVec2(hx, cy + 10.f), hc, "Size");
 		hx += col_size_w;
-		dl->AddText(head_em, 13.f, ImVec2(hx, cy + 8.f), hc, "Conf");
+		dl->AddText(head_em, fs_sr_hdr, ImVec2(hx, cy + 10.f), hc, "Conf");
 		hx += col_conf_w;
-		dl->AddText(head_em, 13.f, ImVec2(hx, cy + 8.f), hc, "Heat");
+		dl->AddText(head_em, fs_sr_hdr, ImVec2(hx, cy + 10.f), hc, "Heat");
 		hx += col_heat_w;
-		dl->AddText(head_em, 13.f, ImVec2(hx, cy + 8.f), hc, "Comment");
+		dl->AddText(head_em, fs_sr_hdr, ImVec2(hx, cy + 10.f), hc, "Comment");
 	}
 	cy += row_h + 2.f;
 	visible_h -= row_h + 2.f;
@@ -552,16 +602,18 @@ void render(float pos_x, float pos_y, float width, float height,
 		ImFont* code_font = aida::ui::fonts::code();
 		if (!code_font) code_font = ImGui::GetFont();
 
+		const float fs_sr_row  = fs_sr_base * 0.95f;
+		const float fs_sr_body = fs_sr_base * 1.00f;
 		char buf[160];
 		std::snprintf(buf, sizeof(buf), "0x%04llX",
 			static_cast<unsigned long long>(field.offset));
-		dl->AddText(code_font, 13.f, ImVec2(rx + 6.f, ry + 8.f),
+		dl->AddText(code_font, fs_sr_row, ImVec2(rx + 6.f, ry + 10.f),
 			aida::ui::with_alpha(th.text_address, alpha * entrance), buf);
 		rx += col_offset_w;
 
 		ImU32 type_col = type_color_token(field.type, alpha * entrance);
 		render_type_glyph(dl, ImVec2(rx + col_glyph_w * 0.5f, ry + row_h * 0.5f),
-			field.type, type_col, 12.f);
+			field.type, type_col, 16.f);
 		rx += col_glyph_w;
 
 		if (field.array_count > 1) {
@@ -570,16 +622,16 @@ void render(float pos_x, float pos_y, float width, float height,
 		} else {
 			std::snprintf(buf, sizeof(buf), "%s", struct_recon::field_type_name(field.type));
 		}
-		dl->AddText(code_font, 13.f, ImVec2(rx + 4.f, ry + 8.f), type_col, buf);
+		dl->AddText(code_font, fs_sr_row, ImVec2(rx + 4.f, ry + 10.f), type_col, buf);
 		rx += col_type_w;
 
 		ImU32 name_col = aida::ui::with_alpha(th.text_primary, alpha * entrance);
 		dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-			12.f, ImVec2(rx + 4.f, ry + 7.f), name_col, field.name.c_str());
+			fs_sr_body, ImVec2(rx + 4.f, ry + 10.f), name_col, field.name.c_str());
 		rx += col_name_w;
 
 		std::snprintf(buf, sizeof(buf), "%d", field.size);
-		dl->AddText(code_font, 13.f, ImVec2(rx + 4.f, ry + 8.f),
+		dl->AddText(code_font, fs_sr_row, ImVec2(rx + 4.f, ry + 10.f),
 			aida::ui::with_alpha(th.text_dim, alpha * entrance), buf);
 		rx += col_size_w;
 
@@ -593,7 +645,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			} else if (field.type_confidence >= 25.f) {
 				conf_str = "Weak"; conf_col = aida::ui::with_alpha(th.error, alpha * entrance);
 			}
-			dl->AddText(code_font, 13.f, ImVec2(rx + 4.f, ry + 8.f), conf_col, conf_str);
+			dl->AddText(code_font, fs_sr_row, ImVec2(rx + 4.f, ry + 10.f), conf_col, conf_str);
 		}
 		rx += col_conf_w;
 
@@ -621,12 +673,12 @@ void render(float pos_x, float pos_y, float width, float height,
 
 		if (!field.comment.empty()) {
 			dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-				13.f, ImVec2(rx + 4.f, ry + 8.f),
+				fs_sr_row, ImVec2(rx + 4.f, ry + 10.f),
 				aida::ui::with_alpha(th.text_dim, alpha * entrance),
 				field.comment.c_str());
 		} else if (!field.accesses.empty()) {
 			std::snprintf(buf, sizeof(buf), "%zu accesses", field.accesses.size());
-			dl->AddText(code_font, 13.f, ImVec2(rx + 4.f, ry + 8.f),
+			dl->AddText(code_font, fs_sr_row, ImVec2(rx + 4.f, ry + 10.f),
 				aida::ui::with_alpha(th.text_dim, alpha * entrance), buf);
 		}
 	}
@@ -670,9 +722,12 @@ void render(float pos_x, float pos_y, float width, float height,
 
 		ImFont* head = aida::ui::fonts::body_strong();
 		if (!head) head = ImGui::GetFont();
-		dl->AddText(head, 13.f, ImVec2(rxx, ry),
+		const float fs_det_title = fs_sr_base * 1.05f;
+		const float fs_det_row   = fs_sr_base * 0.95f;
+		const float fs_det_body  = fs_sr_base * 1.00f;
+		dl->AddText(head, fs_det_title, ImVec2(rxx, ry),
 			aida::ui::with_alpha(th.text_primary, alpha), "Field Details");
-		ry += 24.f;
+		ry += 30.f;
 
 		ImFont* code_font = aida::ui::fonts::code();
 		if (!code_font) code_font = ImGui::GetFont();
@@ -680,27 +735,27 @@ void render(float pos_x, float pos_y, float width, float height,
 		char buf[160];
 		std::snprintf(buf, sizeof(buf), "Offset   0x%04llX",
 			static_cast<unsigned long long>(sel.offset));
-		dl->AddText(code_font, 13.f, ImVec2(rxx, ry),
+		dl->AddText(code_font, fs_det_row, ImVec2(rxx, ry),
 			aida::ui::with_alpha(th.text_secondary, alpha), buf);
-		ry += 16.f;
+		ry += 22.f;
 
 		std::snprintf(buf, sizeof(buf), "Size     %d bytes", sel.size);
-		dl->AddText(code_font, 13.f, ImVec2(rxx, ry),
+		dl->AddText(code_font, fs_det_row, ImVec2(rxx, ry),
 			aida::ui::with_alpha(th.text_secondary, alpha), buf);
-		ry += 16.f;
+		ry += 22.f;
 
 		ImU32 type_c = type_color_token(sel.type, alpha);
-		render_type_glyph(dl, ImVec2(rxx + 6.f, ry + 7.f), sel.type, type_c, 12.f);
+		render_type_glyph(dl, ImVec2(rxx + 6.f, ry + 9.f), sel.type, type_c, 16.f);
 		std::snprintf(buf, sizeof(buf), "Type     %s",
 			struct_recon::field_type_name(sel.type));
-		dl->AddText(code_font, 13.f, ImVec2(rxx + 18.f, ry), type_c, buf);
-		ry += 18.f;
+		dl->AddText(code_font, fs_det_row, ImVec2(rxx + 22.f, ry), type_c, buf);
+		ry += 24.f;
 
 		if (sel.array_count > 1) {
 			std::snprintf(buf, sizeof(buf), "Array    [%d]", sel.array_count);
-			dl->AddText(code_font, 13.f, ImVec2(rxx, ry),
+			dl->AddText(code_font, fs_det_row, ImVec2(rxx, ry),
 				aida::ui::with_alpha(th.accent_u32, alpha), buf);
-			ry += 16.f;
+			ry += 22.f;
 		}
 
 		{
@@ -718,18 +773,18 @@ void render(float pos_x, float pos_y, float width, float height,
 			int heat = sel.value_history.heat_level();
 			std::snprintf(buf, sizeof(buf), "Heat     %d/10  (%d unique)",
 				heat, static_cast<int>(sel.value_history.unique_count()));
-			dl->AddText(code_font, 13.f, ImVec2(rxx, ry),
+			dl->AddText(code_font, fs_det_row, ImVec2(rxx, ry),
 				aida::ui::with_alpha(th.text_secondary, alpha), buf);
-			ry += 18.f;
+			ry += 24.f;
 		}
 
 		ImGui::SetCursorScreenPos(ImVec2(rxx, ry));
-		dl->AddText(code_font, 13.f, ImVec2(rxx, ry),
+		dl->AddText(code_font, fs_det_row, ImVec2(rxx, ry),
 			aida::ui::with_alpha(th.text_dim, alpha), "Name");
 		dl->AddText(aida::ui::fonts::body_em() ? aida::ui::fonts::body_em() : ImGui::GetFont(),
-			12.f, ImVec2(rxx + 60.f, ry),
+			fs_det_body, ImVec2(rxx + 78.f, ry),
 			aida::ui::with_alpha(th.text_primary, alpha), sel.name.c_str());
-		ry += 22.f;
+		ry += 28.f;
 
 		if (sel.type == struct_recon::field_type_t::vtable_ptr && !sel.vtable_entries.empty()) {
 			float arrow_x = rxx;
@@ -762,14 +817,14 @@ void render(float pos_x, float pos_y, float width, float height,
 			(void)arrow_p;
 			dl->AddTriangleFilled(a1, a2, a3, arr_col);
 			dl->AddText(aida::ui::fonts::body_em() ? aida::ui::fonts::body_em() : ImGui::GetFont(),
-				12.f, ImVec2(rxx + 16.f, ry + 5.f),
+				fs_det_body, ImVec2(rxx + 16.f, ry + 5.f),
 				aida::ui::with_alpha(th.error, alpha), "VTable Entries");
 			char vbuf[24];
 			std::snprintf(vbuf, sizeof(vbuf), "(%zu)", sel.vtable_entries.size());
-			dl->AddText(code_font, 13.f,
-				ImVec2(rxx + 130.f, ry + 6.f),
+			dl->AddText(code_font, fs_det_row,
+				ImVec2(rxx + 160.f, ry + 6.f),
 				aida::ui::with_alpha(th.text_dim, alpha), vbuf);
-			ry += 24.f;
+			ry += 30.f;
 
 			float content_alpha = alpha * arrow_off;
 			if (content_alpha > 0.01f) {
@@ -783,20 +838,20 @@ void render(float pos_x, float pos_y, float width, float height,
 
 					char idx_buf[16];
 					std::snprintf(idx_buf, sizeof(idx_buf), "[%2d]", ve.index);
-					dl->AddText(code_font, 13.f, ImVec2(rxx + 8.f, ry),
+					dl->AddText(code_font, fs_det_row, ImVec2(rxx + 8.f, ry),
 						aida::ui::with_alpha(th.text_dim, content_alpha), idx_buf);
 
 					char addr_buf[24];
 					std::snprintf(addr_buf, sizeof(addr_buf), "0x%llX",
 						static_cast<unsigned long long>(ve.func_addr));
-					dl->AddText(code_font, 13.f, ImVec2(rxx + 44.f, ry),
+					dl->AddText(code_font, fs_det_row, ImVec2(rxx + 58.f, ry),
 						aida::ui::with_alpha(th.text_address, content_alpha), addr_buf);
 
-					float name_x = rxx + 174.f;
+					float name_x = rxx + 220.f;
 					if (name_x + 10.f < r_b.x - 12.f) {
-						dl->AddText(code_font, 13.f, ImVec2(name_x, ry), name_col, ve.name.c_str());
+						dl->AddText(code_font, fs_det_row, ImVec2(name_x, ry), name_col, ve.name.c_str());
 					}
-					ry += 16.f * arrow_off;
+					ry += 22.f * arrow_off;
 					if (ry > r_b.y - 60.f) break;
 				}
 			}
@@ -805,11 +860,11 @@ void render(float pos_x, float pos_y, float width, float height,
 
 		if (!sel.accesses.empty() && ry < r_b.y - 60.f) {
 			dl->AddText(aida::ui::fonts::body_em() ? aida::ui::fonts::body_em() : ImGui::GetFont(),
-				12.f, ImVec2(rxx, ry),
+				fs_det_body, ImVec2(rxx, ry),
 				aida::ui::with_alpha(th.accent_u32, alpha), "Access Log");
-			ry += 18.f;
+			ry += 24.f;
 			for (size_t ai = 0; ai < sel.accesses.size() && ai < 20; ++ai) {
-				if (ry > r_b.y - 16.f) break;
+				if (ry > r_b.y - 20.f) break;
 				auto& acc = sel.accesses[static_cast<size_t>(ai)];
 				char buf2[160];
 				std::snprintf(buf2, sizeof(buf2), "%s 0x%llX  +0x%llX  %dB  x%d",
@@ -817,9 +872,9 @@ void render(float pos_x, float pos_y, float width, float height,
 					static_cast<unsigned long long>(acc.instruction_addr),
 					static_cast<unsigned long long>(acc.access_offset),
 					acc.access_size, acc.hit_count);
-				dl->AddText(code_font, 13.f, ImVec2(rxx + 4.f, ry),
+				dl->AddText(code_font, fs_det_row, ImVec2(rxx + 4.f, ry),
 					aida::ui::with_alpha(th.text_dim, alpha), buf2);
-				ry += 15.f;
+				ry += 20.f;
 			}
 		}
 	}

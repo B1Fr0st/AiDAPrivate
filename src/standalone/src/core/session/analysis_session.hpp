@@ -33,7 +33,7 @@ struct analysis_session_t {
 	std::wstring  process_name;
 
 	std::unique_ptr<DisasmFile>                                disasm_file;
-	std::unique_ptr<function_index::detail::cache_t>           fn_cache;
+	std::shared_ptr<function_index::detail::cache_t>           fn_cache;
 	std::unique_ptr<xref_index::detail::registry_t>            xref_registry;
 	std::unique_ptr<symbol_store::snapshot_t>                  symbol_snap;
 	std::unique_ptr<decompiler_engine::snapshot_t>             decomp_snap;

@@ -51,7 +51,8 @@ enum class center_view_t : int {
 	types_hub,
 	analysis_hub,
 	binary_map,
-	graph_view
+	graph_view,
+	image_view
 };
 
 
@@ -199,6 +200,11 @@ namespace chat_edit {
 	inline char  buf[4096] = {};
 }
 
+namespace chat_select_popup {
+	inline bool        open = false;
+	inline std::string text;
+}
+
 struct ConversationSummary {
 	std::string id;
 	std::string title;
@@ -263,8 +269,10 @@ namespace file_browser
 	void refresh(const std::string& dir = "");
 	void toggle_dir(int idx);
 	void open_file(int idx);
+	void open_path(const std::string& path);
 	void render_pending_confirm_modal();
 	void record_recent_workspace(const std::string& path);
+	void tick_watcher();
 }
 
 
@@ -457,9 +465,6 @@ namespace globals
 		inline bool mcp_servers_dialog_open = false;
 
 
-		inline bool about_dialog_open = false;
-
-
 		inline bool  ctx_menu_open = false;
 		inline ImVec2 ctx_menu_pos = ImVec2(0, 0);
 		inline int    ctx_menu_target = -1;
@@ -612,14 +617,15 @@ namespace autocomplete {
 
 
 namespace editor_config {
-	inline int   tab_size               = 4;
-	inline bool  show_line_numbers      = true;
-	inline float font_size              = 14.0f;
-	inline bool  auto_complete          = true;
-	inline bool  highlight_current_line = true;
-	inline bool  word_wrap              = false;
-	inline bool  minimap                = false;
-	inline bool  bracket_match          = true;
+	inline int   tab_size                  = 4;
+	inline bool  show_line_numbers         = true;
+	inline float font_size                 = 14.0f;
+	inline bool  auto_complete             = true;
+	inline bool  highlight_current_line    = true;
+	inline bool  word_wrap                 = false;
+	inline bool  minimap                   = true;
+	inline bool  bracket_match             = true;
+	inline bool  disasm_full_line_select   = false;
 }
 
 

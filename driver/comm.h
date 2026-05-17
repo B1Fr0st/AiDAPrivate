@@ -127,6 +127,11 @@ namespace ioctl_codes {
     __forceinline DWORD HVDT() { return make(52); }
     __forceinline DWORD RELA() { return make(53); }
     __forceinline DWORD EVTS() { return make(54); }
+
+    __forceinline DWORD PSBX() { return make(55); }
+    __forceinline DWORD USBX() { return make(56); }
+    __forceinline DWORD NLOG() { return make(57); }
+    __forceinline DWORD NPKT() { return make(58); }
 }
 
 namespace voyager {
@@ -1039,6 +1044,82 @@ namespace voyager {
             (4u + 4u + 4u + 4u + 8u + 8u + DRAIN_DEBUG_EVENTS_CAP * sizeof(debug_event_t)),
             "drain_debug_events_request size must match kernel struct");
 
+        static constexpr std::uint32_t SANDBOX_FLAG_BLOCK_PERSISTENCE   = 0x00000001u;
+        static constexpr std::uint32_t SANDBOX_FLAG_BLOCK_DRIVER_INSTALL = 0x00000002u;
+        static constexpr std::uint32_t SANDBOX_FLAG_BLOCK_RAW_DISK      = 0x00000004u;
+        static constexpr std::uint32_t SANDBOX_FLAG_BLOCK_KERNEL_HANDLE = 0x00000008u;
+        static constexpr std::uint32_t SANDBOX_FLAG_LOG_NETWORK         = 0x00000010u;
+        static constexpr std::uint32_t SANDBOX_FLAG_BLOCK_CHILD_SPAWN   = 0x00000020u;
+        static constexpr std::uint32_t SANDBOX_FLAG_DEFAULT =
+            SANDBOX_FLAG_BLOCK_PERSISTENCE
+          | SANDBOX_FLAG_BLOCK_DRIVER_INSTALL
+          | SANDBOX_FLAG_BLOCK_RAW_DISK
+          | SANDBOX_FLAG_BLOCK_KERNEL_HANDLE
+          | SANDBOX_FLAG_LOG_NETWORK;
+
+        struct protect_sandbox_request {
+            std::uint32_t magic;
+            std::uint32_t session_key;
+            std::uint32_t pid;
+            std::uint32_t flags;
+            std::uint32_t result;
+            std::uint32_t reserved;
+            std::uint64_t denials_so_far;
+        };
+        static_assert(sizeof(protect_sandbox_request) == 32, "protect_sandbox_request must match kernel struct");
+
+        struct net_log_register_request {
+            std::uint32_t magic;
+            std::uint32_t session_key;
+            std::uint32_t pid;
+            std::uint32_t operation;
+            std::uint32_t result;
+            std::uint32_t reserved;
+        };
+        static_assert(sizeof(net_log_register_request) == 24, "net_log_register_request must match kernel struct");
+
+        static constexpr std::uint32_t NET_PKT_PULL_RING_CAPACITY    = 2048u;
+        static constexpr std::uint32_t NET_PKT_PULL_PAYLOAD_RETAIN   = 256u;
+        static constexpr std::uint32_t NET_PKT_PULL_RECORD_SIZE      = 384u;
+        static constexpr std::uint32_t NET_PKT_PULL_REQ_MAGIC        = 0x4E50414Bu;
+        static constexpr std::uint32_t NET_PKT_PULL_RESP_MAGIC       = 0x4E50414Du;
+        static constexpr std::uint32_t NET_PKT_FLAG_TRUNCATED        = 0x00000001u;
+
+        struct net_packet_pull_request {
+            std::uint32_t magic;
+            std::uint32_t session_key;
+            std::uint32_t pid;
+            std::uint32_t max_records;
+            std::uint32_t reserved;
+            std::uint32_t padding;
+        };
+        static_assert(sizeof(net_packet_pull_request) == 24, "net_packet_pull_request must be 24 bytes");
+
+        struct net_packet_pull_response_header {
+            std::uint32_t magic;
+            std::uint32_t record_count;
+            std::uint64_t dropped_since_last_pull;
+        };
+        static_assert(sizeof(net_packet_pull_response_header) == 16, "net_packet_pull_response_header must be 16 bytes");
+
+        struct net_packet_record {
+            std::uint64_t timestamp;
+            std::uint64_t tcp_seq;
+            std::uint32_t pid;
+            std::uint32_t payload_len;
+            std::uint32_t flags;
+            std::uint16_t local_port;
+            std::uint16_t remote_port;
+            std::uint16_t address_family;
+            std::uint8_t  protocol;
+            std::uint8_t  direction;
+            std::uint8_t  local_addr[16];
+            std::uint8_t  remote_addr[16];
+            std::uint8_t  payload[256];
+            std::uint8_t  pad[60];
+        };
+        static_assert(sizeof(net_packet_record) == 384, "net_packet_record must be exactly 384 bytes (kernel ABI)");
+
 #pragma pack(push, 1)
         struct hv_detect_result {
             std::uint8_t sidt_lock_prefix;
@@ -1558,6 +1639,14 @@ namespace voyager {
         bool kernel_anti_dump_unpermit_pid(std::uint32_t pid) noexcept;
         bool kernel_anti_dump_stop_continuous() noexcept;
         bool kernel_anti_dump_start_continuous(std::uint32_t pid) noexcept;
+
+        bool protect_sandbox_pid(std::uint32_t pid, std::uint32_t flags = 0, std::uint64_t* out_denials = nullptr) noexcept;
+        bool unprotect_sandbox_pid(std::uint32_t pid, std::uint64_t* out_denials = nullptr) noexcept;
+        bool net_log_register_pid(std::uint32_t pid, bool enable) noexcept;
+        bool malware_safe_pull_packets(std::uint32_t pid,
+                                       std::uint32_t max_records,
+                                       std::vector<detail::net_packet_record>& out,
+                                       std::uint64_t* out_dropped_since_last_pull = nullptr) noexcept;
 
         bool relay_server_token(std::uint32_t token_hash, std::uint64_t server_nonce) noexcept;
         bool relay_server_token_v2(std::uint32_t token_hash, std::uint64_t server_nonce, std::uint64_t* out_driver_proof = nullptr) noexcept;

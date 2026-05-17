@@ -100,14 +100,14 @@ struct bw_entry_t {
 
 
 struct repeater_entry_t {
-    std::string host;
-    uint16_t    port = 443;
-    bool        use_tls = true;
-    std::string raw_request;
-    std::string raw_response;
-    int         status_code = 0;
-    uint64_t    latency_ms = 0;
-    bool        in_progress = false;
+    std::string       host;
+    uint16_t          port = 443;
+    bool              use_tls = true;
+    std::string       raw_request;
+    std::string       raw_response;
+    int               status_code = 0;
+    uint64_t          latency_ms = 0;
+    std::atomic<bool> in_progress{false};
 };
 
 enum class fuzzer_attack_mode_t : int {
@@ -219,15 +219,18 @@ struct state_t {
 
     char                          kl_exe_path[512] = {};
     char                          kl_args[512] = {};
+    char                          kl_watch_path[512] = {};
     int                           kl_selected = -1;
     bool                          kl_auto_scroll = true;
 
 
     char                          pcap_path[512] = {};
-    bool                          pcap_writing = false;
-    uint32_t                      pcap_written_count = 0;
+    std::atomic<bool>             pcap_writing{false};
+    std::atomic<uint32_t>         pcap_written_count{0};
     uint32_t                      pcap_filter_pid = 0;
     uint8_t                       pcap_filter_protocol = 0;
+    std::string                   pcap_last_error;
+    std::mutex                    pcap_error_mutex;
 
 
     struct fuzzer_entry_t {

@@ -16,6 +16,7 @@
 #include "../ui/components.hpp"
 #include "../ui/empty_state.hpp"
 #include "../ui/no_target_overlay.hpp"
+#include "../ui/responsive.hpp"
 #include "../ui/skeleton.hpp"
 #include "../ui/blur_layer.hpp"
 #include "../ui/fonts.hpp"
@@ -23,6 +24,7 @@
 #include "../helpers/diag_log.hpp"
 #include "../helpers/win32_dialog.hpp"
 #include "../session/analysis_session.hpp"
+#include "../anti-tamper/webhook.hpp"
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -531,8 +533,45 @@ static void run_fuzzer_thread(state_t& state);
 void initialize() {
     g_state.active = true;
     diag::log_tagged("network", "initialize_begin");
+    anti_tamper::webhook::write_log("net_audit", "[net_audit] network_view initialize begin");
 
     work_queue::initialize();
+
+    mitm_proxy::set_ws_frame_callback([](const mitm_proxy::ws_frame_observed_t& frame) {
+        state_t::ws_frame_entry_t entry;
+        entry.timestamp = frame.timestamp;
+        entry.exchange_id = frame.exchange_id;
+        entry.host = frame.host;
+        entry.port = frame.port;
+        entry.is_outbound = frame.is_outbound;
+        entry.is_text = frame.is_text;
+        entry.opcode = frame.opcode;
+        entry.payload = frame.payload;
+        if (frame.is_text && !frame.payload.empty()) {
+            size_t preview_len = frame.payload.size() < 96 ? frame.payload.size() : 96;
+            entry.preview.assign(frame.payload.begin(), frame.payload.begin() + static_cast<ptrdiff_t>(preview_len));
+            for (auto& ch : entry.preview) {
+                unsigned char uc = static_cast<unsigned char>(ch);
+                if (uc < 32 || uc == 127) ch = '.';
+            }
+        } else if (!frame.payload.empty()) {
+            char buf[16];
+            entry.preview.clear();
+            size_t cap = frame.payload.size() < 16 ? frame.payload.size() : 16;
+            for (size_t bi = 0; bi < cap; ++bi) {
+                snprintf(buf, sizeof(buf), bi == 0 ? "%02X" : " %02X", frame.payload[bi]);
+                entry.preview += buf;
+            }
+            if (frame.payload.size() > cap) entry.preview += " ...";
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_state.ws_mutex);
+            g_state.ws_frames.push_back(std::move(entry));
+            while (g_state.ws_frames.size() > g_state.ws_max_frames)
+                g_state.ws_frames.pop_front();
+        }
+    });
+    anti_tamper::webhook::write_log("net_audit", "[net_audit] websocket ws_frame_callback installed");
 
     g_state.conn_polling.store(true);
     g_state.conn_thread_done.store(false, std::memory_order_release);
@@ -601,6 +640,8 @@ void initialize() {
 
 void shutdown() {
     diag::log_tagged("network", "shutdown_begin");
+    anti_tamper::webhook::write_log("net_audit", "[net_audit] network_view shutdown begin");
+    mitm_proxy::set_ws_frame_callback(nullptr);
     g_state.conn_polling.store(false);
     g_state.conn_cv.notify_all();
     g_state.bw_polling.store(false);
@@ -644,6 +685,12 @@ static const char* tab_names[] = {
     "PCAP", "Fuzzer", "WebSocket", "Scripting", "Decoder"
 };
 
+static const char* tab_short_names[] = {
+    "Conn", "Cap", "Int", "Prx",
+    "DNS", "Filt", "BW", "Rep", "KL",
+    "PCAP", "Fuz", "WS", "Scr", "Dec"
+};
+
 
 static void render_tab_bar(state_t& state, float x, float y, float w, float alpha,
                             float ar, float ag, float ab, float dt) {
@@ -663,11 +710,30 @@ static void render_tab_bar(state_t& state, float x, float y, float w, float alph
     dl->AddRectFilled(ImVec2(clip_x0, clip_y0), ImVec2(clip_x1, clip_y1),
                       aida::ui::with_alpha(th.panel_header, alpha * 0.55f));
 
+    float total_full_w = 0.f;
+    float total_short_w = 0.f;
+    for (int i = 0; i < count; i++) {
+        total_full_w += ImGui::CalcTextSize(tab_names[i]).x + 22.f + 2.f;
+        total_short_w += ImGui::CalcTextSize(tab_short_names[i]).x + 18.f + 2.f;
+    }
+    bool use_short = (w < total_full_w) && (w + 24.f >= total_short_w * 0.6f);
+
+    static bool s_logged_net_short = false;
+    if (use_short && !s_logged_net_short) {
+        s_logged_net_short = true;
+        ::diag::log_tagged_fmt("responsive",
+            "network_view tabs short_labels w=%.0f full=%.0f short=%.0f",
+            w, total_full_w, total_short_w);
+    } else if (!use_short && s_logged_net_short) {
+        s_logged_net_short = false;
+    }
+
     float total_w = 0.f;
     float tab_widths[static_cast<int>(sub_tab_t::COUNT)];
     float tab_offsets[static_cast<int>(sub_tab_t::COUNT)];
     for (int i = 0; i < count; i++) {
-        tab_widths[i] = ImGui::CalcTextSize(tab_names[i]).x + 22.f;
+        const char* lbl = use_short ? tab_short_names[i] : tab_names[i];
+        tab_widths[i] = ImGui::CalcTextSize(lbl).x + (use_short ? 18.f : 22.f);
         tab_offsets[i] = total_w;
         total_w += tab_widths[i] + 2.f;
     }
@@ -746,12 +812,26 @@ static void render_tab_bar(state_t& state, float x, float y, float w, float alph
                 aida::ui::with_alpha(th.hover_wash, hov_v * alpha), 8.f);
         }
 
-        ImVec2 ts = ImGui::CalcTextSize(tab_names[i]);
+        const char* draw_label = use_short ? tab_short_names[i] : tab_names[i];
+        ImVec2 ts = ImGui::CalcTextSize(draw_label);
         ImU32 text_col = is_active
             ? aida::ui::with_alpha(th.text_primary, alpha)
             : aida::ui::with_alpha(th.text_secondary, alpha * (0.65f + 0.30f * hov_v));
         dl->AddText(ImVec2(bx0 + (tab_widths[i] - ts.x) * 0.5f, by0 + (tab_h - ts.y) * 0.5f - prs_v * 0.5f),
-            text_col, tab_names[i]);
+            text_col, draw_label);
+
+        if (use_short && hovered) {
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f, 6.f));
+            ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(th.bg_overlay));
+            if (ImGui::BeginTooltip()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(th.text_primary));
+                ImGui::TextUnformatted(tab_names[i]);
+                ImGui::PopStyleColor();
+                ImGui::EndTooltip();
+            }
+            ImGui::PopStyleColor();
+            ImGui::PopStyleVar();
+        }
     }
 
     ui_anim::render_tab_underline_glow(dl, state.underline_x, state.underline_w,
@@ -792,8 +872,21 @@ static void render_connections(state_t& state, float x, float y, float w, float 
 
     bool driver_ok = driver_bridge::using_kernel_driver();
 
+    float conn_toolbar_avail = ImGui::GetContentRegionAvail().x;
+    bool conn_toolbar_narrow = (conn_toolbar_avail < 560.f);
+    float search_w = conn_toolbar_narrow
+        ? (std::max)(conn_toolbar_avail - 240.f, 140.f)
+        : 280.f;
     aida::ui::input_text("##conn_search", state.conn_filter_text, sizeof(state.conn_filter_text),
-                          "Filter by PID, host, port...", false, ImVec2(280.f, 32.f));
+                          "Filter by PID, host, port...", false, ImVec2(search_w, 32.f));
+    if (conn_toolbar_narrow && conn_toolbar_avail < 360.f) {
+        static bool s_logged_conn_narrow = false;
+        if (!s_logged_conn_narrow) {
+            s_logged_conn_narrow = true;
+            ::diag::log_tagged_fmt("responsive",
+                "network_view connections toolbar avail=%.0f wrap=1", conn_toolbar_avail);
+        }
+    }
     ImGui::SameLine();
     if (!driver_ok) ImGui::BeginDisabled();
     bool prev_auto = state.conn_auto_refresh;
@@ -851,7 +944,16 @@ static void render_connections(state_t& state, float x, float y, float w, float 
 
 
     float col_pid = 64.f, col_proto = 50.f, col_state = 110.f;
-    float col_local = (w - col_pid - col_proto - col_state - 24.f) * 0.5f;
+    float remain_w = w - col_pid - col_proto - col_state - 24.f;
+    if (remain_w < 120.f) {
+        if (w < 280.f) {
+            col_proto = 40.f;
+            col_state = 70.f;
+        }
+        remain_w = w - col_pid - col_proto - col_state - 24.f;
+        if (remain_w < 80.f) remain_w = 80.f;
+    }
+    float col_local = remain_w * 0.5f;
     float col_remote = col_local;
 
     dl->AddRectFilled(ImVec2(org.x, hdr_y), ImVec2(org.x + w, hdr_y + row_h),
@@ -1063,15 +1165,20 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             diag::log_tagged_fmt("network", "start_capture_clicked filter_pid=%u filter_port=%u filter_proto=%u drv_ok=%d",
                 state.cap_filter_pid, state.cap_filter_port, state.cap_filter_protocol,
                 driver_bridge::using_kernel_driver() ? 1 : 0);
-            if (driver_bridge::start_capture(state.cap_filter_pid, state.cap_filter_port,
+            if (driver_bridge::start_capture(state.cap_filter_pid,
+                                       static_cast<uint32_t>(state.cap_filter_port),
                                        state.cap_filter_protocol, nullptr)) {
                 diag::log_tagged("network", "start_capture_ok poll_thread_signaled");
+                anti_tamper::webhook::write_log("net_audit",
+                    "[net_audit] capture started ok");
                 state.cap_running = true;
                 state.cap_polling.store(true);
                 state.cap_cv.notify_all();
             } else {
                 diag::log_tagged_fmt("network", "start_capture_failed kernel_mode=%d",
                     driver_bridge::using_kernel_driver() ? 1 : 0);
+                anti_tamper::webhook::write_log("net_audit",
+                    "[net_audit] capture start FAILED driver call returned false");
             }
         }
     } else {
@@ -1080,10 +1187,55 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             driver_bridge::stop_capture();
             state.cap_running = false;
             state.cap_polling.store(false);
+            anti_tamper::webhook::write_log("net_audit",
+                "[net_audit] capture stopped by user");
         }
     }
 
     if (!driver_ok) ImGui::EndDisabled();
+
+    ImGui::SameLine(0.f, 12.f);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
+                       "PID:");
+    ImGui::SameLine();
+    {
+        int pid_v = static_cast<int>(state.cap_filter_pid);
+        ImGui::SetNextItemWidth(80.f);
+        if (ImGui::InputInt("##cap_filter_pid", &pid_v, 0, 0, ImGuiInputTextFlags_CharsDecimal)) {
+            if (pid_v < 0) pid_v = 0;
+            state.cap_filter_pid = static_cast<uint32_t>(pid_v);
+        }
+    }
+    ImGui::SameLine(0.f, 8.f);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
+                       "Port:");
+    ImGui::SameLine();
+    {
+        int port_v = static_cast<int>(state.cap_filter_port);
+        ImGui::SetNextItemWidth(70.f);
+        if (ImGui::InputInt("##cap_filter_port", &port_v, 0, 0, ImGuiInputTextFlags_CharsDecimal)) {
+            if (port_v < 0) port_v = 0;
+            if (port_v > 65535) port_v = 65535;
+            state.cap_filter_port = static_cast<uint16_t>(port_v);
+        }
+    }
+    ImGui::SameLine(0.f, 8.f);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
+                       "Proto:");
+    ImGui::SameLine();
+    {
+        const char* cap_proto_items[] = { "All", "TCP", "UDP" };
+        int cap_proto_idx = state.cap_filter_protocol == 6 ? 1 :
+                             state.cap_filter_protocol == 17 ? 2 : 0;
+        ImGui::SetNextItemWidth(80.f);
+        if (ImGui::Combo("##cap_filter_proto", &cap_proto_idx, cap_proto_items, 3)) {
+            state.cap_filter_protocol = cap_proto_idx == 1 ? 6 :
+                                         cap_proto_idx == 2 ? 17 : 0;
+        }
+    }
 
     ImGui::SameLine();
     if (aida::ui::button("Clear", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
@@ -1626,6 +1778,16 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
             bool ok = mitm_proxy::start(cfg);
             diag::log_tagged_fmt("network", "proxy_start_result ok=%d running=%d",
                 ok ? 1 : 0, mitm_proxy::is_running() ? 1 : 0);
+            char buf[160];
+            snprintf(buf, sizeof(buf),
+                "[net_audit] proxy start clicked bind=%s:%u tls=%d ok=%d running=%d",
+                state.proxy_bind_addr, state.proxy_port, state.proxy_decode_tls ? 1 : 0,
+                ok ? 1 : 0, mitm_proxy::is_running() ? 1 : 0);
+            anti_tamper::webhook::write_log("net_audit", buf);
+            if (!ok) {
+                toast_notification::push("Failed to start proxy. See aida_debug.log.",
+                    toast_notification::toast_type_t::error);
+            }
         }
     } else {
         auto stats = mitm_proxy::get_stats();
@@ -2349,17 +2511,20 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                 req_buf_dirty = true;
             }
 
-            if (!rep.in_progress) {
+            if (!rep.in_progress.load()) {
                 if (aida::ui::button("Send", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
                     if (req_buf_dirty) {
                         rep.raw_request = req_buf;
                         req_buf_dirty = false;
                     }
-                    rep.in_progress = true;
+                    rep.in_progress.store(true);
                     std::shared_ptr<repeater_entry_t> entry = rep_ptr;
                     diag::log_tagged_fmt("network", "repeater_send_clicked host=%s:%u tls=%d req_size=%zu",
                         entry->host.c_str(), entry->port, entry->use_tls ? 1 : 0,
                         entry->raw_request.size());
+                    anti_tamper::webhook::write_log("net_audit",
+                        (std::string("[net_audit] repeater send host=") + entry->host + ":" +
+                         std::to_string(entry->port) + " tls=" + (entry->use_tls ? "1" : "0")).c_str());
                     work_queue::post([entry]() {
                         std::vector<uint8_t> raw(entry->raw_request.begin(), entry->raw_request.end());
                         auto t0 = GetTickCount64();
@@ -2382,8 +2547,10 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                             diag::log_tagged_fmt("network", "repeater_send_failed host=%s:%u err='%s' wall_ms=%llu",
                                 entry->host.c_str(), entry->port, result.error.c_str(),
                                 static_cast<unsigned long long>(elapsed));
+                            anti_tamper::webhook::write_log("net_audit",
+                                (std::string("[net_audit] repeater send FAILED err='") + result.error + "'").c_str());
                         }
-                        entry->in_progress = false;
+                        entry->in_progress.store(false);
                     });
                 }
             } else {
@@ -2498,14 +2665,18 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(lbl_col),
                        "Held: %d", held_count);
 
-    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows)) {
+    bool can_use_shortcuts = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+                              !ImGui::IsAnyItemActive() && !ImGui::GetIO().WantTextInput;
+    if (can_use_shortcuts) {
         bool shift = ImGui::GetIO().KeyShift;
         if (shift && ImGui::IsKeyPressed(ImGuiKey_F)) {
             diag::log_tagged("network", "intercept_forward_all_shortcut");
+            anti_tamper::webhook::write_log("net_audit", "[net_audit] intercept Shift+F forward_all shortcut fired");
             mitm_proxy::forward_all();
         }
         if (shift && ImGui::IsKeyPressed(ImGuiKey_D)) {
             diag::log_tagged("network", "intercept_drop_all_shortcut");
+            anti_tamper::webhook::write_log("net_audit", "[net_audit] intercept Shift+D drop_all shortcut fired");
             mitm_proxy::drop_all();
         }
 
@@ -2749,6 +2920,23 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
     ImGui::SameLine();
     aida::ui::input_text("##kl_exe", state.kl_exe_path, sizeof(state.kl_exe_path),
                           "C:\\path\\to\\target.exe", false, ImVec2(360.f, 28.f));
+    ImGui::SameLine();
+    if (aida::ui::button("Browse...##kl_browse", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+        char path_buf[MAX_PATH] = {};
+        static const char k_exe_open_filter[] =
+            "Executable (*.exe)\0*.exe\0"
+            "All files (*.*)\0*.*\0\0";
+        if (win32_dialog::show_open_file_dialog(g_hwnd,
+                "Select Target Executable",
+                k_exe_open_filter,
+                path_buf, sizeof(path_buf),
+                "network_view::keylog_exe")) {
+            snprintf(state.kl_exe_path, sizeof(state.kl_exe_path), "%s", path_buf);
+            diag::log_tagged_fmt("network", "keylog_exe_picked path='%s'", path_buf);
+            anti_tamper::webhook::write_log("net_audit",
+                (std::string("[net_audit] keylog exe picked path='") + path_buf + "'").c_str());
+        }
+    }
 
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
                        "Arguments:");
@@ -2776,12 +2964,36 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
             }
         }
         ImGui::SameLine();
-        if (aida::ui::button("Watch File Only", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
-            char path[MAX_PATH] = {};
-            GetTempPathA(MAX_PATH, path);
-            std::string kpath = std::string(path) + "aida_sslkeylog_" + std::to_string(GetCurrentProcessId()) + ".log";
-            diag::log_tagged_fmt("network", "keylog_watch_file_clicked path='%s'", kpath.c_str());
-            ssl_keylog::start_watching(kpath);
+        if (aida::ui::button("Watch File...", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+            char path_buf[MAX_PATH] = {};
+            static const char k_keylog_open_filter[] =
+                "SSL Keylog (*.log;*.keylog;*.txt)\0*.log;*.keylog;*.txt\0"
+                "All files (*.*)\0*.*\0\0";
+            if (win32_dialog::show_open_file_dialog(g_hwnd,
+                    "Watch SSLKEYLOGFILE",
+                    k_keylog_open_filter,
+                    path_buf, sizeof(path_buf),
+                    "network_view::keylog_watch")) {
+                snprintf(state.kl_watch_path, sizeof(state.kl_watch_path), "%s", path_buf);
+                diag::log_tagged_fmt("network", "keylog_watch_dialog_pick path='%s'", path_buf);
+                anti_tamper::webhook::write_log("net_audit",
+                    (std::string("[net_audit] keylog watch dialog path='") + path_buf + "'").c_str());
+                ssl_keylog::start_watching(path_buf);
+            } else {
+                diag::log_tagged("network", "keylog_watch_dialog_cancelled");
+            }
+        }
+        ImGui::SameLine();
+        aida::ui::input_text("##kl_watch_path", state.kl_watch_path, sizeof(state.kl_watch_path),
+                              "or paste a keylog path...", false, ImVec2(260.f, 28.f));
+        ImGui::SameLine();
+        bool can_use_typed = state.kl_watch_path[0] != '\0';
+        if (aida::ui::button("Watch", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm,
+                              ImVec2(0.f, 0.f), !can_use_typed) && can_use_typed) {
+            diag::log_tagged_fmt("network", "keylog_watch_typed path='%s'", state.kl_watch_path);
+            anti_tamper::webhook::write_log("net_audit",
+                (std::string("[net_audit] keylog watch typed path='") + state.kl_watch_path + "'").c_str());
+            ssl_keylog::start_watching(state.kl_watch_path);
         }
     } else {
         char watch_buf[640];
@@ -3049,6 +3261,27 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
     ImGui::SameLine();
     aida::ui::input_text("##pcap_path", state.pcap_path, sizeof(state.pcap_path),
                           "C:\\path\\to\\capture.pcap", false, ImVec2(420.f, 28.f));
+    ImGui::SameLine();
+    if (aida::ui::button("Browse...##pcap_browse", aida::ui::button_kind_t::secondary,
+                          aida::ui::size_t_::sm)) {
+        char path_buf[MAX_PATH] = {};
+        if (state.pcap_path[0])
+            snprintf(path_buf, sizeof(path_buf), "%s", state.pcap_path);
+        static const char k_pcap_save_filter[] =
+            "Packet Capture (*.pcap)\0*.pcap\0"
+            "All files (*.*)\0*.*\0\0";
+        if (win32_dialog::show_save_file_dialog(g_hwnd,
+                "Save PCAP",
+                k_pcap_save_filter,
+                "pcap",
+                path_buf, sizeof(path_buf),
+                "network_view::pcap_save")) {
+            snprintf(state.pcap_path, sizeof(state.pcap_path), "%s", path_buf);
+            diag::log_tagged_fmt("network", "pcap_path_picked path='%s'", path_buf);
+            anti_tamper::webhook::write_log("net_audit",
+                (std::string("[net_audit] pcap path picked path='") + path_buf + "'").c_str());
+        }
+    }
 
     if (state.pcap_path[0] == '\0') {
         char temp[MAX_PATH] = {};
@@ -3093,10 +3326,16 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
 
     ImGui::Spacing();
 
-    if (!state.pcap_writing) {
-        if (aida::ui::button("Export to PCAP", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
-            state.pcap_writing = true;
-            state.pcap_written_count = 0;
+    if (!state.pcap_writing.load()) {
+        bool can_export = state.pcap_path[0] != '\0' && cap_count > 0;
+        if (aida::ui::button("Export to PCAP", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm,
+                              ImVec2(0.f, 0.f), !can_export)) {
+            state.pcap_writing.store(true);
+            state.pcap_written_count.store(0);
+            {
+                std::lock_guard<std::mutex> elock(state.pcap_error_mutex);
+                state.pcap_last_error.clear();
+            }
 
 
             std::deque<packet_entry_t> packets_copy;
@@ -3108,18 +3347,24 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
             auto path = std::string(state.pcap_path);
             auto filter_pid = state.pcap_filter_pid;
             auto filter_proto = state.pcap_filter_protocol;
-            auto* written_count = &state.pcap_written_count;
-            auto* writing_flag = &state.pcap_writing;
 
             diag::log_tagged_fmt("network", "pcap_export_clicked path='%s' filter_pid=%u filter_proto=%u source_packets=%zu",
                 path.c_str(), filter_pid, filter_proto, packets_copy.size());
+            anti_tamper::webhook::write_log("net_audit",
+                ("[net_audit] pcap export start path='" + path + "'").c_str());
 
             work_queue::post([packets_copy = std::move(packets_copy), path, filter_pid, filter_proto,
-                         written_count, writing_flag]() {
+                         st = &state]() {
                 std::ofstream f(path, std::ios::binary);
                 if (!f.is_open()) {
                     diag::log_tagged_fmt("network", "pcap_export_failed_open path='%s'", path.c_str());
-                    *writing_flag = false;
+                    anti_tamper::webhook::write_log("net_audit",
+                        ("[net_audit] pcap export FAILED open path='" + path + "'").c_str());
+                    {
+                        std::lock_guard<std::mutex> elock(st->pcap_error_mutex);
+                        st->pcap_last_error = "Cannot open '" + path + "' for writing";
+                    }
+                    st->pcap_writing.store(false);
                     return;
                 }
                 write_pcap_header(f);
@@ -3131,23 +3376,44 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
                     write_pcap_packet(f, pkt);
                     count++;
                 }
-                *written_count = count;
+                st->pcap_written_count.store(count);
                 f.close();
-                *writing_flag = false;
+                st->pcap_writing.store(false);
                 diag::log_tagged_fmt("network", "pcap_export_done path='%s' written=%u",
                     path.c_str(), count);
+                anti_tamper::webhook::write_log("net_audit",
+                    ("[net_audit] pcap export ok path='" + path + "' written=" + std::to_string(count)).c_str());
             });
+        }
+        if (!can_export) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
+                "Capture some packets first or set a valid output path.");
         }
     } else {
         aida::ui::pill_kind("Writing PCAP file...", aida::ui::pill_kind_t::accent,
                              aida::ui::size_t_::sm, true);
     }
 
-    if (state.pcap_written_count > 0 && !state.pcap_writing) {
+    {
+        std::string err_copy;
+        {
+            std::lock_guard<std::mutex> elock(state.pcap_error_mutex);
+            err_copy = state.pcap_last_error;
+        }
+        if (!err_copy.empty()) {
+            ImGui::Spacing();
+            aida::ui::pill_kind(err_copy.c_str(), aida::ui::pill_kind_t::error,
+                                 aida::ui::size_t_::sm, true);
+        }
+    }
+
+    uint32_t exported_count = state.pcap_written_count.load();
+    if (exported_count > 0 && !state.pcap_writing.load()) {
         ImGui::Spacing();
         char done_buf[640];
         snprintf(done_buf, sizeof(done_buf), "Exported %u packets to %s",
-                 state.pcap_written_count, state.pcap_path);
+                 exported_count, state.pcap_path);
         aida::ui::pill_kind(done_buf, aida::ui::pill_kind_t::success, aida::ui::size_t_::sm, false);
     }
 
@@ -3164,13 +3430,32 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
                        "Proxy exchanges available: %zu", proxy_count);
 
     if (aida::ui::button("Export Proxy as HAR", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+        char har_buf[MAX_PATH] = {};
         char temp[MAX_PATH] = {};
         GetTempPathA(MAX_PATH, temp);
-        std::string har_path = std::string(temp) + "aida_proxy_export.har";
+        snprintf(har_buf, sizeof(har_buf), "%saida_proxy_export.har", temp);
+        static const char k_har_save_filter[] =
+            "HTTP Archive (*.har)\0*.har\0"
+            "JSON (*.json)\0*.json\0"
+            "All files (*.*)\0*.*\0\0";
+        if (!win32_dialog::show_save_file_dialog(g_hwnd,
+                "Export HAR",
+                k_har_save_filter,
+                "har",
+                har_buf, sizeof(har_buf),
+                "network_view::har_save")) {
+            diag::log_tagged("network", "har_export_dialog_cancelled");
+            anti_tamper::webhook::write_log("net_audit",
+                "[net_audit] HAR export dialog cancelled");
+        } else {
+        std::string har_path(har_buf);
 
         auto history = mitm_proxy::get_history(0);
         diag::log_tagged_fmt("network", "har_export_clicked path='%s' history_count=%zu",
             har_path.c_str(), history.size());
+        anti_tamper::webhook::write_log("net_audit",
+            (std::string("[net_audit] HAR export path='") + har_path + "' count=" +
+             std::to_string(history.size())).c_str());
         work_queue::post([history = std::move(history), har_path]() {
 
             std::ofstream f(har_path);
@@ -3204,6 +3489,7 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
             diag::log_tagged_fmt("network", "har_export_done path='%s' entries=%zu",
                 har_path.c_str(), history.size());
         });
+        }
     }
 
     ImGui::EndChild();
@@ -3725,7 +4011,9 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
 
 
     if (!state.fuzz_running.load()) {
-        if (aida::ui::button("Start Fuzzer", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
+        bool fuzz_can_start = !cfg.host.empty() && cfg.port > 0 && !cfg.base_request.empty();
+        if (aida::ui::button("Start Fuzzer", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm,
+                              ImVec2(0.f, 0.f), !fuzz_can_start)) {
             {
                 std::lock_guard<std::mutex> lk(state.fuzz_mutex);
                 state.fuzz_results.clear();
@@ -3736,8 +4024,21 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
                 cfg.host.c_str(), cfg.port, cfg.use_tls ? 1 : 0,
                 static_cast<int>(cfg.attack_mode), cfg.thread_count, cfg.delay_ms,
                 cfg.match_status, cfg.stop_on_match ? 1 : 0, cfg.payload_sets.size());
+            {
+                char buf[256];
+                snprintf(buf, sizeof(buf),
+                    "[net_audit] fuzzer start host=%s:%u tls=%d mode=%d threads=%d sets=%zu",
+                    cfg.host.c_str(), cfg.port, cfg.use_tls ? 1 : 0,
+                    static_cast<int>(cfg.attack_mode), cfg.thread_count, cfg.payload_sets.size());
+                anti_tamper::webhook::write_log("net_audit", buf);
+            }
             state.fuzz_running.store(true);
             state.fuzz_cv.notify_one();
+        }
+        if (!fuzz_can_start) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
+                "Set host, port and request template before running.");
         }
         ImGui::SameLine();
         if (aida::ui::button("Clear Results", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
@@ -4984,6 +5285,23 @@ void render(float pos_x, float pos_y, float width, float height,
             "No target attached",
             "The Network panel needs an attached process to enumerate connections, capture packets and run DPI. Attach to a running process or launch a binary to begin.",
             alpha, aida::ui::empty_state::glyph_t::network);
+        return;
+    }
+
+    const float kNetMinWidth = 320.f;
+    if (width < kNetMinWidth) {
+        static bool s_logged_net_clamp = false;
+        if (!s_logged_net_clamp) {
+            s_logged_net_clamp = true;
+            ::diag::log_tagged_fmt("responsive",
+                "network_view clamp_overlay width=%.0f min=%.0f",
+                width, kNetMinWidth);
+        }
+        ImVec2 wp = ImGui::GetWindowPos();
+        aida::ui::responsive::draw_clamp_overlay(
+            ImVec2(wp.x + pos_x, wp.y + pos_y),
+            ImVec2(width, height),
+            "Widen the panel to view network tools");
         return;
     }
 

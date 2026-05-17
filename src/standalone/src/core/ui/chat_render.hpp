@@ -59,6 +59,7 @@ enum class action_t : int {
     retry,
     edit_msg,
     delete_msg,
+    select_text,
 };
 
 struct render_result_t {

@@ -45,13 +45,13 @@ inline void set_sub_tab(sub_tab_t tab)
 }
 
 inline constexpr aida::ui::hub_strip::tab_t s_tabs[] = {
-	{ "Value Scan", "scan values in memory" },
-	{ "Crypto",     "crypto constant hunter" },
-	{ "AOB",        "array-of-bytes pattern" },
-	{ "Decrypt",    "decrypt oracle" },
-	{ "Pointers",   "pointer scanner" },
-	{ "Snapshots",  "memory snapshot diff" },
-	{ "Integrity",  "integrity hunter" },
+	{ "Value Scan", "scan values in memory", "Val" },
+	{ "Crypto",     "crypto constant hunter", "Cry" },
+	{ "AOB",        "array-of-bytes pattern", "AOB" },
+	{ "Decrypt",    "decrypt oracle",         "Dec" },
+	{ "Pointers",   "pointer scanner",        "Ptr" },
+	{ "Snapshots",  "memory snapshot diff",   "Snap" },
+	{ "Integrity",  "integrity hunter",       "Int" },
 };
 
 inline void render_active(int idx, float cw, float ch, float fa, float ar, float ag, float ab)

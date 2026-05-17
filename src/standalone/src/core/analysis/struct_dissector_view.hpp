@@ -10,11 +10,14 @@
 #include "ui/components.hpp"
 #include "ui/empty_state.hpp"
 #include "ui/blur_layer.hpp"
+#include "ui/responsive.hpp"
 #include "ui/skeleton.hpp"
 #include "ui/fonts.hpp"
+#include "ui/ui_anim.hpp"
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
 #include "../../helpers/diag_log.hpp"
+#include "../anti-tamper/webhook.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -35,6 +38,14 @@ struct field_anim_t {
 	bool                  expanded = false;
 };
 
+enum class edit_target_t : int {
+	none = 0,
+	field_name,
+	field_size,
+	field_comment,
+	struct_name,
+};
+
 struct ui_state_t {
 	int   active_tab = 0;
 	int   selected_field = -1;
@@ -49,6 +60,8 @@ struct ui_state_t {
 	char  size_buf[32] = {};
 	char  edit_value_buf[256] = {};
 	char  addr_buf[20] = {};
+	char  rename_buf[128] = {};
+	char  list_filter[96] = {};
 	int   editing_field = -1;
 	int   add_type = 0;
 	int   selected_struct = -1;
@@ -59,6 +72,9 @@ struct ui_state_t {
 	float row_anim_time = 0.f;
 	std::unordered_map<int, field_anim_t> field_anims;
 	float edit_ring_phase = 0.f;
+	bool  addr_buf_seeded = false;
+	edit_target_t edit_target = edit_target_t::none;
+	int   edit_target_field = -1;
 };
 
 inline ui_state_t g_ui;
@@ -114,8 +130,8 @@ inline void render_type_glyph(ImDrawList* dl, ImVec2 center,
 		}
 		case struct_dissector::field_type_t::float32:
 		case struct_dissector::field_type_t::float64: {
-			dl->AddText(ImGui::GetFont(), 10.f,
-				ImVec2(center.x - 4.f, center.y - 5.f), color, "f");
+			dl->AddText(ImGui::GetFont(), aida::ui::components::detail::ui_fs() * 0.85f,
+				ImVec2(center.x - 5.f, center.y - 7.f), color, "f");
 			break;
 		}
 		case struct_dissector::field_type_t::nested_struct: {
@@ -137,15 +153,22 @@ inline field_anim_t& fanim(int idx) { return g_ui.field_anims[idx]; }
 inline void render(float pos_x, float pos_y, float width, float height,
 				   float alpha, float accent_r, float accent_g, float accent_b) {
 	(void)pos_x; (void)pos_y;
-	(void)accent_r; (void)accent_g; (void)accent_b;
+
+	{
+		static bool s_types_font_logged_dissector = false;
+		if (!s_types_font_logged_dissector) {
+			s_types_font_logged_dissector = true;
+			anti_tamper::webhook::write_log("types_font", "[types_font] scaled struct_dissector_view");
+		}
+	}
 
 	ImGui::BeginChild("##struct_dissector_view", ImVec2(width, height), false,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
 	auto& ui = g_ui;
 	auto& st = struct_dissector::g_state;
 	const float dt = aida::ui::clock::dt();
-	const float line_h = 28.f;
-	const float top_bar_h = 36.f;
+	const float line_h = 36.f;
+	const float top_bar_h = 44.f;
 
 	ImDrawList* dl = ImGui::GetWindowDrawList();
 	ImVec2 wpos = ImGui::GetWindowPos();
@@ -170,10 +193,24 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float bx = ox + 12.f;
 	float by = oy + 6.f;
 
+	const float fs_diss_base = aida::ui::components::detail::ui_fs();
 	dl->AddText(aida::ui::fonts::body_em() ? aida::ui::fonts::body_em() : ImGui::GetFont(),
-		14.f, ImVec2(bx, by + 4.f),
+		fs_diss_base * 1.05f, ImVec2(bx, by + 4.f),
 		aida::ui::with_alpha(th.text_secondary, alpha), "Base");
-	bx += 36.f;
+	bx += 44.f;
+
+	if (!ui.addr_buf_seeded) {
+		uint64_t seed = 0;
+		{
+			std::lock_guard<std::mutex> lk(st.mtx);
+			seed = st.base_address;
+		}
+		if (seed != 0) {
+			std::snprintf(ui.addr_buf, sizeof(ui.addr_buf), "%llX",
+				static_cast<unsigned long long>(seed));
+		}
+		ui.addr_buf_seeded = true;
+	}
 
 	ImGui::SetCursorScreenPos(ImVec2(bx, by));
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
@@ -210,6 +247,29 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	bx += 180.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(bx, by));
+	if (aida::ui::button("Go", aida::ui::button_kind_t::secondary,
+		aida::ui::size_t_::sm, ImVec2(48.f, 28.f))) {
+		uint64_t addr = 0;
+		if (std::sscanf(ui.addr_buf, "%llx", reinterpret_cast<unsigned long long*>(&addr)) == 1) {
+			uint64_t prev = 0;
+			{
+				std::lock_guard<std::mutex> lk(st.mtx);
+				prev = st.base_address;
+				st.base_address = addr;
+			}
+			diag::log_tagged_fmt("dissector",
+				"base_address_go prev=0x%llX new=0x%llX",
+				static_cast<unsigned long long>(prev),
+				static_cast<unsigned long long>(addr));
+			struct_dissector::refresh_values();
+		} else {
+			diag::log_tagged_fmt("dissector",
+				"base_address_go_failed input='%s'", ui.addr_buf);
+		}
+	}
+	bx += 52.f;
+
+	ImGui::SetCursorScreenPos(ImVec2(bx, by));
 	if (aida::ui::button("Refresh", aida::ui::button_kind_t::primary,
 		aida::ui::size_t_::sm, ImVec2(96.f, 28.f))) {
 		diag::log_tagged_fmt("dissector", "refresh_clicked manual=1");
@@ -231,9 +291,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 	bx += 38.f;
 	dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-		12.f, ImVec2(bx, by + 4.f),
+		fs_diss_base * 0.92f, ImVec2(bx, by + 4.f),
 		aida::ui::with_alpha(th.text_dim, alpha), "Auto");
-	bx += 40.f;
+	bx += 48.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(bx, by));
 	if (aida::ui::button("Export C", aida::ui::button_kind_t::ghost,
@@ -279,8 +339,47 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	float body_y = oy + top_bar_h + 1.f;
 	float body_h = height - top_bar_h - 1.f;
+
+	bool driver_loaded = driver_bridge::is_loaded();
+	if (!driver_loaded) {
+		static bool s_no_driver_logged_diss = false;
+		if (!s_no_driver_logged_diss) {
+			s_no_driver_logged_diss = true;
+			anti_tamper::webhook::write_log("types_audit",
+				"[types_audit] dissector_view_no_driver reason='driver_not_loaded'");
+		}
+		float callout_h = 36.f;
+		ui_anim::render_inline_callout(dl, ox + 8.f, body_y + 4.f, width - 16.f, callout_h,
+			"Dissector live values need an attached process. Attach via the debugger to enable Read/Write.",
+			ui_anim::callout_kind_t::warn,
+			accent_r, accent_g, accent_b, alpha);
+		body_y += callout_h + 8.f;
+		body_h -= callout_h + 8.f;
+	}
+
+	const float kMinDissPanelW = 460.f;
+	if (width < kMinDissPanelW) {
+		static bool s_logged_diss_narrow = false;
+		if (!s_logged_diss_narrow) {
+			s_logged_diss_narrow = true;
+			::diag::log_tagged_fmt("responsive",
+				"struct_dissector_view clamp_overlay width=%.0f min=%.0f",
+				width, kMinDissPanelW);
+		}
+		ImVec2 wp = ImGui::GetWindowPos();
+		aida::ui::responsive::draw_clamp_overlay(
+			ImVec2(wp.x + pos_x, wp.y + body_y),
+			ImVec2(width, body_h),
+			"Widen the panel to view the struct dissector");
+		return;
+	}
+
 	float left_w = std::floor(width * 0.28f);
 	if (left_w < 200.f) left_w = 200.f;
+	float right_min_w = 240.f;
+	if (width - left_w - 1.f < right_min_w) {
+		left_w = std::max(160.f, width - right_min_w - 1.f);
+	}
 	float right_w = width - left_w - 1.f;
 
 	dl->AddLine(ImVec2(ox + left_w, body_y), ImVec2(ox + left_w, body_y + body_h),
@@ -293,10 +392,25 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float lh = body_h;
 
 		dl->AddText(aida::ui::fonts::body_em() ? aida::ui::fonts::body_em() : ImGui::GetFont(),
-			12.f, ImVec2(lx + 10.f, ly + 6.f),
+			fs_diss_base * 0.95f, ImVec2(lx + 10.f, ly + 6.f),
 			aida::ui::with_alpha(th.text_secondary, alpha), "Structures");
-		float list_y = ly + 24.f;
-		float list_h = lh - 24.f - line_h - 8.f;
+
+		float filter_y = ly + 26.f;
+		ImGui::SetCursorScreenPos(ImVec2(lx + 8.f, filter_y));
+		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(
+			aida::ui::with_alpha(th.panel_header, alpha)));
+		ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
+			aida::ui::with_alpha(th.text_primary, alpha)));
+		ImGui::PushItemWidth(lw - 16.f);
+		ImGui::InputTextWithHint("##sd_list_filter", "filter structures",
+			ui.list_filter, sizeof(ui.list_filter));
+		ImGui::PopItemWidth();
+		ImGui::PopStyleColor(2);
+		ImGui::PopStyleVar();
+
+		float list_y = filter_y + 28.f;
+		float list_h = lh - (list_y - ly) - (line_h * 2.f + 12.f);
 
 		ui.list_scroll_y = aida::motion::smooth_lerp(ui.list_scroll_y,
 			ui.list_target_scroll_y, 18.f, dt);
@@ -308,16 +422,37 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (wheel != 0.f) ui.list_target_scroll_y -= wheel * line_h * 3.f;
 		}
 
-		int struct_count = 0;
 		std::vector<std::pair<std::string, uint32_t>> entries;
+		std::vector<int> entry_index;
 		int active_struct_idx = -1;
+		std::string filter_lc;
+		filter_lc.reserve(64);
+		for (size_t i = 0; ui.list_filter[i] != '\0' && i < sizeof(ui.list_filter); ++i) {
+			char c = ui.list_filter[i];
+			if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+			filter_lc.push_back(c);
+		}
 		{
 			std::lock_guard<std::mutex> lk(st.mtx);
-			struct_count = static_cast<int>(st.structs.size());
 			active_struct_idx = st.active_struct;
-			entries.reserve(struct_count);
-			for (auto& sd : st.structs) entries.emplace_back(sd.name, sd.total_size);
+			entries.reserve(st.structs.size());
+			entry_index.reserve(st.structs.size());
+			for (size_t i = 0; i < st.structs.size(); ++i) {
+				auto& sd = st.structs[i];
+				if (!filter_lc.empty()) {
+					std::string name_lc;
+					name_lc.reserve(sd.name.size());
+					for (char c : sd.name) {
+						if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+						name_lc.push_back(c);
+					}
+					if (name_lc.find(filter_lc) == std::string::npos) continue;
+				}
+				entries.emplace_back(sd.name, sd.total_size);
+				entry_index.push_back(static_cast<int>(i));
+			}
 		}
+		int struct_count = static_cast<int>(entries.size());
 
 		float content_h = struct_count * line_h;
 		if (ui.list_target_scroll_y < 0.f) ui.list_target_scroll_y = 0.f;
@@ -325,18 +460,29 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (ui.list_target_scroll_y > ms) ui.list_target_scroll_y = ms;
 
 		ImGui::PushClipRect(ImVec2(lx, list_y), ImVec2(lx + lw, list_y + list_h), true);
+		if (struct_count == 0) {
+			ImFont* hint_font = aida::ui::fonts::body_em();
+			if (!hint_font) hint_font = ImGui::GetFont();
+			const char* msg = filter_lc.empty() ? "No structs yet" : "No matches";
+			const float fs_hint = fs_diss_base * 1.00f;
+			ImVec2 sz = hint_font->CalcTextSizeA(fs_hint, FLT_MAX, 0.f, msg);
+			dl->AddText(hint_font, fs_hint,
+				ImVec2(lx + (lw - sz.x) * 0.5f, list_y + list_h * 0.5f - sz.y * 0.5f),
+				aida::ui::with_alpha(th.text_dim, alpha), msg);
+		}
 		for (int i = 0; i < struct_count; ++i) {
+			int sd_idx = entry_index[static_cast<size_t>(i)];
 			float ry = list_y + i * line_h - ui.list_scroll_y;
 			if (ry + line_h < list_y || ry > list_y + list_h) continue;
 
 			ImVec2 a = ImVec2(lx + 4.f, ry);
 			ImVec2 b = ImVec2(lx + lw - 4.f, ry + line_h);
 			bool hov = ImGui::IsMouseHoveringRect(a, b, true);
-			bool sel = (active_struct_idx == i);
+			bool sel = (active_struct_idx == sd_idx);
 
 			ImU32 fill = sel
 				? aida::ui::with_alpha(th.selection, alpha)
-				: (hov ? aida::ui::with_alpha(th.hover_wash, alpha) : 0u);
+				: (hov ? aida::ui::with_alpha(th.hover_wash, alpha * 0.6f) : 0u);
 			if ((fill & 0xFF000000) != 0) {
 				dl->AddRectFilled(a, b, fill, 6.f);
 			}
@@ -349,30 +495,65 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				std::string sel_name;
 				{
 					std::lock_guard<std::mutex> lk(st.mtx);
-					st.active_struct = i;
-					if (i >= 0 && i < static_cast<int>(st.structs.size())) {
-						sel_name = st.structs[i].name;
+					st.active_struct = sd_idx;
+					if (sd_idx >= 0 && sd_idx < static_cast<int>(st.structs.size())) {
+						sel_name = st.structs[sd_idx].name;
 					}
 					ui.selected_field = -1;
 					ui.editing_field = -1;
+					ui.edit_target = edit_target_t::none;
 				}
 				diag::log_tagged_fmt("dissector",
-					"struct_selected idx=%d name='%s'", i, sel_name.c_str());
+					"struct_selected idx=%d name='%s'",
+					sd_idx, sel_name.c_str());
 			}
 
 			dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-				14.f, ImVec2(a.x + 10.f, ry + 5.f),
+				fs_diss_base * 1.05f, ImVec2(a.x + 10.f, ry + 5.f),
 				aida::ui::with_alpha(th.text_primary, alpha),
 				entries[static_cast<size_t>(i)].first.c_str());
 			char sz_buf[32];
 			std::snprintf(sz_buf, sizeof(sz_buf), "(%u)", entries[static_cast<size_t>(i)].second);
 			ImFont* code_font = aida::ui::fonts::code();
 			if (!code_font) code_font = ImGui::GetFont();
-			ImVec2 sz = code_font->CalcTextSizeA(13.f, FLT_MAX, 0.f, sz_buf);
-			dl->AddText(code_font, 13.f, ImVec2(b.x - sz.x - 8.f, ry + 6.f),
+			const float fs_diss_count = fs_diss_base * 0.92f;
+			ImVec2 sz = code_font->CalcTextSizeA(fs_diss_count, FLT_MAX, 0.f, sz_buf);
+			dl->AddText(code_font, fs_diss_count, ImVec2(b.x - sz.x - 8.f, ry + 6.f),
 				aida::ui::with_alpha(th.text_dim, alpha), sz_buf);
 		}
 		ImGui::PopClipRect();
+
+		float ren_y = ly + lh - line_h * 2.f - 4.f;
+		ImGui::SetCursorScreenPos(ImVec2(lx + 8.f, ren_y));
+		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(
+			aida::ui::with_alpha(th.panel_header, alpha)));
+		ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
+			aida::ui::with_alpha(th.text_primary, alpha)));
+		ImGui::PushItemWidth(lw - 16.f - 64.f - 4.f);
+		ImGui::InputTextWithHint("##sd_rename", "rename selected",
+			ui.rename_buf, sizeof(ui.rename_buf));
+		ImGui::PopItemWidth();
+		ImGui::PopStyleColor(2);
+		ImGui::PopStyleVar();
+		ImGui::SameLine();
+		if (aida::ui::button("Rename", aida::ui::button_kind_t::secondary,
+			aida::ui::size_t_::sm, ImVec2(64.f, 28.f))) {
+			int target_idx = -1;
+			{
+				std::lock_guard<std::mutex> lk(st.mtx);
+				target_idx = st.active_struct;
+			}
+			if (target_idx >= 0 && ui.rename_buf[0] != '\0') {
+				if (struct_dissector::rename_struct(target_idx, ui.rename_buf)) {
+					ui.rename_buf[0] = '\0';
+				}
+			} else {
+				diag::log_tagged_fmt("dissector",
+					"rename_struct_skipped reason='%s'",
+					target_idx < 0 ? "no_active" : "empty_name");
+			}
+		}
 
 		float btn_y = ly + lh - line_h + 4.f;
 		ImGui::SetCursorScreenPos(ImVec2(lx + 8.f, btn_y));
@@ -391,7 +572,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (aida::ui::button("+", aida::ui::button_kind_t::primary,
 			aida::ui::size_t_::sm, ImVec2(28.f, 28.f))) {
 			if (ui.name_buf[0] != '\0') {
-				struct_dissector::create_struct(ui.name_buf);
+				int new_idx = struct_dissector::create_struct(ui.name_buf);
+				if (new_idx >= 0) {
+					std::lock_guard<std::mutex> lk(st.mtx);
+					st.active_struct = new_idx;
+					ui.selected_field = -1;
+					ui.editing_field = -1;
+				}
 				ui.name_buf[0] = '\0';
 			} else {
 				diag::log_tagged_fmt("dissector",
@@ -412,6 +599,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					if (st.active_struct >= static_cast<int>(st.structs.size()))
 						st.active_struct = static_cast<int>(st.structs.size()) - 1;
 					ui.selected_field = -1;
+					ui.editing_field = -1;
+					ui.edit_target = edit_target_t::none;
+					st.cached_values.clear();
 				}
 			}
 			if (removed_idx >= 0) {
@@ -451,13 +641,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			return;
 		}
 
-		const float col_offset_w = 70.f;
-		const float col_glyph_w  = 22.f;
-		const float col_name_w   = 200.f;
-		const float col_type_w   = 110.f;
-		const float col_value_w  = std::max(160.f, rw - col_offset_w - col_glyph_w
-		                          - col_name_w - col_type_w - 140.f - 12.f);
-		const float col_desc_w   = 140.f;
+		const float col_offset_w = 92.f;
+		const float col_glyph_w  = 28.f;
+		const float col_name_w   = 260.f;
+		const float col_type_w   = 144.f;
+		const float col_value_w  = std::max(200.f, rw - col_offset_w - col_glyph_w
+		                          - col_name_w - col_type_w - 180.f - 12.f);
+		const float col_desc_w   = 180.f;
 
 		float hdr_y = ry_start;
 		ImU32 hdr_bg = aida::ui::with_alpha(th.panel_header, alpha * 0.9f);
@@ -468,16 +658,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImFont* head_em = aida::ui::fonts::body_em();
 		if (!head_em) head_em = ImGui::GetFont();
 		ImU32 hc = aida::ui::with_alpha(th.text_secondary, alpha);
+		const float fs_dh = fs_diss_base * 0.95f;
 		float hx = rx + 8.f;
-		dl->AddText(head_em, 13.f, ImVec2(hx, hdr_y + 7.f), hc, "Offset");
+		dl->AddText(head_em, fs_dh, ImVec2(hx, hdr_y + 9.f), hc, "Offset");
 		hx += col_offset_w + col_glyph_w;
-		dl->AddText(head_em, 13.f, ImVec2(hx, hdr_y + 7.f), hc, "Name");
+		dl->AddText(head_em, fs_dh, ImVec2(hx, hdr_y + 9.f), hc, "Name");
 		hx += col_name_w;
-		dl->AddText(head_em, 13.f, ImVec2(hx, hdr_y + 7.f), hc, "Type");
+		dl->AddText(head_em, fs_dh, ImVec2(hx, hdr_y + 9.f), hc, "Type");
 		hx += col_type_w;
-		dl->AddText(head_em, 13.f, ImVec2(hx, hdr_y + 7.f), hc, "Value");
+		dl->AddText(head_em, fs_dh, ImVec2(hx, hdr_y + 9.f), hc, "Value");
 		hx += col_value_w;
-		dl->AddText(head_em, 13.f, ImVec2(hx, hdr_y + 7.f), hc, "Description");
+		dl->AddText(head_em, fs_dh, ImVec2(hx, hdr_y + 9.f), hc, "Description");
 
 		float table_y = ry_start + line_h;
 		float table_h = rh - line_h - line_h - 8.f;
@@ -495,6 +686,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (ui.target_scroll_y < 0.f) ui.target_scroll_y = 0.f;
 		float ms = std::max(0.f, content_h - table_h);
 		if (ui.target_scroll_y > ms) ui.target_scroll_y = ms;
+
+		struct deferred_edit_t {
+			edit_target_t target = edit_target_t::none;
+			int field_idx = -1;
+			std::string seed_text;
+		} pending_edit;
+		bool ctx_open_request = false;
+		int  ctx_open_field = -1;
 
 		ImGui::PushClipRect(ImVec2(rx, table_y), ImVec2(rx + rw, table_y + table_h), true);
 		{
@@ -547,15 +746,22 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 					if (row_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 						ui.selected_field = fi;
+					if (row_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+						ui.selected_field = fi;
+						ctx_open_request = true;
+						ctx_open_field = fi;
+					}
 
 					const auto& f = sd.fields[fi];
 					float fx = rx + 8.f;
 					ImFont* code_font = aida::ui::fonts::code();
 					if (!code_font) code_font = ImGui::GetFont();
 
+					const float fs_drow_meta = fs_diss_base * 0.95f;
+					const float fs_drow_body = fs_diss_base * 1.00f;
 					char off_str[16];
 					std::snprintf(off_str, sizeof(off_str), "+0x%03X", f.offset);
-					dl->AddText(code_font, 13.f, ImVec2(fx, row_y + 7.f),
+					dl->AddText(code_font, fs_drow_meta, ImVec2(fx, row_y + 9.f),
 						aida::ui::with_alpha(th.text_address, alpha * entrance), off_str);
 					fx += col_offset_w;
 
@@ -564,13 +770,32 @@ inline void render(float pos_x, float pos_y, float width, float height,
 						f.type, type_c);
 					fx += col_glyph_w;
 
+					float name_x = fx;
 					dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-						14.f, ImVec2(fx, row_y + 7.f),
+						fs_drow_body, ImVec2(fx, row_y + 9.f),
 						aida::ui::with_alpha(th.text_primary, alpha * entrance), f.name.c_str());
+					if (row_hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+						ImVec2 mp = ImGui::GetMousePos();
+						if (mp.x >= name_x && mp.x <= name_x + col_name_w &&
+							mp.y >= row_y && mp.y <= row_y + line_h) {
+							pending_edit.target = edit_target_t::field_name;
+							pending_edit.field_idx = fi;
+							pending_edit.seed_text = f.name;
+						}
+					}
 					fx += col_name_w;
 
-					dl->AddText(code_font, 13.f, ImVec2(fx, row_y + 7.f),
+					float type_x = fx;
+					dl->AddText(code_font, fs_drow_meta, ImVec2(fx, row_y + 9.f),
 						type_c, struct_dissector::field_type_name(f.type));
+					if (row_hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+						ImVec2 mp = ImGui::GetMousePos();
+						if (mp.x >= type_x && mp.x <= type_x + col_type_w &&
+							mp.y >= row_y && mp.y <= row_y + line_h) {
+							ctx_open_request = true;
+							ctx_open_field = fi;
+						}
+					}
 					fx += col_type_w;
 
 					if (fi < static_cast<int>(st.cached_values.size())) {
@@ -581,7 +806,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 						fa.has_last = true;
 
 						ImU32 val_col = aida::ui::with_alpha(th.text_primary, alpha * entrance);
-						dl->AddText(code_font, 13.f, ImVec2(fx, row_y + 7.f),
+						dl->AddText(code_font, fs_drow_meta, ImVec2(fx, row_y + 9.f),
 							val_col, cv.display_text.c_str());
 
 						if (ui.editing_field == fi) {
@@ -675,16 +900,174 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					}
 					fx += col_value_w;
 
+					float desc_x = fx;
 					if (!f.description.empty()) {
 						dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-							13.f, ImVec2(fx, row_y + 7.f),
+							fs_drow_meta, ImVec2(fx, row_y + 9.f),
 							aida::ui::with_alpha(th.text_dim, alpha * entrance),
 							f.description.c_str());
+					} else {
+						dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
+							fs_drow_meta, ImVec2(fx, row_y + 9.f),
+							aida::ui::with_alpha(th.text_dim, alpha * entrance * 0.55f),
+							"(comment)");
+					}
+					if (row_hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+						ImVec2 mp = ImGui::GetMousePos();
+						if (mp.x >= desc_x && mp.x <= desc_x + col_desc_w &&
+							mp.y >= row_y && mp.y <= row_y + line_h) {
+							pending_edit.target = edit_target_t::field_comment;
+							pending_edit.field_idx = fi;
+							pending_edit.seed_text = f.description;
+						}
 					}
 				}
 			}
 		}
 		ImGui::PopClipRect();
+
+		if (pending_edit.target != edit_target_t::none && pending_edit.field_idx >= 0) {
+			ui.edit_target = pending_edit.target;
+			ui.edit_target_field = pending_edit.field_idx;
+			std::strncpy(ui.rename_buf, pending_edit.seed_text.c_str(),
+				sizeof(ui.rename_buf) - 1);
+			ui.rename_buf[sizeof(ui.rename_buf) - 1] = '\0';
+			ImGui::OpenPopup("##sd_inline_edit");
+			diag::log_tagged_fmt("dissector",
+				"inline_edit_open kind=%d field_idx=%d",
+				static_cast<int>(pending_edit.target), pending_edit.field_idx);
+		}
+		if (ctx_open_request && ctx_open_field >= 0) {
+			ui.edit_target_field = ctx_open_field;
+			ImGui::OpenPopup("##sd_field_ctx");
+			diag::log_tagged_fmt("dissector",
+				"field_ctx_open field_idx=%d", ctx_open_field);
+		}
+
+		if (ImGui::BeginPopup("##sd_inline_edit")) {
+			const char* hint = "rename";
+			const char* commit = "Rename";
+			switch (ui.edit_target) {
+			case edit_target_t::field_name:    hint = "field name";    commit = "Rename";     break;
+			case edit_target_t::field_size:    hint = "new size";      commit = "Set Size";   break;
+			case edit_target_t::field_comment: hint = "comment";       commit = "Set Comment";break;
+			case edit_target_t::struct_name:   hint = "struct name";   commit = "Rename";     break;
+			default: break;
+			}
+			ImGui::TextDisabled("%s", hint);
+			ImGui::PushItemWidth(280.f);
+			bool accept = ImGui::InputText("##sd_inline_buf", ui.rename_buf,
+				sizeof(ui.rename_buf), ImGuiInputTextFlags_EnterReturnsTrue);
+			ImGui::PopItemWidth();
+			ImGui::SameLine();
+			if (ImGui::Button(commit) || accept) {
+				int tgt_field = ui.edit_target_field;
+				switch (ui.edit_target) {
+				case edit_target_t::field_name:
+					if (tgt_field >= 0 && ui.rename_buf[0] != '\0')
+						struct_dissector::rename_field(active_idx, tgt_field, ui.rename_buf);
+					break;
+				case edit_target_t::field_size: {
+					uint32_t nsz = 0;
+					if (std::sscanf(ui.rename_buf, "%u", &nsz) == 1 && nsz > 0)
+						struct_dissector::set_field_size(active_idx, tgt_field, nsz);
+					else
+						diag::log_tagged_fmt("dissector",
+							"set_field_size_input_invalid input='%s'", ui.rename_buf);
+					break;
+				}
+				case edit_target_t::field_comment:
+					if (tgt_field >= 0)
+						struct_dissector::set_field_comment(active_idx, tgt_field, ui.rename_buf);
+					break;
+				case edit_target_t::struct_name:
+					if (active_idx >= 0 && ui.rename_buf[0] != '\0')
+						struct_dissector::rename_struct(active_idx, ui.rename_buf);
+					break;
+				default: break;
+				}
+				ui.edit_target = edit_target_t::none;
+				ui.edit_target_field = -1;
+				ui.rename_buf[0] = '\0';
+				ImGui::CloseCurrentPopup();
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Cancel")) {
+				ui.edit_target = edit_target_t::none;
+				ui.edit_target_field = -1;
+				ui.rename_buf[0] = '\0';
+				ImGui::CloseCurrentPopup();
+			}
+			ImGui::EndPopup();
+		} else if (ui.edit_target != edit_target_t::none) {
+			ui.edit_target = edit_target_t::none;
+		}
+
+		if (ImGui::BeginPopup("##sd_field_ctx")) {
+			int tgt_field = ui.edit_target_field;
+			if (ImGui::MenuItem("Rename field...")) {
+				std::string seed;
+				{
+					std::lock_guard<std::mutex> lk(st.mtx);
+					if (active_idx >= 0 && tgt_field >= 0 &&
+						active_idx < static_cast<int>(st.structs.size()) &&
+						tgt_field < static_cast<int>(st.structs[active_idx].fields.size())) {
+						seed = st.structs[active_idx].fields[tgt_field].name;
+					}
+				}
+				ui.edit_target = edit_target_t::field_name;
+				std::strncpy(ui.rename_buf, seed.c_str(), sizeof(ui.rename_buf) - 1);
+				ui.rename_buf[sizeof(ui.rename_buf) - 1] = '\0';
+				ImGui::CloseCurrentPopup();
+				ImGui::OpenPopup("##sd_inline_edit");
+			}
+			if (ImGui::MenuItem("Set size...")) {
+				ui.edit_target = edit_target_t::field_size;
+				ui.rename_buf[0] = '\0';
+				ImGui::CloseCurrentPopup();
+				ImGui::OpenPopup("##sd_inline_edit");
+			}
+			if (ImGui::MenuItem("Set comment...")) {
+				std::string seed;
+				{
+					std::lock_guard<std::mutex> lk(st.mtx);
+					if (active_idx >= 0 && tgt_field >= 0 &&
+						active_idx < static_cast<int>(st.structs.size()) &&
+						tgt_field < static_cast<int>(st.structs[active_idx].fields.size())) {
+						seed = st.structs[active_idx].fields[tgt_field].description;
+					}
+				}
+				ui.edit_target = edit_target_t::field_comment;
+				std::strncpy(ui.rename_buf, seed.c_str(), sizeof(ui.rename_buf) - 1);
+				ui.rename_buf[sizeof(ui.rename_buf) - 1] = '\0';
+				ImGui::CloseCurrentPopup();
+				ImGui::OpenPopup("##sd_inline_edit");
+			}
+			ImGui::Separator();
+			static const char* k_type_names[] = {
+				"Int8", "UInt8", "Int16", "UInt16", "Int32", "UInt32",
+				"Int64", "UInt64", "Float", "Double", "Pointer",
+				"ASCII String", "UTF-16 String", "Byte Array", "Padding", "Struct"
+			};
+			if (ImGui::BeginMenu("Change type")) {
+				for (int t = 0; t < static_cast<int>(struct_dissector::field_type_t::COUNT); ++t) {
+					if (ImGui::MenuItem(k_type_names[t])) {
+						struct_dissector::retype_field(active_idx, tgt_field,
+							static_cast<struct_dissector::field_type_t>(t));
+					}
+				}
+				ImGui::EndMenu();
+			}
+			ImGui::Separator();
+			if (ImGui::MenuItem("Remove field")) {
+				if (tgt_field >= 0) {
+					struct_dissector::remove_field(active_idx, tgt_field);
+					if (ui.selected_field == tgt_field) ui.selected_field = -1;
+					if (ui.editing_field == tgt_field) ui.editing_field = -1;
+				}
+			}
+			ImGui::EndPopup();
+		}
 
 		if (content_h > table_h && table_h > 0.f) {
 			float bar_x = rx + rw - 10.f;

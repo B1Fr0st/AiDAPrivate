@@ -23,6 +23,7 @@
 #include "fonts.hpp"
 #include "work_queue.hpp"
 #include "../helpers/globals.h"
+#include "../helpers/diag_log.hpp"
 
 #include "provider_catalog.hpp"
 #include "provider_transforms.hpp"
@@ -1663,24 +1664,51 @@ namespace auth_view {
 				g_state.selected_provider_id.clear();
 			}
 
-			const float refresh_w = 220.f;
 			const bool refreshing = g_state.refresh.in_flight.load();
+			float refresh_w = 220.f;
+			const char* refresh_label_full = refreshing ? "Refreshing catalog..." : "Refresh model catalog";
+			const char* refresh_label_short = refreshing ? "Refreshing..." : "Refresh";
+			const char* refresh_label = refresh_label_full;
+			if (root_w < 520.f) {
+				refresh_w = 110.f;
+				refresh_label = refresh_label_short;
+			}
 			ImGui::SetCursorScreenPos(ImVec2(root_x + root_w - pad - refresh_w, root_y + 4.f));
-			if (aida::ui::button(refreshing ? "Refreshing catalog..." : "Refresh model catalog",
+			if (aida::ui::button(refresh_label,
 					aida::ui::button_kind_t::secondary,
 					aida::ui::size_t_::md,
 					ImVec2(refresh_w, 30.f),
 					false, nullptr, refreshing)) {
 				if (!refreshing) start_refresh_catalog();
 			}
+			if (root_w < 520.f && ImGui::IsItemHovered()) {
+				aida::ui::components::tooltip_blur("Refresh model catalog", 0.35f);
+			}
 
 			const float tab_y = root_y + toolbar_h;
 			const float tab_h = 36.f;
-			const float tab_w = 200.f;
+			float tab_w = 200.f;
+			float avail_for_tabs = root_w - pad * 2.f - 6.f;
+			float two_tabs = 2.f * tab_w + 6.f;
+			bool use_short_auth_tabs = (avail_for_tabs < two_tabs);
+			if (use_short_auth_tabs) {
+				tab_w = std::max(80.f, (avail_for_tabs - 6.f) * 0.5f);
+			}
+			static bool s_logged_auth_short = false;
+			if (use_short_auth_tabs && !s_logged_auth_short) {
+				s_logged_auth_short = true;
+				::diag::log_tagged_fmt("responsive",
+					"auth_view tabs short_labels root_w=%.0f tab_w=%.0f",
+					root_w, tab_w);
+			} else if (!use_short_auth_tabs && s_logged_auth_short) {
+				s_logged_auth_short = false;
+			}
 			ImGui::SetCursorScreenPos(ImVec2(root_x + pad, tab_y));
 			ImGui::PushID("##chatbox_section_tabs");
 
-			const char* tab_labels[2] = { "API key (chatbox)", "Browser OAuth" };
+			const char* tab_labels_full[2] = { "API key (chatbox)", "Browser OAuth" };
+			const char* tab_labels_short[2] = { "API key", "OAuth" };
+			const char* const* tab_labels = use_short_auth_tabs ? tab_labels_short : tab_labels_full;
 			ImDrawList* tdl = ImGui::GetWindowDrawList();
 			for (int i = 0; i < 2; ++i) {
 				ImVec2 ta(root_x + pad + (tab_w + 6.f) * static_cast<float>(i), tab_y);
@@ -1690,6 +1718,9 @@ namespace auth_view {
 				ImGui::InvisibleButton("##chatbox_tab", ImVec2(tb.x - ta.x, tb.y - ta.y));
 				bool hov = ImGui::IsItemHovered();
 				bool clicked = ImGui::IsItemClicked();
+				if (use_short_auth_tabs && hov) {
+					aida::ui::components::tooltip_blur(tab_labels_full[i], 0.35f);
+				}
 				ImGui::PopID();
 
 				const bool is_sel = (g_state.chatbox_active_section == i);
@@ -1871,9 +1902,8 @@ namespace auth_view {
 			float exit_t = ma.exit.eased();
 			float visible = enter_t * (1.f - exit_t);
 
-			float dim_alpha = visible * 0.45f;
-			fdl->AddRectFilled(ImVec2(0, 0), display,
-				aida::ui::with_alpha(IM_COL32(8, 8, 16, 255), dim_alpha));
+			float dim_alpha = visible * 0.f;
+			(void)dim_alpha;
 
 			float scale = 0.92f + 0.08f * enter_t;
 			scale *= (1.f - 0.04f * exit_t);

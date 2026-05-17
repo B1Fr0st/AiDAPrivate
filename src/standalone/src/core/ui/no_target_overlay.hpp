@@ -8,6 +8,7 @@
 
 #include "../disasm/zydis_disasm.hpp"
 #include "../../helpers/globals.h"
+#include "../../helpers/diag_log.hpp"
 #include "../debugger/spawn_target_dialog.hpp"
 
 #include <string>
@@ -84,46 +85,68 @@ namespace aida::ui::no_target_overlay {
 				nullptr, card_w - 48.f);
 		}
 
-		float btn_w = 140.f;
-		float btn_h = 36.f;
+		const char* labels[3] = { "Open File...", "Attach to Process...", "Run Binary..." };
+		float btn_widths[3];
+		float btn_total = 0.f;
 		float btn_gap = 12.f;
-		float total_btn_w = btn_w * 3.f + btn_gap * 2.f;
+		for (int li = 0; li < 3; ++li) {
+			ImVec2 ls = ImGui::CalcTextSize(labels[li]);
+			btn_widths[li] = ls.x + 32.f;
+			if (btn_widths[li] < 120.f) btn_widths[li] = 120.f;
+			btn_total += btn_widths[li];
+		}
+		btn_total += btn_gap * 2.f;
+		float btn_h = 36.f;
 		float btn_y = cb.y - btn_h - 24.f;
-		float btn_x = ca.x + (card_w - total_btn_w) * 0.5f;
+		float btn_x = ca.x + (card_w - btn_total) * 0.5f;
 
 		ImFont* hint_font = aida::ui::fonts::body();
 		if (!hint_font) hint_font = body_font;
 		const char* tip = "Tip: drag any .exe/.dll/.sys into this window, then ask the AI Assistant on the right.";
-		ImVec2 tip_sz = hint_font->CalcTextSizeA(ui_size * 0.78f, FLT_MAX, 0.f, tip);
-		dl->AddText(hint_font, ui_size * 0.78f,
-			ImVec2(ca.x + (card_w - tip_sz.x) * 0.5f, cb.y - btn_h - 56.f),
-			aida::ui::with_alpha(t.text_dim, alpha * 0.95f), tip);
+		float tip_max_w = card_w - 48.f;
+		float tip_fs = ui_size * 0.78f;
+		ImVec2 tip_sz = hint_font->CalcTextSizeA(tip_fs, FLT_MAX, tip_max_w, tip);
+		dl->AddText(hint_font, tip_fs,
+			ImVec2(ca.x + (card_w - std::min(tip_sz.x, tip_max_w)) * 0.5f,
+				cb.y - btn_h - 24.f - tip_sz.y - 12.f),
+			aida::ui::with_alpha(t.accent_u32, alpha * 0.92f), tip,
+			nullptr, tip_max_w);
 
-		ImVec2 a1(btn_x, btn_y);
-		ImVec2 b1(btn_x + btn_w, btn_y + btn_h);
-		bool clicked_open = render_button(dl, a1, b1, "##nt_open", "Open File...",
+		float cursor = btn_x;
+		ImVec2 a1(cursor, btn_y);
+		ImVec2 b1(cursor + btn_widths[0], btn_y + btn_h);
+		bool clicked_open = render_button(dl, a1, b1, "##nt_open", labels[0],
 			t.accent_dim, t.accent_u32, t.text_primary, alpha);
+		cursor += btn_widths[0] + btn_gap;
 
-		ImVec2 a2(btn_x + btn_w + btn_gap, btn_y);
-		ImVec2 b2(a2.x + btn_w, a2.y + btn_h);
-		bool clicked_attach = render_button(dl, a2, b2, "##nt_attach", "Attach to Process...",
+		ImVec2 a2(cursor, btn_y);
+		ImVec2 b2(cursor + btn_widths[1], btn_y + btn_h);
+		bool clicked_attach = render_button(dl, a2, b2, "##nt_attach", labels[1],
 			t.panel_header, t.accent_dim, t.text_primary, alpha);
+		cursor += btn_widths[1] + btn_gap;
 
-		ImVec2 a3(btn_x + (btn_w + btn_gap) * 2.f, btn_y);
-		ImVec2 b3(a3.x + btn_w, a3.y + btn_h);
-		bool clicked_run = render_button(dl, a3, b3, "##nt_run", "Run Binary...",
+		ImVec2 a3(cursor, btn_y);
+		ImVec2 b3(cursor + btn_widths[2], btn_y + btn_h);
+		bool clicked_run = render_button(dl, a3, b3, "##nt_run", labels[2],
 			t.panel_header, t.accent_dim, t.text_primary, alpha);
 
 		if (clicked_open) {
+			diag::log_tagged_critical("file_dialog", "no_target_overlay.open_clicked invoking_open_file_dialog");
 			std::string fpath = disasm::open_file_dialog(g_hwnd);
 			if (!fpath.empty()) {
+				diag::log_tagged_critical_fmt("file_dialog",
+					"no_target_overlay.open ok path=%s", fpath.c_str());
 				analysis_session::open_session(fpath);
+			} else {
+				diag::log_tagged_critical("file_dialog", "no_target_overlay.open cancelled_or_empty");
 			}
 		}
 		if (clicked_attach) {
+			diag::log_tagged_critical("file_dialog", "no_target_overlay.attach_clicked");
 			globals::ui::process_attach_open = true;
 		}
 		if (clicked_run) {
+			diag::log_tagged_critical("file_dialog", "no_target_overlay.run_clicked");
 			spawn_target_dialog::request_open();
 		}
 	}

@@ -55,15 +55,20 @@ inline bool ensure_apartment(HRESULT& co_init_out, bool& need_uninit_out, const 
 		COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 	if (co_init_out == S_OK || co_init_out == S_FALSE) {
 		need_uninit_out = (co_init_out == S_OK);
+		diag::log_tagged_fmt("dialog",
+			"%s CoInitializeEx STA ok tid=%lu need_uninit=%d",
+			caller_name ? caller_name : "win32_dialog",
+			static_cast<unsigned long>(GetCurrentThreadId()),
+			need_uninit_out ? 1 : 0);
 		return true;
 	}
 	if (co_init_out == RPC_E_CHANGED_MODE) {
 		need_uninit_out = false;
 		diag::log_tagged_fmt("dialog",
-			"%s CoInitializeEx RPC_E_CHANGED_MODE thread already MTA tid=%lu refusing dialog",
+			"%s CoInitializeEx RPC_E_CHANGED_MODE thread already MTA tid=%lu proceeding via MTA",
 			caller_name ? caller_name : "win32_dialog",
 			static_cast<unsigned long>(GetCurrentThreadId()));
-		return false;
+		return true;
 	}
 	need_uninit_out = false;
 	diag::log_tagged_fmt("dialog",

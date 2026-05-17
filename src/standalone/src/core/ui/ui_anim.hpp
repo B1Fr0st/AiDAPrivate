@@ -1377,6 +1377,14 @@ inline void render_inline_callout(ImDrawList* dl, float x, float y, float w, flo
 		break;
 	}
 
+	float text_w = 0.f;
+	if (text) {
+		ImVec2 ts_pre = ImGui::CalcTextSize(text);
+		text_w = ts_pre.x;
+	}
+	const float min_w = 34.f + text_w + 14.f;
+	if (w < min_w) w = min_w;
+
 	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), fill_col, 5.f);
 
 	ImU32 accent_tint_mix = IM_COL32(

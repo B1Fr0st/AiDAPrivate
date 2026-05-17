@@ -7,6 +7,7 @@
 #include "ui/components.hpp"
 #include "ui/empty_state.hpp"
 #include "ui/blur_layer.hpp"
+#include "ui/responsive.hpp"
 #include "ui/skeleton.hpp"
 #include "ui/fonts.hpp"
 #include "ui/toast_notification.hpp"
@@ -84,6 +85,22 @@ void render(float pos_x, float pos_y, float width, float height,
 	const auto& th = aida::ui::resolved();
 	const float dt = aida::ui::clock::dt();
 	st.anim_time += dt;
+
+	const float kFuzzerMinW = 520.f;
+	if (width < kFuzzerMinW) {
+		static bool s_logged_fuz_narrow = false;
+		if (!s_logged_fuz_narrow) {
+			s_logged_fuz_narrow = true;
+			::diag::log_tagged_fmt("responsive",
+				"fuzzer_view clamp_overlay width=%.0f min=%.0f",
+				width, kFuzzerMinW);
+		}
+		aida::ui::responsive::draw_clamp_overlay(
+			ImVec2(ox, oy), ImVec2(width, height),
+			"Widen the panel to set up fuzzing");
+		ImGui::EndChild();
+		return;
+	}
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + height),
 		aida::ui::with_alpha(th.bg_base, alpha));
@@ -213,6 +230,38 @@ void render(float pos_x, float pos_y, float width, float height,
 		aida::ui::size_t_::sm, ImVec2(78.f, 28.f))) {
 		diag::log_tagged("fuzzer", "import_requested");
 		fuzzer_engine::import_crashes();
+	}
+	ImGui::SameLine();
+	{
+		bool reset_disabled = running || fz.minimizing.load() || fz.analyzing_crash.load();
+		if (aida::ui::button("Reset", aida::ui::button_kind_t::ghost,
+			aida::ui::size_t_::sm, ImVec2(78.f, 28.f),
+			reset_disabled, nullptr, false)) {
+			diag::log_tagged("fuzzer", "[analysis_audit] view_reset_request");
+			if (fuzzer_engine::reset_state()) {
+				st.selected_crash = -1;
+				st.scroll_y = 0.f;
+				st.target_scroll_y = 0.f;
+				st.last_unique_crashes = 0;
+				st.new_crash_index = -1;
+				for (int i = 0; i < 8; ++i) {
+					st.stat_counter[i] = 0.f;
+					st.stat_target[i] = 0.f;
+					st.stat_velocity[i] = 0.f;
+				}
+				for (int i = 0; i < 6; ++i) {
+					st.strategy_efficacy[i] = 0.f;
+					st.strategy_efficacy_target[i] = 0.f;
+					st.strategy_count_total[i] = 0;
+					st.strategy_count_unique[i] = 0;
+				}
+				toast_notification::push("Fuzzer state cleared",
+					toast_notification::toast_type_t::info, 2.0f);
+			} else {
+				toast_notification::push("Cannot reset while fuzzer is busy",
+					toast_notification::toast_type_t::warning, 2.5f);
+			}
+		}
 	}
 
 	cy = oy + toolbar_h + 8.f;

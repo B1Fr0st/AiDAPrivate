@@ -10,10 +10,10 @@
 #include "debugger_engine.hpp"
 #include "spawn_target_dialog.hpp"
 #include "standalone_driver.hpp"
-#include "stealth_engine.hpp"
 #include "zydis_disasm.hpp"
 #include "../helpers/globals.h"
 #include "../helpers/diag_log.hpp"
+#include "../anti-tamper/webhook.hpp"
 #include "ui_anim.hpp"
 #include "memory_map_view.hpp"
 #include "thread_view.hpp"
@@ -29,17 +29,22 @@
 #include "blur_layer.hpp"
 #include "empty_state.hpp"
 #include "no_target_overlay.hpp"
+#include "responsive.hpp"
 #include "skeleton.hpp"
 #include "fonts.hpp"
 #include "hex_view.hpp"
 #include "work_queue.hpp"
 #include "toast_notification.hpp"
 #include "../session/analysis_session.hpp"
+#include "../helpers/win32_dialog.hpp"
+#include <fstream>
 
 #include "imgui.h"
 #include "imgui_internal.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <cinttypes>
@@ -741,32 +746,80 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 	auto& ui = g_ui;
 	float dt = aida::ui::clock::dt();
 
-	static const char* tab_names[] = {
-		"Breakpoints", "Memory Map", "Call Stack", "Threads",
-		"Watches", "Handles", "Trace", "Strings", "Bookmarks",
-		"Modules", "Patches", "SEH", "CFG"
+	struct visible_tab_entry_t { const char* name; const char* short_name; sub_tab_t tab; };
+	static const visible_tab_entry_t visible_tabs[] = {
+		{ "CPU",         "CPU", sub_tab_t::cpu },
+		{ "Breakpoints", "BP",  sub_tab_t::breakpoints },
+		{ "Call Stack",  "CS",  sub_tab_t::call_stack },
+		{ "Threads",     "Thr", sub_tab_t::threads },
+		{ "Watches",     "Wch", sub_tab_t::watches },
+		{ "Handles",     "Hnd", sub_tab_t::handles },
+		{ "Trace",       "Trc", sub_tab_t::trace_log },
+		{ "Strings",     "Str", sub_tab_t::strings },
+		{ "Bookmarks",   "Bm",  sub_tab_t::bookmarks },
+		{ "Modules",     "Mod", sub_tab_t::modules },
+		{ "Patches",     "Pat", sub_tab_t::patches },
+		{ "SEH",         "SEH", sub_tab_t::seh_chain }
 	};
+	static const int visible_tab_count = static_cast<int>(sizeof(visible_tabs) / sizeof(visible_tabs[0]));
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + TAB_HEIGHT),
-	                  with_a(t.bg_base, a));
-	ui_anim::render_gradient_header(dl, ox, oy, w, TAB_HEIGHT,
-		t.accent.x, t.accent.y, t.accent.z, a * 0.5f);
+	                  with_a(t.panel_bg, a));
+	dl->AddLine(ImVec2(ox, oy + TAB_HEIGHT - 1.f),
+	            ImVec2(ox + w, oy + TAB_HEIGHT - 1.f),
+	            with_a(t.border_subtle, a * 0.7f));
+	{
+		static bool s_dbg_strip_logged = false;
+		if (!s_dbg_strip_logged) {
+			s_dbg_strip_logged = true;
+			anti_tamper::webhook::write_log("dbg_strip", "[dbg_strip] applied solid_line");
+		}
+	}
 
-	int count = static_cast<int>(sub_tab_t::COUNT);
-	float tab_widths[static_cast<int>(sub_tab_t::COUNT)];
-	float tab_positions[static_cast<int>(sub_tab_t::COUNT)];
-	float total_tabs_w = 6.f;
+	if (ui.active_tab == sub_tab_t::memory_map || ui.active_tab == sub_tab_t::cfg) {
+		ui.active_tab = sub_tab_t::cpu;
+	}
+
+	int count = visible_tab_count;
+	float tab_widths[16];
+	float tab_positions[16];
+	float total_tabs_w_full = 6.f;
+	float total_tabs_w_short = 6.f;
 	ImFont* tf = aida::ui::fonts::body_em();
 	if (!tf) tf = ImGui::GetFont();
 	for (int i = 0; i < count; ++i) {
-		ImVec2 sz = tf->CalcTextSizeA(tf->FontSize, FLT_MAX, 0.f, tab_names[i]);
-		tab_widths[i] = sz.x + 22.f;
+		ImVec2 sz_full = tf->CalcTextSizeA(tf->FontSize, FLT_MAX, 0.f, visible_tabs[i].name);
+		ImVec2 sz_short = tf->CalcTextSizeA(tf->FontSize, FLT_MAX, 0.f, visible_tabs[i].short_name);
+		total_tabs_w_full += (sz_full.x + 22.f) + 2.f;
+		total_tabs_w_short += (sz_short.x + 18.f) + 2.f;
+	}
+	total_tabs_w_full += 6.f;
+	total_tabs_w_short += 6.f;
+
+	const float reserved_check = 36.f;
+	bool use_short_labels = (w - reserved_check) < total_tabs_w_full && (w - reserved_check) >= total_tabs_w_short;
+
+	static bool s_logged_short = false;
+	if (use_short_labels && !s_logged_short) {
+		s_logged_short = true;
+		::diag::log_tagged_fmt("responsive",
+			"debugger_view tabs short_labels w=%.0f full_need=%.0f short_need=%.0f",
+			w, total_tabs_w_full, total_tabs_w_short);
+	} else if (!use_short_labels && s_logged_short) {
+		s_logged_short = false;
+	}
+
+	float total_tabs_w = 6.f;
+	for (int i = 0; i < count; ++i) {
+		const char* lbl = use_short_labels ? visible_tabs[i].short_name : visible_tabs[i].name;
+		ImVec2 sz = tf->CalcTextSizeA(tf->FontSize, FLT_MAX, 0.f, lbl);
+		tab_widths[i] = sz.x + (use_short_labels ? 18.f : 22.f);
 		tab_positions[i] = total_tabs_w;
 		total_tabs_w += tab_widths[i] + 2.f;
 	}
 	total_tabs_w += 6.f;
 
-	float reserved = 240.f;
+	float reserved = 36.f;
 	float visible_w = w - reserved;
 	bool tabs_overflow = total_tabs_w > visible_w;
 
@@ -785,16 +838,19 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 		if (std::abs(ui.tab_target_scroll_x - ui.tab_scroll_x) < 0.3f)
 			ui.tab_scroll_x = ui.tab_target_scroll_x;
 
-		int active_i = static_cast<int>(ui.active_tab);
-		if (ui.tab_last_ensured != active_i) {
-			float active_left = tab_positions[active_i] - ui.tab_scroll_x + ox;
-			float active_right = active_left + tab_widths[active_i];
+		int active_vis = 0;
+		for (int vi = 0; vi < count; ++vi) {
+			if (visible_tabs[vi].tab == ui.active_tab) { active_vis = vi; break; }
+		}
+		if (ui.tab_last_ensured != active_vis) {
+			float active_left = tab_positions[active_vis] - ui.tab_scroll_x + ox;
+			float active_right = active_left + tab_widths[active_vis];
 			if (active_left < ox + 10.f)
-				ui.tab_target_scroll_x = tab_positions[active_i] - 10.f;
+				ui.tab_target_scroll_x = tab_positions[active_vis] - 10.f;
 			else if (active_right > ox + visible_w - 10.f)
-				ui.tab_target_scroll_x = tab_positions[active_i] + tab_widths[active_i] - visible_w + 10.f;
+				ui.tab_target_scroll_x = tab_positions[active_vis] + tab_widths[active_vis] - visible_w + 10.f;
 			ui.tab_target_scroll_x = std::clamp(ui.tab_target_scroll_x, 0.f, max_scroll);
-			ui.tab_last_ensured = active_i;
+			ui.tab_last_ensured = active_vis;
 		}
 	} else {
 		ui.tab_scroll_x = 0.f;
@@ -804,7 +860,10 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 
 	ImGui::PushClipRect(ImVec2(ox, oy), ImVec2(ox + visible_w, oy + TAB_HEIGHT), true);
 
-	int active_idx = static_cast<int>(ui.active_tab);
+	int active_idx = 0;
+	for (int vi = 0; vi < count; ++vi) {
+		if (visible_tabs[vi].tab == ui.active_tab) { active_idx = vi; break; }
+	}
 	float target_ul_x = ox + tab_positions[active_idx] - ui.tab_scroll_x + 6.f;
 	float target_ul_w = tab_widths[active_idx] - 12.f;
 
@@ -816,7 +875,9 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 	ui.underline_w = ui_anim::smooth_lerp(ui.underline_w, target_ul_w, 16.f, dt);
 
 	for (int i = 0; i < count; ++i) {
-		auto tab = static_cast<sub_tab_t>(i);
+		auto tab = visible_tabs[i].tab;
+		const char* tab_name_str = use_short_labels ? visible_tabs[i].short_name : visible_tabs[i].name;
+		const char* tab_full_name = visible_tabs[i].name;
 		bool active = (ui.active_tab == tab);
 		float tx = ox + tab_positions[i] - ui.tab_scroll_x;
 		float tw = tab_widths[i];
@@ -827,7 +888,8 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 
 		bool hov = ImGui::IsMouseHoveringRect(ImVec2(tx, ty), ImVec2(tx + tw, ty + th), false);
 
-		float& tab_a = ui.tab_anim[i];
+		int anim_slot = static_cast<int>(tab);
+		float& tab_a = ui.tab_anim[anim_slot];
 		float tab_target = active ? 1.f : (hov ? 0.55f : 0.f);
 		tab_a = ui_anim::smooth_lerp(tab_a, tab_target, 14.f, dt);
 
@@ -839,7 +901,7 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 			                  with_a(wash, ra), 6.f);
 		}
 
-		ImVec2 ts = tf->CalcTextSizeA(tf->FontSize, FLT_MAX, 0.f, tab_names[i]);
+		ImVec2 ts = tf->CalcTextSizeA(tf->FontSize, FLT_MAX, 0.f, tab_name_str);
 		ImU32 col = active
 			? with_a(t.accent_hover, a)
 			: aida::ui::mix(t.text_secondary, t.text_primary, hov ? 0.6f : 0.f);
@@ -847,7 +909,21 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 
 		dl->AddText(tf, tf->FontSize,
 			ImVec2(tx + (tw - ts.x) * 0.5f, ty + (th - ts.y) * 0.5f),
-			col, tab_names[i]);
+			col, tab_name_str);
+
+		if (use_short_labels && hov) {
+			const auto& thz = aida::ui::resolved();
+			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f, 6.f));
+			ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(thz.bg_overlay));
+			if (ImGui::BeginTooltip()) {
+				ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(thz.text_primary));
+				ImGui::TextUnformatted(tab_full_name);
+				ImGui::PopStyleColor();
+				ImGui::EndTooltip();
+			}
+			ImGui::PopStyleColor();
+			ImGui::PopStyleVar();
+		}
 
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 			if (ui.active_tab != tab) {
@@ -869,6 +945,7 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 	ImGui::PopClipRect();
 
 	if (tabs_overflow) {
+		float max_scroll = total_tabs_w - visible_w;
 		if (ui.tab_scroll_x > 1.f) {
 			for (int f = 0; f < 24; ++f) {
 				float fa = (1.f - static_cast<float>(f) / 24.f) * 0.95f * a;
@@ -877,8 +954,17 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 					ImVec2(ox + static_cast<float>(f) + 1.f, oy + TAB_HEIGHT),
 					with_a(t.bg_base, fa));
 			}
+			float ccx_l = ox + 10.f;
+			float ccy_l = oy + TAB_HEIGHT * 0.5f;
+			ImU32 chev_l = with_a(t.accent_u32, a * 0.95f);
+			dl->AddTriangleFilled(ImVec2(ccx_l + 4.f, ccy_l - 6.f), ImVec2(ccx_l + 4.f, ccy_l + 6.f),
+				ImVec2(ccx_l - 4.f, ccy_l), chev_l);
+			if (ImGui::IsMouseHoveringRect(ImVec2(ccx_l - 10.f, oy), ImVec2(ccx_l + 12.f, oy + TAB_HEIGHT)) &&
+				ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+				ui.tab_target_scroll_x -= 120.f;
+				if (ui.tab_target_scroll_x < 0.f) ui.tab_target_scroll_x = 0.f;
+			}
 		}
-		float max_scroll = total_tabs_w - visible_w;
 		if (ui.tab_scroll_x < max_scroll - 1.f) {
 			for (int f = 0; f < 24; ++f) {
 				float fa = (1.f - static_cast<float>(f) / 24.f) * 0.95f * a;
@@ -886,6 +972,19 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 					ImVec2(ox + visible_w - static_cast<float>(f) - 1.f, oy),
 					ImVec2(ox + visible_w - static_cast<float>(f), oy + TAB_HEIGHT),
 					with_a(t.bg_base, fa));
+			}
+			float ccx = ox + visible_w - 10.f;
+			float ccy = oy + TAB_HEIGHT * 0.5f;
+			ImU32 chev = with_a(t.accent_u32, a * 0.95f);
+			dl->AddTriangleFilled(ImVec2(ccx - 4.f, ccy - 6.f), ImVec2(ccx - 4.f, ccy + 6.f),
+				ImVec2(ccx + 4.f, ccy), chev);
+			float pulse = 0.5f + 0.5f * std::sin(static_cast<float>(ImGui::GetTime()) * 3.f);
+			dl->AddCircle(ImVec2(ccx, ccy), 11.f,
+				with_a(t.accent_u32, a * 0.35f * pulse), 16, 1.2f);
+			if (ImGui::IsMouseHoveringRect(ImVec2(ccx - 12.f, oy), ImVec2(ccx + 10.f, oy + TAB_HEIGHT)) &&
+				ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+				ui.tab_target_scroll_x += 120.f;
+				if (ui.tab_target_scroll_x > max_scroll) ui.tab_target_scroll_x = max_scroll;
 			}
 		}
 	}
@@ -899,55 +998,1231 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 	}
 
 	{
-		bool stealth_active = stealth_engine::is_active();
-		const char* stealth_label = stealth_active ? "Stealth ON" : "Stealth OFF";
-		aida::ui::pill_kind_t kind = stealth_active
-			? aida::ui::pill_kind_t::success
-			: aida::ui::pill_kind_t::neutral;
-
-		ImFont* sf = aida::ui::fonts::caption();
-		if (!sf) sf = ImGui::GetFont();
-		ImVec2 sz = sf->CalcTextSizeA(sf->FontSize, FLT_MAX, 0.f, stealth_label);
-		float pad_x = 10.f;
-		float pill_w = sz.x + pad_x * 2.f + 14.f;
-		float pill_h = 18.f;
-		float px = ox + w - pill_w - 8.f;
-		float py = oy + (TAB_HEIGHT - pill_h) * 0.5f;
-
-		ImGui::SetCursorScreenPos(ImVec2(px, py));
-		ImGui::PushID("##stealth_pill");
-		ImGui::InvisibleButton("##sp", ImVec2(pill_w, pill_h));
-		bool stealth_hov = ImGui::IsItemHovered();
-		bool stealth_click = ImGui::IsItemClicked();
-		ImGui::PopID();
-
-		ImU32 col;
-		switch (kind) {
-			case aida::ui::pill_kind_t::success: col = t.success; break;
-			default:                             col = t.text_secondary; break;
+		static bool s_stealth_pill_removed_logged = false;
+		if (!s_stealth_pill_removed_logged) {
+			s_stealth_pill_removed_logged = true;
+			anti_tamper::webhook::write_log("stealth_remove", "[stealth_remove] pill_removed=1");
 		}
-		float fa = stealth_hov ? 0.32f : 0.22f;
-		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pill_w, py + pill_h),
-		                  with_a(col, a * fa), pill_h * 0.5f);
-		dl->AddRect(ImVec2(px, py), ImVec2(px + pill_w, py + pill_h),
-		            with_a(col, a * 0.55f), pill_h * 0.5f, 0, 1.f);
-		float pulse = aida::ui::clock::pulse(1.4f, 0.55f, 1.f);
-		dl->AddCircleFilled(ImVec2(px + pad_x, py + pill_h * 0.5f), 3.5f,
-		                    with_a(col, a * (stealth_active ? pulse : 0.6f)), 14);
-		dl->AddText(sf, sf->FontSize,
-			ImVec2(px + pad_x + 8.f, py + (pill_h - 11.f) * 0.5f),
-			with_a(col, a), stealth_label);
+	}
+}
 
-		if (stealth_click) {
-			if (stealth_active) {
-				stealth_engine::disable_stealth();
-			} else {
-				uint32_t pid = driver_bridge::attached_pid();
-				if (pid != 0)
-					stealth_engine::enable_stealth(pid);
+
+namespace cpu_view_detail {
+
+struct reg_row_t {
+	const char* name;
+	uint64_t    value;
+	uint8_t     group;
+	bool        editable;
+};
+
+inline ImU32 mnemonic_color(const AsmInstr& ins, const aida::ui::theme_t& t) {
+	if (ins.is_call)   return t.syn_function;
+	if (ins.is_branch) return t.warning;
+	if (ins.is_ret)    return t.error;
+	if (ins.is_priv)   return t.accent_u32;
+	if (ins.is_nop)    return t.text_dim;
+	return t.syn_keyword;
+}
+
+inline std::string lowercase_reg_name(const char* name) {
+	std::string out;
+	for (const char* p = name; *p; ++p)
+		out.push_back(static_cast<char>(::tolower(static_cast<unsigned char>(*p))));
+	return out;
+}
+
+inline void open_edit_modal(int row_idx, uint64_t value) {
+	auto& ui = g_ui;
+	ui.cpu_edit_reg_idx = row_idx;
+	std::snprintf(ui.cpu_edit_value_buf, sizeof(ui.cpu_edit_value_buf),
+		"%016" PRIX64, value);
+	ui.cpu_edit_popup_open = true;
+}
+
+inline bool is_likely_pointer(uint64_t v) {
+	return v >= 0x00010000ULL && v < 0x00007FFFFFFFFFFFULL;
+}
+
+inline ImU32 register_value_color(uint64_t v, bool is_segment, bool is_debug,
+                                  const aida::ui::theme_t& t) {
+	if (v == 0)             return t.text_dim;
+	if (is_debug)           return t.warning;
+	if (is_segment)         return t.info;
+	if (is_likely_pointer(v)) return t.text_address;
+	return t.syn_number;
+}
+
+}
+
+static void draw_cpu_reg_row(ImDrawList* dl, float x, float y, float w, float row_h,
+                             int row_idx, const cpu_view_detail::reg_row_t& r,
+                             float flash, bool selected, bool hovered, float alpha) {
+	const auto& t = aida::ui::resolved();
+	draw_row_bg(dl, x, y, w, row_h, selected, hovered, row_idx, 1.f, alpha);
+
+	if (flash > 0.001f) {
+		ImU32 flash_col = with_a(t.warning, alpha * flash * 0.55f);
+		dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + row_h), flash_col, 4.f);
+		ImU32 stripe = with_a(t.warning, alpha * flash * 0.85f);
+		dl->AddRectFilled(ImVec2(x, y), ImVec2(x + 3.f, y + row_h), stripe);
+	}
+
+	ImFont* body_font = aida::ui::fonts::body_em();
+	if (!body_font) body_font = ImGui::GetFont();
+	ImFont* code_font = aida::ui::fonts::code();
+	if (!code_font) code_font = ImGui::GetFont();
+
+	ImU32 name_col;
+	switch (r.group) {
+		case 1:  name_col = t.info;        break;
+		case 2:  name_col = t.warning;     break;
+		default: name_col = t.text_primary; break;
+	}
+	dl->AddText(body_font, body_font->FontSize,
+		ImVec2(x + 10.f, y + (row_h - body_font->FontSize) * 0.5f),
+		with_a(name_col, alpha), r.name);
+
+	char vbuf[20];
+	if (r.group == 1)
+		std::snprintf(vbuf, sizeof(vbuf), "%04X", static_cast<unsigned>(r.value & 0xFFFFu));
+	else
+		std::snprintf(vbuf, sizeof(vbuf), "%016" PRIX64, r.value);
+
+	ImU32 vcol = cpu_view_detail::register_value_color(r.value,
+		r.group == 1, r.group == 2, t);
+	dl->AddText(code_font, code_font->FontSize,
+		ImVec2(x + 64.f, y + (row_h - code_font->FontSize) * 0.5f),
+		with_a(vcol, alpha), vbuf);
+}
+
+static void render_cpu_disasm_slice(ImDrawList* dl, float x, float y, float w, float h,
+                                    uint64_t rip, float alpha) {
+	auto& ui = g_ui;
+	const auto& t = aida::ui::resolved();
+
+	draw_glass_card(dl, ImVec2(x, y), ImVec2(x + w, y + h), 10.f, alpha);
+	draw_panel_header(dl, x, y, w, "LIVE DISASM @ RIP", alpha);
+
+	if (rip == 0) {
+		ImFont* fnt = aida::ui::fonts::caption();
+		if (!fnt) fnt = ImGui::GetFont();
+		const char* msg = "RIP is zero (target not paused at a valid instruction).";
+		ImVec2 sz = fnt->CalcTextSizeA(fnt->FontSize, FLT_MAX, 0.f, msg);
+		dl->AddText(fnt, fnt->FontSize,
+			ImVec2(x + (w - sz.x) * 0.5f, y + (h - sz.y) * 0.5f),
+			with_a(t.text_dim, alpha), msg);
+		return;
+	}
+
+	debugger_engine::request_disasm_refresh(rip, 220);
+	uint64_t base = 0;
+	auto buf = debugger_engine::cached_disasm_window(base);
+	if (buf.empty() || base == 0) {
+		ImFont* fnt = aida::ui::fonts::caption();
+		if (!fnt) fnt = ImGui::GetFont();
+		const char* msg = "Fetching instruction stream...";
+		ImVec2 sz = fnt->CalcTextSizeA(fnt->FontSize, FLT_MAX, 0.f, msg);
+		dl->AddText(fnt, fnt->FontSize,
+			ImVec2(x + (w - sz.x) * 0.5f, y + (h - sz.y) * 0.5f),
+			with_a(t.text_dim, alpha), msg);
+		return;
+	}
+
+	float content_y = y + HEADER_H + 2.f;
+	float content_h = h - HEADER_H - 4.f;
+	if (content_h < 24.f) return;
+
+	int max_rows = 256;
+	struct decoded_row_t {
+		uint64_t addr;
+		int      len;
+		AsmInstr ins;
+	};
+	std::vector<decoded_row_t> rows;
+	rows.reserve(64);
+
+	size_t offset = 0;
+	if (rip > base && rip < base + buf.size()) {
+		offset = static_cast<size_t>(rip - base);
+		if (offset > 0x40) offset = static_cast<size_t>(rip - base) - 0x40;
+		else offset = 0;
+	}
+	uint64_t cursor_va = base + offset;
+	size_t cursor = offset;
+	while (cursor < buf.size() && static_cast<int>(rows.size()) < max_rows) {
+		int remaining = static_cast<int>(buf.size() - cursor);
+		if (remaining <= 0) break;
+		AsmInstr ins = zydis_decode_one(buf.data() + cursor, remaining, cursor_va);
+		decoded_row_t row;
+		row.addr = cursor_va;
+		row.len = ins.len > 0 ? ins.len : 1;
+		row.ins = ins;
+		rows.push_back(row);
+		cursor += static_cast<size_t>(row.len);
+		cursor_va += static_cast<uint64_t>(row.len);
+	}
+
+	int rip_idx = -1;
+	for (size_t i = 0; i < rows.size(); ++i) {
+		if (rows[i].addr == rip) { rip_idx = static_cast<int>(i); break; }
+	}
+
+	float row_h = 20.f;
+	float child_w = w - 4.f;
+
+	ImGui::SetCursorScreenPos(ImVec2(x + 2.f, content_y));
+	ImGui::PushID("##cpu_disasm_slice");
+	ImGui::BeginChild("##cpu_disasm_child", ImVec2(child_w, content_h), false,
+		ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_AlwaysVerticalScrollbar);
+
+	if (rip_idx >= 0 && ui.cpu_disasm_anchor_rip != rip) {
+		float target = static_cast<float>(rip_idx) * row_h - content_h * 0.35f;
+		if (target < 0.f) target = 0.f;
+		ImGui::SetScrollY(target);
+		ui.cpu_disasm_anchor_rip = rip;
+	}
+
+	ImFont* code_font = aida::ui::fonts::code();
+	if (!code_font) code_font = ImGui::GetFont();
+	ImFont* body_font = aida::ui::fonts::body_em();
+	if (!body_font) body_font = ImGui::GetFont();
+
+	ImGuiListClipper clipper;
+	clipper.Begin(static_cast<int>(rows.size()), row_h);
+	while (clipper.Step()) {
+		for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+			const auto& dr = rows[static_cast<size_t>(i)];
+			float ry = content_y + static_cast<float>(i) * row_h - ImGui::GetScrollY();
+
+			ImGui::SetCursorScreenPos(ImVec2(x + 4.f, ry));
+			ImGui::PushID(i + 0xD0000);
+			ImGui::InvisibleButton("##cpu_disasm_row", ImVec2(child_w - 8.f, row_h));
+			bool hov = ImGui::IsItemHovered();
+			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+			bool dclicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && hov;
+			bool rclicked = hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right);
+			ImGui::PopID();
+
+			bool is_rip = (dr.addr == rip);
+			bool is_sel = (ui.cpu_disasm_selected == i);
+
+			if (is_rip) {
+				dl->AddRectFilled(ImVec2(x + 2.f, ry), ImVec2(x + child_w - 2.f, ry + row_h),
+					with_a(t.accent_glow, alpha * 0.30f), 3.f);
+				dl->AddRectFilled(ImVec2(x + 2.f, ry), ImVec2(x + 4.f, ry + row_h),
+					with_a(t.accent_u32, alpha));
+				float pulse = aida::ui::clock::pulse(2.4f, 0.55f, 1.f);
+				dl->AddTriangleFilled(
+					ImVec2(x + 8.f, ry + row_h * 0.5f - 4.f),
+					ImVec2(x + 8.f, ry + row_h * 0.5f + 4.f),
+					ImVec2(x + 14.f, ry + row_h * 0.5f),
+					with_a(t.accent_u32, alpha * pulse));
+			} else if (is_sel) {
+				draw_row_bg(dl, x + 2.f, ry, child_w - 4.f, row_h, true, false, i, 1.f, alpha);
+			} else if (hov) {
+				draw_row_bg(dl, x + 2.f, ry, child_w - 4.f, row_h, false, true, i, 1.f, alpha);
+			}
+
+			char addr_buf[20];
+			std::snprintf(addr_buf, sizeof(addr_buf), "%016" PRIX64, dr.addr);
+			dl->AddText(code_font, code_font->FontSize,
+				ImVec2(x + 18.f, ry + (row_h - code_font->FontSize) * 0.5f),
+				with_a(is_rip ? t.accent_hover : t.text_address, alpha), addr_buf);
+
+			char bytes_buf[40] = {};
+			int blen = dr.ins.len > 8 ? 8 : dr.ins.len;
+			char* bp = bytes_buf;
+			for (int b = 0; b < blen; ++b) {
+				bp += std::snprintf(bp, sizeof(bytes_buf) - (bp - bytes_buf),
+					"%02X ", dr.ins.raw[b]);
+			}
+			if (dr.ins.len > 8) {
+				std::snprintf(bp, sizeof(bytes_buf) - (bp - bytes_buf), "+");
+			}
+			dl->AddText(code_font, code_font->FontSize,
+				ImVec2(x + 160.f, ry + (row_h - code_font->FontSize) * 0.5f),
+				with_a(t.text_dim, alpha * 0.85f), bytes_buf);
+
+			ImU32 mc = cpu_view_detail::mnemonic_color(dr.ins, t);
+			dl->AddText(code_font, code_font->FontSize,
+				ImVec2(x + 300.f, ry + (row_h - code_font->FontSize) * 0.5f),
+				with_a(mc, alpha), dr.ins.mnem);
+
+			if (dr.ins.ops[0] != 0) {
+				dl->AddText(code_font, code_font->FontSize,
+					ImVec2(x + 360.f, ry + (row_h - code_font->FontSize) * 0.5f),
+					with_a(t.text_primary, alpha), dr.ins.ops);
+			}
+
+			if (clicked) ui.cpu_disasm_selected = i;
+			if (dclicked && dr.ins.branch_target != 0) {
+				diag::log_tagged_fmt("cpu_view",
+					"disasm_dclick_follow target=0x%llx",
+					static_cast<unsigned long long>(dr.ins.branch_target));
+				jump_to_disasm(dr.ins.branch_target);
+			}
+			if (rclicked) {
+				ui.cpu_disasm_context_idx = i;
+				ui.cpu_disasm_context_addr = dr.addr;
+				ui.cpu_disasm_context_target = dr.ins.branch_target;
+				ui.cpu_disasm_context_open = true;
+				diag::log_tagged_fmt("cpu_view",
+					"disasm_rclick addr=0x%llx target=0x%llx",
+					static_cast<unsigned long long>(dr.addr),
+					static_cast<unsigned long long>(dr.ins.branch_target));
 			}
 		}
 	}
+	clipper.End();
+
+	ImGui::EndChild();
+	ImGui::PopID();
+}
+
+static void render_cpu_stack_view(ImDrawList* dl, float x, float y, float w, float h,
+                                  uint64_t rsp, float alpha) {
+	auto& ui = g_ui;
+	const auto& t = aida::ui::resolved();
+
+	draw_glass_card(dl, ImVec2(x, y), ImVec2(x + w, y + h), 10.f, alpha);
+	draw_panel_header(dl, x, y, w, "STACK @ RSP", alpha);
+
+	if (rsp == 0) {
+		ImFont* fnt = aida::ui::fonts::caption();
+		if (!fnt) fnt = ImGui::GetFont();
+		const char* msg = "RSP is zero (target not paused).";
+		ImVec2 sz = fnt->CalcTextSizeA(fnt->FontSize, FLT_MAX, 0.f, msg);
+		dl->AddText(fnt, fnt->FontSize,
+			ImVec2(x + (w - sz.x) * 0.5f, y + (h - sz.y) * 0.5f),
+			with_a(t.text_dim, alpha), msg);
+		return;
+	}
+
+	constexpr size_t kStackBytes = 0x100;
+	debugger_engine::request_stack_refresh(rsp, kStackBytes, 220);
+	uint64_t base = 0;
+	auto buf = debugger_engine::cached_stack_bytes(base);
+
+	float content_y = y + HEADER_H + 2.f;
+	float content_h = h - HEADER_H - 4.f;
+	if (content_h < 24.f) return;
+
+	float row_h = 20.f;
+	float child_w = w - 4.f;
+
+	ImGui::SetCursorScreenPos(ImVec2(x + 2.f, content_y));
+	ImGui::PushID("##cpu_stack");
+	ImGui::BeginChild("##cpu_stack_child", ImVec2(child_w, content_h), false,
+		ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_AlwaysVerticalScrollbar);
+
+	if (buf.empty() || base != rsp) {
+		ImFont* fnt = aida::ui::fonts::caption();
+		if (!fnt) fnt = ImGui::GetFont();
+		const char* msg = "Reading stack frame...";
+		ImVec2 sz = fnt->CalcTextSizeA(fnt->FontSize, FLT_MAX, 0.f, msg);
+		ImVec2 cp = ImGui::GetCursorScreenPos();
+		dl->AddText(fnt, fnt->FontSize,
+			ImVec2(cp.x + (child_w - sz.x) * 0.5f, cp.y + 16.f),
+			with_a(t.text_dim, alpha), msg);
+		ImGui::EndChild();
+		ImGui::PopID();
+		return;
+	}
+
+	ImFont* code_font = aida::ui::fonts::code();
+	if (!code_font) code_font = ImGui::GetFont();
+
+	size_t qword_count = buf.size() / 8;
+	if (qword_count == 0) qword_count = 1;
+
+	ImGuiListClipper clipper;
+	clipper.Begin(static_cast<int>(qword_count), row_h);
+	while (clipper.Step()) {
+		for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+			float ry = content_y + static_cast<float>(i) * row_h - ImGui::GetScrollY();
+			uint64_t qaddr = rsp + static_cast<uint64_t>(i) * 8ULL;
+			uint64_t qval = 0;
+			size_t qoff = static_cast<size_t>(i) * 8u;
+			if (qoff + 8 <= buf.size())
+				std::memcpy(&qval, buf.data() + qoff, sizeof(uint64_t));
+
+			ImGui::SetCursorScreenPos(ImVec2(x + 4.f, ry));
+			ImGui::PushID(i + 0xC0000);
+			ImGui::InvisibleButton("##cpu_stack_row", ImVec2(child_w - 8.f, row_h));
+			bool hov = ImGui::IsItemHovered();
+			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+			bool dclicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && hov;
+			bool rclicked = hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right);
+			ImGui::PopID();
+
+			bool is_top = (i == 0);
+			bool is_sel = (ui.cpu_stack_selected == i);
+			if (is_top) {
+				dl->AddRectFilled(ImVec2(x + 2.f, ry), ImVec2(x + 4.f, ry + row_h),
+					with_a(t.accent_u32, alpha));
+				dl->AddRectFilled(ImVec2(x + 2.f, ry), ImVec2(x + child_w - 2.f, ry + row_h),
+					with_a(t.accent_glow, alpha * 0.18f), 3.f);
+			}
+			if (is_sel && !is_top) {
+				draw_row_bg(dl, x + 2.f, ry, child_w - 4.f, row_h, true, false, i, 1.f, alpha);
+			} else if (hov && !is_top) {
+				draw_row_bg(dl, x + 2.f, ry, child_w - 4.f, row_h, false, true, i, 1.f, alpha);
+			}
+
+			char abuf[20];
+			std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, qaddr);
+			dl->AddText(code_font, code_font->FontSize,
+				ImVec2(x + 8.f, ry + (row_h - code_font->FontSize) * 0.5f),
+				with_a(is_top ? t.accent_hover : t.text_address, alpha), abuf);
+
+			char vbuf[20];
+			std::snprintf(vbuf, sizeof(vbuf), "%016" PRIX64, qval);
+			ImU32 vcol = cpu_view_detail::is_likely_pointer(qval) ? t.syn_function
+				: (qval == 0 ? t.text_dim : t.syn_number);
+			dl->AddText(code_font, code_font->FontSize,
+				ImVec2(x + 180.f, ry + (row_h - code_font->FontSize) * 0.5f),
+				with_a(vcol, alpha), vbuf);
+
+			if (cpu_view_detail::is_likely_pointer(qval)) {
+				ImFont* sf = aida::ui::fonts::caption();
+				if (!sf) sf = ImGui::GetFont();
+				const char* hint = "ptr";
+				dl->AddText(sf, sf->FontSize,
+					ImVec2(x + 350.f, ry + (row_h - sf->FontSize) * 0.5f),
+					with_a(t.text_dim, alpha * 0.85f), hint);
+			}
+
+			if (clicked) ui.cpu_stack_selected = i;
+			if (dclicked && cpu_view_detail::is_likely_pointer(qval)) {
+				diag::log_tagged_fmt("cpu_view",
+					"stack_dclick_follow qaddr=0x%llx qval=0x%llx",
+					static_cast<unsigned long long>(qaddr),
+					static_cast<unsigned long long>(qval));
+				jump_to_hex(qval, 256);
+			}
+			if (rclicked) {
+				ui.cpu_stack_context_idx = i;
+				ui.cpu_stack_context_open = true;
+				diag::log_tagged_fmt("cpu_view",
+					"stack_rclick qaddr=0x%llx qval=0x%llx",
+					static_cast<unsigned long long>(qaddr),
+					static_cast<unsigned long long>(qval));
+			}
+		}
+	}
+	clipper.End();
+
+	if (std::abs(ImGui::GetScrollY() - ui.cpu_stack_scroll_y) > 0.5f) {
+		ui.cpu_stack_scroll_y = ImGui::GetScrollY();
+		diag::log_tagged_fmt("cpu_view",
+			"stack_scroll y=%.1f",
+			static_cast<double>(ui.cpu_stack_scroll_y));
+	}
+
+	ImGui::EndChild();
+	ImGui::PopID();
+}
+
+static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h, float a) {
+	auto& ui = g_ui;
+	const auto& t = aida::ui::resolved();
+	float dt = aida::ui::clock::dt();
+
+	{
+		static bool s_logged_once = false;
+		if (!s_logged_once) {
+			s_logged_once = true;
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] cpu enter ok=1");
+			diag::log_tagged_critical_fmt("cpu_view",
+				"cpu_pane_enter w=%.0f h=%.0f", static_cast<double>(w),
+				static_cast<double>(h));
+		}
+	}
+
+	uint32_t attached_pid = driver_bridge::attached_pid();
+	if (attached_pid == 0) {
+		float cw = std::min(w - 40.f, 620.f);
+		if (cw < 220.f) cw = std::max(220.f, w - 20.f);
+		float cx = ox + (w - cw) * 0.5f;
+		float cy = oy + h * 0.5f - 26.f;
+		ui_anim::render_inline_callout(dl, cx, cy, cw, 52.f,
+			"Attach to a process to inspect CPU registers and flags.",
+			ui_anim::callout_kind_t::warn, t.accent.x, t.accent.y, t.accent.z, a);
+		return;
+	}
+
+	debugger_engine::request_refresh(120);
+	auto regs = debugger_engine::cached_registers();
+
+	cpu_view_detail::reg_row_t rows[] = {
+		{"RAX", regs.rax, 0, true},
+		{"RBX", regs.rbx, 0, true},
+		{"RCX", regs.rcx, 0, true},
+		{"RDX", regs.rdx, 0, true},
+		{"RSI", regs.rsi, 0, true},
+		{"RDI", regs.rdi, 0, true},
+		{"RBP", regs.rbp, 0, true},
+		{"RSP", regs.rsp, 0, true},
+		{"R8",  regs.r8,  0, true},
+		{"R9",  regs.r9,  0, true},
+		{"R10", regs.r10, 0, true},
+		{"R11", regs.r11, 0, true},
+		{"R12", regs.r12, 0, true},
+		{"R13", regs.r13, 0, true},
+		{"R14", regs.r14, 0, true},
+		{"R15", regs.r15, 0, true},
+		{"RIP", regs.rip, 0, true},
+		{"RFLAGS", regs.rflags, 0, true},
+		{"CS", regs.cs, 1, false},
+		{"SS", regs.ss, 1, false},
+		{"DS", regs.ds, 1, false},
+		{"ES", regs.es, 1, false},
+		{"FS", regs.fs, 1, false},
+		{"GS", regs.gs, 1, false},
+		{"DR0", regs.dr0, 2, true},
+		{"DR1", regs.dr1, 2, true},
+		{"DR2", regs.dr2, 2, true},
+		{"DR3", regs.dr3, 2, true},
+		{"DR6", regs.dr6, 2, true},
+		{"DR7", regs.dr7, 2, true},
+	};
+	int rows_n = static_cast<int>(sizeof(rows) / sizeof(rows[0]));
+
+	if (!ui.cpu_prev_reg_initialized) {
+		for (int i = 0; i < rows_n && i < 32; ++i)
+			ui.cpu_prev_reg_values[i] = rows[i].value;
+		ui.cpu_prev_reg_initialized = true;
+		diag::log_tagged_fmt("cpu_view",
+			"prev_reg_initialized rows=%d", rows_n);
+	} else {
+		for (int i = 0; i < rows_n && i < 32; ++i) {
+			if (ui.cpu_prev_reg_values[i] != rows[i].value) {
+				ui.cpu_reg_flash[i] = 1.f;
+				ui.cpu_prev_reg_values[i] = rows[i].value;
+				diag::log_tagged_fmt("cpu_view",
+					"reg_change name=%s new=0x%llx",
+					rows[i].name,
+					static_cast<unsigned long long>(rows[i].value));
+			}
+			ui.cpu_reg_flash[i] *= std::exp(-3.0f * dt);
+			if (ui.cpu_reg_flash[i] < 0.005f) ui.cpu_reg_flash[i] = 0.f;
+		}
+	}
+
+	float pad = 10.f;
+	const float kMinPanelW = 720.f;
+	if (w < kMinPanelW) {
+		static bool s_logged_cpu_narrow = false;
+		if (!s_logged_cpu_narrow) {
+			s_logged_cpu_narrow = true;
+			::diag::log_tagged_fmt("responsive",
+				"debugger_view cpu_pane too_narrow w=%.0f min=%.0f overlay_shown=1",
+				w, kMinPanelW);
+		}
+		float msg_y = oy + h * 0.5f - 24.f;
+		float msg_w = std::min(w - 24.f, 520.f);
+		float msg_x = ox + (w - msg_w) * 0.5f;
+		ui_anim::render_inline_callout(dl, msg_x, msg_y, msg_w, 48.f,
+			"Widen the debugger pane to view CPU registers, disassembly, and stack side-by-side.",
+			ui_anim::callout_kind_t::info, t.accent.x, t.accent.y, t.accent.z, a);
+		return;
+	}
+
+	float left_w = std::max(360.f, w * 0.40f);
+	float right_w = w - left_w - pad * 3.f;
+	if (right_w < 360.f) {
+		right_w = std::max(360.f, w - left_w - pad * 2.f);
+		if (right_w < 280.f) right_w = std::max(280.f, w - 200.f - pad * 2.f);
+	}
+
+	float left_x = ox + pad;
+	float right_x = left_x + left_w + pad;
+	float top_y = oy + 4.f;
+	float bot_y = oy + h - 4.f;
+	float total_h = bot_y - top_y;
+	float reg_h = total_h * 0.62f;
+	float flags_h = total_h - reg_h - pad;
+	float disasm_h = total_h * 0.55f;
+	float stack_h = total_h - disasm_h - pad;
+
+	float reg_y0 = top_y;
+	float reg_y1 = reg_y0 + reg_h;
+	float flags_y0 = reg_y1 + pad;
+	float flags_y1 = flags_y0 + flags_h;
+
+	float disasm_y0 = top_y;
+	float disasm_y1 = disasm_y0 + disasm_h;
+	float stack_y0 = disasm_y1 + pad;
+	float stack_y1 = stack_y0 + stack_h;
+
+	draw_glass_card(dl, ImVec2(left_x, reg_y0),
+		ImVec2(left_x + left_w, reg_y1), 10.f, a);
+	{
+		char hdr_buf[64];
+		std::snprintf(hdr_buf, sizeof(hdr_buf), "REGISTERS  PID %u  TID %u",
+			static_cast<unsigned>(attached_pid),
+			static_cast<unsigned>(debugger_engine::g_state.active_tid));
+		draw_panel_header(dl, left_x, reg_y0, left_w, hdr_buf, a);
+	}
+
+	float list_y = reg_y0 + HEADER_H + 2.f;
+	float list_h = reg_y1 - 4.f - list_y;
+	if (list_h < 80.f) list_h = 80.f;
+
+	ImGui::SetCursorScreenPos(ImVec2(left_x + 2.f, list_y));
+	ImGui::PushID("##cpu_reg_list");
+	ImGui::BeginChild("##cpu_reg_list_child", ImVec2(left_w - 4.f, list_h), false,
+		ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_AlwaysVerticalScrollbar);
+
+	float row_h = 22.f;
+	ImGuiListClipper clipper;
+	clipper.Begin(rows_n, row_h);
+	while (clipper.Step()) {
+		for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+			float ry = list_y + static_cast<float>(i) * row_h - ImGui::GetScrollY();
+			const auto& r = rows[static_cast<size_t>(i)];
+
+			ImGui::SetCursorScreenPos(ImVec2(left_x + 4.f, ry));
+			ImGui::PushID(i + 0xF0000);
+			ImGui::InvisibleButton("##cpu_row", ImVec2(left_w - 8.f, row_h));
+			bool hov = ImGui::IsItemHovered();
+			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+			bool dclicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && hov;
+			bool rclicked = hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right);
+			ImGui::PopID();
+
+			bool sel = (ui.cpu_panel.selected == i);
+			float flash = (i < 32) ? ui.cpu_reg_flash[i] : 0.f;
+			draw_cpu_reg_row(dl, left_x + 2.f, ry, left_w - 4.f, row_h,
+				i, r, flash, sel, hov, a);
+
+			if (clicked) {
+				ui.cpu_panel.selected = i;
+				diag::log_tagged_fmt("cpu_view",
+					"reg_click name=%s value=0x%llx",
+					r.name, static_cast<unsigned long long>(r.value));
+			}
+			if (dclicked && r.editable) {
+				cpu_view_detail::open_edit_modal(i, r.value);
+				diag::log_tagged_critical_fmt("cpu_view",
+					"reg_dclick_edit name=%s value=0x%llx",
+					r.name, static_cast<unsigned long long>(r.value));
+			}
+			if (rclicked && r.editable) {
+				ui.cpu_context_reg_idx = i;
+				ui.cpu_context_open = true;
+				diag::log_tagged_fmt("cpu_view",
+					"reg_rclick name=%s value=0x%llx",
+					r.name, static_cast<unsigned long long>(r.value));
+			}
+		}
+	}
+	clipper.End();
+
+	ui.cpu_reg_scroll_y = ImGui::GetScrollY();
+
+	ImGui::EndChild();
+	ImGui::PopID();
+
+	draw_glass_card(dl, ImVec2(left_x, flags_y0),
+		ImVec2(left_x + left_w, flags_y1), 10.f, a);
+	draw_panel_header(dl, left_x, flags_y0, left_w, "RFLAGS", a);
+
+	struct flag_def_t {
+		const char* short_name;
+		const char* full_name;
+		uint64_t    mask;
+	};
+	flag_def_t flag_defs[] = {
+		{"CF", "Carry",      0x00000001ULL},
+		{"PF", "Parity",     0x00000004ULL},
+		{"AF", "Aux Carry",  0x00000010ULL},
+		{"ZF", "Zero",       0x00000040ULL},
+		{"SF", "Sign",       0x00000080ULL},
+		{"OF", "Overflow",   0x00000800ULL},
+		{"TF", "Trap",       0x00000100ULL},
+		{"IF", "Interrupt",  0x00000200ULL},
+		{"DF", "Direction",  0x00000400ULL},
+		{"NT", "Nested",     0x00004000ULL},
+		{"RF", "Resume",     0x00010000ULL},
+		{"AC", "AlignCheck", 0x00040000ULL},
+	};
+	int flag_n = static_cast<int>(sizeof(flag_defs) / sizeof(flag_defs[0]));
+
+	float fcols = 2.f;
+	float frows = static_cast<float>((flag_n + 1) / 2);
+	float fpad_inner = 8.f;
+	float favail_w = left_w - fpad_inner * (fcols + 1.f);
+	float fchip_w = favail_w / fcols;
+	float favail_h = flags_y1 - (flags_y0 + HEADER_H + 6.f) - fpad_inner;
+	float fchip_h = (favail_h - fpad_inner * (frows - 1.f)) / frows;
+	if (fchip_h < 22.f) fchip_h = 22.f;
+	if (fchip_h > 36.f) fchip_h = 36.f;
+
+	for (int i = 0; i < flag_n; ++i) {
+		int col = i % 2;
+		int row = i / 2;
+		bool set_bit = (regs.rflags & flag_defs[i].mask) != 0;
+		float bx = left_x + fpad_inner + static_cast<float>(col) * (fchip_w + fpad_inner);
+		float by = flags_y0 + HEADER_H + 6.f
+		         + static_cast<float>(row) * (fchip_h + fpad_inner);
+
+		ImGui::SetCursorScreenPos(ImVec2(bx, by));
+		ImGui::PushID(i + 0xF1000);
+		ImGui::InvisibleButton("##cpu_flag", ImVec2(fchip_w, fchip_h));
+		bool hov = ImGui::IsItemHovered();
+		bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+		ImGui::PopID();
+
+		ImU32 bg_col = set_bit ? aida::ui::mix(t.panel_header, t.success, 0.35f)
+		                       : t.panel_header;
+		if (hov) bg_col = aida::ui::mix(bg_col, t.hover_wash, 0.55f);
+		dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + fchip_w, by + fchip_h),
+			with_a(bg_col, a), 6.f);
+		ImU32 border = set_bit ? aida::ui::mix(t.success, t.accent_u32, 0.25f)
+		                       : t.border_subtle;
+		dl->AddRect(ImVec2(bx, by), ImVec2(bx + fchip_w, by + fchip_h),
+			with_a(border, a * (set_bit ? 0.95f : 0.65f)), 6.f, 0, 1.f);
+
+		ImU32 led = set_bit ? t.success : t.text_dim;
+		dl->AddCircleFilled(ImVec2(bx + 14.f, by + fchip_h * 0.5f), 5.f,
+			with_a(led, a * 0.30f), 16);
+		dl->AddCircleFilled(ImVec2(bx + 14.f, by + fchip_h * 0.5f), 3.f,
+			with_a(led, a * (set_bit ? 1.f : 0.55f)), 16);
+
+		ImFont* fnt = aida::ui::fonts::body_em();
+		if (!fnt) fnt = ImGui::GetFont();
+		dl->AddText(fnt, fnt->FontSize,
+			ImVec2(bx + 28.f, by + (fchip_h - fnt->FontSize) * 0.5f),
+			with_a(set_bit ? t.text_primary : t.text_secondary, a),
+			flag_defs[i].short_name);
+
+		ImFont* sf = aida::ui::fonts::caption();
+		if (!sf) sf = ImGui::GetFont();
+		float full_x = bx + 60.f;
+		dl->AddText(sf, sf->FontSize,
+			ImVec2(full_x, by + (fchip_h - sf->FontSize) * 0.5f),
+			with_a(t.text_dim, a * 0.95f), flag_defs[i].full_name);
+
+		ImFont* cf = aida::ui::fonts::code();
+		if (!cf) cf = ImGui::GetFont();
+		const char* bit_str = set_bit ? "1" : "0";
+		ImVec2 bs = cf->CalcTextSizeA(cf->FontSize, FLT_MAX, 0.f, bit_str);
+		dl->AddText(cf, cf->FontSize,
+			ImVec2(bx + fchip_w - bs.x - 10.f, by + (fchip_h - bs.y) * 0.5f),
+			with_a(set_bit ? t.success : t.text_dim, a), bit_str);
+
+		if (clicked) {
+			uint64_t new_rflags = regs.rflags ^ flag_defs[i].mask;
+			bool ok = debugger_engine::set_register("rflags", new_rflags);
+			diag::log_tagged_critical_fmt("cpu_view",
+				"flag_toggle name=%s mask=0x%llx new_rflags=0x%llx ok=%d",
+				flag_defs[i].short_name,
+				static_cast<unsigned long long>(flag_defs[i].mask),
+				static_cast<unsigned long long>(new_rflags),
+				ok ? 1 : 0);
+			anti_tamper::webhook::write_log("dbg_audit", ok
+				? "[dbg_audit] cpu flag_toggle ok=1"
+				: "[dbg_audit] cpu flag_toggle fail reason=set_register_failed");
+			if (!ok) {
+				toast_notification::push("Failed to toggle flag: " +
+					debugger_engine::last_error(),
+					toast_notification::toast_type_t::error);
+			} else {
+				debugger_engine::invalidate_cache();
+			}
+		}
+	}
+
+	render_cpu_disasm_slice(dl, right_x, disasm_y0, right_w, disasm_h, regs.rip, a);
+	render_cpu_stack_view(dl, right_x, stack_y0, right_w, stack_h, regs.rsp, a);
+
+	if (ui.cpu_context_open) {
+		ImGui::OpenPopup("##cpu_reg_context");
+		ui.cpu_context_open = false;
+		diag::log_tagged_fmt("cpu_view", "reg_context_open");
+	}
+	if (ImGui::BeginPopup("##cpu_reg_context")) {
+		if (ui.cpu_context_reg_idx >= 0 && ui.cpu_context_reg_idx < rows_n) {
+			const auto& r = rows[static_cast<size_t>(ui.cpu_context_reg_idx)];
+			ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.f),
+				"%s = 0x%016llX", r.name,
+				static_cast<unsigned long long>(r.value));
+			ImGui::Separator();
+			if (ImGui::MenuItem("Edit value...")) {
+				cpu_view_detail::open_edit_modal(ui.cpu_context_reg_idx, r.value);
+				diag::log_tagged_critical_fmt("cpu_view",
+					"reg_context_edit name=%s value=0x%llx",
+					r.name, static_cast<unsigned long long>(r.value));
+			}
+			if (ImGui::MenuItem("Copy hex (0x...)")) {
+				copy_addr_to_clipboard(r.value);
+				diag::log_tagged_fmt("cpu_view",
+					"reg_context_copy_hex name=%s value=0x%llx",
+					r.name, static_cast<unsigned long long>(r.value));
+			}
+			if (ImGui::MenuItem("Copy decimal")) {
+				char dbuf[32];
+				std::snprintf(dbuf, sizeof(dbuf), "%llu",
+					static_cast<unsigned long long>(r.value));
+				copy_to_clipboard(dbuf);
+				diag::log_tagged_fmt("cpu_view",
+					"reg_context_copy_dec name=%s value=%llu",
+					r.name, static_cast<unsigned long long>(r.value));
+			}
+			ImGui::Separator();
+			if (ImGui::MenuItem("Follow in disasm", nullptr, false, r.value != 0)) {
+				jump_to_disasm(r.value);
+				diag::log_tagged_critical_fmt("cpu_view",
+					"reg_context_follow_disasm name=%s value=0x%llx",
+					r.name, static_cast<unsigned long long>(r.value));
+			}
+			if (ImGui::MenuItem("Follow in hex dump", nullptr, false, r.value != 0)) {
+				jump_to_hex(r.value, 256);
+				diag::log_tagged_critical_fmt("cpu_view",
+					"reg_context_follow_hex name=%s value=0x%llx",
+					r.name, static_cast<unsigned long long>(r.value));
+			}
+			ImGui::Separator();
+			if (ImGui::MenuItem("Set to zero")) {
+				std::string lname = cpu_view_detail::lowercase_reg_name(r.name);
+				bool ok = debugger_engine::set_register(lname, 0);
+				diag::log_tagged_critical_fmt("cpu_view",
+					"reg_context_zero name=%s ok=%d", r.name, ok ? 1 : 0);
+				if (ok) {
+					debugger_engine::invalidate_cache();
+					toast_notification::push("Register cleared.",
+						toast_notification::toast_type_t::info);
+				} else {
+					toast_notification::push("Set zero failed: " +
+						debugger_engine::last_error(),
+						toast_notification::toast_type_t::error);
+				}
+			}
+		}
+		ImGui::EndPopup();
+	}
+
+	if (ui.cpu_stack_context_open) {
+		ImGui::OpenPopup("##cpu_stack_context");
+		ui.cpu_stack_context_open = false;
+		diag::log_tagged_fmt("cpu_view", "stack_context_open");
+	}
+	if (ImGui::BeginPopup("##cpu_stack_context")) {
+		int idx = ui.cpu_stack_context_idx;
+		uint64_t qaddr = regs.rsp + static_cast<uint64_t>(idx) * 8ULL;
+		uint64_t qval = 0;
+		uint64_t scache_base = 0;
+		auto sb = debugger_engine::cached_stack_bytes(scache_base);
+		size_t qoff = static_cast<size_t>(idx) * 8u;
+		if (scache_base == regs.rsp && qoff + 8 <= sb.size())
+			std::memcpy(&qval, sb.data() + qoff, sizeof(uint64_t));
+		ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.f),
+			"[rsp+%02X] @ 0x%016llX = 0x%016llX",
+			static_cast<unsigned>(idx) * 8u,
+			static_cast<unsigned long long>(qaddr),
+			static_cast<unsigned long long>(qval));
+		ImGui::Separator();
+		if (ImGui::MenuItem("Copy slot address")) {
+			copy_addr_to_clipboard(qaddr);
+			diag::log_tagged_fmt("cpu_view", "stack_context_copy_addr addr=0x%llx",
+				static_cast<unsigned long long>(qaddr));
+		}
+		if (ImGui::MenuItem("Copy qword value")) {
+			copy_addr_to_clipboard(qval);
+			diag::log_tagged_fmt("cpu_view", "stack_context_copy_val val=0x%llx",
+				static_cast<unsigned long long>(qval));
+		}
+		ImGui::Separator();
+		if (ImGui::MenuItem("Follow value in disasm",
+			nullptr, false, cpu_view_detail::is_likely_pointer(qval))) {
+			jump_to_disasm(qval);
+			diag::log_tagged_critical_fmt("cpu_view",
+				"stack_context_follow_disasm val=0x%llx",
+				static_cast<unsigned long long>(qval));
+		}
+		if (ImGui::MenuItem("Follow value in hex dump",
+			nullptr, false, cpu_view_detail::is_likely_pointer(qval))) {
+			jump_to_hex(qval, 256);
+			diag::log_tagged_critical_fmt("cpu_view",
+				"stack_context_follow_hex val=0x%llx",
+				static_cast<unsigned long long>(qval));
+		}
+		ImGui::EndPopup();
+	}
+
+	if (ui.cpu_disasm_context_open) {
+		ImGui::OpenPopup("##cpu_disasm_context");
+		ui.cpu_disasm_context_open = false;
+		diag::log_tagged_fmt("cpu_view", "disasm_context_open");
+	}
+	if (ImGui::BeginPopup("##cpu_disasm_context")) {
+		ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.f),
+			"Instruction @ 0x%016llX",
+			static_cast<unsigned long long>(ui.cpu_disasm_context_addr));
+		ImGui::Separator();
+		if (ImGui::MenuItem("Copy address")) {
+			copy_addr_to_clipboard(ui.cpu_disasm_context_addr);
+			diag::log_tagged_fmt("cpu_view",
+				"disasm_context_copy_addr addr=0x%llx",
+				static_cast<unsigned long long>(ui.cpu_disasm_context_addr));
+		}
+		if (ImGui::MenuItem("Open in disassembly view")) {
+			jump_to_disasm(ui.cpu_disasm_context_addr);
+			diag::log_tagged_critical_fmt("cpu_view",
+				"disasm_context_open_in_disasm addr=0x%llx",
+				static_cast<unsigned long long>(ui.cpu_disasm_context_addr));
+		}
+		if (ImGui::MenuItem("Follow branch target",
+			nullptr, false, ui.cpu_disasm_context_target != 0)) {
+			jump_to_disasm(ui.cpu_disasm_context_target);
+			diag::log_tagged_critical_fmt("cpu_view",
+				"disasm_context_follow_target target=0x%llx",
+				static_cast<unsigned long long>(ui.cpu_disasm_context_target));
+		}
+		ImGui::Separator();
+		if (ImGui::MenuItem("Set RIP to here")) {
+			bool ok = debugger_engine::set_register("rip",
+				ui.cpu_disasm_context_addr);
+			diag::log_tagged_critical_fmt("cpu_view",
+				"disasm_context_set_rip addr=0x%llx ok=%d",
+				static_cast<unsigned long long>(ui.cpu_disasm_context_addr),
+				ok ? 1 : 0);
+			if (ok) {
+				debugger_engine::invalidate_cache();
+				toast_notification::push("RIP updated.",
+					toast_notification::toast_type_t::info);
+			} else {
+				toast_notification::push("Set RIP failed: " +
+					debugger_engine::last_error(),
+					toast_notification::toast_type_t::error);
+			}
+		}
+		ImGui::EndPopup();
+	}
+
+	if (ui.cpu_edit_popup_open) {
+		ImGui::OpenPopup("Edit Register##cpu");
+		ui.cpu_edit_popup_open = false;
+		diag::log_tagged_fmt("cpu_view", "edit_modal_open idx=%d",
+			ui.cpu_edit_reg_idx);
+	}
+	if (ImGui::BeginPopupModal("Edit Register##cpu", nullptr,
+		ImGuiWindowFlags_AlwaysAutoResize)) {
+		if (ui.cpu_edit_reg_idx >= 0 && ui.cpu_edit_reg_idx < rows_n) {
+			const auto& er = rows[static_cast<size_t>(ui.cpu_edit_reg_idx)];
+			ImGui::Text("Register: %s", er.name);
+			ImGui::Text("Current:  0x%016llX",
+				static_cast<unsigned long long>(er.value));
+			ImGui::Separator();
+			ImGui::SetNextItemWidth(220.f);
+			ImGui::InputText("##cpu_edit_val", ui.cpu_edit_value_buf,
+				sizeof(ui.cpu_edit_value_buf),
+				ImGuiInputTextFlags_CharsHexadecimal |
+				ImGuiInputTextFlags_AutoSelectAll);
+			ImGui::Separator();
+			if (ImGui::Button("Apply", ImVec2(110.f, 0.f))) {
+				uint64_t new_val = parse_hex_address(ui.cpu_edit_value_buf);
+				std::string lname = cpu_view_detail::lowercase_reg_name(er.name);
+				bool ok = debugger_engine::set_register(lname, new_val);
+				diag::log_tagged_critical_fmt("cpu_view",
+					"edit_modal_apply name=%s new=0x%llx ok=%d err='%s'",
+					lname.c_str(),
+					static_cast<unsigned long long>(new_val),
+					ok ? 1 : 0,
+					debugger_engine::last_error().c_str());
+				anti_tamper::webhook::write_log("dbg_audit", ok
+					? "[dbg_audit] cpu reg_edit ok=1"
+					: "[dbg_audit] cpu reg_edit fail reason=set_register_failed");
+				if (!ok) {
+					toast_notification::push("Edit register failed: " +
+						debugger_engine::last_error(),
+						toast_notification::toast_type_t::error);
+				} else {
+					debugger_engine::invalidate_cache();
+					toast_notification::push("Register updated.",
+						toast_notification::toast_type_t::info);
+				}
+				ui.cpu_edit_reg_idx = -1;
+				ImGui::CloseCurrentPopup();
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Cancel", ImVec2(110.f, 0.f))) {
+				diag::log_tagged_fmt("cpu_view", "edit_modal_cancel");
+				ui.cpu_edit_reg_idx = -1;
+				ImGui::CloseCurrentPopup();
+			}
+		}
+		ImGui::EndPopup();
+	}
+}
+
+
+static void render_cfg_overlay(ImDrawList* dl, float ox, float oy, float w, float a) {
+	auto& ui = g_ui;
+	(void)dl;
+	(void)w;
+	(void)a;
+
+	{
+		static bool s_logged_once = false;
+		if (!s_logged_once) {
+			s_logged_once = true;
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] cfg enter ok=1");
+		}
+	}
+
+	float overlay_h = 36.f;
+	float pad = 8.f;
+	float btn_h = 22.f;
+	float btn_w = 140.f;
+	float btn_gap = 6.f;
+
+	uint64_t rip = debugger_engine::cached_registers().rip;
+	bool can_build = rip != 0;
+
+	ImGui::SetCursorScreenPos(ImVec2(ox + pad, oy + (overlay_h - btn_h) * 0.5f));
+	ImGui::PushID("##cfg_overlay");
+	bool build_clicked = aida::ui::button(
+		can_build ? "Build CFG at RIP" : "Build CFG (no RIP)",
+		aida::ui::button_kind_t::primary,
+		aida::ui::size_t_::sm, ImVec2(btn_w, btn_h),
+		!can_build);
+	if (build_clicked && can_build) {
+		cfg_view::build_cfg(rip);
+		ui.cfg_last_built_addr = rip;
+		diag::log_tagged_critical_fmt("cfg",
+			"cfg_build_from_debugger rip=0x%llx",
+			static_cast<unsigned long long>(rip));
+		anti_tamper::webhook::write_log("dbg_audit",
+			"[dbg_audit] cfg build_at_rip ok=1");
+	}
+	ImGui::SameLine(0.f, btn_gap);
+	bool open_full = aida::ui::button("Open in Graph View",
+		aida::ui::button_kind_t::secondary,
+		aida::ui::size_t_::sm, ImVec2(btn_w + 20.f, btn_h),
+		!can_build && ui.cfg_last_built_addr == 0);
+	if (open_full) {
+		uint64_t target_addr = can_build ? rip : ui.cfg_last_built_addr;
+		if (target_addr != 0) {
+			globals::ui::active_center_view = center_view_t::graph_view;
+			cfg_view::build_cfg(target_addr);
+			ui.cfg_last_built_addr = target_addr;
+			diag::log_tagged_critical_fmt("cfg",
+				"cfg_open_graph_view target=0x%llx",
+				static_cast<unsigned long long>(target_addr));
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] cfg open_full ok=1");
+		} else {
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] cfg open_full fail reason=no_address");
+		}
+	}
+	ImGui::PopID();
+}
+
+static void render_modules_overlay(ImDrawList* dl, float ox, float oy, float w, float a) {
+	const auto& t = aida::ui::resolved();
+
+	{
+		static bool s_logged_once = false;
+		if (!s_logged_once) {
+			s_logged_once = true;
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] modules enter ok=1");
+		}
+	}
+
+	float overlay_h = 36.f;
+	float pad = 8.f;
+	float btn_h = 22.f;
+	float btn_w = 120.f;
+	float btn_gap = 6.f;
+
+	bool can_act = driver_bridge::attached_pid() != 0;
+
+	ImGui::SetCursorScreenPos(ImVec2(ox + pad, oy + (overlay_h - btn_h) * 0.5f));
+	ImGui::PushID("##modules_overlay");
+	bool dump_clicked = aida::ui::button("Dump Selected",
+		aida::ui::button_kind_t::primary,
+		aida::ui::size_t_::sm, ImVec2(btn_w, btn_h),
+		!can_act);
+	if (dump_clicked) {
+		uint64_t base = 0;
+		uint64_t size = 0;
+		std::string name;
+		{
+			std::lock_guard<std::mutex> lk(module_view::g_ui.modules_mutex);
+			int sel = module_view::g_ui.selected_module;
+			if (sel >= 0 && sel < static_cast<int>(module_view::g_ui.modules.size())) {
+				base = module_view::g_ui.modules[sel].base;
+				size = static_cast<uint64_t>(module_view::g_ui.modules[sel].size);
+				name = module_view::g_ui.modules[sel].name;
+			}
+		}
+		if (base == 0 || size == 0) {
+			toast_notification::push("Select a module first.",
+				toast_notification::toast_type_t::warning);
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] modules dump fail reason=no_selection");
+		} else {
+			const uint64_t cap = 256ULL * 1024ULL * 1024ULL;
+			if (size > cap) {
+				toast_notification::push("Module exceeds 256 MiB dump cap.",
+					toast_notification::toast_type_t::warning);
+				anti_tamper::webhook::write_log("dbg_audit",
+					"[dbg_audit] modules dump fail reason=cap_exceeded");
+			} else {
+				char default_name[160] = {};
+				std::snprintf(default_name, sizeof(default_name),
+					"%s_%016llX.bin",
+					name.empty() ? "module" : name.c_str(),
+					static_cast<unsigned long long>(base));
+				char path_buf[MAX_PATH] = {};
+				std::strncpy(path_buf, default_name, sizeof(path_buf) - 1);
+				static const char k_module_filter[] =
+					"Binary (*.bin)\0*.bin\0DLL (*.dll)\0*.dll\0EXE (*.exe)\0*.exe\0All files (*.*)\0*.*\0\0";
+				if (win32_dialog::show_save_file_dialog(g_hwnd,
+						"Dump Module",
+						k_module_filter,
+						"bin",
+						path_buf, sizeof(path_buf),
+						"debugger_view::modules_dump")) {
+					uint64_t base_copy = base;
+					uint64_t size_copy = size;
+					std::string path_copy = path_buf;
+					std::string name_copy = name;
+					work_queue::post([base_copy, size_copy, path_copy, name_copy]() {
+						std::vector<uint8_t> buf;
+						bool read_ok = driver_bridge::read_memory(base_copy,
+							static_cast<size_t>(size_copy), buf);
+						bool write_ok = false;
+						if (read_ok && !buf.empty()) {
+							std::ofstream ofs(path_copy,
+								std::ios::binary | std::ios::trunc);
+							if (ofs.is_open()) {
+								ofs.write(reinterpret_cast<const char*>(buf.data()),
+									static_cast<std::streamsize>(buf.size()));
+								ofs.close();
+								write_ok = true;
+							}
+						}
+						diag::log_tagged_critical_fmt("modules",
+							"modules_dump name='%s' base=0x%llx size=%llu read=%d write=%d path='%s'",
+							name_copy.c_str(),
+							static_cast<unsigned long long>(base_copy),
+							static_cast<unsigned long long>(size_copy),
+							read_ok ? 1 : 0,
+							write_ok ? 1 : 0,
+							path_copy.c_str());
+						anti_tamper::webhook::write_log("dbg_audit", write_ok
+							? "[dbg_audit] modules dump ok=1"
+							: "[dbg_audit] modules dump fail reason=read_or_write_failed");
+						if (write_ok) {
+							char msg[MAX_PATH + 96];
+							std::snprintf(msg, sizeof(msg),
+								"Dumped %llu bytes from %s to %s",
+								static_cast<unsigned long long>(buf.size()),
+								name_copy.c_str(), path_copy.c_str());
+							toast_notification::push(msg,
+								toast_notification::toast_type_t::info);
+						} else {
+							toast_notification::push("Module dump failed.",
+								toast_notification::toast_type_t::error);
+						}
+					});
+				}
+			}
+		}
+	}
+	ImGui::SameLine(0.f, btn_gap);
+
+	bool inject_clicked = aida::ui::button("Inject DLL...",
+		aida::ui::button_kind_t::secondary,
+		aida::ui::size_t_::sm, ImVec2(btn_w, btn_h),
+		true);
+	if (inject_clicked) {
+		anti_tamper::webhook::write_log("dbg_audit",
+			"[dbg_audit] BROKEN feature=modules_inject_dll reason=driver_bridge_has_no_LoadLibrary_helper");
+	}
+	if (ImGui::IsItemHovered())
+		ImGui::SetTooltip(
+			"Inject DLL is not wired: driver_bridge does not expose a remote LoadLibrary helper. "
+			"Use the manual mapper from the disassembly toolbar instead.");
+	ImGui::SameLine(0.f, btn_gap);
+
+	bool unload_clicked = aida::ui::button("Unload Module",
+		aida::ui::button_kind_t::secondary,
+		aida::ui::size_t_::sm, ImVec2(btn_w, btn_h),
+		true);
+	if (unload_clicked) {
+		anti_tamper::webhook::write_log("dbg_audit",
+			"[dbg_audit] BROKEN feature=modules_unload reason=driver_bridge_has_no_FreeLibrary_helper");
+	}
+	if (ImGui::IsItemHovered())
+		ImGui::SetTooltip(
+			"Unload Module is not wired: driver_bridge does not expose a remote FreeLibrary helper. "
+			"Detach and use Process Hacker to unload.");
+	ImGui::PopID();
+
+	float cb_y = oy + overlay_h + 2.f;
+	float cb_h = 20.f;
+	float cb_w = w - 24.f;
+	ui_anim::render_inline_callout(dl, ox + 12.f, cb_y, cb_w, cb_h,
+		"Inject DLL and Unload Module are unavailable in this build (driver helpers missing). Dump uses kernel read_memory.",
+		ui_anim::callout_kind_t::info,
+		t.accent.x, t.accent.y, t.accent.z, a);
+}
+
+static void render_seh_overlay(ImDrawList* dl, float ox, float oy, float w, float a) {
+	auto& ui = g_ui;
+	const auto& t = aida::ui::resolved();
+
+	{
+		static bool s_logged_once = false;
+		if (!s_logged_once) {
+			s_logged_once = true;
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] seh enter ok=1");
+		}
+	}
+
+	float overlay_h = 36.f;
+	float pad = 8.f;
+	float btn_h = 22.f;
+	float btn_w = 200.f;
+
+	ImGui::SetCursorScreenPos(ImVec2(ox + pad, oy + (overlay_h - btn_h) * 0.5f));
+	ImGui::PushID("##seh_overlay");
+	bool break_clicked = aida::ui::button(
+		ui.seh_break_request_active
+			? "Break on Next Exception (armed)"
+			: "Break on Next Exception",
+		ui.seh_break_request_active
+			? aida::ui::button_kind_t::destructive
+			: aida::ui::button_kind_t::secondary,
+		aida::ui::size_t_::sm, ImVec2(btn_w + 40.f, btn_h),
+		true);
+	if (break_clicked) {
+		anti_tamper::webhook::write_log("dbg_audit",
+			"[dbg_audit] BROKEN feature=seh_break_on_exception reason=driver_bridge_has_no_debug_event_subscription");
+	}
+	if (ImGui::IsItemHovered())
+		ImGui::SetTooltip(
+			"Break on Exception requires a debug-event subscription that this build's driver_bridge does not expose. "
+			"Use a HW BP on the SEH handler address instead.");
+	ImGui::PopID();
+
+	float cb_y = oy + overlay_h + 2.f;
+	float cb_h = 20.f;
+	float cb_w = w - 24.f;
+	ui_anim::render_inline_callout(dl, ox + 12.f, cb_y, cb_w, cb_h,
+		"Break-on-next-exception is unavailable (no debug-event channel). Use HW exec breakpoint on the handler address instead.",
+		ui_anim::callout_kind_t::warn,
+		t.accent.x, t.accent.y, t.accent.z, a);
 }
 
 
@@ -1054,6 +2329,15 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
 
+	{
+		static bool s_logged_once = false;
+		if (!s_logged_once) {
+			s_logged_once = true;
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] breakpoints enter ok=1");
+		}
+	}
+
 	float bar_h = 40.f;
 	render_breakpoint_actions(dl, ox, oy, w, a);
 
@@ -1061,9 +2345,9 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 	{
 		ui_anim::table_col_t cols[] = {
 			{"#", 26.f}, {"State", 70.f}, {"Address", 170.f},
-			{"Type", 110.f}, {"Hits", 70.f}, {"Name", 240.f}
+			{"Type", 110.f}, {"Hits", 70.f}, {"Name", 180.f}, {"Actions", 0.f}
 		};
-		draw_table_header(dl, ox, table_y, w, cols, 6, a);
+		draw_table_header(dl, ox, table_y, w, cols, 7, a);
 	}
 
 	std::vector<debugger_engine::breakpoint_t> snapshot;
@@ -1093,7 +2377,7 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 				- ImGui::GetScrollY()));
 			ImVec2 row_min = ImGui::GetCursorScreenPos();
 			ImGui::PushID(i);
-			ImGui::InvisibleButton("##br", ImVec2(w - 18.f, ROW_HEIGHT));
+			ImGui::InvisibleButton("##br", ImVec2(w - 18.f - 220.f, ROW_HEIGHT));
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 			bool dclicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && hov;
@@ -1171,6 +2455,77 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 				dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 490.f, ry + 5.f),
 				            with_a(t.text_primary, a), bp.name.c_str());
 
+			float bp_act_btn_h = 18.f;
+			float bp_act_btn_y = ry + (ROW_HEIGHT - bp_act_btn_h) * 0.5f;
+			float bp_act_btn_w = 56.f;
+			float bp_act_btn_gap = 4.f;
+			float bp_act_x = ox + w - 218.f;
+
+			ImGui::SetCursorScreenPos(ImVec2(bp_act_x, bp_act_btn_y));
+			ImGui::PushID(i + 0xC0000);
+			bool bp_goto_clicked = aida::ui::button("Jump",
+				aida::ui::button_kind_t::secondary,
+				aida::ui::size_t_::sm, ImVec2(bp_act_btn_w, bp_act_btn_h));
+			ImGui::PopID();
+			if (bp_goto_clicked) {
+				bool ok = jump_to_disasm(bp.address);
+				diag::log_tagged_fmt("bp",
+					"bp_jump idx=%d addr=0x%llx ok=%d",
+					i,
+					static_cast<unsigned long long>(bp.address),
+					ok ? 1 : 0);
+				anti_tamper::webhook::write_log("dbg_audit", ok
+					? "[dbg_audit] bp jump ok=1"
+					: "[dbg_audit] bp jump fail reason=zero_addr");
+			}
+
+			ImGui::SetCursorScreenPos(ImVec2(bp_act_x + (bp_act_btn_w + bp_act_btn_gap),
+				bp_act_btn_y));
+			ImGui::PushID(i + 0xC1000);
+			bool bp_edit_clicked = aida::ui::button("Edit",
+				aida::ui::button_kind_t::secondary,
+				aida::ui::size_t_::sm, ImVec2(bp_act_btn_w, bp_act_btn_h));
+			ImGui::PopID();
+			if (bp_edit_clicked) {
+				ui.bp_edit_idx = i;
+				std::snprintf(ui.bp_edit_condition_buf,
+					sizeof(ui.bp_edit_condition_buf), "%s", bp.condition.c_str());
+				std::snprintf(ui.bp_edit_log_buf, sizeof(ui.bp_edit_log_buf),
+					"%s", bp.log_text.c_str());
+				ui.bp_edit_auto_continue = bp.auto_continue;
+				ui.bp_edit_popup_open = true;
+				anti_tamper::webhook::write_log("dbg_audit",
+					"[dbg_audit] bp edit_open ok=1");
+			}
+
+			ImGui::SetCursorScreenPos(ImVec2(bp_act_x + (bp_act_btn_w + bp_act_btn_gap) * 2.f,
+				bp_act_btn_y));
+			ImGui::PushID(i + 0xC2000);
+			bool bp_del_clicked = aida::ui::button("Del",
+				aida::ui::button_kind_t::destructive,
+				aida::ui::size_t_::sm, ImVec2(bp_act_btn_w, bp_act_btn_h));
+			ImGui::PopID();
+			if (bp_del_clicked) {
+				uint64_t addr_log = bp.address;
+				bool ok = debugger_engine::remove_breakpoint(i);
+				diag::log_tagged_critical_fmt("bp",
+					"bp_remove_row idx=%d addr=0x%llx ok=%d err='%s'",
+					i,
+					static_cast<unsigned long long>(addr_log),
+					ok ? 1 : 0,
+					debugger_engine::last_error().c_str());
+				anti_tamper::webhook::write_log("dbg_audit", ok
+					? "[dbg_audit] bp delete ok=1"
+					: "[dbg_audit] bp delete fail reason=remove_failed");
+				if (!ok) {
+					toast_notification::push("Delete failed: " +
+						debugger_engine::last_error(),
+						toast_notification::toast_type_t::error);
+				} else if (ui.bp_panel.selected == i) {
+					ui.bp_panel.selected = -1;
+				}
+			}
+
 			if (clicked) ui.bp_panel.selected = i;
 			if (dclicked) {
 				diag::log_tagged_fmt("bp",
@@ -1183,6 +2538,9 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 					i,
 					ok ? 1 : 0,
 					debugger_engine::last_error().c_str());
+				anti_tamper::webhook::write_log("dbg_audit", ok
+					? "[dbg_audit] bp toggle ok=1"
+					: "[dbg_audit] bp toggle fail reason=toggle_failed");
 			}
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
 				copy_addr_to_clipboard(bp.address);
@@ -1202,11 +2560,89 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 		es.body  = "Type an address above and click Add to set a software breakpoint.";
 		aida::ui::empty_state::render(ImVec2(ox, content_y), ImVec2(w, visible_h), es);
 	}
+
+	if (ui.bp_edit_popup_open) {
+		ImGui::OpenPopup("Edit Breakpoint##bp");
+		ui.bp_edit_popup_open = false;
+	}
+	if (ImGui::BeginPopupModal("Edit Breakpoint##bp", nullptr,
+		ImGuiWindowFlags_AlwaysAutoResize)) {
+		if (ui.bp_edit_idx >= 0 &&
+			ui.bp_edit_idx < static_cast<int>(snapshot.size())) {
+			auto& bp_edit = snapshot[static_cast<size_t>(ui.bp_edit_idx)];
+			ImGui::Text("Address: 0x%016llX",
+				static_cast<unsigned long long>(bp_edit.address));
+			ImGui::Text("Type:    %s",
+				bp_edit.type == debugger_engine::bp_type_t::software ? "Software"
+				: bp_edit.type == debugger_engine::bp_type_t::hardware_execute ? "HW Exec"
+				: bp_edit.type == debugger_engine::bp_type_t::hardware_write   ? "HW Write"
+				: bp_edit.type == debugger_engine::bp_type_t::hardware_read    ? "HW Read"
+				: "Memory");
+			ImGui::Separator();
+			ImGui::Text("Condition (evaluated when hit, 0 = skip):");
+			ImGui::SetNextItemWidth(360.f);
+			ImGui::InputText("##bp_cond_edit", ui.bp_edit_condition_buf,
+				sizeof(ui.bp_edit_condition_buf));
+			ImGui::Text("Log message (use {RAX}, {[RSP+8]} placeholders):");
+			ImGui::SetNextItemWidth(360.f);
+			ImGui::InputText("##bp_log_edit", ui.bp_edit_log_buf,
+				sizeof(ui.bp_edit_log_buf));
+			ImGui::Checkbox("Auto-continue after log", &ui.bp_edit_auto_continue);
+			ImGui::Separator();
+			if (ImGui::Button("Apply", ImVec2(110.f, 0.f))) {
+				bool ok_cond = debugger_engine::set_breakpoint_condition(
+					ui.bp_edit_idx, ui.bp_edit_condition_buf);
+				bool ok_log = debugger_engine::set_breakpoint_log(
+					ui.bp_edit_idx, ui.bp_edit_log_buf, ui.bp_edit_auto_continue);
+				diag::log_tagged_critical_fmt("bp",
+					"bp_edit_apply idx=%d cond_ok=%d log_ok=%d cond='%s' log='%s' auto=%d",
+					ui.bp_edit_idx,
+					ok_cond ? 1 : 0,
+					ok_log ? 1 : 0,
+					ui.bp_edit_condition_buf,
+					ui.bp_edit_log_buf,
+					ui.bp_edit_auto_continue ? 1 : 0);
+				anti_tamper::webhook::write_log("dbg_audit", (ok_cond && ok_log)
+					? "[dbg_audit] bp edit_apply ok=1"
+					: "[dbg_audit] bp edit_apply fail reason=engine_rejected");
+				if (!ok_cond || !ok_log) {
+					toast_notification::push(
+						"Edit failed: " + debugger_engine::last_error(),
+						toast_notification::toast_type_t::error);
+				} else {
+					toast_notification::push("Breakpoint updated.",
+						toast_notification::toast_type_t::info);
+				}
+				ui.bp_edit_idx = -1;
+				ImGui::CloseCurrentPopup();
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Cancel", ImVec2(110.f, 0.f))) {
+				ui.bp_edit_idx = -1;
+				ImGui::CloseCurrentPopup();
+			}
+		} else {
+			ImGui::Text("Selection no longer valid.");
+			if (ImGui::Button("Close", ImVec2(110.f, 0.f))) {
+				ui.bp_edit_idx = -1;
+				ImGui::CloseCurrentPopup();
+			}
+		}
+		ImGui::EndPopup();
+	}
 }
 
 
 static void render_memmap(ImDrawList* dl, float ox, float oy, float w, float h, float a) {
 	(void)dl;
+	{
+		static bool s_logged_once = false;
+		if (!s_logged_once) {
+			s_logged_once = true;
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] memmap enter ok=1");
+		}
+	}
 	memory_map_view::render(ox, oy, w, h, a,
 		aida::ui::resolved().accent.x,
 		aida::ui::resolved().accent.y,
@@ -1218,6 +2654,46 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 	auto& st = debugger_engine::g_state;
 	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
+
+	{
+		static bool s_logged_once = false;
+		if (!s_logged_once) {
+			s_logged_once = true;
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] callstack enter ok=1");
+		}
+	}
+
+	if (driver_bridge::attached_pid() == 0) {
+		float cw = std::min(w - 40.f, 620.f);
+		if (cw < 220.f) cw = std::max(220.f, w - 20.f);
+		float cx = ox + (w - cw) * 0.5f;
+		float cy = oy + h * 0.5f - 26.f;
+		ui_anim::render_inline_callout(dl, cx, cy, cw, 52.f,
+			"Attach to a process and pause it to capture a call stack.",
+			ui_anim::callout_kind_t::warn, t.accent.x, t.accent.y, t.accent.z, a);
+		return;
+	}
+
+	{
+		static std::atomic<uint64_t> s_last_refresh_ms{0};
+		static std::atomic<bool> s_in_flight{false};
+		uint64_t now_ms = static_cast<uint64_t>(
+			std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count());
+		uint64_t last = s_last_refresh_ms.load(std::memory_order_acquire);
+		bool busy = s_in_flight.load(std::memory_order_acquire);
+		if (!busy && now_ms - last > 500) {
+			bool expected = false;
+			if (s_in_flight.compare_exchange_strong(expected, true)) {
+				work_queue::post([now_ms]() {
+					debugger_engine::get_call_stack();
+					s_last_refresh_ms.store(now_ms, std::memory_order_release);
+					s_in_flight.store(false, std::memory_order_release);
+				});
+			}
+		}
+	}
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + HEADER_H),
 	                  with_a(t.panel_header, a));
@@ -1375,6 +2851,26 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 	float dt = aida::ui::clock::dt();
 
 	{
+		static bool s_logged_once = false;
+		if (!s_logged_once) {
+			s_logged_once = true;
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] threads enter ok=1");
+		}
+	}
+
+	if (driver_bridge::attached_pid() == 0) {
+		float cw = std::min(w - 40.f, 620.f);
+		if (cw < 220.f) cw = std::max(220.f, w - 20.f);
+		float cx = ox + (w - cw) * 0.5f;
+		float cy = oy + h * 0.5f - 26.f;
+		ui_anim::render_inline_callout(dl, cx, cy, cw, 52.f,
+			"Attach to a process to enumerate, suspend, resume, or terminate its threads.",
+			ui_anim::callout_kind_t::warn, t.accent.x, t.accent.y, t.accent.z, a);
+		return;
+	}
+
+	{
 		ui_anim::table_col_t cols[] = {
 			{"TID", 90.f}, {"Priority", 80.f}, {"State", 110.f},
 			{"RIP", 200.f}, {"Actions", 0.f}
@@ -1408,7 +2904,7 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 
 			ImGui::SetCursorScreenPos(ImVec2(ox, ry));
 			ImGui::PushID(ti);
-			ImGui::InvisibleButton("##th_row", ImVec2(w - 18.f - 180.f, row_h));
+			ImGui::InvisibleButton("##th_row", ImVec2(w - 18.f - 280.f, row_h));
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 			ImGui::PopID();
@@ -1473,15 +2969,15 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 			}
 
 			float actions_x = ox + 500.f;
-			float btn_w = 56.f;
 			float btn_h = 22.f;
 			float btn_y = ry + (row_h - btn_h) * 0.5f;
 			float btn_g = 4.f;
 
+			float thread_btn_w = 48.f;
 			ImGui::SetCursorScreenPos(ImVec2(actions_x, btn_y));
 			ImGui::PushID(ti + 0x20000);
 			bool susp = aida::ui::button("Susp", aida::ui::button_kind_t::secondary,
-				aida::ui::size_t_::sm, ImVec2(btn_w, btn_h));
+				aida::ui::size_t_::sm, ImVec2(thread_btn_w, btn_h));
 			ImGui::PopID();
 			if (susp) {
 				uint32_t prev = 0;
@@ -1491,12 +2987,16 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 					static_cast<unsigned>(th.tid),
 					ok ? 1 : 0,
 					static_cast<unsigned>(prev));
+				anti_tamper::webhook::write_log("dbg_audit", ok
+					? "[dbg_audit] threads suspend ok=1"
+					: "[dbg_audit] threads suspend fail reason=driver_suspend_failed");
 			}
 
-			ImGui::SetCursorScreenPos(ImVec2(actions_x + btn_w + btn_g, btn_y));
+			ImGui::SetCursorScreenPos(ImVec2(actions_x + thread_btn_w + btn_g, btn_y));
 			ImGui::PushID(ti + 0x30000);
-			bool res = aida::ui::button("Resume", aida::ui::button_kind_t::secondary,
-				aida::ui::size_t_::sm, ImVec2(btn_w + 6.f, btn_h));
+			bool res = aida::ui::button("Res",
+				aida::ui::button_kind_t::secondary,
+				aida::ui::size_t_::sm, ImVec2(thread_btn_w, btn_h));
 			ImGui::PopID();
 			if (res) {
 				uint32_t prev = 0;
@@ -1506,6 +3006,40 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 					static_cast<unsigned>(th.tid),
 					ok ? 1 : 0,
 					static_cast<unsigned>(prev));
+				anti_tamper::webhook::write_log("dbg_audit", ok
+					? "[dbg_audit] threads resume ok=1"
+					: "[dbg_audit] threads resume fail reason=driver_resume_failed");
+			}
+
+			ImGui::SetCursorScreenPos(ImVec2(actions_x + (thread_btn_w + btn_g) * 2.f, btn_y));
+			ImGui::PushID(ti + 0x31000);
+			bool switch_clicked = aida::ui::button("Switch",
+				aida::ui::button_kind_t::primary,
+				aida::ui::size_t_::sm, ImVec2(thread_btn_w + 12.f, btn_h));
+			ImGui::PopID();
+			if (switch_clicked) {
+				debugger_engine::g_state.active_tid = th.tid;
+				debugger_engine::invalidate_cache();
+				diag::log_tagged_critical_fmt("debugger",
+					"thread_switch_context tid=%u", static_cast<unsigned>(th.tid));
+				anti_tamper::webhook::write_log("dbg_audit",
+					"[dbg_audit] threads switch ok=1");
+				toast_notification::push("Active thread context switched.",
+					toast_notification::toast_type_t::info);
+			}
+
+			ImGui::SetCursorScreenPos(ImVec2(actions_x + (thread_btn_w + btn_g) * 3.f + 8.f, btn_y));
+			ImGui::PushID(ti + 0x32000);
+			bool kill_clicked = aida::ui::button("Kill",
+				aida::ui::button_kind_t::destructive,
+				aida::ui::size_t_::sm, ImVec2(thread_btn_w, btn_h));
+			ImGui::PopID();
+			if (kill_clicked) {
+				ui.thread_kill_idx = ti;
+				ui.thread_kill_tid = th.tid;
+				ui.thread_kill_popup_open = true;
+				anti_tamper::webhook::write_log("dbg_audit",
+					"[dbg_audit] threads kill_request ok=1");
 			}
 
 			if (clicked) ui.threads_panel.selected = ti;
@@ -1527,6 +3061,57 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 		es.body  = "Attach to a process to inspect its threads.";
 		aida::ui::empty_state::render(ImVec2(ox, content_y), ImVec2(w, visible_h), es);
 	}
+
+	if (ui.thread_kill_popup_open) {
+		ImGui::OpenPopup("Terminate Thread##th");
+		ui.thread_kill_popup_open = false;
+	}
+	if (ImGui::BeginPopupModal("Terminate Thread##th", nullptr,
+		ImGuiWindowFlags_AlwaysAutoResize)) {
+		ImGui::TextWrapped(
+			"Terminate thread %u with exit code 0xDEAD?\nThis cannot be undone and may destabilise the target.",
+			static_cast<unsigned>(ui.thread_kill_tid));
+		ImGui::Separator();
+		if (ImGui::Button("Terminate", ImVec2(130.f, 0.f))) {
+			uint32_t target_tid = ui.thread_kill_tid;
+			HANDLE th_handle = OpenThread(THREAD_TERMINATE, FALSE, target_tid);
+			bool ok = false;
+			DWORD gle = 0;
+			if (th_handle != nullptr) {
+				ok = TerminateThread(th_handle, 0xDEADu) != FALSE;
+				if (!ok) gle = GetLastError();
+				CloseHandle(th_handle);
+			} else {
+				gle = GetLastError();
+			}
+			diag::log_tagged_critical_fmt("debugger",
+				"thread_kill tid=%u open_ok=%d term_ok=%d gle=%lu",
+				static_cast<unsigned>(target_tid),
+				th_handle != nullptr ? 1 : 0,
+				ok ? 1 : 0,
+				static_cast<unsigned long>(gle));
+			anti_tamper::webhook::write_log("dbg_audit", ok
+				? "[dbg_audit] threads kill ok=1"
+				: "[dbg_audit] threads kill fail reason=open_or_terminate_failed");
+			if (ok) {
+				toast_notification::push("Thread terminated.",
+					toast_notification::toast_type_t::info);
+			} else {
+				toast_notification::push("Terminate thread failed.",
+					toast_notification::toast_type_t::error);
+			}
+			ui.thread_kill_idx = -1;
+			ui.thread_kill_tid = 0;
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Cancel", ImVec2(130.f, 0.f))) {
+			ui.thread_kill_idx = -1;
+			ui.thread_kill_tid = 0;
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::EndPopup();
+	}
 }
 
 
@@ -1534,6 +3119,26 @@ static void render_watches(ImDrawList* dl, float ox, float oy, float w, float h,
 	auto& st = debugger_engine::g_state;
 	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
+
+	{
+		static bool s_logged_once = false;
+		if (!s_logged_once) {
+			s_logged_once = true;
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] watches enter ok=1");
+		}
+	}
+
+	if (driver_bridge::attached_pid() == 0) {
+		float bar_h_local = 40.f;
+		float cw = std::min(w - 40.f, 620.f);
+		if (cw < 220.f) cw = std::max(220.f, w - 20.f);
+		float cx = ox + (w - cw) * 0.5f;
+		float cy = oy + bar_h_local + (h - bar_h_local) * 0.5f - 26.f;
+		ui_anim::render_inline_callout(dl, cx, cy, cw, 52.f,
+			"Attach to a process to evaluate register/memory watch expressions live.",
+			ui_anim::callout_kind_t::info, t.accent.x, t.accent.y, t.accent.z, a);
+	}
 
 	float bar_h = 40.f;
 	float input_w = w * 0.55f;
@@ -1677,6 +3282,15 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h, f
 	const auto& t = aida::ui::resolved();
 	float dt = aida::ui::clock::dt();
 
+	{
+		static bool s_logged_once = false;
+		if (!s_logged_once) {
+			s_logged_once = true;
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] trace enter ok=1");
+		}
+	}
+
 	float bar_h = 40.f;
 	float input_w = w * 0.40f;
 	float btn_gap = 6.f;
@@ -1687,20 +3301,27 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h, f
 		false, ImVec2(input_w, bar_h - 8.f));
 	ImGui::SameLine(0.f, btn_gap);
 	bool tracing = st.tracing.load();
+	bool trace_can_start = driver_bridge::attached_pid() != 0;
 	bool start_clicked = aida::ui::button(tracing ? "Stop Trace" : "Start Trace",
 		tracing ? aida::ui::button_kind_t::destructive : aida::ui::button_kind_t::primary,
-		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
+		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f),
+		!tracing && !trace_can_start);
 	if (start_clicked) {
 		if (tracing) {
 			diag::log_tagged_critical_fmt("trace",
 				"trace_stop_request prev_count=%zu",
 				st.trace_log.size());
 			debugger_engine::stop_trace();
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] trace stop ok=1");
 		} else {
 			diag::log_tagged_critical_fmt("trace",
 				"trace_start_request max_depth=%d",
 				st.trace_max_depth);
-			debugger_engine::start_trace();
+			bool ok = debugger_engine::start_trace();
+			anti_tamper::webhook::write_log("dbg_audit", ok
+				? "[dbg_audit] trace start ok=1"
+				: "[dbg_audit] trace start fail reason=engine_rejected");
 		}
 	}
 	ImGui::SameLine(0.f, btn_gap);
@@ -1716,6 +3337,75 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h, f
 		}
 		diag::log_tagged_fmt("trace",
 			"trace_clear removed=%zu", before);
+		anti_tamper::webhook::write_log("dbg_audit",
+			"[dbg_audit] trace clear ok=1");
+	}
+	ImGui::SameLine(0.f, btn_gap);
+	bool export_clicked = aida::ui::button("Export",
+		aida::ui::button_kind_t::secondary,
+		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
+	if (export_clicked) {
+		std::vector<debugger_engine::trace_record_t> trace_copy;
+		{
+			std::lock_guard<std::mutex> lk(st.trace_mutex);
+			trace_copy = st.trace_log;
+		}
+		if (trace_copy.empty()) {
+			toast_notification::push("Trace is empty.",
+				toast_notification::toast_type_t::warning);
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] trace export fail reason=empty");
+		} else {
+			char path_buf[MAX_PATH] = "trace.csv";
+			static const char k_trace_filter[] =
+				"CSV (*.csv)\0*.csv\0Text (*.txt)\0*.txt\0All files (*.*)\0*.*\0\0";
+			if (win32_dialog::show_save_file_dialog(g_hwnd,
+					"Export Trace",
+					k_trace_filter,
+					"csv",
+					path_buf, sizeof(path_buf),
+					"debugger_view::trace_export")) {
+				std::ofstream ofs(path_buf, std::ios::trunc);
+				if (ofs.is_open()) {
+					ofs << "index,address,rip,rax,rcx,rdx,rsp,disasm\n";
+					for (const auto& tr : trace_copy) {
+						char line[512];
+						std::snprintf(line, sizeof(line),
+							"%d,0x%016llX,0x%016llX,0x%016llX,0x%016llX,0x%016llX,0x%016llX,",
+							tr.index,
+							static_cast<unsigned long long>(tr.address),
+							static_cast<unsigned long long>(tr.regs.rip),
+							static_cast<unsigned long long>(tr.regs.rax),
+							static_cast<unsigned long long>(tr.regs.rcx),
+							static_cast<unsigned long long>(tr.regs.rdx),
+							static_cast<unsigned long long>(tr.regs.rsp));
+						ofs << line;
+						for (char c : tr.disasm_text) {
+							if (c == ',' || c == '"' || c == '\n' || c == '\r') ofs.put(' ');
+							else ofs.put(c);
+						}
+						ofs.put('\n');
+					}
+					ofs.close();
+					diag::log_tagged_critical_fmt("trace",
+						"trace_export count=%zu path='%s'",
+						trace_copy.size(), path_buf);
+					anti_tamper::webhook::write_log("dbg_audit",
+						"[dbg_audit] trace export ok=1");
+					char msg[MAX_PATH + 64];
+					std::snprintf(msg, sizeof(msg),
+						"Exported %zu trace records to %s",
+						trace_copy.size(), path_buf);
+					toast_notification::push(msg,
+						toast_notification::toast_type_t::info);
+				} else {
+					anti_tamper::webhook::write_log("dbg_audit",
+						"[dbg_audit] trace export fail reason=open_failed");
+					toast_notification::push("Failed to open trace file for writing.",
+						toast_notification::toast_type_t::error);
+				}
+			}
+		}
 	}
 	ImGui::PopID();
 
@@ -1850,6 +3540,15 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 	auto& st = debugger_engine::g_state;
 	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
+
+	{
+		static bool s_logged_once = false;
+		if (!s_logged_once) {
+			s_logged_once = true;
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] strings enter ok=1");
+		}
+	}
 
 	bool scanning = st.strings_scanning.load(std::memory_order_acquire);
 	bool cancel_pending = st.strings_cancel.load(std::memory_order_acquire);
@@ -2014,6 +3713,15 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
 
+	{
+		static bool s_logged_once = false;
+		if (!s_logged_once) {
+			s_logged_once = true;
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] bookmarks enter ok=1");
+		}
+	}
+
 	float bar_h = 40.f;
 	float addr_w = w * 0.22f;
 	float lbl_w  = w * 0.32f;
@@ -2155,16 +3863,29 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
 
+	{
+		static bool s_logged_once = false;
+		if (!s_logged_once) {
+			s_logged_once = true;
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] handles enter ok=1");
+		}
+	}
+
 	float bar_h = 40.f;
+	bool attached_handles = driver_bridge::attached_pid() != 0;
 	ImGui::SetCursorScreenPos(ImVec2(ox + 8.f, oy + 2.f));
 	ImGui::PushID("##h_actions");
 	bool refresh_clicked = aida::ui::button("Enumerate Handles",
 		aida::ui::button_kind_t::primary,
-		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
+		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f),
+		!attached_handles);
 	if (refresh_clicked) {
 		diag::log_tagged_critical_fmt("handles",
 			"handles_enumerate_request attached_pid=%u",
 			static_cast<unsigned>(driver_bridge::attached_pid()));
+		anti_tamper::webhook::write_log("dbg_audit",
+			"[dbg_audit] handles enumerate ok=1");
 		work_queue::post([]() {
 			debugger_engine::enumerate_handles();
 			size_t n = 0;
@@ -2179,12 +3900,23 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 	}
 	ImGui::PopID();
 
+	if (!attached_handles) {
+		float cw = std::min(w - 40.f, 620.f);
+		if (cw < 220.f) cw = std::max(220.f, w - 20.f);
+		float cx = ox + (w - cw) * 0.5f;
+		float cy = oy + bar_h + (h - bar_h) * 0.5f - 26.f;
+		ui_anim::render_inline_callout(dl, cx, cy, cw, 52.f,
+			"Attach to a process to enumerate or close its kernel handles.",
+			ui_anim::callout_kind_t::warn, t.accent.x, t.accent.y, t.accent.z, a);
+		return;
+	}
+
 	float table_y = oy + bar_h;
 	{
 		ui_anim::table_col_t cols[] = {
-			{"Handle", 110.f}, {"Type", 160.f}, {"Access", 110.f}, {"Name", 320.f}
+			{"Handle", 110.f}, {"Type", 160.f}, {"Access", 110.f}, {"Name", 250.f}, {"Actions", 0.f}
 		};
-		draw_table_header(dl, ox, table_y, w, cols, 4, a);
+		draw_table_header(dl, ox, table_y, w, cols, 5, a);
 	}
 
 	std::vector<debugger_engine::handle_info_t> snapshot;
@@ -2216,7 +3948,7 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 
 			ImGui::SetCursorScreenPos(ImVec2(ox, ry));
 			ImGui::PushID(hi);
-			ImGui::InvisibleButton("##h_row", ImVec2(w - 18.f, ROW_HEIGHT));
+			ImGui::InvisibleButton("##h_row", ImVec2(w - 18.f - 90.f, ROW_HEIGHT));
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 			ImGui::PopID();
@@ -2245,8 +3977,32 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 280.f, ry + 5.f),
 			            with_a(t.text_secondary, a), acc_buf);
 
+			float name_clip_w = w - 484.f;
+			if (name_clip_w < 80.f) name_clip_w = 80.f;
+			dl->PushClipRect(ImVec2(ox + 390.f, ry),
+				ImVec2(ox + 390.f + name_clip_w, ry + ROW_HEIGHT), true);
 			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 390.f, ry + 5.f),
 			            with_a(t.text_primary, a), he.name.c_str());
+			dl->PopClipRect();
+
+			float hbtn_h = 18.f;
+			float hbtn_y = ry + (ROW_HEIGHT - hbtn_h) * 0.5f;
+			float hbtn_x = ox + w - 78.f;
+			ImGui::SetCursorScreenPos(ImVec2(hbtn_x, hbtn_y));
+			ImGui::PushID(hi + 0xC3000);
+			bool close_clicked = aida::ui::button("Close",
+				aida::ui::button_kind_t::destructive,
+				aida::ui::size_t_::sm, ImVec2(60.f, hbtn_h));
+			ImGui::PopID();
+			if (close_clicked) {
+				ui.handle_close_idx = hi;
+				ui.handle_close_value = he.handle;
+				ui.handle_close_type = he.type_name;
+				ui.handle_close_name = he.name;
+				ui.handle_close_popup_open = true;
+				anti_tamper::webhook::write_log("dbg_audit",
+					"[dbg_audit] handles close_request ok=1");
+			}
 
 			if (clicked) ui.handle_panel.selected = hi;
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
@@ -2265,6 +4021,74 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 		es.body  = "Click Enumerate Handles to capture the target's handle table.";
 		aida::ui::empty_state::render(ImVec2(ox, content_y), ImVec2(w, visible_h), es);
 	}
+
+	if (ui.handle_close_popup_open) {
+		ImGui::OpenPopup("Close Handle##hd");
+		ui.handle_close_popup_open = false;
+	}
+	if (ImGui::BeginPopupModal("Close Handle##hd", nullptr,
+		ImGuiWindowFlags_AlwaysAutoResize)) {
+		ImGui::TextWrapped(
+			"Close handle 0x%X (%s) in target process?\nName: %s\n\nThis duplicates the handle into the host with DUPLICATE_CLOSE_SOURCE, releasing it inside the target. The target may crash if it relies on this handle.",
+			static_cast<unsigned>(ui.handle_close_value),
+			ui.handle_close_type.c_str(),
+			ui.handle_close_name.empty() ? "(unnamed)" : ui.handle_close_name.c_str());
+		ImGui::Separator();
+		if (ImGui::Button("Close Handle", ImVec2(140.f, 0.f))) {
+			uint64_t value = ui.handle_close_value;
+			uint32_t target_pid = driver_bridge::attached_pid();
+			HANDLE target_proc = OpenProcess(PROCESS_DUP_HANDLE, FALSE, target_pid);
+			bool ok = false;
+			DWORD gle = 0;
+			if (target_proc != nullptr) {
+				HANDLE dup = nullptr;
+				BOOL dup_ok = DuplicateHandle(target_proc,
+					reinterpret_cast<HANDLE>(static_cast<uintptr_t>(value)),
+					GetCurrentProcess(), &dup, 0, FALSE,
+					DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE);
+				if (dup_ok) {
+					if (dup != nullptr) CloseHandle(dup);
+					ok = true;
+				} else {
+					gle = GetLastError();
+				}
+				CloseHandle(target_proc);
+			} else {
+				gle = GetLastError();
+			}
+			diag::log_tagged_critical_fmt("handles",
+				"handles_close pid=%u handle=0x%llx ok=%d gle=%lu",
+				static_cast<unsigned>(target_pid),
+				static_cast<unsigned long long>(value),
+				ok ? 1 : 0,
+				static_cast<unsigned long>(gle));
+			anti_tamper::webhook::write_log("dbg_audit", ok
+				? "[dbg_audit] handles close ok=1"
+				: "[dbg_audit] handles close fail reason=duplicate_close_failed");
+			if (ok) {
+				toast_notification::push("Handle closed in target.",
+					toast_notification::toast_type_t::info);
+				work_queue::post([]() { debugger_engine::enumerate_handles(); });
+			} else {
+				toast_notification::push("Close handle failed.",
+					toast_notification::toast_type_t::error);
+			}
+			ui.handle_close_idx = -1;
+			ui.handle_close_value = 0;
+			ui.handle_close_type.clear();
+			ui.handle_close_name.clear();
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Cancel", ImVec2(140.f, 0.f))) {
+			ui.handle_close_idx = -1;
+			ui.handle_close_value = 0;
+			ui.handle_close_type.clear();
+			ui.handle_close_name.clear();
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::EndPopup();
+	}
 }
 
 
@@ -2273,10 +4097,40 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 	const auto& t = aida::ui::resolved();
 	(void)t;
 
+	{
+		static bool s_logged_once = false;
+		if (!s_logged_once) {
+			s_logged_once = true;
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] patches enter ok=1");
+		}
+	}
+
 	float bar_h = 40.f;
 	float btn_gap = 6.f;
 	ImGui::SetCursorScreenPos(ImVec2(ox + 8.f, oy + 2.f));
 	ImGui::PushID("##patches_actions");
+
+	bool apply_sel_clicked = aida::ui::button("Apply Selected",
+		aida::ui::button_kind_t::primary,
+		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
+	if (apply_sel_clicked && ui.patches_panel.selected >= 0) {
+		int sel = ui.patches_panel.selected;
+		bool ok = code_patcher::apply_patch(sel);
+		diag::log_tagged_critical_fmt("patches",
+			"patches_apply_selected idx=%d ok=%d", sel, ok ? 1 : 0);
+		anti_tamper::webhook::write_log("dbg_audit", ok
+			? "[dbg_audit] patches apply ok=1"
+			: "[dbg_audit] patches apply fail reason=apply_failed");
+		if (!ok) {
+			toast_notification::push("Apply patch failed.",
+				toast_notification::toast_type_t::error);
+		} else {
+			toast_notification::push("Patch applied.",
+				toast_notification::toast_type_t::info);
+		}
+	}
+	ImGui::SameLine(0.f, btn_gap);
 
 	bool revert_all_clicked = aida::ui::button("Revert All",
 		aida::ui::button_kind_t::destructive,
@@ -2298,6 +4152,8 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 		diag::log_tagged_critical_fmt("patches",
 			"patches_revert_all total=%zu reverted=%zu",
 			before, reverted);
+		anti_tamper::webhook::write_log("dbg_audit",
+			"[dbg_audit] patches revert_all ok=1");
 		toast_notification::push("Reverted active patches.",
 			toast_notification::toast_type_t::info);
 	}
@@ -2320,7 +4176,88 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 			sel,
 			static_cast<unsigned long long>(addr_log),
 			ok ? 1 : 0);
+		anti_tamper::webhook::write_log("dbg_audit", ok
+			? "[dbg_audit] patches remove ok=1"
+			: "[dbg_audit] patches remove fail reason=remove_failed");
 		ui.patches_panel.selected = -1;
+	}
+	ImGui::SameLine(0.f, btn_gap);
+
+	bool save_set_clicked = aida::ui::button("Save Patchset",
+		aida::ui::button_kind_t::secondary,
+		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
+	if (save_set_clicked) {
+		std::vector<code_patcher::patch_entry_t> sn;
+		{
+			std::lock_guard<std::mutex> plk(code_patcher::g_state.mtx);
+			sn = code_patcher::g_state.patches;
+		}
+		if (sn.empty()) {
+			toast_notification::push("No patches to save.",
+				toast_notification::toast_type_t::warning);
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] patches save fail reason=empty");
+		} else {
+			char path_buf[MAX_PATH] = "patches.json";
+			static const char k_patchset_filter[] =
+				"JSON (*.json)\0*.json\0Text (*.txt)\0*.txt\0All files (*.*)\0*.*\0\0";
+			if (win32_dialog::show_save_file_dialog(g_hwnd,
+					"Save Patchset",
+					k_patchset_filter,
+					"json",
+					path_buf, sizeof(path_buf),
+					"debugger_view::patches_save")) {
+				std::ofstream ofs(path_buf, std::ios::trunc);
+				if (ofs.is_open()) {
+					ofs << "{\n  \"patches\": [\n";
+					for (size_t i = 0; i < sn.size(); ++i) {
+						const auto& p = sn[i];
+						char line[256];
+						std::snprintf(line, sizeof(line),
+							"    {\n      \"index\": %zu,\n"
+							"      \"address\": \"0x%016llX\",\n"
+							"      \"timestamp\": %lld,\n"
+							"      \"active\": %s,\n"
+							"      \"description\": \"",
+							i,
+							static_cast<unsigned long long>(p.address),
+							static_cast<long long>(p.timestamp),
+							p.active ? "true" : "false");
+						ofs << line;
+						for (char c : p.description) {
+							if (c == '"' || c == '\\') ofs.put('\\');
+							if (c == '\n' || c == '\r') ofs.put(' ');
+							else ofs.put(c);
+						}
+						ofs << "\",\n      \"original\": \""
+							<< code_patcher::format_bytes(p.original_bytes)
+							<< "\",\n      \"patched\": \""
+							<< code_patcher::format_bytes(p.patched_bytes)
+							<< "\"\n    }";
+						if (i + 1 < sn.size()) ofs << ",";
+						ofs << "\n";
+					}
+					ofs << "  ]\n}\n";
+					ofs.close();
+					diag::log_tagged_critical_fmt("patches",
+						"patches_save_set count=%zu path='%s'",
+						sn.size(), path_buf);
+					anti_tamper::webhook::write_log("dbg_audit",
+						"[dbg_audit] patches save ok=1");
+					char msg[MAX_PATH + 64];
+					std::snprintf(msg, sizeof(msg),
+						"Saved %zu patches to %s",
+						sn.size(), path_buf);
+					toast_notification::push(msg,
+						toast_notification::toast_type_t::info);
+				} else {
+					anti_tamper::webhook::write_log("dbg_audit",
+						"[dbg_audit] patches save fail reason=open_failed");
+					toast_notification::push("Failed to open patchset file.",
+						toast_notification::toast_type_t::error);
+				}
+			}
+		}
 	}
 	ImGui::PopID();
 
@@ -2681,6 +4618,9 @@ void render(float pos_x, float pos_y, float width, float height,
 	float content_alpha = a * (slide_t < 0.999f ? (0.4f + slide_t * 0.6f) : 1.f);
 
 	switch (ui.active_tab) {
+		case sub_tab_t::cpu:
+			render_cpu(dl, panel_x, panel_y, panel_w, panel_h, content_alpha);
+			break;
 		case sub_tab_t::breakpoints:
 			render_breakpoints(dl, panel_x, panel_y, panel_w, panel_h, content_alpha);
 			break;
@@ -2708,21 +4648,33 @@ void render(float pos_x, float pos_y, float width, float height,
 		case sub_tab_t::bookmarks:
 			render_bookmarks(dl, panel_x, panel_y, panel_w, panel_h, content_alpha);
 			break;
-		case sub_tab_t::modules:
-			module_view::render(panel_x, content_y, panel_w, content_h,
+		case sub_tab_t::modules: {
+			float mod_overlay_h = 60.f;
+			render_modules_overlay(dl, panel_x, content_y + 4.f, panel_w, content_alpha);
+			module_view::render(panel_x, content_y + mod_overlay_h,
+				panel_w, content_h - mod_overlay_h,
 				content_alpha, t.accent.x, t.accent.y, t.accent.z);
 			break;
+		}
 		case sub_tab_t::patches:
 			render_patches(dl, panel_x, panel_y, panel_w, panel_h, content_alpha);
 			break;
-		case sub_tab_t::seh_chain:
-			seh_view::render(panel_x, content_y, panel_w, content_h,
+		case sub_tab_t::seh_chain: {
+			float seh_overlay_h = 60.f;
+			render_seh_overlay(dl, panel_x, content_y + 4.f, panel_w, content_alpha);
+			seh_view::render(panel_x, content_y + seh_overlay_h,
+				panel_w, content_h - seh_overlay_h,
 				content_alpha, t.accent.x, t.accent.y, t.accent.z);
 			break;
-		case sub_tab_t::cfg:
-			cfg_view::render(panel_x, content_y, panel_w, content_h,
+		}
+		case sub_tab_t::cfg: {
+			float cfg_overlay_h = 40.f;
+			render_cfg_overlay(dl, panel_x, content_y + 4.f, panel_w, content_alpha);
+			cfg_view::render(panel_x, content_y + cfg_overlay_h,
+				panel_w, content_h - cfg_overlay_h,
 				content_alpha, t.accent.x, t.accent.y, t.accent.z);
 			break;
+		}
 		default:
 			break;
 	}
@@ -2739,7 +4691,19 @@ void render(float pos_x, float pos_y, float width, float height,
 		opts.working_dir = std::move(spawn_result.working_dir);
 		work_queue::post([opts]() {
 			uint32_t new_pid = 0;
-			bool ok = debugger_engine::spawn_and_attach_target(opts, &new_pid, nullptr);
+			run_target::launch_result_t lr{};
+			bool ok = debugger_engine::spawn_and_attach_target(opts, &new_pid, &lr);
+			std::wstring sandbox_dir_snapshot = lr.sandbox_dir;
+			bool sandbox_registered = lr.sandbox_pid_registered;
+			bool net_logger_registered = lr.net_logger_registered;
+			bool integrity_lowered = lr.integrity_lowered;
+			if (lr.thread_handle != 0) {
+				CloseHandle(reinterpret_cast<HANDLE>(lr.thread_handle));
+				lr.thread_handle = 0;
+			}
+			if (!sandbox_dir_snapshot.empty()) {
+				spawn_target_dialog::detail::last_sandbox_dir() = sandbox_dir_snapshot;
+			}
 			if (!ok) {
 				const std::string& err = debugger_engine::last_error();
 				std::string msg = "Launch failed: ";
@@ -2749,6 +4713,17 @@ void render(float pos_x, float pos_y, float width, float height,
 			} else if (opts.isolation == run_target::isolation_t::windows_sandbox) {
 				toast_notification::push(
 					"Launched Windows Sandbox session.",
+					toast_notification::toast_type_t::success);
+			} else if (opts.malware_safe_mode
+			           || opts.isolation == run_target::isolation_t::malware_safe_desktop) {
+				char ok_msg[256];
+				std::snprintf(ok_msg, sizeof(ok_msg),
+					"Launched PID %u in malware-safe mode (kernel_guard=%d, net_log=%d, il_lowered=%d)",
+					static_cast<unsigned>(new_pid),
+					sandbox_registered ? 1 : 0,
+					net_logger_registered ? 1 : 0,
+					integrity_lowered ? 1 : 0);
+				toast_notification::push(ok_msg,
 					toast_notification::toast_type_t::success);
 			} else {
 				char ok_msg[160];

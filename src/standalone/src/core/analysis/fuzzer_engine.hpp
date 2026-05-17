@@ -794,6 +794,44 @@ inline void stop_fuzzing()
 	g_state.cancel.store(true);
 }
 
+inline bool reset_state()
+{
+	if (g_state.running.load()) {
+		diag::log_tagged("fuzzer", "[analysis_audit] reset_reject reason=fuzzer_running");
+		return false;
+	}
+	if (g_state.minimizing.load() || g_state.analyzing_crash.load()) {
+		diag::log_tagged("fuzzer", "[analysis_audit] reset_reject reason=async_active");
+		return false;
+	}
+
+	size_t prev_crashes = 0;
+	size_t prev_unique = 0;
+	size_t prev_corpus = 0;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		prev_crashes = g_state.crashes.size();
+		prev_unique = g_state.unique_crashes.size();
+		prev_corpus = g_state.corpus.size();
+		g_state.stats = {};
+		g_state.crashes.clear();
+		g_state.unique_crashes.clear();
+		g_state.crash_hashes.clear();
+		g_state.corpus.clear();
+		std::memset(g_state.coverage.bitmap, 0, sizeof(g_state.coverage.bitmap));
+		g_state.coverage.edge_count = 0;
+		g_state.coverage.total_edges_discovered = 0;
+		g_state.coverage.prev_block = 0;
+		g_state.active = false;
+		g_state.cancel.store(false);
+	}
+
+	diag::log_tagged_fmt("fuzzer",
+		"[analysis_audit] reset_done prev_crashes=%zu prev_unique=%zu prev_corpus=%zu",
+		prev_crashes, prev_unique, prev_corpus);
+	return true;
+}
+
 inline void ai_analyze_crash(int crash_index)
 {
 #ifdef __NT__

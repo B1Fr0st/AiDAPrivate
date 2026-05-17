@@ -334,6 +334,158 @@ inline bool remove_field(int struct_idx, int field_idx) {
 	return true;
 }
 
+inline bool rename_struct(int struct_idx, const std::string& new_name) {
+	std::string old_name;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mtx);
+		if (struct_idx < 0 || struct_idx >= static_cast<int>(g_state.structs.size())) {
+			diag::log_tagged_fmt("dissector",
+				"rename_struct rejected reason='bad_idx' idx=%d", struct_idx);
+			return false;
+		}
+		if (new_name.empty()) {
+			diag::log_tagged_fmt("dissector",
+				"rename_struct rejected reason='empty_name' idx=%d", struct_idx);
+			return false;
+		}
+		auto& sd = g_state.structs[struct_idx];
+		old_name = sd.name;
+		sd.name = new_name;
+	}
+	diag::log_tagged_fmt("dissector",
+		"rename_struct idx=%d old='%s' new='%s'",
+		struct_idx, old_name.c_str(), new_name.c_str());
+	return true;
+}
+
+inline bool rename_field(int struct_idx, int field_idx, const std::string& new_name) {
+	std::string sd_name, old_name;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mtx);
+		if (struct_idx < 0 || struct_idx >= static_cast<int>(g_state.structs.size())) {
+			diag::log_tagged_fmt("dissector",
+				"rename_field rejected reason='bad_struct_idx' idx=%d", struct_idx);
+			return false;
+		}
+		auto& sd = g_state.structs[struct_idx];
+		if (field_idx < 0 || field_idx >= static_cast<int>(sd.fields.size())) {
+			diag::log_tagged_fmt("dissector",
+				"rename_field rejected reason='bad_field_idx' struct='%s' field_idx=%d",
+				sd.name.c_str(), field_idx);
+			return false;
+		}
+		sd_name = sd.name;
+		old_name = sd.fields[field_idx].name;
+		sd.fields[field_idx].name = new_name;
+	}
+	diag::log_tagged_fmt("dissector",
+		"rename_field struct='%s' field_idx=%d old='%s' new='%s'",
+		sd_name.c_str(), field_idx, old_name.c_str(), new_name.c_str());
+	return true;
+}
+
+inline bool retype_field(int struct_idx, int field_idx, field_type_t new_type) {
+	std::string sd_name, fname;
+	field_type_t old_type = field_type_t::int32;
+	uint32_t total_after = 0;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mtx);
+		if (struct_idx < 0 || struct_idx >= static_cast<int>(g_state.structs.size())) {
+			diag::log_tagged_fmt("dissector",
+				"retype_field rejected reason='bad_struct_idx' idx=%d", struct_idx);
+			return false;
+		}
+		auto& sd = g_state.structs[struct_idx];
+		if (field_idx < 0 || field_idx >= static_cast<int>(sd.fields.size())) {
+			diag::log_tagged_fmt("dissector",
+				"retype_field rejected reason='bad_field_idx' struct='%s' field_idx=%d",
+				sd.name.c_str(), field_idx);
+			return false;
+		}
+		auto& f = sd.fields[field_idx];
+		old_type = f.type;
+		f.type = new_type;
+		size_t ts = field_type_size(new_type);
+		if (ts > 0) {
+			f.size = static_cast<uint32_t>(ts);
+		} else if (f.size == 0) {
+			f.size = 1;
+		}
+		recalc_total_size(sd);
+		sd_name = sd.name;
+		fname = f.name;
+		total_after = sd.total_size;
+	}
+	diag::log_tagged_fmt("dissector",
+		"retype_field struct='%s' field='%s' old=%s new=%s total=%u",
+		sd_name.c_str(), fname.c_str(),
+		field_type_name(old_type), field_type_name(new_type), total_after);
+	return true;
+}
+
+inline bool set_field_size(int struct_idx, int field_idx, uint32_t new_size) {
+	std::string sd_name, fname;
+	uint32_t old_size = 0;
+	uint32_t total_after = 0;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mtx);
+		if (struct_idx < 0 || struct_idx >= static_cast<int>(g_state.structs.size())) {
+			diag::log_tagged_fmt("dissector",
+				"set_field_size rejected reason='bad_struct_idx' idx=%d", struct_idx);
+			return false;
+		}
+		auto& sd = g_state.structs[struct_idx];
+		if (field_idx < 0 || field_idx >= static_cast<int>(sd.fields.size())) {
+			diag::log_tagged_fmt("dissector",
+				"set_field_size rejected reason='bad_field_idx' struct='%s' field_idx=%d",
+				sd.name.c_str(), field_idx);
+			return false;
+		}
+		if (new_size == 0 || new_size > 65536u) {
+			diag::log_tagged_fmt("dissector",
+				"set_field_size rejected reason='bad_size' new=%u", new_size);
+			return false;
+		}
+		auto& f = sd.fields[field_idx];
+		old_size = f.size;
+		f.size = new_size;
+		recalc_total_size(sd);
+		sd_name = sd.name;
+		fname = f.name;
+		total_after = sd.total_size;
+	}
+	diag::log_tagged_fmt("dissector",
+		"set_field_size struct='%s' field='%s' old=%u new=%u total=%u",
+		sd_name.c_str(), fname.c_str(), old_size, new_size, total_after);
+	return true;
+}
+
+inline bool set_field_comment(int struct_idx, int field_idx, const std::string& comment) {
+	std::string sd_name, fname;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mtx);
+		if (struct_idx < 0 || struct_idx >= static_cast<int>(g_state.structs.size())) {
+			diag::log_tagged_fmt("dissector",
+				"set_field_comment rejected reason='bad_struct_idx' idx=%d", struct_idx);
+			return false;
+		}
+		auto& sd = g_state.structs[struct_idx];
+		if (field_idx < 0 || field_idx >= static_cast<int>(sd.fields.size())) {
+			diag::log_tagged_fmt("dissector",
+				"set_field_comment rejected reason='bad_field_idx' struct='%s' field_idx=%d",
+				sd.name.c_str(), field_idx);
+			return false;
+		}
+		sd.fields[field_idx].description = comment;
+		sd_name = sd.name;
+		fname = sd.fields[field_idx].name;
+	}
+	diag::log_tagged_fmt("dissector",
+		"set_field_comment struct='%s' field='%s' bytes=%zu",
+		sd_name.c_str(), fname.c_str(), comment.size());
+	return true;
+}
+
 inline void refresh_values() {
 	if (!driver_bridge::is_loaded()) {
 		diag::log_tagged_fmt("dissector",

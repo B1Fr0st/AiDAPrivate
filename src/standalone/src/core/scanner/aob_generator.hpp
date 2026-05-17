@@ -18,9 +18,15 @@
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
 #include "../helpers/diag_log.hpp"
+#include "../anti-tamper/webhook.hpp"
+#include "../ui/toast_notification.hpp"
 
 #ifdef AIDA_STANDALONE
 #include <Zydis/Zydis.h>
+#endif
+
+#ifdef AIDA_STANDALONE
+extern DisasmState g_disasm;
 #endif
 
 namespace aob_generator {
@@ -55,6 +61,13 @@ struct state_t {
 	int                      instruction_count = 16;
 	bool                     auto_wildcard = true;
 	bool                     validate_uniqueness = true;
+	std::string              last_error;
+	std::string              pending_clipboard;
+	std::atomic<bool>        pending_clipboard_ready{false};
+	uint64_t                 last_request_addr = 0;
+	int                      last_request_count = 0;
+	bool                     last_request_auto_wildcard = true;
+	bool                     show_no_address_modal = false;
 };
 
 inline state_t g_state;
@@ -314,43 +327,181 @@ inline const char* score_grade(float score)
 inline void generate_from_address(uint64_t address, int num_instructions, bool auto_wildcard)
 {
 #ifdef AIDA_STANDALONE
+	char dbg_buf[256];
+	std::snprintf(dbg_buf, sizeof(dbg_buf),
+		"generate_from_address called va=0x%llX len=%d auto_wildcard=%d",
+		static_cast<unsigned long long>(address), num_instructions, static_cast<int>(auto_wildcard));
+	diag::log_tagged("aob", dbg_buf);
+	anti_tamper::webhook::write_log("aob", dbg_buf);
+
+	if (num_instructions < 1) num_instructions = 1;
+	if (num_instructions > 128) num_instructions = 128;
+
 	if (g_state.generating.load()) {
 		diag::log_tagged("aob", "generate_from_address refused already_generating");
+		anti_tamper::webhook::write_log("aob", "refused already_generating");
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			g_state.last_error = "Generator is already busy with another address.";
+		}
 		return;
 	}
 	if (address == 0) {
-		diag::log_tagged("aob", "generate_from_address refused zero_address");
+		std::snprintf(dbg_buf, sizeof(dbg_buf),
+			"failed reason=zero_address addr=0x%llX",
+			static_cast<unsigned long long>(address));
+		diag::log_tagged("aob", dbg_buf);
+		anti_tamper::webhook::write_log("aob", dbg_buf);
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			g_state.last_error = "No address selected. Click an instruction in the disassembly first.";
+		}
 		return;
 	}
-	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) {
-		diag::log_tagged_fmt("aob", "generate_from_address refused not_attached driver_loaded=%d pid=%u",
-			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.last_request_addr = address;
+		g_state.last_request_count = num_instructions;
+		g_state.last_request_auto_wildcard = auto_wildcard;
+		g_state.last_error.clear();
+	}
+	bool drv_loaded = driver_bridge::is_loaded();
+	uint32_t drv_pid = driver_bridge::attached_pid();
+	bool driver_attached = drv_loaded && drv_pid != 0;
+	bool static_pe_available = g_disasm.file.loaded && !g_disasm.file.sections.empty();
+	size_t static_section_count = static_pe_available ? g_disasm.file.sections.size() : 0;
+	uint64_t static_image_base = static_pe_available ? g_disasm.file.image_base : 0;
+
+	if (driver_attached) {
+		std::snprintf(dbg_buf, sizeof(dbg_buf), "source=live attached_pid=%u", drv_pid);
+	} else {
+		std::snprintf(dbg_buf, sizeof(dbg_buf),
+			"source=static_pe loaded=%d sections=%zu image_base=0x%llX",
+			static_cast<int>(static_pe_available), static_section_count,
+			static_cast<unsigned long long>(static_image_base));
+	}
+	diag::log_tagged("aob", dbg_buf);
+	anti_tamper::webhook::write_log("aob", dbg_buf);
+
+	if (!driver_attached && !static_pe_available) {
+		std::snprintf(dbg_buf, sizeof(dbg_buf),
+			"failed reason=no_source addr=0x%llX driver_loaded=%d pid=%u static=%d",
+			static_cast<unsigned long long>(address),
+			static_cast<int>(drv_loaded), drv_pid,
+			static_cast<int>(static_pe_available));
+		diag::log_tagged("aob", dbg_buf);
+		anti_tamper::webhook::write_log("aob", dbg_buf);
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			g_state.last_error = "No data source available. Attach a process or open a PE file.";
+		}
 		return;
 	}
-	diag::log_tagged_fmt("aob", "generate_from_address start addr=0x%llX instructions=%d auto_wildcard=%d",
-		static_cast<unsigned long long>(address), num_instructions, static_cast<int>(auto_wildcard));
+	std::snprintf(dbg_buf, sizeof(dbg_buf),
+		"generate_from_address start addr=0x%llX instructions=%d auto_wildcard=%d source=%s",
+		static_cast<unsigned long long>(address), num_instructions,
+		static_cast<int>(auto_wildcard),
+		driver_attached ? "live" : "static_pe");
+	diag::log_tagged("aob", dbg_buf);
+	anti_tamper::webhook::write_log("aob", dbg_buf);
+
 	g_state.generating.store(true);
 
-	work_queue::post([address, num_instructions, auto_wildcard]() {
+	bool posted = work_queue::post([address, num_instructions, auto_wildcard, driver_attached, static_pe_available]() {
 		auto t_start = std::chrono::steady_clock::now();
+		char lbuf[256];
+		std::snprintf(lbuf, sizeof(lbuf),
+			"worker enter addr=0x%llX driver_attached=%d static=%d",
+			static_cast<unsigned long long>(address),
+			static_cast<int>(driver_attached),
+			static_cast<int>(static_pe_available));
+		diag::log_tagged("aob", lbuf);
+		anti_tamper::webhook::write_log("aob", lbuf);
+
 		signature_t sig;
 		sig.id = allocate_signature_id();
 		sig.address = address;
 
-		auto modules = driver_bridge::enumerate_modules();
-		for (auto& m : modules) {
-			if (address >= m.base && address < m.base + m.size) {
-				sig.module_name = m.name;
-				break;
+		uint64_t module_base = 0;
+		uint64_t module_size = 0;
+		bool got_module = false;
+		if (driver_attached) {
+			auto modules = driver_bridge::enumerate_modules();
+			for (auto& m : modules) {
+				if (address >= m.base && address < m.base + m.size) {
+					sig.module_name = m.name;
+					module_base = m.base;
+					module_size = m.size;
+					got_module = true;
+					break;
+				}
 			}
+			std::snprintf(lbuf, sizeof(lbuf),
+				"module_lookup live found=%d modules=%zu module_base=0x%llX module_size=%llu",
+				static_cast<int>(got_module), modules.size(),
+				static_cast<unsigned long long>(module_base),
+				static_cast<unsigned long long>(module_size));
+			diag::log_tagged("aob", lbuf);
+		}
+		if (!got_module && static_pe_available) {
+			sig.module_name = g_disasm.file.filename.empty()
+				? g_disasm.file.path
+				: g_disasm.file.filename;
 		}
 
 		size_t read_size = static_cast<size_t>(num_instructions) * 15;
 		std::vector<uint8_t> code;
-		driver_bridge::read_memory(address, read_size, code);
-		if (code.empty()) {
-			diag::log_tagged_fmt("aob", "generate_from_address read_memory_failed addr=0x%llX size=%zu",
-				static_cast<unsigned long long>(address), read_size);
+		bool read_ok = false;
+		const char* source_label = "none";
+
+		if (driver_attached) {
+			bool live_ok = driver_bridge::read_memory(address, read_size, code);
+			std::snprintf(lbuf, sizeof(lbuf),
+				"read_bytes ok=%d got=%zu requested=%zu source=live addr=0x%llX",
+				static_cast<int>(live_ok && !code.empty()),
+				code.size(), read_size,
+				static_cast<unsigned long long>(address));
+			diag::log_tagged("aob", lbuf);
+			anti_tamper::webhook::write_log("aob", lbuf);
+			if (!code.empty()) {
+				read_ok = true;
+				source_label = "live";
+			} else {
+				code.clear();
+			}
+		}
+		if (!read_ok && static_pe_available) {
+			std::vector<uint8_t> pe_bytes;
+			bool pe_ok = static_analysis::read_bytes_from_pe(g_disasm.file, address, read_size, pe_bytes);
+			std::snprintf(lbuf, sizeof(lbuf),
+				"read_bytes ok=%d got=%zu requested=%zu source=static_pe addr=0x%llX sections=%zu",
+				static_cast<int>(pe_ok && !pe_bytes.empty()),
+				pe_bytes.size(), read_size,
+				static_cast<unsigned long long>(address),
+				g_disasm.file.sections.size());
+			diag::log_tagged("aob", lbuf);
+			anti_tamper::webhook::write_log("aob", lbuf);
+			if (pe_ok && !pe_bytes.empty()) {
+				code = std::move(pe_bytes);
+				read_ok = true;
+				source_label = "static_pe";
+			}
+		}
+		if (!read_ok || code.empty()) {
+			std::snprintf(lbuf, sizeof(lbuf),
+				"failed reason=read_empty addr=0x%llX size=%zu driver=%d static=%d",
+				static_cast<unsigned long long>(address), read_size,
+				static_cast<int>(driver_attached),
+				static_cast<int>(static_pe_available));
+			diag::log_tagged("aob", lbuf);
+			anti_tamper::webhook::write_log("aob", lbuf);
+			{
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				g_state.last_error = "Failed to read bytes at the requested address.";
+			}
+			toast_notification::push(
+				"AOB: Failed to read bytes at the requested address.",
+				toast_notification::toast_type_t::error, 5.0f);
 			g_state.generating.store(false);
 			return;
 		}
@@ -373,6 +524,7 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 			if (!ZYAN_SUCCESS(status)) break;
 
 			di.length = static_cast<uint8_t>(di.instr.length);
+			if (di.length == 0 || di.length > 15) break;
 			std::memcpy(di.raw, code.data() + offset, di.length);
 
 			instrs.push_back(di);
@@ -380,7 +532,32 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 			++decoded_count;
 		}
 
+		std::snprintf(lbuf, sizeof(lbuf),
+			"decode result decoded=%zu requested=%d source=%s bytes_consumed=%llu code_size=%zu",
+			instrs.size(), num_instructions, source_label,
+			static_cast<unsigned long long>(offset), code.size());
+		diag::log_tagged("aob", lbuf);
+
+		if (instrs.empty()) {
+			std::snprintf(lbuf, sizeof(lbuf),
+				"failed reason=decode_error addr=0x%llX bytes=%zu source=%s first_byte=0x%02X",
+				static_cast<unsigned long long>(address), code.size(), source_label,
+				code.empty() ? 0u : code[0]);
+			diag::log_tagged("aob", lbuf);
+			anti_tamper::webhook::write_log("aob", lbuf);
+			{
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				g_state.last_error = "Zydis failed to decode any instruction at this address.";
+			}
+			toast_notification::push(
+				"AOB: Decoder couldn't read an instruction at that address.",
+				toast_notification::toast_type_t::error, 5.0f);
+			g_state.generating.store(false);
+			return;
+		}
+
 		std::vector<aob_byte_t> pattern;
+		pattern.reserve(static_cast<size_t>(num_instructions) * 8);
 		for (auto& di : instrs) {
 			if (auto_wildcard) {
 				detail::wildcard_dynamic_bytes(di, pattern);
@@ -394,30 +571,115 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 			}
 		}
 
+		if (pattern.empty()) {
+			std::snprintf(lbuf, sizeof(lbuf),
+				"failed reason=empty_pattern addr=0x%llX decoded=%zu",
+				static_cast<unsigned long long>(address), instrs.size());
+			diag::log_tagged("aob", lbuf);
+			anti_tamper::webhook::write_log("aob", lbuf);
+			{
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				g_state.last_error = "Decoded instructions produced no signature bytes.";
+			}
+			g_state.generating.store(false);
+			return;
+		}
+
 		size_t pattern_size = pattern.size();
 		size_t decoded_instrs = instrs.size();
-		float qs = 0.f;
+		int wildcard_count = 0;
+		for (auto& ab : pattern) if (ab.wildcard) ++wildcard_count;
 		sig.bytes = std::move(pattern);
 		sig.quality_score = compute_quality_score(sig);
-		qs = sig.quality_score;
+		float qs = sig.quality_score;
+
+		std::string copy_payload = format_signature(sig);
 
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			g_state.current = std::move(sig);
+			g_state.last_error.clear();
+			g_state.pending_clipboard = copy_payload;
+			g_state.pending_clipboard_ready.store(true, std::memory_order_release);
 		}
 
 		auto t_end = std::chrono::steady_clock::now();
 		uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
-		diag::log_tagged_fmt("aob", "generate_from_address done addr=0x%llX decoded=%zu bytes=%zu quality=%.2f duration_ms=%llu",
-			static_cast<unsigned long long>(address), decoded_instrs, pattern_size,
+
+		std::string preview = copy_payload.size() > 32
+			? copy_payload.substr(0, 32) + "..."
+			: copy_payload;
+		std::snprintf(lbuf, sizeof(lbuf),
+			"result sig=\"%s\" ok=1 reason=ok bytes=%zu wildcard=%d source=%s addr=0x%llX decoded=%zu quality=%.2f duration_ms=%llu",
+			preview.c_str(), pattern_size, wildcard_count, source_label,
+			static_cast<unsigned long long>(address), decoded_instrs,
 			static_cast<double>(qs), static_cast<unsigned long long>(dur_ms));
+		diag::log_tagged("aob", lbuf);
+		anti_tamper::webhook::write_log("aob", lbuf);
+
+		{
+			char toast_buf[160];
+			std::snprintf(toast_buf, sizeof(toast_buf),
+				"AOB generated: %zu bytes, %d wildcards, quality %.0f%%",
+				pattern_size, wildcard_count, static_cast<double>(qs) * 100.0);
+			toast_notification::push(toast_buf,
+				toast_notification::toast_type_t::info, 4.0f);
+		}
 
 		g_state.generating.store(false);
 	});
+
+	if (!posted) {
+		diag::log_tagged("aob", "work_queue::post failed clearing_generating_flag");
+		anti_tamper::webhook::write_log("aob", "work_queue post failed");
+		g_state.generating.store(false);
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			g_state.last_error = "Background work queue refused the task. Try again.";
+		}
+		toast_notification::push("AOB: Background queue refused. Try again.",
+			toast_notification::toast_type_t::error, 5.0f);
+	}
 #else
 	(void)address;
 	(void)num_instructions;
 	(void)auto_wildcard;
+#endif
+}
+
+inline void regenerate_last()
+{
+#ifdef AIDA_STANDALONE
+	uint64_t addr = 0;
+	int count = 0;
+	bool aw = true;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		addr = g_state.last_request_addr;
+		count = g_state.last_request_count > 0 ? g_state.last_request_count : g_state.instruction_count;
+		aw = g_state.last_request_auto_wildcard;
+	}
+	if (addr == 0) {
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.last_error = "No previous request to regenerate.";
+		return;
+	}
+	generate_from_address(addr, count, aw);
+#endif
+}
+
+inline bool take_pending_clipboard(std::string& out)
+{
+#ifdef AIDA_STANDALONE
+	if (!g_state.pending_clipboard_ready.load(std::memory_order_acquire)) return false;
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	out = g_state.pending_clipboard;
+	g_state.pending_clipboard.clear();
+	g_state.pending_clipboard_ready.store(false, std::memory_order_release);
+	return !out.empty();
+#else
+	(void)out;
+	return false;
 #endif
 }
 

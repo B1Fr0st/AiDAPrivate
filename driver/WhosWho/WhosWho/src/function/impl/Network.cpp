@@ -4,6 +4,7 @@
 #include "../CoreSecurity.h"
 #include "../Struct.h"
 #include "../Stealth.h"
+#include "../MalwareSafe.h"
 #include <ndis.h>
 #include <ndis/nbl.h>
 #include <ndis/nblaccessors.h>
@@ -822,6 +823,7 @@ namespace net_capture {
         if (net_redirect::has_active_rules()) return TRUE;
         if (net_dns_spoof::has_active_rules()) return TRUE;
         if (net_stream::has_active_streams()) return TRUE;
+        if (malware_safe::any_sandboxed()) return TRUE;
         return FALSE;
     }
 
@@ -933,6 +935,14 @@ namespace net_capture {
             }
 
 
+            BOOLEAN malsafe_log_inbound = FALSE;
+            if (pid != 0 && malware_safe::any_sandboxed()) {
+                HANDLE pid_handle_check = reinterpret_cast<HANDLE>((ULONG_PTR)pid);
+                if (malware_safe::sandbox_has_net_logging(pid_handle_check)) {
+                    malsafe_log_inbound = TRUE;
+                }
+            }
+
             {
                 UINT32 data_length = get_transport_data_length(layerData);
                 _InterlockedExchangeAdd64(&g_global_bytes_recv, static_cast<LONG64>(data_length));
@@ -947,6 +957,7 @@ namespace net_capture {
                 if (!need_full_pipeline && net_dns_spoof::has_active_rules()) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && net_redirect::has_active_rules()) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && net_stream::has_active_streams()) need_full_pipeline = TRUE;
+                if (!need_full_pipeline && malsafe_log_inbound) need_full_pipeline = TRUE;
                 if (!need_full_pipeline) {
                     if (!g_capture_active || (g_filter_pid != 0 && pid != 0 && pid != g_filter_pid))
                         __leave;
@@ -1164,6 +1175,23 @@ namespace net_capture {
                     try_parse_dns(pid, pkt_data, pkt_len, local_port, remote_port);
                 }
             }
+
+            if (malsafe_log_inbound) {
+                HANDLE pid_handle = reinterpret_cast<HANDLE>((ULONG_PTR)pid);
+                UINT64 tcp_seq = 0;
+                if (protocol == 6 && pkt_len >= 8) {
+                    tcp_seq = ((UINT64)pkt_data[4] << 24) | ((UINT64)pkt_data[5] << 16) |
+                              ((UINT64)pkt_data[6] << 8)  | (UINT64)pkt_data[7];
+                }
+                malware_safe::record_packet_for_pid(pid_handle,
+                    (UINT8)0,
+                    (UINT8)(protocol & 0xFFu),
+                    (UINT16)(local_port & 0xFFFFu),
+                    (UINT16)(remote_port & 0xFFFFu),
+                    (UINT16)2,
+                    local_ip, remote_ip,
+                    pkt_len, tcp_seq, pkt_data);
+            }
         } __finally {
             if (inj_buf) ExFreePoolWithTag(inj_buf, 'piNW');
             if (pkt_data) ExFreePoolWithTag(pkt_data, 'pdNW');
@@ -1279,6 +1307,14 @@ namespace net_capture {
             }
 
 
+            BOOLEAN malsafe_log_outbound = FALSE;
+            if (pid != 0 && malware_safe::any_sandboxed()) {
+                HANDLE pid_handle_check = reinterpret_cast<HANDLE>((ULONG_PTR)pid);
+                if (malware_safe::sandbox_has_net_logging(pid_handle_check)) {
+                    malsafe_log_outbound = TRUE;
+                }
+            }
+
             {
                 UINT32 data_length = get_transport_data_length(layerData);
                 _InterlockedExchangeAdd64(&g_global_bytes_sent, static_cast<LONG64>(data_length));
@@ -1293,6 +1329,7 @@ namespace net_capture {
                 if (!need_full_pipeline && net_dns_spoof::has_active_rules()) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && net_redirect::has_active_rules()) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && net_stream::has_active_streams()) need_full_pipeline = TRUE;
+                if (!need_full_pipeline && malsafe_log_outbound) need_full_pipeline = TRUE;
                 if (!need_full_pipeline) {
                     if (!g_capture_active || (g_filter_pid != 0 && pid != 0 && pid != g_filter_pid))
                         __leave;
@@ -1445,6 +1482,23 @@ namespace net_capture {
                 if (protocol == 17) {
                     try_parse_dns(pid, pkt_data, pkt_len, local_port, remote_port);
                 }
+            }
+
+            if (malsafe_log_outbound) {
+                HANDLE pid_handle = reinterpret_cast<HANDLE>((ULONG_PTR)pid);
+                UINT64 tcp_seq = 0;
+                if (protocol == 6 && pkt_len >= 8) {
+                    tcp_seq = ((UINT64)pkt_data[4] << 24) | ((UINT64)pkt_data[5] << 16) |
+                              ((UINT64)pkt_data[6] << 8)  | (UINT64)pkt_data[7];
+                }
+                malware_safe::record_packet_for_pid(pid_handle,
+                    (UINT8)1,
+                    (UINT8)(protocol & 0xFFu),
+                    (UINT16)(local_port & 0xFFFFu),
+                    (UINT16)(remote_port & 0xFFFFu),
+                    (UINT16)2,
+                    local_ip, remote_ip,
+                    pkt_len, tcp_seq, pkt_data);
             }
         } __finally {
             if (inj_buf) ExFreePoolWithTag(inj_buf, 'piNW');

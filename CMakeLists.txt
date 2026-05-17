@@ -697,14 +697,18 @@ if(Python3_FOUND)
         CACHE FILEPATH "Path to the built Sentinel.sys")
     set(WINDMAPPER_BINARY "${AIDA_DRIVER_OUTPUT_DIR}/WindMapper.exe"
         CACHE FILEPATH "Path to the built WindMapper.exe")
+    set(SHADOWFS_BINARY   "${AIDA_DRIVER_OUTPUT_DIR}/AiDAShadowFS.sys"
+        CACHE FILEPATH "Path to the built AiDAShadowFS.sys")
 
     set(WHOSWHO_HEX    "${CMAKE_CURRENT_SOURCE_DIR}/WhosWho.c")
     set(SENTINEL_HEX   "${CMAKE_CURRENT_SOURCE_DIR}/Sentinel.c")
     set(WINDMAPPER_HEX "${CMAKE_CURRENT_SOURCE_DIR}/WindMapper.c")
+    set(SHADOWFS_HEX   "${CMAKE_CURRENT_SOURCE_DIR}/AiDAShadowFS.c")
 
     set(WHOSWHO_SCRIPT    "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_whoswho.py")
     set(SENTINEL_SCRIPT   "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_sentinel.py")
     set(WINDMAPPER_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_windmapper.py")
+    set(SHADOWFS_SCRIPT   "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_shadowfs.py")
 
     set(ENCRYPT_DRIVERS_STAMPS "")
 
@@ -755,6 +759,10 @@ if(Python3_FOUND)
         "${WINDMAPPER_BINARY}" "${WINDMAPPER_HEX}" "${WINDMAPPER_SCRIPT}"
         "${CMAKE_BINARY_DIR}/windmapper_encrypted.stamp"
         "Encrypting WindMapper -> windmapper_data.inc")
+    _aida_emit_encrypt_rule("AiDAShadowFS"
+        "${SHADOWFS_BINARY}" "${SHADOWFS_HEX}" "${SHADOWFS_SCRIPT}"
+        "${CMAKE_BINARY_DIR}/shadowfs_encrypted.stamp"
+        "Encrypting AiDAShadowFS -> shadowfs_encrypted.h")
 
     if(ENCRYPT_DRIVERS_STAMPS)
         add_custom_target(encrypt_drivers DEPENDS ${ENCRYPT_DRIVERS_STAMPS})
@@ -782,6 +790,7 @@ set(ENCRYPTED_DRIVER_HEADERS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sentinel_encrypted.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/windmapper_embedded.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/windmapper_data.inc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/shadowfs_encrypted.h"
 )
 set_source_files_properties(
     src/driver_loader.cpp
@@ -940,6 +949,55 @@ if(WIN32)
         )
     endif()
 
+    option(BUILD_MALWARE_SAFE_TESTER "Build MalwareSafeTester console harness" ON)
+
+    if(BUILD_MALWARE_SAFE_TESTER)
+        add_executable(MalwareSafeTester
+            tools/malware_safe_tester/src/main.cpp
+        )
+
+        target_compile_definitions(MalwareSafeTester PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+            UNICODE
+            _UNICODE
+        )
+
+        target_compile_options(MalwareSafeTester PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/W3>
+            $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
+            $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>
+            $<$<COMPILE_LANGUAGE:CXX>:/permissive->
+            $<$<COMPILE_LANGUAGE:CXX>:/MD>
+            $<$<COMPILE_LANGUAGE:CXX>:/Zp8>
+        )
+
+        target_link_libraries(MalwareSafeTester PRIVATE
+            advapi32
+            user32
+            kernel32
+            ws2_32
+            psapi
+            wininet
+        )
+
+        target_link_options(MalwareSafeTester PRIVATE
+            /SUBSYSTEM:CONSOLE
+            /DYNAMICBASE
+            /HIGHENTROPYVA
+            /NXCOMPAT
+        )
+
+        set_target_properties(MalwareSafeTester PROPERTIES
+            OUTPUT_NAME "MalwareSafeTester"
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+            RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}"
+            RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}"
+            RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}"
+        )
+    endif()
+
     option(BUILD_AIDA_STANDALONE "Build AiDA standalone application" ON)
 
     if(BUILD_AIDA_STANDALONE)
@@ -1022,6 +1080,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/mcp/mcp_standalone_tools.cpp"
             "${STANDALONE_ROOT}/core/runtime/standalone_driver.cpp"
             "${STANDALONE_ROOT}/core/runtime/run_target.cpp"
+            "${STANDALONE_ROOT}/core/runtime/shadow_fs_client.cpp"
             "${STANDALONE_ROOT}/core/ai/standalone_ai_client.cpp"
             "${STANDALONE_ROOT}/core/ai/standalone_chat.cpp"
             "${STANDALONE_ROOT}/core/runtime/standalone_license.cpp"
@@ -1041,6 +1100,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_architecture.cpp"
             "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_code_xml_parse.cpp"
             "${STANDALONE_ROOT}/core/editor/hex_view.cpp"
+            "${STANDALONE_ROOT}/core/editor/image_view.cpp"
             "${STANDALONE_ROOT}/core/ui/chat_render.cpp"
             "${STANDALONE_ROOT}/core/mcp/mcp_client.cpp"
             "${STANDALONE_ROOT}/core/mcp/mcp_marketplace.cpp"
@@ -1522,6 +1582,7 @@ set(AIDA_HEADERS
     src/whoswho_encrypted.h
     src/sentinel_encrypted.h
     src/windmapper_embedded.h
+    src/shadowfs_encrypted.h
 )
 
 if(WIN32)

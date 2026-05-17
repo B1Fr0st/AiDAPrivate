@@ -730,6 +730,17 @@ static void websocket_relay(SSL* client_ssl, SSL* target_ssl, http_exchange& exc
                 exchange.ws_frames.push_back(std::move(entry));
             }
 
+            ws_frame_observed_t observed;
+            observed.timestamp = GetTickCount64();
+            observed.exchange_id = exchange.id;
+            observed.host = exchange.target_host;
+            observed.port = exchange.target_port;
+            observed.is_outbound = outbound;
+            observed.is_text = (frame.opcode == protocol_parser::ws_opcode::text);
+            observed.opcode = static_cast<uint8_t>(frame.opcode);
+            observed.payload = payload;
+            publish_ws_frame(observed);
+
 
             bool should_forward = true;
             std::vector<uint8_t> forward_payload = payload;
@@ -1870,6 +1881,24 @@ bool is_intercept_enabled() {
 
 void set_intercept_callback(intercept_callback_t cb) {
     g_state.intercept_cb = std::move(cb);
+}
+
+void set_ws_frame_callback(ws_frame_callback_t cb) {
+    std::lock_guard<std::mutex> lock(g_state.ws_observer_mutex);
+    g_state.ws_observer_cb = std::move(cb);
+    diag::log_tagged_fmt("network", "[net_audit] proxy ws_frame_callback set has_cb=%d",
+        g_state.ws_observer_cb ? 1 : 0);
+}
+
+void publish_ws_frame(const ws_frame_observed_t& frame) {
+    ws_frame_callback_t cb_copy;
+    {
+        std::lock_guard<std::mutex> lock(g_state.ws_observer_mutex);
+        cb_copy = g_state.ws_observer_cb;
+    }
+    if (cb_copy) {
+        cb_copy(frame);
+    }
 }
 
 static std::shared_ptr<held_wait_t> lookup_wait_locked(uint64_t id) {

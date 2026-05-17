@@ -451,6 +451,30 @@ namespace driver_bridge
     bool kernel_anti_dump_stop_continuous();
     bool kernel_anti_dump_start_continuous(uint32_t pid);
 
+    bool malware_safe_protect_pid(uint32_t pid, uint32_t flags = 0, uint64_t* out_denials = nullptr);
+    bool malware_safe_unprotect_pid(uint32_t pid, uint64_t* out_denials = nullptr);
+    bool malware_safe_net_log(uint32_t pid, bool enable);
+
+    struct packet_record_t {
+        uint64_t timestamp;
+        uint64_t tcp_seq;
+        uint32_t pid;
+        uint32_t payload_len;
+        uint32_t flags;
+        uint16_t local_port;
+        uint16_t remote_port;
+        uint16_t address_family;
+        uint8_t  protocol;
+        uint8_t  direction;
+        uint8_t  local_addr[16];
+        uint8_t  remote_addr[16];
+        uint8_t  payload[256];
+    };
+
+    bool malware_safe_pull_packets(uint32_t pid, uint32_t max_records,
+                                   std::vector<packet_record_t>& out,
+                                   uint64_t* out_dropped = nullptr);
+
     bool relay_server_token(uint32_t token_hash, uint64_t server_nonce);
     bool relay_server_token_v2(uint32_t token_hash, uint64_t server_nonce, uint64_t* out_driver_proof = nullptr);
 

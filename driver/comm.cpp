@@ -3206,6 +3206,113 @@ bool voyager::device_t::re_confirmed_usermode_bsod(const detail::re_evidence_blo
     return false;
 }
 
+bool voyager::device_t::protect_sandbox_pid(std::uint32_t pid, std::uint32_t flags, std::uint64_t* out_denials) noexcept
+{
+    if (!is_connected()) return false;
+    if (pid == 0) return false;
+
+    detail::protect_sandbox_request req{};
+    req.magic = session_key_ ^ dynamic_key::get() ^ 0x5A4E0B01u;
+    req.session_key = session_key_;
+    req.pid = pid;
+    req.flags = (flags == 0) ? detail::SANDBOX_FLAG_DEFAULT : flags;
+
+    if (!send_request(ioctl_codes::PSBX(), &req, static_cast<DWORD>(sizeof(req)))) {
+        return false;
+    }
+    if (out_denials) *out_denials = req.denials_so_far;
+    return req.result != 0;
+}
+
+bool voyager::device_t::unprotect_sandbox_pid(std::uint32_t pid, std::uint64_t* out_denials) noexcept
+{
+    if (!is_connected()) return false;
+    if (pid == 0) return false;
+
+    detail::protect_sandbox_request req{};
+    req.magic = session_key_ ^ dynamic_key::get() ^ 0x5A4E0B02u;
+    req.session_key = session_key_;
+    req.pid = pid;
+    req.flags = 0;
+
+    if (!send_request(ioctl_codes::USBX(), &req, static_cast<DWORD>(sizeof(req)))) {
+        return false;
+    }
+    if (out_denials) *out_denials = req.denials_so_far;
+    return req.result != 0;
+}
+
+bool voyager::device_t::net_log_register_pid(std::uint32_t pid, bool enable) noexcept
+{
+    if (!is_connected()) return false;
+    if (pid == 0) return false;
+
+    detail::net_log_register_request req{};
+    req.magic = session_key_ ^ dynamic_key::get() ^ 0x5A4E0B03u;
+    req.session_key = session_key_;
+    req.pid = pid;
+    req.operation = enable ? 1u : 0u;
+
+    if (!send_request(ioctl_codes::NLOG(), &req, static_cast<DWORD>(sizeof(req)))) {
+        return false;
+    }
+    return req.result != 0;
+}
+
+bool voyager::device_t::malware_safe_pull_packets(std::uint32_t pid,
+                                                  std::uint32_t max_records,
+                                                  std::vector<detail::net_packet_record>& out,
+                                                  std::uint64_t* out_dropped_since_last_pull) noexcept
+{
+    out.clear();
+    if (out_dropped_since_last_pull) *out_dropped_since_last_pull = 0;
+    if (!is_connected()) return false;
+    if (pid == 0) return false;
+    if (max_records == 0) max_records = detail::NET_PKT_PULL_RING_CAPACITY;
+    if (max_records > detail::NET_PKT_PULL_RING_CAPACITY) max_records = detail::NET_PKT_PULL_RING_CAPACITY;
+
+    const std::size_t request_size = sizeof(detail::net_packet_pull_request);
+    const std::size_t response_size = sizeof(detail::net_packet_pull_response_header) +
+        static_cast<std::size_t>(max_records) * sizeof(detail::net_packet_record);
+    const std::size_t total_size = (request_size > response_size) ? request_size : response_size;
+    if (total_size > 0xFFFFFFFFu) return false;
+
+    std::unique_ptr<std::uint8_t[]> buf(new (std::nothrow) std::uint8_t[total_size]);
+    if (!buf) return false;
+    std::memset(buf.get(), 0, total_size);
+
+    auto* req = reinterpret_cast<detail::net_packet_pull_request*>(buf.get());
+    req->magic = session_key_ ^ dynamic_key::get() ^ 0x5A4E0B04u;
+    req->session_key = session_key_;
+    req->pid = pid;
+    req->max_records = max_records;
+    req->reserved = 0;
+    req->padding = 0;
+
+    DWORD dw_size = static_cast<DWORD>(total_size);
+    if (!send_request(ioctl_codes::NPKT(), buf.get(), dw_size)) {
+        return false;
+    }
+
+    auto* resp = reinterpret_cast<detail::net_packet_pull_response_header*>(buf.get());
+    if (resp->magic != detail::NET_PKT_PULL_RESP_MAGIC) {
+        return false;
+    }
+    std::uint32_t count = resp->record_count;
+    if (count > max_records) count = max_records;
+    if (out_dropped_since_last_pull) *out_dropped_since_last_pull = resp->dropped_since_last_pull;
+
+    if (count > 0) {
+        const auto* recs = reinterpret_cast<const detail::net_packet_record*>(
+            buf.get() + sizeof(detail::net_packet_pull_response_header));
+        out.reserve(count);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            out.push_back(recs[i]);
+        }
+    }
+    return true;
+}
+
 bool voyager::device_t::kernel_anti_debug_query(anti_debug_result& out) noexcept
 {
     if (!is_connected()) return false;

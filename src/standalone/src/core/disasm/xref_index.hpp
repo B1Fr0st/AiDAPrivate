@@ -753,8 +753,18 @@ namespace xref_index {
 			return it->index;
 		}
 
+		inline std::atomic<bool>& deep_static_xref_requested() {
+			static std::atomic<bool> v{false};
+			return v;
+		}
+
 		inline void schedule_build_locked(std::shared_ptr<module_index_t> mod) {
 			if (!mod) return;
+			if (mod->is_static_pe
+				&& !deep_static_xref_requested().load(std::memory_order_acquire))
+			{
+				return;
+			}
 			uint32_t expected = static_cast<uint32_t>(build_state_t::idle);
 			if (!mod->state.compare_exchange_strong(expected,
 				static_cast<uint32_t>(build_state_t::building),
@@ -768,6 +778,29 @@ namespace xref_index {
 			});
 		}
 
+	}
+
+	inline bool deep_static_xref_requested() {
+		return detail::deep_static_xref_requested().load(std::memory_order_acquire);
+	}
+
+	inline void request_deep_static_xref() {
+		detail::deep_static_xref_requested().store(true, std::memory_order_release);
+		auto& reg = detail::registry();
+		std::vector<std::shared_ptr<detail::module_index_t>> targets;
+		{
+			std::shared_lock<std::shared_mutex> lk(reg.rw);
+			for (const auto& r : reg.table) {
+				if (!r.index) continue;
+				if (!r.index->is_static_pe) continue;
+				uint32_t s = r.index->state.load(std::memory_order_acquire);
+				if (s != static_cast<uint32_t>(detail::build_state_t::idle)) continue;
+				targets.push_back(r.index);
+			}
+		}
+		for (auto& mod : targets) {
+			detail::schedule_build_locked(mod);
+		}
 	}
 
 	inline std::vector<annotation_t> query_to(uint64_t addr, size_t limit = 16) {
@@ -861,6 +894,7 @@ namespace xref_index {
 		reg.table_built.store(false, std::memory_order_release);
 		reg.rebuild_in_flight.store(false, std::memory_order_release);
 		reg.generation.fetch_add(1, std::memory_order_acq_rel);
+		detail::deep_static_xref_requested().store(false, std::memory_order_release);
 
 		if (detail::xref_static_pe_active()) {
 			bool expected = false;

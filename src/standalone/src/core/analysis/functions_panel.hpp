@@ -4,7 +4,6 @@
 #include "imgui/imgui_internal.h"
 #include "../helpers/globals.h"
 #include "disasm_view.hpp"
-#include "cfg_view.hpp"
 #include "pe_parser.hpp"
 #include "symbol_store.hpp"
 #include "rename_store.hpp"
@@ -35,6 +34,10 @@
 #include <Windows.h>
 
 extern DisasmState g_disasm;
+
+namespace cfg_view {
+	void build_cfg(uint64_t entry_address);
+}
 
 namespace functions_panel {
 
@@ -1083,7 +1086,7 @@ namespace functions_panel {
 			ImFont* ncap = aida::ui::fonts::caption();
 			if (!ncap) ncap = ImGui::GetFont();
 			const char* nmsg = "Functions panel too narrow";
-			float nfs = 11.f;
+			float nfs = aida::ui::components::detail::ui_fs() * 0.88f;
 			ImVec2 nts = ncap->CalcTextSizeA(nfs, FLT_MAX, w - 8.f, nmsg);
 			ImVec2 npos = ImVec2(nwp.x + (w - nts.x) * 0.5f, nwp.y + (h - nts.y) * 0.5f);
 			ndl->AddText(ncap, nfs, npos, th.text_dim, nmsg);
@@ -1136,7 +1139,8 @@ namespace functions_panel {
 		ImFont* caption_font = aida::ui::fonts::caption();
 		if (!caption_font) caption_font = body_font;
 
-		const float title_fs = 17.f;
+		const float fs_fp_base = aida::ui::components::detail::ui_fs();
+		const float title_fs = fs_fp_base * 1.10f;
 		const float title_x = wp.x + pad + 2.f;
 		const float title_y = wp.y + 8.f;
 		dl->AddText(title_font, title_fs,
@@ -1195,7 +1199,7 @@ namespace functions_panel {
 			char count_buf[48];
 			std::snprintf(count_buf, sizeof(count_buf), "%zu functions", total_count);
 			ImFont* badge_font = caption_font;
-			float bfs = 13.f;
+			float bfs = fs_fp_base * 0.85f;
 			float bw = badge_font->CalcTextSizeA(bfs, FLT_MAX, 0.f, count_buf).x + 16.f;
 			float bh = 22.f;
 			ImVec2 ba = ImVec2(wp.x + w - pad - bw, wp.y + input_y + (input_h - bh) * 0.5f);
@@ -1221,20 +1225,21 @@ namespace functions_panel {
 			char sub_buf[256];
 			std::snprintf(sub_buf, sizeof(sub_buf), "Module: %s", mod_display.c_str());
 			float sub_avail = w - (pad + 2.f) * 2.f;
-			ImVec2 sub_size = caption_font->CalcTextSizeA(12.f, FLT_MAX, 0.f, sub_buf);
+			const float fs_sub = fs_fp_base * 0.85f;
+			ImVec2 sub_size = caption_font->CalcTextSizeA(fs_sub, FLT_MAX, 0.f, sub_buf);
 			if (sub_size.x > sub_avail && sub_avail > 24.f) {
 				std::string cut(sub_buf);
 				while (cut.size() > 4) {
 					cut.pop_back();
 					std::string probe = cut + "\xe2\x80\xa6";
-					ImVec2 ps = caption_font->CalcTextSizeA(12.f, FLT_MAX, 0.f, probe.c_str());
+					ImVec2 ps = caption_font->CalcTextSizeA(fs_sub, FLT_MAX, 0.f, probe.c_str());
 					if (ps.x <= sub_avail) {
 						std::snprintf(sub_buf, sizeof(sub_buf), "%s", probe.c_str());
 						break;
 					}
 				}
 			}
-			dl->AddText(caption_font, 12.f,
+			dl->AddText(caption_font, fs_sub,
 				ImVec2(wp.x + pad + 2.f, wp.y + header_h - 18.f),
 				th.text_dim, sub_buf);
 		}
@@ -1331,7 +1336,7 @@ namespace functions_panel {
 				ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
 
 			ImDrawList* cdl = ImGui::GetWindowDrawList();
-			const float row_h = 36.f;
+			const float row_h = (std::max)(40.f, fs_fp_base * 2.55f);
 
 			ImGuiListClipper clipper;
 			clipper.Begin(static_cast<int>(row_view.size()), row_h);
@@ -1401,9 +1406,9 @@ namespace functions_panel {
 					}
 
 					const float text_x = row_min.x + 22.f;
-					const float name_fs = 13.f;
+					const float name_fs = fs_fp_base * 0.92f;
 					const float line1_y = row_min.y + 4.f;
-					const float line2_y = row_min.y + 22.f;
+					const float line2_y = row_min.y + name_fs + 8.f;
 					const float text_w_avail = content_size.x - 22.f - 6.f;
 
 					ImU32 name_col = e.synthetic_name ? th.text_dim : th.text_primary;
@@ -1427,7 +1432,7 @@ namespace functions_panel {
 					char addr_buf[32];
 					std::snprintf(addr_buf, sizeof(addr_buf), "0x%llX",
 						static_cast<unsigned long long>(e.address));
-					const float meta_fs = 11.f;
+					const float meta_fs = fs_fp_base * 0.82f;
 					ImVec2 addr_size = code_font->CalcTextSizeA(meta_fs, FLT_MAX, 0.f, addr_buf);
 					float cursor_x = text_x;
 					cdl->AddText(code_font, meta_fs,

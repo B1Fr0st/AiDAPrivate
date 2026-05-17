@@ -13,6 +13,8 @@
 #include "imgui/imgui_internal.h"
 
 #include "initial_analysis.hpp"
+#include "../disasm/function_index.hpp"
+#include "../disasm/xref_index.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
 #include "../ui/fonts.hpp"
@@ -227,14 +229,27 @@ inline void render_overlay()
 
 	bool wants_visible = (running || (finished && !dismissed)) && any_logs_yet;
 
+	ImVec2 vp_for_hit = ImGui::GetIO().DisplaySize;
+	float w_for_hit = 420.f;
+	float h_for_hit = 240.f;
+	float margin_for_hit = 24.f;
+	float ov_x_for_hit = vp_for_hit.x - w_for_hit - margin_for_hit;
+	float ov_y_for_hit = vp_for_hit.y - h_for_hit - margin_for_hit - 28.f;
+	if (ov_y_for_hit < 80.f) ov_y_for_hit = 80.f;
+	ImVec2 mp_for_hit = ImGui::GetMousePos();
+	bool hovered_overlay = (mp_for_hit.x >= ov_x_for_hit && mp_for_hit.x <= ov_x_for_hit + w_for_hit &&
+	                       mp_for_hit.y >= ov_y_for_hit && mp_for_hit.y <= ov_y_for_hit + h_for_hit);
+
 	if (finished && !dismissed) {
 		uint64_t fin_ns = st.finish_time_ns.load(std::memory_order_acquire);
-		if (fin_ns != 0) {
+		if (fin_ns != 0 && !hovered_overlay) {
 			uint64_t now = initial_analysis::detail::now_ns();
 			if (now - fin_ns > 5ull * 1000000000ull) {
 				wants_visible = false;
 				st.overlay_dismissed.store(true, std::memory_order_release);
 			}
+		} else if (fin_ns != 0 && hovered_overlay) {
+			st.finish_time_ns.store(initial_analysis::detail::now_ns(), std::memory_order_release);
 		}
 	}
 
@@ -293,7 +308,82 @@ inline void render_overlay()
 	ImFont* cf = aida::ui::fonts::caption();
 	float cfs = cf ? 12.f : 12.f;
 	float sw = cf ? cf->CalcTextSizeA(cfs, FLT_MAX, 0.f, status_text).x : 50.f;
-	fg->AddText(cf, cfs, ImVec2(b.x - pad - sw, a.y + pad),
+
+	float status_right_x = b.x - pad;
+	bool show_rerun_btn = ov_finished && initial_analysis::can_run_for_disk_load();
+	if (show_rerun_btn) {
+		const char* rerun_lbl = "Re-run";
+		float rerun_text_w = cf ? cf->CalcTextSizeA(cfs, FLT_MAX, 0.f, rerun_lbl).x : 44.f;
+		float rerun_btn_w = rerun_text_w + 14.f;
+		float rerun_btn_h = 18.f;
+		float rerun_btn_x = b.x - pad - rerun_btn_w;
+		float rerun_btn_y = a.y + pad - 3.f;
+		ImVec2 rmin(rerun_btn_x, rerun_btn_y);
+		ImVec2 rmax(rerun_btn_x + rerun_btn_w, rerun_btn_y + rerun_btn_h);
+		bool rhov = (mp_for_hit.x >= rmin.x && mp_for_hit.x <= rmax.x &&
+		             mp_for_hit.y >= rmin.y && mp_for_hit.y <= rmax.y);
+		ImU32 rbg = rhov
+			? aida::ui::with_alpha(th.accent_grad_top, anim * 0.92f)
+			: aida::ui::with_alpha(th.panel_header, anim * 0.85f);
+		ImU32 rbr = rhov
+			? aida::ui::with_alpha(th.accent_hover, anim)
+			: aida::ui::with_alpha(th.border_subtle, anim);
+		fg->AddRectFilled(rmin, rmax, rbg, 5.f);
+		fg->AddRect(rmin, rmax, rbr, 5.f, 0, 1.f);
+		ImU32 rtxt = rhov
+			? aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), anim)
+			: aida::ui::with_alpha(th.text_primary, anim);
+		fg->AddText(cf, cfs,
+			ImVec2(rmin.x + (rerun_btn_w - rerun_text_w) * 0.5f,
+			       rmin.y + (rerun_btn_h - cfs) * 0.5f + 1.f),
+			rtxt, rerun_lbl);
+		if (rhov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			anti_tamper::webhook::write_log("analysis_audit",
+				"[analysis_audit] initial_analysis rerun_clicked");
+			diag::log_tagged("initial_analysis", "[analysis_audit] view_rerun_request");
+			initial_analysis::run_initial_analysis_for_loaded_file();
+		}
+		status_right_x = rmin.x - 8.f;
+
+		bool deep_done = function_index::deep_static_analysis_requested();
+		const char* deep_lbl = deep_done ? "Deep [running]" : "Deep";
+		float deep_text_w = cf ? cf->CalcTextSizeA(cfs, FLT_MAX, 0.f, deep_lbl).x : 36.f;
+		float deep_btn_w = deep_text_w + 14.f;
+		float deep_btn_h = 18.f;
+		float deep_btn_x = rerun_btn_x - 8.f - deep_btn_w;
+		float deep_btn_y = a.y + pad - 3.f;
+		ImVec2 dmin(deep_btn_x, deep_btn_y);
+		ImVec2 dmax(deep_btn_x + deep_btn_w, deep_btn_y + deep_btn_h);
+		bool dhov = (mp_for_hit.x >= dmin.x && mp_for_hit.x <= dmax.x &&
+		             mp_for_hit.y >= dmin.y && mp_for_hit.y <= dmax.y);
+		ImU32 dbg = deep_done
+			? aida::ui::with_alpha(th.success, anim * 0.55f)
+			: (dhov
+				? aida::ui::with_alpha(th.accent_grad_top, anim * 0.85f)
+				: aida::ui::with_alpha(th.panel_header, anim * 0.85f));
+		ImU32 dbr = dhov
+			? aida::ui::with_alpha(th.accent_hover, anim)
+			: aida::ui::with_alpha(th.border_subtle, anim);
+		fg->AddRectFilled(dmin, dmax, dbg, 5.f);
+		fg->AddRect(dmin, dmax, dbr, 5.f, 0, 1.f);
+		ImU32 dtxt = dhov
+			? aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), anim)
+			: aida::ui::with_alpha(th.text_primary, anim);
+		fg->AddText(cf, cfs,
+			ImVec2(dmin.x + (deep_btn_w - deep_text_w) * 0.5f,
+			       dmin.y + (deep_btn_h - cfs) * 0.5f + 1.f),
+			dtxt, deep_lbl);
+		if (dhov && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !deep_done) {
+			anti_tamper::webhook::write_log("analysis_audit",
+				"[analysis_audit] deep_static_analysis_clicked");
+			diag::log_tagged("initial_analysis", "[analysis_audit] deep_static_analysis_request");
+			function_index::request_deep_static_analysis();
+			xref_index::request_deep_static_xref();
+		}
+		status_right_x = dmin.x - 8.f;
+	}
+
+	fg->AddText(cf, cfs, ImVec2(status_right_x - sw, a.y + pad),
 		aida::ui::with_alpha(status_col, anim), status_text);
 
 	std::string fn;

@@ -20,6 +20,7 @@ namespace aida::ui::hub_strip {
 	struct tab_t {
 		const char* label = nullptr;
 		const char* hint = nullptr;
+		const char* short_label = nullptr;
 	};
 
 	struct state_t {
@@ -102,10 +103,26 @@ namespace aida::ui::hub_strip {
 
 		float widths[max_tabs] = {};
 		float offsets[max_tabs] = {};
+		float total_full = 0.f;
+		float total_short = 0.f;
+		bool any_short = false;
+		for (int i = 0; i < count; ++i) {
+			float tw_full = font->CalcTextSizeA(font_size, FLT_MAX, 0.f, tabs[i].label).x;
+			const char* sl = (tabs[i].short_label && *tabs[i].short_label) ? tabs[i].short_label : tabs[i].label;
+			if (tabs[i].short_label && *tabs[i].short_label) any_short = true;
+			float tw_short = font->CalcTextSizeA(font_size, FLT_MAX, 0.f, sl).x;
+			total_full += tw_full + pad_x * 2.f + gap;
+			total_short += tw_short + (pad_x - 4.f) * 2.f + gap;
+		}
+		bool use_short = any_short && (width < total_full) && (width + 24.f >= total_short * 0.55f);
+
 		float total = 0.f;
 		for (int i = 0; i < count; ++i) {
-			float tw = font->CalcTextSizeA(font_size, FLT_MAX, 0.f, tabs[i].label).x;
-			widths[i] = tw + pad_x * 2.f;
+			const char* lbl = use_short && tabs[i].short_label && *tabs[i].short_label
+				? tabs[i].short_label
+				: tabs[i].label;
+			float tw = font->CalcTextSizeA(font_size, FLT_MAX, 0.f, lbl).x;
+			widths[i] = tw + (use_short ? (pad_x - 4.f) : pad_x) * 2.f;
 			offsets[i] = total;
 			total += widths[i] + gap;
 		}
@@ -176,10 +193,26 @@ namespace aida::ui::hub_strip {
 					aida::ui::mix(t.text_secondary, t.text_primary, st.hover_v[i]), alpha);
 			}
 
-			float tw = font->CalcTextSizeA(font_size, FLT_MAX, 0.f, tabs[i].label).x;
+			const char* draw_lbl = use_short && tabs[i].short_label && *tabs[i].short_label
+				? tabs[i].short_label
+				: tabs[i].label;
+			float tw = font->CalcTextSizeA(font_size, FLT_MAX, 0.f, draw_lbl).x;
 			float tx = bx0 + (widths[i] - tw) * 0.5f;
 			float ty = by0 + ((by1 - by0) - font_size) * 0.5f;
-			dl->AddText(font, font_size, ImVec2(tx, ty), text_col, tabs[i].label);
+			dl->AddText(font, font_size, ImVec2(tx, ty), text_col, draw_lbl);
+
+			if (use_short && hovered && tabs[i].label) {
+				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f, 6.f));
+				ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(t.bg_overlay));
+				if (ImGui::BeginTooltip()) {
+					ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(t.text_primary));
+					ImGui::TextUnformatted(tabs[i].label);
+					ImGui::PopStyleColor();
+					ImGui::EndTooltip();
+				}
+				ImGui::PopStyleColor();
+				ImGui::PopStyleVar();
+			}
 
 			if (clicked) {
 				notify_select(st, i);
@@ -196,12 +229,25 @@ namespace aida::ui::hub_strip {
 			ImU32 fade_zero = aida::ui::with_alpha(t.bg_base, 0.f);
 			dl->AddRectFilledMultiColor(ImVec2(clip_x0, clip_y0), ImVec2(clip_x0 + 32.f, clip_y1),
 				fade_col, fade_zero, fade_zero, fade_col);
+			float ccx = clip_x0 + 10.f;
+			float ccy = (clip_y0 + clip_y1) * 0.5f;
+			ImU32 chev = aida::ui::with_alpha(t.accent_u32, alpha * 0.95f);
+			dl->AddTriangleFilled(ImVec2(ccx + 4.f, ccy - 6.f), ImVec2(ccx + 4.f, ccy + 6.f),
+				ImVec2(ccx - 4.f, ccy), chev);
 		}
 		if (st.scroll_x < max_scroll - 1.f) {
 			ImU32 fade_col = aida::ui::with_alpha(t.bg_base, alpha * 0.95f);
 			ImU32 fade_zero = aida::ui::with_alpha(t.bg_base, 0.f);
 			dl->AddRectFilledMultiColor(ImVec2(clip_x1 - 32.f, clip_y0), ImVec2(clip_x1, clip_y1),
 				fade_zero, fade_col, fade_col, fade_zero);
+			float ccx = clip_x1 - 10.f;
+			float ccy = (clip_y0 + clip_y1) * 0.5f;
+			ImU32 chev = aida::ui::with_alpha(t.accent_u32, alpha * 0.95f);
+			dl->AddTriangleFilled(ImVec2(ccx - 4.f, ccy - 6.f), ImVec2(ccx - 4.f, ccy + 6.f),
+				ImVec2(ccx + 4.f, ccy), chev);
+			float pulse = 0.5f + 0.5f * std::sin(static_cast<float>(ImGui::GetTime()) * 3.f);
+			dl->AddCircle(ImVec2(ccx, ccy), 11.f,
+				aida::ui::with_alpha(t.accent_u32, alpha * 0.35f * pulse), 16, 1.2f);
 		}
 	}
 

@@ -717,9 +717,6 @@ namespace aida::mcp_marketplace_view {
 			ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking)) {
 
 			ImDrawList* wdl = ImGui::GetWindowDrawList();
-			ImDrawList* bgdl = ImGui::GetBackgroundDrawList();
-			bgdl->AddRectFilled(ImVec2(0, 0), display,
-				IM_COL32(0, 0, 0, static_cast<int>(170.f * alpha)));
 
 			ImVec2 panel_a(px, py);
 			ImVec2 panel_b(px + sw, py + sh);

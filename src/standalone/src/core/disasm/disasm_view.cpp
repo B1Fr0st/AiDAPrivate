@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -81,6 +82,9 @@ static std::atomic<uint64_t> s_render_log_last_ns{0};
 static std::atomic<uint64_t> s_render_ms_accum_us{0};
 static std::atomic<uint32_t> s_render_log_frames{0};
 static std::atomic<uint64_t> s_render_log_rows_accum{0};
+static std::atomic<uint64_t> s_bytes_overflow_log_last_ns{0};
+static std::atomic<uint64_t> s_bytes_overflow_log_seen{0};
+static std::atomic<uint32_t> s_bytes_overflow_log_max_len{0};
 
 static inline uint64_t now_ns() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2941,6 +2945,10 @@ static thread_local bool s_nav_history_suppress_push = false;
 void goto_address(uint64_t addr, DisasmState& disasm) {
     auto& st = g_state;
     int idx = find_instr_at(addr, disasm.file);
+    diag::log_tagged_fmt("disasm_goto",
+        "goto_address addr=0x%llX resolved_row=%d sections=%zu instrs=%zu",
+        static_cast<unsigned long long>(addr), idx,
+        disasm.file.sections.size(), disasm.file.instrs.size());
     if (idx < 0) return;
 
 
@@ -2963,11 +2971,19 @@ void goto_address(uint64_t addr, DisasmState& disasm) {
     st.sel_anchor = idx;
     st.sel_extent = idx;
     st.sel_dragging = false;
+    st.sel_anchor_sub = INT_MIN;
+    st.sel_extent_sub = INT_MIN;
+    st.sel_anchor_px  = -1.f;
+    st.sel_extent_px  = -1.f;
     st.banner_selected_row = -1;
     st.banner_sel_anchor = -1;
     st.banner_sel_extent = -1;
     st.banner_sel_dragging = false;
-    st.target_scroll_y = layout_instr_target_scroll_y(idx, 18.f);
+    float target = layout_instr_target_scroll_y(idx, 18.f);
+    st.target_scroll_y = target;
+    st.scroll_y = target;
+    st.goto_flash_row = idx;
+    st.goto_flash_t = 1.f;
 }
 
 void navigate_back() {
@@ -2978,11 +2994,21 @@ void navigate_back() {
     st.sel_anchor = st.selected_row;
     st.sel_extent = st.selected_row;
     st.sel_dragging = false;
+    st.sel_anchor_sub = INT_MIN;
+    st.sel_extent_sub = INT_MIN;
+    st.sel_anchor_px  = -1.f;
+    st.sel_extent_px  = -1.f;
     st.banner_selected_row = -1;
     st.banner_sel_anchor = -1;
     st.banner_sel_extent = -1;
     st.banner_sel_dragging = false;
-    st.target_scroll_y = layout_instr_target_scroll_y(st.selected_row, 18.f);
+    {
+        float t = layout_instr_target_scroll_y(st.selected_row, 18.f);
+        st.target_scroll_y = t;
+        st.scroll_y = t;
+    }
+    st.goto_flash_row = st.selected_row;
+    st.goto_flash_t = 1.f;
 }
 
 void navigate_forward() {
@@ -2993,11 +3019,21 @@ void navigate_forward() {
     st.sel_anchor = st.selected_row;
     st.sel_extent = st.selected_row;
     st.sel_dragging = false;
+    st.sel_anchor_sub = INT_MIN;
+    st.sel_extent_sub = INT_MIN;
+    st.sel_anchor_px  = -1.f;
+    st.sel_extent_px  = -1.f;
     st.banner_selected_row = -1;
     st.banner_sel_anchor = -1;
     st.banner_sel_extent = -1;
     st.banner_sel_dragging = false;
-    st.target_scroll_y = layout_instr_target_scroll_y(st.selected_row, 18.f);
+    {
+        float t = layout_instr_target_scroll_y(st.selected_row, 18.f);
+        st.target_scroll_y = t;
+        st.scroll_y = t;
+    }
+    st.goto_flash_row = st.selected_row;
+    st.goto_flash_t = 1.f;
 }
 
 static int xref_type_from_annotation(const xref_index::annotation_t& ann,
@@ -4258,6 +4294,10 @@ void render(float pos_x, float pos_y, float width, float height,
                 st.sel_anchor = best;
                 st.sel_extent = best;
                 st.sel_dragging = false;
+                st.sel_anchor_sub = INT_MIN;
+                st.sel_extent_sub = INT_MIN;
+                st.sel_anchor_px  = -1.f;
+                st.sel_extent_px  = -1.f;
             }
         }
     }
@@ -4529,11 +4569,18 @@ void render(float pos_x, float pos_y, float width, float height,
         }
     }
 
-    ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, 20.f, dt);
+    ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, 60.f, dt);
     float max_scroll = std::max(0.f,
         static_cast<float>(s_layout.total_rows) * line_h - content_height + line_h);
     st.target_scroll_y = std::max(0.f, std::min(st.target_scroll_y, max_scroll));
     st.scroll_y = std::max(0.f, std::min(st.scroll_y, max_scroll));
+    if (st.goto_flash_t > 0.f) {
+        st.goto_flash_t -= dt * 1.4f;
+        if (st.goto_flash_t <= 0.f) {
+            st.goto_flash_t = 0.f;
+            st.goto_flash_row = -1;
+        }
+    }
 
 
     static bool s_ctx_popup_was_open_prev = false;
@@ -4558,7 +4605,8 @@ void render(float pos_x, float pos_y, float width, float height,
 
     const float gutter_w = 20.f;
     const float seg_addr_chars = 22.f;
-    const float bytes_chars = 35.f;
+    const char* const kBytesWidthProbe = "XX XX XX XX XX XX XX..";
+    const float bytes_pixel_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, kBytesWidthProbe).x;
     const float mnem_chars = 6.f;
     const float operand_chars = 28.f;
     const float comment_indent_chars = static_cast<float>(ida_export::kColComment);
@@ -4566,7 +4614,7 @@ void render(float pos_x, float pos_y, float width, float height,
     const float x_seg_addr = ox + gutter_w + 4.f;
     const float x_bytes = x_seg_addr + seg_addr_chars * ch_w_safe + 2.f * ch_w_safe;
     const float x_mnem = st.show_bytes
-        ? (x_bytes + bytes_chars * ch_w_safe + 1.f * ch_w_safe)
+        ? (x_bytes + bytes_pixel_w + 1.f * ch_w_safe)
         : (x_seg_addr + seg_addr_chars * ch_w_safe + 2.f * ch_w_safe);
     const float x_operand = x_mnem + mnem_chars * ch_w_safe;
     const float x_comment = x_seg_addr + comment_indent_chars * ch_w_safe;
@@ -4716,6 +4764,10 @@ void render(float pos_x, float pos_y, float width, float height,
                     st.sel_extent = -1;
                     st.selected_row = -1;
                     st.sel_dragging = false;
+                    st.sel_anchor_sub = INT_MIN;
+                    st.sel_extent_sub = INT_MIN;
+                    st.sel_anchor_px  = -1.f;
+                    st.sel_extent_px  = -1.f;
                 }
 
                 if (banner_row_hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
@@ -4745,6 +4797,10 @@ void render(float pos_x, float pos_y, float width, float height,
                     st.sel_extent = -1;
                     st.selected_row = -1;
                     st.sel_dragging = false;
+                    st.sel_anchor_sub = INT_MIN;
+                    st.sel_extent_sub = INT_MIN;
+                    st.sel_anchor_px  = -1.f;
+                    st.sel_extent_px  = -1.f;
                     ImGui::OpenPopup("##disasm_view_banner_ctx");
                 }
             }
@@ -4844,6 +4900,152 @@ void render(float pos_x, float pos_y, float width, float height,
 
     auto fill_row_bg = [&](float yy, ImU32 col) {
         dl->AddRectFilled(ImVec2(ox, yy), ImVec2(ox + width, yy + line_h - 1.f), col);
+    };
+
+    auto fill_row_bg_range = [&](float yy, float x0_abs, float x1_abs, ImU32 col) {
+        if (x1_abs < x0_abs) {
+            float t = x0_abs;
+            x0_abs = x1_abs;
+            x1_abs = t;
+        }
+        float lo = x0_abs < ox ? ox : x0_abs;
+        float hi = x1_abs > ox + width ? ox + width : x1_abs;
+        if (hi <= lo) return;
+        dl->AddRectFilled(ImVec2(lo, yy), ImVec2(hi, yy + line_h - 1.f), col);
+    };
+
+    const bool s_full_line_select_mode = editor_config::disasm_full_line_select;
+
+    auto mouse_x_abs_clamped = [&]() -> float {
+        float mx = ImGui::GetIO().MousePos.x;
+        if (mx < ox) mx = ox;
+        if (mx > ox + width) mx = ox + width;
+        return mx;
+    };
+
+    auto fill_subrow_selection = [&](float yy, int i_row, int sub, ImU32 sel_col) {
+        if (st.sel_anchor < 0 || st.sel_extent < 0) return;
+        const int lo_row = std::min(st.sel_anchor, st.sel_extent);
+        const int hi_row = std::max(st.sel_anchor, st.sel_extent);
+        if (i_row < lo_row || i_row > hi_row) return;
+
+        const bool char_active = !s_full_line_select_mode
+            && st.sel_anchor_px >= 0.f && st.sel_extent_px >= 0.f
+            && st.sel_anchor_sub != INT_MIN && st.sel_extent_sub != INT_MIN;
+
+        if (!char_active) {
+            fill_row_bg(yy, sel_col);
+            return;
+        }
+
+        const int anchor_row = st.sel_anchor;
+        const int extent_row = st.sel_extent;
+        const int anchor_sub = st.sel_anchor_sub;
+        const int extent_sub = st.sel_extent_sub;
+        const float anchor_x = st.sel_anchor_px;
+        const float extent_x = st.sel_extent_px;
+
+        int lead_row, tail_row, lead_sub, tail_sub;
+        float lead_x, tail_x;
+        if (anchor_row < extent_row
+            || (anchor_row == extent_row && anchor_sub < extent_sub)
+            || (anchor_row == extent_row && anchor_sub == extent_sub && anchor_x <= extent_x))
+        {
+            lead_row = anchor_row;
+            lead_sub = anchor_sub;
+            lead_x   = anchor_x;
+            tail_row = extent_row;
+            tail_sub = extent_sub;
+            tail_x   = extent_x;
+        } else {
+            lead_row = extent_row;
+            lead_sub = extent_sub;
+            lead_x   = extent_x;
+            tail_row = anchor_row;
+            tail_sub = anchor_sub;
+            tail_x   = anchor_x;
+        }
+
+        const bool same_row = (lead_row == tail_row);
+        const bool same_sub = same_row && (lead_sub == tail_sub);
+
+        if (same_sub) {
+            if (i_row == lead_row && sub == lead_sub) {
+                fill_row_bg_range(yy, lead_x, tail_x, sel_col);
+            }
+            return;
+        }
+
+        const bool is_lead_row_sub = (i_row == lead_row && sub == lead_sub);
+        const bool is_tail_row_sub = (i_row == tail_row && sub == tail_sub);
+
+        if (is_lead_row_sub) {
+            fill_row_bg_range(yy, lead_x, ox + width, sel_col);
+            return;
+        }
+        if (is_tail_row_sub) {
+            fill_row_bg_range(yy, ox, tail_x, sel_col);
+            return;
+        }
+
+        if (i_row > lead_row && i_row < tail_row) {
+            fill_row_bg(yy, sel_col);
+            return;
+        }
+
+        if (i_row == lead_row && sub > lead_sub) {
+            fill_row_bg(yy, sel_col);
+            return;
+        }
+
+        if (i_row == tail_row && sub < tail_sub) {
+            fill_row_bg(yy, sel_col);
+            return;
+        }
+    };
+
+    auto reset_char_selection = [&]() {
+        st.sel_anchor_px = -1.f;
+        st.sel_extent_px = -1.f;
+        st.sel_anchor_sub = INT_MIN;
+        st.sel_extent_sub = INT_MIN;
+    };
+
+    auto begin_char_selection = [&](int sub, bool shift_extend) {
+        if (s_full_line_select_mode) {
+            reset_char_selection();
+            return;
+        }
+        float mx = mouse_x_abs_clamped() - ox;
+        if (shift_extend) {
+            if (st.sel_anchor_sub == INT_MIN || st.sel_anchor_px < 0.f) {
+                st.sel_anchor_sub = sub;
+                st.sel_anchor_px  = mx;
+            }
+            st.sel_extent_sub = sub;
+            st.sel_extent_px  = mx;
+        } else {
+            st.sel_anchor_sub = sub;
+            st.sel_extent_sub = sub;
+            st.sel_anchor_px  = mx;
+            st.sel_extent_px  = mx;
+        }
+    };
+
+    auto update_char_drag = [&](int sub) {
+        if (s_full_line_select_mode) return;
+        float mx = mouse_x_abs_clamped() - ox;
+        st.sel_extent_sub = sub;
+        st.sel_extent_px  = mx;
+    };
+
+    auto log_disasm_sel_click = [&](int i_row, int sub, uint64_t addr) {
+        float mx = mouse_x_abs_clamped() - ox;
+        driver_bridge::debug_log(
+            "[disasm_sel] click row=%d sub=%d col_px=%.1f addr=0x%llX full_line=%d\n",
+            i_row, sub, mx,
+            static_cast<unsigned long long>(addr),
+            s_full_line_select_mode ? 1 : 0);
     };
 
     auto sec_resolver_init = [&]() {
@@ -4993,6 +5195,7 @@ void render(float pos_x, float pos_y, float width, float height,
                         }
                         st.selected_row = i;
                         st.sel_dragging = false;
+                        reset_char_selection();
                         st.banner_sel_anchor = -1;
                         st.banner_sel_extent = -1;
                         st.banner_selected_row = -1;
@@ -5007,6 +5210,7 @@ void render(float pos_x, float pos_y, float width, float height,
                             st.sel_anchor = i;
                             st.sel_extent = i;
                             st.selected_row = i;
+                            reset_char_selection();
                         }
                         st.popup_sel_anchor = st.sel_anchor;
                         st.popup_sel_extent = st.sel_extent;
@@ -5050,13 +5254,37 @@ void render(float pos_x, float pos_y, float width, float height,
         bool in_sel    = (sel_lo >= 0 && i >= sel_lo && i <= sel_hi);
         bool is_cursor = (i == st.selected_row);
 
+        const int before_extent_total = (s_layout.ready && i < static_cast<int>(s_layout.before_extent.size()))
+            ? s_layout.before_extent[i]
+            : 0;
+        const int main_subrow_id = before_extent_total;
+
         if (in_sel) {
-            fill_row_bg(y, aida::ui::with_alpha(tk.selection, row_a_inner));
+            fill_subrow_selection(y, i, main_subrow_id,
+                aida::ui::with_alpha(tk.selection, row_a_inner));
+        }
+        if (i == st.goto_flash_row && st.goto_flash_t > 0.001f) {
+            float ft = st.goto_flash_t;
+            ImU32 flash_fill = aida::ui::with_alpha(tk.accent_glow, row_a_inner * ft * 0.85f);
+            fill_row_bg(y, flash_fill);
+            ImU32 flash_border = aida::ui::with_alpha(tk.accent_u32, row_a_inner * ft);
+            dl->AddRect(ImVec2(ox + 2.f, y + 1.f),
+                ImVec2(ox + width - 2.f, y + line_h - 2.f),
+                flash_border, 3.f, 0, 1.8f);
         }
         if (is_cursor) {
-            fill_row_bg(y, aida::ui::with_alpha(disasm_theme::cursor_line_bg(), row_a_inner * 0.5f));
-            dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + 3.f, y + line_h - 1.f),
-                aida::ui::with_alpha(tk.accent_u32, row_a_inner));
+            const bool main_char_cursor = !s_full_line_select_mode
+                && st.sel_anchor_sub != INT_MIN
+                && st.sel_extent_sub != INT_MIN;
+            const bool main_sub_matches = main_char_cursor
+                ? (main_subrow_id == st.sel_anchor_sub
+                   || main_subrow_id == st.sel_extent_sub)
+                : true;
+            if (main_sub_matches) {
+                fill_row_bg(y, aida::ui::with_alpha(disasm_theme::cursor_line_bg(), row_a_inner * 0.5f));
+                dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + 3.f, y + line_h - 1.f),
+                    aida::ui::with_alpha(tk.accent_u32, row_a_inner));
+            }
         }
 
         for (auto& bm : st.bookmarks) {
@@ -5227,16 +5455,25 @@ void render(float pos_x, float pos_y, float width, float height,
             draw_text_at(x_mnem, yy, text_col, r.text.c_str(), row_y_off);
         };
 
-        auto paint_injection_row_bg = [&](float yy) {
+        auto paint_injection_row_bg = [&](float yy, int sub_id) {
             bool injr_in_sel = (sel_lo >= 0 && i >= sel_lo && i <= sel_hi);
             bool injr_is_cursor = (i == st.selected_row);
             if (injr_in_sel) {
-                fill_row_bg(yy, aida::ui::with_alpha(tk.selection, row_a_inner));
+                fill_subrow_selection(yy, i, sub_id,
+                    aida::ui::with_alpha(tk.selection, row_a_inner));
             }
             if (injr_is_cursor) {
-                fill_row_bg(yy, aida::ui::with_alpha(disasm_theme::cursor_line_bg(), row_a_inner * 0.5f));
-                dl->AddRectFilled(ImVec2(ox, yy), ImVec2(ox + 3.f, yy + line_h - 1.f),
-                    aida::ui::with_alpha(tk.accent_u32, row_a_inner));
+                const bool char_cursor = !s_full_line_select_mode
+                    && st.sel_anchor_sub != INT_MIN
+                    && st.sel_extent_sub != INT_MIN;
+                const bool sub_matches_cursor = char_cursor
+                    ? (sub_id == st.sel_anchor_sub || sub_id == st.sel_extent_sub)
+                    : true;
+                if (sub_matches_cursor) {
+                    fill_row_bg(yy, aida::ui::with_alpha(disasm_theme::cursor_line_bg(), row_a_inner * 0.5f));
+                    dl->AddRectFilled(ImVec2(ox, yy), ImVec2(ox + 3.f, yy + line_h - 1.f),
+                        aida::ui::with_alpha(tk.accent_u32, row_a_inner));
+                }
             }
             bool injr_hovered = !ctx_input_locked && ImGui::IsMouseHoveringRect(
                 ImVec2(ox, yy), ImVec2(ox + width, yy + line_h - 1.f), false);
@@ -5245,22 +5482,37 @@ void render(float pos_x, float pos_y, float width, float height,
             }
         };
 
-        auto handle_injection_row_input = [&](float yy, uint64_t row_addr) {
+        auto handle_injection_row_input = [&](float yy, uint64_t row_addr, int sub_id) {
             bool inj_hovered = !ctx_input_locked && ImGui::IsMouseHoveringRect(
                 ImVec2(ox, yy), ImVec2(ox + width, yy + line_h - 1.f), false);
             if (!inj_hovered) return;
+            if (st.sel_dragging
+                && ImGui::IsMouseDown(ImGuiMouseButton_Left)
+                && !ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+            {
+                if (st.sel_extent != i) {
+                    st.sel_extent = i;
+                    st.selected_row = i;
+                }
+                update_char_drag(sub_id);
+                return;
+            }
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                if (ImGui::GetIO().KeyShift) {
+                const bool shift_held = ImGui::GetIO().KeyShift;
+                if (shift_held) {
                     if (st.sel_anchor < 0) st.sel_anchor = i;
                     st.sel_extent = i;
                     st.selected_row = i;
                     st.sel_dragging = false;
+                    begin_char_selection(sub_id, true);
                 } else {
                     st.sel_anchor = i;
                     st.sel_extent = i;
                     st.selected_row = i;
                     st.sel_dragging = false;
+                    begin_char_selection(sub_id, false);
                 }
+                log_disasm_sel_click(i, sub_id, row_addr);
                 st.banner_sel_anchor = -1;
                 st.banner_sel_extent = -1;
                 st.banner_selected_row = -1;
@@ -5277,6 +5529,8 @@ void render(float pos_x, float pos_y, float width, float height,
                     st.sel_anchor = i;
                     st.sel_extent = i;
                     st.selected_row = i;
+                    reset_char_selection();
+                    begin_char_selection(sub_id, false);
                 }
                 st.popup_sel_anchor = st.sel_anchor;
                 st.popup_sel_extent = st.sel_extent;
@@ -5290,9 +5544,6 @@ void render(float pos_x, float pos_y, float width, float height,
         };
 
         const auto& before_rows_ref = *before_rows_ptr;
-        const int before_extent_total = (s_layout.ready && i < static_cast<int>(s_layout.before_extent.size()))
-            ? s_layout.before_extent[i]
-            : 0;
         const int before_row_cap = (s_layout.ready && i < static_cast<int>(s_layout.before_row_count.size()))
             ? s_layout.before_row_count[i]
             : static_cast<int>(before_rows_ref.size());
@@ -5309,7 +5560,7 @@ void render(float pos_x, float pos_y, float width, float height,
             const auto& br = before_rows_ref[bi];
             bool visible = (yy + line_h >= oy_content) && (yy <= oy_content + content_height);
             if (visible) {
-                paint_injection_row_bg(yy);
+                paint_injection_row_bg(yy, this_slot);
                 if (br.kind == function_index::injection_t::spacer_line) {
                     draw_addr_prefix_cached(yy, &cache, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
                 } else {
@@ -5334,7 +5585,7 @@ void render(float pos_x, float pos_y, float width, float height,
                         aida::ui::with_alpha(disasm_theme::xref(), row_a_inner * 0.95f),
                         xref_text.c_str(), row_y_off);
                 }
-                handle_injection_row_input(yy, br.addr);
+                handle_injection_row_input(yy, br.addr, this_slot);
             }
             if (br.kind == function_index::injection_t::proc_header && xrefs_at_func.size() > 1) {
                 const int reserved_proc_xref = (s_layout.ready && i < static_cast<int>(s_layout.proc_xref_extra.size()))
@@ -5345,14 +5596,14 @@ void render(float pos_x, float pos_y, float width, float height,
                     const int x_slot = slot_idx++;
                     float xy = slot_y(x_slot);
                     if (xy + line_h < oy_content || xy > oy_content + content_height) continue;
-                    paint_injection_row_bg(xy);
+                    paint_injection_row_bg(xy, x_slot);
                     draw_addr_prefix_cached(xy, &cache, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
                     bool last_more = (xi + 1 == xrefs_at_func.size()) && xrefs_more;
                     std::string xt = ida_format_xref_comment(xrefs_at_func[xi], last_more);
                     draw_text_at(x_comment, xy,
                         aida::ui::with_alpha(disasm_theme::xref(), row_a_inner * 0.9f),
                         xt.c_str(), row_y_off);
-                    handle_injection_row_input(xy, br.addr);
+                    handle_injection_row_input(xy, br.addr, x_slot);
                 }
             }
         }
@@ -5361,14 +5612,14 @@ void render(float pos_x, float pos_y, float width, float height,
             const int prefix_slot = slot_idx++;
             float prefix_y = slot_y(prefix_slot);
             if (prefix_y + line_h >= oy_content && prefix_y <= oy_content + content_height) {
-                paint_injection_row_bg(prefix_y);
+                paint_injection_row_bg(prefix_y, prefix_slot);
                 draw_addr_prefix_cached(prefix_y, &cache, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
-                handle_injection_row_input(prefix_y, ins.addr);
+                handle_injection_row_input(prefix_y, ins.addr, prefix_slot);
             }
             const int label_slot = slot_idx++;
             float label_y = slot_y(label_slot);
             if (label_y + line_h >= oy_content && label_y <= oy_content + content_height) {
-                paint_injection_row_bg(label_y);
+                paint_injection_row_bg(label_y, label_slot);
                 draw_addr_prefix_cached(label_y, &cache, ins.addr, sec_name, row_a_inner * 0.7f, row_y_off);
                 std::string lbl_text = *inline_label_ptr;
                 if (lbl_text.empty() || lbl_text.back() != ':') lbl_text += ":";
@@ -5390,7 +5641,7 @@ void render(float pos_x, float pos_y, float width, float height,
                         aida::ui::with_alpha(disasm_theme::xref(), row_a_inner * 0.9f),
                         xt.c_str(), row_y_off);
                 }
-                handle_injection_row_input(label_y, ins.addr);
+                handle_injection_row_input(label_y, ins.addr, label_slot);
             }
             if (cache.xref_inline_valid && cache.xref_inline.size() > 1) {
                 const int reserved_inline_xref = (s_layout.ready && i < static_cast<int>(s_layout.inline_xref_extra.size()))
@@ -5401,14 +5652,14 @@ void render(float pos_x, float pos_y, float width, float height,
                     const int x_slot = slot_idx++;
                     float xy = slot_y(x_slot);
                     if (xy + line_h < oy_content || xy > oy_content + content_height) continue;
-                    paint_injection_row_bg(xy);
+                    paint_injection_row_bg(xy, x_slot);
                     draw_addr_prefix_cached(xy, &cache, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
                     bool last_more = (xi + 1 == cache.xref_inline.size()) && cache.xref_inline_more;
                     std::string xt = ida_format_xref_comment(cache.xref_inline[xi], last_more);
                     draw_text_at(x_comment, xy,
                         aida::ui::with_alpha(disasm_theme::xref(), row_a_inner * 0.9f),
                         xt.c_str(), row_y_off);
-                    handle_injection_row_input(xy, ins.addr);
+                    handle_injection_row_input(xy, ins.addr, x_slot);
                 }
             }
         }
@@ -5419,13 +5670,41 @@ void render(float pos_x, float pos_y, float width, float height,
             if (!cache.bytes_valid) {
                 char bytes_buf[96] = {};
                 int boff = 0;
-                int max_pairs = 10;
+                int max_pairs = 7;
                 int show_n = ins.len < max_pairs ? ins.len : max_pairs;
                 for (int b = 0; b < show_n && boff + 4 < static_cast<int>(sizeof(bytes_buf)); b++)
                     boff += std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff,
                         b ? " %02X" : "%02X", ins.raw[b]);
-                if (ins.len > max_pairs && boff + 4 < static_cast<int>(sizeof(bytes_buf)))
+                if (ins.len > max_pairs && boff + 4 < static_cast<int>(sizeof(bytes_buf))) {
                     std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff, "..");
+                    s_bytes_overflow_log_seen.fetch_add(1, std::memory_order_relaxed);
+                    uint32_t prev_max = s_bytes_overflow_log_max_len.load(std::memory_order_relaxed);
+                    while (static_cast<uint32_t>(ins.len) > prev_max
+                        && !s_bytes_overflow_log_max_len.compare_exchange_weak(
+                            prev_max, static_cast<uint32_t>(ins.len),
+                            std::memory_order_relaxed, std::memory_order_relaxed)) {
+                    }
+                    const uint64_t now_ns_v = now_ns();
+                    uint64_t prev_log = s_bytes_overflow_log_last_ns.load(std::memory_order_relaxed);
+                    if (prev_log == 0
+                        || now_ns_v - prev_log >= 5000000000ull)
+                    {
+                        if (s_bytes_overflow_log_last_ns.compare_exchange_strong(
+                            prev_log, now_ns_v,
+                            std::memory_order_acq_rel, std::memory_order_relaxed))
+                        {
+                            uint64_t total = s_bytes_overflow_log_seen.exchange(0, std::memory_order_acq_rel);
+                            uint32_t mx = s_bytes_overflow_log_max_len.exchange(0, std::memory_order_acq_rel);
+                            driver_bridge::debug_log(
+                                "[disasm_bytes] truncated len=%d addr=0x%llX cap=%d window_count=%llu window_max_len=%u\n",
+                                ins.len,
+                                static_cast<unsigned long long>(ins.addr),
+                                max_pairs,
+                                static_cast<unsigned long long>(total),
+                                mx);
+                        }
+                    }
+                }
                 cache.bytes_str.assign(bytes_buf);
                 cache.bytes_valid = true;
             }
@@ -5747,18 +6026,20 @@ void render(float pos_x, float pos_y, float width, float height,
             }
         }
 
+        const int after_sub_base = before_extent_total + 1;
         size_t after_row_offset = 0;
         if (!throttled && function_index::is_noreturn_call_at(ins.addr)) {
             float yy = y + line_h;
             if (yy + line_h >= oy_content && yy <= oy_content + content_height) {
-                paint_injection_row_bg(yy);
+                const int noreturn_sub = after_sub_base + static_cast<int>(after_row_offset);
+                paint_injection_row_bg(yy, noreturn_sub);
                 draw_addr_prefix(yy, ins.addr, sec_name, row_a_inner * 0.55f, row_y_off);
                 function_index::injection_row_t sep;
                 sep.kind = function_index::injection_t::endp_separator;
                 sep.addr = ins.addr;
                 sep.text = "; ---------------------------------------------------------------------------";
                 draw_injection_row(yy, sep, sec_name);
-                handle_injection_row_input(yy, ins.addr);
+                handle_injection_row_input(yy, ins.addr, noreturn_sub);
             }
             ++after_row_offset;
         }
@@ -5769,29 +6050,34 @@ void render(float pos_x, float pos_y, float width, float height,
                 float yy = y + static_cast<float>(ai + 1 + after_row_offset) * line_h;
                 if (yy + line_h < oy_content || yy > oy_content + content_height) continue;
                 const auto& ar = after_rows_ref[ai];
-                paint_injection_row_bg(yy);
+                const int after_sub = after_sub_base + static_cast<int>(after_row_offset + ai);
+                paint_injection_row_bg(yy, after_sub);
                 if (ar.kind == function_index::injection_t::spacer_line) {
                     draw_addr_prefix(yy, ar.addr, sec_name, row_a_inner * 0.55f, row_y_off);
                 } else {
                     function_index::injection_row_t copy = ar;
                     draw_injection_row(yy, copy, sec_name);
                 }
-                handle_injection_row_input(yy, ar.addr);
+                handle_injection_row_input(yy, ar.addr, after_sub);
             }
         }
 
         if (row_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            if (ImGui::GetIO().KeyShift) {
+            const bool shift_held = ImGui::GetIO().KeyShift;
+            if (shift_held) {
                 if (st.sel_anchor < 0) st.sel_anchor = i;
                 st.sel_extent = i;
                 st.selected_row = i;
                 st.sel_dragging = false;
+                begin_char_selection(main_subrow_id, true);
             } else {
                 st.sel_anchor = i;
                 st.sel_extent = i;
                 st.selected_row = i;
                 st.sel_dragging = true;
+                begin_char_selection(main_subrow_id, false);
             }
+            log_disasm_sel_click(i, main_subrow_id, ins.addr);
             st.banner_sel_anchor = -1;
             st.banner_sel_extent = -1;
             st.banner_selected_row = -1;
@@ -5799,11 +6085,13 @@ void render(float pos_x, float pos_y, float width, float height,
         }
 
         if (row_hovered && st.sel_dragging
-            && ImGui::IsMouseDown(ImGuiMouseButton_Left)
-            && st.sel_extent != i)
+            && ImGui::IsMouseDown(ImGuiMouseButton_Left))
         {
-            st.sel_extent = i;
-            st.selected_row = i;
+            if (st.sel_extent != i) {
+                st.sel_extent = i;
+                st.selected_row = i;
+            }
+            update_char_drag(main_subrow_id);
         }
 
         if (row_hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
@@ -5818,6 +6106,8 @@ void render(float pos_x, float pos_y, float width, float height,
                 st.sel_anchor = i;
                 st.sel_extent = i;
                 st.selected_row = i;
+                reset_char_selection();
+                begin_char_selection(main_subrow_id, false);
             }
             st.popup_sel_anchor = st.sel_anchor;
             st.popup_sel_extent = st.sel_extent;
@@ -5855,6 +6145,13 @@ void render(float pos_x, float pos_y, float width, float height,
             if (top_row >= 0 && top_row != st.sel_extent) {
                 st.sel_extent = top_row;
                 st.selected_row = top_row;
+                if (!s_full_line_select_mode
+                    && st.sel_anchor_px >= 0.f
+                    && st.sel_extent_px >= 0.f)
+                {
+                    st.sel_extent_sub = 0;
+                    st.sel_extent_px  = 0.f;
+                }
             }
         } else if (mouse_y > bottom_y) {
             float depth = mouse_y - bottom_y;
@@ -5873,6 +6170,13 @@ void render(float pos_x, float pos_y, float width, float height,
             if (bottom_row >= 0 && bottom_row != st.sel_extent) {
                 st.sel_extent = bottom_row;
                 st.selected_row = bottom_row;
+                if (!s_full_line_select_mode
+                    && st.sel_anchor_px >= 0.f
+                    && st.sel_extent_px >= 0.f)
+                {
+                    st.sel_extent_sub = INT_MAX;
+                    st.sel_extent_px  = width;
+                }
             }
         }
     }
@@ -6131,6 +6435,17 @@ void render(float pos_x, float pos_y, float width, float height,
             if (ImGui::MenuItem("Show Bytes", nullptr, st.show_bytes))
                 st.show_bytes = !st.show_bytes;
 
+            if (ImGui::MenuItem("Full-Line Selection", nullptr,
+                editor_config::disasm_full_line_select))
+            {
+                editor_config::disasm_full_line_select =
+                    !editor_config::disasm_full_line_select;
+                st.sel_anchor_sub = INT_MIN;
+                st.sel_extent_sub = INT_MIN;
+                st.sel_anchor_px  = -1.f;
+                st.sel_extent_px  = -1.f;
+            }
+
             ImGui::Separator();
 
             if (ImGui::MenuItem("Decompile Function")) {
@@ -6144,12 +6459,29 @@ void render(float pos_x, float pos_y, float width, float height,
                 source_reconstruct_view::open();
             }
             if (ImGui::MenuItem("Generate AOB Signature")) {
-                char addr_buf[32];
-                snprintf(addr_buf, sizeof(addr_buf), "%llX", static_cast<unsigned long long>(ci.addr));
-                strncpy(aob_generator::g_state.address_input, addr_buf, sizeof(aob_generator::g_state.address_input) - 1);
-                aob_generator::generate_from_address(ci.addr, aob_generator::g_state.instruction_count, aob_generator::g_state.auto_wildcard);
-                scan_hub_view::set_sub_tab(scan_hub_view::sub_tab_t::aob);
-                globals::ui::active_center_view = center_view_t::scan_hub;
+                bool driver_ok = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
+                bool static_ok = disasm.file.loaded && !disasm.file.sections.empty();
+                if (ci.addr == 0 || (!driver_ok && !static_ok)) {
+                    aob_generator::g_state.show_no_address_modal = true;
+                    {
+                        std::lock_guard<std::mutex> lk(aob_generator::g_state.mutex);
+                        aob_generator::g_state.last_error = (ci.addr == 0)
+                            ? "No address selected - click an instruction first."
+                            : "No data source available. Attach a process or open a PE file.";
+                    }
+                    diag::log_tagged_fmt("aob", "menu_refused addr=0x%llX driver=%d static=%d",
+                        static_cast<unsigned long long>(ci.addr),
+                        static_cast<int>(driver_ok), static_cast<int>(static_ok));
+                    scan_hub_view::set_sub_tab(scan_hub_view::sub_tab_t::aob);
+                    globals::ui::active_center_view = center_view_t::scan_hub;
+                } else {
+                    char addr_buf[32];
+                    snprintf(addr_buf, sizeof(addr_buf), "%llX", static_cast<unsigned long long>(ci.addr));
+                    strncpy(aob_generator::g_state.address_input, addr_buf, sizeof(aob_generator::g_state.address_input) - 1);
+                    aob_generator::generate_from_address(ci.addr, aob_generator::g_state.instruction_count, aob_generator::g_state.auto_wildcard);
+                    scan_hub_view::set_sub_tab(scan_hub_view::sub_tab_t::aob);
+                    globals::ui::active_center_view = center_view_t::scan_hub;
+                }
             }
         }
         ImGui::EndPopup();
@@ -6418,6 +6750,10 @@ void render(float pos_x, float pos_y, float width, float height,
                     st.sel_extent = n - 1;
                     st.selected_row = 0;
                     st.sel_dragging = false;
+                    st.sel_anchor_sub = INT_MIN;
+                    st.sel_extent_sub = INT_MIN;
+                    st.sel_anchor_px  = -1.f;
+                    st.sel_extent_px  = -1.f;
                 }
             }
             if (ImGui::IsKeyPressed(ImGuiKey_C, false)
@@ -6751,6 +7087,10 @@ std::unique_ptr<snapshot_t> detach_snapshot()
     out->sel_anchor = g_state.sel_anchor;
     out->sel_extent = g_state.sel_extent;
     out->sel_dragging = g_state.sel_dragging;
+    out->sel_anchor_sub = g_state.sel_anchor_sub;
+    out->sel_extent_sub = g_state.sel_extent_sub;
+    out->sel_anchor_px = g_state.sel_anchor_px;
+    out->sel_extent_px = g_state.sel_extent_px;
     out->banner_selected_row = g_state.banner_selected_row;
     out->banner_sel_anchor = g_state.banner_sel_anchor;
     out->banner_sel_extent = g_state.banner_sel_extent;
@@ -6793,6 +7133,10 @@ std::unique_ptr<snapshot_t> detach_snapshot()
     g_state.sel_anchor = -1;
     g_state.sel_extent = -1;
     g_state.sel_dragging = false;
+    g_state.sel_anchor_sub = -1;
+    g_state.sel_extent_sub = -1;
+    g_state.sel_anchor_px = -1.f;
+    g_state.sel_extent_px = -1.f;
     g_state.banner_selected_row = -1;
     g_state.banner_sel_anchor = -1;
     g_state.banner_sel_extent = -1;
@@ -6842,6 +7186,10 @@ void attach_snapshot(std::unique_ptr<snapshot_t> snap)
     g_state.sel_anchor = snap->sel_anchor;
     g_state.sel_extent = snap->sel_extent;
     g_state.sel_dragging = snap->sel_dragging;
+    g_state.sel_anchor_sub = snap->sel_anchor_sub;
+    g_state.sel_extent_sub = snap->sel_extent_sub;
+    g_state.sel_anchor_px = snap->sel_anchor_px;
+    g_state.sel_extent_px = snap->sel_extent_px;
     g_state.banner_selected_row = snap->banner_selected_row;
     g_state.banner_sel_anchor = snap->banner_sel_anchor;
     g_state.banner_sel_extent = snap->banner_sel_extent;

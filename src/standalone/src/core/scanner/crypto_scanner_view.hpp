@@ -8,7 +8,9 @@
 #include "imgui.h"
 #include "crypto_scanner.hpp"
 #include "disasm_view.hpp"
+#include "hex_view.hpp"
 #include "ui_anim.hpp"
+#include "../anti-tamper/webhook.hpp"
 #include "../helpers/globals.h"
 #include "../helpers/diag_log.hpp"
 #include "../ui/theme.hpp"
@@ -283,6 +285,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	cx += 140.f;
 
 	bool scanning = cs.scanning.load();
+	bool attached_now = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
+	bool pe_loaded = g_disasm.file.loaded;
 
 	const float btn_gap = 14.f;
 	{
@@ -290,26 +294,37 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		const char* lbl = scanning ? "Cancel" : "Scan Process";
 		if (aida::ui::button(lbl,
 				scanning ? aida::ui::button_kind_t::destructive : aida::ui::button_kind_t::primary,
-				aida::ui::size_t_::md, ImVec2(0.f, 0.f), false, nullptr, false)) {
-			if (scanning) crypto_scanner::cancel();
-			else          crypto_scanner::scan_process();
+				aida::ui::size_t_::md, ImVec2(0.f, 0.f), !scanning && !attached_now, nullptr, false)) {
+			if (scanning) {
+				crypto_scanner::cancel();
+				anti_tamper::webhook::write_log("scan_audit",
+					"[scan_audit] crypto_scanner cancel");
+			} else {
+				crypto_scanner::scan_process();
+				anti_tamper::webhook::write_log("scan_audit",
+					"[scan_audit] crypto_scanner scan_process");
+			}
 		}
 		cx = ImGui::GetItemRectMax().x + btn_gap;
 	}
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
-		bool fl = !g_disasm.file.loaded;
+		bool fl = !pe_loaded;
 		if (aida::ui::button("Scan File", aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), scanning || fl)) {
 			crypto_scanner::scan_file(g_disasm.file);
+			anti_tamper::webhook::write_log("scan_audit",
+				"[scan_audit] crypto_scanner scan_file");
 		}
 		cx = ImGui::GetItemRectMax().x + btn_gap;
 	}
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		if (aida::ui::button("Entropy", aida::ui::button_kind_t::secondary,
-				aida::ui::size_t_::md, ImVec2(0.f, 0.f), scanning)) {
+				aida::ui::size_t_::md, ImVec2(0.f, 0.f), scanning || !attached_now)) {
 			crypto_scanner::scan_entropy();
+			anti_tamper::webhook::write_log("scan_audit",
+				"[scan_audit] crypto_scanner scan_entropy");
 		}
 		cx = ImGui::GetItemRectMax().x + btn_gap;
 	}
@@ -351,7 +366,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		aida::ui::render_progress_bar(ImVec2(bar_x, bar_y), bar_w, 6.f, prog, false, true);
 	}
 
-	cy = oy + toolbar_h + 12.f;
+	cy = oy + toolbar_h + 6.f;
+	if (!attached_now && !pe_loaded) {
+		ui_anim::render_inline_callout(dl, ox + 16.f, cy, width - 32.f, 22.f,
+			"Scan needs either a live attach or a loaded PE.",
+			ui_anim::callout_kind_t::warn, 0.85f, 0.6f, 0.2f, alpha);
+		cy += 28.f;
+	} else {
+		cy += 6.f;
+	}
 
 	{
 		ImGui::SetCursorScreenPos(ImVec2(ox + 16.f, cy));
@@ -639,6 +662,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (ImGui::MenuItem("Go to Disassembly")) {
 				globals::ui::active_center_view = center_view_t::disassembly;
 				disasm_view::goto_address(ctx_hit.address, g_disasm);
+				anti_tamper::webhook::write_log("scan_audit",
+					"[scan_audit] crypto_scanner ctx open_disasm");
+			}
+
+			if (ImGui::MenuItem("Open in Hex")) {
+				hex_view::read_from_process(ctx_hit.address, 256);
+				globals::ui::active_center_view = center_view_t::hex_view;
+				anti_tamper::webhook::write_log("scan_audit",
+					"[scan_audit] crypto_scanner ctx open_hex");
 			}
 
 			if (!ctx_hit.referencing_functions.empty()) {
@@ -652,16 +684,26 @@ inline void render(float pos_x, float pos_y, float width, float height,
 						if (ImGui::MenuItem(menu_text.c_str())) {
 							globals::ui::active_center_view = center_view_t::disassembly;
 							disasm_view::goto_address(ref_addr, g_disasm);
+							anti_tamper::webhook::write_log("scan_audit",
+								"[scan_audit] crypto_scanner ctx show_ref");
 						}
 					}
 					ImGui::EndMenu();
 				}
 			}
 
+			ImGui::Separator();
 			if (ImGui::MenuItem("Copy Address")) {
 				char addr_copy[32];
 				std::snprintf(addr_copy, sizeof(addr_copy), "0x%llX", static_cast<unsigned long long>(ctx_hit.address));
 				ImGui::SetClipboardText(addr_copy);
+				anti_tamper::webhook::write_log("scan_audit",
+					"[scan_audit] crypto_scanner ctx copy_address");
+			}
+			if (ImGui::MenuItem("Copy Algorithm")) {
+				ImGui::SetClipboardText(ctx_hit.algorithm.c_str());
+				anti_tamper::webhook::write_log("scan_audit",
+					"[scan_audit] crypto_scanner ctx copy_algo");
 			}
 		}
 		ImGui::EndPopup();

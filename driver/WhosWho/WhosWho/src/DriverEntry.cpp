@@ -502,6 +502,18 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     NTSTATUS dbe_status = debug_events::initialize();
     WW_LOG("DriverEntry: debug_events::initialize returned 0x%08lx", dbe_status);
 
+    WW_LOG("DriverEntry: invoking malware_safe::init (after process_guard)...");
+    NTSTATUS ms_status = malware_safe::init();
+    if (!NT_SUCCESS(ms_status) && ms_status != STATUS_ALREADY_REGISTERED) {
+        WW_LOG("DriverEntry: malware_safe::init FAILED 0x%08lx - continuing with malware-safe gating DISABLED",
+            ms_status);
+    } else {
+        WW_LOG("DriverEntry: malware_safe::init OK status=0x%08lx callback_registered=%d create_notify_registered=%d",
+            ms_status,
+            malware_safe::g_registry_callback_registered,
+            malware_safe::g_create_notify_registered);
+    }
+
     WW_LOG("DriverEntry: scheduling stealth hide...");
     stealth::ScheduleDelayedHide(DriverObject);
 

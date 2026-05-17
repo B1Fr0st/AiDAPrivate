@@ -68,8 +68,8 @@ inline ImU32 severity_token(stealth_engine::finding_severity_t s, float alpha)
 }
 
 inline constexpr aida::ui::hub_strip::tab_t s_subtabs[] = {
-	{ "Protection Scan", "scan attached process" },
-	{ "Stealth Controls", "anti-debug hook controls" },
+	{ "Protection Scan", "scan attached process", "Scan" },
+	{ "Stealth Controls", "anti-debug hook controls", "Ctrl" },
 };
 
 inline void render_protection_scan(float pos_x, float pos_y, float w, float h,

@@ -56,3 +56,30 @@ namespace icon_loader
 
 extern HWND g_hwnd;
 extern const char* g_render_section;
+
+namespace ui_input_gate
+{
+	bool any_fake_modal_open();
+	bool popup_blocks_background_input();
+	bool true_modal_open();
+	bool chrome_input_blocked();
+	bool splitter_input_blocked();
+
+	inline bool mouse_clicked_left()
+	{
+		if (popup_blocks_background_input()) return false;
+		return ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+	}
+
+	inline bool mouse_clicked_right()
+	{
+		if (popup_blocks_background_input()) return false;
+		return ImGui::IsMouseClicked(ImGuiMouseButton_Right);
+	}
+
+	inline bool mouse_clicked_middle()
+	{
+		if (popup_blocks_background_input()) return false;
+		return ImGui::IsMouseClicked(ImGuiMouseButton_Middle);
+	}
+}

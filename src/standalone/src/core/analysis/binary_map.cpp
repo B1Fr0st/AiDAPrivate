@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -288,6 +289,84 @@ namespace binary_map {
 						load_pins_for_hash(new_hash);
 				});
 			subscription_armed() = invalidation_handle().valid();
+		}
+
+		float compute_shannon_entropy(const uint8_t* data, size_t length)
+		{
+			if (data == nullptr || length == 0)
+				return 0.f;
+			uint64_t freq[256] = {};
+			for (size_t i = 0; i < length; ++i)
+				++freq[data[i]];
+			const double inv = 1.0 / static_cast<double>(length);
+			double h = 0.0;
+			for (int i = 0; i < 256; ++i) {
+				if (freq[i] == 0) continue;
+				const double p = static_cast<double>(freq[i]) * inv;
+				h -= p * (std::log(p) / std::log(2.0));
+			}
+			if (h < 0.0) h = 0.0;
+			if (h > 8.0) h = 8.0;
+			return static_cast<float>(h / 8.0);
+		}
+
+		constexpr uint64_t kEntropyMaxSample = 256ull * 1024ull;
+		constexpr uint64_t kEntropyMaxPerSection = 1024ull * 1024ull;
+
+		void populate_section_entropy_static(std::vector<map_section_t>& sections)
+		{
+			for (auto& ms : sections) {
+				if (ms.size == 0) {
+					ms.entropy = 0.f;
+					ms.sampled_bytes = 0;
+					continue;
+				}
+				uint64_t to_read = ms.size;
+				if (to_read > kEntropyMaxPerSection) to_read = kEntropyMaxPerSection;
+				std::vector<uint8_t> blob;
+				if (!static_analysis::read_bytes_from_pe(g_disasm.file, ms.va,
+					static_cast<size_t>(to_read), blob) || blob.empty()) {
+					ms.entropy = 0.f;
+					ms.sampled_bytes = 0;
+					diag::log_tagged_fmt("binary_map",
+						"entropy_static SKIP name='%s' va=0x%llX size=%llu read_failed",
+						ms.name.c_str(),
+						static_cast<unsigned long long>(ms.va),
+						static_cast<unsigned long long>(ms.size));
+					continue;
+				}
+				size_t sample = blob.size();
+				if (sample > kEntropyMaxSample) sample = static_cast<size_t>(kEntropyMaxSample);
+				ms.entropy = compute_shannon_entropy(blob.data(), sample);
+				ms.sampled_bytes = static_cast<uint64_t>(sample);
+			}
+		}
+
+		void populate_section_entropy_live(std::vector<map_section_t>& sections)
+		{
+			for (auto& ms : sections) {
+				if (ms.size == 0) {
+					ms.entropy = 0.f;
+					ms.sampled_bytes = 0;
+					continue;
+				}
+				uint64_t to_read = ms.size;
+				if (to_read > kEntropyMaxSample) to_read = kEntropyMaxSample;
+				std::vector<uint8_t> blob;
+				if (!driver_bridge::read_memory(ms.va, static_cast<size_t>(to_read), blob)
+					|| blob.empty()) {
+					ms.entropy = 0.f;
+					ms.sampled_bytes = 0;
+					diag::log_tagged_fmt("binary_map",
+						"entropy_live SKIP name='%s' va=0x%llX size=%llu read_failed",
+						ms.name.c_str(),
+						static_cast<unsigned long long>(ms.va),
+						static_cast<unsigned long long>(ms.size));
+					continue;
+				}
+				ms.entropy = compute_shannon_entropy(blob.data(), blob.size());
+				ms.sampled_bytes = static_cast<uint64_t>(blob.size());
+			}
 		}
 
 		bool is_section_executable(uint32_t characteristics)
@@ -872,6 +951,7 @@ namespace binary_map {
 				ms.readable = is_section_readable(s.characteristics);
 				out.sections.push_back(std::move(ms));
 			}
+			populate_section_entropy_static(out.sections);
 
 			std::unordered_map<uint64_t, std::string> import_name_lookup;
 			if (opts.include_imports) {
@@ -1146,6 +1226,7 @@ namespace binary_map {
 				ms.readable = is_section_readable(s.characteristics);
 				out.sections.push_back(std::move(ms));
 			}
+			populate_section_entropy_live(out.sections);
 
 			std::unordered_map<uint64_t, std::string> import_name_lookup;
 			if (opts.include_imports) {
@@ -1412,10 +1493,18 @@ namespace binary_map {
 				std::snprintf(range, sizeof(range), "0x%llX-0x%llX",
 					static_cast<unsigned long long>(s.va),
 					static_cast<unsigned long long>(s.va + s.size));
+				char ent_buf[48];
+				if (s.sampled_bytes > 0) {
+					std::snprintf(ent_buf, sizeof(ent_buf), " H=%.2f",
+						static_cast<double>(s.entropy) * 8.0);
+				} else {
+					ent_buf[0] = '\0';
+				}
 				oss << "  " << (s.name.empty() ? std::string("<unnamed>") : s.name)
 					<< " " << perm
 					<< " " << range
-					<< " (" << format_size_human(s.size) << ")\n";
+					<< " (" << format_size_human(s.size) << ")"
+					<< ent_buf << "\n";
 			}
 
 			oss << "\nfunctions (top " << map.functions.size() << " by score):\n";
@@ -1572,6 +1661,31 @@ namespace binary_map {
 			fresh.globals.size(), fresh.imports.size(),
 			fresh.exports.size(),
 			static_cast<long long>(dur_ms));
+		{
+			size_t sampled_count = 0;
+			uint64_t total_sampled_bytes = 0;
+			for (const auto& s : fresh.sections) {
+				if (s.sampled_bytes > 0) ++sampled_count;
+				total_sampled_bytes += s.sampled_bytes;
+				diag::log_tagged_fmt("binary_map",
+					"[binmap_audit] section name='%s' va=0x%llX size=%llu sampled=%llu entropy01=%.3f H_bits=%.2f exec=%d write=%d",
+					s.name.c_str(),
+					static_cast<unsigned long long>(s.va),
+					static_cast<unsigned long long>(s.size),
+					static_cast<unsigned long long>(s.sampled_bytes),
+					static_cast<double>(s.entropy),
+					static_cast<double>(s.entropy) * 8.0,
+					s.executable ? 1 : 0,
+					s.writable ? 1 : 0);
+			}
+			diag::log_tagged_fmt("binary_map",
+				"[binmap_audit] entropy_summary module='%s' sections=%zu sampled=%zu total_sampled_bytes=%llu",
+				fresh.module_name.c_str(),
+				fresh.sections.size(), sampled_count,
+				static_cast<unsigned long long>(total_sampled_bytes));
+			diag::log_tagged_fmt("binary_map",
+				"[binmap_audit] BROKEN_FEATURES resource_tree=not_wired strings_overlay=not_wired (pe_parser::pe_info_t lacks resource_dir_rva/strings; out-of-scope-for-view-audit)");
+		}
 
 		out = fresh;
 		slot.hash = new_hash;

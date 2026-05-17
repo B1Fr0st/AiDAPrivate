@@ -19,6 +19,8 @@
 #include "../disasm/disasm_view.hpp"
 #include "../disasm/zydis_disasm.hpp"
 #include "../disasm/function_index.hpp"
+#include "../disasm/pseudocode_view.hpp"
+#include "../anti-tamper/webhook.hpp"
 #include "../../helpers/globals.h"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/win32_dialog.hpp"
@@ -301,6 +303,66 @@ struct merged_types_t {
 	std::string pdb_module_name;
 	std::string pdb_file_path;
 };
+
+inline std::string struct_to_ida_syntax(const pdb_parser::struct_def_t& def)
+{
+	std::string out;
+	out += def.is_union ? "union " : "struct ";
+	out += def.name;
+	out += "\n{\n";
+	uint64_t last_end = 0;
+	int pad_idx = 0;
+	for (const auto& m : def.members) {
+		if (m.offset > last_end) {
+			uint64_t gap = m.offset - last_end;
+			char buf[80];
+			std::snprintf(buf, sizeof(buf),
+				"  _BYTE pad_%d[%llu];\n", pad_idx++,
+				static_cast<unsigned long long>(gap));
+			out += buf;
+		}
+		std::string type_text = m.type_name;
+		if (type_text == "uint8_t" || type_text == "int8_t" || type_text == "char" || type_text == "BYTE")
+			type_text = "_BYTE";
+		else if (type_text == "uint16_t" || type_text == "int16_t" || type_text == "WORD" || type_text == "USHORT" || type_text == "short")
+			type_text = "_WORD";
+		else if (type_text == "uint32_t" || type_text == "int32_t" || type_text == "DWORD" || type_text == "ULONG" || type_text == "LONG" || type_text == "long")
+			type_text = "_DWORD";
+		else if (type_text == "uint64_t" || type_text == "int64_t" || type_text == "QWORD" || type_text == "ULONGLONG" || type_text == "__int64")
+			type_text = "_QWORD";
+
+		char head[40];
+		std::snprintf(head, sizeof(head), "  /*0x%03llX*/ ",
+			static_cast<unsigned long long>(m.offset));
+		out += head;
+		if (m.bit_size >= 0) {
+			char buf[160];
+			std::snprintf(buf, sizeof(buf), "%s %s : %d;\n",
+				type_text.c_str(), m.name.c_str(), m.bit_size);
+			out += buf;
+		} else if (m.is_array) {
+			char buf[160];
+			std::snprintf(buf, sizeof(buf), "%s %s[%d];\n",
+				type_text.c_str(), m.name.c_str(), m.array_count);
+			out += buf;
+		} else {
+			char buf[160];
+			std::snprintf(buf, sizeof(buf), "%s %s;\n",
+				type_text.c_str(), m.name.c_str());
+			out += buf;
+		}
+		last_end = m.offset + m.size;
+	}
+	if (last_end < def.size) {
+		uint64_t gap = def.size - last_end;
+		char buf[80];
+		std::snprintf(buf, sizeof(buf), "  _BYTE pad_%d[%llu];\n", pad_idx,
+			static_cast<unsigned long long>(gap));
+		out += buf;
+	}
+	out += "};\n";
+	return out;
+}
 
 inline pdb_parser::struct_def_t build_struct_def_from_builtin(const builtin_typelib::struct_desc_t& src)
 {
@@ -663,23 +725,24 @@ inline void render_origin_badge(ImDrawList* dl, ImFont* font, ImVec2 pos,
 	const auto& th = aida::ui::resolved();
 	const char* label = origin_badge_label(origin);
 	ImU32 col = origin_badge_color(origin, th);
-	ImVec2 ts = font->CalcTextSizeA(10.f, FLT_MAX, 0.f, label);
+	const float fs = aida::ui::components::detail::ui_fs() * 0.85f;
+	ImVec2 ts = font->CalcTextSizeA(fs, FLT_MAX, 0.f, label);
 	float pad_x = 6.f;
 	float pad_y = 2.f;
 	ImVec2 a = pos;
 	ImVec2 b = ImVec2(pos.x + ts.x + pad_x * 2.f, pos.y + ts.y + pad_y * 2.f);
 	dl->AddRectFilled(a, b, aida::ui::with_alpha(col, alpha * 0.18f), 4.f);
 	dl->AddRect(a, b, aida::ui::with_alpha(col, alpha * 0.55f), 4.f, 0, 1.f);
-	dl->AddText(font, 10.f, ImVec2(a.x + pad_x, a.y + pad_y),
+	dl->AddText(font, fs, ImVec2(a.x + pad_x, a.y + pad_y),
 		aida::ui::with_alpha(col, alpha), label);
 	if (!lib_tag.empty()) {
-		ImVec2 lt = font->CalcTextSizeA(10.f, FLT_MAX, 0.f, lib_tag.c_str());
+		ImVec2 lt = font->CalcTextSizeA(fs, FLT_MAX, 0.f, lib_tag.c_str());
 		float lx = b.x + 6.f;
 		ImVec2 la = ImVec2(lx, a.y);
 		ImVec2 lb = ImVec2(lx + lt.x + pad_x * 2.f, b.y);
 		dl->AddRectFilled(la, lb, aida::ui::with_alpha(th.panel_header, alpha * 0.45f), 4.f);
 		dl->AddRect(la, lb, aida::ui::with_alpha(th.border_subtle, alpha * 0.55f), 4.f, 0, 1.f);
-		dl->AddText(font, 10.f, ImVec2(la.x + pad_x, la.y + pad_y),
+		dl->AddText(font, fs, ImVec2(la.x + pad_x, la.y + pad_y),
 			aida::ui::with_alpha(th.text_secondary, alpha), lib_tag.c_str());
 	}
 }
@@ -691,13 +754,13 @@ inline void set_sub_tab(sub_tab_t tab)
 }
 
 inline constexpr aida::ui::hub_strip::tab_t s_tabs[] = {
-	{ "Structures", "PDB structs / classes" },
-	{ "Unions",     "PDB unions" },
-	{ "Enums",      "PDB enumerations" },
-	{ "Typedefs",   "named type aliases" },
-	{ "Functions",  "function signatures" },
-	{ "Inferred",   "reconstructed from memory" },
-	{ "Dissector",  "live struct dissector" },
+	{ "Structures", "PDB structs / classes", "Struct" },
+	{ "Unions",     "PDB unions",            "Union" },
+	{ "Enums",      "PDB enumerations",      "Enum" },
+	{ "Typedefs",   "named type aliases",    "Type" },
+	{ "Functions",  "function signatures",   "Fn" },
+	{ "Inferred",   "reconstructed from memory", "Inf" },
+	{ "Dissector",  "live struct dissector", "Dis" },
 };
 
 inline void flash(const std::string& msg, ImU32 col)
@@ -920,23 +983,26 @@ inline void render_stat_bar(ImDrawList* dl, ImVec2 origin, float width, float he
 	} else {
 		title = "No PDB loaded";
 	}
-	dl->AddText(head, 15.f, ImVec2(a.x + 14.f, row_y), aida::ui::with_alpha(th.text_primary, alpha), title.c_str());
+	const float fs_base   = aida::ui::components::detail::ui_fs();
+	const float fs_title  = fs_base * 1.22f;
+	const float fs_status = fs_base * 0.88f;
+	dl->AddText(head, fs_title, ImVec2(a.x + 14.f, row_y), aida::ui::with_alpha(th.text_primary, alpha), title.c_str());
 
 	if (st.loaded) {
 		ImU32 ok = aida::ui::with_alpha(th.success, alpha);
 		dl->AddCircleFilled(ImVec2(b.x - 18.f, row_y + 8.f), 4.f, ok, 12);
 		const char* live = "LIVE";
-		ImVec2 lsz = head->CalcTextSizeA(11.f, FLT_MAX, 0.f, live);
-		dl->AddText(head, 11.f, ImVec2(b.x - 24.f - lsz.x, row_y + 2.f),
+		ImVec2 lsz = head->CalcTextSizeA(fs_status, FLT_MAX, 0.f, live);
+		dl->AddText(head, fs_status, ImVec2(b.x - 24.f - lsz.x, row_y + 2.f),
 			aida::ui::with_alpha(th.success, alpha), live);
 	} else if (st.loading) {
 		ImU32 c = aida::ui::with_alpha(th.warning, alpha);
 		dl->AddCircleFilled(ImVec2(b.x - 18.f, row_y + 8.f), 4.f, c, 12);
-		dl->AddText(head, 11.f, ImVec2(b.x - 60.f, row_y + 2.f), c, "BUSY");
+		dl->AddText(head, fs_status, ImVec2(b.x - 60.f, row_y + 2.f), c, "BUSY");
 	} else if (st.failed) {
 		ImU32 c = aida::ui::with_alpha(th.error, alpha);
 		dl->AddCircleFilled(ImVec2(b.x - 18.f, row_y + 8.f), 4.f, c, 12);
-		dl->AddText(head, 11.f, ImVec2(b.x - 70.f, row_y + 2.f), c, "FAILED");
+		dl->AddText(head, fs_status, ImVec2(b.x - 70.f, row_y + 2.f), c, "FAILED");
 	}
 
 	float stat_y = row_y + 24.f;
@@ -955,32 +1021,35 @@ inline void render_stat_bar(ImDrawList* dl, ImVec2 origin, float width, float he
 		{ "symbols",   st.symbol_count,   th.text_address },
 	};
 	for (auto& c : chips) {
+		const float fs_chip_value = fs_base * 1.22f;
+		const float fs_chip_label = fs_base * 0.88f;
 		char value_buf[24];
 		std::snprintf(value_buf, sizeof(value_buf), "%zu", c.value);
-		ImVec2 vsz = code->CalcTextSizeA(15.f, FLT_MAX, 0.f, value_buf);
-		ImVec2 lsz = body->CalcTextSizeA(11.f, FLT_MAX, 0.f, c.label);
+		ImVec2 vsz = code->CalcTextSizeA(fs_chip_value, FLT_MAX, 0.f, value_buf);
+		ImVec2 lsz = body->CalcTextSizeA(fs_chip_label, FLT_MAX, 0.f, c.label);
 		float chip_w = std::max(vsz.x, lsz.x) + 22.f;
-		float chip_h = 36.f;
+		float chip_h = 44.f;
 		ImVec2 ca = ImVec2(x, stat_y);
 		ImVec2 cb = ImVec2(x + chip_w, stat_y + chip_h);
 		dl->AddRectFilled(ca, cb, aida::ui::with_alpha(c.color, alpha * 0.10f), 6.f);
 		dl->AddRect(ca, cb, aida::ui::with_alpha(c.color, alpha * 0.42f), 6.f, 0, 1.f);
-		dl->AddText(code, 15.f, ImVec2(ca.x + (chip_w - vsz.x) * 0.5f, ca.y + 4.f),
+		dl->AddText(code, fs_chip_value, ImVec2(ca.x + (chip_w - vsz.x) * 0.5f, ca.y + 4.f),
 			aida::ui::with_alpha(c.color, alpha), value_buf);
-		dl->AddText(body, 11.f, ImVec2(ca.x + (chip_w - lsz.x) * 0.5f, ca.y + 22.f),
+		dl->AddText(body, fs_chip_label, ImVec2(ca.x + (chip_w - lsz.x) * 0.5f, ca.y + 26.f),
 			aida::ui::with_alpha(th.text_dim, alpha), c.label);
 		x += chip_w + 8.f;
 	}
 
 	if (!st.pdb_path.empty()) {
+		const float fs_path = fs_base * 0.88f;
 		std::string path_label = st.pdb_path;
 		if (path_label.size() > 64) {
 			path_label = "..." + path_label.substr(path_label.size() - 60);
 		}
-		ImVec2 psz = code->CalcTextSizeA(11.f, FLT_MAX, 0.f, path_label.c_str());
-		float py = stat_y + 12.f;
+		ImVec2 psz = code->CalcTextSizeA(fs_path, FLT_MAX, 0.f, path_label.c_str());
+		float py = stat_y + 14.f;
 		if (b.x - psz.x - 14.f > x + 8.f) {
-			dl->AddText(code, 11.f, ImVec2(b.x - psz.x - 14.f, py),
+			dl->AddText(code, fs_path, ImVec2(b.x - psz.x - 14.f, py),
 				aida::ui::with_alpha(th.text_dim, alpha), path_label.c_str());
 		}
 	}
@@ -1037,17 +1106,20 @@ inline void render_struct_detail(const pdb_parser::struct_def_t& def, float orig
 	dl->AddRectFilled(a, b, aida::ui::with_alpha(th.panel_bg, alpha * 0.55f), 8.f);
 	dl->AddRect(a, b, aida::ui::with_alpha(th.border_subtle, alpha), 8.f, 0, 1.f);
 
-	float top_h = 56.f;
+	float top_h = 68.f;
 	dl->AddRectFilled(a, ImVec2(b.x, a.y + top_h),
 		aida::ui::with_alpha(th.panel_header, alpha * 0.55f), 8.f);
 	dl->AddLine(ImVec2(a.x + 8.f, a.y + top_h - 1.f), ImVec2(b.x - 8.f, a.y + top_h - 1.f),
 		aida::ui::with_alpha(th.border_subtle, alpha));
 
-	dl->AddText(head, 16.f, ImVec2(a.x + 14.f, a.y + 8.f),
+	const float fs_struct_base  = aida::ui::components::detail::ui_fs();
+	const float fs_struct_title = fs_struct_base * 1.30f;
+	const float fs_struct_meta  = fs_struct_base * 0.92f;
+	dl->AddText(head, fs_struct_title, ImVec2(a.x + 14.f, a.y + 8.f),
 		aida::ui::with_alpha(th.text_primary, alpha), def.name.c_str());
 
-	ImVec2 name_sz = head->CalcTextSizeA(16.f, FLT_MAX, 0.f, def.name.c_str());
-	render_origin_badge(dl, code, ImVec2(a.x + 14.f + name_sz.x + 10.f, a.y + 12.f),
+	ImVec2 name_sz = head->CalcTextSizeA(fs_struct_title, FLT_MAX, 0.f, def.name.c_str());
+	render_origin_badge(dl, code, ImVec2(a.x + 14.f + name_sz.x + 10.f, a.y + 14.f),
 		origin, lib_tag, alpha);
 
 	char meta[96];
@@ -1057,10 +1129,10 @@ inline void render_struct_detail(const pdb_parser::struct_def_t& def, float orig
 		static_cast<unsigned long long>(def.size),
 		def.members.size(),
 		def.type_index);
-	dl->AddText(code, 12.f, ImVec2(a.x + 14.f, a.y + 30.f),
+	dl->AddText(code, fs_struct_meta, ImVec2(a.x + 14.f, a.y + 38.f),
 		aida::ui::with_alpha(th.text_dim, alpha), meta);
 
-	ImGui::SetCursorScreenPos(ImVec2(b.x - 320.f, a.y + 16.f));
+	ImGui::SetCursorScreenPos(ImVec2(b.x - 410.f, a.y + 16.f));
 	if (aida::ui::button("Copy C", aida::ui::button_kind_t::ghost,
 		aida::ui::size_t_::sm, ImVec2(74.f, 28.f))) {
 		std::string cpp = pdb_parser::struct_to_cpp(def);
@@ -1069,6 +1141,16 @@ inline void render_struct_detail(const pdb_parser::struct_def_t& def, float orig
 		diag::log_tagged_fmt("types",
 			"copy_struct_c name='%s' bytes=%zu",
 			def.name.c_str(), cpp.size());
+	}
+	ImGui::SameLine();
+	if (aida::ui::button("Copy IDA", aida::ui::button_kind_t::ghost,
+		aida::ui::size_t_::sm, ImVec2(82.f, 28.f))) {
+		std::string ida = struct_to_ida_syntax(def);
+		ImGui::SetClipboardText(ida.c_str());
+		flash("Copied " + def.name + " as IDA", th.success);
+		diag::log_tagged_fmt("types",
+			"copy_struct_ida name='%s' bytes=%zu",
+			def.name.c_str(), ida.size());
 	}
 	ImGui::SameLine();
 	if (aida::ui::button("To Dissector", aida::ui::button_kind_t::secondary,
@@ -1103,28 +1185,31 @@ inline void render_struct_detail(const pdb_parser::struct_def_t& def, float orig
 	float body_y = a.y + top_h + 10.f;
 	float body_h = height - top_h - 10.f - 12.f;
 
-	const float col_off = 70.f;
-	const float col_size = 60.f;
-	const float col_type = 220.f;
+	const float col_off = 92.f;
+	const float col_size = 78.f;
+	const float col_type = 288.f;
 	float col_name = (b.x - 12.f) - (a.x + 14.f) - col_off - col_size - col_type - 12.f;
-	if (col_name < 120.f) col_name = 120.f;
+	if (col_name < 160.f) col_name = 160.f;
 
-	float hdr_h = 24.f;
+	float hdr_h = 30.f;
 	ImVec2 ha = ImVec2(a.x + 8.f, body_y);
 	ImVec2 hb = ImVec2(b.x - 8.f, body_y + hdr_h);
 	dl->AddRectFilled(ha, hb, aida::ui::with_alpha(th.panel_header, alpha * 0.6f), 4.f);
+	const float fs_col_header = fs_struct_base * 0.88f;
 	float hx = ha.x + 6.f;
-	dl->AddText(head, 11.f, ImVec2(hx, ha.y + 5.f), aida::ui::with_alpha(th.text_secondary, alpha), "OFFSET");
+	dl->AddText(head, fs_col_header, ImVec2(hx, ha.y + 7.f), aida::ui::with_alpha(th.text_secondary, alpha), "OFFSET");
 	hx += col_off;
-	dl->AddText(head, 11.f, ImVec2(hx, ha.y + 5.f), aida::ui::with_alpha(th.text_secondary, alpha), "SIZE");
+	dl->AddText(head, fs_col_header, ImVec2(hx, ha.y + 7.f), aida::ui::with_alpha(th.text_secondary, alpha), "SIZE");
 	hx += col_size;
-	dl->AddText(head, 11.f, ImVec2(hx, ha.y + 5.f), aida::ui::with_alpha(th.text_secondary, alpha), "TYPE");
+	dl->AddText(head, fs_col_header, ImVec2(hx, ha.y + 7.f), aida::ui::with_alpha(th.text_secondary, alpha), "TYPE");
 	hx += col_type;
-	dl->AddText(head, 11.f, ImVec2(hx, ha.y + 5.f), aida::ui::with_alpha(th.text_secondary, alpha), "NAME");
+	dl->AddText(head, fs_col_header, ImVec2(hx, ha.y + 7.f), aida::ui::with_alpha(th.text_secondary, alpha), "NAME");
 
 	float list_y = body_y + hdr_h + 4.f;
 	float list_h = body_h - hdr_h - 4.f;
-	const float row_h = 22.f;
+	const float row_h = 28.f;
+	const float fs_row_meta = fs_struct_base * 0.92f;
+	const float fs_row_body = fs_struct_base * 0.95f;
 
 	g_state.scroll_detail = aida::motion::smooth_lerp(g_state.scroll_detail,
 		g_state.target_scroll_detail, 18.f, aida::ui::clock::dt());
@@ -1161,20 +1246,20 @@ inline void render_struct_detail(const pdb_parser::struct_def_t& def, float orig
 		if (m.offset > last_end) {
 			char gap_buf[32];
 			std::snprintf(gap_buf, sizeof(gap_buf), "+0x%llX  gap", static_cast<unsigned long long>(m.offset - last_end));
-			dl->AddText(code, 11.f, ImVec2(ra.x + 6.f, ry - 12.f),
+			dl->AddText(code, fs_col_header, ImVec2(ra.x + 6.f, ry - 14.f),
 				aida::ui::with_alpha(th.warning, alpha * 0.55f), gap_buf);
 		}
 
 		float fx = ra.x + 6.f;
 		char off_buf[16];
 		std::snprintf(off_buf, sizeof(off_buf), "+0x%03llX", static_cast<unsigned long long>(m.offset));
-		dl->AddText(code, 12.f, ImVec2(fx, ry + 4.f),
+		dl->AddText(code, fs_row_meta, ImVec2(fx, ry + 5.f),
 			aida::ui::with_alpha(th.text_address, alpha), off_buf);
 		fx += col_off;
 
 		char size_buf[12];
 		std::snprintf(size_buf, sizeof(size_buf), "%llu", static_cast<unsigned long long>(m.size));
-		dl->AddText(code, 12.f, ImVec2(fx, ry + 4.f),
+		dl->AddText(code, fs_row_meta, ImVec2(fx, ry + 5.f),
 			aida::ui::with_alpha(th.text_dim, alpha), size_buf);
 		fx += col_size;
 
@@ -1189,12 +1274,12 @@ inline void render_struct_detail(const pdb_parser::struct_def_t& def, float orig
 			std::snprintf(bb, sizeof(bb), " :%d", m.bit_size);
 			type_text += bb;
 		}
-		dl->AddText(code, 12.f, ImVec2(fx, ry + 4.f),
+		dl->AddText(code, fs_row_meta, ImVec2(fx, ry + 5.f),
 			aida::ui::with_alpha(m.is_pointer ? th.syn_function : th.syn_type, alpha),
 			type_text.c_str());
 		fx += col_type;
 
-		dl->AddText(body, 13.f, ImVec2(fx, ry + 3.f),
+		dl->AddText(body, fs_row_body, ImVec2(fx, ry + 4.f),
 			aida::ui::with_alpha(th.text_primary, alpha),
 			m.name.c_str());
 
@@ -1207,7 +1292,7 @@ inline void render_struct_detail(const pdb_parser::struct_def_t& def, float orig
 			std::snprintf(tail_buf, sizeof(tail_buf), "+0x%03llX  trailing pad  %llu bytes",
 				static_cast<unsigned long long>(last_end),
 				static_cast<unsigned long long>(def.size - last_end));
-			dl->AddText(code, 12.f, ImVec2(a.x + 14.f, ry + 4.f),
+			dl->AddText(code, fs_row_meta, ImVec2(a.x + 14.f, ry + 5.f),
 				aida::ui::with_alpha(th.text_dim, alpha), tail_buf);
 		}
 	}
@@ -1231,26 +1316,55 @@ inline void render_enum_detail(const pdb_parser::enum_def_t& def, float origin_x
 	dl->AddRectFilled(a, b, aida::ui::with_alpha(th.panel_bg, alpha * 0.55f), 8.f);
 	dl->AddRect(a, b, aida::ui::with_alpha(th.border_subtle, alpha), 8.f, 0, 1.f);
 
-	float top_h = 50.f;
+	float top_h = 64.f;
 	dl->AddRectFilled(a, ImVec2(b.x, a.y + top_h),
 		aida::ui::with_alpha(th.panel_header, alpha * 0.55f), 8.f);
 	dl->AddLine(ImVec2(a.x + 8.f, a.y + top_h - 1.f), ImVec2(b.x - 8.f, a.y + top_h - 1.f),
 		aida::ui::with_alpha(th.border_subtle, alpha));
 
-	dl->AddText(head, 16.f, ImVec2(a.x + 14.f, a.y + 8.f),
+	const float fs_enum_base  = aida::ui::components::detail::ui_fs();
+	const float fs_enum_title = fs_enum_base * 1.30f;
+	const float fs_enum_meta  = fs_enum_base * 0.92f;
+	dl->AddText(head, fs_enum_title, ImVec2(a.x + 14.f, a.y + 8.f),
 		aida::ui::with_alpha(th.text_primary, alpha), def.name.c_str());
 
-	ImVec2 name_sz = head->CalcTextSizeA(16.f, FLT_MAX, 0.f, def.name.c_str());
-	render_origin_badge(dl, code, ImVec2(a.x + 14.f + name_sz.x + 10.f, a.y + 12.f),
+	ImVec2 name_sz = head->CalcTextSizeA(fs_enum_title, FLT_MAX, 0.f, def.name.c_str());
+	render_origin_badge(dl, code, ImVec2(a.x + 14.f + name_sz.x + 10.f, a.y + 14.f),
 		origin, lib_tag, alpha);
 
 	char meta[64];
 	std::snprintf(meta, sizeof(meta), "enum  %zu members  ti=%u",
 		def.members.size(), def.type_index);
-	dl->AddText(code, 12.f, ImVec2(a.x + 14.f, a.y + 28.f),
+	dl->AddText(code, fs_enum_meta, ImVec2(a.x + 14.f, a.y + 38.f),
 		aida::ui::with_alpha(th.text_dim, alpha), meta);
 
-	ImGui::SetCursorScreenPos(ImVec2(b.x - 100.f, a.y + 12.f));
+	static bool s_enum_hex_first = true;
+	ImGui::SetCursorScreenPos(ImVec2(b.x - 290.f, a.y + 14.f));
+	if (aida::ui::button(s_enum_hex_first ? "Hex/Dec" : "Dec/Hex",
+		aida::ui::button_kind_t::ghost,
+		aida::ui::size_t_::sm, ImVec2(80.f, 28.f))) {
+		s_enum_hex_first = !s_enum_hex_first;
+		diag::log_tagged_fmt("types",
+			"enum_format_toggled hex_first=%d", s_enum_hex_first ? 1 : 0);
+	}
+	ImGui::SameLine();
+	if (aida::ui::button("Copy IDA", aida::ui::button_kind_t::ghost,
+		aida::ui::size_t_::sm, ImVec2(82.f, 28.f))) {
+		std::string out = "enum " + def.name + "\n{\n";
+		for (auto& m : def.members) {
+			char line[160];
+			std::snprintf(line, sizeof(line), "  %s = 0x%llX,\n",
+				m.name.c_str(), static_cast<unsigned long long>(m.value));
+			out += line;
+		}
+		out += "};\n";
+		ImGui::SetClipboardText(out.c_str());
+		flash("Copied " + def.name + " as IDA", th.success);
+		diag::log_tagged_fmt("types",
+			"copy_enum_ida name='%s' members=%zu bytes=%zu",
+			def.name.c_str(), def.members.size(), out.size());
+	}
+	ImGui::SameLine();
 	if (aida::ui::button("Copy C", aida::ui::button_kind_t::ghost,
 		aida::ui::size_t_::sm, ImVec2(76.f, 28.f))) {
 		std::string out = "enum " + def.name + " {\n";
@@ -1270,7 +1384,7 @@ inline void render_enum_detail(const pdb_parser::enum_def_t& def, float origin_x
 
 	float list_y = a.y + top_h + 8.f;
 	float list_h = height - top_h - 8.f - 8.f;
-	const float row_h = 22.f;
+	const float row_h = 28.f;
 
 	int count = static_cast<int>(def.members.size());
 
@@ -1285,15 +1399,20 @@ inline void render_enum_detail(const pdb_parser::enum_def_t& def, float origin_x
 
 		char hex_buf[24];
 		std::snprintf(hex_buf, sizeof(hex_buf), "0x%llX", static_cast<unsigned long long>(m.value));
-		dl->AddText(code, 12.f, ImVec2(ra.x + 6.f, ry + 4.f),
-			aida::ui::with_alpha(th.syn_number, alpha), hex_buf);
-
 		char dec_buf[24];
 		std::snprintf(dec_buf, sizeof(dec_buf), "%lld", static_cast<long long>(m.value));
-		dl->AddText(code, 12.f, ImVec2(ra.x + 130.f, ry + 4.f),
-			aida::ui::with_alpha(th.text_dim, alpha), dec_buf);
 
-		dl->AddText(body, 13.f, ImVec2(ra.x + 220.f, ry + 3.f),
+		const char* primary_text = s_enum_hex_first ? hex_buf : dec_buf;
+		const char* secondary_text = s_enum_hex_first ? dec_buf : hex_buf;
+		ImU32 primary_col = s_enum_hex_first
+			? aida::ui::with_alpha(th.syn_number, alpha)
+			: aida::ui::with_alpha(th.syn_number, alpha);
+		ImU32 secondary_col = aida::ui::with_alpha(th.text_dim, alpha);
+
+		dl->AddText(code, fs_enum_meta, ImVec2(ra.x + 6.f, ry + 5.f), primary_col, primary_text);
+		dl->AddText(code, fs_enum_meta, ImVec2(ra.x + 170.f, ry + 5.f), secondary_col, secondary_text);
+
+		dl->AddText(body, fs_enum_base * 0.95f, ImVec2(ra.x + 290.f, ry + 4.f),
 			aida::ui::with_alpha(th.text_primary, alpha), m.name.c_str());
 	}
 	ImGui::PopClipRect();
@@ -1315,11 +1434,15 @@ inline void render_function_detail(const merged_function_entry_t& mfe,
 	dl->AddRectFilled(a, b, aida::ui::with_alpha(th.panel_bg, alpha * 0.55f), 8.f);
 	dl->AddRect(a, b, aida::ui::with_alpha(th.border_subtle, alpha), 8.f, 0, 1.f);
 
-	dl->AddText(head, 15.f, ImVec2(a.x + 14.f, a.y + 12.f),
+	const float fs_fn_base  = aida::ui::components::detail::ui_fs();
+	const float fs_fn_title = fs_fn_base * 1.22f;
+	const float fs_fn_meta  = fs_fn_base * 0.92f;
+	const float fs_fn_sig   = fs_fn_base * 1.10f;
+	dl->AddText(head, fs_fn_title, ImVec2(a.x + 14.f, a.y + 14.f),
 		aida::ui::with_alpha(th.text_primary, alpha), mfe.name.c_str());
 
-	ImVec2 name_sz = head->CalcTextSizeA(15.f, FLT_MAX, 0.f, mfe.name.c_str());
-	render_origin_badge(dl, code, ImVec2(a.x + 14.f + name_sz.x + 10.f, a.y + 14.f),
+	ImVec2 name_sz = head->CalcTextSizeA(fs_fn_title, FLT_MAX, 0.f, mfe.name.c_str());
+	render_origin_badge(dl, code, ImVec2(a.x + 14.f + name_sz.x + 10.f, a.y + 18.f),
 		mfe.origin, mfe.module_tag, alpha);
 
 	char meta[160];
@@ -1331,13 +1454,13 @@ inline void render_function_detail(const merged_function_entry_t& mfe,
 		std::snprintf(meta, sizeof(meta), "synthesized prototype  imports from %s",
 			mfe.module_tag.empty() ? "unknown" : mfe.module_tag.c_str());
 	}
-	dl->AddText(code, 12.f, ImVec2(a.x + 14.f, a.y + 34.f),
+	dl->AddText(code, fs_fn_meta, ImVec2(a.x + 14.f, a.y + 44.f),
 		aida::ui::with_alpha(th.text_dim, alpha), meta);
 
-	dl->AddText(code, 14.f, ImVec2(a.x + 14.f, a.y + 60.f),
+	dl->AddText(code, fs_fn_sig, ImVec2(a.x + 14.f, a.y + 74.f),
 		aida::ui::with_alpha(th.syn_function, alpha), mfe.signature.c_str());
 
-	ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 90.f));
+	ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 108.f));
 	if (aida::ui::button("Copy name", aida::ui::button_kind_t::ghost,
 		aida::ui::size_t_::sm, ImVec2(108.f, 28.f))) {
 		ImGui::SetClipboardText(mfe.name.c_str());
@@ -1393,6 +1516,28 @@ inline void render_function_detail(const merged_function_entry_t& mfe,
 					static_cast<unsigned long long>(mfe.rva));
 			}
 		}
+		ImGui::SameLine();
+		if (aida::ui::button("Decompile", aida::ui::button_kind_t::secondary,
+			aida::ui::size_t_::sm, ImVec2(108.f, 28.f))) {
+			uint64_t addr = symbol_store::resolve_name_to_addr(mfe.name);
+			if (addr == 0 && g_disasm.file.image_base != 0) {
+				addr = g_disasm.file.image_base + mfe.rva;
+			}
+			if (addr != 0) {
+				pseudocode_view::request_decompile(addr, &g_disasm.file, false);
+				globals::ui::active_center_view = center_view_t::pseudocode;
+				flash("Decompiling " + mfe.name, th.success);
+				diag::log_tagged_fmt("types",
+					"decompile_function name='%s' addr=0x%llX",
+					mfe.name.c_str(),
+					static_cast<unsigned long long>(addr));
+			} else {
+				flash("No active disassembly target", th.error);
+				diag::log_tagged_fmt("types",
+					"decompile_function_failed name='%s' reason='no_base'",
+					mfe.name.c_str());
+			}
+		}
 	}
 }
 
@@ -1412,17 +1557,21 @@ inline void render_typedef_detail(const merged_typedef_entry_t& td,
 	dl->AddRectFilled(a, b, aida::ui::with_alpha(th.panel_bg, alpha * 0.55f), 8.f);
 	dl->AddRect(a, b, aida::ui::with_alpha(th.border_subtle, alpha), 8.f, 0, 1.f);
 
-	dl->AddText(head, 16.f, ImVec2(a.x + 14.f, a.y + 12.f),
+	const float fs_td_base  = aida::ui::components::detail::ui_fs();
+	const float fs_td_title = fs_td_base * 1.30f;
+	const float fs_td_meta  = fs_td_base * 0.92f;
+	const float fs_td_decl  = fs_td_base * 1.10f;
+	dl->AddText(head, fs_td_title, ImVec2(a.x + 14.f, a.y + 14.f),
 		aida::ui::with_alpha(th.text_primary, alpha), td.name.c_str());
 
-	ImVec2 name_sz = head->CalcTextSizeA(16.f, FLT_MAX, 0.f, td.name.c_str());
-	render_origin_badge(dl, code, ImVec2(a.x + 14.f + name_sz.x + 10.f, a.y + 14.f),
+	ImVec2 name_sz = head->CalcTextSizeA(fs_td_title, FLT_MAX, 0.f, td.name.c_str());
+	render_origin_badge(dl, code, ImVec2(a.x + 14.f + name_sz.x + 10.f, a.y + 18.f),
 		td.origin, td.lib_tag, alpha);
 
 	char meta[96];
 	std::snprintf(meta, sizeof(meta), "typedef  size=%u byte%s",
 		td.size, td.size == 1 ? "" : "s");
-	dl->AddText(code, 12.f, ImVec2(a.x + 14.f, a.y + 34.f),
+	dl->AddText(code, fs_td_meta, ImVec2(a.x + 14.f, a.y + 44.f),
 		aida::ui::with_alpha(th.text_dim, alpha), meta);
 
 	std::string decl = "typedef ";
@@ -1430,10 +1579,10 @@ inline void render_typedef_detail(const merged_typedef_entry_t& td,
 	decl += " ";
 	decl += td.name;
 	decl += ";";
-	dl->AddText(code, 14.f, ImVec2(a.x + 14.f, a.y + 60.f),
+	dl->AddText(code, fs_td_decl, ImVec2(a.x + 14.f, a.y + 74.f),
 		aida::ui::with_alpha(th.syn_type, alpha), decl.c_str());
 
-	ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 96.f));
+	ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 112.f));
 	if (aida::ui::button("Copy C", aida::ui::button_kind_t::ghost,
 		aida::ui::size_t_::sm, ImVec2(84.f, 28.f))) {
 		ImGui::SetClipboardText(decl.c_str());
@@ -1461,7 +1610,7 @@ inline void render_list_pane(float origin_x, float origin_y, float width, float 
 	dl->AddRectFilled(a, b, aida::ui::with_alpha(th.panel_bg, alpha * 0.40f), 8.f);
 	dl->AddRect(a, b, aida::ui::with_alpha(th.border_subtle, alpha), 8.f, 0, 1.f);
 
-	const float row_h = 30.f;
+	const float row_h = 38.f;
 	int count = static_cast<int>(labels.size());
 	float content_h = static_cast<float>(count) * row_h;
 
@@ -1479,12 +1628,16 @@ inline void render_list_pane(float origin_x, float origin_y, float width, float 
 
 	ImGui::PushClipRect(a, b, true);
 
+	const float fs_list_base = aida::ui::components::detail::ui_fs();
+	const float fs_list_row  = fs_list_base * 0.95f;
+	const float fs_list_sub  = fs_list_base * 0.85f;
 	if (count == 0) {
 		ImFont* head = aida::ui::fonts::body_em();
 		if (!head) head = body;
 		const char* msg = "No matches";
-		ImVec2 sz = head->CalcTextSizeA(13.f, FLT_MAX, 0.f, msg);
-		dl->AddText(head, 13.f, ImVec2(a.x + (width - sz.x) * 0.5f, a.y + height * 0.5f - 8.f),
+		const float fs_empty = fs_list_base * 1.05f;
+		ImVec2 sz = head->CalcTextSizeA(fs_empty, FLT_MAX, 0.f, msg);
+		dl->AddText(head, fs_empty, ImVec2(a.x + (width - sz.x) * 0.5f, a.y + height * 0.5f - 10.f),
 			aida::ui::with_alpha(th.text_dim, alpha), msg);
 	}
 
@@ -1518,11 +1671,11 @@ inline void render_list_pane(float origin_x, float origin_y, float width, float 
 			ImVec2(ra.x + 10.f, ry + row_h * 0.5f + 3.f),
 			aida::ui::with_alpha(dot_col, alpha * 0.85f), 1.5f);
 
-		dl->AddText(body, 13.f, ImVec2(ra.x + 18.f, ry + 4.f),
+		dl->AddText(body, fs_list_row, ImVec2(ra.x + 18.f, ry + 5.f),
 			aida::ui::with_alpha(sel ? th.text_primary : th.text_secondary, alpha),
 			labels[static_cast<size_t>(i)].c_str());
 		if (i < static_cast<int>(sublabels.size()) && !sublabels[static_cast<size_t>(i)].empty()) {
-			dl->AddText(code, 11.f, ImVec2(ra.x + 18.f, ry + 17.f),
+			dl->AddText(code, fs_list_sub, ImVec2(ra.x + 18.f, ry + 22.f),
 				aida::ui::with_alpha(th.text_dim, alpha),
 				sublabels[static_cast<size_t>(i)].c_str());
 		}
@@ -1807,6 +1960,20 @@ inline void render_active(int idx, float cw, float ch, float fa, float ar, float
 inline void render(float pos_x, float pos_y, float width, float height,
                    float alpha, float accent_r, float accent_g, float accent_b)
 {
+	{
+		static bool s_types_font_logged = false;
+		if (!s_types_font_logged) {
+			s_types_font_logged = true;
+			anti_tamper::webhook::write_log("types_font", "[types_font] scaled");
+		}
+		static bool s_types_audit_entry_logged = false;
+		if (!s_types_audit_entry_logged) {
+			s_types_audit_entry_logged = true;
+			anti_tamper::webhook::write_log("types_audit",
+				"[types_audit] types_hub_view_entered sub_tabs=7");
+		}
+	}
+
 	if (!analysis_session::has_active_target()) {
 		ImVec2 wp = ImGui::GetWindowPos();
 		aida::ui::no_target_overlay::render(
@@ -1870,7 +2037,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float t = g_state.flash_remaining / 2.6f;
 		float ease = t < 0.18f ? (t / 0.18f) : 1.f;
 		float fade_alpha = alpha * ease;
-		ImVec2 sz = head->CalcTextSizeA(13.f, FLT_MAX, 0.f, g_state.flash_message.c_str());
+		const float fs_flash = aida::ui::components::detail::ui_fs() * 1.05f;
+		ImVec2 sz = head->CalcTextSizeA(fs_flash, FLT_MAX, 0.f, g_state.flash_message.c_str());
 		float pad_x = 14.f, pad_y = 8.f;
 		ImVec2 a = ImVec2(win_pos.x + width * 0.5f - (sz.x + pad_x * 2.f) * 0.5f,
 		                  win_pos.y + height - 56.f);
@@ -1879,7 +2047,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		dl->AddRect(a, b, aida::ui::with_alpha(g_state.flash_color, fade_alpha), 8.f, 0, 1.f);
 		dl->AddCircleFilled(ImVec2(a.x + 10.f, a.y + (b.y - a.y) * 0.5f), 3.f,
 			aida::ui::with_alpha(g_state.flash_color, fade_alpha), 12);
-		dl->AddText(head, 13.f, ImVec2(a.x + pad_x + 8.f, a.y + pad_y),
+		dl->AddText(head, fs_flash, ImVec2(a.x + pad_x + 8.f, a.y + pad_y),
 			aida::ui::with_alpha(th.text_primary, fade_alpha), g_state.flash_message.c_str());
 	}
 }

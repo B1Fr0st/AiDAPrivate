@@ -1,6 +1,9 @@
 
 #include <windows.h>
 #include <shlobj.h>
+#ifdef small
+#undef small
+#endif
 
 #include "globals.h"
 #include "zydis_disasm.hpp"
@@ -8,6 +11,7 @@
 #include "xref_index.hpp"
 #include "standalone_license.hpp"
 #include "hex_view.hpp"
+#include "image_view.hpp"
 #include "initial_analysis.hpp"
 #include "loading_binary_overlay.hpp"
 #include "analysis_session.hpp"
@@ -25,6 +29,10 @@
 #include <vector>
 #include <fstream>
 #include <sstream>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <cstring>
 
 namespace fs = std::filesystem;
 
@@ -125,138 +133,218 @@ void file_browser::toggle_dir(int idx)
 }
 
 
-void file_browser::open_file(int idx)
-{
-    if (idx < 0 || idx >= (int)entries.size()) return;
-    auto& ent = entries[idx];
-    if (ent.is_dir) return;
+namespace file_browser {
 
+namespace ext_classify {
+
+static const char* k_text_exts[] = {
+    ".cpp", ".c", ".h", ".hpp", ".hxx", ".cxx", ".cc",
+    ".py", ".js", ".ts", ".json", ".xml", ".yaml", ".yml",
+    ".md", ".txt", ".log", ".cfg", ".ini", ".toml",
+    ".java", ".cs", ".rs", ".go", ".rb", ".php",
+    ".html", ".css", ".scss", ".lua", ".sh", ".bat", ".ps1",
+    ".cmake", ".asm", ".s", ".inc", ".def", ".rules",
+    ".vcxproj", ".vcproj", ".filters", ".props", ".targets",
+    ".sln", ".csproj", ".proj", ".gradle", ".gn", ".gni",
+    ".diff", ".patch", ".gitignore", ".gitattributes",
+    ".srt", ".vtt", ".tsv", ".csv",
+    ".env", ".rc", ".pbxproj", ".plist",
+};
+
+static const char* k_binary_exts[] = {
+    ".exe", ".dll", ".sys", ".efi", ".scr", ".cpl",
+    ".ocx", ".ax", ".drv", ".mui", ".tsp", ".node",
+    ".bin", ".lib", ".obj", ".o", ".a", ".so", ".dylib",
+    ".elf", ".out", ".com", ".ko", ".kext", ".dmp",
+    ".pdb", ".rom", ".img", ".uefi",
+    ".class", ".jar",
+    ".pyc", ".pyo",
+};
+
+static const char* k_archive_exts[] = {
+    ".rar", ".zip", ".7z", ".tar", ".gz", ".bz2", ".xz",
+    ".cab", ".iso",
+};
+
+inline std::string lower_ext(const std::string& filename)
+{
+    std::string ext;
+    auto dot = filename.rfind('.');
+    if (dot != std::string::npos)
+        ext = filename.substr(dot);
+    for (auto& c : ext) c = (char)tolower((unsigned char)c);
+    return ext;
+}
+
+inline bool matches(const std::string& ext, const char* const* table, size_t count)
+{
+    for (size_t i = 0; i < count; ++i) {
+        if (ext == table[i]) return true;
+    }
+    return false;
+}
+
+inline bool is_text(const std::string& ext)
+{
+    return matches(ext, k_text_exts, sizeof(k_text_exts)/sizeof(k_text_exts[0]));
+}
+
+inline bool is_binary(const std::string& ext)
+{
+    return matches(ext, k_binary_exts, sizeof(k_binary_exts)/sizeof(k_binary_exts[0]));
+}
+
+inline bool is_archive(const std::string& ext)
+{
+    return matches(ext, k_archive_exts, sizeof(k_archive_exts)/sizeof(k_archive_exts[0]));
+}
+
+}
+
+void open_path(const std::string& path)
+{
+    if (path.empty()) return;
+
+    std::error_code ec;
+    if (fs::is_directory(path, ec) && !ec) {
+        diag::log_tagged_fmt("file_browser", "open_path directory=%s", path.c_str());
+        refresh(path);
+        globals::ui::active_activity = activity_item_t::explorer;
+        globals::ui::panel_left_visible = true;
+        return;
+    }
 
     {
         uint64_t gt = standalone_license::inline_gate_check(
             standalone_license::gate_file_browser_open);
         if (standalone_license::verify_gate_token(
-                standalone_license::gate_file_browser_open, gt) < 0.5)
+                standalone_license::gate_file_browser_open, gt) < 0.5) {
+            diag::log_tagged_fmt("file_browser", "open_path denied path=%s reason=gate", path.c_str());
             return;
+        }
     }
 
-    std::string ext;
-    auto dot = ent.name.rfind('.');
-    if (dot != std::string::npos)
-        ext = ent.name.substr(dot);
-    for (auto& c : ext) c = (char)tolower((unsigned char)c);
+    std::string fname;
+    {
+        size_t sl = path.find_last_of("/\\");
+        fname = (sl != std::string::npos) ? path.substr(sl + 1) : path;
+    }
+    std::string ext = ext_classify::lower_ext(fname);
 
+    diag::log_tagged_fmt("file_browser",
+        "open_path begin path=%s ext=%s", path.c_str(), ext.c_str());
 
-    static const char* text_exts[] = {
-        ".cpp", ".c", ".h", ".hpp", ".hxx", ".cxx", ".cc",
-        ".py", ".js", ".ts", ".json", ".xml", ".yaml", ".yml",
-        ".md", ".txt", ".log", ".cfg", ".ini", ".toml",
-        ".java", ".cs", ".rs", ".go", ".rb", ".php",
-        ".html", ".css", ".scss", ".lua", ".sh", ".bat", ".ps1",
-        ".cmake", ".asm", ".s", ".inc", ".def", ".rules",
-    };
-
-    bool is_text = false;
-    for (auto& te : text_exts) {
-        if (ext == te) { is_text = true; break; }
+    if (image_view::is_image_extension(ext)) {
+        image_view::load_from_file(path);
+        globals::ui::active_center_view = center_view_t::image_view;
+        diag::log_tagged_fmt("file_browser", "open_path -> image_view path=%s", path.c_str());
+        return;
     }
 
-    if (is_text) {
-
-        std::ifstream ifs(ent.full_path, std::ios::binary);
+    if (ext_classify::is_text(ext)) {
+        std::ifstream ifs(path, std::ios::binary);
         if (ifs.is_open()) {
             std::ostringstream ss;
             ss << ifs.rdbuf();
-            file_tabs::open_or_focus(ent.full_path, ent.name, ss.str());
-
-            g_disasm.file = DisasmFile{};
+            file_tabs::open_or_focus(path, fname, ss.str());
             globals::ui::active_center_view = center_view_t::code_editor;
+            diag::log_tagged_fmt("file_browser", "open_path -> code_editor path=%s", path.c_str());
+            return;
         }
-    } else {
-
-        static const char* archive_exts[] = {
-            ".rar", ".zip", ".7z", ".tar", ".gz", ".bz2", ".xz",
-            ".cab", ".iso", ".img",
-        };
-        bool is_archive = false;
-        for (auto& ae : archive_exts) {
-            if (ext == ae) { is_archive = true; break; }
-        }
-
-        if (is_archive) {
-            code_editor::active = false;
-            code_editor::buffer.clear();
-            code_editor::filename.clear();
-            code_editor::filepath.clear();
-            g_disasm.file = DisasmFile{};
-            hex_view::load_from_file(ent.full_path, 0, 0);
-            globals::ui::active_center_view = center_view_t::hex_view;
-        } else {
-            uint64_t file_size_bytes = 0;
-            {
-                std::error_code fec;
-                auto sz = fs::file_size(ent.full_path, fec);
-                if (!fec) file_size_bytes = static_cast<uint64_t>(sz);
-            }
-            diag::log_tagged_fmt("file_browser",
-                "click_binary path=%s ext=%s size=%llu",
-                ent.full_path.c_str(),
-                ext.c_str(),
-                static_cast<unsigned long long>(file_size_bytes));
-
-            size_t existing_idx = static_cast<size_t>(-1);
-            bool found = analysis_session::find_session_by_path(ent.full_path, &existing_idx);
-            diag::log_tagged_fmt("file_browser",
-                "lookup_session found=%d idx=%llu",
-                found ? 1 : 0,
-                static_cast<unsigned long long>(existing_idx));
-
-            if (found) {
-                diag::log_tagged_fmt("file_browser", "dispatch path=existing_session");
-                if (analysis_session::switch_session(existing_idx)) {
-                    globals::ui::active_center_view = center_view_t::disassembly;
-                    diag::log_tagged_fmt("file_browser",
-                        "sidebar_switch_existing idx=%llu path=%s",
-                        static_cast<unsigned long long>(existing_idx),
-                        ent.full_path.c_str());
-                    file_browser::record_recent_workspace(ent.full_path);
-                } else {
-                    diag::log_tagged_fmt("file_browser",
-                        "sidebar_switch_existing_failed idx=%llu err=%s",
-                        static_cast<unsigned long long>(existing_idx),
-                        analysis_session::last_error()
-                            ? analysis_session::last_error()
-                            : "(null)");
-                }
-            } else {
-                diag::log_tagged_fmt("file_browser", "dispatch path=new_load");
-                if (loading_binary_overlay::is_active()) {
-                    diag::log_tagged_fmt("file_browser",
-                        "sidebar_load_skipped_overlay_active path=%s",
-                        ent.full_path.c_str());
-                } else {
-                    diag::log_tagged_fmt("file_browser",
-                        "loading_overlay_begin_called path=%s action=switch_to_disassembly_or_hex",
-                        ent.full_path.c_str());
-                    bool started = analysis_session::open_session(ent.full_path);
-                    if (started) {
-                        globals::ui::active_center_view = center_view_t::disassembly;
-                        diag::log_tagged_fmt("file_browser",
-                            "sidebar_load_direct path=%s",
-                            ent.full_path.c_str());
-                        file_browser::record_recent_workspace(ent.full_path);
-                    } else {
-                        diag::log_tagged_fmt("file_browser",
-                            "sidebar_load_direct_failed path=%s err=%s",
-                            ent.full_path.c_str(),
-                            analysis_session::last_error()
-                                ? analysis_session::last_error()
-                                : "(null)");
-                    }
-                }
-            }
-        }
+        diag::log_tagged_fmt("file_browser",
+            "open_path text open_failed path=%s", path.c_str());
     }
+
+    if (ext_classify::is_archive(ext)) {
+        code_editor::active = false;
+        code_editor::buffer.clear();
+        code_editor::filename.clear();
+        code_editor::filepath.clear();
+        g_disasm.file = DisasmFile{};
+        hex_view::load_from_file(path, 0, 0);
+        globals::ui::active_center_view = center_view_t::hex_view;
+        diag::log_tagged_fmt("file_browser", "open_path -> hex_view archive path=%s", path.c_str());
+        return;
+    }
+
+    uint64_t file_size_bytes = 0;
+    {
+        std::error_code fec;
+        auto sz = fs::file_size(path, fec);
+        if (!fec) file_size_bytes = static_cast<uint64_t>(sz);
+    }
+    diag::log_tagged_fmt("file_browser",
+        "open_path binary_branch path=%s ext=%s size=%llu",
+        path.c_str(),
+        ext.c_str(),
+        static_cast<unsigned long long>(file_size_bytes));
+
+    size_t existing_idx = static_cast<size_t>(-1);
+    bool found = analysis_session::find_session_by_path(path, &existing_idx);
+    if (found) {
+        if (analysis_session::switch_session(existing_idx)) {
+            globals::ui::active_center_view = center_view_t::disassembly;
+            record_recent_workspace(path);
+            diag::log_tagged_fmt("file_browser",
+                "open_path -> existing_session idx=%llu",
+                static_cast<unsigned long long>(existing_idx));
+            return;
+        }
+        diag::log_tagged_fmt("file_browser",
+            "open_path switch_existing_failed idx=%llu err=%s",
+            static_cast<unsigned long long>(existing_idx),
+            analysis_session::last_error() ? analysis_session::last_error() : "(null)");
+    }
+
+    if (loading_binary_overlay::is_active()) {
+        diag::log_tagged_fmt("file_browser",
+            "open_path skipped overlay_active path=%s", path.c_str());
+        return;
+    }
+
+    bool started = analysis_session::open_session(path);
+    if (started) {
+        globals::ui::active_center_view = center_view_t::disassembly;
+        record_recent_workspace(path);
+        diag::log_tagged_fmt("file_browser",
+            "open_path -> new_session path=%s ext=%s", path.c_str(), ext.c_str());
+        return;
+    }
+
+    const char* err = analysis_session::last_error();
+    bool err_says_not_pe = err && (
+        std::strstr(err, "not a PE") != nullptr ||
+        std::strstr(err, "not_pe")   != nullptr ||
+        std::strstr(err, "PE header") != nullptr ||
+        std::strstr(err, "magic") != nullptr);
+
+    if (ext_classify::is_binary(ext) || err_says_not_pe) {
+        code_editor::active = false;
+        code_editor::buffer.clear();
+        code_editor::filename.clear();
+        code_editor::filepath.clear();
+        g_disasm.file = DisasmFile{};
+        hex_view::load_from_file(path, 0, 0);
+        globals::ui::active_center_view = center_view_t::hex_view;
+        diag::log_tagged_fmt("file_browser",
+            "open_path -> hex_view fallback path=%s err=%s",
+            path.c_str(), err ? err : "(null)");
+        return;
+    }
+
+    diag::log_tagged_fmt("file_browser",
+        "open_path failed path=%s err=%s", path.c_str(),
+        err ? err : "(null)");
+}
+
+}
+
+void file_browser::open_file(int idx)
+{
+    if (idx < 0 || idx >= (int)entries.size()) return;
+    auto& ent = entries[idx];
+    if (ent.is_dir) return;
+    file_browser::open_path(ent.full_path);
 }
 
 namespace file_browser {
@@ -464,6 +552,203 @@ void render_pending_confirm_modal()
 
     ImGui::PopStyleColor(4);
     ImGui::PopStyleVar(4);
+}
+
+namespace watcher_detail {
+
+struct watcher_t {
+    std::atomic<bool>       running{false};
+    std::atomic<bool>       stop{false};
+    std::atomic<bool>       has_change{false};
+    std::thread             th;
+    std::string             watched_dir;
+    HANDLE                  wake_event = nullptr;
+    std::mutex              mtx;
+};
+
+inline watcher_t& g_watcher()
+{
+    static watcher_t w;
+    return w;
+}
+
+inline void stop_watcher_locked(watcher_t& w)
+{
+    if (!w.running.load(std::memory_order_acquire)) return;
+    w.stop.store(true, std::memory_order_release);
+    if (w.wake_event) ::SetEvent(w.wake_event);
+    if (w.th.joinable()) w.th.join();
+    w.running.store(false, std::memory_order_release);
+    w.stop.store(false, std::memory_order_release);
+    if (w.wake_event) {
+        ::CloseHandle(w.wake_event);
+        w.wake_event = nullptr;
+    }
+    w.watched_dir.clear();
+    diag::log_tagged("file_browser_watcher", "stopped");
+}
+
+inline bool is_noise_basename(const std::wstring& bn)
+{
+    if (bn.empty()) return true;
+    if (bn.size() >= 14) {
+        const wchar_t* tail = bn.c_str() + bn.size() - 14;
+        if (_wcsicmp(tail, L"aida_debug.log") == 0) return true;
+    }
+    if (bn.size() >= 4) {
+        const wchar_t* ext = bn.c_str() + bn.size() - 4;
+        if (_wcsicmp(ext, L".log") == 0) return true;
+        if (_wcsicmp(ext, L".tmp") == 0) return true;
+    }
+    if (bn.size() >= 1 && bn[0] == L'.') return true;
+    return false;
+}
+
+inline void watcher_thread(std::string dir, HANDLE wake_event)
+{
+    watcher_t& w = g_watcher();
+
+    std::wstring wdir;
+    {
+        int n = ::MultiByteToWideChar(CP_UTF8, 0, dir.c_str(), -1, nullptr, 0);
+        if (n > 0) {
+            wdir.resize((size_t)n - 1);
+            ::MultiByteToWideChar(CP_UTF8, 0, dir.c_str(), -1, wdir.data(), n);
+        }
+    }
+    if (wdir.empty()) {
+        diag::log_tagged("file_browser_watcher", "thread_exit empty_dir");
+        return;
+    }
+
+    HANDLE h = ::CreateFileW(wdir.c_str(),
+        FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+        nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD err = ::GetLastError();
+        diag::log_tagged_fmt("file_browser_watcher",
+            "thread_exit CreateFileW failed err=%lu dir=%s",
+            static_cast<unsigned long>(err), dir.c_str());
+        return;
+    }
+
+    diag::log_tagged_fmt("file_browser_watcher",
+        "thread_started dir=%s", dir.c_str());
+
+    constexpr DWORD kBufSize = 32768;
+    std::vector<uint8_t> buf(kBufSize);
+
+    uint64_t last_signal_ms = 0;
+
+    while (!w.stop.load(std::memory_order_acquire)) {
+        OVERLAPPED ov{};
+        ov.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ov.hEvent) break;
+
+        DWORD bytes_returned = 0;
+        BOOL ok = ::ReadDirectoryChangesW(
+            h,
+            buf.data(),
+            kBufSize,
+            FALSE,
+            FILE_NOTIFY_CHANGE_FILE_NAME |
+            FILE_NOTIFY_CHANGE_DIR_NAME |
+            FILE_NOTIFY_CHANGE_SIZE,
+            &bytes_returned,
+            &ov,
+            nullptr);
+        if (!ok) {
+            DWORD err = ::GetLastError();
+            diag::log_tagged_fmt("file_browser_watcher",
+                "ReadDirectoryChangesW failed err=%lu",
+                static_cast<unsigned long>(err));
+            ::CloseHandle(ov.hEvent);
+            break;
+        }
+
+        HANDLE waits[2] = { ov.hEvent, wake_event };
+        DWORD wait_count = wake_event ? 2u : 1u;
+        DWORD waited = ::WaitForMultipleObjects(wait_count, waits, FALSE, INFINITE);
+
+        if (waited == WAIT_OBJECT_0) {
+            DWORD transferred = 0;
+            if (::GetOverlappedResult(h, &ov, &transferred, FALSE) && transferred > 0) {
+                bool has_meaningful = false;
+                DWORD off = 0;
+                const uint8_t* p = buf.data();
+                while (off + sizeof(FILE_NOTIFY_INFORMATION) <= transferred) {
+                    const FILE_NOTIFY_INFORMATION* fni =
+                        reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(p + off);
+                    USHORT name_chars = static_cast<USHORT>(fni->FileNameLength / sizeof(WCHAR));
+                    std::wstring bn(fni->FileName, name_chars);
+                    if (!is_noise_basename(bn)) {
+                        has_meaningful = true;
+                        break;
+                    }
+                    if (fni->NextEntryOffset == 0) break;
+                    off += fni->NextEntryOffset;
+                }
+
+                if (has_meaningful) {
+                    LARGE_INTEGER ft, freq;
+                    ::QueryPerformanceCounter(&ft);
+                    ::QueryPerformanceFrequency(&freq);
+                    uint64_t now_ms = (uint64_t)((ft.QuadPart * 1000ull) / (uint64_t)freq.QuadPart);
+                    if (now_ms - last_signal_ms >= 500ull) {
+                        last_signal_ms = now_ms;
+                        w.has_change.store(true, std::memory_order_release);
+                    }
+                }
+            }
+        } else {
+            ::CancelIoEx(h, &ov);
+            DWORD tmp = 0;
+            ::GetOverlappedResult(h, &ov, &tmp, TRUE);
+        }
+        ::CloseHandle(ov.hEvent);
+    }
+
+    ::CloseHandle(h);
+    diag::log_tagged_fmt("file_browser_watcher",
+        "thread_exit dir=%s", dir.c_str());
+}
+
+inline void ensure_running_for(const std::string& dir)
+{
+    watcher_t& w = g_watcher();
+    std::lock_guard<std::mutex> lk(w.mtx);
+    if (w.running.load(std::memory_order_acquire) && w.watched_dir == dir) return;
+
+    if (w.running.load(std::memory_order_acquire)) {
+        stop_watcher_locked(w);
+    }
+    if (dir.empty()) return;
+
+    w.wake_event = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!w.wake_event) return;
+    w.stop.store(false, std::memory_order_release);
+    w.has_change.store(false, std::memory_order_release);
+    w.watched_dir = dir;
+    HANDLE we = w.wake_event;
+    std::string cap = dir;
+    w.th = std::thread([cap, we]() { watcher_thread(cap, we); });
+    w.running.store(true, std::memory_order_release);
+    diag::log_tagged_fmt("file_browser_watcher", "ensure_running_for dir=%s", dir.c_str());
+}
+
+}
+
+void tick_watcher()
+{
+    watcher_detail::ensure_running_for(current_dir);
+    watcher_detail::watcher_t& w = watcher_detail::g_watcher();
+    if (w.has_change.exchange(false, std::memory_order_acq_rel)) {
+        needs_refresh = true;
+    }
 }
 
 }

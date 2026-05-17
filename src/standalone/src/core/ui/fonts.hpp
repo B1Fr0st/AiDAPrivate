@@ -11,6 +11,7 @@ extern ImFont* g_font_ui_500_sm;
 extern ImFont* g_font_ui_700_xl;
 extern ImFont* g_font_code_400;
 extern ImFont* g_font_code_600;
+extern ImFont* g_font_code_400_lg;
 
 namespace aida::ui::fonts {
 	inline ImFont* body()         { return g_font_ui_400; }
@@ -23,4 +24,5 @@ namespace aida::ui::fonts {
 	inline ImFont* display()      { return g_font_ui_700_xl; }
 	inline ImFont* code()         { return g_font_code_400; }
 	inline ImFont* code_em()      { return g_font_code_600; }
+	inline ImFont* code_large()   { return g_font_code_400_lg ? g_font_code_400_lg : g_font_code_400; }
 }

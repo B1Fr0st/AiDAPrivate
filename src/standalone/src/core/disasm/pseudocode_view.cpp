@@ -825,8 +825,7 @@ void render_decompiling_popup(ImDrawList* dl, float ox, float oy, float width, f
 	bool init_active = decompiler_engine::g_state.init_progress_active.load(std::memory_order_acquire);
 
 	float overlay_a = alpha * s.popup_anim * 0.55f;
-	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + height),
-	                  IM_COL32(0, 0, 0, static_cast<int>(140.f * overlay_a)));
+	(void)overlay_a;
 
 	float panel_w = std::min(440.f, width * 0.7f);
 	float panel_h = init_active ? 178.f : 156.f;

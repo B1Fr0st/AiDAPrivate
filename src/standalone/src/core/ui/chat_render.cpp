@@ -1688,24 +1688,25 @@ chat_render::render_result_t chat_render::render_rich_message(
         float btn_gap = 8.f;
 
         struct btn_def_t { const char* glyph; action_t action; };
-        btn_def_t buttons[2] = {
+        btn_def_t buttons[3] = {
             { ICON_COPY, action_t::copy },
+            { "Aa", action_t::select_text },
             { ICON_HISTORY, action_t::retry }
         };
 
         float total_btn_w = 0.f;
-        float btn_widths[2];
+        float btn_widths[3];
         ImFont* icon_font = ImGui::GetFont();
-        for (int bi = 0; bi < 2; ++bi) {
+        for (int bi = 0; bi < 3; ++bi) {
             ImVec2 ts = icon_font->CalcTextSizeA(13.f, FLT_MAX, 0.f, buttons[bi].glyph);
             btn_widths[bi] = ts.x + 16.f;
             total_btn_w += btn_widths[bi];
         }
-        total_btn_w += btn_gap;
+        total_btn_w += btn_gap * 2.f;
 
         float bx = card_b.x - total_btn_w;
 
-        for (int bi = 0; bi < 2; ++bi) {
+        for (int bi = 0; bi < 3; ++bi) {
             float bw = btn_widths[bi];
             ImVec2 bmin(bx, btn_y);
             ImVec2 bmax_pt(bx + bw, btn_y + btn_h);

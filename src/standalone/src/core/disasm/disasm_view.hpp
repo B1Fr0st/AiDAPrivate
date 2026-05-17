@@ -67,6 +67,11 @@ struct state_t {
     int  sel_extent   = -1;
     bool sel_dragging = false;
 
+    int   sel_anchor_sub = -1;
+    int   sel_extent_sub = -1;
+    float sel_anchor_px  = -1.f;
+    float sel_extent_px  = -1.f;
+
     int  banner_selected_row = -1;
     int  banner_sel_anchor   = -1;
     int  banner_sel_extent   = -1;
@@ -97,6 +102,9 @@ struct state_t {
 
     uint64_t layout_signature = 0;
     int      layout_n = 0;
+
+    int      goto_flash_row = -1;
+    float    goto_flash_t = 0.f;
 };
 
 inline state_t g_state;
@@ -126,6 +134,11 @@ struct snapshot_t {
     int  sel_anchor   = -1;
     int  sel_extent   = -1;
     bool sel_dragging = false;
+
+    int   sel_anchor_sub = -1;
+    int   sel_extent_sub = -1;
+    float sel_anchor_px  = -1.f;
+    float sel_extent_px  = -1.f;
 
     int  banner_selected_row = -1;
     int  banner_sel_anchor   = -1;

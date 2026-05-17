@@ -2754,6 +2754,107 @@ namespace driver_bridge
         return device->kernel_anti_dump_start_continuous(pid);
     }
 
+    bool malware_safe_protect_pid(uint32_t pid, uint32_t flags, uint64_t* out_denials)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            diag::log_tagged_fmt("driver",
+                "malware_safe_protect_pid skip_kernel_mode pid=%u flags=0x%08X",
+                pid, flags);
+            return false;
+        }
+        bool ok = device->protect_sandbox_pid(pid, flags, out_denials);
+        diag::log_tagged_fmt("driver",
+            "malware_safe_protect_pid pid=%u flags=0x%08X ok=%d",
+            pid, flags, ok ? 1 : 0);
+        return ok;
+    }
+
+    bool malware_safe_unprotect_pid(uint32_t pid, uint64_t* out_denials)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+        bool ok = device->unprotect_sandbox_pid(pid, out_denials);
+        diag::log_tagged_fmt("driver",
+            "malware_safe_unprotect_pid pid=%u ok=%d",
+            pid, ok ? 1 : 0);
+        return ok;
+    }
+
+    bool malware_safe_net_log(uint32_t pid, bool enable)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+        bool ok = device->net_log_register_pid(pid, enable);
+        diag::log_tagged_fmt("driver",
+            "malware_safe_net_log pid=%u enable=%d ok=%d",
+            pid, enable ? 1 : 0, ok ? 1 : 0);
+        return ok;
+    }
+
+    bool malware_safe_pull_packets(uint32_t pid, uint32_t max_records,
+                                   std::vector<packet_record_t>& out,
+                                   uint64_t* out_dropped)
+    {
+        out.clear();
+        if (out_dropped) *out_dropped = 0;
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            diag::log_tagged_fmt("driver",
+                "malware_safe_pull_packets skip_kernel_mode pid=%u max=%u",
+                pid, max_records);
+            return false;
+        }
+        std::vector<voyager::detail::net_packet_record> raw;
+        uint64_t dropped = 0;
+        bool ok = device->malware_safe_pull_packets(pid, max_records, raw, &dropped);
+        if (out_dropped) *out_dropped = dropped;
+        if (!ok) {
+            diag::log_tagged_fmt("driver",
+                "malware_safe_pull_packets FAILED pid=%u max=%u",
+                pid, max_records);
+            return false;
+        }
+        out.reserve(raw.size());
+        for (const auto& r : raw) {
+            packet_record_t pr{};
+            pr.timestamp = r.timestamp;
+            pr.tcp_seq = r.tcp_seq;
+            pr.pid = r.pid;
+            pr.payload_len = r.payload_len;
+            pr.flags = r.flags;
+            pr.local_port = r.local_port;
+            pr.remote_port = r.remote_port;
+            pr.address_family = r.address_family;
+            pr.protocol = r.protocol;
+            pr.direction = r.direction;
+            for (int i = 0; i < 16; ++i) pr.local_addr[i] = r.local_addr[i];
+            for (int i = 0; i < 16; ++i) pr.remote_addr[i] = r.remote_addr[i];
+            for (int i = 0; i < 256; ++i) pr.payload[i] = r.payload[i];
+            out.push_back(pr);
+        }
+        diag::log_tagged_fmt("driver",
+            "malware_safe_pull_packets pid=%u max=%u returned=%zu dropped_since=%llu",
+            pid, max_records, out.size(), (unsigned long long)dropped);
+        return true;
+    }
+
     bool relay_server_token(uint32_t token_hash, uint64_t server_nonce)
     {
         bool kernel_mode = false;

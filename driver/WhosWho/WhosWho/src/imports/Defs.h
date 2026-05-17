@@ -272,6 +272,10 @@ typedef VOID (NTAPI* PLOAD_IMAGE_NOTIFY_ROUTINE_LOCAL)(
 inline NTSTATUS           (NTAPI* _PsSetLoadImageNotifyRoutine)    (PLOAD_IMAGE_NOTIFY_ROUTINE_LOCAL);
 inline NTSTATUS           (NTAPI* _PsRemoveLoadImageNotifyRoutine) (PLOAD_IMAGE_NOTIFY_ROUTINE_LOCAL);
 
+typedef NTSTATUS (NTAPI* PEX_CALLBACK_FUNCTION_LOCAL)(PVOID CallbackContext, PVOID Argument1, PVOID Argument2);
+inline NTSTATUS           (NTAPI* _CmRegisterCallbackEx)           (PEX_CALLBACK_FUNCTION_LOCAL, PCUNICODE_STRING, PVOID, PVOID, PLARGE_INTEGER, PVOID);
+inline NTSTATUS           (NTAPI* _CmUnRegisterCallback)           (LARGE_INTEGER);
+
 inline ULONG              (__cdecl* _DbgPrintEx)                   (ULONG, ULONG, PCSTR, ...);
 
 #define WW_LOG(fmt, ...) do { if (_DbgPrintEx) _DbgPrintEx(77, 0, "[WW] " fmt "\n", ##__VA_ARGS__); } while(0)
@@ -721,6 +725,9 @@ inline bool SetupFunctions() {
     *(PVOID*)&_PsSetLoadImageNotifyRoutine = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsSetLoadImageNotifyRoutine"));
     *(PVOID*)&_PsRemoveLoadImageNotifyRoutine = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsRemoveLoadImageNotifyRoutine"));
 
+    *(PVOID*)&_CmRegisterCallbackEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("CmRegisterCallbackEx"));
+    *(PVOID*)&_CmUnRegisterCallback = GetProcAddress(kernelBase, (PCHAR)skCrypt("CmUnRegisterCallback"));
+
     *(PVOID*)&_DbgPrintEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("DbgPrintEx"));
 
     WW_LOG("SetupFunctions: kernelBase=%p", kernelBase);
@@ -746,6 +753,7 @@ inline bool SetupFunctions() {
     WW_LOG("SetupFunctions: _ExQueueWorkItem=%p", _ExQueueWorkItem);
     WW_LOG("SetupFunctions: _ObRegisterCallbacks=%p _ObUnRegisterCallbacks=%p _PsSetCreateProcessNotifyRoutineEx=%p", _ObRegisterCallbacks, _ObUnRegisterCallbacks, _PsSetCreateProcessNotifyRoutineEx);
     WW_LOG("SetupFunctions: _PsSetLoadImageNotifyRoutine=%p _PsRemoveLoadImageNotifyRoutine=%p", _PsSetLoadImageNotifyRoutine, _PsRemoveLoadImageNotifyRoutine);
+    WW_LOG("SetupFunctions: _CmRegisterCallbackEx=%p _CmUnRegisterCallback=%p", _CmRegisterCallbackEx, _CmUnRegisterCallback);
     WW_LOG("SetupFunctions: _DbgPrintEx=%p", _DbgPrintEx);
 
     if (!_PsSuspendThread && !_ZwSuspendThread) {

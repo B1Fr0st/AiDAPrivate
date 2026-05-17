@@ -6,9 +6,10 @@
 namespace run_target {
 
 enum class isolation_t : int {
-	same_desktop_jobbed = 0,
-	appcontainer = 1,
-	windows_sandbox = 2,
+	same_desktop_jobbed   = 0,
+	appcontainer          = 1,
+	windows_sandbox       = 2,
+	malware_safe_desktop  = 3,
 };
 
 struct launch_options_t {
@@ -24,6 +25,14 @@ struct launch_options_t {
 
 	uint32_t     memory_cap_mb = 0;
 	uint32_t     auto_terminate_sec = 0;
+
+	bool         malware_safe_mode = false;
+	bool         log_network_traffic = false;
+	bool         lower_integrity_untrusted = false;
+	bool         allow_child_processes = true;
+	bool         force_mitigations_strict = false;
+	bool         redirect_user_paths_to_sandbox = true;
+	bool         register_kernel_sandbox_guard = true;
 };
 
 struct launch_result_t {
@@ -33,6 +42,13 @@ struct launch_result_t {
 	uintptr_t   thread_handle = 0;
 	uintptr_t   job_handle = 0;
 	std::string firewall_rule_name;
+	std::wstring sandbox_dir;
+	bool        sandbox_pid_registered = false;
+	bool        net_logger_registered = false;
+	bool        token_restricted = false;
+	bool        integrity_lowered = false;
+	bool        mitigations_applied = false;
+	bool        shadow_fs_registered = false;
 	std::string error;
 };
 
@@ -41,6 +57,9 @@ struct capability_probe_t {
 	bool     has_appcontainer = false;
 	bool     has_firewall_inet = false;
 	bool     has_windows_sandbox = false;
+	bool     has_restricted_token = false;
+	bool     has_mitigation_policy = false;
+	bool     has_kernel_sandbox_guard = false;
 	uint32_t windows_build = 0;
 };
 

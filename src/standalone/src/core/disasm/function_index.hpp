@@ -27,6 +27,9 @@
 #include "work_queue.hpp"
 #include "zydis_disasm.hpp"
 
+#include "../../helpers/diag_log.hpp"
+#include "../anti-tamper/webhook.hpp"
+
 namespace function_index {
 
 	enum class injection_t {
@@ -192,15 +195,28 @@ namespace function_index {
 			std::string                                                    static_pe_cached_path;
 			std::atomic<uint32_t>                                          static_bulk_pending{0};
 			std::atomic<uint64_t>                                          static_bulk_last_progress_ns{0};
+			std::atomic<bool>                                              deep_static_requested{false};
 		};
 
-		inline std::unique_ptr<cache_t>& cache_holder() {
-			static std::unique_ptr<cache_t> h = std::make_unique<cache_t>();
+		inline std::mutex& holder_swap_mtx() {
+			static std::mutex m;
+			return m;
+		}
+
+		inline std::shared_ptr<cache_t>& cache_holder_sp() {
+			static std::shared_ptr<cache_t> h = std::make_shared<cache_t>();
 			return h;
 		}
 
+		inline std::shared_ptr<cache_t> active_cache_snapshot() {
+			std::lock_guard<std::mutex> lk(holder_swap_mtx());
+			return cache_holder_sp();
+		}
+
 		inline cache_t& cache() {
-			return *cache_holder();
+			static thread_local std::shared_ptr<cache_t> tl_keepalive;
+			tl_keepalive = active_cache_snapshot();
+			return *tl_keepalive;
 		}
 
 		inline std::string format_hex_upper(uint64_t v) {
@@ -3072,11 +3088,33 @@ namespace function_index {
 					return;
 				}
 
+				const uint64_t t_rebuild_start_ns = static_cast<uint64_t>(
+					std::chrono::duration_cast<std::chrono::nanoseconds>(
+						std::chrono::steady_clock::now().time_since_epoch()).count());
 				if (live) {
 					rebuild_bounds_index(base, size, name);
 				}
 				else {
 					rebuild_bounds_index_static(name);
+				}
+				const uint64_t t_rebuild_end_ns = static_cast<uint64_t>(
+					std::chrono::duration_cast<std::chrono::nanoseconds>(
+						std::chrono::steady_clock::now().time_since_epoch()).count());
+				{
+					char log_buf[256];
+					size_t func_count = 0;
+					{
+						std::shared_lock<std::shared_mutex> lk(c2.mutex);
+						func_count = c2.sorted_starts.size();
+					}
+					std::snprintf(log_buf, sizeof(log_buf),
+						"phase=rebuild_bounds_index live=%d elapsed_ms=%llu funcs=%zu name=%s",
+						live ? 1 : 0,
+						static_cast<unsigned long long>((t_rebuild_end_ns - t_rebuild_start_ns) / 1000000ull),
+						func_count,
+						name.c_str());
+					diag::log_tagged("function_index", log_buf);
+					anti_tamper::webhook::write_log("function_index", log_buf);
 				}
 				{
 					std::unique_lock<std::shared_mutex> lk(c2.mutex);
@@ -3085,7 +3123,10 @@ namespace function_index {
 				c2.bounds_state.store(static_cast<uint32_t>(bounds_state_t::ready),
 					std::memory_order_release);
 
-				if (live || static_pe_active()) {
+				bool bulk_allowed = live
+					|| (static_pe_active() && c2.deep_static_requested.load(std::memory_order_acquire));
+
+				if (bulk_allowed) {
 					auto all_targets = std::make_shared<
 						std::vector<std::pair<uint64_t, std::shared_ptr<func_status_t>>>>();
 					std::string mod_name;
@@ -3101,6 +3142,15 @@ namespace function_index {
 							all_targets->emplace_back(start, sit->second);
 						}
 					}
+					char log_extra[160];
+					std::snprintf(log_extra, sizeof(log_extra),
+						"live=%d deep=%d targets=%zu name=%s",
+						live ? 1 : 0,
+						c2.deep_static_requested.load(std::memory_order_acquire) ? 1 : 0,
+						all_targets->size(),
+						mod_name.c_str());
+					diag::log_tagged("function_index", log_extra);
+					anti_tamper::webhook::write_log("function_index", log_extra);
 					if (!all_targets->empty()) {
 						c2.static_bulk_pending.store(static_cast<uint32_t>(all_targets->size()),
 							std::memory_order_release);
@@ -3111,6 +3161,15 @@ namespace function_index {
 						state->mod_name = std::make_shared<std::string>(std::move(mod_name));
 						post_bulk_chunk(state);
 					}
+				} else {
+					char log_extra[160];
+					std::snprintf(log_extra, sizeof(log_extra),
+						"bulk_skipped live=%d deep=%d static=%d",
+						live ? 1 : 0,
+						c2.deep_static_requested.load(std::memory_order_acquire) ? 1 : 0,
+						static_pe_active() ? 1 : 0);
+					diag::log_tagged("function_index", log_extra);
+					anti_tamper::webhook::write_log("function_index", log_extra);
 				}
 			});
 		}
@@ -3144,6 +3203,7 @@ namespace function_index {
 				std::memory_order_release);
 			c.static_bulk_pending.store(0u, std::memory_order_release);
 			c.static_bulk_last_progress_ns.store(0ull, std::memory_order_release);
+			c.deep_static_requested.store(false, std::memory_order_release);
 
 			cached_module_table_t& t = cached_module_table();
 			{
@@ -3220,6 +3280,57 @@ namespace function_index {
 		if (detail::static_pe_active()) {
 			detail::schedule_bounds_rebuild();
 		}
+	}
+
+	inline bool deep_static_analysis_requested() {
+		detail::cache_t& c = detail::cache();
+		return c.deep_static_requested.load(std::memory_order_acquire);
+	}
+
+	inline void request_deep_static_analysis() {
+		detail::cache_t& c = detail::cache();
+		bool prev = c.deep_static_requested.exchange(true, std::memory_order_acq_rel);
+		diag::log_tagged_fmt("function_index",
+			"request_deep_static_analysis prev=%d static_active=%d",
+			prev ? 1 : 0,
+			detail::static_pe_active() ? 1 : 0);
+		anti_tamper::webhook::write_log("function_index",
+			"request_deep_static_analysis");
+		if (!detail::static_pe_active()) return;
+		uint32_t bs = c.bounds_state.load(std::memory_order_acquire);
+		if (bs == static_cast<uint32_t>(detail::bounds_state_t::ready)) {
+			auto all_targets = std::make_shared<
+				std::vector<std::pair<uint64_t, std::shared_ptr<detail::func_status_t>>>>();
+			std::string mod_name;
+			{
+				std::shared_lock<std::shared_mutex> lk(c.mutex);
+				mod_name = c.cached_module_name;
+				all_targets->reserve(c.sorted_starts.size());
+				for (uint64_t start : c.sorted_starts) {
+					auto sit = c.status_by_start.find(start);
+					if (sit == c.status_by_start.end() || !sit->second) continue;
+					uint32_t st = sit->second->state.load(std::memory_order_acquire);
+					if (st != static_cast<uint32_t>(detail::func_state_t::idle)) continue;
+					all_targets->emplace_back(start, sit->second);
+				}
+			}
+			if (!all_targets->empty()) {
+				c.static_bulk_pending.store(static_cast<uint32_t>(all_targets->size()),
+					std::memory_order_release);
+				c.static_bulk_last_progress_ns.store(0ull, std::memory_order_release);
+				auto disp = std::make_shared<detail::bulk_dispatch_state_t>();
+				disp->targets = all_targets;
+				disp->mod_name = std::make_shared<std::string>(std::move(mod_name));
+				detail::post_bulk_chunk(disp);
+			}
+			return;
+		}
+		detail::schedule_bounds_rebuild();
+	}
+
+	inline void clear_deep_static_request() {
+		detail::cache_t& c = detail::cache();
+		c.deep_static_requested.store(false, std::memory_order_release);
 	}
 
 	inline bool static_bulk_in_progress() {
@@ -3710,25 +3821,21 @@ namespace function_index {
 		return it->second.is_library;
 	}
 
-	inline std::unique_ptr<detail::cache_t> detach_snapshot() {
-		auto& h = detail::cache_holder();
+	inline std::shared_ptr<detail::cache_t> detach_snapshot() {
+		auto new_cache = std::make_shared<detail::cache_t>();
+		std::shared_ptr<detail::cache_t> out;
 		{
-			std::unique_lock<std::shared_mutex> drain(h->mutex);
-			(void)drain;
+			std::lock_guard<std::mutex> swap_lk(detail::holder_swap_mtx());
+			out = detail::cache_holder_sp();
+			detail::cache_holder_sp() = new_cache;
 		}
-		std::unique_ptr<detail::cache_t> out = std::move(h);
-		h = std::make_unique<detail::cache_t>();
 		return out;
 	}
 
-	inline void attach_snapshot(std::unique_ptr<detail::cache_t> snap) {
-		auto& h = detail::cache_holder();
-		if (!snap) snap = std::make_unique<detail::cache_t>();
-		{
-			std::unique_lock<std::shared_mutex> drain(h->mutex);
-			(void)drain;
-		}
-		h = std::move(snap);
+	inline void attach_snapshot(std::shared_ptr<detail::cache_t> snap) {
+		if (!snap) snap = std::make_shared<detail::cache_t>();
+		std::lock_guard<std::mutex> swap_lk(detail::holder_swap_mtx());
+		detail::cache_holder_sp() = std::move(snap);
 	}
 
 }

@@ -25,6 +25,7 @@
 #include "standalone_settings.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_tools_fwd.hpp"
+#include "core/runtime/shadow_fs_client.hpp"
 #include "core/runtime/arc_loader.hpp"
 #include "core/anti-tamper/orchestrator.hpp"
 #include "core/anti-tamper/hv_preflight.hpp"
@@ -48,6 +49,10 @@
 #include "core/anti-tamper/virtualizer.hpp"
 #include "core/disasm/function_index.hpp"
 #include "core/auth/auth_http.hpp"
+#include "core/ui/loading_binary_overlay.hpp"
+#include <shellapi.h>
+
+#pragma comment(lib, "shell32.lib")
 
 extern "C" {
 #include <openssl/applink.c>
@@ -104,6 +109,7 @@ ImFont* g_font_ui_500_sm = nullptr;
 ImFont* g_font_ui_700_xl = nullptr;
 ImFont* g_font_code_400 = nullptr;
 ImFont* g_font_code_600 = nullptr;
+ImFont* g_font_code_400_lg = nullptr;
 
 static bool font_file_exists(const std::string& path)
 {
@@ -197,6 +203,7 @@ static void rebuild_fonts(float dpi_scale)
     const float sm   = 13.0f * texture_scale;
     const float xl   = 32.0f * texture_scale;
     const float code = 14.0f * texture_scale;
+    const float code_lg = 28.0f * texture_scale;
     io.FontGlobalScale = 1.0f;
 
     const bool enable_lcd = dpi_scale >= 1.5f;
@@ -307,8 +314,10 @@ static void rebuild_fonts(float dpi_scale)
 
     g_font_code_400 = load_font_with_fallbacks(io, nullptr, 0, jbm_400, code, c_mono);
     g_font_code_600 = load_font_with_fallbacks(io, nullptr, 0, jbm_600, code, c_mono);
+    g_font_code_400_lg = load_font_with_fallbacks(io, nullptr, 0, jbm_400, code_lg, c_mono);
     if (!g_font_code_400) g_font_code_400 = g_font_ui_400;
     if (!g_font_code_600) g_font_code_600 = g_font_code_400;
+    if (!g_font_code_400_lg) g_font_code_400_lg = g_font_code_400;
 
     g_code_font = g_font_code_400;
     if (!g_font_ui_400) g_font_ui_400 = io.Fonts->Fonts.empty() ? nullptr : io.Fonts->Fonts[0];
@@ -332,7 +341,7 @@ bool g_imgui_dx11_initialized = false;
 static DWORD compute_acrylic_color_for_theme()
 {
     const auto& t = aida::ui::resolved();
-    return (DWORD)t.acrylic_color;
+    return ((DWORD)t.acrylic_color & 0x00FFFFFFu) | (0xFFu << 24);
 }
 
 void set_acrylic_color(HWND hwnd)
@@ -349,6 +358,7 @@ void set_acrylic_color(HWND hwnd)
 
     WINCOMPATTRDATA data = { 19, &accent, sizeof(accent) };
     SetWindowCompositionAttribute(hwnd, &data);
+    diag::log_tagged_fmt("ui", "acrylic_set color=0x%08X alpha=0xFF (forced opaque)", color);
 }
 
 static bool os_prefers_dark()
@@ -1110,6 +1120,24 @@ int main(int, char**)
     ::UpdateWindow(hwnd);
     crash_log_write("window_shown_acrylic_set");
 
+    {
+        ::DragAcceptFiles(hwnd, TRUE);
+        HMODULE user32 = ::GetModuleHandleW(L"user32.dll");
+        using ChangeWMFEx_t = BOOL(WINAPI*)(HWND, UINT, DWORD, void*);
+        auto pChangeWMFEx = user32
+            ? reinterpret_cast<ChangeWMFEx_t>(::GetProcAddress(user32, "ChangeWindowMessageFilterEx"))
+            : nullptr;
+        if (pChangeWMFEx) {
+            pChangeWMFEx(hwnd, WM_DROPFILES, 1u, nullptr);
+            pChangeWMFEx(hwnd, 0x0049u, 1u, nullptr);
+            pChangeWMFEx(hwnd, WM_COPYDATA, 1u, nullptr);
+            diag::log_tagged("dragdrop", "msg_filter_relaxed for elevated drop");
+        } else {
+            diag::log_tagged("dragdrop", "ChangeWindowMessageFilterEx unavailable");
+        }
+        diag::log_tagged("dragdrop", "DragAcceptFiles enabled on main window");
+    }
+
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     crash_log_write("imgui_context_created");
@@ -1250,7 +1278,7 @@ int main(int, char**)
 
         {
             static DWORD s_last_acrylic_applied = 0;
-            DWORD now_acrylic = (DWORD)aida::ui::resolved().acrylic_color;
+            DWORD now_acrylic = ((DWORD)aida::ui::resolved().acrylic_color & 0x00FFFFFFu) | (0xFFu << 24);
             if (themes::changed || s_last_acrylic_applied != now_acrylic)
             {
                 themes::changed = false;
@@ -1264,6 +1292,7 @@ int main(int, char**)
                     ACCENT_POLICY_T ap = { 3, 2, now_acrylic, 0 };
                     WINCOMPATTRDATA_T wd = { 19, &ap, sizeof(ap) };
                     SetWCA(hwnd, &wd);
+                    diag::log_tagged_fmt("ui", "acrylic_reapplied color=0x%08X", now_acrylic);
                 }
             }
         }
@@ -1613,6 +1642,7 @@ int main(int, char**)
     script_engine::shutdown();
     workflow_tools::shutdown_services();
     shutdown_standalone_chat();
+    shadow_fs_client::shutdown();
     aida::auth::http::cleanup();
     Blur::Shutdown();
     ImGui_ImplDX11_Shutdown();
@@ -1782,6 +1812,31 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
                       wcscmp(p, L"WindowsThemeElement") == 0)) {
                 apply_os_theme_animated();
             }
+        }
+        return 0;
+    }
+    case WM_DROPFILES:
+    {
+        HDROP hdrop = reinterpret_cast<HDROP>(wParam);
+        if (hdrop) {
+            UINT count = ::DragQueryFileW(hdrop, 0xFFFFFFFFu, nullptr, 0);
+            diag::log_tagged_fmt("dragdrop", "WM_DROPFILES count=%u", count);
+            if (count > 0) {
+                wchar_t wpath[MAX_PATH] = {};
+                UINT got = ::DragQueryFileW(hdrop, 0, wpath, MAX_PATH);
+                if (got > 0) {
+                    char path_utf8[MAX_PATH * 4] = {};
+                    int n = ::WideCharToMultiByte(CP_UTF8, 0, wpath, -1,
+                        path_utf8, sizeof(path_utf8), nullptr, nullptr);
+                    if (n > 0) {
+                        diag::log_tagged_fmt("dragdrop", "drop accepted path=%s", path_utf8);
+                        file_browser::open_path(std::string(path_utf8));
+                    } else {
+                        diag::log_tagged("dragdrop", "drop path utf8 conversion failed");
+                    }
+                }
+            }
+            ::DragFinish(hdrop);
         }
         return 0;
     }

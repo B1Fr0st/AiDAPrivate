@@ -781,9 +781,6 @@ namespace command_palette {
 		ImVec2 vp = io.DisplaySize;
 		ImDrawList* fdl = ImGui::GetForegroundDrawList();
 
-		fdl->AddRectFilled(ImVec2(0.f, 0.f), vp,
-			IM_COL32(0, 0, 0, (int)(140.f * open_t * close_alpha)));
-
 		const float palette_w = 720.f;
 		const float palette_h = 540.f;
 

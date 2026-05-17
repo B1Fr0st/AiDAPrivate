@@ -902,14 +902,22 @@ inline void run_pipeline(const std::string& path, const std::string& filename)
 	}
 
 	begin_step(step_id_t::mark_code_sequences);
-	uint64_t prologues = count_prologue_patterns(g_disasm.file);
-	push_log_fmt("Marked %llu typical code sequences (function prologue patterns)",
-		static_cast<unsigned long long>(prologues));
-	{
-		char buf[80];
-		std::snprintf(buf, sizeof(buf), "%llu prologue sequences",
+	if (function_index::deep_static_analysis_requested()) {
+		const uint64_t t_mcs_start = now_ns();
+		uint64_t prologues = count_prologue_patterns(g_disasm.file);
+		const uint64_t t_mcs_end = now_ns();
+		push_log_fmt("Marked %llu typical code sequences (function prologue patterns)",
 			static_cast<unsigned long long>(prologues));
+		char buf[120];
+		std::snprintf(buf, sizeof(buf), "%llu prologue sequences (elapsed_ms=%llu)",
+			static_cast<unsigned long long>(prologues),
+			static_cast<unsigned long long>((t_mcs_end - t_mcs_start) / 1000000ull));
 		end_step(step_id_t::mark_code_sequences, buf);
+		anti_tamper::webhook::write_log("static_scan",
+			"phase=mark_code_sequences elapsed_ms via push_log");
+	} else {
+		push_log("Skipping prologue heuristic scan (fast static mode)");
+		end_step(step_id_t::mark_code_sequences, "fast static mode", true);
 	}
 
 	begin_step(step_id_t::propagate_types);
@@ -936,8 +944,13 @@ inline void run_pipeline(const std::string& path, const std::string& filename)
 	}
 
 	begin_step(step_id_t::finalize);
-	function_index::on_file_loaded();
-	xref_index::on_file_loaded();
+	if (pdb_loaded) {
+		function_index::on_file_loaded();
+		xref_index::on_file_loaded();
+		push_log("Refreshed function/xref indexes after PDB load");
+	} else {
+		push_log("Skipped redundant index refresh (no new PDB)");
+	}
 	push_log("The initial autoanalysis has been finished.");
 	end_step(step_id_t::finalize, "done");
 

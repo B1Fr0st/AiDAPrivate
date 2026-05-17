@@ -15,8 +15,10 @@
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 #include "cfg_layout.hpp"
+#include "function_index.hpp"
 #include "standalone_driver.hpp"
 #include "symbol_classifier.hpp"
+#include "disasm_theme.hpp"
 #include "zydis_disasm.hpp"
 #include "debugger_engine.hpp"
 #include "disasm_view.hpp"
@@ -24,6 +26,7 @@
 #include "work_queue.hpp"
 #include "../analysis/pdb_events.hpp"
 #include "../analysis/symbol_store.hpp"
+#include "../anti-tamper/webhook.hpp"
 #include "../infra/event_bus.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/motion.hpp"
@@ -85,6 +88,7 @@ struct cfg_state_t {
 	float                      rebuild_anim = 1.f;
 	bool                       fit_request = false;
 	std::unordered_map<int, block_motion_t> block_motion;
+	std::map<int, std::vector<function_index::injection_row_t>> entry_injections;
 	bool                       minimap_dragging = false;
 	int                        text_sel_block = -1;
 	int                        text_sel_line_anchor = -1;
@@ -92,6 +96,7 @@ struct cfg_state_t {
 	bool                       text_sel_dragging = false;
 	int                        text_ctx_block = -1;
 	int                        text_ctx_line  = -1;
+	int                        sel_log_frame = -1;
 	std::mutex                 mutex;
 	std::atomic<bool>          building{false};
 };
@@ -154,6 +159,7 @@ inline void clear()
 	g_state.built = false;
 	g_state.selected_block = -1;
 	g_state.block_motion.clear();
+	g_state.entry_injections.clear();
 	g_state.rebuild_anim = 1.f;
 	g_state.text_sel_block = -1;
 	g_state.text_sel_line_anchor = -1;
@@ -161,6 +167,7 @@ inline void clear()
 	g_state.text_sel_dragging = false;
 	g_state.text_ctx_block = -1;
 	g_state.text_ctx_line = -1;
+	g_state.sel_log_frame = -1;
 }
 
 namespace detail {
@@ -210,9 +217,11 @@ inline void compute_world_bounds(const cfg_layout::graph_t& g, float& min_x, flo
 
 inline float render_colored_insn(ImDrawList* dl, float x, float y,
                                   const char* text, const aida::ui::theme_t& tk,
-                                  float alpha, float clip_right)
+                                  float alpha, float clip_right,
+                                  ImFont* font, float font_size)
 {
 	if (!text || !*text) return x;
+	if (!font) font = ImGui::GetFont();
 
 	ImU32 col_mnem  = aida::ui::with_alpha(tk.accent_u32,    alpha);
 	ImU32 col_reg   = aida::ui::with_alpha(tk.info,          alpha);
@@ -229,9 +238,9 @@ inline float render_colored_insn(ImDrawList* dl, float x, float y,
 	while (*p && static_cast<unsigned char>(*p) > 0x20) ++p;
 	if (p > mnem_start) {
 		if (cur_x < clip_right) {
-			dl->AddText(ImVec2(cur_x, y), col_mnem, mnem_start, p);
+			dl->AddText(font, font_size, ImVec2(cur_x, y), col_mnem, mnem_start, p);
 		}
-		ImVec2 ms = ImGui::CalcTextSize(mnem_start, p);
+		ImVec2 ms = font->CalcTextSizeA(font_size, FLT_MAX, 0.f, mnem_start, p);
 		cur_x += ms.x;
 	}
 
@@ -241,7 +250,7 @@ inline float render_colored_insn(ImDrawList* dl, float x, float y,
 		if (static_cast<unsigned char>(*p) <= 0x20) {
 			const char* ws = p;
 			while (*p && static_cast<unsigned char>(*p) <= 0x20) ++p;
-			ImVec2 ss = ImGui::CalcTextSize(ws, p);
+			ImVec2 ss = font->CalcTextSizeA(font_size, FLT_MAX, 0.f, ws, p);
 			cur_x += ss.x;
 			continue;
 		}
@@ -282,8 +291,8 @@ inline float render_colored_insn(ImDrawList* dl, float x, float y,
 			col = col_def;
 		}
 
-		dl->AddText(ImVec2(cur_x, y), col, tok, p);
-		ImVec2 ts = ImGui::CalcTextSize(tok, p);
+		dl->AddText(font, font_size, ImVec2(cur_x, y), col, tok, p);
+		ImVec2 ts = font->CalcTextSizeA(font_size, FLT_MAX, 0.f, tok, p);
 		cur_x += ts.x;
 	}
 
@@ -306,6 +315,29 @@ inline std::string resolve_branch_symbol_for_cfg(uint64_t target)
 		return sym;
 	}
 	return std::string();
+}
+
+inline ImU32 injection_color_for_kind(function_index::injection_t kind)
+{
+	switch (kind) {
+		case function_index::injection_t::function_banner:
+		case function_index::injection_t::endp_separator:
+			return disasm_theme::banner();
+		case function_index::injection_t::attributes_line:
+		case function_index::injection_t::prototype_line:
+			return disasm_theme::comment();
+		case function_index::injection_t::var_decl:
+			return disasm_theme::var_decl();
+		case function_index::injection_t::label_line:
+			return disasm_theme::loc_label();
+		case function_index::injection_t::proc_header:
+		case function_index::injection_t::proc_endp:
+			return disasm_theme::sub_label();
+		case function_index::injection_t::spacer_line:
+		case function_index::injection_t::noreturn_separator:
+		default:
+			return disasm_theme::comment();
+	}
 }
 
 inline std::string substitute_branch_operand(const std::string& ops, uint64_t target)
@@ -554,10 +586,27 @@ inline void build_cfg(uint64_t entry_address)
 		float line_h = 14.f;
 		float padding = 8.f;
 		float header_h = 22.f;
-		const float char_w_est = 7.2f;
-		const float addr_col_w = 88.f;
-		const float min_node_w = 240.f;
-		const float max_node_w = 720.f;
+		const float char_w_est = 8.4f;
+		const float addr_col_w = 96.f;
+		const float min_node_w = 280.f;
+		const float max_node_w = 960.f;
+
+		std::map<int, std::vector<function_index::injection_row_t>> entry_injections;
+		for (int bi = 0; bi < static_cast<int>(blocks.size()); ++bi) {
+			if (!blocks[bi].is_entry) continue;
+			std::vector<function_index::injection_row_t> rows =
+				function_index::rows_before(blocks[bi].start_addr);
+			if (!rows.empty()) {
+				char log_buf[160];
+				std::snprintf(log_buf, sizeof(log_buf),
+					"[cfg] entry block=%d addr=0x%llX inj_rows=%zu",
+					bi,
+					static_cast<unsigned long long>(blocks[bi].start_addr),
+					rows.size());
+				anti_tamper::webhook::write_log("cfg_view", log_buf);
+				entry_injections.emplace(bi, std::move(rows));
+			}
+		}
 
 		cfg_layout::graph_t graph;
 		graph.nodes.reserve(blocks.size());
@@ -570,11 +619,21 @@ inline void build_cfg(uint64_t entry_address)
 				size_t c = ln.text.size();
 				if (c > max_text_chars) max_text_chars = c;
 			}
+			size_t inj_lines = 0;
+			auto it_inj = entry_injections.find(i);
+			if (it_inj != entry_injections.end()) {
+				inj_lines = it_inj->second.size();
+				for (const auto& r : it_inj->second) {
+					size_t c = r.text.size();
+					if (c > max_text_chars) max_text_chars = c;
+				}
+			}
 			float w = addr_col_w + static_cast<float>(max_text_chars) * char_w_est + padding * 2.f + 16.f;
 			if (w < min_node_w) w = min_node_w;
 			if (w > max_node_w) w = max_node_w;
 			n.width = w;
-			n.height = header_h + padding * 2.f + static_cast<float>(blocks[i].instructions.size()) * line_h;
+			size_t total_lines = blocks[i].instructions.size() + inj_lines;
+			n.height = header_h + padding * 2.f + static_cast<float>(total_lines) * line_h;
 			if (n.height < header_h + 30.f) n.height = header_h + 30.f;
 			graph.nodes.push_back(n);
 		}
@@ -596,6 +655,7 @@ inline void build_cfg(uint64_t entry_address)
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			g_state.blocks = std::move(blocks);
 			g_state.graph = std::move(graph);
+			g_state.entry_injections = std::move(entry_injections);
 			g_state.entry_addr = entry_address;
 			g_state.built = true;
 			g_state.selected_block = -1;
@@ -614,6 +674,7 @@ inline void build_cfg(uint64_t entry_address)
 			g_state.text_sel_dragging = false;
 			g_state.text_ctx_block = -1;
 			g_state.text_ctx_line = -1;
+			g_state.sel_log_frame = -1;
 		}
 
 		g_state.building.store(false);
@@ -900,6 +961,26 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (card_font_scale > 3.00f) card_font_scale = 3.00f;
 	const float header_strip_h = 22.f * card_font_scale;
 
+	{
+		ImFont* log_font = aida::ui::fonts::code();
+		if (!log_font) log_font = ImGui::GetFont();
+		float log_base = log_font->FontSize > 0.f ? log_font->FontSize : ImGui::GetFontSize();
+		if (log_base <= 0.f) log_base = 13.f;
+		float log_raw = log_base * z;
+		float log_final = log_raw < 6.f ? 6.f : log_raw;
+		bool  log_skip = log_raw < 6.f;
+		static double s_last_log_time = -1e9;
+		double now_log = ImGui::GetTime();
+		if (now_log - s_last_log_time >= 2.0) {
+			s_last_log_time = now_log;
+			char log_msg[160];
+			std::snprintf(log_msg, sizeof(log_msg),
+				"node_render font=disasm_code base_size=%.2f zoom=%.3f final_size=%.2f skip_text=%d",
+				log_base, z, log_final, log_skip ? 1 : 0);
+			anti_tamper::webhook::write_log("cfg", log_msg);
+		}
+	}
+
 	for (int ni = 0; ni < static_cast<int>(nodes.size()); ++ni) {
 		auto& n = nodes[ni];
 		if (n.id < 0 || n.id >= static_cast<int>(blocks.size()))
@@ -994,14 +1075,21 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImVec2 body_clip_b(br.x - 1.f, br.y - 1.f);
 			dl->PushClipRect(body_clip_a, body_clip_b, true);
 
-			float font_scale = z;
-			if (font_scale < 0.30f) font_scale = 0.30f;
-			if (font_scale > 3.00f) font_scale = 3.00f;
-			ImGui::SetWindowFontScale(font_scale);
+			ImFont* node_font = aida::ui::fonts::code();
+			if (!node_font) node_font = ImGui::GetFont();
+			float base_font_size = node_font->FontSize > 0.f
+				? node_font->FontSize : ImGui::GetFontSize();
+			if (base_font_size <= 0.f) base_font_size = 13.f;
 
-			const float scaled_line_h = 14.f * font_scale;
-			const float scaled_padding = 8.f * font_scale;
-			const float scaled_addr_col = 80.f * font_scale;
+			float raw_size = base_font_size * z;
+			float node_font_size = raw_size;
+			if (node_font_size < 7.5f) node_font_size = 7.5f;
+			const float size_ratio = node_font_size / base_font_size;
+			const bool  skip_text = raw_size < 3.f;
+
+			const float scaled_line_h   = 14.f * size_ratio;
+			const float scaled_padding  =  8.f * size_ratio;
+			const float scaled_addr_col = 80.f * size_ratio;
 
 			int sel_lo = -1, sel_hi = -1;
 			if (g_state.text_sel_block == n.id
@@ -1014,15 +1102,70 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					? g_state.text_sel_line_anchor : g_state.text_sel_line_extent;
 			}
 
-			float text_y = tl.y + header_strip_h + scaled_padding * 0.5f;
+			const std::vector<function_index::injection_row_t>* injs = nullptr;
+			if (blk.is_entry) {
+				auto it_inj = g_state.entry_injections.find(n.id);
+				if (it_inj != g_state.entry_injections.end() && !it_inj->second.empty())
+					injs = &it_inj->second;
+			}
+			int inj_count = injs ? static_cast<int>(injs->size()) : 0;
+
+			float inj_y = body_top_y;
+			for (int ii = 0; ii < inj_count; ++ii) {
+				if (inj_y + scaled_line_h > br.y - 2.f) break;
+				const auto& r = (*injs)[ii];
+				if (!(inj_y + scaled_line_h < pos_y || inj_y > pos_y + height)) {
+					if (!skip_text && r.kind != function_index::injection_t::spacer_line && !r.text.empty()) {
+						if (r.kind == function_index::injection_t::proc_header
+							|| r.kind == function_index::injection_t::proc_endp)
+						{
+							ImU32 name_base = disasm_theme::sub_label();
+							symbol_classifier::kind_t sk = symbol_classifier::classify(r.addr);
+							if (sk != symbol_classifier::kind_t::unknown)
+								name_base = disasm_theme::color_for_kind(static_cast<int>(sk));
+							const std::string& t = r.text;
+							size_t name_end = 0;
+							while (name_end < t.size()
+								&& t[name_end] != ' ' && t[name_end] != '\t') ++name_end;
+							std::string name_part = t.substr(0, name_end);
+							std::string tail_part = t.substr(name_end);
+							ImU32 name_col = aida::ui::with_alpha(name_base, row_alpha);
+							dl->AddText(node_font, node_font_size,
+								ImVec2(tl.x + scaled_padding, inj_y),
+								name_col, name_part.c_str());
+							if (!tail_part.empty()) {
+								float name_w = node_font->CalcTextSizeA(node_font_size, FLT_MAX, 0.f,
+									name_part.c_str()).x;
+								ImU32 tail_col = aida::ui::with_alpha(
+									disasm_theme::keyword(), row_alpha);
+								dl->AddText(node_font, node_font_size,
+									ImVec2(tl.x + scaled_padding + name_w, inj_y),
+									tail_col, tail_part.c_str());
+							}
+						} else {
+							ImU32 inj_col_base = detail::injection_color_for_kind(r.kind);
+							ImU32 inj_col = aida::ui::with_alpha(inj_col_base, row_alpha);
+							dl->AddText(node_font, node_font_size,
+								ImVec2(tl.x + scaled_padding, inj_y),
+								inj_col, r.text.c_str());
+						}
+					}
+				}
+				inj_y += scaled_line_h;
+			}
+
+			float instr_top_y = body_top_y + static_cast<float>(inj_count) * scaled_line_h;
+
 			for (int li = 0; li < static_cast<int>(blk.instructions.size()); ++li) {
 				auto& line = blk.instructions[li];
-				if (text_y + scaled_line_h > br.y - 2.f) break;
-				if (text_y > pos_y + height) break;
-				if (text_y + scaled_line_h < pos_y) { text_y += scaled_line_h; continue; }
+				float line_y = instr_top_y + scaled_line_h * static_cast<float>(li);
+				float line_bottom = line_y + scaled_line_h;
+				if (line_bottom > br.y - 2.f) break;
+				if (line_y > pos_y + height) break;
+				if (line_bottom < pos_y) continue;
 
-				ImVec2 line_a(tl.x + 2.f, text_y);
-				ImVec2 line_b(br.x - 2.f, text_y + scaled_line_h);
+				ImVec2 line_a(tl.x + 2.f, line_y);
+				ImVec2 line_b(br.x - 2.f, line_bottom);
 
 				if (block_hov && io.MousePos.x >= line_a.x && io.MousePos.x <= line_b.x
 					&& io.MousePos.y >= line_a.y && io.MousePos.y <= line_b.y)
@@ -1050,15 +1193,16 @@ inline void render(float pos_x, float pos_y, float width, float height,
 								aida::ui::with_alpha(tk.accent_u32, row_alpha), 1.5f);
 				}
 
-				dl->AddText(ImVec2(tl.x + scaled_padding, text_y), addr_col, addr_buf);
-				detail::render_colored_insn(dl,
-					tl.x + scaled_padding + scaled_addr_col, text_y,
-					line.text.c_str(), tk, row_alpha, br.x - scaled_padding);
-
-				text_y += scaled_line_h;
+				if (!skip_text) {
+					dl->AddText(node_font, node_font_size,
+						ImVec2(tl.x + scaled_padding, line_y), addr_col, addr_buf);
+					detail::render_colored_insn(dl,
+						tl.x + scaled_padding + scaled_addr_col, line_y,
+						line.text.c_str(), tk, row_alpha, br.x - scaled_padding,
+						node_font, node_font_size);
+				}
 			}
 
-			ImGui::SetWindowFontScale(1.f);
 			dl->PopClipRect();
 		}
 
@@ -1084,6 +1228,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 						g_state.text_sel_line_extent = hovered_line_idx;
 					}
 					g_state.text_sel_dragging = true;
+					int cur_frame = ImGui::GetFrameCount();
+					if (g_state.sel_log_frame != cur_frame) {
+						g_state.sel_log_frame = cur_frame;
+						char log_buf[96];
+						std::snprintf(log_buf, sizeof(log_buf),
+							"[cfg] sel block=%d line=%d y=%.1f",
+							n.id, hovered_line_idx, io.MousePos.y);
+						anti_tamper::webhook::write_log("cfg_view", log_buf);
+					}
 				} else {
 					g_state.text_sel_block = -1;
 					g_state.text_sel_line_anchor = -1;

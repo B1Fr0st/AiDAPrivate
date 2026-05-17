@@ -5,7 +5,10 @@
 
 #include "imgui.h"
 #include "aob_generator.hpp"
+#include "disasm_view.hpp"
+#include "hex_view.hpp"
 #include "ui_anim.hpp"
+#include "../anti-tamper/webhook.hpp"
 #include "../helpers/globals.h"
 #include "../helpers/diag_log.hpp"
 #include "../ui/theme.hpp"
@@ -16,6 +19,8 @@
 #include "../ui/skeleton.hpp"
 #include "../ui/blur_layer.hpp"
 #include "../ui/fonts.hpp"
+#include "../ui/responsive.hpp"
+#include "../ui/toast_notification.hpp"
 
 namespace aob_view {
 
@@ -136,6 +141,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::BeginChild("##aob_view", ImVec2(width, height), false,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
 
+	{
+		std::string pending_clip;
+		if (aob_generator::take_pending_clipboard(pending_clip)) {
+			ImGui::SetClipboardText(pending_clip.c_str());
+		}
+	}
+
 	auto* dl = ImGui::GetWindowDrawList();
 	auto& st = g_state;
 	auto& gen = aob_generator::g_state;
@@ -151,6 +163,21 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + h),
 		aida::ui::with_alpha(t.bg_base, alpha));
 
+	const float kAobMinW = 520.f;
+	if (w < kAobMinW) {
+		static bool s_logged_aob_narrow = false;
+		if (!s_logged_aob_narrow) {
+			s_logged_aob_narrow = true;
+			::diag::log_tagged_fmt("responsive",
+				"aob_view clamp_overlay width=%.0f min=%.0f", w, kAobMinW);
+		}
+		aida::ui::responsive::draw_clamp_overlay(
+			ImVec2(ox, oy), ImVec2(w, h),
+			"Widen the panel to use the AOB generator");
+		ImGui::EndChild();
+		return;
+	}
+
 	float left_w = w * 0.55f;
 	float right_w = w - left_w - 8.f;
 
@@ -162,6 +189,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		aida::ui::with_alpha(t.text_primary, alpha),
 		"AOB Signature Generator");
 	cy += 22.f;
+
+	{
+		bool live = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
+		bool pe = g_disasm.file.loaded && !g_disasm.file.sections.empty();
+		if (!live && !pe) {
+			ui_anim::render_inline_callout(dl, cx, cy, left_w - 24.f, 22.f,
+				"Generate needs a live process attach or an open PE.",
+				ui_anim::callout_kind_t::warn, 0.85f, 0.6f, 0.2f, alpha);
+			cy += 26.f;
+		}
+	}
 
 	{
 		float input_h = 32.f;
@@ -218,21 +256,72 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		if (aida::ui::button("Generate", aida::ui::button_kind_t::primary,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), generating, nullptr, generating)) {
+			diag::log_tagged_fmt("aob",
+				"view generate_button_clicked input='%s' count=%d auto_wildcard=%d generating=%d",
+				gen.address_input, gen.instruction_count,
+				static_cast<int>(gen.auto_wildcard),
+				static_cast<int>(generating));
+			anti_tamper::webhook::write_log("aob", "generate button clicked");
+			toast_notification::push("AOB: Generating signature...",
+				toast_notification::toast_type_t::info, 1.5f);
 			uint64_t addr = 0;
 			if (gen.address_input[0]) {
 				const char* p = gen.address_input;
 				if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
 				addr = std::strtoull(p, nullptr, 16);
 			}
+			if (addr == 0) {
+				uint64_t fallback = 0;
+				{
+					std::lock_guard<std::mutex> lk(gen.mutex);
+					fallback = gen.last_request_addr;
+					if (fallback == 0 && gen.current.address != 0)
+						fallback = gen.current.address;
+				}
+				if (fallback != 0) {
+					diag::log_tagged_fmt("aob",
+						"view generate using_fallback_address va=0x%llX",
+						static_cast<unsigned long long>(fallback));
+					addr = fallback;
+					std::snprintf(gen.address_input, sizeof(gen.address_input),
+						"%llX", static_cast<unsigned long long>(addr));
+				}
+			}
 			if (addr != 0) {
+				diag::log_tagged_fmt("aob",
+					"view generate dispatching addr=0x%llX count=%d",
+					static_cast<unsigned long long>(addr), gen.instruction_count);
 				aob_generator::generate_from_address(addr, gen.instruction_count, gen.auto_wildcard);
 			} else {
-				diag::log_tagged_fmt("aob", "view generate refused parse_failed input='%s'",
-					gen.address_input);
+				bool live = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
+				bool pe = g_disasm.file.loaded && !g_disasm.file.sections.empty();
+				diag::log_tagged_fmt("aob",
+					"view generate refused parse_failed input='%s' live=%d pe=%d",
+					gen.address_input, live ? 1 : 0, pe ? 1 : 0);
+				anti_tamper::webhook::write_log("aob", "generate refused parse_failed");
+				toast_notification::push(
+					"AOB: Enter a hex address (e.g. 7FF6A1B20040) or click an instruction in the disassembly first.",
+					toast_notification::toast_type_t::warning, 5.0f);
+				std::lock_guard<std::mutex> lk(gen.mutex);
+				if (!live && !pe) {
+					gen.last_error =
+						"No data source attached. Open a PE file or attach a process before generating signatures.";
+				} else {
+					gen.last_error =
+						"Address is empty or invalid. Enter a hexadecimal address (e.g. 7FF6A1B20040) or click an instruction in the disassembly first.";
+				}
+				gen.show_no_address_modal = true;
 			}
 		}
 		float btn_gap = 14.f;
 		float run_x = ImGui::GetItemRectMax().x + btn_gap;
+
+		ImGui::SetCursorScreenPos(ImVec2(run_x, cy));
+		if (aida::ui::button("Regenerate", aida::ui::button_kind_t::secondary,
+				aida::ui::size_t_::md, ImVec2(0.f, 0.f), generating, nullptr, generating)) {
+			aob_generator::regenerate_last();
+		}
+		run_x = ImGui::GetItemRectMax().x + btn_gap;
 
 		ImGui::SetCursorScreenPos(ImVec2(run_x, cy));
 		if (aida::ui::button("Save", aida::ui::button_kind_t::secondary,
@@ -241,14 +330,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 		run_x = ImGui::GetItemRectMax().x + btn_gap;
 
+		bool attached_live = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
 		ImGui::SetCursorScreenPos(ImVec2(run_x, cy));
 		if (aida::ui::button("Optimize", aida::ui::button_kind_t::secondary,
-				aida::ui::size_t_::md)) {
+				aida::ui::size_t_::md, ImVec2(0.f, 0.f), !attached_live)) {
 			aob_generator::signature_t to_optimize;
 			{
 				std::lock_guard<std::mutex> lk(gen.mutex);
 				to_optimize = gen.current;
 			}
+			anti_tamper::webhook::write_log("scan_audit",
+				"[scan_audit] aob optimize invoked");
 			work_queue::post([to_optimize]() mutable {
 				aob_generator::optimize_signature(to_optimize);
 				std::lock_guard<std::mutex> lk(aob_generator::g_state.mutex);
@@ -271,9 +363,35 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	cy += 42.f;
 
 	aob_generator::signature_t current_copy;
+	std::string error_copy;
 	{
 		std::lock_guard<std::mutex> lk(gen.mutex);
 		current_copy = gen.current;
+		error_copy = gen.last_error;
+	}
+
+	if (!error_copy.empty()) {
+		float err_x = cx - 4.f;
+		float err_w = ox + left_w - err_x - 12.f;
+		float err_h = 30.f;
+		ImU32 err_col = aida::ui::with_alpha(t.error, alpha);
+		dl->AddRectFilled(ImVec2(err_x, cy),
+			ImVec2(err_x + err_w, cy + err_h),
+			aida::ui::with_alpha(t.error, 0.10f * alpha), 8.f);
+		dl->AddRect(ImVec2(err_x, cy),
+			ImVec2(err_x + err_w, cy + err_h),
+			aida::ui::with_alpha(t.error, 0.55f * alpha), 8.f, 0, 1.f);
+		dl->AddText(aida::ui::fonts::body_em(), 12.f,
+			ImVec2(err_x + 12.f, cy + (err_h - 12.f) * 0.5f),
+			err_col, "Last error:");
+		ImVec2 lbl_sz = ImGui::CalcTextSize("Last error:");
+		ImGui::PushClipRect(ImVec2(err_x + 12.f + lbl_sz.x + 8.f, cy),
+			ImVec2(err_x + err_w - 12.f, cy + err_h), true);
+		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+			ImVec2(err_x + 12.f + lbl_sz.x + 8.f, cy + (err_h - 11.f) * 0.5f),
+			err_col, error_copy.c_str());
+		ImGui::PopClipRect();
+		cy += err_h + 10.f;
 	}
 
 	if (!current_copy.bytes.empty()) {
@@ -381,6 +499,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				ImGui::SetClipboardText(fmt.c_str());
 			}
 			ImGui::SetCursorScreenPos(ImVec2(cx + 110.f, cy));
+			if (aida::ui::button("Copy signature", aida::ui::button_kind_t::primary,
+					aida::ui::size_t_::sm)) {
+				std::string std_fmt = aob_generator::format_signature(current_copy);
+				ImGui::SetClipboardText(std_fmt.c_str());
+			}
+			ImGui::SetCursorScreenPos(ImVec2(cx + 232.f, cy));
 			if (aida::ui::button("Copy YARA", aida::ui::button_kind_t::secondary,
 					aida::ui::size_t_::sm)) {
 				std::string yara = aob_generator::format_yara_rule(current_copy);
@@ -435,13 +559,16 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 			bx = cx;
 			ImGui::SetCursorScreenPos(ImVec2(bx, cy));
+			bool attached_cmp = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
 			if (aida::ui::button("Compare", aida::ui::button_kind_t::secondary,
-					aida::ui::size_t_::sm)) {
+					aida::ui::size_t_::sm, ImVec2(0.f, 0.f), !attached_cmp)) {
 				std::vector<aob_generator::signature_t> sigs_copy;
 				{
 					std::lock_guard<std::mutex> lk(gen.mutex);
 					sigs_copy = gen.saved_signatures;
 				}
+				anti_tamper::webhook::write_log("scan_audit",
+					"[scan_audit] aob compare invoked");
 				work_queue::post([sigs_copy]() mutable {
 					auto results = aob_generator::compare_signatures_against_process(sigs_copy);
 					std::lock_guard<std::mutex> lk(aob_generator::g_state.mutex);
@@ -499,6 +626,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ui_anim::handle_scroll_input(st.target_scroll_y, 0.f, std::max(0.f, content_h - saved_h), row_h);
 	ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, 12.f, dt);
 
+	int ctx_saved_idx = -1;
+	bool ctx_saved_open = false;
+
 	ImGui::PushClipRect(ImVec2(rx, ry), ImVec2(rx + right_w, oy + h - 8.f), true);
 
 	static float saved_anim_time = 0.f;
@@ -525,6 +655,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 			st.selected_saved = (selected ? -1 : static_cast<int>(i));
+		}
+
+		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+			ctx_saved_idx = static_cast<int>(i);
+			ctx_saved_open = true;
+			st.selected_saved = ctx_saved_idx;
 		}
 
 		auto& sig = saved_copy[i];
@@ -576,6 +712,53 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	ImGui::PopClipRect();
 
+	if (ctx_saved_open) ImGui::OpenPopup("##aob_saved_ctx");
+
+	ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::with_alpha(t.bg_overlay, 1.f));
+	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(t.border_subtle, 1.f));
+	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, 1.f));
+	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 10.f);
+	if (ImGui::BeginPopup("##aob_saved_ctx")) {
+		if (ctx_saved_idx >= 0 && ctx_saved_idx < static_cast<int>(saved_copy.size())) {
+			auto& csig = saved_copy[static_cast<size_t>(ctx_saved_idx)];
+			if (ImGui::MenuItem("Open in Disassembly")) {
+				globals::ui::active_center_view = center_view_t::disassembly;
+				disasm_view::goto_address(csig.address, g_disasm);
+				anti_tamper::webhook::write_log("scan_audit",
+					"[scan_audit] aob saved ctx open_disasm");
+			}
+			if (ImGui::MenuItem("Open in Hex")) {
+				hex_view::read_from_process(csig.address, 256);
+				globals::ui::active_center_view = center_view_t::hex_view;
+				anti_tamper::webhook::write_log("scan_audit",
+					"[scan_audit] aob saved ctx open_hex");
+			}
+			ImGui::Separator();
+			if (ImGui::MenuItem("Copy Pattern")) {
+				std::string s = aob_generator::format_signature(csig);
+				ImGui::SetClipboardText(s.c_str());
+				anti_tamper::webhook::write_log("scan_audit",
+					"[scan_audit] aob saved ctx copy_pattern");
+			}
+			if (ImGui::MenuItem("Copy IDA Pattern")) {
+				std::string s = aob_generator::format_ida_signature(csig);
+				ImGui::SetClipboardText(s.c_str());
+				anti_tamper::webhook::write_log("scan_audit",
+					"[scan_audit] aob saved ctx copy_ida");
+			}
+			if (ImGui::MenuItem("Copy Address")) {
+				char abuf[24];
+				snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(csig.address));
+				ImGui::SetClipboardText(abuf);
+				anti_tamper::webhook::write_log("scan_audit",
+					"[scan_audit] aob saved ctx copy_address");
+			}
+		}
+		ImGui::EndPopup();
+	}
+	ImGui::PopStyleVar();
+	ImGui::PopStyleColor(3);
+
 	if (saved_copy.empty()) {
 		aida::ui::empty_state::config_t cfg;
 		cfg.glyph = aida::ui::empty_state::glyph_t::dots;
@@ -588,6 +771,35 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ui_anim::render_custom_scrollbar(dl, rx + right_w - 12.f, ry, 8.f, saved_h,
 		                                  st.scroll_y, content_h, saved_h,
 		                                  alpha, st.scrollbar_dragging, st.scrollbar_drag_offset);
+	}
+
+	if (gen.show_no_address_modal) {
+		ImGui::OpenPopup("AOB Generation Refused##aob_no_address_modal");
+		gen.show_no_address_modal = false;
+	}
+	ImVec2 modal_center = ImGui::GetMainViewport()->GetCenter();
+	ImGui::SetNextWindowPos(modal_center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+	ImGui::SetNextWindowSize(ImVec2(420.f, 0.f), ImGuiCond_Appearing);
+	if (ImGui::BeginPopupModal("AOB Generation Refused##aob_no_address_modal",
+		nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+		std::string modal_msg;
+		{
+			std::lock_guard<std::mutex> lk(gen.mutex);
+			modal_msg = gen.last_error.empty()
+				? std::string("No address selected - click an instruction first.")
+				: gen.last_error;
+		}
+		ImGui::TextColored(ImVec4(1.f, 0.55f, 0.55f, 1.f), "Cannot generate signature");
+		ImGui::Separator();
+		ImGui::TextWrapped("%s", modal_msg.c_str());
+		ImGui::Spacing();
+		float modal_w = ImGui::GetContentRegionAvail().x;
+		float btn_w = 120.f;
+		ImGui::SetCursorPosX((modal_w - btn_w) * 0.5f + ImGui::GetCursorPosX());
+		if (ImGui::Button("OK", ImVec2(btn_w, 0.f))) {
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::EndPopup();
 	}
 
 	ImGui::EndChild();

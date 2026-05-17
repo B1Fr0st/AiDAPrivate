@@ -42,11 +42,11 @@ inline void set_sub_tab(sub_tab_t tab)
 }
 
 inline constexpr aida::ui::hub_strip::tab_t s_tabs[] = {
-	{ "Symbolic",      "symbolic execution" },
-	{ "Taint",         "taint analysis" },
-	{ "Deobfuscation", "deobfuscation tools" },
-	{ "Fuzzer",        "coverage fuzzing" },
-	{ "Protection",    "protection scan / stealth" },
+	{ "Symbolic",      "symbolic execution",     "Sym" },
+	{ "Taint",         "taint analysis",         "Tnt" },
+	{ "Deobfuscation", "deobfuscation tools",    "Deo" },
+	{ "Fuzzer",        "coverage fuzzing",       "Fuz" },
+	{ "Protection",    "protection scan / stealth", "Prot" },
 };
 
 inline void render_active(int idx, float cw, float ch,

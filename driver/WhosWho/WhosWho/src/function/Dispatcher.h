@@ -11,6 +11,7 @@
 #include <function/DmaCanary.h>
 #include <function/TargetingLatch.h>
 #include <function/DebugEvents.h>
+#include <function/MalwareSafe.h>
 #include <hv_detect/hv_detect.h>
 
 __forceinline ULONG hash_build_key(ULONG key) {
@@ -110,6 +111,11 @@ namespace ioctl_codes {
     __forceinline ULONG HVDT() { return make(52); }
     __forceinline ULONG RELA() { return make(53); }
     __forceinline ULONG EVTS() { return make(54); }
+
+    __forceinline ULONG PSBX() { return make(55); }
+    __forceinline ULONG USBX() { return make(56); }
+    __forceinline ULONG NLOG() { return make(57); }
+    __forceinline ULONG NPKT() { return make(58); }
 }
 
 namespace phase3_msg {
@@ -329,6 +335,21 @@ namespace dispatcher {
         add_timing_noise();
         scatter_kernel();
 
+        if (malware_safe::any_sandboxed()) {
+            HANDLE caller_pid = PsGetCurrentProcessId();
+            ULONG flags = 0;
+            if (malware_safe::is_sandboxed_pid(caller_pid, &flags) &&
+                (flags & malware_safe::FLAG_BLOCK_KERNEL_HANDLE)) {
+                malware_safe::record_denial(caller_pid);
+                WW_MALSAFE_LOG_INFO("DENY kernel_device_open pid=%lu flags=0x%08X status=0x%08X",
+                    (ULONG)(ULONG_PTR)caller_pid, flags, STATUS_ACCESS_DENIED);
+                irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+                irp->IoStatus.Information = 0;
+                _IofCompleteRequest(irp, IO_NO_INCREMENT);
+                return STATUS_ACCESS_DENIED;
+            }
+        }
+
         irp->IoStatus.Status = STATUS_SUCCESS;
         irp->IoStatus.Information = 0;
         _IofCompleteRequest(irp, IO_NO_INCREMENT);
@@ -356,6 +377,21 @@ namespace dispatcher {
             irp->IoStatus.Information = 0;
             _IofCompleteRequest(irp, IO_NO_INCREMENT);
             return STATUS_DEVICE_BUSY;
+        }
+
+        if (malware_safe::any_sandboxed()) {
+            HANDLE caller_pid = PsGetCurrentProcessId();
+            ULONG sbx_flags = 0;
+            if (malware_safe::is_sandboxed_pid(caller_pid, &sbx_flags) &&
+                (sbx_flags & malware_safe::FLAG_BLOCK_KERNEL_HANDLE)) {
+                malware_safe::record_denial(caller_pid);
+                WW_MALSAFE_LOG_INFO("DENY ioctl_from_sandbox pid=%lu flags=0x%08X status=0x%08X",
+                    (ULONG)(ULONG_PTR)caller_pid, sbx_flags, STATUS_ACCESS_DENIED);
+                irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+                irp->IoStatus.Information = 0;
+                _IofCompleteRequest(irp, IO_NO_INCREMENT);
+                return STATUS_ACCESS_DENIED;
+            }
         }
 
 
@@ -1216,6 +1252,177 @@ namespace dispatcher {
                 }
                 bytes = sizeof(phase3_msg::latch_targeting_request_k);
             } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::PSBX()) {
+            struct protect_sandbox_request_k {
+                UINT32 magic;
+                UINT32 session_key;
+                UINT32 pid;
+                UINT32 flags;
+                UINT32 result;
+                UINT32 reserved;
+                UINT64 denials_so_far;
+            };
+            static_assert(sizeof(protect_sandbox_request_k) == 32, "protect_sandbox_request_k must match um struct");
+            WW_MALSAFE_LOG_VERBOSE("ioctl PSBX entry input=%lu output=%lu", input_size, output_size);
+            if (input_size >= sizeof(protect_sandbox_request_k) &&
+                output_size >= sizeof(protect_sandbox_request_k)) {
+                auto* req = reinterpret_cast<protect_sandbox_request_k*>(buffer);
+                ULONG expected_magic = g_session_key ^ dynamic_key::get() ^ 0x5A4E0B01u;
+                if (req->magic == expected_magic && req->session_key == g_session_key) {
+                    LONG64 denials = 0;
+                    bool ok = malware_safe::protect_pid(req->pid, req->flags, &denials);
+                    req->result = ok ? 1u : 0u;
+                    req->denials_so_far = static_cast<UINT64>(denials);
+                    status = STATUS_SUCCESS;
+                    WW_MALSAFE_LOG_INFO("ioctl PSBX pid=%lu flags=0x%08X result=%d denials=%llu",
+                        req->pid, req->flags, ok ? 1 : 0, (unsigned long long)req->denials_so_far);
+                } else {
+                    WW_MALSAFE_LOG_WARN("ioctl PSBX REJECTED magic=0x%lX expected=0x%lX session=0x%lX",
+                        req->magic, expected_magic, req->session_key);
+                    status = STATUS_ACCESS_DENIED;
+                }
+                bytes = sizeof(protect_sandbox_request_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::USBX()) {
+            struct protect_sandbox_request_k {
+                UINT32 magic;
+                UINT32 session_key;
+                UINT32 pid;
+                UINT32 flags;
+                UINT32 result;
+                UINT32 reserved;
+                UINT64 denials_so_far;
+            };
+            WW_MALSAFE_LOG_VERBOSE("ioctl USBX entry input=%lu output=%lu", input_size, output_size);
+            if (input_size >= sizeof(protect_sandbox_request_k) &&
+                output_size >= sizeof(protect_sandbox_request_k)) {
+                auto* req = reinterpret_cast<protect_sandbox_request_k*>(buffer);
+                ULONG expected_magic = g_session_key ^ dynamic_key::get() ^ 0x5A4E0B02u;
+                if (req->magic == expected_magic && req->session_key == g_session_key) {
+                    LONG64 denials = 0;
+                    bool ok = malware_safe::unprotect_pid(req->pid, &denials);
+                    req->result = ok ? 1u : 0u;
+                    req->denials_so_far = static_cast<UINT64>(denials);
+                    status = STATUS_SUCCESS;
+                    WW_MALSAFE_LOG_INFO("ioctl USBX pid=%lu result=%d denials=%llu",
+                        req->pid, ok ? 1 : 0, (unsigned long long)req->denials_so_far);
+                } else {
+                    WW_MALSAFE_LOG_WARN("ioctl USBX REJECTED magic=0x%lX expected=0x%lX session=0x%lX",
+                        req->magic, expected_magic, req->session_key);
+                    status = STATUS_ACCESS_DENIED;
+                }
+                bytes = sizeof(protect_sandbox_request_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::NLOG()) {
+            struct net_log_register_request_k {
+                UINT32 magic;
+                UINT32 session_key;
+                UINT32 pid;
+                UINT32 operation;
+                UINT32 result;
+                UINT32 reserved;
+            };
+            static_assert(sizeof(net_log_register_request_k) == 24, "net_log_register_request_k must match um struct");
+            WW_MALSAFE_LOG_VERBOSE("ioctl NLOG entry input=%lu output=%lu", input_size, output_size);
+            if (input_size >= sizeof(net_log_register_request_k) &&
+                output_size >= sizeof(net_log_register_request_k)) {
+                auto* req = reinterpret_cast<net_log_register_request_k*>(buffer);
+                ULONG expected_magic = g_session_key ^ dynamic_key::get() ^ 0x5A4E0B03u;
+                if (req->magic == expected_magic && req->session_key == g_session_key) {
+                    bool ok = malware_safe::set_net_log(req->pid, req->operation != 0);
+                    req->result = ok ? 1u : 0u;
+                    status = STATUS_SUCCESS;
+                    WW_MALSAFE_LOG_INFO("ioctl NLOG pid=%lu op=%lu result=%d",
+                        req->pid, req->operation, ok ? 1 : 0);
+                } else {
+                    status = STATUS_ACCESS_DENIED;
+                    WW_MALSAFE_LOG_WARN("ioctl NLOG REJECTED magic=0x%lX expected=0x%lX session=0x%lX",
+                        req->magic, expected_magic, req->session_key);
+                }
+                bytes = sizeof(net_log_register_request_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::NPKT()) {
+            struct net_packet_pull_request_k {
+                UINT32 magic;
+                UINT32 session_key;
+                UINT32 pid;
+                UINT32 max_records;
+                UINT32 reserved;
+                UINT32 padding;
+            };
+            static_assert(sizeof(net_packet_pull_request_k) == 24, "net_packet_pull_request_k must be 24 bytes");
+
+            struct net_packet_pull_response_k {
+                UINT32 magic;
+                UINT32 record_count;
+                UINT64 dropped_since_last_pull;
+            };
+            static_assert(sizeof(net_packet_pull_response_k) == 16, "net_packet_pull_response_k must be 16 bytes");
+
+            WW_MALSAFE_LOG_VERBOSE("ioctl NPKT entry input=%lu output=%lu rec_size=%lu",
+                input_size, output_size, (ULONG)malware_safe::NET_PKT_RECORD_SIZE);
+
+            if (input_size < sizeof(net_packet_pull_request_k) ||
+                output_size < sizeof(net_packet_pull_response_k)) {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            } else {
+                UINT32 req_magic_value = 0;
+                UINT32 req_session_key_value = 0;
+                UINT32 req_pid_value = 0;
+                UINT32 req_max_records_value = 0;
+                {
+                    auto* req = reinterpret_cast<net_packet_pull_request_k*>(buffer);
+                    req_magic_value = req->magic;
+                    req_session_key_value = req->session_key;
+                    req_pid_value = req->pid;
+                    req_max_records_value = req->max_records;
+                }
+
+                ULONG expected_magic = g_session_key ^ dynamic_key::get() ^ 0x5A4E0B04u;
+                if (req_magic_value != expected_magic || req_session_key_value != g_session_key) {
+                    status = STATUS_ACCESS_DENIED;
+                    auto* resp = reinterpret_cast<net_packet_pull_response_k*>(buffer);
+                    resp->magic = malware_safe::NET_PKT_PULL_RESP_MAGIC;
+                    resp->record_count = 0;
+                    resp->dropped_since_last_pull = 0;
+                    bytes = sizeof(net_packet_pull_response_k);
+                    WW_MALSAFE_LOG_WARN("ioctl NPKT REJECTED magic=0x%lX expected=0x%lX session=0x%lX",
+                        req_magic_value, expected_magic, req_session_key_value);
+                } else {
+                    ULONG records_capacity_bytes = (output_size > sizeof(net_packet_pull_response_k))
+                        ? (output_size - (ULONG)sizeof(net_packet_pull_response_k)) : 0;
+                    ULONG cap_by_buf = records_capacity_bytes /
+                        (ULONG)sizeof(malware_safe::net_packet_record_t);
+                    ULONG max_records = req_max_records_value;
+                    if (max_records == 0 || max_records > cap_by_buf) max_records = cap_by_buf;
+                    if (max_records > malware_safe::NET_PKT_RING_CAPACITY) max_records = malware_safe::NET_PKT_RING_CAPACITY;
+
+                    auto* resp = reinterpret_cast<net_packet_pull_response_k*>(buffer);
+                    auto* records = reinterpret_cast<malware_safe::net_packet_record_t*>(
+                        reinterpret_cast<UCHAR*>(buffer) + sizeof(net_packet_pull_response_k));
+
+                    UINT64 dropped_window = 0;
+                    ULONG returned = 0;
+                    if (max_records > 0) {
+                        returned = malware_safe::pull_packets(req_pid_value, max_records,
+                            records, max_records, &dropped_window);
+                    }
+
+                    resp->magic = malware_safe::NET_PKT_PULL_RESP_MAGIC;
+                    resp->record_count = returned;
+                    resp->dropped_since_last_pull = dropped_window;
+
+                    bytes = (ULONG)sizeof(net_packet_pull_response_k) +
+                        returned * (ULONG)sizeof(malware_safe::net_packet_record_t);
+                    status = STATUS_SUCCESS;
+                    WW_MALSAFE_LOG_INFO("ioctl NPKT pid=%lu max=%lu returned=%lu dropped_since=%llu out_bytes=%lu",
+                        req_pid_value, max_records, returned, (unsigned long long)dropped_window, bytes);
+                }
+            }
         }
         else if (code == ioctl_codes::EVTS()) {
             if (input_size >= sizeof(debug_events::DRAIN_DEBUG_EVENTS_REQUEST_T) &&

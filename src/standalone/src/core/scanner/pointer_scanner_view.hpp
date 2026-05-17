@@ -9,8 +9,10 @@
 #include "imgui/imgui.h"
 #include "pointer_scanner.hpp"
 #include "disasm_view.hpp"
+#include "function_index.hpp"
 #include "hex_view.hpp"
 #include "ui_anim.hpp"
+#include "../anti-tamper/webhook.hpp"
 #include "../helpers/globals.h"
 #include "../helpers/diag_log.hpp"
 #include "../ui/theme.hpp"
@@ -392,9 +394,18 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	dl->AddLine(ImVec2(cfg_x + config_panel_w, cfg_y), ImVec2(cfg_x + config_panel_w, cfg_y + cfg_h),
 		aida::ui::with_alpha(t.border_subtle, a), 1.f);
 
+	bool live_now = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
+	bool static_pe_now = function_index::detail::static_pe_active();
 	float cy = cfg_y + 18.f;
 	float cx = cfg_x + 18.f;
 	float field_w = config_panel_w - 36.f;
+
+	if (!live_now && !static_pe_now) {
+		ui_anim::render_inline_callout(dl, cx, cy, field_w, 36.f,
+			"Pointer chain scanning requires a live attach.",
+			ui_anim::callout_kind_t::warn, 0.85f, 0.6f, 0.2f, a);
+		cy += 44.f;
+	}
 
 	{
 		ImFont* hfn = aida::ui::fonts::body_em();
@@ -528,7 +539,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	} else {
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		if (aida::ui::button("Build Pointer Map", aida::ui::button_kind_t::primary,
-				aida::ui::size_t_::md, ImVec2(field_w, 0.f))) {
+				aida::ui::size_t_::md, ImVec2(field_w, 0.f), !live_now)) {
+			anti_tamper::webhook::write_log("scan_audit",
+				"[scan_audit] pointer_scanner build_reverse_map");
 			pointer_scanner::build_reverse_map();
 		}
 		cy += 46.f;
@@ -547,11 +560,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 		cy += 44.f;
 	} else {
-		bool can_scan = !building && st.map_entry_count > 0;
+		bool can_scan = !building && st.map_entry_count > 0 && live_now;
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		if (aida::ui::button("Scan Chains", aida::ui::button_kind_t::primary,
 				aida::ui::size_t_::md, ImVec2(field_w, 0.f), !can_scan)) {
-			st.config.target_address = strtoull(st.addr_buf, nullptr, 16);
+			const char* p = st.addr_buf;
+			if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+			st.config.target_address = strtoull(p, nullptr, 16);
+			anti_tamper::webhook::write_log("scan_audit",
+				"[scan_audit] pointer_scanner scan_chains");
 			pointer_scanner::start_scan();
 		}
 		cy += 46.f;
@@ -571,7 +588,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	} else {
 		if (aida::ui::button("Validate All", aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::md, ImVec2(field_w, 0.f),
-				scanning || building || validating)) {
+				scanning || building || validating || !live_now)) {
+			anti_tamper::webhook::write_log("scan_audit",
+				"[scan_audit] pointer_scanner validate_all");
 			pointer_scanner::validate_all_results();
 		}
 	}

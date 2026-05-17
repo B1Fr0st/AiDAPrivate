@@ -113,13 +113,18 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			}
 
 			aob_generator::signature_t sig;
+			std::string tool_last_error;
 			{
 				std::lock_guard<std::mutex> lk(aob_generator::g_state.mutex);
 				sig = aob_generator::g_state.current;
+				tool_last_error = aob_generator::g_state.last_error;
 			}
 
-			if (sig.bytes.empty()) {
-				return tool_result_t::error("Failed to generate signature (could not read memory or decode instructions)");
+			if (sig.bytes.empty() || sig.address != addr) {
+				std::string err_msg = tool_last_error.empty()
+					? std::string("Failed to generate signature (could not read memory or decode instructions)")
+					: tool_last_error;
+				return tool_result_t::error(err_msg);
 			}
 
 			json result;

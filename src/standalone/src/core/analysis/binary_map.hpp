@@ -15,6 +15,8 @@ namespace binary_map {
 		bool        executable = false;
 		bool        readable = true;
 		bool        writable = false;
+		float       entropy = 0.f;
+		uint64_t    sampled_bytes = 0;
 	};
 
 	struct map_function_t

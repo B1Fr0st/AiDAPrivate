@@ -1,12 +1,14 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include "transition.hpp"
 
 namespace debugger_view {
 
 enum class sub_tab_t : int {
-	breakpoints = 0,
+	cpu = 0,
+	breakpoints,
 	memory_map,
 	call_stack,
 	threads,
@@ -41,8 +43,8 @@ struct tab_animator_t {
 };
 
 struct ui_state_t {
-	sub_tab_t active_tab = sub_tab_t::breakpoints;
-	sub_tab_t prev_tab   = sub_tab_t::breakpoints;
+	sub_tab_t active_tab = sub_tab_t::cpu;
+	sub_tab_t prev_tab   = sub_tab_t::cpu;
 
 	float tab_anim[static_cast<int>(sub_tab_t::COUNT)] = {};
 
@@ -107,6 +109,48 @@ struct ui_state_t {
 	char     add_bookmark_label_buf[64] = {};
 	char     trace_filter_buf[96] = {};
 
+	list_panel_state_t cpu_panel;
+	float    cpu_scroll_y = 0.f;
+	int      cpu_edit_reg_idx = -1;
+	char     cpu_edit_value_buf[24] = {};
+	bool     cpu_edit_popup_open = false;
+
+	uint64_t cpu_prev_reg_values[32] = {};
+	float    cpu_reg_flash[32] = {};
+	bool     cpu_prev_reg_initialized = false;
+	float    cpu_reg_scroll_y = 0.f;
+	float    cpu_stack_scroll_y = 0.f;
+	int      cpu_stack_selected = -1;
+	int      cpu_disasm_selected = -1;
+	uint64_t cpu_disasm_anchor_rip = 0;
+	int      cpu_context_reg_idx = -1;
+	bool     cpu_context_open = false;
+	int      cpu_stack_context_idx = -1;
+	bool     cpu_stack_context_open = false;
+	int      cpu_disasm_context_idx = -1;
+	bool     cpu_disasm_context_open = false;
+	uint64_t cpu_disasm_context_target = 0;
+	uint64_t cpu_disasm_context_addr = 0;
+
+	int      bp_edit_idx = -1;
+	char     bp_edit_condition_buf[160] = {};
+	char     bp_edit_log_buf[160] = {};
+	bool     bp_edit_auto_continue = false;
+	bool     bp_edit_popup_open = false;
+
+	int      handle_close_idx = -1;
+	uint64_t handle_close_value = 0;
+	std::string handle_close_type;
+	std::string handle_close_name;
+	bool     handle_close_popup_open = false;
+
+	int      thread_kill_idx = -1;
+	uint32_t thread_kill_tid = 0;
+	bool     thread_kill_popup_open = false;
+
+	uint64_t cfg_last_built_addr = 0;
+
+	bool     seh_break_request_active = false;
 };
 
 inline ui_state_t g_ui;

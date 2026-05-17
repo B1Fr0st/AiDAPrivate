@@ -13,8 +13,14 @@
 #include <processthreadsapi.h>
 #include <jobapi2.h>
 #include <jobapi.h>
+#include <winsafer.h>
+#include <sddl.h>
+#include <aclapi.h>
+#include <shlobj.h>
 
 #include "run_target.hpp"
+#include "standalone_driver.hpp"
+#include "shadow_fs_client.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <atomic>
@@ -35,6 +41,71 @@
 #pragma comment(lib, "userenv.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "shell32.lib")
+
+#ifndef PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY
+#define PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY \
+    ProcThreadAttributeValue(7, FALSE, TRUE, FALSE)
+#endif
+
+#ifndef PROCESS_CREATION_MITIGATION_POLICY_DEP_ENABLE
+#define PROCESS_CREATION_MITIGATION_POLICY_DEP_ENABLE                                        0x00000001ULL
+#endif
+#ifndef PROCESS_CREATION_MITIGATION_POLICY_DEP_ATL_THUNK_ENABLE
+#define PROCESS_CREATION_MITIGATION_POLICY_DEP_ATL_THUNK_ENABLE                              0x00000002ULL
+#endif
+#ifndef PROCESS_CREATION_MITIGATION_POLICY_SEHOP_ENABLE
+#define PROCESS_CREATION_MITIGATION_POLICY_SEHOP_ENABLE                                      0x00000004ULL
+#endif
+#ifndef PROCESS_CREATION_MITIGATION_POLICY_FORCE_RELOCATE_IMAGES_ALWAYS_ON
+#define PROCESS_CREATION_MITIGATION_POLICY_FORCE_RELOCATE_IMAGES_ALWAYS_ON                   (0x00000001ULL << 8)
+#endif
+#ifndef PROCESS_CREATION_MITIGATION_POLICY_HEAP_TERMINATE_ALWAYS_ON
+#define PROCESS_CREATION_MITIGATION_POLICY_HEAP_TERMINATE_ALWAYS_ON                          (0x00000001ULL << 12)
+#endif
+#ifndef PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_ON
+#define PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_ON                          (0x00000001ULL << 16)
+#endif
+#ifndef PROCESS_CREATION_MITIGATION_POLICY_HIGH_ENTROPY_ASLR_ALWAYS_ON
+#define PROCESS_CREATION_MITIGATION_POLICY_HIGH_ENTROPY_ASLR_ALWAYS_ON                       (0x00000001ULL << 20)
+#endif
+#ifndef PROCESS_CREATION_MITIGATION_POLICY_STRICT_HANDLE_CHECKS_ALWAYS_ON
+#define PROCESS_CREATION_MITIGATION_POLICY_STRICT_HANDLE_CHECKS_ALWAYS_ON                    (0x00000001ULL << 24)
+#endif
+#ifndef PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON
+#define PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON              (0x00000001ULL << 28)
+#endif
+#ifndef PROCESS_CREATION_MITIGATION_POLICY_EXTENSION_POINT_DISABLE_ALWAYS_ON
+#define PROCESS_CREATION_MITIGATION_POLICY_EXTENSION_POINT_DISABLE_ALWAYS_ON                 (0x00000001ULL << 32)
+#endif
+#ifndef PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_ON
+#define PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_ON                      (0x00000001ULL << 40)
+#endif
+#ifndef PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON
+#define PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON            (0x00000001ULL << 44)
+#endif
+#ifndef PROCESS_CREATION_MITIGATION_POLICY_FONT_DISABLE_ALWAYS_ON
+#define PROCESS_CREATION_MITIGATION_POLICY_FONT_DISABLE_ALWAYS_ON                            (0x00000001ULL << 48)
+#endif
+#ifndef PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_REMOTE_ALWAYS_ON
+#define PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_REMOTE_ALWAYS_ON                    (0x00000001ULL << 52)
+#endif
+#ifndef PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_LOW_LABEL_ALWAYS_ON
+#define PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_LOW_LABEL_ALWAYS_ON                 (0x00000001ULL << 56)
+#endif
+#ifndef PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_PREFER_SYSTEM32_ALWAYS_ON
+#define PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_PREFER_SYSTEM32_ALWAYS_ON              (0x00000001ULL << 60)
+#endif
+
+#ifndef PROCESS_CREATION_MITIGATION_POLICY2_LOADER_INTEGRITY_CONTINUITY_ALWAYS_ON
+#define PROCESS_CREATION_MITIGATION_POLICY2_LOADER_INTEGRITY_CONTINUITY_ALWAYS_ON            (0x00000001ULL << 4)
+#endif
+#ifndef PROCESS_CREATION_MITIGATION_POLICY2_STRICT_CONTROL_FLOW_GUARD_ALWAYS_ON
+#define PROCESS_CREATION_MITIGATION_POLICY2_STRICT_CONTROL_FLOW_GUARD_ALWAYS_ON              (0x00000001ULL << 8)
+#endif
+#ifndef PROCESS_CREATION_MITIGATION_POLICY2_MODULE_TAMPERING_PROTECTION_ALWAYS_ON
+#define PROCESS_CREATION_MITIGATION_POLICY2_MODULE_TAMPERING_PROTECTION_ALWAYS_ON            (0x00000001ULL << 12)
+#endif
 
 namespace run_target {
 
@@ -364,6 +435,326 @@ bool launch_same_desktop(const launch_options_t& opts, launch_result_t& out) {
 	return launch_jobbed(opts, out, false);
 }
 
+std::wstring resolve_local_appdata_dir() {
+	PWSTR raw = nullptr;
+	if (SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &raw) != S_OK || raw == nullptr) {
+		wchar_t buf[MAX_PATH] = {};
+		if (GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH) > 0) {
+			return std::wstring(buf);
+		}
+		return {};
+	}
+	std::wstring out(raw);
+	CoTaskMemFree(raw);
+	return out;
+}
+
+uint64_t make_launch_id() {
+	uint64_t tick = static_cast<uint64_t>(GetTickCount64());
+	uint64_t pid = static_cast<uint64_t>(GetCurrentProcessId());
+	uint64_t qpc = 0;
+	LARGE_INTEGER li{};
+	if (QueryPerformanceCounter(&li)) qpc = static_cast<uint64_t>(li.QuadPart);
+	uint64_t mix = (tick << 24) ^ (pid << 8) ^ qpc;
+	if (mix == 0) mix = tick + pid + 1;
+	return mix;
+}
+
+std::wstring format_launch_id_hex(uint64_t v) {
+	wchar_t buf[24];
+	std::swprintf(buf, 24, L"%016llX", static_cast<unsigned long long>(v));
+	return std::wstring(buf);
+}
+
+bool create_sandbox_directory(const std::wstring& launch_id_hex,
+                              std::wstring& out_root,
+                              std::string* fail_reason) {
+	std::wstring local_app = resolve_local_appdata_dir();
+	if (local_app.empty()) {
+		if (fail_reason) *fail_reason = "LocalAppData path unavailable";
+		return false;
+	}
+	std::filesystem::path root = std::filesystem::path(local_app) / L"AiDA" / L"Sandboxes" / launch_id_hex;
+	std::error_code ec;
+	std::filesystem::create_directories(root, ec);
+	if (ec) {
+		if (fail_reason) *fail_reason = "create sandbox root failed: " + ec.message();
+		return false;
+	}
+	const wchar_t* subs[] = {
+		L"AppData", L"AppData\\Local", L"AppData\\Roaming", L"AppData\\LocalLow",
+		L"Temp", L"Tmp", L"UserProfile", L"Drops", L"Output", L"Logs"
+	};
+	for (auto sub : subs) {
+		std::filesystem::create_directories(root / sub, ec);
+		ec.clear();
+	}
+	out_root = root.wstring();
+	return true;
+}
+
+bool build_sandbox_environment(const std::wstring& sandbox_root,
+                               std::vector<wchar_t>& out_env_block) {
+	wchar_t* env_strings = GetEnvironmentStringsW();
+	if (env_strings == nullptr) return false;
+	out_env_block.clear();
+
+	std::wstring tmp_dir   = sandbox_root + L"\\Temp";
+	std::wstring tmp_dir_alt = sandbox_root + L"\\Tmp";
+	std::wstring appdata   = sandbox_root + L"\\AppData\\Roaming";
+	std::wstring localapp  = sandbox_root + L"\\AppData\\Local";
+	std::wstring userprof  = sandbox_root + L"\\UserProfile";
+
+	auto upper_w = [](std::wstring s) {
+		for (auto& c : s) {
+			if (c >= L'a' && c <= L'z') c = static_cast<wchar_t>(c - L'a' + L'A');
+		}
+		return s;
+	};
+
+	auto get_var_name_upper = [&](const wchar_t* entry) -> std::wstring {
+		const wchar_t* eq = wcschr(entry, L'=');
+		if (eq == nullptr) return {};
+		return upper_w(std::wstring(entry, eq));
+	};
+
+	const wchar_t* p = env_strings;
+	while (*p) {
+		std::wstring name_u = get_var_name_upper(p);
+		if (!name_u.empty()
+		    && name_u != L"TEMP" && name_u != L"TMP"
+		    && name_u != L"APPDATA" && name_u != L"LOCALAPPDATA"
+		    && name_u != L"USERPROFILE") {
+			while (*p) {
+				out_env_block.push_back(*p++);
+			}
+			out_env_block.push_back(L'\0');
+			++p;
+		} else {
+			while (*p) ++p;
+			++p;
+		}
+	}
+	FreeEnvironmentStringsW(env_strings);
+
+	auto push_var = [&](const wchar_t* name, const std::wstring& value) {
+		while (*name) out_env_block.push_back(*name++);
+		out_env_block.push_back(L'=');
+		for (wchar_t c : value) out_env_block.push_back(c);
+		out_env_block.push_back(L'\0');
+	};
+	push_var(L"TEMP",         tmp_dir);
+	push_var(L"TMP",          tmp_dir_alt);
+	push_var(L"APPDATA",      appdata);
+	push_var(L"LOCALAPPDATA", localapp);
+	push_var(L"USERPROFILE",  userprof);
+	out_env_block.push_back(L'\0');
+	return true;
+}
+
+bool drop_token_integrity_level(HANDLE token, bool to_untrusted) {
+	const wchar_t* sddl = to_untrusted ? L"S-1-16-0" : L"S-1-16-4096";
+	PSID il_sid = nullptr;
+	if (!ConvertStringSidToSidW(sddl, &il_sid) || il_sid == nullptr) {
+		return false;
+	}
+	TOKEN_MANDATORY_LABEL tml{};
+	tml.Label.Attributes = SE_GROUP_INTEGRITY;
+	tml.Label.Sid = il_sid;
+	DWORD info_len = sizeof(tml) + GetLengthSid(il_sid);
+	BOOL ok = SetTokenInformation(token, TokenIntegrityLevel, &tml, info_len);
+	DWORD gle = ok ? 0 : GetLastError();
+	LocalFree(il_sid);
+	if (!ok) {
+		diag::log_tagged_critical_fmt("malware_safe",
+			"set_il_FAILED to_untrusted=%d gle=%lu",
+			to_untrusted ? 1 : 0, static_cast<unsigned long>(gle));
+		return false;
+	}
+	return true;
+}
+
+bool build_restricted_token(HANDLE source_token,
+                            HANDLE& out_restricted,
+                            std::string* fail_reason) {
+	out_restricted = nullptr;
+	HANDLE primary = nullptr;
+
+	using fn_saferCreateLevel = BOOL(WINAPI*)(DWORD, DWORD, DWORD, SAFER_LEVEL_HANDLE*, LPVOID);
+	using fn_saferComputeTokenFromLevel = BOOL(WINAPI*)(SAFER_LEVEL_HANDLE, HANDLE, PHANDLE, DWORD, LPVOID);
+	using fn_saferCloseLevel = BOOL(WINAPI*)(SAFER_LEVEL_HANDLE);
+
+	HMODULE adv = GetModuleHandleW(L"advapi32.dll");
+	if (adv == nullptr) adv = LoadLibraryW(L"advapi32.dll");
+	if (adv != nullptr) {
+		fn_saferCreateLevel pCreate =
+			reinterpret_cast<fn_saferCreateLevel>(
+				reinterpret_cast<void*>(GetProcAddress(adv, "SaferCreateLevel")));
+		fn_saferComputeTokenFromLevel pCompute =
+			reinterpret_cast<fn_saferComputeTokenFromLevel>(
+				reinterpret_cast<void*>(GetProcAddress(adv, "SaferComputeTokenFromLevel")));
+		fn_saferCloseLevel pClose =
+			reinterpret_cast<fn_saferCloseLevel>(
+				reinterpret_cast<void*>(GetProcAddress(adv, "SaferCloseLevel")));
+
+		if (pCreate && pCompute && pClose) {
+			SAFER_LEVEL_HANDLE level = nullptr;
+			if (pCreate(SAFER_SCOPEID_USER, SAFER_LEVELID_CONSTRAINED, 0, &level, nullptr) && level) {
+				HANDLE safer_tok = nullptr;
+				if (pCompute(level, source_token, &safer_tok, 0, nullptr) && safer_tok) {
+					primary = safer_tok;
+				} else {
+					DWORD gle = GetLastError();
+					diag::log_tagged_critical_fmt("malware_safe",
+						"safer_compute_FAILED gle=%lu", static_cast<unsigned long>(gle));
+				}
+				pClose(level);
+			} else {
+				DWORD gle = GetLastError();
+				diag::log_tagged_critical_fmt("malware_safe",
+					"safer_create_FAILED gle=%lu", static_cast<unsigned long>(gle));
+			}
+		}
+	}
+
+	if (primary == nullptr) {
+		HANDLE restricted = nullptr;
+		if (!CreateRestrictedToken(
+				source_token,
+				DISABLE_MAX_PRIVILEGE | LUA_TOKEN,
+				0, nullptr,
+				0, nullptr,
+				0, nullptr,
+				&restricted) || restricted == nullptr) {
+			DWORD gle = GetLastError();
+			if (fail_reason) {
+				char tmp[96];
+				std::snprintf(tmp, sizeof(tmp),
+					"CreateRestrictedToken gle=%lu", static_cast<unsigned long>(gle));
+				*fail_reason = tmp;
+			}
+			diag::log_tagged_critical_fmt("malware_safe",
+				"create_restricted_token_FAILED gle=%lu",
+				static_cast<unsigned long>(gle));
+			return false;
+		}
+		primary = restricted;
+	}
+
+	HANDLE dup = nullptr;
+	if (!DuplicateTokenEx(primary, MAXIMUM_ALLOWED, nullptr,
+	                     SecurityImpersonation, TokenPrimary, &dup) || dup == nullptr) {
+		DWORD gle = GetLastError();
+		if (fail_reason) {
+			char tmp[96];
+			std::snprintf(tmp, sizeof(tmp),
+				"DuplicateTokenEx gle=%lu", static_cast<unsigned long>(gle));
+			*fail_reason = tmp;
+		}
+		CloseHandle(primary);
+		return false;
+	}
+	CloseHandle(primary);
+
+	out_restricted = dup;
+	return true;
+}
+
+bool grant_sandbox_dir_access(const std::wstring& sandbox_root) {
+	PSID everyone_sid = nullptr;
+	SID_IDENTIFIER_AUTHORITY world_authority = SECURITY_WORLD_SID_AUTHORITY;
+	if (!AllocateAndInitializeSid(&world_authority, 1,
+	                              SECURITY_WORLD_RID, 0, 0, 0, 0, 0, 0, 0, &everyone_sid)
+	    || everyone_sid == nullptr) {
+		return false;
+	}
+
+	EXPLICIT_ACCESSW ea{};
+	ea.grfAccessPermissions = GENERIC_ALL;
+	ea.grfAccessMode        = SET_ACCESS;
+	ea.grfInheritance       = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+	ea.Trustee.TrusteeForm  = TRUSTEE_IS_SID;
+	ea.Trustee.TrusteeType  = TRUSTEE_IS_WELL_KNOWN_GROUP;
+	ea.Trustee.ptstrName    = reinterpret_cast<LPWSTR>(everyone_sid);
+
+	PACL new_acl = nullptr;
+	DWORD r = SetEntriesInAclW(1, &ea, nullptr, &new_acl);
+	bool ok = false;
+	if (r == ERROR_SUCCESS && new_acl) {
+		DWORD set_r = SetNamedSecurityInfoW(
+			const_cast<LPWSTR>(sandbox_root.c_str()),
+			SE_FILE_OBJECT,
+			DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+			nullptr, nullptr, new_acl, nullptr);
+		ok = (set_r == ERROR_SUCCESS);
+		if (!ok) {
+			diag::log_tagged_critical_fmt("malware_safe",
+				"sandbox_dir_acl_FAILED r=%lu", static_cast<unsigned long>(set_r));
+		}
+	} else {
+		diag::log_tagged_critical_fmt("malware_safe",
+			"set_entries_in_acl_FAILED r=%lu", static_cast<unsigned long>(r));
+	}
+	if (new_acl) LocalFree(new_acl);
+	FreeSid(everyone_sid);
+	return ok;
+}
+
+bool try_register_kernel_sandbox_guard(uint32_t pid, bool log_network, bool block_child_spawn) {
+	if (pid == 0) return false;
+	if (!driver_bridge::is_loaded()) {
+		diag::log_tagged_critical_fmt("malware_safe",
+			"kernel_register_skip driver_not_loaded pid=%u", pid);
+		return false;
+	}
+	bool any_ok = false;
+	uint32_t flags =
+		  0x00000001u
+		| 0x00000002u
+		| 0x00000004u
+		| 0x00000008u;
+	if (log_network) flags |= 0x00000010u;
+	if (block_child_spawn) flags |= 0x00000020u;
+	bool protect_ok = driver_bridge::malware_safe_protect_pid(pid, flags, nullptr);
+	diag::log_tagged_critical_fmt("malware_safe",
+		"kernel_protect_sandbox pid=%u flags=0x%08X ok=%d", pid, flags, protect_ok ? 1 : 0);
+	if (protect_ok) any_ok = true;
+
+	bool permit_ok = driver_bridge::kernel_anti_dump_permit_pid(pid);
+	diag::log_tagged_critical_fmt("malware_safe",
+		"kernel_permit_for_observer pid=%u ok=%d", pid, permit_ok ? 1 : 0);
+
+	if (log_network) {
+		bool net_ok = driver_bridge::malware_safe_net_log(pid, true);
+		bool started = driver_bridge::start_capture(pid, 0, 0, nullptr, 1500);
+		diag::log_tagged_critical_fmt("malware_safe",
+			"kernel_net_log_register pid=%u net_log=%d start_capture=%d",
+			pid, net_ok ? 1 : 0, started ? 1 : 0);
+		if (net_ok || started) any_ok = true;
+	}
+	return any_ok;
+}
+
+void try_unregister_kernel_sandbox_guard(uint32_t pid) {
+	if (pid == 0) return;
+	if (shadow_fs_client::is_connected()) {
+		bool sh_off = shadow_fs_client::unregister_sandbox_pid(pid);
+		diag::log_tagged_critical_fmt("shadow_fs",
+			"unregister_pid pid=%u ok=%d", pid, sh_off ? 1 : 0);
+	}
+	if (!driver_bridge::is_loaded()) return;
+	bool stopped = driver_bridge::stop_capture();
+	bool net_off = driver_bridge::malware_safe_net_log(pid, false);
+	bool unprotect = driver_bridge::malware_safe_unprotect_pid(pid, nullptr);
+	bool unpermit = driver_bridge::kernel_anti_dump_unpermit_pid(pid);
+	diag::log_tagged_critical_fmt("malware_safe",
+		"kernel_unregister pid=%u stop_capture=%d net_off=%d unprotect=%d unpermit=%d",
+		pid, stopped ? 1 : 0, net_off ? 1 : 0, unprotect ? 1 : 0, unpermit ? 1 : 0);
+}
+
+bool launch_malware_safe_desktop(const launch_options_t& opts, launch_result_t& out);
+
+
 bool launch_appcontainer(const launch_options_t& opts, launch_result_t& out) {
 	uint32_t build = get_windows_build_number();
 	if (build < 15063) {
@@ -614,6 +1005,10 @@ bool launch_jobbed(const launch_options_t& opts, launch_result_t& out, bool /*in
 	PROCESS_INFORMATION pi{};
 	const wchar_t* cwd_ptr = opts.working_dir.empty() ? nullptr : opts.working_dir.c_str();
 	DWORD flags = CREATE_SUSPENDED | CREATE_NEW_CONSOLE | CREATE_DEFAULT_ERROR_MODE;
+	diag::log_tagged_critical_fmt("run",
+		"CreateProcessW.invoke flags=0x%08lX cwd=%s",
+		static_cast<unsigned long>(flags),
+		cwd_ptr ? "<set>" : "<inherit>");
 
 	BOOL cp_ok = CreateProcessW(
 		nullptr,
@@ -625,6 +1020,13 @@ bool launch_jobbed(const launch_options_t& opts, launch_result_t& out, bool /*in
 		&si,
 		&pi);
 	DWORD cp_gle = cp_ok ? 0 : GetLastError();
+	diag::log_tagged_critical_fmt("run",
+		"CreateProcessW.result ok=%d pid=%lu tid=%lu gle=%lu flags=0x%08lX",
+		cp_ok ? 1 : 0,
+		cp_ok ? pi.dwProcessId : 0u,
+		cp_ok ? pi.dwThreadId : 0u,
+		static_cast<unsigned long>(cp_gle),
+		static_cast<unsigned long>(flags));
 	diag::log_tagged_critical_fmt("run_target",
 		"launch_jobbed CreateProcessW ok=%d pid=%lu tid=%lu gle=%lu",
 		cp_ok ? 1 : 0,
@@ -677,6 +1079,437 @@ bool launch_jobbed(const launch_options_t& opts, launch_result_t& out, bool /*in
 	if (opts.auto_terminate_sec > 0) {
 		spawn_watchdog_kill(pi.hProcess, job, opts.auto_terminate_sec, pi.dwProcessId);
 	}
+	return true;
+}
+
+bool launch_malware_safe_desktop(const launch_options_t& opts, launch_result_t& out) {
+	diag::log_tagged_critical_fmt("malware_safe",
+		"launch entry safe_mode=%d block_net=%d log_net=%d untrusted=%d allow_children=%d strict_mitigations=%d redirect_paths=%d kernel_guard=%d mem_cap=%u auto_term=%u",
+		opts.malware_safe_mode ? 1 : 0,
+		opts.block_network ? 1 : 0,
+		opts.log_network_traffic ? 1 : 0,
+		opts.lower_integrity_untrusted ? 1 : 0,
+		opts.allow_child_processes ? 1 : 0,
+		opts.force_mitigations_strict ? 1 : 0,
+		opts.redirect_user_paths_to_sandbox ? 1 : 0,
+		opts.register_kernel_sandbox_guard ? 1 : 0,
+		static_cast<unsigned>(opts.memory_cap_mb),
+		static_cast<unsigned>(opts.auto_terminate_sec));
+
+	uint64_t launch_id = make_launch_id();
+	std::wstring launch_id_hex = format_launch_id_hex(launch_id);
+	std::wstring sandbox_root;
+	{
+		std::string fr;
+		if (!create_sandbox_directory(launch_id_hex, sandbox_root, &fr)) {
+			out.error = "Failed to create sandbox directory: " + fr;
+			diag::log_tagged_critical_fmt("malware_safe",
+				"sandbox_dir_create_FAILED reason='%s'", fr.c_str());
+			return false;
+		}
+	}
+	out.sandbox_dir = sandbox_root;
+	diag::log_tagged_critical_fmt("malware_safe",
+		"sandbox_dir_ready path='%s' launch_id=%016llX",
+		narrow_utf8(sandbox_root).c_str(),
+		static_cast<unsigned long long>(launch_id));
+
+	grant_sandbox_dir_access(sandbox_root);
+
+	HANDLE own_token = nullptr;
+	if (!OpenProcessToken(GetCurrentProcess(),
+	                     TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY
+	                     | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_GROUPS,
+	                     &own_token) || own_token == nullptr) {
+		DWORD gle = GetLastError();
+		out.error = format_error("OpenProcessToken", gle);
+		log_fail("OpenProcessToken.malware_safe", gle);
+		return false;
+	}
+
+	HANDLE restricted_token = nullptr;
+	{
+		std::string fr;
+		if (!build_restricted_token(own_token, restricted_token, &fr)) {
+			out.error = "Failed to build restricted token: " + fr;
+			CloseHandle(own_token);
+			return false;
+		}
+	}
+	CloseHandle(own_token);
+
+	bool il_lowered = drop_token_integrity_level(restricted_token, opts.lower_integrity_untrusted);
+	out.integrity_lowered = il_lowered;
+	out.token_restricted = true;
+	diag::log_tagged_critical_fmt("malware_safe",
+		"token_built restricted=1 integrity_lowered=%d untrusted=%d",
+		il_lowered ? 1 : 0,
+		opts.lower_integrity_untrusted ? 1 : 0);
+
+	HANDLE job = CreateJobObjectW(nullptr, nullptr);
+	if (job == nullptr) {
+		DWORD gle = GetLastError();
+		out.error = format_error("CreateJobObjectW (malware_safe)", gle);
+		log_fail("CreateJobObjectW.malware_safe", gle);
+		CloseHandle(restricted_token);
+		return false;
+	}
+
+	JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli{};
+	DWORD lim_flags = JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
+	                | JOB_OBJECT_LIMIT_PRIORITY_CLASS;
+	jeli.BasicLimitInformation.PriorityClass = BELOW_NORMAL_PRIORITY_CLASS;
+	if (opts.kill_on_host_exit) lim_flags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+	lim_flags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+	jeli.BasicLimitInformation.ActiveProcessLimit = opts.allow_child_processes ? 64 : 1;
+	if (opts.memory_cap_mb > 0) {
+		lim_flags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+		jeli.ProcessMemoryLimit = static_cast<SIZE_T>(opts.memory_cap_mb) * 1024ull * 1024ull;
+	}
+	jeli.BasicLimitInformation.LimitFlags = lim_flags;
+
+	if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli))) {
+		DWORD gle = GetLastError();
+		out.error = format_error("SetInformationJobObject (malware_safe)", gle);
+		log_fail("SetInformationJobObject.malware_safe", gle);
+		CloseHandle(job);
+		CloseHandle(restricted_token);
+		return false;
+	}
+	diag::log_tagged_critical_fmt("malware_safe",
+		"job_ext_limits ok flags=0x%lX active_proc_limit=%u mem_mb=%u",
+		static_cast<unsigned long>(lim_flags),
+		static_cast<unsigned>(jeli.BasicLimitInformation.ActiveProcessLimit),
+		opts.memory_cap_mb);
+
+	JOBOBJECT_BASIC_UI_RESTRICTIONS ui{};
+	ui.UIRestrictionsClass =
+		JOB_OBJECT_UILIMIT_DESKTOP
+		| JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
+		| JOB_OBJECT_UILIMIT_EXITWINDOWS
+		| JOB_OBJECT_UILIMIT_GLOBALATOMS
+		| JOB_OBJECT_UILIMIT_HANDLES
+		| JOB_OBJECT_UILIMIT_READCLIPBOARD
+		| JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
+		| JOB_OBJECT_UILIMIT_WRITECLIPBOARD;
+	if (!SetInformationJobObject(job, JobObjectBasicUIRestrictions, &ui, sizeof(ui))) {
+		DWORD gle = GetLastError();
+		diag::log_tagged_critical_fmt("malware_safe",
+			"job_ui_limits_FAILED gle=%lu", static_cast<unsigned long>(gle));
+	} else {
+		diag::log_tagged_critical_fmt("malware_safe",
+			"job_ui_limits ok mask=0x%lX", static_cast<unsigned long>(ui.UIRestrictionsClass));
+	}
+
+	uint32_t windows_build = get_windows_build_number();
+
+	DWORD64 mitig_policy = 0;
+	DWORD64 mitig_policy2 = 0;
+	mitig_policy |=
+		PROCESS_CREATION_MITIGATION_POLICY_DEP_ENABLE
+		| PROCESS_CREATION_MITIGATION_POLICY_DEP_ATL_THUNK_ENABLE
+		| PROCESS_CREATION_MITIGATION_POLICY_SEHOP_ENABLE
+		| PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_ON
+		| PROCESS_CREATION_MITIGATION_POLICY_HIGH_ENTROPY_ASLR_ALWAYS_ON
+		| PROCESS_CREATION_MITIGATION_POLICY_FORCE_RELOCATE_IMAGES_ALWAYS_ON
+		| PROCESS_CREATION_MITIGATION_POLICY_HEAP_TERMINATE_ALWAYS_ON
+		| PROCESS_CREATION_MITIGATION_POLICY_STRICT_HANDLE_CHECKS_ALWAYS_ON
+		| PROCESS_CREATION_MITIGATION_POLICY_EXTENSION_POINT_DISABLE_ALWAYS_ON
+		| PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_ON
+		| PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_REMOTE_ALWAYS_ON
+		| PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_LOW_LABEL_ALWAYS_ON
+		| PROCESS_CREATION_MITIGATION_POLICY_FONT_DISABLE_ALWAYS_ON;
+	if (opts.force_mitigations_strict) {
+		mitig_policy |= PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
+		mitig_policy |= PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_PREFER_SYSTEM32_ALWAYS_ON;
+		mitig_policy2 |= PROCESS_CREATION_MITIGATION_POLICY2_LOADER_INTEGRITY_CONTINUITY_ALWAYS_ON;
+		mitig_policy2 |= PROCESS_CREATION_MITIGATION_POLICY2_MODULE_TAMPERING_PROTECTION_ALWAYS_ON;
+	}
+
+	bool use_v2_mitig = (windows_build >= 17134);
+	DWORD64 mitig_arr[2] = { mitig_policy, mitig_policy2 };
+
+	SIZE_T attr_size = 0;
+	InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
+	if (attr_size == 0) {
+		out.error = "Internal: InitializeProcThreadAttributeList sizing failed";
+		CloseHandle(job);
+		CloseHandle(restricted_token);
+		return false;
+	}
+	std::vector<uint8_t> attr_buf(attr_size, 0);
+	LPPROC_THREAD_ATTRIBUTE_LIST attr_list =
+		reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data());
+	if (!InitializeProcThreadAttributeList(attr_list, 1, 0, &attr_size)) {
+		DWORD gle = GetLastError();
+		out.error = format_error("InitializeProcThreadAttributeList (malware_safe)", gle);
+		log_fail("InitializeProcThreadAttributeList.malware_safe", gle);
+		CloseHandle(job);
+		CloseHandle(restricted_token);
+		return false;
+	}
+
+	BOOL mitig_attr_ok = UpdateProcThreadAttribute(attr_list, 0,
+		PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+		mitig_arr,
+		use_v2_mitig ? sizeof(mitig_arr) : sizeof(mitig_arr[0]),
+		nullptr, nullptr);
+	if (!mitig_attr_ok) {
+		DWORD gle = GetLastError();
+		diag::log_tagged_critical_fmt("malware_safe",
+			"mitigation_attribute_FAILED gle=%lu (continuing without mitigation policy)",
+			static_cast<unsigned long>(gle));
+		DeleteProcThreadAttributeList(attr_list);
+		attr_buf.clear();
+		attr_size = 0;
+		InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
+		attr_buf.assign(attr_size, 0);
+		attr_list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data());
+		if (!InitializeProcThreadAttributeList(attr_list, 0, 0, &attr_size)) {
+			DWORD gle2 = GetLastError();
+			out.error = format_error("InitializeProcThreadAttributeList retry", gle2);
+			CloseHandle(job);
+			CloseHandle(restricted_token);
+			return false;
+		}
+	} else {
+		out.mitigations_applied = true;
+		diag::log_tagged_critical_fmt("malware_safe",
+			"mitigation_attribute ok v2=%d policy=0x%016llX policy2=0x%016llX",
+			use_v2_mitig ? 1 : 0,
+			static_cast<unsigned long long>(mitig_policy),
+			static_cast<unsigned long long>(mitig_policy2));
+	}
+
+	std::wstring cmd;
+	cmd.reserve(opts.exe_path.size() + opts.args.size() + 4);
+	cmd.push_back(L'"');
+	cmd.append(opts.exe_path);
+	cmd.push_back(L'"');
+	if (!opts.args.empty()) {
+		cmd.push_back(L' ');
+		cmd.append(opts.args);
+	}
+	std::vector<wchar_t> cmd_buf(cmd.begin(), cmd.end());
+	cmd_buf.push_back(L'\0');
+
+	std::wstring working_dir_w = opts.working_dir;
+	if (working_dir_w.empty()) {
+		std::filesystem::path exe_path(opts.exe_path);
+		std::error_code ec;
+		auto parent = exe_path.parent_path();
+		if (!parent.empty() && std::filesystem::exists(parent, ec)) {
+			working_dir_w = parent.wstring();
+		}
+	}
+
+	std::vector<wchar_t> env_block;
+	const wchar_t* env_ptr = nullptr;
+	bool env_redirected = false;
+	if (opts.redirect_user_paths_to_sandbox) {
+		if (build_sandbox_environment(sandbox_root, env_block) && !env_block.empty()) {
+			env_redirected = true;
+			diag::log_tagged_critical_fmt("malware_safe",
+				"env_redirected appdata='%s\\AppData\\Roaming' temp='%s\\Temp'",
+				narrow_utf8(sandbox_root).c_str(),
+				narrow_utf8(sandbox_root).c_str());
+		} else {
+			diag::log_tagged_critical("malware_safe",
+				"env_redirect_FAILED proceeding_with_inherited_env");
+		}
+	}
+	if (!env_redirected) {
+		wchar_t* inherited = GetEnvironmentStringsW();
+		if (inherited != nullptr) {
+			const wchar_t* p = inherited;
+			while (*p) {
+				while (*p) env_block.push_back(*p++);
+				env_block.push_back(L'\0');
+				++p;
+			}
+			env_block.push_back(L'\0');
+			FreeEnvironmentStringsW(inherited);
+		}
+	}
+	{
+		auto push_var = [&](const wchar_t* name, const wchar_t* value) {
+			while (*name) env_block.push_back(*name++);
+			env_block.push_back(L'=');
+			while (*value) env_block.push_back(*value++);
+			env_block.push_back(L'\0');
+		};
+		if (env_block.empty()) {
+			env_block.push_back(L'\0');
+		}
+		if (!env_block.empty() && env_block.back() == L'\0') {
+			env_block.pop_back();
+		}
+		uint32_t tester_flags = 0;
+		tester_flags |= 0x00000001u;
+		tester_flags |= 0x00000002u;
+		tester_flags |= 0x00000004u;
+		tester_flags |= 0x00000008u;
+		if (opts.log_network_traffic) tester_flags |= 0x00000010u;
+		if (!opts.allow_child_processes) tester_flags |= 0x00000020u;
+		if (opts.block_network) tester_flags |= 0x00010000u;
+		if (opts.lower_integrity_untrusted) tester_flags |= 0x00020000u;
+		if (opts.force_mitigations_strict) tester_flags |= 0x00040000u;
+		if (opts.redirect_user_paths_to_sandbox) tester_flags |= 0x00080000u;
+		if (opts.register_kernel_sandbox_guard) tester_flags |= 0x00100000u;
+		tester_flags |= 0x80000000u;
+		wchar_t flag_str[20] = {};
+		_snwprintf_s(flag_str, _countof(flag_str), _TRUNCATE,
+			L"0x%08X", tester_flags);
+		push_var(L"AIDA_MALWARESAFE_SANDBOXED", L"1");
+		push_var(L"AIDA_MALWARESAFE_FLAGS", flag_str);
+		push_var(L"AIDA_MALWARESAFE_LAUNCH_ID", launch_id_hex.c_str());
+		push_var(L"AIDA_MALWARESAFE_SANDBOX_ROOT", sandbox_root.c_str());
+		env_block.push_back(L'\0');
+		env_ptr = env_block.data();
+		diag::log_tagged_critical_fmt("malware_safe",
+			"env_injected_tester_vars flags=0x%08X sandbox_root='%s'",
+			tester_flags, narrow_utf8(sandbox_root).c_str());
+	}
+
+	STARTUPINFOEXW siex{};
+	siex.StartupInfo.cb = sizeof(siex);
+	siex.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
+	siex.StartupInfo.wShowWindow = SW_SHOWNORMAL;
+	siex.lpAttributeList = attr_list;
+
+	DWORD flags =
+		EXTENDED_STARTUPINFO_PRESENT
+		| CREATE_SUSPENDED
+		| CREATE_NEW_CONSOLE
+		| CREATE_DEFAULT_ERROR_MODE
+		| CREATE_UNICODE_ENVIRONMENT;
+
+	PROCESS_INFORMATION pi{};
+	const wchar_t* cwd_ptr = working_dir_w.empty() ? nullptr : working_dir_w.c_str();
+
+	BOOL cp_ok = CreateProcessAsUserW(
+		restricted_token,
+		nullptr,
+		cmd_buf.data(),
+		nullptr, nullptr, FALSE,
+		flags,
+		const_cast<wchar_t*>(env_ptr),
+		cwd_ptr,
+		&siex.StartupInfo,
+		&pi);
+	DWORD cp_gle = cp_ok ? 0 : GetLastError();
+	diag::log_tagged_critical_fmt("malware_safe",
+		"CreateProcessAsUserW ok=%d pid=%lu tid=%lu gle=%lu flags=0x%08lX",
+		cp_ok ? 1 : 0,
+		cp_ok ? pi.dwProcessId : 0u,
+		cp_ok ? pi.dwThreadId : 0u,
+		static_cast<unsigned long>(cp_gle),
+		static_cast<unsigned long>(flags));
+
+	DeleteProcThreadAttributeList(attr_list);
+
+	if (!cp_ok) {
+		out.error = format_error("CreateProcessAsUserW (malware_safe)", cp_gle);
+		log_fail("CreateProcessAsUserW.malware_safe", cp_gle);
+		CloseHandle(job);
+		CloseHandle(restricted_token);
+		return false;
+	}
+
+	CloseHandle(restricted_token);
+
+	if (!AssignProcessToJobObject(job, pi.hProcess)) {
+		DWORD gle = GetLastError();
+		out.error = format_error("AssignProcessToJobObject (malware_safe)", gle);
+		log_fail("AssignProcessToJobObject.malware_safe", gle);
+		TerminateProcess(pi.hProcess, 0xDEAD);
+		CloseHandle(pi.hThread);
+		CloseHandle(pi.hProcess);
+		CloseHandle(job);
+		return false;
+	}
+	diag::log_tagged_critical_fmt("malware_safe",
+		"assign_to_job ok pid=%lu", pi.dwProcessId);
+
+	if (opts.block_network) {
+		std::string rule = make_unique_rule_name();
+		std::string fr;
+		bool fok = firewall_add_block_rule(opts.exe_path, rule, &fr);
+		diag::log_tagged_critical_fmt("malware_safe",
+			"firewall_block ok=%d rule_name='%s'%s%s",
+			fok ? 1 : 0, rule.c_str(),
+			fok ? "" : " reason=",
+			fok ? "" : fr.c_str());
+		if (fok) out.firewall_rule_name = rule;
+	}
+
+	if (opts.register_kernel_sandbox_guard) {
+		bool any = try_register_kernel_sandbox_guard(
+			pi.dwProcessId,
+			opts.log_network_traffic,
+			!opts.allow_child_processes);
+		out.sandbox_pid_registered = any;
+		out.net_logger_registered = (opts.log_network_traffic && any);
+		if (!any) {
+			diag::log_tagged_critical_fmt("malware_safe",
+				"kernel_guard_unavailable pid=%lu (driver not loaded or guard refused) (continuing)",
+				pi.dwProcessId);
+		}
+	} else if (opts.log_network_traffic && driver_bridge::is_loaded()) {
+		bool started = driver_bridge::start_capture(pi.dwProcessId, 0, 0, nullptr, 1500);
+		out.net_logger_registered = started;
+		diag::log_tagged_critical_fmt("malware_safe",
+			"net_log_only pid=%lu started=%d",
+			pi.dwProcessId, started ? 1 : 0);
+	}
+
+	if (opts.redirect_user_paths_to_sandbox && !sandbox_root.empty()) {
+		if (!shadow_fs_client::is_connected()) {
+			shadow_fs_client::initialize();
+		}
+		if (shadow_fs_client::is_connected()) {
+			uint32_t shadow_flags = shadow_fs_client::k_default_flags;
+			bool reg_ok = shadow_fs_client::register_sandbox_pid(
+				pi.dwProcessId,
+				shadow_flags,
+				sandbox_root);
+			out.shadow_fs_registered = reg_ok;
+			diag::log_tagged_critical_fmt("shadow_fs",
+				"register_pid pid=%lu flags=0x%08lX ok=%d err='%s'",
+				pi.dwProcessId,
+				static_cast<unsigned long>(shadow_flags),
+				reg_ok ? 1 : 0,
+				reg_ok ? "" : shadow_fs_client::last_error().c_str());
+		} else {
+			out.shadow_fs_registered = false;
+			diag::log_tagged_critical_fmt("shadow_fs",
+				"register_pid_SKIPPED port_not_connected pid=%lu err='%s'",
+				pi.dwProcessId,
+				shadow_fs_client::last_error().c_str());
+		}
+	}
+
+	out.ok = true;
+	out.pid = pi.dwProcessId;
+	out.process_handle = reinterpret_cast<uintptr_t>(pi.hProcess);
+	out.thread_handle = reinterpret_cast<uintptr_t>(pi.hThread);
+	out.job_handle = reinterpret_cast<uintptr_t>(job);
+
+	if (opts.auto_terminate_sec > 0) {
+		spawn_watchdog_kill(pi.hProcess, job, opts.auto_terminate_sec, pi.dwProcessId);
+	}
+
+	diag::log_tagged_critical_fmt("malware_safe",
+		"launch ok pid=%lu sandbox='%s' kernel_guard=%d net_log=%d il_lowered=%d mitigations=%d shadow_fs=%d firewall_rule='%s'",
+		pi.dwProcessId,
+		narrow_utf8(sandbox_root).c_str(),
+		out.sandbox_pid_registered ? 1 : 0,
+		out.net_logger_registered ? 1 : 0,
+		out.integrity_lowered ? 1 : 0,
+		out.mitigations_applied ? 1 : 0,
+		out.shadow_fs_registered ? 1 : 0,
+		out.firewall_rule_name.c_str());
+
 	return true;
 }
 
@@ -906,13 +1739,19 @@ capability_probe_t probe_capabilities() {
 	p.has_appcontainer = (p.windows_build >= 15063);
 	p.has_firewall_inet = (p.windows_build >= 7600);
 	p.has_windows_sandbox = !resolve_windows_sandbox_exe().empty();
+	p.has_restricted_token = true;
+	p.has_mitigation_policy = (p.windows_build >= 9200);
+	p.has_kernel_sandbox_guard = driver_bridge::is_loaded();
 	diag::log_tagged_critical_fmt("run_target",
-		"probe_capabilities win_build=%u job=%d ac=%d fw=%d wsb=%d",
+		"probe_capabilities win_build=%u job=%d ac=%d fw=%d wsb=%d restok=%d mitig=%d kguard=%d",
 		p.windows_build,
 		p.has_jobobject ? 1 : 0,
 		p.has_appcontainer ? 1 : 0,
 		p.has_firewall_inet ? 1 : 0,
-		p.has_windows_sandbox ? 1 : 0);
+		p.has_windows_sandbox ? 1 : 0,
+		p.has_restricted_token ? 1 : 0,
+		p.has_mitigation_policy ? 1 : 0,
+		p.has_kernel_sandbox_guard ? 1 : 0);
 	return p;
 }
 
@@ -938,7 +1777,8 @@ bool launch(const launch_options_t& opts, launch_result_t& out) {
 		cwd_utf8.empty() ? "<inherit>" : cwd_utf8.c_str());
 
 	if (opts.isolation == isolation_t::same_desktop_jobbed
-	    || opts.isolation == isolation_t::appcontainer) {
+	    || opts.isolation == isolation_t::appcontainer
+	    || opts.isolation == isolation_t::malware_safe_desktop) {
 		DWORD attrs = GetFileAttributesW(opts.exe_path.c_str());
 		if (attrs == INVALID_FILE_ATTRIBUTES) {
 			DWORD gle = GetLastError();
@@ -957,7 +1797,14 @@ bool launch(const launch_options_t& opts, launch_result_t& out) {
 	bool ok = false;
 	switch (opts.isolation) {
 		case isolation_t::same_desktop_jobbed:
-			ok = launch_same_desktop(opts, out);
+			if (opts.malware_safe_mode) {
+				ok = launch_malware_safe_desktop(opts, out);
+			} else {
+				ok = launch_same_desktop(opts, out);
+			}
+			break;
+		case isolation_t::malware_safe_desktop:
+			ok = launch_malware_safe_desktop(opts, out);
 			break;
 		case isolation_t::appcontainer:
 			ok = launch_appcontainer(opts, out);
@@ -991,6 +1838,17 @@ bool cleanup(launch_result_t& result) {
 	bool job_closed = false;
 	bool proc_closed = false;
 	bool thr_closed = false;
+	bool kernel_unregistered = false;
+
+	if (result.sandbox_pid_registered && result.pid != 0) {
+		try_unregister_kernel_sandbox_guard(result.pid);
+		kernel_unregistered = true;
+		result.sandbox_pid_registered = false;
+		result.net_logger_registered = false;
+	} else if (result.net_logger_registered && driver_bridge::is_loaded()) {
+		driver_bridge::stop_capture();
+		result.net_logger_registered = false;
+	}
 
 	if (!result.firewall_rule_name.empty()) {
 		fw_removed = firewall_remove_rule(result.firewall_rule_name);
@@ -1012,11 +1870,13 @@ bool cleanup(launch_result_t& result) {
 		proc_closed = true;
 	}
 	diag::log_tagged_critical_fmt("run_target",
-		"cleanup ok=1 job_closed=%d proc_closed=%d thr_closed=%d firewall_removed=%d",
+		"cleanup ok=1 job_closed=%d proc_closed=%d thr_closed=%d firewall_removed=%d kernel_unregistered=%d sandbox_dir='%s'",
 		job_closed ? 1 : 0,
 		proc_closed ? 1 : 0,
 		thr_closed ? 1 : 0,
-		fw_removed ? 1 : 0);
+		fw_removed ? 1 : 0,
+		kernel_unregistered ? 1 : 0,
+		narrow_utf8(result.sandbox_dir).c_str());
 	return true;
 }
 

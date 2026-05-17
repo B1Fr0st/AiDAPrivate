@@ -21,6 +21,7 @@
 #include "imgui/imgui.h"
 #include "standalone_driver.hpp"
 #include "ui_anim.hpp"
+#include "../anti-tamper/webhook.hpp"
 #include "../helpers/globals.h"
 #include "../helpers/helpers.h"
 #include "../helpers/diag_log.hpp"
@@ -823,12 +824,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	bool taking = g_state.capturing.load();
 	bool comparing = g_state.comparing.load();
 	bool loading = g_state.loading.load();
+	bool live_attach = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
 
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		const char* lbl = taking ? "Capturing..." : "Take Snapshot";
 		if (aida::ui::button(lbl, aida::ui::button_kind_t::primary,
-				aida::ui::size_t_::md, ImVec2(0.f, 0.f), busy, nullptr, taking)) {
+				aida::ui::size_t_::md, ImVec2(0.f, 0.f), busy || !live_attach, nullptr, taking)) {
+			anti_tamper::webhook::write_log("scan_audit",
+				"[scan_audit] snapshot_diff take_snapshot");
 			take_snapshot();
 		}
 		cx = ImGui::GetItemRectMax().x + btn_gap;
@@ -849,6 +853,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		const char* lbl = comparing ? "Comparing..." : "Compare";
 		if (aida::ui::button(lbl, aida::ui::button_kind_t::primary,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), !can_compare, nullptr, comparing)) {
+			anti_tamper::webhook::write_log("scan_audit",
+				"[scan_audit] snapshot_diff compare");
 			compare_snapshots(g_state.snap_a_id, g_state.snap_b_id);
 		}
 		cx = ImGui::GetItemRectMax().x + btn_gap;
@@ -908,11 +914,20 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 
+	float callout_h = 0.f;
+	if (!live_attach) {
+		callout_h = 26.f;
+		ui_anim::render_inline_callout(dl, x0 + 12.f, y0 + toolbar_h + 4.f,
+			width - 24.f, 22.f,
+			"Take/Compare need a live attach. Load existing snapshot files from disk to inspect them.",
+			ui_anim::callout_kind_t::info, 0.6f, 0.6f, 0.85f, a);
+	}
+
 	float timeline_h = 64.f;
-	detail::render_timeline(dl, x0 + 12.f, y0 + toolbar_h + 8.f,
+	detail::render_timeline(dl, x0 + 12.f, y0 + toolbar_h + callout_h + 8.f,
 		width - 24.f, timeline_h, a);
 
-	float content_y = y0 + toolbar_h + 8.f + timeline_h + 8.f;
+	float content_y = y0 + toolbar_h + callout_h + 8.f + timeline_h + 8.f;
 	float content_h = (y0 + height) - content_y;
 
 	float detail_h = (g_state.selected_change >= 0) ? 180.f : 0.f;

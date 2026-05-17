@@ -3374,7 +3374,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 std::shared_ptr<network_view::repeater_entry_t> entry = state.repeater_entries[static_cast<size_t>(idx)];
                 if (!entry)
                     return tool_result_t::error(OBFSTR("Invalid repeater entry"));
-                if (entry->in_progress)
+                if (entry->in_progress.load())
                     return tool_result_t::error(OBFSTR("Request already in progress for this entry"));
                 if (args.contains("raw_request") && args["raw_request"].is_string())
                     entry->raw_request = args["raw_request"].get<std::string>();
@@ -3384,7 +3384,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                     entry->port = static_cast<uint16_t>(args["port"].get<int>());
                 if (args.contains("use_tls") && args["use_tls"].is_boolean())
                     entry->use_tls = args["use_tls"].get<bool>();
-                entry->in_progress = true;
+                entry->in_progress.store(true);
                 entry->raw_response.clear();
                 entry->status_code = 0;
                 entry->latency_ms = 0;
@@ -3405,7 +3405,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                         entry->status_code = 0;
                         entry->raw_response = res.error;
                     }
-                    entry->in_progress = false;
+                    entry->in_progress.store(false);
                 });
                 json r;
                 r["index"] = idx;
@@ -3427,7 +3427,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                     ej["use_tls"] = e.use_tls;
                     ej["status_code"] = e.status_code;
                     ej["latency_ms"] = e.latency_ms;
-                    ej["in_progress"] = e.in_progress;
+                    ej["in_progress"] = e.in_progress.load();
                     arr.push_back(ej);
                 }
                 json r;
@@ -3453,7 +3453,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 r["use_tls"] = e.use_tls;
                 r["status_code"] = e.status_code;
                 r["latency_ms"] = e.latency_ms;
-                r["in_progress"] = e.in_progress;
+                r["in_progress"] = e.in_progress.load();
                 r["raw_request"] = e.raw_request;
                 r["raw_response"] = e.raw_response.substr(0, std::min<size_t>(4096, e.raw_response.size()));
                 return tool_result_t::ok(OBFSTR("Repeater entry ") + std::to_string(idx), r);
@@ -3466,7 +3466,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 if (idx < 0 || idx >= static_cast<int>(state.repeater_entries.size()))
                     return tool_result_t::error(OBFSTR("Invalid repeater entry index"));
                 const auto& del_ptr = state.repeater_entries[static_cast<size_t>(idx)];
-                if (del_ptr && del_ptr->in_progress)
+                if (del_ptr && del_ptr->in_progress.load())
                     return tool_result_t::error(OBFSTR("Cannot delete entry while request is in progress"));
                 state.repeater_entries.erase(state.repeater_entries.begin() + idx);
                 return tool_result_t::ok(OBFSTR("Repeater entry ") + std::to_string(idx) + OBFSTR(" deleted"));

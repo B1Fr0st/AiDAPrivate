@@ -10,7 +10,11 @@
 #include <Windows.h>
 #include <commdlg.h>
 #include <ShlObj.h>
+#include <shellapi.h>
 #include <objbase.h>
+#ifdef small
+#undef small
+#endif
 
 #include <cstring>
 #include <cstdio>
@@ -23,6 +27,7 @@
 #include "../helpers/diag_log.hpp"
 #include "../helpers/win32_dialog.hpp"
 #include "../runtime/run_target.hpp"
+#include "../ui/toast_notification.hpp"
 
 extern HWND g_hwnd;
 
@@ -98,16 +103,65 @@ inline int& auto_terminate_sec_value() {
 	return v;
 }
 
+inline bool& malware_safe_mode_flag() {
+	static bool v = true;
+	return v;
+}
+
+inline bool& log_network_traffic_flag() {
+	static bool v = true;
+	return v;
+}
+
+inline bool& lower_integrity_untrusted_flag() {
+	static bool v = false;
+	return v;
+}
+
+inline bool& allow_child_processes_flag() {
+	static bool v = true;
+	return v;
+}
+
+inline bool& force_mitigations_strict_flag() {
+	static bool v = false;
+	return v;
+}
+
+inline bool& redirect_user_paths_flag() {
+	static bool v = true;
+	return v;
+}
+
+inline bool& register_kernel_guard_flag() {
+	static bool v = true;
+	return v;
+}
+
+inline std::wstring& last_sandbox_dir() {
+	static std::wstring v;
+	return v;
+}
+
 inline void reset_inputs() {
 	std::memset(exe_buf(), 0, 1024);
 	std::memset(args_buf(), 0, 2048);
 	std::memset(cwd_buf(), 0, 1024);
 	isolation_choice() = static_cast<int>(run_target::isolation_t::same_desktop_jobbed);
-	block_network_flag() = true;
+	block_network_flag() = false;
 	kill_on_host_exit_flag() = true;
 	memory_cap_mb_value() = 0;
 	auto_terminate_sec_value() = 0;
+	malware_safe_mode_flag() = true;
+	log_network_traffic_flag() = true;
+	lower_integrity_untrusted_flag() = false;
+	allow_child_processes_flag() = true;
+	force_mitigations_strict_flag() = false;
+	redirect_user_paths_flag() = true;
+	register_kernel_guard_flag() = true;
 }
+
+
 
 inline std::wstring widen_utf8(const char* utf8) {
 	if (!utf8 || !*utf8) return std::wstring();
@@ -153,6 +207,7 @@ inline std::string trim(const char* s) {
 }
 
 inline void browse_executable() {
+	diag::log_tagged_critical("file_dialog", "spawn_target.browse_executable invoking show_open_file_dialog_w");
 	wchar_t path_buf[1024] = {};
 	std::string current = trim(exe_buf());
 	if (!current.empty()) {
@@ -164,18 +219,38 @@ inline void browse_executable() {
 	}
 
 	static const wchar_t k_spawn_exe_filter[] =
+		L"Binary files (*.exe;*.dll;*.sys;*.com;*.scr;*.efi;*.cpl)\0*.exe;*.dll;*.sys;*.com;*.scr;*.efi;*.cpl\0"
 		L"Executable files (*.exe;*.com;*.scr)\0*.exe;*.com;*.scr\0"
+		L"Libraries (*.dll;*.cpl)\0*.dll;*.cpl\0"
+		L"Drivers (*.sys;*.efi)\0*.sys;*.efi\0"
 		L"All files (*.*)\0*.*\0\0";
 	if (!win32_dialog::show_open_file_dialog_w(g_hwnd,
-			L"Select target executable",
+			L"Select target binary (.exe / .dll / .sys)",
 			k_spawn_exe_filter,
 			path_buf, 1024,
 			"spawn_target::browse_executable")) {
+		diag::log_tagged_critical("file_dialog", "spawn_target.browse_executable cancelled_or_failed");
 		return;
 	}
 
 	std::string sel = narrow_utf8(path_buf);
-	if (sel.empty()) return;
+	if (sel.empty()) {
+		diag::log_tagged_critical("file_dialog", "spawn_target.browse_executable empty_path");
+		return;
+	}
+
+	{
+		DWORD attrs = ::GetFileAttributesW(path_buf);
+		if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+			diag::log_tagged_critical_fmt("file_dialog",
+				"spawn_target.browse_executable missing_or_dir path='%s' attrs=0x%08X",
+				sel.c_str(), static_cast<unsigned int>(attrs));
+			toast_notification::push(
+				"Selected file does not exist on disk: " + sel,
+				toast_notification::toast_type_t::error, 5.0f);
+			return;
+		}
+	}
 
 	std::strncpy(exe_buf(), sel.c_str(), 1023);
 	exe_buf()[1023] = '\0';
@@ -188,11 +263,14 @@ inline void browse_executable() {
 		}
 	}
 
+	diag::log_tagged_critical_fmt("file_dialog",
+		"spawn_target.browse_executable ok path='%s'", sel.c_str());
 	diag::log_tagged_critical_fmt("dialog",
 		"spawn_browse_exe_selected path='%s'", sel.c_str());
 }
 
 inline void browse_working_dir() {
+	diag::log_tagged_critical("file_dialog", "spawn_target.browse_working_dir invoking show_open_folder_dialog_ex");
 	std::string current = trim(cwd_buf());
 	std::wstring initial = current.empty() ? std::wstring() : widen_utf8(current.c_str());
 	std::string picked;
@@ -201,11 +279,17 @@ inline void browse_working_dir() {
 			initial.empty() ? nullptr : initial.c_str(),
 			picked,
 			"spawn_target::browse_working_dir")) {
+		diag::log_tagged_critical("file_dialog", "spawn_target.browse_working_dir cancelled_or_failed");
 		return;
 	}
-	if (picked.empty()) return;
+	if (picked.empty()) {
+		diag::log_tagged_critical("file_dialog", "spawn_target.browse_working_dir empty_path");
+		return;
+	}
 	std::strncpy(cwd_buf(), picked.c_str(), 1023);
 	cwd_buf()[1023] = '\0';
+	diag::log_tagged_critical_fmt("file_dialog",
+		"spawn_target.browse_working_dir ok path='%s'", picked.c_str());
 	diag::log_tagged_critical_fmt("dialog",
 		"spawn_browse_cwd_selected path='%s'", picked.c_str());
 }
@@ -239,7 +323,7 @@ inline void render() {
 	s_last_render_frame = cur_frame;
 
 	if (detail::should_open()) {
-		ImGui::OpenPopup("##aida_spawn_target_dialog");
+		ImGui::OpenPopup("Launch Target###aida_spawn_target_dialog");
 		detail::should_open() = false;
 		detail::open_flag() = true;
 	}
@@ -258,6 +342,7 @@ inline void render() {
 
 	ImVec2 viewport_center = ImGui::GetMainViewport()->GetCenter();
 	ImGui::SetNextWindowPos(viewport_center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+	ImGui::SetNextWindowSizeConstraints(ImVec2(620.f, 0.f), ImVec2(620.f, FLT_MAX));
 	ImGui::SetNextWindowSize(ImVec2(620.f, 0.f), ImGuiCond_Appearing);
 
 	bool open_flag_local = true;
@@ -267,7 +352,7 @@ inline void render() {
 	if (ImGui::BeginPopupModal("Launch Target###aida_spawn_target_dialog",
 	                           &open_flag_local,
 	                           ImGuiWindowFlags_NoSavedSettings |
-	                           ImGuiWindowFlags_AlwaysAutoResize)) {
+	                           ImGuiWindowFlags_NoResize)) {
 
 		ImFont* title_font = aida::ui::fonts::h1();
 		ImFont* body_font  = aida::ui::fonts::body();
@@ -338,6 +423,9 @@ inline void render() {
 				"Same desktop  (jobbed; interact + driver attach)",
 				iso, static_cast<int>(run_target::isolation_t::same_desktop_jobbed));
 			aida::ui::radio_button(
+				"Malware-safe desktop  (restricted token + kernel guard + network log; UI visible)",
+				iso, static_cast<int>(run_target::isolation_t::malware_safe_desktop));
+			aida::ui::radio_button(
 				"AppContainer  (FS/registry isolated)",
 				iso, static_cast<int>(run_target::isolation_t::appcontainer));
 			aida::ui::radio_button(
@@ -372,6 +460,75 @@ inline void render() {
 			if (detail::auto_terminate_sec_value() < 0) detail::auto_terminate_sec_value() = 0;
 		}
 
+		ImGui::Dummy(ImVec2(0.f, 10.f));
+
+		bool malware_section_available =
+			(detail::isolation_choice() == static_cast<int>(run_target::isolation_t::same_desktop_jobbed)
+			 || detail::isolation_choice() == static_cast<int>(run_target::isolation_t::malware_safe_desktop));
+
+		if (malware_section_available) {
+			if (body_font) ImGui::PushFont(body_font);
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.text_secondary),
+			                   "Malware Safety");
+			if (body_font) ImGui::PopFont();
+			if (caption) ImGui::PushFont(caption);
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.text_secondary),
+			                   "Run unknown samples on the host with restricted token, mitigation policy, and per-launch sandbox.");
+			if (caption) ImGui::PopFont();
+			ImGui::Dummy(ImVec2(0.f, 4.f));
+
+			{
+				bool* ms = &detail::malware_safe_mode_flag();
+				aida::ui::toggle_switch("Treat as malware (recommended for unknown samples)",
+				                       ms, aida::ui::size_t_::sm);
+			}
+			ImGui::Dummy(ImVec2(0.f, 2.f));
+			{
+				bool* lt = &detail::log_network_traffic_flag();
+				aida::ui::toggle_switch("Log network traffic (driver-level packet capture)",
+				                       lt, aida::ui::size_t_::sm);
+				ImGui::SameLine(0.f, 18.f);
+				bool* kg = &detail::register_kernel_guard_flag();
+				aida::ui::toggle_switch("Register kernel sandbox guard",
+				                       kg, aida::ui::size_t_::sm);
+			}
+			ImGui::Dummy(ImVec2(0.f, 2.f));
+			{
+				bool* lu = &detail::lower_integrity_untrusted_flag();
+				aida::ui::toggle_switch("Lower integrity to Untrusted (paranoid)",
+				                       lu, aida::ui::size_t_::sm);
+				ImGui::SameLine(0.f, 18.f);
+				bool* ac = &detail::allow_child_processes_flag();
+				aida::ui::toggle_switch("Allow target to spawn children",
+				                       ac, aida::ui::size_t_::sm);
+			}
+			ImGui::Dummy(ImVec2(0.f, 2.f));
+			{
+				bool* rp = &detail::redirect_user_paths_flag();
+				aida::ui::toggle_switch("Redirect AppData/Temp/UserProfile into sandbox",
+				                       rp, aida::ui::size_t_::sm);
+				ImGui::SameLine(0.f, 18.f);
+				bool* fm = &detail::force_mitigations_strict_flag();
+				aida::ui::toggle_switch("Strict signature mitigations (may break packers)",
+				                       fm, aida::ui::size_t_::sm);
+			}
+
+			if (!detail::last_sandbox_dir().empty()) {
+				ImGui::Dummy(ImVec2(0.f, 4.f));
+				std::string sb_utf8 = detail::narrow_utf8(detail::last_sandbox_dir().c_str());
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.text_secondary),
+				                   "Last sandbox: %s", sb_utf8.c_str());
+				ImGui::SameLine();
+				if (aida::ui::button("Open folder##spawn_open_sandbox",
+				                     aida::ui::button_kind_t::secondary,
+				                     aida::ui::size_t_::sm,
+				                     ImVec2(110.f, 28.f), false, nullptr, false)) {
+					ShellExecuteW(g_hwnd, L"open", detail::last_sandbox_dir().c_str(),
+					              nullptr, nullptr, SW_SHOWNORMAL);
+				}
+			}
+		}
+
 		ImGui::Dummy(ImVec2(0.f, 6.f));
 
 		{
@@ -382,13 +539,19 @@ inline void render() {
 			float pad_y = 10.f;
 			ImFont* warn_font = aida::ui::fonts::body_em();
 			if (!warn_font) warn_font = ImGui::GetFont();
-			const char* warn_title = "Caution: live execution on host";
-			const char* warn_body  =
-				"AiDA spawns the target inside a Job Object (and optional AppContainer / Windows Sandbox), "
-				"optionally blocks the network, then attaches the driver. Containment level is your choice above.";
-			float fs_title = warn_font->FontSize;
 			ImFont* base = ImGui::GetFont();
+			float fs_title = warn_font->FontSize;
 			float fs_body = base->FontSize;
+
+			const bool malware_active =
+				malware_section_available && detail::malware_safe_mode_flag();
+			const char* warn_title = malware_active
+				? "Malware-safe mode active"
+				: "Caution: live execution on host";
+			const char* warn_body  = malware_active
+				? "The target's UI is visible. Host filesystem outside the sandbox folder is protected by token IL + mitigation policy + job UI limits. Network traffic is recorded if the driver is loaded. Persistence sites, raw disk, and kernel handles are gated by WhosWho."
+				: "AiDA spawns the target inside a Job Object (and optional AppContainer / Windows Sandbox), optionally blocks the network, then attaches the driver. Containment level is your choice above.";
+
 			ImVec2 ts_title = warn_font->CalcTextSizeA(fs_title, FLT_MAX, w - pad_x * 2.f, warn_title);
 			ImVec2 ts_body = base->CalcTextSizeA(fs_body, FLT_MAX, w - pad_x * 2.f, warn_body);
 			float box_h = pad_y * 2.f + ts_title.y + 6.f + ts_body.y;
@@ -460,18 +623,36 @@ inline void render() {
 			int term = detail::auto_terminate_sec_value();
 			lo.auto_terminate_sec = term > 0 ? static_cast<uint32_t>(term) : 0u;
 
+			const bool iso_supports_malware =
+				(lo.isolation == run_target::isolation_t::same_desktop_jobbed
+				 || lo.isolation == run_target::isolation_t::malware_safe_desktop);
+			lo.malware_safe_mode = iso_supports_malware && detail::malware_safe_mode_flag();
+			lo.log_network_traffic = iso_supports_malware && detail::log_network_traffic_flag();
+			lo.lower_integrity_untrusted = iso_supports_malware && detail::lower_integrity_untrusted_flag();
+			lo.allow_child_processes = !iso_supports_malware || detail::allow_child_processes_flag();
+			lo.force_mitigations_strict = iso_supports_malware && detail::force_mitigations_strict_flag();
+			lo.redirect_user_paths_to_sandbox = iso_supports_malware && detail::redirect_user_paths_flag();
+			lo.register_kernel_sandbox_guard = iso_supports_malware && detail::register_kernel_guard_flag();
+
 			pending.accepted = true;
 			detail::pending_result_ready() = true;
 
 			diag::log_tagged_critical_fmt("spawn",
-				"spawn_dialog_launch exe='%s' args_len=%zu cwd='%s' iso=%d block_net=%d kill_on_exit=%d mem_cap=%u auto_term=%u",
+				"spawn_dialog_launch exe='%s' args_len=%zu cwd='%s' iso=%d block_net=%d kill_on_exit=%d mem_cap=%u auto_term=%u malware_safe=%d log_net=%d untrusted=%d allow_children=%d strict=%d redirect_paths=%d kernel_guard=%d",
 				exe_trim.c_str(), args_trim.size(),
 				cwd_trim.empty() ? "<inherit>" : cwd_trim.c_str(),
 				static_cast<int>(lo.isolation),
 				lo.block_network ? 1 : 0,
 				lo.kill_on_host_exit ? 1 : 0,
 				static_cast<unsigned>(lo.memory_cap_mb),
-				static_cast<unsigned>(lo.auto_terminate_sec));
+				static_cast<unsigned>(lo.auto_terminate_sec),
+				lo.malware_safe_mode ? 1 : 0,
+				lo.log_network_traffic ? 1 : 0,
+				lo.lower_integrity_untrusted ? 1 : 0,
+				lo.allow_child_processes ? 1 : 0,
+				lo.force_mitigations_strict ? 1 : 0,
+				lo.redirect_user_paths_to_sandbox ? 1 : 0,
+				lo.register_kernel_sandbox_guard ? 1 : 0);
 
 			ImGui::CloseCurrentPopup();
 			detail::open_flag() = false;
