@@ -189,6 +189,8 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 
     g_shadow_driver_object = DriverObject;
 
+    dbg_capture::initialize();
+
     SHADOW_LOG_INFO("DriverEntry begin DriverObject=%p RegistryPath='%wZ'",
         DriverObject, RegistryPath);
 

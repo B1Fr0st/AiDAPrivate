@@ -2,6 +2,7 @@
 
 #include <fltKernel.h>
 #include <ntstrsafe.h>
+#include "KernelDebugCapture.h"
 
 #ifndef DPFLTR_IHVDRIVER_ID
 #define DPFLTR_IHVDRIVER_ID 77
@@ -33,8 +34,12 @@ __forceinline VOID shadow_log_va_at(_In_ ULONG level, _In_z_ PCSTR fmt, ...) {
     char buf[768];
     NTSTATUS s = RtlStringCbVPrintfA(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (NT_SUCCESS(s)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, level, "%s", buf);
+    if (NT_SUCCESS(s) || s == STATUS_BUFFER_OVERFLOW) {
+        size_t out_len = 0;
+        if (NT_SUCCESS(RtlStringCbLengthA(buf, sizeof(buf), &out_len))) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, level, "%s", buf);
+            dbg_capture::write_raw(buf, static_cast<ULONG>(out_len));
+        }
     }
 }
 

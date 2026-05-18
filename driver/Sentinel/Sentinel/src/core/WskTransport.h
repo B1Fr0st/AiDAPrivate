@@ -17,12 +17,49 @@ namespace wsk_transport
     constexpr ULONG  MAX_MISSED_HEARTBEATS = 3;
     constexpr ULONG  TLS_RECORD_MAX = 16384 + 256;
 
-    inline const UINT8 g_pinned_spki_sha256[32] = {
-        0x9F, 0x8C, 0x4B, 0x77, 0xE2, 0xA4, 0x53, 0x91,
-        0xD7, 0x6D, 0xC1, 0x3A, 0x14, 0x88, 0xBC, 0xE9,
-        0x52, 0x71, 0x5F, 0x80, 0x6B, 0xC0, 0x47, 0x29,
-        0x33, 0xEC, 0xA2, 0xCD, 0xF1, 0x8B, 0x57, 0x44
+#ifndef SENTINEL_PIN_DEBUG_BYPASS
+#define SENTINEL_PIN_DEBUG_BYPASS 0
+#endif
+
+    constexpr ULONG SPKI_PIN_HASH_LEN = 32;
+    constexpr ULONG SPKI_PIN_SLOT_COUNT = 4;
+    constexpr LONG  SPKI_PIN_SLOT_NONE = -1;
+    constexpr LONG  SPKI_PIN_SLOT_DEBUG_BYPASS = -2;
+
+    inline const UINT8 g_sentinel_spki_pins[SPKI_PIN_SLOT_COUNT][SPKI_PIN_HASH_LEN] = {
+        {
+            0x9F, 0x8C, 0x4B, 0x77, 0xE2, 0xA4, 0x53, 0x91,
+            0xD7, 0x6D, 0xC1, 0x3A, 0x14, 0x88, 0xBC, 0xE9,
+            0x52, 0x71, 0x5F, 0x80, 0x6B, 0xC0, 0x47, 0x29,
+            0x33, 0xEC, 0xA2, 0xCD, 0xF1, 0x8B, 0x57, 0x44
+        },
+        {
+            0x90, 0x76, 0xD3, 0xCB, 0xAD, 0x35, 0x0E, 0xD3,
+            0x9B, 0xD7, 0x24, 0xBB, 0x48, 0xF7, 0x65, 0xFE,
+            0x8E, 0x3D, 0xC0, 0x9F, 0x02, 0x8B, 0xE8, 0xB4,
+            0x56, 0xD6, 0x9B, 0x4B, 0x9D, 0x0B, 0x00, 0xA4
+        },
+        {
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        },
+        {
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        }
     };
+
+    __forceinline BOOLEAN spki_pin_slot_is_active(ULONG slot)
+    {
+        UINT8 acc = 0;
+        for (ULONG i = 0; i < SPKI_PIN_HASH_LEN; ++i)
+            acc |= g_sentinel_spki_pins[slot][i];
+        return acc != 0;
+    }
 
     inline const char g_server_hostname[] = "aidapro.net";
     inline constexpr ULONG g_server_hostname_len = sizeof(g_server_hostname) - 1;
@@ -524,12 +561,24 @@ namespace wsk_transport
         return st;
     }
 
-    __forceinline BOOLEAN spki_pin_matches(const UINT8 server_spki_sha256[32])
+    __forceinline LONG spki_pin_match_slot(const UINT8 server_spki_sha256[SPKI_PIN_HASH_LEN])
     {
-        UINT8 diff = 0;
-        for (ULONG i = 0; i < 32; ++i)
-            diff |= static_cast<UINT8>(server_spki_sha256[i] ^ g_pinned_spki_sha256[i]);
-        return diff == 0;
+#if SENTINEL_PIN_DEBUG_BYPASS
+        UNREFERENCED_PARAMETER(server_spki_sha256);
+        return SPKI_PIN_SLOT_DEBUG_BYPASS;
+#else
+        for (ULONG slot = 0; slot < SPKI_PIN_SLOT_COUNT; ++slot)
+        {
+            if (!spki_pin_slot_is_active(slot))
+                continue;
+            UINT8 diff = 0;
+            for (ULONG i = 0; i < SPKI_PIN_HASH_LEN; ++i)
+                diff |= static_cast<UINT8>(server_spki_sha256[i] ^ g_sentinel_spki_pins[slot][i]);
+            if (diff == 0)
+                return static_cast<LONG>(slot);
+        }
+        return SPKI_PIN_SLOT_NONE;
+#endif
     }
 
     static NTSTATUS tls13_send_record(PWSK_SOCKET sock, UINT8 content_type,
@@ -848,23 +897,47 @@ namespace wsk_transport
             spki_hash[20], spki_hash[21], spki_hash[22], spki_hash[23],
             spki_hash[24], spki_hash[25], spki_hash[26], spki_hash[27],
             spki_hash[28], spki_hash[29], spki_hash[30], spki_hash[31]);
-        SN_LOG("tls13_handshake: pinned_sha256  =%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
-            g_pinned_spki_sha256[0],  g_pinned_spki_sha256[1],  g_pinned_spki_sha256[2],  g_pinned_spki_sha256[3],
-            g_pinned_spki_sha256[4],  g_pinned_spki_sha256[5],  g_pinned_spki_sha256[6],  g_pinned_spki_sha256[7],
-            g_pinned_spki_sha256[8],  g_pinned_spki_sha256[9],  g_pinned_spki_sha256[10], g_pinned_spki_sha256[11],
-            g_pinned_spki_sha256[12], g_pinned_spki_sha256[13], g_pinned_spki_sha256[14], g_pinned_spki_sha256[15],
-            g_pinned_spki_sha256[16], g_pinned_spki_sha256[17], g_pinned_spki_sha256[18], g_pinned_spki_sha256[19],
-            g_pinned_spki_sha256[20], g_pinned_spki_sha256[21], g_pinned_spki_sha256[22], g_pinned_spki_sha256[23],
-            g_pinned_spki_sha256[24], g_pinned_spki_sha256[25], g_pinned_spki_sha256[26], g_pinned_spki_sha256[27],
-            g_pinned_spki_sha256[28], g_pinned_spki_sha256[29], g_pinned_spki_sha256[30], g_pinned_spki_sha256[31]);
-
-        if (!spki_pin_matches(spki_hash))
+        for (ULONG slot = 0; slot < SPKI_PIN_SLOT_COUNT; ++slot)
         {
-            SN_LOG("tls13_handshake: SPKI MISMATCH - returning STATUS_INVALID_SIGNATURE");
+            if (!spki_pin_slot_is_active(slot))
+            {
+                SN_LOG("tls13::spki_pin: slot%lu=<unpopulated>", slot);
+                continue;
+            }
+            SN_LOG("tls13::spki_pin: slot%lu=%02X%02X%02X%02X%02X%02X%02X%02X..",
+                slot,
+                g_sentinel_spki_pins[slot][0], g_sentinel_spki_pins[slot][1],
+                g_sentinel_spki_pins[slot][2], g_sentinel_spki_pins[slot][3],
+                g_sentinel_spki_pins[slot][4], g_sentinel_spki_pins[slot][5],
+                g_sentinel_spki_pins[slot][6], g_sentinel_spki_pins[slot][7]);
+        }
+        SN_LOG("tls13::spki_pin: presented=%02X%02X%02X%02X%02X%02X%02X%02X.. cert_chain_leaf_size=%lu cert_msg_total=%lu",
+            spki_hash[0], spki_hash[1], spki_hash[2], spki_hash[3],
+            spki_hash[4], spki_hash[5], spki_hash[6], spki_hash[7],
+            c1_len, cert_len);
+
+        LONG matched_slot = spki_pin_match_slot(spki_hash);
+        if (matched_slot == SPKI_PIN_SLOT_NONE)
+        {
+            SN_LOG("tls13::spki_pin: MISMATCH presented=%02X%02X%02X%02X%02X%02X%02X%02X.. matched=none - returning STATUS_INVALID_SIGNATURE",
+                spki_hash[0], spki_hash[1], spki_hash[2], spki_hash[3],
+                spki_hash[4], spki_hash[5], spki_hash[6], spki_hash[7]);
             sess->spki_matched = FALSE;
             return STATUS_INVALID_SIGNATURE;
         }
-        SN_LOG("tls13_handshake: SPKI MATCH - continuing handshake");
+        if (matched_slot == SPKI_PIN_SLOT_DEBUG_BYPASS)
+        {
+            SN_LOG("tls13::spki_pin: matched=debug_bypass (SENTINEL_PIN_DEBUG_BYPASS=1) presented=%02X%02X%02X%02X%02X%02X%02X%02X..",
+                spki_hash[0], spki_hash[1], spki_hash[2], spki_hash[3],
+                spki_hash[4], spki_hash[5], spki_hash[6], spki_hash[7]);
+        }
+        else
+        {
+            SN_LOG("tls13::spki_pin: matched=slot%ld presented=%02X%02X%02X%02X%02X%02X%02X%02X..",
+                matched_slot,
+                spki_hash[0], spki_hash[1], spki_hash[2], spki_hash[3],
+                spki_hash[4], spki_hash[5], spki_hash[6], spki_hash[7]);
+        }
         sess->spki_matched = TRUE;
 
         UINT8* cv_msg = sess->scratch_cv_msg;

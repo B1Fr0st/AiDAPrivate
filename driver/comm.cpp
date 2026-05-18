@@ -5,6 +5,7 @@
 #include <cwctype>
 #include "encrypt/crypter.h"
 #include "spoofer/spoof.hpp"
+#include "../src/standalone/src/helpers/diag_log.hpp"
 #include <string>
 #include <windows.h>
 #include <winternl.h>
@@ -1772,7 +1773,58 @@ bool voyager::device_t::query_memory(std::uint64_t address, memory_region_info& 
 }
 
 bool voyager::device_t::protect_memory(std::uint64_t address, std::uint64_t size, std::uint32_t new_protect, std::uint32_t* old_protect) noexcept {
+    const DWORD pm_code = ioctl_codes::PM();
+    RC_UM_DBG("protect_memory: ENTER pid=%lu addr=0x%016llX size=0x%llX new=0x%08X ioctl=0x%08X connected=%d",
+        static_cast<unsigned long>(process_id_),
+        static_cast<unsigned long long>(address),
+        static_cast<unsigned long long>(size),
+        static_cast<unsigned int>(new_protect),
+        static_cast<unsigned int>(pm_code),
+        is_connected() ? 1 : 0);
+
     if (!is_connected() || process_id_ == 0 || size == 0) {
+        RC_UM_DBG("protect_memory: ABORT connected=%d pid=%lu size=0x%llX",
+            is_connected() ? 1 : 0,
+            static_cast<unsigned long>(process_id_),
+            static_cast<unsigned long long>(size));
+        return false;
+    }
+
+    if (address == 0) {
+        RC_UM_DBG("protect_memory: ABORT address_zero");
+        return false;
+    }
+
+    constexpr std::uint64_t kUserAddressMax = 0x00007FFFFFFFFFFFULL;
+    if (address >= kUserAddressMax) {
+        RC_UM_DBG("protect_memory: ABORT address_in_kernel_range addr=0x%016llX",
+            static_cast<unsigned long long>(address));
+        return false;
+    }
+
+    if (size > 0xFFFFFFFFULL) {
+        RC_UM_DBG("protect_memory: ABORT size_too_large size=0x%llX",
+            static_cast<unsigned long long>(size));
+        return false;
+    }
+
+    const std::uint64_t end_addr = address + size;
+    if (end_addr < address || end_addr >= kUserAddressMax) {
+        RC_UM_DBG("protect_memory: ABORT range_overflow addr=0x%016llX size=0x%llX end=0x%016llX",
+            static_cast<unsigned long long>(address),
+            static_cast<unsigned long long>(size),
+            static_cast<unsigned long long>(end_addr));
+        return false;
+    }
+
+    constexpr std::uint32_t kAllowedProtect =
+        0x01u | 0x02u | 0x04u | 0x08u |
+        0x10u | 0x20u | 0x40u | 0x80u |
+        0x100u | 0x200u | 0x400u;
+    if ((new_protect & ~kAllowedProtect) != 0 || new_protect == 0) {
+        RC_UM_DBG("protect_memory: ABORT bad_protect_flags new=0x%08X mask=0x%08X",
+            static_cast<unsigned int>(new_protect),
+            static_cast<unsigned int>(kAllowedProtect));
         return false;
     }
 
@@ -1782,9 +1834,29 @@ bool voyager::device_t::protect_memory(std::uint64_t address, std::uint64_t size
     req.size = size;
     req.new_protect = new_protect;
 
-    bool ok = send_request(ioctl_codes::PM(), &req, sizeof(req));
-    if (ok && old_protect) *old_protect = req.old_protect;
-    return ok;
+    bool ok = send_request(pm_code, &req, sizeof(req));
+    DWORD post_err = GetLastError();
+
+    if (!ok) {
+        RC_UM_DBG("protect_memory: send_request FAILED ioctl=0x%08X pid=%lu addr=0x%016llX size=0x%llX new=0x%08X gle=%lu",
+            static_cast<unsigned int>(pm_code),
+            static_cast<unsigned long>(process_id_),
+            static_cast<unsigned long long>(address),
+            static_cast<unsigned long long>(size),
+            static_cast<unsigned int>(new_protect),
+            static_cast<unsigned long>(post_err));
+        return false;
+    }
+
+    if (old_protect) *old_protect = req.old_protect;
+
+    RC_UM_DBG("protect_memory: OK pid=%lu addr=0x%016llX size=0x%llX new=0x%08X old=0x%08X",
+        static_cast<unsigned long>(process_id_),
+        static_cast<unsigned long long>(address),
+        static_cast<unsigned long long>(size),
+        static_cast<unsigned int>(new_protect),
+        static_cast<unsigned int>(req.old_protect));
+    return true;
 }
 
 std::vector<voyager::detail::region_entry> voyager::device_t::enumerate_memory_regions(std::uint64_t start, std::uint64_t end_addr, bool include_all) noexcept {
@@ -2608,13 +2680,28 @@ bool voyager::device_t::stream_reassemble_op(std::uint32_t operation, std::uint3
                                               const std::uint8_t* dst_addr,
                                               std::vector<std::uint8_t>* out_data,
                                               std::uint32_t* out_packets, std::uint32_t* out_truncated) noexcept {
+    DWORD strm_code = ioctl_codes::STRM();
+    diag::log_tagged_fmt("netaction-strm",
+        "stream_reassemble_op ENTER op=%u src_port=%u dst_port=%u pid=%u ioctl=0x%08X struct_size=%zu connected=%d",
+        operation, src_port, dst_port, pid, strm_code,
+        sizeof(detail::stream_reassemble_request), is_connected() ? 1 : 0);
+
     if (!is_connected()) {
+        diag::log_tagged_fmt("netaction-strm",
+            "stream_reassemble_op ABORT not_connected handle=0x%llX",
+            reinterpret_cast<unsigned long long>(driver_handle_));
         return false;
     }
 
     auto* req = static_cast<detail::stream_reassemble_request*>(
         VirtualAlloc(nullptr, sizeof(detail::stream_reassemble_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!req) return false;
+    if (!req) {
+        DWORD err = GetLastError();
+        diag::log_tagged_fmt("netaction-strm",
+            "stream_reassemble_op ABORT VirtualAlloc_failed bytes=%zu err=%lu",
+            sizeof(detail::stream_reassemble_request), err);
+        return false;
+    }
 
     std::memset(req, 0, sizeof(*req));
     req->operation = operation;
@@ -2624,7 +2711,14 @@ bool voyager::device_t::stream_reassemble_op(std::uint32_t operation, std::uint3
     if (src_addr) std::memcpy(req->src_addr, src_addr, 16);
     if (dst_addr) std::memcpy(req->dst_addr, dst_addr, 16);
 
-    bool ok = send_request(ioctl_codes::STRM(), req, static_cast<DWORD>(sizeof(*req)));
+    SetLastError(0);
+    bool ok = send_request(strm_code, req, static_cast<DWORD>(sizeof(*req)));
+    DWORD post_err = GetLastError();
+    diag::log_tagged_fmt("netaction-strm",
+        "stream_reassemble_op send_request ok=%d last_error=%lu stream_size=%u total_packets=%u stream_count=%u truncated=%u",
+        ok ? 1 : 0, post_err,
+        req->stream_size, req->total_packets, req->stream_count, req->truncated);
+
     if (ok) {
         if (out_data && req->stream_size > 0) {
             out_data->assign(req->stream_data, req->stream_data + req->stream_size);
@@ -2634,6 +2728,8 @@ bool voyager::device_t::stream_reassemble_op(std::uint32_t operation, std::uint3
     }
 
     VirtualFree(req, 0, MEM_RELEASE);
+    diag::log_tagged_fmt("netaction-strm",
+        "stream_reassemble_op EXIT ok=%d", ok ? 1 : 0);
     return ok;
 }
 
@@ -2765,13 +2861,28 @@ bool voyager::device_t::kill_connection(std::uint32_t protocol, std::uint32_t af
                                          std::uint32_t src_port, std::uint32_t dst_port,
                                          const std::uint8_t* src_addr, const std::uint8_t* dst_addr,
                                          std::uint32_t pid) noexcept {
+    DWORD ckil_code = ioctl_codes::CKIL();
+    diag::log_tagged_fmt("netaction-ckil",
+        "kill_connection ENTER protocol=%u af=%u src_port=%u dst_port=%u pid=%u ioctl=0x%08X struct_size=%zu connected=%d",
+        protocol, af, src_port, dst_port, pid, ckil_code,
+        sizeof(detail::conn_kill_request), is_connected() ? 1 : 0);
+
     if (!is_connected()) {
+        diag::log_tagged_fmt("netaction-ckil",
+            "kill_connection ABORT not_connected handle=0x%llX",
+            reinterpret_cast<unsigned long long>(driver_handle_));
         return false;
     }
 
     auto* req = static_cast<detail::conn_kill_request*>(
         VirtualAlloc(nullptr, sizeof(detail::conn_kill_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!req) return false;
+    if (!req) {
+        DWORD err = GetLastError();
+        diag::log_tagged_fmt("netaction-ckil",
+            "kill_connection ABORT VirtualAlloc_failed bytes=%zu err=%lu",
+            sizeof(detail::conn_kill_request), err);
+        return false;
+    }
 
     std::memset(req, 0, sizeof(*req));
     req->protocol = protocol;
@@ -2782,9 +2893,30 @@ bool voyager::device_t::kill_connection(std::uint32_t protocol, std::uint32_t af
     if (src_addr) std::memcpy(req->src_addr, src_addr, 16);
     if (dst_addr) std::memcpy(req->dst_addr, dst_addr, 16);
 
-    bool ok = send_request(ioctl_codes::CKIL(), req, static_cast<DWORD>(sizeof(*req)));
+    if (src_addr) {
+        diag::log_tagged_fmt("netaction-ckil",
+            "kill_connection src_addr=%u.%u.%u.%u",
+            (unsigned)src_addr[0], (unsigned)src_addr[1],
+            (unsigned)src_addr[2], (unsigned)src_addr[3]);
+    }
+    if (dst_addr) {
+        diag::log_tagged_fmt("netaction-ckil",
+            "kill_connection dst_addr=%u.%u.%u.%u",
+            (unsigned)dst_addr[0], (unsigned)dst_addr[1],
+            (unsigned)dst_addr[2], (unsigned)dst_addr[3]);
+    }
+
+    SetLastError(0);
+    bool ok = send_request(ckil_code, req, static_cast<DWORD>(sizeof(*req)));
+    DWORD post_err = GetLastError();
     bool success = ok && (req->status == 0);
+    diag::log_tagged_fmt("netaction-ckil",
+        "kill_connection send_request ok=%d last_error=%lu request_status=%u success=%d",
+        ok ? 1 : 0, post_err, req->status, success ? 1 : 0);
+
     VirtualFree(req, 0, MEM_RELEASE);
+    diag::log_tagged_fmt("netaction-ckil",
+        "kill_connection EXIT success=%d", success ? 1 : 0);
     return success;
 }
 
@@ -3208,8 +3340,17 @@ bool voyager::device_t::re_confirmed_usermode_bsod(const detail::re_evidence_blo
 
 bool voyager::device_t::protect_sandbox_pid(std::uint32_t pid, std::uint32_t flags, std::uint64_t* out_denials) noexcept
 {
-    if (!is_connected()) return false;
-    if (pid == 0) return false;
+    diag::log_tagged_fmt("ww:malsafe-um", "protect_sandbox_pid ENTER pid=%u flags_in=0x%08X connected=%d session=0x%08X self_pid=%lu",
+        pid, flags, is_connected() ? 1 : 0, session_key_, GetCurrentProcessId());
+
+    if (!is_connected()) {
+        diag::log_tagged_fmt("ww:malsafe-um", "protect_sandbox_pid REJECT not_connected pid=%u", pid);
+        return false;
+    }
+    if (pid == 0) {
+        diag::log_tagged_fmt("ww:malsafe-um", "protect_sandbox_pid REJECT pid=0");
+        return false;
+    }
 
     detail::protect_sandbox_request req{};
     req.magic = session_key_ ^ dynamic_key::get() ^ 0x5A4E0B01u;
@@ -3217,17 +3358,34 @@ bool voyager::device_t::protect_sandbox_pid(std::uint32_t pid, std::uint32_t fla
     req.pid = pid;
     req.flags = (flags == 0) ? detail::SANDBOX_FLAG_DEFAULT : flags;
 
+    diag::log_tagged_fmt("ww:malsafe-um", "protect_sandbox_pid SEND ioctl=0x%08X pid=%u flags_effective=0x%08X magic=0x%08X session_key=0x%08X size=%u",
+        ioctl_codes::PSBX(), req.pid, req.flags, req.magic, req.session_key, static_cast<unsigned>(sizeof(req)));
+
     if (!send_request(ioctl_codes::PSBX(), &req, static_cast<DWORD>(sizeof(req)))) {
+        DWORD err = GetLastError();
+        diag::log_tagged_fmt("ww:malsafe-um", "protect_sandbox_pid send_request FAILED pid=%u err=%lu", pid, err);
         return false;
     }
     if (out_denials) *out_denials = req.denials_so_far;
-    return req.result != 0;
+    bool ok = req.result != 0;
+    diag::log_tagged_fmt("ww:malsafe-um", "protect_sandbox_pid RESULT pid=%u result=%u denials=%llu ok=%d",
+        pid, req.result, static_cast<unsigned long long>(req.denials_so_far), ok ? 1 : 0);
+    return ok;
 }
 
 bool voyager::device_t::unprotect_sandbox_pid(std::uint32_t pid, std::uint64_t* out_denials) noexcept
 {
-    if (!is_connected()) return false;
-    if (pid == 0) return false;
+    diag::log_tagged_fmt("ww:malsafe-um", "unprotect_sandbox_pid ENTER pid=%u connected=%d session=0x%08X self_pid=%lu",
+        pid, is_connected() ? 1 : 0, session_key_, GetCurrentProcessId());
+
+    if (!is_connected()) {
+        diag::log_tagged_fmt("ww:malsafe-um", "unprotect_sandbox_pid REJECT not_connected pid=%u", pid);
+        return false;
+    }
+    if (pid == 0) {
+        diag::log_tagged_fmt("ww:malsafe-um", "unprotect_sandbox_pid REJECT pid=0");
+        return false;
+    }
 
     detail::protect_sandbox_request req{};
     req.magic = session_key_ ^ dynamic_key::get() ^ 0x5A4E0B02u;
@@ -3235,17 +3393,34 @@ bool voyager::device_t::unprotect_sandbox_pid(std::uint32_t pid, std::uint64_t* 
     req.pid = pid;
     req.flags = 0;
 
+    diag::log_tagged_fmt("ww:malsafe-um", "unprotect_sandbox_pid SEND ioctl=0x%08X pid=%u magic=0x%08X session_key=0x%08X size=%u",
+        ioctl_codes::USBX(), req.pid, req.magic, req.session_key, static_cast<unsigned>(sizeof(req)));
+
     if (!send_request(ioctl_codes::USBX(), &req, static_cast<DWORD>(sizeof(req)))) {
+        DWORD err = GetLastError();
+        diag::log_tagged_fmt("ww:malsafe-um", "unprotect_sandbox_pid send_request FAILED pid=%u err=%lu", pid, err);
         return false;
     }
     if (out_denials) *out_denials = req.denials_so_far;
-    return req.result != 0;
+    bool ok = req.result != 0;
+    diag::log_tagged_fmt("ww:malsafe-um", "unprotect_sandbox_pid RESULT pid=%u result=%u denials=%llu ok=%d",
+        pid, req.result, static_cast<unsigned long long>(req.denials_so_far), ok ? 1 : 0);
+    return ok;
 }
 
 bool voyager::device_t::net_log_register_pid(std::uint32_t pid, bool enable) noexcept
 {
-    if (!is_connected()) return false;
-    if (pid == 0) return false;
+    diag::log_tagged_fmt("ww:malsafe-um", "net_log_register_pid ENTER pid=%u enable=%d connected=%d session=0x%08X self_pid=%lu",
+        pid, enable ? 1 : 0, is_connected() ? 1 : 0, session_key_, GetCurrentProcessId());
+
+    if (!is_connected()) {
+        diag::log_tagged_fmt("ww:malsafe-um", "net_log_register_pid REJECT not_connected pid=%u", pid);
+        return false;
+    }
+    if (pid == 0) {
+        diag::log_tagged_fmt("ww:malsafe-um", "net_log_register_pid REJECT pid=0");
+        return false;
+    }
 
     detail::net_log_register_request req{};
     req.magic = session_key_ ^ dynamic_key::get() ^ 0x5A4E0B03u;
@@ -3253,10 +3428,18 @@ bool voyager::device_t::net_log_register_pid(std::uint32_t pid, bool enable) noe
     req.pid = pid;
     req.operation = enable ? 1u : 0u;
 
+    diag::log_tagged_fmt("ww:malsafe-um", "net_log_register_pid SEND ioctl=0x%08X pid=%u op=%u magic=0x%08X session_key=0x%08X size=%u",
+        ioctl_codes::NLOG(), req.pid, req.operation, req.magic, req.session_key, static_cast<unsigned>(sizeof(req)));
+
     if (!send_request(ioctl_codes::NLOG(), &req, static_cast<DWORD>(sizeof(req)))) {
+        DWORD err = GetLastError();
+        diag::log_tagged_fmt("ww:malsafe-um", "net_log_register_pid send_request FAILED pid=%u err=%lu", pid, err);
         return false;
     }
-    return req.result != 0;
+    bool ok = req.result != 0;
+    diag::log_tagged_fmt("ww:malsafe-um", "net_log_register_pid RESULT pid=%u op=%u result=%u ok=%d",
+        pid, req.operation, req.result, ok ? 1 : 0);
+    return ok;
 }
 
 bool voyager::device_t::malware_safe_pull_packets(std::uint32_t pid,

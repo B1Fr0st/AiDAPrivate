@@ -55,6 +55,8 @@ WCHAR g_SentinelServicePath[128] = { 0 };
 PVOID g_SentinelLoadAddress = nullptr;
 ULONG g_SentinelImageSize = 0;
 
+WCHAR g_ShadowFsServicePath[128] = { 0 };
+
 struct WindowsVersion {
     DWORD major;
     DWORD minor;

@@ -21,6 +21,26 @@ cmd /c "\"C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliar
 
 If a header was edited but the build reports "no work to do", touch the dependent source files (`(Get-Item path).LastWriteTime = Get-Date`) to force a recompile — header-only changes don't always trigger Ninja invalidation. A "compiles in my head" review is not a substitute for an actual build — protected-binary header changes and ScopeInternal-style access-control issues only surface at link/compile time.
 
+**DRIVER REBUILD CHAIN — MANDATORY when ANY file under `driver/**` or `mapper/**` is edited.** The CMake build above only compiles user-mode code; kernel-driver changes do NOT take effect until the embedded `_encrypted.h` headers are regenerated from freshly-built `.sys` files. The host AI must run the FULL chain end-to-end before reporting the task complete:
+
+1. **MSBuild the driver solution** — `driver/WhosWho/WhosWho.sln` is the single solution containing all four driver projects (WhosWho, WindMapper, Sentinel, AiDAShadowFS). Build `Release|x64`:
+   ```
+   cmd /c "\"C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat\" >nul && msbuild C:/Users/ruar1337/AiDAPrivate/driver/WhosWho/WhosWho.sln /p:Configuration=Release /p:Platform=x64 /m"
+   ```
+
+2. **Encrypt each rebuilt `.sys`** — each `src/encrypt_*.py` accepts `--from-binary <.sys path>`, which BOTH regenerates the legacy top-level `.c` hex dump in HxD-compatible format AND produces the encrypted header. No manual HxD export step is needed.
+   ```
+   python src/encrypt_whoswho.py    --from-binary driver/WhosWho/WhosWho/x64/Release/WhosWho.sys
+   python src/encrypt_sentinel.py   --from-binary driver/Sentinel/Sentinel/x64/Release/Sentinel.sys
+   python src/encrypt_windmapper.py --from-binary mapper/x64/Release/WindMapper.sys
+   python src/encrypt_shadowfs.py   --from-binary driver/AiDAShadowFS/AiDAShadowFS/x64/Release/AiDAShadowFS.sys
+   ```
+   (Actual output paths can vary by `.vcxproj` `OutDir` — locate with `Get-ChildItem -Recurse driver/,mapper/ -Filter '*.sys' | Where-Object FullName -Match 'Release'` after the MSBuild.)
+
+3. **Re-run the canonical CMake build** — `driver_loader.cpp` has `OBJECT_DEPENDS` on the four `_encrypted.h` headers, so the link picks up the new embedded drivers automatically.
+
+Only report a driver task complete after step 3 exits 0. The user will launch `AiDAStandalone.exe` to verify behaviour.
+
 ## Subagent policy (HARD RULE — NEVER BREAK)
 
 **For very massive tasks (large refactors, multi-file redesigns, UI overhauls, cross-module implementations), the host AI MUST dispatch implementer/designer subagents.** Solo inline-editing on big jobs is wrong; parallel Opus implementer/designer subagents with surgical briefs is the default.

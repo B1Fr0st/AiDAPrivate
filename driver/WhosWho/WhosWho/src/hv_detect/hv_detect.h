@@ -140,7 +140,7 @@ namespace hv_detect {
                 } __except (EXCEPTION_EXECUTE_HANDLER) {}
             }
 
-            if (image_base != 0 && safety_net::init_safety_net(image_base, image_size)) {
+            if (!ms_hv_root && image_base != 0 && safety_net::init_safety_net(image_base, image_size)) {
                 safety_net::set_safety_net_kpcr(KeGetPcr());
 
                 {

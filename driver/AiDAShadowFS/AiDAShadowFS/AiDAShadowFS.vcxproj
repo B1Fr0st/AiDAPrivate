@@ -152,6 +152,7 @@
     <ClCompile Include="src\Operations\PreDirectoryControl.cpp" />
     <ClCompile Include="src\Operations\PreFsCtrl.cpp" />
     <ClCompile Include="src\Operations\DirMerge.cpp" />
+    <ClCompile Include="src\KernelDebugCapture.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\MinifilterContext.h" />
@@ -159,6 +160,7 @@
     <ClInclude Include="src\ShadowPath.h" />
     <ClInclude Include="src\Comms.h" />
     <ClInclude Include="src\Logging.h" />
+    <ClInclude Include="src\KernelDebugCapture.h" />
     <ClInclude Include="src\ShadowFSProtocol.h" />
     <ClInclude Include="src\Operations\Operations.h" />
     <ClInclude Include="src\Operations\DirMerge.h" />

@@ -381,16 +381,26 @@ namespace dispatcher {
 
         if (malware_safe::any_sandboxed()) {
             HANDLE caller_pid = PsGetCurrentProcessId();
-            ULONG sbx_flags = 0;
-            if (malware_safe::is_sandboxed_pid(caller_pid, &sbx_flags) &&
-                (sbx_flags & malware_safe::FLAG_BLOCK_KERNEL_HANDLE)) {
-                malware_safe::record_denial(caller_pid);
-                WW_MALSAFE_LOG_INFO("DENY ioctl_from_sandbox pid=%lu flags=0x%08X status=0x%08X",
-                    (ULONG)(ULONG_PTR)caller_pid, sbx_flags, STATUS_ACCESS_DENIED);
-                irp->IoStatus.Status = STATUS_ACCESS_DENIED;
-                irp->IoStatus.Information = 0;
-                _IofCompleteRequest(irp, IO_NO_INCREMENT);
-                return STATUS_ACCESS_DENIED;
+            HANDLE client_pid = caller_validation::g_registered_client_pid;
+            if (caller_pid != client_pid) {
+                ULONG sbx_flags = 0;
+                if (malware_safe::is_sandboxed_pid(caller_pid, &sbx_flags) &&
+                    (sbx_flags & malware_safe::FLAG_BLOCK_KERNEL_HANDLE)) {
+                    malware_safe::record_denial(caller_pid);
+                    WW_MALSAFE_LOG_INFO("DENY ioctl_from_sandbox pid=%lu flags=0x%08X status=0x%08X",
+                        (ULONG)(ULONG_PTR)caller_pid, sbx_flags, STATUS_ACCESS_DENIED);
+                    irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+                    irp->IoStatus.Information = 0;
+                    _IofCompleteRequest(irp, IO_NO_INCREMENT);
+                    return STATUS_ACCESS_DENIED;
+                }
+            }
+            else {
+                ULONG sbx_flags_self = 0;
+                if (malware_safe::is_sandboxed_pid(caller_pid, &sbx_flags_self)) {
+                    WW_MALSAFE_LOG_INFO("EXEMPT ioctl_from_sandbox pid=%lu flags=0x%08X (registered client, self-sandbox)",
+                        (ULONG)(ULONG_PTR)caller_pid, sbx_flags_self);
+                }
             }
         }
 
@@ -440,6 +450,10 @@ namespace dispatcher {
         UINT64 secure_request_id = 0;
 
         if (!buffer) {
+            if (code == ioctl_codes::STRM() || code == ioctl_codes::CKIL()) {
+                WW_LOG("netaction::DISPATCH null_buffer code=0x%08X input_size=%lu output_size=%lu",
+                    code, input_size, output_size);
+            }
             irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
             irp->IoStatus.Information = 0;
             _IofCompleteRequest(irp, IO_NO_INCREMENT);
@@ -448,6 +462,10 @@ namespace dispatcher {
 
         if (code != ioctl_codes::HB() && secure_comm::g_comm_initialized != 0) {
             if (input_size < sizeof(secure_comm::SECURE_HEADER)) {
+                if (code == ioctl_codes::STRM() || code == ioctl_codes::CKIL()) {
+                    WW_LOG("netaction::DISPATCH secure_header_too_small code=0x%08X input_size=%lu required=%lu",
+                        code, input_size, (ULONG)sizeof(secure_comm::SECURE_HEADER));
+                }
                 irp->IoStatus.Status = STATUS_ACCESS_DENIED;
                 irp->IoStatus.Information = 0;
                 _IofCompleteRequest(irp, IO_NO_INCREMENT);
@@ -465,6 +483,10 @@ namespace dispatcher {
 
             secure_work_buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, work_size, 'mocS');
             if (!secure_work_buffer) {
+                if (code == ioctl_codes::STRM() || code == ioctl_codes::CKIL()) {
+                    WW_LOG("netaction::DISPATCH secure_work_buffer_alloc_failed code=0x%08X work_size=%llu",
+                        code, (ULONG64)work_size);
+                }
                 irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
                 irp->IoStatus.Information = 0;
                 _IofCompleteRequest(irp, IO_NO_INCREMENT);
@@ -474,6 +496,10 @@ namespace dispatcher {
             SIZE_T plain_size = 0;
             if (!secure_comm::decrypt_request(buffer, input_size,
                 secure_work_buffer, work_size, &plain_size)) {
+                if (code == ioctl_codes::STRM() || code == ioctl_codes::CKIL()) {
+                    WW_LOG("netaction::DISPATCH secure_decrypt_failed code=0x%08X input_size=%lu work_size=%llu",
+                        code, input_size, (ULONG64)work_size);
+                }
                 ExFreePoolWithTag(secure_work_buffer, 'mocS');
                 irp->IoStatus.Status = STATUS_ACCESS_DENIED;
                 irp->IoStatus.Information = 0;
@@ -486,6 +512,10 @@ namespace dispatcher {
         }
 
         if (code != ioctl_codes::HB() && code != ioctl_codes::SRVT() && code != ioctl_codes::SRV2() && !is_session_valid()) {
+            if (code == ioctl_codes::STRM() || code == ioctl_codes::CKIL()) {
+                WW_LOG("netaction::DISPATCH session_invalid code=0x%08X g_driver_activated=%ld",
+                    code, _InterlockedCompareExchange(&g_driver_activated, 0, 0));
+            }
             if (secure_work_buffer)
                 ExFreePoolWithTag(secure_work_buffer, 'mocS');
             irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
@@ -602,10 +632,29 @@ namespace dispatcher {
         }
         else if (code == ioctl_codes::PM()) {
             if (input_size >= sizeof(protect_memory) && output_size >= sizeof(protect_memory)) {
-                status = functions::handle_protect_memory((p_protect_memory)buffer);
+                p_protect_memory pm_req = (p_protect_memory)buffer;
+                WW_LOG("memory::protect_memory: ENTER pid=%lu addr=0x%016llX size=0x%llX new=0x%08X input_size=%lu output_size=%lu",
+                    (ULONG)pm_req->pid,
+                    (unsigned long long)pm_req->address,
+                    (unsigned long long)pm_req->size,
+                    (ULONG)pm_req->new_protect,
+                    (ULONG)input_size,
+                    (ULONG)output_size);
+                status = functions::handle_protect_memory(pm_req);
                 bytes = sizeof(protect_memory);
+                WW_LOG("memory::protect_memory: EXIT pid=%lu addr=0x%016llX size=0x%llX new=0x%08X old=0x%08X status=0x%08X bytes=%lu",
+                    (ULONG)pm_req->pid,
+                    (unsigned long long)pm_req->address,
+                    (unsigned long long)pm_req->size,
+                    (ULONG)pm_req->new_protect,
+                    (ULONG)pm_req->old_protect,
+                    (ULONG)status,
+                    (ULONG)bytes);
             }
             else {
+                WW_LOG("memory::protect_memory: SIZE_MISMATCH input_size=%lu output_size=%lu expected=%llu",
+                    (ULONG)input_size, (ULONG)output_size,
+                    (unsigned long long)sizeof(protect_memory));
                 status = STATUS_INFO_LENGTH_MISMATCH;
             }
         }
@@ -777,11 +826,24 @@ namespace dispatcher {
             else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
         else if (code == ioctl_codes::STRM()) {
+            WW_LOG("netaction::STRM ENTER code=0x%08X input_size=%lu output_size=%lu required=%lu secure_wrapped=%d buffer=%p",
+                code, input_size, output_size, (ULONG)sizeof(stream_reassemble_request),
+                (int)secure_wrapped, buffer);
             if (input_size >= sizeof(stream_reassemble_request) && output_size >= sizeof(stream_reassemble_request)) {
-                status = functions::handle_stream_reassemble((p_stream_reassemble_request)buffer);
+                p_stream_reassemble_request strm_req = (p_stream_reassemble_request)buffer;
+                WW_LOG("netaction::STRM dispatch op=%u src_port=%u dst_port=%u pid=%u",
+                    strm_req->operation, strm_req->src_port, strm_req->dst_port, strm_req->pid);
+                status = functions::handle_stream_reassemble(strm_req);
                 bytes = sizeof(stream_reassemble_request);
+                WW_LOG("netaction::STRM EXIT status=0x%08X bytes=%lu stream_size=%u total_packets=%u stream_count=%u truncated=%u",
+                    status, bytes, strm_req->stream_size, strm_req->total_packets,
+                    strm_req->stream_count, strm_req->truncated);
             }
-            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+                WW_LOG("netaction::STRM REJECT length_mismatch input_size=%lu output_size=%lu required=%lu status=0x%08X",
+                    input_size, output_size, (ULONG)sizeof(stream_reassemble_request), status);
+            }
         }
         else if (code == ioctl_codes::DPIN()) {
             if (input_size >= sizeof(dpi_request) && output_size >= sizeof(dpi_request)) {
@@ -798,11 +860,26 @@ namespace dispatcher {
             else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
         else if (code == ioctl_codes::CKIL()) {
+            WW_LOG("netaction::CKIL ENTER code=0x%08X input_size=%lu output_size=%lu required=%lu secure_wrapped=%d buffer=%p",
+                code, input_size, output_size, (ULONG)sizeof(conn_kill_request),
+                (int)secure_wrapped, buffer);
             if (input_size >= sizeof(conn_kill_request) && output_size >= sizeof(conn_kill_request)) {
-                status = functions::handle_conn_kill((p_conn_kill_request)buffer);
+                p_conn_kill_request ckil_req = (p_conn_kill_request)buffer;
+                WW_LOG("netaction::CKIL dispatch protocol=%u af=%u src_port=%u dst_port=%u pid=%u src=%u.%u.%u.%u dst=%u.%u.%u.%u",
+                    ckil_req->protocol, ckil_req->address_family,
+                    ckil_req->src_port, ckil_req->dst_port, ckil_req->pid,
+                    ckil_req->src_addr[0], ckil_req->src_addr[1], ckil_req->src_addr[2], ckil_req->src_addr[3],
+                    ckil_req->dst_addr[0], ckil_req->dst_addr[1], ckil_req->dst_addr[2], ckil_req->dst_addr[3]);
+                status = functions::handle_conn_kill(ckil_req);
                 bytes = sizeof(conn_kill_request);
+                WW_LOG("netaction::CKIL EXIT status=0x%08X bytes=%lu request_status=%u",
+                    status, bytes, ckil_req->status);
             }
-            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+                WW_LOG("netaction::CKIL REJECT length_mismatch input_size=%lu output_size=%lu required=%lu status=0x%08X",
+                    input_size, output_size, (ULONG)sizeof(conn_kill_request), status);
+            }
         }
         else if (code == ioctl_codes::DNSS()) {
             if (input_size >= sizeof(dns_spoof_list) && output_size >= sizeof(dns_spoof_list) &&
@@ -1264,26 +1341,34 @@ namespace dispatcher {
                 UINT64 denials_so_far;
             };
             static_assert(sizeof(protect_sandbox_request_k) == 32, "protect_sandbox_request_k must match um struct");
-            WW_MALSAFE_LOG_VERBOSE("ioctl PSBX entry input=%lu output=%lu", input_size, output_size);
+            ULONG psbx_caller_pid = static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(PsGetCurrentProcessId()));
+            WW_MALSAFE_LOG_INFO("ioctl PSBX ENTRY caller=%lu input=%lu output=%lu need=%lu",
+                psbx_caller_pid, input_size, output_size, (ULONG)sizeof(protect_sandbox_request_k));
             if (input_size >= sizeof(protect_sandbox_request_k) &&
                 output_size >= sizeof(protect_sandbox_request_k)) {
                 auto* req = reinterpret_cast<protect_sandbox_request_k*>(buffer);
                 ULONG expected_magic = g_session_key ^ dynamic_key::get() ^ 0x5A4E0B01u;
+                WW_MALSAFE_LOG_INFO("ioctl PSBX req pid=%lu flags=0x%08X magic=0x%lX expected=0x%lX session=0x%lX g_session=0x%lX",
+                    req->pid, req->flags, req->magic, expected_magic, req->session_key, g_session_key);
                 if (req->magic == expected_magic && req->session_key == g_session_key) {
                     LONG64 denials = 0;
                     bool ok = malware_safe::protect_pid(req->pid, req->flags, &denials);
                     req->result = ok ? 1u : 0u;
                     req->denials_so_far = static_cast<UINT64>(denials);
                     status = STATUS_SUCCESS;
-                    WW_MALSAFE_LOG_INFO("ioctl PSBX pid=%lu flags=0x%08X result=%d denials=%llu",
-                        req->pid, req->flags, ok ? 1 : 0, (unsigned long long)req->denials_so_far);
+                    WW_MALSAFE_LOG_INFO("ioctl PSBX EXIT pid=%lu flags=0x%08X result=%d denials=%llu status=0x%08X",
+                        req->pid, req->flags, ok ? 1 : 0, (unsigned long long)req->denials_so_far, (ULONG)status);
                 } else {
-                    WW_MALSAFE_LOG_WARN("ioctl PSBX REJECTED magic=0x%lX expected=0x%lX session=0x%lX",
-                        req->magic, expected_magic, req->session_key);
+                    WW_MALSAFE_LOG_WARN("ioctl PSBX REJECTED auth_fail caller=%lu req_pid=%lu magic=0x%lX expected=0x%lX session=0x%lX g_session=0x%lX",
+                        psbx_caller_pid, req->pid, req->magic, expected_magic, req->session_key, g_session_key);
                     status = STATUS_ACCESS_DENIED;
                 }
                 bytes = sizeof(protect_sandbox_request_k);
-            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+            } else {
+                WW_MALSAFE_LOG_WARN("ioctl PSBX REJECT length_mismatch input=%lu output=%lu need=%lu",
+                    input_size, output_size, (ULONG)sizeof(protect_sandbox_request_k));
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
         }
         else if (code == ioctl_codes::USBX()) {
             struct protect_sandbox_request_k {
@@ -1295,26 +1380,34 @@ namespace dispatcher {
                 UINT32 reserved;
                 UINT64 denials_so_far;
             };
-            WW_MALSAFE_LOG_VERBOSE("ioctl USBX entry input=%lu output=%lu", input_size, output_size);
+            ULONG usbx_caller_pid = static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(PsGetCurrentProcessId()));
+            WW_MALSAFE_LOG_INFO("ioctl USBX ENTRY caller=%lu input=%lu output=%lu need=%lu",
+                usbx_caller_pid, input_size, output_size, (ULONG)sizeof(protect_sandbox_request_k));
             if (input_size >= sizeof(protect_sandbox_request_k) &&
                 output_size >= sizeof(protect_sandbox_request_k)) {
                 auto* req = reinterpret_cast<protect_sandbox_request_k*>(buffer);
                 ULONG expected_magic = g_session_key ^ dynamic_key::get() ^ 0x5A4E0B02u;
+                WW_MALSAFE_LOG_INFO("ioctl USBX req pid=%lu magic=0x%lX expected=0x%lX session=0x%lX g_session=0x%lX",
+                    req->pid, req->magic, expected_magic, req->session_key, g_session_key);
                 if (req->magic == expected_magic && req->session_key == g_session_key) {
                     LONG64 denials = 0;
                     bool ok = malware_safe::unprotect_pid(req->pid, &denials);
                     req->result = ok ? 1u : 0u;
                     req->denials_so_far = static_cast<UINT64>(denials);
                     status = STATUS_SUCCESS;
-                    WW_MALSAFE_LOG_INFO("ioctl USBX pid=%lu result=%d denials=%llu",
-                        req->pid, ok ? 1 : 0, (unsigned long long)req->denials_so_far);
+                    WW_MALSAFE_LOG_INFO("ioctl USBX EXIT pid=%lu result=%d denials=%llu status=0x%08X",
+                        req->pid, ok ? 1 : 0, (unsigned long long)req->denials_so_far, (ULONG)status);
                 } else {
-                    WW_MALSAFE_LOG_WARN("ioctl USBX REJECTED magic=0x%lX expected=0x%lX session=0x%lX",
-                        req->magic, expected_magic, req->session_key);
+                    WW_MALSAFE_LOG_WARN("ioctl USBX REJECTED auth_fail caller=%lu req_pid=%lu magic=0x%lX expected=0x%lX session=0x%lX g_session=0x%lX",
+                        usbx_caller_pid, req->pid, req->magic, expected_magic, req->session_key, g_session_key);
                     status = STATUS_ACCESS_DENIED;
                 }
                 bytes = sizeof(protect_sandbox_request_k);
-            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+            } else {
+                WW_MALSAFE_LOG_WARN("ioctl USBX REJECT length_mismatch input=%lu output=%lu need=%lu",
+                    input_size, output_size, (ULONG)sizeof(protect_sandbox_request_k));
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
         }
         else if (code == ioctl_codes::NLOG()) {
             struct net_log_register_request_k {
@@ -1326,24 +1419,32 @@ namespace dispatcher {
                 UINT32 reserved;
             };
             static_assert(sizeof(net_log_register_request_k) == 24, "net_log_register_request_k must match um struct");
-            WW_MALSAFE_LOG_VERBOSE("ioctl NLOG entry input=%lu output=%lu", input_size, output_size);
+            ULONG nlog_caller_pid = static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(PsGetCurrentProcessId()));
+            WW_MALSAFE_LOG_INFO("ioctl NLOG ENTRY caller=%lu input=%lu output=%lu need=%lu",
+                nlog_caller_pid, input_size, output_size, (ULONG)sizeof(net_log_register_request_k));
             if (input_size >= sizeof(net_log_register_request_k) &&
                 output_size >= sizeof(net_log_register_request_k)) {
                 auto* req = reinterpret_cast<net_log_register_request_k*>(buffer);
                 ULONG expected_magic = g_session_key ^ dynamic_key::get() ^ 0x5A4E0B03u;
+                WW_MALSAFE_LOG_INFO("ioctl NLOG req pid=%lu op=%lu magic=0x%lX expected=0x%lX session=0x%lX g_session=0x%lX",
+                    req->pid, req->operation, req->magic, expected_magic, req->session_key, g_session_key);
                 if (req->magic == expected_magic && req->session_key == g_session_key) {
                     bool ok = malware_safe::set_net_log(req->pid, req->operation != 0);
                     req->result = ok ? 1u : 0u;
                     status = STATUS_SUCCESS;
-                    WW_MALSAFE_LOG_INFO("ioctl NLOG pid=%lu op=%lu result=%d",
-                        req->pid, req->operation, ok ? 1 : 0);
+                    WW_MALSAFE_LOG_INFO("ioctl NLOG EXIT pid=%lu op=%lu result=%d status=0x%08X",
+                        req->pid, req->operation, ok ? 1 : 0, (ULONG)status);
                 } else {
                     status = STATUS_ACCESS_DENIED;
-                    WW_MALSAFE_LOG_WARN("ioctl NLOG REJECTED magic=0x%lX expected=0x%lX session=0x%lX",
-                        req->magic, expected_magic, req->session_key);
+                    WW_MALSAFE_LOG_WARN("ioctl NLOG REJECTED auth_fail caller=%lu req_pid=%lu magic=0x%lX expected=0x%lX session=0x%lX g_session=0x%lX",
+                        nlog_caller_pid, req->pid, req->magic, expected_magic, req->session_key, g_session_key);
                 }
                 bytes = sizeof(net_log_register_request_k);
-            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+            } else {
+                WW_MALSAFE_LOG_WARN("ioctl NLOG REJECT length_mismatch input=%lu output=%lu need=%lu",
+                    input_size, output_size, (ULONG)sizeof(net_log_register_request_k));
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
         }
         else if (code == ioctl_codes::NPKT()) {
             struct net_packet_pull_request_k {
@@ -1556,6 +1657,11 @@ namespace dispatcher {
 
         if (secure_work_buffer)
             ExFreePoolWithTag(secure_work_buffer, 'mocS');
+
+        if (code == ioctl_codes::STRM() || code == ioctl_codes::CKIL()) {
+            WW_LOG("netaction::DISPATCH COMPLETE code=0x%08X final_status=0x%08X final_bytes=%lu secure_wrapped=%d",
+                code, status, bytes, (int)secure_wrapped);
+        }
 
         irp->IoStatus.Status = status;
         irp->IoStatus.Information = bytes;

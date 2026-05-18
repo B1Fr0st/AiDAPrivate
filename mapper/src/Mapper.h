@@ -297,6 +297,8 @@ extern WCHAR g_SentinelServicePath[128];
 extern PVOID g_SentinelLoadAddress;
 extern ULONG g_SentinelImageSize;
 
+extern WCHAR g_ShadowFsServicePath[128];
+
 namespace Utils {
     std::wstring GenerateRandomName(size_t length);
     BOOL InitializeNtFunctions();
@@ -310,6 +312,8 @@ namespace Utils {
 
 namespace DriverLoader {
     NTSTATUS CreateDriverService(PWSTR servicePath, PCWSTR filePath);
+    NTSTATUS CreateMinifilterService(PWSTR servicePath, PCWSTR filePath,
+                                     PCWSTR instanceName, PCWSTR altitude);
     NTSTATUS LoadDriver(PCWSTR servicePath);
     NTSTATUS UnloadDriver(PCWSTR servicePath);
 }
@@ -338,8 +342,10 @@ namespace VulnDriver {
 }
 
 namespace MapperCore {
-    NTSTATUS TriggerExploit(PCWSTR targetDriverFileName, PCWSTR sentinelDriverFileName = nullptr);
-    NTSTATUS WindLoadDriver(PCWSTR loaderPath, PCWSTR driverPath, PCWSTR sentinelPath = nullptr);
+    NTSTATUS TriggerExploit(PCWSTR targetDriverFileName, PCWSTR sentinelDriverFileName = nullptr,
+                            PCWSTR shadowFsDriverFileName = nullptr);
+    NTSTATUS WindLoadDriver(PCWSTR loaderPath, PCWSTR driverPath, PCWSTR sentinelPath = nullptr,
+                            PCWSTR shadowFsPath = nullptr);
     NTSTATUS RestoreCiCallback(HANDLE device);
     NTSTATUS CleanupArtifacts();
     BOOL WriteSentinelGlobals(HANDLE device, PVOID sentinelBase, ULONG sentinelImageSize,

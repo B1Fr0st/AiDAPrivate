@@ -704,12 +704,64 @@ NTSTATUS functions::handle_query_memory(p_query_memory request) {
 
 
 NTSTATUS functions::handle_protect_memory(p_protect_memory request) {
-    if (!request || request->pid == 0 || request->size == 0) {
+    if (!request) {
+        WW_LOG("memory::protect_memory: REJECT request=null");
         return STATUS_INVALID_PARAMETER;
+    }
+
+    WW_LOG("memory::protect_memory: handle ENTER pid=%lu addr=0x%016llX size=0x%llX new=0x%08X",
+        (ULONG)request->pid,
+        (unsigned long long)request->address,
+        (unsigned long long)request->size,
+        (ULONG)request->new_protect);
+
+    if (request->pid == 0 || request->size == 0) {
+        WW_LOG("memory::protect_memory: REJECT pid_or_size_zero pid=%lu size=0x%llX",
+            (ULONG)request->pid, (unsigned long long)request->size);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (request->address == 0) {
+        WW_LOG("memory::protect_memory: REJECT addr_zero");
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    const UINT64 kUserAddressMax = 0x00007FFFFFFFFFFFULL;
+    if (request->address >= kUserAddressMax) {
+        WW_LOG("memory::protect_memory: REJECT addr_kernel_range addr=0x%016llX",
+            (unsigned long long)request->address);
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    if (request->size > 0x00000000FFFFFFFFULL) {
+        WW_LOG("memory::protect_memory: REJECT size_too_large size=0x%llX",
+            (unsigned long long)request->size);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if ((request->address + request->size) < request->address ||
+        (request->address + request->size) >= kUserAddressMax) {
+        WW_LOG("memory::protect_memory: REJECT range_overflow addr=0x%016llX size=0x%llX",
+            (unsigned long long)request->address,
+            (unsigned long long)request->size);
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    const ULONG kAllowedProtect =
+        PAGE_NOACCESS | PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+        PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+        PAGE_EXECUTE_WRITECOPY | PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE;
+    if ((request->new_protect & ~kAllowedProtect) != 0 || request->new_protect == 0) {
+        WW_LOG("memory::protect_memory: REJECT bad_protect_flags new=0x%08X mask=0x%08X",
+            (ULONG)request->new_protect, (ULONG)kAllowedProtect);
+        return STATUS_INVALID_PAGE_PROTECTION;
     }
 
     if (!_PsLookupProcessByProcessId || !_KeStackAttachProcess ||
         !_KeUnstackDetachProcess || !_ZwProtectVirtualMemory || !_ObfDereferenceObject) {
+        WW_LOG("memory::protect_memory: REJECT procedures_missing PsLookup=%p KeStack=%p KeUnstack=%p ZwProtect=%p ObfDeref=%p",
+            _PsLookupProcessByProcessId, _KeStackAttachProcess,
+            _KeUnstackDetachProcess, _ZwProtectVirtualMemory, _ObfDereferenceObject);
         return STATUS_PROCEDURE_NOT_FOUND;
     }
 
@@ -719,6 +771,8 @@ NTSTATUS functions::handle_protect_memory(p_protect_memory request) {
     NTSTATUS status = _PsLookupProcessByProcessId(
         (HANDLE)(ULONG_PTR)request->pid, &process);
     if (!NT_SUCCESS(status) || !process) {
+        WW_LOG("memory::protect_memory: PsLookupProcessByProcessId FAIL pid=%lu status=0x%08X process=%p",
+            (ULONG)request->pid, (ULONG)status, process);
         return status;
     }
 
@@ -729,15 +783,36 @@ NTSTATUS functions::handle_protect_memory(p_protect_memory request) {
     SIZE_T region_size = (SIZE_T)request->size;
     ULONG old_protect = 0;
 
-    status = _ZwProtectVirtualMemory(
-        (HANDLE)-1,
-        &base_addr,
-        &region_size,
-        request->new_protect,
-        &old_protect);
+    __try {
+        status = _ZwProtectVirtualMemory(
+            (HANDLE)-1,
+            &base_addr,
+            &region_size,
+            request->new_protect,
+            &old_protect);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+        WW_LOG("memory::protect_memory: EXCEPTION pid=%lu addr=0x%016llX code=0x%08X",
+            (ULONG)request->pid,
+            (unsigned long long)request->address,
+            (ULONG)status);
+    }
+
+    WW_LOG("memory::protect_memory: ZwProtectVirtualMemory RESULT pid=%lu in_addr=0x%016llX out_addr=0x%016llX in_size=0x%llX out_size=0x%llX new=0x%08X old=0x%08X status=0x%08X",
+        (ULONG)request->pid,
+        (unsigned long long)request->address,
+        (unsigned long long)(ULONG_PTR)base_addr,
+        (unsigned long long)request->size,
+        (unsigned long long)region_size,
+        (ULONG)request->new_protect,
+        (ULONG)old_protect,
+        (ULONG)status);
 
     if (NT_SUCCESS(status)) {
         request->old_protect = old_protect;
+    }
+    else {
+        request->old_protect = 0;
     }
 
     _KeUnstackDetachProcess(&apc_state);

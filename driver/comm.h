@@ -1682,6 +1682,29 @@ namespace voyager {
                                 std::size_t max_events = detail::DRAIN_DEBUG_EVENTS_CAP,
                                 debug_event_drain_stats* out_stats = nullptr) noexcept;
 
+        bool send_ioctl_raw(std::uint32_t ioctl_code,
+                            void* in_out_buffer,
+                            std::uint32_t buffer_size,
+                            std::uint32_t& bytes_returned) const noexcept {
+            bytes_returned = 0;
+            if (!is_connected() || in_out_buffer == nullptr || buffer_size == 0) {
+                return false;
+            }
+            DWORD br = 0;
+            BOOL ok = DeviceIoControl(
+                driver_handle_,
+                static_cast<DWORD>(ioctl_code),
+                in_out_buffer,
+                static_cast<DWORD>(buffer_size),
+                in_out_buffer,
+                static_cast<DWORD>(buffer_size),
+                &br,
+                nullptr
+            );
+            bytes_returned = static_cast<std::uint32_t>(br);
+            return ok != FALSE;
+        }
+
         [[nodiscard]] std::uint32_t get_process_id() const noexcept { return process_id_; }
         [[nodiscard]] std::uint64_t get_base_address() const noexcept { return base_address_; }
         [[nodiscard]] std::uint64_t get_dtb() const noexcept { return dtb_; }

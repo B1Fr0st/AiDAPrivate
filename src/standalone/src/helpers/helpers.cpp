@@ -54,6 +54,7 @@
 #include "xref_index.hpp"
 #include "xref_db.hpp"
 #include "binary_map_view.hpp"
+#include "../core/testlab/test_lab_view.hpp"
 #include "ui_anim.hpp"
 #include "agent_picker_view.hpp"
 #include "initial_analysis.hpp"
@@ -1329,6 +1330,10 @@ void helpers::render_title()
 
 		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_B, false)) {
 			globals::ui::active_center_view = center_view_t::binary_map;
+		}
+
+		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_T, false)) {
+			globals::ui::active_center_view = center_view_t::test_lab;
 		}
 
 		if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) {
@@ -5952,6 +5957,13 @@ void helpers::render_title()
 	else if (cv == center_view_t::binary_map)
 	{
 		aida::binary_map_view::render(0, 0, vw, vh, a, ax3, ay3, az3);
+	}
+
+	else if (cv == center_view_t::test_lab)
+	{
+		static float s_test_lab_anim_time = 0.f;
+		s_test_lab_anim_time += ImGui::GetIO().DeltaTime;
+		test_lab_view::render(vw, vh, s_test_lab_anim_time);
 	}
 
 	else

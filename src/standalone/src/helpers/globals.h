@@ -52,7 +52,8 @@ enum class center_view_t : int {
 	analysis_hub,
 	binary_map,
 	graph_view,
-	image_view
+	image_view,
+	test_lab
 };
 
 

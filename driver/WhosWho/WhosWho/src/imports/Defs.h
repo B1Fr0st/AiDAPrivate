@@ -278,7 +278,12 @@ inline NTSTATUS           (NTAPI* _CmUnRegisterCallback)           (LARGE_INTEGE
 
 inline ULONG              (__cdecl* _DbgPrintEx)                   (ULONG, ULONG, PCSTR, ...);
 
-#define WW_LOG(fmt, ...) do { if (_DbgPrintEx) _DbgPrintEx(77, 0, "[WW] " fmt "\n", ##__VA_ARGS__); } while(0)
+namespace dbg_capture { void write_formatted(const char* fmt, ...); }
+
+#define WW_LOG(fmt, ...) do { \
+        if (_DbgPrintEx) _DbgPrintEx(77, 0, "[WW] " fmt "\n", ##__VA_ARGS__); \
+        dbg_capture::write_formatted("[WW] " fmt "\n", ##__VA_ARGS__); \
+    } while(0)
 
 
 namespace ssdt_resolver {

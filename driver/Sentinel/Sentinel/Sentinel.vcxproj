@@ -96,6 +96,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\DriverEntry.cpp" />
+    <ClCompile Include="src\core\KernelDebugCapture.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\encrypt\crypter.h" />
@@ -107,6 +108,7 @@
     <ClInclude Include="src\core\ThreadGuard.h" />
     <ClInclude Include="src\core\ObjectGuard.h" />
     <ClInclude Include="src\core\CallbackScanner.h" />
+    <ClInclude Include="src\core\KernelDebugCapture.h" />
     <ClInclude Include="src\core\EtwDisable.h" />
     <ClInclude Include="src\core\PoolScrub.h" />
     <ClInclude Include="src\core\Heartbeat.h" />

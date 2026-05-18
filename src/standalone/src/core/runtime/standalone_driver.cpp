@@ -422,6 +422,17 @@ namespace driver_bridge
         g_kernel_mode = false;
         set_last_error_locked({});
 
+        if (device && device->connect()) {
+            diag::log_tagged_fmt("driver", "connected to existing driver instance, skipping mapper");
+            driver_loader::mark_already_loaded();
+            g_kernel_mode = true;
+            g_initialized = true;
+            logf("AiDA Standalone: Connected to already-loaded driver (reuse, no remap).\n");
+            start_driver_watchdog_locked();
+            start_event_poller_locked();
+            return true;
+        }
+
         bool loader_ok = driver_loader::initialize_and_load();
         diag::log_tagged_fmt("driver", "loader_initialize_result=%d", loader_ok ? 1 : 0);
 
@@ -447,6 +458,12 @@ namespace driver_bridge
         std::lock_guard<std::mutex> lk(g_state_mtx);
         if (g_kernel_mode && device && device->is_connected())
             return true;
+
+        if (device && device->connect()) {
+            driver_loader::mark_already_loaded();
+            g_kernel_mode = true;
+            return true;
+        }
 
         driver_loader::initialize_and_load();
 

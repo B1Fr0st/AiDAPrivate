@@ -12,6 +12,7 @@
 #include <core/DeviceScan.h>
 #include <core/EvidenceRing.h>
 #include <core/DriverLoadAudit.h>
+#include <core/KernelDebugCapture.h>
 
 
 #pragma data_seg(".sntl")
@@ -665,6 +666,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     if (!SetupFunctions())
         return STATUS_UNSUCCESSFUL;
+
+    dbg_capture::initialize();
 
     SN_LOG("DriverEntry: SetupFunctions OK");
 

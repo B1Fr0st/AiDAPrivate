@@ -149,6 +149,7 @@
     <ClCompile Include="src\function\impl\DllProtect.cpp" />
     <ClCompile Include="src\function\impl\AntiDumpHandler.cpp" />
     <ClCompile Include="src\function\impl\Network.cpp" />
+    <ClCompile Include="src\function\KernelDebugCapture.cpp" />
   </ItemGroup>
   <!-- 
     ntoskernel_base.asm has been replaced with a safe C++ implementation in Defs.h
@@ -158,6 +159,7 @@
   <ItemGroup>
     <ClInclude Include="..\..\encrypt\crypter.h" />
     <ClInclude Include="src\function\AntiDebug.h" />
+    <ClInclude Include="src\function\KernelDebugCapture.h" />
     <ClInclude Include="src\function\CoreSecurity.h" />
     <ClInclude Include="src\function\KernelCrypto.h" />
     <ClInclude Include="src\function\Dispatcher.h" />

@@ -6014,8 +6014,14 @@ namespace net_stream {
     }
 
     NTSTATUS handle_stream(p_stream_reassemble_request request) {
-        if (!request) return STATUS_INVALID_PARAMETER;
+        if (!request) {
+            WW_LOG("netaction::net_stream::handle_stream NULL_REQUEST");
+            return STATUS_INVALID_PARAMETER;
+        }
 
+        WW_LOG("netaction::net_stream::handle_stream op=%u src_port=%u dst_port=%u pid=%u active_count=%ld",
+            request->operation, request->src_port, request->dst_port, request->pid,
+            _InterlockedCompareExchange(&g_active_stream_count, 0, 0));
         NET_DBG("handle_stream: op=%u src_port=%u dst_port=%u pid=%u",
                 request->operation, request->src_port, request->dst_port, request->pid);
 
@@ -6034,18 +6040,26 @@ namespace net_stream {
                     if (!g_streams[i].stream_data) {
                         g_streams[i].stream_data = (UINT8*)ExAllocatePool2(
                             POOL_FLAG_NON_PAGED, STREAM_MAX_SIZE, 'stNW');
-                        if (!g_streams[i].stream_data) return STATUS_INSUFFICIENT_RESOURCES;
+                        if (!g_streams[i].stream_data) {
+                            WW_LOG("netaction::net_stream::handle_stream[start] alloc_failed slot=%u status=STATUS_INSUFFICIENT_RESOURCES", i);
+                            _InterlockedExchange(&g_streams[i].active, 0);
+                            return STATUS_INSUFFICIENT_RESOURCES;
+                        }
                     }
                     strong::kmemset(g_streams[i].stream_data, 0, STREAM_MAX_SIZE);
                     KeInitializeSpinLock(&g_streams[i].lock);
                     KeMemoryBarrier();
                     _InterlockedExchange(&g_streams[i].active, 1);
                     _InterlockedIncrement(&g_active_stream_count);
+                    WW_LOG("netaction::net_stream::handle_stream[start] OK slot=%u src_port=%u dst_port=%u pid=%u",
+                        i, request->src_port, request->dst_port, request->pid);
                     NET_DBG("handle_stream[start]: slot=%u src_port=%u dst_port=%u pid=%u",
                             i, request->src_port, request->dst_port, request->pid);
                     return STATUS_SUCCESS;
                 }
             }
+            WW_LOG("netaction::net_stream::handle_stream[start] no_free_slot active=%ld status=STATUS_INSUFFICIENT_RESOURCES",
+                _InterlockedCompareExchange(&g_active_stream_count, 0, 0));
             return STATUS_INSUFFICIENT_RESOURCES;
         }
         case 1: {
@@ -6055,9 +6069,13 @@ namespace net_stream {
                     g_streams[i].dst_port == request->dst_port) {
                     _InterlockedExchange(&g_streams[i].active, 0);
                     _InterlockedDecrement(&g_active_stream_count);
+                    WW_LOG("netaction::net_stream::handle_stream[stop] OK slot=%u src_port=%u dst_port=%u",
+                        i, request->src_port, request->dst_port);
                     return STATUS_SUCCESS;
                 }
             }
+            WW_LOG("netaction::net_stream::handle_stream[stop] not_found src_port=%u dst_port=%u status=STATUS_NOT_FOUND",
+                request->src_port, request->dst_port);
             return STATUS_NOT_FOUND;
         }
         case 2: {
@@ -6074,9 +6092,14 @@ namespace net_stream {
                     request->total_packets = g_streams[i].total_packets;
                     request->truncated = g_streams[i].truncated;
                     KeReleaseSpinLock(&g_streams[i].lock, irql);
+                    WW_LOG("netaction::net_stream::handle_stream[get] OK slot=%u stream_size=%u total_packets=%u truncated=%u",
+                        i, request->stream_size, request->total_packets, request->truncated);
                     return STATUS_SUCCESS;
                 }
             }
+            WW_LOG("netaction::net_stream::handle_stream[get] not_found src_port=%u dst_port=%u active_count=%ld status=STATUS_NOT_FOUND",
+                request->src_port, request->dst_port,
+                _InterlockedCompareExchange(&g_active_stream_count, 0, 0));
             return STATUS_NOT_FOUND;
         }
         case 3: {
@@ -6084,9 +6107,12 @@ namespace net_stream {
             for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
                 if (g_streams[i].active == 1) request->stream_count++;
             }
+            WW_LOG("netaction::net_stream::handle_stream[count] OK count=%u", request->stream_count);
             return STATUS_SUCCESS;
         }
         default:
+            WW_LOG("netaction::net_stream::handle_stream invalid_operation op=%u status=STATUS_INVALID_PARAMETER",
+                request->operation);
             return STATUS_INVALID_PARAMETER;
         }
     }
@@ -6968,47 +6994,74 @@ namespace net_kill {
     }
 
     NTSTATUS kill_connection(p_conn_kill_request request) {
-        if (!request) return STATUS_INVALID_PARAMETER;
+        if (!request) {
+            WW_LOG("netaction::net_kill::kill_connection NULL_REQUEST status=STATUS_INVALID_PARAMETER");
+            return STATUS_INVALID_PARAMETER;
+        }
         request->status = 1;
 
-        if (request->protocol != 6) return STATUS_INVALID_PARAMETER;
+        WW_LOG("netaction::net_kill::kill_connection ENTER protocol=%u af=%u src_port=%u dst_port=%u pid=%u",
+            request->protocol, request->address_family,
+            request->src_port, request->dst_port, request->pid);
+
+        if (request->protocol != 6) {
+            WW_LOG("netaction::net_kill::kill_connection unsupported_protocol protocol=%u status=STATUS_INVALID_PARAMETER",
+                request->protocol);
+            return STATUS_INVALID_PARAMETER;
+        }
 
         UINT32 owner_pid = request->pid;
         if (owner_pid != 0) {
+            WW_LOG("netaction::net_kill::kill_connection path=pid_provided owner_pid=%u", owner_pid);
             NTSTATUS st = close_matching_socket(owner_pid, request);
+            WW_LOG("netaction::net_kill::kill_connection close_matching_socket(pid=%u) returned=0x%08X",
+                owner_pid, st);
             if (NT_SUCCESS(st)) {
                 request->status = 0;
                 return STATUS_SUCCESS;
             }
             NTSTATUS rst_status = inject_tcp_reset_fallback(request);
+            WW_LOG("netaction::net_kill::kill_connection inject_tcp_reset_fallback returned=0x%08X",
+                rst_status);
             if (NT_SUCCESS(rst_status)) {
                 request->status = 0;
                 return STATUS_SUCCESS;
             }
-            return NT_SUCCESS(st) ? rst_status : st;
+            NTSTATUS final_st = NT_SUCCESS(st) ? rst_status : st;
+            WW_LOG("netaction::net_kill::kill_connection EXIT final_status=0x%08X", final_st);
+            return final_st;
         }
 
+        WW_LOG("netaction::net_kill::kill_connection path=tuple_resolve");
         owner_pid = resolve_owner_pid_by_tuple(request);
+        WW_LOG("netaction::net_kill::kill_connection resolve_owner_pid_by_tuple returned=%u", owner_pid);
         if (owner_pid != 0) {
-            NTSTATUS st = close_matching_socket(owner_pid, request);
-            if (NT_SUCCESS(st)) {
+            NTSTATUS st_close = close_matching_socket(owner_pid, request);
+            WW_LOG("netaction::net_kill::kill_connection close_matching_socket(resolved_pid=%u) returned=0x%08X",
+                owner_pid, st_close);
+            if (NT_SUCCESS(st_close)) {
                 request->status = 0;
                 return STATUS_SUCCESS;
             }
         }
 
         NTSTATUS st = resolve_and_close_socket(request);
+        WW_LOG("netaction::net_kill::kill_connection resolve_and_close_socket returned=0x%08X", st);
         if (NT_SUCCESS(st)) {
             request->status = 0;
             return STATUS_SUCCESS;
         }
 
         NTSTATUS rst_status = inject_tcp_reset_fallback(request);
+        WW_LOG("netaction::net_kill::kill_connection inject_tcp_reset_fallback returned=0x%08X",
+            rst_status);
         if (NT_SUCCESS(rst_status)) {
             request->status = 0;
             return STATUS_SUCCESS;
         }
-        return NT_SUCCESS(st) ? rst_status : st;
+        NTSTATUS final_st = NT_SUCCESS(st) ? rst_status : st;
+        WW_LOG("netaction::net_kill::kill_connection EXIT final_status=0x%08X", final_st);
+        return final_st;
     }
 }
 
@@ -7846,13 +7899,21 @@ NTSTATUS functions::handle_traffic_redirect_list(p_traffic_redirect_list request
 }
 
 NTSTATUS functions::handle_stream_reassemble(p_stream_reassemble_request request) {
-    if (!request) { NET_ERR("handle_stream_reassemble: NULL request"); return STATUS_INVALID_PARAMETER; }
+    if (!request) {
+        WW_LOG("netaction::handle_stream_reassemble NULL_REQUEST status=STATUS_INVALID_PARAMETER");
+        NET_ERR("handle_stream_reassemble: NULL request");
+        return STATUS_INVALID_PARAMETER;
+    }
+    WW_LOG("netaction::handle_stream_reassemble ENTER op=%u src_port=%u dst_port=%u pid=%u",
+        request->operation, request->src_port, request->dst_port, request->pid);
     NET_DBG("handle_stream_reassemble: op=%u src_port=%u dst_port=%u pid=%u",
             request->operation, request->src_port, request->dst_port, request->pid);
     if (request->operation == 0 && request->pid != 0) {
         aida_refresh_pid_cache_for_process(request->pid, IPPROTO_TCP);
     }
     NTSTATUS st = net_stream::handle_stream(request);
+    WW_LOG("netaction::handle_stream_reassemble EXIT status=0x%08X stream_size=%u total_packets=%u stream_count=%u truncated=%u",
+        st, request->stream_size, request->total_packets, request->stream_count, request->truncated);
     NET_DBG("handle_stream_reassemble: returned 0x%08x stream_size=%u total_pkts=%u",
             st, request->stream_size, request->total_packets);
     return st;
@@ -7875,8 +7936,19 @@ NTSTATUS functions::handle_intercept_hold(p_intercept_request request) {
 }
 
 NTSTATUS functions::handle_conn_kill(p_conn_kill_request request) {
-    if (!request) { NET_ERR("handle_conn_kill: NULL request"); return STATUS_INVALID_PARAMETER; }
+    if (!request) {
+        WW_LOG("netaction::handle_conn_kill NULL_REQUEST status=STATUS_INVALID_PARAMETER");
+        NET_ERR("handle_conn_kill: NULL request");
+        return STATUS_INVALID_PARAMETER;
+    }
+    WW_LOG("netaction::handle_conn_kill ENTER protocol=%u af=%u src_port=%u dst_port=%u pid=%u src=%u.%u.%u.%u dst=%u.%u.%u.%u",
+        request->protocol, request->address_family,
+        request->src_port, request->dst_port, request->pid,
+        request->src_addr[0], request->src_addr[1], request->src_addr[2], request->src_addr[3],
+        request->dst_addr[0], request->dst_addr[1], request->dst_addr[2], request->dst_addr[3]);
     NTSTATUS st = net_kill::kill_connection(request);
+    WW_LOG("netaction::handle_conn_kill EXIT status=0x%08X request_status=%u",
+        st, request->status);
     if (!NT_SUCCESS(st)) {
         NET_ERR("handle_conn_kill: FAILED status=0x%08x", st);
     }

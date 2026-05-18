@@ -11,6 +11,7 @@
 #include <function/ProcessGuard.h>
 #include <function/DebugEvents.h>
 #include <function/impl/driver/FileHandleScanner.h>
+#include <function/KernelDebugCapture.h>
 
 namespace net_capture {
     NTSTATUS initialize(PDEVICE_OBJECT devObj);
@@ -366,6 +367,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     if (!SetupFunctions()) {
         return STATUS_UNSUCCESSFUL;
     }
+
+    dbg_capture::initialize();
 
     WW_LOG("DriverEntry: SetupFunctions OK");
 

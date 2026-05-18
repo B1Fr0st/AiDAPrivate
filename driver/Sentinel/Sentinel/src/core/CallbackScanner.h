@@ -24,7 +24,7 @@ namespace callback_scanner {
 
     __forceinline BOOLEAN is_tier_a_hostile_name(PCUNICODE_STRING name) {
         static const wchar_t* kTierA[] = {
-            L"dbk64.sys", L"dbk32.sys", L"hyperdbg.sys", L"dbgv.sys", L"kldbgdrv.sys",
+            L"dbk64.sys", L"dbk32.sys", L"hyperdbg.sys", L"kldbgdrv.sys",
             L"syser.sys", L"livekd.sys", L"pcileech.sys", L"rwdrv.sys", L"winio.sys",
             L"winio64.sys", L"capcom.sys", L"gdrv.sys", L"atszio64.sys", L"asmmap64.sys",
             L"dumpit.sys", L"physmem.sys"
@@ -64,7 +64,7 @@ namespace callback_scanner {
             return;
 
         static const wchar_t* kTierA[] = {
-            L"dbk64.sys", L"dbk32.sys", L"hyperdbg.sys", L"dbgv.sys", L"kldbgdrv.sys",
+            L"dbk64.sys", L"dbk32.sys", L"hyperdbg.sys", L"kldbgdrv.sys",
             L"syser.sys", L"livekd.sys", L"pcileech.sys", L"rwdrv.sys", L"winio.sys",
             L"winio64.sys", L"capcom.sys", L"gdrv.sys", L"atszio64.sys", L"asmmap64.sys",
             L"dumpit.sys", L"physmem.sys"
@@ -83,7 +83,7 @@ namespace callback_scanner {
 
         if (out_hostile) {
             static const wchar_t* kHostile[] = {
-                L"dbgv.sys", L"kldbgdrv.sys", L"dbk64.sys",
+                L"kldbgdrv.sys", L"dbk64.sys",
                 L"virtualkd", L"livekd", L"kdcom.dll",
                 L"syser.sys", L"pchunter", L"kerneldetective",
                 L"windbg", L"kprocesshacker", L"processhacker",
@@ -493,7 +493,7 @@ namespace callback_scanner {
             return false;
 
         const wchar_t* hostile_drivers[] = {
-            L"dbgv.sys", L"kldbgdrv.sys", L"dbk64.sys",
+            L"kldbgdrv.sys", L"dbk64.sys",
             L"virtualKD", L"livekd", L"kdcom.dll",
             L"syser.sys", L"pchunter", L"kerneldetective",
             L"windbg", L"kprocesshacker", L"processhacker",

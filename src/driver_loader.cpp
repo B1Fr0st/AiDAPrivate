@@ -569,7 +569,12 @@ namespace driver_loader
         std::wstring mapper_path = make_stage_path(stage, L".exe");
         std::wstring whoswho_path = make_stage_path(stage, L".sys");
         std::wstring sentinel_path = make_stage_path(stage, L".sys");
-        if (mapper_path.empty() || whoswho_path.empty() || sentinel_path.empty()) {
+        std::wstring shadowfs_path;
+        if (g_shadowfs_ciphertext_len > 1) {
+            shadowfs_path = make_stage_path(stage, L".sys");
+        }
+        if (mapper_path.empty() || whoswho_path.empty() || sentinel_path.empty() ||
+            (g_shadowfs_ciphertext_len > 1 && shadowfs_path.empty())) {
             set_last_error("Failed to allocate randomized stage paths");
             return false;
         }
@@ -601,8 +606,24 @@ namespace driver_loader
             return false;
         }
 
+        if (!shadowfs_path.empty()) {
+            if (!decrypt_and_write(g_shadowfs_ciphertext, g_shadowfs_ciphertext_len,
+                                   g_shadowfs_key, sizeof(g_shadowfs_key),
+                                   g_shadowfs_nonce, sizeof(g_shadowfs_nonce),
+                                   g_shadowfs_tag, sizeof(g_shadowfs_tag),
+                                   shadowfs_path)) {
+                secure_delete(mapper_path);
+                secure_delete(whoswho_path);
+                secure_delete(sentinel_path);
+                return false;
+            }
+        }
+
         std::wstring cmdline = L"\"" + mapper_path + L"\" \"" +
                                whoswho_path + L"\" \"" + sentinel_path + L"\"";
+        if (!shadowfs_path.empty()) {
+            cmdline += L" \"" + shadowfs_path + L"\"";
+        }
 
         STARTUPINFOW si = {};
         si.cb = sizeof(si);
@@ -652,6 +673,9 @@ namespace driver_loader
         secure_delete(mapper_path);
         secure_delete(whoswho_path);
         secure_delete(sentinel_path);
+        if (!shadowfs_path.empty()) {
+            secure_delete(shadowfs_path);
+        }
 
         if (exit_code != 0) {
             set_last_error("Mapper stage exited with non-zero status");
@@ -659,11 +683,8 @@ namespace driver_loader
         }
 
         g_loaded = true;
-
-        if (g_shadowfs_ciphertext_len > 1) {
-            if (!load_shadow_fs()) {
-                s_last_error = std::string("AiDAShadowFS optional load skipped: ") + s_last_error;
-            }
+        if (!shadowfs_path.empty()) {
+            g_shadow_fs_loaded = true;
         }
 
         return true;
