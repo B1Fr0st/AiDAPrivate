@@ -69,7 +69,6 @@ This is **not** a single product — it is a set of interlocking components that
 | `WindMapper` driver | `WindMapper.sys` | `mapper/` (separate `.sln`) | Manual-mapper. |
 | `AiDAProtector` | `aida_protector.exe` | `tools/protector/` | PE protector run as a post-build step on all three end-user binaries. |
 | License server | Node.js / Express | `server/` (PostgreSQL) | Primary license server. PM2 process `aida-api` on port 3001, deployed via `deploy_server.ps1`. |
-| Firebase functions | Cloud Functions | `firebase/` | Alternate/legacy license path; `src/license.cpp` (IDA plugin) defaults here. |
 | Discord bot | Node.js | `bot/` | Issues/revokes license keys against the server DB. **Sole distribution channel for `AiDAStandalone.exe`.** |
 
 ### Encrypted-driver embedding
@@ -261,7 +260,6 @@ IOCTL codes are **dynamic** — both UM and KM compute `((hash_build_key(key) ^ 
 ### License flow & gating
 
 - **Standalone** (`core/runtime/standalone_license.{hpp,cpp}`): HTTPS → Node server (`server/routes/license.js`). Ed25519-signed responses. On success, downloads `aida_core.dll` (ARC), watermarked with a 256-byte trailer (license HMAC, HWID hash, IP hash, integrity HMAC).
-- **IDA plugin** (`src/license.cpp`): default endpoint is the Firebase function (`https://europe-west1-aida-license-prod.cloudfunctions.net/...`, `OBFSTR`-obfuscated). Embedded Ed25519 public keys (KID 1 + KID 2) in DER hex; rotation requires updating `src/license.cpp` AND the server-side primary/next key pair before `ED25519_PRIMARY_RETIRE_AT`.
 - **Both share constraints**: mandatory online (no offline fallback, no cached-bypass), single canonical online path (no legacy/alt routes), main EXE distribution is **Discord-only** (no public download route on the server — `/api/download/*` only serves encrypted ARC blobs).
 - `state.license_pending_activation` defaults `true` so a crash inside `license::initialize` doesn't trip `enforce_violation("license_killed")` on round one. It clears to `false` only after cached validation + ARC defer + snapshot + heartbeat restart all succeed.
 
