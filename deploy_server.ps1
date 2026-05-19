@@ -26,6 +26,7 @@ $files = @(
     "routes\functions.js",
     "routes\attestation.js",
     "routes\stolen_bytes.js",
+    "routes\server_info.js",
     "crypto\signing.js",
     "crypto\arc-encrypt.js",
     "crypto\arc-license-bind.js",
@@ -40,17 +41,24 @@ $files = @(
     "crypto\session_aead.js",
     "crypto\canonical_response.js",
     "crypto\key_format.js",
+    "crypto\peer_code_hash.js",
     "middleware\hmac_auth.js",
     "middleware\rate_limit.js",
     "middleware\audit_log.js",
     "middleware\license_rate_limit.js",
     "middleware\bot_auth.js",
+    "middleware\replay_counter.js",
+    "middleware\session_ratchet.js",
+    "middleware\kill_switch.js",
     "anomaly\model.js",
     "anomaly\score.js",
     "db\pool.js",
     "db\migrate.js",
     "db\schema.sql",
-    "db\migrations\0001_auth_redesign.sql"
+    "db\migrations\0001_auth_redesign.sql",
+    "db\migrations\0002_strict_replay_ratchet.sql",
+    "db\migrations\0003_peer_attestation_ratchet.sql",
+    "db\migrations\0004_oracle_audit_killswitch.sql"
 )
 $remoteDirs = @("routes", "crypto", "middleware", "anomaly", "db", "db/migrations") | ForEach-Object { "$DST$_" }
 $mkdirCmd = "mkdir -p " + ($remoteDirs -join " ")

@@ -11,8 +11,11 @@ CREATE TABLE IF NOT EXISTS kill_switch (
 );
 
 CREATE INDEX IF NOT EXISTS idx_kill_switch_target
-    ON kill_switch (target_type, target_value)
-    WHERE expires_at IS NULL OR expires_at > NOW();
+    ON kill_switch (target_type, target_value);
+
+CREATE INDEX IF NOT EXISTS idx_kill_switch_expires
+    ON kill_switch (expires_at)
+    WHERE expires_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS audit_log_v2 (
     id               BIGSERIAL    PRIMARY KEY,
