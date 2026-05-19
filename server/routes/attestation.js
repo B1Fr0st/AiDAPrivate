@@ -4,6 +4,7 @@ const express = require('express');
 const crypto = require('crypto');
 const pool = require('../db/pool');
 const { signPayload } = require('../crypto/signing');
+const canonicalResponse = require('../crypto/canonical_response');
 
 const router = express.Router();
 
@@ -156,13 +157,13 @@ router.post('/nonce', async (req, res) => {
             [nonce, license_key, issuedAt, expiresAt]
         );
 
-        return res.json({
+        return res.json(canonicalResponse.buildEnvelope({
             status: 'ok',
             nonce,
             expires_at: expiresAt,
             ttl: NONCE_TTL_SECONDS,
             label: ATTESTATION_HMAC_LABEL,
-        });
+        }));
     } catch (err) {
         return res.status(500).json({ status: 'error', reason: 'internal_error' });
     }
@@ -316,11 +317,10 @@ router.post('/verify', async (req, res) => {
             anomaly_count: state.anomaly_count,
             tpm_quote_accepted: tpmQuoteAccepted,
             digest: expectedDigest,
+            hmac: hmacAttest(`${license_key}|${nonce}|${code_hash}|${expectedDigest}`),
         };
-        responsePayload.signature = signPayload(responsePayload) || '';
-        responsePayload.hmac = hmacAttest(`${license_key}|${nonce}|${code_hash}|${expectedDigest}`);
 
-        return res.json(responsePayload);
+        return res.json(canonicalResponse.buildEnvelope(responsePayload));
     } catch (err) {
         return res.status(500).json({ status: 'error', reason: 'internal_error' });
     }
@@ -347,11 +347,11 @@ router.post('/anti-rollback/check', async (req, res) => {
                 observed: counterInt,
             });
         }
-        return res.json({
+        return res.json(canonicalResponse.buildEnvelope({
             status: 'ok',
             counter_max: stored,
             advanced: counterInt > stored,
-        });
+        }));
     } catch (_e) {
         return res.status(500).json({ status: 'error', reason: 'internal_error' });
     }
@@ -365,7 +365,7 @@ router.get('/state/:license_key', async (req, res) => {
         }
         const row = await getStateRow(licenseKey);
         if (!row) return res.status(404).json({ status: 'error', reason: 'not_found' });
-        return res.json({
+        return res.json(canonicalResponse.buildEnvelope({
             status: 'ok',
             license_key: licenseKey,
             counter_max: row.counter_max,
@@ -374,7 +374,7 @@ router.get('/state/:license_key', async (req, res) => {
             anomaly_count: row.anomaly_count,
             history: pruneHistoryArray(row.history),
             updated_at: row.updated_at,
-        });
+        }));
     } catch (_e) {
         return res.status(500).json({ status: 'error', reason: 'internal_error' });
     }

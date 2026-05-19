@@ -44,7 +44,9 @@ const sentinelRoutes = require('./routes/sentinel');
 const telemetryRoutes = require('./routes/telemetry');
 const stolenBytesRoutes = require('./routes/stolen_bytes');
 const attestationRoutes = require('./routes/attestation');
+const serverInfoRoutes = require('./routes/server_info');
 const tlsExporter = require('./crypto/tls_exporter');
+const killSwitch = require('./middleware/kill_switch');
 
 if (process.env.NODE_APP_INSTANCE && parseInt(process.env.NODE_APP_INSTANCE, 10) > 0) {
     console.error('[server] FATAL: server must run as a single PM2 instance (NODE_APP_INSTANCE=' + process.env.NODE_APP_INSTANCE + '); in-process rotation state breaks under cluster mode.');
@@ -53,8 +55,14 @@ if (process.env.NODE_APP_INSTANCE && parseInt(process.env.NODE_APP_INSTANCE, 10)
 
 const app = express();
 
+app.disable('x-powered-by');
 
-app.set('trust proxy', 1);
+app.set('trust proxy', (ip) => {
+    if (typeof ip !== 'string' || ip.length === 0) return false;
+    if (ip === '127.0.0.1' || ip === '::1') return true;
+    if (ip === '::ffff:127.0.0.1') return true;
+    return false;
+});
 app.use(helmet());
 
 const corsOriginEnv = (process.env.CORS_ORIGIN || 'https://aidapro.net').trim();
@@ -112,6 +120,12 @@ const downloadLimiter = rateLimit({
 
 app.use('/api/', limiter);
 app.use('/api/download/', downloadLimiter);
+
+app.use('/api/license', killSwitch.middleware);
+app.use('/api/download', killSwitch.middleware);
+app.use('/api/arc', killSwitch.middleware);
+app.use('/validateLicense', killSwitch.middleware);
+
 app.use('/api/', tlsExporter.middleware);
 app.use('/validateLicense', tlsExporter.middleware);
 
@@ -145,6 +159,7 @@ app.use('/api/sentinel', sentinelRoutes);
 app.use('/api/telemetry', telemetryRoutes);
 app.use('/api/stolen_bytes', stolenBytesRoutes);
 app.use('/api/attestation', attestationRoutes);
+app.use('/api/server_info', serverInfoRoutes);
 
 
 app.use('/api/download', downloadRoutes);

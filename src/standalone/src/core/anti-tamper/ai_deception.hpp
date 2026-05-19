@@ -81,7 +81,7 @@ namespace phase {
         if (nt.Signature != IMAGE_NT_SIGNATURE) { return 0u; }
 
         const uint32_t kAuxMagic   = 0x4D585541u;
-        const uint32_t kAuxVersion = 0x00020000u;
+        const uint32_t kAuxVersion = 0x00030000u;
         const size_t   kPhaseOff   = 120;
         const size_t   kAuxSize    = 176;
 

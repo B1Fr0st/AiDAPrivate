@@ -407,4 +407,65 @@ ALTER TABLE licenses ADD COLUMN IF NOT EXISTS discord_id_linked_at BIGINT NOT NU
 CREATE INDEX IF NOT EXISTS idx_licenses_discord_id ON licenses (discord_id) WHERE discord_id != '';
 CREATE INDEX IF NOT EXISTS idx_licenses_expires_epoch ON licenses (expires_epoch) WHERE expires_epoch > 0;
 
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS hwid_factors   JSONB    NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS key_format     SMALLINT NOT NULL DEFAULT 1;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS hwid_grace_used_at BIGINT NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS idx_licenses_key_format ON licenses (key_format);
+
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS bind_contribution        BYTEA;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS bind_response_hash       TEXT  NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_key_fingerprint  TEXT  NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS sentinel_bind_token_hash TEXT  NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS sentinel_bind_consumed   BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS sentinel_bind_issued_at  BIGINT NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS license_request_rate (
+    license_key     TEXT     NOT NULL,
+    window_kind     TEXT     NOT NULL CHECK (window_kind IN ('minute','hour','day')),
+    window_start    BIGINT   NOT NULL,
+    count           INTEGER  NOT NULL DEFAULT 0,
+    PRIMARY KEY (license_key, window_kind, window_start)
+);
+
+CREATE INDEX IF NOT EXISTS idx_license_request_rate_ws ON license_request_rate (window_kind, window_start);
+
+CREATE TABLE IF NOT EXISTS bot_command_log (
+    nonce_hex       TEXT     PRIMARY KEY,
+    action          TEXT     NOT NULL,
+    discord_id      TEXT     NOT NULL DEFAULT '',
+    received_at     BIGINT   NOT NULL,
+    payload         JSONB    NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_bot_command_log_received ON bot_command_log (received_at DESC);
+
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_req_seq      BIGINT  NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS tool_call_counter BIGINT  NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS force_violation   BOOLEAN NOT NULL DEFAULT false;
+
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS license_key_format SMALLINT NOT NULL DEFAULT 1;
+
+CREATE INDEX IF NOT EXISTS idx_licenses_key_format2 ON licenses (license_key_format);
+
+CREATE TABLE IF NOT EXISTS session_audit_recent (
+    license_key   TEXT     NOT NULL,
+    session_token TEXT     NOT NULL,
+    event_kind    TEXT     NOT NULL,
+    occurred_at   BIGINT   NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_audit_recent_ses ON session_audit_recent (session_token, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_session_audit_recent_lic ON session_audit_recent (license_key, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_session_audit_recent_kind ON session_audit_recent (event_kind, occurred_at DESC);
+
+CREATE TABLE IF NOT EXISTS bot_user_issuance (
+    discord_id    TEXT     NOT NULL,
+    issued_at     BIGINT   NOT NULL,
+    license_key   TEXT     NOT NULL DEFAULT '',
+    action        TEXT     NOT NULL DEFAULT 'create'
+);
+
+CREATE INDEX IF NOT EXISTS idx_bot_user_issuance_did ON bot_user_issuance (discord_id, issued_at DESC);
+
 COMMIT;

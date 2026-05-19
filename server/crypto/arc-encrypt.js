@@ -185,6 +185,22 @@ function splitIntoPages(blob) {
     return pages;
 }
 
+function deriveWatermarkStreamKey(licenseKey, timestamp) {
+    const masterSecret = process.env.ARC_MASTER_SECRET;
+    if (!masterSecret || masterSecret.length < 32) {
+        throw new Error('ARC_MASTER_SECRET must be at least 32 characters');
+    }
+    const tsNum = Number.isFinite(timestamp) ? Math.floor(timestamp) : 0;
+    return crypto.createHash('sha256')
+        .update('watermark-stream|', 'utf8')
+        .update(String(licenseKey || ''), 'utf8')
+        .update('|', 'utf8')
+        .update(String(tsNum), 'utf8')
+        .update('|', 'utf8')
+        .update(masterSecret, 'utf8')
+        .digest();
+}
+
 module.exports = {
     deriveKeySeed,
     deriveKeySeedFull,
@@ -198,5 +214,6 @@ module.exports = {
     encryptPage,
     encryptPageFull,
     splitIntoPages,
+    deriveWatermarkStreamKey,
     CODE_PAGE_SIZE,
 };

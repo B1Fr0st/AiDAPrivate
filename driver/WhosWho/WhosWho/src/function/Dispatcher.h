@@ -13,6 +13,7 @@
 #include <function/DebugEvents.h>
 #include <function/MalwareSafe.h>
 #include <hv_detect/hv_detect.h>
+#include <core/HardwareId.h>
 
 __forceinline ULONG hash_build_key(ULONG key) {
     key ^= key >> 16;
@@ -458,6 +459,15 @@ namespace dispatcher {
             irp->IoStatus.Information = 0;
             _IofCompleteRequest(irp, IO_NO_INCREMENT);
             return STATUS_INVALID_PARAMETER;
+        }
+
+        if (code == IOCTL_AIDA_GET_HWID) {
+            NTSTATUS hwid_status = HardwareIdHandleIoctl(irp, stack);
+            ULONG hwid_bytes = static_cast<ULONG>(irp->IoStatus.Information);
+            irp->IoStatus.Status = hwid_status;
+            irp->IoStatus.Information = hwid_bytes;
+            _IofCompleteRequest(irp, IO_NO_INCREMENT);
+            return hwid_status;
         }
 
         if (code != ioctl_codes::HB() && secure_comm::g_comm_initialized != 0) {

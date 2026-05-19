@@ -101,6 +101,7 @@ inline probe_result_t probe_p03(const context_t& c) {
         if (std::strcmp(nm, ".gehi") == 0 || std::strcmp(nm, ".epheme") == 0 || std::strcmp(nm, ".rdiag") == 0) { continue; }
         if (std::strcmp(nm, ".dseal") == 0 || std::strcmp(nm, ".dthunk") == 0) { continue; }
         if (std::strcmp(nm, ".licbind") == 0 || std::strcmp(nm, ".feat") == 0) { continue; }
+        if (std::strcmp(nm, ".aidashr") == 0) { continue; }
         if (s.raw_size != 0u) { ++nonzero; }
     }
     return { "P03", "original sections zeroed (raw_size==0)", nonzero == 0,

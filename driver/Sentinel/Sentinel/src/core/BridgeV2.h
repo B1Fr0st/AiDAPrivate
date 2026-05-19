@@ -20,6 +20,9 @@ namespace bridge_v2
         volatile UINT64  sentinel_challenge_enc;
         volatile UINT64  whoswho_response;
         volatile UINT64  challenge_issued_tsc;
+        volatile UINT8   peer_code_hash[32];
+        volatile UINT64  peer_code_hash_tsc;
+        volatile UINT32  peer_code_hash_valid;
         volatile UINT8   mac[32];
     };
 
@@ -68,6 +71,27 @@ namespace bridge_v2
         g_bridge_v2->sentinel_tsc = __rdtsc();
         g_bridge_v2->sentinel_cmd_enc = cmd;
         g_bridge_v2->sentinel_cmd_param_enc = param;
+
+        compute_mac(g_bridge_v2, g_bridge_key, const_cast<UINT8*>(g_bridge_v2->mac));
+
+        KeReleaseSpinLock(&g_bridge_lock, old_irql);
+        return TRUE;
+    }
+
+    __forceinline BOOLEAN publish_peer_code_hash(const UINT8 hash[32])
+    {
+        if (!g_bridge_v2 || !hash) return FALSE;
+
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_bridge_lock, &old_irql);
+
+        for (ULONG i = 0; i < 32; ++i) {
+            const_cast<UINT8*>(g_bridge_v2->peer_code_hash)[i] = hash[i];
+        }
+        g_bridge_v2->peer_code_hash_tsc = __rdtsc();
+        g_bridge_v2->peer_code_hash_valid = 1;
+        g_bridge_v2->counter++;
+        g_bridge_v2->sentinel_tsc = __rdtsc();
 
         compute_mac(g_bridge_v2, g_bridge_key, const_cast<UINT8*>(g_bridge_v2->mac));
 

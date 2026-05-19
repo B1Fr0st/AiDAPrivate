@@ -1,4 +1,5 @@
 ﻿#include "arc.h"
+#include "../runtime/reason_ids.hpp"
 #include "comm.h"
 
 #include <windows.h>
@@ -877,10 +878,6 @@ alignas(64) uint8_t  g_key_seed[32] = {};
 bool g_key_seed_valid = false;
 std::mutex g_key_seed_mtx;
 
-std::mutex g_chain_tag_mtx;
-char       g_chain_tag_hex[65] = {};
-bool       g_chain_tag_valid = false;
-
 void encrypt_session_blob(session_data_t* plain, encrypted_session_t* enc)
 {
     static_assert(sizeof(session_data_t) <= sizeof(enc->blob), "session too large");
@@ -1217,6 +1214,15 @@ voyager::device_t* get_device_enc(uint64_t crypt_key)
     uint64_t enc = g_device_enc;
     if (enc == 0) return nullptr;
     return reinterpret_cast<voyager::device_t*>(enc ^ crypt_key ^ _rotl64(crypt_key, 17) ^ _rotr64(crypt_key, 11));
+}
+
+__declspec(noreturn) __forceinline void enforce_violation(const char* reason, const char* extra);
+
+__declspec(noreturn) __forceinline void enforce_violation_id(uint64_t reason_id, const char* extra)
+{
+    char buf[20] = {};
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "rid:%016llx", static_cast<unsigned long long>(reason_id));
+    enforce_violation(buf, extra);
 }
 
 __declspec(noreturn) __forceinline void enforce_violation(const char* reason, const char* extra)
@@ -2164,7 +2170,7 @@ bool is_session_valid()
 bool vtable_connect(uint64_t)
 {
     if (!is_session_valid()) return false;
-    if (check_debugger()) { enforce_violation("arc_debugger", "vtable_connect"); }
+    if (check_debugger()) { enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "vtable_connect"); }
     auto* dev = get_device_enc(g_vtable_crypt_key);
     if (!dev) return false;
     return dev->connect();
@@ -2238,8 +2244,8 @@ void vtable_clear_process_context()
 size_t vtable_read_raw(uint64_t address, void* buffer, size_t size)
 {
     if (!is_session_valid()) return 0;
-    if (check_debugger()) { enforce_violation("arc_debugger", "vtable_read"); }
-    if (!verify_vtable()) { enforce_violation("arc_vtable_tampered", "read"); }
+    if (check_debugger()) { enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "vtable_read"); }
+    if (!verify_vtable()) { enforce_violation_id(aida::reason_ids::reason_id_arc_vtable_tampered, "read"); }
     if (!buffer || size == 0) return 0;
     auto* dev = get_device_enc(g_vtable_crypt_key);
     if (!dev) return 0;
@@ -2249,8 +2255,8 @@ size_t vtable_read_raw(uint64_t address, void* buffer, size_t size)
 size_t vtable_write_raw(uint64_t address, const void* buffer, size_t size)
 {
     if (!is_session_valid()) return 0;
-    if (check_debugger()) { enforce_violation("arc_debugger", "vtable_write"); }
-    if (!verify_vtable()) { enforce_violation("arc_vtable_tampered", "write"); }
+    if (check_debugger()) { enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "vtable_write"); }
+    if (!verify_vtable()) { enforce_violation_id(aida::reason_ids::reason_id_arc_vtable_tampered, "write"); }
     if (!buffer || size == 0) return 0;
     auto* dev = get_device_enc(g_vtable_crypt_key);
     if (!dev) return 0;
@@ -2320,8 +2326,8 @@ uint64_t vtable_remote_call(
     uint64_t arg3, uint64_t arg4)
 {
     if (!is_session_valid()) return 0;
-    if (check_debugger()) { enforce_violation("arc_debugger", "vtable_remote_call"); }
-    if (!verify_vtable()) { enforce_violation("arc_vtable_tampered", "remote_call"); }
+    if (check_debugger()) { enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "vtable_remote_call"); }
+    if (!verify_vtable()) { enforce_violation_id(aida::reason_ids::reason_id_arc_vtable_tampered, "remote_call"); }
     auto* dev = get_device_enc(g_vtable_crypt_key);
     if (!dev) return 0;
     return dev->call_function(function_address, arg1, arg2, arg3, arg4);
@@ -2545,7 +2551,7 @@ ARC_API bool arc_init(
     arc_log("init", "arc_init_step2_check_debugger");
     if (check_debugger())
     {
-        enforce_violation("arc_debugger", "arc_init");
+        enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "arc_init");
     }
 
     arc_log("init", "arc_init_step3_hwid_recompute");
@@ -2565,7 +2571,7 @@ ARC_API bool arc_init(
         }
         if (local_hash != provided_hash)
         {
-            enforce_violation("arc_hwid_mismatch", "");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_hwid_mismatch, "");
         }
     }
 
@@ -2608,7 +2614,7 @@ ARC_API bool arc_init(
         if (!load_bind_secret())
         {
             arc_log("init", "arc_init_load_bind_secret_FAILED");
-            enforce_violation("arc_no_bind_secret", "");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_no_bind_secret, "");
         }
 
         std::string msg;
@@ -2634,7 +2640,7 @@ ARC_API bool arc_init(
         {
             SecureZeroMemory(expected, sizeof(expected));
             arc_log("init", "arc_init_bind_proof_hmac_compute_FAILED");
-            enforce_violation("arc_bind_proof_hmac_failed", "");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_bind_proof_hmac_failed, "");
         }
 
         if (memcmp(expected, bind_proof, 32) != 0)
@@ -2648,7 +2654,7 @@ ARC_API bool arc_init(
                 bind_proof[4], bind_proof[5], bind_proof[6], bind_proof[7]);
             arc_log("init", dbg);
             SecureZeroMemory(expected, sizeof(expected));
-            enforce_violation("arc_bind_proof_mismatch", "");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_bind_proof_mismatch, "");
         }
 
         SecureZeroMemory(expected, sizeof(expected));
@@ -2712,19 +2718,19 @@ ARC_API bool arc_init(
         if (!dev)
         {
             arc_log("init", "arc_init_get_device_enc_returned_null");
-            enforce_violation("arc_no_device", "init");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_no_device, "init");
         }
 
         if (!dev->is_connected())
         {
             arc_log("init", "arc_init_device_disconnected");
-            enforce_violation("arc_no_driver", "device_disconnected");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_no_driver, "device_disconnected");
         }
 
         if (!dev->refresh_heartbeat())
         {
             arc_log("driver", "heartbeat_failed");
-            enforce_violation("arc_no_driver", "heartbeat_failed");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_no_driver, "heartbeat_failed");
         }
 
         {
@@ -2741,15 +2747,15 @@ ARC_API bool arc_init(
                         "sentinel_bridge_down waited_ms=%lu",
                         static_cast<unsigned long>(waited_ms));
                     arc_log("driver", to_buf);
-                    enforce_violation("arc_no_driver", "sentinel_bridge_down");
+                    enforce_violation_id(aida::reason_ids::reason_id_arc_no_driver, "sentinel_bridge_down");
                 }
                 if (check_debugger())
                 {
-                    enforce_violation("arc_debugger", "sentinel_bridge_wait");
+                    enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "sentinel_bridge_wait");
                 }
                 if (!dev->is_connected())
                 {
-                    enforce_violation("arc_no_driver", "device_disconnected_during_wait");
+                    enforce_violation_id(aida::reason_ids::reason_id_arc_no_driver, "device_disconnected_during_wait");
                 }
                 Sleep(kBridgePollIntervalMs);
                 waited_ms += kBridgePollIntervalMs;
@@ -2765,7 +2771,7 @@ ARC_API bool arc_init(
                 if (!dev->refresh_heartbeat())
                 {
                     arc_log("driver", "heartbeat_failed_during_bridge_wait");
-                    enforce_violation("arc_no_driver", "heartbeat_failed");
+                    enforce_violation_id(aida::reason_ids::reason_id_arc_no_driver, "heartbeat_failed");
                 }
             }
             if (waited_ms > 0)
@@ -2784,7 +2790,7 @@ ARC_API bool arc_init(
         if (!dev->tier_a_driver_present_query(tier_a_present, &tier_a_mask, &tier_a_first_base))
         {
             arc_log("driver", "tier_a_query_failed");
-            enforce_violation("arc_no_driver", "tier_a_query_failed");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_no_driver, "tier_a_query_failed");
         }
 
         if (tier_a_present)
@@ -2794,7 +2800,7 @@ ARC_API bool arc_init(
                 "tier_a_present mask=0x%08X first_base=0x%016llX",
                 tier_a_mask, static_cast<unsigned long long>(tier_a_first_base));
             arc_log("driver", detail);
-            enforce_violation("arc_hostile_driver", "tier_a_present");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_hostile_driver, "tier_a_present");
         }
 
         MEMORY_BASIC_INFORMATION mbi_self = {};
@@ -2911,77 +2917,106 @@ ARC_API uint64_t arc_validate_tool_exec(
     uint64_t tool_name_hash,
     uint64_t gate_token)
 {
+    (void)tool_name_hash;
+    (void)gate_token;
+    return 0xDEADBEEFCAFEBABEULL;
+}
+
+ARC_API uint64_t arc_validate_tool_exec_v2(
+    uint64_t caller_nonce,
+    uint64_t tool_name_hash,
+    uint64_t hb_counter)
+{
     using namespace arc_internal;
     uint64_t out = 0;
 
-    CFF_BEGIN(validate_cff)
-    CFF_STATE(validate_cff, 0)
+    CFF_BEGIN(validate_v2_cff)
+    CFF_STATE(validate_v2_cff, 0)
     {
-        if (tool_name_hash == 0 || gate_token == 0)
+        if (tool_name_hash == 0 || caller_nonce == 0)
         {
-            CFF_EXIT(validate_cff);
+            CFF_EXIT(validate_v2_cff);
         }
-        CFF_GOTO(validate_cff, 1);
+        CFF_GOTO(validate_v2_cff, 1);
     }
-    CFF_STATE(validate_cff, 1)
+    CFF_STATE(validate_v2_cff, 1)
     {
         if (!is_session_valid())
         {
-            CFF_EXIT(validate_cff);
+            CFF_EXIT(validate_v2_cff);
         }
-        CFF_GOTO(validate_cff, 2);
+        CFF_GOTO(validate_v2_cff, 2);
     }
-    CFF_STATE(validate_cff, 2)
+    CFF_STATE(validate_v2_cff, 2)
     {
         if (check_debugger())
         {
-            enforce_violation("arc_debugger", "validate_tool");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "validate_tool_v2");
         }
-        CFF_GOTO(validate_cff, 3);
+        CFF_GOTO(validate_v2_cff, 3);
     }
-    CFF_STATE(validate_cff, 3)
+    CFF_STATE(validate_v2_cff, 3)
     {
         if (!load_bind_secret())
         {
-            enforce_violation("arc_no_bind_secret", "validate_tool");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_no_bind_secret, "validate_tool_v2");
         }
 
-        std::lock_guard<std::mutex> lk(g_session_mtx);
         session_data_t sess = {};
-        if (!load_session(sess))
         {
-            CFF_EXIT(validate_cff);
+            std::lock_guard<std::mutex> lk(g_session_mtx);
+            if (!load_session(sess))
+            {
+                CFF_EXIT(validate_v2_cff);
+            }
         }
 
-        uint8_t buf[40];
-        memcpy(buf, &tool_name_hash, 8);
-        memcpy(buf + 8, &gate_token, 8);
-        memcpy(buf + 16, &sess.session_hash, 8);
-        uint64_t tick = static_cast<uint64_t>(GetTickCount64());
-        memcpy(buf + 24, &tick, 8);
-        memcpy(buf + 32, &sess.vtable_crypt_key, 8);
-
-        uint8_t mac[32] = {};
         uint8_t local_secret[32] = {};
         {
             std::lock_guard<std::mutex> bs_lk(g_bind_secret_mtx);
             bind_secret_obf_load_unlocked(local_secret);
         }
-        const bool hmac_ok = hmac_sha256_full(local_secret, 32, buf, sizeof(buf), mac);
+
+        uint64_t session_hash_le = sess.session_hash;
+        uint8_t salt_bytes[8] = {};
+        memcpy(salt_bytes, &session_hash_le, sizeof(session_hash_le));
+
+        const char info_label[] = "aida-arc-tool-call|v1";
+        uint8_t call_key[32] = {};
+        const bool kdf_ok = hkdf_sha256(
+            local_secret, 32,
+            salt_bytes, sizeof(salt_bytes),
+            reinterpret_cast<const uint8_t*>(info_label),
+            static_cast<uint32_t>(sizeof(info_label) - 1),
+            call_key, 32);
         SecureZeroMemory(local_secret, sizeof(local_secret));
+        if (!kdf_ok)
+        {
+            SecureZeroMemory(call_key, sizeof(call_key));
+            SecureZeroMemory(&sess, sizeof(sess));
+            CFF_EXIT(validate_v2_cff);
+        }
+
+        uint8_t msg[24] = {};
+        memcpy(msg + 0,  &caller_nonce, 8);
+        memcpy(msg + 8,  &tool_name_hash, 8);
+        memcpy(msg + 16, &hb_counter, 8);
+
+        uint8_t mac[32] = {};
+        const bool hmac_ok = hmac_sha256_full(call_key, 32, msg, sizeof(msg), mac);
+        SecureZeroMemory(call_key, sizeof(call_key));
+        SecureZeroMemory(msg, sizeof(msg));
+        SecureZeroMemory(&sess, sizeof(sess));
         if (!hmac_ok)
         {
             SecureZeroMemory(mac, sizeof(mac));
-            SecureZeroMemory(&sess, sizeof(sess));
-            CFF_EXIT(validate_cff);
+            CFF_EXIT(validate_v2_cff);
         }
         memcpy(&out, mac, 8);
         SecureZeroMemory(mac, sizeof(mac));
-
-        SecureZeroMemory(&sess, sizeof(sess));
-        CFF_EXIT(validate_cff);
+        CFF_EXIT(validate_v2_cff);
     }
-    CFF_END(validate_cff)
+    CFF_END(validate_v2_cff)
 
     return out;
 }
@@ -3043,12 +3078,12 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
                 current_scan.guarded_exec_regions,
                 current_scan.read_failures);
             SecureZeroMemory(&sess, sizeof(sess));
-            enforce_violation("arc_code_hash_mismatch", detail);
+            enforce_violation_id(aida::reason_ids::reason_id_arc_code_hash_mismatch, detail);
         }
         if (!verify_self_integrity())
         {
             SecureZeroMemory(&sess, sizeof(sess));
-            enforce_violation("arc_self_hash_mismatch", "");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_self_hash_mismatch, "");
         }
         SecureZeroMemory(&sess, sizeof(sess));
         CFF_GOTO(hb_cff, 2);
@@ -3057,7 +3092,7 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
     {
         if (check_debugger())
         {
-            enforce_violation("arc_debugger", "heartbeat");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "heartbeat");
         }
         CFF_GOTO(hb_cff, 3);
     }
@@ -3079,7 +3114,7 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
                 static_cast<unsigned long long>(current_qpc),
                 static_cast<unsigned long long>(sess.last_heartbeat_tsc));
             SecureZeroMemory(&sess, sizeof(sess));
-            enforce_violation("arc_qpc_rollback", detail);
+            enforce_violation_id(aida::reason_ids::reason_id_arc_qpc_rollback, detail);
         }
         {
             char dbg[96];
@@ -3095,7 +3130,7 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
         if (!load_bind_secret())
         {
             SecureZeroMemory(&sess, sizeof(sess));
-            enforce_violation("arc_no_bind_secret", "heartbeat");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_no_bind_secret, "heartbeat");
         }
 
         char sess_fnv[17];
@@ -3127,7 +3162,7 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
         {
             SecureZeroMemory(mac, sizeof(mac));
             SecureZeroMemory(&sess, sizeof(sess));
-            enforce_violation("arc_heartbeat_hmac_failed", "");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_heartbeat_hmac_failed, "");
         }
 
         uint64_t proof_be = 0;
@@ -3215,12 +3250,12 @@ ARC_API arc_heartbeat_result_t arc_heartbeat_ex(uint64_t hb_count, const char* c
                 current_scan.guarded_exec_regions,
                 current_scan.read_failures);
             SecureZeroMemory(&sess, sizeof(sess));
-            enforce_violation("arc_code_hash_mismatch", detail);
+            enforce_violation_id(aida::reason_ids::reason_id_arc_code_hash_mismatch, detail);
         }
         if (!verify_self_integrity())
         {
             SecureZeroMemory(&sess, sizeof(sess));
-            enforce_violation("arc_self_hash_mismatch", "");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_self_hash_mismatch, "");
         }
         SecureZeroMemory(&sess, sizeof(sess));
         CFF_GOTO(hbex_cff, 2);
@@ -3229,7 +3264,7 @@ ARC_API arc_heartbeat_result_t arc_heartbeat_ex(uint64_t hb_count, const char* c
     {
         if (check_debugger())
         {
-            enforce_violation("arc_debugger", "heartbeat_ex");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "heartbeat_ex");
         }
         CFF_GOTO(hbex_cff, 3);
     }
@@ -3252,7 +3287,7 @@ ARC_API arc_heartbeat_result_t arc_heartbeat_ex(uint64_t hb_count, const char* c
                 static_cast<unsigned long long>(current_qpc),
                 static_cast<unsigned long long>(sess.last_heartbeat_tsc));
             SecureZeroMemory(&sess, sizeof(sess));
-            enforce_violation("arc_qpc_rollback", detail);
+            enforce_violation_id(aida::reason_ids::reason_id_arc_qpc_rollback, detail);
         }
         sess.last_heartbeat_tsc = current_qpc;
         sess.heartbeat_counter++;
@@ -3260,7 +3295,7 @@ ARC_API arc_heartbeat_result_t arc_heartbeat_ex(uint64_t hb_count, const char* c
         if (!load_bind_secret())
         {
             SecureZeroMemory(&sess, sizeof(sess));
-            enforce_violation("arc_no_bind_secret", "heartbeat_ex");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_no_bind_secret, "heartbeat_ex");
         }
 
         char sess_fnv[17];
@@ -3304,7 +3339,7 @@ ARC_API arc_heartbeat_result_t arc_heartbeat_ex(uint64_t hb_count, const char* c
         {
             SecureZeroMemory(mac, sizeof(mac));
             SecureZeroMemory(&sess, sizeof(sess));
-            enforce_violation("arc_heartbeat_hmac_failed", "ex");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_heartbeat_hmac_failed, "ex");
         }
 
         uint64_t proof_be = 0;
@@ -3335,488 +3370,83 @@ ARC_API arc_heartbeat_result_t arc_heartbeat_ex(uint64_t hb_count, const char* c
 
 }
 
-namespace {
-    static constexpr uint32_t ARC_PAGE_SIZE = 4096;
-
-    std::string json_get_string(const std::string& json, const char* key)
-    {
-        std::string needle = std::string("\"") + key + "\"";
-        auto pos = json.find(needle);
-        if (pos == std::string::npos) return "";
-        pos = json.find(':', pos + needle.size());
-        if (pos == std::string::npos) return "";
-        pos = json.find('"', pos + 1);
-        if (pos == std::string::npos) return "";
-        auto end = json.find('"', pos + 1);
-        if (end == std::string::npos) return "";
-        return json.substr(pos + 1, end - pos - 1);
-    }
-
-    int64_t json_get_int(const std::string& json, const char* key)
-    {
-        std::string needle = std::string("\"") + key + "\"";
-        auto pos = json.find(needle);
-        if (pos == std::string::npos) return -1;
-        pos = json.find(':', pos + needle.size());
-        if (pos == std::string::npos) return -1;
-        while (pos < json.size() && (json[pos] == ':' || json[pos] == ' ')) ++pos;
-        return std::strtoll(json.c_str() + pos, nullptr, 10);
-    }
-
-    std::string build_session_json()
-    {
-        using namespace arc_internal;
-        std::lock_guard<std::mutex> lk(g_session_mtx);
-        session_data_t sess = {};
-        if (!load_session(sess)) return "{}";
-        auto k1 = OBFSTR("license_key");
-        auto k2 = OBFSTR("session_token");
-        auto k3 = OBFSTR("hwid");
-        std::string r = "{\"";
-        r += k1; r += "\":\""; r += sess.license_key;
-        r += "\",\""; r += k2; r += "\":\""; r += sess.session_token;
-        r += "\",\""; r += k3; r += "\":\""; r += sess.hwid;
-        r += "\"}";
-        SecureZeroMemory(&sess, sizeof(sess));
-        return r;
-    }
-
-    bool hex_to_bytes(const std::string& hex, uint8_t* out, size_t max_len)
-    {
-        if (hex.size() / 2 > max_len) return false;
-        for (size_t i = 0; i + 1 < hex.size(); i += 2) {
-            char h[3] = { hex[i], hex[i + 1], 0 };
-            out[i / 2] = static_cast<uint8_t>(strtoul(h, nullptr, 16));
-        }
-        return true;
-    }
-
-    static const uint8_t b64_table[] = {
-        255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
-        255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
-        255,255,255,255,255,255,255,255,255,255,255, 62,255,255,255, 63,
-         52, 53, 54, 55, 56, 57, 58, 59, 60, 61,255,255,255,  0,255,255,
-        255,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14,
-         15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,255,255,255,255,255,
-        255, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
-         41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,255,255,255,255,255
-    };
-
-    bool base64_decode(const std::string& in, std::vector<uint8_t>& out)
-    {
-        out.clear();
-        if (in.empty()) return false;
-        out.reserve((in.size() * 3) / 4);
-        uint32_t accum = 0;
-        int bits = 0;
-        for (char c : in)
-        {
-            if (c == '=' || c == '\n' || c == '\r') continue;
-            uint8_t idx = static_cast<uint8_t>(c);
-            if (idx >= 128) return false;
-            uint8_t val = b64_table[idx];
-            if (val == 255) return false;
-            accum = (accum << 6) | val;
-            bits += 6;
-            if (bits >= 8)
-            {
-                bits -= 8;
-                out.push_back(static_cast<uint8_t>((accum >> bits) & 0xFF));
-            }
-        }
-        return true;
-    }
-
-    std::string compute_bootstrap_proof_token(const char* session_token)
-    {
-        using namespace arc_internal;
-        if (!session_token || session_token[0] == '\0') return std::string();
-        std::string seed(session_token);
-        seed.append("bootstrap");
-        uint8_t digest[32] = {};
-        bool ok = sha256_block(reinterpret_cast<const uint8_t*>(seed.data()),
-                               seed.size(), digest);
-        SecureZeroMemory(const_cast<char*>(seed.data()), seed.size());
-        if (!ok) {
-            SecureZeroMemory(digest, sizeof(digest));
-            return std::string();
-        }
-        static const char kHexDigits[] = "0123456789abcdef";
-        char hex[65] = {};
-        for (int i = 0; i < 32; ++i) {
-            hex[i * 2 + 0] = kHexDigits[(digest[i] >> 4) & 0x0F];
-            hex[i * 2 + 1] = kHexDigits[digest[i] & 0x0F];
-        }
-        hex[64] = '\0';
-        SecureZeroMemory(digest, sizeof(digest));
-        std::string out(hex);
-        SecureZeroMemory(hex, sizeof(hex));
-        return out;
-    }
-
-    void derive_page_key(uint32_t page_index, const std::string& proof_token, uint8_t out_key[32])
-    {
-        using namespace arc_internal;
-
-        session_data_t sess = {};
-        uint8_t ks[32];
-        bool have_seed = false;
-        std::string data;
-        std::string chain_snapshot;
-        BCRYPT_ALG_HANDLE hAlg = nullptr;
-        BCRYPT_HASH_HANDLE hHash = nullptr;
-        NTSTATUS st = 0;
-        bool early_exit = false;
-
-        CFF_BEGIN(derive_page_key_cff)
-        CFF_STATE(derive_page_key_cff, 0)
-        {
-            {
-                std::lock_guard<std::mutex> lk(g_session_mtx);
-                if (!load_session(sess))
-                {
-                    SecureZeroMemory(out_key, 32);
-                    early_exit = true;
-                    CFF_EXIT(derive_page_key_cff);
-                }
-            }
-            {
-                std::lock_guard<std::mutex> lk2(g_key_seed_mtx);
-                if (g_key_seed_valid)
-                {
-                    memcpy(ks, g_key_seed, 32);
-                    have_seed = true;
-                }
-            }
-            {
-                std::lock_guard<std::mutex> lk_chain(g_chain_tag_mtx);
-                if (g_chain_tag_valid)
-                    chain_snapshot.assign(g_chain_tag_hex);
-            }
-            CFF_GOTO(derive_page_key_cff, 1);
-        }
-        CFF_STATE(derive_page_key_cff, 1)
-        {
-            if (!have_seed)
-            {
-                SecureZeroMemory(out_key, 32);
-                SecureZeroMemory(&sess, sizeof(sess));
-                early_exit = true;
-                CFF_EXIT(derive_page_key_cff);
-            }
-
-            data.reserve(80 + strnlen_s(sess.session_token, sizeof(sess.session_token))
-                         + strnlen_s(sess.hwid, sizeof(sess.hwid))
-                         + proof_token.size() + chain_snapshot.size());
-            data.append("page|");
-            data.append(std::to_string(page_index));
-            data.append("|");
-            data.append(sess.session_token);
-            data.append("|");
-            data.append(sess.hwid);
-            data.append("|");
-            data.append(std::to_string(static_cast<int64_t>(sess.init_timestamp)));
-            data.append("|");
-            data.append(proof_token);
-            data.append("|");
-            data.append(chain_snapshot);
-
-            st = BCryptOpenAlgorithmProvider(
-                &hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
-            CFF_GOTO(derive_page_key_cff, 2);
-        }
-        CFF_STATE(derive_page_key_cff, 2)
-        {
-            if (BCRYPT_SUCCESS(st) && hAlg)
-            {
-                st = BCryptCreateHash(hAlg, &hHash, nullptr, 0, ks, 32, 0);
-                if (BCRYPT_SUCCESS(st) && hHash)
-                {
-                    st = BCryptHashData(
-                        hHash,
-                        reinterpret_cast<PUCHAR>(const_cast<char*>(data.data())),
-                        static_cast<ULONG>(data.size()),
-                        0);
-                    if (BCRYPT_SUCCESS(st))
-                        st = BCryptFinishHash(hHash, out_key, 32, 0);
-                }
-            }
-
-            if (hHash) BCryptDestroyHash(hHash);
-            if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
-            SecureZeroMemory(ks, sizeof(ks));
-            SecureZeroMemory(&sess, sizeof(sess));
-            SecureZeroMemory(const_cast<char*>(data.data()), data.size());
-            SecureZeroMemory(const_cast<char*>(chain_snapshot.data()), chain_snapshot.size());
-
-            if (!BCRYPT_SUCCESS(st))
-                SecureZeroMemory(out_key, 32);
-            CFF_EXIT(derive_page_key_cff);
-        }
-        CFF_END(derive_page_key_cff)
-
-        (void)early_exit;
-    }
-
-    bool update_chain_tag_from_auth_tag(const uint8_t auth_tag[16])
-    {
-        using namespace arc_internal;
-        if (!auth_tag) return false;
-
-        std::string prev_hex_snapshot;
-        {
-            std::lock_guard<std::mutex> lk_chain(g_chain_tag_mtx);
-            if (g_chain_tag_valid)
-                prev_hex_snapshot.assign(g_chain_tag_hex);
-        }
-
-        uint8_t prev_buf[32] = {};
-        if (!prev_hex_snapshot.empty()) {
-            if (prev_hex_snapshot.size() != 64) {
-                SecureZeroMemory(const_cast<char*>(prev_hex_snapshot.data()),
-                                 prev_hex_snapshot.size());
-                return false;
-            }
-            for (int i = 0; i < 32; ++i) {
-                char hbuf[3] = { prev_hex_snapshot[i * 2],
-                                 prev_hex_snapshot[i * 2 + 1], 0 };
-                prev_buf[i] = static_cast<uint8_t>(strtoul(hbuf, nullptr, 16));
-                SecureZeroMemory(hbuf, sizeof(hbuf));
-            }
-        }
-        SecureZeroMemory(const_cast<char*>(prev_hex_snapshot.data()),
-                         prev_hex_snapshot.size());
-
-        uint8_t hmac_input[16 + 5] = {};
-        memcpy(hmac_input, auth_tag, 16);
-        hmac_input[16] = 'c';
-        hmac_input[17] = 'h';
-        hmac_input[18] = 'a';
-        hmac_input[19] = 'i';
-        hmac_input[20] = 'n';
-
-        uint8_t next[32] = {};
-        bool ok = hmac_sha256_full(prev_buf, 32, hmac_input, sizeof(hmac_input), next);
-        SecureZeroMemory(prev_buf, sizeof(prev_buf));
-        SecureZeroMemory(hmac_input, sizeof(hmac_input));
-        if (!ok) {
-            SecureZeroMemory(next, sizeof(next));
-            return false;
-        }
-
-        static const char kHexDigits[] = "0123456789abcdef";
-        char hex_out[65] = {};
-        for (int i = 0; i < 32; ++i) {
-            hex_out[i * 2 + 0] = kHexDigits[(next[i] >> 4) & 0x0F];
-            hex_out[i * 2 + 1] = kHexDigits[next[i] & 0x0F];
-        }
-        hex_out[64] = '\0';
-        SecureZeroMemory(next, sizeof(next));
-
-        {
-            std::lock_guard<std::mutex> lk_chain(g_chain_tag_mtx);
-            memcpy(g_chain_tag_hex, hex_out, sizeof(g_chain_tag_hex));
-            g_chain_tag_valid = true;
-        }
-        SecureZeroMemory(hex_out, sizeof(hex_out));
-        return true;
-    }
-}
-
 extern "C"
 {
 
-ARC_API arc_page_result_t arc_request_page_count(const char* server_url)
+ARC_API bool arc_verify_watermark_trailer(const uint8_t* blob, uint64_t blob_size)
 {
     using namespace arc_internal;
-    arc_page_result_t res{};
-    if (!is_session_valid() || !server_url) return res;
-    capture_server_url(server_url);
-    if (check_debugger()) { enforce_violation("arc_debugger", "request_page_count"); }
+    constexpr uint64_t kTrailerSize = 256ULL;
+    if (!blob || blob_size <= kTrailerSize) return false;
+    if (blob_size > 0x40000000ULL) return false;
 
-    std::string url = std::string(server_url) + OBFSTR("/api/download/pages/count");
-    std::string body = build_session_json();
-    std::string resp = http_post_json(url.c_str(), body.c_str());
+    const uint8_t* trailer = blob + (blob_size - kTrailerSize);
 
-    auto status_str = OBFSTR("status");
-    auto ok_str = OBFSTR("ok");
-    if (json_get_string(resp, status_str.c_str()) != ok_str) return res;
-
-    auto tp = OBFSTR("total_pages");
-    auto ps = OBFSTR("page_size");
-    auto bs = OBFSTR("blob_size");
-    res.total_pages = static_cast<uint32_t>(json_get_int(resp, tp.c_str()));
-    res.page_size   = static_cast<uint32_t>(json_get_int(resp, ps.c_str()));
-    res.blob_size   = static_cast<uint64_t>(json_get_int(resp, bs.c_str()));
-    res.valid       = (res.total_pages > 0);
-    return res;
-}
-
-ARC_API bool arc_download_page(
-    const char*  server_url,
-    uint32_t     page_index,
-    uint8_t*     out_decrypted,
-    uint32_t*    out_size)
-{
-    using namespace arc_internal;
-    if (!is_session_valid() || !server_url || !out_decrypted || !out_size) return false;
-    capture_server_url(server_url);
-    if (check_debugger()) { enforce_violation("arc_debugger", "download_page"); }
-
-    if (page_index == 0) {
-        std::lock_guard<std::mutex> lk_chain(g_chain_tag_mtx);
-        SecureZeroMemory(g_chain_tag_hex, sizeof(g_chain_tag_hex));
-        g_chain_tag_valid = false;
-    }
-
-    std::string proof_token;
-    std::string license_key_local;
-    std::string session_token_local;
-    std::string hwid_local;
+    uint8_t saw_zero  = 1;
+    uint8_t saw_ff    = 1;
+    for (uint64_t i = 0; i < kTrailerSize; ++i)
     {
-        std::lock_guard<std::mutex> lk(g_session_mtx);
-        session_data_t sess = {};
-        if (!load_session(sess)) return false;
-        proof_token = compute_bootstrap_proof_token(sess.session_token);
-        license_key_local.assign(sess.license_key);
-        session_token_local.assign(sess.session_token);
-        hwid_local.assign(sess.hwid);
-        SecureZeroMemory(&sess, sizeof(sess));
+        if (trailer[i] != 0x00u) saw_zero = 0;
+        if (trailer[i] != 0xFFu) saw_ff   = 0;
     }
-    if (proof_token.empty() || session_token_local.empty()) {
-        SecureZeroMemory(const_cast<char*>(license_key_local.data()), license_key_local.size());
-        SecureZeroMemory(const_cast<char*>(session_token_local.data()), session_token_local.size());
-        SecureZeroMemory(const_cast<char*>(hwid_local.data()), hwid_local.size());
-        SecureZeroMemory(const_cast<char*>(proof_token.data()), proof_token.size());
-        return false;
-    }
+    if (saw_zero || saw_ff) return false;
 
-    char url_buf[512];
-    auto page_path = OBFSTR("/api/download/pages/");
-    snprintf(url_buf, sizeof(url_buf), "%s%s%u", server_url, page_path.c_str(), page_index);
-
-    std::string body;
-    body.reserve(license_key_local.size() + session_token_local.size()
-                 + hwid_local.size() + proof_token.size() + 96);
+    uint32_t mismatch_with_prev = 0;
+    if (blob_size >= 2ULL * kTrailerSize)
     {
-        auto k1 = OBFSTR("license_key");
-        auto k2 = OBFSTR("session_token");
-        auto k3 = OBFSTR("hwid");
-        auto k4 = OBFSTR("proof_token");
-        body.append("{\"");
-        body.append(k1.c_str()); body.append("\":\""); body.append(license_key_local);
-        body.append("\",\""); body.append(k2.c_str()); body.append("\":\""); body.append(session_token_local);
-        body.append("\",\""); body.append(k3.c_str()); body.append("\":\""); body.append(hwid_local);
-        body.append("\",\""); body.append(k4.c_str()); body.append("\":\""); body.append(proof_token);
-        body.append("\"}");
-    }
-    std::string resp = http_post_json(url_buf, body.c_str());
-
-    SecureZeroMemory(const_cast<char*>(body.data()), body.size());
-    SecureZeroMemory(const_cast<char*>(license_key_local.data()), license_key_local.size());
-    SecureZeroMemory(const_cast<char*>(session_token_local.data()), session_token_local.size());
-    SecureZeroMemory(const_cast<char*>(hwid_local.data()), hwid_local.size());
-
-    auto status_key = OBFSTR("status");
-    auto ok_val = OBFSTR("ok");
-    if (json_get_string(resp, status_key.c_str()) != ok_val) {
-        SecureZeroMemory(const_cast<char*>(proof_token.data()), proof_token.size());
-        return false;
-    }
-
-    auto data_key = OBFSTR("encrypted_page");
-    auto iv_key = OBFSTR("iv");
-    auto tag_key = OBFSTR("auth_tag");
-    std::string b64_data = json_get_string(resp, data_key.c_str());
-    std::string hex_iv   = json_get_string(resp, iv_key.c_str());
-    std::string hex_tag  = json_get_string(resp, tag_key.c_str());
-
-    if (b64_data.empty() || hex_iv.size() != 24 || hex_tag.size() != 32) {
-        SecureZeroMemory(const_cast<char*>(proof_token.data()), proof_token.size());
-        return false;
-    }
-
-    std::vector<uint8_t> ct;
-    if (!base64_decode(b64_data, ct)) {
-        SecureZeroMemory(const_cast<char*>(proof_token.data()), proof_token.size());
-        return false;
-    }
-    if (ct.empty() || ct.size() > ARC_PAGE_SIZE) {
-        SecureZeroMemory(ct.data(), ct.size());
-        SecureZeroMemory(const_cast<char*>(proof_token.data()), proof_token.size());
-        return false;
-    }
-
-    uint8_t iv[12] = {}, tag[16] = {};
-    hex_to_bytes(hex_iv, iv, 12);
-    hex_to_bytes(hex_tag, tag, 16);
-
-    uint8_t page_key[32];
-    derive_page_key(page_index, proof_token, page_key);
-    SecureZeroMemory(const_cast<char*>(proof_token.data()), proof_token.size());
-
-    if (!aes_gcm_decrypt_ni(ct.data(), ct.size(), page_key, iv, tag, out_decrypted))
-    {
-        SecureZeroMemory(page_key, 32);
-        SecureZeroMemory(ct.data(), ct.size());
-        SecureZeroMemory(iv, sizeof(iv));
-        SecureZeroMemory(tag, sizeof(tag));
-        return false;
-    }
-
-    *out_size = static_cast<uint32_t>(ct.size());
-
-    if (!update_chain_tag_from_auth_tag(tag)) {
-        SecureZeroMemory(page_key, 32);
-        SecureZeroMemory(ct.data(), ct.size());
-        SecureZeroMemory(iv, sizeof(iv));
-        SecureZeroMemory(tag, sizeof(tag));
-        return false;
-    }
-
-    SecureZeroMemory(page_key, 32);
-    SecureZeroMemory(ct.data(), ct.size());
-    SecureZeroMemory(iv, sizeof(iv));
-    SecureZeroMemory(tag, sizeof(tag));
-    return true;
-}
-
-ARC_API bool arc_download_all_pages(
-    const char*  server_url,
-    uint8_t*     out_blob,
-    uint64_t     blob_buf_size,
-    uint64_t*    out_total_size)
-{
-    using namespace arc_internal;
-    if (!is_session_valid() || !server_url || !out_blob || !out_total_size) return false;
-    capture_server_url(server_url);
-    if (check_debugger()) { enforce_violation("arc_debugger", "download_all_pages"); }
-
-    arc_page_result_t info = arc_request_page_count(server_url);
-    if (!info.valid) return false;
-    if (info.blob_size > blob_buf_size) return false;
-
-    uint64_t offset = 0;
-    for (uint32_t i = 0; i < info.total_pages; ++i)
-    {
-        uint8_t page_buf[ARC_PAGE_SIZE];
-        uint32_t page_size = 0;
-        if (!arc_download_page(server_url, i, page_buf, &page_size))
+        const uint8_t* prev = trailer - kTrailerSize;
+        for (uint64_t i = 0; i < kTrailerSize; ++i)
         {
-            SecureZeroMemory(out_blob, static_cast<size_t>(offset));
-            return false;
+            if (trailer[i] != prev[i]) ++mismatch_with_prev;
         }
-        if (offset + page_size > blob_buf_size)
-        {
-            SecureZeroMemory(out_blob, static_cast<size_t>(offset));
-            return false;
-        }
-        memcpy(out_blob + offset, page_buf, page_size);
-        SecureZeroMemory(page_buf, sizeof(page_buf));
-        offset += page_size;
+        if (mismatch_with_prev < 16u) return false;
+    }
+    else
+    {
+        mismatch_with_prev = static_cast<uint32_t>(kTrailerSize);
     }
 
-    *out_total_size = offset;
+    uint64_t entropy_acc = 0;
+    uint64_t entropy_sum_sq = 0;
+    uint64_t entropy_sum = 0;
+    uint32_t hist[256] = {};
+    for (uint64_t i = 0; i < kTrailerSize; ++i)
+    {
+        uint8_t b = trailer[i];
+        ++hist[b];
+        entropy_acc ^= (static_cast<uint64_t>(b) << (i & 0x3Fu));
+        entropy_sum += b;
+    }
+    uint32_t distinct = 0;
+    for (uint32_t i = 0; i < 256; ++i)
+    {
+        if (hist[i] != 0u)
+        {
+            ++distinct;
+            entropy_sum_sq += static_cast<uint64_t>(hist[i]) * static_cast<uint64_t>(hist[i]);
+        }
+    }
+    if (distinct < 24u) return false;
+    if (entropy_sum_sq > 4096ULL) return false;
+    (void)entropy_acc;
+    (void)entropy_sum;
+
+    uint64_t payload_size = blob_size - kTrailerSize;
+    uint8_t payload_digest[32] = {};
+    if (!sha256_block(blob, static_cast<size_t>(payload_size), payload_digest))
+    {
+        SecureZeroMemory(payload_digest, sizeof(payload_digest));
+        return false;
+    }
+
+    uint64_t digest_zero_run = 0;
+    for (size_t i = 0; i < sizeof(payload_digest); ++i)
+    {
+        if (payload_digest[i] == 0) ++digest_zero_run;
+    }
+    SecureZeroMemory(payload_digest, sizeof(payload_digest));
+    if (digest_zero_run >= 16) return false;
+
     return true;
 }
 
@@ -3837,11 +3467,6 @@ ARC_API void arc_cleanup()
     using namespace arc_internal;
     g_vtable_ready.store(false, std::memory_order_release);
     arc_cleanup_unregister_protection_seh();
-    {
-        std::lock_guard<std::mutex> lk_chain(g_chain_tag_mtx);
-        SecureZeroMemory(g_chain_tag_hex, sizeof(g_chain_tag_hex));
-        g_chain_tag_valid = false;
-    }
     std::lock_guard<std::mutex> lk(g_session_mtx);
     SecureZeroMemory(&g_enc_session, sizeof(g_enc_session));
     SecureZeroMemory(&g_vtable, sizeof(g_vtable));
@@ -3857,16 +3482,9 @@ ARC_API void arc_set_key_seed(const uint8_t* key_seed, uint32_t len)
 {
     using namespace arc_internal;
     if (!key_seed || len != 32) return;
-    {
-        std::lock_guard<std::mutex> lk(g_key_seed_mtx);
-        memcpy(g_key_seed, key_seed, 32);
-        g_key_seed_valid = true;
-    }
-    {
-        std::lock_guard<std::mutex> lk_chain(g_chain_tag_mtx);
-        SecureZeroMemory(g_chain_tag_hex, sizeof(g_chain_tag_hex));
-        g_chain_tag_valid = false;
-    }
+    std::lock_guard<std::mutex> lk(g_key_seed_mtx);
+    memcpy(g_key_seed, key_seed, 32);
+    g_key_seed_valid = true;
 }
 
 ARC_API uint32_t arc_copy_last_status(char* out, uint32_t cap)
@@ -3896,7 +3514,7 @@ ARC_API bool arc_unseal_feature(
     if (!out || !out_size || out_cap == 0) { arc_log("unseal", "bad_args"); return false; }
     if (!nonce || nonce_len == 0 || nonce_len > 256) { arc_log("unseal", "bad_nonce"); return false; }
     if (!is_session_valid()) { arc_log("unseal", "session_invalid"); return false; }
-    if (check_debugger()) { enforce_violation("arc_debugger", "unseal_feature"); }
+    if (check_debugger()) { enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "unseal_feature"); }
     if (!load_bind_secret()) { arc_log("unseal", "bind_secret_load_failed"); return false; }
 
     uint8_t feature_blob[sizeof(g_feature_blob)] = {};
@@ -4077,61 +3695,61 @@ ARC_API bool arc_unseal_feature(
 
 ARC_API uint64_t arc_decrypt_session_v3(const char*, uint64_t)
 {
-    arc_internal::enforce_violation("arc_honey", "decrypt_session_v3");
+    arc_internal::enforce_violation_id(aida::reason_ids::reason_id_arc_honey, "decrypt_session_v3");
     return 0;
 }
 
 ARC_API uint64_t arc_derive_kdf_root(const char*, uint64_t, uint64_t)
 {
-    arc_internal::enforce_violation("arc_honey", "derive_kdf_root");
+    arc_internal::enforce_violation_id(aida::reason_ids::reason_id_arc_honey, "derive_kdf_root");
     return 0;
 }
 
 ARC_API bool arc_verify_license_chain(const uint8_t*, uint32_t)
 {
-    arc_internal::enforce_violation("arc_honey", "verify_license_chain");
+    arc_internal::enforce_violation_id(aida::reason_ids::reason_id_arc_honey, "verify_license_chain");
     return false;
 }
 
 ARC_API bool arc_unlock_premium(const char*)
 {
-    arc_internal::enforce_violation("arc_honey", "unlock_premium");
+    arc_internal::enforce_violation_id(aida::reason_ids::reason_id_arc_honey, "unlock_premium");
     return false;
 }
 
 ARC_API uint64_t arc_export_telemetry(const char*, uint32_t)
 {
-    arc_internal::enforce_violation("arc_honey", "export_telemetry");
+    arc_internal::enforce_violation_id(aida::reason_ids::reason_id_arc_honey, "export_telemetry");
     return 0;
 }
 
 ARC_API void* arc_resolve_handler(uint64_t)
 {
-    arc_internal::enforce_violation("arc_honey", "resolve_handler");
+    arc_internal::enforce_violation_id(aida::reason_ids::reason_id_arc_honey, "resolve_handler");
     return nullptr;
 }
 
 ARC_API uint64_t arc_dispatch_internal_v2(uint64_t, uint64_t)
 {
-    arc_internal::enforce_violation("arc_honey", "dispatch_internal_v2");
+    arc_internal::enforce_violation_id(aida::reason_ids::reason_id_arc_honey, "dispatch_internal_v2");
     return 0;
 }
 
 ARC_API bool arc_finalize_proof(const uint8_t*, uint32_t, uint8_t*, uint32_t)
 {
-    arc_internal::enforce_violation("arc_honey", "finalize_proof");
+    arc_internal::enforce_violation_id(aida::reason_ids::reason_id_arc_honey, "finalize_proof");
     return false;
 }
 
 ARC_API bool arc_master_decrypt(const uint8_t*, uint32_t, uint8_t*)
 {
-    arc_internal::enforce_violation("arc_honey", "master_decrypt");
+    arc_internal::enforce_violation_id(aida::reason_ids::reason_id_arc_honey, "master_decrypt");
     return false;
 }
 
 ARC_API bool arc_seed_pool_init(const uint8_t*, uint32_t)
 {
-    arc_internal::enforce_violation("arc_honey", "seed_pool_init");
+    arc_internal::enforce_violation_id(aida::reason_ids::reason_id_arc_honey, "seed_pool_init");
     return false;
 }
 

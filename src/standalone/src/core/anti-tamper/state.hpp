@@ -111,35 +111,41 @@ inline runtime_t& get()
 
 namespace detail_master_key {
 
-    inline std::atomic<bool>& s_initialized()
+    constexpr uint64_t kVmKeyMaxCacheMs = 100ULL;
+
+    inline std::mutex& cache_mutex()
     {
-        static std::atomic<bool> v{false};
-        return v;
+        static std::mutex m;
+        return m;
     }
 
-    inline std::once_flag& s_once_flag()
-    {
-        static std::once_flag f;
-        return f;
-    }
-
-    inline uint8_t* storage()
+    inline uint8_t* cache_storage()
     {
         alignas(32) static uint8_t buf[32] = {};
         return buf;
     }
 
-    inline void derive_now()
+    inline std::atomic<uint64_t>& cache_expiry_ms()
+    {
+        static std::atomic<uint64_t> v{0};
+        return v;
+    }
+
+    inline uint64_t now_ms_steady()
+    {
+        return static_cast<uint64_t>(GetTickCount64());
+    }
+
+    inline bool derive_into(uint8_t out[32])
     {
         auto anchors = aida::hardware_id::collect_user_mode();
         std::string canonical = aida::hardware_id::canonical_string(anchors);
 
-        uint8_t* dst = storage();
         bool ok = key_pipeline::derive(
             "aida.vm.master",
             reinterpret_cast<const uint8_t*>(canonical.data()),
             canonical.size(),
-            dst, 32);
+            out, 32);
 
         if (!ok)
         {
@@ -153,33 +159,103 @@ namespace detail_master_key {
             ok = key_pipeline::derive(
                 "aida.vm.master.fallback",
                 fallback_salt, sizeof(fallback_salt),
-                dst, 32);
+                out, 32);
             SecureZeroMemory(fallback_salt, sizeof(fallback_salt));
         }
 
-        if (!ok)
-            __fastfail(0xA1DAA0E1u);
-
-        s_initialized().store(true, std::memory_order_release);
+        return ok;
     }
 
-    inline const uint8_t* materialize()
+    inline void scrub_cache_locked()
     {
-        std::call_once(s_once_flag(), derive_now);
-        return storage();
+        SecureZeroMemory(cache_storage(), 32);
+        cache_expiry_ms().store(0, std::memory_order_release);
     }
 
 }
+
+inline bool materialize_vm_master_key(uint8_t out[32])
+{
+    uint64_t now = detail_master_key::now_ms_steady();
+    {
+        std::lock_guard<std::mutex> lk(detail_master_key::cache_mutex());
+        uint64_t exp = detail_master_key::cache_expiry_ms().load(std::memory_order_acquire);
+        if (exp != 0 && now < exp)
+        {
+            std::memcpy(out, detail_master_key::cache_storage(), 32);
+            return true;
+        }
+        detail_master_key::scrub_cache_locked();
+    }
+
+    uint8_t fresh[32] = {};
+    if (!detail_master_key::derive_into(fresh))
+    {
+        SecureZeroMemory(fresh, 32);
+        __fastfail(0xA1DAA0E1u);
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(detail_master_key::cache_mutex());
+        std::memcpy(detail_master_key::cache_storage(), fresh, 32);
+        detail_master_key::cache_expiry_ms().store(
+            now + detail_master_key::kVmKeyMaxCacheMs,
+            std::memory_order_release);
+        std::memcpy(out, fresh, 32);
+    }
+
+    SecureZeroMemory(fresh, 32);
+    return true;
+}
+
+inline void clear_vm_master_key_cache()
+{
+    std::lock_guard<std::mutex> lk(detail_master_key::cache_mutex());
+    detail_master_key::scrub_cache_locked();
+}
+
+struct vm_master_key_scoped_t
+{
+    alignas(32) uint8_t bytes[32] = {};
+    bool ok = false;
+
+    vm_master_key_scoped_t() noexcept
+    {
+        ok = materialize_vm_master_key(bytes);
+    }
+    ~vm_master_key_scoped_t() noexcept
+    {
+        SecureZeroMemory(bytes, sizeof(bytes));
+    }
+    vm_master_key_scoped_t(const vm_master_key_scoped_t&) = delete;
+    vm_master_key_scoped_t& operator=(const vm_master_key_scoped_t&) = delete;
+
+    const uint8_t* data() const noexcept { return bytes; }
+};
 
 struct vm_master_key_proxy_t
 {
     operator const uint8_t*() const noexcept
     {
-        return detail_master_key::materialize();
+        thread_local alignas(32) uint8_t tls_buf[32] = {};
+        thread_local uint64_t tls_expiry = 0;
+        uint64_t now = detail_master_key::now_ms_steady();
+        if (tls_expiry == 0 || now >= tls_expiry)
+        {
+            if (!materialize_vm_master_key(tls_buf))
+            {
+                SecureZeroMemory(tls_buf, sizeof(tls_buf));
+                tls_expiry = 0;
+                return tls_buf;
+            }
+            tls_expiry = now + detail_master_key::kVmKeyMaxCacheMs;
+        }
+        return tls_buf;
     }
     const uint8_t* data() const noexcept
     {
-        return detail_master_key::materialize();
+        return static_cast<const uint8_t*>(*this);
     }
 };
 

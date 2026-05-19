@@ -12,8 +12,245 @@ const rateLimit = require('../middleware/rate_limit');
 const tpmQuote = require('../crypto/tpm_quote');
 const ekRoots = require('../crypto/ek_roots');
 const anomalyScore = require('../anomaly/score');
+const sessionAead = require('../crypto/session_aead');
+const canonicalResponse = require('../crypto/canonical_response');
+const keyFormat = require('../crypto/key_format');
+const auditLog = require('../middleware/audit_log');
+const licenseRateLimit = require('../middleware/license_rate_limit');
+const botAuth = require('../middleware/bot_auth');
+const replayCounter = require('../middleware/replay_counter');
+const killSwitchModule = require('../middleware/kill_switch');
+const peerCodeHash = require('../crypto/peer_code_hash');
+const sessionRatchet = require('../middleware/session_ratchet');
+
+const SESSION_RATCHET_AUTHENTICATED_ACTIONS = new Set([
+    'heartbeat',
+    'driver_proof',
+    'tpm_attest',
+    'report_violation',
+]);
+
+const SESSION_RATCHET_ENABLED = (process.env.SESSION_RATCHET_ENABLED || '1') !== '0';
 
 const router = express.Router();
+
+const REASON_INVALID = 1;
+const REASON_BANNED = 2;
+const REASON_RATE_LIMITED = 3;
+
+const HANDLER_TIMING_BUDGET_MS = parseInt(process.env.LICENSE_TIMING_BUDGET_MS || '50', 10) || 50;
+const EAUTH_BUDGET_MS = parseInt(process.env.LICENSE_EAUTH_BUDGET_MS || '250', 10) || 250;
+const EAUTH_JITTER_MAX_MS = parseInt(process.env.LICENSE_EAUTH_JITTER_MS || '20', 10) || 20;
+const REQ_TIME_WINDOW_MS = keyFormat.REQ_TIME_WINDOW_MS;
+const REQ_TIME_WINDOW_LEGACY_MS = keyFormat.REQ_TIME_WINDOW_LEGACY_MS;
+const HKDF_RATCHET_INFO_PREFIX = 'ratchet|';
+const EAUTH_BODY_OBJECT = Object.freeze({ ok: false, error_code: 'EAUTH' });
+const EAUTH_BODY_JSON   = JSON.stringify(EAUTH_BODY_OBJECT);
+const EAUTH_BODY_LENGTH = Buffer.byteLength(EAUTH_BODY_JSON, 'utf8');
+
+function jitterMs() {
+    if (EAUTH_JITTER_MAX_MS <= 0) return 0;
+    return crypto.randomInt(0, EAUTH_JITTER_MAX_MS + 1);
+}
+
+async function applyEauthBudget(startMs) {
+    const elapsed = Date.now() - startMs;
+    const target = EAUTH_BUDGET_MS + jitterMs();
+    const remaining = target - elapsed;
+    if (remaining > 0) {
+        await new Promise(resolve => setTimeout(resolve, remaining));
+    }
+}
+
+function buildEauthResult() {
+    return {
+        status: 401,
+        body: EAUTH_BODY_OBJECT,
+        eauth: true,
+        headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': String(EAUTH_BODY_LENGTH),
+            'Cache-Control': 'no-store',
+        },
+    };
+}
+
+function padToFixedLengthBuf(value, length) {
+    if (Buffer.isBuffer(value) && value.length === length) return value;
+    const out = Buffer.alloc(length);
+    if (typeof value === 'string') {
+        Buffer.from(value, 'utf8').copy(out, 0, 0, Math.min(length, value.length));
+    } else if (Buffer.isBuffer(value)) {
+        value.copy(out, 0, 0, Math.min(length, value.length));
+    }
+    return out;
+}
+
+function fixedLengthTimingSafeEqual(a, b) {
+    const padded_a = padToFixedLengthBuf(a, 32);
+    const padded_b = padToFixedLengthBuf(b, 32);
+    return crypto.timingSafeEqual(padded_a, padded_b);
+}
+
+async function applyTimingBudget(startMs) {
+    const elapsed = Date.now() - startMs;
+    const remaining = HANDLER_TIMING_BUDGET_MS - elapsed;
+    if (remaining > 0) {
+        await new Promise(resolve => setTimeout(resolve, remaining));
+    }
+}
+
+function timingBudgetWrap(handler) {
+    return async function timingWrapped(...args) {
+        const t0 = Date.now();
+        let result;
+        try {
+            result = await handler.apply(this, args);
+        } finally {
+            await applyTimingBudget(t0);
+        }
+        return result;
+    };
+}
+
+function deriveRatchetedSessionToken(prevSessionToken, hwid, toolCallCounter) {
+    const prk = crypto.createHmac('sha256', Buffer.from(String(hwid || ''), 'utf8'))
+        .update(Buffer.from(String(prevSessionToken || ''), 'utf8'))
+        .digest();
+    const info = Buffer.from(HKDF_RATCHET_INFO_PREFIX + String(toolCallCounter), 'utf8');
+    const t1 = crypto.createHmac('sha256', prk)
+        .update(info)
+        .update(Buffer.from([0x01]))
+        .digest();
+    return t1.toString('hex');
+}
+
+async function persistRatchet(licenseKey, newSessionToken, prevSessionUuid, newCounter) {
+    const uuid = prevSessionUuid || columnCrypt.generateRowUuid();
+    const wrapped = encryptSessionToken(uuid, newSessionToken);
+    try {
+        await pool.query(
+            `UPDATE sessions
+                SET session_token = $1,
+                    session_uuid = $2,
+                    tool_call_counter = $3
+              WHERE license_key = $4`,
+            [wrapped, uuid, String(newCounter), licenseKey]
+        );
+        return { ok: true, session_token: newSessionToken, tool_call_counter: newCounter };
+    } catch (err) {
+        console.warn('[license] ratchet persist failed:', err && err.message ? err.message : err);
+        return { ok: false, reason: 'ratchet_persist_failed' };
+    }
+}
+
+async function performSessionRatchet(licenseKey, sessionRow) {
+    if (!licenseKey || !sessionRow) return { ok: false, reason: 'no_session' };
+    const prevToken = sessionRow.session_token || '';
+    const hwid = sessionRow.hwid || '';
+    const prevCounter = (() => {
+        try { return BigInt(sessionRow.tool_call_counter || 0); }
+        catch (_) { return 0n; }
+    })();
+    const nextCounter = prevCounter + 1n;
+    const newToken = deriveRatchetedSessionToken(prevToken, hwid, nextCounter.toString());
+    const persist = await persistRatchet(licenseKey, newToken, sessionRow.session_uuid, nextCounter.toString());
+    if (!persist.ok) return persist;
+    return { ok: true, prev_session_token: prevToken, new_session_token: newToken, tool_call_counter: nextCounter.toString() };
+}
+
+const HWID_GRACE_WINDOW_SECONDS = parseInt(process.env.HWID_GRACE_WINDOW_SECONDS || (30 * 86400), 10);
+
+function envelopeResponse(status, payload) {
+    return {
+        status,
+        body: canonicalResponse.buildEnvelope(payload),
+    };
+}
+
+function collapseInvalid(rawReason, licenseKey, hwid, clientIp, extra) {
+    auditLog.logValidationFailure(REASON_INVALID, rawReason, licenseKey || '', hwid || '', clientIp || '', extra || null)
+        .catch(() => {});
+    auditLog.logV2({
+        action: 'license.validate',
+        license_key: licenseKey || '',
+        hwid: hwid || '',
+        source_ip: clientIp || '',
+        decision: 'deny',
+        reason_code: 'invalid:' + String(rawReason || 'unknown'),
+        extra: extra || {},
+    }).catch(() => {});
+    return buildEauthResult();
+}
+
+function collapseBanned(rawReason, licenseKey, hwid, clientIp, extra) {
+    auditLog.logValidationFailure(REASON_BANNED, rawReason, licenseKey || '', hwid || '', clientIp || '', extra || null)
+        .catch(() => {});
+    auditLog.logV2({
+        action: 'license.validate',
+        license_key: licenseKey || '',
+        hwid: hwid || '',
+        source_ip: clientIp || '',
+        decision: 'deny',
+        reason_code: 'banned:' + String(rawReason || 'unknown'),
+        extra: extra || {},
+    }).catch(() => {});
+    return buildEauthResult();
+}
+
+function collapseRateLimited(scope, retryAfterSeconds, licenseKey, hwid, clientIp) {
+    auditLog.logValidationFailure(REASON_RATE_LIMITED, 'rate_limited:' + (scope || ''), licenseKey || '', hwid || '', clientIp || '', { retry_after: retryAfterSeconds })
+        .catch(() => {});
+    auditLog.logV2({
+        action: 'license.validate',
+        license_key: licenseKey || '',
+        hwid: hwid || '',
+        source_ip: clientIp || '',
+        decision: 'deny',
+        reason_code: 'rate_limited:' + String(scope || ''),
+        extra: { retry_after: retryAfterSeconds || 0 },
+    }).catch(() => {});
+    return buildEauthResult();
+}
+
+function collapseHeartbeatDeny(reasonCode, licenseKey, hwid, clientIp, extra) {
+    auditLog.logV2({
+        action: 'license.heartbeat',
+        license_key: licenseKey || '',
+        hwid: hwid || '',
+        source_ip: clientIp || '',
+        decision: 'deny',
+        reason_code: String(reasonCode || 'heartbeat_deny'),
+        extra: extra || {},
+    }).catch(() => {});
+    return buildEauthResult();
+}
+
+function constantTimeKeyMatch(submitted, expected) {
+    const saltSource = process.env.SERVER_HMAC_SALT
+        || process.env.ARC_MASTER_SECRET
+        || 'aida-admin-cmp-v1';
+    const salt = Buffer.from(String(saltSource), 'utf8');
+    const a = crypto.createHmac('sha256', salt).update(String(submitted || ''), 'utf8').digest();
+    const b = crypto.createHmac('sha256', salt).update(String(expected || ''), 'utf8').digest();
+    return fixedLengthTimingSafeEqual(a, b);
+}
+
+function hashSessionToken(token) {
+    return crypto.createHash('sha256').update(String(token || ''), 'utf8').digest('hex');
+}
+
+function computeHwidHash(hwid) {
+    return crypto.createHash('sha256').update(String(hwid || ''), 'utf8').digest('hex');
+}
+
+function parseHexBuf(value, expectedLen) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim().toLowerCase();
+    if (!/^[0-9a-f]+$/.test(trimmed)) return null;
+    if (expectedLen && trimmed.length !== expectedLen) return null;
+    return Buffer.from(trimmed, 'hex');
+}
 
 
 const SESSION_TTL_SECONDS = 3600;
@@ -612,13 +849,23 @@ async function lookupLicense(licenseKey) {
     if (!licenseKey || typeof licenseKey !== 'string') {
         return { valid: false, reason: 'missing_key' };
     }
-    if (!/^[A-Za-z0-9\-]{10,40}$/.test(licenseKey)) {
+    if (keyFormat.format2IsCandidate(licenseKey)) {
+        const verdict = keyFormat.format2Decode(licenseKey);
+        if (!verdict.ok) {
+            if (verdict.reason === 'format2_crc') {
+                replayCounter.recordFormat2CrcFail(licenseKey, { reason: verdict.reason }).catch(() => {});
+            }
+            return { valid: false, reason: 'invalid_format' };
+        }
+    }
+    const normalized = keyFormat.normalizeForLookup(licenseKey);
+    if (!normalized) {
         return { valid: false, reason: 'invalid_format' };
     }
 
     const { rows } = await pool.query(
         'SELECT * FROM licenses WHERE key = $1',
-        [licenseKey]
+        [normalized]
     );
     if (rows.length === 0) {
         return { valid: false, reason: 'not_found' };
@@ -633,12 +880,63 @@ async function lookupLicense(licenseKey) {
         return { valid: false, reason: 'expired', data };
     }
 
-    await ensureLicenseSecrets(licenseKey, data);
+    await ensureLicenseSecrets(normalized, data);
 
     return { valid: true, data };
 }
 
-async function verifyOrBindHwid(licenseKey, hwid, existingHwid) {
+function parseHwidFactors(value) {
+    if (!value) return {};
+    if (typeof value === 'object' && !Buffer.isBuffer(value)) return value;
+    try {
+        return JSON.parse(typeof value === 'string' ? value : value.toString('utf8'));
+    } catch (_) {
+        return {};
+    }
+}
+
+function deriveHwidFactors(body) {
+    const factors = {};
+    const append = (label, raw) => {
+        if (typeof raw !== 'string' || raw.length === 0) return;
+        factors[label] = crypto.createHash('sha256').update(raw, 'utf8').digest('hex');
+    };
+    append('smbios_uuid', body && body.smbios_uuid_hash);
+    append('baseboard', body && body.baseboard_serial_hash);
+    append('disk_vpd', body && body.disk_vpd_hash);
+    append('machine_guid', body && body.machine_guid_hash);
+    append('hardware_id', body && body.hardware_id_sha256);
+    append('hwid', body && body.hwid);
+    if (Object.keys(factors).length === 0 && body && typeof body.hwid === 'string' && body.hwid.length > 0) {
+        factors.hwid = crypto.createHash('sha256').update(body.hwid, 'utf8').digest('hex');
+    }
+    return factors;
+}
+
+function compareHwidFactors(prev, current) {
+    if (!prev || !current) {
+        return { changed: 99, changed_keys: [], total: 0 };
+    }
+    const keys = new Set([...Object.keys(prev), ...Object.keys(current)]);
+    const changedKeys = [];
+    for (const k of keys) {
+        if (prev[k] && current[k] && prev[k] !== current[k]) changedKeys.push(k);
+        else if (!prev[k] && current[k]) changedKeys.push(k);
+        else if (prev[k] && !current[k]) changedKeys.push(k);
+    }
+    return { changed: changedKeys.length, changed_keys: changedKeys, total: keys.size };
+}
+
+async function persistHwidFactors(licenseKey, factors) {
+    try {
+        await pool.query(
+            'UPDATE licenses SET hwid_factors = $1::jsonb WHERE key = $2',
+            [JSON.stringify(factors || {}), licenseKey]
+        );
+    } catch (_) { }
+}
+
+async function verifyOrBindHwid(licenseKey, hwid, existingHwid, options) {
     if (!hwid || typeof hwid !== 'string' || hwid.length < 8 || hwid.length > 256) {
         return { ok: false, reason: 'invalid_hwid' };
     }
@@ -649,11 +947,42 @@ async function verifyOrBindHwid(licenseKey, hwid, existingHwid) {
             'UPDATE licenses SET hwid = $1 WHERE key = $2 AND hwid = $3',
             [hwid, licenseKey, '']
         );
+        if (options && options.factors) {
+            await persistHwidFactors(licenseKey, options.factors);
+        }
         return { ok: true, reason: 'bound' };
     }
 
     if (existingHwid !== hwid) {
+        if (options && options.factors && options.licenseRow) {
+            const prevFactors = parseHwidFactors(options.licenseRow.hwid_factors);
+            const comparison = compareHwidFactors(prevFactors, options.factors);
+            const graceUsedAt = Number(options.licenseRow.hwid_grace_used_at || 0);
+            const now = Math.floor(Date.now() / 1000);
+            const withinCooldown = graceUsedAt > 0 && (now - graceUsedAt) < HWID_GRACE_WINDOW_SECONDS;
+            if (comparison.changed === 1 && !withinCooldown) {
+                try {
+                    await pool.query(
+                        'UPDATE licenses SET hwid = $1, hwid_factors = $2::jsonb, hwid_grace_used_at = $3 WHERE key = $4',
+                        [hwid, JSON.stringify(options.factors), now, licenseKey]
+                    );
+                } catch (_) { }
+                auditLog.logServerEvent('license.hwid_grace_accepted', licenseKey, {
+                    changed_keys: comparison.changed_keys,
+                    previous_hwid_prefix: typeof existingHwid === 'string' ? existingHwid.slice(0, 16) : '',
+                    new_hwid_prefix: hwid.slice(0, 16),
+                }).catch(() => {});
+                return { ok: true, reason: 'grace_accepted' };
+            }
+        }
         return { ok: false, reason: 'hwid_mismatch' };
+    }
+
+    if (options && options.factors) {
+        const prevFactors = parseHwidFactors(options.licenseRow && options.licenseRow.hwid_factors);
+        if (Object.keys(prevFactors).length === 0) {
+            await persistHwidFactors(licenseKey, options.factors);
+        }
     }
 
     return { ok: true, reason: 'match' };
@@ -662,34 +991,43 @@ async function verifyOrBindHwid(licenseKey, hwid, existingHwid) {
 async function storeSession(licenseKey, sessionData) {
     const sessionUuid = columnCrypt.generateRowUuid();
     const sessionTokenWrapped = encryptSessionToken(sessionUuid, sessionData.session_token);
-    const authHmacKey = crypto.randomBytes(32);
+    const authHmacKey = sessionData.auth_hmac_key_buf || crypto.randomBytes(32);
+    const bindContribution = sessionData.bind_contribution || Buffer.alloc(0);
+    const bindResponseHash = sessionData.bind_response_hash || '';
+    const sessionKeyFingerprint = sessionData.session_key_fingerprint || '';
     await pool.query(`
-        INSERT INTO sessions (license_key, session_token, server_nonce, issued_at, ttl, hwid, ip, plugin_version, last_heartbeat, kill_flag, heartbeat_count, last_proof_token, last_code_hash, ip_history, heartbeat_times, honeypot_export, challenge_id, last_chain_tag, session_uuid, column_crypt_version, auth_hmac_key, anomaly_score, driver_proof_absent_streak)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, 0, '', '', ARRAY[$7]::TEXT[], ARRAY[]::BIGINT[], $10, $11, '', $12, 1, $13, 0, 0)
+        INSERT INTO sessions (license_key, session_token, server_nonce, issued_at, ttl, hwid, ip, plugin_version, last_heartbeat, kill_flag, heartbeat_count, last_proof_token, last_code_hash, ip_history, heartbeat_times, honeypot_export, challenge_id, last_chain_tag, session_uuid, column_crypt_version, auth_hmac_key, anomaly_score, driver_proof_absent_streak, bind_contribution, bind_response_hash, session_key_fingerprint, sentinel_bind_token_hash, sentinel_bind_consumed, sentinel_bind_issued_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, 0, '', '', ARRAY[$7]::TEXT[], ARRAY[]::BIGINT[], $10, $11, '', $12, 1, $13, 0, 0, $14, $15, $16, '', false, 0)
         ON CONFLICT (license_key) DO UPDATE SET
-            session_token        = EXCLUDED.session_token,
-            server_nonce         = EXCLUDED.server_nonce,
-            issued_at            = EXCLUDED.issued_at,
-            ttl                  = EXCLUDED.ttl,
-            hwid                 = EXCLUDED.hwid,
-            ip                   = EXCLUDED.ip,
-            plugin_version       = EXCLUDED.plugin_version,
-            last_heartbeat       = EXCLUDED.last_heartbeat,
-            kill_flag            = false,
-            heartbeat_count      = 0,
-            last_proof_token     = '',
-            last_code_hash       = '',
-            ip_history           = ARRAY[EXCLUDED.ip]::TEXT[],
-            heartbeat_times      = ARRAY[]::BIGINT[],
-            honeypot_export      = EXCLUDED.honeypot_export,
-            challenge_id         = EXCLUDED.challenge_id,
-            last_chain_tag       = '',
-            last_gate_bitmap     = 0,
-            session_uuid         = EXCLUDED.session_uuid,
-            column_crypt_version = 1,
-            auth_hmac_key        = EXCLUDED.auth_hmac_key,
-            anomaly_score        = 0,
-            driver_proof_absent_streak = 0
+            session_token             = EXCLUDED.session_token,
+            server_nonce              = EXCLUDED.server_nonce,
+            issued_at                 = EXCLUDED.issued_at,
+            ttl                       = EXCLUDED.ttl,
+            hwid                      = EXCLUDED.hwid,
+            ip                        = EXCLUDED.ip,
+            plugin_version            = EXCLUDED.plugin_version,
+            last_heartbeat            = EXCLUDED.last_heartbeat,
+            kill_flag                 = false,
+            heartbeat_count           = 0,
+            last_proof_token          = '',
+            last_code_hash            = '',
+            ip_history                = ARRAY[EXCLUDED.ip]::TEXT[],
+            heartbeat_times           = ARRAY[]::BIGINT[],
+            honeypot_export           = EXCLUDED.honeypot_export,
+            challenge_id              = EXCLUDED.challenge_id,
+            last_chain_tag            = '',
+            last_gate_bitmap          = 0,
+            session_uuid              = EXCLUDED.session_uuid,
+            column_crypt_version      = 1,
+            auth_hmac_key             = EXCLUDED.auth_hmac_key,
+            anomaly_score             = 0,
+            driver_proof_absent_streak = 0,
+            bind_contribution         = EXCLUDED.bind_contribution,
+            bind_response_hash        = EXCLUDED.bind_response_hash,
+            session_key_fingerprint   = EXCLUDED.session_key_fingerprint,
+            sentinel_bind_token_hash  = '',
+            sentinel_bind_consumed    = false,
+            sentinel_bind_issued_at   = 0
     `, [
         licenseKey,
         sessionTokenWrapped,
@@ -704,8 +1042,52 @@ async function storeSession(licenseKey, sessionData) {
         sessionData.challenge_id || '',
         sessionUuid,
         authHmacKey,
+        bindContribution,
+        bindResponseHash,
+        sessionKeyFingerprint,
     ]);
     return { authHmacKey };
+}
+
+function deriveLicenseSecret(licenseRow) {
+    const masterSecret = process.env.ARC_MASTER_SECRET;
+    if (!masterSecret || masterSecret.length < 32) {
+        throw new Error('ARC_MASTER_SECRET must be at least 32 characters');
+    }
+    const witness = licenseRow && licenseRow.witness_key_wrapped
+        ? (Buffer.isBuffer(licenseRow.witness_key_wrapped)
+            ? licenseRow.witness_key_wrapped
+            : Buffer.from(licenseRow.witness_key_wrapped))
+        : Buffer.alloc(0);
+    const install = licenseRow && licenseRow.install_secret_wrapped
+        ? (Buffer.isBuffer(licenseRow.install_secret_wrapped)
+            ? licenseRow.install_secret_wrapped
+            : Buffer.from(licenseRow.install_secret_wrapped))
+        : Buffer.alloc(0);
+    return crypto.createHmac('sha256', Buffer.from(masterSecret, 'utf8'))
+        .update('license_secret|', 'utf8')
+        .update(String(licenseRow && licenseRow.key || ''), 'utf8')
+        .update('|', 'utf8')
+        .update(witness)
+        .update('|', 'utf8')
+        .update(install)
+        .digest();
+}
+
+function deriveBindResponse(licenseSecret, nonceC2, hwid, issuedAt, bindContribution) {
+    const mac = crypto.createHmac('sha256', licenseSecret)
+        .update('bind|', 'utf8')
+        .update(String(nonceC2 || ''), 'utf8')
+        .update('|', 'utf8')
+        .update(String(hwid || ''), 'utf8')
+        .update('|', 'utf8')
+        .update(String(issuedAt || 0), 'utf8')
+        .digest();
+    const out = Buffer.alloc(32);
+    for (let i = 0; i < 32; i++) {
+        out[i] = mac[i] ^ (bindContribution[i] || 0);
+    }
+    return { bind_response: out, server_hmac: mac };
 }
 
 async function getSession(licenseKey) {
@@ -901,28 +1283,42 @@ async function handleValidate(body, clientIp) {
 
 
     if (body.timestamp && typeof body.timestamp === 'number') {
-        const drift = Math.abs(Math.floor(Date.now() / 1000) - body.timestamp);
-        if (drift > 300) {
-            return { status: 200, body: { status: 'invalid', reason: 'clock_drift' } };
+        const driftMs = Math.abs(Date.now() - (body.timestamp * 1000));
+        if (driftMs > REQ_TIME_WINDOW_MS) {
+            await replayCounter.recordSignatureInvalid(license_key, '', { reason: 'validate_clock_drift', drift_ms: driftMs, limit_ms: REQ_TIME_WINDOW_MS });
+            return collapseInvalid('clock_drift', license_key, hwid, clientIp);
         }
     }
 
+    if (typeof body.req_ts_ms === 'number' && Number.isFinite(body.req_ts_ms)) {
+        const driftMs = Math.abs(Date.now() - Math.floor(body.req_ts_ms));
+        if (driftMs > REQ_TIME_WINDOW_MS) {
+            await replayCounter.recordSignatureInvalid(license_key, '', { reason: 'validate_req_ts_drift', drift_ms: driftMs, limit_ms: REQ_TIME_WINDOW_MS });
+            return collapseInvalid('req_ts_drift', license_key, hwid, clientIp);
+        }
+    }
+
+    const rl = await licenseRateLimit.check(license_key, {});
+    if (!rl.ok) {
+        return collapseRateLimited(rl.scope, rl.retry_after, license_key, hwid, clientIp);
+    }
 
     const banCheck = await checkBans(hwid, clientIp);
     if (banCheck.banned) {
-        return { status: 200, body: { status: 'banned', reason: banCheck.reason } };
+        return collapseBanned(banCheck.reason, license_key, hwid, clientIp);
     }
 
 
     const lookup = await lookupLicense(license_key);
     if (!lookup.valid) {
-        return { status: 200, body: { status: 'invalid', reason: lookup.reason } };
+        return collapseInvalid('lookup:' + (lookup.reason || 'unknown'), license_key, hwid, clientIp);
     }
+    const normalizedLicenseKey = lookup.data.key;
 
 
-    const chResult = await enforceChallenge(body, clientIp, license_key);
+    const chResult = await enforceChallenge(body, clientIp, normalizedLicenseKey);
     if (!chResult.ok) {
-        return { status: 200, body: { status: 'invalid', reason: chResult.reason } };
+        return collapseInvalid('challenge:' + (chResult.reason || 'unknown'), normalizedLicenseKey, hwid, clientIp);
     }
 
 
@@ -936,31 +1332,61 @@ async function handleValidate(body, clientIp) {
         });
         const result = tpmQuote.verifyTpmQuote(enriched);
         if (!result.ok) {
-            return { status: 200, body: { status: 'invalid', reason: 'tpm_quote_invalid', detail: result.reason } };
+            return collapseInvalid('tpm_quote_invalid:' + (result.reason || 'unknown'), normalizedLicenseKey, hwid, clientIp);
         }
         tpmVerify = result;
         effectiveHwid = combineHardwareIdWithTpm(hwid, result.hwidComponentHex);
         if (lookup.data.tpm_ek_fingerprint && lookup.data.tpm_ek_fingerprint !== result.ekCertFingerprint) {
-            return { status: 200, body: { status: 'invalid', reason: 'tpm_ek_mismatch' } };
+            return collapseInvalid('tpm_ek_mismatch', normalizedLicenseKey, hwid, clientIp);
         }
     } else if (isTpmRequiredForLicense(lookup.data)) {
-        return { status: 200, body: { status: 'invalid', reason: 'tpm_attest_required' } };
+        return collapseInvalid('tpm_attest_required', normalizedLicenseKey, hwid, clientIp);
     }
 
 
-    const hwidResult = await verifyOrBindHwid(license_key, effectiveHwid, lookup.data.hwid || '');
+    const hwidFactors = deriveHwidFactors(Object.assign({}, body, { hwid: effectiveHwid }));
+    const hwidResult = await verifyOrBindHwid(normalizedLicenseKey, effectiveHwid, lookup.data.hwid || '', {
+        factors: hwidFactors,
+        licenseRow: lookup.data,
+    });
     if (!hwidResult.ok) {
-        return { status: 200, body: { status: 'invalid', reason: hwidResult.reason } };
+        return collapseInvalid('hwid:' + (hwidResult.reason || 'unknown'), normalizedLicenseKey, hwid, clientIp);
     }
 
+    try {
+        const peerState = await peerCodeHash.getSessionPeerState(normalizedLicenseKey);
+        if (peerState && Number(peerState.peer_attest_divergence_streak || 0) >= 5) {
+            await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [normalizedLicenseKey]);
+            return collapseInvalid('peer_code_hash_divergent', normalizedLicenseKey, hwid, clientIp);
+        }
+    } catch (_) { }
 
-    const sessionToken = generateSessionToken();
-    const serverNonce = generateServerNonce();
     const issuedAt = Math.floor(Date.now() / 1000);
     const ttl = SESSION_TTL_SECONDS;
     const honeypotExport = pickHoneypotExport();
+    const hwidHashForSeal = computeHwidHash(effectiveHwid);
+    const tierForSeal = lookup.data.tier || lookup.data.plan || 'standard';
+    const sessionToken = sessionAead.seal(normalizedLicenseKey, hwidHashForSeal, issuedAt, ttl, tierForSeal);
+    const serverNonce = generateServerNonce();
 
-    const sessionStore = await storeSession(license_key, {
+    let licenseSecret = null;
+    try {
+        licenseSecret = deriveLicenseSecret(lookup.data);
+    } catch (err) {
+        console.error('[license] deriveLicenseSecret failed:', err && err.message ? err.message : err);
+        return collapseInvalid('license_secret_unavailable', normalizedLicenseKey, hwid, clientIp);
+    }
+
+    let bindContributionBuf = parseHexBuf(body.bind_contribution, 64);
+    if (!bindContributionBuf) {
+        bindContributionBuf = Buffer.alloc(32);
+    }
+    const bindDerivation = deriveBindResponse(licenseSecret, body.client_nonce_c2 || body.client_nonce, effectiveHwid, issuedAt, bindContributionBuf);
+    const sessionKey = sessionAead.deriveSessionKey(licenseSecret, sessionToken, effectiveHwid, issuedAt);
+    const authHmacKey = sessionAead.deriveAuthHmacKey(sessionKey);
+    const sessionKeyFingerprint = crypto.createHash('sha256').update(sessionKey).digest('hex').slice(0, 16);
+
+    const sessionStore = await storeSession(normalizedLicenseKey, {
         session_token: sessionToken,
         server_nonce: serverNonce,
         issued_at: issuedAt,
@@ -971,14 +1397,18 @@ async function handleValidate(body, clientIp) {
         last_heartbeat: issuedAt,
         honeypot_export: honeypotExport,
         challenge_id: (body && body.challenge_id) || '',
+        auth_hmac_key_buf: authHmacKey,
+        bind_contribution: bindContributionBuf,
+        bind_response_hash: crypto.createHash('sha256').update(bindDerivation.bind_response).digest('hex'),
+        session_key_fingerprint: sessionKeyFingerprint,
     });
 
-    await rateLimit.registerNonce(license_key, sessionToken, 'issued:' + serverNonce, NONCE_REPLAY_TTL_SECONDS);
+    await rateLimit.registerNonce(normalizedLicenseKey, sessionToken, 'issued:' + serverNonce, NONCE_REPLAY_TTL_SECONDS);
 
     let tpmSealed = null;
     if (tpmVerify) {
         tpmSealed = buildTpmSealedPayload(lookup.data, tpmVerify, sessionToken);
-        await persistTpmAttestation(license_key, tpmVerify, tpmSealed);
+        await persistTpmAttestation(normalizedLicenseKey, tpmVerify, tpmSealed);
     }
 
     const keySeed = deriveKeySeed(sessionToken, effectiveHwid, issuedAt);
@@ -1011,6 +1441,15 @@ async function handleValidate(body, clientIp) {
         console.warn('[license] validate next-challenge create failed:', err && err.message ? err.message : err);
     }
 
+    const sentinelBindToken = crypto.createHmac('sha256', licenseSecret)
+        .update('attest|', 'utf8')
+        .update(sessionToken, 'utf8')
+        .update('|', 'utf8')
+        .update(client_nonce, 'utf8')
+        .digest();
+    const sentinelBindTokenHex = sentinelBindToken.toString('hex');
+    const sentinelBindTokenHash = crypto.createHash('sha256').update(sentinelBindToken).digest('hex');
+
     try {
         await pool.query(`
             UPDATE sessions SET
@@ -1021,7 +1460,10 @@ async function handleValidate(body, clientIp) {
                 bind_proof_history = '{}'::TEXT[],
                 challenge_sealed = $5,
                 tpm_quote_digest = $6,
-                challenge_id = $8
+                challenge_id = $8,
+                sentinel_bind_token_hash = $9,
+                sentinel_bind_consumed   = false,
+                sentinel_bind_issued_at  = $2
             WHERE license_key = $7
         `, [
             initialHbNonce,
@@ -1030,8 +1472,9 @@ async function handleValidate(body, clientIp) {
             0,
             !!tpmVerify,
             tpmDigestSeed,
-            license_key,
+            normalizedLicenseKey,
             initialChallenge ? initialChallenge.challenge_id : '',
+            sentinelBindTokenHash,
         ]);
     } catch (err) {
         console.warn('[license] validate session-rotation update failed:', err && err.message ? err.message : err);
@@ -1043,19 +1486,20 @@ async function handleValidate(body, clientIp) {
                 INSERT INTO bind_proof_rotations (license_key, session_token, epoch, bind_proof, issued_at)
                 VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (session_token, epoch) DO UPDATE SET bind_proof = EXCLUDED.bind_proof, issued_at = EXCLUDED.issued_at
-            `, [license_key, sessionToken, 0, rotatingBindProofHex, issuedAt]);
+            `, [normalizedLicenseKey, sessionToken, 0, rotatingBindProofHex, issuedAt]);
         } catch (err) {
             console.warn('[license] validate bind_proof_rotations insert failed:', err && err.message ? err.message : err);
         }
     }
 
-    await rateLimit.registerNonce(license_key, sessionToken, 'hbnonce:' + initialHbNonce, HEARTBEAT_NONCE_MAX_AGE_SECONDS);
+    await rateLimit.registerNonce(normalizedLicenseKey, sessionToken, 'hbnonce:' + initialHbNonce, HEARTBEAT_NONCE_MAX_AGE_SECONDS);
 
     const sigPayload = {
         status: 'valid',
-        license_key,
+        license_key: normalizedLicenseKey,
         hwid: effectiveHwid,
         plan: lookup.data.plan || 'standard',
+        tier: lookup.data.tier || lookup.data.plan || 'standard',
         session_token: sessionToken,
         ttl,
         issued_at: issuedAt,
@@ -1072,6 +1516,9 @@ async function handleValidate(body, clientIp) {
         rotated_bind_proof_epoch: 0,
         challenge_required: CHALLENGE_REQUIRED,
         challenge_ttl: CHALLENGE_TTL_SECONDS,
+        bind_response: bindDerivation.bind_response.toString('hex'),
+        bind_token: sentinelBindTokenHex,
+        session_key_fingerprint: sessionKeyFingerprint,
     };
     if (initialChallenge) {
         sigPayload.next_challenge_id = initialChallenge.challenge_id;
@@ -1081,30 +1528,25 @@ async function handleValidate(body, clientIp) {
         if (initialChallenge.signature) sigPayload.next_challenge_signature = initialChallenge.signature;
     }
     if (bindProofHex) sigPayload.bind_proof = bindProofHex;
-    if (sessionStore && sessionStore.authHmacKey) {
-        sigPayload.auth_hmac_key_b64 = sessionStore.authHmacKey.toString('base64');
-    }
     if (tpmVerify) {
         sigPayload.tpm_bound = true;
         sigPayload.tpm_ek_vendor = tpmVerify.ekVendor || '';
         sigPayload.tpm_ek_fingerprint = tpmVerify.ekCertFingerprint;
         sigPayload.tpm_pcr_digest = tpmVerify.pcrDigestHex;
     }
+    if (tpmSealed) sigPayload.tpm_sealed_key = tpmSealed;
     const rotationBlock = buildRotationBlock();
     Object.assign(sigPayload, rotationBlock);
-    const kidInfo = getActiveKidInfo();
-    sigPayload.kid = kidInfo.active_kid;
-    const { signature, next_signature, next_kid } = dualSignPayload(sigPayload);
 
-    const responseBody = { ...sigPayload, signature };
-    if (next_signature) responseBody.next_signature = next_signature;
-    if (next_kid) responseBody.next_kid = next_kid;
-    if (tpmSealed) responseBody.tpm_sealed_key = tpmSealed;
+    if (SESSION_RATCHET_ENABLED) {
+        try {
+            await sessionRatchet.bootstrapForSession(sessionToken, normalizedLicenseKey);
+        } catch (err) {
+            console.warn('[license] session_ratchet bootstrap failed:', err && err.message ? err.message : err);
+        }
+    }
 
-    return {
-        status: 200,
-        body: responseBody,
-    };
+    return envelopeResponse(200, sigPayload);
 }
 
 
@@ -1151,48 +1593,60 @@ async function handleHeartbeat(body, clientIp) {
 
     if (!license_key || !session_token) {
         dbgHb('reject_missing_fields', { license_key: !!license_key, session_token: !!session_token });
-        return { status: 400, body: { status: 'error', reason: 'missing_fields' } };
+        return collapseHeartbeatDeny('missing_fields', license_key, hwid, clientIp);
+    }
+
+    const perLicenseRl = await licenseRateLimit.check(license_key, {});
+    if (!perLicenseRl.ok) {
+        dbgHb('per_license_rate_limited', { scope: perLicenseRl.scope, retry_after: perLicenseRl.retry_after });
+        auditLog.logValidationFailure(REASON_RATE_LIMITED, 'heartbeat_rate_limited:' + (perLicenseRl.scope || ''), license_key, hwid, clientIp, { retry_after: perLicenseRl.retry_after })
+            .catch(() => {});
+        return collapseHeartbeatDeny('rate_limited:' + (perLicenseRl.scope || ''), license_key, hwid, clientIp, { retry_after: perLicenseRl.retry_after });
     }
 
     const rl = await rateLimit.checkAndRegisterHeartbeat(license_key, session_token);
     if (!rl.ok) {
         dbgHb('rate_limited', { reason: rl.reason, retryAfter: rl.retryAfter });
-        return {
-            status: 429,
-            body: { status: 'error', reason: rl.reason || 'rate_limited', retry_after: rl.retryAfter || 0 },
-            headers: { 'Retry-After': String(rl.retryAfter || 1) },
-        };
+        await replayCounter.recordRateLimitExceeded(license_key, session_token, { reason: rl.reason, retry_after: rl.retryAfter });
+        return collapseHeartbeatDeny('rate_limited:' + (rl.reason || ''), license_key, hwid, clientIp, { retry_after: rl.retryAfter || 0 });
+    }
+
+    const replayVerdict = await replayCounter.checkAndAdvance(body, { required: true });
+    if (!replayVerdict.ok) {
+        dbgHb('replay_blocked', { reason: replayVerdict.reason });
+        return collapseHeartbeatDeny('replay:' + (replayVerdict.reason || 'replay_blocked'), license_key, hwid, clientIp);
     }
 
     const banCheck = await checkBans(hwid, clientIp);
     dbgHb('ban_check', { banned: banCheck.banned, reason: banCheck.reason });
     if (banCheck.banned) {
-        return { status: 200, body: { status: 'banned', reason: banCheck.reason } };
+        return collapseHeartbeatDeny('banned:' + (banCheck.reason || ''), license_key, hwid, clientIp);
     }
 
     if (body.timestamp && typeof body.timestamp === 'number') {
-        const drift = Math.abs(Math.floor(Date.now() / 1000) - body.timestamp);
-        if (drift > 300) {
-            dbgHb('clock_drift', { drift, limit: 300 });
-            return { status: 200, body: { status: 'invalid', reason: 'clock_drift' } };
+        const driftMs = Math.abs(Date.now() - (body.timestamp * 1000));
+        if (driftMs > REQ_TIME_WINDOW_MS) {
+            dbgHb('clock_drift', { drift_ms: driftMs, limit_ms: REQ_TIME_WINDOW_MS });
+            await replayCounter.recordSignatureInvalid(license_key, session_token, { reason: 'heartbeat_clock_drift', drift_ms: driftMs, limit_ms: REQ_TIME_WINDOW_MS });
+            return collapseHeartbeatDeny('clock_drift', license_key, hwid, clientIp);
         }
     }
 
     if (!isHexNonce(body.heartbeat_nonce || '', 16, 128)) {
         dbgHb('invalid_heartbeat_nonce', { len: (body.heartbeat_nonce || '').length });
-        return { status: 200, body: { status: 'invalid', reason: 'invalid_heartbeat_nonce' } };
+        return collapseHeartbeatDeny('invalid_heartbeat_nonce', license_key, hwid, clientIp);
     }
 
     if (typeof body.echoed_server_nonce === 'string' && body.echoed_server_nonce.length > 0) {
         const echoed = body.echoed_server_nonce.trim().toLowerCase();
         if (!/^[0-9a-f]{16,128}$/.test(echoed)) {
             dbgHb('invalid_echoed_server_nonce', { len: echoed.length });
-            return { status: 401, body: { status: 'error', reason: 'invalid_echoed_server_nonce' } };
+            return collapseHeartbeatDeny('invalid_echoed_server_nonce', license_key, hwid, clientIp);
         }
         const nonceCheck = await rateLimit.registerNonce(license_key, session_token, 'echo:' + echoed, NONCE_REPLAY_TTL_SECONDS);
         if (!nonceCheck.ok) {
             dbgHb('nonce_replay', { echoed: echoed.slice(0, 16) });
-            return { status: 401, body: { status: 'error', reason: 'nonce_replay' } };
+            return collapseHeartbeatDeny('nonce_replay', license_key, hwid, clientIp);
         }
     }
 
@@ -1203,10 +1657,7 @@ async function handleHeartbeat(body, clientIp) {
         plan: lookup.data ? lookup.data.plan : '<no-data>',
     });
     if (!lookup.valid) {
-        return {
-            status: 200,
-            body: { status: lookup.reason === 'revoked' ? 'revoked' : 'invalid', reason: lookup.reason },
-        };
+        return collapseHeartbeatDeny('lookup:' + (lookup.reason || 'unknown'), license_key, hwid, clientIp);
     }
 
     const session = await getSession(license_key);
@@ -1225,12 +1676,26 @@ async function handleHeartbeat(body, clientIp) {
         last_gate_bitmap: session ? session.last_gate_bitmap : null,
     });
     if (!session || session.session_token !== session_token) {
-        return { status: 200, body: { status: 'invalid', reason: 'session_mismatch' } };
+        return collapseHeartbeatDeny('session_mismatch', license_key, hwid, clientIp);
     }
 
     if (session.kill_flag) {
         dbgHb('kill_flag_set', { license_key: maskToken(license_key) });
-        return { status: 200, body: { status: 'killed', alive: false, reason: 'server_kill' } };
+        return collapseHeartbeatDeny('server_kill', license_key, hwid, clientIp);
+    }
+
+    try {
+        const peerState = await peerCodeHash.getSessionPeerState(license_key);
+        if (peerState) {
+            const streak = Number(peerState.peer_attest_divergence_streak || 0);
+            if (streak >= 5) {
+                dbgHb('peer_attest_revoked', { streak });
+                await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
+                return collapseHeartbeatDeny('peer_code_hash_divergent', license_key, hwid, clientIp);
+            }
+        }
+    } catch (err) {
+        dbgHb('peer_attest_check_failed', { err: err && err.message ? err.message : 'unknown' });
     }
 
     const now = Math.floor(Date.now() / 1000);
@@ -1238,13 +1703,14 @@ async function handleHeartbeat(body, clientIp) {
         const expiresAt = session.issued_at + Math.floor(session.ttl * SESSION_TTL_GRACE_FACTOR);
         if (now > expiresAt) {
             dbgHb('session_expired', { now, issued_at: session.issued_at, ttl: session.ttl, expiresAt });
-            return { status: 200, body: { status: 'invalid', reason: 'session_expired' } };
+            return collapseHeartbeatDeny('session_expired', license_key, hwid, clientIp);
         }
     }
 
     if (hwid && session.hwid && hwid !== session.hwid) {
         dbgHb('hwid_mismatch', { body_hwid: maskToken(hwid), session_hwid: maskToken(session.hwid) });
-        return { status: 200, body: { status: 'invalid', reason: 'hwid_mismatch' } };
+        await replayCounter.recordHwidMismatch(license_key, session_token, { body_hwid_prefix: (hwid || '').slice(0, 16), session_hwid_prefix: (session.hwid || '').slice(0, 16) });
+        return collapseHeartbeatDeny('hwid_mismatch', license_key, hwid, clientIp);
     }
 
     const sessionStoredHbNonce = typeof session.heartbeat_nonce === 'string' ? session.heartbeat_nonce.trim().toLowerCase() : '';
@@ -1256,19 +1722,19 @@ async function handleHeartbeat(body, clientIp) {
                 expected_prefix: sessionStoredHbNonce.slice(0, 16),
                 provided_prefix: echoedRaw.slice(0, 16),
             });
-            return { status: 401, body: { status: 'invalid', reason: 'nonce_stale' } };
+            return collapseHeartbeatDeny('nonce_stale', license_key, hwid, clientIp);
         }
         const ageS = now - sessionStoredHbNonceIssuedAt;
         if (sessionStoredHbNonceIssuedAt <= 0 || ageS > HEARTBEAT_NONCE_MAX_AGE_SECONDS || ageS < -HEARTBEAT_NONCE_MAX_AGE_SECONDS) {
             dbgHb('nonce_stale', { age: ageS, issued_at: sessionStoredHbNonceIssuedAt, limit: HEARTBEAT_NONCE_MAX_AGE_SECONDS });
-            return { status: 401, body: { status: 'invalid', reason: 'nonce_stale' } };
+            return collapseHeartbeatDeny('nonce_stale', license_key, hwid, clientIp);
         }
     }
 
     const echoedBindProofRaw = typeof body.echoed_bind_proof === 'string' ? body.echoed_bind_proof.trim().toLowerCase() : '';
     if (echoedBindProofRaw.length > 0) {
         if (!/^[0-9a-f]{32,128}$/.test(echoedBindProofRaw)) {
-            return { status: 401, body: { status: 'invalid', reason: 'bind_proof_format' } };
+            return collapseHeartbeatDeny('bind_proof_format', license_key, hwid, clientIp);
         }
         const sessionCurrentBindProof = typeof session.bind_proof_current === 'string' ? session.bind_proof_current.trim().toLowerCase() : '';
         if (sessionCurrentBindProof.length > 0 && echoedBindProofRaw !== sessionCurrentBindProof) {
@@ -1276,14 +1742,14 @@ async function handleHeartbeat(body, clientIp) {
                 provided_prefix: echoedBindProofRaw.slice(0, 16),
                 expected_prefix: sessionCurrentBindProof.slice(0, 16),
             });
-            return { status: 401, body: { status: 'invalid', reason: 'bind_proof_mismatch' } };
+            return collapseHeartbeatDeny('bind_proof_mismatch', license_key, hwid, clientIp);
         }
         const history = Array.isArray(session.bind_proof_history) ? session.bind_proof_history : [];
         if (history.length > 0) {
             const reuseHit = history.some(entry => typeof entry === 'string' && entry.trim().toLowerCase() === echoedBindProofRaw);
             if (sessionCurrentBindProof !== echoedBindProofRaw && reuseHit) {
                 dbgHb('bind_proof_reuse', { proof_prefix: echoedBindProofRaw.slice(0, 16) });
-                return { status: 401, body: { status: 'invalid', reason: 'bind_proof_reuse' } };
+                return collapseHeartbeatDeny('bind_proof_reuse', license_key, hwid, clientIp);
             }
         }
     }
@@ -1291,7 +1757,7 @@ async function handleHeartbeat(body, clientIp) {
 
     const chHbResult = await enforceChallenge(body, clientIp, license_key);
     if (!chHbResult.ok) {
-        return { status: 200, body: { status: 'invalid', reason: chHbResult.reason } };
+        return collapseHeartbeatDeny('challenge:' + (chHbResult.reason || 'unknown'), license_key, hwid, clientIp);
     }
 
 
@@ -1308,7 +1774,7 @@ async function handleHeartbeat(body, clientIp) {
                     reasons: ['honeypot_export_called'],
                     evidence: { honeypot_export: session.honeypot_export },
                 });
-                return { status: 200, body: { status: 'killed', alive: false, reason: 'honeypot' } };
+                return collapseHeartbeatDeny('honeypot', license_key, hwid, clientIp);
             }
         }
     }
@@ -1458,7 +1924,7 @@ async function handleHeartbeat(body, clientIp) {
                 server_heartbeat_count: session.heartbeat_count || 0,
             },
         });
-        return { status: 200, body: { status: 'killed', alive: false, reason: violationReason } };
+        return collapseHeartbeatDeny('violation:' + violationReason, license_key, hwid, clientIp, { evidence_keys: Object.keys(violationEvidence) });
     }
     dbgHb('accept', {
         next_hb_count: (Number(session.heartbeat_count) || 0) + 1,
@@ -1498,15 +1964,7 @@ async function handleHeartbeat(body, clientIp) {
         console.warn('[anomaly] ingestHeartbeatAnomaly failed:', err && err.message ? err.message : err);
     }
     if (anomalyResult && anomalyResult.applied && anomalyResult.applied.action === 'revoke') {
-        return {
-            status: 200,
-            body: {
-                status: 'killed',
-                alive: false,
-                reason: anomalyResult.applied.reason || 'anomaly_auto_revoke',
-                anomaly_score: anomalyResult.applied.score,
-            },
-        };
+        return collapseHeartbeatDeny('anomaly:' + (anomalyResult.applied.reason || 'auto_revoke'), license_key, hwid, clientIp, { anomaly_score: anomalyResult.applied.score });
     }
 
     const heartbeatNonce = body.heartbeat_nonce || '';
@@ -1585,6 +2043,7 @@ async function handleHeartbeat(body, clientIp) {
     await rateLimit.registerNonce(license_key, session_token, 'issued:' + serverNonce, NONCE_REPLAY_TTL_SECONDS);
     await rateLimit.registerNonce(license_key, session_token, 'hbnonce:' + rotatedHbNonce, HEARTBEAT_NONCE_MAX_AGE_SECONDS);
 
+    const counter = (Number(session.heartbeat_count) || 0) + 1;
     const sigPayload = {
         status: 'valid',
         alive: true,
@@ -1600,6 +2059,7 @@ async function handleHeartbeat(body, clientIp) {
         rotated_bind_proof: rotatedBindProofHex,
         rotated_bind_proof_epoch: pageEpoch,
         page_epoch: pageEpoch,
+        ratchet_counter: counter,
         ttl_grace_factor: SESSION_TTL_GRACE_FACTOR,
         nonce_replay_ttl: NONCE_REPLAY_TTL_SECONDS,
     };
@@ -1624,19 +2084,99 @@ async function handleHeartbeat(body, clientIp) {
             if (killRows[0].reason) sigPayload.kill_reason = String(killRows[0].reason).slice(0, 64);
         }
     } catch (_) { }
+    try {
+        const forceVio = await replayCounter.isForceViolation(license_key);
+        if (forceVio) {
+            sigPayload.force_violation = true;
+            await replayCounter.clearForceViolation(license_key);
+        }
+    } catch (_) { }
     const rotationBlock = buildRotationBlock();
     Object.assign(sigPayload, rotationBlock);
-    const kidInfo = getActiveKidInfo();
-    sigPayload.kid = kidInfo.active_kid;
-    const { signature, next_signature, next_kid } = dualSignPayload(sigPayload);
 
-    const responseBody = { ...sigPayload, signature };
-    if (next_signature) responseBody.next_signature = next_signature;
-    if (next_kid) responseBody.next_kid = next_kid;
+    try {
+        if (body && (body.subaction === 'tool_exec' || body.tool_exec === true || typeof body.tool_call_id !== 'undefined')) {
+            const toolBind = await bindToolCallToken(license_key, session_token, anomalyEffectiveHwid, body);
+            if (toolBind && toolBind.ok) {
+                sigPayload.tool_call_id = toolBind.tool_call_id;
+                sigPayload.tool_call_token = toolBind.tool_call_token_hex;
+                sigPayload.tool_call_issued_at = toolBind.issued_at;
+            }
+        }
+    } catch (err) {
+        console.warn('[license] tool_call_token bind failed:', err && err.message ? err.message : err);
+    }
 
+    auditLog.logV2({
+        action: 'license.heartbeat',
+        license_key,
+        hwid: anomalyEffectiveHwid,
+        source_ip: clientIp,
+        decision: 'accept',
+        reason_code: 'ok',
+        extra: { heartbeat_count: counter, page_epoch: pageEpoch },
+    }).catch(() => {});
+
+    return envelopeResponse(200, sigPayload);
+}
+
+async function bindToolCallToken(licenseKey, sessionToken, hwid, body) {
+    if (!licenseKey || !sessionToken) return { ok: false, reason: 'missing_args' };
+    const rawCallId = (body && typeof body.tool_call_id !== 'undefined') ? body.tool_call_id : null;
+    let toolCallId;
+    if (rawCallId === null || rawCallId === undefined || rawCallId === '') {
+        try {
+            const { rows } = await pool.query(
+                `UPDATE session_ratchet
+                    SET last_tool_call_id = COALESCE(last_tool_call_id, 0) + 1,
+                        updated_at = $2
+                  WHERE license_key = $1
+                RETURNING last_tool_call_id`,
+                [licenseKey, Math.floor(Date.now() / 1000)]
+            );
+            if (rows.length === 0) {
+                toolCallId = 1;
+            } else {
+                toolCallId = Number(rows[0].last_tool_call_id || 1);
+            }
+        } catch (err) {
+            toolCallId = Math.floor(Date.now() / 1000);
+        }
+    } else {
+        const n = Number(rawCallId);
+        if (!Number.isFinite(n) || n < 0) return { ok: false, reason: 'invalid_call_id' };
+        toolCallId = Math.floor(n);
+    }
+    const issuedAt = Math.floor(Date.now() / 1000);
+    const masterSeed = process.env.ARC_MASTER_SECRET || process.env.SERVER_MASTER_KEY_B64 || 'aida-tool-bind-fallback';
+    const prk = crypto.createHmac('sha256', Buffer.from(String(masterSeed), 'utf8'))
+        .update(Buffer.from(String(sessionToken || ''), 'utf8'))
+        .update(Buffer.from('|tool|', 'utf8'))
+        .update(Buffer.from(String(hwid || ''), 'utf8'))
+        .digest();
+    const token = crypto.createHmac('sha256', prk)
+        .update(Buffer.from('tool_call|', 'utf8'))
+        .update(Buffer.from(String(toolCallId), 'utf8'))
+        .update(Buffer.from('|', 'utf8'))
+        .update(Buffer.from(String(issuedAt), 'utf8'))
+        .digest();
+    try {
+        await pool.query(
+            `UPDATE session_ratchet
+                SET last_tool_call_id = $2,
+                    last_tool_call_token = $3,
+                    updated_at = $4
+              WHERE license_key = $1`,
+            [licenseKey, toolCallId, token, issuedAt]
+        );
+    } catch (err) {
+        return { ok: false, reason: 'persist_failed' };
+    }
     return {
-        status: 200,
-        body: responseBody,
+        ok: true,
+        tool_call_id: toolCallId,
+        tool_call_token_hex: token.toString('hex'),
+        issued_at: issuedAt,
     };
 }
 
@@ -1648,7 +2188,7 @@ async function handleTpmAttest(body, clientIp) {
     }
     const lookup = await lookupLicense(license_key);
     if (!lookup.valid) {
-        return { status: 200, body: { status: 'invalid', reason: lookup.reason } };
+        return collapseInvalid('tpm_attest_lookup:' + (lookup.reason || 'unknown'), license_key, hwid, clientIp);
     }
     const tpmBundle = body.tpm_attest || body;
     if (!tpmBundle || typeof tpmBundle !== 'object') {
@@ -1659,54 +2199,53 @@ async function handleTpmAttest(body, clientIp) {
     });
     const result = tpmQuote.verifyTpmQuote(enriched);
     if (!result.ok) {
-        return { status: 200, body: { status: 'invalid', reason: 'tpm_quote_invalid', detail: result.reason } };
+        return collapseInvalid('tpm_quote_invalid:' + (result.reason || 'unknown'), lookup.data.key, hwid, clientIp);
     }
     if (lookup.data.tpm_ek_fingerprint && lookup.data.tpm_ek_fingerprint !== result.ekCertFingerprint) {
-        return { status: 200, body: { status: 'invalid', reason: 'tpm_ek_mismatch' } };
+        return collapseInvalid('tpm_ek_mismatch', lookup.data.key, hwid, clientIp);
     }
     const sessionTokenForSeal = (session_token && typeof session_token === 'string') ? session_token : '';
     const sealed = sessionTokenForSeal ? buildTpmSealedPayload(lookup.data, result, sessionTokenForSeal) : null;
-    await persistTpmAttestation(license_key, result, sealed);
+    await persistTpmAttestation(lookup.data.key, result, sealed);
 
     const responsePayload = {
         status: 'valid',
-        license_key,
+        license_key: lookup.data.key,
         ek_vendor: result.ekVendor || '',
         ek_fingerprint: result.ekCertFingerprint,
         pcr_digest: result.pcrDigestHex,
         hwid_component: result.hwidComponentHex,
     };
     if (sealed) responsePayload.tpm_sealed_key = sealed;
-    const kidInfo = getActiveKidInfo();
-    responsePayload.kid = kidInfo.active_kid;
-    const { signature, next_signature, next_kid } = dualSignPayload({
-        status: responsePayload.status,
-        license_key,
-        ek_fingerprint: responsePayload.ek_fingerprint,
-        pcr_digest: responsePayload.pcr_digest,
-        hwid_component: responsePayload.hwid_component,
-        kid: kidInfo.active_kid,
-    });
-    responsePayload.signature = signature;
-    if (next_signature) responsePayload.next_signature = next_signature;
-    if (next_kid) responsePayload.next_kid = next_kid;
-    return { status: 200, body: responsePayload };
+    return envelopeResponse(200, responsePayload);
 }
 
 
 async function handleKillSwitch(body, clientIp) {
-    const { admin_key, target_license, target_hwid, reason } = body;
+    const { admin_key, target_license, target_hwid, target_global, reason } = body;
 
     const expectedKey = process.env.ADMIN_API_KEY || '';
-    if (!expectedKey || !admin_key || typeof admin_key !== 'string') {
-        return { status: 403, body: { status: 'error', reason: 'unauthorized' } };
+    const adminOk = expectedKey
+        && typeof admin_key === 'string'
+        && admin_key.length > 0
+        && constantTimeKeyMatch(admin_key, expectedKey);
+
+    let botAuthorized = false;
+    if (!adminOk) {
+        const sigPresent = body && body.__bot_signature_present === true;
+        if (sigPresent && body && body.__bot_verified === true) {
+            botAuthorized = true;
+        }
     }
-    if (!crypto.timingSafeEqual(Buffer.from(admin_key), Buffer.from(expectedKey))) {
-        return { status: 403, body: { status: 'error', reason: 'unauthorized' } };
+
+    if (!adminOk && !botAuthorized) {
+        return buildEauthResult();
     }
 
     const sanitized = sanitizeReason(reason || 'admin_kill');
+    const createdBy = adminOk ? 'admin' : 'bot:' + (body && body.discord_id ? String(body.discord_id) : 'unknown');
     let killed = 0;
+    let switchesAdded = 0;
 
     if (target_license) {
         const { rowCount } = await pool.query(
@@ -1714,6 +2253,8 @@ async function handleKillSwitch(body, clientIp) {
             [target_license]
         );
         killed += rowCount;
+        const add = await killSwitchModule.addKill('license_key', target_license, sanitized, createdBy, null);
+        if (add.ok) switchesAdded += 1;
     }
 
     if (target_hwid) {
@@ -1722,70 +2263,167 @@ async function handleKillSwitch(body, clientIp) {
             [target_hwid]
         );
         killed += rowCount;
+        const hwidHashHex = killSwitchModule.hashHwid(target_hwid);
+        const add = await killSwitchModule.addKill('hwid_hash', hwidHashHex, sanitized, createdBy, null);
+        if (add.ok) switchesAdded += 1;
     }
 
-    if (killed > 0) {
+    if (target_global === true || target_global === 'on' || target_global === 1) {
+        const add = await killSwitchModule.addKill('global', null, sanitized, createdBy, null);
+        if (add.ok) switchesAdded += 1;
+    }
+
+    if (target_global === false || target_global === 'off' || target_global === 0) {
+        await killSwitchModule.removeKill('global', null);
+    }
+
+    if (killed > 0 || switchesAdded > 0) {
         const fields = [
             { name: 'Action', value: 'Kill Switch Activated' },
             { name: 'Target License', value: target_license || 'N/A' },
             { name: 'Target HWID', value: target_hwid || 'N/A' },
+            { name: 'Global', value: target_global ? String(target_global) : 'N/A' },
             { name: 'Reason', value: sanitized },
             { name: 'Sessions Killed', value: String(killed) },
-            { name: 'Triggered By', value: clientIp },
+            { name: 'Switches Added', value: String(switchesAdded) },
+            { name: 'Triggered By', value: createdBy + ' (' + clientIp + ')' },
         ];
         await sendDiscordWebhook('\uD83D\uDCA3 Kill Switch Activated', fields, 0xFF0000);
         await sendTelegramAlert('\uD83D\uDCA3 Kill Switch Activated', fields);
     }
 
-    return { status: 200, body: { status: 'ok', killed } };
+    auditLog.logV2({
+        action: 'license.kill_switch',
+        license_key: target_license || '',
+        hwid: target_hwid || '',
+        source_ip: clientIp,
+        decision: 'accept',
+        reason_code: sanitized,
+        extra: { switches_added: switchesAdded, killed, global: !!target_global, created_by: createdBy },
+    }).catch(() => {});
+
+    return { status: 200, body: { status: 'ok', killed, switches_added: switchesAdded } };
 }
 
 
-async function handleReportViolation(body, clientIp) {
-    const { hwid, reason, version, license_key, session_token } = body;
+async function verifyReportBindProof(session, body) {
+    if (!session || !session.auth_hmac_key) return { ok: false, reason: 'no_session_key' };
+    const provided = body && body.bind_proof;
+    if (typeof provided !== 'string' || provided.length < 32) return { ok: false, reason: 'missing_bind_proof' };
+    const canonicalSubset = {};
+    const keys = Object.keys(body).filter(k => k !== 'bind_proof' && k !== '__challenge_id_header' && k !== '__challenge_signature_header' && k !== '__raw_body').sort();
+    for (const k of keys) canonicalSubset[k] = body[k];
+    const canonical = JSON.stringify(canonicalSubset);
+    const expected = crypto.createHmac('sha256', session.auth_hmac_key)
+        .update('report|', 'utf8')
+        .update(canonical, 'utf8')
+        .digest();
+    const expectedHex = expected.toString('hex');
+    const providedNorm = provided.trim().toLowerCase();
+    if (providedNorm.length !== expectedHex.length) return { ok: false, reason: 'bind_proof_length' };
+    const a = Buffer.from(providedNorm, 'utf8');
+    const b = Buffer.from(expectedHex, 'utf8');
+    if (a.length !== b.length) return { ok: false, reason: 'bind_proof_length' };
+    if (!crypto.timingSafeEqual(a, b)) return { ok: false, reason: 'bind_proof_mismatch' };
+    return { ok: true };
+}
 
+async function handleReportViolation(body, clientIp) {
+    const { hwid, reason, version, license_key, session_token, driver_proof } = body || {};
+
+    const respondOk = () => envelopeResponse(200, { status: 'ok' });
 
     if (!hwid || typeof hwid !== 'string' || hwid.length < 8 || hwid.length > 64) {
-        return { status: 200, body: { status: 'ok' } };
+        return respondOk();
     }
     if (!license_key || !session_token) {
-        return { status: 200, body: { status: 'ok' } };
+        return respondOk();
     }
 
     const sanitizedReason = sanitizeReason(reason);
 
     const lookup = await lookupLicense(license_key);
     if (!lookup.valid) {
-        return { status: 200, body: { status: 'ok' } };
+        auditLog.logServerEvent('report_violation.reject', license_key, { reason: 'lookup_failed' }).catch(() => {});
+        return respondOk();
     }
+    const normalizedLicenseKey = lookup.data.key;
 
-    const session = await getSession(license_key);
+    const session = await getSession(normalizedLicenseKey);
     if (!session || session.session_token !== session_token) {
-        return { status: 200, body: { status: 'ok' } };
+        auditLog.logServerEvent('report_violation.reject', normalizedLicenseKey, { reason: 'session_mismatch' }).catch(() => {});
+        return respondOk();
     }
     if (session.hwid && session.hwid !== hwid) {
-        return { status: 200, body: { status: 'ok' } };
+        auditLog.logServerEvent('report_violation.reject', normalizedLicenseKey, { reason: 'hwid_mismatch' }).catch(() => {});
+        return respondOk();
     }
 
-    await revokeLicenseAndSession(license_key, sanitizedReason, version, hwid);
+    const bindCheck = await verifyReportBindProof(session, body);
+    if (!bindCheck.ok) {
+        auditLog.logServerEvent('report_violation.reject', normalizedLicenseKey, { reason: 'bind_proof:' + (bindCheck.reason || 'unknown') }).catch(() => {});
+        return respondOk();
+    }
+
+    const driverProofPresent = typeof driver_proof === 'string'
+        && driver_proof.length >= 16
+        && /^[0-9a-fA-F]+$/.test(driver_proof);
+    const storedProofToken = typeof session.last_proof_token === 'string' ? session.last_proof_token : '';
+    if (!driverProofPresent || !storedProofToken || driver_proof !== storedProofToken) {
+        auditLog.logServerEvent('report_violation.reject', normalizedLicenseKey, { reason: 'driver_proof_missing_or_mismatch' }).catch(() => {});
+        return respondOk();
+    }
+
+    await revokeLicenseAndSession(normalizedLicenseKey, sanitizedReason, version, hwid);
     await recordBan(hwid, clientIp, sanitizedReason, version, {
         route: 'license',
         action: 'report_violation',
-        license_key,
+        license_key: normalizedLicenseKey,
         session_token,
         reasons: [sanitizedReason],
-        evidence: { client_reason: sanitizedReason },
+        evidence: { client_reason: sanitizedReason, bind_proof_verified: true, driver_proof_verified: true },
     });
 
-    return { status: 200, body: { status: 'ok' } };
+    return respondOk();
 }
 
 
 async function handleHoneypotTrip(body, clientIp) {
-    const { event, trap, hwid, timestamp, cpuid, tsc } = body;
+    const { event, trap, hwid, timestamp, cpuid, tsc, license_key, session_token, driver_proof } = body || {};
+
+    const respondOk = () => envelopeResponse(200, { status: 'ok' });
 
     if (event !== 'honeypot_trip' || !trap || !hwid) {
-        return { status: 200, body: { status: 'ok' } };
+        return respondOk();
+    }
+
+    if (license_key && session_token) {
+        const lookup = await lookupLicense(license_key);
+        if (!lookup.valid) {
+            auditLog.logServerEvent('honeypot_trip.reject', license_key, { reason: 'lookup_failed' }).catch(() => {});
+            return respondOk();
+        }
+        const session = await getSession(lookup.data.key);
+        if (!session || session.session_token !== session_token) {
+            auditLog.logServerEvent('honeypot_trip.reject', lookup.data.key, { reason: 'session_mismatch' }).catch(() => {});
+            return respondOk();
+        }
+        const bindCheck = await verifyReportBindProof(session, body);
+        if (!bindCheck.ok) {
+            auditLog.logServerEvent('honeypot_trip.reject', lookup.data.key, { reason: 'bind_proof:' + (bindCheck.reason || 'unknown') }).catch(() => {});
+            return respondOk();
+        }
+        const driverProofPresent = typeof driver_proof === 'string'
+            && driver_proof.length >= 16
+            && /^[0-9a-fA-F]+$/.test(driver_proof);
+        const storedProofToken = typeof session.last_proof_token === 'string' ? session.last_proof_token : '';
+        if (!driverProofPresent || !storedProofToken || driver_proof !== storedProofToken) {
+            auditLog.logServerEvent('honeypot_trip.reject', lookup.data.key, { reason: 'driver_proof_missing_or_mismatch' }).catch(() => {});
+            return respondOk();
+        }
+    } else {
+        auditLog.logServerEvent('honeypot_trip.reject', license_key || '', { reason: 'unauthenticated' }).catch(() => {});
+        return respondOk();
     }
 
     const sanitizedTrap = sanitizeReason(trap);
@@ -1831,7 +2469,7 @@ async function handleHoneypotTrip(body, clientIp) {
     await sendTelegramAlert('\uD83C\uDFAF HONEYPOT TRIGGERED — Cracker Detected', fields);
 
 
-    return { status: 200, body: { status: 'ok' } };
+    return envelopeResponse(200, { status: 'ok' });
 }
 
 
@@ -1927,17 +2565,25 @@ async function handleDriverProof(body, clientIp) {
     await updateLastProofToken(license_key, driver_proof);
 
     const newNonce = generateServerNonce();
-    return {
-        status: 200,
-        body: { status: 'valid', server_nonce: newNonce },
-    };
+    return envelopeResponse(200, { status: 'valid', server_nonce: newNonce });
 }
 
 
+async function sendEauth(res, startedAt) {
+    await applyEauthBudget(startedAt);
+    res.removeHeader && res.removeHeader('X-Powered-By');
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Length', String(EAUTH_BODY_LENGTH));
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(401).send(EAUTH_BODY_JSON);
+}
+
 router.post('/', async (req, res) => {
     const body = req.body;
+    const dispatchStartedAt = Date.now();
+
     if (!body || typeof body !== 'object') {
-        return res.status(400).json({ status: 'error', reason: 'invalid_body' });
+        return sendEauth(res, dispatchStartedAt);
     }
 
     const headers = req.headers || {};
@@ -1947,6 +2593,37 @@ router.post('/', async (req, res) => {
 
     const clientIp = getClientIp(req);
     const action = body.action;
+
+    if (action === 'kill') {
+        const sig = req.headers['x-bot-signature'];
+        if (typeof sig === 'string' && sig.length > 0) {
+            const verify = botAuth.verifyBotRequest(req);
+            body.__bot_signature_present = true;
+            body.__bot_verified = !!(verify && verify.ok);
+        }
+    }
+
+    if (SESSION_RATCHET_ENABLED && SESSION_RATCHET_AUTHENTICATED_ACTIONS.has(action)) {
+        const middleware = sessionRatchet.enforce({ required: true });
+        let nextCalled = false;
+        const ratchetDone = new Promise((resolve) => {
+            const nextFn = () => { nextCalled = true; resolve(); };
+            try {
+                const ret = middleware(req, res, nextFn);
+                if (ret && typeof ret.then === 'function') {
+                    ret.then(() => resolve(), () => resolve());
+                }
+            } catch (_) {
+                resolve();
+            }
+            res.on('finish', () => resolve());
+            res.on('close', () => resolve());
+        });
+        await ratchetDone;
+        if (!nextCalled || res.headersSent || res.writableEnded) {
+            return;
+        }
+    }
 
     try {
         let result;
@@ -1974,7 +2651,11 @@ router.post('/', async (req, res) => {
                 result = await withPgRetry(() => handleTpmAttest(body, clientIp));
                 break;
             default:
-                return res.status(400).json({ status: 'error', reason: 'unknown_action' });
+                return sendEauth(res, dispatchStartedAt);
+        }
+
+        if (result && result.eauth === true) {
+            return sendEauth(res, dispatchStartedAt);
         }
 
         if (result && result.headers && typeof result.headers === 'object') {
@@ -1982,11 +2663,11 @@ router.post('/', async (req, res) => {
                 if (hk && hv !== undefined && hv !== null) res.setHeader(hk, String(hv));
             }
         }
+        await applyTimingBudget(dispatchStartedAt);
         return res.status(result.status).json(result.body);
     } catch (err) {
         console.error(`[license] Error processing ${action}:`, err);
-        const statusCode = isTransientError(err) ? 503 : 500;
-        return res.status(statusCode).json({ status: 'error', reason: 'internal_error' });
+        return sendEauth(res, dispatchStartedAt);
     }
 });
 
@@ -2113,15 +2794,97 @@ function epochToIsoOrNull(epoch) {
     return d.toISOString();
 }
 
+async function authorizeAdminOrBot(req, expectedAction) {
+    const body = req.body || {};
+    const adminKey = body.admin_key;
+    if (typeof adminKey === 'string' && adminKey.length > 0 && verifyAdminKey(adminKey)) {
+        return { ok: true, mode: 'admin' };
+    }
+    const botSig = req.headers['x-bot-signature'];
+    if (typeof botSig === 'string' && botSig.length > 0) {
+        const verify = botAuth.verifyBotRequest(req);
+        if (!verify.ok) {
+            return { ok: false, reason: verify.reason || 'bot_unauthorized' };
+        }
+        if (expectedAction && body.action && body.action !== expectedAction) {
+            return { ok: false, reason: 'bot_action_mismatch' };
+        }
+        try {
+            const nonce = typeof body.nonce === 'string' ? body.nonce : '';
+            if (!nonce) return { ok: false, reason: 'bot_nonce_missing' };
+            await pool.query(
+                `INSERT INTO bot_command_log (nonce_hex, action, discord_id, received_at, payload)
+                 VALUES ($1, $2, $3, $4, $5::jsonb)`,
+                [nonce, expectedAction || body.action || 'unknown', String(body.discord_id || ''), Math.floor(Date.now() / 1000), JSON.stringify(body || {})]
+            );
+        } catch (err) {
+            if (err && err.code === '23505') {
+                return { ok: false, reason: 'bot_nonce_replay' };
+            }
+        }
+        return { ok: true, mode: 'bot' };
+    }
+    return { ok: false, reason: 'unauthorized' };
+}
+
+async function generateLicenseSecrets() {
+    let installSecretWrapped = null;
+    let witnessKeyWrapped = null;
+    let ioctlSeedWrapped = null;
+    const installSecret = kwWrap.generateInstallSecret();
+    installSecretWrapped = kwWrap.wrap(installSecret, 'install_secret/v1');
+    const kw = kwWrap.generateWitnessKey();
+    witnessKeyWrapped = kwWrap.wrap(kw, 'kw/v1');
+    const ioctlSeed = crypto.randomBytes(16);
+    ioctlSeedWrapped = kwWrap.wrap(ioctlSeed, 'ioctl_seed/v1');
+    return { installSecretWrapped, witnessKeyWrapped, ioctlSeedWrapped };
+}
+
+async function createLicenseRow(opts) {
+    const safeNote = (typeof opts.note === 'string' ? opts.note : '').slice(0, 512).replace(/[^\x20-\x7E]/g, '');
+    const safeCreatedBy = (typeof opts.created_by === 'string' ? opts.created_by : 'payment_system').slice(0, 128).replace(/[^\x20-\x7E]/g, '');
+    const planValue = typeof opts.plan === 'string' && opts.plan.length > 0 ? opts.plan : 'pro';
+    const tierValue = typeof opts.tier === 'string' && opts.tier.length > 0 ? opts.tier : (planValue || 'standard');
+    const formatRequested = Number(opts.key_format) === keyFormat.FORMAT_LEGACY ? keyFormat.FORMAT_LEGACY : keyFormat.FORMAT_MODERN;
+    const key = formatRequested === keyFormat.FORMAT_MODERN ? keyFormat.generateModernKey() : keyFormat.generateLegacyKey();
+    const now = Math.floor(Date.now() / 1000);
+
+    const secrets = await generateLicenseSecrets();
+    const discordLinkedAt = opts.discord_id ? now : 0;
+
+    await pool.query(
+        `INSERT INTO licenses (key, active, hwid, expires, expires_epoch, plan, tier, key_format, note, created_at, created_by, install_secret_wrapped, witness_key_wrapped, ioctl_seed_wrapped, discord_id, discord_id_linked_at)
+         VALUES ($1, true, '', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+        [
+            key,
+            opts.expires_date_str || '',
+            opts.expires_epoch || 0,
+            planValue,
+            tierValue,
+            formatRequested,
+            safeNote,
+            now,
+            safeCreatedBy,
+            secrets.installSecretWrapped,
+            secrets.witnessKeyWrapped,
+            secrets.ioctlSeedWrapped,
+            opts.discord_id || '',
+            discordLinkedAt,
+        ]
+    );
+    return { key, created_at: now, plan: planValue, tier: tierValue, key_format: formatRequested };
+}
+
 router.post('/create', async (req, res) => {
     const body = req.body || {};
-    const { admin_key, plan, note, expires, expiry_time, discord_id, created_by } = body;
+    const { plan, note, expires, expiry_time, discord_id, created_by, key_format: keyFormatRequest } = body;
 
-    if (!verifyAdminKey(admin_key)) {
-        return res.status(403).json({ status: 'error', reason: 'unauthorized' });
+    const auth = await authorizeAdminOrBot(req, 'create');
+    if (!auth.ok) {
+        return res.status(403).json({ status: 'error', reason: auth.reason || 'unauthorized' });
     }
 
-    if (plan !== 'pro') {
+    if (plan && plan !== 'pro') {
         return res.status(400).json({ status: 'error', reason: 'invalid_plan', valid_plans: ['pro'] });
     }
 
@@ -2138,72 +2901,221 @@ router.post('/create', async (req, res) => {
         return res.status(400).json({ status: 'error', reason: discordParsed.reason });
     }
 
-    const safeNote = (typeof note === 'string' ? note : '').slice(0, 512).replace(/[^\x20-\x7E]/g, '');
-    const safeCreatedBy = (typeof created_by === 'string' ? created_by : 'payment_system').slice(0, 128).replace(/[^\x20-\x7E]/g, '');
-
-    const segments = [
-        crypto.randomBytes(2).toString('hex').toUpperCase(),
-        crypto.randomBytes(2).toString('hex').toUpperCase(),
-        crypto.randomBytes(2).toString('hex').toUpperCase(),
-        crypto.randomBytes(2).toString('hex').toUpperCase(),
-    ];
-    const key = 'AIDA-' + segments.join('-');
-    const now = Math.floor(Date.now() / 1000);
-
-    let installSecretWrapped = null;
-    let witnessKeyWrapped = null;
     try {
-        const installSecret = kwWrap.generateInstallSecret();
-        installSecretWrapped = kwWrap.wrap(installSecret, 'install_secret/v1');
+        const created = await createLicenseRow({
+            plan: plan || 'pro',
+            tier: body.tier || plan || 'pro',
+            note,
+            created_by,
+            discord_id: discordParsed.value,
+            expires_date_str: expiryParsed.date_str,
+            expires_epoch: expiryParsed.epoch,
+            key_format: keyFormatRequest,
+        });
+        return res.status(200).json({
+            status: 'ok',
+            key: created.key,
+            plan: created.plan,
+            tier: created.tier,
+            key_format: created.key_format,
+            expires: expiryParsed.date_str || null,
+            expires_epoch: expiryParsed.epoch || null,
+            expires_iso: epochToIsoOrNull(expiryParsed.epoch),
+            discord_id: discordParsed.value || null,
+            created_at: created.created_at,
+        });
     } catch (err) {
-        console.error('[license/create] install_secret wrap failed:', err && err.message ? err.message : err);
-        return res.status(500).json({ status: 'error', reason: 'install_secret_wrap_failed' });
-    }
-    try {
-        const kw = kwWrap.generateWitnessKey();
-        witnessKeyWrapped = kwWrap.wrap(kw, 'kw/v1');
-    } catch (err) {
-        console.error('[license/create] witness_key wrap failed:', err && err.message ? err.message : err);
-        return res.status(500).json({ status: 'error', reason: 'witness_key_wrap_failed' });
-    }
-
-    const discordLinkedAt = discordParsed.value ? now : 0;
-
-    try {
-        await pool.query(
-            `INSERT INTO licenses (key, active, hwid, expires, expires_epoch, plan, note, created_at, created_by, install_secret_wrapped, witness_key_wrapped, discord_id, discord_id_linked_at)
-             VALUES ($1, true, '', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-            [key, expiryParsed.date_str, expiryParsed.epoch, plan, safeNote, now, safeCreatedBy, installSecretWrapped, witnessKeyWrapped, discordParsed.value, discordLinkedAt]
-        );
-    } catch (err) {
-        console.error('[license/create] DB insert error:', err);
+        console.error('[license/create] failure:', err && err.message ? err.message : err);
         return res.status(500).json({ status: 'error', reason: 'internal_error' });
     }
+});
 
+router.post('/bulk_create', async (req, res) => {
+    const body = req.body || {};
+    const auth = await authorizeAdminOrBot(req, 'bulk_create');
+    if (!auth.ok) {
+        return res.status(403).json({ status: 'error', reason: auth.reason || 'unauthorized' });
+    }
+    const count = Math.max(1, Math.min(50, Number(body.count) || 0));
+    if (!count) {
+        return res.status(400).json({ status: 'error', reason: 'invalid_count' });
+    }
+    if (body.plan && body.plan !== 'pro') {
+        return res.status(400).json({ status: 'error', reason: 'invalid_plan' });
+    }
+    const expiryInput = (body.expiry_time !== undefined && body.expiry_time !== null && body.expiry_time !== '')
+        ? body.expiry_time
+        : body.expires;
+    const expiryParsed = parseExpiryInput(expiryInput);
+    if (!expiryParsed.ok) {
+        return res.status(400).json({ status: 'error', reason: expiryParsed.reason });
+    }
+    const discordParsed = parseDiscordId(body.discord_id);
+    if (!discordParsed.ok) {
+        return res.status(400).json({ status: 'error', reason: discordParsed.reason });
+    }
+    const keys = [];
+    try {
+        for (let i = 0; i < count; i++) {
+            const created = await createLicenseRow({
+                plan: body.plan || 'pro',
+                tier: body.tier || body.plan || 'pro',
+                note: body.note,
+                created_by: body.created_by,
+                discord_id: discordParsed.value,
+                expires_date_str: expiryParsed.date_str,
+                expires_epoch: expiryParsed.epoch,
+                key_format: body.key_format,
+            });
+            keys.push(created.key);
+        }
+    } catch (err) {
+        console.error('[license/bulk_create] failure:', err && err.message ? err.message : err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
     return res.status(200).json({
         status: 'ok',
-        key,
-        plan,
+        count: keys.length,
+        keys,
         expires: expiryParsed.date_str || null,
         expires_epoch: expiryParsed.epoch || null,
         expires_iso: epochToIsoOrNull(expiryParsed.epoch),
         discord_id: discordParsed.value || null,
-        created_at: now,
     });
+});
+
+router.post('/reset_hwid', async (req, res) => {
+    const body = req.body || {};
+    const auth = await authorizeAdminOrBot(req, 'reset_hwid');
+    if (!auth.ok) {
+        return res.status(403).json({ status: 'error', reason: auth.reason || 'unauthorized' });
+    }
+    const key = typeof body.key === 'string' ? body.key.trim() : '';
+    const normalized = keyFormat.normalizeForLookup(key);
+    if (!normalized) {
+        return res.status(400).json({ status: 'error', reason: 'invalid_key_format' });
+    }
+    try {
+        const { rowCount } = await pool.query(
+            "UPDATE licenses SET hwid = '', hwid_factors = '{}'::jsonb, hwid_grace_used_at = 0 WHERE key = $1",
+            [normalized]
+        );
+        if (rowCount === 0) {
+            return res.status(404).json({ status: 'error', reason: 'license_not_found' });
+        }
+        await pool.query('DELETE FROM sessions WHERE license_key = $1', [normalized]);
+        return res.status(200).json({ status: 'ok', key: normalized });
+    } catch (err) {
+        console.error('[license/reset_hwid] failure:', err && err.message ? err.message : err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+});
+
+router.post('/transfer', async (req, res) => {
+    const body = req.body || {};
+    const auth = await authorizeAdminOrBot(req, 'transfer');
+    if (!auth.ok) {
+        return res.status(403).json({ status: 'error', reason: auth.reason || 'unauthorized' });
+    }
+    const key = typeof body.key === 'string' ? body.key.trim() : '';
+    const normalized = keyFormat.normalizeForLookup(key);
+    if (!normalized) {
+        return res.status(400).json({ status: 'error', reason: 'invalid_key_format' });
+    }
+    const newHwid = typeof body.new_hwid === 'string' ? body.new_hwid.trim() : '';
+    if (newHwid.length < 8 || newHwid.length > 256) {
+        return res.status(400).json({ status: 'error', reason: 'invalid_new_hwid' });
+    }
+    try {
+        const { rowCount } = await pool.query(
+            "UPDATE licenses SET hwid = $1, hwid_factors = '{}'::jsonb, hwid_grace_used_at = 0 WHERE key = $2",
+            [newHwid, normalized]
+        );
+        if (rowCount === 0) {
+            return res.status(404).json({ status: 'error', reason: 'license_not_found' });
+        }
+        await pool.query('DELETE FROM sessions WHERE license_key = $1', [normalized]);
+        return res.status(200).json({ status: 'ok', key: normalized, new_hwid: newHwid });
+    } catch (err) {
+        console.error('[license/transfer] failure:', err && err.message ? err.message : err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+});
+
+router.post('/revoke', async (req, res) => {
+    const body = req.body || {};
+    const auth = await authorizeAdminOrBot(req, 'revoke');
+    if (!auth.ok) {
+        return res.status(403).json({ status: 'error', reason: auth.reason || 'unauthorized' });
+    }
+    const key = typeof body.key === 'string' ? body.key.trim() : '';
+    const normalized = keyFormat.normalizeForLookup(key);
+    if (!normalized) {
+        return res.status(400).json({ status: 'error', reason: 'invalid_key_format' });
+    }
+    const reason = sanitizeReason(body.reason || 'admin_revoke');
+    try {
+        const now = Math.floor(Date.now() / 1000);
+        const { rowCount } = await pool.query(
+            `UPDATE licenses
+             SET active = false, revoked_at = $1, revoked_at_iso = $2, revoked_reason = $3, revoked_version = 'admin'
+             WHERE key = $4`,
+            [now, new Date(now * 1000).toISOString(), reason, normalized]
+        );
+        if (rowCount === 0) {
+            return res.status(404).json({ status: 'error', reason: 'license_not_found' });
+        }
+        await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [normalized]);
+        return res.status(200).json({ status: 'ok', key: normalized, reason });
+    } catch (err) {
+        console.error('[license/revoke] failure:', err && err.message ? err.message : err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+});
+
+router.post('/kill', async (req, res) => {
+    const startedAt = Date.now();
+    const body = req.body || {};
+    const auth = await authorizeAdminOrBot(req, 'kill');
+    if (!auth.ok) {
+        await applyEauthBudget(startedAt);
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Content-Length', String(EAUTH_BODY_LENGTH));
+        res.setHeader('Cache-Control', 'no-store');
+        return res.status(401).send(EAUTH_BODY_JSON);
+    }
+    if (auth.mode === 'bot') {
+        body.__bot_signature_present = true;
+        body.__bot_verified = true;
+    }
+    const clientIp = getClientIp(req);
+    const result = await handleKillSwitch(body, clientIp);
+    if (result && result.eauth === true) {
+        await applyEauthBudget(startedAt);
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Content-Length', String(EAUTH_BODY_LENGTH));
+        res.setHeader('Cache-Control', 'no-store');
+        return res.status(401).send(EAUTH_BODY_JSON);
+    }
+    return res.status(result.status).json(result.body);
 });
 
 router.post('/update', async (req, res) => {
     const body = req.body || {};
-    const { admin_key, key } = body;
+    const { key } = body;
 
-    if (!verifyAdminKey(admin_key)) {
-        return res.status(403).json({ status: 'error', reason: 'unauthorized' });
+    const auth = await authorizeAdminOrBot(req, 'update');
+    if (!auth.ok) {
+        return res.status(403).json({ status: 'error', reason: auth.reason || 'unauthorized' });
     }
 
-    if (typeof key !== 'string' || !/^AIDA-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}$/.test(key.toUpperCase())) {
+    if (typeof key !== 'string') {
         return res.status(400).json({ status: 'error', reason: 'invalid_key_format' });
     }
-    const normalizedKey = key.toUpperCase();
+    const normalizedKey = keyFormat.normalizeForLookup(key);
+    if (!normalizedKey) {
+        return res.status(400).json({ status: 'error', reason: 'invalid_key_format' });
+    }
 
     const updates = [];
     const params = [];
@@ -2329,10 +3241,10 @@ router.get('/lookup/:key', async (req, res) => {
         return res.status(403).json({ status: 'error', reason: 'unauthorized' });
     }
     const rawKey = req.params.key || '';
-    if (typeof rawKey !== 'string' || !/^AIDA-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}$/.test(rawKey.toUpperCase())) {
+    const key = keyFormat.normalizeForLookup(rawKey);
+    if (!key) {
         return res.status(400).json({ status: 'error', reason: 'invalid_key_format' });
     }
-    const key = rawKey.toUpperCase();
     try {
         const result = await pool.query(
             `SELECT key, active, hwid, plan, note, expires, expires_epoch, discord_id, discord_id_linked_at, created_at, created_by, revoked_at, revoked_at_iso, revoked_reason

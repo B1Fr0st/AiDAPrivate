@@ -1222,12 +1222,16 @@ inline bool verify_page_eager(uint32_t page_index)
     return detail::verify_page_locked(pt, page_index);
 }
 
+inline bool is_page_expected_to_be_corrupted_u32(uint32_t page_index);
+
 inline bool verify_full_text_eager(uint32_t* mismatched_page_out = nullptr)
 {
     auto& pt = detail::page_table();
     std::lock_guard<std::mutex> lk(pt.mtx);
     for (uint32_t i = 0; i < pt.entries.size(); ++i)
     {
+        if (is_page_expected_to_be_corrupted_u32(i))
+            continue;
         if (!detail::verify_page_locked(pt, i))
         {
             if (mismatched_page_out) *mismatched_page_out = i;
@@ -1256,6 +1260,90 @@ inline bool periodic_violation_latched()
 inline void clear_periodic_violation_flag()
 {
     detail::periodic_violation_flag().store(false, std::memory_order_release);
+}
+
+namespace expected_corruption {
+
+    constexpr uint32_t kMaskBitCount = 8192;
+    constexpr uint32_t kMaskWordCount = kMaskBitCount / 64;
+
+    inline std::atomic<uint64_t>* mask_array()
+    {
+        static std::atomic<uint64_t> arr[kMaskWordCount]{};
+        return arr;
+    }
+
+    inline std::atomic<uint32_t>& active_count()
+    {
+        static std::atomic<uint32_t> v{0};
+        return v;
+    }
+
+}
+
+inline bool is_page_expected_to_be_corrupted(uint8_t page_index)
+{
+    if (expected_corruption::active_count().load(std::memory_order_acquire) == 0)
+        return false;
+    uint32_t idx = static_cast<uint32_t>(page_index);
+    uint32_t word = idx / 64u;
+    uint32_t bit = idx % 64u;
+    if (word >= expected_corruption::kMaskWordCount) return false;
+    uint64_t w = expected_corruption::mask_array()[word].load(std::memory_order_acquire);
+    return (w & (1ULL << bit)) != 0;
+}
+
+inline bool is_page_expected_to_be_corrupted_u32(uint32_t page_index)
+{
+    if (expected_corruption::active_count().load(std::memory_order_acquire) == 0)
+        return false;
+    uint32_t word = page_index / 64u;
+    uint32_t bit = page_index % 64u;
+    if (word >= expected_corruption::kMaskWordCount) return false;
+    uint64_t w = expected_corruption::mask_array()[word].load(std::memory_order_acquire);
+    return (w & (1ULL << bit)) != 0;
+}
+
+inline void set_expected_corruption_mask(const uint8_t* page_indices, size_t count)
+{
+    if (!page_indices || count == 0) return;
+    uint32_t added = 0;
+    for (size_t i = 0; i < count; ++i)
+    {
+        uint32_t idx = static_cast<uint32_t>(page_indices[i]);
+        uint32_t word = idx / 64u;
+        uint32_t bit = idx % 64u;
+        if (word >= expected_corruption::kMaskWordCount) continue;
+        auto& w = expected_corruption::mask_array()[word];
+        uint64_t prev = w.fetch_or(1ULL << bit, std::memory_order_acq_rel);
+        if ((prev & (1ULL << bit)) == 0)
+            ++added;
+    }
+    if (added > 0)
+        expected_corruption::active_count().fetch_add(added, std::memory_order_acq_rel);
+}
+
+inline void clear_expected_corruption_mask(const uint8_t* page_indices, size_t count)
+{
+    if (!page_indices || count == 0) return;
+    uint32_t removed = 0;
+    for (size_t i = 0; i < count; ++i)
+    {
+        uint32_t idx = static_cast<uint32_t>(page_indices[i]);
+        uint32_t word = idx / 64u;
+        uint32_t bit = idx % 64u;
+        if (word >= expected_corruption::kMaskWordCount) continue;
+        auto& w = expected_corruption::mask_array()[word];
+        uint64_t prev = w.fetch_and(~(1ULL << bit), std::memory_order_acq_rel);
+        if ((prev & (1ULL << bit)) != 0)
+            ++removed;
+    }
+    if (removed > 0)
+    {
+        uint32_t cur = expected_corruption::active_count().load(std::memory_order_acquire);
+        uint32_t next = (removed >= cur) ? 0u : (cur - removed);
+        expected_corruption::active_count().store(next, std::memory_order_release);
+    }
 }
 
 inline void rebuild_self_chain_anchor_locked()
@@ -1501,6 +1589,13 @@ namespace periodic {
                             quorum = false;
                             break;
                         }
+                    }
+                    bool corruption_active = expected_corruption::active_count().load(std::memory_order_acquire) != 0;
+                    if (!quorum && corruption_active)
+                    {
+                        webhook::write_log_critical("page_mac",
+                            "worker_quorum_skip_due_to_expected_corruption");
+                        quorum = true;
                     }
                     if (!quorum)
                     {

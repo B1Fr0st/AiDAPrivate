@@ -37,15 +37,22 @@ $files = @(
     "crypto\binary_protocol.js",
     "crypto\tpm_quote.js",
     "crypto\ek_roots.js",
+    "crypto\session_aead.js",
+    "crypto\canonical_response.js",
+    "crypto\key_format.js",
     "middleware\hmac_auth.js",
     "middleware\rate_limit.js",
+    "middleware\audit_log.js",
+    "middleware\license_rate_limit.js",
+    "middleware\bot_auth.js",
     "anomaly\model.js",
     "anomaly\score.js",
     "db\pool.js",
     "db\migrate.js",
-    "db\schema.sql"
+    "db\schema.sql",
+    "db\migrations\0001_auth_redesign.sql"
 )
-$remoteDirs = @("routes", "crypto", "middleware", "anomaly", "db") | ForEach-Object { "$DST$_" }
+$remoteDirs = @("routes", "crypto", "middleware", "anomaly", "db", "db/migrations") | ForEach-Object { "$DST$_" }
 $mkdirCmd = "mkdir -p " + ($remoteDirs -join " ")
 & ssh @SSH_OPTS $REMOTE $mkdirCmd | Out-Null
 foreach ($f in $files) {
@@ -97,9 +104,9 @@ if ((Test-Path $privKeyPath) -and (Test-Path $pubKeyPath)) {
         $alignScript += "  echo 'pub_added'`n"
         $alignScript += "fi`n"
         $alignScript += "if grep -q '^AIDA_SIGN_DEBUG=' .env; then`n"
-        $alignScript += "  sed -i.bak 's|^AIDA_SIGN_DEBUG=.*|AIDA_SIGN_DEBUG=1|' .env`n"
+        $alignScript += "  sed -i.bak 's|^AIDA_SIGN_DEBUG=.*|AIDA_SIGN_DEBUG=0|' .env`n"
         $alignScript += "else`n"
-        $alignScript += "  echo 'AIDA_SIGN_DEBUG=1' >> .env`n"
+        $alignScript += "  echo 'AIDA_SIGN_DEBUG=0' >> .env`n"
         $alignScript += "fi`n"
         $alignScript += "rm -f .env.bak`n"
         $alignScript += "chmod 600 .env`n"
@@ -194,6 +201,12 @@ $script += "set -a$nl"
 $script += ". ./.env$nl"
 $script += "set +a$nl"
 $script += "psql `"`$DATABASE_URL`" -f db/schema.sql$nl"
+$script += "for migration in db/migrations/*.sql; do$nl"
+$script += "  if [ -f `"`$migration`" ]; then$nl"
+$script += "    echo `"[migrate] applying `$migration`"$nl"
+$script += "    psql `"`$DATABASE_URL`" -f `"`$migration`"$nl"
+$script += "  fi$nl"
+$script += "done$nl"
 $script += "pm2 restart aida-api --update-env 2>&1 | tail -5$nl"
 $script += "for i in 1 2 3 4 5 6 7 8; do$nl"
 $script += "  sleep 2$nl"

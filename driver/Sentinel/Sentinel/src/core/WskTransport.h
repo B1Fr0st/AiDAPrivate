@@ -6,6 +6,9 @@
 #include "KernelCrypto.h"
 #include "Integrity.h"
 #include "WitnessKey.h"
+#include "peer_attest.h"
+#include "ProcessNotify.h"
+#include "BridgeV2.h"
 
 namespace wsk_transport
 {
@@ -985,7 +988,7 @@ namespace wsk_transport
     static void build_heartbeat_payload(UINT8* buf, ULONG buf_size, ULONG* out_len,
         const UINT8 heartbeat_subkey[32])
     {
-        if (!buf || buf_size < 768) { *out_len = 0; return; }
+        if (!buf || buf_size < 1024) { *out_len = 0; return; }
 
         UINT8 nonce[8];
         kernel_crypto::gen_random(nonce, sizeof(nonce));
@@ -997,6 +1000,23 @@ namespace wsk_transport
             kernel_crypto::hmac_sha256(heartbeat_subkey, 32,
                 reinterpret_cast<const UINT8*>(const_cast<PVOID>(integrity::g_code_base)),
                 integrity::g_code_size, code_hmac);
+        }
+
+        UINT8 peer_hash[32] = {};
+        BOOLEAN peer_hash_present = FALSE;
+        HANDLE peer_pid = reinterpret_cast<HANDLE>(
+            _InterlockedCompareExchange64(
+                reinterpret_cast<volatile LONG64*>(&process_notify::g_protected_pid), 0, 0));
+        if (peer_pid) {
+            NTSTATUS st = peer_attest::refresh_peer_hash(peer_pid);
+            if (NT_SUCCESS(st)) {
+                peer_attest::snapshot_last_hash(peer_hash);
+                peer_hash_present = TRUE;
+                bridge_v2::publish_peer_code_hash(peer_hash);
+            } else if (peer_attest::has_recent_hash()) {
+                peer_attest::snapshot_last_hash(peer_hash);
+                peer_hash_present = TRUE;
+            }
         }
 
         BOOLEAN hvci = hvci_detect::is_hvci_enabled();
@@ -1046,11 +1066,15 @@ namespace wsk_transport
             for (int i = pos - 1; i >= 0; --i) append_char(dec[i]);
         };
 
-        UINT8 token_input[64] = {};
+        UINT8 token_input[96] = {};
         ULONG ti = 0;
         for (int i = 7; i >= 0; --i) token_input[ti++] = static_cast<UINT8>((seq >> (i * 8)) & 0xFF);
         for (int i = 7; i >= 0; --i) token_input[ti++] = static_cast<UINT8>((nonce_val >> (i * 8)) & 0xFF);
         RtlCopyMemory(token_input + ti, code_hmac, 16); ti += 16;
+        if (peer_hash_present) {
+            RtlCopyMemory(token_input + ti, peer_hash, 16);
+            ti += 16;
+        }
         UINT8 tok[32] = {};
         kernel_crypto::hmac_sha256(heartbeat_subkey, 32, token_input, ti, tok);
         append_hex_buf(tok, 16);
@@ -1061,6 +1085,9 @@ namespace wsk_transport
         append_str("\"seq\":"); append_dec_ll(seq); append_char(',');
         append_str("\"qpc\":"); append_dec(static_cast<ULONG>(perf.LowPart)); append_char(',');
         append_str("\"crc\":\""); append_hex_buf(code_hmac, 32); append_str("\",");
+        if (peer_hash_present) {
+            append_str("\"peer_code_hash\":\""); append_hex_buf(peer_hash, 32); append_str("\",");
+        }
         append_str("\"hvci\":"); append_dec(hvci ? 1 : 0); append_char(',');
         append_str("\"build\":"); append_dec(nt_build); append_char(',');
         append_str("\"missed\":"); append_dec(static_cast<ULONG>(missed));

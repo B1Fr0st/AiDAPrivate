@@ -6,11 +6,76 @@ const pool = require('../db/pool');
 const { signPayload } = require('../crypto/signing');
 const kw = require('../crypto/kw_wrap');
 const hmacAuth = require('../middleware/hmac_auth');
+const canonicalResponse = require('../crypto/canonical_response');
+const peerCodeHash = require('../crypto/peer_code_hash');
+
+let columnCrypt = null;
+try { columnCrypt = require('../crypto/column_crypt'); } catch (_) { columnCrypt = null; }
 
 const router = express.Router();
 
-router.use((req, res, next) => {
-    if (req.path === '/attest') return next();
+async function verifyAttestBindToken(req) {
+    const body = req.body || {};
+    const provided = typeof body.bind_token === 'string' ? body.bind_token.trim().toLowerCase() : '';
+    const licenseKey = typeof body.license_key === 'string' ? body.license_key.trim() : '';
+    if (!provided || !/^[0-9a-f]{32,128}$/.test(provided)) {
+        return { ok: false, reason: 'bind_token_missing' };
+    }
+    if (!licenseKey) {
+        return { ok: false, reason: 'license_missing' };
+    }
+    try {
+        const { rows } = await pool.query(
+            'SELECT sentinel_bind_token_hash, sentinel_bind_consumed, sentinel_bind_issued_at FROM sessions WHERE license_key = $1',
+            [licenseKey]
+        );
+        if (rows.length === 0) {
+            return { ok: false, reason: 'session_not_found' };
+        }
+        const row = rows[0];
+        const expected = String(row.sentinel_bind_token_hash || '').trim().toLowerCase();
+        if (!expected || expected.length !== 64) {
+            return { ok: false, reason: 'bind_token_not_issued' };
+        }
+        const providedHash = crypto.createHash('sha256').update(provided, 'hex').digest('hex');
+        const a = Buffer.from(providedHash, 'utf8');
+        const b = Buffer.from(expected, 'utf8');
+        if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+            return { ok: false, reason: 'bind_token_mismatch' };
+        }
+        if (row.sentinel_bind_consumed) {
+            return { ok: false, reason: 'bind_token_consumed' };
+        }
+        const issuedAt = Number(row.sentinel_bind_issued_at || 0);
+        const ageSec = Math.floor(Date.now() / 1000) - issuedAt;
+        if (!issuedAt || ageSec > 86400 || ageSec < -300) {
+            return { ok: false, reason: 'bind_token_expired' };
+        }
+        return { ok: true };
+    } catch (err) {
+        return { ok: false, reason: 'bind_token_lookup_failed' };
+    }
+}
+
+router.use(async (req, res, next) => {
+    if (req.path === '/attest') {
+        const lic = req.body && typeof req.body === 'object' ? req.body.license_key : '';
+        if (typeof lic === 'string' && lic.length > 0) {
+            try {
+                const { rows } = await pool.query('SELECT install_secret_wrapped FROM licenses WHERE key = $1', [lic]);
+                if (rows.length > 0 && rows[0].install_secret_wrapped) {
+                    const verdict = await verifyAttestBindToken(req);
+                    if (!verdict.ok) {
+                        return res.status(403).json({ status: 'error', reason: 'attest_bind_token_invalid', detail: verdict.reason });
+                    }
+                    req._attestBindOk = true;
+                }
+            } catch (_) {
+                return res.status(503).json({ status: 'error', reason: 'attest_lookup_failed' });
+            }
+        }
+        return next();
+    }
     return hmacAuth.authenticate(req, res, next);
 });
 
@@ -221,15 +286,99 @@ router.post('/attest', async (req, res) => {
             first_activation: isFirstActivation,
             install_secret_fingerprint: crypto.createHash('sha256').update(installSecret).digest('hex').slice(0, 16),
         };
-        response.signature = sigSignOrFallback(response);
 
-        return res.json(response);
+        if (req._attestBindOk) {
+            try {
+                await pool.query(
+                    'UPDATE sessions SET sentinel_bind_consumed = true WHERE license_key = $1',
+                    [license_key]
+                );
+            } catch (_) { }
+        }
+
+        return res.json(canonicalResponse.buildEnvelope(response));
     } catch (err) {
         console.error('[sentinel] /attest error:', err);
         return res.status(500).json({ status: 'error', reason: 'internal_error' });
     }
 });
 
+
+async function recordPeerCodeHash(licenseKey, quorumId, peerHashHex, hvci, ntBuild, ip) {
+    if (!licenseKey || !peerHashHex) return;
+    const cleaned = String(peerHashHex || '').trim().toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(cleaned)) return;
+    const now = Math.floor(Date.now() / 1000);
+    const expectedHash = peerCodeHash.getExpected();
+    const matched = expectedHash ? (expectedHash === cleaned) : false;
+    let sessionToken = '';
+    try {
+        const { rows } = await pool.query(
+            'SELECT session_token, session_uuid FROM sessions WHERE license_key = $1',
+            [licenseKey]
+        );
+        if (rows.length > 0) {
+            let stored = rows[0].session_token || '';
+            const uuid = rows[0].session_uuid || '';
+            if (uuid && typeof stored === 'string' && columnCrypt && columnCrypt.isCiphertext && columnCrypt.isCiphertext(stored)) {
+                try { stored = columnCrypt.decrypt(uuid, 'sessions/session_token', stored); } catch (_) { stored = ''; }
+            }
+            sessionToken = stored || '';
+        }
+    } catch (_) { }
+    try {
+        await pool.query(
+            `INSERT INTO sentinel_attestations
+                (license_key, session_token, quorum_id, peer_code_hash, peer_code_hash_received_at,
+                 expected_hash_at_receive, matched, nt_build, hvci_enabled, client_ip)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+            [licenseKey, sessionToken, quorumId || '', cleaned, now, expectedHash || '', matched, ntBuild || null, hvci === undefined ? null : !!hvci, ip || '']
+        );
+    } catch (err) {
+        console.warn('[sentinel] peer_code_hash persist failed:', err && err.message ? err.message : err);
+    }
+    if (expectedHash) {
+        try {
+            if (matched) {
+                await pool.query(
+                    `UPDATE sessions
+                        SET peer_attest_divergence_streak = 0,
+                            peer_attest_last_hash         = $1,
+                            peer_attest_last_matched_at   = $2,
+                            peer_attest_degraded          = false
+                      WHERE license_key = $3`,
+                    [cleaned, now, licenseKey]
+                );
+            } else {
+                await pool.query(
+                    `UPDATE sessions
+                        SET peer_attest_divergence_streak = peer_attest_divergence_streak + 1,
+                            peer_attest_last_hash         = $1
+                      WHERE license_key = $2`,
+                    [cleaned, licenseKey]
+                );
+                const { rows } = await pool.query(
+                    'SELECT peer_attest_divergence_streak FROM sessions WHERE license_key = $1',
+                    [licenseKey]
+                );
+                const streak = rows.length > 0 ? Number(rows[0].peer_attest_divergence_streak || 0) : 0;
+                if (streak >= 2 && streak < 5) {
+                    await pool.query(
+                        'UPDATE sessions SET peer_attest_degraded = true WHERE license_key = $1',
+                        [licenseKey]
+                    );
+                    await recordSentinelEvent(licenseKey, quorumId || '', 'peer_code_hash_degraded', 'warn',
+                        { streak, expected: expectedHash, observed: cleaned }, ip, hvci, ntBuild, 0);
+                } else if (streak >= 5) {
+                    await recordSentinelViolation(licenseKey, quorumId || '', 'peer_code_hash_divergent',
+                        { streak, expected: expectedHash, observed: cleaned }, ip, hvci, ntBuild, 0);
+                }
+            }
+        } catch (err) {
+            console.warn('[sentinel] peer_code_hash streak update failed:', err && err.message ? err.message : err);
+        }
+    }
+}
 
 router.post('/heartbeat', async (req, res) => {
     try {
@@ -241,6 +390,7 @@ router.post('/heartbeat', async (req, res) => {
             nt_build,
             boot_count,
             sensors,
+            peer_code_hash,
         } = req.body || {};
 
         if (!license_key || !quorum_id) {
@@ -252,6 +402,9 @@ router.post('/heartbeat', async (req, res) => {
 
         const ip = clientIp(req);
         await upsertQuorumSeen(license_key, quorum_id, nt_build, hvci_enabled);
+        if (typeof peer_code_hash === 'string' && peer_code_hash.length > 0) {
+            await recordPeerCodeHash(license_key, quorum_id, peer_code_hash, hvci_enabled, nt_build, ip);
+        }
 
         const evArr = Array.isArray(events) ? events : [];
         for (const ev of evArr.slice(0, 64)) {
@@ -298,8 +451,7 @@ router.post('/heartbeat', async (req, res) => {
                 reason: 'sensor_deviation',
                 next_interval_seconds: 0,
             };
-            response.signature = sigSignOrFallback(response);
-            return res.json(response);
+            return res.json(canonicalResponse.buildEnvelope(response));
         }
 
         const quorumWindow = 120;
@@ -327,8 +479,7 @@ router.post('/heartbeat', async (req, res) => {
             kill_flag: killFlag,
             next_interval_seconds: liveQuorum >= 2 ? 45 : 20,
         };
-        response.signature = sigSignOrFallback(response);
-        return res.json(response);
+        return res.json(canonicalResponse.buildEnvelope(response));
     } catch (err) {
         console.error('[sentinel] /heartbeat error:', err);
         return res.status(500).json({ status: 'error', reason: 'internal_error' });

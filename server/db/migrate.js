@@ -36,6 +36,26 @@ async function applyBaseSchema() {
     console.log('[migrate] applied base schema.sql');
 }
 
+async function applyDirectoryMigrations() {
+    const dir = path.join(__dirname, 'migrations');
+    if (!fs.existsSync(dir)) {
+        console.log('[migrate] no migrations directory present at', dir);
+        return;
+    }
+    const entries = fs.readdirSync(dir).filter(f => f.toLowerCase().endsWith('.sql')).sort();
+    for (const entry of entries) {
+        const full = path.join(dir, entry);
+        const sql = fs.readFileSync(full, 'utf8');
+        try {
+            await pool.query(sql);
+            console.log('[migrate] applied migration', entry);
+        } catch (err) {
+            console.error('[migrate] migration failed:', entry, err && err.message ? err.message : err);
+            throw err;
+        }
+    }
+}
+
 async function applyColumnEncryptionSchema() {
     const stmts = [
         `ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_uuid UUID NOT NULL DEFAULT gen_random_uuid()`,
@@ -105,6 +125,7 @@ async function main() {
         await applyBaseSchema();
         await ensurePgcrypto();
         await applyColumnEncryptionSchema();
+        await applyDirectoryMigrations();
         await localHsm.initializeColumnRootKeyAsync();
         await rewrapExistingRows();
         await recordHsmStamp();
@@ -124,6 +145,7 @@ if (require.main === module) {
 module.exports = {
     ensurePgcrypto,
     applyBaseSchema,
+    applyDirectoryMigrations,
     applyColumnEncryptionSchema,
     rewrapExistingRows,
     recordHsmStamp,

@@ -1241,7 +1241,7 @@ static_assert(sizeof(packed_header_t) == 96, "packed_header_t must be 96 bytes")
 constexpr uint32_t kBindFlagCpuid = 0x1u;
 
 constexpr uint32_t kAuxMagic   = 0x4D585541u;
-constexpr uint32_t kAuxVersion = 0x00020000u;
+constexpr uint32_t kAuxVersion = 0x00030000u;
 
 #pragma pack(push, 1)
 struct aux_block_t {
@@ -1263,11 +1263,19 @@ struct aux_block_t {
     uint64_t polymorphic_build_nonce;
     uint32_t stub_signature_tag;
     uint32_t ghost_veh_flags;
-    uint8_t  reserved1[16];
+    uint8_t  spki_pins[2][32];
+    char     primary_host[64];
+    char     secondary_host[64];
+    uint32_t pin_reserved[4];
 };
 #pragma pack(pop)
 
-static_assert(sizeof(aux_block_t) == 176, "aux_block_t must be 176 bytes");
+static_assert(sizeof(aux_block_t) == 368, "aux_block_t must be 368 bytes");
+static_assert(offsetof(aux_block_t, phase_flags) == 120, "phase_flags offset must remain 120");
+static_assert(offsetof(aux_block_t, spki_pins) == 160, "spki_pins offset must be 160");
+static_assert(offsetof(aux_block_t, primary_host) == 224, "primary_host offset must be 224");
+static_assert(offsetof(aux_block_t, secondary_host) == 288, "secondary_host offset must be 288");
+static_assert(offsetof(aux_block_t, pin_reserved) == 352, "pin_reserved offset must be 352");
 
 struct section_descriptor_t {
     uint32_t original_rva;
@@ -1428,6 +1436,14 @@ struct protect_options_t {
     uint32_t tamper_response_level = 0;
     uint8_t  license_hash[16] = {0};
     uint32_t matryoshka_layers = 3u;
+    uint8_t  spki_pin_primary[32]   = {0};
+    uint8_t  spki_pin_secondary[32] = {0};
+    char     primary_host[64]   = {0};
+    char     secondary_host[64] = {0};
+    bool     spki_pin_primary_provided   = false;
+    bool     spki_pin_secondary_provided = false;
+    bool     primary_host_provided   = false;
+    bool     secondary_host_provided = false;
 };
 
 struct section_skip_list {
@@ -1448,7 +1464,8 @@ struct section_skip_list {
             || name_equals(name, ".dseal")
             || name_equals(name, ".dthunk")
             || name_equals(name, ".licbind")
-            || name_equals(name, ".feat");
+            || name_equals(name, ".feat")
+            || name_equals(name, ".aidashr");
     }
 };
 
@@ -2224,7 +2241,8 @@ inline void randomize_section_names(pe_file::pe_image_t& pe, rng_state_t& rng) {
             section_skip_list::name_equals(sec.name, ".dseal") ||
             section_skip_list::name_equals(sec.name, ".dthunk") ||
             section_skip_list::name_equals(sec.name, ".licbind") ||
-            section_skip_list::name_equals(sec.name, ".feat")) {
+            section_skip_list::name_equals(sec.name, ".feat") ||
+            section_skip_list::name_equals(sec.name, ".aidashr")) {
             continue;
         }
         char nn[8] = { 0 };
@@ -3599,6 +3617,28 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
         if (opt.jit)                { pf |= 0x400u; }
         aux.phase_flags = pf;
     }
+    std::memcpy(aux.spki_pins[0], opt.spki_pin_primary,   32);
+    std::memcpy(aux.spki_pins[1], opt.spki_pin_secondary, 32);
+    std::memset(aux.primary_host,   0, sizeof(aux.primary_host));
+    std::memset(aux.secondary_host, 0, sizeof(aux.secondary_host));
+    {
+        const size_t primary_cap = sizeof(aux.primary_host);
+        size_t primary_n = 0;
+        while (primary_n < primary_cap && opt.primary_host[primary_n] != '\0') { ++primary_n; }
+        if (primary_n > 0u) {
+            std::memcpy(aux.primary_host, opt.primary_host, primary_n);
+        }
+        const size_t secondary_cap = sizeof(aux.secondary_host);
+        size_t secondary_n = 0;
+        while (secondary_n < secondary_cap && opt.secondary_host[secondary_n] != '\0') { ++secondary_n; }
+        if (secondary_n > 0u) {
+            std::memcpy(aux.secondary_host, opt.secondary_host, secondary_n);
+        }
+    }
+    aux.pin_reserved[0] = 0u;
+    aux.pin_reserved[1] = 0u;
+    aux.pin_reserved[2] = 0u;
+    aux.pin_reserved[3] = 0u;
     result.aux_size = static_cast<uint32_t>(sizeof(aux_block_t));
 
     import_hash_table_t imports{};

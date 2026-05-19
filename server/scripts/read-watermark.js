@@ -5,12 +5,13 @@ const crypto = require('crypto');
 const fs = require('fs');
 
 const args = process.argv.slice(2);
-if (args.length < 1) {
-    console.error('Usage: ARC_MASTER_SECRET=<secret> node read-watermark.js <AiDA.exe>');
+if (args.length < 2) {
+    console.error('Usage: ARC_MASTER_SECRET=<secret> node read-watermark.js <AiDA.exe> <license_key>');
     process.exit(1);
 }
 
 const filePath = args[0];
+const licenseKey = args[1];
 const masterSecret = process.env.ARC_MASTER_SECRET;
 
 if (!masterSecret || masterSecret.length < 32) {
@@ -34,10 +35,17 @@ const block = Buffer.from(data.subarray(data.length - 256));
 const originalBinary = data.subarray(0, data.length - 256);
 
 
+const trailerTimestamp = Number(block.readBigUInt64LE(8));
 const streamKey = crypto.createHash('sha256')
-    .update(`watermark-stream|${masterSecret}`)
+    .update('watermark-stream|', 'utf8')
+    .update(String(licenseKey), 'utf8')
+    .update('|', 'utf8')
+    .update(String(trailerTimestamp), 'utf8')
+    .update('|', 'utf8')
+    .update(masterSecret, 'utf8')
     .digest();
 for (let i = 0; i < 256; i++) {
+    if (i >= 8 && i < 16) continue;
     block[i] ^= streamKey[i % 32];
 }
 

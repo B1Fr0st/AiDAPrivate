@@ -34,6 +34,9 @@
     <ClCompile Include="src\function\impl\RemoteCall.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\core\HardwareId.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <MASM Include="src\imports\ntoskernel_base.asm">
@@ -66,6 +69,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\function\impl\driver\za.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\HardwareId.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\function\AntiDebug.h">

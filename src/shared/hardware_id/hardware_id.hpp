@@ -44,6 +44,8 @@ namespace aida::hardware_id
 
     anchor_set_t collect_user_mode() noexcept;
 
+    anchor_set_t collect_user_mode_v2() noexcept;
+
     bool collect_from_driver(anchor_set_t& out) noexcept;
 
     composite_t hash_anchors(const anchor_set_t& anchors) noexcept;

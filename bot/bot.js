@@ -84,6 +84,68 @@ const DATABASE_URL       = process.env.AIDA_DATABASE_URL       || '';
 const ADMIN_API_BASE     = process.env.AIDA_ADMIN_API_BASE     || '';
 const ADMIN_HMAC_KEY     = process.env.AIDA_ADMIN_HMAC_KEY     || '';
 const ADMIN_API_KEY      = process.env.AIDA_ADMIN_API_KEY      || '';
+const BOT_ED25519_PRIV_B64 = process.env.BOT_ED25519_PRIVATE_KEY_B64 || '';
+
+let _botPrivKey = null;
+function getBotPrivateKey() {
+    if (_botPrivKey) return _botPrivKey;
+    if (!BOT_ED25519_PRIV_B64) return null;
+    try {
+        const raw = Buffer.from(BOT_ED25519_PRIV_B64, 'base64');
+        if (raw.length === 32) {
+            const PKCS8_PREFIX = Buffer.from([0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20]);
+            _botPrivKey = crypto.createPrivateKey({ key: Buffer.concat([PKCS8_PREFIX, raw]), format: 'der', type: 'pkcs8' });
+        } else {
+            _botPrivKey = crypto.createPrivateKey({ key: raw, format: 'der', type: 'pkcs8' });
+        }
+        return _botPrivKey;
+    } catch (err) {
+        console.error('[bot] BOT_ED25519_PRIVATE_KEY_B64 parse failed:', err && err.message ? err.message : err);
+        return null;
+    }
+}
+
+function botCanonicalize(payload) {
+    return JSON.stringify(Object.keys(payload).sort().reduce((acc, k) => {
+        acc[k] = payload[k];
+        return acc;
+    }, {}));
+}
+
+function signBotPayload(payload) {
+    const key = getBotPrivateKey();
+    if (!key) return '';
+    const canonical = botCanonicalize(payload);
+    return crypto.sign(null, Buffer.from(canonical, 'utf8'), key).toString('base64');
+}
+
+async function callServerAction(action, fields) {
+    if (!ADMIN_API_BASE) {
+        return { ok: false, reason: 'admin_api_base_not_configured' };
+    }
+    const url = ADMIN_API_BASE.replace(/\/+$/, '') + '/api/license/' + action;
+    const payload = Object.assign({
+        action,
+        nonce: crypto.randomBytes(16).toString('hex'),
+        ts: Math.floor(Date.now() / 1000),
+    }, fields || {});
+    const sig = signBotPayload(payload);
+    const headers = { 'Content-Type': 'application/json' };
+    if (sig) headers['x-bot-signature'] = sig;
+    try {
+        const resp = await fetch(url, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(payload),
+        });
+        const text = await resp.text();
+        let body = null;
+        try { body = JSON.parse(text); } catch { body = { raw: text }; }
+        return { ok: resp.ok, status: resp.status, body };
+    } catch (err) {
+        return { ok: false, reason: 'network_error', error: err && err.message ? err.message : String(err) };
+    }
+}
 
 if (!BOT_TOKEN) {
     console.error('[bot] FATAL: AIDA_BOT_TOKEN must be set in env (no in-source default).');
@@ -205,6 +267,177 @@ function licenseStatus(data) {
 
 function isOwner(interaction) {
     return OWNER_IDS.has(interaction.user.id);
+}
+
+const DISCORD_ADMIN_ROLE_ID = (process.env.DISCORD_ADMIN_ROLE_ID || '').trim();
+
+function isAdminInteraction(interaction) {
+    if (isOwner(interaction)) return true;
+    if (!DISCORD_ADMIN_ROLE_ID) return false;
+    try {
+        const member = interaction.member;
+        if (!member) return false;
+        const roles = member.roles && member.roles.cache;
+        if (roles && typeof roles.has === 'function') {
+            return roles.has(DISCORD_ADMIN_ROLE_ID);
+        }
+        if (Array.isArray(member.roles)) {
+            return member.roles.includes(DISCORD_ADMIN_ROLE_ID);
+        }
+    } catch (_) { }
+    return false;
+}
+
+const BOT_RATE_LIMITS = {
+    issuePerHour: parseInt(process.env.AIDA_BOT_ISSUE_PER_HOUR || '3', 10) || 3,
+    issuePerDay: parseInt(process.env.AIDA_BOT_ISSUE_PER_DAY || '10', 10) || 10,
+    burstWindowSeconds: parseInt(process.env.AIDA_BOT_BURST_WINDOW_S || '60', 10) || 60,
+    burstMax: parseInt(process.env.AIDA_BOT_BURST_MAX || '5', 10) || 5,
+    burstLockoutSeconds: parseInt(process.env.AIDA_BOT_BURST_LOCKOUT_S || '600', 10) || 600,
+};
+
+const ISSUE_COMMAND_SET = new Set(['generate', 'bulk_generate']);
+
+const inMemoryActivity = new Map();
+
+function pruneActivity(userId, now) {
+    const arr = inMemoryActivity.get(userId);
+    if (!arr) return [];
+    const cutoff = now - BOT_RATE_LIMITS.burstWindowSeconds * 1000 - 5000;
+    const fresh = arr.filter(entry => entry.ts >= cutoff);
+    if (fresh.length === 0) {
+        inMemoryActivity.delete(userId);
+    } else {
+        inMemoryActivity.set(userId, fresh);
+    }
+    return fresh;
+}
+
+function recordActivity(userId, action) {
+    const now = Date.now();
+    const fresh = pruneActivity(userId, now);
+    fresh.push({ ts: now, action });
+    inMemoryActivity.set(userId, fresh);
+    return fresh;
+}
+
+async function isLockedOut(userId, now) {
+    try {
+        const nowSec = Math.floor((now || Date.now()) / 1000);
+        const { rows } = await pgQuery(
+            'SELECT locked_until, reason FROM bot_user_lockout WHERE discord_user_id = $1',
+            [userId]
+        );
+        if (rows.length > 0 && Number(rows[0].locked_until) > nowSec) {
+            return { locked: true, until: Number(rows[0].locked_until), reason: rows[0].reason || '' };
+        }
+        if (rows.length > 0 && Number(rows[0].locked_until) <= nowSec) {
+            await pgQuery('DELETE FROM bot_user_lockout WHERE discord_user_id = $1', [userId]).catch(() => {});
+        }
+    } catch (_) { }
+    return { locked: false };
+}
+
+async function setLockout(userId, durationSec, reason) {
+    const until = Math.floor(Date.now() / 1000) + Math.floor(durationSec || 0);
+    try {
+        await pgQuery(
+            `INSERT INTO bot_user_lockout (discord_user_id, locked_until, reason)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (discord_user_id)
+             DO UPDATE SET locked_until = EXCLUDED.locked_until, reason = EXCLUDED.reason, created_at = NOW()`,
+            [userId, until, String(reason || '').slice(0, 256)]
+        );
+    } catch (err) {
+        console.warn('[bot] setLockout failed:', err && err.message ? err.message : err);
+    }
+}
+
+async function bumpWindow(userId, kind, now, limit) {
+    let windowStart;
+    if (kind === 'hour') windowStart = Math.floor(now / 3600) * 3600;
+    else if (kind === 'day') windowStart = Math.floor(now / 86400) * 86400;
+    else windowStart = Math.floor(now / 60) * 60;
+    try {
+        const { rows } = await pgQuery(
+            `INSERT INTO bot_command_rate (discord_user_id, window_kind, window_start, count)
+             VALUES ($1, $2, $3, 1)
+             ON CONFLICT (discord_user_id, window_kind, window_start)
+             DO UPDATE SET count = bot_command_rate.count + 1
+             RETURNING count`,
+            [userId, kind, windowStart]
+        );
+        const current = rows.length > 0 ? Number(rows[0].count) : 1;
+        return { current, exceeded: current > limit, window_start: windowStart };
+    } catch (err) {
+        return { current: 0, exceeded: false, window_start: windowStart };
+    }
+}
+
+async function checkAbuseGate(interaction) {
+    const userId = interaction.user.id;
+    const commandName = interaction.commandName;
+    const nowMs = Date.now();
+    const nowSec = Math.floor(nowMs / 1000);
+
+    const lock = await isLockedOut(userId, nowMs);
+    if (lock.locked) {
+        return { ok: false, reason: 'locked_out', message: `⛔ You are temporarily locked out (until <t:${lock.until}:R>).` };
+    }
+
+    const activity = recordActivity(userId, commandName);
+    const windowCutoff = nowMs - BOT_RATE_LIMITS.burstWindowSeconds * 1000;
+    const recent = activity.filter(e => e.ts >= windowCutoff).length;
+    if (recent > BOT_RATE_LIMITS.burstMax) {
+        await setLockout(userId, BOT_RATE_LIMITS.burstLockoutSeconds, 'burst_exceeded');
+        try { await callServerAuditLog('bot.lockout', '', userId, 'burst_exceeded', { recent, window_s: BOT_RATE_LIMITS.burstWindowSeconds }); } catch (_) { }
+        return { ok: false, reason: 'burst_exceeded', message: `⛔ Burst limit hit (${recent}/${BOT_RATE_LIMITS.burstMax} in ${BOT_RATE_LIMITS.burstWindowSeconds}s). Locked out for ${Math.floor(BOT_RATE_LIMITS.burstLockoutSeconds/60)}m.` };
+    }
+
+    if (ISSUE_COMMAND_SET.has(commandName)) {
+        const hour = await bumpWindow(userId, 'hour', nowSec, BOT_RATE_LIMITS.issuePerHour);
+        if (hour.exceeded) {
+            try { await callServerAuditLog('bot.issue_rate_limited', '', userId, 'hour', { count: hour.current, limit: BOT_RATE_LIMITS.issuePerHour }); } catch (_) { }
+            return { ok: false, reason: 'issue_hour', message: `⛔ Hourly license-issue limit reached (${hour.current}/${BOT_RATE_LIMITS.issuePerHour}).` };
+        }
+        const day = await bumpWindow(userId, 'day', nowSec, BOT_RATE_LIMITS.issuePerDay);
+        if (day.exceeded) {
+            try { await callServerAuditLog('bot.issue_rate_limited', '', userId, 'day', { count: day.current, limit: BOT_RATE_LIMITS.issuePerDay }); } catch (_) { }
+            return { ok: false, reason: 'issue_day', message: `⛔ Daily license-issue limit reached (${day.current}/${BOT_RATE_LIMITS.issuePerDay}).` };
+        }
+    }
+
+    if (commandName === 'generate') {
+        try {
+            const { rows } = await pgQuery(
+                'SELECT key FROM licenses WHERE discord_id = $1 LIMIT 1',
+                [userId]
+            );
+            if (rows.length > 0 && !isOwner(interaction)) {
+                return { ok: false, reason: 'one_per_user', message: `⛔ You already claimed a license (\`${rows[0].key}\`). One key per Discord user.` };
+            }
+        } catch (_) { }
+    }
+
+    return { ok: true };
+}
+
+async function callServerAuditLog(action, target, userId, reason, extra) {
+    try {
+        await pgQuery(
+            `INSERT INTO audit_log_v2 (action, license_key_hmac, hwid_hash, source_ip, user_agent_hash, decision, reason_code, extra)
+             VALUES ($1, $2, NULL, NULL, NULL, $3, $4, $5::jsonb)`,
+            [
+                String(action || 'bot.event'),
+                String(userId || ''),
+                'deny',
+                String(reason || ''),
+                JSON.stringify(Object.assign({ target: target || '' }, extra || {})),
+            ]
+        );
+    } catch (err) {
+        console.warn('[bot] audit_log_v2 insert failed:', err && err.message ? err.message : err);
+    }
 }
 
 function signAdminCommand(commandObj) {
@@ -586,6 +819,46 @@ const commands = [
             opt.setName('key')
                .setDescription('License key whose Kw should rotate on next activation')
                .setRequired(true)),
+
+    new SlashCommandBuilder()
+        .setName('aida-kill')
+        .setDescription('💣 Add a license key to the kill-switch table (immediate auth deny)')
+        .addStringOption(opt =>
+            opt.setName('key')
+               .setDescription('License key to kill')
+               .setRequired(true))
+        .addStringOption(opt =>
+            opt.setName('reason')
+               .setDescription('Reason')
+               .setRequired(false)),
+
+    new SlashCommandBuilder()
+        .setName('aida-kill-hwid')
+        .setDescription('💣 Add a HWID hash to the kill-switch table')
+        .addStringOption(opt =>
+            opt.setName('hwid_hash')
+               .setDescription('SHA-256 hex of HWID (64 hex chars)')
+               .setRequired(true))
+        .addStringOption(opt =>
+            opt.setName('reason')
+               .setDescription('Reason')
+               .setRequired(false)),
+
+    new SlashCommandBuilder()
+        .setName('aida-killswitch-global')
+        .setDescription('💣 Toggle the global kill switch on/off')
+        .addStringOption(opt =>
+            opt.setName('mode')
+               .setDescription('on or off')
+               .setRequired(true)
+               .addChoices(
+                   { name: 'on', value: 'on' },
+                   { name: 'off', value: 'off' },
+               ))
+        .addStringOption(opt =>
+            opt.setName('reason')
+               .setDescription('Reason')
+               .setRequired(false)),
 ];
 
 // ─── Register Commands on Ready ───────────────────────────────────────────────
@@ -624,8 +897,18 @@ client.on('interactionCreate', async (interaction) => {
     const { commandName } = interaction;
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-    if (!isOwner(interaction)) {
+    const KILL_COMMANDS = new Set(['aida-kill', 'aida-kill-hwid', 'aida-killswitch-global']);
+    if (KILL_COMMANDS.has(commandName)) {
+        if (!isAdminInteraction(interaction)) {
+            return interaction.editReply('❌ Only the bot owner or an admin role can use this command.');
+        }
+    } else if (!isOwner(interaction)) {
         return interaction.editReply('❌ Only the bot owner can use this command.');
+    }
+
+    const abuseGate = await checkAbuseGate(interaction);
+    if (!abuseGate.ok) {
+        return interaction.editReply(abuseGate.message || '❌ Rate-limited.');
     }
 
     try {
@@ -635,14 +918,24 @@ client.on('interactionCreate', async (interaction) => {
             const duration = interaction.options.getInteger('duration');
             const plan     = interaction.options.getString('plan').toLowerCase();
             const note     = interaction.options.getString('note') ?? '';
-            const key      = generateKey();
             const expires  = duration > 0 ? addDays(todayStr(), duration) : '';
 
-            await pgQuery(
-                `INSERT INTO licenses (key, active, hwid, expires, plan, note, created_at, created_by)
-                 VALUES ($1, true, '', $2, $3, $4, $5, $6)`,
-                [key, expires, plan, note, Math.floor(Date.now() / 1000), interaction.user.tag]
-            );
+            const serverPlan = plan === 'pro' ? 'pro' : 'pro';
+            const result = await callServerAction('create', {
+                plan: serverPlan,
+                tier: plan,
+                note,
+                created_by: interaction.user.tag,
+                expires,
+                discord_id: interaction.user.id,
+            });
+            if (!result.ok) {
+                return interaction.editReply(`❌ Server refused: \`${(result.body && result.body.reason) || result.reason || 'unknown'}\``);
+            }
+            const key = result.body && result.body.key;
+            if (!key) {
+                return interaction.editReply(`❌ Server returned no key (status ${result.status}).`);
+            }
             await logAudit(interaction, 'license.generate', key, { plan, expires, note });
 
             await interaction.editReply({ embeds: [
@@ -668,24 +961,27 @@ client.on('interactionCreate', async (interaction) => {
             const plan     = interaction.options.getString('plan').toLowerCase();
             const note     = interaction.options.getString('note') ?? '';
             const expires  = duration > 0 ? addDays(todayStr(), duration) : '';
-            const now      = Math.floor(Date.now() / 1000);
 
-            const keys = [];
-            for (let i = 0; i < count; i++) {
-                const key = generateKey();
-                await pgQuery(
-                    `INSERT INTO licenses (key, active, hwid, expires, plan, note, created_at, created_by)
-                     VALUES ($1, true, '', $2, $3, $4, $5, $6)`,
-                    [key, expires, plan, note, now, interaction.user.tag]
-                );
-                keys.push(key);
+            const serverPlan = plan === 'pro' ? 'pro' : 'pro';
+            const result = await callServerAction('bulk_create', {
+                plan: serverPlan,
+                tier: plan,
+                count,
+                note,
+                created_by: interaction.user.tag,
+                expires,
+                discord_id: interaction.user.id,
+            });
+            if (!result.ok || !result.body || !Array.isArray(result.body.keys)) {
+                return interaction.editReply(`❌ Server refused bulk_create: \`${(result.body && result.body.reason) || result.reason || 'unknown'}\``);
             }
-            await logAudit(interaction, 'license.bulk_generate', `count=${count}`, { plan, expires, note, keys });
+            const keys = result.body.keys;
+            await logAudit(interaction, 'license.bulk_generate', `count=${keys.length}`, { plan, expires, note, keys });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
                     .setAuthor({ name: 'AiDA License System' })
-                    .setTitle(`🔑 ${count} Keys Generated`)
+                    .setTitle(`🔑 ${keys.length} Keys Generated`)
                     .setColor(0x00FF88)
                     .setDescription(`\`\`\`\n${keys.join('\n')}\n\`\`\``)
                     .addFields(
@@ -706,16 +1002,17 @@ client.on('interactionCreate', async (interaction) => {
             if (!rows.length) return interaction.editReply(`❌ Key \`${key}\` not found.`);
             const data = rows[0];
 
-            // Delete session first (FK cascade would handle it, but be explicit)
-            await pgQuery('DELETE FROM sessions WHERE license_key = $1', [key]);
-            await pgQuery('DELETE FROM licenses WHERE key = $1', [key]);
+            const result = await callServerAction('revoke', { key, reason: 'discord_bot_revoke' });
+            if (!result.ok) {
+                return interaction.editReply(`❌ Server refused revoke: \`${(result.body && result.body.reason) || result.reason || 'unknown'}\``);
+            }
             await logAudit(interaction, 'license.revoke', key, { plan: data.plan, hwid: data.hwid, note: data.note });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
-                    .setTitle('🗑️ License Revoked & Deleted')
+                    .setTitle('🗑️ License Revoked')
                     .setColor(0xFF4444)
-                    .setDescription(`\`${key}\`\nLicense has been permanently removed from the database.`)
+                    .setDescription(`\`${key}\`\nLicense has been deactivated server-side.`)
                     .addFields(
                         { name: '📝 Note', value: data.note || '—', inline: true },
                         { name: '📦 Plan', value: data.plan || '—', inline: true },
@@ -885,9 +1182,10 @@ client.on('interactionCreate', async (interaction) => {
             if (!rows.length) return interaction.editReply(`❌ Key \`${key}\` not found.`);
             const data = rows[0];
 
-            await pgQuery("UPDATE licenses SET hwid = '' WHERE key = $1", [key]);
-            // Also delete session — new HWID means new session
-            await pgQuery('DELETE FROM sessions WHERE license_key = $1', [key]);
+            const result = await callServerAction('reset_hwid', { key });
+            if (!result.ok) {
+                return interaction.editReply(`❌ Server refused reset_hwid: \`${(result.body && result.body.reason) || result.reason || 'unknown'}\``);
+            }
             await logAudit(interaction, 'license.reset_hwid', key, { previous_hwid: data.hwid });
 
             await interaction.editReply({ embeds: [
@@ -1224,8 +1522,10 @@ client.on('interactionCreate', async (interaction) => {
             const data = rows[0];
 
             const oldHwid = data.hwid || '*(unbound)*';
-            await pgQuery('UPDATE licenses SET hwid = $1 WHERE key = $2', [newHwid, key]);
-            await pgQuery('DELETE FROM sessions WHERE license_key = $1', [key]);
+            const result = await callServerAction('transfer', { key, new_hwid: newHwid });
+            if (!result.ok) {
+                return interaction.editReply(`❌ Server refused transfer: \`${(result.body && result.body.reason) || result.reason || 'unknown'}\``);
+            }
             await logAudit(interaction, 'license.transfer', key, { previous_hwid: data.hwid, new_hwid: newHwid });
 
             await interaction.editReply({ embeds: [
@@ -1616,6 +1916,89 @@ client.on('interactionCreate', async (interaction) => {
                     .setTitle('🔑 Kw Rotation Armed')
                     .setColor(0x9B59B6)
                     .setDescription(`\`${key}\`\nkey_rotation_ts = ${now}\nsession killed — next activation will re-wrap.`)
+                    .setFooter({ text: `By ${interaction.user.tag}` })
+                    .setTimestamp(),
+            ]});
+        }
+
+        else if (commandName === 'aida-kill') {
+            const key = interaction.options.getString('key').toUpperCase().trim();
+            const reason = interaction.options.getString('reason') || 'discord_admin_kill';
+            const result = await callServerAction('kill', {
+                target_license: key,
+                reason,
+                discord_id: interaction.user.id,
+            });
+            if (!result.ok) {
+                return interaction.editReply(`❌ Server refused kill: \`${(result.body && result.body.reason) || result.reason || 'unknown'}\``);
+            }
+            await logAudit(interaction, 'kill_switch.license_key', key, { reason });
+            await callServerAuditLog('bot.kill_switch.license_key', key, interaction.user.id, reason, {});
+            await interaction.editReply({ embeds: [
+                new EmbedBuilder()
+                    .setTitle('💣 Kill Switch — License Key')
+                    .setColor(0xFF0000)
+                    .setDescription(`\`${key}\``)
+                    .addFields(
+                        { name: 'Switches Added', value: String((result.body && result.body.switches_added) || 0), inline: true },
+                        { name: 'Sessions Killed', value: String((result.body && result.body.killed) || 0), inline: true },
+                        { name: 'Reason', value: reason, inline: false },
+                    )
+                    .setFooter({ text: `By ${interaction.user.tag}` })
+                    .setTimestamp(),
+            ]});
+        }
+
+        else if (commandName === 'aida-kill-hwid') {
+            const hwidHash = interaction.options.getString('hwid_hash').trim();
+            const reason = interaction.options.getString('reason') || 'discord_admin_kill_hwid';
+            if (!/^[0-9a-fA-F]{32,128}$/.test(hwidHash)) {
+                return interaction.editReply('❌ hwid_hash must be 32-128 hex characters.');
+            }
+            const result = await callServerAction('kill', {
+                target_hwid: hwidHash,
+                reason,
+                discord_id: interaction.user.id,
+            });
+            if (!result.ok) {
+                return interaction.editReply(`❌ Server refused kill: \`${(result.body && result.body.reason) || result.reason || 'unknown'}\``);
+            }
+            await logAudit(interaction, 'kill_switch.hwid_hash', hwidHash, { reason });
+            await callServerAuditLog('bot.kill_switch.hwid_hash', hwidHash, interaction.user.id, reason, {});
+            await interaction.editReply({ embeds: [
+                new EmbedBuilder()
+                    .setTitle('💣 Kill Switch — HWID Hash')
+                    .setColor(0xFF0000)
+                    .setDescription(`\`${hwidHash}\``)
+                    .addFields(
+                        { name: 'Switches Added', value: String((result.body && result.body.switches_added) || 0), inline: true },
+                        { name: 'Sessions Killed', value: String((result.body && result.body.killed) || 0), inline: true },
+                        { name: 'Reason', value: reason, inline: false },
+                    )
+                    .setFooter({ text: `By ${interaction.user.tag}` })
+                    .setTimestamp(),
+            ]});
+        }
+
+        else if (commandName === 'aida-killswitch-global') {
+            const mode = interaction.options.getString('mode');
+            const reason = interaction.options.getString('reason') || 'discord_admin_global';
+            const result = await callServerAction('kill', {
+                target_global: mode === 'on',
+                reason,
+                discord_id: interaction.user.id,
+            });
+            if (!result.ok) {
+                return interaction.editReply(`❌ Server refused: \`${(result.body && result.body.reason) || result.reason || 'unknown'}\``);
+            }
+            await logAudit(interaction, 'kill_switch.global', mode, { reason });
+            await callServerAuditLog('bot.kill_switch.global', mode, interaction.user.id, reason, {});
+            await interaction.editReply({ embeds: [
+                new EmbedBuilder()
+                    .setTitle(`💣 Global Kill Switch — ${mode.toUpperCase()}`)
+                    .setColor(mode === 'on' ? 0xFF0000 : 0x00FF88)
+                    .setDescription(mode === 'on' ? 'ALL traffic will be denied at the edge.' : 'Global kill cleared.')
+                    .addFields({ name: 'Reason', value: reason, inline: false })
                     .setFooter({ text: `By ${interaction.user.tag}` })
                     .setTimestamp(),
             ]});

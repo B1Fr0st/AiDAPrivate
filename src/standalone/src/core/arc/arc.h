@@ -97,16 +97,6 @@ struct arc_heartbeat_result_t
 };
 
 
-struct arc_page_result_t
-{
-    bool     valid;
-    uint32_t page_index;
-    uint32_t total_pages;
-    uint32_t page_size;
-    uint64_t blob_size;
-};
-
-
 extern "C"
 {
 
@@ -147,6 +137,19 @@ extern "C"
     );
 
 
+    ARC_API uint64_t arc_validate_tool_exec_v2(
+        uint64_t caller_nonce,
+        uint64_t tool_name_hash,
+        uint64_t hb_counter
+    );
+
+
+    ARC_API bool arc_verify_watermark_trailer(
+        const uint8_t* blob,
+        uint64_t       blob_size
+    );
+
+
     ARC_API arc_heartbeat_result_t arc_heartbeat();
 
 
@@ -157,23 +160,4 @@ extern "C"
 
 
     ARC_API void arc_cleanup();
-
-
-    ARC_API arc_page_result_t arc_request_page_count(
-        const char* server_url
-    );
-
-    ARC_API bool arc_download_page(
-        const char*  server_url,
-        uint32_t     page_index,
-        uint8_t*     out_decrypted,
-        uint32_t*    out_size
-    );
-
-    ARC_API bool arc_download_all_pages(
-        const char*  server_url,
-        uint8_t*     out_blob,
-        uint64_t     blob_buf_size,
-        uint64_t*    out_total_size
-    );
 }

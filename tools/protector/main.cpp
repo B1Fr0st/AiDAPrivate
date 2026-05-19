@@ -57,6 +57,14 @@ struct config_t {
     uint32_t tamper_response_level = 0;
     uint8_t  license_hash[16] = {0};
     uint32_t matryoshka_layers = 3u;
+    uint8_t  spki_pin_primary[32]   = {0};
+    uint8_t  spki_pin_secondary[32] = {0};
+    bool     spki_pin_primary_provided   = false;
+    bool     spki_pin_secondary_provided = false;
+    char     primary_host[64]   = {0};
+    char     secondary_host[64] = {0};
+    bool     primary_host_provided   = false;
+    bool     secondary_host_provided = false;
 };
 
 static void print_usage(std::FILE* out) {
@@ -107,6 +115,12 @@ static void print_usage(std::FILE* out) {
         "                              3 (default) = Matryoshka triple-stack: AES-128-CTR (HWID-anchored)\n"
         "                              -> ChaCha20 (TPM-anchored) -> XTEA-CTR (server-heartbeat-anchored).\n"
         "\n"
+        "Auth transport pinning:\n"
+        "  --pin-primary <hex64>       SHA-256(SPKI) of the primary auth server cert, hex (64 chars)\n"
+        "  --pin-secondary <hex64>     SHA-256(SPKI) of the backup auth server cert, hex (64 chars)\n"
+        "  --primary-host <utf8>       Override default primary auth hostname (<= 63 chars, alnum/./-/_)\n"
+        "  --secondary-host <utf8>     Override default secondary auth hostname (<= 63 chars, alnum/./-/_)\n"
+        "\n"
         "Control:\n"
         "  --seed <u64>                Deterministic seed for RNG\n"
         "  -v, --verbose               Print transform log to stdout\n"
@@ -152,6 +166,41 @@ static bool parse_hex16(const char* s, uint8_t out[16]) {
         if (!hexv(s[i * 2 + 1], lo)) { return false; }
         out[i] = static_cast<uint8_t>((hi << 4) | lo);
     }
+    return true;
+}
+
+static bool parse_hex32(const char* s, uint8_t out[32]) {
+    if (s == nullptr) { return false; }
+    size_t len = std::strlen(s);
+    if (len != 64) { return false; }
+    auto hexv = [](char c, int& v) {
+        if (c >= '0' && c <= '9') { v = c - '0'; return true; }
+        if (c >= 'a' && c <= 'f') { v = c - 'a' + 10; return true; }
+        if (c >= 'A' && c <= 'F') { v = c - 'A' + 10; return true; }
+        return false;
+    };
+    for (int i = 0; i < 32; ++i) {
+        int hi = 0, lo = 0;
+        if (!hexv(s[i * 2], hi)) { return false; }
+        if (!hexv(s[i * 2 + 1], lo)) { return false; }
+        out[i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    return true;
+}
+
+static bool copy_host_arg(const char* s, char out[64]) {
+    if (s == nullptr) { return false; }
+    size_t len = std::strlen(s);
+    if (len == 0u || len >= 64u) { return false; }
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        bool alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        bool digit = (c >= '0' && c <= '9');
+        bool punct = (c == '.' || c == '-' || c == '_');
+        if (!alpha && !digit && !punct) { return false; }
+    }
+    std::memset(out, 0, 64);
+    std::memcpy(out, s, len);
     return true;
 }
 
@@ -286,6 +335,46 @@ inline config_t parse_args(int argc, char** argv) {
                 std::exit(1);
             }
             cfg.tamper_response_level = static_cast<uint32_t>(v);
+        } else if (arg == "--pin-primary") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "Error: --pin-primary requires a value\n");
+                std::exit(1);
+            }
+            if (!parse_hex32(argv[++i], cfg.spki_pin_primary)) {
+                std::fprintf(stderr, "Error: --pin-primary must be 64 hex chars (SHA-256 of SPKI)\n");
+                std::exit(1);
+            }
+            cfg.spki_pin_primary_provided = true;
+        } else if (arg == "--pin-secondary") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "Error: --pin-secondary requires a value\n");
+                std::exit(1);
+            }
+            if (!parse_hex32(argv[++i], cfg.spki_pin_secondary)) {
+                std::fprintf(stderr, "Error: --pin-secondary must be 64 hex chars (SHA-256 of SPKI)\n");
+                std::exit(1);
+            }
+            cfg.spki_pin_secondary_provided = true;
+        } else if (arg == "--primary-host") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "Error: --primary-host requires a value\n");
+                std::exit(1);
+            }
+            if (!copy_host_arg(argv[++i], cfg.primary_host)) {
+                std::fprintf(stderr, "Error: --primary-host must be a DNS hostname (<= 63 chars, alnum/./-/_)\n");
+                std::exit(1);
+            }
+            cfg.primary_host_provided = true;
+        } else if (arg == "--secondary-host") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "Error: --secondary-host requires a value\n");
+                std::exit(1);
+            }
+            if (!copy_host_arg(argv[++i], cfg.secondary_host)) {
+                std::fprintf(stderr, "Error: --secondary-host must be a DNS hostname (<= 63 chars, alnum/./-/_)\n");
+                std::exit(1);
+            }
+            cfg.secondary_host_provided = true;
         } else if (arg == "--matryoshka-layers") {
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "Error: --matryoshka-layers requires a value (1 or 3)\n");
@@ -446,6 +535,14 @@ inline int run(const config_t& cfg) {
     opt.tamper_response_level = cfg.tamper_response_level;
     opt.matryoshka_layers = cfg.matryoshka_layers;
     std::memcpy(opt.license_hash, cfg.license_hash, 16);
+    std::memcpy(opt.spki_pin_primary,   cfg.spki_pin_primary,   32);
+    std::memcpy(opt.spki_pin_secondary, cfg.spki_pin_secondary, 32);
+    opt.spki_pin_primary_provided   = cfg.spki_pin_primary_provided;
+    opt.spki_pin_secondary_provided = cfg.spki_pin_secondary_provided;
+    std::memcpy(opt.primary_host,   cfg.primary_host,   sizeof(opt.primary_host));
+    std::memcpy(opt.secondary_host, cfg.secondary_host, sizeof(opt.secondary_host));
+    opt.primary_host_provided   = cfg.primary_host_provided;
+    opt.secondary_host_provided = cfg.secondary_host_provided;
 
     if (cfg.verbose) {
         std::fprintf(stdout, "[+] Loaded PE: %s (%llu bytes, %s)\n",

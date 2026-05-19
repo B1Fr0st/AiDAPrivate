@@ -259,6 +259,8 @@ if(WIN32 AND MSVC)
         OUTPUT_NAME "aida_pdb_scrubber"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
     )
+
+    add_subdirectory(tools/share_fingerprint_baker)
 endif()
 
 set(DEPS_DIR "${CMAKE_SOURCE_DIR}/.deps")
@@ -1084,6 +1086,15 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/ai/standalone_ai_client.cpp"
             "${STANDALONE_ROOT}/core/ai/standalone_chat.cpp"
             "${STANDALONE_ROOT}/core/runtime/standalone_license.cpp"
+            "${STANDALONE_ROOT}/core/runtime/standalone_license_transport.cpp"
+            "${STANDALONE_ROOT}/core/runtime/license_state.cpp"
+            "${STANDALONE_ROOT}/core/runtime/gate_tokens.cpp"
+            "${STANDALONE_ROOT}/core/crypto/keys_a.cpp"
+            "${STANDALONE_ROOT}/core/crypto/keys_b.cpp"
+            "${STANDALONE_ROOT}/core/crypto/keys_c.cpp"
+            "${STANDALONE_ROOT}/core/crypto/keys_d.cpp"
+            "${STANDALONE_ROOT}/core/crypto/wb_ed25519.cpp"
+            "${STANDALONE_ROOT}/core/arc/plaintext_window.cpp"
             "${STANDALONE_ROOT}/core/tools/driver_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/network/network_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/network/net_security_tools_standalone.cpp"
@@ -1176,6 +1187,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_sentinel.cpp"
             "${DEPS_DIR}/sqlite-amalgamation-3530000/sqlite3.c"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/hardware_id/hardware_id.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/hardware_id/hardware_id_v2.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/telemetry/telemetry_client.cpp"
         )
 
@@ -2066,6 +2078,17 @@ endif()
 
 if(BUILD_PROTECTOR)
     if(TARGET AiDAStandalone)
+        if(TARGET aida_share_fingerprint_baker)
+            add_custom_command(TARGET AiDAStandalone POST_BUILD
+                COMMAND ${CMAKE_COMMAND}
+                    "-DRETRY_LABEL=AiDAStandalone.exe-bake-share-fingerprints"
+                    "-DRETRY_CMD=$<TARGET_FILE:aida_share_fingerprint_baker>;--input;$<TARGET_FILE:AiDAStandalone>;--output;$<TARGET_FILE:AiDAStandalone>"
+                    -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
+                COMMENT "Baking per-share self-fingerprints into AiDAStandalone.exe (must run BEFORE protector: pack_sections zeroes .text)..."
+                VERBATIM
+            )
+            add_dependencies(AiDAStandalone aida_share_fingerprint_baker)
+        endif()
         add_custom_command(TARGET AiDAStandalone POST_BUILD
             COMMAND ${CMAKE_COMMAND}
                 "-DRETRY_LABEL=AiDAStandalone.exe-protect"

@@ -274,6 +274,34 @@ inline void send_violation_alert(const char* reason, const std::string& extra_de
     catch (...) {}
 }
 
+inline void send_violation_alert_id(uint64_t reason_id, const std::string& extra_detail)
+{
+    char idbuf[20];
+    _snprintf_s(idbuf, sizeof(idbuf), _TRUNCATE,
+        "0x%016llX", static_cast<unsigned long long>(reason_id));
+    write_log("violation", (std::string(idbuf) + " " + extra_detail).c_str());
+
+    try
+    {
+        nlohmann::json payload;
+        payload["reason_id_hex"] = idbuf;
+        payload["detail"] = extra_detail;
+        payload["computer"] = get_computer_name();
+        payload["user"] = get_username();
+        payload["pid"] = GetCurrentProcessId();
+        payload["exe"] = get_exe_path();
+        payload["debug_state"] = collect_debug_state();
+
+        aida::telemetry::event_t ev;
+        ev.type = "violation_alert";
+        ev.severity = aida::telemetry::severity_t::critical;
+        ev.payload_json = payload.dump();
+        aida::telemetry::instance().enqueue(ev);
+        aida::telemetry::instance().flush_blocking();
+    }
+    catch (...) {}
+}
+
 inline void post_critical_then_enforce(const char* reason,
                                        const std::string& extra_detail,
                                        uint32_t signal_mask)

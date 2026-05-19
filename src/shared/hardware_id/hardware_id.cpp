@@ -1,4 +1,5 @@
 #include "hardware_id.hpp"
+#include "hardware_id_v2.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -228,6 +229,38 @@ namespace aida::hardware_id
     bool collect_from_driver(anchor_set_t& ) noexcept
     {
         return false;
+    }
+
+    anchor_set_t collect_user_mode_v2() noexcept
+    {
+        anchor_set_t a;
+        v2::collection_t c;
+        std::string err;
+        if (!v2::collect(c, err)) {
+            a.collected_anchor_count = 0;
+            a.valid_count = false;
+            return a;
+        }
+        auto bytes_to_string = [](const std::vector<std::uint8_t>& b) -> std::string {
+            return std::string(reinterpret_cast<const char*>(b.data()), b.size());
+        };
+        a.smbios_uuid      = bytes_to_string(c.factors[0].bytes);
+        a.baseboard_serial = bytes_to_string(c.factors[1].bytes);
+        a.disk_vpd_serial  = bytes_to_string(c.factors[3].bytes);
+        a.machine_guid     = bytes_to_string(c.factors[6].bytes);
+        a.primary_mac      = bytes_to_string(c.factors[4].bytes);
+        a.cpu_topology     = bytes_to_string(c.factors[5].bytes);
+        a.volume_serial    = read_volume_serial();
+        a.efi_boot_guid    = bytes_to_string(c.factors[7].bytes);
+        a.boot_nonce       = 0;
+
+        int n = 0;
+        for (const auto& f : c.factors) {
+            if (f.collected) ++n;
+        }
+        a.collected_anchor_count = n;
+        a.valid_count = (n >= 6);
+        return a;
     }
 
     std::string canonical_string(const anchor_set_t& a) noexcept

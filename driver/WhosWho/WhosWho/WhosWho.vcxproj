@@ -150,6 +150,7 @@
     <ClCompile Include="src\function\impl\AntiDumpHandler.cpp" />
     <ClCompile Include="src\function\impl\Network.cpp" />
     <ClCompile Include="src\function\KernelDebugCapture.cpp" />
+    <ClCompile Include="src\core\HardwareId.cpp" />
   </ItemGroup>
   <!-- 
     ntoskernel_base.asm has been replaced with a safe C++ implementation in Defs.h
@@ -160,6 +161,7 @@
     <ClInclude Include="..\..\encrypt\crypter.h" />
     <ClInclude Include="src\function\AntiDebug.h" />
     <ClInclude Include="src\function\KernelDebugCapture.h" />
+    <ClInclude Include="src\core\HardwareId.h" />
     <ClInclude Include="src\function\CoreSecurity.h" />
     <ClInclude Include="src\function\KernelCrypto.h" />
     <ClInclude Include="src\function\Dispatcher.h" />

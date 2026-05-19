@@ -47,6 +47,8 @@
 #include "obfuscation.hpp"
 #include "standalone_license.hpp"
 #include "../arc/arc.h"
+#include "../runtime/reason_ids.hpp"
+#include "dr_check.hpp"
 
 #pragma comment(lib, "bcrypt.lib")
 
@@ -140,11 +142,16 @@ inline uint32_t apply_vm_nested_tags()
     uint32_t applied = 0;
 
     static const char* const kCriticalNames[] = {
-        "arc_validate_tool_exec",
+        "arc_validate_tool_exec_v2",
         "arc_heartbeat",
         "arc_init",
-        "arc_download_page",
-        "arc_get_comm_bridge"
+        "arc_get_comm_bridge",
+        "arc_verify_watermark_trailer"
+    };
+
+    static const char* const kCriticalNamesOptional[] = {
+        "arc_validate_tool_exec_v2",
+        "arc_verify_watermark_trailer"
     };
 
     rt.vm_nested_rvas.clear();
@@ -153,8 +160,47 @@ inline uint32_t apply_vm_nested_tags()
         uint32_t rva = resolve_export_rva(name);
         if (rva == 0u)
         {
-            std::string err = std::string("vm_nested_skip_export_missing:") + name;
+            HMODULE h_self = GetModuleHandleW(nullptr);
+            bool is_arc_core = false;
+            if (h_self)
+            {
+                wchar_t path[MAX_PATH] = {};
+                DWORD n = GetModuleFileNameW(h_self, path, MAX_PATH);
+                if (n > 0)
+                {
+                    for (DWORD i = 0; i < n; ++i)
+                    {
+                        if (path[i] >= L'A' && path[i] <= L'Z')
+                            path[i] = static_cast<wchar_t>(path[i] + 32);
+                    }
+                    for (DWORD i = 0; i + 12 < n; ++i)
+                    {
+                        if (path[i] == L'a' && path[i+1] == L'i' && path[i+2] == L'd' &&
+                            path[i+3] == L'a' && path[i+4] == L'_' && path[i+5] == L'c' &&
+                            path[i+6] == L'o' && path[i+7] == L'r' && path[i+8] == L'e')
+                        {
+                            is_arc_core = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            bool is_optional = false;
+            for (const char* opt : kCriticalNamesOptional)
+            {
+                if (std::strcmp(name, opt) == 0) { is_optional = true; break; }
+            }
+
+            std::string err = std::string("vm_nested_export_missing:") + name;
             webhook::write_log("init", err.c_str());
+
+            if (is_arc_core && !is_optional)
+            {
+                webhook::write_log_critical("init",
+                    (std::string("arc_export_missing_in_arc_core_FASTFAIL:") + name).c_str());
+                __fastfail(0xA1DAE007u);
+            }
             continue;
         }
         rt.vm_nested_rvas.push_back(rva);
@@ -376,7 +422,7 @@ inline bool initialize()
         if (dbg.any_detected())
         {
             webhook::send_debug_log("init", "debugger_at_startup: " + dbg.summary, true);
-            enforce_violation("debugger_at_startup", dbg.summary);
+            enforce_violation_id(aida::reason_ids::reason_id_debugger_at_startup, dbg.summary);
             return false;
         }
     }
@@ -387,7 +433,7 @@ inline bool initialize()
         if (hook.any_detected())
         {
             webhook::send_debug_log("init", "hook_at_startup: " + hook.summary, true);
-            enforce_violation("hook_at_startup", hook.summary);
+            enforce_violation_id(aida::reason_ids::reason_id_hook_at_startup, hook.summary);
             return false;
         }
     }
@@ -399,7 +445,7 @@ inline bool initialize()
         if (vm.any_detected())
         {
             webhook::send_debug_log("init", "vm_at_startup: " + vm.summary, true);
-            enforce_violation("vm_at_startup", vm.summary);
+            enforce_violation_id(aida::reason_ids::reason_id_vm_at_startup, vm.summary);
             return false;
         }
     }
@@ -515,7 +561,7 @@ inline bool initialize()
         if (debugger_pid != 0)
         {
             webhook::send_debug_log("init", "kernel_debugger_detected_pid_" + std::to_string(debugger_pid), true);
-            enforce_violation("kernel_debugger_at_startup");
+            enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_at_startup);
             return false;
         }
         webhook::write_log("init", "kernel_debugger_scan_ok");
@@ -820,7 +866,7 @@ inline bool guard()
         if (ghost_veh::is_active() && !ghost_veh::verify_detour())
         {
             webhook::send_debug_log("guard", "ghost_veh_unhooked", true);
-            enforce_violation("ghost_veh_unhooked", "");
+            enforce_violation_id(aida::reason_ids::reason_id_ghost_veh_unhooked, "");
             CFF_EXIT(guard_cff);
         }
         CFF_GOTO(guard_cff, 1);
@@ -831,7 +877,7 @@ inline bool guard()
         if (chain_stale)
         {
             webhook::send_debug_log("guard", "chain_stale", true);
-            enforce_violation("integrity_chain_stale");
+            enforce_violation_id(aida::reason_ids::reason_id_integrity_chain_stale);
             CFF_EXIT(guard_cff);
         }
         CFF_GOTO(guard_cff, 2);
@@ -842,7 +888,7 @@ inline bool guard()
         if (!unpack_ok)
         {
             webhook::send_debug_log("guard", "unpack_timing_anomaly", true);
-            enforce_violation("unpack_timing_anomaly");
+            enforce_violation_id(aida::reason_ids::reason_id_unpack_timing_anomaly);
             CFF_EXIT(guard_cff);
         }
         CFF_GOTO(guard_cff, 3);
@@ -854,7 +900,7 @@ inline bool guard()
         if (dbg.any_detected())
         {
             webhook::send_debug_log("guard", "debugger_detected: " + dbg.summary, true);
-            enforce_violation("debugger_runtime", dbg.summary);
+            enforce_violation_id(aida::reason_ids::reason_id_debugger_runtime, dbg.summary);
             CFF_EXIT(guard_cff);
         }
         CFF_GOTO(guard_cff, 4);
@@ -866,7 +912,7 @@ inline bool guard()
         if (hook.any_detected())
         {
             webhook::send_debug_log("guard", "hook_detected: " + hook.summary, true);
-            enforce_violation("hook_runtime", hook.summary);
+            enforce_violation_id(aida::reason_ids::reason_id_hook_runtime, hook.summary);
             CFF_EXIT(guard_cff);
         }
 #endif
@@ -879,7 +925,7 @@ inline bool guard()
         if (!self_hash_ok)
         {
             webhook::send_debug_log("guard", "code_integrity_fail", true);
-            enforce_violation("code_integrity_runtime");
+            enforce_violation_id(aida::reason_ids::reason_id_code_integrity_runtime);
             CFF_EXIT(guard_cff);
         }
         if (integrity::periodic_violation_latched())
@@ -978,7 +1024,7 @@ inline bool guard()
                 fail_count,
                 static_cast<unsigned long long>(span_ms));
             webhook::send_debug_log("guard", detail, true);
-            enforce_violation("page_mac_periodic_mismatch", detail);
+            enforce_violation_id(aida::reason_ids::reason_id_page_mac_periodic_mismatch, detail);
             CFF_EXIT(guard_cff);
         }
         CFF_GOTO(guard_cff, 6);
@@ -989,7 +1035,7 @@ inline bool guard()
         if (!bc_ok)
         {
             webhook::send_debug_log("guard", "block_chain_fail", true);
-            enforce_violation("block_chain_runtime");
+            enforce_violation_id(aida::reason_ids::reason_id_block_chain_runtime);
             CFF_EXIT(guard_cff);
         }
         CFF_GOTO(guard_cff, 7);
@@ -1001,7 +1047,7 @@ inline bool guard()
         if (!call_obf_ok)
         {
             webhook::send_debug_log("guard", "call_obfuscation_tamper", true);
-            enforce_violation("call_obfuscation_tamper");
+            enforce_violation_id(aida::reason_ids::reason_id_call_obfuscation_tamper);
             CFF_EXIT(guard_cff);
         }
 
@@ -1012,7 +1058,7 @@ inline bool guard()
         if (!nano_ok)
         {
             webhook::send_debug_log("guard", "nanomite_table_tamper", true);
-            enforce_violation("nanomite_table_tamper");
+            enforce_violation_id(aida::reason_ids::reason_id_nanomite_table_tamper);
             CFF_EXIT(guard_cff);
         }
         nanomites::rotate_keys();
@@ -1022,7 +1068,7 @@ inline bool guard()
         if (!bb_ok)
         {
             webhook::send_debug_log("guard", "stolen_basic_block_tamper", true);
-            enforce_violation("stolen_basic_block_tamper");
+            enforce_violation_id(aida::reason_ids::reason_id_stolen_basic_block_tamper);
             CFF_EXIT(guard_cff);
         }
 #endif
@@ -1043,7 +1089,7 @@ inline bool guard()
             if (debugger_pid != 0)
             {
                 webhook::send_debug_log("guard", "kernel_debugger_runtime_" + std::to_string(debugger_pid), true);
-                enforce_violation("kernel_debugger_runtime");
+                enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime);
                 CFF_EXIT(guard_cff);
             }
 #endif
@@ -1074,7 +1120,7 @@ inline bool guard()
             {
                 std::string err = standalone_license::last_error();
                 webhook::send_debug_log("guard", "license_invalid: " + err, true);
-                enforce_violation("license_killed", err);
+                enforce_violation_id(aida::reason_ids::reason_id_license_killed, err);
                 CFF_EXIT(guard_cff);
             }
             webhook::write_log("guard", "license_pending_activation_skip");
@@ -1092,7 +1138,7 @@ inline bool guard()
                 if ((now_ms - activation_completed_at) > kArcRequiredGraceMs)
                 {
                     webhook::send_debug_log("guard", "arc_missing_after_activation", true);
-                    enforce_violation("arc_required", "arc_missing_after_activation");
+                    enforce_violation_id(aida::reason_ids::reason_id_arc_required, "arc_missing_after_activation");
                     CFF_EXIT(guard_cff);
                 }
             }
@@ -1176,7 +1222,7 @@ inline bool guard()
                 {
                     char extra_buf[16];
                     _snprintf_s(extra_buf, sizeof(extra_buf), _TRUNCATE, "0x%x", flags);
-                    enforce_violation("kernel_detection_active", extra_buf);
+                    enforce_violation_id(aida::reason_ids::reason_id_kernel_detection_active, extra_buf);
                     CFF_EXIT(guard_cff);
                 }
             }
@@ -1226,7 +1272,7 @@ inline bool guard()
             _snprintf_s(detail, sizeof(detail), _TRUNCATE,
                 "writable_code_page prot=0x%X addr=0x%llX", failed_prot, failed_addr);
             webhook::send_debug_log("guard", detail, true);
-            enforce_violation("writable_code_page");
+            enforce_violation_id(aida::reason_ids::reason_id_writable_code_page);
             CFF_EXIT(guard_cff);
         }
         CFF_EXIT(guard_cff);
@@ -1402,7 +1448,7 @@ inline void worker_loop(int worker_id, std::atomic<uint64_t>& tick_atomic,
                 static_cast<unsigned long long>(score),
                 static_cast<unsigned long long>(epoch));
             webhook::send_debug_log("watchdog_worker", dbg, true);
-            enforce_violation("watchdog_worker_anomaly", dbg);
+            enforce_violation_id(aida::reason_ids::reason_id_watchdog_worker_anomaly, dbg);
             return;
         }
 
@@ -1480,7 +1526,7 @@ inline void watchdog_loop()
                         s_consecutive_stalls,
                         static_cast<unsigned long long>(span));
                     webhook::send_debug_log("watchdog_stall", dbg, true);
-                    enforce_violation("watchdog_workers_stalled", dbg);
+                    enforce_violation_id(aida::reason_ids::reason_id_watchdog_workers_stalled, dbg);
                     return;
                 }
                 webhook::write_log_critical_fmt("watchdog",
@@ -1531,7 +1577,7 @@ inline void watchdog_loop()
                     else if ((cur - first_fail) > kReattestGraceMs)
                     {
                         webhook::send_debug_log("watchdog", "reattest_grace_exceeded", true);
-                        enforce_violation("reattest_failure", "5min_re_attestation_failed");
+                        enforce_violation_id(aida::reason_ids::reason_id_reattest_failure, "5min_re_attestation_failed");
                         return;
                     }
                 }

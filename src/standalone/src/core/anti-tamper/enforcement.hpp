@@ -13,8 +13,10 @@
 #include "webhook.hpp"
 #include "syscall.hpp"
 #include "obfuscation_macros.hpp"
+#include "integrity.hpp"
 #include "standalone_license.hpp"
 #include "standalone_driver.hpp"
+#include "../runtime/reason_ids.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../../../../libs/cpp-httplib/httplib.h"
 #include "../../../../../libs/nlohmann/json.hpp"
@@ -24,6 +26,67 @@
 #endif
 
 namespace anti_tamper {
+
+inline uint32_t get_tamper_response_level()
+{
+    static std::atomic<int32_t> s_cached{-1};
+    int32_t cur = s_cached.load(std::memory_order_acquire);
+    if (cur >= 0) return static_cast<uint32_t>(cur);
+
+    constexpr uint32_t kAuxMagic   = 0x4D585541u;
+    constexpr uint32_t kAuxVersion = 0x00030000u;
+    constexpr size_t   kAuxSize    = 176;
+    constexpr size_t   kTamperLevelOffsetInAux = 12;
+
+    HMODULE h = GetModuleHandleW(nullptr);
+    if (!h)
+    {
+        s_cached.store(2, std::memory_order_release);
+        return 2u;
+    }
+    uint8_t* base = reinterpret_cast<uint8_t*>(h);
+    IMAGE_DOS_HEADER dos{};
+    std::memcpy(&dos, base, sizeof(dos));
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE)
+    {
+        s_cached.store(2, std::memory_order_release);
+        return 2u;
+    }
+    IMAGE_NT_HEADERS nt{};
+    std::memcpy(&nt, base + dos.e_lfanew, sizeof(nt));
+    if (nt.Signature != IMAGE_NT_SIGNATURE)
+    {
+        s_cached.store(2, std::memory_order_release);
+        return 2u;
+    }
+
+    IMAGE_SECTION_HEADER* sec = reinterpret_cast<IMAGE_SECTION_HEADER*>(
+        base + dos.e_lfanew + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER)
+             + nt.FileHeader.SizeOfOptionalHeader);
+
+    for (unsigned i = 0; i < nt.FileHeader.NumberOfSections; ++i, ++sec)
+    {
+        uint8_t* p = base + sec->VirtualAddress;
+        size_t sz = sec->Misc.VirtualSize;
+        if (sz < kAuxSize || sz > 0x02000000u) continue;
+
+        for (size_t j = 0; j + kAuxSize <= sz; j += 4)
+        {
+            uint32_t mg = 0, ver = 0, lvl = 0;
+            std::memcpy(&mg,  p + j,     4);
+            if (mg != kAuxMagic) continue;
+            std::memcpy(&ver, p + j + 4, 4);
+            if (ver != kAuxVersion) continue;
+            std::memcpy(&lvl, p + j + kTamperLevelOffsetInAux, 4);
+            if (lvl < 1u || lvl > 4u) lvl = 2u;
+            s_cached.store(static_cast<int32_t>(lvl), std::memory_order_release);
+            return lvl;
+        }
+    }
+
+    s_cached.store(2, std::memory_order_release);
+    return 2u;
+}
 
 namespace enforcement_detail {
 
@@ -112,96 +175,188 @@ namespace enforcement_detail {
         return seed * 0x2545F4914F6CDD1DULL;
     }
 
-    inline void silent_corrupt_text(int round)
+    struct section_layout_t
     {
-        HMODULE hMod = GetModuleHandleA(nullptr);
-        if (!hMod) {
-            webhook::write_log("enforce", "corrupt_text: no module handle");
-            return;
-        }
-
-        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(hMod);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
-            webhook::write_log("enforce", "corrupt_text: dos magic mismatch (expected after anti_dump)");
-            return;
-        }
-
-        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(
-            reinterpret_cast<uint8_t*>(hMod) + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE) {
-            webhook::write_log("enforce", "corrupt_text: nt sig mismatch (expected after anti_dump)");
-            return;
-        }
-
-        auto* sec = IMAGE_FIRST_SECTION(nt);
         uint8_t* text_base = nullptr;
         uint32_t text_size = 0;
+        uint8_t* rdata_base = nullptr;
+        uint32_t rdata_size = 0;
+        bool valid = false;
+    };
 
-        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
-            if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) {
-                text_base = reinterpret_cast<uint8_t*>(hMod) + sec[i].VirtualAddress;
-                text_size = sec[i].Misc.VirtualSize;
-                break;
+    inline section_layout_t locate_sections()
+    {
+        section_layout_t out{};
+        HMODULE hMod = GetModuleHandleA(nullptr);
+        if (!hMod) return out;
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(hMod);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return out;
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(
+            reinterpret_cast<uint8_t*>(hMod) + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return out;
+
+        auto* sec = IMAGE_FIRST_SECTION(nt);
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+        {
+            if (!out.text_base && (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE))
+            {
+                out.text_base = reinterpret_cast<uint8_t*>(hMod) + sec[i].VirtualAddress;
+                out.text_size = sec[i].Misc.VirtualSize;
+            }
+            if (!out.rdata_base &&
+                sec[i].Name[0] == '.' && sec[i].Name[1] == 'r' &&
+                sec[i].Name[2] == 'd' && sec[i].Name[3] == 'a')
+            {
+                out.rdata_base = reinterpret_cast<uint8_t*>(hMod) + sec[i].VirtualAddress;
+                out.rdata_size = sec[i].Misc.VirtualSize;
             }
         }
-
-        if (!text_base || text_size < 256) return;
-
-        DWORD old_prot = 0;
-
-        uint64_t seed = __rdtsc() ^ (static_cast<uint64_t>(round) << 32);
-
-        switch (round) {
-        case 1: {
-            VirtualProtect(text_base, text_size, PAGE_EXECUTE_READWRITE, &old_prot);
-            for (int i = 0; i < 16; ++i) {
-                uint32_t offset = static_cast<uint32_t>(corruption_prng(seed) % (text_size - 1));
-                text_base[offset] ^= static_cast<uint8_t>(corruption_prng(seed));
-            }
-            VirtualProtect(text_base, text_size, old_prot, &old_prot);
-            break;
-        }
-        case 2: {
-            VirtualProtect(text_base, text_size, PAGE_EXECUTE_READWRITE, &old_prot);
-            for (int i = 0; i < 256; ++i) {
-                uint32_t offset = static_cast<uint32_t>(corruption_prng(seed) % (text_size - 1));
-                text_base[offset] = static_cast<uint8_t>(corruption_prng(seed));
-            }
-            auto* rdata_sec = IMAGE_FIRST_SECTION(nt);
-            for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
-                if (rdata_sec[i].Name[1] == 'r' && rdata_sec[i].Name[2] == 'd') {
-                    uint8_t* rdata = reinterpret_cast<uint8_t*>(hMod) + rdata_sec[i].VirtualAddress;
-                    uint32_t rdata_size = rdata_sec[i].Misc.VirtualSize;
-                    DWORD rp = 0;
-                    VirtualProtect(rdata, rdata_size, PAGE_READWRITE, &rp);
-                    for (int j = 0; j < 64; ++j) {
-                        uint32_t off = static_cast<uint32_t>(corruption_prng(seed) % (rdata_size - 1));
-                        rdata[off] ^= static_cast<uint8_t>(corruption_prng(seed));
-                    }
-                    VirtualProtect(rdata, rdata_size, rp, &rp);
-                    break;
-                }
-            }
-            VirtualProtect(text_base, text_size, old_prot, &old_prot);
-            break;
-        }
-        case 3: {
-            VirtualProtect(text_base, text_size, PAGE_EXECUTE_READWRITE, &old_prot);
-            uint32_t page_count = text_size / 4096;
-            for (uint32_t p = 0; p < page_count; ++p) {
-                if ((corruption_prng(seed) & 3) == 0) {
-                    uint8_t* page = text_base + p * 4096;
-                    for (int b = 0; b < 4096; ++b)
-                        page[b] = static_cast<uint8_t>(corruption_prng(seed));
-                }
-            }
-            VirtualProtect(text_base, text_size, old_prot, &old_prot);
-            break;
-        }
-        }
+        out.valid = (out.text_base != nullptr && out.text_size >= 4096);
+        return out;
     }
 
-    static void violation_post_impl(int round)
+    inline uint8_t pick_random_page(uint32_t section_size, uint64_t& seed)
+    {
+        if (section_size < 4096) return 0;
+        uint32_t page_count = section_size / 4096u;
+        if (page_count == 0) return 0;
+        if (page_count > 254u) page_count = 254u;
+        uint32_t pick = static_cast<uint32_t>(corruption_prng(seed) % page_count);
+        return static_cast<uint8_t>(pick);
+    }
+
+    inline void corrupt_page_bytes_exec(uint8_t* section_base,
+                                        uint32_t section_size,
+                                        uint8_t page_index,
+                                        uint32_t n_bytes,
+                                        uint64_t& seed)
+    {
+        uint32_t offset = static_cast<uint32_t>(page_index) * 4096u;
+        if (offset >= section_size) return;
+        uint32_t page_size = 4096u;
+        if (offset + page_size > section_size) page_size = section_size - offset;
+        uint8_t* page_addr = section_base + offset;
+
+        DWORD old_prot = 0;
+        if (!VirtualProtect(page_addr, page_size, PAGE_EXECUTE_READWRITE, &old_prot))
+            return;
+
+        for (uint32_t i = 0; i < n_bytes; ++i)
+        {
+            uint32_t boff = static_cast<uint32_t>(corruption_prng(seed) % page_size);
+            volatile uint8_t* p = page_addr + boff;
+            *p = static_cast<uint8_t>(*p ^ 0x66u);
+        }
+
+        VirtualProtect(page_addr, page_size, old_prot, &old_prot);
+        FlushInstructionCache(GetCurrentProcess(), page_addr, page_size);
+    }
+
+    inline void corrupt_page_bytes_data(uint8_t* section_base,
+                                        uint32_t section_size,
+                                        uint8_t page_index,
+                                        uint32_t n_bytes,
+                                        uint64_t& seed)
+    {
+        uint32_t offset = static_cast<uint32_t>(page_index) * 4096u;
+        if (offset >= section_size) return;
+        uint32_t page_size = 4096u;
+        if (offset + page_size > section_size) page_size = section_size - offset;
+        uint8_t* page_addr = section_base + offset;
+
+        DWORD old_prot = 0;
+        if (!VirtualProtect(page_addr, page_size, PAGE_READWRITE, &old_prot))
+            return;
+
+        for (uint32_t i = 0; i < n_bytes; ++i)
+        {
+            uint32_t boff = static_cast<uint32_t>(corruption_prng(seed) % page_size);
+            volatile uint8_t* p = page_addr + boff;
+            *p = static_cast<uint8_t>(*p ^ 0x66u);
+        }
+
+        VirtualProtect(page_addr, page_size, old_prot, &old_prot);
+    }
+
+    inline void silent_corrupt_text_surgical(int round, uint64_t reason_id)
+    {
+        section_layout_t lay = locate_sections();
+        if (!lay.valid)
+        {
+            webhook::write_log("enforce", "corrupt_surgical: no module layout (expected after anti_dump)");
+            return;
+        }
+
+        uint64_t seed = __rdtsc()
+            ^ (static_cast<uint64_t>(round) << 32)
+            ^ reason_id
+            ^ static_cast<uint64_t>(GetCurrentProcessId());
+
+        uint8_t corruption_pages[16] = {0};
+        size_t corruption_count = 0;
+
+        auto add_corruption_text_page = [&](uint8_t p)
+        {
+            if (corruption_count < 16)
+                corruption_pages[corruption_count++] = p;
+        };
+
+        if (round <= 1)
+        {
+            uint8_t pt = pick_random_page(lay.text_size, seed);
+            add_corruption_text_page(pt);
+            integrity::set_expected_corruption_mask(corruption_pages, corruption_count);
+            corrupt_page_bytes_exec(lay.text_base, lay.text_size, pt, 16, seed);
+            if (lay.rdata_base && lay.rdata_size >= 4096)
+            {
+                uint8_t pr = pick_random_page(lay.rdata_size, seed);
+                corrupt_page_bytes_data(lay.rdata_base, lay.rdata_size, pr, 16, seed);
+            }
+        }
+        else if (round == 2)
+        {
+            uint8_t pt1 = pick_random_page(lay.text_size, seed);
+            uint8_t pt2 = pick_random_page(lay.text_size, seed);
+            add_corruption_text_page(pt1);
+            if (pt2 != pt1) add_corruption_text_page(pt2);
+            integrity::set_expected_corruption_mask(corruption_pages, corruption_count);
+            corrupt_page_bytes_exec(lay.text_base, lay.text_size, pt1, 128, seed);
+            if (pt2 != pt1)
+                corrupt_page_bytes_exec(lay.text_base, lay.text_size, pt2, 128, seed);
+            if (lay.rdata_base && lay.rdata_size >= 4096)
+            {
+                uint8_t pr = pick_random_page(lay.rdata_size, seed);
+                corrupt_page_bytes_data(lay.rdata_base, lay.rdata_size, pr, 64, seed);
+            }
+        }
+        else
+        {
+            uint32_t page_count = lay.text_size / 4096u;
+            if (page_count > 254u) page_count = 254u;
+            for (uint32_t p = 0; p < page_count && corruption_count < 16; ++p)
+            {
+                if ((corruption_prng(seed) & 3u) == 0u)
+                    add_corruption_text_page(static_cast<uint8_t>(p));
+            }
+            if (corruption_count == 0)
+                add_corruption_text_page(pick_random_page(lay.text_size, seed));
+            integrity::set_expected_corruption_mask(corruption_pages, corruption_count);
+            for (size_t i = 0; i < corruption_count; ++i)
+            {
+                corrupt_page_bytes_exec(lay.text_base, lay.text_size,
+                                        corruption_pages[i], 256, seed);
+            }
+        }
+
+        integrity::clear_expected_corruption_mask(corruption_pages, corruption_count);
+    }
+
+    inline void silent_corrupt_text(int round)
+    {
+        silent_corrupt_text_surgical(round, 0);
+    }
+
+    static void violation_post_impl(int round, uint64_t reason_id)
     {
         try {
             std::string host = get_payload_host();
@@ -215,69 +370,110 @@ namespace enforcement_detail {
             body["session_token"] = standalone_license::get_session_token();
             body["corruption_round"] = round;
             body["tsc"] = __rdtsc();
+            body["reason_id_hex"] = ([reason_id]() {
+                char tmp[20];
+                _snprintf_s(tmp, sizeof(tmp), _TRUNCATE,
+                    "0x%016llX", static_cast<unsigned long long>(reason_id));
+                return std::string(tmp);
+            })();
 
             std::string body_str = body.dump();
             cli.Post("/api/license/violation", body_str, "application/json");
         } catch (...) {}
     }
 
-    __declspec(noinline) static DWORD seh_violation_post(int round)
+    __declspec(noinline) static DWORD seh_violation_post(int round, uint64_t reason_id)
     {
         __try {
-            violation_post_impl(round);
+            violation_post_impl(round, reason_id);
             return 0;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             return GetExceptionCode();
         }
     }
 
-    inline void graduated_enforcement()
+    __declspec(noinline) static void seh_graduated_enforcement_round_impl(int round,
+                                                                          uint64_t reason_id,
+                                                                          uint32_t level)
+    {
+        if (round == 1)
+        {
+            silent_corrupt_text_surgical(1, reason_id);
+            if (level >= 4)
+                execute_all_kill_paths();
+        }
+        else if (round == 2)
+        {
+            silent_corrupt_text_surgical(2, reason_id);
+            if (level >= 3)
+                execute_all_kill_paths();
+        }
+        else if (round == 3)
+        {
+            silent_corrupt_text_surgical(3, reason_id);
+            execute_all_kill_paths();
+        }
+        else
+        {
+            execute_all_kill_paths();
+        }
+    }
+
+    __declspec(noinline) static void seh_graduated_enforcement_round(int round,
+                                                                     uint64_t reason_id,
+                                                                     uint32_t level)
+    {
+        __try {
+            seh_graduated_enforcement_round_impl(round, reason_id, level);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            char dbg[80];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "graduated_round_SEH code=0x%08X round=%d",
+                GetExceptionCode(), round);
+            webhook::write_log("enforce", dbg);
+        }
+    }
+
+    inline void graduated_enforcement(uint64_t reason_id = 0)
     {
         int round = g_corruption_round.fetch_add(1) + 1;
+        uint32_t level = anti_tamper::get_tamper_response_level();
+        if (level == 0) level = 2;
 
         {
-            char dbg[128];
+            char dbg[160];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "graduated_enforcement round=%d", round);
+                "graduated_enforcement round=%d level=%u reason_id=0x%016llX",
+                round, level,
+                static_cast<unsigned long long>(reason_id));
             webhook::write_log("enforce", dbg);
         }
 
-        if (round == 1) {
-            DWORD seh_post = seh_violation_post(round);
-            if (seh_post != 0) {
-                char dbg[64];
-                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "violation_post_seh=0x%08X", seh_post);
-                webhook::write_log("enforce", dbg);
-            }
-        } else if (round <= 3) {
-            silent_corrupt_text(round);
+        seh_graduated_enforcement_round(round, reason_id, level);
 
-            DWORD seh_post = seh_violation_post(round);
-            if (seh_post != 0) {
-                char dbg[64];
-                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "violation_post_seh=0x%08X", seh_post);
-                webhook::write_log("enforce", dbg);
-            }
-
-            if (round == 3) {
-                execute_all_kill_paths();
-            }
-        } else {
-            execute_all_kill_paths();
+        DWORD seh_post = seh_violation_post(round, reason_id);
+        if (seh_post != 0) {
+            char dbg[64];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "violation_post_seh=0x%08X", seh_post);
+            webhook::write_log("enforce", dbg);
         }
     }
 
 }
 
-inline void enforce_violation(const char* reason, const std::string& extra = "")
+inline void enforce_violation_id(uint64_t reason_id, const std::string& extra = "")
 {
     auto& rt = state::get();
+
+    char reason_short[9] = {};
+    aida::reason_ids::reason_id_to_short_string(reason_id, reason_short);
 
     {
         char enforce_dbg[512];
         _snprintf_s(enforce_dbg, sizeof(enforce_dbg), _TRUNCATE,
-            "ENFORCE_VIOLATION reason=%s extra=%s already_latched=%d",
-            reason ? reason : "null",
+            "ENFORCE_VIOLATION_ID reason_id=0x%016llX short=%s extra=%s already_latched=%d",
+            static_cast<unsigned long long>(reason_id),
+            reason_short,
             extra.empty() ? "none" : extra.c_str(),
             rt.violation_latched.load() ? 1 : 0);
         diag::log_tagged_critical("enforce", enforce_dbg);
@@ -296,7 +492,7 @@ inline void enforce_violation(const char* reason, const std::string& extra = "")
     {
         {
             std::lock_guard<std::mutex> lk(rt.mtx);
-            rt.violation_reason = reason ? reason : "anti_tamper";
+            rt.violation_reason = std::string("rid_") + reason_short;
         }
         diag::log_tagged_critical("enforce", "ev_cff_state_0_done_goto_1");
         CFF_GOTO(ev_cff, 1);
@@ -305,7 +501,7 @@ inline void enforce_violation(const char* reason, const std::string& extra = "")
     {
         diag::log_tagged_critical("enforce", "ev_cff_state_1_calling_send_violation_alert");
         OBFUSCATE_JUNK(ev_wh);
-        webhook::send_violation_alert(reason ? reason : "anti_tamper", extra);
+        webhook::send_violation_alert_id(reason_id, extra);
         diag::log_tagged_critical("enforce", "ev_cff_state_1_done_goto_2");
         CFF_GOTO(ev_cff, 2);
     }
@@ -320,11 +516,17 @@ inline void enforce_violation(const char* reason, const std::string& extra = "")
     {
         diag::log_tagged_critical("enforce", "ev_cff_state_3_calling_graduated_enforcement");
         OBFUSCATE_JUNK(ev_grad);
-        enforcement_detail::graduated_enforcement();
+        enforcement_detail::graduated_enforcement(reason_id);
         diag::log_tagged_critical("enforce", "ev_cff_state_3_returned_from_graduated");
     }
     CFF_END(ev_cff)
     diag::log_tagged_critical("enforce", "enforce_violation_returning_normally");
+}
+
+inline void enforce_violation(const char* reason, const std::string& extra = "")
+{
+    uint64_t rid = aida::reason_ids::reason_id_from_string(reason);
+    enforce_violation_id(rid, extra);
 }
 
 namespace enforcement {
@@ -406,7 +608,7 @@ inline void enforcement_tick()
 
     int current_round = enforcement_detail::g_corruption_round.load();
     if (current_round > 0 && current_round < 3) {
-        enforcement_detail::graduated_enforcement();
+        enforcement_detail::graduated_enforcement(0);
     }
 }
 
