@@ -4,8 +4,14 @@
 #include <imports/Defs.h>
 #include <core/KernelCrypto.h>
 
+extern "C" PPEB NTAPI PsGetProcessPeb(PEPROCESS Process);
 
 namespace peer_attest {
+
+    struct peb_image_view_t {
+        UCHAR _reserved[0x10];
+        PVOID image_base_address;
+    };
 
     constexpr ULONG PEER_ATTEST_POOL_TAG = 'aPpS';
     constexpr ULONG MAX_PEER_SECTION_SIZE = 32u * 1024u * 1024u;
@@ -64,13 +70,13 @@ namespace peer_attest {
         attached = TRUE;
 
         __try {
-            PPEB peb = PsGetProcessPeb(target);
+            auto peb = reinterpret_cast<peb_image_view_t*>(PsGetProcessPeb(target));
             if (!peb || !_MmIsAddressValid(peb)) {
                 status = STATUS_NOT_FOUND;
                 goto cleanup;
             }
 
-            PVOID image_base = peb->ImageBaseAddress;
+            PVOID image_base = peb->image_base_address;
             if (!image_base || !_MmIsAddressValid(image_base)) {
                 status = STATUS_NOT_FOUND;
                 goto cleanup;

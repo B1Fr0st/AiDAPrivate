@@ -1536,6 +1536,7 @@ if(WIN32)
         set(ARC_SOURCES
             "${STANDALONE_ROOT}/core/arc/arc.cpp"
             driver/comm.cpp
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/hardware_id/hardware_id_v2.cpp"
         )
 
         set(ARC_ASM driver/syscall.asm)

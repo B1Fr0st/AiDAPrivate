@@ -2195,6 +2195,7 @@ namespace
     std::string s_cached_hwid;
 
     std::string s_cached_session_token;
+    std::string s_cached_arc_bind_token;
 
     std::atomic<uint64_t> s_proof_hash{0};
 
@@ -2667,6 +2668,30 @@ namespace
     {
         std::string combined = session_token + "|" + hwid;
         s_proof_hash.store(fnv1a_str(combined), std::memory_order_release);
+    }
+
+    bool is_hex_session_token(const std::string& s)
+    {
+        if (s.size() < 16 || s.size() > 256) return false;
+        for (char c : s) {
+            const bool is_hex = (c >= '0' && c <= '9')
+                || (c >= 'a' && c <= 'f')
+                || (c >= 'A' && c <= 'F');
+            if (!is_hex) return false;
+        }
+        return true;
+    }
+
+    std::string select_heartbeat_session_token(const settings_sa_t& settings)
+    {
+        std::string cached_copy;
+        {
+            std::lock_guard<std::mutex> lk(s_state_mtx);
+            cached_copy = s_cached_session_token;
+        }
+        if (is_hex_session_token(cached_copy))
+            return cached_copy;
+        return settings.license_session_token;
     }
 
     uint64_t vm_generate_proof_token(uint64_t session_seed, uint64_t heartbeat_count,
@@ -4025,19 +4050,195 @@ namespace
         lic_log("gate_token_root_rotated");
     }
 
-    void apply_valid_response(settings_sa_t& settings, const std::string& key,
-                              const std::string& hwid, const json& response)
+    struct apply_response_snapshot_t
     {
-        lic_log("apply_valid_response_enter");
+        std::string settings_license_key;
+        std::string settings_license_plan;
+        std::string settings_license_sig_payload;
+        std::string settings_license_server_sig;
+        std::string settings_license_session_token;
+        std::string settings_license_server_nonce;
+        std::string settings_license_client_nonce;
+        std::string settings_license_auth_hmac_key_b64;
+        std::string settings_license_hwid;
+        std::string settings_license_key_seed;
+        std::string settings_license_bind_proof;
+        int64_t     settings_license_issued_at = 0;
+        int64_t     settings_license_ttl = 3600;
+        int         settings_license_signing_kid = 1;
+        bool        settings_license_arc_load_ok = false;
+
+        std::string cached_hwid;
+        std::string cached_session_token;
+        std::string cached_arc_bind_token;
+        uint32_t    heartbeat_counter = 0;
+        uint64_t    magic = 0;
+        std::string plan;
+        std::string error;
+        bool        valid_was_true = false;
+        uint64_t    proof_hash = 0;
+
+        std::string rotated_heartbeat_nonce;
+        int64_t     rotated_heartbeat_nonce_issued_at = 0;
+        int64_t     rotated_heartbeat_nonce_max_age_s = 60;
+        std::string rotated_bind_proof;
+        int64_t     rotated_bind_proof_epoch = 0;
+        std::string next_challenge_id;
+        std::string next_challenge_nonce;
+        std::string next_challenge_signature;
+        int64_t     next_challenge_issued_at = 0;
+        int64_t     next_challenge_ttl_s = 30;
+        std::string licensee_id;
+        int64_t     silent_kill_after_ms = 0;
+
+        bool                          ratchet_was_initialized = false;
+        std::array<uint8_t, 32>       ratchet_current_token_secret{};
+        std::array<uint8_t, 32>       ratchet_server_seed{};
+        uint64_t                      ratchet_request_counter = 0;
+    };
+
+    std::atomic<bool> s_apply_response_corrupted{false};
+
+    void capture_apply_response_snapshot(const settings_sa_t& settings,
+                                          apply_response_snapshot_t& out)
+    {
+        out.settings_license_key                = settings.license_key;
+        out.settings_license_plan               = settings.license_plan;
+        out.settings_license_sig_payload        = settings.license_sig_payload;
+        out.settings_license_server_sig         = settings.license_server_sig;
+        out.settings_license_session_token      = settings.license_session_token;
+        out.settings_license_server_nonce       = settings.license_server_nonce;
+        out.settings_license_client_nonce       = settings.license_client_nonce;
+        out.settings_license_auth_hmac_key_b64  = settings.license_auth_hmac_key_b64;
+        out.settings_license_hwid               = settings.license_hwid;
+        out.settings_license_key_seed           = settings.license_key_seed;
+        out.settings_license_bind_proof         = settings.license_bind_proof;
+        out.settings_license_issued_at          = settings.license_issued_at;
+        out.settings_license_ttl                = settings.license_ttl;
+        out.settings_license_signing_kid        = settings.license_signing_kid;
+        out.settings_license_arc_load_ok        = settings.license_arc_load_ok;
+
+        {
+            std::lock_guard<std::mutex> lk(s_state_mtx);
+            out.cached_hwid           = s_cached_hwid;
+            out.cached_session_token  = s_cached_session_token;
+            out.cached_arc_bind_token = s_cached_arc_bind_token;
+            out.plan                  = s_plan;
+            out.error                 = s_error;
+            out.magic                 = s_magic.load(std::memory_order_acquire);
+            out.valid_was_true        = s_valid.load(std::memory_order_acquire);
+        }
+        out.heartbeat_counter = s_heartbeat_counter.load(std::memory_order_acquire);
+        out.proof_hash        = s_proof_hash.load(std::memory_order_acquire);
+        out.silent_kill_after_ms = s_silent_kill_after_ms.load(std::memory_order_acquire);
+
+        {
+            std::lock_guard<std::mutex> lk(s_rotation_mtx);
+            out.rotated_heartbeat_nonce           = s_rotated_heartbeat_nonce;
+            out.rotated_heartbeat_nonce_issued_at = s_rotated_heartbeat_nonce_issued_at;
+            out.rotated_heartbeat_nonce_max_age_s = s_rotated_heartbeat_nonce_max_age_s;
+            out.rotated_bind_proof                = s_rotated_bind_proof;
+            out.rotated_bind_proof_epoch          = s_rotated_bind_proof_epoch;
+            out.next_challenge_id                 = s_next_challenge_id;
+            out.next_challenge_nonce              = s_next_challenge_nonce;
+            out.next_challenge_signature          = s_next_challenge_signature;
+            out.next_challenge_issued_at          = s_next_challenge_issued_at;
+            out.next_challenge_ttl_s              = s_next_challenge_ttl_s;
+            out.licensee_id                       = s_licensee_id;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(s_session_ratchet_mtx);
+            out.ratchet_was_initialized      = s_session_ratchet.initialized;
+            out.ratchet_current_token_secret = s_session_ratchet.current_token_secret;
+            out.ratchet_server_seed          = s_session_ratchet.server_seed;
+            out.ratchet_request_counter      = s_session_ratchet.request_counter.load(std::memory_order_acquire);
+        }
+    }
+
+    void restore_apply_response_snapshot(settings_sa_t& settings,
+                                          const apply_response_snapshot_t& snap,
+                                          bool skip_mutex_guarded)
+    {
+        settings.license_key                = snap.settings_license_key;
+        settings.license_plan               = snap.settings_license_plan;
+        settings.license_sig_payload        = snap.settings_license_sig_payload;
+        settings.license_server_sig         = snap.settings_license_server_sig;
+        settings.license_session_token      = snap.settings_license_session_token;
+        settings.license_server_nonce       = snap.settings_license_server_nonce;
+        settings.license_client_nonce      = snap.settings_license_client_nonce;
+        settings.license_auth_hmac_key_b64  = snap.settings_license_auth_hmac_key_b64;
+        settings.license_hwid               = snap.settings_license_hwid;
+        settings.license_key_seed           = snap.settings_license_key_seed;
+        settings.license_bind_proof         = snap.settings_license_bind_proof;
+        settings.license_issued_at          = snap.settings_license_issued_at;
+        settings.license_ttl                = snap.settings_license_ttl;
+        settings.license_signing_kid        = snap.settings_license_signing_kid;
+        settings.license_arc_load_ok        = snap.settings_license_arc_load_ok;
+
+        s_heartbeat_counter.store(snap.heartbeat_counter, std::memory_order_release);
+        s_proof_hash.store(snap.proof_hash, std::memory_order_release);
+        s_silent_kill_after_ms.store(snap.silent_kill_after_ms, std::memory_order_release);
+        s_magic.store(snap.magic, std::memory_order_release);
+        s_valid.store(snap.valid_was_true, std::memory_order_release);
+
+        if (skip_mutex_guarded)
+            return;
+
+        {
+            std::lock_guard<std::mutex> lk(s_state_mtx);
+            s_cached_hwid           = snap.cached_hwid;
+            s_cached_session_token  = snap.cached_session_token;
+            s_cached_arc_bind_token = snap.cached_arc_bind_token;
+            s_plan                  = snap.plan;
+            s_error                 = snap.error;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(s_rotation_mtx);
+            s_rotated_heartbeat_nonce           = snap.rotated_heartbeat_nonce;
+            s_rotated_heartbeat_nonce_issued_at = snap.rotated_heartbeat_nonce_issued_at;
+            s_rotated_heartbeat_nonce_max_age_s = snap.rotated_heartbeat_nonce_max_age_s;
+            s_rotated_bind_proof                = snap.rotated_bind_proof;
+            s_rotated_bind_proof_epoch          = snap.rotated_bind_proof_epoch;
+            s_next_challenge_id                 = snap.next_challenge_id;
+            s_next_challenge_nonce              = snap.next_challenge_nonce;
+            s_next_challenge_signature          = snap.next_challenge_signature;
+            s_next_challenge_issued_at          = snap.next_challenge_issued_at;
+            s_next_challenge_ttl_s              = snap.next_challenge_ttl_s;
+            s_licensee_id                       = snap.licensee_id;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(s_session_ratchet_mtx);
+            s_session_ratchet.initialized          = snap.ratchet_was_initialized;
+            s_session_ratchet.current_token_secret = snap.ratchet_current_token_secret;
+            s_session_ratchet.server_seed          = snap.ratchet_server_seed;
+            s_session_ratchet.request_counter.store(snap.ratchet_request_counter, std::memory_order_release);
+        }
+    }
+
+    bool apply_valid_response_body(settings_sa_t& settings,
+                                    const std::string& key,
+                                    const std::string& hwid,
+                                    const json& response)
+    {
         ensure_modules_initialized();
 
         if (!verify_envelope_signature_or_skip(response, "apply_valid_response"))
         {
+            {
+                std::lock_guard<std::mutex> lk(s_state_mtx);
+                s_error = "License response signature verification failed.";
+            }
             anti_tamper::enforce_violation_id(
                 aida::reason_ids::reason_id_from_string("license_response_sig_invalid"),
                 std::string("envelope_signature_invalid"));
-            return;
+            return false;
         }
+
+        const std::string previous_session_token = settings.license_session_token;
+
         settings.license_key = key;
         lic_log("apply_valid_response_set_key");
         settings.license_plan = response.value("plan", "standard");
@@ -4082,11 +4283,6 @@ namespace
             settings.license_key_seed = response["key_seed"].get<std::string>();
         if (response.contains("bind_proof") && response["bind_proof"].is_string())
             settings.license_bind_proof = response["bind_proof"].get<std::string>();
-        lic_log("apply_valid_response_pre_save");
-
-        settings.license_arc_load_ok = s_arc_loaded;
-        settings.save();
-        lic_log("apply_valid_response_post_save");
 
         if (!settings.license_key_seed.empty())
             anti_tamper::server_pages::detail::stored_key_seed() = settings.license_key_seed;
@@ -4110,8 +4306,12 @@ namespace
         }
 
 
-        s_cached_hwid = hwid;
-        s_cached_session_token = settings.license_session_token;
+        {
+            std::lock_guard<std::mutex> lk(s_state_mtx);
+            s_cached_hwid = hwid;
+            s_cached_session_token = settings.license_session_token;
+            s_cached_arc_bind_token = settings.license_session_token;
+        }
         update_proof_hash(settings.license_session_token, hwid);
 
         {
@@ -4204,15 +4404,15 @@ namespace
             }
         }
 
-        lic_log("apply_valid_response_pre_validity_commit");
+        const bool session_token_changed =
+            !previous_session_token.empty() &&
+            settings.license_session_token != previous_session_token;
+        if (session_token_changed)
         {
-            std::lock_guard<std::mutex> lk(s_state_mtx);
-            s_magic.store(S_MAGIC_INIT ^ nonce_seed, std::memory_order_release);
-            s_plan = settings.license_plan;
-            s_error.clear();
-            set_obfuscated_valid(true, nonce_seed);
+            lic_log("apply_valid_response_session_token_changed_resetting_gate_session");
+            aida::gate_tokens::clear_session();
+            ratchet_clear();
         }
-        lic_log("apply_valid_response_post_validity_commit");
 
         if (!aida::gate_tokens::is_session_active())
         {
@@ -4242,6 +4442,83 @@ namespace
                 lic_log_fmt("session_ratchet_advanced len=%zu", next_token_hex.size());
             }
         }
+
+        lic_log("apply_valid_response_pre_validity_commit");
+        {
+            std::lock_guard<std::mutex> lk(s_state_mtx);
+            s_magic.store(S_MAGIC_INIT ^ nonce_seed, std::memory_order_release);
+            s_plan = settings.license_plan;
+            s_error.clear();
+            set_obfuscated_valid(true, nonce_seed);
+        }
+        lic_log("apply_valid_response_post_validity_commit");
+
+        lic_log("apply_valid_response_pre_save");
+        settings.license_arc_load_ok = s_arc_loaded;
+        settings.save();
+        lic_log("apply_valid_response_post_save");
+
+        return true;
+    }
+
+    __declspec(noinline) DWORD apply_valid_response_seh(settings_sa_t* settings,
+                                                       const std::string* key,
+                                                       const std::string* hwid,
+                                                       const json* response,
+                                                       BOOL* out_ok)
+    {
+        *out_ok = FALSE;
+        __try {
+            bool ok = apply_valid_response_body(*settings, *key, *hwid, *response);
+            *out_ok = ok ? TRUE : FALSE;
+            return 0;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return GetExceptionCode();
+        }
+    }
+
+    bool apply_valid_response(settings_sa_t& settings, const std::string& key,
+                              const std::string& hwid, const json& response)
+    {
+        lic_log("apply_valid_response_enter");
+
+        if (s_apply_response_corrupted.load(std::memory_order_acquire))
+        {
+            lic_log("apply_valid_response_refused_binary_corrupted");
+            std::lock_guard<std::mutex> lk(s_state_mtx);
+            s_error = "Process integrity violated. Please restart AiDAStandalone.exe.";
+            return false;
+        }
+
+        apply_response_snapshot_t snapshot;
+        capture_apply_response_snapshot(settings, snapshot);
+
+        BOOL body_ok = FALSE;
+        DWORD seh_code = apply_valid_response_seh(&settings, &key, &hwid, &response, &body_ok);
+
+        if (seh_code != 0)
+        {
+            char buf[160];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "apply_valid_response_seh_code=0x%08X rolling_back",
+                static_cast<unsigned int>(seh_code));
+            lic_log(buf);
+            restore_apply_response_snapshot(settings, snapshot, true);
+            s_apply_response_corrupted.store(true, std::memory_order_release);
+            std::unique_lock<std::mutex> err_lk(s_state_mtx, std::try_to_lock);
+            if (err_lk.owns_lock())
+            {
+                s_error = "License activation aborted due to process integrity fault. Please restart AiDAStandalone.exe and try again.";
+            }
+            return false;
+        }
+        if (body_ok == FALSE)
+        {
+            lic_log("apply_valid_response_body_returned_false_rolling_back");
+            restore_apply_response_snapshot(settings, snapshot, false);
+            return false;
+        }
+        return true;
     }
 
 
@@ -5628,7 +5905,18 @@ namespace
             return false;
         }
 
-        apply_valid_response(settings, settings.license_key, hwid, response);
+        if (!apply_valid_response(settings, settings.license_key, hwid, response))
+        {
+            std::string err_copy;
+            {
+                std::lock_guard<std::mutex> lk(s_state_mtx);
+                err_copy = s_error;
+            }
+            error_out = err_copy.empty()
+                ? std::string("Cached license revalidation failed during response apply.")
+                : err_copy;
+            return false;
+        }
         settings.license_arc_load_ok = true;
         settings.save();
 
@@ -5738,8 +6026,12 @@ namespace
         settings.license_ttl = 3600;
         settings.license_arc_load_ok = false;
         settings.save();
-        s_cached_hwid.clear();
-        s_cached_session_token.clear();
+        {
+            std::lock_guard<std::mutex> lk(s_state_mtx);
+            s_cached_hwid.clear();
+            s_cached_session_token.clear();
+            s_cached_arc_bind_token.clear();
+        }
         s_proof_hash.store(0, std::memory_order_release);
         s_heartbeat_counter.store(0, std::memory_order_release);
         {
@@ -5787,8 +6079,9 @@ namespace
             lic_diag::dump_pe_self("pre_heartbeat_call");
             lic_diag::dump_mitigation("pre_heartbeat_call");
             lic_diag::thread_canary("pre_heartbeat_call");
+            std::string hb_session_token = select_heartbeat_session_token(*settings);
             const bool hb_ok = call_validation_endpoint(*settings, "heartbeat", settings->license_key,
-                                          s_cached_hwid, settings->license_session_token,
+                                          s_cached_hwid, hb_session_token,
                                           nonce, error, response);
             {
                 char hbr[256];
@@ -5826,8 +6119,14 @@ namespace
                     if (call_validation_endpoint(*settings, "validate", settings->license_key,
                                                  s_cached_hwid, {}, reval_nonce,
                                                  reval_error, reval_response)) {
-                        apply_valid_response(*settings, settings->license_key,
-                                             s_cached_hwid, reval_response);
+                        if (!apply_valid_response(*settings, settings->license_key,
+                                                  s_cached_hwid, reval_response))
+                        {
+                            lic_log("heartbeat_revalidation_apply_failed");
+                            enter_pending_activation(*settings,
+                                std::string("revalidation_apply_failed"));
+                            break;
+                        }
                         consecutive_failures = 0;
                         continue;
                     }
@@ -5860,7 +6159,12 @@ namespace
             lic_diag::dump_pe_self("post_heartbeat_call");
             lic_diag::dump_mitigation("post_heartbeat_call");
             lic_diag::thread_canary("post_heartbeat_call");
-            apply_valid_response(*settings, settings->license_key, s_cached_hwid, response);
+            if (!apply_valid_response(*settings, settings->license_key, s_cached_hwid, response))
+            {
+                lic_log("heartbeat_apply_response_failed");
+                enter_pending_activation(*settings, std::string("heartbeat_apply_failed"));
+                break;
+            }
             lic_diag::dump_pe_self("post_apply_valid_response");
             lic_diag::dump_mitigation("post_apply_valid_response");
             lic_diag::thread_canary("post_apply_valid_response");
@@ -6125,6 +6429,29 @@ namespace standalone_license
         reset_activation_completed_at();
         anti_tamper::state::get().license_pending_activation.store(true, std::memory_order_release);
 
+        if (s_apply_response_corrupted.load(std::memory_order_acquire))
+        {
+            lic_log("activate_refused_binary_corrupted");
+            error_out = "Process integrity violated. Please restart AiDAStandalone.exe before reactivating.";
+            std::lock_guard<std::mutex> lk(s_state_mtx);
+            s_error = error_out;
+            return false;
+        }
+
+        if (!check_obfuscated_valid())
+        {
+            bool ratchet_active = false;
+            {
+                std::lock_guard<std::mutex> lk(s_session_ratchet_mtx);
+                ratchet_active = s_session_ratchet.initialized;
+            }
+            if (ratchet_active)
+            {
+                lic_log("activate_clearing_stale_ratchet");
+                ratchet_clear();
+            }
+        }
+
         const std::string nonce = generate_nonce();
         json response;
         std::string hwid;
@@ -6153,7 +6480,21 @@ namespace standalone_license
             ch.last_fast_check_ms.store(now_ms, std::memory_order_release);
             ch.last_deep_check_ms.store(now_ms, std::memory_order_release);
         }
-        apply_valid_response(settings, key, hwid, response);
+        if (!apply_valid_response(settings, key, hwid, response))
+        {
+            lic_log("activate_applied_response_failed");
+            std::string err_copy;
+            {
+                std::lock_guard<std::mutex> lk(s_state_mtx);
+                err_copy = s_error;
+                set_obfuscated_valid(false);
+            }
+            anti_tamper::state::get().license_pending_activation.store(true, std::memory_order_release);
+            error_out = err_copy.empty()
+                ? std::string("Activation failed during response apply. Please restart AiDAStandalone.exe and try again.")
+                : err_copy;
+            return false;
+        }
         lic_log("activate_applied_response");
 
         lic_log("activate_downloading_arc");
@@ -6704,5 +7045,11 @@ namespace standalone_license
     {
         std::lock_guard<std::mutex> lk(s_state_mtx);
         return s_cached_session_token;
+    }
+
+    std::string get_arc_bind_token()
+    {
+        std::lock_guard<std::mutex> lk(s_state_mtx);
+        return s_cached_arc_bind_token;
     }
 }

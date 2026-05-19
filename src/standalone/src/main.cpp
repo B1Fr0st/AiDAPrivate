@@ -1361,11 +1361,18 @@ int main(int, char**)
         {
             globals::ui::arc_unseal_phase.store(1, std::memory_order_release);
             uint8_t gate_nonce[32] = {};
-            const std::string sess_tok = standalone_license::get_session_token();
+            std::string sess_tok = standalone_license::get_arc_bind_token();
+            if (sess_tok.empty())
+                sess_tok = standalone_license::get_session_token();
             size_t cp = sess_tok.size();
             if (cp > sizeof(gate_nonce)) cp = sizeof(gate_nonce);
             if (cp > 0)
                 memcpy(gate_nonce, sess_tok.data(), cp);
+            diag::log_tagged_critical_fmt("license",
+                "arc_render_gate_nonce_source bind_token_len=%zu used_len=%zu first8=%02X%02X%02X%02X%02X%02X%02X%02X",
+                sess_tok.size(), cp,
+                gate_nonce[0], gate_nonce[1], gate_nonce[2], gate_nonce[3],
+                gate_nonce[4], gate_nonce[5], gate_nonce[6], gate_nonce[7]);
 
             uint8_t poly_seed[32] = {};
             uint32_t poly_seed_len = 0;
@@ -1375,6 +1382,9 @@ int main(int, char**)
                 gate_nonce, sizeof(gate_nonce),
                 poly_seed, &poly_seed_len, sizeof(poly_seed));
             if (!unseal_ok || poly_seed_len != 32) {
+                diag::log_tagged_critical_fmt("license",
+                    "arc_render_gate_unseal_FAIL unseal_ok=%d poly_seed_len=%u bind_token_len=%zu",
+                    unseal_ok ? 1 : 0, poly_seed_len, sess_tok.size());
                 globals::ui::arc_unseal_phase.store(3, std::memory_order_release);
                 SecureZeroMemory(poly_seed, sizeof(poly_seed));
                 SecureZeroMemory(gate_nonce, sizeof(gate_nonce));

@@ -25,7 +25,6 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "tbs.lib")
 
 namespace aida::hardware_id::v2
 {
@@ -511,25 +510,57 @@ namespace aida::hardware_id::v2
             cmd[5] = static_cast<std::uint8_t>(total & 0xFF);
         }
 
+        using tbsi_context_create_fn = TBS_RESULT (WINAPI*)(const TBS_CONTEXT_PARAMS*, PTBS_HCONTEXT);
+        using tbsip_submit_command_fn = TBS_RESULT (WINAPI*)(TBS_HCONTEXT, TBS_COMMAND_LOCALITY, TBS_COMMAND_PRIORITY, const BYTE*, UINT32, BYTE*, PUINT32);
+        using tbsip_context_close_fn = TBS_RESULT (WINAPI*)(TBS_HCONTEXT);
+
+        struct tbs_api_t
+        {
+            tbsi_context_create_fn   create  = nullptr;
+            tbsip_submit_command_fn  submit  = nullptr;
+            tbsip_context_close_fn   close   = nullptr;
+            bool                     ready   = false;
+        };
+
+        const tbs_api_t& tbs_api() noexcept
+        {
+            static tbs_api_t api = []() noexcept {
+                tbs_api_t a{};
+                HMODULE mod = LoadLibraryExW(L"tbs.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+                if (!mod) return a;
+                a.create = reinterpret_cast<tbsi_context_create_fn>(
+                    reinterpret_cast<void*>(GetProcAddress(mod, "Tbsi_Context_Create")));
+                a.submit = reinterpret_cast<tbsip_submit_command_fn>(
+                    reinterpret_cast<void*>(GetProcAddress(mod, "Tbsip_Submit_Command")));
+                a.close  = reinterpret_cast<tbsip_context_close_fn>(
+                    reinterpret_cast<void*>(GetProcAddress(mod, "Tbsip_Context_Close")));
+                a.ready = (a.create && a.submit && a.close);
+                return a;
+            }();
+            return api;
+        }
+
         bool tbs_submit(const std::vector<std::uint8_t>& cmd,
                         std::vector<std::uint8_t>& reply) noexcept
         {
+            const tbs_api_t& api = tbs_api();
+            if (!api.ready) return false;
             TBS_CONTEXT_PARAMS2 params{};
             params.version = TBS_CONTEXT_VERSION_TWO;
             params.includeTpm20 = 1;
             TBS_HCONTEXT ctx = nullptr;
-            TBS_RESULT rc = Tbsi_Context_Create(
-                reinterpret_cast<TBS_CONTEXT_PARAMS*>(&params), &ctx);
+            TBS_RESULT rc = api.create(
+                reinterpret_cast<const TBS_CONTEXT_PARAMS*>(&params), &ctx);
             if (rc != TBS_SUCCESS || ctx == nullptr) return false;
             reply.assign(4096, 0);
             UINT32 reply_len = static_cast<UINT32>(reply.size());
-            rc = Tbsip_Submit_Command(ctx,
-                                      TBS_COMMAND_LOCALITY_ZERO,
-                                      TBS_COMMAND_PRIORITY_NORMAL,
-                                      cmd.data(),
-                                      static_cast<UINT32>(cmd.size()),
-                                      reply.data(), &reply_len);
-            Tbsip_Context_Close(ctx);
+            rc = api.submit(ctx,
+                            TBS_COMMAND_LOCALITY_ZERO,
+                            TBS_COMMAND_PRIORITY_NORMAL,
+                            cmd.data(),
+                            static_cast<UINT32>(cmd.size()),
+                            reply.data(), &reply_len);
+            api.close(ctx);
             if (rc != TBS_SUCCESS) return false;
             if (reply_len < 10) return false;
             reply.resize(reply_len);

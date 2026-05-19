@@ -864,11 +864,22 @@ void run_agentic(std::string user_message,
 
     workflow_tools::get_repetition_detector().reset();
 
+    diag::log_tagged_fmt("chat",
+        "run_agentic_enter provider=%.40s model=%.80s user_len=%zu history=%zu",
+        g_sa_settings.selected_provider_id().c_str(),
+        g_sa_settings.selected_model_id().c_str(),
+        user_message.size(),
+        history.size());
+
     {
         uint64_t gate = standalone_license::inline_gate_check(
             standalone_license::gate_chat_pre_agentic);
-        if (standalone_license::verify_gate_token(
-                standalone_license::gate_chat_pre_agentic, gate) < 0.5) {
+        const double v = standalone_license::verify_gate_token(
+            standalone_license::gate_chat_pre_agentic, gate);
+        if (v < 0.5) {
+            diag::log_tagged_fmt("chat",
+                "run_agentic_pre_agentic_gate_blocked gt=0x%016llX v=%.3f",
+                static_cast<unsigned long long>(gate), v);
             post_update(ai_update_t::ERR,
                 standalone_license::decode_status_string(
                     standalone_license::str_session_revoked));
@@ -877,6 +888,7 @@ void run_agentic(std::string user_message,
     }
 
     if (!standalone_license::is_valid()) {
+        diag::log_tagged("chat", "run_agentic_license_invalid");
         post_update(ai_update_t::ERR, "Session expired. Please restart.");
         return;
     }
@@ -1284,15 +1296,29 @@ void run_agentic(std::string user_message,
                     }
                 });
         } catch (const std::exception& e) {
+            diag::log_tagged_fmt("chat",
+                "generate_with_tools_exception what=%.200s", e.what());
             output_log::push(bottom_tab_t::output, std::string("[ai] Exception: ") + e.what());
             post_update(ai_update_t::ERR, std::string("Exception: ") + e.what());
             return;
         }
 
+        diag::log_tagged_fmt("chat",
+            "generate_with_tools_done turn=%d is_error=%d in=%lld out=%lld text_len=%zu think_len=%zu tool_calls=%zu",
+            turn, gen.is_error ? 1 : 0,
+            static_cast<long long>(gen.input_tokens),
+            static_cast<long long>(gen.output_tokens),
+            gen.text.size(), gen.thinking.size(), gen.tool_calls.size());
+
         budget_used += gen.input_tokens + gen.output_tokens;
 
         if (s_cancel.load()) { post_update(ai_update_t::COMPLETE); return; }
-        if (gen.is_error) { post_update(ai_update_t::ERR, gen.text); return; }
+        if (gen.is_error) {
+            diag::log_tagged_fmt("chat",
+                "generate_with_tools_error_returned text=%.200s", gen.text.c_str());
+            post_update(ai_update_t::ERR, gen.text);
+            return;
+        }
 
         {
             std::string sid = get_chat_session_id_locked();
@@ -1987,11 +2013,22 @@ void tick_ai_chat()
     ai.thinking_text  = "";
     ai.text           = "";
     {
-        auto* prof = g_sa_settings.get_active_profile();
-        if (prof)
-            ai.model_id = prof->display_name + " / " + prof->model;
-        else
-            ai.model_id = g_sa_settings.get_active_model();
+        const std::string sel_provider = g_sa_settings.selected_provider_id();
+        const std::string sel_model    = g_sa_settings.selected_model_id();
+        std::string m_disp = sel_model;
+        if (!sel_provider.empty() && !sel_model.empty()) {
+            const auto* m = aida::provider::catalog::get_model(sel_provider, sel_model);
+            if (m != nullptr && !m->name.empty())
+                m_disp = m->name;
+        }
+        if (m_disp.empty()) {
+            auto* prof = g_sa_settings.get_active_profile();
+            if (prof) m_disp = prof->model;
+        }
+        ai.model_id = m_disp;
+        diag::log_tagged_fmt("chat",
+            "new_assistant_message provider=%.40s model=%.80s",
+            sel_provider.c_str(), m_disp.c_str());
     }
     g_chat_messages.push_back(ai);
     g_chat_scroll_to_bottom = true;
@@ -2412,13 +2449,27 @@ void chat_handle_agent_shortcuts()
     }
 }
 
+namespace {
+struct agent_pill_anim_t { float hover = 0.f; };
+inline agent_pill_anim_t& agent_pill_anim()
+{
+    static agent_pill_anim_t s;
+    return s;
+}
+}
+
 float chat_agent_pill_width()
 {
     std::string label, glyph;
     ImU32 bg, fg;
     plan_build_pill_meta(label, glyph, bg, fg);
     ImVec2 ts = ImGui::CalcTextSize(label.c_str());
-    return ts.x + 38.f;
+    const float pad_x = 12.f;
+    const float dot_r = 4.f;
+    const float dot_block = dot_r * 2.f + 6.f;
+    const float gap = 6.f;
+    const float chev_w = 10.f;
+    return pad_x + dot_block + ts.x + gap + chev_w + pad_x;
 }
 
 void chat_render_agent_pill(float anchor_x, float anchor_y, float alpha)
@@ -2429,13 +2480,19 @@ void chat_render_agent_pill(float anchor_x, float anchor_y, float alpha)
     ImU32 bg, fg;
     plan_build_pill_meta(label, glyph, bg, fg);
 
+    const auto& th = aida::ui::resolved();
+    auto& anim = agent_pill_anim();
+    float dt = ImGui::GetIO().DeltaTime;
+
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 ts = ImGui::CalcTextSize(label.c_str());
-    float pill_h = 22.f;
-    float pad_x = 12.f;
-    float gap = 6.f;
-    float dot_r = 6.f;
-    float pill_w = pad_x + dot_r * 2.f + gap + ts.x + pad_x;
+    const float pill_h = 22.f;
+    const float pad_x = 12.f;
+    const float dot_r = 4.f;
+    const float dot_block = dot_r * 2.f + 6.f;
+    const float gap = 6.f;
+    const float chev_w = 10.f;
+    const float pill_w = pad_x + dot_block + ts.x + gap + chev_w + pad_x;
 
     ImVec2 pmin(anchor_x, anchor_y);
     ImVec2 pmax(anchor_x + pill_w, anchor_y + pill_h);
@@ -2447,31 +2504,33 @@ void chat_render_agent_pill(float anchor_x, float anchor_y, float alpha)
     ImGui::InvisibleButton("##aida_agent_pill", ImVec2(pill_w, pill_h));
     bool hov = ImGui::IsItemHovered();
     bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    anim.hover += ((hov ? 1.f : 0.f) - anim.hover) * std::min(12.f * dt, 1.f);
 
+    ImU32 fill = aida::ui::with_alpha(th.panel_header, (0.78f + 0.14f * anim.hover) * alpha);
+    ImU32 border_col = aida::ui::with_alpha(th.border_strong,
+        (0.65f + 0.35f * anim.hover) * alpha);
+    dl->AddRectFilled(pmin, pmax, fill, pill_h * 0.5f);
+    dl->AddRect(pmin, pmax, border_col, pill_h * 0.5f, 0, 1.f);
+
+    float dot_cx = pmin.x + pad_x + dot_r;
+    float dot_cy = pmin.y + pill_h * 0.5f;
     int br = (bg >> 0) & 0xFF;
     int bg_g = (bg >> 8) & 0xFF;
     int bb_v = (bg >> 16) & 0xFF;
-    ImU32 fill = IM_COL32(br, bg_g, bb_v, static_cast<int>(((bg >> 24) & 0xFF) * alpha));
-    ImU32 fill_hov = IM_COL32(
-        std::min(255, br + 25), std::min(255, bg_g + 25), std::min(255, bb_v + 25),
-        static_cast<int>(((bg >> 24) & 0xFF) * alpha));
-    dl->AddRectFilled(pmin, pmax, hov ? fill_hov : fill, pill_h * 0.5f);
-    dl->AddRect(pmin, pmax,
-        aida::ui::with_alpha(aida::ui::resolved().border_strong, (hov ? 1.f : 0.5f) * alpha),
-        pill_h * 0.5f, 0, 1.f);
+    ImU32 dot_col = IM_COL32(br, bg_g, bb_v, static_cast<int>(((bg >> 24) & 0xFF) * alpha));
+    aida::ui::status_dot(ImVec2(dot_cx, dot_cy), dot_r, dot_col, false, 1.4f);
 
-    int fr = (fg >> 0) & 0xFF;
-    int fg_g = (fg >> 8) & 0xFF;
-    int fb = (fg >> 16) & 0xFF;
+    ImU32 text_col = aida::ui::with_alpha(th.text_primary,
+        (0.86f + 0.14f * anim.hover) * alpha);
+    float text_x = pmin.x + pad_x + dot_block;
+    dl->AddText(ImVec2(text_x, pmin.y + (pill_h - ts.y) * 0.5f), text_col, label.c_str());
 
-    float dot_cx = pmin.x + pad_x + dot_r * 0.5f;
-    float dot_cy = pmin.y + pill_h * 0.5f;
-    dl->AddCircleFilled(ImVec2(dot_cx, dot_cy), dot_r,
-        IM_COL32(fr, fg_g, fb, static_cast<int>(((fg >> 24) & 0xFF) * alpha)), 18);
-
-    float text_x = dot_cx + dot_r + gap;
-    ImU32 fg_a = IM_COL32(fr, fg_g, fb, static_cast<int>(((fg >> 24) & 0xFF) * alpha));
-    dl->AddText(ImVec2(text_x, pmin.y + (pill_h - ts.y) * 0.5f), fg_a, label.c_str());
+    float cx_chev = text_x + ts.x + gap + chev_w * 0.5f;
+    float cy_chev = pmin.y + pill_h * 0.5f;
+    ImU32 chev_col = aida::ui::with_alpha(th.text_secondary,
+        (0.7f + 0.3f * anim.hover) * alpha);
+    dl->AddLine(ImVec2(cx_chev - 3.f, cy_chev - 1.5f), ImVec2(cx_chev, cy_chev + 1.5f), chev_col, 1.4f);
+    dl->AddLine(ImVec2(cx_chev, cy_chev + 1.5f), ImVec2(cx_chev + 3.f, cy_chev - 1.5f), chev_col, 1.4f);
 
     if (hov) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);

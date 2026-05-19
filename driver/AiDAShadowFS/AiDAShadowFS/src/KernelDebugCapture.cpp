@@ -11,6 +11,7 @@ namespace dbg_capture {
     static constexpr ULONG kPoolTag = 'gbDA';
 
     static UCHAR* g_ring = nullptr;
+    static UCHAR* g_flush_buffer = nullptr;
     static volatile ULONG g_write_pos = 0;
     static volatile ULONG g_read_pos = 0;
     static volatile LONG g_initialized = 0;
@@ -82,6 +83,9 @@ namespace dbg_capture {
 
     static void flush_to_file()
     {
+        if (!g_ring || !g_flush_buffer) return;
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return;
+
         ULONG snapshot_len = 0;
 
         KIRQL old_irql;
@@ -93,34 +97,19 @@ namespace dbg_capture {
             KeReleaseSpinLock(&g_lock, old_irql);
             return;
         }
-        if (used > kRingSize) used = kRingSize;
-        snapshot_len = used;
-        KeReleaseSpinLock(&g_lock, old_irql);
-
-        UCHAR* snapshot = static_cast<UCHAR*>(
-            ExAllocatePool2(POOL_FLAG_PAGED, snapshot_len, kPoolTag));
-        if (!snapshot) return;
-
-        KeAcquireSpinLock(&g_lock, &old_irql);
-        wpos = g_write_pos;
-        rpos = g_read_pos;
-        ULONG now_used = wpos - rpos;
-        if (now_used == 0) {
-            KeReleaseSpinLock(&g_lock, old_irql);
-            ExFreePoolWithTag(snapshot, kPoolTag);
-            return;
+        if (used > kRingSize) {
+            rpos = wpos - kRingSize;
+            used = kRingSize;
         }
-        if (now_used > snapshot_len) now_used = snapshot_len;
-
         ULONG offset = rpos % kRingSize;
         ULONG first_chunk = kRingSize - offset;
-        if (first_chunk > now_used) first_chunk = now_used;
-        RtlCopyMemory(snapshot, g_ring + offset, first_chunk);
-        if (first_chunk < now_used) {
-            RtlCopyMemory(snapshot + first_chunk, g_ring, now_used - first_chunk);
+        if (first_chunk > used) first_chunk = used;
+        RtlCopyMemory(g_flush_buffer, g_ring + offset, first_chunk);
+        if (first_chunk < used) {
+            RtlCopyMemory(g_flush_buffer + first_chunk, g_ring, used - first_chunk);
         }
-        g_read_pos = rpos + now_used;
-        snapshot_len = now_used;
+        g_read_pos = rpos + used;
+        snapshot_len = used;
         KeReleaseSpinLock(&g_lock, old_irql);
 
         UNICODE_STRING path;
@@ -149,11 +138,9 @@ namespace dbg_capture {
             offset_li.HighPart = -1;
             offset_li.LowPart = FILE_WRITE_TO_END_OF_FILE;
             ZwWriteFile(hFile, NULL, NULL, NULL, &iosb,
-                snapshot, snapshot_len, &offset_li, NULL);
+                g_flush_buffer, snapshot_len, &offset_li, NULL);
             ZwClose(hFile);
         }
-
-        ExFreePoolWithTag(snapshot, kPoolTag);
     }
 
     static VOID NTAPI drain_thread_routine(PVOID context)
@@ -181,6 +168,14 @@ namespace dbg_capture {
             ExAllocatePool2(POOL_FLAG_NON_PAGED, kRingSize, kPoolTag));
         if (!g_ring) return STATUS_INSUFFICIENT_RESOURCES;
 
+        g_flush_buffer = static_cast<UCHAR*>(
+            ExAllocatePool2(POOL_FLAG_NON_PAGED, kRingSize, kPoolTag));
+        if (!g_flush_buffer) {
+            ExFreePoolWithTag(g_ring, kPoolTag);
+            g_ring = nullptr;
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
         KeInitializeSpinLock(&g_lock);
         KeInitializeEvent(&g_wake_event, SynchronizationEvent, FALSE);
         g_write_pos = 0;
@@ -203,6 +198,8 @@ namespace dbg_capture {
         if (!NT_SUCCESS(st)) {
             ExFreePoolWithTag(g_ring, kPoolTag);
             g_ring = nullptr;
+            ExFreePoolWithTag(g_flush_buffer, kPoolTag);
+            g_flush_buffer = nullptr;
             _InterlockedExchange(&g_initialized, 0);
             return st;
         }

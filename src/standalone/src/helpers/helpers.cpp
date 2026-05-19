@@ -6774,32 +6774,15 @@ void helpers::render_title()
 			{
 				if (msg.has_thinking)
 				{
-					bool still_thinking = !g_ai_thinking_active && mi == (int)g_chat_messages.size() - 1;
+					const bool still_thinking = !g_ai_thinking_active && mi == (int)g_chat_messages.size() - 1;
 
 					ImGuiID tid = ImGui::GetID(("think_open_" + std::to_string(mi)).c_str());
 					bool    open = s->GetBool(tid, false);
 
-
-					if (!still_thinking && open)
-					{
-						s->SetBool(tid, false);
-						open = false;
-					}
-
 					ImGuiID toa = ImGui::GetID(("toa_" + std::to_string(mi)).c_str());
 					float   topen = s->GetFloat(toa, 0.f);
-					topen += ((open ? 1.f : 0.f) - topen) * std::min(10.f * ImGui::GetIO().DeltaTime, 1.f);
+					topen += ((open ? 1.f : 0.f) - topen) * std::min(11.f * ImGui::GetIO().DeltaTime, 1.f);
 					s->SetFloat(toa, topen);
-
-
-					ImGuiID tvid = ImGui::GetID(("tv_" + std::to_string(mi)).c_str());
-					float think_vis = s->GetFloat(tvid, 1.f);
-					if (!still_thinking && topen < 0.05f)
-					{
-						think_vis = std::max(0.f, think_vis - 4.f * ImGui::GetIO().DeltaTime);
-						s->SetFloat(tvid, think_vis);
-					}
-
 
 					ImGuiID tstart_id = ImGui::GetID(("tstart_" + std::to_string(mi)).c_str());
 					float   tstart    = s->GetFloat(tstart_id, -1.f);
@@ -6808,75 +6791,177 @@ void helpers::render_title()
 					float   tdur      = s->GetFloat(tdur_id, -1.f);
 					if (!still_thinking && tstart > 0.f && tdur < 0.f) { tdur = (float)ImGui::GetTime() - tstart; s->SetFloat(tdur_id, tdur); }
 
-					if (think_vis > 0.01f)
+					ImFont* tlabel_font = aida::ui::fonts::caption() ? aida::ui::fonts::caption() : ImGui::GetFont();
+					float   tlabel_fs   = tlabel_font->FontSize > 0.f ? tlabel_font->FontSize : 13.f;
+					ImFont* tbody_font  = aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont();
+					float   tbody_fs    = tbody_font->FontSize > 0.f ? tbody_font->FontSize : 14.f;
+
+					char think_label[64];
+					if (still_thinking) {
+						snprintf(think_label, sizeof(think_label), "Thinking");
+					} else if (tdur > 0.f) {
+						const float secs = tdur;
+						if (secs < 1.f)
+							snprintf(think_label, sizeof(think_label), "Thought for less than a second");
+						else if (secs < 60.f)
+							snprintf(think_label, sizeof(think_label), "Thought for %ds", (int)secs);
+						else
+							snprintf(think_label, sizeof(think_label), "Thought for %dm %ds", (int)(secs / 60.f), (int)secs % 60);
+					} else {
+						snprintf(think_label, sizeof(think_label), "Show reasoning");
+					}
+
+					ImVec2 label_ts = tlabel_font->CalcTextSizeA(tlabel_fs, FLT_MAX, 0.f, think_label);
+					const float pill_h   = 22.f;
+					const float pad_l    = 10.f;
+					const float pad_r    = 8.f;
+					const float dot_block_w = 18.f;
+					const float chev_w   = 12.f;
+					const float gap      = 6.f;
+					float  pill_w   = pad_l + dot_block_w + gap + label_ts.x + gap + chev_w + pad_r;
+					float  vis_a    = appear * a;
+
+					ImVec2 pmin = ImVec2(wp2.x + 6.f, wp2.y + cursor_y);
+					ImVec2 pmax = ImVec2(pmin.x + pill_w, pmin.y + pill_h);
+
+					ImGuiID phov_id = ImGui::GetID(("thp_hov_" + std::to_string(mi)).c_str());
+					float   phov_t  = s->GetFloat(phov_id, 0.f);
+					bool phover = !ui_input_gate::popup_blocks_background_input() && ImGui::IsMouseHoveringRect(pmin, pmax);
+					phov_t += ((phover ? 1.f : 0.f) - phov_t) * std::min(12.f * ImGui::GetIO().DeltaTime, 1.f);
+					s->SetFloat(phov_id, phov_t);
+
+					if (phover && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 					{
+						s->SetBool(tid, !open); open = !open;
+					}
+					if (phover)
+						ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
 
-						char think_label[20];
-						if (still_thinking) {
-							int dots = 1 + (int)(ImGui::GetTime() * 2.0) % 3;
-							snprintf(think_label, sizeof(think_label), "Thinking%.*s", dots, "...");
-						} else {
-							snprintf(think_label, sizeof(think_label), "Thinking...");
+					dl->AddRectFilled(pmin, pmax,
+						aida::ui::with_alpha(th_msg.panel_header, (0.62f + 0.30f * phov_t) * vis_a), pill_h * 0.5f);
+					dl->AddRect(pmin, pmax,
+						aida::ui::with_alpha(th_msg.border_subtle, (0.55f + 0.35f * phov_t) * vis_a), pill_h * 0.5f, 0, 0.7f);
+
+					{
+						const float dot_cy = pmin.y + pill_h * 0.5f;
+						const float dot_cx0 = pmin.x + pad_l + 2.f;
+						const float spacing = 5.f;
+						const float dot_r = 1.7f;
+						const float t = (float)ImGui::GetTime();
+						for (int di = 0; di < 3; ++di) {
+							float ph = t * 4.f - (float)di * 0.55f;
+							float s_pulse = 0.5f + 0.5f * sinf(ph);
+							float dot_a = still_thinking ? (0.35f + 0.65f * s_pulse) : 0.55f;
+							ImU32 dot_col = aida::ui::with_alpha(th_msg.accent_u32, dot_a * vis_a);
+							dl->AddCircleFilled(ImVec2(dot_cx0 + (float)di * spacing, dot_cy), dot_r, dot_col, 8);
 						}
+					}
 
-						ImVec2 label_ts = ImGui::CalcTextSize(think_label);
-						float  pill_h   = 18.f;
-						float  pill_w   = 10.f + label_ts.x + 10.f;
-						float  vis_a    = think_vis * appear * a;
+					ImU32 label_col = still_thinking
+						? aida::ui::with_alpha(th_msg.text_primary, (0.85f + 0.15f * phov_t) * vis_a)
+						: aida::ui::with_alpha(th_msg.text_secondary, (0.80f + 0.20f * phov_t) * vis_a);
+					if (still_thinking) {
+						const float t = (float)ImGui::GetTime();
+						const float pulse = 0.78f + 0.22f * (0.5f + 0.5f * sinf(t * 2.4f));
+						label_col = aida::ui::with_alpha(th_msg.text_primary, pulse * vis_a);
+					}
+					dl->AddText(tlabel_font, tlabel_fs,
+						ImVec2(pmin.x + pad_l + dot_block_w + gap, pmin.y + (pill_h - label_ts.y) * 0.5f),
+						label_col, think_label);
 
-						ImVec2 pmin = ImVec2(wp2.x + 6.f, wp2.y + cursor_y);
-						ImVec2 pmax = ImVec2(pmin.x + pill_w, pmin.y + pill_h);
+					{
+						const float chev_cx = pmax.x - pad_r - chev_w * 0.5f;
+						const float chev_cy = pmin.y + pill_h * 0.5f;
+						const float ext = 3.2f;
+						const float ease = topen;
+						ImU32 chev_col = aida::ui::with_alpha(th_msg.text_secondary, (0.80f + 0.20f * phov_t) * vis_a);
 
-						bool phover = !ui_input_gate::popup_blocks_background_input() && ImGui::IsMouseHoveringRect(pmin, pmax);
-						if (phover && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+						const float collapsed_lx = chev_cx - ext * 0.6f;
+						const float collapsed_ly_top = chev_cy - ext;
+						const float collapsed_ly_bot = chev_cy + ext;
+						const float collapsed_tx = chev_cx + ext * 0.6f;
+						const float collapsed_ty = chev_cy;
+
+						const float expanded_lx = chev_cx - ext;
+						const float expanded_ly = chev_cy - ext * 0.6f;
+						const float expanded_tx = chev_cx;
+						const float expanded_ty = chev_cy + ext * 0.6f;
+						const float expanded_rx = chev_cx + ext;
+						const float expanded_ry = chev_cy - ext * 0.6f;
+
+						ImVec2 p_top(
+							collapsed_lx + (expanded_lx - collapsed_lx) * ease,
+							collapsed_ly_top + (expanded_ly - collapsed_ly_top) * ease);
+						ImVec2 p_tip(
+							collapsed_tx + (expanded_tx - collapsed_tx) * ease,
+							collapsed_ty + (expanded_ty - collapsed_ty) * ease);
+						ImVec2 p_bot(
+							collapsed_lx + (expanded_rx - collapsed_lx) * ease,
+							collapsed_ly_bot + (expanded_ry - collapsed_ly_bot) * ease);
+
+						dl->AddLine(p_top, p_tip, chev_col, 1.4f);
+						dl->AddLine(p_bot, p_tip, chev_col, 1.4f);
+					}
+
+					cursor_y += pill_h + 4.f;
+
+					if ((topen > 0.01f || open) && !msg.thinking_text.empty())
+					{
+						const float body_pad_x = 14.f;
+						const float body_pad_y = 8.f;
+						const float body_pad_l = 18.f;
+						const float body_x     = 16.f;
+						const float body_w     = std::max(80.f, cw - body_x - 8.f);
+						const float text_w     = std::max(40.f, body_w - body_pad_l - body_pad_x);
+
+						ImVec2 text_ts = tbody_font->CalcTextSizeA(tbody_fs, FLT_MAX, text_w, msg.thinking_text.c_str());
+						float full_bk_h = text_ts.y + body_pad_y * 2.f;
+
+						ImGuiID bkha = ImGui::GetID(("bkh_" + std::to_string(mi)).c_str());
+						float   bk_h = s->GetFloat(bkha, 0.f);
+						const float target_h = open ? full_bk_h : 0.f;
+						bk_h += (target_h - bk_h) * std::min(11.f * ImGui::GetIO().DeltaTime, 1.f);
+						s->SetFloat(bkha, bk_h);
+
+						if (bk_h > 0.5f)
 						{
-							s->SetBool(tid, !open); open = !open;
-						}
+							ImVec2 bkmin = ImVec2(wp2.x + body_x, wp2.y + cursor_y);
+							ImVec2 bkmax = ImVec2(bkmin.x + body_w, bkmin.y + bk_h);
 
-						dl->AddRectFilled(pmin, pmax,
-							aida::ui::with_alpha(th_msg.hover_wash, phover ? vis_a : 0.6f * vis_a), 9.f);
-						dl->AddRect(pmin, pmax,
-							aida::ui::with_alpha(th_msg.border_subtle, vis_a), 9.f, 0, 0.5f);
+							dl->PushClipRect(bkmin, bkmax, true);
 
-						dl->AddText(
-							ImVec2(pmin.x + 10.f, pmin.y + (pill_h - label_ts.y) * 0.5f),
-							aida::ui::with_alpha(th_msg.text_secondary, vis_a), think_label);
-
-						cursor_y += (pill_h + 4.f) * think_vis;
-
-						if (!msg.thinking_text.empty())
-						{
-							float pad2  = 10.f;
-							float bk_w  = cw - 14.f;
-							ImVec2 tts  = ImGui::CalcTextSize(
-								msg.thinking_text.c_str(), nullptr, false, bk_w - pad2 * 2.f);
-							float full_bk_h = tts.y + pad2 * 2.f;
-
-							ImGuiID bkha = ImGui::GetID(("bkh_" + std::to_string(mi)).c_str());
-							float   bk_h = s->GetFloat(bkha, 0.f);
-							bk_h += ((topen > 0.5f ? full_bk_h : 0.f) - bk_h)
-								* std::min(10.f * ImGui::GetIO().DeltaTime, 1.f);
-							s->SetFloat(bkha, bk_h);
-
-							if (bk_h > 1.f)
-							{
-								ImVec2 bkmin = ImVec2(wp2.x + 6.f, wp2.y + cursor_y);
-								ImVec2 bkmax = ImVec2(bkmin.x + bk_w, bkmin.y + bk_h);
-
-								dl->AddRectFilled(bkmin, bkmax,
-									aida::ui::with_alpha(th_msg.bg_overlay, 0.82f * topen * vis_a), 7.f);
-								dl->AddRect(bkmin, bkmax,
-									aida::ui::with_alpha(th_msg.border_subtle, topen * vis_a), 7.f, 0, 0.5f);
-
-								dl->PushClipRect(bkmin, bkmax, true);
-								dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
-									ImVec2(bkmin.x + pad2, bkmin.y + pad2),
-									aida::ui::with_alpha(th_msg.text_secondary, topen * vis_a),
-									msg.thinking_text.c_str(), nullptr, bk_w - pad2 * 2.f);
-								dl->PopClipRect();
-
-								cursor_y += (bk_h + 5.f) * think_vis;
+							ImU32 chain_col = aida::ui::with_alpha(th_msg.border_strong, topen * vis_a);
+							const float chain_x = bkmin.x + 7.5f;
+							const float chain_top = bkmin.y + 2.f;
+							const float chain_bot = bkmax.y - 2.f;
+							const float fade_len = 14.f;
+							const float chain_full_h = (chain_bot - chain_top);
+							if (chain_full_h > 1.f) {
+								const int segs = 16;
+								for (int si = 0; si < segs; ++si) {
+									float y0 = chain_top + chain_full_h * ((float)si / (float)segs);
+									float y1 = chain_top + chain_full_h * ((float)(si + 1) / (float)segs);
+									float mid = (y0 + y1) * 0.5f;
+									float fade = 1.f;
+									if (mid - chain_top < fade_len)
+										fade = std::max(0.f, (mid - chain_top) / fade_len);
+									else if (chain_bot - mid < fade_len)
+										fade = std::max(0.f, (chain_bot - mid) / fade_len);
+									dl->AddLine(ImVec2(chain_x, y0), ImVec2(chain_x, y1),
+										aida::ui::with_alpha(chain_col, fade), 1.f);
+								}
 							}
+
+							const float text_x = bkmin.x + body_pad_l;
+							const float text_y = bkmin.y + body_pad_y;
+							ImU32 body_text_col = aida::ui::with_alpha(th_msg.text_secondary, topen * vis_a);
+							dl->AddText(tbody_font, tbody_fs,
+								ImVec2(text_x, text_y), body_text_col,
+								msg.thinking_text.c_str(), nullptr, text_w);
+
+							dl->PopClipRect();
+
+							cursor_y += bk_h + 6.f;
 						}
 					}
 				}
@@ -7109,17 +7194,6 @@ void helpers::render_title()
 				float w_agent = chat_agent_pill_width();
 				chat_render_agent_pill(chat_wp.x + pill_cursor_x, chat_wp.y + pill_strip_y, a);
 				pill_cursor_x += w_agent + pill_strip_gap;
-			}
-			{
-				float w_skills = chat_skills_pill_width();
-				chat_render_skills_pill(chat_wp.x + pill_cursor_x, chat_wp.y + pill_strip_y, a,
-					g_chat_buf, sizeof(g_chat_buf));
-				pill_cursor_x += w_skills + pill_strip_gap;
-			}
-			{
-				float w_mcp = chat_mcp_pill_width();
-				chat_render_mcp_pill(chat_wp.x + pill_cursor_x, chat_wp.y + pill_strip_y, a);
-				pill_cursor_x += w_mcp + pill_strip_gap;
 			}
 
 

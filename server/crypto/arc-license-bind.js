@@ -207,6 +207,21 @@ function assembleFeatureBlob(licenseRow, sessionRow) {
     ]);
     const polymorphismTag = polymorphismCipher.getAuthTag();
 
+    try {
+        const lkPrefix = (licenseRow && typeof licenseRow.key === 'string' ? licenseRow.key : '').slice(0, 10);
+        const bsFirst = bindSecret.slice(0, 8).toString('hex').toUpperCase();
+        const bsLast = bindSecret.slice(24, 32).toString('hex').toUpperCase();
+        const nonceFirst = nonce.slice(0, 8).toString('hex').toUpperCase();
+        const nonceLast = nonce.slice(24, 32).toString('hex').toUpperCase();
+        const ivHex = polymorphismIv.toString('hex').toUpperCase();
+        const tagFirst = polymorphismTag.slice(0, 8).toString('hex').toUpperCase();
+        const tagLast = polymorphismTag.slice(8, 16).toString('hex').toUpperCase();
+        const ctFirst = polymorphismCiphertext.slice(0, 8).toString('hex').toUpperCase();
+        const fkFirst = polymorphismKey.slice(0, 8).toString('hex').toUpperCase();
+        const fkLast = polymorphismKey.slice(24, 32).toString('hex').toUpperCase();
+        console.warn(`[arc-bind-diag] lk=${lkPrefix} bs_first8=${bsFirst} bs_last8=${bsLast} nonce_first8=${nonceFirst} nonce_last8=${nonceLast} iv=${ivHex} tag_first8=${tagFirst} tag_last8=${tagLast} ct_first8=${ctFirst} fk_first8=${fkFirst} fk_last8=${fkLast} ct_len=${polymorphismCiphertext.length}`);
+    } catch (_) {}
+
     const entries = [
         {
             featureId: FEAT_FEATURE_POLYMORPHISM_SEED,

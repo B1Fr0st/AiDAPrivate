@@ -210,6 +210,68 @@ namespace sa_settings_detail
         return kind;
     }
 
+    inline std::string canonicalize_internal_kind(std::string id)
+    {
+        id = trim(id);
+        if (id.empty())
+            return "openai_compatible";
+        if (id == "google" || id == "google-ai" || id == "google-generative-ai" || id == "google-genai")
+            return "gemini";
+        if (id == "google-vertex" || id == "vertex" || id == "vertex-anthropic")
+            return "vertex";
+        if (id == "anthropic" || id == "claude")
+            return "anthropic";
+        if (id == "openai")
+            return "openai_native";
+        if (id == "openai-codex" || id == "openai_codex")
+            return "openai_codex";
+        if (id == "github-copilot" || id == "copilot")
+            return "github-copilot";
+        if (id == "openrouter")
+            return "openrouter";
+        if (id == "amazon-bedrock" || id == "bedrock")
+            return "bedrock";
+        if (id == "deepseek")
+            return "deepseek";
+        if (id == "mistral" || id == "codestral")
+            return "mistral";
+        if (id == "xai" || id == "grok")
+            return "xai";
+        if (id == "sambanova")
+            return "sambanova";
+        if (id == "fireworks" || id == "fireworks-ai")
+            return "fireworks";
+        if (id == "moonshot" || id == "moonshot-ai")
+            return "moonshot";
+        if (id == "minimax")
+            return "minimax";
+        if (id == "qwen" || id == "qwen-code" || id == "qwen_code")
+            return "qwen_code";
+        if (id == "baseten")
+            return "baseten";
+        if (id == "zai" || id == "z-ai" || id == "bigmodel")
+            return "zai";
+        if (id == "ollama")
+            return "ollama";
+        if (id == "lmstudio" || id == "lm-studio")
+            return "lmstudio";
+        if (id == "azure" || id == "azure-openai")
+            return "azure";
+        if (id == "requesty")
+            return "requesty";
+        if (id == "unbound")
+            return "unbound";
+        if (id == "vercel-ai" || id == "vercel_ai")
+            return "vercel_ai";
+        if (id == "litellm")
+            return "litellm";
+        if (id == "local" || id == "local_llm")
+            return "local";
+        if (id == "openai_native" || id == "openai_compatible" || id == "gemini")
+            return id;
+        return id;
+    }
+
     inline bool read_json_file(const std::filesystem::path& path, nlohmann::json& out)
     {
         std::ifstream ifs(path);
@@ -875,16 +937,19 @@ struct settings_sa_t
     std::string get_active_profile_kind() const
     {
         if (!default_provider_id.empty())
-            return default_provider_id;
+            return sa_settings_detail::canonicalize_internal_kind(default_provider_id);
         const auto* profile = get_active_profile();
-        return profile ? sa_settings_detail::normalize_provider_kind(profile->kind) : std::string("openai_compatible");
+        return profile ? sa_settings_detail::canonicalize_internal_kind(sa_settings_detail::normalize_provider_kind(profile->kind)) : std::string("openai_compatible");
     }
 
     std::string selected_provider_id() const
     {
         if (!default_provider_id.empty())
             return default_provider_id;
-        return get_active_profile_kind();
+        const auto* profile = get_active_profile();
+        if (profile)
+            return sa_settings_detail::normalize_provider_kind(profile->kind);
+        return std::string("openai_compatible");
     }
 
     std::string selected_model_id() const
@@ -935,7 +1000,7 @@ struct settings_sa_t
         if (!profile->base_url.empty())
             return profile->base_url;
 
-        const std::string kind = sa_settings_detail::normalize_provider_kind(profile->kind);
+        const std::string kind = sa_settings_detail::canonicalize_internal_kind(sa_settings_detail::normalize_provider_kind(profile->kind));
         if (kind == "gemini")           return "https://generativelanguage.googleapis.com";
         if (kind == "anthropic")        return "https://api.anthropic.com";
         if (kind == "openrouter")       return "https://openrouter.ai";

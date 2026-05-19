@@ -16,6 +16,7 @@
 #include "../mcp/mcp_client.hpp"
 #include "../session/session_store.hpp"
 #include "../helpers/globals.h"
+#include "../helpers/diag_log.hpp"
 #include "../infra/work_queue.hpp"
 
 #include <nlohmann/json.hpp>
@@ -142,7 +143,7 @@ bool standalone_ai_client_t::is_available() const
     const auto kind = _settings.get_active_profile_kind();
     if (kind == "local")
         return !_settings.get_active_base_url().empty() && !model.empty();
-    if (kind == "gemini" || kind == "anthropic" || kind == "openrouter")
+    if (kind == "gemini" || kind == "google" || kind == "anthropic" || kind == "openrouter")
         return !_settings.get_active_api_key().empty() && !model.empty();
     return !_settings.get_active_base_url().empty() && !model.empty();
 }
@@ -349,7 +350,11 @@ std::string standalone_ai_client_t::do_generate(
     }
 
     const auto provider = _settings.get_active_profile_kind();
-    if (provider == "gemini")      return generate_gemini(prompt, temperature, on_chunk, stop_check);
+    diag::log_tagged_fmt("chat",
+        "do_generate_dispatch provider=%.40s",
+        provider.c_str());
+    if (provider == "gemini" || provider == "google" || provider == "vertex")
+        return generate_gemini(prompt, temperature, on_chunk, stop_check);
     if (provider == "anthropic")   return generate_anthropic(prompt, temperature, on_chunk, stop_check);
     if (provider == "openrouter")  return generate_openrouter(prompt, temperature, on_chunk, stop_check);
 
@@ -1454,10 +1459,15 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools(
     ai_generation_result_t result;
 
     {
-        uint64_t gt = standalone_license::inline_gate_check(
-            standalone_license::gate_native_tool_use);
-        if (!standalone_license::verify_tool_runtime(
-                standalone_license::gate_native_tool_use, gt, "native_tool_use")) {
+        const uint64_t gt = standalone_license::inline_gate_check(
+            standalone_license::gate_ai_generate);
+        const double v = standalone_license::verify_gate_token(
+            standalone_license::gate_ai_generate, gt);
+        standalone_license::fold_integrity_token(gt);
+        if (v < 0.5) {
+            diag::log_tagged_fmt("chat",
+                "generate_with_tools_gate_blocked gt=0x%016llX v=%.3f",
+                static_cast<unsigned long long>(gt), v);
             result.is_error = true;
             result.text = "Error: License gate blocked native tool use.";
             return result;
@@ -1465,18 +1475,31 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools(
     }
 
     const auto provider = _settings.get_active_profile_kind();
+    const auto raw_provider = _settings.selected_provider_id();
+    diag::log_tagged_fmt("chat",
+        "generate_with_tools_enter provider=%.40s raw=%.40s tools=%zu msgs=%zu",
+        provider.c_str(), raw_provider.c_str(),
+        tools.size(), messages.is_array() ? messages.size() : 0);
 
 
-    if (provider == "anthropic")
+    if (provider == "anthropic") {
+        diag::log_tagged_fmt("chat", "generate_with_tools_path=anthropic");
         return generate_with_tools_anthropic(messages, system_prompt, tools, on_chunk);
+    }
 
-    if (provider == "gemini" || provider == "vertex")
+    if (provider == "gemini" || provider == "google" || provider == "vertex") {
+        diag::log_tagged_fmt("chat", "generate_with_tools_path=gemini");
         return generate_with_tools_gemini(messages, system_prompt, tools, on_chunk);
+    }
 
-    if (provider == "openai_native" || provider == "openai_codex")
+    if (provider == "openai_native" || provider == "openai_codex") {
+        diag::log_tagged_fmt("chat", "generate_with_tools_path=openai_native");
         return generate_with_tools_openai(messages, system_prompt, tools, on_chunk);
+    }
 
 
+    diag::log_tagged_fmt("chat", "generate_with_tools_path=generic_openai provider=%.40s",
+        provider.c_str());
     return generate_with_tools_generic_openai(messages, system_prompt, tools, on_chunk);
 }
 
@@ -1492,10 +1515,15 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
 
 
     {
-        uint64_t gt = standalone_license::inline_gate_check(
-            standalone_license::gate_native_tool_use);
-        if (!standalone_license::verify_tool_runtime(
-                standalone_license::gate_native_tool_use, gt, "native_tool_use")) {
+        const uint64_t gt = standalone_license::inline_gate_check(
+            standalone_license::gate_ai_generate);
+        const double v = standalone_license::verify_gate_token(
+            standalone_license::gate_ai_generate, gt);
+        standalone_license::fold_integrity_token(gt);
+        if (v < 0.5) {
+            diag::log_tagged_fmt("chat",
+                "anthropic_gate_blocked gt=0x%016llX v=%.3f",
+                static_cast<unsigned long long>(gt), v);
             result.is_error = true;
             result.text = "Error: License gate blocked native tool use.";
             return result;
@@ -1504,6 +1532,9 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
 
     std::string base_url = _settings.get_active_base_url();
     std::string model    = _settings.get_active_model();
+    diag::log_tagged_fmt("chat",
+        "anthropic_enter base=%.80s model=%.80s tools=%zu",
+        base_url.c_str(), model.c_str(), tools.size());
 
 
     std::string clean_model = model;
@@ -2078,6 +2109,11 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
     std::string raw_response;
     const std::string gemini_body = body.dump();
 
+    diag::log_tagged_fmt("chat",
+        "gemini_request host=%.120s model=%.80s body=%zu key_present=%d",
+        base_url.c_str(), model.c_str(), gemini_body.size(),
+        api_key.empty() ? 0 : 1);
+
     output_log::push(bottom_tab_t::output, "[ai] Gemini POST model=" + model
         + " tools=" + std::to_string(gem_tools.empty() ? 0 : gem_tools[0].value("functionDeclarations", json::array()).size())
         + " body=" + std::to_string(gemini_body.size()) + "B");
@@ -2160,6 +2196,11 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
         "POST", gemini_url, gemini_hdr_list, gemini_body,
         std::string("application/json"),
         k_ai_chat_stream_timeout_sec, chunk_cb);
+
+    diag::log_tagged_fmt("chat",
+        "gemini_response status=%d ok=%d cancelled=%d err_len=%zu raw_len=%zu",
+        res.status, res.ok ? 1 : 0, res.cancelled ? 1 : 0,
+        res.error.size(), raw_response.size());
 
     if (_cancelled) { result.is_error = true; result.text = "Error: Operation cancelled."; return result; }
     if (res.cancelled) return result;

@@ -114,6 +114,7 @@ namespace standalone_license
                                      uint32_t out_cap);
     uint64_t get_server_nonce_hash();
     std::string get_session_token();
+    std::string get_arc_bind_token();
 }
 
 
