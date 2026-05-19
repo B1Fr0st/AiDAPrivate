@@ -1,0 +1,336 @@
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shlobj.h>
+
+#ifdef small
+#undef small
+#endif
+
+#include "h2_editor_view.hpp"
+#include "h2_editor.hpp"
+
+#include "imgui/imgui.h"
+#include "imgui/imgui_internal.h"
+#include "../../ui/theme.hpp"
+#include "../../ui/components.hpp"
+#include "helpers/diag_log.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace aida {
+namespace burp {
+namespace h2_editor_view {
+
+namespace {
+
+struct ui_state_t
+{
+    std::mutex                                       mtx;
+    char                                             host[256] = "example.com";
+    int                                              port = 443;
+    char                                             method[16] = "GET";
+    char                                             path[1024] = "/";
+    char                                             scheme[16] = "https";
+    char                                             authority[256] = "";
+    char                                             header_name_buf[128] = "";
+    char                                             header_value_buf[512] = "";
+    std::vector<std::pair<std::string, std::string>> headers;
+    char                                             body[16384] = "";
+    int                                              timeout_ms = 15000;
+    bool                                             use_raw = false;
+    char                                             raw_frames_hex[16384] = "";
+    bool                                             end_stream = true;
+    bool                                             end_headers = true;
+    bool                                             padded = false;
+    bool                                             priority = false;
+
+    h2_editor::response_t                            last_response;
+    bool                                             has_response = false;
+    std::atomic<bool>                                in_flight{false};
+    std::mutex                                       resp_mtx;
+};
+
+static ui_state_t& ui() { static ui_state_t s; return s; }
+
+static bool hex_char(char c, uint8_t& out)
+{
+    if (c >= '0' && c <= '9') { out = static_cast<uint8_t>(c - '0'); return true; }
+    if (c >= 'a' && c <= 'f') { out = static_cast<uint8_t>(c - 'a' + 10); return true; }
+    if (c >= 'A' && c <= 'F') { out = static_cast<uint8_t>(c - 'A' + 10); return true; }
+    return false;
+}
+
+static std::vector<uint8_t> hex_decode(const std::string& s)
+{
+    std::vector<uint8_t> out;
+    out.reserve(s.size() / 2);
+    uint8_t high = 0;
+    bool have_high = false;
+    for (char c : s) {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+        uint8_t v = 0;
+        if (!hex_char(c, v)) return {};
+        if (!have_high) { high = v; have_high = true; }
+        else { out.push_back(static_cast<uint8_t>((high << 4) | v)); have_high = false; }
+    }
+    return out;
+}
+
+static std::string hex_encode(const std::vector<uint8_t>& v, size_t max_bytes)
+{
+    static const char* hex = "0123456789abcdef";
+    std::string out;
+    size_t n = v.size() < max_bytes ? v.size() : max_bytes;
+    out.reserve(n * 3);
+    for (size_t i = 0; i < n; ++i) {
+        out.push_back(hex[(v[i] >> 4) & 0xF]);
+        out.push_back(hex[v[i] & 0xF]);
+        if ((i & 0xF) == 0xF) out.push_back('\n');
+        else out.push_back(' ');
+    }
+    if (v.size() > max_bytes) out += "... (truncated)";
+    return out;
+}
+
+}
+
+void initialize()
+{
+}
+
+void shutdown()
+{
+}
+
+void render(float pos_x, float pos_y, float width, float height,
+            float alpha, float accent_r, float accent_g, float accent_b)
+{
+    (void)accent_r; (void)accent_g; (void)accent_b;
+    const auto& th = aida::ui::resolved();
+    auto& st = ui();
+
+    ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
+    ImGui::BeginChild("##burp_h2_root", ImVec2(width, height), false, ImGuiWindowFlags_NoBackground);
+
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
+                       "HTTP/2 Frame Editor");
+    ImGui::Spacing();
+
+    float left_w = width * 0.55f;
+    if (left_w < 360.f) left_w = 360.f;
+    float right_w = width - left_w - 8.f;
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, aida::ui::with_alpha(th.panel_bg, 0.55f * alpha));
+    ImGui::BeginChild("##burp_h2_edit", ImVec2(left_w, height - 36.f), true, ImGuiWindowFlags_NoBackground);
+
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
+                       "Target");
+    ImGui::SetNextItemWidth(220.f);
+    ImGui::InputText("Host##h2_host", st.host, sizeof(st.host));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(80.f);
+    ImGui::InputInt("Port##h2_port", &st.port);
+    ImGui::SetNextItemWidth(80.f);
+    ImGui::InputInt("Timeout ms##h2_to", &st.timeout_ms);
+
+    ImGui::Separator();
+    ImGui::Checkbox("Raw frames mode##h2_raw", &st.use_raw);
+
+    if (!st.use_raw) {
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
+                           "Pseudo-headers");
+        ImGui::SetNextItemWidth(80.f);
+        ImGui::InputText(":method##h2_m", st.method, sizeof(st.method));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80.f);
+        ImGui::InputText(":scheme##h2_s", st.scheme, sizeof(st.scheme));
+        ImGui::SetNextItemWidth(left_w - 60.f);
+        ImGui::InputText(":path##h2_p", st.path, sizeof(st.path));
+        ImGui::SetNextItemWidth(left_w - 100.f);
+        ImGui::InputText(":authority##h2_a", st.authority, sizeof(st.authority));
+
+        ImGui::Separator();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
+                           "Stream flags");
+        ImGui::Checkbox("END_STREAM##h2_es", &st.end_stream);
+        ImGui::SameLine();
+        ImGui::Checkbox("END_HEADERS##h2_eh", &st.end_headers);
+        ImGui::SameLine();
+        ImGui::Checkbox("PADDED##h2_pad", &st.padded);
+        ImGui::SameLine();
+        ImGui::Checkbox("PRIORITY##h2_pri", &st.priority);
+
+        ImGui::Separator();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
+                           "Headers");
+        ImGui::SetNextItemWidth(160.f);
+        ImGui::InputText("##h2_hn", st.header_name_buf, sizeof(st.header_name_buf));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(left_w - 280.f);
+        ImGui::InputText("##h2_hv", st.header_value_buf, sizeof(st.header_value_buf));
+        ImGui::SameLine();
+        if (aida::ui::button("+", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+            std::string n = st.header_name_buf;
+            std::string v = st.header_value_buf;
+            if (!n.empty()) {
+                std::lock_guard<std::mutex> lk(st.mtx);
+                st.headers.push_back({ std::move(n), std::move(v) });
+                st.header_name_buf[0] = '\0';
+                st.header_value_buf[0] = '\0';
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(st.mtx);
+            for (size_t i = 0; i < st.headers.size(); ++i) {
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
+                                   "%s:", st.headers[i].first.c_str());
+                ImGui::SameLine();
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_primary, alpha)),
+                                   "%s", st.headers[i].second.c_str());
+                ImGui::SameLine();
+                if (aida::ui::button("X", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
+                    st.headers.erase(st.headers.begin() + static_cast<ptrdiff_t>(i));
+                    ImGui::PopID();
+                    break;
+                }
+                ImGui::PopID();
+            }
+        }
+
+        ImGui::Separator();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
+                           "Body");
+        ImGui::InputTextMultiline("##h2_body", st.body, sizeof(st.body),
+                                  ImVec2(left_w - 24.f, 100.f));
+    } else {
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
+                           "Hex frames (length(3) type(1) flags(1) Rbit+stream(4) payload):");
+        ImGui::InputTextMultiline("##h2_raw_hex", st.raw_frames_hex, sizeof(st.raw_frames_hex),
+                                  ImVec2(left_w - 24.f, 280.f));
+    }
+
+    ImGui::Separator();
+    bool in_flight = st.in_flight.load();
+    if (!in_flight) {
+        if (aida::ui::button("Send", aida::ui::button_kind_t::primary, aida::ui::size_t_::md)) {
+            h2_editor::request_t req;
+            req.host = st.host;
+            req.port = static_cast<uint16_t>(std::max(1, std::min(65535, st.port)));
+            req.timeout_ms = std::max(500, st.timeout_ms);
+            if (st.use_raw) {
+                std::vector<uint8_t> bytes = hex_decode(st.raw_frames_hex);
+                req.use_raw_frames = true;
+                std::vector<h2_editor::frame_t> frames;
+                h2_editor::decode_frames(bytes, frames);
+                req.raw_frames = std::move(frames);
+            } else {
+                req.pseudo.method = st.method;
+                req.pseudo.path = st.path;
+                req.pseudo.scheme = st.scheme;
+                req.pseudo.authority = st.authority[0] ? std::string(st.authority) : std::string(st.host);
+                {
+                    std::lock_guard<std::mutex> lk(st.mtx);
+                    req.headers = st.headers;
+                }
+                req.body.assign(st.body, st.body + strlen(st.body));
+                uint32_t flg = 0;
+                if (st.end_stream)  flg |= static_cast<uint32_t>(h2_editor::send_flags_t::end_stream);
+                if (st.end_headers) flg |= static_cast<uint32_t>(h2_editor::send_flags_t::end_headers);
+                if (st.padded)      flg |= static_cast<uint32_t>(h2_editor::send_flags_t::padded);
+                if (st.priority)    flg |= static_cast<uint32_t>(h2_editor::send_flags_t::priority);
+                req.flags = flg;
+            }
+
+            st.in_flight.store(true);
+            std::thread([&st, req]() {
+                h2_editor::response_t r = h2_editor::send(req);
+                {
+                    std::lock_guard<std::mutex> lk(st.resp_mtx);
+                    st.last_response = std::move(r);
+                    st.has_response = true;
+                }
+                st.in_flight.store(false);
+            }).detach();
+            diag::log_tagged_fmt("burp", "h2_editor_send host=%s port=%d raw=%d",
+                                 req.host.c_str(), req.port, req.use_raw_frames ? 1 : 0);
+        }
+    } else {
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
+                           "Sending...");
+    }
+
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+
+    ImGui::SameLine(0.f, 8.f);
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, aida::ui::with_alpha(th.panel_bg, 0.45f * alpha));
+    ImGui::BeginChild("##burp_h2_resp", ImVec2(right_w, height - 36.f), true, ImGuiWindowFlags_NoBackground);
+
+    h2_editor::response_t r_copy;
+    bool have;
+    {
+        std::lock_guard<std::mutex> lk(st.resp_mtx);
+        r_copy = st.last_response;
+        have = st.has_response;
+    }
+    if (!have) {
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
+                           "(no response yet)");
+    } else {
+        char hdr[256];
+        snprintf(hdr, sizeof(hdr), "Status: %d  Latency: %llums  %s",
+                 r_copy.status_code,
+                 static_cast<unsigned long long>(r_copy.latency_ms),
+                 r_copy.ok ? "OK" : "ERROR");
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_primary, alpha)),
+                           "%s", hdr);
+        if (!r_copy.error_msg.empty()) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.error, alpha)),
+                               "%s", r_copy.error_msg.c_str());
+        }
+        ImGui::Separator();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
+                           "Headers");
+        for (auto& h : r_copy.headers) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
+                               "%s: %s", h.first.c_str(), h.second.c_str());
+        }
+        ImGui::Separator();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
+                           "Body (%zu bytes)", r_copy.body.size());
+        std::string preview;
+        size_t cap = r_copy.body.size() < 4096 ? r_copy.body.size() : 4096;
+        preview.reserve(cap);
+        for (size_t i = 0; i < cap; ++i) {
+            uint8_t b = r_copy.body[i];
+            if (b == '\r' || b == '\n' || b == '\t' || (b >= 0x20 && b < 0x7f)) preview.push_back(static_cast<char>(b));
+            else preview.push_back('.');
+        }
+        ImGui::TextWrapped("%.*s", static_cast<int>(preview.size()), preview.c_str());
+
+        ImGui::Separator();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
+                           "Raw wire (hex)");
+        std::string hex_in = hex_encode(r_copy.raw_wire_in, 1024);
+        ImGui::TextWrapped("%.*s", static_cast<int>(hex_in.size()), hex_in.c_str());
+    }
+
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+
+    ImGui::EndChild();
+}
+
+}
+}
+}

@@ -33,6 +33,7 @@ struct response_t {
     std::vector<uint8_t> body;
     std::vector<uint8_t> tls_exporter;
     std::array<uint8_t, 32> server_spki_hash = {};
+    std::string debug_reason;
 };
 
 using pubkey_provider_fn = bool(*)(uint8_t kid, uint8_t out_pubkey[32]);

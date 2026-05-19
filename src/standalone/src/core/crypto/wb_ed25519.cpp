@@ -1365,4 +1365,9 @@ namespace aida::wb_ed25519
         const char* e = s_last_error.load(std::memory_order_acquire);
         return e ? e : "";
     }
+
+    bool self_test_ok() noexcept
+    {
+        return run_self_test_once();
+    }
 }

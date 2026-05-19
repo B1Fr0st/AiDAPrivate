@@ -26,6 +26,29 @@
 #include "../session/analysis_session.hpp"
 #include "../anti-tamper/webhook.hpp"
 
+#include "burp/burp_module.hpp"
+#include "burp/site_map.hpp"
+#include "burp/scope.hpp"
+#include "burp/cookie_jar.hpp"
+#include "burp/scanner_view.hpp"
+#include "burp/recon_view.hpp"
+#include "burp/intruder_view.hpp"
+#include "burp/collaborator_view.hpp"
+#include "burp/sequencer_view.hpp"
+#include "burp/comparer_view.hpp"
+#include "burp/jwt_lab_view.hpp"
+#include "burp/match_replace_view.hpp"
+#include "burp/session_handler_view.hpp"
+#include "burp/api_view.hpp"
+#include "burp/ws_editor_view.hpp"
+#include "burp/h2_editor_view.hpp"
+#include "burp/burp_logger_view.hpp"
+#include "burp/csp_view.hpp"
+#include "burp/upstream_view.hpp"
+#include "burp/browser_view.hpp"
+#include "burp/report_view.hpp"
+#include "burp/headless_view.hpp"
+
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 
@@ -635,6 +658,8 @@ void initialize() {
         g_state.fuzz_thread_done.store(true, std::memory_order_release);
         diag::log_tagged("network", "fuzzer_thread_post_failed");
     }
+    aida::burp::initialize();
+
     diag::log_tagged("network", "initialize_complete");
 }
 
@@ -671,6 +696,8 @@ void shutdown() {
     while (!g_state.fuzz_thread_done.load(std::memory_order_acquire))
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
+    aida::burp::shutdown();
+
     work_queue::shutdown();
     mitm_proxy::stop();
     ssl_keylog::stop_watching();
@@ -682,13 +709,23 @@ void shutdown() {
 static const char* tab_names[] = {
     "Connections", "Capture", "Intercept", "Proxy",
     "DNS", "Filters", "Bandwidth", "Repeater", "KeyLog",
-    "PCAP", "Fuzzer", "WebSocket", "Scripting", "Decoder"
+    "PCAP", "Fuzzer", "WebSocket", "Scripting", "Decoder",
+    "Site Map", "Scope", "Cookies", "Scanner", "Recon",
+    "Intruder", "Collaborator", "Sequencer", "Comparer",
+    "JWT Lab", "Match/Replace", "Session", "API",
+    "WS Editor", "H/2 Editor", "Logger", "CSP",
+    "Upstream", "Browser", "Reports", "Headless"
 };
 
 static const char* tab_short_names[] = {
     "Conn", "Cap", "Int", "Prx",
     "DNS", "Filt", "BW", "Rep", "KL",
-    "PCAP", "Fuz", "WS", "Scr", "Dec"
+    "PCAP", "Fuz", "WS", "Scr", "Dec",
+    "Site", "Scope", "Cook", "Scan", "Recon",
+    "Intr", "Collab", "Seq", "Cmp",
+    "JWT", "M/R", "Sess", "API",
+    "WSe", "H2e", "Log", "CSP",
+    "Up", "Brw", "Rpt", "HL"
 };
 
 
@@ -5375,6 +5412,69 @@ void render(float pos_x, float pos_y, float width, float height,
             break;
         case sub_tab_t::decoder:
             render_decoder(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::sitemap:
+            aida::burp::sitemap::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::scope:
+            aida::burp::scope::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::cookies:
+            aida::burp::cookie_jar::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::scanner:
+            aida::burp::scanner_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::recon:
+            aida::burp::recon_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::intruder:
+            aida::burp::intruder_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::collab:
+            aida::burp::collaborator_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::sequencer:
+            aida::burp::sequencer_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::comparer:
+            aida::burp::comparer_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::jwt:
+            aida::burp::jwt_lab_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::mr:
+            aida::burp::match_replace_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::session:
+            aida::burp::session_handler_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::api:
+            aida::burp::api_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::ws_edit:
+            aida::burp::ws_editor_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::h2_edit:
+            aida::burp::h2_editor_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::logger:
+            aida::burp::logger_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::csp:
+            aida::burp::csp::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::upstream:
+            aida::burp::upstream::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::browser:
+            aida::burp::browser::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::reports:
+            aida::burp::report_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::headless:
+            aida::burp::headless_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         default:
             break;

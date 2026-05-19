@@ -1,0 +1,658 @@
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+
+#ifdef small
+#undef small
+#endif
+
+#include "audit_http.hpp"
+#include "scope.hpp"
+
+#include "../../../helpers/diag_log.hpp"
+
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#pragma comment(lib, "Ws2_32.lib")
+
+namespace aida {
+namespace burp {
+namespace audit_http {
+
+namespace {
+
+std::mutex& err_mtx() { static std::mutex m; return m; }
+std::string& err_slot() { static std::string s; return s; }
+
+void set_err(const std::string& msg)
+{
+    std::lock_guard<std::mutex> lk(err_mtx());
+    err_slot() = msg;
+}
+
+uint64_t now_ms()
+{
+    using namespace std::chrono;
+    return static_cast<uint64_t>(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
+}
+
+uint64_t now_steady_ms()
+{
+    using namespace std::chrono;
+    return static_cast<uint64_t>(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+}
+
+struct wsa_init_t
+{
+    bool ok = false;
+    wsa_init_t() {
+        WSADATA d{};
+        ok = (WSAStartup(MAKEWORD(2, 2), &d) == 0);
+    }
+};
+
+void ensure_wsa()
+{
+    static wsa_init_t s_init;
+    (void)s_init;
+}
+
+struct openssl_init_t
+{
+    openssl_init_t() {
+        OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, nullptr);
+    }
+};
+
+void ensure_openssl()
+{
+    static openssl_init_t s_init;
+    (void)s_init;
+}
+
+struct socket_holder_t
+{
+    SOCKET sock = INVALID_SOCKET;
+    ~socket_holder_t() {
+        if (sock != INVALID_SOCKET) {
+            shutdown(sock, SD_BOTH);
+            closesocket(sock);
+        }
+    }
+};
+
+struct ssl_holder_t
+{
+    SSL_CTX* ctx = nullptr;
+    SSL*     ssl = nullptr;
+    ~ssl_holder_t() {
+        if (ssl) {
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+        }
+        if (ctx) SSL_CTX_free(ctx);
+    }
+};
+
+bool resolve_target(const std::string& host, uint16_t port, sockaddr_storage& out, int& out_len)
+{
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    char port_str[16];
+    _snprintf_s(port_str, sizeof(port_str), _TRUNCATE, "%u", port);
+
+    addrinfo* res = nullptr;
+    int rc = getaddrinfo(host.c_str(), port_str, &hints, &res);
+    if (rc != 0 || !res) return false;
+    std::memcpy(&out, res->ai_addr, res->ai_addrlen);
+    out_len = static_cast<int>(res->ai_addrlen);
+    freeaddrinfo(res);
+    return true;
+}
+
+bool set_nonblocking(SOCKET s, bool nb)
+{
+    u_long mode = nb ? 1 : 0;
+    return ioctlsocket(s, FIONBIO, &mode) == 0;
+}
+
+bool wait_socket(SOCKET s, int timeout_ms, bool for_write)
+{
+    WSAPOLLFD pfd{};
+    pfd.fd = s;
+    pfd.events = static_cast<short>(for_write ? POLLOUT : POLLIN);
+    int rc = WSAPoll(&pfd, 1, timeout_ms);
+    return rc > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) == 0;
+}
+
+bool tcp_connect(SOCKET s, const sockaddr* sa, int sa_len, int timeout_ms)
+{
+    if (!set_nonblocking(s, true)) return false;
+    int rc = connect(s, sa, sa_len);
+    if (rc == 0) return true;
+    int err = WSAGetLastError();
+    if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) return false;
+    if (!wait_socket(s, timeout_ms, true)) return false;
+    int so_err = 0;
+    int len = sizeof(so_err);
+    if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_err), &len) != 0) return false;
+    return so_err == 0;
+}
+
+bool send_all(SOCKET s, const uint8_t* data, size_t len, int timeout_ms)
+{
+    uint64_t deadline = now_steady_ms() + static_cast<uint64_t>(timeout_ms);
+    size_t off = 0;
+    while (off < len) {
+        if (!wait_socket(s, static_cast<int>(deadline - now_steady_ms()), true)) return false;
+        int n = ::send(s, reinterpret_cast<const char*>(data + off), static_cast<int>(len - off), 0);
+        if (n <= 0) {
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK) {
+                if (now_steady_ms() >= deadline) return false;
+                continue;
+            }
+            return false;
+        }
+        off += static_cast<size_t>(n);
+        if (now_steady_ms() >= deadline) return false;
+    }
+    return true;
+}
+
+bool ssl_send_all(SSL* ssl, const uint8_t* data, size_t len, SOCKET s, int timeout_ms)
+{
+    uint64_t deadline = now_steady_ms() + static_cast<uint64_t>(timeout_ms);
+    size_t off = 0;
+    while (off < len) {
+        int n = SSL_write(ssl, data + off, static_cast<int>(len - off));
+        if (n > 0) { off += static_cast<size_t>(n); continue; }
+        int err = SSL_get_error(ssl, n);
+        if (err == SSL_ERROR_WANT_READ) {
+            if (!wait_socket(s, static_cast<int>(deadline - now_steady_ms()), false)) return false;
+        } else if (err == SSL_ERROR_WANT_WRITE) {
+            if (!wait_socket(s, static_cast<int>(deadline - now_steady_ms()), true)) return false;
+        } else {
+            return false;
+        }
+        if (now_steady_ms() >= deadline) return false;
+    }
+    return true;
+}
+
+bool recv_until_complete(SOCKET s, std::vector<uint8_t>& buf, int timeout_ms)
+{
+    uint64_t deadline = now_steady_ms() + static_cast<uint64_t>(timeout_ms);
+    constexpr size_t kChunk = 16 * 1024;
+    constexpr size_t kMaxResp = 32 * 1024 * 1024;
+    char tmp[kChunk];
+    bool headers_done = false;
+    size_t header_end = 0;
+    long long content_length = -1;
+    bool chunked = false;
+    while (buf.size() < kMaxResp) {
+        if (now_steady_ms() >= deadline) break;
+        int wait = static_cast<int>(deadline - now_steady_ms());
+        if (!wait_socket(s, wait, false)) break;
+        int n = recv(s, tmp, sizeof(tmp), 0);
+        if (n == 0) break;
+        if (n < 0) {
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK) continue;
+            break;
+        }
+        buf.insert(buf.end(), reinterpret_cast<uint8_t*>(tmp), reinterpret_cast<uint8_t*>(tmp) + n);
+        if (!headers_done) {
+            const std::string sep = "\r\n\r\n";
+            for (size_t i = 0; i + sep.size() <= buf.size(); ++i) {
+                if (std::memcmp(buf.data() + i, sep.data(), sep.size()) == 0) {
+                    headers_done = true;
+                    header_end = i + sep.size();
+                    break;
+                }
+            }
+            if (headers_done) {
+                std::string headers_only(reinterpret_cast<const char*>(buf.data()), header_end);
+                std::string lc = headers_only;
+                std::transform(lc.begin(), lc.end(), lc.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                size_t cl = lc.find("\r\ncontent-length:");
+                if (cl != std::string::npos) {
+                    size_t vs = cl + 17;
+                    while (vs < lc.size() && (lc[vs] == ' ' || lc[vs] == '\t')) ++vs;
+                    size_t ve = vs;
+                    while (ve < lc.size() && lc[ve] != '\r' && lc[ve] != '\n') ++ve;
+                    try { content_length = std::stoll(headers_only.substr(vs, ve - vs)); } catch (...) { content_length = -1; }
+                }
+                size_t te = lc.find("\r\ntransfer-encoding:");
+                if (te != std::string::npos) {
+                    size_t vs = te + 20;
+                    size_t ve = lc.find("\r\n", vs);
+                    std::string tev = lc.substr(vs, ve - vs);
+                    if (tev.find("chunked") != std::string::npos) chunked = true;
+                }
+            }
+        }
+        if (headers_done) {
+            if (content_length >= 0) {
+                size_t total_expected = header_end + static_cast<size_t>(content_length);
+                if (buf.size() >= total_expected) break;
+            } else if (chunked) {
+                if (buf.size() >= 5 && std::memcmp(buf.data() + buf.size() - 5, "0\r\n\r\n", 5) == 0) break;
+            }
+        }
+    }
+    return !buf.empty();
+}
+
+bool ssl_recv_until_complete(SSL* ssl, SOCKET s, std::vector<uint8_t>& buf, int timeout_ms)
+{
+    uint64_t deadline = now_steady_ms() + static_cast<uint64_t>(timeout_ms);
+    constexpr size_t kChunk = 16 * 1024;
+    constexpr size_t kMaxResp = 32 * 1024 * 1024;
+    char tmp[kChunk];
+    bool headers_done = false;
+    size_t header_end = 0;
+    long long content_length = -1;
+    bool chunked = false;
+    while (buf.size() < kMaxResp) {
+        if (now_steady_ms() >= deadline) break;
+        int n = SSL_read(ssl, tmp, static_cast<int>(sizeof(tmp)));
+        if (n > 0) {
+            buf.insert(buf.end(), reinterpret_cast<uint8_t*>(tmp), reinterpret_cast<uint8_t*>(tmp) + n);
+            if (!headers_done) {
+                const std::string sep = "\r\n\r\n";
+                for (size_t i = 0; i + sep.size() <= buf.size(); ++i) {
+                    if (std::memcmp(buf.data() + i, sep.data(), sep.size()) == 0) {
+                        headers_done = true;
+                        header_end = i + sep.size();
+                        break;
+                    }
+                }
+                if (headers_done) {
+                    std::string headers_only(reinterpret_cast<const char*>(buf.data()), header_end);
+                    std::string lc = headers_only;
+                    std::transform(lc.begin(), lc.end(), lc.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    size_t cl = lc.find("\r\ncontent-length:");
+                    if (cl != std::string::npos) {
+                        size_t vs = cl + 17;
+                        while (vs < lc.size() && (lc[vs] == ' ' || lc[vs] == '\t')) ++vs;
+                        size_t ve = vs;
+                        while (ve < lc.size() && lc[ve] != '\r' && lc[ve] != '\n') ++ve;
+                        try { content_length = std::stoll(headers_only.substr(vs, ve - vs)); } catch (...) { content_length = -1; }
+                    }
+                    size_t te = lc.find("\r\ntransfer-encoding:");
+                    if (te != std::string::npos) {
+                        size_t vs = te + 20;
+                        size_t ve = lc.find("\r\n", vs);
+                        std::string tev = lc.substr(vs, ve - vs);
+                        if (tev.find("chunked") != std::string::npos) chunked = true;
+                    }
+                }
+            }
+            if (headers_done) {
+                if (content_length >= 0) {
+                    size_t total_expected = header_end + static_cast<size_t>(content_length);
+                    if (buf.size() >= total_expected) break;
+                } else if (chunked) {
+                    if (buf.size() >= 5 && std::memcmp(buf.data() + buf.size() - 5, "0\r\n\r\n", 5) == 0) break;
+                }
+            }
+            continue;
+        }
+        int err = SSL_get_error(ssl, n);
+        if (err == SSL_ERROR_ZERO_RETURN) break;
+        if (err == SSL_ERROR_WANT_READ) {
+            if (!wait_socket(s, static_cast<int>(deadline - now_steady_ms()), false)) break;
+        } else if (err == SSL_ERROR_WANT_WRITE) {
+            if (!wait_socket(s, static_cast<int>(deadline - now_steady_ms()), true)) break;
+        } else {
+            break;
+        }
+    }
+    return !buf.empty();
+}
+
+void parse_response_status(const std::string& raw, int& status_code, std::string& reason)
+{
+    auto eol = raw.find("\r\n");
+    if (eol == std::string::npos) return;
+    std::string line = raw.substr(0, eol);
+    auto sp1 = line.find(' ');
+    if (sp1 == std::string::npos) return;
+    auto sp2 = line.find(' ', sp1 + 1);
+    std::string code_str = (sp2 == std::string::npos) ? line.substr(sp1 + 1) : line.substr(sp1 + 1, sp2 - sp1 - 1);
+    try { status_code = std::stoi(code_str); } catch (...) { status_code = 0; }
+    if (sp2 != std::string::npos) reason = line.substr(sp2 + 1);
+}
+
+void parse_response_headers(const std::string& raw,
+                            std::vector<std::pair<std::string, std::string>>& out_headers,
+                            size_t& body_offset)
+{
+    auto sep = raw.find("\r\n\r\n");
+    if (sep == std::string::npos) { body_offset = raw.size(); return; }
+    body_offset = sep + 4;
+    size_t p = raw.find("\r\n");
+    if (p == std::string::npos) return;
+    p += 2;
+    while (p < sep) {
+        size_t eol = raw.find("\r\n", p);
+        if (eol == std::string::npos || eol > sep) break;
+        size_t colon = raw.find(':', p);
+        if (colon == std::string::npos || colon > eol) { p = eol + 2; continue; }
+        std::string name = raw.substr(p, colon - p);
+        size_t vs = colon + 1;
+        while (vs < eol && (raw[vs] == ' ' || raw[vs] == '\t')) ++vs;
+        std::string value = raw.substr(vs, eol - vs);
+        out_headers.emplace_back(std::move(name), std::move(value));
+        p = eol + 2;
+    }
+}
+
+std::vector<uint8_t> decode_chunked_body(const std::vector<uint8_t>& src, size_t body_offset)
+{
+    std::vector<uint8_t> out;
+    size_t p = body_offset;
+    while (p < src.size()) {
+        size_t eol = p;
+        while (eol + 1 < src.size() && !(src[eol] == '\r' && src[eol + 1] == '\n')) ++eol;
+        if (eol + 1 >= src.size()) break;
+        std::string len_line(reinterpret_cast<const char*>(src.data() + p), eol - p);
+        size_t semi = len_line.find(';');
+        if (semi != std::string::npos) len_line = len_line.substr(0, semi);
+        size_t len = 0;
+        try { len = std::stoul(len_line, nullptr, 16); } catch (...) { break; }
+        p = eol + 2;
+        if (len == 0) break;
+        if (p + len > src.size()) break;
+        out.insert(out.end(), src.begin() + static_cast<std::ptrdiff_t>(p),
+                              src.begin() + static_cast<std::ptrdiff_t>(p + len));
+        p += len + 2;
+    }
+    return out;
+}
+
+void normalize_host_header(std::vector<uint8_t>& raw_request, const std::string& host, uint16_t port, bool tls)
+{
+    std::string s(reinterpret_cast<const char*>(raw_request.data()), raw_request.size());
+    auto eol = s.find("\r\n");
+    if (eol == std::string::npos) return;
+    std::string lc = s;
+    std::transform(lc.begin(), lc.end(), lc.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    size_t pos = lc.find("\r\nhost:", eol);
+    std::string normalized = host;
+    if ((tls && port != 443) || (!tls && port != 80)) {
+        normalized += ":";
+        normalized += std::to_string(port);
+    }
+    if (pos != std::string::npos) {
+        size_t vs = pos + 7;
+        while (vs < s.size() && (s[vs] == ' ' || s[vs] == '\t')) ++vs;
+        size_t ve = s.find("\r\n", vs);
+        if (ve == std::string::npos) return;
+        s = s.substr(0, vs) + normalized + s.substr(ve);
+    } else {
+        s = s.substr(0, eol + 2) + "Host: " + normalized + "\r\n" + s.substr(eol + 2);
+    }
+    raw_request.assign(s.begin(), s.end());
+}
+
+}
+
+bool parse_url(const std::string& url,
+               std::string& scheme,
+               std::string& host,
+               uint16_t& port,
+               std::string& path)
+{
+    auto sep = url.find("://");
+    if (sep == std::string::npos) {
+        scheme = "http";
+        host.clear();
+        port = 80;
+        path = "/";
+    } else {
+        scheme = url.substr(0, sep);
+        std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    }
+    size_t start = (sep == std::string::npos) ? 0 : sep + 3;
+    size_t slash = url.find('/', start);
+    std::string authority = (slash == std::string::npos) ? url.substr(start) : url.substr(start, slash - start);
+    path = (slash == std::string::npos) ? "/" : url.substr(slash);
+    auto colon = authority.find(':');
+    if (colon == std::string::npos) {
+        host = authority;
+        port = (scheme == "https") ? 443 : 80;
+    } else {
+        host = authority.substr(0, colon);
+        try { port = static_cast<uint16_t>(std::stoul(authority.substr(colon + 1))); }
+        catch (...) { return false; }
+    }
+    if (host.empty()) return false;
+    return true;
+}
+
+std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
+                                        const std::string& host,
+                                        uint16_t port,
+                                        bool tls,
+                                        const send_options_t& options)
+{
+    if (raw_request.empty() || host.empty()) {
+        set_err("audit_http.send: empty request or host");
+        return std::nullopt;
+    }
+    if (options.enforce_scope) {
+        std::string check_url;
+        check_url += tls ? "https://" : "http://";
+        check_url += host;
+        if ((tls && port != 443) || (!tls && port != 80)) {
+            check_url += ":"; check_url += std::to_string(port);
+        }
+        check_url += "/";
+        if (!scope::in_scope(check_url)) {
+            set_err("audit_http.send: target out of scope");
+            return std::nullopt;
+        }
+    }
+
+    ensure_wsa();
+    ensure_openssl();
+
+    std::vector<uint8_t> req = raw_request;
+    normalize_host_header(req, host, port, tls);
+
+    sockaddr_storage sa{};
+    int sa_len = 0;
+    if (!resolve_target(host, port, sa, sa_len)) {
+        set_err("audit_http.send: DNS resolution failed");
+        return std::nullopt;
+    }
+
+    socket_holder_t sh;
+    sh.sock = socket(sa.ss_family, SOCK_STREAM, IPPROTO_TCP);
+    if (sh.sock == INVALID_SOCKET) {
+        set_err("audit_http.send: socket() failed");
+        return std::nullopt;
+    }
+    BOOL nodelay = TRUE;
+    setsockopt(sh.sock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+    LINGER lin{}; lin.l_onoff = 1; lin.l_linger = 0;
+    setsockopt(sh.sock, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&lin), sizeof(lin));
+
+    uint64_t t_req_start = now_ms();
+    uint64_t t_steady_start = now_steady_ms();
+
+    if (!tcp_connect(sh.sock, reinterpret_cast<sockaddr*>(&sa), sa_len, options.timeout_ms)) {
+        set_err("audit_http.send: connect failed");
+        return std::nullopt;
+    }
+
+    ssl_holder_t ssh;
+    if (tls) {
+        const SSL_METHOD* m = TLS_client_method();
+        ssh.ctx = SSL_CTX_new(m);
+        if (!ssh.ctx) { set_err("audit_http.send: SSL_CTX_new failed"); return std::nullopt; }
+        SSL_CTX_set_min_proto_version(ssh.ctx, TLS1_2_VERSION);
+        SSL_CTX_set_verify(ssh.ctx, SSL_VERIFY_NONE, nullptr);
+        ssh.ssl = SSL_new(ssh.ctx);
+        if (!ssh.ssl) { set_err("audit_http.send: SSL_new failed"); return std::nullopt; }
+        SSL_set_fd(ssh.ssl, static_cast<int>(sh.sock));
+        const std::string& sni = options.sni_override.empty() ? host : options.sni_override;
+        SSL_set_tlsext_host_name(ssh.ssl, sni.c_str());
+
+        uint64_t handshake_deadline = now_steady_ms() + static_cast<uint64_t>(options.timeout_ms);
+        while (true) {
+            int rc = SSL_connect(ssh.ssl);
+            if (rc == 1) break;
+            int err = SSL_get_error(ssh.ssl, rc);
+            if (err == SSL_ERROR_WANT_READ) {
+                if (now_steady_ms() >= handshake_deadline) { set_err("audit_http.send: TLS handshake timeout"); return std::nullopt; }
+                if (!wait_socket(sh.sock, static_cast<int>(handshake_deadline - now_steady_ms()), false)) { set_err("audit_http.send: TLS handshake poll failed"); return std::nullopt; }
+            } else if (err == SSL_ERROR_WANT_WRITE) {
+                if (now_steady_ms() >= handshake_deadline) { set_err("audit_http.send: TLS handshake timeout"); return std::nullopt; }
+                if (!wait_socket(sh.sock, static_cast<int>(handshake_deadline - now_steady_ms()), true)) { set_err("audit_http.send: TLS handshake poll failed"); return std::nullopt; }
+            } else {
+                set_err("audit_http.send: TLS handshake error");
+                return std::nullopt;
+            }
+        }
+    }
+
+    int remaining_ms = options.timeout_ms - static_cast<int>(now_steady_ms() - t_steady_start);
+    if (remaining_ms <= 0) { set_err("audit_http.send: post-connect timeout"); return std::nullopt; }
+
+    bool sent_ok;
+    if (tls) sent_ok = ssl_send_all(ssh.ssl, req.data(), req.size(), sh.sock, remaining_ms);
+    else     sent_ok = send_all(sh.sock, req.data(), req.size(), remaining_ms);
+    if (!sent_ok) { set_err("audit_http.send: send failed"); return std::nullopt; }
+
+    remaining_ms = options.timeout_ms - static_cast<int>(now_steady_ms() - t_steady_start);
+    if (remaining_ms <= 0) { set_err("audit_http.send: post-send timeout"); return std::nullopt; }
+
+    std::vector<uint8_t> resp_buf;
+    bool got_response;
+    if (tls) got_response = ssl_recv_until_complete(ssh.ssl, sh.sock, resp_buf, remaining_ms);
+    else     got_response = recv_until_complete(sh.sock, resp_buf, remaining_ms);
+    if (!got_response) { set_err("audit_http.send: no response"); return std::nullopt; }
+
+    uint64_t latency = now_steady_ms() - t_steady_start;
+
+    exchange_observed_t ex;
+    ex.timestamp_ms = t_req_start;
+    ex.scheme = tls ? "https" : "http";
+    ex.host = host;
+    ex.port = port;
+    ex.latency_ms = latency;
+    ex.tls_version = tls ? "TLS1.2+" : std::string();
+
+    {
+        std::string raw_s(reinterpret_cast<const char*>(req.data()), req.size());
+        auto eol = raw_s.find("\r\n");
+        if (eol != std::string::npos) {
+            std::string line = raw_s.substr(0, eol);
+            auto sp1 = line.find(' ');
+            auto sp2 = (sp1 == std::string::npos) ? std::string::npos : line.find(' ', sp1 + 1);
+            if (sp1 != std::string::npos) ex.method = line.substr(0, sp1);
+            if (sp1 != std::string::npos && sp2 != std::string::npos) {
+                std::string uri = line.substr(sp1 + 1, sp2 - sp1 - 1);
+                auto qm = uri.find('?');
+                if (qm == std::string::npos) ex.path = uri;
+                else { ex.path = uri.substr(0, qm); ex.query = uri.substr(qm + 1); }
+            }
+        }
+        size_t headers_off = eol == std::string::npos ? raw_s.size() : eol + 2;
+        size_t body_off = raw_s.find("\r\n\r\n");
+        body_off = (body_off == std::string::npos) ? raw_s.size() : body_off + 4;
+        size_t p = headers_off;
+        while (p + 1 < body_off) {
+            size_t le = raw_s.find("\r\n", p);
+            if (le == std::string::npos || le >= body_off) break;
+            size_t colon = raw_s.find(':', p);
+            if (colon != std::string::npos && colon < le) {
+                std::string name = raw_s.substr(p, colon - p);
+                size_t vs = colon + 1;
+                while (vs < le && (raw_s[vs] == ' ' || raw_s[vs] == '\t')) ++vs;
+                ex.req_headers.emplace_back(std::move(name), raw_s.substr(vs, le - vs));
+            }
+            p = le + 2;
+        }
+        if (body_off < raw_s.size()) ex.req_body.assign(req.begin() + static_cast<std::ptrdiff_t>(body_off), req.end());
+    }
+
+    std::string resp_s(reinterpret_cast<const char*>(resp_buf.data()), resp_buf.size());
+    parse_response_status(resp_s, ex.status_code, ex.reason_phrase);
+    size_t body_offset = resp_buf.size();
+    parse_response_headers(resp_s, ex.resp_headers, body_offset);
+    bool chunked = false;
+    for (const auto& h : ex.resp_headers) {
+        std::string lc = h.first;
+        std::transform(lc.begin(), lc.end(), lc.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (lc == "transfer-encoding") {
+            std::string vlc = h.second;
+            std::transform(vlc.begin(), vlc.end(), vlc.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (vlc.find("chunked") != std::string::npos) chunked = true;
+        }
+    }
+    if (chunked) {
+        ex.resp_body = decode_chunked_body(resp_buf, body_offset);
+    } else if (body_offset < resp_buf.size()) {
+        ex.resp_body.assign(resp_buf.begin() + static_cast<std::ptrdiff_t>(body_offset), resp_buf.end());
+    }
+
+    if (options.follow_redirects && options.max_redirects > 0 &&
+        (ex.status_code >= 300 && ex.status_code < 400)) {
+        for (const auto& h : ex.resp_headers) {
+            std::string lc = h.first;
+            std::transform(lc.begin(), lc.end(), lc.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (lc == "location") {
+                std::string new_url = h.second;
+                if (!new_url.empty()) {
+                    std::string ns, nh, np;
+                    uint16_t nport = 0;
+                    if (parse_url(new_url, ns, nh, nport, np)) {
+                        bool ntls = (ns == "https");
+                        std::vector<uint8_t> redir_req;
+                        std::string line = "GET " + np + " HTTP/1.1\r\nHost: " + nh + "\r\nUser-Agent: AiDA-Scanner/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n";
+                        redir_req.assign(line.begin(), line.end());
+                        send_options_t opt2 = options;
+                        opt2.max_redirects--;
+                        opt2.follow_redirects = (opt2.max_redirects > 0);
+                        auto next = send(redir_req, nh, nport, ntls, opt2);
+                        if (next.has_value()) return next;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    return ex;
+}
+
+std::string last_error()
+{
+    std::lock_guard<std::mutex> lk(err_mtx());
+    return err_slot();
+}
+
+}
+}
+}

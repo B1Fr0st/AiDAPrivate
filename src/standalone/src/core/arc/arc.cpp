@@ -2527,25 +2527,30 @@ ARC_API bool arc_init(
     arc_log("init", "arc_init_step1_validate_lengths");
     {
         size_t token_len = strlen(session_token);
-        if (token_len < 32 || token_len > 128)
+        if (token_len < 32 || token_len > 4096)
         {
-            char dbg[96];
+            char dbg[128];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "arc_init_session_token_len_out_of_range got=%zu expected=[32,128]",
+                "arc_init_session_token_len_out_of_range got=%zu expected=[32,4096]",
                 token_len);
             arc_log("init", dbg);
             return false;
         }
         size_t hwid_len = strlen(hwid);
-        if (hwid_len < 8 || hwid_len > 64)
+        if (hwid_len < 8 || hwid_len > 256)
         {
-            char dbg[96];
+            char dbg[128];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "arc_init_hwid_len_out_of_range got=%zu expected=[8,64]",
+                "arc_init_hwid_len_out_of_range got=%zu expected=[8,256]",
                 hwid_len);
             arc_log("init", dbg);
             return false;
         }
+        char dbg_ok[160];
+        _snprintf_s(dbg_ok, sizeof(dbg_ok), _TRUNCATE,
+            "arc_init_lengths_ok token_len=%zu hwid_len=%zu",
+            token_len, hwid_len);
+        arc_log("init", dbg_ok);
     }
 
     arc_log("init", "arc_init_step2_check_debugger");

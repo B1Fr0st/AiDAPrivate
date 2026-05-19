@@ -19,6 +19,7 @@
 #include "mitm_proxy.hpp"
 #include "../infra/work_queue.hpp"
 #include "helpers/diag_log.hpp"
+#include "burp/burp_module.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -1643,6 +1644,8 @@ tool_result_t network_export_pcap(const json& params)
 }
 
 void register_network_tools(mcp_standalone::server_t& srv) {
+        aida::burp::register_all_tools(srv);
+
         register_compat(srv, {
         OBFSTR("network_enumerate_connections"), OBFSTR("network"),
         OBFSTR("Enumerate all active TCP/UDP connections on the system via kernel driver. "

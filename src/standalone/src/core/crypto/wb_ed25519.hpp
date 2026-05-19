@@ -11,4 +11,6 @@ namespace aida::wb_ed25519
                 const uint8_t* pubkey_32bytes) noexcept;
 
     const char* last_error() noexcept;
+
+    bool self_test_ok() noexcept;
 }

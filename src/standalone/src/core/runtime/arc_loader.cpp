@@ -2102,24 +2102,24 @@ namespace arc_loader
         }
 
         if (mod.initialized && mod.entry_point != nullptr) {
-            using DllMain_t = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
-            auto entry = reinterpret_cast<DllMain_t>(mod.entry_point);
+            if (mod.sealed) {
+                arc_breadcrumb("unload_dllmain_detach_skipped_sealed");
+            } else {
+                using DllMain_t = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
+                auto entry = reinterpret_cast<DllMain_t>(mod.entry_point);
 
-            arc_breadcrumb(mod.sealed
-                ? "unload_dllmain_detach_pre_sealed"
-                : "unload_dllmain_detach_pre_unsealed");
-            __try {
-                entry(
-                    reinterpret_cast<HINSTANCE>(image_base),
-                    DLL_PROCESS_DETACH,
-                    nullptr);
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER) {
+                arc_breadcrumb("unload_dllmain_detach_pre_unsealed");
+                __try {
+                    entry(
+                        reinterpret_cast<HINSTANCE>(image_base),
+                        DLL_PROCESS_DETACH,
+                        nullptr);
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER) {
 
+                }
+                arc_breadcrumb("unload_dllmain_detach_post_unsealed");
             }
-            arc_breadcrumb(mod.sealed
-                ? "unload_dllmain_detach_post_sealed"
-                : "unload_dllmain_detach_post_unsealed");
         }
 
 

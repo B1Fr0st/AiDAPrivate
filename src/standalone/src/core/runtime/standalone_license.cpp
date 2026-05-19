@@ -1923,10 +1923,10 @@ static SimpleHttpResponse raw_https_request(
     if (ok)
     {
         out.ok = true;
-        char buf[256];
+        char buf[384];
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-            "https_request_transport_ok status=%d body_len=%zu",
-            out.status, out.body.size());
+            "https_request_transport_ok status=%d body_len=%zu debug_reason=%.180s",
+            out.status, out.body.size(), resp.debug_reason.c_str());
         lic_log(buf);
         return out;
     }
@@ -4372,103 +4372,6 @@ namespace
         return out;
     }
 
-    std::string get_arc_signing_public_key_der_hex_kid1()
-    {
-        std::string k;
-        k.reserve(88);
-        k += OBFSTR("302a3005");
-        k += OBFSTR("06032b65");
-        k += OBFSTR("70032100");
-        k += OBFSTR("ae7ba74a");
-        k += OBFSTR("a9b8a230");
-        k += OBFSTR("d6614d8d");
-        k += OBFSTR("0c78e0e5");
-        k += OBFSTR("33adfa2a");
-        k += OBFSTR("bdc3d632");
-        k += OBFSTR("8438c378");
-        k += OBFSTR("077adc90");
-        return k;
-    }
-
-    std::string get_arc_signing_public_key_der_hex_kid2()
-    {
-        std::string k;
-        k.reserve(88);
-        k += OBFSTR("302a3005");
-        k += OBFSTR("06032b65");
-        k += OBFSTR("70032100");
-        k += OBFSTR("be7ba74a");
-        k += OBFSTR("a9b8a230");
-        k += OBFSTR("d6614d8d");
-        k += OBFSTR("0c78e0e5");
-        k += OBFSTR("33adfa2a");
-        k += OBFSTR("bdc3d632");
-        k += OBFSTR("8438c378");
-        k += OBFSTR("077adc90");
-        return k;
-    }
-
-    std::string get_arc_signing_public_key_der_hex_for_kid(int kid)
-    {
-        if (kid == 2) return get_arc_signing_public_key_der_hex_kid2();
-        return get_arc_signing_public_key_der_hex_kid1();
-    }
-
-    std::string get_arc_signing_public_key_der_hex()
-    {
-        return get_arc_signing_public_key_der_hex_kid1();
-    }
-
-    bool verify_arc_page_signature_with_kid(const std::string& canonical, const std::string& sig_hex, int kid)
-    {
-        if (canonical.empty() || sig_hex.empty())
-            return false;
-
-        auto signature_bytes = hex_decode(sig_hex);
-        if (signature_bytes.empty())
-            return false;
-
-        uint8_t der[44] = {};
-        std::string err;
-        aida::pubkeys::kid_e mapped_kid = (kid == 2) ? aida::pubkeys::kid_arc_2 : aida::pubkeys::kid_arc_1;
-        if (!aida::pubkeys::load_pubkey_spki_der(mapped_kid, der, err))
-            return false;
-
-        const unsigned char* der_ptr = der;
-        EVP_PKEY* public_key = d2i_PUBKEY(nullptr, &der_ptr, static_cast<long>(sizeof(der)));
-        if (public_key == nullptr) {
-            SecureZeroMemory(der, sizeof(der));
-            return false;
-        }
-
-        EVP_MD_CTX* verify_ctx = EVP_MD_CTX_new();
-        if (verify_ctx == nullptr) {
-            EVP_PKEY_free(public_key);
-            SecureZeroMemory(der, sizeof(der));
-            return false;
-        }
-
-        bool verified = false;
-        if (EVP_DigestVerifyInit(verify_ctx, nullptr, nullptr, nullptr, public_key) == 1) {
-            verified = EVP_DigestVerify(
-                verify_ctx,
-                signature_bytes.data(), signature_bytes.size(),
-                reinterpret_cast<const unsigned char*>(canonical.data()),
-                canonical.size()) == 1;
-        }
-
-        EVP_MD_CTX_free(verify_ctx);
-        EVP_PKEY_free(public_key);
-        SecureZeroMemory(der, sizeof(der));
-        return verified;
-    }
-
-    bool verify_arc_page_signature(const std::string& canonical, const std::string& sig_hex)
-    {
-        if (verify_arc_page_signature_with_kid(canonical, sig_hex, 1)) return true;
-        return verify_arc_page_signature_with_kid(canonical, sig_hex, 2);
-    }
-
     std::vector<uint8_t> hmac_sha256_block(const uint8_t* key, size_t key_len,
                                            const uint8_t* data, size_t data_len)
     {
@@ -4743,128 +4646,230 @@ namespace
         }
 
 
+        const ULONGLONG t_arc_bulk_start_ms = GetTickCount64();
         try {
             std::string host = get_cloud_function_host();
+            const std::string lk_prefix = settings.license_key.size() >= 10
+                ? settings.license_key.substr(0, 10)
+                : settings.license_key;
+            const std::string hwid_prefix = hwid.size() >= 12 ? hwid.substr(0, 12) : hwid;
+
+            lic_log_fmt("[arc-bulk] download_enter lk_prefix=%s hwid_prefix=%s attempt=%u host=%.64s",
+                lk_prefix.c_str(), hwid_prefix.c_str(), attempt_number, host.c_str());
 
             std::vector<uint8_t> key_seed = hex_decode(settings.license_key_seed);
             if (key_seed.empty() || key_seed.size() != 32) {
+                lic_log("[arc-bulk] missing_server_key_seed");
                 log_arc_status("arc_missing_server_key_seed");
                 return false;
             }
-
-            json count_body;
-            count_body["license_key"] = settings.license_key;
-            count_body["session_token"] = settings.license_session_token;
-            count_body["hwid"] = hwid;
-            std::string count_body_str = count_body.dump();
-
-            auto count_resp = raw_https_request("POST", host + "/api/download/pages/count",
-                {}, count_body_str, "application/json");
-            if (!count_resp.ok || count_resp.status != 200) {
-                SecureZeroMemory(key_seed.data(), key_seed.size());
-                char buf[128];
-                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                    "arc_paged_count_failed status=%d attempt=%u",
-                    count_resp.status, attempt_number);
-                log_arc_status(buf);
-                return false;
-            }
-
-            auto count_json = json::parse(count_resp.body, nullptr, false);
-            if (count_json.is_discarded() || !count_json.is_object() ||
-                count_json.value("status", "") != "ok") {
-                SecureZeroMemory(key_seed.data(), key_seed.size());
-                log_arc_status("arc_paged_count_invalid_json");
-                return false;
-            }
-
-            uint64_t total_pages_u = count_json.value("total_pages", uint64_t{0});
-            uint64_t blob_size_u   = count_json.value("blob_size",   uint64_t{0});
-
-            constexpr uint64_t kMaxBlobSize = 64ull * 1024ull * 1024ull;
-            if (total_pages_u == 0 || total_pages_u > 1000000ull ||
-                blob_size_u == 0 || blob_size_u > kMaxBlobSize) {
-                SecureZeroMemory(key_seed.data(), key_seed.size());
-                char buf[128];
-                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                    "arc_paged_count_invalid_values total=%llu size=%llu",
-                    static_cast<unsigned long long>(total_pages_u),
-                    static_cast<unsigned long long>(blob_size_u));
-                log_arc_status(buf);
-                return false;
-            }
-
-            uint32_t total_pages = static_cast<uint32_t>(total_pages_u);
-            size_t   blob_size   = static_cast<size_t>(blob_size_u);
+            lic_log_fmt("[arc-bulk] key_seed_loaded len=%zu", key_seed.size());
 
             std::string proof_token = compute_arc_bootstrap_proof(settings.license_session_token);
             if (proof_token.empty()) {
                 SecureZeroMemory(key_seed.data(), key_seed.size());
+                lic_log("[arc-bulk] bootstrap_proof_failed");
                 log_arc_status("arc_paged_bootstrap_proof_failed");
                 return false;
             }
+            lic_log_fmt("[arc-bulk] proof_token_built len=%zu prefix=%.16s",
+                proof_token.size(), proof_token.c_str());
+
+            winhttp_session_t arc_session;
+            bool session_active = winhttp_session_open(arc_session, host, 30);
+            struct arc_session_guard
+            {
+                winhttp_session_t* sess;
+                ~arc_session_guard() { if (sess) winhttp_session_close(*sess); }
+            } _arc_session_guard{ session_active ? &arc_session : nullptr };
+            lic_log_fmt("[arc-bulk] session_state active=%d host=%.64s", session_active ? 1 : 0, host.c_str());
+
+            json bulk_body;
+            bulk_body["license_key"] = settings.license_key;
+            bulk_body["session_token"] = settings.license_session_token;
+            bulk_body["hwid"] = hwid;
+            bulk_body["proof_token"] = proof_token;
+            std::string bulk_body_str = bulk_body.dump();
+            lic_log_fmt("[arc-bulk] request_built body_size=%zu", bulk_body_str.size());
+
+            const ULONGLONG http_start_ms = GetTickCount64();
+            SimpleHttpResponse bulk_resp = raw_https_request(
+                "POST",
+                host + "/api/download/arc/pages/bulk",
+                {},
+                bulk_body_str,
+                "application/json");
+            const ULONGLONG http_elapsed_ms = GetTickCount64() - http_start_ms;
+            lic_log_fmt("[arc-bulk] transport_dispatched method=POST path=/api/download/arc/pages/bulk session_active_unused=%d",
+                session_active ? 1 : 0);
+
+            if (!bulk_resp.ok || bulk_resp.status != 200) {
+                SecureZeroMemory(key_seed.data(), key_seed.size());
+                lic_log_fmt("[arc-bulk] response_http_failed status=%d ok=%d elapsed_ms=%llu err=%.128s body_size=%zu",
+                    bulk_resp.status, bulk_resp.ok ? 1 : 0,
+                    static_cast<unsigned long long>(http_elapsed_ms),
+                    bulk_resp.error.c_str(), bulk_resp.body.size());
+                log_arc_status("arc_bulk_http_failed");
+                return false;
+            }
+            lic_log_fmt("[arc-bulk] response_received status=%d elapsed_ms=%llu body_size=%zu",
+                bulk_resp.status,
+                static_cast<unsigned long long>(http_elapsed_ms),
+                bulk_resp.body.size());
+
+            auto envelope_json = json::parse(bulk_resp.body, nullptr, false);
+            if (envelope_json.is_discarded() || !envelope_json.is_object()) {
+                SecureZeroMemory(key_seed.data(), key_seed.size());
+                lic_log("[arc-bulk] envelope_parse_failed");
+                log_arc_status("arc_bulk_envelope_parse_failed");
+                return false;
+            }
+
+            const std::string payload_b64 = envelope_json.value("payload", "");
+            const std::string sig_b64     = envelope_json.value("sig", "");
+            const int         kid_raw     = envelope_json.value("kid", 0);
+            if (payload_b64.empty() || sig_b64.empty() || kid_raw <= 0) {
+                SecureZeroMemory(key_seed.data(), key_seed.size());
+                lic_log_fmt("[arc-bulk] envelope_fields_missing payload_len=%zu sig_len=%zu kid=%d",
+                    payload_b64.size(), sig_b64.size(), kid_raw);
+                log_arc_status("arc_bulk_envelope_fields_missing");
+                return false;
+            }
+            lic_log_fmt("[arc-bulk] envelope_parsed kid=%d payload_b64_len=%zu sig_b64_len=%zu",
+                kid_raw, payload_b64.size(), sig_b64.size());
+
+            std::vector<uint8_t> payload_bytes = base64_decode(payload_b64);
+            std::vector<uint8_t> sig_bytes     = base64_decode(sig_b64);
+            if (payload_bytes.empty() || sig_bytes.size() != 64) {
+                SecureZeroMemory(key_seed.data(), key_seed.size());
+                lic_log_fmt("[arc-bulk] envelope_decode_failed payload_bytes=%zu sig_bytes=%zu",
+                    payload_bytes.size(), sig_bytes.size());
+                log_arc_status("arc_bulk_envelope_decode_failed");
+                return false;
+            }
+
+            std::string verr;
+            const bool sig_ok = aida::license::transport::verify_response_signature(
+                payload_bytes, sig_bytes, static_cast<uint8_t>(kid_raw), verr);
+            if (!sig_ok) {
+                SecureZeroMemory(key_seed.data(), key_seed.size());
+                lic_log_fmt("[arc-bulk] envelope_verify_failed kid=%d err=%.96s", kid_raw, verr.c_str());
+                log_arc_status("arc_bulk_envelope_signature_invalid");
+                anti_tamper::enforce_violation_id(
+                    aida::reason_ids::reason_id_from_string("arc_envelope_sig_invalid"),
+                    std::string("arc_bulk_envelope_signature_invalid"));
+                return false;
+            }
+            lic_log_fmt("[arc-bulk] envelope_verify_ok kid=%d payload_bytes=%zu", kid_raw, payload_bytes.size());
+
+            std::string signed_text(reinterpret_cast<const char*>(payload_bytes.data()), payload_bytes.size());
+            auto signed_payload = json::parse(signed_text, nullptr, false);
+            if (signed_payload.is_discarded() || !signed_payload.is_object()) {
+                SecureZeroMemory(key_seed.data(), key_seed.size());
+                lic_log("[arc-bulk] signed_payload_parse_failed");
+                log_arc_status("arc_bulk_signed_payload_parse_failed");
+                return false;
+            }
+
+            const std::string status_value = signed_payload.value("status", "");
+            if (status_value != "ok") {
+                SecureZeroMemory(key_seed.data(), key_seed.size());
+                lic_log_fmt("[arc-bulk] status_not_ok status=%.32s", status_value.c_str());
+                log_arc_status("arc_bulk_status_not_ok");
+                return false;
+            }
+            lic_log_fmt("[arc-bulk] status_ok status=%.16s", status_value.c_str());
+
+            const uint64_t total_pages_u = signed_payload.value("total_pages", uint64_t{0});
+            const uint64_t blob_size_u   = signed_payload.value("blob_size",   uint64_t{0});
+            constexpr uint64_t kMaxBlobSize = 64ull * 1024ull * 1024ull;
+            if (total_pages_u == 0 || total_pages_u > 1000000ull ||
+                blob_size_u == 0 || blob_size_u > kMaxBlobSize) {
+                SecureZeroMemory(key_seed.data(), key_seed.size());
+                lic_log_fmt("[arc-bulk] invalid_counts total_pages=%llu blob_size=%llu",
+                    static_cast<unsigned long long>(total_pages_u),
+                    static_cast<unsigned long long>(blob_size_u));
+                log_arc_status("arc_bulk_invalid_counts");
+                return false;
+            }
+            const uint32_t total_pages = static_cast<uint32_t>(total_pages_u);
+            const size_t   blob_size   = static_cast<size_t>(blob_size_u);
+            lic_log_fmt("[arc-bulk] counts_ok total_pages=%u blob_size=%zu",
+                total_pages, blob_size);
+
+            if (!signed_payload.contains("pages") || !signed_payload["pages"].is_array()) {
+                SecureZeroMemory(key_seed.data(), key_seed.size());
+                lic_log("[arc-bulk] pages_array_missing");
+                log_arc_status("arc_bulk_pages_array_missing");
+                return false;
+            }
+            const json& pages_json = signed_payload["pages"];
+            if (pages_json.size() != static_cast<size_t>(total_pages)) {
+                SecureZeroMemory(key_seed.data(), key_seed.size());
+                lic_log_fmt("[arc-bulk] pages_count_mismatch got=%zu expected=%u",
+                    pages_json.size(), total_pages);
+                log_arc_status("arc_bulk_pages_count_mismatch");
+                return false;
+            }
+            lic_log_fmt("[arc-bulk] pages_count got=%zu expected=%u", pages_json.size(), total_pages);
 
             aida::arc::plaintext_window::handle_t ptw_handle{};
             std::string ptw_err;
             if (!aida::arc::plaintext_window::create(static_cast<size_t>(total_pages), ptw_handle, ptw_err))
             {
                 SecureZeroMemory(key_seed.data(), key_seed.size());
-                char buf[160];
-                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                    "arc_plaintext_window_create_failed err=%.96s", ptw_err.c_str());
-                log_arc_status(buf);
+                lic_log_fmt("[arc-bulk] plaintext_window_create_failed err=%.96s", ptw_err.c_str());
+                log_arc_status("arc_plaintext_window_create_failed");
                 return false;
             }
             struct ptw_guard_t {
                 aida::arc::plaintext_window::handle_t* h;
                 ~ptw_guard_t() { if (h) aida::arc::plaintext_window::destroy(*h); }
             } ptw_guard{ &ptw_handle };
-
             std::atomic<size_t> ptw_total_bytes{0};
+            lic_log_fmt("[arc-bulk] plaintext_window_created pages=%u", total_pages);
 
             std::vector<uint8_t> chain_tag;
             std::string          chain_tag_hex;
 
-            auto append_arc_page = [&](const json& page_json, uint32_t page_index, bool verify_page_signature) -> bool {
-                if (!page_json.is_object() ||
-                    (page_json.contains("status") && page_json.value("status", "") != "ok")) {
-                    log_arc_status("arc_paged_page_invalid_json");
-                    return false;
+            const ULONGLONG page_loop_start_ms = GetTickCount64();
+            bool bulk_loaded = true;
+
+            for (uint32_t page_index = 0; page_index < total_pages; ++page_index) {
+                const json& page_json = pages_json[page_index];
+                if (!page_json.is_object()) {
+                    lic_log_fmt("[arc-bulk] page_invalid_json page=%u", page_index);
+                    log_arc_status("arc_bulk_page_invalid_json");
+                    bulk_loaded = false;
+                    break;
                 }
 
-                uint64_t page_index_resp = page_json.value("page_index", uint64_t{UINT64_MAX});
-                uint64_t total_pages_resp = page_json.value("total_pages", uint64_t{0});
-                uint64_t blob_size_resp = page_json.value("blob_size", uint64_t{0});
-                std::string page_data_b64 = page_json.value("data", "");
-                std::string page_iv_hex   = page_json.value("iv", "");
-                std::string page_tag_hex  = page_json.value("auth_tag", "");
-                std::string page_sig      = page_json.value("signature", "");
+                const uint64_t page_index_resp  = page_json.value("page_index",  uint64_t{UINT64_MAX});
+                const uint64_t total_pages_resp = page_json.value("total_pages", uint64_t{0});
+                const uint64_t blob_size_resp   = page_json.value("blob_size",   uint64_t{0});
+                const std::string page_data_b64 = page_json.value("data", "");
+                const std::string page_iv_hex   = page_json.value("iv", "");
+                const std::string page_tag_hex  = page_json.value("auth_tag", "");
 
                 if (page_index_resp != static_cast<uint64_t>(page_index) ||
                     total_pages_resp != static_cast<uint64_t>(total_pages) ||
                     blob_size_resp   != static_cast<uint64_t>(blob_size) ||
-                    page_data_b64.empty() || page_iv_hex.empty() ||
-                    page_tag_hex.empty() || (verify_page_signature && page_sig.empty())) {
-                    log_arc_status("arc_paged_page_field_mismatch");
-                    return false;
+                    page_data_b64.empty() || page_iv_hex.empty() || page_tag_hex.empty()) {
+                    lic_log_fmt("[arc-bulk] page_field_mismatch page=%u idx=%llu total=%llu blob=%llu data_empty=%d iv_empty=%d tag_empty=%d",
+                        page_index,
+                        static_cast<unsigned long long>(page_index_resp),
+                        static_cast<unsigned long long>(total_pages_resp),
+                        static_cast<unsigned long long>(blob_size_resp),
+                        page_data_b64.empty() ? 1 : 0,
+                        page_iv_hex.empty() ? 1 : 0,
+                        page_tag_hex.empty() ? 1 : 0);
+                    log_arc_status("arc_bulk_page_field_mismatch");
+                    bulk_loaded = false;
+                    break;
                 }
 
-                if (verify_page_signature) {
-                    json signed_view = page_json;
-                    signed_view.erase("signature");
-                    std::string canonical = signed_view.dump();
-                    if (!verify_arc_page_signature(canonical, page_sig)) {
-                        char buf[160];
-                        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                            "arc_paged_signature_invalid page=%u",
-                            static_cast<unsigned>(page_index));
-                        log_arc_status(buf);
-                        return false;
-                    }
-                }
-
-                std::string page_code_binding_sig = page_json.value("code_binding_sig", "");
-                std::string page_licensee_id = page_json.value("licensee_id", "");
+                const std::string page_code_binding_sig = page_json.value("code_binding_sig", "");
+                const std::string page_licensee_id      = page_json.value("licensee_id", "");
                 {
                     std::lock_guard<std::mutex> rot_lk(s_rotation_mtx);
                     if (!page_licensee_id.empty()) s_licensee_id = page_licensee_id;
@@ -4879,8 +4884,11 @@ namespace
                 auto page_tag = hex_decode(page_tag_hex);
                 auto page_ct  = base64_decode(page_data_b64);
                 if (page_iv.size() != 12 || page_tag.size() != 16 || page_ct.empty()) {
-                    log_arc_status("arc_paged_page_invalid_format");
-                    return false;
+                    lic_log_fmt("[arc-bulk] page_invalid_format page=%u iv_len=%zu tag_len=%zu ct_len=%zu",
+                        page_index, page_iv.size(), page_tag.size(), page_ct.size());
+                    log_arc_status("arc_bulk_page_invalid_format");
+                    bulk_loaded = false;
+                    break;
                 }
 
                 if (!page_code_binding_sig.empty() && !settings.license_bind_proof.empty()) {
@@ -4921,15 +4929,12 @@ namespace
 
                         if (page_code_binding_sig.size() != expected_hex.size() ||
                             ::_stricmp(page_code_binding_sig.c_str(), expected_hex.c_str()) != 0) {
-                            char buf[192];
-                            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                                "arc_paged_code_binding_invalid page=%u expected_prefix=%.16s got_prefix=%.16s",
-                                static_cast<unsigned>(page_index),
-                                expected_hex.c_str(),
-                                page_code_binding_sig.c_str());
-                            log_arc_status(buf);
+                            lic_log_fmt("[arc-bulk] code_binding_mismatch page=%u expected_prefix=%.16s got_prefix=%.16s",
+                                page_index, expected_hex.c_str(), page_code_binding_sig.c_str());
+                            log_arc_status("arc_paged_code_binding_invalid");
                             schedule_silent_kill("code_binding_mismatch");
-                            return false;
+                            bulk_loaded = false;
+                            break;
                         }
                     }
                 }
@@ -4943,25 +4948,29 @@ namespace
                     proof_token,
                     chain_tag_hex);
                 if (page_key.size() != 32) {
+                    lic_log_fmt("[arc-bulk] page_key_failed page=%u", page_index);
                     log_arc_status("arc_paged_page_key_failed");
-                    return false;
+                    bulk_loaded = false;
+                    break;
                 }
 
                 auto page_plain = aes_gcm_decrypt(page_key, page_iv, page_tag, page_ct);
                 SecureZeroMemory(page_key.data(), page_key.size());
                 if (page_plain.empty()) {
-                    char buf[96];
-                    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                        "arc_paged_page_decrypt_failed page=%u", page_index);
-                    log_arc_status(buf);
-                    return false;
+                    lic_log_fmt("[arc-bulk] page_decrypt_failed page=%u ct_len=%zu", page_index, page_ct.size());
+                    log_arc_status("arc_bulk_page_decrypt_failed");
+                    bulk_loaded = false;
+                    break;
                 }
 
-                size_t accumulated = ptw_total_bytes.load(std::memory_order_acquire);
+                const size_t accumulated = ptw_total_bytes.load(std::memory_order_acquire);
                 if (accumulated + page_plain.size() > blob_size) {
                     SecureZeroMemory(page_plain.data(), page_plain.size());
-                    log_arc_status("arc_paged_page_overflow");
-                    return false;
+                    lic_log_fmt("[arc-bulk] page_overflow page=%u accumulated=%zu blob_size=%zu plain_size=%zu",
+                        page_index, accumulated, blob_size, page_plain.size());
+                    log_arc_status("arc_bulk_page_overflow");
+                    bulk_loaded = false;
+                    break;
                 }
 
                 std::string consume_err;
@@ -4973,12 +4982,11 @@ namespace
                         consume_err))
                 {
                     SecureZeroMemory(page_plain.data(), page_plain.size());
-                    char buf[192];
-                    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                        "arc_paged_page_consume_failed page=%u err=%.96s",
+                    lic_log_fmt("[arc-bulk] page_consume_failed page=%u err=%.96s",
                         page_index, consume_err.c_str());
-                    log_arc_status(buf);
-                    return false;
+                    log_arc_status("arc_bulk_page_consume_failed");
+                    bulk_loaded = false;
+                    break;
                 }
                 ptw_total_bytes.fetch_add(page_plain.size(), std::memory_order_acq_rel);
                 SecureZeroMemory(page_plain.data(), page_plain.size());
@@ -4990,174 +4998,18 @@ namespace
                     ? derive_arc_chain_tag(std::vector<uint8_t>(32, 0), page_tag)
                     : derive_arc_chain_tag(chain_tag, page_tag);
                 if (next_chain.size() != 32) {
+                    lic_log_fmt("[arc-bulk] chain_tag_failed page=%u", page_index);
                     log_arc_status("arc_paged_chain_tag_failed");
-                    return false;
+                    bulk_loaded = false;
+                    break;
                 }
                 chain_tag = std::move(next_chain);
                 chain_tag_hex = bytes_to_hex(chain_tag.data(), chain_tag.size());
-                return true;
-            };
 
-            auto compute_bulk_pages_digest = [&](const json& pages_json) -> std::string {
-                if (!pages_json.is_array())
-                    return {};
-                std::string material;
-                material.reserve(blob_size + pages_json.size() * 256u);
-                for (const auto& page_json : pages_json) {
-                    if (!page_json.is_object())
-                        return {};
-                    uint64_t page_index = page_json.value("page_index", uint64_t{UINT64_MAX});
-                    std::string page_data_b64 = page_json.value("data", "");
-                    std::string page_iv_hex = page_json.value("iv", "");
-                    std::string page_tag_hex = page_json.value("auth_tag", "");
-                    std::string page_hmac_hex = page_json.value("hmac", "");
-                    std::string page_trailer_hex = page_json.value("page_trailer", "");
-                    std::string page_code_binding_sig = page_json.value("code_binding_sig", "");
-                    if (page_index == uint64_t{UINT64_MAX} || page_data_b64.empty() ||
-                        page_iv_hex.empty() || page_tag_hex.empty() ||
-                        page_hmac_hex.empty() || page_trailer_hex.empty())
-                        return {};
-                    material += std::to_string(page_index);
-                    material += '|';
-                    material += page_data_b64;
-                    material += '|';
-                    material += page_iv_hex;
-                    material += '|';
-                    material += page_tag_hex;
-                    material += '|';
-                    material += page_hmac_hex;
-                    material += '|';
-                    material += page_trailer_hex;
-                    material += '|';
-                    material += page_code_binding_sig;
-                    material += '\n';
-                }
-                auto digest = sha256_block(reinterpret_cast<const uint8_t*>(material.data()), material.size());
-                if (digest.size() != 32)
-                    return {};
-                return bytes_to_hex(digest.data(), digest.size());
-            };
-
-            winhttp_session_t arc_session;
-            bool session_active = winhttp_session_open(arc_session, host, 30);
-            struct arc_session_guard
-            {
-                winhttp_session_t* sess;
-                ~arc_session_guard() { if (sess) winhttp_session_close(*sess); }
-            } _arc_session_guard{ session_active ? &arc_session : nullptr };
-
-            const ULONGLONG page_loop_start_ms = GetTickCount64();
-            bool bulk_loaded = false;
-
-            {
-                json bulk_body;
-                bulk_body["license_key"] = settings.license_key;
-                bulk_body["session_token"] = settings.license_session_token;
-                bulk_body["hwid"] = hwid;
-                bulk_body["proof_token"] = proof_token;
-                std::string bulk_body_str = bulk_body.dump();
-
-                SimpleHttpResponse bulk_resp;
-                if (session_active) {
-                    bulk_resp = winhttp_session_request(arc_session, "POST", "/api/download/arc/pages/bulk",
-                        {}, bulk_body_str, "application/json");
-                } else {
-                    bulk_resp = raw_https_request("POST", host + "/api/download/arc/pages/bulk",
-                        {}, bulk_body_str, "application/json");
-                }
-
-                if (!bulk_resp.ok || bulk_resp.status != 200) {
-                    char bbuf[160];
-                    _snprintf_s(bbuf, sizeof(bbuf), _TRUNCATE,
-                        "arc_bulk_http_failed status=%d err=%.96s",
-                        bulk_resp.status, bulk_resp.error.c_str());
-                    log_arc_status(bbuf);
-                } else {
-                    auto bulk_json = json::parse(bulk_resp.body, nullptr, false);
-                    const json* pages_json = bulk_json.is_object() && bulk_json.contains("pages")
-                        ? &bulk_json["pages"] : nullptr;
-                    std::string bulk_sig = bulk_json.is_object() ? bulk_json.value("signature", "") : "";
-                    std::string pages_digest = bulk_json.is_object() ? bulk_json.value("pages_digest", "") : "";
-                    std::string computed_digest = pages_json ? compute_bulk_pages_digest(*pages_json) : "";
-                    json signed_bulk = bulk_json;
-                    if (!signed_bulk.is_discarded() && signed_bulk.is_object()) {
-                        signed_bulk.erase("signature");
-                        signed_bulk.erase("pages");
-                    }
-                    std::string canonical = signed_bulk.is_object() ? signed_bulk.dump() : "";
-
-                    bool fail_discarded = bulk_json.is_discarded();
-                    bool fail_not_object = !fail_discarded && !bulk_json.is_object();
-                    std::string status_value = !fail_discarded && bulk_json.is_object() ? bulk_json.value("status", "") : "";
-                    bool fail_status = (status_value != "ok");
-                    uint64_t got_total_pages = !fail_discarded && bulk_json.is_object() ? bulk_json.value("total_pages", uint64_t{0}) : 0;
-                    uint64_t got_blob_size = !fail_discarded && bulk_json.is_object() ? bulk_json.value("blob_size", uint64_t{0}) : 0;
-                    bool fail_total = (got_total_pages != static_cast<uint64_t>(total_pages));
-                    bool fail_blob = (got_blob_size != static_cast<uint64_t>(blob_size));
-                    bool fail_pages_null = (pages_json == nullptr);
-                    bool fail_pages_not_array = !fail_pages_null && !pages_json->is_array();
-                    size_t got_pages_size = (!fail_pages_null && pages_json->is_array()) ? pages_json->size() : 0;
-                    bool fail_pages_size = (got_pages_size != static_cast<size_t>(total_pages));
-                    bool fail_sig_empty = bulk_sig.empty();
-                    bool fail_digest_empty = pages_digest.empty();
-                    bool fail_computed_empty = computed_digest.empty();
-                    bool fail_digest_mismatch = !fail_computed_empty && !fail_digest_empty && (computed_digest != pages_digest);
-                    bool sig_ok = !fail_sig_empty && !canonical.empty() && verify_arc_page_signature(canonical, bulk_sig);
-                    bool fail_sig_verify = !fail_sig_empty && !sig_ok;
-
-                    if (fail_discarded || fail_not_object || fail_status ||
-                        fail_total || fail_blob || fail_pages_null || fail_pages_not_array ||
-                        fail_pages_size || fail_sig_empty || fail_digest_empty ||
-                        fail_computed_empty || fail_digest_mismatch || fail_sig_verify) {
-                        char detail[512];
-                        _snprintf_s(detail, sizeof(detail), _TRUNCATE,
-                            "arc_bulk_failed body_len=%zu disc=%d not_obj=%d status=%.20s status_bad=%d "
-                            "total_pages got=%llu exp=%lu (bad=%d) blob_size got=%llu exp=%lu (bad=%d) "
-                            "pages_null=%d pages_not_array=%d pages_size got=%zu exp=%lu (bad=%d) "
-                            "sig_empty=%d digest_empty=%d computed_empty=%d digest_mismatch=%d sig_verify_failed=%d",
-                            bulk_resp.body.size(),
-                            fail_discarded ? 1 : 0,
-                            fail_not_object ? 1 : 0,
-                            status_value.c_str(),
-                            fail_status ? 1 : 0,
-                            (unsigned long long)got_total_pages, (unsigned long)total_pages,
-                            fail_total ? 1 : 0,
-                            (unsigned long long)got_blob_size, (unsigned long)blob_size,
-                            fail_blob ? 1 : 0,
-                            fail_pages_null ? 1 : 0,
-                            fail_pages_not_array ? 1 : 0,
-                            got_pages_size, (unsigned long)total_pages,
-                            fail_pages_size ? 1 : 0,
-                            fail_sig_empty ? 1 : 0,
-                            fail_digest_empty ? 1 : 0,
-                            fail_computed_empty ? 1 : 0,
-                            fail_digest_mismatch ? 1 : 0,
-                            fail_sig_verify ? 1 : 0);
-                        log_arc_status(detail);
-                        if (!fail_sig_empty && !fail_digest_empty && !computed_digest.empty()) {
-                            char dd[256];
-                            _snprintf_s(dd, sizeof(dd), _TRUNCATE,
-                                "arc_bulk_digests computed=%.16s server=%.16s sig_len=%zu canonical_len=%zu",
-                                computed_digest.c_str(), pages_digest.c_str(),
-                                bulk_sig.size(), canonical.size());
-                            log_arc_status(dd);
-                        }
-                        log_arc_status("arc_bulk_signature_or_shape_failed");
-                    } else {
-                        bulk_loaded = true;
-                        for (uint32_t i = 0; i < total_pages; ++i) {
-                            if (!append_arc_page((*pages_json)[i], i, false)) {
-                                bulk_loaded = false;
-                                char abuf[96];
-                                _snprintf_s(abuf, sizeof(abuf), _TRUNCATE,
-                                    "arc_bulk_append_page_failed index=%u", i);
-                                log_arc_status(abuf);
-                                break;
-                            }
-                        }
-                        if (bulk_loaded)
-                            log_arc_status("arc_bulk_pages_ok");
-                    }
+                if ((page_index % 50u) == 0u || page_index + 1u == total_pages) {
+                    lic_log_fmt("[arc-bulk] page_decrypt_ok index=%u total=%u accumulated=%zu",
+                        page_index, total_pages,
+                        ptw_total_bytes.load(std::memory_order_acquire));
                 }
             }
 
@@ -5167,20 +5019,20 @@ namespace
                     SecureZeroMemory(chain_tag.data(), chain_tag.size());
                 chain_tag.clear();
                 chain_tag_hex.clear();
+                lic_log("[arc-bulk] decrypt_loop_failed");
                 log_arc_status("arc_bulk_required_failed");
                 return false;
             }
+            lic_log_fmt("[arc-bulk] all_pages_decrypted total=%u accumulated=%zu",
+                total_pages,
+                ptw_total_bytes.load(std::memory_order_acquire));
 
             {
-                ULONGLONG page_loop_elapsed_ms = GetTickCount64() - page_loop_start_ms;
-                char tbuf[160];
-                _snprintf_s(tbuf, sizeof(tbuf), _TRUNCATE,
-                    "arc_paged_loop_done pages=%u elapsed_ms=%llu session_active=%d bulk=%d",
+                const ULONGLONG page_loop_elapsed_ms = GetTickCount64() - page_loop_start_ms;
+                lic_log_fmt("[arc-bulk] pages_loop_done total=%u elapsed_ms=%llu session_active=%d",
                     total_pages,
                     static_cast<unsigned long long>(page_loop_elapsed_ms),
-                    session_active ? 1 : 0,
-                    bulk_loaded ? 1 : 0);
-                log_arc_status(tbuf);
+                    session_active ? 1 : 0);
             }
 
             SecureZeroMemory(key_seed.data(), key_seed.size());
@@ -5189,18 +5041,19 @@ namespace
 
             const size_t accumulated_total = ptw_total_bytes.load(std::memory_order_acquire);
             if (accumulated_total != blob_size) {
-                char buf[160];
-                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                    "arc_paged_blob_size_mismatch accumulated=%zu blob=%zu",
+                lic_log_fmt("[arc-bulk] blob_size_mismatch accumulated=%zu blob=%zu",
                     accumulated_total, blob_size);
-                log_arc_status(buf);
+                log_arc_status("arc_paged_blob_size_mismatch");
                 return false;
             }
+            lic_log_fmt("[arc-bulk] plaintext_window_filled accumulated=%zu blob_size=%zu",
+                accumulated_total, blob_size);
 
             if (s_activation_completed_at_ms.load(std::memory_order_acquire) != 0)
                 mark_activation_completed();
 
             log_arc_status("arc_paged_blob_assembled");
+            lic_log("[arc-bulk] blob_assembled");
 
             lic_diag::thread_canary("pre_arc_loader_load_call");
             lic_diag::dump_pe_self("pre_arc_loader_load_call");
@@ -5223,29 +5076,27 @@ namespace
             {
                 if (!loader_buffer.empty())
                     SecureZeroMemory(loader_buffer.data(), loader_buffer.size());
-                char buf[160];
-                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                    "arc_paged_stream_failed err=%.96s collected=%zu",
+                lic_log_fmt("[arc-bulk] plaintext_window_streamed_failed err=%.96s collected=%zu",
                     stream_err.c_str(), loader_buffer.size());
-                log_arc_status(buf);
+                log_arc_status("arc_paged_stream_failed");
                 return false;
             }
+            lic_log_fmt("[arc-bulk] plaintext_window_streamed bytes=%zu", loader_buffer.size());
 
+            lic_log_fmt("[arc-bulk] arc_loader_handoff size=%zu", loader_buffer.size());
             s_arc_module = arc_loader::load(loader_buffer.data(), loader_buffer.size());
             const bool load_ok = (s_arc_module.base != nullptr);
             SecureZeroMemory(loader_buffer.data(), loader_buffer.size());
             loader_buffer.clear();
             if (!load_ok) {
-                char rl_buf[192];
-                _snprintf_s(rl_buf, sizeof(rl_buf), _TRUNCATE,
-                    "arc_paged_reflective_load_failed reason=%s",
-                    arc_loader::last_error().c_str());
-                log_arc_status(rl_buf);
+                lic_log_fmt("[arc-bulk] arc_loader_failed reason=%.128s", arc_loader::last_error().c_str());
+                log_arc_status("arc_paged_reflective_load_failed");
                 lic_diag::thread_canary("post_arc_loader_load_FAIL");
                 lic_diag::dump_pe_self("post_arc_loader_load_FAIL");
                 lic_diag::dump_mitigation("post_arc_loader_load_FAIL");
                 return false;
             }
+            lic_log("[arc-bulk] arc_loader_returned_ok");
 
             log_arc_status("arc_load_ok_resolving_exports");
 
@@ -5671,9 +5522,15 @@ namespace
                 log_arc_status("anti_tamper_finalize_unknown_exception");
             }
 
+            const ULONGLONG t_arc_bulk_total_ms = GetTickCount64() - t_arc_bulk_start_ms;
+            lic_log_fmt("[arc-bulk] complete duration_ms=%llu",
+                static_cast<unsigned long long>(t_arc_bulk_total_ms));
             return true;
 
         } catch (...) {
+            const ULONGLONG t_arc_bulk_total_ms = GetTickCount64() - t_arc_bulk_start_ms;
+            lic_log_fmt("[arc-bulk] handler_exception duration_ms=%llu",
+                static_cast<unsigned long long>(t_arc_bulk_total_ms));
             log_arc_status("arc_paged_download_exception");
             return false;
         }
@@ -6242,6 +6099,27 @@ namespace standalone_license
     bool activate(settings_sa_t& settings, const std::string& key, std::string& error_out)
     {
         lic_log("activate_enter");
+        {
+            char dbg[256];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "activate_key len=%zu first=%.6s last=%.6s",
+                key.size(),
+                key.c_str(),
+                key.size() >= 6 ? key.c_str() + key.size() - 6 : key.c_str());
+            lic_log(dbg);
+            std::string hex_dump;
+            hex_dump.reserve(key.size() * 3);
+            for (unsigned char c : key) {
+                static const char kHex[] = "0123456789abcdef";
+                hex_dump.push_back(kHex[(c >> 4) & 0xF]);
+                hex_dump.push_back(kHex[c & 0xF]);
+                hex_dump.push_back(' ');
+            }
+            char dbg2[512];
+            _snprintf_s(dbg2, sizeof(dbg2), _TRUNCATE,
+                "activate_key_hex=%.450s", hex_dump.c_str());
+            lic_log(dbg2);
+        }
         ensure_modules_initialized();
         reset_arc_fetch_state();
         reset_activation_completed_at();

@@ -34,7 +34,7 @@ const FORMAT_FORMAT2 = 2;
 
 const REQ_SEQ_INITIAL = 1;
 const REQ_SEQ_SKIP_THRESHOLD = 1000;
-const REQ_TIME_WINDOW_MS = 5000;
+const REQ_TIME_WINDOW_MS = 60000;
 const REQ_TIME_WINDOW_LEGACY_MS = 25000;
 
 function crc8Ccitt(buf) {

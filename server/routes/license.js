@@ -169,6 +169,11 @@ function envelopeResponse(status, payload) {
 }
 
 function collapseInvalid(rawReason, licenseKey, hwid, clientIp, extra) {
+    console.warn('[validate-reject] kind=invalid reason=' + String(rawReason || 'unknown')
+        + ' key_prefix=' + String(licenseKey || '').slice(0, 14)
+        + ' hwid_prefix=' + String(hwid || '').slice(0, 12)
+        + ' ip=' + String(clientIp || '')
+        + ' extra=' + (extra ? JSON.stringify(extra).slice(0, 200) : ''));
     auditLog.logValidationFailure(REASON_INVALID, rawReason, licenseKey || '', hwid || '', clientIp || '', extra || null)
         .catch(() => {});
     auditLog.logV2({
@@ -180,10 +185,18 @@ function collapseInvalid(rawReason, licenseKey, hwid, clientIp, extra) {
         reason_code: 'invalid:' + String(rawReason || 'unknown'),
         extra: extra || {},
     }).catch(() => {});
-    return buildEauthResult();
+    const r = buildEauthResult();
+    if (process.env.AIDA_DEBUG_EAUTH_HEADER !== '0') {
+        r.headers = Object.assign({}, r.headers || {}, { 'X-Debug-Reason': 'invalid:' + String(rawReason || 'unknown') });
+    }
+    return r;
 }
 
 function collapseBanned(rawReason, licenseKey, hwid, clientIp, extra) {
+    console.warn('[validate-reject] kind=banned reason=' + String(rawReason || 'unknown')
+        + ' key_prefix=' + String(licenseKey || '').slice(0, 14)
+        + ' hwid_prefix=' + String(hwid || '').slice(0, 12)
+        + ' ip=' + String(clientIp || ''));
     auditLog.logValidationFailure(REASON_BANNED, rawReason, licenseKey || '', hwid || '', clientIp || '', extra || null)
         .catch(() => {});
     auditLog.logV2({
@@ -195,10 +208,19 @@ function collapseBanned(rawReason, licenseKey, hwid, clientIp, extra) {
         reason_code: 'banned:' + String(rawReason || 'unknown'),
         extra: extra || {},
     }).catch(() => {});
-    return buildEauthResult();
+    const r = buildEauthResult();
+    if (process.env.AIDA_DEBUG_EAUTH_HEADER !== '0') {
+        r.headers = Object.assign({}, r.headers || {}, { 'X-Debug-Reason': 'banned:' + String(rawReason || 'unknown') });
+    }
+    return r;
 }
 
 function collapseRateLimited(scope, retryAfterSeconds, licenseKey, hwid, clientIp) {
+    console.warn('[validate-reject] kind=rate_limited scope=' + String(scope || '')
+        + ' retry_after=' + String(retryAfterSeconds || 0)
+        + ' key_prefix=' + String(licenseKey || '').slice(0, 14)
+        + ' hwid_prefix=' + String(hwid || '').slice(0, 12)
+        + ' ip=' + String(clientIp || ''));
     auditLog.logValidationFailure(REASON_RATE_LIMITED, 'rate_limited:' + (scope || ''), licenseKey || '', hwid || '', clientIp || '', { retry_after: retryAfterSeconds })
         .catch(() => {});
     auditLog.logV2({
@@ -210,10 +232,18 @@ function collapseRateLimited(scope, retryAfterSeconds, licenseKey, hwid, clientI
         reason_code: 'rate_limited:' + String(scope || ''),
         extra: { retry_after: retryAfterSeconds || 0 },
     }).catch(() => {});
-    return buildEauthResult();
+    const r = buildEauthResult();
+    if (process.env.AIDA_DEBUG_EAUTH_HEADER !== '0') {
+        r.headers = Object.assign({}, r.headers || {}, { 'X-Debug-Reason': 'rate_limited:' + String(scope || '') });
+    }
+    return r;
 }
 
 function collapseHeartbeatDeny(reasonCode, licenseKey, hwid, clientIp, extra) {
+    console.warn('[heartbeat-reject] reason=' + String(reasonCode || 'heartbeat_deny')
+        + ' key_prefix=' + String(licenseKey || '').slice(0, 14)
+        + ' hwid_prefix=' + String(hwid || '').slice(0, 12)
+        + ' ip=' + String(clientIp || ''));
     auditLog.logV2({
         action: 'license.heartbeat',
         license_key: licenseKey || '',
@@ -223,7 +253,11 @@ function collapseHeartbeatDeny(reasonCode, licenseKey, hwid, clientIp, extra) {
         reason_code: String(reasonCode || 'heartbeat_deny'),
         extra: extra || {},
     }).catch(() => {});
-    return buildEauthResult();
+    const r = buildEauthResult();
+    if (process.env.AIDA_DEBUG_EAUTH_HEADER !== '0') {
+        r.headers = Object.assign({}, r.headers || {}, { 'X-Debug-Reason': 'hb:' + String(reasonCode || 'heartbeat_deny') });
+    }
+    return r;
 }
 
 function constantTimeKeyMatch(submitted, expected) {
@@ -847,11 +881,18 @@ async function ensureLicenseSecrets(licenseKey, data) {
 
 async function lookupLicense(licenseKey) {
     if (!licenseKey || typeof licenseKey !== 'string') {
+        console.warn('[lookupLicense] missing_key type=' + typeof licenseKey);
         return { valid: false, reason: 'missing_key' };
     }
+    console.warn('[lookupLicense] in_key len=' + licenseKey.length
+        + ' prefix=' + licenseKey.slice(0, 14)
+        + ' is_format2_candidate=' + keyFormat.format2IsCandidate(licenseKey)
+        + ' is_modern=' + keyFormat.isModernKey(licenseKey)
+        + ' is_legacy=' + keyFormat.isLegacyKey(licenseKey));
     if (keyFormat.format2IsCandidate(licenseKey)) {
         const verdict = keyFormat.format2Decode(licenseKey);
         if (!verdict.ok) {
+            console.warn('[lookupLicense] format2_decode_failed reason=' + verdict.reason);
             if (verdict.reason === 'format2_crc') {
                 replayCounter.recordFormat2CrcFail(licenseKey, { reason: verdict.reason }).catch(() => {});
             }
@@ -860,6 +901,7 @@ async function lookupLicense(licenseKey) {
     }
     const normalized = keyFormat.normalizeForLookup(licenseKey);
     if (!normalized) {
+        console.warn('[lookupLicense] normalizeForLookup_returned_empty raw_key=' + JSON.stringify(licenseKey));
         return { valid: false, reason: 'invalid_format' };
     }
 
@@ -868,6 +910,7 @@ async function lookupLicense(licenseKey) {
         [normalized]
     );
     if (rows.length === 0) {
+        console.warn('[lookupLicense] not_found normalized=' + normalized);
         return { valid: false, reason: 'not_found' };
     }
 
@@ -2569,12 +2612,15 @@ async function handleDriverProof(body, clientIp) {
 }
 
 
-async function sendEauth(res, startedAt) {
+async function sendEauth(res, startedAt, debugReason) {
     await applyEauthBudget(startedAt);
     res.removeHeader && res.removeHeader('X-Powered-By');
     res.setHeader('Content-Type', 'application/json');
     res.setHeader('Content-Length', String(EAUTH_BODY_LENGTH));
     res.setHeader('Cache-Control', 'no-store');
+    if (debugReason && process.env.AIDA_DEBUG_EAUTH_HEADER !== '0') {
+        res.setHeader('X-Debug-Reason', String(debugReason).slice(0, 160));
+    }
     return res.status(401).send(EAUTH_BODY_JSON);
 }
 
@@ -2655,7 +2701,8 @@ router.post('/', async (req, res) => {
         }
 
         if (result && result.eauth === true) {
-            return sendEauth(res, dispatchStartedAt);
+            const dbgReason = result.headers && result.headers['X-Debug-Reason'];
+            return sendEauth(res, dispatchStartedAt, dbgReason);
         }
 
         if (result && result.headers && typeof result.headers === 'object') {
@@ -2845,7 +2892,8 @@ async function createLicenseRow(opts) {
     const safeCreatedBy = (typeof opts.created_by === 'string' ? opts.created_by : 'payment_system').slice(0, 128).replace(/[^\x20-\x7E]/g, '');
     const planValue = typeof opts.plan === 'string' && opts.plan.length > 0 ? opts.plan : 'pro';
     const tierValue = typeof opts.tier === 'string' && opts.tier.length > 0 ? opts.tier : (planValue || 'standard');
-    const formatRequested = Number(opts.key_format) === keyFormat.FORMAT_LEGACY ? keyFormat.FORMAT_LEGACY : keyFormat.FORMAT_MODERN;
+    const requestedNum = Number(opts.key_format);
+    const formatRequested = requestedNum === keyFormat.FORMAT_MODERN ? keyFormat.FORMAT_MODERN : keyFormat.FORMAT_LEGACY;
     const key = formatRequested === keyFormat.FORMAT_MODERN ? keyFormat.generateModernKey() : keyFormat.generateLegacyKey();
     const now = Math.floor(Date.now() / 1000);
 

