@@ -524,6 +524,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				if (appdata) {
 					std::string path = std::string(appdata) + "\\AiDA\\Standalone\\aob_export.json";
 					free(appdata);
+					diag::log_tagged_fmt("aob", "export_json path='%s'", path.c_str());
 					aob_generator::export_signatures_json(path);
 				}
 			}
@@ -532,6 +533,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImGui::SetCursorScreenPos(ImVec2(bx, cy));
 			if (aida::ui::button("Export YARA", aida::ui::button_kind_t::ghost,
 					aida::ui::size_t_::sm)) {
+				diag::log_tagged("aob", "export_yara_clicked");
 				char* appdata = nullptr;
 				size_t elen = 0;
 				_dupenv_s(&appdata, &elen, "APPDATA");

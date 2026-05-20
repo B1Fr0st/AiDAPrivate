@@ -5,6 +5,7 @@
 #include <cstdint>
 #include "imgui/imgui.h"
 #include "theme.hpp"
+#include "fonts.hpp"
 
 namespace ui_anim {
 
@@ -561,17 +562,26 @@ inline void render_stat_card(ImDrawList* dl, float x, float y, float w, float h,
 							 float ar, float ag, float ab, float alpha,
 							 ImU32 value_col = 0)
 {
-	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
+	ImVec2 lsz = ImGui::CalcTextSize(label);
+	ImVec2 vsz = ImGui::CalcTextSize(value);
+
+	const float pad_top = 6.f;
+	const float gap = 4.f;
+	const float pad_bot = 8.f;
+	float needed_h = pad_top + lsz.y + gap + vsz.y + pad_bot;
+	float eff_h = h > needed_h ? h : needed_h;
+
+	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + eff_h),
 		theme_alpha(aida::ui::resolved().panel_bg, 0.78f * alpha), 6.f);
-	dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h),
+	dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + eff_h),
 		theme_alpha(aida::ui::resolved().border_strong, 0.39f * alpha), 6.f);
 
 	ImU32 top_line = IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
 							   static_cast<int>(ab * 255), static_cast<int>(alpha * 120));
 	dl->AddLine(ImVec2(x + 4.f, y), ImVec2(x + w - 4.f, y), top_line, 2.f);
 
-	ImVec2 lsz = ImGui::CalcTextSize(label);
-	dl->AddText(ImVec2(x + (w - lsz.x) * 0.5f, y + 6.f),
+	float label_y = y + pad_top;
+	dl->AddText(ImVec2(x + (w - lsz.x) * 0.5f, label_y),
 		theme_alpha(aida::ui::resolved().text_dim, alpha), label);
 
 	if (value_col == 0)
@@ -579,8 +589,10 @@ inline void render_stat_card(ImDrawList* dl, float x, float y, float w, float h,
 	else
 		value_col = theme_alpha(value_col, alpha);
 
-	ImVec2 vsz = ImGui::CalcTextSize(value);
-	dl->AddText(ImVec2(x + (w - vsz.x) * 0.5f, y + h - vsz.y - 8.f), value_col, value);
+	float value_y = label_y + lsz.y + gap;
+	float value_bottom = y + eff_h - pad_bot - vsz.y;
+	if (value_bottom > value_y) value_y = value_bottom;
+	dl->AddText(ImVec2(x + (w - vsz.x) * 0.5f, value_y), value_col, value);
 }
 
 inline float render_row_entrance(int row_index, float anim_time, float stagger_delay = 0.015f,
@@ -1494,15 +1506,22 @@ inline void render_stat_strip(ImDrawList* dl, float x, float y, float w, float h
 	if (avail < static_cast<float>(count)) return;
 	float item_w = avail / static_cast<float>(count);
 
+	const float line_h = ImGui::CalcTextSize("Ag").y;
+	const float strip_pad_top = 6.f;
+	const float strip_gap = 4.f;
+	const float strip_pad_bot = 8.f;
+	float needed_h = strip_pad_top + line_h + strip_gap + line_h + strip_pad_bot;
+	float eff_h = h > needed_h ? h : needed_h;
+
 	float cx = x + pad_outer;
 	for (int i = 0; i < count; ++i) {
 		float ix = cx;
 		float iy = y;
 		const auto& it = items[i];
 
-		dl->AddRectFilled(ImVec2(ix, iy), ImVec2(ix + item_w, iy + h),
+		dl->AddRectFilled(ImVec2(ix, iy), ImVec2(ix + item_w, iy + eff_h),
 			theme_alpha(aida::ui::resolved().panel_bg, 0.78f * alpha), 6.f);
-		dl->AddRect(ImVec2(ix, iy), ImVec2(ix + item_w, iy + h),
+		dl->AddRect(ImVec2(ix, iy), ImVec2(ix + item_w, iy + eff_h),
 			theme_alpha(aida::ui::resolved().border_strong, 0.35f * alpha), 6.f, 0, 1.f);
 
 		ImU32 accent_top = IM_COL32(
@@ -1512,11 +1531,11 @@ inline void render_stat_strip(ImDrawList* dl, float x, float y, float w, float h
 			accent_top, 1.f);
 
 		if (it.label) {
-			dl->AddText(ImVec2(ix + 10.f, iy + 6.f),
+			dl->AddText(ImVec2(ix + 10.f, iy + strip_pad_top),
 				theme_alpha(aida::ui::resolved().text_dim, alpha), it.label);
 		}
 
-		float value_baseline_y = iy + h - 8.f;
+		float value_baseline_y = iy + eff_h - strip_pad_bot;
 		if (it.value) {
 			ImU32 vc = it.value_color ? theme_alpha(it.value_color, alpha)
 									  : theme_alpha(aida::ui::resolved().text_primary, alpha);
@@ -1562,8 +1581,12 @@ inline void render_graph_node_card(ImDrawList* dl, float x, float y, float w, fl
 	if (font_scale < 0.30f) font_scale = 0.30f;
 	if (font_scale > 3.00f) font_scale = 3.00f;
 
+	ImFont* hdr_font = aida::ui::fonts::body_em();
+	if (!hdr_font) hdr_font = ImGui::GetFont();
+	float hdr_base = hdr_font && hdr_font->FontSize > 0.f ? hdr_font->FontSize : 13.f;
+
 	const float rounding = 7.f * font_scale;
-	const float header_h = 22.f * font_scale;
+	const float header_h = (hdr_base + 8.f) * font_scale;
 
 	dl->AddRectFilled(ImVec2(x + 3.f, y + 4.f), ImVec2(x + w + 3.f, y + h + 4.f),
 		IM_COL32(0, 0, 0, static_cast<int>(70 * alpha)), rounding);
@@ -1607,17 +1630,15 @@ inline void render_graph_node_card(ImDrawList* dl, float x, float y, float w, fl
 				 static_cast<int>(ab * 255), static_cast<int>(130 * alpha)), 1.f * font_scale);
 
 	if (header_text) {
-		ImFont* fnt = ImGui::GetFont();
-		float base_font_size = ImGui::GetFontSize();
-		float scaled_font_size = base_font_size * font_scale;
-		ImVec2 ts = fnt->CalcTextSizeA(scaled_font_size, FLT_MAX, 0.f, header_text);
+		float scaled_font_size = hdr_base * font_scale;
+		ImVec2 ts = hdr_font->CalcTextSizeA(scaled_font_size, FLT_MAX, 0.f, header_text);
 		ImU32 title_col = is_entry
 			? theme_alpha(aida::ui::resolved().bg_base, 0.96f * alpha)
 			: IM_COL32(
 				static_cast<int>(ar * 200 + 55), static_cast<int>(ag * 200 + 55),
 				static_cast<int>(ab * 200 + 55), static_cast<int>(alpha * 240));
-		dl->AddText(fnt, scaled_font_size,
-			ImVec2(x + 10.f * font_scale, y + (header_h - ts.y) * 0.5f + 1.f * font_scale),
+		dl->AddText(hdr_font, scaled_font_size,
+			ImVec2(x + 10.f * font_scale, y + (header_h - ts.y) * 0.5f),
 			title_col, header_text);
 	}
 

@@ -2988,8 +2988,14 @@ void goto_address(uint64_t addr, DisasmState& disasm) {
 
 void navigate_back() {
     auto& st = g_state;
-    if (st.nav_pos <= 0 || st.nav_history.empty()) return;
+    if (st.nav_pos <= 0 || st.nav_history.empty()) {
+        diag::log_tagged_fmt("disasm", "navigate_back rejected nav_pos=%d history_size=%zu",
+            st.nav_pos, st.nav_history.size());
+        return;
+    }
     st.nav_pos--;
+    diag::log_tagged_fmt("disasm", "navigate_back nav_pos=%d -> row=%d",
+        st.nav_pos, st.nav_history[st.nav_pos]);
     st.selected_row = st.nav_history[st.nav_pos];
     st.sel_anchor = st.selected_row;
     st.sel_extent = st.selected_row;
@@ -3013,8 +3019,14 @@ void navigate_back() {
 
 void navigate_forward() {
     auto& st = g_state;
-    if (st.nav_pos + 1 >= static_cast<int>(st.nav_history.size())) return;
+    if (st.nav_pos + 1 >= static_cast<int>(st.nav_history.size())) {
+        diag::log_tagged_fmt("disasm", "navigate_forward rejected nav_pos=%d history_size=%zu",
+            st.nav_pos, st.nav_history.size());
+        return;
+    }
     st.nav_pos++;
+    diag::log_tagged_fmt("disasm", "navigate_forward nav_pos=%d -> row=%d",
+        st.nav_pos, st.nav_history[st.nav_pos]);
     st.selected_row = st.nav_history[st.nav_pos];
     st.sel_anchor = st.selected_row;
     st.sel_extent = st.selected_row;
@@ -4734,17 +4746,17 @@ void render(float pos_x, float pos_y, float width, float height,
                         aida::ui::with_alpha(tk.accent_u32, a));
                 }
 
-                dl->AddText(code_font, code_size, ImVec2(x_seg_addr, y + 1.f),
+                dl->AddText(code_font, code_size, ImVec2(x_seg_addr, y + disasm_text_oy),
                     aida::ui::with_alpha(disasm_theme::segment(), a * 0.85f),
                     seg_part.c_str());
-                dl->AddText(code_font, code_size, ImVec2(x_seg_addr + seg_w, y + 1.f),
+                dl->AddText(code_font, code_size, ImVec2(x_seg_addr + seg_w, y + disasm_text_oy),
                     aida::ui::with_alpha(disasm_theme::separator(), a * 0.85f), ":");
-                dl->AddText(code_font, code_size, ImVec2(x_seg_addr + seg_w + ch_w_safe, y + 1.f),
+                dl->AddText(code_font, code_size, ImVec2(x_seg_addr + seg_w + ch_w_safe, y + disasm_text_oy),
                     aida::ui::with_alpha(disasm_theme::address(), a * 0.85f), addr_buf);
 
                 if (!bl.text.empty()) {
                     ImU32 col = aida::ui::with_alpha(bl.color, a);
-                    dl->AddText(code_font, code_size, ImVec2(x_banner_text, y + 1.f),
+                    dl->AddText(code_font, code_size, ImVec2(x_banner_text, y + disasm_text_oy),
                         col, bl.text.c_str());
                 }
 
@@ -4872,14 +4884,15 @@ void render(float pos_x, float pos_y, float width, float height,
 
         const std::string& seg_part = *seg_part_ptr;
         const std::string& addr_part = *addr_part_ptr;
-        ImVec2 sp(x_seg_addr, yy + 1.f - yoff);
+        const float addr_text_oy = (line_h - code_size) * 0.5f;
+        ImVec2 sp(x_seg_addr, yy + addr_text_oy - yoff);
         dl->AddText(code_font, code_size, sp,
             aida::ui::with_alpha(disasm_theme::segment(), row_alpha), seg_part.c_str());
         if (!seg_part.empty()) {
-            ImVec2 cp(x_seg_addr + seg_part_w, yy + 1.f - yoff);
+            ImVec2 cp(x_seg_addr + seg_part_w, yy + addr_text_oy - yoff);
             dl->AddText(code_font, code_size, cp,
                 aida::ui::with_alpha(disasm_theme::separator(), row_alpha), ":");
-            ImVec2 ap(x_seg_addr + seg_part_w + ch_w_safe, yy + 1.f - yoff);
+            ImVec2 ap(x_seg_addr + seg_part_w + ch_w_safe, yy + addr_text_oy - yoff);
             dl->AddText(code_font, code_size, ap,
                 aida::ui::with_alpha(disasm_theme::address(), row_alpha), addr_part.c_str());
         } else {
@@ -4894,8 +4907,9 @@ void render(float pos_x, float pos_y, float width, float height,
         draw_addr_prefix_cached(yy, nullptr, va, seg_override, row_alpha, yoff);
     };
 
+    const float disasm_text_oy = (line_h - code_size) * 0.5f;
     auto draw_text_at = [&](float xx, float yy, ImU32 col, const char* str, float yoff) {
-        dl->AddText(code_font, code_size, ImVec2(xx, yy + 1.f - yoff), col, str);
+        dl->AddText(code_font, code_size, ImVec2(xx, yy + disasm_text_oy - yoff), col, str);
     };
 
     auto fill_row_bg = [&](float yy, ImU32 col) {
@@ -7167,6 +7181,8 @@ std::unique_ptr<snapshot_t> detach_snapshot()
 
 void attach_snapshot(std::unique_ptr<snapshot_t> snap)
 {
+    diag::log_tagged_fmt("disasm", "attach_snapshot enter has_snap=%d",
+        snap ? 1 : 0);
     std::lock_guard<std::mutex> lk(g_state.xref_mutex);
     if (!snap) snap = std::make_unique<snapshot_t>();
     g_state.nav_history = std::move(snap->nav_history);

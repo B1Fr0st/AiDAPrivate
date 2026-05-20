@@ -152,8 +152,6 @@ inline field_anim_t& fanim(int idx) { return g_ui.field_anims[idx]; }
 
 inline void render(float pos_x, float pos_y, float width, float height,
 				   float alpha, float accent_r, float accent_g, float accent_b) {
-	(void)pos_x; (void)pos_y;
-
 	{
 		static bool s_types_font_logged_dissector = false;
 		if (!s_types_font_logged_dissector) {
@@ -162,13 +160,16 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 
+	ImGui::SetCursorScreenPos(ImVec2(ImGui::GetWindowPos().x + pos_x,
+	                                 ImGui::GetWindowPos().y + pos_y));
+
 	ImGui::BeginChild("##struct_dissector_view", ImVec2(width, height), false,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
 	auto& ui = g_ui;
 	auto& st = struct_dissector::g_state;
 	const float dt = aida::ui::clock::dt();
 	const float line_h = 36.f;
-	const float top_bar_h = 44.f;
+	const float top_bar_h = 52.f;
 
 	ImDrawList* dl = ImGui::GetWindowDrawList();
 	ImVec2 wpos = ImGui::GetWindowPos();
@@ -191,13 +192,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		aida::ui::with_alpha(th.border_subtle, alpha));
 
 	float bx = ox + 12.f;
-	float by = oy + 6.f;
+	float by = oy + 12.f;
 
 	const float fs_diss_base = aida::ui::components::detail::ui_fs();
 	dl->AddText(aida::ui::fonts::body_em() ? aida::ui::fonts::body_em() : ImGui::GetFont(),
 		fs_diss_base * 1.05f, ImVec2(bx, by + 4.f),
 		aida::ui::with_alpha(th.text_secondary, alpha), "Base");
-	bx += 44.f;
+	bx += 48.f;
 
 	if (!ui.addr_buf_seeded) {
 		uint64_t seed = 0;
@@ -244,7 +245,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PopItemWidth();
 	ImGui::PopStyleColor(3);
 	ImGui::PopStyleVar(2);
-	bx += 180.f;
+	bx += 180.f + 6.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(bx, by));
 	if (aida::ui::button("Go", aida::ui::button_kind_t::secondary,
@@ -267,7 +268,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				"base_address_go_failed input='%s'", ui.addr_buf);
 		}
 	}
-	bx += 52.f;
+	bx += 56.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(bx, by));
 	if (aida::ui::button("Refresh", aida::ui::button_kind_t::primary,
@@ -275,7 +276,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		diag::log_tagged_fmt("dissector", "refresh_clicked manual=1");
 		struct_dissector::refresh_values();
 	}
-	bx += 92.f;
+	bx += 102.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(bx, by));
 	{
@@ -293,7 +294,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
 		fs_diss_base * 0.92f, ImVec2(bx, by + 4.f),
 		aida::ui::with_alpha(th.text_dim, alpha), "Auto");
-	bx += 48.f;
+	bx += 42.f + 8.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(bx, by));
 	if (aida::ui::button("Export C", aida::ui::button_kind_t::ghost,
@@ -337,8 +338,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 
-	float body_y = oy + top_bar_h + 1.f;
-	float body_h = height - top_bar_h - 1.f;
+	float body_y = oy + top_bar_h + 4.f;
+	float body_h = height - top_bar_h - 4.f;
 
 	bool driver_loaded = driver_bridge::is_loaded();
 	if (!driver_loaded) {
@@ -392,10 +393,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float lh = body_h;
 
 		dl->AddText(aida::ui::fonts::body_em() ? aida::ui::fonts::body_em() : ImGui::GetFont(),
-			fs_diss_base * 0.95f, ImVec2(lx + 10.f, ly + 6.f),
+			fs_diss_base * 0.95f, ImVec2(lx + 10.f, ly + 8.f),
 			aida::ui::with_alpha(th.text_secondary, alpha), "Structures");
 
-		float filter_y = ly + 26.f;
+		float filter_y = ly + 30.f;
 		ImGui::SetCursorScreenPos(ImVec2(lx + 8.f, filter_y));
 		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(
@@ -409,8 +410,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::PopStyleColor(2);
 		ImGui::PopStyleVar();
 
-		float list_y = filter_y + 28.f;
-		float list_h = lh - (list_y - ly) - (line_h * 2.f + 12.f);
+		float list_y = filter_y + 32.f;
+		float list_h = lh - (list_y - ly) - (line_h * 2.f + 16.f);
 
 		ui.list_scroll_y = aida::motion::smooth_lerp(ui.list_scroll_y,
 			ui.list_target_scroll_y, 18.f, dt);
@@ -523,7 +524,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 		ImGui::PopClipRect();
 
-		float ren_y = ly + lh - line_h * 2.f - 4.f;
+		float ren_y = ly + lh - line_h * 2.f - 8.f;
 		ImGui::SetCursorScreenPos(ImVec2(lx + 8.f, ren_y));
 		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(
@@ -555,7 +556,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			}
 		}
 
-		float btn_y = ly + lh - line_h + 4.f;
+		float btn_y = ly + lh - line_h + 2.f;
 		ImGui::SetCursorScreenPos(ImVec2(lx + 8.f, btn_y));
 		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(
@@ -1084,8 +1085,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				aida::ui::with_alpha(th.accent_dim, alpha), 2.f);
 		}
 
-		float add_y = ry_start + rh - line_h - 2.f;
-		ImGui::SetCursorScreenPos(ImVec2(rx + 4.f, add_y + 1.f));
+		float add_y = ry_start + rh - line_h - 6.f;
+		ImGui::SetCursorScreenPos(ImVec2(rx + 8.f, add_y + 2.f));
 		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(
 			aida::ui::with_alpha(th.panel_header, alpha)));
@@ -1095,13 +1096,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::PushItemWidth(170.f);
 		ImGui::InputTextWithHint("##sd_fn", "field name", ui.field_name_buf, sizeof(ui.field_name_buf));
 		ImGui::PopItemWidth();
-		ImGui::SameLine();
+		ImGui::SameLine(0.f, 6.f);
 
 		ImGui::PushItemWidth(80.f);
 		ImGui::InputTextWithHint("##sd_fo", "+0x?", ui.offset_buf, sizeof(ui.offset_buf),
 						 ImGuiInputTextFlags_CharsHexadecimal);
 		ImGui::PopItemWidth();
-		ImGui::SameLine();
+		ImGui::SameLine(0.f, 6.f);
 
 		static const char* type_names[] = {
 			"Int8", "UInt8", "Int16", "UInt16", "Int32", "UInt32",
@@ -1112,7 +1113,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::Combo("##sd_ft", &ui.add_type, type_names,
 					 static_cast<int>(struct_dissector::field_type_t::COUNT));
 		ImGui::PopItemWidth();
-		ImGui::SameLine();
+		ImGui::SameLine(0.f, 6.f);
 
 		ImGui::PopStyleColor(2);
 		ImGui::PopStyleVar();
@@ -1136,7 +1137,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					"add_field_skipped reason='empty_name'");
 			}
 		}
-		ImGui::SameLine();
+		ImGui::SameLine(0.f, 6.f);
 		if (aida::ui::button("Del", aida::ui::button_kind_t::destructive,
 			aida::ui::size_t_::sm, ImVec2(64.f, 28.f))) {
 			if (ui.selected_field >= 0) {

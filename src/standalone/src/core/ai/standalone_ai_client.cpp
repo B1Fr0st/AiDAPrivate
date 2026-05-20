@@ -59,12 +59,18 @@ bool refresh_oauth_if_needed(const std::string& store_key)
         return true;
     if (info.kind != aida::auth::auth_kind_t::oauth)
         return true;
-    if (info.expires_unix <= 0)
-        return true;
 
-    const int64_t now = static_cast<int64_t>(std::time(nullptr));
-    if (info.expires_unix > now + k_oauth_refresh_safety_margin_sec)
-        return true;
+    // If expires_unix is not set but the access token is present, assume it's valid.
+    // If expires_unix is not set and the access token is empty, force a refresh.
+    if (info.expires_unix <= 0) {
+        if (!info.access.empty())
+            return true;
+        // Access token is empty with no expiry info -- force refresh below.
+    } else {
+        const int64_t now = static_cast<int64_t>(std::time(nullptr));
+        if (info.expires_unix > now + k_oauth_refresh_safety_margin_sec)
+            return true;
+    }
 
     bool ok = false;
     if (store_key == "anthropic") {
@@ -139,13 +145,68 @@ standalone_ai_client_t::~standalone_ai_client_t()
 
 bool standalone_ai_client_t::is_available() const
 {
-    const auto& model = _settings.get_active_model();
+    const auto model = _settings.get_active_model();
+    if (model.empty())
+        return false;
+
     const auto kind = _settings.get_active_profile_kind();
-    if (kind == "local")
-        return !_settings.get_active_base_url().empty() && !model.empty();
-    if (kind == "gemini" || kind == "google" || kind == "anthropic" || kind == "openrouter")
-        return !_settings.get_active_api_key().empty() && !model.empty();
-    return !_settings.get_active_base_url().empty() && !model.empty();
+    if (kind == "local" || kind == "ollama" || kind == "lmstudio" || kind == "litellm")
+        return !_settings.resolve_active_base_url().empty();
+
+    // For providers that require an API key, check resolve_active_api_key first.
+    if (kind == "gemini" || kind == "google" || kind == "anthropic" || kind == "openrouter"
+        || kind == "deepseek" || kind == "mistral" || kind == "xai" || kind == "fireworks"
+        || kind == "sambanova" || kind == "moonshot" || kind == "minimax" || kind == "qwen_code"
+        || kind == "baseten" || kind == "zai") {
+        if (!_settings.resolve_active_api_key().empty())
+            return true;
+    }
+
+    // For OAuth-based providers (Copilot, Anthropic OAuth, OpenAI Codex OAuth),
+    // check the auth store for a valid access token or API key.
+    const std::string store_key = oauth_store_key_for_profile_kind(kind);
+    if (!store_key.empty()) {
+        aida::auth::auth_info_t info;
+        if (aida::auth::store::get(store_key, info)) {
+            if (info.kind == aida::auth::auth_kind_t::oauth && !info.access.empty())
+                return true;
+            if (info.kind == aida::auth::auth_kind_t::api && !info.api_key.empty())
+                return true;
+            if (info.kind == aida::auth::auth_kind_t::wellknown && !info.wellknown_token.empty())
+                return true;
+        }
+    }
+
+    // Also check the auth store using the raw selected_provider_id (e.g. "google" from catalog).
+    const std::string raw_pid = _settings.selected_provider_id();
+    if (!raw_pid.empty() && raw_pid != store_key) {
+        aida::auth::auth_info_t info;
+        if (aida::auth::store::get(raw_pid, info)) {
+            if (info.kind == aida::auth::auth_kind_t::oauth && !info.access.empty())
+                return true;
+            if (info.kind == aida::auth::auth_kind_t::api && !info.api_key.empty())
+                return true;
+            if (info.kind == aida::auth::auth_kind_t::wellknown && !info.wellknown_token.empty())
+                return true;
+        }
+    }
+
+    // Fallback: if there's a base URL configured, allow it (for custom/unknown providers).
+    return !_settings.resolve_active_base_url().empty();
+}
+
+
+std::string standalone_ai_client_t::resolve_api_key_logged(const char* context) const
+{
+    bool from_store = false;
+    std::string key = _settings.resolve_active_api_key(from_store);
+    diag::log_tagged_fmt("ai",
+        "resolve_api_key context=%.40s provider=%.40s source=%s present=%d",
+        context ? context : "",
+        _settings.selected_provider_id().c_str(),
+        from_store ? "auth-store" : "profile",
+        key.empty() ? 0 : 1);
+    return key;
 }
 
 
@@ -296,7 +357,9 @@ std::string join_host_path(const std::string& host, const std::string& path)
     std::string h = host;
     while (!h.empty() && h.back() == '/')
         h.pop_back();
-    if (path.empty() || path[0] != '/')
+    if (path.empty())
+        return h;
+    if (path[0] != '/')
         return h + "/" + path;
     return h + path;
 }
@@ -506,9 +569,9 @@ std::string standalone_ai_client_t::generate_gemini(
     const std::string& prompt, double temperature,
     ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check)
 {
-    std::string base_url = _settings.get_active_base_url();
+    std::string base_url = _settings.resolve_active_base_url();
     std::string model = clean_model_name(_settings.get_active_model());
-    std::string api_key = _settings.get_active_api_key();
+    std::string api_key = resolve_api_key_logged("gemini");
 
 
     bool is_thinking_model = (model.find("2.5") != std::string::npos ||
@@ -590,7 +653,7 @@ std::string standalone_ai_client_t::generate_openai(
     const std::string& prompt, double temperature,
     ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check)
 {
-    std::string base_url = _settings.get_active_base_url();
+    std::string base_url = _settings.resolve_active_base_url();
     std::string model = _settings.get_active_model();
 
 
@@ -624,24 +687,54 @@ std::string standalone_ai_client_t::generate_openai(
         return std::string("Error: ") + s_last_error;
     }
 
+    const bool oai_is_copilot = (oai_store_key == "github-copilot");
+    std::string oai_path = "/v1/chat/completions";
+
     std::map<std::string, std::string> headers = _settings.get_active_headers();
-    if (!_settings.get_active_api_key().empty())
-        headers["Authorization"] = "Bearer " + _settings.get_active_api_key();
+    {
+        const std::string resolved_key = resolve_api_key_logged("openai");
+        if (!resolved_key.empty())
+            headers["Authorization"] = "Bearer " + resolved_key;
+    }
     headers["Content-Type"] = "application/json";
 
     if (!oai_store_key.empty()) {
-        const std::string provider_id = (oai_kind == "openai_codex") ? std::string("openai-codex") : std::string("openai");
+        std::string provider_id;
+        if (oai_is_copilot)
+            provider_id = _settings.selected_provider_id();
+        else if (oai_kind == "openai_codex")
+            provider_id = "openai-codex";
+        else
+            provider_id = "openai";
+
         apply_oauth_headers(headers, provider_id, oai_store_key, model,
                             build_request_context(&body));
         if (headers.count("authorization") > 0)
             headers.erase("Authorization");
+
+        if (oai_is_copilot) {
+            aida::auth::auth_info_t oai_info;
+            const bool have_oai_info = aida::auth::store::get(oai_store_key, oai_info);
+            std::string resolved = aida::provider::transforms::resolve_endpoint(provider_id, model, oai_info);
+            const auto responses_pos = resolved.rfind("/responses");
+            if (responses_pos != std::string::npos && responses_pos == resolved.size() - 10)
+                resolved.replace(responses_pos, std::string::npos, "/chat/completions");
+            if (!resolved.empty())
+                base_url = resolved;
+            oai_path.clear();
+            diag::log_tagged_fmt("ai",
+                "copilot endpoint=%.160s responses_api=%d info=%d",
+                base_url.c_str(),
+                aida::provider::transforms::copilot_uses_responses_api(model) ? 1 : 0,
+                have_oai_info ? 1 : 0);
+        }
     }
 
     if (on_chunk) {
         std::string thinking_text;
         int64_t in_tokens = 0, out_tokens = 0, cache_read = 0, cache_write = 0;
 
-        auto result = streaming_post(base_url, "/v1/chat/completions", headers, body.dump(),
+        auto result = streaming_post(base_url, oai_path, headers, body.dump(),
             [&](const std::string& sse_data) -> std::string {
                 auto j = json::parse(sse_data, nullptr, false);
                 if (j.is_discarded()) return "";
@@ -687,7 +780,7 @@ std::string standalone_ai_client_t::generate_openai(
         return result;
     }
 
-    return simple_post(base_url, "/v1/chat/completions", headers, body.dump(),
+    return simple_post(base_url, oai_path, headers, body.dump(),
         [](const json& j) -> std::string {
             return j["choices"][0]["message"]["content"].get<std::string>();
         });
@@ -709,7 +802,7 @@ std::string standalone_ai_client_t::generate_anthropic(
         }
     }
 
-    std::string base_url = _settings.get_active_base_url();
+    std::string base_url = _settings.resolve_active_base_url();
     std::string model = _settings.get_active_model();
 
     std::string clean_model = model;
@@ -755,7 +848,7 @@ std::string standalone_ai_client_t::generate_anthropic(
     }
 
     std::map<std::string, std::string> headers = _settings.get_active_headers();
-    const std::string anthropic_api_key = _settings.get_active_api_key();
+    const std::string anthropic_api_key = resolve_api_key_logged("anthropic");
     if (!anthropic_api_key.empty())
         headers["x-api-key"] = anthropic_api_key;
     headers["anthropic-version"] = "2023-06-01";
@@ -861,7 +954,7 @@ std::string standalone_ai_client_t::generate_openrouter(
     ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check)
 {
     std::string model = _settings.get_active_model();
-    std::string base_url = _settings.get_active_base_url();
+    std::string base_url = _settings.resolve_active_base_url();
 
     json body = {
         {"model", model},
@@ -873,7 +966,7 @@ std::string standalone_ai_client_t::generate_openrouter(
     };
 
     std::map<std::string, std::string> headers = _settings.get_active_headers();
-    headers["Authorization"] = "Bearer " + _settings.get_active_api_key();
+    headers["Authorization"] = "Bearer " + resolve_api_key_logged("openrouter");
     headers["X-Title"] = "AiDA Standalone";
     headers["Content-Type"] = "application/json";
 
@@ -1530,7 +1623,7 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
         }
     }
 
-    std::string base_url = _settings.get_active_base_url();
+    std::string base_url = _settings.resolve_active_base_url();
     std::string model    = _settings.get_active_model();
     diag::log_tagged_fmt("chat",
         "anthropic_enter base=%.80s model=%.80s tools=%zu",
@@ -1583,7 +1676,7 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
     }
 
     std::map<std::string, std::string> headers = _settings.get_active_headers();
-    const std::string anthropic_api_key = _settings.get_active_api_key();
+    const std::string anthropic_api_key = resolve_api_key_logged("anthropic_tools");
     if (!anthropic_api_key.empty())
         headers["x-api-key"] = anthropic_api_key;
     headers["anthropic-version"]  = "2023-06-01";
@@ -1774,7 +1867,7 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
     using json = nlohmann::json;
     ai_generation_result_t result;
 
-    std::string base_url = _settings.get_active_base_url();
+    std::string base_url = _settings.resolve_active_base_url();
     std::string model    = clean_model_name(_settings.get_active_model());
 
     json oai_messages = convert_messages_for_openai(messages, system_prompt);
@@ -1819,7 +1912,7 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
 
     std::map<std::string, std::string> openai_headers = _settings.get_active_headers();
     openai_headers["Content-Type"] = "application/json";
-    openai_headers["Authorization"] = "Bearer " + _settings.get_active_api_key();
+    openai_headers["Authorization"] = "Bearer " + resolve_api_key_logged("openai_tools");
 
     if (!oai_store_key.empty()) {
         const std::string provider_id = (oai_kind == "openai_codex") ? std::string("openai-codex") : std::string("openai");
@@ -2046,9 +2139,9 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
     using json = nlohmann::json;
     ai_generation_result_t result;
 
-    std::string base_url = _settings.get_active_base_url();
+    std::string base_url = _settings.resolve_active_base_url();
     std::string model    = clean_model_name(_settings.get_active_model());
-    std::string api_key  = _settings.get_active_api_key();
+    std::string api_key  = resolve_api_key_logged("gemini_tools");
 
 
     json contents  = convert_messages_for_gemini(messages);
@@ -2264,9 +2357,9 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
     using json = nlohmann::json;
     ai_generation_result_t result;
 
-    std::string base_url = _settings.get_active_base_url();
+    std::string base_url = _settings.resolve_active_base_url();
     std::string model    = clean_model_name(_settings.get_active_model());
-    std::string api_key  = _settings.get_active_api_key();
+    std::string api_key  = resolve_api_key_logged("generic_openai");
     std::string provider = _settings.get_active_profile_kind();
 
     json oai_messages = convert_messages_for_openai(messages, system_prompt);
@@ -2283,7 +2376,21 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
         body["tool_choice"] = "auto";
     }
 
-    body["temperature"] = 0.0;
+    const bool generic_is_copilot =
+        (oauth_store_key_for_profile_kind(provider) == "github-copilot");
+    const bool copilot_reasoning_model =
+        generic_is_copilot && aida::provider::transforms::copilot_uses_responses_api(model);
+
+    if (copilot_reasoning_model) {
+        if (_settings.enable_reasoning && !_settings.reasoning_effort.empty()) {
+            std::string effort = _settings.reasoning_effort;
+            if (effort == "xhigh") effort = "high";
+            if (effort == "minimal") effort = "low";
+            body["reasoning_effort"] = effort;
+        }
+    } else {
+        body["temperature"] = 0.0;
+    }
 
 
     if (provider == "deepseek" || provider == "deepseek_r1") {
@@ -2316,15 +2423,50 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
         generic_headers["Authorization"] = "Bearer " + api_key;
         generic_headers["HTTP-Referer"] = "https://aida.dev";
         generic_headers["X-Title"] = "AiDA";
-    } else {
+    } else if (!api_key.empty()) {
         generic_headers["Authorization"] = "Bearer " + api_key;
     }
 
     if (!generic_store_key.empty()) {
-        apply_oauth_headers(generic_headers, generic_store_key, generic_store_key, model,
+        // Use the actual provider_id for proper header computation,
+        // matching generate_openai's Copilot handling.
+        std::string oauth_provider_id;
+        if (generic_is_copilot)
+            oauth_provider_id = _settings.selected_provider_id();
+        else if (provider == "openai_codex")
+            oauth_provider_id = "openai-codex";
+        else if (!generic_store_key.empty())
+            oauth_provider_id = generic_store_key;
+        else
+            oauth_provider_id = provider;
+
+        apply_oauth_headers(generic_headers, oauth_provider_id, generic_store_key, model,
                             build_request_context(&body));
+        // If the OAuth layer set a lowercase "authorization" header, remove the
+        // uppercase "Authorization" to avoid duplicate/conflicting headers.
         if (generic_headers.count("authorization") > 0)
             generic_headers.erase("Authorization");
+        // If the OAuth layer set an uppercase "Authorization" and we had an empty
+        // API key, verify we actually have a token. Otherwise the request will fail
+        // silently with an empty bearer.
+        if (api_key.empty() && generic_headers.count("Authorization") > 0) {
+            const std::string& auth_val = generic_headers["Authorization"];
+            if (auth_val == "Bearer " || auth_val == "Bearer") {
+                // OAuth token was not applied - the auth store may be empty or stale.
+                // Try refreshing the token one more time.
+                if (!generic_store_key.empty()) {
+                    diag::log_tagged_fmt("ai",
+                        "generic_openai_empty_oauth_token store_key=%.40s provider=%.40s, forcing refresh",
+                        generic_store_key.c_str(), oauth_provider_id.c_str());
+                    refresh_oauth_if_needed(generic_store_key);
+                    // Re-apply OAuth headers after refresh.
+                    apply_oauth_headers(generic_headers, oauth_provider_id, generic_store_key, model,
+                                        build_request_context(&body));
+                    if (generic_headers.count("authorization") > 0)
+                        generic_headers.erase("Authorization");
+                }
+            }
+        }
     }
 
 
@@ -2346,7 +2488,50 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
     else if (provider == "ollama")
         chat_path = "/api/chat";
 
-    const std::string generic_url = join_host_path(base_url, chat_path);
+    std::string generic_url = join_host_path(base_url, chat_path);
+
+    if (generic_store_key == "github-copilot") {
+        aida::auth::auth_info_t copilot_info;
+        const std::string endpoint_provider = _settings.selected_provider_id();
+        const bool have_info = aida::auth::store::get(generic_store_key, copilot_info);
+        const bool uses_responses = aida::provider::transforms::copilot_uses_responses_api(model);
+        std::string resolved = aida::provider::transforms::resolve_endpoint(endpoint_provider, model, copilot_info);
+
+        const auto responses_pos = resolved.rfind("/responses");
+        if (responses_pos != std::string::npos && responses_pos == resolved.size() - 10)
+            resolved.replace(responses_pos, std::string::npos, "/chat/completions");
+
+        if (!resolved.empty())
+            generic_url = resolved;
+
+        diag::log_tagged_fmt("ai",
+            "copilot endpoint=%.160s responses_api=%d info=%d",
+            generic_url.c_str(), uses_responses ? 1 : 0, have_info ? 1 : 0);
+    }
+
+    // Pre-flight check: for OAuth providers, ensure we have valid credentials
+    // before making the HTTP request. This catches cases where the token
+    // exchange failed or the auth store is empty, preventing silent failures
+    // that appear as infinite "thinking" to the user.
+    if (generic_is_copilot) {
+        bool has_auth = false;
+        if (generic_headers.count("Authorization") > 0) {
+            const std::string& val = generic_headers["Authorization"];
+            has_auth = (val.size() > 7);  // "Bearer " + at least one char
+        }
+        if (!has_auth && generic_headers.count("authorization") > 0) {
+            const std::string& val = generic_headers["authorization"];
+            has_auth = (val.size() > 7);
+        }
+        if (!has_auth) {
+            result.is_error = true;
+            result.text = "Error: GitHub Copilot authentication token is missing or expired. "
+                          "Please sign out and sign in again in Settings > Accounts.";
+            diag::log_tagged("ai", "copilot_preflight_no_auth_token");
+            return result;
+        }
+    }
+
     auto generic_hdr_list = headers_map_to_list(generic_headers, true);
     const std::string generic_body = body.dump();
 

@@ -16,6 +16,7 @@
 #include "clock.hpp"
 #include "transition.hpp"
 #include "components.hpp"
+#include "responsive.hpp"
 #include "blur_layer.hpp"
 #include "brand.hpp"
 #include "avatar.hpp"
@@ -1541,30 +1542,51 @@ namespace auth_view {
 			const float row_gap = 12.f;
 			const float row_w = section_w - pad * 2.f;
 
+			const float glyph_r = 22.f;
+			const float text_x_rel = 18.f + glyph_r * 2.f + 16.f;
+			const float name_fs = aida::ui::components::detail::ui_fs() * 1.08f;
+			const float desc_fs = aida::ui::components::detail::ui_fs() * 0.88f;
+			const float btn_w_full = 156.f;
+			const float btn_h = 32.f;
+			const float btn_min_gap = 12.f;
+			const float right_inset = 14.f;
+
+			const float w_if_inline = row_w - text_x_rel - right_inset - (btn_w_full + btn_min_gap);
+			const bool wrap_btn = (w_if_inline < 150.f);
+			const float card_text_w = wrap_btn
+				? (row_w - text_x_rel - right_inset)
+				: w_if_inline;
+			const float this_row_h = wrap_btn ? (row_h + btn_h + 14.f) : row_h;
+
 			for (size_t i = 0; i < entries.size(); ++i) {
 				const auto& e = entries[i];
 				ImVec2 a(origin_x + pad, cy);
-				ImVec2 b(a.x + row_w, a.y + row_h);
+				ImVec2 b(a.x + row_w, a.y + this_row_h);
+
+				ImGui::SetCursorScreenPos(a);
+				ImGui::BeginGroup();
 
 				dl->AddRectFilled(a, b,
 					aida::ui::with_alpha(th.bg_elevated, 0.85f), 12.f);
 				dl->AddRect(a, b,
 					aida::ui::with_alpha(th.border_subtle, 0.85f), 12.f, 0, 1.f);
 
-				float glyph_r = 22.f;
-				ImVec2 gc(a.x + 18.f + glyph_r, (a.y + b.y) * 0.5f);
+				ImVec2 gc(a.x + 18.f + glyph_r, a.y + 14.f + glyph_r);
 				brand_glyph::render(dl, e.glyph, gc, glyph_r,
 					e.grad_top, e.grad_bot, e.ring, 1.f);
 
-				float text_x = gc.x + glyph_r + 16.f;
+				float text_x = a.x + text_x_rel;
 				dl->AddText(aida::ui::fonts::body_strong(),
-					aida::ui::components::detail::ui_fs() * 1.08f,
+					name_fs,
 					ImVec2(text_x, a.y + 14.f),
 					th.text_primary, e.display_name);
+
+				std::string desc_str = aida::ui::responsive::truncate_to_width(
+					std::string(e.description), aida::ui::fonts::caption(), desc_fs, card_text_w);
 				dl->AddText(aida::ui::fonts::caption(),
-					aida::ui::components::detail::ui_fs() * 0.88f,
+					desc_fs,
 					ImVec2(text_x, a.y + 38.f),
-					th.text_secondary, e.description);
+					th.text_secondary, desc_str.c_str());
 
 				const provider_status_t st = compute_provider_status(e.provider_id);
 				ImGui::SetCursorScreenPos(ImVec2(text_x, a.y + 58.f));
@@ -1580,9 +1602,18 @@ namespace auth_view {
 				else if (e.glyph == brand_glyph::kind_t::github)
 					busy = g_state.copilot_modal_open.load();
 
-				const float btn_w = 156.f;
-				const float btn_h = 32.f;
-				ImVec2 btn_pos(b.x - btn_w - 14.f, a.y + (row_h - btn_h) * 0.5f);
+				float btn_w = btn_w_full;
+				ImVec2 btn_pos;
+				const char* signin_lbl;
+				if (wrap_btn) {
+					btn_w = (card_text_w < btn_w_full)
+						? std::max(110.f, card_text_w * 0.5f) : btn_w_full;
+					btn_pos = ImVec2(text_x, a.y + row_h);
+					signin_lbl = busy ? "Signing in..." : "Sign in";
+				} else {
+					btn_pos = ImVec2(b.x - btn_w - right_inset, a.y + (row_h - btn_h) * 0.5f);
+					signin_lbl = busy ? "Signing in..." : "Sign in with browser";
+				}
 				ImGui::SetCursorScreenPos(btn_pos);
 				ImGui::PushID(static_cast<int>(i));
 				if (authed) {
@@ -1593,8 +1624,7 @@ namespace auth_view {
 						clear_credentials_for(e.provider_id);
 					}
 				} else {
-					const char* lbl = busy ? "Signing in..." : "Sign in with browser";
-					if (aida::ui::button(lbl,
+					if (aida::ui::button(signin_lbl,
 							aida::ui::button_kind_t::primary,
 							aida::ui::size_t_::md,
 							ImVec2(btn_w, btn_h), busy, nullptr, busy)
@@ -1609,8 +1639,16 @@ namespace auth_view {
 				}
 				ImGui::PopID();
 
-				cy += row_h + row_gap;
+				ImGui::SetCursorScreenPos(ImVec2(a.x, b.y));
+				ImGui::Dummy(ImVec2(row_w, 0.f));
+				ImGui::EndGroup();
+
+				cy += this_row_h + row_gap;
 			}
+
+			float consumed = cy - origin_y;
+			ImGui::SetCursorScreenPos(ImVec2(origin_x, origin_y));
+			ImGui::Dummy(ImVec2(section_w, consumed));
 
 			(void)section_h;
 		}

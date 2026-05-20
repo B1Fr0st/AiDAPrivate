@@ -383,7 +383,6 @@ namespace settings_overlay {
 
 		inline void render_tab_mcp_servers(float content_w, float content_h)
 		{
-			(void)content_w;
 			auto& s = state();
 			const auto& th = aida::ui::resolved();
 			const float dt = aida::ui::clock::dt();
@@ -391,6 +390,8 @@ namespace settings_overlay {
 			ImGui::PushFont(aida::ui::fonts::lg());
 			ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.f, 8.f));
 			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 7.f));
+
+			const ImVec2 mcp_tab_origin = ImGui::GetCursorScreenPos();
 
 			{
 				ImDrawList* hdl = ImGui::GetWindowDrawList();
@@ -559,10 +560,46 @@ namespace settings_overlay {
 
 			ImGui::EndChild();
 
-			float detail_h = list_h;
+			const float footer_avail = ImGui::GetContentRegionAvail().x;
+			const float btn_sep = 8.f;
+			const bool btn_narrow = footer_avail < 440.f;
+			const char* lbl_add    = "+ Add Server";
+			const char* lbl_apply  = btn_narrow ? "Apply" : "Apply Changes";
+			const char* lbl_remove = btn_narrow ? "Remove" : "Remove Selected";
+			const char* lbl_market = btn_narrow ? "Market..." : "Marketplace...";
+
+			ImFont* mcp_btn_font = ImGui::GetFont();
+			const float mcp_btn_fs = aida::ui::components::detail::ui_fs();
+			auto mcp_bw = [&](const char* lbl) -> float {
+				float tw = mcp_btn_font->CalcTextSizeA(mcp_btn_fs, FLT_MAX, 0.f, lbl).x;
+				return tw + 24.f;
+			};
+			const float w_add    = std::max(mcp_bw(lbl_add), 90.f);
+			const float w_apply  = std::max(mcp_bw(lbl_apply), 90.f);
+			const float w_remove = std::max(mcp_bw(lbl_remove), 90.f);
+			const float w_market = std::max(mcp_bw(lbl_market), 90.f);
+			const float btn_total_w = w_add + w_apply + w_remove + w_market + btn_sep * 3.f;
+			const bool btn_wrap = (footer_avail < btn_total_w);
+
+			int btn_rows = 1;
+			{
+				float cx = 0.f;
+				int rows = 1;
+				auto adv = [&](float w) {
+					if (cx <= 0.f) { cx = w; return; }
+					if (btn_wrap && (cx + btn_sep + w) > footer_avail) { cx = w; ++rows; }
+					else cx += btn_sep + w;
+				};
+				adv(w_add); adv(w_apply); adv(w_remove); adv(w_market);
+				btn_rows = rows;
+			}
+			const float footer_h = btn_rows * 36.f + (btn_rows - 1) * btn_sep + 12.f + 6.f;
+
+			float detail_h;
 			if (stack_vertical) {
-				detail_h = (std::max)(content_h * 0.55f - 4.f, 240.f);
+				detail_h = (std::max)(content_h * 0.55f - 4.f - footer_h, 200.f);
 			} else {
+				detail_h = (std::max)(list_h - footer_h, 160.f);
 				ImGui::SameLine();
 			}
 			ImGui::BeginChild("##mcp_detail", ImVec2(0, detail_h), false,
@@ -638,18 +675,13 @@ namespace settings_overlay {
 
 			ImGui::Dummy(ImVec2(0, 12.f));
 
-			float btn_row_avail = ImGui::GetContentRegionAvail().x;
-			float btn_total_w = 170.f + 10.f + 240.f + 10.f + 170.f + 18.f + 160.f;
-			bool btn_wrap = (btn_row_avail < btn_total_w);
 			float btn_cursor_x = 0.f;
-			float btn_sep = 10.f;
-
 			auto place_button = [&](float bw) -> bool {
 				if (btn_cursor_x <= 0.f) {
 					btn_cursor_x = bw;
 					return false;
 				}
-				if (btn_wrap && (btn_cursor_x + btn_sep + bw) > btn_row_avail) {
+				if (btn_wrap && (btn_cursor_x + btn_sep + bw) > footer_avail) {
 					btn_cursor_x = bw;
 					return false;
 				}
@@ -657,11 +689,11 @@ namespace settings_overlay {
 				return true;
 			};
 
-			if (place_button(170.f)) ImGui::SameLine(0.f, btn_sep);
-			if (aida::ui::button("+ Add Server",
+			if (place_button(w_add)) ImGui::SameLine(0.f, btn_sep);
+			if (aida::ui::button(lbl_add,
 					aida::ui::button_kind_t::primary,
 					aida::ui::size_t_::md,
-					ImVec2(170.f, 36.f))) {
+					ImVec2(w_add, 36.f))) {
 				mcp_client_server_t srv;
 				srv.name = "New Server";
 				srv.url = "http://localhost:3001";
@@ -670,11 +702,11 @@ namespace settings_overlay {
 				refresh_buf();
 				g_sa_settings.save();
 			}
-			if (place_button(240.f)) ImGui::SameLine(0.f, btn_sep);
-			if (aida::ui::button("Apply Connection Changes",
+			if (place_button(w_apply)) ImGui::SameLine(0.f, btn_sep);
+			if (aida::ui::button(lbl_apply,
 					aida::ui::button_kind_t::secondary,
 					aida::ui::size_t_::md,
-					ImVec2(240.f, 36.f))) {
+					ImVec2(w_apply, 36.f))) {
 				mgr.disconnect_all();
 				for (const auto& srv : servers) {
 					mcp_client::server_config_t cfg;
@@ -699,11 +731,11 @@ namespace settings_overlay {
 				mgr.connect_all();
 				g_sa_settings.save();
 			}
-			if (place_button(170.f)) ImGui::SameLine(0.f, btn_sep);
-			if (aida::ui::button("Remove Selected",
+			if (place_button(w_remove)) ImGui::SameLine(0.f, btn_sep);
+			if (aida::ui::button(lbl_remove,
 					aida::ui::button_kind_t::destructive,
 					aida::ui::size_t_::md,
-					ImVec2(170.f, 36.f)) &&
+					ImVec2(w_remove, 36.f)) &&
 				s_sel_index >= 0 && s_sel_index < static_cast<int>(servers.size()))
 			{
 				servers.erase(servers.begin() + s_sel_index);
@@ -711,12 +743,17 @@ namespace settings_overlay {
 				refresh_buf();
 				g_sa_settings.save();
 			}
-			if (place_button(160.f)) ImGui::SameLine(0.f, btn_sep);
-			if (aida::ui::button("Marketplace...",
+			if (place_button(w_market)) ImGui::SameLine(0.f, btn_sep);
+			if (aida::ui::button(lbl_market,
 					aida::ui::button_kind_t::accent_gradient,
 					aida::ui::size_t_::md,
-					ImVec2(160.f, 36.f))) {
+					ImVec2(w_market, 36.f))) {
 				aida::mcp_marketplace_view::open();
+			}
+
+			if (footer_avail < 200.f) {
+				aida::ui::responsive::draw_clamp_overlay(mcp_tab_origin,
+					ImVec2(content_w, content_h), "Settings pane too narrow");
 			}
 
 			ImGui::PopStyleVar(2);

@@ -192,6 +192,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
     ImVec2 table_org = ImGui::GetWindowPos();
     const float row_h = 24.f;
+    const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
     const float col_pid = 72.f;
     const float col_port = 80.f;
     const float col_elapsed = 90.f;
@@ -204,12 +205,12 @@ void render(float pos_x, float pos_y, float width, float height,
                       aida::ui::with_alpha(th.panel_header, alpha));
     float cx = table_org.x + 8.f;
     ImU32 hdr_col = aida::ui::with_alpha(th.text_secondary, alpha);
-    dl->AddText(ImVec2(cx, table_org.y + 4.f), hdr_col, "PID");       cx += col_pid;
-    dl->AddText(ImVec2(cx, table_org.y + 4.f), hdr_col, "Proxy");     cx += col_port;
-    dl->AddText(ImVec2(cx, table_org.y + 4.f), hdr_col, "Uptime");    cx += col_elapsed;
-    dl->AddText(ImVec2(cx, table_org.y + 4.f), hdr_col, "Browser");   cx += col_browser;
-    dl->AddText(ImVec2(cx, table_org.y + 4.f), hdr_col, "Profile");   cx += col_profile;
-    dl->AddText(ImVec2(cx, table_org.y + 4.f), hdr_col, "Actions");
+    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "PID");       cx += col_pid;
+    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Proxy");     cx += col_port;
+    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Uptime");    cx += col_elapsed;
+    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Browser");   cx += col_browser;
+    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Profile");   cx += col_profile;
+    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Actions");
 
     ImGui::SetCursorPosY(row_h + 4.f);
 
@@ -230,7 +231,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
         ImU32 txt = aida::ui::with_alpha(r.running ? th.text_primary : th.text_dim, r_alpha);
         ImU32 status_col = aida::ui::with_alpha(r.running ? th.success : th.error, r_alpha);
-        float ty = abs_ry + 4.f;
+        float ty = abs_ry + text_oy;
         float lx = table_org.x + 8.f;
 
         char buf[64];
@@ -249,7 +250,7 @@ void render(float pos_x, float pos_y, float width, float height,
         const char* pp = r.profile_path.c_str();
         dl->AddText(ImVec2(lx, ty), txt, pp); lx += col_profile;
 
-        ImGui::SetCursorScreenPos(ImVec2(lx, abs_ry + 1.f));
+        ImGui::SetCursorScreenPos(ImVec2(lx, abs_ry + (row_h - ImGui::GetFrameHeight()) * 0.5f));
         if (ImGui::SmallButton("Kill")) {
             kill(r.pid);
         }

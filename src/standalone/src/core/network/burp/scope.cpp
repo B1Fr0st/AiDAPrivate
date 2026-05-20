@@ -532,6 +532,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
     ImVec2 table_org = ImGui::GetWindowPos();
     const float row_h = 24.f;
+    const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
     const float col_kind = 64.f;
     const float col_proto = 64.f;
     const float col_port = 56.f;
@@ -544,12 +545,12 @@ void render(float pos_x, float pos_y, float width, float height,
                       aida::ui::with_alpha(th.panel_header, alpha));
     float cx = table_org.x + 8.f;
     ImU32 hdr_col = aida::ui::with_alpha(th.text_secondary, alpha);
-    dl->AddText(ImVec2(cx, table_org.y + 4.f), hdr_col, "Kind");   cx += col_kind;
-    dl->AddText(ImVec2(cx, table_org.y + 4.f), hdr_col, "Proto");  cx += col_proto;
-    dl->AddText(ImVec2(cx, table_org.y + 4.f), hdr_col, "Host");   cx += col_host;
-    dl->AddText(ImVec2(cx, table_org.y + 4.f), hdr_col, "Path");   cx += col_path;
-    dl->AddText(ImVec2(cx, table_org.y + 4.f), hdr_col, "Port");   cx += col_port;
-    dl->AddText(ImVec2(cx, table_org.y + 4.f), hdr_col, "Actions");
+    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Kind");   cx += col_kind;
+    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Proto");  cx += col_proto;
+    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Host");   cx += col_host;
+    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Path");   cx += col_path;
+    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Port");   cx += col_port;
+    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Actions");
 
     ImGui::SetCursorPosY(row_h + 4.f);
 
@@ -579,7 +580,7 @@ void render(float pos_x, float pos_y, float width, float height,
         ImU32 kind_col = (r.kind == rule_kind_t::include) ? aida::ui::with_alpha(th.success, r_alpha)
                                                           : aida::ui::with_alpha(th.error, r_alpha);
         ImU32 txt = aida::ui::with_alpha(r.enabled ? th.text_primary : th.text_dim, r_alpha);
-        float ty = abs_ry + 4.f;
+        float ty = abs_ry + text_oy;
         float lx = table_org.x + 8.f;
         dl->AddText(ImVec2(lx, ty), kind_col, (r.kind == rule_kind_t::include) ? "include" : "exclude");
         lx += col_kind;
@@ -594,7 +595,7 @@ void render(float pos_x, float pos_y, float width, float height,
         dl->AddText(ImVec2(lx, ty), txt, port_buf);
         lx += col_port;
 
-        ImGui::SetCursorScreenPos(ImVec2(lx, abs_ry + 1.f));
+        ImGui::SetCursorScreenPos(ImVec2(lx, abs_ry + (row_h - ImGui::GetFrameHeight()) * 0.5f));
         if (ImGui::SmallButton(r.enabled ? "Disable" : "Enable")) set_rule_enabled(r.id, !r.enabled);
         ImGui::SameLine();
         if (ImGui::SmallButton("Remove")) remove_rule(r.id);

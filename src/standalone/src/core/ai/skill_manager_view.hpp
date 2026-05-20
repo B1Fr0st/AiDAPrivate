@@ -35,7 +35,9 @@
 #include "../ui/motion.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/transition.hpp"
+#include "../ui/responsive.hpp"
 #include "../helpers/globals.h"
+#include "../helpers/diag_log.hpp"
 
 namespace aida {
 namespace skill_manager {
@@ -351,25 +353,37 @@ namespace skill_manager {
 	}
 
 
-	inline void render_toolbar(float root_x, float root_y, float root_w, float toolbar_h)
+	inline float render_toolbar(float root_x, float root_y, float root_w, float toolbar_h)
 	{
 		auto& st = state();
 		const float pad = 10.f;
-		const float search_w = std::max(220.f, (root_w - pad * 6.f) * 0.30f);
-		ImGui::SetCursorScreenPos(ImVec2(root_x + pad, root_y + 2.f));
+		const float gap = 8.f;
+		const float ctl_h = 28.f;
+		const float avail = root_w - pad * 2.f;
+
+		const float search_w = std::max(180.f, (root_w - pad * 6.f) * 0.30f);
+		const float combo_w = 200.f;
+		const float refresh_w = 110.f;
+		const float addurl_w = 80.f;
+		const float url_w_full = 280.f;
+
+		const float left_chain = search_w + gap + combo_w + gap + refresh_w;
+		const float right_chain_full = url_w_full + gap + addurl_w;
+		const bool tb_wrap = (avail < (left_chain + gap + right_chain_full));
+
+		const float row1_y = root_y + 2.f;
+
+		ImGui::SetCursorScreenPos(ImVec2(root_x + pad, row1_y));
 		char search_local[256];
 		std::memcpy(search_local, st.search_buf, sizeof(search_local));
 		if (aida::ui::input_text("##sm_search", search_local, sizeof(search_local),
-				"Filter skills", false, ImVec2(search_w, 28.f))) {
+				"Filter skills", false, ImVec2(search_w, ctl_h))) {
 			std::lock_guard<std::mutex> lk(state_mutex());
 			std::memcpy(st.search_buf, search_local, sizeof(st.search_buf));
 		}
 
-		const float combo_x = root_x + pad * 2.f + search_w;
-		const float combo_w = 200.f;
-		ImGui::SetCursorScreenPos(ImVec2(combo_x, root_y + 4.f));
+		ImGui::SameLine(0.f, gap);
 		ImGui::PushItemWidth(combo_w);
-
 		std::string current_label = st.agent_filter.empty()
 			? std::string("All agents") : st.agent_filter;
 		if (ImGui::BeginCombo("##sm_agent_filter", current_label.c_str())) {
@@ -388,13 +402,12 @@ namespace skill_manager {
 		}
 		ImGui::PopItemWidth();
 
-		const float refresh_x = combo_x + combo_w + pad;
-		ImGui::SetCursorScreenPos(ImVec2(refresh_x, root_y + 2.f));
+		ImGui::SameLine(0.f, gap);
 		bool refreshing_local = st.refreshing;
 		if (aida::ui::button("Refresh##sm",
 				aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::sm,
-				ImVec2(110.f, 28.f),
+				ImVec2(refresh_w, ctl_h),
 				false, nullptr, refreshing_local)) {
 			st.refreshing = true;
 			work_queue::post([]() {
@@ -409,20 +422,27 @@ namespace skill_manager {
 			});
 		}
 
-		const float url_w = 280.f;
-		const float url_x = root_x + root_w - pad - url_w - 80.f;
-		ImGui::SetCursorScreenPos(ImVec2(url_x, root_y + 4.f));
+		float url_w = url_w_full;
+		if (!tb_wrap) {
+			float url_room = avail - left_chain - gap - gap - addurl_w;
+			url_w = std::max(140.f, std::min(url_w_full, url_room));
+			ImGui::SameLine(0.f, gap);
+		} else {
+			ImGui::SetCursorScreenPos(ImVec2(root_x + pad, row1_y + ctl_h + 6.f));
+			url_w = std::max(140.f, std::min(url_w_full, avail - gap - addurl_w));
+		}
+
+		ImGui::BeginGroup();
 		ImGui::PushItemWidth(url_w);
 		ImGui::InputTextWithHint("##sm_add_url", "https://host/index.json",
 			st.add_url_buf, sizeof(st.add_url_buf));
 		ImGui::PopItemWidth();
 
-		const float add_x = root_x + root_w - pad - 70.f;
-		ImGui::SetCursorScreenPos(ImVec2(add_x, root_y + 2.f));
+		ImGui::SameLine(0.f, gap);
 		if (aida::ui::button("Add URL##sm",
 				aida::ui::button_kind_t::primary,
 				aida::ui::size_t_::sm,
-				ImVec2(70.f, 28.f))) {
+				ImVec2(addurl_w, ctl_h))) {
 			std::string url(st.add_url_buf);
 			if (!url.empty()) {
 				if (::aida::skills::add_remote_url(url)) {
@@ -438,6 +458,19 @@ namespace skill_manager {
 				}
 			}
 		}
+		ImGui::EndGroup();
+
+		static bool s_sm_logged_wrap = false;
+		if (tb_wrap && !s_sm_logged_wrap) {
+			s_sm_logged_wrap = true;
+			::diag::log_tagged_fmt("responsive",
+				"skill_manager toolbar wrapped avail=%.0f need=%.0f",
+				avail, left_chain + gap + right_chain_full);
+		} else if (!tb_wrap && s_sm_logged_wrap) {
+			s_sm_logged_wrap = false;
+		}
+
+		return tb_wrap ? (toolbar_h + ctl_h + 6.f) : toolbar_h;
 	}
 
 	inline void render_tab_strip(float x, float y, float w, float dt)
@@ -1019,10 +1052,10 @@ namespace skill_manager {
 
 		const float toolbar_h = 34.f;
 		const float pad = 8.f;
-		render_toolbar(root_x, root_y, root_w, toolbar_h);
+		const float tb_used_h = render_toolbar(root_x, root_y, root_w, toolbar_h);
 
-		const float body_y = root_y + toolbar_h + 6.f;
-		const float body_h = root_h - (toolbar_h + 8.f);
+		const float body_y = root_y + tb_used_h + 6.f;
+		const float body_h = root_h - (tb_used_h + 8.f);
 
 		const float left_w = std::max(280.f, root_w * st.list_split);
 		const float right_w = std::max(300.f, root_w * st.detail_split);

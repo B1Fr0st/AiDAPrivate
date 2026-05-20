@@ -96,6 +96,7 @@ namespace output_log {
 namespace menu_bar {
 	inline int  open_menu = -1;
 	inline bool any_open  = false;
+	inline int  suppress_frames = 0;
 }
 
 
@@ -449,6 +450,9 @@ namespace globals
 
 
 		inline bool shortcuts_dialog_open = false;
+
+
+		inline bool test_all_visible = false;
 
 
 		inline bool find_bar_open = false;

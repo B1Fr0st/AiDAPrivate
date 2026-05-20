@@ -14,6 +14,7 @@ struct node_t {
 	float y = 0.f;
 	float width = 200.f;
 	float height = 100.f;
+	float addr_col_w = 80.f;
 	int   layer = -1;
 	bool  is_entry = false;
 };

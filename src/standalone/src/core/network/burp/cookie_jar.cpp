@@ -663,6 +663,7 @@ void render_table(state_t& st, const ImVec2& origin, float width, float height, 
     const auto& th = aida::ui::resolved();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float row_h = 22.f;
+    const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
 
     const float col_host   = 220.f;
     const float col_name   = 180.f;
@@ -676,13 +677,13 @@ void render_table(state_t& st, const ImVec2& origin, float width, float height, 
                       aida::ui::with_alpha(th.panel_header, alpha));
     float cx = origin.x + 8.f;
     ImU32 hdr_col = aida::ui::with_alpha(th.text_secondary, alpha);
-    dl->AddText(ImVec2(cx, origin.y + 4.f), hdr_col, "Host");      cx += col_host;
-    dl->AddText(ImVec2(cx, origin.y + 4.f), hdr_col, "Name");      cx += col_name;
-    dl->AddText(ImVec2(cx, origin.y + 4.f), hdr_col, "Value");     cx += col_value;
-    dl->AddText(ImVec2(cx, origin.y + 4.f), hdr_col, "Secure");    cx += col_secure;
-    dl->AddText(ImVec2(cx, origin.y + 4.f), hdr_col, "HttpOnly");  cx += col_http;
-    dl->AddText(ImVec2(cx, origin.y + 4.f), hdr_col, "SameSite");  cx += col_same;
-    dl->AddText(ImVec2(cx, origin.y + 4.f), hdr_col, "Expires");
+    dl->AddText(ImVec2(cx, origin.y + text_oy), hdr_col, "Host");      cx += col_host;
+    dl->AddText(ImVec2(cx, origin.y + text_oy), hdr_col, "Name");      cx += col_name;
+    dl->AddText(ImVec2(cx, origin.y + text_oy), hdr_col, "Value");     cx += col_value;
+    dl->AddText(ImVec2(cx, origin.y + text_oy), hdr_col, "Secure");    cx += col_secure;
+    dl->AddText(ImVec2(cx, origin.y + text_oy), hdr_col, "HttpOnly");  cx += col_http;
+    dl->AddText(ImVec2(cx, origin.y + text_oy), hdr_col, "SameSite");  cx += col_same;
+    dl->AddText(ImVec2(cx, origin.y + text_oy), hdr_col, "Expires");
 
     ImGui::SetCursorPosY(row_h + 4.f);
 
@@ -748,7 +749,7 @@ void render_table(state_t& st, const ImVec2& origin, float width, float height, 
 
         ImU32 txt = aida::ui::with_alpha(th.text_primary, r_alpha);
         float lx = origin.x + 8.f;
-        const float ty = abs_ry + 4.f;
+        const float ty = abs_ry + text_oy;
         dl->AddText(ImVec2(lx, ty), txt, host.c_str()); lx += col_host;
         dl->AddText(ImVec2(lx, ty), txt, c.name.c_str()); lx += col_name;
 

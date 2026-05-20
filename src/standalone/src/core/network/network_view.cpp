@@ -977,6 +977,7 @@ static void render_connections(state_t& state, float x, float y, float w, float 
     ImVec2 org = ImGui::GetWindowPos();
     ImVec2 cursor = ImGui::GetCursorPos();
     float row_h = 22.f;
+    const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
     float hdr_y = org.y + cursor.y;
 
 
@@ -1001,11 +1002,11 @@ static void render_connections(state_t& state, float x, float y, float w, float 
 
     float cx = org.x + 8.f;
     ImU32 hdr_col = aida::ui::with_alpha(th.text_secondary, alpha);
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "PID");    cx += col_pid;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "Proto");  cx += col_proto;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "State");  cx += col_state;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "Local");  cx += col_local;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "Remote");
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "PID");    cx += col_pid;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Proto");  cx += col_proto;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "State");  cx += col_state;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Local");  cx += col_local;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Remote");
 
     ImGui::SetCursorPosY(cursor.y + row_h + 4.f);
 
@@ -1088,8 +1089,8 @@ static void render_connections(state_t& state, float x, float y, float w, float 
         cx = list_org.x + 8.f + row_xoff;
         char pid_buf[16];
         snprintf(pid_buf, sizeof(pid_buf), "%u", c.pid);
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), txt_col, pid_buf);                            cx += col_pid;
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), txt_col, protocol_name(c.protocol));          cx += col_proto;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, pid_buf);                            cx += col_pid;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, protocol_name(c.protocol));          cx += col_proto;
 
 
         aida::ui::pill_kind_t state_kind = tcp_state_to_pill(c.state);
@@ -1118,8 +1119,8 @@ static void render_connections(state_t& state, float x, float y, float w, float 
         dl->AddText(pill_font, pill_fs, ImVec2(pill_x + pill_pad, pill_y + (pill_h - pill_fs) * 0.5f),
                      aida::ui::with_alpha(pill_col, r_alpha), sname);
         cx += col_state;
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), txt_col, local_str.c_str());                  cx += col_local;
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), txt_col, remote_str.c_str());
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, local_str.c_str());                  cx += col_local;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, remote_str.c_str());
 
         conn_visible_row++;
         ImGui::SetCursorPosY(ry + row_h);
@@ -1633,6 +1634,7 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
     ImVec2 org = ImGui::GetWindowPos();
     ImVec2 cursor = ImGui::GetCursorPos();
     float row_h = 22.f;
+    const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
     float hdr_y = org.y + cursor.y;
 
     float col_pid = 64.f, col_type = 60.f, col_rcode = 64.f, col_ttl = 56.f;
@@ -1646,12 +1648,12 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
 
     float cx = org.x + 8.f;
     ImU32 hdr_col = aida::ui::with_alpha(th.text_secondary, alpha);
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "PID");     cx += col_pid;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "Type");    cx += col_type;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "Domain");  cx += col_domain;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "Address"); cx += col_addr;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "RCode");   cx += col_rcode;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "TTL");
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "PID");     cx += col_pid;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Type");    cx += col_type;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Domain");  cx += col_domain;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Address"); cx += col_addr;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "RCode");   cx += col_rcode;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "TTL");
 
     ImGui::SetCursorPosY(cursor.y + row_h + 4.f);
     dl->AddLine(ImVec2(org.x, hdr_y + row_h - 1.f), ImVec2(org.x + w, hdr_y + row_h - 1.f),
@@ -1742,28 +1744,28 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
         char buf[16];
 
         snprintf(buf, sizeof(buf), "%u", d.pid);
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), txt_col, buf); cx += col_pid;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, buf); cx += col_pid;
 
         const char* qtype = d.query_type == 1 ? "A" : d.query_type == 28 ? "AAAA" : d.query_type == 5 ? "CNAME" : "?";
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), aida::ui::with_alpha(th.info, r_alpha), qtype);
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), aida::ui::with_alpha(th.info, r_alpha), qtype);
         cx += col_type;
 
 
         std::string domain = d.domain;
         if (domain.size() > 40) domain = domain.substr(0, 37) + "...";
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), aida::ui::with_alpha(th.accent_u32, r_alpha),
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), aida::ui::with_alpha(th.accent_u32, r_alpha),
                      domain.c_str()); cx += col_domain;
 
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), txt_col, d.resolved_addr.c_str()); cx += col_addr;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, d.resolved_addr.c_str()); cx += col_addr;
 
         snprintf(buf, sizeof(buf), "%u", d.response_code);
         ImU32 rcode_col = d.response_code == 0
             ? aida::ui::with_alpha(th.success, r_alpha)
             : aida::ui::with_alpha(th.error, r_alpha);
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), rcode_col, buf); cx += col_rcode;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), rcode_col, buf); cx += col_rcode;
 
         snprintf(buf, sizeof(buf), "%u", d.ttl);
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), aida::ui::with_alpha(th.text_dim, r_alpha), buf);
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), aida::ui::with_alpha(th.text_dim, r_alpha), buf);
 
         dns_visible_row++;
     }
@@ -1896,6 +1898,7 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
     ImVec2 org = ImGui::GetWindowPos();
     ImVec2 cursor = ImGui::GetCursorPos();
     float row_h = 22.f;
+    const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
     float hdr_y = org.y + cursor.y;
 
     float col_id = 50.f, col_method = 64.f, col_status = 60.f, col_lat = 64.f, col_size = 64.f, col_tls = 36.f;
@@ -1908,14 +1911,14 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
 
     float cx = org.x + 8.f;
     ImU32 hdr_col = aida::ui::with_alpha(th.text_secondary, alpha);
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "#");       cx += col_id;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "Method");  cx += col_method;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "Host");    cx += col_host;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "Path");    cx += col_path;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "Status");  cx += col_status;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "Time");    cx += col_lat;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "Size");    cx += col_size;
-    dl->AddText(ImVec2(cx, hdr_y + 4.f), hdr_col, "TLS");
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "#");       cx += col_id;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Method");  cx += col_method;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Host");    cx += col_host;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Path");    cx += col_path;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Status");  cx += col_status;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Time");    cx += col_lat;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Size");    cx += col_size;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "TLS");
 
     ImGui::SetCursorPosY(cursor.y + row_h + 4.f);
     dl->AddLine(ImVec2(org.x, hdr_y + row_h - 1.f), ImVec2(org.x + w, hdr_y + row_h - 1.f),
@@ -1990,23 +1993,23 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
 
         char buf[32];
         snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(ex.id));
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), dim_col, buf);
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), dim_col, buf);
         cx += col_id;
 
         ImU32 method_col = ui_anim::http_method_color(ex.request.method.c_str(), r_alpha);
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), method_col, ex.request.method.c_str()); cx += col_method;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), method_col, ex.request.method.c_str()); cx += col_method;
 
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), txt_col, ex.target_host.c_str()); cx += col_host;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, ex.target_host.c_str()); cx += col_host;
 
         std::string path = ex.request.uri;
         if (path.size() > 50) path = path.substr(0, 47) + "...";
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), txt_col, path.c_str()); cx += col_path;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, path.c_str()); cx += col_path;
 
 
         if (ex.response.status_code > 0) {
             ImU32 status_col = aida::ui::with_alpha(status_code_color(ex.response.status_code), r_alpha);
             snprintf(buf, sizeof(buf), "%d", ex.response.status_code);
-            dl->AddText(ImVec2(cx, abs_ry + 3.f), status_col, buf);
+            dl->AddText(ImVec2(cx, abs_ry + text_oy), status_col, buf);
         } else {
             const char* st = "...";
             ImU32 st_col = dim_col;
@@ -2017,16 +2020,16 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
                 st = "ERR";
                 st_col = aida::ui::with_alpha(th.error, r_alpha);
             }
-            dl->AddText(ImVec2(cx, abs_ry + 3.f), st_col, st);
+            dl->AddText(ImVec2(cx, abs_ry + text_oy), st_col, st);
         }
         cx += col_status;
 
         snprintf(buf, sizeof(buf), "%llums", static_cast<unsigned long long>(ex.latency_ms));
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), txt_col, buf); cx += col_lat;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, buf); cx += col_lat;
 
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), txt_col, format_bytes(ex.response_size).c_str()); cx += col_size;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, format_bytes(ex.response_size).c_str()); cx += col_size;
 
-        dl->AddText(ImVec2(cx, abs_ry + 3.f),
+        dl->AddText(ImVec2(cx, abs_ry + text_oy),
             ex.is_tls ? aida::ui::with_alpha(th.success, r_alpha)
                       : aida::ui::with_alpha(th.text_dim, r_alpha),
             ex.is_tls ? "TLS" : "-");
@@ -2295,6 +2298,7 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
     ImVec2 org = ImGui::GetWindowPos();
     ImVec2 cursor = ImGui::GetCursorPos();
     float row_h = 26.f;
+    const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
     float hdr_y = org.y + cursor.y;
 
     float col_pid = 64.f, col_name = 160.f, col_spark = 130.f;
@@ -2307,13 +2311,13 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
 
     float cx = org.x + 8.f;
     ImU32 hdr_col = aida::ui::with_alpha(th.text_secondary, alpha);
-    dl->AddText(ImVec2(cx, hdr_y + 6.f), hdr_col, "PID");       cx += col_pid;
-    dl->AddText(ImVec2(cx, hdr_y + 6.f), hdr_col, "Process");   cx += col_name;
-    dl->AddText(ImVec2(cx, hdr_y + 6.f), hdr_col, "In");        cx += col_in;
-    dl->AddText(ImVec2(cx, hdr_y + 6.f), hdr_col, "Out");       cx += col_out;
-    dl->AddText(ImVec2(cx, hdr_y + 6.f), hdr_col, "In Rate");   cx += col_rin;
-    dl->AddText(ImVec2(cx, hdr_y + 6.f), hdr_col, "Out Rate");  cx += col_rout;
-    dl->AddText(ImVec2(cx, hdr_y + 6.f), hdr_col, "Trend");
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "PID");       cx += col_pid;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Process");   cx += col_name;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "In");        cx += col_in;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Out");       cx += col_out;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "In Rate");   cx += col_rin;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Out Rate");  cx += col_rout;
+    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Trend");
 
     ImGui::SetCursorPosY(cursor.y + row_h + 4.f);
     dl->AddLine(ImVec2(org.x, hdr_y + row_h - 1.f), ImVec2(org.x + w, hdr_y + row_h - 1.f),
@@ -2373,17 +2377,17 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
 
         char buf[32];
         snprintf(buf, sizeof(buf), "%u", b.pid);
-        dl->AddText(ImVec2(cx, abs_ry + 5.f), txt_col, buf); cx += col_pid;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, buf); cx += col_pid;
 
         std::string name = b.process_name.empty() ? "-" : b.process_name;
-        dl->AddText(ImVec2(cx, abs_ry + 5.f), txt_col, name.c_str()); cx += col_name;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, name.c_str()); cx += col_name;
 
-        dl->AddText(ImVec2(cx, abs_ry + 5.f), aida::ui::with_alpha(th.info, alpha),
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), aida::ui::with_alpha(th.info, alpha),
             format_bytes(b.bytes_in).c_str()); cx += col_in;
-        dl->AddText(ImVec2(cx, abs_ry + 5.f), aida::ui::with_alpha(th.warning, alpha),
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), aida::ui::with_alpha(th.warning, alpha),
             format_bytes(b.bytes_out).c_str()); cx += col_out;
-        dl->AddText(ImVec2(cx, abs_ry + 5.f), txt_col, format_rate(b.rate_in).c_str()); cx += col_rin;
-        dl->AddText(ImVec2(cx, abs_ry + 5.f), txt_col, format_rate(b.rate_out).c_str()); cx += col_rout;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, format_rate(b.rate_in).c_str()); cx += col_rin;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, format_rate(b.rate_out).c_str()); cx += col_rout;
 
         int hist_count = std::min(b.history_index, 64);
         if (hist_count > 1) {
@@ -2747,6 +2751,7 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
     ImVec2 list_org = ImGui::GetWindowPos();
     ImVec2 list_sz  = ImGui::GetWindowSize();
     float row_h = 22.f;
+    const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
 
     dl->AddRectFilled(list_org, ImVec2(list_org.x + list_sz.x, list_org.y + list_sz.y),
                       aida::ui::with_alpha(th.panel_bg, alpha * 0.75f), 8.f);
@@ -2809,19 +2814,19 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
 
         char id_buf[16];
         snprintf(id_buf, sizeof(id_buf), "%llu", static_cast<unsigned long long>(ex.id));
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), txt_col, id_buf); cx += col_id;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, id_buf); cx += col_id;
 
         ImU32 method_col = ui_anim::http_method_color(ex.request.method.c_str(), alpha);
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), method_col, ex.request.method.c_str()); cx += col_method;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), method_col, ex.request.method.c_str()); cx += col_method;
 
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), txt_col, ex.target_host.c_str()); cx += col_host;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, ex.target_host.c_str()); cx += col_host;
 
         std::string path_display = ex.request.uri.size() > 50 ? ex.request.uri.substr(0, 47) + "..." : ex.request.uri;
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), txt_col, path_display.c_str()); cx += col_path;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, path_display.c_str()); cx += col_path;
 
         char size_buf[32];
         snprintf(size_buf, sizeof(size_buf), "%zu B", ex.raw_request.size());
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), aida::ui::with_alpha(th.text_dim, alpha), size_buf);
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), aida::ui::with_alpha(th.text_dim, alpha), size_buf);
 
         ImGui::SetCursorPosY(ry + row_h);
     }
@@ -3061,6 +3066,7 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
     ImVec2 org = ImGui::GetWindowPos();
     ImVec2 cursor = ImGui::GetCursorPos();
     float row_h = 22.f;
+    const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
     float hdr_h = std::max(28.f, ImGui::GetFontSize() + 9.f);
     float hdr_y = org.y + cursor.y;
 
@@ -3144,12 +3150,12 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
             label_col = aida::ui::with_alpha(th.success, r_alpha);
 
         cx = list_org.x + 8.f;
-        dl->AddText(ImVec2(cx, abs_ry + 3.f),
+        dl->AddText(ImVec2(cx, abs_ry + text_oy),
                      aida::ui::with_alpha(th.text_dim, r_alpha),
                      format_timestamp(e.timestamp).c_str());
         cx += col_time;
 
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), label_col, e.label.c_str());
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), label_col, e.label.c_str());
         cx += col_label;
 
         ImFont* mono_font = aida::ui::fonts::code();
@@ -3158,10 +3164,10 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
             ImGui::PushFont(mono_font);
             pushed = true;
         }
-        dl->AddText(ImVec2(cx, abs_ry + 3.f),
+        dl->AddText(ImVec2(cx, abs_ry + text_oy),
                      aida::ui::with_alpha(th.text_secondary, r_alpha), cr_short.c_str());
         cx += col_cr;
-        dl->AddText(ImVec2(cx, abs_ry + 3.f),
+        dl->AddText(ImVec2(cx, abs_ry + text_oy),
                      aida::ui::with_alpha(th.text_secondary, r_alpha), sec_short.c_str());
         if (pushed) ImGui::PopFont();
 
@@ -4136,6 +4142,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
     ImDrawList* dl   = ImGui::GetWindowDrawList();
     ImVec2 list_org  = ImGui::GetWindowPos();
     float row_h      = 22.f;
+    const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
 
 
     float c_idx     = 50.f;
@@ -4159,16 +4166,17 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
     {
         float cx = cx0;
         char hbuf[32];
-        dl->AddText(ImVec2(cx, cy), hdr_col, "#"); cx += c_idx;
+        float hdr_ty = cy - 4.f + (row_h - ImGui::GetTextLineHeight()) * 0.5f;
+        dl->AddText(ImVec2(cx, hdr_ty), hdr_col, "#"); cx += c_idx;
         for (size_t pi = 0; pi < max_cols; pi++) {
             snprintf(hbuf, sizeof(hbuf), "Payload %zu", pi + 1);
-            dl->AddText(ImVec2(cx, cy), hdr_col, hbuf); cx += c_payload;
+            dl->AddText(ImVec2(cx, hdr_ty), hdr_col, hbuf); cx += c_payload;
         }
-        dl->AddText(ImVec2(cx, cy), hdr_col, "Status");  cx += c_status;
-        dl->AddText(ImVec2(cx, cy), hdr_col, "Length");  cx += c_len;
-        dl->AddText(ImVec2(cx, cy), hdr_col, "Time");    cx += c_time;
-        dl->AddText(ImVec2(cx, cy), hdr_col, "Match");   cx += c_match;
-        if (show_extract) dl->AddText(ImVec2(cx, cy), hdr_col, "Extracted");
+        dl->AddText(ImVec2(cx, hdr_ty), hdr_col, "Status");  cx += c_status;
+        dl->AddText(ImVec2(cx, hdr_ty), hdr_col, "Length");  cx += c_len;
+        dl->AddText(ImVec2(cx, hdr_ty), hdr_col, "Time");    cx += c_time;
+        dl->AddText(ImVec2(cx, hdr_ty), hdr_col, "Match");   cx += c_match;
+        if (show_extract) dl->AddText(ImVec2(cx, hdr_ty), hdr_col, "Extracted");
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + row_h + 4.f);
     }
 
@@ -4199,7 +4207,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
         char buf[64];
 
         snprintf(buf, sizeof(buf), "%d", fr.index);
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), txt_col, buf); cx += c_idx;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, buf); cx += c_idx;
 
 
         for (size_t pi = 0; pi < max_cols; pi++) {
@@ -4208,30 +4216,30 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
                 pl = fr.payloads[pi].size() > 28
                     ? fr.payloads[pi].substr(0, 28) + ".." : fr.payloads[pi];
             }
-            dl->AddText(ImVec2(cx, abs_ry + 3.f), txt_col, pl.c_str()); cx += c_payload;
+            dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, pl.c_str()); cx += c_payload;
         }
 
 
         ImU32 sc_col = aida::ui::with_alpha(status_code_color(fr.status_code), alpha);
         snprintf(buf, sizeof(buf), "%d", fr.status_code);
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), sc_col, buf); cx += c_status;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), sc_col, buf); cx += c_status;
 
         snprintf(buf, sizeof(buf), "%zu", fr.response_len);
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), txt_col, buf); cx += c_len;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, buf); cx += c_len;
 
         snprintf(buf, sizeof(buf), "%llums",
                  static_cast<unsigned long long>(fr.latency_ms));
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), txt_col, buf); cx += c_time;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, buf); cx += c_time;
 
         if (fr.match)
-            dl->AddText(ImVec2(cx, abs_ry + 3.f),
+            dl->AddText(ImVec2(cx, abs_ry + text_oy),
                          aida::ui::with_alpha(th.success, alpha), "YES");
         cx += c_match;
 
         if (show_extract && !fr.extracted_value.empty()) {
             std::string ev = fr.extracted_value.size() > 20
                 ? fr.extracted_value.substr(0, 20) + ".." : fr.extracted_value;
-            dl->AddText(ImVec2(cx, abs_ry + 3.f),
+            dl->AddText(ImVec2(cx, abs_ry + text_oy),
                          aida::ui::with_alpha(th.warning, alpha), ev.c_str());
         }
 
@@ -4279,6 +4287,7 @@ static void render_websocket(state_t& state, float x, float y, float w, float h,
     float header_y = ty + 38.f;
 
     float row_h = 22.f;
+    const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
     dl->AddRectFilled(ImVec2(origin.x, origin.y + header_y - 4.f),
                       ImVec2(origin.x + w, origin.y + header_y + row_h - 4.f),
                       aida::ui::with_alpha(th.panel_header, alpha));
@@ -4286,11 +4295,12 @@ static void render_websocket(state_t& state, float x, float y, float w, float h,
 
     float c_dir = 36.f, c_host = 220.f, c_opcode = 70.f, c_size = 80.f;
     float cx = 8.f;
-    dl->AddText(ImVec2(origin.x + cx, origin.y + header_y), dim_col, "Dir"); cx += c_dir;
-    dl->AddText(ImVec2(origin.x + cx, origin.y + header_y), dim_col, "Host"); cx += c_host;
-    dl->AddText(ImVec2(origin.x + cx, origin.y + header_y), dim_col, "Opcode"); cx += c_opcode;
-    dl->AddText(ImVec2(origin.x + cx, origin.y + header_y), dim_col, "Size"); cx += c_size;
-    dl->AddText(ImVec2(origin.x + cx, origin.y + header_y), dim_col, "Preview");
+    float ws_hdr_ty = origin.y + header_y - 4.f + text_oy;
+    dl->AddText(ImVec2(origin.x + cx, ws_hdr_ty), dim_col, "Dir"); cx += c_dir;
+    dl->AddText(ImVec2(origin.x + cx, ws_hdr_ty), dim_col, "Host"); cx += c_host;
+    dl->AddText(ImVec2(origin.x + cx, ws_hdr_ty), dim_col, "Opcode"); cx += c_opcode;
+    dl->AddText(ImVec2(origin.x + cx, ws_hdr_ty), dim_col, "Size"); cx += c_size;
+    dl->AddText(ImVec2(origin.x + cx, ws_hdr_ty), dim_col, "Preview");
 
     float list_y = header_y + row_h;
     float list_h = h * 0.55f;
@@ -4343,20 +4353,20 @@ static void render_websocket(state_t& state, float x, float y, float w, float h,
         ImU32 dir_col = fr.is_outbound
             ? aida::ui::with_alpha(th.warning, alpha)
             : aida::ui::with_alpha(th.info, alpha);
-        dl->AddText(ImVec2(ImGui::GetWindowPos().x + cx, abs_ry + 3.f), dir_col,
+        dl->AddText(ImVec2(ImGui::GetWindowPos().x + cx, abs_ry + text_oy), dir_col,
             fr.is_outbound ? "\xe2\x86\x91" : "\xe2\x86\x93"); cx += c_dir;
 
         char buf[512];
         snprintf(buf, sizeof(buf), "%s:%u", fr.host.c_str(), fr.port);
-        dl->AddText(ImVec2(ImGui::GetWindowPos().x + cx, abs_ry + 3.f), txt_col, buf); cx += c_host;
+        dl->AddText(ImVec2(ImGui::GetWindowPos().x + cx, abs_ry + text_oy), txt_col, buf); cx += c_host;
 
         snprintf(buf, sizeof(buf), "0x%02X", fr.opcode);
-        dl->AddText(ImVec2(ImGui::GetWindowPos().x + cx, abs_ry + 3.f), dim_col, buf); cx += c_opcode;
+        dl->AddText(ImVec2(ImGui::GetWindowPos().x + cx, abs_ry + text_oy), dim_col, buf); cx += c_opcode;
 
         snprintf(buf, sizeof(buf), "%zu", fr.payload.size());
-        dl->AddText(ImVec2(ImGui::GetWindowPos().x + cx, abs_ry + 3.f), txt_col, buf); cx += c_size;
+        dl->AddText(ImVec2(ImGui::GetWindowPos().x + cx, abs_ry + text_oy), txt_col, buf); cx += c_size;
 
-        dl->AddText(ImVec2(ImGui::GetWindowPos().x + cx, abs_ry + 3.f), dim_col,
+        dl->AddText(ImVec2(ImGui::GetWindowPos().x + cx, abs_ry + text_oy), dim_col,
             fr.preview.empty() ? "(empty)" : fr.preview.c_str());
 
         ImGui::SetCursorPosY(ry + row_h);

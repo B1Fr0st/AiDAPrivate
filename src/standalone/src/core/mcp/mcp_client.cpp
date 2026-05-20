@@ -15,6 +15,7 @@
 #include "event_bus.hpp"
 #include "anti-tamper/webhook.hpp"
 #include "../infra/work_queue.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <httplib.h>
 #include <openssl/evp.h>
@@ -1250,10 +1251,14 @@ std::vector<remote_tool_t> client_t::list_tools()
 
 call_result_t client_t::call_tool(const std::string& tool_name, const json& arguments)
 {
+    diag::log_tagged_fmt("mcp", "call_tool enter server='%s' tool='%s'",
+        _cfg.name.c_str(), tool_name.c_str());
     std::lock_guard<std::mutex> lk(_mtx);
 
-    if (_state != connection_state_t::connected)
+    if (_state != connection_state_t::connected) {
+        diag::log_tagged_fmt("mcp", "call_tool FAILED not_connected server='%s'", _cfg.name.c_str());
         return call_result_t::error("Not connected to " + _cfg.name);
+    }
 
     json req = rpc_request("tools/call", {
         {"name", tool_name},
@@ -1262,16 +1267,23 @@ call_result_t client_t::call_tool(const std::string& tool_name, const json& argu
 
     json response;
     if (!send_rpc(response, req)) {
+        diag::log_tagged_fmt("mcp", "call_tool RPC_FAILED server='%s' tool='%s' error='%s'",
+            _cfg.name.c_str(), tool_name.c_str(), _last_error.c_str());
         return call_result_t::error("tools/call failed: " + _last_error);
     }
 
     if (response.contains("error")) {
-        return call_result_t::error(
-            response["error"].value("message", "Tool execution error"));
+        std::string err_msg = response["error"].value("message", "Tool execution error");
+        diag::log_tagged_fmt("mcp", "call_tool ERROR server='%s' tool='%s' msg='%s'",
+            _cfg.name.c_str(), tool_name.c_str(), err_msg.c_str());
+        return call_result_t::error(err_msg);
     }
 
-    if (!response.contains("result"))
+    if (!response.contains("result")) {
+        diag::log_tagged_fmt("mcp", "call_tool EMPTY_RESULT server='%s' tool='%s'",
+            _cfg.name.c_str(), tool_name.c_str());
         return call_result_t::error("Empty result from server");
+    }
 
     const auto& result = response["result"];
 
@@ -1292,9 +1304,14 @@ call_result_t client_t::call_tool(const std::string& tool_name, const json& argu
     }
 
     bool is_error = result.value("isError", false);
-    if (is_error)
+    if (is_error) {
+        diag::log_tagged_fmt("mcp", "call_tool TOOL_ERROR server='%s' tool='%s' text_len=%zu",
+            _cfg.name.c_str(), tool_name.c_str(), text.size());
         return call_result_t::error(text.empty() ? "Tool returned error" : text);
+    }
 
+    diag::log_tagged_fmt("mcp", "call_tool SUCCESS server='%s' tool='%s' text_len=%zu",
+        _cfg.name.c_str(), tool_name.c_str(), text.size());
     return call_result_t::ok(sanitize_utf8(text), data);
 }
 
@@ -2187,12 +2204,16 @@ manager_t::~manager_t() { disconnect_all(); }
 
 void manager_t::add_server(const server_config_t& cfg)
 {
+    diag::log_tagged_fmt("mcp", "add_server name='%s' url='%s' enabled=%d auto_connect=%d",
+        cfg.name.c_str(), cfg.url.c_str(), static_cast<int>(cfg.enabled),
+        static_cast<int>(cfg.auto_connect));
     std::lock_guard<std::mutex> lk(_mtx);
 
 
     for (auto& ep : _entries) {
         if (ep->cfg.name == cfg.name) {
             ep->cfg = cfg;
+            diag::log_tagged_fmt("mcp", "add_server updated_existing name='%s'", cfg.name.c_str());
             return;
         }
     }
@@ -2200,10 +2221,13 @@ void manager_t::add_server(const server_config_t& cfg)
     auto ep = std::make_shared<entry_t>();
     ep->cfg = cfg;
     _entries.push_back(std::move(ep));
+    diag::log_tagged_fmt("mcp", "add_server added_new name='%s' total_servers=%zu",
+        cfg.name.c_str(), _entries.size());
 }
 
 void manager_t::remove_server(const std::string& name)
 {
+    diag::log_tagged_fmt("mcp", "remove_server name='%s'", name.c_str());
     std::shared_ptr<entry_t> target;
     {
         std::lock_guard<std::mutex> lk(_mtx);
@@ -2211,16 +2235,23 @@ void manager_t::remove_server(const std::string& name)
         auto it = std::find_if(_entries.begin(), _entries.end(),
             [&](const std::shared_ptr<entry_t>& ep) { return ep && ep->cfg.name == name; });
 
-        if (it == _entries.end()) return;
+        if (it == _entries.end()) {
+            diag::log_tagged_fmt("mcp", "remove_server NOT_FOUND name='%s'", name.c_str());
+            return;
+        }
         target = *it;
         _entries.erase(it);
     }
 
-    if (target) target->client.disconnect();
+    if (target) {
+        target->client.disconnect();
+        diag::log_tagged_fmt("mcp", "remove_server disconnected name='%s'", name.c_str());
+    }
 }
 
 void manager_t::connect_all()
 {
+    diag::log_tagged("mcp", "connect_all enter");
     std::vector<std::string> to_connect;
     {
         std::lock_guard<std::mutex> lk(_mtx);
@@ -2281,6 +2312,7 @@ void manager_t::connect_all()
 
 void manager_t::disconnect_all()
 {
+    diag::log_tagged("mcp", "disconnect_all enter");
     std::vector<std::shared_ptr<entry_t>> snapshot;
     {
         std::lock_guard<std::mutex> lk(_mtx);
@@ -2288,6 +2320,7 @@ void manager_t::disconnect_all()
     }
     for (auto& ep : snapshot)
         ep->client.disconnect();
+    diag::log_tagged_fmt("mcp", "disconnect_all done disconnected=%zu", snapshot.size());
 }
 
 bool manager_t::connect_server(const std::string& name)

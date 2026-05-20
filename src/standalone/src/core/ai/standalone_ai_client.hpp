@@ -156,6 +156,8 @@ private:
         ai_stream_chunk_t on_chunk,
         ai_stop_predicate_t stop_check);
 
+    std::string resolve_api_key_logged(const char* context) const;
+
 
     std::string generate_gemini(const std::string& prompt, double temperature, ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check);
     std::string generate_openai(const std::string& prompt, double temperature, ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check);

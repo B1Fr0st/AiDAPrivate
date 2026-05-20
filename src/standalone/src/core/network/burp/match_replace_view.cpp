@@ -176,6 +176,7 @@ void render(float pos_x, float pos_y, float width, float height,
     ImDrawList* tdl = ImGui::GetWindowDrawList();
     const ImVec2 t_org = ImGui::GetWindowPos();
     const float row_h = 24.f;
+    const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
     const float col_label = 180.f;
     const float col_target = 130.f;
     const float col_match  = 220.f;
@@ -186,11 +187,11 @@ void render(float pos_x, float pos_y, float width, float height,
                        aida::ui::with_alpha(th.panel_header, alpha));
     float hx = t_org.x + 8.f;
     ImU32 hdr_col = aida::ui::with_alpha(th.text_secondary, alpha);
-    tdl->AddText(ImVec2(hx, t_org.y + 4.f), hdr_col, "Label"); hx += col_label;
-    tdl->AddText(ImVec2(hx, t_org.y + 4.f), hdr_col, "Target"); hx += col_target;
-    tdl->AddText(ImVec2(hx, t_org.y + 4.f), hdr_col, "Match"); hx += col_match;
-    tdl->AddText(ImVec2(hx, t_org.y + 4.f), hdr_col, "Hits"); hx += col_hits;
-    tdl->AddText(ImVec2(hx, t_org.y + 4.f), hdr_col, "Active");
+    tdl->AddText(ImVec2(hx, t_org.y + text_oy), hdr_col, "Label"); hx += col_label;
+    tdl->AddText(ImVec2(hx, t_org.y + text_oy), hdr_col, "Target"); hx += col_target;
+    tdl->AddText(ImVec2(hx, t_org.y + text_oy), hdr_col, "Match"); hx += col_match;
+    tdl->AddText(ImVec2(hx, t_org.y + text_oy), hdr_col, "Hits"); hx += col_hits;
+    tdl->AddText(ImVec2(hx, t_org.y + text_oy), hdr_col, "Active");
 
     ImGui::SetCursorPosY(row_h + 4.f);
 
@@ -226,7 +227,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
         ImU32 txt = aida::ui::with_alpha(th.text_primary, r_alpha);
         float lx = t_org.x + 8.f;
-        const float ty = abs_ry + 4.f;
+        const float ty = abs_ry + text_oy;
         std::string lbl = r.label;
         if (lbl.empty()) lbl = std::string("(rule #") + std::to_string(r.id) + ")";
         if (lbl.size() > 30) lbl = lbl.substr(0, 30) + "...";

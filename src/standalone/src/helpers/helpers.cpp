@@ -55,8 +55,10 @@
 #include "xref_db.hpp"
 #include "binary_map_view.hpp"
 #include "../core/testlab/test_lab_view.hpp"
+#include "../core/testlab/test_all_features.hpp"
 #include "ui_anim.hpp"
 #include "agent_picker_view.hpp"
+#include "mcp_marketplace_view.hpp"
 #include "initial_analysis.hpp"
 #include "initial_analysis_view.hpp"
 #include "loading_binary_overlay.hpp"
@@ -118,10 +120,17 @@ namespace ui_input_gate
 {
 	bool any_fake_modal_open()
 	{
+		if (menu_bar::suppress_frames > 0) {
+			--menu_bar::suppress_frames;
+			return true;
+		}
 		return globals::ui::process_attach_open
 			|| globals::ui::command_palette_open
 			|| globals::ui::driver_status_open
-			|| globals::ui::shortcuts_dialog_open;
+			|| globals::ui::shortcuts_dialog_open
+			|| aida::mcp_marketplace_view::is_open()
+			|| aida::agent_picker::is_open()
+			|| menu_bar::any_open;
 	}
 
 	bool true_modal_open()
@@ -357,7 +366,7 @@ void helpers::begin_child(const char* str_id, ImVec2 pos, ImVec2 size, float alp
 	ImGui::SetCursorPos(ImVec2(pos.x + padding, pos.y + padding));
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
 	ImGui::BeginChild(uid.c_str(), ImVec2(size.x - (2 * padding), size.y - (2 * padding)), false,
-		ImGuiWindowFlags_NoBackground | flags);
+		ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings | flags);
 
 }
 
@@ -1234,18 +1243,24 @@ void helpers::render_title()
 			globals::ui::panel_left_visible = !globals::ui::panel_left_visible;
 			g_sa_settings.workspace.left_visible = globals::ui::panel_left_visible;
 			g_sa_settings_request_save();
+			diag::log_tagged_fmt("ui", "panel_toggle left_visible=%d hotkey=Ctrl+B",
+				static_cast<int>(globals::ui::panel_left_visible));
 		}
 
 		if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_J, false)) {
 			globals::ui::panel_right_visible = !globals::ui::panel_right_visible;
 			g_sa_settings.workspace.right_visible = globals::ui::panel_right_visible;
 			g_sa_settings_request_save();
+			diag::log_tagged_fmt("ui", "panel_toggle right_visible=%d hotkey=Ctrl+J",
+				static_cast<int>(globals::ui::panel_right_visible));
 		}
 
 		if (ctrl && ImGui::IsKeyPressed(ImGuiKey_GraveAccent, false)) {
 			globals::ui::panel_bottom_visible = !globals::ui::panel_bottom_visible;
 			g_sa_settings.workspace.bottom_visible = globals::ui::panel_bottom_visible;
 			g_sa_settings_request_save();
+			diag::log_tagged_fmt("ui", "panel_toggle bottom_visible=%d hotkey=Ctrl+`",
+				static_cast<int>(globals::ui::panel_bottom_visible));
 		}
 
 		if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_S, false) && code_editor::active) {
@@ -1318,37 +1333,44 @@ void helpers::render_title()
 
 		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_N, false)) {
 			globals::ui::active_center_view = center_view_t::network_view;
+			diag::log_tagged("ui", "view_switch to=network hotkey=Ctrl+Shift+N");
 		}
 
 		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_M, false)) {
 			globals::ui::active_center_view = center_view_t::scan_hub;
+			diag::log_tagged("ui", "view_switch to=scan_hub hotkey=Ctrl+Shift+M");
 		}
 
 		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_D, false)) {
 			globals::ui::active_center_view = center_view_t::debugger_view;
+			diag::log_tagged("ui", "view_switch to=debugger hotkey=Ctrl+Shift+D");
 		}
 
 		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_B, false)) {
 			globals::ui::active_center_view = center_view_t::binary_map;
+			diag::log_tagged("ui", "view_switch to=binary_map hotkey=Ctrl+Shift+B");
 		}
 
 		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_T, false)) {
-			globals::ui::active_center_view = center_view_t::test_lab;
+			globals::ui::test_all_visible = !globals::ui::test_all_visible;
 		}
 
 		if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) {
 			if (pseudocode_view::has_active_tab()) {
 				globals::ui::active_center_view = center_view_t::pseudocode;
+				diag::log_tagged("ui", "view_switch to=pseudocode hotkey=F5");
 			}
 		}
 
 		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_X, false)) {
 			globals::ui::active_center_view = center_view_t::xref_browser;
+			diag::log_tagged("ui", "view_switch to=xref_browser hotkey=Ctrl+Shift+X");
 		}
 
 		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
 			analysis_hub_view::set_sub_tab(analysis_hub_view::sub_tab_t::deobfuscation);
 			globals::ui::active_center_view = center_view_t::analysis_hub;
+			diag::log_tagged("ui", "view_switch to=analysis_hub hotkey=Ctrl+Shift+O");
 		}
 	}
 
@@ -1491,7 +1513,7 @@ void helpers::render_title()
 
 	ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
 	ImGui::SetNextWindowSize(ImVec2(globals::ui::window_w, globals::ui::window_h));
-	ImGui::Begin("##main", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove);
+	ImGui::Begin("##main", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
 
 	{
 		ImVec2 bgwp = ImGui::GetWindowPos();
@@ -2713,44 +2735,49 @@ void helpers::render_title()
 
 
 		{
-			ImFont* sm_font = aida::ui::fonts::caption();
-			if (!sm_font) sm_font = ImGui::GetFont();
-			float bell_sz = 22.f;
-			ImVec2 bell_a(wp.x + ww - ctl_off - bell_sz, wp.y + (title_h - bell_sz) * 0.5f);
-			ImVec2 bell_b(bell_a.x + bell_sz, bell_a.y + bell_sz);
-			bool bell_hov = ImGui::IsMouseHoveringRect(bell_a, bell_b);
-			static aida::ui::hover_state_t bell_h;
-			float bhv = bell_h.tick(bell_hov, dt, aida::motion::spring::balanced);
-			if (bhv > 0.01f) {
-				dl->AddRectFilled(bell_a, bell_b,
-					aida::ui::with_alpha(th_tb.hover_wash, bhv * a), 6.f);
+			float toggle_sz = 22.f;
+			ImVec2 tgl_a(wp.x + ww - ctl_off - toggle_sz, wp.y + (title_h - toggle_sz) * 0.5f);
+			ImVec2 tgl_b(tgl_a.x + toggle_sz, tgl_a.y + toggle_sz);
+			bool tgl_hov = ImGui::IsMouseHoveringRect(tgl_a, tgl_b);
+			static aida::ui::hover_state_t tgl_h;
+			float thv = tgl_h.tick(tgl_hov, dt, aida::motion::spring::balanced);
+			if (thv > 0.01f) {
+				dl->AddRectFilled(tgl_a, tgl_b,
+					aida::ui::with_alpha(th_tb.hover_wash, thv * a), 6.f);
 			}
-			ImU32 bcol = aida::ui::mix(th_tb.text_secondary, th_tb.text_primary, bhv);
-			ImVec2 bcc((bell_a.x + bell_b.x) * 0.5f, (bell_a.y + bell_b.y) * 0.5f);
-			dl->PathArcTo(ImVec2(bcc.x, bcc.y - 1.f), 5.f, 3.6651915f, 5.7595864f, 12);
-			dl->PathLineTo(ImVec2(bcc.x + 5.5f, bcc.y + 4.f));
-			dl->PathLineTo(ImVec2(bcc.x - 5.5f, bcc.y + 4.f));
-			dl->PathStroke(aida::ui::with_alpha(bcol, a), ImDrawFlags_Closed, 1.5f);
-			dl->AddCircleFilled(ImVec2(bcc.x, bcc.y + 6.5f), 1.5f, aida::ui::with_alpha(bcol, a), 8);
-			ctl_off += bell_sz + 8.f;
-		}
-
-		{
-			float av_sz = 22.f;
-			ImVec2 av_a(wp.x + ww - ctl_off - av_sz, wp.y + (title_h - av_sz) * 0.5f);
-			ImVec2 av_b(av_a.x + av_sz, av_a.y + av_sz);
-			bool av_hov = ImGui::IsMouseHoveringRect(av_a, av_b);
-			static aida::ui::hover_state_t av_h;
-			float ahv = av_h.tick(av_hov, dt, aida::motion::spring::balanced);
-			if (ahv > 0.01f) {
-				dl->AddRectFilled(av_a, av_b,
-					aida::ui::with_alpha(th_tb.hover_wash, ahv * a), av_sz * 0.5f);
+			ImU32 tcol = aida::ui::mix(th_tb.text_secondary, th_tb.text_primary, thv);
+			ImVec2 tcc((tgl_a.x + tgl_b.x) * 0.5f, (tgl_a.y + tgl_b.y) * 0.5f);
+			bool currently_dark = aida::ui::is_dark();
+			if (currently_dark) {
+				dl->AddCircle(ImVec2(tcc.x, tcc.y), 6.f, aida::ui::with_alpha(tcol, a), 16, 1.5f);
+				for (int ray = 0; ray < 8; ++ray) {
+					float angle = ray * 0.785398f;
+					float cx = cosf(angle), cy = sinf(angle);
+					dl->AddLine(ImVec2(tcc.x + cx * 8.f, tcc.y + cy * 8.f),
+						ImVec2(tcc.x + cx * 9.5f, tcc.y + cy * 9.5f),
+						aida::ui::with_alpha(tcol, a), 1.5f);
+				}
+			} else {
+				dl->PathArcTo(ImVec2(tcc.x - 1.f, tcc.y), 7.f, 5.5f, 9.95f, 16);
+				dl->PathStroke(aida::ui::with_alpha(tcol, a), 0, 1.5f);
 			}
-			ImVec2 ac((av_a.x + av_b.x) * 0.5f, (av_a.y + av_b.y) * 0.5f);
-			std::string seed = license::saved_key.empty() ? std::string("aida") : license::saved_key;
-			aida::ui::avatar::render(dl, ac, av_sz * 0.45f,
-				seed, aida::ui::avatar::kind_t::gradient, true, a);
-			ctl_off += av_sz + 8.f;
+			if (tgl_hov && !ui_input_gate::chrome_input_blocked() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+				int idx = g_sa_settings.active_theme_idx;
+				int new_idx;
+				switch (idx) {
+					case 0: new_idx = 1; break;
+					case 1: new_idx = 0; break;
+					case 2: new_idx = 3; break;
+					case 3: new_idx = 2; break;
+					default: new_idx = currently_dark ? 1 : 0; break;
+				}
+				g_sa_settings.active_theme_idx = new_idx;
+				g_sa_settings.active_custom_theme_idx = -1;
+				aida::ui::apply_for_index(new_idx, true);
+				g_sa_settings_request_save();
+			}
+			if (tgl_hov) ImGui::SetTooltip("Toggle dark/light mode");
+			ctl_off += toggle_sz + 8.f;
 		}
 
 		{
@@ -2817,6 +2844,8 @@ void helpers::render_title()
 							g_sa_settings.active_theme_idx = ti;
 							g_sa_settings.active_custom_theme_idx = -1;
 							g_sa_settings_request_save();
+							diag::log_tagged_fmt("ui", "theme_changed idx=%d name='%s'",
+								ti, tp.name);
 						}
 					}
 
@@ -3321,7 +3350,7 @@ void helpers::render_title()
 								ImVec2(cp.x + mw - sts.x - 14.f, cp.y + (ih - short_sz) * 0.5f),
 								aida::ui::with_alpha(th_p.text_dim, 1.f), shortcut);
 						}
-						if (clicked) { menu_bar::open_menu = -1; menu_bar::any_open = false; ImGui::CloseCurrentPopup(); }
+						if (clicked) { menu_bar::open_menu = -1; menu_bar::any_open = false; menu_bar::suppress_frames = 2; ImGui::CloseCurrentPopup(); }
 						return clicked;
 					};
 
@@ -3864,10 +3893,11 @@ void helpers::render_title()
 		if (globals::ui::active_activity == activity_item_t::search) {
 
 			const char* search_lbl = "SEARCH";
-			fdl->AddText(ImVec2(fwp.x + 10.f, fwp.y + 8.f),
+			float search_hdr_h = 28.f;
+			fdl->AddText(ImVec2(fwp.x + 10.f, fwp.y + (search_hdr_h - ImGui::GetFontSize()) * 0.5f),
 				aida::ui::with_alpha(th_lp.text_dim, a), search_lbl);
 
-			float sy = 28.f;
+			float sy = search_hdr_h + 4.f;
 			ImGui::SetCursorPos(ImVec2(6.f, sy));
 			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 4.f));
 			ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(th_ph_r, th_ph_g, th_ph_b, (int)(200 * a)));
@@ -3929,22 +3959,22 @@ void helpers::render_title()
 				toggle_btn(".*", "Use Regular Expression", workspace_search::g_search.use_regex, "##ws_regex");
 			}
 
-			sy += 24.f;
+			sy += 28.f;
 
-			fdl->AddText(ImVec2(fwp.x + 8.f, fwp.y + sy + 2.f),
+			fdl->AddText(ImVec2(fwp.x + 8.f, fwp.y + sy),
 				aida::ui::with_alpha(th_lp.text_dim, 0.78f * a), "files to include");
-			sy += 16.f;
+			sy += ImGui::GetFontSize() + 6.f;
 			ImGui::SetCursorPos(ImVec2(6.f, sy));
 			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 4.f));
 			ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(th_ph_r, th_ph_g, th_ph_b, (int)(200 * a)));
 			ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(th_lp.text_primary, a));
 			ImGui::PushItemWidth(fw - 12.f);
 			ImGui::InputText("##ws_include", workspace_search::g_search.include_buf, sizeof(workspace_search::g_search.include_buf));
-			sy += 28.f;
+			sy += 32.f;
 
-			fdl->AddText(ImVec2(fwp.x + 8.f, fwp.y + sy + 2.f),
+			fdl->AddText(ImVec2(fwp.x + 8.f, fwp.y + sy),
 				aida::ui::with_alpha(th_lp.text_dim, 0.78f * a), "files to exclude");
-			sy += 16.f;
+			sy += ImGui::GetFontSize() + 6.f;
 			ImGui::SetCursorPos(ImVec2(6.f, sy));
 			ImGui::InputText("##ws_exclude", workspace_search::g_search.exclude_buf, sizeof(workspace_search::g_search.exclude_buf));
 
@@ -3970,7 +4000,7 @@ void helpers::render_title()
 
 			ImGui::SetCursorPos(ImVec2(0.f, sy));
 			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
-			ImGui::BeginChild("##ws_results", ImVec2(fw, fh - sy), false, ImGuiWindowFlags_NoBackground);
+			ImGui::BeginChild("##ws_results", ImVec2(fw, fh - sy), false, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings);
 			{
 				auto& results = workspace_search::g_search.results;
 
@@ -4085,7 +4115,7 @@ void helpers::render_title()
 			if (rc_list_h < 24.f) rc_list_h = 24.f;
 			ImGui::SetCursorPos(ImVec2(0.f, rc_sy));
 			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
-			ImGui::BeginChild("##recent_list", ImVec2(fw, rc_list_h), false, ImGuiWindowFlags_NoBackground);
+			ImGui::BeginChild("##recent_list", ImVec2(fw, rc_list_h), false, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings);
 			{
 				std::vector<std::string> recent_list;
 				if (!g_sa_settings.recent_workspaces_json.empty()) {
@@ -4271,15 +4301,15 @@ void helpers::render_title()
 		} else {
 
 		const char* explorer_lbl = "EXPLORER";
-		float fb_label_y = 6.f;
 		float fb_header_h = 26.f;
+		float fb_label_y = (fb_header_h - ImGui::GetFontSize()) * 0.5f;
 
 		float tree_y = fb_header_h;
 		float fb_scroll_h = fh - tree_y;
 		if (fb_scroll_h < 24.f) fb_scroll_h = 24.f;
 		ImGui::SetCursorPos(ImVec2(0.f, tree_y));
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
-		ImGui::BeginChild("##fb_scroll", ImVec2(fw, fb_scroll_h), false, ImGuiWindowFlags_NoBackground);
+		ImGui::BeginChild("##fb_scroll", ImVec2(fw, fb_scroll_h), false, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings);
 		{
 			ImDrawList* scl = ImGui::GetWindowDrawList();
 			if (file_browser::needs_refresh || file_browser::entries.empty()) {
@@ -6243,6 +6273,8 @@ void helpers::render_title()
 				}
 			}
 
+			ImFont* icon_font = aida::ui::fonts::body_strong();
+			const float icon_fs = gear_sz * 0.52f;
 			auto draw_circle_btn = [&](const char* label, const char* tip,
 				const char* icon_render, float bx_local, float by_local,
 				ImU32 icon_col_resting) -> bool
@@ -6263,8 +6295,8 @@ void helpers::render_title()
 						aida::ui::with_alpha(th_ch.hover_wash, hv * a), gear_sz * 0.5f);
 				}
 				ImU32 ic = aida::ui::mix(icon_col_resting, th_ch.text_primary, hv);
-				ImVec2 ic_ts = ImGui::CalcTextSize(icon_render);
-				hdr_dl->AddText(
+				ImVec2 ic_ts = icon_font->CalcTextSizeA(icon_fs, FLT_MAX, 0.f, icon_render);
+				hdr_dl->AddText(icon_font, icon_fs,
 					ImVec2((ba.x + bb.x) * 0.5f - ic_ts.x * 0.5f,
 					       (ba.y + bb.y) * 0.5f - ic_ts.y * 0.5f),
 					aida::ui::with_alpha(ic, a), icon_render);
@@ -7222,7 +7254,17 @@ void helpers::render_title()
 				return 0;
 			};
 
-			float input_w = cw - btn_sz - igap;
+			bool ai_busy = is_ai_busy();
+			static aida::ui::transition_t stop_slide;
+			static bool stop_shown_prev = false;
+			if (ai_busy && !stop_shown_prev) { stop_slide.start(0.180f, aida::motion::ease::out_back); stop_shown_prev = true; }
+			if (!ai_busy && stop_shown_prev) { stop_slide.start_reverse(0.180f, aida::motion::ease::out_cubic); stop_shown_prev = false; }
+			stop_slide.tick(dt);
+			float stop_e = stop_slide.eased();
+			float stop_w = btn_sz * stop_e;
+			float stop_reserved = (stop_e > 0.005f) ? (stop_w + 6.f) : 0.f;
+
+			float input_w = cw - btn_sz - igap - stop_reserved;
 			ImGui::SetNextItemAllowOverlap();
 			ImGui::SetNextItemWidth(input_w);
 			ImGui::InputTextMultiline("##chatinput", g_chat_buf, sizeof(g_chat_buf),
@@ -7254,17 +7296,7 @@ void helpers::render_title()
 
 			const auto& th_chat = aida::ui::resolved();
 			float btn_y = input_y + input_h - btn_sz;
-			float send_x = input_w + igap;
-
-			bool ai_busy = is_ai_busy();
-			static aida::ui::transition_t stop_slide;
-			static bool stop_shown_prev = false;
-			if (ai_busy && !stop_shown_prev) { stop_slide.start(0.180f, aida::motion::ease::out_back); stop_shown_prev = true; }
-			if (!ai_busy && stop_shown_prev) { stop_slide.start_reverse(0.180f, aida::motion::ease::out_cubic); stop_shown_prev = false; }
-			stop_slide.tick(dt);
-			float stop_e = stop_slide.eased();
-
-			float stop_w = btn_sz * stop_e;
+			float send_x = cw - btn_sz;
 
 			ImGui::SetCursorPos(ImVec2(send_x, btn_y));
 			ImVec2 btn_min = ImGui::GetCursorScreenPos();
@@ -8477,6 +8509,7 @@ void helpers::render_title()
 				{ "Ctrl+L",       "New Chat" },
 				{ "Ctrl+Tab",     "Next Session / Tab" },
 				{ "Ctrl+Shift+Tab", "Previous Session / Tab" },
+				{ "Ctrl+Shift+T", "Test All Features" },
 			};
 			static const shortcut_entry_t sec_editor[] = {
 				{ "Ctrl+Z",       "Undo" },
@@ -8665,6 +8698,12 @@ void helpers::render_title()
 	g_render_section = "popups_loading_binary";
 	loading_binary_overlay::render();
 
+	g_render_section = "popups_test_all_features";
+	{
+		ImGuiIO& io_ta = ImGui::GetIO();
+		test_all_features::render_overlay(io_ta.DisplaySize.x, io_ta.DisplaySize.y);
+	}
+
 	g_render_section = "popups_open_binary_confirm";
 	file_browser::render_pending_confirm_modal();
 
@@ -8688,7 +8727,7 @@ void helpers::render_title()
 		ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(th_cs.panel_bg, 1.f));
 		bool stay_open = true;
 		if (ImGui::Begin("Select & Copy Text##aida_chat_select_popup", &stay_open,
-				ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking)) {
+				ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings)) {
 			ImGui::TextWrapped("Drag to select. Ctrl+C to copy. Ctrl+A selects all.");
 			ImGui::Separator();
 			float avail_y = ImGui::GetContentRegionAvail().y - 44.f;

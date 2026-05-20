@@ -1851,6 +1851,7 @@ void init_standalone_chat()
 
 void shutdown_standalone_chat()
 {
+    diag::log_tagged("chat", "shutdown_standalone_chat enter");
     s_cancel = true;
     {
         std::lock_guard<std::mutex> lk(s_ai_thread_mtx);
@@ -1897,6 +1898,7 @@ void shutdown_standalone_chat()
         driver_bridge::unregister_dll_protection();
 
     s_initialized = false;
+    diag::log_tagged("chat", "shutdown_standalone_chat done");
 }
 
 
@@ -2185,6 +2187,7 @@ std::atomic<bool>* chat_cancel_flag()
 
 void chat_bind_session(const std::string& session_id)
 {
+    diag::log_tagged_fmt("chat", "chat_bind_session id='%s'", session_id.c_str());
     set_chat_session_id_locked(session_id);
 }
 
@@ -2203,6 +2206,7 @@ void chat_record_assistant_message_id(const std::string& message_id)
 
 std::string start_new_conversation()
 {
+    diag::log_tagged("chat", "start_new_conversation enter");
     aida::session::session_info_t info;
     std::string new_id;
     if (aida::session::create(info, std::string{}, std::string{}, std::string{}))
@@ -2216,6 +2220,7 @@ std::string start_new_conversation()
 
     workflow_tools::get_repetition_detector().reset();
 
+    diag::log_tagged_fmt("chat", "start_new_conversation done new_id='%s'", new_id.c_str());
     return new_id;
 }
 
@@ -2348,18 +2353,26 @@ file_context::tracker_t& get_file_tracker()
 
 void do_process_attach(unsigned long pid)
 {
+    diag::log_tagged_fmt("chat", "do_process_attach pid=%lu driver_loaded=%d",
+        pid, static_cast<int>(driver_bridge::is_loaded()));
     if (driver_bridge::attach(pid)) {
         output_log::push(bottom_tab_t::driver_log, "[driver] Attached to PID " + std::to_string(pid));
+        diag::log_tagged_fmt("chat", "do_process_attach SUCCESS pid=%lu", pid);
     } else {
         output_log::push(bottom_tab_t::driver_log, "[driver] Failed to attach to PID " + std::to_string(pid) +
                          ": " + driver_bridge::last_error());
+        diag::log_tagged_fmt("chat", "do_process_attach FAILED pid=%lu error='%s'",
+            pid, driver_bridge::last_error().c_str());
     }
 }
 
 void do_process_detach()
 {
+    diag::log_tagged_fmt("chat", "do_process_detach pid=%u",
+        driver_bridge::attached_pid());
     driver_bridge::detach();
     output_log::push(bottom_tab_t::driver_log, "[driver] Detached from process");
+    diag::log_tagged("chat", "do_process_detach done");
 }
 
 bool is_process_attached()

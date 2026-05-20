@@ -37,55 +37,7 @@ extern settings_sa_t g_sa_settings;
 namespace aida::mcp_marketplace_view {
 
 
-	enum class category_t : int
-	{
-		all = 0,
-		database,
-		web,
-		ai,
-		productivity,
-		files,
-		dev,
-		other,
-		count
-	};
-
-
-	inline const char* category_label(category_t c)
-	{
-		switch (c) {
-		case category_t::all:           return "All";
-		case category_t::database:      return "Database";
-		case category_t::web:           return "Web";
-		case category_t::ai:            return "AI";
-		case category_t::productivity:  return "Productivity";
-		case category_t::files:         return "Files";
-		case category_t::dev:           return "Dev";
-		case category_t::other:         return "Other";
-		default: return "?";
-		}
-	}
-
-
-	inline category_t classify_package(const ::mcp_marketplace::package_info_t& p)
-	{
-		std::string blob = p.name + " " + p.description + " " + p.keywords_str;
-		std::transform(blob.begin(), blob.end(), blob.begin(),
-			[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-		auto has = [&](const char* k) { return blob.find(k) != std::string::npos; };
-		if (has("postgres") || has("mysql") || has("sqlite") || has("mongo") ||
-			has("redis") || has("database") || has("sql ")) return category_t::database;
-		if (has("http") || has("web") || has("browser") || has("fetch") ||
-			has("scrape") || has("api ")) return category_t::web;
-		if (has("openai") || has("claude") || has("anthropic") || has("gemini") ||
-			has("llm") || has("embedding") || has("rag")) return category_t::ai;
-		if (has("calendar") || has("email") || has("slack") || has("notion") ||
-			has("trello") || has("jira") || has("ticket")) return category_t::productivity;
-		if (has("filesystem") || has("file ") || has("path ") || has("directory") ||
-			has("git ") || has("github")) return category_t::files;
-		if (has("editor") || has("ide ") || has("debugger") || has("compile")) return category_t::dev;
-		return category_t::other;
-	}
+	// Categories removed -- search-only filtering (VSCode-style).
 
 
 	struct card_anim_t
@@ -105,7 +57,6 @@ namespace aida::mcp_marketplace_view {
 		float open_velocity = 0.f;
 
 		char  search_buf[256] = {};
-		category_t active_category = category_t::all;
 		std::vector<::mcp_marketplace::package_info_t> last_results;
 		::mcp_marketplace::search_state_t last_search_state =
 			::mcp_marketplace::search_state_t::idle;
@@ -214,57 +165,7 @@ namespace aida::mcp_marketplace_view {
 	}
 
 
-	inline void render_category_pills(float origin_x, float origin_y, float avail_w)
-	{
-		auto& s = state();
-		const auto& th = aida::ui::resolved();
-		ImDrawList* dl = ImGui::GetWindowDrawList();
-		(void)dl;
-
-		float x = origin_x;
-		float y = origin_y;
-		const float gap = 8.f;
-		const int n = static_cast<int>(category_t::count);
-		for (int i = 0; i < n; ++i) {
-			category_t c = static_cast<category_t>(i);
-			const char* label = category_label(c);
-			ImFont* font = aida::ui::fonts::body();
-			float fs = 14.f;
-			float text_w = font->CalcTextSizeA(fs, FLT_MAX, 0.f, label).x;
-			float pill_w = text_w + 22.f;
-			float pill_h = 24.f;
-			if (x + pill_w > origin_x + avail_w) {
-				x = origin_x;
-				y += pill_h + gap;
-			}
-			ImGui::SetCursorScreenPos(ImVec2(x, y));
-			ImGui::PushID(i);
-			ImGui::InvisibleButton("##cat", ImVec2(pill_w, pill_h));
-			bool hov = ImGui::IsItemHovered();
-			bool clicked = ImGui::IsItemClicked();
-			ImGui::PopID();
-
-			ImVec2 a(x, y);
-			ImVec2 b(x + pill_w, y + pill_h);
-			bool active = (s.active_category == c);
-			ImU32 fill = active
-				? aida::ui::with_alpha(th.accent_u32, 0.95f)
-				: hov
-					? aida::ui::with_alpha(th.hover_wash, 1.f)
-					: aida::ui::with_alpha(th.panel_header, 0.85f);
-			ImU32 border = active
-				? th.accent_u32
-				: aida::ui::with_alpha(th.border_subtle, hov ? 1.f : 0.7f);
-			ImU32 text_col = active ? IM_COL32(255, 255, 255, 245) : th.text_secondary;
-			dl->AddRectFilled(a, b, fill, pill_h * 0.5f);
-			dl->AddRect(a, b, border, pill_h * 0.5f, 0, 1.f);
-			dl->AddText(font, fs, ImVec2(x + 11.f, y + (pill_h - fs) * 0.5f),
-				text_col, label);
-
-			if (clicked) s.active_category = c;
-			x += pill_w + gap;
-		}
-	}
+	// Category pills removed -- VSCode-style search-only filtering.
 
 
 	inline void start_search()
@@ -322,12 +223,12 @@ namespace aida::mcp_marketplace_view {
 			aida::ui::button("Configured",
 				aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::sm,
-				ImVec2(120.f, 28.f), true);
+				ImVec2(90.f, 26.f), true);
 		} else {
 			if (aida::ui::button(installing ? "Installing" : "Install",
 					aida::ui::button_kind_t::primary,
 					aida::ui::size_t_::sm,
-					ImVec2(120.f, 28.f),
+					ImVec2(90.f, 26.f),
 					false, nullptr, installing)) {
 				if (!installing) {
 					s.installing_pkg = p.name;
@@ -352,75 +253,10 @@ namespace aida::mcp_marketplace_view {
 	}
 
 
-	inline void render_featured_card(float ox, float oy, float w, float h,
-		const ::mcp_marketplace::package_info_t& p, float dt)
-	{
-		auto& s = state();
-		const auto& th = aida::ui::resolved();
-		ImDrawList* dl = ImGui::GetWindowDrawList();
-
-		card_anim_t* ca = nullptr;
-		{
-			std::lock_guard<std::mutex> lk(s.mtx);
-			ca = &s.card_anims[std::string("feat_") + p.name];
-		}
-
-		ImGui::PushID((std::string("feat_") + p.name).c_str());
-		ImGui::SetCursorScreenPos(ImVec2(ox, oy));
-		ImGui::InvisibleButton("##card", ImVec2(w, h));
-		bool hov = ImGui::IsItemHovered();
-		bool clicked = ImGui::IsItemClicked();
-		ImGui::PopID();
-
-		float hov_v = ca->hover.tick(hov, dt, aida::motion::spring::playful);
-		float lift = hov_v * 4.f;
-
-		ImVec2 a(ox, oy - lift);
-		ImVec2 b(ox + w, oy + h - lift);
-
-		if (hov_v > 0.05f) {
-			aida::ui::blur::render_drop_shadow(dl, a, b, 14.f, 5,
-				0.32f * hov_v, ImVec2(0.f, 5.f * hov_v));
-		}
-
-		aida::ui::blur::layer_request_t br;
-		br.pos = a;
-		br.size = ImVec2(w, h);
-		br.radius = 14.f;
-		br.strength = 0.5f + 0.2f * hov_v;
-		br.alpha = 1.f;
-		aida::ui::blur::schedule(br);
-
-		aida::ui::blur::render_glass_fill(dl, a, b, 14.f, 1.f);
-		aida::ui::blur::render_glass_border(dl, a, b, 14.f, 1.f, 1.f);
-
-		ImU32 grad_top = aida::ui::with_alpha(th.accent_grad_top, 0.18f * (0.4f + hov_v * 0.6f));
-		ImU32 grad_bot = aida::ui::with_alpha(th.accent_grad_bot, 0.05f);
-		ImU32 grad_flat = aida::ui::mix(grad_top, grad_bot, 0.5f);
-		dl->AddRectFilled(a, b, grad_flat, 14.f);
-
-		ImVec2 av_c(a.x + 22.f, a.y + 24.f);
-		render_card_glyph_ring(dl, av_c, 16.f, p.name, 1.f);
-
-		float text_x = a.x + 16.f;
-		float text_y = a.y + 50.f;
-		dl->AddText(aida::ui::fonts::body_strong(), 13.f,
-			ImVec2(text_x, text_y), th.text_primary,
-			truncate_text(p.display_name.empty() ? p.name : p.display_name, 24).c_str());
-		dl->AddText(aida::ui::fonts::caption(), 13.f,
-			ImVec2(text_x, text_y + 18.f),
-			aida::ui::with_alpha(th.text_secondary, 0.95f),
-			truncate_text(p.description, 64).c_str(),
-			nullptr, w - 32.f);
-
-		if (clicked) {
-			s.selected_pkg = p.name;
-			s.detail_view_open = true;
-		}
-	}
+	// Featured cards removed -- all items render as list rows (VSCode-style).
 
 
-	inline void render_full_card(float ox, float oy, float w, float h,
+	inline void render_list_row(float ox, float oy, float w,
 		const ::mcp_marketplace::package_info_t& p, float dt)
 	{
 		auto& s = state();
@@ -433,67 +269,122 @@ namespace aida::mcp_marketplace_view {
 			ca = &s.card_anims[p.name];
 		}
 
+		// --- measure description height for dynamic row sizing ---
+		const float icon_size = 36.f;
+		const float row_pad_x = 14.f;
+		const float row_pad_y = 10.f;
+		const float text_x = ox + row_pad_x + icon_size + 12.f;
+		const float btn_w = 90.f;
+		const float right_margin = btn_w + 24.f;
+		const float desc_wrap = w - (text_x - ox) - right_margin;
+
+		const std::string& display = p.display_name.empty() ? p.name : p.display_name;
+		const float name_h = 16.f;
+		const float author_h = 14.f;
+
+		// Compute wrapped description height.
+		float desc_h = 0.f;
+		if (!p.description.empty()) {
+			ImFont* desc_font = aida::ui::fonts::body();
+			ImVec2 desc_sz = desc_font->CalcTextSizeA(13.f, FLT_MAX, desc_wrap,
+				p.description.c_str(), nullptr);
+			desc_h = desc_sz.y;
+		}
+
+		const float row_h = row_pad_y * 2.f + name_h + 4.f + desc_h +
+			(p.author.empty() ? 0.f : author_h + 2.f);
+		const float min_h = icon_size + row_pad_y * 2.f;
+		const float h = std::max(row_h, min_h);
+
+		// --- hit test ---
 		ImGui::PushID(p.name.c_str());
 		ImGui::SetCursorScreenPos(ImVec2(ox, oy));
 		ImGui::SetNextItemAllowOverlap();
-		ImGui::InvisibleButton("##fc_hit", ImVec2(w, h));
+		ImGui::InvisibleButton("##lr_hit", ImVec2(w, h));
 		bool hov = ImGui::IsItemHovered();
 		bool clicked = ImGui::IsItemClicked();
 		ImGui::PopID();
 
-		float hov_v = ca->hover.tick(hov, dt, aida::motion::spring::playful);
-		float lift = hov_v * 4.f;
+		float hov_v = ca->hover.tick(hov, dt, aida::motion::spring::balanced);
 
-		ImVec2 a(ox, oy - lift);
-		ImVec2 b(ox + w, oy + h - lift);
+		ImVec2 a(ox, oy);
+		ImVec2 b(ox + w, oy + h);
 
-		if (hov_v > 0.05f) {
-			aida::ui::blur::render_drop_shadow(dl, a, b, 12.f, 5,
-				0.30f * hov_v, ImVec2(0.f, 4.f * hov_v));
+		// Hover highlight (subtle, no lift).
+		if (hov_v > 0.01f) {
+			ImU32 hov_fill = aida::ui::with_alpha(th.hover_wash, 0.55f * hov_v);
+			dl->AddRectFilled(a, b, hov_fill, 6.f);
 		}
 
-		ImU32 fill = aida::ui::mix(
-			aida::ui::with_alpha(th.panel_header, 0.85f),
-			aida::ui::with_alpha(th.bg_elevated, 1.f),
-			0.3f + hov_v * 0.3f);
-		dl->AddRectFilled(a, b, fill, 12.f);
-		dl->AddRect(a, b,
-			aida::ui::with_alpha(th.border_subtle, 0.7f + 0.4f * hov_v), 12.f, 0, 1.f);
+		// Separator line at the bottom of each row.
+		dl->AddLine(ImVec2(a.x + row_pad_x, b.y),
+			ImVec2(b.x - row_pad_x, b.y),
+			aida::ui::with_alpha(th.border_subtle, 0.35f), 1.f);
 
-		const float av_r = 22.f;
-		ImVec2 av_c(a.x + 18.f + av_r, (a.y + b.y) * 0.5f);
-		render_card_glyph_ring(dl, av_c, av_r, p.name, 1.f);
+		// --- icon (avatar glyph, rounded-rect clipped) ---
+		float icon_x = a.x + row_pad_x;
+		float icon_cy = a.y + h * 0.5f;
+		ImVec2 icon_tl(icon_x, icon_cy - icon_size * 0.5f);
+		ImVec2 icon_br(icon_x + icon_size, icon_cy + icon_size * 0.5f);
 
-		float text_x = av_c.x + av_r + 14.f;
+		// Rounded-rect avatar background + initial.
+		ImVec2 icon_c(icon_x + icon_size * 0.5f, icon_cy);
+		aida::ui::avatar::render(dl, icon_c, icon_size * 0.5f, p.name,
+			aida::ui::avatar::kind_t::gradient, false, 1.f,
+			aida::ui::fonts::body_strong());
+
+		// Round the corners by overlaying a rounded-rect clip border.
+		dl->AddRect(icon_tl, icon_br,
+			aida::ui::with_alpha(th.border_subtle, 0.5f), 8.f, 0, 1.f);
+
+		// --- text block ---
+		float ty = a.y + row_pad_y;
+
+		// Package name (bold).
 		dl->AddText(aida::ui::fonts::body_strong(), 14.f,
-			ImVec2(text_x, a.y + 12.f), th.text_primary,
-			(p.display_name.empty() ? p.name : p.display_name).c_str());
-		dl->AddText(aida::ui::fonts::caption(), 13.f,
-			ImVec2(text_x, a.y + 32.f),
-			aida::ui::with_alpha(th.text_dim, 0.9f), p.name.c_str());
+			ImVec2(text_x, ty), th.text_primary, display.c_str());
 
-		dl->AddText(aida::ui::fonts::body(), 14.f,
-			ImVec2(text_x, a.y + 50.f),
-			aida::ui::with_alpha(th.text_secondary, 0.95f),
-			truncate_text(p.description, 120).c_str(),
-			nullptr, w - (text_x - a.x) - 160.f);
+		// Author + downloads inline after name.
+		{
+			ImFont* name_font = aida::ui::fonts::body_strong();
+			float name_w = name_font->CalcTextSizeA(14.f, FLT_MAX, 0.f, display.c_str()).x;
+			float meta_x = text_x + name_w + 10.f;
 
-		std::string dl_label = format_count(p.weekly_downloads) + "/wk";
-		ImVec2 dl_pos(text_x, b.y - 26.f);
-		ImGui::SetCursorScreenPos(dl_pos);
-		aida::ui::components::badge(dl_label.c_str(),
-			aida::ui::with_alpha(th.info, 0.85f), 4.f);
+			if (!p.author.empty()) {
+				dl->AddText(aida::ui::fonts::caption(), 12.f,
+					ImVec2(meta_x, ty + 2.f),
+					aida::ui::with_alpha(th.text_dim, 0.85f),
+					p.author.c_str());
+				float author_w = aida::ui::fonts::caption()->CalcTextSizeA(
+					12.f, FLT_MAX, 0.f, p.author.c_str()).x;
+				meta_x += author_w + 10.f;
+			}
 
-		if (!p.version.empty()) {
-			ImGui::SameLine(0.f, 8.f);
-			aida::ui::components::badge(p.version.c_str(),
-				aida::ui::with_alpha(th.text_dim, 0.85f), 4.f);
+			if (p.weekly_downloads > 0) {
+				std::string dl_str = format_count(p.weekly_downloads) + " installs";
+				dl->AddText(aida::ui::fonts::caption(), 12.f,
+					ImVec2(meta_x, ty + 2.f),
+					aida::ui::with_alpha(th.text_dim, 0.6f),
+					dl_str.c_str());
+			}
 		}
 
-		float btn_x = b.x - 134.f;
-		float btn_y = a.y + (h - 28.f) * 0.5f;
+		ty += name_h + 4.f;
+
+		// Description (full text, wrapped).
+		if (!p.description.empty()) {
+			dl->AddText(aida::ui::fonts::body(), 13.f,
+				ImVec2(text_x, ty),
+				aida::ui::with_alpha(th.text_secondary, 0.9f),
+				p.description.c_str(), nullptr, desc_wrap);
+		}
+
+		// --- install button (right-aligned, vertically centered) ---
+		float btn_x = b.x - btn_w - row_pad_x;
+		float btn_y = a.y + (h - 26.f) * 0.5f;
 		render_install_button(p, btn_x, btn_y);
 
+		// --- click to open detail ---
 		if (clicked) {
 			ImVec2 mp = ImGui::GetIO().MousePos;
 			if (mp.x < btn_x - 4.f) {
@@ -501,6 +392,10 @@ namespace aida::mcp_marketplace_view {
 				s.detail_view_open = true;
 			}
 		}
+
+		// Advance cursor past this row.
+		ImGui::SetCursorScreenPos(ImVec2(ox, oy + h + 1.f));
+		ImGui::Dummy(ImVec2(w, 0.f));
 	}
 
 
@@ -561,7 +456,7 @@ namespace aida::mcp_marketplace_view {
 			ImGui::SameLine(0.f, 8.f);
 		}
 		if (!p.author.empty()) {
-			std::string albl = "by " + truncate_text(p.author, 18);
+			std::string albl = "by " + p.author;
 			aida::ui::components::badge(albl.c_str(),
 				aida::ui::with_alpha(th.text_secondary, 0.85f), 4.f);
 			ImGui::SameLine(0.f, 8.f);
@@ -704,11 +599,32 @@ namespace aida::mcp_marketplace_view {
 		const float py = display.y * 0.5f - sh * 0.5f - 24.f * (1.f - ease);
 		const float alpha = s.open_anim;
 
+		ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+		ImGui::SetNextWindowSize(display, ImGuiCond_Always);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
+		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(0, 0, 0, 0));
+		if (ImGui::Begin("##mcp_market_blocker", nullptr,
+			ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+			ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+			ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
+			ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoScrollbar)) {
+			ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), display,
+				IM_COL32(0, 0, 0, static_cast<int>(140.f * alpha)));
+			ImGui::InvisibleButton("##mcp_block", display);
+			if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
+				close();
+		}
+		ImGui::End();
+		ImGui::PopStyleColor();
+		ImGui::PopStyleVar(2);
+
 		ImGui::SetNextWindowPos(ImVec2(px, py), ImGuiCond_Always);
 		ImGui::SetNextWindowSize(ImVec2(sw, sh), ImGuiCond_Always);
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
 		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(0, 0, 0, 0));
+		ImGui::SetNextWindowFocus();
 
 		bool win_open = true;
 		if (ImGui::Begin("##aida_mcp_marketplace", &win_open,
@@ -762,10 +678,26 @@ namespace aida::mcp_marketplace_view {
 			float search_w = sw - pad * 2.f - 132.f;
 			render_hero_search(panel_a.x + pad, search_y, search_w);
 
-			float cat_y = search_y + 60.f;
-			render_category_pills(panel_a.x + pad, cat_y, sw - pad * 2.f);
+			// Thin separator below search.
+			float sep_y = search_y + 52.f;
+			wdl->AddLine(ImVec2(panel_a.x + pad, sep_y),
+				ImVec2(panel_b.x - pad, sep_y),
+				aida::ui::with_alpha(th.border_subtle, 0.4f * alpha), 1.f);
 
-			float content_y = cat_y + 50.f;
+			// Result count label.
+			float count_y = sep_y + 6.f;
+			if (!s.last_results.empty()) {
+				char count_buf[64];
+				std::snprintf(count_buf, sizeof(count_buf), "%d server%s",
+					(int)s.last_results.size(),
+					s.last_results.size() == 1 ? "" : "s");
+				wdl->AddText(aida::ui::fonts::caption(), 12.f,
+					ImVec2(panel_a.x + pad, count_y),
+					aida::ui::with_alpha(th.text_dim, 0.7f * alpha),
+					count_buf);
+			}
+
+			float content_y = count_y + 18.f;
 			float content_h = panel_b.y - content_y - pad;
 			float content_w = sw - pad * 2.f;
 
@@ -774,25 +706,20 @@ namespace aida::mcp_marketplace_view {
 			ImGui::BeginChild("##mp_content", ImVec2(content_w, content_h), false,
 				ImGuiWindowFlags_NoBackground);
 
-			std::vector<::mcp_marketplace::package_info_t> filtered;
-			filtered.reserve(s.last_results.size());
-			for (const auto& p : s.last_results) {
-				if (s.active_category != category_t::all &&
-					classify_package(p) != s.active_category) continue;
-				filtered.push_back(p);
-			}
+			const auto& filtered = s.last_results;
 
 			if (s.last_search_state == ::mcp_marketplace::search_state_t::searching &&
 				s.last_results.empty()) {
+				// Loading skeleton rows.
 				ImVec2 sp = ImGui::GetCursorScreenPos();
 				ImDrawList* sdl = ImGui::GetWindowDrawList();
-				for (int i = 0; i < 4; ++i) {
-					float card_h = 96.f;
-					ImVec2 ka(sp.x, sp.y + i * (card_h + 12.f));
-					ImVec2 kb(sp.x + content_w - 16.f, ka.y + card_h);
-					aida::ui::skeleton::render_card(sdl, ka, kb, 12.f, 1.5f);
+				for (int i = 0; i < 6; ++i) {
+					float row_h = 58.f;
+					ImVec2 ka(sp.x, sp.y + i * (row_h + 1.f));
+					ImVec2 kb(sp.x + content_w, ka.y + row_h);
+					aida::ui::skeleton::render_card(sdl, ka, kb, 6.f, 1.5f);
 				}
-				ImGui::Dummy(ImVec2(content_w, 4 * 108.f));
+				ImGui::Dummy(ImVec2(content_w, 6 * 59.f));
 			} else if (filtered.empty()) {
 				ImVec2 region_pos = ImGui::GetCursorScreenPos();
 				ImVec2 region_size(content_w, content_h);
@@ -803,36 +730,14 @@ namespace aida::mcp_marketplace_view {
 					: std::string("No matches");
 				cfg.body = s.last_results.empty()
 					? std::string("Type a query above to discover MCP servers from npm.")
-					: std::string("No packages match the selected category.");
+					: std::string("No servers found for this query.");
 				cfg.max_width = content_w * 0.7f;
 				aida::ui::empty_state::render(region_pos, region_size, cfg);
 			} else {
-				int featured_count = std::min((int)filtered.size(), 4);
-				if (featured_count > 0) {
-					ImVec2 fp = ImGui::GetCursorScreenPos();
-					float fc_w = 220.f;
-					float fc_h = 140.f;
-					float fx = fp.x;
-					for (int i = 0; i < featured_count; ++i) {
-						render_featured_card(fx, fp.y, fc_w, fc_h, filtered[i], dt);
-						fx += fc_w + 12.f;
-						if (fx + fc_w > fp.x + content_w - 16.f) break;
-					}
-					ImGui::Dummy(ImVec2(content_w, fc_h + 16.f));
-				}
-
-				ImVec2 hdr_p = ImGui::GetCursorScreenPos();
-				wdl->AddText(aida::ui::fonts::body_strong(), 13.f,
-					hdr_p, aida::ui::with_alpha(th.text_primary, alpha),
-					"All servers");
-				ImGui::Dummy(ImVec2(content_w, 22.f));
-
-				const float card_h = 88.f;
-				const float card_gap = 10.f;
-				for (size_t i = featured_count; i < filtered.size(); ++i) {
+				// Clean list view -- one row per server.
+				for (size_t i = 0; i < filtered.size(); ++i) {
 					ImVec2 cp = ImGui::GetCursorScreenPos();
-					render_full_card(cp.x, cp.y, content_w - 16.f, card_h, filtered[i], dt);
-					ImGui::Dummy(ImVec2(content_w, card_h + card_gap));
+					render_list_row(cp.x, cp.y, content_w, filtered[i], dt);
 				}
 			}
 

@@ -451,6 +451,7 @@ void render_tree_node(state_t& st, const std::shared_ptr<path_node_t>& node, con
         ImGui::PushID(visible_counter);
         const ImVec2 cursor_screen = ImGui::GetCursorScreenPos();
         const float row_h = 22.f;
+        const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const float win_w = ImGui::GetContentRegionAvail().x;
 
@@ -483,7 +484,7 @@ void render_tree_node(state_t& st, const std::shared_ptr<path_node_t>& node, con
         }
 
         ImU32 txt_col = aida::ui::with_alpha(node->in_scope ? th.text_primary : th.text_dim, r_alpha);
-        dl->AddText(ImVec2(text_x, cursor_screen.y + 4.f), txt_col, display_seg.c_str());
+        dl->AddText(ImVec2(text_x, cursor_screen.y + text_oy), txt_col, display_seg.c_str());
 
         if (node->total_requests > 0) {
             char buf[64];
@@ -492,7 +493,7 @@ void render_tree_node(state_t& st, const std::shared_ptr<path_node_t>& node, con
             dl->AddRectFilled(ImVec2(cursor_screen.x + win_w - bw - 4.f, cursor_screen.y + 3.f),
                               ImVec2(cursor_screen.x + win_w - 4.f, cursor_screen.y + row_h - 3.f),
                               aida::ui::with_alpha(th.accent_dim, r_alpha * 0.6f), 4.f);
-            dl->AddText(ImVec2(cursor_screen.x + win_w - bw + 2.f, cursor_screen.y + 4.f),
+            dl->AddText(ImVec2(cursor_screen.x + win_w - bw + 2.f, cursor_screen.y + text_oy),
                         aida::ui::with_alpha(th.text_secondary, r_alpha), buf);
         }
 
@@ -576,6 +577,7 @@ void render_tree(state_t& st, float width, float height, float alpha)
         ImGui::PushID(visible);
         const ImVec2 cs = ImGui::GetCursorScreenPos();
         const float row_h = 22.f;
+        const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const float win_w = ImGui::GetContentRegionAvail().x;
 
@@ -607,7 +609,7 @@ void render_tree(state_t& st, float width, float height, float alpha)
         }
 
         ImU32 host_col = aida::ui::with_alpha(h.in_scope ? aida::ui::resolved().text_primary : aida::ui::resolved().text_dim, r_alpha);
-        dl->AddText(ImVec2(cs.x + 20.f, cs.y + 4.f), host_col, header_buf);
+        dl->AddText(ImVec2(cs.x + 20.f, cs.y + text_oy), host_col, header_buf);
 
         ImGui::InvisibleButton("##sitemap_host_row", ImVec2(win_w, row_h));
         if (ImGui::IsItemClicked()) {
@@ -859,6 +861,7 @@ void render_right_pane(state_t& st, float width, float height, float alpha)
     ImVec2 lorg = ImGui::GetWindowPos();
 
     const float row_h = 22.f;
+    const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
     const float col_id     = 60.f;
     const float col_method = 60.f;
     const float col_status = 60.f;
@@ -870,12 +873,12 @@ void render_right_pane(state_t& st, float width, float height, float alpha)
                        aida::ui::with_alpha(th.panel_header, alpha));
     float cx = lorg.x + 6.f;
     ImU32 hdr_col = aida::ui::with_alpha(th.text_secondary, alpha);
-    ldl->AddText(ImVec2(cx, lorg.y + 4.f), hdr_col, "#");       cx += col_id;
-    ldl->AddText(ImVec2(cx, lorg.y + 4.f), hdr_col, "Method");  cx += col_method;
-    ldl->AddText(ImVec2(cx, lorg.y + 4.f), hdr_col, "Path");    cx += col_path;
-    ldl->AddText(ImVec2(cx, lorg.y + 4.f), hdr_col, "Status");  cx += col_status;
-    ldl->AddText(ImVec2(cx, lorg.y + 4.f), hdr_col, "Size");    cx += col_size;
-    ldl->AddText(ImVec2(cx, lorg.y + 4.f), hdr_col, "Time");
+    ldl->AddText(ImVec2(cx, lorg.y + text_oy), hdr_col, "#");       cx += col_id;
+    ldl->AddText(ImVec2(cx, lorg.y + text_oy), hdr_col, "Method");  cx += col_method;
+    ldl->AddText(ImVec2(cx, lorg.y + text_oy), hdr_col, "Path");    cx += col_path;
+    ldl->AddText(ImVec2(cx, lorg.y + text_oy), hdr_col, "Status");  cx += col_status;
+    ldl->AddText(ImVec2(cx, lorg.y + text_oy), hdr_col, "Size");    cx += col_size;
+    ldl->AddText(ImVec2(cx, lorg.y + text_oy), hdr_col, "Time");
 
     ImGui::SetCursorPosY(row_h + 4.f);
     const uint64_t sel_id = st.selected_exchange_id.load();
@@ -925,7 +928,7 @@ void render_right_pane(state_t& st, float width, float height, float alpha)
         ImU32 txt = aida::ui::with_alpha(th.text_primary, r_alpha);
         ImU32 dim = aida::ui::with_alpha(th.text_dim, r_alpha);
         float lx = lorg.x + 6.f;
-        const float ty = abs_ry + 4.f;
+        const float ty = abs_ry + text_oy;
         char buf[64];
 
         std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(e.id));

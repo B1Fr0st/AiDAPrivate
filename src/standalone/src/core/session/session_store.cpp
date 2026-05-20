@@ -17,6 +17,7 @@
 #include <sqlite3.h>
 
 #include "event_bus.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "Shell32.lib")
@@ -762,12 +763,17 @@ bool list_with_filter(const std::string& filter_clause,
 
 bool initialize()
 {
-    if (g_initialized.load(std::memory_order_acquire)) return true;
+    diag::log_tagged("session", "initialize enter");
+    if (g_initialized.load(std::memory_order_acquire)) {
+        diag::log_tagged("session", "initialize already_initialized");
+        return true;
+    }
 
     std::lock_guard<std::mutex> lk(g_init_mutex);
     if (g_initialized.load(std::memory_order_acquire)) return true;
 
     const std::filesystem::path db_path = resolve_database_path();
+    diag::log_tagged_fmt("session", "initialize db_path='%s'", db_path.string().c_str());
     std::error_code ec;
     std::filesystem::create_directories(db_path.parent_path(), ec);
 
@@ -806,23 +812,28 @@ bool initialize()
 
     g_db.store(db, std::memory_order_release);
     g_initialized.store(true, std::memory_order_release);
+    diag::log_tagged("session", "initialize SUCCESS db_open schema_ready");
     return true;
 }
 
 
 bool shutdown()
 {
+    diag::log_tagged("session", "shutdown enter");
     std::lock_guard<std::mutex> lk(g_init_mutex);
     sqlite3* db = g_db.exchange(nullptr, std::memory_order_acq_rel);
     g_initialized.store(false, std::memory_order_release);
     if (!db) {
+        diag::log_tagged("session", "shutdown no_db_handle");
         return true;
     }
     int rc = sqlite3_close_v2(db);
     if (rc != SQLITE_OK) {
         set_last_error("sqlite_close_failed");
+        diag::log_tagged_fmt("session", "shutdown FAILED sqlite_close rc=%d", rc);
         return false;
     }
+    diag::log_tagged("session", "shutdown SUCCESS db_closed");
     return true;
 }
 
@@ -832,9 +843,12 @@ bool create(session_info_t& out_info,
             const std::string& binary_path,
             const std::string& parent_id)
 {
+    diag::log_tagged_fmt("session", "create enter project='%s' binary='%s' parent='%s'",
+        project_id.c_str(), binary_path.c_str(), parent_id.c_str());
     sqlite3* db = db_handle();
     if (!db) {
         set_last_error("not_initialized");
+        diag::log_tagged("session", "create FAILED not_initialized");
         return false;
     }
 
@@ -872,6 +886,8 @@ bool create(session_info_t& out_info,
         aida::events::publish(aida::events::event_session_created, evt);
     }
 
+    diag::log_tagged_fmt("session", "create SUCCESS id='%s' slug='%s'",
+        out_info.id.c_str(), out_info.slug.c_str());
     return true;
 }
 
@@ -990,9 +1006,12 @@ bool fork(const std::string& session_id,
           const std::string& fork_at_message_id,
           session_info_t& out_new)
 {
+    diag::log_tagged_fmt("session", "fork enter session='%s' fork_at='%s'",
+        session_id.c_str(), fork_at_message_id.c_str());
     sqlite3* db = db_handle();
     if (!db) {
         set_last_error("not_initialized");
+        diag::log_tagged("session", "fork FAILED not_initialized");
         return false;
     }
 
@@ -1266,9 +1285,11 @@ bool set_compacting(const std::string& session_id, int64_t compacting_unix)
 
 bool remove(const std::string& session_id)
 {
+    diag::log_tagged_fmt("session", "remove enter session='%s'", session_id.c_str());
     sqlite3* db = db_handle();
     if (!db) {
         set_last_error("not_initialized");
+        diag::log_tagged("session", "remove FAILED not_initialized");
         return false;
     }
     if (!exec_simple(db, "BEGIN IMMEDIATE")) return false;
@@ -1360,6 +1381,8 @@ bool remove(const std::string& session_id)
 
 bool set_title(const std::string& session_id, const std::string& title)
 {
+    diag::log_tagged_fmt("session", "set_title session='%s' title='%s'",
+        session_id.c_str(), title.c_str());
     sqlite3* db = db_handle();
     if (!db) {
         set_last_error("not_initialized");
@@ -1396,13 +1419,18 @@ bool set_title(const std::string& session_id, const std::string& title)
 
 bool append_message(const message_t& message)
 {
+    diag::log_tagged_fmt("session", "append_message enter msg_id='%s' session='%s' role=%s parts=%zu",
+        message.id.c_str(), message.session_id.c_str(),
+        role_to_string(message.role).c_str(), message.parts.size());
     sqlite3* db = db_handle();
     if (!db) {
         set_last_error("not_initialized");
+        diag::log_tagged("session", "append_message FAILED not_initialized");
         return false;
     }
     if (message.id.empty() || message.session_id.empty()) {
         set_last_error("invalid_message_id");
+        diag::log_tagged("session", "append_message FAILED invalid_message_id");
         return false;
     }
 

@@ -158,11 +158,12 @@ void render(float pos_x, float pos_y, float width, float height,
 
     ImVec2 table_org = ImGui::GetWindowPos();
     const float row_h = 26.f;
+    const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
     dl->AddRectFilled(ImVec2(table_org.x, table_org.y), ImVec2(table_org.x + width - 12.f, table_org.y + row_h),
                       aida::ui::with_alpha(th.panel_header, alpha));
     float cx = table_org.x + 8.f;
     ImU32 hdr_col = aida::ui::with_alpha(th.text_secondary, alpha);
-    dl->AddText(ImVec2(cx, table_org.y + 6.f), hdr_col, "Label / Hops / Actions");
+    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Label / Hops / Actions");
 
     ImGui::SetCursorPosY(row_h + 4.f);
 
@@ -187,7 +188,7 @@ void render(float pos_x, float pos_y, float width, float height,
         std::string label_disp = c.label;
         if (c.id == active) label_disp += "  (active)";
 
-        float ty = abs_ry + 4.f;
+        float ty = abs_ry + text_oy;
         float lx = table_org.x + 8.f;
         ImU32 col = aida::ui::with_alpha(c.id == active ? th.success : th.text_primary, r_alpha);
         dl->AddText(ImVec2(lx, ty), col, label_disp.c_str());
@@ -207,7 +208,7 @@ void render(float pos_x, float pos_y, float width, float height,
                     aida::ui::with_alpha(th.text_secondary, r_alpha),
                     hops_buf);
 
-        ImGui::SetCursorScreenPos(ImVec2(table_org.x + width - 12.f - 240.f, abs_ry + 1.f));
+        ImGui::SetCursorScreenPos(ImVec2(table_org.x + width - 12.f - 240.f, abs_ry + (row_h - ImGui::GetFrameHeight()) * 0.5f));
         if (c.id == active) {
             if (ImGui::SmallButton("Deactivate")) set_active_chain(0);
         } else {

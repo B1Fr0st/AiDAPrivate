@@ -244,7 +244,7 @@ endif()
 
 if(WIN32 AND MSVC)
     add_executable(aida_build_seed_gen tools/build_seed/build_seed_gen.cpp)
-    target_compile_options(aida_build_seed_gen PRIVATE /W4 /EHsc /O2 /MD /Zc:__cplusplus /permissive-)
+    target_compile_options(aida_build_seed_gen PRIVATE /W4 /EHsc $<IF:$<CONFIG:Debug>,/Od,/O2> /MD /Zc:__cplusplus /permissive-)
     target_compile_definitions(aida_build_seed_gen PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
     target_link_libraries(aida_build_seed_gen PRIVATE bcrypt)
     set_target_properties(aida_build_seed_gen PROPERTIES
@@ -253,7 +253,7 @@ if(WIN32 AND MSVC)
     )
 
     add_executable(aida_pdb_scrubber tools/pdb_scrubber/pdb_scrubber.cpp)
-    target_compile_options(aida_pdb_scrubber PRIVATE /W4 /EHsc /O2 /MD /Zc:__cplusplus /permissive-)
+    target_compile_options(aida_pdb_scrubber PRIVATE /W4 /EHsc $<IF:$<CONFIG:Debug>,/Od,/O2> /MD /Zc:__cplusplus /permissive-)
     target_compile_definitions(aida_pdb_scrubber PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
     set_target_properties(aida_pdb_scrubber PROPERTIES
         OUTPUT_NAME "aida_pdb_scrubber"
@@ -1286,6 +1286,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_shadowfs.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_verify.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_sentinel.cpp"
+            "${STANDALONE_ROOT}/core/testlab/test_all_features.cpp"
             "${DEPS_DIR}/sqlite-amalgamation-3530000/sqlite3.c"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/hardware_id/hardware_id.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/hardware_id/hardware_id_v2.cpp"
@@ -1391,6 +1392,7 @@ if(WIN32)
             GHIDRA_SPECS_DIR=${GHIDRA_SPECS_OUTPUT_DIR}
             AIDA_DEEP_STEAL=1
             AIDA_TEST_VMWARE_BYPASS=1
+            AIDA_STANDALONE
         )
 
         target_compile_options(AiDAStandalone PRIVATE
@@ -1887,8 +1889,20 @@ if(WIN32)
 
     target_link_libraries(AiDA PRIVATE delayimp)
 
+    # AiDA is a DLL loaded into IDA Pro — IDA provides its own process hardening.
+    # triton.lib and libcrypto_static.lib contain objects without /guard:ehcont
+    # metadata (ASM objects), causing LNK2047 errors. Apply hardening WITHOUT
+    # ehcont for this target; AiDAStandalone still gets full ehcont hardening.
     if(TARGET aida_hardening)
-        target_link_libraries(AiDA PRIVATE aida_hardening)
+        target_compile_options(AiDA PRIVATE
+            $<$<COMPILE_LANGUAGE:C,CXX>:/GS>
+            $<$<COMPILE_LANGUAGE:C,CXX>:/guard:cf>
+            $<$<COMPILE_LANGUAGE:C,CXX>:/Qspectre>
+            $<$<COMPILE_LANGUAGE:CXX>:/sdl>
+        )
+        target_link_options(AiDA PRIVATE
+            /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT /CETCOMPAT /guard:cf
+        )
     endif()
 
     target_link_libraries(AiDA PRIVATE
@@ -2005,7 +2019,7 @@ if(BUILD_PROTECTOR)
     )
 
     add_executable(AiDAExtractPayload tools/protector/payload/extract_payload.cpp)
-    target_compile_options(AiDAExtractPayload PRIVATE /W4 /WX /EHsc /O2 /Zc:__cplusplus /std:c++17)
+    target_compile_options(AiDAExtractPayload PRIVATE /W4 /WX /EHsc $<IF:$<CONFIG:Debug>,/Od,/O2> /Zc:__cplusplus /std:c++17)
     target_compile_definitions(AiDAExtractPayload PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
 
     set(AIDA_PAYLOAD_OBJ "${CMAKE_BINARY_DIR}/aida_payload.obj")
@@ -2048,7 +2062,7 @@ if(BUILD_PROTECTOR)
         _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
     )
     target_compile_options(AiDAProtectorVerify PRIVATE
-        /W4 /EHsc /O2 /Zc:__cplusplus /permissive- /MD
+        /W4 /EHsc $<IF:$<CONFIG:Debug>,/Od,/O2> /Zc:__cplusplus /permissive- /MD
     )
     target_link_libraries(AiDAProtectorVerify PRIVATE bcrypt advapi32)
     set_target_properties(AiDAProtectorVerify PROPERTIES
@@ -2061,7 +2075,7 @@ if(BUILD_PROTECTOR)
         _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
     )
     target_compile_options(AiDAProtectorTest PRIVATE
-        /W4 /EHsc /O2 /Zc:__cplusplus /permissive- /MD
+        /W4 /EHsc $<IF:$<CONFIG:Debug>,/Od,/O2> /Zc:__cplusplus /permissive- /MD
     )
     set_target_properties(AiDAProtectorTest PROPERTIES
         OUTPUT_NAME "aida_protector_test"
@@ -2078,7 +2092,7 @@ if(BUILD_PROTECTOR)
             _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
         )
         target_compile_options(MATRYOSHKA_TEST PRIVATE
-            /W4 /EHsc /O2 /Zc:__cplusplus /permissive- /MD /std:c++17
+            /W4 /EHsc $<IF:$<CONFIG:Debug>,/Od,/O2> /Zc:__cplusplus /permissive- /MD /std:c++17
         )
         target_link_libraries(MATRYOSHKA_TEST PRIVATE bcrypt advapi32)
         set_target_properties(MATRYOSHKA_TEST PROPERTIES
@@ -2088,14 +2102,14 @@ if(BUILD_PROTECTOR)
     endif()
 
     add_executable(AiDATestPayload tools/protector/test_payload/test_payload.c)
-    target_compile_options(AiDATestPayload PRIVATE /W3 /O2 /MD)
+    target_compile_options(AiDATestPayload PRIVATE /W3 $<IF:$<CONFIG:Debug>,/Od,/O2> /MD)
     set_target_properties(AiDATestPayload PROPERTIES
         OUTPUT_NAME "aida_test_payload"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
     )
 
     add_executable(AiDAHelloLoop tools/protector/test_payload/hello_loop.cpp)
-    target_compile_options(AiDAHelloLoop PRIVATE /W3 /O2 /MD /EHsc /std:c++17 /Zc:threadSafeInit)
+    target_compile_options(AiDAHelloLoop PRIVATE /W3 $<IF:$<CONFIG:Debug>,/Od,/O2> /MD /EHsc /std:c++17 /Zc:threadSafeInit)
     target_compile_definitions(AiDAHelloLoop PRIVATE
         _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
     )
@@ -2308,4 +2322,8 @@ endif()
 
 if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/overlap_test/CMakeLists.txt")
     add_subdirectory(tools/overlap_test)
+endif()
+
+if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/test_target/CMakeLists.txt")
+    add_subdirectory(src/standalone/test_target)
 endif()

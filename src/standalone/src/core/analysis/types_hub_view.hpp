@@ -1020,22 +1020,30 @@ inline void render_stat_bar(ImDrawList* dl, ImVec2 origin, float width, float he
 		{ "functions", st.function_count, th.syn_function },
 		{ "symbols",   st.symbol_count,   th.text_address },
 	};
+	const float fs_chip_value = fs_base * 1.22f;
+	const float fs_chip_label = fs_base * 1.0f;
+	const float chip_pad_top = 6.f;
+	const float chip_value_gap = 4.f;
+	const float chip_pad_bot = 8.f;
 	for (auto& c : chips) {
-		const float fs_chip_value = fs_base * 1.22f;
-		const float fs_chip_label = fs_base * 0.88f;
 		char value_buf[24];
 		std::snprintf(value_buf, sizeof(value_buf), "%zu", c.value);
 		ImVec2 vsz = code->CalcTextSizeA(fs_chip_value, FLT_MAX, 0.f, value_buf);
 		ImVec2 lsz = body->CalcTextSizeA(fs_chip_label, FLT_MAX, 0.f, c.label);
 		float chip_w = std::max(vsz.x, lsz.x) + 22.f;
-		float chip_h = 44.f;
+		float content_h_raw = chip_pad_top + vsz.y + chip_value_gap + lsz.y + chip_pad_bot;
+		float chip_h = std::max(content_h_raw, 48.f);
 		ImVec2 ca = ImVec2(x, stat_y);
 		ImVec2 cb = ImVec2(x + chip_w, stat_y + chip_h);
+		float inner_content_h = vsz.y + chip_value_gap + lsz.y;
+		float vert_offset = (chip_h - inner_content_h) * 0.5f;
+		float value_y = ca.y + vert_offset;
+		float caption_y = value_y + vsz.y + chip_value_gap;
 		dl->AddRectFilled(ca, cb, aida::ui::with_alpha(c.color, alpha * 0.10f), 6.f);
 		dl->AddRect(ca, cb, aida::ui::with_alpha(c.color, alpha * 0.42f), 6.f, 0, 1.f);
-		dl->AddText(code, fs_chip_value, ImVec2(ca.x + (chip_w - vsz.x) * 0.5f, ca.y + 4.f),
+		dl->AddText(code, fs_chip_value, ImVec2(ca.x + (chip_w - vsz.x) * 0.5f, value_y),
 			aida::ui::with_alpha(c.color, alpha), value_buf);
-		dl->AddText(body, fs_chip_label, ImVec2(ca.x + (chip_w - lsz.x) * 0.5f, ca.y + 26.f),
+		dl->AddText(body, fs_chip_label, ImVec2(ca.x + (chip_w - lsz.x) * 0.5f, caption_y),
 			aida::ui::with_alpha(th.text_dim, alpha), c.label);
 		x += chip_w + 8.f;
 	}
@@ -1903,7 +1911,20 @@ inline void render_active(int idx, float cw, float ch, float fa, float ar, float
 		st.status_text = "Parsing PDB...";
 	}
 
-	const float stat_h = 76.f;
+	float stat_h;
+	{
+		const float sb_fs = aida::ui::components::detail::ui_fs();
+		ImFont* sb_value_font = aida::ui::fonts::code();
+		if (!sb_value_font) sb_value_font = ImGui::GetFont();
+		ImFont* sb_label_font = aida::ui::fonts::body();
+		if (!sb_label_font) sb_label_font = ImGui::GetFont();
+		float sb_value_h = sb_value_font->CalcTextSizeA(sb_fs * 1.22f, FLT_MAX, 0.f, "0").y;
+		float sb_label_h = sb_label_font->CalcTextSizeA(sb_fs * 1.0f, FLT_MAX, 0.f, "structs").y;
+		float sb_chip_h = 6.f + sb_value_h + 4.f + sb_label_h + 8.f;
+		if (sb_chip_h < 48.f) sb_chip_h = 48.f;
+		stat_h = 32.f + sb_chip_h + 8.f;
+		if (stat_h < 80.f) stat_h = 80.f;
+	}
 	const float stat_gap = 10.f;
 
 	ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1927,10 +1948,12 @@ inline void render_active(int idx, float cw, float ch, float fa, float ar, float
 	if (body_h < 80.f) body_h = 80.f;
 
 	if (tab == sub_tab_t::inferred) {
+		ImGui::SetCursorScreenPos(ImVec2(win_pos.x + 8.f, win_pos.y + body_y));
 		struct_recon_view::render(8.f, body_y, cw - 16.f, body_h, fa, ar, ag, ab);
 		return;
 	}
 	if (tab == sub_tab_t::dissector) {
+		ImGui::SetCursorScreenPos(ImVec2(win_pos.x + 8.f, win_pos.y + body_y));
 		struct_dissector_view::render(8.f, body_y, cw - 16.f, body_h, fa, ar, ag, ab);
 		return;
 	}

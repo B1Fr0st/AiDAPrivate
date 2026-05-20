@@ -211,6 +211,7 @@ void render_issues_pane(float w, float h, float alpha)
     ImGui::BeginChild("##burp_issue_list", ImVec2(w - 4.f, list_h), false, ImGuiWindowFlags_NoBackground);
     ImVec2 lo = ImGui::GetWindowPos();
     float row_h = 22.f;
+    const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
     float col_sev = 80.f, col_conf = 70.f, col_host = 220.f, col_param = 140.f;
     float col_type = (w - 8.f - col_sev - col_conf - col_host - col_param - 16.f);
     if (col_type < 120.f) col_type = 120.f;
@@ -221,11 +222,11 @@ void render_issues_pane(float w, float h, float alpha)
                           aida::ui::with_alpha(th.panel_header, alpha));
         float cx = lo.x + 8.f;
         ImU32 hc = aida::ui::with_alpha(th.text_secondary, alpha);
-        dl->AddText(ImVec2(cx, hy + 4.f), hc, "Severity"); cx += col_sev;
-        dl->AddText(ImVec2(cx, hy + 4.f), hc, "Conf.");    cx += col_conf;
-        dl->AddText(ImVec2(cx, hy + 4.f), hc, "Host");     cx += col_host;
-        dl->AddText(ImVec2(cx, hy + 4.f), hc, "Param");    cx += col_param;
-        dl->AddText(ImVec2(cx, hy + 4.f), hc, "Type");
+        dl->AddText(ImVec2(cx, hy + text_oy), hc, "Severity"); cx += col_sev;
+        dl->AddText(ImVec2(cx, hy + text_oy), hc, "Conf.");    cx += col_conf;
+        dl->AddText(ImVec2(cx, hy + text_oy), hc, "Host");     cx += col_host;
+        dl->AddText(ImVec2(cx, hy + text_oy), hc, "Param");    cx += col_param;
+        dl->AddText(ImVec2(cx, hy + text_oy), hc, "Type");
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + row_h + 4.f);
     }
 
@@ -247,15 +248,15 @@ void render_issues_pane(float w, float h, float alpha)
         if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) s.selected_issue_id = it.id;
 
         float cx = lo.x + 8.f;
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), sev_color(it.severity, alpha), severity_label(it.severity)); cx += col_sev;
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), conf_color(it.confidence, alpha), confidence_label(it.confidence)); cx += col_conf;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), sev_color(it.severity, alpha), severity_label(it.severity)); cx += col_sev;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), conf_color(it.confidence, alpha), confidence_label(it.confidence)); cx += col_conf;
         std::string host = it.host;
         if (host.size() > 32) host = host.substr(0, 29) + "...";
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), aida::ui::with_alpha(th.text_primary, alpha), host.c_str()); cx += col_host;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), aida::ui::with_alpha(th.text_primary, alpha), host.c_str()); cx += col_host;
         std::string param = it.parameter;
         if (param.size() > 18) param = param.substr(0, 15) + "...";
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), aida::ui::with_alpha(th.text_secondary, alpha), param.c_str()); cx += col_param;
-        dl->AddText(ImVec2(cx, abs_ry + 3.f), aida::ui::with_alpha(th.text_primary, alpha), it.type_key.c_str());
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), aida::ui::with_alpha(th.text_secondary, alpha), param.c_str()); cx += col_param;
+        dl->AddText(ImVec2(cx, abs_ry + text_oy), aida::ui::with_alpha(th.text_primary, alpha), it.type_key.c_str());
 
         ImGui::SetCursorPosY(ry + row_h);
     }

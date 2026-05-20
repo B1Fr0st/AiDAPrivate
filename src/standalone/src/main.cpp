@@ -663,9 +663,20 @@ static void show_ban_refuse_ui_and_exit(const std::string& reason, const std::st
 
 __declspec(noinline) static DWORD seh_render_title(helpers* h, uint64_t frame_number)
 {
+    // Save ImGui stack state before rendering so we can recover on SEH exception.
+    // Without this, an access-violation mid-render leaves Begin/End and Push/Pop
+    // stacks unbalanced, causing cascading "Missing EndChild/PopStyleVar" errors
+    // on every subsequent frame (Bug #11 - imgui.ini corruption crash).
+    ImGuiErrorRecoveryState imgui_state_backup;
+    ImGui::ErrorRecoveryStoreState(&imgui_state_backup);
+
     __try {
         h->render_title();
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        // Recover ImGui internal stacks to the state before render_title().
+        // This pops all un-popped Begin/End, Push/Pop pairs so the next
+        // frame starts clean instead of cascading errors.
+        ImGui::ErrorRecoveryTryToRecoverState(&imgui_state_backup);
         return GetExceptionCode();
     }
     return 0;
@@ -673,9 +684,12 @@ __declspec(noinline) static DWORD seh_render_title(helpers* h, uint64_t frame_nu
 
 __declspec(noinline) static DWORD seh_render_source_reconstruct(uint64_t frame_number)
 {
+    ImGuiErrorRecoveryState imgui_state_backup;
+    ImGui::ErrorRecoveryStoreState(&imgui_state_backup);
     __try {
         source_reconstruct_view::render(1.0f, globals::ui::accent.x, globals::ui::accent.y, globals::ui::accent.z);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        ImGui::ErrorRecoveryTryToRecoverState(&imgui_state_backup);
         return GetExceptionCode();
     }
     return 0;
@@ -683,9 +697,12 @@ __declspec(noinline) static DWORD seh_render_source_reconstruct(uint64_t frame_n
 
 __declspec(noinline) static DWORD seh_render_toast(uint64_t frame_number)
 {
+    ImGuiErrorRecoveryState imgui_state_backup;
+    ImGui::ErrorRecoveryStoreState(&imgui_state_backup);
     __try {
         toast_notification::render();
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        ImGui::ErrorRecoveryTryToRecoverState(&imgui_state_backup);
         return GetExceptionCode();
     }
     return 0;
@@ -753,9 +770,12 @@ __declspec(noinline) static DWORD seh_swapchain_present(IDXGISwapChain* sc, HRES
 
 __declspec(noinline) static DWORD seh_render_command_palette(uint64_t frame_number)
 {
+    ImGuiErrorRecoveryState imgui_state_backup;
+    ImGui::ErrorRecoveryStoreState(&imgui_state_backup);
     __try {
         aida::command_palette::render();
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        ImGui::ErrorRecoveryTryToRecoverState(&imgui_state_backup);
         return GetExceptionCode();
     }
     return 0;
@@ -763,6 +783,8 @@ __declspec(noinline) static DWORD seh_render_command_palette(uint64_t frame_numb
 
 __declspec(noinline) static DWORD seh_render_agent_picker(uint64_t frame_number)
 {
+    ImGuiErrorRecoveryState imgui_state_backup;
+    ImGui::ErrorRecoveryStoreState(&imgui_state_backup);
     __try {
         aida::agent_picker::render_if_open();
         if (aida::agent_picker::consume_manager_request()) {
@@ -770,6 +792,7 @@ __declspec(noinline) static DWORD seh_render_agent_picker(uint64_t frame_number)
             aida::settings_overlay::set_active_tab(aida::settings_overlay::tab_agents);
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        ImGui::ErrorRecoveryTryToRecoverState(&imgui_state_backup);
         return GetExceptionCode();
     }
     return 0;

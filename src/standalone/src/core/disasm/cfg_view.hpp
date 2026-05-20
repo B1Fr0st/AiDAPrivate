@@ -38,6 +38,7 @@
 #include "../ui/skeleton.hpp"
 #include "../ui/fonts.hpp"
 #include "../helpers/globals.h"
+#include "../../helpers/diag_log.hpp"
 
 extern DisasmState g_disasm;
 
@@ -423,8 +424,14 @@ inline void build_cfg(uint64_t entry_address)
 {
 	detail::ensure_pdb_subscription();
 
-	if (g_state.building.load())
+	if (g_state.building.load()) {
+		diag::log_tagged_fmt("cfg", "build_cfg skipped already_building entry=0x%llX",
+			static_cast<unsigned long long>(entry_address));
 		return;
+	}
+
+	diag::log_tagged_fmt("cfg", "build_cfg START entry=0x%llX pid=%u",
+		static_cast<unsigned long long>(entry_address), driver_bridge::attached_pid());
 
 	g_state.building.store(true);
 	{
@@ -433,6 +440,7 @@ inline void build_cfg(uint64_t entry_address)
 	}
 
 	work_queue::post([entry_address]() {
+		auto t_start = std::chrono::steady_clock::now();
 		const size_t max_bytes = 0x10000;
 		const size_t max_insns = 4096;
 
@@ -447,9 +455,13 @@ inline void build_cfg(uint64_t entry_address)
 		}
 
 		if (mem.empty()) {
+			diag::log_tagged_fmt("cfg", "build_cfg FAILED no_memory_data entry=0x%llX have_data=%d",
+				static_cast<unsigned long long>(entry_address), static_cast<int>(have_data));
 			g_state.building.store(false);
 			return;
 		}
+		diag::log_tagged_fmt("cfg", "build_cfg memory_read %zu bytes from 0x%llX",
+			mem.size(), static_cast<unsigned long long>(entry_address));
 
 		struct decoded_insn_t {
 			AsmInstr    ins;
@@ -583,13 +595,21 @@ inline void build_cfg(uint64_t entry_address)
 			}
 		}
 
-		float line_h = 14.f;
-		float padding = 8.f;
-		float header_h = 22.f;
-		const float char_w_est = 8.4f;
-		const float addr_col_w = 96.f;
-		const float min_node_w = 280.f;
-		const float max_node_w = 960.f;
+		ImFont* code_font = aida::ui::fonts::code();
+		if (!code_font) code_font = ImGui::GetFont();
+		ImFont* ui_font = aida::ui::fonts::body_em();
+		if (!ui_font) ui_font = ImGui::GetFont();
+		float code_base = code_font && code_font->FontSize > 0.f ? code_font->FontSize : 13.f;
+		float ui_base = ui_font && ui_font->FontSize > 0.f ? ui_font->FontSize : 13.f;
+
+		const float line_gap = 5.f;
+		const float line_h = code_base + line_gap;
+		const float padding = 14.f;
+		const float header_h = ui_base + 12.f;
+		const float addr_gap = 14.f;
+		const float text_slack = 24.f;
+		const float min_node_w = 380.f;
+		const float max_node_w = 1200.f;
 
 		std::map<int, std::vector<function_index::injection_row_t>> entry_injections;
 		for (int bi = 0; bi < static_cast<int>(blocks.size()); ++bi) {
@@ -614,27 +634,71 @@ inline void build_cfg(uint64_t entry_address)
 			cfg_layout::node_t n;
 			n.id = i;
 			n.is_entry = blocks[i].is_entry;
-			size_t max_text_chars = 0;
+
+			float addr_w = 0.f;
+			float text_w = 0.f;
 			for (auto& ln : blocks[i].instructions) {
-				size_t c = ln.text.size();
-				if (c > max_text_chars) max_text_chars = c;
+				char ab[24];
+				std::snprintf(ab, sizeof(ab), "%llX",
+					static_cast<unsigned long long>(ln.addr));
+				float aw = code_font->CalcTextSizeA(code_base, FLT_MAX, 0.f, ab).x;
+				if (aw > addr_w) addr_w = aw;
+				if (!ln.text.empty()) {
+					float tw = code_font->CalcTextSizeA(code_base, FLT_MAX, 0.f,
+						ln.text.c_str()).x;
+					if (tw > text_w) text_w = tw;
+				}
 			}
+
 			size_t inj_lines = 0;
 			auto it_inj = entry_injections.find(i);
 			if (it_inj != entry_injections.end()) {
 				inj_lines = it_inj->second.size();
 				for (const auto& r : it_inj->second) {
-					size_t c = r.text.size();
-					if (c > max_text_chars) max_text_chars = c;
+					if (r.text.empty()) continue;
+					float tw = code_font->CalcTextSizeA(code_base, FLT_MAX, 0.f,
+						r.text.c_str()).x;
+					if (tw > text_w) text_w = tw;
 				}
 			}
-			float w = addr_col_w + static_cast<float>(max_text_chars) * char_w_est + padding * 2.f + 16.f;
+
+			char header_buf[160];
+			const char* kind = blocks[i].is_entry
+				? "ENTRY"
+				: (blocks[i].successors.empty() && !blocks[i].is_entry ? "EXIT" : "BLOCK");
+			if (blocks[i].is_entry) {
+				std::string fname = detail::resolve_branch_symbol_for_cfg(entry_address);
+				if (fname.empty() && entry_address != blocks[i].start_addr)
+					fname = detail::resolve_branch_symbol_for_cfg(blocks[i].start_addr);
+				if (!fname.empty()) {
+					size_t avail = sizeof(header_buf) - 12;
+					std::string fn_short = fname.size() > avail
+						? fname.substr(0, avail - 2) + ".." : fname;
+					std::snprintf(header_buf, sizeof(header_buf), "%s  %s",
+						kind, fn_short.c_str());
+				} else {
+					std::snprintf(header_buf, sizeof(header_buf), "%s  %llX",
+						kind, static_cast<unsigned long long>(blocks[i].start_addr));
+				}
+			} else {
+				std::snprintf(header_buf, sizeof(header_buf), "%s  %llX",
+					kind, static_cast<unsigned long long>(blocks[i].start_addr));
+			}
+			float header_w = ui_font->CalcTextSizeA(ui_base, FLT_MAX, 0.f, header_buf).x;
+
+			n.addr_col_w = addr_w + addr_gap;
+
+			float body_w = n.addr_col_w + text_w + padding * 2.f + text_slack;
+			float head_w = header_w + padding * 2.f + 20.f;
+			float w = body_w > head_w ? body_w : head_w;
 			if (w < min_node_w) w = min_node_w;
 			if (w > max_node_w) w = max_node_w;
 			n.width = w;
+
 			size_t total_lines = blocks[i].instructions.size() + inj_lines;
 			n.height = header_h + padding * 2.f + static_cast<float>(total_lines) * line_h;
-			if (n.height < header_h + 30.f) n.height = header_h + 30.f;
+			float min_h = header_h + line_h + padding * 2.f;
+			if (n.height < min_h) n.height = min_h;
 			graph.nodes.push_back(n);
 		}
 
@@ -676,6 +740,15 @@ inline void build_cfg(uint64_t entry_address)
 			g_state.text_ctx_line = -1;
 			g_state.sel_log_frame = -1;
 		}
+
+		auto t_end = std::chrono::steady_clock::now();
+		uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+		diag::log_tagged_fmt("cfg", "build_cfg DONE entry=0x%llX blocks=%zu nodes=%zu edges=%zu duration_ms=%llu",
+			static_cast<unsigned long long>(entry_address),
+			g_state.blocks.size(),
+			g_state.graph.nodes.size(),
+			g_state.graph.edges.size(),
+			static_cast<unsigned long long>(dur_ms));
 
 		g_state.building.store(false);
 	});
@@ -953,13 +1026,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 
-	float line_h = 14.f * z;
-	float padding = 8.f * z;
-
 	float card_font_scale = z;
 	if (card_font_scale < 0.30f) card_font_scale = 0.30f;
 	if (card_font_scale > 3.00f) card_font_scale = 3.00f;
-	const float header_strip_h = 22.f * card_font_scale;
+	ImFont* header_font = aida::ui::fonts::body_em();
+	if (!header_font) header_font = ImGui::GetFont();
+	float header_base = header_font && header_font->FontSize > 0.f
+		? header_font->FontSize : 13.f;
+	const float header_strip_h = (header_base + 8.f) * card_font_scale;
 
 	{
 		ImFont* log_font = aida::ui::fonts::code();
@@ -1087,9 +1161,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			const float size_ratio = node_font_size / base_font_size;
 			const bool  skip_text = raw_size < 3.f;
 
-			const float scaled_line_h   = 14.f * size_ratio;
+			const float scaled_line_h   = (base_font_size + 4.f) * size_ratio;
 			const float scaled_padding  =  8.f * size_ratio;
-			const float scaled_addr_col = 80.f * size_ratio;
+			const float scaled_addr_col = n.addr_col_w * size_ratio;
+			const float row_text_dy     = (scaled_line_h - node_font_size) * 0.5f;
 
 			int sel_lo = -1, sel_hi = -1;
 			if (g_state.text_sel_block == n.id
@@ -1114,6 +1189,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			for (int ii = 0; ii < inj_count; ++ii) {
 				if (inj_y + scaled_line_h > br.y - 2.f) break;
 				const auto& r = (*injs)[ii];
+				float inj_text_y = inj_y + row_text_dy;
 				if (!(inj_y + scaled_line_h < pos_y || inj_y > pos_y + height)) {
 					if (!skip_text && r.kind != function_index::injection_t::spacer_line && !r.text.empty()) {
 						if (r.kind == function_index::injection_t::proc_header
@@ -1131,7 +1207,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 							std::string tail_part = t.substr(name_end);
 							ImU32 name_col = aida::ui::with_alpha(name_base, row_alpha);
 							dl->AddText(node_font, node_font_size,
-								ImVec2(tl.x + scaled_padding, inj_y),
+								ImVec2(tl.x + scaled_padding, inj_text_y),
 								name_col, name_part.c_str());
 							if (!tail_part.empty()) {
 								float name_w = node_font->CalcTextSizeA(node_font_size, FLT_MAX, 0.f,
@@ -1139,14 +1215,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 								ImU32 tail_col = aida::ui::with_alpha(
 									disasm_theme::keyword(), row_alpha);
 								dl->AddText(node_font, node_font_size,
-									ImVec2(tl.x + scaled_padding + name_w, inj_y),
+									ImVec2(tl.x + scaled_padding + name_w, inj_text_y),
 									tail_col, tail_part.c_str());
 							}
 						} else {
 							ImU32 inj_col_base = detail::injection_color_for_kind(r.kind);
 							ImU32 inj_col = aida::ui::with_alpha(inj_col_base, row_alpha);
 							dl->AddText(node_font, node_font_size,
-								ImVec2(tl.x + scaled_padding, inj_y),
+								ImVec2(tl.x + scaled_padding, inj_text_y),
 								inj_col, r.text.c_str());
 						}
 					}
@@ -1194,10 +1270,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				}
 
 				if (!skip_text) {
+					float text_y = line_y + row_text_dy;
 					dl->AddText(node_font, node_font_size,
-						ImVec2(tl.x + scaled_padding, line_y), addr_col, addr_buf);
+						ImVec2(tl.x + scaled_padding, text_y), addr_col, addr_buf);
 					detail::render_colored_insn(dl,
-						tl.x + scaled_padding + scaled_addr_col, line_y,
+						tl.x + scaled_padding + scaled_addr_col, text_y,
 						line.text.c_str(), tk, row_alpha, br.x - scaled_padding,
 						node_font, node_font_size);
 				}

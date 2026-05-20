@@ -142,8 +142,6 @@ static field_anim_t& fanim(int idx) { return s_state.field_anims[idx]; }
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b)
 {
-	(void)pos_x; (void)pos_y;
-
 	{
 		static bool s_types_font_logged_recon = false;
 		if (!s_types_font_logged_recon) {
@@ -151,6 +149,9 @@ void render(float pos_x, float pos_y, float width, float height,
 			anti_tamper::webhook::write_log("types_font", "[types_font] scaled struct_recon_view");
 		}
 	}
+
+	ImGui::SetCursorScreenPos(ImVec2(ImGui::GetWindowPos().x + pos_x,
+	                                 ImGui::GetWindowPos().y + pos_y));
 
 	ImGui::BeginChild("##struct_recon_view", ImVec2(width, height), false,
 	    ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
@@ -185,7 +186,7 @@ void render(float pos_x, float pos_y, float width, float height,
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + height),
 		aida::ui::with_alpha(th.bg_base, alpha));
 
-	const float toolbar_h = 56.f;
+	const float toolbar_h = 64.f;
 
 	ImU32 bar_top = aida::ui::with_alpha(th.panel_header, alpha * 0.85f);
 	ImU32 bar_bot = aida::ui::with_alpha(th.panel_bg, alpha * 0.85f);
@@ -210,11 +211,11 @@ void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PushItemWidth(160.f);
 	ImGui::InputTextWithHint("##sr_addr", "Base address (hex)", sr.address_input, sizeof(sr.address_input));
 	ImGui::PopItemWidth();
-	ImGui::SameLine();
+	ImGui::SameLine(0.f, 6.f);
 	ImGui::PushItemWidth(140.f);
 	ImGui::InputTextWithHint("##sr_name", "Struct name", sr.name_input, sizeof(sr.name_input));
 	ImGui::PopItemWidth();
-	ImGui::SameLine();
+	ImGui::SameLine(0.f, 6.f);
 	ImGui::PushItemWidth(70.f);
 	ImGui::InputTextWithHint("##sr_size", "Size", sr.size_input, sizeof(sr.size_input));
 	ImGui::PopItemWidth();
@@ -222,7 +223,7 @@ void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PopStyleColor(3);
 	ImGui::PopStyleVar(2);
 
-	cy += 28.f;
+	cy += 32.f;
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 
 	bool monitoring = sr.monitoring.load();
@@ -246,7 +247,7 @@ void render(float pos_x, float pos_y, float width, float height,
 					"snapshot_skipped reason='addr_zero' input='%s'", sr.address_input);
 			}
 		}
-		ImGui::SameLine();
+		ImGui::SameLine(0.f, 6.f);
 		if (aida::ui::button("HW Monitor", aida::ui::button_kind_t::secondary,
 			aida::ui::size_t_::sm, ImVec2(98.f, 28.f))) {
 			uint64_t addr = 0;
@@ -265,7 +266,7 @@ void render(float pos_x, float pos_y, float width, float height,
 					"hwmon_skipped reason='addr_zero' input='%s'", sr.address_input);
 			}
 		}
-		ImGui::SameLine();
+		ImGui::SameLine(0.f, 6.f);
 		bool live_active = struct_monitor::g_state.active.load();
 		if (!live_active) {
 			if (aida::ui::button("Live Monitor", aida::ui::button_kind_t::secondary,
@@ -322,7 +323,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		ImGui::Dummy(ImVec2(124.f, 22.f));
 	}
 
-	ImGui::SameLine();
+	ImGui::SameLine(0.f, 10.f);
 	if (aida::ui::button("Export C++", aida::ui::button_kind_t::ghost,
 		aida::ui::size_t_::sm, ImVec2(94.f, 28.f))) {
 		std::string cpp;
@@ -341,7 +342,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			"export_cpp_clipboard name='%s' fields=%zu bytes=%zu",
 			name.c_str(), field_count, cpp.size());
 	}
-	ImGui::SameLine();
+	ImGui::SameLine(0.f, 6.f);
 	{
 		bool ai_naming = sr.ai_naming.load();
 		bool clicked = aida::ui::button(ai_naming ? "Naming" : "AI Name",
@@ -353,7 +354,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			struct_recon::ai_name_fields();
 		}
 	}
-	ImGui::SameLine();
+	ImGui::SameLine(0.f, 6.f);
 	if (aida::ui::button("Save", aida::ui::button_kind_t::ghost,
 		aida::ui::size_t_::sm, ImVec2(64.f, 28.f))) {
 		struct_recon::reconstructed_struct_t snap;
@@ -371,7 +372,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			"save_clicked name='%s' fields=%zu",
 			snap.name.c_str(), snap.fields.size());
 	}
-	ImGui::SameLine();
+	ImGui::SameLine(0.f, 6.f);
 	if (aida::ui::button("Load All", aida::ui::button_kind_t::ghost,
 		aida::ui::size_t_::sm, ImVec2(82.f, 28.f))) {
 		work_queue::post([]() {
@@ -386,7 +387,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		});
 		diag::log_tagged_fmt("struct_recon", "load_all_clicked");
 	}
-	ImGui::SameLine();
+	ImGui::SameLine(0.f, 6.f);
 	if (aida::ui::button("Refresh", aida::ui::button_kind_t::ghost,
 		aida::ui::size_t_::sm, ImVec2(76.f, 28.f))) {
 		uint64_t base = 0;

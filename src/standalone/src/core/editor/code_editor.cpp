@@ -1101,6 +1101,7 @@ void finalize_diff_if_resolved_locked() {
 
 
 void code_editor_widget::init() {
+    diag::log_tagged("editor", "init enter reset_state");
     s_cache.dirty = true;
     s_sel = {};
     s_find = {};
@@ -1116,9 +1117,12 @@ void code_editor_widget::init() {
         s_diff_scroll_target = -1.f;
     }
     break_undo_coalescing();
+    diag::log_tagged("editor", "init done");
 }
 
 void code_editor_widget::on_text_changed() {
+    diag::log_tagged_fmt("editor", "on_text_changed file='%s' buffer_size=%zu",
+        code_editor::filename.c_str(), code_editor::buffer.size());
     s_cache.dirty = true;
     s_sel = {};
     s_undo.clear();
@@ -1138,6 +1142,8 @@ void code_editor_widget::on_text_changed() {
     if (!code_editor::filename.empty()) {
         s_lang = syntax::detect_language(code_editor::filename);
         s_lang_set = true;
+        diag::log_tagged_fmt("editor", "syntax_detected file='%s' lang_set=%d",
+            code_editor::filename.c_str(), static_cast<int>(s_lang_set));
     }
 }
 

@@ -301,14 +301,17 @@ namespace agent_picker {
 			ImFont* f_h2 = aida::ui::fonts::h2();
 			ImFont* f_caption = aida::ui::fonts::caption();
 			ImFont* f_body = aida::ui::fonts::body();
+			const float fs = aida::ui::components::detail::ui_fs();
+			const float caption_fs = fs * 0.85f;
 
 			wdl->AddText(f_h2, 17.f, ImVec2(panel_a.x + 18.f, panel_a.y + 16.f),
 				aida::ui::with_alpha(th.text_primary, alpha), "Switch agent");
 
 			const char* hint = "Esc to cancel  |  Click to switch";
-			ImVec2 hts = f_caption->CalcTextSizeA(11.f, FLT_MAX, 0.f, hint);
-			wdl->AddText(f_caption, 13.f,
-				ImVec2(panel_b.x - hts.x - 18.f, panel_a.y + 21.f),
+			const float hint_fs = fs * 0.92f;
+			ImVec2 hts = f_caption->CalcTextSizeA(hint_fs, FLT_MAX, 0.f, hint);
+			wdl->AddText(f_caption, hint_fs,
+				ImVec2(panel_b.x - hts.x - 24.f, panel_a.y + 20.f),
 				aida::ui::with_alpha(th.text_dim, alpha), hint);
 
 			float content_x = panel_a.x + content_x_local;
@@ -327,7 +330,7 @@ namespace agent_picker {
 			}
 
 			float list_y = content_y + 44.f;
-			float list_h = sh - (52.f + 44.f + 52.f);
+			float list_h = sh - (52.f + 44.f + 48.f);
 
 			ImGui::SetCursorScreenPos(ImVec2(content_x, list_y));
 			ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 0));
@@ -379,7 +382,25 @@ namespace agent_picker {
 
 				ImVec2 row_pos = ImGui::GetCursorScreenPos();
 				row_pos.y += entrance_y;
-				const float row_h = 60.f;
+
+				const float name_fs = fs * 1.10f;
+				const float desc_fs = fs * 0.94f;
+				const float avatar_radius = 18.f;
+				const float text_x_rel = 14.f + avatar_radius * 2.f + 14.f;
+				const float row_pad_r = 14.f;
+				const float name_top = 9.f;
+				const float name_h = name_fs;
+				const float gap_name_desc = 6.f;
+				const float desc_top = name_top + name_h + gap_name_desc;
+
+				float wrap_w = content_w - text_x_rel - row_pad_r;
+				if (wrap_w < 40.f) wrap_w = 40.f;
+
+				std::string desc = info->description;
+				ImVec2 desc_sz = aida::ui::fonts::caption()->CalcTextSizeA(desc_fs, FLT_MAX, wrap_w, desc.c_str());
+				const float desc_block_h = desc_sz.y;
+				const float row_inner_h = desc_top + desc_block_h + 10.f;
+				const float row_h = (std::max)(60.f, row_inner_h);
 
 				ImGui::PushID(static_cast<int>(i));
 				ImGui::SetCursorScreenPos(ImVec2(row_pos.x, row_pos.y));
@@ -433,36 +454,44 @@ namespace agent_picker {
 						10.f, 0, 1.f);
 				}
 
-				const float avatar_radius = 18.f;
 				const ImVec2 avatar_center(row_a.x + 14.f + avatar_radius, (row_a.y + row_b.y) * 0.5f);
 				aida::ui::avatar::render(dl, avatar_center, avatar_radius,
 					info->name, aida::ui::avatar::kind_t::gradient,
 					true, row_alpha, aida::ui::fonts::body_strong());
 
-				const float text_x = avatar_center.x + avatar_radius + 14.f;
-				dl->AddText(aida::ui::fonts::body_strong(), 14.f,
-					ImVec2(text_x, row_a.y + 9.f),
+				const float text_x = row_a.x + text_x_rel;
+				dl->AddText(aida::ui::fonts::body_strong(), name_fs,
+					ImVec2(text_x, row_a.y + name_top),
 					aida::ui::with_alpha(th.text_primary, row_alpha),
 					info->name.c_str());
 
 				if (info->native) {
-					ImVec2 ns = aida::ui::fonts::body_strong()->CalcTextSizeA(14.f, FLT_MAX, 0.f, info->name.c_str());
-					float bx = text_x + ns.x + 8.f;
-					float by = row_a.y + 10.f;
-					ImGui::SetCursorScreenPos(ImVec2(bx, by));
-					aida::ui::badge("native",
-						aida::ui::with_alpha(th.info, row_alpha * 0.85f), 4.f);
+					ImFont* nf = aida::ui::fonts::body_strong();
+					ImVec2 ns = nf->CalcTextSizeA(name_fs, FLT_MAX, 0.f, info->name.c_str());
+					const char* badge_txt = "native";
+					ImFont* bf = aida::ui::fonts::caption();
+					const float badge_fs = fs * 0.78f;
+					ImVec2 bts = bf->CalcTextSizeA(badge_fs, FLT_MAX, 0.f, badge_txt);
+					const float pill_pad_x = 6.f;
+					const float pill_h = badge_fs + 4.f;
+					const float pill_w = bts.x + pill_pad_x * 2.f;
+					float pill_x = text_x + ns.x + 8.f;
+					const float pill_y = row_a.y + name_top + (name_h - pill_h) * 0.5f;
+					if (pill_x + pill_w > row_b.x - 8.f) pill_x = row_b.x - 8.f - pill_w;
+					ImVec2 pa(pill_x, pill_y);
+					ImVec2 pb(pill_x + pill_w, pill_y + pill_h);
+					ImU32 pill_top = aida::ui::with_alpha(th.info, row_alpha * 0.95f);
+					ImU32 pill_bot = aida::ui::with_alpha(th.info, row_alpha * 0.70f);
+					dl->AddRectFilled(pa, pb, aida::ui::mix(pill_top, pill_bot, 0.5f), pill_h * 0.5f);
+					dl->AddText(bf, badge_fs,
+						ImVec2(pa.x + pill_pad_x, pa.y + (pill_h - badge_fs) * 0.5f),
+						aida::ui::with_alpha(IM_COL32(255, 255, 255, 240), row_alpha), badge_txt);
 				}
 
-				std::string desc = info->description;
-				if (desc.size() > 96) {
-					desc.resize(93);
-					desc.append("...");
-				}
-				dl->AddText(aida::ui::fonts::caption(), 14.f,
-					ImVec2(text_x, row_a.y + 30.f),
+				dl->AddText(aida::ui::fonts::caption(), desc_fs,
+					ImVec2(text_x, row_a.y + desc_top),
 					aida::ui::with_alpha(th.text_secondary, row_alpha * 0.95f),
-					desc.c_str());
+					desc.c_str(), nullptr, wrap_w);
 
 				if (clicked) {
 					if (aida::agent::set_active_agent(info->name)) {
@@ -509,9 +538,9 @@ namespace agent_picker {
 
 			std::string active_name = aida::agent::active_agent_name();
 			std::string footer_active = "Active: " + (active_name.empty() ? std::string("none") : active_name);
-			ImVec2 ats = aida::ui::fonts::caption()->CalcTextSizeA(12.f, FLT_MAX, 0.f, footer_active.c_str());
-			wdl->AddText(aida::ui::fonts::caption(), 14.f,
-				ImVec2(panel_b.x - ats.x - 18.f, footer_y + 8.f),
+			ImVec2 ats = aida::ui::fonts::caption()->CalcTextSizeA(caption_fs, FLT_MAX, 0.f, footer_active.c_str());
+			wdl->AddText(aida::ui::fonts::caption(), caption_fs,
+				ImVec2(panel_b.x - ats.x - 20.f, footer_y + 8.f),
 				aida::ui::with_alpha(th.text_secondary, alpha),
 				footer_active.c_str());
 			(void)f_body;

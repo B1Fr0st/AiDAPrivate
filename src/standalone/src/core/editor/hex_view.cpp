@@ -17,6 +17,7 @@
 #include "blur_layer.hpp"
 #include "empty_state.hpp"
 #include "fonts.hpp"
+#include "../helpers/diag_log.hpp"
 
 namespace hex_view {
 
@@ -49,6 +50,8 @@ bool parse_hex_pattern(const char* in, std::vector<uint8_t>& out) {
 }
 
 void recompute_search_matches(state_t& st) {
+    diag::log_tagged_fmt("hex", "search_recompute enter query='%s' hex=%d data_size=%zu",
+        st.search_buf, static_cast<int>(st.search_hex), st.data.size());
     st.search_matches.clear();
     st.search_match     = -1;
     st.search_match_idx = -1;
@@ -84,6 +87,8 @@ void recompute_search_matches(state_t& st) {
         st.search_match_idx = 0;
         st.search_match     = st.search_matches[0];
     }
+    diag::log_tagged_fmt("hex", "search_recompute done matches=%zu pat_len=%zu",
+        st.search_matches.size(), m);
 }
 
 void goto_search_match(state_t& st, int idx, float line_h, int bytes_per_row, float view_h) {
@@ -145,6 +150,8 @@ void clipboard_copy_string(const std::string& text) {
 
 void set_data(const std::vector<uint8_t>& bytes, uint64_t base_addr,
               const std::string& name) {
+    diag::log_tagged_fmt("hex", "set_data enter size=%zu base=0x%llX name='%s'",
+        bytes.size(), static_cast<unsigned long long>(base_addr), name.c_str());
     g_state.data       = bytes;
     g_state.base_addr  = base_addr;
     g_state.source_name = name;
@@ -158,12 +165,16 @@ void set_data(const std::vector<uint8_t>& bytes, uint64_t base_addr,
     g_state.search_match_idx = -1;
     g_state.search_matches.clear();
     g_state.search_last_query.clear();
+    diag::log_tagged_fmt("hex", "set_data complete buffer_active=true");
 }
 
 void load_from_file(const std::string& path, size_t offset, size_t size) {
+    diag::log_tagged_fmt("hex", "load_from_file enter path='%s' offset=%zu size=%zu",
+        path.c_str(), offset, size);
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f.is_open()) {
         s_last_error = "hex_view::load_from_file: failed to open " + path;
+        diag::log_tagged_fmt("hex", "load_from_file FAILED open path='%s'", path.c_str());
         return;
     }
     std::streampos tp = f.tellg();
@@ -188,6 +199,7 @@ void load_from_file(const std::string& path, size_t offset, size_t size) {
     std::string name = (pos != std::string::npos) ? path.substr(pos + 1) : path;
     set_data(buf, static_cast<uint64_t>(offset), name);
     s_last_error.clear();
+    diag::log_tagged_fmt("hex", "load_from_file SUCCESS read_sz=%zu name='%s'", read_sz, name.c_str());
 }
 
 std::string last_error() {
@@ -195,30 +207,51 @@ std::string last_error() {
 }
 
 bool read_from_process(uint64_t address, size_t size) {
-    if (!driver_bridge::is_loaded() || !driver_bridge::can_read_memory())
+    diag::log_tagged_fmt("hex", "read_from_process enter addr=0x%llX size=%zu pid=%u",
+        static_cast<unsigned long long>(address), size, driver_bridge::attached_pid());
+    if (!driver_bridge::is_loaded() || !driver_bridge::can_read_memory()) {
+        diag::log_tagged_fmt("hex", "read_from_process FAILED driver_loaded=%d can_read=%d",
+            static_cast<int>(driver_bridge::is_loaded()),
+            static_cast<int>(driver_bridge::can_read_memory()));
         return false;
-    if (driver_bridge::attached_pid() == 0)
+    }
+    if (driver_bridge::attached_pid() == 0) {
+        diag::log_tagged("hex", "read_from_process FAILED no_attached_pid");
         return false;
-    if (size == 0 || size > 1 * 1024 * 1024)
+    }
+    if (size == 0 || size > 1 * 1024 * 1024) {
+        diag::log_tagged_fmt("hex", "read_from_process FAILED invalid_size=%zu", size);
         return false;
+    }
 
     std::vector<uint8_t> buf;
-    if (!driver_bridge::read_memory(address, size, buf))
+    if (!driver_bridge::read_memory(address, size, buf)) {
+        diag::log_tagged_fmt("hex", "read_from_process FAILED read_memory addr=0x%llX size=%zu",
+            static_cast<unsigned long long>(address), size);
         return false;
-    if (buf.empty())
+    }
+    if (buf.empty()) {
+        diag::log_tagged("hex", "read_from_process FAILED empty_buffer");
         return false;
+    }
 
     char label[64];
     snprintf(label, sizeof(label), "PID %u @ %016llX",
              driver_bridge::attached_pid(),
              static_cast<unsigned long long>(address));
     set_data(buf, address, label);
+    diag::log_tagged_fmt("hex", "read_from_process SUCCESS read=%zu bytes", buf.size());
     return true;
 }
 
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b) {
     (void)accent_r; (void)accent_g; (void)accent_b;
+    static bool s_render_first_log = false;
+    if (!s_render_first_log) {
+        s_render_first_log = true;
+        diag::log_tagged_fmt("hex", "render first_call width=%.0f height=%.0f", width, height);
+    }
 
     auto& st = g_state;
     const float a   = alpha;
@@ -947,7 +980,11 @@ void render(float pos_x, float pos_y, float width, float height,
                     st.target_scroll_y = row * line_h;
                     st.sel_start = st.sel_end = off;
                     st.goto_visible = false;
+                    diag::log_tagged_fmt("hex", "goto_address addr=0x%llX offset=%d row=%d",
+                        static_cast<unsigned long long>(addr), off, row);
                 }
+            } else {
+                diag::log_tagged_fmt("hex", "goto_address parse_failed input='%s'", st.goto_buf);
             }
         }
     }

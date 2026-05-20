@@ -20,6 +20,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "../auth/auth_store.hpp"
+
 #pragma comment(lib, "Crypt32.lib")
 #pragma comment(lib, "Shell32.lib")
 
@@ -984,6 +986,38 @@ struct settings_sa_t
         return profile ? profile->api_key : std::string();
     }
 
+    std::string resolve_active_api_key() const
+    {
+        bool from_store = false;
+        return resolve_active_api_key(from_store);
+    }
+
+    std::string resolve_active_api_key(bool& out_from_store) const
+    {
+        out_from_store = false;
+
+        if (default_provider_id.empty()) {
+            const auto* profile = get_active_profile();
+            if (profile && !profile->api_key.empty())
+                return profile->api_key;
+        }
+
+        const std::string pid = selected_provider_id();
+        if (!pid.empty()) {
+            aida::auth::auth_info_t info;
+            if (aida::auth::store::get(pid, info) && !info.api_key.empty()) {
+                out_from_store = true;
+                return info.api_key;
+            }
+        }
+
+        const auto* profile = get_active_profile();
+        if (profile && !profile->api_key.empty())
+            return profile->api_key;
+
+        return std::string();
+    }
+
     std::string get_active_model() const
     {
         if (!default_model_id.empty())
@@ -992,15 +1026,8 @@ struct settings_sa_t
         return profile ? profile->model : std::string();
     }
 
-    std::string get_active_base_url() const
+    static std::string default_base_url_for_kind(const std::string& kind)
     {
-        const auto* profile = get_active_profile();
-        if (!profile)
-            return {};
-        if (!profile->base_url.empty())
-            return profile->base_url;
-
-        const std::string kind = sa_settings_detail::canonicalize_internal_kind(sa_settings_detail::normalize_provider_kind(profile->kind));
         if (kind == "gemini")           return "https://generativelanguage.googleapis.com";
         if (kind == "anthropic")        return "https://api.anthropic.com";
         if (kind == "openrouter")       return "https://openrouter.ai";
@@ -1015,6 +1042,7 @@ struct settings_sa_t
         if (kind == "baseten")          return "https://bridge.baseten.co";
         if (kind == "zai")              return "https://open.bigmodel.cn";
         if (kind == "openai_codex")     return "https://api.openai.com";
+        if (kind == "github-copilot")   return "https://api.githubcopilot.com";
         if (kind == "ollama")           return "http://127.0.0.1:11434";
         if (kind == "lmstudio")         return "http://127.0.0.1:1234";
         if (kind == "requesty")         return "https://router.requesty.ai";
@@ -1024,6 +1052,28 @@ struct settings_sa_t
         if (kind == "local")            return "http://127.0.0.1:11434";
         if (kind == "openai_native")    return "https://api.openai.com";
         return "https://api.openai.com";
+    }
+
+    std::string get_active_base_url() const
+    {
+        const auto* profile = get_active_profile();
+        if (!profile)
+            return {};
+        if (!profile->base_url.empty())
+            return profile->base_url;
+
+        const std::string kind = sa_settings_detail::canonicalize_internal_kind(sa_settings_detail::normalize_provider_kind(profile->kind));
+        return default_base_url_for_kind(kind);
+    }
+
+    std::string resolve_active_base_url() const
+    {
+        if (default_provider_id.empty()) {
+            const auto* profile = get_active_profile();
+            if (profile && !profile->base_url.empty())
+                return profile->base_url;
+        }
+        return default_base_url_for_kind(get_active_profile_kind());
     }
 
     std::map<std::string, std::string> get_active_headers() const

@@ -229,6 +229,7 @@ void render(float pos_x, float pos_y, float width, float height,
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImVec2 org = ImGui::GetWindowPos();
         float row_h = 22.f;
+        const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
         float cx0 = org.x + 6.f;
         float c_idx = 50.f;
         float c_pay = 220.f;
@@ -241,12 +242,13 @@ void render(float pos_x, float pos_y, float width, float height,
                           ImVec2(org.x + ImGui::GetWindowWidth(), head_y + row_h - 2.f),
                           aida::ui::with_alpha(th.panel_header, alpha));
         ImU32 hcol = aida::ui::with_alpha(th.text_secondary, alpha);
-        dl->AddText(ImVec2(cx0,                              head_y), hcol, "#");
-        dl->AddText(ImVec2(cx0 + c_idx,                      head_y), hcol, "Payload");
-        dl->AddText(ImVec2(cx0 + c_idx + c_pay,              head_y), hcol, "Status");
-        dl->AddText(ImVec2(cx0 + c_idx + c_pay + c_st,       head_y), hcol, "Length");
-        dl->AddText(ImVec2(cx0 + c_idx + c_pay + c_st + c_len, head_y), hcol, "Latency");
-        dl->AddText(ImVec2(cx0 + c_idx + c_pay + c_st + c_len + c_lat, head_y), hcol, "Error");
+        float hdr_ty = head_y - 2.f + text_oy;
+        dl->AddText(ImVec2(cx0,                              hdr_ty), hcol, "#");
+        dl->AddText(ImVec2(cx0 + c_idx,                      hdr_ty), hcol, "Payload");
+        dl->AddText(ImVec2(cx0 + c_idx + c_pay,              hdr_ty), hcol, "Status");
+        dl->AddText(ImVec2(cx0 + c_idx + c_pay + c_st,       hdr_ty), hcol, "Length");
+        dl->AddText(ImVec2(cx0 + c_idx + c_pay + c_st + c_len, hdr_ty), hcol, "Latency");
+        dl->AddText(ImVec2(cx0 + c_idx + c_pay + c_st + c_len + c_lat, hdr_ty), hcol, "Error");
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + row_h + 4.f);
 
         int sel_row;
@@ -277,7 +279,7 @@ void render(float pos_x, float pos_y, float width, float height,
             ImU32 txt = aida::ui::with_alpha(is_sel ? th.text_primary : th.text_secondary, alpha);
             char buf[64];
             snprintf(buf, sizeof(buf), "%zu", r.index);
-            dl->AddText(ImVec2(cx0, abs_ry + 3.f), txt, buf);
+            dl->AddText(ImVec2(cx0, abs_ry + text_oy), txt, buf);
 
             std::string pay;
             for (size_t i = 0; i < r.payloads.size(); ++i) {
@@ -285,20 +287,20 @@ void render(float pos_x, float pos_y, float width, float height,
                 if (r.payloads[i].size() > 32) pay += r.payloads[i].substr(0, 30) + "..";
                 else                            pay += r.payloads[i];
             }
-            dl->AddText(ImVec2(cx0 + c_idx, abs_ry + 3.f), txt, pay.c_str());
+            dl->AddText(ImVec2(cx0 + c_idx, abs_ry + text_oy), txt, pay.c_str());
 
             snprintf(buf, sizeof(buf), "%d", r.status_code);
-            dl->AddText(ImVec2(cx0 + c_idx + c_pay, abs_ry + 3.f),
+            dl->AddText(ImVec2(cx0 + c_idx + c_pay, abs_ry + text_oy),
                          aida::ui::with_alpha(status_code_color(r.status_code), alpha), buf);
 
             snprintf(buf, sizeof(buf), "%zu", r.response_size);
-            dl->AddText(ImVec2(cx0 + c_idx + c_pay + c_st, abs_ry + 3.f), txt, buf);
+            dl->AddText(ImVec2(cx0 + c_idx + c_pay + c_st, abs_ry + text_oy), txt, buf);
 
             snprintf(buf, sizeof(buf), "%llums", static_cast<unsigned long long>(r.latency_ms));
-            dl->AddText(ImVec2(cx0 + c_idx + c_pay + c_st + c_len, abs_ry + 3.f), txt, buf);
+            dl->AddText(ImVec2(cx0 + c_idx + c_pay + c_st + c_len, abs_ry + text_oy), txt, buf);
 
             if (r.error && !r.error_msg.empty()) {
-                dl->AddText(ImVec2(cx0 + c_idx + c_pay + c_st + c_len + c_lat, abs_ry + 3.f),
+                dl->AddText(ImVec2(cx0 + c_idx + c_pay + c_st + c_len + c_lat, abs_ry + text_oy),
                              aida::ui::with_alpha(th.error, alpha), r.error_msg.c_str());
             }
             ImGui::SetCursorPosY(ry + row_h);

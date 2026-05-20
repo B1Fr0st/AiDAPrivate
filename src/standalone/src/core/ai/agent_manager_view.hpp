@@ -31,7 +31,9 @@
 #include "../ui/motion.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/transition.hpp"
+#include "../ui/responsive.hpp"
 #include "../helpers/globals.h"
+#include "../helpers/diag_log.hpp"
 
 namespace aida {
 namespace agent_manager {
@@ -382,11 +384,33 @@ namespace agent_manager {
 		ImGui::BeginChild("##aida_agent_manager_root", ImVec2(panel_w, content_h), false,
 			ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
-		float left_w = std::max(220.f, panel_w * 0.30f);
-		float right_w = std::max(260.f, panel_w - left_w - 12.f);
+		const float gm_gap = 12.f;
+		const float gm_min_detail_w = 260.f;
+		float left_w = std::clamp(panel_w * 0.24f, 190.f, 280.f);
+		bool gm_stack_vertical = (panel_w - left_w - gm_gap) < gm_min_detail_w;
+		if (gm_stack_vertical) {
+			left_w = std::max(panel_w - 8.f, 180.f);
+		}
+		float right_w = gm_stack_vertical
+			? std::max(panel_w - 8.f, 180.f)
+			: std::max(gm_min_detail_w, panel_w - left_w - gm_gap);
+
+		static bool s_gm_logged_stack = false;
+		if (gm_stack_vertical && !s_gm_logged_stack) {
+			s_gm_logged_stack = true;
+			::diag::log_tagged_fmt("responsive",
+				"agent_manager panel stacked panel_w=%.0f min_detail_w=%.0f",
+				panel_w, gm_min_detail_w);
+		} else if (!gm_stack_vertical && s_gm_logged_stack) {
+			s_gm_logged_stack = false;
+		}
+
+		float gm_left_h = gm_stack_vertical
+			? std::max(ImGui::GetContentRegionAvail().y * 0.42f, 160.f)
+			: ImGui::GetContentRegionAvail().y;
 
 		ImGui::BeginChild("##agent_manager_left",
-			ImVec2(left_w, ImGui::GetContentRegionAvail().y), false,
+			ImVec2(left_w, gm_left_h), false,
 			ImGuiWindowFlags_None);
 
 		{
@@ -427,8 +451,8 @@ namespace agent_manager {
 			}
 
 			const bool selected_now = (a.name == st.selected_name);
-			const float row_h = 62.f;
-			const float row_w = left_w - 16.f;
+			const float row_h = 54.f;
+			const float row_w = left_w - 12.f;
 
 			ImVec2 row_pos = ImGui::GetCursorScreenPos();
 
@@ -460,18 +484,18 @@ namespace agent_manager {
 					10.f, 0, 1.f);
 			}
 
-			const float av_r = 14.f;
-			ImVec2 av_c(ra2.x + 12.f + av_r, (ra2.y + rb2.y) * 0.5f);
+			const float av_r = 12.f;
+			ImVec2 av_c(ra2.x + 10.f + av_r, (ra2.y + rb2.y) * 0.5f);
 			aida::ui::avatar::render(ldl, av_c, av_r, a.name,
 				aida::ui::avatar::kind_t::gradient, true, 1.f,
 				aida::ui::fonts::body_strong());
 
 			ldl->AddText(aida::ui::fonts::body_strong(),
-				aida::ui::components::detail::ui_fs() * 1.02f,
-				ImVec2(av_c.x + av_r + 10.f, ra2.y + 7.f),
+				aida::ui::components::detail::ui_fs() * 0.96f,
+				ImVec2(av_c.x + av_r + 8.f, ra2.y + 6.f),
 				th.text_primary, a.name.c_str());
 
-			ImGui::SetCursorScreenPos(ImVec2(av_c.x + av_r + 10.f, ra2.y + 28.f));
+			ImGui::SetCursorScreenPos(ImVec2(av_c.x + av_r + 8.f, ra2.y + 24.f));
 			aida::ui::pill_kind(a.native ? "native" : "custom",
 				a.native ? aida::ui::pill_kind_t::info : aida::ui::pill_kind_t::warning,
 				aida::ui::size_t_::sm, false);
@@ -496,7 +520,7 @@ namespace agent_manager {
 
 		ImGui::EndChild();
 
-		ImGui::SameLine();
+		if (!gm_stack_vertical) ImGui::SameLine();
 
 		ImGui::BeginChild("##agent_manager_right",
 			ImVec2(right_w, ImGui::GetContentRegionAvail().y), false,
