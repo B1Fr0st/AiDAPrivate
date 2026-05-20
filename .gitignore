@@ -8,7 +8,6 @@
 !/src/
 !/driver/
 !/server/
-!/stealer/
 !/tools/
 !/cmake/
 
@@ -55,7 +54,6 @@
 **/obj/
 **/bin/
 **/build/
-stealer/.deps/
 /.cache/
 /dist/
 __pycache__/
@@ -96,10 +94,8 @@ license-validation-response.json
 /ida-sdk/
 /libdecomp/
 /libs/
-/malware_checker/
 /mapper/
 /sources/
-/stealer/
 
 # Excluded specific files
 /perception_analysis.md
