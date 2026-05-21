@@ -9,6 +9,7 @@
 #include "net_security.hpp"
 #include "obfuscation.hpp"
 #include "pro.h"
+#include "helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -69,11 +70,20 @@ static std::string ns_get_downloads_folder() {
 }
 
 tool_result_t tls_extract_keys(const json& params) {
-    if (!device || !device->is_connected())
+    std::uint32_t pid = params.value("pid", 0u);
+    diag::log_tagged_fmt("net_sec", "tls_extract_keys entry pid=%u scan_schannel=%d scan_openssl=%d scan_nss=%d scan_boringssl=%d",
+        pid,
+        (int)params.value("scan_schannel", true),
+        (int)params.value("scan_openssl", true),
+        (int)params.value("scan_nss", true),
+        (int)params.value("scan_boringssl", true));
+    if (!device || !device->is_connected()) {
+        diag::log_tagged("net_sec", "tls_extract_keys driver not connected");
         return tool_result_t::error(OBFSTR("Driver not connected"));
+    }
 
     net_security::tls_key_scan_config_t config;
-    config.pid = params.value("pid", 0u);
+    config.pid = pid;
     config.scan_schannel = params.value("scan_schannel", true);
     config.scan_openssl = params.value("scan_openssl", true);
     config.scan_nss = params.value("scan_nss", true);
@@ -81,6 +91,7 @@ tool_result_t tls_extract_keys(const json& params) {
     config.max_results = params.value("max_results", 64u);
 
     auto keys = net_security::TlsKeyExtractor::instance().extract_keys(config);
+    diag::log_tagged_fmt("net_sec", "tls_extract_keys keys_found=%zu pid=%u", keys.size(), pid);
     json result;
     result["keys_found"] = keys.size();
     json arr = json::array();
@@ -93,6 +104,7 @@ tool_result_t tls_extract_keys(const json& params) {
         kj["pid"] = k.pid;
         kj["library"] = k.library;
         kj["timestamp"] = k.timestamp;
+        diag::log_tagged_fmt("net_sec", "tls_extract_keys key label=%s library=%s pid=%u", k.label.c_str(), k.library.c_str(), k.pid);
         arr.push_back(kj);
     }
     result["keys"] = arr;
@@ -100,6 +112,10 @@ tool_result_t tls_extract_keys(const json& params) {
 }
 
 tool_result_t tls_start_keylog(const json& params) {
+    diag::log_tagged_fmt("net_sec", "tls_start_keylog entry pid=%u output_file=%s poll_interval_ms=%u",
+        params.value("pid", 0u),
+        params.value("output_file", "").c_str(),
+        params.value("poll_interval_ms", 2000u));
     net_security::keylog_config_t config;
     config.pid = params.value("pid", 0u);
     config.output_file = params.value("output_file", "");
@@ -108,9 +124,12 @@ tool_result_t tls_start_keylog(const json& params) {
 
     if (config.output_file.empty()) {
         config.output_file = ns_get_downloads_folder() + "\\sslkeylog.txt";
+        diag::log_tagged_fmt("net_sec", "tls_start_keylog using default output_file=%s", config.output_file.c_str());
     }
 
-    if (net_security::TlsKeyExtractor::instance().start_keylog(config)) {
+    bool started = net_security::TlsKeyExtractor::instance().start_keylog(config);
+    diag::log_tagged_fmt("net_sec", "tls_start_keylog started=%d output_file=%s", (int)started, config.output_file.c_str());
+    if (started) {
         json r;
         r["status"] = "started";
         r["output_file"] = config.output_file;
@@ -121,7 +140,10 @@ tool_result_t tls_start_keylog(const json& params) {
 }
 
 tool_result_t tls_stop_keylog(const json&) {
-    if (net_security::TlsKeyExtractor::instance().stop_keylog()) {
+    diag::log_tagged("net_sec", "tls_stop_keylog entry");
+    bool stopped = net_security::TlsKeyExtractor::instance().stop_keylog();
+    diag::log_tagged_fmt("net_sec", "tls_stop_keylog stopped=%d", (int)stopped);
+    if (stopped) {
         json r;
         r["status"] = "stopped";
         return tool_result_t::ok(OBFSTR("TLS keylogging stopped"), r);
@@ -130,8 +152,10 @@ tool_result_t tls_stop_keylog(const json&) {
 }
 
 tool_result_t tls_get_extracted_keys(const json&) {
+    diag::log_tagged("net_sec", "tls_get_extracted_keys entry");
     auto& ext = net_security::TlsKeyExtractor::instance();
     auto& seen = ext.get_seen_keys();
+    diag::log_tagged_fmt("net_sec", "tls_get_extracted_keys total_keys=%zu", seen.size());
 
     json result;
     result["total_keys"] = seen.size();
@@ -150,6 +174,11 @@ tool_result_t tls_get_extracted_keys(const json&) {
 }
 
 tool_result_t cert_inject(const json& params) {
+    diag::log_tagged_fmt("net_sec", "cert_inject entry store_name=%s system_wide=%d has_pem=%d has_der_hex=%d",
+        params.value("store_name", "ROOT").c_str(),
+        (int)params.value("system_wide", false),
+        (int)params.contains("cert_pem"),
+        (int)params.contains("cert_der_hex"));
     net_security::cert_injection_config_t config;
     config.cert_pem = params.value("cert_pem", "");
     config.store_name = params.value("store_name", "ROOT");
@@ -158,9 +187,12 @@ tool_result_t cert_inject(const json& params) {
     if (params.contains("cert_der_hex") && params["cert_der_hex"].is_string()) {
         auto hex = params["cert_der_hex"].get<std::string>();
         config.cert_der = ns_hex_to_bytes(hex);
+        diag::log_tagged_fmt("net_sec", "cert_inject der_hex len=%zu bytes=%zu", hex.size(), config.cert_der.size());
     }
 
     auto result = net_security::CertificateInjector::instance().inject_certificate(config);
+    diag::log_tagged_fmt("net_sec", "cert_inject result success=%d thumbprint=%s subject_cn=%s store=%s method=%s",
+        (int)result.success, result.thumbprint.c_str(), result.subject_cn.c_str(), result.store_name.c_str(), result.method.c_str());
     json r;
     r["success"] = result.success;
     r["thumbprint"] = result.thumbprint;
@@ -175,10 +207,15 @@ tool_result_t cert_inject(const json& params) {
 tool_result_t cert_remove(const json& params) {
     std::string thumbprint = params.value("thumbprint", "");
     std::string store_name = params.value("store_name", "ROOT");
-    if (thumbprint.empty())
+    diag::log_tagged_fmt("net_sec", "cert_remove entry thumbprint=%s store_name=%s", thumbprint.c_str(), store_name.c_str());
+    if (thumbprint.empty()) {
+        diag::log_tagged("net_sec", "cert_remove thumbprint empty -> error");
         return tool_result_t::error(OBFSTR("thumbprint is required"));
+    }
 
-    if (net_security::CertificateInjector::instance().remove_certificate(thumbprint, store_name)) {
+    bool removed = net_security::CertificateInjector::instance().remove_certificate(thumbprint, store_name);
+    diag::log_tagged_fmt("net_sec", "cert_remove removed=%d thumbprint=%s", (int)removed, thumbprint.c_str());
+    if (removed) {
         json r;
         r["removed"] = true;
         r["thumbprint"] = thumbprint;
@@ -190,9 +227,12 @@ tool_result_t cert_remove(const json& params) {
 tool_result_t cert_generate_ca(const json& params) {
     std::string cn = params.value("cn", "AiDA Proxy CA");
     std::uint32_t days = params.value("validity_days", 3650u);
+    diag::log_tagged_fmt("net_sec", "cert_generate_ca entry cn=%s days=%u", cn.c_str(), days);
 
     std::vector<std::uint8_t> cert_der, key_der;
-    if (net_security::CertificateInjector::instance().generate_ca_certificate(cn, days, cert_der, key_der)) {
+    bool ok = net_security::CertificateInjector::instance().generate_ca_certificate(cn, days, cert_der, key_der);
+    diag::log_tagged_fmt("net_sec", "cert_generate_ca ok=%d cert_size=%zu key_size=%zu cn=%s", (int)ok, cert_der.size(), key_der.size(), cn.c_str());
+    if (ok) {
         json r;
         r["success"] = true;
         r["cert_der_hex"] = ns_bytes_to_hex(cert_der.data(), cert_der.size());
@@ -207,7 +247,9 @@ tool_result_t cert_generate_ca(const json& params) {
 
 tool_result_t cert_list(const json& params) {
     std::string store_name = params.value("store_name", "ROOT");
+    diag::log_tagged_fmt("net_sec", "cert_list entry store_name=%s", store_name.c_str());
     auto certs = net_security::CertificateInjector::instance().list_certificates(store_name);
+    diag::log_tagged_fmt("net_sec", "cert_list count=%zu store_name=%s", certs.size(), store_name.c_str());
 
     json result;
     result["store_name"] = store_name;
@@ -228,12 +270,16 @@ tool_result_t cert_list(const json& params) {
 }
 
 tool_result_t pin_bypass(const json& params) {
-    if (!device || !device->is_connected())
+    std::uint32_t pid = params.value("pid", 0u);
+    std::string method = params.value("method", "all");
+    diag::log_tagged_fmt("net_sec", "pin_bypass entry pid=%u method=%s", pid, method.c_str());
+    if (!device || !device->is_connected()) {
+        diag::log_tagged("net_sec", "pin_bypass driver not connected");
         return tool_result_t::error(OBFSTR("Driver not connected"));
+    }
 
     net_security::pin_bypass_config_t config;
-    config.pid = params.value("pid", 0u);
-    std::string method = params.value("method", "all");
+    config.pid = pid;
     if (method == "wintrust") config.method = net_security::pin_bypass_method::patch_wintrust;
     else if (method == "crypt32") config.method = net_security::pin_bypass_method::patch_crypt32;
     else if (method == "schannel") config.method = net_security::pin_bypass_method::patch_schannel;
@@ -242,6 +288,8 @@ tool_result_t pin_bypass(const json& params) {
     else config.method = net_security::pin_bypass_method::all;
 
     auto result = net_security::CertPinBypasser::instance().bypass_pins(config);
+    diag::log_tagged_fmt("net_sec", "pin_bypass result success=%d patches_applied=%zu patches_failed=%zu pid=%u",
+        (int)result.success, result.patches_applied.size(), result.patches_failed.size(), pid);
     json r;
     r["success"] = result.success;
     r["patches_applied"] = result.patches_applied;
@@ -252,13 +300,19 @@ tool_result_t pin_bypass(const json& params) {
 }
 
 tool_result_t pin_bypass_revert(const json& params) {
-    if (!device || !device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected"));
-
     std::uint32_t pid = params.value("pid", 0u);
-    if (pid == 0) pid = device->get_process_id();
+    diag::log_tagged_fmt("net_sec", "pin_bypass_revert entry pid=%u", pid);
+    if (!device || !device->is_connected()) {
+        diag::log_tagged("net_sec", "pin_bypass_revert driver not connected");
+        return tool_result_t::error(OBFSTR("Driver not connected"));
+    }
 
-    if (net_security::CertPinBypasser::instance().revert_bypass(pid)) {
+    if (pid == 0) pid = device->get_process_id();
+    diag::log_tagged_fmt("net_sec", "pin_bypass_revert effective pid=%u", pid);
+
+    bool reverted = net_security::CertPinBypasser::instance().revert_bypass(pid);
+    diag::log_tagged_fmt("net_sec", "pin_bypass_revert reverted=%d pid=%u", (int)reverted, pid);
+    if (reverted) {
         json r;
         r["reverted"] = true;
         r["pid"] = pid;
@@ -269,8 +323,10 @@ tool_result_t pin_bypass_revert(const json& params) {
 
 tool_result_t pin_bypass_status(const json& params) {
     std::uint32_t pid = params.value("pid", 0u);
+    diag::log_tagged_fmt("net_sec", "pin_bypass_status entry pid=%u", pid);
     if (pid == 0 && device && device->is_connected()) pid = device->get_process_id();
     bool active = net_security::CertPinBypasser::instance().is_bypass_active(pid);
+    diag::log_tagged_fmt("net_sec", "pin_bypass_status pid=%u active=%d", pid, (int)active);
     json r;
     r["pid"] = pid;
     r["bypass_active"] = active;
@@ -278,11 +334,15 @@ tool_result_t pin_bypass_status(const json& params) {
 }
 
 tool_result_t quic_detect_connections(const json& params) {
-    if (!device || !device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected"));
-
     std::uint32_t pid = params.value("pid", 0u);
+    diag::log_tagged_fmt("net_sec", "quic_detect_connections entry pid=%u", pid);
+    if (!device || !device->is_connected()) {
+        diag::log_tagged("net_sec", "quic_detect_connections driver not connected");
+        return tool_result_t::error(OBFSTR("Driver not connected"));
+    }
+
     auto conns = net_security::QuicAnalyzer::instance().detect_quic_connections(pid);
+    diag::log_tagged_fmt("net_sec", "quic_detect_connections count=%zu pid=%u", conns.size(), pid);
 
     json result;
     result["count"] = conns.size();
@@ -306,14 +366,21 @@ tool_result_t quic_detect_connections(const json& params) {
 }
 
 tool_result_t quic_decrypt_initial(const json& params) {
-    if (!params.contains("packet_hex"))
+    diag::log_tagged("net_sec", "quic_decrypt_initial entry");
+    if (!params.contains("packet_hex")) {
+        diag::log_tagged("net_sec", "quic_decrypt_initial missing packet_hex");
         return tool_result_t::error(OBFSTR("packet_hex is required"));
+    }
 
     auto pkt_bytes = ns_hex_to_bytes(params["packet_hex"].get<std::string>());
-    if (pkt_bytes.empty())
+    diag::log_tagged_fmt("net_sec", "quic_decrypt_initial packet_bytes=%zu", pkt_bytes.size());
+    if (pkt_bytes.empty()) {
+        diag::log_tagged("net_sec", "quic_decrypt_initial invalid packet hex data");
         return tool_result_t::error(OBFSTR("Invalid packet hex data"));
+    }
 
     auto result = net_security::QuicAnalyzer::instance().decrypt_initial_packet(pkt_bytes.data(), pkt_bytes.size());
+    diag::log_tagged_fmt("net_sec", "quic_decrypt_initial result success=%d version=0x%x type=%s", (int)result.success, result.quic_version, result.packet_type.c_str());
     json r;
     r["success"] = result.success;
     r["quic_version"] = result.quic_version;
@@ -326,11 +393,15 @@ tool_result_t quic_decrypt_initial(const json& params) {
 }
 
 tool_result_t quic_extract_keys(const json& params) {
-    if (!device || !device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected"));
-
     std::uint32_t pid = params.value("pid", 0u);
+    diag::log_tagged_fmt("net_sec", "quic_extract_keys entry pid=%u", pid);
+    if (!device || !device->is_connected()) {
+        diag::log_tagged("net_sec", "quic_extract_keys driver not connected");
+        return tool_result_t::error(OBFSTR("Driver not connected"));
+    }
+
     auto keys = net_security::QuicAnalyzer::instance().extract_quic_traffic_keys(pid);
+    diag::log_tagged_fmt("net_sec", "quic_extract_keys keys_found=%zu pid=%u", keys.size(), pid);
 
     json result;
     result["keys_found"] = keys.size();
@@ -349,11 +420,15 @@ tool_result_t quic_extract_keys(const json& params) {
 }
 
 tool_result_t dtls_detect_sessions(const json& params) {
-    if (!device || !device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected"));
-
     std::uint32_t pid = params.value("pid", 0u);
+    diag::log_tagged_fmt("net_sec", "dtls_detect_sessions entry pid=%u", pid);
+    if (!device || !device->is_connected()) {
+        diag::log_tagged("net_sec", "dtls_detect_sessions driver not connected");
+        return tool_result_t::error(OBFSTR("Driver not connected"));
+    }
+
     auto sessions = net_security::DtlsAnalyzer::instance().detect_dtls_sessions(pid);
+    diag::log_tagged_fmt("net_sec", "dtls_detect_sessions count=%zu pid=%u", sessions.size(), pid);
 
     json result;
     result["count"] = sessions.size();
@@ -374,11 +449,15 @@ tool_result_t dtls_detect_sessions(const json& params) {
 }
 
 tool_result_t dtls_extract_keys(const json& params) {
-    if (!device || !device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected"));
-
     std::uint32_t pid = params.value("pid", 0u);
+    diag::log_tagged_fmt("net_sec", "dtls_extract_keys entry pid=%u", pid);
+    if (!device || !device->is_connected()) {
+        diag::log_tagged("net_sec", "dtls_extract_keys driver not connected");
+        return tool_result_t::error(OBFSTR("Driver not connected"));
+    }
+
     auto keys = net_security::TlsKeyExtractor::instance().extract_dtls_keys(pid);
+    diag::log_tagged_fmt("net_sec", "dtls_extract_keys keys_found=%zu pid=%u", keys.size(), pid);
 
     json result;
     result["keys_found"] = keys.size();
@@ -400,21 +479,31 @@ tool_result_t network_decrypt_capture(const json& params) {
     std::string pcap_path = params.value("pcap_path", "");
     std::string keylog_path = params.value("keylog_path", "");
     std::string display_filter = params.value("display_filter", "http2");
+    diag::log_tagged_fmt("net_sec", "network_decrypt_capture entry pcap_path=%s keylog_path=%s display_filter=%s",
+        pcap_path.c_str(), keylog_path.c_str(), display_filter.c_str());
 
-    if (pcap_path.empty())
+    if (pcap_path.empty()) {
+        diag::log_tagged("net_sec", "network_decrypt_capture pcap_path empty -> error");
         return tool_result_t::error(OBFSTR("pcap_path is required"));
+    }
 
 
     if (keylog_path.empty()) {
         char buf[MAX_PATH] = {};
         DWORD len = GetEnvironmentVariableA("SSLKEYLOGFILE", buf, MAX_PATH);
         if (len > 0 && len < MAX_PATH) keylog_path = std::string(buf, len);
+        diag::log_tagged_fmt("net_sec", "network_decrypt_capture SSLKEYLOGFILE env keylog_path=%s", keylog_path.c_str());
     }
-    if (keylog_path.empty())
+    if (keylog_path.empty()) {
+        diag::log_tagged("net_sec", "network_decrypt_capture keylog_path empty -> error");
         return tool_result_t::error(OBFSTR("keylog_path is required (or set SSLKEYLOGFILE environment variable)"));
+    }
 
+    diag::log_tagged_fmt("net_sec", "network_decrypt_capture calling tshark pcap=%s keylog=%s filter=%s", pcap_path.c_str(), keylog_path.c_str(), display_filter.c_str());
     auto decrypt_result = net_security::TlsKeyExtractor::instance().decrypt_pcap_with_tshark(
         pcap_path, keylog_path, display_filter);
+    diag::log_tagged_fmt("net_sec", "network_decrypt_capture result success=%d total_packets=%u decrypted=%u http2_frames=%zu",
+        (int)decrypt_result.success, decrypt_result.total_packets, decrypt_result.decrypted_packets, decrypt_result.http2_frames.size());
 
     json r;
     r["success"] = decrypt_result.success;
@@ -458,12 +547,17 @@ tool_result_t network_decrypt_capture(const json& params) {
 
 tool_result_t tls_ensure_keylogfile(const json& params) {
     std::string path = params.value("path", "");
-    if (net_security::TlsKeyExtractor::instance().ensure_sslkeylogfile_env(path)) {
+    diag::log_tagged_fmt("net_sec", "tls_ensure_keylogfile entry path=%s", path.c_str());
+    bool ok = net_security::TlsKeyExtractor::instance().ensure_sslkeylogfile_env(path);
+    diag::log_tagged_fmt("net_sec", "tls_ensure_keylogfile ok=%d", (int)ok);
+    if (ok) {
         char buf[MAX_PATH] = {};
         DWORD len = GetEnvironmentVariableA("SSLKEYLOGFILE", buf, MAX_PATH);
+        std::string effective_path = (len > 0) ? std::string(buf, len) : path;
+        diag::log_tagged_fmt("net_sec", "tls_ensure_keylogfile configured effective_path=%s", effective_path.c_str());
         json r;
         r["status"] = "configured";
-        r["path"] = (len > 0) ? std::string(buf, len) : path;
+        r["path"] = effective_path;
         r["note"] = "SSLKEYLOGFILE set at user level. Newly started processes (browsers, VS Code, etc.) "
                     "will log TLS session keys to this file. Restart the target application for it to take effect.";
         return tool_result_t::ok(OBFSTR("SSLKEYLOGFILE configured"), r);
@@ -472,11 +566,13 @@ tool_result_t tls_ensure_keylogfile(const json& params) {
 }
 
 tool_result_t autoresponder_add_rule(const json& params) {
+    std::string mt = params.value("match_type", "prefix_url");
+    std::string match_pattern = params.value("match_pattern", "");
+    diag::log_tagged_fmt("net_sec", "autoresponder_add_rule entry match_type=%s match_pattern=%s status_code=%u",
+        mt.c_str(), match_pattern.c_str(), params.value("status_code", 200u));
     net_security::autoresponder_rule_t rule;
     rule.enabled = params.value("enabled", true);
     rule.priority = params.value("priority", 0);
-
-    std::string mt = params.value("match_type", "prefix_url");
     if (mt == "exact_url") rule.match_type = net_security::autoresponder_match_type::exact_url;
     else if (mt == "prefix_url") rule.match_type = net_security::autoresponder_match_type::prefix_url;
     else if (mt == "regex_url") rule.match_type = net_security::autoresponder_match_type::regex_url;
@@ -502,6 +598,7 @@ tool_result_t autoresponder_add_rule(const json& params) {
     }
 
     std::uint32_t id = net_security::AutoResponder::instance().add_rule(rule);
+    diag::log_tagged_fmt("net_sec", "autoresponder_add_rule rule_id=%u match_type=%s match_pattern=%s", id, mt.c_str(), match_pattern.c_str());
     json r;
     r["rule_id"] = id;
     return tool_result_t::ok(OBFSTR("AutoResponder rule added with ID ") + std::to_string(id), r);
@@ -509,7 +606,10 @@ tool_result_t autoresponder_add_rule(const json& params) {
 
 tool_result_t autoresponder_remove_rule(const json& params) {
     std::uint32_t rule_id = params.value("rule_id", 0u);
-    if (net_security::AutoResponder::instance().remove_rule(rule_id)) {
+    diag::log_tagged_fmt("net_sec", "autoresponder_remove_rule entry rule_id=%u", rule_id);
+    bool removed = net_security::AutoResponder::instance().remove_rule(rule_id);
+    diag::log_tagged_fmt("net_sec", "autoresponder_remove_rule removed=%d rule_id=%u", (int)removed, rule_id);
+    if (removed) {
         json r;
         r["removed"] = true;
         r["rule_id"] = rule_id;
@@ -519,7 +619,9 @@ tool_result_t autoresponder_remove_rule(const json& params) {
 }
 
 tool_result_t autoresponder_list_rules(const json&) {
+    diag::log_tagged("net_sec", "autoresponder_list_rules entry");
     auto rules = net_security::AutoResponder::instance().list_rules();
+    diag::log_tagged_fmt("net_sec", "autoresponder_list_rules count=%zu", rules.size());
     json result;
     result["count"] = rules.size();
     json arr = json::array();
@@ -541,7 +643,10 @@ tool_result_t autoresponder_list_rules(const json&) {
 }
 
 tool_result_t autoresponder_start(const json&) {
-    if (net_security::AutoResponder::instance().start()) {
+    diag::log_tagged("net_sec", "autoresponder_start entry");
+    bool started = net_security::AutoResponder::instance().start();
+    diag::log_tagged_fmt("net_sec", "autoresponder_start started=%d", (int)started);
+    if (started) {
         json r;
         r["status"] = "started";
         return tool_result_t::ok(OBFSTR("AutoResponder started"), r);
@@ -550,7 +655,10 @@ tool_result_t autoresponder_start(const json&) {
 }
 
 tool_result_t autoresponder_stop(const json&) {
-    if (net_security::AutoResponder::instance().stop()) {
+    diag::log_tagged("net_sec", "autoresponder_stop entry");
+    bool stopped = net_security::AutoResponder::instance().stop();
+    diag::log_tagged_fmt("net_sec", "autoresponder_stop stopped=%d", (int)stopped);
+    if (stopped) {
         json r;
         r["status"] = "stopped";
         return tool_result_t::ok(OBFSTR("AutoResponder stopped"), r);
@@ -560,11 +668,17 @@ tool_result_t autoresponder_stop(const json&) {
 
 tool_result_t autoresponder_import_rules(const json& params) {
     std::string rules_json = params.value("rules_json", "");
-    if (rules_json.empty())
+    diag::log_tagged_fmt("net_sec", "autoresponder_import_rules entry rules_json_len=%zu", rules_json.size());
+    if (rules_json.empty()) {
+        diag::log_tagged("net_sec", "autoresponder_import_rules rules_json empty -> error");
         return tool_result_t::error(OBFSTR("rules_json is required"));
+    }
 
-    if (net_security::AutoResponder::instance().import_rules(rules_json)) {
+    bool imported = net_security::AutoResponder::instance().import_rules(rules_json);
+    diag::log_tagged_fmt("net_sec", "autoresponder_import_rules imported=%d", (int)imported);
+    if (imported) {
         auto count = net_security::AutoResponder::instance().list_rules().size();
+        diag::log_tagged_fmt("net_sec", "autoresponder_import_rules total_rules=%zu", count);
         json r;
         r["imported"] = true;
         r["total_rules"] = count;
@@ -574,7 +688,9 @@ tool_result_t autoresponder_import_rules(const json& params) {
 }
 
 tool_result_t autoresponder_export_rules(const json&) {
+    diag::log_tagged("net_sec", "autoresponder_export_rules entry");
     std::string exported = net_security::AutoResponder::instance().export_rules();
+    diag::log_tagged_fmt("net_sec", "autoresponder_export_rules exported_len=%zu", exported.size());
     json r;
     r["rules_json"] = exported;
     return tool_result_t::ok(OBFSTR("AutoResponder rules exported"), r);
@@ -610,7 +726,7 @@ tool_result_t tls_ensure_keylogfile(const json&) { return tool_result_t::error("
 #endif
 
 void register_net_security_tools(mcp_standalone::server_t& srv) {
-
+    diag::log_tagged("net_sec", "register_net_security_tools entry");
 
     register_compat(srv, {
         OBFSTR("tls_extract_keys"), OBFSTR("network_security"),
@@ -817,6 +933,8 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
                "Once set, use tls_extract_keys or network_decrypt_capture to read the logged keys and decrypt traffic."),
         {{OBFSTR("path"), OBFSTR("string"), OBFSTR("File path for the keylog file (default: %USERPROFILE%\\sslkeys.log)"), false}},
         tls_ensure_keylogfile, false});
+
+    diag::log_tagged("net_sec", "register_net_security_tools complete");
 }
 
 }

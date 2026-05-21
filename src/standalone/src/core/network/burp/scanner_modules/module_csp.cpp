@@ -2,6 +2,8 @@
 #include "../csp_analyzer.hpp"
 #include "../issue.hpp"
 
+#include "../../../../helpers/diag_log.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <string>
@@ -37,11 +39,18 @@ void run_csp_analysis(const insertion_point_t& ip,
                       const module_context_t& ctx,
                       const send_fn_t& send_fn)
 {
+    diag::log_tagged_fmt("mod_csp", "run_csp_analysis entry host=%s headers_count=%zu",
+                         ctx.host.c_str(), ctx.baseline_response_headers.size());
     (void)ip;
     (void)send_fn;
-    if (ctx.baseline_response_headers.empty()) return;
+    if (ctx.baseline_response_headers.empty()) {
+        diag::log_tagged_fmt("mod_csp", "run_csp_analysis skip no baseline headers host=%s", ctx.host.c_str());
+        return;
+    }
     auto res = csp::analyze_for_response(ctx.baseline_response_headers);
+    diag::log_tagged_fmt("mod_csp", "run_csp_analysis has_csp=%d findings=%zu", res.has_csp ? 1 : 0, res.findings.size());
     if (!res.has_csp) {
+        diag::log_tagged_fmt("mod_csp", "run_csp_analysis FINDING csp_missing host=%s", ctx.host.c_str());
         issue_t iss;
         iss.type_key = "csp_missing";
         iss.name = "Missing Content-Security-Policy header";
@@ -59,6 +68,8 @@ void run_csp_analysis(const insertion_point_t& ip,
         return;
     }
     for (const auto& f : res.findings) {
+        diag::log_tagged_fmt("mod_csp", "run_csp_analysis FINDING csp.%s severity=%s host=%s",
+                             f.id.c_str(), f.severity.c_str(), ctx.host.c_str());
         issue_t iss;
         iss.type_key = "csp." + f.id;
         iss.name = f.title;
@@ -77,6 +88,7 @@ void run_csp_analysis(const insertion_point_t& ip,
         iss.cwe.push_back("CWE-1021");
         issue_store::add(std::move(iss));
     }
+    diag::log_tagged_fmt("mod_csp", "run_csp_analysis complete host=%s total_findings=%zu", ctx.host.c_str(), res.findings.size());
 }
 
 struct auto_register_t

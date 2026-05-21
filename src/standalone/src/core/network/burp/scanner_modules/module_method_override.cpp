@@ -1,6 +1,8 @@
 #include "../scanner_module.hpp"
 #include "../audit_http.hpp"
 
+#include "../../../../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <optional>
@@ -68,22 +70,41 @@ static std::vector<uint8_t> add_query_param(const std::string& base, const std::
 
 void method_override_run(const insertion_point_t& ip, const module_context_t& ctx, const send_fn_t& send)
 {
-    if (!insertion_point_is_request_line(ip)) return;
-    if (ip.base_request.empty()) return;
+    diag::log_tagged_fmt("mod_method", "method_override_run entry ip=%s:%s host=%s", ip.kind.c_str(), ip.name.c_str(), ctx.host.c_str());
+    if (!insertion_point_is_request_line(ip)) {
+        diag::log_tagged_fmt("mod_method", "method_override_run skip not request-line");
+        return;
+    }
+    if (ip.base_request.empty()) {
+        diag::log_tagged_fmt("mod_method", "method_override_run skip empty request");
+        return;
+    }
 
     std::string orig_method = extract_method(ip.base_request);
-    if (orig_method.empty()) return;
+    if (orig_method.empty()) {
+        diag::log_tagged_fmt("mod_method", "method_override_run skip no method");
+        return;
+    }
     orig_method = ascii_upper(orig_method);
-    if (orig_method != "GET" && orig_method != "POST") return;
+    if (orig_method != "GET" && orig_method != "POST") {
+        diag::log_tagged_fmt("mod_method", "method_override_run skip non-GET/POST method=%s", orig_method.c_str());
+        return;
+    }
+    diag::log_tagged_fmt("mod_method", "method_override_run testing method=%s host=%s", orig_method.c_str(), ctx.host.c_str());
 
     audit_http::send_options_t opt;
     opt.timeout_ms = ctx.timeout_ms > 0 ? ctx.timeout_ms : 10000;
     opt.follow_redirects = false;
 
+    diag::log_tagged_fmt("mod_method", "method_override_run fetching baseline timeout=%dms", opt.timeout_ms);
     auto baseline = audit_http::send(std::vector<uint8_t>(ip.base_request.begin(), ip.base_request.end()),
                                      ctx.host, ctx.port, ctx.tls, opt);
-    if (!baseline.has_value()) return;
+    if (!baseline.has_value()) {
+        diag::log_tagged_fmt("mod_method", "method_override_run no baseline response");
+        return;
+    }
     int baseline_status = baseline->status_code;
+    diag::log_tagged_fmt("mod_method", "method_override_run baseline status=%d method=%s", baseline_status, orig_method.c_str());
 
     struct variant_t { std::string id; std::string description; std::vector<uint8_t> req; };
     std::vector<variant_t> variants;
@@ -116,13 +137,19 @@ void method_override_run(const insertion_point_t& ip, const module_context_t& ct
                          "Raw TRACE information disclosure",
                          change_method(ip.base_request, "TRACE") });
 
+    diag::log_tagged_fmt("mod_method", "method_override_run testing %zu variants baseline_status=%d", variants.size(), baseline_status);
     for (auto& v : variants) {
+        diag::log_tagged_fmt("mod_method", "method_override_run probe variant=%s", v.id.c_str());
         probe_t p;
         p.variant = v.id;
         p.payload = v.description;
         p.marker = "method-override";
         auto resp = send(v.req, p);
-        if (!resp.has_value()) continue;
+        if (!resp.has_value()) {
+            diag::log_tagged_fmt("mod_method", "method_override_run no response for variant=%s", v.id.c_str());
+            continue;
+        }
+        diag::log_tagged_fmt("mod_method", "method_override_run variant=%s status=%d", v.id.c_str(), resp->status_code);
 
         if (v.id == "raw-options") {
             std::string allow_header;
@@ -132,6 +159,7 @@ void method_override_run(const insertion_point_t& ip, const module_context_t& ct
                 if (lname == "allow") { allow_header = h.second; break; }
             }
             if (resp->status_code == 200 && !allow_header.empty()) {
+                diag::log_tagged_fmt("mod_method", "method_override_run FINDING options-leak allow=%s", allow_header.c_str());
                 std::string evidence = "OPTIONS returned 200 with Allow header: " + allow_header;
                 auto iss = make_issue("method-override.options-leak",
                                       "OPTIONS method discloses allowed verbs",
@@ -147,6 +175,7 @@ void method_override_run(const insertion_point_t& ip, const module_context_t& ct
 
         if (v.id == "raw-trace") {
             if (resp->status_code == 200) {
+                diag::log_tagged_fmt("mod_method", "method_override_run FINDING trace-enabled status=200");
                 std::string evidence = "TRACE returned 200 (TRACE may be enabled)";
                 auto iss = make_issue("method-override.trace-enabled",
                                       "TRACE method enabled",
@@ -170,7 +199,11 @@ void method_override_run(const insertion_point_t& ip, const module_context_t& ct
             bool baseline_405 = (baseline_status == 405 || baseline_status == 501);
             bool now_ok = (resp->status_code >= 200 && resp->status_code < 400);
             bool now_authed = (resp->status_code == 401 || resp->status_code == 403);
+            diag::log_tagged_fmt("mod_method", "method_override_run privileged variant=%s baseline_405=%d now_ok=%d now_authed=%d",
+                                 v.id.c_str(), baseline_405 ? 1 : 0, now_ok ? 1 : 0, now_authed ? 1 : 0);
             if (baseline_405 && now_ok) {
+                diag::log_tagged_fmt("mod_method", "method_override_run FINDING privileged-verb-allowed variant=%s baseline=%d probe=%d",
+                                     v.id.c_str(), baseline_status, resp->status_code);
                 std::string evidence = v.description + ": baseline " + std::to_string(baseline_status)
                                      + " -> " + std::to_string(resp->status_code);
                 auto iss = make_issue("method-override.privileged-verb-allowed",
@@ -188,6 +221,8 @@ void method_override_run(const insertion_point_t& ip, const module_context_t& ct
                               ? resp->resp_body.size() - baseline->resp_body.size()
                               : baseline->resp_body.size() - resp->resp_body.size();
                 if (diff > 32) {
+                    diag::log_tagged_fmt("mod_method", "method_override_run FINDING behavior-divergence variant=%s size_delta=%zu",
+                                         v.id.c_str(), diff);
                     std::string evidence = v.description + ": status=" + std::to_string(resp->status_code)
                                          + " (baseline=" + std::to_string(baseline_status)
                                          + ") size_delta=" + std::to_string(diff);
@@ -201,6 +236,8 @@ void method_override_run(const insertion_point_t& ip, const module_context_t& ct
                     issue_store::add(std::move(iss));
                 }
             } else if (now_authed && baseline_status == 405) {
+                diag::log_tagged_fmt("mod_method", "method_override_run FINDING auth-boundary variant=%s baseline=%d probe=%d",
+                                     v.id.c_str(), baseline_status, resp->status_code);
                 std::string evidence = v.description + ": baseline " + std::to_string(baseline_status)
                                      + " -> " + std::to_string(resp->status_code)
                                      + " (auth boundary reached via override)";
@@ -215,6 +252,7 @@ void method_override_run(const insertion_point_t& ip, const module_context_t& ct
             }
         }
     }
+    diag::log_tagged_fmt("mod_method", "method_override_run complete ip=%s:%s", ip.kind.c_str(), ip.name.c_str());
 }
 
 bool register_self()

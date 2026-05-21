@@ -1,5 +1,7 @@
 #include "../scanner_module.hpp"
 
+#include "../../../../helpers/diag_log.hpp"
+
 #include <optional>
 #include <regex>
 #include <string>
@@ -13,6 +15,8 @@ namespace {
 
 std::vector<probe_t> ssrf_probes(const insertion_point_t& ip, const module_context_t&)
 {
+    diag::log_tagged_fmt("mod_ssrf", "ssrf_probes entry ip=%s:%s orig=%s",
+                         ip.kind.c_str(), ip.name.c_str(), ip.original_value.c_str());
     std::vector<probe_t> out;
     out.push_back({"http://169.254.169.254/latest/meta-data/", "instance-id", "aws-imds"});
     out.push_back({"http://metadata.google.internal/computeMetadata/v1/instance/id", "computeMetadata", "gcp-imds"});
@@ -22,14 +26,19 @@ std::vector<probe_t> ssrf_probes(const insertion_point_t& ip, const module_conte
     out.push_back({"file:///c:/windows/win.ini", "[fonts]", "file-uri-win"});
     out.push_back({"gopher://127.0.0.1:25/", std::string(), "gopher-smtp"});
     (void)ip;
+    diag::log_tagged_fmt("mod_ssrf", "ssrf_probes built %zu probes ip=%s:%s", out.size(), ip.kind.c_str(), ip.name.c_str());
     return out;
 }
 
 std::optional<issue_t> ssrf_detect(const insertion_point_t& ip, const probe_t& probe,
                                    const exchange_observed_t& resp, const module_context_t& ctx)
 {
+    diag::log_tagged_fmt("mod_ssrf", "ssrf_detect entry ip=%s:%s variant=%s status=%d",
+                         ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str(), resp.status_code);
     if (!probe.marker.empty()) {
         if (body_contains_ci(resp, probe.marker)) {
+            diag::log_tagged_fmt("mod_ssrf", "ssrf_detect FINDING metadata-or-local ip=%s:%s variant=%s marker=%s",
+                                 ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str(), probe.marker.c_str());
             auto iss = make_issue("ssrf.metadata-or-local", "Server-Side Request Forgery (likely)",
                                   severity_t::critical, confidence_t::firm, ip, probe, resp, ctx,
                                   std::string("Marker '") + probe.marker + "' returned by SSRF target");
@@ -39,10 +48,12 @@ std::optional<issue_t> ssrf_detect(const insertion_point_t& ip, const probe_t& p
             iss.cwe.push_back("CWE-918");
             return iss;
         }
+        diag::log_tagged_fmt("mod_ssrf", "ssrf_detect marker not in body ip=%s:%s variant=%s", ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str());
         return std::nullopt;
     }
 
     if (probe.variant == "file-uri-unix" && body_contains(resp, "127.0.0.1")) {
+        diag::log_tagged_fmt("mod_ssrf", "ssrf_detect FINDING file-scheme ip=%s:%s", ip.kind.c_str(), ip.name.c_str());
         auto iss = make_issue("ssrf.file-scheme", "SSRF via file:// scheme",
                               severity_t::high, confidence_t::tentative, ip, probe, resp, ctx,
                               "file:// payload changed response");
@@ -51,6 +62,7 @@ std::optional<issue_t> ssrf_detect(const insertion_point_t& ip, const probe_t& p
         iss.cwe.push_back("CWE-918");
         return iss;
     }
+    diag::log_tagged_fmt("mod_ssrf", "ssrf_detect no finding ip=%s:%s variant=%s", ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str());
     return std::nullopt;
 }
 

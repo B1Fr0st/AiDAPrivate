@@ -461,20 +461,24 @@ std::vector<std::string> read_results(const sentinel_t& s)
 
 sentinel_t make_sentinel()
 {
+    diag::log_tagged_fmt("dom_xss", "make_sentinel entry");
     sentinel_t s;
     uint8_t buf[12] = {0};
     if (!random_bytes(buf, sizeof(buf))) {
+        diag::log_tagged_fmt("dom_xss", "make_sentinel bcrypt_failed using_prng");
         std::mt19937_64 rng(static_cast<uint64_t>(now_ms_wall()) ^ sentinel_counter().fetch_add(1));
         for (size_t i = 0; i < sizeof(buf); ++i) buf[i] = static_cast<uint8_t>(rng() & 0xFF);
     }
     s.token = bytes_to_hex(buf, sizeof(buf));
     s.canary_fn      = std::string("__aida_xss_canary_")  + s.token + "__";
     s.results_global = std::string("__aida_xss_results_") + s.token + "__";
+    diag::log_tagged_fmt("dom_xss", "make_sentinel done token=%s", s.token.c_str());
     return s;
 }
 
 std::string build_pre_injection_script(const sentinel_t& s)
 {
+    diag::log_tagged_fmt("dom_xss", "build_pre_injection_script entry token=%s", s.token.c_str());
     std::ostringstream os;
     os << "(function(){";
     os << "try{";
@@ -592,11 +596,14 @@ std::string build_pre_injection_script(const sentinel_t& s)
 
     os << "}catch(outer){try{console.log('aida_xss init err:'+(outer&&outer.message?outer.message:outer));}catch(e){}}";
     os << "})();";
-    return os.str();
+    std::string script = os.str();
+    diag::log_tagged_fmt("dom_xss", "build_pre_injection_script done script_len=%zu", script.size());
+    return script;
 }
 
 std::vector<payload_set_t> default_payload_sets()
 {
+    diag::log_tagged_fmt("dom_xss", "default_payload_sets entry");
     std::vector<payload_set_t> sets;
 
     payload_set_t polyglot;
@@ -642,6 +649,7 @@ std::vector<payload_set_t> default_payload_sets()
     };
     sets.push_back(std::move(dom_only));
 
+    diag::log_tagged_fmt("dom_xss", "default_payload_sets done sets=%zu", sets.size());
     return sets;
 }
 
@@ -772,6 +780,8 @@ fire_result_t fire_payload(const insertion_point_t& ip,
 
 size_t scan_insertion_point(const insertion_point_t& ip, const scan_options_t& opts)
 {
+    diag::log_tagged_fmt("dom_xss", "scan_insertion_point entry kind=%s param=%s host=%s",
+        ip.kind.c_str(), ip.name.c_str(), opts.host.c_str());
     if (!camoufox::ensure_ready()) {
         diag::log_tagged("dom_xss", "scan_insertion_point: camoufox not ready, skipping");
         return 0;
@@ -786,7 +796,10 @@ size_t scan_insertion_point(const insertion_point_t& ip, const scan_options_t& o
         else if (set.name == "standard" && opts.include_standard) active.push_back(&set);
         else if (set.name == "dom_only" && opts.include_dom_only) active.push_back(&set);
     }
-    if (active.empty()) return 0;
+    if (active.empty()) {
+        diag::log_tagged_fmt("dom_xss", "scan_insertion_point no_active_sets");
+        return 0;
+    }
 
     std::string path_hint;
     {
@@ -798,6 +811,7 @@ size_t scan_insertion_point(const insertion_point_t& ip, const scan_options_t& o
         }
     }
 
+    diag::log_tagged_fmt("dom_xss", "scan_insertion_point active_sets=%zu path_hint=%s", active.size(), path_hint.c_str());
     size_t fired = 0;
     size_t issued = 0;
     size_t budget = opts.max_payloads_per_point;
@@ -824,9 +838,12 @@ size_t scan_insertion_point(const insertion_point_t& ip, const scan_options_t& o
             auto iss = make_browser_certain_issue(type_key, title, ip, payload, r, opts, path_hint);
             issue_store::add(std::move(iss));
             ++issued;
+            diag::log_tagged_fmt("dom_xss", "scan_insertion_point confirmed kind=%s param=%s type=%s issued=%zu",
+                ip.kind.c_str(), ip.name.c_str(), type_key.c_str(), issued);
             return issued;
         }
     }
+    diag::log_tagged_fmt("dom_xss", "scan_insertion_point done fired=%zu issued=%zu", fired, issued);
     return issued;
 }
 
@@ -835,39 +852,60 @@ bool confirm_reflected_in_browser(const std::string&        url,
                                   std::vector<std::string>& out_sink_log,
                                   int                       per_payload_timeout_ms)
 {
+    diag::log_tagged_fmt("dom_xss", "confirm_reflected_in_browser entry url=%s canary=%s timeout_ms=%d",
+        url.c_str(), canary_marker.c_str(), per_payload_timeout_ms);
     std::lock_guard<std::mutex> global_lk(browser_global_mtx());
     out_sink_log.clear();
-    if (!camoufox::ensure_ready()) return false;
-    if (url.empty()) return false;
+    if (!camoufox::ensure_ready()) {
+        diag::log_tagged_fmt("dom_xss", "confirm_reflected_in_browser camoufox_not_ready");
+        return false;
+    }
+    if (url.empty()) {
+        diag::log_tagged_fmt("dom_xss", "confirm_reflected_in_browser empty_url");
+        return false;
+    }
 
     sentinel_t s = make_sentinel();
     if (!canary_marker.empty()) {
         s.token = canary_marker;
     }
     camoufox::reset_browser_state();
-    if (!navigate_with_init_script(url, s, per_payload_timeout_ms)) return false;
+    if (!navigate_with_init_script(url, s, per_payload_timeout_ms)) {
+        diag::log_tagged_fmt("dom_xss", "confirm_reflected_in_browser navigate_failed url=%s", url.c_str());
+        return false;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
     out_sink_log = read_results(s);
+    diag::log_tagged_fmt("dom_xss", "confirm_reflected_in_browser done url=%s fired=%d sinks=%zu",
+        url.c_str(), !out_sink_log.empty() ? 1 : 0, out_sink_log.size());
     return !out_sink_log.empty();
 }
 
 bool initialize()
 {
+    diag::log_tagged_fmt("dom_xss", "initialize entry");
     bool expected = false;
-    if (!initialized_flag().compare_exchange_strong(expected, true)) return true;
+    if (!initialized_flag().compare_exchange_strong(expected, true)) {
+        diag::log_tagged_fmt("dom_xss", "initialize already_initialized");
+        return true;
+    }
     diag::log_tagged("dom_xss", "engine initialized");
     return true;
 }
 
 void shutdown()
 {
+    diag::log_tagged_fmt("dom_xss", "shutdown entry");
     initialized_flag().store(false);
+    diag::log_tagged_fmt("dom_xss", "shutdown done");
 }
 
 std::string last_error()
 {
     std::lock_guard<std::mutex> lk(err_mtx());
-    return err_slot();
+    std::string e = err_slot();
+    diag::log_tagged_fmt("dom_xss", "last_error queried val=%s", e.c_str());
+    return e;
 }
 
 }

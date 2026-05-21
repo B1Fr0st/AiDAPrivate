@@ -420,6 +420,8 @@ static std::vector<uint8_t> trim_to_window(const std::vector<uint8_t>& data, boo
 static std::vector<diff_block_t> compute_diff_impl(const std::vector<uint8_t>& a_full, const std::vector<uint8_t>& b_full,
                                                    diff_mode_t mode, diff_stats_t& stats)
 {
+    diag::log_tagged_fmt("comparer", "compute_diff_impl entry a_full=%zu b_full=%zu mode=%d",
+        a_full.size(), b_full.size(), (int)mode);
     bool ta = false, tb = false;
     std::vector<uint8_t> a = trim_to_window(a_full, ta);
     std::vector<uint8_t> b = trim_to_window(b_full, tb);
@@ -427,6 +429,10 @@ static std::vector<diff_block_t> compute_diff_impl(const std::vector<uint8_t>& a
     stats.window_used = std::max(a.size(), b.size());
     stats.a_size = a.size();
     stats.b_size = b.size();
+    if (ta || tb) {
+        diag::log_tagged_fmt("comparer", "compute_diff_impl truncated a_orig=%zu b_orig=%zu window=%zu",
+            a_full.size(), b_full.size(), kMyersWindow);
+    }
 
     std::vector<diff_block_t> blocks;
     switch (mode) {
@@ -507,77 +513,122 @@ uint64_t add_slot(const slot_t& s)
 
 uint64_t add_slot_from_bytes(const std::string& label, const std::vector<uint8_t>& data, const std::string& source_hint)
 {
+    diag::log_tagged_fmt("comparer", "add_slot_from_bytes entry label='%s' data_len=%zu source='%s'",
+        label.c_str(), data.size(), source_hint.c_str());
     slot_t s;
     s.label = label.empty() ? ("Slot " + std::to_string(g_reg.next_id.load())) : label;
     s.data = data;
     s.source_hint = source_hint;
-    return add_slot(s);
+    uint64_t id = add_slot(s);
+    diag::log_tagged_fmt("comparer", "add_slot_from_bytes ok id=%llu", static_cast<unsigned long long>(id));
+    return id;
 }
 
 bool add_slot_from_file(const std::string& label, const std::string& path)
 {
+    diag::log_tagged_fmt("comparer", "add_slot_from_file entry label='%s' path='%s'", label.c_str(), path.c_str());
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) {
+        diag::log_tagged_fmt("comparer", "add_slot_from_file error open_failed path='%s'", path.c_str());
         set_last_error("file_open_failed");
         return false;
     }
     std::vector<uint8_t> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     f.close();
+    diag::log_tagged_fmt("comparer", "add_slot_from_file read_ok bytes=%zu path='%s'", buf.size(), path.c_str());
     add_slot_from_bytes(label.empty() ? path : label, buf, std::string("file:") + path);
     return true;
 }
 
 std::vector<slot_t> list_slots()
 {
+    diag::log_tagged_fmt("comparer", "list_slots entry");
     std::vector<slot_t> out;
     std::lock_guard<std::mutex> lk(g_reg.mtx);
     out.reserve(g_reg.slots.size());
     for (const auto& kv : g_reg.slots) out.push_back(kv.second);
     std::sort(out.begin(), out.end(), [](const slot_t& a, const slot_t& b) { return a.id < b.id; });
+    diag::log_tagged_fmt("comparer", "list_slots result count=%zu", out.size());
     return out;
 }
 
 bool get_slot(uint64_t id, slot_t& out)
 {
+    diag::log_tagged_fmt("comparer", "get_slot entry id=%llu", static_cast<unsigned long long>(id));
     std::lock_guard<std::mutex> lk(g_reg.mtx);
     auto it = g_reg.slots.find(id);
-    if (it == g_reg.slots.end()) return false;
+    if (it == g_reg.slots.end()) {
+        diag::log_tagged_fmt("comparer", "get_slot not_found id=%llu", static_cast<unsigned long long>(id));
+        return false;
+    }
     out = it->second;
+    diag::log_tagged_fmt("comparer", "get_slot found id=%llu label='%s' size=%zu",
+        static_cast<unsigned long long>(id), out.label.c_str(), out.data.size());
     return true;
 }
 
 void clear_slots()
 {
-    std::lock_guard<std::mutex> lk(g_reg.mtx);
-    g_reg.slots.clear();
+    diag::log_tagged_fmt("comparer", "clear_slots entry");
+    size_t count = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_reg.mtx);
+        count = g_reg.slots.size();
+        g_reg.slots.clear();
+    }
+    diag::log_tagged_fmt("comparer", "clear_slots done cleared=%zu", count);
 }
 
 bool remove_slot(uint64_t id)
 {
+    diag::log_tagged_fmt("comparer", "remove_slot entry id=%llu", static_cast<unsigned long long>(id));
     std::lock_guard<std::mutex> lk(g_reg.mtx);
     auto it = g_reg.slots.find(id);
-    if (it == g_reg.slots.end()) return false;
+    if (it == g_reg.slots.end()) {
+        diag::log_tagged_fmt("comparer", "remove_slot not_found id=%llu", static_cast<unsigned long long>(id));
+        return false;
+    }
     g_reg.slots.erase(it);
+    diag::log_tagged_fmt("comparer", "remove_slot ok id=%llu", static_cast<unsigned long long>(id));
     return true;
 }
 
 std::vector<diff_block_t> compute_diff(uint64_t slot_a, uint64_t slot_b, diff_mode_t mode)
 {
+    diag::log_tagged_fmt("comparer", "compute_diff entry slot_a=%llu slot_b=%llu",
+        static_cast<unsigned long long>(slot_a), static_cast<unsigned long long>(slot_b));
     diff_stats_t stats;
-    return compute_diff_with_stats(slot_a, slot_b, mode, stats);
+    auto result = compute_diff_with_stats(slot_a, slot_b, mode, stats);
+    diag::log_tagged_fmt("comparer", "compute_diff result blocks=%zu", result.size());
+    return result;
 }
 
 std::vector<diff_block_t> compute_diff_with_stats(uint64_t slot_a, uint64_t slot_b, diff_mode_t mode, diff_stats_t& stats)
 {
+    diag::log_tagged_fmt("comparer", "compute_diff_with_stats entry slot_a=%llu slot_b=%llu mode=%d",
+        static_cast<unsigned long long>(slot_a), static_cast<unsigned long long>(slot_b), (int)mode);
     slot_t a;
     slot_t b;
-    if (!get_slot(slot_a, a)) { set_last_error("slot_a_not_found"); return {}; }
-    if (!get_slot(slot_b, b)) { set_last_error("slot_b_not_found"); return {}; }
-    return compute_diff_impl(a.data, b.data, mode, stats);
+    if (!get_slot(slot_a, a)) {
+        diag::log_tagged_fmt("comparer", "compute_diff_with_stats error slot_a_not_found id=%llu", static_cast<unsigned long long>(slot_a));
+        set_last_error("slot_a_not_found");
+        return {};
+    }
+    if (!get_slot(slot_b, b)) {
+        diag::log_tagged_fmt("comparer", "compute_diff_with_stats error slot_b_not_found id=%llu", static_cast<unsigned long long>(slot_b));
+        set_last_error("slot_b_not_found");
+        return {};
+    }
+    diag::log_tagged_fmt("comparer", "compute_diff_with_stats a_size=%zu b_size=%zu", a.data.size(), b.data.size());
+    auto result = compute_diff_impl(a.data, b.data, mode, stats);
+    diag::log_tagged_fmt("comparer", "compute_diff_with_stats done blocks=%zu equal=%zu insert=%zu delete=%zu replace=%zu",
+        result.size(), stats.equal_runs, stats.insert_runs, stats.delete_runs, stats.replace_runs);
+    return result;
 }
 
 std::string last_error()
 {
+    diag::log_tagged_fmt("comparer", "last_error queried");
     std::lock_guard<std::mutex> lk(g_reg.err_mtx);
     return g_reg.last_err;
 }

@@ -247,7 +247,11 @@ void merge_subdomain(enum_t& e, const std::string& fqdn, const std::string& sour
 
 void passive_crtsh(std::shared_ptr<enum_t> ctx)
 {
-    if (ctx->stop_flag.load()) return;
+    diag::log_tagged_fmt("subdomain_enum", "passive_crtsh id=%llu domain=%s", static_cast<unsigned long long>(ctx->id), ctx->config.domain.c_str());
+    if (ctx->stop_flag.load()) {
+        diag::log_tagged_fmt("subdomain_enum", "passive_crtsh id=%llu stopped", static_cast<unsigned long long>(ctx->id));
+        return;
+    }
     std::string url = "https://crt.sh/?q=%25." + ctx->config.domain + "&output=json";
     std::string body;
     if (!https_fetch(url, ctx->config.user_agent, ctx->config.request_timeout_ms, body))
@@ -255,6 +259,7 @@ void passive_crtsh(std::shared_ptr<enum_t> ctx)
         diag::log_tagged_fmt("burp.subdomain_enum", "crtsh_failed domain=%s", ctx->config.domain.c_str());
         return;
     }
+    diag::log_tagged_fmt("subdomain_enum", "passive_crtsh id=%llu body_bytes=%zu", static_cast<unsigned long long>(ctx->id), body.size());
     nlohmann::json j = nlohmann::json::parse(body, nullptr, false);
     if (j.is_discarded() || !j.is_array())
     {
@@ -280,10 +285,12 @@ void passive_crtsh(std::shared_ptr<enum_t> ctx)
         }
     }
     ctx->passive_count.fetch_add(added);
+    diag::log_tagged_fmt("subdomain_enum", "passive_crtsh id=%llu added=%d", static_cast<unsigned long long>(ctx->id), added);
 }
 
 void passive_bufferover(std::shared_ptr<enum_t> ctx)
 {
+    diag::log_tagged_fmt("subdomain_enum", "passive_bufferover id=%llu domain=%s", static_cast<unsigned long long>(ctx->id), ctx->config.domain.c_str());
     if (ctx->stop_flag.load()) return;
     std::string url = "https://dns.bufferover.run/dns?q=" + ctx->config.domain;
     std::string body;
@@ -310,10 +317,12 @@ void passive_bufferover(std::shared_ptr<enum_t> ctx)
     if (j.contains("FDNS_A")) handle_array(j["FDNS_A"]);
     if (j.contains("RDNS")) handle_array(j["RDNS"]);
     ctx->passive_count.fetch_add(added);
+    diag::log_tagged_fmt("subdomain_enum", "passive_bufferover id=%llu added=%d", static_cast<unsigned long long>(ctx->id), added);
 }
 
 void passive_hackertarget(std::shared_ptr<enum_t> ctx)
 {
+    diag::log_tagged_fmt("subdomain_enum", "passive_hackertarget id=%llu domain=%s", static_cast<unsigned long long>(ctx->id), ctx->config.domain.c_str());
     if (ctx->stop_flag.load()) return;
     std::string url = "https://api.hackertarget.com/hostsearch/?q=" + ctx->config.domain;
     std::string body;
@@ -336,6 +345,7 @@ void passive_hackertarget(std::shared_ptr<enum_t> ctx)
         added++;
     }
     ctx->passive_count.fetch_add(added);
+    diag::log_tagged_fmt("subdomain_enum", "passive_hackertarget id=%llu added=%d", static_cast<unsigned long long>(ctx->id), added);
 }
 
 std::vector<std::string> load_brute_words(const config_t& cfg)
@@ -361,6 +371,7 @@ void brute_one(std::shared_ptr<enum_t> ctx, const std::string& word)
     ctx->in_flight.fetch_add(1);
     ctx->brute_attempts.fetch_add(1);
     std::string fqdn = word + "." + ctx->config.domain;
+    diag::log_tagged_fmt("subdomain_enum", "brute_one id=%llu fqdn=%s", static_cast<unsigned long long>(ctx->id), fqdn.c_str());
     if (!ctx->stop_flag.load())
     {
         std::vector<std::string> ips;
@@ -368,7 +379,12 @@ void brute_one(std::shared_ptr<enum_t> ctx, const std::string& word)
         if (ok)
         {
             ctx->brute_resolved.fetch_add(1);
+            std::string ip_list;
+            for (size_t i = 0; i < ips.size(); ++i) { if (i) ip_list += ","; ip_list += ips[i]; }
+            diag::log_tagged_fmt("subdomain_enum", "brute_one resolved id=%llu fqdn=%s ips=%s", static_cast<unsigned long long>(ctx->id), fqdn.c_str(), ip_list.c_str());
             merge_subdomain(*ctx, fqdn, "brute", ips, true);
+        } else {
+            diag::log_tagged_fmt("subdomain_enum", "brute_one nxdomain id=%llu fqdn=%s", static_cast<unsigned long long>(ctx->id), fqdn.c_str());
         }
     }
     ctx->in_flight.fetch_sub(1);
@@ -382,13 +398,22 @@ void resolve_known_passive(std::shared_ptr<enum_t> ctx)
         fqdns.reserve(ctx->results.size());
         for (auto& kv : ctx->results) if (!kv.second.resolves) fqdns.push_back(kv.first);
     }
+    diag::log_tagged_fmt("subdomain_enum", "resolve_known_passive id=%llu fqdns_to_resolve=%zu", static_cast<unsigned long long>(ctx->id), fqdns.size());
+    int resolved = 0;
     for (auto& f : fqdns)
     {
-        if (ctx->stop_flag.load()) break;
+        if (ctx->stop_flag.load()) {
+            diag::log_tagged_fmt("subdomain_enum", "resolve_known_passive id=%llu stopped resolved_so_far=%d", static_cast<unsigned long long>(ctx->id), resolved);
+            break;
+        }
         std::vector<std::string> ips;
-        if (resolve_fqdn(f, ctx->config.bypass_dns_cache, ips))
+        if (resolve_fqdn(f, ctx->config.bypass_dns_cache, ips)) {
             merge_subdomain(*ctx, f, std::string(), ips, true);
+            resolved++;
+            diag::log_tagged_fmt("subdomain_enum", "resolve_known_passive resolved id=%llu fqdn=%s ip_count=%zu", static_cast<unsigned long long>(ctx->id), f.c_str(), ips.size());
+        }
     }
+    diag::log_tagged_fmt("subdomain_enum", "resolve_known_passive done id=%llu resolved=%d of %zu", static_cast<unsigned long long>(ctx->id), resolved, fqdns.size());
 }
 
 void finalize(std::shared_ptr<enum_t> ctx)
@@ -409,17 +434,22 @@ void finalize(std::shared_ptr<enum_t> ctx)
 
 void run_enum(std::shared_ptr<enum_t> ctx)
 {
+    diag::log_tagged_fmt("subdomain_enum", "run_enum id=%llu domain=%s run_passive=%d run_brute=%d",
+        static_cast<unsigned long long>(ctx->id), ctx->config.domain.c_str(),
+        ctx->config.run_passive ? 1 : 0, ctx->config.run_brute ? 1 : 0);
     {
         std::lock_guard<std::mutex> lk(ctx->mtx);
         ctx->phase = enum_phase_t::passive;
     }
     if (ctx->config.run_passive && !ctx->stop_flag.load())
     {
+        diag::log_tagged_fmt("subdomain_enum", "run_enum passive_phase id=%llu", static_cast<unsigned long long>(ctx->id));
         std::vector<std::string> sources = ctx->config.passive_sources;
         if (sources.empty()) sources = {"crt.sh", "bufferover", "hackertarget"};
         for (auto& src : sources)
         {
             if (ctx->stop_flag.load()) break;
+            diag::log_tagged_fmt("subdomain_enum", "run_enum passive_source id=%llu src=%s", static_cast<unsigned long long>(ctx->id), src.c_str());
             std::string ls = to_lower(src);
             if (ls.find("crt") != std::string::npos) passive_crtsh(ctx);
             else if (ls.find("bufferover") != std::string::npos) passive_bufferover(ctx);
@@ -435,6 +465,8 @@ void run_enum(std::shared_ptr<enum_t> ctx)
             ctx->phase = enum_phase_t::brute;
         }
         std::vector<std::string> words = load_brute_words(ctx->config);
+        diag::log_tagged_fmt("subdomain_enum", "run_enum brute_phase id=%llu wordlist_size=%zu conc=%d",
+            static_cast<unsigned long long>(ctx->id), words.size(), ctx->config.resolver_concurrency);
         if (words.empty())
         {
             diag::log_tagged_fmt("burp.subdomain_enum", "brute_empty_wordlist id=%llu wl=%s",
@@ -467,24 +499,34 @@ void run_enum(std::shared_ptr<enum_t> ctx)
 
 bool initialize()
 {
+    diag::log_tagged_fmt("subdomain_enum", "initialize called");
     auto& r = reg();
     bool expected = false;
-    if (!r.init_done.compare_exchange_strong(expected, true)) return true;
+    if (!r.init_done.compare_exchange_strong(expected, true)) {
+        diag::log_tagged_fmt("subdomain_enum", "initialize already_done");
+        return true;
+    }
     payloads::initialize();
     ensure_winsock();
+    diag::log_tagged_fmt("subdomain_enum", "initialize success");
     return true;
 }
 
 void shutdown()
 {
+    diag::log_tagged_fmt("subdomain_enum", "shutdown called");
     auto& r = reg();
-    if (!r.init_done.exchange(false)) return;
+    if (!r.init_done.exchange(false)) {
+        diag::log_tagged_fmt("subdomain_enum", "shutdown skipped not_initialized");
+        return;
+    }
     std::vector<std::shared_ptr<enum_t>> snaps;
     {
         std::lock_guard<std::mutex> lk(r.mtx);
         snaps.reserve(r.by_id.size());
         for (auto& kv : r.by_id) { kv.second->stop_flag.store(true); snaps.push_back(kv.second); }
     }
+    diag::log_tagged_fmt("subdomain_enum", "shutdown stopping %zu jobs", snaps.size());
     for (int i = 0; i < 60; ++i)
     {
         bool done = true;
@@ -496,6 +538,7 @@ void shutdown()
         std::lock_guard<std::mutex> lk(r.mtx);
         r.by_id.clear();
     }
+    diag::log_tagged_fmt("subdomain_enum", "shutdown complete");
 }
 
 uint64_t start(const config_t& cfg)
@@ -519,11 +562,16 @@ uint64_t start(const config_t& cfg)
 
 bool stop(uint64_t id)
 {
+    diag::log_tagged_fmt("subdomain_enum", "stop id=%llu", static_cast<unsigned long long>(id));
     std::shared_ptr<enum_t> ctx;
     {
         std::lock_guard<std::mutex> lk(reg().mtx);
         auto it = reg().by_id.find(id);
-        if (it == reg().by_id.end()) { set_err("not found"); return false; }
+        if (it == reg().by_id.end()) {
+            diag::log_tagged_fmt("subdomain_enum", "stop id=%llu not_found", static_cast<unsigned long long>(id));
+            set_err("not found");
+            return false;
+        }
         ctx = it->second;
     }
     ctx->stop_flag.store(true);

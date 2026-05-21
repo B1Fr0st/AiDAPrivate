@@ -421,6 +421,7 @@ bool parse_url(const std::string& url,
                uint16_t& port,
                std::string& path)
 {
+    diag::log_tagged_fmt("audit_http", "parse_url url=%s", url.c_str());
     auto sep = url.find("://");
     if (sep == std::string::npos) {
         scheme = "http";
@@ -443,9 +444,17 @@ bool parse_url(const std::string& url,
     } else {
         host = authority.substr(0, colon);
         try { port = static_cast<uint16_t>(std::stoul(authority.substr(colon + 1))); }
-        catch (...) { return false; }
+        catch (...) {
+            diag::log_tagged_fmt("audit_http", "parse_url invalid_port authority=%s", authority.c_str());
+            return false;
+        }
     }
-    if (host.empty()) return false;
+    if (host.empty()) {
+        diag::log_tagged("audit_http", "parse_url empty_host");
+        return false;
+    }
+    diag::log_tagged_fmt("audit_http", "parse_url ok scheme=%s host=%s port=%u path=%s",
+        scheme.c_str(), host.c_str(), static_cast<unsigned>(port), path.c_str());
     return true;
 }
 
@@ -455,7 +464,11 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
                                         bool tls,
                                         const send_options_t& options)
 {
+    diag::log_tagged_fmt("audit_http", "send host=%s port=%u tls=%d req_len=%zu scope_only=%d timeout_ms=%d",
+        host.c_str(), static_cast<unsigned>(port), tls ? 1 : 0, raw_request.size(),
+        options.enforce_scope ? 1 : 0, options.timeout_ms);
     if (raw_request.empty() || host.empty()) {
+        diag::log_tagged("audit_http", "send rejected empty_request_or_host");
         set_err("audit_http.send: empty request or host");
         return std::nullopt;
     }
@@ -468,6 +481,7 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
         }
         check_url += "/";
         if (!scope::in_scope(check_url)) {
+            diag::log_tagged_fmt("audit_http", "send out_of_scope url=%s", check_url.c_str());
             set_err("audit_http.send: target out of scope");
             return std::nullopt;
         }
@@ -482,13 +496,16 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
     sockaddr_storage sa{};
     int sa_len = 0;
     if (!resolve_target(host, port, sa, sa_len)) {
+        diag::log_tagged_fmt("audit_http", "send dns_failed host=%s", host.c_str());
         set_err("audit_http.send: DNS resolution failed");
         return std::nullopt;
     }
+    diag::log_tagged_fmt("audit_http", "send dns_ok host=%s port=%u", host.c_str(), static_cast<unsigned>(port));
 
     socket_holder_t sh;
     sh.sock = socket(sa.ss_family, SOCK_STREAM, IPPROTO_TCP);
     if (sh.sock == INVALID_SOCKET) {
+        diag::log_tagged("audit_http", "send socket_create_failed");
         set_err("audit_http.send: socket() failed");
         return std::nullopt;
     }
@@ -501,19 +518,29 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
     uint64_t t_steady_start = now_steady_ms();
 
     if (!tcp_connect(sh.sock, reinterpret_cast<sockaddr*>(&sa), sa_len, options.timeout_ms)) {
+        diag::log_tagged_fmt("audit_http", "send tcp_connect_failed host=%s port=%u", host.c_str(), static_cast<unsigned>(port));
         set_err("audit_http.send: connect failed");
         return std::nullopt;
     }
+    diag::log_tagged_fmt("audit_http", "send tcp_connected host=%s port=%u tls=%d", host.c_str(), static_cast<unsigned>(port), tls ? 1 : 0);
 
     ssl_holder_t ssh;
     if (tls) {
+        diag::log_tagged_fmt("audit_http", "send tls_handshake_start host=%s sni=%s",
+            host.c_str(), options.sni_override.empty() ? host.c_str() : options.sni_override.c_str());
         const SSL_METHOD* m = TLS_client_method();
         ssh.ctx = SSL_CTX_new(m);
-        if (!ssh.ctx) { set_err("audit_http.send: SSL_CTX_new failed"); return std::nullopt; }
+        if (!ssh.ctx) {
+            diag::log_tagged("audit_http", "send ssl_ctx_new_failed");
+            set_err("audit_http.send: SSL_CTX_new failed"); return std::nullopt;
+        }
         SSL_CTX_set_min_proto_version(ssh.ctx, TLS1_2_VERSION);
         SSL_CTX_set_verify(ssh.ctx, SSL_VERIFY_NONE, nullptr);
         ssh.ssl = SSL_new(ssh.ctx);
-        if (!ssh.ssl) { set_err("audit_http.send: SSL_new failed"); return std::nullopt; }
+        if (!ssh.ssl) {
+            diag::log_tagged("audit_http", "send ssl_new_failed");
+            set_err("audit_http.send: SSL_new failed"); return std::nullopt;
+        }
         SSL_set_fd(ssh.ssl, static_cast<int>(sh.sock));
         const std::string& sni = options.sni_override.empty() ? host : options.sni_override;
         SSL_set_tlsext_host_name(ssh.ssl, sni.c_str());
@@ -524,36 +551,67 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
             if (rc == 1) break;
             int err = SSL_get_error(ssh.ssl, rc);
             if (err == SSL_ERROR_WANT_READ) {
-                if (now_steady_ms() >= handshake_deadline) { set_err("audit_http.send: TLS handshake timeout"); return std::nullopt; }
-                if (!wait_socket(sh.sock, static_cast<int>(handshake_deadline - now_steady_ms()), false)) { set_err("audit_http.send: TLS handshake poll failed"); return std::nullopt; }
+                if (now_steady_ms() >= handshake_deadline) {
+                    diag::log_tagged("audit_http", "send tls_handshake_timeout want_read");
+                    set_err("audit_http.send: TLS handshake timeout"); return std::nullopt;
+                }
+                if (!wait_socket(sh.sock, static_cast<int>(handshake_deadline - now_steady_ms()), false)) {
+                    diag::log_tagged("audit_http", "send tls_handshake_poll_failed want_read");
+                    set_err("audit_http.send: TLS handshake poll failed"); return std::nullopt;
+                }
             } else if (err == SSL_ERROR_WANT_WRITE) {
-                if (now_steady_ms() >= handshake_deadline) { set_err("audit_http.send: TLS handshake timeout"); return std::nullopt; }
-                if (!wait_socket(sh.sock, static_cast<int>(handshake_deadline - now_steady_ms()), true)) { set_err("audit_http.send: TLS handshake poll failed"); return std::nullopt; }
+                if (now_steady_ms() >= handshake_deadline) {
+                    diag::log_tagged("audit_http", "send tls_handshake_timeout want_write");
+                    set_err("audit_http.send: TLS handshake timeout"); return std::nullopt;
+                }
+                if (!wait_socket(sh.sock, static_cast<int>(handshake_deadline - now_steady_ms()), true)) {
+                    diag::log_tagged("audit_http", "send tls_handshake_poll_failed want_write");
+                    set_err("audit_http.send: TLS handshake poll failed"); return std::nullopt;
+                }
             } else {
+                diag::log_tagged_fmt("audit_http", "send tls_handshake_error ssl_err=%d", err);
                 set_err("audit_http.send: TLS handshake error");
                 return std::nullopt;
             }
         }
+        diag::log_tagged_fmt("audit_http", "send tls_handshake_ok host=%s", host.c_str());
     }
 
     int remaining_ms = options.timeout_ms - static_cast<int>(now_steady_ms() - t_steady_start);
-    if (remaining_ms <= 0) { set_err("audit_http.send: post-connect timeout"); return std::nullopt; }
+    if (remaining_ms <= 0) {
+        diag::log_tagged("audit_http", "send post_connect_timeout");
+        set_err("audit_http.send: post-connect timeout"); return std::nullopt;
+    }
 
+    diag::log_tagged_fmt("audit_http", "send sending req_len=%zu remaining_ms=%d", req.size(), remaining_ms);
     bool sent_ok;
     if (tls) sent_ok = ssl_send_all(ssh.ssl, req.data(), req.size(), sh.sock, remaining_ms);
     else     sent_ok = send_all(sh.sock, req.data(), req.size(), remaining_ms);
-    if (!sent_ok) { set_err("audit_http.send: send failed"); return std::nullopt; }
+    if (!sent_ok) {
+        diag::log_tagged("audit_http", "send send_failed");
+        set_err("audit_http.send: send failed"); return std::nullopt;
+    }
 
     remaining_ms = options.timeout_ms - static_cast<int>(now_steady_ms() - t_steady_start);
-    if (remaining_ms <= 0) { set_err("audit_http.send: post-send timeout"); return std::nullopt; }
+    if (remaining_ms <= 0) {
+        diag::log_tagged("audit_http", "send post_send_timeout");
+        set_err("audit_http.send: post-send timeout"); return std::nullopt;
+    }
 
+    diag::log_tagged_fmt("audit_http", "send receiving remaining_ms=%d", remaining_ms);
     std::vector<uint8_t> resp_buf;
     bool got_response;
     if (tls) got_response = ssl_recv_until_complete(ssh.ssl, sh.sock, resp_buf, remaining_ms);
     else     got_response = recv_until_complete(sh.sock, resp_buf, remaining_ms);
-    if (!got_response) { set_err("audit_http.send: no response"); return std::nullopt; }
+    if (!got_response) {
+        diag::log_tagged("audit_http", "send no_response");
+        set_err("audit_http.send: no response"); return std::nullopt;
+    }
+    diag::log_tagged_fmt("audit_http", "send recv_ok resp_buf=%zu", resp_buf.size());
 
     uint64_t latency = now_steady_ms() - t_steady_start;
+    diag::log_tagged_fmt("audit_http", "send response_parsed latency_ms=%llu resp_size=%zu",
+        static_cast<unsigned long long>(latency), resp_buf.size());
 
     exchange_observed_t ex;
     ex.timestamp_ms = t_req_start;
@@ -599,6 +657,8 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
 
     std::string resp_s(reinterpret_cast<const char*>(resp_buf.data()), resp_buf.size());
     parse_response_status(resp_s, ex.status_code, ex.reason_phrase);
+    diag::log_tagged_fmt("audit_http", "send status=%d reason=%s method=%s path=%s",
+        ex.status_code, ex.reason_phrase.c_str(), ex.method.c_str(), ex.path.c_str());
     size_t body_offset = resp_buf.size();
     parse_response_headers(resp_s, ex.resp_headers, body_offset);
     bool chunked = false;
@@ -619,11 +679,13 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
 
     if (options.follow_redirects && options.max_redirects > 0 &&
         (ex.status_code >= 300 && ex.status_code < 400)) {
+        diag::log_tagged_fmt("audit_http", "send redirect status=%d max_redirects=%d", ex.status_code, options.max_redirects);
         for (const auto& h : ex.resp_headers) {
             std::string lc = h.first;
             std::transform(lc.begin(), lc.end(), lc.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
             if (lc == "location") {
                 std::string new_url = h.second;
+                diag::log_tagged_fmt("audit_http", "send redirect_to url=%s", new_url.c_str());
                 if (!new_url.empty()) {
                     std::string ns, nh, np;
                     uint16_t nport = 0;
@@ -636,7 +698,12 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
                         opt2.max_redirects--;
                         opt2.follow_redirects = (opt2.max_redirects > 0);
                         auto next = send(redir_req, nh, nport, ntls, opt2);
-                        if (next.has_value()) return next;
+                        if (next.has_value()) {
+                            diag::log_tagged_fmt("audit_http", "send redirect_ok status=%d", next->status_code);
+                            return next;
+                        }
+                    } else {
+                        diag::log_tagged_fmt("audit_http", "send redirect_parse_failed url=%s", new_url.c_str());
                     }
                 }
                 break;
@@ -644,13 +711,17 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
         }
     }
 
+    diag::log_tagged_fmt("audit_http", "send complete status=%d resp_body=%zu latency_ms=%llu",
+        ex.status_code, ex.resp_body.size(), static_cast<unsigned long long>(latency));
     return ex;
 }
 
 std::string last_error()
 {
     std::lock_guard<std::mutex> lk(err_mtx());
-    return err_slot();
+    std::string e = err_slot();
+    diag::log_tagged_fmt("audit_http", "last_error=%s", e.c_str());
+    return e;
 }
 
 }

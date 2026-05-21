@@ -196,27 +196,38 @@ bool parse_source(const std::string& s, source_t& out)
 
 bool initialize()
 {
+    diag::log_tagged_fmt("logger", "initialize entry");
     auto& r = ring();
     bool expected = false;
-    if (!r.initialized.compare_exchange_strong(expected, true)) return true;
+    if (!r.initialized.compare_exchange_strong(expected, true)) {
+        diag::log_tagged_fmt("logger", "initialize already_initialized");
+        return true;
+    }
     r.sub = aida::events::subscribe(kExchangeObservedEvent,
         [](const exchange_observed_t& ex) {
             record(source_t::proxy, ex);
         });
+    diag::log_tagged_fmt("logger", "initialize done subscribed cap=%zu", r.cap);
     return true;
 }
 
 void shutdown()
 {
+    diag::log_tagged_fmt("logger", "shutdown entry");
     auto& r = ring();
     if (r.initialized.load()) {
         aida::events::unsubscribe(r.sub);
         r.initialized.store(false);
+        diag::log_tagged_fmt("logger", "shutdown unsubscribed");
+    } else {
+        diag::log_tagged_fmt("logger", "shutdown not_initialized skipping");
     }
     std::lock_guard<std::mutex> lk(r.mtx);
+    size_t n = r.count;
     r.rows.clear();
     r.count = 0;
     r.write_idx = 0;
+    diag::log_tagged_fmt("logger", "shutdown done cleared=%zu", n);
 }
 
 uint64_t record(source_t src, const exchange_observed_t& ex)
@@ -237,6 +248,9 @@ uint64_t record(source_t src, const exchange_observed_t& ex)
     row.source          = src;
     row.exchange_id     = ex.id;
     uint64_t id = row.id;
+    diag::log_tagged_fmt("logger", "record id=%llu method=%s host=%s status=%d latency_ms=%llu src=%s",
+        static_cast<unsigned long long>(id), row.method.c_str(), row.host.c_str(),
+        row.status, static_cast<unsigned long long>(row.latency_ms), source_label(src));
     std::lock_guard<std::mutex> lk(r.mtx);
     push_locked(r, std::move(row));
     return id;
@@ -244,6 +258,8 @@ uint64_t record(source_t src, const exchange_observed_t& ex)
 
 std::vector<log_row_t> query(const log_filter_t& f, size_t limit)
 {
+    diag::log_tagged_fmt("logger", "query entry limit=%zu method=%s status_min=%d status_max=%d",
+        limit, f.method.c_str(), f.status_min, f.status_max);
     std::vector<log_row_t> all = snapshot_chronological();
     std::vector<log_row_t> out;
     out.reserve(all.size());
@@ -253,6 +269,7 @@ std::vector<log_row_t> query(const log_filter_t& f, size_t limit)
             if (limit > 0 && out.size() >= limit) break;
         }
     }
+    diag::log_tagged_fmt("logger", "query result total=%zu matching=%zu", all.size(), out.size());
     return out;
 }
 
@@ -260,27 +277,35 @@ size_t total_rows()
 {
     auto& r = ring();
     std::lock_guard<std::mutex> lk(r.mtx);
-    return r.count;
+    size_t n = r.count;
+    diag::log_tagged_fmt("logger", "total_rows result=%zu", n);
+    return n;
 }
 
 void clear()
 {
+    diag::log_tagged_fmt("logger", "clear entry");
     auto& r = ring();
     std::lock_guard<std::mutex> lk(r.mtx);
+    size_t n = r.count;
     r.rows.clear();
     r.count = 0;
     r.write_idx = 0;
+    diag::log_tagged_fmt("logger", "clear done cleared=%zu", n);
 }
 
 bool export_csv(const std::string& path, const log_filter_t& f)
 {
+    diag::log_tagged_fmt("logger", "export_csv entry path=%s", path.c_str());
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) {
+        diag::log_tagged_fmt("logger", "export_csv open_failed path=%s", path.c_str());
         set_err("burp_logger.export_csv: cannot open output");
         return false;
     }
     out << "id,ts_ms,method,url,host,port,status,req_len,resp_len,latency_ms,mime,source\r\n";
     auto rows = query(f, 0);
+    diag::log_tagged_fmt("logger", "export_csv writing rows=%zu", rows.size());
     for (const auto& r : rows) {
         out << r.id << ',' << r.ts_ms << ','
             << csv_quote(r.method) << ',' << csv_quote(r.url) << ','
@@ -290,15 +315,21 @@ bool export_csv(const std::string& path, const log_filter_t& f)
             << csv_quote(r.mime_type) << ','
             << csv_quote(source_label(r.source)) << "\r\n";
     }
+    diag::log_tagged_fmt("logger", "export_csv done path=%s rows=%zu", path.c_str(), rows.size());
     return true;
 }
 
 void set_capacity(size_t rows)
 {
+    diag::log_tagged_fmt("logger", "set_capacity entry rows=%zu", rows);
     if (rows < 16) rows = 16;
     auto& r = ring();
     std::lock_guard<std::mutex> lk(r.mtx);
-    if (rows == r.cap) return;
+    if (rows == r.cap) {
+        diag::log_tagged_fmt("logger", "set_capacity unchanged cap=%zu", r.cap);
+        return;
+    }
+    size_t old_cap = r.cap;
     auto chronological = std::vector<log_row_t>();
     if (r.count > 0) {
         if (r.rows.size() < r.cap || r.count < r.cap) {
@@ -315,19 +346,24 @@ void set_capacity(size_t rows)
     r.rows = std::move(chronological);
     r.count = r.rows.size();
     r.write_idx = r.count % r.cap;
+    diag::log_tagged_fmt("logger", "set_capacity done old=%zu new=%zu current_count=%zu", old_cap, rows, r.count);
 }
 
 size_t capacity()
 {
     auto& r = ring();
     std::lock_guard<std::mutex> lk(r.mtx);
-    return r.cap;
+    size_t cap = r.cap;
+    diag::log_tagged_fmt("logger", "capacity result=%zu", cap);
+    return cap;
 }
 
 std::string last_error()
 {
     std::lock_guard<std::mutex> lk(err_mtx());
-    return err_slot();
+    std::string e = err_slot();
+    diag::log_tagged_fmt("logger", "last_error queried val=%s", e.c_str());
+    return e;
 }
 
 }

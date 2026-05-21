@@ -105,6 +105,8 @@ static std::string extract_path(const std::string& url)
 
 static bool perform_one_request(const collection_config_t& cfg, const std::regex& re, std::string& out_token, std::string& out_err)
 {
+    diag::log_tagged_fmt("sequencer", "perform_one_request entry host=%s port=%u tls=%d url=%s",
+        cfg.host.c_str(), (unsigned)cfg.port, (int)cfg.use_tls, cfg.url.c_str());
     std::string origin = make_origin(cfg.url, cfg.host, cfg.port, cfg.use_tls);
     std::string path = cfg.url.empty() ? "/" : extract_path(cfg.url);
 
@@ -156,9 +158,11 @@ static bool perform_one_request(const collection_config_t& cfg, const std::regex
     }
 
     if (!res) {
+        diag::log_tagged_fmt("sequencer", "perform_one_request error transport_error url=%s", cfg.url.c_str());
         out_err = "transport_error";
         return false;
     }
+    diag::log_tagged_fmt("sequencer", "perform_one_request http_ok status=%d body_len=%zu", res->status, res->body.size());
 
     std::smatch m;
     if (!std::regex_search(res->body, m, re)) {
@@ -170,7 +174,9 @@ static bool perform_one_request(const collection_config_t& cfg, const std::regex
             composite += "\n";
         }
         if (std::regex_search(composite, m, re)) {
+            diag::log_tagged_fmt("sequencer", "perform_one_request extracted_from_headers");
         } else {
+            diag::log_tagged_fmt("sequencer", "perform_one_request error extraction_miss url=%s", cfg.url.c_str());
             out_err = "extraction_miss";
             return false;
         }
@@ -187,6 +193,7 @@ static bool perform_one_request(const collection_config_t& cfg, const std::regex
         return true;
     }
     out_token = m[0].str();
+    diag::log_tagged_fmt("sequencer", "perform_one_request extracted token_len=%zu", out_token.size());
     return true;
 }
 
@@ -655,12 +662,16 @@ bool stop_collection(uint64_t id)
 
 collection_status_t status(uint64_t id)
 {
+    diag::log_tagged_fmt("sequencer", "status entry id=%llu", static_cast<unsigned long long>(id));
     collection_status_t s;
     std::shared_ptr<collection_t> coll;
     {
         std::lock_guard<std::mutex> lk(g_reg.mtx);
         auto it = g_reg.collections.find(id);
-        if (it == g_reg.collections.end()) return s;
+        if (it == g_reg.collections.end()) {
+            diag::log_tagged_fmt("sequencer", "status not_found id=%llu", static_cast<unsigned long long>(id));
+            return s;
+        }
         coll = it->second;
     }
     s.id = coll->id;
@@ -676,30 +687,43 @@ collection_status_t status(uint64_t id)
     }
     s.started_ms = coll->started_ms;
     s.last_sample_ms = coll->last_sample_ms.load();
+    diag::log_tagged_fmt("sequencer", "status id=%llu collected=%zu target=%zu running=%d error=%d",
+        static_cast<unsigned long long>(id), s.collected, s.target, (int)s.running, (int)s.error);
     return s;
 }
 
 std::vector<std::string> samples(uint64_t id, size_t max_count)
 {
-    std::shared_ptr<collection_t> coll;
-    {
-        std::lock_guard<std::mutex> lk(g_reg.mtx);
-        auto it = g_reg.collections.find(id);
-        if (it == g_reg.collections.end()) return {};
-        coll = it->second;
-    }
-    std::lock_guard<std::mutex> lk(coll->samples_mtx);
-    if (max_count == 0 || max_count >= coll->samples.size()) return coll->samples;
-    return std::vector<std::string>(coll->samples.end() - static_cast<ptrdiff_t>(max_count), coll->samples.end());
-}
-
-analysis_result_t analyze(uint64_t id)
-{
+    diag::log_tagged_fmt("sequencer", "samples entry id=%llu max_count=%zu", static_cast<unsigned long long>(id), max_count);
     std::shared_ptr<collection_t> coll;
     {
         std::lock_guard<std::mutex> lk(g_reg.mtx);
         auto it = g_reg.collections.find(id);
         if (it == g_reg.collections.end()) {
+            diag::log_tagged_fmt("sequencer", "samples not_found id=%llu", static_cast<unsigned long long>(id));
+            return {};
+        }
+        coll = it->second;
+    }
+    std::lock_guard<std::mutex> lk(coll->samples_mtx);
+    size_t total = coll->samples.size();
+    if (max_count == 0 || max_count >= total) {
+        diag::log_tagged_fmt("sequencer", "samples result id=%llu count=%zu", static_cast<unsigned long long>(id), total);
+        return coll->samples;
+    }
+    diag::log_tagged_fmt("sequencer", "samples result id=%llu count=%zu (capped)", static_cast<unsigned long long>(id), max_count);
+    return std::vector<std::string>(coll->samples.end() - static_cast<ptrdiff_t>(max_count), coll->samples.end());
+}
+
+analysis_result_t analyze(uint64_t id)
+{
+    diag::log_tagged_fmt("sequencer", "analyze entry id=%llu", static_cast<unsigned long long>(id));
+    std::shared_ptr<collection_t> coll;
+    {
+        std::lock_guard<std::mutex> lk(g_reg.mtx);
+        auto it = g_reg.collections.find(id);
+        if (it == g_reg.collections.end()) {
+            diag::log_tagged_fmt("sequencer", "analyze error not_found id=%llu", static_cast<unsigned long long>(id));
             analysis_result_t a;
             a.verdict = "collection_not_found";
             return a;
@@ -711,13 +735,17 @@ analysis_result_t analyze(uint64_t id)
         std::lock_guard<std::mutex> lk(coll->samples_mtx);
         snap = coll->samples;
     }
+    diag::log_tagged_fmt("sequencer", "analyze analyzing id=%llu samples=%zu", static_cast<unsigned long long>(id), snap.size());
     analysis_result_t r = analyze_internal(snap);
     r.collection_id = id;
+    diag::log_tagged_fmt("sequencer", "analyze done id=%llu verdict='%s' samples=%zu entropy=%.3f",
+        static_cast<unsigned long long>(id), r.verdict.c_str(), r.samples_count, r.shannon_entropy_bits);
     return r;
 }
 
 std::vector<collection_status_t> list_collections()
 {
+    diag::log_tagged_fmt("sequencer", "list_collections entry");
     std::vector<collection_status_t> out;
     std::vector<uint64_t> ids;
     {
@@ -727,30 +755,39 @@ std::vector<collection_status_t> list_collections()
     }
     out.reserve(ids.size());
     for (uint64_t id : ids) out.push_back(status(id));
+    diag::log_tagged_fmt("sequencer", "list_collections result count=%zu", out.size());
     return out;
 }
 
 bool delete_collection(uint64_t id)
 {
+    diag::log_tagged_fmt("sequencer", "delete_collection entry id=%llu", static_cast<unsigned long long>(id));
     std::shared_ptr<collection_t> coll;
     {
         std::lock_guard<std::mutex> lk(g_reg.mtx);
         auto it = g_reg.collections.find(id);
-        if (it == g_reg.collections.end()) return false;
+        if (it == g_reg.collections.end()) {
+            diag::log_tagged_fmt("sequencer", "delete_collection not_found id=%llu", static_cast<unsigned long long>(id));
+            return false;
+        }
         coll = it->second;
     }
     coll->stop_request.store(true);
     coll->running.store(false);
+    diag::log_tagged_fmt("sequencer", "delete_collection waiting_inflight id=%llu in_flight=%zu",
+        static_cast<unsigned long long>(id), coll->in_flight.load());
     while (coll->in_flight.load() > 0) Sleep(5);
     {
         std::lock_guard<std::mutex> lk(g_reg.mtx);
         g_reg.collections.erase(id);
     }
+    diag::log_tagged_fmt("sequencer", "delete_collection ok id=%llu", static_cast<unsigned long long>(id));
     return true;
 }
 
 std::string last_error()
 {
+    diag::log_tagged_fmt("sequencer", "last_error queried");
     std::lock_guard<std::mutex> lk(g_reg.err_mtx);
     return g_reg.last_err;
 }

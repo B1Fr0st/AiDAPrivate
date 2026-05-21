@@ -451,13 +451,19 @@ bool initialize()
 
 void shutdown()
 {
+    diag::log_tagged_fmt("session", "shutdown entry");
     auto& st = s();
-    if (!st.initialized.exchange(false)) return;
+    if (!st.initialized.exchange(false)) {
+        diag::log_tagged_fmt("session", "shutdown already_stopped");
+        return;
+    }
     save_to_disk();
+    diag::log_tagged_fmt("session", "shutdown complete");
 }
 
 uint64_t add_macro(macro_t m)
 {
+    diag::log_tagged_fmt("session", "add_macro entry name='%s' steps=%zu", m.name.c_str(), m.steps.size());
     auto& st = s();
     if (m.id == 0) m.id = st.next_macro_id.fetch_add(1, std::memory_order_acq_rel);
     else if (m.id >= st.next_macro_id.load()) st.next_macro_id.store(m.id + 1, std::memory_order_release);
@@ -466,11 +472,13 @@ uint64_t add_macro(macro_t m)
         st.macros.push_back(m);
     }
     save_to_disk();
+    diag::log_tagged_fmt("session", "add_macro ok id=%llu name='%s'", static_cast<unsigned long long>(m.id), m.name.c_str());
     return m.id;
 }
 
 bool remove_macro(uint64_t id)
 {
+    diag::log_tagged_fmt("session", "remove_macro entry id=%llu", static_cast<unsigned long long>(id));
     auto& st = s();
     bool removed = false;
     {
@@ -479,12 +487,18 @@ bool remove_macro(uint64_t id)
             if (it->id == id) { st.macros.erase(it); removed = true; break; }
         }
     }
-    if (removed) save_to_disk();
+    if (removed) {
+        save_to_disk();
+        diag::log_tagged_fmt("session", "remove_macro ok id=%llu", static_cast<unsigned long long>(id));
+    } else {
+        diag::log_tagged_fmt("session", "remove_macro not_found id=%llu", static_cast<unsigned long long>(id));
+    }
     return removed;
 }
 
 bool update_macro(const macro_t& m)
 {
+    diag::log_tagged_fmt("session", "update_macro entry id=%llu name='%s'", static_cast<unsigned long long>(m.id), m.name.c_str());
     auto& st = s();
     bool ok = false;
     {
@@ -493,44 +507,71 @@ bool update_macro(const macro_t& m)
             if (e.id == m.id) { e = m; ok = true; break; }
         }
     }
-    if (ok) save_to_disk();
+    if (ok) {
+        save_to_disk();
+        diag::log_tagged_fmt("session", "update_macro ok id=%llu", static_cast<unsigned long long>(m.id));
+    } else {
+        diag::log_tagged_fmt("session", "update_macro not_found id=%llu", static_cast<unsigned long long>(m.id));
+    }
     return ok;
 }
 
 std::vector<macro_t> list_macros()
 {
+    diag::log_tagged_fmt("session", "list_macros entry");
     auto& st = s();
     std::vector<macro_t> snap;
     {
         std::lock_guard<std::mutex> lk(st.macros_mtx);
         snap = st.macros;
     }
+    diag::log_tagged_fmt("session", "list_macros result count=%zu", snap.size());
     return snap;
 }
 
 bool get_macro(uint64_t id, macro_t& out)
 {
+    diag::log_tagged_fmt("session", "get_macro entry id=%llu", static_cast<unsigned long long>(id));
     auto& st = s();
     std::lock_guard<std::mutex> lk(st.macros_mtx);
     for (const auto& m : st.macros) {
-        if (m.id == id) { out = m; return true; }
+        if (m.id == id) {
+            out = m;
+            diag::log_tagged_fmt("session", "get_macro found id=%llu name='%s' steps=%zu",
+                static_cast<unsigned long long>(id), m.name.c_str(), m.steps.size());
+            return true;
+        }
     }
+    diag::log_tagged_fmt("session", "get_macro not_found id=%llu", static_cast<unsigned long long>(id));
     return false;
 }
 
 bool run_macro(uint64_t id, std::map<std::string, std::string>& out_values)
 {
+    diag::log_tagged_fmt("session", "run_macro entry id=%llu", static_cast<unsigned long long>(id));
     macro_t snap;
     if (!get_macro(id, snap)) {
+        diag::log_tagged_fmt("session", "run_macro error not_found id=%llu", static_cast<unsigned long long>(id));
         set_err("run_macro: macro not found");
         return false;
     }
+    diag::log_tagged_fmt("session", "run_macro executing id=%llu name='%s' steps=%zu",
+        static_cast<unsigned long long>(id), snap.name.c_str(), snap.steps.size());
     std::map<std::string, std::string> kv;
     bool any_failed = false;
+    size_t step_idx = 0;
     for (auto& step : snap.steps) {
-        if (step.host.empty()) { any_failed = true; continue; }
+        diag::log_tagged_fmt("session", "run_macro step=%zu label='%s' host=%s port=%u",
+            step_idx, step.label.c_str(), step.host.c_str(), (unsigned)step.port);
+        if (step.host.empty()) {
+            diag::log_tagged_fmt("session", "run_macro step=%zu error empty_host skipping", step_idx);
+            any_failed = true;
+            ++step_idx;
+            continue;
+        }
         std::vector<uint8_t> req = step.raw_request;
         if (!kv.empty()) {
+            diag::log_tagged_fmt("session", "run_macro step=%zu substituting_tokens kv_count=%zu", step_idx, kv.size());
             std::string as_text(req.begin(), req.end());
             std::string rline, hblock, body;
             bool crlf = true;
@@ -549,23 +590,40 @@ bool run_macro(uint64_t id, std::map<std::string, std::string>& out_values)
         opts.follow_redirects = false;
         opts.enforce_scope = false;
         const bool tls = (ascii_lower(step.scheme) == "https");
+        diag::log_tagged_fmt("session", "run_macro step=%zu sending host=%s tls=%d req_len=%zu",
+            step_idx, step.host.c_str(), (int)tls, req.size());
         const auto resp = audit_http::send(req, step.host, step.port, tls, opts);
-        if (!resp) { any_failed = true; continue; }
+        if (!resp) {
+            diag::log_tagged_fmt("session", "run_macro step=%zu error send_failed", step_idx);
+            any_failed = true;
+            ++step_idx;
+            continue;
+        }
+        diag::log_tagged_fmt("session", "run_macro step=%zu response_ok extracting count=%zu",
+            step_idx, step.extracts.size());
         for (const auto& e : step.extracts) {
             std::string v;
-            if (extract_value(e, *resp, v) && !e.name.empty()) kv[e.name] = v;
+            if (extract_value(e, *resp, v) && !e.name.empty()) {
+                kv[e.name] = v;
+                diag::log_tagged_fmt("session", "run_macro step=%zu extracted name='%s' value_len=%zu", step_idx, e.name.c_str(), v.size());
+            }
         }
+        ++step_idx;
     }
     snap.last_extracted_values = kv;
     snap.last_run_ms = now_ms();
     snap.ok_last_run = !any_failed;
     update_macro(snap);
     out_values = kv;
+    diag::log_tagged_fmt("session", "run_macro done id=%llu ok=%d kv_count=%zu",
+        static_cast<unsigned long long>(id), (int)!any_failed, kv.size());
     return !any_failed;
 }
 
 uint64_t add_rule(session_rule_t r)
 {
+    diag::log_tagged_fmt("session", "add_rule entry name='%s' match=%s macro_id=%llu",
+        r.name.c_str(), match_label(r.match), static_cast<unsigned long long>(r.macro_id));
     auto& st = s();
     if (r.id == 0) r.id = st.next_rule_id.fetch_add(1, std::memory_order_acq_rel);
     else if (r.id >= st.next_rule_id.load()) st.next_rule_id.store(r.id + 1, std::memory_order_release);
@@ -574,11 +632,13 @@ uint64_t add_rule(session_rule_t r)
         st.rules.push_back(r);
     }
     save_to_disk();
+    diag::log_tagged_fmt("session", "add_rule ok id=%llu name='%s'", static_cast<unsigned long long>(r.id), r.name.c_str());
     return r.id;
 }
 
 bool remove_rule(uint64_t id)
 {
+    diag::log_tagged_fmt("session", "remove_rule entry id=%llu", static_cast<unsigned long long>(id));
     auto& st = s();
     bool removed = false;
     {
@@ -587,12 +647,18 @@ bool remove_rule(uint64_t id)
             if (it->id == id) { st.rules.erase(it); removed = true; break; }
         }
     }
-    if (removed) save_to_disk();
+    if (removed) {
+        save_to_disk();
+        diag::log_tagged_fmt("session", "remove_rule ok id=%llu", static_cast<unsigned long long>(id));
+    } else {
+        diag::log_tagged_fmt("session", "remove_rule not_found id=%llu", static_cast<unsigned long long>(id));
+    }
     return removed;
 }
 
 bool update_rule(const session_rule_t& r)
 {
+    diag::log_tagged_fmt("session", "update_rule entry id=%llu name='%s'", static_cast<unsigned long long>(r.id), r.name.c_str());
     auto& st = s();
     bool ok = false;
     {
@@ -601,33 +667,46 @@ bool update_rule(const session_rule_t& r)
             if (e.id == r.id) { e = r; ok = true; break; }
         }
     }
-    if (ok) save_to_disk();
+    if (ok) {
+        save_to_disk();
+        diag::log_tagged_fmt("session", "update_rule ok id=%llu", static_cast<unsigned long long>(r.id));
+    } else {
+        diag::log_tagged_fmt("session", "update_rule not_found id=%llu", static_cast<unsigned long long>(r.id));
+    }
     return ok;
 }
 
 std::vector<session_rule_t> list_rules()
 {
+    diag::log_tagged_fmt("session", "list_rules entry");
     auto& st = s();
     std::vector<session_rule_t> snap;
     {
         std::lock_guard<std::mutex> lk(st.rules_mtx);
         snap = st.rules;
     }
+    diag::log_tagged_fmt("session", "list_rules result count=%zu", snap.size());
     return snap;
 }
 
 bool apply_rules(std::vector<uint8_t>& raw_request,
                  const std::string& url, int last_status)
 {
+    diag::log_tagged_fmt("session", "apply_rules entry url=%s last_status=%d raw_len=%zu",
+        url.c_str(), last_status, raw_request.size());
     auto& st = s();
     std::vector<session_rule_t> rules_snap;
     {
         std::lock_guard<std::mutex> lk(st.rules_mtx);
         rules_snap = st.rules;
     }
+    diag::log_tagged_fmt("session", "apply_rules rules_count=%zu", rules_snap.size());
     bool modified = false;
     for (const auto& r : rules_snap) {
-        if (!r.active) continue;
+        if (!r.active) {
+            diag::log_tagged_fmt("session", "apply_rules rule=%llu inactive skipping", static_cast<unsigned long long>(r.id));
+            continue;
+        }
         bool match_hit = false;
         if (r.match == sh_match_t::url_regex) {
             if (r.match_pattern.empty()) continue;
@@ -635,21 +714,38 @@ bool apply_rules(std::vector<uint8_t>& raw_request,
                 std::regex re(r.match_pattern, std::regex::ECMAScript | std::regex::icase);
                 if (std::regex_search(url, re)) match_hit = true;
             } catch (...) {}
+            diag::log_tagged_fmt("session", "apply_rules rule=%llu url_regex match=%d url=%s",
+                static_cast<unsigned long long>(r.id), (int)match_hit, url.c_str());
         } else if (r.match == sh_match_t::response_status) {
             if (last_status != 0 && last_status == r.match_status) match_hit = true;
+            diag::log_tagged_fmt("session", "apply_rules rule=%llu status_match=%d wanted=%d got=%d",
+                static_cast<unsigned long long>(r.id), (int)match_hit, r.match_status, last_status);
         } else if (r.match == sh_match_t::response_regex) {
             try {
                 std::regex re(r.match_pattern, std::regex::ECMAScript | std::regex::icase);
                 std::string txt(raw_request.begin(), raw_request.end());
                 if (std::regex_search(txt, re)) match_hit = true;
             } catch (...) {}
+            diag::log_tagged_fmt("session", "apply_rules rule=%llu response_regex match=%d",
+                static_cast<unsigned long long>(r.id), (int)match_hit);
         }
         if (!match_hit) continue;
 
+        diag::log_tagged_fmt("session", "apply_rules rule=%llu matched running_macro=%llu",
+            static_cast<unsigned long long>(r.id), static_cast<unsigned long long>(r.macro_id));
         std::map<std::string, std::string> values;
-        if (!run_macro(r.macro_id, values)) continue;
-        if (values.empty()) continue;
+        if (!run_macro(r.macro_id, values)) {
+            diag::log_tagged_fmt("session", "apply_rules rule=%llu macro_failed macro_id=%llu",
+                static_cast<unsigned long long>(r.id), static_cast<unsigned long long>(r.macro_id));
+            continue;
+        }
+        if (values.empty()) {
+            diag::log_tagged_fmt("session", "apply_rules rule=%llu macro_no_values", static_cast<unsigned long long>(r.id));
+            continue;
+        }
 
+        diag::log_tagged_fmt("session", "apply_rules rule=%llu substituting_tokens kv_count=%zu",
+            static_cast<unsigned long long>(r.id), values.size());
         std::string text(raw_request.begin(), raw_request.end());
         std::string rline, hblock, body;
         bool crlf = true;
@@ -660,7 +756,10 @@ bool apply_rules(std::vector<uint8_t>& raw_request,
         const std::string rebuilt = rebuild_request(rline, hblock, body, crlf);
         raw_request.assign(rebuilt.begin(), rebuilt.end());
         modified = true;
+        diag::log_tagged_fmt("session", "apply_rules rule=%llu substituted new_raw_len=%zu",
+            static_cast<unsigned long long>(r.id), raw_request.size());
     }
+    diag::log_tagged_fmt("session", "apply_rules done modified=%d", (int)modified);
     return modified;
 }
 
@@ -676,34 +775,51 @@ std::string storage_path_rules()
 
 bool save_to_disk()
 {
+    diag::log_tagged_fmt("session", "save_to_disk entry");
     auto& st = s();
     {
         nlohmann::json arr = nlohmann::json::array();
+        size_t count = 0;
         {
             std::lock_guard<std::mutex> lk(st.macros_mtx);
-            for (const auto& m : st.macros) arr.push_back(macro_to_json(m));
+            for (const auto& m : st.macros) { arr.push_back(macro_to_json(m)); count++; }
         }
-        std::ofstream out(storage_path_macros(), std::ios::binary | std::ios::trunc);
-        if (!out) { set_err("failed to write macros.json"); return false; }
+        const std::string path = storage_path_macros();
+        diag::log_tagged_fmt("session", "save_to_disk macros count=%zu path=%s", count, path.c_str());
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            diag::log_tagged_fmt("session", "save_to_disk error macros_open_failed");
+            set_err("failed to write macros.json");
+            return false;
+        }
         const std::string dump = arr.dump(2);
         out.write(dump.data(), static_cast<std::streamsize>(dump.size()));
     }
     {
         nlohmann::json arr = nlohmann::json::array();
+        size_t count = 0;
         {
             std::lock_guard<std::mutex> lk(st.rules_mtx);
-            for (const auto& r : st.rules) arr.push_back(rule_to_json(r));
+            for (const auto& r : st.rules) { arr.push_back(rule_to_json(r)); count++; }
         }
-        std::ofstream out(storage_path_rules(), std::ios::binary | std::ios::trunc);
-        if (!out) { set_err("failed to write session_rules.json"); return false; }
+        const std::string path = storage_path_rules();
+        diag::log_tagged_fmt("session", "save_to_disk rules count=%zu path=%s", count, path.c_str());
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            diag::log_tagged_fmt("session", "save_to_disk error rules_open_failed");
+            set_err("failed to write session_rules.json");
+            return false;
+        }
         const std::string dump = arr.dump(2);
         out.write(dump.data(), static_cast<std::streamsize>(dump.size()));
     }
+    diag::log_tagged_fmt("session", "save_to_disk complete");
     return true;
 }
 
 bool load_from_disk()
 {
+    diag::log_tagged_fmt("session", "load_from_disk entry");
     auto& st = s();
     {
         std::ifstream in(storage_path_macros(), std::ios::binary);
@@ -724,6 +840,8 @@ bool load_from_disk()
                             loaded.push_back(m);
                         }
                     }
+                    diag::log_tagged_fmt("session", "load_from_disk macros loaded=%zu max_id=%llu",
+                        loaded.size(), static_cast<unsigned long long>(max_id));
                     std::lock_guard<std::mutex> lk(st.macros_mtx);
                     st.macros = std::move(loaded);
                     if (max_id >= st.next_macro_id.load())
@@ -751,6 +869,8 @@ bool load_from_disk()
                             loaded.push_back(r);
                         }
                     }
+                    diag::log_tagged_fmt("session", "load_from_disk rules loaded=%zu max_id=%llu",
+                        loaded.size(), static_cast<unsigned long long>(max_id));
                     std::lock_guard<std::mutex> lk(st.rules_mtx);
                     st.rules = std::move(loaded);
                     if (max_id >= st.next_rule_id.load())
@@ -759,11 +879,13 @@ bool load_from_disk()
             }
         }
     }
+    diag::log_tagged_fmt("session", "load_from_disk complete");
     return true;
 }
 
 std::string last_error()
 {
+    diag::log_tagged_fmt("session", "last_error queried");
     auto& st = s();
     std::lock_guard<std::mutex> lk(st.err_mtx);
     return st.last_err;

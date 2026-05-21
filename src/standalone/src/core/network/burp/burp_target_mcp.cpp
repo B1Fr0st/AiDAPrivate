@@ -50,6 +50,7 @@ std::string trim_lower(const std::string& s)
 
 tool_result_t sitemap_list_hosts(const json& args)
 {
+    diag::log_tagged_fmt("mcp_burp", "sitemap_list_hosts scope_only=%d", (int)args.value("scope_only", false));
     const bool scope_only = args.value("scope_only", false);
     const auto hosts = sitemap::list_hosts(scope_only);
     json arr = json::array();
@@ -66,11 +67,13 @@ tool_result_t sitemap_list_hosts(const json& args)
     json r;
     r["hosts"] = arr;
     r["count"] = hosts.size();
+    diag::log_tagged_fmt("mcp_burp", "sitemap_list_hosts ok count=%zu", hosts.size());
     return tool_result_t::ok(std::to_string(hosts.size()) + " hosts in site map", r);
 }
 
 tool_result_t sitemap_list_paths(const json& args)
 {
+    diag::log_tagged_fmt("mcp_burp", "sitemap_list_paths host=%s", args.contains("host") && args["host"].is_string() ? args["host"].get<std::string>().c_str() : "<missing>");
     if (!args.contains("host") || !args["host"].is_string()) {
         return tool_result_t::error("Missing 'host' parameter");
     }
@@ -84,26 +87,33 @@ tool_result_t sitemap_list_paths(const json& args)
     r["port"]  = port;
     r["paths"] = arr;
     r["count"] = paths.size();
+    diag::log_tagged_fmt("mcp_burp", "sitemap_list_paths ok host=%s count=%zu", host.c_str(), paths.size());
     return tool_result_t::ok(std::to_string(paths.size()) + " paths for " + host, r);
 }
 
 tool_result_t sitemap_get_exchange(const json& args)
 {
+    diag::log_tagged_fmt("mcp_burp", "sitemap_get_exchange id=%llu", args.contains("exchange_id") && args["exchange_id"].is_number_unsigned() ? static_cast<unsigned long long>(args["exchange_id"].get<uint64_t>()) : 0ULL);
     if (!args.contains("exchange_id") || !args["exchange_id"].is_number_unsigned()) {
         return tool_result_t::error("Missing or invalid 'exchange_id' parameter");
     }
     const uint64_t id = args["exchange_id"].get<uint64_t>();
     exchange_observed_t e;
     if (!sitemap::find_exchange(id, e)) {
+        diag::log_tagged_fmt("mcp_burp", "sitemap_get_exchange not_found id=%llu", static_cast<unsigned long long>(id));
         return tool_result_t::error("Exchange id not found");
     }
     const bool include_bodies = args.value("include_bodies", true);
     json j = sitemap::exchange_to_json(e, include_bodies);
+    diag::log_tagged_fmt("mcp_burp", "sitemap_get_exchange ok id=%llu", static_cast<unsigned long long>(id));
     return tool_result_t::ok("Exchange " + std::to_string(id), j);
 }
 
 tool_result_t sitemap_send_to(const json& args)
 {
+    diag::log_tagged_fmt("mcp_burp", "sitemap_send_to id=%llu target=%s",
+        args.contains("exchange_id") && args["exchange_id"].is_number_unsigned() ? static_cast<unsigned long long>(args["exchange_id"].get<uint64_t>()) : 0ULL,
+        args.contains("target") && args["target"].is_string() ? args["target"].get<std::string>().c_str() : "<missing>");
     if (!args.contains("exchange_id") || !args["exchange_id"].is_number_unsigned()) {
         return tool_result_t::error("Missing or invalid 'exchange_id' parameter");
     }
@@ -123,6 +133,7 @@ tool_result_t sitemap_send_to(const json& args)
         return tool_result_t::error("Exchange id not found");
     }
     sitemap::send_to(id, tgt, "mcp");
+    diag::log_tagged_fmt("mcp_burp", "sitemap_send_to ok id=%llu target=%s", static_cast<unsigned long long>(id), tgt.c_str());
     json r;
     r["exchange_id"] = id;
     r["target"]      = tgt;
@@ -131,14 +142,17 @@ tool_result_t sitemap_send_to(const json& args)
 
 tool_result_t scope_add(const json& args)
 {
+    diag::log_tagged_fmt("mcp_burp", "scope_add entry");
     scope::rule_t r;
     if (!scope::rule_from_json(args, r)) {
+        diag::log_tagged_fmt("mcp_burp", "scope_add invalid_rule");
         return tool_result_t::error("Invalid rule payload");
     }
     if (r.host_pattern.empty()) {
         return tool_result_t::error("'host_pattern' required");
     }
     const uint64_t id = scope::add_rule(r);
+    diag::log_tagged_fmt("mcp_burp", "scope_add ok rule_id=%llu pattern=%s", static_cast<unsigned long long>(id), r.host_pattern.c_str());
     json out;
     out["rule_id"] = id;
     return tool_result_t::ok("Scope rule added id=" + std::to_string(id), out);
@@ -146,34 +160,41 @@ tool_result_t scope_add(const json& args)
 
 tool_result_t scope_remove(const json& args)
 {
+    diag::log_tagged_fmt("mcp_burp", "scope_remove rule_id=%llu", args.contains("rule_id") && args["rule_id"].is_number_unsigned() ? static_cast<unsigned long long>(args["rule_id"].get<uint64_t>()) : 0ULL);
     if (!args.contains("rule_id") || !args["rule_id"].is_number_unsigned()) {
         return tool_result_t::error("Missing 'rule_id'");
     }
     const uint64_t id = args["rule_id"].get<uint64_t>();
     if (!scope::remove_rule(id)) {
+        diag::log_tagged_fmt("mcp_burp", "scope_remove not_found id=%llu", static_cast<unsigned long long>(id));
         return tool_result_t::error("rule_id not found");
     }
+    diag::log_tagged_fmt("mcp_burp", "scope_remove ok id=%llu", static_cast<unsigned long long>(id));
     return tool_result_t::ok("Scope rule " + std::to_string(id) + " removed");
 }
 
 tool_result_t scope_list(const json&)
 {
+    diag::log_tagged_fmt("mcp_burp", "scope_list entry");
     const auto rules = scope::list_rules();
     json arr = json::array();
     for (const auto& r : rules) arr.push_back(scope::rule_to_json(r));
     json out;
     out["rules"] = arr;
     out["count"] = rules.size();
+    diag::log_tagged_fmt("mcp_burp", "scope_list ok count=%zu", rules.size());
     return tool_result_t::ok(std::to_string(rules.size()) + " scope rules", out);
 }
 
 tool_result_t scope_check(const json& args)
 {
+    diag::log_tagged_fmt("mcp_burp", "scope_check url=%s", args.contains("url") && args["url"].is_string() ? args["url"].get<std::string>().c_str() : "<missing>");
     if (!args.contains("url") || !args["url"].is_string()) {
         return tool_result_t::error("Missing 'url'");
     }
     const std::string url = args["url"].get<std::string>();
     const bool ok = scope::in_scope(url);
+    diag::log_tagged_fmt("mcp_burp", "scope_check ok url=%s in_scope=%d", url.c_str(), (int)ok);
     json out;
     out["url"]      = url;
     out["in_scope"] = ok;
@@ -182,6 +203,7 @@ tool_result_t scope_check(const json& args)
 
 tool_result_t cookie_list(const json& args)
 {
+    diag::log_tagged_fmt("mcp_burp", "cookie_list host=%s", args.contains("host") && args["host"].is_string() ? args["host"].get<std::string>().c_str() : "<all>");
     std::vector<cookie_jar::parsed_cookie_t> cookies;
     if (args.contains("host") && args["host"].is_string()) {
         cookies = cookie_jar::list_for_host(args["host"].get<std::string>());
@@ -206,11 +228,15 @@ tool_result_t cookie_list(const json& args)
     json out;
     out["cookies"] = arr;
     out["count"]   = cookies.size();
+    diag::log_tagged_fmt("mcp_burp", "cookie_list ok count=%zu", cookies.size());
     return tool_result_t::ok(std::to_string(cookies.size()) + " cookies", out);
 }
 
 tool_result_t cookie_set(const json& args)
 {
+    diag::log_tagged_fmt("mcp_burp", "cookie_set host=%s name=%s",
+        args.contains("host") && args["host"].is_string() ? args["host"].get<std::string>().c_str() : "<missing>",
+        args.contains("name") && args["name"].is_string() ? args["name"].get<std::string>().c_str() : "<missing>");
     if (!args.contains("host") || !args["host"].is_string()) {
         return tool_result_t::error("Missing 'host'");
     }
@@ -233,6 +259,7 @@ tool_result_t cookie_set(const json& args)
         c.expires_unix_ms = args["expires_unix_ms"].get<int64_t>();
     }
     cookie_jar::set_cookie(host, c);
+    diag::log_tagged_fmt("mcp_burp", "cookie_set ok host=%s name=%s", host.c_str(), c.name.c_str());
     json out;
     out["host"] = host;
     out["name"] = c.name;
@@ -241,6 +268,9 @@ tool_result_t cookie_set(const json& args)
 
 tool_result_t cookie_delete(const json& args)
 {
+    diag::log_tagged_fmt("mcp_burp", "cookie_delete host=%s name=%s",
+        args.contains("host") && args["host"].is_string() ? args["host"].get<std::string>().c_str() : "<missing>",
+        args.contains("name") && args["name"].is_string() ? args["name"].get<std::string>().c_str() : "<missing>");
     if (!args.contains("host") || !args["host"].is_string()) {
         return tool_result_t::error("Missing 'host'");
     }
@@ -251,20 +281,25 @@ tool_result_t cookie_delete(const json& args)
     const std::string name = args["name"].get<std::string>();
     const std::string path = args.value("path", std::string());
     if (!cookie_jar::delete_cookie(host, name, path)) {
+        diag::log_tagged_fmt("mcp_burp", "cookie_delete not_found host=%s name=%s", host.c_str(), name.c_str());
         return tool_result_t::error("Cookie not found");
     }
+    diag::log_tagged_fmt("mcp_burp", "cookie_delete ok host=%s name=%s", host.c_str(), name.c_str());
     return tool_result_t::ok("Cookie deleted");
 }
 
 tool_result_t cookie_export_netscape(const json& args)
 {
+    diag::log_tagged_fmt("mcp_burp", "cookie_export_netscape path=%s", args.contains("file_path") && args["file_path"].is_string() ? args["file_path"].get<std::string>().c_str() : "<missing>");
     if (!args.contains("file_path") || !args["file_path"].is_string()) {
         return tool_result_t::error("Missing 'file_path'");
     }
     const std::string path = args["file_path"].get<std::string>();
     if (!cookie_jar::export_netscape(path)) {
+        diag::log_tagged_fmt("mcp_burp", "cookie_export_netscape failed path=%s err=%s", path.c_str(), cookie_jar::last_error().c_str());
         return tool_result_t::error("Export failed: " + cookie_jar::last_error());
     }
+    diag::log_tagged_fmt("mcp_burp", "cookie_export_netscape ok path=%s", path.c_str());
     json out;
     out["file_path"] = path;
     return tool_result_t::ok("Cookies exported to " + path, out);

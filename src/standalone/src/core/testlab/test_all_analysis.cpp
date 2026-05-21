@@ -13,6 +13,7 @@
 #include "../analysis/stealth_engine.hpp"
 #include "../analysis/decrypt_oracle.hpp"
 #include "../analysis/pdb_downloader.hpp"
+#include "../analysis/analysis_hub_view.hpp"
 #include "../disasm/comment_store.hpp"
 #include "../disasm/rename_store.hpp"
 #include "../editor/expression_eval.hpp"
@@ -1178,10 +1179,33 @@ static void test_comment_store_overwrite(HANDLE hf, std::atomic<int>& passed, st
     }
 }
 
+static void select_analysis_hub_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
+                                     const char* tag, analysis_hub_view::sub_tab_t value) {
+    analysis_hub_view::set_sub_tab(value);
+    log_msg(hf, tag, "PASS -- analysis_hub sub_tab selected (%d)", static_cast<int>(value));
+    passed.fetch_add(1);
+}
+
+static void test_analysis_hub_tab_symbolic(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_analysis_hub_tab(hf, passed, failed, "analysis_hub_tab.symbolic", analysis_hub_view::sub_tab_t::symbolic);
+}
+static void test_analysis_hub_tab_taint(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_analysis_hub_tab(hf, passed, failed, "analysis_hub_tab.taint", analysis_hub_view::sub_tab_t::taint);
+}
+static void test_analysis_hub_tab_deobfuscation(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_analysis_hub_tab(hf, passed, failed, "analysis_hub_tab.deobfuscation", analysis_hub_view::sub_tab_t::deobfuscation);
+}
+static void test_analysis_hub_tab_fuzzer(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_analysis_hub_tab(hf, passed, failed, "analysis_hub_tab.fuzzer", analysis_hub_view::sub_tab_t::fuzzer);
+}
+static void test_analysis_hub_tab_stealth(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_analysis_hub_tab(hf, passed, failed, "analysis_hub_tab.stealth", analysis_hub_view::sub_tab_t::stealth);
+}
+
 }
 
 void phase_analysis_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
-    log_msg(hf, "analysis", "=== BEGIN analysis tests (57 tests) ===");
+    log_msg(hf, "analysis", "=== BEGIN analysis tests (62 tests) ===");
 
     struct test_entry_t {
         const char* name;
@@ -1246,6 +1270,12 @@ void phase_analysis_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
         { "decrypt_oracle_state",        test_decrypt_oracle_state        },
         { "decrypt_oracle_config",       test_decrypt_oracle_config       },
         { "pdb_resolve_cache_path",      test_pdb_resolve_cache_path      },
+
+        { "analysis_hub_tab_symbolic",   test_analysis_hub_tab_symbolic   },
+        { "analysis_hub_tab_taint",      test_analysis_hub_tab_taint      },
+        { "analysis_hub_tab_deobfusc",   test_analysis_hub_tab_deobfuscation },
+        { "analysis_hub_tab_fuzzer",     test_analysis_hub_tab_fuzzer     },
+        { "analysis_hub_tab_stealth",    test_analysis_hub_tab_stealth    },
     };
 
     int total = static_cast<int>(sizeof(tests) / sizeof(tests[0]));

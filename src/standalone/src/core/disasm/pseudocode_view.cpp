@@ -296,6 +296,8 @@ inline std::string substitute_synthetic_function_names(const std::string& text)
 
 void rebuild_lines(tab_t& t)
 {
+	diag::log_tagged_fmt("pcode_view", "rebuild_lines addr=0x%llX pseudocode_bytes=%zu",
+		static_cast<unsigned long long>(t.addr), t.pseudocode.size());
 	t.lines.clear();
 	if (t.pseudocode.empty()) return;
 	size_t start = 0;
@@ -316,15 +318,21 @@ void rebuild_lines(tab_t& t)
 		start = end + 1;
 		if (end == t.pseudocode.size()) break;
 	}
+	diag::log_tagged_fmt("pcode_view", "rebuild_lines_done addr=0x%llX line_count=%zu",
+		static_cast<unsigned long long>(t.addr), t.lines.size());
 }
 
 bool sync_tab_from_cache(tab_t& t)
 {
+	diag::log_tagged_fmt("pcode_view", "sync_tab_from_cache addr=0x%llX pending=%d",
+		static_cast<unsigned long long>(t.addr), t.pending ? 1 : 0);
 	auto& st = decompiler_engine::g_state;
 	std::lock_guard<std::mutex> lk(st.mutex);
 	auto it = st.cache.find(t.addr);
 	if (it == st.cache.end()) {
 		if (!st.decompiling.load() && st.current.function_addr == t.addr && st.current.is_error) {
+			diag::log_tagged_fmt("pcode_view", "sync_tab_cache_miss_error addr=0x%llX error=%s",
+				static_cast<unsigned long long>(t.addr), st.current.error_text.c_str());
 			t.is_error = true;
 			t.error_text = st.current.error_text;
 			t.loaded = false;
@@ -332,6 +340,8 @@ bool sync_tab_from_cache(tab_t& t)
 			t.decompiling = false;
 			return true;
 		}
+		diag::log_tagged_fmt("pcode_view", "sync_tab_cache_miss addr=0x%llX not_ready",
+			static_cast<unsigned long long>(t.addr));
 		return false;
 	}
 	auto& r = it->second;
@@ -349,6 +359,8 @@ bool sync_tab_from_cache(tab_t& t)
 	t.loaded = !r.is_error;
 	t.pending = false;
 	t.decompiling = false;
+	diag::log_tagged_fmt("pcode_view", "sync_tab_cache_hit addr=0x%llX func=%s is_error=%d lines_before_rebuild=0",
+		static_cast<unsigned long long>(t.addr), t.function_name.c_str(), t.is_error ? 1 : 0);
 	rebuild_lines(t);
 	return true;
 }
@@ -370,10 +382,16 @@ void poll_pending_tabs()
 	auto& s = state();
 	for (auto& t : s.tabs) {
 		if (!t->pending) continue;
+		diag::log_tagged_fmt("pcode_view", "poll_pending_tab addr=0x%llX label=%s",
+			static_cast<unsigned long long>(t->addr), t->label.c_str());
 		bool was_pending = t->pending;
 		bool advanced = sync_tab_from_cache(*t);
 		if (advanced && was_pending && t->is_error) {
+			diag::log_tagged_fmt("pcode_view", "poll_tab_error addr=0x%llX error=%s",
+				static_cast<unsigned long long>(t->addr), t->error_text.c_str());
 			if (error_text_is_cancellation(t->error_text)) {
+				diag::log_tagged_fmt("pcode_view", "poll_tab_cancelled addr=0x%llX",
+					static_cast<unsigned long long>(t->addr));
 				globals::ui::decompile_popup_active.store(false, std::memory_order_release);
 				continue;
 			}
@@ -576,6 +594,8 @@ void render_error_state(ImDrawList* dl, tab_t& tab, float ox, float oy, float wi
 	if (aida::ui::components::button("Retry",
 	    aida::ui::components::button_kind_t::primary,
 	    aida::ui::components::size_t_::sm, ImVec2(btn_w, btn_h))) {
+		diag::log_tagged_fmt("pcode_view", "retry_decompile addr=0x%llX",
+			static_cast<unsigned long long>(tab.addr));
 		tab.pending = true;
 		tab.decompiling = true;
 		tab.loaded = false;
@@ -724,6 +744,8 @@ void render_code_panel(ImDrawList* dl, tab_t& tab, float ox, float oy, float wid
 			tab.cursor_pulse = 0.f;
 		}
 		if (line_hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+			diag::log_tagged_fmt("pcode_view", "double_click_line line=%d addr=0x%llX",
+				i, static_cast<unsigned long long>(line_addr));
 			tab.cursor_line = i;
 			tab.cursor_pulse = 0.f;
 			if (line_addr != 0) {
@@ -880,6 +902,8 @@ void render_decompiling_popup(ImDrawList* dl, float ox, float oy, float width, f
 	if (aida::ui::components::button("Cancel",
 	    aida::ui::components::button_kind_t::ghost,
 	    aida::ui::components::size_t_::sm, ImVec2(btn_w, btn_h))) {
+		diag::log_tagged_fmt("pcode_view", "cancel_decompile_popup addr=0x%llX",
+			static_cast<unsigned long long>(globals::ui::decompile_popup_addr.load(std::memory_order_acquire)));
 		decompiler_engine::cancel_decompile();
 		globals::ui::decompile_popup_active.store(false, std::memory_order_release);
 	}
@@ -1015,6 +1039,8 @@ void check_popup_dismiss()
 
 void request_decompile(uint64_t addr, const DisasmFile* file, bool force_refresh)
 {
+	diag::log_tagged_fmt("pcode_view", "request_decompile_enter addr=0x%llX force=%d",
+		static_cast<unsigned long long>(addr), force_refresh ? 1 : 0);
 	if (addr == 0) return;
 
 	ensure_pdb_subscription();
@@ -1148,6 +1174,8 @@ void close_active_tab()
 	if (s.active_index < 0 || s.active_index >= static_cast<int>(s.tabs.size())) return;
 	int idx = s.active_index;
 	uint64_t closed_addr = s.tabs[idx]->addr;
+	diag::log_tagged_fmt("pcode_view", "close_active_tab addr=0x%llX idx=%d",
+		static_cast<unsigned long long>(closed_addr), idx);
 	s.tabs.erase(s.tabs.begin() + idx);
 	if (s.tabs.empty()) s.active_index = -1;
 	else s.active_index = std::min(idx, static_cast<int>(s.tabs.size()) - 1);
@@ -1157,6 +1185,8 @@ void close_active_tab()
 
 void close_tab_by_addr(uint64_t addr)
 {
+	diag::log_tagged_fmt("pcode_view", "close_tab_by_addr addr=0x%llX",
+		static_cast<unsigned long long>(addr));
 	std::lock_guard<std::mutex> guard(state_mutex());
 	auto& s = state();
 	int found = -1;
@@ -1182,21 +1212,29 @@ void close_tab_by_addr(uint64_t addr)
 
 void activate_tab_by_addr(uint64_t addr)
 {
+	diag::log_tagged_fmt("pcode_view", "activate_tab_by_addr addr=0x%llX",
+		static_cast<unsigned long long>(addr));
 	std::lock_guard<std::mutex> guard(state_mutex());
 	auto& s = state();
 	for (size_t i = 0; i < s.tabs.size(); ++i) {
 		if (s.tabs[i]->addr == addr) {
+			diag::log_tagged_fmt("pcode_view", "activate_tab_found addr=0x%llX idx=%zu",
+				static_cast<unsigned long long>(addr), i);
 			s.active_index = static_cast<int>(i);
 			globals::ui::active_center_view = center_view_t::pseudocode;
 			return;
 		}
 	}
+	diag::log_tagged_fmt("pcode_view", "activate_tab_not_found addr=0x%llX",
+		static_cast<unsigned long long>(addr));
 }
 
 void close_all_tabs()
 {
 	std::lock_guard<std::mutex> guard(state_mutex());
 	auto& s = state();
+	diag::log_tagged_fmt("pcode_view", "close_all_tabs count=%zu",
+		s.tabs.size());
 	s.tabs.clear();
 	s.active_index = -1;
 	decompiler_engine::cancel_decompile();
@@ -1213,17 +1251,23 @@ void cancel_active_decompile()
 
 void refresh_active_tab()
 {
+	diag::log_tagged_fmt("pcode_view", "refresh_active_tab_enter");
 	uint64_t addr = 0;
 	{
 		std::lock_guard<std::mutex> guard(state_mutex());
 		auto at = active_tab_locked();
-		if (!at) return;
+		if (!at) {
+			diag::log_tagged_fmt("pcode_view", "refresh_active_tab_no_active_tab");
+			return;
+		}
 		addr = at->addr;
 		at->pending = true;
 		at->decompiling = true;
 		at->loaded = false;
 		at->is_error = false;
 	}
+	diag::log_tagged_fmt("pcode_view", "refresh_active_tab_dispatch addr=0x%llX",
+		static_cast<unsigned long long>(addr));
 	decompiler_engine::erase_cache_entry(addr);
 	globals::ui::decompile_popup_addr.store(addr, std::memory_order_release);
 	globals::ui::decompile_popup_active.store(true, std::memory_order_release);
@@ -1232,11 +1276,13 @@ void refresh_active_tab()
 
 void refresh_all_tabs()
 {
+	diag::log_tagged_fmt("pcode_view", "refresh_all_tabs_enter");
 	std::vector<uint64_t> addrs;
 	uint64_t active_addr = 0;
 	{
 		std::lock_guard<std::mutex> guard(state_mutex());
 		auto& s = state();
+		diag::log_tagged_fmt("pcode_view", "refresh_all_tabs_count=%zu", s.tabs.size());
 		addrs.reserve(s.tabs.size());
 		for (auto& t : s.tabs) {
 			if (!t) continue;
@@ -1308,6 +1354,9 @@ void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b)
 {
 	(void)accent_r; (void)accent_g; (void)accent_b;
+
+	diag::log_tagged_fmt("pcode_view", "render_enter tabs=%zu active_idx=%d alpha=%.2f",
+		state().tabs.size(), state().active_index, static_cast<double>(alpha));
 
 	bool deferred_dispatch_native = false;
 	uint64_t deferred_dispatch_addr = 0;
@@ -1393,6 +1442,8 @@ void render(float pos_x, float pos_y, float width, float height,
 		if (aida::ui::components::button("Copy",
 		    aida::ui::components::button_kind_t::secondary,
 		    aida::ui::components::size_t_::md, ImVec2(btn_w, btn_h))) {
+			diag::log_tagged_fmt("pcode_view", "toolbar_copy addr=0x%llX pseudocode_bytes=%zu",
+				static_cast<unsigned long long>(active->addr), active->pseudocode.size());
 			if (!active->pseudocode.empty()) copy_to_clipboard(active->pseudocode);
 		}
 	}
@@ -1401,6 +1452,8 @@ void render(float pos_x, float pos_y, float width, float height,
 		if (aida::ui::components::button("Refresh",
 		    aida::ui::components::button_kind_t::secondary,
 		    aida::ui::components::size_t_::md, ImVec2(btn_w, btn_h))) {
+			diag::log_tagged_fmt("pcode_view", "toolbar_refresh addr=0x%llX label=%s",
+				static_cast<unsigned long long>(active->addr), active->label.c_str());
 			active->pending = true;
 			active->decompiling = true;
 			active->loaded = false;
@@ -1418,6 +1471,8 @@ void render(float pos_x, float pos_y, float width, float height,
 		if (aida::ui::components::button("Disasm",
 		    aida::ui::components::button_kind_t::primary,
 		    aida::ui::components::size_t_::md, ImVec2(btn_w, btn_h))) {
+			diag::log_tagged_fmt("pcode_view", "toolbar_goto_disasm addr=0x%llX",
+				static_cast<unsigned long long>(active->addr));
 			globals::ui::active_center_view = center_view_t::disassembly;
 			disasm_view::goto_address(active->addr, g_disasm);
 		}
@@ -1453,6 +1508,8 @@ void render(float pos_x, float pos_y, float width, float height,
 				int idx = s.active_index;
 				if (idx >= 0 && idx < static_cast<int>(s.tabs.size())) {
 					uint64_t closed_addr = s.tabs[idx]->addr;
+					diag::log_tagged_fmt("pcode_view", "key_close_tab addr=0x%llX idx=%d",
+						static_cast<unsigned long long>(closed_addr), idx);
 					s.tabs.erase(s.tabs.begin() + idx);
 					if (s.tabs.empty()) s.active_index = -1;
 					else s.active_index = std::min(idx, static_cast<int>(s.tabs.size()) - 1);
@@ -1462,8 +1519,11 @@ void render(float pos_x, float pos_y, float width, float height,
 			}
 
 			if (io.KeyCtrl && !io.KeyShift && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
-				if (!psv_text_lock && !active->pseudocode.empty())
+				if (!psv_text_lock && !active->pseudocode.empty()) {
+					diag::log_tagged_fmt("pcode_view", "key_copy_pseudocode addr=0x%llX bytes=%zu",
+						static_cast<unsigned long long>(active->addr), active->pseudocode.size());
 					copy_to_clipboard(active->pseudocode);
+				}
 			}
 
 			if (!psv_text_lock && !io.KeyCtrl && !io.KeyAlt
@@ -1530,6 +1590,8 @@ void render(float pos_x, float pos_y, float width, float height,
 
 				if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
 					uint64_t cursor_addr = cursor_addr_or_entry();
+					diag::log_tagged_fmt("pcode_view", "key_space_cfg cursor=0x%llX",
+						static_cast<unsigned long long>(cursor_addr));
 					if (cursor_addr != 0) {
 						uint64_t entry = disasm_view::enclosing_function_start(cursor_addr, g_disasm.file);
 						if (entry == 0) entry = cursor_addr;
@@ -1544,6 +1606,8 @@ void render(float pos_x, float pos_y, float width, float height,
 
 				if (ImGui::IsKeyPressed(ImGuiKey_X, false)) {
 					uint64_t cursor_addr = cursor_addr_or_entry();
+					diag::log_tagged_fmt("pcode_view", "key_x_goto_disasm cursor=0x%llX",
+						static_cast<unsigned long long>(cursor_addr));
 					if (cursor_addr != 0) {
 						globals::ui::active_center_view = center_view_t::disassembly;
 						disasm_view::goto_address(cursor_addr, g_disasm);
@@ -1552,18 +1616,24 @@ void render(float pos_x, float pos_y, float width, float height,
 
 				if (!comment_dialog::is_open() && ImGui::IsKeyPressed(ImGuiKey_Semicolon, false)) {
 					uint64_t cmt_addr = cursor_addr_or_entry();
+					diag::log_tagged_fmt("pcode_view", "key_comment addr=0x%llX",
+						static_cast<unsigned long long>(cmt_addr));
 					if (cmt_addr != 0)
 						comment_dialog::open(cmt_addr);
 				}
 
 				if (!rename_dialog::is_open() && ImGui::IsKeyPressed(ImGuiKey_N, false)) {
 					uint64_t rename_addr = cursor_addr_or_entry();
+					diag::log_tagged_fmt("pcode_view", "key_rename addr=0x%llX",
+						static_cast<unsigned long long>(rename_addr));
 					if (rename_addr != 0)
 						rename_dialog::open(rename_addr);
 				}
 
 				if (ImGui::IsKeyPressed(ImGuiKey_G, false)) {
 					uint64_t goto_addr = cursor_addr_or_entry();
+					diag::log_tagged_fmt("pcode_view", "key_g_goto addr=0x%llX",
+						static_cast<unsigned long long>(goto_addr));
 					globals::ui::active_center_view = center_view_t::disassembly;
 					if (goto_addr != 0)
 						disasm_view::goto_address(goto_addr, g_disasm);
@@ -1574,6 +1644,8 @@ void render(float pos_x, float pos_y, float width, float height,
 				if (ImGui::IsKeyPressed(ImGuiKey_Tab, false)) {
 					uint64_t tab_target = cursor_addr_or_entry();
 					if (tab_target == 0) tab_target = active->addr;
+					diag::log_tagged_fmt("pcode_view", "key_tab_switch_disasm addr=0x%llX",
+						static_cast<unsigned long long>(tab_target));
 					if (tab_target != 0) {
 						globals::ui::active_center_view = center_view_t::disassembly;
 						disasm_view::goto_address(tab_target, g_disasm);
@@ -1583,6 +1655,8 @@ void render(float pos_x, float pos_y, float width, float height,
 
 			if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_G, false)) {
 				uint64_t goto_addr = cursor_addr_or_entry();
+				diag::log_tagged_fmt("pcode_view", "key_ctrl_g_goto addr=0x%llX",
+					static_cast<unsigned long long>(goto_addr));
 				globals::ui::active_center_view = center_view_t::disassembly;
 				if (goto_addr != 0)
 					disasm_view::goto_address(goto_addr, g_disasm);

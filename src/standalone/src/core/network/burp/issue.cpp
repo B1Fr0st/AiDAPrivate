@@ -26,6 +26,7 @@ namespace burp {
 
 const char* severity_label(severity_t s)
 {
+    diag::log_tagged_fmt("issue", "severity_label s=%d", static_cast<int>(s));
     switch (s) {
         case severity_t::info:     return "Info";
         case severity_t::low:      return "Low";
@@ -38,6 +39,7 @@ const char* severity_label(severity_t s)
 
 const char* confidence_label(confidence_t c)
 {
+    diag::log_tagged_fmt("issue", "confidence_label c=%d", static_cast<int>(c));
     switch (c) {
         case confidence_t::tentative: return "Tentative";
         case confidence_t::firm:      return "Firm";
@@ -48,23 +50,27 @@ const char* confidence_label(confidence_t c)
 
 bool parse_severity(const std::string& s, severity_t& out)
 {
+    diag::log_tagged_fmt("issue", "parse_severity s=%s", s.c_str());
     std::string lc; lc.reserve(s.size());
     for (char c : s) lc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-    if (lc == "info")     { out = severity_t::info;     return true; }
-    if (lc == "low")      { out = severity_t::low;      return true; }
-    if (lc == "medium")   { out = severity_t::medium;   return true; }
-    if (lc == "high")     { out = severity_t::high;     return true; }
-    if (lc == "critical") { out = severity_t::critical; return true; }
+    if (lc == "info")     { out = severity_t::info;     diag::log_tagged_fmt("issue", "parse_severity result=info"); return true; }
+    if (lc == "low")      { out = severity_t::low;      diag::log_tagged_fmt("issue", "parse_severity result=low"); return true; }
+    if (lc == "medium")   { out = severity_t::medium;   diag::log_tagged_fmt("issue", "parse_severity result=medium"); return true; }
+    if (lc == "high")     { out = severity_t::high;     diag::log_tagged_fmt("issue", "parse_severity result=high"); return true; }
+    if (lc == "critical") { out = severity_t::critical; diag::log_tagged_fmt("issue", "parse_severity result=critical"); return true; }
+    diag::log_tagged_fmt("issue", "parse_severity unknown s=%s", s.c_str());
     return false;
 }
 
 bool parse_confidence(const std::string& s, confidence_t& out)
 {
+    diag::log_tagged_fmt("issue", "parse_confidence s=%s", s.c_str());
     std::string lc; lc.reserve(s.size());
     for (char c : s) lc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-    if (lc == "tentative") { out = confidence_t::tentative; return true; }
-    if (lc == "firm")      { out = confidence_t::firm;      return true; }
-    if (lc == "certain")   { out = confidence_t::certain;   return true; }
+    if (lc == "tentative") { out = confidence_t::tentative; diag::log_tagged_fmt("issue", "parse_confidence result=tentative"); return true; }
+    if (lc == "firm")      { out = confidence_t::firm;      diag::log_tagged_fmt("issue", "parse_confidence result=firm"); return true; }
+    if (lc == "certain")   { out = confidence_t::certain;   diag::log_tagged_fmt("issue", "parse_confidence result=certain"); return true; }
+    diag::log_tagged_fmt("issue", "parse_confidence unknown s=%s", s.c_str());
     return false;
 }
 
@@ -179,22 +185,35 @@ bool evidence_from_json(const nlohmann::json& j, evidence_t& out)
 
 bool initialize()
 {
+    diag::log_tagged_fmt("issue", "initialize entry");
     auto& s = state();
     bool expected = false;
-    if (!s.initialized.compare_exchange_strong(expected, true)) return true;
+    if (!s.initialized.compare_exchange_strong(expected, true)) {
+        diag::log_tagged_fmt("issue", "initialize already_initialized");
+        return true;
+    }
+    diag::log_tagged_fmt("issue", "initialize loading_from_disk");
     load_from_disk();
+    diag::log_tagged_fmt("issue", "initialize done count=%zu", s.items.size());
     return true;
 }
 
 void shutdown()
 {
+    diag::log_tagged_fmt("issue", "shutdown entry");
     auto& s = state();
-    if (!s.initialized.load()) return;
+    if (!s.initialized.load()) {
+        diag::log_tagged_fmt("issue", "shutdown not_initialized skip");
+        return;
+    }
+    diag::log_tagged_fmt("issue", "shutdown saving count=%zu", s.items.size());
     save_to_disk();
+    diag::log_tagged_fmt("issue", "shutdown done");
 }
 
 nlohmann::json issue_to_json(const issue_t& i)
 {
+    diag::log_tagged_fmt("issue", "issue_to_json id=%llu type_key=%s host=%s", static_cast<unsigned long long>(i.id), i.type_key.c_str(), i.host.c_str());
     nlohmann::json j;
     j["id"]               = i.id;
     j["type_key"]         = i.type_key;
@@ -216,26 +235,33 @@ nlohmann::json issue_to_json(const issue_t& i)
     nlohmann::json ev_arr = nlohmann::json::array();
     for (const auto& e : i.evidence) ev_arr.push_back(evidence_to_json(e));
     j["evidence"] = std::move(ev_arr);
+    diag::log_tagged_fmt("issue", "issue_to_json done id=%llu evidence=%zu", static_cast<unsigned long long>(i.id), i.evidence.size());
     return j;
 }
 
 uint64_t add(issue_t issue)
 {
+    diag::log_tagged_fmt("issue", "add entry type_key=%s host=%s path=%s parameter=%s severity=%d",
+        issue.type_key.c_str(), issue.host.c_str(), issue.path.c_str(), issue.parameter.c_str(), static_cast<int>(issue.severity));
     auto& s = state();
     if (!s.initialized.load()) initialize();
 
     if (issue.seen_ms == 0) issue.seen_ms = now_ms();
 
     const std::string key = build_dedupe_key(issue);
+    diag::log_tagged_fmt("issue", "add dedupe_key=%s", key.c_str());
 
     {
         std::lock_guard<std::mutex> lk(s.mtx);
         if (s.dedupe_keys.find(key) != s.dedupe_keys.end()) {
+            diag::log_tagged_fmt("issue", "add duplicate_found key=%s", key.c_str());
             for (auto& existing : s.items) {
                 if (build_dedupe_key(existing) == key) {
                     if (!issue.evidence.empty() && existing.evidence.size() < 8) {
+                        diag::log_tagged_fmt("issue", "add merging_evidence existing_id=%llu evidence_count=%zu", static_cast<unsigned long long>(existing.id), issue.evidence.size());
                         for (auto& e : issue.evidence) existing.evidence.push_back(std::move(e));
                     }
+                    diag::log_tagged_fmt("issue", "add deduped existing_id=%llu", static_cast<unsigned long long>(existing.id));
                     return existing.id;
                 }
             }
@@ -243,65 +269,97 @@ uint64_t add(issue_t issue)
         issue.id = s.next_id.fetch_add(1);
         s.dedupe_keys.insert(key);
         s.items.push_back(std::move(issue));
+        diag::log_tagged_fmt("issue", "add inserted id=%llu total=%zu", static_cast<unsigned long long>(s.items.back().id), s.items.size());
     }
 
-    if (s.autosave.load()) save_to_disk();
-    return s.next_id.load() - 1;
+    if (s.autosave.load()) {
+        diag::log_tagged_fmt("issue", "add autosave triggered");
+        save_to_disk();
+    }
+    uint64_t new_id = s.next_id.load() - 1;
+    diag::log_tagged_fmt("issue", "add ok new_id=%llu", static_cast<unsigned long long>(new_id));
+    return new_id;
 }
 
 bool remove(uint64_t id)
 {
+    diag::log_tagged_fmt("issue", "remove entry id=%llu", static_cast<unsigned long long>(id));
     auto& s = state();
     std::lock_guard<std::mutex> lk(s.mtx);
     for (auto it = s.items.begin(); it != s.items.end(); ++it) {
         if (it->id == id) {
+            diag::log_tagged_fmt("issue", "remove found id=%llu type_key=%s", static_cast<unsigned long long>(id), it->type_key.c_str());
             s.dedupe_keys.erase(build_dedupe_key(*it));
             s.items.erase(it);
+            diag::log_tagged_fmt("issue", "remove ok id=%llu remaining=%zu", static_cast<unsigned long long>(id), s.items.size());
             return true;
         }
     }
+    diag::log_tagged_fmt("issue", "remove not_found id=%llu", static_cast<unsigned long long>(id));
     return false;
 }
 
 void clear()
 {
+    diag::log_tagged_fmt("issue", "clear entry");
     auto& s = state();
+    size_t prev = 0;
     {
         std::lock_guard<std::mutex> lk(s.mtx);
+        prev = s.items.size();
         s.items.clear();
         s.dedupe_keys.clear();
     }
-    if (s.autosave.load()) save_to_disk();
+    diag::log_tagged_fmt("issue", "clear cleared prev_count=%zu", prev);
+    if (s.autosave.load()) {
+        diag::log_tagged_fmt("issue", "clear autosave triggered");
+        save_to_disk();
+    }
+    diag::log_tagged_fmt("issue", "clear done");
 }
 
 size_t count()
 {
+    diag::log_tagged_fmt("issue", "count entry");
     auto& s = state();
     std::lock_guard<std::mutex> lk(s.mtx);
-    return s.items.size();
+    size_t n = s.items.size();
+    diag::log_tagged_fmt("issue", "count result=%zu", n);
+    return n;
 }
 
 bool get(uint64_t id, issue_t& out)
 {
+    diag::log_tagged_fmt("issue", "get entry id=%llu", static_cast<unsigned long long>(id));
     auto& s = state();
     std::lock_guard<std::mutex> lk(s.mtx);
     for (const auto& iss : s.items) {
-        if (iss.id == id) { out = iss; return true; }
+        if (iss.id == id) {
+            out = iss;
+            diag::log_tagged_fmt("issue", "get found id=%llu type_key=%s host=%s", static_cast<unsigned long long>(id), iss.type_key.c_str(), iss.host.c_str());
+            return true;
+        }
     }
+    diag::log_tagged_fmt("issue", "get not_found id=%llu", static_cast<unsigned long long>(id));
     return false;
 }
 
 size_t count_by_severity(severity_t sev)
 {
+    diag::log_tagged_fmt("issue", "count_by_severity entry sev=%d", static_cast<int>(sev));
     auto& s = state();
     std::lock_guard<std::mutex> lk(s.mtx);
     size_t c = 0;
     for (const auto& it : s.items) if (it.severity == sev) ++c;
+    diag::log_tagged_fmt("issue", "count_by_severity sev=%d result=%zu", static_cast<int>(sev), c);
     return c;
 }
 
 std::vector<issue_t> list(const issue_filter_t& filter)
 {
+    diag::log_tagged_fmt("issue", "list entry has_severity_min=%d has_confidence_min=%d has_audit_id=%d host_sub=%s type_key_sub=%s limit=%zu",
+        filter.has_severity_min ? 1 : 0, filter.has_confidence_min ? 1 : 0, filter.has_audit_id ? 1 : 0,
+        filter.host_substring.c_str(), filter.type_key_substring.c_str(), filter.limit);
     auto& s = state();
     std::vector<issue_t> out;
     std::lock_guard<std::mutex> lk(s.mtx);
@@ -327,35 +385,44 @@ std::vector<issue_t> list(const issue_filter_t& filter)
         if (a.severity != b.severity) return static_cast<int>(a.severity) > static_cast<int>(b.severity);
         return a.seen_ms > b.seen_ms;
     });
+    diag::log_tagged_fmt("issue", "list result=%zu total_in_store=%zu", out.size(), s.items.size());
     return out;
 }
 
 nlohmann::json export_json(const issue_filter_t& filter)
 {
+    diag::log_tagged_fmt("issue", "export_json entry");
     auto items = list(filter);
+    diag::log_tagged_fmt("issue", "export_json serializing count=%zu", items.size());
     nlohmann::json arr = nlohmann::json::array();
     for (const auto& it : items) arr.push_back(issue_to_json(it));
     nlohmann::json doc;
     doc["count"]  = arr.size();
     doc["issues"] = std::move(arr);
+    diag::log_tagged_fmt("issue", "export_json done count=%zu", items.size());
     return doc;
 }
 
 std::string storage_path()
 {
+    diag::log_tagged_fmt("issue", "storage_path entry");
     std::string dir = resolve_appdata_dir() + "\\AiDA\\Standalone\\burp";
     ensure_dir(dir);
-    return dir + "\\issues.json";
+    std::string path = dir + "\\issues.json";
+    diag::log_tagged_fmt("issue", "storage_path result=%s", path.c_str());
+    return path;
 }
 
 bool save_to_disk()
 {
+    diag::log_tagged_fmt("issue", "save_to_disk entry");
     auto& s = state();
     std::vector<issue_t> snapshot;
     {
         std::lock_guard<std::mutex> lk(s.mtx);
         snapshot = s.items;
     }
+    diag::log_tagged_fmt("issue", "save_to_disk snapshot_count=%zu next_id=%llu", snapshot.size(), static_cast<unsigned long long>(s.next_id.load()));
     const std::string path = storage_path();
     const std::string tmp_path = path + ".tmp";
     nlohmann::json doc;
@@ -366,19 +433,31 @@ bool save_to_disk()
     doc["issues"]   = std::move(arr);
     try {
         std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
-        if (!f.is_open()) { set_err("issue_store.save: open failed"); return false; }
+        if (!f.is_open()) {
+            diag::log_tagged_fmt("issue", "save_to_disk open_failed path=%s", tmp_path.c_str());
+            set_err("issue_store.save: open failed");
+            return false;
+        }
         const std::string out = doc.dump(2);
         f.write(out.data(), static_cast<std::streamsize>(out.size()));
         f.close();
+        diag::log_tagged_fmt("issue", "save_to_disk written bytes=%zu", out.size());
         std::error_code ec;
         std::filesystem::rename(tmp_path, path, ec);
         if (ec) {
+            diag::log_tagged_fmt("issue", "save_to_disk rename_failed retrying ec=%s", ec.message().c_str());
             std::filesystem::remove(path, ec);
             std::filesystem::rename(tmp_path, path, ec);
-            if (ec) { set_err("issue_store.save: rename failed"); return false; }
+            if (ec) {
+                diag::log_tagged_fmt("issue", "save_to_disk rename_failed_final ec=%s", ec.message().c_str());
+                set_err("issue_store.save: rename failed");
+                return false;
+            }
         }
+        diag::log_tagged_fmt("issue", "save_to_disk ok path=%s", path.c_str());
         return true;
     } catch (...) {
+        diag::log_tagged_fmt("issue", "save_to_disk exception");
         set_err("issue_store.save: serialization exception");
         return false;
     }
@@ -386,16 +465,32 @@ bool save_to_disk()
 
 bool load_from_disk()
 {
+    diag::log_tagged_fmt("issue", "load_from_disk entry");
     auto& s = state();
     const std::string path = storage_path();
+    diag::log_tagged_fmt("issue", "load_from_disk path=%s", path.c_str());
     std::ifstream f(path, std::ios::binary);
-    if (!f.is_open()) return false;
+    if (!f.is_open()) {
+        diag::log_tagged_fmt("issue", "load_from_disk file_not_found path=%s", path.c_str());
+        return false;
+    }
     std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    if (raw.empty()) return false;
+    if (raw.empty()) {
+        diag::log_tagged_fmt("issue", "load_from_disk file_empty");
+        return false;
+    }
+    diag::log_tagged_fmt("issue", "load_from_disk raw_bytes=%zu", raw.size());
     nlohmann::json doc;
     try { doc = nlohmann::json::parse(raw); }
-    catch (...) { set_err("issue_store.load: parse failed"); return false; }
-    if (!doc.is_object() || !doc.contains("issues") || !doc["issues"].is_array()) return false;
+    catch (...) {
+        diag::log_tagged_fmt("issue", "load_from_disk parse_failed");
+        set_err("issue_store.load: parse failed");
+        return false;
+    }
+    if (!doc.is_object() || !doc.contains("issues") || !doc["issues"].is_array()) {
+        diag::log_tagged_fmt("issue", "load_from_disk invalid_schema");
+        return false;
+    }
     std::vector<issue_t> loaded;
     std::unordered_set<std::string> keys;
     for (const auto& j : doc["issues"]) {
@@ -432,6 +527,7 @@ bool load_from_disk()
     uint64_t next = 1;
     if (doc.contains("next_id") && doc["next_id"].is_number_unsigned()) next = doc["next_id"].get<uint64_t>();
     for (const auto& it : loaded) if (it.id >= next) next = it.id + 1;
+    diag::log_tagged_fmt("issue", "load_from_disk parsed_count=%zu next_id=%llu", loaded.size(), static_cast<unsigned long long>(next));
     {
         std::lock_guard<std::mutex> lk(s.mtx);
         s.items = std::move(loaded);
@@ -440,13 +536,16 @@ bool load_from_disk()
     }
     diag::log_tagged_fmt("burp", "issue_store loaded count=%zu next_id=%llu",
         s.items.size(), static_cast<unsigned long long>(next));
+    diag::log_tagged_fmt("issue", "load_from_disk ok count=%zu next_id=%llu", s.items.size(), static_cast<unsigned long long>(next));
     return true;
 }
 
 std::string last_error()
 {
+    diag::log_tagged_fmt("issue", "last_error queried");
     auto& s = state();
     std::lock_guard<std::mutex> lk(s.err_mtx);
+    diag::log_tagged_fmt("issue", "last_error=%s", s.last_error.c_str());
     return s.last_error;
 }
 

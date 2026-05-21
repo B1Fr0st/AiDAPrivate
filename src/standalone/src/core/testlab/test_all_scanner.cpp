@@ -5,6 +5,7 @@
 #include "../scanner/pointer_scanner.hpp"
 #include "../scanner/snapshot_diff.hpp"
 #include "../scanner/aob_generator.hpp"
+#include "../scanner/scan_hub_view.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <Windows.h>
@@ -1307,10 +1308,39 @@ static void test_memscan_shutdown(HANDLE hf, std::atomic<int>& passed, std::atom
     passed.fetch_add(1);
 }
 
+static void select_scan_hub_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
+                                const char* tag, scan_hub_view::sub_tab_t value) {
+    scan_hub_view::set_sub_tab(value);
+    log_msg(hf, tag, "PASS -- scan_hub sub_tab selected (%d)", static_cast<int>(value));
+    passed.fetch_add(1);
+}
+
+static void test_scan_hub_tab_value_scan(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_scan_hub_tab(hf, passed, failed, "scan_hub_tab.value_scan", scan_hub_view::sub_tab_t::value_scan);
+}
+static void test_scan_hub_tab_crypto(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_scan_hub_tab(hf, passed, failed, "scan_hub_tab.crypto", scan_hub_view::sub_tab_t::crypto);
+}
+static void test_scan_hub_tab_aob(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_scan_hub_tab(hf, passed, failed, "scan_hub_tab.aob", scan_hub_view::sub_tab_t::aob);
+}
+static void test_scan_hub_tab_decrypt(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_scan_hub_tab(hf, passed, failed, "scan_hub_tab.decrypt", scan_hub_view::sub_tab_t::decrypt);
+}
+static void test_scan_hub_tab_pointers(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_scan_hub_tab(hf, passed, failed, "scan_hub_tab.pointers", scan_hub_view::sub_tab_t::pointers);
+}
+static void test_scan_hub_tab_snapshots(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_scan_hub_tab(hf, passed, failed, "scan_hub_tab.snapshots", scan_hub_view::sub_tab_t::snapshots);
+}
+static void test_scan_hub_tab_integrity(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_scan_hub_tab(hf, passed, failed, "scan_hub_tab.integrity", scan_hub_view::sub_tab_t::integrity);
+}
+
 }
 
 void phase_scanner_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
-    log_msg(hf, "scanner", "=== BEGIN scanner tests (56 tests) ===");
+    log_msg(hf, "scanner", "=== BEGIN scanner tests (63 tests) ===");
 
     struct test_entry_t {
         const char* name;
@@ -1374,6 +1404,15 @@ void phase_scanner_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& 
         { "aob_quality_score",        test_aob_quality_score        },
         { "aob_score_grades",         test_aob_score_grades         },
         { "aob_quality_all_wc",       test_aob_quality_all_wildcards},
+
+        { "scan_hub_tab_value_scan",  test_scan_hub_tab_value_scan  },
+        { "scan_hub_tab_crypto",      test_scan_hub_tab_crypto      },
+        { "scan_hub_tab_aob",         test_scan_hub_tab_aob         },
+        { "scan_hub_tab_decrypt",     test_scan_hub_tab_decrypt     },
+        { "scan_hub_tab_pointers",    test_scan_hub_tab_pointers    },
+        { "scan_hub_tab_snapshots",   test_scan_hub_tab_snapshots   },
+        { "scan_hub_tab_integrity",   test_scan_hub_tab_integrity   },
+
         { "memscan_shutdown",         test_memscan_shutdown         },
     };
 

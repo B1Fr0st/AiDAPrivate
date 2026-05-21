@@ -5364,6 +5364,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
     int active_now = static_cast<int>(g_state.active_tab);
     if (active_now != s_last_active_tab) {
+        diag::log_tagged_fmt("network", "tab_switch from=%d to=%d", s_last_active_tab, active_now);
         s_tab_content_in.start(0.220f, aida::motion::ease::out_cubic);
         s_last_active_tab = active_now;
     }

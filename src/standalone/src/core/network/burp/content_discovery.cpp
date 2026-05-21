@@ -282,6 +282,8 @@ void run_disc(std::shared_ptr<disc_t> ctx);
 
 void worker_one(std::shared_ptr<disc_t> ctx, candidate_t cand)
 {
+    diag::log_tagged_fmt("content_discovery", "worker_one id=%llu url=%s depth=%d",
+        static_cast<unsigned long long>(ctx->id), cand.url.c_str(), cand.depth);
     auto& d = *ctx;
     d.in_flight.fetch_add(1);
 
@@ -291,9 +293,15 @@ void worker_one(std::shared_ptr<disc_t> ctx, candidate_t cand)
     std::vector<std::pair<std::string,std::string>> hdr;
     uint64_t lat = 0;
     bool ok = perform_request(cand.url, d.config, status, body_bytes, body, content_type, redirect, hdr, lat, err);
+    diag::log_tagged_fmt("content_discovery", "worker_one result id=%llu url=%s ok=%d status=%d body=%zu lat=%llu err=%s",
+        static_cast<unsigned long long>(ctx->id), cand.url.c_str(), ok ? 1 : 0,
+        status, body_bytes, static_cast<unsigned long long>(lat), err.c_str());
 
     d.attempts.fetch_add(1);
-    if (!ok) { d.errors.fetch_add(1); }
+    if (!ok) {
+        d.errors.fetch_add(1);
+        diag::log_tagged_fmt("content_discovery", "worker_one error id=%llu url=%s err=%s", static_cast<unsigned long long>(ctx->id), cand.url.c_str(), err.c_str());
+    }
     else
     {
         {
@@ -302,6 +310,7 @@ void worker_one(std::shared_ptr<disc_t> ctx, candidate_t cand)
         }
         bool match = status_in_set(status, d.config.match_status);
         if (status_in_set(status, d.config.filter_status)) match = false;
+        diag::log_tagged_fmt("content_discovery", "worker_one filter_check id=%llu url=%s status=%d match=%d", static_cast<unsigned long long>(ctx->id), cand.url.c_str(), status, match ? 1 : 0);
         if (match && d.config.filter_size_max > 0)
         {
             if (body_bytes >= d.config.filter_size_min && body_bytes <= d.config.filter_size_max) match = false;
@@ -317,6 +326,8 @@ void worker_one(std::shared_ptr<disc_t> ctx, candidate_t cand)
 
         if (match)
         {
+            diag::log_tagged_fmt("content_discovery", "worker_one hit id=%llu url=%s status=%d body=%zu payload=%s",
+                static_cast<unsigned long long>(ctx->id), cand.url.c_str(), status, body_bytes, cand.payload.c_str());
             hit_t h;
             h.url = cand.url;
             h.payload = cand.payload;
@@ -424,6 +435,7 @@ void run_disc(std::shared_ptr<disc_t> ctx)
 
 bool auto_calibrate(disc_t& d)
 {
+    diag::log_tagged_fmt("content_discovery", "auto_calibrate id=%llu target=%s", static_cast<unsigned long long>(d.id), d.config.target_url.c_str());
     static const char* k = "abcdefghijklmnopqrstuvwxyz0123456789";
     std::mt19937 rng(static_cast<uint32_t>(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::uniform_int_distribution<int> dist(0, 35);
@@ -438,10 +450,17 @@ bool auto_calibrate(disc_t& d)
         std::string body, ct, redir, err;
         std::vector<std::pair<std::string,std::string>> hdr;
         uint64_t lat = 0;
-        if (perform_request(url, d.config, status, body_bytes, body, ct, redir, hdr, lat, err))
+        if (perform_request(url, d.config, status, body_bytes, body, ct, redir, hdr, lat, err)) {
+            diag::log_tagged_fmt("content_discovery", "auto_calibrate probe id=%llu url=%s status=%d body=%zu", static_cast<unsigned long long>(d.id), url.c_str(), status, body_bytes);
             sizes.push_back(body_bytes);
+        } else {
+            diag::log_tagged_fmt("content_discovery", "auto_calibrate probe_failed id=%llu url=%s err=%s", static_cast<unsigned long long>(d.id), url.c_str(), err.c_str());
+        }
     }
-    if (sizes.empty()) return false;
+    if (sizes.empty()) {
+        diag::log_tagged_fmt("content_discovery", "auto_calibrate failed id=%llu no_samples", static_cast<unsigned long long>(d.id));
+        return false;
+    }
     std::sort(sizes.begin(), sizes.end());
     size_t lo = sizes.front();
     size_t hi = sizes.back();
@@ -449,6 +468,8 @@ bool auto_calibrate(disc_t& d)
     if (lo > 8) lo -= 8;
     d.calibrated_lo = lo;
     d.calibrated_hi = hi;
+    diag::log_tagged_fmt("content_discovery", "auto_calibrate result id=%llu lo=%zu hi=%zu samples=%zu",
+        static_cast<unsigned long long>(d.id), lo, hi, sizes.size());
     return true;
 }
 
@@ -456,23 +477,33 @@ bool auto_calibrate(disc_t& d)
 
 bool initialize()
 {
+    diag::log_tagged_fmt("content_discovery", "initialize called");
     auto& r = reg();
     bool expected = false;
-    if (!r.init_done.compare_exchange_strong(expected, true)) return true;
+    if (!r.init_done.compare_exchange_strong(expected, true)) {
+        diag::log_tagged_fmt("content_discovery", "initialize already_done");
+        return true;
+    }
     payloads::initialize();
+    diag::log_tagged_fmt("content_discovery", "initialize success");
     return true;
 }
 
 void shutdown()
 {
+    diag::log_tagged_fmt("content_discovery", "shutdown called");
     auto& r = reg();
-    if (!r.init_done.exchange(false)) return;
+    if (!r.init_done.exchange(false)) {
+        diag::log_tagged_fmt("content_discovery", "shutdown skipped not_initialized");
+        return;
+    }
     std::vector<std::shared_ptr<disc_t>> snaps;
     {
         std::lock_guard<std::mutex> lk(r.mtx);
         snaps.reserve(r.by_id.size());
         for (auto& kv : r.by_id) { kv.second->stop_flag.store(true); snaps.push_back(kv.second); }
     }
+    diag::log_tagged_fmt("content_discovery", "shutdown stopping %zu jobs", snaps.size());
     for (int i = 0; i < 40; ++i)
     {
         bool done = true;
@@ -484,6 +515,7 @@ void shutdown()
         std::lock_guard<std::mutex> lk(r.mtx);
         r.by_id.clear();
     }
+    diag::log_tagged_fmt("content_discovery", "shutdown complete");
 }
 
 uint64_t start(const config_t& cfg)
@@ -565,11 +597,16 @@ uint64_t start(const config_t& cfg)
 
 bool stop(uint64_t id)
 {
+    diag::log_tagged_fmt("content_discovery", "stop id=%llu", static_cast<unsigned long long>(id));
     std::shared_ptr<disc_t> ctx;
     {
         std::lock_guard<std::mutex> lk(reg().mtx);
         auto it = reg().by_id.find(id);
-        if (it == reg().by_id.end()) { set_err("not found"); return false; }
+        if (it == reg().by_id.end()) {
+            diag::log_tagged_fmt("content_discovery", "stop id=%llu not_found", static_cast<unsigned long long>(id));
+            set_err("not found");
+            return false;
+        }
         ctx = it->second;
     }
     ctx->stop_flag.store(true);
@@ -640,11 +677,16 @@ std::vector<hit_t> results(uint64_t id)
 
 bool remove(uint64_t id)
 {
+    diag::log_tagged_fmt("content_discovery", "remove id=%llu", static_cast<unsigned long long>(id));
     std::shared_ptr<disc_t> ctx;
     {
         std::lock_guard<std::mutex> lk(reg().mtx);
         auto it = reg().by_id.find(id);
-        if (it == reg().by_id.end()) { set_err("not found"); return false; }
+        if (it == reg().by_id.end()) {
+            diag::log_tagged_fmt("content_discovery", "remove id=%llu not_found", static_cast<unsigned long long>(id));
+            set_err("not found");
+            return false;
+        }
         ctx = it->second;
     }
     ctx->stop_flag.store(true);
@@ -657,6 +699,7 @@ bool remove(uint64_t id)
         std::lock_guard<std::mutex> lk(reg().mtx);
         reg().by_id.erase(id);
     }
+    diag::log_tagged_fmt("content_discovery", "remove id=%llu complete", static_cast<unsigned long long>(id));
     return true;
 }
 

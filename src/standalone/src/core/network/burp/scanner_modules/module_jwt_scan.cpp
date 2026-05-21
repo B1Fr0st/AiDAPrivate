@@ -9,6 +9,7 @@
 #pragma comment(lib, "Bcrypt.lib")
 
 #include "../scanner_module.hpp"
+#include "../../../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -182,14 +183,26 @@ bool try_secret(const jwt_t& j, const std::string& secret, std::string& out_toke
 
 void jwt_run(const insertion_point_t& ip, const module_context_t& ctx, const send_fn_t& send)
 {
-    if (ip.kind != "header") return;
-    if (lc(ip.name) != "host") return;
+    diag::log_tagged_fmt("mod_jwt_scan", "jwt_run entry ip=%s:%s host=%s", ip.kind.c_str(), ip.name.c_str(), ctx.host.c_str());
+    if (ip.kind != "header") {
+        diag::log_tagged_fmt("mod_jwt_scan", "jwt_run skip not header kind=%s", ip.kind.c_str());
+        return;
+    }
+    if (lc(ip.name) != "host") {
+        diag::log_tagged_fmt("mod_jwt_scan", "jwt_run skip not host header name=%s", ip.name.c_str());
+        return;
+    }
 
     auto jwts = find_jwts(ip.base_request);
-    if (jwts.empty()) return;
+    diag::log_tagged_fmt("mod_jwt_scan", "jwt_run found %zu JWTs in request", jwts.size());
+    if (jwts.empty()) {
+        diag::log_tagged_fmt("mod_jwt_scan", "jwt_run no JWTs found host=%s", ctx.host.c_str());
+        return;
+    }
 
     for (auto& j : jwts)
     {
+        diag::log_tagged_fmt("mod_jwt_scan", "jwt_run processing JWT alg=%s kid=%s", j.alg.c_str(), j.kid.c_str());
         {
             probe_t p; p.payload = j.raw; p.marker = j.raw; p.variant = "informational";
             exchange_observed_t synthetic;
@@ -200,6 +213,7 @@ void jwt_run(const insertion_point_t& ip, const module_context_t& ctx, const sen
             synthetic.resp_headers = ctx.baseline_response_headers;
             synthetic.resp_body = ctx.baseline_response_body;
             synthetic.status_code = ctx.baseline_status_code;
+            diag::log_tagged_fmt("mod_jwt_scan", "jwt_run FINDING detected alg=%s kid=%s", j.alg.c_str(), j.kid.c_str());
             auto iss = make_issue("jwt.detected",
                                   std::string("JWT detected (alg=") + (j.alg.empty() ? "?" : j.alg) + ")",
                                   severity_t::info, confidence_t::firm, ip, p, synthetic, ctx,
@@ -213,6 +227,7 @@ void jwt_run(const insertion_point_t& ip, const module_context_t& ctx, const sen
 
         if (lc(j.alg) != "none")
         {
+            diag::log_tagged_fmt("mod_jwt_scan", "jwt_run testing alg-none attack alg=%s", j.alg.c_str());
             nlohmann::json hj = nlohmann::json::parse(j.header_json, nullptr, false);
             if (!hj.is_discarded() && hj.is_object())
             {
@@ -222,9 +237,13 @@ void jwt_run(const insertion_point_t& ip, const module_context_t& ctx, const sen
                 std::vector<uint8_t> raw = swap_token(ip.base_request, j.raw, forged);
                 probe_t p; p.payload = forged; p.marker = forged; p.variant = "alg-none";
                 auto resp = send(raw, p);
+                if (resp.has_value()) {
+                    diag::log_tagged_fmt("mod_jwt_scan", "jwt_run alg-none response status=%d baseline=%d", resp->status_code, ctx.baseline_status_code);
+                }
                 if (resp.has_value() && resp->status_code == ctx.baseline_status_code &&
                     resp->status_code >= 200 && resp->status_code < 400)
                 {
+                    diag::log_tagged_fmt("mod_jwt_scan", "jwt_run FINDING alg-none-accepted alg=%s status=%d", j.alg.c_str(), resp->status_code);
                     auto iss = make_issue("jwt.alg-none-accepted",
                                           "JWT alg=none accepted",
                                           severity_t::critical, confidence_t::firm, ip, p, *resp, ctx,
@@ -239,10 +258,14 @@ void jwt_run(const insertion_point_t& ip, const module_context_t& ctx, const sen
 
         if (lc(j.alg) == "hs256" || lc(j.alg) == "hs384" || lc(j.alg) == "hs512")
         {
+            diag::log_tagged_fmt("mod_jwt_scan", "jwt_run testing weak HMAC secrets alg=%s", j.alg.c_str());
+            size_t tried = 0;
             for (const char* sec : kWeakSecrets)
             {
+                ++tried;
                 std::string out;
                 if (!try_secret(j, sec, out)) continue;
+                diag::log_tagged_fmt("mod_jwt_scan", "jwt_run FINDING weak-hmac-secret alg=%s secret=%s tried=%zu", j.alg.c_str(), sec ? sec : "", tried);
                 probe_t p; p.payload = out; p.marker = sec ? sec : ""; p.variant = "weak-hmac-secret";
                 exchange_observed_t synthetic;
                 synthetic.status_code = ctx.baseline_status_code;
@@ -260,10 +283,12 @@ void jwt_run(const insertion_point_t& ip, const module_context_t& ctx, const sen
                 issue_store::add(std::move(iss));
                 break;
             }
+            diag::log_tagged_fmt("mod_jwt_scan", "jwt_run weak secret scan complete tried=%zu", tried);
         }
 
         if (!j.kid.empty())
         {
+            diag::log_tagged_fmt("mod_jwt_scan", "jwt_run testing kid path-traversal kid=%s", j.kid.c_str());
             nlohmann::json hj = nlohmann::json::parse(j.header_json, nullptr, false);
             if (!hj.is_discarded() && hj.is_object())
             {
@@ -273,9 +298,13 @@ void jwt_run(const insertion_point_t& ip, const module_context_t& ctx, const sen
                 std::vector<uint8_t> raw = swap_token(ip.base_request, j.raw, forged);
                 probe_t p; p.payload = forged; p.marker = forged; p.variant = "kid-path-traversal";
                 auto resp = send(raw, p);
+                if (resp.has_value()) {
+                    diag::log_tagged_fmt("mod_jwt_scan", "jwt_run kid-path-traversal response status=%d baseline=%d", resp->status_code, ctx.baseline_status_code);
+                }
                 if (resp.has_value() && resp->status_code == ctx.baseline_status_code &&
                     resp->status_code >= 200 && resp->status_code < 400)
                 {
+                    diag::log_tagged_fmt("mod_jwt_scan", "jwt_run FINDING kid-path-traversal kid=%s", j.kid.c_str());
                     auto iss = make_issue("jwt.kid-path-traversal",
                                           "JWT kid path-traversal accepted",
                                           severity_t::critical, confidence_t::firm, ip, p, *resp, ctx,
@@ -289,6 +318,7 @@ void jwt_run(const insertion_point_t& ip, const module_context_t& ctx, const sen
             }
         }
     }
+    diag::log_tagged_fmt("mod_jwt_scan", "jwt_run complete ip=%s:%s jwts_processed=%zu", ip.kind.c_str(), ip.name.c_str(), jwts.size());
 }
 
 bool register_self()

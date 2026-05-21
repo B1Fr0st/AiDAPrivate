@@ -86,6 +86,7 @@ void render(float pos_x, float pos_y, float width, float height,
         aida::burp::jwt_lab::initialize();
         if (st.forge_alg_buf[0] == '\0') std::strncpy(st.forge_alg_buf, "HS256", sizeof(st.forge_alg_buf) - 1);
         st.initialized = true;
+        diag::log_tagged("jwt_v", "render_first_init");
     }
 
     ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
@@ -130,6 +131,7 @@ void render(float pos_x, float pos_y, float width, float height,
         st.decoded_alg.clear();
         st.decoded_kid.clear();
         st.decoded_valid = false;
+        diag::log_tagged("jwt_v", "token_cleared");
     }
 
     ImGui::Spacing();
@@ -159,6 +161,7 @@ void render(float pos_x, float pos_y, float width, float height,
     if (aida::ui::button("Verify HMAC", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
         const bool ok = aida::burp::jwt_lab::verify_hmac(st.token_buf, st.secret_buf);
         st.verify_result = ok ? std::string("HMAC verified") : std::string("HMAC failed");
+        diag::log_tagged_fmt("jwt_v", "verify_hmac ok=%d", ok ? 1 : 0);
     }
     if (!st.verify_result.empty()) {
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
@@ -171,11 +174,13 @@ void render(float pos_x, float pos_y, float width, float height,
     if (aida::ui::button("Verify RSA", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
         const bool ok = aida::burp::jwt_lab::verify_rsa(st.token_buf, st.rsa_pub_buf);
         st.verify_result = ok ? std::string("RSA verified") : std::string("RSA failed");
+        diag::log_tagged_fmt("jwt_v", "verify_rsa ok=%d", ok ? 1 : 0);
     }
     ImGui::SameLine();
     if (aida::ui::button("Verify ECDSA", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
         const bool ok = aida::burp::jwt_lab::verify_ecdsa(st.token_buf, st.rsa_pub_buf);
         st.verify_result = ok ? std::string("ECDSA verified") : std::string("ECDSA failed");
+        diag::log_tagged_fmt("jwt_v", "verify_ecdsa ok=%d", ok ? 1 : 0);
     }
 
     ImGui::EndChild();
@@ -190,6 +195,7 @@ void render(float pos_x, float pos_y, float width, float height,
         if (aida::ui::button(tab_labels[i],
             st.active_inner_tab == i ? aida::ui::button_kind_t::primary : aida::ui::button_kind_t::ghost,
             aida::ui::size_t_::sm)) {
+            diag::log_tagged_fmt("jwt_v", "tab_switch tab=%s", tab_labels[i]);
             st.active_inner_tab = i;
         }
         ImGui::PopID();
@@ -235,7 +241,10 @@ void render(float pos_x, float pos_y, float width, float height,
         }
         ImGui::SameLine();
         if (aida::ui::button("Copy to token", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
-            if (!st.forge_output.empty() && st.forge_output[0] != '(') copy_to_buf(st.token_buf, sizeof(st.token_buf), st.forge_output);
+            if (!st.forge_output.empty() && st.forge_output[0] != '(') {
+                copy_to_buf(st.token_buf, sizeof(st.token_buf), st.forge_output);
+                diag::log_tagged("jwt_v", "forged_token_copied_to_input");
+            }
         }
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)), "Forged token");
         ImGui::InputTextMultiline("##jwt_forge_out",
@@ -265,7 +274,10 @@ void render(float pos_x, float pos_y, float width, float height,
         }
         ImGui::SameLine();
         if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
-            if (st.active_crack_id != 0) aida::burp::jwt_lab::crack_stop(st.active_crack_id);
+            if (st.active_crack_id != 0) {
+                diag::log_tagged_fmt("jwt_v", "crack_stop id=%llu", static_cast<unsigned long long>(st.active_crack_id));
+                aida::burp::jwt_lab::crack_stop(st.active_crack_id);
+            }
         }
 
         const auto status = aida::burp::jwt_lab::crack_status(st.active_crack_id);
@@ -273,6 +285,12 @@ void render(float pos_x, float pos_y, float width, float height,
             "id=%llu  attempts=%zu  running=%s",
             static_cast<unsigned long long>(status.id), status.attempts, status.running ? "yes" : "no");
         if (!status.secret_found.empty()) {
+            static std::string s_last_found;
+            if (status.secret_found != s_last_found) {
+                s_last_found = status.secret_found;
+                diag::log_tagged_fmt("jwt_v", "crack_secret_found secret='%s' id=%llu",
+                    status.secret_found.c_str(), static_cast<unsigned long long>(st.active_crack_id));
+            }
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.success, alpha)),
                 "Secret: %s", status.secret_found.c_str());
         }
@@ -299,6 +317,7 @@ void render(float pos_x, float pos_y, float width, float height,
         }
         ImGui::SameLine();
         if (aida::ui::button("Pack: All", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+            diag::log_tagged("jwt_v", "attack_pack_all");
             st.attack_results.clear();
             const std::string token(st.token_buf);
             auto add_set = [](std::vector<std::string>& dst, const std::vector<std::string>& src) {
@@ -318,6 +337,7 @@ void render(float pos_x, float pos_y, float width, float height,
             ImGui::PushID(static_cast<int>(i));
             if (aida::ui::button("Use", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
                 copy_to_buf(st.token_buf, sizeof(st.token_buf), st.attack_results[i]);
+                diag::log_tagged_fmt("jwt_v", "attack_candidate_used idx=%zu", i);
             }
             ImGui::SameLine();
             std::string preview = st.attack_results[i];

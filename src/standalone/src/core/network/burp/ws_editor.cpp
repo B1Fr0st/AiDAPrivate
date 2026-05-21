@@ -532,45 +532,72 @@ std::shared_ptr<connection_t> find_conn(uint64_t id)
 
 }
 
-bool initialize() { return s_wsa_guard.ok; }
+bool initialize() {
+    diag::log_tagged_fmt("ws_edit", "initialize entry wsa_ok=%d", static_cast<int>(s_wsa_guard.ok));
+    return s_wsa_guard.ok;
+}
 
 void shutdown()
 {
+    diag::log_tagged_fmt("ws_edit", "shutdown entry");
     disconnect_all();
+    diag::log_tagged_fmt("ws_edit", "shutdown done");
 }
 
 uint64_t connect(const ws_connection_config_t& cfg)
 {
-    if (!s_wsa_guard.ok) { set_err("ws_editor: WSAStartup failed"); return 0; }
+    diag::log_tagged_fmt("ws_edit", "connect entry scheme=%s host=%s port=%u path=%s tls_verify=%d",
+        cfg.scheme.c_str(), cfg.host.c_str(), static_cast<unsigned>(cfg.port),
+        cfg.path.c_str(), static_cast<int>(cfg.verify_tls));
+    if (!s_wsa_guard.ok) {
+        diag::log_tagged_fmt("ws_edit", "connect wsa_not_initialized");
+        set_err("ws_editor: WSAStartup failed");
+        return 0;
+    }
     ensure_openssl();
     if (cfg.host.empty() || cfg.port == 0) {
+        diag::log_tagged_fmt("ws_edit", "connect empty_host_or_port host=%s port=%u",
+            cfg.host.c_str(), static_cast<unsigned>(cfg.port));
         set_err("ws_editor: empty host or port");
         return 0;
     }
     bool tls = (cfg.scheme == "wss");
+    diag::log_tagged_fmt("ws_edit", "connect tls=%d host=%s port=%u", static_cast<int>(tls),
+        cfg.host.c_str(), static_cast<unsigned>(cfg.port));
 
     sockaddr_storage sa{}; int sa_len = 0;
+    diag::log_tagged_fmt("ws_edit", "connect resolving host=%s port=%u", cfg.host.c_str(), static_cast<unsigned>(cfg.port));
     if (!resolve_target(cfg.host, cfg.port, sa, sa_len)) {
+        diag::log_tagged_fmt("ws_edit", "connect dns_failed host=%s", cfg.host.c_str());
         set_err("ws_editor: DNS failed");
         return 0;
     }
     SOCKET s = socket(sa.ss_family, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) { set_err("ws_editor: socket() failed"); return 0; }
+    if (s == INVALID_SOCKET) {
+        diag::log_tagged_fmt("ws_edit", "connect socket_create_failed");
+        set_err("ws_editor: socket() failed");
+        return 0;
+    }
     BOOL nodelay = TRUE;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
 
+    diag::log_tagged_fmt("ws_edit", "connect tcp_connecting timeout_ms=%d", cfg.connect_timeout_ms);
     if (!tcp_connect_with_timeout(s, reinterpret_cast<const sockaddr*>(&sa), sa_len, cfg.connect_timeout_ms)) {
         ::shutdown(s, SD_BOTH); closesocket(s);
+        diag::log_tagged_fmt("ws_edit", "connect tcp_failed host=%s port=%u", cfg.host.c_str(), static_cast<unsigned>(cfg.port));
         set_err("ws_editor: TCP connect failed");
         return 0;
     }
+    diag::log_tagged_fmt("ws_edit", "connect tcp_ok host=%s port=%u", cfg.host.c_str(), static_cast<unsigned>(cfg.port));
 
     SSL_CTX* ctx = nullptr;
     SSL* ssl = nullptr;
     if (tls) {
+        diag::log_tagged_fmt("ws_edit", "connect tls_handshake host=%s verify=%d", cfg.host.c_str(), static_cast<int>(cfg.verify_tls));
         ctx = SSL_CTX_new(TLS_client_method());
         if (!ctx) {
             ::shutdown(s, SD_BOTH); closesocket(s);
+            diag::log_tagged_fmt("ws_edit", "connect ssl_ctx_new_failed");
             set_err("ws_editor: SSL_CTX_new failed");
             return 0;
         }
@@ -582,6 +609,7 @@ uint64_t connect(const ws_connection_config_t& cfg)
         if (!ssl) {
             SSL_CTX_free(ctx);
             ::shutdown(s, SD_BOTH); closesocket(s);
+            diag::log_tagged_fmt("ws_edit", "connect ssl_new_failed");
             set_err("ws_editor: SSL_new failed");
             return 0;
         }
@@ -590,12 +618,16 @@ uint64_t connect(const ws_connection_config_t& cfg)
         uint64_t deadline = now_steady_ms() + static_cast<uint64_t>(cfg.connect_timeout_ms);
         while (true) {
             int r = SSL_connect(ssl);
-            if (r == 1) break;
+            if (r == 1) {
+                diag::log_tagged_fmt("ws_edit", "connect tls_ok host=%s", cfg.host.c_str());
+                break;
+            }
             int err = SSL_get_error(ssl, r);
             if (err == SSL_ERROR_WANT_READ) {
                 if (!wait_socket(s, static_cast<int>(deadline - now_steady_ms()), false)) {
                     SSL_free(ssl); SSL_CTX_free(ctx);
                     ::shutdown(s, SD_BOTH); closesocket(s);
+                    diag::log_tagged_fmt("ws_edit", "connect tls_timeout_read host=%s", cfg.host.c_str());
                     set_err("ws_editor: TLS handshake timeout (read)");
                     return 0;
                 }
@@ -603,12 +635,14 @@ uint64_t connect(const ws_connection_config_t& cfg)
                 if (!wait_socket(s, static_cast<int>(deadline - now_steady_ms()), true)) {
                     SSL_free(ssl); SSL_CTX_free(ctx);
                     ::shutdown(s, SD_BOTH); closesocket(s);
+                    diag::log_tagged_fmt("ws_edit", "connect tls_timeout_write host=%s", cfg.host.c_str());
                     set_err("ws_editor: TLS handshake timeout (write)");
                     return 0;
                 }
             } else {
                 SSL_free(ssl); SSL_CTX_free(ctx);
                 ::shutdown(s, SD_BOTH); closesocket(s);
+                diag::log_tagged_fmt("ws_edit", "connect tls_handshake_failed ssl_err=%d host=%s", err, cfg.host.c_str());
                 set_err("ws_editor: TLS handshake failed");
                 return 0;
             }
@@ -621,9 +655,11 @@ uint64_t connect(const ws_connection_config_t& cfg)
     cptr->ssl_ctx   = ctx;
     cptr->ssl       = ssl;
     cptr->opened_ms = now_ms();
+    diag::log_tagged_fmt("ws_edit", "connect ws_handshake host=%s path=%s", cfg.host.c_str(), cfg.path.c_str());
     if (!perform_handshake(*cptr)) {
         std::string e = get_conn_err(*cptr);
         cleanup_connection(*cptr);
+        diag::log_tagged_fmt("ws_edit", "connect ws_handshake_failed err=%s", e.c_str());
         set_err(e.empty() ? std::string("ws_editor: handshake failed") : e);
         return 0;
     }
@@ -638,15 +674,26 @@ uint64_t connect(const ws_connection_config_t& cfg)
     cptr->recv_thread = std::thread([cptr]() { receive_loop(cptr); });
     diag::log_tagged_fmt("burp.ws_editor", "connected id=%llu host=%s:%u path=%s",
         static_cast<unsigned long long>(cptr->id), cptr->cfg.host.c_str(), cptr->cfg.port, cptr->cfg.path.c_str());
+    diag::log_tagged_fmt("ws_edit", "connect ok id=%llu host=%s",
+        static_cast<unsigned long long>(cptr->id), cfg.host.c_str());
     return cptr->id;
 }
 
 bool disconnect(uint64_t conn_id)
 {
+    diag::log_tagged_fmt("ws_edit", "disconnect entry conn_id=%llu",
+        static_cast<unsigned long long>(conn_id));
     auto cptr = find_conn(conn_id);
-    if (!cptr) { set_err("ws_editor.disconnect: not found"); return false; }
+    if (!cptr) {
+        diag::log_tagged_fmt("ws_edit", "disconnect not_found conn_id=%llu",
+            static_cast<unsigned long long>(conn_id));
+        set_err("ws_editor.disconnect: not found");
+        return false;
+    }
     cptr->running.store(false);
     if (cptr->connected.load()) {
+        diag::log_tagged_fmt("ws_edit", "disconnect sending_close_frame conn_id=%llu",
+            static_cast<unsigned long long>(conn_id));
         std::vector<uint8_t> close_payload = { 0x03, 0xE8 };
         send_frame_internal(*cptr, 0x8, true, true, close_payload);
     }
@@ -655,11 +702,14 @@ bool disconnect(uint64_t conn_id)
     auto& r = registry();
     std::lock_guard<std::mutex> lk(r.mtx);
     r.by_id.erase(conn_id);
+    diag::log_tagged_fmt("ws_edit", "disconnect ok conn_id=%llu remaining=%zu",
+        static_cast<unsigned long long>(conn_id), r.by_id.size());
     return true;
 }
 
 bool disconnect_all()
 {
+    diag::log_tagged_fmt("ws_edit", "disconnect_all entry");
     std::vector<uint64_t> ids;
     {
         auto& r = registry();
@@ -667,12 +717,15 @@ bool disconnect_all()
         ids.reserve(r.by_id.size());
         for (const auto& kv : r.by_id) ids.push_back(kv.first);
     }
+    diag::log_tagged_fmt("ws_edit", "disconnect_all disconnecting count=%zu", ids.size());
     for (uint64_t id : ids) disconnect(id);
+    diag::log_tagged_fmt("ws_edit", "disconnect_all done");
     return true;
 }
 
 std::vector<ws_status_t> list_connections()
 {
+    diag::log_tagged_fmt("ws_edit", "list_connections entry");
     std::vector<ws_status_t> out;
     auto& r = registry();
     std::lock_guard<std::mutex> lk(r.mtx);
@@ -687,13 +740,20 @@ std::vector<ws_status_t> list_connections()
         st.last_error      = get_conn_err(*kv.second);
         out.push_back(std::move(st));
     }
+    diag::log_tagged_fmt("ws_edit", "list_connections result count=%zu", out.size());
     return out;
 }
 
 bool get_status(uint64_t conn_id, ws_status_t& out)
 {
+    diag::log_tagged_fmt("ws_edit", "get_status entry conn_id=%llu",
+        static_cast<unsigned long long>(conn_id));
     auto cptr = find_conn(conn_id);
-    if (!cptr) return false;
+    if (!cptr) {
+        diag::log_tagged_fmt("ws_edit", "get_status not_found conn_id=%llu",
+            static_cast<unsigned long long>(conn_id));
+        return false;
+    }
     out.id              = cptr->id;
     out.connected       = cptr->connected.load();
     out.frames_sent     = cptr->frames_sent.load();
@@ -701,89 +761,183 @@ bool get_status(uint64_t conn_id, ws_status_t& out)
     out.opened_ms       = cptr->opened_ms;
     out.url             = cptr->cfg.scheme + "://" + cptr->cfg.host + ":" + std::to_string(cptr->cfg.port) + cptr->cfg.path;
     out.last_error      = get_conn_err(*cptr);
+    diag::log_tagged_fmt("ws_edit", "get_status conn_id=%llu connected=%d sent=%zu recv=%zu",
+        static_cast<unsigned long long>(conn_id), static_cast<int>(out.connected),
+        out.frames_sent, out.frames_received);
     return true;
 }
 
 bool send_text(uint64_t conn_id, const std::string& msg)
 {
+    diag::log_tagged_fmt("ws_edit", "send_text conn_id=%llu msg_len=%zu",
+        static_cast<unsigned long long>(conn_id), msg.size());
     auto cptr = find_conn(conn_id);
-    if (!cptr) { set_err("ws_editor.send_text: not found"); return false; }
+    if (!cptr) {
+        diag::log_tagged_fmt("ws_edit", "send_text not_found conn_id=%llu",
+            static_cast<unsigned long long>(conn_id));
+        set_err("ws_editor.send_text: not found");
+        return false;
+    }
     std::vector<uint8_t> payload(msg.begin(), msg.end());
-    return send_frame_internal(*cptr, 0x1, true, true, payload);
+    bool ok = send_frame_internal(*cptr, 0x1, true, true, payload);
+    diag::log_tagged_fmt("ws_edit", "send_text result=%d conn_id=%llu",
+        static_cast<int>(ok), static_cast<unsigned long long>(conn_id));
+    return ok;
 }
 
 bool send_binary(uint64_t conn_id, const std::vector<uint8_t>& data)
 {
+    diag::log_tagged_fmt("ws_edit", "send_binary conn_id=%llu bytes=%zu",
+        static_cast<unsigned long long>(conn_id), data.size());
     auto cptr = find_conn(conn_id);
-    if (!cptr) { set_err("ws_editor.send_binary: not found"); return false; }
-    return send_frame_internal(*cptr, 0x2, true, true, data);
+    if (!cptr) {
+        diag::log_tagged_fmt("ws_edit", "send_binary not_found conn_id=%llu",
+            static_cast<unsigned long long>(conn_id));
+        set_err("ws_editor.send_binary: not found");
+        return false;
+    }
+    bool ok = send_frame_internal(*cptr, 0x2, true, true, data);
+    diag::log_tagged_fmt("ws_edit", "send_binary result=%d conn_id=%llu",
+        static_cast<int>(ok), static_cast<unsigned long long>(conn_id));
+    return ok;
 }
 
 bool send_raw_frame(uint64_t conn_id, uint8_t opcode, bool fin, bool masked, const std::vector<uint8_t>& payload)
 {
+    diag::log_tagged_fmt("ws_edit", "send_raw_frame conn_id=%llu opcode=0x%02x fin=%d masked=%d payload=%zu",
+        static_cast<unsigned long long>(conn_id), static_cast<unsigned>(opcode),
+        static_cast<int>(fin), static_cast<int>(masked), payload.size());
     auto cptr = find_conn(conn_id);
-    if (!cptr) { set_err("ws_editor.send_raw_frame: not found"); return false; }
-    return send_frame_internal(*cptr, opcode, fin, masked, payload);
+    if (!cptr) {
+        diag::log_tagged_fmt("ws_edit", "send_raw_frame not_found conn_id=%llu",
+            static_cast<unsigned long long>(conn_id));
+        set_err("ws_editor.send_raw_frame: not found");
+        return false;
+    }
+    bool ok = send_frame_internal(*cptr, opcode, fin, masked, payload);
+    diag::log_tagged_fmt("ws_edit", "send_raw_frame result=%d conn_id=%llu",
+        static_cast<int>(ok), static_cast<unsigned long long>(conn_id));
+    return ok;
 }
 
 bool send_ping(uint64_t conn_id, const std::vector<uint8_t>& payload)
 {
+    diag::log_tagged_fmt("ws_edit", "send_ping conn_id=%llu payload=%zu",
+        static_cast<unsigned long long>(conn_id), payload.size());
     auto cptr = find_conn(conn_id);
-    if (!cptr) { set_err("ws_editor.send_ping: not found"); return false; }
-    return send_frame_internal(*cptr, 0x9, true, true, payload);
+    if (!cptr) {
+        diag::log_tagged_fmt("ws_edit", "send_ping not_found conn_id=%llu",
+            static_cast<unsigned long long>(conn_id));
+        set_err("ws_editor.send_ping: not found");
+        return false;
+    }
+    bool ok = send_frame_internal(*cptr, 0x9, true, true, payload);
+    diag::log_tagged_fmt("ws_edit", "send_ping result=%d conn_id=%llu",
+        static_cast<int>(ok), static_cast<unsigned long long>(conn_id));
+    return ok;
 }
 
 bool send_pong(uint64_t conn_id, const std::vector<uint8_t>& payload)
 {
+    diag::log_tagged_fmt("ws_edit", "send_pong conn_id=%llu payload=%zu",
+        static_cast<unsigned long long>(conn_id), payload.size());
     auto cptr = find_conn(conn_id);
-    if (!cptr) { set_err("ws_editor.send_pong: not found"); return false; }
-    return send_frame_internal(*cptr, 0xA, true, true, payload);
+    if (!cptr) {
+        diag::log_tagged_fmt("ws_edit", "send_pong not_found conn_id=%llu",
+            static_cast<unsigned long long>(conn_id));
+        set_err("ws_editor.send_pong: not found");
+        return false;
+    }
+    bool ok = send_frame_internal(*cptr, 0xA, true, true, payload);
+    diag::log_tagged_fmt("ws_edit", "send_pong result=%d conn_id=%llu",
+        static_cast<int>(ok), static_cast<unsigned long long>(conn_id));
+    return ok;
 }
 
 bool send_close(uint64_t conn_id, uint16_t code, const std::string& reason)
 {
+    diag::log_tagged_fmt("ws_edit", "send_close conn_id=%llu code=%u reason=%s",
+        static_cast<unsigned long long>(conn_id), static_cast<unsigned>(code), reason.c_str());
     auto cptr = find_conn(conn_id);
-    if (!cptr) { set_err("ws_editor.send_close: not found"); return false; }
+    if (!cptr) {
+        diag::log_tagged_fmt("ws_edit", "send_close not_found conn_id=%llu",
+            static_cast<unsigned long long>(conn_id));
+        set_err("ws_editor.send_close: not found");
+        return false;
+    }
     std::vector<uint8_t> payload;
     payload.push_back(static_cast<uint8_t>((code >> 8) & 0xFF));
     payload.push_back(static_cast<uint8_t>(code & 0xFF));
     for (char ch : reason) payload.push_back(static_cast<uint8_t>(ch));
-    return send_frame_internal(*cptr, 0x8, true, true, payload);
+    bool ok = send_frame_internal(*cptr, 0x8, true, true, payload);
+    diag::log_tagged_fmt("ws_edit", "send_close result=%d conn_id=%llu",
+        static_cast<int>(ok), static_cast<unsigned long long>(conn_id));
+    return ok;
 }
 
 std::vector<ws_frame_log_t> frames(uint64_t conn_id, size_t start, size_t max)
 {
+    diag::log_tagged_fmt("ws_edit", "frames conn_id=%llu start=%zu max=%zu",
+        static_cast<unsigned long long>(conn_id), start, max);
     auto cptr = find_conn(conn_id);
-    if (!cptr) return {};
+    if (!cptr) {
+        diag::log_tagged_fmt("ws_edit", "frames not_found conn_id=%llu",
+            static_cast<unsigned long long>(conn_id));
+        return {};
+    }
     std::lock_guard<std::mutex> lk(cptr->frames_mtx);
     std::vector<ws_frame_log_t> out;
-    if (start >= cptr->frames.size()) return out;
+    if (start >= cptr->frames.size()) {
+        diag::log_tagged_fmt("ws_edit", "frames start_out_of_range start=%zu total=%zu",
+            start, cptr->frames.size());
+        return out;
+    }
     size_t count = std::min(max == 0 ? cptr->frames.size() : max, cptr->frames.size() - start);
     out.reserve(count);
     for (size_t i = 0; i < count; ++i) out.push_back(cptr->frames[start + i]);
+    diag::log_tagged_fmt("ws_edit", "frames result count=%zu conn_id=%llu",
+        out.size(), static_cast<unsigned long long>(conn_id));
     return out;
 }
 
 size_t frame_count(uint64_t conn_id)
 {
     auto cptr = find_conn(conn_id);
-    if (!cptr) return 0;
+    if (!cptr) {
+        diag::log_tagged_fmt("ws_edit", "frame_count not_found conn_id=%llu",
+            static_cast<unsigned long long>(conn_id));
+        return 0;
+    }
     std::lock_guard<std::mutex> lk(cptr->frames_mtx);
-    return cptr->frames.size();
+    size_t n = cptr->frames.size();
+    diag::log_tagged_fmt("ws_edit", "frame_count conn_id=%llu count=%zu",
+        static_cast<unsigned long long>(conn_id), n);
+    return n;
 }
 
 void clear_frames(uint64_t conn_id)
 {
+    diag::log_tagged_fmt("ws_edit", "clear_frames conn_id=%llu",
+        static_cast<unsigned long long>(conn_id));
     auto cptr = find_conn(conn_id);
-    if (!cptr) return;
+    if (!cptr) {
+        diag::log_tagged_fmt("ws_edit", "clear_frames not_found conn_id=%llu",
+            static_cast<unsigned long long>(conn_id));
+        return;
+    }
     std::lock_guard<std::mutex> lk(cptr->frames_mtx);
+    size_t n = cptr->frames.size();
     cptr->frames.clear();
+    diag::log_tagged_fmt("ws_edit", "clear_frames done conn_id=%llu cleared=%zu",
+        static_cast<unsigned long long>(conn_id), n);
 }
 
 std::string last_error()
 {
     std::lock_guard<std::mutex> lk(err_mtx());
-    return err_slot();
+    std::string e = err_slot();
+    diag::log_tagged_fmt("ws_edit", "last_error queried val=%s", e.c_str());
+    return e;
 }
 
 }

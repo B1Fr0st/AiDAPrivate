@@ -14,6 +14,7 @@
 #include "hex_view.hpp"
 #include "standalone_driver.hpp"
 #include "../helpers/globals.h"
+#include "../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -116,12 +117,21 @@ static const char* xref_type_label(int t)
 static tool_result_t handle_jump_to_address(const json& params)
 {
     uint64_t addr = 0;
-    if (!parse_address_param(params, "address", addr))
+    if (!parse_address_param(params, "address", addr)) {
+        diag::log_tagged_fmt("disasm_tools", "jump_to_address_bad_params");
         return tool_result_t::error("'address' is required (hex string or integer).");
+    }
+    diag::log_tagged_fmt("disasm_tools", "jump_to_address addr=0x%llX",
+        static_cast<unsigned long long>(addr));
 
     int idx = find_instr_index(g_disasm.file, addr);
-    if (idx < 0)
+    if (idx < 0) {
+        diag::log_tagged_fmt("disasm_tools", "jump_to_address_not_found addr=0x%llX instrs=%zu",
+            static_cast<unsigned long long>(addr), g_disasm.file.instrs.size());
         return tool_result_t::error("Address not found in current disassembly listing.");
+    }
+    diag::log_tagged_fmt("disasm_tools", "jump_to_address_resolved addr=0x%llX row=%d",
+        static_cast<unsigned long long>(addr), idx);
 
     globals::ui::active_center_view = center_view_t::disassembly;
     disasm_view::goto_address(addr, g_disasm);
@@ -136,14 +146,24 @@ static tool_result_t handle_jump_to_address(const json& params)
 static tool_result_t handle_get_instruction(const json& params)
 {
     uint64_t addr = 0;
-    if (!parse_address_param(params, "address", addr))
+    if (!parse_address_param(params, "address", addr)) {
+        diag::log_tagged_fmt("disasm_tools", "get_instruction_bad_params");
         return tool_result_t::error("'address' is required.");
+    }
+    diag::log_tagged_fmt("disasm_tools", "get_instruction addr=0x%llX",
+        static_cast<unsigned long long>(addr));
 
     int idx = find_instr_index(g_disasm.file, addr);
-    if (idx < 0)
+    if (idx < 0) {
+        diag::log_tagged_fmt("disasm_tools", "get_instruction_not_found addr=0x%llX",
+            static_cast<unsigned long long>(addr));
         return tool_result_t::error("Address not found in disassembly listing.");
+    }
 
     const AsmInstr& ins = g_disasm.file.instrs[static_cast<size_t>(idx)];
+    diag::log_tagged_fmt("disasm_tools", "get_instruction_result addr=0x%llX mnem=%s len=%d is_call=%d is_ret=%d",
+        static_cast<unsigned long long>(ins.addr), ins.mnem, ins.len,
+        ins.is_call ? 1 : 0, ins.is_ret ? 1 : 0);
 
     json result;
     result["address"]  = hex_u64(ins.addr);
@@ -162,8 +182,12 @@ static tool_result_t handle_get_instruction(const json& params)
 static tool_result_t handle_get_function_bounds(const json& params)
 {
     uint64_t addr = 0;
-    if (!parse_address_param(params, "address", addr))
+    if (!parse_address_param(params, "address", addr)) {
+        diag::log_tagged_fmt("disasm_tools", "get_function_bounds_bad_params");
         return tool_result_t::error("'address' is required.");
+    }
+    diag::log_tagged_fmt("disasm_tools", "get_function_bounds addr=0x%llX",
+        static_cast<unsigned long long>(addr));
 
     auto& c = function_index::detail::cache();
     uint64_t start = 0;
@@ -199,6 +223,9 @@ static tool_result_t handle_get_function_bounds(const json& params)
 
     if (name.empty()) name = function_index::synthetic_name(start);
 
+    diag::log_tagged_fmt("disasm_tools", "get_function_bounds_result addr=0x%llX start=0x%llX end=0x%llX name=%s",
+        static_cast<unsigned long long>(addr), static_cast<unsigned long long>(start),
+        static_cast<unsigned long long>(end), name.c_str());
     json result;
     result["start"]   = hex_u64(start);
     result["end"]     = hex_u64(end);
@@ -211,8 +238,12 @@ static tool_result_t handle_get_function_bounds(const json& params)
 static tool_result_t handle_get_function_disassembly(const json& params)
 {
     uint64_t addr = 0;
-    if (!parse_address_param(params, "address", addr))
+    if (!parse_address_param(params, "address", addr)) {
+        diag::log_tagged_fmt("disasm_tools", "get_function_disasm_bad_params");
         return tool_result_t::error("'address' is required.");
+    }
+    diag::log_tagged_fmt("disasm_tools", "get_function_disasm addr=0x%llX",
+        static_cast<unsigned long long>(addr));
 
     int max_instrs = 256;
     if (params.contains("max_instrs") && params["max_instrs"].is_number_integer()) {
@@ -266,6 +297,9 @@ static tool_result_t handle_get_function_disassembly(const json& params)
         ++emitted;
     }
 
+    diag::log_tagged_fmt("disasm_tools", "get_function_disasm_result start=0x%llX end=0x%llX instr_count=%d truncated=%d",
+        static_cast<unsigned long long>(start), static_cast<unsigned long long>(end),
+        emitted, (emitted >= max_instrs) ? 1 : 0);
     json result;
     result["function_start"] = hex_u64(start);
     result["function_end"]   = hex_u64(end);
@@ -281,6 +315,7 @@ static tool_result_t handle_list_functions(const json& params)
     std::string filter;
     if (params.contains("filter") && params["filter"].is_string())
         filter = lower_copy(params["filter"].get<std::string>());
+    diag::log_tagged_fmt("disasm_tools", "list_functions filter=%s", filter.c_str());
 
     size_t offset = 0;
     if (params.contains("offset") && params["offset"].is_number_unsigned())
@@ -349,6 +384,8 @@ static tool_result_t handle_list_functions(const json& params)
         ++emitted;
     }
 
+    diag::log_tagged_fmt("disasm_tools", "list_functions_result total=%zu returned=%zu filter=%s",
+        total_matching, emitted, filter.c_str());
     json result;
     result["total"]    = total_matching;
     result["offset"]   = offset;
@@ -360,8 +397,12 @@ static tool_result_t handle_list_functions(const json& params)
 static tool_result_t handle_get_xrefs_to(const json& params)
 {
     uint64_t addr = 0;
-    if (!parse_address_param(params, "address", addr))
+    if (!parse_address_param(params, "address", addr)) {
+        diag::log_tagged_fmt("disasm_tools", "get_xrefs_to_bad_params");
         return tool_result_t::error("'address' is required.");
+    }
+    diag::log_tagged_fmt("disasm_tools", "get_xrefs_to addr=0x%llX",
+        static_cast<unsigned long long>(addr));
 
     json arr = json::array();
     {
@@ -383,6 +424,8 @@ static tool_result_t handle_get_xrefs_to(const json& params)
         }
     }
 
+    diag::log_tagged_fmt("disasm_tools", "get_xrefs_to_result addr=0x%llX count=%zu",
+        static_cast<unsigned long long>(addr), arr.size());
     json result;
     result["address"] = hex_u64(addr);
     result["count"]   = arr.size();
@@ -396,8 +439,12 @@ static tool_result_t handle_get_xrefs_to(const json& params)
 static tool_result_t handle_get_xrefs_from(const json& params)
 {
     uint64_t addr = 0;
-    if (!parse_address_param(params, "address", addr))
+    if (!parse_address_param(params, "address", addr)) {
+        diag::log_tagged_fmt("disasm_tools", "get_xrefs_from_bad_params");
         return tool_result_t::error("'address' is required.");
+    }
+    diag::log_tagged_fmt("disasm_tools", "get_xrefs_from addr=0x%llX",
+        static_cast<unsigned long long>(addr));
 
     json arr = json::array();
     {
@@ -419,6 +466,8 @@ static tool_result_t handle_get_xrefs_from(const json& params)
         }
     }
 
+    diag::log_tagged_fmt("disasm_tools", "get_xrefs_from_result addr=0x%llX count=%zu",
+        static_cast<unsigned long long>(addr), arr.size());
     json result;
     result["address"] = hex_u64(addr);
     result["count"]   = arr.size();
@@ -431,11 +480,16 @@ static tool_result_t handle_get_xrefs_from(const json& params)
 static tool_result_t handle_set_comment(const json& params)
 {
     uint64_t addr = 0;
-    if (!parse_address_param(params, "address", addr))
+    if (!parse_address_param(params, "address", addr)) {
+        diag::log_tagged_fmt("disasm_tools", "set_comment_bad_params");
         return tool_result_t::error("'address' is required.");
+    }
     std::string text;
     if (params.contains("comment") && params["comment"].is_string())
         text = params["comment"].get<std::string>();
+    diag::log_tagged_fmt("disasm_tools", "set_comment addr=0x%llX action=%s text=%s",
+        static_cast<unsigned long long>(addr),
+        text.empty() ? "delete" : "set", text.c_str());
     comment_store::set(addr, text);
     json result;
     result["address"] = hex_u64(addr);
@@ -446,22 +500,32 @@ static tool_result_t handle_set_comment(const json& params)
 static tool_result_t handle_get_comment(const json& params)
 {
     uint64_t addr = 0;
-    if (!parse_address_param(params, "address", addr))
+    if (!parse_address_param(params, "address", addr)) {
+        diag::log_tagged_fmt("disasm_tools", "get_comment_bad_params");
         return tool_result_t::error("'address' is required.");
+    }
+    std::string cmt = comment_store::get(addr);
+    diag::log_tagged_fmt("disasm_tools", "get_comment addr=0x%llX has_comment=%d",
+        static_cast<unsigned long long>(addr), cmt.empty() ? 0 : 1);
     json result;
     result["address"] = hex_u64(addr);
-    result["comment"] = comment_store::get(addr);
+    result["comment"] = cmt;
     return tool_result_t::ok(result);
 }
 
 static tool_result_t handle_rename_function(const json& params)
 {
     uint64_t addr = 0;
-    if (!parse_address_param(params, "address", addr))
+    if (!parse_address_param(params, "address", addr)) {
+        diag::log_tagged_fmt("disasm_tools", "rename_function_bad_params");
         return tool_result_t::error("'address' is required.");
+    }
     std::string new_name;
     if (params.contains("new_name") && params["new_name"].is_string())
         new_name = params["new_name"].get<std::string>();
+    diag::log_tagged_fmt("disasm_tools", "rename_function addr=0x%llX new_name=%s action=%s",
+        static_cast<unsigned long long>(addr), new_name.c_str(),
+        new_name.empty() ? "clear" : "rename");
     rename_store::set(addr, new_name);
     disasm_view::bump_format_generation();
     json result;
@@ -473,6 +537,9 @@ static tool_result_t handle_rename_function(const json& params)
 
 static tool_result_t handle_get_section_info(const json&)
 {
+    diag::log_tagged_fmt("disasm_tools", "get_section_info image_base=0x%llX sections=%zu filename=%s",
+        static_cast<unsigned long long>(g_disasm.file.image_base),
+        g_disasm.file.sections.size(), g_disasm.file.filename.c_str());
     json arr = json::array();
     for (const PESection& sec : g_disasm.file.sections) {
         json o;
@@ -535,13 +602,20 @@ static bool parse_hex_pattern(const std::string& in, std::vector<uint8_t>& bytes
 
 static tool_result_t handle_search_bytes(const json& params)
 {
-    if (!params.contains("pattern") || !params["pattern"].is_string())
+    if (!params.contains("pattern") || !params["pattern"].is_string()) {
+        diag::log_tagged_fmt("disasm_tools", "search_bytes_bad_params");
         return tool_result_t::error("'pattern' is required (hex string, supports '??' wildcards).");
+    }
 
     std::vector<uint8_t> needle;
     std::vector<bool>    wildmask;
-    if (!parse_hex_pattern(params["pattern"].get<std::string>(), needle, wildmask))
+    if (!parse_hex_pattern(params["pattern"].get<std::string>(), needle, wildmask)) {
+        diag::log_tagged_fmt("disasm_tools", "search_bytes_invalid_pattern pattern=%s",
+            params["pattern"].get<std::string>().c_str());
         return tool_result_t::error("Invalid hex pattern.");
+    }
+    diag::log_tagged_fmt("disasm_tools", "search_bytes pattern=%s needle_len=%zu",
+        params["pattern"].get<std::string>().c_str(), needle.size());
 
     size_t max_hits = 256;
     if (params.contains("max_hits") && params["max_hits"].is_number_unsigned()) {
@@ -570,6 +644,8 @@ static tool_result_t handle_search_bytes(const json& params)
         }
     }
 
+    diag::log_tagged_fmt("disasm_tools", "search_bytes_result total_hits=%zu returned=%zu",
+        total_hits, arr.size());
     json result;
     result["pattern"]    = params["pattern"].get<std::string>();
     result["total_hits"] = total_hits;
@@ -587,6 +663,7 @@ static bool is_printable_ascii(uint8_t b)
 
 static tool_result_t handle_get_strings(const json& params)
 {
+    diag::log_tagged_fmt("disasm_tools", "get_strings_enter");
     size_t min_len = 4;
     if (params.contains("min_length") && params["min_length"].is_number_unsigned()) {
         size_t v = params["min_length"].get<size_t>();
@@ -672,6 +749,8 @@ static tool_result_t handle_get_strings(const json& params)
         }
     }
 
+    diag::log_tagged_fmt("disasm_tools", "get_strings_result total=%zu returned=%zu encoding=%s min_len=%zu",
+        total_found, arr.size(), encoding.c_str(), min_len);
     json result;
     result["total_found"] = total_found;
     result["returned"]    = arr.size();
@@ -683,9 +762,12 @@ static tool_result_t handle_get_strings(const json& params)
 
 static tool_result_t handle_ui_set_active_view(const json& params)
 {
-    if (!params.contains("view") || !params["view"].is_string())
+    if (!params.contains("view") || !params["view"].is_string()) {
+        diag::log_tagged_fmt("disasm_tools", "ui_set_active_view_bad_params");
         return tool_result_t::error("'view' is required.");
+    }
     std::string name = lower_copy(params["view"].get<std::string>());
+    diag::log_tagged_fmt("disasm_tools", "ui_set_active_view view=%s", name.c_str());
 
     struct entry_t { const char* key; center_view_t v; };
     static const entry_t table[] = {
@@ -724,6 +806,7 @@ static tool_result_t handle_ui_set_active_view(const json& params)
 
     for (const entry_t& e : table) {
         if (name == e.key) {
+            diag::log_tagged_fmt("disasm_tools", "ui_set_active_view_activated view=%s", e.key);
             globals::ui::active_center_view = e.v;
             json result;
             result["view"]   = e.key;
@@ -731,22 +814,29 @@ static tool_result_t handle_ui_set_active_view(const json& params)
             return tool_result_t::ok(result);
         }
     }
+    diag::log_tagged_fmt("disasm_tools", "ui_set_active_view_unknown view=%s", name.c_str());
     return tool_result_t::error("Unknown view name. Accepted: code_editor, disassembly, hex_view, welcome, settings, network, memory_scanner, debugger, pseudocode, struct_recon, crypto_scanner, aob_generator, fuzzer, xref_browser, snapshot_diff, pointer_scanner, decrypt_oracle, integrity_hunter, symbolic, taint, deobfuscation, stealth, scan_hub, types_hub, analysis_hub, binary_map, graph.");
 }
 
 static tool_result_t handle_bookmarks_add(const json& params)
 {
     uint64_t addr = 0;
-    if (!parse_address_param(params, "address", addr))
+    if (!parse_address_param(params, "address", addr)) {
+        diag::log_tagged_fmt("disasm_tools", "bookmark_add_bad_params");
         return tool_result_t::error("'address' is required.");
+    }
     std::string label;
     if (params.contains("label") && params["label"].is_string())
         label = params["label"].get<std::string>();
+    diag::log_tagged_fmt("disasm_tools", "bookmark_add addr=0x%llX label=%s",
+        static_cast<unsigned long long>(addr), label.c_str());
 
     auto& bms = disasm_view::g_state.bookmarks;
     for (auto& bm : bms) {
         if (bm.addr == addr) {
             if (!label.empty()) bm.label = label;
+            diag::log_tagged_fmt("disasm_tools", "bookmark_add_updated addr=0x%llX",
+                static_cast<unsigned long long>(addr));
             json result;
             result["address"] = hex_u64(addr);
             result["label"]   = bm.label;
@@ -758,6 +848,8 @@ static tool_result_t handle_bookmarks_add(const json& params)
     b.addr  = addr;
     b.label = label;
     bms.push_back(std::move(b));
+    diag::log_tagged_fmt("disasm_tools", "bookmark_add_created addr=0x%llX total=%zu",
+        static_cast<unsigned long long>(addr), bms.size());
     json result;
     result["address"] = hex_u64(addr);
     result["label"]   = label;
@@ -768,23 +860,33 @@ static tool_result_t handle_bookmarks_add(const json& params)
 static tool_result_t handle_bookmarks_remove(const json& params)
 {
     uint64_t addr = 0;
-    if (!parse_address_param(params, "address", addr))
+    if (!parse_address_param(params, "address", addr)) {
+        diag::log_tagged_fmt("disasm_tools", "bookmark_remove_bad_params");
         return tool_result_t::error("'address' is required.");
+    }
+    diag::log_tagged_fmt("disasm_tools", "bookmark_remove addr=0x%llX",
+        static_cast<unsigned long long>(addr));
     auto& bms = disasm_view::g_state.bookmarks;
     for (auto it = bms.begin(); it != bms.end(); ++it) {
         if (it->addr == addr) {
             bms.erase(it);
+            diag::log_tagged_fmt("disasm_tools", "bookmark_remove_ok addr=0x%llX remaining=%zu",
+                static_cast<unsigned long long>(addr), bms.size());
             json result;
             result["address"] = hex_u64(addr);
             result["status"]  = "removed";
             return tool_result_t::ok(result);
         }
     }
+    diag::log_tagged_fmt("disasm_tools", "bookmark_remove_not_found addr=0x%llX",
+        static_cast<unsigned long long>(addr));
     return tool_result_t::error("Bookmark not found at this address.");
 }
 
 static tool_result_t handle_bookmarks_list(const json&)
 {
+    diag::log_tagged_fmt("disasm_tools", "bookmark_list count=%zu",
+        disasm_view::g_state.bookmarks.size());
     json arr = json::array();
     for (const auto& bm : disasm_view::g_state.bookmarks) {
         json o;
@@ -801,8 +903,10 @@ static tool_result_t handle_bookmarks_list(const json&)
 static tool_result_t handle_hex_view_open(const json& params)
 {
     uint64_t addr = 0;
-    if (!parse_address_param(params, "address", addr))
+    if (!parse_address_param(params, "address", addr)) {
+        diag::log_tagged_fmt("disasm_tools", "hex_view_open_bad_params");
         return tool_result_t::error("'address' is required.");
+    }
     size_t size = 0x1000;
     if (params.contains("size") && params["size"].is_number_unsigned()) {
         size_t v = params["size"].get<size_t>();
@@ -810,11 +914,17 @@ static tool_result_t handle_hex_view_open(const json& params)
         if (v > (1u << 20)) v = (1u << 20);
         size = v;
     }
+    diag::log_tagged_fmt("disasm_tools", "hex_view_open addr=0x%llX size=%zu",
+        static_cast<unsigned long long>(addr), size);
     if (!hex_view::read_from_process(addr, size)) {
         std::string err = hex_view::last_error();
         if (err.empty()) err = "hex_view::read_from_process failed.";
+        diag::log_tagged_fmt("disasm_tools", "hex_view_open_failed addr=0x%llX err=%s",
+            static_cast<unsigned long long>(addr), err.c_str());
         return tool_result_t::error(err);
     }
+    diag::log_tagged_fmt("disasm_tools", "hex_view_open_ok addr=0x%llX size=%zu",
+        static_cast<unsigned long long>(addr), size);
     globals::ui::active_center_view = center_view_t::hex_view;
     json result;
     result["address"] = hex_u64(addr);

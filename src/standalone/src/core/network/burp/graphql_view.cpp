@@ -13,6 +13,7 @@
 #include "../../ui/empty_state.hpp"
 #include "../../ui/fonts.hpp"
 #include "../../infra/work_queue.hpp"
+#include "helpers/diag_log.hpp"
 
 #include "imgui/imgui.h"
 
@@ -87,15 +88,20 @@ void render(float pos_x, float pos_y, float width, float height,
     if (aida::ui::button("Introspect", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm, ImVec2(0.f, 28.f))) {
         std::string ep(s_state.endpoint_buf);
         std::map<std::string, std::string> hdrs = parse_kv(s_state.headers_buf);
+        ::diag::log_tagged_fmt("graphql_v", "introspect ep='%s'", ep.c_str());
         s_state.introspecting.store(true);
         work_queue::post([ep, hdrs]() {
             graphql::gql_schema_t schema;
             std::string raw;
             bool ok = graphql::introspect(ep, hdrs, schema, raw);
-            std::lock_guard<std::mutex> lk(s_state.lock);
-            s_state.last_schema_raw = raw;
-            s_state.schema_status   = ok ? std::string("Schema loaded, ") + std::to_string(schema.types.size()) + " types"
-                                          : (std::string("Introspect failed: ") + graphql::last_error());
+            {
+                std::lock_guard<std::mutex> lk(s_state.lock);
+                s_state.last_schema_raw = raw;
+                s_state.schema_status   = ok ? std::string("Schema loaded, ") + std::to_string(schema.types.size()) + " types"
+                                              : (std::string("Introspect failed: ") + graphql::last_error());
+            }
+            ::diag::log_tagged_fmt("graphql_v", "introspect_result ok=%d types=%zu err='%s'",
+                ok ? 1 : 0, schema.types.size(), ok ? "" : graphql::last_error().c_str());
             s_state.introspecting.store(false);
         });
     }
@@ -108,11 +114,20 @@ void render(float pos_x, float pos_y, float width, float height,
                               ImVec2(width - 16.f, 56.f));
 
     ImGui::SetCursorPos(ImVec2(8.f, 122.f));
-    if (aida::ui::button("Schema", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) s_state.active_tab = 0;
+    if (aida::ui::button("Schema", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+        ::diag::log_tagged("graphql_v", "tab_switch tab=schema");
+        s_state.active_tab = 0;
+    }
     ImGui::SameLine();
-    if (aida::ui::button("Query", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm))  s_state.active_tab = 1;
+    if (aida::ui::button("Query", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+        ::diag::log_tagged("graphql_v", "tab_switch tab=query");
+        s_state.active_tab = 1;
+    }
     ImGui::SameLine();
-    if (aida::ui::button("History", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) s_state.active_tab = 2;
+    if (aida::ui::button("History", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+        ::diag::log_tagged("graphql_v", "tab_switch tab=history");
+        s_state.active_tab = 2;
+    }
 
     ImGui::SameLine(0.f, 24.f);
     {
@@ -191,6 +206,8 @@ void render(float pos_x, float pos_y, float width, float height,
                     if (aida::ui::button("Generate Query", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
                         if (s_state.selected_field_index >= 0 && s_state.selected_field_index < static_cast<int>(t.fields.size())) {
                             std::string q = graphql::build_example_query(schema, t.fields[s_state.selected_field_index].name, s_state.depth);
+                            ::diag::log_tagged_fmt("graphql_v", "generate_query field='%s' depth=%d len=%zu",
+                                t.fields[s_state.selected_field_index].name.c_str(), s_state.depth, q.size());
                             std::lock_guard<std::mutex> lk(s_state.lock);
                             s_state.query_text = q;
                             s_state.active_tab = 1;
@@ -239,6 +256,7 @@ void render(float pos_x, float pos_y, float width, float height,
                 q = s_state.query_text;
                 v = s_state.variables_text;
             }
+            ::diag::log_tagged_fmt("graphql_v", "send_query ep='%s' query_len=%zu", ep.c_str(), q.size());
             s_state.sending.store(true);
             work_queue::post([ep, hdrs, q, v]() {
                 nlohmann::json variables = nlohmann::json::object();
@@ -261,6 +279,8 @@ void render(float pos_x, float pos_y, float width, float height,
                         s_state.last_status       = 0;
                     }
                     s_state.last_latency_ms = latency;
+                    ::diag::log_tagged_fmt("graphql_v", "query_result ok=%d status=%d latency=%llums",
+                        ok ? 1 : 0, s_state.last_status, static_cast<unsigned long long>(latency));
                     history_row_t row;
                     row.ts_ms       = now_ms();
                     row.endpoint    = ep;
@@ -276,11 +296,13 @@ void render(float pos_x, float pos_y, float width, float height,
         if (sending) ImGui::EndDisabled();
         ImGui::SameLine();
         if (aida::ui::button("Beautify", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+            ::diag::log_tagged("graphql_v", "beautify_query");
             std::lock_guard<std::mutex> lk(s_state.lock);
             s_state.query_text = graphql::beautify_query(s_state.query_text);
         }
         ImGui::SameLine();
         if (aida::ui::button("Minify", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+            ::diag::log_tagged("graphql_v", "minify_query");
             std::lock_guard<std::mutex> lk(s_state.lock);
             s_state.query_text = graphql::minify_query(s_state.query_text);
         }
@@ -291,6 +313,7 @@ void render(float pos_x, float pos_y, float width, float height,
         if (s_state.batch_count > 1000) s_state.batch_count = 1000;
         ImGui::SameLine();
         if (aida::ui::button("Batch", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+            ::diag::log_tagged_fmt("graphql_v", "batch_query count=%d", s_state.batch_count);
             std::lock_guard<std::mutex> lk(s_state.lock);
             s_state.query_text = graphql::build_batched_query(s_state.query_text, static_cast<size_t>(s_state.batch_count));
         }

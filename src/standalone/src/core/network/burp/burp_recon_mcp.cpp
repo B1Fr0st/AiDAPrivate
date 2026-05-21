@@ -13,6 +13,7 @@
 #include "payload_library.hpp"
 
 #include "../../settings/standalone_compat.hpp"
+#include "../../../helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -136,6 +137,7 @@ json sub_status_to_json(const subdomain_enum::enum_status_t& s)
 
 tool_result_t crawler_start(const json& p)
 {
+    diag::log_tagged_fmt("mcp_burp", "crawler_start entry start_urls_count=%zu", get_string_array(p, "start_urls").size() + (p.contains("url") && p["url"].is_string() ? 1 : 0));
     crawler::crawl_config_t cfg;
     cfg.start_urls = get_string_array(p, "start_urls");
     if (cfg.start_urls.empty() && p.contains("url") && p["url"].is_string())
@@ -153,7 +155,8 @@ tool_result_t crawler_start(const json& p)
     cfg.exclude_extensions = get_string_array(p, "exclude_extensions");
     cfg.exclude_patterns  = get_string_array(p, "exclude_patterns");
     uint64_t id = crawler::start(cfg);
-    if (id == 0) return tool_result_t::error(crawler::last_error());
+    if (id == 0) { diag::log_tagged_fmt("mcp_burp", "crawler_start failed err=%s", crawler::last_error().c_str()); return tool_result_t::error(crawler::last_error()); }
+    diag::log_tagged_fmt("mcp_burp", "crawler_start ok crawl_id=%llu", static_cast<unsigned long long>(id));
     json r;
     r["crawl_id"] = id;
     return tool_result_t::ok("crawl started", r);
@@ -162,9 +165,10 @@ tool_result_t crawler_start(const json& p)
 tool_result_t crawler_status_(const json& p)
 {
     uint64_t id = get_or<uint64_t>(p, "crawl_id", 0);
+    diag::log_tagged_fmt("mcp_burp", "crawler_status crawl_id=%llu", static_cast<unsigned long long>(id));
     if (id == 0) return tool_result_t::error("crawl_id required");
     auto s = crawler::status(id);
-    if (s.id == 0) return tool_result_t::error("not found");
+    if (s.id == 0) { diag::log_tagged_fmt("mcp_burp", "crawler_status not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("not found"); }
     json j = crawler_status_to_json(s);
     json urls = json::array();
     int cap = get_or<int>(p, "max_urls", 200);
@@ -181,29 +185,35 @@ tool_result_t crawler_status_(const json& p)
         urls.push_back(e);
     }
     j["urls"] = urls;
+    diag::log_tagged_fmt("mcp_burp", "crawler_status ok id=%llu urls=%d", static_cast<unsigned long long>(id), n);
     return tool_result_t::ok("status", j);
 }
 
 tool_result_t crawler_stop_(const json& p)
 {
     uint64_t id = get_or<uint64_t>(p, "crawl_id", 0);
+    diag::log_tagged_fmt("mcp_burp", "crawler_stop crawl_id=%llu", static_cast<unsigned long long>(id));
     if (id == 0) return tool_result_t::error("crawl_id required");
-    if (!crawler::stop(id)) return tool_result_t::error(crawler::last_error());
+    if (!crawler::stop(id)) { diag::log_tagged_fmt("mcp_burp", "crawler_stop failed err=%s", crawler::last_error().c_str()); return tool_result_t::error(crawler::last_error()); }
+    diag::log_tagged_fmt("mcp_burp", "crawler_stop ok id=%llu", static_cast<unsigned long long>(id));
     return tool_result_t::ok("stop requested");
 }
 
 tool_result_t crawler_list_(const json&)
 {
+    diag::log_tagged_fmt("mcp_burp", "crawler_list entry");
     auto v = crawler::list();
     json arr = json::array();
     for (auto& s : v) arr.push_back(crawler_status_to_json(s));
     json out;
     out["crawls"] = arr;
+    diag::log_tagged_fmt("mcp_burp", "crawler_list ok count=%zu", v.size());
     return tool_result_t::ok("list", out);
 }
 
 tool_result_t cd_start(const json& p)
 {
+    diag::log_tagged_fmt("mcp_burp", "content_discovery_start target=%s", get_or<std::string>(p, "target_url", std::string()).c_str());
     content_discovery::config_t cfg;
     cfg.target_url        = get_or<std::string>(p, "target_url", std::string());
     if (cfg.target_url.empty()) return tool_result_t::error("target_url required");
@@ -232,7 +242,8 @@ tool_result_t cd_start(const json& p)
             if (it.value().is_string()) cfg.extra_headers.emplace_back(it.key(), it.value().get<std::string>());
     }
     uint64_t id = content_discovery::start(cfg);
-    if (id == 0) return tool_result_t::error(content_discovery::last_error());
+    if (id == 0) { diag::log_tagged_fmt("mcp_burp", "content_discovery_start failed err=%s", content_discovery::last_error().c_str()); return tool_result_t::error(content_discovery::last_error()); }
+    diag::log_tagged_fmt("mcp_burp", "content_discovery_start ok disc_id=%llu", static_cast<unsigned long long>(id));
     json r;
     r["disc_id"] = id;
     return tool_result_t::ok("discovery started", r);
@@ -241,15 +252,18 @@ tool_result_t cd_start(const json& p)
 tool_result_t cd_status_(const json& p)
 {
     uint64_t id = get_or<uint64_t>(p, "disc_id", 0);
+    diag::log_tagged_fmt("mcp_burp", "content_discovery_status disc_id=%llu", static_cast<unsigned long long>(id));
     if (id == 0) return tool_result_t::error("disc_id required");
     auto s = content_discovery::status(id);
-    if (s.id == 0) return tool_result_t::error("not found");
+    if (s.id == 0) { diag::log_tagged_fmt("mcp_burp", "content_discovery_status not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("not found"); }
+    diag::log_tagged_fmt("mcp_burp", "content_discovery_status ok id=%llu hits=%zu", static_cast<unsigned long long>(id), s.hits);
     return tool_result_t::ok("status", disc_status_to_json(s));
 }
 
 tool_result_t cd_results_(const json& p)
 {
     uint64_t id = get_or<uint64_t>(p, "disc_id", 0);
+    diag::log_tagged_fmt("mcp_burp", "content_discovery_results disc_id=%llu", static_cast<unsigned long long>(id));
     if (id == 0) return tool_result_t::error("disc_id required");
     int cap = get_or<int>(p, "max_results", 500);
     auto hits = content_discovery::results(id);
@@ -273,19 +287,23 @@ tool_result_t cd_results_(const json& p)
     out["hits"] = arr;
     out["total"] = static_cast<int>(hits.size());
     out["returned"] = n;
+    diag::log_tagged_fmt("mcp_burp", "content_discovery_results ok id=%llu returned=%d", static_cast<unsigned long long>(id), n);
     return tool_result_t::ok("results", out);
 }
 
 tool_result_t cd_stop_(const json& p)
 {
     uint64_t id = get_or<uint64_t>(p, "disc_id", 0);
+    diag::log_tagged_fmt("mcp_burp", "content_discovery_stop disc_id=%llu", static_cast<unsigned long long>(id));
     if (id == 0) return tool_result_t::error("disc_id required");
-    if (!content_discovery::stop(id)) return tool_result_t::error(content_discovery::last_error());
+    if (!content_discovery::stop(id)) { diag::log_tagged_fmt("mcp_burp", "content_discovery_stop failed err=%s", content_discovery::last_error().c_str()); return tool_result_t::error(content_discovery::last_error()); }
+    diag::log_tagged_fmt("mcp_burp", "content_discovery_stop ok id=%llu", static_cast<unsigned long long>(id));
     return tool_result_t::ok("stop requested");
 }
 
 tool_result_t sub_start(const json& p)
 {
+    diag::log_tagged_fmt("mcp_burp", "subdomain_enum_start domain=%s", get_or<std::string>(p, "domain", std::string()).c_str());
     subdomain_enum::config_t cfg;
     cfg.domain                = get_or<std::string>(p, "domain", std::string());
     if (cfg.domain.empty()) return tool_result_t::error("domain required");
@@ -299,7 +317,8 @@ tool_result_t sub_start(const json& p)
     cfg.user_agent            = get_or<std::string>(p, "user_agent", std::string("AiDA-SubdomainEnum/1.0"));
     cfg.passive_sources       = get_string_array(p, "sources");
     uint64_t id = subdomain_enum::start(cfg);
-    if (id == 0) return tool_result_t::error(subdomain_enum::last_error());
+    if (id == 0) { diag::log_tagged_fmt("mcp_burp", "subdomain_enum_start failed err=%s", subdomain_enum::last_error().c_str()); return tool_result_t::error(subdomain_enum::last_error()); }
+    diag::log_tagged_fmt("mcp_burp", "subdomain_enum_start ok sub_id=%llu", static_cast<unsigned long long>(id));
     json r;
     r["sub_id"] = id;
     return tool_result_t::ok("enum started", r);
@@ -308,15 +327,18 @@ tool_result_t sub_start(const json& p)
 tool_result_t sub_status_(const json& p)
 {
     uint64_t id = get_or<uint64_t>(p, "sub_id", 0);
+    diag::log_tagged_fmt("mcp_burp", "subdomain_enum_status sub_id=%llu", static_cast<unsigned long long>(id));
     if (id == 0) return tool_result_t::error("sub_id required");
     auto s = subdomain_enum::status(id);
-    if (s.id == 0) return tool_result_t::error("not found");
+    if (s.id == 0) { diag::log_tagged_fmt("mcp_burp", "subdomain_enum_status not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("not found"); }
+    diag::log_tagged_fmt("mcp_burp", "subdomain_enum_status ok id=%llu passive=%zu brute_resolved=%zu", static_cast<unsigned long long>(id), s.passive_count, s.brute_resolved);
     return tool_result_t::ok("status", sub_status_to_json(s));
 }
 
 tool_result_t sub_results_(const json& p)
 {
     uint64_t id = get_or<uint64_t>(p, "sub_id", 0);
+    diag::log_tagged_fmt("mcp_burp", "subdomain_enum_results sub_id=%llu", static_cast<unsigned long long>(id));
     if (id == 0) return tool_result_t::error("sub_id required");
     int cap = get_or<int>(p, "max_results", 1000);
     auto v = subdomain_enum::results(id);
@@ -336,11 +358,13 @@ tool_result_t sub_results_(const json& p)
     out["subdomains"] = arr;
     out["total"] = static_cast<int>(v.size());
     out["returned"] = n;
+    diag::log_tagged_fmt("mcp_burp", "subdomain_enum_results ok id=%llu returned=%d", static_cast<unsigned long long>(id), n);
     return tool_result_t::ok("results", out);
 }
 
 tool_result_t payloads_list(const json&)
 {
+    diag::log_tagged_fmt("mcp_burp", "payloads_list entry");
     auto v = payloads::list_summaries();
     json arr = json::array();
     for (auto& p : v)
@@ -357,28 +381,32 @@ tool_result_t payloads_list(const json&)
     }
     json out;
     out["sets"] = arr;
+    diag::log_tagged_fmt("mcp_burp", "payloads_list ok count=%zu", v.size());
     return tool_result_t::ok("payload sets", out);
 }
 
 tool_result_t payloads_get_(const json& p)
 {
     std::string id = get_or<std::string>(p, "set_id", std::string());
+    diag::log_tagged_fmt("mcp_burp", "payloads_get set_id=%s", id.c_str());
     if (id.empty()) return tool_result_t::error("set_id required");
     int cap = get_or<int>(p, "max", 500);
     auto v = payloads::entries(id, static_cast<size_t>(std::max(0, cap)));
     const auto* full = payloads::get(id);
-    if (!full) return tool_result_t::error("not found");
+    if (!full) { diag::log_tagged_fmt("mcp_burp", "payloads_get not_found set_id=%s", id.c_str()); return tool_result_t::error("not found"); }
     json out;
     out["id"] = id;
     out["total"] = static_cast<int>(full->entries.size());
     out["returned"] = static_cast<int>(v.size());
     out["entries"] = v;
+    diag::log_tagged_fmt("mcp_burp", "payloads_get ok set_id=%s returned=%zu", id.c_str(), v.size());
     return tool_result_t::ok("entries", out);
 }
 
 tool_result_t payloads_search_(const json& p)
 {
     std::string q = get_or<std::string>(p, "query", std::string());
+    diag::log_tagged_fmt("mcp_burp", "payloads_search query=%s", q.c_str());
     if (q.empty()) return tool_result_t::error("query required");
     std::string set_id = get_or<std::string>(p, "set_id", std::string());
     int cap = get_or<int>(p, "max", 200);
@@ -387,19 +415,21 @@ tool_result_t payloads_search_(const json& p)
     json out;
     out["matches"] = v;
     out["returned"] = static_cast<int>(v.size());
+    diag::log_tagged_fmt("mcp_burp", "payloads_search ok query=%s returned=%zu", q.c_str(), v.size());
     return tool_result_t::ok("search results", out);
 }
 
 tool_result_t payloads_add_(const json& p)
 {
     std::string id = get_or<std::string>(p, "set_id", std::string());
+    diag::log_tagged_fmt("mcp_burp", "payloads_add_custom set_id=%s", id.c_str());
     if (id.empty()) return tool_result_t::error("set_id required");
     std::string label = get_or<std::string>(p, "label", std::string());
     std::string desc  = get_or<std::string>(p, "description", std::string());
     auto entries = get_string_array(p, "entries");
     if (entries.empty()) return tool_result_t::error("entries required");
-    if (!payloads::add_custom_set(id, label, desc, entries))
-        return tool_result_t::error(payloads::last_error());
+    if (!payloads::add_custom_set(id, label, desc, entries)) { diag::log_tagged_fmt("mcp_burp", "payloads_add_custom failed err=%s", payloads::last_error().c_str()); return tool_result_t::error(payloads::last_error()); }
+    diag::log_tagged_fmt("mcp_burp", "payloads_add_custom ok set_id=%s count=%zu", id.c_str(), entries.size());
     json out;
     out["set_id"] = id;
     out["count"] = static_cast<int>(entries.size());

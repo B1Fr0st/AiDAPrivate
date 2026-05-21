@@ -11,6 +11,7 @@
 #include "../editor/expression_eval.hpp"
 #include "../debugger/debugger_engine.hpp"
 #include "../../helpers/diag_log.hpp"
+#include "../../helpers/globals.h"
 
 #include <chrono>
 #include <cstdarg>
@@ -1545,10 +1546,110 @@ namespace {
         }
     }
 
+    void select_center_view(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped,
+                            const char* tag, center_view_t value) {
+        globals::ui::active_center_view = value;
+        if (globals::ui::active_center_view == value) {
+            log_msg(hf, tag, "PASS -- active_center_view selected (%d)", static_cast<int>(value));
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- active_center_view not selected (%d)", static_cast<int>(value));
+            failed.fetch_add(1);
+        }
+    }
+
+    void test_center_view_code_editor(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.code_editor", center_view_t::code_editor);
+    }
+    void test_center_view_disassembly(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.disassembly", center_view_t::disassembly);
+    }
+    void test_center_view_hex_view(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.hex_view", center_view_t::hex_view);
+    }
+    void test_center_view_welcome(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.welcome", center_view_t::welcome);
+    }
+    void test_center_view_settings_view(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.settings_view", center_view_t::settings_view);
+    }
+    void test_center_view_network_view(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.network_view", center_view_t::network_view);
+    }
+    void test_center_view_memory_scanner(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.memory_scanner", center_view_t::memory_scanner);
+    }
+    void test_center_view_debugger_view(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.debugger_view", center_view_t::debugger_view);
+    }
+    void test_center_view_pseudocode(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.pseudocode", center_view_t::pseudocode);
+    }
+    void test_center_view_struct_recon(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.struct_recon", center_view_t::struct_recon);
+    }
+    void test_center_view_crypto_scanner(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.crypto_scanner", center_view_t::crypto_scanner);
+    }
+    void test_center_view_aob_generator(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.aob_generator", center_view_t::aob_generator);
+    }
+    void test_center_view_fuzzer_view(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.fuzzer_view", center_view_t::fuzzer_view);
+    }
+    void test_center_view_xref_browser(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.xref_browser", center_view_t::xref_browser);
+    }
+    void test_center_view_snapshot_diff(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.snapshot_diff", center_view_t::snapshot_diff);
+    }
+    void test_center_view_pointer_scanner(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.pointer_scanner", center_view_t::pointer_scanner);
+    }
+    void test_center_view_decrypt_oracle(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.decrypt_oracle", center_view_t::decrypt_oracle);
+    }
+    void test_center_view_integrity_hunter(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.integrity_hunter", center_view_t::integrity_hunter);
+    }
+    void test_center_view_symbolic_view(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.symbolic_view", center_view_t::symbolic_view);
+    }
+    void test_center_view_taint_view(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.taint_view", center_view_t::taint_view);
+    }
+    void test_center_view_deobfuscation_view(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.deobfuscation_view", center_view_t::deobfuscation_view);
+    }
+    void test_center_view_stealth_view(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.stealth_view", center_view_t::stealth_view);
+    }
+    void test_center_view_scan_hub(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.scan_hub", center_view_t::scan_hub);
+    }
+    void test_center_view_types_hub(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.types_hub", center_view_t::types_hub);
+    }
+    void test_center_view_analysis_hub(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.analysis_hub", center_view_t::analysis_hub);
+    }
+    void test_center_view_binary_map(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.binary_map", center_view_t::binary_map);
+    }
+    void test_center_view_graph_view(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.graph_view", center_view_t::graph_view);
+    }
+    void test_center_view_image_view(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.image_view", center_view_t::image_view);
+    }
+    void test_center_view_test_lab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.test_lab", center_view_t::test_lab);
+    }
+
 }
 
 void phase_disasm_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
-    log_msg(hf, "disasm_phase", "=== DISASM TESTS START (81 tests) ===");
+    log_msg(hf, "disasm_phase", "=== DISASM TESTS START (109 tests) ===");
     auto t0 = std::chrono::steady_clock::now();
 
     struct test_entry_t {
@@ -1647,6 +1748,36 @@ void phase_disasm_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& f
         { "disasm_goto_ntcreatefile",                test_disasm_goto_ntcreatefile                },
         { "disasm_goto_ntreadfile",                  test_disasm_goto_ntreadfile                  },
         { "disasm_goto_ntwritefile",                 test_disasm_goto_ntwritefile                 },
+
+        { "center_view_code_editor",                 test_center_view_code_editor                 },
+        { "center_view_disassembly",                 test_center_view_disassembly                 },
+        { "center_view_hex_view",                    test_center_view_hex_view                    },
+        { "center_view_welcome",                     test_center_view_welcome                     },
+        { "center_view_settings_view",               test_center_view_settings_view               },
+        { "center_view_network_view",                test_center_view_network_view                },
+        { "center_view_memory_scanner",              test_center_view_memory_scanner              },
+        { "center_view_debugger_view",               test_center_view_debugger_view               },
+        { "center_view_pseudocode",                  test_center_view_pseudocode                  },
+        { "center_view_struct_recon",                test_center_view_struct_recon                },
+        { "center_view_crypto_scanner",              test_center_view_crypto_scanner              },
+        { "center_view_aob_generator",               test_center_view_aob_generator               },
+        { "center_view_fuzzer_view",                 test_center_view_fuzzer_view                 },
+        { "center_view_xref_browser",                test_center_view_xref_browser                },
+        { "center_view_snapshot_diff",               test_center_view_snapshot_diff               },
+        { "center_view_pointer_scanner",             test_center_view_pointer_scanner             },
+        { "center_view_decrypt_oracle",              test_center_view_decrypt_oracle              },
+        { "center_view_integrity_hunter",            test_center_view_integrity_hunter            },
+        { "center_view_symbolic_view",               test_center_view_symbolic_view               },
+        { "center_view_taint_view",                  test_center_view_taint_view                  },
+        { "center_view_deobfuscation_view",          test_center_view_deobfuscation_view          },
+        { "center_view_stealth_view",                test_center_view_stealth_view                },
+        { "center_view_scan_hub",                    test_center_view_scan_hub                    },
+        { "center_view_types_hub",                   test_center_view_types_hub                   },
+        { "center_view_analysis_hub",                test_center_view_analysis_hub                },
+        { "center_view_binary_map",                  test_center_view_binary_map                  },
+        { "center_view_graph_view",                  test_center_view_graph_view                  },
+        { "center_view_image_view",                  test_center_view_image_view                  },
+        { "center_view_test_lab",                    test_center_view_test_lab                    },
     };
 
     int total = static_cast<int>(sizeof(tests) / sizeof(tests[0]));

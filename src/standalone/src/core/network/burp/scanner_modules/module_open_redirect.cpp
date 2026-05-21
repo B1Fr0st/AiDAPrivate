@@ -1,5 +1,7 @@
 #include "../scanner_module.hpp"
 
+#include "../../../../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <optional>
@@ -14,6 +16,7 @@ namespace {
 
 std::vector<probe_t> redirect_probes(const insertion_point_t& ip, const module_context_t&)
 {
+    diag::log_tagged_fmt("mod_redirect", "redirect_probes entry ip=%s:%s", ip.kind.c_str(), ip.name.c_str());
     std::vector<probe_t> out;
     out.push_back({"http://aida-redir-canary.invalid/",          "aida-redir-canary.invalid", "absolute-http"});
     out.push_back({"https://aida-redir-canary.invalid/",         "aida-redir-canary.invalid", "absolute-https"});
@@ -21,6 +24,7 @@ std::vector<probe_t> redirect_probes(const insertion_point_t& ip, const module_c
     out.push_back({"/\\aida-redir-canary.invalid/",              "aida-redir-canary.invalid", "backslash-trick"});
     out.push_back({"@aida-redir-canary.invalid/",                "aida-redir-canary.invalid", "userinfo-trick"});
     (void)ip;
+    diag::log_tagged_fmt("mod_redirect", "redirect_probes built %zu probes ip=%s:%s", out.size(), ip.kind.c_str(), ip.name.c_str());
     return out;
 }
 
@@ -43,7 +47,11 @@ bool redirect_target_has_canary(const exchange_observed_t& resp, const std::stri
 std::optional<issue_t> redirect_detect(const insertion_point_t& ip, const probe_t& probe,
                                        const exchange_observed_t& resp, const module_context_t& ctx)
 {
+    diag::log_tagged_fmt("mod_redirect", "redirect_detect entry ip=%s:%s variant=%s status=%d",
+                         ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str(), resp.status_code);
     if (redirect_target_has_canary(resp, probe.marker)) {
+        diag::log_tagged_fmt("mod_redirect", "redirect_detect FINDING location-header ip=%s:%s variant=%s",
+                             ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str());
         auto iss = make_issue("open-redirect.location", "Open Redirect via Location header",
                               severity_t::medium, confidence_t::firm, ip, probe, resp, ctx,
                               std::string("Location header reflects attacker-supplied host: ") + probe.payload);
@@ -60,6 +68,8 @@ std::optional<issue_t> redirect_detect(const insertion_point_t& ip, const probe_
         if (lc.find(std::string("window.location") ) != std::string::npos ||
             lc.find(std::string("location.href")  ) != std::string::npos ||
             lc.find(std::string("meta http-equiv=\"refresh\"")) != std::string::npos) {
+            diag::log_tagged_fmt("mod_redirect", "redirect_detect FINDING body-redirect ip=%s:%s variant=%s",
+                                 ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str());
             auto iss = make_issue("open-redirect.body", "Open Redirect via response body",
                                   severity_t::low, confidence_t::tentative, ip, probe, resp, ctx,
                                   std::string("Response body references redirect canary: ") + probe.marker);
@@ -69,6 +79,7 @@ std::optional<issue_t> redirect_detect(const insertion_point_t& ip, const probe_
             return iss;
         }
     }
+    diag::log_tagged_fmt("mod_redirect", "redirect_detect no finding ip=%s:%s variant=%s", ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str());
     return std::nullopt;
 }
 

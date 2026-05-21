@@ -72,7 +72,7 @@ static std::uint32_t find_target_pid() {
     std::uint32_t pid = 0;
     if (Process32FirstW(snap, &pe)) {
         do {
-            if (_wcsicmp(pe.szExeFile, L"test_target.exe") == 0) {
+            if (_wcsicmp(pe.szExeFile, L"AiDA_TestTarget.exe") == 0) {
                 pid = pe.th32ProcessID;
                 break;
             }
@@ -130,7 +130,7 @@ static std::uint32_t test_find_process() {
     section("CORE: Find Process");
 
 
-    std::uint32_t pid = device->find_process("test_target.exe");
+    std::uint32_t pid = device->find_process("AiDA_TestTarget.exe");
     char detail[128];
     snprintf(detail, sizeof(detail), "pid=%u", pid);
     report("find_process(\"test_target.exe\")", pid != 0, detail);
@@ -1537,7 +1537,7 @@ int main() {
     GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
     char* last_slash = strrchr(exe_path, '\\');
     if (last_slash) *(last_slash + 1) = '\0';
-    strcat_s(exe_path, "test_target.exe");
+    strcat_s(exe_path, "AiDA_TestTarget.exe");
 
     bool launched = false;
     std::uint32_t target_pid = find_target_pid();

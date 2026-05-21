@@ -143,6 +143,13 @@ void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b)
 {
 	{
+		static bool s_sr_render_logged = false;
+		if (!s_sr_render_logged) {
+			s_sr_render_logged = true;
+			diag::log_tagged_fmt("struct_recon", "render first_frame width=%.0f height=%.0f", width, height);
+		}
+	}
+	{
 		static bool s_types_font_logged_recon = false;
 		if (!s_types_font_logged_recon) {
 			s_types_font_logged_recon = true;
@@ -596,6 +603,13 @@ void render(float pos_x, float pos_y, float width, float height,
 		fa.has_last = true;
 
 		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			diag::log_tagged_fmt("struct_recon",
+				"field_row_click idx=%d offset=0x%llX type=%s name='%s' size=%d",
+				i,
+				static_cast<unsigned long long>(field.offset),
+				struct_recon::field_type_name(field.type),
+				field.name.c_str(),
+				field.size);
 			st.selected_field = i;
 		}
 
@@ -794,6 +808,11 @@ void render(float pos_x, float pos_y, float width, float height,
 			ImGui::InvisibleButton("##sr_vtable_hdr", ImVec2(rp_w - 24.f, 22.f));
 			if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
 				st.vtable_expanded = !st.vtable_expanded;
+				diag::log_tagged_fmt("struct_recon",
+					"vtable_toggle expanded=%d field_idx=%d entry_count=%zu",
+					st.vtable_expanded ? 1 : 0,
+					st.selected_field,
+					sel.vtable_entries.size());
 				if (st.vtable_expanded) st.vtable_expand.start(0.18f);
 				else                    st.vtable_expand.start_reverse(0.18f);
 			}

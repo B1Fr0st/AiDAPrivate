@@ -13,6 +13,7 @@
 #include "../../ui/empty_state.hpp"
 #include "../../ui/fonts.hpp"
 #include "../../infra/work_queue.hpp"
+#include "helpers/diag_log.hpp"
 
 #include "imgui/imgui.h"
 
@@ -133,13 +134,17 @@ void render(float pos_x, float pos_y, float width, float height,
         cfg.subprotocol  = s_state.subprotocol_buf;
         cfg.verify_tls   = s_state.verify_tls;
         cfg.headers      = parse_headers(s_state.headers_buf);
+        ::diag::log_tagged_fmt("ws_v", "connect scheme=%s host=%s port=%d path=%s",
+            cfg.scheme.c_str(), cfg.host.c_str(), cfg.port, cfg.path.c_str());
         work_queue::post([cfg]() {
             uint64_t id = ws_editor::connect(cfg);
             std::lock_guard<std::mutex> lk(s_state.lock);
             if (id != 0) {
+                ::diag::log_tagged_fmt("ws_v", "connected id=%llu", static_cast<unsigned long long>(id));
                 s_state.last_action_kind = "ok";
                 s_state.last_action = std::string("Connected id=") + std::to_string(id);
             } else {
+                ::diag::log_tagged_fmt("ws_v", "connect_failed err='%s'", ws_editor::last_error().c_str());
                 s_state.last_action_kind = "error";
                 s_state.last_action = ws_editor::last_error();
             }
@@ -189,7 +194,11 @@ void render(float pos_x, float pos_y, float width, float height,
             static_cast<unsigned long long>(c.id), c.url.c_str(),
             c.connected ? "" : " (disconnected)");
         bool sel = (s_state.selected_conn_index == static_cast<int>(i));
-        if (ImGui::Selectable(buf, sel)) s_state.selected_conn_index = static_cast<int>(i);
+        if (ImGui::Selectable(buf, sel)) {
+            ::diag::log_tagged_fmt("ws_v", "connection_selected idx=%zu id=%llu url=%s",
+                i, static_cast<unsigned long long>(c.id), c.url.c_str());
+            s_state.selected_conn_index = static_cast<int>(i);
+        }
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
                            "    sent=%zu recv=%zu err=%s",
                            c.frames_sent, c.frames_received,
@@ -207,18 +216,22 @@ void render(float pos_x, float pos_y, float width, float height,
                            "%s [id=%llu]", c.url.c_str(), static_cast<unsigned long long>(cid));
         ImGui::SameLine();
         if (aida::ui::button("Disconnect", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+            ::diag::log_tagged_fmt("ws_v", "disconnect id=%llu", static_cast<unsigned long long>(cid));
             work_queue::post([cid]() { ws_editor::disconnect(cid); });
         }
         ImGui::SameLine();
         if (aida::ui::button("Clear log", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+            ::diag::log_tagged_fmt("ws_v", "clear_frames id=%llu", static_cast<unsigned long long>(cid));
             ws_editor::clear_frames(cid);
         }
         ImGui::SameLine();
         if (aida::ui::button("Ping", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+            ::diag::log_tagged_fmt("ws_v", "send_ping id=%llu", static_cast<unsigned long long>(cid));
             work_queue::post([cid]() { ws_editor::send_ping(cid, {}); });
         }
         ImGui::SameLine();
         if (aida::ui::button("Close", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
+            ::diag::log_tagged_fmt("ws_v", "send_close id=%llu", static_cast<unsigned long long>(cid));
             work_queue::post([cid]() { ws_editor::send_close(cid, 1000, "user_close"); });
         }
 
@@ -269,6 +282,10 @@ void render(float pos_x, float pos_y, float width, float height,
             int opcode = s_state.compose_opcode & 0xF;
             bool fin = s_state.compose_fin;
             bool masked = s_state.compose_masked;
+            ::diag::log_tagged_fmt("ws_v", "send_frame id=%llu mode=%d payload_len=%zu",
+                static_cast<unsigned long long>(cid),
+                mode,
+                mode == 0 ? text.size() : hex.size());
             work_queue::post([cid, mode, text, hex, opcode, fin, masked]() {
                 if (mode == 0) {
                     ws_editor::send_text(cid, text);

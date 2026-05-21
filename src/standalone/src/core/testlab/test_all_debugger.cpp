@@ -1,6 +1,7 @@
 #include "test_all_debugger.h"
 
 #include "../debugger/debugger_engine.hpp"
+#include "../debugger/debugger_view.hpp"
 #include "../debugger/seh_view.hpp"
 #include "../debugger/module_view.hpp"
 #include "../../helpers/diag_log.hpp"
@@ -1480,10 +1481,65 @@ static void test_module_view_entries(HANDLE hf, std::atomic<int>& passed, std::a
     passed.fetch_add(1);
 }
 
+static void select_debugger_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
+                                const char* tag, debugger_view::sub_tab_t value) {
+    debugger_view::g_ui.active_tab = value;
+    if (debugger_view::g_ui.active_tab == value) {
+        log_msg(hf, tag, "PASS -- active_tab selected (%d)", static_cast<int>(value));
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, tag, "FAIL -- active_tab not selected (%d)", static_cast<int>(value));
+        failed.fetch_add(1);
+    }
+}
+
+static void test_dbg_tab_cpu(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_debugger_tab(hf, passed, failed, "dbg_tab.cpu", debugger_view::sub_tab_t::cpu);
+}
+static void test_dbg_tab_breakpoints(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_debugger_tab(hf, passed, failed, "dbg_tab.breakpoints", debugger_view::sub_tab_t::breakpoints);
+}
+static void test_dbg_tab_memory_map(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_debugger_tab(hf, passed, failed, "dbg_tab.memory_map", debugger_view::sub_tab_t::memory_map);
+}
+static void test_dbg_tab_call_stack(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_debugger_tab(hf, passed, failed, "dbg_tab.call_stack", debugger_view::sub_tab_t::call_stack);
+}
+static void test_dbg_tab_threads(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_debugger_tab(hf, passed, failed, "dbg_tab.threads", debugger_view::sub_tab_t::threads);
+}
+static void test_dbg_tab_watches(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_debugger_tab(hf, passed, failed, "dbg_tab.watches", debugger_view::sub_tab_t::watches);
+}
+static void test_dbg_tab_handles(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_debugger_tab(hf, passed, failed, "dbg_tab.handles", debugger_view::sub_tab_t::handles);
+}
+static void test_dbg_tab_trace_log(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_debugger_tab(hf, passed, failed, "dbg_tab.trace_log", debugger_view::sub_tab_t::trace_log);
+}
+static void test_dbg_tab_strings(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_debugger_tab(hf, passed, failed, "dbg_tab.strings", debugger_view::sub_tab_t::strings);
+}
+static void test_dbg_tab_bookmarks(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_debugger_tab(hf, passed, failed, "dbg_tab.bookmarks", debugger_view::sub_tab_t::bookmarks);
+}
+static void test_dbg_tab_modules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_debugger_tab(hf, passed, failed, "dbg_tab.modules", debugger_view::sub_tab_t::modules);
+}
+static void test_dbg_tab_patches(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_debugger_tab(hf, passed, failed, "dbg_tab.patches", debugger_view::sub_tab_t::patches);
+}
+static void test_dbg_tab_seh_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_debugger_tab(hf, passed, failed, "dbg_tab.seh_chain", debugger_view::sub_tab_t::seh_chain);
+}
+static void test_dbg_tab_cfg(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_debugger_tab(hf, passed, failed, "dbg_tab.cfg", debugger_view::sub_tab_t::cfg);
+}
+
 }
 
 void phase_debugger_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
-    log_msg(hf, "debugger", "=== BEGIN debugger engine tests (69 tests) ===");
+    log_msg(hf, "debugger", "=== BEGIN debugger engine tests (83 tests) ===");
 
     struct test_entry_t {
         const char* name;
@@ -1560,6 +1616,21 @@ void phase_debugger_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
         { "seh_view_entries",                  test_seh_view_entries                  },
         { "module_view_refresh",               test_module_view_refresh               },
         { "module_view_entries",               test_module_view_entries               },
+
+        { "dbg_tab_cpu",                       test_dbg_tab_cpu                       },
+        { "dbg_tab_breakpoints",               test_dbg_tab_breakpoints               },
+        { "dbg_tab_memory_map",                test_dbg_tab_memory_map                },
+        { "dbg_tab_call_stack",                test_dbg_tab_call_stack                },
+        { "dbg_tab_threads",                   test_dbg_tab_threads                   },
+        { "dbg_tab_watches",                   test_dbg_tab_watches                   },
+        { "dbg_tab_handles",                   test_dbg_tab_handles                   },
+        { "dbg_tab_trace_log",                 test_dbg_tab_trace_log                 },
+        { "dbg_tab_strings",                   test_dbg_tab_strings                   },
+        { "dbg_tab_bookmarks",                 test_dbg_tab_bookmarks                 },
+        { "dbg_tab_modules",                   test_dbg_tab_modules                   },
+        { "dbg_tab_patches",                   test_dbg_tab_patches                   },
+        { "dbg_tab_seh_chain",                 test_dbg_tab_seh_chain                 },
+        { "dbg_tab_cfg",                       test_dbg_tab_cfg                       },
     };
 
     int total = static_cast<int>(sizeof(tests) / sizeof(tests[0]));

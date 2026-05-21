@@ -115,6 +115,8 @@ struct hold_outcome_t {
 };
 
 static hold_outcome_t hold_until_decision(state_t& state, http_exchange exchange) {
+    diag::log_tagged_fmt("mitm", "hold_until_decision entry exchange_id=%llu method=%s uri=%s host=%s",
+        static_cast<unsigned long long>(exchange.id), exchange.request.method.c_str(), exchange.request.uri.c_str(), exchange.target_host.c_str());
     auto wait = std::make_shared<held_wait_t>();
     uint64_t exchange_id = exchange.id;
 
@@ -164,10 +166,14 @@ static hold_outcome_t hold_until_decision(state_t& state, http_exchange exchange
     hold_outcome_t outcome;
     if (!released) {
         outcome.decision = hold_decision_t::drop;
+        diag::log_tagged_fmt("mitm", "hold_until_decision proxy stopped exchange_id=%llu -> drop", static_cast<unsigned long long>(exchange_id));
     } else if (decision == hold_decision_t::pending) {
         outcome.decision = hold_decision_t::forward;
+        diag::log_tagged_fmt("mitm", "hold_until_decision exchange_id=%llu decision=pending -> forward", static_cast<unsigned long long>(exchange_id));
     } else {
         outcome.decision = decision;
+        diag::log_tagged_fmt("mitm", "hold_until_decision exchange_id=%llu decision=%d modified_size=%zu",
+            static_cast<unsigned long long>(exchange_id), (int)decision, modified.size());
     }
     outcome.modified_request = std::move(modified);
     return outcome;
@@ -743,6 +749,8 @@ static bool ssl_handshake_with_timeout(SSL* ssl, int (*op)(SSL*), int timeout_ms
 }
 
 static void websocket_relay(SSL* client_ssl, SSL* target_ssl, http_exchange& exchange, state_t& state) {
+    diag::log_tagged_fmt("mitm", "websocket_relay entry exchange_id=%llu host=%s:%u",
+        static_cast<unsigned long long>(exchange.id), exchange.target_host.c_str(), exchange.target_port);
     exchange.is_websocket = true;
     fd_set fds;
     bool done = false;
@@ -781,6 +789,8 @@ static void websocket_relay(SSL* client_ssl, SSL* target_ssl, http_exchange& exc
                 exchange.ws_frames.push_back(std::move(entry));
             }
 
+            diag::log_tagged_fmt("mitm", "websocket_relay frame opcode=%d outbound=%d payload=%zu fin=%d masked=%d exchange_id=%llu",
+                (int)frame.opcode, (int)outbound, payload.size(), (int)frame.fin, (int)frame.masked, static_cast<unsigned long long>(exchange.id));
             ws_frame_observed_t observed;
             observed.timestamp = GetTickCount64();
             observed.exchange_id = exchange.id;
@@ -862,6 +872,8 @@ static void websocket_relay(SSL* client_ssl, SSL* target_ssl, http_exchange& exc
 
 
             if (frame.opcode == protocol_parser::ws_opcode::close) {
+                diag::log_tagged_fmt("mitm", "websocket_relay close frame exchange_id=%llu outbound=%d",
+                    static_cast<unsigned long long>(exchange.id), (int)outbound);
                 done = true;
                 break;
             }
@@ -871,6 +883,7 @@ static void websocket_relay(SSL* client_ssl, SSL* target_ssl, http_exchange& exc
     };
 
     uint8_t read_buf[65536];
+    diag::log_tagged_fmt("mitm", "websocket_relay loop starting exchange_id=%llu", static_cast<unsigned long long>(exchange.id));
     while (!done && state.running.load()) {
         FD_ZERO(&fds);
         FD_SET(client_fd, &fds);
@@ -929,20 +942,26 @@ static void handle_h2_session(SSL* client_ssl, SSL* target_ssl,
                                const std::string& target_host, uint16_t target_port,
                                const std::string& client_addr, uint16_t client_port,
                                state_t& state) {
+    diag::log_tagged_fmt("mitm", "handle_h2_session entry host=%s:%u client=%s:%u",
+        target_host.c_str(), target_port, client_addr.c_str(), client_port);
     h2_session::session client_session(h2_session::session::role::server);
     h2_session::session target_session(h2_session::session::role::client);
-
 
     bool init_ok = client_session.initialize([&](const uint8_t* data, size_t len) -> ssize_t {
         return static_cast<ssize_t>(SSL_write(client_ssl, data, static_cast<int>(len)));
     }) && target_session.initialize([&](const uint8_t* data, size_t len) -> ssize_t {
         return static_cast<ssize_t>(SSL_write(target_ssl, data, static_cast<int>(len)));
     });
-    if (!init_ok) return;
+    diag::log_tagged_fmt("mitm", "handle_h2_session init_ok=%d host=%s:%u", (int)init_ok, target_host.c_str(), target_port);
+    if (!init_ok) {
+        diag::log_tagged_fmt("mitm", "handle_h2_session session init failed host=%s:%u", target_host.c_str(), target_port);
+        return;
+    }
 
 
     client_session.set_on_request([&](const h2_session::stream_data& sd) {
-
+        diag::log_tagged_fmt("mitm", "handle_h2_session on_request stream_id=%u method=%s path=%s host=%s:%u body_size=%zu",
+            sd.stream_id, sd.method.c_str(), sd.path.c_str(), target_host.c_str(), target_port, sd.request_body.size());
         http_exchange exchange;
         exchange.id = state.next_id++;
         exchange.timestamp = GetTickCount64();
@@ -1004,7 +1023,8 @@ static void handle_h2_session(SSL* client_ssl, SSL* target_ssl,
 
 
     target_session.set_on_response([&](const h2_session::stream_data& sd) {
-
+        diag::log_tagged_fmt("mitm", "handle_h2_session on_response stream_id=%u status=%d host=%s:%u body_size=%zu",
+            sd.stream_id, sd.status_code, target_host.c_str(), target_port, sd.response_body.size());
         if (script_engine::is_initialized()) {
             script_engine::hook_response_data hook_data;
             hook_data.status_code = sd.status_code;
@@ -1087,18 +1107,23 @@ static void handle_h2_session(SSL* client_ssl, SSL* target_ssl,
 static void handle_tls_connection(SOCKET client_sock, const std::string& target_host,
                                    uint16_t target_port, const std::string& client_addr,
                                    uint16_t client_port, state_t& state) {
+    diag::log_tagged_fmt("mitm", "handle_tls_connection entry host=%s:%u client=%s:%u",
+        target_host.c_str(), target_port, client_addr.c_str(), client_port);
 
     const auto& ca = cert_generator::get_root_ca();
     if (!ca.valid) {
+        diag::log_tagged_fmt("mitm", "handle_tls_connection CA not valid host=%s:%u", target_host.c_str(), target_port);
         close_socket(client_sock);
         return;
     }
 
     SSL_CTX* ctx = cert_generator::get_ssl_ctx_for_domain(target_host, ca);
     if (!ctx) {
+        diag::log_tagged_fmt("mitm", "handle_tls_connection get_ssl_ctx_for_domain failed host=%s", target_host.c_str());
         close_socket(client_sock);
         return;
     }
+    diag::log_tagged_fmt("mitm", "handle_tls_connection got ssl_ctx host=%s ctx=%p", target_host.c_str(), ctx);
 
 
     static const unsigned char alpn_h2_h1[] = {
@@ -1124,17 +1149,19 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
 
     SSL* client_ssl = SSL_new(ctx);
     if (!client_ssl) {
+        diag::log_tagged_fmt("mitm", "handle_tls_connection SSL_new failed host=%s", target_host.c_str());
         close_socket(client_sock);
         return;
     }
     SSL_set_fd(client_ssl, static_cast<int>(client_sock));
 
-    if (!ssl_handshake_with_timeout(client_ssl, SSL_accept)) {
+    bool accept_ok = ssl_handshake_with_timeout(client_ssl, SSL_accept);
+    diag::log_tagged_fmt("mitm", "handle_tls_connection SSL_accept host=%s ok=%d", target_host.c_str(), (int)accept_ok);
+    if (!accept_ok) {
         SSL_free(client_ssl);
         close_socket(client_sock);
         return;
     }
-
 
     const unsigned char* alpn_data = nullptr;
     unsigned int alpn_len = 0;
@@ -1142,10 +1169,13 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
     std::string client_alpn;
     if (alpn_data && alpn_len > 0)
         client_alpn.assign(reinterpret_cast<const char*>(alpn_data), alpn_len);
-
+    diag::log_tagged_fmt("mitm", "handle_tls_connection client_alpn=%s host=%s", client_alpn.c_str(), target_host.c_str());
 
     SOCKET target_sock = connect_to_target(target_host, target_port);
+    diag::log_tagged_fmt("mitm", "handle_tls_connection connect_to_target host=%s:%u sock=%lld",
+        target_host.c_str(), target_port, (long long)target_sock);
     if (target_sock == INVALID_SOCKET) {
+        diag::log_tagged_fmt("mitm", "handle_tls_connection connect_to_target failed host=%s:%u", target_host.c_str(), target_port);
         SSL_shutdown(client_ssl);
         SSL_free(client_ssl);
         close_socket(client_sock);
@@ -1179,7 +1209,10 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
     SSL_set_fd(target_ssl, static_cast<int>(target_sock));
     SSL_set_tlsext_host_name(target_ssl, target_host.c_str());
 
-    if (!ssl_handshake_with_timeout(target_ssl, SSL_connect)) {
+    bool connect_ok = ssl_handshake_with_timeout(target_ssl, SSL_connect);
+    diag::log_tagged_fmt("mitm", "handle_tls_connection SSL_connect host=%s ok=%d", target_host.c_str(), (int)connect_ok);
+    if (!connect_ok) {
+        diag::log_tagged_fmt("mitm", "handle_tls_connection SSL_connect failed host=%s:%u", target_host.c_str(), target_port);
         SSL_free(target_ssl);
         SSL_CTX_free(target_ctx);
         close_socket(target_sock);
@@ -1189,7 +1222,6 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
         return;
     }
 
-
     const unsigned char* target_alpn_data = nullptr;
     unsigned int target_alpn_len = 0;
     SSL_get0_alpn_selected(target_ssl, &target_alpn_data, &target_alpn_len);
@@ -1198,14 +1230,17 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
         target_alpn.assign(reinterpret_cast<const char*>(target_alpn_data), target_alpn_len);
 
     state.active_connections.fetch_add(1);
-
+    diag::log_tagged_fmt("mitm", "handle_tls_connection target_alpn=%s use_h2=%d host=%s:%u",
+        target_alpn.c_str(), (int)(target_alpn == "h2" && state.config.enable_h2), target_host.c_str(), target_port);
 
     if (target_alpn == "h2" && state.config.enable_h2) {
+        diag::log_tagged_fmt("mitm", "handle_tls_connection dispatching to handle_h2_session host=%s:%u", target_host.c_str(), target_port);
         handle_h2_session(client_ssl, target_ssl, target_host, target_port,
                           client_addr, client_port, state);
     }
 
     else {
+        diag::log_tagged_fmt("mitm", "handle_tls_connection HTTP/1.1 path host=%s:%u", target_host.c_str(), target_port);
 
         std::vector<uint8_t> request_data;
         if (recv_ssl_all(client_ssl, request_data, state.config.max_body_size)) {
@@ -1288,11 +1323,13 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
                 }
             }
 
+            diag::log_tagged_fmt("mitm", "handle_tls_connection http1 should_forward=%d exchange_id=%llu method=%s uri=%s",
+                (int)should_forward, static_cast<unsigned long long>(exchange.id), exchange.request.method.c_str(), exchange.request.uri.c_str());
             if (should_forward) {
                 exchange.state = http_exchange::state_t::forwarding;
 
-
                 int sent = SSL_write(target_ssl, request_data.data(), static_cast<int>(request_data.size()));
+                diag::log_tagged_fmt("mitm", "handle_tls_connection SSL_write request sent=%d size=%zu host=%s", sent, request_data.size(), target_host.c_str());
                 if (sent > 0) {
 
                     std::vector<uint8_t> response_data;
@@ -1305,9 +1342,12 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
                         exchange.latency_ms = exchange.response_time - exchange.request_time;
                         exchange.response = protocol_parser::parse_http_response(response_data.data(), response_data.size());
                         exchange.state = http_exchange::state_t::complete;
+                        diag::log_tagged_fmt("mitm", "handle_tls_connection response status=%d size=%zu host=%s exchange_id=%llu latency_ms=%llu",
+                            exchange.response.status_code, response_data.size(), target_host.c_str(),
+                            static_cast<unsigned long long>(exchange.id),
+                            static_cast<unsigned long long>(exchange.latency_ms));
 
                         state.total_bytes_out.fetch_add(response_data.size());
-
 
                         if (script_engine::is_initialized()) {
                             script_engine::hook_response_data hook_data;
@@ -1319,20 +1359,22 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
                             hook_data.body = response_data;
                             script_engine::invoke_hook(script_engine::hook_type::on_response, hook_data);
                             if (hook_data.dropped) {
+                                diag::log_tagged_fmt("mitm", "handle_tls_connection script dropped response exchange_id=%llu", static_cast<unsigned long long>(exchange.id));
                                 exchange.state = http_exchange::state_t::dropped;
                             } else if (hook_data.modified) {
+                                diag::log_tagged_fmt("mitm", "handle_tls_connection script modified response exchange_id=%llu", static_cast<unsigned long long>(exchange.id));
                                 response_data = hook_data.body;
                             }
                         }
-
 
                         aida::burp::match_replace::apply_response(response_data, target_host, "https");
 
                         if (exchange.state != http_exchange::state_t::dropped)
                             SSL_write(client_ssl, response_data.data(), static_cast<int>(response_data.size()));
 
-
                         if (state.config.enable_websocket && is_websocket_upgrade(exchange.response)) {
+                            diag::log_tagged_fmt("mitm", "handle_tls_connection WebSocket upgrade detected exchange_id=%llu host=%s:%u",
+                                static_cast<unsigned long long>(exchange.id), target_host.c_str(), target_port);
                             std::shared_ptr<http_exchange> ws_exchange;
                             {
                                 std::lock_guard<std::mutex> lock(state.history_mutex);
@@ -1383,18 +1425,22 @@ cleanup_no_history:
 
 static void handle_plain_connection(SOCKET client_sock, const std::string& client_addr,
                                      uint16_t client_port, state_t& state) {
+    diag::log_tagged_fmt("mitm", "handle_plain_connection entry client=%s:%u", client_addr.c_str(), client_port);
     state.active_connections.fetch_add(1);
-
 
     std::vector<uint8_t> request_data;
     if (!recv_all(client_sock, request_data, state.config.max_body_size)) {
+        diag::log_tagged_fmt("mitm", "handle_plain_connection recv_all failed client=%s:%u", client_addr.c_str(), client_port);
         state.active_connections.fetch_sub(1);
         close_socket(client_sock);
         return;
     }
     read_remaining_body(client_sock, request_data, state.config.max_body_size);
+    diag::log_tagged_fmt("mitm", "handle_plain_connection recv request_data=%zu client=%s:%u", request_data.size(), client_addr.c_str(), client_port);
 
     auto req = protocol_parser::parse_http_request(request_data.data(), request_data.size());
+    diag::log_tagged_fmt("mitm", "handle_plain_connection parse_http_request valid=%d method=%s uri=%s client=%s:%u",
+        (int)req.valid, req.method.c_str(), req.uri.c_str(), client_addr.c_str(), client_port);
     if (!req.valid) {
         state.active_connections.fetch_sub(1);
         close_socket(client_sock);
@@ -1412,7 +1458,9 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
         target_host = target_host.substr(0, colon);
     }
 
+    diag::log_tagged_fmt("mitm", "handle_plain_connection target_host=%s port=%u client=%s:%u", target_host.c_str(), target_port, client_addr.c_str(), client_port);
     if (target_host.empty()) {
+        diag::log_tagged_fmt("mitm", "handle_plain_connection empty_target_host client=%s:%u", client_addr.c_str(), client_port);
         state.active_connections.fetch_sub(1);
         close_socket(client_sock);
         return;
@@ -1437,6 +1485,7 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
 
 
     if (script_engine::is_initialized()) {
+        diag::log_tagged_fmt("mitm", "handle_plain_connection script_hook_request exchange_id=%llu method=%s uri=%s", static_cast<unsigned long long>(exchange.id), req.method.c_str(), req.uri.c_str());
         script_engine::hook_request_data hook_data;
         hook_data.method = req.method;
         hook_data.uri = req.uri;
@@ -1448,6 +1497,7 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
         hook_data.body = request_data;
         script_engine::invoke_hook(script_engine::hook_type::on_request, hook_data);
         if (hook_data.dropped) {
+            diag::log_tagged_fmt("mitm", "handle_plain_connection script_dropped exchange_id=%llu", static_cast<unsigned long long>(exchange.id));
             exchange.state = http_exchange::state_t::dropped;
             publish_exchange_event(exchange);
             std::lock_guard<std::mutex> lock(state.history_mutex);
@@ -1456,8 +1506,10 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
             close_socket(client_sock);
             return;
         }
-        if (hook_data.modified)
+        if (hook_data.modified) {
+            diag::log_tagged_fmt("mitm", "handle_plain_connection script_modified exchange_id=%llu new_body=%zu", static_cast<unsigned long long>(exchange.id), hook_data.body.size());
             request_data = hook_data.body;
+        }
     }
 
     aida::burp::match_replace::apply_request(request_data, target_host, "http");
@@ -1468,20 +1520,25 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
         if (state.intercept_cb) {
             intercept_action action = state.intercept_cb(exchange);
             if (action == intercept_action::drop) {
+                diag::log_tagged_fmt("mitm", "handle_plain_connection intercept_cb_drop exchange_id=%llu", static_cast<unsigned long long>(exchange.id));
                 exchange.state = http_exchange::state_t::dropped;
                 should_forward = false;
                 cb_decided = true;
             } else if (action == intercept_action::modify) {
+                diag::log_tagged_fmt("mitm", "handle_plain_connection intercept_cb_modify exchange_id=%llu", static_cast<unsigned long long>(exchange.id));
                 request_data = exchange.raw_request;
                 cb_decided = true;
             } else if (action == intercept_action::forward) {
+                diag::log_tagged_fmt("mitm", "handle_plain_connection intercept_cb_forward exchange_id=%llu", static_cast<unsigned long long>(exchange.id));
                 cb_decided = true;
             }
         }
         if (!cb_decided && should_forward) {
+            diag::log_tagged_fmt("mitm", "handle_plain_connection hold_until_decision exchange_id=%llu", static_cast<unsigned long long>(exchange.id));
             exchange.raw_request = request_data;
             exchange.request_size = request_data.size();
             hold_outcome_t outcome = hold_until_decision(state, exchange);
+            diag::log_tagged_fmt("mitm", "handle_plain_connection hold_decision=%d exchange_id=%llu", (int)outcome.decision, static_cast<unsigned long long>(exchange.id));
             if (outcome.decision == hold_decision_t::drop) {
                 exchange.state = http_exchange::state_t::dropped;
                 should_forward = false;
@@ -1494,12 +1551,15 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
         }
     }
 
+    diag::log_tagged_fmt("mitm", "handle_plain_connection should_forward=%d exchange_id=%llu", (int)should_forward, static_cast<unsigned long long>(exchange.id));
     if (should_forward) {
         exchange.state = http_exchange::state_t::forwarding;
         SOCKET target_sock = connect_to_target(target_host, target_port);
+        diag::log_tagged_fmt("mitm", "handle_plain_connection connect_to_target host=%s port=%u result=%d exchange_id=%llu", target_host.c_str(), target_port, (target_sock != INVALID_SOCKET) ? 1 : 0, static_cast<unsigned long long>(exchange.id));
         if (target_sock != INVALID_SOCKET) {
             int sent = send(target_sock, reinterpret_cast<const char*>(request_data.data()),
                             static_cast<int>(request_data.size()), 0);
+            diag::log_tagged_fmt("mitm", "handle_plain_connection send_request sent=%d size=%zu exchange_id=%llu", sent, request_data.size(), static_cast<unsigned long long>(exchange.id));
             if (sent > 0) {
                 std::vector<uint8_t> response_data;
                 if (recv_all(target_sock, response_data, state.config.max_body_size)) {
@@ -1511,6 +1571,7 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
                     exchange.latency_ms = exchange.response_time - exchange.request_time;
                     exchange.response = protocol_parser::parse_http_response(response_data.data(), response_data.size());
                     exchange.state = http_exchange::state_t::complete;
+                    diag::log_tagged_fmt("mitm", "handle_plain_connection response_ok status=%d size=%zu latency_ms=%llu exchange_id=%llu", exchange.response.status_code, response_data.size(), static_cast<unsigned long long>(exchange.latency_ms), static_cast<unsigned long long>(exchange.id));
 
                     state.total_bytes_out.fetch_add(response_data.size());
 
@@ -1525,8 +1586,10 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
                         hook_data.body = response_data;
                         script_engine::invoke_hook(script_engine::hook_type::on_response, hook_data);
                         if (hook_data.dropped) {
+                            diag::log_tagged_fmt("mitm", "handle_plain_connection script_response_dropped exchange_id=%llu", static_cast<unsigned long long>(exchange.id));
                             exchange.state = http_exchange::state_t::dropped;
                         } else if (hook_data.modified) {
+                            diag::log_tagged_fmt("mitm", "handle_plain_connection script_response_modified new_size=%zu exchange_id=%llu", hook_data.body.size(), static_cast<unsigned long long>(exchange.id));
                             response_data = hook_data.body;
                         }
                     }
@@ -1537,15 +1600,18 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
                         send(client_sock, reinterpret_cast<const char*>(response_data.data()),
                              static_cast<int>(response_data.size()), 0);
                 } else {
+                    diag::log_tagged_fmt("mitm", "handle_plain_connection recv_response_failed exchange_id=%llu", static_cast<unsigned long long>(exchange.id));
                     exchange.state = http_exchange::state_t::error;
                     exchange.error_msg = "No response from target";
                 }
             } else {
+                diag::log_tagged_fmt("mitm", "handle_plain_connection send_failed exchange_id=%llu", static_cast<unsigned long long>(exchange.id));
                 exchange.state = http_exchange::state_t::error;
                 exchange.error_msg = "Failed to send to target";
             }
             close_socket(target_sock);
         } else {
+            diag::log_tagged_fmt("mitm", "handle_plain_connection connect_failed host=%s port=%u exchange_id=%llu", target_host.c_str(), target_port, static_cast<unsigned long long>(exchange.id));
             exchange.state = http_exchange::state_t::error;
             exchange.error_msg = "Cannot connect to target";
         }
@@ -1567,20 +1633,23 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
 static void handle_client(SOCKET client_sock, sockaddr_in client_addr_in, state_t& state) {
     std::string client_addr = addr_to_string(client_addr_in);
     uint16_t client_port = ntohs(client_addr_in.sin_port);
-
+    diag::log_tagged_fmt("mitm", "handle_client entry client=%s:%u", client_addr.c_str(), client_port);
 
     uint8_t peek_buf[16] = {};
     int peeked = recv(client_sock, reinterpret_cast<char*>(peek_buf), sizeof(peek_buf), MSG_PEEK);
     if (peeked <= 0) {
+        diag::log_tagged_fmt("mitm", "handle_client peek_failed peeked=%d client=%s:%u", peeked, client_addr.c_str(), client_port);
         close_socket(client_sock);
         return;
     }
 
+    diag::log_tagged_fmt("mitm", "handle_client peeked=%d first_bytes=%02x%02x%02x is_connect=%d client=%s:%u", peeked, peek_buf[0], peek_buf[1], peek_buf[2], (peeked >= 7 && memcmp(peek_buf, "CONNECT", 7) == 0) ? 1 : 0, client_addr.c_str(), client_port);
 
     if (peeked >= 7 && memcmp(peek_buf, "CONNECT", 7) == 0) {
 
         std::vector<uint8_t> connect_req;
         if (!recv_all(client_sock, connect_req, 8192)) {
+            diag::log_tagged_fmt("mitm", "handle_client connect_recv_all_failed client=%s:%u", client_addr.c_str(), client_port);
             close_socket(client_sock);
             return;
         }
@@ -1590,8 +1659,10 @@ static void handle_client(SOCKET client_sock, sockaddr_in client_addr_in, state_
         std::string target_host;
         uint16_t target_port = 443;
         parse_connect_target(first_line, target_host, target_port);
+        diag::log_tagged_fmt("mitm", "handle_client connect_target host=%s port=%u client=%s:%u", target_host.c_str(), target_port, client_addr.c_str(), client_port);
 
         if (target_host.empty()) {
+            diag::log_tagged_fmt("mitm", "handle_client connect_empty_target client=%s:%u", client_addr.c_str(), client_port);
             close_socket(client_sock);
             return;
         }
@@ -1601,18 +1672,19 @@ static void handle_client(SOCKET client_sock, sockaddr_in client_addr_in, state_
         send(client_sock, ok_resp, static_cast<int>(strlen(ok_resp)), 0);
 
         if (state.config.decode_tls) {
-
+            diag::log_tagged_fmt("mitm", "handle_client dispatch_tls host=%s port=%u client=%s:%u", target_host.c_str(), target_port, client_addr.c_str(), client_port);
             handle_tls_connection(client_sock, target_host, target_port, client_addr, client_port, state);
         } else {
-
+            diag::log_tagged_fmt("mitm", "handle_client dispatch_tunnel host=%s port=%u client=%s:%u", target_host.c_str(), target_port, client_addr.c_str(), client_port);
             SOCKET target_sock = connect_to_target(target_host, target_port);
             if (target_sock == INVALID_SOCKET) {
+                diag::log_tagged_fmt("mitm", "handle_client tunnel_connect_failed host=%s port=%u client=%s:%u", target_host.c_str(), target_port, client_addr.c_str(), client_port);
                 close_socket(client_sock);
                 return;
             }
 
             state.active_connections.fetch_add(1);
-
+            diag::log_tagged_fmt("mitm", "handle_client tunnel_started host=%s port=%u client=%s:%u", target_host.c_str(), target_port, client_addr.c_str(), client_port);
 
             fd_set fds;
             uint8_t buf[8192];
@@ -1645,17 +1717,19 @@ static void handle_client(SOCKET client_sock, sockaddr_in client_addr_in, state_
             }
 
             state.active_connections.fetch_sub(1);
+            diag::log_tagged_fmt("mitm", "handle_client tunnel_done host=%s port=%u client=%s:%u", target_host.c_str(), target_port, client_addr.c_str(), client_port);
             close_socket(target_sock);
             close_socket(client_sock);
         }
     } else {
-
+        diag::log_tagged_fmt("mitm", "handle_client dispatch_plain client=%s:%u", client_addr.c_str(), client_port);
         handle_plain_connection(client_sock, client_addr, client_port, state);
     }
 }
 
 
 static void worker_thread_func(state_t& state) {
+    diag::log_tagged("mitm", "worker_thread_func started");
     while (state.proxy_alive.load()) {
         {
             std::unique_lock<std::mutex> lk(state.proxy_start_mtx);
@@ -1663,6 +1737,7 @@ static void worker_thread_func(state_t& state) {
                 return state.running.load() || !state.proxy_alive.load();
             });
         }
+        diag::log_tagged_fmt("mitm", "worker_thread_func running=%d proxy_alive=%d", (int)state.running.load(), (int)state.proxy_alive.load());
         while (state.running.load()) {
             work_item item;
             {
@@ -1675,6 +1750,7 @@ static void worker_thread_func(state_t& state) {
                 item = state.work_queue.front();
                 state.work_queue.pop();
             }
+            diag::log_tagged_fmt("mitm", "worker_thread_func dequeued client_port=%u", item.client_port);
 
             sockaddr_in client_addr_in = {};
             client_addr_in.sin_family = AF_INET;
@@ -1682,7 +1758,9 @@ static void worker_thread_func(state_t& state) {
             client_addr_in.sin_port = htons(item.client_port);
             handle_client(static_cast<SOCKET>(item.client_socket), client_addr_in, state);
         }
+        diag::log_tagged("mitm", "worker_thread_func inner_loop_exit");
     }
+    diag::log_tagged("mitm", "worker_thread_func exiting");
 }
 
 static void listener_thread_func(state_t& state) {
@@ -1870,45 +1948,58 @@ bool is_running() {
 }
 
 void pre_initialize() {
+    diag::log_tagged_fmt("mitm", "pre_initialize entry worker_pool_size=%u", WORKER_POOL_SIZE);
     auto& st = g_state;
     st.proxy_alive.store(true);
 
     state_t* st_ptr = &st;
 
     st.listener_done.store(false, std::memory_order_release);
-    if (!work_queue::post([st_ptr]() {
+    bool listener_posted = work_queue::post([st_ptr]() {
             listener_thread_func(*st_ptr);
             st_ptr->listener_done.store(true, std::memory_order_release);
-        }))
-    {
+        });
+    if (!listener_posted) {
+        diag::log_tagged("mitm", "pre_initialize listener_post_failed");
         st.listener_done.store(true, std::memory_order_release);
+    } else {
+        diag::log_tagged("mitm", "pre_initialize listener_posted");
     }
 
     for (uint32_t i = 0; i < WORKER_POOL_SIZE; ++i) {
         st.active_worker_count.fetch_add(1, std::memory_order_acq_rel);
-        if (!work_queue::post([st_ptr]() {
+        bool worker_posted = work_queue::post([st_ptr]() {
                 worker_thread_func(*st_ptr);
                 st_ptr->active_worker_count.fetch_sub(1, std::memory_order_acq_rel);
-            }))
-        {
+            });
+        if (!worker_posted) {
+            diag::log_tagged_fmt("mitm", "pre_initialize worker_post_failed i=%u", i);
             st.active_worker_count.fetch_sub(1, std::memory_order_acq_rel);
+        } else {
+            diag::log_tagged_fmt("mitm", "pre_initialize worker_posted i=%u", i);
         }
     }
+    diag::log_tagged_fmt("mitm", "pre_initialize complete worker_count=%d", (int)st.active_worker_count.load());
 }
 
 void shutdown() {
+    diag::log_tagged_fmt("mitm", "shutdown entry active_workers=%d", (int)g_state.active_worker_count.load());
     auto& st = g_state;
     stop();
     st.proxy_alive.store(false);
     st.work_cv.notify_all();
     st.proxy_start_cv.notify_all();
+    diag::log_tagged("mitm", "shutdown draining_workers");
     while (st.active_worker_count.load(std::memory_order_acquire) > 0)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    diag::log_tagged("mitm", "shutdown draining_listener");
     while (!st.listener_done.load(std::memory_order_acquire))
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    diag::log_tagged("mitm", "shutdown complete");
 }
 
 std::vector<http_exchange> get_history(size_t max_count) {
+    diag::log_tagged_fmt("mitm", "get_history entry max_count=%zu", max_count);
     std::lock_guard<std::mutex> lock(g_state.history_mutex);
     std::vector<http_exchange> result;
     size_t count = g_state.history.size();
@@ -1920,21 +2011,30 @@ std::vector<http_exchange> get_history(size_t max_count) {
         if (i++ < skip) continue;
         if (ex_ptr) result.push_back(*ex_ptr);
     }
+    diag::log_tagged_fmt("mitm", "get_history result=%zu total_history=%zu", result.size(), count);
     return result;
 }
 
 const http_exchange* find_exchange(uint64_t id) {
+    diag::log_tagged_fmt("mitm", "find_exchange entry id=%llu", static_cast<unsigned long long>(id));
     std::lock_guard<std::mutex> lock(g_state.history_mutex);
     for (const auto& ex_ptr : g_state.history) {
-        if (ex_ptr && ex_ptr->id == id) return ex_ptr.get();
+        if (ex_ptr && ex_ptr->id == id) {
+            diag::log_tagged_fmt("mitm", "find_exchange found id=%llu method=%s uri=%s", static_cast<unsigned long long>(id), ex_ptr->request.method.c_str(), ex_ptr->request.uri.c_str());
+            return ex_ptr.get();
+        }
     }
+    diag::log_tagged_fmt("mitm", "find_exchange not_found id=%llu", static_cast<unsigned long long>(id));
     return nullptr;
 }
 
 void clear_history() {
+    diag::log_tagged("mitm", "clear_history entry");
     std::lock_guard<std::mutex> lock(g_state.history_mutex);
+    size_t was = g_state.history.size();
     g_state.history.clear();
     g_state.next_id.store(1);
+    diag::log_tagged_fmt("mitm", "clear_history complete cleared=%zu", was);
 }
 
 size_t history_count() {
@@ -2065,6 +2165,7 @@ void forward_all() {
         for (auto& kv : g_state.held_waits)
             waits.push_back(kv.second);
     }
+    diag::log_tagged_fmt("mitm", "forward_all count=%zu", waits.size());
     for (auto& wait : waits) {
         {
             std::lock_guard<std::mutex> wlock(wait->mtx);
@@ -2074,6 +2175,7 @@ void forward_all() {
         }
         wait->cv.notify_all();
     }
+    diag::log_tagged_fmt("mitm", "forward_all complete count=%zu", waits.size());
 }
 
 void drop_all() {
@@ -2084,6 +2186,7 @@ void drop_all() {
         for (auto& kv : g_state.held_waits)
             waits.push_back(kv.second);
     }
+    diag::log_tagged_fmt("mitm", "drop_all count=%zu", waits.size());
     for (auto& wait : waits) {
         {
             std::lock_guard<std::mutex> wlock(wait->mtx);
@@ -2093,32 +2196,39 @@ void drop_all() {
         }
         wait->cv.notify_all();
     }
+    diag::log_tagged_fmt("mitm", "drop_all complete count=%zu", waits.size());
 }
 
 std::vector<http_exchange> get_held_exchanges() {
+    diag::log_tagged("mitm", "get_held_exchanges entry");
     std::lock_guard<std::mutex> lock(g_state.held_mutex);
     std::vector<http_exchange> result;
     result.reserve(g_state.held_exchanges.size());
     for (const auto* ex : g_state.held_exchanges) {
         if (ex) result.push_back(*ex);
     }
+    diag::log_tagged_fmt("mitm", "get_held_exchanges result=%zu", result.size());
     return result;
 }
 
 repeat_result repeat_request(const std::string& host, uint16_t port, bool use_tls,
                              const std::vector<uint8_t>& raw_request) {
+    diag::log_tagged_fmt("mitm", "repeat_request entry host=%s port=%u use_tls=%d req_size=%zu", host.c_str(), port, (int)use_tls, raw_request.size());
     repeat_result result;
 
     if (!s_wsa_guard.ok) {
+        diag::log_tagged("mitm", "repeat_request wsa_not_ok");
         result.error = "WSAStartup failed";
         return result;
     }
 
     SOCKET sock = connect_to_target(host, port);
     if (sock == INVALID_SOCKET) {
+        diag::log_tagged_fmt("mitm", "repeat_request connect_failed host=%s port=%u", host.c_str(), port);
         result.error = "Cannot connect to " + host + ":" + std::to_string(port);
         return result;
     }
+    diag::log_tagged_fmt("mitm", "repeat_request connected host=%s port=%u use_tls=%d", host.c_str(), port, (int)use_tls);
 
     result.exchange.target_host = host;
     result.exchange.target_port = port;
@@ -2147,12 +2257,14 @@ repeat_result repeat_request(const std::string& host, uint16_t port, bool use_tl
         SSL_set_tlsext_host_name(ssl, host.c_str());
 
         if (!ssl_handshake_with_timeout(ssl, SSL_connect)) {
+            diag::log_tagged_fmt("mitm", "repeat_request tls_handshake_failed host=%s port=%u", host.c_str(), port);
             SSL_free(ssl);
             SSL_CTX_free(ctx);
             close_socket(sock);
             result.error = "TLS handshake failed";
             return result;
         }
+        diag::log_tagged_fmt("mitm", "repeat_request tls_handshake_ok host=%s port=%u", host.c_str(), port);
 
         SSL_write(ssl, raw_request.data(), static_cast<int>(raw_request.size()));
 
@@ -2166,7 +2278,9 @@ repeat_result repeat_request(const std::string& host, uint16_t port, bool use_tl
             result.exchange.response = protocol_parser::parse_http_response(response_data.data(), response_data.size());
             result.exchange.state = http_exchange::state_t::complete;
             result.success = true;
+            diag::log_tagged_fmt("mitm", "repeat_request tls_response_ok host=%s status=%d size=%zu latency_ms=%llu", host.c_str(), result.exchange.response.status_code, response_data.size(), static_cast<unsigned long long>(result.exchange.latency_ms));
         } else {
+            diag::log_tagged_fmt("mitm", "repeat_request tls_no_response host=%s port=%u", host.c_str(), port);
             result.error = "No response from server";
         }
 
@@ -2187,16 +2301,20 @@ repeat_result repeat_request(const std::string& host, uint16_t port, bool use_tl
             result.exchange.response = protocol_parser::parse_http_response(response_data.data(), response_data.size());
             result.exchange.state = http_exchange::state_t::complete;
             result.success = true;
+            diag::log_tagged_fmt("mitm", "repeat_request plain_response_ok host=%s status=%d size=%zu latency_ms=%llu", host.c_str(), result.exchange.response.status_code, response_data.size(), static_cast<unsigned long long>(result.exchange.latency_ms));
         } else {
+            diag::log_tagged_fmt("mitm", "repeat_request plain_no_response host=%s port=%u", host.c_str(), port);
             result.error = "No response from server";
         }
     }
 
     close_socket(sock);
+    diag::log_tagged_fmt("mitm", "repeat_request complete host=%s success=%d", host.c_str(), (int)result.success);
     return result;
 }
 
 proxy_stats get_stats() {
+    diag::log_tagged("mitm", "get_stats entry");
     proxy_stats stats;
     stats.running = g_state.running.load();
     stats.total_requests = g_state.total_requests.load();
@@ -2212,6 +2330,13 @@ proxy_stats get_stats() {
         std::lock_guard<std::mutex> lock(g_state.held_mutex);
         stats.held_count = g_state.held_exchanges.size();
     }
+    diag::log_tagged_fmt("mitm", "get_stats running=%d requests=%llu bytes_in=%llu bytes_out=%llu active=%llu history=%zu held=%zu",
+        (int)stats.running,
+        static_cast<unsigned long long>(stats.total_requests),
+        static_cast<unsigned long long>(stats.total_bytes_in),
+        static_cast<unsigned long long>(stats.total_bytes_out),
+        static_cast<unsigned long long>(stats.active_connections),
+        stats.history_size, stats.held_count);
     return stats;
 }
 

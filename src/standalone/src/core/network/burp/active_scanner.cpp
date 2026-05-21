@@ -140,7 +140,13 @@ void run_module_for_point(std::shared_ptr<audit_runtime_t> rt_ptr,
                           const scanner::module_t& mod,
                           const insertion_point_t& ip)
 {
-    if (rt_ptr->cancel_flag.load()) return;
+    diag::log_tagged_fmt("scanner", "run_module_for_point audit=%llu module=%s ip_kind=%s ip_name=%s",
+        static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str(), ip.kind.c_str(), ip.name.c_str());
+    if (rt_ptr->cancel_flag.load()) {
+        diag::log_tagged_fmt("scanner", "run_module_for_point cancelled early audit=%llu module=%s",
+            static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str());
+        return;
+    }
 
     scanner::module_context_t ctx;
     ctx.audit_id = rt_ptr->status.id;
@@ -162,24 +168,52 @@ void run_module_for_point(std::shared_ptr<audit_runtime_t> rt_ptr,
         ctx.baseline_response_body = baseline->resp_body;
         ctx.baseline_response_headers = baseline->resp_headers;
         ctx.baseline_status_code = baseline->status_code;
+        diag::log_tagged_fmt("scanner", "run_module_for_point baseline audit=%llu module=%s status=%d latency=%llu body=%zu",
+            static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str(),
+            baseline->status_code, static_cast<unsigned long long>(baseline->latency_ms), baseline->resp_body.size());
+    } else {
+        diag::log_tagged_fmt("scanner", "run_module_for_point baseline_failed audit=%llu module=%s",
+            static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str());
     }
 
     auto send_fn = make_send_fn(rt_ptr, mod.id);
 
     if (mod.custom_run) {
+        diag::log_tagged_fmt("scanner", "run_module_for_point custom_run audit=%llu module=%s",
+            static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str());
         mod.custom_run(ip, ctx, send_fn);
         if (!mod.probes || !mod.detect) return;
     }
 
-    if (!mod.probes || !mod.detect) return;
+    if (!mod.probes || !mod.detect) {
+        diag::log_tagged_fmt("scanner", "run_module_for_point no_probes_or_detect audit=%llu module=%s", static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str());
+        return;
+    }
     auto probes = mod.probes(ip, ctx);
     int probe_cap = mod.max_probes_per_point > 0 ? mod.max_probes_per_point : 6;
+    diag::log_tagged_fmt("scanner", "run_module_for_point probes_generated audit=%llu module=%s ip=%s/%s probe_count=%zu cap=%d",
+        static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str(),
+        ip.kind.c_str(), ip.name.c_str(), probes.size(), probe_cap);
     int issued = 0;
     for (const auto& p : probes) {
-        if (rt_ptr->cancel_flag.load()) return;
-        if (issued >= probe_cap) break;
-        if (!wait_for_inflight_slot(*rt_ptr, rt_ptr->config.max_concurrent_requests)) return;
+        if (rt_ptr->cancel_flag.load()) {
+            diag::log_tagged_fmt("scanner", "run_module_for_point probe_loop cancelled audit=%llu module=%s issued=%d",
+                static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str(), issued);
+            return;
+        }
+        if (issued >= probe_cap) {
+            diag::log_tagged_fmt("scanner", "run_module_for_point probe_cap_reached audit=%llu module=%s cap=%d",
+                static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str(), probe_cap);
+            break;
+        }
+        if (!wait_for_inflight_slot(*rt_ptr, rt_ptr->config.max_concurrent_requests)) {
+            diag::log_tagged_fmt("scanner", "run_module_for_point inflight_wait_failed audit=%llu module=%s",
+                static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str());
+            return;
+        }
 
+        diag::log_tagged_fmt("scanner", "run_module_for_point sending_probe audit=%llu module=%s probe_idx=%d payload_len=%zu",
+            static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str(), issued, p.payload.size());
         auto built = ip.build ? ip.build(p.payload) : std::vector<uint8_t>(ip.base_request.begin(), ip.base_request.end());
         auto resp = send_fn(built, p);
         release_inflight(*rt_ptr);
@@ -188,13 +222,24 @@ void run_module_for_point(std::shared_ptr<audit_runtime_t> rt_ptr,
             rt_ptr->status.completed_probes++;
         }
         ++issued;
-        if (!resp.has_value()) continue;
+        if (!resp.has_value()) {
+            diag::log_tagged_fmt("scanner", "run_module_for_point probe_no_response audit=%llu module=%s probe_idx=%d",
+                static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str(), issued - 1);
+            continue;
+        }
+        diag::log_tagged_fmt("scanner", "run_module_for_point probe_response audit=%llu module=%s probe_idx=%d status=%d body=%zu latency=%llu",
+            static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str(), issued - 1,
+            resp->status_code, resp->resp_body.size(), static_cast<unsigned long long>(resp->latency_ms));
         auto maybe = mod.detect(ip, p, *resp, ctx);
         if (maybe.has_value()) {
+            diag::log_tagged_fmt("scanner", "run_module_for_point issue_found audit=%llu module=%s type=%s",
+                static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str(), maybe->type_key.c_str());
             emit_issue_safe(rt_ptr, *maybe);
             break;
         }
     }
+    diag::log_tagged_fmt("scanner", "run_module_for_point done audit=%llu module=%s ip=%s/%s issued=%d",
+        static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str(), ip.kind.c_str(), ip.name.c_str(), issued);
 }
 
 void run_audit(std::shared_ptr<audit_runtime_t> rt_ptr)
@@ -266,21 +311,31 @@ void run_audit(std::shared_ptr<audit_runtime_t> rt_ptr)
 
 bool initialize()
 {
+    diag::log_tagged_fmt("scanner", "active_scanner initialize called");
     auto& s = state();
     bool expected = false;
-    if (!s.initialized.compare_exchange_strong(expected, true)) return true;
+    if (!s.initialized.compare_exchange_strong(expected, true)) {
+        diag::log_tagged_fmt("scanner", "active_scanner already_initialized");
+        return true;
+    }
+    diag::log_tagged_fmt("scanner", "active_scanner initialize success");
     return true;
 }
 
 void shutdown()
 {
+    diag::log_tagged_fmt("scanner", "active_scanner shutdown called");
     auto& s = state();
-    if (!s.initialized.load()) return;
+    if (!s.initialized.load()) {
+        diag::log_tagged_fmt("scanner", "active_scanner shutdown skipped not_initialized");
+        return;
+    }
     std::vector<std::shared_ptr<audit_runtime_t>> alive;
     {
         std::lock_guard<std::mutex> lk(s.audits_mtx);
         for (auto& kv : s.audits) alive.push_back(kv.second);
     }
+    diag::log_tagged_fmt("scanner", "active_scanner shutdown cancelling %zu audits", alive.size());
     for (auto& rt : alive) rt->cancel_flag.store(true);
     auto t0 = std::chrono::steady_clock::now();
     while (true) {
@@ -290,26 +345,39 @@ void shutdown()
             if (rt->status.running) { all_done = false; break; }
         }
         if (all_done) break;
-        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(5)) break;
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(5)) {
+            diag::log_tagged_fmt("scanner", "active_scanner shutdown timeout waiting for audits");
+            break;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+    diag::log_tagged_fmt("scanner", "active_scanner shutdown complete");
 }
 
 uint64_t enqueue_target(const std::vector<uint8_t>& raw_request,
                         const std::string& url,
                         const audit_config_t& cfg)
 {
+    diag::log_tagged_fmt("scanner", "enqueue_target url=%s req_len=%zu scope_only=%d timeout=%d modules=%zu",
+        url.c_str(), raw_request.size(), cfg.scope_only ? 1 : 0, cfg.timeout_ms, cfg.enabled_modules.size());
     auto& s = state();
     if (!s.initialized.load()) initialize();
-    if (raw_request.empty() || url.empty()) { set_err("active_scanner.enqueue: empty request or url"); return 0; }
+    if (raw_request.empty() || url.empty()) {
+        diag::log_tagged_fmt("scanner", "enqueue_target rejected empty_request=%d empty_url=%d",
+            raw_request.empty() ? 1 : 0, url.empty() ? 1 : 0);
+        set_err("active_scanner.enqueue: empty request or url");
+        return 0;
+    }
 
     std::string scheme, host, path;
     uint16_t port = 0;
     if (!audit_http::parse_url(url, scheme, host, port, path)) {
+        diag::log_tagged_fmt("scanner", "enqueue_target rejected invalid_url=%s", url.c_str());
         set_err("active_scanner.enqueue: invalid url");
         return 0;
     }
     if (cfg.scope_only && !scope::in_scope(url)) {
+        diag::log_tagged_fmt("scanner", "enqueue_target rejected out_of_scope url=%s", url.c_str());
         set_err("active_scanner.enqueue: target out of scope");
         return 0;
     }
@@ -328,6 +396,9 @@ uint64_t enqueue_target(const std::vector<uint8_t>& raw_request,
         s.audits[rt->status.id] = rt;
     }
 
+    diag::log_tagged_fmt("scanner", "enqueue_target queued audit_id=%llu host=%s port=%u tls=%d",
+        static_cast<unsigned long long>(rt->status.id), host.c_str(), port, rt->status.tls ? 1 : 0);
+
     std::shared_ptr<audit_runtime_t> captured = rt;
     work_queue::post([captured]() { run_audit(captured); });
 
@@ -336,16 +407,21 @@ uint64_t enqueue_target(const std::vector<uint8_t>& raw_request,
 
 bool cancel_audit(uint64_t audit_id)
 {
+    diag::log_tagged_fmt("scanner", "cancel_audit id=%llu", static_cast<unsigned long long>(audit_id));
     auto& s = state();
     std::shared_ptr<audit_runtime_t> rt;
     {
         std::lock_guard<std::mutex> lk(s.audits_mtx);
         auto it = s.audits.find(audit_id);
-        if (it == s.audits.end()) return false;
+        if (it == s.audits.end()) {
+            diag::log_tagged_fmt("scanner", "cancel_audit id=%llu not_found", static_cast<unsigned long long>(audit_id));
+            return false;
+        }
         rt = it->second;
     }
     rt->cancel_flag.store(true);
     rt->cancel_cv.notify_all();
+    diag::log_tagged_fmt("scanner", "cancel_audit id=%llu cancel_flag_set", static_cast<unsigned long long>(audit_id));
     return true;
 }
 
@@ -370,16 +446,23 @@ std::vector<audit_status_t> list_audits()
 
 bool get_status(uint64_t audit_id, audit_status_t& out)
 {
+    diag::log_tagged_fmt("scanner", "get_status id=%llu", static_cast<unsigned long long>(audit_id));
     auto& s = state();
     std::shared_ptr<audit_runtime_t> rt;
     {
         std::lock_guard<std::mutex> lk(s.audits_mtx);
         auto it = s.audits.find(audit_id);
-        if (it == s.audits.end()) return false;
+        if (it == s.audits.end()) {
+            diag::log_tagged_fmt("scanner", "get_status id=%llu not_found", static_cast<unsigned long long>(audit_id));
+            return false;
+        }
         rt = it->second;
     }
     std::lock_guard<std::mutex> lk(rt->status_mtx);
     out = rt->status;
+    diag::log_tagged_fmt("scanner", "get_status id=%llu running=%d issues=%zu completed=%zu total=%zu",
+        static_cast<unsigned long long>(audit_id), out.running ? 1 : 0,
+        out.issues_found, out.completed_probes, out.total_probes);
     return true;
 }
 

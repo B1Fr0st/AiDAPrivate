@@ -769,12 +769,18 @@ static std::string generate_token_internal()
 
 bool start(const collaborator_config_t& cfg)
 {
+    diag::log_tagged_fmt("collaborator", "start entry http=%d dns=%d smtp=%d bind=%s http_port=%u dns_port=%u smtp_port=%u",
+        static_cast<int>(cfg.enable_http), static_cast<int>(cfg.enable_dns), static_cast<int>(cfg.enable_smtp),
+        cfg.bind_ip.c_str(), static_cast<unsigned>(cfg.http_port),
+        static_cast<unsigned>(cfg.dns_port), static_cast<unsigned>(cfg.smtp_port));
     if (!s_wsa_guard.ok) {
+        diag::log_tagged_fmt("collaborator", "start winsock_not_initialized");
         set_last_error("winsock_init_failed");
         return false;
     }
 
     if (g_state.running.exchange(true)) {
+        diag::log_tagged_fmt("collaborator", "start already_running");
         set_last_error("already_running");
         return false;
     }
@@ -851,12 +857,20 @@ bool start(const collaborator_config_t& cfg)
     }
 
     set_last_error("");
+    diag::log_tagged_fmt("collaborator", "start done http_alive=%d dns_alive=%d smtp_alive=%d",
+        g_state.http_alive.load() ? 1 : 0,
+        g_state.dns_alive.load() ? 1 : 0,
+        g_state.smtp_alive.load() ? 1 : 0);
     return true;
 }
 
 void stop()
 {
-    if (!g_state.running.exchange(false)) return;
+    diag::log_tagged_fmt("collaborator", "stop entry");
+    if (!g_state.running.exchange(false)) {
+        diag::log_tagged_fmt("collaborator", "stop not_running");
+        return;
+    }
 
     g_state.stop_request.store(true);
 
@@ -891,7 +905,9 @@ void stop()
 
 bool is_running()
 {
-    return g_state.running.load();
+    bool r = g_state.running.load();
+    ::diag::log_tagged_fmt("collaborator", "is_running result=%d", static_cast<int>(r));
+    return r;
 }
 
 status_t status()
@@ -911,11 +927,16 @@ status_t status()
     s.interaction_count = g_state.interactions.size();
     s.token_count = g_state.tokens.size();
     s.started_ms = g_state.started_ms;
+    ::diag::log_tagged_fmt("collaborator", "status running=%d http=%d dns=%d smtp=%d interactions=%zu tokens=%zu",
+        static_cast<int>(s.running), static_cast<int>(s.http_alive),
+        static_cast<int>(s.dns_alive), static_cast<int>(s.smtp_alive),
+        s.interaction_count, s.token_count);
     return s;
 }
 
 collaborator_config_t current_config()
 {
+    ::diag::log_tagged_fmt("collaborator", "current_config entry");
     std::lock_guard<std::mutex> lk(g_state.mtx);
     return g_state.config;
 }
@@ -946,47 +967,59 @@ std::string generate_token()
 
 std::vector<token_info_t> list_tokens()
 {
+    ::diag::log_tagged_fmt("collaborator", "list_tokens entry");
     std::vector<token_info_t> out;
     std::lock_guard<std::mutex> lk(g_state.mtx);
     out.reserve(g_state.tokens.size());
     for (const auto& kv : g_state.tokens) out.push_back(kv.second);
+    ::diag::log_tagged_fmt("collaborator", "list_tokens result=%zu", out.size());
     return out;
 }
 
 bool forget_token(const std::string& token)
 {
+    ::diag::log_tagged_fmt("collaborator", "forget_token entry token=%s", token.c_str());
     std::string norm = lower_ascii(token);
     std::lock_guard<std::mutex> lk(g_state.mtx);
     auto it = g_state.tokens.find(norm);
-    if (it == g_state.tokens.end()) return false;
+    if (it == g_state.tokens.end()) {
+        ::diag::log_tagged_fmt("collaborator", "forget_token not_found token=%s", token.c_str());
+        return false;
+    }
     g_state.tokens.erase(it);
+    ::diag::log_tagged_fmt("collaborator", "forget_token ok token=%s", token.c_str());
     return true;
 }
 
 std::vector<interaction_t> poll_since(uint64_t timestamp_ms_inclusive)
 {
+    ::diag::log_tagged_fmt("collaborator", "poll_since entry ts=%llu", static_cast<unsigned long long>(timestamp_ms_inclusive));
     std::vector<interaction_t> out;
     std::lock_guard<std::mutex> lk(g_state.mtx);
     out.reserve(g_state.interactions.size());
     for (const auto& it : g_state.interactions) {
         if (it.timestamp_ms >= timestamp_ms_inclusive) out.push_back(it);
     }
+    ::diag::log_tagged_fmt("collaborator", "poll_since result=%zu", out.size());
     return out;
 }
 
 std::vector<interaction_t> poll_by_token(const std::string& token)
 {
+    ::diag::log_tagged_fmt("collaborator", "poll_by_token entry token=%s", token.c_str());
     std::string norm = lower_ascii(token);
     std::vector<interaction_t> out;
     std::lock_guard<std::mutex> lk(g_state.mtx);
     for (const auto& it : g_state.interactions) {
         if (it.payload_token == norm) out.push_back(it);
     }
+    ::diag::log_tagged_fmt("collaborator", "poll_by_token result=%zu token=%s", out.size(), token.c_str());
     return out;
 }
 
 std::vector<interaction_t> snapshot_all(size_t max_entries)
 {
+    ::diag::log_tagged_fmt("collaborator", "snapshot_all entry max=%zu", max_entries);
     std::vector<interaction_t> out;
     std::lock_guard<std::mutex> lk(g_state.mtx);
     size_t total = g_state.interactions.size();
@@ -996,33 +1029,45 @@ std::vector<interaction_t> snapshot_all(size_t max_entries)
         if (i++ < skip) continue;
         out.push_back(it);
     }
+    ::diag::log_tagged_fmt("collaborator", "snapshot_all result=%zu total=%zu", out.size(), total);
     return out;
 }
 
 bool get_interaction(uint64_t id, interaction_t& out)
 {
+    ::diag::log_tagged_fmt("collaborator", "get_interaction entry id=%llu", static_cast<unsigned long long>(id));
     std::lock_guard<std::mutex> lk(g_state.mtx);
     for (const auto& it : g_state.interactions) {
-        if (it.id == id) { out = it; return true; }
+        if (it.id == id) {
+            ::diag::log_tagged_fmt("collaborator", "get_interaction found id=%llu kind=%s", static_cast<unsigned long long>(id), it.kind.c_str());
+            out = it;
+            return true;
+        }
     }
+    ::diag::log_tagged_fmt("collaborator", "get_interaction not_found id=%llu", static_cast<unsigned long long>(id));
     return false;
 }
 
 void clear()
 {
+    ::diag::log_tagged_fmt("collaborator", "clear entry");
     std::lock_guard<std::mutex> lk(g_state.mtx);
+    size_t n = g_state.interactions.size();
     g_state.interactions.clear();
     for (auto& kv : g_state.tokens) {
         kv.second.interaction_count = 0;
         kv.second.last_seen_ms = 0;
     }
     g_state.next_id.store(1);
+    ::diag::log_tagged_fmt("collaborator", "clear done cleared_interactions=%zu tokens_reset=%zu", n, g_state.tokens.size());
 }
 
 std::string last_error()
 {
     std::lock_guard<std::mutex> lk(g_state.err_mtx);
-    return g_state.last_err;
+    std::string e = g_state.last_err;
+    ::diag::log_tagged_fmt("collaborator", "last_error queried val=%s", e.c_str());
+    return e;
 }
 
 }

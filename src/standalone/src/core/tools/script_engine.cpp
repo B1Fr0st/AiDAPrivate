@@ -1,5 +1,5 @@
 #include "script_engine.hpp"
-
+#include "../../helpers/diag_log.hpp"
 
 #define SOL_ALL_SAFETIES_ON 1
 #include <sol/sol.hpp>
@@ -705,12 +705,14 @@ static void apply_sandbox(sol::state& lua) {
 
 
 static void rebuild_hook_table_locked() {
+    diag::log_tagged_fmt("script_eng", "rebuild_hook_table scripts=%zu", g_scripts.size());
     if (!g_lua) return;
     reset_hook_table();
     std::string saved_context = current_script_context;
     for (auto& kv : g_scripts) {
         script_info& sinfo = kv.second;
         if (!sinfo.enabled || !sinfo.loaded) continue;
+        diag::log_tagged_fmt("script_eng", "rebuild_hook_table re-exec name='%s'", sinfo.name.c_str());
         current_script_context = sinfo.name;
         sol::protected_function_result result =
             g_lua->safe_script(sinfo.source, sol::script_pass_on_error);
@@ -718,17 +720,25 @@ static void rebuild_hook_table_locked() {
             sol::error err = result;
             sinfo.last_error = err.what();
             sinfo.loaded = false;
+            diag::log_tagged_fmt("script_eng", "rebuild_hook_table fail name='%s' err='%s'",
+                sinfo.name.c_str(), sinfo.last_error.c_str());
             add_log(sinfo.name, log_level::error,
                     "Rebuild failed: " + sinfo.last_error);
         }
     }
     current_script_context = saved_context;
+    diag::log_tagged_fmt("script_eng", "rebuild_hook_table done");
 }
 
 
 bool initialize() {
+    diag::log_tagged_fmt("script_eng", "initialize entry");
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_initialized.load()) return true;
+    if (g_initialized.load())
+    {
+        diag::log_tagged_fmt("script_eng", "initialize already done");
+        return true;
+    }
 
     g_lua = std::make_unique<sol::state>();
     g_lua->open_libraries(
@@ -746,6 +756,7 @@ bool initialize() {
     reset_hook_table();
 
     g_initialized.store(true);
+    diag::log_tagged_fmt("script_eng", "initialize done lua_state=%p", (void*)g_lua->lua_state());
     if (!g_init_logged) {
         add_log("engine", log_level::info, "Script engine initialized (Lua 5.4 + sol2)");
         g_init_logged = true;
@@ -754,8 +765,13 @@ bool initialize() {
 }
 
 void shutdown() {
+    diag::log_tagged_fmt("script_eng", "shutdown entry scripts=%zu", g_scripts.size());
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_initialized.load()) return;
+    if (!g_initialized.load())
+    {
+        diag::log_tagged_fmt("script_eng", "shutdown not initialized");
+        return;
+    }
 
     g_scripts.clear();
     g_log.clear();
@@ -763,6 +779,7 @@ void shutdown() {
     g_init_logged = false;
     g_lua.reset();
     g_initialized.store(false);
+    diag::log_tagged_fmt("script_eng", "shutdown done");
 }
 
 bool is_initialized() {
@@ -771,7 +788,13 @@ bool is_initialized() {
 
 static bool install_script_locked(const std::string& name, const std::string& path,
                                   const std::string& source, const std::string& origin) {
-    if (!g_lua) return false;
+    diag::log_tagged_fmt("script_eng", "install_script name='%s' origin='%s' bytes=%zu",
+        name.c_str(), origin.c_str(), source.size());
+    if (!g_lua)
+    {
+        diag::log_tagged_fmt("script_eng", "install_script no lua state");
+        return false;
+    }
 
     if (g_scripts.find(name) != g_scripts.end())
         add_log(name, log_level::info, "Reloading existing script");
@@ -789,20 +812,29 @@ static bool install_script_locked(const std::string& name, const std::string& pa
 
     script_info& stored = g_scripts[name];
     if (!stored.loaded) {
+        diag::log_tagged_fmt("script_eng", "install_script load fail name='%s' err='%s'",
+            name.c_str(), stored.last_error.c_str());
         add_log(name, log_level::error,
                 "Failed to load: " + stored.last_error);
         return false;
     }
+    diag::log_tagged_fmt("script_eng", "install_script ok name='%s'", name.c_str());
     add_log(name, log_level::info, "Loaded from " + origin);
     return true;
 }
 
 bool load_script(const std::string& path) {
+    diag::log_tagged_fmt("script_eng", "load_script path='%.120s'", path.c_str());
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_lua) return false;
+    if (!g_lua)
+    {
+        diag::log_tagged_fmt("script_eng", "load_script no lua state");
+        return false;
+    }
 
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {
+        diag::log_tagged_fmt("script_eng", "load_script cannot open path='%.120s'", path.c_str());
         std::filesystem::path fp(path);
         add_log(fp.stem().string(), log_level::error,
                 "Cannot open file: " + path);
@@ -818,29 +850,54 @@ bool load_script(const std::string& path) {
 }
 
 bool load_script_source(const std::string& name, const std::string& source) {
+    diag::log_tagged_fmt("script_eng", "load_script_source name='%s' bytes=%zu",
+        name.c_str(), source.size());
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_lua) return false;
+    if (!g_lua)
+    {
+        diag::log_tagged_fmt("script_eng", "load_script_source no lua state");
+        return false;
+    }
     return install_script_locked(name, std::string(), source, "source");
 }
 
 bool unload_script(const std::string& name) {
+    diag::log_tagged_fmt("script_eng", "unload_script name='%s'", name.c_str());
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_lua) return false;
+    if (!g_lua)
+    {
+        diag::log_tagged_fmt("script_eng", "unload_script no lua state");
+        return false;
+    }
     auto it = g_scripts.find(name);
-    if (it == g_scripts.end()) return false;
+    if (it == g_scripts.end())
+    {
+        diag::log_tagged_fmt("script_eng", "unload_script not found name='%s'", name.c_str());
+        return false;
+    }
 
     g_scripts.erase(it);
     rebuild_hook_table_locked();
 
+    diag::log_tagged_fmt("script_eng", "unload_script ok name='%s'", name.c_str());
     add_log(name, log_level::info, "Unloaded");
     return true;
 }
 
 bool reload_script(const std::string& name) {
+    diag::log_tagged_fmt("script_eng", "reload_script name='%s'", name.c_str());
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_lua) return false;
+    if (!g_lua)
+    {
+        diag::log_tagged_fmt("script_eng", "reload_script no lua state");
+        return false;
+    }
     auto it = g_scripts.find(name);
-    if (it == g_scripts.end()) return false;
+    if (it == g_scripts.end())
+    {
+        diag::log_tagged_fmt("script_eng", "reload_script not found name='%s'", name.c_str());
+        return false;
+    }
 
     script_info& info = it->second;
 
@@ -863,21 +920,32 @@ bool reload_script(const std::string& name) {
     rebuild_hook_table_locked();
 
     if (!info.loaded) {
+        diag::log_tagged_fmt("script_eng", "reload_script fail name='%s' err='%s'",
+            name.c_str(), info.last_error.c_str());
         add_log(name, log_level::error, "Reload failed: " + info.last_error);
         return false;
     }
+    diag::log_tagged_fmt("script_eng", "reload_script ok name='%s'", name.c_str());
     add_log(name, log_level::info, "Reloaded");
     return true;
 }
 
 void set_script_enabled(const std::string& name, bool enabled) {
+    diag::log_tagged_fmt("script_eng", "set_script_enabled name='%s' enabled=%d",
+        name.c_str(), (int)enabled);
     std::lock_guard<std::mutex> lock(g_mutex);
     auto it = g_scripts.find(name);
-    if (it == g_scripts.end()) return;
+    if (it == g_scripts.end())
+    {
+        diag::log_tagged_fmt("script_eng", "set_script_enabled not found name='%s'", name.c_str());
+        return;
+    }
     if (it->second.enabled == enabled) return;
     it->second.enabled = enabled;
 
     rebuild_hook_table_locked();
+    diag::log_tagged_fmt("script_eng", "set_script_enabled done name='%s' enabled=%d",
+        name.c_str(), (int)enabled);
     add_log(name, log_level::info, enabled ? "Enabled" : "Paused");
 }
 
@@ -903,6 +971,7 @@ static bool invoke_hook_impl(hook_type type, T& data) {
     if (type < hook_type::on_request || type >= hook_type::COUNT) return false;
 
     std::string hook_name = hook_type_name(type);
+    diag::log_tagged_fmt("script_eng", "invoke_hook hook='%s'", hook_name.c_str());
     sol::object hooks_obj = (*g_lua)["_hooks"];
     if (!hooks_obj.valid() || hooks_obj.get_type() != sol::type::table)
         return false;
@@ -928,11 +997,15 @@ static bool invoke_hook_impl(hook_type type, T& data) {
         sol::protected_function_result result = fn(std::ref(data));
         if (!result.valid()) {
             sol::error err = result;
+            diag::log_tagged_fmt("script_eng", "invoke_hook error hook='%s' err='%.120s'",
+                hook_name.c_str(), err.what());
             add_log(hook_name, log_level::error,
                     "Hook error: " + std::string(err.what()));
         }
     }
 
+    diag::log_tagged_fmt("script_eng", "invoke_hook done hook='%s' invoked=%d",
+        hook_name.c_str(), (int)invoked_any);
     current_script_context = saved_context;
     return invoked_any;
 }
@@ -993,8 +1066,14 @@ static std::string stringify_result(const sol::protected_function_result& result
 }
 
 std::string execute(const std::string& code) {
+    diag::log_tagged_fmt("script_eng", "execute code_len=%zu code='%.80s'",
+        code.size(), code.c_str());
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_lua) return "[error: engine not initialized]";
+    if (!g_lua)
+    {
+        diag::log_tagged_fmt("script_eng", "execute no lua state");
+        return "[error: engine not initialized]";
+    }
 
     std::string trimmed = code;
     size_t first = trimmed.find_first_not_of(" \t\r\n");
@@ -1038,6 +1117,7 @@ std::string execute(const std::string& code) {
     if (!out.empty())
         add_log("console", log_level::output, out);
 
+    diag::log_tagged_fmt("script_eng", "execute ok out_len=%zu", out.size());
     current_script_context = saved_context;
     return out;
 }

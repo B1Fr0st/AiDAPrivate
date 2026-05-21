@@ -20,13 +20,17 @@ namespace {
 
 void dom_xss_run(const insertion_point_t& ip, const module_context_t& ctx, const send_fn_t& send)
 {
+    diag::log_tagged_fmt("mod_dom_xss", "dom_xss_run entry ip=%s:%s url=%s", ip.kind.c_str(), ip.name.c_str(), ctx.url.c_str());
     (void)send;
     if (!camoufox::ensure_ready()) {
+        diag::log_tagged_fmt("mod_dom_xss", "dom_xss_run skip camoufox not ready ip=%s:%s", ip.kind.c_str(), ip.name.c_str());
         return;
     }
     if (!scope::in_scope(ctx.url)) {
+        diag::log_tagged_fmt("mod_dom_xss", "dom_xss_run skip out-of-scope url=%s", ctx.url.c_str());
         return;
     }
+    diag::log_tagged_fmt("mod_dom_xss", "dom_xss_run camoufox ready scanning ip=%s:%s", ip.kind.c_str(), ip.name.c_str());
 
     dom_xss::scan_options_t opts;
     opts.include_polyglot       = true;

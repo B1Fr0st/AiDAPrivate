@@ -73,6 +73,14 @@ void render(float pos_x, float pos_y, float width, float height,
 	(void)pos_x; (void)pos_y;
 	(void)accent_r; (void)accent_g; (void)accent_b;
 
+	{
+		static bool s_fz_render_logged = false;
+		if (!s_fz_render_logged) {
+			s_fz_render_logged = true;
+			diag::log_tagged_fmt("fuzz_view", "render first_frame width=%.0f height=%.0f", width, height);
+		}
+	}
+
 	ImGui::BeginChild("##fuzzer_view", ImVec2(width, height), false,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
 	ImVec2 wp = ImGui::GetWindowPos();
@@ -688,7 +696,14 @@ void render(float pos_x, float pos_y, float width, float height,
 		}
 
 		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-			st.selected_crash = selected ? -1 : i;
+			int new_sel = selected ? -1 : i;
+			diag::log_tagged_fmt("fuzz_view",
+				"crash_row_click idx=%d new_selected=%d type=%s addr=0x%llX score=%s",
+				i, new_sel,
+				fuzzer_engine::crash_type_name(crash.type),
+				static_cast<unsigned long long>(crash.instruction_address),
+				fuzzer_engine::exploit_score_name(crash.score));
+			st.selected_crash = new_sel;
 		}
 
 		float rx = ox + 16.f;
@@ -766,6 +781,22 @@ void render(float pos_x, float pos_y, float width, float height,
 
 	if (detail_panel_h > 8.f && st.selected_crash >= 0 &&
 		st.selected_crash < static_cast<int>(crashes_copy.size())) {
+		{
+			static int s_last_detail_crash = -2;
+			if (s_last_detail_crash != st.selected_crash) {
+				s_last_detail_crash = st.selected_crash;
+				if (st.selected_crash >= 0) {
+					auto& dc = crashes_copy[static_cast<size_t>(st.selected_crash)];
+					diag::log_tagged_fmt("fuzz_view",
+						"detail_panel_shown crash_idx=%d type=%s score=%s fault=0x%llX rip=0x%llX",
+						st.selected_crash,
+						fuzzer_engine::crash_type_name(dc.type),
+						fuzzer_engine::exploit_score_name(dc.score),
+						static_cast<unsigned long long>(dc.fault_address),
+						static_cast<unsigned long long>(dc.rip));
+				}
+			}
+		}
 		auto& sel = crashes_copy[static_cast<size_t>(st.selected_crash)];
 		float dy = cy + crash_table_h + 4.f;
 		float dw = width - 16.f;
@@ -894,7 +925,14 @@ void render(float pos_x, float pos_y, float width, float height,
 			aida::ui::size_t_::sm,
 			ImVec2(112.f, 28.f),
 			analyzing, nullptr, analyzing)) {
-			if (!analyzing) fuzzer_engine::ai_analyze_crash(st.selected_crash);
+			if (!analyzing) {
+				diag::log_tagged_fmt("fuzz_view",
+					"ai_analyze_clicked crash_idx=%d type=%s addr=0x%llX",
+					st.selected_crash,
+					fuzzer_engine::crash_type_name(sel.type),
+					static_cast<unsigned long long>(sel.instruction_address));
+				fuzzer_engine::ai_analyze_crash(st.selected_crash);
+			}
 		}
 		ImGui::SameLine();
 		if (aida::ui::button(minimizing ? "Minimizing" : "Minimize",
@@ -902,7 +940,12 @@ void render(float pos_x, float pos_y, float width, float height,
 			aida::ui::size_t_::sm,
 			ImVec2(102.f, 28.f),
 			minimizing, nullptr, minimizing)) {
-			if (!minimizing) fuzzer_engine::minimize_crash(st.selected_crash);
+			if (!minimizing) {
+				diag::log_tagged_fmt("fuzz_view",
+					"minimize_clicked crash_idx=%d input_size=%zu",
+					st.selected_crash, sel.input.size());
+				fuzzer_engine::minimize_crash(st.selected_crash);
+			}
 		}
 		dy_inner += 28.f;
 

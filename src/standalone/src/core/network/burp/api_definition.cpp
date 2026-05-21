@@ -808,7 +808,11 @@ uint64_t install_collection(api_collection_t col)
         col.id          = s.next_id.fetch_add(1);
         col.imported_ms = now_ms();
         s.items.push_back(std::move(col));
-        return s.items.back().id;
+        uint64_t id = s.items.back().id;
+        diag::log_tagged_fmt("api_def", "install_collection id=%llu name=%s requests=%zu format=%s",
+            static_cast<unsigned long long>(id), s.items.back().name.c_str(),
+            s.items.back().requests.size(), format_label(s.items.back().format));
+        return id;
     }
 }
 
@@ -830,8 +834,15 @@ api_format_t infer_format(const std::string& text)
 
 uint64_t import_text_with_format(const std::string& text, api_format_t fmt, const std::string& source_path)
 {
-    if (text.empty()) { set_err("api_definition.import: empty text"); return 0; }
+    diag::log_tagged_fmt("api_def", "import_text_with_format entry text_len=%zu fmt=%s source=%s",
+        text.size(), format_label(fmt), source_path.c_str());
+    if (text.empty()) {
+        diag::log_tagged_fmt("api_def", "import_text_with_format empty_text");
+        set_err("api_definition.import: empty text");
+        return 0;
+    }
     if (fmt == api_format_t::auto_detect) fmt = infer_format(text);
+    diag::log_tagged_fmt("api_def", "import_text_with_format resolved_fmt=%s", format_label(fmt));
 
     api_collection_t col;
     col.format      = fmt;
@@ -885,20 +896,26 @@ uint64_t import_text_with_format(const std::string& text, api_format_t fmt, cons
     }
 
     if (col.requests.empty()) {
+        diag::log_tagged_fmt("api_def", "import_text_with_format no_requests_parsed fmt=%s", format_label(fmt));
         set_err("api_definition.import: no requests parsed");
         return 0;
     }
 
+    diag::log_tagged_fmt("api_def", "import_text_with_format parsed name=%s requests=%zu", col.name.c_str(), col.requests.size());
     return install_collection(std::move(col));
 }
 
 bool fetch_text_url(const std::string& url, std::string& out)
 {
+    diag::log_tagged_fmt("api_def", "fetch_text_url entry url=%s", url.c_str());
     std::string scheme, host, path; uint16_t port = 0;
     if (!parse_url_components(url, scheme, host, port, path)) {
+        diag::log_tagged_fmt("api_def", "fetch_text_url parse_url_failed url=%s", url.c_str());
         set_err("api_definition.import_url: parse_url failed");
         return false;
     }
+    diag::log_tagged_fmt("api_def", "fetch_text_url parsed scheme=%s host=%s port=%u path=%s",
+        scheme.c_str(), host.c_str(), static_cast<unsigned>(port), path.c_str());
 
     std::string origin = scheme + "://" + host;
     if ((scheme == "https" && port != 443) || (scheme == "http" && port != 80)) {
@@ -914,14 +931,17 @@ bool fetch_text_url(const std::string& url, std::string& out)
 
     auto res = cli.Get(path);
     if (!res) {
+        diag::log_tagged_fmt("api_def", "fetch_text_url get_failed url=%s", url.c_str());
         set_err(std::string("api_definition.import_url: GET failed"));
         return false;
     }
     if (res->status < 200 || res->status >= 300) {
+        diag::log_tagged_fmt("api_def", "fetch_text_url http_error status=%d url=%s", res->status, url.c_str());
         set_err(std::string("api_definition.import_url: HTTP ") + std::to_string(res->status));
         return false;
     }
     out = res->body;
+    diag::log_tagged_fmt("api_def", "fetch_text_url ok url=%s body_len=%zu", url.c_str(), out.size());
     return true;
 }
 
@@ -929,28 +949,38 @@ bool fetch_text_url(const std::string& url, std::string& out)
 
 bool initialize()
 {
+    diag::log_tagged_fmt("api_def", "initialize entry");
     return true;
 }
 
 void shutdown()
 {
+    diag::log_tagged_fmt("api_def", "shutdown entry");
     auto& s = store();
     std::lock_guard<std::mutex> lk(s.mtx);
+    size_t n = s.items.size();
     s.items.clear();
+    diag::log_tagged_fmt("api_def", "shutdown done cleared=%zu", n);
 }
 
 api_format_t detect_format_from_path(const std::string& path)
 {
-    if (ends_with_ci(path, ".json"))    return api_format_t::openapi_json;
-    if (ends_with_ci(path, ".yaml") || ends_with_ci(path, ".yml")) return api_format_t::openapi_yaml;
-    if (ends_with_ci(path, ".har"))     return api_format_t::har;
-    if (ends_with_ci(path, ".graphql") || ends_with_ci(path, ".gql")) return api_format_t::graphql_sdl;
-    return api_format_t::auto_detect;
+    diag::log_tagged_fmt("api_def", "detect_format_from_path entry path=%s", path.c_str());
+    api_format_t result = api_format_t::auto_detect;
+    if (ends_with_ci(path, ".json"))    result = api_format_t::openapi_json;
+    else if (ends_with_ci(path, ".yaml") || ends_with_ci(path, ".yml")) result = api_format_t::openapi_yaml;
+    else if (ends_with_ci(path, ".har")) result = api_format_t::har;
+    else if (ends_with_ci(path, ".graphql") || ends_with_ci(path, ".gql")) result = api_format_t::graphql_sdl;
+    diag::log_tagged_fmt("api_def", "detect_format_from_path result=%s", format_label(result));
+    return result;
 }
 
 api_format_t detect_format_from_text(const std::string& text)
 {
-    return infer_format(text);
+    diag::log_tagged_fmt("api_def", "detect_format_from_text entry text_len=%zu", text.size());
+    api_format_t result = infer_format(text);
+    diag::log_tagged_fmt("api_def", "detect_format_from_text result=%s", format_label(result));
+    return result;
 }
 
 const char* format_label(api_format_t f)
@@ -969,6 +999,7 @@ const char* format_label(api_format_t f)
 
 bool parse_format(const std::string& s, api_format_t& out)
 {
+    diag::log_tagged_fmt("api_def", "parse_format entry s=%s", s.c_str());
     std::string l = to_lower(s);
     if (l == "auto" || l.empty())            { out = api_format_t::auto_detect; return true; }
     if (l == "openapi_json" || l == "openapi") { out = api_format_t::openapi_json; return true; }
@@ -977,55 +1008,87 @@ bool parse_format(const std::string& s, api_format_t& out)
     if (l == "postman" || l == "postman_v2_1") { out = api_format_t::postman_v2_1; return true; }
     if (l == "har")                           { out = api_format_t::har; return true; }
     if (l == "graphql" || l == "graphql_sdl") { out = api_format_t::graphql_sdl; return true; }
+    diag::log_tagged_fmt("api_def", "parse_format unknown_format s=%s", s.c_str());
     return false;
 }
 
 uint64_t import_from_file(const std::string& path, api_format_t hint)
 {
+    diag::log_tagged_fmt("api_def", "import_from_file entry path=%s hint=%s", path.c_str(), format_label(hint));
     std::string text = read_file_utf8(path);
     if (text.empty()) {
+        diag::log_tagged_fmt("api_def", "import_from_file empty_or_unreadable path=%s", path.c_str());
         set_err("api_definition.import_from_file: empty or unreadable file");
         return 0;
     }
     if (hint == api_format_t::auto_detect) hint = detect_format_from_path(path);
-    return import_text_with_format(text, hint, path);
+    uint64_t id = import_text_with_format(text, hint, path);
+    diag::log_tagged_fmt("api_def", "import_from_file done path=%s id=%llu", path.c_str(), static_cast<unsigned long long>(id));
+    return id;
 }
 
 uint64_t import_from_text(const std::string& text, api_format_t format)
 {
-    return import_text_with_format(text, format, std::string());
+    diag::log_tagged_fmt("api_def", "import_from_text entry text_len=%zu format=%s", text.size(), format_label(format));
+    uint64_t id = import_text_with_format(text, format, std::string());
+    diag::log_tagged_fmt("api_def", "import_from_text done id=%llu", static_cast<unsigned long long>(id));
+    return id;
 }
 
 uint64_t import_from_url(const std::string& url)
 {
+    diag::log_tagged_fmt("api_def", "import_from_url entry url=%s", url.c_str());
     std::string body;
-    if (!fetch_text_url(url, body)) return 0;
+    if (!fetch_text_url(url, body)) {
+        diag::log_tagged_fmt("api_def", "import_from_url fetch_failed url=%s", url.c_str());
+        return 0;
+    }
+    diag::log_tagged_fmt("api_def", "import_from_url fetched body_len=%zu", body.size());
     api_format_t fmt = api_format_t::auto_detect;
-    return import_text_with_format(body, fmt, url);
+    uint64_t id = import_text_with_format(body, fmt, url);
+    diag::log_tagged_fmt("api_def", "import_from_url done url=%s id=%llu", url.c_str(), static_cast<unsigned long long>(id));
+    return id;
 }
 
 std::vector<api_collection_t> list_collections()
 {
     auto& s = store();
     std::lock_guard<std::mutex> lk(s.mtx);
+    size_t n = s.items.size();
+    diag::log_tagged_fmt("api_def", "list_collections result=%zu", n);
     return s.items;
 }
 
 bool get_collection(uint64_t id, api_collection_t& out)
 {
+    diag::log_tagged_fmt("api_def", "get_collection entry id=%llu", static_cast<unsigned long long>(id));
     auto& s = store();
     std::lock_guard<std::mutex> lk(s.mtx);
-    for (const auto& it : s.items) if (it.id == id) { out = it; return true; }
+    for (const auto& it : s.items) {
+        if (it.id == id) {
+            diag::log_tagged_fmt("api_def", "get_collection found id=%llu name=%s requests=%zu",
+                static_cast<unsigned long long>(id), it.name.c_str(), it.requests.size());
+            out = it;
+            return true;
+        }
+    }
+    diag::log_tagged_fmt("api_def", "get_collection not_found id=%llu", static_cast<unsigned long long>(id));
     return false;
 }
 
 bool remove_collection(uint64_t id)
 {
+    diag::log_tagged_fmt("api_def", "remove_collection entry id=%llu", static_cast<unsigned long long>(id));
     auto& s = store();
     std::lock_guard<std::mutex> lk(s.mtx);
     for (auto it = s.items.begin(); it != s.items.end(); ++it) {
-        if (it->id == id) { s.items.erase(it); return true; }
+        if (it->id == id) {
+            diag::log_tagged_fmt("api_def", "remove_collection ok id=%llu", static_cast<unsigned long long>(id));
+            s.items.erase(it);
+            return true;
+        }
     }
+    diag::log_tagged_fmt("api_def", "remove_collection not_found id=%llu", static_cast<unsigned long long>(id));
     return false;
 }
 
@@ -1033,14 +1096,19 @@ size_t collection_count()
 {
     auto& s = store();
     std::lock_guard<std::mutex> lk(s.mtx);
-    return s.items.size();
+    size_t n = s.items.size();
+    diag::log_tagged_fmt("api_def", "collection_count result=%zu", n);
+    return n;
 }
 
 void clear_all()
 {
+    diag::log_tagged_fmt("api_def", "clear_all entry");
     auto& s = store();
     std::lock_guard<std::mutex> lk(s.mtx);
+    size_t n = s.items.size();
     s.items.clear();
+    diag::log_tagged_fmt("api_def", "clear_all done cleared=%zu", n);
 }
 
 std::vector<uint8_t> render_to_raw_request(const api_request_template_t& tpl,
@@ -1049,6 +1117,8 @@ std::vector<uint8_t> render_to_raw_request(const api_request_template_t& tpl,
                                             const std::map<std::string, std::string>& header_values,
                                             const std::string& body_override)
 {
+    diag::log_tagged_fmt("api_def", "render_to_raw_request entry method=%s path=%s base_url=%s",
+        tpl.method.c_str(), tpl.path.c_str(), tpl.base_url.c_str());
     std::string path = tpl.path;
     for (const auto& kv : tpl.path_params) {
         const std::string ph_brace = std::string("{") + kv.first + "}";
@@ -1139,18 +1209,27 @@ std::vector<uint8_t> render_to_raw_request(const api_request_template_t& tpl,
     out += "\r\n";
     out += body;
 
-    return std::vector<uint8_t>(out.begin(), out.end());
+    std::vector<uint8_t> result(out.begin(), out.end());
+    diag::log_tagged_fmt("api_def", "render_to_raw_request done method=%s path=%s bytes=%zu",
+        tpl.method.c_str(), path.c_str(), result.size());
+    return result;
 }
 
 bool audit_entire_collection(uint64_t collection_id,
                               const std::map<std::string, std::string>& auth_values,
                               audit_result_t& out)
 {
+    diag::log_tagged_fmt("api_def", "audit_entire_collection entry collection_id=%llu auth_keys=%zu",
+        static_cast<unsigned long long>(collection_id), auth_values.size());
     api_collection_t col;
     if (!get_collection(collection_id, col)) {
+        diag::log_tagged_fmt("api_def", "audit_entire_collection collection_not_found id=%llu",
+            static_cast<unsigned long long>(collection_id));
         set_err("audit_entire_collection: collection not found");
         return false;
     }
+    diag::log_tagged_fmt("api_def", "audit_entire_collection collection_found name=%s requests=%zu",
+        col.name.c_str(), col.requests.size());
 
     out = audit_result_t{};
     out.audit_id = now_ms();
@@ -1218,6 +1297,7 @@ bool audit_entire_collection(uint64_t collection_id,
 
 nlohmann::json template_to_json(const api_request_template_t& t)
 {
+    diag::log_tagged_fmt("api_def", "template_to_json entry id=%s method=%s", t.id.c_str(), t.method.c_str());
     nlohmann::json j;
     j["id"]            = t.id;
     j["method"]        = t.method;
@@ -1247,6 +1327,8 @@ nlohmann::json template_to_json(const api_request_template_t& t)
 
 nlohmann::json collection_to_json(const api_collection_t& c)
 {
+    diag::log_tagged_fmt("api_def", "collection_to_json entry id=%llu name=%s requests=%zu",
+        static_cast<unsigned long long>(c.id), c.name.c_str(), c.requests.size());
     nlohmann::json j;
     j["id"]          = c.id;
     j["name"]        = c.name;
@@ -1263,7 +1345,9 @@ nlohmann::json collection_to_json(const api_collection_t& c)
 std::string last_error()
 {
     std::lock_guard<std::mutex> lk(err_mtx());
-    return err_slot();
+    std::string e = err_slot();
+    diag::log_tagged_fmt("api_def", "last_error queried val=%s", e.c_str());
+    return e;
 }
 
 }

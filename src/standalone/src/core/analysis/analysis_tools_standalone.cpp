@@ -46,10 +46,13 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		{},
 		true,
 		[](const json&) -> tool_result_t {
+			diag::log_tagged("analysis", "scan_crypto_constants entry");
 			if (crypto_scanner::g_state.scanning.load()) {
+				diag::log_tagged("analysis", "scan_crypto_constants refused already_scanning");
 				return tool_result_t::error("A crypto scan is already in progress.");
 			}
 			crypto_scanner::scan_process();
+			diag::log_tagged("analysis", "scan_crypto_constants scan_process called waiting");
 
 			int wait = 0;
 			while (crypto_scanner::g_state.scanning.load() && wait < 600) {
@@ -59,6 +62,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 
 			std::lock_guard<std::mutex> lk(crypto_scanner::g_state.mutex);
 			auto& results = crypto_scanner::g_state.results;
+			diag::log_tagged_fmt("analysis", "scan_crypto_constants complete count=%zu", results.size());
 
 			json arr = json::array();
 			for (auto& r : results) {
@@ -94,16 +98,22 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		[](const json& params) -> tool_result_t {
 			std::string addr_str = params.value("address", "");
 			int count = params.value("instruction_count", 16);
+			diag::log_tagged_fmt("analysis", "generate_aob_signature entry addr=%s count=%d",
+				addr_str.c_str(), count);
 
 			if (addr_str.empty()) {
+				diag::log_tagged("analysis", "generate_aob_signature refused no_address");
 				return tool_result_t::error("address parameter is required");
 			}
 
 			uint64_t addr = std::strtoull(addr_str.c_str(), nullptr, 16);
 			if (addr == 0) {
+				diag::log_tagged("analysis", "generate_aob_signature refused invalid_address");
 				return tool_result_t::error("invalid address");
 			}
 
+			diag::log_tagged_fmt("analysis", "generate_aob_signature generating addr=0x%llX count=%d",
+				static_cast<unsigned long long>(addr), count);
 			aob_generator::generate_from_address(addr, count, true);
 
 			int wait = 0;
@@ -124,6 +134,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				std::string err_msg = tool_last_error.empty()
 					? std::string("Failed to generate signature (could not read memory or decode instructions)")
 					: tool_last_error;
+				diag::log_tagged_fmt("analysis", "generate_aob_signature failed addr=0x%llX err=%s",
+					static_cast<unsigned long long>(addr), err_msg.c_str());
 				return tool_result_t::error(err_msg);
 			}
 
@@ -133,6 +145,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			result["address"] = abuf;
 			result["module"] = sig.module_name;
 			result["byte_count"] = sig.bytes.size();
+			diag::log_tagged_fmt("analysis", "generate_aob_signature complete addr=0x%llX bytes=%zu module=%s",
+				static_cast<unsigned long long>(sig.address), sig.bytes.size(), sig.module_name.c_str());
 			result["standard"] = aob_generator::format_signature(sig);
 			result["ida_style"] = aob_generator::format_ida_signature(sig);
 			result["code_pattern"] = aob_generator::format_code_signature(sig);
@@ -158,16 +172,22 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			std::string addr_str = params.value("address", "");
 			int size = params.value("size", 256);
 			std::string name = params.value("name", "struct_t");
+			diag::log_tagged_fmt("analysis", "reconstruct_struct entry addr=%s size=%d name=%s",
+				addr_str.c_str(), size, name.c_str());
 
 			if (addr_str.empty()) {
+				diag::log_tagged("analysis", "reconstruct_struct refused no_address");
 				return tool_result_t::error("address parameter is required");
 			}
 
 			uint64_t addr = std::strtoull(addr_str.c_str(), nullptr, 16);
 			if (addr == 0) {
+				diag::log_tagged("analysis", "reconstruct_struct refused invalid_address");
 				return tool_result_t::error("invalid address");
 			}
 
+			diag::log_tagged_fmt("analysis", "reconstruct_struct starting addr=0x%llX size=%d name=%s",
+				static_cast<unsigned long long>(addr), size, name.c_str());
 			struct_recon::reconstruct_from_snapshot(addr, size, name);
 
 			int wait = 0;
@@ -182,6 +202,10 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				result_struct = struct_recon::g_state.current;
 			}
 
+			diag::log_tagged_fmt("analysis", "reconstruct_struct complete addr=0x%llX name=%s fields=%zu size=%u has_vtable=%d",
+				static_cast<unsigned long long>(result_struct.base_address),
+				result_struct.name.c_str(), result_struct.fields.size(),
+				result_struct.total_size, result_struct.has_vtable ? 1 : 0);
 			std::string cpp_output = struct_recon::export_as_cpp(result_struct);
 
 			json result;
@@ -231,8 +255,11 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			std::string target = params.value("target_address", "");
 			std::string end = params.value("end_address", "");
 			std::string input = params.value("input_address", "");
+			diag::log_tagged_fmt("analysis", "start_fuzz entry target=%s end=%s input=%s",
+				target.c_str(), end.c_str(), input.c_str());
 
 			if (target.empty()) {
+				diag::log_tagged("analysis", "start_fuzz refused no_target_address");
 				return tool_result_t::error("target_address is required");
 			}
 
@@ -246,9 +273,18 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			auto threads_snap = driver_bridge::enumerate_threads();
 			cfg.tid = threads_snap.empty() ? 0 : threads_snap.front().tid;
 
-			if (cfg.pid == 0 || cfg.tid == 0)
+			if (cfg.pid == 0 || cfg.tid == 0) {
+				diag::log_tagged_fmt("analysis", "start_fuzz refused pid=%u tid=%u",
+					cfg.pid, cfg.tid);
 				return tool_result_t::error("fuzzer requires an attached process and at least one thread for snapshotting");
+			}
 
+			diag::log_tagged_fmt("analysis", "start_fuzz starting pid=%u tid=%u target=0x%llX end=0x%llX input=0x%llX input_size=%d max_iters=%d",
+				cfg.pid, cfg.tid,
+				static_cast<unsigned long long>(cfg.target_address),
+				static_cast<unsigned long long>(cfg.end_address),
+				static_cast<unsigned long long>(cfg.input_address),
+				cfg.input_size, cfg.max_iterations);
 			fuzzer_engine::start_fuzzing();
 
 			return tool_result_t::ok("Fuzzing started. Use get_fuzz_results to check progress.");
@@ -261,7 +297,9 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		{},
 		false,
 		[](const json&) -> tool_result_t {
+			diag::log_tagged("analysis", "stop_fuzz entry");
 			fuzzer_engine::stop_fuzzing();
+			diag::log_tagged("analysis", "stop_fuzz stop_requested");
 			return tool_result_t::ok("Fuzzer stop requested.");
 		}
 	});
@@ -272,8 +310,15 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		{},
 		true,
 		[](const json&) -> tool_result_t {
+			diag::log_tagged("analysis", "get_fuzz_results entry");
 			std::lock_guard<std::mutex> lk(fuzzer_engine::g_state.mutex);
 			auto& stats = fuzzer_engine::g_state.stats;
+			diag::log_tagged_fmt("analysis", "get_fuzz_results running=%d executions=%llu crashes=%llu unique=%llu coverage=%llu",
+				fuzzer_engine::g_state.running.load() ? 1 : 0,
+				static_cast<unsigned long long>(stats.total_executions),
+				static_cast<unsigned long long>(stats.total_crashes),
+				static_cast<unsigned long long>(stats.total_unique_crashes),
+				static_cast<unsigned long long>(stats.edge_coverage));
 
 			json result;
 			result["running"] = fuzzer_engine::g_state.running.load();
@@ -313,16 +358,22 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		[](const json& params) -> tool_result_t {
 			std::string addr_str = params.value("region_address", "");
 			uint64_t size = params.value("region_size", 4096);
+			diag::log_tagged_fmt("analysis", "auto_decrypt_strings entry addr=%s size=%llu",
+				addr_str.c_str(), static_cast<unsigned long long>(size));
 
 			if (addr_str.empty()) {
+				diag::log_tagged("analysis", "auto_decrypt_strings refused no_region_address");
 				return tool_result_t::error("region_address parameter is required");
 			}
 
 			uint64_t addr = std::strtoull(addr_str.c_str(), nullptr, 16);
 			if (addr == 0) {
+				diag::log_tagged("analysis", "auto_decrypt_strings refused invalid_region_address");
 				return tool_result_t::error("invalid region_address");
 			}
 
+			diag::log_tagged_fmt("analysis", "auto_decrypt_strings scanning addr=0x%llX size=%llu",
+				static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size));
 			decrypt_oracle::scan_and_decrypt(addr, size);
 
 			int wait = 0;
@@ -333,6 +384,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 
 			std::lock_guard<std::mutex> lk(decrypt_oracle::g_state.mutex);
 			auto& results = decrypt_oracle::g_state.results;
+			diag::log_tagged_fmt("analysis", "auto_decrypt_strings complete count=%zu", results.size());
 
 			json arr = json::array();
 			for (auto& r : results) {
@@ -443,11 +495,15 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		true,
 		[](const json& params) -> tool_result_t {
 			int index = params.value("node_index", -1);
+			diag::log_tagged_fmt("analysis", "neutralize_integrity_node entry index=%d", index);
 			if (index < 0) {
+				diag::log_tagged("analysis", "neutralize_integrity_node refused invalid_index");
 				return tool_result_t::error("node_index parameter is required");
 			}
 
 			bool ok = integrity_hunter::neutralize(index);
+			diag::log_tagged_fmt("analysis", "neutralize_integrity_node result=%s index=%d",
+				ok ? "ok" : "failed", index);
 
 			json result;
 			result["success"] = ok;
@@ -481,20 +537,27 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			std::string addr_str = params.value("address", "");
 			int size = params.value("size", 256);
 			std::string name = params.value("name", "struct_t");
+			diag::log_tagged_fmt("analysis", "start_live_monitor entry addr=%s size=%d name=%s",
+				addr_str.c_str(), size, name.c_str());
 
 			if (addr_str.empty()) {
+				diag::log_tagged("analysis", "start_live_monitor refused no_address");
 				return tool_result_t::error("address parameter is required");
 			}
 
 			uint64_t addr = std::strtoull(addr_str.c_str(), nullptr, 16);
 			if (addr == 0) {
+				diag::log_tagged("analysis", "start_live_monitor refused invalid_address");
 				return tool_result_t::error("invalid address");
 			}
 
 			if (struct_monitor::g_state.active.load()) {
+				diag::log_tagged("analysis", "start_live_monitor refused already_active");
 				return tool_result_t::error("Live monitor already active. Stop it first.");
 			}
 
+			diag::log_tagged_fmt("analysis", "start_live_monitor starting addr=0x%llX size=%d name=%s",
+				static_cast<unsigned long long>(addr), size, name.c_str());
 			struct_monitor::start(addr, size, name);
 
 			json result;
@@ -513,7 +576,9 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		{},
 		true,
 		[](const json&) -> tool_result_t {
+			diag::log_tagged("analysis", "stop_live_monitor entry");
 			if (!struct_monitor::g_state.active.load()) {
+				diag::log_tagged("analysis", "stop_live_monitor refused not_active");
 				return tool_result_t::error("No active live monitor session.");
 			}
 
@@ -526,6 +591,9 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			}
 
 			auto accesses = struct_monitor::get_access_snapshot();
+			diag::log_tagged_fmt("analysis", "stop_live_monitor complete total_captures=%llu unique_offsets=%zu",
+				static_cast<unsigned long long>(struct_monitor::g_state.total_captures.load()),
+				accesses.size());
 
 			json arr = json::array();
 			for (auto& a : accesses) {
@@ -560,16 +628,26 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		true,
 		[](const json& params) -> tool_result_t {
 			std::string addr_str = params.value("entry_address", "");
-			if (addr_str.empty())
+			diag::log_tagged_fmt("analysis", "symbolic_deobfuscate entry addr=%s", addr_str.c_str());
+			if (addr_str.empty()) {
+				diag::log_tagged("analysis", "symbolic_deobfuscate refused no_entry_address");
 				return tool_result_t::error("entry_address is required");
+			}
 
 			uint64_t entry = std::strtoull(addr_str.c_str(), nullptr, 16);
-			if (entry == 0)
+			if (entry == 0) {
+				diag::log_tagged("analysis", "symbolic_deobfuscate refused invalid_entry_address");
 				return tool_result_t::error("invalid entry_address");
+			}
 
 			uint32_t max_insns = static_cast<uint32_t>(params.value("max_instructions", 10000));
+			diag::log_tagged_fmt("analysis", "symbolic_deobfuscate running entry=0x%llX max_insns=%u",
+				static_cast<unsigned long long>(entry), max_insns);
 
 			auto result = deobfuscation_engine::deobfuscate_function(entry, max_insns);
+			diag::log_tagged_fmt("analysis", "symbolic_deobfuscate complete total=%u clean=%u junk_removed=%u opaques=%u constants=%u",
+				result.total_original, result.total_clean,
+				result.removed_junk, result.opaque_predicates_found, result.constants_resolved);
 
 			json out;
 			out["statistics"] = {
@@ -635,14 +713,24 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			std::string start_str = params.value("start_address", "");
 			std::string end_str = params.value("end_address", "");
 			std::string reg = params.value("target_register", "");
-			if (start_str.empty() || end_str.empty() || reg.empty())
+			diag::log_tagged_fmt("analysis", "symbolic_slice_function entry start=%s end=%s reg=%s",
+				start_str.c_str(), end_str.c_str(), reg.c_str());
+			if (start_str.empty() || end_str.empty() || reg.empty()) {
+				diag::log_tagged("analysis", "symbolic_slice_function refused missing_params");
 				return tool_result_t::error("start_address, end_address, and target_register are required");
+			}
 
 			uint64_t start = std::strtoull(start_str.c_str(), nullptr, 16);
 			uint64_t end = std::strtoull(end_str.c_str(), nullptr, 16);
 			uint32_t max_insns = static_cast<uint32_t>(params.value("max_instructions", 5000));
+			diag::log_tagged_fmt("analysis", "symbolic_slice_function running start=0x%llX end=0x%llX reg=%s max_insns=%u",
+				static_cast<unsigned long long>(start), static_cast<unsigned long long>(end),
+				reg.c_str(), max_insns);
 
 			auto result = symbolic_engine::slice_to_register(start, end, max_insns, reg);
+			diag::log_tagged_fmt("analysis", "symbolic_slice_function complete total=%u effective=%u removed=%u",
+				result.total_instructions, result.effective_count,
+				result.total_instructions - result.effective_count);
 
 			json out;
 			out["target_register"] = reg;
@@ -677,8 +765,12 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			std::string start_str = params.value("start_address", "");
 			std::string target_str = params.value("target_address", "");
 			std::string regs_str = params.value("symbolic_registers", "");
-			if (start_str.empty() || target_str.empty() || regs_str.empty())
+			diag::log_tagged_fmt("analysis", "symbolic_solve_path entry start=%s target=%s regs=%s",
+				start_str.c_str(), target_str.c_str(), regs_str.c_str());
+			if (start_str.empty() || target_str.empty() || regs_str.empty()) {
+				diag::log_tagged("analysis", "symbolic_solve_path refused missing_params");
 				return tool_result_t::error("start_address, target_address, and symbolic_registers are required");
+			}
 
 			uint64_t start = std::strtoull(start_str.c_str(), nullptr, 16);
 			uint64_t target = std::strtoull(target_str.c_str(), nullptr, 16);
@@ -696,7 +788,12 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				}
 			}
 
+			diag::log_tagged_fmt("analysis", "symbolic_solve_path running start=0x%llX target=0x%llX sym_regs=%zu max_insns=%u",
+				static_cast<unsigned long long>(start), static_cast<unsigned long long>(target),
+				sym_regs.size(), max_insns);
 			auto result = symbolic_engine::solve_for_path(start, target, max_insns, sym_regs);
+			diag::log_tagged_fmt("analysis", "symbolic_solve_path complete satisfiable=%d solving_time_ms=%u",
+				result.satisfiable ? 1 : 0, result.solving_time_ms);
 
 			json out;
 			out["satisfiable"] = result.satisfiable;
@@ -728,8 +825,12 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		[](const json& params) -> tool_result_t {
 			std::string start_str = params.value("start_address", "");
 			std::string end_str = params.value("end_address", "");
-			if (start_str.empty() || end_str.empty())
+			diag::log_tagged_fmt("analysis", "taint_trace_register entry start=%s end=%s",
+				start_str.c_str(), end_str.c_str());
+			if (start_str.empty() || end_str.empty()) {
+				diag::log_tagged("analysis", "taint_trace_register refused missing_params");
 				return tool_result_t::error("start_address and end_address are required");
+			}
 
 			uint64_t start = std::strtoull(start_str.c_str(), nullptr, 16);
 			uint64_t end = std::strtoull(end_str.c_str(), nullptr, 16);
@@ -761,7 +862,12 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				}
 			}
 
+			diag::log_tagged_fmt("analysis", "taint_trace_register running start=0x%llX end=0x%llX taint_regs=%zu taint_mem=%zu max_insns=%u",
+				static_cast<unsigned long long>(start), static_cast<unsigned long long>(end),
+				taint_regs.size(), taint_mem.size(), max_insns);
 			auto result = symbolic_engine::taint_trace(start, end, max_insns, taint_regs, taint_mem);
+			diag::log_tagged_fmt("analysis", "taint_trace_register complete total=%u tainted=%u",
+				result.total_processed, result.tainted_count);
 
 			json out;
 			out["total_instructions"] = result.total_processed;
@@ -811,12 +917,17 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		true,
 		[](const json& params) -> tool_result_t {
 			std::string addr_str = params.value("address", "");
-			if (addr_str.empty())
+			diag::log_tagged_fmt("analysis", "decompile_function entry addr=%s", addr_str.c_str());
+			if (addr_str.empty()) {
+				diag::log_tagged("analysis", "decompile_function refused no_address");
 				return tool_result_t::error("address is required");
+			}
 
 			uint64_t addr = std::strtoull(addr_str.c_str(), nullptr, 16);
-			if (addr == 0)
+			if (addr == 0) {
+				diag::log_tagged("analysis", "decompile_function refused invalid_address");
 				return tool_result_t::error("invalid address");
+			}
 
 			if (!ghidra_decompiler::g_state.initialized.load()) {
 				if (!ghidra_decompiler::init())
@@ -844,11 +955,18 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				return tool_result_t::error("no source available: open a PE file via File > Open or attach a process via File > Attach");
 			}
 
+			diag::log_tagged_fmt("analysis", "decompile_function running addr=0x%llX source=%s mem_bytes=%zu",
+				static_cast<unsigned long long>(addr),
+				driver_provided ? "driver" : (has_static ? "file" : "none"),
+				mem.size());
 			auto result = ghidra_decompiler::decompile_buffer(
 				mem.data(), mem.size(), addr, addr, nullptr,
 				g_disasm.file.loaded ? &g_disasm.file : nullptr);
-			if (result.is_error)
+			if (result.is_error) {
+				diag::log_tagged_fmt("analysis", "decompile_function failed addr=0x%llX err=%s",
+					static_cast<unsigned long long>(addr), result.error_text.c_str());
 				return tool_result_t::error(result.error_text);
+			}
 
 			json out;
 			char abuf[32];
@@ -869,6 +987,10 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			}
 			out["callees"] = callees;
 			out["source"] = driver_provided ? "driver" : "file";
+			diag::log_tagged_fmt("analysis", "decompile_function complete addr=0x%llX name=%s elapsed_ms=%u source=%s",
+				static_cast<unsigned long long>(result.function_addr),
+				result.function_name.c_str(), result.elapsed_ms,
+				driver_provided ? "driver" : "file");
 			return tool_result_t::ok(out);
 		}
 	});
@@ -926,20 +1048,25 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		{},
 		true,
 		[](const json& params) -> tool_result_t {
-			if (!stealth_engine::is_active())
+			diag::log_tagged("analysis", "disable_stealth_context entry");
+			if (!stealth_engine::is_active()) {
+				diag::log_tagged("analysis", "disable_stealth_context skipped not_active");
 				return tool_result_t::ok(json{{"status", "stealth was not active"}, {"hooks_removed", 0}});
+			}
 
 			int hook_count = 0;
 			{
 				std::lock_guard<std::mutex> lk(stealth_engine::g_state.mutex);
 				hook_count = static_cast<int>(stealth_engine::g_state.session.hooks.size());
 			}
+			diag::log_tagged_fmt("analysis", "disable_stealth_context removing hooks=%d", hook_count);
 
 			stealth_engine::disable_stealth();
 
 			json out;
 			out["status"] = stealth_engine::get_status();
 			out["hooks_removed"] = hook_count;
+			diag::log_tagged_fmt("analysis", "disable_stealth_context complete hooks_removed=%d", hook_count);
 			return tool_result_t::ok(out);
 		}
 	});
@@ -950,14 +1077,21 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		{},
 		true,
 		[](const json&) -> tool_result_t {
-			if (driver_bridge::attached_pid() == 0)
+			diag::log_tagged("analysis", "analysis_get_imports entry");
+			if (driver_bridge::attached_pid() == 0) {
+				diag::log_tagged("analysis", "analysis_get_imports refused no_process");
 				return tool_result_t::error("No process is attached; call driver_attach first.");
+			}
 			auto modules = driver_bridge::enumerate_modules();
-			if (modules.empty())
+			if (modules.empty()) {
+				diag::log_tagged("analysis", "analysis_get_imports failed no_modules");
 				return tool_result_t::error("Module enumeration returned no entries.");
+			}
 			pe_parser::pe_info_t pe;
-			if (!pe_parser::parse(modules.front().base, pe, true))
+			if (!pe_parser::parse(modules.front().base, pe, true)) {
+				diag::log_tagged("analysis", "analysis_get_imports failed pe_parse_failed");
 				return tool_result_t::error("pe_parser::parse failed on the main module.");
+			}
 			json arr = json::array();
 			char buf[32];
 			for (const auto& imp : pe.imports) {
@@ -976,6 +1110,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			result["module"] = modules.front().name;
 			result["count"]  = arr.size();
 			result["imports"] = std::move(arr);
+			diag::log_tagged_fmt("analysis", "analysis_get_imports complete module=%s count=%zu",
+				modules.front().name.c_str(), static_cast<size_t>(result["count"].get<size_t>()));
 			return tool_result_t::ok(result);
 		}
 	});
@@ -986,14 +1122,21 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		{},
 		true,
 		[](const json&) -> tool_result_t {
-			if (driver_bridge::attached_pid() == 0)
+			diag::log_tagged("analysis", "analysis_get_exports entry");
+			if (driver_bridge::attached_pid() == 0) {
+				diag::log_tagged("analysis", "analysis_get_exports refused no_process");
 				return tool_result_t::error("No process is attached; call driver_attach first.");
+			}
 			auto modules = driver_bridge::enumerate_modules();
-			if (modules.empty())
+			if (modules.empty()) {
+				diag::log_tagged("analysis", "analysis_get_exports failed no_modules");
 				return tool_result_t::error("Module enumeration returned no entries.");
+			}
 			pe_parser::pe_info_t pe;
-			if (!pe_parser::parse(modules.front().base, pe, true))
+			if (!pe_parser::parse(modules.front().base, pe, true)) {
+				diag::log_tagged("analysis", "analysis_get_exports failed pe_parse_failed");
 				return tool_result_t::error("pe_parser::parse failed on the main module.");
+			}
 			json arr = json::array();
 			char buf[32];
 			for (const auto& exp : pe.exports) {
@@ -1014,6 +1157,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			result["module"]  = modules.front().name;
 			result["count"]   = arr.size();
 			result["exports"] = std::move(arr);
+			diag::log_tagged_fmt("analysis", "analysis_get_exports complete module=%s count=%zu",
+				modules.front().name.c_str(), static_cast<size_t>(result["count"].get<size_t>()));
 			return tool_result_t::ok(result);
 		}
 	});
@@ -1025,6 +1170,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		 {"limit",  "number", "Maximum types to return (default 200, max 5000)", false}},
 		true,
 		[](const json& params) -> tool_result_t {
+			diag::log_tagged("analysis", "analysis_get_types entry");
 			std::string filter;
 			if (params.contains("filter") && params["filter"].is_string()) {
 				filter = params["filter"].get<std::string>();
@@ -1080,6 +1226,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			result["total"]    = total;
 			result["returned"] = arr.size();
 			result["types"]    = std::move(arr);
+			diag::log_tagged_fmt("analysis", "analysis_get_types complete total=%zu returned=%zu filter=%s",
+				total, static_cast<size_t>(result["returned"].get<size_t>()), filter.c_str());
 			return tool_result_t::ok(result);
 		}
 	});
@@ -1091,8 +1239,12 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		 {"module", "string", "Optional module name to narrow the lookup", false}},
 		true,
 		[](const json& params) -> tool_result_t {
-			if (!params.contains("name") || !params["name"].is_string())
+			std::string want_name = (params.contains("name") && params["name"].is_string()) ? params["name"].get<std::string>() : "";
+			diag::log_tagged_fmt("analysis", "analysis_get_type_definition entry name=%s", want_name.c_str());
+			if (!params.contains("name") || !params["name"].is_string()) {
+				diag::log_tagged("analysis", "analysis_get_type_definition refused no_name");
 				return tool_result_t::error("'name' is required.");
+			}
 			std::string want = params["name"].get<std::string>();
 			std::string want_module;
 			if (params.contains("module") && params["module"].is_string())
@@ -1148,6 +1300,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 					return tool_result_t::ok(result);
 				}
 			}
+			diag::log_tagged_fmt("analysis", "analysis_get_type_definition not_found name=%s", want.c_str());
 			return tool_result_t::error("Type not found in any loaded module's PDB.");
 		}
 	});
@@ -1161,6 +1314,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		 {"limit",  "number", "Maximum symbols to return (default 500, max 10000)", false}},
 		true,
 		[](const json& params) -> tool_result_t {
+			diag::log_tagged("analysis", "analysis_get_pdb_symbols entry");
 			std::string filter;
 			if (params.contains("filter") && params["filter"].is_string()) {
 				filter = params["filter"].get<std::string>();
@@ -1217,6 +1371,9 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			result["total"]    = total;
 			result["returned"] = arr.size();
 			result["symbols"]  = std::move(arr);
+			diag::log_tagged_fmt("analysis", "analysis_get_pdb_symbols complete total=%zu returned=%zu filter=%s module=%s",
+				total, static_cast<size_t>(result["returned"].get<size_t>()),
+				filter.c_str(), want_module.c_str());
 			return tool_result_t::ok(result);
 		}
 	});
@@ -1228,15 +1385,21 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		 {"max_globals",   "number", "Maximum globals to include (default 30)", false}},
 		true,
 		[](const json& params) -> tool_result_t {
+			diag::log_tagged("analysis", "analysis_get_binary_map_overview entry");
 			aida::binary_map::map_options_t opts;
 			if (params.contains("max_functions") && params["max_functions"].is_number_integer())
 				opts.max_functions = params["max_functions"].get<int>();
 			if (params.contains("max_globals") && params["max_globals"].is_number_integer())
 				opts.max_globals = params["max_globals"].get<int>();
+			diag::log_tagged_fmt("analysis", "analysis_get_binary_map_overview generating max_funcs=%d max_globals=%d",
+				opts.max_functions, opts.max_globals);
 
 			aida::binary_map::map_t m;
-			if (!aida::binary_map::generate(opts, m))
+			if (!aida::binary_map::generate(opts, m)) {
+				diag::log_tagged_fmt("analysis", "analysis_get_binary_map_overview failed err=%s",
+					aida::binary_map::last_error().c_str());
 				return tool_result_t::error(aida::binary_map::last_error());
+			}
 
 			char buf[32];
 			json sections = json::array();
@@ -1289,6 +1452,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			result["globals"]      = std::move(globals);
 			result["imports"]      = m.imports;
 			result["exports"]      = m.exports;
+			diag::log_tagged_fmt("analysis", "analysis_get_binary_map_overview complete module=%s sections=%zu funcs=%zu globals=%zu",
+				m.module_name.c_str(), m.sections.size(), m.functions.size(), m.globals.size());
 			return tool_result_t::ok(result);
 		}
 	});
@@ -1299,6 +1464,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		{},
 		true,
 		[](const json&) -> tool_result_t {
+			diag::log_tagged("analysis", "analysis_get_xref_db_stats entry");
 			std::lock_guard<std::mutex> lk(xref_db::g_state.mutex);
 			json arr = json::array();
 			size_t total = 0;
@@ -1324,6 +1490,9 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			result["building"]     = xref_db::g_state.building.load();
 			result["progress"]     = xref_db::g_state.progress.load();
 			result["modules"]      = std::move(arr);
+			diag::log_tagged_fmt("analysis", "analysis_get_xref_db_stats complete modules=%zu built=%zu total_xrefs=%zu building=%d",
+				static_cast<size_t>(xref_db::g_state.modules.size()), built, total,
+				xref_db::g_state.building.load() ? 1 : 0);
 			return tool_result_t::ok(result);
 		}
 	});
@@ -1334,9 +1503,13 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		{},
 		false,
 		[](const json&) -> tool_result_t {
-			if (crypto_scanner::g_state.scanning.load())
+			diag::log_tagged("analysis", "crypto_scanner_run entry");
+			if (crypto_scanner::g_state.scanning.load()) {
+				diag::log_tagged("analysis", "crypto_scanner_run refused already_scanning");
 				return tool_result_t::error("A crypto scan is already in progress.");
+			}
 			crypto_scanner::scan_process();
+			diag::log_tagged("analysis", "crypto_scanner_run scan_process called waiting");
 			int wait = 0;
 			while (crypto_scanner::g_state.scanning.load() && wait < 600) {
 				Sleep(100);
@@ -1344,8 +1517,12 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			}
 			std::lock_guard<std::mutex> lk(crypto_scanner::g_state.mutex);
 			json result;
-			result["status"] = crypto_scanner::g_state.scanning.load() ? "still_running" : "complete";
+			bool still_running = crypto_scanner::g_state.scanning.load();
+			result["status"] = still_running ? "still_running" : "complete";
 			result["count"]  = crypto_scanner::g_state.results.size();
+			diag::log_tagged_fmt("analysis", "crypto_scanner_run complete status=%s count=%zu",
+				still_running ? "still_running" : "complete",
+				crypto_scanner::g_state.results.size());
 			return tool_result_t::ok(result);
 		}
 	});
@@ -1361,6 +1538,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				size_t v = params["limit"].get<size_t>();
 				if (v > 0 && v <= 5000) limit = v;
 			}
+			diag::log_tagged_fmt("analysis", "crypto_scanner_get_results entry limit=%zu", limit);
 			std::lock_guard<std::mutex> lk(crypto_scanner::g_state.mutex);
 			json arr = json::array();
 			char buf[32];
@@ -1383,6 +1561,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			result["total"]    = crypto_scanner::g_state.results.size();
 			result["returned"] = n;
 			result["results"]  = std::move(arr);
+			diag::log_tagged_fmt("analysis", "crypto_scanner_get_results complete total=%zu returned=%zu",
+				crypto_scanner::g_state.results.size(), n);
 			return tool_result_t::ok(result);
 		}
 	});

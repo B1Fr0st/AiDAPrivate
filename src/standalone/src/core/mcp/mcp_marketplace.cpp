@@ -6,6 +6,7 @@
 #include "standalone_license.hpp"
 #include "standalone_settings.hpp"
 #include "../helpers/globals.h"
+#include "../../helpers/diag_log.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -316,11 +317,13 @@ static std::vector<package_info_t> search_pypi(const std::string& query, std::st
 
 void search_async(const std::string& query, registry_t reg)
 {
-
+    diag::log_tagged_fmt("mcp_market", "search_async query='%.80s' reg=%d",
+        query.c_str(), (int)reg);
     {
         uint64_t gt = standalone_license::inline_gate_check(
             standalone_license::gate_marketplace_search);
         if (gt == 0) {
+            diag::log_tagged_fmt("mcp_market", "search_async gate blocked");
             std::lock_guard<std::mutex> lk(s_mtx);
             s_search_state = search_state_t::error_state;
             s_search_error = "License gate blocked marketplace search.";
@@ -368,9 +371,11 @@ void search_async(const std::string& query, registry_t reg)
         std::lock_guard<std::mutex> lk(s_mtx);
         s_results = std::move(results);
         if (s_results.empty() && !err.empty()) {
+            diag::log_tagged_fmt("mcp_market", "search_async error err='%s'", err.c_str());
             s_search_state = search_state_t::error_state;
             s_search_error = err;
         } else {
+            diag::log_tagged_fmt("mcp_market", "search_async done results=%zu", s_results.size());
             s_search_state = search_state_t::done;
             s_search_error.clear();
         }
@@ -399,11 +404,13 @@ std::vector<package_info_t> get_search_results()
 
 void install_async(const package_info_t& pkg)
 {
-
+    diag::log_tagged_fmt("mcp_market", "install_async pkg='%s' version='%s'",
+        pkg.name.c_str(), pkg.version.c_str());
     {
         uint64_t gt = standalone_license::inline_gate_check(
             standalone_license::gate_marketplace_install);
         if (gt == 0) {
+            diag::log_tagged_fmt("mcp_market", "install_async gate blocked");
             std::lock_guard<std::mutex> lk(s_mtx);
             s_install_state = install_state_t::error_state;
             s_install_error = "License gate blocked marketplace install.";
@@ -483,7 +490,8 @@ void install_async(const package_info_t& pkg)
         }
 
         if (p.registry == registry_t::npm) {
-
+            diag::log_tagged_fmt("mcp_market", "install_async npm pkg='%s' dir='%.120s'",
+                p.name.c_str(), pkg_dir.c_str());
             std::string spec = p.name + (p.version.empty() ? std::string{} : "@" + p.version);
             std::string cmd = "cmd.exe /c npm install --prefix \"" + pkg_dir + "\" \"" + spec + "\"";
             output = run_process_capture(cmd, pkg_dir, 120000);
@@ -496,7 +504,8 @@ void install_async(const package_info_t& pkg)
             srv.command = "cmd.exe";
             srv.args = {"/c", "npx", "-y", p.name};
         } else {
-
+            diag::log_tagged_fmt("mcp_market", "install_async pypi pkg='%s' dir='%.120s'",
+                p.name.c_str(), pkg_dir.c_str());
             std::string venv_dir = pkg_dir + "\\venv";
             std::string cmd_venv = "python -m venv \"" + venv_dir + "\"";
             run_process_capture(cmd_venv, pkg_dir, 60000);
@@ -524,11 +533,13 @@ void install_async(const package_info_t& pkg)
         }
 
         if (!success) {
+            diag::log_tagged_fmt("mcp_market", "install_async fail pkg='%s'", p.name.c_str());
             std::lock_guard<std::mutex> lk(s_mtx);
             s_install_state = install_state_t::error_state;
             s_install_error = "Install failed. Output:\n" + output.substr(0, 500);
             return;
         }
+        diag::log_tagged_fmt("mcp_market", "install_async ok pkg='%s'", p.name.c_str());
 
 
         {
@@ -556,6 +567,7 @@ void install_async(const package_info_t& pkg)
 
 bool uninstall(const std::string& package_name)
 {
+    diag::log_tagged_fmt("mcp_market", "uninstall pkg='%s'", package_name.c_str());
     ::s_mcp_client_mgr.disconnect_server(package_name);
     ::s_mcp_client_mgr.remove_server(package_name);
 
@@ -590,6 +602,8 @@ bool uninstall(const std::string& package_name)
     }
 
     s_install_persist_pending.store(true, std::memory_order_release);
+    diag::log_tagged_fmt("mcp_market", "uninstall %s pkg='%s'",
+        found ? "ok" : "not_found", package_name.c_str());
     enqueue_deferred_log(bottom_tab_t::output,
         "[marketplace] Uninstalled " + package_name);
     return found;
@@ -617,6 +631,7 @@ std::vector<installed_server_t> get_installed()
 
 void activate_server(const installed_server_t& srv)
 {
+    diag::log_tagged_fmt("mcp_market", "activate_server pkg='%s'", srv.package_name.c_str());
     mcp_client::server_config_t cfg;
     cfg.name = srv.package_name;
     cfg.transport = (srv.transport == "stdio")
@@ -631,15 +646,18 @@ void activate_server(const installed_server_t& srv)
     ::s_mcp_client_mgr.add_server(cfg);
     ::s_mcp_client_mgr.connect_server(cfg.name);
 
+    diag::log_tagged_fmt("mcp_market", "activate_server ok pkg='%s'", srv.package_name.c_str());
     enqueue_deferred_log(bottom_tab_t::mcp_log,
         "[marketplace] Activated server: " + srv.package_name);
 }
 
 void deactivate_server(const std::string& package_name)
 {
+    diag::log_tagged_fmt("mcp_market", "deactivate_server pkg='%s'", package_name.c_str());
     ::s_mcp_client_mgr.disconnect_server(package_name);
     ::s_mcp_client_mgr.remove_server(package_name);
 
+    diag::log_tagged_fmt("mcp_market", "deactivate_server ok pkg='%s'", package_name.c_str());
     enqueue_deferred_log(bottom_tab_t::mcp_log,
         "[marketplace] Deactivated server: " + package_name);
 }

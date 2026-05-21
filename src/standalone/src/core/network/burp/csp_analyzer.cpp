@@ -140,7 +140,12 @@ severity_t severity_from_str(const std::string& s)
 
 void handle_exchange(const exchange_observed_t& e)
 {
-    if (!initialized_flag().load()) return;
+    if (!initialized_flag().load()) {
+        diag::log_tagged_fmt("csp", "handle_exchange skipped not_initialized");
+        return;
+    }
+    diag::log_tagged_fmt("csp", "handle_exchange entry host=%s path=%s exchange_id=%llu",
+        e.host.c_str(), e.path.c_str(), static_cast<unsigned long long>(e.id));
     std::string csp_value;
     bool report_only = false;
     for (const auto& h : e.resp_headers) {
@@ -157,17 +162,28 @@ void handle_exchange(const exchange_observed_t& e)
             }
         }
     }
+    diag::log_tagged_fmt("csp", "handle_exchange csp_found=%d report_only=%d csp_len=%zu",
+        static_cast<int>(!csp_value.empty()), static_cast<int>(report_only), csp_value.size());
     auto res = analyze(csp_value, report_only);
-    if (res.findings.empty() && res.has_csp) return;
+    if (res.findings.empty() && res.has_csp) {
+        diag::log_tagged_fmt("csp", "handle_exchange no_findings has_csp=true host=%s", e.host.c_str());
+        return;
+    }
+    diag::log_tagged_fmt("csp", "handle_exchange findings=%zu has_csp=%d host=%s",
+        res.findings.size(), static_cast<int>(res.has_csp), e.host.c_str());
 
     std::string key_base = e.host + "|";
     if (!res.has_csp) {
         std::string dedupe_key = "csp.missing|" + e.host;
         {
             std::lock_guard<std::mutex> lk(seen_mtx());
-            if (seen_keys().count(dedupe_key)) return;
+            if (seen_keys().count(dedupe_key)) {
+                diag::log_tagged_fmt("csp", "handle_exchange missing_csp already_issued host=%s", e.host.c_str());
+                return;
+            }
             seen_keys().insert(dedupe_key);
         }
+        diag::log_tagged_fmt("csp", "handle_exchange adding_missing_csp_issue host=%s", e.host.c_str());
         issue_t iss;
         iss.type_key = "csp_missing";
         iss.name = "Missing Content-Security-Policy header";
@@ -191,9 +207,15 @@ void handle_exchange(const exchange_observed_t& e)
         std::string dedupe_key = key_base + f.id;
         {
             std::lock_guard<std::mutex> lk(seen_mtx());
-            if (seen_keys().count(dedupe_key)) continue;
+            if (seen_keys().count(dedupe_key)) {
+                diag::log_tagged_fmt("csp", "handle_exchange finding_already_issued id=%s host=%s",
+                    f.id.c_str(), e.host.c_str());
+                continue;
+            }
             seen_keys().insert(dedupe_key);
         }
+        diag::log_tagged_fmt("csp", "handle_exchange adding_finding id=%s sev=%s host=%s",
+            f.id.c_str(), f.severity.c_str(), e.host.c_str());
         issue_t iss;
         iss.type_key = "csp." + f.id;
         iss.name = f.title;
@@ -214,38 +236,54 @@ void handle_exchange(const exchange_observed_t& e)
         iss.cwe.push_back("CWE-1021");
         issue_store::add(std::move(iss));
     }
+    diag::log_tagged_fmt("csp", "handle_exchange done host=%s findings_processed=%zu",
+        e.host.c_str(), res.findings.size());
 }
 
 }
 
 bool initialize()
 {
+    diag::log_tagged_fmt("csp", "initialize entry");
     bool expected = false;
-    if (!initialized_flag().compare_exchange_strong(expected, true)) return true;
+    if (!initialized_flag().compare_exchange_strong(expected, true)) {
+        diag::log_tagged_fmt("csp", "initialize already_initialized");
+        return true;
+    }
     subscription_handle() = aida::events::subscribe(kExchangeObservedEvent, [](const exchange_observed_t& e) {
         handle_exchange(e);
     });
     diag::log_tagged("burp_csp", "initialized");
+    diag::log_tagged_fmt("csp", "initialize done subscribed");
     return true;
 }
 
 void shutdown()
 {
-    if (!initialized_flag().exchange(false)) return;
+    diag::log_tagged_fmt("csp", "shutdown entry");
+    if (!initialized_flag().exchange(false)) {
+        diag::log_tagged_fmt("csp", "shutdown not_initialized skipping");
+        return;
+    }
     aida::events::unsubscribe(subscription_handle());
     subscription_handle() = aida::events::subscription_handle_t{};
     std::lock_guard<std::mutex> lk(seen_mtx());
+    size_t n = seen_keys().size();
     seen_keys().clear();
+    diag::log_tagged_fmt("csp", "shutdown done cleared_seen=%zu", n);
 }
 
 csp_result_t analyze(const std::string& csp_header_value, bool is_report_only)
 {
+    diag::log_tagged_fmt("csp", "analyze entry csp_len=%zu report_only=%d",
+        csp_header_value.size(), static_cast<int>(is_report_only));
     csp_result_t out;
     out.score = 100;
     out.is_report_only = is_report_only;
 
     std::string raw = trim(csp_header_value);
     if (raw.empty()) {
+        diag::log_tagged_fmt("csp", "analyze no_csp_header returning missing");
         out.has_csp = false;
         push_finding(out, "missing", "No Content-Security-Policy header", "low",
                      "No CSP header was present in the response.", "(no header)", -25);
@@ -253,6 +291,7 @@ csp_result_t analyze(const std::string& csp_header_value, bool is_report_only)
         return out;
     }
     out.has_csp = true;
+    diag::log_tagged_fmt("csp", "analyze csp_present raw_len=%zu", raw.size());
 
     {
         std::string buf;
@@ -433,11 +472,14 @@ csp_result_t analyze(const std::string& csp_header_value, bool is_report_only)
 
     if (out.score < 0) out.score = 0;
     if (out.score > 100) out.score = 100;
+    diag::log_tagged_fmt("csp", "analyze done score=%d findings=%zu directives=%zu",
+        out.score, out.findings.size(), out.directives.size());
     return out;
 }
 
 csp_result_t analyze_for_response(const std::vector<std::pair<std::string, std::string>>& response_headers)
 {
+    diag::log_tagged_fmt("csp", "analyze_for_response entry headers=%zu", response_headers.size());
     std::string value;
     bool report_only = false;
     for (const auto& h : response_headers) {
@@ -454,13 +496,17 @@ csp_result_t analyze_for_response(const std::vector<std::pair<std::string, std::
             }
         }
     }
+    diag::log_tagged_fmt("csp", "analyze_for_response csp_found=%d report_only=%d",
+        static_cast<int>(!value.empty()), static_cast<int>(report_only));
     return analyze(value, report_only);
 }
 
 std::string last_error()
 {
     std::lock_guard<std::mutex> lk(err_mtx());
-    return err_slot();
+    std::string e = err_slot();
+    diag::log_tagged_fmt("csp", "last_error queried val=%s", e.c_str());
+    return e;
 }
 
 }

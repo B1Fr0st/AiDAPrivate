@@ -10,6 +10,8 @@
 #include "session_handler.hpp"
 #include "auth_lab.hpp"
 
+#include "../../../helpers/diag_log.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <map>
@@ -94,6 +96,7 @@ json macro_to_json(const session_handler::macro_t& m)
 
 tool_result_t handle_macro_add(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "macro_add name=%s", params.value("name", std::string()).c_str());
     session_handler::macro_t m;
     m.name = params.value("name", std::string());
     if (params.contains("steps") && params["steps"].is_array()) {
@@ -102,7 +105,9 @@ tool_result_t handle_macro_add(const json& params)
             if (step_from_json(js, st)) m.steps.push_back(st);
         }
     }
+    diag::log_tagged_fmt("mcp_burp", "macro_add steps=%zu", m.steps.size());
     const uint64_t id = session_handler::add_macro(m);
+    diag::log_tagged_fmt("mcp_burp", "macro_add ok macro_id=%llu", static_cast<unsigned long long>(id));
     json out;
     out["macro_id"] = id;
     return tool_result_t::ok(out);
@@ -111,9 +116,15 @@ tool_result_t handle_macro_add(const json& params)
 tool_result_t handle_macro_run(const json& params)
 {
     const uint64_t id = static_cast<uint64_t>(params.value("macro_id", 0));
-    if (id == 0) return tool_result_t::error("missing macro_id");
+    diag::log_tagged_fmt("mcp_burp", "macro_run macro_id=%llu", static_cast<unsigned long long>(id));
+    if (id == 0)
+    {
+        diag::log_tagged_fmt("mcp_burp", "macro_run missing macro_id");
+        return tool_result_t::error("missing macro_id");
+    }
     std::map<std::string, std::string> values;
     const bool ok = session_handler::run_macro(id, values);
+    diag::log_tagged_fmt("mcp_burp", "macro_run ok macro_id=%llu success=%d extracted=%zu", static_cast<unsigned long long>(id), (int)ok, values.size());
     json out;
     out["ok"] = ok;
     json vj = json::object();
@@ -124,9 +135,11 @@ tool_result_t handle_macro_run(const json& params)
 
 tool_result_t handle_macro_list(const json&)
 {
+    diag::log_tagged_fmt("mcp_burp", "macro_list entry");
     auto items = session_handler::list_macros();
     json arr = json::array();
     for (const auto& m : items) arr.push_back(macro_to_json(m));
+    diag::log_tagged_fmt("mcp_burp", "macro_list ok count=%zu", items.size());
     json out;
     out["count"] = arr.size();
     out["macros"] = arr;
@@ -136,17 +149,29 @@ tool_result_t handle_macro_list(const json&)
 tool_result_t handle_macro_remove(const json& params)
 {
     const uint64_t id = static_cast<uint64_t>(params.value("macro_id", 0));
+    diag::log_tagged_fmt("mcp_burp", "macro_remove macro_id=%llu", static_cast<unsigned long long>(id));
+    const bool removed = session_handler::remove_macro(id);
+    diag::log_tagged_fmt("mcp_burp", "macro_remove ok macro_id=%llu removed=%d", static_cast<unsigned long long>(id), (int)removed);
     json out;
-    out["removed"] = session_handler::remove_macro(id);
+    out["removed"] = removed;
     return tool_result_t::ok(out);
 }
 
 tool_result_t handle_macro_update(const json& params)
 {
     const uint64_t id = static_cast<uint64_t>(params.value("macro_id", 0));
-    if (id == 0) return tool_result_t::error("missing macro_id");
+    diag::log_tagged_fmt("mcp_burp", "macro_update macro_id=%llu", static_cast<unsigned long long>(id));
+    if (id == 0)
+    {
+        diag::log_tagged_fmt("mcp_burp", "macro_update missing macro_id");
+        return tool_result_t::error("missing macro_id");
+    }
     session_handler::macro_t cur;
-    if (!session_handler::get_macro(id, cur)) return tool_result_t::error("macro not found");
+    if (!session_handler::get_macro(id, cur))
+    {
+        diag::log_tagged_fmt("mcp_burp", "macro_update not_found id=%llu", static_cast<unsigned long long>(id));
+        return tool_result_t::error("macro not found");
+    }
     if (params.contains("fields") && params["fields"].is_object()) {
         const auto& f = params["fields"];
         if (f.contains("name")) cur.name = f.value("name", cur.name);
@@ -158,7 +183,12 @@ tool_result_t handle_macro_update(const json& params)
             }
         }
     }
-    if (!session_handler::update_macro(cur)) return tool_result_t::error("update failed");
+    if (!session_handler::update_macro(cur))
+    {
+        diag::log_tagged_fmt("mcp_burp", "macro_update backend_failed id=%llu", static_cast<unsigned long long>(id));
+        return tool_result_t::error("update failed");
+    }
+    diag::log_tagged_fmt("mcp_burp", "macro_update ok macro_id=%llu", static_cast<unsigned long long>(id));
     json out;
     out["macro"] = macro_to_json(cur);
     return tool_result_t::ok(out);
@@ -166,11 +196,15 @@ tool_result_t handle_macro_update(const json& params)
 
 tool_result_t handle_rule_add(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "session_rule_add name=%s match=%s", params.value("name", std::string()).c_str(), params.value("match", std::string("url_regex")).c_str());
     session_handler::session_rule_t r;
     r.name = params.value("name", std::string());
     session_handler::sh_match_t m;
     if (!session_handler::parse_match(params.value("match", std::string("url_regex")), m))
+    {
+        diag::log_tagged_fmt("mcp_burp", "session_rule_add invalid_match match=%s", params.value("match", std::string()).c_str());
         return tool_result_t::error("invalid 'match'");
+    }
     r.match = m;
     r.match_pattern = params.value("pattern", std::string());
     r.match_status = params.value("status", 0);
@@ -179,8 +213,13 @@ tool_result_t handle_rule_add(const json& params)
     r.replace_in_headers = params.value("replace_in_headers", true);
     r.replace_in_body = params.value("replace_in_body", true);
     r.active = params.value("active", true);
-    if (r.macro_id == 0) return tool_result_t::error("macro_id is required");
+    if (r.macro_id == 0)
+    {
+        diag::log_tagged_fmt("mcp_burp", "session_rule_add missing macro_id");
+        return tool_result_t::error("macro_id is required");
+    }
     const uint64_t id = session_handler::add_rule(r);
+    diag::log_tagged_fmt("mcp_burp", "session_rule_add ok rule_id=%llu macro_id=%llu", static_cast<unsigned long long>(id), static_cast<unsigned long long>(r.macro_id));
     json out;
     out["rule_id"] = id;
     return tool_result_t::ok(out);
@@ -188,6 +227,7 @@ tool_result_t handle_rule_add(const json& params)
 
 tool_result_t handle_rule_list(const json&)
 {
+    diag::log_tagged_fmt("mcp_burp", "session_rule_list entry");
     auto rules = session_handler::list_rules();
     json arr = json::array();
     for (const auto& r : rules) {
@@ -204,6 +244,7 @@ tool_result_t handle_rule_list(const json&)
         j["active"]             = r.active;
         arr.push_back(j);
     }
+    diag::log_tagged_fmt("mcp_burp", "session_rule_list ok count=%zu", rules.size());
     json out;
     out["count"] = arr.size();
     out["rules"] = arr;
@@ -213,8 +254,11 @@ tool_result_t handle_rule_list(const json&)
 tool_result_t handle_rule_remove(const json& params)
 {
     const uint64_t id = static_cast<uint64_t>(params.value("rule_id", 0));
+    diag::log_tagged_fmt("mcp_burp", "session_rule_remove rule_id=%llu", static_cast<unsigned long long>(id));
+    const bool removed = session_handler::remove_rule(id);
+    diag::log_tagged_fmt("mcp_burp", "session_rule_remove ok rule_id=%llu removed=%d", static_cast<unsigned long long>(id), (int)removed);
     json out;
-    out["removed"] = session_handler::remove_rule(id);
+    out["removed"] = removed;
     return tool_result_t::ok(out);
 }
 

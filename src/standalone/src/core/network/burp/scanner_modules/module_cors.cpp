@@ -1,5 +1,7 @@
 #include "../scanner_module.hpp"
 
+#include "../../../../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <optional>
@@ -80,10 +82,18 @@ std::vector<uint8_t> rebuild_with_origin(const std::string& base, const std::str
 
 void cors_run(const insertion_point_t& ip, const module_context_t& ctx, const send_fn_t& send)
 {
-    if (ip.kind != "header") return;
-    if (lc(ip.name) != "host") return;
+    diag::log_tagged_fmt("mod_cors", "cors_run entry ip=%s:%s host=%s", ip.kind.c_str(), ip.name.c_str(), ctx.host.c_str());
+    if (ip.kind != "header") {
+        diag::log_tagged_fmt("mod_cors", "cors_run skip not header kind=%s", ip.kind.c_str());
+        return;
+    }
+    if (lc(ip.name) != "host") {
+        diag::log_tagged_fmt("mod_cors", "cors_run skip not host header name=%s", ip.name.c_str());
+        return;
+    }
 
     std::string tag = random_marker("aidacors");
+    diag::log_tagged_fmt("mod_cors", "cors_run testing CORS origins tag=%s host=%s", tag.c_str(), ctx.host.c_str());
     std::string attacker_origin    = std::string("https://attacker-") + tag + ".example";
     std::string null_origin        = "null";
     std::string suffix_origin      = std::string("https://") + ctx.host + ".attacker-" + tag + ".example";
@@ -101,6 +111,7 @@ void cors_run(const insertion_point_t& ip, const module_context_t& ctx, const se
 
     for (auto& pd : probes_def)
     {
+        diag::log_tagged_fmt("mod_cors", "cors_run probing variant=%s origin=%s", pd.variant.c_str(), pd.origin.c_str());
         std::vector<uint8_t> raw = rebuild_with_origin(ip.base_request, pd.origin);
         probe_t p;
         p.payload = pd.origin;
@@ -108,20 +119,33 @@ void cors_run(const insertion_point_t& ip, const module_context_t& ctx, const se
         p.variant = pd.variant;
 
         auto resp = send(raw, p);
-        if (!resp.has_value()) continue;
+        if (!resp.has_value()) {
+            diag::log_tagged_fmt("mod_cors", "cors_run no response variant=%s", pd.variant.c_str());
+            continue;
+        }
 
         std::string acao = find_header_value(resp->resp_headers, "Access-Control-Allow-Origin");
         std::string acac = find_header_value(resp->resp_headers, "Access-Control-Allow-Credentials");
-        if (acao.empty()) continue;
+        diag::log_tagged_fmt("mod_cors", "cors_run variant=%s status=%d ACAO=%s ACAC=%s",
+                             pd.variant.c_str(), resp->status_code, acao.c_str(), acac.c_str());
+        if (acao.empty()) {
+            diag::log_tagged_fmt("mod_cors", "cors_run no ACAO header variant=%s", pd.variant.c_str());
+            continue;
+        }
 
         bool reflects = (acao == pd.origin) || lc(acao) == lc(pd.origin);
         if (!reflects && acao == "*" && lc(acac) == "true") reflects = true;
-        if (!reflects) continue;
+        if (!reflects) {
+            diag::log_tagged_fmt("mod_cors", "cors_run origin not reflected variant=%s acao=%s", pd.variant.c_str(), acao.c_str());
+            continue;
+        }
 
         bool credentials = !acac.empty() && lc(acac) == "true";
         severity_t sev = credentials ? severity_t::high : severity_t::medium;
         confidence_t conf = confidence_t::firm;
 
+        diag::log_tagged_fmt("mod_cors", "cors_run FINDING origin-reflection variant=%s origin=%s credentials=%d",
+                             pd.variant.c_str(), pd.origin.c_str(), credentials ? 1 : 0);
         auto iss = make_issue("cors.origin-reflection",
                               std::string("CORS Misconfiguration (") + pd.variant + ")",
                               sev, conf, ip, p, *resp, ctx,
@@ -138,6 +162,7 @@ void cors_run(const insertion_point_t& ip, const module_context_t& ctx, const se
         issue_store::add(std::move(iss));
         return;
     }
+    diag::log_tagged_fmt("mod_cors", "cors_run complete no findings ip=%s:%s host=%s", ip.kind.c_str(), ip.name.c_str(), ctx.host.c_str());
 }
 
 bool register_self()

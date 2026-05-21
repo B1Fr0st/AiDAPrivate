@@ -418,9 +418,11 @@ nlohmann::json build_launch_args(const launch_config_t& cfg)
 
 bool ensure_python_available(std::string& out_python_path)
 {
+    diag::log_tagged_fmt("camoufox", "ensure_python_available entry");
     std::lock_guard<std::recursive_mutex> lk(sg().mtx);
     if (!sg().cached_python_path.empty() && path_exists_w(utf8_to_wide(sg().cached_python_path)))
     {
+        diag::log_tagged_fmt("camoufox", "ensure_python_available cached path=%s", sg().cached_python_path.c_str());
         out_python_path = sg().cached_python_path;
         return true;
     }
@@ -430,28 +432,35 @@ bool ensure_python_available(std::string& out_python_path)
         || try_search_path(L"python3.exe", found)
         || try_local_appdata_python(found))
     {
+        diag::log_tagged_fmt("camoufox", "ensure_python_available found path=%s", found.c_str());
         sg().cached_python_path = found;
         out_python_path         = found;
         return true;
     }
+    diag::log_tagged_fmt("camoufox", "ensure_python_available python_not_found");
     set_error_locked("python interpreter not found on PATH or in %LOCALAPPDATA%\\Programs\\Python");
     return false;
 }
 
 bool start_bridge(const launch_config_t& cfg)
 {
+    diag::log_tagged_fmt("camoufox", "start_bridge entry headless=%d module=%s",
+        static_cast<int>(cfg.headless), cfg.server_module.c_str());
     std::lock_guard<std::recursive_mutex> lk(sg().mtx);
 
     if (sg().state == bridge_state_t::ready && sg().client)
     {
+        diag::log_tagged_fmt("camoufox", "start_bridge already_ready reusing");
         sg().active_cfg = cfg;
         return true;
     }
     if (sg().state == bridge_state_t::starting)
     {
+        diag::log_tagged_fmt("camoufox", "start_bridge already_starting rejected");
         set_error_locked("camoufox bridge already starting");
         return false;
     }
+    diag::log_tagged_fmt("camoufox", "start_bridge state->starting");
 
     sg().state          = bridge_state_t::starting;
     sg().last_error.clear();
@@ -551,14 +560,17 @@ bool start_bridge(const launch_config_t& cfg)
 
 bool stop_bridge()
 {
+    diag::log_tagged_fmt("camoufox", "stop_bridge entry");
     std::lock_guard<std::recursive_mutex> lk(sg().mtx);
     if (sg().state == bridge_state_t::stopped)
     {
+        diag::log_tagged_fmt("camoufox", "stop_bridge already_stopped");
         sg().client.reset();
         return true;
     }
     if (sg().client && sg().browser_open)
     {
+        diag::log_tagged_fmt("camoufox", "stop_bridge sending_close_browser");
         mcp_client::call_result_t r = sg().client->call_tool("close_browser", nlohmann::json::object());
         (void)r;
         sg().browser_open    = false;
@@ -576,18 +588,26 @@ bool stop_bridge()
 bool is_ready()
 {
     std::lock_guard<std::recursive_mutex> lk(sg().mtx);
-    return sg().state == bridge_state_t::ready && sg().client != nullptr;
+    bool ready = sg().state == bridge_state_t::ready && sg().client != nullptr;
+    diag::log_tagged_fmt("camoufox", "is_ready result=%d", static_cast<int>(ready));
+    return ready;
 }
 
 bool ensure_ready()
 {
-    if (is_ready()) return true;
+    diag::log_tagged_fmt("camoufox", "ensure_ready entry");
+    if (is_ready()) {
+        diag::log_tagged_fmt("camoufox", "ensure_ready already_ready");
+        return true;
+    }
     install::status_t st = install::get_status();
     if (st.state != install::install_state_t::ok &&
         st.state != install::install_state_t::available)
     {
+        diag::log_tagged_fmt("camoufox", "ensure_ready install_not_ready state=%d", static_cast<int>(st.state));
         return false;
     }
+    diag::log_tagged_fmt("camoufox", "ensure_ready starting_bridge python=%s", st.python_path.c_str());
     launch_config_t cfg;
     cfg.headless = true;
     cfg.python_executable = st.python_path;
@@ -608,26 +628,37 @@ bridge_status_t get_status()
     s.total_errors    = sg().total_errors.load(std::memory_order_relaxed);
     s.browser_open    = sg().browser_open;
     s.active_page_url = sg().active_page_url;
+    diag::log_tagged_fmt("camoufox", "get_status state=%d browser_open=%d calls=%llu errors=%llu url=%s",
+        static_cast<int>(s.state), static_cast<int>(s.browser_open),
+        static_cast<unsigned long long>(s.total_calls),
+        static_cast<unsigned long long>(s.total_errors), s.active_page_url.c_str());
     return s;
 }
 
 call_result_t call_tool(const std::string& tool_name, const nlohmann::json& args, int timeout_ms)
 {
-    return call_with_deadline(tool_name, args.is_null() ? nlohmann::json::object() : args, timeout_ms);
+    diag::log_tagged_fmt("camoufox", "call_tool entry tool=%s timeout_ms=%d", tool_name.c_str(), timeout_ms);
+    call_result_t r = call_with_deadline(tool_name, args.is_null() ? nlohmann::json::object() : args, timeout_ms);
+    diag::log_tagged_fmt("camoufox", "call_tool result tool=%s ok=%d", tool_name.c_str(), static_cast<int>(r.ok));
+    return r;
 }
 
 bool launch_browser(const launch_config_t& cfg)
 {
+    diag::log_tagged_fmt("camoufox", "launch_browser entry headless=%d", static_cast<int>(cfg.headless));
     return start_bridge(cfg);
 }
 
 bool close_browser()
 {
+    diag::log_tagged_fmt("camoufox", "close_browser entry");
     return stop_bridge();
 }
 
 bool navigate(const std::string& url, const std::string& wait_until, int timeout_ms)
 {
+    diag::log_tagged_fmt("camoufox", "navigate entry url=%s wait_until=%s timeout_ms=%d",
+        url.c_str(), wait_until.c_str(), timeout_ms);
     if (url.empty())
     {
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
@@ -643,6 +674,7 @@ bool navigate(const std::string& url, const std::string& wait_until, int timeout
     call_result_t r = call_with_deadline("navigate", a, call_timeout);
     if (!r.ok)
     {
+        diag::log_tagged_fmt("camoufox", "navigate failed url=%s err=%s", url.c_str(), r.error.c_str());
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked(std::string("navigate failed: ") + r.error);
         return false;
@@ -651,17 +683,22 @@ bool navigate(const std::string& url, const std::string& wait_until, int timeout
     {
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         sg().active_page_url = r.data["url"].get<std::string>();
+        diag::log_tagged_fmt("camoufox", "navigate ok final_url=%s", sg().active_page_url.c_str());
+    } else {
+        diag::log_tagged_fmt("camoufox", "navigate ok url=%s", url.c_str());
     }
     return true;
 }
 
 bool reload(const std::string& wait_until)
 {
+    diag::log_tagged_fmt("camoufox", "reload entry wait_until=%s", wait_until.c_str());
     nlohmann::json a;
     a["wait_until"] = wait_until.empty() ? std::string("load") : wait_until;
     call_result_t r = call_with_deadline("reload", a, 35000);
     if (!r.ok)
     {
+        diag::log_tagged_fmt("camoufox", "reload failed err=%s", r.error.c_str());
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked(std::string("reload failed: ") + r.error);
         return false;
@@ -670,20 +707,28 @@ bool reload(const std::string& wait_until)
     {
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         sg().active_page_url = r.data["url"].get<std::string>();
+        diag::log_tagged_fmt("camoufox", "reload ok url=%s", sg().active_page_url.c_str());
+    } else {
+        diag::log_tagged_fmt("camoufox", "reload ok");
     }
     return true;
 }
 
 call_result_t evaluate_js(const std::string& expression, bool await_promise)
 {
+    diag::log_tagged_fmt("camoufox", "evaluate_js entry expr_len=%zu await=%d",
+        expression.size(), static_cast<int>(await_promise));
     nlohmann::json a;
     a["expression"]    = expression;
     a["await_promise"] = await_promise;
-    return call_with_deadline("evaluate_js", a, 60000);
+    call_result_t r = call_with_deadline("evaluate_js", a, 60000);
+    diag::log_tagged_fmt("camoufox", "evaluate_js result ok=%d", static_cast<int>(r.ok));
+    return r;
 }
 
 bool add_init_script(const std::string& js)
 {
+    diag::log_tagged_fmt("camoufox", "add_init_script entry js_len=%zu", js.size());
     if (js.empty())
     {
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
@@ -701,35 +746,43 @@ bool add_init_script(const std::string& js)
     {
         if (js == name)
         {
+            diag::log_tagged_fmt("camoufox", "add_init_script preset=%s", name);
             nlohmann::json a;
             a["preset"]     = name;
             a["persistent"] = true;
             call_result_t r = call_with_deadline("inject_hook_preset", a, 30000);
             if (!r.ok)
             {
+                diag::log_tagged_fmt("camoufox", "add_init_script preset_failed preset=%s err=%s",
+                    name, r.error.c_str());
                 std::lock_guard<std::recursive_mutex> lk(sg().mtx);
                 set_error_locked(std::string("add_init_script (preset) failed: ") + r.error);
                 return false;
             }
+            diag::log_tagged_fmt("camoufox", "add_init_script preset_ok preset=%s", name);
             return true;
         }
     }
 
+    diag::log_tagged_fmt("camoufox", "add_init_script inline_script js_len=%zu", js.size());
     nlohmann::json a;
     a["expression"]    = std::string("(function(){ try { ") + js + std::string(" } catch(e) { return { __aida_init_error: String(e) }; } return { __aida_init_ok: true }; })()");
     a["await_promise"] = false;
     call_result_t r = call_with_deadline("evaluate_js", a, 30000);
     if (!r.ok)
     {
+        diag::log_tagged_fmt("camoufox", "add_init_script inline_failed err=%s", r.error.c_str());
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked(std::string("add_init_script (evaluate_js) failed: ") + r.error);
         return false;
     }
+    diag::log_tagged_fmt("camoufox", "add_init_script inline_ok");
     return true;
 }
 
 call_result_t get_console_logs(size_t max_records)
 {
+    diag::log_tagged_fmt("camoufox", "get_console_logs entry max_records=%zu", max_records);
     nlohmann::json a;
     if (max_records == 0) max_records = 200;
     call_result_t r = call_with_deadline("get_console_logs", a, 15000);
@@ -739,11 +792,14 @@ call_result_t get_console_logs(size_t max_records)
         for (size_t i = r.data.size() - max_records; i < r.data.size(); ++i) trimmed.push_back(r.data[i]);
         r.data = std::move(trimmed);
     }
+    diag::log_tagged_fmt("camoufox", "get_console_logs result ok=%d count=%zu",
+        static_cast<int>(r.ok), r.data.is_array() ? r.data.size() : static_cast<size_t>(0));
     return r;
 }
 
 call_result_t list_network_requests(size_t max_records)
 {
+    diag::log_tagged_fmt("camoufox", "list_network_requests entry max_records=%zu", max_records);
     nlohmann::json a;
     call_result_t r = call_with_deadline("list_network_requests", a, 30000);
     if (r.ok && r.data.is_array() && max_records > 0 && r.data.size() > max_records)
@@ -752,23 +808,31 @@ call_result_t list_network_requests(size_t max_records)
         for (size_t i = r.data.size() - max_records; i < r.data.size(); ++i) trimmed.push_back(r.data[i]);
         r.data = std::move(trimmed);
     }
+    diag::log_tagged_fmt("camoufox", "list_network_requests result ok=%d count=%zu",
+        static_cast<int>(r.ok), r.data.is_array() ? r.data.size() : static_cast<size_t>(0));
     return r;
 }
 
 call_result_t get_page_info()
 {
+    diag::log_tagged_fmt("camoufox", "get_page_info entry");
     nlohmann::json a;
     call_result_t r = call_with_deadline("get_page_info", a, 15000);
     if (r.ok && r.data.is_object() && r.data.contains("url") && r.data["url"].is_string())
     {
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         sg().active_page_url = r.data["url"].get<std::string>();
+        diag::log_tagged_fmt("camoufox", "get_page_info ok url=%s", sg().active_page_url.c_str());
+    } else {
+        diag::log_tagged_fmt("camoufox", "get_page_info ok no_url_in_result");
     }
     return r;
 }
 
 bool take_screenshot(const std::string& output_path, bool full_page)
 {
+    diag::log_tagged_fmt("camoufox", "take_screenshot entry path=%s full_page=%d",
+        output_path.c_str(), static_cast<int>(full_page));
     if (output_path.empty())
     {
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
@@ -842,20 +906,25 @@ bool take_screenshot(const std::string& output_path, bool full_page)
     CloseHandle(h);
     if (!wrote_ok || written != decoded.size())
     {
+        diag::log_tagged_fmt("camoufox", "take_screenshot write_failed path=%s written=%lu decoded=%zu",
+            output_path.c_str(), static_cast<unsigned long>(written), decoded.size());
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked(std::string("take_screenshot: write failed for ") + output_path);
         return false;
     }
+    diag::log_tagged_fmt("camoufox", "take_screenshot ok path=%s bytes=%zu", output_path.c_str(), decoded.size());
     return true;
 }
 
 bool take_snapshot(std::string& out_text)
 {
+    diag::log_tagged_fmt("camoufox", "take_snapshot entry");
     out_text.clear();
     nlohmann::json a;
     call_result_t r = call_with_deadline("take_snapshot", a, 30000);
     if (!r.ok)
     {
+        diag::log_tagged_fmt("camoufox", "take_snapshot failed err=%s", r.error.c_str());
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked(std::string("take_snapshot failed: ") + r.error);
         return false;
@@ -863,16 +932,20 @@ bool take_snapshot(std::string& out_text)
     if (r.data.is_object() && r.data.contains("snapshot"))
     {
         out_text = r.data["snapshot"].dump(2);
+        diag::log_tagged_fmt("camoufox", "take_snapshot ok snapshot_len=%zu", out_text.size());
         return true;
     }
     out_text = r.text;
+    diag::log_tagged_fmt("camoufox", "take_snapshot ok text_len=%zu", out_text.size());
     return true;
 }
 
 bool click(const std::string& selector)
 {
+    diag::log_tagged_fmt("camoufox", "click entry selector=%s", selector.c_str());
     if (selector.empty())
     {
+        diag::log_tagged_fmt("camoufox", "click empty_selector");
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked("click: selector is empty");
         return false;
@@ -882,17 +955,21 @@ bool click(const std::string& selector)
     call_result_t r = call_with_deadline("click", a, 30000);
     if (!r.ok)
     {
+        diag::log_tagged_fmt("camoufox", "click failed selector=%s err=%s", selector.c_str(), r.error.c_str());
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked(std::string("click failed: ") + r.error);
         return false;
     }
+    diag::log_tagged_fmt("camoufox", "click ok selector=%s", selector.c_str());
     return true;
 }
 
 bool type_text(const std::string& selector, const std::string& text)
 {
+    diag::log_tagged_fmt("camoufox", "type_text entry selector=%s text_len=%zu", selector.c_str(), text.size());
     if (selector.empty())
     {
+        diag::log_tagged_fmt("camoufox", "type_text empty_selector");
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked("type_text: selector is empty");
         return false;
@@ -903,17 +980,21 @@ bool type_text(const std::string& selector, const std::string& text)
     call_result_t r = call_with_deadline("type_text", a, 30000);
     if (!r.ok)
     {
+        diag::log_tagged_fmt("camoufox", "type_text failed selector=%s err=%s", selector.c_str(), r.error.c_str());
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked(std::string("type_text failed: ") + r.error);
         return false;
     }
+    diag::log_tagged_fmt("camoufox", "type_text ok selector=%s", selector.c_str());
     return true;
 }
 
 bool wait_for(const std::string& selector, int timeout_ms)
 {
+    diag::log_tagged_fmt("camoufox", "wait_for entry selector=%s timeout_ms=%d", selector.c_str(), timeout_ms);
     if (selector.empty())
     {
+        diag::log_tagged_fmt("camoufox", "wait_for empty_selector");
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked("wait_for: selector is empty");
         return false;
@@ -925,15 +1006,18 @@ bool wait_for(const std::string& selector, int timeout_ms)
     call_result_t r = call_with_deadline("wait_for", a, call_timeout);
     if (!r.ok)
     {
+        diag::log_tagged_fmt("camoufox", "wait_for failed selector=%s err=%s", selector.c_str(), r.error.c_str());
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked(std::string("wait_for failed: ") + r.error);
         return false;
     }
+    diag::log_tagged_fmt("camoufox", "wait_for ok selector=%s", selector.c_str());
     return true;
 }
 
 bool reset_browser_state()
 {
+    diag::log_tagged_fmt("camoufox", "reset_browser_state entry");
     nlohmann::json a;
     a["clear_persistent_hooks"] = true;
     a["clear_network_capture"]  = true;
@@ -943,17 +1027,21 @@ bool reset_browser_state()
     call_result_t r = call_with_deadline("reset_browser_state", a, 30000);
     if (!r.ok)
     {
+        diag::log_tagged_fmt("camoufox", "reset_browser_state failed err=%s", r.error.c_str());
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked(std::string("reset_browser_state failed: ") + r.error);
         return false;
     }
+    diag::log_tagged_fmt("camoufox", "reset_browser_state ok");
     return true;
 }
 
 bool inject_hook_preset(const std::string& preset_name)
 {
+    diag::log_tagged_fmt("camoufox", "inject_hook_preset entry preset=%s", preset_name.c_str());
     if (preset_name.empty())
     {
+        diag::log_tagged_fmt("camoufox", "inject_hook_preset empty_preset");
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked("inject_hook_preset: preset_name is empty");
         return false;
@@ -964,17 +1052,21 @@ bool inject_hook_preset(const std::string& preset_name)
     call_result_t r = call_with_deadline("inject_hook_preset", a, 30000);
     if (!r.ok)
     {
+        diag::log_tagged_fmt("camoufox", "inject_hook_preset failed preset=%s err=%s", preset_name.c_str(), r.error.c_str());
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked(std::string("inject_hook_preset failed: ") + r.error);
         return false;
     }
+    diag::log_tagged_fmt("camoufox", "inject_hook_preset ok preset=%s", preset_name.c_str());
     return true;
 }
 
 bool hook_function(const std::string& target, const std::string& mode)
 {
+    diag::log_tagged_fmt("camoufox", "hook_function entry target=%s mode=%s", target.c_str(), mode.c_str());
     if (target.empty())
     {
+        diag::log_tagged_fmt("camoufox", "hook_function empty_target");
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked("hook_function: target is empty");
         return false;
@@ -985,31 +1077,38 @@ bool hook_function(const std::string& target, const std::string& mode)
     call_result_t r = call_with_deadline("hook_function", a, 30000);
     if (!r.ok)
     {
+        diag::log_tagged_fmt("camoufox", "hook_function failed target=%s err=%s", target.c_str(), r.error.c_str());
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked(std::string("hook_function failed: ") + r.error);
         return false;
     }
+    diag::log_tagged_fmt("camoufox", "hook_function ok target=%s mode=%s", target.c_str(), mode.empty() ? "trace" : mode.c_str());
     return true;
 }
 
 bool remove_hooks()
 {
+    diag::log_tagged_fmt("camoufox", "remove_hooks entry");
     nlohmann::json a;
     a["keep_persistent"] = false;
     call_result_t r = call_with_deadline("remove_hooks", a, 30000);
     if (!r.ok)
     {
+        diag::log_tagged_fmt("camoufox", "remove_hooks failed err=%s", r.error.c_str());
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked(std::string("remove_hooks failed: ") + r.error);
         return false;
     }
+    diag::log_tagged_fmt("camoufox", "remove_hooks ok");
     return true;
 }
 
 std::string last_error()
 {
     std::lock_guard<std::recursive_mutex> lk(sg().mtx);
-    return sg().last_error;
+    std::string e = sg().last_error;
+    diag::log_tagged_fmt("camoufox", "last_error queried val=%s", e.c_str());
+    return e;
 }
 
 }

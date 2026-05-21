@@ -37,6 +37,7 @@
 #include "../network/burp/scanner_module.hpp"
 #include "../network/burp/audit_http.hpp"
 #include "../network/burp/headless_view.hpp"
+#include "../network/network_view.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <Windows.h>
@@ -2689,6 +2690,67 @@ namespace {
         passed.fetch_add(1);
     }
 
+    static void select_network_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
+                                   const char* tag, network_view::sub_tab_t value) {
+        network_view::g_state.active_tab = value;
+        if (network_view::g_state.active_tab == value) {
+            log_msg(hf, tag, "PASS -- network active_tab selected (%d)", static_cast<int>(value));
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- network active_tab not selected (%d)", static_cast<int>(value));
+            failed.fetch_add(1);
+        }
+    }
+
+    static void test_burp_tab_repeater(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "burp_tab.repeater", network_view::sub_tab_t::repeater);
+    }
+    static void test_burp_tab_fuzzer(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "burp_tab.fuzzer", network_view::sub_tab_t::fuzzer);
+    }
+    static void test_burp_tab_scripting(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "burp_tab.scripting", network_view::sub_tab_t::scripting);
+    }
+    static void test_burp_tab_sitemap(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "burp_tab.sitemap", network_view::sub_tab_t::sitemap);
+    }
+    static void test_burp_tab_scope(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "burp_tab.scope", network_view::sub_tab_t::scope);
+    }
+    static void test_burp_tab_scanner(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "burp_tab.scanner", network_view::sub_tab_t::scanner);
+    }
+    static void test_burp_tab_recon(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "burp_tab.recon", network_view::sub_tab_t::recon);
+    }
+    static void test_burp_tab_intruder(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "burp_tab.intruder", network_view::sub_tab_t::intruder);
+    }
+    static void test_burp_tab_collab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "burp_tab.collab", network_view::sub_tab_t::collab);
+    }
+    static void test_burp_tab_sequencer(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "burp_tab.sequencer", network_view::sub_tab_t::sequencer);
+    }
+    static void test_burp_tab_comparer(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "burp_tab.comparer", network_view::sub_tab_t::comparer);
+    }
+    static void test_burp_tab_jwt(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "burp_tab.jwt", network_view::sub_tab_t::jwt);
+    }
+    static void test_burp_tab_mr(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "burp_tab.mr", network_view::sub_tab_t::mr);
+    }
+    static void test_burp_tab_session(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "burp_tab.session", network_view::sub_tab_t::session);
+    }
+    static void test_burp_tab_api(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "burp_tab.api", network_view::sub_tab_t::api);
+    }
+    static void test_burp_tab_reports(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "burp_tab.reports", network_view::sub_tab_t::reports);
+    }
+
     static void call_test(void(*fn)(HANDLE, std::atomic<int>&, std::atomic<int>&), HANDLE hf, std::atomic<int>& p, std::atomic<int>& f) {
         __try { fn(hf, p, f); } __except(EXCEPTION_EXECUTE_HANDLER) { f.fetch_add(1); }
     }
@@ -2696,7 +2758,7 @@ namespace {
 
 void phase_burp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
     (void)skipped;
-    log_msg(hf, "burp_phase", "========== Burp Suite Tests START (167 tests) ==========");
+    log_msg(hf, "burp_phase", "========== Burp Suite Tests START (183 tests) ==========");
 
     if (cancelled && cancelled()) return;
     call_test(test_scope_init, hf, passed, failed);
@@ -3066,6 +3128,39 @@ void phase_burp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fai
     call_test(test_headless_view_last_error, hf, passed, failed);
     if (cancelled && cancelled()) return;
     call_test(test_headless_view_shutdown, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_burp_tab_repeater, hf, passed, failed);
+    if (cancelled && cancelled()) return;
+    call_test(test_burp_tab_fuzzer, hf, passed, failed);
+    if (cancelled && cancelled()) return;
+    call_test(test_burp_tab_scripting, hf, passed, failed);
+    if (cancelled && cancelled()) return;
+    call_test(test_burp_tab_sitemap, hf, passed, failed);
+    if (cancelled && cancelled()) return;
+    call_test(test_burp_tab_scope, hf, passed, failed);
+    if (cancelled && cancelled()) return;
+    call_test(test_burp_tab_scanner, hf, passed, failed);
+    if (cancelled && cancelled()) return;
+    call_test(test_burp_tab_recon, hf, passed, failed);
+    if (cancelled && cancelled()) return;
+    call_test(test_burp_tab_intruder, hf, passed, failed);
+    if (cancelled && cancelled()) return;
+    call_test(test_burp_tab_collab, hf, passed, failed);
+    if (cancelled && cancelled()) return;
+    call_test(test_burp_tab_sequencer, hf, passed, failed);
+    if (cancelled && cancelled()) return;
+    call_test(test_burp_tab_comparer, hf, passed, failed);
+    if (cancelled && cancelled()) return;
+    call_test(test_burp_tab_jwt, hf, passed, failed);
+    if (cancelled && cancelled()) return;
+    call_test(test_burp_tab_mr, hf, passed, failed);
+    if (cancelled && cancelled()) return;
+    call_test(test_burp_tab_session, hf, passed, failed);
+    if (cancelled && cancelled()) return;
+    call_test(test_burp_tab_api, hf, passed, failed);
+    if (cancelled && cancelled()) return;
+    call_test(test_burp_tab_reports, hf, passed, failed);
 
     log_msg(hf, "burp_phase", "========== Burp Suite Tests DONE ==========");
 }

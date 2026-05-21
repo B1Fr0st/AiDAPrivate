@@ -2,6 +2,8 @@
 #include "../audit_http.hpp"
 #include "../intruder_engine.hpp"
 
+#include "../../../../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -45,19 +47,35 @@ static double median_size(std::vector<size_t> sizes)
 
 void race_run(const insertion_point_t& ip, const module_context_t& ctx, const send_fn_t& send)
 {
-    if (!insertion_point_is_request_line(ip)) return;
-    if (ip.base_request.empty()) return;
+    diag::log_tagged_fmt("mod_race", "race_run entry ip=%s:%s host=%s", ip.kind.c_str(), ip.name.c_str(), ctx.host.c_str());
+    if (!insertion_point_is_request_line(ip)) {
+        diag::log_tagged_fmt("mod_race", "race_run skip not request-line value_offset=%zu", ip.value_offset);
+        return;
+    }
+    if (ip.base_request.empty()) {
+        diag::log_tagged_fmt("mod_race", "race_run skip empty base_request");
+        return;
+    }
 
     std::string method = extract_method(ip.base_request);
-    if (!is_state_changing_method(method)) return;
+    if (!is_state_changing_method(method)) {
+        diag::log_tagged_fmt("mod_race", "race_run skip non-state-changing method=%s", method.c_str());
+        return;
+    }
+    diag::log_tagged_fmt("mod_race", "race_run state-changing method=%s proceeding", method.c_str());
 
     audit_http::send_options_t opt;
     opt.timeout_ms = ctx.timeout_ms > 0 ? ctx.timeout_ms : 12000;
     opt.follow_redirects = false;
 
     std::vector<uint8_t> raw_req(ip.base_request.begin(), ip.base_request.end());
+    diag::log_tagged_fmt("mod_race", "race_run fetching baseline timeout=%dms", opt.timeout_ms);
     auto baseline = audit_http::send(raw_req, ctx.host, ctx.port, ctx.tls, opt);
-    if (!baseline.has_value()) return;
+    if (!baseline.has_value()) {
+        diag::log_tagged_fmt("mod_race", "race_run no baseline response host=%s", ctx.host.c_str());
+        return;
+    }
+    diag::log_tagged_fmt("mod_race", "race_run baseline status=%d latency=%llums", baseline->status_code, static_cast<unsigned long long>(baseline->latency_ms));
 
     intruder::config_t cfg;
     cfg.scheme = ctx.tls ? "https" : "http";
@@ -76,8 +94,13 @@ void race_run(const insertion_point_t& ip, const module_context_t& ctx, const se
     cfg.positions.push_back({ raw_req.size(), 0 });
     cfg.max_response_body_bytes = 16384;
 
+    diag::log_tagged_fmt("mod_race", "race_run starting intruder job concurrency=%d method=%s", cfg.concurrency, method.c_str());
     uint64_t job_id = intruder::start(cfg);
-    if (job_id == 0) return;
+    if (job_id == 0) {
+        diag::log_tagged_fmt("mod_race", "race_run intruder start failed");
+        return;
+    }
+    diag::log_tagged_fmt("mod_race", "race_run intruder job_id=%llu", static_cast<unsigned long long>(job_id));
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(opt.timeout_ms * 3);
     while (std::chrono::steady_clock::now() < deadline) {
@@ -88,7 +111,12 @@ void race_run(const insertion_point_t& ip, const module_context_t& ctx, const se
     }
     auto results = intruder::results(job_id, 0, 256);
     intruder::clear(job_id);
-    if (results.empty()) return;
+    diag::log_tagged_fmt("mod_race", "race_run intruder returned %zu results job_id=%llu",
+                         results.size(), static_cast<unsigned long long>(job_id));
+    if (results.empty()) {
+        diag::log_tagged_fmt("mod_race", "race_run no results from intruder");
+        return;
+    }
 
     int twoxx_count = 0;
     int fourxx_count = 0;
@@ -119,7 +147,13 @@ void race_run(const insertion_point_t& ip, const module_context_t& ctx, const se
     bool size_divergence = deviant >= 2;
     bool status_divergence = status_distribution.size() >= 2;
 
-    if (!multi_success && !size_divergence && !status_divergence) return;
+    diag::log_tagged_fmt("mod_race", "race_run analysis 2xx=%d 4xx=%d 5xx=%d deviant=%zu multi_success=%d size_div=%d status_div=%d",
+                         twoxx_count, fourxx_count, fivexx_count, deviant,
+                         multi_success ? 1 : 0, size_divergence ? 1 : 0, status_divergence ? 1 : 0);
+    if (!multi_success && !size_divergence && !status_divergence) {
+        diag::log_tagged_fmt("mod_race", "race_run no divergence found ip=%s:%s", ip.kind.c_str(), ip.name.c_str());
+        return;
+    }
 
     severity_t sev = severity_t::medium;
     confidence_t conf = confidence_t::tentative;
@@ -153,6 +187,8 @@ void race_run(const insertion_point_t& ip, const module_context_t& ctx, const se
     iss.remediation = "Wrap state-changing operations in transactional locks or use database-level uniqueness constraints. Audit endpoints that perform critical state changes (account creation, voucher redemption, balance transfer) for atomicity.";
     iss.cwe.push_back("CWE-362");
     iss.cwe.push_back("CWE-367");
+    diag::log_tagged_fmt("mod_race", "race_run FINDING race-condition ip=%s:%s method=%s 2xx=%d deviant=%zu",
+                         ip.kind.c_str(), ip.name.c_str(), method.c_str(), twoxx_count, deviant);
     issue_store::add(std::move(iss));
 }
 

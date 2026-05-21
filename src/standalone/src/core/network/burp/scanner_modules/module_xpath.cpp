@@ -1,5 +1,7 @@
 #include "../scanner_module.hpp"
 
+#include "../../../../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <optional>
 #include <sstream>
@@ -24,8 +26,9 @@ bool body_contains_xpath_error(const exchange_observed_t& resp)
     return false;
 }
 
-std::vector<probe_t> xpath_probes(const insertion_point_t&, const module_context_t&)
+std::vector<probe_t> xpath_probes(const insertion_point_t& ip, const module_context_t&)
 {
+    diag::log_tagged_fmt("mod_xpath", "xpath_probes entry ip=%s:%s", ip.kind.c_str(), ip.name.c_str());
     std::vector<probe_t> out;
     out.push_back({ "' or '1'='1",          "_AIDA_XPATH", "always-true-single" });
     out.push_back({ "\" or \"1\"=\"1",      "_AIDA_XPATH", "always-true-double" });
@@ -35,12 +38,15 @@ std::vector<probe_t> xpath_probes(const insertion_point_t&, const module_context
     out.push_back({ "'",                    "_AIDA_XPATH", "broken-quote" });
     out.push_back({ "(",                    "_AIDA_XPATH", "broken-paren" });
     out.push_back({ "1] | //user[contains(@*, ''",  "_AIDA_XPATH", "predicate-break" });
+    diag::log_tagged_fmt("mod_xpath", "xpath_probes built %zu probes ip=%s:%s", out.size(), ip.kind.c_str(), ip.name.c_str());
     return out;
 }
 
 std::optional<issue_t> xpath_detect(const insertion_point_t& ip, const probe_t& probe,
                                     const exchange_observed_t& resp, const module_context_t& ctx)
 {
+    diag::log_tagged_fmt("mod_xpath", "xpath_detect entry ip=%s:%s variant=%s status=%d",
+                         ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str(), resp.status_code);
     if (probe.marker != "_AIDA_XPATH") return std::nullopt;
     bool err = body_contains_xpath_error(resp);
     bool differential = false;
@@ -51,7 +57,13 @@ std::optional<issue_t> xpath_detect(const insertion_point_t& ip, const probe_t& 
         size_t mn = std::min(resp.resp_body.size(), ctx.baseline_response_body.size());
         if (mx > 0 && (mx - mn) * 10 > mx) differential = true;
     }
-    if (!err && !differential) return std::nullopt;
+    diag::log_tagged_fmt("mod_xpath", "xpath_detect err=%d differential=%d variant=%s", err ? 1 : 0, differential ? 1 : 0, probe.variant.c_str());
+    if (!err && !differential) {
+        diag::log_tagged_fmt("mod_xpath", "xpath_detect no finding ip=%s:%s variant=%s", ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str());
+        return std::nullopt;
+    }
+    diag::log_tagged_fmt("mod_xpath", "xpath_detect FINDING injection ip=%s:%s variant=%s err=%d differential=%d",
+                         ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str(), err ? 1 : 0, differential ? 1 : 0);
     confidence_t conf = err ? confidence_t::firm : confidence_t::tentative;
     auto iss = make_issue("xpath.injection",
                           std::string("Possible XPath Injection (") + probe.variant + ")",

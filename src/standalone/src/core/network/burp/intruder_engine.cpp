@@ -643,6 +643,7 @@ static int h2_on_stream_close_callback(nghttp2_session*, int32_t stream_id,
 
 static bool h2_session_init_client(h2_session_state_t& st, size_t body_cap)
 {
+    diag::log_tagged_fmt("intruder", "h2_session_init_client body_cap=%zu", body_cap);
     st.body_cap = body_cap;
     nghttp2_session_callbacks* cbs = nullptr;
     nghttp2_session_callbacks_new(&cbs);
@@ -654,18 +655,26 @@ static bool h2_session_init_client(h2_session_state_t& st, size_t body_cap)
 
     int rv = nghttp2_session_client_new(&st.session, cbs, &st);
     nghttp2_session_callbacks_del(cbs);
-    if (rv != 0) return false;
+    if (rv != 0) {
+        diag::log_tagged_fmt("intruder", "h2_session_init_client session_new_failed rv=%d", rv);
+        return false;
+    }
 
     nghttp2_settings_entry iv[2] = {
         { NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 1024 },
         { NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 1u << 24 }
     };
-    if (nghttp2_submit_settings(st.session, NGHTTP2_FLAG_NONE, iv, 2) != 0) return false;
+    if (nghttp2_submit_settings(st.session, NGHTTP2_FLAG_NONE, iv, 2) != 0) {
+        diag::log_tagged("intruder", "h2_session_init_client submit_settings_failed");
+        return false;
+    }
+    diag::log_tagged("intruder", "h2_session_init_client ok");
     return true;
 }
 
 static void h2_session_term(h2_session_state_t& st)
 {
+    diag::log_tagged("intruder", "h2_session_term");
     if (st.session) {
         nghttp2_session_del(st.session);
         st.session = nullptr;
@@ -894,7 +903,15 @@ struct payload_iter_t
 
 static size_t compute_total(const payload_iter_t& it, const config_t& cfg)
 {
-    if (!it.sets || it.sets->empty() || !it.positions || it.positions->empty()) return 0;
+    diag::log_tagged_fmt("intruder", "compute_total mode=%s positions=%zu sets=%zu cap=%zu",
+        attack_mode_name(it.mode),
+        it.positions ? it.positions->size() : 0,
+        it.sets ? it.sets->size() : 0,
+        cfg.total_requests_cap);
+    if (!it.sets || it.sets->empty() || !it.positions || it.positions->empty()) {
+        diag::log_tagged("intruder", "compute_total empty_sets_or_positions result=0");
+        return 0;
+    }
     size_t total = 0;
     switch (it.mode) {
         case attack_mode_t::sniper:
@@ -931,8 +948,10 @@ static size_t compute_total(const payload_iter_t& it, const config_t& cfg)
             break;
     }
     if (cfg.total_requests_cap > 0 && total > cfg.total_requests_cap) {
+        diag::log_tagged_fmt("intruder", "compute_total capped raw=%zu cap=%zu", total, cfg.total_requests_cap);
         total = cfg.total_requests_cap;
     }
+    diag::log_tagged_fmt("intruder", "compute_total result=%zu", total);
     return total;
 }
 
@@ -941,16 +960,20 @@ static bool send_one_request_h1(const std::string& host, uint16_t port, bool tls
                                 const config_t& cfg,
                                 result_t& out_result)
 {
+    diag::log_tagged_fmt("intruder", "send_one_request_h1 host=%s port=%u tls=%d req_len=%zu",
+        host.c_str(), static_cast<unsigned>(port), tls ? 1 : 0, req.size());
     auto t0 = std::chrono::steady_clock::now();
     if (tls) {
         ssl_conn_t c;
         std::vector<std::string> alpn = { "http/1.1" };
         if (!ssl_connect(c, host, port, cfg.timeout_ms, alpn)) {
+            diag::log_tagged_fmt("intruder", "send_one_request_h1 tls_connect_failed host=%s port=%u", host.c_str(), static_cast<unsigned>(port));
             out_result.error = true;
             out_result.error_msg = "tls_connect_failed";
             return false;
         }
         if (!ssl_send_all(c.ssl, req.data(), req.size(), cfg.timeout_ms)) {
+            diag::log_tagged("intruder", "send_one_request_h1 tls_send_failed");
             close_ssl(c);
             out_result.error = true;
             out_result.error_msg = "tls_send_failed";
@@ -961,6 +984,7 @@ static bool send_one_request_h1(const std::string& host, uint16_t port, bool tls
                                      cfg.max_response_body_bytes, cfg.timeout_ms);
         close_ssl(c);
         if (!ok) {
+            diag::log_tagged("intruder", "send_one_request_h1 tls_recv_failed");
             out_result.error = true;
             out_result.error_msg = "tls_recv_failed";
             return false;
@@ -973,15 +997,19 @@ static bool send_one_request_h1(const std::string& host, uint16_t port, bool tls
         out_result.response_raw = std::move(resp);
         auto t1 = std::chrono::steady_clock::now();
         out_result.latency_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+        diag::log_tagged_fmt("intruder", "send_one_request_h1 tls_ok status=%d resp_size=%zu latency_ms=%llu",
+            sc, out_result.response_size, static_cast<unsigned long long>(out_result.latency_ms));
         return true;
     } else {
         SOCKET s = tcp_connect(host, port, cfg.timeout_ms);
         if (s == INVALID_SOCKET) {
+            diag::log_tagged_fmt("intruder", "send_one_request_h1 tcp_connect_failed host=%s port=%u", host.c_str(), static_cast<unsigned>(port));
             out_result.error = true;
             out_result.error_msg = "tcp_connect_failed";
             return false;
         }
         if (!plain_send_all(s, req.data(), req.size(), cfg.timeout_ms)) {
+            diag::log_tagged("intruder", "send_one_request_h1 tcp_send_failed");
             shutdown(s, SD_BOTH); closesocket(s);
             out_result.error = true;
             out_result.error_msg = "tcp_send_failed";
@@ -992,6 +1020,7 @@ static bool send_one_request_h1(const std::string& host, uint16_t port, bool tls
                                      cfg.max_response_body_bytes, cfg.timeout_ms);
         shutdown(s, SD_BOTH); closesocket(s);
         if (!ok) {
+            diag::log_tagged("intruder", "send_one_request_h1 tcp_recv_failed");
             out_result.error = true;
             out_result.error_msg = "tcp_recv_failed";
             return false;
@@ -1004,12 +1033,16 @@ static bool send_one_request_h1(const std::string& host, uint16_t port, bool tls
         out_result.response_raw = std::move(resp);
         auto t1 = std::chrono::steady_clock::now();
         out_result.latency_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+        diag::log_tagged_fmt("intruder", "send_one_request_h1 tcp_ok status=%d resp_size=%zu latency_ms=%llu",
+            sc, out_result.response_size, static_cast<unsigned long long>(out_result.latency_ms));
         return true;
     }
 }
 
 static void worker_pooled_h1(std::shared_ptr<job_t> job)
 {
+    diag::log_tagged_fmt("intruder", "worker_pooled_h1 job_id=%llu total=%zu",
+        static_cast<unsigned long long>(job->id), job->total.load());
     payload_iter_t it;
     it.mode = job->cfg.attack_mode;
     it.positions = &job->cfg.positions;
@@ -1035,14 +1068,24 @@ static void worker_pooled_h1(std::shared_ptr<job_t> job)
         r.index  = idx;
         r.payloads = payloads;
         send_one_request_h1(job->cfg.host, job->cfg.port, tls, req_raw, job->cfg, r);
-        if (r.error) job->errors.fetch_add(1);
+        if (r.error) {
+            job->errors.fetch_add(1);
+            diag::log_tagged_fmt("intruder", "worker_pooled_h1 idx=%zu error=%s", idx, r.error_msg.c_str());
+        } else {
+            diag::log_tagged_fmt("intruder", "worker_pooled_h1 idx=%zu status=%d resp_size=%zu latency_ms=%llu",
+                idx, r.status_code, r.response_size, static_cast<unsigned long long>(r.latency_ms));
+        }
         job->sent.fetch_add(1);
         store_result(*job, std::move(r));
     }
+    diag::log_tagged_fmt("intruder", "worker_pooled_h1 done job_id=%llu sent=%zu errors=%zu",
+        static_cast<unsigned long long>(job->id), job->sent.load(), job->errors.load());
 }
 
 static void run_pipelined_h1(std::shared_ptr<job_t> job)
 {
+    diag::log_tagged_fmt("intruder", "run_pipelined_h1 job_id=%llu host=%s port=%u total=%zu",
+        static_cast<unsigned long long>(job->id), job->cfg.host.c_str(), static_cast<unsigned>(job->cfg.port), job->total.load());
     payload_iter_t it;
     it.mode = job->cfg.attack_mode;
     it.positions = &job->cfg.positions;
@@ -1056,11 +1099,13 @@ static void run_pipelined_h1(std::shared_ptr<job_t> job)
         size_t this_batch = (total - cursor);
         if (this_batch > batch) this_batch = batch;
 
+        diag::log_tagged_fmt("intruder", "run_pipelined_h1 batch cursor=%zu batch_size=%zu tls=%d", cursor, this_batch, tls ? 1 : 0);
         ssl_conn_t sc;
         SOCKET plain_s = INVALID_SOCKET;
         if (tls) {
             std::vector<std::string> alpn = { "http/1.1" };
             if (!ssl_connect(sc, job->cfg.host, job->cfg.port, job->cfg.timeout_ms, alpn)) {
+                diag::log_tagged_fmt("intruder", "run_pipelined_h1 tls_connect_failed cursor=%zu batch=%zu", cursor, this_batch);
                 for (size_t i = 0; i < this_batch; ++i) {
                     result_t r;
                     r.job_id = job->id;
@@ -1078,6 +1123,7 @@ static void run_pipelined_h1(std::shared_ptr<job_t> job)
         } else {
             plain_s = tcp_connect(job->cfg.host, job->cfg.port, job->cfg.timeout_ms);
             if (plain_s == INVALID_SOCKET) {
+                diag::log_tagged_fmt("intruder", "run_pipelined_h1 tcp_connect_failed cursor=%zu batch=%zu", cursor, this_batch);
                 for (size_t i = 0; i < this_batch; ++i) {
                     result_t r;
                     r.job_id = job->id;
@@ -1115,10 +1161,12 @@ static void run_pipelined_h1(std::shared_ptr<job_t> job)
             combined.insert(combined.end(), req.begin(), req.end());
         }
 
+        diag::log_tagged_fmt("intruder", "run_pipelined_h1 sending combined_len=%zu batch=%zu", combined.size(), this_batch);
         auto t0 = std::chrono::steady_clock::now();
         bool sent_ok = tls ? ssl_send_all(sc.ssl, combined.data(), combined.size(), job->cfg.timeout_ms)
                            : plain_send_all(plain_s, combined.data(), combined.size(), job->cfg.timeout_ms);
         if (!sent_ok) {
+            diag::log_tagged_fmt("intruder", "run_pipelined_h1 pipelined_send_failed cursor=%zu batch=%zu", cursor, this_batch);
             for (size_t i = 0; i < this_batch; ++i) {
                 result_t r;
                 r.job_id = job->id;
@@ -1207,6 +1255,10 @@ static void run_pipelined_h1(std::shared_ptr<job_t> job)
             }
         }
 
+        if (parsed_count < this_batch) {
+            diag::log_tagged_fmt("intruder", "run_pipelined_h1 pipelined_response_missing cursor=%zu parsed=%zu expected=%zu",
+                cursor, parsed_count, this_batch);
+        }
         for (size_t i = parsed_count; i < this_batch; ++i) {
             result_t r;
             r.job_id = job->id;
@@ -1219,10 +1271,13 @@ static void run_pipelined_h1(std::shared_ptr<job_t> job)
             store_result(*job, std::move(r));
         }
 
+        diag::log_tagged_fmt("intruder", "run_pipelined_h1 batch_done cursor=%zu parsed=%zu", cursor, parsed_count);
         if (tls) close_ssl(sc);
         else { shutdown(plain_s, SD_BOTH); closesocket(plain_s); }
         cursor += this_batch;
     }
+    diag::log_tagged_fmt("intruder", "run_pipelined_h1 complete job_id=%llu sent=%zu errors=%zu",
+        static_cast<unsigned long long>(job->id), job->sent.load(), job->errors.load());
 }
 
 static bool h2_flush_out(ssl_conn_t& sc, h2_session_state_t& st, int timeout_ms)
@@ -1265,6 +1320,8 @@ static bool h2_pump_session_input(ssl_conn_t& sc, h2_session_state_t& st, int ti
 
 static int32_t h2_submit(h2_session_state_t& st, const parsed_h2_target_t& p)
 {
+    diag::log_tagged_fmt("intruder", "h2_submit method=%s scheme=%s authority=%s path=%s body_len=%zu",
+        p.method.c_str(), p.scheme.c_str(), p.authority.c_str(), p.path.c_str(), p.body.size());
     std::vector<nghttp2_nv> nva;
     nva.reserve(p.headers.size() + 4);
     auto push = [&](const std::string& n, const std::string& v) {
@@ -1285,6 +1342,7 @@ static int32_t h2_submit(h2_session_state_t& st, const parsed_h2_target_t& p)
     if (p.body.empty()) {
         int32_t sid = nghttp2_submit_request(st.session, nullptr, nva.data(), nva.size(),
                                              nullptr, nullptr);
+        diag::log_tagged_fmt("intruder", "h2_submit no_body sid=%d", sid);
         return sid;
     }
 
@@ -1311,11 +1369,14 @@ static int32_t h2_submit(h2_session_state_t& st, const parsed_h2_target_t& p)
         std::lock_guard<std::mutex> lk(st.mtx);
         st.bodies[sid] = body;
     }
+    diag::log_tagged_fmt("intruder", "h2_submit with_body sid=%d", sid);
     return sid;
 }
 
 static void run_h2_multiplexed(std::shared_ptr<job_t> job)
 {
+    diag::log_tagged_fmt("intruder", "run_h2_multiplexed job_id=%llu host=%s port=%u total=%zu",
+        static_cast<unsigned long long>(job->id), job->cfg.host.c_str(), static_cast<unsigned>(job->cfg.port), job->total.load());
     payload_iter_t it;
     it.mode = job->cfg.attack_mode;
     it.positions = &job->cfg.positions;
@@ -1324,6 +1385,7 @@ static void run_h2_multiplexed(std::shared_ptr<job_t> job)
     ssl_conn_t sc;
     std::vector<std::string> alpn = { "h2" };
     if (!ssl_connect(sc, job->cfg.host, job->cfg.port, job->cfg.timeout_ms, alpn)) {
+        diag::log_tagged_fmt("intruder", "run_h2_multiplexed h2_tls_failed host=%s", job->cfg.host.c_str());
         size_t t = job->total.load();
         for (size_t i = 0; i < t; ++i) {
             result_t r; r.job_id = job->id; r.index = i;
@@ -1335,6 +1397,7 @@ static void run_h2_multiplexed(std::shared_ptr<job_t> job)
         return;
     }
     if (!sc.alpn_is_h2) {
+        diag::log_tagged_fmt("intruder", "run_h2_multiplexed alpn_not_h2 host=%s", job->cfg.host.c_str());
         size_t t = job->total.load();
         for (size_t i = 0; i < t; ++i) {
             result_t r; r.job_id = job->id; r.index = i;
@@ -1350,6 +1413,7 @@ static void run_h2_multiplexed(std::shared_ptr<job_t> job)
     h2_session_state_t st;
     st.body_cap = job->cfg.max_response_body_bytes;
     if (!h2_session_init_client(st, job->cfg.max_response_body_bytes)) {
+        diag::log_tagged("intruder", "run_h2_multiplexed session_init_failed");
         close_ssl(sc);
         return;
     }
@@ -1359,6 +1423,7 @@ static void run_h2_multiplexed(std::shared_ptr<job_t> job)
         'S','M','\r','\n','\r','\n'
     };
     if (!ssl_send_all(sc.ssl, kPreface, sizeof(kPreface), job->cfg.timeout_ms)) {
+        diag::log_tagged("intruder", "run_h2_multiplexed preface_send_failed");
         close_ssl(sc); h2_session_term(st);
         return;
     }
@@ -1366,6 +1431,7 @@ static void run_h2_multiplexed(std::shared_ptr<job_t> job)
     size_t total = job->total.load();
     size_t inflight_cap = job->cfg.concurrency > 0 ? job->cfg.concurrency : 32;
     if (inflight_cap > 256) inflight_cap = 256;
+    diag::log_tagged_fmt("intruder", "run_h2_multiplexed tls_ok total=%zu inflight_cap=%zu", total, inflight_cap);
 
     std::unordered_map<int32_t, std::pair<size_t, std::vector<std::string>>> stream_to_idx;
     auto t_start = std::chrono::steady_clock::now();
@@ -1383,6 +1449,7 @@ static void run_h2_multiplexed(std::shared_ptr<job_t> job)
             parsed_h2_target_t p = parse_http1_for_h2(req, scheme, auth);
             int32_t sid = h2_submit(st, p);
             if (sid < 0) {
+                diag::log_tagged_fmt("intruder", "run_h2_multiplexed h2_submit_failed cursor=%zu", cursor);
                 result_t r;
                 r.job_id = job->id; r.index = cursor; r.payloads = payloads;
                 r.error = true; r.error_msg = "h2_submit_failed";
@@ -1416,7 +1483,13 @@ static void run_h2_multiplexed(std::shared_ptr<job_t> job)
             r.response_raw = std::move(cap.body);
             auto t1 = std::chrono::steady_clock::now();
             r.latency_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t_start).count());
-            if (cap.errored) { r.error = true; r.error_msg = "h2_stream_errored"; job->errors.fetch_add(1); }
+            if (cap.errored) {
+                diag::log_tagged_fmt("intruder", "run_h2_multiplexed stream_errored sid=%d idx=%zu", sid, r.index);
+                r.error = true; r.error_msg = "h2_stream_errored"; job->errors.fetch_add(1);
+            } else {
+                diag::log_tagged_fmt("intruder", "run_h2_multiplexed stream_ok sid=%d idx=%zu status=%d resp_size=%zu latency_ms=%llu",
+                    sid, r.index, r.status_code, r.response_size, static_cast<unsigned long long>(r.latency_ms));
+            }
             job->sent.fetch_add(1);
             store_result(*job, std::move(r));
             stream_to_idx.erase(it_si);
@@ -1462,12 +1535,17 @@ static void run_h2_multiplexed(std::shared_ptr<job_t> job)
         }
     }
 
+    diag::log_tagged_fmt("intruder", "run_h2_multiplexed complete job_id=%llu sent=%zu errors=%zu",
+        static_cast<unsigned long long>(job->id), job->sent.load(), job->errors.load());
     close_ssl(sc);
     h2_session_term(st);
 }
 
 static void run_h2_single_packet(std::shared_ptr<job_t> job)
 {
+    diag::log_tagged_fmt("intruder", "run_h2_single_packet job_id=%llu host=%s port=%u total=%zu warmup=%d gate=%d",
+        static_cast<unsigned long long>(job->id), job->cfg.host.c_str(), static_cast<unsigned>(job->cfg.port),
+        job->total.load(), job->cfg.race_warmup_count, job->cfg.race_gate_size);
     payload_iter_t it;
     it.mode = job->cfg.attack_mode;
     it.positions = &job->cfg.positions;
@@ -1476,6 +1554,7 @@ static void run_h2_single_packet(std::shared_ptr<job_t> job)
     ssl_conn_t sc;
     std::vector<std::string> alpn = { "h2" };
     if (!ssl_connect(sc, job->cfg.host, job->cfg.port, job->cfg.timeout_ms, alpn)) {
+        diag::log_tagged_fmt("intruder", "run_h2_single_packet h2_tls_failed host=%s", job->cfg.host.c_str());
         size_t t = job->total.load();
         for (size_t i = 0; i < t; ++i) {
             result_t r; r.job_id = job->id; r.index = i;
@@ -1487,6 +1566,7 @@ static void run_h2_single_packet(std::shared_ptr<job_t> job)
         return;
     }
     if (!sc.alpn_is_h2) {
+        diag::log_tagged_fmt("intruder", "run_h2_single_packet alpn_not_h2 host=%s", job->cfg.host.c_str());
         size_t t = job->total.load();
         for (size_t i = 0; i < t; ++i) {
             result_t r; r.job_id = job->id; r.index = i;
@@ -1502,6 +1582,7 @@ static void run_h2_single_packet(std::shared_ptr<job_t> job)
     h2_session_state_t st;
     st.body_cap = job->cfg.max_response_body_bytes;
     if (!h2_session_init_client(st, job->cfg.max_response_body_bytes)) {
+        diag::log_tagged("intruder", "run_h2_single_packet session_init_failed");
         close_ssl(sc);
         return;
     }
@@ -1516,11 +1597,14 @@ static void run_h2_single_packet(std::shared_ptr<job_t> job)
         'S','M','\r','\n','\r','\n'
     };
     if (!ssl_send_all(sc.ssl, kPreface, sizeof(kPreface), job->cfg.timeout_ms)) {
+        diag::log_tagged("intruder", "run_h2_single_packet preface_send_failed");
         close_ssl(sc); h2_session_term(st);
         return;
     }
 
+    diag::log_tagged_fmt("intruder", "run_h2_single_packet tls_ok total=%zu warmup=%zu gate=%zu", total, warmup, gate);
     if (warmup > 0) {
+        diag::log_tagged_fmt("intruder", "run_h2_single_packet warmup_phase count=%zu", warmup);
         std::unordered_map<int32_t, std::pair<size_t, std::vector<std::string>>> warm_map;
         size_t w_used = warmup < total ? warmup : total;
         for (size_t i = 0; i < w_used; ++i) {
@@ -1548,17 +1632,24 @@ static void run_h2_single_packet(std::shared_ptr<job_t> job)
             r.response_size = cap.body.size();
             r.response_preview = preview_string(cap.body, 4096);
             r.response_raw = std::move(cap.body);
-            if (cap.errored) { r.error = true; r.error_msg = "h2_warmup_errored"; job->errors.fetch_add(1); }
+            if (cap.errored) {
+                diag::log_tagged_fmt("intruder", "run_h2_single_packet warmup_errored sid=%d idx=%zu", kv.first, r.index);
+                r.error = true; r.error_msg = "h2_warmup_errored"; job->errors.fetch_add(1);
+            } else {
+                diag::log_tagged_fmt("intruder", "run_h2_single_packet warmup_ok sid=%d idx=%zu status=%d", kv.first, r.index, r.status_code);
+            }
             job->sent.fetch_add(1);
             store_result(*job, std::move(r));
             st.streams.erase(kv.first);
         }
+        diag::log_tagged("intruder", "run_h2_single_packet warmup_phase_done");
     }
 
     std::unordered_map<int32_t, std::pair<size_t, std::vector<std::string>>> gate_map;
     size_t gate_start_idx = warmup;
     size_t gate_end_idx = gate_start_idx + gate;
     if (gate_end_idx > total) gate_end_idx = total;
+    diag::log_tagged_fmt("intruder", "run_h2_single_packet gate_phase start=%zu end=%zu", gate_start_idx, gate_end_idx);
     for (size_t i = gate_start_idx; i < gate_end_idx; ++i) {
         auto payloads = it.resolve(i);
         std::vector<uint8_t> req =
@@ -1567,6 +1658,7 @@ static void run_h2_single_packet(std::shared_ptr<job_t> job)
         parsed_h2_target_t p = parse_http1_for_h2(req, scheme, job->cfg.host);
         int32_t sid = h2_submit(st, p);
         if (sid < 0) {
+            diag::log_tagged_fmt("intruder", "run_h2_single_packet gate_submit_failed idx=%zu", i);
             result_t r;
             r.job_id = job->id; r.index = i; r.payloads = payloads;
             r.error = true; r.error_msg = "h2_submit_failed";
@@ -1576,13 +1668,17 @@ static void run_h2_single_packet(std::shared_ptr<job_t> job)
         }
         gate_map[sid] = { i, std::move(payloads) };
     }
+    diag::log_tagged_fmt("intruder", "run_h2_single_packet gate_submitted streams=%zu", gate_map.size());
 
     while (nghttp2_session_want_write(st.session)) {
         (void)nghttp2_session_send(st.session);
     }
     auto t_send_start = std::chrono::steady_clock::now();
     if (!st.pending_out.empty()) {
+        diag::log_tagged_fmt("intruder", "run_h2_single_packet sending_gate_packet bytes=%zu streams=%zu",
+            st.pending_out.size(), gate_map.size());
         if (!ssl_send_all(sc.ssl, st.pending_out.data(), st.pending_out.size(), job->cfg.timeout_ms)) {
+            diag::log_tagged("intruder", "run_h2_single_packet gate_packet_send_failed");
             for (auto& kv : gate_map) {
                 result_t r;
                 r.job_id = job->id;
@@ -1596,6 +1692,7 @@ static void run_h2_single_packet(std::shared_ptr<job_t> job)
             return;
         }
         st.pending_out.clear();
+        diag::log_tagged("intruder", "run_h2_single_packet gate_packet_sent");
     }
 
     h2_pump_session_input(sc, st, job->cfg.timeout_ms, true);
@@ -1612,8 +1709,15 @@ static void run_h2_single_packet(std::shared_ptr<job_t> job)
             r.response_size = cap.body.size();
             r.response_preview = preview_string(cap.body, 4096);
             r.response_raw = std::move(cap.body);
-            if (!cap.complete) { r.error = true; r.error_msg = "h2_gate_incomplete"; job->errors.fetch_add(1); }
+            if (!cap.complete) {
+                diag::log_tagged_fmt("intruder", "run_h2_single_packet gate_incomplete sid=%d idx=%zu", kv.first, r.index);
+                r.error = true; r.error_msg = "h2_gate_incomplete"; job->errors.fetch_add(1);
+            } else {
+                diag::log_tagged_fmt("intruder", "run_h2_single_packet gate_ok sid=%d idx=%zu status=%d resp_size=%zu",
+                    kv.first, r.index, r.status_code, r.response_size);
+            }
         } else {
+            diag::log_tagged_fmt("intruder", "run_h2_single_packet gate_stream_missing sid=%d idx=%zu", kv.first, r.index);
             r.error = true; r.error_msg = "h2_gate_stream_missing";
             job->errors.fetch_add(1);
         }
@@ -1651,11 +1755,15 @@ static void run_h2_single_packet(std::shared_ptr<job_t> job)
         }
     }
 
+    diag::log_tagged_fmt("intruder", "run_h2_single_packet complete job_id=%llu sent=%zu errors=%zu",
+        static_cast<unsigned long long>(job->id), job->sent.load(), job->errors.load());
     close_ssl(sc); h2_session_term(st);
 }
 
 static void run_serial_h1(std::shared_ptr<job_t> job)
 {
+    diag::log_tagged_fmt("intruder", "run_serial_h1 job_id=%llu host=%s port=%u total=%zu",
+        static_cast<unsigned long long>(job->id), job->cfg.host.c_str(), static_cast<unsigned>(job->cfg.port), job->total.load());
     payload_iter_t it;
     it.mode = job->cfg.attack_mode;
     it.positions = &job->cfg.positions;
@@ -1665,7 +1773,10 @@ static void run_serial_h1(std::shared_ptr<job_t> job)
     size_t total = job->total.load();
     for (size_t i = 0; i < total && !job->cancel.load(); ++i) {
         if (job->cfg.requests_per_second_cap > 0) bucket_wait(job->bucket, job->cancel);
-        if (job->cancel.load()) break;
+        if (job->cancel.load()) {
+            diag::log_tagged_fmt("intruder", "run_serial_h1 cancelled at idx=%zu", i);
+            break;
+        }
         auto payloads = it.resolve(i);
         std::vector<uint8_t> req =
             apply_payload_replacements(job->cfg.base_request, job->cfg.positions, payloads);
@@ -1673,14 +1784,29 @@ static void run_serial_h1(std::shared_ptr<job_t> job)
         result_t r;
         r.job_id = job->id; r.index = i; r.payloads = payloads;
         send_one_request_h1(job->cfg.host, job->cfg.port, tls, req, job->cfg, r);
-        if (r.error) job->errors.fetch_add(1);
+        if (r.error) {
+            diag::log_tagged_fmt("intruder", "run_serial_h1 error idx=%zu msg=%s", i, r.error_msg.c_str());
+            job->errors.fetch_add(1);
+        } else {
+            diag::log_tagged_fmt("intruder", "run_serial_h1 ok idx=%zu status=%d resp_size=%zu latency_ms=%llu",
+                i, r.status_code, r.response_size, static_cast<unsigned long long>(r.latency_ms));
+        }
         job->sent.fetch_add(1);
         store_result(*job, std::move(r));
     }
+    diag::log_tagged_fmt("intruder", "run_serial_h1 complete job_id=%llu sent=%zu errors=%zu",
+        static_cast<unsigned long long>(job->id), job->sent.load(), job->errors.load());
 }
 
 static void job_main(std::shared_ptr<job_t> job)
 {
+    diag::log_tagged_fmt("intruder", "job_main start job_id=%llu host=%s port=%u scheme=%s attack=%s engine=%s",
+        static_cast<unsigned long long>(job->id),
+        job->cfg.host.c_str(),
+        static_cast<unsigned>(job->cfg.port),
+        job->cfg.scheme.c_str(),
+        attack_mode_name(job->cfg.attack_mode),
+        engine_mode_name(job->cfg.engine_mode));
     job->started_ms.store(unix_ms_now());
 
     payload_iter_t pit;
@@ -1689,23 +1815,28 @@ static void job_main(std::shared_ptr<job_t> job)
     pit.sets = &job->cfg.payload_sets;
     pit.total = compute_total(pit, job->cfg);
     job->total.store(pit.total);
+    diag::log_tagged_fmt("intruder", "job_main total=%zu rps_cap=%zu", pit.total, job->cfg.requests_per_second_cap);
 
     if (job->cfg.requests_per_second_cap > 0) {
         bucket_init(job->bucket, job->cfg.requests_per_second_cap);
+        diag::log_tagged_fmt("intruder", "job_main rps_bucket_init rate=%zu", job->cfg.requests_per_second_cap);
     }
 
     switch (job->cfg.engine_mode) {
         case engine_mode_t::http1_serial: {
+            diag::log_tagged_fmt("intruder", "job_main dispatching http1_serial job_id=%llu", static_cast<unsigned long long>(job->id));
             run_serial_h1(job);
             break;
         }
         case engine_mode_t::http1_pipelined: {
+            diag::log_tagged_fmt("intruder", "job_main dispatching http1_pipelined job_id=%llu", static_cast<unsigned long long>(job->id));
             run_pipelined_h1(job);
             break;
         }
         case engine_mode_t::http1_pooled: {
             size_t pool = job->cfg.concurrency > 0 ? job->cfg.concurrency : 16;
             if (pool > 128) pool = 128;
+            diag::log_tagged_fmt("intruder", "job_main dispatching http1_pooled pool=%zu job_id=%llu", pool, static_cast<unsigned long long>(job->id));
             std::vector<std::thread> ws;
             ws.reserve(pool);
             for (size_t i = 0; i < pool; ++i) {
@@ -1715,10 +1846,12 @@ static void job_main(std::shared_ptr<job_t> job)
             break;
         }
         case engine_mode_t::http2_multiplexed: {
+            diag::log_tagged_fmt("intruder", "job_main dispatching http2_multiplexed job_id=%llu", static_cast<unsigned long long>(job->id));
             run_h2_multiplexed(job);
             break;
         }
         case engine_mode_t::http2_single_packet: {
+            diag::log_tagged_fmt("intruder", "job_main dispatching http2_single_packet job_id=%llu", static_cast<unsigned long long>(job->id));
             run_h2_single_packet(job);
             break;
         }
@@ -1726,17 +1859,25 @@ static void job_main(std::shared_ptr<job_t> job)
 
     job->finished_ms.store(unix_ms_now());
     job->running.store(false);
+    diag::log_tagged_fmt("intruder", "job_main done job_id=%llu sent=%zu errors=%zu total=%zu",
+        static_cast<unsigned long long>(job->id), job->sent.load(), job->errors.load(), job->total.load());
 }
 
 }
 
 uint64_t start(config_t cfg)
 {
+    diag::log_tagged_fmt("intruder", "start host=%s port=%u scheme=%s attack=%s engine=%s positions=%zu sets=%zu",
+        cfg.host.c_str(), static_cast<unsigned>(cfg.port), cfg.scheme.c_str(),
+        attack_mode_name(cfg.attack_mode), engine_mode_name(cfg.engine_mode),
+        cfg.positions.size(), cfg.payload_sets.size());
     if (cfg.host.empty() || cfg.port == 0) {
+        diag::log_tagged("intruder", "start rejected invalid_host_or_port");
         set_err("intruder: invalid host/port");
         return 0;
     }
     if (cfg.base_request.empty()) {
+        diag::log_tagged("intruder", "start rejected empty_base_request");
         set_err("intruder: empty base_request");
         return 0;
     }
@@ -1744,12 +1885,15 @@ uint64_t start(config_t cfg)
     if (cfg.engine_mode == engine_mode_t::http2_multiplexed
         || cfg.engine_mode == engine_mode_t::http2_single_packet) {
         cfg.scheme = "https";
+        diag::log_tagged("intruder", "start forced scheme=https for h2 engine");
     }
     if (cfg.payload_sets.empty()) {
         cfg.payload_sets.push_back({ std::string() });
+        diag::log_tagged("intruder", "start added default_empty_payload_set");
     }
     if (cfg.positions.empty() && cfg.attack_mode != attack_mode_t::turbo) {
         cfg.positions.push_back({ 0, 0 });
+        diag::log_tagged("intruder", "start added default_position_0");
     }
     if (cfg.concurrency == 0) cfg.concurrency = 32;
     if (cfg.timeout_ms <= 0) cfg.timeout_ms = 15000;
@@ -1765,31 +1909,43 @@ uint64_t start(config_t cfg)
         reg().jobs[job->id] = job;
     }
 
+    diag::log_tagged_fmt("intruder", "start job_id=%llu concurrency=%zu timeout_ms=%d max_resp_bytes=%zu",
+        static_cast<unsigned long long>(job->id), job->cfg.concurrency,
+        job->cfg.timeout_ms, job->cfg.max_response_body_bytes);
     std::thread([job]() { job_main(job); }).detach();
     return job->id;
 }
 
 bool stop(uint64_t job_id)
 {
+    diag::log_tagged_fmt("intruder", "stop job_id=%llu", static_cast<unsigned long long>(job_id));
     std::shared_ptr<job_t> job;
     {
         std::lock_guard<std::mutex> lk(reg().mtx);
         auto it = reg().jobs.find(job_id);
-        if (it == reg().jobs.end()) return false;
+        if (it == reg().jobs.end()) {
+            diag::log_tagged_fmt("intruder", "stop not_found job_id=%llu", static_cast<unsigned long long>(job_id));
+            return false;
+        }
         job = it->second;
     }
     job->cancel.store(true);
+    diag::log_tagged_fmt("intruder", "stop cancel_set job_id=%llu", static_cast<unsigned long long>(job_id));
     return true;
 }
 
 status_t status(uint64_t job_id)
 {
+    diag::log_tagged_fmt("intruder", "status job_id=%llu", static_cast<unsigned long long>(job_id));
     status_t s;
     std::shared_ptr<job_t> job;
     {
         std::lock_guard<std::mutex> lk(reg().mtx);
         auto it = reg().jobs.find(job_id);
-        if (it == reg().jobs.end()) return s;
+        if (it == reg().jobs.end()) {
+            diag::log_tagged_fmt("intruder", "status not_found job_id=%llu", static_cast<unsigned long long>(job_id));
+            return s;
+        }
         job = it->second;
     }
     s.job_id = job->id;
@@ -1806,39 +1962,56 @@ status_t status(uint64_t job_id)
         elapsed = unix_ms_now() - s.started_unix_ms;
     }
     if (elapsed > 0) s.current_rps = static_cast<double>(s.sent) * 1000.0 / static_cast<double>(elapsed);
+    diag::log_tagged_fmt("intruder", "status result job_id=%llu running=%d sent=%zu total=%zu errors=%zu rps=%.1f",
+        static_cast<unsigned long long>(job_id), s.running ? 1 : 0, s.sent, s.total, s.errors, s.current_rps);
     return s;
 }
 
 std::vector<result_t> results(uint64_t job_id, size_t start_idx, size_t max)
 {
+    diag::log_tagged_fmt("intruder", "results job_id=%llu start_idx=%zu max=%zu",
+        static_cast<unsigned long long>(job_id), start_idx, max);
     std::vector<result_t> out;
     std::shared_ptr<job_t> job;
     {
         std::lock_guard<std::mutex> lk(reg().mtx);
         auto it = reg().jobs.find(job_id);
-        if (it == reg().jobs.end()) return out;
+        if (it == reg().jobs.end()) {
+            diag::log_tagged_fmt("intruder", "results not_found job_id=%llu", static_cast<unsigned long long>(job_id));
+            return out;
+        }
         job = it->second;
     }
     std::lock_guard<std::mutex> lk(job->results_mtx);
-    if (start_idx >= job->results.size()) return out;
+    if (start_idx >= job->results.size()) {
+        diag::log_tagged_fmt("intruder", "results start_idx_oob start_idx=%zu total_results=%zu", start_idx, job->results.size());
+        return out;
+    }
     size_t available = job->results.size() - start_idx;
     size_t take = (max == 0) ? available : (max < available ? max : available);
     out.reserve(take);
     for (size_t i = 0; i < take; ++i) {
         out.push_back(job->results[start_idx + i]);
     }
+    diag::log_tagged_fmt("intruder", "results returning %zu results job_id=%llu", take, static_cast<unsigned long long>(job_id));
     return out;
 }
 
 bool clear(uint64_t job_id)
 {
+    diag::log_tagged_fmt("intruder", "clear job_id=%llu", static_cast<unsigned long long>(job_id));
     std::lock_guard<std::mutex> lk(reg().mtx);
     auto it = reg().jobs.find(job_id);
-    if (it == reg().jobs.end()) return false;
+    if (it == reg().jobs.end()) {
+        diag::log_tagged_fmt("intruder", "clear not_found job_id=%llu", static_cast<unsigned long long>(job_id));
+        return false;
+    }
     if (it->second->running.load()) {
         it->second->cancel.store(true);
+        diag::log_tagged_fmt("intruder", "clear cancel_running job_id=%llu", static_cast<unsigned long long>(job_id));
     }
     reg().jobs.erase(it);
+    diag::log_tagged_fmt("intruder", "clear erased job_id=%llu", static_cast<unsigned long long>(job_id));
     return true;
 }
 
@@ -1851,6 +2024,7 @@ std::vector<status_t> list_jobs()
         snapshot.reserve(reg().jobs.size());
         for (auto& kv : reg().jobs) snapshot.push_back(kv.second);
     }
+    diag::log_tagged_fmt("intruder", "list_jobs count=%zu", snapshot.size());
     out.reserve(snapshot.size());
     for (auto& j : snapshot) {
         out.push_back(status(j->id));
@@ -1861,7 +2035,9 @@ std::vector<status_t> list_jobs()
 std::string last_error()
 {
     std::lock_guard<std::mutex> lk(err_mtx());
-    return err_slot();
+    std::string e = err_slot();
+    diag::log_tagged_fmt("intruder", "last_error=%s", e.c_str());
+    return e;
 }
 
 const char* attack_mode_name(attack_mode_t m)
@@ -1891,22 +2067,26 @@ const char* engine_mode_name(engine_mode_t m)
 
 bool parse_attack_mode(const std::string& s, attack_mode_t& out)
 {
-    if (s == "sniper") { out = attack_mode_t::sniper; return true; }
-    if (s == "battering_ram" || s == "ram") { out = attack_mode_t::battering_ram; return true; }
-    if (s == "pitchfork") { out = attack_mode_t::pitchfork; return true; }
-    if (s == "clusterbomb" || s == "cluster_bomb") { out = attack_mode_t::clusterbomb; return true; }
-    if (s == "turbo") { out = attack_mode_t::turbo; return true; }
-    if (s == "race") { out = attack_mode_t::race; return true; }
+    diag::log_tagged_fmt("intruder", "parse_attack_mode input=%s", s.c_str());
+    if (s == "sniper") { out = attack_mode_t::sniper; diag::log_tagged("intruder", "parse_attack_mode result=sniper"); return true; }
+    if (s == "battering_ram" || s == "ram") { out = attack_mode_t::battering_ram; diag::log_tagged("intruder", "parse_attack_mode result=battering_ram"); return true; }
+    if (s == "pitchfork") { out = attack_mode_t::pitchfork; diag::log_tagged("intruder", "parse_attack_mode result=pitchfork"); return true; }
+    if (s == "clusterbomb" || s == "cluster_bomb") { out = attack_mode_t::clusterbomb; diag::log_tagged("intruder", "parse_attack_mode result=clusterbomb"); return true; }
+    if (s == "turbo") { out = attack_mode_t::turbo; diag::log_tagged("intruder", "parse_attack_mode result=turbo"); return true; }
+    if (s == "race") { out = attack_mode_t::race; diag::log_tagged("intruder", "parse_attack_mode result=race"); return true; }
+    diag::log_tagged_fmt("intruder", "parse_attack_mode unknown=%s", s.c_str());
     return false;
 }
 
 bool parse_engine_mode(const std::string& s, engine_mode_t& out)
 {
-    if (s == "http1_serial" || s == "h1_serial") { out = engine_mode_t::http1_serial; return true; }
-    if (s == "http1_pipelined" || s == "h1_pipelined") { out = engine_mode_t::http1_pipelined; return true; }
-    if (s == "http1_pooled" || s == "h1_pooled") { out = engine_mode_t::http1_pooled; return true; }
-    if (s == "http2_multiplexed" || s == "h2_multiplexed" || s == "h2") { out = engine_mode_t::http2_multiplexed; return true; }
-    if (s == "http2_single_packet" || s == "h2_single_packet" || s == "single_packet") { out = engine_mode_t::http2_single_packet; return true; }
+    diag::log_tagged_fmt("intruder", "parse_engine_mode input=%s", s.c_str());
+    if (s == "http1_serial" || s == "h1_serial") { out = engine_mode_t::http1_serial; diag::log_tagged("intruder", "parse_engine_mode result=http1_serial"); return true; }
+    if (s == "http1_pipelined" || s == "h1_pipelined") { out = engine_mode_t::http1_pipelined; diag::log_tagged("intruder", "parse_engine_mode result=http1_pipelined"); return true; }
+    if (s == "http1_pooled" || s == "h1_pooled") { out = engine_mode_t::http1_pooled; diag::log_tagged("intruder", "parse_engine_mode result=http1_pooled"); return true; }
+    if (s == "http2_multiplexed" || s == "h2_multiplexed" || s == "h2") { out = engine_mode_t::http2_multiplexed; diag::log_tagged("intruder", "parse_engine_mode result=http2_multiplexed"); return true; }
+    if (s == "http2_single_packet" || s == "h2_single_packet" || s == "single_packet") { out = engine_mode_t::http2_single_packet; diag::log_tagged("intruder", "parse_engine_mode result=http2_single_packet"); return true; }
+    diag::log_tagged_fmt("intruder", "parse_engine_mode unknown=%s", s.c_str());
     return false;
 }
 

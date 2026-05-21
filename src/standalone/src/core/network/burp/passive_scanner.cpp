@@ -105,9 +105,16 @@ void emit(issue_t iss)
 
 void check_security_headers(const exchange_observed_t& ex)
 {
-    if (ex.status_code <= 0) return;
+    diag::log_tagged_fmt("passive", "check_security_headers host=%s path=%s status=%d",
+        ex.host.c_str(), ex.path.c_str(), ex.status_code);
+    if (ex.status_code <= 0) {
+        diag::log_tagged_fmt("passive", "check_security_headers skipped status=%d", ex.status_code);
+        return;
+    }
     auto ct = lc_string(find_header(ex.resp_headers, "content-type"));
     bool is_html = (ct.find("text/html") != std::string::npos);
+    diag::log_tagged_fmt("passive", "check_security_headers content_type=%s is_html=%d is_https=%d",
+        ct.c_str(), is_html ? 1 : 0, (ex.scheme == "https") ? 1 : 0);
 
     auto check = [&](const char* name_lc, const char* canonical, const char* desc, severity_t sev,
                      bool only_html) {
@@ -152,8 +159,10 @@ void check_security_headers(const exchange_observed_t& ex)
 
 void check_server_disclosure(const exchange_observed_t& ex)
 {
+    diag::log_tagged_fmt("passive", "check_server_disclosure host=%s path=%s", ex.host.c_str(), ex.path.c_str());
     auto v = find_header(ex.resp_headers, "server");
     auto p = find_header(ex.resp_headers, "x-powered-by");
+    diag::log_tagged_fmt("passive", "check_server_disclosure server='%s' x-powered-by='%s'", v.c_str(), p.c_str());
     if (!v.empty()) {
         auto iss = base_issue(ex);
         iss.type_key = "info-disclosure.server-banner";
@@ -184,8 +193,10 @@ void check_server_disclosure(const exchange_observed_t& ex)
 
 void check_cookies(const exchange_observed_t& ex)
 {
+    diag::log_tagged_fmt("passive", "check_cookies host=%s path=%s scheme=%s", ex.host.c_str(), ex.path.c_str(), ex.scheme.c_str());
     for (const auto& h : ex.resp_headers) {
         if (lc_string(h.first) != "set-cookie") continue;
+        diag::log_tagged_fmt("passive", "check_cookies found Set-Cookie value_len=%zu", h.second.size());
         const std::string& v = h.second;
         std::string lc = lc_string(v);
         bool secure = lc.find("; secure") != std::string::npos || lc.find(";secure") != std::string::npos;
@@ -235,7 +246,11 @@ void check_cookies(const exchange_observed_t& ex)
 
 void check_session_id_in_url(const exchange_observed_t& ex)
 {
-    if (ex.query.empty()) return;
+    diag::log_tagged_fmt("passive", "check_session_id_in_url host=%s path=%s query_len=%zu", ex.host.c_str(), ex.path.c_str(), ex.query.size());
+    if (ex.query.empty()) {
+        diag::log_tagged_fmt("passive", "check_session_id_in_url skipped empty_query");
+        return;
+    }
     std::string lq = lc_string(ex.query);
     static const char* kNames[] = { "sessionid=", "session_id=", "jsessionid=", "phpsessid=", "asp.net_sessionid=", "token=", "auth=" };
     for (const char* n : kNames) {
@@ -258,7 +273,11 @@ void check_session_id_in_url(const exchange_observed_t& ex)
 
 void check_csrf_form_post(const exchange_observed_t& ex)
 {
-    if (ex.method != "POST") return;
+    diag::log_tagged_fmt("passive", "check_csrf_form_post host=%s path=%s method=%s", ex.host.c_str(), ex.path.c_str(), ex.method.c_str());
+    if (ex.method != "POST") {
+        diag::log_tagged_fmt("passive", "check_csrf_form_post skipped method=%s", ex.method.c_str());
+        return;
+    }
     bool has_token = false;
     std::string body(reinterpret_cast<const char*>(ex.req_body.data()), ex.req_body.size());
     std::string lc = lc_string(body);
@@ -282,7 +301,11 @@ void check_csrf_form_post(const exchange_observed_t& ex)
 
 void check_mixed_content(const exchange_observed_t& ex)
 {
-    if (ex.scheme != "https") return;
+    diag::log_tagged_fmt("passive", "check_mixed_content host=%s path=%s scheme=%s", ex.host.c_str(), ex.path.c_str(), ex.scheme.c_str());
+    if (ex.scheme != "https") {
+        diag::log_tagged_fmt("passive", "check_mixed_content skipped scheme=%s", ex.scheme.c_str());
+        return;
+    }
     auto ct = lc_string(find_header(ex.resp_headers, "content-type"));
     if (ct.find("text/html") == std::string::npos) return;
     std::string text = body_text(ex, 16384);
@@ -306,6 +329,7 @@ void check_mixed_content(const exchange_observed_t& ex)
 
 void check_verbose_errors(const exchange_observed_t& ex)
 {
+    diag::log_tagged_fmt("passive", "check_verbose_errors host=%s path=%s body_len=%zu", ex.host.c_str(), ex.path.c_str(), ex.resp_body.size());
     static const std::regex re(
         R"((SQLSTATE\[\w+\]|ORA-\d{5}|PostgreSQL[^\n]{0,80}ERROR|MySQL[^\n]{0,80}error|SQLite3?::SQL|System\.Data\.SqlClient\.|"
         R"(Microsoft OLE DB Provider for SQL|Stack trace:|at\s+[a-zA-Z_][\w.]+\([^)]*\)\s+in\s+|Exception in thread|Traceback \(most recent call last\)))",
@@ -327,7 +351,12 @@ void check_verbose_errors(const exchange_observed_t& ex)
 
 void check_reflected_input(const exchange_observed_t& ex)
 {
-    if (ex.query.empty() && ex.req_body.empty()) return;
+    diag::log_tagged_fmt("passive", "check_reflected_input host=%s path=%s query_len=%zu body_len=%zu",
+        ex.host.c_str(), ex.path.c_str(), ex.query.size(), ex.req_body.size());
+    if (ex.query.empty() && ex.req_body.empty()) {
+        diag::log_tagged_fmt("passive", "check_reflected_input skipped no_query_no_body");
+        return;
+    }
     auto extract_params = [](const std::string& s, std::vector<std::pair<std::string, std::string>>& out) {
         size_t p = 0;
         while (p < s.size()) {
@@ -377,7 +406,11 @@ void check_reflected_input(const exchange_observed_t& ex)
 
 void check_cleartext_password(const exchange_observed_t& ex)
 {
-    if (ex.scheme == "https") return;
+    diag::log_tagged_fmt("passive", "check_cleartext_password host=%s path=%s scheme=%s method=%s", ex.host.c_str(), ex.path.c_str(), ex.scheme.c_str(), ex.method.c_str());
+    if (ex.scheme == "https") {
+        diag::log_tagged_fmt("passive", "check_cleartext_password skipped scheme=https");
+        return;
+    }
     auto has_password_param = [](const std::string& s) {
         std::string lc = lc_string(s);
         return lc.find("password=") != std::string::npos || lc.find("passwd=") != std::string::npos || lc.find("pwd=") != std::string::npos;
@@ -400,6 +433,7 @@ void check_cleartext_password(const exchange_observed_t& ex)
 
 void check_cloud_bucket_pointer(const exchange_observed_t& ex)
 {
+    diag::log_tagged_fmt("passive", "check_cloud_bucket_pointer host=%s path=%s body_len=%zu", ex.host.c_str(), ex.path.c_str(), ex.resp_body.size());
     std::string text = body_text(ex, 16384);
     static const std::regex re(
         R"((https?://[a-z0-9.-]+\.s3[.-][a-z0-9.-]*amazonaws\.com|https?://storage\.googleapis\.com/[a-z0-9._-]+|https?://[a-z0-9.-]+\.blob\.core\.windows\.net))",
@@ -421,6 +455,7 @@ void check_cloud_bucket_pointer(const exchange_observed_t& ex)
 
 void check_pii_leak(const exchange_observed_t& ex)
 {
+    diag::log_tagged_fmt("passive", "check_pii_leak host=%s path=%s body_len=%zu", ex.host.c_str(), ex.path.c_str(), ex.resp_body.size());
     std::string text = body_text(ex, 16384);
     static const std::regex email_re(R"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})", std::regex::ECMAScript);
     static const std::regex ipv4_internal_re(R"(\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})\b)", std::regex::ECMAScript);
@@ -459,6 +494,8 @@ void check_pii_leak(const exchange_observed_t& ex)
 
 void check_jwt(const exchange_observed_t& ex)
 {
+    diag::log_tagged_fmt("passive", "check_jwt host=%s path=%s query_len=%zu body_len=%zu req_header_count=%zu",
+        ex.host.c_str(), ex.path.c_str(), ex.query.size(), ex.req_body.size(), ex.req_headers.size());
     static const std::regex jwt_re(R"(\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b)", std::regex::ECMAScript);
     auto scan_string = [&](const std::string& where, const std::string& s) {
         std::smatch m;
@@ -485,6 +522,7 @@ void check_jwt(const exchange_observed_t& ex)
 
 void check_cors(const exchange_observed_t& ex)
 {
+    diag::log_tagged_fmt("passive", "check_cors host=%s path=%s", ex.host.c_str(), ex.path.c_str());
     auto acao = find_header(ex.resp_headers, "access-control-allow-origin");
     auto acac = lc_string(find_header(ex.resp_headers, "access-control-allow-credentials"));
     if (acao.empty()) return;
@@ -532,6 +570,7 @@ void check_cors(const exchange_observed_t& ex)
 
 void check_numeric_id_idor(const exchange_observed_t& ex)
 {
+    diag::log_tagged_fmt("passive", "check_numeric_id_idor host=%s path=%s", ex.host.c_str(), ex.path.c_str());
     static const std::regex re(R"((/users/|/accounts/|/orders/|/invoice/|/profile/|/document/|/id/)(\d+)\b)",
                                std::regex::ECMAScript | std::regex::icase);
     std::smatch m;
@@ -552,9 +591,15 @@ void check_numeric_id_idor(const exchange_observed_t& ex)
 void scan_one(const exchange_observed_t& ex)
 {
     auto& s = state();
-    if (!s.enabled.load()) return;
-    s.exchanges.fetch_add(1);
+    if (!s.enabled.load()) {
+        diag::log_tagged_fmt("passive", "scan_one skipped disabled host=%s path=%s", ex.host.c_str(), ex.path.c_str());
+        return;
+    }
+    uint64_t n = s.exchanges.fetch_add(1) + 1;
     s.last_scan_ms.store(now_ms());
+    diag::log_tagged_fmt("passive", "scan_one start host=%s path=%s method=%s status=%d body_len=%zu exchange_count=%llu",
+        ex.host.c_str(), ex.path.c_str(), ex.method.c_str(), ex.status_code, ex.resp_body.size(),
+        static_cast<unsigned long long>(n));
     check_security_headers(ex);
     check_server_disclosure(ex);
     check_cookies(ex);
@@ -569,15 +614,21 @@ void scan_one(const exchange_observed_t& ex)
     check_jwt(ex);
     check_cors(ex);
     check_numeric_id_idor(ex);
+    diag::log_tagged_fmt("passive", "scan_one done host=%s path=%s total_issues=%llu",
+        ex.host.c_str(), ex.path.c_str(), static_cast<unsigned long long>(s.issues.load()));
 }
 
 }
 
 bool initialize()
 {
+    diag::log_tagged_fmt("passive", "initialize called");
     auto& s = state();
     bool expected = false;
-    if (!s.initialized.compare_exchange_strong(expected, true)) return true;
+    if (!s.initialized.compare_exchange_strong(expected, true)) {
+        diag::log_tagged_fmt("passive", "initialize already_initialized");
+        return true;
+    }
     issue_store::initialize();
     s.sub = aida::events::subscribe(kExchangeObservedEvent,
                                     [](const exchange_observed_t& ex) {
@@ -587,24 +638,40 @@ bool initialize()
                                         });
                                     });
     if (!s.sub.valid()) {
+        diag::log_tagged_fmt("passive", "initialize failed subscription_invalid");
         set_err("passive_scanner.initialize: event subscription failed");
         s.initialized.store(false);
         return false;
     }
     diag::log_tagged("burp", "passive_scanner initialized");
+    diag::log_tagged_fmt("passive", "initialize success sub_valid=1");
     return true;
 }
 
 void shutdown()
 {
+    diag::log_tagged_fmt("passive", "shutdown called");
     auto& s = state();
-    if (!s.initialized.load()) return;
+    if (!s.initialized.load()) {
+        diag::log_tagged_fmt("passive", "shutdown skipped not_initialized");
+        return;
+    }
     if (s.sub.valid()) aida::events::unsubscribe(s.sub);
     s.initialized.store(false);
+    diag::log_tagged_fmt("passive", "shutdown complete exchanges=%llu issues=%llu",
+        static_cast<unsigned long long>(s.exchanges.load()),
+        static_cast<unsigned long long>(s.issues.load()));
 }
 
-bool is_enabled() { return state().enabled.load(); }
-void set_enabled(bool e) { state().enabled.store(e); }
+bool is_enabled() {
+    bool e = state().enabled.load();
+    diag::log_tagged_fmt("passive", "is_enabled=%d", e ? 1 : 0);
+    return e;
+}
+void set_enabled(bool e) {
+    diag::log_tagged_fmt("passive", "set_enabled=%d", e ? 1 : 0);
+    state().enabled.store(e);
+}
 
 stats_t get_stats()
 {
@@ -613,6 +680,10 @@ stats_t get_stats()
     st.exchanges_scanned = s.exchanges.load();
     st.issues_found = s.issues.load();
     st.last_scan_ms = s.last_scan_ms.load();
+    diag::log_tagged_fmt("passive", "get_stats exchanges=%llu issues=%llu last_scan_ms=%llu",
+        static_cast<unsigned long long>(st.exchanges_scanned),
+        static_cast<unsigned long long>(st.issues_found),
+        static_cast<unsigned long long>(st.last_scan_ms));
     return st;
 }
 

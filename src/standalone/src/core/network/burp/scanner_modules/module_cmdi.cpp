@@ -1,5 +1,7 @@
 #include "../scanner_module.hpp"
 
+#include "../../../../helpers/diag_log.hpp"
+
 #include <optional>
 #include <regex>
 #include <string>
@@ -13,6 +15,8 @@ namespace {
 
 std::vector<probe_t> cmdi_probes(const insertion_point_t& ip, const module_context_t&)
 {
+    diag::log_tagged_fmt("mod_cmdi", "cmdi_probes entry ip=%s:%s orig=%s",
+                         ip.kind.c_str(), ip.name.c_str(), ip.original_value.c_str());
     std::vector<probe_t> out;
     auto base = ip.original_value;
     out.push_back({base + "; sleep 8 ; ",       "_AIDA_SLEEP", "unix-semicolon"});
@@ -23,15 +27,26 @@ std::vector<probe_t> cmdi_probes(const insertion_point_t& ip, const module_conte
     out.push_back({base + "%0Aid",              "uid=", "newline-id"});
     out.push_back({base + ";uname -a",          "Linux", "uname"});
     out.push_back({base + ";echo aida_cmdi_marker_zxq", "aida_cmdi_marker_zxq", "echo-marker"});
+    diag::log_tagged_fmt("mod_cmdi", "cmdi_probes built %zu probes ip=%s:%s", out.size(), ip.kind.c_str(), ip.name.c_str());
     return out;
 }
 
 std::optional<issue_t> cmdi_detect(const insertion_point_t& ip, const probe_t& probe,
                                    const exchange_observed_t& resp, const module_context_t& ctx)
 {
+    diag::log_tagged_fmt("mod_cmdi", "cmdi_detect entry ip=%s:%s variant=%s status=%d latency=%llums",
+                         ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str(),
+                         resp.status_code, static_cast<unsigned long long>(resp.latency_ms));
     if (probe.marker == "_AIDA_SLEEP") {
-        if (ctx.baseline_latency_ms == 0) return std::nullopt;
+        if (ctx.baseline_latency_ms == 0) {
+            diag::log_tagged_fmt("mod_cmdi", "cmdi_detect sleep skip no baseline ip=%s:%s", ip.kind.c_str(), ip.name.c_str());
+            return std::nullopt;
+        }
         if (resp.latency_ms >= ctx.baseline_latency_ms + 7000) {
+            diag::log_tagged_fmt("mod_cmdi", "cmdi_detect FINDING time-based ip=%s:%s variant=%s baseline=%llums response=%llums",
+                                 ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str(),
+                                 static_cast<unsigned long long>(ctx.baseline_latency_ms),
+                                 static_cast<unsigned long long>(resp.latency_ms));
             auto iss = make_issue("cmdi.time-based", "Command Injection (time-based)",
                                   severity_t::critical, confidence_t::firm, ip, probe, resp, ctx,
                                   std::string("Latency increased: baseline=")
@@ -43,10 +58,15 @@ std::optional<issue_t> cmdi_detect(const insertion_point_t& ip, const probe_t& p
             iss.cwe.push_back("CWE-78");
             return iss;
         }
+        diag::log_tagged_fmt("mod_cmdi", "cmdi_detect sleep latency insufficient baseline=%llums response=%llums",
+                             static_cast<unsigned long long>(ctx.baseline_latency_ms),
+                             static_cast<unsigned long long>(resp.latency_ms));
         return std::nullopt;
     }
     if (probe.marker == "Linux" || probe.marker.rfind("uid=", 0) == 0) {
         if (body_contains_ci(resp, probe.marker)) {
+            diag::log_tagged_fmt("mod_cmdi", "cmdi_detect FINDING output-leak ip=%s:%s variant=%s marker=%s",
+                                 ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str(), probe.marker.c_str());
             auto iss = make_issue("cmdi.output-leak", "Command Injection (output leak)",
                                   severity_t::critical, confidence_t::firm, ip, probe, resp, ctx,
                                   std::string("Command output reflected: ") + probe.marker);
@@ -55,9 +75,12 @@ std::optional<issue_t> cmdi_detect(const insertion_point_t& ip, const probe_t& p
             iss.cwe.push_back("CWE-78");
             return iss;
         }
+        diag::log_tagged_fmt("mod_cmdi", "cmdi_detect output-leak marker not in body ip=%s:%s variant=%s", ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str());
         return std::nullopt;
     }
     if (!probe.marker.empty() && body_contains(resp, probe.marker)) {
+        diag::log_tagged_fmt("mod_cmdi", "cmdi_detect FINDING echo-marker ip=%s:%s variant=%s marker=%s",
+                             ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str(), probe.marker.c_str());
         auto iss = make_issue("cmdi.echo-marker", "Command Injection (echo marker)",
                               severity_t::critical, confidence_t::firm, ip, probe, resp, ctx,
                               std::string("Echo marker observed: ") + probe.marker);
@@ -66,6 +89,7 @@ std::optional<issue_t> cmdi_detect(const insertion_point_t& ip, const probe_t& p
         iss.cwe.push_back("CWE-78");
         return iss;
     }
+    diag::log_tagged_fmt("mod_cmdi", "cmdi_detect no finding ip=%s:%s variant=%s", ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str());
     return std::nullopt;
 }
 

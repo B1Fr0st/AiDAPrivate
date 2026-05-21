@@ -59,6 +59,7 @@ uint32_t parse_pid(const json& v)
 
 static tool_result_t sessions_list(const json& params)
 {
+	diag::log_tagged_fmt("sess_tools", "sessions_list entry");
 	(void)params;
 	auto sessions = analysis_session::list_session_summaries();
 	json arr = json::array();
@@ -66,7 +67,7 @@ static tool_result_t sessions_list(const json& params)
 	json root;
 	root["count"] = sessions.size();
 	root["sessions"] = arr;
-	diag::log_tagged_fmt("mcp_sessions",
+	diag::log_tagged_fmt("sess_tools",
 		"sessions_list returned=%llu",
 		static_cast<unsigned long long>(sessions.size()));
 	return tool_result_t::ok(root);
@@ -74,6 +75,7 @@ static tool_result_t sessions_list(const json& params)
 
 static tool_result_t sessions_get_active(const json& params)
 {
+	diag::log_tagged_fmt("sess_tools", "sessions_get_active entry");
 	(void)params;
 	size_t idx = analysis_session::active_session_idx();
 	if (idx == static_cast<size_t>(-1)) {
@@ -92,26 +94,29 @@ static tool_result_t sessions_get_active(const json& params)
 
 static tool_result_t sessions_switch(const json& params)
 {
+	diag::log_tagged_fmt("sess_tools", "sessions_switch entry id='%s'",
+		params.contains("binary_id") && params["binary_id"].is_string()
+			? params["binary_id"].get<std::string>().c_str() : "");
 	if (!params.contains("binary_id") || !params["binary_id"].is_string()) {
 		return tool_result_t::error("binary_id (string) is required");
 	}
 	std::string id = params["binary_id"].get<std::string>();
 	size_t idx = 0;
 	if (!analysis_session::find_session_by_id(id, &idx)) {
-		diag::log_tagged_fmt("mcp_sessions",
+		diag::log_tagged_fmt("sess_tools",
 			"sessions_switch id='%s' not_found", id.c_str());
 		return tool_result_t::error("binary_id not found: " + id);
 	}
 	if (!analysis_session::switch_session(idx)) {
 		std::string err = analysis_session::last_error();
-		diag::log_tagged_fmt("mcp_sessions",
+		diag::log_tagged_fmt("sess_tools",
 			"sessions_switch id='%s' switch_failed err='%s'", id.c_str(), err.c_str());
 		return tool_result_t::error(std::string("switch failed: ") + err);
 	}
 	auto sum = analysis_session::summarize_session_at(idx);
 	json root;
 	root["switched_to"] = summary_to_json(sum);
-	diag::log_tagged_fmt("mcp_sessions",
+	diag::log_tagged_fmt("sess_tools",
 		"sessions_switch id='%s' switched_idx=%llu",
 		id.c_str(), static_cast<unsigned long long>(idx));
 	return tool_result_t::ok(root);
@@ -119,6 +124,9 @@ static tool_result_t sessions_switch(const json& params)
 
 static tool_result_t sessions_open_file(const json& params)
 {
+	diag::log_tagged_fmt("sess_tools", "sessions_open_file entry path='%.120s'",
+		params.contains("path") && params["path"].is_string()
+			? params["path"].get<std::string>().c_str() : "");
 	if (!params.contains("path") || !params["path"].is_string()) {
 		return tool_result_t::error("path (string) is required");
 	}
@@ -134,12 +142,12 @@ static tool_result_t sessions_open_file(const json& params)
 			json root;
 			root["opened"] = summary_to_json(sum);
 			root["already_open"] = true;
-			diag::log_tagged_fmt("mcp_sessions",
+			diag::log_tagged_fmt("sess_tools",
 				"sessions_open_file path='%s' already_open id='%s'",
 				path.c_str(), sum.id.c_str());
 			return tool_result_t::ok(root);
 		}
-		diag::log_tagged_fmt("mcp_sessions",
+		diag::log_tagged_fmt("sess_tools",
 			"sessions_open_file path='%s' open_failed err='%s'",
 			path.c_str(), err.c_str());
 		return tool_result_t::error(std::string("open failed: ") + err);
@@ -152,7 +160,7 @@ static tool_result_t sessions_open_file(const json& params)
 	json root;
 	root["opened"] = summary_to_json(sum);
 	root["already_open"] = false;
-	diag::log_tagged_fmt("mcp_sessions",
+	diag::log_tagged_fmt("sess_tools",
 		"sessions_open_file path='%s' opened id='%s'",
 		path.c_str(), sum.id.c_str());
 	return tool_result_t::ok(root);
@@ -160,6 +168,7 @@ static tool_result_t sessions_open_file(const json& params)
 
 static tool_result_t sessions_attach_pid(const json& params)
 {
+	diag::log_tagged_fmt("sess_tools", "sessions_attach_pid entry");
 	if (!params.contains("pid")) {
 		return tool_result_t::error("pid is required");
 	}
@@ -169,7 +178,7 @@ static tool_result_t sessions_attach_pid(const json& params)
 	}
 	std::string err;
 	if (!analysis_session::open_attach_session(pid, &err)) {
-		diag::log_tagged_fmt("mcp_sessions",
+		diag::log_tagged_fmt("sess_tools",
 			"sessions_attach_pid pid=%u attach_failed err='%s'", pid, err.c_str());
 		return tool_result_t::error(std::string("attach failed: ") + err);
 	}
@@ -180,7 +189,7 @@ static tool_result_t sessions_attach_pid(const json& params)
 	auto sum = analysis_session::summarize_session_at(idx);
 	json root;
 	root["attached"] = summary_to_json(sum);
-	diag::log_tagged_fmt("mcp_sessions",
+	diag::log_tagged_fmt("sess_tools",
 		"sessions_attach_pid pid=%u attached id='%s'",
 		pid, sum.id.c_str());
 	return tool_result_t::ok(root);
@@ -188,6 +197,9 @@ static tool_result_t sessions_attach_pid(const json& params)
 
 static tool_result_t sessions_close(const json& params)
 {
+	diag::log_tagged_fmt("sess_tools", "sessions_close entry id='%s'",
+		params.contains("binary_id") && params["binary_id"].is_string()
+			? params["binary_id"].get<std::string>().c_str() : "");
 	if (!params.contains("binary_id") || !params["binary_id"].is_string()) {
 		return tool_result_t::error("binary_id (string) is required");
 	}
@@ -203,7 +215,7 @@ static tool_result_t sessions_close(const json& params)
 	json root;
 	root["closed_id"] = id;
 	root["closed_idx"] = static_cast<uint64_t>(idx);
-	diag::log_tagged_fmt("mcp_sessions",
+	diag::log_tagged_fmt("sess_tools",
 		"sessions_close id='%s' idx=%llu",
 		id.c_str(), static_cast<unsigned long long>(idx));
 	return tool_result_t::ok(root);
@@ -223,6 +235,9 @@ static std::wstring widen(const std::string& s)
 
 static tool_result_t sessions_run_binary(const json& params)
 {
+	diag::log_tagged_fmt("sess_tools", "sessions_run_binary entry path='%.120s'",
+		params.contains("path") && params["path"].is_string()
+			? params["path"].get<std::string>().c_str() : "");
 	if (!params.contains("path") || !params["path"].is_string()) {
 		return tool_result_t::error("path (string) is required");
 	}
@@ -253,7 +268,7 @@ static tool_result_t sessions_run_binary(const json& params)
 	run_target::launch_result_t result;
 	bool ok = run_target::launch(opts, result);
 	if (!ok || !result.ok) {
-		diag::log_tagged_fmt("mcp_sessions",
+		diag::log_tagged_fmt("sess_tools",
 			"sessions_run_binary path='%s' launch_failed err='%s'",
 			params["path"].get<std::string>().c_str(), result.error.c_str());
 		return tool_result_t::error(std::string("launch failed: ") + result.error);
@@ -268,7 +283,7 @@ static tool_result_t sessions_run_binary(const json& params)
 	root["pid"] = result.pid;
 	root["firewall_rule_name"] = result.firewall_rule_name;
 	root["attached"] = (opts.attach_after_resume && result.pid != 0);
-	diag::log_tagged_fmt("mcp_sessions",
+	diag::log_tagged_fmt("sess_tools",
 		"sessions_run_binary launched pid=%u",
 		result.pid);
 	return tool_result_t::ok(root);
@@ -276,6 +291,7 @@ static tool_result_t sessions_run_binary(const json& params)
 
 void register_session_tools(mcp_standalone::server_t& srv)
 {
+	diag::log_tagged_fmt("sess_tools", "register_session_tools entry");
 	srv.register_tool({
 		"sessions_list",
 		"List all open analysis sessions (static files and live process attaches). Returns each session's id, kind (file|live), path, pid, process name, is_active, is_alive, and last_active_steady_ms. Use the returned id as `binary_id` on any other tool call to target that session.",

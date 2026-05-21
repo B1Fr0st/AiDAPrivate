@@ -9,6 +9,7 @@
 #include "emulation_engine.hpp"
 #include "obfuscation.hpp"
 #include "pro.h"
+#include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -100,16 +101,28 @@ static void setup_stack_region(
 
 tool_result_t disassemble_zydis(const json& params)
 {
+    diag::log_tagged_fmt("emul_tools", "disassemble_zydis entry addr='%s'",
+        params.value("address", std::string()).c_str());
     auto addr = sa_parse_address(params.value("address", std::string()));
     if (!addr)
+    {
+        diag::log_tagged_fmt("emul_tools", "disassemble_zydis invalid address");
         return tool_result_t::error(OBFSTR("Invalid address"));
+    }
 
     auto chk = check_driver_for_address(*addr);
-    if (!chk.success) return chk;
+    if (!chk.success)
+    {
+        diag::log_tagged_fmt("emul_tools", "disassemble_zydis driver check failed");
+        return chk;
+    }
 
     std::uint32_t size = params.value("size", 256);
     if (size > 65536)
+    {
+        diag::log_tagged_fmt("emul_tools", "disassemble_zydis size too large size=%u", size);
         return tool_result_t::error(OBFSTR("Size too large (max 65536)"));
+    }
 
     std::uint32_t max_insns = params.value("max_instructions", 100);
     if (max_insns > 10000) max_insns = 10000;
@@ -117,10 +130,16 @@ tool_result_t disassemble_zydis(const json& params)
     bool follow = params.value("follow_jumps", false);
     std::uint64_t effective_addr = *addr;
 
+    diag::log_tagged_fmt("emul_tools", "disassemble_zydis reading addr=0x%llx size=%u max_insns=%u follow=%d",
+        static_cast<unsigned long long>(*addr), size, max_insns, (int)follow);
     auto instructions = emulation::driver_disassemble_range(effective_addr, size, max_insns);
     if (instructions.empty())
+    {
+        diag::log_tagged_fmt("emul_tools", "disassemble_zydis no instructions decoded at 0x%llx",
+            static_cast<unsigned long long>(*addr));
         return tool_result_t::error(OBFSTR("No instructions decoded. The address may be unreadable at ") +
                                     sa_format_address(*addr));
+    }
 
     json result;
     result["address"] = sa_format_address(*addr);
@@ -176,6 +195,8 @@ tool_result_t disassemble_zydis(const json& params)
     }
     result["instructions"] = std::move(arr);
 
+    diag::log_tagged_fmt("emul_tools", "disassemble_zydis ok count=%zu jumps_followed=%d",
+        instructions.size(), jumps_followed);
     return tool_result_t::ok(OBFSTR("Zydis disassembly: ") + std::to_string(instructions.size()) +
                              OBFSTR(" instructions at ") + sa_format_address(static_cast<uint64_t>(effective_addr)) +
                              (jumps_followed > 0 ? OBFSTR(" (followed ") + std::to_string(jumps_followed) + OBFSTR(" jumps)") : ""),
@@ -184,11 +205,19 @@ tool_result_t disassemble_zydis(const json& params)
 
 tool_result_t driver_snapshot_and_emulate(const json& params)
 {
+    diag::log_tagged_fmt("emul_tools", "driver_snapshot_and_emulate entry addr='%s'",
+        params.value("address", std::string()).c_str());
     if (!driver_bridge::using_kernel_driver())
+    {
+        diag::log_tagged_fmt("emul_tools", "driver_snapshot_and_emulate driver not connected");
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+    }
 
     if (driver_bridge::attached_pid() == 0)
+    {
+        diag::log_tagged_fmt("emul_tools", "driver_snapshot_and_emulate no attached pid");
         return tool_result_t::error(OBFSTR("Not attached to a process. Call driver_attach first."));
+    }
 
     std::uint32_t pid = driver_bridge::attached_pid();
     std::uint32_t tid = 0;
@@ -254,9 +283,14 @@ tool_result_t driver_snapshot_and_emulate(const json& params)
     if (params.contains("snapshot_size"))
         snap_size = params.value("snapshot_size", 0);
 
+    diag::log_tagged_fmt("emul_tools", "driver_snapshot_and_emulate running pid=%u tid=%u addr=0x%llx max_insns=%u",
+        pid, tid, static_cast<unsigned long long>(config.start_address), config.max_instructions);
     auto result = emulation::driver_snapshot_and_emulate(pid, tid, config, snap_base, snap_size);
     if (!result.success)
+    {
+        diag::log_tagged_fmt("emul_tools", "driver_snapshot_and_emulate failed err='%s'", result.error.c_str());
         return tool_result_t::error(OBFSTR("Emulation failed: ") + result.error);
+    }
 
     json out;
     out["start_address"]      = sa_format_address(static_cast<uint64_t>(result.start_address));
@@ -335,6 +369,8 @@ tool_result_t driver_snapshot_and_emulate(const json& params)
     if (!result.error.empty())
         out["note"] = result.error;
 
+    diag::log_tagged_fmt("emul_tools", "driver_snapshot_and_emulate ok total=%u junk=%u writes=%zu",
+        result.total_instructions, result.junk_instruction_count, result.mem_writes.size());
     return tool_result_t::ok(
         OBFSTR("Snapshot + emulation complete: ") + std::to_string(result.total_instructions) +
         OBFSTR(" insns traced (") + std::to_string(result.junk_instruction_count) + OBFSTR(" junk)"),
@@ -343,12 +379,21 @@ tool_result_t driver_snapshot_and_emulate(const json& params)
 
 tool_result_t trace_execution_unicorn(const json& params)
 {
+    diag::log_tagged_fmt("emul_tools", "trace_execution_unicorn entry addr='%s'",
+        params.value("address", std::string()).c_str());
     auto addr = sa_parse_address(params.value("address", std::string()));
     if (!addr)
+    {
+        diag::log_tagged_fmt("emul_tools", "trace_execution_unicorn invalid address");
         return tool_result_t::error(OBFSTR("Invalid address. Provide the entry point address."));
+    }
 
     auto chk = check_driver_for_address(*addr);
-    if (!chk.success) return chk;
+    if (!chk.success)
+    {
+        diag::log_tagged_fmt("emul_tools", "trace_execution_unicorn driver check failed");
+        return chk;
+    }
 
     const bool kernel_mode = is_kernel_address(*addr);
 
@@ -405,9 +450,14 @@ tool_result_t trace_execution_unicorn(const json& params)
         if (stop) config.stop_address = *stop;
     }
 
+    diag::log_tagged_fmt("emul_tools", "trace_execution_unicorn emulating addr=0x%llx size=%u kernel=%d",
+        static_cast<unsigned long long>(*addr), size, (int)kernel_mode);
     auto result = emulation::emulate_from_snapshot(snapshot, config);
     if (!result.success)
+    {
+        diag::log_tagged_fmt("emul_tools", "trace_execution_unicorn failed err='%s'", result.error.c_str());
         return tool_result_t::error(OBFSTR("Unicorn emulation failed: ") + result.error);
+    }
 
     json out;
     out["start_address"]      = sa_format_address(static_cast<uint64_t>(result.start_address));
@@ -471,6 +521,8 @@ tool_result_t trace_execution_unicorn(const json& params)
     }
     out["trace_excerpt"] = std::move(trace_arr);
 
+    diag::log_tagged_fmt("emul_tools", "trace_execution_unicorn ok total=%u junk=%u kernel=%d",
+        result.total_instructions, result.junk_instruction_count, (int)kernel_mode);
     return tool_result_t::ok(
         OBFSTR("Emulation complete: ") + std::to_string(result.total_instructions) +
         OBFSTR(" insns (") + std::to_string(result.junk_instruction_count) + OBFSTR(" junk)") +
@@ -479,9 +531,14 @@ tool_result_t trace_execution_unicorn(const json& params)
 
 tool_result_t analyze_vm_handler(const json& params)
 {
+    diag::log_tagged_fmt("emul_tools", "analyze_vm_handler entry addr='%s'",
+        params.value("address", std::string()).c_str());
     auto addr = sa_parse_address(params.value("address", std::string()));
     if (!addr)
+    {
+        diag::log_tagged_fmt("emul_tools", "analyze_vm_handler invalid address");
         return tool_result_t::error(OBFSTR("Invalid address. Provide the VM handler entry point."));
+    }
 
     auto chk = check_driver_for_address(*addr);
     if (!chk.success) return chk;
@@ -547,6 +604,8 @@ tool_result_t analyze_vm_handler(const json& params)
     config.analyze_effective_ops = true;
     config.timeout_us            = params.value("timeout_us", 15000000);
 
+    diag::log_tagged_fmt("emul_tools", "analyze_vm_handler emulating addr=0x%llx size=%u kernel=%d",
+        static_cast<unsigned long long>(*addr), handler_size, (int)kernel_mode);
     auto emu_result = emulation::emulate_from_snapshot(snapshot, config);
 
     json out;
@@ -626,6 +685,9 @@ tool_result_t analyze_vm_handler(const json& params)
 
     out["classification"] = classification;
 
+    diag::log_tagged_fmt("emul_tools", "analyze_vm_handler ok classification='%s' junk_ratio=%.2f",
+        classification.c_str(), emu_result.success && emu_result.total_instructions > 0
+            ? static_cast<double>(emu_result.junk_instruction_count) / emu_result.total_instructions : 0.0);
     return tool_result_t::ok(
         OBFSTR("VM handler analysis at ") + sa_format_address(*addr) +
         OBFSTR(": ") + classification +
@@ -635,9 +697,14 @@ tool_result_t analyze_vm_handler(const json& params)
 
 tool_result_t emulate_multi_trace(const json& params)
 {
+    diag::log_tagged_fmt("emul_tools", "emulate_multi_trace entry addr='%s'",
+        params.value("address", std::string()).c_str());
     auto addr = sa_parse_address(params.value("address", std::string()));
     if (!addr)
+    {
+        diag::log_tagged_fmt("emul_tools", "emulate_multi_trace invalid address");
         return tool_result_t::error(OBFSTR("Invalid address"));
+    }
 
     auto chk = check_driver_for_address(*addr);
     if (!chk.success) return chk;
@@ -645,7 +712,10 @@ tool_result_t emulate_multi_trace(const json& params)
     const bool kernel_mode = is_kernel_address(*addr);
 
     if (!params.contains("inputs") || !params["inputs"].is_array() || params["inputs"].empty())
+    {
+        diag::log_tagged_fmt("emul_tools", "emulate_multi_trace missing inputs array");
         return tool_result_t::error(OBFSTR("Provide 'inputs' array of register state objects [{rax:..., rbx:...}, ...]"));
+    }
 
     std::uint32_t size = params.value("size", 4096);
     if (size > 1024 * 1024) size = 1024 * 1024;
@@ -659,6 +729,8 @@ tool_result_t emulate_multi_trace(const json& params)
     std::uint64_t code_base_aligned = *addr & ~0xFFFULL;
     std::uint64_t code_region_size = (static_cast<std::uint64_t>(size) + 0xFFF + (*addr & 0xFFF)) & ~0xFFFULL;
 
+    diag::log_tagged_fmt("emul_tools", "emulate_multi_trace addr=0x%llx input_count=%zu kernel=%d",
+        static_cast<unsigned long long>(*addr), params["inputs"].size(), (int)kernel_mode);
     json traces = json::array();
     const auto& inputs = params["inputs"];
 
@@ -781,6 +853,8 @@ tool_result_t emulate_multi_trace(const json& params)
     out["traces"]       = std::move(traces);
     if (!diff.empty()) out["differential_analysis"] = std::move(diff);
 
+    diag::log_tagged_fmt("emul_tools", "emulate_multi_trace ok trace_count=%zu",
+        out["trace_count"].get<std::size_t>());
     return tool_result_t::ok(OBFSTR("Multi-trace: ") + std::to_string(out["trace_count"].get<std::size_t>()) +
                              OBFSTR(" traces at ") + sa_format_address(*addr) +
                              (kernel_mode ? OBFSTR(" [kernel]") : OBFSTR(" [user]")), out);
@@ -789,9 +863,14 @@ tool_result_t emulate_multi_trace(const json& params)
 
 tool_result_t emulate_function(const json& params)
 {
+    diag::log_tagged_fmt("emul_tools", "emulate_function entry addr='%s'",
+        params.value("address", std::string()).c_str());
     auto addr = sa_parse_address(params.value("address", std::string()));
     if (!addr)
+    {
+        diag::log_tagged_fmt("emul_tools", "emulate_function invalid address");
         return tool_result_t::error(OBFSTR("Invalid address"));
+    }
 
     auto chk = check_driver_for_address(*addr);
     if (!chk.success) return chk;
@@ -867,6 +946,8 @@ tool_result_t emulate_function(const json& params)
     config.timeout_us         = params.value("timeout_us", 15000000);
     config.breakpoint_addresses.insert(SENTINEL_RET);
 
+    diag::log_tagged_fmt("emul_tools", "emulate_function running addr=0x%llx fn_size=%u kernel=%d",
+        static_cast<unsigned long long>(*addr), fn_size, (int)kernel_mode);
     auto result = emulation::emulate_from_snapshot(snapshot, config);
 
     json out;
@@ -945,6 +1026,9 @@ tool_result_t emulate_function(const json& params)
         out["error"] = result.error;
     }
 
+    diag::log_tagged_fmt("emul_tools", "emulate_function ok returned=%d total=%u junk=%u",
+        (int)returned_normally, result.success ? result.total_instructions : 0u,
+        result.success ? result.junk_instruction_count : 0u);
     return tool_result_t::ok(
         OBFSTR("Function emulation ") + sa_format_address(*addr) +
         (returned_normally ? OBFSTR(": returned normally") : OBFSTR(": did not return")) +
@@ -987,6 +1071,7 @@ tool_result_t emulate_function(const json&)
 
 void register_emulation_tools(mcp_standalone::server_t& srv)
 {
+    diag::log_tagged_fmt("emul_tools", "register_emulation_tools registering 6 tools");
         register_compat(srv, {
         OBFSTR("disassemble_zydis"), OBFSTR("emulation"),
         OBFSTR("Disassemble raw bytes from LIVE MEMORY using the Zydis engine via the kernel driver. "

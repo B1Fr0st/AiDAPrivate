@@ -271,11 +271,17 @@ bool hmac_md5_bytes(const uint8_t* key, size_t key_len,
 
 bool ensure_legacy_provider_loaded()
 {
+    diag::log_tagged_fmt("auth_lab", "ensure_legacy_provider_loaded entry");
     auto& st = s();
-    if (st.legacy_loaded.load(std::memory_order_acquire)) return true;
+    if (st.legacy_loaded.load(std::memory_order_acquire)) {
+        diag::log_tagged_fmt("auth_lab", "ensure_legacy_provider_loaded already_loaded");
+        return true;
+    }
+    diag::log_tagged_fmt("auth_lab", "ensure_legacy_provider_loaded loading_providers");
     OSSL_PROVIDER* def = OSSL_PROVIDER_load(nullptr, "default");
     OSSL_PROVIDER* legacy = OSSL_PROVIDER_load(nullptr, "legacy");
     if (!legacy) {
+        diag::log_tagged_fmt("auth_lab", "ensure_legacy_provider_loaded error legacy_load_failed");
         if (def) OSSL_PROVIDER_unload(def);
         set_err("legacy provider load failed");
         return false;
@@ -283,6 +289,7 @@ bool ensure_legacy_provider_loaded()
     st.legacy = legacy;
     st.default_p = def;
     st.legacy_loaded.store(true, std::memory_order_release);
+    diag::log_tagged_fmt("auth_lab", "ensure_legacy_provider_loaded success");
     return true;
 }
 
@@ -426,11 +433,16 @@ bool initialize()
 
 void shutdown()
 {
+    diag::log_tagged_fmt("auth_lab", "shutdown entry");
     auto& st = s();
-    if (!st.initialized.exchange(false)) return;
+    if (!st.initialized.exchange(false)) {
+        diag::log_tagged_fmt("auth_lab", "shutdown already_stopped");
+        return;
+    }
     if (st.legacy) { OSSL_PROVIDER_unload(st.legacy); st.legacy = nullptr; }
     if (st.default_p) { OSSL_PROVIDER_unload(st.default_p); st.default_p = nullptr; }
     st.legacy_loaded.store(false, std::memory_order_release);
+    diag::log_tagged_fmt("auth_lab", "shutdown complete");
 }
 
 std::string base64_encode_std(const uint8_t* data, size_t len)
@@ -445,26 +457,42 @@ bool base64_decode_std(const std::string& in, std::string& out)
 
 std::string basic_encode(const std::string& user, const std::string& pass)
 {
+    diag::log_tagged_fmt("auth_lab", "basic_encode entry user=%s pass_len=%zu", user.c_str(), pass.size());
     std::string raw = user + ":" + pass;
     std::string enc = base64_encode_internal(reinterpret_cast<const uint8_t*>(raw.data()), raw.size());
+    diag::log_tagged_fmt("auth_lab", "basic_encode ok enc_len=%zu", enc.size());
     return std::string("Basic ") + enc;
 }
 
 bool basic_decode(const std::string& header, std::string& user, std::string& pass)
 {
+    diag::log_tagged_fmt("auth_lab", "basic_decode entry header_len=%zu", header.size());
     user.clear();
     pass.clear();
     std::string h = trim(header);
-    if (h.size() < 6) return false;
+    if (h.size() < 6) {
+        diag::log_tagged_fmt("auth_lab", "basic_decode error header_too_short len=%zu", h.size());
+        return false;
+    }
     std::string lo = ascii_lower(h.substr(0, 6));
-    if (lo != "basic ") return false;
+    if (lo != "basic ") {
+        diag::log_tagged_fmt("auth_lab", "basic_decode error not_basic_scheme prefix=%s", lo.c_str());
+        return false;
+    }
     std::string b = trim(h.substr(6));
     std::string raw;
-    if (!base64_decode_internal(b, raw)) return false;
+    if (!base64_decode_internal(b, raw)) {
+        diag::log_tagged_fmt("auth_lab", "basic_decode error b64_decode_failed");
+        return false;
+    }
     size_t colon = raw.find(':');
-    if (colon == std::string::npos) return false;
+    if (colon == std::string::npos) {
+        diag::log_tagged_fmt("auth_lab", "basic_decode error no_colon_in_decoded");
+        return false;
+    }
     user = raw.substr(0, colon);
     pass = raw.substr(colon + 1);
+    diag::log_tagged_fmt("auth_lab", "basic_decode ok user=%s pass_len=%zu", user.c_str(), pass.size());
     return true;
 }
 
@@ -476,6 +504,8 @@ std::string digest_solve(const std::string& method,
                          const std::string& pass,
                          const std::string& cnonce_in)
 {
+    diag::log_tagged_fmt("auth_lab", "digest_solve entry method=%s uri=%s user=%s body_len=%zu",
+        method.c_str(), uri.c_str(), user.c_str(), body.size());
     auto kv = parse_auth_header(www_auth_header);
     std::string realm = get_param(kv, "realm");
     std::string nonce = get_param(kv, "nonce");
@@ -483,6 +513,8 @@ std::string digest_solve(const std::string& method,
     std::string opaque = get_param(kv, "opaque");
     std::string algorithm = get_param(kv, "algorithm");
     if (algorithm.empty()) algorithm = "MD5";
+    diag::log_tagged_fmt("auth_lab", "digest_solve realm=%s nonce_len=%zu qop=%s algorithm=%s",
+        get_param(kv, "realm").c_str(), get_param(kv, "nonce").size(), get_param(kv, "qop").c_str(), algorithm.c_str());
 
     std::string algorithm_up;
     for (char c : algorithm) algorithm_up.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
@@ -544,11 +576,13 @@ std::string digest_solve(const std::string& method,
     }
     out += ", response=\"" + response_hash + "\"";
     if (!opaque.empty()) out += ", opaque=\"" + opaque + "\"";
+    diag::log_tagged_fmt("auth_lab", "digest_solve result_len=%zu qop_sel=%s sess=%d", out.size(), qop_sel.c_str(), (int)sess);
     return out;
 }
 
 std::string ntlm_type1(const std::string& domain, const std::string& workstation)
 {
+    diag::log_tagged_fmt("auth_lab", "ntlm_type1 entry domain=%s workstation=%s", domain.c_str(), workstation.c_str());
     std::vector<uint8_t> msg;
     msg.reserve(64);
     const char sig[] = "NTLMSSP";
@@ -574,7 +608,9 @@ std::string ntlm_type1(const std::string& domain, const std::string& workstation
     u32(32);
     msg.insert(msg.end(), workstation.begin(), workstation.end());
     msg.insert(msg.end(), domain.begin(), domain.end());
-    return base64_encode_internal(msg.data(), msg.size());
+    std::string result = base64_encode_internal(msg.data(), msg.size());
+    diag::log_tagged_fmt("auth_lab", "ntlm_type1 ok msg_bytes=%zu b64_len=%zu", msg.size(), result.size());
+    return result;
 }
 
 namespace {
@@ -610,15 +646,20 @@ std::string ntlm_type3(const std::string& type2_b64,
                        const std::string& domain,
                        const std::string& workstation)
 {
+    diag::log_tagged_fmt("auth_lab", "ntlm_type3 entry user=%s domain=%s workstation=%s type2_b64_len=%zu",
+        user.c_str(), domain.c_str(), workstation.c_str(), type2_b64.size());
     std::string raw_type2;
     if (!base64_decode_internal(type2_b64, raw_type2)) {
+        diag::log_tagged_fmt("auth_lab", "ntlm_type3 error type2_b64_decode_failed");
         set_err("ntlm_type3: type2 b64 decode failed");
         return std::string();
     }
     if (raw_type2.size() < 48) {
+        diag::log_tagged_fmt("auth_lab", "ntlm_type3 error type2_too_short size=%zu", raw_type2.size());
         set_err("ntlm_type3: type2 too short");
         return std::string();
     }
+    diag::log_tagged_fmt("auth_lab", "ntlm_type3 type2_decoded size=%zu", raw_type2.size());
     const uint8_t* t2 = reinterpret_cast<const uint8_t*>(raw_type2.data());
     uint8_t server_challenge[8];
     std::memcpy(server_challenge, t2 + 24, 8);
@@ -630,6 +671,7 @@ std::string ntlm_type3(const std::string& type2_b64,
     }
 
     if (!ensure_legacy_provider_loaded()) {
+        diag::log_tagged_fmt("auth_lab", "ntlm_type3 error legacy_provider_unavailable");
         set_err("ntlm_type3: legacy provider unavailable for MD4");
         return std::string();
     }
@@ -637,9 +679,11 @@ std::string ntlm_type3(const std::string& type2_b64,
     std::vector<uint8_t> pass_utf16 = utf16le(pass);
     std::vector<uint8_t> ntlm_hash;
     if (!evp_md4_bytes(pass_utf16.data(), pass_utf16.size(), ntlm_hash) || ntlm_hash.size() != 16) {
+        diag::log_tagged_fmt("auth_lab", "ntlm_type3 error md4_failed");
         set_err("ntlm_type3: md4 failed");
         return std::string();
     }
+    diag::log_tagged_fmt("auth_lab", "ntlm_type3 ntlm_hash_ok computing_ntlmv2");
 
     std::vector<uint8_t> user_dom_utf16;
     {
@@ -653,9 +697,11 @@ std::string ntlm_type3(const std::string& type2_b64,
     if (!hmac_md5_bytes(ntlm_hash.data(), ntlm_hash.size(),
                         user_dom_utf16.data(), user_dom_utf16.size(), ntlmv2_hash) ||
         ntlmv2_hash.size() != 16) {
+        diag::log_tagged_fmt("auth_lab", "ntlm_type3 error hmac_md5_failed");
         set_err("ntlm_type3: hmac-md5 failed");
         return std::string();
     }
+    diag::log_tagged_fmt("auth_lab", "ntlm_type3 ntlmv2_hash_ok building_blob");
 
     uint64_t now_filetime_100ns = 0;
     {
@@ -688,9 +734,11 @@ std::string ntlm_type3(const std::string& type2_b64,
     if (!hmac_md5_bytes(ntlmv2_hash.data(), ntlmv2_hash.size(),
                         ntlmv2_data.data(), ntlmv2_data.size(), nt_proof) ||
         nt_proof.size() != 16) {
+        diag::log_tagged_fmt("auth_lab", "ntlm_type3 error nt_proof_hmac_failed");
         set_err("ntlm_type3: nt proof hmac failed");
         return std::string();
     }
+    diag::log_tagged_fmt("auth_lab", "ntlm_type3 nt_proof_ok nt_response_bytes=%zu", 16 + blob.size());
     std::vector<uint8_t> nt_response;
     nt_response.reserve(16 + blob.size());
     nt_response.insert(nt_response.end(), nt_proof.begin(), nt_proof.end());
@@ -765,16 +813,20 @@ std::string ntlm_type3(const std::string& type2_b64,
     std::memcpy(msg.data() + off_nt, nt_response.data(), nt_response.size());
     std::memcpy(msg.data() + off_sk, session_key.data(), session_key.size());
 
-    return base64_encode_internal(msg.data(), msg.size());
+    std::string result = base64_encode_internal(msg.data(), msg.size());
+    diag::log_tagged_fmt("auth_lab", "ntlm_type3 ok msg_bytes=%zu b64_len=%zu", msg.size(), result.size());
+    return result;
 }
 
 std::string bearer_header(const std::string& token)
 {
+    diag::log_tagged_fmt("auth_lab", "bearer_header entry token_len=%zu", token.size());
     return std::string("Bearer ") + token;
 }
 
 oauth2_pkce_t generate_pkce_pair()
 {
+    diag::log_tagged_fmt("auth_lab", "generate_pkce_pair entry");
     oauth2_pkce_t out;
     auto rb = random_bytes(32);
     out.verifier = base64url_encode_no_pad(rb.data(), rb.size());
@@ -783,6 +835,8 @@ oauth2_pkce_t generate_pkce_pair()
                      reinterpret_cast<const uint8_t*>(out.verifier.data()),
                      out.verifier.size(), sha);
     out.challenge = base64url_encode_no_pad(sha.data(), sha.size());
+    diag::log_tagged_fmt("auth_lab", "generate_pkce_pair ok verifier_len=%zu challenge_len=%zu",
+        out.verifier.size(), out.challenge.size());
     return out;
 }
 
@@ -793,6 +847,8 @@ std::string oauth2_build_auth_url(const std::string& authorize_endpoint,
                                   const std::string& state,
                                   const std::string& code_challenge)
 {
+    diag::log_tagged_fmt("auth_lab", "oauth2_build_auth_url entry endpoint=%s client_id=%s scope=%s has_pkce=%d",
+        authorize_endpoint.c_str(), client_id.c_str(), scope.c_str(), !code_challenge.empty());
     std::string out = authorize_endpoint;
     out += (authorize_endpoint.find('?') == std::string::npos) ? "?" : "&";
     out += "response_type=code";
@@ -804,6 +860,7 @@ std::string oauth2_build_auth_url(const std::string& authorize_endpoint,
         out += "&code_challenge=" + url_encode(code_challenge);
         out += "&code_challenge_method=S256";
     }
+    diag::log_tagged_fmt("auth_lab", "oauth2_build_auth_url ok url_len=%zu", out.size());
     return out;
 }
 
@@ -816,6 +873,8 @@ bool oauth2_exchange_code(const std::string& token_endpoint,
                           std::string& refresh_token,
                           int& expires_in)
 {
+    diag::log_tagged_fmt("auth_lab", "oauth2_exchange_code entry endpoint=%s client_id=%s has_verifier=%d",
+        token_endpoint.c_str(), client_id.c_str(), !code_verifier.empty());
     access_token.clear();
     refresh_token.clear();
     expires_in = 0;
@@ -826,16 +885,26 @@ bool oauth2_exchange_code(const std::string& token_endpoint,
     form.emplace_back("redirect_uri", redirect_uri);
     if (!code_verifier.empty()) form.emplace_back("code_verifier", code_verifier);
     std::string body;
-    if (!http_post_form(token_endpoint, form, body)) return false;
+    if (!http_post_form(token_endpoint, form, body)) {
+        diag::log_tagged_fmt("auth_lab", "oauth2_exchange_code error http_post_failed endpoint=%s", token_endpoint.c_str());
+        return false;
+    }
+    diag::log_tagged_fmt("auth_lab", "oauth2_exchange_code http_ok body_len=%zu parsing_response", body.size());
     nlohmann::json j;
     try { j = nlohmann::json::parse(body, nullptr, false); } catch (...) { j = {}; }
-    if (j.is_discarded() || !j.is_object()) { set_err("token response not JSON"); return false; }
+    if (j.is_discarded() || !j.is_object()) {
+        diag::log_tagged_fmt("auth_lab", "oauth2_exchange_code error response_not_json");
+        set_err("token response not JSON");
+        return false;
+    }
     if (j.contains("access_token") && j["access_token"].is_string()) access_token = j["access_token"].get<std::string>();
     if (j.contains("refresh_token") && j["refresh_token"].is_string()) refresh_token = j["refresh_token"].get<std::string>();
     if (j.contains("expires_in")) {
         if (j["expires_in"].is_number_integer()) expires_in = j["expires_in"].get<int>();
         else if (j["expires_in"].is_number_unsigned()) expires_in = static_cast<int>(j["expires_in"].get<uint64_t>());
     }
+    diag::log_tagged_fmt("auth_lab", "oauth2_exchange_code result access_token_len=%zu has_refresh=%d expires_in=%d",
+        access_token.size(), !refresh_token.empty(), expires_in);
     return !access_token.empty();
 }
 
@@ -845,6 +914,8 @@ bool oauth2_refresh(const std::string& token_endpoint,
                     std::string& access_token,
                     int& expires_in)
 {
+    diag::log_tagged_fmt("auth_lab", "oauth2_refresh entry endpoint=%s client_id=%s refresh_token_len=%zu",
+        token_endpoint.c_str(), client_id.c_str(), refresh_token.size());
     access_token.clear();
     expires_in = 0;
     std::vector<std::pair<std::string, std::string>> form;
@@ -852,15 +923,25 @@ bool oauth2_refresh(const std::string& token_endpoint,
     form.emplace_back("client_id", client_id);
     form.emplace_back("refresh_token", refresh_token);
     std::string body;
-    if (!http_post_form(token_endpoint, form, body)) return false;
+    if (!http_post_form(token_endpoint, form, body)) {
+        diag::log_tagged_fmt("auth_lab", "oauth2_refresh error http_post_failed endpoint=%s", token_endpoint.c_str());
+        return false;
+    }
+    diag::log_tagged_fmt("auth_lab", "oauth2_refresh http_ok body_len=%zu parsing_response", body.size());
     nlohmann::json j;
     try { j = nlohmann::json::parse(body, nullptr, false); } catch (...) { j = {}; }
-    if (j.is_discarded() || !j.is_object()) { set_err("refresh response not JSON"); return false; }
+    if (j.is_discarded() || !j.is_object()) {
+        diag::log_tagged_fmt("auth_lab", "oauth2_refresh error response_not_json");
+        set_err("refresh response not JSON");
+        return false;
+    }
     if (j.contains("access_token") && j["access_token"].is_string()) access_token = j["access_token"].get<std::string>();
     if (j.contains("expires_in")) {
         if (j["expires_in"].is_number_integer()) expires_in = j["expires_in"].get<int>();
         else if (j["expires_in"].is_number_unsigned()) expires_in = static_cast<int>(j["expires_in"].get<uint64_t>());
     }
+    diag::log_tagged_fmt("auth_lab", "oauth2_refresh result access_token_len=%zu expires_in=%d",
+        access_token.size(), expires_in);
     return !access_token.empty();
 }
 
@@ -927,6 +1008,7 @@ std::string pretty_xml(const std::string& in)
 
 std::string saml_decode_request(const std::string& saml_b64)
 {
+    diag::log_tagged_fmt("auth_lab", "saml_decode_request entry b64_len=%zu", saml_b64.size());
     std::string urldecoded;
     {
         std::string s_in = saml_b64;
@@ -952,9 +1034,11 @@ std::string saml_decode_request(const std::string& saml_b64)
     }
     std::string raw;
     if (!base64_decode_internal(urldecoded, raw)) {
+        diag::log_tagged_fmt("auth_lab", "saml_decode_request error b64_decode_failed");
         set_err("saml_decode_request: base64 decode failed");
         return std::string();
     }
+    diag::log_tagged_fmt("auth_lab", "saml_decode_request b64_ok raw_len=%zu inflating", raw.size());
     std::vector<uint8_t> inflated;
     inflated.reserve(raw.size() * 4 + 32);
     z_stream strm{};
@@ -980,23 +1064,29 @@ std::string saml_decode_request(const std::string& saml_b64)
     }
     inflateEnd(&strm);
     std::string xml(reinterpret_cast<const char*>(inflated.data()), inflated.size());
+    diag::log_tagged_fmt("auth_lab", "saml_decode_request inflated_len=%zu formatting_xml", inflated.size());
     return pretty_xml(xml);
 }
 
 std::string saml_decode_response(const std::string& saml_b64)
 {
+    diag::log_tagged_fmt("auth_lab", "saml_decode_response entry b64_len=%zu", saml_b64.size());
     std::string raw;
     if (!base64_decode_internal(saml_b64, raw)) {
+        diag::log_tagged_fmt("auth_lab", "saml_decode_response error b64_decode_failed");
         set_err("saml_decode_response: base64 decode failed");
         return std::string();
     }
+    diag::log_tagged_fmt("auth_lab", "saml_decode_response ok raw_len=%zu formatting_xml", raw.size());
     return pretty_xml(raw);
 }
 
 std::string last_error()
 {
+    diag::log_tagged_fmt("auth_lab", "last_error queried");
     auto& st = s();
     std::lock_guard<std::mutex> lk(st.err_mtx);
+    diag::log_tagged_fmt("auth_lab", "last_error value_len=%zu", st.last_err.size());
     return st.last_err;
 }
 

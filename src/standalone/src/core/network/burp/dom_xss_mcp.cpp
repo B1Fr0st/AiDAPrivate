@@ -110,6 +110,7 @@ std::vector<uint8_t> synthesize_get_request(const std::string& path, const std::
 tool_result_t tool_status(const json& params)
 {
     (void)params;
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_status entry");
     json data;
     data["camoufox_ready"]  = camoufox::is_ready();
     auto st = camoufox::get_status();
@@ -119,19 +120,32 @@ tool_result_t tool_status(const json& params)
     data["last_scan_ms"]    = last_scan_ms_slot().load();
     data["total_payloads_fired"] = total_payloads_slot().load();
     data["total_scans"]     = total_scans_slot().load();
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_status ok ready=%d total_scans=%llu", (int)camoufox::is_ready(), static_cast<unsigned long long>(total_scans_slot().load()));
     return tool_result_t::ok(data);
 }
 
 tool_result_t tool_test_payload(const json& params)
 {
-    if (!params.is_object()) return tool_result_t::error("expected object params");
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload entry");
+    if (!params.is_object())
+    {
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload invalid_params");
+        return tool_result_t::error("expected object params");
+    }
     if (!params.contains("target_url") || !params["target_url"].is_string())
+    {
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload missing target_url");
         return tool_result_t::error("missing 'target_url'");
+    }
     if (!params.contains("payload") || !params["payload"].is_string())
+    {
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload missing payload");
         return tool_result_t::error("missing 'payload'");
+    }
 
     const std::string target_url = params["target_url"].get<std::string>();
     const std::string payload_tpl = params["payload"].get<std::string>();
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload url=%s payload_len=%zu", target_url.c_str(), payload_tpl.size());
     bool capture = false;
     if (params.contains("capture_screenshot") && params["capture_screenshot"].is_boolean())
         capture = params["capture_screenshot"].get<bool>();
@@ -168,6 +182,7 @@ tool_result_t tool_test_payload(const json& params)
     auto s = dom_xss::make_sentinel();
     auto r = dom_xss::fire_payload(*chosen, payload_tpl, s, capture, per_timeout, scheme, port);
     total_payloads_slot().fetch_add(1);
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload ok canary_fired=%d url=%s", (int)r.canary_fired, target_url.c_str());
 
     json data;
     data["ok"] = r.ok;
@@ -182,15 +197,26 @@ tool_result_t tool_test_payload(const json& params)
 
 tool_result_t tool_scan(const json& params)
 {
-    if (!params.is_object()) return tool_result_t::error("expected object params");
-    if (!params.contains("target_url") || !params["target_url"].is_string())
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan entry");
+    if (!params.is_object()) {
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_scan invalid_params");
+        return tool_result_t::error("expected object params");
+    }
+    if (!params.contains("target_url") || !params["target_url"].is_string()) {
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_scan missing target_url");
         return tool_result_t::error("missing 'target_url'");
+    }
 
     const std::string target_url = params["target_url"].get<std::string>();
-    if (!camoufox::is_ready())
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan url=%s", target_url.c_str());
+    if (!camoufox::is_ready()) {
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_scan bridge_not_ready");
         return tool_result_t::error("camoufox bridge not ready");
-    if (!scope::in_scope(target_url))
+    }
+    if (!scope::in_scope(target_url)) {
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_scan out_of_scope url=%s", target_url.c_str());
         return tool_result_t::error("target out of scope");
+    }
 
     std::string scheme, host, path;
     uint16_t port = 0;
@@ -261,6 +287,7 @@ tool_result_t tool_scan(const json& params)
     data["per_point"]     = per_point;
     data["issues_emitted"] = total_emitted;
     data["last_engine_error"] = dom_xss::last_error();
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan ok url=%s points_scanned=%zu issues_emitted=%zu", target_url.c_str(), per_point.size(), total_emitted);
     return tool_result_t::ok(data);
 }
 

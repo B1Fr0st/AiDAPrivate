@@ -1,5 +1,7 @@
 #include "../scanner_module.hpp"
 
+#include "../../../../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <optional>
 #include <sstream>
@@ -27,6 +29,8 @@ bool body_contains_ldap_error(const exchange_observed_t& resp)
 
 std::vector<probe_t> ldap_probes(const insertion_point_t& ip, const module_context_t&)
 {
+    diag::log_tagged_fmt("mod_ldap", "ldap_probes entry ip=%s:%s orig=%s",
+                         ip.kind.c_str(), ip.name.c_str(), ip.original_value.c_str());
     std::vector<probe_t> out;
     std::string base = ip.original_value;
     out.push_back({ "*",                        "_AIDA_LDAP", "wildcard-filter" });
@@ -37,12 +41,15 @@ std::vector<probe_t> ldap_probes(const insertion_point_t& ip, const module_conte
     out.push_back({ "*)(!(objectClass=*)",      "_AIDA_LDAP", "blind-bool-false" });
     out.push_back({ "(",                        "_AIDA_LDAP", "broken-paren" });
     out.push_back({ "&",                        "_AIDA_LDAP", "broken-amp" });
+    diag::log_tagged_fmt("mod_ldap", "ldap_probes built %zu probes ip=%s:%s", out.size(), ip.kind.c_str(), ip.name.c_str());
     return out;
 }
 
 std::optional<issue_t> ldap_detect(const insertion_point_t& ip, const probe_t& probe,
                                    const exchange_observed_t& resp, const module_context_t& ctx)
 {
+    diag::log_tagged_fmt("mod_ldap", "ldap_detect entry ip=%s:%s variant=%s status=%d",
+                         ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str(), resp.status_code);
     if (probe.marker != "_AIDA_LDAP") return std::nullopt;
     bool err = body_contains_ldap_error(resp);
     bool differential = false;
@@ -53,7 +60,13 @@ std::optional<issue_t> ldap_detect(const insertion_point_t& ip, const probe_t& p
         size_t mn = std::min(resp.resp_body.size(), ctx.baseline_response_body.size());
         if (mx > 0 && (mx - mn) * 10 > mx) differential = true;
     }
-    if (!err && !differential) return std::nullopt;
+    diag::log_tagged_fmt("mod_ldap", "ldap_detect err=%d differential=%d variant=%s", err ? 1 : 0, differential ? 1 : 0, probe.variant.c_str());
+    if (!err && !differential) {
+        diag::log_tagged_fmt("mod_ldap", "ldap_detect no finding ip=%s:%s variant=%s", ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str());
+        return std::nullopt;
+    }
+    diag::log_tagged_fmt("mod_ldap", "ldap_detect FINDING injection ip=%s:%s variant=%s err=%d differential=%d",
+                         ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str(), err ? 1 : 0, differential ? 1 : 0);
     confidence_t conf = err ? confidence_t::firm : confidence_t::tentative;
     auto iss = make_issue("ldap.injection",
                           std::string("Possible LDAP Injection (") + probe.variant + ")",

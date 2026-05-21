@@ -6,6 +6,7 @@
 #endif
 
 #include "pdb_downloader.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <windows.h>
 #include <winhttp.h>
@@ -102,10 +103,12 @@ bool http_get_to_file(const std::string& url,
 {
 	out_bytes = 0;
 	out_status = 0;
+	diag::log_tagged_fmt("pdb_dl", "http_get_to_file url=%s", url.c_str());
 
 	parsed_url_t pu;
 	if (!parse_url(url, pu)) {
 		error = "invalid url";
+		diag::log_tagged_fmt("pdb_dl", "http_get_to_file failed invalid_url url=%s", url.c_str());
 		return false;
 	}
 
@@ -169,9 +172,12 @@ bool http_get_to_file(const std::string& url,
 		return false;
 	}
 	out_status = static_cast<int>(status_code);
+	diag::log_tagged_fmt("pdb_dl", "http_get_to_file status=%d url=%s", static_cast<int>(status_code), url.c_str());
 
 	if (status_code < 200 || status_code >= 300) {
 		error = "http status=" + std::to_string(status_code);
+		diag::log_tagged_fmt("pdb_dl", "http_get_to_file failed http_error status=%d url=%s",
+			static_cast<int>(status_code), url.c_str());
 		return false;
 	}
 
@@ -264,6 +270,11 @@ bool http_get_to_file(const std::string& url,
 	if (ok) emit_progress(total);
 	if (!ok) {
 		std::filesystem::remove(destination, ec);
+		diag::log_tagged_fmt("pdb_dl", "http_get_to_file failed bytes=%llu err=%s url=%s",
+			static_cast<unsigned long long>(total), error.c_str(), url.c_str());
+	} else {
+		diag::log_tagged_fmt("pdb_dl", "http_get_to_file complete bytes=%llu url=%s",
+			static_cast<unsigned long long>(total), url.c_str());
 	}
 	return ok;
 }
@@ -358,11 +369,14 @@ bool fdi_decompress(const std::filesystem::path& cab_path,
                     std::string& out_extracted_path,
                     std::string& error)
 {
+	diag::log_tagged_fmt("pdb_dl", "fdi_decompress cab=%s target_dir=%s",
+		cab_path.string().c_str(), target_dir.string().c_str());
 	ERF erf = {};
 	HFDI hfdi = FDICreate(fdi_alloc, fdi_free, fdi_open, fdi_read,
 		fdi_write, fdi_close, fdi_seek, cpuUNKNOWN, &erf);
 	if (!hfdi) {
 		error = "FDICreate failed err=" + std::to_string(erf.erfOper);
+		diag::log_tagged_fmt("pdb_dl", "fdi_decompress failed FDICreate err=%d", erf.erfOper);
 		return false;
 	}
 
@@ -384,9 +398,12 @@ bool fdi_decompress(const std::filesystem::path& cab_path,
 
 	if (!ok || !ctx.wrote_any) {
 		error = "FDICopy failed err=" + std::to_string(erf.erfOper);
+		diag::log_tagged_fmt("pdb_dl", "fdi_decompress failed FDICopy err=%d cab=%s",
+			erf.erfOper, cab_path.string().c_str());
 		return false;
 	}
 	out_extracted_path = ctx.final_path;
+	diag::log_tagged_fmt("pdb_dl", "fdi_decompress complete extracted=%s", ctx.final_path.c_str());
 	return true;
 }
 
@@ -434,17 +451,24 @@ std::string build_server_url(const std::string& server_base,
 bool resolve_cache_path(const download_request_t& req, std::string& out_path)
 {
 	out_path.clear();
-	if (req.pdb_name.empty() || req.pdb_guid.empty() || req.cache_root.empty())
+	diag::log_tagged_fmt("pdb_dl", "resolve_cache_path pdb=%s guid=%s age=%u",
+		req.pdb_name.c_str(), req.pdb_guid.c_str(), req.pdb_age);
+	if (req.pdb_name.empty() || req.pdb_guid.empty() || req.cache_root.empty()) {
+		diag::log_tagged("pdb_dl", "resolve_cache_path failed invalid_request");
 		return false;
+	}
 	auto target = build_local_target(req);
 	std::error_code ec;
 	if (std::filesystem::exists(target, ec) && std::filesystem::is_regular_file(target, ec)) {
 		auto sz = std::filesystem::file_size(target, ec);
 		if (!ec && sz > 0) {
 			out_path = target.string();
+			diag::log_tagged_fmt("pdb_dl", "resolve_cache_path cache_hit path=%s bytes=%llu",
+				out_path.c_str(), static_cast<unsigned long long>(sz));
 			return true;
 		}
 	}
+	diag::log_tagged_fmt("pdb_dl", "resolve_cache_path cache_miss pdb=%s", req.pdb_name.c_str());
 	return false;
 }
 
@@ -454,10 +478,13 @@ bool download_pdb_sync(const download_request_t& req,
                        download_result_t& out)
 {
 	out = {};
+	diag::log_tagged_fmt("pdb_dl", "download_pdb_sync entry pdb=%s guid=%s age=%u server=%s",
+		req.pdb_name.c_str(), req.pdb_guid.c_str(), req.pdb_age, req.server_base.c_str());
 
 	if (req.pdb_name.empty() || req.pdb_guid.empty() || req.server_base.empty() ||
 	    req.cache_root.empty()) {
 		out.error = "invalid request";
+		diag::log_tagged("pdb_dl", "download_pdb_sync failed invalid_request");
 		return false;
 	}
 
@@ -469,6 +496,9 @@ bool download_pdb_sync(const download_request_t& req,
 		std::error_code ec;
 		auto sz = std::filesystem::file_size(cached, ec);
 		out.bytes_downloaded = ec ? 0 : sz;
+		diag::log_tagged_fmt("pdb_dl", "download_pdb_sync from_cache pdb=%s path=%s bytes=%llu",
+			req.pdb_name.c_str(), cached.c_str(),
+			static_cast<unsigned long long>(out.bytes_downloaded));
 		if (on_progress) {
 			progress_t p;
 			p.bytes_received = out.bytes_downloaded;
@@ -485,6 +515,7 @@ bool download_pdb_sync(const download_request_t& req,
 
 	std::string url = build_server_url(req.server_base, req.pdb_name,
 		req.pdb_guid, req.pdb_age, false);
+	diag::log_tagged_fmt("pdb_dl", "download_pdb_sync http_request url=%s", url.c_str());
 
 	std::string error;
 	uint64_t bytes = 0;
@@ -492,8 +523,10 @@ bool download_pdb_sync(const download_request_t& req,
 	bool ok = http_get_to_file(url, target, on_progress, cancel, error, bytes, status);
 
 	if (!ok && status == 404) {
+		diag::log_tagged_fmt("pdb_dl", "download_pdb_sync 404_fallback_to_cab pdb=%s", req.pdb_name.c_str());
 		std::string cab_url = build_server_url(req.server_base, req.pdb_name,
 			req.pdb_guid, req.pdb_age, true);
+		diag::log_tagged_fmt("pdb_dl", "download_pdb_sync cab_url=%s", cab_url.c_str());
 		auto cab_target = target;
 		std::string cab_name = req.pdb_name;
 		if (!cab_name.empty() && (cab_name.back() == 'b' || cab_name.back() == 'B'))
@@ -506,17 +539,23 @@ bool download_pdb_sync(const download_request_t& req,
 			cab_error, cab_bytes, cab_status);
 		if (!cab_ok) {
 			out.error = "primary http " + error + "; compressed " + cab_error;
+			diag::log_tagged_fmt("pdb_dl", "download_pdb_sync cab_download_failed pdb=%s err=%s",
+				req.pdb_name.c_str(), out.error.c_str());
 			return false;
 		}
+		diag::log_tagged_fmt("pdb_dl", "download_pdb_sync cab_downloaded bytes=%llu decompressing",
+			static_cast<unsigned long long>(cab_bytes));
 
 		std::string extracted;
 		std::string fdi_err;
 		if (!fdi_decompress(cab_target, cab_target.parent_path(), extracted, fdi_err)) {
 			std::filesystem::remove(cab_target, ec);
 			out.error = "cab decompress failed: " + fdi_err;
+			diag::log_tagged_fmt("pdb_dl", "download_pdb_sync cab_decompress_failed err=%s", fdi_err.c_str());
 			return false;
 		}
 		std::filesystem::remove(cab_target, ec);
+		diag::log_tagged_fmt("pdb_dl", "download_pdb_sync cab_decompressed extracted=%s", extracted.c_str());
 
 		if (std::filesystem::path(extracted) != target) {
 			std::filesystem::rename(extracted, target, ec);
@@ -530,11 +569,16 @@ bool download_pdb_sync(const download_request_t& req,
 		out.local_path = target.string();
 		out.bytes_downloaded = cab_bytes;
 		out.from_cache = false;
+		diag::log_tagged_fmt("pdb_dl", "download_pdb_sync complete via_cab pdb=%s path=%s bytes=%llu",
+			req.pdb_name.c_str(), out.local_path.c_str(),
+			static_cast<unsigned long long>(out.bytes_downloaded));
 		return true;
 	}
 
 	if (!ok) {
 		out.error = error;
+		diag::log_tagged_fmt("pdb_dl", "download_pdb_sync failed pdb=%s err=%s",
+			req.pdb_name.c_str(), error.c_str());
 		return false;
 	}
 
@@ -542,6 +586,9 @@ bool download_pdb_sync(const download_request_t& req,
 	out.local_path = target.string();
 	out.bytes_downloaded = bytes;
 	out.from_cache = false;
+	diag::log_tagged_fmt("pdb_dl", "download_pdb_sync complete direct pdb=%s path=%s bytes=%llu",
+		req.pdb_name.c_str(), out.local_path.c_str(),
+		static_cast<unsigned long long>(out.bytes_downloaded));
 	return true;
 }
 

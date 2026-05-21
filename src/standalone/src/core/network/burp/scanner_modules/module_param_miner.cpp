@@ -2,6 +2,8 @@
 #include "../audit_http.hpp"
 #include "../param_miner.hpp"
 
+#include "../../../../helpers/diag_log.hpp"
+
 #include <chrono>
 #include <optional>
 #include <string>
@@ -22,6 +24,7 @@ static bool insertion_point_is_request_line(const insertion_point_t& ip)
 static void run_one_location(const insertion_point_t& ip, const module_context_t& ctx,
                              aida::burp::param_miner::location_t loc, const std::string& label)
 {
+    diag::log_tagged_fmt("mod_param_miner", "run_one_location entry label=%s url=%s", label.c_str(), ctx.url.c_str());
     aida::burp::param_miner::config_t cfg;
     cfg.target_url = ctx.url;
     cfg.location = loc;
@@ -34,7 +37,11 @@ static void run_one_location(const insertion_point_t& ip, const module_context_t
     cfg.report_as_issues = true;
 
     uint64_t id = aida::burp::param_miner::start(std::move(cfg));
-    if (id == 0) return;
+    if (id == 0) {
+        diag::log_tagged_fmt("mod_param_miner", "run_one_location start failed label=%s url=%s", label.c_str(), ctx.url.c_str());
+        return;
+    }
+    diag::log_tagged_fmt("mod_param_miner", "run_one_location job_id=%llu label=%s waiting", static_cast<unsigned long long>(id), label.c_str());
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(180);
     while (std::chrono::steady_clock::now() < deadline) {
@@ -45,6 +52,8 @@ static void run_one_location(const insertion_point_t& ip, const module_context_t
     }
     auto hits = aida::burp::param_miner::results(id);
     aida::burp::param_miner::clear(id);
+    diag::log_tagged_fmt("mod_param_miner", "run_one_location job_id=%llu label=%s hits=%zu",
+                         static_cast<unsigned long long>(id), label.c_str(), hits.size());
 
     if (!hits.empty()) {
         probe_t p;
@@ -65,6 +74,8 @@ static void run_one_location(const insertion_point_t& ip, const module_context_t
             summary += h.param_name;
             ++shown;
         }
+        diag::log_tagged_fmt("mod_param_miner", "run_one_location FINDING hidden-params label=%s hits=%zu summary=%s",
+                             label.c_str(), hits.size(), summary.c_str());
         auto iss = make_issue("param-miner.summary",
                               "Hidden parameters discovered in " + label,
                               severity_t::info, confidence_t::firm,
@@ -79,12 +90,22 @@ static void run_one_location(const insertion_point_t& ip, const module_context_t
 
 void param_miner_run(const insertion_point_t& ip, const module_context_t& ctx, const send_fn_t& send)
 {
+    diag::log_tagged_fmt("mod_param_miner", "param_miner_run entry ip=%s:%s url=%s", ip.kind.c_str(), ip.name.c_str(), ctx.url.c_str());
     (void)send;
-    if (!insertion_point_is_request_line(ip)) return;
-    if (ctx.url.empty()) return;
+    if (!insertion_point_is_request_line(ip)) {
+        diag::log_tagged_fmt("mod_param_miner", "param_miner_run skip not request-line");
+        return;
+    }
+    if (ctx.url.empty()) {
+        diag::log_tagged_fmt("mod_param_miner", "param_miner_run skip empty url");
+        return;
+    }
 
+    diag::log_tagged_fmt("mod_param_miner", "param_miner_run scanning query location url=%s", ctx.url.c_str());
     run_one_location(ip, ctx, aida::burp::param_miner::location_t::query, "query");
+    diag::log_tagged_fmt("mod_param_miner", "param_miner_run scanning header location url=%s", ctx.url.c_str());
     run_one_location(ip, ctx, aida::burp::param_miner::location_t::header, "header");
+    diag::log_tagged_fmt("mod_param_miner", "param_miner_run complete ip=%s:%s", ip.kind.c_str(), ip.name.c_str());
 }
 
 bool register_self()

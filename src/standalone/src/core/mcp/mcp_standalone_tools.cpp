@@ -9,6 +9,7 @@
 #include "standalone_settings.hpp"
 #include "zydis_disasm.hpp"
 #include "source_reconstructor.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <httplib.h>
 
@@ -134,6 +135,7 @@ namespace
 
     tool_result_t handle_driver_status(const json&)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_driver_status entry");
         json out;
         out["ready"] = driver_bridge::is_loaded();
         out["kernel_backend"] = driver_bridge::using_kernel_driver();
@@ -147,6 +149,7 @@ namespace
 
     tool_result_t handle_driver_load(const json&)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_driver_load entry");
         if (!driver_bridge::load_kernel_driver())
             return error(driver_bridge::last_error().empty() ? "Failed to load kernel driver." : driver_bridge::last_error());
         return handle_driver_status({});
@@ -154,6 +157,7 @@ namespace
 
     tool_result_t handle_list_processes(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_list_processes entry");
         const std::string filter = to_lower(params.value("filter", std::string()));
         json items = json::array();
         for (const auto& proc : driver_bridge::enumerate_processes()) {
@@ -166,6 +170,7 @@ namespace
 
     tool_result_t handle_driver_attach(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_driver_attach entry");
         if (params.contains("pid") && params["pid"].is_number_integer()) {
             uint32_t pid = params["pid"].get<uint32_t>();
             if (pid == static_cast<uint32_t>(GetCurrentProcessId()))
@@ -190,6 +195,7 @@ namespace
 
     tool_result_t handle_driver_detach(const json&)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_driver_detach entry");
         driver_bridge::detach();
         return tool_result_t::ok("Detached from the live process.");
     }
@@ -203,6 +209,7 @@ namespace
 
     tool_result_t handle_read_memory(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_read_memory entry");
         auto chk = ensure_attached();
         if (!chk.success)
             return chk;
@@ -238,6 +245,7 @@ namespace
 
     tool_result_t handle_read_string(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_read_string entry");
         auto chk = ensure_attached();
         if (!chk.success)
             return chk;
@@ -255,6 +263,7 @@ namespace
 
     tool_result_t handle_query_memory(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_query_memory entry");
         auto chk = ensure_attached();
         if (!chk.success)
             return chk;
@@ -278,6 +287,7 @@ namespace
 
     tool_result_t handle_enumerate_modules(const json&)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_enumerate_modules entry");
         auto chk = ensure_attached();
         if (!chk.success)
             return chk;
@@ -296,6 +306,7 @@ namespace
 
     tool_result_t handle_enumerate_threads(const json&)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_enumerate_threads entry");
         auto chk = ensure_attached();
         if (!chk.success)
             return chk;
@@ -313,6 +324,7 @@ namespace
 
     tool_result_t handle_disassemble_address(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_disassemble_address entry");
         auto chk = ensure_attached();
         if (!chk.success)
             return chk;
@@ -351,6 +363,7 @@ namespace
 
     tool_result_t handle_disassemble_file(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_disassemble_file entry");
         if (!params.contains("path") || !params["path"].is_string())
             return error("Missing required parameter: path");
 
@@ -383,6 +396,7 @@ namespace
 
     tool_result_t handle_sandbox_execute(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_sandbox_execute entry");
         if (!params.contains("path") || !params["path"].is_string())
             return error("Missing required parameter: path");
         if (!g_sa_settings.sandbox.enabled)
@@ -432,6 +446,7 @@ namespace
 
     tool_result_t handle_convert_number(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_convert_number entry");
         if (!params.contains("value") || !params["value"].is_string())
             return error("Missing required parameter: value");
 
@@ -459,6 +474,7 @@ namespace
 
     tool_result_t handle_read_file(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_read_file entry");
         if (!params.contains("path") || !params["path"].is_string())
             return error("Missing required parameter: path");
         const fs::path path = params["path"].get<std::string>();
@@ -470,6 +486,7 @@ namespace
 
     tool_result_t handle_write_file(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_write_file entry");
         if (!params.contains("path") || !params["path"].is_string() ||
             !params.contains("content") || !params["content"].is_string())
             return error("Provide path and content.");
@@ -485,6 +502,7 @@ namespace
 
     tool_result_t handle_edit_file(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_edit_file entry");
         if (!params.contains("path") || !params["path"].is_string() ||
             !params.contains("find_text") || !params["find_text"].is_string() ||
             !params.contains("replace_text") || !params["replace_text"].is_string())
@@ -518,6 +536,7 @@ namespace
 
     tool_result_t handle_delete_file(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_delete_file entry");
         if (!params.contains("path") || !params["path"].is_string())
             return error("Missing required parameter: path");
         std::error_code ec;
@@ -529,6 +548,7 @@ namespace
 
     tool_result_t handle_create_directory(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_create_directory entry");
         if (!params.contains("path") || !params["path"].is_string())
             return error("Missing required parameter: path");
         std::error_code ec;
@@ -540,6 +560,7 @@ namespace
 
     tool_result_t handle_list_directory(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_list_directory entry");
         const fs::path root = params.contains("path") && params["path"].is_string()
             ? fs::path(params["path"].get<std::string>())
             : fs::current_path();
@@ -560,6 +581,7 @@ namespace
 
     tool_result_t handle_search_files(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_search_files entry");
         if (!params.contains("root") || !params["root"].is_string() ||
             !params.contains("pattern") || !params["pattern"].is_string())
             return error("Provide root and pattern.");
@@ -581,6 +603,7 @@ namespace
 
     tool_result_t handle_grep_in_files(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_grep_in_files entry");
         if (!params.contains("root") || !params["root"].is_string() ||
             !params.contains("pattern") || !params["pattern"].is_string())
             return error("Provide root and pattern.");
@@ -621,6 +644,7 @@ namespace
 
     tool_result_t handle_web_search(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_web_search entry");
         if (!params.contains("query") || !params["query"].is_string())
             return error("Provide a search query.");
 
@@ -1015,6 +1039,7 @@ namespace
 
     tool_result_t handle_webfetch(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_webfetch entry");
         if (!params.contains("url") || !params["url"].is_string())
             return error("Missing required parameter: url");
 
@@ -1141,6 +1166,7 @@ namespace
 
     tool_result_t handle_reconstruct_source(const json& params)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_reconstruct_source entry");
         if (source_reconstructor::is_running())
             return error("Source reconstruction is already running.");
 
@@ -1192,6 +1218,7 @@ namespace
 
     tool_result_t handle_reconstruct_status(const json&)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_reconstruct_status entry");
         json result;
         result["running"] = source_reconstructor::is_running();
         result["progress"] = source_reconstructor::get_progress();
@@ -1213,6 +1240,7 @@ namespace
 
     tool_result_t handle_reconstruct_cancel(const json&)
     {
+        diag::log_tagged_fmt("mcp_tools", "handle_reconstruct_cancel entry");
         if (!source_reconstructor::is_running())
             return error("No reconstruction is running.");
         source_reconstructor::cancel();
@@ -1224,7 +1252,7 @@ namespace mcp_standalone
 {
     void register_standalone_tools(server_t& srv)
     {
-
+        diag::log_tagged_fmt("mcp_tools", "register_standalone_tools entry");
 
         srv.register_tool({"driver_load", "Load and connect the kernel driver backend for deep runtime analysis.", {}, false, handle_driver_load});
         srv.register_tool({"driver_detach", "Detach from the current live process.", {}, false, handle_driver_detach});
@@ -1319,5 +1347,6 @@ namespace mcp_standalone
         srv.register_tool({"reconstruct_cancel",
             "Cancel a running source reconstruction.",
             {}, false, handle_reconstruct_cancel});
+        diag::log_tagged_fmt("mcp_tools", "register_standalone_tools done");
     }
 }

@@ -1,5 +1,7 @@
 #include "scanner_module.hpp"
 
+#include "../../../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -50,15 +52,28 @@ std::string base36(uint64_t v)
 
 bool register_module(module_t mod)
 {
-    if (mod.id.empty() || !mod.probes || (!mod.detect && !mod.custom_run)) return false;
+    diag::log_tagged_fmt("scanner", "register_module id=%s probes=%s detect=%s custom_run=%s",
+        mod.id.c_str(),
+        mod.probes ? "yes" : "no",
+        mod.detect ? "yes" : "no",
+        mod.custom_run ? "yes" : "no");
+    if (mod.id.empty() || !mod.probes || (!mod.detect && !mod.custom_run)) {
+        diag::log_tagged_fmt("scanner", "register_module rejected id=%s reason=%s",
+            mod.id.c_str(),
+            mod.id.empty() ? "empty_id" : (!mod.probes ? "no_probes" : "no_detect_and_no_custom_run"));
+        return false;
+    }
     auto& r = reg();
     std::lock_guard<std::mutex> lk(r.mtx);
     auto it = r.by_id.find(mod.id);
     if (it != r.by_id.end()) {
+        diag::log_tagged_fmt("scanner", "register_module replace id=%s idx=%zu", mod.id.c_str(), it->second);
         r.modules[it->second] = std::move(mod);
         return true;
     }
-    r.by_id[mod.id] = r.modules.size();
+    size_t new_idx = r.modules.size();
+    diag::log_tagged_fmt("scanner", "register_module new id=%s idx=%zu total=%zu", mod.id.c_str(), new_idx, new_idx + 1);
+    r.by_id[mod.id] = new_idx;
     r.modules.push_back(std::move(mod));
     return true;
 }
@@ -67,15 +82,21 @@ std::vector<module_t> all_modules()
 {
     auto& r = reg();
     std::lock_guard<std::mutex> lk(r.mtx);
+    diag::log_tagged_fmt("scanner", "all_modules returning %zu modules", r.modules.size());
     return r.modules;
 }
 
 const module_t* find(const std::string& id)
 {
+    diag::log_tagged_fmt("scanner", "find id=%s", id.c_str());
     auto& r = reg();
     std::lock_guard<std::mutex> lk(r.mtx);
     auto it = r.by_id.find(id);
-    if (it == r.by_id.end()) return nullptr;
+    if (it == r.by_id.end()) {
+        diag::log_tagged_fmt("scanner", "find id=%s not_found", id.c_str());
+        return nullptr;
+    }
+    diag::log_tagged_fmt("scanner", "find id=%s found idx=%zu", id.c_str(), it->second);
     return &r.modules[it->second];
 }
 
@@ -83,7 +104,9 @@ size_t count()
 {
     auto& r = reg();
     std::lock_guard<std::mutex> lk(r.mtx);
-    return r.modules.size();
+    size_t n = r.modules.size();
+    diag::log_tagged_fmt("scanner", "count=%zu", n);
+    return n;
 }
 
 std::string random_marker(const std::string& prefix)
@@ -96,7 +119,9 @@ std::string random_marker(const std::string& prefix)
     { std::lock_guard<std::mutex> lk(s_mtx); r = s_rng(); }
     std::ostringstream os;
     os << prefix << base36(now_ms()) << base36(c) << base36(r & 0xFFFFFFFFu);
-    return os.str();
+    std::string marker = os.str();
+    diag::log_tagged_fmt("scanner", "random_marker prefix=%s result=%s", prefix.c_str(), marker.c_str());
+    return marker;
 }
 
 bool body_contains(const exchange_observed_t& resp, const std::string& needle)
@@ -106,7 +131,10 @@ bool body_contains(const exchange_observed_t& resp, const std::string& needle)
     auto end = resp.resp_body.end();
     auto it = std::search(resp.resp_body.begin(), end,
                           needle.begin(), needle.end());
-    return it != end;
+    bool found = it != end;
+    diag::log_tagged_fmt("scanner", "body_contains needle_len=%zu body_len=%zu found=%d",
+        needle.size(), resp.resp_body.size(), found ? 1 : 0);
+    return found;
 }
 
 bool body_contains_ci(const exchange_observed_t& resp, const std::string& needle)
@@ -121,8 +149,12 @@ bool body_contains_ci(const exchange_observed_t& resp, const std::string& needle
             char rb = static_cast<char>(std::tolower(static_cast<unsigned char>(resp.resp_body[i + j])));
             if (rb != nl[j]) { match = false; break; }
         }
-        if (match) return true;
+        if (match) {
+            diag::log_tagged_fmt("scanner", "body_contains_ci needle=%s found at offset=%zu", needle.c_str(), i);
+            return true;
+        }
     }
+    diag::log_tagged_fmt("scanner", "body_contains_ci needle=%s not_found body_len=%zu", needle.c_str(), resp.resp_body.size());
     return false;
 }
 
@@ -133,6 +165,7 @@ double body_length_ratio(const exchange_observed_t& a, const exchange_observed_t
     if (la == 0 && lb == 0) return 1.0;
     if (la == 0 || lb == 0) return 0.0;
     double ratio = static_cast<double>(std::min(la, lb)) / static_cast<double>(std::max(la, lb));
+    diag::log_tagged_fmt("scanner", "body_length_ratio la=%zu lb=%zu ratio=%.4f", la, lb, ratio);
     return ratio;
 }
 
@@ -198,6 +231,12 @@ issue_t make_issue(const std::string& type_key,
                    const module_context_t& ctx,
                    const std::string& evidence_snippet)
 {
+    diag::log_tagged_fmt("scanner", "make_issue type=%s name=%s severity=%d confidence=%d ip_kind=%s ip_name=%s host=%s path=%s status=%d",
+        type_key.c_str(), name.c_str(),
+        static_cast<int>(severity), static_cast<int>(confidence),
+        ip.kind.c_str(), ip.name.c_str(),
+        resp.host.empty() ? ctx.host.c_str() : resp.host.c_str(),
+        resp.path.c_str(), resp.status_code);
     issue_t iss;
     iss.type_key = type_key;
     iss.name = name;

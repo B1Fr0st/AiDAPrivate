@@ -738,6 +738,7 @@ static const builtin_def_t kBuiltins[] = {
 
 std::string storage_dir()
 {
+    diag::log_tagged_fmt("payload", "storage_dir entry");
     PWSTR known = nullptr;
     std::string base;
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &known)) && known)
@@ -750,20 +751,29 @@ std::string storage_dir()
         }
         CoTaskMemFree(known);
     }
-    if (base.empty()) base = "C:\\Users\\Public";
+    if (base.empty()) {
+        diag::log_tagged_fmt("payload", "storage_dir appdata_fallback");
+        base = "C:\\Users\\Public";
+    }
     base += "\\AiDA\\Standalone\\burp\\payloads\\";
     std::error_code ec;
     std::filesystem::create_directories(base, ec);
+    diag::log_tagged_fmt("payload", "storage_dir result=%s", base.c_str());
     return base;
 }
 
 bool initialize()
 {
+    diag::log_tagged_fmt("payload", "initialize entry");
     auto& st = s();
     bool expected = false;
-    if (!st.initialized.compare_exchange_strong(expected, true)) return true;
+    if (!st.initialized.compare_exchange_strong(expected, true)) {
+        diag::log_tagged_fmt("payload", "initialize already_initialized");
+        return true;
+    }
 
     std::lock_guard<std::mutex> lk(st.mtx);
+    size_t builtin_count = 0;
     for (const auto& b : kBuiltins)
     {
         payload_set_t p;
@@ -772,13 +782,18 @@ bool initialize()
         p.description = b.description;
         p.builtin     = true;
         p.entries     = split_lines(b.blob);
+        diag::log_tagged_fmt("payload", "initialize builtin id=%s entries=%zu", b.id, p.entries.size());
         st.sets[p.id] = std::move(p);
+        ++builtin_count;
     }
+    diag::log_tagged_fmt("payload", "initialize builtins_loaded count=%zu", builtin_count);
 
     std::error_code ec;
     const std::string dir = storage_dir();
     if (std::filesystem::exists(dir, ec))
     {
+        diag::log_tagged_fmt("payload", "initialize scanning_custom_dir dir=%s", dir.c_str());
+        size_t custom_count = 0;
         for (auto it = std::filesystem::directory_iterator(dir, ec); !ec && it != std::filesystem::directory_iterator(); ++it)
         {
             if (!it->is_regular_file()) continue;
@@ -788,7 +803,10 @@ bool initialize()
             std::replace(id.begin(), id.end(), '_', '/');
 
             std::ifstream f(it->path(), std::ios::binary);
-            if (!f) continue;
+            if (!f) {
+                diag::log_tagged_fmt("payload", "initialize custom_open_failed file=%s", fname.c_str());
+                continue;
+            }
             std::ostringstream oss;
             oss << f.rdbuf();
             const std::string blob = oss.str();
@@ -809,44 +827,70 @@ bool initialize()
             p.entries     = std::move(lines);
 
             auto exist = st.sets.find(id);
-            if (exist == st.sets.end() || !exist->second.builtin)
+            if (exist == st.sets.end() || !exist->second.builtin) {
+                diag::log_tagged_fmt("payload", "initialize custom_loaded id=%s entries=%zu", id.c_str(), p.entries.size());
                 st.sets[id] = std::move(p);
+                ++custom_count;
+            }
         }
+        diag::log_tagged_fmt("payload", "initialize custom_sets_loaded count=%zu", custom_count);
+    }
+    else
+    {
+        diag::log_tagged_fmt("payload", "initialize custom_dir_not_found dir=%s", dir.c_str());
     }
     diag::log_tagged_fmt("burp.payloads", "initialize sets=%zu", st.sets.size());
+    diag::log_tagged_fmt("payload", "initialize done total_sets=%zu", st.sets.size());
     return true;
 }
 
 void shutdown()
 {
+    diag::log_tagged_fmt("payload", "shutdown entry");
     auto& st = s();
-    if (!st.initialized.exchange(false)) return;
-    std::lock_guard<std::mutex> lk(st.mtx);
-    st.sets.clear();
+    if (!st.initialized.exchange(false)) {
+        diag::log_tagged_fmt("payload", "shutdown not_initialized skip");
+        return;
+    }
+    size_t prev = 0;
+    {
+        std::lock_guard<std::mutex> lk(st.mtx);
+        prev = st.sets.size();
+        st.sets.clear();
+    }
+    diag::log_tagged_fmt("payload", "shutdown done cleared=%zu", prev);
 }
 
 const payload_set_t* get(const std::string& id)
 {
+    diag::log_tagged_fmt("payload", "get entry id=%s", id.c_str());
     auto& st = s();
     std::lock_guard<std::mutex> lk(st.mtx);
     auto it = st.sets.find(id);
-    if (it == st.sets.end()) return nullptr;
+    if (it == st.sets.end()) {
+        diag::log_tagged_fmt("payload", "get not_found id=%s", id.c_str());
+        return nullptr;
+    }
+    diag::log_tagged_fmt("payload", "get found id=%s entries=%zu builtin=%d", id.c_str(), it->second.entries.size(), it->second.builtin ? 1 : 0);
     return &it->second;
 }
 
 std::vector<std::string> list_ids()
 {
+    diag::log_tagged_fmt("payload", "list_ids entry");
     auto& st = s();
     std::vector<std::string> out;
     std::lock_guard<std::mutex> lk(st.mtx);
     out.reserve(st.sets.size());
     for (auto& kv : st.sets) out.push_back(kv.first);
     std::sort(out.begin(), out.end());
+    diag::log_tagged_fmt("payload", "list_ids result count=%zu", out.size());
     return out;
 }
 
 std::vector<payload_set_t> list_summaries()
 {
+    diag::log_tagged_fmt("payload", "list_summaries entry");
     auto& st = s();
     std::vector<payload_set_t> out;
     std::lock_guard<std::mutex> lk(st.mtx);
@@ -862,23 +906,37 @@ std::vector<payload_set_t> list_summaries()
         out.push_back(std::move(cp));
     }
     std::sort(out.begin(), out.end(), [](const payload_set_t& a, const payload_set_t& b) { return a.id < b.id; });
+    diag::log_tagged_fmt("payload", "list_summaries result count=%zu", out.size());
     return out;
 }
 
 std::vector<std::string> entries(const std::string& id, size_t max_count)
 {
+    diag::log_tagged_fmt("payload", "entries entry id=%s max_count=%zu", id.c_str(), max_count);
     auto& st = s();
     std::lock_guard<std::mutex> lk(st.mtx);
     auto it = st.sets.find(id);
-    if (it == st.sets.end()) return {};
-    if (max_count == 0 || max_count >= it->second.entries.size()) return it->second.entries;
+    if (it == st.sets.end()) {
+        diag::log_tagged_fmt("payload", "entries not_found id=%s", id.c_str());
+        return {};
+    }
+    size_t total = it->second.entries.size();
+    if (max_count == 0 || max_count >= total) {
+        diag::log_tagged_fmt("payload", "entries returning_all id=%s count=%zu", id.c_str(), total);
+        return it->second.entries;
+    }
+    diag::log_tagged_fmt("payload", "entries returning_slice id=%s count=%zu of %zu", id.c_str(), max_count, total);
     return std::vector<std::string>(it->second.entries.begin(), it->second.entries.begin() + max_count);
 }
 
 std::vector<std::string> search(const std::string& query, const std::string& set_id)
 {
+    diag::log_tagged_fmt("payload", "search entry query=%s set_id=%s", query.c_str(), set_id.c_str());
     std::vector<std::string> out;
-    if (query.empty()) return out;
+    if (query.empty()) {
+        diag::log_tagged_fmt("payload", "search empty_query");
+        return out;
+    }
     auto& st = s();
     std::string ql = query;
     std::transform(ql.begin(), ql.end(), ql.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
@@ -895,21 +953,29 @@ std::vector<std::string> search(const std::string& query, const std::string& set
     };
     if (set_id.empty())
     {
+        diag::log_tagged_fmt("payload", "search scanning_all_sets sets=%zu", st.sets.size());
         for (auto& kv : st.sets) check_set(kv.second);
     }
     else
     {
         auto it = st.sets.find(set_id);
-        if (it == st.sets.end()) return out;
+        if (it == st.sets.end()) {
+            diag::log_tagged_fmt("payload", "search set_not_found set_id=%s", set_id.c_str());
+            return out;
+        }
+        diag::log_tagged_fmt("payload", "search scanning_set set_id=%s", set_id.c_str());
         check_set(it->second);
     }
+    diag::log_tagged_fmt("payload", "search result count=%zu query=%s", out.size(), query.c_str());
     return out;
 }
 
 bool add_custom_set(const std::string& id, const std::string& label, const std::string& description, const std::vector<std::string>& entries_in)
 {
+    diag::log_tagged_fmt("payload", "add_custom_set entry id=%s label=%s entries=%zu", id.c_str(), label.c_str(), entries_in.size());
     if (id.empty())
     {
+        diag::log_tagged_fmt("payload", "add_custom_set empty_id");
         set_err("empty id");
         return false;
     }
@@ -919,6 +985,7 @@ bool add_custom_set(const std::string& id, const std::string& label, const std::
         auto it = st.sets.find(id);
         if (it != st.sets.end() && it->second.builtin)
         {
+            diag::log_tagged_fmt("payload", "add_custom_set override_builtin_denied id=%s", id.c_str());
             set_err("cannot override built-in id");
             return false;
         }
@@ -929,43 +996,55 @@ bool add_custom_set(const std::string& id, const std::string& label, const std::
         p.builtin     = false;
         p.entries     = entries_in;
         st.sets[id] = std::move(p);
+        diag::log_tagged_fmt("payload", "add_custom_set inserted id=%s total_sets=%zu", id.c_str(), st.sets.size());
     }
-    return export_to_file(storage_path_for(id), id);
+    bool saved = export_to_file(storage_path_for(id), id);
+    diag::log_tagged_fmt("payload", "add_custom_set saved=%d id=%s", saved ? 1 : 0, id.c_str());
+    return saved;
 }
 
 bool remove_custom_set(const std::string& id)
 {
+    diag::log_tagged_fmt("payload", "remove_custom_set entry id=%s", id.c_str());
     auto& st = s();
     {
         std::lock_guard<std::mutex> lk(st.mtx);
         auto it = st.sets.find(id);
         if (it == st.sets.end())
         {
+            diag::log_tagged_fmt("payload", "remove_custom_set not_found id=%s", id.c_str());
             set_err("not found");
             return false;
         }
         if (it->second.builtin)
         {
+            diag::log_tagged_fmt("payload", "remove_custom_set remove_builtin_denied id=%s", id.c_str());
             set_err("cannot remove built-in");
             return false;
         }
         st.sets.erase(it);
+        diag::log_tagged_fmt("payload", "remove_custom_set erased id=%s remaining=%zu", id.c_str(), st.sets.size());
     }
     std::error_code ec;
-    std::filesystem::remove(storage_path_for(id), ec);
+    std::string fpath = storage_path_for(id);
+    std::filesystem::remove(fpath, ec);
+    diag::log_tagged_fmt("payload", "remove_custom_set file_removed path=%s ec=%s", fpath.c_str(), ec.message().c_str());
     return true;
 }
 
 bool load_from_file(const std::string& path, const std::string& id)
 {
+    diag::log_tagged_fmt("payload", "load_from_file entry path=%s id=%s", path.c_str(), id.c_str());
     if (id.empty())
     {
+        diag::log_tagged_fmt("payload", "load_from_file empty_id");
         set_err("empty id");
         return false;
     }
     std::ifstream f(path, std::ios::binary);
     if (!f)
     {
+        diag::log_tagged_fmt("payload", "load_from_file open_failed path=%s", path.c_str());
         set_err("open failed");
         return false;
     }
@@ -976,11 +1055,15 @@ bool load_from_file(const std::string& path, const std::string& id)
         while (!ln.empty() && (ln.back() == '\r' || ln.back() == '\n')) ln.pop_back();
         if (!ln.empty()) lines.push_back(ln);
     }
-    return add_custom_set(id, id, "Loaded from " + path, lines);
+    diag::log_tagged_fmt("payload", "load_from_file parsed lines=%zu id=%s", lines.size(), id.c_str());
+    bool ok = add_custom_set(id, id, "Loaded from " + path, lines);
+    diag::log_tagged_fmt("payload", "load_from_file result=%d id=%s", ok ? 1 : 0, id.c_str());
+    return ok;
 }
 
 bool export_to_file(const std::string& path, const std::string& id)
 {
+    diag::log_tagged_fmt("payload", "export_to_file entry id=%s path=%s", id.c_str(), path.c_str());
     auto& st = s();
     std::vector<std::string> snapshot;
     {
@@ -988,17 +1071,20 @@ bool export_to_file(const std::string& path, const std::string& id)
         auto it = st.sets.find(id);
         if (it == st.sets.end())
         {
+            diag::log_tagged_fmt("payload", "export_to_file not_found id=%s", id.c_str());
             set_err("not found");
             return false;
         }
         snapshot = it->second.entries;
     }
+    diag::log_tagged_fmt("payload", "export_to_file snapshot_count=%zu id=%s", snapshot.size(), id.c_str());
     std::filesystem::path p(path);
     std::error_code ec;
     std::filesystem::create_directories(p.parent_path(), ec);
     std::ofstream f(p, std::ios::binary | std::ios::trunc);
     if (!f)
     {
+        diag::log_tagged_fmt("payload", "export_to_file open_failed path=%s", path.c_str());
         set_err("open for write failed");
         return false;
     }
@@ -1007,20 +1093,26 @@ bool export_to_file(const std::string& path, const std::string& id)
         f.write(e.data(), static_cast<std::streamsize>(e.size()));
         f.put('\n');
     }
+    diag::log_tagged_fmt("payload", "export_to_file ok id=%s entries=%zu path=%s", id.c_str(), snapshot.size(), path.c_str());
     return true;
 }
 
 bool set_exists(const std::string& id)
 {
+    diag::log_tagged_fmt("payload", "set_exists entry id=%s", id.c_str());
     auto& st = s();
     std::lock_guard<std::mutex> lk(st.mtx);
-    return st.sets.find(id) != st.sets.end();
+    bool found = st.sets.find(id) != st.sets.end();
+    diag::log_tagged_fmt("payload", "set_exists id=%s result=%d", id.c_str(), found ? 1 : 0);
+    return found;
 }
 
 std::string last_error()
 {
+    diag::log_tagged_fmt("payload", "last_error queried");
     auto& st = s();
     std::lock_guard<std::mutex> lk(st.err_mtx);
+    diag::log_tagged_fmt("payload", "last_error=%s", st.last_err.c_str());
     return st.last_err;
 }
 

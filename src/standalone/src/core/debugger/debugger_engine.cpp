@@ -225,12 +225,15 @@ void ensure_event_subscriptions() {
 
 void initialize() {
 	auto& st = g_state;
+	diag::log_tagged_fmt("dbg_engine", "initialize: entry");
 	st.status.store(dbg_status_t::idle);
 	ensure_event_subscriptions();
+	diag::log_tagged_fmt("dbg_engine", "initialize: done status=idle");
 }
 
 void shutdown() {
 	auto& st = g_state;
+	diag::log_tagged_fmt("dbg_engine", "shutdown: entry");
 	st.tracing.store(false);
 	st.worker_active.store(false);
 	{
@@ -241,6 +244,7 @@ void shutdown() {
 	while (!st.worker_thread_done.load(std::memory_order_acquire))
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	clear_all_breakpoints();
+	diag::log_tagged_fmt("dbg_engine", "shutdown: done");
 }
 
 
@@ -437,10 +441,13 @@ bool remove_breakpoint(int index) {
 
 bool toggle_breakpoint(int index) {
 	auto& st = g_state;
+	diag::log_tagged_fmt("dbg_engine", "toggle_breakpoint: index=%d", index);
 	sync_attached_state();
 	std::lock_guard<std::mutex> lk(st.bp_mutex);
-	if (index < 0 || index >= static_cast<int>(st.breakpoints.size()))
+	if (index < 0 || index >= static_cast<int>(st.breakpoints.size())) {
+		diag::log_tagged_fmt("dbg_engine", "toggle_breakpoint: index=%d out of range (size=%zu)", index, st.breakpoints.size());
 		return false;
+	}
 	auto& bp = st.breakpoints[static_cast<size_t>(index)];
 
 	bool will_enable = (bp.state == bp_state_t::disabled);
@@ -518,11 +525,13 @@ bool toggle_breakpoint(int index) {
 	}
 
 	bp.state = will_enable ? bp_state_t::enabled : bp_state_t::disabled;
+	diag::log_tagged_fmt("dbg_engine", "toggle_breakpoint: index=%d addr=0x%llX now=%s", index, (unsigned long long)bp.address, will_enable ? "enabled" : "disabled");
 	return true;
 }
 
 void clear_all_breakpoints() {
 	auto& st = g_state;
+	diag::log_tagged_fmt("dbg_engine", "clear_all_breakpoints: entry");
 	sync_attached_state();
 
 	std::vector<driver_bridge::thread_info_t> threads;
@@ -553,6 +562,7 @@ void clear_all_breakpoints() {
 		}
 	}
 	st.internal_breakpoints.clear();
+	diag::log_tagged_fmt("dbg_engine", "clear_all_breakpoints: done");
 }
 
 
@@ -1236,8 +1246,12 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 
 register_set_t get_registers() {
 	auto& st = g_state;
+	diag::log_tagged_fmt("dbg_engine", "get_registers: entry pid=%u tid=%u", st.target_pid, st.active_tid);
 	sync_attached_state();
-	if (st.target_pid == 0 || st.active_tid == 0) return {};
+	if (st.target_pid == 0 || st.active_tid == 0) {
+		diag::log_tagged_fmt("dbg_engine", "get_registers: not attached (pid=%u tid=%u)", st.target_pid, st.active_tid);
+		return {};
+	}
 
 	std::lock_guard<std::recursive_mutex> ctx_lk(thread_ctx_serializer());
 
@@ -1266,6 +1280,7 @@ register_set_t get_registers() {
 		driver_bridge::resume_thread(st.active_tid);
 
 	std::lock_guard<std::mutex> lk(st.reg_mutex);
+	diag::log_tagged_fmt("dbg_engine", "get_registers: result RIP=0x%llX RAX=0x%llX RSP=0x%llX tid=%u", (unsigned long long)st.registers.rip, (unsigned long long)st.registers.rax, (unsigned long long)st.registers.rsp, st.active_tid);
 	return st.registers;
 }
 
@@ -1349,10 +1364,14 @@ bool set_register(const std::string& name, uint64_t value) {
 
 std::vector<stack_frame_t> get_call_stack() {
 	auto& st = g_state;
+	diag::log_tagged_fmt("dbg_engine", "get_call_stack: entry pid=%u tid=%u", st.target_pid, st.active_tid);
 	std::vector<stack_frame_t> frames;
 
 	auto regs = get_registers();
-	if (regs.rip == 0 || regs.rsp == 0) return frames;
+	if (regs.rip == 0 || regs.rsp == 0) {
+		diag::log_tagged_fmt("dbg_engine", "get_call_stack: empty regs (RIP=0 or RSP=0), returning empty");
+		return frames;
+	}
 
 	auto modules = driver_bridge::enumerate_modules();
 
@@ -1404,12 +1423,14 @@ std::vector<stack_frame_t> get_call_stack() {
 		st.call_stack = frames;
 	}
 
+	diag::log_tagged_fmt("dbg_engine", "get_call_stack: result frames=%zu", frames.size());
 	return frames;
 }
 
 
 std::vector<memory_region_t> get_memory_map() {
 	auto& st = g_state;
+	diag::log_tagged_fmt("dbg_engine", "get_memory_map: entry pid=%u", st.target_pid);
 	auto regions = driver_bridge::enumerate_memory_regions(4096);
 	auto modules = driver_bridge::enumerate_modules();
 
@@ -1439,30 +1460,39 @@ std::vector<memory_region_t> get_memory_map() {
 		st.memory_map = map;
 	}
 
+	diag::log_tagged_fmt("dbg_engine", "get_memory_map: result regions=%zu", map.size());
 	return map;
 }
 
 
 int add_watch(const std::string& expression) {
 	auto& st = g_state;
+	diag::log_tagged_fmt("dbg_engine", "add_watch: expr='%s'", expression.c_str());
 	std::lock_guard<std::mutex> lk(st.watch_mutex);
 	watch_entry_t w;
 	w.expression = expression;
 	st.watches.push_back(std::move(w));
-	return static_cast<int>(st.watches.size()) - 1;
+	int idx = static_cast<int>(st.watches.size()) - 1;
+	diag::log_tagged_fmt("dbg_engine", "add_watch: added at index=%d", idx);
+	return idx;
 }
 
 bool remove_watch(int index) {
 	auto& st = g_state;
+	diag::log_tagged_fmt("dbg_engine", "remove_watch: index=%d", index);
 	std::lock_guard<std::mutex> lk(st.watch_mutex);
-	if (index < 0 || index >= static_cast<int>(st.watches.size()))
+	if (index < 0 || index >= static_cast<int>(st.watches.size())) {
+		diag::log_tagged_fmt("dbg_engine", "remove_watch: index=%d out of range (size=%zu)", index, st.watches.size());
 		return false;
+	}
 	st.watches.erase(st.watches.begin() + index);
+	diag::log_tagged_fmt("dbg_engine", "remove_watch: removed index=%d", index);
 	return true;
 }
 
 void refresh_watches() {
 	auto& st = g_state;
+	diag::log_tagged_fmt("dbg_engine", "refresh_watches: entry watch_count=%zu", st.watches.size());
 	auto regs = get_registers();
 	expression_eval::context_t ctx = build_eval_context(regs);
 	std::lock_guard<std::mutex> lk(st.watch_mutex);
@@ -1886,31 +1916,38 @@ std::string format_protect(uint32_t protect) {
 
 bool set_breakpoint_condition(int index, const std::string& condition) {
 	auto& st = g_state;
+	diag::log_tagged_fmt("dbg_engine", "set_breakpoint_condition: index=%d condition='%s'", index, condition.c_str());
 	std::lock_guard<std::mutex> lk(st.bp_mutex);
 	if (index < 0 || index >= static_cast<int>(st.breakpoints.size())) {
+		diag::log_tagged_fmt("dbg_engine", "set_breakpoint_condition: index=%d out of range (size=%zu)", index, st.breakpoints.size());
 		set_last_error("set_breakpoint_condition: index out of range");
 		return false;
 	}
 	st.breakpoints[static_cast<size_t>(index)].condition = condition;
+	diag::log_tagged_fmt("dbg_engine", "set_breakpoint_condition: index=%d condition set ok", index);
 	return true;
 }
 
 bool set_breakpoint_log(int index, const std::string& log_text, bool auto_continue) {
 	auto& st = g_state;
+	diag::log_tagged_fmt("dbg_engine", "set_breakpoint_log: index=%d log_text='%s' auto_continue=%d", index, log_text.c_str(), auto_continue ? 1 : 0);
 	std::lock_guard<std::mutex> lk(st.bp_mutex);
 	if (index < 0 || index >= static_cast<int>(st.breakpoints.size())) {
+		diag::log_tagged_fmt("dbg_engine", "set_breakpoint_log: index=%d out of range (size=%zu)", index, st.breakpoints.size());
 		set_last_error("set_breakpoint_log: index out of range");
 		return false;
 	}
 	auto& bp = st.breakpoints[static_cast<size_t>(index)];
 	bp.log_text = log_text;
 	bp.auto_continue = auto_continue;
+	diag::log_tagged_fmt("dbg_engine", "set_breakpoint_log: index=%d addr=0x%llX log set ok", index, (unsigned long long)bp.address);
 	return true;
 }
 
 bp_hit_action_t handle_breakpoint_hit(uint64_t address) {
 	auto& st = g_state;
 
+	diag::log_tagged_fmt("dbg_engine", "handle_breakpoint_hit: addr=0x%llX active_tid=%u", (unsigned long long)address, st.active_tid);
 	signal_trap(address);
 
 	std::string condition;

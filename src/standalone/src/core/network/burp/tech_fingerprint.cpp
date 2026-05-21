@@ -140,13 +140,23 @@ std::string header_get(const std::vector<std::pair<std::string, std::string>>& h
 
 void handle_exchange(const exchange_observed_t& e)
 {
-    if (!initialized_flag().load()) return;
+    if (!initialized_flag().load()) {
+        diag::log_tagged_fmt("tech_fp", "handle_exchange skipped not_initialized");
+        return;
+    }
+    diag::log_tagged_fmt("tech_fp", "handle_exchange entry host=%s path=%s exchange_id=%llu",
+        e.host.c_str(), e.path.c_str(), static_cast<unsigned long long>(e.id));
     std::string url = e.scheme.empty() ? std::string("http") : e.scheme;
     url += "://";
     url += e.host;
     url += e.path;
     auto detected = fingerprint(e.resp_headers, e.resp_body, url);
-    if (detected.empty()) return;
+    if (detected.empty()) {
+        diag::log_tagged_fmt("tech_fp", "handle_exchange no_techs_detected host=%s", e.host.c_str());
+        return;
+    }
+    diag::log_tagged_fmt("tech_fp", "handle_exchange detected count=%zu host=%s",
+        detected.size(), e.host.c_str());
 
     auto& s = inv();
     std::vector<tech_t> new_to_emit;
@@ -161,12 +171,21 @@ void handle_exchange(const exchange_observed_t& e)
                 if (!s.issued_pairs.count(key_pair)) {
                     s.issued_pairs.insert(key_pair);
                     new_to_emit.push_back(t);
+                    diag::log_tagged_fmt("tech_fp", "handle_exchange new_tech name=%s version=%s category=%s",
+                        t.name.c_str(), t.version.c_str(), t.category.c_str());
+                } else {
+                    diag::log_tagged_fmt("tech_fp", "handle_exchange tech_already_issued name=%s", t.name.c_str());
                 }
+            } else {
+                diag::log_tagged_fmt("tech_fp", "handle_exchange tech_already_known name=%s", t.name.c_str());
             }
         }
     }
 
+    diag::log_tagged_fmt("tech_fp", "handle_exchange emitting_issues count=%zu", new_to_emit.size());
     for (const auto& t : new_to_emit) {
+        diag::log_tagged_fmt("tech_fp", "handle_exchange adding_issue name=%s version=%s host=%s",
+            t.name.c_str(), t.version.c_str(), e.host.c_str());
         issue_t iss;
         iss.type_key = "tech_fingerprint";
         iss.name = std::string("Technology detected: ") + t.name + (t.version.empty() ? std::string() : (" " + t.version));
@@ -184,6 +203,7 @@ void handle_exchange(const exchange_observed_t& e)
         iss.remediation = "Confirm that the disclosed version is up to date and that exposing the technology stack is acceptable for this surface.";
         issue_store::add(std::move(iss));
     }
+    diag::log_tagged_fmt("tech_fp", "handle_exchange done host=%s new_issues=%zu", e.host.c_str(), new_to_emit.size());
 }
 
 bool regex_search_safe(const std::string& src, const std::string& pattern, std::smatch& m, bool case_insensitive)
@@ -216,35 +236,50 @@ bool regex_search_safe(const std::string& src, const std::string& pattern, bool 
 
 bool initialize()
 {
+    diag::log_tagged_fmt("tech_fp", "initialize entry");
     bool expected = false;
-    if (!initialized_flag().compare_exchange_strong(expected, true)) return true;
+    if (!initialized_flag().compare_exchange_strong(expected, true)) {
+        diag::log_tagged_fmt("tech_fp", "initialize already_initialized");
+        return true;
+    }
     subscription_handle() = aida::events::subscribe(kExchangeObservedEvent, [](const exchange_observed_t& e) {
         handle_exchange(e);
     });
     diag::log_tagged("burp_tech", "initialized");
+    diag::log_tagged_fmt("tech_fp", "initialize done rules=%zu", static_cast<size_t>(sizeof(kRules) / sizeof(kRules[0])));
     return true;
 }
 
 void shutdown()
 {
-    if (!initialized_flag().exchange(false)) return;
+    diag::log_tagged_fmt("tech_fp", "shutdown entry");
+    if (!initialized_flag().exchange(false)) {
+        diag::log_tagged_fmt("tech_fp", "shutdown not_initialized skipping");
+        return;
+    }
     aida::events::unsubscribe(subscription_handle());
     subscription_handle() = aida::events::subscription_handle_t{};
     std::lock_guard<std::mutex> lk(inv().mtx);
+    size_t hosts = inv().by_host.size();
+    size_t pairs = inv().issued_pairs.size();
     inv().by_host.clear();
     inv().issued_pairs.clear();
+    diag::log_tagged_fmt("tech_fp", "shutdown done cleared hosts=%zu issued_pairs=%zu", hosts, pairs);
 }
 
 std::vector<tech_t> fingerprint(const std::vector<std::pair<std::string, std::string>>& response_headers,
                                 const std::vector<uint8_t>& response_body,
                                 const std::string& url)
 {
+    diag::log_tagged_fmt("tech_fp", "fingerprint entry url=%s headers=%zu body_bytes=%zu",
+        url.c_str(), response_headers.size(), response_body.size());
     (void)url;
     std::vector<tech_t> out;
     std::string body_view;
     if (!response_body.empty()) {
         size_t n = std::min<size_t>(response_body.size(), 1024 * 1024);
         body_view.assign(reinterpret_cast<const char*>(response_body.data()), n);
+        diag::log_tagged_fmt("tech_fp", "fingerprint body_view_size=%zu (capped from %zu)", n, response_body.size());
     }
 
     for (const auto& r : kRules) {
@@ -257,10 +292,14 @@ std::vector<tech_t> fingerprint(const std::vector<std::pair<std::string, std::st
                 std::smatch m;
                 if (regex_search_safe(hv, r.header_regex, m, true)) {
                     header_hit = true;
+                    diag::log_tagged_fmt("tech_fp", "fingerprint header_hit rule=%s header=%s val=%s",
+                        r.name, r.header_name, hv.c_str());
                     if (r.version_source && std::string(r.version_source) == "header" && r.version_regex) {
                         std::smatch vm;
                         if (regex_search_safe(hv, r.version_regex, vm, true) && vm.size() > 1) {
                             version = vm[1].str();
+                            diag::log_tagged_fmt("tech_fp", "fingerprint version_extracted rule=%s ver=%s",
+                                r.name, version.c_str());
                         }
                     }
                 }
@@ -270,10 +309,13 @@ std::vector<tech_t> fingerprint(const std::vector<std::pair<std::string, std::st
             std::smatch m;
             if (regex_search_safe(body_view, r.body_regex, m, true)) {
                 body_hit = true;
+                diag::log_tagged_fmt("tech_fp", "fingerprint body_hit rule=%s", r.name);
                 if (r.version_source && std::string(r.version_source) == "body" && r.version_regex) {
                     std::smatch vm;
                     if (regex_search_safe(body_view, r.version_regex, vm, true) && vm.size() > 1) {
                         version = vm[1].str();
+                        diag::log_tagged_fmt("tech_fp", "fingerprint version_extracted_body rule=%s ver=%s",
+                            r.name, version.c_str());
                     }
                 }
             }
@@ -292,15 +334,20 @@ std::vector<tech_t> fingerprint(const std::vector<std::pair<std::string, std::st
     std::vector<tech_t> deduped;
     for (auto& t : out) {
         std::string key = t.name + "|" + t.category;
-        if (seen_per_cat.count(key)) continue;
+        if (seen_per_cat.count(key)) {
+            diag::log_tagged_fmt("tech_fp", "fingerprint dedup_skip name=%s", t.name.c_str());
+            continue;
+        }
         seen_per_cat[key] = 1;
         deduped.push_back(std::move(t));
     }
+    diag::log_tagged_fmt("tech_fp", "fingerprint done raw=%zu deduped=%zu", out.size(), deduped.size());
     return deduped;
 }
 
 std::vector<host_inventory_t> inventory()
 {
+    diag::log_tagged_fmt("tech_fp", "inventory entry");
     auto& s = inv();
     std::vector<host_inventory_t> out;
     std::lock_guard<std::mutex> lk(s.mtx);
@@ -311,21 +358,28 @@ std::vector<host_inventory_t> inventory()
         for (const auto& kv : p.second) h.technologies.push_back(kv.second);
         out.push_back(std::move(h));
     }
+    diag::log_tagged_fmt("tech_fp", "inventory result hosts=%zu", out.size());
     return out;
 }
 
 void clear_inventory()
 {
+    diag::log_tagged_fmt("tech_fp", "clear_inventory entry");
     auto& s = inv();
     std::lock_guard<std::mutex> lk(s.mtx);
+    size_t hosts = s.by_host.size();
+    size_t pairs = s.issued_pairs.size();
     s.by_host.clear();
     s.issued_pairs.clear();
+    diag::log_tagged_fmt("tech_fp", "clear_inventory done cleared hosts=%zu pairs=%zu", hosts, pairs);
 }
 
 std::string last_error()
 {
     std::lock_guard<std::mutex> lk(err_mtx());
-    return err_slot();
+    std::string e = err_slot();
+    diag::log_tagged_fmt("tech_fp", "last_error queried val=%s", e.c_str());
+    return e;
 }
 
 }

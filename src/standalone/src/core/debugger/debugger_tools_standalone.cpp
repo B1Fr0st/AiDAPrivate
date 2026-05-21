@@ -17,6 +17,7 @@
 #include "pe_parser.hpp"
 #include "code_patcher.hpp"
 #include "stealth_engine.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -49,8 +50,11 @@ static bool is_process_alive(std::uint32_t pid)
 
 static std::optional<tool_result_t> ensure_attached(const json& params)
 {
-    if (!device->is_connected())
+    diag::log_tagged_fmt("dbg_tools", "ensure_attached: entry");
+    if (!device->is_connected()) {
+        diag::log_tagged_fmt("dbg_tools", "ensure_attached: driver not connected");
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+    }
 
     std::uint32_t requested_pid = 0;
     for (const char* key : {"target_pid", "process_id", "pid"})
@@ -74,43 +78,56 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
     const std::uint32_t current_pid = driver_bridge::attached_pid();
     if (requested_pid != 0 && requested_pid != current_pid)
     {
-        if (!is_process_alive(requested_pid))
+        diag::log_tagged_fmt("dbg_tools", "ensure_attached: switching active pid from %u to %u", current_pid, requested_pid);
+        if (!is_process_alive(requested_pid)) {
+            diag::log_tagged_fmt("dbg_tools", "ensure_attached: target_pid %u not alive", requested_pid);
             return tool_result_t::error(OBFSTR("target_pid ") + std::to_string(requested_pid) + OBFSTR(" is not alive."));
+        }
 
         const auto attached = driver_bridge::attached_pids();
         bool in_map = false;
         for (auto p : attached) { if (p == requested_pid) { in_map = true; break; } }
         if (!in_map)
         {
+            diag::log_tagged_fmt("dbg_tools", "ensure_attached: calling attach_additional for pid %u", requested_pid);
             if (!driver_bridge::attach_additional(requested_pid))
             {
+                diag::log_tagged_fmt("dbg_tools", "ensure_attached: attach_additional failed for pid %u", requested_pid);
                 return tool_result_t::error(
                     OBFSTR("attach_additional failed for target_pid ") + std::to_string(requested_pid) +
                     OBFSTR(": ") + driver_bridge::last_error());
             }
         }
 
-        if (!driver_bridge::set_active_pid(requested_pid))
+        if (!driver_bridge::set_active_pid(requested_pid)) {
+            diag::log_tagged_fmt("dbg_tools", "ensure_attached: set_active_pid failed for pid %u", requested_pid);
             return tool_result_t::error(
                 OBFSTR("set_active_pid failed for target_pid ") + std::to_string(requested_pid) +
                 OBFSTR(": ") + driver_bridge::last_error());
+        }
 
         if (device->get_dtb() == 0)
         {
             device->solve_dtb();
-            if (device->get_dtb() == 0)
+            if (device->get_dtb() == 0) {
+                diag::log_tagged_fmt("dbg_tools", "ensure_attached: DTB solve failed for pid %u", requested_pid);
                 return tool_result_t::error(
                     OBFSTR("Failed to solve DTB for target_pid ") +
                     std::to_string(requested_pid) + OBFSTR("."));
+            }
         }
+        diag::log_tagged_fmt("dbg_tools", "ensure_attached: switched to pid %u ok", requested_pid);
     }
 
-    if (driver_bridge::attached_pid() == 0)
+    if (driver_bridge::attached_pid() == 0) {
+        diag::log_tagged_fmt("dbg_tools", "ensure_attached: not attached");
         return tool_result_t::error(OBFSTR("Not attached. Call driver_attach first or pass target_pid."));
+    }
 
     if (!is_process_alive(driver_bridge::attached_pid()))
     {
         const std::uint32_t dead_pid = driver_bridge::attached_pid();
+        diag::log_tagged_fmt("dbg_tools", "ensure_attached: attached pid %u is dead", dead_pid);
         device->clear_process_context();
         return tool_result_t::error(
             OBFSTR("Attached process PID ") + std::to_string(dead_pid) +
@@ -120,16 +137,21 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
     if (device->get_dtb() == 0)
     {
         device->solve_dtb();
-        if (device->get_dtb() == 0)
+        if (device->get_dtb() == 0) {
+            diag::log_tagged_fmt("dbg_tools", "ensure_attached: DTB solve failed for attached pid");
             return tool_result_t::error(OBFSTR("Failed to solve DTB for the attached process."));
+        }
     }
+    diag::log_tagged_fmt("dbg_tools", "ensure_attached: ok pid=%u", driver_bridge::attached_pid());
     return std::nullopt;
 }
 
 static std::optional<std::uint32_t> parse_tid(const json& params)
 {
-    if (!params.contains("tid"))
+    if (!params.contains("tid")) {
+        diag::log_tagged_fmt("dbg_tools", "parse_tid: no tid param");
         return std::nullopt;
+    }
     const auto& v = params["tid"];
     std::uint32_t tid = 0;
     if (v.is_number_unsigned())
@@ -141,26 +163,37 @@ static std::optional<std::uint32_t> parse_tid(const json& params)
         auto addr = sa_parse_address(v.get<std::string>());
         if (addr) tid = static_cast<std::uint32_t>(*addr);
     }
+    if (tid != 0)
+        diag::log_tagged_fmt("dbg_tools", "parse_tid: resolved tid=%u", tid);
+    else
+        diag::log_tagged_fmt("dbg_tools", "parse_tid: failed to parse tid");
     return (tid != 0) ? std::optional<std::uint32_t>{tid} : std::nullopt;
 }
 
 
 static tool_result_t dbg_set_breakpoint(const json& params)
 {
+    diag::log_tagged_fmt("dbg_tools", "dbg_set_breakpoint: entry");
     if (auto err = ensure_attached(params))
         return *err;
 
-    if (!params.contains("address") || !params["address"].is_string())
+    if (!params.contains("address") || !params["address"].is_string()) {
+        diag::log_tagged_fmt("dbg_tools", "dbg_set_breakpoint: missing address param");
         return tool_result_t::error(OBFSTR("'address' (hex string) is required."));
+    }
 
     auto addr_opt = sa_parse_address(params["address"].get<std::string>());
-    if (!addr_opt || *addr_opt == 0)
+    if (!addr_opt || *addr_opt == 0) {
+        diag::log_tagged_fmt("dbg_tools", "dbg_set_breakpoint: invalid address");
         return tool_result_t::error(OBFSTR("Invalid address."));
+    }
     const std::uint64_t addr = *addr_opt;
 
+    diag::log_tagged_fmt("dbg_tools", "dbg_set_breakpoint: adding SW BP at 0x%llX", (unsigned long long)addr);
     int idx = debugger_engine::add_breakpoint(addr, debugger_engine::bp_type_t::software);
     if (idx < 0) {
         const auto& err_msg = debugger_engine::last_error();
+        diag::log_tagged_fmt("dbg_tools", "dbg_set_breakpoint: add_breakpoint failed at 0x%llX: %s", (unsigned long long)addr, err_msg.c_str());
         std::string detail = err_msg.empty() ? std::string() : (OBFSTR(": ") + err_msg);
         return tool_result_t::error(
             OBFSTR("Failed to add breakpoint at ") + sa_format_address(addr) + detail);
@@ -173,6 +206,7 @@ static tool_result_t dbg_set_breakpoint(const json& params)
             original = debugger_engine::g_state.breakpoints[idx].original_byte;
     }
 
+    diag::log_tagged_fmt("dbg_tools", "dbg_set_breakpoint: SW BP set at 0x%llX idx=%d original_byte=0x%02X", (unsigned long long)addr, idx, original);
     json result;
     result["address"]       = sa_format_address(addr);
     result["original_byte"] = sa_format_address(static_cast<uint64_t>(original));
@@ -183,15 +217,20 @@ static tool_result_t dbg_set_breakpoint(const json& params)
 
 static tool_result_t dbg_remove_breakpoint(const json& params)
 {
+    diag::log_tagged_fmt("dbg_tools", "dbg_remove_breakpoint: entry");
     if (auto err = ensure_attached(params))
         return *err;
 
-    if (!params.contains("address") || !params["address"].is_string())
+    if (!params.contains("address") || !params["address"].is_string()) {
+        diag::log_tagged_fmt("dbg_tools", "dbg_remove_breakpoint: missing address param");
         return tool_result_t::error(OBFSTR("'address' (hex string) is required."));
+    }
 
     auto addr_opt = sa_parse_address(params["address"].get<std::string>());
-    if (!addr_opt || *addr_opt == 0)
+    if (!addr_opt || *addr_opt == 0) {
+        diag::log_tagged_fmt("dbg_tools", "dbg_remove_breakpoint: invalid address");
         return tool_result_t::error(OBFSTR("Invalid address."));
+    }
     const std::uint64_t addr = *addr_opt;
 
     int target_idx = -1;
@@ -208,17 +247,22 @@ static tool_result_t dbg_remove_breakpoint(const json& params)
         }
     }
 
-    if (target_idx < 0)
+    if (target_idx < 0) {
+        diag::log_tagged_fmt("dbg_tools", "dbg_remove_breakpoint: no BP at 0x%llX", (unsigned long long)addr);
         return tool_result_t::error(
             OBFSTR("No active breakpoint found at ") + sa_format_address(addr));
+    }
 
+    diag::log_tagged_fmt("dbg_tools", "dbg_remove_breakpoint: removing BP at 0x%llX idx=%d", (unsigned long long)addr, target_idx);
     if (!debugger_engine::remove_breakpoint(target_idx)) {
         const auto& err_msg = debugger_engine::last_error();
+        diag::log_tagged_fmt("dbg_tools", "dbg_remove_breakpoint: remove_breakpoint failed: %s", err_msg.c_str());
         std::string detail = err_msg.empty() ? std::string() : (OBFSTR(": ") + err_msg);
         return tool_result_t::error(
             OBFSTR("Failed to remove breakpoint at ") + sa_format_address(addr) + detail);
     }
 
+    diag::log_tagged_fmt("dbg_tools", "dbg_remove_breakpoint: BP removed at 0x%llX restored_byte=0x%02X", (unsigned long long)addr, original);
     json result;
     result["address"]       = sa_format_address(addr);
     result["restored_byte"] = sa_format_address(static_cast<uint64_t>(original));
@@ -228,6 +272,7 @@ static tool_result_t dbg_remove_breakpoint(const json& params)
 
 static tool_result_t dbg_list_breakpoints(const json& params)
 {
+    diag::log_tagged_fmt("dbg_tools", "dbg_list_breakpoints: entry");
     (void)params;
 
     std::lock_guard<std::mutex> lk(debugger_engine::g_state.bp_mutex);
@@ -252,6 +297,7 @@ static tool_result_t dbg_list_breakpoints(const json& params)
         ++active_count;
     }
 
+    diag::log_tagged_fmt("dbg_tools", "dbg_list_breakpoints: found %d active breakpoints", active_count);
     json result;
     result["active_count"] = active_count;
     result["breakpoints"]  = arr;
@@ -262,30 +308,37 @@ static tool_result_t dbg_list_breakpoints(const json& params)
 
 static tool_result_t dbg_get_callstack(const json& params)
 {
+    diag::log_tagged_fmt("dbg_tools", "dbg_get_callstack: entry");
     if (auto err = ensure_attached(params))
         return *err;
 
     auto tid_opt = parse_tid(params);
-    if (!tid_opt)
+    if (!tid_opt) {
+        diag::log_tagged_fmt("dbg_tools", "dbg_get_callstack: missing tid param");
         return tool_result_t::error(
             OBFSTR("'tid' (thread ID) is required."));
+    }
     const std::uint32_t tid = *tid_opt;
 
     int max_depth = 64;
     if (params.contains("max_depth") && params["max_depth"].is_number())
         max_depth = std::clamp(params["max_depth"].get<int>(), 1, 256);
 
+    diag::log_tagged_fmt("dbg_tools", "dbg_get_callstack: tid=%u max_depth=%d", tid, max_depth);
 
     std::uint32_t prev_count = 0;
     const bool did_suspend = device->suspend_thread(tid, &prev_count);
+    diag::log_tagged_fmt("dbg_tools", "dbg_get_callstack: suspend_thread did_suspend=%d", (int)did_suspend);
 
     voyager::device_t::thread_context ctx{};
     if (!device->get_thread_context(tid, ctx))
     {
+        diag::log_tagged_fmt("dbg_tools", "dbg_get_callstack: get_thread_context failed for tid=%u", tid);
         if (did_suspend) device->resume_thread(tid);
         return tool_result_t::error(
             OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
     }
+    diag::log_tagged_fmt("dbg_tools", "dbg_get_callstack: thread context RIP=0x%llX RSP=0x%llX RBP=0x%llX", (unsigned long long)ctx.rip, (unsigned long long)ctx.rsp, (unsigned long long)ctx.rbp);
 
     json frames = json::array();
 
@@ -410,6 +463,7 @@ static tool_result_t dbg_get_callstack(const json& params)
     if (did_suspend)
         device->resume_thread(tid);
 
+    diag::log_tagged_fmt("dbg_tools", "dbg_get_callstack: tid=%u method=%s frames=%zu", tid, rbp_looks_valid ? "rbp_chain" : "stack_scan", frames.size());
     json result;
     result["tid"]         = tid;
     result["frame_count"] = static_cast<int>(frames.size());
@@ -442,19 +496,25 @@ static std::map<std::string, execution_snapshot>    s_snapshots;
 
 static tool_result_t dbg_snapshot_state(const json& params)
 {
+    diag::log_tagged_fmt("dbg_tools", "dbg_snapshot_state: entry");
     if (auto err = ensure_attached(params))
         return *err;
 
     auto tid_opt = parse_tid(params);
-    if (!tid_opt)
+    if (!tid_opt) {
+        diag::log_tagged_fmt("dbg_tools", "dbg_snapshot_state: missing tid param");
         return tool_result_t::error(OBFSTR("'tid' (thread ID) is required."));
+    }
     const std::uint32_t tid = *tid_opt;
 
     std::string snap_name = "default";
     if (params.contains("name") && params["name"].is_string())
         snap_name = params["name"].get<std::string>();
-    if (snap_name.empty())
+    if (snap_name.empty()) {
+        diag::log_tagged_fmt("dbg_tools", "dbg_snapshot_state: empty snapshot name");
         return tool_result_t::error(OBFSTR("Snapshot name cannot be empty."));
+    }
+    diag::log_tagged_fmt("dbg_tools", "dbg_snapshot_state: capturing snapshot '%s' tid=%u", snap_name.c_str(), tid);
 
 
     std::uint32_t prev_count = 0;
@@ -516,28 +576,39 @@ static tool_result_t dbg_snapshot_state(const json& params)
         s_snapshots[snap_name] = std::move(snap);
     }
 
+    diag::log_tagged_fmt("dbg_tools", "dbg_snapshot_state: snapshot '%s' captured tid=%u RIP=0x%llX memory_regions=%zu", snap_name.c_str(), tid, (unsigned long long)ctx.rip, snap.memory.size());
     return tool_result_t::ok(
         OBFSTR("Snapshot '") + snap_name + OBFSTR("' captured"), result);
 }
 
 static tool_result_t dbg_compare_snapshots(const json& params)
 {
-    if (!params.contains("snapshot_a") || !params["snapshot_a"].is_string())
+    diag::log_tagged_fmt("dbg_tools", "dbg_compare_snapshots: entry");
+    if (!params.contains("snapshot_a") || !params["snapshot_a"].is_string()) {
+        diag::log_tagged_fmt("dbg_tools", "dbg_compare_snapshots: missing snapshot_a");
         return tool_result_t::error(OBFSTR("'snapshot_a' name is required."));
-    if (!params.contains("snapshot_b") || !params["snapshot_b"].is_string())
+    }
+    if (!params.contains("snapshot_b") || !params["snapshot_b"].is_string()) {
+        diag::log_tagged_fmt("dbg_tools", "dbg_compare_snapshots: missing snapshot_b");
         return tool_result_t::error(OBFSTR("'snapshot_b' name is required."));
+    }
 
     const std::string name_a = params["snapshot_a"].get<std::string>();
     const std::string name_b = params["snapshot_b"].get<std::string>();
+    diag::log_tagged_fmt("dbg_tools", "dbg_compare_snapshots: comparing '%s' vs '%s'", name_a.c_str(), name_b.c_str());
 
     std::lock_guard<std::mutex> lock(s_snap_mutex);
 
     auto it_a = s_snapshots.find(name_a);
     auto it_b = s_snapshots.find(name_b);
-    if (it_a == s_snapshots.end())
+    if (it_a == s_snapshots.end()) {
+        diag::log_tagged_fmt("dbg_tools", "dbg_compare_snapshots: snapshot '%s' not found", name_a.c_str());
         return tool_result_t::error(OBFSTR("Snapshot '") + name_a + OBFSTR("' not found."));
-    if (it_b == s_snapshots.end())
+    }
+    if (it_b == s_snapshots.end()) {
+        diag::log_tagged_fmt("dbg_tools", "dbg_compare_snapshots: snapshot '%s' not found", name_b.c_str());
         return tool_result_t::error(OBFSTR("Snapshot '") + name_b + OBFSTR("' not found."));
+    }
 
     const auto& a = it_a->second;
     const auto& b = it_b->second;
@@ -641,6 +712,7 @@ static tool_result_t dbg_compare_snapshots(const json& params)
     result["memory_changes"]   = static_cast<int>(mem_diffs.size());
     result["memory_diffs"]     = mem_diffs;
 
+    diag::log_tagged_fmt("dbg_tools", "dbg_compare_snapshots: '%s' vs '%s' => %zu reg diffs, %zu mem diffs, elapsed_ms=%lld", name_a.c_str(), name_b.c_str(), reg_diffs.size(), mem_diffs.size(), (long long)elapsed_ms);
     return tool_result_t::ok(
         OBFSTR("Diff: ") + std::to_string(reg_diffs.size()) +
         OBFSTR(" register(s), ") + std::to_string(mem_diffs.size()) +
@@ -651,27 +723,36 @@ static tool_result_t dbg_compare_snapshots(const json& params)
 
 static tool_result_t dbg_detect_vm_handler(const json& params)
 {
+    diag::log_tagged_fmt("dbg_tools", "dbg_detect_vm_handler: entry");
     if (auto err = ensure_attached(params))
         return *err;
 
-    if (!params.contains("address") || !params["address"].is_string())
+    if (!params.contains("address") || !params["address"].is_string()) {
+        diag::log_tagged_fmt("dbg_tools", "dbg_detect_vm_handler: missing address param");
         return tool_result_t::error(OBFSTR("'address' (hex string) is required."));
+    }
 
     auto addr_opt = sa_parse_address(params["address"].get<std::string>());
-    if (!addr_opt || *addr_opt == 0)
+    if (!addr_opt || *addr_opt == 0) {
+        diag::log_tagged_fmt("dbg_tools", "dbg_detect_vm_handler: invalid address");
         return tool_result_t::error(OBFSTR("Invalid address."));
+    }
     const std::uint64_t addr = *addr_opt;
 
     int scan_size = 512;
     if (params.contains("size") && params["size"].is_number())
         scan_size = std::clamp(params["size"].get<int>(), 64, 16384);
+    diag::log_tagged_fmt("dbg_tools", "dbg_detect_vm_handler: analyzing 0x%llX size=%d", (unsigned long long)addr, scan_size);
 
 
     std::vector<uint8_t> code(static_cast<std::size_t>(scan_size));
     std::size_t read = device->read_raw(addr, code.data(), code.size());
-    if (read < 16)
+    if (read < 16) {
+        diag::log_tagged_fmt("dbg_tools", "dbg_detect_vm_handler: only %zu bytes read at 0x%llX", read, (unsigned long long)addr);
         return tool_result_t::error(
             OBFSTR("Insufficient bytes read at ") + sa_format_address(addr));
+    }
+    diag::log_tagged_fmt("dbg_tools", "dbg_detect_vm_handler: read %zu bytes", read);
     code.resize(read);
 
     zydis_detail::ensure_init();
@@ -811,6 +892,7 @@ static tool_result_t dbg_detect_vm_handler(const json& params)
     if (likely_dispatch_addr != 0)
         result["likely_dispatch"] = sa_format_address(likely_dispatch_addr);
 
+    diag::log_tagged_fmt("dbg_tools", "dbg_detect_vm_handler: addr=0x%llX score=%d verdict=%s indirect_jmps=%d scaled_jmps=%d", (unsigned long long)addr, (int)score, verdict.c_str(), indirect_jumps, scaled_jumps);
     return tool_result_t::ok(
         OBFSTR("VM analysis at ") + sa_format_address(addr) +
         OBFSTR(": ") + verdict, result);
@@ -818,22 +900,28 @@ static tool_result_t dbg_detect_vm_handler(const json& params)
 
 static tool_result_t dbg_map_vm_handlers(const json& params)
 {
+    diag::log_tagged_fmt("dbg_tools", "dbg_map_vm_handlers: entry");
     if (auto err = ensure_attached(params))
         return *err;
 
-    if (!params.contains("table_address") || !params["table_address"].is_string())
+    if (!params.contains("table_address") || !params["table_address"].is_string()) {
+        diag::log_tagged_fmt("dbg_tools", "dbg_map_vm_handlers: missing table_address param");
         return tool_result_t::error(
             OBFSTR("'table_address' (hex string of handler table base) is required."));
+    }
 
     auto table_addr_opt = sa_parse_address(
         params["table_address"].get<std::string>());
-    if (!table_addr_opt || *table_addr_opt == 0)
+    if (!table_addr_opt || *table_addr_opt == 0) {
+        diag::log_tagged_fmt("dbg_tools", "dbg_map_vm_handlers: invalid table_address");
         return tool_result_t::error(OBFSTR("Invalid table_address."));
+    }
     const std::uint64_t table_base = *table_addr_opt;
 
     int entry_count = 256;
     if (params.contains("count") && params["count"].is_number())
         entry_count = std::clamp(params["count"].get<int>(), 1, 4096);
+    diag::log_tagged_fmt("dbg_tools", "dbg_map_vm_handlers: table=0x%llX count=%d", (unsigned long long)table_base, entry_count);
 
     int entry_size = 8;
     if (params.contains("entry_size") && params["entry_size"].is_number())
@@ -869,10 +957,13 @@ static tool_result_t dbg_map_vm_handlers(const json& params)
     std::vector<uint8_t> table_data(table_byte_size);
     std::size_t table_read = device->read_raw(
         table_base, table_data.data(), table_byte_size);
-    if (table_read < static_cast<std::size_t>(entry_size))
+    if (table_read < static_cast<std::size_t>(entry_size)) {
+        diag::log_tagged_fmt("dbg_tools", "dbg_map_vm_handlers: failed to read table at 0x%llX read=%zu", (unsigned long long)table_base, table_read);
         return tool_result_t::error(
             OBFSTR("Failed to read handler table at ") +
             sa_format_address(table_base));
+    }
+    diag::log_tagged_fmt("dbg_tools", "dbg_map_vm_handlers: read %zu bytes from table", table_read);
 
     const int actual_entries =
         static_cast<int>(table_read) / entry_size;
@@ -962,6 +1053,7 @@ static tool_result_t dbg_map_vm_handlers(const json& params)
         result["image_base"] = sa_format_address(image_base);
     result["handlers"]       = handlers;
 
+    diag::log_tagged_fmt("dbg_tools", "dbg_map_vm_handlers: table=0x%llX valid=%d null=%d", (unsigned long long)table_base, valid_count, null_count);
     return tool_result_t::ok(
         OBFSTR("Mapped ") + std::to_string(valid_count) +
         OBFSTR(" handlers from table at ") + sa_format_address(table_base),
@@ -971,7 +1063,7 @@ static tool_result_t dbg_map_vm_handlers(const json& params)
 
 void register_debugger_tools(mcp_standalone::server_t& srv)
 {
-
+    diag::log_tagged_fmt("dbg_tools", "register_debugger_tools: registering all debugger MCP tools");
 
     register_compat(srv, {
         OBFSTR("dbg_set_breakpoint"), OBFSTR("debugger"),
@@ -1077,8 +1169,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Resume execution of the attached process (set debugger state to running)."),
         {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_run: entry");
             if (auto err = ensure_attached(params)) return *err;
             debugger_engine::run_target();
+            diag::log_tagged_fmt("dbg_tools", "dbg_run: run_target called");
             return tool_result_t::ok(OBFSTR("Execution resumed."));
         }, false});
 
@@ -1087,8 +1181,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Pause (break) the attached process."),
         {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_pause: entry");
             if (auto err = ensure_attached(params)) return *err;
             debugger_engine::pause_target();
+            diag::log_tagged_fmt("dbg_tools", "dbg_pause: pause_target called");
             return tool_result_t::ok(OBFSTR("Execution paused."));
         }, false});
 
@@ -1098,11 +1194,14 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_step_into: entry");
             if (auto err = ensure_attached(params)) return *err;
             auto tid = parse_tid(params);
             if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
+            diag::log_tagged_fmt("dbg_tools", "dbg_step_into: tid=%u", *tid);
             debugger_engine::g_state.active_tid = *tid;
             debugger_engine::step_into();
+            diag::log_tagged_fmt("dbg_tools", "dbg_step_into: step_into called");
             return tool_result_t::ok(OBFSTR("Step into executed."));
         }, false});
 
@@ -1112,11 +1211,14 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_step_over: entry");
             if (auto err = ensure_attached(params)) return *err;
             auto tid = parse_tid(params);
             if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
+            diag::log_tagged_fmt("dbg_tools", "dbg_step_over: tid=%u", *tid);
             debugger_engine::g_state.active_tid = *tid;
             debugger_engine::step_over();
+            diag::log_tagged_fmt("dbg_tools", "dbg_step_over: step_over called");
             return tool_result_t::ok(OBFSTR("Step over executed."));
         }, false});
 
@@ -1126,11 +1228,14 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_step_out: entry");
             if (auto err = ensure_attached(params)) return *err;
             auto tid = parse_tid(params);
             if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
+            diag::log_tagged_fmt("dbg_tools", "dbg_step_out: tid=%u", *tid);
             debugger_engine::g_state.active_tid = *tid;
             debugger_engine::step_out();
+            diag::log_tagged_fmt("dbg_tools", "dbg_step_out: step_out called");
             return tool_result_t::ok(OBFSTR("Step out executed."));
         }, false});
 
@@ -1140,12 +1245,15 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Target address (hex)"), true},
          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_run_to_address: entry");
             if (auto err = ensure_attached(params)) return *err;
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error(OBFSTR("'address' is required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
             if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            diag::log_tagged_fmt("dbg_tools", "dbg_run_to_address: running to 0x%llX", (unsigned long long)*addr);
             debugger_engine::run_to_address(*addr);
+            diag::log_tagged_fmt("dbg_tools", "dbg_run_to_address: run_to_address called");
             return tool_result_t::ok(OBFSTR("Running to ") + sa_format_address(*addr));
         }, false});
 
@@ -1155,6 +1263,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {},
         true,
         [](const json&) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_attached: entry");
             json result;
             result["driver_connected"] = device->is_connected();
             uint32_t pid = device->is_connected() ? device->get_process_id() : 0u;
@@ -1164,6 +1273,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 uint64_t base = device->find_image();
                 result["name"] = driver_bridge::attached_process_name();
                 result["base_address"] = sa_format_address(base);
+                diag::log_tagged_fmt("dbg_tools", "debugger_get_attached: pid=%u name=%s base=0x%llX", pid, driver_bridge::attached_process_name().c_str(), (unsigned long long)base);
                 auto mods = driver_bridge::enumerate_modules();
                 uint64_t image_size = 0;
                 for (const auto& m : mods) {
@@ -1182,7 +1292,9 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {},
         true,
         [](const json&) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_registers: entry");
             auto regs = debugger_engine::get_registers();
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_registers: RIP=0x%llX RAX=0x%llX RSP=0x%llX", (unsigned long long)regs.rip, (unsigned long long)regs.rax, (unsigned long long)regs.rsp);
             json result;
             result["rax"] = sa_format_address(regs.rax);
             result["rbx"] = sa_format_address(regs.rbx);
@@ -1219,6 +1331,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {},
         true,
         [](const json&) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_breakpoints: entry");
             std::lock_guard<std::mutex> lk(debugger_engine::g_state.bp_mutex);
             json arr = json::array();
             for (size_t i = 0; i < debugger_engine::g_state.breakpoints.size(); ++i) {
@@ -1237,6 +1350,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 if (!bp.log_text.empty())  e["log_text"]  = bp.log_text;
                 arr.push_back(std::move(e));
             }
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_breakpoints: returning %zu breakpoints", arr.size());
             json result;
             result["count"]       = arr.size();
             result["breakpoints"] = std::move(arr);
@@ -1250,8 +1364,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {},
         true,
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_memory_map: entry");
             if (auto err = ensure_attached(params)) return *err;
             auto regions = debugger_engine::get_memory_map();
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_memory_map: got %zu regions", regions.size());
             json arr = json::array();
             for (const auto& r : regions) {
                 json o;
@@ -1276,7 +1392,9 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {},
         true,
         [](const json&) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_callstack: entry");
             auto frames = debugger_engine::get_call_stack();
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_callstack: got %zu frames", frames.size());
             json arr = json::array();
             for (const auto& f : frames) {
                 json o;
@@ -1300,8 +1418,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {},
         true,
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_threads: entry");
             if (auto err = ensure_attached(params)) return *err;
             auto threads = driver_bridge::enumerate_threads();
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_threads: got %zu threads", threads.size());
             json arr = json::array();
             for (const auto& t : threads) {
                 json o;
@@ -1325,6 +1445,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {},
         true,
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_handles: entry");
             if (auto err = ensure_attached(params)) return *err;
             debugger_engine::enumerate_handles();
             std::lock_guard<std::mutex> lk(debugger_engine::g_state.handle_mutex);
@@ -1338,6 +1459,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 o["access"]     = sa_format_address(static_cast<uint64_t>(h.access));
                 arr.push_back(std::move(o));
             }
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_handles: returning %zu handles", arr.size());
             json result;
             result["count"]   = arr.size();
             result["handles"] = std::move(arr);
@@ -1351,8 +1473,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {},
         true,
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_modules: entry");
             if (auto err = ensure_attached(params)) return *err;
             auto modules = driver_bridge::enumerate_modules();
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_modules: got %zu modules", modules.size());
             json arr = json::array();
             for (const auto& m : modules) {
                 json o;
@@ -1375,7 +1499,9 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {},
         true,
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_seh_chain: entry");
             if (auto err = ensure_attached(params)) return *err;
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_seh_chain: calling seh_view::refresh");
             seh_view::refresh();
             for (int i = 0; i < 100; ++i) {
                 if (!seh_view::g_ui.refreshing.load()) break;
@@ -1393,6 +1519,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 if (!e.handler_name.empty()) o["handler_name"] = e.handler_name;
                 arr.push_back(std::move(o));
             }
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_seh_chain: returning %zu SEH entries", arr.size());
             json result;
             result["count"]   = arr.size();
             result["entries"] = std::move(arr);
@@ -1406,6 +1533,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {},
         true,
         [](const json&) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_patches: entry");
             std::lock_guard<std::mutex> lk(code_patcher::g_state.mtx);
             json arr = json::array();
             for (size_t i = 0; i < code_patcher::g_state.patches.size(); ++i) {
@@ -1438,6 +1566,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {"condition", "string", "Optional condition expression", false}},
         false,
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_set_breakpoint: entry");
             if (!device->is_connected())
                 return tool_result_t::error("Driver not connected. Call driver_load first.");
             uint64_t addr = 0;
@@ -1467,10 +1596,14 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             std::string cond;
             if (params.contains("condition") && params["condition"].is_string())
                 cond = params["condition"].get<std::string>();
+            diag::log_tagged_fmt("dbg_tools", "debugger_set_breakpoint: addr=0x%llX type=%s size=%d", (unsigned long long)addr, type_str.c_str(), size);
             int idx = debugger_engine::add_breakpoint(addr, bp_type, name, cond, size);
-            if (idx < 0)
+            if (idx < 0) {
+                diag::log_tagged_fmt("dbg_tools", "debugger_set_breakpoint: add_breakpoint failed: %s", debugger_engine::last_error().c_str());
                 return tool_result_t::error("debugger_engine::add_breakpoint failed: " +
                                             debugger_engine::last_error());
+            }
+            diag::log_tagged_fmt("dbg_tools", "debugger_set_breakpoint: BP set at 0x%llX idx=%d", (unsigned long long)addr, idx);
             json result;
             result["index"]   = idx;
             result["address"] = sa_format_address(addr);
@@ -1487,6 +1620,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {"address", "string", "Breakpoint address (hex). Used when index is absent.", false}},
         false,
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_remove_breakpoint: entry");
             int idx = -1;
             if (params.contains("index") && params["index"].is_number_integer()) {
                 idx = params["index"].get<int>();
@@ -1504,9 +1638,13 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             } else {
                 return tool_result_t::error("Provide 'index' or 'address'.");
             }
-            if (!debugger_engine::remove_breakpoint(idx))
+            diag::log_tagged_fmt("dbg_tools", "debugger_remove_breakpoint: removing idx=%d", idx);
+            if (!debugger_engine::remove_breakpoint(idx)) {
+                diag::log_tagged_fmt("dbg_tools", "debugger_remove_breakpoint: remove failed: %s", debugger_engine::last_error().c_str());
                 return tool_result_t::error("debugger_engine::remove_breakpoint failed: " +
                                             debugger_engine::last_error());
+            }
+            diag::log_tagged_fmt("dbg_tools", "debugger_remove_breakpoint: removed idx=%d", idx);
             json result;
             result["index"]  = idx;
             result["status"] = "removed";
@@ -1520,12 +1658,14 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{"tid", "string", "Optional thread ID; otherwise current active_tid is used", false}},
         false,
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_step_over: entry");
             if (auto err = ensure_attached(params)) return *err;
             if (params.contains("tid")) {
                 auto tid = parse_tid(params);
                 if (tid) debugger_engine::g_state.active_tid = *tid;
             }
             bool ok = debugger_engine::step_over();
+            diag::log_tagged_fmt("dbg_tools", "debugger_step_over: step_over returned ok=%d", (int)ok);
             json result;
             result["status"] = ok ? "stepped" : "failed";
             if (!ok) result["error"] = debugger_engine::last_error();
@@ -1539,12 +1679,14 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{"tid", "string", "Optional thread ID; otherwise current active_tid is used", false}},
         false,
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_step_into: entry");
             if (auto err = ensure_attached(params)) return *err;
             if (params.contains("tid")) {
                 auto tid = parse_tid(params);
                 if (tid) debugger_engine::g_state.active_tid = *tid;
             }
             bool ok = debugger_engine::step_into();
+            diag::log_tagged_fmt("dbg_tools", "debugger_step_into: step_into returned ok=%d", (int)ok);
             json result;
             result["status"] = ok ? "stepped" : "failed";
             if (!ok) result["error"] = debugger_engine::last_error();
@@ -1558,12 +1700,14 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{"tid", "string", "Optional thread ID; otherwise current active_tid is used", false}},
         false,
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_step_out: entry");
             if (auto err = ensure_attached(params)) return *err;
             if (params.contains("tid")) {
                 auto tid = parse_tid(params);
                 if (tid) debugger_engine::g_state.active_tid = *tid;
             }
             bool ok = debugger_engine::step_out();
+            diag::log_tagged_fmt("dbg_tools", "debugger_step_out: step_out returned ok=%d", (int)ok);
             json result;
             result["status"] = ok ? "stepped" : "failed";
             if (!ok) result["error"] = debugger_engine::last_error();
@@ -1577,8 +1721,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {},
         false,
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_continue: entry");
             if (auto err = ensure_attached(params)) return *err;
             bool ok = debugger_engine::run_target();
+            diag::log_tagged_fmt("dbg_tools", "debugger_continue: run_target returned ok=%d", (int)ok);
             json result;
             result["status"] = ok ? "running" : "failed";
             if (!ok) result["error"] = debugger_engine::last_error();
@@ -1592,8 +1738,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {},
         false,
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_pause: entry");
             if (auto err = ensure_attached(params)) return *err;
             bool ok = debugger_engine::pause_target();
+            diag::log_tagged_fmt("dbg_tools", "debugger_pause: pause_target returned ok=%d", (int)ok);
             json result;
             result["status"] = ok ? "paused" : "failed";
             if (!ok) result["error"] = debugger_engine::last_error();
@@ -1608,6 +1756,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {"size",    "number", "Bytes to read (default 256, max 65536)", false}},
         true,
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_read_memory: entry");
             if (auto err = ensure_attached(params)) return *err;
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error("'address' is required.");
@@ -1620,9 +1769,13 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 if (v > 65536) v = 65536;
                 size = v;
             }
+            diag::log_tagged_fmt("dbg_tools", "debugger_read_memory: addr=0x%llX size=%zu", (unsigned long long)*a, size);
             std::vector<uint8_t> bytes;
-            if (!driver_bridge::read_memory(*a, size, bytes))
+            if (!driver_bridge::read_memory(*a, size, bytes)) {
+                diag::log_tagged_fmt("dbg_tools", "debugger_read_memory: read_memory failed at 0x%llX", (unsigned long long)*a);
                 return tool_result_t::error("driver_bridge::read_memory failed.");
+            }
+            diag::log_tagged_fmt("dbg_tools", "debugger_read_memory: read %zu bytes from 0x%llX", bytes.size(), (unsigned long long)*a);
             std::string hex;
             hex.reserve(bytes.size() * 3);
             char buf[4];
@@ -1646,6 +1799,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {"hex_bytes", "string", "Hex byte sequence (whitespace/comma separated, e.g. 'CC 90 90')", true}},
         false,
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_write_memory: entry");
             if (auto err = ensure_attached(params)) return *err;
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error("'address' is required.");
@@ -1688,8 +1842,12 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return tool_result_t::error("Decoded byte sequence is empty.");
             if (bytes.size() > 65536)
                 return tool_result_t::error("Write exceeds 64 KiB cap.");
-            if (!driver_bridge::write_memory(*a, bytes))
+            diag::log_tagged_fmt("dbg_tools", "debugger_write_memory: addr=0x%llX bytes=%zu", (unsigned long long)*a, bytes.size());
+            if (!driver_bridge::write_memory(*a, bytes)) {
+                diag::log_tagged_fmt("dbg_tools", "debugger_write_memory: write_memory failed at 0x%llX", (unsigned long long)*a);
                 return tool_result_t::error("driver_bridge::write_memory failed.");
+            }
+            diag::log_tagged_fmt("dbg_tools", "debugger_write_memory: wrote %zu bytes to 0x%llX", bytes.size(), (unsigned long long)*a);
             json result;
             result["address"] = sa_format_address(*a);
             result["bytes_written"] = bytes.size();
@@ -1705,6 +1863,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {"new_protect", "number", "PAGE_* constant (e.g. 0x40 for PAGE_EXECUTE_READWRITE)", true}},
         false,
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_protect_memory: entry");
             if (auto err = ensure_attached(params)) return *err;
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error("'address' is required.");
@@ -1716,9 +1875,13 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return tool_result_t::error("'new_protect' is required (PAGE_* constant).");
             uint64_t size = params["size"].get<uint64_t>();
             uint32_t new_prot = static_cast<uint32_t>(params["new_protect"].get<int>());
+            diag::log_tagged_fmt("dbg_tools", "debugger_protect_memory: addr=0x%llX size=%llu new_prot=0x%X", (unsigned long long)*a, (unsigned long long)size, new_prot);
             uint32_t old_prot = 0;
-            if (!driver_bridge::protect_memory(*a, size, new_prot, &old_prot))
+            if (!driver_bridge::protect_memory(*a, size, new_prot, &old_prot)) {
+                diag::log_tagged_fmt("dbg_tools", "debugger_protect_memory: protect_memory failed at 0x%llX", (unsigned long long)*a);
                 return tool_result_t::error("driver_bridge::protect_memory failed.");
+            }
+            diag::log_tagged_fmt("dbg_tools", "debugger_protect_memory: old_prot=0x%X new_prot=0x%X", old_prot, new_prot);
             json result;
             result["address"]      = sa_format_address(*a);
             result["size"]         = size;
@@ -1735,7 +1898,9 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {"name", "string", "Process name (e.g. 'notepad.exe')", false}},
         false,
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_attach_to_process: entry");
             if (!device->is_connected()) {
+                diag::log_tagged_fmt("dbg_tools", "debugger_attach_to_process: connecting to driver");
                 if (!device->connect())
                     return tool_result_t::error("Cannot connect to kernel driver.");
             }
@@ -1745,16 +1910,22 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             } else if (params.contains("name") && params["name"].is_string()) {
                 std::string n = params["name"].get<std::string>();
                 pid = device->find_process(n.c_str());
-                if (pid == 0)
+                if (pid == 0) {
+                    diag::log_tagged_fmt("dbg_tools", "debugger_attach_to_process: process not found: %s", n.c_str());
                     return tool_result_t::error("Process not found: " + n);
+                }
             } else {
                 return tool_result_t::error("Provide 'pid' or 'name'.");
             }
-            if (!driver_bridge::attach(pid))
+            diag::log_tagged_fmt("dbg_tools", "debugger_attach_to_process: attaching to pid=%u", pid);
+            if (!driver_bridge::attach(pid)) {
+                diag::log_tagged_fmt("dbg_tools", "debugger_attach_to_process: attach failed for pid=%u: %s", pid, driver_bridge::last_error().c_str());
                 return tool_result_t::error("driver_bridge::attach failed: " +
                                             driver_bridge::last_error());
+            }
             uint64_t base = device->find_image();
             device->solve_dtb();
+            diag::log_tagged_fmt("dbg_tools", "debugger_attach_to_process: attached pid=%u base=0x%llX", pid, (unsigned long long)base);
             json result;
             result["pid"]          = pid;
             result["base_address"] = sa_format_address(base);
@@ -1769,7 +1940,9 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {},
         false,
         [](const json&) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_detach: entry");
             driver_bridge::detach();
+            diag::log_tagged_fmt("dbg_tools", "debugger_detach: detached");
             return tool_result_t::ok("Detached.");
         }
     });
@@ -1781,10 +1954,12 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID (default: first thread)"), false},
          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_registers: entry");
             if (auto err = ensure_attached(params)) return *err;
             auto tid = parse_tid(params);
             if (tid) debugger_engine::g_state.active_tid = *tid;
             auto regs = debugger_engine::get_registers();
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_registers: RIP=0x%llX RAX=0x%llX", (unsigned long long)regs.rip, (unsigned long long)regs.rax);
 
             json r;
             r["rax"] = sa_format_address(regs.rax);
@@ -1817,6 +1992,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {OBFSTR("value"), OBFSTR("string"), OBFSTR("New value (hex)"), true},
          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_set_register: entry");
             if (auto err = ensure_attached(params)) return *err;
             auto tid = parse_tid(params);
             if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
@@ -1824,8 +2000,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return tool_result_t::error(OBFSTR("'register' and 'value' required."));
             auto val = sa_parse_address(params["value"].get<std::string>());
             if (!val) return tool_result_t::error(OBFSTR("Invalid value."));
+            const std::string reg_name = params["register"].get<std::string>();
+            diag::log_tagged_fmt("dbg_tools", "dbg_set_register: tid=%u reg=%s val=0x%llX", *tid, reg_name.c_str(), (unsigned long long)*val);
             debugger_engine::g_state.active_tid = *tid;
-            debugger_engine::set_register(params["register"].get<std::string>(), *val);
+            debugger_engine::set_register(reg_name, *val);
+            diag::log_tagged_fmt("dbg_tools", "dbg_set_register: set_register done");
             return tool_result_t::ok(OBFSTR("Register set."));
         }, false});
 
@@ -1835,8 +2014,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                "size, protection flags, and module name for each region."),
         {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_memory_map: entry");
             if (auto err = ensure_attached(params)) return *err;
             auto regions = debugger_engine::get_memory_map();
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_memory_map: got %zu regions", regions.size());
             json arr = json::array();
             for (const auto& r : regions) {
                 json rj;
@@ -1858,10 +2039,14 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Add a watch expression. Supports register names (rax, rsp, etc.) and hex addresses."),
         {{OBFSTR("expression"), OBFSTR("string"), OBFSTR("Watch expression"), true}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_add_watch: entry");
             if (!params.contains("expression") || !params["expression"].is_string())
                 return tool_result_t::error(OBFSTR("'expression' is required."));
-            debugger_engine::add_watch(params["expression"].get<std::string>());
+            const std::string expr = params["expression"].get<std::string>();
+            diag::log_tagged_fmt("dbg_tools", "dbg_add_watch: expr=%s", expr.c_str());
+            debugger_engine::add_watch(expr);
             debugger_engine::refresh_watches();
+            diag::log_tagged_fmt("dbg_tools", "dbg_add_watch: watch added and refreshed");
             return tool_result_t::ok(OBFSTR("Watch added."));
         }, false});
 
@@ -1870,9 +2055,13 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Remove a watch by index."),
         {{OBFSTR("index"), OBFSTR("number"), OBFSTR("Watch index"), true}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_remove_watch: entry");
             if (!params.contains("index") || !params["index"].is_number())
                 return tool_result_t::error(OBFSTR("'index' required."));
-            debugger_engine::remove_watch(params["index"].get<int>());
+            int idx = params["index"].get<int>();
+            diag::log_tagged_fmt("dbg_tools", "dbg_remove_watch: removing watch idx=%d", idx);
+            debugger_engine::remove_watch(idx);
+            diag::log_tagged_fmt("dbg_tools", "dbg_remove_watch: removed");
             return tool_result_t::ok(OBFSTR("Watch removed."));
         }, false});
 
@@ -1881,6 +2070,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Get all watch expressions and their current values."),
         {},
         [](const json& ) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_watches: entry");
             debugger_engine::refresh_watches();
             auto& st = debugger_engine::g_state;
             std::lock_guard<std::mutex> lk(st.watch_mutex);
@@ -1894,6 +2084,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 wj["error"] = st.watches[i].error;
                 arr.push_back(wj);
             }
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_watches: returning %zu watches", arr.size());
             return tool_result_t::ok(
                 std::to_string(arr.size()) + OBFSTR(" watches."), arr);
         }, true});
@@ -1905,9 +2096,12 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("max_records"), OBFSTR("number"), OBFSTR("Maximum trace records to keep (default 50000)"), false},
          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_start_trace: entry");
             if (auto err = ensure_attached(params)) return *err;
             int max_records = params.value("max_records", 50000);
+            diag::log_tagged_fmt("dbg_tools", "dbg_start_trace: max_records=%d", max_records);
             debugger_engine::start_trace(max_records);
+            diag::log_tagged_fmt("dbg_tools", "dbg_start_trace: trace started");
             return tool_result_t::ok(OBFSTR("Trace started."));
         }, false});
 
@@ -1916,7 +2110,9 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Stop instruction tracing."),
         {},
         [](const json& ) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_stop_trace: entry");
             debugger_engine::stop_trace();
+            diag::log_tagged_fmt("dbg_tools", "dbg_stop_trace: trace stopped");
             return tool_result_t::ok(OBFSTR("Trace stopped."));
         }, false});
 
@@ -1926,6 +2122,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("offset"), OBFSTR("number"), OBFSTR("Start index (default 0)"), false},
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max entries to return (default 200)"), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_trace: entry");
             auto& st = debugger_engine::g_state;
             std::lock_guard<std::mutex> lk(st.trace_mutex);
             int offset = params.value("offset", 0);
@@ -1944,6 +2141,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             result["total"] = st.trace_log.size();
             result["returned"] = arr.size();
             result["entries"] = arr;
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_trace: total=%zu returned=%zu", st.trace_log.size(), arr.size());
             return tool_result_t::ok(
                 std::to_string(arr.size()) + OBFSTR(" trace entries."), result);
         }, true});
@@ -1954,11 +2152,14 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (hex)"), true},
          {OBFSTR("text"), OBFSTR("string"), OBFSTR("Comment text"), true}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_set_comment: entry");
             if (!params.contains("address") || !params.contains("text"))
                 return tool_result_t::error(OBFSTR("'address' and 'text' required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
             if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
-            debugger_engine::set_comment(*addr, params["text"].get<std::string>());
+            const std::string text = params["text"].get<std::string>();
+            diag::log_tagged_fmt("dbg_tools", "dbg_set_comment: addr=0x%llX text=%s", (unsigned long long)*addr, text.c_str());
+            debugger_engine::set_comment(*addr, text);
             return tool_result_t::ok(OBFSTR("Comment set at ") + sa_format_address(*addr));
         }, false});
 
@@ -1968,11 +2169,14 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (hex)"), true},
          {OBFSTR("text"), OBFSTR("string"), OBFSTR("Label text"), true}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_set_label: entry");
             if (!params.contains("address") || !params.contains("text"))
                 return tool_result_t::error(OBFSTR("'address' and 'text' required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
             if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
-            debugger_engine::set_label(*addr, params["text"].get<std::string>());
+            const std::string text = params["text"].get<std::string>();
+            diag::log_tagged_fmt("dbg_tools", "dbg_set_label: addr=0x%llX text=%s", (unsigned long long)*addr, text.c_str());
+            debugger_engine::set_label(*addr, text);
             return tool_result_t::ok(OBFSTR("Label set at ") + sa_format_address(*addr));
         }, false});
 
@@ -1981,11 +2185,14 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Toggle a bookmark at an address."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (hex)"), true}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_toggle_bookmark: entry");
             if (!params.contains("address"))
                 return tool_result_t::error(OBFSTR("'address' is required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
             if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            diag::log_tagged_fmt("dbg_tools", "dbg_toggle_bookmark: addr=0x%llX", (unsigned long long)*addr);
             debugger_engine::toggle_bookmark(*addr);
+            diag::log_tagged_fmt("dbg_tools", "dbg_toggle_bookmark: toggled");
             return tool_result_t::ok(OBFSTR("Bookmark toggled at ") + sa_format_address(*addr));
         }, false});
 
@@ -1996,8 +2203,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("min_length"), OBFSTR("number"), OBFSTR("Minimum string length (default 4)"), false},
          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_find_strings: entry");
             if (auto err = ensure_attached(params)) return *err;
             int min_len = params.value("min_length", 4);
+            diag::log_tagged_fmt("dbg_tools", "dbg_find_strings: min_length=%d", min_len);
             debugger_engine::find_strings(min_len);
             auto& st = debugger_engine::g_state;
             std::lock_guard<std::mutex> lk(st.strings_mutex);
@@ -2015,6 +2224,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             result["total"] = st.strings.size();
             result["returned"] = arr.size();
             result["strings"] = arr;
+            diag::log_tagged_fmt("dbg_tools", "dbg_find_strings: total=%zu returned=%d", st.strings.size(), count < 500 ? count : 500);
             return tool_result_t::ok(
                 std::to_string(st.strings.size()) + OBFSTR(" strings found."), result);
         }, true});
@@ -2024,7 +2234,9 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Enumerate open handles in the attached process (requires NtQuerySystemInformation)."),
         {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_enumerate_handles: entry");
             if (auto err = ensure_attached(params)) return *err;
+            diag::log_tagged_fmt("dbg_tools", "dbg_enumerate_handles: calling enumerate_handles");
             debugger_engine::enumerate_handles();
             auto& st = debugger_engine::g_state;
             std::lock_guard<std::mutex> lk(st.handle_mutex);
@@ -2036,6 +2248,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 hj["name"] = h.name;
                 arr.push_back(hj);
             }
+            diag::log_tagged_fmt("dbg_tools", "dbg_enumerate_handles: returning %zu handles", arr.size());
             json result;
             result["count"] = arr.size();
             result["handles"] = arr;
@@ -2053,6 +2266,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {OBFSTR("size"), OBFSTR("number"), OBFSTR("Watch granularity in bytes: 1, 2, 4, or 8 (default 1; ignored for 'execute')"), false},
          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_add_hw_breakpoint: entry");
             if (auto err = ensure_attached(params)) return *err;
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error(OBFSTR("'address' required."));
@@ -2067,9 +2281,13 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 size = params["size"].get<int>();
             if (size != 1 && size != 2 && size != 4 && size != 8)
                 return tool_result_t::error(OBFSTR("'size' must be 1, 2, 4, or 8."));
+            diag::log_tagged_fmt("dbg_tools", "dbg_add_hw_breakpoint: addr=0x%llX type=%s size=%d", (unsigned long long)*addr, type_str.c_str(), size);
             int idx = debugger_engine::add_breakpoint(*addr, bpt, "", "", size);
-            if (idx < 0)
+            if (idx < 0) {
+                diag::log_tagged_fmt("dbg_tools", "dbg_add_hw_breakpoint: add_breakpoint failed: %s", debugger_engine::last_error().c_str());
                 return tool_result_t::error(debugger_engine::last_error());
+            }
+            diag::log_tagged_fmt("dbg_tools", "dbg_add_hw_breakpoint: HW BP set at 0x%llX idx=%d", (unsigned long long)*addr, idx);
             return tool_result_t::ok(OBFSTR("Hardware breakpoint set at ") + sa_format_address(*addr));
         }, false});
 
@@ -2078,11 +2296,16 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Toggle a breakpoint on or off by its index in the breakpoint list."),
         {{OBFSTR("index"), OBFSTR("number"), OBFSTR("Breakpoint index"), true}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_toggle_breakpoint: entry");
             if (!params.contains("index") || !params["index"].is_number())
                 return tool_result_t::error(OBFSTR("'index' is required."));
             int idx = params["index"].get<int>();
-            if (!debugger_engine::toggle_breakpoint(idx))
+            diag::log_tagged_fmt("dbg_tools", "dbg_toggle_breakpoint: toggling idx=%d", idx);
+            if (!debugger_engine::toggle_breakpoint(idx)) {
+                diag::log_tagged_fmt("dbg_tools", "dbg_toggle_breakpoint: toggle failed for idx=%d", idx);
                 return tool_result_t::error(OBFSTR("Failed to toggle breakpoint at index ") + std::to_string(idx));
+            }
+            diag::log_tagged_fmt("dbg_tools", "dbg_toggle_breakpoint: toggled idx=%d", idx);
             return tool_result_t::ok(OBFSTR("Breakpoint toggled."));
         }, false});
 
@@ -2091,7 +2314,9 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Remove all breakpoints (software and hardware)."),
         {},
         [](const json&) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_clear_all_breakpoints: entry");
             debugger_engine::clear_all_breakpoints();
+            diag::log_tagged_fmt("dbg_tools", "dbg_clear_all_breakpoints: all breakpoints cleared");
             return tool_result_t::ok(OBFSTR("All breakpoints cleared."));
         }, false});
 
@@ -2100,11 +2325,13 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Get the comment annotation at an address."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (hex)"), true}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_comment: entry");
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error(OBFSTR("'address' is required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
             if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
             std::string text = debugger_engine::get_comment(*addr);
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_comment: addr=0x%llX comment=%s", (unsigned long long)*addr, text.c_str());
             json result;
             result["address"] = sa_format_address(*addr);
             result["comment"] = text;
@@ -2116,11 +2343,13 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Get the label (name) at an address."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (hex)"), true}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_label: entry");
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error(OBFSTR("'address' is required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
             if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
             std::string text = debugger_engine::get_label(*addr);
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_label: addr=0x%llX label=%s", (unsigned long long)*addr, text.c_str());
             json result;
             result["address"] = sa_format_address(*addr);
             result["label"] = text;
@@ -2132,6 +2361,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Get all bookmarked addresses."),
         {},
         [](const json&) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_bookmarks: entry");
             auto& st = debugger_engine::g_state;
             std::lock_guard<std::mutex> lk(st.anno_mutex);
             json arr = json::array();
@@ -2140,6 +2370,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             json result;
             result["count"] = arr.size();
             result["bookmarks"] = arr;
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_bookmarks: returning %zu bookmarks", arr.size());
             return tool_result_t::ok(
                 std::to_string(arr.size()) + OBFSTR(" bookmark(s)."), result);
         }, true});
@@ -2150,6 +2381,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Target address (hex)"), true},
          {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum results to return (default 100)"), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_xrefs_to: entry");
             if (auto err = ensure_attached(params)) return *err;
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error(OBFSTR("'address' is required."));
@@ -2158,6 +2390,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             int max_results = params.value("max_results", 100);
             if (max_results <= 0) max_results = 100;
             if (max_results > 10000) max_results = 10000;
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_xrefs_to: addr=0x%llX max_results=%d", (unsigned long long)*addr, max_results);
             auto modules = driver_bridge::enumerate_modules();
             uint64_t search_start = 0;
             uint64_t search_size = 0;
@@ -2194,6 +2427,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             result["count"] = arr.size();
             result["total"] = xref_engine::g_state.results.size();
             result["xrefs"] = std::move(arr);
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_xrefs_to: found %zu xrefs to 0x%llX", xref_engine::g_state.results.size(), (unsigned long long)*addr);
             return tool_result_t::ok(
                 std::to_string(result["count"].get<size_t>()) + OBFSTR(" xref(s) to ") + sa_format_address(*addr), result);
         }, true});
@@ -2204,6 +2438,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Source address (hex)"), true},
          {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum instructions to scan (default 200)"), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_xrefs_from: entry");
             if (auto err = ensure_attached(params)) return *err;
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error(OBFSTR("'address' is required."));
@@ -2227,6 +2462,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             json result;
             result["count"] = arr.size();
             result["xrefs"] = std::move(arr);
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_xrefs_from: found %zu xrefs from 0x%llX", xrefs.size(), (unsigned long long)*addr);
             return tool_result_t::ok(
                 std::to_string(result["count"].get<size_t>()) + OBFSTR(" xref(s) from ") + sa_format_address(*addr), result);
         }, true});
@@ -2238,6 +2474,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {OBFSTR("start_address"), OBFSTR("string"), OBFSTR("Start of scan range (hex)"), true},
          {OBFSTR("size"), OBFSTR("number"), OBFSTR("Size of range in bytes (default 0x10000)"), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_scan_xrefs: entry");
             if (auto err = ensure_attached(params)) return *err;
             if (!params.contains("target_address") || !params["target_address"].is_string())
                 return tool_result_t::error(OBFSTR("'target_address' is required."));
@@ -2261,6 +2498,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             result["target"] = sa_format_address(*target);
             result["range_start"] = sa_format_address(*start);
             result["range_size"] = size;
+            diag::log_tagged_fmt("dbg_tools", "dbg_scan_xrefs: target=0x%llX start=0x%llX size=0x%llX results=%zu", (unsigned long long)*target, (unsigned long long)*start, (unsigned long long)size, xref_engine::g_state.results.size());
             return tool_result_t::ok(
                 OBFSTR("Scan complete. ") + std::to_string(xref_engine::g_state.results.size()) + OBFSTR(" xref(s) found."), result);
         }, true});
@@ -2270,11 +2508,13 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Build a control flow graph starting from an address. Disassembles and splits into basic blocks with edges."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Entry address to build CFG from (hex)"), true}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_build_cfg: entry");
             if (auto err = ensure_attached(params)) return *err;
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error(OBFSTR("'address' is required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
             if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            diag::log_tagged_fmt("dbg_tools", "dbg_build_cfg: building CFG from 0x%llX", (unsigned long long)*addr);
             cfg_view::build_cfg(*addr);
             for (int i = 0; i < 300; ++i) {
                 if (!cfg_view::g_state.building.load()) break;
@@ -2285,6 +2525,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             result["entry"] = sa_format_address(*addr);
             result["blocks"] = cfg_view::g_state.blocks.size();
             result["built"] = cfg_view::g_state.built;
+            diag::log_tagged_fmt("dbg_tools", "dbg_build_cfg: CFG built for 0x%llX with %zu blocks", (unsigned long long)*addr, cfg_view::g_state.blocks.size());
             return tool_result_t::ok(
                 OBFSTR("CFG built: ") + std::to_string(cfg_view::g_state.blocks.size()) + OBFSTR(" blocks."), result);
         }, true});
@@ -2294,9 +2535,12 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Get the current control flow graph state, including all basic blocks, instructions, and edges."),
         {},
         [](const json&) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_cfg: entry");
             std::lock_guard<std::mutex> lk(cfg_view::g_state.mutex);
-            if (!cfg_view::g_state.built)
+            if (!cfg_view::g_state.built) {
+                diag::log_tagged_fmt("dbg_tools", "dbg_get_cfg: no CFG built yet");
                 return tool_result_t::error(OBFSTR("No CFG built. Call dbg_build_cfg first."));
+            }
             json blocks_arr = json::array();
             for (size_t bi = 0; bi < cfg_view::g_state.blocks.size(); ++bi) {
                 const auto& blk = cfg_view::g_state.blocks[bi];
@@ -2320,6 +2564,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             result["entry"] = sa_format_address(cfg_view::g_state.entry_addr);
             result["block_count"] = cfg_view::g_state.blocks.size();
             result["blocks"] = std::move(blocks_arr);
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_cfg: returning %zu blocks entry=0x%llX", cfg_view::g_state.blocks.size(), (unsigned long long)cfg_view::g_state.entry_addr);
             return tool_result_t::ok(
                 OBFSTR("CFG: ") + std::to_string(cfg_view::g_state.blocks.size()) + OBFSTR(" blocks."), result);
         }, true});
@@ -2329,7 +2574,9 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Get the SEH (Structured Exception Handler) chain of the attached process."),
         {},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_seh_chain: entry");
             if (auto err = ensure_attached(params)) return *err;
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_seh_chain: calling seh_view::refresh");
             seh_view::refresh();
             Sleep(500);
             std::lock_guard<std::mutex> lk(seh_view::g_ui.mutex);
@@ -2347,6 +2594,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             json result;
             result["count"] = arr.size();
             result["entries"] = std::move(arr);
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_seh_chain: returning %zu SEH handlers", arr.size());
             return tool_result_t::ok(
                 std::to_string(arr.size()) + OBFSTR(" SEH handler(s)."), result);
         }, true});
@@ -2356,7 +2604,9 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Get detailed module information with PE analysis including exports and imports."),
         {{OBFSTR("module_name"), OBFSTR("string"), OBFSTR("Optional module name filter"), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_modules_detail: entry");
             if (auto err = ensure_attached(params)) return *err;
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_modules_detail: calling module_view::refresh");
             module_view::refresh();
             Sleep(300);
             std::string filter;
@@ -2428,6 +2678,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             json result;
             result["count"] = arr.size();
             result["modules"] = std::move(arr);
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_modules_detail: returning %zu modules", arr.size());
             return tool_result_t::ok(
                 std::to_string(result["count"].get<size_t>()) + OBFSTR(" module(s)."), result);
         }, true});
@@ -2439,6 +2690,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {OBFSTR("bytes"), OBFSTR("string"), OBFSTR("Hex bytes to write (e.g. '90 90 90')"), true},
          {OBFSTR("label"), OBFSTR("string"), OBFSTR("Optional description for this patch"), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_add_patch: entry");
             if (auto err = ensure_attached(params)) return *err;
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error(OBFSTR("'address' is required."));
@@ -2447,16 +2699,24 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             auto addr = sa_parse_address(params["address"].get<std::string>());
             if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
             auto patched = code_patcher::parse_bytes(params["bytes"].get<std::string>());
-            if (patched.empty())
+            if (patched.empty()) {
+                diag::log_tagged_fmt("dbg_tools", "dbg_add_patch: invalid hex bytes");
                 return tool_result_t::error(OBFSTR("Invalid hex bytes."));
+            }
             std::string label;
             if (params.contains("label") && params["label"].is_string())
                 label = params["label"].get<std::string>();
+            diag::log_tagged_fmt("dbg_tools", "dbg_add_patch: addr=0x%llX size=%zu label=%s", (unsigned long long)*addr, patched.size(), label.c_str());
             int idx = code_patcher::create_patch(*addr, patched, label);
-            if (idx < 0)
+            if (idx < 0) {
+                diag::log_tagged_fmt("dbg_tools", "dbg_add_patch: create_patch failed");
                 return tool_result_t::error(OBFSTR("Failed to create patch."));
-            if (!code_patcher::apply_patch(idx))
+            }
+            if (!code_patcher::apply_patch(idx)) {
+                diag::log_tagged_fmt("dbg_tools", "dbg_add_patch: apply_patch failed for idx=%d", idx);
                 return tool_result_t::error(OBFSTR("Patch created but failed to apply."));
+            }
+            diag::log_tagged_fmt("dbg_tools", "dbg_add_patch: patch applied at 0x%llX idx=%d", (unsigned long long)*addr, idx);
             json result;
             result["index"] = idx;
             result["address"] = sa_format_address(*addr);
@@ -2471,13 +2731,20 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("Remove a code patch by index. Reverts original bytes before removing."),
         {{OBFSTR("index"), OBFSTR("number"), OBFSTR("Patch index to remove"), true}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_remove_patch: entry");
             if (!params.contains("index") || !params["index"].is_number())
                 return tool_result_t::error(OBFSTR("'index' is required."));
             int idx = params["index"].get<int>();
-            if (!code_patcher::revert_patch(idx))
+            diag::log_tagged_fmt("dbg_tools", "dbg_remove_patch: reverting and removing idx=%d", idx);
+            if (!code_patcher::revert_patch(idx)) {
+                diag::log_tagged_fmt("dbg_tools", "dbg_remove_patch: revert_patch failed for idx=%d", idx);
                 return tool_result_t::error(OBFSTR("Failed to revert patch."));
-            if (!code_patcher::remove_patch(idx))
+            }
+            if (!code_patcher::remove_patch(idx)) {
+                diag::log_tagged_fmt("dbg_tools", "dbg_remove_patch: remove_patch failed for idx=%d", idx);
                 return tool_result_t::error(OBFSTR("Failed to remove patch."));
+            }
+            diag::log_tagged_fmt("dbg_tools", "dbg_remove_patch: patch removed idx=%d", idx);
             return tool_result_t::ok(OBFSTR("Patch removed."));
         }, false});
 
@@ -2486,6 +2753,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("List all code patches with their status, addresses, and byte values."),
         {},
         [](const json&) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_list_patches: entry");
             std::lock_guard<std::mutex> lk(code_patcher::g_state.mtx);
             json arr = json::array();
             for (size_t i = 0; i < code_patcher::g_state.patches.size(); ++i) {
@@ -2502,6 +2770,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             json result;
             result["count"] = arr.size();
             result["patches"] = std::move(arr);
+            diag::log_tagged_fmt("dbg_tools", "dbg_list_patches: returning %zu patches", arr.size());
             return tool_result_t::ok(
                 std::to_string(arr.size()) + OBFSTR(" patch(es)."), result);
         }, true});
@@ -2512,6 +2781,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address to start NOP fill (hex)"), true},
          {OBFSTR("size"), OBFSTR("number"), OBFSTR("Number of bytes to NOP"), true}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_nop_fill: entry");
             if (auto err = ensure_attached(params)) return *err;
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error(OBFSTR("'address' is required."));
@@ -2522,14 +2792,18 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             int size = params["size"].get<int>();
             if (size <= 0 || size > 4096)
                 return tool_result_t::error(OBFSTR("Size must be between 1 and 4096."));
-            if (!code_patcher::nop_region(*addr, static_cast<size_t>(size), OBFSTR("NOP fill")))
+            diag::log_tagged_fmt("dbg_tools", "dbg_nop_fill: addr=0x%llX size=%d", (unsigned long long)*addr, size);
+            if (!code_patcher::nop_region(*addr, static_cast<size_t>(size), OBFSTR("NOP fill"))) {
+                diag::log_tagged_fmt("dbg_tools", "dbg_nop_fill: nop_region failed at 0x%llX", (unsigned long long)*addr);
                 return tool_result_t::error(OBFSTR("Failed to NOP-fill region."));
+            }
             int idx = static_cast<int>(code_patcher::count()) - 1;
             if (!code_patcher::apply_patch(idx))
                 return tool_result_t::error(OBFSTR("NOP patch created but failed to apply."));
             json result;
             result["address"] = sa_format_address(*addr);
             result["size"] = size;
+            diag::log_tagged_fmt("dbg_tools", "dbg_nop_fill: NOP-filled %d bytes at 0x%llX", size, (unsigned long long)*addr);
             return tool_result_t::ok(
                 OBFSTR("NOP-filled ") + std::to_string(size) + OBFSTR(" bytes at ") + sa_format_address(*addr), result);
         }, false});
@@ -2541,6 +2815,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {OBFSTR("size"), OBFSTR("number"), OBFSTR("Size of region to scan (default 0x1000)"), false},
          {OBFSTR("min_cave_size"), OBFSTR("number"), OBFSTR("Minimum cave size in bytes (default 16)"), false}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_find_code_caves: entry");
             if (auto err = ensure_attached(params)) return *err;
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error(OBFSTR("'address' is required."));
@@ -2550,6 +2825,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             if (size == 0) size = 0x1000;
             size_t min_size = static_cast<size_t>(params.value("min_cave_size", 16));
             if (min_size == 0) min_size = 16;
+            diag::log_tagged_fmt("dbg_tools", "dbg_find_code_caves: addr=0x%llX size=0x%X min_size=%zu", (unsigned long long)*addr, size, min_size);
             auto caves = code_patcher::find_code_caves(*addr, size, min_size);
             json arr = json::array();
             for (const auto& c : caves) {
@@ -2562,6 +2838,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             json result;
             result["count"] = arr.size();
             result["caves"] = std::move(arr);
+            diag::log_tagged_fmt("dbg_tools", "dbg_find_code_caves: found %zu caves", caves.size());
             return tool_result_t::ok(
                 std::to_string(arr.size()) + OBFSTR(" code cave(s) found."), result);
         }, true});
@@ -2572,6 +2849,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address for breakpoint (hex)"), true},
          {OBFSTR("condition"), OBFSTR("string"), OBFSTR("Condition expression (e.g. 'rax == 0x1234')"), true}},
         [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "dbg_conditional_breakpoint: entry");
             if (auto err = ensure_attached(params)) return *err;
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error(OBFSTR("'address' is required."));
@@ -2580,13 +2858,17 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             auto addr = sa_parse_address(params["address"].get<std::string>());
             if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
             std::string cond = params["condition"].get<std::string>();
+            diag::log_tagged_fmt("dbg_tools", "dbg_conditional_breakpoint: addr=0x%llX cond=%s", (unsigned long long)*addr, cond.c_str());
             int bp_idx = debugger_engine::add_breakpoint(*addr, debugger_engine::bp_type_t::software, "", cond);
-            if (bp_idx < 0)
+            if (bp_idx < 0) {
+                diag::log_tagged_fmt("dbg_tools", "dbg_conditional_breakpoint: add_breakpoint failed: %s", debugger_engine::last_error().c_str());
                 return tool_result_t::error(OBFSTR("Failed to add breakpoint."));
+            }
             json result;
             result["index"] = bp_idx;
             result["address"] = sa_format_address(*addr);
             result["condition"] = cond;
+            diag::log_tagged_fmt("dbg_tools", "dbg_conditional_breakpoint: BP set at 0x%llX idx=%d cond=%s", (unsigned long long)*addr, bp_idx, cond.c_str());
             return tool_result_t::ok(
                 OBFSTR("Conditional breakpoint set at ") + sa_format_address(*addr) + OBFSTR(" [condition: ") + cond + OBFSTR("]"), result);
         }, false});
@@ -2599,20 +2881,29 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
 		},
 		true,
 		[](const json& params) -> tool_result_t {
+			diag::log_tagged_fmt("dbg_tools", "enable_stealth: entry");
 			if (auto err = ensure_attached(params)) return *err;
 
 			uint32_t pid = device->get_process_id();
-			if (pid == 0)
+			if (pid == 0) {
+				diag::log_tagged_fmt("dbg_tools", "enable_stealth: not attached to any process");
 				return tool_result_t::error("Not attached to a process.");
+			}
 
-			if (stealth_engine::is_active())
+			if (stealth_engine::is_active()) {
+				diag::log_tagged_fmt("dbg_tools", "enable_stealth: already active");
 				return tool_result_t::error("Stealth mode is already active.");
+			}
 
+			diag::log_tagged_fmt("dbg_tools", "enable_stealth: enabling for pid=%u", pid);
 			bool ok = stealth_engine::enable_stealth(pid);
-			if (!ok)
+			if (!ok) {
+				diag::log_tagged_fmt("dbg_tools", "enable_stealth: enable_stealth failed for pid=%u", pid);
 				return tool_result_t::error("Failed to enable stealth mode.");
+			}
 
 			auto status = stealth_engine::get_session_info();
+			diag::log_tagged_fmt("dbg_tools", "enable_stealth: active pid=%u peb_spoofed=%d hooks=%zu", pid, (int)status.peb_spoofed, status.hooks.size());
 			json result;
 			result["status"] = "active";
 			result["pid"] = pid;
@@ -2628,11 +2919,16 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
 		{},
 		true,
 		[](const json&) -> tool_result_t {
-			if (!stealth_engine::is_active())
+			diag::log_tagged_fmt("dbg_tools", "disable_stealth: entry");
+			if (!stealth_engine::is_active()) {
+				diag::log_tagged_fmt("dbg_tools", "disable_stealth: stealth not active");
 				return tool_result_t::error("Stealth mode is not active.");
+			}
 
+			diag::log_tagged_fmt("dbg_tools", "disable_stealth: disabling stealth");
 			stealth_engine::disable_stealth();
 
+			diag::log_tagged_fmt("dbg_tools", "disable_stealth: stealth disabled");
 			json result;
 			result["status"] = "disabled";
 			return tool_result_t::ok(result);
@@ -2645,8 +2941,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
 		{},
 		true,
 		[](const json&) -> tool_result_t {
+			diag::log_tagged_fmt("dbg_tools", "stealth_status: entry");
 			json result;
 			result["active"] = stealth_engine::is_active();
+			diag::log_tagged_fmt("dbg_tools", "stealth_status: active=%d", (int)stealth_engine::is_active());
 
 			if (stealth_engine::is_active()) {
 				auto status = stealth_engine::get_session_info();

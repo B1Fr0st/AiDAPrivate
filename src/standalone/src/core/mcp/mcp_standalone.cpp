@@ -356,6 +356,7 @@ json server_t::tool_schema(const tool_def_t& tool) const
 
 json server_t::handle_initialize(const json& id, const json&)
 {
+    diag::log_tagged_fmt("mcp_srv", "handle_initialize entry");
     json capabilities;
     capabilities["tools"]     = {{"listChanged", true}};
     capabilities["resources"] = {{"listChanged", true}};
@@ -418,6 +419,7 @@ json server_t::handle_tools_call(const json& id, const json& params)
         return make_error(id, JSONRPC_INVALID_PARAMS, "Missing required field: 'name'");
 
     const std::string early_name = params["name"].get<std::string>();
+    diag::log_tagged_fmt("mcp_srv", "handle_tools_call tool='%s'", early_name.c_str());
 
     {
         uint64_t gt = standalone_license::inline_gate_check(
@@ -451,18 +453,27 @@ json server_t::handle_tools_call(const json& id, const json& params)
     }
 
     if (!found)
+    {
+        diag::log_tagged_fmt("mcp_srv", "handle_tools_call unknown_tool='%s'", tool_name.c_str());
         return make_error(id, JSONRPC_INVALID_PARAMS, "Unknown tool: " + tool_name);
+    }
 
+    diag::log_tagged_fmt("mcp_srv", "handle_tools_call dispatching tool='%s'", tool_name.c_str());
     cancel_scope_t scope(id);
 
     tool_result_t tr;
     try {
         tr = handler_copy(arguments);
     } catch (const std::exception& e) {
+        diag::log_tagged_fmt("mcp_srv", "handle_tools_call exception tool='%s' what='%s'",
+            tool_name.c_str(), e.what());
         tr = tool_result_t::error(std::string("Tool threw exception: ") + e.what());
     } catch (...) {
+        diag::log_tagged_fmt("mcp_srv", "handle_tools_call unknown_exception tool='%s'", tool_name.c_str());
         tr = tool_result_t::error("Tool threw unknown exception");
     }
+    diag::log_tagged_fmt("mcp_srv", "handle_tools_call result tool='%s' success=%d",
+        tool_name.c_str(), (int)tr.success);
 
     if (scope.token && scope.token->load(std::memory_order_acquire)) {
         json cancel_result;
@@ -664,6 +675,7 @@ json server_t::route_request(const json& msg)
         return make_error(nullptr, JSONRPC_INVALID_REQUEST, "Request must be a JSON object");
 
     std::string method = msg.value("method", "");
+    diag::log_tagged_fmt("mcp_srv", "route_request method='%s'", method.c_str());
     if (method.empty())
         return make_error(msg.value("id", json(nullptr)), JSONRPC_INVALID_REQUEST, "Missing 'method' field");
 
@@ -720,17 +732,25 @@ std::string handle_body(server_t* self, const std::string& body)
 
 bool server_t::start(int port)
 {
-    if (_running.load()) return true;
+    diag::log_tagged_fmt("mcp_srv", "start entry port=%d", port);
+    if (_running.load())
+    {
+        diag::log_tagged_fmt("mcp_srv", "start already running port=%d", port);
+        return true;
+    }
 
     _stop_requested = false;
     _port = 0;
 
     _server_done.store(false, std::memory_order_release);
     if (!work_queue::post([this, port]() {
+            diag::log_tagged_fmt("mcp_srv", "server_thread starting port=%d", port);
             server_thread_func(port);
+            diag::log_tagged_fmt("mcp_srv", "server_thread exited port=%d", port);
             _server_done.store(true, std::memory_order_release);
         }))
     {
+        diag::log_tagged_fmt("mcp_srv", "start work_queue post fail");
         _server_done.store(true, std::memory_order_release);
         return false;
     }
@@ -739,12 +759,19 @@ bool server_t::start(int port)
     for (int i = 0; i < 20 && !_running.load() && !_stop_requested.load(); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
+    diag::log_tagged_fmt("mcp_srv", "start result running=%d port=%d",
+        (int)_running.load(), _port);
     return _running.load();
 }
 
 void server_t::stop()
 {
-    if (!_running.load() && _server_done.load(std::memory_order_acquire)) return;
+    diag::log_tagged_fmt("mcp_srv", "stop entry running=%d", (int)_running.load());
+    if (!_running.load() && _server_done.load(std::memory_order_acquire))
+    {
+        diag::log_tagged_fmt("mcp_srv", "stop already stopped");
+        return;
+    }
     _stop_requested = true;
     {
         std::lock_guard<std::mutex> lk(_server_mtx);
@@ -753,10 +780,12 @@ void server_t::stop()
     }
     while (!_server_done.load(std::memory_order_acquire))
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    diag::log_tagged_fmt("mcp_srv", "stop done");
 }
 
 void server_t::server_thread_func(int port)
 {
+    diag::log_tagged_fmt("mcp_srv", "server_thread_func entry port=%d", port);
     httplib::Server svr;
     {
         std::lock_guard<std::mutex> lk(_server_mtx);
@@ -764,6 +793,7 @@ void server_t::server_thread_func(int port)
     }
 
     std::string session_id = generate_session_id();
+    diag::log_tagged_fmt("mcp_srv", "server_thread_func session_id='%s'", session_id.c_str());
 
     svr.set_default_headers({
         {"Access-Control-Allow-Origin",  "*"},
@@ -777,6 +807,7 @@ void server_t::server_thread_func(int port)
     });
 
     svr.Post("/mcp", [this, &session_id](const httplib::Request& req, httplib::Response& res) {
+        diag::log_tagged_fmt("mcp_srv", "POST /mcp body_len=%zu", req.body.size());
         std::string response_body = handle_body(this, req.body);
         res.set_header("Mcp-Session-Id", session_id);
         if (response_body.empty())
@@ -847,6 +878,7 @@ void server_t::server_thread_func(int port)
     });
 
     svr.Post("/api/tools/call", [this](const httplib::Request& req, httplib::Response& res) {
+        diag::log_tagged_fmt("mcp_srv", "POST /api/tools/call body_len=%zu", req.body.size());
         json body;
         try { body = json::parse(req.body); }
         catch (const json::parse_error& e) {
@@ -982,6 +1014,7 @@ void server_t::server_thread_func(int port)
         bound_port = svr.bind_to_any_port("127.0.0.1");
 
     if (bound_port <= 0) {
+        diag::log_tagged_fmt("mcp_srv", "server_thread_func bind fail port=%d", port);
         std::lock_guard<std::mutex> lk(_server_mtx);
         _active_server = nullptr;
         _stop_requested = true;
@@ -990,9 +1023,11 @@ void server_t::server_thread_func(int port)
 
     _port = bound_port;
     _running = true;
+    diag::log_tagged_fmt("mcp_srv", "server_thread_func listening bound_port=%d", bound_port);
 
     svr.listen_after_bind();
 
+    diag::log_tagged_fmt("mcp_srv", "server_thread_func listen_after_bind returned port=%d", bound_port);
     _running = false;
     { std::lock_guard<std::mutex> lk(_server_mtx); _active_server = nullptr; }
 }

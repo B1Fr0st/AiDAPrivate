@@ -157,6 +157,7 @@ tool_result_t network_enumerate_connections(const json& params)
 
 tool_result_t network_start_capture(const json& params)
 {
+    diag::log_tagged_fmt("net_tools", "network_start_capture entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
 
@@ -180,8 +181,10 @@ tool_result_t network_start_capture(const json& params)
     if (params.contains("max_payload") && params["max_payload"].is_number())
         max_payload = params["max_payload"].get<std::uint32_t>();
 
+    diag::log_tagged_fmt("net_tools", "network_start_capture pid=%u port=%u proto=%u max_payload=%u", filter_pid, filter_port, filter_protocol, max_payload);
     bool ok = driver_bridge::start_capture(filter_pid, filter_port, filter_protocol,
         filter_ip, max_payload);
+    diag::log_tagged_fmt("net_tools", "network_start_capture result=%d", (int)ok);
 
     if (!ok)
         return tool_result_t::error(OBFSTR("Failed to start packet capture. Network subsystem may not be ready."));
@@ -199,10 +202,13 @@ tool_result_t network_start_capture(const json& params)
 
 tool_result_t network_stop_capture(const json&)
 {
+    diag::log_tagged("net_tools", "network_stop_capture entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
-    if (!driver_bridge::stop_capture())
+    bool ok = driver_bridge::stop_capture();
+    diag::log_tagged_fmt("net_tools", "network_stop_capture result=%d", (int)ok);
+    if (!ok)
         return tool_result_t::error(OBFSTR("Failed to stop packet capture."));
 
     return tool_result_t::ok(OBFSTR("Packet capture stopped"));
@@ -210,6 +216,7 @@ tool_result_t network_stop_capture(const json&)
 
 tool_result_t network_get_packets(const json& params)
 {
+    diag::log_tagged("net_tools", "network_get_packets entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -219,6 +226,7 @@ tool_result_t network_get_packets(const json& params)
     if (max_packets > 32) max_packets = 32;
 
     auto packets = driver_bridge::get_captured_packets(max_packets);
+    diag::log_tagged_fmt("net_tools", "network_get_packets retrieved=%zu max=%u", packets.size(), max_packets);
 
     json arr = json::array();
     for (const auto& p : packets) {
@@ -245,11 +253,13 @@ tool_result_t network_get_packets(const json& params)
 
 tool_result_t network_analyze_packet(const json& params)
 {
+    diag::log_tagged("net_tools", "network_analyze_packet entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
 
     auto packets = driver_bridge::get_captured_packets(1);
+    diag::log_tagged_fmt("net_tools", "network_analyze_packet packets_avail=%zu", packets.size());
     if (packets.empty())
         return tool_result_t::error(OBFSTR("No packets available. Start capture first."));
 
@@ -292,11 +302,13 @@ tool_result_t network_analyze_packet(const json& params)
         }
     }
 
+    diag::log_tagged_fmt("net_tools", "network_analyze_packet complete payload_size=%u", (unsigned)p.payload_size);
     return tool_result_t::ok(OBFSTR("Packet analysis complete"), result);
 }
 
 tool_result_t network_dns_log(const json& params)
 {
+    diag::log_tagged("net_tools", "network_dns_log entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -304,7 +316,9 @@ tool_result_t network_dns_log(const json& params)
     if (params.contains("pid") && params["pid"].is_number())
         filter_pid = params["pid"].get<std::uint32_t>();
 
+    diag::log_tagged_fmt("net_tools", "network_dns_log filter_pid=%u", filter_pid);
     auto entries = driver_bridge::get_dns_queries(filter_pid);
+    diag::log_tagged_fmt("net_tools", "network_dns_log entries=%zu", entries.size());
 
     json arr = json::array();
     for (const auto& e : entries) {
@@ -345,6 +359,7 @@ tool_result_t network_dns_log(const json& params)
 
 tool_result_t network_add_filter(const json& params)
 {
+    diag::log_tagged("net_tools", "network_add_filter entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -382,8 +397,10 @@ tool_result_t network_add_filter(const json& params)
     }
 
     std::uint32_t rule_id = 0;
+    diag::log_tagged_fmt("net_tools", "network_add_filter action=%u direction=%u protocol=%u pid=%u port=%u", action, direction, protocol, pid, port);
     bool ok = driver_bridge::add_filter_rule(action, direction, protocol, pid, port,
         ip_addr, ip_mask, &rule_id);
+    diag::log_tagged_fmt("net_tools", "network_add_filter result=%d rule_id=%u", (int)ok, rule_id);
 
     if (!ok)
         return tool_result_t::error(OBFSTR("Failed to add filter rule. Rule table may be full."));
@@ -402,6 +419,7 @@ tool_result_t network_add_filter(const json& params)
 
 tool_result_t network_remove_filter(const json& params)
 {
+    diag::log_tagged("net_tools", "network_remove_filter entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -409,7 +427,10 @@ tool_result_t network_remove_filter(const json& params)
         return tool_result_t::error(OBFSTR("Missing required parameter: rule_id"));
 
     std::uint32_t rule_id = params["rule_id"].get<std::uint32_t>();
-    if (!driver_bridge::remove_filter_rule(rule_id))
+    diag::log_tagged_fmt("net_tools", "network_remove_filter rule_id=%u", rule_id);
+    bool ok = driver_bridge::remove_filter_rule(rule_id);
+    diag::log_tagged_fmt("net_tools", "network_remove_filter result=%d", (int)ok);
+    if (!ok)
         return tool_result_t::error(OBFSTR("Failed to remove filter rule ") + std::to_string(rule_id));
 
     return tool_result_t::ok(OBFSTR("Filter rule ") + std::to_string(rule_id) + OBFSTR(" removed"));
@@ -417,10 +438,13 @@ tool_result_t network_remove_filter(const json& params)
 
 tool_result_t network_clear_filters(const json&)
 {
+    diag::log_tagged("net_tools", "network_clear_filters entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
-    if (!driver_bridge::clear_filter_rules())
+    bool ok = driver_bridge::clear_filter_rules();
+    diag::log_tagged_fmt("net_tools", "network_clear_filters result=%d", (int)ok);
+    if (!ok)
         return tool_result_t::error(OBFSTR("Failed to clear filter rules."));
 
     return tool_result_t::ok(OBFSTR("All filter rules cleared"));
@@ -428,11 +452,14 @@ tool_result_t network_clear_filters(const json&)
 
 tool_result_t network_stats(const json&)
 {
+    diag::log_tagged("net_tools", "network_stats entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     driver_bridge::network_stats_t stats{};
-    if (!driver_bridge::get_network_stats(stats))
+    bool ok = driver_bridge::get_network_stats(stats);
+    diag::log_tagged_fmt("net_tools", "network_stats result=%d bytes_sent=%llu bytes_recv=%llu captured=%llu dropped=%llu", (int)ok, static_cast<unsigned long long>(stats.bytes_sent), static_cast<unsigned long long>(stats.bytes_received), static_cast<unsigned long long>(stats.total_captured), static_cast<unsigned long long>(stats.total_dropped));
+    if (!ok)
         return tool_result_t::error(OBFSTR("Failed to get network stats."));
 
     json result;
@@ -451,12 +478,15 @@ tool_result_t network_stats(const json&)
 
 tool_result_t network_capture_status(const json&)
 {
+    diag::log_tagged("net_tools", "network_capture_status entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     bool active = false;
     std::uint32_t captured = 0, dropped = 0;
-    if (!driver_bridge::get_capture_status(active, captured, dropped))
+    bool ok = driver_bridge::get_capture_status(active, captured, dropped);
+    diag::log_tagged_fmt("net_tools", "network_capture_status result=%d active=%d captured=%u dropped=%u", (int)ok, (int)active, captured, dropped);
+    if (!ok)
         return tool_result_t::error(OBFSTR("Failed to get capture status."));
 
     json result;
@@ -469,6 +499,7 @@ tool_result_t network_capture_status(const json&)
 
 tool_result_t network_block_ip(const json& params)
 {
+    diag::log_tagged("net_tools", "network_block_ip entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -489,7 +520,10 @@ tool_result_t network_block_ip(const json& params)
     }
 
     std::uint32_t rule_id = 0;
-    if (!driver_bridge::add_filter_rule(1, direction, 0, 0, 0, ip, mask, &rule_id))
+    diag::log_tagged_fmt("net_tools", "network_block_ip ip=%s direction=%u", params["ip"].get<std::string>().c_str(), direction);
+    bool block_ok = driver_bridge::add_filter_rule(1, direction, 0, 0, 0, ip, mask, &rule_id);
+    diag::log_tagged_fmt("net_tools", "network_block_ip result=%d rule_id=%u", (int)block_ok, rule_id);
+    if (!block_ok)
         return tool_result_t::error(OBFSTR("Failed to add block rule"));
 
     json result;
@@ -501,6 +535,7 @@ tool_result_t network_block_ip(const json& params)
 
 tool_result_t network_block_port(const json& params)
 {
+    diag::log_tagged("net_tools", "network_block_port entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -516,7 +551,10 @@ tool_result_t network_block_port(const json& params)
     }
 
     std::uint32_t rule_id = 0;
-    if (!driver_bridge::add_filter_rule(1, 2, protocol, 0, port, nullptr, nullptr, &rule_id))
+    diag::log_tagged_fmt("net_tools", "network_block_port port=%u protocol=%u", port, protocol);
+    bool port_ok = driver_bridge::add_filter_rule(1, 2, protocol, 0, port, nullptr, nullptr, &rule_id);
+    diag::log_tagged_fmt("net_tools", "network_block_port result=%d rule_id=%u", (int)port_ok, rule_id);
+    if (!port_ok)
         return tool_result_t::error(OBFSTR("Failed to add port block rule"));
 
     json result;
@@ -528,6 +566,7 @@ tool_result_t network_block_port(const json& params)
 
 tool_result_t network_block_process(const json& params)
 {
+    diag::log_tagged("net_tools", "network_block_process entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -535,9 +574,12 @@ tool_result_t network_block_process(const json& params)
         return tool_result_t::error(OBFSTR("Missing required parameter: pid"));
 
     std::uint32_t pid = params["pid"].get<std::uint32_t>();
+    diag::log_tagged_fmt("net_tools", "network_block_process pid=%u", pid);
 
     std::uint32_t rule_id = 0;
-    if (!driver_bridge::add_filter_rule(1, 2, 0, pid, 0, nullptr, nullptr, &rule_id))
+    bool proc_ok = driver_bridge::add_filter_rule(1, 2, 0, pid, 0, nullptr, nullptr, &rule_id);
+    diag::log_tagged_fmt("net_tools", "network_block_process result=%d rule_id=%u", (int)proc_ok, rule_id);
+    if (!proc_ok)
         return tool_result_t::error(OBFSTR("Failed to add process block rule"));
 
     json result;
@@ -821,6 +863,7 @@ static std::string format_ipv4_bytes(const std::uint8_t* ip) {
 
 tool_result_t network_deep_inspect(const json& params)
 {
+    diag::log_tagged("net_tools", "network_deep_inspect entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -833,7 +876,9 @@ tool_result_t network_deep_inspect(const json& params)
         else if (p == "udp" || p == "UDP") filter_protocol = 17;
     }
 
+    diag::log_tagged_fmt("net_tools", "network_deep_inspect filter_pid=%u proto=%u port=%u", filter_pid, filter_protocol, filter_port);
     auto results = driver_bridge::get_dpi_results(filter_pid, filter_protocol, filter_port, 0);
+    diag::log_tagged_fmt("net_tools", "network_deep_inspect results=%zu", results.size());
     json arr = json::array();
     for (const auto& d : results) {
         json entry;
@@ -868,6 +913,7 @@ tool_result_t network_deep_inspect(const json& params)
 
 tool_result_t network_follow_tcp_stream(const json& params)
 {
+    diag::log_tagged("net_tools", "network_follow_tcp_stream entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
@@ -878,20 +924,24 @@ tool_result_t network_follow_tcp_stream(const json& params)
     if (params.contains("src_port") && params["src_port"].is_number()) src_port = params["src_port"].get<std::uint32_t>();
     if (params.contains("dst_port") && params["dst_port"].is_number()) dst_port = params["dst_port"].get<std::uint32_t>();
     if (params.contains("pid") && params["pid"].is_number()) pid = params["pid"].get<std::uint32_t>();
+    diag::log_tagged_fmt("net_tools", "network_follow_tcp_stream op=%s src_port=%u dst_port=%u pid=%u", op.c_str(), src_port, dst_port, pid);
 
     if (op == "start") {
         bool ok = driver_bridge::stream_reassemble_op(0, src_port, dst_port, pid, nullptr, nullptr, nullptr, nullptr, nullptr);
+        diag::log_tagged_fmt("net_tools", "network_follow_tcp_stream start result=%d", (int)ok);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to start stream reassembly. Max 1024 concurrent streams."));
         json r; r["status"] = "started"; r["src_port"] = src_port; r["dst_port"] = dst_port;
         return tool_result_t::ok(OBFSTR("TCP stream reassembly started"), r);
     } else if (op == "stop") {
         bool ok = driver_bridge::stream_reassemble_op(1, src_port, dst_port, pid, nullptr, nullptr, nullptr, nullptr, nullptr);
+        diag::log_tagged_fmt("net_tools", "network_follow_tcp_stream stop result=%d", (int)ok);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to stop stream reassembly."));
         return tool_result_t::ok(OBFSTR("TCP stream reassembly stopped"));
     } else if (op == "get") {
         std::vector<std::uint8_t> stream_data;
         std::uint32_t total_packets = 0, truncated = 0;
         bool ok = driver_bridge::stream_reassemble_op(2, src_port, dst_port, pid, nullptr, nullptr, &stream_data, &total_packets, &truncated);
+        diag::log_tagged_fmt("net_tools", "network_follow_tcp_stream get result=%d bytes=%zu packets=%u truncated=%u", (int)ok, stream_data.size(), total_packets, truncated);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to get reassembled stream data."));
         json r;
         r["total_bytes"] = stream_data.size();
@@ -908,6 +958,7 @@ tool_result_t network_follow_tcp_stream(const json& params)
 
 tool_result_t network_parse_http(const json& params)
 {
+    diag::log_tagged("net_tools", "network_parse_http entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -917,6 +968,7 @@ tool_result_t network_parse_http(const json& params)
     if (max_pkts > 32) max_pkts = 32;
 
     auto packets = driver_bridge::get_captured_packets(max_pkts);
+    diag::log_tagged_fmt("net_tools", "network_parse_http packets=%zu max=%u", packets.size(), max_pkts);
     json arr = json::array();
     for (const auto& p : packets) {
         if (p.payload.empty()) continue;
@@ -951,6 +1003,7 @@ tool_result_t network_parse_http(const json& params)
         arr.push_back(entry);
     }
 
+    diag::log_tagged_fmt("net_tools", "network_parse_http parsed=%zu", arr.size());
     if (arr.empty())
         return tool_result_t::ok(OBFSTR("No HTTP messages found in captured packets. Ensure capture is active and HTTP traffic is flowing."), arr);
     return tool_result_t::ok(std::to_string(arr.size()) + OBFSTR(" HTTP messages parsed"), arr);
@@ -958,6 +1011,7 @@ tool_result_t network_parse_http(const json& params)
 
 tool_result_t network_parse_tls(const json& params)
 {
+    diag::log_tagged("net_tools", "network_parse_tls entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -967,6 +1021,7 @@ tool_result_t network_parse_tls(const json& params)
     if (max_pkts > 32) max_pkts = 32;
 
     auto packets = driver_bridge::get_captured_packets(max_pkts);
+    diag::log_tagged_fmt("net_tools", "network_parse_tls packets=%zu max=%u", packets.size(), max_pkts);
     json arr = json::array();
     for (const auto& p : packets) {
         if (p.payload.size() < 5) continue;
@@ -1002,6 +1057,7 @@ tool_result_t network_parse_tls(const json& params)
         arr.push_back(entry);
     }
 
+    diag::log_tagged_fmt("net_tools", "network_parse_tls parsed=%zu", arr.size());
     if (arr.empty())
         return tool_result_t::ok(OBFSTR("No TLS records found in captured packets. Ensure capture is active and HTTPS traffic is flowing."), arr);
     return tool_result_t::ok(std::to_string(arr.size()) + OBFSTR(" TLS records parsed"), arr);
@@ -1009,6 +1065,7 @@ tool_result_t network_parse_tls(const json& params)
 
 tool_result_t network_enumerate_wfp_callouts(const json& params)
 {
+    diag::log_tagged("net_tools", "network_enumerate_wfp_callouts entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -1016,7 +1073,9 @@ tool_result_t network_enumerate_wfp_callouts(const json& params)
     if (params.contains("module") && params["module"].is_string())
         filter_module = params["module"].get<std::string>();
 
+    diag::log_tagged_fmt("net_tools", "network_enumerate_wfp_callouts filter_module=%s", filter_module.c_str());
     auto callouts = driver_bridge::enumerate_wfp_callouts(filter_module);
+    diag::log_tagged_fmt("net_tools", "network_enumerate_wfp_callouts count=%zu", callouts.size());
     json arr = json::array();
     for (const auto& c : callouts) {
         json entry;
@@ -1037,6 +1096,7 @@ tool_result_t network_enumerate_wfp_callouts(const json& params)
 
 tool_result_t network_get_socket_handles(const json& params)
 {
+    diag::log_tagged("net_tools", "network_get_socket_handles entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -1044,7 +1104,9 @@ tool_result_t network_get_socket_handles(const json& params)
     if (params.contains("pid") && params["pid"].is_number())
         target_pid = params["pid"].get<std::uint32_t>();
 
+    diag::log_tagged_fmt("net_tools", "network_get_socket_handles target_pid=%u", target_pid);
     auto socks = driver_bridge::get_socket_handles(target_pid);
+    diag::log_tagged_fmt("net_tools", "network_get_socket_handles count=%zu", socks.size());
     json arr = json::array();
     for (const auto& s : socks) {
         json entry;
@@ -1062,6 +1124,7 @@ tool_result_t network_get_socket_handles(const json& params)
 
 tool_result_t network_dump_tcpip(const json& params)
 {
+    diag::log_tagged("net_tools", "network_dump_tcpip entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -1073,7 +1136,9 @@ tool_result_t network_dump_tcpip(const json& params)
         else if (p == "udp" || p == "UDP") filter_protocol = 17;
     }
 
+    diag::log_tagged_fmt("net_tools", "network_dump_tcpip pid=%u proto=%u", target_pid, filter_protocol);
     auto conns = driver_bridge::dump_tcpip_connections(target_pid, filter_protocol);
+    diag::log_tagged_fmt("net_tools", "network_dump_tcpip count=%zu", conns.size());
     json arr = json::array();
     for (const auto& c : conns) {
         json entry;
@@ -1096,10 +1161,12 @@ tool_result_t network_dump_tcpip(const json& params)
 
 tool_result_t network_enumerate_interfaces(const json&)
 {
+    diag::log_tagged("net_tools", "network_enumerate_interfaces entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     auto ifaces = driver_bridge::enumerate_interfaces();
+    diag::log_tagged_fmt("net_tools", "network_enumerate_interfaces count=%zu", ifaces.size());
     json arr = json::array();
     for (const auto& ifc : ifaces) {
         json entry;
@@ -1122,6 +1189,7 @@ tool_result_t network_enumerate_interfaces(const json&)
 
 tool_result_t network_inject_packet(const json& params)
 {
+    diag::log_tagged("net_tools", "network_inject_packet entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -1156,9 +1224,11 @@ tool_result_t network_inject_packet(const json& params)
     if (payload.empty())
         return tool_result_t::error(OBFSTR("Payload required. Provide 'payload_hex' or 'payload_text'."));
 
+    diag::log_tagged_fmt("net_tools", "network_inject_packet direction=%u protocol=%u src_port=%u dst_port=%u payload=%zu", direction, protocol, src_port, dst_port, payload.size());
     bool ok = driver_bridge::inject_packet(direction, protocol, af, src_port, dst_port,
         src_addr, dst_addr, payload.data(), static_cast<std::uint32_t>(payload.size()),
         tcp_flags, tcp_seq, tcp_ack);
+    diag::log_tagged_fmt("net_tools", "network_inject_packet result=%d", (int)ok);
 
     if (!ok) return tool_result_t::error(OBFSTR("Packet injection failed."));
     json r;
@@ -1170,12 +1240,14 @@ tool_result_t network_inject_packet(const json& params)
 
 tool_result_t network_modify_packet_rule(const json& params)
 {
+    diag::log_tagged("net_tools", "network_modify_packet_rule entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
         return tool_result_t::error(OBFSTR("Missing required parameter: operation ('add', 'remove', or 'clear')"));
 
     std::string op = params["operation"].get<std::string>();
+    diag::log_tagged_fmt("net_tools", "network_modify_packet_rule op=%s", op.c_str());
     if (op == "add") {
         std::uint32_t direction = 2, protocol = 0, port = 0, pid = 0;
         if (params.contains("direction") && params["direction"].is_string()) {
@@ -1208,10 +1280,12 @@ tool_result_t network_modify_packet_rule(const json& params)
             return tool_result_t::error(OBFSTR("Pattern required for 'add'. Provide 'pattern_hex' or 'pattern_text'."));
 
         std::uint32_t rule_id = 0;
+        diag::log_tagged_fmt("net_tools", "network_modify_packet_rule add direction=%u proto=%u port=%u pid=%u pattern=%zu replacement=%zu", direction, protocol, port, pid, pattern.size(), replacement.size());
         bool ok = driver_bridge::packet_mod_rule_op(0, 0, direction, protocol, port, pid,
             pattern.data(), static_cast<std::uint32_t>(pattern.size()),
             replacement.empty() ? nullptr : replacement.data(), static_cast<std::uint32_t>(replacement.size()),
             &rule_id);
+        diag::log_tagged_fmt("net_tools", "network_modify_packet_rule add result=%d rule_id=%u", (int)ok, rule_id);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to add modification rule. Max 32 rules."));
         json r; r["rule_id"] = rule_id;
         return tool_result_t::ok(OBFSTR("Packet modification rule added (ID: ") + std::to_string(rule_id) + ")", r);
@@ -1232,10 +1306,12 @@ tool_result_t network_modify_packet_rule(const json& params)
 
 tool_result_t network_list_mod_rules(const json&)
 {
+    diag::log_tagged("net_tools", "network_list_mod_rules entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     auto rules = driver_bridge::list_packet_mod_rules();
+    diag::log_tagged_fmt("net_tools", "network_list_mod_rules count=%zu", rules.size());
     json arr = json::array();
     for (const auto& r : rules) {
         json entry;
@@ -1253,12 +1329,14 @@ tool_result_t network_list_mod_rules(const json&)
 
 tool_result_t network_redirect_traffic(const json& params)
 {
+    diag::log_tagged("net_tools", "network_redirect_traffic entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
         return tool_result_t::error(OBFSTR("Missing required parameter: operation ('add', 'remove', or 'clear')"));
 
     std::string op = params["operation"].get<std::string>();
+    diag::log_tagged_fmt("net_tools", "network_redirect_traffic op=%s", op.c_str());
     if (op == "add") {
         std::uint32_t protocol = 6, match_port = 0, redirect_port = 0, af = 2;
         std::uint8_t match_addr[16] = {}, redirect_addr[16] = {};
@@ -1293,10 +1371,12 @@ tool_result_t network_redirect_traffic(const json& params)
 
 tool_result_t network_list_redirect_rules(const json&)
 {
+    diag::log_tagged("net_tools", "network_list_redirect_rules entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     auto rules = driver_bridge::list_redirect_rules();
+    diag::log_tagged_fmt("net_tools", "network_list_redirect_rules count=%zu", rules.size());
     json arr = json::array();
     for (const auto& r : rules) {
         json entry;
@@ -1313,12 +1393,14 @@ tool_result_t network_list_redirect_rules(const json&)
 
 tool_result_t network_intercept(const json& params)
 {
+    diag::log_tagged("net_tools", "network_intercept entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
         return tool_result_t::error(OBFSTR("Missing required parameter: operation ('enable' or 'disable')"));
 
     std::string op = params["operation"].get<std::string>();
+    diag::log_tagged_fmt("net_tools", "network_intercept op=%s", op.c_str());
     if (op == "enable") {
         std::uint32_t filter_pid = 0, filter_port = 0, filter_protocol = 0;
         if (params.contains("pid") && params["pid"].is_number()) filter_pid = params["pid"].get<std::uint32_t>();
@@ -1329,12 +1411,15 @@ tool_result_t network_intercept(const json& params)
             else if (p == "udp" || p == "UDP") filter_protocol = 17;
         }
         std::uint32_t held_count = 0; bool active = false;
+        diag::log_tagged_fmt("net_tools", "network_intercept enable pid=%u port=%u proto=%u", filter_pid, filter_port, filter_protocol);
         bool ok = driver_bridge::intercept_op(0, filter_pid, filter_port, filter_protocol, 0, nullptr, 0, &held_count, &active);
+        diag::log_tagged_fmt("net_tools", "network_intercept enable result=%d active=%d held=%u", (int)ok, (int)active, held_count);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to enable packet interception."));
         json r; r["active"] = active; r["held_count"] = held_count;
         return tool_result_t::ok(OBFSTR("Packet interception enabled. Matching packets will be held for inspection."), r);
     } else if (op == "disable") {
         bool ok = driver_bridge::intercept_op(1, 0, 0, 0, 0, nullptr, 0, nullptr, nullptr);
+        diag::log_tagged_fmt("net_tools", "network_intercept disable result=%d", (int)ok);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to disable packet interception."));
         return tool_result_t::ok(OBFSTR("Packet interception disabled. All held packets released."));
     }
@@ -1343,10 +1428,12 @@ tool_result_t network_intercept(const json& params)
 
 tool_result_t network_get_held_packets(const json&)
 {
+    diag::log_tagged("net_tools", "network_get_held_packets entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     auto held = driver_bridge::get_held_packets();
+    diag::log_tagged_fmt("net_tools", "network_get_held_packets count=%zu", held.size());
     json arr = json::array();
     for (const auto& h : held) {
         json entry;
@@ -1369,12 +1456,14 @@ tool_result_t network_get_held_packets(const json&)
 
 tool_result_t network_release_packet(const json& params)
 {
+    diag::log_tagged("net_tools", "network_release_packet entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
     if (!params.contains("hold_id") || !params["hold_id"].is_number())
         return tool_result_t::error(OBFSTR("Missing required parameter: hold_id"));
 
     std::uint64_t hold_id = params["hold_id"].get<std::uint64_t>();
+    diag::log_tagged_fmt("net_tools", "network_release_packet hold_id=%llu", static_cast<unsigned long long>(hold_id));
     std::vector<std::uint8_t> modify_payload;
     std::uint32_t operation = 3;
 
@@ -1393,9 +1482,11 @@ tool_result_t network_release_packet(const json& params)
         }
     }
 
+    diag::log_tagged_fmt("net_tools", "network_release_packet operation=%u modify_payload=%zu", operation, modify_payload.size());
     bool ok = driver_bridge::intercept_op(operation, 0, 0, 0, hold_id,
         modify_payload.empty() ? nullptr : modify_payload.data(),
         static_cast<std::uint32_t>(modify_payload.size()), nullptr, nullptr);
+    diag::log_tagged_fmt("net_tools", "network_release_packet result=%d operation=%u", (int)ok, operation);
     if (!ok) return tool_result_t::error(OBFSTR("Failed to release/process held packet."));
 
     std::string action_str = (operation == 4) ? "dropped" : (operation == 5) ? "modified and released" : "released";
@@ -1404,6 +1495,7 @@ tool_result_t network_release_packet(const json& params)
 
 tool_result_t network_kill_connection(const json& params)
 {
+    diag::log_tagged("net_tools", "network_kill_connection entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -1420,19 +1512,23 @@ tool_result_t network_kill_connection(const json& params)
     if (params.contains("dst_ip") && params["dst_ip"].is_string()) parse_ipv4(params["dst_ip"].get<std::string>(), dst_addr);
     if (params.contains("pid") && params["pid"].is_number()) pid = params["pid"].get<std::uint32_t>();
 
+    diag::log_tagged_fmt("net_tools", "network_kill_connection protocol=%u src_port=%u dst_port=%u pid=%u", protocol, src_port, dst_port, pid);
     bool ok = driver_bridge::kill_connection(protocol, af, src_port, dst_port, src_addr, dst_addr, pid);
+    diag::log_tagged_fmt("net_tools", "network_kill_connection result=%d", (int)ok);
     if (!ok) return tool_result_t::error(OBFSTR("Failed to kill connection. Tries socket close + RST injection."));
     return tool_result_t::ok(OBFSTR("Connection killed successfully"));
 }
 
 tool_result_t network_spoof_dns(const json& params)
 {
+    diag::log_tagged("net_tools", "network_spoof_dns entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
         return tool_result_t::error(OBFSTR("Missing required parameter: operation ('add', 'remove', or 'clear')"));
 
     std::string op = params["operation"].get<std::string>();
+    diag::log_tagged_fmt("net_tools", "network_spoof_dns op=%s", op.c_str());
     if (op == "add") {
         if (!params.contains("domain") || !params["domain"].is_string())
             return tool_result_t::error(OBFSTR("Missing required parameter: domain"));
@@ -1446,7 +1542,9 @@ tool_result_t network_spoof_dns(const json& params)
         if (params.contains("ttl") && params["ttl"].is_number()) ttl = params["ttl"].get<std::uint32_t>();
 
         std::uint32_t rule_id = 0;
+        diag::log_tagged_fmt("net_tools", "network_spoof_dns add domain=%s ttl=%u", domain.c_str(), ttl);
         bool ok = driver_bridge::dns_spoof_op(0, 0, domain.c_str(), spoof_addr, 2, ttl, &rule_id);
+        diag::log_tagged_fmt("net_tools", "network_spoof_dns add result=%d rule_id=%u", (int)ok, rule_id);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to add DNS spoof rule. Max 32 rules."));
         json r; r["rule_id"] = rule_id; r["domain"] = domain;
         return tool_result_t::ok(OBFSTR("DNS spoof rule added: ") + domain + OBFSTR(" -> ") + params["spoof_ip"].get<std::string>(), r);
@@ -1467,10 +1565,12 @@ tool_result_t network_spoof_dns(const json& params)
 
 tool_result_t network_list_dns_spoof_rules(const json&)
 {
+    diag::log_tagged("net_tools", "network_list_dns_spoof_rules entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     auto rules = driver_bridge::list_dns_spoof_rules();
+    diag::log_tagged_fmt("net_tools", "network_list_dns_spoof_rules count=%zu", rules.size());
     json arr = json::array();
     for (const auto& r : rules) {
         json entry;
@@ -1486,6 +1586,7 @@ tool_result_t network_list_dns_spoof_rules(const json&)
 
 tool_result_t network_bandwidth_monitor(const json& params)
 {
+    diag::log_tagged("net_tools", "network_bandwidth_monitor entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
@@ -1494,18 +1595,22 @@ tool_result_t network_bandwidth_monitor(const json& params)
     std::string op = params["operation"].get<std::string>();
     std::uint32_t filter_pid = 0;
     if (params.contains("pid") && params["pid"].is_number()) filter_pid = params["pid"].get<std::uint32_t>();
+    diag::log_tagged_fmt("net_tools", "network_bandwidth_monitor op=%s pid=%u", op.c_str(), filter_pid);
 
     if (op == "start") {
         bool ok = driver_bridge::bw_monitor_op(0, filter_pid, nullptr);
+        diag::log_tagged_fmt("net_tools", "network_bandwidth_monitor start result=%d", (int)ok);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to start bandwidth monitoring."));
         return tool_result_t::ok(OBFSTR("Bandwidth monitoring started"));
     } else if (op == "stop") {
         bool ok = driver_bridge::bw_monitor_op(1, 0, nullptr);
+        diag::log_tagged_fmt("net_tools", "network_bandwidth_monitor stop result=%d", (int)ok);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to stop bandwidth monitoring."));
         return tool_result_t::ok(OBFSTR("Bandwidth monitoring stopped"));
     } else if (op == "get") {
         driver_bridge::bw_stats_t stats{};
         bool ok = driver_bridge::bw_monitor_op(2, filter_pid, &stats);
+        diag::log_tagged_fmt("net_tools", "network_bandwidth_monitor get result=%d active=%d bps_in=%llu bps_out=%llu", (int)ok, (int)stats.active, static_cast<unsigned long long>(stats.bps_in), static_cast<unsigned long long>(stats.bps_out));
         if (!ok) return tool_result_t::error(OBFSTR("Failed to get bandwidth stats."));
         json r;
         r["active"] = stats.active;
@@ -1526,13 +1631,16 @@ tool_result_t network_bandwidth_monitor(const json& params)
 
 tool_result_t network_bandwidth_per_process(const json& params)
 {
+    diag::log_tagged("net_tools", "network_bandwidth_per_process entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     std::uint32_t filter_pid = 0;
     if (params.contains("pid") && params["pid"].is_number()) filter_pid = params["pid"].get<std::uint32_t>();
 
+    diag::log_tagged_fmt("net_tools", "network_bandwidth_per_process filter_pid=%u", filter_pid);
     auto procs = driver_bridge::get_bw_per_process(filter_pid);
+    diag::log_tagged_fmt("net_tools", "network_bandwidth_per_process count=%zu", procs.size());
     json arr = json::array();
     for (const auto& p : procs) {
         json entry;
@@ -1549,22 +1657,27 @@ tool_result_t network_bandwidth_per_process(const json& params)
 
 tool_result_t network_os_fingerprint(const json& params)
 {
+    diag::log_tagged("net_tools", "network_os_fingerprint entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
         return tool_result_t::error(OBFSTR("Missing required parameter: operation ('enable', 'disable', or 'get')"));
 
     std::string op = params["operation"].get<std::string>();
+    diag::log_tagged_fmt("net_tools", "network_os_fingerprint op=%s", op.c_str());
     if (op == "enable") {
         bool ok = driver_bridge::fingerprint_op(0);
+        diag::log_tagged_fmt("net_tools", "network_os_fingerprint enable result=%d", (int)ok);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to enable OS fingerprinting."));
         return tool_result_t::ok(OBFSTR("Passive OS fingerprinting enabled. Analyzing TCP SYN packets."));
     } else if (op == "disable") {
         bool ok = driver_bridge::fingerprint_op(1);
+        diag::log_tagged_fmt("net_tools", "network_os_fingerprint disable result=%d", (int)ok);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to disable OS fingerprinting."));
         return tool_result_t::ok(OBFSTR("OS fingerprinting disabled"));
     } else if (op == "get") {
         auto fps = driver_bridge::get_fingerprints();
+        diag::log_tagged_fmt("net_tools", "network_os_fingerprint get count=%zu", fps.size());
         json arr = json::array();
         for (const auto& f : fps) {
             json entry;
@@ -1585,6 +1698,7 @@ tool_result_t network_os_fingerprint(const json& params)
 
 tool_result_t network_export_pcap(const json& params)
 {
+    diag::log_tagged("net_tools", "network_export_pcap entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -1600,7 +1714,9 @@ tool_result_t network_export_pcap(const json& params)
     if (max_packets > 256) max_packets = 256;
 
     driver_bridge::pcap_export_result_t pcap{};
+    diag::log_tagged_fmt("net_tools", "network_export_pcap filter_pid=%u proto=%u max=%u", filter_pid, filter_protocol, max_packets);
     bool ok = driver_bridge::export_pcap(filter_pid, filter_protocol, max_packets, &pcap);
+    diag::log_tagged_fmt("net_tools", "network_export_pcap driver_result=%d packets=%zu", (int)ok, pcap.packets.size());
     if (!ok) return tool_result_t::error(OBFSTR("Failed to export PCAP data from driver."));
 
     std::string filename;
@@ -1640,10 +1756,12 @@ tool_result_t network_export_pcap(const json& params)
     json r;
     r["file_path"] = path;
     r["packet_count"] = pcap.packets.size();
+    diag::log_tagged_fmt("net_tools", "network_export_pcap complete path=%s packets=%zu", path.c_str(), pcap.packets.size());
     return tool_result_t::ok(std::to_string(pcap.packets.size()) + OBFSTR(" packets exported to ") + path, r);
 }
 
 void register_network_tools(mcp_standalone::server_t& srv) {
+    diag::log_tagged("net_tools", "register_network_tools entry");
         aida::burp::register_all_tools(srv);
 
         register_compat(srv, {
@@ -2000,6 +2118,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
          {OBFSTR("input_hex"), OBFSTR("string"), OBFSTR("Input data (hex encoded) - use instead of 'input' for binary"), false},
          {OBFSTR("pipeline"), OBFSTR("array"), OBFSTR("Array of transform step objects: [{\"name\":\"base64_decode\"}, {\"name\":\"xor\",\"params\":{\"key\":\"41\"}}]"), true}},
         [](const json& args) -> tool_result_t {
+            diag::log_tagged("net_tools", "network_decode_data entry");
             std::vector<uint8_t> data;
             if (args.contains("input_hex") && args["input_hex"].is_string()) {
                 std::string hex = args["input_hex"].get<std::string>();
@@ -2038,9 +2157,12 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                         params[k] = v.is_string() ? v.get<std::string>() : v.dump();
                 }
 
+                diag::log_tagged_fmt("net_tools", "network_decode_data step=%s", name.c_str());
                 auto result = decoder_pipeline::apply_single(name, data, params);
-                if (!result.success)
+                if (!result.success) {
+                    diag::log_tagged_fmt("net_tools", "network_decode_data step_failed step=%s error=%s", name.c_str(), result.error.c_str());
                     return tool_result_t::error("Transform '" + name + "' failed: " + result.error);
+                }
                 data = std::move(result.data);
             }
 
@@ -2080,8 +2202,10 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                "Use to discover available transforms for network_decode_data pipeline."),
         {},
         [](const json&) -> tool_result_t {
+            diag::log_tagged("net_tools", "network_list_transforms entry");
             auto& reg = decoder_pipeline::registry::instance();
             auto transforms = reg.all();
+            diag::log_tagged_fmt("net_tools", "network_list_transforms count=%zu", transforms.size());
             json arr = json::array();
             for (const auto* t : transforms) {
                 json obj;
@@ -2107,6 +2231,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
          {OBFSTR("name"), OBFSTR("string"), OBFSTR("Script name (default: derived from path)"), false}},
         [](const json& args) -> tool_result_t {
             std::string name = args.value("name", "");
+            diag::log_tagged_fmt("net_tools", "network_script_load entry name=%s", name.c_str());
             bool ok = false;
             if (args.contains("source") && args["source"].is_string()) {
                 std::string src = args["source"].get<std::string>();
@@ -2122,6 +2247,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             } else {
                 return tool_result_t::error("Either 'path' or 'source' required");
             }
+            diag::log_tagged_fmt("net_tools", "network_script_load result=%d name=%s", (int)ok, name.c_str());
             return ok ? tool_result_t::ok("Script '" + name + "' loaded") : tool_result_t::error("Failed to load script");
         }, false});
 
@@ -2142,7 +2268,9 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         {{OBFSTR("code"), OBFSTR("string"), OBFSTR("Lua code to execute"), true}},
         [](const json& args) -> tool_result_t {
             std::string code = args.value("code", "");
+            diag::log_tagged_fmt("net_tools", "network_script_execute code_len=%zu", code.size());
             std::string result = script_engine::execute(code);
+            diag::log_tagged_fmt("net_tools", "network_script_execute result_len=%zu", result.size());
             json r;
             r["output"] = result;
             return tool_result_t::ok(result.empty() ? "(no output)" : result, r);
@@ -2207,9 +2335,11 @@ void register_network_tools(mcp_standalone::server_t& srv) {
          {OBFSTR("dst_port"),  OBFSTR("number"), OBFSTR("Destination port for get_stream"), false}},
         [](const json& params) -> tool_result_t {
             const std::string op = params.value("operation", "");
+            diag::log_tagged_fmt("net_tools", "network_stream_track op=%s", op.c_str());
 
             if (op == "start") {
                 uint32_t pid = params.value("pid", 0u);
+                diag::log_tagged_fmt("net_tools", "network_stream_track start pid=%u", pid);
                 network_view::g_stream_tracker.start(pid);
                 json r;
                 r["status"] = "started";
@@ -2266,6 +2396,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
 
             if (op == "get_all") {
                 auto snaps = network_view::g_stream_tracker.get_all();
+                diag::log_tagged_fmt("net_tools", "network_stream_track get_all count=%zu", snaps.size());
                 json arr = json::array();
                 for (auto& s : snaps)
                     arr.push_back(snap_to_json(s));
@@ -2325,6 +2456,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
          {OBFSTR("session_id"), OBFSTR("number"), OBFSTR("Session ID returned by install (get_captures/uninstall)"), false}},
         [](const json& params) -> tool_result_t {
             const std::string op = params.value("operation", "");
+            diag::log_tagged_fmt("net_tools", "network_pg_sniff op=%s", op.c_str());
 
             if (op == "install") {
                 uint32_t pid = params.value("pid", 0u);
@@ -2350,7 +2482,9 @@ void register_network_tools(mcp_standalone::server_t& srv) {
 
                 uint64_t size = params.value("size", static_cast<uint64_t>(0x1000));
 
+                diag::log_tagged_fmt("net_tools", "network_pg_sniff install pid=%u addr=0x%llX size=%llu", pid, static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size));
                 uint32_t sid = page_guard_engine::g_pg_engine.install(pid, addr, size);
+                diag::log_tagged_fmt("net_tools", "network_pg_sniff install sid=%u", sid);
                 if (sid == 0)
                     return tool_result_t::error("Failed to install page guard. "
                                                 "Ensure the driver is connected and the "
@@ -2371,7 +2505,9 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 if (sid == 0)
                     return tool_result_t::error("'session_id' is required");
 
+                diag::log_tagged_fmt("net_tools", "network_pg_sniff get_captures sid=%u", sid);
                 auto caps = page_guard_engine::g_pg_engine.get_captures(sid);
+                diag::log_tagged_fmt("net_tools", "network_pg_sniff get_captures count=%zu", caps.size());
                 json arr  = json::array();
                 for (auto& c : caps) {
                     json o;
@@ -2453,20 +2589,25 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             if (op.empty())
                 return tool_result_t::error("Missing 'operation' parameter");
 
+            diag::log_tagged_fmt("net_tools", "network_packet_callstack op=%s", op.c_str());
             if (op == "enable") {
                 packet_callstack::set_enabled(true);
+                diag::log_tagged("net_tools", "network_packet_callstack enabled");
                 return tool_result_t::ok("Packet callstack capture enabled");
             }
             if (op == "disable") {
                 packet_callstack::set_enabled(false);
+                diag::log_tagged("net_tools", "network_packet_callstack disabled");
                 return tool_result_t::ok("Packet callstack capture disabled");
             }
             if (op == "clear") {
                 packet_callstack::clear();
+                diag::log_tagged("net_tools", "network_packet_callstack cleared");
                 return tool_result_t::ok("Packet callstack entries cleared");
             }
             if (op == "get") {
                 uint64_t idx = args.value("packet_index", static_cast<uint64_t>(0));
+                diag::log_tagged_fmt("net_tools", "network_packet_callstack get idx=%llu", static_cast<unsigned long long>(idx));
                 packet_callstack::packet_callstack_entry_t entry{};
                 if (!packet_callstack::get_callstack(idx, entry))
                     return tool_result_t::error("No callstack found for packet " + std::to_string(idx));
@@ -2491,6 +2632,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             if (op == "recent") {
                 size_t max_count = args.value("max_count", 64);
                 auto entries = packet_callstack::get_recent(max_count);
+                diag::log_tagged_fmt("net_tools", "network_packet_callstack recent count=%zu", entries.size());
                 json arr = json::array();
                 for (const auto& e : entries) {
                     json ej;
@@ -2526,15 +2668,20 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             if (op.empty())
                 return tool_result_t::error("Missing 'operation' parameter");
 
+            diag::log_tagged_fmt("net_tools", "network_pre_encrypt_hook op=%s", op.c_str());
             if (op == "auto_hook") {
                 uint32_t pid = args.value("pid", static_cast<uint32_t>(0));
                 if (pid == 0)
                     return tool_result_t::error("Missing 'pid' parameter for auto_hook");
-                if (!pre_encrypt_hook::auto_hook(pid))
+                diag::log_tagged_fmt("net_tools", "network_pre_encrypt_hook auto_hook pid=%u", pid);
+                if (!pre_encrypt_hook::auto_hook(pid)) {
+                    diag::log_tagged_fmt("net_tools", "network_pre_encrypt_hook auto_hook failed pid=%u", pid);
                     return tool_result_t::error("Failed to auto-hook encryption functions in PID " + std::to_string(pid));
+                }
                 pre_encrypt_hook::start_polling();
                 json r;
                 std::lock_guard<std::mutex> lock(pre_encrypt_hook::g_state.mutex);
+                diag::log_tagged_fmt("net_tools", "network_pre_encrypt_hook auto_hook hooks=%zu", pre_encrypt_hook::g_state.targets.size());
                 r["hooks_installed"] = static_cast<int>(pre_encrypt_hook::g_state.targets.size());
                 json hooks = json::array();
                 for (const auto& t : pre_encrypt_hook::g_state.targets) {
@@ -2569,6 +2716,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             if (op == "get_captures") {
                 size_t max_count = args.value("max_count", 64);
                 auto caps = pre_encrypt_hook::get_captures(max_count);
+                diag::log_tagged_fmt("net_tools", "network_pre_encrypt_hook get_captures count=%zu", caps.size());
                 json arr = json::array();
                 for (const auto& c : caps) {
                     json cj;
@@ -2629,9 +2777,11 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             if (expr.empty())
                 return tool_result_t::error("Missing 'expression' parameter");
 
+            diag::log_tagged_fmt("net_tools", "network_display_filter op=%s expr_len=%zu", op.c_str(), expr.size());
             if (op == "validate") {
                 std::string error;
                 bool valid = display_filter::validate(expr, error);
+                diag::log_tagged_fmt("net_tools", "network_display_filter validate valid=%d", (int)valid);
                 json r;
                 r["valid"] = valid;
                 if (!valid) r["error"] = error;
@@ -2669,6 +2819,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 }
 
                 bool match = filter.matches(pkt);
+                diag::log_tagged_fmt("net_tools", "network_display_filter test matches=%d", (int)match);
                 json r;
                 r["matches"] = match;
                 r["expression"] = expr;
@@ -2694,6 +2845,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             if (op.empty())
                 return tool_result_t::error("Missing 'operation' parameter");
 
+            diag::log_tagged_fmt("net_tools", "network_protobuf_decode op=%s", op.c_str());
             auto hex_to_bytes = [](const std::string& hex) -> std::vector<uint8_t> {
                 std::vector<uint8_t> result;
                 for (size_t i = 0; i < hex.size(); i += 2) {
@@ -2737,7 +2889,9 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 if (hex.empty())
                     return tool_result_t::error("Missing 'hex_data' parameter");
                 auto bytes = hex_to_bytes(hex);
+                diag::log_tagged_fmt("net_tools", "network_protobuf_decode decode bytes=%zu", bytes.size());
                 auto fields = protobuf_codec::decode(bytes.data(), bytes.size());
+                diag::log_tagged_fmt("net_tools", "network_protobuf_decode decode fields=%zu", fields.size());
                 if (fields.empty())
                     return tool_result_t::error("Failed to decode protobuf data");
                 protobuf_codec::auto_detect_types(fields);
@@ -2818,6 +2972,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             if (op.empty())
                 return tool_result_t::error(OBFSTR("Missing 'operation' parameter"));
 
+            diag::log_tagged_fmt("net_tools", "network_fuzzer op=%s", op.c_str());
             auto& state = network_view::g_state;
 
             if (op == "configure") {
@@ -2854,10 +3009,12 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 r["use_tls"] = cfg.use_tls;
                 r["attack_mode"] = static_cast<int>(cfg.attack_mode);
                 r["thread_count"] = cfg.thread_count;
+                diag::log_tagged_fmt("net_tools", "network_fuzzer configure host=%s port=%u use_tls=%d threads=%d", cfg.host.c_str(), cfg.port, (int)cfg.use_tls, cfg.thread_count);
                 return tool_result_t::ok(OBFSTR("Fuzzer configured"), r);
             }
 
             if (op == "start") {
+                diag::log_tagged_fmt("net_tools", "network_fuzzer start host=%s port=%u use_tls=%d", state.fuzz_config.host.c_str(), state.fuzz_config.port, (int)state.fuzz_config.use_tls);
                 if (state.fuzz_running.load())
                     return tool_result_t::error(OBFSTR("Fuzzer is already running"));
                 {
@@ -3072,7 +3229,9 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             }
 
             if (op == "stop") {
-                if (!state.fuzz_running.load())
+                bool was_running = state.fuzz_running.load();
+                diag::log_tagged_fmt("net_tools", "network_fuzzer stop was_running=%d", (int)was_running);
+                if (!was_running)
                     return tool_result_t::ok(OBFSTR("Fuzzer is not running"));
                 state.fuzz_running.store(false);
                 return tool_result_t::ok(OBFSTR("Fuzzer stop signal sent"));
@@ -3085,6 +3244,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 r["total"] = state.fuzz_total.load();
                 std::lock_guard<std::mutex> lk(state.fuzz_mutex);
                 r["result_count"] = static_cast<int>(state.fuzz_results.size());
+                diag::log_tagged_fmt("net_tools", "network_fuzzer status running=%d progress=%d total=%d results=%zu", (int)state.fuzz_running.load(), (int)state.fuzz_progress.load(), (int)state.fuzz_total.load(), state.fuzz_results.size());
                 return tool_result_t::ok(state.fuzz_running.load() ? OBFSTR("Fuzzer running") : OBFSTR("Fuzzer idle"), r);
             }
 
@@ -3116,14 +3276,17 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 json r;
                 r["results"] = arr;
                 r["total"] = static_cast<int>(state.fuzz_results.size());
+                diag::log_tagged_fmt("net_tools", "network_fuzzer get_results returned=%zu total=%zu", arr.size(), state.fuzz_results.size());
                 return tool_result_t::ok(std::to_string(state.fuzz_results.size()) + OBFSTR(" total results"), r);
             }
 
             if (op == "clear") {
                 std::lock_guard<std::mutex> lk(state.fuzz_mutex);
+                size_t was = state.fuzz_results.size();
                 state.fuzz_results.clear();
                 state.fuzz_progress.store(0);
                 state.fuzz_total.store(0);
+                diag::log_tagged_fmt("net_tools", "network_fuzzer clear cleared=%zu", was);
                 return tool_result_t::ok(OBFSTR("Fuzzer results cleared"));
             }
 
@@ -3148,11 +3311,14 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             if (op.empty())
                 return tool_result_t::error(OBFSTR("Missing 'operation' parameter"));
 
+            diag::log_tagged_fmt("net_tools", "network_websocket op=%s", op.c_str());
+
             auto& state = network_view::g_state;
 
             if (op == "list_frames") {
                 int max_count = args.value("max_count", 64);
                 std::string filter = args.value("filter", "");
+                diag::log_tagged_fmt("net_tools", "network_websocket list_frames max_count=%d filter=%s", max_count, filter.c_str());
                 std::lock_guard<std::mutex> lk(state.ws_mutex);
                 json arr = json::array();
                 int count = 0;
@@ -3179,19 +3345,24 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 json r;
                 r["frames"] = arr;
                 r["total_buffered"] = static_cast<int>(state.ws_frames.size());
+                diag::log_tagged_fmt("net_tools", "network_websocket list_frames returned=%d total_buffered=%zu", count, state.ws_frames.size());
                 return tool_result_t::ok(std::to_string(count) + OBFSTR(" WebSocket frames"), r);
             }
 
             if (op == "inject_frame") {
+                diag::log_tagged("net_tools", "network_websocket inject_frame not_supported");
                 return tool_result_t::error(OBFSTR("WebSocket frame injection requires an active proxy connection with an established WebSocket upgrade. Use the proxy to intercept and modify frames instead."));
             }
 
             if (op == "clear") {
                 std::lock_guard<std::mutex> lk(state.ws_mutex);
+                size_t was = state.ws_frames.size();
                 state.ws_frames.clear();
+                diag::log_tagged_fmt("net_tools", "network_websocket clear cleared=%zu", was);
                 return tool_result_t::ok(OBFSTR("WebSocket frame buffer cleared"));
             }
 
+            diag::log_tagged_fmt("net_tools", "network_websocket unknown_op op=%s", op.c_str());
             return tool_result_t::error(OBFSTR("Unknown operation. Use list_frames|inject_frame|clear"));
         }, true});
 
@@ -3212,8 +3383,12 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             if (op.empty())
                 return tool_result_t::error(OBFSTR("Missing 'operation' parameter"));
 
+            diag::log_tagged_fmt("net_tools", "network_proxy op=%s", op.c_str());
+
             if (op == "start") {
-                if (mitm_proxy::is_running())
+                bool already_running = mitm_proxy::is_running();
+                diag::log_tagged_fmt("net_tools", "network_proxy start already_running=%d", (int)already_running);
+                if (already_running)
                     return tool_result_t::error(OBFSTR("Proxy is already running"));
                 mitm_proxy::proxy_config cfg;
                 cfg.bind_addr = args.value("bind_addr", std::string("127.0.0.1"));
@@ -3221,7 +3396,10 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                     cfg.bind_port = static_cast<uint16_t>(args["port"].get<int>());
                 if (args.contains("decode_tls") && args["decode_tls"].is_boolean())
                     cfg.decode_tls = args["decode_tls"].get<bool>();
-                if (!mitm_proxy::start(cfg))
+                diag::log_tagged_fmt("net_tools", "network_proxy start bind_addr=%s port=%u decode_tls=%d", cfg.bind_addr.c_str(), (unsigned)cfg.bind_port, (int)cfg.decode_tls);
+                bool ok = mitm_proxy::start(cfg);
+                diag::log_tagged_fmt("net_tools", "network_proxy start result=%d", (int)ok);
+                if (!ok)
                     return tool_result_t::error(OBFSTR("Failed to start proxy"));
                 json r;
                 r["bind_addr"] = cfg.bind_addr;
@@ -3231,14 +3409,19 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             }
 
             if (op == "stop") {
-                if (!mitm_proxy::is_running())
+                bool was_running = mitm_proxy::is_running();
+                diag::log_tagged_fmt("net_tools", "network_proxy stop was_running=%d", (int)was_running);
+                if (!was_running)
                     return tool_result_t::ok(OBFSTR("Proxy is not running"));
                 mitm_proxy::stop();
+                diag::log_tagged("net_tools", "network_proxy stop done");
                 return tool_result_t::ok(OBFSTR("Proxy stopped"));
             }
 
             if (op == "status") {
                 auto stats = mitm_proxy::get_stats();
+                diag::log_tagged_fmt("net_tools", "network_proxy status running=%d requests=%llu history=%zu held=%zu active=%zu",
+                    (int)stats.running, (unsigned long long)stats.total_requests, stats.history_size, stats.held_count, stats.active_connections);
                 json r;
                 r["running"] = stats.running;
                 r["total_requests"] = stats.total_requests;
@@ -3253,6 +3436,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             if (op == "get_history") {
                 size_t max_count = args.value("max_count", static_cast<size_t>(100));
                 std::string filter = args.value("filter", "");
+                diag::log_tagged_fmt("net_tools", "network_proxy get_history max_count=%zu filter=%s", max_count, filter.c_str());
                 auto history = mitm_proxy::get_history(max_count);
                 json arr = json::array();
                 for (const auto& ex : history) {
@@ -3279,11 +3463,13 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 json r;
                 r["exchanges"] = arr;
                 r["count"] = static_cast<int>(arr.size());
+                diag::log_tagged_fmt("net_tools", "network_proxy get_history returned=%zu fetched=%zu", arr.size(), history.size());
                 return tool_result_t::ok(std::to_string(arr.size()) + OBFSTR(" proxy exchanges"), r);
             }
 
             if (op == "clear_history") {
                 mitm_proxy::clear_history();
+                diag::log_tagged("net_tools", "network_proxy clear_history done");
                 return tool_result_t::ok(OBFSTR("Proxy history cleared"));
             }
 
@@ -3291,9 +3477,13 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 if (!args.contains("exchange_id") || !args["exchange_id"].is_number())
                     return tool_result_t::error(OBFSTR("Missing 'exchange_id' parameter"));
                 uint64_t eid = args["exchange_id"].get<uint64_t>();
+                diag::log_tagged_fmt("net_tools", "network_proxy get_exchange eid=%llu", (unsigned long long)eid);
                 const auto* ex = mitm_proxy::find_exchange(eid);
-                if (!ex)
+                if (!ex) {
+                    diag::log_tagged_fmt("net_tools", "network_proxy get_exchange not_found eid=%llu", (unsigned long long)eid);
                     return tool_result_t::error(OBFSTR("Exchange not found: ") + std::to_string(eid));
+                }
+                diag::log_tagged_fmt("net_tools", "network_proxy get_exchange found eid=%llu method=%s host=%s status=%d", (unsigned long long)eid, ex->request.method.c_str(), ex->target_host.c_str(), ex->response.status_code);
                 json r;
                 r["id"] = ex->id;
                 r["method"] = ex->request.method;
@@ -3329,6 +3519,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 return tool_result_t::ok(OBFSTR("Exchange ") + std::to_string(eid), r);
             }
 
+            diag::log_tagged_fmt("net_tools", "network_proxy unknown_op op=%s", op.c_str());
             return tool_result_t::error(OBFSTR("Unknown operation. Use start|stop|status|get_history|clear_history|get_exchange"));
         }, false});
 
@@ -3348,6 +3539,8 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             if (op.empty())
                 return tool_result_t::error(OBFSTR("Missing 'operation' parameter"));
 
+            diag::log_tagged_fmt("net_tools", "network_repeater op=%s", op.c_str());
+
             auto& state = network_view::g_state;
 
             if (op == "create") {
@@ -3361,6 +3554,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                     entry->raw_request = args["raw_request"].get<std::string>();
                 state.repeater_entries.push_back(entry);
                 int idx = static_cast<int>(state.repeater_entries.size()) - 1;
+                diag::log_tagged_fmt("net_tools", "network_repeater create host=%s port=%u use_tls=%d idx=%d", entry->host.c_str(), (unsigned)entry->port, (int)entry->use_tls, idx);
                 json r;
                 r["index"] = idx;
                 r["host"] = entry->host;
@@ -3372,13 +3566,16 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 if (!args.contains("index") || !args["index"].is_number())
                     return tool_result_t::error(OBFSTR("Missing 'index' parameter"));
                 int idx = args["index"].get<int>();
+                diag::log_tagged_fmt("net_tools", "network_repeater send idx=%d total_entries=%zu", idx, state.repeater_entries.size());
                 if (idx < 0 || idx >= static_cast<int>(state.repeater_entries.size()))
                     return tool_result_t::error(OBFSTR("Invalid repeater entry index"));
                 std::shared_ptr<network_view::repeater_entry_t> entry = state.repeater_entries[static_cast<size_t>(idx)];
                 if (!entry)
                     return tool_result_t::error(OBFSTR("Invalid repeater entry"));
-                if (entry->in_progress.load())
+                if (entry->in_progress.load()) {
+                    diag::log_tagged_fmt("net_tools", "network_repeater send already_in_progress idx=%d", idx);
                     return tool_result_t::error(OBFSTR("Request already in progress for this entry"));
+                }
                 if (args.contains("raw_request") && args["raw_request"].is_string())
                     entry->raw_request = args["raw_request"].get<std::string>();
                 if (args.contains("host") && args["host"].is_string())
@@ -3395,7 +3592,9 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 uint16_t port = entry->port;
                 bool tls = entry->use_tls;
                 std::vector<uint8_t> raw(entry->raw_request.begin(), entry->raw_request.end());
+                diag::log_tagged_fmt("net_tools", "network_repeater send dispatch host=%s port=%u tls=%d raw_size=%zu idx=%d", host.c_str(), (unsigned)port, (int)tls, raw.size(), idx);
                 work_queue::post([entry, host, port, tls, raw]() {
+                    diag::log_tagged_fmt("net_tools", "network_repeater send_worker host=%s port=%u tls=%d raw_size=%zu", host.c_str(), (unsigned)port, (int)tls, raw.size());
                     auto t0 = GetTickCount64();
                     auto res = mitm_proxy::repeat_request(host, port, tls, raw);
                     uint64_t latency = GetTickCount64() - t0;
@@ -3404,9 +3603,11 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                         entry->status_code = res.exchange.response.status_code;
                         entry->raw_response = std::string(res.exchange.raw_response.begin(),
                                                           res.exchange.raw_response.end());
+                        diag::log_tagged_fmt("net_tools", "network_repeater send_worker success status=%d latency_ms=%llu resp_size=%zu", entry->status_code, (unsigned long long)latency, entry->raw_response.size());
                     } else {
                         entry->status_code = 0;
                         entry->raw_response = res.error;
+                        diag::log_tagged_fmt("net_tools", "network_repeater send_worker failed error=%s latency_ms=%llu", res.error.c_str(), (unsigned long long)latency);
                     }
                     entry->in_progress.store(false);
                 });
@@ -3418,6 +3619,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
 
             if (op == "list") {
                 int max_count = args.value("max_count", static_cast<int>(state.repeater_entries.size()));
+                diag::log_tagged_fmt("net_tools", "network_repeater list max_count=%d total=%zu", max_count, state.repeater_entries.size());
                 json arr = json::array();
                 for (int i = 0; i < static_cast<int>(state.repeater_entries.size()) && i < max_count; i++) {
                     const auto& e_ptr = state.repeater_entries[static_cast<size_t>(i)];
@@ -3436,6 +3638,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 json r;
                 r["entries"] = arr;
                 r["count"] = static_cast<int>(state.repeater_entries.size());
+                diag::log_tagged_fmt("net_tools", "network_repeater list returned=%zu total=%zu", arr.size(), state.repeater_entries.size());
                 return tool_result_t::ok(std::to_string(state.repeater_entries.size()) + OBFSTR(" repeater entries"), r);
             }
 
@@ -3443,12 +3646,14 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 if (!args.contains("index") || !args["index"].is_number())
                     return tool_result_t::error(OBFSTR("Missing 'index' parameter"));
                 int idx = args["index"].get<int>();
+                diag::log_tagged_fmt("net_tools", "network_repeater get idx=%d total=%zu", idx, state.repeater_entries.size());
                 if (idx < 0 || idx >= static_cast<int>(state.repeater_entries.size()))
                     return tool_result_t::error(OBFSTR("Invalid repeater entry index"));
                 const auto& e_ptr = state.repeater_entries[static_cast<size_t>(idx)];
                 if (!e_ptr)
                     return tool_result_t::error(OBFSTR("Invalid repeater entry"));
                 const auto& e = *e_ptr;
+                diag::log_tagged_fmt("net_tools", "network_repeater get found idx=%d host=%s port=%u status=%d in_progress=%d", idx, e.host.c_str(), (unsigned)e.port, e.status_code, (int)e.in_progress.load());
                 json r;
                 r["index"] = idx;
                 r["host"] = e.host;
@@ -3466,15 +3671,20 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 if (!args.contains("index") || !args["index"].is_number())
                     return tool_result_t::error(OBFSTR("Missing 'index' parameter"));
                 int idx = args["index"].get<int>();
+                diag::log_tagged_fmt("net_tools", "network_repeater delete idx=%d total=%zu", idx, state.repeater_entries.size());
                 if (idx < 0 || idx >= static_cast<int>(state.repeater_entries.size()))
                     return tool_result_t::error(OBFSTR("Invalid repeater entry index"));
                 const auto& del_ptr = state.repeater_entries[static_cast<size_t>(idx)];
-                if (del_ptr && del_ptr->in_progress.load())
+                if (del_ptr && del_ptr->in_progress.load()) {
+                    diag::log_tagged_fmt("net_tools", "network_repeater delete blocked_in_progress idx=%d", idx);
                     return tool_result_t::error(OBFSTR("Cannot delete entry while request is in progress"));
+                }
                 state.repeater_entries.erase(state.repeater_entries.begin() + idx);
+                diag::log_tagged_fmt("net_tools", "network_repeater delete done idx=%d remaining=%zu", idx, state.repeater_entries.size());
                 return tool_result_t::ok(OBFSTR("Repeater entry ") + std::to_string(idx) + OBFSTR(" deleted"));
             }
 
+            diag::log_tagged_fmt("net_tools", "network_repeater unknown_op op=%s", op.c_str());
             return tool_result_t::error(OBFSTR("Unknown operation. Use create|send|list|get|delete"));
         }, false});
 

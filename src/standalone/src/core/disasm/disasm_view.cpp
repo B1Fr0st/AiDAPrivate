@@ -4212,6 +4212,16 @@ void render(float pos_x, float pos_y, float width, float height,
 
     const uint64_t frame_t0_ns = now_ns();
 
+    {
+        static uint32_t s_render_call_count = 0;
+        if (s_render_call_count < 10 || (s_render_call_count & 0x3FF) == 0) {
+            diag::log_tagged_fmt("disasm_view", "render_enter call=%u instrs=%zu live_mode=%d selected_row=%d",
+                s_render_call_count, disasm.file.instrs.size(),
+                disasm.live_mode ? 1 : 0, g_state.selected_row);
+        }
+        ++s_render_call_count;
+    }
+
     ensure_pdb_event_subscriptions();
 
     auto& st    = g_state;
@@ -4442,8 +4452,13 @@ void render(float pos_x, float pos_y, float width, float height,
 
     if (s_last_known_n != n) {
         if (disasm.last_swap_was_live) {
+            diag::log_tagged_fmt("disasm_view", "instr_count_changed_live prev=%d new=%d image_base=0x%llX",
+                s_last_known_n, n, static_cast<unsigned long long>(disasm.file.image_base));
             s_last_known_n = n;
         } else {
+            diag::log_tagged_fmt("disasm_view", "instr_count_changed_static prev=%d new=%d filename=%s image_base=0x%llX",
+                s_last_known_n, n, disasm.file.filename.c_str(),
+                static_cast<unsigned long long>(disasm.file.image_base));
             s_first_load_anim = 0.f;
             s_row_entrance.clear();
             s_row_hover.clear();
@@ -4577,7 +4592,11 @@ void render(float pos_x, float pos_y, float width, float height,
             }
         }
         if (need_rebuild) {
+            diag::log_tagged_fmt("disasm_view", "rebuild_layout n=%d banner_lines=%d gen=%u fi_sig=0x%llX",
+                static_cast<int>(instrs.size()), banner_lines, cur_gen_for_layout,
+                static_cast<unsigned long long>(fi_sig));
             rebuild_layout(instrs, banner_lines, cur_gen_for_layout, fi_sig);
+            diag::log_tagged_fmt("disasm_view", "rebuild_layout_done total_rows=%d", s_layout.total_rows);
         }
     }
 
@@ -6410,6 +6429,8 @@ void render(float pos_x, float pos_y, float width, float height,
             }
             if (has_bm) {
                 if (ImGui::MenuItem("Remove Bookmark")) {
+                    diag::log_tagged_fmt("disasm_view", "ctx_remove_bookmark addr=0x%llX",
+                        static_cast<unsigned long long>(ci.addr));
                     st.bookmarks.erase(st.bookmarks.begin() + bm_idx);
                 }
             } else {
@@ -6420,12 +6441,17 @@ void render(float pos_x, float pos_y, float width, float height,
                     snprintf(lbl, sizeof(lbl), "0x%llX", static_cast<unsigned long long>(ci.addr));
                     bm.label = lbl;
                     st.bookmarks.push_back(bm);
+                    diag::log_tagged_fmt("disasm_view", "ctx_add_bookmark addr=0x%llX total=%zu",
+                        static_cast<unsigned long long>(ci.addr), st.bookmarks.size());
                 }
             }
 
 
             if (ci.is_branch || ci.is_call) {
                 if (ImGui::MenuItem("Follow Target")) {
+                    diag::log_tagged_fmt("disasm_view", "ctx_follow_target from=0x%llX to=0x%llX is_call=%d",
+                        static_cast<unsigned long long>(ci.addr),
+                        static_cast<unsigned long long>(ci.branch_target), ci.is_call ? 1 : 0);
                     if (ci.branch_target != 0)
                         goto_address(ci.branch_target, disasm);
                 }
@@ -6436,12 +6462,14 @@ void render(float pos_x, float pos_y, float width, float height,
 
             if (ImGui::MenuItem("VA Format", nullptr, st.addr_format == addr_format_t::va)) {
                 if (st.addr_format != addr_format_t::va) {
+                    diag::log_tagged_fmt("disasm_view", "ctx_addr_format_va");
                     st.addr_format = addr_format_t::va;
                     bump_format_generation();
                 }
             }
             if (ImGui::MenuItem("RVA Format", nullptr, st.addr_format == addr_format_t::rva)) {
                 if (st.addr_format != addr_format_t::rva) {
+                    diag::log_tagged_fmt("disasm_view", "ctx_addr_format_rva");
                     st.addr_format = addr_format_t::rva;
                     bump_format_generation();
                 }
@@ -6471,6 +6499,8 @@ void render(float pos_x, float pos_y, float width, float height,
                     static_cast<unsigned long long>(rc_entry));
             }
             if (ImGui::MenuItem("Reconstruct Source")) {
+                diag::log_tagged_fmt("disasm_view", "ctx_reconstruct_source addr=0x%llX",
+                    static_cast<unsigned long long>(ci.addr));
                 source_reconstruct_view::open();
             }
             if (ImGui::MenuItem("Generate AOB Signature")) {
@@ -6655,6 +6685,8 @@ void render(float pos_x, float pos_y, float width, float height,
                     cmt_addr = instrs[st.selected_row].addr;
                 else if (n > 0)
                     cmt_addr = instrs[0].addr;
+                diag::log_tagged_fmt("disasm_view", "key_semicolon_comment addr=0x%llX",
+                    static_cast<unsigned long long>(cmt_addr));
                 if (cmt_addr != 0)
                     comment_dialog::open(cmt_addr);
             }
@@ -6665,9 +6697,13 @@ void render(float pos_x, float pos_y, float width, float height,
                     cursor_addr = instrs[st.selected_row].addr;
                 else if (n > 0)
                     cursor_addr = instrs[0].addr;
+                diag::log_tagged_fmt("disasm_view", "key_space_cfg cursor=0x%llX",
+                    static_cast<unsigned long long>(cursor_addr));
                 if (cursor_addr != 0) {
                     uint64_t entry = find_enclosing_function_start(cursor_addr, disasm.file);
                     if (entry == 0) entry = cursor_addr;
+                    diag::log_tagged_fmt("disasm_view", "key_space_cfg_build entry=0x%llX",
+                        static_cast<unsigned long long>(entry));
                     cfg_view::g_state.current_rip = cursor_addr;
                     cfg_view::g_state.last_cursor_addr = cursor_addr;
                     if (cfg_view::g_state.entry_addr != entry || !cfg_view::g_state.built)
@@ -6734,6 +6770,8 @@ void render(float pos_x, float pos_y, float width, float height,
                     rename_addr = instrs[row].addr;
                 else if (n > 0)
                     rename_addr = instrs[0].addr;
+                diag::log_tagged_fmt("disasm_view", "key_n_rename addr=0x%llX",
+                    static_cast<unsigned long long>(rename_addr));
                 if (rename_addr != 0)
                     rename_dialog::open(rename_addr);
             }
@@ -6868,9 +6906,14 @@ void render(float pos_x, float pos_y, float width, float height,
             }
 
             if (resolved_ok) {
+                diag::log_tagged_fmt("disasm_view", "goto_bar_navigate input=%s resolved=0x%llX",
+                    trimmed_input.c_str(), static_cast<unsigned long long>(resolved_addr));
                 goto_address(resolved_addr, disasm);
                 st.goto_visible = false;
                 st.goto_buf[0] = '\0';
+            } else if (!trimmed_input.empty()) {
+                diag::log_tagged_fmt("disasm_view", "goto_bar_unresolved input=%s",
+                    trimmed_input.c_str());
             }
         }
         ImGui::SameLine();

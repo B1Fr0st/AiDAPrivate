@@ -1,5 +1,7 @@
 #include "../scanner_module.hpp"
 
+#include "../../../../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <optional>
@@ -32,6 +34,8 @@ bool body_contains_nosql_error(const exchange_observed_t& resp)
 
 std::vector<probe_t> nosqli_probes(const insertion_point_t& ip, const module_context_t&)
 {
+    diag::log_tagged_fmt("mod_nosqli", "nosqli_probes entry ip=%s:%s orig=%s",
+                         ip.kind.c_str(), ip.name.c_str(), ip.original_value.c_str());
     std::vector<probe_t> out;
     std::string base = ip.original_value;
     out.push_back({ base + "[$ne]=1",          "_AIDA_NOSQLI", "operator-ne" });
@@ -42,12 +46,15 @@ std::vector<probe_t> nosqli_probes(const insertion_point_t& ip, const module_con
     out.push_back({ std::string("{\"$gt\":\"\"}"),                "_AIDA_NOSQLI", "json-gt-empty" });
     out.push_back({ std::string("{\"$regex\":\".*\"}"),           "_AIDA_NOSQLI", "json-regex-dotstar" });
     out.push_back({ std::string("{\"$in\":[\"\",\"admin\",\"user\"]}"), "_AIDA_NOSQLI", "json-in-array" });
+    diag::log_tagged_fmt("mod_nosqli", "nosqli_probes built %zu probes ip=%s:%s", out.size(), ip.kind.c_str(), ip.name.c_str());
     return out;
 }
 
 std::optional<issue_t> nosqli_detect(const insertion_point_t& ip, const probe_t& probe,
                                      const exchange_observed_t& resp, const module_context_t& ctx)
 {
+    diag::log_tagged_fmt("mod_nosqli", "nosqli_detect entry ip=%s:%s variant=%s status=%d",
+                         ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str(), resp.status_code);
     if (probe.marker != "_AIDA_NOSQLI") return std::nullopt;
     bool err = body_contains_nosql_error(resp);
 
@@ -60,7 +67,13 @@ std::optional<issue_t> nosqli_detect(const insertion_point_t& ip, const probe_t&
         if (mx > 0 && (mx - mn) * 10 > mx) differential = true;
     }
 
-    if (!err && !differential) return std::nullopt;
+    diag::log_tagged_fmt("mod_nosqli", "nosqli_detect err=%d differential=%d variant=%s", err ? 1 : 0, differential ? 1 : 0, probe.variant.c_str());
+    if (!err && !differential) {
+        diag::log_tagged_fmt("mod_nosqli", "nosqli_detect no finding ip=%s:%s variant=%s", ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str());
+        return std::nullopt;
+    }
+    diag::log_tagged_fmt("mod_nosqli", "nosqli_detect FINDING injection ip=%s:%s variant=%s err=%d differential=%d",
+                         ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str(), err ? 1 : 0, differential ? 1 : 0);
     confidence_t conf = err ? confidence_t::firm : confidence_t::tentative;
     auto iss = make_issue("nosqli.injection",
                           std::string("Possible NoSQL Injection (") + probe.variant + ")",

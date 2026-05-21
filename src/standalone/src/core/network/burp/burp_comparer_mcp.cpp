@@ -87,6 +87,7 @@ tool_result_t handle_add_slot(const json& p)
 {
     std::string label = (p.contains("label") && p["label"].is_string()) ? p["label"].get<std::string>() : "Slot";
     std::string hint  = (p.contains("source_hint") && p["source_hint"].is_string()) ? p["source_hint"].get<std::string>() : "mcp";
+    diag::log_tagged_fmt("mcp_burp", "comparer_add_slot label=%s hint=%s", label.c_str(), hint.c_str());
 
     std::vector<uint8_t> data;
     if (p.contains("data_b64") && p["data_b64"].is_string()) {
@@ -95,9 +96,11 @@ tool_result_t handle_add_slot(const json& p)
         const std::string& s = p["data_text"].get_ref<const std::string&>();
         data.assign(s.begin(), s.end());
     } else {
+        diag::log_tagged_fmt("mcp_burp", "comparer_add_slot missing data");
         return tool_result_t::error("data_b64 or data_text required");
     }
     uint64_t id = aida::burp::comparer::add_slot_from_bytes(label, data, hint);
+    diag::log_tagged_fmt("mcp_burp", "comparer_add_slot ok slot_id=%llu bytes=%zu", static_cast<unsigned long long>(id), data.size());
     json out;
     out["slot_id"] = id;
     return tool_result_t::ok("slot added", out);
@@ -105,6 +108,7 @@ tool_result_t handle_add_slot(const json& p)
 
 tool_result_t handle_list(const json&)
 {
+    diag::log_tagged_fmt("mcp_burp", "comparer_list entry");
     auto v = aida::burp::comparer::list_slots();
     json arr = json::array();
     for (const auto& s : v) {
@@ -116,6 +120,7 @@ tool_result_t handle_list(const json&)
         e["created_ms"] = static_cast<uint64_t>(s.created_ms);
         arr.push_back(std::move(e));
     }
+    diag::log_tagged_fmt("mcp_burp", "comparer_list ok count=%zu", v.size());
     json out;
     out["slots"] = std::move(arr);
     return tool_result_t::ok("slots", out);
@@ -123,29 +128,55 @@ tool_result_t handle_list(const json&)
 
 tool_result_t handle_remove(const json& p)
 {
-    if (!p.contains("slot_id") || !p["slot_id"].is_number()) return tool_result_t::error("slot_id required");
-    bool ok = aida::burp::comparer::remove_slot(p["slot_id"].get<uint64_t>());
-    if (!ok) return tool_result_t::error("slot not found");
+    diag::log_tagged_fmt("mcp_burp", "comparer_remove entry");
+    if (!p.contains("slot_id") || !p["slot_id"].is_number())
+    {
+        diag::log_tagged_fmt("mcp_burp", "comparer_remove missing slot_id");
+        return tool_result_t::error("slot_id required");
+    }
+    const uint64_t sid = p["slot_id"].get<uint64_t>();
+    diag::log_tagged_fmt("mcp_burp", "comparer_remove slot_id=%llu", static_cast<unsigned long long>(sid));
+    bool ok = aida::burp::comparer::remove_slot(sid);
+    if (!ok)
+    {
+        diag::log_tagged_fmt("mcp_burp", "comparer_remove not_found id=%llu", static_cast<unsigned long long>(sid));
+        return tool_result_t::error("slot not found");
+    }
+    diag::log_tagged_fmt("mcp_burp", "comparer_remove ok slot_id=%llu", static_cast<unsigned long long>(sid));
     return tool_result_t::ok("slot removed");
 }
 
 tool_result_t handle_clear(const json&)
 {
+    diag::log_tagged_fmt("mcp_burp", "comparer_clear entry");
     aida::burp::comparer::clear_slots();
+    diag::log_tagged_fmt("mcp_burp", "comparer_clear ok");
     return tool_result_t::ok("cleared");
 }
 
 tool_result_t handle_diff(const json& p)
 {
-    if (!p.contains("slot_a") || !p["slot_a"].is_number()) return tool_result_t::error("slot_a required");
-    if (!p.contains("slot_b") || !p["slot_b"].is_number()) return tool_result_t::error("slot_b required");
+    diag::log_tagged_fmt("mcp_burp", "comparer_diff entry");
+    if (!p.contains("slot_a") || !p["slot_a"].is_number())
+    {
+        diag::log_tagged_fmt("mcp_burp", "comparer_diff missing slot_a");
+        return tool_result_t::error("slot_a required");
+    }
+    if (!p.contains("slot_b") || !p["slot_b"].is_number())
+    {
+        diag::log_tagged_fmt("mcp_burp", "comparer_diff missing slot_b");
+        return tool_result_t::error("slot_b required");
+    }
 
+    const uint64_t sa = p["slot_a"].get<uint64_t>();
+    const uint64_t sb = p["slot_b"].get<uint64_t>();
     aida::burp::comparer::diff_mode_t mode = aida::burp::comparer::diff_mode_t::lines;
     if (p.contains("mode") && p["mode"].is_string()) mode = parse_mode(p["mode"].get<std::string>());
+    diag::log_tagged_fmt("mcp_burp", "comparer_diff slot_a=%llu slot_b=%llu mode=%s", static_cast<unsigned long long>(sa), static_cast<unsigned long long>(sb), p.value("mode", std::string("lines")).c_str());
 
     aida::burp::comparer::diff_stats_t stats;
-    auto blocks = aida::burp::comparer::compute_diff_with_stats(
-        p["slot_a"].get<uint64_t>(), p["slot_b"].get<uint64_t>(), mode, stats);
+    auto blocks = aida::burp::comparer::compute_diff_with_stats(sa, sb, mode, stats);
+    diag::log_tagged_fmt("mcp_burp", "comparer_diff ok blocks=%zu truncated=%d", blocks.size(), (int)stats.truncated);
 
     json arr = json::array();
     for (const auto& b : blocks) {

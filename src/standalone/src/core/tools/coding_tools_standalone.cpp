@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include "mcp_standalone.hpp"
+#include "../../helpers/diag_log.hpp"
 #include "standalone_tools_fwd.hpp"
 #include "standalone_license.hpp"
 #include "standalone_settings.hpp"
@@ -128,36 +129,64 @@ static bool ensure_coding_tool_runtime(const char* tool_name, tool_result_t& out
 
 static tool_result_t tool_read_file(const json& params)
 {
+    diag::log_tagged_fmt("coding", "read_file entry path='%.120s'",
+        params.contains("path") && params["path"].is_string()
+            ? params["path"].get<std::string>().c_str() : "");
     tool_result_t gate_error;
     if (!ensure_coding_tool_runtime("read_file", gate_error))
+    {
+        diag::log_tagged_fmt("coding", "read_file gate fail");
         return gate_error;
+    }
 
     if (!params.contains("path") || !params["path"].is_string())
+    {
+        diag::log_tagged_fmt("coding", "read_file missing path");
         return tool_result_t::error("Missing required parameter: path");
+    }
 
     std::string path = sanitize_path(params["path"].get<std::string>());
+    diag::log_tagged_fmt("coding", "read_file resolved='%.120s'", path.c_str());
     if (!path_within_workspace(path))
+    {
+        diag::log_tagged_fmt("coding", "read_file outside workspace path='%.120s'", path.c_str());
         return tool_result_t::error("Path is outside the workspace.");
+    }
 
     std::error_code ec;
     if (!fs::exists(path, ec))
+    {
+        diag::log_tagged_fmt("coding", "read_file not found path='%.120s'", path.c_str());
         return tool_result_t::error("File not found: " + path);
+    }
 
     if (fs::is_directory(path, ec))
+    {
+        diag::log_tagged_fmt("coding", "read_file is directory path='%.120s'", path.c_str());
         return tool_result_t::error("Path is a directory, not a file. Use list_directory instead.");
+    }
 
     auto file_size = fs::file_size(path, ec);
     if (ec || file_size > 2 * 1024 * 1024)
+    {
+        diag::log_tagged_fmt("coding", "read_file too large size=%llu path='%.120s'",
+            (unsigned long long)file_size, path.c_str());
         return tool_result_t::error("File too large (>2MB). Use read_file with line range instead.");
+    }
 
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs.is_open())
+    {
+        diag::log_tagged_fmt("coding", "read_file open fail path='%.120s'", path.c_str());
         return tool_result_t::error("Cannot open file: " + path);
+    }
 
     std::string content((std::istreambuf_iterator<char>(ifs)),
                          std::istreambuf_iterator<char>());
     ifs.close();
 
+    diag::log_tagged_fmt("coding", "read_file loaded bytes=%zu path='%.120s'",
+        content.size(), path.c_str());
     int start_line = 1;
     int end_line   = 0;
 
@@ -203,18 +232,33 @@ static tool_result_t tool_read_file(const json& params)
 
 static tool_result_t tool_write_file(const json& params)
 {
+    diag::log_tagged_fmt("coding", "write_file entry path='%.120s'",
+        params.contains("path") && params["path"].is_string()
+            ? params["path"].get<std::string>().c_str() : "");
     tool_result_t gate_error;
     if (!ensure_coding_tool_runtime("write_file", gate_error))
+    {
+        diag::log_tagged_fmt("coding", "write_file gate fail");
         return gate_error;
+    }
 
     if (!params.contains("path") || !params["path"].is_string())
+    {
+        diag::log_tagged_fmt("coding", "write_file missing path");
         return tool_result_t::error("Missing required parameter: path");
+    }
     if (!params.contains("content") || !params["content"].is_string())
+    {
+        diag::log_tagged_fmt("coding", "write_file missing content");
         return tool_result_t::error("Missing required parameter: content");
+    }
 
     std::string path = sanitize_path(params["path"].get<std::string>());
     if (!path_within_workspace(path))
+    {
+        diag::log_tagged_fmt("coding", "write_file outside workspace path='%.120s'", path.c_str());
         return tool_result_t::error("Path is outside the workspace.");
+    }
 
     const std::string& content = params["content"].get_ref<const std::string&>();
 
@@ -226,10 +270,15 @@ static tool_result_t tool_write_file(const json& params)
 
     std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
     if (!ofs.is_open())
+    {
+        diag::log_tagged_fmt("coding", "write_file open fail path='%.120s'", path.c_str());
         return tool_result_t::error("Cannot create/open file: " + path);
+    }
 
     ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
     ofs.close();
+    diag::log_tagged_fmt("coding", "write_file ok bytes=%zu path='%.120s'",
+        content.size(), path.c_str());
 
 
     if (code_editor::active && code_editor::filepath == path) {
@@ -254,24 +303,45 @@ static tool_result_t tool_write_file(const json& params)
 
 static tool_result_t tool_edit_file(const json& params)
 {
+    diag::log_tagged_fmt("coding", "edit_file entry path='%.120s'",
+        params.contains("path") && params["path"].is_string()
+            ? params["path"].get<std::string>().c_str() : "");
     tool_result_t gate_error;
     if (!ensure_coding_tool_runtime("edit_file", gate_error))
+    {
+        diag::log_tagged_fmt("coding", "edit_file gate fail");
         return gate_error;
+    }
 
     if (!params.contains("path") || !params["path"].is_string())
+    {
+        diag::log_tagged_fmt("coding", "edit_file missing path");
         return tool_result_t::error("Missing required parameter: path");
+    }
     if (!params.contains("old_text") || !params["old_text"].is_string())
+    {
+        diag::log_tagged_fmt("coding", "edit_file missing old_text");
         return tool_result_t::error("Missing required parameter: old_text");
+    }
     if (!params.contains("new_text") || !params["new_text"].is_string())
+    {
+        diag::log_tagged_fmt("coding", "edit_file missing new_text");
         return tool_result_t::error("Missing required parameter: new_text");
+    }
 
     std::string path = sanitize_path(params["path"].get<std::string>());
     if (!path_within_workspace(path))
+    {
+        diag::log_tagged_fmt("coding", "edit_file outside workspace path='%.120s'", path.c_str());
         return tool_result_t::error("Path is outside the workspace.");
+    }
 
     std::error_code ec;
     if (!fs::exists(path, ec))
+    {
+        diag::log_tagged_fmt("coding", "edit_file not found path='%.120s'", path.c_str());
         return tool_result_t::error("File not found: " + path);
+    }
 
 
     std::ifstream ifs(path, std::ios::binary);
@@ -287,14 +357,19 @@ static tool_result_t tool_edit_file(const json& params)
 
     size_t pos = content.find(old_text);
     if (pos == std::string::npos)
+    {
+        diag::log_tagged_fmt("coding", "edit_file old_text not found path='%.120s'", path.c_str());
         return tool_result_t::error("old_text not found in file. Ensure it matches exactly "
                                     "(including whitespace and indentation).");
-
+    }
 
     size_t second = content.find(old_text, pos + old_text.size());
     if (second != std::string::npos)
+    {
+        diag::log_tagged_fmt("coding", "edit_file old_text ambiguous path='%.120s'", path.c_str());
         return tool_result_t::error("old_text matches multiple locations (" +
             std::to_string(2) + "+). Include more surrounding context to match uniquely.");
+    }
 
 
     content.replace(pos, old_text.size(), new_text);
@@ -302,9 +377,13 @@ static tool_result_t tool_edit_file(const json& params)
 
     std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
     if (!ofs.is_open())
+    {
+        diag::log_tagged_fmt("coding", "edit_file write fail path='%.120s'", path.c_str());
         return tool_result_t::error("Cannot write file: " + path);
+    }
     ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
     ofs.close();
+    diag::log_tagged_fmt("coding", "edit_file ok path='%.120s'", path.c_str());
 
 
     if (code_editor::active && code_editor::filepath == path) {
@@ -331,9 +410,15 @@ static tool_result_t tool_edit_file(const json& params)
 
 static tool_result_t tool_list_directory(const json& params)
 {
+    diag::log_tagged_fmt("coding", "list_directory entry path='%.120s'",
+        params.contains("path") && params["path"].is_string()
+            ? params["path"].get<std::string>().c_str() : "");
     tool_result_t gate_error;
     if (!ensure_coding_tool_runtime("list_directory", gate_error))
+    {
+        diag::log_tagged_fmt("coding", "list_directory gate fail");
         return gate_error;
+    }
 
     std::string path;
     if (params.contains("path") && params["path"].is_string())
@@ -341,11 +426,18 @@ static tool_result_t tool_list_directory(const json& params)
     else if (!file_browser::current_dir.empty())
         path = file_browser::current_dir;
     else
+    {
+        diag::log_tagged_fmt("coding", "list_directory no path no workspace");
         return tool_result_t::error("No path specified and no workspace directory set.");
+    }
 
+    diag::log_tagged_fmt("coding", "list_directory resolved='%.120s'", path.c_str());
     std::error_code ec;
     if (!fs::is_directory(path, ec))
+    {
+        diag::log_tagged_fmt("coding", "list_directory not a dir path='%.120s'", path.c_str());
         return tool_result_t::error("Not a directory: " + path);
+    }
 
     std::string output;
     int count = 0;
@@ -375,24 +467,40 @@ static tool_result_t tool_list_directory(const json& params)
     }
 
     if (output.empty())
+    {
+        diag::log_tagged_fmt("coding", "list_directory empty path='%.120s'", path.c_str());
         return tool_result_t::ok("Directory is empty: " + path);
+    }
 
+    diag::log_tagged_fmt("coding", "list_directory ok count=%d path='%.120s'", count, path.c_str());
     return tool_result_t::ok("Contents of " + path + ":\n" + output);
 }
 
 
 static tool_result_t tool_search_workspace(const json& params)
 {
+    diag::log_tagged_fmt("coding", "search_workspace entry query='%.80s'",
+        params.contains("query") && params["query"].is_string()
+            ? params["query"].get<std::string>().c_str() : "");
     tool_result_t gate_error;
     if (!ensure_coding_tool_runtime("search_workspace", gate_error))
+    {
+        diag::log_tagged_fmt("coding", "search_workspace gate fail");
         return gate_error;
+    }
 
     if (!params.contains("query") || !params["query"].is_string())
+    {
+        diag::log_tagged_fmt("coding", "search_workspace missing query");
         return tool_result_t::error("Missing required parameter: query");
+    }
 
     std::string query = params["query"].get<std::string>();
     if (query.empty())
+    {
+        diag::log_tagged_fmt("coding", "search_workspace empty query");
         return tool_result_t::error("Query cannot be empty.");
+    }
 
     std::string root = file_browser::current_dir;
     if (params.contains("path") && params["path"].is_string()) {
@@ -543,6 +651,8 @@ static tool_result_t tool_search_workspace(const json& params)
         }
     }
 
+    diag::log_tagged_fmt("coding", "search_workspace scanned=%d matches=%zu query='%.80s'",
+        files_scanned, matches.size(), query.c_str());
     if (matches.empty())
         return tool_result_t::ok("No matches found for \"" + query + "\" in " +
                                  std::to_string(files_scanned) + " files.");
@@ -564,19 +674,32 @@ static tool_result_t tool_search_workspace(const json& params)
 
 static tool_result_t tool_run_command(const json& params)
 {
+    diag::log_tagged_fmt("coding", "run_command entry cmd='%.120s'",
+        params.contains("command") && params["command"].is_string()
+            ? params["command"].get<std::string>().c_str() : "");
     tool_result_t gate_error;
     if (!ensure_coding_tool_runtime("run_command", gate_error))
+    {
+        diag::log_tagged_fmt("coding", "run_command gate fail");
         return gate_error;
+    }
 
     if (!params.contains("command") || !params["command"].is_string())
+    {
+        diag::log_tagged_fmt("coding", "run_command missing command");
         return tool_result_t::error("Missing required parameter: command");
+    }
 
     std::string command = params["command"].get<std::string>();
     if (command.empty())
+    {
+        diag::log_tagged_fmt("coding", "run_command empty command");
         return tool_result_t::error("Command cannot be empty.");
+    }
 
 
     if (auto_approval::is_dangerous_command(command)) {
+        diag::log_tagged_fmt("coding", "run_command dangerous cmd='%.120s'", command.c_str());
         output_log::push(bottom_tab_t::sandbox_log,
             "[run_command] WARNING: Potentially dangerous command detected: " + command);
     }
@@ -655,12 +778,16 @@ static tool_result_t tool_run_command(const json& params)
     CloseHandle(h_stderr_wr);
 
     if (!created) {
+        diag::log_tagged_fmt("coding", "run_command create process fail err=%lu cmd='%.120s'",
+            GetLastError(), command.c_str());
         CloseHandle(h_stdout_rd);
         CloseHandle(h_stderr_rd);
         return tool_result_t::error("Failed to launch command: " + command +
                                     " (error " + std::to_string(GetLastError()) + ")");
     }
 
+    diag::log_tagged_fmt("coding", "run_command process started pid=%lu wait=%d cmd='%.120s'",
+        pi.dwProcessId, (int)wait, command.c_str());
     constexpr size_t MAX_OUTPUT = 1048576;
 
     if (want_session) {
@@ -785,6 +912,8 @@ static tool_result_t tool_run_command(const json& params)
             return tool_result_t::ok(result);
         }
 
+        diag::log_tagged_fmt("coding", "run_command bg session_id='%s' cmd='%.120s'",
+            session_id_copy.c_str(), command.c_str());
         return tool_result_t::ok(
             "Started background command (session " + session_id_copy + "). "
             "Use read_command_output with this id to retrieve output.",
@@ -865,8 +994,13 @@ static tool_result_t tool_run_command(const json& params)
         (cancelled ? " (CANCELLED)" : (timed_out ? " (TIMED OUT)" : "")));
 
     if (cancelled)
+    {
+        diag::log_tagged_fmt("coding", "run_command cancelled cmd='%.120s'", command.c_str());
         return tool_result_t::error("Command cancelled by client request.");
+    }
 
+    diag::log_tagged_fmt("coding", "run_command finished exit=%lu timed_out=%d cmd='%.120s'",
+        exit_code, (int)timed_out, command.c_str());
     std::string result;
     result += "Exit code: " + std::to_string(exit_code);
     if (timed_out)
@@ -886,16 +1020,28 @@ static tool_result_t tool_run_command(const json& params)
 
 static tool_result_t tool_cancel_command(const json& params)
 {
+    diag::log_tagged_fmt("coding", "cancel_command entry session_id='%s'",
+        params.contains("session_id") && params["session_id"].is_string()
+            ? params["session_id"].get<std::string>().c_str() : "");
     tool_result_t gate_error;
     if (!ensure_coding_tool_runtime("cancel_command", gate_error))
+    {
+        diag::log_tagged_fmt("coding", "cancel_command gate fail");
         return gate_error;
+    }
 
     if (!params.contains("session_id") || !params["session_id"].is_string())
+    {
+        diag::log_tagged_fmt("coding", "cancel_command missing session_id");
         return tool_result_t::error("Missing required parameter: session_id");
+    }
 
     std::string session_id = params["session_id"].get<std::string>();
     if (session_id.empty())
+    {
+        diag::log_tagged_fmt("coding", "cancel_command empty session_id");
         return tool_result_t::error("session_id cannot be empty.");
+    }
 
     bool was_running = false;
     bool found = command_sessions::with_session(session_id,
@@ -910,11 +1056,19 @@ static tool_result_t tool_cancel_command(const json& params)
         });
 
     if (!found)
+    {
+        diag::log_tagged_fmt("coding", "cancel_command not found session_id='%s'", session_id.c_str());
         return tool_result_t::error("Session not found: " + session_id);
+    }
 
     if (!command_sessions::remove_session(session_id))
+    {
+        diag::log_tagged_fmt("coding", "cancel_command remove fail session_id='%s'", session_id.c_str());
         return tool_result_t::error("Failed to remove session: " + session_id);
+    }
 
+    diag::log_tagged_fmt("coding", "cancel_command ok session_id='%s' was_running=%d",
+        session_id.c_str(), (int)was_running);
     output_log::push(bottom_tab_t::sandbox_log,
         "[cancel_command] session=" + session_id +
         (was_running ? " (terminated)" : " (already finished)"));
@@ -929,11 +1083,16 @@ static tool_result_t tool_cancel_command(const json& params)
 
 static tool_result_t tool_list_commands(const json& /*params*/)
 {
+    diag::log_tagged_fmt("coding", "list_commands entry");
     tool_result_t gate_error;
     if (!ensure_coding_tool_runtime("list_commands", gate_error))
+    {
+        diag::log_tagged_fmt("coding", "list_commands gate fail");
         return gate_error;
+    }
 
     auto ids = command_sessions::list_sessions();
+    diag::log_tagged_fmt("coding", "list_commands session_count=%zu", ids.size());
 
     json sessions = json::array();
     std::string text;
@@ -995,6 +1154,7 @@ static tool_result_t tool_list_commands(const json& /*params*/)
 
 void register_coding_tools(mcp_standalone::server_t& srv)
 {
+    diag::log_tagged_fmt("coding", "register_coding_tools entry");
     using p = mcp_standalone::tool_param_t;
 
     srv.register_tool({
@@ -1111,6 +1271,7 @@ void register_coding_tools(mcp_standalone::server_t& srv)
         tool_list_commands,
         mcp_standalone::tool_visibility_t::internal_only
     });
+    diag::log_tagged_fmt("coding", "register_coding_tools done");
 }
 
 }

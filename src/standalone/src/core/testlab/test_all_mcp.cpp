@@ -2382,10 +2382,615 @@ namespace {
         test_tool_call(hf, "mcp.tls_ensure_keylogfile", get_server(), "tls_ensure_keylogfile", {}, passed, failed, skipped);
     }
 
+    void test_tool_burp_scanner_start_audit(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["url"] = "http://127.0.0.1/";
+        test_tool_call(hf, "mcp.burp_scanner_start_audit", get_server(), "burp_scanner_start_audit", args, passed, failed, skipped);
+    }
+    void test_tool_burp_scanner_audit_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["audit_id"] = 0;
+        test_tool_call(hf, "mcp.burp_scanner_audit_status", get_server(), "burp_scanner_audit_status", args, passed, failed, skipped);
+    }
+    void test_tool_burp_scanner_list_audits(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_scanner_list_audits", get_server(), "burp_scanner_list_audits", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_scanner_cancel(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["audit_id"] = 0;
+        test_tool_call(hf, "mcp.burp_scanner_cancel", get_server(), "burp_scanner_cancel", args, passed, failed, skipped);
+    }
+    void test_tool_burp_scanner_list_issues(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_scanner_list_issues", get_server(), "burp_scanner_list_issues", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_scanner_get_issue(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["issue_id"] = 0;
+        test_tool_call(hf, "mcp.burp_scanner_get_issue", get_server(), "burp_scanner_get_issue", args, passed, failed, skipped);
+    }
+    void test_tool_burp_scanner_passive_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_scanner_passive_status", get_server(), "burp_scanner_passive_status", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_scanner_list_modules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_scanner_list_modules", get_server(), "burp_scanner_list_modules", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_scanner_clear_issues(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_scanner_clear_issues", get_server(), "burp_scanner_clear_issues", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_scanner_passive_enable(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["enabled"] = false;
+        test_tool_call(hf, "mcp.burp_scanner_passive_enable", get_server(), "burp_scanner_passive_enable", args, passed, failed, skipped);
+    }
+    void test_tool_burp_sitemap_list_hosts(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_sitemap_list_hosts", get_server(), "burp_sitemap_list_hosts", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_sitemap_list_paths(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_sitemap_list_paths", get_server(), "burp_sitemap_list_paths", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_sitemap_get_exchange(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["exchange_id"] = 0;
+        test_tool_call(hf, "mcp.burp_sitemap_get_exchange", get_server(), "burp_sitemap_get_exchange", args, passed, failed, skipped);
+    }
+    void test_tool_burp_sitemap_send_to(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["exchange_id"] = 0; args["destination"] = "repeater";
+        test_tool_call(hf, "mcp.burp_sitemap_send_to", get_server(), "burp_sitemap_send_to", args, passed, failed, skipped);
+    }
+    void test_tool_burp_scope_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["url"] = "http://127.0.0.1/";
+        test_tool_call(hf, "mcp.burp_scope_add", get_server(), "burp_scope_add", args, passed, failed, skipped);
+    }
+    void test_tool_burp_scope_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["url"] = "http://127.0.0.1/";
+        test_tool_call(hf, "mcp.burp_scope_remove", get_server(), "burp_scope_remove", args, passed, failed, skipped);
+    }
+    void test_tool_burp_scope_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_scope_list", get_server(), "burp_scope_list", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_scope_check(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["url"] = "http://127.0.0.1/";
+        test_tool_call(hf, "mcp.burp_scope_check", get_server(), "burp_scope_check", args, passed, failed, skipped);
+    }
+    void test_tool_burp_cookie_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_cookie_list", get_server(), "burp_cookie_list", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_cookie_set(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["name"] = "test_cookie"; args["value"] = "test_val"; args["domain"] = "127.0.0.1";
+        test_tool_call(hf, "mcp.burp_cookie_set", get_server(), "burp_cookie_set", args, passed, failed, skipped);
+    }
+    void test_tool_burp_cookie_delete(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["name"] = "test_cookie"; args["domain"] = "127.0.0.1";
+        test_tool_call(hf, "mcp.burp_cookie_delete", get_server(), "burp_cookie_delete", args, passed, failed, skipped);
+    }
+    void test_tool_burp_cookie_export_netscape(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_cookie_export_netscape", get_server(), "burp_cookie_export_netscape", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_dom_xss_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_dom_xss_status", get_server(), "burp_dom_xss_status", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_dom_xss_test_payload(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["payload"] = "<script>test</script>";
+        test_tool_call(hf, "mcp.burp_dom_xss_test_payload", get_server(), "burp_dom_xss_test_payload", args, passed, failed, skipped);
+    }
+    void test_tool_burp_dom_xss_scan(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["url"] = "http://127.0.0.1/";
+        test_tool_call(hf, "mcp.burp_dom_xss_scan", get_server(), "burp_dom_xss_scan", args, passed, failed, skipped);
+    }
+    void test_tool_burp_crawler_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["url"] = "http://127.0.0.1/";
+        test_tool_call(hf, "mcp.burp_crawler_start", get_server(), "burp_crawler_start", args, passed, failed, skipped);
+    }
+    void test_tool_burp_crawler_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["crawler_id"] = 0;
+        test_tool_call(hf, "mcp.burp_crawler_status", get_server(), "burp_crawler_status", args, passed, failed, skipped);
+    }
+    void test_tool_burp_crawler_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["crawler_id"] = 0;
+        test_tool_call(hf, "mcp.burp_crawler_stop", get_server(), "burp_crawler_stop", args, passed, failed, skipped);
+    }
+    void test_tool_burp_crawler_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_crawler_list", get_server(), "burp_crawler_list", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_content_discovery_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["url"] = "http://127.0.0.1/";
+        test_tool_call(hf, "mcp.burp_content_discovery_start", get_server(), "burp_content_discovery_start", args, passed, failed, skipped);
+    }
+    void test_tool_burp_content_discovery_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["job_id"] = 0;
+        test_tool_call(hf, "mcp.burp_content_discovery_status", get_server(), "burp_content_discovery_status", args, passed, failed, skipped);
+    }
+    void test_tool_burp_content_discovery_results(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["job_id"] = 0;
+        test_tool_call(hf, "mcp.burp_content_discovery_results", get_server(), "burp_content_discovery_results", args, passed, failed, skipped);
+    }
+    void test_tool_burp_content_discovery_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["job_id"] = 0;
+        test_tool_call(hf, "mcp.burp_content_discovery_stop", get_server(), "burp_content_discovery_stop", args, passed, failed, skipped);
+    }
+    void test_tool_burp_subdomain_enum_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["domain"] = "test.local";
+        test_tool_call(hf, "mcp.burp_subdomain_enum_start", get_server(), "burp_subdomain_enum_start", args, passed, failed, skipped);
+    }
+    void test_tool_burp_subdomain_enum_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["job_id"] = 0;
+        test_tool_call(hf, "mcp.burp_subdomain_enum_status", get_server(), "burp_subdomain_enum_status", args, passed, failed, skipped);
+    }
+    void test_tool_burp_subdomain_enum_results(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["job_id"] = 0;
+        test_tool_call(hf, "mcp.burp_subdomain_enum_results", get_server(), "burp_subdomain_enum_results", args, passed, failed, skipped);
+    }
+    void test_tool_burp_payloads_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_payloads_list", get_server(), "burp_payloads_list", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_payloads_get(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["name"] = "xss";
+        test_tool_call(hf, "mcp.burp_payloads_get", get_server(), "burp_payloads_get", args, passed, failed, skipped);
+    }
+    void test_tool_burp_payloads_search(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["query"] = "xss";
+        test_tool_call(hf, "mcp.burp_payloads_search", get_server(), "burp_payloads_search", args, passed, failed, skipped);
+    }
+    void test_tool_burp_payloads_add_custom(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["name"] = "test_payload"; args["content"] = "test";
+        test_tool_call(hf, "mcp.burp_payloads_add_custom", get_server(), "burp_payloads_add_custom", args, passed, failed, skipped);
+    }
+    void test_tool_burp_intruder_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["url"] = "http://127.0.0.1/"; args["raw_request"] = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        test_tool_call(hf, "mcp.burp_intruder_start", get_server(), "burp_intruder_start", args, passed, failed, skipped);
+    }
+    void test_tool_burp_intruder_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["job_id"] = 0;
+        test_tool_call(hf, "mcp.burp_intruder_status", get_server(), "burp_intruder_status", args, passed, failed, skipped);
+    }
+    void test_tool_burp_intruder_results(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["job_id"] = 0;
+        test_tool_call(hf, "mcp.burp_intruder_results", get_server(), "burp_intruder_results", args, passed, failed, skipped);
+    }
+    void test_tool_burp_intruder_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["job_id"] = 0;
+        test_tool_call(hf, "mcp.burp_intruder_stop", get_server(), "burp_intruder_stop", args, passed, failed, skipped);
+    }
+    void test_tool_burp_intruder_list_jobs(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_intruder_list_jobs", get_server(), "burp_intruder_list_jobs", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_intruder_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_intruder_clear", get_server(), "burp_intruder_clear", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_param_miner_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["url"] = "http://127.0.0.1/";
+        test_tool_call(hf, "mcp.burp_param_miner_start", get_server(), "burp_param_miner_start", args, passed, failed, skipped);
+    }
+    void test_tool_burp_param_miner_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["job_id"] = 0;
+        test_tool_call(hf, "mcp.burp_param_miner_status", get_server(), "burp_param_miner_status", args, passed, failed, skipped);
+    }
+    void test_tool_burp_param_miner_results(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["job_id"] = 0;
+        test_tool_call(hf, "mcp.burp_param_miner_results", get_server(), "burp_param_miner_results", args, passed, failed, skipped);
+    }
+    void test_tool_burp_param_miner_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["job_id"] = 0;
+        test_tool_call(hf, "mcp.burp_param_miner_stop", get_server(), "burp_param_miner_stop", args, passed, failed, skipped);
+    }
+    void test_tool_burp_h2_send(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["url"] = "http://127.0.0.1/";
+        test_tool_call(hf, "mcp.burp_h2_send", get_server(), "burp_h2_send", args, passed, failed, skipped);
+    }
+    void test_tool_burp_jwt_decode(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["token"] = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0In0.test";
+        test_tool_call(hf, "mcp.burp_jwt_decode", get_server(), "burp_jwt_decode", args, passed, failed, skipped);
+    }
+    void test_tool_burp_jwt_forge(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["header"] = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}"; args["payload"] = "{\"sub\":\"test\"}";
+        test_tool_call(hf, "mcp.burp_jwt_forge", get_server(), "burp_jwt_forge", args, passed, failed, skipped);
+    }
+    void test_tool_burp_jwt_verify(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["token"] = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0In0.test";
+        test_tool_call(hf, "mcp.burp_jwt_verify", get_server(), "burp_jwt_verify", args, passed, failed, skipped);
+    }
+    void test_tool_burp_jwt_crack_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["token"] = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0In0.test";
+        test_tool_call(hf, "mcp.burp_jwt_crack_start", get_server(), "burp_jwt_crack_start", args, passed, failed, skipped);
+    }
+    void test_tool_burp_jwt_crack_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["job_id"] = 0;
+        test_tool_call(hf, "mcp.burp_jwt_crack_status", get_server(), "burp_jwt_crack_status", args, passed, failed, skipped);
+    }
+    void test_tool_burp_jwt_crack_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["job_id"] = 0;
+        test_tool_call(hf, "mcp.burp_jwt_crack_stop", get_server(), "burp_jwt_crack_stop", args, passed, failed, skipped);
+    }
+    void test_tool_burp_jwt_attack(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["token"] = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0In0.test";
+        test_tool_call(hf, "mcp.burp_jwt_attack", get_server(), "burp_jwt_attack", args, passed, failed, skipped);
+    }
+    void test_tool_burp_auth_basic_encode(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["username"] = "test"; args["password"] = "test";
+        test_tool_call(hf, "mcp.burp_auth_basic_encode", get_server(), "burp_auth_basic_encode", args, passed, failed, skipped);
+    }
+    void test_tool_burp_auth_basic_decode(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["encoded"] = "dGVzdDp0ZXN0";
+        test_tool_call(hf, "mcp.burp_auth_basic_decode", get_server(), "burp_auth_basic_decode", args, passed, failed, skipped);
+    }
+    void test_tool_burp_auth_digest_solve(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["username"] = "test"; args["password"] = "test";
+        args["realm"] = "test"; args["nonce"] = "test"; args["uri"] = "/";
+        test_tool_call(hf, "mcp.burp_auth_digest_solve", get_server(), "burp_auth_digest_solve", args, passed, failed, skipped);
+    }
+    void test_tool_burp_auth_ntlm_type1(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_auth_ntlm_type1", get_server(), "burp_auth_ntlm_type1", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_auth_ntlm_type3(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["username"] = "test"; args["password"] = "test"; args["challenge"] = "0000000000000000";
+        test_tool_call(hf, "mcp.burp_auth_ntlm_type3", get_server(), "burp_auth_ntlm_type3", args, passed, failed, skipped);
+    }
+    void test_tool_burp_auth_bearer(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["token"] = "test_token";
+        test_tool_call(hf, "mcp.burp_auth_bearer", get_server(), "burp_auth_bearer", args, passed, failed, skipped);
+    }
+    void test_tool_burp_auth_oauth2_pkce(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_auth_oauth2_pkce", get_server(), "burp_auth_oauth2_pkce", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_auth_oauth2_build_auth_url(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["client_id"] = "test"; args["auth_endpoint"] = "http://127.0.0.1/auth"; args["redirect_uri"] = "http://127.0.0.1/cb";
+        test_tool_call(hf, "mcp.burp_auth_oauth2_build_auth_url", get_server(), "burp_auth_oauth2_build_auth_url", args, passed, failed, skipped);
+    }
+    void test_tool_burp_auth_oauth2_exchange_code(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["code"] = "test_code"; args["token_endpoint"] = "http://127.0.0.1/token"; args["client_id"] = "test"; args["redirect_uri"] = "http://127.0.0.1/cb";
+        test_tool_call(hf, "mcp.burp_auth_oauth2_exchange_code", get_server(), "burp_auth_oauth2_exchange_code", args, passed, failed, skipped);
+    }
+    void test_tool_burp_auth_oauth2_refresh(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["refresh_token"] = "test_refresh"; args["token_endpoint"] = "http://127.0.0.1/token"; args["client_id"] = "test";
+        test_tool_call(hf, "mcp.burp_auth_oauth2_refresh", get_server(), "burp_auth_oauth2_refresh", args, passed, failed, skipped);
+    }
+    void test_tool_burp_auth_saml_decode_request(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["saml_request"] = "dGVzdA==";
+        test_tool_call(hf, "mcp.burp_auth_saml_decode_request", get_server(), "burp_auth_saml_decode_request", args, passed, failed, skipped);
+    }
+    void test_tool_burp_auth_saml_decode_response(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["saml_response"] = "dGVzdA==";
+        test_tool_call(hf, "mcp.burp_auth_saml_decode_response", get_server(), "burp_auth_saml_decode_response", args, passed, failed, skipped);
+    }
+    void test_tool_burp_match_replace_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["match"] = "test_match"; args["replace"] = "test_replace";
+        test_tool_call(hf, "mcp.burp_match_replace_add", get_server(), "burp_match_replace_add", args, passed, failed, skipped);
+    }
+    void test_tool_burp_match_replace_update(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["id"] = 0; args["match"] = "test_match2"; args["replace"] = "test_replace2";
+        test_tool_call(hf, "mcp.burp_match_replace_update", get_server(), "burp_match_replace_update", args, passed, failed, skipped);
+    }
+    void test_tool_burp_match_replace_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["id"] = 0;
+        test_tool_call(hf, "mcp.burp_match_replace_remove", get_server(), "burp_match_replace_remove", args, passed, failed, skipped);
+    }
+    void test_tool_burp_match_replace_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_match_replace_list", get_server(), "burp_match_replace_list", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_match_replace_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_match_replace_clear", get_server(), "burp_match_replace_clear", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_match_replace_test(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["match"] = "test"; args["data"] = "test data";
+        test_tool_call(hf, "mcp.burp_match_replace_test", get_server(), "burp_match_replace_test", args, passed, failed, skipped);
+    }
+    void test_tool_burp_macro_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["name"] = "test_macro"; args["request"] = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        test_tool_call(hf, "mcp.burp_macro_add", get_server(), "burp_macro_add", args, passed, failed, skipped);
+    }
+    void test_tool_burp_macro_run(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["name"] = "test_macro";
+        test_tool_call(hf, "mcp.burp_macro_run", get_server(), "burp_macro_run", args, passed, failed, skipped);
+    }
+    void test_tool_burp_macro_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_macro_list", get_server(), "burp_macro_list", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_macro_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["name"] = "test_macro";
+        test_tool_call(hf, "mcp.burp_macro_remove", get_server(), "burp_macro_remove", args, passed, failed, skipped);
+    }
+    void test_tool_burp_macro_update(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["name"] = "test_macro";
+        test_tool_call(hf, "mcp.burp_macro_update", get_server(), "burp_macro_update", args, passed, failed, skipped);
+    }
+    void test_tool_burp_session_rule_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["name"] = "test_rule"; args["condition"] = "always";
+        test_tool_call(hf, "mcp.burp_session_rule_add", get_server(), "burp_session_rule_add", args, passed, failed, skipped);
+    }
+    void test_tool_burp_session_rule_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_session_rule_list", get_server(), "burp_session_rule_list", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_session_rule_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["id"] = 0;
+        test_tool_call(hf, "mcp.burp_session_rule_remove", get_server(), "burp_session_rule_remove", args, passed, failed, skipped);
+    }
+    void test_tool_burp_api_import(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["path"] = "nonexistent.json";
+        test_tool_call(hf, "mcp.burp_api_import", get_server(), "burp_api_import", args, passed, failed, skipped);
+    }
+    void test_tool_burp_api_list_collections(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_api_list_collections", get_server(), "burp_api_list_collections", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_api_get_collection(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["name"] = "nonexistent";
+        test_tool_call(hf, "mcp.burp_api_get_collection", get_server(), "burp_api_get_collection", args, passed, failed, skipped);
+    }
+    void test_tool_burp_api_remove_collection(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["name"] = "nonexistent";
+        test_tool_call(hf, "mcp.burp_api_remove_collection", get_server(), "burp_api_remove_collection", args, passed, failed, skipped);
+    }
+    void test_tool_burp_api_send_request(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["collection"] = "nonexistent"; args["request_name"] = "test";
+        test_tool_call(hf, "mcp.burp_api_send_request", get_server(), "burp_api_send_request", args, passed, failed, skipped);
+    }
+    void test_tool_burp_api_audit_collection(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["name"] = "nonexistent";
+        test_tool_call(hf, "mcp.burp_api_audit_collection", get_server(), "burp_api_audit_collection", args, passed, failed, skipped);
+    }
+    void test_tool_burp_graphql_introspect(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["url"] = "http://127.0.0.1/graphql";
+        test_tool_call(hf, "mcp.burp_graphql_introspect", get_server(), "burp_graphql_introspect", args, passed, failed, skipped);
+    }
+    void test_tool_burp_graphql_example(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["url"] = "http://127.0.0.1/graphql"; args["query"] = "{ __typename }";
+        test_tool_call(hf, "mcp.burp_graphql_example", get_server(), "burp_graphql_example", args, passed, failed, skipped);
+    }
+    void test_tool_burp_graphql_send(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["url"] = "http://127.0.0.1/graphql"; args["query"] = "{ __typename }";
+        test_tool_call(hf, "mcp.burp_graphql_send", get_server(), "burp_graphql_send", args, passed, failed, skipped);
+    }
+    void test_tool_burp_ws_connect(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["url"] = "ws://127.0.0.1/ws";
+        test_tool_call(hf, "mcp.burp_ws_connect", get_server(), "burp_ws_connect", args, passed, failed, skipped);
+    }
+    void test_tool_burp_ws_disconnect(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["conn_id"] = 0;
+        test_tool_call(hf, "mcp.burp_ws_disconnect", get_server(), "burp_ws_disconnect", args, passed, failed, skipped);
+    }
+    void test_tool_burp_ws_send_text(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["conn_id"] = 0; args["message"] = "test";
+        test_tool_call(hf, "mcp.burp_ws_send_text", get_server(), "burp_ws_send_text", args, passed, failed, skipped);
+    }
+    void test_tool_burp_ws_send_binary(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["conn_id"] = 0; args["data_hex"] = "00";
+        test_tool_call(hf, "mcp.burp_ws_send_binary", get_server(), "burp_ws_send_binary", args, passed, failed, skipped);
+    }
+    void test_tool_burp_ws_send_raw(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["conn_id"] = 0; args["data"] = "test";
+        test_tool_call(hf, "mcp.burp_ws_send_raw", get_server(), "burp_ws_send_raw", args, passed, failed, skipped);
+    }
+    void test_tool_burp_ws_list_connections(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_ws_list_connections", get_server(), "burp_ws_list_connections", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_ws_frames(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["conn_id"] = 0;
+        test_tool_call(hf, "mcp.burp_ws_frames", get_server(), "burp_ws_frames", args, passed, failed, skipped);
+    }
+    void test_tool_burp_ws_clear_frames(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["conn_id"] = 0;
+        test_tool_call(hf, "mcp.burp_ws_clear_frames", get_server(), "burp_ws_clear_frames", args, passed, failed, skipped);
+    }
+    void test_tool_burp_logger_query(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_logger_query", get_server(), "burp_logger_query", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_logger_total(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_logger_total", get_server(), "burp_logger_total", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_logger_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_logger_clear", get_server(), "burp_logger_clear", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_logger_export_csv(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["path"] = "C:\\temp\\aida_logger_test.csv";
+        test_tool_call(hf, "mcp.burp_logger_export_csv", get_server(), "burp_logger_export_csv", args, passed, failed, skipped);
+    }
+    void test_tool_burp_report_generate(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["path"] = "C:\\temp\\aida_burp_report.html";
+        test_tool_call(hf, "mcp.burp_report_generate", get_server(), "burp_report_generate", args, passed, failed, skipped);
+    }
+    void test_tool_burp_bambda_compile(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["code"] = "return true;";
+        test_tool_call(hf, "mcp.burp_bambda_compile", get_server(), "burp_bambda_compile", args, passed, failed, skipped);
+    }
+    void test_tool_burp_bambda_test(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["code"] = "return true;";
+        test_tool_call(hf, "mcp.burp_bambda_test", get_server(), "burp_bambda_test", args, passed, failed, skipped);
+    }
+    void test_tool_burp_bambda_help(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_bambda_help", get_server(), "burp_bambda_help", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_csp_analyze(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["policy"] = "default-src 'self'";
+        test_tool_call(hf, "mcp.burp_csp_analyze", get_server(), "burp_csp_analyze", args, passed, failed, skipped);
+    }
+    void test_tool_burp_csp_analyze_url(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["url"] = "http://127.0.0.1/";
+        test_tool_call(hf, "mcp.burp_csp_analyze_url", get_server(), "burp_csp_analyze_url", args, passed, failed, skipped);
+    }
+    void test_tool_burp_upstream_add_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["host"] = "127.0.0.1"; args["port"] = 8888; args["protocol"] = "http";
+        test_tool_call(hf, "mcp.burp_upstream_add_chain", get_server(), "burp_upstream_add_chain", args, passed, failed, skipped);
+    }
+    void test_tool_burp_upstream_remove_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["id"] = 0;
+        test_tool_call(hf, "mcp.burp_upstream_remove_chain", get_server(), "burp_upstream_remove_chain", args, passed, failed, skipped);
+    }
+    void test_tool_burp_upstream_list_chains(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_upstream_list_chains", get_server(), "burp_upstream_list_chains", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_upstream_set_active(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["id"] = 0;
+        test_tool_call(hf, "mcp.burp_upstream_set_active", get_server(), "burp_upstream_set_active", args, passed, failed, skipped);
+    }
+    void test_tool_burp_upstream_get_active(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_upstream_get_active", get_server(), "burp_upstream_get_active", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_upstream_test_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["id"] = 0;
+        test_tool_call(hf, "mcp.burp_upstream_test_chain", get_server(), "burp_upstream_test_chain", args, passed, failed, skipped);
+    }
+    void test_tool_burp_tech_fingerprint(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["url"] = "http://127.0.0.1/";
+        test_tool_call(hf, "mcp.burp_tech_fingerprint", get_server(), "burp_tech_fingerprint", args, passed, failed, skipped);
+    }
+    void test_tool_burp_tech_inventory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_tech_inventory", get_server(), "burp_tech_inventory", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_tech_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_tech_clear", get_server(), "burp_tech_clear", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_browser_launch(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_browser_launch", get_server(), "burp_browser_launch", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_browser_kill(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["pid"] = 0;
+        test_tool_call(hf, "mcp.burp_browser_kill", get_server(), "burp_browser_kill", args, passed, failed, skipped);
+    }
+    void test_tool_burp_browser_kill_all(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_browser_kill_all", get_server(), "burp_browser_kill_all", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_browser_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_browser_list", get_server(), "burp_browser_list", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_browser_detect(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_browser_detect", get_server(), "burp_browser_detect", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_headless_start", get_server(), "burp_headless_start", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_headless_stop", get_server(), "burp_headless_stop", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_headless_status", get_server(), "burp_headless_status", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_navigate(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["url"] = "http://127.0.0.1/";
+        test_tool_call(hf, "mcp.burp_headless_navigate", get_server(), "burp_headless_navigate", args, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_reload(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_headless_reload", get_server(), "burp_headless_reload", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_evaluate(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["code"] = "document.title";
+        test_tool_call(hf, "mcp.burp_headless_evaluate", get_server(), "burp_headless_evaluate", args, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_screenshot(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_headless_screenshot", get_server(), "burp_headless_screenshot", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_snapshot(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_headless_snapshot", get_server(), "burp_headless_snapshot", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_click(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["selector"] = "body";
+        test_tool_call(hf, "mcp.burp_headless_click", get_server(), "burp_headless_click", args, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_type(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["selector"] = "input"; args["text"] = "test";
+        test_tool_call(hf, "mcp.burp_headless_type", get_server(), "burp_headless_type", args, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_wait_for(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["selector"] = "body";
+        test_tool_call(hf, "mcp.burp_headless_wait_for", get_server(), "burp_headless_wait_for", args, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_console_logs(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_headless_console_logs", get_server(), "burp_headless_console_logs", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_network_requests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_headless_network_requests", get_server(), "burp_headless_network_requests", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_inject_hook(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["code"] = "console.log('test');";
+        test_tool_call(hf, "mcp.burp_headless_inject_hook", get_server(), "burp_headless_inject_hook", args, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_hook_function(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["function_name"] = "XMLHttpRequest.prototype.send"; args["code"] = "console.log('intercepted');";
+        test_tool_call(hf, "mcp.burp_headless_hook_function", get_server(), "burp_headless_hook_function", args, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_remove_hooks(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_headless_remove_hooks", get_server(), "burp_headless_remove_hooks", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_reset_state(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_headless_reset_state", get_server(), "burp_headless_reset_state", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_view_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_headless_view_status", get_server(), "burp_headless_view_status", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_view_quick_navigate(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["url"] = "http://127.0.0.1/";
+        test_tool_call(hf, "mcp.burp_headless_view_quick_navigate", get_server(), "burp_headless_view_quick_navigate", args, passed, failed, skipped);
+    }
+    void test_tool_burp_headless_view_install(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_headless_view_install", get_server(), "burp_headless_view_install", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_collaborator_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_collaborator_status", get_server(), "burp_collaborator_status", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_collaborator_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_collaborator_start", get_server(), "burp_collaborator_start", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_collaborator_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_collaborator_stop", get_server(), "burp_collaborator_stop", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_collaborator_generate_token(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_collaborator_generate_token", get_server(), "burp_collaborator_generate_token", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_collaborator_poll(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_collaborator_poll", get_server(), "burp_collaborator_poll", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_collaborator_get_interaction(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["id"] = 0;
+        test_tool_call(hf, "mcp.burp_collaborator_get_interaction", get_server(), "burp_collaborator_get_interaction", args, passed, failed, skipped);
+    }
+    void test_tool_burp_collaborator_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_collaborator_clear", get_server(), "burp_collaborator_clear", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_collaborator_list_tokens(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_collaborator_list_tokens", get_server(), "burp_collaborator_list_tokens", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_sequencer_start_collection(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["url"] = "http://127.0.0.1/";
+        test_tool_call(hf, "mcp.burp_sequencer_start_collection", get_server(), "burp_sequencer_start_collection", args, passed, failed, skipped);
+    }
+    void test_tool_burp_sequencer_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["collection_id"] = 0;
+        test_tool_call(hf, "mcp.burp_sequencer_status", get_server(), "burp_sequencer_status", args, passed, failed, skipped);
+    }
+    void test_tool_burp_sequencer_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["collection_id"] = 0;
+        test_tool_call(hf, "mcp.burp_sequencer_stop", get_server(), "burp_sequencer_stop", args, passed, failed, skipped);
+    }
+    void test_tool_burp_sequencer_samples(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["collection_id"] = 0;
+        test_tool_call(hf, "mcp.burp_sequencer_samples", get_server(), "burp_sequencer_samples", args, passed, failed, skipped);
+    }
+    void test_tool_burp_sequencer_analyze(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["collection_id"] = 0;
+        test_tool_call(hf, "mcp.burp_sequencer_analyze", get_server(), "burp_sequencer_analyze", args, passed, failed, skipped);
+    }
+    void test_tool_burp_sequencer_list_collections(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_sequencer_list_collections", get_server(), "burp_sequencer_list_collections", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_sequencer_delete(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["collection_id"] = 0;
+        test_tool_call(hf, "mcp.burp_sequencer_delete", get_server(), "burp_sequencer_delete", args, passed, failed, skipped);
+    }
+    void test_tool_burp_comparer_add_slot(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["data"] = "test data";
+        test_tool_call(hf, "mcp.burp_comparer_add_slot", get_server(), "burp_comparer_add_slot", args, passed, failed, skipped);
+    }
+    void test_tool_burp_comparer_list_slots(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_comparer_list_slots", get_server(), "burp_comparer_list_slots", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_comparer_remove_slot(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["slot_id"] = 0;
+        test_tool_call(hf, "mcp.burp_comparer_remove_slot", get_server(), "burp_comparer_remove_slot", args, passed, failed, skipped);
+    }
+    void test_tool_burp_comparer_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_call(hf, "mcp.burp_comparer_clear", get_server(), "burp_comparer_clear", {}, passed, failed, skipped);
+    }
+    void test_tool_burp_comparer_diff(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["slot_a"] = 0; args["slot_b"] = 1;
+        test_tool_call(hf, "mcp.burp_comparer_diff", get_server(), "burp_comparer_diff", args, passed, failed, skipped);
+    }
+
 }
 
 void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
-    log_msg(hf, "mcp_phase", "=== MCP TOOL TESTS START (368 tests) ===");
+    log_msg(hf, "mcp_phase", "=== MCP TOOL TESTS START (533 tests) ===");
     auto t0 = std::chrono::steady_clock::now();
 
 
@@ -2769,6 +3374,172 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_autoresponder_export_rules(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_decrypt_capture(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_tls_ensure_keylogfile(hf, passed, failed, skipped);
+
+    if (!cancelled()) test_tool_burp_scanner_start_audit(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scanner_audit_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scanner_list_audits(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scanner_cancel(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scanner_list_issues(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scanner_get_issue(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scanner_passive_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scanner_list_modules(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scanner_clear_issues(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scanner_passive_enable(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_sitemap_list_hosts(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_sitemap_list_paths(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_sitemap_get_exchange(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_sitemap_send_to(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scope_add(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scope_remove(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scope_list(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scope_check(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_cookie_list(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_cookie_set(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_cookie_delete(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_cookie_export_netscape(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_dom_xss_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_dom_xss_test_payload(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_dom_xss_scan(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_crawler_start(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_crawler_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_crawler_stop(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_crawler_list(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_content_discovery_start(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_content_discovery_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_content_discovery_results(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_content_discovery_stop(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_subdomain_enum_start(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_subdomain_enum_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_subdomain_enum_results(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_payloads_list(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_payloads_get(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_payloads_search(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_payloads_add_custom(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_intruder_start(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_intruder_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_intruder_results(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_intruder_stop(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_intruder_list_jobs(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_intruder_clear(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_param_miner_start(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_param_miner_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_param_miner_results(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_param_miner_stop(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_h2_send(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_jwt_decode(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_jwt_forge(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_jwt_verify(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_jwt_crack_start(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_jwt_crack_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_jwt_crack_stop(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_jwt_attack(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_auth_basic_encode(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_auth_basic_decode(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_auth_digest_solve(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_auth_ntlm_type1(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_auth_ntlm_type3(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_auth_bearer(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_auth_oauth2_pkce(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_auth_oauth2_build_auth_url(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_auth_oauth2_exchange_code(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_auth_oauth2_refresh(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_auth_saml_decode_request(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_auth_saml_decode_response(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_match_replace_add(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_match_replace_update(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_match_replace_remove(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_match_replace_list(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_match_replace_clear(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_match_replace_test(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_macro_add(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_macro_run(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_macro_list(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_macro_remove(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_macro_update(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_session_rule_add(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_session_rule_list(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_session_rule_remove(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_api_import(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_api_list_collections(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_api_get_collection(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_api_remove_collection(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_api_send_request(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_api_audit_collection(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_graphql_introspect(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_graphql_example(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_graphql_send(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_ws_connect(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_ws_disconnect(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_ws_send_text(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_ws_send_binary(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_ws_send_raw(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_ws_list_connections(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_ws_frames(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_ws_clear_frames(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_logger_query(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_logger_total(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_logger_clear(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_logger_export_csv(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_report_generate(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_bambda_compile(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_bambda_test(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_bambda_help(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_csp_analyze(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_csp_analyze_url(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_upstream_add_chain(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_upstream_remove_chain(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_upstream_list_chains(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_upstream_set_active(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_upstream_get_active(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_upstream_test_chain(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_tech_fingerprint(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_tech_inventory(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_tech_clear(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_browser_launch(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_browser_kill(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_browser_kill_all(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_browser_list(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_browser_detect(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_start(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_stop(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_navigate(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_reload(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_evaluate(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_screenshot(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_snapshot(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_click(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_type(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_wait_for(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_console_logs(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_network_requests(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_inject_hook(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_hook_function(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_remove_hooks(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_reset_state(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_view_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_view_quick_navigate(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_view_install(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_collaborator_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_collaborator_start(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_collaborator_stop(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_collaborator_generate_token(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_collaborator_poll(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_collaborator_get_interaction(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_collaborator_clear(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_collaborator_list_tokens(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_sequencer_start_collection(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_sequencer_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_sequencer_stop(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_sequencer_samples(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_sequencer_analyze(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_sequencer_list_collections(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_sequencer_delete(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_comparer_add_slot(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_comparer_list_slots(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_comparer_remove_slot(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_comparer_clear(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_comparer_diff(hf, passed, failed, skipped);
 
     auto t1 = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();

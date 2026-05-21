@@ -5,6 +5,7 @@
 #include "imgui/imgui_internal.h"
 #include "../../ui/theme.hpp"
 #include "../../ui/ui_anim.hpp"
+#include "helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -79,13 +80,21 @@ void render(float pos_x, float pos_y, float width, float height,
     ImGui::SameLine();
     if (ImGui::Button("Analyze", ImVec2(120.f, 24.f))) {
         std::string src(st.input_buf);
+        ::diag::log_tagged_fmt("csp_v", "analyze report_only=%d input_len=%zu",
+            st.report_only ? 1 : 0, src.size());
         auto r = analyze(src, st.report_only);
-        std::lock_guard<std::mutex> lk(st.mtx);
-        st.result = std::move(r);
-        st.have_result = true;
+        {
+            std::lock_guard<std::mutex> lk(st.mtx);
+            st.result = std::move(r);
+            st.have_result = true;
+        }
+        ::diag::log_tagged_fmt("csp_v", "analyze_result score=%d has_csp=%d directives=%zu findings=%zu",
+            st.result.score, st.result.has_csp ? 1 : 0,
+            st.result.directives.size(), st.result.findings.size());
     }
     ImGui::SameLine();
     if (ImGui::Button("Clear", ImVec2(80.f, 24.f))) {
+        ::diag::log_tagged("csp_v", "clear");
         st.input_buf[0] = '\0';
         std::lock_guard<std::mutex> lk(st.mtx);
         st.result = csp_result_t{};

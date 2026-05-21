@@ -83,10 +83,12 @@ static bool interaction_matches(const aida::burp::collaborator::interaction_t& i
 
 void initialize()
 {
+    ::diag::log_tagged("collaborator_v", "initialize");
 }
 
 void shutdown()
 {
+    ::diag::log_tagged("collaborator_v", "shutdown");
 }
 
 void render(float pos_x, float pos_y, float width, float height,
@@ -99,6 +101,14 @@ void render(float pos_x, float pos_y, float width, float height,
     ImGui::BeginChild("##collab_root", ImVec2(width, height), false, ImGuiWindowFlags_NoBackground);
 
     auto status = aida::burp::collaborator::status();
+    static bool s_last_running = false;
+    if (status.running != s_last_running) {
+        s_last_running = status.running;
+        ::diag::log_tagged_fmt("collaborator_v", "render_state_change running=%d interactions=%zu tokens=%zu",
+            status.running ? 1 : 0,
+            status.interaction_count,
+            status.token_count);
+    }
 
     float bar_h = 64.f;
     ImGui::BeginChild("##collab_bar", ImVec2(width, bar_h), false, ImGuiWindowFlags_NoBackground);
@@ -165,17 +175,21 @@ void render(float pos_x, float pos_y, float width, float height,
         auto cfg = aida::burp::collaborator::current_config();
         g_view_state.last_generated_token = tok;
         g_view_state.last_generated_domain = tok + "." + cfg.public_host;
+        ::diag::log_tagged_fmt("collaborator_v", "generate_token token=%s domain=%s",
+            tok.c_str(), g_view_state.last_generated_domain.c_str());
     }
     ImGui::SameLine();
     if (aida::ui::button("Copy Domain", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
         if (!g_view_state.last_generated_domain.empty()) {
             ImGui::SetClipboardText(g_view_state.last_generated_domain.c_str());
+            ::diag::log_tagged_fmt("collaborator_v", "copy_domain domain=%s", g_view_state.last_generated_domain.c_str());
         }
     }
     ImGui::SameLine();
     if (aida::ui::button("Clear", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
         aida::burp::collaborator::clear();
         g_view_state.selected_id = -1;
+        ::diag::log_tagged("collaborator_v", "clear_interactions");
     }
 
     ImGui::EndChild();
@@ -266,6 +280,7 @@ void render(float pos_x, float pos_y, float width, float height,
     ImGui::PushItemWidth(80.f);
     if (ImGui::Combo("##c_kind", &cur, kinds, 4)) {
         g_view_state.filter_kind = kinds[cur];
+        ::diag::log_tagged_fmt("collaborator_v", "filter_kind_changed kind=%s", g_view_state.filter_kind.c_str());
     }
     ImGui::PopItemWidth();
 
@@ -321,6 +336,8 @@ void render(float pos_x, float pos_y, float width, float height,
             snprintf(idbuf, sizeof(idbuf), "%llu", static_cast<unsigned long long>(it.id));
             if (ImGui::Selectable(idbuf, sel, ImGuiSelectableFlags_SpanAllColumns)) {
                 g_view_state.selected_id = static_cast<int>(it.id);
+                ::diag::log_tagged_fmt("collaborator_v", "interaction_selected id=%llu kind=%s client=%s",
+                    static_cast<unsigned long long>(it.id), it.kind.c_str(), it.client_ip.c_str());
             }
 
             uint64_t age = (status.started_ms == 0) ? 0 : (it.timestamp_ms > status.started_ms ? it.timestamp_ms - status.started_ms : 0);

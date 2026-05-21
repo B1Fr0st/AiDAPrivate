@@ -470,9 +470,15 @@ void run_crawl(std::shared_ptr<crawl_t> ctx);
 
 void enqueue_url(crawl_t& c, const std::string& url, int depth, const std::string& parent)
 {
-    if (static_cast<int>(c.discovered.size()) >= c.config.max_pages) return;
+    if (static_cast<int>(c.discovered.size()) >= c.config.max_pages) {
+        diag::log_tagged_fmt("crawler", "enqueue_url id=%llu max_pages_reached url=%s", static_cast<unsigned long long>(c.id), url.c_str());
+        return;
+    }
     parsed_url_t p = parse_url(url);
-    if (!p.valid) return;
+    if (!p.valid) {
+        diag::log_tagged_fmt("crawler", "enqueue_url id=%llu invalid_url=%s", static_cast<unsigned long long>(c.id), url.c_str());
+        return;
+    }
     std::string canonical = canonicalize(p);
     if (canonical.empty()) return;
     if (c.seen.find(canonical) != c.seen.end()) return;
@@ -484,14 +490,26 @@ void enqueue_url(crawl_t& c, const std::string& url, int depth, const std::strin
             parsed_url_t sp = parse_url(s);
             if (sp.valid && sp.host == p.host) { host_ok = true; break; }
         }
-        if (!host_ok) return;
+        if (!host_ok) {
+            diag::log_tagged_fmt("crawler", "enqueue_url id=%llu same_host_filter blocked url=%s", static_cast<unsigned long long>(c.id), canonical.c_str());
+            return;
+        }
     }
     if (c.config.scope_only)
     {
-        if (!aida::burp::scope::in_scope_components(p.scheme, p.host, p.port, p.path)) return;
+        if (!aida::burp::scope::in_scope_components(p.scheme, p.host, p.port, p.path)) {
+            diag::log_tagged_fmt("crawler", "enqueue_url id=%llu scope_filter blocked url=%s", static_cast<unsigned long long>(c.id), canonical.c_str());
+            return;
+        }
     }
-    if (should_skip_extension(p.path, c.config.exclude_extensions)) return;
-    if (matches_any_pattern(canonical, c.config.exclude_patterns)) return;
+    if (should_skip_extension(p.path, c.config.exclude_extensions)) {
+        diag::log_tagged_fmt("crawler", "enqueue_url id=%llu ext_filter blocked url=%s", static_cast<unsigned long long>(c.id), canonical.c_str());
+        return;
+    }
+    if (matches_any_pattern(canonical, c.config.exclude_patterns)) {
+        diag::log_tagged_fmt("crawler", "enqueue_url id=%llu pattern_filter blocked url=%s", static_cast<unsigned long long>(c.id), canonical.c_str());
+        return;
+    }
 
     c.seen.insert(canonical);
     queue_item_t q;
@@ -499,13 +517,21 @@ void enqueue_url(crawl_t& c, const std::string& url, int depth, const std::strin
     q.depth = depth;
     q.parent = parent;
     c.queue.push_back(std::move(q));
+    diag::log_tagged_fmt("crawler", "enqueue_url id=%llu queued url=%s depth=%d queue_size=%zu",
+        static_cast<unsigned long long>(c.id), canonical.c_str(), depth, c.queue.size());
 }
 
 void worker_step(std::shared_ptr<crawl_t> ctx, queue_item_t item)
 {
+    diag::log_tagged_fmt("crawler", "worker_step id=%llu url=%s depth=%d",
+        static_cast<unsigned long long>(ctx->id), item.url.c_str(), item.depth);
     ctx->in_flight.fetch_add(1);
     auto& c = *ctx;
-    if (c.stop_flag.load()) { ctx->in_flight.fetch_sub(1); return; }
+    if (c.stop_flag.load()) {
+        diag::log_tagged_fmt("crawler", "worker_step id=%llu stopped url=%s", static_cast<unsigned long long>(ctx->id), item.url.c_str());
+        ctx->in_flight.fetch_sub(1);
+        return;
+    }
 
     parsed_url_t p = parse_url(item.url);
     if (!p.valid) { ctx->in_flight.fetch_sub(1); return; }
@@ -568,8 +594,13 @@ void worker_step(std::shared_ptr<crawl_t> ctx, queue_item_t item)
     std::string body, content_type, err;
     std::vector<std::pair<std::string,std::string>> resp_headers;
     uint64_t lat = 0;
+    diag::log_tagged_fmt("crawler", "worker_step fetching id=%llu url=%s timeout=%d",
+        static_cast<unsigned long long>(ctx->id), item.url.c_str(), c.config.request_timeout_ms);
     bool ok = fetch_url(item.url, c.config.user_agent, c.config.request_timeout_ms,
                         status, body, content_type, resp_headers, lat, err);
+    diag::log_tagged_fmt("crawler", "worker_step fetch_result id=%llu url=%s ok=%d status=%d body=%zu lat=%llu err=%s",
+        static_cast<unsigned long long>(ctx->id), item.url.c_str(), ok ? 1 : 0,
+        status, body.size(), static_cast<unsigned long long>(lat), err.c_str());
 
     discovered_url_t d;
     d.url = item.url;
@@ -699,22 +730,32 @@ void run_crawl(std::shared_ptr<crawl_t> ctx)
 
 bool initialize()
 {
+    diag::log_tagged_fmt("crawler", "initialize called");
     auto& r = reg();
     bool expected = false;
-    if (!r.init_done.compare_exchange_strong(expected, true)) return true;
+    if (!r.init_done.compare_exchange_strong(expected, true)) {
+        diag::log_tagged_fmt("crawler", "initialize already_done");
+        return true;
+    }
+    diag::log_tagged_fmt("crawler", "initialize success");
     return true;
 }
 
 void shutdown()
 {
+    diag::log_tagged_fmt("crawler", "shutdown called");
     auto& r = reg();
-    if (!r.init_done.exchange(false)) return;
+    if (!r.init_done.exchange(false)) {
+        diag::log_tagged_fmt("crawler", "shutdown skipped not_initialized");
+        return;
+    }
     std::vector<std::shared_ptr<crawl_t>> snapshots;
     {
         std::lock_guard<std::mutex> lk(r.mtx);
         snapshots.reserve(r.by_id.size());
         for (auto& kv : r.by_id) { kv.second->stop_flag.store(true); snapshots.push_back(kv.second); }
     }
+    diag::log_tagged_fmt("crawler", "shutdown stopping %zu crawls", snapshots.size());
     for (int i = 0; i < 40; ++i)
     {
         bool all_done = true;
@@ -726,6 +767,7 @@ void shutdown()
         std::lock_guard<std::mutex> lk(r.mtx);
         r.by_id.clear();
     }
+    diag::log_tagged_fmt("crawler", "shutdown complete");
 }
 
 uint64_t start(const crawl_config_t& config)
@@ -764,11 +806,16 @@ uint64_t start(const crawl_config_t& config)
 
 bool stop(uint64_t crawl_id)
 {
+    diag::log_tagged_fmt("crawler", "stop id=%llu", static_cast<unsigned long long>(crawl_id));
     std::shared_ptr<crawl_t> ctx;
     {
         std::lock_guard<std::mutex> lk(reg().mtx);
         auto it = reg().by_id.find(crawl_id);
-        if (it == reg().by_id.end()) { set_err("not found"); return false; }
+        if (it == reg().by_id.end()) {
+            diag::log_tagged_fmt("crawler", "stop id=%llu not_found", static_cast<unsigned long long>(crawl_id));
+            set_err("not found");
+            return false;
+        }
         ctx = it->second;
     }
     ctx->stop_flag.store(true);
@@ -824,11 +871,16 @@ std::vector<crawl_status_t> list()
 
 bool remove(uint64_t crawl_id)
 {
+    diag::log_tagged_fmt("crawler", "remove id=%llu", static_cast<unsigned long long>(crawl_id));
     std::shared_ptr<crawl_t> ctx;
     {
         std::lock_guard<std::mutex> lk(reg().mtx);
         auto it = reg().by_id.find(crawl_id);
-        if (it == reg().by_id.end()) { set_err("not found"); return false; }
+        if (it == reg().by_id.end()) {
+            diag::log_tagged_fmt("crawler", "remove id=%llu not_found", static_cast<unsigned long long>(crawl_id));
+            set_err("not found");
+            return false;
+        }
         ctx = it->second;
     }
     ctx->stop_flag.store(true);
@@ -841,6 +893,7 @@ bool remove(uint64_t crawl_id)
         std::lock_guard<std::mutex> lk(reg().mtx);
         reg().by_id.erase(crawl_id);
     }
+    diag::log_tagged_fmt("crawler", "remove id=%llu complete", static_cast<unsigned long long>(crawl_id));
     return true;
 }
 

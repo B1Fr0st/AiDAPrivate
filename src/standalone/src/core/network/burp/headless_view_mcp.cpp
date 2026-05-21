@@ -59,6 +59,7 @@ json install_status_to_json(const aida::burp::camoufox::install::status_t& s)
 tool_result_t tool_status(const json& params)
 {
     (void)params;
+    diag::log_tagged_fmt("mcp_burp", "headless_view_status entry");
     json out;
     try {
         aida::burp::camoufox::bridge_status_t bs = aida::burp::camoufox::get_status();
@@ -73,15 +74,19 @@ tool_result_t tool_status(const json& params)
         out["install"] = nullptr;
     }
     out["view_last_error"] = aida::burp::headless_view::last_error();
+    diag::log_tagged_fmt("mcp_burp", "headless_view_status ok");
     return tool_result_t::ok(out);
 }
 
 tool_result_t tool_quick_navigate(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "headless_view_quick_navigate entry");
     if (!params.is_object() || !params.contains("url") || !params["url"].is_string()) {
+        diag::log_tagged_fmt("mcp_burp", "headless_view_quick_navigate missing_url");
         return tool_result_t::error("missing_url");
     }
     const std::string url = params["url"].get<std::string>();
+    diag::log_tagged_fmt("mcp_burp", "headless_view_quick_navigate url=%s", url.c_str());
     std::string eval_after;
     if (params.contains("eval_after_load") && params["eval_after_load"].is_string()) {
         eval_after = params["eval_after_load"].get<std::string>();
@@ -93,6 +98,7 @@ tool_result_t tool_quick_navigate(const json& params)
     }
 
     if (!aida::burp::camoufox::is_ready()) {
+        diag::log_tagged_fmt("mcp_burp", "headless_view_quick_navigate bridge_not_ready");
         return tool_result_t::error("bridge_not_ready");
     }
 
@@ -101,6 +107,7 @@ tool_result_t tool_quick_navigate(const json& params)
     catch (...) { nav_ok = false; }
     if (!nav_ok) {
         std::string msg = aida::burp::camoufox::last_error();
+        diag::log_tagged_fmt("mcp_burp", "headless_view_quick_navigate navigate_failed err=%s", msg.c_str());
         return tool_result_t::error(msg.empty() ? std::string("navigate_failed") : msg);
     }
 
@@ -122,7 +129,7 @@ tool_result_t tool_quick_navigate(const json& params)
         out["eval"] = nullptr;
     }
 
-    diag::log_tagged("headless_mcp", (std::string("quick_navigate url=") + url).c_str());
+    diag::log_tagged_fmt("mcp_burp", "headless_view_quick_navigate ok url=%s eval=%d", url.c_str(), (int)!eval_after.empty());
     return tool_result_t::ok(out);
 }
 
@@ -133,10 +140,12 @@ tool_result_t tool_install(const json& params)
         action = params["action"].get<std::string>();
     }
     for (char& c : action) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+    diag::log_tagged_fmt("mcp_burp", "headless_view_install action=%s", action.c_str());
 
     if (action == "probe") {
         aida::burp::camoufox::install::status_t s;
         try { s = aida::burp::camoufox::install::probe(); } catch (...) {}
+        diag::log_tagged_fmt("mcp_burp", "headless_view_install probe ok ready=%d", (int)(s.state == aida::burp::camoufox::install::install_state_t::ok));
         return tool_result_t::ok(install_status_to_json(s));
     }
     if (action == "install_module" || action == "pip_install" || action == "install") {
@@ -147,8 +156,10 @@ tool_result_t tool_install(const json& params)
             try { s = aida::burp::camoufox::install::probe(); } catch (...) {}
             std::string msg = s.last_message;
             if (msg.empty()) msg = "pip_install_async returned false";
+            diag::log_tagged_fmt("mcp_burp", "headless_view_install install_module failed err=%s", msg.c_str());
             return tool_result_t::error(msg);
         }
+        diag::log_tagged_fmt("mcp_burp", "headless_view_install install_module dispatched");
         json out;
         out["dispatched"] = true;
         out["action"] = "install_module";
@@ -162,13 +173,16 @@ tool_result_t tool_install(const json& params)
             try { s = aida::burp::camoufox::install::probe(); } catch (...) {}
             std::string msg = s.last_message;
             if (msg.empty()) msg = "fetch_browser_async returned false";
+            diag::log_tagged_fmt("mcp_burp", "headless_view_install fetch_browser failed err=%s", msg.c_str());
             return tool_result_t::error(msg);
         }
+        diag::log_tagged_fmt("mcp_burp", "headless_view_install fetch_browser dispatched");
         json out;
         out["dispatched"] = true;
         out["action"] = "fetch_browser";
         return tool_result_t::ok(out);
     }
+    diag::log_tagged_fmt("mcp_burp", "headless_view_install unsupported_action action=%s", action.c_str());
     return tool_result_t::error("unsupported_action");
 }
 

@@ -118,6 +118,7 @@ json status_to_json(const aida::burp::sequencer::collection_status_t& s)
 
 tool_result_t handle_start(const json& p)
 {
+    diag::log_tagged_fmt("mcp_burp", "sequencer_start url=%s name=%s", p.value("url", std::string()).c_str(), p.value("name", std::string()).c_str());
     aida::burp::sequencer::collection_config_t cfg;
     if (p.contains("url") && p["url"].is_string()) cfg.url = p["url"].get<std::string>();
     if (p.contains("raw_request_b64") && p["raw_request_b64"].is_string()) {
@@ -134,9 +135,12 @@ tool_result_t handle_start(const json& p)
     if (p.contains("name") && p["name"].is_string()) cfg.name = p["name"].get<std::string>();
 
     uint64_t id = aida::burp::sequencer::start_collection(cfg);
-    if (id == 0) {
+    if (id == 0)
+    {
+        diag::log_tagged_fmt("mcp_burp", "sequencer_start failed err=%s", aida::burp::sequencer::last_error().c_str());
         return tool_result_t::error("start failed: " + aida::burp::sequencer::last_error());
     }
+    diag::log_tagged_fmt("mcp_burp", "sequencer_start ok collection_id=%llu target=%zu", static_cast<unsigned long long>(id), cfg.target_count);
     json out;
     out["collection_id"] = id;
     return tool_result_t::ok("collection started", out);
@@ -144,34 +148,59 @@ tool_result_t handle_start(const json& p)
 
 tool_result_t handle_status(const json& p)
 {
-    if (!p.contains("collection_id") || !p["collection_id"].is_number()) {
+    diag::log_tagged_fmt("mcp_burp", "sequencer_status entry");
+    if (!p.contains("collection_id") || !p["collection_id"].is_number())
+    {
+        diag::log_tagged_fmt("mcp_burp", "sequencer_status missing collection_id");
         return tool_result_t::error("collection_id required");
     }
-    auto s = aida::burp::sequencer::status(p["collection_id"].get<uint64_t>());
-    if (s.id == 0) return tool_result_t::error("collection not found");
+    const uint64_t cid = p["collection_id"].get<uint64_t>();
+    auto s = aida::burp::sequencer::status(cid);
+    if (s.id == 0)
+    {
+        diag::log_tagged_fmt("mcp_burp", "sequencer_status not_found id=%llu", static_cast<unsigned long long>(cid));
+        return tool_result_t::error("collection not found");
+    }
+    diag::log_tagged_fmt("mcp_burp", "sequencer_status ok id=%llu collected=%zu running=%d", static_cast<unsigned long long>(cid), s.collected, (int)s.running);
     return tool_result_t::ok("collection status", status_to_json(s));
 }
 
 tool_result_t handle_stop(const json& p)
 {
-    if (!p.contains("collection_id") || !p["collection_id"].is_number()) {
+    diag::log_tagged_fmt("mcp_burp", "sequencer_stop entry");
+    if (!p.contains("collection_id") || !p["collection_id"].is_number())
+    {
+        diag::log_tagged_fmt("mcp_burp", "sequencer_stop missing collection_id");
         return tool_result_t::error("collection_id required");
     }
-    bool ok = aida::burp::sequencer::stop_collection(p["collection_id"].get<uint64_t>());
-    if (!ok) return tool_result_t::error("collection not found");
+    const uint64_t cid = p["collection_id"].get<uint64_t>();
+    diag::log_tagged_fmt("mcp_burp", "sequencer_stop collection_id=%llu", static_cast<unsigned long long>(cid));
+    bool ok = aida::burp::sequencer::stop_collection(cid);
+    if (!ok)
+    {
+        diag::log_tagged_fmt("mcp_burp", "sequencer_stop not_found id=%llu", static_cast<unsigned long long>(cid));
+        return tool_result_t::error("collection not found");
+    }
+    diag::log_tagged_fmt("mcp_burp", "sequencer_stop ok collection_id=%llu", static_cast<unsigned long long>(cid));
     return tool_result_t::ok("collection stopping");
 }
 
 tool_result_t handle_samples(const json& p)
 {
-    if (!p.contains("collection_id") || !p["collection_id"].is_number()) {
+    diag::log_tagged_fmt("mcp_burp", "sequencer_samples entry");
+    if (!p.contains("collection_id") || !p["collection_id"].is_number())
+    {
+        diag::log_tagged_fmt("mcp_burp", "sequencer_samples missing collection_id");
         return tool_result_t::error("collection_id required");
     }
+    const uint64_t cid = p["collection_id"].get<uint64_t>();
     size_t max_count = 0;
     if (p.contains("max") && p["max"].is_number()) max_count = p["max"].get<size_t>();
-    auto v = aida::burp::sequencer::samples(p["collection_id"].get<uint64_t>(), max_count);
+    diag::log_tagged_fmt("mcp_burp", "sequencer_samples collection_id=%llu max=%zu", static_cast<unsigned long long>(cid), max_count);
+    auto v = aida::burp::sequencer::samples(cid, max_count);
     json arr = json::array();
     for (const auto& s : v) arr.push_back(s);
+    diag::log_tagged_fmt("mcp_burp", "sequencer_samples ok id=%llu returned=%zu", static_cast<unsigned long long>(cid), v.size());
     json out;
     out["samples"] = std::move(arr);
     out["count"]   = static_cast<uint64_t>(v.size());
@@ -180,18 +209,26 @@ tool_result_t handle_samples(const json& p)
 
 tool_result_t handle_analyze(const json& p)
 {
-    if (!p.contains("collection_id") || !p["collection_id"].is_number()) {
+    diag::log_tagged_fmt("mcp_burp", "sequencer_analyze entry");
+    if (!p.contains("collection_id") || !p["collection_id"].is_number())
+    {
+        diag::log_tagged_fmt("mcp_burp", "sequencer_analyze missing collection_id");
         return tool_result_t::error("collection_id required");
     }
-    auto a = aida::burp::sequencer::analyze(p["collection_id"].get<uint64_t>());
+    const uint64_t cid = p["collection_id"].get<uint64_t>();
+    diag::log_tagged_fmt("mcp_burp", "sequencer_analyze collection_id=%llu", static_cast<unsigned long long>(cid));
+    auto a = aida::burp::sequencer::analyze(cid);
+    diag::log_tagged_fmt("mcp_burp", "sequencer_analyze ok id=%llu samples=%llu verdict=%s", static_cast<unsigned long long>(cid), static_cast<unsigned long long>(a.samples_count), a.verdict.c_str());
     return tool_result_t::ok("analysis", analysis_to_json(a));
 }
 
 tool_result_t handle_list(const json&)
 {
+    diag::log_tagged_fmt("mcp_burp", "sequencer_list entry");
     auto v = aida::burp::sequencer::list_collections();
     json arr = json::array();
     for (const auto& s : v) arr.push_back(status_to_json(s));
+    diag::log_tagged_fmt("mcp_burp", "sequencer_list ok count=%zu", v.size());
     json out;
     out["collections"] = std::move(arr);
     return tool_result_t::ok("collections", out);
@@ -199,11 +236,21 @@ tool_result_t handle_list(const json&)
 
 tool_result_t handle_delete(const json& p)
 {
-    if (!p.contains("collection_id") || !p["collection_id"].is_number()) {
+    diag::log_tagged_fmt("mcp_burp", "sequencer_delete entry");
+    if (!p.contains("collection_id") || !p["collection_id"].is_number())
+    {
+        diag::log_tagged_fmt("mcp_burp", "sequencer_delete missing collection_id");
         return tool_result_t::error("collection_id required");
     }
-    bool ok = aida::burp::sequencer::delete_collection(p["collection_id"].get<uint64_t>());
-    if (!ok) return tool_result_t::error("collection not found");
+    const uint64_t cid = p["collection_id"].get<uint64_t>();
+    diag::log_tagged_fmt("mcp_burp", "sequencer_delete collection_id=%llu", static_cast<unsigned long long>(cid));
+    bool ok = aida::burp::sequencer::delete_collection(cid);
+    if (!ok)
+    {
+        diag::log_tagged_fmt("mcp_burp", "sequencer_delete not_found id=%llu", static_cast<unsigned long long>(cid));
+        return tool_result_t::error("collection not found");
+    }
+    diag::log_tagged_fmt("mcp_burp", "sequencer_delete ok collection_id=%llu", static_cast<unsigned long long>(cid));
     return tool_result_t::ok("collection deleted");
 }
 

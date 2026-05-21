@@ -12,6 +12,7 @@
 #include "pro.h"
 #include "../infra/work_queue.hpp"
 #include "../runtime/standalone_driver.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <Zydis/Zydis.h>
 #include "zydis_disasm.hpp"
@@ -527,6 +528,7 @@ static bool resolve_loaded_module_base(const std::string& query,
 
 tool_result_t driver_connect(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_connect entry");
     (void)params;
     if (device->is_connected())
     {
@@ -546,14 +548,19 @@ tool_result_t driver_connect(const json& params)
             result["connected"] = true;
             result["process_id"] = device->get_process_id();
             result["kernel_dtb"] = sa_format_address(device->get_kernel_dtb());
+            diag::log_tagged_fmt("drv_tools", "driver_connect already connected cleared_self_target");
             return tool_result_t::ok(OBFSTR("Driver connected. Cleared stale AiDA self-attach context."), result);
         }
 
+        diag::log_tagged_fmt("drv_tools", "driver_connect already connected");
         return tool_result_t::ok(OBFSTR("Driver already connected"));
     }
 
     if (!device->connect())
+    {
+        diag::log_tagged_fmt("drv_tools", "driver_connect connect fail");
         return tool_result_t::error(OBFSTR("Failed to connect to kernel driver. Ensure the driver is loaded and running."));
+    }
 
     device->solve_kernel_dtb();
 
@@ -561,11 +568,14 @@ tool_result_t driver_connect(const json& params)
     result["connected"] = true;
     result["kernel_dtb"] = sa_format_address(device->get_kernel_dtb());
     result["note"] = OBFSTR("Connected via obfuscated device path. Kernel DTB solved for full kernel memory access.");
+    diag::log_tagged_fmt("drv_tools", "driver_connect ok kernel_dtb=%s",
+        sa_format_address(device->get_kernel_dtb()).c_str());
     return tool_result_t::ok(OBFSTR("Kernel driver connected"), result);
 }
 
 tool_result_t driver_status(const json&)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_status entry");
     const std::uint32_t attached_pid = device->get_process_id();
     const bool self_target = is_self_target_pid(attached_pid);
 
@@ -585,11 +595,14 @@ tool_result_t driver_status(const json&)
     if (device->is_connected() && attached_pid != 0)
         result["heartbeat"] = device->send_heartbeat() ? "ok" : "failed";
 
+    diag::log_tagged_fmt("drv_tools", "driver_status connected=%d pid=%u",
+        (int)device->is_connected(), attached_pid);
     return tool_result_t::ok(OBFSTR("Driver status"), result);
 }
 
 tool_result_t driver_attach(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_attach entry");
     if (!device->is_connected())
     {
         if (!device->connect())
@@ -631,13 +644,19 @@ tool_result_t driver_attach(const json& params)
     result["process_id"]   = pid;
     result["base_address"] = sa_format_address(base);
     result["dtb"]          = sa_format_address(device->get_dtb());
+    diag::log_tagged_fmt("drv_tools", "driver_attach ok process='%s' pid=%u base=%s",
+        process_name.c_str(), pid, sa_format_address(base).c_str());
     return tool_result_t::ok(OBFSTR("Attached to process: ") + process_name, result);
 }
 
 tool_result_t driver_unattach(const json&)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_unattach entry");
     if (!device->is_connected())
+    {
+        diag::log_tagged_fmt("drv_tools", "driver_unattach not connected");
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+    }
 
     const std::uint32_t previous_pid = device->get_process_id();
     const std::uint64_t previous_base = device->get_base_address();
@@ -656,29 +675,49 @@ tool_result_t driver_unattach(const json&)
     result["kernel_dtb"] = sa_format_address(device->get_kernel_dtb());
 
     if (previous_pid == 0)
+    {
+        diag::log_tagged_fmt("drv_tools", "driver_unattach no process was attached");
         return tool_result_t::ok(OBFSTR("No process was attached. Driver connection remains active."), result);
+    }
 
+    diag::log_tagged_fmt("drv_tools", "driver_unattach ok prev_pid=%u", previous_pid);
     return tool_result_t::ok(OBFSTR("Detached from attached process context. Driver connection remains active."), result);
 }
 
 tool_result_t driver_read_memory(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_read_memory entry addr='%s' size=%zu",
+        (params.contains("address") && params["address"].is_string()
+            ? params["address"].get<std::string>().c_str() : ""),
+        params.value("size", static_cast<std::size_t>(256)));
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
     auto ea_opt = sa_parse_address(params["address"].get<std::string>());
     if (!ea_opt)
+    {
+        diag::log_tagged_fmt("drv_tools", "driver_read_memory invalid address");
         return tool_result_t::error(OBFSTR("Invalid address"));
+    }
 
     std::size_t size = params.value("size", 256);
     if (size > 65536)
+    {
+        diag::log_tagged_fmt("drv_tools", "driver_read_memory size too large size=%zu", size);
         return tool_result_t::error(OBFSTR("Size too large (max 65536)"));
+    }
 
 
     std::vector<std::uint8_t> buffer(size);
     std::size_t bytes_read = device->read_raw(*ea_opt, buffer.data(), size);
     if (bytes_read == 0)
+    {
+        diag::log_tagged_fmt("drv_tools", "driver_read_memory read fail addr=%s",
+            sa_format_address(*ea_opt).c_str());
         return tool_result_t::error(OBFSTR("Kernel read failed at ") + sa_format_address(*ea_opt));
+    }
+    diag::log_tagged_fmt("drv_tools", "driver_read_memory ok addr=%s bytes_read=%zu",
+        sa_format_address(*ea_opt).c_str(), bytes_read);
 
     std::ostringstream hex_ss, ascii_ss;
     for (std::size_t i = 0; i < bytes_read; i++)
@@ -711,6 +750,9 @@ tool_result_t driver_read_memory(const json& params)
 
 tool_result_t driver_write_memory(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_write_memory entry addr='%s'",
+        params.contains("address") && params["address"].is_string()
+            ? params["address"].get<std::string>().c_str() : "");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -3841,6 +3883,7 @@ static int force_code_pages_in_memory(
 
 tool_result_t driver_dump_module(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_dump_module entry");
     json steps = json::array();
     auto log = [&](const std::string& step, bool ok, const std::string& detail = "") {
         steps.push_back({{"step", step}, {"ok", ok}, {"detail", detail}});
@@ -4538,6 +4581,7 @@ tool_result_t driver_dump_module(const json& params)
 
 tool_result_t driver_scan_pattern(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_scan_pattern entry");
     if (!device->is_connected() || device->get_process_id() == 0)
         return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
 
@@ -4684,6 +4728,7 @@ tool_result_t driver_scan_pattern(const json& params)
 
 tool_result_t driver_read_string(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_read_string entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -4739,6 +4784,7 @@ tool_result_t driver_read_string(const json& params)
 
 tool_result_t driver_read_pointer_chain(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_read_pointer_chain entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -4802,6 +4848,7 @@ tool_result_t driver_read_pointer_chain(const json& params)
 
 tool_result_t driver_enumerate_modules(const json&)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_enumerate_modules entry");
     if (!device->is_connected() || device->get_process_id() == 0)
         return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
 
@@ -4998,6 +5045,7 @@ static bool query_kernel_modules(
 
 tool_result_t driver_enumerate_kernel_modules(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_enumerate_kernel_modules entry");
     std::vector<std::uint8_t> buf;
     sys_module_info_t* info = nullptr;
     std::string err;
@@ -5061,6 +5109,7 @@ tool_result_t driver_enumerate_kernel_modules(const json& params)
 
 tool_result_t driver_dump_kernel_module(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_dump_kernel_module entry");
     std::string module_name = params["module"].get<std::string>();
     std::string output_path = params.value("output_path", std::string());
     bool use_memory = params.value("from_memory", true);
@@ -5953,6 +6002,7 @@ tool_result_t driver_dump_kernel_module(const json& params)
 
 tool_result_t driver_read_kernel_memory(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_read_kernel_memory entry");
     if (!device || !device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
 
@@ -6032,6 +6082,7 @@ tool_result_t driver_read_kernel_memory(const json& params)
 
 tool_result_t driver_write_kernel_memory(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_write_kernel_memory entry");
     if (!device || !device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
 
@@ -6080,6 +6131,7 @@ tool_result_t driver_write_kernel_memory(const json& params)
 
 tool_result_t driver_allocate_memory(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_allocate_memory entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -6113,6 +6165,7 @@ tool_result_t driver_allocate_memory(const json& params)
 
 tool_result_t driver_free_memory(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_free_memory entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -6148,6 +6201,7 @@ tool_result_t driver_free_memory(const json& params)
 
 tool_result_t driver_call_function(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_call_function entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -6225,6 +6279,7 @@ tool_result_t driver_call_function(const json& params)
 
 tool_result_t driver_get_thread_context(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_get_thread_context entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -6269,6 +6324,7 @@ tool_result_t driver_get_thread_context(const json& params)
 
 tool_result_t driver_set_thread_context(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_set_thread_context entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -6316,6 +6372,7 @@ tool_result_t driver_set_thread_context(const json& params)
 
 tool_result_t driver_enumerate_threads(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_enumerate_threads entry");
     (void)params;
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
@@ -6341,6 +6398,7 @@ tool_result_t driver_enumerate_threads(const json& params)
 
 tool_result_t driver_suspend_thread(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_suspend_thread entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -6361,6 +6419,7 @@ tool_result_t driver_suspend_thread(const json& params)
 
 tool_result_t driver_resume_thread(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_resume_thread entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -6381,6 +6440,7 @@ tool_result_t driver_resume_thread(const json& params)
 
 tool_result_t driver_query_memory(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_query_memory entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -6431,6 +6491,7 @@ tool_result_t driver_query_memory(const json& params)
 
 tool_result_t driver_protect_memory(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_protect_memory entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -6471,6 +6532,7 @@ tool_result_t driver_protect_memory(const json& params)
 
 tool_result_t driver_enumerate_memory_regions(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_enumerate_memory_regions entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -6522,6 +6584,7 @@ tool_result_t driver_enumerate_memory_regions(const json& params)
 
 tool_result_t driver_read_peb(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_read_peb entry");
     (void)params;
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
@@ -6545,6 +6608,7 @@ tool_result_t driver_read_peb(const json& params)
 
 tool_result_t driver_spoof_debug_flags(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_spoof_debug_flags entry");
     (void)params;
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
@@ -6563,6 +6627,7 @@ tool_result_t driver_spoof_debug_flags(const json& params)
 
 tool_result_t driver_set_hw_breakpoint(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_set_hw_breakpoint entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -6610,6 +6675,7 @@ tool_result_t driver_set_hw_breakpoint(const json& params)
 
 tool_result_t driver_clear_hw_breakpoint(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_clear_hw_breakpoint entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -6632,6 +6698,7 @@ tool_result_t driver_clear_hw_breakpoint(const json& params)
 
 tool_result_t driver_resolve_export(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_resolve_export entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -6707,6 +6774,7 @@ tool_result_t driver_resolve_export(const json& params)
 
 tool_result_t driver_virtual_to_physical(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_virtual_to_physical entry");
     if (!device->is_connected() || device->get_dtb() == 0)
         return tool_result_t::error(OBFSTR("Driver not connected or DTB not solved"));
 
@@ -7292,6 +7360,7 @@ static std::string deferred_status_to_string(deferred_status s)
 
 tool_result_t driver_defer_action(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_defer_action entry");
     json normalized = params;
 
     if (!normalized.contains("actions") && normalized.contains("action"))
@@ -7409,6 +7478,7 @@ tool_result_t driver_defer_action(const json& params)
 
 tool_result_t driver_list_deferred_actions(const json&)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_list_deferred_actions entry");
     auto actions = DeferredActionManager::instance().get_all_actions();
 
     json arr = json::array();
@@ -7450,6 +7520,7 @@ tool_result_t driver_list_deferred_actions(const json&)
 
 tool_result_t driver_cancel_deferred_action(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_cancel_deferred_action entry");
     int id = 0;
     if (params.contains("action_id"))
     {
@@ -7475,6 +7546,7 @@ tool_result_t driver_cancel_deferred_action(const json& params)
 
 tool_result_t driver_get_deferred_results(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_get_deferred_results entry");
     int id = 0;
     if (params.contains("action_id"))
     {
@@ -7564,6 +7636,7 @@ static std::string reg_index_to_name(std::uint32_t idx) {
 
 tool_result_t driver_enumerate_wfp_callouts(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_enumerate_wfp_callouts entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected"));
 
@@ -7603,6 +7676,7 @@ tool_result_t driver_enumerate_wfp_callouts(const json& params)
 
 tool_result_t driver_get_socket_handles(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_get_socket_handles entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -7637,6 +7711,7 @@ tool_result_t driver_get_socket_handles(const json& params)
 
 tool_result_t driver_sniff_network_buffers(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_sniff_network_buffers entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -7753,6 +7828,7 @@ tool_result_t driver_sniff_network_buffers(const json& params)
 
 tool_result_t driver_dump_tcpip_connections(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_dump_tcpip_connections entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected"));
 
@@ -7869,6 +7945,7 @@ static std::uint32_t proto_from_param(const json& params, const char* key) {
 
 tool_result_t driver_inject_packet(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_inject_packet entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected"));
 
@@ -7922,6 +7999,7 @@ tool_result_t driver_inject_packet(const json& params)
 
 tool_result_t driver_modify_packet_rule(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_modify_packet_rule entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected"));
 
@@ -7997,6 +8075,7 @@ tool_result_t driver_modify_packet_rule(const json& params)
 
 tool_result_t driver_redirect_traffic(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_redirect_traffic entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected"));
 
@@ -8054,6 +8133,7 @@ tool_result_t driver_redirect_traffic(const json& params)
 
 tool_result_t driver_reassemble_stream(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_reassemble_stream entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected"));
 
@@ -8108,6 +8188,7 @@ tool_result_t driver_reassemble_stream(const json& params)
 
 tool_result_t driver_deep_inspect(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_deep_inspect entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected"));
 
@@ -8168,6 +8249,7 @@ tool_result_t driver_deep_inspect(const json& params)
 
 tool_result_t driver_intercept_hold(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_intercept_hold entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected"));
 
@@ -8251,6 +8333,7 @@ tool_result_t driver_intercept_hold(const json& params)
 
 tool_result_t driver_kill_connection(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_kill_connection entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected"));
 
@@ -8277,6 +8360,7 @@ tool_result_t driver_kill_connection(const json& params)
 
 tool_result_t driver_spoof_dns(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_spoof_dns entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected"));
 
@@ -8332,6 +8416,7 @@ tool_result_t driver_spoof_dns(const json& params)
 
 tool_result_t driver_bandwidth_monitor(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_bandwidth_monitor entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected"));
 
@@ -8385,6 +8470,7 @@ tool_result_t driver_bandwidth_monitor(const json& params)
 
 tool_result_t driver_list_interfaces(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_list_interfaces entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected"));
 
@@ -8421,6 +8507,7 @@ tool_result_t driver_list_interfaces(const json& params)
 
 tool_result_t driver_export_pcap(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_export_pcap entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected"));
 
@@ -8483,6 +8570,7 @@ tool_result_t driver_export_pcap(const json& params)
 
 tool_result_t driver_network_fingerprint(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_network_fingerprint entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected"));
 
@@ -8529,6 +8617,7 @@ tool_result_t driver_network_fingerprint(const json& params)
 
 tool_result_t driver_enum_kernel_callbacks(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_enum_kernel_callbacks entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
     if (device->get_kernel_dtb() == 0)
@@ -8669,6 +8758,7 @@ tool_result_t driver_enum_kernel_callbacks(const json& params)
 
 tool_result_t driver_detect_integrity_checks(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_detect_integrity_checks entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
     if (device->get_kernel_dtb() == 0)
@@ -8804,6 +8894,7 @@ tool_result_t driver_detect_integrity_checks(const json& params)
 
 tool_result_t driver_detect_ssdt_hooks(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
     if (device->get_kernel_dtb() == 0)
@@ -8918,6 +9009,7 @@ tool_result_t driver_detect_ssdt_hooks(const json& params)
 
 tool_result_t driver_enum_minifilters(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_enum_minifilters entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
     if (device->get_kernel_dtb() == 0)
@@ -9120,6 +9212,7 @@ tool_result_t driver_enum_minifilters(const json& params)
 
 tool_result_t driver_detect_etw_monitors(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_detect_etw_monitors entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
     if (device->get_kernel_dtb() == 0)
@@ -9290,6 +9383,7 @@ tool_result_t driver_detect_etw_monitors(const json& params)
 
 tool_result_t driver_detect_hidden_modules(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_detect_hidden_modules entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
     if (device->get_process_id() == 0)
@@ -9540,6 +9634,7 @@ tool_result_t driver_detect_hidden_modules(const json& params)
 
 tool_result_t driver_walk_heap(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_walk_heap entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -9672,6 +9767,7 @@ tool_result_t driver_walk_heap(const json& params)
 
 tool_result_t driver_enumerate_handles(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_enumerate_handles entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
 
@@ -9787,6 +9883,7 @@ tool_result_t driver_enumerate_handles(const json& params)
 
 tool_result_t driver_walk_seh_chain(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_walk_seh_chain entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -10029,6 +10126,7 @@ tool_result_t driver_walk_seh_chain(const json& params)
 
 tool_result_t driver_find_code_caves(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_find_code_caves entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -10122,6 +10220,7 @@ tool_result_t driver_find_code_caves(const json& params)
 
 tool_result_t driver_scan_memory_value(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_scan_memory_value entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -10347,6 +10446,7 @@ tool_result_t driver_scan_memory_value(const json& params)
 
 tool_result_t driver_pointer_scan(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_pointer_scan entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -10483,6 +10583,7 @@ tool_result_t driver_pointer_scan(const json& params)
 
 tool_result_t driver_enumerate_windows(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_enumerate_windows entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
 
@@ -10575,6 +10676,7 @@ tool_result_t driver_enumerate_windows(const json& params)
 
 tool_result_t driver_walk_stack(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_walk_stack entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -10707,6 +10809,7 @@ tool_result_t driver_walk_stack(const json& params)
 
 tool_result_t driver_assemble(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_assemble entry");
     const std::string assembly_text = params.value("assembly", "");
     if (assembly_text.empty())
         return tool_result_t::error(OBFSTR("Missing required parameter: assembly"));
@@ -11022,6 +11125,7 @@ static std::mutex s_snapshot_mutex;
 
 tool_result_t driver_compare_memory_snapshot(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_compare_memory_snapshot entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -11153,6 +11257,7 @@ tool_result_t driver_compare_memory_snapshot(const json& params)
 
 tool_result_t driver_find_references(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_find_references entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -11260,6 +11365,7 @@ tool_result_t driver_find_references(const json& params)
 
 tool_result_t driver_read_teb(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_read_teb entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -11333,6 +11439,7 @@ tool_result_t driver_read_teb(const json& params)
 
 tool_result_t driver_map_peb_modules(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_map_peb_modules entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -11463,6 +11570,7 @@ tool_result_t driver_map_peb_modules(const json& params)
 
 tool_result_t driver_set_page_guard(const json& params)
 {
+    diag::log_tagged_fmt("drv_tools", "driver_set_page_guard entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -11548,7 +11656,7 @@ tool_result_t driver_set_page_guard(const json& params)
 
 void register_driver_tools(mcp_standalone::server_t& srv)
 {
-
+    diag::log_tagged_fmt("drv_tools", "register_driver_tools entry");
     s_deferred_tool_list = &srv.get_tools();
 
         register_compat(srv, {
@@ -12478,6 +12586,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
          {OBFSTR("size"), OBFSTR("number"), OBFSTR("Size of the guarded region in bytes (default 4096)"), false},
          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
         driver_set_page_guard, false});
+    diag::log_tagged_fmt("drv_tools", "register_driver_tools done");
 }
 
 }

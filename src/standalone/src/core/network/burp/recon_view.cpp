@@ -245,18 +245,32 @@ void render_crawler(ui_state_t& st, float alpha)
         cfg.user_agent = st.crawler_user_agent;
         cfg.exclude_extensions = split_csv(st.crawler_exclude_ext);
         uint64_t id = crawler::start(cfg);
-        if (id == 0) toast_notification::push(std::string("crawler start failed: ") + crawler::last_error(), toast_notification::toast_type_t::error);
-        else { st.crawler_selected = id; toast_notification::push("crawl started", toast_notification::toast_type_t::success); }
+        if (id == 0) {
+            ::diag::log_tagged_fmt("recon_v", "crawler_start_failed err='%s'", crawler::last_error().c_str());
+            toast_notification::push(std::string("crawler start failed: ") + crawler::last_error(), toast_notification::toast_type_t::error);
+        } else {
+            st.crawler_selected = id;
+            ::diag::log_tagged_fmt("recon_v", "crawler_started id=%llu seed='%s' depth=%d maxpages=%d",
+                static_cast<unsigned long long>(id), st.crawler_seed, cfg.max_depth, cfg.max_pages);
+            toast_notification::push("crawl started", toast_notification::toast_type_t::success);
+        }
     }
     ImGui::SameLine();
     if (aida::ui::button("Stop Selected", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm))
     {
-        if (st.crawler_selected != 0) crawler::stop(st.crawler_selected);
+        if (st.crawler_selected != 0) {
+            ::diag::log_tagged_fmt("recon_v", "crawler_stop id=%llu", static_cast<unsigned long long>(st.crawler_selected));
+            crawler::stop(st.crawler_selected);
+        }
     }
     ImGui::SameLine();
     if (aida::ui::button("Remove Selected", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm))
     {
-        if (st.crawler_selected != 0) { crawler::remove(st.crawler_selected); st.crawler_selected = 0; }
+        if (st.crawler_selected != 0) {
+            ::diag::log_tagged_fmt("recon_v", "crawler_remove id=%llu", static_cast<unsigned long long>(st.crawler_selected));
+            crawler::remove(st.crawler_selected);
+            st.crawler_selected = 0;
+        }
     }
 
     ImGui::Spacing();
@@ -391,18 +405,32 @@ void render_content_discovery(ui_state_t& st, float alpha)
         cfg.cookie_header = st.disc_cookie;
         cfg.user_agent = st.disc_user_agent;
         uint64_t id = content_discovery::start(cfg);
-        if (id == 0) toast_notification::push(std::string("discovery start failed: ") + content_discovery::last_error(), toast_notification::toast_type_t::error);
-        else { st.disc_selected = id; toast_notification::push("discovery started", toast_notification::toast_type_t::success); }
+        if (id == 0) {
+            ::diag::log_tagged_fmt("recon_v", "disc_start_failed err='%s'", content_discovery::last_error().c_str());
+            toast_notification::push(std::string("discovery start failed: ") + content_discovery::last_error(), toast_notification::toast_type_t::error);
+        } else {
+            st.disc_selected = id;
+            ::diag::log_tagged_fmt("recon_v", "disc_started id=%llu target='%s' wordlist='%s'",
+                static_cast<unsigned long long>(id), st.disc_target, st.disc_wordlist_id);
+            toast_notification::push("discovery started", toast_notification::toast_type_t::success);
+        }
     }
     ImGui::SameLine();
     if (aida::ui::button("Stop Selected", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm))
     {
-        if (st.disc_selected != 0) content_discovery::stop(st.disc_selected);
+        if (st.disc_selected != 0) {
+            ::diag::log_tagged_fmt("recon_v", "disc_stop id=%llu", static_cast<unsigned long long>(st.disc_selected));
+            content_discovery::stop(st.disc_selected);
+        }
     }
     ImGui::SameLine();
     if (aida::ui::button("Remove Selected", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm))
     {
-        if (st.disc_selected != 0) { content_discovery::remove(st.disc_selected); st.disc_selected = 0; }
+        if (st.disc_selected != 0) {
+            ::diag::log_tagged_fmt("recon_v", "disc_remove id=%llu", static_cast<unsigned long long>(st.disc_selected));
+            content_discovery::remove(st.disc_selected);
+            st.disc_selected = 0;
+        }
     }
 
     ImGui::Spacing();
@@ -518,24 +546,41 @@ void render_subdomains(ui_state_t& st, float alpha)
         if (st.sub_passive_bufferover) cfg.passive_sources.push_back("bufferover");
         if (st.sub_passive_hackertarget) cfg.passive_sources.push_back("hackertarget");
         uint64_t id = subdomain_enum::start(cfg);
-        if (id == 0) toast_notification::push(std::string("enum start failed: ") + subdomain_enum::last_error(), toast_notification::toast_type_t::error);
-        else { st.sub_selected = id; toast_notification::push("subdomain enum started", toast_notification::toast_type_t::success); }
+        if (id == 0) {
+            ::diag::log_tagged_fmt("recon_v", "sub_enum_start_failed domain='%s' err='%s'",
+                st.sub_domain, subdomain_enum::last_error().c_str());
+            toast_notification::push(std::string("enum start failed: ") + subdomain_enum::last_error(), toast_notification::toast_type_t::error);
+        } else {
+            st.sub_selected = id;
+            ::diag::log_tagged_fmt("recon_v", "sub_enum_started id=%llu domain='%s' wordlist='%s' passive=%d brute=%d",
+                static_cast<unsigned long long>(id), st.sub_domain, st.sub_wordlist_id,
+                st.sub_run_passive ? 1 : 0, st.sub_run_brute ? 1 : 0);
+            toast_notification::push("subdomain enum started", toast_notification::toast_type_t::success);
+        }
     }
     ImGui::SameLine();
     if (aida::ui::button("Stop Selected", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm))
     {
-        if (st.sub_selected != 0) subdomain_enum::stop(st.sub_selected);
+        if (st.sub_selected != 0) {
+            ::diag::log_tagged_fmt("recon_v", "sub_enum_stop id=%llu", static_cast<unsigned long long>(st.sub_selected));
+            subdomain_enum::stop(st.sub_selected);
+        }
     }
     ImGui::SameLine();
     if (aida::ui::button("Remove Selected", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm))
     {
-        if (st.sub_selected != 0) { subdomain_enum::remove(st.sub_selected); st.sub_selected = 0; }
+        if (st.sub_selected != 0) {
+            ::diag::log_tagged_fmt("recon_v", "sub_enum_remove id=%llu", static_cast<unsigned long long>(st.sub_selected));
+            subdomain_enum::remove(st.sub_selected);
+            st.sub_selected = 0;
+        }
     }
     ImGui::SameLine();
     if (aida::ui::button("Export CSV", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm))
     {
         if (st.sub_selected != 0)
         {
+            ::diag::log_tagged_fmt("recon_v", "sub_enum_export_csv id=%llu", static_cast<unsigned long long>(st.sub_selected));
             std::string csv = subdomain_enum::export_csv(st.sub_selected);
             PWSTR known = nullptr;
             std::string base;
@@ -553,8 +598,14 @@ void render_subdomains(ui_state_t& st, float alpha)
             char ts[32]; snprintf(ts, sizeof(ts), "%llu", static_cast<unsigned long long>(st.sub_selected));
             std::string path = base + "\\subdomains_" + ts + ".csv";
             std::ofstream f(path, std::ios::binary);
-            if (f) { f.write(csv.data(), static_cast<std::streamsize>(csv.size())); toast_notification::push("CSV exported to " + path, toast_notification::toast_type_t::success); }
-            else toast_notification::push("CSV export failed", toast_notification::toast_type_t::error);
+            if (f) {
+                f.write(csv.data(), static_cast<std::streamsize>(csv.size()));
+                ::diag::log_tagged_fmt("recon_v", "sub_enum_csv_exported path='%s' bytes=%zu", path.c_str(), csv.size());
+                toast_notification::push("CSV exported to " + path, toast_notification::toast_type_t::success);
+            } else {
+                ::diag::log_tagged_fmt("recon_v", "sub_enum_csv_export_failed path='%s'", path.c_str());
+                toast_notification::push("CSV export failed", toast_notification::toast_type_t::error);
+            }
         }
     }
 
@@ -680,11 +731,14 @@ void render_payloads(ui_state_t& st, float alpha)
                     std::string id = p->id;
                     if (payloads::remove_custom_set(id))
                     {
+                        ::diag::log_tagged_fmt("recon_v", "payload_set_removed id='%s'", id.c_str());
                         st.pl_selected_id[0] = '\0';
                         toast_notification::push("Removed custom set " + id, toast_notification::toast_type_t::success);
                     }
                     else
                     {
+                        ::diag::log_tagged_fmt("recon_v", "payload_set_remove_failed id='%s' err='%s'",
+                            id.c_str(), payloads::last_error().c_str());
                         toast_notification::push("Remove failed: " + payloads::last_error(), toast_notification::toast_type_t::error);
                     }
                 }
@@ -716,6 +770,7 @@ void render_payloads(ui_state_t& st, float alpha)
         if (!cur.empty()) entries.push_back(cur);
         if (payloads::add_custom_set(st.pl_new_id, st.pl_new_label, st.pl_new_desc, entries))
         {
+            ::diag::log_tagged_fmt("recon_v", "payload_set_added id='%s' entries=%zu", st.pl_new_id, entries.size());
             toast_notification::push("Custom set added", toast_notification::toast_type_t::success);
             st.pl_new_id[0] = '\0';
             st.pl_new_label[0] = '\0';
@@ -724,6 +779,8 @@ void render_payloads(ui_state_t& st, float alpha)
         }
         else
         {
+            ::diag::log_tagged_fmt("recon_v", "payload_set_add_failed id='%s' err='%s'",
+                st.pl_new_id, payloads::last_error().c_str());
             toast_notification::push("Add failed: " + payloads::last_error(), toast_notification::toast_type_t::error);
         }
     }
@@ -739,6 +796,7 @@ bool initialize()
     auto& s = ui();
     bool expected = false;
     if (!s.initialized.compare_exchange_strong(expected, true)) return true;
+    ::diag::log_tagged("recon_v", "initialize");
     payloads::initialize();
     crawler::initialize();
     content_discovery::initialize();
@@ -750,6 +808,7 @@ void shutdown()
 {
     auto& s = ui();
     if (!s.initialized.exchange(false)) return;
+    ::diag::log_tagged("recon_v", "shutdown");
     crawler::shutdown();
     content_discovery::shutdown();
     subdomain_enum::shutdown();
@@ -773,7 +832,10 @@ void render(float pos_x, float pos_y, float width, float height,
         bool is_active = (s.active_tab == i);
         if (i > 0) ImGui::SameLine();
         const aida::ui::button_kind_t k = is_active ? aida::ui::button_kind_t::primary : aida::ui::button_kind_t::secondary;
-        if (aida::ui::button(labels[i], k, aida::ui::size_t_::sm)) s.active_tab = i;
+        if (aida::ui::button(labels[i], k, aida::ui::size_t_::sm)) {
+            ::diag::log_tagged_fmt("recon_v", "tab_switch tab=%s", labels[i]);
+            s.active_tab = i;
+        }
     }
 
     ImGui::Spacing();

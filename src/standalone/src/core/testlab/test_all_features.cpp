@@ -186,14 +186,14 @@ namespace test_all_features {
 			for (const auto& candidate : candidates) {
 				char narrow[MAX_PATH] = {};
 				WideCharToMultiByte(CP_UTF8, 0, candidate.c_str(), -1, narrow, MAX_PATH, nullptr, nullptr);
-				diag::log_tagged_fmt("testall", "find_test_target: probing %s", narrow);
+				diag::log_tagged_fmt("test_all", "find_test_target: probing %s", narrow);
 				if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
-					diag::log_tagged_fmt("testall", "find_test_target: resolved %s", narrow);
+					diag::log_tagged_fmt("test_all", "find_test_target: resolved %s", narrow);
 					return candidate;
 				}
 			}
 
-			diag::log_tagged_fmt("testall", "find_test_target: AiDA_TestTarget.exe not found in any candidate path");
+			diag::log_tagged_fmt("test_all", "find_test_target: AiDA_TestTarget.exe not found in any candidate path");
 			return {};
 		}
 

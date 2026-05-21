@@ -78,8 +78,15 @@ static void start_pressed()
 
 }
 
-void initialize() {}
-void shutdown() {}
+void initialize()
+{
+    ::diag::log_tagged("sequencer_v", "initialize");
+}
+
+void shutdown()
+{
+    ::diag::log_tagged("sequencer_v", "shutdown");
+}
 
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b)
@@ -171,16 +178,24 @@ void render(float pos_x, float pos_y, float width, float height,
     ImGui::SameLine();
     if (g_view_state.selected_id != 0) {
         if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+            ::diag::log_tagged_fmt("sequencer_v", "stop_collection id=%llu", static_cast<unsigned long long>(g_view_state.selected_id));
             aida::burp::sequencer::stop_collection(g_view_state.selected_id);
         }
         ImGui::SameLine();
         if (aida::ui::button("Analyze", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+            ::diag::log_tagged_fmt("sequencer_v", "analyze_collection id=%llu", static_cast<unsigned long long>(g_view_state.selected_id));
             g_view_state.last_analysis = aida::burp::sequencer::analyze(g_view_state.selected_id);
             g_view_state.analysis_valid = g_view_state.last_analysis.valid;
             g_view_state.analysis_for_id = g_view_state.selected_id;
+            ::diag::log_tagged_fmt("sequencer_v", "analyze_result valid=%d verdict=%s fips=%d samples=%zu",
+                g_view_state.last_analysis.valid ? 1 : 0,
+                g_view_state.last_analysis.verdict.c_str(),
+                g_view_state.last_analysis.passes_fips_140_2 ? 1 : 0,
+                g_view_state.last_analysis.samples_count);
         }
         ImGui::SameLine();
         if (aida::ui::button("Delete", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
+            ::diag::log_tagged_fmt("sequencer_v", "delete_collection id=%llu", static_cast<unsigned long long>(g_view_state.selected_id));
             aida::burp::sequencer::delete_collection(g_view_state.selected_id);
             g_view_state.selected_id = 0;
             g_view_state.analysis_valid = false;
@@ -207,6 +222,9 @@ void render(float pos_x, float pos_y, float width, float height,
             if (ImGui::Selectable(idbuf, sel, ImGuiSelectableFlags_SpanAllColumns)) {
                 g_view_state.selected_id = c.id;
                 g_view_state.analysis_valid = false;
+                ::diag::log_tagged_fmt("sequencer_v", "collection_selected id=%llu name='%s'",
+                    static_cast<unsigned long long>(c.id),
+                    c.name.empty() ? c.url.c_str() : c.name.c_str());
             }
             ImGui::TableSetColumnIndex(1);
             ImGui::TextUnformatted(c.name.empty() ? c.url.c_str() : c.name.c_str());
@@ -247,6 +265,8 @@ void render(float pos_x, float pos_y, float width, float height,
             st.collected, st.target,
             st.running ? 1 : 0);
         if (!st.error_message.empty()) {
+            ::diag::log_tagged_fmt("sequencer_v", "collection_error id=%llu msg='%s'",
+                static_cast<unsigned long long>(st.id), st.error_message.c_str());
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.error, alpha)),
                 "Error: %s", st.error_message.c_str());
         }

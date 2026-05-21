@@ -407,6 +407,7 @@ bool write_file(const std::string& path, const std::string& body)
 
 bool parse_format(const std::string& s, report_format_t& out)
 {
+    diag::log_tagged_fmt("report", "parse_format entry s=%s", s.c_str());
     std::string l = s;
     std::transform(l.begin(), l.end(), l.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     if (l == "html")     { out = report_format_t::html;      return true; }
@@ -414,6 +415,7 @@ bool parse_format(const std::string& s, report_format_t& out)
     if (l == "json")     { out = report_format_t::json;      return true; }
     if (l == "sarif" || l == "sarif_2_1_0" || l == "sarif_2_1") { out = report_format_t::sarif_2_1; return true; }
     if (l == "csv")      { out = report_format_t::csv;       return true; }
+    diag::log_tagged_fmt("report", "parse_format unknown_format s=%s", s.c_str());
     return false;
 }
 
@@ -431,6 +433,7 @@ const char* format_label(report_format_t f)
 
 const char* default_extension(report_format_t f)
 {
+    diag::log_tagged_fmt("report", "default_extension entry format=%s", format_label(f));
     switch (f) {
         case report_format_t::html:      return ".html";
         case report_format_t::markdown:  return ".md";
@@ -443,12 +446,16 @@ const char* default_extension(report_format_t f)
 
 bool generate(const report_config_t& cfg, std::string& out_path_or_error)
 {
+    diag::log_tagged_fmt("report", "generate entry path=%s format=%s title=%s",
+        cfg.output_path.c_str(), format_label(cfg.format), cfg.title.c_str());
     if (cfg.output_path.empty()) {
+        diag::log_tagged_fmt("report", "generate empty_output_path");
         set_err("report.generate: empty output_path");
         out_path_or_error = err_slot();
         return false;
     }
     auto issues = filter_issues(cfg);
+    diag::log_tagged_fmt("report", "generate filtered_issues=%zu format=%s", issues.size(), format_label(cfg.format));
     std::string body;
     switch (cfg.format) {
         case report_format_t::html:      body = generate_html(cfg, issues); break;
@@ -458,6 +465,7 @@ bool generate(const report_config_t& cfg, std::string& out_path_or_error)
         case report_format_t::csv:       body = generate_csv(cfg, issues); break;
     }
     if (!write_file(cfg.output_path, body)) {
+        diag::log_tagged_fmt("report", "generate write_failed path=%s", cfg.output_path.c_str());
         out_path_or_error = err_slot();
         return false;
     }
@@ -473,6 +481,8 @@ bool generate(const report_config_t& cfg, std::string& out_path_or_error)
         rec.issue_count = issues.size();
         h.items.push_back(std::move(rec));
     }
+    diag::log_tagged_fmt("report", "generate ok path=%s format=%s issues=%zu body_len=%zu",
+        cfg.output_path.c_str(), format_label(cfg.format), issues.size(), body.size());
     diag::log_tagged_fmt("burp.report", "generated path=%s format=%s issues=%zu",
         cfg.output_path.c_str(), format_label(cfg.format), issues.size());
     out_path_or_error = cfg.output_path;
@@ -483,6 +493,8 @@ std::vector<generated_report_t> list_reports()
 {
     auto& h = history();
     std::lock_guard<std::mutex> lk(h.mtx);
+    size_t n = h.items.size();
+    diag::log_tagged_fmt("report", "list_reports result=%zu", n);
     return h.items;
 }
 
@@ -490,20 +502,27 @@ size_t reports_count()
 {
     auto& h = history();
     std::lock_guard<std::mutex> lk(h.mtx);
-    return h.items.size();
+    size_t n = h.items.size();
+    diag::log_tagged_fmt("report", "reports_count result=%zu", n);
+    return n;
 }
 
 void clear_history()
 {
+    diag::log_tagged_fmt("report", "clear_history entry");
     auto& h = history();
     std::lock_guard<std::mutex> lk(h.mtx);
+    size_t n = h.items.size();
     h.items.clear();
+    diag::log_tagged_fmt("report", "clear_history done cleared=%zu", n);
 }
 
 std::string last_error()
 {
     std::lock_guard<std::mutex> lk(err_mtx());
-    return err_slot();
+    std::string e = err_slot();
+    diag::log_tagged_fmt("report", "last_error queried val=%s", e.c_str());
+    return e;
 }
 
 }

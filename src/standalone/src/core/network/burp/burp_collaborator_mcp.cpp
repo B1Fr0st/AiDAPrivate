@@ -63,12 +63,15 @@ json status_to_json(const aida::burp::collaborator::status_t& s)
 
 tool_result_t handle_status(const json&)
 {
+    diag::log_tagged_fmt("mcp_burp", "collaborator_status entry");
     auto s = aida::burp::collaborator::status();
+    diag::log_tagged_fmt("mcp_burp", "collaborator_status ok running=%d interactions=%llu", (int)s.running, static_cast<unsigned long long>(s.interaction_count));
     return tool_result_t::ok("collaborator status", status_to_json(s));
 }
 
 tool_result_t handle_start(const json& p)
 {
+    diag::log_tagged_fmt("mcp_burp", "collaborator_start entry");
     aida::burp::collaborator::collaborator_config_t cfg;
     if (p.contains("bind_ip") && p["bind_ip"].is_string()) cfg.bind_ip = p["bind_ip"].get<std::string>();
     if (p.contains("http_port") && p["http_port"].is_number()) cfg.http_port = static_cast<uint16_t>(p["http_port"].get<int>());
@@ -81,27 +84,37 @@ tool_result_t handle_start(const json& p)
     if (p.contains("enable_smtp") && p["enable_smtp"].is_boolean()) cfg.enable_smtp = p["enable_smtp"].get<bool>();
     if (p.contains("canned_body") && p["canned_body"].is_string()) cfg.canned_body = p["canned_body"].get<std::string>();
     if (p.contains("canned_content_type") && p["canned_content_type"].is_string()) cfg.canned_content_type = p["canned_content_type"].get<std::string>();
+    diag::log_tagged_fmt("mcp_burp", "collaborator_start public_host=%s http=%d dns=%d smtp=%d", cfg.public_host.c_str(), (int)cfg.enable_http, (int)cfg.enable_dns, (int)cfg.enable_smtp);
 
     bool ok = aida::burp::collaborator::start(cfg);
-    if (!ok) {
+    if (!ok)
+    {
+        diag::log_tagged_fmt("mcp_burp", "collaborator_start failed err=%s", aida::burp::collaborator::last_error().c_str());
         return tool_result_t::error("collaborator start failed: " + aida::burp::collaborator::last_error());
     }
+    diag::log_tagged_fmt("mcp_burp", "collaborator_start ok");
     return tool_result_t::ok("collaborator started", status_to_json(aida::burp::collaborator::status()));
 }
 
 tool_result_t handle_stop(const json&)
 {
+    diag::log_tagged_fmt("mcp_burp", "collaborator_stop entry");
     aida::burp::collaborator::stop();
+    diag::log_tagged_fmt("mcp_burp", "collaborator_stop ok");
     return tool_result_t::ok("collaborator stopped", status_to_json(aida::burp::collaborator::status()));
 }
 
 tool_result_t handle_generate_token(const json&)
 {
-    if (!aida::burp::collaborator::is_running()) {
+    diag::log_tagged_fmt("mcp_burp", "collaborator_generate_token entry");
+    if (!aida::burp::collaborator::is_running())
+    {
+        diag::log_tagged_fmt("mcp_burp", "collaborator_generate_token not_running");
         return tool_result_t::error("collaborator not running");
     }
     auto cfg = aida::burp::collaborator::current_config();
     std::string tok = aida::burp::collaborator::generate_token();
+    diag::log_tagged_fmt("mcp_burp", "collaborator_generate_token ok token=%s host=%s", tok.c_str(), cfg.public_host.c_str());
     json out;
     out["token"] = tok;
     out["full_domain"] = tok + "." + cfg.public_host;
@@ -111,16 +124,24 @@ tool_result_t handle_generate_token(const json&)
 
 tool_result_t handle_poll(const json& p)
 {
+    diag::log_tagged_fmt("mcp_burp", "collaborator_poll entry");
     json out = json::array();
+    size_t count = 0;
     if (p.contains("token") && p["token"].is_string() && !p["token"].get<std::string>().empty()) {
-        auto list = aida::burp::collaborator::poll_by_token(p["token"].get<std::string>());
+        const std::string tok = p["token"].get<std::string>();
+        diag::log_tagged_fmt("mcp_burp", "collaborator_poll by_token token=%s", tok.c_str());
+        auto list = aida::burp::collaborator::poll_by_token(tok);
         for (const auto& it : list) out.push_back(interaction_to_json(it));
+        count = list.size();
     } else {
         uint64_t since = 0;
         if (p.contains("since_ms") && p["since_ms"].is_number_unsigned()) since = p["since_ms"].get<uint64_t>();
+        diag::log_tagged_fmt("mcp_burp", "collaborator_poll since_ms=%llu", static_cast<unsigned long long>(since));
         auto list = aida::burp::collaborator::poll_since(since);
         for (const auto& it : list) out.push_back(interaction_to_json(it));
+        count = list.size();
     }
+    diag::log_tagged_fmt("mcp_burp", "collaborator_poll ok count=%zu", count);
     json result;
     result["interactions"] = std::move(out);
     return tool_result_t::ok("collaborator interactions", result);
@@ -128,25 +149,35 @@ tool_result_t handle_poll(const json& p)
 
 tool_result_t handle_get_interaction(const json& p)
 {
-    if (!p.contains("id") || !p["id"].is_number()) {
+    diag::log_tagged_fmt("mcp_burp", "collaborator_get_interaction entry");
+    if (!p.contains("id") || !p["id"].is_number())
+    {
+        diag::log_tagged_fmt("mcp_burp", "collaborator_get_interaction missing_id");
         return tool_result_t::error("id parameter required");
     }
     uint64_t id = p["id"].get<uint64_t>();
+    diag::log_tagged_fmt("mcp_burp", "collaborator_get_interaction id=%llu", static_cast<unsigned long long>(id));
     aida::burp::collaborator::interaction_t it;
-    if (!aida::burp::collaborator::get_interaction(id, it)) {
+    if (!aida::burp::collaborator::get_interaction(id, it))
+    {
+        diag::log_tagged_fmt("mcp_burp", "collaborator_get_interaction not_found id=%llu", static_cast<unsigned long long>(id));
         return tool_result_t::error("interaction not found");
     }
+    diag::log_tagged_fmt("mcp_burp", "collaborator_get_interaction ok id=%llu kind=%s", static_cast<unsigned long long>(id), it.kind.c_str());
     return tool_result_t::ok("interaction", interaction_to_json(it));
 }
 
 tool_result_t handle_clear(const json&)
 {
+    diag::log_tagged_fmt("mcp_burp", "collaborator_clear entry");
     aida::burp::collaborator::clear();
+    diag::log_tagged_fmt("mcp_burp", "collaborator_clear ok");
     return tool_result_t::ok("cleared", status_to_json(aida::burp::collaborator::status()));
 }
 
 tool_result_t handle_list_tokens(const json&)
 {
+    diag::log_tagged_fmt("mcp_burp", "collaborator_list_tokens entry");
     auto toks = aida::burp::collaborator::list_tokens();
     json arr = json::array();
     for (const auto& t : toks) {
@@ -158,6 +189,7 @@ tool_result_t handle_list_tokens(const json&)
         e["interaction_count"] = static_cast<uint64_t>(t.interaction_count);
         arr.push_back(std::move(e));
     }
+    diag::log_tagged_fmt("mcp_burp", "collaborator_list_tokens ok count=%zu", toks.size());
     json r;
     r["tokens"] = std::move(arr);
     return tool_result_t::ok("tokens", r);

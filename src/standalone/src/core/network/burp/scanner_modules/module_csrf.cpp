@@ -1,5 +1,7 @@
 #include "../scanner_module.hpp"
 
+#include "../../../../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <regex>
@@ -111,17 +113,40 @@ std::vector<uint8_t> strip_referer_and_origin(const std::string& base)
 
 void csrf_run(const insertion_point_t& ip, const module_context_t& ctx, const send_fn_t& send)
 {
-    if (ip.kind != "header") return;
-    if (lc(ip.name) != "host") return;
-    if (!is_state_changing(ip.base_request)) return;
-    if (!request_carries_session_cookie(ip.base_request)) return;
-    if (request_has_csrf_token(ip.base_request)) return;
-    if (ctx.baseline_status_code < 200 || ctx.baseline_status_code >= 400) return;
+    diag::log_tagged_fmt("mod_csrf", "csrf_run entry ip=%s:%s host=%s", ip.kind.c_str(), ip.name.c_str(), ctx.host.c_str());
+    if (ip.kind != "header") {
+        diag::log_tagged_fmt("mod_csrf", "csrf_run skip not header kind=%s", ip.kind.c_str());
+        return;
+    }
+    if (lc(ip.name) != "host") {
+        diag::log_tagged_fmt("mod_csrf", "csrf_run skip not host header name=%s", ip.name.c_str());
+        return;
+    }
+    if (!is_state_changing(ip.base_request)) {
+        diag::log_tagged_fmt("mod_csrf", "csrf_run skip not state-changing method");
+        return;
+    }
+    if (!request_carries_session_cookie(ip.base_request)) {
+        diag::log_tagged_fmt("mod_csrf", "csrf_run skip no session cookie");
+        return;
+    }
+    if (request_has_csrf_token(ip.base_request)) {
+        diag::log_tagged_fmt("mod_csrf", "csrf_run skip has csrf token");
+        return;
+    }
+    if (ctx.baseline_status_code < 200 || ctx.baseline_status_code >= 400) {
+        diag::log_tagged_fmt("mod_csrf", "csrf_run skip bad baseline status=%d", ctx.baseline_status_code);
+        return;
+    }
 
     exchange_observed_t baseline_facade;
     baseline_facade.resp_headers = ctx.baseline_response_headers;
     baseline_facade.status_code = ctx.baseline_status_code;
-    if (response_set_cookies_have_samesite_protective(baseline_facade)) return;
+    if (response_set_cookies_have_samesite_protective(baseline_facade)) {
+        diag::log_tagged_fmt("mod_csrf", "csrf_run skip samesite protective cookie");
+        return;
+    }
+    diag::log_tagged_fmt("mod_csrf", "csrf_run all checks passed sending csrf replay probe host=%s", ctx.host.c_str());
 
     std::vector<uint8_t> raw = strip_referer_and_origin(ip.base_request);
     probe_t p;
@@ -129,10 +154,22 @@ void csrf_run(const insertion_point_t& ip, const module_context_t& ctx, const se
     p.marker = "<csrf-replay>";
     p.variant = "strip-referer-origin";
     auto resp = send(raw, p);
-    if (!resp.has_value()) return;
-    if (resp->status_code != ctx.baseline_status_code) return;
-    if (resp->status_code < 200 || resp->status_code >= 400) return;
+    if (!resp.has_value()) {
+        diag::log_tagged_fmt("mod_csrf", "csrf_run no response for replay probe");
+        return;
+    }
+    diag::log_tagged_fmt("mod_csrf", "csrf_run replay response status=%d baseline=%d", resp->status_code, ctx.baseline_status_code);
+    if (resp->status_code != ctx.baseline_status_code) {
+        diag::log_tagged_fmt("mod_csrf", "csrf_run status mismatch probe=%d baseline=%d", resp->status_code, ctx.baseline_status_code);
+        return;
+    }
+    if (resp->status_code < 200 || resp->status_code >= 400) {
+        diag::log_tagged_fmt("mod_csrf", "csrf_run non-2xx replay status=%d", resp->status_code);
+        return;
+    }
 
+    diag::log_tagged_fmt("mod_csrf", "csrf_run FINDING missing-token host=%s baseline=%d replay=%d",
+                         ctx.host.c_str(), ctx.baseline_status_code, resp->status_code);
     auto iss = make_issue("csrf.missing-token",
                           "Cross-Site Request Forgery (CSRF)",
                           severity_t::high, confidence_t::firm, ip, p, *resp, ctx,

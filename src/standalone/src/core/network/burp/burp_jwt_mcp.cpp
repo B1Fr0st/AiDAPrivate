@@ -9,6 +9,8 @@
 #include "burp_jwt_mcp.hpp"
 #include "jwt_lab.hpp"
 
+#include "../../../helpers/diag_log.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <string>
@@ -24,6 +26,7 @@ using tool_result_t = mcp_standalone::tool_result_t;
 
 tool_result_t handle_decode(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "jwt_decode entry");
     if (!params.contains("token") || !params["token"].is_string())
         return tool_result_t::error("missing 'token'");
     const std::string token = params["token"].get<std::string>();
@@ -37,11 +40,13 @@ tool_result_t handle_decode(const json& params)
     out["header_b64"] = parsed.header_b64;
     out["payload_b64"] = parsed.payload_b64;
     out["signature_b64"] = parsed.signature_b64;
+    diag::log_tagged_fmt("mcp_burp", "jwt_decode ok alg=%s valid=%d", parsed.alg.c_str(), (int)parsed.valid_structure);
     return tool_result_t::ok(out);
 }
 
 tool_result_t handle_forge(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "jwt_forge alg=%s", params.value("alg", std::string("HS256")).c_str());
     jwt_lab::jwt_forge_input_t in;
     if (params.contains("header") && params["header"].is_object()) in.header = params["header"];
     else in.header = json::object();
@@ -52,7 +57,8 @@ tool_result_t handle_forge(const json& params)
     in.rsa_private_pem = params.value("rsa_private_pem", std::string());
     in.ecdsa_private_pem = params.value("ecdsa_private_pem", std::string());
     const std::string out_token = jwt_lab::forge(in);
-    if (out_token.empty()) return tool_result_t::error(std::string("forge failed: ") + jwt_lab::last_error());
+    if (out_token.empty()) { diag::log_tagged_fmt("mcp_burp", "jwt_forge failed err=%s", jwt_lab::last_error().c_str()); return tool_result_t::error(std::string("forge failed: ") + jwt_lab::last_error()); }
+    diag::log_tagged_fmt("mcp_burp", "jwt_forge ok token_len=%zu", out_token.size());
     json out;
     out["token"] = out_token;
     return tool_result_t::ok(out);
@@ -60,6 +66,7 @@ tool_result_t handle_forge(const json& params)
 
 tool_result_t handle_verify(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "jwt_verify mode=%s", params.value("mode", std::string("auto")).c_str());
     if (!params.contains("token") || !params["token"].is_string())
         return tool_result_t::error("missing 'token'");
     const std::string token = params["token"].get<std::string>();
@@ -69,6 +76,7 @@ tool_result_t handle_verify(const json& params)
     if (mode == "hmac" || mode == "auto") ok = jwt_lab::verify_hmac(token, key);
     if (!ok && (mode == "rsa" || mode == "auto")) ok = jwt_lab::verify_rsa(token, key);
     if (!ok && (mode == "ecdsa" || mode == "auto")) ok = jwt_lab::verify_ecdsa(token, key);
+    diag::log_tagged_fmt("mcp_burp", "jwt_verify ok verified=%d mode=%s", (int)ok, mode.c_str());
     json out;
     out["verified"] = ok;
     return tool_result_t::ok(out);
@@ -76,6 +84,7 @@ tool_result_t handle_verify(const json& params)
 
 tool_result_t handle_crack_start(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "jwt_crack_start wordlist=%s concurrency=%d", params.value("wordlist_id", std::string("common_passwords")).c_str(), params.value("concurrency", 8));
     if (!params.contains("token") || !params["token"].is_string())
         return tool_result_t::error("missing 'token'");
     jwt_lab::crack_config_t cfg;
@@ -89,7 +98,8 @@ tool_result_t handle_crack_start(const json& params)
     cfg.concurrency = static_cast<size_t>(params.value("concurrency", 8));
     cfg.max_attempts = static_cast<size_t>(params.value("max_attempts", 1000000));
     const uint64_t id = jwt_lab::start_crack(cfg);
-    if (id == 0) return tool_result_t::error(std::string("start_crack failed: ") + jwt_lab::last_error());
+    if (id == 0) { diag::log_tagged_fmt("mcp_burp", "jwt_crack_start failed err=%s", jwt_lab::last_error().c_str()); return tool_result_t::error(std::string("start_crack failed: ") + jwt_lab::last_error()); }
+    diag::log_tagged_fmt("mcp_burp", "jwt_crack_start ok crack_id=%llu", static_cast<unsigned long long>(id));
     json out;
     out["crack_id"] = id;
     return tool_result_t::ok(out);
@@ -98,19 +108,23 @@ tool_result_t handle_crack_start(const json& params)
 tool_result_t handle_crack_status(const json& params)
 {
     const uint64_t id = static_cast<uint64_t>(params.value("crack_id", 0));
+    diag::log_tagged_fmt("mcp_burp", "jwt_crack_status crack_id=%llu", static_cast<unsigned long long>(id));
     const auto status = jwt_lab::crack_status(id);
     json out;
     out["id"] = status.id;
     out["attempts"] = status.attempts;
     out["running"] = status.running;
     out["secret_found"] = status.secret_found;
+    diag::log_tagged_fmt("mcp_burp", "jwt_crack_status ok id=%llu running=%d found=%s attempts=%zu", static_cast<unsigned long long>(id), (int)status.running, status.secret_found.c_str(), status.attempts);
     return tool_result_t::ok(out);
 }
 
 tool_result_t handle_crack_stop(const json& params)
 {
     const uint64_t id = static_cast<uint64_t>(params.value("crack_id", 0));
+    diag::log_tagged_fmt("mcp_burp", "jwt_crack_stop crack_id=%llu", static_cast<unsigned long long>(id));
     jwt_lab::crack_stop(id);
+    diag::log_tagged_fmt("mcp_burp", "jwt_crack_stop ok id=%llu", static_cast<unsigned long long>(id));
     json out;
     out["stopped"] = true;
     return tool_result_t::ok(out);
@@ -118,6 +132,7 @@ tool_result_t handle_crack_stop(const json& params)
 
 tool_result_t handle_attack(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "jwt_attack attack=%s", params.value("attack", std::string("alg_none")).c_str());
     if (!params.contains("token") || !params["token"].is_string())
         return tool_result_t::error("missing 'token'");
     const std::string token = params["token"].get<std::string>();
@@ -137,6 +152,7 @@ tool_result_t handle_attack(const json& params)
     else if (attack == "signature_strip") candidates = jwt_lab::attack_signature_strip(token);
     else return tool_result_t::error("unknown attack");
 
+    diag::log_tagged_fmt("mcp_burp", "jwt_attack ok attack=%s candidates=%zu", attack.c_str(), candidates.size());
     json out;
     out["count"] = candidates.size();
     out["candidates"] = candidates;

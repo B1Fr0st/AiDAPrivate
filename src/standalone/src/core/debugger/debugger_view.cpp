@@ -927,6 +927,7 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 			if (ui.active_tab != tab) {
+				diag::log_tagged_fmt("dbg_view", "tab_switch: '%s' -> '%s'", visible_tabs[active_idx].name, tab_full_name);
 				int prev_i = static_cast<int>(ui.active_tab);
 				int next_i = static_cast<int>(tab);
 				ui.tab_animator.direction = (next_i > prev_i) ? 1.f : -1.f;
@@ -2825,7 +2826,10 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 			}
 
 			if (clicked) ui.callstack_panel.selected = i;
-			if (dclicked) jump_to_disasm(f.address);
+			if (dclicked) {
+				diag::log_tagged_fmt("dbg_view", "callstack double-click: jump to frame addr=0x%llX module='%s'", (unsigned long long)f.address, f.module_name.c_str());
+				jump_to_disasm(f.address);
+			}
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
 				copy_addr_to_clipboard(f.address);
 		}
@@ -3659,8 +3663,10 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 				            with_a(t.text_dim, a), sr.module_name.c_str());
 
 			if (clicked) ui.strings_panel.selected = i;
-			if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+			if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+				diag::log_tagged_fmt("dbg_view", "strings double-click: jump to hex addr=0x%llX value='%.32s'", (unsigned long long)sr.address, sr.value.c_str());
 				jump_to_hex(sr.address, 256);
+			}
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
 				copy_addr_to_clipboard(sr.address);
 		}
@@ -3838,7 +3844,10 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 			}
 
 			if (clicked) ui.bookmark_panel.selected = i;
-			if (dclicked) jump_to_disasm(addr);
+			if (dclicked) {
+				diag::log_tagged_fmt("dbg_view", "bookmark double-click: jump to addr=0x%llX", (unsigned long long)addr);
+				jump_to_disasm(addr);
+			}
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
 				copy_addr_to_clipboard(addr);
 		}

@@ -83,7 +83,9 @@ std::string typeref_to_str(const nlohmann::json& tr)
 std::string last_error()
 {
     std::lock_guard<std::mutex> lk(err_mtx());
-    return err_slot();
+    std::string e = err_slot();
+    diag::log_tagged_fmt("graphql", "last_error queried val=%s", e.c_str());
+    return e;
 }
 
 bool introspect(const std::string& endpoint,
@@ -91,26 +93,34 @@ bool introspect(const std::string& endpoint,
                 gql_schema_t& out,
                 std::string& raw_response)
 {
+    diag::log_tagged_fmt("graphql", "introspect entry endpoint=%s headers=%zu",
+        endpoint.c_str(), headers.size());
     nlohmann::json body;
     body["query"] = introspection_query();
     body["operationName"] = "IntrospectionQuery";
     nlohmann::json variables = nlohmann::json::object();
 
     nlohmann::json resp_json;
+    diag::log_tagged_fmt("graphql", "introspect sending_introspection_query");
     if (!send_query(endpoint, headers, introspection_query(), variables, resp_json, raw_response)) {
+        diag::log_tagged_fmt("graphql", "introspect send_query_failed endpoint=%s", endpoint.c_str());
         return false;
     }
+    diag::log_tagged_fmt("graphql", "introspect response_received raw_len=%zu", raw_response.size());
 
     if (!resp_json.is_object() || !resp_json.contains("data") || !resp_json["data"].is_object()) {
+        diag::log_tagged_fmt("graphql", "introspect no_data_field endpoint=%s", endpoint.c_str());
         set_err("graphql.introspect: no data field");
         return false;
     }
     const auto& data = resp_json["data"];
     if (!data.contains("__schema") || !data["__schema"].is_object()) {
+        diag::log_tagged_fmt("graphql", "introspect no_schema_field endpoint=%s", endpoint.c_str());
         set_err("graphql.introspect: no __schema");
         return false;
     }
     const auto& schema = data["__schema"];
+    diag::log_tagged_fmt("graphql", "introspect parsing_schema");
 
     gql_schema_t parsed;
     if (schema.contains("queryType") && schema["queryType"].is_object())
@@ -119,6 +129,9 @@ bool introspect(const std::string& endpoint,
         parsed.mutation_type = schema["mutationType"].value("name", std::string());
     if (schema.contains("subscriptionType") && schema["subscriptionType"].is_object())
         parsed.subscription_type = schema["subscriptionType"].value("name", std::string());
+
+    diag::log_tagged_fmt("graphql", "introspect schema query_type=%s mutation_type=%s subscription_type=%s",
+        parsed.query_type.c_str(), parsed.mutation_type.c_str(), parsed.subscription_type.c_str());
 
     if (schema.contains("types") && schema["types"].is_array()) {
         for (const auto& t : schema["types"]) {
@@ -166,12 +179,18 @@ bool introspect(const std::string& endpoint,
                     gt.fields.push_back(std::move(gf));
                 }
             }
+            diag::log_tagged_fmt("graphql", "introspect type name=%s kind=%s fields=%zu",
+                gt.name.c_str(), gt.kind.c_str(), gt.fields.size());
             parsed.types.push_back(std::move(gt));
         }
     }
 
+    diag::log_tagged_fmt("graphql", "introspect caching schema types=%zu endpoint=%s",
+        parsed.types.size(), endpoint.c_str());
     cache_schema(endpoint, parsed);
     out = std::move(parsed);
+    diag::log_tagged_fmt("graphql", "introspect ok endpoint=%s types=%zu",
+        endpoint.c_str(), out.types.size());
     return true;
 }
 
@@ -235,16 +254,20 @@ std::string field_selection(const gql_schema_t& s, const std::string& type_name,
 
 std::string build_example_query(const gql_schema_t& schema, const std::string& field_name, int depth)
 {
+    diag::log_tagged_fmt("graphql", "build_example_query entry field=%s depth=%d types=%zu",
+        field_name.c_str(), depth, schema.types.size());
     if (depth < 1) depth = 1;
     if (depth > 5) depth = 5;
     std::string query_root_name = schema.query_type.empty() ? std::string("Query") : schema.query_type;
     const gql_type_t* root = find_type(schema, query_root_name);
     if (!root) {
+        diag::log_tagged_fmt("graphql", "build_example_query root_type_not_found name=%s", query_root_name.c_str());
         return std::string("query { __typename }");
     }
     const gql_field_t* found = nullptr;
     for (const auto& f : root->fields) if (f.name == field_name) { found = &f; break; }
     if (!found) {
+        diag::log_tagged_fmt("graphql", "build_example_query searching all types for field=%s", field_name.c_str());
         for (const auto& t : schema.types) {
             for (const auto& f : t.fields) {
                 if (f.name == field_name) { found = &f; break; }
@@ -253,8 +276,11 @@ std::string build_example_query(const gql_schema_t& schema, const std::string& f
         }
     }
     if (!found) {
+        diag::log_tagged_fmt("graphql", "build_example_query field_not_found name=%s using_fallback", field_name.c_str());
         return std::string("query { ") + field_name + std::string(" }");
     }
+    diag::log_tagged_fmt("graphql", "build_example_query field_found name=%s type=%s args=%zu",
+        found->name.c_str(), found->type_str.c_str(), found->args.size());
     std::string out = "query Example {\n  " + field_name;
     if (!found->args.empty()) {
         out += "(";
@@ -277,11 +303,14 @@ std::string build_example_query(const gql_schema_t& schema, const std::string& f
         out += field_selection(schema, base_ret, 1, depth);
     }
     out += "\n}\n";
+    diag::log_tagged_fmt("graphql", "build_example_query done query_len=%zu", out.size());
     return out;
 }
 
 std::string build_batched_query(const std::string& operation, size_t batch_count)
 {
+    diag::log_tagged_fmt("graphql", "build_batched_query entry batch_count=%zu op_len=%zu",
+        batch_count, operation.size());
     if (batch_count == 0) batch_count = 1;
     std::string trimmed = operation;
     while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\n' || trimmed.back() == '\r' || trimmed.back() == '\t')) trimmed.pop_back();
@@ -301,11 +330,14 @@ std::string build_batched_query(const std::string& operation, size_t batch_count
         out += "\n";
     }
     out += "}\n";
+    diag::log_tagged_fmt("graphql", "build_batched_query done batch_count=%zu result_len=%zu",
+        batch_count, out.size());
     return out;
 }
 
 std::string beautify_query(const std::string& source)
 {
+    diag::log_tagged_fmt("graphql", "beautify_query entry src_len=%zu", source.size());
     std::string out;
     int depth = 0;
     bool prev_space = true;
@@ -343,6 +375,7 @@ std::string beautify_query(const std::string& source)
 
 std::string minify_query(const std::string& source)
 {
+    diag::log_tagged_fmt("graphql", "minify_query entry src_len=%zu", source.size());
     std::string out;
     out.reserve(source.size());
     bool prev_space = false;
@@ -356,6 +389,7 @@ std::string minify_query(const std::string& source)
     }
     while (!out.empty() && out.front() == ' ') out.erase(out.begin());
     while (!out.empty() && out.back()  == ' ') out.pop_back();
+    diag::log_tagged_fmt("graphql", "minify_query done result_len=%zu", out.size());
     return out;
 }
 
@@ -366,11 +400,16 @@ bool send_query(const std::string& endpoint,
                 nlohmann::json& response_json,
                 std::string& raw_text)
 {
+    diag::log_tagged_fmt("graphql", "send_query entry endpoint=%s query_len=%zu headers=%zu",
+        endpoint.c_str(), query.size(), headers.size());
     std::string scheme, host, path; uint16_t port = 0;
     if (!audit_http::parse_url(endpoint, scheme, host, port, path)) {
+        diag::log_tagged_fmt("graphql", "send_query parse_url_failed endpoint=%s", endpoint.c_str());
         set_err("graphql.send_query: parse_url failed");
         return false;
     }
+    diag::log_tagged_fmt("graphql", "send_query parsed scheme=%s host=%s port=%u path=%s",
+        scheme.c_str(), host.c_str(), static_cast<unsigned>(port), path.c_str());
     std::string origin = scheme + "://" + host;
     if ((scheme == "https" && port != 443) || (scheme == "http" && port != 80))
         origin += ":" + std::to_string(port);
@@ -394,26 +433,35 @@ bool send_query(const std::string& endpoint,
     if (!variables.is_null()) body["variables"] = variables;
     std::string body_str = body.dump();
 
+    diag::log_tagged_fmt("graphql", "send_query posting to %s%s body_len=%zu",
+        origin.c_str(), path.c_str(), body_str.size());
     auto res = cli.Post(path, hh, body_str, std::string("application/json"));
     if (!res) {
+        diag::log_tagged_fmt("graphql", "send_query post_failed endpoint=%s", endpoint.c_str());
         set_err("graphql.send_query: POST failed");
         return false;
     }
     raw_text = res->body;
+    diag::log_tagged_fmt("graphql", "send_query response_received status=%d body_len=%zu",
+        res->status, raw_text.size());
     if (raw_text.empty()) {
+        diag::log_tagged_fmt("graphql", "send_query empty_body endpoint=%s", endpoint.c_str());
         set_err("graphql.send_query: empty body");
         return false;
     }
     response_json = nlohmann::json::parse(raw_text, nullptr, false);
     if (response_json.is_discarded()) {
+        diag::log_tagged_fmt("graphql", "send_query response_not_json endpoint=%s", endpoint.c_str());
         set_err("graphql.send_query: response is not JSON");
         return false;
     }
+    diag::log_tagged_fmt("graphql", "send_query ok endpoint=%s", endpoint.c_str());
     return true;
 }
 
 nlohmann::json schema_to_json(const gql_schema_t& s)
 {
+    diag::log_tagged_fmt("graphql", "schema_to_json entry types=%zu", s.types.size());
     nlohmann::json j;
     j["query_type"]        = s.query_type;
     j["mutation_type"]     = s.mutation_type;
@@ -445,19 +493,28 @@ nlohmann::json schema_to_json(const gql_schema_t& s)
 
 bool cache_schema(const std::string& endpoint, const gql_schema_t& schema)
 {
+    diag::log_tagged_fmt("graphql", "cache_schema endpoint=%s types=%zu",
+        endpoint.c_str(), schema.types.size());
     auto& c = cache();
     std::lock_guard<std::mutex> lk(c.mtx);
     c.by_endpoint[endpoint] = schema;
+    diag::log_tagged_fmt("graphql", "cache_schema cached total_entries=%zu", c.by_endpoint.size());
     return true;
 }
 
 bool get_cached_schema(const std::string& endpoint, gql_schema_t& out)
 {
+    diag::log_tagged_fmt("graphql", "get_cached_schema entry endpoint=%s", endpoint.c_str());
     auto& c = cache();
     std::lock_guard<std::mutex> lk(c.mtx);
     auto it = c.by_endpoint.find(endpoint);
-    if (it == c.by_endpoint.end()) return false;
+    if (it == c.by_endpoint.end()) {
+        diag::log_tagged_fmt("graphql", "get_cached_schema not_found endpoint=%s", endpoint.c_str());
+        return false;
+    }
     out = it->second;
+    diag::log_tagged_fmt("graphql", "get_cached_schema found endpoint=%s types=%zu",
+        endpoint.c_str(), out.types.size());
     return true;
 }
 
@@ -465,7 +522,10 @@ bool has_cached_schema(const std::string& endpoint)
 {
     auto& c = cache();
     std::lock_guard<std::mutex> lk(c.mtx);
-    return c.by_endpoint.find(endpoint) != c.by_endpoint.end();
+    bool found = c.by_endpoint.find(endpoint) != c.by_endpoint.end();
+    diag::log_tagged_fmt("graphql", "has_cached_schema endpoint=%s result=%d",
+        endpoint.c_str(), static_cast<int>(found));
+    return found;
 }
 
 }

@@ -168,30 +168,46 @@ bool quote_path(const std::string& in, std::wstring& out)
 
 bool initialize()
 {
+    diag::log_tagged_fmt("browser", "initialize entry");
     auto& st = s();
     bool expected = false;
-    if (!st.initialized.compare_exchange_strong(expected, true)) return true;
+    if (!st.initialized.compare_exchange_strong(expected, true)) {
+        diag::log_tagged_fmt("browser", "initialize already_initialized");
+        return true;
+    }
     diag::log_tagged("burp_browser", "initialized");
+    diag::log_tagged_fmt("browser", "initialize done");
     return true;
 }
 
 void shutdown()
 {
+    diag::log_tagged_fmt("browser", "shutdown entry");
     auto& st = s();
-    if (!st.initialized.exchange(false)) return;
+    if (!st.initialized.exchange(false)) {
+        diag::log_tagged_fmt("browser", "shutdown not_initialized skipping");
+        return;
+    }
     std::lock_guard<std::mutex> lk(st.mtx);
+    size_t n = st.tracked.size();
     st.tracked.clear();
+    diag::log_tagged_fmt("browser", "shutdown done cleared_tracked=%zu", n);
 }
 
 bool detect_edge_path(std::string& out_path)
 {
+    diag::log_tagged_fmt("browser", "detect_edge_path entry");
     std::string candidates[4];
     candidates[0] = program_files_x86() + "\\Microsoft\\Edge\\Application\\msedge.exe";
     candidates[1] = program_files() + "\\Microsoft\\Edge\\Application\\msedge.exe";
     candidates[2] = local_appdata_dir() + "\\Microsoft\\Edge\\Application\\msedge.exe";
     candidates[3] = registry_string_hkcu("SOFTWARE\\Microsoft\\Edge\\BLBeacon", "InstallLocation");
     for (auto& p : candidates) {
-        if (!p.empty() && file_exists(p)) { out_path = p; return true; }
+        if (!p.empty() && file_exists(p)) {
+            diag::log_tagged_fmt("browser", "detect_edge_path found path=%s", p.c_str());
+            out_path = p;
+            return true;
+        }
     }
     HKEY k = nullptr;
     if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
@@ -205,21 +221,31 @@ bool detect_edge_path(std::string& out_path)
         if (rc == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ)) {
             if (sz > 0 && buf[sz - 1] == '\0') sz--;
             std::string p(buf, sz);
-            if (file_exists(p)) { out_path = p; return true; }
+            if (file_exists(p)) {
+                diag::log_tagged_fmt("browser", "detect_edge_path found_via_registry path=%s", p.c_str());
+                out_path = p;
+                return true;
+            }
         }
     }
+    diag::log_tagged_fmt("browser", "detect_edge_path not_found");
     set_err("edge_not_detected");
     return false;
 }
 
 bool detect_chrome_path(std::string& out_path)
 {
+    diag::log_tagged_fmt("browser", "detect_chrome_path entry");
     std::string candidates[3];
     candidates[0] = program_files() + "\\Google\\Chrome\\Application\\chrome.exe";
     candidates[1] = program_files_x86() + "\\Google\\Chrome\\Application\\chrome.exe";
     candidates[2] = local_appdata_dir() + "\\Google\\Chrome\\Application\\chrome.exe";
     for (auto& p : candidates) {
-        if (!p.empty() && file_exists(p)) { out_path = p; return true; }
+        if (!p.empty() && file_exists(p)) {
+            diag::log_tagged_fmt("browser", "detect_chrome_path found path=%s", p.c_str());
+            out_path = p;
+            return true;
+        }
     }
     HKEY k = nullptr;
     if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
@@ -233,9 +259,14 @@ bool detect_chrome_path(std::string& out_path)
         if (rc == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ)) {
             if (sz > 0 && buf[sz - 1] == '\0') sz--;
             std::string p(buf, sz);
-            if (file_exists(p)) { out_path = p; return true; }
+            if (file_exists(p)) {
+                diag::log_tagged_fmt("browser", "detect_chrome_path found_via_registry path=%s", p.c_str());
+                out_path = p;
+                return true;
+            }
         }
     }
+    diag::log_tagged_fmt("browser", "detect_chrome_path not_found");
     set_err("chrome_not_detected");
     return false;
 }
@@ -246,12 +277,14 @@ std::string profile_root()
     base += "\\AiDA";
     std::error_code ec;
     std::filesystem::create_directories(base, ec);
+    diag::log_tagged_fmt("browser", "profile_root result=%s", base.c_str());
     return base;
 }
 
 std::string compute_profile_path(const std::string& subdir)
 {
     std::string sd = subdir.empty() ? std::string("BurpBrowser") : subdir;
+    diag::log_tagged_fmt("browser", "compute_profile_path entry subdir=%s", sd.c_str());
     std::string base = profile_root();
     base += "\\";
     for (char c : sd) {
@@ -264,6 +297,7 @@ std::string compute_profile_path(const std::string& subdir)
     }
     std::error_code ec;
     std::filesystem::create_directories(base, ec);
+    diag::log_tagged_fmt("browser", "compute_profile_path result=%s", base.c_str());
     return base;
 }
 
@@ -326,29 +360,41 @@ std::wstring build_command_line(const std::string& browser_path,
 
 bool launch(const browser_launch_config_t& cfg, uint32_t& out_pid)
 {
+    diag::log_tagged_fmt("browser", "launch entry prefer_chrome=%d proxy=%s:%u url=%s ignore_cert=%d",
+        static_cast<int>(cfg.prefer_chrome), cfg.proxy_host.c_str(),
+        static_cast<unsigned>(cfg.proxy_port), cfg.initial_url.c_str(),
+        static_cast<int>(cfg.ignore_cert_errors));
     out_pid = 0;
     auto& st = s();
     if (!st.initialized.load()) initialize();
 
     std::string browser_path;
     if (cfg.prefer_chrome) {
+        diag::log_tagged_fmt("browser", "launch prefer_chrome=true trying_chrome_first");
         if (!detect_chrome_path(browser_path)) {
+            diag::log_tagged_fmt("browser", "launch chrome_not_found trying_edge");
             if (!detect_edge_path(browser_path)) {
+                diag::log_tagged_fmt("browser", "launch no_chromium_browser_detected");
                 set_err("no_chromium_browser_detected");
                 return false;
             }
         }
     } else {
+        diag::log_tagged_fmt("browser", "launch prefer_edge=true trying_edge_first");
         if (!detect_edge_path(browser_path)) {
+            diag::log_tagged_fmt("browser", "launch edge_not_found trying_chrome");
             if (!detect_chrome_path(browser_path)) {
+                diag::log_tagged_fmt("browser", "launch no_chromium_browser_detected");
                 set_err("no_chromium_browser_detected");
                 return false;
             }
         }
     }
+    diag::log_tagged_fmt("browser", "launch browser_path=%s", browser_path.c_str());
 
     std::string profile_path = compute_profile_path(cfg.profile_subdir);
     if (cfg.clear_profile_first) {
+        diag::log_tagged_fmt("browser", "launch clearing_profile profile=%s", profile_path.c_str());
         remove_directory_recursive(profile_path);
         std::error_code ec;
         std::filesystem::create_directories(profile_path, ec);
@@ -356,9 +402,11 @@ bool launch(const browser_launch_config_t& cfg, uint32_t& out_pid)
 
     std::wstring cmdline = build_command_line(browser_path, cfg, profile_path);
     if (cmdline.empty()) {
+        diag::log_tagged_fmt("browser", "launch build_cmdline_failed");
         set_err("build_cmdline_failed");
         return false;
     }
+    diag::log_tagged_fmt("browser", "launch cmdline_built launching process");
 
     std::vector<wchar_t> cmd_mutable(cmdline.begin(), cmdline.end());
     cmd_mutable.push_back(L'\0');
@@ -384,11 +432,13 @@ bool launch(const browser_launch_config_t& cfg, uint32_t& out_pid)
         DWORD err = GetLastError();
         char msg[128];
         _snprintf_s(msg, sizeof(msg), _TRUNCATE, "createprocess_failed code=%lu", err);
+        diag::log_tagged_fmt("browser", "launch createprocess_failed code=%lu", err);
         set_err(msg);
         return false;
     }
 
     out_pid = static_cast<uint32_t>(pi.dwProcessId);
+    diag::log_tagged_fmt("browser", "launch createprocess_ok pid=%u", out_pid);
 
     tracked_pid_t rec;
     rec.pid = out_pid;
@@ -406,20 +456,27 @@ bool launch(const browser_launch_config_t& cfg, uint32_t& out_pid)
     CloseHandle(pi.hProcess);
 
     diag::log_tagged("burp_browser", "launched");
+    diag::log_tagged_fmt("browser", "launch ok pid=%u browser=%s", out_pid, browser_path.c_str());
     return true;
 }
 
 bool kill(uint32_t pid)
 {
-    if (pid == 0) return false;
+    diag::log_tagged_fmt("browser", "kill entry pid=%u", pid);
+    if (pid == 0) {
+        diag::log_tagged_fmt("browser", "kill pid_zero rejected");
+        return false;
+    }
     HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
     if (!h) {
+        diag::log_tagged_fmt("browser", "kill open_process_failed pid=%u", pid);
         set_err("kill_open_failed");
         return false;
     }
     BOOL ok = TerminateProcess(h, 0);
     if (ok) WaitForSingleObject(h, 2000);
     CloseHandle(h);
+    diag::log_tagged_fmt("browser", "kill terminate_result=%d pid=%u", static_cast<int>(ok != 0), pid);
 
     auto& st = s();
     {
@@ -433,6 +490,7 @@ bool kill(uint32_t pid)
 
 bool kill_all()
 {
+    diag::log_tagged_fmt("browser", "kill_all entry");
     auto& st = s();
     std::vector<uint32_t> pids;
     {
@@ -440,29 +498,40 @@ bool kill_all()
         pids.reserve(st.tracked.size());
         for (const auto& r : st.tracked) pids.push_back(r.pid);
     }
+    diag::log_tagged_fmt("browser", "kill_all killing count=%zu", pids.size());
     bool all_ok = true;
     for (uint32_t pid : pids) {
         if (!kill(pid)) all_ok = false;
     }
+    diag::log_tagged_fmt("browser", "kill_all done all_ok=%d", static_cast<int>(all_ok));
     return all_ok;
 }
 
 void register_browser_pid(uint32_t pid)
 {
-    if (pid == 0) return;
+    diag::log_tagged_fmt("browser", "register_browser_pid entry pid=%u", pid);
+    if (pid == 0) {
+        diag::log_tagged_fmt("browser", "register_browser_pid pid_zero rejected");
+        return;
+    }
     auto& st = s();
     std::lock_guard<std::mutex> lk(st.mtx);
     for (const auto& r : st.tracked) {
-        if (r.pid == pid) return;
+        if (r.pid == pid) {
+            diag::log_tagged_fmt("browser", "register_browser_pid already_tracked pid=%u", pid);
+            return;
+        }
     }
     tracked_pid_t rec;
     rec.pid = pid;
     rec.launched_ms = now_ms();
     st.tracked.push_back(rec);
+    diag::log_tagged_fmt("browser", "register_browser_pid registered pid=%u total=%zu", pid, st.tracked.size());
 }
 
 std::vector<browser_status_t> list_running()
 {
+    diag::log_tagged_fmt("browser", "list_running entry");
     auto& st = s();
     std::vector<tracked_pid_t> snapshot;
     {
@@ -480,7 +549,12 @@ std::vector<browser_status_t> list_running()
         s.proxy_port = r.proxy_port;
         s.launched_ms = r.launched_ms;
         s.running = is_process_alive(r.pid);
-        if (!s.running) to_remove.push_back(r.pid);
+        if (!s.running) {
+            diag::log_tagged_fmt("browser", "list_running dead_process pid=%u removing", r.pid);
+            to_remove.push_back(r.pid);
+        } else {
+            diag::log_tagged_fmt("browser", "list_running alive pid=%u", r.pid);
+        }
         out.push_back(s);
     }
     if (!to_remove.empty()) {
@@ -492,6 +566,8 @@ std::vector<browser_status_t> list_running()
                                         }),
                          st.tracked.end());
     }
+    diag::log_tagged_fmt("browser", "list_running result count=%zu dead_removed=%zu",
+        out.size(), to_remove.size());
     return out;
 }
 
@@ -499,6 +575,7 @@ std::string last_error()
 {
     auto& st = s();
     std::lock_guard<std::mutex> lk(st.err_mtx);
+    diag::log_tagged_fmt("browser", "last_error queried val=%s", st.last_err.c_str());
     return st.last_err;
 }
 

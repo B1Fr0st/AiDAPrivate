@@ -2,6 +2,7 @@
 #include <windows.h>
 
 #include "mcp_standalone.hpp"
+#include "../../helpers/diag_log.hpp"
 #include "agent_registry.hpp"
 #include "standalone_settings.hpp"
 #include "standalone_chat.hpp"
@@ -118,8 +119,12 @@ tool_result_t handle_switch_agent(const json& params)
         name = params["name"].get<std::string>();
     else if (params.contains("agent_name") && params["agent_name"].is_string())
         name = params["agent_name"].get<std::string>();
+    diag::log_tagged_fmt("workflow", "switch_agent entry name='%s'", name.c_str());
     if (name.empty())
+    {
+        diag::log_tagged_fmt("workflow", "switch_agent missing agent name");
         return tool_result_t::error("Missing required parameter: agent");
+    }
 
     std::string reason;
     if (params.contains("reason") && params["reason"].is_string())
@@ -127,11 +132,18 @@ tool_result_t handle_switch_agent(const json& params)
 
     const auto* info = aida::agent::get(name);
     if (info == nullptr)
+    {
+        diag::log_tagged_fmt("workflow", "switch_agent unknown agent='%s'", name.c_str());
         return tool_result_t::error("Unknown agent: " + name + ". Use list_agents to see available agents.");
+    }
 
     std::string previous = aida::agent::active_agent_name();
     if (!aida::agent::set_active_agent(name))
+    {
+        diag::log_tagged_fmt("workflow", "switch_agent set_active failed err='%s'",
+            aida::agent::last_error().c_str());
         return tool_result_t::error("Failed to switch agent: " + aida::agent::last_error());
+    }
 
     if (previous != name) {
         aida::events::agent_changed_t evt;
@@ -145,6 +157,8 @@ tool_result_t handle_switch_agent(const json& params)
     if (!reason.empty())
         msg += " Reason: " + reason;
 
+    diag::log_tagged_fmt("workflow", "switch_agent ok previous='%s' new='%s'",
+        previous.c_str(), name.c_str());
     output_log::push(bottom_tab_t::output, "[agent] " + msg);
     return tool_result_t::ok(msg);
 }
@@ -152,12 +166,21 @@ tool_result_t handle_switch_agent(const json& params)
 
 tool_result_t handle_plan_enter(const json&)
 {
+    diag::log_tagged_fmt("workflow", "plan_enter current='%s'",
+        aida::agent::active_agent_name().c_str());
     if (aida::agent::active_agent_name() == "plan")
+    {
+        diag::log_tagged_fmt("workflow", "plan_enter already in plan mode");
         return tool_result_t::ok("Already in plan mode.");
+    }
 
     std::string previous = aida::agent::active_agent_name();
     if (!aida::agent::set_active_agent("plan"))
+    {
+        diag::log_tagged_fmt("workflow", "plan_enter failed err='%s'",
+            aida::agent::last_error().c_str());
         return tool_result_t::error("Failed to enter plan mode: " + aida::agent::last_error());
+    }
 
     aida::events::agent_changed_t evt;
     evt.session_id = conversations::current_id;
@@ -165,6 +188,7 @@ tool_result_t handle_plan_enter(const json&)
     evt.new_agent = "plan";
     aida::events::publish(aida::events::event_agent_changed, evt);
 
+    diag::log_tagged_fmt("workflow", "plan_enter ok previous='%s'", previous.c_str());
     output_log::push(bottom_tab_t::output, "[agent] Entered plan mode (previous: " + previous + ")");
 
     return tool_result_t::ok(
@@ -175,8 +199,13 @@ tool_result_t handle_plan_enter(const json&)
 
 tool_result_t handle_plan_exit(const json& params)
 {
+    diag::log_tagged_fmt("workflow", "plan_exit entry current='%s'",
+        aida::agent::active_agent_name().c_str());
     if (aida::agent::active_agent_name() != "plan")
+    {
+        diag::log_tagged_fmt("workflow", "plan_exit not in plan mode");
         return tool_result_t::error("Not in plan mode.");
+    }
 
     std::string summary;
     if (params.contains("summary") && params["summary"].is_string())
@@ -228,6 +257,7 @@ tool_result_t handle_plan_exit(const json& params)
         std::string("[agent] plan_exit: switching to build agent") +
         (summary.empty() ? std::string{} : std::string(" (summary: ") + summary.substr(0, 80) + ")"));
 
+    diag::log_tagged_fmt("workflow", "plan_exit ok switched to build");
     return tool_result_t::ok("Plan complete. Switching to build agent to execute.");
 }
 
@@ -239,8 +269,12 @@ tool_result_t handle_task(const json& params)
         agent_name = params["agent"].get<std::string>();
     else if (params.contains("name") && params["name"].is_string())
         agent_name = params["name"].get<std::string>();
+    diag::log_tagged_fmt("workflow", "task entry agent='%s'", agent_name.c_str());
     if (agent_name.empty())
+    {
+        diag::log_tagged_fmt("workflow", "task missing agent name");
         return tool_result_t::error("Missing required parameter: agent");
+    }
 
     std::string prompt;
     if (params.contains("prompt") && params["prompt"].is_string())
@@ -264,6 +298,8 @@ tool_result_t handle_task(const json& params)
 
     std::string parent_session_id;
 
+    diag::log_tagged_fmt("workflow", "task spawning agent='%s' max_steps=%d",
+        agent_name.c_str(), max_steps);
     output_log::push(bottom_tab_t::output, "[task] Spawning subagent: " + agent_name);
 
     std::string result;
@@ -271,13 +307,20 @@ tool_result_t handle_task(const json& params)
     bool ok = aida::agent::task::execute(agent_name, prompt, max_steps,
                                          parent_session_id, result, cancel_flag);
     if (!ok && result.empty())
+    {
+        diag::log_tagged_fmt("workflow", "task failed agent='%s' err='%s'",
+            agent_name.c_str(), aida::agent::task::last_error().c_str());
         return tool_result_t::error("Subagent failed: " + aida::agent::task::last_error());
+    }
+    diag::log_tagged_fmt("workflow", "task ok agent='%s' result_len=%zu",
+        agent_name.c_str(), result.size());
     return tool_result_t::ok(result);
 }
 
 
 tool_result_t handle_list_agents(const json&)
 {
+    diag::log_tagged_fmt("workflow", "list_agents entry");
     std::string out = "Available agents:\n";
     json arr = json::array();
     auto primaries = aida::agent::primary_agents();
@@ -290,14 +333,19 @@ tool_result_t handle_list_agents(const json&)
         out += "- " + a->name + " (subagent): " + a->description + "\n";
         arr.push_back({{"name", a->name}, {"mode", "subagent"}, {"description", a->description}, {"hidden", a->hidden}});
     }
+    diag::log_tagged_fmt("workflow", "list_agents ok count=%zu", arr.size());
     return tool_result_t::ok(out, json{{"agents", arr}});
 }
 
 
 tool_result_t handle_ask_followup_question(const json& params)
 {
+    diag::log_tagged_fmt("workflow", "ask_followup_question entry");
     if (!params.contains("question") || !params["question"].is_string())
+    {
+        diag::log_tagged_fmt("workflow", "ask_followup_question missing question param");
         return tool_result_t::error("Missing required parameter: question");
+    }
 
     std::string question = params["question"].get<std::string>();
     std::vector<std::string> options;
@@ -316,6 +364,8 @@ tool_result_t handle_ask_followup_question(const json& params)
         g_followup_pending = true;
     }
 
+    diag::log_tagged_fmt("workflow", "ask_followup_question q='%.80s' options=%zu",
+        question.c_str(), options.size());
     std::string msg = "Follow-up question presented to user: " + question;
     if (!options.empty()) {
         msg += "\nOptions: ";
@@ -331,8 +381,12 @@ tool_result_t handle_ask_followup_question(const json& params)
 
 tool_result_t handle_attempt_completion(const json& params)
 {
+    diag::log_tagged_fmt("workflow", "attempt_completion entry");
     if (!params.contains("result") || !params["result"].is_string())
+    {
+        diag::log_tagged_fmt("workflow", "attempt_completion missing result param");
         return tool_result_t::error("Missing required parameter: result");
+    }
 
     std::string result = params["result"].get<std::string>();
     std::string command;
@@ -347,6 +401,8 @@ tool_result_t handle_attempt_completion(const json& params)
         g_completion_pending = true;
     }
 
+    diag::log_tagged_fmt("workflow", "attempt_completion result_len=%zu has_command=%d",
+        result.size(), !command.empty() ? 1 : 0);
     std::string msg = "Task completion attempted.\nResult: " + result;
     if (!command.empty())
         msg += "\nVerification command: " + command;
@@ -357,8 +413,12 @@ tool_result_t handle_attempt_completion(const json& params)
 
 tool_result_t handle_update_todo_list(const json& params)
 {
+    diag::log_tagged_fmt("workflow", "update_todo_list entry");
     if (!params.contains("content") || !params["content"].is_string())
+    {
+        diag::log_tagged_fmt("workflow", "update_todo_list missing content param");
         return tool_result_t::error("Missing required parameter: content");
+    }
 
     std::string content = params["content"].get<std::string>();
 
@@ -383,6 +443,7 @@ tool_result_t handle_update_todo_list(const json& params)
         }
     }
 
+    diag::log_tagged_fmt("workflow", "update_todo_list ok done=%d total=%d", done, total);
     std::string msg = "Todo list updated. " + std::to_string(done) + "/" + std::to_string(total) + " items completed.";
     return tool_result_t::ok(msg);
 }
@@ -390,10 +451,19 @@ tool_result_t handle_update_todo_list(const json& params)
 
 tool_result_t handle_apply_diff(const json& params)
 {
+    diag::log_tagged_fmt("workflow", "apply_diff entry path='%s'",
+        params.contains("path") && params["path"].is_string()
+            ? params["path"].get<std::string>().c_str() : "");
     if (!params.contains("path") || !params["path"].is_string())
+    {
+        diag::log_tagged_fmt("workflow", "apply_diff missing path");
         return tool_result_t::error("Missing required parameter: path");
+    }
     if (!params.contains("diff") || !params["diff"].is_string())
+    {
+        diag::log_tagged_fmt("workflow", "apply_diff missing diff");
         return tool_result_t::error("Missing required parameter: diff");
+    }
 
     std::string path = sanitize_workspace_path(params["path"].get<std::string>());
     if (!path_within_workspace(path))
@@ -415,7 +485,11 @@ tool_result_t handle_apply_diff(const json& params)
 
     auto result = apply_diff::apply(original, diff_text);
     if (!result.success)
+    {
+        diag::log_tagged_fmt("workflow", "apply_diff failed path='%s' err='%s'",
+            path.c_str(), result.error.c_str());
         return tool_result_t::error("Failed to apply diff: " + result.error);
+    }
 
     std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
     if (!ofs)
@@ -425,6 +499,7 @@ tool_result_t handle_apply_diff(const json& params)
     ofs.close();
 
     std::string msg = "Applied diff to " + path + " successfully.";
+    diag::log_tagged_fmt("workflow", "apply_diff ok path='%s'", path.c_str());
     output_log::push(bottom_tab_t::output, "[diff] " + msg);
     return tool_result_t::ok(msg);
 }
@@ -432,8 +507,12 @@ tool_result_t handle_apply_diff(const json& params)
 
 tool_result_t handle_apply_patch(const json& params)
 {
+    diag::log_tagged_fmt("workflow", "apply_patch entry");
     if (!params.contains("patch") || !params["patch"].is_string())
+    {
+        diag::log_tagged_fmt("workflow", "apply_patch missing patch param");
         return tool_result_t::error("Missing required parameter: patch");
+    }
 
     std::string patch_text = params["patch"].get<std::string>();
 
@@ -483,6 +562,7 @@ tool_result_t handle_apply_patch(const json& params)
     auto result = apply_patch::apply(patch_text, read_fn, write_fn, delete_fn, move_fn);
 
     if (!result.success) {
+        diag::log_tagged_fmt("workflow", "apply_patch failed err='%s'", result.error.c_str());
         return tool_result_t::error("Patch application failed: " + result.error);
     }
 
@@ -494,6 +574,8 @@ tool_result_t handle_apply_patch(const json& params)
                      std::to_string(files_modified) + " modified, " +
                      std::to_string(files_deleted) + " deleted, " +
                      std::to_string(files_moved) + " moved.";
+    diag::log_tagged_fmt("workflow", "apply_patch ok modified=%d deleted=%d moved=%d",
+        files_modified, files_deleted, files_moved);
     output_log::push(bottom_tab_t::output, "[patch] " + msg);
     return tool_result_t::ok(msg);
 }
@@ -501,8 +583,14 @@ tool_result_t handle_apply_patch(const json& params)
 
 tool_result_t handle_codebase_search(const json& params)
 {
+    diag::log_tagged_fmt("workflow", "codebase_search entry query='%.80s'",
+        params.contains("query") && params["query"].is_string()
+            ? params["query"].get<std::string>().c_str() : "");
     if (!params.contains("query") || !params["query"].is_string())
+    {
+        diag::log_tagged_fmt("workflow", "codebase_search missing query");
         return tool_result_t::error("Missing required parameter: query");
+    }
 
     std::string query = params["query"].get<std::string>();
     std::string directory;
@@ -524,6 +612,8 @@ tool_result_t handle_codebase_search(const json& params)
                                 std::to_string(g_code_index->indexed_count()) + " documents indexed so far.");
 
     auto results = g_code_index->search(query, directory, 10);
+    diag::log_tagged_fmt("workflow", "codebase_search results=%zu query='%.80s'",
+        results.size(), query.c_str());
 
     if (results.empty())
         return tool_result_t::ok("No results found for query: " + query);
@@ -546,8 +636,14 @@ tool_result_t handle_codebase_search(const json& params)
 
 tool_result_t handle_read_command_output(const json& params)
 {
+    diag::log_tagged_fmt("workflow", "read_command_output entry id='%s'",
+        params.contains("id") && params["id"].is_string()
+            ? params["id"].get<std::string>().c_str() : "");
     if (!params.contains("id") || !params["id"].is_string())
+    {
+        diag::log_tagged_fmt("workflow", "read_command_output missing id");
         return tool_result_t::error("Missing required parameter: id");
+    }
 
     std::string id = params["id"].get<std::string>();
     if (id.empty())
@@ -596,8 +692,13 @@ tool_result_t handle_read_command_output(const json& params)
         });
 
     if (!found)
+    {
+        diag::log_tagged_fmt("workflow", "read_command_output session not found id='%s'", id.c_str());
         return tool_result_t::error("Session not found: " + id);
+    }
 
+    diag::log_tagged_fmt("workflow", "read_command_output id='%s' running=%d exit=%lld",
+        id.c_str(), (int)running, (long long)exit_code);
     json status;
     status["session_id"] = sess_id;
     status["command"] = sess_cmd;
@@ -636,6 +737,7 @@ tool_result_t handle_read_command_output(const json& params)
 
 tool_result_t handle_save_checkpoint(const json& params)
 {
+    diag::log_tagged_fmt("workflow", "save_checkpoint entry");
     std::string message;
     if (params.contains("message") && params["message"].is_string())
         message = params["message"].get<std::string>();
@@ -662,8 +764,12 @@ tool_result_t handle_save_checkpoint(const json& params)
     std::vector<std::string> tracked;
     bool ok = g_checkpoint_svc->save_checkpoint(g_task_id, message, 0, tracked);
     if (!ok)
+    {
+        diag::log_tagged_fmt("workflow", "save_checkpoint failed");
         return tool_result_t::error("Failed to save checkpoint.");
+    }
 
+    diag::log_tagged_fmt("workflow", "save_checkpoint ok msg='%.80s'", message.c_str());
     return tool_result_t::ok("Checkpoint saved." +
                             (message.empty() ? std::string{} : " (" + message + ")"));
 }
@@ -671,8 +777,14 @@ tool_result_t handle_save_checkpoint(const json& params)
 
 tool_result_t handle_restore_checkpoint(const json& params)
 {
+    diag::log_tagged_fmt("workflow", "restore_checkpoint entry id='%s'",
+        params.contains("checkpoint_id") && params["checkpoint_id"].is_string()
+            ? params["checkpoint_id"].get<std::string>().c_str() : "");
     if (!params.contains("checkpoint_id") || !params["checkpoint_id"].is_string())
+    {
+        diag::log_tagged_fmt("workflow", "restore_checkpoint missing id");
         return tool_result_t::error("Missing required parameter: checkpoint_id");
+    }
 
     std::string id = params["checkpoint_id"].get<std::string>();
 
@@ -682,19 +794,28 @@ tool_result_t handle_restore_checkpoint(const json& params)
 
     bool ok = g_checkpoint_svc->restore_checkpoint(g_task_id, id);
     if (!ok)
+    {
+        diag::log_tagged_fmt("workflow", "restore_checkpoint failed id='%s'", id.c_str());
         return tool_result_t::error("Failed to restore checkpoint: " + id);
+    }
 
+    diag::log_tagged_fmt("workflow", "restore_checkpoint ok id='%s'", id.c_str());
     return tool_result_t::ok("Checkpoint " + id + " restored successfully.");
 }
 
 
 tool_result_t handle_list_checkpoints(const json& )
 {
+    diag::log_tagged_fmt("workflow", "list_checkpoints entry");
     std::lock_guard<std::mutex> lk(g_checkpoint_mtx);
     if (!g_checkpoint_svc)
+    {
+        diag::log_tagged_fmt("workflow", "list_checkpoints no svc");
         return tool_result_t::ok("No checkpoints available.");
+    }
 
     auto cps = g_checkpoint_svc->list_checkpoints(g_task_id);
+    diag::log_tagged_fmt("workflow", "list_checkpoints count=%zu", cps.size());
     if (cps.empty())
         return tool_result_t::ok("No checkpoints saved yet.");
 
@@ -716,8 +837,14 @@ tool_result_t handle_list_checkpoints(const json& )
 
 tool_result_t handle_skill(const json& params)
 {
+    diag::log_tagged_fmt("workflow", "skill entry name='%s'",
+        params.contains("name") && params["name"].is_string()
+            ? params["name"].get<std::string>().c_str() : "");
     if (!params.contains("name") || !params["name"].is_string())
+    {
+        diag::log_tagged_fmt("workflow", "skill missing name param");
         return tool_result_t::error("Missing required parameter: name");
+    }
 
     std::string name = params["name"].get<std::string>();
     std::string arguments;
@@ -742,8 +869,12 @@ tool_result_t handle_skill(const json& params)
     }
 
     if (!g_skills_mgr->has_skill(name))
+    {
+        diag::log_tagged_fmt("workflow", "skill not found name='%s'", name.c_str());
         return tool_result_t::error("Skill not found: " + name);
+    }
 
+    diag::log_tagged_fmt("workflow", "skill resolving name='%s'", name.c_str());
     auto result = g_skills_mgr->resolve(name);
 
     std::string response = "## Skill: " + result.name + "\n\n";
@@ -759,8 +890,14 @@ tool_result_t handle_skill(const json& params)
 
 tool_result_t handle_run_slash_command(const json& params)
 {
+    diag::log_tagged_fmt("workflow", "run_slash_command entry cmd='%s'",
+        params.contains("command") && params["command"].is_string()
+            ? params["command"].get<std::string>().c_str() : "");
     if (!params.contains("command") || !params["command"].is_string())
+    {
+        diag::log_tagged_fmt("workflow", "run_slash_command missing command param");
         return tool_result_t::error("Missing required parameter: command");
+    }
 
     std::string command = params["command"].get<std::string>();
     std::string arguments;
@@ -838,6 +975,7 @@ tool_result_t handle_run_slash_command(const json& params)
         return tool_result_t::ok("Code index rebuild started.");
     }
 
+    diag::log_tagged_fmt("workflow", "run_slash_command unknown cmd='%s'", command.c_str());
     return tool_result_t::error("Unknown slash command: /" + command);
 }
 
@@ -913,35 +1051,49 @@ tool_repetition::detector_t& get_repetition_detector()
 
 void initialize_code_index(const std::string& workspace_root)
 {
+    diag::log_tagged_fmt("workflow", "initialize_code_index root='%s'", workspace_root.c_str());
     std::lock_guard<std::mutex> lk(g_code_index_mtx);
     if (!g_code_index) {
         g_code_index = std::make_unique<code_index::manager_t>(workspace_root);
         g_code_index->start_indexing();
+        diag::log_tagged_fmt("workflow", "initialize_code_index started indexing");
+    } else {
+        diag::log_tagged_fmt("workflow", "initialize_code_index already initialized");
     }
 }
 
 void shutdown_services()
 {
+    diag::log_tagged_fmt("workflow", "shutdown_services entry");
     {
         std::lock_guard<std::mutex> lk(g_code_index_mtx);
         if (g_code_index) {
+            diag::log_tagged_fmt("workflow", "shutdown_services stopping code index");
             g_code_index->stop_indexing();
             g_code_index.reset();
         }
     }
     {
         std::lock_guard<std::mutex> lk(g_checkpoint_mtx);
-        g_checkpoint_svc.reset();
+        if (g_checkpoint_svc) {
+            diag::log_tagged_fmt("workflow", "shutdown_services resetting checkpoint svc");
+            g_checkpoint_svc.reset();
+        }
     }
     {
         std::lock_guard<std::mutex> lk(g_skills_mtx);
-        g_skills_mgr.reset();
+        if (g_skills_mgr) {
+            diag::log_tagged_fmt("workflow", "shutdown_services resetting skills mgr");
+            g_skills_mgr.reset();
+        }
     }
+    diag::log_tagged_fmt("workflow", "shutdown_services done");
 }
 
 
 void register_workflow_tools(mcp_standalone::server_t& srv)
 {
+    diag::log_tagged_fmt("workflow", "register_workflow_tools entry");
     srv.register_tool({"switch_agent",
         "Switch the current operating agent. Built-in primary agents: build (default), plan. "
         "Subagents (build/plan only) cannot be activated as primary.",
@@ -1067,6 +1219,7 @@ void register_workflow_tools(mcp_standalone::server_t& srv)
         false, handle_run_slash_command,
         mcp_standalone::tool_visibility_t::internal_only});
 
+    diag::log_tagged_fmt("workflow", "register_workflow_tools tools registered");
     static aida::events::subscription_handle_t s_session_selected_sub;
     if (!s_session_selected_sub.valid()) {
         s_session_selected_sub = aida::events::subscribe(

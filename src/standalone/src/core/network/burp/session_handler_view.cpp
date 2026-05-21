@@ -86,6 +86,7 @@ void render(float pos_x, float pos_y, float width, float height,
     if (!st.initialized) {
         session_handler::initialize();
         st.initialized = true;
+        ::diag::log_tagged("session_v", "render_first_init");
     }
 
     ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
@@ -119,6 +120,8 @@ void render(float pos_x, float pos_y, float width, float height,
         dl->AddRectFilled(cur, ImVec2(cur.x + row_w, cur.y + row_h), bg, 4.f);
         ImGui::InvisibleButton("##sh_macro_row", ImVec2(row_w, row_h));
         if (ImGui::IsItemClicked()) {
+            ::diag::log_tagged_fmt("session_v", "macro_selected id=%llu name='%s' steps=%zu",
+                static_cast<unsigned long long>(m.id), m.name.c_str(), m.steps.size());
             st.selected_macro_id = m.id;
             std::strncpy(st.edit_macro_name, m.name.c_str(), sizeof(st.edit_macro_name) - 1);
             st.edit_macro_name[sizeof(st.edit_macro_name) - 1] = '\0';
@@ -145,6 +148,8 @@ void render(float pos_x, float pos_y, float width, float height,
         session_handler::macro_t m;
         m.name = st.new_macro_name;
         const uint64_t id = session_handler::add_macro(m);
+        ::diag::log_tagged_fmt("session_v", "macro_created id=%llu name='%s'",
+            static_cast<unsigned long long>(id), m.name.c_str());
         st.selected_macro_id = id;
         st.new_macro_name[0] = '\0';
         std::strncpy(st.edit_macro_name, "", sizeof(st.edit_macro_name) - 1);
@@ -152,6 +157,7 @@ void render(float pos_x, float pos_y, float width, float height,
     ImGui::SameLine();
     if (st.selected_macro_id != 0 &&
         aida::ui::button("Delete macro", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+        ::diag::log_tagged_fmt("session_v", "macro_deleted id=%llu", static_cast<unsigned long long>(st.selected_macro_id));
         session_handler::remove_macro(st.selected_macro_id);
         st.selected_macro_id = 0;
     }
@@ -205,12 +211,15 @@ void render(float pos_x, float pos_y, float width, float height,
         r.replace_in_body = st.new_rule_repl_body;
         r.active = true;
         session_handler::add_rule(r);
+        ::diag::log_tagged_fmt("session_v", "rule_added name='%s' match=%d macro_id=%llu",
+            r.name.c_str(), st.new_rule_match, static_cast<unsigned long long>(r.macro_id));
         st.new_rule_name[0] = '\0';
         st.new_rule_pattern[0] = '\0';
     }
     ImGui::SameLine();
     if (st.selected_rule_id != 0 &&
         aida::ui::button("Delete rule", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+        ::diag::log_tagged_fmt("session_v", "rule_deleted id=%llu", static_cast<unsigned long long>(st.selected_rule_id));
         session_handler::remove_rule(st.selected_rule_id);
         st.selected_rule_id = 0;
     }
@@ -234,15 +243,21 @@ void render(float pos_x, float pos_y, float width, float height,
         }
         ImGui::InputText("Macro name##sh_edit_name", st.edit_macro_name, sizeof(st.edit_macro_name));
         if (aida::ui::button("Rename", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+            ::diag::log_tagged_fmt("session_v", "macro_rename id=%llu new_name='%s'",
+                static_cast<unsigned long long>(cur.id), st.edit_macro_name);
             cur.name = st.edit_macro_name;
             session_handler::update_macro(cur);
         }
         ImGui::SameLine();
         if (aida::ui::button("Run macro now", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
             const uint64_t mid = cur.id;
+            ::diag::log_tagged_fmt("session_v", "macro_run id=%llu name='%s'",
+                static_cast<unsigned long long>(mid), cur.name.c_str());
             work_queue::post([mid]() {
                 std::map<std::string, std::string> values;
                 const bool ok = session_handler::run_macro(mid, values);
+                ::diag::log_tagged_fmt("session_v", "macro_run_result id=%llu ok=%d extracted=%zu",
+                    static_cast<unsigned long long>(mid), ok ? 1 : 0, values.size());
                 auto& vs = s();
                 std::lock_guard<std::mutex> lk(vs.run_mtx);
                 vs.last_run_values = std::move(values);
@@ -278,6 +293,8 @@ void render(float pos_x, float pos_y, float width, float height,
             const int idx = st.edit_step_index;
             ImGui::SameLine();
             if (aida::ui::button("Delete step", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+                ::diag::log_tagged_fmt("session_v", "step_deleted macro_id=%llu step_idx=%d",
+                    static_cast<unsigned long long>(cur.id), idx);
                 cur.steps.erase(cur.steps.begin() + idx);
                 session_handler::update_macro(cur);
                 st.edit_step_index = -1;
@@ -312,6 +329,8 @@ void render(float pos_x, float pos_y, float width, float height,
             const std::string r(st.new_step_request);
             step.raw_request.assign(r.begin(), r.end());
             step.timeout_ms = st.new_step_timeout_ms;
+            ::diag::log_tagged_fmt("session_v", "step_adding macro_id=%llu label='%s' host='%s' port=%d",
+                static_cast<unsigned long long>(cur.id), step.label.c_str(), step.host.c_str(), step.port);
             if (st.new_extract_name[0] != '\0' && st.new_extract_regex[0] != '\0') {
                 session_handler::extract_t e;
                 e.name = st.new_extract_name;

@@ -1,5 +1,7 @@
 #include "bambda.hpp"
 
+#include "../../../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -682,10 +684,12 @@ std::string header_value(const std::vector<std::pair<std::string, std::string>>&
 
 bambda_program_t compile(const std::string& source)
 {
+    diag::log_tagged_fmt("bambda", "compile entry source_len=%zu", source.size());
     bambda_program_t prog;
     prog.source = source;
     prog.valid = false;
     if (source.empty()) {
+        diag::log_tagged_fmt("bambda", "compile error empty_source");
         prog.error = "empty";
         set_err(prog.error);
         return prog;
@@ -695,24 +699,37 @@ bambda_program_t compile(const std::string& source)
     std::string err;
     if (!p.parse(root, err) || !root) {
         prog.error = err.empty() ? std::string("parse_failed") : err;
+        diag::log_tagged_fmt("bambda", "compile error parse_failed error='%s'", prog.error.c_str());
         set_err(prog.error);
         return prog;
     }
     prog.ast = std::static_pointer_cast<void>(root);
     prog.valid = true;
+    diag::log_tagged_fmt("bambda", "compile ok source_len=%zu", source.size());
     return prog;
 }
 
 bool evaluate(const bambda_program_t& p, const row_view_t& row)
 {
-    if (!p.valid || !p.ast) return false;
+    diag::log_tagged_fmt("bambda", "evaluate entry valid=%d has_ast=%d", (int)p.valid, p.ast != nullptr);
+    if (!p.valid || !p.ast) {
+        diag::log_tagged_fmt("bambda", "evaluate error invalid_program valid=%d", (int)p.valid);
+        return false;
+    }
     auto root = std::static_pointer_cast<ast_node_t>(p.ast);
-    if (!root) return false;
-    return eval_node(*root, row);
+    if (!root) {
+        diag::log_tagged_fmt("bambda", "evaluate error null_root");
+        return false;
+    }
+    bool result = eval_node(*root, row);
+    diag::log_tagged_fmt("bambda", "evaluate result=%d", (int)result);
+    return result;
 }
 
 row_view_t make_provider_for_exchange(const exchange_observed_t& e)
 {
+    diag::log_tagged_fmt("bambda", "make_provider_for_exchange entry method=%s host=%s status=%d",
+        e.method.c_str(), e.host.c_str(), e.status_code);
     row_view_t v;
     const exchange_observed_t* ep = &e;
     v.get_string = [ep](const std::string& path) -> std::optional<std::string> {
@@ -767,6 +784,7 @@ row_view_t make_provider_for_exchange(const exchange_observed_t& e)
 
 std::string bambda_help_text()
 {
+    diag::log_tagged_fmt("bambda", "bambda_help_text entry");
     return std::string(
         "Bambda filter DSL\n"
         "-----------------\n"
@@ -793,8 +811,11 @@ std::string bambda_help_text()
 
 std::string last_error()
 {
+    diag::log_tagged_fmt("bambda", "last_error queried");
     std::lock_guard<std::mutex> lk(err_mtx());
-    return err_slot();
+    const std::string& e = err_slot();
+    diag::log_tagged_fmt("bambda", "last_error value_len=%zu", e.size());
+    return e;
 }
 
 }

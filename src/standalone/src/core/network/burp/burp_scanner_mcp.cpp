@@ -80,10 +80,11 @@ bool extract_request_payload(const json& params, std::vector<uint8_t>& out_raw, 
 
 tool_result_t tool_start_audit(const json& p)
 {
+    diag::log_tagged_fmt("mcp_burp", "tool_start_audit url=%s", p.contains("url") && p["url"].is_string() ? p["url"].get<std::string>().c_str() : "<missing>");
     if (!p.contains("url") || !p["url"].is_string()) return tool_result_t::error("missing 'url'");
     std::vector<uint8_t> raw;
     std::string err;
-    if (!extract_request_payload(p, raw, err)) return tool_result_t::error(err);
+    if (!extract_request_payload(p, raw, err)) { diag::log_tagged_fmt("mcp_burp", "tool_start_audit payload_error=%s", err.c_str()); return tool_result_t::error(err); }
     if (raw.size() >= 2) {
         bool ends_dcrlf = (raw.size() >= 4 &&
                           raw[raw.size() - 4] == '\r' && raw[raw.size() - 3] == '\n' &&
@@ -108,7 +109,8 @@ tool_result_t tool_start_audit(const json& p)
         cfg.per_module_request_cap = p["per_module_cap"].get<size_t>();
 
     auto id = active_scanner::enqueue_target(raw, p["url"].get<std::string>(), cfg);
-    if (id == 0) return tool_result_t::error(active_scanner::last_error());
+    if (id == 0) { diag::log_tagged_fmt("mcp_burp", "tool_start_audit enqueue_failed err=%s", active_scanner::last_error().c_str()); return tool_result_t::error(active_scanner::last_error()); }
+    diag::log_tagged_fmt("mcp_burp", "tool_start_audit ok audit_id=%llu", static_cast<unsigned long long>(id));
     json data;
     data["audit_id"] = id;
     return tool_result_t::ok(std::string("Audit started: ") + std::to_string(id), data);
@@ -116,11 +118,12 @@ tool_result_t tool_start_audit(const json& p)
 
 tool_result_t tool_audit_status(const json& p)
 {
+    diag::log_tagged_fmt("mcp_burp", "tool_audit_status audit_id=%llu", p.contains("audit_id") && p["audit_id"].is_number_unsigned() ? static_cast<unsigned long long>(p["audit_id"].get<uint64_t>()) : 0ULL);
     if (!p.contains("audit_id") || !p["audit_id"].is_number_unsigned())
         return tool_result_t::error("missing 'audit_id'");
     uint64_t id = p["audit_id"].get<uint64_t>();
     active_scanner::audit_status_t st;
-    if (!active_scanner::get_status(id, st)) return tool_result_t::error("audit not found");
+    if (!active_scanner::get_status(id, st)) { diag::log_tagged_fmt("mcp_burp", "tool_audit_status not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("audit not found"); }
     json data;
     data["id"] = st.id;
     data["url"] = st.url;
@@ -135,11 +138,13 @@ tool_result_t tool_audit_status(const json& p)
     data["cancelled"] = st.cancelled;
     data["started_ms"] = st.started_ms;
     data["ended_ms"] = st.ended_ms;
+    diag::log_tagged_fmt("mcp_burp", "tool_audit_status ok id=%llu running=%d issues=%zu", static_cast<unsigned long long>(id), (int)st.running, st.issues_found);
     return tool_result_t::ok(data);
 }
 
 tool_result_t tool_list_audits(const json&)
 {
+    diag::log_tagged_fmt("mcp_burp", "tool_list_audits entry");
     auto v = active_scanner::list_audits();
     json arr = json::array();
     for (const auto& st : v) {
@@ -161,21 +166,25 @@ tool_result_t tool_list_audits(const json&)
     json data;
     data["count"] = arr.size();
     data["audits"] = std::move(arr);
+    diag::log_tagged_fmt("mcp_burp", "tool_list_audits ok count=%zu", v.size());
     return tool_result_t::ok(data);
 }
 
 tool_result_t tool_cancel(const json& p)
 {
+    diag::log_tagged_fmt("mcp_burp", "tool_cancel audit_id=%llu", p.contains("audit_id") && p["audit_id"].is_number_unsigned() ? static_cast<unsigned long long>(p["audit_id"].get<uint64_t>()) : 0ULL);
     if (!p.contains("audit_id") || !p["audit_id"].is_number_unsigned())
         return tool_result_t::error("missing 'audit_id'");
     uint64_t id = p["audit_id"].get<uint64_t>();
-    if (!active_scanner::cancel_audit(id)) return tool_result_t::error("audit not found");
+    if (!active_scanner::cancel_audit(id)) { diag::log_tagged_fmt("mcp_burp", "tool_cancel not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("audit not found"); }
+    diag::log_tagged_fmt("mcp_burp", "tool_cancel ok id=%llu", static_cast<unsigned long long>(id));
     json data; data["audit_id"] = id; data["cancelled"] = true;
     return tool_result_t::ok(std::string("Cancelled audit ") + std::to_string(id), data);
 }
 
 tool_result_t tool_list_issues(const json& p)
 {
+    diag::log_tagged_fmt("mcp_burp", "tool_list_issues entry");
     issue_filter_t f;
     if (p.contains("severity_min") && p["severity_min"].is_string()) {
         severity_t sv; if (parse_severity(p["severity_min"].get<std::string>(), sv)) {
@@ -194,32 +203,38 @@ tool_result_t tool_list_issues(const json& p)
     }
     if (p.contains("limit") && p["limit"].is_number_unsigned()) f.limit = p["limit"].get<size_t>();
     json data = issue_store::export_json(f);
+    diag::log_tagged_fmt("mcp_burp", "tool_list_issues ok");
     return tool_result_t::ok(data);
 }
 
 tool_result_t tool_get_issue(const json& p)
 {
+    diag::log_tagged_fmt("mcp_burp", "tool_get_issue issue_id=%llu", p.contains("issue_id") && p["issue_id"].is_number_unsigned() ? static_cast<unsigned long long>(p["issue_id"].get<uint64_t>()) : 0ULL);
     if (!p.contains("issue_id") || !p["issue_id"].is_number_unsigned())
         return tool_result_t::error("missing 'issue_id'");
     uint64_t id = p["issue_id"].get<uint64_t>();
     issue_t it;
-    if (!issue_store::get(id, it)) return tool_result_t::error("issue not found");
+    if (!issue_store::get(id, it)) { diag::log_tagged_fmt("mcp_burp", "tool_get_issue not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("issue not found"); }
+    diag::log_tagged_fmt("mcp_burp", "tool_get_issue ok id=%llu", static_cast<unsigned long long>(id));
     return tool_result_t::ok(issue_store::issue_to_json(it));
 }
 
 tool_result_t tool_passive_status(const json&)
 {
+    diag::log_tagged_fmt("mcp_burp", "tool_passive_status entry");
     auto st = passive_scanner::get_stats();
     json data;
     data["enabled"] = passive_scanner::is_enabled();
     data["exchanges_scanned"] = st.exchanges_scanned;
     data["issues_found"] = st.issues_found;
     data["last_scan_ms"] = st.last_scan_ms;
+    diag::log_tagged_fmt("mcp_burp", "tool_passive_status ok enabled=%d scanned=%zu issues=%zu", (int)passive_scanner::is_enabled(), st.exchanges_scanned, st.issues_found);
     return tool_result_t::ok(data);
 }
 
 tool_result_t tool_list_modules(const json&)
 {
+    diag::log_tagged_fmt("mcp_burp", "tool_list_modules entry");
     auto v = scanner::all_modules();
     json arr = json::array();
     for (const auto& m : v) {
@@ -233,23 +248,28 @@ tool_result_t tool_list_modules(const json&)
     json data;
     data["count"] = arr.size();
     data["modules"] = std::move(arr);
+    diag::log_tagged_fmt("mcp_burp", "tool_list_modules ok count=%zu", v.size());
     return tool_result_t::ok(data);
 }
 
 tool_result_t tool_clear_issues(const json&)
 {
+    diag::log_tagged_fmt("mcp_burp", "tool_clear_issues entry");
     size_t n = issue_store::count();
     issue_store::clear();
+    diag::log_tagged_fmt("mcp_burp", "tool_clear_issues ok cleared=%zu", n);
     json data; data["cleared"] = n;
     return tool_result_t::ok(std::string("Cleared ") + std::to_string(n) + std::string(" issues"), data);
 }
 
 tool_result_t tool_passive_enable(const json& p)
 {
+    diag::log_tagged_fmt("mcp_burp", "tool_passive_enable enabled=%d", p.contains("enabled") && p["enabled"].is_boolean() ? (int)p["enabled"].get<bool>() : -1);
     if (!p.contains("enabled") || !p["enabled"].is_boolean())
         return tool_result_t::error("missing 'enabled' boolean");
     passive_scanner::set_enabled(p["enabled"].get<bool>());
     json data; data["enabled"] = passive_scanner::is_enabled();
+    diag::log_tagged_fmt("mcp_burp", "tool_passive_enable ok enabled=%d", (int)passive_scanner::is_enabled());
     return tool_result_t::ok(data);
 }
 

@@ -104,10 +104,12 @@ static std::string hex_encode(const std::vector<uint8_t>& v, size_t max_bytes)
 
 void initialize()
 {
+    ::diag::log_tagged("h2_v", "initialize");
 }
 
 void shutdown()
 {
+    ::diag::log_tagged("h2_v", "shutdown");
 }
 
 void render(float pos_x, float pos_y, float width, float height,
@@ -181,6 +183,7 @@ void render(float pos_x, float pos_y, float width, float height,
             std::string n = st.header_name_buf;
             std::string v = st.header_value_buf;
             if (!n.empty()) {
+                ::diag::log_tagged_fmt("h2_v", "header_added name='%s' value='%s'", n.c_str(), v.c_str());
                 std::lock_guard<std::mutex> lk(st.mtx);
                 st.headers.push_back({ std::move(n), std::move(v) });
                 st.header_name_buf[0] = '\0';
@@ -198,6 +201,7 @@ void render(float pos_x, float pos_y, float width, float height,
                                    "%s", st.headers[i].second.c_str());
                 ImGui::SameLine();
                 if (aida::ui::button("X", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
+                    ::diag::log_tagged_fmt("h2_v", "header_removed idx=%zu name='%s'", i, st.headers[i].first.c_str());
                     st.headers.erase(st.headers.begin() + static_cast<ptrdiff_t>(i));
                     ImGui::PopID();
                     break;
@@ -258,10 +262,15 @@ void render(float pos_x, float pos_y, float width, float height,
                     st.last_response = std::move(r);
                     st.has_response = true;
                 }
+                ::diag::log_tagged_fmt("h2_v", "send_response_received status=%d ok=%d latency=%llums",
+                    st.last_response.status_code, st.last_response.ok ? 1 : 0,
+                    static_cast<unsigned long long>(st.last_response.latency_ms));
                 st.in_flight.store(false);
             }).detach();
-            diag::log_tagged_fmt("burp", "h2_editor_send host=%s port=%d raw=%d",
-                                 req.host.c_str(), req.port, req.use_raw_frames ? 1 : 0);
+            ::diag::log_tagged_fmt("h2_v", "send host=%s port=%d method=%s path=%s raw=%d",
+                                 req.host.c_str(), req.port,
+                                 req.pseudo.method.c_str(), req.pseudo.path.c_str(),
+                                 req.use_raw_frames ? 1 : 0);
         }
     } else {
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
@@ -295,6 +304,7 @@ void render(float pos_x, float pos_y, float width, float height,
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_primary, alpha)),
                            "%s", hdr);
         if (!r_copy.error_msg.empty()) {
+            ::diag::log_tagged_fmt("h2_v", "response_error msg='%s'", r_copy.error_msg.c_str());
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.error, alpha)),
                                "%s", r_copy.error_msg.c_str());
         }

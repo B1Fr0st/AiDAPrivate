@@ -185,8 +185,15 @@ static void render_pane(const char* id, const std::vector<uint8_t>& data,
 
 }
 
-void initialize() {}
-void shutdown() {}
+void initialize()
+{
+    ::diag::log_tagged("comparer_v", "initialize");
+}
+
+void shutdown()
+{
+    ::diag::log_tagged("comparer_v", "shutdown");
+}
 
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b)
@@ -213,6 +220,7 @@ void render(float pos_x, float pos_y, float width, float height,
             size_t n = strlen(cb);
             std::vector<uint8_t> data(cb, cb + n);
             aida::burp::comparer::add_slot_from_bytes(g_view_state.add_label, data, "clipboard");
+            ::diag::log_tagged_fmt("comparer_v", "paste_slot label='%s' bytes=%zu", g_view_state.add_label, n);
         }
     }
     ImGui::SameLine();
@@ -225,11 +233,14 @@ void render(float pos_x, float pos_y, float width, float height,
     ImGui::SameLine();
     if (aida::ui::button("Add file", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
         if (g_view_state.add_file_path[0]) {
+            ::diag::log_tagged_fmt("comparer_v", "add_file_slot label='%s' path='%s'",
+                g_view_state.add_label, g_view_state.add_file_path);
             aida::burp::comparer::add_slot_from_file(g_view_state.add_label, g_view_state.add_file_path);
         }
     }
     ImGui::SameLine();
     if (aida::ui::button("Clear slots", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+        ::diag::log_tagged("comparer_v", "clear_slots");
         aida::burp::comparer::clear_slots();
         g_view_state.selected_a = 0;
         g_view_state.selected_b = 0;
@@ -247,6 +258,7 @@ void render(float pos_x, float pos_y, float width, float height,
         if (g_view_state.paste_buffer[0]) {
             size_t n = strlen(g_view_state.paste_buffer);
             std::vector<uint8_t> data(g_view_state.paste_buffer, g_view_state.paste_buffer + n);
+            ::diag::log_tagged_fmt("comparer_v", "add_text_slot label='%s' bytes=%zu", g_view_state.add_label, n);
             aida::burp::comparer::add_slot_from_bytes(g_view_state.add_label, data, "manual");
             g_view_state.paste_buffer[0] = 0;
         }
@@ -294,10 +306,14 @@ void render(float pos_x, float pos_y, float width, float height,
     ImGui::PushItemWidth(100.f);
     if (ImGui::Combo("##cmp_mode", &g_view_state.mode_idx, modes, 4)) {
         g_view_state.cached_valid = false;
+        ::diag::log_tagged_fmt("comparer_v", "mode_changed mode=%s", modes[g_view_state.mode_idx]);
     }
     ImGui::PopItemWidth();
     ImGui::SameLine();
     if (aida::ui::button("Swap", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
+        ::diag::log_tagged_fmt("comparer_v", "swap_slots a=%llu b=%llu",
+            static_cast<unsigned long long>(g_view_state.selected_a),
+            static_cast<unsigned long long>(g_view_state.selected_b));
         std::swap(g_view_state.selected_a, g_view_state.selected_b);
         g_view_state.cached_valid = false;
     }
@@ -309,7 +325,18 @@ void render(float pos_x, float pos_y, float width, float height,
     ImGui::SetCursorPos(ImVec2(0.f, stats_y));
     ImGui::BeginChild("##cmp_stats", ImVec2(width, stats_h), false, ImGuiWindowFlags_NoBackground);
 
-    ensure_diff();
+    {
+        bool was_valid = g_view_state.cached_valid;
+        ensure_diff();
+        if (!was_valid && g_view_state.cached_valid) {
+            const auto& dst = g_view_state.cached_stats;
+            ::diag::log_tagged_fmt("comparer_v", "diff_computed a=%llu b=%llu mode=%d blocks_eq=%zu ins=%zu del=%zu rep=%zu",
+                static_cast<unsigned long long>(g_view_state.selected_a),
+                static_cast<unsigned long long>(g_view_state.selected_b),
+                g_view_state.mode_idx,
+                dst.equal_runs, dst.insert_runs, dst.delete_runs, dst.replace_runs);
+        }
+    }
     if (g_view_state.cached_valid) {
         const auto& st = g_view_state.cached_stats;
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),

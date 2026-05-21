@@ -281,6 +281,9 @@ static int s_on_close_cb(nghttp2_session*, int32_t sid, uint32_t ec, void* ud)
 
 std::vector<uint8_t> encode_frame(const frame_t& f)
 {
+    diag::log_tagged_fmt("h2_edit", "encode_frame entry type=0x%02x flags=0x%02x stream=%u payload=%zu",
+        static_cast<unsigned>(f.type), static_cast<unsigned>(f.flags),
+        static_cast<unsigned>(f.stream_id), f.payload.size());
     std::vector<uint8_t> out;
     out.reserve(9 + f.payload.size());
     uint32_t len = static_cast<uint32_t>(f.payload.size()) & 0xFFFFFFu;
@@ -301,6 +304,7 @@ std::vector<uint8_t> encode_frame(const frame_t& f)
 
 bool decode_frames(const std::vector<uint8_t>& data, std::vector<frame_t>& out)
 {
+    diag::log_tagged_fmt("h2_edit", "decode_frames entry data_len=%zu", data.size());
     out.clear();
     size_t i = 0;
     while (i + 9 <= data.size()) {
@@ -321,39 +325,52 @@ bool decode_frames(const std::vector<uint8_t>& data, std::vector<frame_t>& out)
         out.push_back(std::move(f));
         i += 9 + f.length;
     }
+    diag::log_tagged_fmt("h2_edit", "decode_frames done frames=%zu", out.size());
     return true;
 }
 
 response_t send(const request_t& req)
 {
+    diag::log_tagged_fmt("h2_edit", "send entry host=%s port=%u method=%s path=%s body=%zu use_raw=%d timeout_ms=%d",
+        req.host.c_str(), static_cast<unsigned>(req.port),
+        req.pseudo.method.c_str(), req.pseudo.path.c_str(),
+        req.body.size(), static_cast<int>(req.use_raw_frames), req.timeout_ms);
     response_t r;
     conn_t c;
+    diag::log_tagged_fmt("h2_edit", "send tls_connecting host=%s port=%u", req.host.c_str(), static_cast<unsigned>(req.port));
     if (!tls_connect(c, req.host, req.port, req.timeout_ms)) {
+        diag::log_tagged_fmt("h2_edit", "send tls_connect_failed host=%s", req.host.c_str());
         r.error_msg = "tls_connect_failed (ALPN must be h2)";
         return r;
     }
+    diag::log_tagged_fmt("h2_edit", "send tls_ok host=%s sending_preface", req.host.c_str());
 
     static const uint8_t kPreface[] = {
         'P','R','I',' ','*',' ','H','T','T','P','/','2','.','0','\r','\n','\r','\n',
         'S','M','\r','\n','\r','\n'
     };
     if (!ssl_send_all(c.ssl, kPreface, sizeof(kPreface), req.timeout_ms)) {
+        diag::log_tagged_fmt("h2_edit", "send preface_send_failed host=%s", req.host.c_str());
         r.error_msg = "preface_send_failed";
         close_conn(c);
         return r;
     }
     r.raw_wire_out.insert(r.raw_wire_out.end(), kPreface, kPreface + sizeof(kPreface));
+    diag::log_tagged_fmt("h2_edit", "send preface_ok");
 
     if (req.use_raw_frames) {
+        diag::log_tagged_fmt("h2_edit", "send raw_frames_mode frames=%zu", req.raw_frames.size());
         for (auto& f : req.raw_frames) {
             std::vector<uint8_t> enc = encode_frame(f);
             r.raw_wire_out.insert(r.raw_wire_out.end(), enc.begin(), enc.end());
             if (!ssl_send_all(c.ssl, enc.data(), enc.size(), req.timeout_ms)) {
+                diag::log_tagged_fmt("h2_edit", "send raw_frame_send_failed type=0x%02x", static_cast<unsigned>(f.type));
                 r.error_msg = "raw_frame_send_failed";
                 close_conn(c);
                 return r;
             }
         }
+        diag::log_tagged_fmt("h2_edit", "send raw_frames_sent reading_response");
         auto t0 = std::chrono::steady_clock::now();
         uint8_t tmp[8192];
         auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(req.timeout_ms);
@@ -369,10 +386,13 @@ response_t send(const request_t& req)
         r.latency_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
         r.ok = !r.raw_wire_in.empty();
         if (!r.ok) r.error_msg = "no_response_to_raw_frames";
+        diag::log_tagged_fmt("h2_edit", "send raw_frames_done ok=%d latency_ms=%llu wire_in=%zu",
+            static_cast<int>(r.ok), static_cast<unsigned long long>(r.latency_ms), r.raw_wire_in.size());
         close_conn(c);
         return r;
     }
 
+    diag::log_tagged_fmt("h2_edit", "send creating_h2_session");
     session_state_t st;
     nghttp2_session_callbacks* cbs = nullptr;
     nghttp2_session_callbacks_new(&cbs);
@@ -384,21 +404,25 @@ response_t send(const request_t& req)
     int nrv = nghttp2_session_client_new(&st.session, cbs, &st);
     nghttp2_session_callbacks_del(cbs);
     if (nrv != 0) {
+        diag::log_tagged_fmt("h2_edit", "send h2_session_create_failed rv=%d", nrv);
         r.error_msg = "h2_session_create_failed";
         close_conn(c);
         return r;
     }
+    diag::log_tagged_fmt("h2_edit", "send h2_session_ok submitting_settings");
 
     nghttp2_settings_entry iv[2] = {
         { NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100 },
         { NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 1u << 24 }
     };
     if (nghttp2_submit_settings(st.session, NGHTTP2_FLAG_NONE, iv, 2) != 0) {
+        diag::log_tagged_fmt("h2_edit", "send settings_failed");
         r.error_msg = "settings_failed";
         nghttp2_session_del(st.session);
         close_conn(c);
         return r;
     }
+    diag::log_tagged_fmt("h2_edit", "send settings_ok");
 
     std::vector<nghttp2_nv> nva;
     nva.reserve(req.headers.size() + 4);
@@ -432,14 +456,18 @@ response_t send(const request_t& req)
         return static_cast<ssize_t>(take);
     };
 
+    diag::log_tagged_fmt("h2_edit", "send submitting_request headers=%zu body=%zu",
+        nva.size(), req.body.size());
     int32_t sid = nghttp2_submit_request(st.session, nullptr, nva.data(), nva.size(),
                                          req.body.empty() ? nullptr : &prd, nullptr);
     if (sid < 0) {
+        diag::log_tagged_fmt("h2_edit", "send submit_request_failed sid=%d", sid);
         r.error_msg = "submit_request_failed";
         nghttp2_session_del(st.session);
         close_conn(c);
         return r;
     }
+    diag::log_tagged_fmt("h2_edit", "send stream_id=%d sending", sid);
 
     auto t0 = std::chrono::steady_clock::now();
     int rv = nghttp2_session_send(st.session);
@@ -447,6 +475,7 @@ response_t send(const request_t& req)
     if (!st.out_buf.empty()) {
         r.raw_wire_out.insert(r.raw_wire_out.end(), st.out_buf.begin(), st.out_buf.end());
         if (!ssl_send_all(c.ssl, st.out_buf.data(), st.out_buf.size(), req.timeout_ms)) {
+            diag::log_tagged_fmt("h2_edit", "send h2_send_failed out_buf=%zu", st.out_buf.size());
             r.error_msg = "h2_send_failed";
             nghttp2_session_del(st.session);
             close_conn(c);
@@ -454,20 +483,36 @@ response_t send(const request_t& req)
         }
         st.out_buf.clear();
     }
+    diag::log_tagged_fmt("h2_edit", "send request_sent waiting_for_response sid=%d", sid);
 
     uint8_t tmp[16384];
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(req.timeout_ms);
     while (std::chrono::steady_clock::now() < deadline) {
         auto it = st.streams.find(sid);
-        if (it != st.streams.end() && it->second.complete) break;
-        if (st.goaway.load()) break;
+        if (it != st.streams.end() && it->second.complete) {
+            diag::log_tagged_fmt("h2_edit", "send stream_complete sid=%d", sid);
+            break;
+        }
+        if (st.goaway.load()) {
+            diag::log_tagged_fmt("h2_edit", "send goaway_received sid=%d", sid);
+            break;
+        }
         int rem = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count());
-        if (rem <= 0) break;
+        if (rem <= 0) {
+            diag::log_tagged_fmt("h2_edit", "send recv_timeout sid=%d", sid);
+            break;
+        }
         int n = ssl_recv_some(c.ssl, tmp, sizeof(tmp), rem);
-        if (n <= 0) break;
+        if (n <= 0) {
+            diag::log_tagged_fmt("h2_edit", "send recv_closed n=%d sid=%d", n, sid);
+            break;
+        }
         r.raw_wire_in.insert(r.raw_wire_in.end(), tmp, tmp + n);
         ssize_t mr = nghttp2_session_mem_recv(st.session, tmp, static_cast<size_t>(n));
-        if (mr < 0) break;
+        if (mr < 0) {
+            diag::log_tagged_fmt("h2_edit", "send mem_recv_failed mr=%d sid=%d", static_cast<int>(mr), sid);
+            break;
+        }
         rv = nghttp2_session_send(st.session);
         (void)rv;
         if (!st.out_buf.empty()) {
@@ -486,9 +531,13 @@ response_t send(const request_t& req)
         if (it->second.errored) r.error_msg = "h2_stream_errored";
         else if (!it->second.complete) r.error_msg = "h2_stream_incomplete";
     } else {
+        diag::log_tagged_fmt("h2_edit", "send stream_missing sid=%d", sid);
         r.error_msg = "h2_stream_missing";
     }
     r.latency_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+    diag::log_tagged_fmt("h2_edit", "send done ok=%d status=%d latency_ms=%llu body=%zu err=%s",
+        static_cast<int>(r.ok), r.status_code, static_cast<unsigned long long>(r.latency_ms),
+        r.body.size(), r.error_msg.c_str());
 
     nghttp2_session_del(st.session);
     close_conn(c);
@@ -498,7 +547,9 @@ response_t send(const request_t& req)
 std::string last_error()
 {
     std::lock_guard<std::mutex> lk(err_mtx());
-    return err_slot();
+    std::string e = err_slot();
+    diag::log_tagged_fmt("h2_edit", "last_error queried val=%s", e.c_str());
+    return e;
 }
 
 }

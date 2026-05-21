@@ -1,6 +1,8 @@
 #include "burp_upstream_mcp.hpp"
 #include "upstream_chain.hpp"
 
+#include "../../../helpers/diag_log.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -64,13 +66,22 @@ bool parse_hops(const json& src, std::vector<upstream_hop_t>& out, std::string& 
 
 tool_result_t tool_add(const json& params)
 {
-    if (!params.is_object()) return tool_result_t::error("params_must_be_object");
+    diag::log_tagged_fmt("mcp_burp", "upstream_add entry");
+    if (!params.is_object())
+    {
+        diag::log_tagged_fmt("mcp_burp", "upstream_add invalid_params");
+        return tool_result_t::error("params_must_be_object");
+    }
     upstream_chain_t c;
     if (params.contains("label") && params["label"].is_string()) c.label = params["label"].get<std::string>();
     std::string err;
     if (!params.contains("hops") || !parse_hops(params["hops"], c.hops, err))
+    {
+        diag::log_tagged_fmt("mcp_burp", "upstream_add parse_hops_failed err=%s", err.c_str());
         return tool_result_t::error(err.empty() ? std::string("missing_hops") : err);
+    }
     uint64_t id = add_chain(c);
+    diag::log_tagged_fmt("mcp_burp", "upstream_add ok id=%llu label=%s hops=%zu", static_cast<unsigned long long>(id), c.label.c_str(), c.hops.size());
     json j;
     j["id"]    = id;
     j["label"] = c.label;
@@ -80,10 +91,16 @@ tool_result_t tool_add(const json& params)
 
 tool_result_t tool_remove(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "upstream_remove entry");
     if (!params.is_object() || !params.contains("id") || !params["id"].is_number_unsigned())
+    {
+        diag::log_tagged_fmt("mcp_burp", "upstream_remove missing_id");
         return tool_result_t::error("missing_id");
+    }
     uint64_t id = params["id"].get<uint64_t>();
+    diag::log_tagged_fmt("mcp_burp", "upstream_remove id=%llu", static_cast<unsigned long long>(id));
     bool ok = remove_chain(id);
+    diag::log_tagged_fmt("mcp_burp", "upstream_remove ok id=%llu removed=%d", static_cast<unsigned long long>(id), (int)ok);
     json j;
     j["id"] = id;
     j["removed"] = ok;
@@ -93,49 +110,75 @@ tool_result_t tool_remove(const json& params)
 tool_result_t tool_list(const json& params)
 {
     (void)params;
+    diag::log_tagged_fmt("mcp_burp", "upstream_list entry");
     auto chains = list_chains();
     json arr = json::array();
     for (const auto& c : chains) arr.push_back(chain_json(c));
+    const uint64_t active = get_active_chain_id();
+    diag::log_tagged_fmt("mcp_burp", "upstream_list ok count=%zu active_id=%llu", chains.size(), static_cast<unsigned long long>(active));
     json out;
     out["chains"]    = arr;
-    out["active_id"] = get_active_chain_id();
+    out["active_id"] = active;
     return tool_result_t::ok(out);
 }
 
 tool_result_t tool_set_active(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "upstream_set_active entry");
     if (!params.is_object() || !params.contains("id") || !params["id"].is_number_unsigned())
+    {
+        diag::log_tagged_fmt("mcp_burp", "upstream_set_active missing_id");
         return tool_result_t::error("missing_id");
+    }
     uint64_t id = params["id"].get<uint64_t>();
+    diag::log_tagged_fmt("mcp_burp", "upstream_set_active id=%llu", static_cast<unsigned long long>(id));
     bool ok = set_active_chain(id);
+    if (!ok)
+    {
+        diag::log_tagged_fmt("mcp_burp", "upstream_set_active failed id=%llu err=%s", static_cast<unsigned long long>(id), last_error().c_str());
+        return tool_result_t::error(last_error().empty() ? std::string("set_active_failed") : last_error());
+    }
+    diag::log_tagged_fmt("mcp_burp", "upstream_set_active ok active_id=%llu", static_cast<unsigned long long>(id));
     json j;
     j["active_id"] = id;
     j["ok"]        = ok;
-    return ok ? tool_result_t::ok(j) : tool_result_t::error(last_error().empty() ? std::string("set_active_failed") : last_error());
+    return tool_result_t::ok(j);
 }
 
 tool_result_t tool_get_active(const json& params)
 {
     (void)params;
+    diag::log_tagged_fmt("mcp_burp", "upstream_get_active entry");
+    const uint64_t active = get_active_chain_id();
+    diag::log_tagged_fmt("mcp_burp", "upstream_get_active ok active_id=%llu", static_cast<unsigned long long>(active));
     json j;
-    j["active_id"] = get_active_chain_id();
+    j["active_id"] = active;
     return tool_result_t::ok(j);
 }
 
 tool_result_t tool_test(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "upstream_test entry");
     if (!params.is_object() ||
         !params.contains("id") || !params["id"].is_number_unsigned() ||
         !params.contains("target_host") || !params["target_host"].is_string() ||
-        !params.contains("target_port") || !params["target_port"].is_number_unsigned()) {
+        !params.contains("target_port") || !params["target_port"].is_number_unsigned())
+    {
+        diag::log_tagged_fmt("mcp_burp", "upstream_test missing_params");
         return tool_result_t::error("missing_id_target_host_or_target_port");
     }
     uint64_t id = params["id"].get<uint64_t>();
     std::string host = params["target_host"].get<std::string>();
     uint32_t port = params["target_port"].get<uint32_t>();
-    if (port == 0 || port > 65535) return tool_result_t::error("bad_port");
+    diag::log_tagged_fmt("mcp_burp", "upstream_test id=%llu host=%s port=%u", static_cast<unsigned long long>(id), host.c_str(), port);
+    if (port == 0 || port > 65535)
+    {
+        diag::log_tagged_fmt("mcp_burp", "upstream_test bad_port port=%u", port);
+        return tool_result_t::error("bad_port");
+    }
     std::string err;
     bool ok = test_chain(id, host, static_cast<uint16_t>(port), err);
+    diag::log_tagged_fmt("mcp_burp", "upstream_test ok id=%llu success=%d err=%s", static_cast<unsigned long long>(id), (int)ok, err.c_str());
     json j;
     j["ok"]    = ok;
     j["error"] = err;

@@ -13,6 +13,7 @@
 #include "../../ui/empty_state.hpp"
 #include "../../ui/fonts.hpp"
 #include "../../infra/work_queue.hpp"
+#include "helpers/diag_log.hpp"
 
 #include "imgui/imgui.h"
 
@@ -71,6 +72,7 @@ void render(float pos_x, float pos_y, float width, float height,
     if (s_state.row_limit > 100000) s_state.row_limit = 100000;
     ImGui::SameLine();
     if (aida::ui::button("Clear", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+        ::diag::log_tagged("logger_v", "clear_log");
         logger::clear();
     }
 
@@ -88,8 +90,12 @@ void render(float pos_x, float pos_y, float width, float height,
         f.mime_type  = s_state.mime_buf;
         f.status_min = s_state.status_min;
         f.status_max = s_state.status_max;
+        ::diag::log_tagged_fmt("logger_v", "export_csv path='%s' method='%s' host='%s' url='%s' status=%d-%d",
+            path.c_str(), f.method.c_str(), f.host_regex.c_str(), f.url_regex.c_str(),
+            f.status_min, f.status_max);
         work_queue::post([path, f]() {
             bool ok = logger::export_csv(path, f);
+            ::diag::log_tagged_fmt("logger_v", "export_csv_result ok=%d path='%s'", ok ? 1 : 0, path.c_str());
             std::lock_guard<std::mutex> lk(s_state.lock);
             s_state.last_action_kind = ok ? "ok" : "error";
             s_state.last_action      = ok ? std::string("Exported ") + path : logger::last_error();

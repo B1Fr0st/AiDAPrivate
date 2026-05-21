@@ -1885,6 +1885,76 @@ namespace {
         passed.fetch_add(1);
     }
 
+    void select_network_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
+                            const char* tag, network_view::sub_tab_t value) {
+        network_view::g_state.active_tab = value;
+        if (network_view::g_state.active_tab == value) {
+            log_msg(hf, tag, "PASS -- network active_tab selected (%d)", static_cast<int>(value));
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- network active_tab not selected (%d)", static_cast<int>(value));
+            failed.fetch_add(1);
+        }
+    }
+
+    void test_net_tab_connections(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "net_tab.connections", network_view::sub_tab_t::connections);
+    }
+    void test_net_tab_capture(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "net_tab.capture", network_view::sub_tab_t::capture);
+    }
+    void test_net_tab_intercept(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "net_tab.intercept", network_view::sub_tab_t::intercept);
+    }
+    void test_net_tab_proxy(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "net_tab.proxy", network_view::sub_tab_t::proxy);
+    }
+    void test_net_tab_dns(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "net_tab.dns", network_view::sub_tab_t::dns);
+    }
+    void test_net_tab_filters(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "net_tab.filters", network_view::sub_tab_t::filters);
+    }
+    void test_net_tab_bandwidth(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "net_tab.bandwidth", network_view::sub_tab_t::bandwidth);
+    }
+    void test_net_tab_keylog(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "net_tab.keylog", network_view::sub_tab_t::keylog);
+    }
+    void test_net_tab_pcap_export(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "net_tab.pcap_export", network_view::sub_tab_t::pcap_export);
+    }
+    void test_net_tab_websocket(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "net_tab.websocket", network_view::sub_tab_t::websocket);
+    }
+    void test_net_tab_decoder(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "net_tab.decoder", network_view::sub_tab_t::decoder);
+    }
+    void test_net_tab_cookies(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "net_tab.cookies", network_view::sub_tab_t::cookies);
+    }
+    void test_net_tab_ws_edit(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "net_tab.ws_edit", network_view::sub_tab_t::ws_edit);
+    }
+    void test_net_tab_h2_edit(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "net_tab.h2_edit", network_view::sub_tab_t::h2_edit);
+    }
+    void test_net_tab_logger(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "net_tab.logger", network_view::sub_tab_t::logger);
+    }
+    void test_net_tab_csp(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "net_tab.csp", network_view::sub_tab_t::csp);
+    }
+    void test_net_tab_upstream(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "net_tab.upstream", network_view::sub_tab_t::upstream);
+    }
+    void test_net_tab_browser(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "net_tab.browser", network_view::sub_tab_t::browser);
+    }
+    void test_net_tab_headless(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "net_tab.headless", network_view::sub_tab_t::headless);
+    }
+
     void test_find_header(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "find_header";
         log_msg(hf, tag, "START -- protocol_parser::find_header()");
@@ -2218,6 +2288,63 @@ void phase_network_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& 
 
     if (cancelled && cancelled()) return;
     call_test_s(test_driver_inject_loopback, hf, passed, failed, skipped);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_net_tab_connections, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_net_tab_capture, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_net_tab_intercept, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_net_tab_proxy, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_net_tab_dns, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_net_tab_filters, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_net_tab_bandwidth, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_net_tab_keylog, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_net_tab_pcap_export, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_net_tab_websocket, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_net_tab_decoder, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_net_tab_cookies, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_net_tab_ws_edit, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_net_tab_h2_edit, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_net_tab_logger, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_net_tab_csp, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_net_tab_upstream, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_net_tab_browser, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_net_tab_headless, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
     call_test(test_cert_generator_shutdown, hf, passed, failed);

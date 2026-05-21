@@ -1,6 +1,8 @@
 #include "burp_bambda_mcp.hpp"
 #include "bambda.hpp"
 
+#include "../../../helpers/diag_log.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <optional>
@@ -64,10 +66,14 @@ row_view_t make_provider_for_json_object(const json& obj)
 
 tool_result_t tool_compile(const json& params)
 {
-    if (!params.is_object() || !params.contains("source") || !params["source"].is_string()) {
+    diag::log_tagged_fmt("mcp_burp", "bambda_compile entry");
+    if (!params.is_object() || !params.contains("source") || !params["source"].is_string())
+    {
+        diag::log_tagged_fmt("mcp_burp", "bambda_compile missing_source");
         return tool_result_t::error("missing_source");
     }
     auto p = compile(params["source"].get<std::string>());
+    diag::log_tagged_fmt("mcp_burp", "bambda_compile ok valid=%d err=%s", (int)p.valid, p.error.c_str());
     json j;
     j["valid"] = p.valid;
     j["error"] = p.error;
@@ -77,14 +83,21 @@ tool_result_t tool_compile(const json& params)
 
 tool_result_t tool_test(const json& params)
 {
-    if (!params.is_object() || !params.contains("source") || !params["source"].is_string()) {
+    diag::log_tagged_fmt("mcp_burp", "bambda_test entry");
+    if (!params.is_object() || !params.contains("source") || !params["source"].is_string())
+    {
+        diag::log_tagged_fmt("mcp_burp", "bambda_test missing_source");
         return tool_result_t::error("missing_source");
     }
-    if (!params.contains("row") || !params["row"].is_object()) {
+    if (!params.contains("row") || !params["row"].is_object())
+    {
+        diag::log_tagged_fmt("mcp_burp", "bambda_test missing_row");
         return tool_result_t::error("missing_row");
     }
     auto p = compile(params["source"].get<std::string>());
-    if (!p.valid) {
+    if (!p.valid)
+    {
+        diag::log_tagged_fmt("mcp_burp", "bambda_test compile_failed err=%s", p.error.c_str());
         json j;
         j["valid"] = false;
         j["error"] = p.error;
@@ -92,6 +105,7 @@ tool_result_t tool_test(const json& params)
     }
     auto provider = make_provider_for_json_object(params["row"]);
     bool match = evaluate(p, provider);
+    diag::log_tagged_fmt("mcp_burp", "bambda_test ok match=%d", (int)match);
     json j;
     j["valid"] = true;
     j["match"] = match;
@@ -101,8 +115,10 @@ tool_result_t tool_test(const json& params)
 tool_result_t tool_help(const json& params)
 {
     (void)params;
+    diag::log_tagged_fmt("mcp_burp", "bambda_help entry");
     json j;
     j["help"] = bambda_help_text();
+    diag::log_tagged_fmt("mcp_burp", "bambda_help ok");
     return tool_result_t::ok(j);
 }
 

@@ -2,6 +2,7 @@
 #include <windows.h>
 
 #include "protocol_parser.hpp"
+#include "helpers/diag_log.hpp"
 
 #include <zlib.h>
 #include <brotli/decode.h>
@@ -104,20 +105,31 @@ static std::vector<uint8_t> decode_chunked(const uint8_t* data, size_t len) {
 }
 
 http_request parse_http_request(const uint8_t* data, size_t len) {
+    diag::log_tagged_fmt("proto", "parse_http_request entry len=%zu", len);
     http_request req;
-    if (len < 16) return req;
+    if (len < 16) {
+        diag::log_tagged_fmt("proto", "parse_http_request too short len=%zu", len);
+        return req;
+    }
 
     size_t first_eol = find_crlf(data, len);
-    if (first_eol == std::string::npos) return req;
+    if (first_eol == std::string::npos) {
+        diag::log_tagged("proto", "parse_http_request no CRLF found");
+        return req;
+    }
 
     std::string request_line = make_string(data, first_eol);
     size_t sp1 = request_line.find(' ');
     size_t sp2 = request_line.find(' ', sp1 + 1);
-    if (sp1 == std::string::npos || sp2 == std::string::npos) return req;
+    if (sp1 == std::string::npos || sp2 == std::string::npos) {
+        diag::log_tagged_fmt("proto", "parse_http_request invalid request line: %s", request_line.c_str());
+        return req;
+    }
 
     req.method = request_line.substr(0, sp1);
     req.uri = request_line.substr(sp1 + 1, sp2 - sp1 - 1);
     req.version = request_line.substr(sp2 + 1);
+    diag::log_tagged_fmt("proto", "parse_http_request method=%s uri=%s version=%s", req.method.c_str(), req.uri.c_str(), req.version.c_str());
 
     static const char* methods[] = { "GET", "POST", "PUT", "DELETE", "PATCH",
                                       "HEAD", "OPTIONS", "CONNECT", "TRACE" };
@@ -125,16 +137,21 @@ http_request parse_http_request(const uint8_t* data, size_t len) {
     for (auto m : methods) {
         if (req.method == m) { method_ok = true; break; }
     }
-    if (!method_ok) return req;
+    if (!method_ok) {
+        diag::log_tagged_fmt("proto", "parse_http_request unknown method=%s", req.method.c_str());
+        return req;
+    }
 
     req.valid = true;
     size_t pos = first_eol + 2;
 
     if (!parse_headers(data, len, pos, req.headers)) {
+        diag::log_tagged_fmt("proto", "parse_http_request parse_headers incomplete headers_count=%zu", req.headers.size());
         req.complete = false;
         req.total_consumed = len;
         return req;
     }
+    diag::log_tagged_fmt("proto", "parse_http_request headers_count=%zu", req.headers.size());
 
     std::string cl_str = find_header(req.headers, "Content-Length");
     std::string te = to_lower(find_header(req.headers, "Transfer-Encoding"));
@@ -144,6 +161,7 @@ http_request parse_http_request(const uint8_t* data, size_t len) {
         req.body = decode_chunked(data + body_start, len - body_start);
         req.complete = true;
         req.total_consumed = len;
+        diag::log_tagged_fmt("proto", "parse_http_request chunked body body_size=%zu", req.body.size());
     } else if (!cl_str.empty()) {
         size_t cl = 0;
         {
@@ -157,30 +175,47 @@ http_request parse_http_request(const uint8_t* data, size_t len) {
             req.body.assign(data + pos, data + pos + cl);
             req.complete = true;
             req.total_consumed = pos + cl;
+            diag::log_tagged_fmt("proto", "parse_http_request content-length body cl=%zu complete=true", cl);
         } else {
             req.body.assign(data + pos, data + len);
             req.complete = false;
             req.total_consumed = len;
+            diag::log_tagged_fmt("proto", "parse_http_request content-length body partial cl=%zu have=%zu", cl, len - pos);
         }
     } else {
         req.complete = true;
         req.total_consumed = pos;
+        diag::log_tagged("proto", "parse_http_request no body");
     }
+    diag::log_tagged_fmt("proto", "parse_http_request result valid=%d complete=%d method=%s uri=%s body_size=%zu", (int)req.valid, (int)req.complete, req.method.c_str(), req.uri.c_str(), req.body.size());
     return req;
 }
 
 http_response parse_http_response(const uint8_t* data, size_t len) {
+    diag::log_tagged_fmt("proto", "parse_http_response entry len=%zu", len);
     http_response resp;
-    if (len < 12) return resp;
+    if (len < 12) {
+        diag::log_tagged_fmt("proto", "parse_http_response too short len=%zu", len);
+        return resp;
+    }
 
     size_t first_eol = find_crlf(data, len);
-    if (first_eol == std::string::npos) return resp;
+    if (first_eol == std::string::npos) {
+        diag::log_tagged("proto", "parse_http_response no CRLF found");
+        return resp;
+    }
 
     std::string status_line = make_string(data, first_eol);
-    if (status_line.size() < 12 || status_line.substr(0, 5) != "HTTP/") return resp;
+    if (status_line.size() < 12 || status_line.substr(0, 5) != "HTTP/") {
+        diag::log_tagged_fmt("proto", "parse_http_response invalid status line: %.40s", status_line.c_str());
+        return resp;
+    }
 
     size_t sp1 = status_line.find(' ');
-    if (sp1 == std::string::npos) return resp;
+    if (sp1 == std::string::npos) {
+        diag::log_tagged("proto", "parse_http_response no space in status line");
+        return resp;
+    }
     size_t sp2 = status_line.find(' ', sp1 + 1);
 
     resp.version = status_line.substr(0, sp1);
@@ -192,19 +227,25 @@ http_response parse_http_response(const uint8_t* data, size_t len) {
         char* code_end = nullptr;
         errno = 0;
         long code_val = strtol(code_str.c_str(), &code_end, 10);
-        if (errno != 0 || code_end == code_str.c_str() || code_val < 100 || code_val > 999) return resp;
+        if (errno != 0 || code_end == code_str.c_str() || code_val < 100 || code_val > 999) {
+            diag::log_tagged_fmt("proto", "parse_http_response invalid status code str=%s", code_str.c_str());
+            return resp;
+        }
         resp.status_code = static_cast<int>(code_val);
     }
     if (sp2 != std::string::npos) resp.reason = status_line.substr(sp2 + 1);
+    diag::log_tagged_fmt("proto", "parse_http_response status_code=%d reason=%s version=%s", resp.status_code, resp.reason.c_str(), resp.version.c_str());
 
     resp.valid = true;
     size_t pos = first_eol + 2;
 
     if (!parse_headers(data, len, pos, resp.headers)) {
+        diag::log_tagged_fmt("proto", "parse_http_response parse_headers incomplete headers_count=%zu", resp.headers.size());
         resp.complete = false;
         resp.total_consumed = len;
         return resp;
     }
+    diag::log_tagged_fmt("proto", "parse_http_response headers_count=%zu", resp.headers.size());
 
     std::string cl_str = find_header(resp.headers, "Content-Length");
     std::string te = to_lower(find_header(resp.headers, "Transfer-Encoding"));
@@ -213,6 +254,7 @@ http_response parse_http_response(const uint8_t* data, size_t len) {
         resp.body = decode_chunked(data + pos, len - pos);
         resp.complete = true;
         resp.total_consumed = len;
+        diag::log_tagged_fmt("proto", "parse_http_response chunked body body_size=%zu", resp.body.size());
     } else if (!cl_str.empty()) {
         size_t cl = 0;
         {
@@ -226,31 +268,45 @@ http_response parse_http_response(const uint8_t* data, size_t len) {
             resp.body.assign(data + pos, data + pos + cl);
             resp.complete = true;
             resp.total_consumed = pos + cl;
+            diag::log_tagged_fmt("proto", "parse_http_response content-length body cl=%zu complete=true", cl);
         } else {
             resp.body.assign(data + pos, data + len);
             resp.complete = false;
             resp.total_consumed = len;
+            diag::log_tagged_fmt("proto", "parse_http_response content-length partial cl=%zu have=%zu", cl, len - pos);
         }
     } else {
         resp.body.assign(data + pos, data + len);
         resp.complete = (len == pos);
         resp.total_consumed = len;
+        diag::log_tagged_fmt("proto", "parse_http_response no cl/te body_size=%zu complete=%d", resp.body.size(), (int)resp.complete);
     }
+    diag::log_tagged_fmt("proto", "parse_http_response result valid=%d complete=%d status=%d body_size=%zu", (int)resp.valid, (int)resp.complete, resp.status_code, resp.body.size());
     return resp;
 }
 
 std::string find_header(const std::vector<http_header>& headers, const std::string& name) {
+    diag::log_tagged_fmt("proto", "find_header name=%s headers_count=%zu", name.c_str(), headers.size());
     for (auto& h : headers) {
-        if (iequals(h.name, name)) return h.value;
+        if (iequals(h.name, name)) {
+            diag::log_tagged_fmt("proto", "find_header found name=%s value=%s", name.c_str(), h.value.c_str());
+            return h.value;
+        }
     }
+    diag::log_tagged_fmt("proto", "find_header not found name=%s", name.c_str());
     return {};
 }
 
 std::vector<uint8_t> decompress_body(const std::vector<uint8_t>& body, const std::string& encoding) {
+    diag::log_tagged_fmt("proto", "decompress_body entry encoding=%s body_size=%zu", encoding.c_str(), body.size());
     std::string enc = to_lower(encoding);
 
     if (enc == "gzip" || enc == "deflate" || enc == "x-gzip") {
-        if (body.empty()) return body;
+        diag::log_tagged_fmt("proto", "decompress_body gzip/deflate branch enc=%s", enc.c_str());
+        if (body.empty()) {
+            diag::log_tagged("proto", "decompress_body empty body returning as-is");
+            return body;
+        }
 
         z_stream strm = {};
         strm.next_in = const_cast<Bytef*>(body.data());
@@ -258,8 +314,10 @@ std::vector<uint8_t> decompress_body(const std::vector<uint8_t>& body, const std
 
 
         int window_bits = 15 + 32;
-        if (inflateInit2(&strm, window_bits) != Z_OK)
+        if (inflateInit2(&strm, window_bits) != Z_OK) {
+            diag::log_tagged("proto", "decompress_body inflateInit2 failed");
             return body;
+        }
 
         std::vector<uint8_t> result;
         result.reserve(body.size() * 4);
@@ -271,6 +329,7 @@ std::vector<uint8_t> decompress_body(const std::vector<uint8_t>& body, const std
             strm.avail_out = sizeof(out_buf);
             ret = inflate(&strm, Z_NO_FLUSH);
             if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
+                diag::log_tagged_fmt("proto", "decompress_body inflate error ret=%d", ret);
                 inflateEnd(&strm);
                 return body;
             }
@@ -279,16 +338,21 @@ std::vector<uint8_t> decompress_body(const std::vector<uint8_t>& body, const std
         } while (ret != Z_STREAM_END);
 
         inflateEnd(&strm);
+        diag::log_tagged_fmt("proto", "decompress_body gzip success input=%zu output=%zu", body.size(), result.size());
         return result;
     }
 
     if (enc == "br") {
+        diag::log_tagged_fmt("proto", "decompress_body brotli branch input=%zu", body.size());
         size_t decoded_size = body.size() * 4;
         std::vector<uint8_t> result;
         result.resize(decoded_size);
 
         BrotliDecoderState* bs = BrotliDecoderCreateInstance(nullptr, nullptr, nullptr);
-        if (!bs) return body;
+        if (!bs) {
+            diag::log_tagged("proto", "decompress_body BrotliDecoderCreateInstance failed");
+            return body;
+        }
 
         const uint8_t* next_in = body.data();
         size_t avail_in = body.size();
@@ -311,26 +375,35 @@ std::vector<uint8_t> decompress_body(const std::vector<uint8_t>& body, const std
 
         if (br_res == BROTLI_DECODER_RESULT_SUCCESS) {
             result.resize(total_out);
+            diag::log_tagged_fmt("proto", "decompress_body brotli success input=%zu output=%zu", body.size(), total_out);
             return result;
         }
+        diag::log_tagged_fmt("proto", "decompress_body brotli failed result=%d", (int)br_res);
         return body;
     }
 
+    diag::log_tagged_fmt("proto", "decompress_body unknown encoding=%s returning as-is", encoding.c_str());
     return body;
 }
 
 content_type_t detect_content_type(const std::vector<http_header>& headers) {
+    diag::log_tagged_fmt("proto", "detect_content_type headers_count=%zu", headers.size());
     std::string ct = to_lower(find_header(headers, "Content-Type"));
-    if (ct.empty()) return content_type_t::unknown;
-    if (ct.find("application/json") != std::string::npos) return content_type_t::json;
-    if (ct.find("text/xml") != std::string::npos || ct.find("application/xml") != std::string::npos)
-        return content_type_t::xml;
-    if (ct.find("text/html") != std::string::npos) return content_type_t::html;
-    if (ct.find("text/") != std::string::npos) return content_type_t::text;
-    if (ct.find("application/x-www-form-urlencoded") != std::string::npos)
-        return content_type_t::form_urlencoded;
-    if (ct.find("multipart/") != std::string::npos) return content_type_t::multipart;
-    return content_type_t::binary;
+    if (ct.empty()) {
+        diag::log_tagged("proto", "detect_content_type no Content-Type header -> unknown");
+        return content_type_t::unknown;
+    }
+    content_type_t result = content_type_t::binary;
+    if (ct.find("application/json") != std::string::npos) result = content_type_t::json;
+    else if (ct.find("text/xml") != std::string::npos || ct.find("application/xml") != std::string::npos)
+        result = content_type_t::xml;
+    else if (ct.find("text/html") != std::string::npos) result = content_type_t::html;
+    else if (ct.find("text/") != std::string::npos) result = content_type_t::text;
+    else if (ct.find("application/x-www-form-urlencoded") != std::string::npos)
+        result = content_type_t::form_urlencoded;
+    else if (ct.find("multipart/") != std::string::npos) result = content_type_t::multipart;
+    diag::log_tagged_fmt("proto", "detect_content_type ct=%s result=%s", ct.c_str(), content_type_name(result).c_str());
+    return result;
 }
 
 std::string content_type_name(content_type_t ct) {
@@ -365,14 +438,16 @@ static uint16_t read_u16(const uint8_t* p) {
 }
 
 std::vector<h2_frame> parse_h2_frames(const uint8_t* data, size_t len) {
+    diag::log_tagged_fmt("proto", "parse_h2_frames entry len=%zu", len);
     std::vector<h2_frame> frames;
-
 
     static const char h2_preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     size_t preface_len = 24;
     size_t offset = 0;
-    if (len >= preface_len && memcmp(data, h2_preface, preface_len) == 0) {
+    bool has_preface = (len >= preface_len && memcmp(data, h2_preface, preface_len) == 0);
+    if (has_preface) {
         offset = preface_len;
+        diag::log_tagged("proto", "parse_h2_frames detected connection preface");
     }
 
     while (offset + 9 <= len) {
@@ -383,13 +458,21 @@ std::vector<h2_frame> parse_h2_frames(const uint8_t* data, size_t len) {
         f.stream_id = read_u32(data + offset + 5) & 0x7FFFFFFF;
         offset += 9;
 
-        if (f.length > 16384 * 4) break;
-        if (offset + f.length > len) break;
+        if (f.length > 16384 * 4) {
+            diag::log_tagged_fmt("proto", "parse_h2_frames frame too large length=%u breaking", f.length);
+            break;
+        }
+        if (offset + f.length > len) {
+            diag::log_tagged_fmt("proto", "parse_h2_frames frame truncated need=%u have=%zu", f.length, len - offset);
+            break;
+        }
 
         f.payload.assign(data + offset, data + offset + f.length);
         offset += f.length;
+        diag::log_tagged_fmt("proto", "parse_h2_frames frame type=%s flags=0x%02x stream_id=%u length=%u", h2_frame_type_name(f.type).c_str(), f.flags, f.stream_id, f.length);
         frames.push_back(std::move(f));
     }
+    diag::log_tagged_fmt("proto", "parse_h2_frames result frames_count=%zu", frames.size());
     return frames;
 }
 
@@ -635,6 +718,7 @@ static void hpack_add_to_dynamic(hpack_context& ctx, const h2_header_field& fiel
 }
 
 h2_parsed_headers decode_hpack(const uint8_t* data, size_t len, hpack_context& ctx) {
+    diag::log_tagged_fmt("proto", "decode_hpack entry len=%zu dyn_table_size=%zu", len, ctx.dynamic_table.size());
     h2_parsed_headers result;
     size_t pos = 0;
 
@@ -642,13 +726,14 @@ h2_parsed_headers decode_hpack(const uint8_t* data, size_t len, hpack_context& c
         uint8_t b = data[pos];
 
         if (b & 0x80) {
-
             uint32_t index = hpack_decode_integer(data, len, pos, 7);
             auto field = hpack_get_indexed(index, ctx);
-            if (!field.name.empty()) result.fields.push_back(field);
+            if (!field.name.empty()) {
+                diag::log_tagged_fmt("proto", "decode_hpack indexed idx=%u name=%s value=%s", index, field.name.c_str(), field.value.c_str());
+                result.fields.push_back(field);
+            }
         }
         else if (b & 0x40) {
-
             uint32_t index = hpack_decode_integer(data, len, pos, 6);
             h2_header_field field;
             if (index > 0) {
@@ -658,12 +743,13 @@ h2_parsed_headers decode_hpack(const uint8_t* data, size_t len, hpack_context& c
                 field.name = hpack_decode_string(data, len, pos);
                 field.value = hpack_decode_string(data, len, pos);
             }
+            diag::log_tagged_fmt("proto", "decode_hpack literal-with-index name=%s value=%s", field.name.c_str(), field.value.c_str());
             hpack_add_to_dynamic(ctx, field);
             result.fields.push_back(field);
         }
         else if (b & 0x20) {
-
             uint32_t new_size = hpack_decode_integer(data, len, pos, 5);
+            diag::log_tagged_fmt("proto", "decode_hpack dynamic table size update new_size=%u", new_size);
             ctx.max_dynamic_table_size = new_size;
             while (ctx.dynamic_table_size > ctx.max_dynamic_table_size && !ctx.dynamic_table.empty()) {
                 auto& last = ctx.dynamic_table.back();
@@ -672,7 +758,6 @@ h2_parsed_headers decode_hpack(const uint8_t* data, size_t len, hpack_context& c
             }
         }
         else {
-
             bool never_index = (b & 0x10) != 0;
             (void)never_index;
             uint32_t index = hpack_decode_integer(data, len, pos, 4);
@@ -684,73 +769,114 @@ h2_parsed_headers decode_hpack(const uint8_t* data, size_t len, hpack_context& c
                 field.name = hpack_decode_string(data, len, pos);
                 field.value = hpack_decode_string(data, len, pos);
             }
+            diag::log_tagged_fmt("proto", "decode_hpack literal-never-index=%d name=%s value=%s", (int)never_index, field.name.c_str(), field.value.c_str());
             result.fields.push_back(field);
         }
     }
     result.valid = true;
+    diag::log_tagged_fmt("proto", "decode_hpack result fields_count=%zu", result.fields.size());
     return result;
 }
 
 
 bool is_websocket_upgrade(const http_request& req) {
-    if (!req.valid) return false;
+    diag::log_tagged_fmt("proto", "is_websocket_upgrade entry req_valid=%d method=%s uri=%s", (int)req.valid, req.method.c_str(), req.uri.c_str());
+    if (!req.valid) {
+        diag::log_tagged("proto", "is_websocket_upgrade req not valid -> false");
+        return false;
+    }
     std::string upgrade = to_lower(find_header(req.headers, "Upgrade"));
     std::string conn = to_lower(find_header(req.headers, "Connection"));
-    return upgrade.find("websocket") != std::string::npos &&
-           conn.find("upgrade") != std::string::npos;
+    bool result = upgrade.find("websocket") != std::string::npos &&
+                  conn.find("upgrade") != std::string::npos;
+    diag::log_tagged_fmt("proto", "is_websocket_upgrade upgrade=%s connection=%s result=%d", upgrade.c_str(), conn.c_str(), (int)result);
+    return result;
 }
 
 bool is_websocket_accept(const http_response& resp) {
-    if (!resp.valid) return false;
-    if (resp.status_code != 101) return false;
+    diag::log_tagged_fmt("proto", "is_websocket_accept entry resp_valid=%d status=%d", (int)resp.valid, resp.status_code);
+    if (!resp.valid) {
+        diag::log_tagged("proto", "is_websocket_accept resp not valid -> false");
+        return false;
+    }
+    if (resp.status_code != 101) {
+        diag::log_tagged_fmt("proto", "is_websocket_accept status not 101 got=%d -> false", resp.status_code);
+        return false;
+    }
     std::string upgrade = to_lower(find_header(resp.headers, "Upgrade"));
-    return upgrade.find("websocket") != std::string::npos;
+    bool result = upgrade.find("websocket") != std::string::npos;
+    diag::log_tagged_fmt("proto", "is_websocket_accept upgrade=%s result=%d", upgrade.c_str(), (int)result);
+    return result;
 }
 
 ws_frame parse_ws_frame(const uint8_t* data, size_t len) {
+    diag::log_tagged_fmt("proto", "parse_ws_frame entry len=%zu", len);
     ws_frame f;
-    if (len < 2) return f;
+    if (len < 2) {
+        diag::log_tagged_fmt("proto", "parse_ws_frame too short len=%zu", len);
+        return f;
+    }
 
     f.fin = (data[0] & 0x80) != 0;
     f.opcode = static_cast<ws_opcode>(data[0] & 0x0F);
     f.masked = (data[1] & 0x80) != 0;
+    diag::log_tagged_fmt("proto", "parse_ws_frame fin=%d opcode=%s masked=%d", (int)f.fin, ws_opcode_name(f.opcode).c_str(), (int)f.masked);
 
     uint64_t plen = data[1] & 0x7F;
     size_t hdr_size = 2;
 
     if (plen == 126) {
-        if (len < 4) return f;
+        if (len < 4) {
+            diag::log_tagged("proto", "parse_ws_frame 2-byte plen but too short");
+            return f;
+        }
         plen = read_u16(data + 2);
         hdr_size = 4;
     } else if (plen == 127) {
-        if (len < 10) return f;
+        if (len < 10) {
+            diag::log_tagged("proto", "parse_ws_frame 8-byte plen but too short");
+            return f;
+        }
         plen = 0;
         for (int i = 0; i < 8; i++)
             plen = (plen << 8) | data[2 + i];
         hdr_size = 10;
     }
+    diag::log_tagged_fmt("proto", "parse_ws_frame payload_length=%llu hdr_size=%zu", (unsigned long long)plen, hdr_size);
 
     if (f.masked) {
-        if (len < hdr_size + 4) return f;
+        if (len < hdr_size + 4) {
+            diag::log_tagged("proto", "parse_ws_frame masked but not enough for masking key");
+            return f;
+        }
         memcpy(f.masking_key, data + hdr_size, 4);
         hdr_size += 4;
     }
 
     f.payload_length = plen;
-    if (hdr_size + plen > len) return f;
+    if (hdr_size + plen > len) {
+        diag::log_tagged_fmt("proto", "parse_ws_frame truncated hdr=%zu plen=%llu total_avail=%zu", hdr_size, (unsigned long long)plen, len);
+        return f;
+    }
 
     f.payload.assign(data + hdr_size, data + hdr_size + plen);
     f.valid = true;
     f.total_consumed = hdr_size + static_cast<size_t>(plen);
+    diag::log_tagged_fmt("proto", "parse_ws_frame success opcode=%s plen=%llu fin=%d masked=%d consumed=%zu", ws_opcode_name(f.opcode).c_str(), (unsigned long long)plen, (int)f.fin, (int)f.masked, f.total_consumed);
     return f;
 }
 
 std::vector<uint8_t> unmask_payload(const ws_frame& frame) {
-    if (!frame.masked || frame.payload.empty()) return frame.payload;
+    diag::log_tagged_fmt("proto", "unmask_payload masked=%d payload_size=%zu", (int)frame.masked, frame.payload.size());
+    if (!frame.masked || frame.payload.empty()) {
+        diag::log_tagged("proto", "unmask_payload not masked or empty returning as-is");
+        return frame.payload;
+    }
     std::vector<uint8_t> result = frame.payload;
     for (size_t i = 0; i < result.size(); i++) {
         result[i] ^= frame.masking_key[i % 4];
     }
+    diag::log_tagged_fmt("proto", "unmask_payload done size=%zu", result.size());
     return result;
 }
 
@@ -768,35 +894,44 @@ std::string ws_opcode_name(ws_opcode op) {
 
 
 bool is_quic_packet(const uint8_t* data, size_t len, uint16_t dst_port) {
-    if (len < 5) return false;
-
-
-    if ((data[0] & 0x80) != 0) {
-
-        if (len < 5) return false;
-        uint32_t ver = read_u32(data + 1);
-
-        if (ver == 0x00000001 || ver == 0x6b3343cf || ver == 0xff000000 ||
-            (ver & 0xffffff00) == 0xff000000 || ver == 0) {
-            return true;
-        }
+    diag::log_tagged_fmt("proto", "is_quic_packet entry len=%zu dst_port=%u first_byte=0x%02x", len, dst_port, (len > 0 ? data[0] : 0));
+    if (len < 5) {
+        diag::log_tagged_fmt("proto", "is_quic_packet too short len=%zu -> false", len);
+        return false;
     }
 
+    if ((data[0] & 0x80) != 0) {
+        uint32_t ver = read_u32(data + 1);
+        bool quic_ver = (ver == 0x00000001 || ver == 0x6b3343cf || ver == 0xff000000 ||
+                         (ver & 0xffffff00) == 0xff000000 || ver == 0);
+        diag::log_tagged_fmt("proto", "is_quic_packet long header ver=0x%08x quic_ver=%d", ver, (int)quic_ver);
+        if (quic_ver) return true;
+    }
 
-    if (dst_port == 443 && (data[0] & 0x40) != 0) return true;
+    if (dst_port == 443 && (data[0] & 0x40) != 0) {
+        diag::log_tagged("proto", "is_quic_packet short header on port 443 -> true");
+        return true;
+    }
+    diag::log_tagged("proto", "is_quic_packet -> false");
     return false;
 }
 
 quic_header parse_quic_header(const uint8_t* data, size_t len) {
+    diag::log_tagged_fmt("proto", "parse_quic_header entry len=%zu", len);
     quic_header h;
-    if (len < 5) return h;
+    if (len < 5) {
+        diag::log_tagged_fmt("proto", "parse_quic_header too short len=%zu", len);
+        return h;
+    }
 
     h.first_byte = data[0];
     h.is_long_header = (data[0] & 0x80) != 0;
+    diag::log_tagged_fmt("proto", "parse_quic_header is_long_header=%d first_byte=0x%02x", (int)h.is_long_header, h.first_byte);
 
     if (h.is_long_header) {
         h.version = read_u32(data + 1);
         h.version_name = quic_version_name(h.version);
+        diag::log_tagged_fmt("proto", "parse_quic_header long header version=0x%08x version_name=%s", h.version, h.version_name.c_str());
 
         if (len < 6) return h;
         uint8_t dcid_len = data[5];
@@ -878,7 +1013,9 @@ quic_header parse_quic_header(const uint8_t* data, size_t len) {
         }
         h.payload_offset = 1 + h.dcid.size();
         h.valid = true;
+        diag::log_tagged_fmt("proto", "parse_quic_header short header type=%s dcid_len=%zu", h.packet_type.c_str(), h.dcid.size());
     }
+    diag::log_tagged_fmt("proto", "parse_quic_header result valid=%d type=%s version_name=%s", (int)h.valid, h.packet_type.c_str(), h.version_name.c_str());
     return h;
 }
 
@@ -900,44 +1037,70 @@ std::string quic_version_name(uint32_t version) {
 
 
 tls_record parse_tls_record(const uint8_t* data, size_t len) {
+    diag::log_tagged_fmt("proto", "parse_tls_record entry len=%zu", len);
     tls_record rec;
-    if (len < 5) return rec;
+    if (len < 5) {
+        diag::log_tagged_fmt("proto", "parse_tls_record too short len=%zu", len);
+        return rec;
+    }
 
     rec.content_type = data[0];
     rec.version = read_u16(data + 1);
     rec.length = read_u16(data + 3);
+    diag::log_tagged_fmt("proto", "parse_tls_record content_type=%u(%s) version=%s record_len=%u", rec.content_type, tls_content_type_name(rec.content_type).c_str(), tls_version_name(rec.version).c_str(), rec.length);
 
-
-    if (rec.content_type < 20 || (rec.content_type > 25 && rec.content_type != 255))
+    if (rec.content_type < 20 || (rec.content_type > 25 && rec.content_type != 255)) {
+        diag::log_tagged_fmt("proto", "parse_tls_record invalid content_type=%u", rec.content_type);
         return rec;
+    }
 
-    if ((rec.version & 0xFF00) != 0x0300) return rec;
+    if ((rec.version & 0xFF00) != 0x0300) {
+        diag::log_tagged_fmt("proto", "parse_tls_record invalid version=0x%04x", rec.version);
+        return rec;
+    }
 
-    if (rec.length > 16384 + 2048) return rec;
+    if (rec.length > 16384 + 2048) {
+        diag::log_tagged_fmt("proto", "parse_tls_record record too large length=%u", rec.length);
+        return rec;
+    }
 
     if (5 + rec.length <= len) {
         rec.fragment.assign(data + 5, data + 5 + rec.length);
     }
     rec.valid = true;
+    diag::log_tagged_fmt("proto", "parse_tls_record success content_type=%s version=%s frag_size=%zu", tls_content_type_name(rec.content_type).c_str(), tls_version_name(rec.version).c_str(), rec.fragment.size());
     return rec;
 }
 
 tls_client_hello parse_client_hello(const uint8_t* data, size_t len) {
+    diag::log_tagged_fmt("proto", "parse_client_hello entry len=%zu", len);
     tls_client_hello hello;
 
-
     auto rec = parse_tls_record(data, len);
-    if (!rec.valid || rec.content_type != 22) return hello;
+    if (!rec.valid || rec.content_type != 22) {
+        diag::log_tagged_fmt("proto", "parse_client_hello tls_record invalid or not handshake rec_valid=%d ct=%u", (int)rec.valid, rec.content_type);
+        return hello;
+    }
 
     const uint8_t* hs = rec.fragment.data();
     size_t hs_len = rec.fragment.size();
-    if (hs_len < 4) return hello;
+    if (hs_len < 4) {
+        diag::log_tagged_fmt("proto", "parse_client_hello handshake too short hs_len=%zu", hs_len);
+        return hello;
+    }
 
     uint8_t hs_type = hs[0];
-    if (hs_type != 1) return hello;
+    diag::log_tagged_fmt("proto", "parse_client_hello handshake_type=%u (expected 1=ClientHello)", hs_type);
+    if (hs_type != 1) {
+        diag::log_tagged_fmt("proto", "parse_client_hello not ClientHello type=%u", hs_type);
+        return hello;
+    }
 
     uint32_t hs_length = read_u24(hs + 1);
-    if (hs_length + 4 > hs_len) return hello;
+    if (hs_length + 4 > hs_len) {
+        diag::log_tagged_fmt("proto", "parse_client_hello hs_length mismatch hs_length=%u hs_len=%zu", hs_length, hs_len);
+        return hello;
+    }
 
     const uint8_t* ch = hs + 4;
     size_t ch_len = hs_length;
@@ -1014,6 +1177,7 @@ tls_client_hello parse_client_hello(const uint8_t* data, size_t len) {
     }
 
     hello.valid = true;
+    diag::log_tagged_fmt("proto", "parse_client_hello success sni=%s cipher_count=%zu alpn_count=%zu version=0x%04x", hello.sni.c_str(), hello.cipher_suites.size(), hello.alpn_protocols.size(), hello.version);
     return hello;
 }
 
@@ -1046,17 +1210,20 @@ std::string tls_version_name(uint16_t ver) {
 detection_result detect_protocol(const uint8_t* data, size_t len,
                                  uint16_t src_port, uint16_t dst_port,
                                  uint32_t ip_protocol) {
+    diag::log_tagged_fmt("proto", "detect_protocol entry len=%zu src_port=%u dst_port=%u ip_proto=%u", len, src_port, dst_port, ip_protocol);
     detection_result r;
-    if (!data || len == 0) return r;
-
+    if (!data || len == 0) {
+        diag::log_tagged("proto", "detect_protocol null data or len=0");
+        return r;
+    }
 
     if (ip_protocol == 17 && (src_port == 53 || dst_port == 53) && len >= 12) {
         r.protocol = detected_protocol_t::dns;
         r.label = "DNS";
         r.summary = (src_port == 53) ? "DNS Response" : "DNS Query";
+        diag::log_tagged_fmt("proto", "detect_protocol detected DNS summary=%s", r.summary.c_str());
         return r;
     }
-
 
     if (ip_protocol == 17 && is_quic_packet(data, len, dst_port)) {
         auto qh = parse_quic_header(data, len);
@@ -1082,12 +1249,13 @@ detection_result detect_protocol(const uint8_t* data, size_t len,
         } else {
             r.summary = "QUIC (encrypted)";
         }
+        diag::log_tagged_fmt("proto", "detect_protocol detected QUIC summary=%s", r.summary.c_str());
         return r;
     }
 
-
     if (len >= 5 && data[0] >= 20 && data[0] <= 25 &&
         data[1] == 0x03 && data[2] <= 0x04) {
+        diag::log_tagged("proto", "detect_protocol TLS record heuristic match trying parse");
         auto rec = parse_tls_record(data, len);
         if (rec.valid) {
             r.protocol = detected_protocol_t::tls;
@@ -1097,48 +1265,53 @@ detection_result detect_protocol(const uint8_t* data, size_t len,
                 auto hello = parse_client_hello(data, len);
                 if (hello.valid && !hello.sni.empty())
                     r.summary += " SNI=" + hello.sni;
+                diag::log_tagged_fmt("proto", "detect_protocol TLS ClientHello sni=%s cipher_count=%zu", hello.sni.c_str(), hello.cipher_suites.size());
             }
+            diag::log_tagged_fmt("proto", "detect_protocol detected TLS summary=%s", r.summary.c_str());
             return r;
         }
     }
-
 
     if (len >= 24 && memcmp(data, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24) == 0) {
         r.protocol = detected_protocol_t::http2;
         r.label = "HTTP/2";
         r.summary = "Connection Preface";
+        diag::log_tagged("proto", "detect_protocol detected HTTP/2 connection preface");
         return r;
     }
-
 
     static const char* http_methods[] = { "GET ", "POST ", "PUT ", "DELETE ",
                                            "PATCH ", "HEAD ", "OPTIONS ", "CONNECT ", "TRACE " };
     for (auto m : http_methods) {
         size_t mlen = strlen(m);
         if (len >= mlen && memcmp(data, m, mlen) == 0) {
+            diag::log_tagged_fmt("proto", "detect_protocol HTTP method match: %s trying parse", m);
             auto req = parse_http_request(data, len);
             if (req.valid) {
                 r.protocol = detected_protocol_t::http_request;
                 r.label = "HTTP";
                 r.summary = req.method + " " + req.uri;
+                diag::log_tagged_fmt("proto", "detect_protocol detected HTTP_REQUEST summary=%s", r.summary.c_str());
                 return r;
             }
         }
     }
 
-
     if (len >= 12 && memcmp(data, "HTTP/", 5) == 0) {
+        diag::log_tagged("proto", "detect_protocol HTTP/ prefix match trying response parse");
         auto resp = parse_http_response(data, len);
         if (resp.valid) {
             r.protocol = detected_protocol_t::http_response;
             r.label = "HTTP";
             r.summary = std::to_string(resp.status_code) + " " + resp.reason;
+            diag::log_tagged_fmt("proto", "detect_protocol detected HTTP_RESPONSE summary=%s", r.summary.c_str());
             return r;
         }
     }
 
     r.protocol = detected_protocol_t::unknown;
     r.label = (ip_protocol == 6) ? "TCP" : ((ip_protocol == 17) ? "UDP" : "");
+    diag::log_tagged_fmt("proto", "detect_protocol unknown label=%s", r.label.c_str());
     return r;
 }
 

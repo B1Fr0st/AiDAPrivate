@@ -1,5 +1,7 @@
 #include "../scanner_module.hpp"
 
+#include "../../../../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -92,19 +94,29 @@ detection_t detect_inner(const std::string& value)
 
 std::vector<probe_t> deserial_probes(const insertion_point_t& ip, const module_context_t&)
 {
+    diag::log_tagged_fmt("mod_deserial", "deserial_probes entry ip=%s:%s orig_len=%zu",
+                         ip.kind.c_str(), ip.name.c_str(), ip.original_value.size());
     std::vector<probe_t> out;
     out.push_back({ip.original_value + "_aida_deserial_pad", "_AIDA_DESERIAL", "passive-scan"});
     out.push_back({"!!!__corrupt__!!!", "_AIDA_DESERIAL_CORRUPT", "corrupt-payload"});
+    diag::log_tagged_fmt("mod_deserial", "deserial_probes built %zu probes ip=%s:%s", out.size(), ip.kind.c_str(), ip.name.c_str());
     return out;
 }
 
 std::optional<issue_t> deserial_detect(const insertion_point_t& ip, const probe_t& probe,
                                        const exchange_observed_t& resp, const module_context_t& ctx)
 {
+    diag::log_tagged_fmt("mod_deserial", "deserial_detect entry ip=%s:%s variant=%s status=%d",
+                         ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str(), resp.status_code);
     if (probe.marker == "_AIDA_DESERIAL")
     {
         detection_t d = detect_inner(ip.original_value);
-        if (!d.ok) return std::nullopt;
+        if (!d.ok) {
+            diag::log_tagged_fmt("mod_deserial", "deserial_detect no magic detected ip=%s:%s", ip.kind.c_str(), ip.name.c_str());
+            return std::nullopt;
+        }
+        diag::log_tagged_fmt("mod_deserial", "deserial_detect FINDING magic-detected ip=%s:%s format=%s",
+                             ip.kind.c_str(), ip.name.c_str(), d.format.c_str());
         auto iss = make_issue("deserial.magic-detected",
                               std::string("Deserialization marker detected: ") + d.format,
                               severity_t::high, confidence_t::tentative, ip, probe, resp, ctx,
@@ -120,9 +132,16 @@ std::optional<issue_t> deserial_detect(const insertion_point_t& ip, const probe_
     if (probe.marker == "_AIDA_DESERIAL_CORRUPT")
     {
         detection_t d = detect_inner(ip.original_value);
-        if (!d.ok) return std::nullopt;
+        if (!d.ok) {
+            diag::log_tagged_fmt("mod_deserial", "deserial_detect corrupt probe no magic ip=%s:%s", ip.kind.c_str(), ip.name.c_str());
+            return std::nullopt;
+        }
+        diag::log_tagged_fmt("mod_deserial", "deserial_detect corrupt probe format=%s baseline=%d probe_status=%d",
+                             d.format.c_str(), ctx.baseline_status_code, resp.status_code);
         if (resp.status_code >= 500 && ctx.baseline_status_code < 500)
         {
+            diag::log_tagged_fmt("mod_deserial", "deserial_detect FINDING exception-on-corrupt ip=%s:%s format=%s",
+                                 ip.kind.c_str(), ip.name.c_str(), d.format.c_str());
             auto iss = make_issue("deserial.exception-on-corrupt",
                                   "Deserialization Exception on Corrupted Input",
                                   severity_t::high, confidence_t::firm, ip, probe, resp, ctx,
@@ -135,6 +154,7 @@ std::optional<issue_t> deserial_detect(const insertion_point_t& ip, const probe_
             return iss;
         }
     }
+    diag::log_tagged_fmt("mod_deserial", "deserial_detect no finding ip=%s:%s variant=%s", ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str());
     return std::nullopt;
 }
 

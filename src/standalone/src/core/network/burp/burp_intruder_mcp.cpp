@@ -87,6 +87,9 @@ std::string b64_encode(const std::vector<uint8_t>& v)
 
 static tool_result_t burp_intruder_start(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "intruder_start host=%s mode=%s",
+        params.contains("host") && params["host"].is_string() ? params["host"].get<std::string>().c_str() : "<missing>",
+        params.value("attack_mode", std::string("sniper")).c_str());
     intruder::config_t cfg;
     if (!params.contains("host") || !params["host"].is_string()) {
         return tool_result_t::error("host required");
@@ -144,8 +147,10 @@ static tool_result_t burp_intruder_start(const json& params)
 
     uint64_t id = intruder::start(std::move(cfg));
     if (id == 0) {
+        diag::log_tagged_fmt("mcp_burp", "intruder_start failed err=%s", intruder::last_error().c_str());
         return tool_result_t::error(std::string("intruder::start failed: ") + intruder::last_error());
     }
+    diag::log_tagged_fmt("mcp_burp", "intruder_start ok job_id=%llu", static_cast<unsigned long long>(id));
     json r;
     r["job_id"] = id;
     return tool_result_t::ok("intruder job started", r);
@@ -153,10 +158,11 @@ static tool_result_t burp_intruder_start(const json& params)
 
 static tool_result_t burp_intruder_status(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "intruder_status job_id=%llu", params.contains("job_id") ? static_cast<unsigned long long>(params["job_id"].get<uint64_t>()) : 0ULL);
     if (!params.contains("job_id")) return tool_result_t::error("job_id required");
     uint64_t id = params["job_id"].get<uint64_t>();
     intruder::status_t s = intruder::status(id);
-    if (s.job_id == 0) return tool_result_t::error("job not found");
+    if (s.job_id == 0) { diag::log_tagged_fmt("mcp_burp", "intruder_status not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("job not found"); }
     json r;
     r["job_id"] = s.job_id;
     r["total"] = s.total;
@@ -166,11 +172,13 @@ static tool_result_t burp_intruder_status(const json& params)
     r["current_rps"] = s.current_rps;
     r["started_unix_ms"] = s.started_unix_ms;
     r["finished_unix_ms"] = s.finished_unix_ms;
+    diag::log_tagged_fmt("mcp_burp", "intruder_status ok id=%llu sent=%zu running=%d", static_cast<unsigned long long>(id), s.sent, (int)s.running);
     return tool_result_t::ok(r);
 }
 
 static tool_result_t burp_intruder_results(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "intruder_results job_id=%llu", params.contains("job_id") ? static_cast<unsigned long long>(params["job_id"].get<uint64_t>()) : 0ULL);
     if (!params.contains("job_id")) return tool_result_t::error("job_id required");
     uint64_t id = params["job_id"].get<uint64_t>();
     size_t start_idx = params.value("start", static_cast<size_t>(0));
@@ -194,20 +202,24 @@ static tool_result_t burp_intruder_results(const json& params)
     out["job_id"] = id;
     out["count"] = rows.size();
     out["results"] = std::move(arr);
+    diag::log_tagged_fmt("mcp_burp", "intruder_results ok id=%llu count=%zu", static_cast<unsigned long long>(id), rows.size());
     return tool_result_t::ok(out);
 }
 
 static tool_result_t burp_intruder_stop(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "intruder_stop job_id=%llu", params.contains("job_id") ? static_cast<unsigned long long>(params["job_id"].get<uint64_t>()) : 0ULL);
     if (!params.contains("job_id")) return tool_result_t::error("job_id required");
     uint64_t id = params["job_id"].get<uint64_t>();
-    if (!intruder::stop(id)) return tool_result_t::error("job not found");
+    if (!intruder::stop(id)) { diag::log_tagged_fmt("mcp_burp", "intruder_stop not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("job not found"); }
+    diag::log_tagged_fmt("mcp_burp", "intruder_stop ok id=%llu", static_cast<unsigned long long>(id));
     return tool_result_t::ok("intruder job stopped");
 }
 
 static tool_result_t burp_intruder_list_jobs(const json& params)
 {
     (void)params;
+    diag::log_tagged_fmt("mcp_burp", "intruder_list_jobs entry");
     auto jobs = intruder::list_jobs();
     json arr = json::array();
     for (auto& s : jobs) {
@@ -223,19 +235,25 @@ static tool_result_t burp_intruder_list_jobs(const json& params)
     json out;
     out["count"] = jobs.size();
     out["jobs"] = std::move(arr);
+    diag::log_tagged_fmt("mcp_burp", "intruder_list_jobs ok count=%zu", jobs.size());
     return tool_result_t::ok(out);
 }
 
 static tool_result_t burp_intruder_clear(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "intruder_clear job_id=%llu", params.contains("job_id") ? static_cast<unsigned long long>(params["job_id"].get<uint64_t>()) : 0ULL);
     if (!params.contains("job_id")) return tool_result_t::error("job_id required");
     uint64_t id = params["job_id"].get<uint64_t>();
-    if (!intruder::clear(id)) return tool_result_t::error("job not found");
+    if (!intruder::clear(id)) { diag::log_tagged_fmt("mcp_burp", "intruder_clear not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("job not found"); }
+    diag::log_tagged_fmt("mcp_burp", "intruder_clear ok id=%llu", static_cast<unsigned long long>(id));
     return tool_result_t::ok("intruder job cleared");
 }
 
 static tool_result_t burp_param_miner_start(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "param_miner_start target=%s loc=%s",
+        params.contains("target_url") && params["target_url"].is_string() ? params["target_url"].get<std::string>().c_str() : "<missing>",
+        params.value("location", std::string("query")).c_str());
     if (!params.contains("target_url") || !params["target_url"].is_string()) {
         return tool_result_t::error("target_url required");
     }
@@ -259,7 +277,8 @@ static tool_result_t burp_param_miner_start(const json& params)
     cfg.report_as_issues = params.value("report_as_issues", true);
 
     uint64_t id = aida::burp::param_miner::start(std::move(cfg));
-    if (id == 0) return tool_result_t::error(std::string("param_miner::start failed: ") + aida::burp::param_miner::last_error());
+    if (id == 0) { diag::log_tagged_fmt("mcp_burp", "param_miner_start failed err=%s", aida::burp::param_miner::last_error().c_str()); return tool_result_t::error(std::string("param_miner::start failed: ") + aida::burp::param_miner::last_error()); }
+    diag::log_tagged_fmt("mcp_burp", "param_miner_start ok job_id=%llu", static_cast<unsigned long long>(id));
     json out;
     out["job_id"] = id;
     return tool_result_t::ok("param miner started", out);
@@ -267,21 +286,24 @@ static tool_result_t burp_param_miner_start(const json& params)
 
 static tool_result_t burp_param_miner_status(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "param_miner_status id=%llu", params.contains("id") ? static_cast<unsigned long long>(params["id"].get<uint64_t>()) : 0ULL);
     if (!params.contains("id")) return tool_result_t::error("id required");
     uint64_t id = params["id"].get<uint64_t>();
     auto s = aida::burp::param_miner::status(id);
-    if (s.job_id == 0) return tool_result_t::error("job not found");
+    if (s.job_id == 0) { diag::log_tagged_fmt("mcp_burp", "param_miner_status not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("job not found"); }
     json out;
     out["job_id"] = s.job_id;
     out["total"] = s.total;
     out["tried"] = s.tried;
     out["hits"] = s.hits;
     out["running"] = s.running;
+    diag::log_tagged_fmt("mcp_burp", "param_miner_status ok id=%llu tried=%zu hits=%zu running=%d", static_cast<unsigned long long>(id), s.tried, s.hits, (int)s.running);
     return tool_result_t::ok(out);
 }
 
 static tool_result_t burp_param_miner_results(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "param_miner_results id=%llu", params.contains("id") ? static_cast<unsigned long long>(params["id"].get<uint64_t>()) : 0ULL);
     if (!params.contains("id")) return tool_result_t::error("id required");
     uint64_t id = params["id"].get<uint64_t>();
     auto hits = aida::burp::param_miner::results(id);
@@ -302,19 +324,25 @@ static tool_result_t burp_param_miner_results(const json& params)
     json out;
     out["count"] = hits.size();
     out["hits"] = std::move(arr);
+    diag::log_tagged_fmt("mcp_burp", "param_miner_results ok id=%llu count=%zu", static_cast<unsigned long long>(id), hits.size());
     return tool_result_t::ok(out);
 }
 
 static tool_result_t burp_param_miner_stop(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "param_miner_stop id=%llu", params.contains("id") ? static_cast<unsigned long long>(params["id"].get<uint64_t>()) : 0ULL);
     if (!params.contains("id")) return tool_result_t::error("id required");
     uint64_t id = params["id"].get<uint64_t>();
-    if (!aida::burp::param_miner::stop(id)) return tool_result_t::error("job not found");
+    if (!aida::burp::param_miner::stop(id)) { diag::log_tagged_fmt("mcp_burp", "param_miner_stop not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("job not found"); }
+    diag::log_tagged_fmt("mcp_burp", "param_miner_stop ok id=%llu", static_cast<unsigned long long>(id));
     return tool_result_t::ok("param miner stopped");
 }
 
 static tool_result_t burp_h2_send(const json& params)
 {
+    diag::log_tagged_fmt("mcp_burp", "h2_send host=%s port=%d",
+        params.contains("host") && params["host"].is_string() ? params["host"].get<std::string>().c_str() : "<missing>",
+        params.value("port", 443));
     h2_editor::request_t req;
     if (!params.contains("host") || !params["host"].is_string()) return tool_result_t::error("host required");
     req.host = params["host"].get<std::string>();
@@ -373,6 +401,7 @@ static tool_result_t burp_h2_send(const json& params)
     out["body_size"] = r.body.size();
     out["raw_wire_in_b64"]  = b64_encode(r.raw_wire_in);
     out["raw_wire_out_b64"] = b64_encode(r.raw_wire_out);
+    diag::log_tagged_fmt("mcp_burp", "h2_send ok status=%d latency=%dms ok=%d", r.status_code, r.latency_ms, (int)r.ok);
     return tool_result_t::ok(out);
 }
 

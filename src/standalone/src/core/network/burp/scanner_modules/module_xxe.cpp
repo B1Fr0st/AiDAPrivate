@@ -1,5 +1,7 @@
 #include "../scanner_module.hpp"
 
+#include "../../../../helpers/diag_log.hpp"
+
 #include <optional>
 #include <regex>
 #include <string>
@@ -13,6 +15,7 @@ namespace {
 
 std::vector<probe_t> xxe_probes(const insertion_point_t& ip, const module_context_t&)
 {
+    diag::log_tagged_fmt("mod_xxe", "xxe_probes entry ip=%s:%s", ip.kind.c_str(), ip.name.c_str());
     std::vector<probe_t> out;
     std::string payload_unix =
         "<?xml version=\"1.0\"?>\n"
@@ -30,14 +33,20 @@ std::vector<probe_t> xxe_probes(const insertion_point_t& ip, const module_contex
     out.push_back({payload_win,  "[fonts]", "file-winini"});
     out.push_back({param_unix,   std::string(), "param-entity"});
     (void)ip;
+    diag::log_tagged_fmt("mod_xxe", "xxe_probes built %zu probes ip=%s:%s", out.size(), ip.kind.c_str(), ip.name.c_str());
     return out;
 }
 
 std::optional<issue_t> xxe_detect(const insertion_point_t& ip, const probe_t& probe,
                                   const exchange_observed_t& resp, const module_context_t& ctx)
 {
+    diag::log_tagged_fmt("mod_xxe", "xxe_detect entry ip=%s:%s variant=%s status=%d marker_empty=%d",
+                         ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str(), resp.status_code,
+                         probe.marker.empty() ? 1 : 0);
     if (!probe.marker.empty()) {
         if (body_contains(resp, probe.marker)) {
+            diag::log_tagged_fmt("mod_xxe", "xxe_detect FINDING file-read ip=%s:%s variant=%s marker=%s",
+                                 ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str(), probe.marker.c_str());
             auto iss = make_issue("xxe.file-read", "XML External Entity (XXE) file disclosure",
                                   severity_t::critical, confidence_t::firm, ip, probe, resp, ctx,
                                   std::string("Marker indicates local file was read: ") + probe.marker);
@@ -47,6 +56,7 @@ std::optional<issue_t> xxe_detect(const insertion_point_t& ip, const probe_t& pr
             iss.cwe.push_back("CWE-827");
             return iss;
         }
+        diag::log_tagged_fmt("mod_xxe", "xxe_detect marker not in body ip=%s:%s variant=%s", ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str());
         return std::nullopt;
     }
 
@@ -56,6 +66,8 @@ std::optional<issue_t> xxe_detect(const insertion_point_t& ip, const probe_t& pr
                      std::min<size_t>(resp.resp_body.size(), static_cast<size_t>(8192)));
     std::smatch m;
     if (std::regex_search(text, m, err_re)) {
+        diag::log_tagged_fmt("mod_xxe", "xxe_detect FINDING parser-error ip=%s:%s variant=%s match=%s",
+                             ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str(), m[0].str().c_str());
         auto iss = make_issue("xxe.parser-error", "XML parser error suggests external entity processing",
                               severity_t::medium, confidence_t::tentative, ip, probe, resp, ctx,
                               std::string("XML parser reported: ") + m[0].str());
@@ -64,6 +76,7 @@ std::optional<issue_t> xxe_detect(const insertion_point_t& ip, const probe_t& pr
         iss.cwe.push_back("CWE-611");
         return iss;
     }
+    diag::log_tagged_fmt("mod_xxe", "xxe_detect no finding ip=%s:%s variant=%s", ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str());
     return std::nullopt;
 }
 

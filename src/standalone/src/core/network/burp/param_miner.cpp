@@ -234,26 +234,36 @@ static std::string build_path_with_query(const std::string& base_path, const std
 
 static void miner_main(std::shared_ptr<job_t> job)
 {
+    diag::log_tagged_fmt("param_miner", "miner_main start job_id=%llu url=%s location=%s concurrency=%zu",
+        static_cast<unsigned long long>(job->id),
+        job->cfg.target_url.c_str(),
+        location_name(job->cfg.location),
+        job->cfg.concurrency);
     job->running.store(true);
 
     std::string scheme, host, path;
     uint16_t port = 0;
     if (!parse_url(job->cfg.target_url, scheme, host, port, path)) {
+        diag::log_tagged_fmt("param_miner", "miner_main invalid_url url=%s", job->cfg.target_url.c_str());
         set_err("param_miner: invalid target_url");
         job->running.store(false);
         return;
     }
     if (path.empty()) path = "/";
     bool tls = (scheme == "https");
+    diag::log_tagged_fmt("param_miner", "miner_main url_parsed host=%s port=%u tls=%d path=%s",
+        host.c_str(), static_cast<unsigned>(port), tls ? 1 : 0, path.c_str());
 
     std::vector<std::string> words = resolve_wordlist(job->cfg);
     job->total.store(words.size());
+    diag::log_tagged_fmt("param_miner", "miner_main wordlist_size=%zu", words.size());
 
     audit_http::send_options_t sopts;
     sopts.timeout_ms = job->cfg.timeout_ms;
     sopts.follow_redirects = false;
     sopts.enforce_scope = false;
 
+    diag::log_tagged_fmt("param_miner", "miner_main collecting_baseline count=%zu", job->cfg.baseline_count);
     std::vector<double> baseline_sizes;
     baseline_sizes.reserve(job->cfg.baseline_count);
     int baseline_status = 0;
@@ -261,13 +271,19 @@ static void miner_main(std::shared_ptr<job_t> job)
     for (size_t i = 0; i < job->cfg.baseline_count && !job->cancel.load(); ++i) {
         auto req = build_request_h1("GET", path, host, {}, "", "");
         auto ex = audit_http::send(req, host, port, tls, sopts);
-        if (!ex) continue;
+        if (!ex) {
+            diag::log_tagged_fmt("param_miner", "miner_main baseline_probe_failed idx=%zu", i);
+            continue;
+        }
+        diag::log_tagged_fmt("param_miner", "miner_main baseline_probe idx=%zu status=%d size=%zu latency_ms=%llu",
+            i, ex->status_code, ex->resp_body.size(), static_cast<unsigned long long>(ex->latency_ms));
         baseline_sizes.push_back(static_cast<double>(ex->resp_body.size()));
         baseline_status = ex->status_code;
         baseline_resp_headers = ex->resp_headers;
         if (job->cfg.throttle_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(job->cfg.throttle_ms));
     }
     if (baseline_sizes.empty()) {
+        diag::log_tagged("param_miner", "miner_main baseline_failed no_samples");
         set_err("param_miner: failed to collect baseline");
         job->running.store(false);
         return;
@@ -275,6 +291,8 @@ static void miner_main(std::shared_ptr<job_t> job)
     double bmean = mean_of(baseline_sizes);
     double bstd = stddev_of(baseline_sizes, bmean);
     if (bstd < 1.0) bstd = 1.0;
+    diag::log_tagged_fmt("param_miner", "miner_main baseline_ok samples=%zu bmean=%.1f bstd=%.2f baseline_status=%d",
+        baseline_sizes.size(), bmean, bstd, baseline_status);
 
     std::string baseline_cache_status = ascii_lower(find_header_ci(baseline_resp_headers, "X-Cache"));
     if (baseline_cache_status.empty()) baseline_cache_status = ascii_lower(find_header_ci(baseline_resp_headers, "CF-Cache-Status"));
@@ -282,6 +300,7 @@ static void miner_main(std::shared_ptr<job_t> job)
 
     size_t concurrency = job->cfg.concurrency > 0 ? job->cfg.concurrency : 4;
     if (concurrency > 16) concurrency = 16;
+    diag::log_tagged_fmt("param_miner", "miner_main launching_workers concurrency=%zu words=%zu", concurrency, words.size());
 
     std::mutex feed_mtx;
     size_t feed_pos = 0;
@@ -300,6 +319,7 @@ static void miner_main(std::shared_ptr<job_t> job)
             }
             std::string param = words[idx];
             std::string value = random_value();
+            diag::log_tagged_fmt("param_miner", "testing param=%s location=%s idx=%zu", param.c_str(), location_name(job->cfg.location), idx);
             std::vector<std::pair<std::string, std::string>> extra_headers;
             std::string body;
             std::string ct;
@@ -338,7 +358,10 @@ static void miner_main(std::shared_ptr<job_t> job)
             auto ex = audit_http::send(req, host, port, tls, sopts_local);
             job->tried.fetch_add(1);
             if (job->cfg.throttle_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(job->cfg.throttle_ms));
-            if (!ex) continue;
+            if (!ex) {
+                diag::log_tagged_fmt("param_miner", "param_send_failed param=%s", param.c_str());
+                continue;
+            }
 
             double sz = static_cast<double>(ex->resp_body.size());
             double sigma = (sz - bmean) / bstd;
@@ -358,7 +381,14 @@ static void miner_main(std::shared_ptr<job_t> job)
                 if (h.second.find(value) != std::string::npos) { header_echoed = true; break; }
             }
 
+            diag::log_tagged_fmt("param_miner", "param_result param=%s status=%d size=%zu sigma=%.2f status_diff=%d cache_diff=%d echoed=%d header_echoed=%d",
+                param.c_str(), ex->status_code, ex->resp_body.size(), sigma,
+                status_diff ? 1 : 0, cache_diff ? 1 : 0, echoed ? 1 : 0, header_echoed ? 1 : 0);
+
             if (size_significant || status_diff || cache_diff || echoed || header_echoed) {
+                diag::log_tagged_fmt("param_miner", "hit_found param=%s location=%s sigma=%.2f status_diff=%d cache_diff=%d echoed=%d header_echoed=%d",
+                    param.c_str(), location_name(job->cfg.location), sigma,
+                    status_diff ? 1 : 0, cache_diff ? 1 : 0, echoed ? 1 : 0, header_echoed ? 1 : 0);
                 hit_t h;
                 h.param_name = param;
                 h.location_label = location_name(job->cfg.location);
@@ -386,13 +416,21 @@ static void miner_main(std::shared_ptr<job_t> job)
     for (auto& t : threads) if (t.joinable()) t.join();
 
     job->running.store(false);
+    diag::log_tagged_fmt("param_miner", "miner_main done job_id=%llu tried=%zu hits=%zu",
+        static_cast<unsigned long long>(job->id), job->tried.load(), job->hits_count.load());
 }
 
 }
 
 uint64_t start(config_t cfg)
 {
-    if (cfg.target_url.empty()) { set_err("param_miner: target_url empty"); return 0; }
+    diag::log_tagged_fmt("param_miner", "start url=%s location=%s concurrency=%zu baseline_count=%zu sigma=%.1f",
+        cfg.target_url.c_str(), location_name(cfg.location), cfg.concurrency, cfg.baseline_count, cfg.diff_sigma_threshold);
+    if (cfg.target_url.empty()) {
+        diag::log_tagged("param_miner", "start rejected empty_target_url");
+        set_err("param_miner: target_url empty");
+        return 0;
+    }
     if (cfg.concurrency == 0) cfg.concurrency = 4;
     if (cfg.timeout_ms <= 0) cfg.timeout_ms = 12000;
     if (cfg.baseline_count == 0) cfg.baseline_count = 5;
@@ -406,31 +444,42 @@ uint64_t start(config_t cfg)
         std::lock_guard<std::mutex> lk(reg().mtx);
         reg().jobs[job->id] = job;
     }
+    diag::log_tagged_fmt("param_miner", "start job_id=%llu concurrency=%zu timeout_ms=%d sigma=%.1f",
+        static_cast<unsigned long long>(job->id), job->cfg.concurrency, job->cfg.timeout_ms, job->cfg.diff_sigma_threshold);
     std::thread([job]() { miner_main(job); }).detach();
     return job->id;
 }
 
 bool stop(uint64_t id)
 {
+    diag::log_tagged_fmt("param_miner", "stop job_id=%llu", static_cast<unsigned long long>(id));
     std::shared_ptr<job_t> job;
     {
         std::lock_guard<std::mutex> lk(reg().mtx);
         auto it = reg().jobs.find(id);
-        if (it == reg().jobs.end()) return false;
+        if (it == reg().jobs.end()) {
+            diag::log_tagged_fmt("param_miner", "stop not_found job_id=%llu", static_cast<unsigned long long>(id));
+            return false;
+        }
         job = it->second;
     }
     job->cancel.store(true);
+    diag::log_tagged_fmt("param_miner", "stop cancel_set job_id=%llu", static_cast<unsigned long long>(id));
     return true;
 }
 
 status_t status(uint64_t id)
 {
+    diag::log_tagged_fmt("param_miner", "status job_id=%llu", static_cast<unsigned long long>(id));
     status_t s;
     std::shared_ptr<job_t> job;
     {
         std::lock_guard<std::mutex> lk(reg().mtx);
         auto it = reg().jobs.find(id);
-        if (it == reg().jobs.end()) return s;
+        if (it == reg().jobs.end()) {
+            diag::log_tagged_fmt("param_miner", "status not_found job_id=%llu", static_cast<unsigned long long>(id));
+            return s;
+        }
         job = it->second;
     }
     s.job_id = job->id;
@@ -438,31 +487,46 @@ status_t status(uint64_t id)
     s.tried = job->tried.load();
     s.hits  = job->hits_count.load();
     s.running = job->running.load();
+    diag::log_tagged_fmt("param_miner", "status result job_id=%llu running=%d tried=%zu total=%zu hits=%zu",
+        static_cast<unsigned long long>(id), s.running ? 1 : 0, s.tried, s.total, s.hits);
     return s;
 }
 
 std::vector<hit_t> results(uint64_t id)
 {
+    diag::log_tagged_fmt("param_miner", "results job_id=%llu", static_cast<unsigned long long>(id));
     std::vector<hit_t> out;
     std::shared_ptr<job_t> job;
     {
         std::lock_guard<std::mutex> lk(reg().mtx);
         auto it = reg().jobs.find(id);
-        if (it == reg().jobs.end()) return out;
+        if (it == reg().jobs.end()) {
+            diag::log_tagged_fmt("param_miner", "results not_found job_id=%llu", static_cast<unsigned long long>(id));
+            return out;
+        }
         job = it->second;
     }
     std::lock_guard<std::mutex> lk(job->hits_mtx);
     out = job->hits;
+    diag::log_tagged_fmt("param_miner", "results returning %zu hits job_id=%llu", out.size(), static_cast<unsigned long long>(id));
     return out;
 }
 
 bool clear(uint64_t id)
 {
+    diag::log_tagged_fmt("param_miner", "clear job_id=%llu", static_cast<unsigned long long>(id));
     std::lock_guard<std::mutex> lk(reg().mtx);
     auto it = reg().jobs.find(id);
-    if (it == reg().jobs.end()) return false;
-    if (it->second->running.load()) it->second->cancel.store(true);
+    if (it == reg().jobs.end()) {
+        diag::log_tagged_fmt("param_miner", "clear not_found job_id=%llu", static_cast<unsigned long long>(id));
+        return false;
+    }
+    if (it->second->running.load()) {
+        it->second->cancel.store(true);
+        diag::log_tagged_fmt("param_miner", "clear cancel_running job_id=%llu", static_cast<unsigned long long>(id));
+    }
     reg().jobs.erase(it);
+    diag::log_tagged_fmt("param_miner", "clear erased job_id=%llu", static_cast<unsigned long long>(id));
     return true;
 }
 
@@ -475,6 +539,7 @@ std::vector<status_t> list_jobs()
         snap.reserve(reg().jobs.size());
         for (auto& kv : reg().jobs) snap.push_back(kv.second);
     }
+    diag::log_tagged_fmt("param_miner", "list_jobs count=%zu", snap.size());
     out.reserve(snap.size());
     for (auto& j : snap) out.push_back(status(j->id));
     return out;
@@ -482,13 +547,15 @@ std::vector<status_t> list_jobs()
 
 bool parse_location(const std::string& v, location_t& out)
 {
+    diag::log_tagged_fmt("param_miner", "parse_location input=%s", v.c_str());
     std::string lc = v;
     for (char& c : lc) if (c >= 'A' && c <= 'Z') c += 32;
-    if (lc == "query")     { out = location_t::query;     return true; }
-    if (lc == "body_form" || lc == "form") { out = location_t::body_form; return true; }
-    if (lc == "json_body" || lc == "json") { out = location_t::json_body; return true; }
-    if (lc == "header")    { out = location_t::header;    return true; }
-    if (lc == "cookie")    { out = location_t::cookie;    return true; }
+    if (lc == "query")     { out = location_t::query;     diag::log_tagged("param_miner", "parse_location result=query"); return true; }
+    if (lc == "body_form" || lc == "form") { out = location_t::body_form; diag::log_tagged("param_miner", "parse_location result=body_form"); return true; }
+    if (lc == "json_body" || lc == "json") { out = location_t::json_body; diag::log_tagged("param_miner", "parse_location result=json_body"); return true; }
+    if (lc == "header")    { out = location_t::header;    diag::log_tagged("param_miner", "parse_location result=header"); return true; }
+    if (lc == "cookie")    { out = location_t::cookie;    diag::log_tagged("param_miner", "parse_location result=cookie"); return true; }
+    diag::log_tagged_fmt("param_miner", "parse_location unknown=%s", v.c_str());
     return false;
 }
 
@@ -507,7 +574,9 @@ const char* location_name(location_t v)
 std::string last_error()
 {
     std::lock_guard<std::mutex> lk(err_mtx());
-    return err_slot();
+    std::string e = err_slot();
+    diag::log_tagged_fmt("param_miner", "last_error=%s", e.c_str());
+    return e;
 }
 
 }

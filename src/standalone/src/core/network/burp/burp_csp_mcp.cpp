@@ -2,6 +2,8 @@
 #include "csp_analyzer.hpp"
 #include "audit_http.hpp"
 
+#include "../../../helpers/diag_log.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <string>
@@ -47,13 +49,18 @@ nlohmann::json result_to_json(const csp_result_t& r)
 
 tool_result_t tool_analyze(const json& params)
 {
-    if (!params.is_object() || !params.contains("csp_header_value") || !params["csp_header_value"].is_string()) {
+    diag::log_tagged_fmt("mcp_burp", "csp_analyze entry");
+    if (!params.is_object() || !params.contains("csp_header_value") || !params["csp_header_value"].is_string())
+    {
+        diag::log_tagged_fmt("mcp_burp", "csp_analyze missing_csp_header_value");
         return tool_result_t::error("missing_csp_header_value");
     }
     bool report_only = false;
     if (params.contains("is_report_only") && params["is_report_only"].is_boolean())
         report_only = params["is_report_only"].get<bool>();
+    diag::log_tagged_fmt("mcp_burp", "csp_analyze report_only=%d", (int)report_only);
     auto res = analyze(params["csp_header_value"].get<std::string>(), report_only);
+    diag::log_tagged_fmt("mcp_burp", "csp_analyze ok score=%d findings=%zu", res.score, res.findings.size());
     return tool_result_t::ok(result_to_json(res));
 }
 
@@ -70,16 +77,23 @@ std::vector<uint8_t> build_get_request(const std::string& host, const std::strin
 
 tool_result_t tool_analyze_url(const json& params)
 {
-    if (!params.is_object() || !params.contains("url") || !params["url"].is_string()) {
+    diag::log_tagged_fmt("mcp_burp", "csp_analyze_url entry");
+    if (!params.is_object() || !params.contains("url") || !params["url"].is_string())
+    {
+        diag::log_tagged_fmt("mcp_burp", "csp_analyze_url missing_url");
         return tool_result_t::error("missing_url");
     }
     const std::string url = params["url"].get<std::string>();
+    diag::log_tagged_fmt("mcp_burp", "csp_analyze_url url=%s", url.c_str());
     std::string scheme, host, path;
     uint16_t port = 0;
-    if (!audit_http::parse_url(url, scheme, host, port, path)) {
+    if (!audit_http::parse_url(url, scheme, host, port, path))
+    {
+        diag::log_tagged_fmt("mcp_burp", "csp_analyze_url invalid_url url=%s", url.c_str());
         return tool_result_t::error("invalid_url");
     }
     bool tls = (scheme == "https");
+    diag::log_tagged_fmt("mcp_burp", "csp_analyze_url sending host=%s port=%d tls=%d", host.c_str(), (int)port, (int)tls);
 
     audit_http::send_options_t opt;
     opt.timeout_ms = 15000;
@@ -88,10 +102,13 @@ tool_result_t tool_analyze_url(const json& params)
 
     auto req = build_get_request(host, path);
     auto resp = audit_http::send(req, host, port, tls, opt);
-    if (!resp.has_value()) {
+    if (!resp.has_value())
+    {
+        diag::log_tagged_fmt("mcp_burp", "csp_analyze_url send_failed err=%s", audit_http::last_error().c_str());
         return tool_result_t::error(std::string("send_failed: ") + audit_http::last_error());
     }
     auto res = analyze_for_response(resp->resp_headers);
+    diag::log_tagged_fmt("mcp_burp", "csp_analyze_url ok status=%d score=%d findings=%zu", resp->status_code, res.score, res.findings.size());
     json j = result_to_json(res);
     j["url"] = url;
     j["status_code"] = resp->status_code;

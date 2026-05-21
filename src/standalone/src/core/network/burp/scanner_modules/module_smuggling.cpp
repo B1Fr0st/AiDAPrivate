@@ -1,6 +1,8 @@
 #include "../scanner_module.hpp"
 #include "../audit_http.hpp"
 
+#include "../../../../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <optional>
@@ -95,23 +97,36 @@ std::vector<uint8_t> build_te_cl_request(const std::string& base)
 
 void smuggling_run(const insertion_point_t& ip, const module_context_t& ctx, const send_fn_t& send)
 {
-    if (!insertion_point_is_request_line(ip)) return;
+    diag::log_tagged_fmt("mod_smuggling", "smuggling_run entry ip=%s:%s host=%s value_offset=%zu",
+                         ip.kind.c_str(), ip.name.c_str(), ctx.host.c_str(), ip.value_offset);
+    if (!insertion_point_is_request_line(ip)) {
+        diag::log_tagged_fmt("mod_smuggling", "smuggling_run skip not request-line value_offset=%zu", ip.value_offset);
+        return;
+    }
 
     auto t0 = std::chrono::steady_clock::now();
     audit_http::send_options_t opt;
     opt.timeout_ms = 8000;
+    diag::log_tagged_fmt("mod_smuggling", "smuggling_run fetching baseline host=%s port=%d tls=%d", ctx.host.c_str(), ctx.port, ctx.tls ? 1 : 0);
     auto baseline = audit_http::send(std::vector<uint8_t>(ip.base_request.begin(), ip.base_request.end()),
                                      ctx.host, ctx.port, ctx.tls, opt);
-    if (!baseline.has_value()) return;
+    if (!baseline.has_value()) {
+        diag::log_tagged_fmt("mod_smuggling", "smuggling_run no baseline response host=%s", ctx.host.c_str());
+        return;
+    }
     auto baseline_lat = baseline->latency_ms;
+    diag::log_tagged_fmt("mod_smuggling", "smuggling_run baseline status=%d latency=%llums", baseline->status_code, static_cast<unsigned long long>(baseline_lat));
 
     auto cl_te_raw = build_cl_te_request(ip.base_request);
     probe_t pa; pa.variant = "CL.TE"; pa.payload = std::string("Content-Length+TE chunked"); pa.marker = "CL.TE";
+    diag::log_tagged_fmt("mod_smuggling", "smuggling_run sending CL.TE probe");
     auto resp_a = send(cl_te_raw, pa);
     auto t1 = std::chrono::steady_clock::now();
     if (!resp_a.has_value()) {
         long long dt = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        diag::log_tagged_fmt("mod_smuggling", "smuggling_run CL.TE no response dt=%lldms baseline=%llums", dt, static_cast<unsigned long long>(baseline_lat));
         if (dt > static_cast<long long>(baseline_lat) + 4000) {
+            diag::log_tagged_fmt("mod_smuggling", "smuggling_run FINDING cl-te-hang dt=%lldms", dt);
             auto iss = make_issue("smuggling.cl-te-hang", "HTTP Request Smuggling (CL.TE, socket hang)",
                                   severity_t::high, confidence_t::tentative, ip, pa, *baseline, ctx,
                                   std::string("Socket hung beyond baseline+4s with conflicting CL/TE headers; baseline=")
@@ -123,8 +138,10 @@ void smuggling_run(const insertion_point_t& ip, const module_context_t& ctx, con
         }
         return;
     }
+    diag::log_tagged_fmt("mod_smuggling", "smuggling_run CL.TE response status=%d", resp_a->status_code);
     if (resp_a->status_code >= 400 && resp_a->status_code < 500 &&
         baseline->status_code >= 200 && baseline->status_code < 400) {
+        diag::log_tagged_fmt("mod_smuggling", "smuggling_run FINDING cl-te-rejected status=%d baseline=%d", resp_a->status_code, baseline->status_code);
         auto iss = make_issue("smuggling.cl-te-rejected", "Proxy chain disagreement on CL/TE framing",
                               severity_t::low, confidence_t::tentative, ip, pa, *resp_a, ctx,
                               std::string("Server returned ") + std::to_string(resp_a->status_code)
@@ -137,9 +154,16 @@ void smuggling_run(const insertion_point_t& ip, const module_context_t& ctx, con
 
     auto te_cl_raw = build_te_cl_request(ip.base_request);
     probe_t pb; pb.variant = "TE.CL"; pb.payload = std::string("TE chunked + CL=4 smuggle"); pb.marker = "TE.CL";
+    diag::log_tagged_fmt("mod_smuggling", "smuggling_run sending TE.CL probe");
     auto resp_b = send(te_cl_raw, pb);
+    if (resp_b.has_value()) {
+        diag::log_tagged_fmt("mod_smuggling", "smuggling_run TE.CL response status=%d", resp_b->status_code);
+    } else {
+        diag::log_tagged_fmt("mod_smuggling", "smuggling_run TE.CL no response");
+    }
     if (resp_b.has_value() && resp_b->status_code >= 400 && resp_b->status_code < 500 &&
         baseline->status_code >= 200 && baseline->status_code < 400) {
+        diag::log_tagged_fmt("mod_smuggling", "smuggling_run FINDING te-cl-rejected status=%d baseline=%d", resp_b->status_code, baseline->status_code);
         auto iss = make_issue("smuggling.te-cl-rejected", "Proxy chain disagreement on TE.CL framing",
                               severity_t::low, confidence_t::tentative, ip, pb, *resp_b, ctx,
                               std::string("Server returned ") + std::to_string(resp_b->status_code)
@@ -149,6 +173,7 @@ void smuggling_run(const insertion_point_t& ip, const module_context_t& ctx, con
         iss.cwe.push_back("CWE-444");
         issue_store::add(std::move(iss));
     }
+    diag::log_tagged_fmt("mod_smuggling", "smuggling_run complete ip=%s:%s", ip.kind.c_str(), ip.name.c_str());
 }
 
 bool register_self()

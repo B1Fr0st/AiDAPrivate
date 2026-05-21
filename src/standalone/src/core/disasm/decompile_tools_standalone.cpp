@@ -7,6 +7,7 @@
 #include "function_index.hpp"
 #include "rename_store.hpp"
 #include "work_queue.hpp"
+#include "../helpers/diag_log.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -54,14 +55,18 @@ static bool parse_address_param(const json& params, const char* key, uint64_t& o
 static tool_result_t handle_decompile_function(const json& params)
 {
     uint64_t addr = 0;
-    if (!parse_address_param(params, "address", addr))
+    if (!parse_address_param(params, "address", addr)) {
+        diag::log_tagged_fmt("decomp_tools", "decompile_function_bad_params");
         return tool_result_t::error("'address' is required (hex string or integer).");
+    }
 
     int timeout_sec = 30;
     if (params.contains("timeout_sec") && params["timeout_sec"].is_number_integer()) {
         int v = params["timeout_sec"].get<int>();
         if (v >= 1 && v <= 300) timeout_sec = v;
     }
+    diag::log_tagged_fmt("decomp_tools", "decompile_function_enter addr=0x%llX timeout_sec=%d",
+        static_cast<unsigned long long>(addr), timeout_sec);
 
     struct slot_t {
         std::mutex                              mtx;
@@ -72,16 +77,25 @@ static tool_result_t handle_decompile_function(const json& params)
     auto slot = std::make_shared<slot_t>();
 
     bool posted = work_queue::post([slot, addr]() {
+        diag::log_tagged_fmt("decomp_tools", "decompile_function_work_start addr=0x%llX",
+            static_cast<unsigned long long>(addr));
         ghidra_decompiler::ghidra_result_t r =
             ghidra_decompiler::decompile_function(addr, &slot->cancel);
+        diag::log_tagged_fmt("decomp_tools", "decompile_function_work_done addr=0x%llX is_error=%d elapsed_ms=%lld",
+            static_cast<unsigned long long>(addr), r.is_error ? 1 : 0,
+            static_cast<long long>(r.elapsed_ms));
         std::lock_guard<std::mutex> lk(slot->mtx);
         slot->result = std::move(r);
         slot->done = true;
     });
     if (!posted) {
+        diag::log_tagged_fmt("decomp_tools", "decompile_function_post_failed addr=0x%llX",
+            static_cast<unsigned long long>(addr));
         slot->cancel.store(true);
         return tool_result_t::error("Failed to schedule decompilation work item.");
     }
+    diag::log_tagged_fmt("decomp_tools", "decompile_function_posted addr=0x%llX waiting_timeout=%d",
+        static_cast<unsigned long long>(addr), timeout_sec);
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_sec);
     while (std::chrono::steady_clock::now() < deadline) {
@@ -96,15 +110,25 @@ static tool_result_t handle_decompile_function(const json& params)
         std::lock_guard<std::mutex> lk(slot->mtx);
         if (!slot->done) {
             slot->cancel.store(true);
+            diag::log_tagged_fmt("decomp_tools", "decompile_function_timeout addr=0x%llX timeout_sec=%d",
+                static_cast<unsigned long long>(addr), timeout_sec);
             return tool_result_t::error("Decompilation timed out after " +
                                        std::to_string(timeout_sec) + " seconds.");
         }
         const auto& r = slot->result;
         if (r.is_error) {
+            diag::log_tagged_fmt("decomp_tools", "decompile_function_error addr=0x%llX error=%s",
+                static_cast<unsigned long long>(addr), r.error_text.c_str());
             return tool_result_t::error(r.error_text.empty()
                                         ? std::string("Decompilation failed.")
                                         : r.error_text);
         }
+        diag::log_tagged_fmt("decomp_tools",
+            "decompile_function_success addr=0x%llX func=%s sleigh=%s elapsed_ms=%lld lines=%zu callees=%zu pseudocode_bytes=%zu",
+            static_cast<unsigned long long>(r.function_addr),
+            r.function_name.c_str(), r.sleigh_id.c_str(),
+            static_cast<long long>(r.elapsed_ms),
+            r.line_to_address.size(), r.callees.size(), r.pseudocode.size());
         json result;
         result["address"]      = hex_u64(r.function_addr);
         result["function_name"]= r.function_name.empty()

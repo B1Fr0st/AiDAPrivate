@@ -2,6 +2,8 @@
 #include "tech_fingerprint.hpp"
 #include "audit_http.hpp"
 
+#include "../../../helpers/diag_log.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <string>
@@ -40,13 +42,19 @@ json tech_to_json(const tech_t& t)
 
 tool_result_t tool_fingerprint(const json& params)
 {
-    if (!params.is_object() || !params.contains("url") || !params["url"].is_string()) {
+    diag::log_tagged_fmt("mcp_burp", "tech_fingerprint entry");
+    if (!params.is_object() || !params.contains("url") || !params["url"].is_string())
+    {
+        diag::log_tagged_fmt("mcp_burp", "tech_fingerprint missing_url");
         return tool_result_t::error("missing_url");
     }
     std::string url = params["url"].get<std::string>();
+    diag::log_tagged_fmt("mcp_burp", "tech_fingerprint url=%s", url.c_str());
     std::string scheme, host, path;
     uint16_t port = 0;
-    if (!audit_http::parse_url(url, scheme, host, port, path)) {
+    if (!audit_http::parse_url(url, scheme, host, port, path))
+    {
+        diag::log_tagged_fmt("mcp_burp", "tech_fingerprint invalid_url url=%s", url.c_str());
         return tool_result_t::error("invalid_url");
     }
     bool tls = (scheme == "https");
@@ -56,10 +64,13 @@ tool_result_t tool_fingerprint(const json& params)
     opt.enforce_scope = false;
     auto req = build_get_request(host, path);
     auto resp = audit_http::send(req, host, port, tls, opt);
-    if (!resp.has_value()) {
+    if (!resp.has_value())
+    {
+        diag::log_tagged_fmt("mcp_burp", "tech_fingerprint send_failed err=%s", audit_http::last_error().c_str());
         return tool_result_t::error(std::string("send_failed: ") + audit_http::last_error());
     }
     auto items = fingerprint(resp->resp_headers, resp->resp_body, url);
+    diag::log_tagged_fmt("mcp_burp", "tech_fingerprint ok url=%s status=%d techs=%zu", url.c_str(), resp->status_code, items.size());
     json arr = json::array();
     for (const auto& t : items) arr.push_back(tech_to_json(t));
     json out;
@@ -72,6 +83,7 @@ tool_result_t tool_fingerprint(const json& params)
 tool_result_t tool_inventory(const json& params)
 {
     (void)params;
+    diag::log_tagged_fmt("mcp_burp", "tech_inventory entry");
     auto items = inventory();
     json arr = json::array();
     for (const auto& h : items) {
@@ -82,6 +94,7 @@ tool_result_t tool_inventory(const json& params)
         h_obj["technologies"] = techs;
         arr.push_back(h_obj);
     }
+    diag::log_tagged_fmt("mcp_burp", "tech_inventory ok hosts=%zu", items.size());
     json out;
     out["host_count"] = arr.size();
     out["hosts"]      = arr;
@@ -91,7 +104,9 @@ tool_result_t tool_inventory(const json& params)
 tool_result_t tool_clear(const json& params)
 {
     (void)params;
+    diag::log_tagged_fmt("mcp_burp", "tech_clear entry");
     clear_inventory();
+    diag::log_tagged_fmt("mcp_burp", "tech_clear ok");
     json j;
     j["ok"] = true;
     return tool_result_t::ok(j);

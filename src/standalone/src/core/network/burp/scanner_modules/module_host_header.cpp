@@ -1,6 +1,8 @@
 #include "../scanner_module.hpp"
 #include "../audit_http.hpp"
 
+#include "../../../../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <optional>
@@ -27,17 +29,27 @@ std::vector<uint8_t> rebuild_with_injected_headers(const std::string& base, cons
 
 void host_run(const insertion_point_t& ip, const module_context_t& ctx, const send_fn_t& send)
 {
-    if (ip.kind != "query" && ip.kind != "header") return;
+    diag::log_tagged_fmt("mod_host_hdr", "host_run entry ip=%s:%s host=%s",
+                         ip.kind.c_str(), ip.name.c_str(), ctx.host.c_str());
+    if (ip.kind != "query" && ip.kind != "header") {
+        diag::log_tagged_fmt("mod_host_hdr", "host_run skip wrong kind=%s", ip.kind.c_str());
+        return;
+    }
     if (ip.kind == "header") {
         std::string lc = ip.name;
         std::transform(lc.begin(), lc.end(), lc.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (lc != "host") return;
+        if (lc != "host") {
+            diag::log_tagged_fmt("mod_host_hdr", "host_run skip header not host name=%s", ip.name.c_str());
+            return;
+        }
     } else {
+        diag::log_tagged_fmt("mod_host_hdr", "host_run skip query kind");
         return;
     }
 
     std::string canary = "aida-host-canary.invalid";
+    diag::log_tagged_fmt("mod_host_hdr", "host_run starting probes canary=%s", canary.c_str());
     std::vector<std::pair<std::string, std::string>> probes_def = {
         {"Host", canary},
         {"X-Forwarded-Host", canary},
@@ -46,6 +58,7 @@ void host_run(const insertion_point_t& ip, const module_context_t& ctx, const se
         {"X-Forwarded-Server", canary}
     };
     for (const auto& pr : probes_def) {
+        diag::log_tagged_fmt("mod_host_hdr", "host_run testing header=%s", pr.first.c_str());
         std::vector<std::pair<std::string, std::string>> ex;
         if (pr.first == "Host") {
             std::string body = ip.base_request;
@@ -61,8 +74,12 @@ void host_run(const insertion_point_t& ip, const module_context_t& ctx, const se
             std::vector<uint8_t> raw(body.begin(), body.end());
             probe_t p; p.payload = canary; p.marker = canary; p.variant = "host-override";
             auto resp = send(raw, p);
-            if (!resp.has_value()) continue;
+            if (!resp.has_value()) {
+                diag::log_tagged_fmt("mod_host_hdr", "host_run no response for host-override probe");
+                continue;
+            }
             if (body_contains_ci(*resp, canary)) {
+                diag::log_tagged_fmt("mod_host_hdr", "host_run FINDING host-injection status=%d", resp->status_code);
                 auto iss = make_issue("host-header.injection", "Host header injection reflected",
                                       severity_t::medium, confidence_t::firm, ip, p, *resp, ctx,
                                       std::string("Canary host '") + canary + "' reflected in response body");
@@ -73,14 +90,20 @@ void host_run(const insertion_point_t& ip, const module_context_t& ctx, const se
                 issue_store::add(std::move(iss));
                 return;
             }
+            diag::log_tagged_fmt("mod_host_hdr", "host_run host-override canary not reflected status=%d", resp->status_code);
             continue;
         }
         std::vector<std::pair<std::string, std::string>> extras = { pr };
         std::vector<uint8_t> raw = rebuild_with_injected_headers(ip.base_request, extras);
         probe_t p; p.payload = canary; p.marker = canary; p.variant = std::string("hdr-") + pr.first;
         auto resp = send(raw, p);
-        if (!resp.has_value()) continue;
+        if (!resp.has_value()) {
+            diag::log_tagged_fmt("mod_host_hdr", "host_run no response for hdr-%s probe", pr.first.c_str());
+            continue;
+        }
+        diag::log_tagged_fmt("mod_host_hdr", "host_run hdr-%s response status=%d", pr.first.c_str(), resp->status_code);
         if (body_contains_ci(*resp, canary)) {
+            diag::log_tagged_fmt("mod_host_hdr", "host_run FINDING x-forwarded-reflection hdr=%s status=%d", pr.first.c_str(), resp->status_code);
             auto iss = make_issue("host-header.smuggled-via-x-forwarded",
                                   std::string("Reflected '") + pr.first + "' header",
                                   severity_t::medium, confidence_t::firm, ip, p, *resp, ctx,
@@ -102,6 +125,7 @@ void host_run(const insertion_point_t& ip, const module_context_t& ctx, const se
                 std::transform(vlc.begin(), vlc.end(), vlc.begin(),
                                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
                 if (vlc.find(canary) != std::string::npos) {
+                    diag::log_tagged_fmt("mod_host_hdr", "host_run FINDING redirect-injection hdr=%s location=%s", pr.first.c_str(), h.second.c_str());
                     auto iss = make_issue("host-header.redirect-injection",
                                           std::string("Header '") + pr.first + "' poisoned redirect",
                                           severity_t::high, confidence_t::firm, ip, p, *resp, ctx,
@@ -117,6 +141,7 @@ void host_run(const insertion_point_t& ip, const module_context_t& ctx, const se
             }
         }
     }
+    diag::log_tagged_fmt("mod_host_hdr", "host_run complete no findings ip=%s:%s", ip.kind.c_str(), ip.name.c_str());
 }
 
 bool register_self()

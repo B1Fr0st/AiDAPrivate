@@ -14,6 +14,7 @@
 #include "../../ui/empty_state.hpp"
 #include "../../ui/fonts.hpp"
 #include "../../infra/work_queue.hpp"
+#include "helpers/diag_log.hpp"
 
 #include "imgui/imgui.h"
 
@@ -100,13 +101,18 @@ void render(float pos_x, float pos_y, float width, float height,
         cfg.format              = fmt_from_idx(s_state.format_idx);
         cfg.include_evidence    = s_state.include_evidence;
         cfg.include_remediation = s_state.include_remediation;
+        ::diag::log_tagged_fmt("report_v", "generate_report title='%s' format=%d path='%s' issues=%zu",
+            cfg.title.c_str(), s_state.format_idx, cfg.output_path.c_str(), cnt);
         s_state.generating.store(true);
         work_queue::post([cfg]() {
             std::string out;
             bool ok = report::generate(cfg, out);
-            std::lock_guard<std::mutex> lk(s_state.lock);
-            s_state.last_action_kind = ok ? "ok" : "error";
-            s_state.last_action      = ok ? std::string("Generated: ") + out : out;
+            {
+                std::lock_guard<std::mutex> lk(s_state.lock);
+                s_state.last_action_kind = ok ? "ok" : "error";
+                s_state.last_action      = ok ? std::string("Generated: ") + out : out;
+            }
+            ::diag::log_tagged_fmt("report_v", "generate_result ok=%d path='%s'", ok ? 1 : 0, out.c_str());
             s_state.generating.store(false);
         });
     }
@@ -128,6 +134,7 @@ void render(float pos_x, float pos_y, float width, float height,
                        "Generated reports:");
     ImGui::SameLine();
     if (aida::ui::button("Clear history", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
+        ::diag::log_tagged("report_v", "clear_history");
         report::clear_history();
     }
     ImGui::Separator();
@@ -149,7 +156,11 @@ void render(float pos_x, float pos_y, float width, float height,
                 r.issue_count,
                 r.output_path.c_str());
             bool sel = (s_state.selected_history == static_cast<int>(i));
-            if (ImGui::Selectable(buf, sel)) s_state.selected_history = static_cast<int>(i);
+            if (ImGui::Selectable(buf, sel)) {
+                ::diag::log_tagged_fmt("report_v", "history_selected id=%llu path='%s'",
+                    static_cast<unsigned long long>(r.id), r.output_path.c_str());
+                s_state.selected_history = static_cast<int>(i);
+            }
         }
     }
     ImGui::EndChild();

@@ -14,6 +14,7 @@
 #include "../../ui/empty_state.hpp"
 #include "../../ui/fonts.hpp"
 #include "../../infra/work_queue.hpp"
+#include "helpers/diag_log.hpp"
 
 #include "imgui/imgui.h"
 
@@ -105,6 +106,7 @@ void render(float pos_x, float pos_y, float width, float height,
     if (aida::ui::button("Import", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm, ImVec2(0.f, 28.f))) {
         std::string what(s_state.import_path_buf);
         api_definition::api_format_t fmt = fmt_from_idx(s_state.import_format_idx);
+        ::diag::log_tagged_fmt("api_v", "import what='%s' format_idx=%d", what.c_str(), s_state.import_format_idx);
         s_state.importing.store(true);
         work_queue::post([what, fmt]() {
             uint64_t id = 0;
@@ -115,9 +117,11 @@ void render(float pos_x, float pos_y, float width, float height,
             {
                 std::lock_guard<std::mutex> lk(s_state.lock);
                 if (id != 0) {
+                    ::diag::log_tagged_fmt("api_v", "import_ok id=%llu", static_cast<unsigned long long>(id));
                     s_state.last_action_kind    = "ok";
                     s_state.last_action_message = std::string("Imported collection id=") + std::to_string(id);
                 } else {
+                    ::diag::log_tagged_fmt("api_v", "import_failed err='%s'", api_definition::last_error().c_str());
                     s_state.last_action_kind    = "error";
                     s_state.last_action_message = api_definition::last_error();
                 }
@@ -167,6 +171,8 @@ void render(float pos_x, float pos_y, float width, float height,
         }
         if (ImGui::BeginPopupContextItem(buf)) {
             if (ImGui::MenuItem("Remove")) {
+                ::diag::log_tagged_fmt("api_v", "collection_removed id=%llu name='%s'",
+                    static_cast<unsigned long long>(c.id), c.name.c_str());
                 api_definition::remove_collection(c.id);
                 s_state.selected_collection_index = -1;
                 s_state.selected_request_index    = -1;
@@ -208,6 +214,8 @@ void render(float pos_x, float pos_y, float width, float height,
         if (aida::ui::button("Audit Collection", aida::ui::button_kind_t::accent_gradient, aida::ui::size_t_::sm)) {
             uint64_t cid = c.id;
             std::map<std::string, std::string> auth = parse_kv_lines(s_state.audit_auth_buf);
+            ::diag::log_tagged_fmt("api_v", "audit_collection id=%llu name='%s'",
+                static_cast<unsigned long long>(cid), c.name.c_str());
             s_state.auditing.store(true);
             work_queue::post([cid, auth]() {
                 api_definition::audit_result_t res;
@@ -218,6 +226,9 @@ void render(float pos_x, float pos_y, float width, float height,
                     _snprintf_s(msg, sizeof(msg), _TRUNCATE,
                         "Audit %s: sent=%zu failed=%zu issues=%zu",
                         ok ? "completed" : "failed",
+                        res.requests_sent, res.requests_failed, res.issues_raised);
+                    ::diag::log_tagged_fmt("api_v", "audit_result id=%llu ok=%d sent=%zu failed=%zu issues=%zu",
+                        static_cast<unsigned long long>(cid), ok ? 1 : 0,
                         res.requests_sent, res.requests_failed, res.issues_raised);
                     s_state.last_action_kind    = ok ? "ok" : "error";
                     s_state.last_action_message = msg;
@@ -269,6 +280,8 @@ void render(float pos_x, float pos_y, float width, float height,
             auto qv = parse_kv_lines(s_state.send_query_value_buf);
             auto hv = parse_kv_lines(s_state.send_header_value_buf);
             api_definition::api_request_template_t tpl_copy = r;
+            ::diag::log_tagged_fmt("api_v", "send_request method='%s' path='%s' base='%s'",
+                r.method.c_str(), r.path.c_str(), r.base_url.c_str());
             s_state.sending.store(true);
             work_queue::post([tpl_copy, pv, qv, hv]() {
                 std::string scheme, host, path; uint16_t port = 0;
@@ -284,6 +297,8 @@ void render(float pos_x, float pos_y, float width, float height,
                 auto resp = audit_http::send(raw, host, port, tls, opts);
                 std::lock_guard<std::mutex> lk(s_state.lock);
                 if (resp.has_value()) {
+                    ::diag::log_tagged_fmt("api_v", "send_response status=%d latency=%llums",
+                        resp->status_code, static_cast<unsigned long long>(resp->latency_ms));
                     s_state.response_status     = resp->status_code;
                     s_state.response_latency_ms = resp->latency_ms;
                     std::string out;
@@ -295,6 +310,7 @@ void render(float pos_x, float pos_y, float width, float height,
                     s_state.last_action_kind = "ok";
                     s_state.last_action_message = std::string("Sent: HTTP ") + std::to_string(resp->status_code);
                 } else {
+                    ::diag::log_tagged_fmt("api_v", "send_failed err='%s'", audit_http::last_error().c_str());
                     s_state.response_status = 0;
                     s_state.response_raw    = audit_http::last_error();
                     s_state.last_action_kind = "error";

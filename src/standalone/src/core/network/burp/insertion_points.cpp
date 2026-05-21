@@ -2,6 +2,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "../../../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cstring>
@@ -326,12 +328,21 @@ std::string url_decode(const std::string& s)
 
 std::vector<insertion_point_t> analyze(const std::vector<uint8_t>& raw_request, const std::string& /*url*/)
 {
+    diag::log_tagged_fmt("insertion_points", "analyze raw_len=%zu", raw_request.size());
     std::vector<insertion_point_t> out;
-    if (raw_request.empty()) return out;
+    if (raw_request.empty()) {
+        diag::log_tagged("insertion_points", "analyze empty_request");
+        return out;
+    }
     std::string raw(reinterpret_cast<const char*>(raw_request.data()), raw_request.size());
     auto rl = parse_request_line(raw);
-    if (!rl.valid) return out;
+    if (!rl.valid) {
+        diag::log_tagged("insertion_points", "analyze invalid_request_line");
+        return out;
+    }
+    diag::log_tagged_fmt("insertion_points", "analyze method=%s uri=%s", rl.method.c_str(), rl.uri.c_str());
     auto headers = parse_headers(raw, rl.headers_offset, rl.body_offset);
+    diag::log_tagged_fmt("insertion_points", "analyze header_count=%zu body_offset=%zu", headers.size(), rl.body_offset);
 
     std::string uri = rl.uri;
     size_t qmark = uri.find('?');
@@ -340,6 +351,7 @@ std::vector<insertion_point_t> analyze(const std::vector<uint8_t>& raw_request, 
 
     if (!query.empty()) {
         auto pairs = find_query_pairs(query);
+        diag::log_tagged_fmt("insertion_points", "analyze query_params_found=%zu", pairs.size());
         for (auto& pr : pairs) {
             size_t key_off = pr.first;
             size_t eq_off  = pr.second;
@@ -351,6 +363,7 @@ std::vector<insertion_point_t> analyze(const std::vector<uint8_t>& raw_request, 
             std::string raw_val = query.substr(val_start, val_end - val_start);
             std::string decoded = url_decode(raw_val);
 
+            diag::log_tagged_fmt("insertion_points", "analyze query_param name=%s", name.c_str());
             insertion_point_t ip;
             ip.kind = "query";
             ip.name = url_decode(name);
@@ -375,6 +388,7 @@ std::vector<insertion_point_t> analyze(const std::vector<uint8_t>& raw_request, 
     }
 
     if (!path.empty() && path.size() > 1) {
+        diag::log_tagged_fmt("insertion_points", "analyze path_segments path=%s", path.c_str());
         size_t p = 1;
         size_t seg_index = 0;
         while (p < path.size()) {
@@ -382,6 +396,7 @@ std::vector<insertion_point_t> analyze(const std::vector<uint8_t>& raw_request, 
             size_t end = (slash == std::string::npos) ? path.size() : slash;
             std::string seg = path.substr(p, end - p);
             if (!seg.empty()) {
+                diag::log_tagged_fmt("insertion_points", "analyze path_segment seg=%s idx=%zu", seg.c_str(), seg_index);
                 insertion_point_t ip;
                 ip.kind = "path";
                 ip.name = "seg" + std::to_string(seg_index);
@@ -415,10 +430,12 @@ std::vector<insertion_point_t> analyze(const std::vector<uint8_t>& raw_request, 
     }
     std::string ct_lower; ct_lower.reserve(content_type_str.size());
     for (char c : content_type_str) ct_lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    diag::log_tagged_fmt("insertion_points", "analyze body_len=%zu content_type=%s", body.size(), content_type_str.c_str());
 
     if (!body.empty()) {
         if (ct_lower.find("application/x-www-form-urlencoded") != std::string::npos) {
             auto pairs = find_query_pairs(body);
+            diag::log_tagged_fmt("insertion_points", "analyze form_body_pairs=%zu", pairs.size());
             for (auto& pr : pairs) {
                 size_t key_off = pr.first;
                 size_t eq_off  = pr.second;
@@ -449,9 +466,14 @@ std::vector<insertion_point_t> analyze(const std::vector<uint8_t>& raw_request, 
             nlohmann::json doc;
             bool parsed = false;
             try { doc = nlohmann::json::parse(body); parsed = true; } catch (...) {}
+            if (!parsed) {
+                diag::log_tagged("insertion_points", "analyze json_body_parse_failed");
+            }
             if (parsed) {
+                diag::log_tagged("insertion_points", "analyze json_body_parsed");
                 std::vector<std::pair<std::string, std::string>> leaves;
                 collect_json_leaves(doc, "", leaves);
+                diag::log_tagged_fmt("insertion_points", "analyze json_leaves=%zu", leaves.size());
                 for (const auto& lf : leaves) {
                     insertion_point_t ip;
                     ip.kind = "body_json";
@@ -478,6 +500,7 @@ std::vector<insertion_point_t> analyze(const std::vector<uint8_t>& raw_request, 
         } else if (ct_lower.find("xml") != std::string::npos) {
             std::vector<std::pair<size_t, size_t>> spans;
             collect_xml_text_nodes(body, spans);
+            diag::log_tagged_fmt("insertion_points", "analyze xml_text_nodes=%zu", spans.size());
             size_t idx = 0;
             for (const auto& sp : spans) {
                 insertion_point_t ip;
@@ -497,6 +520,7 @@ std::vector<insertion_point_t> analyze(const std::vector<uint8_t>& raw_request, 
                 out.push_back(std::move(ip));
             }
         } else if (ct_lower.find("multipart/form-data") != std::string::npos) {
+            diag::log_tagged("insertion_points", "analyze multipart_body");
             size_t bpos = ct_lower.find("boundary=");
             std::string boundary;
             if (bpos != std::string::npos) {
@@ -505,6 +529,7 @@ std::vector<insertion_point_t> analyze(const std::vector<uint8_t>& raw_request, 
                     boundary = boundary.substr(1, boundary.size() - 2);
             }
             if (!boundary.empty()) {
+                diag::log_tagged_fmt("insertion_points", "analyze multipart_boundary=%s", boundary.c_str());
                 std::string delim = "--" + boundary;
                 size_t p = 0;
                 size_t idx = 0;
@@ -525,6 +550,7 @@ std::vector<insertion_point_t> analyze(const std::vector<uint8_t>& raw_request, 
                         size_t e = hdr_section.find('"', nm + 6);
                         if (e != std::string::npos) field_name = hdr_section.substr(nm + 6, e - nm - 6);
                     }
+                    diag::log_tagged_fmt("insertion_points", "analyze multipart_field name=%s idx=%zu", field_name.c_str(), idx - 1);
                     insertion_point_t ip;
                     ip.kind = "body_multipart";
                     ip.name = field_name;
@@ -546,10 +572,12 @@ std::vector<insertion_point_t> analyze(const std::vector<uint8_t>& raw_request, 
         }
     }
 
+    diag::log_tagged_fmt("insertion_points", "analyze scanning_headers_for_cookies_and_targets header_count=%zu", headers.size());
     for (const auto& h : headers) {
         std::string lc; lc.reserve(h.name.size());
         for (char c : h.name) lc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
         if (lc == "cookie") {
+            diag::log_tagged_fmt("insertion_points", "analyze cookie_header value_len=%zu", h.value.size());
             size_t p = 0;
             while (p < h.value.size()) {
                 size_t eq = h.value.find('=', p);
@@ -563,6 +591,7 @@ std::vector<insertion_point_t> analyze(const std::vector<uint8_t>& raw_request, 
                 if (val_end == std::string::npos) val_end = h.value.size();
                 std::string cval = h.value.substr(val_start, val_end - val_start);
 
+                diag::log_tagged_fmt("insertion_points", "analyze cookie_param name=%s", cname.c_str());
                 insertion_point_t ip;
                 ip.kind = "cookie";
                 ip.name = cname;
@@ -585,6 +614,7 @@ std::vector<insertion_point_t> analyze(const std::vector<uint8_t>& raw_request, 
                 while (p < h.value.size() && (h.value[p] == ' ' || h.value[p] == '\t')) ++p;
             }
         } else if (is_target_header(h.name) && !is_common_skipped_header(h.name)) {
+            diag::log_tagged_fmt("insertion_points", "analyze target_header name=%s", h.name.c_str());
             insertion_point_t ip;
             ip.kind = "header";
             ip.name = h.name;
@@ -600,6 +630,7 @@ std::vector<insertion_point_t> analyze(const std::vector<uint8_t>& raw_request, 
         }
     }
 
+    diag::log_tagged_fmt("insertion_points", "analyze complete total_points=%zu", out.size());
     return out;
 }
 

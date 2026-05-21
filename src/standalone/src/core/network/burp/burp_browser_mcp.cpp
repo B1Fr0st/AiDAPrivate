@@ -2,6 +2,8 @@
 #include "browser_launch.hpp"
 #include "../mitm_proxy.hpp"
 
+#include "../../../helpers/diag_log.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <string>
@@ -40,6 +42,7 @@ tool_result_t tool_launch(const json& params)
     browser_launch_config_t cfg;
     cfg.proxy_host = "127.0.0.1";
     cfg.proxy_port = default_proxy_port();
+    diag::log_tagged_fmt("mcp_burp", "browser_launch proxy_host=%s proxy_port=%d", cfg.proxy_host.c_str(), (int)cfg.proxy_port);
 
     if (params.is_object()) {
         if (params.contains("proxy_host") && params["proxy_host"].is_string())
@@ -61,9 +64,12 @@ tool_result_t tool_launch(const json& params)
     }
 
     uint32_t pid = 0;
-    if (!launch(cfg, pid)) {
+    if (!launch(cfg, pid))
+    {
+        diag::log_tagged_fmt("mcp_burp", "browser_launch failed err=%s", last_error().c_str());
         return tool_result_t::error(last_error().empty() ? std::string("launch_failed") : last_error());
     }
+    diag::log_tagged_fmt("mcp_burp", "browser_launch ok pid=%u proxy_port=%d", pid, (int)cfg.proxy_port);
     json j;
     j["pid"]          = pid;
     j["proxy_host"]   = cfg.proxy_host;
@@ -74,22 +80,34 @@ tool_result_t tool_launch(const json& params)
 
 tool_result_t tool_kill(const json& params)
 {
-    if (!params.is_object() || !params.contains("pid") || !params["pid"].is_number_unsigned()) {
+    diag::log_tagged_fmt("mcp_burp", "browser_kill entry");
+    if (!params.is_object() || !params.contains("pid") || !params["pid"].is_number_unsigned())
+    {
+        diag::log_tagged_fmt("mcp_burp", "browser_kill missing_pid");
         return tool_result_t::error("missing_pid");
     }
     uint32_t pid = params["pid"].get<uint32_t>();
+    diag::log_tagged_fmt("mcp_burp", "browser_kill pid=%u", pid);
     bool ok = kill(pid);
+    if (!ok)
+    {
+        diag::log_tagged_fmt("mcp_burp", "browser_kill failed pid=%u err=%s", pid, last_error().c_str());
+        return tool_result_t::error(last_error().empty() ? std::string("kill_failed") : last_error());
+    }
+    diag::log_tagged_fmt("mcp_burp", "browser_kill ok pid=%u", pid);
     json j;
     j["pid"] = pid;
     j["killed"] = ok;
     j["error"] = ok ? std::string() : last_error();
-    return ok ? tool_result_t::ok(j) : tool_result_t::error(last_error().empty() ? std::string("kill_failed") : last_error());
+    return tool_result_t::ok(j);
 }
 
 tool_result_t tool_kill_all(const json& params)
 {
     (void)params;
+    diag::log_tagged_fmt("mcp_burp", "browser_kill_all entry");
     bool ok = kill_all();
+    diag::log_tagged_fmt("mcp_burp", "browser_kill_all ok result=%d", (int)ok);
     json j;
     j["ok"] = ok;
     return tool_result_t::ok(j);
@@ -98,6 +116,7 @@ tool_result_t tool_kill_all(const json& params)
 tool_result_t tool_list(const json& params)
 {
     (void)params;
+    diag::log_tagged_fmt("mcp_burp", "browser_list entry");
     auto items = list_running();
     json arr = json::array();
     for (const auto& s : items) {
@@ -110,6 +129,7 @@ tool_result_t tool_list(const json& params)
         j["launched_ms"]  = s.launched_ms;
         arr.push_back(j);
     }
+    diag::log_tagged_fmt("mcp_burp", "browser_list ok count=%zu", items.size());
     json out;
     out["count"] = arr.size();
     out["items"] = arr;
@@ -119,9 +139,11 @@ tool_result_t tool_list(const json& params)
 tool_result_t tool_detect(const json& params)
 {
     (void)params;
+    diag::log_tagged_fmt("mcp_burp", "browser_detect entry");
     std::string edge, chrome;
     bool edge_ok = detect_edge_path(edge);
     bool chrome_ok = detect_chrome_path(chrome);
+    diag::log_tagged_fmt("mcp_burp", "browser_detect ok edge=%d chrome=%d", (int)edge_ok, (int)chrome_ok);
     json j;
     j["edge_detected"]   = edge_ok;
     j["edge_path"]       = edge;
