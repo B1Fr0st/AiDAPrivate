@@ -3,6 +3,7 @@
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 #include "../helpers/globals.h"
+#include "zydis_disasm.hpp"
 #include "disasm_view.hpp"
 #include "pe_parser.hpp"
 #include "symbol_store.hpp"

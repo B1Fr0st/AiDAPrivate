@@ -13,7 +13,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-find_program(AIDA_SCCACHE_PROGRAM sccache)
+find_program(AIDA_SCCACHE_PROGRAM sccache
+    HINTS "${CMAKE_SOURCE_DIR}/sccache-v0.15.0-x86_64-pc-windows-msvc")
 if(AIDA_SCCACHE_PROGRAM)
     message(STATUS "AiDA: sccache enabled for C++ at ${AIDA_SCCACHE_PROGRAM}")
     set(CMAKE_C_COMPILER_LAUNCHER   "" CACHE STRING "compiler launcher (disabled for C)" FORCE)
@@ -876,33 +877,6 @@ if(WIN32)
         set_target_properties(DriverTest PROPERTIES
             OUTPUT_NAME "test_driver"
         )
-
-        add_executable(TestTarget
-            driver/test_target.cpp
-        )
-
-        target_compile_definitions(TestTarget PRIVATE
-            _CRT_SECURE_NO_WARNINGS
-            NOMINMAX
-            WIN32_LEAN_AND_MEAN
-        )
-
-        target_compile_options(TestTarget PRIVATE
-            /W3
-            /EHsc
-            /Zc:__cplusplus
-            /permissive-
-            /MD
-            /wd4201
-        )
-
-        target_link_libraries(TestTarget PRIVATE
-            ws2_32
-        )
-
-        set_target_properties(TestTarget PROPERTIES
-            OUTPUT_NAME "test_target"
-        )
     endif()
 
     option(BUILD_BINPROTO_TEST "Build the binary protocol test executable" ON)
@@ -1287,6 +1261,13 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_verify.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_sentinel.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_all_features.cpp"
+            "${STANDALONE_ROOT}/core/testlab/test_all_debugger.cpp"
+            "${STANDALONE_ROOT}/core/testlab/test_all_scanner.cpp"
+            "${STANDALONE_ROOT}/core/testlab/test_all_analysis.cpp"
+            "${STANDALONE_ROOT}/core/testlab/test_all_network.cpp"
+            "${STANDALONE_ROOT}/core/testlab/test_all_burp.cpp"
+            "${STANDALONE_ROOT}/core/testlab/test_all_disasm.cpp"
+            "${STANDALONE_ROOT}/core/testlab/test_all_mcp.cpp"
             "${DEPS_DIR}/sqlite-amalgamation-3530000/sqlite3.c"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/hardware_id/hardware_id.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/hardware_id/hardware_id_v2.cpp"
@@ -2326,4 +2307,12 @@ endif()
 
 if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/test_target/CMakeLists.txt")
     add_subdirectory(src/standalone/test_target)
+    if(TARGET AiDA_TestTarget)
+        set_target_properties(AiDA_TestTarget PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+            RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
+            RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/Debug"
+            RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
+        )
+    endif()
 endif()

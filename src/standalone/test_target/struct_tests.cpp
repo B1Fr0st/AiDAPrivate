@@ -305,11 +305,12 @@ static void free_list(linked_list_node_t* head) {
 static void populate_entity(volatile entity_t* e, uint64_t id, const char* name, float x, float y, float z) {
     e->id = id;
     strncpy_s((char*)e->name, sizeof(e->name), name, _TRUNCATE);
-    e->position = { x, y, z };
-    e->velocity = { x * 0.1f, y * 0.1f, z * 0.1f };
-    e->bounds.min_pt = { x - 1.0f, y - 1.0f, z - 1.0f };
-    e->bounds.max_pt = { x + 1.0f, y + 1.0f, z + 1.0f };
-    e->color = { (uint8_t)(id * 37), (uint8_t)(id * 73), (uint8_t)(id * 113), 255 };
+    e->position.x = x;            e->position.y = y;            e->position.z = z;
+    e->velocity.x = x * 0.1f;     e->velocity.y = y * 0.1f;     e->velocity.z = z * 0.1f;
+    e->bounds.min_pt.x = x - 1.0f; e->bounds.min_pt.y = y - 1.0f; e->bounds.min_pt.z = z - 1.0f;
+    e->bounds.max_pt.x = x + 1.0f; e->bounds.max_pt.y = y + 1.0f; e->bounds.max_pt.z = z + 1.0f;
+    e->color.r = (uint8_t)(id * 37);  e->color.g = (uint8_t)(id * 73);
+    e->color.b = (uint8_t)(id * 113); e->color.a = 255;
     e->stats.strength = (int32_t)(id * 3 + 10);
     e->stats.dexterity = (int32_t)(id * 2 + 15);
     e->stats.intelligence = (int32_t)(id * 4 + 8);

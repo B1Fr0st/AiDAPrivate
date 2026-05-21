@@ -39,7 +39,7 @@ public:
 		return cache_.addCommentNoDuplicate(tp, fad, ad, txt);
 	}
 
-	void deleteComment(ghidra::Comment* /*com*/) override
+	void deleteComment(ghidra::Comment* ) override
 	{
 		throw ghidra::LowlevelError("comment_database_t::deleteComment not supported");
 	}
@@ -55,7 +55,7 @@ public:
 	}
 
 	void encode(ghidra::Encoder& encoder) const override { cache_.encode(encoder); }
-	void decode(ghidra::Decoder& /*decoder*/) override
+	void decode(ghidra::Decoder& ) override
 	{
 		throw ghidra::LowlevelError("comment_database_t::decode not supported");
 	}

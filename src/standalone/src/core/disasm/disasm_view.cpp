@@ -4705,6 +4705,7 @@ void render(float pos_x, float pos_y, float width, float height,
         int b_last = std::min(banner_lines - 1, last_vrow);
         if (b_first <= b_last) {
             const float x_banner_text = x_bytes;
+            const float disasm_text_oy = (line_h - code_size) * 0.5f;
             const uint64_t banner_addr = instrs.empty() ? file.image_base : instrs.front().addr;
             const std::string banner_seg = instrs.empty()
                 ? std::string(".text")

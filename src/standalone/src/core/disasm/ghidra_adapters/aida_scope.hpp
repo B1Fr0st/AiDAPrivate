@@ -43,7 +43,7 @@ private:
 	ghidra::Symbol* query_aida_(const ghidra::Address& addr, bool contain) const;
 
 protected:
-	void removeRange(ghidra::AddrSpace* /*spc*/, ghidra::uintb /*first*/, ghidra::uintb /*last*/) override
+	void removeRange(ghidra::AddrSpace* , ghidra::uintb , ghidra::uintb ) override
 	{
 	}
 	void addSymbolInternal(ghidra::Symbol* sym) override
@@ -96,7 +96,7 @@ public:
 	}
 	ghidra::Funcdata* findFunction(const ghidra::Address& addr) const override;
 	ghidra::ExternRefSymbol* findExternalRef(const ghidra::Address& addr) const override;
-	ghidra::LabSymbol* findCodeLabel(const ghidra::Address& /*addr*/) const override;
+	ghidra::LabSymbol* findCodeLabel(const ghidra::Address& ) const override;
 	bool isNameUsed(const std::string& name, const Scope* op2) const override
 	{
 		return cache_->isNameUsed(name, op2);

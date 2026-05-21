@@ -103,7 +103,7 @@ ghidra::Symbol* scope_t::register_global_(uint64_t address) const
 	return symbol;
 }
 
-ghidra::Symbol* scope_t::query_aida_(const ghidra::Address& addr, bool /*contain*/) const
+ghidra::Symbol* scope_t::query_aida_(const ghidra::Address& addr, bool ) const
 {
 	if (addr.getSpace() != arch_->getDefaultCodeSpace() && addr.getSpace() != arch_->getDefaultDataSpace())
 		return nullptr;

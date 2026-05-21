@@ -119,7 +119,7 @@ ghidra::Translate* architecture_t::buildTranslator(ghidra::DocumentStorage& stor
 	return ret;
 }
 
-void architecture_t::buildLoader(ghidra::DocumentStorage& /*store*/)
+void architecture_t::buildLoader(ghidra::DocumentStorage& )
 {
 	collectSpecFiles(*errorstream);
 	if (staged_loader_) {
@@ -130,7 +130,7 @@ void architecture_t::buildLoader(ghidra::DocumentStorage& /*store*/)
 	}
 }
 
-ghidra::Scope* architecture_t::buildDatabase(ghidra::DocumentStorage& /*store*/)
+ghidra::Scope* architecture_t::buildDatabase(ghidra::DocumentStorage& )
 {
 	symboltab = new ghidra::Database(this, false);
 	auto* gscope = new scope_t(this);
@@ -138,12 +138,12 @@ ghidra::Scope* architecture_t::buildDatabase(ghidra::DocumentStorage& /*store*/)
 	return gscope;
 }
 
-void architecture_t::buildTypegrp(ghidra::DocumentStorage& /*store*/)
+void architecture_t::buildTypegrp(ghidra::DocumentStorage& )
 {
 	types = new ghidra::TypeFactory(this);
 }
 
-void architecture_t::buildCoreTypes(ghidra::DocumentStorage& /*store*/)
+void architecture_t::buildCoreTypes(ghidra::DocumentStorage& )
 {
 	types->setCoreType("void", 1, ghidra::TYPE_VOID, false);
 	types->setCoreType("bool", 1, ghidra::TYPE_BOOL, false);
@@ -169,7 +169,7 @@ void architecture_t::buildCoreTypes(ghidra::DocumentStorage& /*store*/)
 	types->cacheCoreTypes();
 }
 
-void architecture_t::buildCommentDB(ghidra::DocumentStorage& /*store*/)
+void architecture_t::buildCommentDB(ghidra::DocumentStorage& )
 {
 	commentdb = new comment_database_t();
 }

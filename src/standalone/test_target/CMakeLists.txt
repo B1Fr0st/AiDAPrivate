@@ -16,6 +16,13 @@ add_executable(AiDA_TestTarget
     "${CMAKE_CURRENT_SOURCE_DIR}/memory_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/thread_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/struct_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/crypto_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/exception_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/debug_surface_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/file_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/module_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/http_server_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/traffic_generator.cpp"
 )
 
 target_include_directories(AiDA_TestTarget PRIVATE
@@ -52,4 +59,5 @@ target_link_libraries(AiDA_TestTarget PRIVATE
     kernel32
     ws2_32
     user32
+    ntdll
 )

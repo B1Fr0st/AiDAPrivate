@@ -154,7 +154,7 @@ void annotate_function_name(const ghidra::Element* node, parse_context_t& ctx, s
 	out.push_back(a);
 }
 
-void annotate_comment_offset(const ghidra::Element* node, parse_context_t& /*ctx*/, std::vector<code_annotation_t>& out)
+void annotate_comment_offset(const ghidra::Element* node, parse_context_t& , std::vector<code_annotation_t>& out)
 {
 	uint64_t off = attr_ull(node, "off", ULLONG_MAX);
 	if (off == ULLONG_MAX)
@@ -165,7 +165,7 @@ void annotate_comment_offset(const ghidra::Element* node, parse_context_t& /*ctx
 	out.push_back(a);
 }
 
-void annotate_color(const ghidra::Element* node, parse_context_t& /*ctx*/, std::vector<code_annotation_t>& out)
+void annotate_color(const ghidra::Element* node, parse_context_t& , std::vector<code_annotation_t>& out)
 {
 	int color = attr_int(node, "color", -1);
 	if (color < 0)

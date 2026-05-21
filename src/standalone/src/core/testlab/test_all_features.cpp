@@ -1,6 +1,13 @@
 #include "test_all_features.hpp"
 #include "test_lab.hpp"
 #include "test_lab_format.hpp"
+#include "test_all_debugger.h"
+#include "test_all_scanner.h"
+#include "test_all_analysis.h"
+#include "test_all_network.h"
+#include "test_all_burp.h"
+#include "test_all_disasm.h"
+#include "test_all_mcp.h"
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -32,9 +39,6 @@ namespace test_all_features {
 
 	namespace {
 
-		// ----------------------------------------------------------------
-		// state
-		// ----------------------------------------------------------------
 
 		std::atomic<bool> g_running{ false };
 		std::atomic<bool> g_cancel_requested{ false };
@@ -52,17 +56,11 @@ namespace test_all_features {
 		std::mutex        g_phase_mtx;
 		std::string       g_phase_label;
 
-		// ----------------------------------------------------------------
-		// log path
-		// ----------------------------------------------------------------
 
 		const char* log_path() {
 			return "C:\\Users\\Public\\Desktop\\aida_full_test.log";
 		}
 
-		// ----------------------------------------------------------------
-		// helpers
-		// ----------------------------------------------------------------
 
 		void format_timestamp(char* out, std::size_t cap) {
 			SYSTEMTIME st;
@@ -112,19 +110,19 @@ namespace test_all_features {
 			_vsnprintf_s(detail, sizeof(detail), _TRUNCATE, fmt, ap);
 			va_end(ap);
 
-			// build formatted line
+
 			char line[1200];
 			_snprintf_s(line, sizeof(line), _TRUNCATE, "[%s] [%s] %s\n", ts, tag, detail);
 			std::string s(line);
 
-			// write to log file
+
 			write_log_file(hf, s);
 
-			// write to diag log + OutputDebugString
+
 			diag::log_tagged_fmt("test_all", "%s: %s", tag, detail);
 			OutputDebugStringA(s.c_str());
 
-			// push to UI log
+
 			push_log(s);
 		}
 
@@ -137,9 +135,6 @@ namespace test_all_features {
 			return g_cancel_requested.load(std::memory_order_acquire);
 		}
 
-		// ----------------------------------------------------------------
-		// destructive test skip list  (copied from test_lab_view.cpp)
-		// ----------------------------------------------------------------
 
 		bool is_destructive(const char* name) {
 			if (name == nullptr) return false;
@@ -159,9 +154,6 @@ namespace test_all_features {
 			return std::strncmp(name, prefix, std::strlen(prefix)) == 0;
 		}
 
-		// ----------------------------------------------------------------
-		// safe defaults  (mirrors test_lab_view.cpp populate_safe_defaults)
-		// ----------------------------------------------------------------
 
 		void populate_defaults(test_lab::state_t& s) {
 			s.pid = static_cast<std::uint32_t>(GetCurrentProcessId());
@@ -177,46 +169,42 @@ namespace test_all_features {
 			s.user = nullptr;
 		}
 
-		// ----------------------------------------------------------------
-		// find test_target.exe
-		// ----------------------------------------------------------------
 
 		std::wstring find_test_target() {
-			// try next to our own exe first
+
 			wchar_t self[MAX_PATH] = {};
 			GetModuleFileNameW(nullptr, self, MAX_PATH);
 			std::wstring dir(self);
 			auto pos = dir.find_last_of(L"\\/");
 			if (pos != std::wstring::npos) dir.resize(pos + 1);
 
-			std::wstring candidate = dir + L"test_target.exe";
-			if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES)
-				return candidate;
+			const std::wstring candidates[] = {
+				dir + L"AiDA_TestTarget.exe",
+				dir + L"test_target\\AiDA_TestTarget.exe",
+			};
 
-			// try build/test_target/
-			candidate = dir + L"..\\test_target\\test_target.exe";
-			if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES)
-				return candidate;
+			for (const auto& candidate : candidates) {
+				char narrow[MAX_PATH] = {};
+				WideCharToMultiByte(CP_UTF8, 0, candidate.c_str(), -1, narrow, MAX_PATH, nullptr, nullptr);
+				diag::log_tagged_fmt("testall", "find_test_target: probing %s", narrow);
+				if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+					diag::log_tagged_fmt("testall", "find_test_target: resolved %s", narrow);
+					return candidate;
+				}
+			}
 
-			// try build root
-			candidate = dir + L"..\\..\\build\\test_target\\AiDATestTarget.exe";
-			if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES)
-				return candidate;
-
+			diag::log_tagged_fmt("testall", "find_test_target: AiDA_TestTarget.exe not found in any candidate path");
 			return {};
 		}
 
-		// ----------------------------------------------------------------
-		// phase: launch & attach test target
-		// ----------------------------------------------------------------
 
 		bool phase_launch_target(HANDLE hf, std::uint32_t& out_pid) {
-			set_phase("Launch test_target.exe");
-			log_msg(hf, "launch", "searching for test_target.exe ...");
+			set_phase("Launch AiDA_TestTarget.exe");
+			log_msg(hf, "launch", "searching for AiDA_TestTarget.exe ...");
 
 			std::wstring exe = find_test_target();
 			if (exe.empty()) {
-				log_msg(hf, "launch", "SKIP -- test_target.exe not found");
+				log_msg(hf, "launch", "SKIP -- AiDA_TestTarget.exe not found");
 				g_skipped.fetch_add(1);
 				return false;
 			}
@@ -227,7 +215,7 @@ namespace test_all_features {
 
 			auto t0 = std::chrono::steady_clock::now();
 
-			// extract working directory from exe path
+
 			std::wstring work_dir = exe;
 			auto slash = work_dir.find_last_of(L"\\/");
 			if (slash != std::wstring::npos) work_dir.resize(slash);
@@ -248,7 +236,7 @@ namespace test_all_features {
 			log_msg(hf, "launch", "PASS -- attached to pid=%u (elapsed %lld ms)", pid, (long long)ms);
 			g_passed.fetch_add(1);
 
-			// wait up to 8s for "READY" event
+
 			set_phase("Waiting for test_target READY");
 			log_msg(hf, "launch", "waiting for WhosWhoTestReady event (8s timeout) ...");
 
@@ -270,9 +258,6 @@ namespace test_all_features {
 			return true;
 		}
 
-		// ----------------------------------------------------------------
-		// phase: run all registered test_lab features
-		// ----------------------------------------------------------------
 
 		void phase_testlab_features(HANDLE hf) {
 			set_phase("Test Lab features");
@@ -332,9 +317,6 @@ namespace test_all_features {
 			}
 		}
 
-		// ----------------------------------------------------------------
-		// extended feature tests
-		// ----------------------------------------------------------------
 
 		void test_disassembly_view(HANDLE hf) {
 			set_phase("Disassembly view");
@@ -357,7 +339,7 @@ namespace test_all_features {
 			std::uint64_t addr = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(nt_close));
 			log_msg(hf, "disasm", "NtClose address: 0x%016llX", static_cast<unsigned long long>(addr));
 
-			// request disassembly refresh at that address
+
 			debugger_engine::request_disasm_refresh(addr, 0);
 			Sleep(500);
 
@@ -381,7 +363,7 @@ namespace test_all_features {
 			log_msg(hf, "memscan", "START -- scan for known pattern 0xCAFEBABE");
 			auto t0 = std::chrono::steady_clock::now();
 
-			// use ReadProcessMemory on ourselves to verify memory reading works
+
 			std::uint64_t magic = 0xCAFEBABE00000001ULL;
 			volatile std::uint64_t* target = &magic;
 
@@ -411,7 +393,7 @@ namespace test_all_features {
 			log_msg(hf, "netview", "START -- verify network connection enumeration");
 			auto t0 = std::chrono::steady_clock::now();
 
-			// test that we can at least resolve a hostname (basic network stack test)
+
 			WSADATA wsa{};
 			WSAStartup(MAKEWORD(2, 2), &wsa);
 
@@ -438,11 +420,11 @@ namespace test_all_features {
 			log_msg(hf, "hexview", "START -- verify hex data display capability");
 			auto t0 = std::chrono::steady_clock::now();
 
-			// verify that we can format raw bytes (the hex view's core operation)
+
 			std::vector<std::uint8_t> test_data(256);
 			for (int i = 0; i < 256; ++i) test_data[i] = static_cast<std::uint8_t>(i);
 
-			// quick sanity: ensure the data round-trips through format
+
 			bool data_ok = true;
 			for (int i = 0; i < 256; ++i) {
 				if (test_data[i] != static_cast<std::uint8_t>(i)) {
@@ -482,7 +464,7 @@ namespace test_all_features {
 				return;
 			}
 
-			// read first 16 bytes as a signature
+
 			std::uint8_t sig[16] = {};
 			SIZE_T br = 0;
 			BOOL ok = ReadProcessMemory(GetCurrentProcess(), fn, sig, sizeof(sig), &br);
@@ -525,7 +507,7 @@ namespace test_all_features {
 
 			std::uint64_t addr = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(fn));
 
-			// read the first 64 bytes to confirm we can analyze code at this address
+
 			std::uint8_t code[64] = {};
 			SIZE_T br = 0;
 			BOOL ok = ReadProcessMemory(GetCurrentProcess(), fn, code, sizeof(code), &br);
@@ -543,9 +525,6 @@ namespace test_all_features {
 			}
 		}
 
-		// ----------------------------------------------------------------
-		// phase: extended feature tests
-		// ----------------------------------------------------------------
 
 		void phase_extended_features(HANDLE hf) {
 			set_phase("Extended feature tests");
@@ -559,16 +538,13 @@ namespace test_all_features {
 			if (!cancelled()) test_cfg_view(hf);
 		}
 
-		// ----------------------------------------------------------------
-		// phase: stop test target
-		// ----------------------------------------------------------------
 
 		void phase_stop_target(HANDLE hf, std::uint32_t pid) {
 			if (pid == 0) return;
 			set_phase("Stopping test_target");
 			log_msg(hf, "cleanup", "signaling test_target done event for pid=%u", pid);
 
-			// signal the done event so test_target shuts down cleanly
+
 			HANDLE hDone = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Global\\WhosWhoTestDone");
 			if (!hDone) hDone = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Local\\WhosWhoTestDone");
 			if (hDone) {
@@ -580,9 +556,6 @@ namespace test_all_features {
 			log_msg(hf, "cleanup", "test_target shutdown signaled");
 		}
 
-		// ----------------------------------------------------------------
-		// main runner
-		// ----------------------------------------------------------------
 
 		void run_all() {
 			HANDLE hf = open_log_file();
@@ -601,31 +574,67 @@ namespace test_all_features {
 
 			diag::log_tagged_fmt("test_all", "========== Full Feature Test START ==========");
 
-			// count total expected tests: test_lab features + 7 extended + 1 launch
 			const auto& features = test_lab::all_features();
 			int testlab_count = static_cast<int>(features.size());
-			g_total.store(testlab_count + 7); // 6 extended + 1 launch
+			g_total.store(testlab_count + 250);
 
-			// phase 1: launch test target
 			std::uint32_t target_pid = 0;
 			if (!cancelled()) {
 				phase_launch_target(hf, target_pid);
 			}
 
-			// phase 2: run all test_lab features
 			if (!cancelled()) {
 				phase_testlab_features(hf);
 			}
 
-			// phase 3: extended feature tests
 			if (!cancelled()) {
 				phase_extended_features(hf);
 			}
 
-			// phase 4: cleanup
+			if (!cancelled()) {
+				set_phase("Debugger feature tests");
+				log_msg(hf, "phase", "BEGIN debugger feature tests");
+				phase_debugger_tests(hf, g_passed, g_failed, g_skipped, cancelled);
+			}
+
+			if (!cancelled()) {
+				set_phase("Scanner feature tests");
+				log_msg(hf, "phase", "BEGIN scanner feature tests");
+				phase_scanner_tests(hf, g_passed, g_failed, g_skipped, cancelled);
+			}
+
+			if (!cancelled()) {
+				set_phase("Analysis feature tests");
+				log_msg(hf, "phase", "BEGIN analysis feature tests");
+				phase_analysis_tests(hf, g_passed, g_failed, g_skipped, cancelled);
+			}
+
+			if (!cancelled()) {
+				set_phase("Network feature tests");
+				log_msg(hf, "phase", "BEGIN network feature tests");
+				phase_network_tests(hf, g_passed, g_failed, g_skipped, cancelled);
+			}
+
+			if (!cancelled()) {
+				set_phase("Burp suite feature tests");
+				log_msg(hf, "phase", "BEGIN burp suite feature tests");
+				phase_burp_tests(hf, g_passed, g_failed, g_skipped, cancelled);
+			}
+
+			if (!cancelled()) {
+				set_phase("Disassembly & decompiler tests");
+				log_msg(hf, "phase", "BEGIN disassembly & decompiler tests");
+				phase_disasm_tests(hf, g_passed, g_failed, g_skipped, cancelled);
+			}
+
+			if (!cancelled()) {
+				set_phase("MCP tool tests");
+				log_msg(hf, "phase", "BEGIN MCP tool tests");
+				phase_mcp_tests(hf, g_passed, g_failed, g_skipped, cancelled);
+			}
+
 			phase_stop_target(hf, target_pid);
 
-			// summary
 			set_phase("Complete");
 			int p = g_passed.load();
 			int f = g_failed.load();
@@ -651,9 +660,6 @@ namespace test_all_features {
 			g_running.store(false, std::memory_order_release);
 		}
 
-		// ----------------------------------------------------------------
-		// start / cancel
-		// ----------------------------------------------------------------
 
 		void start_tests() {
 			bool expected = false;
@@ -684,11 +690,8 @@ namespace test_all_features {
 			diag::log_tagged_fmt("test_all", "user cancelled Test All Features");
 		}
 
-	} // anon namespace
+	}
 
-	// ----------------------------------------------------------------
-	// overlay render
-	// ----------------------------------------------------------------
 
 	void render_overlay(float vw, float vh) {
 		if (!globals::ui::test_all_visible) return;
@@ -719,7 +722,7 @@ namespace test_all_features {
 
 			bool running = g_running.load(std::memory_order_acquire);
 
-			// header row: buttons
+
 			if (running) ImGui::BeginDisabled();
 			if (ImGui::Button("Start Test", ImVec2(140.f, 30.f))) {
 				start_tests();
@@ -736,7 +739,7 @@ namespace test_all_features {
 
 			ImGui::SameLine(0.f, 20.f);
 
-			// phase label
+
 			{
 				std::lock_guard<std::mutex> lk(g_phase_mtx);
 				if (!g_phase_label.empty()) {
@@ -748,7 +751,7 @@ namespace test_all_features {
 
 			ImGui::Dummy(ImVec2(0.f, 6.f));
 
-			// summary bar
+
 			{
 				int total   = g_total.load();
 				int passed  = g_passed.load();
@@ -786,7 +789,7 @@ namespace test_all_features {
 			ImGui::Separator();
 			ImGui::Dummy(ImVec2(0.f, 4.f));
 
-			// log output
+
 			ImGui::PushStyleColor(ImGuiCol_Text, t.text_dim);
 			ImGui::TextUnformatted("TEST LOG");
 			ImGui::PopStyleColor();
@@ -802,7 +805,7 @@ namespace test_all_features {
 			{
 				std::lock_guard<std::mutex> lk(g_log_mtx);
 				for (const auto& line : g_log_lines) {
-					// colorize based on content
+
 					if (line.find("PASS") != std::string::npos) {
 						ImGui::PushStyleColor(ImGuiCol_Text, t.success);
 						ImGui::TextUnformatted(line.c_str());
@@ -821,7 +824,7 @@ namespace test_all_features {
 				}
 			}
 
-			// auto-scroll to bottom when running
+
 			if (running) {
 				ImGui::SetScrollHereY(1.0f);
 			}
@@ -830,7 +833,7 @@ namespace test_all_features {
 
 			ImGui::EndChild();
 
-			// bottom status
+
 			ImGui::PushStyleColor(ImGuiCol_Text, t.text_dim);
 			ImGui::Text("Log file: %s", log_path());
 			ImGui::PopStyleColor();
