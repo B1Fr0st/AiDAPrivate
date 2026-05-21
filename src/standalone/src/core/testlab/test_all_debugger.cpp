@@ -64,25 +64,38 @@ static uint64_t get_ntdll_fn(const char* name) {
     return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fn));
 }
 
+static uint64_t alloc_target_bp_region(size_t size = 64) {
+    uint64_t addr = driver_bridge::allocate_memory(size);
+    if (addr == 0) return 0;
+    std::vector<uint8_t> code(size, 0x90);
+    code.back() = 0xC3;
+    driver_bridge::write_memory(addr, code);
+    return addr;
+}
+
 static void test_add_remove_software_bp(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_bp", "START -- add and remove software breakpoint");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
+    uint64_t addr = alloc_target_bp_region();
     if (addr == 0) {
-        log_msg(hf, "dbg_bp", "FAIL -- NtClose not found");
+        log_msg(hf, "dbg_bp", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)");
         failed.fetch_add(1); return;
     }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_bp inputs: addr=0x%llX type=software size=1 pid=%u",
+        (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
 
     int idx = debugger_engine::add_breakpoint(addr, debugger_engine::bp_type_t::software, "test_sw_bp", "", 1);
     bool removed = debugger_engine::remove_breakpoint(idx);
+    driver_bridge::free_memory(addr);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_bp result: add_breakpoint=>idx=%d remove_breakpoint=>%d", idx, (int)removed);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (idx >= 0 && removed) {
         log_msg(hf, "dbg_bp", "PASS -- sw bp idx=%d, removed ok (elapsed %lld ms)", idx, (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_bp", "FAIL -- idx=%d removed=%d (elapsed %lld ms)", idx, removed, (long long)ms);
+        log_msg(hf, "dbg_bp", "FAIL -- idx=%d (<0 means add failed) removed=%d (elapsed %lld ms)", idx, (int)removed, (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -93,16 +106,19 @@ static void test_add_remove_hw_execute_bp(HANDLE hf, std::atomic<int>& passed, s
 
     uint64_t addr = get_ntdll_fn("NtClose");
     if (addr == 0) { log_msg(hf, "dbg_hwx", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_hwx inputs: addr=0x%llX type=hardware_execute size=1 pid=%u",
+        (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
 
     int idx = debugger_engine::add_breakpoint(addr, debugger_engine::bp_type_t::hardware_execute, "test_hwx_bp", "", 1);
     bool removed = debugger_engine::remove_breakpoint(idx);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_hwx result: add_breakpoint=>idx=%d remove_breakpoint=>%d", idx, (int)removed);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (idx >= 0 && removed) {
         log_msg(hf, "dbg_hwx", "PASS -- hw exec bp idx=%d, removed ok (elapsed %lld ms)", idx, (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_hwx", "FAIL -- idx=%d removed=%d (elapsed %lld ms)", idx, removed, (long long)ms);
+        log_msg(hf, "dbg_hwx", "FAIL -- idx=%d (<0 means add failed) removed=%d (elapsed %lld ms)", idx, (int)removed, (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -113,16 +129,19 @@ static void test_add_remove_hw_write_bp(HANDLE hf, std::atomic<int>& passed, std
 
     uint64_t addr = get_ntdll_fn("NtClose");
     if (addr == 0) { log_msg(hf, "dbg_hww", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_hww inputs: addr=0x%llX type=hardware_write size=4 pid=%u",
+        (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
 
     int idx = debugger_engine::add_breakpoint(addr, debugger_engine::bp_type_t::hardware_write, "test_hww_bp", "", 4);
     bool removed = debugger_engine::remove_breakpoint(idx);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_hww result: add_breakpoint=>idx=%d remove_breakpoint=>%d", idx, (int)removed);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (idx >= 0 && removed) {
         log_msg(hf, "dbg_hww", "PASS -- hw write bp idx=%d, removed ok (elapsed %lld ms)", idx, (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_hww", "FAIL -- idx=%d removed=%d (elapsed %lld ms)", idx, removed, (long long)ms);
+        log_msg(hf, "dbg_hww", "FAIL -- idx=%d (<0 means add failed) removed=%d (elapsed %lld ms)", idx, (int)removed, (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -133,16 +152,19 @@ static void test_add_remove_hw_read_bp(HANDLE hf, std::atomic<int>& passed, std:
 
     uint64_t addr = get_ntdll_fn("NtClose");
     if (addr == 0) { log_msg(hf, "dbg_hwr", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_hwr inputs: addr=0x%llX type=hardware_read size=4 pid=%u",
+        (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
 
     int idx = debugger_engine::add_breakpoint(addr, debugger_engine::bp_type_t::hardware_read, "test_hwr_bp", "", 4);
     bool removed = debugger_engine::remove_breakpoint(idx);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_hwr result: add_breakpoint=>idx=%d remove_breakpoint=>%d", idx, (int)removed);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (idx >= 0 && removed) {
         log_msg(hf, "dbg_hwr", "PASS -- hw read bp idx=%d, removed ok (elapsed %lld ms)", idx, (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_hwr", "FAIL -- idx=%d removed=%d (elapsed %lld ms)", idx, removed, (long long)ms);
+        log_msg(hf, "dbg_hwr", "FAIL -- idx=%d (<0 means add failed) removed=%d (elapsed %lld ms)", idx, (int)removed, (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -151,13 +173,17 @@ static void test_toggle_breakpoint(HANDLE hf, std::atomic<int>& passed, std::ato
     log_msg(hf, "dbg_tog", "START -- toggle breakpoint on/off");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
-    if (addr == 0) { log_msg(hf, "dbg_tog", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
+    uint64_t addr = alloc_target_bp_region();
+    if (addr == 0) { log_msg(hf, "dbg_tog", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_tog inputs: addr=0x%llX type=software size=1 pid=%u",
+        (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
 
     int idx = debugger_engine::add_breakpoint(addr, debugger_engine::bp_type_t::software, "test_toggle_bp", "", 1);
     bool t1_ok = debugger_engine::toggle_breakpoint(idx);
     bool t2_ok = debugger_engine::toggle_breakpoint(idx);
     debugger_engine::remove_breakpoint(idx);
+    driver_bridge::free_memory(addr);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_tog result: idx=%d toggle1=>%d toggle2=>%d", idx, (int)t1_ok, (int)t2_ok);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (idx >= 0 && t1_ok && t2_ok) {
@@ -173,12 +199,16 @@ static void test_set_breakpoint_condition(HANDLE hf, std::atomic<int>& passed, s
     log_msg(hf, "dbg_cond", "START -- set breakpoint condition");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
-    if (addr == 0) { log_msg(hf, "dbg_cond", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
+    uint64_t addr = alloc_target_bp_region();
+    if (addr == 0) { log_msg(hf, "dbg_cond", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_cond inputs: addr=0x%llX condition='rax == 0' pid=%u",
+        (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
 
     int idx = debugger_engine::add_breakpoint(addr, debugger_engine::bp_type_t::software, "test_cond_bp", "", 1);
     bool ok = debugger_engine::set_breakpoint_condition(idx, "rax == 0");
     debugger_engine::remove_breakpoint(idx);
+    driver_bridge::free_memory(addr);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_cond result: idx=%d set_breakpoint_condition=>%d", idx, (int)ok);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (idx >= 0 && ok) {
@@ -194,12 +224,16 @@ static void test_set_breakpoint_log(HANDLE hf, std::atomic<int>& passed, std::at
     log_msg(hf, "dbg_log", "START -- set breakpoint log message");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
-    if (addr == 0) { log_msg(hf, "dbg_log", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
+    uint64_t addr = alloc_target_bp_region();
+    if (addr == 0) { log_msg(hf, "dbg_log", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_log inputs: addr=0x%llX log_text='hit bp' auto_continue=1 pid=%u",
+        (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
 
     int idx = debugger_engine::add_breakpoint(addr, debugger_engine::bp_type_t::software, "test_log_bp", "", 1);
-    bool ok = debugger_engine::set_breakpoint_log(idx, "hit NtClose", true);
+    bool ok = debugger_engine::set_breakpoint_log(idx, "hit bp", true);
     debugger_engine::remove_breakpoint(idx);
+    driver_bridge::free_memory(addr);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_log result: idx=%d set_breakpoint_log=>%d", idx, (int)ok);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (idx >= 0 && ok) {
@@ -215,29 +249,53 @@ static void test_snapshot_breakpoints(HANDLE hf, std::atomic<int>& passed, std::
     log_msg(hf, "dbg_snap", "START -- snapshot all breakpoints");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
-    if (addr == 0) { log_msg(hf, "dbg_snap", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
+    uint64_t addr = alloc_target_bp_region();
+    if (addr == 0) { log_msg(hf, "dbg_snap", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_snap inputs: addr=0x%llX type=software size=1 pid=%u",
+        (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
 
     int idx = debugger_engine::add_breakpoint(addr, debugger_engine::bp_type_t::software, "test_snap_bp", "", 1);
     auto bps = debugger_engine::snapshot_breakpoints();
+    bool found = false;
+    for (const auto& bp : bps) {
+        if (bp.address == addr) { found = true; break; }
+    }
     debugger_engine::remove_breakpoint(idx);
+    driver_bridge::free_memory(addr);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_snap result: idx=%d snapshot_size=%zu found_added=%d", idx, bps.size(), (int)found);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_snap", "PASS -- snapshot returned %zu breakpoints (elapsed %lld ms)", bps.size(), (long long)ms);
-    passed.fetch_add(1);
+    if (idx >= 0 && !bps.empty() && found) {
+        log_msg(hf, "dbg_snap", "PASS -- snapshot returned %zu breakpoints, added bp present (elapsed %lld ms)", bps.size(), (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_snap", "FAIL -- idx=%d snapshot_size=%zu added_bp_found=%d (snapshot must contain the just-added bp) (elapsed %lld ms)",
+            idx, bps.size(), (int)found, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_clear_all_breakpoints(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_clr", "START -- clear all breakpoints");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
-    if (addr == 0) { log_msg(hf, "dbg_clr", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
+    uint64_t a1 = alloc_target_bp_region();
+    uint64_t a2 = alloc_target_bp_region();
+    if (a1 == 0 || a2 == 0) {
+        if (a1) driver_bridge::free_memory(a1);
+        if (a2) driver_bridge::free_memory(a2);
+        log_msg(hf, "dbg_clr", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)"); failed.fetch_add(1); return;
+    }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_clr inputs: addr1=0x%llX addr2=0x%llX pid=%u",
+        (unsigned long long)a1, (unsigned long long)a2, (unsigned)driver_bridge::attached_pid());
 
-    debugger_engine::add_breakpoint(addr, debugger_engine::bp_type_t::software, "test_clr1", "", 1);
-    debugger_engine::add_breakpoint(addr + 16, debugger_engine::bp_type_t::software, "test_clr2", "", 1);
+    debugger_engine::add_breakpoint(a1, debugger_engine::bp_type_t::software, "test_clr1", "", 1);
+    debugger_engine::add_breakpoint(a2, debugger_engine::bp_type_t::software, "test_clr2", "", 1);
     debugger_engine::clear_all_breakpoints();
     auto bps = debugger_engine::snapshot_breakpoints();
+    driver_bridge::free_memory(a1);
+    driver_bridge::free_memory(a2);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_clr result: snapshot_size_after_clear=%zu", bps.size());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (bps.empty()) {
@@ -253,49 +311,94 @@ static void test_get_registers(HANDLE hf, std::atomic<int>& passed, std::atomic<
     log_msg(hf, "dbg_reg", "START -- get registers");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_reg inputs: get_registers() driver_loaded=%d attached_pid=%u",
+        (int)driver_bridge::is_loaded(), (unsigned)driver_bridge::attached_pid());
+
     auto regs = debugger_engine::get_registers();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 
-    log_msg(hf, "dbg_reg", "PASS -- rax=0x%llX rbx=0x%llX rcx=0x%llX rdx=0x%llX rip=0x%llX rflags=0x%llX (elapsed %lld ms)",
-        (unsigned long long)regs.rax, (unsigned long long)regs.rbx,
-        (unsigned long long)regs.rcx, (unsigned long long)regs.rdx,
-        (unsigned long long)regs.rip, (unsigned long long)regs.rflags,
-        (long long)ms);
-    passed.fetch_add(1);
+    diag::log_tagged_fmt("test_dbg_detail",
+        "dbg_reg result: rip=0x%llX rsp=0x%llX rbp=0x%llX cs=0x%llX ss=0x%llX rflags=0x%llX",
+        (unsigned long long)regs.rip, (unsigned long long)regs.rsp, (unsigned long long)regs.rbp,
+        (unsigned long long)regs.cs, (unsigned long long)regs.ss, (unsigned long long)regs.rflags);
+
+    if (regs.rip != 0 && regs.rsp != 0) {
+        log_msg(hf, "dbg_reg", "PASS -- rax=0x%llX rbx=0x%llX rcx=0x%llX rdx=0x%llX rip=0x%llX rsp=0x%llX rflags=0x%llX (elapsed %lld ms)",
+            (unsigned long long)regs.rax, (unsigned long long)regs.rbx,
+            (unsigned long long)regs.rcx, (unsigned long long)regs.rdx,
+            (unsigned long long)regs.rip, (unsigned long long)regs.rsp,
+            (unsigned long long)regs.rflags, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_reg", "FAIL -- live thread cannot have rip=0x%llX rsp=0x%llX (both must be non-zero); engine returned empty regs (not attached or context read failed) (elapsed %lld ms)",
+            (unsigned long long)regs.rip, (unsigned long long)regs.rsp, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_cached_registers(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_creg", "START -- get cached registers");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_creg inputs: request_refresh(0) then cached_registers() driver_loaded=%d attached_pid=%u",
+        (int)driver_bridge::is_loaded(), (unsigned)driver_bridge::attached_pid());
+
+    debugger_engine::request_refresh(0);
+    Sleep(300);
     auto regs = debugger_engine::cached_registers();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 
-    log_msg(hf, "dbg_creg", "PASS -- cached rax=0x%llX rsp=0x%llX rip=0x%llX (elapsed %lld ms)",
-        (unsigned long long)regs.rax, (unsigned long long)regs.rsp,
-        (unsigned long long)regs.rip, (long long)ms);
-    passed.fetch_add(1);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_creg result: cached rip=0x%llX rsp=0x%llX rax=0x%llX",
+        (unsigned long long)regs.rip, (unsigned long long)regs.rsp, (unsigned long long)regs.rax);
+
+    if (regs.rip != 0 && regs.rsp != 0) {
+        log_msg(hf, "dbg_creg", "PASS -- cached rax=0x%llX rsp=0x%llX rip=0x%llX (elapsed %lld ms)",
+            (unsigned long long)regs.rax, (unsigned long long)regs.rsp,
+            (unsigned long long)regs.rip, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_creg", "FAIL -- cache not populated after refresh: rip=0x%llX rsp=0x%llX (both must be non-zero for a live thread) (elapsed %lld ms)",
+            (unsigned long long)regs.rip, (unsigned long long)regs.rsp, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_get_call_stack(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_stk", "START -- get call stack");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_stk inputs: get_call_stack() driver_loaded=%d attached_pid=%u",
+        (int)driver_bridge::is_loaded(), (unsigned)driver_bridge::attached_pid());
+
     auto frames = debugger_engine::get_call_stack();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 
-    log_msg(hf, "dbg_stk", "PASS -- %zu stack frames (elapsed %lld ms)", frames.size(), (long long)ms);
+    uint64_t top_addr = frames.empty() ? 0 : frames.front().address;
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_stk result: frame_count=%zu top_addr=0x%llX",
+        frames.size(), (unsigned long long)top_addr);
     for (size_t i = 0; i < frames.size() && i < 8; ++i) {
         log_msg(hf, "dbg_stk", "  frame[%zu]: addr=0x%llX ret=0x%llX module=%s func=%s",
             i, (unsigned long long)frames[i].address, (unsigned long long)frames[i].return_addr,
             frames[i].module_name.c_str(), frames[i].function_name.c_str());
     }
-    passed.fetch_add(1);
+
+    if (!frames.empty() && top_addr != 0) {
+        log_msg(hf, "dbg_stk", "PASS -- %zu stack frames, top addr=0x%llX (elapsed %lld ms)",
+            frames.size(), (unsigned long long)top_addr, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_stk", "FAIL -- call stack empty (frames=%zu top_addr=0x%llX); a live thread always yields >=1 frame at RIP (elapsed %lld ms)",
+            frames.size(), (unsigned long long)top_addr, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_get_memory_map(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_mmap", "START -- get memory map");
     auto t0 = std::chrono::steady_clock::now();
+
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_mmap inputs: get_memory_map() driver_loaded=%d attached_pid=%u",
+        (int)driver_bridge::is_loaded(), (unsigned)driver_bridge::attached_pid());
 
     auto regions = debugger_engine::get_memory_map();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
@@ -305,43 +408,61 @@ static void test_get_memory_map(HANDLE hf, std::atomic<int>& passed, std::atomic
         uint32_t prot = r.protect & 0xFF;
         if (prot == 0x10 || prot == 0x20 || prot == 0x40 || prot == 0x80) exec_count++;
     }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_mmap result: region_count=%zu exec_count=%zu", regions.size(), exec_count);
 
-    log_msg(hf, "dbg_mmap", "PASS -- %zu regions total, %zu executable (elapsed %lld ms)",
-        regions.size(), exec_count, (long long)ms);
-    passed.fetch_add(1);
+    if (!regions.empty()) {
+        log_msg(hf, "dbg_mmap", "PASS -- %zu regions total, %zu executable (elapsed %lld ms)",
+            regions.size(), exec_count, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_mmap", "FAIL -- memory map empty (0 regions); an attached live process always has mapped regions (elapsed %lld ms)", (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_get_thread_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_thr", "START -- get thread list");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_thr inputs: request_thread_refresh(0) then cached_thread_list() driver_loaded=%d attached_pid=%u",
+        (int)driver_bridge::is_loaded(), (unsigned)driver_bridge::attached_pid());
+
     debugger_engine::request_thread_refresh(0);
-    Sleep(200);
+    Sleep(300);
     auto threads = debugger_engine::cached_thread_list();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 
-    log_msg(hf, "dbg_thr", "PASS -- %zu threads (elapsed %lld ms)", threads.size(), (long long)ms);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_thr result: thread_count=%zu", threads.size());
     for (size_t i = 0; i < threads.size() && i < 10; ++i) {
         log_msg(hf, "dbg_thr", "  thread[%zu]: tid=%u pid=%u priority=%d state=%u rip=0x%llX",
             i, threads[i].tid, threads[i].owner_pid, threads[i].priority,
             threads[i].state, (unsigned long long)threads[i].rip);
     }
-    passed.fetch_add(1);
+
+    if (!threads.empty()) {
+        log_msg(hf, "dbg_thr", "PASS -- %zu threads (elapsed %lld ms)", threads.size(), (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_thr", "FAIL -- thread list empty (0 threads); every process has >=1 thread (elapsed %lld ms)", (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_add_remove_watch(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_wat", "START -- add and remove watch expression");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_wat inputs: add_watch('rax') then remove_watch");
     int idx = debugger_engine::add_watch("rax");
     bool removed = debugger_engine::remove_watch(idx);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_wat result: add_watch=>idx=%d remove_watch=>%d", idx, (int)removed);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (idx >= 0 && removed) {
         log_msg(hf, "dbg_wat", "PASS -- watch idx=%d, removed ok (elapsed %lld ms)", idx, (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_wat", "FAIL -- idx=%d removed=%d (elapsed %lld ms)", idx, removed, (long long)ms);
+        log_msg(hf, "dbg_wat", "FAIL -- idx=%d (<0 means add failed) removed=%d (elapsed %lld ms)", idx, (int)removed, (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -350,38 +471,88 @@ static void test_refresh_watches(HANDLE hf, std::atomic<int>& passed, std::atomi
     log_msg(hf, "dbg_wrfr", "START -- refresh watches");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_wrfr inputs: add_watch('rsp') refresh_watches() driver_loaded=%d attached_pid=%u",
+        (int)driver_bridge::is_loaded(), (unsigned)driver_bridge::attached_pid());
+
     int idx = debugger_engine::add_watch("rsp");
     debugger_engine::refresh_watches();
+
+    auto watches = debugger_engine::snapshot_watches();
+    bool evaluated = false;
+    std::string value;
+    std::string error;
+    for (const auto& w : watches) {
+        if (w.expression == "rsp") {
+            evaluated = w.valid && !w.value.empty() && w.error.empty();
+            value = w.value;
+            error = w.error;
+            break;
+        }
+    }
     debugger_engine::remove_watch(idx);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_wrfr result: idx=%d valid_value='%s' error='%s'",
+        idx, value.c_str(), error.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_wrfr", "PASS -- refresh_watches completed (elapsed %lld ms)", (long long)ms);
-    passed.fetch_add(1);
+    if (idx >= 0 && evaluated) {
+        log_msg(hf, "dbg_wrfr", "PASS -- 'rsp' watch evaluated to \"%s\" (elapsed %lld ms)", value.c_str(), (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_wrfr", "FAIL -- idx=%d watch not evaluated value=\"%s\" error=\"%s\" (rsp must resolve on a live target) (elapsed %lld ms)",
+            idx, value.c_str(), error.c_str(), (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_snapshot_watches(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_wsn", "START -- snapshot watches");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_wsn inputs: add_watch('rbp') then snapshot_watches()");
     int idx = debugger_engine::add_watch("rbp");
     auto watches = debugger_engine::snapshot_watches();
+    bool found = false;
+    for (const auto& w : watches) {
+        if (w.expression == "rbp") { found = true; break; }
+    }
     debugger_engine::remove_watch(idx);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_wsn result: idx=%d snapshot_size=%zu found_added=%d", idx, watches.size(), (int)found);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_wsn", "PASS -- snapshot returned %zu watches (elapsed %lld ms)", watches.size(), (long long)ms);
-    passed.fetch_add(1);
+    if (idx >= 0 && !watches.empty() && found) {
+        log_msg(hf, "dbg_wsn", "PASS -- snapshot returned %zu watches, added watch present (elapsed %lld ms)", watches.size(), (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_wsn", "FAIL -- idx=%d snapshot_size=%zu added_watch_found=%d (snapshot must contain the just-added watch) (elapsed %lld ms)",
+            idx, watches.size(), (int)found, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_start_stop_trace(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_trc", "START -- start and stop trace");
     auto t0 = std::chrono::steady_clock::now();
 
+    debugger_engine::stop_trace();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_trc inputs: start_trace(1000) then stop_trace()");
+
     bool started = debugger_engine::start_trace(1000);
+    bool tracing_active = debugger_engine::g_state.tracing.load();
     bool stopped = debugger_engine::stop_trace();
+    bool tracing_cleared = !debugger_engine::g_state.tracing.load();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_trc result: start=>%d tracing_active=%d stop=>%d tracing_cleared=%d",
+        (int)started, (int)tracing_active, (int)stopped, (int)tracing_cleared);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_trc", "PASS -- start=%d stop=%d (elapsed %lld ms)", started, stopped, (long long)ms);
-    passed.fetch_add(1);
+    if (started && tracing_active && stopped && tracing_cleared) {
+        log_msg(hf, "dbg_trc", "PASS -- start=%d (tracing flag set) stop=%d (flag cleared) (elapsed %lld ms)",
+            (int)started, (int)stopped, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_trc", "FAIL -- start=%d tracing_active=%d stop=%d tracing_cleared=%d (start must set tracing, stop must clear it) (elapsed %lld ms)",
+            (int)started, (int)tracing_active, (int)stopped, (int)tracing_cleared, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_set_get_comment(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -390,10 +561,12 @@ static void test_set_get_comment(HANDLE hf, std::atomic<int>& passed, std::atomi
 
     uint64_t addr = get_ntdll_fn("NtClose");
     if (addr == 0) { log_msg(hf, "dbg_cmt", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_cmt inputs: addr=0x%llX set_comment='test_comment_12345'", (unsigned long long)addr);
 
     debugger_engine::set_comment(addr, "test_comment_12345");
     std::string got = debugger_engine::get_comment(addr);
     debugger_engine::set_comment(addr, "");
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_cmt result: get_comment=>'%s'", got.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (got == "test_comment_12345") {
@@ -411,10 +584,12 @@ static void test_set_get_label(HANDLE hf, std::atomic<int>& passed, std::atomic<
 
     uint64_t addr = get_ntdll_fn("NtClose");
     if (addr == 0) { log_msg(hf, "dbg_lbl", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_lbl inputs: addr=0x%llX set_label='test_label_67890'", (unsigned long long)addr);
 
     debugger_engine::set_label(addr, "test_label_67890");
     std::string got = debugger_engine::get_label(addr);
     debugger_engine::set_label(addr, "");
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_lbl result: get_label=>'%s'", got.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (got == "test_label_67890") {
@@ -432,18 +607,42 @@ static void test_toggle_bookmark(HANDLE hf, std::atomic<int>& passed, std::atomi
 
     uint64_t addr = get_ntdll_fn("NtClose");
     if (addr == 0) { log_msg(hf, "dbg_bkm", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_bkm inputs: addr=0x%llX toggle on then off", (unsigned long long)addr);
 
+    auto bookmark_present = [&](uint64_t a) -> bool {
+        std::lock_guard<std::mutex> lk(debugger_engine::g_state.anno_mutex);
+        for (uint64_t b : debugger_engine::g_state.bookmarks) {
+            if (b == a) return true;
+        }
+        return false;
+    };
+
+    bool before = bookmark_present(addr);
     debugger_engine::toggle_bookmark(addr);
+    bool after_on = bookmark_present(addr);
     debugger_engine::toggle_bookmark(addr);
+    bool after_off = bookmark_present(addr);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_bkm result: before=%d after_on=%d after_off=%d",
+        (int)before, (int)after_on, (int)after_off);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_bkm", "PASS -- bookmark toggled on/off (elapsed %lld ms)", (long long)ms);
-    passed.fetch_add(1);
+    if (after_on != before && after_off == before) {
+        log_msg(hf, "dbg_bkm", "PASS -- bookmark toggled on (present=%d) then off (present=%d) (elapsed %lld ms)",
+            (int)after_on, (int)after_off, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_bkm", "FAIL -- toggle did not flip state: before=%d after_on=%d after_off=%d (elapsed %lld ms)",
+            (int)before, (int)after_on, (int)after_off, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_enumerate_handles(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_hdl", "START -- enumerate handles");
     auto t0 = std::chrono::steady_clock::now();
+
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_hdl inputs: enumerate_handles() driver_loaded=%d attached_pid=%u",
+        (int)driver_bridge::is_loaded(), (unsigned)driver_bridge::attached_pid());
 
     debugger_engine::enumerate_handles();
     Sleep(500);
@@ -454,15 +653,24 @@ static void test_enumerate_handles(HANDLE hf, std::atomic<int>& passed, std::ato
         std::lock_guard<std::mutex> lk(state.handle_mutex);
         count = state.handles.size();
     }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_hdl result: handle_count=%zu", count);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_hdl", "PASS -- enumerated %zu handles (elapsed %lld ms)", count, (long long)ms);
-    passed.fetch_add(1);
+    if (count != 0) {
+        log_msg(hf, "dbg_hdl", "PASS -- enumerated %zu handles (elapsed %lld ms)", count, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_hdl", "FAIL -- 0 handles enumerated; every attached process has open handles (not attached or query failed) (elapsed %lld ms)", (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_find_strings(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_str", "START -- find strings (min_length=4)");
     auto t0 = std::chrono::steady_clock::now();
+
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_str inputs: find_strings_async(min_length=4) driver_loaded=%d attached_pid=%u",
+        (int)driver_bridge::is_loaded(), (unsigned)driver_bridge::attached_pid());
 
     debugger_engine::find_strings_async(4);
 
@@ -478,10 +686,18 @@ static void test_find_strings(HANDLE hf, std::atomic<int>& passed, std::atomic<i
         std::lock_guard<std::mutex> lk(state.strings_mutex);
         count = state.strings.size();
     }
+    uint64_t pages = state.strings_pages_scanned.load();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_str result: string_count=%zu pages_scanned=%llu", count, (unsigned long long)pages);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_str", "PASS -- found %zu strings (elapsed %lld ms)", count, (long long)ms);
-    passed.fetch_add(1);
+    if (count != 0) {
+        log_msg(hf, "dbg_str", "PASS -- found %zu strings across %llu pages (elapsed %lld ms)", count, (unsigned long long)pages, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_str", "FAIL -- 0 strings found (pages_scanned=%llu); an attached process with mapped modules contains ASCII/wide strings (elapsed %lld ms)",
+            (unsigned long long)pages, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_format_flags(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -489,7 +705,9 @@ static void test_format_flags(HANDLE hf, std::atomic<int>& passed, std::atomic<i
     auto t0 = std::chrono::steady_clock::now();
 
     uint64_t test_flags = 0x246;
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_fmt inputs: format_flags(0x%llX)", (unsigned long long)test_flags);
     std::string formatted = debugger_engine::format_flags(test_flags);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_fmt result: '%s'", formatted.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!formatted.empty()) {
@@ -506,9 +724,11 @@ static void test_format_protect(HANDLE hf, std::atomic<int>& passed, std::atomic
     log_msg(hf, "dbg_prt", "START -- format memory protection");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_prt inputs: format_protect(EXECUTE_READWRITE, READONLY, READWRITE)");
     std::string p1 = debugger_engine::format_protect(PAGE_EXECUTE_READWRITE);
     std::string p2 = debugger_engine::format_protect(PAGE_READONLY);
     std::string p3 = debugger_engine::format_protect(PAGE_READWRITE);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_prt result: p1='%s' p2='%s' p3='%s'", p1.c_str(), p2.c_str(), p3.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!p1.empty() && !p2.empty() && !p3.empty()) {
@@ -525,13 +745,28 @@ static void test_request_refresh(HANDLE hf, std::atomic<int>& passed, std::atomi
     log_msg(hf, "dbg_rfr", "START -- request refresh operations");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_rfr inputs: request_refresh(0)+request_thread_refresh(0) driver_loaded=%d attached_pid=%u",
+        (int)driver_bridge::is_loaded(), (unsigned)driver_bridge::attached_pid());
+
     debugger_engine::request_refresh(0);
     debugger_engine::request_thread_refresh(0);
-    Sleep(200);
+    Sleep(400);
+
+    auto regs = debugger_engine::cached_registers();
+    auto threads = debugger_engine::cached_thread_list();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_rfr result: cached rip=0x%llX rsp=0x%llX thread_count=%zu",
+        (unsigned long long)regs.rip, (unsigned long long)regs.rsp, threads.size());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_rfr", "PASS -- refresh requests issued (elapsed %lld ms)", (long long)ms);
-    passed.fetch_add(1);
+    if (regs.rip != 0 && regs.rsp != 0 && !threads.empty()) {
+        log_msg(hf, "dbg_rfr", "PASS -- refresh populated caches: rip=0x%llX rsp=0x%llX threads=%zu (elapsed %lld ms)",
+            (unsigned long long)regs.rip, (unsigned long long)regs.rsp, threads.size(), (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_rfr", "FAIL -- caches not populated after refresh: rip=0x%llX rsp=0x%llX threads=%zu (elapsed %lld ms)",
+            (unsigned long long)regs.rip, (unsigned long long)regs.rsp, threads.size(), (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_get_disasm_window(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -540,48 +775,86 @@ static void test_get_disasm_window(HANDLE hf, std::atomic<int>& passed, std::ato
 
     uint64_t addr = get_ntdll_fn("NtClose");
     if (addr == 0) { log_msg(hf, "dbg_dasm", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_dasm inputs: request_disasm_refresh(addr=0x%llX, max_age=0) driver_loaded=%d attached_pid=%u",
+        (unsigned long long)addr, (int)driver_bridge::is_loaded(), (unsigned)driver_bridge::attached_pid());
 
     debugger_engine::request_disasm_refresh(addr, 0);
     Sleep(300);
 
     uint64_t base_out = 0;
     auto bytes = debugger_engine::cached_disasm_window(base_out);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_dasm result: byte_count=%zu base=0x%llX", bytes.size(), (unsigned long long)base_out);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_dasm", "PASS -- disasm window %zu bytes at base 0x%llX (elapsed %lld ms)",
-        bytes.size(), (unsigned long long)base_out, (long long)ms);
-    passed.fetch_add(1);
+    if (!bytes.empty() && base_out != 0) {
+        log_msg(hf, "dbg_dasm", "PASS -- disasm window %zu bytes at base 0x%llX (elapsed %lld ms)",
+            bytes.size(), (unsigned long long)base_out, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_dasm", "FAIL -- disasm window empty: bytes=%zu base=0x%llX (target read returned no code) (elapsed %lld ms)",
+            bytes.size(), (unsigned long long)base_out, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_get_stack_bytes(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_stkb", "START -- get stack bytes");
     auto t0 = std::chrono::steady_clock::now();
 
-    auto regs = debugger_engine::cached_registers();
-    if (regs.rsp != 0) {
-        debugger_engine::request_stack_refresh(regs.rsp, 256, 0);
-        Sleep(300);
+    auto regs = debugger_engine::get_registers();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_stkb inputs: rsp=0x%llX request_stack_refresh(rsp, 256, 0) attached_pid=%u",
+        (unsigned long long)regs.rsp, (unsigned)driver_bridge::attached_pid());
+
+    if (regs.rsp == 0) {
+        auto ms0 = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        log_msg(hf, "dbg_stkb", "FAIL -- rsp is 0; cannot read stack of a live thread (not attached) (elapsed %lld ms)", (long long)ms0);
+        failed.fetch_add(1);
+        return;
     }
+
+    debugger_engine::request_stack_refresh(regs.rsp, 256, 0);
+    Sleep(300);
 
     uint64_t addr_out = 0;
     auto bytes = debugger_engine::cached_stack_bytes(addr_out);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_stkb result: byte_count=%zu addr=0x%llX", bytes.size(), (unsigned long long)addr_out);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_stkb", "PASS -- stack %zu bytes at addr 0x%llX (elapsed %lld ms)",
-        bytes.size(), (unsigned long long)addr_out, (long long)ms);
-    passed.fetch_add(1);
+    if (!bytes.empty() && addr_out != 0) {
+        log_msg(hf, "dbg_stkb", "PASS -- stack %zu bytes at addr 0x%llX (elapsed %lld ms)",
+            bytes.size(), (unsigned long long)addr_out, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_stkb", "FAIL -- stack read empty: bytes=%zu addr=0x%llX (rsp=0x%llX) (elapsed %lld ms)",
+            bytes.size(), (unsigned long long)addr_out, (unsigned long long)regs.rsp, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_last_error(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_err", "START -- last_error() accessor");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_err inputs: last_error() driver_loaded=%d attached_pid=%u",
+        (int)driver_bridge::is_loaded(), (unsigned)driver_bridge::attached_pid());
+
     const std::string& err = debugger_engine::last_error();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_err result: last_error='%s'", err.empty() ? "(empty)" : err.c_str());
+
+    bool has_fatal = (err.find("not attached") != std::string::npos)
+                  || (err.find("must be non-zero") != std::string::npos)
+                  || (err.find("<read error>") != std::string::npos);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_err", "PASS -- last_error=\"%s\" (elapsed %lld ms)",
-        err.empty() ? "(empty)" : err.c_str(), (long long)ms);
-    passed.fetch_add(1);
+    if (!has_fatal) {
+        log_msg(hf, "dbg_err", "PASS -- last_error=\"%s\" (no fatal engine error pending) (elapsed %lld ms)",
+            err.empty() ? "(empty)" : err.c_str(), (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_err", "FAIL -- engine has fatal error pending: last_error=\"%s\" (elapsed %lld ms)",
+            err.c_str(), (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_memory_access_bp(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -590,16 +863,19 @@ static void test_memory_access_bp(HANDLE hf, std::atomic<int>& passed, std::atom
 
     uint64_t addr = get_ntdll_fn("NtClose");
     if (addr == 0) { log_msg(hf, "dbg_ma", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_ma inputs: addr=0x%llX type=memory_access size=4 pid=%u",
+        (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
 
     int idx = debugger_engine::add_breakpoint(addr, debugger_engine::bp_type_t::memory_access, "test_ma_bp", "", 4);
     bool removed = debugger_engine::remove_breakpoint(idx);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_ma result: add_breakpoint=>idx=%d remove_breakpoint=>%d", idx, (int)removed);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (idx >= 0 && removed) {
         log_msg(hf, "dbg_ma", "PASS -- memory_access bp idx=%d, removed ok (elapsed %lld ms)", idx, (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_ma", "FAIL -- idx=%d removed=%d (elapsed %lld ms)", idx, removed, (long long)ms);
+        log_msg(hf, "dbg_ma", "FAIL -- idx=%d (<0 means add failed) removed=%d (elapsed %lld ms)", idx, (int)removed, (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -610,15 +886,22 @@ static void test_multiple_breakpoints(HANDLE hf, std::atomic<int>& passed, std::
 
     debugger_engine::clear_all_breakpoints();
 
-    uint64_t a1 = get_ntdll_fn("NtClose");
-    uint64_t a2 = get_ntdll_fn("NtOpenFile");
-    uint64_t a3 = get_ntdll_fn("NtCreateFile");
-    uint64_t a4 = get_ntdll_fn("NtReadFile");
+    uint64_t a1 = alloc_target_bp_region();
+    uint64_t a2 = alloc_target_bp_region();
+    uint64_t a3 = alloc_target_bp_region();
+    uint64_t a4 = alloc_target_bp_region();
     if (a1 == 0 || a2 == 0 || a3 == 0 || a4 == 0) {
-        log_msg(hf, "dbg_mbp", "FAIL -- one or more ntdll functions not found");
+        if (a1) driver_bridge::free_memory(a1);
+        if (a2) driver_bridge::free_memory(a2);
+        if (a3) driver_bridge::free_memory(a3);
+        if (a4) driver_bridge::free_memory(a4);
+        log_msg(hf, "dbg_mbp", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)");
         failed.fetch_add(1);
         return;
     }
+
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_mbp inputs: a1=0x%llX a2=0x%llX a3=0x%llX a4=0x%llX",
+        (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)a4);
 
     int i1 = debugger_engine::add_breakpoint(a1, debugger_engine::bp_type_t::software, "mbp_1", "", 1);
     int i2 = debugger_engine::add_breakpoint(a2, debugger_engine::bp_type_t::software, "mbp_2", "", 1);
@@ -633,9 +916,15 @@ static void test_multiple_breakpoints(HANDLE hf, std::atomic<int>& passed, std::
 
     auto snap2 = debugger_engine::snapshot_breakpoints();
     size_t count_after = snap2.size();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_mbp result: idx=[%d,%d,%d,%d] count_before=%zu count_after=%zu",
+        i1, i2, i3, i4, count_before, count_after);
 
     debugger_engine::remove_breakpoint(i1);
     debugger_engine::remove_breakpoint(i4);
+    driver_bridge::free_memory(a1);
+    driver_bridge::free_memory(a2);
+    driver_bridge::free_memory(a3);
+    driver_bridge::free_memory(a4);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (i1 >= 0 && i2 >= 0 && i3 >= 0 && i4 >= 0 && count_before >= 4 && count_after == count_before - 2) {
@@ -655,16 +944,19 @@ static void test_hw_bp_size_1(HANDLE hf, std::atomic<int>& passed, std::atomic<i
 
     uint64_t addr = get_ntdll_fn("NtClose");
     if (addr == 0) { log_msg(hf, "dbg_hw1", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_hw1 inputs: addr=0x%llX type=hardware_write size=1 pid=%u",
+        (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
 
     int idx = debugger_engine::add_breakpoint(addr, debugger_engine::bp_type_t::hardware_write, "hw_s1", "", 1);
     bool removed = debugger_engine::remove_breakpoint(idx);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_hw1 result: add_breakpoint=>idx=%d remove_breakpoint=>%d", idx, (int)removed);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (idx >= 0 && removed) {
         log_msg(hf, "dbg_hw1", "PASS -- 1-byte hw write bp idx=%d (elapsed %lld ms)", idx, (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_hw1", "FAIL -- idx=%d (elapsed %lld ms)", idx, (long long)ms);
+        log_msg(hf, "dbg_hw1", "FAIL -- idx=%d (<0 means add failed) removed=%d (elapsed %lld ms)", idx, (int)removed, (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -675,16 +967,19 @@ static void test_hw_bp_size_2(HANDLE hf, std::atomic<int>& passed, std::atomic<i
 
     uint64_t addr = get_ntdll_fn("NtOpenFile");
     if (addr == 0) { log_msg(hf, "dbg_hw2", "FAIL -- NtOpenFile not found"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_hw2 inputs: addr=0x%llX type=hardware_write size=2 pid=%u",
+        (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
 
     int idx = debugger_engine::add_breakpoint(addr, debugger_engine::bp_type_t::hardware_write, "hw_s2", "", 2);
     bool removed = debugger_engine::remove_breakpoint(idx);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_hw2 result: add_breakpoint=>idx=%d remove_breakpoint=>%d", idx, (int)removed);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (idx >= 0 && removed) {
         log_msg(hf, "dbg_hw2", "PASS -- 2-byte hw write bp idx=%d (elapsed %lld ms)", idx, (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_hw2", "FAIL -- idx=%d (elapsed %lld ms)", idx, (long long)ms);
+        log_msg(hf, "dbg_hw2", "FAIL -- idx=%d (<0 means add failed) removed=%d (elapsed %lld ms)", idx, (int)removed, (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -695,16 +990,19 @@ static void test_hw_bp_size_8(HANDLE hf, std::atomic<int>& passed, std::atomic<i
 
     uint64_t addr = get_ntdll_fn("NtCreateFile");
     if (addr == 0) { log_msg(hf, "dbg_hw8", "FAIL -- NtCreateFile not found"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_hw8 inputs: addr=0x%llX type=hardware_write size=8 pid=%u",
+        (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
 
     int idx = debugger_engine::add_breakpoint(addr, debugger_engine::bp_type_t::hardware_write, "hw_s8", "", 8);
     bool removed = debugger_engine::remove_breakpoint(idx);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_hw8 result: add_breakpoint=>idx=%d remove_breakpoint=>%d", idx, (int)removed);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (idx >= 0 && removed) {
         log_msg(hf, "dbg_hw8", "PASS -- 8-byte hw write bp idx=%d (elapsed %lld ms)", idx, (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_hw8", "FAIL -- idx=%d (elapsed %lld ms)", idx, (long long)ms);
+        log_msg(hf, "dbg_hw8", "FAIL -- idx=%d (<0 means add failed) removed=%d (elapsed %lld ms)", idx, (int)removed, (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -713,74 +1011,163 @@ static void test_set_register(HANDLE hf, std::atomic<int>& passed, std::atomic<i
     log_msg(hf, "dbg_sreg", "START -- set_register API call");
     auto t0 = std::chrono::steady_clock::now();
 
-    bool ok = debugger_engine::set_register("rax", 0x41414141);
+    const uint64_t test_val = 0x41414141ULL;
+    auto before = debugger_engine::get_registers();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_sreg inputs: set_register('rax', 0x%llX) before_rax=0x%llX attached_pid=%u",
+        (unsigned long long)test_val, (unsigned long long)before.rax, (unsigned)driver_bridge::attached_pid());
+
+    bool ok = debugger_engine::set_register("rax", test_val);
+    std::string err = debugger_engine::last_error();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_sreg result: set_register=>%d last_error='%s' (return value is the authoritative kernel set_thread_context confirmation)",
+        (int)ok, err.c_str());
+
+    if (ok) {
+        debugger_engine::set_register("rax", before.rax);
+    }
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_sreg", "PASS -- set_register(rax, 0x41414141) returned %d (elapsed %lld ms)",
-        (int)ok, (long long)ms);
-    passed.fetch_add(1);
+    if (ok) {
+        log_msg(hf, "dbg_sreg", "PASS -- set_register(rax, 0x%llX) succeeded (kernel set_thread_context confirmed), original 0x%llX restored (elapsed %lld ms)",
+            (unsigned long long)test_val, (unsigned long long)before.rax, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_sreg", "FAIL -- set_register returned 0; last_error=\"%s\" (not attached or kernel context write failed) (elapsed %lld ms)",
+            err.empty() ? "(none)" : err.c_str(), (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_step_into(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "dbg_si", "START -- step_into API exists");
+    log_msg(hf, "dbg_si", "START -- step_into single-step");
     auto t0 = std::chrono::steady_clock::now();
 
+    auto before = debugger_engine::get_registers();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_si inputs: step_into() before_rip=0x%llX attached_pid=%u",
+        (unsigned long long)before.rip, (unsigned)driver_bridge::attached_pid());
+
     bool ok = debugger_engine::step_into();
+    auto after = debugger_engine::get_registers();
+    std::string err = debugger_engine::last_error();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_si result: step_into=>%d before_rip=0x%llX after_rip=0x%llX last_error='%s'",
+        (int)ok, (unsigned long long)before.rip, (unsigned long long)after.rip, err.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_si", "PASS -- step_into returned %d (no target attached expected) (elapsed %lld ms)",
-        (int)ok, (long long)ms);
-    passed.fetch_add(1);
+    if (ok && after.rip != 0) {
+        log_msg(hf, "dbg_si", "PASS -- step_into advanced rip 0x%llX -> 0x%llX (elapsed %lld ms)",
+            (unsigned long long)before.rip, (unsigned long long)after.rip, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_si", "FAIL -- step_into returned %d (after_rip=0x%llX); last_error=\"%s\" (elapsed %lld ms)",
+            (int)ok, (unsigned long long)after.rip, err.empty() ? "(none)" : err.c_str(), (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_step_over(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "dbg_so", "START -- step_over API exists");
+    log_msg(hf, "dbg_so", "START -- step_over");
     auto t0 = std::chrono::steady_clock::now();
 
+    auto before = debugger_engine::get_registers();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_so inputs: step_over() before_rip=0x%llX attached_pid=%u",
+        (unsigned long long)before.rip, (unsigned)driver_bridge::attached_pid());
+
     bool ok = debugger_engine::step_over();
+    auto after = debugger_engine::get_registers();
+    std::string err = debugger_engine::last_error();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_so result: step_over=>%d before_rip=0x%llX after_rip=0x%llX last_error='%s'",
+        (int)ok, (unsigned long long)before.rip, (unsigned long long)after.rip, err.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_so", "PASS -- step_over returned %d (elapsed %lld ms)", (int)ok, (long long)ms);
-    passed.fetch_add(1);
+    if (ok && after.rip != 0) {
+        log_msg(hf, "dbg_so", "PASS -- step_over completed, rip 0x%llX -> 0x%llX (elapsed %lld ms)",
+            (unsigned long long)before.rip, (unsigned long long)after.rip, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_so", "FAIL -- step_over returned %d (after_rip=0x%llX); last_error=\"%s\" (elapsed %lld ms)",
+            (int)ok, (unsigned long long)after.rip, err.empty() ? "(none)" : err.c_str(), (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_step_out(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "dbg_sout", "START -- step_out API exists");
+    log_msg(hf, "dbg_sout", "START -- step_out");
     auto t0 = std::chrono::steady_clock::now();
 
+    auto before = debugger_engine::get_registers();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_sout inputs: step_out() before_rip=0x%llX before_rsp=0x%llX attached_pid=%u",
+        (unsigned long long)before.rip, (unsigned long long)before.rsp, (unsigned)driver_bridge::attached_pid());
+
     bool ok = debugger_engine::step_out();
+    auto after = debugger_engine::get_registers();
+    std::string err = debugger_engine::last_error();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_sout result: step_out=>%d after_rip=0x%llX last_error='%s'",
+        (int)ok, (unsigned long long)after.rip, err.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_sout", "PASS -- step_out returned %d (elapsed %lld ms)", (int)ok, (long long)ms);
-    passed.fetch_add(1);
+    if (ok && after.rip != 0) {
+        log_msg(hf, "dbg_sout", "PASS -- step_out completed, rip now 0x%llX (elapsed %lld ms)",
+            (unsigned long long)after.rip, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_sout", "FAIL -- step_out returned %d (after_rip=0x%llX); last_error=\"%s\" (elapsed %lld ms)",
+            (int)ok, (unsigned long long)after.rip, err.empty() ? "(none)" : err.c_str(), (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_run_target(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "dbg_run", "START -- run_target API exists");
+    log_msg(hf, "dbg_run", "START -- run_target resumes target threads");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_run inputs: run_target() driver_loaded=%d attached_pid=%u",
+        (int)driver_bridge::is_loaded(), (unsigned)driver_bridge::attached_pid());
+
     bool ok = debugger_engine::run_target();
+    std::string err = debugger_engine::last_error();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_run result: run_target=>%d status=%d last_error='%s'",
+        (int)ok, (int)debugger_engine::g_state.status.load(), err.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_run", "PASS -- run_target returned %d (elapsed %lld ms)", (int)ok, (long long)ms);
-    passed.fetch_add(1);
+    if (ok) {
+        log_msg(hf, "dbg_run", "PASS -- run_target resumed target threads (elapsed %lld ms)", (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_run", "FAIL -- run_target returned 0; last_error=\"%s\" (not attached) (elapsed %lld ms)",
+            err.empty() ? "(none)" : err.c_str(), (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_pause_target(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "dbg_pause", "START -- pause_target API exists");
+    log_msg(hf, "dbg_pause", "START -- pause_target suspends target threads");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_pause inputs: pause_target() driver_loaded=%d attached_pid=%u",
+        (int)driver_bridge::is_loaded(), (unsigned)driver_bridge::attached_pid());
+
     bool ok = debugger_engine::pause_target();
+    std::string err = debugger_engine::last_error();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_pause result: pause_target=>%d status=%d last_error='%s'",
+        (int)ok, (int)debugger_engine::g_state.status.load(), err.c_str());
+
+    debugger_engine::run_target();
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_pause", "PASS -- pause_target returned %d (elapsed %lld ms)", (int)ok, (long long)ms);
-    passed.fetch_add(1);
+    if (ok) {
+        log_msg(hf, "dbg_pause", "PASS -- pause_target suspended target threads (elapsed %lld ms)", (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_pause", "FAIL -- pause_target returned 0; last_error=\"%s\" (not attached) (elapsed %lld ms)",
+            err.empty() ? "(none)" : err.c_str(), (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_multiple_watches(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_mw", "START -- add multiple watch expressions");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_mw inputs: add_watch x5 ('rax','rbx','rcx + rdx','rsp - 0x100','[rsp]')");
     int w1 = debugger_engine::add_watch("rax");
     int w2 = debugger_engine::add_watch("rbx");
     int w3 = debugger_engine::add_watch("rcx + rdx");
@@ -789,6 +1176,7 @@ static void test_multiple_watches(HANDLE hf, std::atomic<int>& passed, std::atom
 
     auto snap = debugger_engine::snapshot_watches();
     size_t count = snap.size();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_mw result: idx=[%d,%d,%d,%d,%d] snapshot_size=%zu", w1, w2, w3, w4, w5, count);
 
     debugger_engine::remove_watch(w1);
     debugger_engine::remove_watch(w2);
@@ -812,6 +1200,9 @@ static void test_trace_with_depth(HANDLE hf, std::atomic<int>& passed, std::atom
     log_msg(hf, "dbg_trd", "START -- start trace with different max_instructions values");
     auto t0 = std::chrono::steady_clock::now();
 
+    debugger_engine::stop_trace();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_trd inputs: start_trace depths {100, 10000, 50000}, each paired with stop_trace");
+
     bool s1 = debugger_engine::start_trace(100);
     debugger_engine::stop_trace();
 
@@ -820,20 +1211,31 @@ static void test_trace_with_depth(HANDLE hf, std::atomic<int>& passed, std::atom
 
     bool s3 = debugger_engine::start_trace(50000);
     debugger_engine::stop_trace();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_trd result: start_trace depth100=>%d depth10000=>%d depth50000=>%d",
+        (int)s1, (int)s2, (int)s3);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_trd", "PASS -- trace depth 100=%d 10000=%d 50000=%d (elapsed %lld ms)",
-        (int)s1, (int)s2, (int)s3, (long long)ms);
-    passed.fetch_add(1);
+    if (s1 && s2 && s3) {
+        log_msg(hf, "dbg_trd", "PASS -- trace depth 100=%d 10000=%d 50000=%d (all started) (elapsed %lld ms)",
+            (int)s1, (int)s2, (int)s3, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_trd", "FAIL -- start_trace failed for one or more depths: 100=%d 10000=%d 50000=%d (elapsed %lld ms)",
+            (int)s1, (int)s2, (int)s3, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_trace_result_inspection(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_tri", "START -- trace result buffer inspection");
     auto t0 = std::chrono::steady_clock::now();
 
-    debugger_engine::start_trace(500);
-    Sleep(100);
     debugger_engine::stop_trace();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_tri inputs: start_trace(500) then inspect g_state.trace_log");
+
+    bool started = debugger_engine::start_trace(500);
+    Sleep(100);
+    bool stopped = debugger_engine::stop_trace();
 
     auto& state = debugger_engine::g_state;
     size_t trace_count = 0;
@@ -841,11 +1243,19 @@ static void test_trace_result_inspection(HANDLE hf, std::atomic<int>& passed, st
         std::lock_guard<std::mutex> lk(state.trace_mutex);
         trace_count = state.trace_log.size();
     }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_tri result: start=>%d stop=>%d trace_log_size=%zu",
+        (int)started, (int)stopped, trace_count);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_tri", "PASS -- trace_log contains %zu records (elapsed %lld ms)",
-        trace_count, (long long)ms);
-    passed.fetch_add(1);
+    if (started && stopped) {
+        log_msg(hf, "dbg_tri", "PASS -- trace engaged and buffer accessible: %zu records (0 expected without stepping) (elapsed %lld ms)",
+            trace_count, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_tri", "FAIL -- trace control failed: start=%d stop=%d (elapsed %lld ms)",
+            (int)started, (int)stopped, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_comment_multiple_addresses(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -861,6 +1271,9 @@ static void test_comment_multiple_addresses(HANDLE hf, std::atomic<int>& passed,
         return;
     }
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_cmt2 inputs: a1=0x%llX a2=0x%llX a3=0x%llX",
+        (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3);
+
     debugger_engine::set_comment(a1, "comment_alpha");
     debugger_engine::set_comment(a2, "comment_beta");
     debugger_engine::set_comment(a3, "comment_gamma");
@@ -872,6 +1285,7 @@ static void test_comment_multiple_addresses(HANDLE hf, std::atomic<int>& passed,
     debugger_engine::set_comment(a1, "");
     debugger_engine::set_comment(a2, "");
     debugger_engine::set_comment(a3, "");
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_cmt2 result: c1='%s' c2='%s' c3='%s'", c1.c_str(), c2.c_str(), c3.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (c1 == "comment_alpha" && c2 == "comment_beta" && c3 == "comment_gamma") {
@@ -896,6 +1310,8 @@ static void test_label_multiple_addresses(HANDLE hf, std::atomic<int>& passed, s
         return;
     }
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_lbl2 inputs: a1=0x%llX a2=0x%llX", (unsigned long long)a1, (unsigned long long)a2);
+
     debugger_engine::set_label(a1, "label_first");
     debugger_engine::set_label(a2, "label_second");
 
@@ -904,6 +1320,7 @@ static void test_label_multiple_addresses(HANDLE hf, std::atomic<int>& passed, s
 
     debugger_engine::set_label(a1, "");
     debugger_engine::set_label(a2, "");
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_lbl2 result: l1='%s' l2='%s'", l1.c_str(), l2.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (l1 == "label_first" && l2 == "label_second") {
@@ -921,10 +1338,12 @@ static void test_label_lookup_by_name(HANDLE hf, std::atomic<int>& passed, std::
 
     uint64_t addr = get_ntdll_fn("NtReadFile");
     if (addr == 0) { log_msg(hf, "dbg_llkp", "FAIL -- NtReadFile not found"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_llkp inputs: addr=0x%llX set_label='label_lookup_test_xyzzy'", (unsigned long long)addr);
 
     debugger_engine::set_label(addr, "label_lookup_test_xyzzy");
     std::string got = debugger_engine::get_label(addr);
     debugger_engine::set_label(addr, "");
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_llkp result: get_label=>'%s'", got.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (got == "label_lookup_test_xyzzy") {
@@ -950,6 +1369,9 @@ static void test_bookmark_listing(HANDLE hf, std::atomic<int>& passed, std::atom
         return;
     }
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_bklst inputs: toggle_bookmark a1=0x%llX a2=0x%llX a3=0x%llX",
+        (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3);
+
     debugger_engine::toggle_bookmark(a1);
     debugger_engine::toggle_bookmark(a2);
     debugger_engine::toggle_bookmark(a3);
@@ -963,6 +1385,7 @@ static void test_bookmark_listing(HANDLE hf, std::atomic<int>& passed, std::atom
     debugger_engine::toggle_bookmark(a1);
     debugger_engine::toggle_bookmark(a2);
     debugger_engine::toggle_bookmark(a3);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_bklst result: bookmark_count_after_3=%zu", count);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (count >= 3) {
@@ -978,6 +1401,8 @@ static void test_memory_map_executable_filter(HANDLE hf, std::atomic<int>& passe
     log_msg(hf, "dbg_mmex", "START -- memory map filter executable regions");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_mmex inputs: get_memory_map() attached_pid=%u", (unsigned)driver_bridge::attached_pid());
+
     auto regions = debugger_engine::get_memory_map();
     size_t exec_count = 0;
     size_t write_count = 0;
@@ -988,29 +1413,41 @@ static void test_memory_map_executable_filter(HANDLE hf, std::atomic<int>& passe
         if (prot == 0x04 || prot == 0x08 || prot == 0x40 || prot == 0x80) write_count++;
         if (prot & 0x100) guard_count++;
     }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_mmex result: region_count=%zu exec=%zu writable=%zu guard=%zu",
+        regions.size(), exec_count, write_count, guard_count);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_mmex", "PASS -- %zu regions: exec=%zu writable=%zu guard=%zu (elapsed %lld ms)",
-        regions.size(), exec_count, write_count, guard_count, (long long)ms);
-    passed.fetch_add(1);
+    if (!regions.empty() && exec_count != 0) {
+        log_msg(hf, "dbg_mmex", "PASS -- %zu regions: exec=%zu writable=%zu guard=%zu (elapsed %lld ms)",
+            regions.size(), exec_count, write_count, guard_count, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_mmex", "FAIL -- memory map invalid: regions=%zu exec=%zu (an attached process always has mapped + executable regions) (elapsed %lld ms)",
+            regions.size(), exec_count, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_format_protect_guard(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_fpg", "START -- format_protect with GUARD pages");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_fpg inputs: format_protect(EXECUTE_READ, NOACCESS, GUARD|READWRITE, WRITECOPY)");
     std::string p1 = debugger_engine::format_protect(PAGE_EXECUTE_READ);
     std::string p2 = debugger_engine::format_protect(PAGE_NOACCESS);
     std::string p3 = debugger_engine::format_protect(PAGE_GUARD | PAGE_READWRITE);
     std::string p4 = debugger_engine::format_protect(PAGE_WRITECOPY);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_fpg result: p1='%s' p2='%s' p3='%s' p4='%s'",
+        p1.c_str(), p2.c_str(), p3.c_str(), p4.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (!p1.empty() && !p2.empty()) {
+    if (!p1.empty() && !p2.empty() && !p3.empty() && !p4.empty()) {
         log_msg(hf, "dbg_fpg", "PASS -- ER=\"%s\" NA=\"%s\" G|RW=\"%s\" WC=\"%s\" (elapsed %lld ms)",
             p1.c_str(), p2.c_str(), p3.c_str(), p4.c_str(), (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_fpg", "FAIL -- format_protect returned empty (elapsed %lld ms)", (long long)ms);
+        log_msg(hf, "dbg_fpg", "FAIL -- format_protect returned empty: p1=\"%s\" p2=\"%s\" p3=\"%s\" p4=\"%s\" (elapsed %lld ms)",
+            p1.c_str(), p2.c_str(), p3.c_str(), p4.c_str(), (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -1019,43 +1456,77 @@ static void test_format_flags_zero(HANDLE hf, std::atomic<int>& passed, std::ato
     log_msg(hf, "dbg_ff0", "START -- format_flags with zero and various flag combos");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_ff0 inputs: format_flags(0x0, 0x202, 0x246, 0x297)");
     std::string f0 = debugger_engine::format_flags(0);
     std::string f1 = debugger_engine::format_flags(0x202);
     std::string f2 = debugger_engine::format_flags(0x246);
     std::string f3 = debugger_engine::format_flags(0x297);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_ff0 result: f0='%s' f1='%s' f2='%s' f3='%s'",
+        f0.c_str(), f1.c_str(), f2.c_str(), f3.c_str());
+
+    bool f1_has_if = f1.find("IF") != std::string::npos;
+    bool f2_has_zf = f2.find("ZF") != std::string::npos;
+    bool f3_has_cf = f3.find("CF") != std::string::npos;
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_ff0", "PASS -- 0x0=\"%s\" 0x202=\"%s\" 0x246=\"%s\" 0x297=\"%s\" (elapsed %lld ms)",
-        f0.c_str(), f1.c_str(), f2.c_str(), f3.c_str(), (long long)ms);
-    passed.fetch_add(1);
+    if (f0.empty() && !f1.empty() && !f2.empty() && !f3.empty() && f1_has_if && f2_has_zf && f3_has_cf) {
+        log_msg(hf, "dbg_ff0", "PASS -- 0x0=\"%s\" 0x202=\"%s\" 0x246=\"%s\" 0x297=\"%s\" (elapsed %lld ms)",
+            f0.c_str(), f1.c_str(), f2.c_str(), f3.c_str(), (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_ff0", "FAIL -- format_flags wrong: 0x0=\"%s\"(want empty) 0x202=\"%s\"(want IF) 0x246=\"%s\"(want ZF) 0x297=\"%s\"(want CF) (elapsed %lld ms)",
+            f0.c_str(), f1.c_str(), f2.c_str(), f3.c_str(), (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_format_segment_registers(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_seg", "START -- read segment registers CS/DS/SS/ES/FS/GS");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_seg inputs: get_registers() (cs/ss populated from kernel thread context) attached_pid=%u",
+        (unsigned)driver_bridge::attached_pid());
     auto regs = debugger_engine::get_registers();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_seg result: cs=0x%llX ss=0x%llX (ds/es/fs/gs not provided by driver context)",
+        (unsigned long long)regs.cs, (unsigned long long)regs.ss);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_seg", "PASS -- cs=0x%llX ds=0x%llX ss=0x%llX es=0x%llX fs=0x%llX gs=0x%llX (elapsed %lld ms)",
-        (unsigned long long)regs.cs, (unsigned long long)regs.ds, (unsigned long long)regs.ss,
-        (unsigned long long)regs.es, (unsigned long long)regs.fs, (unsigned long long)regs.gs,
-        (long long)ms);
-    passed.fetch_add(1);
+    if (regs.cs != 0 && regs.ss != 0) {
+        log_msg(hf, "dbg_seg", "PASS -- cs=0x%llX ds=0x%llX ss=0x%llX es=0x%llX fs=0x%llX gs=0x%llX (elapsed %lld ms)",
+            (unsigned long long)regs.cs, (unsigned long long)regs.ds, (unsigned long long)regs.ss,
+            (unsigned long long)regs.es, (unsigned long long)regs.fs, (unsigned long long)regs.gs,
+            (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_seg", "FAIL -- segment regs all zero: cs=0x%llX ss=0x%llX (a live x64 user thread always has non-zero cs and ss; engine returned empty regs) (elapsed %lld ms)",
+            (unsigned long long)regs.cs, (unsigned long long)regs.ss, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_debug_registers(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_dreg", "START -- read debug registers DR0-DR3, DR6, DR7");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_dreg inputs: get_registers() (DR0-DR3/DR6/DR7) attached_pid=%u",
+        (unsigned)driver_bridge::attached_pid());
     auto regs = debugger_engine::get_registers();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_dreg result: rip=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
+        (unsigned long long)regs.rip, (unsigned long long)regs.dr0, (unsigned long long)regs.dr1, (unsigned long long)regs.dr2,
+        (unsigned long long)regs.dr3, (unsigned long long)regs.dr6, (unsigned long long)regs.dr7);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_dreg", "PASS -- dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX (elapsed %lld ms)",
-        (unsigned long long)regs.dr0, (unsigned long long)regs.dr1, (unsigned long long)regs.dr2,
-        (unsigned long long)regs.dr3, (unsigned long long)regs.dr6, (unsigned long long)regs.dr7,
-        (long long)ms);
-    passed.fetch_add(1);
+    if (regs.rip != 0 && regs.rsp != 0) {
+        log_msg(hf, "dbg_dreg", "PASS -- debug-register read succeeded: dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX (elapsed %lld ms)",
+            (unsigned long long)regs.dr0, (unsigned long long)regs.dr1, (unsigned long long)regs.dr2,
+            (unsigned long long)regs.dr3, (unsigned long long)regs.dr6, (unsigned long long)regs.dr7,
+            (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_dreg", "FAIL -- debug-register read failed: thread context not read (rip=0x%llX rsp=0x%llX must be non-zero) (elapsed %lld ms)",
+            (unsigned long long)regs.rip, (unsigned long long)regs.rsp, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_request_dump_refresh(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -1064,6 +1535,8 @@ static void test_request_dump_refresh(HANDLE hf, std::atomic<int>& passed, std::
 
     uint64_t addr = get_ntdll_fn("NtClose");
     if (addr == 0) { log_msg(hf, "dbg_dump", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_dump inputs: request_dump_refresh(addr=0x%llX, bytes=128, max_age=0) attached_pid=%u",
+        (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
 
     debugger_engine::request_dump_refresh(addr, 128, 0);
     Sleep(300);
@@ -1071,17 +1544,26 @@ static void test_request_dump_refresh(HANDLE hf, std::atomic<int>& passed, std::
     uint64_t addr_out = 0;
     size_t size_out = 0;
     auto bytes = debugger_engine::cached_dump_bytes(addr_out, size_out);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_dump result: byte_count=%zu addr=0x%llX requested_size=%zu",
+        bytes.size(), (unsigned long long)addr_out, size_out);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_dump", "PASS -- dump %zu bytes at 0x%llX size=%zu (elapsed %lld ms)",
-        bytes.size(), (unsigned long long)addr_out, size_out, (long long)ms);
-    passed.fetch_add(1);
+    if (!bytes.empty() && addr_out != 0) {
+        log_msg(hf, "dbg_dump", "PASS -- dump %zu bytes at 0x%llX size=%zu (elapsed %lld ms)",
+            bytes.size(), (unsigned long long)addr_out, size_out, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_dump", "FAIL -- dump read empty: bytes=%zu addr=0x%llX (target memory read returned no data) (elapsed %lld ms)",
+            bytes.size(), (unsigned long long)addr_out, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_invalidate_cache(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_inv", "START -- invalidate_cache resets timestamps");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_inv inputs: invalidate_cache()");
     debugger_engine::invalidate_cache();
 
     uint64_t lr = debugger_engine::g_state.last_refresh_ms.load();
@@ -1089,6 +1571,8 @@ static void test_invalidate_cache(HANDLE hf, std::atomic<int>& passed, std::atom
     uint64_t ls = debugger_engine::g_state.last_stack_refresh_ms.load();
     uint64_t ld = debugger_engine::g_state.last_dump_refresh_ms.load();
     uint64_t lda = debugger_engine::g_state.last_disasm_refresh_ms.load();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_inv result: last_refresh=%llu thread=%llu stack=%llu dump=%llu disasm=%llu",
+        (unsigned long long)lr, (unsigned long long)lt, (unsigned long long)ls, (unsigned long long)ld, (unsigned long long)lda);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (lr == 0 && lt == 0 && ls == 0 && ld == 0 && lda == 0) {
@@ -1107,8 +1591,11 @@ static void test_signal_trap(HANDLE hf, std::atomic<int>& passed, std::atomic<in
     auto t0 = std::chrono::steady_clock::now();
 
     uint64_t trap_addr = 0xDEADCAFE00000001ULL;
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_trap inputs: signal_trap(0x%llX) then wait_for_trap(0x%llX, 1000ms)",
+        (unsigned long long)trap_addr, (unsigned long long)trap_addr);
     debugger_engine::signal_trap(trap_addr);
     bool caught = debugger_engine::wait_for_trap(trap_addr, 1000);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_trap result: wait_for_trap=>%d", (int)caught);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (caught) {
@@ -1125,13 +1612,23 @@ static void test_pop_log_messages(HANDLE hf, std::atomic<int>& passed, std::atom
     log_msg(hf, "dbg_poplog", "START -- pop_log_messages and log_message_count");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_poplog inputs: log_message_count() then pop_log_messages() then re-count");
     size_t before_count = debugger_engine::log_message_count();
     auto msgs = debugger_engine::pop_log_messages();
+    size_t after_count = debugger_engine::log_message_count();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_poplog result: before_count=%zu popped=%zu after_count=%zu",
+        before_count, msgs.size(), after_count);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_poplog", "PASS -- before_count=%zu, popped %zu messages (elapsed %lld ms)",
-        before_count, msgs.size(), (long long)ms);
-    passed.fetch_add(1);
+    if (msgs.size() == before_count && after_count == 0) {
+        log_msg(hf, "dbg_poplog", "PASS -- popped %zu of %zu messages, buffer drained to 0 (elapsed %lld ms)",
+            msgs.size(), before_count, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_poplog", "FAIL -- pop inconsistent: before=%zu popped=%zu after=%zu (pop must drain buffer and return all entries) (elapsed %lld ms)",
+            before_count, msgs.size(), after_count, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_restore_breakpoints_and_watches(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -1140,9 +1637,10 @@ static void test_restore_breakpoints_and_watches(HANDLE hf, std::atomic<int>& pa
 
     debugger_engine::clear_breakpoints_and_watches();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
-    if (addr == 0) { log_msg(hf, "dbg_rest", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
+    uint64_t addr = alloc_target_bp_region();
+    if (addr == 0) { log_msg(hf, "dbg_rest", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)"); failed.fetch_add(1); return; }
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_rest inputs: addr=0x%llX add 1 bp + 1 watch, snapshot, clear, restore", (unsigned long long)addr);
     debugger_engine::add_breakpoint(addr, debugger_engine::bp_type_t::software, "restore_test", "", 1);
     debugger_engine::add_watch("rax + rbx");
 
@@ -1158,14 +1656,18 @@ static void test_restore_breakpoints_and_watches(HANDLE hf, std::atomic<int>& pa
     auto restored_ws = debugger_engine::snapshot_watches();
 
     debugger_engine::clear_breakpoints_and_watches();
+    driver_bridge::free_memory(addr);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_rest result: orig_bps=%zu orig_ws=%zu after_clear_bps=%zu after_clear_ws=%zu restored_bps=%zu restored_ws=%zu",
+        bps.size(), ws.size(), empty_bps.size(), empty_ws.size(), restored_bps.size(), restored_ws.size());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (empty_bps.empty() && empty_ws.empty() && restored_bps.size() == bps.size() && restored_ws.size() == ws.size()) {
+    if (!bps.empty() && !ws.empty() && empty_bps.empty() && empty_ws.empty() && restored_bps.size() == bps.size() && restored_ws.size() == ws.size()) {
         log_msg(hf, "dbg_rest", "PASS -- clear then restore verified: bps=%zu ws=%zu (elapsed %lld ms)",
             restored_bps.size(), restored_ws.size(), (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_rest", "FAIL -- restore mismatch (elapsed %lld ms)", (long long)ms);
+        log_msg(hf, "dbg_rest", "FAIL -- restore mismatch: orig_bps=%zu orig_ws=%zu after_clear(bps=%zu ws=%zu, expect 0/0) restored(bps=%zu ws=%zu, expect %zu/%zu) (elapsed %lld ms)",
+            bps.size(), ws.size(), empty_bps.size(), empty_ws.size(), restored_bps.size(), restored_ws.size(), bps.size(), ws.size(), (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -1174,8 +1676,9 @@ static void test_clear_breakpoints_and_watches(HANDLE hf, std::atomic<int>& pass
     log_msg(hf, "dbg_cbw", "START -- clear_breakpoints_and_watches");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
-    if (addr == 0) { log_msg(hf, "dbg_cbw", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
+    uint64_t addr = alloc_target_bp_region();
+    if (addr == 0) { log_msg(hf, "dbg_cbw", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_cbw inputs: addr=0x%llX add 1 bp + 1 watch then clear_breakpoints_and_watches()", (unsigned long long)addr);
 
     debugger_engine::add_breakpoint(addr, debugger_engine::bp_type_t::software, "cbw_bp", "", 1);
     debugger_engine::add_watch("rip");
@@ -1183,6 +1686,8 @@ static void test_clear_breakpoints_and_watches(HANDLE hf, std::atomic<int>& pass
 
     auto bps = debugger_engine::snapshot_breakpoints();
     auto ws = debugger_engine::snapshot_watches();
+    driver_bridge::free_memory(addr);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_cbw result: bps_after_clear=%zu ws_after_clear=%zu", bps.size(), ws.size());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (bps.empty() && ws.empty()) {
@@ -1200,17 +1705,26 @@ static void test_disasm_refresh_ntcreatefile(HANDLE hf, std::atomic<int>& passed
 
     uint64_t addr = get_ntdll_fn("NtCreateFile");
     if (addr == 0) { log_msg(hf, "dbg_dasm2", "FAIL -- NtCreateFile not found"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_dasm2 inputs: request_disasm_refresh(addr=0x%llX, max_age=0) attached_pid=%u",
+        (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
 
     debugger_engine::request_disasm_refresh(addr, 0);
     Sleep(300);
 
     uint64_t base_out = 0;
     auto bytes = debugger_engine::cached_disasm_window(base_out);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_dasm2 result: byte_count=%zu base=0x%llX", bytes.size(), (unsigned long long)base_out);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_dasm2", "PASS -- NtCreateFile disasm %zu bytes at base 0x%llX (elapsed %lld ms)",
-        bytes.size(), (unsigned long long)base_out, (long long)ms);
-    passed.fetch_add(1);
+    if (!bytes.empty() && base_out != 0) {
+        log_msg(hf, "dbg_dasm2", "PASS -- NtCreateFile disasm %zu bytes at base 0x%llX (elapsed %lld ms)",
+            bytes.size(), (unsigned long long)base_out, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_dasm2", "FAIL -- NtCreateFile disasm empty: bytes=%zu base=0x%llX (elapsed %lld ms)",
+            bytes.size(), (unsigned long long)base_out, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_disasm_refresh_ntopenfile(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -1219,22 +1733,33 @@ static void test_disasm_refresh_ntopenfile(HANDLE hf, std::atomic<int>& passed, 
 
     uint64_t addr = get_ntdll_fn("NtOpenFile");
     if (addr == 0) { log_msg(hf, "dbg_dasm3", "FAIL -- NtOpenFile not found"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_dasm3 inputs: request_disasm_refresh(addr=0x%llX, max_age=0) attached_pid=%u",
+        (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
 
     debugger_engine::request_disasm_refresh(addr, 0);
     Sleep(300);
 
     uint64_t base_out = 0;
     auto bytes = debugger_engine::cached_disasm_window(base_out);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_dasm3 result: byte_count=%zu base=0x%llX", bytes.size(), (unsigned long long)base_out);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_dasm3", "PASS -- NtOpenFile disasm %zu bytes at base 0x%llX (elapsed %lld ms)",
-        bytes.size(), (unsigned long long)base_out, (long long)ms);
-    passed.fetch_add(1);
+    if (!bytes.empty() && base_out != 0) {
+        log_msg(hf, "dbg_dasm3", "PASS -- NtOpenFile disasm %zu bytes at base 0x%llX (elapsed %lld ms)",
+            bytes.size(), (unsigned long long)base_out, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_dasm3", "FAIL -- NtOpenFile disasm empty: bytes=%zu base=0x%llX (elapsed %lld ms)",
+            bytes.size(), (unsigned long long)base_out, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_handle_type_distribution(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_htyp", "START -- enumerate handles and check type distribution");
     auto t0 = std::chrono::steady_clock::now();
+
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_htyp inputs: enumerate_handles() attached_pid=%u", (unsigned)driver_bridge::attached_pid());
 
     debugger_engine::enumerate_handles();
     Sleep(500);
@@ -1255,17 +1780,26 @@ static void test_handle_type_distribution(HANDLE hf, std::atomic<int>& passed, s
         }
         unique_types = seen_types.size();
     }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_htyp result: handle_count=%zu unique_types=%zu", total, unique_types);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_htyp", "PASS -- %zu handles, %zu unique type indices (elapsed %lld ms)",
-        total, unique_types, (long long)ms);
-    passed.fetch_add(1);
+    if (total != 0 && unique_types != 0) {
+        log_msg(hf, "dbg_htyp", "PASS -- %zu handles, %zu unique type indices (elapsed %lld ms)",
+            total, unique_types, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_htyp", "FAIL -- handle enumeration empty: handles=%zu unique_types=%zu (every attached process has open handles) (elapsed %lld ms)",
+            total, unique_types, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_strings_cancel(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_strc", "START -- start string search, cancel mid-way");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_strc inputs: find_strings_async(4) then request_strings_cancel() attached_pid=%u",
+        (unsigned)driver_bridge::attached_pid());
     debugger_engine::find_strings_async(4);
     Sleep(200);
     debugger_engine::request_strings_cancel();
@@ -1276,6 +1810,8 @@ static void test_strings_cancel(HANDLE hf, std::atomic<int>& passed, std::atomic
     }
 
     bool cancelled = !debugger_engine::g_state.strings_scanning.load();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_strc result: strings_scanning=%d cancelled=%d",
+        (int)debugger_engine::g_state.strings_scanning.load(), (int)cancelled);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (cancelled) {
@@ -1291,41 +1827,65 @@ static void test_dbg_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int
     log_msg(hf, "dbg_stat", "START -- g_state.status check");
     auto t0 = std::chrono::steady_clock::now();
 
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_stat inputs: g_state.status.load() attached_pid=%u", (unsigned)driver_bridge::attached_pid());
     auto status = debugger_engine::g_state.status.load();
     const char* status_str = "unknown";
+    bool valid = true;
     switch (status) {
         case debugger_engine::dbg_status_t::idle: status_str = "idle"; break;
         case debugger_engine::dbg_status_t::running: status_str = "running"; break;
         case debugger_engine::dbg_status_t::paused: status_str = "paused"; break;
         case debugger_engine::dbg_status_t::stepping: status_str = "stepping"; break;
-        case debugger_engine::dbg_status_t::terminated: status_str = "terminated"; break;
+        case debugger_engine::dbg_status_t::terminated: status_str = "terminated"; valid = false; break;
     }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_stat result: status=%s(%d)", status_str, (int)status);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_stat", "PASS -- debugger status=%s (elapsed %lld ms)", status_str, (long long)ms);
-    passed.fetch_add(1);
+    if (valid) {
+        log_msg(hf, "dbg_stat", "PASS -- debugger status=%s (elapsed %lld ms)", status_str, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_stat", "FAIL -- debugger status=terminated; the attached target is dead (elapsed %lld ms)", (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_run_to_address(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_rta", "START -- run_to_address API exists");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
-    if (addr == 0) { log_msg(hf, "dbg_rta", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
+    uint64_t addr = alloc_target_bp_region();
+    if (addr == 0) { log_msg(hf, "dbg_rta", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_rta inputs: run_to_address(addr=0x%llX, wait=false, timeout=100ms) attached_pid=%u",
+        (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
 
     bool ok = debugger_engine::run_to_address(addr, false, 100);
+    std::string err = debugger_engine::last_error();
+    debugger_engine::clear_all_breakpoints();
+    driver_bridge::free_memory(addr);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_rta result: run_to_address=>%d last_error='%s' (armed bp cleared/byte restored)",
+        (int)ok, err.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "dbg_rta", "PASS -- run_to_address returned %d (elapsed %lld ms)", (int)ok, (long long)ms);
-    passed.fetch_add(1);
+    if (ok) {
+        log_msg(hf, "dbg_rta", "PASS -- run_to_address armed one-shot bp at 0x%llX and resumed target (elapsed %lld ms)",
+            (unsigned long long)addr, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "dbg_rta", "FAIL -- run_to_address returned 0; last_error=\"%s\" (not attached or memory read/write failed) (elapsed %lld ms)",
+            err.empty() ? "(none)" : err.c_str(), (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_one_shot_bp(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_1shot", "START -- add breakpoint with bp_state one_shot via toggle");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtWriteFile");
-    if (addr == 0) { log_msg(hf, "dbg_1shot", "FAIL -- NtWriteFile not found"); failed.fetch_add(1); return; }
+    uint64_t addr = alloc_target_bp_region();
+    if (addr == 0) { log_msg(hf, "dbg_1shot", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)"); failed.fetch_add(1); return; }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_1shot inputs: addr=0x%llX add software bp then toggle pid=%u",
+        (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
 
     int idx = debugger_engine::add_breakpoint(addr, debugger_engine::bp_type_t::software, "one_shot_test", "", 1);
     debugger_engine::toggle_breakpoint(idx);
@@ -1337,6 +1897,8 @@ static void test_one_shot_bp(HANDLE hf, std::atomic<int>& passed, std::atomic<in
     }
 
     debugger_engine::remove_breakpoint(idx);
+    driver_bridge::free_memory(addr);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_1shot result: idx=%d found_in_snapshot=%d snapshot_size=%zu", idx, (int)found, snap.size());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (idx >= 0 && found) {
@@ -1355,6 +1917,9 @@ static void test_seh_view_refresh(HANDLE hf, std::atomic<int>& passed, std::atom
     log_msg(hf, "seh_ref", "driver_loaded=%d attached_pid=%u",
         (int)driver_bridge::is_loaded(),
         (unsigned)driver_bridge::attached_pid());
+    diag::log_tagged_fmt("test_dbg_detail", "seh_ref inputs: seh_view::refresh() driver_loaded=%d attached_pid=%u active_tid=%u",
+        (int)driver_bridge::is_loaded(), (unsigned)driver_bridge::attached_pid(),
+        (unsigned)debugger_engine::g_state.active_tid);
 
     seh_view::refresh();
 
@@ -1370,16 +1935,19 @@ static void test_seh_view_refresh(HANDLE hf, std::atomic<int>& passed, std::atom
         std::lock_guard<std::mutex> lk(seh_view::g_ui.mutex);
         chain_depth = seh_view::g_ui.entries.size();
     }
+    diag::log_tagged_fmt("test_dbg_detail", "seh_ref result: still_refreshing=%d chain_depth=%zu waited_ms=%d (empty chain expected on x64)",
+        (int)still_refreshing, chain_depth, waited_ms);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     log_msg(hf, "seh_ref", "refresh completed: still_refreshing=%d chain_depth=%zu waited_ms=%d (elapsed %lld ms)",
         (int)still_refreshing, chain_depth, waited_ms, (long long)ms);
 
     if (!still_refreshing) {
-        log_msg(hf, "seh_ref", "PASS -- seh_view refresh completed without hang (elapsed %lld ms)", (long long)ms);
+        log_msg(hf, "seh_ref", "PASS -- seh_view refresh completed without hang, chain_depth=%zu (x64 targets commonly have no linked SEH chain) (elapsed %lld ms)",
+            chain_depth, (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "seh_ref", "FAIL -- seh_view refresh still running after 3s timeout (elapsed %lld ms)", (long long)ms);
+        log_msg(hf, "seh_ref", "FAIL -- seh_view refresh still running after 3s timeout (worker hung) (elapsed %lld ms)", (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -1395,7 +1963,9 @@ static void test_seh_view_entries(HANDLE hf, std::atomic<int>& passed, std::atom
     }
 
     log_msg(hf, "seh_ent", "chain_depth=%zu", snapshot.size());
+    diag::log_tagged_fmt("test_dbg_detail", "seh_ent inputs: inspect seh_view::g_ui.entries chain_depth=%zu", snapshot.size());
 
+    size_t valid_entries = 0;
     for (size_t i = 0; i < snapshot.size() && i < 16; ++i) {
         const auto& e = snapshot[i];
         log_msg(hf, "seh_ent", "  [%zu] frame=0x%016llX handler=0x%016llX module=%s name=%s",
@@ -1405,11 +1975,21 @@ static void test_seh_view_entries(HANDLE hf, std::atomic<int>& passed, std::atom
             e.module_name.c_str(),
             e.handler_name.c_str());
     }
+    for (const auto& e : snapshot) {
+        if (e.frame_addr != 0 && e.handler_addr != 0) valid_entries++;
+    }
+    diag::log_tagged_fmt("test_dbg_detail", "seh_ent result: chain_depth=%zu valid_entries=%zu", snapshot.size(), valid_entries);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "seh_ent", "PASS -- SEH chain inspection complete: depth=%zu (elapsed %lld ms)",
-        snapshot.size(), (long long)ms);
-    passed.fetch_add(1);
+    if (snapshot.empty() || valid_entries == snapshot.size()) {
+        log_msg(hf, "seh_ent", "PASS -- SEH chain valid: depth=%zu valid_entries=%zu (empty chain acceptable on x64) (elapsed %lld ms)",
+            snapshot.size(), valid_entries, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "seh_ent", "FAIL -- SEH chain has %zu malformed entries (frame_addr or handler_addr == 0) out of %zu (elapsed %lld ms)",
+            snapshot.size() - valid_entries, snapshot.size(), (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_module_view_refresh(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -1419,6 +1999,8 @@ static void test_module_view_refresh(HANDLE hf, std::atomic<int>& passed, std::a
     log_msg(hf, "mod_ref", "driver_loaded=%d attached_pid=%u",
         (int)driver_bridge::is_loaded(),
         (unsigned)driver_bridge::attached_pid());
+    diag::log_tagged_fmt("test_dbg_detail", "mod_ref inputs: module_view::refresh() driver_loaded=%d attached_pid=%u",
+        (int)driver_bridge::is_loaded(), (unsigned)driver_bridge::attached_pid());
 
     module_view::refresh();
 
@@ -1434,17 +2016,22 @@ static void test_module_view_refresh(HANDLE hf, std::atomic<int>& passed, std::a
         std::lock_guard<std::mutex> lk(module_view::g_ui.modules_mutex);
         module_count = module_view::g_ui.modules.size();
     }
+    diag::log_tagged_fmt("test_dbg_detail", "mod_ref result: still_loading=%d module_count=%zu waited_ms=%d",
+        (int)still_loading, module_count, waited_ms);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     log_msg(hf, "mod_ref", "refresh result: still_loading=%d module_count=%zu waited_ms=%d (elapsed %lld ms)",
         (int)still_loading, module_count, waited_ms, (long long)ms);
 
-    if (!still_loading) {
+    if (!still_loading && module_count > 0) {
         log_msg(hf, "mod_ref", "PASS -- module_view refresh completed: %zu modules found (elapsed %lld ms)",
             module_count, (long long)ms);
         passed.fetch_add(1);
+    } else if (still_loading) {
+        log_msg(hf, "mod_ref", "FAIL -- module_view refresh still loading after 5s timeout (worker hung) (elapsed %lld ms)", (long long)ms);
+        failed.fetch_add(1);
     } else {
-        log_msg(hf, "mod_ref", "FAIL -- module_view refresh still loading after 5s timeout (elapsed %lld ms)", (long long)ms);
+        log_msg(hf, "mod_ref", "FAIL -- module_view refresh returned 0 modules; an attached process always has loaded modules (image + ntdll) (elapsed %lld ms)", (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -1460,6 +2047,7 @@ static void test_module_view_entries(HANDLE hf, std::atomic<int>& passed, std::a
     }
 
     log_msg(hf, "mod_ent", "total_modules=%zu", snapshot.size());
+    diag::log_tagged_fmt("test_dbg_detail", "mod_ent inputs: inspect module_view::g_ui.modules total=%zu", snapshot.size());
 
     for (size_t i = 0; i < snapshot.size() && i < 32; ++i) {
         const auto& m = snapshot[i];
@@ -1475,20 +2063,39 @@ static void test_module_view_entries(HANDLE hf, std::atomic<int>& passed, std::a
             snapshot.size() - 32);
     }
 
+    size_t valid_modules = 0;
+    for (const auto& m : snapshot) {
+        if (m.base != 0 && m.size != 0) valid_modules++;
+    }
+    diag::log_tagged_fmt("test_dbg_detail", "mod_ent result: total_modules=%zu valid_modules=%zu", snapshot.size(), valid_modules);
+
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "mod_ent", "PASS -- module entry inspection complete: %zu modules (elapsed %lld ms)",
-        snapshot.size(), (long long)ms);
-    passed.fetch_add(1);
+    if (!snapshot.empty() && valid_modules == snapshot.size()) {
+        log_msg(hf, "mod_ent", "PASS -- module entry inspection complete: %zu modules, all with valid base+size (elapsed %lld ms)",
+            snapshot.size(), (long long)ms);
+        passed.fetch_add(1);
+    } else if (snapshot.empty()) {
+        log_msg(hf, "mod_ent", "FAIL -- 0 modules; an attached process always has loaded modules (run module_view_refresh first) (elapsed %lld ms)", (long long)ms);
+        failed.fetch_add(1);
+    } else {
+        log_msg(hf, "mod_ent", "FAIL -- %zu of %zu modules have base==0 or size==0 (elapsed %lld ms)",
+            snapshot.size() - valid_modules, snapshot.size(), (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void select_debugger_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
                                 const char* tag, debugger_view::sub_tab_t value) {
+    diag::log_tagged_fmt("test_dbg_detail", "%s inputs: set active_tab=%d", tag, static_cast<int>(value));
     debugger_view::g_ui.active_tab = value;
-    if (debugger_view::g_ui.active_tab == value) {
+    auto read_back = debugger_view::g_ui.active_tab;
+    diag::log_tagged_fmt("test_dbg_detail", "%s result: active_tab read_back=%d", tag, static_cast<int>(read_back));
+    if (read_back == value) {
         log_msg(hf, tag, "PASS -- active_tab selected (%d)", static_cast<int>(value));
         passed.fetch_add(1);
     } else {
-        log_msg(hf, tag, "FAIL -- active_tab not selected (%d)", static_cast<int>(value));
+        log_msg(hf, tag, "FAIL -- active_tab not selected: set %d, read back %d",
+            static_cast<int>(value), static_cast<int>(read_back));
         failed.fetch_add(1);
     }
 }

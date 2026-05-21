@@ -23,6 +23,7 @@ add_executable(AiDA_TestTarget
     "${CMAKE_CURRENT_SOURCE_DIR}/module_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/http_server_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/traffic_generator.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resident_state.cpp"
 )
 
 target_include_directories(AiDA_TestTarget PRIVATE

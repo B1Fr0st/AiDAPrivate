@@ -37,12 +37,6 @@ void test_tcp_connect(const config_t& cfg) {
 
     log("TCP connect test starting...");
 
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) {
-        log("TCP socket creation failed: %d", WSAGetLastError());
-        return;
-    }
-
     struct addrinfo hints{}, *result = nullptr;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -51,18 +45,55 @@ void test_tcp_connect(const config_t& cfg) {
     int rc = getaddrinfo("httpbin.org", "80", &hints, &result);
     if (rc != 0) {
         log("TCP getaddrinfo failed: %d", rc);
-        closesocket(s);
         return;
     }
+
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) {
+        freeaddrinfo(result);
+        log("TCP socket creation failed: %d", WSAGetLastError());
+        return;
+    }
+
+    DWORD sock_timeout = 3000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&sock_timeout, sizeof(sock_timeout));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sock_timeout, sizeof(sock_timeout));
+
+    u_long nonblocking = 1;
+    ioctlsocket(s, FIONBIO, &nonblocking);
 
     rc = connect(s, result->ai_addr, (int)result->ai_addrlen);
     freeaddrinfo(result);
 
-    if (rc == SOCKET_ERROR) {
+    if (rc == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(s, &wfds);
+        struct timeval tv;
+        tv.tv_sec = 3;
+        tv.tv_usec = 0;
+        int sel = select(0, nullptr, &wfds, nullptr, &tv);
+        if (sel <= 0) {
+            log("TCP connect timeout: %d", WSAGetLastError());
+            closesocket(s);
+            return;
+        }
+        int so_err = 0;
+        int so_len = (int)sizeof(so_err);
+        getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&so_err, &so_len);
+        if (so_err != 0) {
+            log("TCP connect failed so_error=%d", so_err);
+            closesocket(s);
+            return;
+        }
+    } else if (rc == SOCKET_ERROR) {
         log("TCP connect failed: %d", WSAGetLastError());
         closesocket(s);
         return;
     }
+
+    u_long nb_off = 0;
+    ioctlsocket(s, FIONBIO, &nb_off);
 
     log("TCP connected to httpbin.org:80");
 
@@ -144,13 +175,10 @@ void test_dns_lookup(const config_t& cfg) {
 
     const char* hosts[] = {
         "google.com",
-        "github.com",
-        "httpbin.org",
-        "example.com",
-        "cloudflare.com"
+        "example.com"
     };
 
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 2; ++i) {
         struct addrinfo hints{}, *result = nullptr;
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
@@ -199,14 +227,45 @@ void test_http_get(const config_t& cfg) {
         return;
     }
 
+    DWORD sock_timeout = 3000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&sock_timeout, sizeof(sock_timeout));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sock_timeout, sizeof(sock_timeout));
+
+    u_long nonblocking = 1;
+    ioctlsocket(s, FIONBIO, &nonblocking);
+
     rc = connect(s, result->ai_addr, (int)result->ai_addrlen);
     freeaddrinfo(result);
 
-    if (rc == SOCKET_ERROR) {
+    if (rc == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(s, &wfds);
+        struct timeval tv;
+        tv.tv_sec = 3;
+        tv.tv_usec = 0;
+        int sel = select(0, nullptr, &wfds, nullptr, &tv);
+        if (sel <= 0) {
+            log("HTTP GET connect timeout: %d", WSAGetLastError());
+            closesocket(s);
+            return;
+        }
+        int so_err = 0;
+        int so_len = (int)sizeof(so_err);
+        getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&so_err, &so_len);
+        if (so_err != 0) {
+            log("HTTP GET connect failed so_error=%d", so_err);
+            closesocket(s);
+            return;
+        }
+    } else if (rc == SOCKET_ERROR) {
         log("HTTP GET connect failed: %d", WSAGetLastError());
         closesocket(s);
         return;
     }
+
+    u_long nb_off = 0;
+    ioctlsocket(s, FIONBIO, &nb_off);
 
     const char* request =
         "GET /get?test=aida_target HTTP/1.1\r\n"
@@ -265,14 +324,45 @@ void test_http_post(const config_t& cfg) {
         return;
     }
 
+    DWORD sock_timeout = 3000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&sock_timeout, sizeof(sock_timeout));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sock_timeout, sizeof(sock_timeout));
+
+    u_long nonblocking = 1;
+    ioctlsocket(s, FIONBIO, &nonblocking);
+
     rc = connect(s, result->ai_addr, (int)result->ai_addrlen);
     freeaddrinfo(result);
 
-    if (rc == SOCKET_ERROR) {
+    if (rc == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(s, &wfds);
+        struct timeval tv;
+        tv.tv_sec = 3;
+        tv.tv_usec = 0;
+        int sel = select(0, nullptr, &wfds, nullptr, &tv);
+        if (sel <= 0) {
+            log("HTTP POST connect timeout: %d", WSAGetLastError());
+            closesocket(s);
+            return;
+        }
+        int so_err = 0;
+        int so_len = (int)sizeof(so_err);
+        getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&so_err, &so_len);
+        if (so_err != 0) {
+            log("HTTP POST connect failed so_error=%d", so_err);
+            closesocket(s);
+            return;
+        }
+    } else if (rc == SOCKET_ERROR) {
         log("HTTP POST connect failed: %d", WSAGetLastError());
         closesocket(s);
         return;
     }
+
+    u_long nb_off = 0;
+    ioctlsocket(s, FIONBIO, &nb_off);
 
     const char* body = "{\"tool\":\"AiDA\",\"test\":\"target\",\"version\":1}";
     int body_len = (int)strlen(body);
@@ -455,12 +545,12 @@ void test_multiport_io(const config_t& cfg) {
 void run_all(const config_t& cfg, std::atomic<bool>& running) {
     log("=== Network tests starting ===");
 
-    test_dns_lookup(cfg);
-    test_tcp_connect(cfg);
-    test_udp_send(cfg);
-    test_http_get(cfg);
-    test_http_post(cfg);
-    test_multiport_io(cfg);
+    if (running.load()) test_dns_lookup(cfg);
+    if (running.load()) test_tcp_connect(cfg);
+    if (running.load()) test_udp_send(cfg);
+    if (running.load()) test_http_get(cfg);
+    if (running.load()) test_http_post(cfg);
+    if (running.load()) test_multiport_io(cfg);
 
     log("=== Network tests complete ===");
 }

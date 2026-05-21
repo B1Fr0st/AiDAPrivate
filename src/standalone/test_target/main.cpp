@@ -19,6 +19,7 @@
 #include "module_tests.h"
 #include "http_server_tests.h"
 #include "traffic_generator.h"
+#include "resident_state.h"
 
 static std::atomic<bool> g_running{ true };
 
@@ -224,8 +225,125 @@ static cli_args_t parse_args(int argc, char* argv[]) {
     return args;
 }
 
+static cli_args_t s_args{};
+static HANDLE     s_listener_thread = nullptr;
+
+static DWORD WINAPI tcp_listener_thread(LPVOID param) {
+    (void)param;
+    test_target::network::config_t ncfg{};
+    ncfg.listen_port = s_args.port;
+    ncfg.verbose = s_args.verbose;
+    test_target::network::test_listen_socket(ncfg, g_running);
+    return 0;
+}
+
+static DWORD WINAPI workload_orchestrator(LPVOID param) {
+    (void)param;
+    const cli_args_t& args = s_args;
+
+    printf("[work] orchestrator thread started\n");
+    fflush(stdout);
+
+    if (g_running.load()) {
+        test_target::structs::config_t scfg{};
+        scfg.verbose = args.verbose;
+        test_target::structs::run_all(scfg, g_running);
+    }
+
+    if (g_running.load()) {
+        test_target::memory::config_t mcfg{};
+        mcfg.verbose = args.verbose;
+        test_target::memory::run_all(mcfg, g_running);
+    }
+
+    if (g_running.load()) {
+        test_target::threads::config_t tcfg{};
+        tcfg.verbose = args.verbose;
+        test_target::threads::run_all(tcfg, g_running);
+    }
+
+    if (g_running.load()) {
+        test_target::crypto::config_t ccfg{};
+        ccfg.verbose = args.verbose;
+        test_target::crypto::run_all(ccfg, g_running);
+    }
+
+    if (g_running.load()) {
+        test_target::exceptions::config_t ecfg{};
+        ecfg.verbose = args.verbose;
+        test_target::exceptions::run_all(ecfg, g_running);
+    }
+
+    if (g_running.load()) {
+        test_target::debug_surface::config_t dcfg{};
+        dcfg.verbose = args.verbose;
+        test_target::debug_surface::run_all(dcfg, g_running);
+    }
+
+    if (g_running.load()) {
+        test_target::file_io::config_t fcfg{};
+        fcfg.verbose = args.verbose;
+        test_target::file_io::run_all(fcfg, g_running);
+    }
+
+    if (g_running.load()) {
+        test_target::modules::config_t modcfg{};
+        modcfg.verbose = args.verbose;
+        test_target::modules::run_all(modcfg, g_running);
+    }
+
+    if (args.skip_network) {
+        printf("[work] network tests skipped (--skip-network)\n");
+        fflush(stdout);
+        printf("[work] orchestrator thread stopped\n");
+        fflush(stdout);
+        return 0;
+    }
+
+    if (g_running.load()) {
+        test_target::http_server::config_t hcfg{};
+        hcfg.port = args.http_port;
+        hcfg.verbose = args.verbose;
+        test_target::http_server::run_all(hcfg, g_running);
+
+        test_target::traffic::config_t gcfg{};
+        gcfg.base_port = args.port;
+        gcfg.http_port = args.http_port;
+        gcfg.rate_ms = args.net_rate_ms;
+        gcfg.verbose = args.verbose;
+        gcfg.no_external = args.no_external;
+        gcfg.skip_network = args.skip_network;
+        test_target::traffic::run_all(gcfg, g_running);
+    }
+
+    if (g_running.load()) {
+        s_listener_thread = CreateThread(nullptr, 0, tcp_listener_thread, nullptr, 0, nullptr);
+        if (s_listener_thread) {
+            printf("[net] tcp listener thread started on port %u\n", args.port);
+        } else {
+            printf("[net] tcp listener thread FAILED (err=%lu)\n", GetLastError());
+        }
+        fflush(stdout);
+    }
+
+    if (g_running.load() && !args.no_external) {
+        test_target::network::config_t ncfg{};
+        ncfg.listen_port = args.port;
+        ncfg.verbose = args.verbose;
+        test_target::network::run_all(ncfg, g_running);
+    } else if (args.no_external) {
+        printf("[work] external network probes skipped (--no-external, loopback only)\n");
+        fflush(stdout);
+    }
+
+    printf("[work] orchestrator thread stopped\n");
+    fflush(stdout);
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
-    cli_args_t args = parse_args(argc, argv);
+    s_args = parse_args(argc, argv);
+    const cli_args_t& args = s_args;
 
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
 
@@ -298,78 +416,18 @@ int main(int argc, char* argv[]) {
     fflush(stdout);
 
     {
-        test_target::structs::config_t scfg{};
-        scfg.verbose = args.verbose;
-        test_target::structs::run_all(scfg, g_running);
+        test_target::resident::config_t rcfg{};
+        rcfg.verbose = args.verbose;
+        test_target::resident::init(rcfg, g_running);
     }
 
-    {
-        test_target::memory::config_t mcfg{};
-        mcfg.verbose = args.verbose;
-        test_target::memory::run_all(mcfg, g_running);
-    }
-
-    {
-        test_target::threads::config_t tcfg{};
-        tcfg.verbose = args.verbose;
-        test_target::threads::run_all(tcfg, g_running);
-    }
-
-    {
-        test_target::crypto::config_t ccfg{};
-        ccfg.verbose = args.verbose;
-        test_target::crypto::run_all(ccfg, g_running);
-    }
-
-    {
-        test_target::exceptions::config_t ecfg{};
-        ecfg.verbose = args.verbose;
-        test_target::exceptions::run_all(ecfg, g_running);
-    }
-
-    {
-        test_target::debug_surface::config_t dcfg{};
-        dcfg.verbose = args.verbose;
-        test_target::debug_surface::run_all(dcfg, g_running);
-    }
-
-    {
-        test_target::file_io::config_t fcfg{};
-        fcfg.verbose = args.verbose;
-        test_target::file_io::run_all(fcfg, g_running);
-    }
-
-    {
-        test_target::modules::config_t modcfg{};
-        modcfg.verbose = args.verbose;
-        test_target::modules::run_all(modcfg, g_running);
-    }
-
-    if (!args.skip_network) {
-        test_target::network::config_t ncfg{};
-        ncfg.listen_port = args.port;
-        ncfg.verbose = args.verbose;
-        test_target::network::run_all(ncfg, g_running);
+    HANDLE orchestrator_thread = CreateThread(nullptr, 0, workload_orchestrator, nullptr, 0, nullptr);
+    if (orchestrator_thread) {
+        printf("[MAIN] Workload orchestrator dispatched on background thread\n");
     } else {
-        printf("[MAIN] Network tests skipped (--skip-network)\n");
-        fflush(stdout);
+        printf("[MAIN] Workload orchestrator FAILED to start (err=%lu)\n", GetLastError());
     }
-
-    if (!args.skip_network) {
-        test_target::http_server::config_t hcfg{};
-        hcfg.port = args.http_port;
-        hcfg.verbose = args.verbose;
-        test_target::http_server::run_all(hcfg, g_running);
-
-        test_target::traffic::config_t gcfg{};
-        gcfg.base_port = args.port;
-        gcfg.http_port = args.http_port;
-        gcfg.rate_ms = args.net_rate_ms;
-        gcfg.verbose = args.verbose;
-        gcfg.no_external = args.no_external;
-        gcfg.skip_network = args.skip_network;
-        test_target::traffic::run_all(gcfg, g_running);
-    }
+    fflush(stdout);
 
     printf("READY\n");
     fflush(stdout);
@@ -385,19 +443,6 @@ int main(int argc, char* argv[]) {
     fflush(stdout);
 
     ULONGLONG start_tick = GetTickCount64();
-
-    if (!args.skip_network) {
-        HANDLE listen_thread = CreateThread(nullptr, 0, [](LPVOID param) -> DWORD {
-            cli_args_t* a = (cli_args_t*)param;
-            test_target::network::config_t ncfg{};
-            ncfg.listen_port = a->port;
-            ncfg.verbose = a->verbose;
-            test_target::network::test_listen_socket(ncfg, g_running);
-            return 0;
-        }, &args, 0, nullptr);
-
-        if (listen_thread) CloseHandle(listen_thread);
-    }
 
     printf("[MAIN] Entering main loop (Ctrl+C to stop)\n");
     fflush(stdout);
@@ -444,9 +489,26 @@ int main(int argc, char* argv[]) {
     printf("[MAIN] Shutting down...\n");
     fflush(stdout);
 
+    if (orchestrator_thread) {
+        WaitForSingleObject(orchestrator_thread, 10000);
+        CloseHandle(orchestrator_thread);
+        orchestrator_thread = nullptr;
+        printf("[MAIN] Workload orchestrator joined\n");
+        fflush(stdout);
+    }
+
+    if (s_listener_thread) {
+        WaitForSingleObject(s_listener_thread, 5000);
+        CloseHandle(s_listener_thread);
+        s_listener_thread = nullptr;
+        printf("[net] tcp listener thread joined\n");
+        fflush(stdout);
+    }
+
     test_target::threads::shutdown_all();
     test_target::traffic::shutdown_all();
     test_target::http_server::shutdown_all();
+    test_target::resident::shutdown_all();
 
     if (h_ready_local) CloseHandle(h_ready_local);
     if (h_done_local) CloseHandle(h_done_local);

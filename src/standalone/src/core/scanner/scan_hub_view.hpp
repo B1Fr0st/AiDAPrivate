@@ -44,6 +44,11 @@ inline void set_sub_tab(sub_tab_t tab)
 	aida::ui::hub_strip::notify_select(g_state.strip, idx);
 }
 
+inline sub_tab_t active_sub_tab()
+{
+	return static_cast<sub_tab_t>(g_state.strip.active);
+}
+
 inline constexpr aida::ui::hub_strip::tab_t s_tabs[] = {
 	{ "Value Scan", "scan values in memory", "Val" },
 	{ "Crypto",     "crypto constant hunter", "Cry" },
