@@ -296,6 +296,39 @@ namespace {
         }
     }
 
+    void test_mcp_duplicate_tool_names(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        const char* tag = "mcp.duplicate_tool_names";
+        auto* srv = get_server();
+        if (!srv) {
+            log_msg(hf, tag, "SKIP -- no server instance");
+            skipped.fetch_add(1);
+            return;
+        }
+
+        std::map<std::string, int> counts;
+        for (const auto& t : srv->get_tools()) {
+            counts[t.name]++;
+        }
+
+        int duplicates = 0;
+        for (const auto& kv : counts) {
+            if (kv.second > 1) {
+                duplicates += kv.second - 1;
+                log_msg(hf, tag, "DUPLICATE -- tool \"%s\" registered %d times; direct tests exercise only the first handler",
+                    kv.first.c_str(), kv.second);
+            }
+        }
+
+        if (duplicates == 0) {
+            log_msg(hf, tag, "PASS -- %zu registered tool names are unique", counts.size());
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- %d duplicate MCP tool registration(s) across %zu unique names",
+                duplicates, counts.size());
+            failed.fetch_add(1);
+        }
+    }
+
 
     void test_tool_driver_load(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         test_tool_call(hf, "mcp.driver_load", get_server(), "driver_load", {}, passed, failed, skipped);
@@ -2990,7 +3023,7 @@ namespace {
 }
 
 void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
-    log_msg(hf, "mcp_phase", "=== MCP TOOL TESTS START (533 tests) ===");
+    log_msg(hf, "mcp_phase", "=== MCP TOOL TESTS START (534 tests) ===");
     auto t0 = std::chrono::steady_clock::now();
 
 
@@ -3000,6 +3033,7 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_mcp_enumerate_tools(hf, passed, failed, skipped);
     if (!cancelled()) test_mcp_categorize_tools(hf, passed, failed, skipped);
     if (!cancelled()) test_mcp_tool_schemas(hf, passed, failed, skipped);
+    if (!cancelled()) test_mcp_duplicate_tool_names(hf, passed, failed, skipped);
 
     if (!cancelled()) test_tool_driver_load(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_status(hf, passed, failed, skipped);

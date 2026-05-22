@@ -1028,17 +1028,7 @@ int main(int, char**)
             GetLastError());
 
         crash_log_write(buf);
-
-        char crash_path[MAX_PATH];
-        _snprintf_s(crash_path, sizeof(crash_path), _TRUNCATE, "%saida_crash.log", diag::resolve_log_dir());
-
-        HANDLE hf = CreateFileA(crash_path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hf != INVALID_HANDLE_VALUE) {
-            DWORD written;
-            WriteFile(hf, buf, static_cast<DWORD>(strlen(buf)), &written, nullptr);
-            CloseHandle(hf);
-        }
+        diag::write_crash_log(buf, false);
 
         anti_tamper::webhook::send_debug_log("crash", buf, true);
 

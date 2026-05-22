@@ -4,6 +4,7 @@
 #include <Shlwapi.h>
 #include <cstdio>
 #include <cstdarg>
+#include <cstring>
 #include <tlhelp32.h>
 #include <string>
 #include <initguid.h>
@@ -42,6 +43,36 @@ static void DbgLog(const char* func, const char* fmt, ...) {
 #define LOG(fmt, ...) DbgLog(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define LOG_STATUS(msg, st) DbgLog(__FUNCTION__, "%s: 0x%08X (%s)", msg, (DWORD)(st), NT_SUCCESS(st) ? "SUCCESS" : "FAILED")
 // ============ END DEBUG LOGGING ============
+
+static void OpenMapperLog()
+{
+    char logPath[MAX_PATH] = {};
+    DWORD envLen = GetEnvironmentVariableA("AIDA_MAPPER_LOG", logPath, static_cast<DWORD>(sizeof(logPath)));
+    if (envLen > 0 && envLen < sizeof(logPath)) {
+        fopen_s(&g_LogFile, logPath, "w");
+    }
+
+    if (!g_LogFile) {
+        char exePath[MAX_PATH] = {};
+        DWORD got = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+        if (got > 0 && got < MAX_PATH) {
+            char* lastSlash = std::strrchr(exePath, '\\');
+            if (lastSlash) {
+                *(lastSlash + 1) = '\0';
+                strncat_s(exePath, sizeof(exePath), "WindMapper_debug.log", _TRUNCATE);
+                fopen_s(&g_LogFile, exePath, "w");
+            }
+        }
+    }
+
+    if (!g_LogFile) {
+        fopen_s(&g_LogFile, "C:\\WindMapper_debug.log", "w");
+    }
+
+    if (!g_LogFile) {
+        OutputDebugStringA("[WindMapper][OpenMapperLog] failed to open file log\n");
+    }
+}
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "crypt32.lib")
@@ -1104,7 +1135,7 @@ static void RunSignatureCheck(LPCWSTR filePath) {
 
 int main(int argc, char* argv[]) {
     // Open log file immediately
-    fopen_s(&g_LogFile, "C:\\WindMapper_debug.log", "w");
+    OpenMapperLog();
     LOG("============================================");
     LOG("WindMapper started, argc=%d", argc);
     for (int i = 0; i < argc; i++) {

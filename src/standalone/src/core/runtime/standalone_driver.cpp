@@ -145,7 +145,32 @@ namespace
             (unsigned long)hb_err, (unsigned long)hb_bytes,
             (unsigned long long)hb_resp,
             hb_ioctl, hb_magic, hb_dioctl ? 1 : 0);
+        const std::string loader_error = driver_loader::last_error();
         diag::log_tagged_critical("driver", buf);
+        diag::log_tagged_critical_fmt("driver", "loader_last_error=\"%s\"",
+            loader_error.empty() ? "<empty>" : loader_error.c_str());
+
+        char crash[2048];
+        _snprintf_s(crash, sizeof(crash), _TRUNCATE,
+            "FASTFAIL: code=0x%08X phase=%s err=0x%08X tid=%lu\r\n"
+            "Reason=Kernel driver is required, but the loader did not produce a connectable device.\r\n"
+            "DriverLoaderLastError=%s\r\n"
+            "HeartbeatError=%lu HeartbeatBytes=%lu HeartbeatResponse=0x%016llX\r\n"
+            "HeartbeatIoctl=0x%08X HeartbeatMagic=0x%08X HeartbeatDeviceIoctl=%d\r\n"
+            "KernelDriverLogExpected=%s\r\n",
+            kDriverFastFailCode,
+            phase ? phase : "?",
+            err,
+            GetCurrentThreadId(),
+            loader_error.empty() ? "<empty>" : loader_error.c_str(),
+            (unsigned long)hb_err,
+            (unsigned long)hb_bytes,
+            (unsigned long long)hb_resp,
+            hb_ioctl,
+            hb_magic,
+            hb_dioctl ? 1 : 0,
+            (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) ? "no, DriverEntry likely did not run" : "unknown");
+        diag::write_crash_log(crash, false);
         diag::log_tagged_critical("driver", "ABOUT_TO_FASTFAIL_0xBEA7DEAD");
         OutputDebugStringA(buf);
         anti_tamper::webhook::send_debug_log("driver", buf, true);
@@ -435,6 +460,11 @@ namespace driver_bridge
 
         bool loader_ok = driver_loader::initialize_and_load();
         diag::log_tagged_fmt("driver", "loader_initialize_result=%d", loader_ok ? 1 : 0);
+        if (!loader_ok) {
+            const std::string loader_error = driver_loader::last_error();
+            diag::log_tagged_critical_fmt("driver", "loader_last_error=\"%s\"",
+                loader_error.empty() ? "<empty>" : loader_error.c_str());
+        }
 
         if (device && device->connect()) {
             g_kernel_mode = true;
@@ -465,7 +495,13 @@ namespace driver_bridge
             return true;
         }
 
-        driver_loader::initialize_and_load();
+        bool loader_ok = driver_loader::initialize_and_load();
+        diag::log_tagged_fmt("driver", "load_kernel_driver loader_initialize_result=%d", loader_ok ? 1 : 0);
+        if (!loader_ok) {
+            const std::string loader_error = driver_loader::last_error();
+            diag::log_tagged_critical_fmt("driver", "load_kernel_driver loader_last_error=\"%s\"",
+                loader_error.empty() ? "<empty>" : loader_error.c_str());
+        }
 
         if (!device || !device->connect()) {
             DWORD err = device ? device->get_last_connect_error() : 0xFFFFFFFFu;

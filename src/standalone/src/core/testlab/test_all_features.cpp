@@ -33,6 +33,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <deque>
@@ -60,6 +61,7 @@ namespace test_all_features {
 		std::atomic<std::uint64_t> g_target_addr{ 0 };
 		std::atomic<std::uint64_t> g_target_image_base{ 0 };
 		std::atomic<bool>          g_driver_attached{ false };
+		std::atomic<std::uint64_t> g_saved_dtb{ 0 };
 
 		std::mutex        g_log_mtx;
 		std::deque<std::string> g_log_lines;
@@ -518,18 +520,60 @@ namespace test_all_features {
 					char tmp[MAX_PATH];
 					GetTempPathA(MAX_PATH, tmp);
 					s.text_a = std::string(tmp) + "aida_test_capture.pcap";
+				} else if (std::strcmp(name, "PHYS") == 0 || std::strcmp(name, "MEX") == 0 || std::strcmp(name, "V2P") == 0) {
+					std::uint64_t saved = g_saved_dtb.load(std::memory_order_acquire);
+					if (saved != 0) {
+						s.u64_a = saved;
+						log_msg(hf, "testlab", "[%d/%d] DTB-inject %s: injecting saved_dtb=0x%016llX into u64_a",
+							i + 1, total, name, static_cast<unsigned long long>(saved));
+					} else {
+						log_msg(hf, "testlab", "[%d/%d] DTB-inject %s: WARN no saved dtb (u64_a=0); test may fail",
+							i + 1, total, name);
+					}
 				}
 
 				test_lab::result_t r;
 
-				log_msg(hf, "testlab", "[%d/%d] START %s/%s (pid=%u tid=%u addr=0x%016llX)",
+				log_msg(hf, "testlab", "[%d/%d] START %s/%s pid=%u tid=%u addr=0x%016llX u64_a=0x%016llX u32_a=%u u32_b=%u size=%u text_a=\"%.32s\"",
 					i + 1, total, cat, name, s.pid, s.tid,
-					static_cast<unsigned long long>(s.addr));
+					static_cast<unsigned long long>(s.addr),
+					static_cast<unsigned long long>(s.u64_a),
+					s.u32_a, s.u32_b, s.size,
+					s.text_a.empty() ? "(none)" : s.text_a.c_str());
 				auto t0 = std::chrono::steady_clock::now();
 				f.run(s, r);
 				auto t1 = std::chrono::steady_clock::now();
 				auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
 				if (r.elapsed_us == 0) r.elapsed_us = static_cast<std::uint64_t>(us);
+
+				if (std::strcmp(name, "DTB") == 0 && r.ok) {
+					for (const auto& kv : r.parsed) {
+						if (kv.label == "CR3 (DTB)") {
+							std::uint64_t dtb = std::strtoull(kv.value.c_str(), nullptr, 16);
+							if (dtb != 0) {
+								g_saved_dtb.store(dtb, std::memory_order_release);
+								log_msg(hf, "testlab", "[%d/%d] DTB-save: cr3=0x%016llX saved for PHYS/MEX/V2P tests",
+									i + 1, total, static_cast<unsigned long long>(dtb));
+							}
+							break;
+						}
+					}
+				}
+
+				for (const auto& kv : r.parsed) {
+					log_msg(hf, "testlab", "[%d/%d] FIELD %s/%s \"%s\" = \"%s\"",
+						i + 1, total, cat, name, kv.label.c_str(), kv.value.c_str());
+				}
+
+				if (!r.raw.empty()) {
+					char hex_preview[97] = {};
+					std::size_t preview_n = std::min(r.raw.size(), std::size_t(16));
+					for (std::size_t bi = 0; bi < preview_n; ++bi) {
+						std::snprintf(hex_preview + bi * 3, sizeof(hex_preview) - bi * 3, "%02X ", static_cast<unsigned>(r.raw[bi]));
+					}
+					log_msg(hf, "testlab", "[%d/%d] RAW %s/%s total_bytes=%zu raw_preview=[%s]",
+						i + 1, total, cat, name, r.raw.size(), hex_preview);
+				}
 
 				if (r.ok) {
 					g_passed.fetch_add(1);
@@ -542,10 +586,11 @@ namespace test_all_features {
 							r.bytes_returned,
 							static_cast<unsigned long long>(r.elapsed_us));
 					} else {
-						log_msg(hf, "testlab", "[%d/%d] PASS %s/%s ntstatus=%s bytes=%u elapsed=%llu us",
+						log_msg(hf, "testlab", "[%d/%d] PASS %s/%s ntstatus=%s bytes=%u parsed_fields=%zu elapsed=%llu us",
 							i + 1, total, cat, name,
 							test_lab_format::ntstatus_to_string(r.ntstatus),
 							r.bytes_returned,
+							r.parsed.size(),
 							static_cast<unsigned long long>(r.elapsed_us));
 					}
 				} else {
@@ -1145,6 +1190,7 @@ namespace test_all_features {
 			g_target_addr.store(0);
 			g_target_image_base.store(0);
 			g_driver_attached.store(false);
+			g_saved_dtb.store(0, std::memory_order_release);
 
 			{
 				std::lock_guard<std::mutex> lk(g_log_mtx);
@@ -1198,7 +1244,7 @@ namespace test_all_features {
 
 
 			if (running) ImGui::BeginDisabled();
-			if (ImGui::Button("Start Test", ImVec2(140.f, 30.f))) {
+			if (ImGui::Button("TEST ALL FEATURES", ImVec2(190.f, 30.f))) {
 				start_tests();
 			}
 			if (running) ImGui::EndDisabled();

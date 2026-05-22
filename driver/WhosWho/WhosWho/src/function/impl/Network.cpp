@@ -325,6 +325,7 @@ namespace net_bw {
 namespace net_inject {
     inline constexpr UINT32 INJECT_FLAG_RAW_TRANSPORT = 0x80000000u;
     BOOLEAN resolve_inject_functions();
+    BOOLEAN prepare_injection_runtime();
     NTSTATUS inject_packet(p_packet_inject_request request);
     void cleanup();
     extern HANDLE g_inject_handle_v4;
@@ -2100,6 +2101,10 @@ namespace net_capture {
             g_dns_ring = nullptr;
             _InterlockedExchange(&g_wfp_initialized, 0);
             return STATUS_NOT_SUPPORTED;
+        }
+
+        if (!net_inject::prepare_injection_runtime()) {
+            NET_ERR("initialize: injection runtime prewarm FAILED; reinjection-only features will report not-supported instead of resolving inside WFP callouts");
         }
 
 
@@ -4676,19 +4681,32 @@ namespace net_inject {
 
     BOOLEAN resolve_inject_functions() {
         NET_DBG("resolve_inject_functions: enter");
-        LONG prev = _InterlockedCompareExchange(&g_inject_resolved, 1, 0);
-        if (prev == 2) {
+        LONG state = _InterlockedCompareExchange(&g_inject_resolved, 0, 0);
+        if (state == 2) {
             NET_DBG("resolve_inject_functions: already resolved, handle_v4=%p handle_net_v4=%p",
                     g_inject_handle_v4, g_inject_handle_net_v4);
-            return g_inject_handle_v4 != nullptr;
+            return (g_inject_handle_v4 != nullptr) || (g_inject_handle_net_v4 != nullptr);
         }
-        if (prev == 1) {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+            NET_ERR("resolve_inject_functions: blocked at IRQL=%u before first-time export resolution",
+                    (UINT32)KeGetCurrentIrql());
+            return FALSE;
+        }
+        if (state == 1) {
             for (UINT32 spin = 0; spin < 100000; spin++) {
                 if (_InterlockedCompareExchange(&g_inject_resolved, 0, 0) != 1)
                     break;
                 YieldProcessor();
             }
-            return g_inject_handle_v4 != nullptr;
+            return (g_inject_handle_v4 != nullptr) || (g_inject_handle_net_v4 != nullptr);
+        }
+
+        LONG prev = _InterlockedCompareExchange(&g_inject_resolved, 1, 0);
+        if (prev == 2) {
+            return (g_inject_handle_v4 != nullptr) || (g_inject_handle_net_v4 != nullptr);
+        }
+        if (prev != 0) {
+            return FALSE;
         }
 
         PVOID fwp_base = net_capture::find_module_base("FWPKCLNT.SYS");
@@ -4787,6 +4805,17 @@ namespace net_inject {
         return TRUE;
     }
 
+    BOOLEAN prepare_injection_runtime() {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+            NET_ERR("prepare_injection_runtime: blocked at IRQL=%u", (UINT32)KeGetCurrentIrql());
+            return FALSE;
+        }
+        if (!resolve_inject_functions()) {
+            return FALSE;
+        }
+        return ensure_inject_nbl_pool();
+    }
+
     static UINT64 lookup_endpoint_handle_by_port(UINT32 protocol, UINT32 src_port) {
         aida_ensure_endpoint_pid_cache_init();
         KIRQL old_irql;
@@ -4869,6 +4898,12 @@ namespace net_inject {
         if (!resolve_inject_functions()) {
             NET_ERR("inject_packet: resolve_inject_functions FAILED");
             return STATUS_NOT_SUPPORTED;
+        }
+
+        if (!g_inject_nbl_pool && KeGetCurrentIrql() != PASSIVE_LEVEL) {
+            NET_ERR("inject_packet: NBL pool unavailable at IRQL=%u; injection runtime was not prewarmed",
+                    (UINT32)KeGetCurrentIrql());
+            return STATUS_INSUFFICIENT_RESOURCES;
         }
 
         if (!ensure_inject_nbl_pool()) {

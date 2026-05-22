@@ -98,4 +98,34 @@ inline void log_tagged_critical_fmt(const char* tag, const char* fmt, ...)
     log_tagged_critical(tag, buf);
 }
 
+inline bool write_crash_log(const char* msg, bool append = false)
+{
+    char path[MAX_PATH];
+    _snprintf_s(path, sizeof(path), _TRUNCATE, "%saida_crash.log", resolve_log_dir());
+
+    HANDLE hf = CreateFileA(path,
+        append ? (FILE_APPEND_DATA | SYNCHRONIZE) : (GENERIC_WRITE | SYNCHRONIZE),
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+        append ? OPEN_ALWAYS : CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+        nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+
+    if (append)
+        SetFilePointer(hf, 0, nullptr, FILE_END);
+
+    DWORD written = 0;
+    if (msg && msg[0] != '\0') {
+        WriteFile(hf, msg, static_cast<DWORD>(std::strlen(msg)), &written, nullptr);
+        const size_t len = std::strlen(msg);
+        if (len < 2 || msg[len - 2] != '\r' || msg[len - 1] != '\n') {
+            DWORD newline_written = 0;
+            WriteFile(hf, "\r\n", 2, &newline_written, nullptr);
+        }
+    }
+    FlushFileBuffers(hf);
+    CloseHandle(hf);
+    return true;
+}
+
 }

@@ -123,12 +123,20 @@ async function callServerAction(action, fields) {
     if (!ADMIN_API_BASE) {
         return { ok: false, reason: 'admin_api_base_not_configured' };
     }
-    const url = ADMIN_API_BASE.replace(/\/+$/, '') + '/api/license/' + action;
+    const base = ADMIN_API_BASE.trim().replace(/\/+$/, '');
+    const url = /\/api\/license$/i.test(base)
+        ? base + '/' + encodeURIComponent(action)
+        : /\/api$/i.test(base)
+            ? base + '/license/' + encodeURIComponent(action)
+            : base + '/api/license/' + encodeURIComponent(action);
     const payload = Object.assign({
         action,
         nonce: crypto.randomBytes(16).toString('hex'),
         ts: Math.floor(Date.now() / 1000),
     }, fields || {});
+    if (ADMIN_API_KEY) {
+        payload.admin_key = ADMIN_API_KEY;
+    }
     const sig = signBotPayload(payload);
     const headers = { 'Content-Type': 'application/json' };
     if (sig) headers['x-bot-signature'] = sig;
@@ -144,6 +152,95 @@ async function callServerAction(action, fields) {
         return { ok: resp.ok, status: resp.status, body };
     } catch (err) {
         return { ok: false, reason: 'network_error', error: err && err.message ? err.message : String(err) };
+    }
+}
+
+function serverActionFailure(result) {
+    const body = result && (result.body || result.response);
+    const parts = [];
+    if (body && typeof body === 'object') {
+        for (const key of ['reason', 'error_code', 'error', 'status']) {
+            if (body[key]) {
+                parts.push(String(body[key]));
+                break;
+            }
+        }
+        if (!parts.length && typeof body.raw === 'string' && body.raw.trim()) {
+            parts.push(body.raw.trim().replace(/\s+/g, ' ').slice(0, 160));
+        }
+    }
+    if (!parts.length && result && result.reason) parts.push(String(result.reason));
+    if (!parts.length && result && result.error) parts.push(String(result.error));
+    if (result && result.status) parts.push('HTTP ' + result.status);
+    return parts.length ? parts.join(' / ') : 'unknown';
+}
+
+function embedPayloadLength(embed) {
+    const data = typeof embed.toJSON === 'function' ? embed.toJSON() : (embed || {});
+    let total = 0;
+    const add = value => {
+        if (value !== undefined && value !== null) total += String(value).length;
+    };
+    add(data.title);
+    add(data.description);
+    if (data.author) add(data.author.name);
+    if (data.footer) add(data.footer.text);
+    if (Array.isArray(data.fields)) {
+        for (const field of data.fields) {
+            add(field.name);
+            add(field.value);
+        }
+    }
+    return total;
+}
+
+function chunkLines(lines, maxLength = 3800) {
+    const chunks = [];
+    let current = '';
+    for (const rawLine of lines) {
+        const line = String(rawLine || '');
+        if (line.length > maxLength) {
+            if (current) {
+                chunks.push(current);
+                current = '';
+            }
+            chunks.push(line.slice(0, maxLength - 3) + '...');
+            continue;
+        }
+        const next = current ? `${current}\n${line}` : line;
+        if (next.length > maxLength) {
+            if (current) chunks.push(current);
+            current = line;
+        } else {
+            current = next;
+        }
+    }
+    if (current) chunks.push(current);
+    return chunks;
+}
+
+async function sendEmbedPages(interaction, embeds) {
+    const pages = Array.isArray(embeds) ? embeds.filter(Boolean) : [];
+    if (!pages.length) return interaction.editReply('No results.');
+
+    const messages = [];
+    let current = [];
+    let currentLength = 0;
+    for (const embed of pages) {
+        const length = embedPayloadLength(embed);
+        if (current.length > 0 && (current.length >= 10 || currentLength + length > 5800)) {
+            messages.push(current);
+            current = [];
+            currentLength = 0;
+        }
+        current.push(embed);
+        currentLength += length;
+    }
+    if (current.length > 0) messages.push(current);
+
+    await interaction.editReply({ embeds: messages[0] });
+    for (const batch of messages.slice(1)) {
+        await interaction.followUp({ embeds: batch, flags: MessageFlags.Ephemeral });
     }
 }
 
@@ -930,7 +1027,7 @@ client.on('interactionCreate', async (interaction) => {
                 discord_id: interaction.user.id,
             });
             if (!result.ok) {
-                return interaction.editReply(`❌ Server refused: \`${(result.body && result.body.reason) || result.reason || 'unknown'}\``);
+                return interaction.editReply(`❌ Server refused: \`${serverActionFailure(result)}\``);
             }
             const key = result.body && result.body.key;
             if (!key) {
@@ -973,7 +1070,7 @@ client.on('interactionCreate', async (interaction) => {
                 discord_id: interaction.user.id,
             });
             if (!result.ok || !result.body || !Array.isArray(result.body.keys)) {
-                return interaction.editReply(`❌ Server refused bulk_create: \`${(result.body && result.body.reason) || result.reason || 'unknown'}\``);
+                return interaction.editReply(`❌ Server refused bulk_create: \`${serverActionFailure(result)}\``);
             }
             const keys = result.body.keys;
             await logAudit(interaction, 'license.bulk_generate', `count=${keys.length}`, { plan, expires, note, keys });
@@ -1004,7 +1101,7 @@ client.on('interactionCreate', async (interaction) => {
 
             const result = await callServerAction('revoke', { key, reason: 'discord_bot_revoke' });
             if (!result.ok) {
-                return interaction.editReply(`❌ Server refused revoke: \`${(result.body && result.body.reason) || result.reason || 'unknown'}\``);
+                return interaction.editReply(`❌ Server refused revoke: \`${serverActionFailure(result)}\``);
             }
             await logAudit(interaction, 'license.revoke', key, { plan: data.plan, hwid: data.hwid, note: data.note });
 
@@ -1083,14 +1180,7 @@ client.on('interactionCreate', async (interaction) => {
                 return `${label} ${lock} \`${d.key}\` — \`${d.plan || '?'}\`${note}`;
             });
 
-            const chunks = [];
-            let cur = '';
-            for (const line of lines) {
-                const next = cur ? `${cur}\n${line}` : line;
-                if (next.length > 3800) { chunks.push(cur); cur = line; }
-                else cur = next;
-            }
-            if (cur) chunks.push(cur);
+            const chunks = chunkLines(lines);
 
             const embeds = chunks.map((chunk, i) =>
                 new EmbedBuilder()
@@ -1103,7 +1193,7 @@ client.on('interactionCreate', async (interaction) => {
                     .setTimestamp(),
             );
 
-            await interaction.editReply({ embeds: embeds.slice(0, 10) });
+            await sendEmbedPages(interaction, embeds);
         }
 
         // ── /search ───────────────────────────────────────────────────────────
@@ -1129,14 +1219,19 @@ client.on('interactionCreate', async (interaction) => {
                 return `${label} \`${d.key}\` — \`${d.plan || '?'}\`${note}`;
             });
 
-            await interaction.editReply({ embeds: [
+            const displayedLines = lines.slice(0, 30);
+            const chunks = chunkLines(displayedLines);
+            const embeds = chunks.map((chunk, i) =>
                 new EmbedBuilder()
-                    .setTitle(`🔍 Search: "${query}" — ${matches.length} result(s)`)
+                    .setTitle(i === 0
+                        ? `Search: "${query}" - ${matches.length} result(s)`
+                        : 'Search continued')
                     .setColor(0xA855F7)
-                    .setDescription(lines.slice(0, 30).join('\n'))
-                    .setFooter({ text: 'Showing first 30 results' })
+                    .setDescription(chunk)
+                    .setFooter({ text: `Showing first ${displayedLines.length} result(s)` })
                     .setTimestamp(),
-            ]});
+            );
+            await sendEmbedPages(interaction, embeds);
         }
 
         // ── /stats ────────────────────────────────────────────────────────────
@@ -1184,7 +1279,7 @@ client.on('interactionCreate', async (interaction) => {
 
             const result = await callServerAction('reset_hwid', { key });
             if (!result.ok) {
-                return interaction.editReply(`❌ Server refused reset_hwid: \`${(result.body && result.body.reason) || result.reason || 'unknown'}\``);
+                return interaction.editReply(`❌ Server refused reset_hwid: \`${serverActionFailure(result)}\``);
             }
             await logAudit(interaction, 'license.reset_hwid', key, { previous_hwid: data.hwid });
 
@@ -1426,14 +1521,7 @@ client.on('interactionCreate', async (interaction) => {
                 lines.push(`🌐 IP \`${ip}\`${reason}`);
             }
 
-            const chunks = [];
-            let cur = '';
-            for (const line of lines) {
-                const next = cur ? `${cur}\n${line}` : line;
-                if (next.length > 3800) { chunks.push(cur); cur = line; }
-                else cur = next;
-            }
-            if (cur) chunks.push(cur);
+            const chunks = chunkLines(lines);
 
             const embeds = chunks.map((chunk, i) =>
                 new EmbedBuilder()
@@ -1444,7 +1532,7 @@ client.on('interactionCreate', async (interaction) => {
                     .setDescription(chunk)
                     .setTimestamp(),
             );
-            await interaction.editReply({ embeds: embeds.slice(0, 10) });
+            await sendEmbedPages(interaction, embeds);
         }
 
         // ── /violations ───────────────────────────────────────────────────────
@@ -1466,14 +1554,18 @@ client.on('interactionCreate', async (interaction) => {
                 return `\`${time}\` 🚨 **${d.reason || '?'}** — HWID \`${(d.hwid || '?').slice(0, 12)}…\` IP \`${d.ip || '?'}\``;
             });
 
-            await interaction.editReply({ embeds: [
+            const chunks = chunkLines(lines);
+            const embeds = chunks.map((chunk, i) =>
                 new EmbedBuilder()
-                    .setTitle(`🚨 Violation Log (${entries.length}/${totalCount})`)
+                    .setTitle(i === 0
+                        ? `Violation Log (${entries.length}/${totalCount})`
+                        : 'Violation Log continued')
                     .setColor(0xFF8800)
-                    .setDescription(lines.join('\n'))
+                    .setDescription(chunk)
                     .setFooter({ text: `Showing ${entries.length} most recent` })
                     .setTimestamp(),
-            ]});
+            );
+            await sendEmbedPages(interaction, embeds);
         }
 
         // ── /lookup_hwid ──────────────────────────────────────────────────────
@@ -1502,14 +1594,22 @@ client.on('interactionCreate', async (interaction) => {
                 ? `\n\n⛔ **This HWID is BANNED** — ${ban.reason || 'no reason'} (${ban.banned_at_iso || '?'})`
                 : '';
 
-            await interaction.editReply({ embeds: [
+            const prefix = `\`\`\`\n${hwid}\n\`\`\``;
+            const chunks = chunkLines(lines);
+            if (banLine && chunks.length > 0) {
+                const last = chunks[chunks.length - 1];
+                if ((last + banLine).length <= 3800) chunks[chunks.length - 1] = last + banLine;
+                else chunks.push(banLine.trim());
+            }
+            const embeds = chunks.map((chunk, i) =>
                 new EmbedBuilder()
-                    .setTitle(`🔎 Licenses for HWID`)
+                    .setTitle(i === 0 ? 'Licenses for HWID' : 'Licenses for HWID continued')
                     .setColor(ban ? 0xFF4444 : 0x5865F2)
-                    .setDescription(`\`\`\`\n${hwid}\n\`\`\`\n${lines.join('\n')}${banLine}`)
+                    .setDescription((i === 0 ? `${prefix}\n` : '') + chunk)
                     .setFooter({ text: `${matches.length} license(s) found` })
                     .setTimestamp(),
-            ]});
+            );
+            await sendEmbedPages(interaction, embeds);
         }
 
         // ── /transfer ─────────────────────────────────────────────────────────
@@ -1524,7 +1624,7 @@ client.on('interactionCreate', async (interaction) => {
             const oldHwid = data.hwid || '*(unbound)*';
             const result = await callServerAction('transfer', { key, new_hwid: newHwid });
             if (!result.ok) {
-                return interaction.editReply(`❌ Server refused transfer: \`${(result.body && result.body.reason) || result.reason || 'unknown'}\``);
+                return interaction.editReply(`❌ Server refused transfer: \`${serverActionFailure(result)}\``);
             }
             await logAudit(interaction, 'license.transfer', key, { previous_hwid: data.hwid, new_hwid: newHwid });
 
@@ -1651,14 +1751,7 @@ client.on('interactionCreate', async (interaction) => {
                 return `🔑 \`${s.license_key}\` — ${hwid} — last heartbeat: ${lastHb}`;
             });
 
-            const chunks = [];
-            let cur = '';
-            for (const line of lines) {
-                const next = cur ? `${cur}\n${line}` : line;
-                if (next.length > 3800) { chunks.push(cur); cur = line; }
-                else cur = next;
-            }
-            if (cur) chunks.push(cur);
+            const chunks = chunkLines(lines);
 
             const embeds = chunks.map((chunk, i) =>
                 new EmbedBuilder()
@@ -1669,7 +1762,7 @@ client.on('interactionCreate', async (interaction) => {
                     .setDescription(chunk)
                     .setTimestamp(),
             );
-            await interaction.editReply({ embeds: embeds.slice(0, 10) });
+            await sendEmbedPages(interaction, embeds);
         }
 
         // ── /nuke ─────────────────────────────────────────────────────────────
@@ -1930,7 +2023,7 @@ client.on('interactionCreate', async (interaction) => {
                 discord_id: interaction.user.id,
             });
             if (!result.ok) {
-                return interaction.editReply(`❌ Server refused kill: \`${(result.body && result.body.reason) || result.reason || 'unknown'}\``);
+                return interaction.editReply(`❌ Server refused kill: \`${serverActionFailure(result)}\``);
             }
             await logAudit(interaction, 'kill_switch.license_key', key, { reason });
             await callServerAuditLog('bot.kill_switch.license_key', key, interaction.user.id, reason, {});
@@ -1961,7 +2054,7 @@ client.on('interactionCreate', async (interaction) => {
                 discord_id: interaction.user.id,
             });
             if (!result.ok) {
-                return interaction.editReply(`❌ Server refused kill: \`${(result.body && result.body.reason) || result.reason || 'unknown'}\``);
+                return interaction.editReply(`❌ Server refused kill: \`${serverActionFailure(result)}\``);
             }
             await logAudit(interaction, 'kill_switch.hwid_hash', hwidHash, { reason });
             await callServerAuditLog('bot.kill_switch.hwid_hash', hwidHash, interaction.user.id, reason, {});
@@ -1989,7 +2082,7 @@ client.on('interactionCreate', async (interaction) => {
                 discord_id: interaction.user.id,
             });
             if (!result.ok) {
-                return interaction.editReply(`❌ Server refused: \`${(result.body && result.body.reason) || result.reason || 'unknown'}\``);
+                return interaction.editReply(`❌ Server refused: \`${serverActionFailure(result)}\``);
             }
             await logAudit(interaction, 'kill_switch.global', mode, { reason });
             await callServerAuditLog('bot.kill_switch.global', mode, interaction.user.id, reason, {});
