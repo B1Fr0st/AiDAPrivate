@@ -116,9 +116,13 @@ inline void find_xrefs_to(uint64_t target_addr, uint64_t search_start, uint64_t 
 		}
 	}
 
-	work_queue::post([target_addr, search_start, search_size, module_name]() {
+	if (!work_queue::post([target_addr, search_start, search_size, module_name]() {
+		struct scan_finish_t {
+			~scan_finish_t() { g_state.scanning.store(false); }
+		} scan_finish;
+
 		const size_t page_size = 4096;
-		uint64_t total = search_size;
+		uint64_t total = search_size ? search_size : 1;
 		uint64_t scanned = 0;
 
 		for (uint64_t offset = 0; offset < search_size && !g_state.cancel.load(); offset += page_size) {
@@ -143,9 +147,10 @@ inline void find_xrefs_to(uint64_t target_addr, uint64_t search_start, uint64_t 
 
 				uint64_t ins_addr = search_start + offset + pos;
 				AsmInstr ins = zydis_decode_one(data + pos, avail, ins_addr);
+				const int ins_len = (ins.len > 0 && ins.len <= avail) ? ins.len : 1;
 
 				uint64_t resolved_target = 0;
-				if (detail::extract_target(data + pos, ins.len, ins_addr, ins, resolved_target)) {
+				if (ins.len > 0 && ins.len <= avail && detail::extract_target(data + pos, ins.len, ins_addr, ins, resolved_target)) {
 					if (resolved_target == target_addr) {
 						xref_t xref;
 						xref.from_addr = ins_addr;
@@ -160,15 +165,16 @@ inline void find_xrefs_to(uint64_t target_addr, uint64_t search_start, uint64_t 
 					}
 				}
 
-				pos += ins.len;
+				pos += ins_len;
 			}
 
 			scanned += chunk;
 			g_state.progress.store(static_cast<float>(scanned) / static_cast<float>(total));
 		}
 
+	})) {
 		g_state.scanning.store(false);
-	});
+	}
 }
 
 inline void find_xrefs_from(uint64_t source_addr, size_t max_instructions, std::vector<xref_t>& out)
@@ -196,9 +202,10 @@ inline void find_xrefs_from(uint64_t source_addr, size_t max_instructions, std::
 
 		uint64_t ins_addr = source_addr + pos;
 		AsmInstr ins = zydis_decode_one(data + pos, avail, ins_addr);
+		const int ins_len = (ins.len > 0 && ins.len <= avail) ? ins.len : 1;
 
 		uint64_t resolved_target = 0;
-		if (detail::extract_target(data + pos, ins.len, ins_addr, ins, resolved_target)) {
+		if (ins.len > 0 && ins.len <= avail && detail::extract_target(data + pos, ins.len, ins_addr, ins, resolved_target)) {
 			xref_t xref;
 			xref.from_addr = ins_addr;
 			xref.to_addr = resolved_target;
@@ -220,7 +227,7 @@ inline void find_xrefs_from(uint64_t source_addr, size_t max_instructions, std::
 		if (ins.is_ret)
 			break;
 
-		pos += ins.len;
+		pos += ins_len;
 		++count;
 	}
 }

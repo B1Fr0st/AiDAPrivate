@@ -25,6 +25,7 @@
 #include "anti-tamper/virtualizer.hpp"
 #include "anti-tamper/vm_compiler.hpp"
 #include "standalone_anti_ai.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #ifndef CPPHTTPLIB_OPENSSL_SUPPORT
 #define CPPHTTPLIB_OPENSSL_SUPPORT
@@ -51,6 +52,44 @@ namespace webhook
     inline void send_violation_alert(const std::string& reason, const std::string& extra_detail = "")
     {
         anti_tamper::webhook::send_violation_alert(reason.c_str(), extra_detail);
+    }
+}
+
+namespace runtime_enforcement_detail
+{
+    inline bool env_flag_enabled(const char* name)
+    {
+        if (!name || !*name)
+            return false;
+        char value[16] = {};
+        DWORD n = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+        if (n == 0)
+            return false;
+        if (n >= sizeof(value))
+            return true;
+        return value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+    }
+
+    inline bool destructive_enforcement_suppressed()
+    {
+#ifdef NDEBUG
+        return false;
+#else
+        return env_flag_enabled("AIDA_FULL_TEST_RUNNING") ||
+               env_flag_enabled("AIDA_DISABLE_DESTRUCTIVE_ENFORCEMENT");
+#endif
+    }
+
+    inline void log_suppressed(const char* reason)
+    {
+        char msg[192];
+        _snprintf_s(msg, sizeof(msg), _TRUNCATE,
+            "runtime_destructive_enforcement_suppressed reason=%s env_full_test=%d env_disable=%d",
+            reason ? reason : "standalone_tamper",
+            env_flag_enabled("AIDA_FULL_TEST_RUNNING") ? 1 : 0,
+            env_flag_enabled("AIDA_DISABLE_DESTRUCTIVE_ENFORCEMENT") ? 1 : 0);
+        diag::log_tagged_critical("standalone_anti_tamper", msg);
+        anti_tamper::webhook::write_log("standalone_anti_tamper", msg);
     }
 }
 
@@ -463,7 +502,26 @@ inline void enforce_violation(const char* reason, const std::string& extra = "")
         rt.violation_reason = reason ? reason : "standalone_tamper";
     }
 
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll)
+    {
+        using NtSetInformationProcess_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
+        auto pSetInfo = reinterpret_cast<NtSetInformationProcess_t>(
+            GetProcAddress(ntdll, "NtSetInformationProcess"));
+        if (pSetInfo)
+        {
+            ULONG one = 1;
+            pSetInfo(GetCurrentProcess(), 0x1D, &one, sizeof(one));
+        }
+    }
+
     webhook::send_violation_alert(reason ? reason : "standalone_tamper", extra);
+
+    if (runtime_enforcement_detail::destructive_enforcement_suppressed())
+    {
+        runtime_enforcement_detail::log_suppressed(reason);
+        return;
+    }
 
     standalone_license::shutdown();
 
@@ -475,7 +533,6 @@ inline void enforce_violation(const char* reason, const std::string& extra = "")
         );
     }
 
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (ntdll)
     {
         using RtlAdjustPrivilege_t = NTSTATUS(NTAPI*)(

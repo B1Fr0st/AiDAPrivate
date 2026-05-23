@@ -208,14 +208,61 @@ namespace function_index {
 			return h;
 		}
 
+		inline std::atomic<uint64_t>& cache_holder_generation() {
+			static std::atomic<uint64_t> g{1};
+			return g;
+		}
+
+		inline std::atomic<uint64_t>& cache_lifecycle_log_counter() {
+			static std::atomic<uint64_t> n{0};
+			return n;
+		}
+
+		inline bool should_log_cache_lifecycle() {
+			uint64_t n = cache_lifecycle_log_counter().fetch_add(1, std::memory_order_relaxed) + 1;
+			return n <= 64 || (n % 65536) == 0;
+		}
+
 		inline std::shared_ptr<cache_t> active_cache_snapshot() {
 			std::lock_guard<std::mutex> lk(holder_swap_mtx());
-			return cache_holder_sp();
+			auto& holder = cache_holder_sp();
+			if (should_log_cache_lifecycle()) {
+				diag::log_tagged_critical_fmt("fn_index_cache",
+					"active_cache_snapshot pre_copy tid=%lu holder_raw=%p",
+					static_cast<unsigned long>(GetCurrentThreadId()), holder.get());
+			}
+			auto snap = holder;
+			if (should_log_cache_lifecycle()) {
+				diag::log_tagged_critical_fmt("fn_index_cache",
+					"active_cache_snapshot post_copy tid=%lu snap_raw=%p",
+					static_cast<unsigned long>(GetCurrentThreadId()), snap.get());
+			}
+			return snap;
 		}
 
 		inline cache_t& cache() {
 			static thread_local std::shared_ptr<cache_t> tl_keepalive;
-			tl_keepalive = active_cache_snapshot();
+			static thread_local uint64_t tl_generation = 0;
+			uint64_t gen = cache_holder_generation().load(std::memory_order_acquire);
+			if (!tl_keepalive || tl_generation != gen) {
+				auto snap = active_cache_snapshot();
+				if (should_log_cache_lifecycle()) {
+					diag::log_tagged_critical_fmt("fn_index_cache",
+						"cache pre_tls_assign tid=%lu gen=%llu old_tls_raw=%p new_snap_raw=%p",
+						static_cast<unsigned long>(GetCurrentThreadId()),
+						static_cast<unsigned long long>(gen),
+						tl_keepalive.get(), snap.get());
+				}
+				tl_keepalive = std::move(snap);
+				tl_generation = gen;
+				if (should_log_cache_lifecycle()) {
+					diag::log_tagged_critical_fmt("fn_index_cache",
+						"cache post_tls_assign tid=%lu gen=%llu tls_raw=%p",
+						static_cast<unsigned long>(GetCurrentThreadId()),
+						static_cast<unsigned long long>(tl_generation),
+						tl_keepalive.get());
+				}
+			}
 			return *tl_keepalive;
 		}
 
@@ -3826,8 +3873,20 @@ namespace function_index {
 		std::shared_ptr<detail::cache_t> out;
 		{
 			std::lock_guard<std::mutex> swap_lk(detail::holder_swap_mtx());
+			diag::log_tagged_critical_fmt("fn_index_cache",
+				"detach_snapshot pre_swap tid=%lu old_raw=%p new_raw=%p",
+				static_cast<unsigned long>(GetCurrentThreadId()),
+				detail::cache_holder_sp().get(),
+				new_cache.get());
 			out = detail::cache_holder_sp();
 			detail::cache_holder_sp() = new_cache;
+			uint64_t gen = detail::cache_holder_generation().fetch_add(1, std::memory_order_acq_rel) + 1;
+			diag::log_tagged_critical_fmt("fn_index_cache",
+				"detach_snapshot post_swap tid=%lu gen=%llu detached_raw=%p active_raw=%p",
+				static_cast<unsigned long>(GetCurrentThreadId()),
+				static_cast<unsigned long long>(gen),
+				out.get(),
+				detail::cache_holder_sp().get());
 		}
 		return out;
 	}
@@ -3835,7 +3894,18 @@ namespace function_index {
 	inline void attach_snapshot(std::shared_ptr<detail::cache_t> snap) {
 		if (!snap) snap = std::make_shared<detail::cache_t>();
 		std::lock_guard<std::mutex> swap_lk(detail::holder_swap_mtx());
+		diag::log_tagged_critical_fmt("fn_index_cache",
+			"attach_snapshot pre_swap tid=%lu old_raw=%p incoming_raw=%p",
+			static_cast<unsigned long>(GetCurrentThreadId()),
+			detail::cache_holder_sp().get(),
+			snap.get());
 		detail::cache_holder_sp() = std::move(snap);
+		uint64_t gen = detail::cache_holder_generation().fetch_add(1, std::memory_order_acq_rel) + 1;
+		diag::log_tagged_critical_fmt("fn_index_cache",
+			"attach_snapshot post_swap tid=%lu gen=%llu active_raw=%p",
+			static_cast<unsigned long>(GetCurrentThreadId()),
+			static_cast<unsigned long long>(gen),
+			detail::cache_holder_sp().get());
 	}
 
 }

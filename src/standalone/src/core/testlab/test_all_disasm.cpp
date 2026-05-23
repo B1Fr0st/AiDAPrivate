@@ -1,5 +1,6 @@
 #include "test_all_disasm.h"
 
+#include "test_all_features.hpp"
 #include "../disasm/disasm_view.hpp"
 #include "../disasm/pseudocode_view.hpp"
 #include "../disasm/function_index.hpp"
@@ -10,6 +11,7 @@
 #include "../editor/hex_view.hpp"
 #include "../editor/expression_eval.hpp"
 #include "../debugger/debugger_engine.hpp"
+#include "../runtime/standalone_driver.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/globals.h"
 
@@ -48,7 +50,33 @@ namespace {
         OutputDebugStringA(s.c_str());
     }
 
+    uint64_t resolve_remote_module_base(const char* module_name) {
+        const uint32_t pid = driver_bridge::attached_pid();
+        if (pid == 0)
+            return 0;
+        for (const auto& mod : driver_bridge::enumerate_modules_for(pid)) {
+            if (_stricmp(mod.name.c_str(), module_name) == 0)
+                return mod.base;
+        }
+        return 0;
+    }
+
     uint64_t resolve_ntclose() {
+        const uint64_t remote_ntdll = resolve_remote_module_base("ntdll.dll");
+        if (remote_ntdll != 0) {
+            const uint64_t resolved = driver_bridge::resolve_export(remote_ntdll, "NtClose");
+            if (resolved != 0)
+                return resolved;
+
+            HMODULE local_ntdll = GetModuleHandleW(L"ntdll.dll");
+            FARPROC local_fn = local_ntdll ? GetProcAddress(local_ntdll, "NtClose") : nullptr;
+            if (local_ntdll && local_fn) {
+                const uint64_t offset =
+                    reinterpret_cast<uintptr_t>(local_fn) - reinterpret_cast<uintptr_t>(local_ntdll);
+                return remote_ntdll + offset;
+            }
+        }
+
         HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
         if (!ntdll) return 0;
         FARPROC fn = GetProcAddress(ntdll, "NtClose");
@@ -153,7 +181,6 @@ namespace {
                              std::vector<xref_index::annotation_t>& out, int timeout_ms) {
         const uint64_t warm_lo = (addr > 0x40000ull) ? addr - 0x40000ull : 0;
         const uint64_t warm_hi = addr + 0x40000ull;
-        xref_index::on_attach_changed();
         xref_index::warm_range(warm_lo, warm_hi);
 
         const int step_ms = 50;
@@ -730,8 +757,13 @@ namespace {
             pseudocode_view::close_tab_by_addr(addr);
             log_msg(hf, tag, "INPUT -- creating tab for 0x%016llX then snapshot_tabs()",
                 (unsigned long long)addr);
+            log_msg(hf, tag, "TRACE -- before request_decompile tab_count=%d",
+                pseudocode_view::tab_count());
             pseudocode_view::request_decompile(addr, nullptr, false);
+            log_msg(hf, tag, "TRACE -- after request_decompile tab_count=%d; before snapshot_tabs",
+                pseudocode_view::tab_count());
             auto tabs = pseudocode_view::snapshot_tabs();
+            log_msg(hf, tag, "TRACE -- after snapshot_tabs count=%zu", tabs.size());
             log_msg(hf, tag, "OUTPUT -- snapshot_tabs() returned %zu tabs", tabs.size());
             bool found = false;
             for (size_t i = 0; i < tabs.size() && i < 8; ++i) {
@@ -2181,7 +2213,6 @@ namespace {
 }
 
 void phase_disasm_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
-    log_msg(hf, "disasm_phase", "=== DISASM TESTS START (109 tests) ===");
     auto t0 = std::chrono::steady_clock::now();
 
     struct test_entry_t {
@@ -2313,6 +2344,7 @@ void phase_disasm_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& f
     };
 
     int total = static_cast<int>(sizeof(tests) / sizeof(tests[0]));
+    log_msg(hf, "disasm_phase", "=== DISASM TESTS START (%d tests) ===", total);
     for (int i = 0; i < total; ++i) {
         if (cancelled && cancelled()) {
             int remaining = total - i;
@@ -2320,8 +2352,26 @@ void phase_disasm_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& f
             log_msg(hf, "disasm_phase", "cancelled -- skipping %d remaining tests", remaining);
             break;
         }
+        const uint32_t attached_pid = driver_bridge::attached_pid();
+        if (attached_pid != 0) {
+            uint32_t exit_code = 0;
+            if (!driver_bridge::attached_process_alive(&exit_code)) {
+                int remaining = total - i;
+                failed.fetch_add(1);
+                skipped.fetch_add(remaining);
+                log_msg(hf, "disasm_phase", "FAIL -- attached target pid=%u is dead before %s exit_code_or_err=0x%08X; skipping %d remaining disasm tests",
+                    attached_pid, tests[i].name, exit_code, remaining);
+                break;
+            }
+        }
 
-        log_msg(hf, "disasm_phase", "[%d/%d] %s", i + 1, total, tests[i].name);
+        char progress[160];
+        _snprintf_s(progress, sizeof(progress), _TRUNCATE,
+            "disasm [%d/%d] %s", i + 1, total, tests[i].name);
+        set_progress_step(progress);
+
+        log_msg(hf, "disasm_phase", "[%d/%d] START %s", i + 1, total, tests[i].name);
+        auto test_t0 = std::chrono::steady_clock::now();
         __try {
             tests[i].fn(hf, passed, failed, skipped);
         }
@@ -2330,10 +2380,16 @@ void phase_disasm_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& f
                 tests[i].name, GetExceptionCode());
             failed.fetch_add(1);
         }
+        auto test_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - test_t0).count();
+        log_msg(hf, "disasm_phase", "[%d/%d] END %s elapsed=%lld ms totals pass=%d fail=%d skip=%d",
+            i + 1, total, tests[i].name, (long long)test_ms,
+            passed.load(), failed.load(), skipped.load());
     }
 
     auto t1 = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    set_progress_step("disasm complete");
     log_msg(hf, "disasm_phase", "=== DISASM TESTS DONE (elapsed %lld ms) ===", (long long)ms);
 }
 

@@ -78,6 +78,11 @@ namespace trapframe_ctx {
     constexpr ULONG KTHREAD_DEBUG_ACTIVE     = 0x03;
     constexpr ULONG DR7_USER_MASK            = 0xFFFF0355;
     constexpr ULONG DR7_ACTIVE_BITS          = 0x0355;
+    constexpr UINT64 DR7_GLOBAL_ENABLE_BITS  = 0xAAULL;
+
+    __forceinline UINT64 sanitize_user_dr7(UINT64 dr7) {
+        return (dr7 & DR7_USER_MASK) & ~DR7_GLOBAL_ENABLE_BITS;
+    }
 
 
     constexpr ULONG TF_RAX    = 0x30;
@@ -233,7 +238,7 @@ namespace trapframe_ctx {
             if (mask & (1ULL << 21)) *(UINT64*)(tf + TF_DR3) = request->dr3;
             if (mask & (1ULL << 22)) *(UINT64*)(tf + TF_DR6) = request->dr6;
             if (mask & (1ULL << 23)) {
-                UINT64 sanitized = request->dr7 & DR7_USER_MASK;
+                UINT64 sanitized = sanitize_user_dr7(request->dr7);
                 *(UINT64*)(tf + TF_DR7) = sanitized;
             }
 
@@ -291,6 +296,9 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
             return STATUS_INVALID_CID;
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        _ObfDereferenceObject(thread);
+        _ObfDereferenceObject(process);
+        return STATUS_INVALID_CID;
     }
 
     dbg_guard::timing_scatter();
@@ -423,7 +431,7 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
                 if (mask & (1ULL << 20)) ctx.Dr2    = request->dr2;
                 if (mask & (1ULL << 21)) ctx.Dr3    = request->dr3;
                 if (mask & (1ULL << 22)) ctx.Dr6    = request->dr6;
-                if (mask & (1ULL << 23)) ctx.Dr7    = request->dr7;
+                if (mask & (1ULL << 23)) ctx.Dr7    = trapframe_ctx::sanitize_user_dr7(request->dr7);
 
                 ctx.ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
                 status = STATUS_PROCEDURE_NOT_FOUND;

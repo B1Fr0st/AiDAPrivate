@@ -633,11 +633,24 @@ tool_result_t driver_attach(const json& params)
     if (is_self_target_pid(pid))
         return tool_result_t::error(OBFSTR("Cannot attach to AiDA's own process."));
 
-    std::uint64_t base = device->find_image();
+    if (!driver_bridge::attach(pid))
+        return tool_result_t::error(
+            OBFSTR("Failed to attach to process: ") + process_name +
+            OBFSTR(". ") + driver_bridge::last_error());
+
+    std::uint64_t base = device->get_base_address();
+    if (base == 0)
+    {
+        base = device->find_image();
+        if (base != 0)
+            device->set_base_address(base);
+    }
+
+    if (device->get_dtb() == 0)
+        device->solve_dtb();
+
     if (base == 0)
         return tool_result_t::error(OBFSTR("Failed to locate image base for process: ") + process_name);
-
-    device->solve_dtb();
 
     json result;
     result["process_name"] = process_name;
@@ -658,16 +671,20 @@ tool_result_t driver_unattach(const json&)
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
     }
 
-    const std::uint32_t previous_pid = device->get_process_id();
+    const std::uint32_t bridge_pid = driver_bridge::attached_pid();
+    const std::uint32_t previous_pid = bridge_pid != 0 ? bridge_pid : device->get_process_id();
     const std::uint64_t previous_base = device->get_base_address();
     const std::uint64_t previous_dtb = device->get_dtb();
 
-    device->clear_process_context();
+    const bool bridge_cleared = driver_bridge::clear_active_pid();
+    if (!bridge_cleared)
+        device->clear_process_context();
 
     json result;
     result["previous_process_id"] = previous_pid;
     result["previous_base_address"] = sa_format_address(static_cast<uint64_t>(previous_base));
     result["previous_dtb"] = sa_format_address(static_cast<uint64_t>(previous_dtb));
+    result["bridge_cleared"] = bridge_cleared;
     result["connected"] = device->is_connected();
     result["process_id"] = device->get_process_id();
     result["base_address"] = sa_format_address(device->get_base_address());
@@ -4994,6 +5011,24 @@ struct sys_module_info_t
     sys_module_entry_t Modules[1];
 };
 
+static std::string bounded_kernel_module_path(const sys_module_entry_t& m)
+{
+    const char* p = reinterpret_cast<const char*>(m.FullPathName);
+    std::size_t len = 0;
+    while (len < sizeof(m.FullPathName) && p[len] != '\0')
+        ++len;
+    return std::string(p, len);
+}
+
+static std::string bounded_kernel_module_name(const sys_module_entry_t& m)
+{
+    std::string path = bounded_kernel_module_path(m);
+    if (m.OffsetToFileName < path.size())
+        return path.substr(m.OffsetToFileName);
+    std::size_t slash = path.find_last_of("\\/");
+    return (slash == std::string::npos) ? path : path.substr(slash + 1);
+}
+
 typedef LONG(NTAPI* NtQuerySystemInformation_fn)(
     ULONG SystemInformationClass,
     PVOID SystemInformation,
@@ -5022,6 +5057,7 @@ static bool query_kernel_modules(
 
     constexpr ULONG SystemModuleInformation = 11;
     ULONG needed = 0;
+    diag::log_tagged_fmt("drv_tools", "query_kernel_modules entry");
     pNtQuerySystemInformation(SystemModuleInformation, nullptr, 0, &needed);
     if (needed == 0)
         needed = 256 * 1024;
@@ -5040,6 +5076,22 @@ static bool query_kernel_modules(
     }
 
     out_info = reinterpret_cast<sys_module_info_t*>(out_buffer.data());
+    if (out_buffer.size() < sizeof(ULONG))
+    {
+        error_msg = OBFSTR("System module buffer is too small");
+        return false;
+    }
+    const ULONG count = out_info->NumberOfModules;
+    const std::size_t min_size =
+        sizeof(ULONG) + static_cast<std::size_t>(count) * sizeof(sys_module_entry_t);
+    if (count > 4096 || min_size > out_buffer.size())
+    {
+        error_msg = OBFSTR("System module buffer failed bounds validation: count=") +
+            std::to_string(count) + OBFSTR(" buffer=") + std::to_string(out_buffer.size());
+        return false;
+    }
+    diag::log_tagged_fmt("drv_tools", "query_kernel_modules ok count=%lu bytes=%zu",
+        static_cast<unsigned long>(count), out_buffer.size());
     return true;
 }
 
@@ -5062,8 +5114,8 @@ tool_result_t driver_enumerate_kernel_modules(const json& params)
     for (ULONG i = 0; i < info->NumberOfModules && static_cast<int>(modules_arr.size()) < limit; i++)
     {
         const auto& m = info->Modules[i];
-        std::string full_path(reinterpret_cast<const char*>(m.FullPathName));
-        std::string name(reinterpret_cast<const char*>(m.FullPathName + m.OffsetToFileName));
+        std::string full_path = bounded_kernel_module_path(m);
+        std::string name = bounded_kernel_module_name(m);
 
         if (!filter.empty())
         {
@@ -5115,6 +5167,10 @@ tool_result_t driver_dump_kernel_module(const json& params)
     bool use_memory = params.value("from_memory", true);
     bool patch_idb  = params.value("patch_idb", true);
     bool analyze    = params.value("analyze", true);
+    diag::log_tagged_fmt("drv_tools",
+        "driver_dump_kernel_module params module='%s' from_memory=%d patch_idb=%d analyze=%d output='%s'",
+        module_name.c_str(), use_memory ? 1 : 0, patch_idb ? 1 : 0,
+        analyze ? 1 : 0, output_path.c_str());
 
     std::vector<std::uint8_t> buf;
     sys_module_info_t* info = nullptr;
@@ -5134,8 +5190,8 @@ tool_result_t driver_dump_kernel_module(const json& params)
     for (ULONG i = 0; i < info->NumberOfModules; i++)
     {
         const auto& m = info->Modules[i];
-        std::string name(reinterpret_cast<const char*>(m.FullPathName + m.OffsetToFileName));
-        std::string full_path(reinterpret_cast<const char*>(m.FullPathName));
+        std::string name = bounded_kernel_module_name(m);
+        std::string full_path = bounded_kernel_module_path(m);
 
         std::string lower_name = name;
         std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
@@ -5156,6 +5212,12 @@ tool_result_t driver_dump_kernel_module(const json& params)
         return tool_result_t::error(
             OBFSTR("Kernel module not found: ") + module_name +
             OBFSTR(". Use driver_enumerate_kernel_modules with filter to list loaded drivers."));
+    diag::log_tagged_fmt("drv_tools",
+        "driver_dump_kernel_module found name='%s' base=0x%llX size=0x%lX nt_path='%s'",
+        found_name.c_str(),
+        static_cast<unsigned long long>(found_base),
+        static_cast<unsigned long>(found_size),
+        found_nt_path.c_str());
 
     if (use_memory)
     {
@@ -5231,29 +5293,36 @@ tool_result_t driver_dump_kernel_module(const json& params)
                 " - anti-cheat header erasure detected. Will synthesize PE header.");
         }
 
-
-        protection_analysis_t kd_protection = analyze_module_protection(
-            device.get(), base_addr, header_buf.data(), header_read,
-            has_valid_pe, header_wiped, pe_off, num_sections,
-            section_table_off, image_size, true, steps);
-
-        if (kd_protection.is_packed || kd_protection.is_vmprotected ||
-            kd_protection.is_themida)
+        protection_analysis_t kd_protection;
+        if (analyze)
         {
-            msg(OBFSTR_C("AiDA: kernel module protection detected - VMProtect=%s Themida=%s Packed=%s "
-                "encrypted_sections=%d high_entropy_pages=%d\n"),
-                kd_protection.is_vmprotected ? "YES" : "no",
-                kd_protection.is_themida ? "YES" : "no",
-                kd_protection.is_packed ? "YES" : "no",
-                kd_protection.encrypted_section_count,
-                kd_protection.high_entropy_pages);
-            log("protection_analysis", true,
-                "Kernel module protections: VMProtect=" +
-                std::string(kd_protection.is_vmprotected ? "YES" : "no") +
-                " Themida=" + std::string(kd_protection.is_themida ? "YES" : "no") +
-                " packed=" + std::string(kd_protection.is_packed ? "YES" : "no") +
-                " encrypted_sections=" + std::to_string(kd_protection.encrypted_section_count) +
-                " avg_entropy=" + std::to_string(kd_protection.avg_code_entropy));
+            kd_protection = analyze_module_protection(
+                device.get(), base_addr, header_buf.data(), header_read,
+                has_valid_pe, header_wiped, pe_off, num_sections,
+                section_table_off, image_size, true, steps);
+
+            if (kd_protection.is_packed || kd_protection.is_vmprotected ||
+                kd_protection.is_themida)
+            {
+                msg(OBFSTR_C("AiDA: kernel module protection detected - VMProtect=%s Themida=%s Packed=%s "
+                    "encrypted_sections=%d high_entropy_pages=%d\n"),
+                    kd_protection.is_vmprotected ? "YES" : "no",
+                    kd_protection.is_themida ? "YES" : "no",
+                    kd_protection.is_packed ? "YES" : "no",
+                    kd_protection.encrypted_section_count,
+                    kd_protection.high_entropy_pages);
+                log("protection_analysis", true,
+                    "Kernel module protections: VMProtect=" +
+                    std::string(kd_protection.is_vmprotected ? "YES" : "no") +
+                    " Themida=" + std::string(kd_protection.is_themida ? "YES" : "no") +
+                    " packed=" + std::string(kd_protection.is_packed ? "YES" : "no") +
+                    " encrypted_sections=" + std::to_string(kd_protection.encrypted_section_count) +
+                    " avg_entropy=" + std::to_string(kd_protection.avg_code_entropy));
+            }
+        }
+        else
+        {
+            log("protection_analysis", true, "skipped because analyze=false");
         }
 
         std::uint32_t dump_size = image_size;
@@ -5419,7 +5488,7 @@ tool_result_t driver_dump_kernel_module(const json& params)
             std::to_string(total_read) + "/" + std::to_string(dump_size) + " bytes" +
             (kd_failed_pages > 0 ? (", " + std::to_string(kd_failed_pages) + " pages unreadable (paged-out/shadow)") : ""));
 
-        if (header_wiped || !has_valid_pe)
+        if (analyze && (header_wiped || !has_valid_pe))
         {
             msg(OBFSTR_C("AiDA: Synthesizing PE header for headerless kernel dump...\n"));
 
@@ -5589,108 +5658,122 @@ tool_result_t driver_dump_kernel_module(const json& params)
             msg(OBFSTR_C("AiDA: Synthesized PE header - %d sections discovered via memory scanning\n"),
                 max_synth_sections);
         }
-
-
-        pe_fix_result_t pe_fix = fix_dumped_pe_image(dump_data, base_addr);
-        if (pe_fix.success)
+        else if (!analyze && (header_wiped || !has_valid_pe))
         {
-            msg(OBFSTR_C("AiDA: PE fixed - %d sections, %d IAT entries restored, EP %s\n"),
-                pe_fix.sections_fixed, pe_fix.iat_entries_restored,
-                pe_fix.entry_point_valid ? "valid" : "fallback");
-            log("pe_fix", true, std::to_string(pe_fix.sections_fixed) + " sections, " +
-                std::to_string(pe_fix.iat_entries_restored) + " IAT entries");
+            log("synthesize_header", true, "skipped because analyze=false");
         }
 
-        cleanup_exception_directory(dump_data, pe_fix.is_pe64 || (machine == 0x8664));
-        log("exception_cleanup", true, "Invalid runtime function entries cleaned");
 
+        pe_fix_result_t pe_fix;
+        iat_rebuild_result_t iat_rebuild;
+        if (analyze)
         {
-            std::uint16_t kd_sec_count = num_sections;
-            std::uint32_t kd_sec_table = section_table_off;
-            if (pe_fix.success && dump_size > 0x200)
+            pe_fix = fix_dumped_pe_image(dump_data, base_addr);
+            if (pe_fix.success)
             {
-                std::uint32_t fpo = *reinterpret_cast<std::uint32_t*>(dump_data.data() + 0x3C);
-                if (fpo + 0x18 < dump_size)
-                {
-                    kd_sec_count = *reinterpret_cast<std::uint16_t*>(dump_data.data() + fpo + 6);
-                    std::uint16_t fo = *reinterpret_cast<std::uint16_t*>(dump_data.data() + fpo + 0x14);
-                    kd_sec_table = fpo + 0x18 + fo;
-                }
+                msg(OBFSTR_C("AiDA: PE fixed - %d sections, %d IAT entries restored, EP %s\n"),
+                    pe_fix.sections_fixed, pe_fix.iat_entries_restored,
+                    pe_fix.entry_point_valid ? "valid" : "fallback");
+                log("pe_fix", true, std::to_string(pe_fix.sections_fixed) + " sections, " +
+                    std::to_string(pe_fix.iat_entries_restored) + " IAT entries");
             }
 
-            int kd_nop_filled = 0;
-            for (int si = 0; si < kd_sec_count && si < 96; si++)
+            cleanup_exception_directory(dump_data, pe_fix.is_pe64 || (machine == 0x8664));
+            log("exception_cleanup", true, "Invalid runtime function entries cleaned");
+
             {
-                std::uint32_t soff = kd_sec_table + si * 40;
-                if (soff + 40 > dump_size) break;
-
-                std::uint32_t vsize = *reinterpret_cast<std::uint32_t*>(dump_data.data() + soff + 8);
-                std::uint32_t vrva  = *reinterpret_cast<std::uint32_t*>(dump_data.data() + soff + 12);
-                std::uint32_t chars = *reinterpret_cast<std::uint32_t*>(dump_data.data() + soff + 36);
-
-                if (vsize == 0 || vrva == 0 || !(chars & 0x20000000)) continue;
-
-                for (std::uint32_t pg_off = vrva; pg_off < vrva + vsize; pg_off += 0x1000)
+                std::uint16_t kd_sec_count = num_sections;
+                std::uint32_t kd_sec_table = section_table_off;
+                if (pe_fix.success && dump_size > 0x200)
                 {
-                    if (pg_off >= dump_size) break;
-                    std::uint32_t pg_sz = std::min<std::uint32_t>(0x1000, dump_size - pg_off);
-
-                    bool is_all_zero = true;
-                    for (std::uint32_t i = 0; i < pg_sz; i++)
+                    std::uint32_t fpo = *reinterpret_cast<std::uint32_t*>(dump_data.data() + 0x3C);
+                    if (fpo + 0x18 < dump_size)
                     {
-                        if (dump_data[pg_off + i] != 0x00)
+                        kd_sec_count = *reinterpret_cast<std::uint16_t*>(dump_data.data() + fpo + 6);
+                        std::uint16_t fo = *reinterpret_cast<std::uint16_t*>(dump_data.data() + fpo + 0x14);
+                        kd_sec_table = fpo + 0x18 + fo;
+                    }
+                }
+
+                int kd_nop_filled = 0;
+                for (int si = 0; si < kd_sec_count && si < 96; si++)
+                {
+                    std::uint32_t soff = kd_sec_table + si * 40;
+                    if (soff + 40 > dump_size) break;
+
+                    std::uint32_t vsize = *reinterpret_cast<std::uint32_t*>(dump_data.data() + soff + 8);
+                    std::uint32_t vrva  = *reinterpret_cast<std::uint32_t*>(dump_data.data() + soff + 12);
+                    std::uint32_t chars = *reinterpret_cast<std::uint32_t*>(dump_data.data() + soff + 36);
+
+                    if (vsize == 0 || vrva == 0 || !(chars & 0x20000000)) continue;
+
+                    for (std::uint32_t pg_off = vrva; pg_off < vrva + vsize; pg_off += 0x1000)
+                    {
+                        if (pg_off >= dump_size) break;
+                        std::uint32_t pg_sz = std::min<std::uint32_t>(0x1000, dump_size - pg_off);
+
+                        bool is_all_zero = true;
+                        for (std::uint32_t i = 0; i < pg_sz; i++)
                         {
-                            is_all_zero = false;
-                            break;
+                            if (dump_data[pg_off + i] != 0x00)
+                            {
+                                is_all_zero = false;
+                                break;
+                            }
+                        }
+                        if (is_all_zero)
+                        {
+                            std::memset(dump_data.data() + pg_off, 0x90, pg_sz);
+                            kd_nop_filled++;
                         }
                     }
-                    if (is_all_zero)
-                    {
-                        std::memset(dump_data.data() + pg_off, 0x90, pg_sz);
-                        kd_nop_filled++;
-                    }
+                }
+
+                if (kd_nop_filled > 0)
+                {
+                    log("nop_fill", true, std::to_string(kd_nop_filled) +
+                        " zero code pages NOP-filled to prevent IDA treating them as data");
+                    msg(OBFSTR_C("AiDA: NOP-filled %d zero code pages in kernel dump\n"), kd_nop_filled);
                 }
             }
 
-            if (kd_nop_filled > 0)
+            iat_rebuild = reconstruct_iat_runtime(dump_data, base_addr, device.get(), true);
+            if (iat_rebuild.success && iat_rebuild.descriptors_rebuilt > 0)
             {
-                log("nop_fill", true, std::to_string(kd_nop_filled) +
-                    " zero code pages NOP-filled to prevent IDA treating them as data");
-                msg(OBFSTR_C("AiDA: NOP-filled %d zero code pages in kernel dump\n"), kd_nop_filled);
+                msg(OBFSTR_C("AiDA: Kernel IAT reconstruction - %d imports resolved, %d failed, %d descriptors rebuilt\n"),
+                    iat_rebuild.imports_resolved, iat_rebuild.imports_failed, iat_rebuild.descriptors_rebuilt);
+                log("iat_rebuild", true, std::to_string(iat_rebuild.imports_resolved) + " imports, " +
+                    std::to_string(iat_rebuild.descriptors_rebuilt) + " descriptors");
             }
-        }
+            else if (!iat_rebuild.error.empty())
+            {
+                msg(OBFSTR_C("AiDA: Kernel IAT rebuild note: %s\n"), iat_rebuild.error.c_str());
+                log("iat_rebuild", false, iat_rebuild.error);
+            }
 
-        iat_rebuild_result_t iat_rebuild = reconstruct_iat_runtime(dump_data, base_addr, device.get(), true);
-        if (iat_rebuild.success && iat_rebuild.descriptors_rebuilt > 0)
-        {
-            msg(OBFSTR_C("AiDA: Kernel IAT reconstruction - %d imports resolved, %d failed, %d descriptors rebuilt\n"),
-                iat_rebuild.imports_resolved, iat_rebuild.imports_failed, iat_rebuild.descriptors_rebuilt);
-            log("iat_rebuild", true, std::to_string(iat_rebuild.imports_resolved) + " imports, " +
-                std::to_string(iat_rebuild.descriptors_rebuilt) + " descriptors");
-        }
-        else if (!iat_rebuild.error.empty())
-        {
-            msg(OBFSTR_C("AiDA: Kernel IAT rebuild note: %s\n"), iat_rebuild.error.c_str());
-            log("iat_rebuild", false, iat_rebuild.error);
-        }
-
-        if (iat_rebuild.descriptors_rebuilt == 0 || iat_rebuild.imports_resolved == 0)
-        {
-            msg(OBFSTR_C("AiDA: Standard kernel IAT rebuild found nothing - running full export-scan reconstruction...\n"));
-            iat_rebuild_result_t scan_result = full_iat_scan_and_rebuild(dump_data, base_addr, device.get(), true);
-            if (scan_result.success && scan_result.imports_resolved > 0)
+            if (iat_rebuild.descriptors_rebuilt == 0 || iat_rebuild.imports_resolved == 0)
             {
-                iat_rebuild = scan_result;
-                msg(OBFSTR_C("AiDA: Kernel full IAT scan - %d imports resolved, %d DLLs\n"),
-                    scan_result.imports_resolved, scan_result.descriptors_rebuilt);
-                log("iat_full_scan", true, std::to_string(scan_result.imports_resolved) +
-                    " imports via full scan, " + std::to_string(scan_result.descriptors_rebuilt) + " DLLs");
+                msg(OBFSTR_C("AiDA: Standard kernel IAT rebuild found nothing - running full export-scan reconstruction...\n"));
+                iat_rebuild_result_t scan_result = full_iat_scan_and_rebuild(dump_data, base_addr, device.get(), true);
+                if (scan_result.success && scan_result.imports_resolved > 0)
+                {
+                    iat_rebuild = scan_result;
+                    msg(OBFSTR_C("AiDA: Kernel full IAT scan - %d imports resolved, %d DLLs\n"),
+                        scan_result.imports_resolved, scan_result.descriptors_rebuilt);
+                    log("iat_full_scan", true, std::to_string(scan_result.imports_resolved) +
+                        " imports via full scan, " + std::to_string(scan_result.descriptors_rebuilt) + " DLLs");
+                }
+                else
+                {
+                    msg(OBFSTR_C("AiDA: Kernel full IAT scan found no additional imports\n"));
+                    log("iat_full_scan", false, scan_result.error.empty() ? "No imports found" : scan_result.error);
+                }
             }
-            else
-            {
-                msg(OBFSTR_C("AiDA: Kernel full IAT scan found no additional imports\n"));
-                log("iat_full_scan", false, scan_result.error.empty() ? "No imports found" : scan_result.error);
-            }
+        }
+        else
+        {
+            log("pe_fix", true, "skipped because analyze=false");
+            log("iat_rebuild", true, "skipped because analyze=false");
         }
 
         show_wait_box("HIDECANCEL\nAiDA: Writing memory dump to %s...", output_path.c_str());
@@ -5823,12 +5906,12 @@ tool_result_t driver_dump_kernel_module(const json& params)
         result["saved_to"]           = output_path;
         result["valid_pe"]           = has_valid_pe;
         result["header_wiped"]       = header_wiped;
-        result["header_synthesized"] = header_wiped || !has_valid_mz;
+        result["header_synthesized"] = analyze && (header_wiped || !has_valid_mz);
         result["architecture"]       = pe_arch;
         result["num_sections"]       = static_cast<int>(num_sections);
         result["dump_source"]        = "kernel_memory";
-        result["can_load_in_ida"]    = true;
-        result["analyzed"]           = analyze && patch_idb;
+        result["can_load_in_ida"]    = has_valid_pe;
+        result["analyzed"]           = analyze;
         result["steps"]              = steps;
         if (kd_failed_pages > 0)
             result["unreadable_pages"] = kd_failed_pages;
@@ -5860,10 +5943,12 @@ tool_result_t driver_dump_kernel_module(const json& params)
         }
 
         std::string note_str;
-        if (header_wiped)
+        if (header_wiped && analyze)
             note_str = OBFSTR("WARNING: Original PE header was wiped by anti-cheat. "
                 "A synthetic header has been constructed from memory analysis. "
                 "Section boundaries are approximate. ");
+        else if (header_wiped)
+            note_str = OBFSTR("WARNING: Original PE header was wiped and analyze=false, so no synthetic header was built. ");
         note_str += OBFSTR("Live kernel memory dump - contains runtime-decrypted code. "
             "Open this file in a NEW IDA Pro instance for proper analysis. ");
         if (kd_failed_pages > 0)
@@ -5875,12 +5960,15 @@ tool_result_t driver_dump_kernel_module(const json& params)
             OBFSTR("Kernel module dumped: ") + found_name + OBFSTR(" (") +
             std::to_string(total_read) + OBFSTR("/") + std::to_string(dump_size) +
             OBFSTR(" bytes, ") + std::to_string(coverage) + OBFSTR("% coverage") +
-            (header_wiped ? OBFSTR(", header synthesized") : "") +
+            ((header_wiped && analyze) ? OBFSTR(", header synthesized") : "") +
             OBFSTR(") -> ") + output_path +
             OBFSTR(". Open this file in a NEW IDA Pro instance for proper analysis."), result);
     }
 
     std::string disk_path = resolve_nt_path_to_win32(found_nt_path);
+    diag::log_tagged_fmt("drv_tools",
+        "driver_dump_kernel_module disk path resolved='%s' output='%s'",
+        disk_path.c_str(), output_path.c_str());
 
     if (output_path.empty())
     {
@@ -5959,8 +6047,18 @@ tool_result_t driver_dump_kernel_module(const json& params)
     }
 
     DWORD bytes_written = 0;
-    WriteFile(hOut, file_data.data(), total_read, &bytes_written, nullptr);
+    BOOL wrote = WriteFile(hOut, file_data.data(), total_read, &bytes_written, nullptr);
     CloseHandle(hOut);
+    if (!wrote || bytes_written != total_read)
+    {
+        return tool_result_t::error(
+            OBFSTR("Failed to write complete disk dump: wrote ") +
+            std::to_string(bytes_written) + OBFSTR(" of ") + std::to_string(total_read) +
+            OBFSTR(" bytes. Win32 error: ") + std::to_string(GetLastError()));
+    }
+    diag::log_tagged_fmt("drv_tools",
+        "driver_dump_kernel_module disk dump wrote=%lu path='%s'",
+        static_cast<unsigned long>(bytes_written), output_path.c_str());
 
     bool is_valid_pe = false;
     std::string pe_arch = "unknown";
@@ -5991,6 +6089,8 @@ tool_result_t driver_dump_kernel_module(const json& params)
     result["architecture"]      = pe_arch;
     result["dump_source"]       = "disk";
     result["can_load_in_ida"]   = is_valid_pe;
+    result["analyzed"]          = false;
+    result["patch_idb_requested"] = patch_idb;
     result["note"]              = OBFSTR(
         "ON-DISK dump (not live memory). Contains static file contents only. "
         "For runtime-decrypted code, use from_memory=true with driver connected.");
@@ -8146,6 +8246,7 @@ tool_result_t driver_reassemble_stream(const json& params)
     else if (operation == "stop") op_code = 1;
     else if (operation == "get" || operation == "get_data") op_code = 2;
     else if (operation == "list") op_code = 3;
+    else if (operation == "clear") op_code = 4;
 
     std::uint32_t src_port = params.value("src_port", 0u);
     std::uint32_t dst_port = params.value("dst_port", 0u);
@@ -8339,14 +8440,30 @@ tool_result_t driver_kill_connection(const json& params)
 
     std::uint8_t src_addr[16] = {}, dst_addr[16] = {};
     std::uint32_t af = 2;
-    if (params.contains("src_addr")) parse_ip_string(params["src_addr"].get<std::string>(), src_addr, &af);
-    if (params.contains("dst_addr")) parse_ip_string(params["dst_addr"].get<std::string>(), dst_addr, &af);
+    const bool has_src_addr = params.contains("src_addr") && params["src_addr"].is_string() &&
+        parse_ip_string(params["src_addr"].get<std::string>(), src_addr, &af);
+    const bool has_dst_addr = params.contains("dst_addr") && params["dst_addr"].is_string() &&
+        parse_ip_string(params["dst_addr"].get<std::string>(), dst_addr, &af);
 
     std::uint32_t src_port = params.value("src_port", 0u);
     std::uint32_t dst_port = params.value("dst_port", 0u);
     std::uint32_t proto = proto_from_param(params, "protocol");
     if (proto == 0) proto = 6;
     std::uint32_t pid = params.value("pid", 0u);
+
+    auto addr_is_zero = [](const std::uint8_t* addr) {
+        for (int i = 0; i < 16; ++i) {
+            if (addr[i] != 0)
+                return false;
+        }
+        return true;
+    };
+    if (!has_src_addr || !has_dst_addr || addr_is_zero(src_addr) || addr_is_zero(dst_addr)) {
+        return tool_result_t::error(OBFSTR("Refusing to kill connection without explicit non-wildcard src_addr and dst_addr"));
+    }
+    if (src_port == 0 || dst_port == 0) {
+        return tool_result_t::error(OBFSTR("Refusing to kill connection without explicit non-zero src_port and dst_port"));
+    }
 
     bool ok = device->kill_connection(proto, af, src_port, dst_port, src_addr, dst_addr, pid);
     if (!ok) return tool_result_t::error(OBFSTR("Connection kill failed"));
@@ -12248,9 +12365,9 @@ void register_driver_tools(mcp_standalone::server_t& srv)
         OBFSTR("driver_reassemble_stream"), OBFSTR("driver"),
         OBFSTR("TCP stream reassembly engine. Like Wireshark's 'Follow TCP Stream' but from the kernel. "
                "Tracks TCP connections and reassembles the byte stream in order. Supports up to 8 "
-               "concurrent streams, 64KB each. Operations: start, stop, get_data, list."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'start', 'stop', 'get'/'get_data', 'list'"), false,
-          {OBFSTR("start"), OBFSTR("stop"), OBFSTR("get"), OBFSTR("get_data"), OBFSTR("list")}},
+               "concurrent streams, 64KB each. Operations: start, stop, get_data, list, clear."),
+        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'start', 'stop', 'get'/'get_data', 'list', 'clear'"), false,
+          {OBFSTR("start"), OBFSTR("stop"), OBFSTR("get"), OBFSTR("get_data"), OBFSTR("list"), OBFSTR("clear")}},
          {OBFSTR("src_addr"), OBFSTR("string"), OBFSTR("Source IP of the connection to track"), false},
          {OBFSTR("dst_addr"), OBFSTR("string"), OBFSTR("Destination IP"), false},
          {OBFSTR("src_port"), OBFSTR("number"), OBFSTR("Source port"), false},

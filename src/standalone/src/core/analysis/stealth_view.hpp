@@ -72,6 +72,30 @@ inline constexpr aida::ui::hub_strip::tab_t s_subtabs[] = {
 	{ "Stealth Controls", "anti-debug hook controls", "Ctrl" },
 };
 
+inline int sub_tab_count()
+{
+	return static_cast<int>(sizeof(s_subtabs) / sizeof(s_subtabs[0]));
+}
+
+inline void set_sub_tab(int idx)
+{
+	if (idx < 0 || idx >= sub_tab_count())
+		return;
+	aida::ui::hub_strip::notify_select(s_state.strip, idx);
+}
+
+inline int active_sub_tab()
+{
+	return s_state.strip.active;
+}
+
+inline const char* sub_tab_label(int idx)
+{
+	if (idx < 0 || idx >= sub_tab_count())
+		return "";
+	return s_subtabs[idx].label;
+}
+
 inline void render_protection_scan(float pos_x, float pos_y, float w, float h,
                                     float alpha, ImDrawList* dl, ImVec2 wp)
 {

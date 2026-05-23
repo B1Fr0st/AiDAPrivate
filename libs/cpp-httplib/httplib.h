@@ -5889,15 +5889,22 @@ inline bool has_crlf(const std::string &s) {
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 inline std::string message_digest(const std::string &s, const EVP_MD *algo) {
+  if (!algo) { return {}; }
+
+  static std::mutex openssl_digest_mutex;
+  std::lock_guard<std::mutex> lock(openssl_digest_mutex);
+
   auto context = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>(
       EVP_MD_CTX_new(), EVP_MD_CTX_free);
+  if (!context) { return {}; }
 
   unsigned int hash_length = 0;
-  unsigned char hash[EVP_MAX_MD_SIZE];
+  unsigned char hash[EVP_MAX_MD_SIZE] = {};
 
-  EVP_DigestInit_ex(context.get(), algo, nullptr);
-  EVP_DigestUpdate(context.get(), s.c_str(), s.size());
-  EVP_DigestFinal_ex(context.get(), hash, &hash_length);
+  if (EVP_DigestInit_ex(context.get(), algo, nullptr) != 1) { return {}; }
+  if (EVP_DigestUpdate(context.get(), s.data(), s.size()) != 1) { return {}; }
+  if (EVP_DigestFinal_ex(context.get(), hash, &hash_length) != 1) { return {}; }
+  if (hash_length > EVP_MAX_MD_SIZE) { return {}; }
 
   std::stringstream ss;
   for (auto i = 0u; i < hash_length; ++i) {

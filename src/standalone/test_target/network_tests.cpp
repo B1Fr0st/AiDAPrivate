@@ -1,4 +1,5 @@
 #include "network_tests.h"
+#include "test_log.h"
 #include <cstdio>
 #include <cstring>
 #include <string>

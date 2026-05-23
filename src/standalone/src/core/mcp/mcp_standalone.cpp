@@ -283,7 +283,7 @@ bool current_call_cancelled() noexcept
 server_t::server_t()  = default;
 server_t::~server_t() { stop(); }
 
-void server_t::register_tool(tool_def_t tool)
+bool server_t::register_tool(tool_def_t tool)
 {
     bool already_has_binary_id = false;
     for (const auto& p : tool.params) {
@@ -299,7 +299,26 @@ void server_t::register_tool(tool_def_t tool)
         });
     }
     std::lock_guard<std::mutex> lk(_tools_mtx);
+    auto dup = std::find_if(_tools.begin(), _tools.end(), [&](const tool_def_t& existing) {
+        return existing.name == tool.name;
+    });
+    if (dup != _tools.end()) {
+        if (tool.name == "decompile_function" &&
+            dup->visibility == tool_visibility_t::external_visible &&
+            tool.visibility == tool_visibility_t::external_visible) {
+            diag::log_tagged_fmt("mcp_srv",
+                "register_tool duplicate replaced name='%s' visibility=%d",
+                tool.name.c_str(), static_cast<int>(tool.visibility));
+            *dup = std::move(tool);
+            return true;
+        }
+        diag::log_tagged_fmt("mcp_srv",
+            "register_tool duplicate skipped name='%s' existing_visibility=%d new_visibility=%d",
+            tool.name.c_str(), static_cast<int>(dup->visibility), static_cast<int>(tool.visibility));
+        return false;
+    }
     _tools.push_back(std::move(tool));
+    return true;
 }
 
 json server_t::make_result(const json& id, const json& result)

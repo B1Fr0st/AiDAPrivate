@@ -6,7 +6,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -19,6 +22,39 @@ namespace {
 	constexpr std::uint8_t  kProtoIcmpV6        = 58;
 	constexpr std::uint32_t kVisiblePacketCap   = 50u;
 	constexpr std::uint32_t kDefaultRingPull    = 256u;
+	std::mutex g_bootstrap_mtx;
+	std::vector<std::uint32_t> g_bootstrap_pids;
+
+	bool remember_bootstrap_pid(std::uint32_t pid) {
+		std::lock_guard<std::mutex> lk(g_bootstrap_mtx);
+		for (std::uint32_t existing : g_bootstrap_pids) {
+			if (existing == pid)
+				return false;
+		}
+		g_bootstrap_pids.push_back(pid);
+		return true;
+	}
+
+	bool forget_bootstrap_pid(std::uint32_t pid) {
+		std::lock_guard<std::mutex> lk(g_bootstrap_mtx);
+		for (auto it = g_bootstrap_pids.begin(); it != g_bootstrap_pids.end(); ++it) {
+			if (*it == pid) {
+				g_bootstrap_pids.erase(it);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void cleanup_bootstrap_pid(std::uint32_t pid) {
+		if (!device || !device->is_connected())
+			return;
+		if (!forget_bootstrap_pid(pid))
+			return;
+		device->net_log_register_pid(pid, false);
+		std::uint64_t unreg_denials = 0;
+		device->unprotect_sandbox_pid(pid, &unreg_denials);
+	}
 
 	void push_u32_field(test_lab::result_t& r, const char* label, std::uint32_t value) {
 		char buf[40];
@@ -122,18 +158,23 @@ namespace {
 		std::memcpy(r.raw.data(), &req, sizeof(req));
 		r.bytes_returned = static_cast<std::uint32_t>(sizeof(req));
 
-		if (we_registered_for_test) {
-			std::uint64_t unreg_denials = 0;
-			device->unprotect_sandbox_pid(s.pid, &unreg_denials);
-		}
-
 		if (!ok) {
+			if (we_registered_for_test) {
+				std::uint64_t unreg_denials = 0;
+				device->unprotect_sandbox_pid(s.pid, &unreg_denials);
+			}
 			r.error = enable
 				? "net_log_register_pid(enable) returned false (pid not in sandbox table, ring alloc failed, or driver rejected)"
 				: "net_log_register_pid(disable) returned false (pid not registered or driver rejected)";
 			r.ntstatus = static_cast<std::int32_t>(0xC0000022u);
 			r.ok = false;
 			return;
+		}
+
+		if (enable && we_registered_for_test) {
+			remember_bootstrap_pid(s.pid);
+		} else if (!enable) {
+			cleanup_bootstrap_pid(s.pid);
 		}
 
 		push_u32_field(r, "PID", s.pid);
@@ -181,7 +222,17 @@ namespace {
 
 		std::vector<voyager::detail::net_packet_record> records;
 		std::uint64_t dropped_since_last_pull = 0;
-		bool ok = device->malware_safe_pull_packets(s.pid, max_records, records, &dropped_since_last_pull);
+		bool ok = false;
+		std::uint32_t attempts = 0;
+		for (std::uint32_t attempt = 0; attempt < 16u; ++attempt) {
+			++attempts;
+			records.clear();
+			dropped_since_last_pull = 0;
+			ok = device->malware_safe_pull_packets(s.pid, max_records, records, &dropped_since_last_pull);
+			if (!ok || !records.empty())
+				break;
+			std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		}
 
 		const std::size_t header_size = sizeof(voyager::detail::net_packet_pull_response_header);
 		const std::size_t record_bytes = records.size() * sizeof(voyager::detail::net_packet_record);
@@ -197,6 +248,7 @@ namespace {
 		r.bytes_returned = static_cast<std::uint32_t>(r.raw.size());
 
 		if (!ok) {
+			cleanup_bootstrap_pid(s.pid);
 			r.error = "malware_safe_pull_packets returned false (pid not registered for net logging or driver rejected)";
 			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
 			r.ok = false;
@@ -205,8 +257,16 @@ namespace {
 
 		push_u32_field(r, "PID", s.pid);
 		push_u32_field(r, "Requested Max", max_records);
+		push_u32_field(r, "Pull Attempts", attempts);
 		push_u32_field(r, "Records Returned", static_cast<std::uint32_t>(records.size()));
 		push_u64_field(r, "Dropped Since Last Pull", dropped_since_last_pull);
+		if (records.empty()) {
+			cleanup_bootstrap_pid(s.pid);
+			r.error = "malware_safe_pull_packets succeeded but returned no packet records for the PID";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			r.ok = false;
+			return;
+		}
 
 		const std::uint32_t visible = (records.size() > kVisiblePacketCap)
 			? kVisiblePacketCap
@@ -250,6 +310,7 @@ namespace {
 
 		r.ntstatus = 0;
 		r.ok = true;
+		cleanup_bootstrap_pid(s.pid);
 	}
 
 }

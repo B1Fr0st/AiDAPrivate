@@ -54,6 +54,25 @@ namespace
     bool            g_has_vm_read = false;
     bool            g_kernel_attached = false;
 
+    bool env_flag_enabled(const char* name)
+    {
+        if (!name || !*name)
+            return false;
+        char value[16] = {};
+        DWORD n = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+        if (n == 0)
+            return false;
+        if (n >= sizeof(value))
+            return true;
+        return value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+    }
+
+    bool destructive_driver_action_suppressed()
+    {
+        return env_flag_enabled("AIDA_FULL_TEST_RUNNING") ||
+               env_flag_enabled("AIDA_DISABLE_DESTRUCTIVE_ENFORCEMENT");
+    }
+
     struct process_ctx_t {
         HANDLE      h_process = nullptr;
         bool        kernel_attached = false;
@@ -589,15 +608,22 @@ namespace driver_bridge
         std::lock_guard<std::mutex> lk(g_state_mtx);
         diag::log_tagged_critical("driver", "attach_post_state_mtx_lock");
 
-        DWORD access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ;
+        DWORD access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ |
+                       PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
         diag::log_tagged_critical_fmt("driver", "attach_pre_OpenProcess access=0x%X pid=%u", access, pid);
         unique_handle process(OpenProcess(access, FALSE, pid));
         diag::log_tagged_critical_fmt("driver", "attach_post_OpenProcess handle=%p gle=%lu",
             process.get(), process ? 0UL : GetLastError());
         bool has_vm_read = true;
         if (!process) {
+            access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ;
+            diag::log_tagged_critical_fmt("driver", "attach_retry_OpenProcess access=0x%X pid=%u", access, pid);
+            process.reset(OpenProcess(access, FALSE, pid));
+        }
+        if (!process) {
             has_vm_read = false;
             access = PROCESS_QUERY_LIMITED_INFORMATION;
+            diag::log_tagged_critical_fmt("driver", "attach_retry_OpenProcess access=0x%X pid=%u", access, pid);
             process.reset(OpenProcess(access, FALSE, pid));
             if (!process) {
                 set_last_error_locked("OpenProcess failed for PID " + std::to_string(pid) +
@@ -665,6 +691,14 @@ namespace driver_bridge
                 diag::log_tagged_critical_fmt("driver", "attach_post_device_solve_dtb_fallback dtb=0x%llX",
                     (unsigned long long)device->get_dtb());
                 if (device->get_dtb() == 0) {
+                    diag::log_tagged_critical_fmt("driver",
+                        "attach_device_solve_dtb_zero connected=%d hb_err=%lu hb_bytes=%lu hb_ioctl=0x%08X hb_magic=0x%08X hb_dioctl=%d",
+                        device->is_connected() ? 1 : 0,
+                        static_cast<unsigned long>(device->get_last_heartbeat_error()),
+                        static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()),
+                        device->get_last_heartbeat_ioctl_code(),
+                        device->get_last_heartbeat_magic(),
+                        device->get_last_heartbeat_dioctl_result() ? 1 : 0);
                     kernel_ok = false;
                 } else {
                     diag::log_tagged_critical("driver", "attach_pre_device_find_image_fallback");
@@ -695,9 +729,15 @@ namespace driver_bridge
                  g_pid, g_process_name.empty() ? "unknown" : g_process_name.c_str(),
                  static_cast<unsigned long long>(device->get_dtb()));
         } else if (has_vm_read) {
+            diag::log_tagged_critical_fmt("driver",
+                "attach_DEGRADED_USERMODE_VM_READ pid=%u kernel_mode=%d device=%p connected=%d",
+                pid, g_kernel_mode ? 1 : 0, device.get(), (device && device->is_connected()) ? 1 : 0);
             logf("AiDA Standalone: Attached to PID %u (%s) via user-mode handle (VM_READ).\n",
                  g_pid, g_process_name.empty() ? "unknown" : g_process_name.c_str());
         } else {
+            diag::log_tagged_critical_fmt("driver",
+                "attach_DEGRADED_QUERY_ONLY pid=%u kernel_mode=%d device=%p connected=%d",
+                pid, g_kernel_mode ? 1 : 0, device.get(), (device && device->is_connected()) ? 1 : 0);
             logf("AiDA Standalone: Attached to PID %u (%s) via limited handle (query-only).\n",
                  g_pid, g_process_name.empty() ? "unknown" : g_process_name.c_str());
         }
@@ -708,7 +748,14 @@ namespace driver_bridge
             ctx.kernel_attached = g_kernel_attached;
             ctx.has_vm_read = g_has_vm_read;
             ctx.name = g_process_name;
-            ctx.cached_image_base = (g_kernel_attached && device) ? device->find_image() : 0;
+            if (g_kernel_attached && device) {
+                diag::log_tagged_critical("driver", "attach_pre_ctx_cached_find_image");
+                ctx.cached_image_base = device->find_image();
+                diag::log_tagged_critical_fmt("driver", "attach_post_ctx_cached_find_image base=0x%llX",
+                    static_cast<unsigned long long>(ctx.cached_image_base));
+            } else {
+                ctx.cached_image_base = 0;
+            }
             ctx.cached_dtb = (g_kernel_attached && device) ? device->get_dtb() : 0;
             ctx.cached_kernel_dtb = (g_kernel_attached && device) ? device->get_kernel_dtb() : 0;
             g_processes[pid] = std::move(ctx);
@@ -795,9 +842,14 @@ namespace driver_bridge
             return true;
         }
 
-        DWORD access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ;
+        DWORD access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ |
+                       PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
         unique_handle process(OpenProcess(access, FALSE, pid));
         bool has_vm_read = true;
+        if (!process) {
+            access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ;
+            process.reset(OpenProcess(access, FALSE, pid));
+        }
         if (!process) {
             has_vm_read = false;
             access = PROCESS_QUERY_LIMITED_INFORMATION;
@@ -829,8 +881,40 @@ namespace driver_bridge
             return false;
 
         std::lock_guard<std::mutex> lk(g_state_mtx);
-        if (g_pid == pid)
+        if (g_pid == pid) {
+            bool kernel_mode = g_kernel_mode && device && device->is_connected();
+            if (kernel_mode) {
+                const auto* vtable = get_arc_vtable();
+                if (vtable && vtable->set_process_id)
+                    vtable->set_process_id(pid);
+                device->set_process_id(pid);
+                if (device->get_dtb() == 0)
+                    device->solve_dtb();
+                if (device->get_dtb() != 0) {
+                    g_kernel_attached = true;
+                    auto it = g_processes.find(pid);
+                    if (it != g_processes.end()) {
+                        it->second.kernel_attached = true;
+                        it->second.cached_dtb = device->get_dtb();
+                        it->second.cached_kernel_dtb = device->get_kernel_dtb();
+                        if (it->second.cached_image_base == 0) {
+                            const auto image_base = device->find_image();
+                            if (image_base != 0) {
+                                it->second.cached_image_base = image_base;
+                                device->set_base_address(image_base);
+                                if (vtable && vtable->set_base_address)
+                                    vtable->set_base_address(image_base);
+                            }
+                        }
+                    }
+                }
+            }
+            diag::log_tagged_fmt("driver", "set_active_pid_same pid=%u kernel_attached=%d dtb=0x%llX",
+                pid,
+                g_kernel_attached ? 1 : 0,
+                static_cast<unsigned long long>((device && device->is_connected()) ? device->get_dtb() : 0));
             return true;
+        }
 
         auto it = g_processes.find(pid);
         if (it == g_processes.end()) {
@@ -1001,6 +1085,48 @@ namespace driver_bridge
     {
         std::lock_guard<std::mutex> lk(g_state_mtx);
         return g_pid;
+    }
+
+    bool attached_process_alive(uint32_t* exit_code_out)
+    {
+        uint32_t pid = 0;
+        DWORD exit_code = 0;
+        bool got_exit_code = false;
+
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            pid = g_pid;
+            if (pid == 0) {
+                if (exit_code_out) *exit_code_out = 0;
+                return false;
+            }
+            if (g_process && GetExitCodeProcess(g_process, &exit_code)) {
+                got_exit_code = true;
+            }
+        }
+
+        if (!got_exit_code) {
+            auto proc = make_handle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+            if (!proc) {
+                const DWORD err = GetLastError();
+                if (exit_code_out) *exit_code_out = err;
+                diag::log_tagged_fmt("driver",
+                    "attached_process_alive open_failed pid=%u err=%lu",
+                    pid, static_cast<unsigned long>(err));
+                return err == ERROR_ACCESS_DENIED;
+            }
+            if (!GetExitCodeProcess(proc.get(), &exit_code)) {
+                const DWORD err = GetLastError();
+                if (exit_code_out) *exit_code_out = err;
+                diag::log_tagged_fmt("driver",
+                    "attached_process_alive get_exit_failed pid=%u err=%lu",
+                    pid, static_cast<unsigned long>(err));
+                return false;
+            }
+        }
+
+        if (exit_code_out) *exit_code_out = static_cast<uint32_t>(exit_code);
+        return exit_code == STILL_ACTIVE;
     }
 
     std::string attached_process_name()
@@ -1257,8 +1383,17 @@ namespace driver_bridge
             std::sort(result.begin(), result.end(), [](const thread_info_t& a, const thread_info_t& b) {
                 return a.tid < b.tid;
             });
-            logf("AiDA Standalone: enumerate_threads: resolved %zu threads via user-mode snapshot for PID %u.\n",
+        logf("AiDA Standalone: enumerate_threads: resolved %zu threads via user-mode snapshot for PID %u.\n",
                  result.size(), pid);
+            if (result.empty()) {
+                uint32_t exit_code = 0;
+                if (!attached_process_alive(&exit_code)) {
+                    diag::log_tagged_fmt("driver",
+                        "enumerate_threads_dead_target_user pid=%u exit_code_or_err=0x%08X; detaching stale target",
+                        pid, exit_code);
+                    detach();
+                }
+            }
             return result;
         }
 
@@ -1298,6 +1433,15 @@ namespace driver_bridge
 
         logf("AiDA Standalone: enumerate_threads: resolved %zu threads via kernel IOCTL for PID %u.\n",
              result.size(), pid);
+        if (result.empty()) {
+            uint32_t exit_code = 0;
+            if (!attached_process_alive(&exit_code)) {
+                diag::log_tagged_fmt("driver",
+                    "enumerate_threads_dead_target_kernel pid=%u exit_code_or_err=0x%08X; detaching stale target",
+                    pid, exit_code);
+                detach();
+            }
+        }
         return result;
     }
 
@@ -1557,9 +1701,11 @@ namespace driver_bridge
             return false;
 
         bool kernel_mode = false;
+        HANDLE process = nullptr;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
+            process = g_process;
         }
 
         if (kernel_mode) {
@@ -1601,6 +1747,22 @@ namespace driver_bridge
                 return true;
         }
 
+        if (process) {
+            SIZE_T bytes_written = 0;
+            BOOL ok = WriteProcessMemory(process,
+                reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)),
+                data.data(), data.size(), &bytes_written);
+            diag::log_tagged_fmt("driver",
+                "write_memory WPM fallback addr=0x%llX sz=%llu ok=%d bytes=%llu err=%lu",
+                static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(data.size()),
+                ok ? 1 : 0,
+                static_cast<unsigned long long>(bytes_written),
+                ok ? 0UL : GetLastError());
+            if (ok && bytes_written == data.size())
+                return true;
+        }
+
         return false;
     }
 
@@ -1627,6 +1789,28 @@ namespace driver_bridge
 namespace driver_bridge_pid_call
 {
     std::recursive_mutex g_call_mtx;
+
+    inline bool pid_is_alive(uint32_t pid, uint32_t* exit_code_out)
+    {
+        if (pid == 0) {
+            if (exit_code_out) *exit_code_out = 0;
+            return false;
+        }
+        auto proc = make_handle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+        if (!proc) {
+            const DWORD err = GetLastError();
+            if (exit_code_out) *exit_code_out = err;
+            return err == ERROR_ACCESS_DENIED;
+        }
+        DWORD exit_code = 0;
+        if (!GetExitCodeProcess(proc.get(), &exit_code)) {
+            const DWORD err = GetLastError();
+            if (exit_code_out) *exit_code_out = err;
+            return false;
+        }
+        if (exit_code_out) *exit_code_out = static_cast<uint32_t>(exit_code);
+        return exit_code == STILL_ACTIVE;
+    }
 
     struct pid_scope_t
     {
@@ -1658,6 +1842,14 @@ namespace driver_bridge_pid_call
         scope.lk = std::unique_lock<std::recursive_mutex>(g_call_mtx);
         scope.prev_pid = driver_bridge::attached_pid();
         scope.target_pid = pid;
+        uint32_t exit_code = 0;
+        if (!pid_is_alive(pid, &exit_code)) {
+            diag::log_tagged_fmt("driver_bridge",
+                "pid_scope_enter_dead_target pid=%u exit_code_or_err=0x%08X",
+                pid, exit_code);
+            (void)driver_bridge::detach_one(pid);
+            return false;
+        }
         if (scope.prev_pid == pid) {
             scope.ok = true;
             scope.swapped = false;
@@ -1814,15 +2006,31 @@ namespace driver_bridge
             return 0;
 
         bool kernel_mode = false;
+        HANDLE process = nullptr;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            return 0;
+            process = g_process;
         }
 
-        return device->allocate_memory(size);
+        if (kernel_mode) {
+            const uint64_t remote = device->allocate_memory(size);
+            diag::log_tagged_fmt("driver",
+                "allocate_memory kernel sz=%llu addr=0x%llX",
+                static_cast<unsigned long long>(size),
+                static_cast<unsigned long long>(remote));
+            if (remote != 0)
+                return remote;
+        }
+
+        if (!process)
+            return 0;
+
+        LPVOID remote = VirtualAllocEx(process, nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        diag::log_tagged_fmt("driver",
+            "allocate_memory VAE fallback sz=%llu addr=%p err=%lu",
+            static_cast<unsigned long long>(size), remote, remote ? 0UL : GetLastError());
+        return reinterpret_cast<uint64_t>(remote);
     }
 
     bool free_memory(uint64_t address)
@@ -1831,29 +2039,71 @@ namespace driver_bridge
             return false;
 
         bool kernel_mode = false;
+        HANDLE process = nullptr;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            return false;
+            process = g_process;
         }
 
-        return device->free_memory(address);
+        if (kernel_mode) {
+            const bool ok = device->free_memory(address);
+            diag::log_tagged_fmt("driver",
+                "free_memory kernel addr=0x%llX ok=%d",
+                static_cast<unsigned long long>(address), ok ? 1 : 0);
+            if (ok)
+                return true;
+        }
+
+        if (!process)
+            return false;
+
+        BOOL ok = VirtualFreeEx(process,
+            reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), 0, MEM_RELEASE);
+        diag::log_tagged_fmt("driver",
+            "free_memory VFE fallback addr=0x%llX ok=%d err=%lu",
+            static_cast<unsigned long long>(address), ok ? 1 : 0, ok ? 0UL : GetLastError());
+        return ok != FALSE;
     }
 
     bool protect_memory(uint64_t address, uint64_t size, uint32_t new_protect, uint32_t* old_protect)
     {
         bool kernel_mode = false;
+        HANDLE process = nullptr;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
-        if (!kernel_mode) {
-            return false;
+            process = g_process;
         }
 
-        return device->protect_memory(address, size, new_protect, old_protect);
+        if (kernel_mode) {
+            const bool ok = device->protect_memory(address, size, new_protect, old_protect);
+            diag::log_tagged_fmt("driver",
+                "protect_memory kernel addr=0x%llX sz=0x%llX protect=0x%X ok=%d",
+                static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(size),
+                new_protect, ok ? 1 : 0);
+            if (ok)
+                return true;
+        }
+
+        if (!process || size == 0)
+            return false;
+
+        DWORD old = 0;
+        BOOL ok = VirtualProtectEx(process,
+            reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)),
+            static_cast<SIZE_T>(size),
+            static_cast<DWORD>(new_protect),
+            &old);
+        if (ok && old_protect)
+            *old_protect = old;
+        diag::log_tagged_fmt("driver",
+            "protect_memory VPE fallback addr=0x%llX sz=0x%llX protect=0x%X ok=%d old=0x%X err=%lu",
+            static_cast<unsigned long long>(address),
+            static_cast<unsigned long long>(size),
+            new_protect, ok ? 1 : 0, old, ok ? 0UL : GetLastError());
+        return ok != FALSE;
     }
 
 
@@ -1880,6 +2130,14 @@ namespace driver_bridge
         ctx.cs  = kctx.cs;   ctx.ss  = kctx.ss;
         ctx.dr0 = kctx.dr0;  ctx.dr1 = kctx.dr1;  ctx.dr2 = kctx.dr2;  ctx.dr3 = kctx.dr3;
         ctx.dr6 = kctx.dr6;  ctx.dr7 = kctx.dr7;
+        if (ctx.rip == 0 || ctx.rsp == 0) {
+            diag::log_tagged_fmt("driver",
+                "get_thread_context_REJECTED_ZERO tid=%u rip=0x%llX rsp=0x%llX",
+                tid,
+                static_cast<unsigned long long>(ctx.rip),
+                static_cast<unsigned long long>(ctx.rsp));
+            return false;
+        }
         return true;
     }
 
@@ -2028,6 +2286,7 @@ namespace driver_bridge
 
     std::vector<net_connection_info_t> enumerate_connections(uint32_t filter_pid, uint32_t filter_protocol)
     {
+        const ULONGLONG t0 = GetTickCount64();
         std::vector<net_connection_info_t> result;
 
         bool kernel_mode = false;
@@ -2040,6 +2299,9 @@ namespace driver_bridge
             return result;
         }
 
+        diag::log_tagged_fmt("driver_bridge_net",
+            "enumerate_connections ENTER filter_pid=%u filter_protocol=%u",
+            filter_pid, filter_protocol);
         auto raw = device->enumerate_connections(filter_pid, filter_protocol);
         result.reserve(raw.size());
         for (const auto& src : raw) {
@@ -2055,6 +2317,10 @@ namespace driver_bridge
             std::memcpy(c.process_path, src.process_path, sizeof(c.process_path));
             result.push_back(c);
         }
+        diag::log_tagged_fmt("driver_bridge_net",
+            "enumerate_connections EXIT filter_pid=%u filter_protocol=%u raw=%zu mapped=%zu elapsed_ms=%llu",
+            filter_pid, filter_protocol, raw.size(), result.size(),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         return result;
     }
 
@@ -2485,7 +2751,15 @@ namespace driver_bridge
 
     bool trigger_kernel_bsod(uint32_t reason_code, uint64_t evidence_hash)
     {
-
+        if (destructive_driver_action_suppressed()) {
+            diag::log_tagged_critical_fmt("driver",
+                "trigger_kernel_bsod_SUPPRESSED reason=0x%08X evidence=0x%016llX env_full_test=%d env_disable=%d",
+                reason_code,
+                static_cast<unsigned long long>(evidence_hash),
+                env_flag_enabled("AIDA_FULL_TEST_RUNNING") ? 1 : 0,
+                env_flag_enabled("AIDA_DISABLE_DESTRUCTIVE_ENFORCEMENT") ? 1 : 0);
+            return false;
+        }
 
         bool kernel_mode = false;
         {
@@ -2937,6 +3211,7 @@ namespace driver_bridge
                              uint32_t redirect_port, const uint8_t* redirect_addr,
                              uint32_t af, uint32_t* out_rule_id, uint32_t exclude_pid)
     {
+        const ULONGLONG t0 = GetTickCount64();
         bool kernel_mode = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
@@ -2947,8 +3222,22 @@ namespace driver_bridge
             return false;
         }
 
-        return device->traffic_redirect_op(operation, rule_id, protocol, match_port, match_addr,
-                                           redirect_port, redirect_addr, af, out_rule_id, exclude_pid);
+        diag::log_tagged_fmt("driver_bridge_net",
+            "traffic_redirect_op ENTER op=%u rule_id=%u proto=%u match_port=%u redir_port=%u af=%u exclude_pid=%u match=%02X.%02X.%02X.%02X redir=%02X.%02X.%02X.%02X",
+            operation, rule_id, protocol, match_port, redirect_port, af, exclude_pid,
+            match_addr ? match_addr[0] : 0, match_addr ? match_addr[1] : 0,
+            match_addr ? match_addr[2] : 0, match_addr ? match_addr[3] : 0,
+            redirect_addr ? redirect_addr[0] : 0, redirect_addr ? redirect_addr[1] : 0,
+            redirect_addr ? redirect_addr[2] : 0, redirect_addr ? redirect_addr[3] : 0);
+        bool ok = device->traffic_redirect_op(operation, rule_id, protocol, match_port, match_addr,
+                                              redirect_port, redirect_addr, af, out_rule_id, exclude_pid);
+        DWORD gle = ok ? 0 : GetLastError();
+        diag::log_tagged_fmt("driver_bridge_net",
+            "traffic_redirect_op EXIT op=%u ok=%d out_rule_id=%u gle=%lu elapsed_ms=%llu",
+            operation, ok ? 1 : 0, out_rule_id ? *out_rule_id : 0,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return ok;
     }
 
     bool inject_packet(uint32_t direction, uint32_t protocol, uint32_t af,
@@ -3014,6 +3303,7 @@ namespace driver_bridge
                       const uint8_t* spoof_addr, uint32_t af,
                       uint32_t ttl, uint32_t* out_rule_id)
     {
+        const ULONGLONG t0 = GetTickCount64();
         bool kernel_mode = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
@@ -3024,7 +3314,19 @@ namespace driver_bridge
             return false;
         }
 
-        return device->dns_spoof_op(operation, rule_id, domain, spoof_addr, af, ttl, out_rule_id);
+        diag::log_tagged_fmt("driver_bridge_net",
+            "dns_spoof_op ENTER op=%u rule_id=%u domain=\"%.96s\" af=%u ttl=%u spoof=%02X.%02X.%02X.%02X",
+            operation, rule_id, domain ? domain : "", af, ttl,
+            spoof_addr ? spoof_addr[0] : 0, spoof_addr ? spoof_addr[1] : 0,
+            spoof_addr ? spoof_addr[2] : 0, spoof_addr ? spoof_addr[3] : 0);
+        bool ok = device->dns_spoof_op(operation, rule_id, domain, spoof_addr, af, ttl, out_rule_id);
+        DWORD gle = ok ? 0 : GetLastError();
+        diag::log_tagged_fmt("driver_bridge_net",
+            "dns_spoof_op EXIT op=%u ok=%d out_rule_id=%u gle=%lu elapsed_ms=%llu",
+            operation, ok ? 1 : 0, out_rule_id ? *out_rule_id : 0,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return ok;
     }
 
     bool packet_mod_rule_op(uint32_t operation, uint32_t rule_id,
@@ -3034,6 +3336,7 @@ namespace driver_bridge
                             const uint8_t* replacement, uint32_t replace_size,
                             uint32_t* out_rule_id)
     {
+        const ULONGLONG t0 = GetTickCount64();
         bool kernel_mode = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
@@ -3044,9 +3347,19 @@ namespace driver_bridge
             return false;
         }
 
-        return device->packet_mod_rule_op(operation, rule_id, direction, protocol,
-                                          port, pid, pattern, pattern_size,
-                                          replacement, replace_size, out_rule_id);
+        diag::log_tagged_fmt("driver_bridge_net",
+            "packet_mod_rule_op ENTER op=%u rule_id=%u dir=%u proto=%u port=%u pid=%u pattern_size=%u replace_size=%u",
+            operation, rule_id, direction, protocol, port, pid, pattern_size, replace_size);
+        bool ok = device->packet_mod_rule_op(operation, rule_id, direction, protocol,
+                                             port, pid, pattern, pattern_size,
+                                             replacement, replace_size, out_rule_id);
+        DWORD gle = ok ? 0 : GetLastError();
+        diag::log_tagged_fmt("driver_bridge_net",
+            "packet_mod_rule_op EXIT op=%u ok=%d out_rule_id=%u gle=%lu elapsed_ms=%llu",
+            operation, ok ? 1 : 0, out_rule_id ? *out_rule_id : 0,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return ok;
     }
 
     bool stream_reassemble_op(uint32_t operation, uint32_t src_port, uint32_t dst_port,
@@ -3055,6 +3368,7 @@ namespace driver_bridge
                               std::vector<uint8_t>* out_data,
                               uint32_t* out_packets, uint32_t* out_truncated)
     {
+        const ULONGLONG t0 = GetTickCount64();
         bool kernel_mode = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
@@ -3065,9 +3379,24 @@ namespace driver_bridge
             return false;
         }
 
-        return device->stream_reassemble_op(operation, src_port, dst_port, pid,
-                                            src_addr, dst_addr, out_data,
-                                            out_packets, out_truncated);
+        diag::log_tagged_fmt("driver_bridge_net",
+            "stream_reassemble_op ENTER op=%u src_port=%u dst_port=%u pid=%u src=%02X.%02X.%02X.%02X dst=%02X.%02X.%02X.%02X",
+            operation, src_port, dst_port, pid,
+            src_addr ? src_addr[0] : 0, src_addr ? src_addr[1] : 0,
+            src_addr ? src_addr[2] : 0, src_addr ? src_addr[3] : 0,
+            dst_addr ? dst_addr[0] : 0, dst_addr ? dst_addr[1] : 0,
+            dst_addr ? dst_addr[2] : 0, dst_addr ? dst_addr[3] : 0);
+        bool ok = device->stream_reassemble_op(operation, src_port, dst_port, pid,
+                                               src_addr, dst_addr, out_data,
+                                               out_packets, out_truncated);
+        DWORD gle = ok ? 0 : GetLastError();
+        diag::log_tagged_fmt("driver_bridge_net",
+            "stream_reassemble_op EXIT op=%u ok=%d data_size=%zu packets=%u truncated=%u gle=%lu elapsed_ms=%llu",
+            operation, ok ? 1 : 0, out_data ? out_data->size() : 0,
+            out_packets ? *out_packets : 0, out_truncated ? *out_truncated : 0,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return ok;
     }
 
     bool sniff_net_buffers_start(uint64_t address, uint32_t buf_reg, uint32_t size_reg,

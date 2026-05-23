@@ -1061,6 +1061,31 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 
 void initialize() {
 	auto& st = g_state;
+	st.scanning.store(false);
+	st.pointer_scanning.store(false);
+	for (int i = 0; i < 100 && !st.scan_thread_done.load(std::memory_order_acquire); ++i)
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	for (int i = 0; i < 100 && !st.pointer_thread_done.load(std::memory_order_acquire); ++i)
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	{
+		std::lock_guard<std::mutex> lk(st.results_mutex);
+		size_t had = st.results.size();
+		st.results.clear();
+		st.scan_history.clear();
+		st.total_found = 0;
+		st.has_initial_scan = false;
+		st.scan_count = 0;
+		diag::log_tagged_fmt("mem_scanner", "initialize reset_results cleared=%zu", had);
+	}
+	{
+		std::lock_guard<std::mutex> lk(st.pointer_mutex);
+		st.pointer_results.clear();
+	}
+	if (st.freeze_active.load(std::memory_order_acquire) &&
+		!st.freeze_thread_done.load(std::memory_order_acquire)) {
+		diag::log_tagged("mem_scanner", "initialize freeze_loop_already_running");
+		return;
+	}
 	st.freeze_active.store(true);
 	st.freeze_thread_done.store(false, std::memory_order_release);
 	diag::log_tagged("mem_scanner", "initialize posting_freeze_loop");

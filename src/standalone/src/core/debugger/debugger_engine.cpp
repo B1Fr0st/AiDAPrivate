@@ -152,6 +152,49 @@ std::recursive_mutex& thread_ctx_serializer() {
 	return m;
 }
 
+bool resume_thread_for_controlled_run(uint32_t tid, uint32_t previous_suspend_count) {
+	uint32_t resumes = previous_suspend_count + 1;
+	if (resumes == 0 || resumes > 64)
+		resumes = 64;
+	for (uint32_t i = 0; i < resumes; ++i) {
+		uint32_t prev = 0;
+		if (!driver_bridge::resume_thread(tid, &prev))
+			return false;
+		if (prev == 0)
+			break;
+	}
+	return true;
+}
+
+bool suspend_contextable_thread(state_t& st, driver_bridge::thread_context_t& ctx, uint32_t& previous_suspend_count) {
+	auto try_thread = [&](uint32_t tid) -> bool {
+		if (tid == 0)
+			return false;
+		uint32_t saved = 0;
+		if (!driver_bridge::suspend_thread(tid, &saved))
+			return false;
+		if (driver_bridge::get_thread_context(tid, ctx)) {
+			st.active_tid = tid;
+			previous_suspend_count = saved;
+			return true;
+		}
+		driver_bridge::resume_thread(tid);
+		return false;
+	};
+
+	if (try_thread(st.active_tid))
+		return true;
+
+	auto threads = driver_bridge::enumerate_threads();
+	for (const auto& th : threads) {
+		if (th.owner_pid != st.target_pid || th.tid == st.active_tid)
+			continue;
+		if (try_thread(th.tid))
+			return true;
+	}
+	return false;
+}
+
 }
 
 void sync_attached_state();
@@ -637,15 +680,24 @@ bool spawn_and_attach_target(const run_target::launch_options_t& opts,
 		opts.attach_after_resume ? 1 : 0);
 
 	run_target::launch_result_t lr{};
+	ULONGLONG launch_t0 = GetTickCount64();
+	diag::log_tagged_critical_fmt("spawn",
+		"spawn_pre_run_target_launch exe='%s' args='%.160s'",
+		exe_utf8.c_str(), args_utf8.c_str());
 	if (!run_target::launch(opts, lr)) {
 		set_last_error(lr.error.empty() ? std::string("launch failed (no detail)") : lr.error);
 		diag::log_tagged_critical_fmt("spawn",
-			"spawn_launch_FAILED iso=%d err='%s'",
+			"spawn_launch_FAILED iso=%d err='%s' elapsed_ms=%llu",
 			static_cast<int>(opts.isolation),
-			lr.error.c_str());
+			lr.error.c_str(),
+			static_cast<unsigned long long>(GetTickCount64() - launch_t0));
 		run_target::cleanup(lr);
 		return false;
 	}
+	diag::log_tagged_critical_fmt("spawn",
+		"spawn_post_run_target_launch ok=1 pid=%u elapsed_ms=%llu",
+		static_cast<unsigned>(lr.pid),
+		static_cast<unsigned long long>(GetTickCount64() - launch_t0));
 
 	diag::log_tagged_critical_fmt("spawn",
 		"spawn_created pid=%u hProc=%p hThr=%p job=%p firewall='%s'",
@@ -660,7 +712,20 @@ bool spawn_and_attach_target(const run_target::launch_options_t& opts,
 
 	bool driver_ok = true;
 	if (can_attach && opts.attach_after_resume) {
+		ULONGLONG attach_t0 = GetTickCount64();
+		diag::log_tagged_critical_fmt("spawn",
+			"spawn_pre_driver_attach pid=%u driver_status='%s'",
+			static_cast<unsigned>(lr.pid),
+			driver_bridge::status().c_str());
 		driver_ok = driver_bridge::attach(lr.pid);
+		diag::log_tagged_critical_fmt("spawn",
+			"spawn_post_driver_attach pid=%u ok=%d elapsed_ms=%llu driver_pid=%u driver_status='%s' last_error='%s'",
+			static_cast<unsigned>(lr.pid),
+			driver_ok ? 1 : 0,
+			static_cast<unsigned long long>(GetTickCount64() - attach_t0),
+			driver_bridge::attached_pid(),
+			driver_bridge::status().c_str(),
+			driver_bridge::last_error().c_str());
 		if (!driver_ok) {
 			std::string drv_err = driver_bridge::last_error();
 			char err[384];
@@ -684,6 +749,9 @@ bool spawn_and_attach_target(const run_target::launch_options_t& opts,
 
 	if (lr.thread_handle != 0) {
 		HANDLE t = reinterpret_cast<HANDLE>(lr.thread_handle);
+		diag::log_tagged_critical_fmt("spawn",
+			"spawn_pre_ResumeThread pid=%u thread_handle=%p",
+			static_cast<unsigned>(lr.pid), t);
 		DWORD prev_count = ResumeThread(t);
 		if (prev_count == static_cast<DWORD>(-1)) {
 			DWORD gle = GetLastError();
@@ -704,6 +772,17 @@ bool spawn_and_attach_target(const run_target::launch_options_t& opts,
 			"spawn_ResumeThread_ok pid=%u prev_suspend_count=%lu",
 			static_cast<unsigned>(lr.pid),
 			static_cast<unsigned long>(prev_count));
+		HANDLE p = reinterpret_cast<HANDLE>(lr.process_handle);
+		DWORD exit_code = STILL_ACTIVE;
+		DWORD wait0 = p ? WaitForSingleObject(p, 0) : WAIT_FAILED;
+		BOOL got_exit = p ? GetExitCodeProcess(p, &exit_code) : FALSE;
+		diag::log_tagged_critical_fmt("spawn",
+			"spawn_post_resume_process_status pid=%u wait0=0x%08lX got_exit=%d exit_code=0x%08lX gle=%lu",
+			static_cast<unsigned>(lr.pid),
+			static_cast<unsigned long>(wait0),
+			got_exit ? 1 : 0,
+			static_cast<unsigned long>(exit_code),
+			got_exit ? 0 : GetLastError());
 	}
 
 	if (can_attach && driver_ok) {
@@ -838,6 +917,7 @@ bool step_into() {
 	auto regs = get_registers();
 	if (regs.rip == 0) {
 		set_last_error("step_into: rip cache is zero");
+		st.status.store(dbg_status_t::paused);
 		diag::log_tagged_fmt("debugger",
 			"step_into_REJECTED rip_zero pid=%u tid=%u",
 			static_cast<unsigned>(st.target_pid),
@@ -895,15 +975,11 @@ bool step_into() {
 
 	std::lock_guard<std::recursive_mutex> step_lk(thread_ctx_serializer());
 
-	if (!driver_bridge::suspend_thread(st.active_tid)) {
-		set_last_error("step_into: suspend_thread failed");
-		return false;
-	}
-
+	uint32_t previous_suspend_count = 0;
 	driver_bridge::thread_context_t kctx{};
-	if (!driver_bridge::get_thread_context(st.active_tid, kctx)) {
-		driver_bridge::resume_thread(st.active_tid);
-		set_last_error("step_into: get_thread_context failed");
+	if (!suspend_contextable_thread(st, kctx, previous_suspend_count)) {
+		set_last_error("step_into: no contextable target thread");
+		st.status.store(dbg_status_t::paused);
 		return false;
 	}
 
@@ -912,11 +988,13 @@ bool step_into() {
 	if (!driver_bridge::set_thread_context(st.active_tid, kctx, ~0ULL)) {
 		driver_bridge::resume_thread(st.active_tid);
 		set_last_error("step_into: set_thread_context failed");
+		st.status.store(dbg_status_t::paused);
 		return false;
 	}
 
-	if (!driver_bridge::resume_thread(st.active_tid)) {
+	if (!resume_thread_for_controlled_run(st.active_tid, previous_suspend_count)) {
 		set_last_error("step_into: resume_thread failed");
+		st.status.store(dbg_status_t::paused);
 		return false;
 	}
 
@@ -931,9 +1009,18 @@ bool step_into() {
 		if (!driver_bridge::get_thread_context(st.active_tid, probe))
 			continue;
 		if (probe.rip != pre_step_rip) {
-			driver_bridge::suspend_thread(st.active_tid);
+			if (!driver_bridge::suspend_thread(st.active_tid)) {
+				diag::log_tagged_fmt("debugger",
+					"step_into_probe_advanced_suspend_failed pid=%u tid=%u probe_rip=0x%llx",
+					static_cast<unsigned>(st.target_pid),
+					static_cast<unsigned>(st.active_tid),
+					static_cast<unsigned long long>(probe.rip));
+				continue;
+			}
 			driver_bridge::thread_context_t stable{};
 			if (driver_bridge::get_thread_context(st.active_tid, stable)) {
+				stable.rflags &= ~0x100ULL;
+				driver_bridge::set_thread_context(st.active_tid, stable, ~0ULL);
 				post_regs.rax = stable.rax; post_regs.rbx = stable.rbx;
 				post_regs.rcx = stable.rcx; post_regs.rdx = stable.rdx;
 				post_regs.rsi = stable.rsi; post_regs.rdi = stable.rdi;
@@ -947,9 +1034,15 @@ bool step_into() {
 				post_regs.dr0 = stable.dr0; post_regs.dr1 = stable.dr1;
 				post_regs.dr2 = stable.dr2; post_regs.dr3 = stable.dr3;
 				post_regs.dr6 = stable.dr6; post_regs.dr7 = stable.dr7;
+				advanced = true;
+				break;
 			}
-			advanced = true;
-			break;
+			driver_bridge::resume_thread(st.active_tid);
+			diag::log_tagged_fmt("debugger",
+				"step_into_probe_advanced_stable_context_failed pid=%u tid=%u probe_rip=0x%llx",
+				static_cast<unsigned>(st.target_pid),
+				static_cast<unsigned>(st.active_tid),
+				static_cast<unsigned long long>(probe.rip));
 		}
 	}
 
@@ -1767,55 +1860,107 @@ void find_strings(size_t min_length) {
 	st.strings_pages_scanned.store(0, std::memory_order_release);
 	st.strings_found_so_far.store(0, std::memory_order_release);
 
+	auto attach_module = [&modules](string_ref_t& sr) {
+		for (const auto& m : modules) {
+			if (sr.address >= m.base && sr.address < m.base + m.size) {
+				sr.module_name = m.name;
+				sr.module_offset = sr.address - m.base;
+				break;
+			}
+		}
+	};
+
+	auto push_ascii = [&](uint64_t address, const uint8_t* data, size_t len) {
+		if (len < min_length || found.size() > 100000)
+			return;
+		string_ref_t sr;
+		sr.address = address;
+		size_t keep = (len > 512) ? 512 : len;
+		sr.value.assign(reinterpret_cast<const char*>(data), keep);
+		sr.is_unicode = false;
+		attach_module(sr);
+		found.push_back(std::move(sr));
+		st.strings_found_so_far.store(found.size(), std::memory_order_release);
+	};
+
+	auto push_wide = [&](uint64_t address, const uint8_t* data, size_t chars) {
+		if (chars < min_length || found.size() > 100000)
+			return;
+		string_ref_t sr;
+		sr.address = address;
+		size_t keep = (chars > 512) ? 512 : chars;
+		sr.value.reserve(keep);
+		for (size_t i = 0; i < keep; ++i)
+			sr.value.push_back(static_cast<char>(data[i * 2]));
+		sr.is_unicode = true;
+		attach_module(sr);
+		found.push_back(std::move(sr));
+		st.strings_found_so_far.store(found.size(), std::memory_order_release);
+	};
+
+	auto scan_buffer = [&](uint64_t base, const std::vector<uint8_t>& buf) {
+		size_t ascii_start = 0;
+		bool in_ascii = false;
+		for (size_t i = 0; i < buf.size(); ++i) {
+			bool printable = (buf[i] >= 0x20 && buf[i] <= 0x7e);
+			if (printable && !in_ascii) {
+				ascii_start = i;
+				in_ascii = true;
+			} else if (!printable && in_ascii) {
+				push_ascii(base + ascii_start, buf.data() + ascii_start, i - ascii_start);
+				in_ascii = false;
+			}
+		}
+		if (in_ascii)
+			push_ascii(base + ascii_start, buf.data() + ascii_start, buf.size() - ascii_start);
+
+		size_t wide_start = 0;
+		bool in_wide = false;
+		for (size_t i = 0; i + 1 < buf.size(); i += 2) {
+			bool printable = (buf[i] >= 0x20 && buf[i] <= 0x7e && buf[i + 1] == 0);
+			if (printable && !in_wide) {
+				wide_start = i;
+				in_wide = true;
+			} else if (!printable && in_wide) {
+				push_wide(base + wide_start, buf.data() + wide_start, (i - wide_start) / 2);
+				in_wide = false;
+			}
+		}
+		if (in_wide)
+			push_wide(base + wide_start, buf.data() + wide_start, (buf.size() - wide_start) / 2);
+	};
+
 	for (const auto& region : regions) {
 		if (st.strings_cancel.load(std::memory_order_acquire)) break;
 		if (region.state != 0x1000) continue;
 		if (region.size > 0x1000000) continue;
-
-		std::vector<uint8_t> buf;
-		if (!driver_bridge::read_memory(region.base, static_cast<size_t>(region.size), buf)) {
-			uint64_t region_pages = (region.size + 0xFFFull) / 0x1000ull;
-			st.strings_pages_scanned.fetch_add(region_pages, std::memory_order_acq_rel);
+		if ((region.protect & PAGE_GUARD) != 0 || (region.protect & 0xff) == PAGE_NOACCESS)
 			continue;
-		}
 
-
-		size_t start = 0;
-		bool in_string = false;
-		const size_t cancel_check_stride = 0x10000;
-		size_t next_cancel_check = cancel_check_stride;
-		for (size_t i = 0; i < buf.size(); ++i) {
-			if (i >= next_cancel_check) {
-				if (st.strings_cancel.load(std::memory_order_acquire)) break;
-				next_cancel_check += cancel_check_stride;
-			}
-			bool printable = (buf[i] >= 0x20 && buf[i] <= 0x7e);
-			if (printable && !in_string) {
-				start = i;
-				in_string = true;
-			} else if (!printable && in_string) {
-				size_t len = i - start;
-				if (len >= min_length && buf[i] == 0) {
-					string_ref_t sr;
-					sr.address = region.base + start;
-					sr.value = std::string(reinterpret_cast<const char*>(buf.data() + start), len);
-					sr.is_unicode = false;
-					for (const auto& m : modules) {
-						if (sr.address >= m.base && sr.address < m.base + m.size) {
-							sr.module_name = m.name;
-							sr.module_offset = sr.address - m.base;
-							break;
-						}
-					}
-					found.push_back(std::move(sr));
-					st.strings_found_so_far.store(found.size(), std::memory_order_release);
+		uint64_t remaining = region.size;
+		uint64_t cursor = region.base;
+		while (remaining != 0) {
+			if (st.strings_cancel.load(std::memory_order_acquire)) break;
+			size_t chunk = static_cast<size_t>((remaining > 0x10000ull) ? 0x10000ull : remaining);
+			std::vector<uint8_t> buf;
+			if (driver_bridge::read_memory(cursor, chunk, buf) && !buf.empty()) {
+				scan_buffer(cursor, buf);
+				uint64_t pages = (buf.size() + 0xFFFull) / 0x1000ull;
+				st.strings_pages_scanned.fetch_add(pages, std::memory_order_acq_rel);
+			} else {
+				for (size_t off = 0; off < chunk; off += 0x1000) {
+					if (st.strings_cancel.load(std::memory_order_acquire)) break;
+					size_t page = (chunk - off > 0x1000) ? 0x1000 : (chunk - off);
+					std::vector<uint8_t> page_buf;
+					if (driver_bridge::read_memory(cursor + off, page, page_buf) && !page_buf.empty())
+						scan_buffer(cursor + off, page_buf);
+					st.strings_pages_scanned.fetch_add(1, std::memory_order_acq_rel);
 				}
-				in_string = false;
 			}
+			cursor += chunk;
+			remaining -= chunk;
+			if (found.size() > 100000) break;
 		}
-
-		uint64_t region_pages = (buf.size() + 0xFFFull) / 0x1000ull;
-		st.strings_pages_scanned.fetch_add(region_pages, std::memory_order_acq_rel);
 
 		if (found.size() > 100000) break;
 	}

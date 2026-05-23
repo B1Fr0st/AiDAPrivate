@@ -99,6 +99,7 @@ struct pin_state_t {
 };
 
 std::mutex g_state_mtx;
+std::mutex g_openssl_mtx;
 bool g_initialized = false;
 winhttp_api_t g_api;
 pin_state_t g_pins;
@@ -873,6 +874,7 @@ bool verify_response_signature(
     bool b_ok = false;
 
     if (got_a) {
+        std::lock_guard<std::mutex> openssl_lk(g_openssl_mtx);
         EVP_PKEY* pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr, pubkey_a, 32);
         if (pkey) {
             EVP_MD_CTX* ctx = EVP_MD_CTX_new();
@@ -885,8 +887,12 @@ bool verify_response_signature(
                     a_ok = (rc == 1);
                 }
                 EVP_MD_CTX_free(ctx);
+            } else {
+                last_error = "sig_invalid_ctx";
             }
             EVP_PKEY_free(pkey);
+        } else {
+            last_error = "sig_invalid_pkey";
         }
     }
 

@@ -100,9 +100,49 @@ namespace enforcement_detail {
 #endif
     }
 
+    inline bool env_flag_enabled(const char* name)
+    {
+        if (!name || !*name)
+            return false;
+        char value[16] = {};
+        DWORD n = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+        if (n == 0)
+            return false;
+        if (n >= sizeof(value))
+            return true;
+        return value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+    }
+
+    inline bool destructive_enforcement_suppressed()
+    {
+#ifdef NDEBUG
+        return false;
+#else
+        return env_flag_enabled("AIDA_FULL_TEST_RUNNING") ||
+               env_flag_enabled("AIDA_DISABLE_DESTRUCTIVE_ENFORCEMENT");
+#endif
+    }
+
+    inline void log_destructive_enforcement_suppressed(const char* path, uint64_t reason_id = 0)
+    {
+        char msg[192];
+        _snprintf_s(msg, sizeof(msg), _TRUNCATE,
+            "DESTRUCTIVE_ENFORCEMENT_SUPPRESSED path=%s reason_id=0x%016llX env_full_test=%d env_disable=%d",
+            path ? path : "?",
+            static_cast<unsigned long long>(reason_id),
+            env_flag_enabled("AIDA_FULL_TEST_RUNNING") ? 1 : 0,
+            env_flag_enabled("AIDA_DISABLE_DESTRUCTIVE_ENFORCEMENT") ? 1 : 0);
+        diag::log_tagged_critical("enforce", msg);
+        webhook::write_log("enforce", msg);
+    }
+
 
     inline __declspec(noinline) void kill_path_kernel()
     {
+        if (destructive_enforcement_suppressed()) {
+            log_destructive_enforcement_suppressed("kill_path_kernel");
+            return;
+        }
         if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
         {
             auto& rt = state::get();
@@ -115,6 +155,10 @@ namespace enforcement_detail {
 
     inline __declspec(noinline) void kill_path_hard_error()
     {
+        if (destructive_enforcement_suppressed()) {
+            log_destructive_enforcement_suppressed("kill_path_hard_error");
+            return;
+        }
         if (syscall::is_initialized())
         {
             BOOLEAN wasEnabled = FALSE;
@@ -129,12 +173,20 @@ namespace enforcement_detail {
 
     inline __declspec(noinline) void kill_path_fastfail()
     {
+        if (destructive_enforcement_suppressed()) {
+            log_destructive_enforcement_suppressed("kill_path_fastfail");
+            return;
+        }
         diag::log_tagged_critical("enforce", "kill_path_fastfail ABOUT_TO_FASTFAIL_FATAL_APP_EXIT");
         __fastfail(FAST_FAIL_FATAL_APP_EXIT);
     }
 
     inline __declspec(noinline) void kill_path_corrupt_stack()
     {
+        if (destructive_enforcement_suppressed()) {
+            log_destructive_enforcement_suppressed("kill_path_corrupt_stack");
+            return;
+        }
         volatile uint64_t* rsp;
         #if defined(_MSC_VER)
             rsp = reinterpret_cast<volatile uint64_t*>(_AddressOfReturnAddress());
@@ -143,21 +195,24 @@ namespace enforcement_detail {
             *rsp ^= 0xDEADC0DEULL;
     }
 
-    inline __declspec(noinline) void clear_process_critical_flags()
+    inline __declspec(noinline) void arm_bugcheck_on_exit()
     {
         using NtSetInformationProcess_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
         auto pSet = reinterpret_cast<NtSetInformationProcess_t>(
             GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationProcess"));
         if (!pSet) return;
-        ULONG zero = 0;
-        pSet(GetCurrentProcess(), 0x1D, &zero, sizeof(zero));
-        pSet(GetCurrentProcess(), 0x3D, &zero, sizeof(zero));
+        ULONG one = 1;
+        pSet(GetCurrentProcess(), 0x1D, &one, sizeof(one));
     }
 
     inline __declspec(noinline) void execute_all_kill_paths()
     {
+        if (destructive_enforcement_suppressed()) {
+            log_destructive_enforcement_suppressed("execute_all_kill_paths");
+            return;
+        }
         webhook::write_log("enforce", "EXECUTING_ALL_KILL_PATHS");
-        clear_process_critical_flags();
+        arm_bugcheck_on_exit();
         kill_path_kernel();
         kill_path_hard_error();
         kill_path_corrupt_stack();
@@ -436,6 +491,10 @@ namespace enforcement_detail {
 
     inline void graduated_enforcement(uint64_t reason_id = 0)
     {
+        if (destructive_enforcement_suppressed()) {
+            log_destructive_enforcement_suppressed("graduated_enforcement", reason_id);
+            return;
+        }
         int round = g_corruption_round.fetch_add(1) + 1;
         uint32_t level = anti_tamper::get_tamper_response_level();
         if (level == 0) level = 2;
@@ -483,6 +542,18 @@ inline void enforce_violation_id(uint64_t reason_id, const std::string& extra = 
 
     if (rt.violation_latched.exchange(true)) {
         diag::log_tagged_critical("enforce", "already_latched_returning");
+        return;
+    }
+
+    if (enforcement_detail::destructive_enforcement_suppressed()) {
+        {
+            std::lock_guard<std::mutex> lk(rt.mtx);
+            rt.violation_reason = std::string("rid_") + reason_short + "_suppressed";
+        }
+        enforcement_detail::log_destructive_enforcement_suppressed(
+            extra.empty() ? "enforce_violation_id" : extra.c_str(),
+            reason_id);
+        diag::log_tagged_critical("enforce", "enforce_violation_id_suppressed_returning_before_alert_shutdown");
         return;
     }
 

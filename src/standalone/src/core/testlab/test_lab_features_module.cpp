@@ -378,6 +378,13 @@ namespace {
 		req->filter_pid = s.pid;
 		req->filter_port = s.size;
 		req->filter_protocol = s.u32_b;
+		if (s.u32_a == 0u && req->filter_pid == 0u &&
+			req->filter_port == 0u && req->filter_protocol == 0u) {
+			r.error = "refusing wildcard intercept start; set pid, port, or protocol";
+			r.ntstatus = static_cast<std::int32_t>(0xC000000Du);
+			r.ok = false;
+			return;
+		}
 		if (s.u32_a == 5u) {
 			std::uint32_t mod_written = parse_hex_payload(s.text_a, req->modify_payload,
 				voyager::detail::INTERCEPT_MAX_PAYLOAD);

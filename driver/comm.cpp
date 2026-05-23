@@ -1550,6 +1550,10 @@ std::uint64_t voyager::device_t::call_function_attempt(
 
 bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD input_size) const noexcept {
     if (!is_connected() || !input || input_size == 0) {
+        diag::log_tagged_fmt("comm",
+            "send_request REJECT ioctl=0x%08X input_size=%u connected=%d input=%p handle=0x%llX pid=%u",
+            control_code, input_size, is_connected() ? 1 : 0, input,
+            reinterpret_cast<unsigned long long>(driver_handle_), process_id_);
         return false;
     }
 
@@ -1594,6 +1598,7 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
     }
 
     DWORD bytes_returned = 0;
+    const ULONGLONG ioctl_start = GetTickCount64();
 
     BOOL result = DeviceIoControl(
         driver_handle_,
@@ -1610,6 +1615,19 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
         DWORD err = GetLastError();
         RC_UM_DBG("send_request FAILED ioctl=0x%08X input_size=%u err=%lu handle=0x%llX",
             control_code, input_size, err, reinterpret_cast<unsigned long long>(driver_handle_));
+        diag::log_tagged_fmt("comm",
+            "send_request FAILED ioctl=0x%08X input_size=%u bytes=%lu err=%lu handle=0x%llX pid=%u session=%d elapsed_ms=%llu",
+            control_code, input_size, static_cast<unsigned long>(bytes_returned), err,
+            reinterpret_cast<unsigned long long>(driver_handle_), process_id_,
+            session_key_ != 0 ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - ioctl_start));
+    } else if (bytes_returned == 0 || (GetTickCount64() - ioctl_start) > 250) {
+        diag::log_tagged_fmt("comm",
+            "send_request OK_SUSPICIOUS ioctl=0x%08X input_size=%u bytes=%lu handle=0x%llX pid=%u session=%d elapsed_ms=%llu",
+            control_code, input_size, static_cast<unsigned long>(bytes_returned),
+            reinterpret_cast<unsigned long long>(driver_handle_), process_id_,
+            session_key_ != 0 ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - ioctl_start));
     }
 
     spoofer::scatter_execution();
@@ -1982,11 +2000,15 @@ bool voyager::device_t::set_hardware_breakpoint(std::uint32_t tid, int index, st
 
 
     std::uint64_t dr7 = ctx.dr7;
+    constexpr std::uint64_t kDr7UserMask = 0xFFFF0355ULL;
+    constexpr std::uint64_t kDr7GlobalEnableMask = 0xAAULL;
+    dr7 &= kDr7UserMask;
+    dr7 &= ~kDr7GlobalEnableMask;
 
 
     int rw_shift = 16 + index * 4;
     int len_shift = 18 + index * 4;
-    dr7 &= ~(1ULL << (index * 2));
+    dr7 &= ~(3ULL << (index * 2));
     dr7 &= ~(3ULL << rw_shift);
     dr7 &= ~(3ULL << len_shift);
 
@@ -2028,12 +2050,17 @@ bool voyager::device_t::clear_hardware_breakpoint(std::uint32_t tid, int index) 
 
 
     std::uint64_t dr7 = ctx.dr7;
-    dr7 &= ~(1ULL << (index * 2));
+    constexpr std::uint64_t kDr7UserMask = 0xFFFF0355ULL;
+    constexpr std::uint64_t kDr7GlobalEnableMask = 0xAAULL;
+    dr7 &= kDr7UserMask;
+    dr7 &= ~kDr7GlobalEnableMask;
+    dr7 &= ~(3ULL << (index * 2));
     dr7 &= ~(3ULL << (16 + index * 4));
     dr7 &= ~(3ULL << (18 + index * 4));
+    ctx.dr6 = 0;
     ctx.dr7 = dr7;
 
-    std::uint64_t mask = (1ULL << (18 + index)) | (1ULL << 23);
+    std::uint64_t mask = (1ULL << (18 + index)) | (1ULL << 22) | (1ULL << 23);
 
     return set_thread_context(tid, ctx, mask);
 }

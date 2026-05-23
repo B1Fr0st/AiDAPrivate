@@ -41,6 +41,17 @@ namespace
     bool parse_addr(const std::string& text, uint64_t& out)
     {
         try {
+            if (text.size() > 2 && text[0] == '0' && (text[1] == 'b' || text[1] == 'B')) {
+                uint64_t value = 0;
+                for (size_t i = 2; i < text.size(); ++i) {
+                    const char c = text[i];
+                    if (c != '0' && c != '1')
+                        return false;
+                    value = (value << 1) | static_cast<uint64_t>(c == '1');
+                }
+                out = value;
+                return true;
+            }
             size_t idx = 0;
             out = std::stoull(text, &idx, 0);
             return idx == text.size();
@@ -369,11 +380,35 @@ namespace
 
         DisasmFile file;
         const auto path = params["path"].get<std::string>();
+        const size_t limit = static_cast<size_t>(params.value("count", 64));
+        diag::log_tagged_fmt("mcp_tools",
+            "handle_disassemble_file load_start path='%s' count=%zu",
+            path.c_str(), limit);
         if (!disasm::load_pe(path, file))
             return error(file.err.empty() ? "Unable to load PE file." : file.err);
+        size_t exec_sections = 0;
+        size_t exec_bytes = 0;
+        for (const auto& section : file.sections) {
+            if (section.is_executable) {
+                ++exec_sections;
+                exec_bytes += section.bytes.size();
+            }
+        }
+        diag::log_tagged_fmt("mcp_tools",
+            "handle_disassemble_file load_done path='%s' image=0x%llX sections=%zu exec_sections=%zu exec_bytes=%zu",
+            path.c_str(),
+            static_cast<unsigned long long>(file.image_base),
+            file.sections.size(),
+            exec_sections,
+            exec_bytes);
 
-        disasm::decode_section(file);
-        const size_t limit = static_cast<size_t>(params.value("count", 64));
+        diag::log_tagged_fmt("mcp_tools",
+            "handle_disassemble_file decode_start path='%s' max_instrs=%zu",
+            path.c_str(), limit);
+        disasm::decode_section_limited(file, limit);
+        diag::log_tagged_fmt("mcp_tools",
+            "handle_disassemble_file decode_done path='%s' instrs=%zu",
+            path.c_str(), file.instrs.size());
         json instructions = json::array();
         for (size_t i = 0; i < file.instrs.size() && i < limit; ++i) {
             const auto& insn = file.instrs[i];
@@ -390,6 +425,9 @@ namespace
         out["image_base"] = hex_addr(file.image_base);
         out["entry_point"] = hex_addr(file.entry_point);
         out["instruction_count"] = file.instrs.size();
+        out["exec_section_count"] = exec_sections;
+        out["exec_byte_count"] = exec_bytes;
+        out["decode_limited"] = true;
         out["instructions"] = instructions;
         return tool_result_t::ok("Disassembled PE file.", out);
     }
@@ -1226,8 +1264,12 @@ namespace
 
         if (!source_reconstructor::is_running()) {
             auto& last = source_reconstructor::get_last_result();
-            result["success"] = last.success;
-            result["error"] = last.error;
+            bool has_last_run = !last.output_dir.empty() || last.total_functions != 0 ||
+                last.decompiled_functions != 0 || last.modules_created != 0 ||
+                !last.files_created.empty() || !last.error.empty();
+            result["has_last_run"] = has_last_run;
+            result["last_success"] = has_last_run ? last.success : false;
+            result["last_error"] = last.error;
             result["total_functions"] = last.total_functions;
             result["decompiled_functions"] = last.decompiled_functions;
             result["modules_created"] = last.modules_created;

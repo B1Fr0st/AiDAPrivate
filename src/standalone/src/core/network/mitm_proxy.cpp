@@ -437,21 +437,31 @@ static void parse_connect_target(const std::string& line, std::string& host, uin
 }
 
 
-static SOCKET try_connect_address(const sockaddr* addr, int addr_len, int family, int socktype, int proto) {
+static SOCKET try_connect_address(const sockaddr* addr, int addr_len, int family, int socktype, int proto,
+                                  int connect_timeout_ms = 10000, DWORD io_timeout_ms = 30000) {
+    const ULONGLONG t0 = GetTickCount64();
+    diag::log_tagged_fmt("mitm",
+        "try_connect_address ENTER family=%d socktype=%d proto=%d connect_timeout_ms=%d io_timeout_ms=%lu",
+        family, socktype, proto, connect_timeout_ms, static_cast<unsigned long>(io_timeout_ms));
     SOCKET s = socket(family, socktype, proto);
-    if (s == INVALID_SOCKET) return INVALID_SOCKET;
+    if (s == INVALID_SOCKET) {
+        diag::log_tagged_fmt("mitm", "try_connect_address socket_failed family=%d wsa=%d", family, WSAGetLastError());
+        return INVALID_SOCKET;
+    }
 
     u_long nonblocking = 1;
     if (ioctlsocket(s, FIONBIO, &nonblocking) != 0) {
+        diag::log_tagged_fmt("mitm", "try_connect_address ioctlsocket_failed family=%d wsa=%d", family, WSAGetLastError());
         closesocket(s);
         return INVALID_SOCKET;
     }
 
-    constexpr int kConnectTimeoutMs = 10000;
     int cr = connect(s, addr, addr_len);
     if (cr != 0) {
         int werr = WSAGetLastError();
         if (werr != WSAEWOULDBLOCK && werr != WSAEINPROGRESS) {
+            diag::log_tagged_fmt("mitm", "try_connect_address connect_immediate_failed family=%d wsa=%d elapsed_ms=%llu",
+                family, werr, static_cast<unsigned long long>(GetTickCount64() - t0));
             closesocket(s);
             return INVALID_SOCKET;
         }
@@ -459,8 +469,10 @@ static SOCKET try_connect_address(const sockaddr* addr, int addr_len, int family
         WSAPOLLFD pfd{};
         pfd.fd = s;
         pfd.events = POLLOUT;
-        int pr = WSAPoll(&pfd, 1, kConnectTimeoutMs);
+        int pr = WSAPoll(&pfd, 1, connect_timeout_ms);
         if (pr <= 0) {
+            diag::log_tagged_fmt("mitm", "try_connect_address poll_failed family=%d pr=%d wsa=%d elapsed_ms=%llu",
+                family, pr, WSAGetLastError(), static_cast<unsigned long long>(GetTickCount64() - t0));
             closesocket(s);
             return INVALID_SOCKET;
         }
@@ -468,6 +480,8 @@ static SOCKET try_connect_address(const sockaddr* addr, int addr_len, int family
         int so_err = 0;
         int so_err_len = sizeof(so_err);
         if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_err), &so_err_len) != 0 || so_err != 0) {
+            diag::log_tagged_fmt("mitm", "try_connect_address so_error family=%d so_err=%d wsa=%d elapsed_ms=%llu",
+                family, so_err, WSAGetLastError(), static_cast<unsigned long long>(GetTickCount64() - t0));
             closesocket(s);
             return INVALID_SOCKET;
         }
@@ -475,13 +489,69 @@ static SOCKET try_connect_address(const sockaddr* addr, int addr_len, int family
 
     u_long blocking = 0;
     ioctlsocket(s, FIONBIO, &blocking);
-    DWORD io_timeout_ms = 30000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&io_timeout_ms), sizeof(io_timeout_ms));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&io_timeout_ms), sizeof(io_timeout_ms));
+    diag::log_tagged_fmt("mitm", "try_connect_address CONNECTED family=%d elapsed_ms=%llu",
+        family, static_cast<unsigned long long>(GetTickCount64() - t0));
     return s;
 }
 
+static bool is_loopback_host(const std::string& host) {
+    if (host.empty()) return false;
+
+    std::string lower = host;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+        [](unsigned char c) { return static_cast<char>(::tolower(c)); });
+    if (lower == "localhost" || lower == "localhost.") return true;
+
+    in_addr addr4{};
+    if (inet_pton(AF_INET, host.c_str(), &addr4) == 1) {
+        const uint32_t h = ntohl(addr4.s_addr);
+        return (h >> 24) == 127;
+    }
+
+    in6_addr addr6{};
+    if (inet_pton(AF_INET6, host.c_str(), &addr6) == 1) {
+        static const uint8_t loop6[16] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1 };
+        return std::memcmp(&addr6, loop6, sizeof(loop6)) == 0;
+    }
+
+    return false;
+}
+
+static SOCKET connect_loopback(uint16_t port, int connect_timeout_ms, DWORD io_timeout_ms) {
+    sockaddr_in sin{};
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(port);
+    inet_pton(AF_INET, "127.0.0.1", &sin.sin_addr);
+
+    SOCKET s = try_connect_address(reinterpret_cast<const sockaddr*>(&sin), sizeof(sin),
+                                   AF_INET, SOCK_STREAM, IPPROTO_TCP,
+                                   connect_timeout_ms, io_timeout_ms);
+    if (s != INVALID_SOCKET) {
+        diag::log_tagged_fmt("mitm", "connect_loopback ipv4_ok port=%u", port);
+        return s;
+    }
+    diag::log_tagged_fmt("mitm", "connect_loopback ipv4_failed_try_ipv6 port=%u", port);
+
+    sockaddr_in6 sin6{};
+    sin6.sin6_family = AF_INET6;
+    sin6.sin6_port = htons(port);
+    inet_pton(AF_INET6, "::1", &sin6.sin6_addr);
+    return try_connect_address(reinterpret_cast<const sockaddr*>(&sin6), sizeof(sin6),
+                               AF_INET6, SOCK_STREAM, IPPROTO_TCP,
+                               connect_timeout_ms, io_timeout_ms);
+}
+
 static SOCKET connect_tcp(const std::string& host, uint16_t port) {
+    if (is_loopback_host(host)) {
+        diag::log_tagged_fmt("mitm", "connect_tcp loopback_fast_path host=%s port=%u", host.c_str(), port);
+        SOCKET s = connect_loopback(port, 500, 5000);
+        diag::log_tagged_fmt("mitm", "connect_tcp loopback_fast_path_done host=%s port=%u ok=%d",
+            host.c_str(), port, s != INVALID_SOCKET ? 1 : 0);
+        return s;
+    }
+
     addrinfo hints = {};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -490,6 +560,8 @@ static SOCKET connect_tcp(const std::string& host, uint16_t port) {
     addrinfo* result = nullptr;
     std::string port_str = std::to_string(port);
     int rc = getaddrinfo(host.c_str(), port_str.c_str(), &hints, &result);
+    diag::log_tagged_fmt("mitm", "connect_tcp getaddrinfo host=%s port=%u rc=%d has_result=%d",
+        host.c_str(), port, rc, result ? 1 : 0);
 
     SOCKET connected = INVALID_SOCKET;
     if (rc == 0 && result) {

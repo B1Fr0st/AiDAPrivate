@@ -90,6 +90,16 @@ static void test_symbolic_execute(HANDLE hf, std::atomic<int>& passed, std::atom
     auto result = symbolic_engine::execute_symbolic(addr, addr + 32, 500, {}, {});
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    if (!result.success) {
+        log_msg(hf, "sym_exec", "FAIL -- execute_symbolic success=0 error=\"%s\" traced=%u (elapsed %lld ms)",
+            result.error.c_str(), result.total_instructions, (long long)ms);
+        failed.fetch_add(1); return;
+    }
+    if (result.total_instructions == 0 || result.trace.empty()) {
+        log_msg(hf, "sym_exec", "FAIL -- execute_symbolic returned empty trace success=%d traced=%u trace=%zu (elapsed %lld ms)",
+            result.success, result.total_instructions, result.trace.size(), (long long)ms);
+        failed.fetch_add(1); return;
+    }
     log_msg(hf, "sym_exec", "PASS -- success=%d traced=%u tainted=%u junk=%u opaque=%u (elapsed %lld ms)",
         result.success, result.total_instructions, result.tainted_count,
         result.junk_count, result.opaque_count, (long long)ms);
@@ -109,6 +119,16 @@ static void test_symbolic_slice(HANDLE hf, std::atomic<int>& passed, std::atomic
     auto result = symbolic_engine::slice_to_register(addr, addr + 32, 500, "rax");
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    if (!result.success) {
+        log_msg(hf, "sym_slice", "FAIL -- slice_to_register success=0 error=\"%s\" total=%u effective=%u (elapsed %lld ms)",
+            result.error.c_str(), result.total_instructions, result.effective_count, (long long)ms);
+        failed.fetch_add(1); return;
+    }
+    if (result.total_instructions == 0 || result.effective_instructions.empty()) {
+        log_msg(hf, "sym_slice", "FAIL -- slice_to_register returned empty slice success=%d total=%u effective=%u (elapsed %lld ms)",
+            result.success, result.total_instructions, result.effective_count, (long long)ms);
+        failed.fetch_add(1); return;
+    }
     log_msg(hf, "sym_slice", "PASS -- success=%d total=%u effective=%u removed=%u (elapsed %lld ms)",
         result.success, result.total_instructions, result.effective_count,
         result.removed_count, (long long)ms);
@@ -128,6 +148,16 @@ static void test_symbolic_taint(HANDLE hf, std::atomic<int>& passed, std::atomic
     auto result = symbolic_engine::taint_trace(addr, addr + 32, 500, {"rcx"}, {});
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    if (!result.success) {
+        log_msg(hf, "sym_taint", "FAIL -- taint_trace success=0 error=\"%s\" traced=%u tainted=%u (elapsed %lld ms)",
+            result.error.c_str(), result.total_processed, result.tainted_count, (long long)ms);
+        failed.fetch_add(1); return;
+    }
+    if (result.total_processed == 0 || result.tainted_instructions.empty()) {
+        log_msg(hf, "sym_taint", "FAIL -- taint_trace returned empty taint result success=%d traced=%u tainted=%u (elapsed %lld ms)",
+            result.success, result.total_processed, result.tainted_count, (long long)ms);
+        failed.fetch_add(1); return;
+    }
     log_msg(hf, "sym_taint", "PASS -- success=%d traced=%u tainted=%u (elapsed %lld ms)",
         result.success, result.total_processed, result.tainted_count, (long long)ms);
     passed.fetch_add(1);
@@ -164,6 +194,16 @@ static void test_deobfusc_strip_junk(HANDLE hf, std::atomic<int>& passed, std::a
     auto result = deobfuscation_engine::strip_junk_code(addr, addr + 64, {"rax"});
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    if (!result.success) {
+        log_msg(hf, "deob_jnk", "FAIL -- strip_junk_code success=0 error=\"%s\" original=%u clean=%u (elapsed %lld ms)",
+            result.error.c_str(), result.total_original, result.total_clean, (long long)ms);
+        failed.fetch_add(1); return;
+    }
+    if (result.total_original == 0 || result.clean_instructions.empty()) {
+        log_msg(hf, "deob_jnk", "FAIL -- strip_junk_code returned empty clean result success=%d original=%u clean=%u (elapsed %lld ms)",
+            result.success, result.total_original, result.total_clean, (long long)ms);
+        failed.fetch_add(1); return;
+    }
     log_msg(hf, "deob_jnk", "PASS -- success=%d original=%u clean=%u removed=%u junk_ratio=%.2f (elapsed %lld ms)",
         result.success, result.total_original, result.total_clean,
         result.removed_junk, static_cast<double>(result.junk_ratio), (long long)ms);
@@ -183,6 +223,10 @@ static void test_deobfusc_resolve_constants(HANDLE hf, std::atomic<int>& passed,
     auto constants = deobfuscation_engine::resolve_constants(addr, addr + 32, 500);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    if (constants.empty()) {
+        log_msg(hf, "deob_cst", "FAIL -- resolve_constants returned 0 constants (elapsed %lld ms)", (long long)ms);
+        failed.fetch_add(1); return;
+    }
     log_msg(hf, "deob_cst", "PASS -- resolved %zu constants (elapsed %lld ms)", constants.size(), (long long)ms);
     passed.fetch_add(1);
 }
@@ -323,6 +367,10 @@ static void test_xref_find(HANDLE hf, std::atomic<int>& passed, std::atomic<int>
     }
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    if (count == 0) {
+        log_msg(hf, "xref_find", "FAIL -- found 0 xrefs to NtClose (elapsed %lld ms)", (long long)ms);
+        failed.fetch_add(1); return;
+    }
     log_msg(hf, "xref_find", "PASS -- found %zu xrefs to NtClose (elapsed %lld ms)", count, (long long)ms);
     passed.fetch_add(1);
 }
@@ -454,13 +502,23 @@ static void test_symbolic_execute_larger(HANDLE hf, std::atomic<int>& passed, st
     auto result = symbolic_engine::execute_symbolic(addr, addr + 64, 1000, {}, {});
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    if (!result.success) {
+        log_msg(hf, "sym_exlg", "FAIL -- execute_symbolic success=0 error=\"%s\" traced=%u (elapsed %lld ms)",
+            result.error.c_str(), result.total_instructions, (long long)ms);
+        failed.fetch_add(1); return;
+    }
+    if (result.total_instructions == 0 || result.trace.empty()) {
+        log_msg(hf, "sym_exlg", "FAIL -- execute_symbolic returned empty trace success=%d traced=%u trace=%zu (elapsed %lld ms)",
+            result.success, result.total_instructions, result.trace.size(), (long long)ms);
+        failed.fetch_add(1); return;
+    }
     log_msg(hf, "sym_exlg", "PASS -- success=%d traced=%u tainted=%u (elapsed %lld ms)",
         result.success, result.total_instructions, result.tainted_count, (long long)ms);
     passed.fetch_add(1);
 }
 
 static void test_symbolic_slice_rsi(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "sym_slrsi", "START -- symbolic engine slice to rsi");
+    log_msg(hf, "sym_slrsi", "START -- symbolic engine slice to syscall argument mirror r10");
     auto t0 = std::chrono::steady_clock::now();
 
     uint64_t addr = get_ntdll_fn("NtQuerySystemInformation");
@@ -469,9 +527,19 @@ static void test_symbolic_slice_rsi(HANDLE hf, std::atomic<int>& passed, std::at
         failed.fetch_add(1); return;
     }
 
-    auto result = symbolic_engine::slice_to_register(addr, addr + 48, 500, "rsi");
+    auto result = symbolic_engine::slice_to_register(addr, addr + 48, 500, "r10");
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    if (!result.success) {
+        log_msg(hf, "sym_slrsi", "FAIL -- slice_to_register success=0 error=\"%s\" total=%u effective=%u (elapsed %lld ms)",
+            result.error.c_str(), result.total_instructions, result.effective_count, (long long)ms);
+        failed.fetch_add(1); return;
+    }
+    if (result.total_instructions == 0 || result.effective_instructions.empty()) {
+        log_msg(hf, "sym_slrsi", "FAIL -- slice_to_register returned empty slice success=%d total=%u effective=%u (elapsed %lld ms)",
+            result.success, result.total_instructions, result.effective_count, (long long)ms);
+        failed.fetch_add(1); return;
+    }
     log_msg(hf, "sym_slrsi", "PASS -- success=%d total=%u effective=%u removed=%u (elapsed %lld ms)",
         result.success, result.total_instructions, result.effective_count,
         result.removed_count, (long long)ms);
@@ -479,7 +547,7 @@ static void test_symbolic_slice_rsi(HANDLE hf, std::atomic<int>& passed, std::at
 }
 
 static void test_symbolic_taint_rdx(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "sym_trdx", "START -- symbolic engine taint trace rdx");
+    log_msg(hf, "sym_trdx", "START -- symbolic engine taint trace syscall input rcx");
     auto t0 = std::chrono::steady_clock::now();
 
     uint64_t addr = get_ntdll_fn("NtClose");
@@ -488,9 +556,20 @@ static void test_symbolic_taint_rdx(HANDLE hf, std::atomic<int>& passed, std::at
         failed.fetch_add(1); return;
     }
 
-    auto result = symbolic_engine::taint_trace(addr, addr + 32, 500, {"rdx"}, {});
+    auto result = symbolic_engine::taint_trace(addr, addr + 32, 500, {"rcx"}, {});
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    if (!result.success) {
+        log_msg(hf, "sym_trdx", "FAIL -- taint_trace success=0 error=\"%s\" traced=%u tainted=%u (elapsed %lld ms)",
+            result.error.c_str(), result.total_processed, result.tainted_count, (long long)ms);
+        failed.fetch_add(1); return;
+    }
+    if (result.total_processed == 0 || result.tainted_instructions.empty()) {
+        log_msg(hf, "sym_trdx", "FAIL -- taint_trace returned empty taint result success=%d traced=%u tainted=%u regs=%zu mem=%zu (elapsed %lld ms)",
+            result.success, result.total_processed, result.tainted_count,
+            result.tainted_registers.size(), result.tainted_memory_addresses.size(), (long long)ms);
+        failed.fetch_add(1); return;
+    }
     log_msg(hf, "sym_trdx", "PASS -- success=%d traced=%u tainted=%u regs=%zu mem=%zu (elapsed %lld ms)",
         result.success, result.total_processed, result.tainted_count,
         result.tainted_registers.size(), result.tainted_memory_addresses.size(), (long long)ms);
@@ -510,6 +589,12 @@ static void test_symbolic_solve_for_path(HANDLE hf, std::atomic<int>& passed, st
     auto result = symbolic_engine::solve_for_path(addr, addr + 16, 500, {"rcx"});
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    if (!result.success) {
+        log_msg(hf, "sym_solv", "FAIL -- solve_for_path success=0 error=\"%s\" satisfiable=%d vars=%zu solve_ms=%u (elapsed %lld ms)",
+            result.error.c_str(), result.satisfiable,
+            result.variable_values.size(), result.solving_time_ms, (long long)ms);
+        failed.fetch_add(1); return;
+    }
     log_msg(hf, "sym_solv", "PASS -- success=%d satisfiable=%d vars=%zu solve_ms=%u (elapsed %lld ms)",
         result.success, result.satisfiable,
         result.variable_values.size(), result.solving_time_ms, (long long)ms);
@@ -540,6 +625,18 @@ static void test_deobfusc_deobfuscate_function(HANDLE hf, std::atomic<int>& pass
     auto result = deobfuscation_engine::deobfuscate_function(addr, 128);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    if (!result.success) {
+        log_msg(hf, "deob_fn", "FAIL -- deobfuscate_function success=0 error=\"%s\" original=%u clean=%u blocks=%zu (elapsed %lld ms)",
+            result.error.c_str(), result.total_original, result.total_clean,
+            result.clean_blocks.size(), (long long)ms);
+        failed.fetch_add(1); return;
+    }
+    if (result.total_original == 0 || result.clean_instructions.empty() || result.clean_blocks.empty()) {
+        log_msg(hf, "deob_fn", "FAIL -- deobfuscate_function returned empty result success=%d original=%u clean=%u blocks=%zu (elapsed %lld ms)",
+            result.success, result.total_original, result.total_clean,
+            result.clean_blocks.size(), (long long)ms);
+        failed.fetch_add(1); return;
+    }
     log_msg(hf, "deob_fn", "PASS -- success=%d original=%u clean=%u blocks=%zu edges=%zu (elapsed %lld ms)",
         result.success, result.total_original, result.total_clean,
         result.clean_blocks.size(), result.clean_edges.size(), (long long)ms);
@@ -846,6 +943,10 @@ static void test_xref_db_query_to(HANDLE hf, std::atomic<int>& passed, std::atom
     }
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    if (results == 0) {
+        log_msg(hf, "xrefdb_qt", "FAIL -- query_xrefs_to found 0 results (elapsed %lld ms)", (long long)ms);
+        failed.fetch_add(1); return;
+    }
     log_msg(hf, "xrefdb_qt", "PASS -- query_xrefs_to found %zu results (elapsed %lld ms)", results, (long long)ms);
     passed.fetch_add(1);
 }
@@ -1058,7 +1159,10 @@ static void test_struct_recon_field_types(HANDLE hf, std::atomic<int>& passed, s
     int count_val = static_cast<int>(struct_recon::field_type_t::COUNT);
     bool ok = (count_val > 20 &&
                static_cast<int>(struct_recon::field_type_t::unknown) == 0 &&
-               static_cast<int>(struct_recon::field_type_t::pointer) == 12);
+               static_cast<int>(struct_recon::field_type_t::pointer) == 11 &&
+               static_cast<int>(struct_recon::field_type_t::vtable_ptr) == 12 &&
+               std::strcmp(struct_recon::field_type_name(struct_recon::field_type_t::pointer), "void*") == 0 &&
+               std::strcmp(struct_recon::field_type_name(struct_recon::field_type_t::vtable_ptr), "vtable*") == 0);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (ok) {
@@ -1182,8 +1286,51 @@ static void test_comment_store_overwrite(HANDLE hf, std::atomic<int>& passed, st
 static void select_analysis_hub_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
                                      const char* tag, analysis_hub_view::sub_tab_t value) {
     analysis_hub_view::set_sub_tab(value);
-    log_msg(hf, tag, "PASS -- analysis_hub sub_tab selected (%d)", static_cast<int>(value));
-    passed.fetch_add(1);
+    analysis_hub_view::sub_tab_t got = analysis_hub_view::active_sub_tab();
+    const char* label = analysis_hub_view::sub_tab_label(value);
+    if (got == value && label[0] != '\0') {
+        log_msg(hf, tag, "PASS -- analysis_hub sub_tab selected and read back (%d label=%s)",
+            static_cast<int>(value), label);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, tag, "FAIL -- analysis_hub sub_tab set %d but read back %d label=\"%s\"",
+            static_cast<int>(value), static_cast<int>(got), label);
+        failed.fetch_add(1);
+    }
+}
+
+static void select_symbolic_inner_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
+                                      const char* tag, int value, const char* expected_label) {
+    analysis_hub_view::set_sub_tab(analysis_hub_view::sub_tab_t::symbolic);
+    symbolic_view::set_active_tab(value);
+    int got = symbolic_view::active_tab();
+    const char* label = symbolic_view::tab_label(value);
+    if (got == value && std::strcmp(label, expected_label) == 0) {
+        log_msg(hf, tag, "PASS -- symbolic inner tab selected and read back (%d label=%s)",
+            value, label);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, tag, "FAIL -- symbolic inner tab set %d but read back %d label=\"%s\" expected=\"%s\"",
+            value, got, label, expected_label);
+        failed.fetch_add(1);
+    }
+}
+
+static void select_protection_inner_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
+                                        const char* tag, int value, const char* expected_label) {
+    analysis_hub_view::set_sub_tab(analysis_hub_view::sub_tab_t::stealth);
+    stealth_view::set_sub_tab(value);
+    int got = stealth_view::active_sub_tab();
+    const char* label = stealth_view::sub_tab_label(value);
+    if (got == value && std::strcmp(label, expected_label) == 0) {
+        log_msg(hf, tag, "PASS -- protection inner tab selected and read back (%d label=%s)",
+            value, label);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, tag, "FAIL -- protection inner tab set %d but read back %d label=\"%s\" expected=\"%s\"",
+            value, got, label, expected_label);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_analysis_hub_tab_symbolic(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -1198,15 +1345,39 @@ static void test_analysis_hub_tab_deobfuscation(HANDLE hf, std::atomic<int>& pas
 static void test_analysis_hub_tab_fuzzer(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     select_analysis_hub_tab(hf, passed, failed, "analysis_hub_tab.fuzzer", analysis_hub_view::sub_tab_t::fuzzer);
 }
-static void test_analysis_hub_tab_stealth(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    select_analysis_hub_tab(hf, passed, failed, "analysis_hub_tab.stealth", analysis_hub_view::sub_tab_t::stealth);
+static void test_analysis_hub_tab_protection(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_analysis_hub_tab(hf, passed, failed, "analysis_hub_tab.protection", analysis_hub_view::sub_tab_t::stealth);
+}
+
+static void test_symbolic_inner_trace(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_symbolic_inner_tab(hf, passed, failed, "symbolic_inner.trace", 0, "Trace");
+}
+static void test_symbolic_inner_deobfuscation(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_symbolic_inner_tab(hf, passed, failed, "symbolic_inner.deobfuscation", 1, "Deobfuscation");
+}
+static void test_symbolic_inner_slice(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_symbolic_inner_tab(hf, passed, failed, "symbolic_inner.slice", 2, "Slice");
+}
+static void test_symbolic_inner_solver(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_symbolic_inner_tab(hf, passed, failed, "symbolic_inner.solver", 3, "Solver");
+}
+static void test_symbolic_inner_constraints(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_symbolic_inner_tab(hf, passed, failed, "symbolic_inner.constraints", 4, "Constraints");
+}
+static void test_symbolic_inner_expression(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_symbolic_inner_tab(hf, passed, failed, "symbolic_inner.expression", 5, "Expression");
+}
+
+static void test_protection_inner_scan(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_protection_inner_tab(hf, passed, failed, "protection_inner.scan", 0, "Protection Scan");
+}
+static void test_protection_inner_controls(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_protection_inner_tab(hf, passed, failed, "protection_inner.controls", 1, "Stealth Controls");
 }
 
 }
 
 void phase_analysis_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
-    log_msg(hf, "analysis", "=== BEGIN analysis tests (62 tests) ===");
-
     struct test_entry_t {
         const char* name;
         void (*fn)(HANDLE, std::atomic<int>&, std::atomic<int>&);
@@ -1275,10 +1446,19 @@ void phase_analysis_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
         { "analysis_hub_tab_taint",      test_analysis_hub_tab_taint      },
         { "analysis_hub_tab_deobfusc",   test_analysis_hub_tab_deobfuscation },
         { "analysis_hub_tab_fuzzer",     test_analysis_hub_tab_fuzzer     },
-        { "analysis_hub_tab_stealth",    test_analysis_hub_tab_stealth    },
+        { "analysis_hub_tab_protection", test_analysis_hub_tab_protection },
+        { "symbolic_inner_trace",        test_symbolic_inner_trace        },
+        { "symbolic_inner_deobfusc",     test_symbolic_inner_deobfuscation },
+        { "symbolic_inner_slice",        test_symbolic_inner_slice        },
+        { "symbolic_inner_solver",       test_symbolic_inner_solver       },
+        { "symbolic_inner_constraints",  test_symbolic_inner_constraints  },
+        { "symbolic_inner_expression",   test_symbolic_inner_expression   },
+        { "protection_inner_scan",       test_protection_inner_scan       },
+        { "protection_inner_controls",   test_protection_inner_controls   },
     };
 
     int total = static_cast<int>(sizeof(tests) / sizeof(tests[0]));
+    log_msg(hf, "analysis", "=== BEGIN analysis tests (%d tests) ===", total);
     for (int i = 0; i < total; ++i) {
         if (cancelled && cancelled()) {
             int remaining = total - i;

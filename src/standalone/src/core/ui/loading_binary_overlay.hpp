@@ -195,8 +195,8 @@ inline void worker_load(std::string path, completion_action_t action)
 
 	set_milestone(0.18f, "Mapping sections...", 2u);
 
-	const bool live_path = (driver_bridge::attached_pid() != 0)
-		|| (!g_disasm.file.path.empty() && g_disasm.file.path.compare(0, 7, "live://") == 0);
+	const bool live_path = (!g_disasm.file.path.empty()
+		&& g_disasm.file.path.compare(0, 7, "live://") == 0);
 
 	if (live_path) {
 		const uint64_t t_decode_start = monotonic_ms_now();

@@ -41,6 +41,11 @@ inline void set_sub_tab(sub_tab_t tab)
 	aida::ui::hub_strip::notify_select(g_state.strip, idx);
 }
 
+inline sub_tab_t active_sub_tab()
+{
+	return static_cast<sub_tab_t>(g_state.strip.active);
+}
+
 inline constexpr aida::ui::hub_strip::tab_t s_tabs[] = {
 	{ "Symbolic",      "symbolic execution",     "Sym" },
 	{ "Taint",         "taint analysis",         "Tnt" },
@@ -48,6 +53,14 @@ inline constexpr aida::ui::hub_strip::tab_t s_tabs[] = {
 	{ "Fuzzer",        "coverage fuzzing",       "Fuz" },
 	{ "Protection",    "protection scan / stealth", "Prot" },
 };
+
+inline const char* sub_tab_label(sub_tab_t tab)
+{
+	int idx = static_cast<int>(tab);
+	if (idx < 0 || idx >= static_cast<int>(sub_tab_t::COUNT))
+		return "";
+	return s_tabs[idx].label;
+}
 
 inline void render_active(int idx, float cw, float ch,
                           float fa, float ar, float ag, float ab)

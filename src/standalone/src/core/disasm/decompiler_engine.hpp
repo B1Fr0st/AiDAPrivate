@@ -497,11 +497,25 @@ inline bool derive_function_extents(uint64_t func_addr,
                                      uint64_t* out_start,
                                      uint64_t* out_end)
 {
+	diag::log_tagged_critical_fmt("dec",
+		"derive_function_extents ENTER addr=0x%llX tid=%lu",
+		static_cast<unsigned long long>(func_addr),
+		static_cast<unsigned long>(GetCurrentThreadId()));
 	if (function_index::func_extent(func_addr, out_start, out_end)) {
+		diag::log_tagged_critical_fmt("dec",
+			"derive_function_extents HIT addr=0x%llX start=0x%llX end=0x%llX",
+			static_cast<unsigned long long>(func_addr),
+			static_cast<unsigned long long>(out_start ? *out_start : 0),
+			static_cast<unsigned long long>(out_end ? *out_end : 0));
 		return true;
 	}
 	if (out_start) *out_start = func_addr;
 	if (out_end) *out_end = func_addr + 0x40000ull;
+	diag::log_tagged_critical_fmt("dec",
+		"derive_function_extents MISS addr=0x%llX fallback_start=0x%llX fallback_end=0x%llX",
+		static_cast<unsigned long long>(func_addr),
+		static_cast<unsigned long long>(out_start ? *out_start : func_addr),
+		static_cast<unsigned long long>(out_end ? *out_end : (func_addr + 0x40000ull)));
 	return false;
 }
 
@@ -524,8 +538,42 @@ inline size_t plan_preread_size(uint64_t func_addr)
 inline void cancel_decompile()
 {
 	diag::log_tagged_critical("dec", "cancel_decompile_enter");
-	g_state.cancel.store(true);
+	g_state.cancel.store(true, std::memory_order_release);
+	g_state.next_pending.store(false, std::memory_order_release);
+	g_state.next_addr.store(0, std::memory_order_release);
+	g_state.next_file.store(nullptr, std::memory_order_release);
 	diag::log_tagged_critical("dec", "cancel_decompile_exit");
+}
+
+inline bool wait_for_idle(uint32_t timeout_ms, uint32_t poll_ms = 25)
+{
+	const auto start = std::chrono::steady_clock::now();
+	for (;;) {
+		const bool idle =
+			!g_state.decompiling.load(std::memory_order_acquire) &&
+			!g_state.batch_running.load(std::memory_order_acquire) &&
+			!g_state.next_pending.load(std::memory_order_acquire) &&
+			!g_state.init_progress_active.load(std::memory_order_acquire);
+		if (idle) {
+			diag::log_tagged_critical("dec", "wait_for_idle_exit idle=1");
+			return true;
+		}
+
+		const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - start).count();
+		if (elapsed >= static_cast<long long>(timeout_ms)) {
+			diag::log_tagged_critical_fmt("dec",
+				"wait_for_idle_exit idle=0 timeout_ms=%u decompiling=%d batch=%d next=%d init=%d",
+				timeout_ms,
+				g_state.decompiling.load(std::memory_order_acquire) ? 1 : 0,
+				g_state.batch_running.load(std::memory_order_acquire) ? 1 : 0,
+				g_state.next_pending.load(std::memory_order_acquire) ? 1 : 0,
+				g_state.init_progress_active.load(std::memory_order_acquire) ? 1 : 0);
+			return false;
+		}
+
+		std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms == 0 ? 25 : poll_ms));
+	}
 }
 
 inline void ensure_pdb_subscription();

@@ -156,6 +156,7 @@ namespace zydis_detail
 {
     inline ZydisDecoder&   decoder()   { static ZydisDecoder   d; return d; }
     inline ZydisFormatter& formatter() { static ZydisFormatter f; return f; }
+    inline std::mutex&     mutex()     { static std::mutex     m; return m; }
     inline bool&           ready()     { static bool r = false; return r; }
     inline std::once_flag& flag()      { static std::once_flag f; return f; }
 
@@ -175,6 +176,7 @@ namespace zydis_detail
 inline AsmInstr zydis_decode_one(const uint8_t* code, int avail, uint64_t va)
 {
     zydis_detail::ensure_init();
+    std::lock_guard<std::mutex> decode_lk(zydis_detail::mutex());
 
     AsmInstr ins;
     ins.addr = va;
@@ -411,7 +413,7 @@ namespace disasm
                 const int raw_len = (ins.len < 15) ? ins.len : 15;
                 memcpy(ins.raw, data + off, static_cast<size_t>(raw_len));
                 file.instrs.push_back(ins);
-                off += ins.len;
+                off += (ins.len > 0) ? ins.len : 1;
                 if (++since_yield >= kYieldEveryN) {
                     since_yield = 0;
                     std::this_thread::yield();
@@ -431,6 +433,44 @@ namespace disasm
             const int keep = last_real + 1 + 3;
             if (keep < static_cast<int>(file.instrs.size()))
                 file.instrs.resize(keep);
+        }
+
+        file.instrs.shrink_to_fit();
+    }
+
+    inline void decode_section_limited(DisasmFile& file, size_t max_instrs)
+    {
+        file.instrs.clear();
+        if (file.sections.empty() || max_instrs == 0) return;
+        file.instrs.reserve((std::min)(max_instrs, static_cast<size_t>(4096)));
+
+        for (auto& section : file.sections) {
+            if (!section.is_executable) continue;
+            const uint8_t* data = section.bytes.data();
+            int             sz   = static_cast<int>(section.bytes.size());
+            int             off  = 0;
+            uint64_t        va   = section.va;
+
+            diag::log_tagged_fmt("disasm",
+                "decode_section_limited section_start va=0x%llX bytes=%d current_instrs=%zu max=%zu",
+                static_cast<unsigned long long>(va), sz, file.instrs.size(), max_instrs);
+
+            while (off < sz && file.instrs.size() < max_instrs) {
+                const int remaining = sz - off;
+                const int avail = (remaining < 15) ? remaining : 15;
+                AsmInstr ins = zydis_decode_one(data + off, avail, va + off);
+                const int raw_len = (ins.len < 15) ? ins.len : 15;
+                memcpy(ins.raw, data + off, static_cast<size_t>(raw_len));
+                file.instrs.push_back(ins);
+                off += (ins.len > 0) ? ins.len : 1;
+            }
+
+            diag::log_tagged_fmt("disasm",
+                "decode_section_limited section_end va=0x%llX off=%d emitted=%zu max=%zu",
+                static_cast<unsigned long long>(va), off, file.instrs.size(), max_instrs);
+
+            if (file.instrs.size() >= max_instrs)
+                break;
         }
 
         file.instrs.shrink_to_fit();
@@ -520,13 +560,14 @@ namespace disasm
                 static_cast<unsigned long long>(read_sz),
                 GetCurrentThreadId());
             std::vector<uint8_t> mem;
-            if (driver_bridge::is_loaded() &&
-                driver_bridge::attached_pid() == pid) {
+            if (driver_bridge::is_loaded()) {
                 diag::log_tagged_critical("disasm", "live_decode_worker_pre_read_memory");
-                driver_bridge::read_memory(win_start, static_cast<size_t>(read_sz), mem);
+                bool read_ok = driver_bridge::read_memory_for(pid, win_start, static_cast<size_t>(read_sz), mem);
                 diag::log_tagged_critical_fmt("disasm",
-                    "live_decode_worker_post_read_memory bytes=%llu",
-                    (unsigned long long)mem.size());
+                    "live_decode_worker_post_read_memory ok=%d bytes=%llu active_pid=%u",
+                    read_ok ? 1 : 0,
+                    (unsigned long long)mem.size(),
+                    driver_bridge::attached_pid());
             }
 
             std::vector<AsmInstr> instrs;
@@ -621,7 +662,7 @@ namespace disasm
                     size_t read_size = (sec_size <= remaining_budget) ? sec_size : remaining_budget;
                     uint64_t sec_va = base + static_cast<uint64_t>(s.virtual_address);
                     std::vector<uint8_t> sec_bytes;
-                    if (driver_bridge::read_memory(sec_va, read_size, sec_bytes) && !sec_bytes.empty()) {
+                    if (driver_bridge::read_memory_for(pid, sec_va, read_size, sec_bytes) && !sec_bytes.empty()) {
                         PESection ps;
                         ps.va = sec_va;
                         ps.bytes = std::move(sec_bytes);
@@ -643,7 +684,7 @@ namespace disasm
                     size_t read_size = (sec_size <= remaining_budget) ? sec_size : remaining_budget;
                     uint64_t sec_va = base + static_cast<uint64_t>(s.virtual_address);
                     std::vector<uint8_t> sec_bytes;
-                    if (driver_bridge::read_memory(sec_va, read_size, sec_bytes) && !sec_bytes.empty()) {
+                    if (driver_bridge::read_memory_for(pid, sec_va, read_size, sec_bytes) && !sec_bytes.empty()) {
                         PESection ps;
                         ps.va = sec_va;
                         ps.bytes = std::move(sec_bytes);

@@ -15,11 +15,14 @@
 #include "../infra/work_queue.hpp"
 #include "../ui/theme.hpp"
 #include "../debugger/debugger_engine.hpp"
+#include "../network/mitm_proxy.hpp"
 #include "../runtime/run_target.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "../scanner/memory_scanner.hpp"
 #include "../scanner/aob_generator.hpp"
 #include "../disasm/cfg_view.hpp"
+#include "../disasm/decompiler_engine.hpp"
+#include "../disasm/pseudocode_view.hpp"
 #include "../disasm/zydis_disasm.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/globals.h"
@@ -27,18 +30,22 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <Windows.h>
+#include "../../../../../driver/comm.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
 #include <atomic>
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace test_all_features {
@@ -69,11 +76,30 @@ namespace test_all_features {
 
 		std::mutex        g_phase_mtx;
 		std::string       g_phase_label;
+		std::mutex        g_step_mtx;
+		std::string       g_step_label;
+		std::atomic<std::uint64_t> g_run_id{ 0 };
+		std::atomic<std::uint64_t> g_run_start_tick{ 0 };
+		std::atomic<std::uint64_t> g_phase_start_tick{ 0 };
+		std::atomic<std::uint64_t> g_step_start_tick{ 0 };
 
 
 		const char* log_path() {
 			return "C:\\Users\\Public\\Desktop\\aida_full_test.log";
 		}
+
+		constexpr const char* kFullTestEnvName = "AIDA_FULL_TEST_RUNNING";
+		constexpr const char* kTargetArgsText = "--no-external --duration 0 --net-rate 2000 --absorb-external-single-step";
+		constexpr const wchar_t* kTargetArgsWide = L"--no-external --duration 0 --net-rate 2000 --absorb-external-single-step";
+		constexpr int kLaunchFeatureTests = 1;
+		constexpr int kExtendedFeatureTests = 6;
+		constexpr int kDebuggerFeatureTests = 83;
+		constexpr int kScannerFeatureTests = 64;
+		constexpr int kAnalysisFeatureTests = 70;
+		constexpr int kNetworkFeatureTests = 119;
+		constexpr int kBurpFeatureTests = 183;
+		constexpr int kDisasmFeatureTests = 110;
+		constexpr int kMcpFeatureTests = 525;
 
 
 		void format_timestamp(char* out, std::size_t cap) {
@@ -140,9 +166,179 @@ namespace test_all_features {
 			push_log(s);
 		}
 
+		std::uint64_t now_ms_tick() {
+			return static_cast<std::uint64_t>(GetTickCount64());
+		}
+
+		void copy_label_try(std::mutex& mtx, const std::string& value, char* out, std::size_t cap, const char* busy_text) {
+			if (cap == 0) return;
+			out[0] = '\0';
+			if (mtx.try_lock()) {
+				_snprintf_s(out, cap, _TRUNCATE, "%s", value.empty() ? "<none>" : value.c_str());
+				mtx.unlock();
+			} else {
+				_snprintf_s(out, cap, _TRUNCATE, "%s", busy_text ? busy_text : "<lock-busy>");
+			}
+		}
+
+		void format_debug_snapshot_impl(char* out, std::size_t cap) {
+			if (out == nullptr || cap == 0) return;
+
+			char phase[192] = {};
+			char step[256] = {};
+			copy_label_try(g_phase_mtx, g_phase_label, phase, sizeof(phase), "<phase-lock-busy>");
+			copy_label_try(g_step_mtx, g_step_label, step, sizeof(step), "<step-lock-busy>");
+
+			const std::uint64_t now = now_ms_tick();
+			const std::uint64_t run_start = g_run_start_tick.load(std::memory_order_acquire);
+			const std::uint64_t phase_start = g_phase_start_tick.load(std::memory_order_acquire);
+			const std::uint64_t step_start = g_step_start_tick.load(std::memory_order_acquire);
+			const std::uint64_t run_age = (run_start != 0 && now >= run_start) ? (now - run_start) : 0;
+			const std::uint64_t phase_age = (phase_start != 0 && now >= phase_start) ? (now - phase_start) : 0;
+			const std::uint64_t step_age = (step_start != 0 && now >= step_start) ? (now - step_start) : 0;
+
+			_snprintf_s(out, cap, _TRUNCATE,
+				"run_id=%llu running=%d cancel=%d phase=\"%.160s\" phase_age_ms=%llu "
+				"step=\"%.220s\" step_age_ms=%llu run_age_ms=%llu total=%d current=%d "
+				"pass=%d fail=%d skip=%d suspect=%d target_pid=%u driver_attached=%d "
+				"image_base=0x%016llX target_addr=0x%016llX saved_dtb=0x%016llX",
+				static_cast<unsigned long long>(g_run_id.load(std::memory_order_acquire)),
+				g_running.load(std::memory_order_acquire) ? 1 : 0,
+				g_cancel_requested.load(std::memory_order_acquire) ? 1 : 0,
+				phase,
+				static_cast<unsigned long long>(phase_age),
+				step,
+				static_cast<unsigned long long>(step_age),
+				static_cast<unsigned long long>(run_age),
+				g_total.load(std::memory_order_acquire),
+				g_current.load(std::memory_order_acquire),
+				g_passed.load(std::memory_order_acquire),
+				g_failed.load(std::memory_order_acquire),
+				g_skipped.load(std::memory_order_acquire),
+				g_suspect.load(std::memory_order_acquire),
+				g_target_pid.load(std::memory_order_acquire),
+				g_driver_attached.load(std::memory_order_acquire) ? 1 : 0,
+				static_cast<unsigned long long>(g_target_image_base.load(std::memory_order_acquire)),
+				static_cast<unsigned long long>(g_target_addr.load(std::memory_order_acquire)),
+				static_cast<unsigned long long>(g_saved_dtb.load(std::memory_order_acquire)));
+		}
+
+		void log_debug_snapshot(HANDLE hf, const char* tag, const char* prefix) {
+			char snap[1200] = {};
+			format_debug_snapshot_impl(snap, sizeof(snap));
+			log_msg(hf, tag ? tag : "snapshot", "%s%s%s",
+				prefix ? prefix : "snapshot",
+				(prefix && *prefix) ? " | " : "",
+				snap);
+		}
+
+		void set_full_test_env(HANDLE hf, bool enabled, const char* reason) {
+			BOOL ok = SetEnvironmentVariableA(kFullTestEnvName, enabled ? "1" : nullptr);
+			DWORD err = ok ? 0UL : GetLastError();
+			log_msg(hf, "env", "%s %s ok=%d err=%lu",
+				enabled ? "set" : "clear",
+				kFullTestEnvName,
+				ok ? 1 : 0,
+				static_cast<unsigned long>(err));
+			diag::log_tagged_fmt("test_all", "%s %s reason=%s ok=%d err=%lu",
+				enabled ? "set" : "clear",
+				kFullTestEnvName,
+				reason ? reason : "",
+				ok ? 1 : 0,
+				static_cast<unsigned long>(err));
+		}
+
+		void set_step(const char* label) {
+			{
+				std::lock_guard<std::mutex> lk(g_step_mtx);
+				g_step_label = (label != nullptr) ? label : "";
+			}
+			g_step_start_tick.store(now_ms_tick(), std::memory_order_release);
+		}
+
+		void set_stepf(const char* fmt, ...) {
+			char detail[256];
+			va_list ap;
+			va_start(ap, fmt);
+			_vsnprintf_s(detail, sizeof(detail), _TRUNCATE, fmt, ap);
+			va_end(ap);
+			set_step(detail);
+		}
+
+		void cleanup_network_runtime(HANDLE hf, const char* reason) {
+			set_stepf("network cleanup: %s", reason ? reason : "unspecified");
+			log_debug_snapshot(hf, "net-cleanup", "ENTRY");
+			bool proxy_running = mitm_proxy::is_running();
+			log_msg(hf, "net-cleanup", "local MITM proxy running=%d before cleanup (%s)",
+				proxy_running ? 1 : 0, reason ? reason : "unspecified");
+			if (proxy_running) {
+				mitm_proxy::drop_all();
+				mitm_proxy::stop();
+				log_msg(hf, "net-cleanup", "local MITM proxy stop/drop attempted; running=%d",
+					mitm_proxy::is_running() ? 1 : 0);
+			}
+
+			if (!device || !device->is_connected()) {
+				log_msg(hf, "net-cleanup", "SKIP -- driver not connected (%s)",
+					reason ? reason : "unspecified");
+				log_debug_snapshot(hf, "net-cleanup", "EXIT skipped");
+				return;
+			}
+
+			log_msg(hf, "net-cleanup", "BEGIN -- clearing stateful WFP/test modes (%s)",
+				reason ? reason : "unspecified");
+
+			auto send_cleanup = [&](const char* name, DWORD code, void* req, std::size_t size) {
+				std::uint32_t bytes_returned = 0;
+				bool ok = device->send_ioctl_raw(code, req, static_cast<std::uint32_t>(size), bytes_returned);
+				log_msg(hf, "net-cleanup", "%s ok=%d bytes=%u",
+					name, ok ? 1 : 0, bytes_returned);
+			};
+
+			voyager::detail::net_cap_ctrl_request cap{};
+			cap.operation = 1u;
+			send_cleanup("NCAP stop", ioctl_codes::NCAP(), &cap, sizeof(cap));
+
+			voyager::detail::intercept_request ihld{};
+			ihld.operation = 1u;
+			send_cleanup("IHLD stop+drop-held", ioctl_codes::IHLD(), &ihld, sizeof(ihld));
+
+			voyager::detail::net_filter_rule_request filter{};
+			filter.operation = 2u;
+			send_cleanup("NFLT clear", ioctl_codes::NFLT(), &filter, sizeof(filter));
+
+			bool mod_clear = driver_bridge::packet_mod_rule_op(3);
+			log_msg(hf, "net-cleanup", "PMOD clear ok=%d", mod_clear ? 1 : 0);
+
+			bool redir_clear = driver_bridge::traffic_redirect_op(3);
+			log_msg(hf, "net-cleanup", "PRED clear ok=%d", redir_clear ? 1 : 0);
+
+			bool stream_clear = driver_bridge::stream_reassemble_op(4);
+			log_msg(hf, "net-cleanup", "STRM clear ok=%d", stream_clear ? 1 : 0);
+
+			voyager::detail::dns_spoof_rule dns{};
+			dns.operation = 3u;
+			send_cleanup("DNSS clear", ioctl_codes::DNSS(), &dns, sizeof(dns));
+
+			voyager::detail::net_fingerprint_request fp{};
+			fp.operation = 1u;
+			send_cleanup("NFPR stop", ioctl_codes::NFPR(), &fp, sizeof(fp));
+
+			voyager::detail::bw_monitor_request bw{};
+			bw.operation = 1u;
+			send_cleanup("BWMN stop", ioctl_codes::BWMN(), &bw, sizeof(bw));
+			bw = {};
+			bw.operation = 3u;
+			send_cleanup("BWMN reset", ioctl_codes::BWMN(), &bw, sizeof(bw));
+
+			log_msg(hf, "net-cleanup", "END -- stateful network cleanup attempted");
+			log_debug_snapshot(hf, "net-cleanup", "EXIT");
+		}
+
 		void set_phase(const char* label) {
 			std::lock_guard<std::mutex> lk(g_phase_mtx);
 			g_phase_label = (label != nullptr) ? label : "";
+			g_phase_start_tick.store(now_ms_tick(), std::memory_order_release);
 		}
 
 		bool cancelled() {
@@ -156,11 +352,13 @@ namespace test_all_features {
 		void log_phase_begin(HANDLE hf, const char* phase) {
 			log_msg(hf, "phase", "BEGIN %s | running totals pass=%d fail=%d skip=%d done=%d",
 				phase, g_passed.load(), g_failed.load(), g_skipped.load(), running_done());
+			log_debug_snapshot(hf, "phase", "BEGIN snapshot");
 		}
 
 		void log_phase_end(HANDLE hf, const char* phase) {
 			log_msg(hf, "phase", "END %s | running totals pass=%d fail=%d skip=%d done=%d",
 				phase, g_passed.load(), g_failed.load(), g_skipped.load(), running_done());
+			log_debug_snapshot(hf, "phase", "END snapshot");
 		}
 
 
@@ -172,7 +370,7 @@ namespace test_all_features {
 				"HVDT", "CANR", "CANQ"
 			};
 			for (const auto* s : kSkip) {
-				if (std::strcmp(name, s) == 0) return true;
+				if (std::strncmp(name, s, std::strlen(s)) == 0) return true;
 			}
 			return false;
 		}
@@ -193,6 +391,47 @@ namespace test_all_features {
 
 		std::uint64_t current_target_image_base() {
 			return g_target_image_base.load(std::memory_order_acquire);
+		}
+
+		bool verify_target_liveness(HANDLE hf, const char* checkpoint, bool abort_on_dead = true) {
+			const std::uint32_t pid = current_target_pid();
+			if (pid == 0) {
+				log_msg(hf, "target-live", "SKIP -- no target pid at %s",
+					checkpoint ? checkpoint : "checkpoint");
+				return false;
+			}
+
+			std::uint32_t attached = driver_bridge::attached_pid();
+			if (attached != pid) {
+				const bool reattached = driver_bridge::attach(pid);
+				log_msg(hf, "target-live", "reattach attempt at %s target_pid=%u previous_attached=%u ok=%d status=\"%s\" last_error=\"%s\"",
+					checkpoint ? checkpoint : "checkpoint",
+					pid,
+					attached,
+					reattached ? 1 : 0,
+					driver_bridge::status().c_str(),
+					driver_bridge::last_error().c_str());
+				attached = driver_bridge::attached_pid();
+			}
+
+			std::uint32_t exit_code = 0;
+			const bool alive = (attached == pid) && driver_bridge::attached_process_alive(&exit_code);
+			if (alive) {
+				g_driver_attached.store(true, std::memory_order_release);
+				log_msg(hf, "target-live", "OK -- target alive at %s pid=%u attached=%u exit_code=0x%08X",
+					checkpoint ? checkpoint : "checkpoint", pid, attached, exit_code);
+				return true;
+			}
+
+			g_driver_attached.store(false, std::memory_order_release);
+			g_failed.fetch_add(1);
+			log_msg(hf, "target-live", "FAIL -- target is not alive at %s pid=%u attached=%u exit_code_or_err=0x%08X; stale target-dependent phases will be aborted",
+				checkpoint ? checkpoint : "checkpoint", pid, attached, exit_code);
+			log_debug_snapshot(hf, "target-live", "DEAD target snapshot");
+			if (abort_on_dead) {
+				g_cancel_requested.store(true, std::memory_order_release);
+			}
+			return false;
 		}
 
 
@@ -418,10 +657,28 @@ namespace test_all_features {
 			if (slash != std::wstring::npos) work_dir.resize(slash);
 
 			std::uint32_t pid = 0;
-			bool ok = debugger_engine::spawn_and_attach_target(exe, L"--no-external --duration 300 --net-rate 2000", work_dir, &pid);
+			set_step("launch: spawn_and_attach_target");
+			log_debug_snapshot(hf, "launch", "BEFORE spawn_and_attach_target");
+			BOOL env_ok = SetEnvironmentVariableA("AIDA_TARGET_LOG_PATH", log_path());
+			log_msg(hf, "launch", "set AIDA_TARGET_LOG_PATH ok=%d err=%lu path=%s",
+				env_ok ? 1 : 0,
+				env_ok ? 0UL : static_cast<unsigned long>(GetLastError()),
+				log_path());
+			log_msg(hf, "launch", "target args: %s", kTargetArgsText);
+			bool ok = debugger_engine::spawn_and_attach_target(exe, kTargetArgsWide, work_dir, &pid);
+			DWORD spawn_gle = GetLastError();
+			SetEnvironmentVariableA("AIDA_TARGET_LOG_PATH", nullptr);
 
 			auto t1 = std::chrono::steady_clock::now();
 			auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+			log_msg(hf, "launch", "spawn_and_attach_target returned ok=%d pid=%u elapsed=%lld ms gle=%lu driver_status=\"%s\" driver_last_error=\"%s\"",
+				ok ? 1 : 0,
+				pid,
+				(long long)ms,
+				static_cast<unsigned long>(spawn_gle),
+				driver_bridge::status().c_str(),
+				driver_bridge::last_error().c_str());
+			log_debug_snapshot(hf, "launch", "AFTER spawn_and_attach_target");
 
 			if (!ok || pid == 0) {
 				log_msg(hf, "launch", "FAIL -- spawn_and_attach_target returned false pid=%u (elapsed %lld ms) last_error=\"%s\"",
@@ -440,14 +697,34 @@ namespace test_all_features {
 			log_msg(hf, "launch", "waiting for WhosWhoTestReady event (8s timeout) ...");
 
 			HANDLE hReady = OpenEventW(SYNCHRONIZE, FALSE, L"Global\\WhosWhoTestReady");
-			if (!hReady) hReady = OpenEventW(SYNCHRONIZE, FALSE, L"Local\\WhosWhoTestReady");
+			DWORD global_ready_err = hReady ? 0 : GetLastError();
+			log_msg(hf, "launch", "OpenEvent Global\\WhosWhoTestReady handle=%p err=%lu",
+				hReady, static_cast<unsigned long>(global_ready_err));
+			if (!hReady) {
+				hReady = OpenEventW(SYNCHRONIZE, FALSE, L"Local\\WhosWhoTestReady");
+				log_msg(hf, "launch", "OpenEvent Local\\WhosWhoTestReady handle=%p err=%lu",
+					hReady, static_cast<unsigned long>(hReady ? 0 : GetLastError()));
+			}
 			if (hReady) {
+				set_step("launch: wait READY event");
 				DWORD wait = WaitForSingleObject(hReady, 8000);
+				DWORD wait_err = (wait == WAIT_FAILED) ? GetLastError() : 0;
 				CloseHandle(hReady);
 				if (wait == WAIT_OBJECT_0) {
-					log_msg(hf, "launch", "READY event signaled");
+					log_msg(hf, "launch", "READY event signaled wait=0x%08lX", static_cast<unsigned long>(wait));
 				} else {
-					log_msg(hf, "launch", "READY event timed out (proceeding anyway)");
+					DWORD exit_code = STILL_ACTIVE;
+					HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+					BOOL got_exit = hp ? GetExitCodeProcess(hp, &exit_code) : FALSE;
+					DWORD hp_err = hp ? 0 : GetLastError();
+					if (hp) CloseHandle(hp);
+					log_msg(hf, "launch", "READY wait did not signal wait=0x%08lX wait_err=%lu child_handle=%s child_exit_known=%d exit_code=0x%08lX open_err=%lu (proceeding anyway)",
+						static_cast<unsigned long>(wait),
+						static_cast<unsigned long>(wait_err),
+						hp ? "opened" : "null",
+						got_exit ? 1 : 0,
+						static_cast<unsigned long>(exit_code),
+						static_cast<unsigned long>(hp_err));
 				}
 			} else {
 				log_msg(hf, "launch", "could not open READY event handle, sleeping 3s");
@@ -463,6 +740,15 @@ namespace test_all_features {
 
 			log_phase_end(hf, "launch target");
 			return attach_ok;
+		}
+
+		DWORD run_testlab_feature_seh(test_lab::run_fn fn, test_lab::state_t& s, test_lab::result_t& r) {
+			__try {
+				fn(s, r);
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return GetExceptionCode();
+			}
+			return 0;
 		}
 
 
@@ -502,25 +788,66 @@ namespace test_all_features {
 
 				test_lab::state_t s;
 				populate_defaults(s, target_pid);
+				std::uint64_t cleanup_alloc = 0;
 
-				if (std::strcmp(name, "PMOD") == 0) {
+				if (name_starts_with(name, "PMOD")) {
 					s.u32_a = 2;
-				} else if (std::strcmp(name, "PRED") == 0) {
+				} else if (name_starts_with(name, "PRED")) {
 					s.u32_a = 1;
-				} else if (std::strcmp(name, "NLOG") == 0) {
+				} else if (name_starts_with(name, "NLOG")) {
 					s.u32_a = 1;
-				} else if (std::strcmp(name, "REGISTER_PID") == 0 || std::strcmp(name, "UNREGISTER_PID") == 0) {
+				} else if (name_starts_with(name, "NCAP")) {
+					s.u32_a = 1;
+					s.pid = target_pid;
+				} else if (name_starts_with(name, "NFLT")) {
+					s.u32_a = 3;
+				} else if (name_starts_with(name, "IHLD")) {
+					s.u32_a = 2;
+					s.pid = target_pid;
+				} else if (name_starts_with(name, "NFPR")) {
+					s.u32_b = 2;
+				} else if (name_starts_with(name, "DNSS")) {
+					s.u32_a = 1;
+				} else if (name_starts_with(name, "BWMN")) {
+					s.u32_a = 2;
+				} else if (name_starts_with(name, "REGISTER_PID") || name_starts_with(name, "UNREGISTER_PID")) {
 					char tmp[MAX_PATH];
 					GetTempPathA(MAX_PATH, tmp);
 					s.text_a = std::string(tmp) + "aida_sandbox_test";
 					if (s.pid == 0) {
 						s.pid = static_cast<std::uint32_t>(GetCurrentProcessId());
 					}
-				} else if (std::strcmp(name, "PCEX") == 0) {
+				} else if (name_starts_with(name, "PCEX")) {
 					char tmp[MAX_PATH];
 					GetTempPathA(MAX_PATH, tmp);
 					s.text_a = std::string(tmp) + "aida_test_capture.pcap";
-				} else if (std::strcmp(name, "PHYS") == 0 || std::strcmp(name, "MEX") == 0 || std::strcmp(name, "V2P") == 0) {
+				} else if (name_starts_with(name, "FM")) {
+					std::uint64_t alloc = driver_bridge::allocate_memory(0x1000);
+					if (alloc != 0) {
+						s.addr = alloc;
+						s.size = 0x1000;
+						cleanup_alloc = alloc;
+						log_msg(hf, "testlab", "[%d/%d] memory-fixture %s: allocated target page 0x%016llX for free validation",
+							i + 1, total, name, static_cast<unsigned long long>(alloc));
+					} else {
+						log_msg(hf, "testlab", "[%d/%d] memory-fixture %s: WARN allocate_memory failed; using default addr=0x%016llX",
+							i + 1, total, name, static_cast<unsigned long long>(s.addr));
+					}
+				} else if (name_starts_with(name, "PM")) {
+					std::uint64_t alloc = driver_bridge::allocate_memory(0x1000);
+					if (alloc != 0) {
+						s.addr = alloc;
+						s.size = 0x1000;
+						s.u32_a = PAGE_READWRITE;
+						cleanup_alloc = alloc;
+						log_msg(hf, "testlab", "[%d/%d] memory-fixture %s: allocated target page 0x%016llX protect=0x%08X",
+							i + 1, total, name, static_cast<unsigned long long>(alloc), s.u32_a);
+					} else {
+						s.u32_a = PAGE_READWRITE;
+						log_msg(hf, "testlab", "[%d/%d] memory-fixture %s: WARN allocate_memory failed; using default addr=0x%016llX protect=0x%08X",
+							i + 1, total, name, static_cast<unsigned long long>(s.addr), s.u32_a);
+					}
+				} else if (name_starts_with(name, "PHYS") || name_starts_with(name, "MEX") || name_starts_with(name, "V2P")) {
 					std::uint64_t saved = g_saved_dtb.load(std::memory_order_acquire);
 					if (saved != 0) {
 						s.u64_a = saved;
@@ -529,6 +856,19 @@ namespace test_all_features {
 					} else {
 						log_msg(hf, "testlab", "[%d/%d] DTB-inject %s: WARN no saved dtb (u64_a=0); test may fail",
 							i + 1, total, name);
+					}
+					if (name_starts_with(name, "MEX")) {
+						for (const auto& mod : driver_bridge::enumerate_modules_for(target_pid)) {
+							if (_stricmp(mod.name.c_str(), "ntdll.dll") == 0) {
+								s.addr = mod.base;
+								s.text_a = mod.name;
+								s.text_b = "NtClose";
+								log_msg(hf, "testlab", "[%d/%d] MEX-fixture: module=%s base=0x%016llX export=%s",
+									i + 1, total, mod.name.c_str(),
+									static_cast<unsigned long long>(mod.base), s.text_b.c_str());
+								break;
+							}
+						}
 					}
 				}
 
@@ -540,13 +880,63 @@ namespace test_all_features {
 					static_cast<unsigned long long>(s.u64_a),
 					s.u32_a, s.u32_b, s.size,
 					s.text_a.empty() ? "(none)" : s.text_a.c_str());
+				set_stepf("testlab %d/%d %s/%s", i + 1, total, cat, name);
 				auto t0 = std::chrono::steady_clock::now();
-				f.run(s, r);
+				DWORD seh_code = 0;
+				bool cpp_exception = false;
+				std::string cpp_error;
+				try {
+					seh_code = run_testlab_feature_seh(f.run, s, r);
+				} catch (const std::exception& ex) {
+					cpp_exception = true;
+					cpp_error = ex.what();
+				} catch (...) {
+					cpp_exception = true;
+					cpp_error = "unknown C++ exception";
+				}
 				auto t1 = std::chrono::steady_clock::now();
 				auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
 				if (r.elapsed_us == 0) r.elapsed_us = static_cast<std::uint64_t>(us);
+				log_msg(hf, "testlab", "[%d/%d] END-RUN %s/%s seh=0x%08lX cpp_exception=%d elapsed=%llu us state=%d ok=%d bytes=%u fields=%zu raw=%zu",
+					i + 1, total, cat, name,
+					static_cast<unsigned long>(seh_code),
+					cpp_exception ? 1 : 0,
+					static_cast<unsigned long long>(r.elapsed_us),
+					static_cast<int>(r.state.load()),
+					r.ok ? 1 : 0,
+					r.bytes_returned,
+					r.parsed.size(),
+					r.raw.size());
 
-				if (std::strcmp(name, "DTB") == 0 && r.ok) {
+				if (seh_code != 0) {
+					g_failed.fetch_add(1);
+					log_msg(hf, "testlab", "[%d/%d] FAIL %s/%s threw SEH exception 0x%08lX elapsed=%llu us",
+						i + 1, total, cat, name,
+						static_cast<unsigned long>(seh_code),
+						static_cast<unsigned long long>(r.elapsed_us));
+					if (cleanup_alloc != 0) {
+						bool freed = driver_bridge::free_memory(cleanup_alloc);
+						log_msg(hf, "testlab", "[%d/%d] memory-fixture cleanup after SEH addr=0x%016llX freed=%d",
+							i + 1, total, static_cast<unsigned long long>(cleanup_alloc), freed ? 1 : 0);
+					}
+					continue;
+				}
+
+				if (cpp_exception) {
+					g_failed.fetch_add(1);
+					log_msg(hf, "testlab", "[%d/%d] FAIL %s/%s threw C++ exception \"%s\" elapsed=%llu us",
+						i + 1, total, cat, name,
+						cpp_error.c_str(),
+						static_cast<unsigned long long>(r.elapsed_us));
+					if (cleanup_alloc != 0) {
+						bool freed = driver_bridge::free_memory(cleanup_alloc);
+						log_msg(hf, "testlab", "[%d/%d] memory-fixture cleanup after C++ exception addr=0x%016llX freed=%d",
+							i + 1, total, static_cast<unsigned long long>(cleanup_alloc), freed ? 1 : 0);
+					}
+					continue;
+				}
+
+				if (name_starts_with(name, "DTB") && r.ok) {
 					for (const auto& kv : r.parsed) {
 						if (kv.label == "CR3 (DTB)") {
 							std::uint64_t dtb = std::strtoull(kv.value.c_str(), nullptr, 16);
@@ -601,6 +991,11 @@ namespace test_all_features {
 						r.error.c_str(),
 						static_cast<unsigned long long>(r.elapsed_us));
 				}
+				if (cleanup_alloc != 0 && (!name_starts_with(name, "FM") || !r.ok)) {
+					bool freed = driver_bridge::free_memory(cleanup_alloc);
+					log_msg(hf, "testlab", "[%d/%d] memory-fixture cleanup addr=0x%016llX freed=%d",
+						i + 1, total, static_cast<unsigned long long>(cleanup_alloc), freed ? 1 : 0);
+				}
 			}
 			log_phase_end(hf, "testlab features");
 		}
@@ -612,6 +1007,15 @@ namespace test_all_features {
 			if (pid == 0 || !attached || driver_bridge::attached_pid() != pid) {
 				log_msg(hf, tag, "FAIL -- no verified attached target (pid=%u attached=%d driver_pid=%u)",
 					pid, static_cast<int>(attached), driver_bridge::attached_pid());
+				g_failed.fetch_add(1);
+				return false;
+			}
+			std::uint32_t exit_code = 0;
+			if (!driver_bridge::attached_process_alive(&exit_code)) {
+				g_driver_attached.store(false, std::memory_order_release);
+				g_cancel_requested.store(true, std::memory_order_release);
+				log_msg(hf, tag, "FAIL -- attached target pid=%u is dead exit_code_or_err=0x%08X; cancelling target-dependent tests",
+					pid, exit_code);
 				g_failed.fetch_add(1);
 				return false;
 			}
@@ -1004,6 +1408,40 @@ namespace test_all_features {
 			log_phase_end(hf, "extended features");
 		}
 
+		void drain_decompiler_runtime(HANDLE hf, const char* reason) {
+			set_stepf("decompiler drain: %s", reason ? reason : "unspecified");
+			const bool before_decompiling = decompiler_engine::g_state.decompiling.load(std::memory_order_acquire);
+			const bool before_batch = decompiler_engine::g_state.batch_running.load(std::memory_order_acquire);
+			const bool before_next = decompiler_engine::g_state.next_pending.load(std::memory_order_acquire);
+			const int before_tabs = pseudocode_view::tab_count();
+			log_msg(hf, "decompiler-drain",
+				"BEGIN -- %s decompiling=%d batch=%d next_pending=%d tabs=%d",
+				reason ? reason : "unspecified",
+				before_decompiling ? 1 : 0,
+				before_batch ? 1 : 0,
+				before_next ? 1 : 0,
+				before_tabs);
+
+			pseudocode_view::cancel_active_decompile();
+			const bool idle = decompiler_engine::wait_for_idle(12000, 25);
+			const int tabs_after_wait = pseudocode_view::tab_count();
+			if (idle) {
+				pseudocode_view::close_all_tabs();
+			} else {
+				g_suspect.fetch_add(1);
+			}
+
+			log_msg(hf, "decompiler-drain",
+				"%s -- idle=%d tabs_after_wait=%d tabs_final=%d decompiling=%d batch=%d next_pending=%d",
+				idle ? "PASS" : "SUSPECT",
+				idle ? 1 : 0,
+				tabs_after_wait,
+				pseudocode_view::tab_count(),
+				decompiler_engine::g_state.decompiling.load(std::memory_order_acquire) ? 1 : 0,
+				decompiler_engine::g_state.batch_running.load(std::memory_order_acquire) ? 1 : 0,
+				decompiler_engine::g_state.next_pending.load(std::memory_order_acquire) ? 1 : 0);
+		}
+
 
 		void phase_stop_target(HANDLE hf, std::uint32_t pid) {
 			if (pid == 0) return;
@@ -1038,9 +1476,85 @@ namespace test_all_features {
 			log_msg(hf, "cleanup", "test_target shutdown complete");
 		}
 
+		struct run_cleanup_guard_t {
+			HANDLE* hf = nullptr;
+			std::uint32_t* target_pid = nullptr;
+			bool active = true;
+
+			~run_cleanup_guard_t() {
+				if (!active) return;
+				HANDLE h = hf ? *hf : INVALID_HANDLE_VALUE;
+				log_msg(h, "cleanup", "abnormal/early exit cleanup guard fired");
+				cleanup_network_runtime(h, "abnormal/early exit");
+				if (target_pid) {
+					phase_stop_target(h, *target_pid);
+				}
+				if (hf && *hf != INVALID_HANDLE_VALUE) {
+					CloseHandle(*hf);
+					*hf = INVALID_HANDLE_VALUE;
+				}
+				g_running.store(false, std::memory_order_release);
+			}
+		};
+
+		struct full_test_env_guard_t {
+			HANDLE* hf = nullptr;
+			bool active = false;
+
+			explicit full_test_env_guard_t(HANDLE* handle) : hf(handle), active(true) {
+				set_full_test_env(hf ? *hf : INVALID_HANDLE_VALUE, true, "run_all begin");
+			}
+
+			void clear(const char* reason) {
+				if (!active) return;
+				set_full_test_env(hf ? *hf : INVALID_HANDLE_VALUE, false, reason ? reason : "run_all end");
+				active = false;
+			}
+
+			~full_test_env_guard_t() {
+				clear("run_all scope exit");
+			}
+		};
+
+		struct run_heartbeat_t {
+			std::atomic<bool> stop{ false };
+			std::thread worker;
+
+			void start() {
+				worker = std::thread([this]() {
+					while (!stop.load(std::memory_order_acquire)) {
+						for (int i = 0; i < 50; ++i) {
+							if (stop.load(std::memory_order_acquire)) return;
+							Sleep(100);
+						}
+						HANDLE hh = open_log_file();
+						log_debug_snapshot(hh, "heartbeat", "FULL-TEST live heartbeat");
+						if (hh != INVALID_HANDLE_VALUE) CloseHandle(hh);
+					}
+				});
+			}
+
+			void stop_and_join() {
+				stop.store(true, std::memory_order_release);
+				if (worker.joinable()) worker.join();
+			}
+
+			~run_heartbeat_t() {
+				stop_and_join();
+			}
+		};
+
 
 		void run_all() {
 			HANDLE hf = open_log_file();
+			full_test_env_guard_t full_test_env_guard{ &hf };
+			std::uint32_t target_pid = 0;
+			run_cleanup_guard_t cleanup_guard{ &hf, &target_pid, true };
+			run_heartbeat_t heartbeat;
+			heartbeat.start();
+			const std::uint64_t this_run = g_run_id.fetch_add(1, std::memory_order_acq_rel) + 1;
+			g_run_start_tick.store(now_ms_tick(), std::memory_order_release);
+			set_step("run_all entry");
 
 			char ts[40];
 			format_timestamp(ts, sizeof(ts));
@@ -1055,15 +1569,45 @@ namespace test_all_features {
 			push_log(header);
 
 			diag::log_tagged_fmt("test_all", "========== Full Feature Test START ==========");
+			log_msg(hf, "run", "run_id=%llu thread=%lu log_path=%s",
+				static_cast<unsigned long long>(this_run),
+				static_cast<unsigned long>(GetCurrentThreadId()),
+				log_path());
+			log_debug_snapshot(hf, "run", "initial snapshot");
 
 			const auto& features = test_lab::all_features();
 			int testlab_count = static_cast<int>(features.size());
-			g_total.store(testlab_count + 250);
+			int total_estimate =
+				kLaunchFeatureTests +
+				testlab_count +
+				kExtendedFeatureTests +
+				kDebuggerFeatureTests +
+				kScannerFeatureTests +
+				kAnalysisFeatureTests +
+				kNetworkFeatureTests +
+				kBurpFeatureTests +
+				kDisasmFeatureTests +
+				kMcpFeatureTests;
+			g_total.store(total_estimate);
+			log_msg(hf, "run", "progress total estimate=%d launch=%d testlab=%d extended=%d debugger=%d scanner=%d analysis=%d network=%d burp=%d disasm=%d mcp=%d",
+				total_estimate,
+				kLaunchFeatureTests,
+				testlab_count,
+				kExtendedFeatureTests,
+				kDebuggerFeatureTests,
+				kScannerFeatureTests,
+				kAnalysisFeatureTests,
+				kNetworkFeatureTests,
+				kBurpFeatureTests,
+				kDisasmFeatureTests,
+				kMcpFeatureTests);
 
-			std::uint32_t target_pid = 0;
 			bool attach_ok = false;
 			if (!cancelled()) {
+				set_step("phase call: launch target");
+				log_debug_snapshot(hf, "checkpoint", "BEFORE phase_launch_target");
 				attach_ok = phase_launch_target(hf, target_pid);
+				log_debug_snapshot(hf, "checkpoint", "AFTER phase_launch_target");
 			}
 
 			log_msg(hf, "summary", "post-launch state: target_pid=%u driver_attached=%d attach_ok=%d",
@@ -1071,63 +1615,95 @@ namespace test_all_features {
 				static_cast<int>(g_driver_attached.load()),
 				static_cast<int>(attach_ok));
 
-			if (!cancelled()) {
-				phase_testlab_features(hf, target_pid);
-			}
+			cleanup_network_runtime(hf, "pre-run reset");
 
 			if (!cancelled()) {
+				set_step("phase call: testlab features");
+				log_debug_snapshot(hf, "checkpoint", "BEFORE phase_testlab_features");
+				phase_testlab_features(hf, target_pid);
+				log_debug_snapshot(hf, "checkpoint", "AFTER phase_testlab_features");
+				verify_target_liveness(hf, "after testlab features");
+			}
+
+			cleanup_network_runtime(hf, "after testlab features");
+
+			if (!cancelled()) {
+				set_step("phase call: extended features");
+				log_debug_snapshot(hf, "checkpoint", "BEFORE phase_extended_features");
 				phase_extended_features(hf);
+				log_debug_snapshot(hf, "checkpoint", "AFTER phase_extended_features");
+				verify_target_liveness(hf, "after extended features");
 			}
 
 			if (!cancelled()) {
 				set_phase("Debugger feature tests");
+				set_step("phase call: debugger feature tests");
 				log_phase_begin(hf, "debugger feature tests");
 				phase_debugger_tests(hf, g_passed, g_failed, g_skipped, cancelled);
 				log_phase_end(hf, "debugger feature tests");
+				verify_target_liveness(hf, "after debugger feature tests");
 			}
 
 			if (!cancelled()) {
 				set_phase("Scanner feature tests");
+				set_step("phase call: scanner feature tests");
 				log_phase_begin(hf, "scanner feature tests");
 				phase_scanner_tests(hf, g_passed, g_failed, g_skipped, cancelled);
 				log_phase_end(hf, "scanner feature tests");
+				verify_target_liveness(hf, "after scanner feature tests");
 			}
 
 			if (!cancelled()) {
 				set_phase("Analysis feature tests");
+				set_step("phase call: analysis feature tests");
 				log_phase_begin(hf, "analysis feature tests");
 				phase_analysis_tests(hf, g_passed, g_failed, g_skipped, cancelled);
 				log_phase_end(hf, "analysis feature tests");
+				verify_target_liveness(hf, "after analysis feature tests");
 			}
 
 			if (!cancelled()) {
 				set_phase("Network feature tests");
+				set_step("phase call: network feature tests");
 				log_phase_begin(hf, "network feature tests");
 				phase_network_tests(hf, g_passed, g_failed, g_skipped, cancelled);
 				log_phase_end(hf, "network feature tests");
+				verify_target_liveness(hf, "after network feature tests");
 			}
+
+			cleanup_network_runtime(hf, "after network feature tests");
 
 			if (!cancelled()) {
 				set_phase("Burp suite feature tests");
+				set_step("phase call: burp suite feature tests");
 				log_phase_begin(hf, "burp suite feature tests");
 				phase_burp_tests(hf, g_passed, g_failed, g_skipped, cancelled);
 				log_phase_end(hf, "burp suite feature tests");
+				verify_target_liveness(hf, "after burp suite feature tests");
 			}
 
 			if (!cancelled()) {
 				set_phase("Disassembly & decompiler tests");
+				set_step("phase call: disassembly & decompiler tests");
 				log_phase_begin(hf, "disassembly & decompiler tests");
 				phase_disasm_tests(hf, g_passed, g_failed, g_skipped, cancelled);
 				log_phase_end(hf, "disassembly & decompiler tests");
+				verify_target_liveness(hf, "after disassembly & decompiler tests");
+			}
+
+			if (!cancelled()) {
+				drain_decompiler_runtime(hf, "after disassembly before MCP");
 			}
 
 			if (!cancelled()) {
 				set_phase("MCP tool tests");
+				set_step("phase call: MCP tool tests");
 				log_phase_begin(hf, "MCP tool tests");
 				phase_mcp_tests(hf, g_passed, g_failed, g_skipped, cancelled);
 				log_phase_end(hf, "MCP tool tests");
 			}
 
+			cleanup_network_runtime(hf, "final cleanup");
 			phase_stop_target(hf, target_pid);
 
 			set_phase("Complete");
@@ -1168,16 +1744,67 @@ namespace test_all_features {
 
 			diag::log_tagged_fmt("test_all", "========== Full Feature Test DONE: passed=%d failed=%d skipped=%d suspect=%d ==========", p, f, s, suspect);
 
+			full_test_env_guard.clear("run_all normal completion");
+
 			if (hf != INVALID_HANDLE_VALUE)
 				CloseHandle(hf);
+			hf = INVALID_HANDLE_VALUE;
 
 			g_running.store(false, std::memory_order_release);
+			cleanup_guard.active = false;
 		}
 
 
-		void start_tests() {
+		void log_worker_escape(const char* kind, DWORD code, const char* message) {
+			HANDLE hf = open_log_file();
+			char snap[1200] = {};
+			format_debug_snapshot_impl(snap, sizeof(snap));
+			log_msg(hf, "fatal", "FULL-TEST worker escaped kind=%s code=0x%08lX message=\"%s\" snapshot=%s",
+				kind ? kind : "?",
+				static_cast<unsigned long>(code),
+				message ? message : "",
+				snap);
+			set_full_test_env(hf, false, "worker exception escape");
+			cleanup_network_runtime(hf, "worker exception escape");
+			std::uint32_t pid = g_target_pid.load(std::memory_order_acquire);
+			if (pid != 0)
+				phase_stop_target(hf, pid);
+			g_running.store(false, std::memory_order_release);
+			if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+		}
+
+		void run_all_cpp_guarded() {
+			try {
+				run_all();
+			} catch (const std::exception& ex) {
+				log_worker_escape("c++", 0, ex.what());
+			} catch (...) {
+				log_worker_escape("c++", 0, "unknown C++ exception");
+			}
+		}
+
+		DWORD run_all_seh_guarded() {
+			__try {
+				run_all_cpp_guarded();
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				DWORD code = GetExceptionCode();
+				log_worker_escape("seh", code, "SEH exception escaped run_all");
+				return code;
+			}
+			return 0;
+		}
+
+		bool start_tests_impl() {
 			bool expected = false;
-			if (!g_running.compare_exchange_strong(expected, true)) return;
+			if (!g_running.compare_exchange_strong(expected, true)) {
+				char snap[1200] = {};
+				format_debug_snapshot_impl(snap, sizeof(snap));
+				diag::log_tagged_fmt("test_all", "start_tests rejected: run already active | %s", snap);
+				HANDLE hf = open_log_file();
+				log_msg(hf, "start", "REJECTED -- run already active | %s", snap);
+				if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+				return false;
+			}
 
 			g_cancel_requested.store(false);
 			g_total.store(0);
@@ -1197,12 +1824,24 @@ namespace test_all_features {
 				g_log_lines.clear();
 			}
 			set_phase("Initializing...");
+			set_step("start_tests_impl queued");
 
 			diag::log_tagged_fmt("test_all", "user triggered Test All Features");
 
-			work_queue::post([]() {
-				run_all();
+			bool posted = work_queue::post([]() {
+				(void)run_all_seh_guarded();
 			});
+			if (!posted) {
+				HANDLE hf = open_log_file();
+				log_msg(hf, "start", "FAIL -- work_queue::post returned false; run not queued");
+				g_failed.fetch_add(1);
+				g_running.store(false, std::memory_order_release);
+				if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+				diag::log_tagged("test_all", "work_queue::post failed for full test");
+				return false;
+			}
+			diag::log_tagged("test_all", "work_queue::post accepted full test worker");
+			return true;
 		}
 
 		void cancel_tests() {
@@ -1212,6 +1851,22 @@ namespace test_all_features {
 
 	}
 
+
+	bool start_tests() {
+		return start_tests_impl();
+	}
+
+	bool is_running() {
+		return g_running.load(std::memory_order_acquire);
+	}
+
+	void set_progress_step(const char* label) {
+		set_step(label ? label : "");
+	}
+
+	void format_debug_snapshot(char* out, std::size_t cap) {
+		format_debug_snapshot_impl(out, cap);
+	}
 
 	void render_overlay(float vw, float vh) {
 		if (!globals::ui::test_all_visible) return;

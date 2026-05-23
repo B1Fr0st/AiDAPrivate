@@ -220,7 +220,7 @@ namespace {
 		if (!ensure_driver(r)) return;
 		voyager::detail::net_cap_ctrl_request req{};
 		req.operation = s.u32_a;
-		req.filter_pid = 0;
+		req.filter_pid = s.pid;
 		req.filter_port = 0;
 		req.filter_protocol = 0;
 		req.max_packet_bytes = 1500u;

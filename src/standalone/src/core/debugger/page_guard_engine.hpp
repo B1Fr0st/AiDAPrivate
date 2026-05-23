@@ -256,18 +256,8 @@ public:
         driver_bridge::write_memory(sc_addr, sc);
 
 
-        uint32_t old_prot = 0;
-        if (!driver_bridge::protect_memory(target_addr, region_size,
-                                    orig_protect | 0x100 , &old_prot)) {
-            driver_bridge::free_memory(sc_addr);
-            driver_bridge::free_memory(ring_addr);
-            return 0;
-        }
-
-
         uint64_t ntdll_base_install = find_module_base(pid, "ntdll.dll");
         if (ntdll_base_install == 0) {
-            driver_bridge::protect_memory(target_addr, region_size, orig_protect, nullptr);
             driver_bridge::free_memory(sc_addr);
             driver_bridge::free_memory(ring_addr);
             return 0;
@@ -275,7 +265,6 @@ public:
         uint64_t rtl_add_fn = driver_bridge::resolve_export(ntdll_base_install,
                                                       "RtlAddVectoredExceptionHandler");
         if (rtl_add_fn == 0) {
-            driver_bridge::protect_memory(target_addr, region_size, orig_protect, nullptr);
             driver_bridge::free_memory(sc_addr);
             driver_bridge::free_memory(ring_addr);
             return 0;
@@ -283,7 +272,17 @@ public:
 
         uint64_t veh_handle = driver_bridge::call_function(rtl_add_fn, 1, sc_addr);
         if (veh_handle == 0) {
-            driver_bridge::protect_memory(target_addr, region_size, orig_protect, nullptr);
+            driver_bridge::free_memory(sc_addr);
+            driver_bridge::free_memory(ring_addr);
+            return 0;
+        }
+
+        uint32_t old_prot = 0;
+        if (!driver_bridge::protect_memory(target_addr, region_size,
+                                    orig_protect | 0x100 , &old_prot)) {
+            uint64_t rtl_rm = driver_bridge::resolve_export(ntdll_base_install,
+                                                      "RtlRemoveVectoredExceptionHandler");
+            if (rtl_rm) driver_bridge::call_function(rtl_rm, veh_handle);
             driver_bridge::free_memory(sc_addr);
             driver_bridge::free_memory(ring_addr);
             return 0;

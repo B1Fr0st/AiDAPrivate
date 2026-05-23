@@ -753,6 +753,24 @@ namespace xref_index {
 			return it->index;
 		}
 
+		inline std::vector<std::shared_ptr<module_index_t>> built_modules_snapshot() {
+			std::vector<std::shared_ptr<module_index_t>> out;
+			auto& reg = registry();
+			std::shared_lock<std::shared_mutex> lk(reg.rw);
+			if (!reg.table_built.load(std::memory_order_acquire)) return out;
+			out.reserve(reg.table.size());
+			for (const auto& r : reg.table) {
+				if (!r.index) continue;
+				if (r.index->state.load(std::memory_order_acquire) !=
+					static_cast<uint32_t>(build_state_t::built))
+					continue;
+				if (std::find(out.begin(), out.end(), r.index) != out.end())
+					continue;
+				out.push_back(r.index);
+			}
+			return out;
+		}
+
 		inline std::atomic<bool>& deep_static_xref_requested() {
 			static std::atomic<bool> v{false};
 			return v;
@@ -807,33 +825,39 @@ namespace xref_index {
 		std::vector<annotation_t> out;
 		if (addr == 0 || limit == 0) return out;
 
-		auto mod = detail::lookup_cached_module(addr);
-		if (!mod) return out;
+		auto modules = detail::built_modules_snapshot();
+		for (const auto& mod : modules) {
+			auto it = mod->to_index.find(addr);
+			if (it == mod->to_index.end()) continue;
+			out.insert(out.end(), it->second.begin(), it->second.end());
+		}
 
-		uint32_t st = mod->state.load(std::memory_order_acquire);
-		if (st != static_cast<uint32_t>(detail::build_state_t::built)) return out;
+		if (out.empty()) return out;
 
-		auto it = mod->to_index.find(addr);
-		if (it == mod->to_index.end()) return out;
-
-		const auto& vec = it->second;
-		if (vec.size() <= limit) {
-			out = vec;
-		} else {
-			out.assign(vec.begin(), vec.begin() + static_cast<std::ptrdiff_t>(limit));
+		std::sort(out.begin(), out.end(), detail::sort_less);
+		out.erase(std::unique(out.begin(), out.end(),
+			[](const annotation_t& a, const annotation_t& b) {
+				return a.source_addr == b.source_addr
+					&& a.kind == b.kind
+					&& a.edge == b.edge;
+			}), out.end());
+		if (out.size() > limit) {
+			out.resize(limit);
 		}
 		return out;
 	}
 
 	inline bool has_more(uint64_t addr, size_t limit) {
 		if (addr == 0) return false;
-		auto mod = detail::lookup_cached_module(addr);
-		if (!mod) return false;
-		if (mod->state.load(std::memory_order_acquire) !=
-			static_cast<uint32_t>(detail::build_state_t::built)) return false;
-		auto it = mod->to_index.find(addr);
-		if (it == mod->to_index.end()) return false;
-		return it->second.size() > limit;
+		size_t count = 0;
+		auto modules = detail::built_modules_snapshot();
+		for (const auto& mod : modules) {
+			auto it = mod->to_index.find(addr);
+			if (it == mod->to_index.end()) continue;
+			count += it->second.size();
+			if (count > limit) return true;
+		}
+		return false;
 	}
 
 	inline void warm_range(uint64_t lo_addr, uint64_t hi_addr) {

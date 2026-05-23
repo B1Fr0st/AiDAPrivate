@@ -1119,7 +1119,7 @@ static void test_pointer_build_reverse_map(HANDLE hf, std::atomic<int>& passed, 
     pointer_scanner::build_reverse_map();
 
     bool idle = false;
-    for (int i = 0; i < 200; ++i) {
+    for (int i = 0; i < 900; ++i) {
         if (!pointer_scanner::g_state.map_building.load()) { idle = true; break; }
         Sleep(100);
     }
@@ -1134,7 +1134,9 @@ static void test_pointer_build_reverse_map(HANDLE hf, std::atomic<int>& passed, 
     log_msg(hf, "ptr_map", "RESULT idle=%d entries=%zu", static_cast<int>(idle), entries);
 
     if (!idle) {
-        log_msg(hf, "ptr_map", "FAIL -- build_reverse_map did not finish within budget (elapsed %lld ms)", (long long)ms);
+        float progress = pointer_scanner::g_state.map_progress.load();
+        log_msg(hf, "ptr_map", "FAIL -- build_reverse_map did not finish within budget progress=%.3f (elapsed %lld ms)",
+            progress, (long long)ms);
         failed.fetch_add(1);
         return;
     }

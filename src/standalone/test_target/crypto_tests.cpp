@@ -1,4 +1,5 @@
 #include "crypto_tests.h"
+#include "test_log.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -416,8 +417,11 @@ static const uint32_t kCrc32Table[256] = {
 
 static uint32_t crc32_compute(const uint8_t* data, size_t len) {
     uint32_t crc = 0xFFFFFFFF;
-    for (size_t i = 0; i < len; ++i)
-        crc = kCrc32Table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; ++bit)
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
     return crc ^ 0xFFFFFFFF;
 }
 
@@ -634,6 +638,7 @@ void __declspec(noinline) test_crc32(const config_t& cfg) {
 
     uint32_t crc_test = crc32_compute((const uint8_t*)"123456789", 9);
     log("CRC32(\"123456789\") = 0x%08X (expected 0xCBF43926)", crc_test);
+    log("CRC32 standard KAT: %s", crc_test == 0xCBF43926u ? "PASS" : "FAIL");
 
     uint32_t crc_aida = crc32_compute((const uint8_t*)"AiDA_TestTarget", 15);
     log("CRC32(\"AiDA_TestTarget\") = 0x%08X", crc_aida);

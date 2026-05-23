@@ -1508,9 +1508,21 @@ tool_result_t network_kill_connection(const json& params)
     }
     if (params.contains("src_port") && params["src_port"].is_number()) src_port = params["src_port"].get<std::uint32_t>();
     if (params.contains("dst_port") && params["dst_port"].is_number()) dst_port = params["dst_port"].get<std::uint32_t>();
-    if (params.contains("src_ip") && params["src_ip"].is_string()) parse_ipv4(params["src_ip"].get<std::string>(), src_addr);
-    if (params.contains("dst_ip") && params["dst_ip"].is_string()) parse_ipv4(params["dst_ip"].get<std::string>(), dst_addr);
+    const bool has_src_ip = params.contains("src_ip") && params["src_ip"].is_string() &&
+        parse_ipv4(params["src_ip"].get<std::string>(), src_addr);
+    const bool has_dst_ip = params.contains("dst_ip") && params["dst_ip"].is_string() &&
+        parse_ipv4(params["dst_ip"].get<std::string>(), dst_addr);
     if (params.contains("pid") && params["pid"].is_number()) pid = params["pid"].get<std::uint32_t>();
+
+    auto addr_is_zero = [](const std::uint8_t* addr) {
+        return addr[0] == 0 && addr[1] == 0 && addr[2] == 0 && addr[3] == 0;
+    };
+    if (!has_src_ip || !has_dst_ip || addr_is_zero(src_addr) || addr_is_zero(dst_addr)) {
+        return tool_result_t::error(OBFSTR("Refusing to kill connection without explicit non-wildcard src_ip and dst_ip"));
+    }
+    if (src_port == 0 || dst_port == 0) {
+        return tool_result_t::error(OBFSTR("Refusing to kill connection without explicit non-zero src_port and dst_port"));
+    }
 
     diag::log_tagged_fmt("net_tools", "network_kill_connection protocol=%u src_port=%u dst_port=%u pid=%u", protocol, src_port, dst_port, pid);
     bool ok = driver_bridge::kill_connection(protocol, af, src_port, dst_port, src_addr, dst_addr, pid);

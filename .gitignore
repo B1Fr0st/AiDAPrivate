@@ -16,6 +16,9 @@
 !.aider*
 !CMakeLists.txt
 !CLAUDE.md
+!AGENTS.md
+!build-host.ps1
+!build-host.cmd
 !CMakePresets.json
 
 # ==========================================

@@ -315,6 +315,7 @@ namespace driver_bridge
     std::string status();
     std::string last_error();
     uint32_t attached_pid();
+    bool attached_process_alive(uint32_t* exit_code_out = nullptr);
     std::string attached_process_name();
 
     std::vector<process_info_t> enumerate_processes();

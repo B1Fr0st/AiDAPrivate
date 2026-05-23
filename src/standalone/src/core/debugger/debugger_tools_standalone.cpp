@@ -170,6 +170,37 @@ static std::optional<std::uint32_t> parse_tid(const json& params)
     return (tid != 0) ? std::optional<std::uint32_t>{tid} : std::nullopt;
 }
 
+static int int_param_clamped(const json& params, const char* key, int fallback, int lo, int hi)
+{
+    int value = fallback;
+    if (params.contains(key)) {
+        const auto& v = params[key];
+        if (v.is_number_unsigned()) {
+            auto raw = v.get<std::uint64_t>();
+            value = raw > static_cast<std::uint64_t>(hi) ? hi : static_cast<int>(raw);
+        } else if (v.is_number_integer()) {
+            auto raw = v.get<std::int64_t>();
+            if (raw < static_cast<std::int64_t>(lo))
+                value = lo;
+            else if (raw > static_cast<std::int64_t>(hi))
+                value = hi;
+            else
+                value = static_cast<int>(raw);
+        }
+        else if (v.is_string()) {
+            auto parsed = sa_parse_address(v.get<std::string>());
+            if (parsed)
+                value = static_cast<int>(*parsed);
+        }
+    }
+    return std::clamp(value, lo, hi);
+}
+
+static bool deadline_expired(const std::chrono::steady_clock::time_point& deadline)
+{
+    return std::chrono::steady_clock::now() >= deadline || mcp_standalone::current_call_cancelled();
+}
+
 
 static tool_result_t dbg_set_breakpoint(const json& params)
 {
@@ -1171,8 +1202,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_run: entry");
             if (auto err = ensure_attached(params)) return *err;
-            debugger_engine::run_target();
-            diag::log_tagged_fmt("dbg_tools", "dbg_run: run_target called");
+            bool ok = debugger_engine::run_target();
+            diag::log_tagged_fmt("dbg_tools", "dbg_run: run_target returned ok=%d", (int)ok);
+            if (!ok)
+                return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("run_target failed.") : debugger_engine::last_error());
             return tool_result_t::ok(OBFSTR("Execution resumed."));
         }, false});
 
@@ -1183,8 +1216,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_pause: entry");
             if (auto err = ensure_attached(params)) return *err;
-            debugger_engine::pause_target();
-            diag::log_tagged_fmt("dbg_tools", "dbg_pause: pause_target called");
+            bool ok = debugger_engine::pause_target();
+            diag::log_tagged_fmt("dbg_tools", "dbg_pause: pause_target returned ok=%d", (int)ok);
+            if (!ok)
+                return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("pause_target failed.") : debugger_engine::last_error());
             return tool_result_t::ok(OBFSTR("Execution paused."));
         }, false});
 
@@ -1200,8 +1235,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
             diag::log_tagged_fmt("dbg_tools", "dbg_step_into: tid=%u", *tid);
             debugger_engine::g_state.active_tid = *tid;
-            debugger_engine::step_into();
-            diag::log_tagged_fmt("dbg_tools", "dbg_step_into: step_into called");
+            bool ok = debugger_engine::step_into();
+            diag::log_tagged_fmt("dbg_tools", "dbg_step_into: step_into returned ok=%d", (int)ok);
+            if (!ok)
+                return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("step_into failed.") : debugger_engine::last_error());
             return tool_result_t::ok(OBFSTR("Step into executed."));
         }, false});
 
@@ -1217,8 +1254,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
             diag::log_tagged_fmt("dbg_tools", "dbg_step_over: tid=%u", *tid);
             debugger_engine::g_state.active_tid = *tid;
-            debugger_engine::step_over();
-            diag::log_tagged_fmt("dbg_tools", "dbg_step_over: step_over called");
+            bool ok = debugger_engine::step_over();
+            diag::log_tagged_fmt("dbg_tools", "dbg_step_over: step_over returned ok=%d", (int)ok);
+            if (!ok)
+                return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("step_over failed.") : debugger_engine::last_error());
             return tool_result_t::ok(OBFSTR("Step over executed."));
         }, false});
 
@@ -1234,8 +1273,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
             diag::log_tagged_fmt("dbg_tools", "dbg_step_out: tid=%u", *tid);
             debugger_engine::g_state.active_tid = *tid;
-            debugger_engine::step_out();
-            diag::log_tagged_fmt("dbg_tools", "dbg_step_out: step_out called");
+            bool ok = debugger_engine::step_out();
+            diag::log_tagged_fmt("dbg_tools", "dbg_step_out: step_out returned ok=%d", (int)ok);
+            if (!ok)
+                return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("step_out failed.") : debugger_engine::last_error());
             return tool_result_t::ok(OBFSTR("Step out executed."));
         }, false});
 
@@ -1252,8 +1293,16 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             auto addr = sa_parse_address(params["address"].get<std::string>());
             if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
             diag::log_tagged_fmt("dbg_tools", "dbg_run_to_address: running to 0x%llX", (unsigned long long)*addr);
-            debugger_engine::run_to_address(*addr);
-            diag::log_tagged_fmt("dbg_tools", "dbg_run_to_address: run_to_address called");
+            bool wait = false;
+            if (params.contains("wait_for_completion") && params["wait_for_completion"].is_boolean())
+                wait = params["wait_for_completion"].get<bool>();
+            else if (params.contains("wait") && params["wait"].is_boolean())
+                wait = params["wait"].get<bool>();
+            uint32_t timeout_ms = static_cast<uint32_t>(int_param_clamped(params, "timeout_ms", 30000, 1, 300000));
+            bool ok = debugger_engine::run_to_address(*addr, wait, timeout_ms);
+            diag::log_tagged_fmt("dbg_tools", "dbg_run_to_address: run_to_address returned ok=%d", (int)ok);
+            if (!ok)
+                return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("run_to_address failed.") : debugger_engine::last_error());
             return tool_result_t::ok(OBFSTR("Running to ") + sa_format_address(*addr));
         }, false});
 
@@ -1654,63 +1703,63 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
 
     srv.register_tool({
         "debugger_step_over",
-        "Step over the next instruction (alias of dbg_step_over without requiring a tid override).",
-        {{"tid", "string", "Optional thread ID; otherwise current active_tid is used", false}},
+        "Step over the next instruction for an explicit thread.",
+        {{"tid", "string", "Thread ID", true}},
         false,
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "debugger_step_over: entry");
             if (auto err = ensure_attached(params)) return *err;
-            if (params.contains("tid")) {
-                auto tid = parse_tid(params);
-                if (tid) debugger_engine::g_state.active_tid = *tid;
-            }
+            auto tid = parse_tid(params);
+            if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
+            debugger_engine::g_state.active_tid = *tid;
             bool ok = debugger_engine::step_over();
             diag::log_tagged_fmt("dbg_tools", "debugger_step_over: step_over returned ok=%d", (int)ok);
+            if (!ok)
+                return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("step_over failed.") : debugger_engine::last_error());
             json result;
-            result["status"] = ok ? "stepped" : "failed";
-            if (!ok) result["error"] = debugger_engine::last_error();
+            result["status"] = "stepped";
             return tool_result_t::ok(result);
         }
     });
 
     srv.register_tool({
         "debugger_step_into",
-        "Single-step into the next instruction.",
-        {{"tid", "string", "Optional thread ID; otherwise current active_tid is used", false}},
+        "Single-step into the next instruction for an explicit thread.",
+        {{"tid", "string", "Thread ID", true}},
         false,
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "debugger_step_into: entry");
             if (auto err = ensure_attached(params)) return *err;
-            if (params.contains("tid")) {
-                auto tid = parse_tid(params);
-                if (tid) debugger_engine::g_state.active_tid = *tid;
-            }
+            auto tid = parse_tid(params);
+            if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
+            debugger_engine::g_state.active_tid = *tid;
             bool ok = debugger_engine::step_into();
             diag::log_tagged_fmt("dbg_tools", "debugger_step_into: step_into returned ok=%d", (int)ok);
+            if (!ok)
+                return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("step_into failed.") : debugger_engine::last_error());
             json result;
-            result["status"] = ok ? "stepped" : "failed";
-            if (!ok) result["error"] = debugger_engine::last_error();
+            result["status"] = "stepped";
             return tool_result_t::ok(result);
         }
     });
 
     srv.register_tool({
         "debugger_step_out",
-        "Run until the current function returns.",
-        {{"tid", "string", "Optional thread ID; otherwise current active_tid is used", false}},
+        "Run until the current function returns for an explicit thread.",
+        {{"tid", "string", "Thread ID", true}},
         false,
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "debugger_step_out: entry");
             if (auto err = ensure_attached(params)) return *err;
-            if (params.contains("tid")) {
-                auto tid = parse_tid(params);
-                if (tid) debugger_engine::g_state.active_tid = *tid;
-            }
+            auto tid = parse_tid(params);
+            if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
+            debugger_engine::g_state.active_tid = *tid;
             bool ok = debugger_engine::step_out();
             diag::log_tagged_fmt("dbg_tools", "debugger_step_out: step_out returned ok=%d", (int)ok);
+            if (!ok)
+                return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("step_out failed.") : debugger_engine::last_error());
             json result;
-            result["status"] = ok ? "stepped" : "failed";
-            if (!ok) result["error"] = debugger_engine::last_error();
+            result["status"] = "stepped";
             return tool_result_t::ok(result);
         }
     });
@@ -1725,9 +1774,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             if (auto err = ensure_attached(params)) return *err;
             bool ok = debugger_engine::run_target();
             diag::log_tagged_fmt("dbg_tools", "debugger_continue: run_target returned ok=%d", (int)ok);
+            if (!ok)
+                return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("run_target failed.") : debugger_engine::last_error());
             json result;
-            result["status"] = ok ? "running" : "failed";
-            if (!ok) result["error"] = debugger_engine::last_error();
+            result["status"] = "running";
             return tool_result_t::ok(result);
         }
     });
@@ -1742,9 +1792,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             if (auto err = ensure_attached(params)) return *err;
             bool ok = debugger_engine::pause_target();
             diag::log_tagged_fmt("dbg_tools", "debugger_pause: pause_target returned ok=%d", (int)ok);
+            if (!ok)
+                return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("pause_target failed.") : debugger_engine::last_error());
             json result;
-            result["status"] = ok ? "paused" : "failed";
-            if (!ok) result["error"] = debugger_engine::last_error();
+            result["status"] = "paused";
             return tool_result_t::ok(result);
         }
     });
@@ -2410,6 +2461,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 if (!xref_engine::g_state.scanning.load()) break;
                 Sleep(10);
             }
+            if (xref_engine::g_state.scanning.load()) {
+                diag::log_tagged_fmt("dbg_tools", "dbg_get_xrefs_to: scan timeout, cancelling");
+                xref_engine::cancel_scan();
+            }
             std::lock_guard<std::mutex> lk(xref_engine::g_state.mutex);
             json arr = json::array();
             size_t n = std::min(static_cast<size_t>(max_results), xref_engine::g_state.results.size());
@@ -2491,6 +2546,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             for (int i = 0; i < 300; ++i) {
                 if (!xref_engine::g_state.scanning.load()) break;
                 Sleep(10);
+            }
+            if (xref_engine::g_state.scanning.load()) {
+                diag::log_tagged_fmt("dbg_tools", "dbg_scan_xrefs: scan timeout, cancelling");
+                xref_engine::cancel_scan();
             }
             std::lock_guard<std::mutex> lk(xref_engine::g_state.mutex);
             json result;
@@ -2602,23 +2661,45 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
     register_compat(srv, {
         OBFSTR("dbg_get_modules_detail"), OBFSTR("debugger"),
         OBFSTR("Get detailed module information with PE analysis including exports and imports."),
-        {{OBFSTR("module_name"), OBFSTR("string"), OBFSTR("Optional module name filter"), false}},
+        {{OBFSTR("module_name"), OBFSTR("string"), OBFSTR("Optional module name filter"), false},
+         {OBFSTR("max_modules"), OBFSTR("number"), OBFSTR("Maximum modules to inspect deeply"), false},
+         {OBFSTR("max_exports"), OBFSTR("number"), OBFSTR("Maximum exports per module"), false},
+         {OBFSTR("max_imports"), OBFSTR("number"), OBFSTR("Maximum imports per module"), false},
+         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Maximum elapsed time before returning partial results"), false}},
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_get_modules_detail: entry");
             if (auto err = ensure_attached(params)) return *err;
             diag::log_tagged_fmt("dbg_tools", "dbg_get_modules_detail: calling module_view::refresh");
             module_view::refresh();
-            Sleep(300);
+            const int timeout_ms = int_param_clamped(params, "timeout_ms", 5000, 500, 60000);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+            while (module_view::g_ui.loading.load(std::memory_order_acquire) && !deadline_expired(deadline))
+                Sleep(25);
             std::string filter;
             if (params.contains("module_name") && params["module_name"].is_string())
                 filter = params["module_name"].get<std::string>();
+            const int default_modules = filter.empty() ? 8 : 1;
+            const int max_modules = int_param_clamped(params, "max_modules", default_modules, 1, 256);
+            const int max_exports = int_param_clamped(params, "max_exports", 50, 0, 1000);
+            const int max_imports = int_param_clamped(params, "max_imports", 50, 0, 1000);
             std::vector<driver_bridge::module_info_t> mods;
             {
                 std::lock_guard<std::mutex> lk(module_view::g_ui.modules_mutex);
                 mods = module_view::g_ui.modules;
             }
             json arr = json::array();
+            bool truncated = false;
+            bool timed_out = false;
             for (const auto& m : mods) {
+                if (arr.size() >= static_cast<size_t>(max_modules)) {
+                    truncated = true;
+                    break;
+                }
+                if (deadline_expired(deadline)) {
+                    timed_out = true;
+                    truncated = true;
+                    break;
+                }
                 if (!filter.empty()) {
                     std::string lower_name = m.name;
                     std::string lower_filter = filter;
@@ -2632,7 +2713,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 mj["base"] = sa_format_address(m.base);
                 mj["size"] = m.size;
                 pe_parser::pe_info_t pe;
-                if (pe_parser::parse(m.base, pe)) {
+                if (pe_parser::parse(m.base, pe, false)) {
                     mj["entry_point"] = sa_format_address(pe.entry_point);
                     mj["is_64bit"] = pe.is_64bit;
                     json sections = json::array();
@@ -2646,10 +2727,13 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                     }
                     mj["sections"] = std::move(sections);
                     std::vector<pe_parser::export_entry_t> exports;
-                    pe_parser::parse_exports(m.base, pe, exports);
+                    bool exports_truncated = false;
+                    pe_parser::parse_exports(m.base, pe, exports, static_cast<size_t>(max_exports), &deadline, &exports_truncated);
+                    if (exports_truncated) truncated = true;
                     mj["export_count"] = exports.size();
+                    mj["exports_truncated"] = exports_truncated;
                     json exp_arr = json::array();
-                    size_t exp_limit = std::min<size_t>(exports.size(), 50);
+                    size_t exp_limit = std::min<size_t>(exports.size(), static_cast<size_t>(max_exports));
                     for (size_t ei = 0; ei < exp_limit; ++ei) {
                         json ej;
                         ej["ordinal"] = exports[ei].ordinal;
@@ -2660,10 +2744,14 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                     }
                     mj["exports"] = std::move(exp_arr);
                     std::vector<pe_parser::import_entry_t> imports;
-                    pe_parser::parse_imports(m.base, pe, imports);
+                    bool imports_truncated = false;
+                    pe_parser::parse_imports(m.base, pe, imports, static_cast<size_t>(max_imports), &deadline, &imports_truncated);
+                    if (imports_truncated) truncated = true;
+                    if (deadline_expired(deadline)) timed_out = true;
                     mj["import_count"] = imports.size();
+                    mj["imports_truncated"] = imports_truncated;
                     json imp_arr = json::array();
-                    size_t imp_limit = std::min<size_t>(imports.size(), 50);
+                    size_t imp_limit = std::min<size_t>(imports.size(), static_cast<size_t>(max_imports));
                     for (size_t ii = 0; ii < imp_limit; ++ii) {
                         json ij;
                         ij["module"] = imports[ii].module_name;
@@ -2677,8 +2765,15 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             }
             json result;
             result["count"] = arr.size();
+            result["truncated"] = truncated;
+            result["timed_out"] = timed_out;
+            result["max_modules"] = max_modules;
+            result["max_exports"] = max_exports;
+            result["max_imports"] = max_imports;
+            result["timeout_ms"] = timeout_ms;
             result["modules"] = std::move(arr);
-            diag::log_tagged_fmt("dbg_tools", "dbg_get_modules_detail: returning %zu modules", arr.size());
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_modules_detail: returning %zu modules truncated=%d timed_out=%d",
+                arr.size(), truncated ? 1 : 0, timed_out ? 1 : 0);
             return tool_result_t::ok(
                 std::to_string(result["count"].get<size_t>()) + OBFSTR(" module(s)."), result);
         }, true});

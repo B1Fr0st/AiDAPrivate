@@ -290,6 +290,7 @@ namespace net_fingerprint {
                          const UINT8* tcp_data, UINT32 tcp_len,
                          UINT32 ip_ttl);
     BOOLEAN is_active();
+    void cleanup();
 }
 namespace net_dpi {
     NTSTATUS init();
@@ -309,6 +310,7 @@ namespace net_intercept {
                             UINT32 af, UINT32 pid,
                             const UINT8* payload, UINT32 payload_len);
     BOOLEAN is_active();
+    void cleanup();
 }
 namespace net_redirect {
     BOOLEAN check_redirect(UINT32 protocol, UINT32 dst_port, const UINT8* dst_addr,
@@ -318,9 +320,11 @@ namespace net_redirect {
 namespace net_dns_spoof {
     BOOLEAN check_spoof(const char* domain, UINT8* out_addr, UINT32* out_af, UINT32* out_ttl);
     BOOLEAN has_active_rules();
+    void cleanup();
 }
 namespace net_bw {
     BOOLEAN is_active();
+    void cleanup();
 }
 namespace net_inject {
     inline constexpr UINT32 INJECT_FLAG_RAW_TRANSPORT = 0x80000000u;
@@ -753,10 +757,29 @@ namespace net_capture {
         if (local_port != 53 && remote_port != 53) return;
         if (data_len < 12) return;
 
-        UINT16 flags = ((UINT16)data[2] << 8) | data[3];
-        UINT16 qdcount = ((UINT16)data[4] << 8) | data[5];
-        UINT16 ancount = ((UINT16)data[6] << 8) | data[7];
-        UINT8  rcode = data[3] & 0x0F;
+        const UINT8* dns_data = data;
+        UINT32 dns_len = data_len;
+
+        if (data_len >= 20) {
+            UINT16 udp_src = ((UINT16)data[0] << 8) | data[1];
+            UINT16 udp_dst = ((UINT16)data[2] << 8) | data[3];
+            UINT16 udp_len = ((UINT16)data[4] << 8) | data[5];
+            BOOLEAN ports_match =
+                ((udp_src == (UINT16)local_port || udp_src == (UINT16)remote_port ||
+                  udp_dst == (UINT16)local_port || udp_dst == (UINT16)remote_port) &&
+                 (udp_src == 53 || udp_dst == 53));
+            if (ports_match && udp_len >= 20 && udp_len <= data_len) {
+                dns_data = data + 8;
+                dns_len = udp_len - 8;
+            }
+        }
+
+        if (dns_len < 12) return;
+
+        UINT16 flags = ((UINT16)dns_data[2] << 8) | dns_data[3];
+        UINT16 qdcount = ((UINT16)dns_data[4] << 8) | dns_data[5];
+        UINT16 ancount = ((UINT16)dns_data[6] << 8) | dns_data[7];
+        UINT8  rcode = dns_data[3] & 0x0F;
         BOOLEAN is_response = (flags & 0x8000) != 0;
 
         if (qdcount == 0 || qdcount > 16) return;
@@ -765,45 +788,45 @@ namespace net_capture {
         UINT32 pos = 12;
 
 
-        pos = parse_dns_name(data, pos, data_len, domain, sizeof(domain));
-        if (pos == 0 || pos + 4 > data_len) return;
+        pos = parse_dns_name(dns_data, pos, dns_len, domain, sizeof(domain));
+        if (pos == 0 || pos + 4 > dns_len) return;
 
-        UINT16 qtype = ((UINT16)data[pos] << 8) | data[pos + 1];
+        UINT16 qtype = ((UINT16)dns_data[pos] << 8) | dns_data[pos + 1];
         pos += 4;
 
         UINT8 resolved[16] = {};
         UINT32 ttl = 0;
 
 
-        if (is_response && ancount > 0 && pos < data_len) {
-            for (UINT16 i = 0; i < ancount && pos < data_len; i++) {
+        if (is_response && ancount > 0 && pos < dns_len) {
+            for (UINT16 i = 0; i < ancount && pos < dns_len; i++) {
 
-                if ((data[pos] & 0xC0) == 0xC0) {
+                if ((dns_data[pos] & 0xC0) == 0xC0) {
                     pos += 2;
                 } else {
-                    while (pos < data_len && data[pos] != 0) {
-                        if ((data[pos] & 0xC0) == 0xC0) { pos += 2; goto after_name; }
-                        if (data[pos] > 63) break;
-                        pos += data[pos] + 1;
+                    while (pos < dns_len && dns_data[pos] != 0) {
+                        if ((dns_data[pos] & 0xC0) == 0xC0) { pos += 2; goto after_name; }
+                        if (dns_data[pos] > 63) break;
+                        pos += dns_data[pos] + 1;
                     }
                     pos++;
                 }
                 after_name:
-                if (pos + 10 > data_len) break;
+                if (pos + 10 > dns_len) break;
 
-                UINT16 atype = ((UINT16)data[pos] << 8) | data[pos + 1];
+                UINT16 atype = ((UINT16)dns_data[pos] << 8) | dns_data[pos + 1];
                 pos += 4;
-                ttl = ((UINT32)data[pos] << 24) | ((UINT32)data[pos+1] << 16) |
-                      ((UINT32)data[pos+2] << 8) | data[pos+3];
+                ttl = ((UINT32)dns_data[pos] << 24) | ((UINT32)dns_data[pos+1] << 16) |
+                      ((UINT32)dns_data[pos+2] << 8) | dns_data[pos+3];
                 pos += 4;
-                UINT16 rdlength = ((UINT16)data[pos] << 8) | data[pos + 1];
+                UINT16 rdlength = ((UINT16)dns_data[pos] << 8) | dns_data[pos + 1];
                 pos += 2;
 
-                if (atype == 1 && rdlength == 4 && pos + 4 <= data_len) {
-                    strong::kmemcpy(resolved, &data[pos], 4);
+                if (atype == 1 && rdlength == 4 && pos + 4 <= dns_len) {
+                    strong::kmemcpy(resolved, &dns_data[pos], 4);
                     break;
-                } else if (atype == 28 && rdlength == 16 && pos + 16 <= data_len) {
-                    strong::kmemcpy(resolved, &data[pos], 16);
+                } else if (atype == 28 && rdlength == 16 && pos + 16 <= dns_len) {
+                    strong::kmemcpy(resolved, &dns_data[pos], 16);
                     break;
                 }
                 pos += rdlength;
@@ -960,7 +983,7 @@ namespace net_capture {
                 if (!need_full_pipeline && net_stream::has_active_streams()) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && malsafe_log_inbound) need_full_pipeline = TRUE;
                 if (!need_full_pipeline) {
-                    if (!g_capture_active || (g_filter_pid != 0 && pid != 0 && pid != g_filter_pid))
+                    if (!g_capture_active || (g_filter_pid != 0 && pid != g_filter_pid))
                         __leave;
                 }
             }
@@ -1332,7 +1355,7 @@ namespace net_capture {
                 if (!need_full_pipeline && net_stream::has_active_streams()) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && malsafe_log_outbound) need_full_pipeline = TRUE;
                 if (!need_full_pipeline) {
-                    if (!g_capture_active || (g_filter_pid != 0 && pid != 0 && pid != g_filter_pid))
+                    if (!g_capture_active || (g_filter_pid != 0 && pid != g_filter_pid))
                         __leave;
                 }
             }
@@ -2139,10 +2162,22 @@ namespace net_capture {
 
     void cleanup() {
         _InterlockedExchange(&g_capture_active, 0);
+        g_filter_pid = 0;
+        g_filter_port = 0;
+        g_filter_protocol = 0;
+        strong::kmemset(g_filter_ip, 0, sizeof(g_filter_ip));
+        for (UINT32 i = 0; i < MAX_FILTER_RULES; i++) {
+            _InterlockedExchange(&g_filter_rules[i].active, 0);
+        }
+        _InterlockedExchange(&g_active_rule_count, 0);
         unregister_wfp();
         net_inject::cleanup();
         net_stream::cleanup();
         net_dpi::cleanup();
+        net_intercept::cleanup();
+        net_dns_spoof::cleanup();
+        net_fingerprint::cleanup();
+        net_bw::cleanup();
 
         if (g_ring_buffer) {
             ExFreePoolWithTag(g_ring_buffer, 'pkNW');
@@ -3380,6 +3415,10 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
         }
         case 1: {
             _InterlockedExchange(&net_capture::g_capture_active, 0);
+            net_capture::g_filter_pid = 0;
+            net_capture::g_filter_port = 0;
+            net_capture::g_filter_protocol = 0;
+            strong::kmemset(net_capture::g_filter_ip, 0, sizeof(net_capture::g_filter_ip));
             NET_DBG("handle_net_cap_ctrl: capture STOPPED");
             request->capture_active = 0;
             break;
@@ -3472,6 +3511,11 @@ NTSTATUS functions::handle_net_filter_rule(p_net_filter_rule request) {
 
     switch (request->operation) {
         case 0: {
+            if (request->pid == 0 && request->port == 0 &&
+                request->protocol == 0 && net_capture::is_zero_ip(request->ip_addr)) {
+                NET_ERR("filter_rule: rejecting wildcard rule with no pid/port/protocol/ip");
+                return STATUS_INVALID_PARAMETER;
+            }
             for (UINT32 i = 0; i < MAX_FILTER_RULES; i++) {
                 if (_InterlockedCompareExchange(&net_capture::g_filter_rules[i].active, 2, 0) == 0) {
                     UINT32 id = (UINT32)_InterlockedIncrement(&net_capture::g_next_rule_id);
@@ -4243,6 +4287,7 @@ namespace net_sniff {
             return STATUS_INVALID_PARAMETER;
         }
     }
+
 }
 
 
@@ -5833,6 +5878,21 @@ namespace net_redirect {
     inline volatile LONG g_next_redir_id = 1;
     inline volatile LONG g_active_redir_count = 0;
 
+    static BOOLEAN is_valid_redirect_add_request(p_traffic_redirect_rule request) {
+        if (!request) return FALSE;
+        if (request->address_family != AF_INET && request->address_family != AF_INET6) return FALSE;
+        if (request->redirect_port == 0) return FALSE;
+        if (net_capture::is_zero_ip(request->redirect_addr)) return FALSE;
+
+        const BOOLEAN wildcard_match =
+            request->protocol == 0 &&
+            request->match_port == 0 &&
+            net_capture::is_zero_ip(request->match_addr);
+        if (wildcard_match) return FALSE;
+
+        return TRUE;
+    }
+
     BOOLEAN has_active_rules() {
         return (g_active_redir_count != 0);
     }
@@ -5870,6 +5930,12 @@ namespace net_redirect {
 
         switch (request->operation) {
         case 0: {
+            if (!is_valid_redirect_add_request(request)) {
+                NET_ERR("handle_redirect_rule: reject invalid add proto=%u match_port=%u redir_port=%u af=%u",
+                        request->protocol, request->match_port,
+                        request->redirect_port, request->address_family);
+                return STATUS_INVALID_PARAMETER;
+            }
             for (UINT32 i = 0; i < REDIR_MAX_RULES; i++) {
                 if (_InterlockedCompareExchange(&g_redir_rules[i].active, 2, 0) == 0) {
                     UINT32 id = (UINT32)_InterlockedIncrement(&g_next_redir_id);
@@ -6026,7 +6092,7 @@ namespace net_stream {
                 }
                 if (addr_match) match = TRUE;
             }
-            if (g_streams[i].pid != 0 && pid != 0 && g_streams[i].pid != pid) match = FALSE;
+            if (g_streams[i].pid != 0 && g_streams[i].pid != pid) match = FALSE;
 
             if (match && g_streams[i].stream_data && data_len > 0) {
                 KIRQL irql;
@@ -6143,6 +6209,25 @@ namespace net_stream {
                 if (g_streams[i].active == 1) request->stream_count++;
             }
             WW_LOG("netaction::net_stream::handle_stream[count] OK count=%u", request->stream_count);
+            return STATUS_SUCCESS;
+        }
+        case 4: {
+            UINT32 cleared = 0;
+            for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
+                if (_InterlockedExchange(&g_streams[i].active, 0) == 1)
+                    cleared++;
+                g_streams[i].src_port = 0;
+                g_streams[i].dst_port = 0;
+                g_streams[i].pid = 0;
+                g_streams[i].stream_size = 0;
+                g_streams[i].total_packets = 0;
+                g_streams[i].truncated = 0;
+                strong::kmemset(g_streams[i].src_addr, 0, sizeof(g_streams[i].src_addr));
+                strong::kmemset(g_streams[i].dst_addr, 0, sizeof(g_streams[i].dst_addr));
+            }
+            _InterlockedExchange(&g_active_stream_count, 0);
+            request->stream_count = 0;
+            WW_LOG("netaction::net_stream::handle_stream[clear] OK cleared=%u", cleared);
             return STATUS_SUCCESS;
         }
         default:
@@ -6394,8 +6479,6 @@ namespace net_dpi {
             NTSTATUS st = init();
             if (!NT_SUCCESS(st)) return st;
         }
-        _InterlockedExchange(&g_dpi_active, 1);
-
         request->result_count = 0;
         KIRQL irql;
         KeAcquireSpinLock(&g_dpi_lock, &irql);
@@ -6407,7 +6490,7 @@ namespace net_dpi {
             DPI_HEADER_INFO* src = &g_dpi_ring[idx];
 
 
-            if (request->filter_pid != 0 && src->pid != 0 && src->pid != request->filter_pid) goto next;
+            if (request->filter_pid != 0 && src->pid != request->filter_pid) goto next;
             if (request->filter_protocol != 0 && src->protocol != request->filter_protocol) goto next;
             if (request->filter_port != 0 && src->src_port != request->filter_port &&
                 src->dst_port != request->filter_port) goto next;
@@ -6462,7 +6545,7 @@ namespace net_intercept {
                             UINT32 af, UINT32 pid,
                             const UINT8* payload, UINT32 payload_len) {
         if (!g_intercepting) return FALSE;
-        if (g_filter_pid != 0 && pid != 0 && pid != g_filter_pid) return FALSE;
+        if (g_filter_pid != 0 && pid != g_filter_pid) return FALSE;
         if (g_filter_port != 0 && src_port != g_filter_port && dst_port != g_filter_port) return FALSE;
         if (g_filter_protocol != 0 && protocol != g_filter_protocol) return FALSE;
 
@@ -6508,6 +6591,10 @@ namespace net_intercept {
 
         switch (request->operation) {
         case 0: {
+            if (request->filter_pid == 0 && request->filter_port == 0 &&
+                request->filter_protocol == 0) {
+                return STATUS_INVALID_PARAMETER;
+            }
             g_filter_pid = request->filter_pid;
             g_filter_port = request->filter_port;
             g_filter_protocol = request->filter_protocol;
@@ -6518,6 +6605,9 @@ namespace net_intercept {
         }
         case 1: {
             _InterlockedExchange(&g_intercepting, 0);
+            g_filter_pid = 0;
+            g_filter_port = 0;
+            g_filter_protocol = 0;
 
             KIRQL irql;
             KeAcquireSpinLock(&g_intercept_lock, &irql);
@@ -6630,6 +6720,21 @@ namespace net_intercept {
         default:
             return STATUS_INVALID_PARAMETER;
         }
+    }
+
+    void cleanup() {
+        _InterlockedExchange(&g_intercepting, 0);
+        g_filter_pid = 0;
+        g_filter_port = 0;
+        g_filter_protocol = 0;
+
+        KIRQL irql;
+        KeAcquireSpinLock(&g_intercept_lock, &irql);
+        for (UINT32 i = 0; i < INTERCEPT_MAX_HELD; i++) {
+            strong::kmemset(&g_held[i], 0, sizeof(HELD_PACKET));
+        }
+        g_held_count = 0;
+        KeReleaseSpinLock(&g_intercept_lock, irql);
     }
 }
 
@@ -7236,6 +7341,19 @@ namespace net_dns_spoof {
         }
         return STATUS_SUCCESS;
     }
+
+    void cleanup() {
+        for (UINT32 i = 0; i < DNS_SPOOF_MAX_RULES; i++) {
+            _InterlockedExchange(&g_spoof_rules[i].active, 0);
+            g_spoof_rules[i].rule_id = 0;
+            strong::kmemset(g_spoof_rules[i].domain, 0, sizeof(g_spoof_rules[i].domain));
+            strong::kmemset(g_spoof_rules[i].spoof_addr, 0, sizeof(g_spoof_rules[i].spoof_addr));
+            g_spoof_rules[i].address_family = 0;
+            g_spoof_rules[i].ttl = 0;
+            _InterlockedExchange(&g_spoof_rules[i].match_count, 0);
+        }
+        _InterlockedExchange(&g_active_spoof_count, 0);
+    }
 }
 
 
@@ -7426,6 +7544,26 @@ namespace net_bw {
         }
         default:
             return STATUS_INVALID_PARAMETER;
+        }
+    }
+
+    void cleanup() {
+        _InterlockedExchange(&g_bw_active, 0);
+        _InterlockedExchange64(&g_bw_total_sent, 0);
+        _InterlockedExchange64(&g_bw_total_recv, 0);
+        _InterlockedExchange64(&g_bw_total_pkts_sent, 0);
+        _InterlockedExchange64(&g_bw_total_pkts_recv, 0);
+        _InterlockedExchange64(&g_bw_last_sample_sent, 0);
+        _InterlockedExchange64(&g_bw_last_sample_recv, 0);
+        g_bw_last_sample_time = 0;
+        for (UINT32 i = 0; i < BW_MAX_PROCESSES; i++) {
+            _InterlockedExchange(&g_bw_entries[i].active, 0);
+            g_bw_entries[i].pid = 0;
+            _InterlockedExchange64(&g_bw_entries[i].bytes_sent, 0);
+            _InterlockedExchange64(&g_bw_entries[i].bytes_recv, 0);
+            _InterlockedExchange64(&g_bw_entries[i].packets_sent, 0);
+            _InterlockedExchange64(&g_bw_entries[i].packets_recv, 0);
+            g_bw_entries[i].last_activity = 0;
         }
     }
 }
@@ -7863,6 +8001,15 @@ namespace net_fingerprint {
         default:
             return STATUS_INVALID_PARAMETER;
         }
+    }
+
+    void cleanup() {
+        _InterlockedExchange(&g_fp_active, 0);
+        KIRQL irql;
+        KeAcquireSpinLock(&g_fp_lock, &irql);
+        strong::kmemset(g_fp_entries, 0, sizeof(g_fp_entries));
+        _InterlockedExchange(&g_fp_count, 0);
+        KeReleaseSpinLock(&g_fp_lock, irql);
     }
 }
 

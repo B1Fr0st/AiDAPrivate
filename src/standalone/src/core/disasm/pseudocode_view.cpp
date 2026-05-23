@@ -1053,6 +1053,12 @@ void request_decompile(uint64_t addr, const DisasmFile* file, bool force_refresh
 	{
 		std::lock_guard<std::mutex> guard(state_mutex());
 		auto& s = state();
+		diag::log_tagged_critical_fmt("psv",
+			"request_decompile_state_locked addr=0x%llX tabs=%zu active=%d force=%d",
+			static_cast<unsigned long long>(addr),
+			s.tabs.size(),
+			s.active_index,
+			force_refresh ? 1 : 0);
 		globals::ui::active_center_view = center_view_t::pseudocode;
 
 		auto existing = find_tab_for_addr_locked(addr);
@@ -1090,6 +1096,11 @@ void request_decompile(uint64_t addr, const DisasmFile* file, bool force_refresh
 			}
 		} else {
 			auto t = std::make_shared<tab_t>();
+			diag::log_tagged_critical_fmt("psv",
+				"request_decompile_create_tab addr=0x%llX tab_raw=%p tabs_before=%zu",
+				static_cast<unsigned long long>(addr),
+				t.get(),
+				s.tabs.size());
 			t->addr = addr;
 			char nm[64];
 			std::snprintf(nm, sizeof(nm), "sub_%llX", static_cast<unsigned long long>(addr));
@@ -1151,7 +1162,16 @@ void request_decompile(uint64_t addr, const DisasmFile* file, bool force_refresh
 				static_cast<unsigned long long>(addr),
 				log_label.c_str());
 		}
+		diag::log_tagged_critical_fmt("psv",
+			"request_decompile_dispatch addr=0x%llX label=%s file=%p",
+			static_cast<unsigned long long>(addr),
+			log_label.c_str(),
+			file);
 		decompiler_engine::decompile_function_native(addr, file);
+		diag::log_tagged_critical_fmt("psv",
+			"request_decompile_dispatch_returned addr=0x%llX label=%s",
+			static_cast<unsigned long long>(addr),
+			log_label.c_str());
 	}
 }
 
@@ -1334,10 +1354,23 @@ int tab_count()
 std::vector<tab_info_t> snapshot_tabs()
 {
 	std::vector<tab_info_t> out;
+	diag::log_tagged_critical_fmt("psv", "snapshot_tabs ENTER tid=%lu",
+		static_cast<unsigned long>(GetCurrentThreadId()));
 	std::lock_guard<std::mutex> guard(state_mutex());
 	auto& s = state();
+	diag::log_tagged_critical_fmt("psv", "snapshot_tabs locked tabs=%zu active=%d",
+		s.tabs.size(), s.active_index);
 	out.reserve(s.tabs.size());
 	for (auto& t : s.tabs) {
+		diag::log_tagged_critical_fmt("psv",
+			"snapshot_tabs tab_raw=%p addr=0x%llX label=%s loaded=%d pending=%d decompiling=%d error=%d",
+			t.get(),
+			static_cast<unsigned long long>(t->addr),
+			t->label.c_str(),
+			t->loaded ? 1 : 0,
+			t->pending ? 1 : 0,
+			t->decompiling ? 1 : 0,
+			t->is_error ? 1 : 0);
 		tab_info_t ti;
 		ti.addr = t->addr;
 		ti.label = t->label;
@@ -1347,6 +1380,7 @@ std::vector<tab_info_t> snapshot_tabs()
 		ti.is_error = t->is_error;
 		out.push_back(std::move(ti));
 	}
+	diag::log_tagged_critical_fmt("psv", "snapshot_tabs EXIT count=%zu", out.size());
 	return out;
 }
 

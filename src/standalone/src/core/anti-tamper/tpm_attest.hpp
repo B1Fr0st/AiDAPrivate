@@ -334,7 +334,7 @@ inline bool extend_pcr(uint32_t pcr_index, const uint8_t digest[32])
     cmd.resize(10, 0);
     put_u32(cmd, pcr_index);
     put_u32(cmd, 9);
-    put_u16(cmd, TPM_RS_PW);
+    put_u32(cmd, TPM_RS_PW);
     put_u16(cmd, 0);
     cmd.push_back(0);
     put_u16(cmd, 0);
@@ -425,7 +425,7 @@ inline bool sign_with_aik(const uint8_t* nonce, uint32_t nonce_len,
     cmd.resize(10, 0);
     put_u32(cmd, 0x81000001u);
     put_u32(cmd, 9);
-    put_u16(cmd, TPM_RS_PW);
+    put_u32(cmd, TPM_RS_PW);
     put_u16(cmd, 0);
     cmd.push_back(0);
     put_u16(cmd, 0);
@@ -519,7 +519,7 @@ inline bool nv_define_counter(uint32_t nv_index)
     cmd.resize(10, 0);
     put_u32(cmd, TPM_RH_OWNER);
     put_u32(cmd, 9);
-    put_u16(cmd, TPM_RS_PW);
+    put_u32(cmd, TPM_RS_PW);
     put_u16(cmd, 0);
     cmd.push_back(0);
     put_u16(cmd, 0);
@@ -563,7 +563,7 @@ inline bool nv_increment(uint32_t nv_index)
     put_u32(cmd, nv_index);
     put_u32(cmd, nv_index);
     put_u32(cmd, 9);
-    put_u16(cmd, TPM_RS_PW);
+    put_u32(cmd, TPM_RS_PW);
     put_u16(cmd, 0);
     cmd.push_back(0);
     put_u16(cmd, 0);
@@ -594,7 +594,7 @@ inline bool nv_read_counter(uint32_t nv_index, uint64_t& out_value)
     put_u32(cmd, nv_index);
     put_u32(cmd, nv_index);
     put_u32(cmd, 9);
-    put_u16(cmd, TPM_RS_PW);
+    put_u32(cmd, TPM_RS_PW);
     put_u16(cmd, 0);
     cmd.push_back(0);
     put_u16(cmd, 0);

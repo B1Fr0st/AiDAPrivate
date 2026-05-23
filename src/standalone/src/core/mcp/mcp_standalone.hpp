@@ -74,7 +74,7 @@ namespace mcp_standalone
         void stop();
         bool is_running() const { return _running.load(); }
         int  get_port() const { return _port; }
-        void register_tool(tool_def_t tool);
+        bool register_tool(tool_def_t tool);
         void write_client_configs() const;
         const std::vector<tool_def_t>& get_tools() const { return _tools; }
 
@@ -104,6 +104,7 @@ namespace mcp_standalone
     };
 
     void register_standalone_tools(server_t& server);
+    std::string handle_body(server_t* self, const std::string& body);
 
     struct target_scope_t
     {

@@ -134,6 +134,8 @@ inline void attach_snapshot(std::unique_ptr<snapshot_t> snap) {
 
 namespace detail {
 
+inline constexpr uint32_t k_cache_version = 2;
+
 inline std::filesystem::path cache_dir()
 {
 	wchar_t* appdata = nullptr;
@@ -159,6 +161,7 @@ inline void save_module_cache(const module_index_t& mod)
 	std::filesystem::create_directories(dir);
 
 	nlohmann::json root;
+	root["version"] = k_cache_version;
 	root["name"] = mod.name;
 	root["base"] = mod.base;
 	root["size"] = mod.size;
@@ -197,6 +200,7 @@ inline bool load_module_cache(const std::string& name, uint64_t base, uint32_t s
 
 	nlohmann::json root = nlohmann::json::parse(ifs, nullptr, false);
 	if (root.is_discarded()) return false;
+	if (root.value("version", uint32_t(0)) != k_cache_version) return false;
 
 	out.name = name;
 	out.base = base;
@@ -220,6 +224,168 @@ inline bool load_module_cache(const std::string& name, uint64_t base, uint32_t s
 		}
 	}
 
+	return true;
+}
+
+inline module_index_t scan_module_index(const std::string& name, uint64_t base, uint32_t size)
+{
+	module_index_t mod;
+	mod.name = name;
+	mod.base = base;
+	mod.size = size;
+	mod.timestamp = static_cast<uint64_t>(
+		std::chrono::system_clock::now().time_since_epoch().count());
+
+	const size_t page_size = 4096;
+	uint64_t total = size ? size : 1;
+	uint64_t scanned = 0;
+	size_t xref_count = 0;
+
+	for (uint64_t offset = 0; offset < size && !g_state.cancel.load(); offset += page_size) {
+		size_t chunk = page_size;
+		if (offset + chunk > size)
+			chunk = static_cast<size_t>(size - offset);
+
+		std::vector<uint8_t> page_data;
+		if (!driver_bridge::read_memory(base + offset, chunk, page_data)) {
+			scanned += chunk;
+			g_state.progress.store(static_cast<float>(scanned) / static_cast<float>(total));
+			continue;
+		}
+
+		const uint8_t* data = page_data.data();
+		int sz = static_cast<int>(page_data.size());
+		int pos = 0;
+
+		while (pos < sz && !g_state.cancel.load()) {
+			int avail = sz - pos;
+			if (avail > 15) avail = 15;
+
+			uint64_t ins_addr = base + offset + pos;
+			AsmInstr ins = zydis_decode_one(data + pos, avail, ins_addr);
+			const int ins_len = (ins.len > 0 && ins.len <= avail) ? ins.len : 1;
+
+			uint64_t target = 0;
+			if (ins.len > 0 && ins.len <= avail &&
+				xref_engine::detail::extract_target(data + pos, ins.len, ins_addr, ins, target)) {
+				xref_entry_t e;
+				e.from_addr = ins_addr;
+				e.to_addr = target;
+				e.type = xref_engine::detail::classify_instruction(ins);
+				char full_text[256];
+				snprintf(full_text, sizeof(full_text), "%s %s", ins.mnem, ins.ops);
+				e.disasm_text = full_text;
+
+				mod.to_index[target].push_back(e);
+				mod.from_index[ins_addr].push_back(e);
+				++xref_count;
+			}
+
+			pos += ins_len;
+		}
+
+		scanned += chunk;
+		g_state.progress.store(static_cast<float>(scanned) / static_cast<float>(total));
+	}
+
+	mod.total_xrefs = xref_count;
+	mod.built = true;
+	return mod;
+}
+
+inline void sort_unique_entries(std::vector<xref_entry_t>& entries)
+{
+	std::sort(entries.begin(), entries.end(),
+		[](const xref_entry_t& a, const xref_entry_t& b) {
+			if (a.from_addr != b.from_addr) return a.from_addr < b.from_addr;
+			if (a.to_addr != b.to_addr) return a.to_addr < b.to_addr;
+			if (a.type != b.type) return static_cast<int>(a.type) < static_cast<int>(b.type);
+			return a.disasm_text < b.disasm_text;
+		});
+	entries.erase(std::unique(entries.begin(), entries.end(),
+		[](const xref_entry_t& a, const xref_entry_t& b) {
+			return a.from_addr == b.from_addr
+				&& a.to_addr == b.to_addr
+				&& a.type == b.type;
+		}), entries.end());
+}
+
+inline void append_xrefs_to_locked(uint64_t addr, std::vector<xref_entry_t>& out)
+{
+	for (auto& [name, mod] : g_state.modules) {
+		if (!mod.built) continue;
+		auto it = mod.to_index.find(addr);
+		if (it != mod.to_index.end()) {
+			out.insert(out.end(), it->second.begin(), it->second.end());
+		}
+	}
+}
+
+inline void append_xrefs_from_locked(uint64_t addr, std::vector<xref_entry_t>& out)
+{
+	for (auto& [name, mod] : g_state.modules) {
+		if (!mod.built) continue;
+		auto it = mod.from_index.find(addr);
+		if (it != mod.from_index.end()) {
+			out.insert(out.end(), it->second.begin(), it->second.end());
+		}
+	}
+}
+
+inline bool find_module_for_addr(uint64_t addr, driver_bridge::module_info_t& out)
+{
+	auto modules = driver_bridge::enumerate_modules();
+	for (const auto& m : modules) {
+		if (m.base == 0 || m.size == 0) continue;
+		if (addr >= m.base && addr < m.base + m.size) {
+			out = m;
+			return true;
+		}
+	}
+	return false;
+}
+
+inline bool module_is_built_locked(const driver_bridge::module_info_t& m)
+{
+	auto it = g_state.modules.find(m.name);
+	return it != g_state.modules.end()
+		&& it->second.built
+		&& it->second.base == m.base
+		&& it->second.size == m.size;
+}
+
+inline bool ensure_module_index_for_addr(uint64_t addr)
+{
+	driver_bridge::module_info_t m;
+	if (!find_module_for_addr(addr, m)) return false;
+
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		if (module_is_built_locked(m)) return true;
+	}
+
+	bool expected = false;
+	if (!g_state.building.compare_exchange_strong(expected, true))
+		return false;
+
+	struct build_finish_t {
+		~build_finish_t() { g_state.building.store(false); }
+	} build_finish;
+
+	g_state.cancel.store(false);
+	g_state.progress.store(0.f);
+	g_state.building_module = m.name;
+
+	module_index_t mod;
+	if (!load_module_cache(m.name, m.base, m.size, mod)) {
+		mod = scan_module_index(m.name, m.base, m.size);
+		save_module_cache(mod);
+	}
+
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.modules[m.name] = std::move(mod);
+	}
 	return true;
 }
 
@@ -256,69 +422,12 @@ inline void build_module_index(const std::string& name, uint64_t base, uint32_t 
 	g_state.progress.store(0.f);
 	g_state.building_module = name;
 
-	work_queue::post([name, base, size]() {
-		module_index_t mod;
-		mod.name = name;
-		mod.base = base;
-		mod.size = size;
-		mod.timestamp = static_cast<uint64_t>(
-			std::chrono::system_clock::now().time_since_epoch().count());
+	if (!work_queue::post([name, base, size]() {
+		struct build_finish_t {
+			~build_finish_t() { g_state.building.store(false); }
+		} build_finish;
 
-		const size_t page_size = 4096;
-		uint64_t total = size;
-		uint64_t scanned = 0;
-		size_t xref_count = 0;
-
-		auto modules = driver_bridge::enumerate_modules();
-
-		for (uint64_t offset = 0; offset < size && !g_state.cancel.load(); offset += page_size) {
-			size_t chunk = page_size;
-			if (offset + chunk > size)
-				chunk = static_cast<size_t>(size - offset);
-
-			std::vector<uint8_t> page_data;
-			if (!driver_bridge::read_memory(base + offset, chunk, page_data)) {
-				scanned += chunk;
-				g_state.progress.store(static_cast<float>(scanned) / static_cast<float>(total));
-				continue;
-			}
-
-			const uint8_t* data = page_data.data();
-			int sz = static_cast<int>(page_data.size());
-			int pos = 0;
-
-			while (pos < sz && !g_state.cancel.load()) {
-				int avail = sz - pos;
-				if (avail > 15) avail = 15;
-
-				uint64_t ins_addr = base + offset + pos;
-				AsmInstr ins = zydis_decode_one(data + pos, avail, ins_addr);
-
-				uint64_t target = 0;
-				if (xref_engine::detail::extract_target(data + pos, ins.len, ins_addr, ins, target)) {
-					xref_entry_t e;
-					e.from_addr = ins_addr;
-					e.to_addr = target;
-					e.type = xref_engine::detail::classify_instruction(ins);
-					char full_text[256];
-					snprintf(full_text, sizeof(full_text), "%s %s", ins.mnem, ins.ops);
-					e.disasm_text = full_text;
-
-					mod.to_index[target].push_back(e);
-					mod.from_index[ins_addr].push_back(e);
-					++xref_count;
-				}
-
-				pos += ins.len;
-			}
-
-			scanned += chunk;
-			g_state.progress.store(static_cast<float>(scanned) / static_cast<float>(total));
-		}
-
-		mod.total_xrefs = xref_count;
-		mod.built = true;
-
+		module_index_t mod = detail::scan_module_index(name, base, size);
 		detail::save_module_cache(mod);
 
 		{
@@ -327,7 +436,9 @@ inline void build_module_index(const std::string& name, uint64_t base, uint32_t 
 		}
 
 		g_state.building.store(false);
-	});
+	})) {
+		g_state.building.store(false);
+	}
 }
 
 inline void build_call_graph(const std::string& module_name)
@@ -360,36 +471,48 @@ inline void build_call_graph(const std::string& module_name)
 
 inline void query_xrefs_to(uint64_t addr)
 {
-	std::lock_guard<std::mutex> lk(g_state.mutex);
-	g_state.query_results.clear();
-	g_state.query_is_to = true;
-	g_state.query_addr = addr;
+	std::vector<xref_entry_t> results;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		detail::append_xrefs_to_locked(addr, results);
+	}
 
-	for (auto& [name, mod] : g_state.modules) {
-		if (!mod.built) continue;
-		auto it = mod.to_index.find(addr);
-		if (it != mod.to_index.end()) {
-			for (auto& e : it->second)
-				g_state.query_results.push_back(e);
+	if (results.empty()) {
+		if (detail::ensure_module_index_for_addr(addr)) {
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			detail::append_xrefs_to_locked(addr, results);
 		}
 	}
+
+	detail::sort_unique_entries(results);
+
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	g_state.query_results = std::move(results);
+	g_state.query_is_to = true;
+	g_state.query_addr = addr;
 }
 
 inline void query_xrefs_from(uint64_t addr)
 {
-	std::lock_guard<std::mutex> lk(g_state.mutex);
-	g_state.query_results.clear();
-	g_state.query_is_to = false;
-	g_state.query_addr = addr;
+	std::vector<xref_entry_t> results;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		detail::append_xrefs_from_locked(addr, results);
+	}
 
-	for (auto& [name, mod] : g_state.modules) {
-		if (!mod.built) continue;
-		auto it = mod.from_index.find(addr);
-		if (it != mod.from_index.end()) {
-			for (auto& e : it->second)
-				g_state.query_results.push_back(e);
+	if (results.empty()) {
+		if (detail::ensure_module_index_for_addr(addr)) {
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			detail::append_xrefs_from_locked(addr, results);
 		}
 	}
+
+	detail::sort_unique_entries(results);
+
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	g_state.query_results = std::move(results);
+	g_state.query_is_to = false;
+	g_state.query_addr = addr;
 }
 
 inline size_t total_indexed_xrefs()

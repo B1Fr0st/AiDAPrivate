@@ -295,9 +295,75 @@ struct line_layout_t {
     uint64_t              built_fi_state_sig = 0;
     uint64_t              built_at_ns = 0;
     bool                  ready = false;
+    bool                  virtual_flat = false;
 };
 
 static line_layout_t s_layout;
+static constexpr int kVirtualFlatStaticLayoutThreshold = 250000;
+
+template <typename T>
+static void release_layout_vector(std::vector<T>& v) {
+    std::vector<T>().swap(v);
+}
+
+static int saturated_row_count(int banner_lines, int n) {
+    if (n <= 0) return std::max(0, banner_lines);
+    if (banner_lines > INT_MAX - n) return INT_MAX;
+    return banner_lines + n;
+}
+
+static bool should_use_virtual_flat_layout(int n) {
+    return n >= kVirtualFlatStaticLayoutThreshold
+        && function_index::detail::static_pe_active();
+}
+
+static bool layout_uses_virtual_flat() {
+    return s_layout.ready && s_layout.virtual_flat;
+}
+
+static bool layout_instr_hidden(int i) {
+    if (layout_uses_virtual_flat()) return false;
+    return i >= 0
+        && i < static_cast<int>(s_layout.hidden.size())
+        && s_layout.hidden[i] != 0;
+}
+
+static int layout_instr_start_row(int i, int banner_lines) {
+    if (i < 0) return 0;
+    if (layout_uses_virtual_flat()) return s_layout.banner_rows + i;
+    if (s_layout.ready && i < static_cast<int>(s_layout.start_row.size())) {
+        return s_layout.start_row[i];
+    }
+    return banner_lines + i;
+}
+
+static int layout_before_extent_for(int i) {
+    if (layout_uses_virtual_flat()) return 0;
+    return i >= 0 && i < static_cast<int>(s_layout.before_extent.size())
+        ? s_layout.before_extent[i]
+        : 0;
+}
+
+static int layout_before_row_count_for(int i, int fallback) {
+    if (layout_uses_virtual_flat()) return 0;
+    return i >= 0 && i < static_cast<int>(s_layout.before_row_count.size())
+        ? s_layout.before_row_count[i]
+        : fallback;
+}
+
+static int layout_proc_xref_extra_for(int i, int fallback) {
+    if (layout_uses_virtual_flat()) return 0;
+    return i >= 0 && i < static_cast<int>(s_layout.proc_xref_extra.size())
+        ? s_layout.proc_xref_extra[i]
+        : fallback;
+}
+
+static int layout_inline_xref_extra_for(int i, int fallback) {
+    if (layout_uses_virtual_flat()) return 0;
+    return i >= 0 && i < static_cast<int>(s_layout.inline_xref_extra.size())
+        ? s_layout.inline_xref_extra[i]
+        : fallback;
+}
 
 struct layout_row_metrics_t {
     int  before_count = 0;
@@ -393,6 +459,34 @@ static void rebuild_layout(const std::vector<AsmInstr>& instrs,
                            uint64_t fi_sig)
 {
     const int n = static_cast<int>(instrs.size());
+    if (should_use_virtual_flat_layout(n)) {
+        release_layout_vector(s_layout.start_row);
+        release_layout_vector(s_layout.before_extent);
+        release_layout_vector(s_layout.after_extent);
+        release_layout_vector(s_layout.before_row_count);
+        release_layout_vector(s_layout.proc_xref_extra);
+        release_layout_vector(s_layout.inline_label_extra);
+        release_layout_vector(s_layout.inline_xref_extra);
+        release_layout_vector(s_layout.align_extra);
+        release_layout_vector(s_layout.hidden);
+
+        s_layout.total_rows = saturated_row_count(banner_lines, n);
+        s_layout.banner_rows = banner_lines;
+        s_layout.built_gen = cur_gen;
+        s_layout.built_n = n;
+        s_layout.built_addr_first = (n > 0) ? instrs.front().addr : 0;
+        s_layout.built_addr_last  = (n > 0) ? instrs.back().addr  : 0;
+        s_layout.built_fi_state_sig = fi_sig;
+        s_layout.built_at_ns = now_ns();
+        s_layout.ready = true;
+        s_layout.virtual_flat = true;
+        diag::log_tagged_fmt("disasm_view",
+            "rebuild_layout_virtual_flat n=%d threshold=%d total_rows=%d",
+            n, kVirtualFlatStaticLayoutThreshold, s_layout.total_rows);
+        return;
+    }
+
+    s_layout.virtual_flat = false;
     s_layout.start_row.assign(static_cast<size_t>(n), 0);
     s_layout.before_extent.assign(static_cast<size_t>(n), 0);
     s_layout.after_extent.assign(static_cast<size_t>(n), 0);
@@ -468,23 +562,36 @@ static void rebuild_layout(const std::vector<AsmInstr>& instrs,
 }
 
 static inline int layout_instr_row_height(int i) {
-    if (i < 0 || i >= static_cast<int>(s_layout.start_row.size())) return 1;
+    if (i < 0) return 1;
+    if (layout_uses_virtual_flat()) return 1;
+    if (i >= static_cast<int>(s_layout.start_row.size())) return 1;
     if (s_layout.hidden[i]) return 0;
     return 1 + s_layout.align_extra[i] + s_layout.after_extent[i];
 }
 
 static inline int layout_instr_block_start(int i) {
-    if (i < 0 || i >= static_cast<int>(s_layout.start_row.size())) return 0;
+    if (i < 0) return 0;
+    if (layout_uses_virtual_flat()) return s_layout.banner_rows + i;
+    if (i >= static_cast<int>(s_layout.start_row.size())) return 0;
     return s_layout.start_row[i] - s_layout.before_extent[i];
 }
 
 static inline int layout_instr_block_end(int i) {
-    if (i < 0 || i >= static_cast<int>(s_layout.start_row.size())) return 0;
+    if (i < 0) return 0;
+    if (layout_uses_virtual_flat()) return s_layout.banner_rows + i + 1;
+    if (i >= static_cast<int>(s_layout.start_row.size())) return 0;
     if (s_layout.hidden[i]) return s_layout.start_row[i];
     return s_layout.start_row[i] + 1 + s_layout.align_extra[i] + s_layout.after_extent[i];
 }
 
 static int layout_first_visible_instr(int first_vrow, int banner_lines) {
+    if (layout_uses_virtual_flat()) {
+        if (s_layout.built_n <= 0) return -1;
+        int row = first_vrow - s_layout.banner_rows;
+        if (row < 0) row = 0;
+        if (row >= s_layout.built_n) row = s_layout.built_n - 1;
+        return row;
+    }
     const int n = static_cast<int>(s_layout.start_row.size());
     if (n <= 0) return -1;
     if (first_vrow < banner_lines) return 0;
@@ -505,6 +612,13 @@ static int layout_first_visible_instr(int first_vrow, int banner_lines) {
 }
 
 static int layout_last_visible_instr(int last_vrow) {
+    if (layout_uses_virtual_flat()) {
+        if (s_layout.built_n <= 0) return -1;
+        int row = last_vrow - s_layout.banner_rows;
+        if (row < 0) row = 0;
+        if (row >= s_layout.built_n) row = s_layout.built_n - 1;
+        return row;
+    }
     const int n = static_cast<int>(s_layout.start_row.size());
     if (n <= 0) return -1;
     int lo = 0;
@@ -524,6 +638,9 @@ static int layout_last_visible_instr(int last_vrow) {
 }
 
 static inline float layout_instr_target_scroll_y(int idx, float line_h) {
+    if (layout_uses_virtual_flat() && idx >= 0 && idx < s_layout.built_n) {
+        return static_cast<float>(s_layout.banner_rows + idx) * line_h;
+    }
     if (s_layout.ready && idx >= 0 && idx < static_cast<int>(s_layout.start_row.size())) {
         return static_cast<float>(s_layout.start_row[idx]) * line_h;
     }
@@ -4596,7 +4713,8 @@ void render(float pos_x, float pos_y, float width, float height,
                 static_cast<int>(instrs.size()), banner_lines, cur_gen_for_layout,
                 static_cast<unsigned long long>(fi_sig));
             rebuild_layout(instrs, banner_lines, cur_gen_for_layout, fi_sig);
-            diag::log_tagged_fmt("disasm_view", "rebuild_layout_done total_rows=%d", s_layout.total_rows);
+            diag::log_tagged_fmt("disasm_view", "rebuild_layout_done total_rows=%d virtual_flat=%d",
+                s_layout.total_rows, s_layout.virtual_flat ? 1 : 0);
         }
     }
 
@@ -5117,13 +5235,12 @@ void render(float pos_x, float pos_y, float width, float height,
         ? -1 : std::max(st.sel_anchor, st.sel_extent);
 
     uint64_t align_skip_end = 0;
+    const bool virtual_flat_layout = layout_uses_virtual_flat();
     for (int i = first_row; i <= last_row; i++) {
-        if (s_layout.ready && i < static_cast<int>(s_layout.hidden.size()) && s_layout.hidden[i]) {
+        if (s_layout.ready && layout_instr_hidden(i)) {
             continue;
         }
-        const float instr_row_f = s_layout.ready
-            ? static_cast<float>(s_layout.start_row[i])
-            : static_cast<float>(i + banner_lines);
+        const float instr_row_f = static_cast<float>(layout_instr_start_row(i, banner_lines));
         float y = oy_content + instr_row_f * line_h - st.scroll_y;
         const AsmInstr& ins = instrs[i];
 
@@ -5134,7 +5251,7 @@ void render(float pos_x, float pos_y, float width, float height,
             align_skip_end = 0;
         }
 
-        if (!throttled) {
+        if (!throttled && !virtual_flat_layout) {
             function_index::detail::align_run_t arun;
             if (function_index::is_align_row_start(ins.addr)
                 && function_index::align_run_at(ins.addr, &arun)) {
@@ -5288,9 +5405,7 @@ void render(float pos_x, float pos_y, float width, float height,
         bool in_sel    = (sel_lo >= 0 && i >= sel_lo && i <= sel_hi);
         bool is_cursor = (i == st.selected_row);
 
-        const int before_extent_total = (s_layout.ready && i < static_cast<int>(s_layout.before_extent.size()))
-            ? s_layout.before_extent[i]
-            : 0;
+        const int before_extent_total = layout_before_extent_for(i);
         const int main_subrow_id = before_extent_total;
 
         if (in_sel) {
@@ -5338,7 +5453,7 @@ void render(float pos_x, float pos_y, float width, float height,
         const std::string* inline_label_ptr = nullptr;
         static const std::vector<function_index::injection_row_t> s_empty_inj;
         static const std::string s_empty_str;
-        if (!throttled) {
+        if (!throttled && !virtual_flat_layout) {
             if (!cache.inj_valid) {
                 cache.before_rows = function_index::rows_before(ins.addr);
                 cache.after_rows = function_index::rows_after(ins.addr);
@@ -5578,9 +5693,8 @@ void render(float pos_x, float pos_y, float width, float height,
         };
 
         const auto& before_rows_ref = *before_rows_ptr;
-        const int before_row_cap = (s_layout.ready && i < static_cast<int>(s_layout.before_row_count.size()))
-            ? s_layout.before_row_count[i]
-            : static_cast<int>(before_rows_ref.size());
+        const int before_row_cap = layout_before_row_count_for(
+            i, static_cast<int>(before_rows_ref.size()));
         int slot_idx = 0;
 
         auto slot_y = [&](int slot) -> float {
@@ -5622,9 +5736,8 @@ void render(float pos_x, float pos_y, float width, float height,
                 handle_injection_row_input(yy, br.addr, this_slot);
             }
             if (br.kind == function_index::injection_t::proc_header && xrefs_at_func.size() > 1) {
-                const int reserved_proc_xref = (s_layout.ready && i < static_cast<int>(s_layout.proc_xref_extra.size()))
-                    ? s_layout.proc_xref_extra[i]
-                    : static_cast<int>(xrefs_at_func.size()) - 1;
+                const int reserved_proc_xref = layout_proc_xref_extra_for(
+                    i, static_cast<int>(xrefs_at_func.size()) - 1);
                 int drawn_xref = 0;
                 for (size_t xi = 1; xi < xrefs_at_func.size() && drawn_xref < reserved_proc_xref; ++xi, ++drawn_xref) {
                     const int x_slot = slot_idx++;
@@ -5678,9 +5791,8 @@ void render(float pos_x, float pos_y, float width, float height,
                 handle_injection_row_input(label_y, ins.addr, label_slot);
             }
             if (cache.xref_inline_valid && cache.xref_inline.size() > 1) {
-                const int reserved_inline_xref = (s_layout.ready && i < static_cast<int>(s_layout.inline_xref_extra.size()))
-                    ? s_layout.inline_xref_extra[i]
-                    : static_cast<int>(cache.xref_inline.size()) - 1;
+                const int reserved_inline_xref = layout_inline_xref_extra_for(
+                    i, static_cast<int>(cache.xref_inline.size()) - 1);
                 int drawn_inline = 0;
                 for (size_t xi = 1; xi < cache.xref_inline.size() && drawn_inline < reserved_inline_xref; ++xi, ++drawn_inline) {
                     const int x_slot = slot_idx++;
@@ -6274,12 +6386,8 @@ void render(float pos_x, float pos_y, float width, float height,
             if (btarget == 0) continue;
             int tidx = find_instr_at(btarget, file);
             if (tidx < first_row || tidx > last_row) continue;
-            const float bi_row = (s_layout.ready && bi < static_cast<int>(s_layout.start_row.size()))
-                ? static_cast<float>(s_layout.start_row[bi])
-                : static_cast<float>(bi + banner_lines);
-            const float tidx_row = (s_layout.ready && tidx < static_cast<int>(s_layout.start_row.size()))
-                ? static_cast<float>(s_layout.start_row[tidx])
-                : static_cast<float>(tidx + banner_lines);
+            const float bi_row = static_cast<float>(layout_instr_start_row(bi, banner_lines));
+            const float tidx_row = static_cast<float>(layout_instr_start_row(tidx, banner_lines));
             float fy = oy_content + bi_row * line_h - st.scroll_y + line_h * 0.5f;
             float ty = oy_content + tidx_row * line_h - st.scroll_y + line_h * 0.5f;
             ImU32 bcol;

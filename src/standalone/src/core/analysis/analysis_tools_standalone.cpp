@@ -24,6 +24,7 @@
 #include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cinttypes>
 #include <sstream>
@@ -38,31 +39,99 @@ extern DisasmState g_disasm;
 
 namespace analysis_tools {
 
+static size_t bounded_size_param(const json& params, const char* name, size_t fallback, size_t minimum, size_t maximum)
+{
+	size_t value = fallback;
+	auto it = params.find(name);
+	if (it != params.end()) {
+		if (it->is_number_unsigned()) {
+			value = it->get<size_t>();
+		} else if (it->is_number_integer()) {
+			int64_t signed_value = it->get<int64_t>();
+			if (signed_value >= 0)
+				value = static_cast<size_t>(signed_value);
+		}
+	}
+	if (value < minimum)
+		return minimum;
+	if (value > maximum)
+		return maximum;
+	return value;
+}
+
+static uint32_t bounded_u32_param(const json& params, const char* name, uint32_t fallback, uint32_t minimum, uint32_t maximum)
+{
+	uint32_t value = fallback;
+	auto it = params.find(name);
+	if (it != params.end()) {
+		if (it->is_number_unsigned()) {
+			uint64_t unsigned_value = it->get<uint64_t>();
+			value = unsigned_value > maximum ? maximum : static_cast<uint32_t>(unsigned_value);
+		} else if (it->is_number_integer()) {
+			int64_t signed_value = it->get<int64_t>();
+			if (signed_value >= 0)
+				value = signed_value > static_cast<int64_t>(maximum) ? maximum : static_cast<uint32_t>(signed_value);
+		}
+	}
+	if (value < minimum)
+		return minimum;
+	if (value > maximum)
+		return maximum;
+	return value;
+}
+
 void register_analysis_tools(mcp_standalone::server_t& srv)
 {
 	srv.register_tool({
 		"scan_crypto_constants",
 		"Scan the attached process memory for well-known cryptographic constants (AES S-Box, SHA-256, MD5, CRC32, Blowfish, DES, ChaCha20, Base64, etc).",
-		{},
+		{
+			{"module_filter", "string", "Optional case-insensitive module name substring to scan", false},
+			{"max_regions", "integer", "Maximum committed readable regions to scan (default 4096)", false},
+			{"max_bytes", "integer", "Maximum bytes to scan before stopping (0 = unlimited)", false},
+			{"max_hits", "integer", "Maximum hits before stopping (0 = unlimited)", false},
+			{"timeout_ms", "integer", "Maximum scan time before cancellation (default 60000)", false}
+		},
 		true,
-		[](const json&) -> tool_result_t {
-			diag::log_tagged("analysis", "scan_crypto_constants entry");
+		[](const json& params) -> tool_result_t {
+			crypto_scanner::process_scan_config_t cfg;
+			cfg.module_filter = params.value("module_filter", std::string());
+			cfg.max_regions = params.value("max_regions", static_cast<size_t>(4096));
+			cfg.max_bytes = params.value("max_bytes", static_cast<uint64_t>(0));
+			cfg.max_hits = params.value("max_hits", static_cast<size_t>(0));
+			cfg.timeout_ms = params.value("timeout_ms", static_cast<uint32_t>(60000));
+			if (cfg.timeout_ms == 0 || cfg.timeout_ms > 60000)
+				cfg.timeout_ms = 60000;
+			diag::log_tagged_fmt("analysis", "scan_crypto_constants entry module_filter='%s' max_regions=%zu max_bytes=%llu max_hits=%zu timeout_ms=%u",
+				cfg.module_filter.c_str(),
+				cfg.max_regions,
+				static_cast<unsigned long long>(cfg.max_bytes),
+				cfg.max_hits,
+				cfg.timeout_ms);
 			if (crypto_scanner::g_state.scanning.load()) {
 				diag::log_tagged("analysis", "scan_crypto_constants refused already_scanning");
 				return tool_result_t::error("A crypto scan is already in progress.");
 			}
-			crypto_scanner::scan_process();
+			crypto_scanner::scan_process(cfg);
 			diag::log_tagged("analysis", "scan_crypto_constants scan_process called waiting");
 
 			int wait = 0;
-			while (crypto_scanner::g_state.scanning.load() && wait < 600) {
+			int max_wait = static_cast<int>((cfg.timeout_ms + 99) / 100) + 20;
+			while (crypto_scanner::g_state.scanning.load() && wait < max_wait) {
 				Sleep(100);
 				++wait;
+			}
+			bool timed_out = crypto_scanner::g_state.scanning.load();
+			if (timed_out) {
+				crypto_scanner::cancel();
+				for (int stop_wait = 0; crypto_scanner::g_state.scanning.load() && stop_wait < 50; ++stop_wait)
+					Sleep(100);
 			}
 
 			std::lock_guard<std::mutex> lk(crypto_scanner::g_state.mutex);
 			auto& results = crypto_scanner::g_state.results;
-			diag::log_tagged_fmt("analysis", "scan_crypto_constants complete count=%zu", results.size());
+			diag::log_tagged_fmt("analysis", "scan_crypto_constants complete count=%zu timed_out=%d still_running=%d",
+				results.size(), timed_out ? 1 : 0, crypto_scanner::g_state.scanning.load() ? 1 : 0);
 
 			json arr = json::array();
 			for (auto& r : results) {
@@ -83,6 +152,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			json result;
 			result["count"] = results.size();
 			result["results"] = arr;
+			result["status"] = crypto_scanner::g_state.scanning.load() ? "cancel_requested" : (timed_out ? "cancelled_by_timeout" : "complete");
+			result["timed_out"] = timed_out;
 			return tool_result_t::ok(result);
 		}
 	});
@@ -352,12 +423,16 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		"Automatically decrypt obfuscated strings by emulating functions that reference a suspected encrypted region. Finds xrefs to the region, emulates each referencing function, and captures memory writes that produce printable strings.",
 		{
 			{"region_address", "string", "Hex address of the encrypted string region", true},
-			{"region_size", "integer", "Size of the region in bytes (default: 4096)", false}
+			{"region_size", "integer", "Size of the region in bytes (default: 4096)", false},
+			{"timeout_ms", "integer", "Maximum wait time before cancellation (default: 60000)", false}
 		},
 		true,
 		[](const json& params) -> tool_result_t {
 			std::string addr_str = params.value("region_address", "");
 			uint64_t size = params.value("region_size", 4096);
+			uint32_t timeout_ms = params.value("timeout_ms", static_cast<uint32_t>(60000));
+			if (timeout_ms == 0 || timeout_ms > 60000)
+				timeout_ms = 60000;
 			diag::log_tagged_fmt("analysis", "auto_decrypt_strings entry addr=%s size=%llu",
 				addr_str.c_str(), static_cast<unsigned long long>(size));
 
@@ -377,9 +452,23 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			decrypt_oracle::scan_and_decrypt(addr, size);
 
 			int wait = 0;
-			while (decrypt_oracle::g_state.scanning.load() && wait < 600) {
+			int max_wait = static_cast<int>((timeout_ms + 99) / 100);
+			while (decrypt_oracle::g_state.scanning.load() && wait < max_wait) {
+				if (mcp_standalone::current_call_cancelled()) {
+					decrypt_oracle::g_state.cancel.store(true, std::memory_order_release);
+					xref_engine::cancel_scan();
+					break;
+				}
 				Sleep(100);
 				++wait;
+			}
+
+			bool timed_out = decrypt_oracle::g_state.scanning.load();
+			if (timed_out) {
+				decrypt_oracle::g_state.cancel.store(true, std::memory_order_release);
+				xref_engine::cancel_scan();
+				for (int stop_wait = 0; decrypt_oracle::g_state.scanning.load() && stop_wait < 50; ++stop_wait)
+					Sleep(100);
 			}
 
 			std::lock_guard<std::mutex> lk(decrypt_oracle::g_state.mutex);
@@ -405,6 +494,13 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			json result;
 			result["count"] = results.size();
 			result["results"] = arr;
+			result["timed_out"] = timed_out;
+			if (timed_out) {
+				result["status"] = "timeout";
+				result["cancelled"] = true;
+				result["message"] = "auto_decrypt_strings timed out and cancellation was requested";
+				return tool_result_t::ok(result);
+			}
 			return tool_result_t::ok(result);
 		}
 	});
@@ -506,7 +602,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				ok ? "ok" : "failed", index);
 
 			json result;
-			result["success"] = ok;
+			result["neutralized"] = ok;
 			result["node_index"] = index;
 			if (ok) {
 				std::lock_guard<std::mutex> lk(integrity_hunter::g_state.mutex);
@@ -518,7 +614,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 					result["status"] = "neutralized";
 				}
 			} else {
-				result["error"] = "Failed to neutralize node (no conditional branch found near RIP)";
+				result["status"] = "not_applicable";
+				result["message"] = "No conditional branch was found near the node RIP.";
 			}
 			return tool_result_t::ok(result);
 		}
@@ -556,9 +653,36 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				return tool_result_t::error("Live monitor already active. Stop it first.");
 			}
 
+			if (size <= 0) {
+				diag::log_tagged_fmt("analysis", "start_live_monitor refused invalid_size=%d", size);
+				return tool_result_t::error("size must be positive");
+			}
+
 			diag::log_tagged_fmt("analysis", "start_live_monitor starting addr=0x%llX size=%d name=%s",
 				static_cast<unsigned long long>(addr), size, name.c_str());
 			struct_monitor::start(addr, size, name);
+
+			for (int wait = 0; wait < 60; ++wait) {
+				if (!struct_monitor::g_state.active.load())
+					break;
+				if (struct_monitor::g_state.session.using_page_guard ||
+				    struct_monitor::g_state.session.using_hwbp)
+					break;
+				Sleep(50);
+			}
+
+			bool active = struct_monitor::g_state.active.load();
+			bool page_guard = struct_monitor::g_state.session.using_page_guard;
+			bool hwbp = struct_monitor::g_state.session.using_hwbp;
+			if (!active || (!page_guard && !hwbp)) {
+				diag::log_tagged_fmt("analysis",
+					"start_live_monitor failed backend active=%d page_guard=%d hwbp=%d",
+					active ? 1 : 0, page_guard ? 1 : 0, hwbp ? 1 : 0);
+				struct_monitor::stop();
+				for (int wait = 0; wait < 50 && struct_monitor::g_state.active.load(); ++wait)
+					Sleep(50);
+				return tool_result_t::error("live monitor backend did not become active");
+			}
 
 			json result;
 			char abuf[32];
@@ -566,6 +690,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			result["address"] = abuf;
 			result["size"] = size;
 			result["status"] = "monitoring";
+			result["backend"] = page_guard ? "page_guard" : "hardware_breakpoint";
 			return tool_result_t::ok(result);
 		}
 	});
@@ -573,9 +698,9 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 	srv.register_tool({
 		"stop_live_monitor",
 		"Stop the active live struct monitoring session and return accumulated access data.",
-		{},
+		{{"require_captures", "boolean", "Return an error if no accesses were captured", false}},
 		true,
-		[](const json&) -> tool_result_t {
+		[](const json& params) -> tool_result_t {
 			diag::log_tagged("analysis", "stop_live_monitor entry");
 			if (!struct_monitor::g_state.active.load()) {
 				diag::log_tagged("analysis", "stop_live_monitor refused not_active");
@@ -616,6 +741,10 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			result["total_captures"] = struct_monitor::g_state.total_captures.load();
 			result["unique_offsets"] = accesses.size();
 			result["accesses"] = arr;
+			if (params.value("require_captures", false) && accesses.empty()) {
+				diag::log_tagged("analysis", "stop_live_monitor failed require_captures no_accesses");
+				return tool_result_t::error("live monitor captured no accesses");
+			}
 			return tool_result_t::ok(result);
 		}
 	});
@@ -1074,9 +1203,10 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 	srv.register_tool({
 		"analysis_get_imports",
 		"List the IAT imports of the attached process's main module (module, function name, ordinal, IAT virtual address, bound address).",
-		{},
+		{{"max_entries", "integer", "Maximum imports to return (default 512, max 4096)", false},
+		 {"timeout_ms", "integer", "Maximum parse time before returning partial results (default 2500, max 10000)", false}},
 		true,
-		[](const json&) -> tool_result_t {
+		[](const json& params) -> tool_result_t {
 			diag::log_tagged("analysis", "analysis_get_imports entry");
 			if (driver_bridge::attached_pid() == 0) {
 				diag::log_tagged("analysis", "analysis_get_imports refused no_process");
@@ -1088,10 +1218,17 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				return tool_result_t::error("Module enumeration returned no entries.");
 			}
 			pe_parser::pe_info_t pe;
-			if (!pe_parser::parse(modules.front().base, pe, true)) {
+			if (!pe_parser::parse(modules.front().base, pe, false)) {
 				diag::log_tagged("analysis", "analysis_get_imports failed pe_parse_failed");
 				return tool_result_t::error("pe_parser::parse failed on the main module.");
 			}
+			size_t max_entries = bounded_size_param(params, "max_entries", 512, 1, 4096);
+			uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 2500, 100, 10000);
+			auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+			bool truncated = false;
+			bool parsed = pe_parser::parse_imports(modules.front().base, pe, pe.imports, max_entries, &deadline, &truncated);
+			if (!parsed)
+				truncated = true;
 			json arr = json::array();
 			char buf[32];
 			for (const auto& imp : pe.imports) {
@@ -1109,9 +1246,14 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			json result;
 			result["module"] = modules.front().name;
 			result["count"]  = arr.size();
+			result["truncated"] = truncated;
+			result["parse_complete"] = parsed && !truncated;
+			result["max_entries"] = max_entries;
+			result["timeout_ms"] = timeout_ms;
 			result["imports"] = std::move(arr);
-			diag::log_tagged_fmt("analysis", "analysis_get_imports complete module=%s count=%zu",
-				modules.front().name.c_str(), static_cast<size_t>(result["count"].get<size_t>()));
+			diag::log_tagged_fmt("analysis", "analysis_get_imports complete module=%s count=%zu truncated=%d parsed=%d",
+				modules.front().name.c_str(), static_cast<size_t>(result["count"].get<size_t>()),
+				static_cast<int>(truncated), static_cast<int>(parsed));
 			return tool_result_t::ok(result);
 		}
 	});
@@ -1119,9 +1261,10 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 	srv.register_tool({
 		"analysis_get_exports",
 		"List the exports of the attached process's main module (ordinal, name, RVA, absolute address, forwarder info).",
-		{},
+		{{"max_entries", "integer", "Maximum exports to return (default 512, max 4096)", false},
+		 {"timeout_ms", "integer", "Maximum parse time before returning partial results (default 2500, max 10000)", false}},
 		true,
-		[](const json&) -> tool_result_t {
+		[](const json& params) -> tool_result_t {
 			diag::log_tagged("analysis", "analysis_get_exports entry");
 			if (driver_bridge::attached_pid() == 0) {
 				diag::log_tagged("analysis", "analysis_get_exports refused no_process");
@@ -1133,10 +1276,17 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				return tool_result_t::error("Module enumeration returned no entries.");
 			}
 			pe_parser::pe_info_t pe;
-			if (!pe_parser::parse(modules.front().base, pe, true)) {
+			if (!pe_parser::parse(modules.front().base, pe, false)) {
 				diag::log_tagged("analysis", "analysis_get_exports failed pe_parse_failed");
 				return tool_result_t::error("pe_parser::parse failed on the main module.");
 			}
+			size_t max_entries = bounded_size_param(params, "max_entries", 512, 1, 4096);
+			uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 2500, 100, 10000);
+			auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+			bool truncated = false;
+			bool parsed = pe_parser::parse_exports(modules.front().base, pe, pe.exports, max_entries, &deadline, &truncated);
+			if (!parsed)
+				truncated = true;
 			json arr = json::array();
 			char buf[32];
 			for (const auto& exp : pe.exports) {
@@ -1156,9 +1306,14 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			json result;
 			result["module"]  = modules.front().name;
 			result["count"]   = arr.size();
+			result["truncated"] = truncated;
+			result["parse_complete"] = parsed && !truncated;
+			result["max_entries"] = max_entries;
+			result["timeout_ms"] = timeout_ms;
 			result["exports"] = std::move(arr);
-			diag::log_tagged_fmt("analysis", "analysis_get_exports complete module=%s count=%zu",
-				modules.front().name.c_str(), static_cast<size_t>(result["count"].get<size_t>()));
+			diag::log_tagged_fmt("analysis", "analysis_get_exports complete module=%s count=%zu truncated=%d parsed=%d",
+				modules.front().name.c_str(), static_cast<size_t>(result["count"].get<size_t>()),
+				static_cast<int>(truncated), static_cast<int>(parsed));
 			return tool_result_t::ok(result);
 		}
 	});
@@ -1500,29 +1655,57 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 	srv.register_tool({
 		"crypto_scanner_run",
 		"Trigger a fresh crypto-constant scan over the attached process memory (AES S-Box, SHA, MD5, CRC32, Blowfish, ChaCha20, Base64, etc.). Blocks until the scan worker finishes (up to 60s).",
-		{},
+		{
+			{"module_filter", "string", "Optional case-insensitive module name substring to scan", false},
+			{"max_regions", "integer", "Maximum committed readable regions to scan (default 4096)", false},
+			{"max_bytes", "integer", "Maximum bytes to scan before stopping (0 = unlimited)", false},
+			{"max_hits", "integer", "Maximum hits before stopping (0 = unlimited)", false},
+			{"timeout_ms", "integer", "Maximum scan time before cancellation (default 60000)", false}
+		},
 		false,
-		[](const json&) -> tool_result_t {
-			diag::log_tagged("analysis", "crypto_scanner_run entry");
+		[](const json& params) -> tool_result_t {
+			crypto_scanner::process_scan_config_t cfg;
+			cfg.module_filter = params.value("module_filter", std::string());
+			cfg.max_regions = params.value("max_regions", static_cast<size_t>(4096));
+			cfg.max_bytes = params.value("max_bytes", static_cast<uint64_t>(0));
+			cfg.max_hits = params.value("max_hits", static_cast<size_t>(0));
+			cfg.timeout_ms = params.value("timeout_ms", static_cast<uint32_t>(60000));
+			if (cfg.timeout_ms == 0 || cfg.timeout_ms > 60000)
+				cfg.timeout_ms = 60000;
+			diag::log_tagged_fmt("analysis", "crypto_scanner_run entry module_filter='%s' max_regions=%zu max_bytes=%llu max_hits=%zu timeout_ms=%u",
+				cfg.module_filter.c_str(),
+				cfg.max_regions,
+				static_cast<unsigned long long>(cfg.max_bytes),
+				cfg.max_hits,
+				cfg.timeout_ms);
 			if (crypto_scanner::g_state.scanning.load()) {
 				diag::log_tagged("analysis", "crypto_scanner_run refused already_scanning");
 				return tool_result_t::error("A crypto scan is already in progress.");
 			}
-			crypto_scanner::scan_process();
+			crypto_scanner::scan_process(cfg);
 			diag::log_tagged("analysis", "crypto_scanner_run scan_process called waiting");
 			int wait = 0;
-			while (crypto_scanner::g_state.scanning.load() && wait < 600) {
+			int max_wait = static_cast<int>((cfg.timeout_ms + 99) / 100) + 20;
+			while (crypto_scanner::g_state.scanning.load() && wait < max_wait) {
 				Sleep(100);
 				++wait;
+			}
+			bool timed_out = crypto_scanner::g_state.scanning.load();
+			if (timed_out) {
+				crypto_scanner::cancel();
+				for (int stop_wait = 0; crypto_scanner::g_state.scanning.load() && stop_wait < 50; ++stop_wait)
+					Sleep(100);
 			}
 			std::lock_guard<std::mutex> lk(crypto_scanner::g_state.mutex);
 			json result;
 			bool still_running = crypto_scanner::g_state.scanning.load();
 			result["status"] = still_running ? "still_running" : "complete";
 			result["count"]  = crypto_scanner::g_state.results.size();
-			diag::log_tagged_fmt("analysis", "crypto_scanner_run complete status=%s count=%zu",
+			result["timed_out"] = timed_out;
+			diag::log_tagged_fmt("analysis", "crypto_scanner_run complete status=%s count=%zu timed_out=%d",
 				still_running ? "still_running" : "complete",
-				crypto_scanner::g_state.results.size());
+				crypto_scanner::g_state.results.size(),
+				timed_out ? 1 : 0);
 			return tool_result_t::ok(result);
 		}
 	});

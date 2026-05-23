@@ -74,8 +74,17 @@ std::string ascii_lower(const std::string& v)
 
 bool match_host_pattern(const std::string& pattern, const std::string& host)
 {
-    if (pattern.empty() || pattern == "*") return true;
-    if (pattern == host) return true;
+    const std::string pat = ascii_lower(pattern);
+    const std::string h = ascii_lower(host);
+
+    if (pat.empty() || pat == "*") return true;
+    if (pat == h) return true;
+
+    if (pat.rfind("*.", 0) == 0) {
+        const std::string suffix = pat.substr(1);
+        return h.size() > suffix.size() &&
+               h.compare(h.size() - suffix.size(), suffix.size(), suffix) == 0;
+    }
 
     if (pattern.find_first_of("*?[\\^$+(){}|") != std::string::npos) {
         std::regex re;
@@ -91,16 +100,16 @@ bool match_host_pattern(const std::string& pattern, const std::string& host)
         }
     }
 
-    if (pattern.size() >= 2 && pattern[0] == '.' ) {
-        return host.size() >= pattern.size() - 1 &&
-               host.compare(host.size() - (pattern.size() - 1), pattern.size() - 1, pattern.substr(1)) == 0;
+    if (pat.size() >= 2 && pat[0] == '.' ) {
+        return h.size() >= pat.size() - 1 &&
+               h.compare(h.size() - (pat.size() - 1), pat.size() - 1, pat.substr(1)) == 0;
     }
 
-    if (host.size() >= pattern.size()) {
-        const size_t off = host.size() - pattern.size();
-        if (host.compare(off, pattern.size(), pattern) == 0) {
+    if (h.size() >= pat.size()) {
+        const size_t off = h.size() - pat.size();
+        if (h.compare(off, pat.size(), pat) == 0) {
             if (off == 0) return true;
-            if (host[off - 1] == '.') return true;
+            if (h[off - 1] == '.') return true;
         }
     }
     return false;

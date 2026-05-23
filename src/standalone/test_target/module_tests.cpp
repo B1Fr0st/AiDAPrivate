@@ -1,4 +1,5 @@
 #include "module_tests.h"
+#include "test_log.h"
 #include <cstdio>
 #include <cstring>
 #include <TlHelp32.h>

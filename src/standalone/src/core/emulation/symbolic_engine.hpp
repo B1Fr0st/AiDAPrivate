@@ -322,7 +322,7 @@ inline symbolic_result_t execute_symbolic(
 			auto parent_id = ctx.getParentRegister(reg).getId();
 			if (!seen_parents_this_insn.insert(parent_id).second) continue;
 			auto ast = ctx.getRegisterAst(ctx.getRegister(parent_id));
-			if (!ast || !ast->isSymbolized()) continue;
+			if (!ast) continue;
 			auto simplified = ctx.simplify(ast, true);
 			if (simplified && simplified->getType() == triton::ast::BV_NODE) {
 				uint64_t val = static_cast<uint64_t>(simplified->evaluate());

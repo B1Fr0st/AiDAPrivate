@@ -1,4 +1,5 @@
 #include "traffic_generator.h"
+#include "test_log.h"
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
@@ -833,8 +834,12 @@ static DWORD WINAPI websocket_thread(LPVOID param) {
     return 0;
 }
 
-static DWORD WINAPI multiport_thread(LPVOID param) {
-    if (!ensure_wsa_thread()) return 1;
+static DWORD multiport_thread_impl(LPVOID param) {
+    (void)param;
+    if (!ensure_wsa_thread()) {
+        log("multiport WSAStartup failed err=%d", WSAGetLastError());
+        return 1;
+    }
     log("multiport worker started");
 
     uint32_t round = 0;
@@ -855,20 +860,37 @@ static DWORD WINAPI multiport_thread(LPVOID param) {
                 clients[i] = connect_loopback(ports[i]);
                 if (clients[i] != INVALID_SOCKET) {
                     servers[i] = accept_with_timeout(listeners[i], 1);
-                    if (servers[i] != INVALID_SOCKET) active++;
+                    if (servers[i] != INVALID_SOCKET) {
+                        active++;
+                    } else {
+                        log("multiport round=%u idx=%d port=%u accept failed err=%d",
+                            round, i, ports[i], WSAGetLastError());
+                    }
+                } else {
+                    log("multiport round=%u idx=%d port=%u connect failed err=%d",
+                        round, i, ports[i], WSAGetLastError());
                 }
+            } else {
+                log("multiport round=%u idx=%d port=%u listen failed err=%d",
+                    round, i, ports[i], WSAGetLastError());
             }
         }
-        log("multiport opened %d concurrent connections", active);
+        log("multiport round=%u opened %d concurrent connections", round, active);
 
         for (int i = 0; i < kPairs; ++i) {
             if (clients[i] != INVALID_SOCKET && servers[i] != INVALID_SOCKET) {
                 char msg[128];
                 int len = sprintf_s(msg, sizeof(msg), "AIDA_MULTIPORT port=%u idx=%d round=%u", ports[i], i, round);
-                send_all(clients[i], msg, len);
+                int sent = send_all(clients[i], msg, len);
                 char rb[128]{};
                 int n = recv(servers[i], rb, sizeof(rb) - 1, 0);
-                if (n > 0) log("multiport port=%u exchanged %d bytes", ports[i], n);
+                if (n > 0) {
+                    log("multiport round=%u port=%u sent=%d/%d recv=%d bytes",
+                        round, ports[i], sent, len, n);
+                } else {
+                    log("multiport round=%u port=%u sent=%d/%d recv=%d err=%d",
+                        round, ports[i], sent, len, n, WSAGetLastError());
+                }
             }
         }
 
@@ -877,14 +899,26 @@ static DWORD WINAPI multiport_thread(LPVOID param) {
             if (servers[i] != INVALID_SOCKET) closesocket(servers[i]);
             if (listeners[i] != INVALID_SOCKET) closesocket(listeners[i]);
         }
-        log("multiport closed %d connections", active);
+        log("multiport round=%u closed %d connections", round, active);
 
         round++;
+        log("multiport before sleep next_round=%u sleep_ms=%u", round, s_cfg.rate_ms * 2);
         interruptible_sleep(s_cfg.rate_ms * 2);
+        log("multiport after sleep round=%u running=%d", round, running_now() ? 1 : 0);
     }
 
     log("multiport worker stopped");
     return 0;
+}
+
+static DWORD WINAPI multiport_thread(LPVOID param) {
+    __try {
+        return multiport_thread_impl(param);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        DWORD code = GetExceptionCode();
+        log("multiport worker crashed code=0x%08lX", static_cast<unsigned long>(code));
+        return code;
+    }
 }
 
 void run_all(const config_t& cfg, std::atomic<bool>& running) {
@@ -934,10 +968,17 @@ void shutdown_all() {
     log("shutting down traffic generator workers...");
 
     if (s_thread_used > 0) {
-        WaitForMultipleObjects(s_thread_used, s_threads, TRUE, 8000);
+        DWORD wr = WaitForMultipleObjects(s_thread_used, s_threads, TRUE, 8000);
+        log("traffic generator wait result=0x%08lX workers=%d err=%lu",
+            static_cast<unsigned long>(wr), s_thread_used,
+            wr == WAIT_FAILED ? static_cast<unsigned long>(GetLastError()) : 0UL);
     }
     for (int i = 0; i < s_thread_used; ++i) {
         if (s_threads[i]) {
+            DWORD exit_code = STILL_ACTIVE;
+            BOOL got_exit = GetExitCodeThread(s_threads[i], &exit_code);
+            log("traffic worker[%d] exit_code_known=%d exit_code=0x%08lX",
+                i, got_exit ? 1 : 0, static_cast<unsigned long>(exit_code));
             CloseHandle(s_threads[i]);
             s_threads[i] = nullptr;
         }

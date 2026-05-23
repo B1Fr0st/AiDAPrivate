@@ -2,7 +2,9 @@
 
 #include <atomic>
 #include "work_queue.hpp"
+#include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -553,7 +555,15 @@ inline const char* category_name(crypto_category_t cat)
 
 inline void auto_label_references();
 
-inline void scan_process()
+struct process_scan_config_t {
+	size_t      max_regions = 4096;
+	uint64_t    max_bytes = 0;
+	size_t      max_hits = 0;
+	uint32_t    timeout_ms = 0;
+	std::string module_filter;
+};
+
+inline void scan_process(const process_scan_config_t& cfg)
 {
 	if (g_state.scanning.load()) {
 		diag::log_tagged("crypto_scan", "scan_process refused already_scanning");
@@ -564,7 +574,13 @@ inline void scan_process()
 			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
 		return;
 	}
-	diag::log_tagged_fmt("crypto_scan", "scan_process start pid=%u", driver_bridge::attached_pid());
+	diag::log_tagged_fmt("crypto_scan", "scan_process start pid=%u max_regions=%zu max_bytes=%llu max_hits=%zu timeout_ms=%u module_filter='%s'",
+		driver_bridge::attached_pid(),
+		cfg.max_regions,
+		static_cast<unsigned long long>(cfg.max_bytes),
+		cfg.max_hits,
+		cfg.timeout_ms,
+		cfg.module_filter.c_str());
 
 	g_state.scanning.store(true);
 	g_state.cancel.store(false);
@@ -575,9 +591,12 @@ inline void scan_process()
 		g_state.active = true;
 	}
 
-	work_queue::post([]() {
+	work_queue::post([cfg]() {
 		auto t_start = std::chrono::steady_clock::now();
 		auto signatures = get_signatures();
+		std::string module_filter = cfg.module_filter;
+		for (char& c : module_filter)
+			c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
 
 		std::vector<custom_signature_t> custom_copy;
 		{
@@ -609,38 +628,76 @@ inline void scan_process()
 
 		std::vector<driver_bridge::memory_region_t> scan_regions;
 		for (auto& r : regions) {
+			if (cfg.max_regions != 0 && scan_regions.size() >= cfg.max_regions) break;
 			if (r.state != 0x1000) continue;
 			if (r.protect & 0x100) continue;
 			uint32_t prot = r.protect & 0xFF;
 			if (prot == 0x01 || prot == 0x00) continue;
 			if (r.size > 0x10000000) continue;
+			if (!module_filter.empty()) {
+				auto mod = find_module(r.base);
+				std::string mod_name = mod.first;
+				for (char& c : mod_name)
+					c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+				if (mod_name.find(module_filter) == std::string::npos)
+					continue;
+			}
 			scan_regions.push_back(r);
 		}
 
 		uint64_t total_bytes = 0;
-		for (auto& r : scan_regions) total_bytes += r.size;
+		for (auto& r : scan_regions) {
+			uint64_t remaining_cap = cfg.max_bytes == 0 || total_bytes >= cfg.max_bytes
+				? r.size
+				: cfg.max_bytes - total_bytes;
+			uint64_t accounted = (std::min)(r.size, remaining_cap);
+			total_bytes += accounted;
+			if (cfg.max_bytes != 0 && total_bytes >= cfg.max_bytes)
+				break;
+		}
 		if (total_bytes == 0) total_bytes = 1;
 		uint64_t scanned = 0;
+		size_t hit_count_live = 0;
 
 		for (auto& region : scan_regions) {
 			if (g_state.cancel.load()) break;
+			if (cfg.timeout_ms != 0) {
+				auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now() - t_start).count();
+				if (elapsed_ms >= cfg.timeout_ms) {
+					g_state.cancel.store(true);
+					break;
+				}
+			}
+			if (cfg.max_bytes != 0 && scanned >= cfg.max_bytes) break;
 
 			std::vector<uint8_t> data;
-			driver_bridge::read_memory(region.base, static_cast<size_t>(region.size), data);
+			uint64_t remaining = cfg.max_bytes == 0 ? region.size : cfg.max_bytes - scanned;
+			uint64_t read_size64 = (std::min)(region.size, remaining);
+			size_t read_size = static_cast<size_t>((std::min)(read_size64, static_cast<uint64_t>(0x10000000)));
+			driver_bridge::read_memory(region.base, read_size, data);
 			if (data.empty()) {
-				scanned += region.size;
+				scanned += read_size64;
 				g_state.progress.store(static_cast<float>(scanned) / static_cast<float>(total_bytes));
 				continue;
 			}
 
 			for (auto& sig : signatures) {
 				if (g_state.cancel.load()) break;
+				if (cfg.max_hits != 0 && hit_count_live >= cfg.max_hits) {
+					g_state.cancel.store(true);
+					break;
+				}
 
 				auto hits = detail::find_pattern_in_region(
 					data.data(), data.size(), region.base,
 					sig.pattern, sig.min_match);
 
 				for (auto hit_addr : hits) {
+					if (cfg.max_hits != 0 && hit_count_live >= cfg.max_hits) {
+						g_state.cancel.store(true);
+						break;
+					}
 					auto [mod_name, mod_offset] = find_module(hit_addr);
 
 					crypto_hit_t hit;
@@ -659,14 +716,16 @@ inline void scan_process()
 
 					std::lock_guard<std::mutex> lk(g_state.mutex);
 					g_state.results.push_back(std::move(hit));
+					++hit_count_live;
 				}
 			}
 
-			scanned += region.size;
+			scanned += read_size64;
 			g_state.progress.store(static_cast<float>(scanned) / static_cast<float>(total_bytes));
 		}
 
-		auto_label_references();
+		if (!g_state.cancel.load())
+			auto_label_references();
 
 		auto t_end = std::chrono::steady_clock::now();
 		uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
@@ -682,6 +741,12 @@ inline void scan_process()
 
 		g_state.scanning.store(false);
 	});
+}
+
+inline void scan_process()
+{
+	process_scan_config_t cfg;
+	scan_process(cfg);
 }
 
 inline void scan_file(const DisasmFile& file)

@@ -12,6 +12,7 @@ endif()
 
 add_executable(AiDA_TestTarget
     "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/test_log.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/network_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/memory_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/thread_tests.cpp"

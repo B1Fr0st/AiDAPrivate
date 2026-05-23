@@ -37,6 +37,83 @@ namespace {
 		return std::string(b);
 	}
 
+	BOOL CALLBACK init_test_winsock_once(PINIT_ONCE, PVOID parameter, PVOID*) {
+		bool* ok = static_cast<bool*>(parameter);
+		WSADATA d{};
+		*ok = (WSAStartup(MAKEWORD(2, 2), &d) == 0);
+		return TRUE;
+	}
+
+	bool ensure_test_winsock_ready() {
+		static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+		static bool ok = false;
+		if (!InitOnceExecuteOnce(&once, init_test_winsock_once, &ok, nullptr))
+			return false;
+		return ok;
+	}
+
+	std::wstring ascii_to_wide(const char* s) {
+		std::wstring out;
+		if (!s)
+			return out;
+		while (*s) {
+			out.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*s)));
+			++s;
+		}
+		return out;
+	}
+
+	struct dns_query_context_t {
+		OVERLAPPED overlapped{};
+		PADDRINFOEXW result = nullptr;
+		HANDLE event = nullptr;
+		DWORD error = WSA_OPERATION_ABORTED;
+		bool had_result = false;
+	};
+
+	void CALLBACK dns_query_complete(DWORD error, DWORD, LPWSAOVERLAPPED overlapped) {
+		dns_query_context_t* ctx = CONTAINING_RECORD(overlapped, dns_query_context_t, overlapped);
+		ctx->error = error;
+		ctx->had_result = (ctx->result != nullptr);
+		if (ctx->result != nullptr) {
+			FreeAddrInfoExW(ctx->result);
+			ctx->result = nullptr;
+		}
+		if (ctx->event != nullptr)
+			SetEvent(ctx->event);
+	}
+
+	bool resolve_host_with_timeout(const char* host, int timeout_ms) {
+		std::wstring host_w = ascii_to_wide(host);
+		if (host_w.empty())
+			return false;
+
+		ADDRINFOEXW hints{};
+		hints.ai_family = AF_UNSPEC;
+		hints.ai_socktype = SOCK_STREAM;
+		dns_query_context_t ctx{};
+		ctx.event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+		if (ctx.event == nullptr)
+			return false;
+
+		HANDLE cancel_handle = nullptr;
+		int rc = GetAddrInfoExW(host_w.c_str(), nullptr, NS_DNS, nullptr, &hints, &ctx.result, nullptr, &ctx.overlapped, dns_query_complete, &cancel_handle);
+		if (rc != WSA_IO_PENDING) {
+			dns_query_complete(static_cast<DWORD>(rc), 0, &ctx.overlapped);
+		} else {
+			DWORD wait_ms = timeout_ms > 0 ? static_cast<DWORD>(timeout_ms) : 1u;
+			if (WaitForSingleObject(ctx.event, wait_ms) == WAIT_TIMEOUT) {
+				if (cancel_handle != nullptr)
+					GetAddrInfoExCancel(&cancel_handle);
+				WaitForSingleObject(ctx.event, INFINITE);
+			}
+		}
+
+		bool ok = (ctx.error == ERROR_SUCCESS && ctx.had_result);
+		CloseHandle(ctx.event);
+		return ok;
+	}
+
 	std::string fmt_u64(std::uint64_t v) {
 		char b[32];
 		std::snprintf(b, sizeof(b), "%llu", static_cast<unsigned long long>(v));
@@ -63,12 +140,9 @@ namespace {
 	struct wsa_guard_t {
 		bool ok = false;
 		wsa_guard_t() {
-			WSADATA d{};
-			ok = (WSAStartup(MAKEWORD(2, 2), &d) == 0);
+			ok = ensure_test_winsock_ready();
 		}
-		~wsa_guard_t() {
-			if (ok) WSACleanup();
-		}
+		~wsa_guard_t() = default;
 		wsa_guard_t(const wsa_guard_t&) = delete;
 		wsa_guard_t& operator=(const wsa_guard_t&) = delete;
 	};
@@ -171,6 +245,83 @@ namespace {
 		}
 		closesocket(s);
 		return initiated;
+	}
+
+	bool issue_udp_dns_probe_to_one_one(const char* host, std::string& diag) {
+		wsa_guard_t g;
+		if (!g.ok) {
+			diag = "WSAStartup failed";
+			return false;
+		}
+		if (host == nullptr || host[0] == '\0') {
+			diag = "empty DNS host";
+			return false;
+		}
+
+		std::vector<unsigned char> packet;
+		packet.reserve(512);
+		const std::uint16_t qid = static_cast<std::uint16_t>(GetTickCount() & 0xffffu);
+		packet.push_back(static_cast<unsigned char>(qid >> 8));
+		packet.push_back(static_cast<unsigned char>(qid & 0xff));
+		packet.push_back(0x01);
+		packet.push_back(0x00);
+		packet.push_back(0x00);
+		packet.push_back(0x01);
+		packet.push_back(0x00);
+		packet.push_back(0x00);
+		packet.push_back(0x00);
+		packet.push_back(0x00);
+		packet.push_back(0x00);
+		packet.push_back(0x00);
+
+		const char* label = host;
+		while (*label) {
+			const char* dot = std::strchr(label, '.');
+			std::size_t len = dot ? static_cast<std::size_t>(dot - label) : std::strlen(label);
+			if (len == 0 || len > 63 || packet.size() + len + 6 > 512) {
+				diag = "DNS host label invalid";
+				return false;
+			}
+			packet.push_back(static_cast<unsigned char>(len));
+			for (std::size_t i = 0; i < len; ++i)
+				packet.push_back(static_cast<unsigned char>(label[i]));
+			if (!dot)
+				break;
+			label = dot + 1;
+		}
+		packet.push_back(0x00);
+		packet.push_back(0x00);
+		packet.push_back(0x01);
+		packet.push_back(0x00);
+		packet.push_back(0x01);
+
+		SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+		if (s == INVALID_SOCKET) {
+			diag = "DNS UDP socket failed";
+			return false;
+		}
+		sockaddr_in dst{};
+		dst.sin_family = AF_INET;
+		dst.sin_port = htons(53);
+		dst.sin_addr.s_addr = htonl(0x01010101u);
+		int sent = sendto(s,
+			reinterpret_cast<const char*>(packet.data()),
+			static_cast<int>(packet.size()),
+			0,
+			reinterpret_cast<sockaddr*>(&dst),
+			sizeof(dst));
+		int err = (sent == SOCKET_ERROR) ? WSAGetLastError() : 0;
+		closesocket(s);
+		if (sent == SOCKET_ERROR) {
+			char b[80];
+			std::snprintf(b, sizeof(b), "DNS UDP sendto err=%d", err);
+			diag = b;
+			return false;
+		}
+		char b[96];
+		std::snprintf(b, sizeof(b), "DNS UDP query host=%s bytes=%d id=%u", host, sent, qid);
+		diag = b;
+		return true;
 	}
 
 	void render_inputs_empty(test_lab::state_t& s) {
@@ -322,9 +473,28 @@ namespace {
 		r.parsed.push_back({ "baseline_dns_entry_count", fmt_u32(baseline_total) });
 		std::free(baseline);
 
+		voyager::detail::net_cap_ctrl_request start_req{};
+		start_req.operation = 0u;
+		start_req.filter_pid = 0u;
+		start_req.filter_port = 53u;
+		start_req.filter_protocol = 17u;
+		start_req.max_packet_bytes = 512u;
+		std::uint32_t br_start = 0;
+		bool cap_started = device->send_ioctl_raw(ioctl_codes::NCAP(), &start_req, sizeof(start_req), br_start);
+		r.parsed.push_back({ "dns_capture_start_ok", cap_started ? "1" : "0" });
+		r.parsed.push_back({ "dns_capture_filter_pid", "0" });
+		r.parsed.push_back({ "dns_probe_owner_pid", fmt_u32(self_pid) });
+		if (!cap_started) {
+			r.ok = false;
+			r.error = "NCAP start failed before DNS probe";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			ctx->done = true;
+			return 0;
+		}
+
 		static const char* kCandidateHosts[] = {
 			"aida-testlab-probe.invalid",
-			"localhost",
+			"aida-testlab-dns.invalid",
 			"www.microsoft.com"
 		};
 		const std::size_t kCandidateHostCount = sizeof(kCandidateHosts) / sizeof(kCandidateHosts[0]);
@@ -335,41 +505,15 @@ namespace {
 		for (std::size_t i = 0; i < kCandidateHostCount; ++i) {
 			const char* host = kCandidateHosts[i];
 
-			struct gai_ctx_t {
-				const char* host;
-				int result;
-				addrinfo* info;
-			};
-			gai_ctx_t gai_state{ host, 0, nullptr };
-
-			HANDLE gai_thread = CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
-				gai_ctx_t* gc = static_cast<gai_ctx_t*>(p);
-				addrinfo hints{};
-				hints.ai_family = AF_UNSPEC;
-				hints.ai_socktype = SOCK_STREAM;
-				gc->result = getaddrinfo(gc->host, nullptr, &hints, &gc->info);
-				return 0;
-			}, &gai_state, 0, nullptr);
-
-			bool lookup_ok = false;
-			if (gai_thread != nullptr) {
-				DWORD wait_rc = WaitForSingleObject(gai_thread, 2000);
-				if (wait_rc == WAIT_OBJECT_0) {
-					if (gai_state.result == 0) {
-						lookup_ok = true;
-						if (gai_state.info != nullptr) {
-							freeaddrinfo(gai_state.info);
-							gai_state.info = nullptr;
-						}
-					}
-				}
-				CloseHandle(gai_thread);
-			}
+			std::string udp_diag;
+			bool lookup_ok = issue_udp_dns_probe_to_one_one(host, udp_diag);
+			if (!lookup_ok)
+				lookup_ok = resolve_host_with_timeout(host, 2000);
 
 			char label[40];
 			std::snprintf(label, sizeof(label), "step1_gai[%zu]", i);
 			char val[200];
-			std::snprintf(val, sizeof(val), "host=%s ok=%d", host, lookup_ok ? 1 : 0);
+			std::snprintf(val, sizeof(val), "host=%s ok=%d %s", host, lookup_ok ? 1 : 0, udp_diag.c_str());
 			r.parsed.push_back({ std::string(label), std::string(val) });
 			if (!attempted_hosts.empty()) attempted_hosts.append(",");
 			attempted_hosts.append(host);
@@ -381,12 +525,15 @@ namespace {
 
 		std::uint32_t after_total = 0u;
 		std::uint32_t matches_name_and_pid = 0u;
+		std::uint32_t matches_name_any_pid = 0u;
+		std::uint32_t matches_name_self_or_unknown_pid = 0u;
 		std::uint32_t any_self_pid_rows = 0u;
+		std::uint32_t unknown_pid_rows = 0u;
 		std::uint32_t printed = 0u;
 		const std::uint32_t print_cap = 8u;
 		std::string matched_host;
 
-		for (int attempt = 0; attempt < 3; ++attempt) {
+		for (int attempt = 0; attempt < 10; ++attempt) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
 			voyager::detail::net_dns_get_request* req =
@@ -414,66 +561,88 @@ namespace {
 			std::uint32_t cap = after_total;
 			if (cap > voyager::detail::NET_DNS_GET_MAX) cap = static_cast<std::uint32_t>(voyager::detail::NET_DNS_GET_MAX);
 			matches_name_and_pid = 0u;
+			matches_name_any_pid = 0u;
+			matches_name_self_or_unknown_pid = 0u;
 			any_self_pid_rows = 0u;
+			unknown_pid_rows = 0u;
 			for (std::uint32_t i = 0; i < cap; ++i) {
 				const auto& e = req->entries[i];
 				char dom[261];
 				std::memcpy(dom, e.domain, 260);
 				dom[260] = '\0';
 				bool pid_match = (e.pid == self_pid);
+				bool pid_unknown = (e.pid == 0u);
+				bool pid_accepted = pid_match || pid_unknown;
 				if (pid_match) ++any_self_pid_rows;
+				if (pid_unknown) ++unknown_pid_rows;
 				bool name_match = false;
 				for (std::size_t h = 0; h < kCandidateHostCount; ++h) {
 					if (std::strstr(dom, kCandidateHosts[h]) != nullptr) {
 						name_match = true;
-						if (pid_match && matched_host.empty()) matched_host = kCandidateHosts[h];
+						if (pid_accepted && matched_host.empty()) matched_host = kCandidateHosts[h];
 						break;
 					}
 				}
+				if (name_match) ++matches_name_any_pid;
 				if (name_match && pid_match) ++matches_name_and_pid;
-				if (attempt == 2 && name_match && printed < print_cap) {
+				if (name_match && pid_accepted) ++matches_name_self_or_unknown_pid;
+				if (attempt == 9 && name_match && printed < print_cap) {
 					char label[24];
 					std::snprintf(label, sizeof(label), "dns[%u]", i);
 					char val[384];
 					std::snprintf(val, sizeof(val),
-						"ts=%llu pid=%u type=%u rcode=%u ttl=%u %s -> %s pid_match=%u",
+						"ts=%llu pid=%u type=%u rcode=%u ttl=%u %s -> %s pid_match=%u pid_unknown=%u",
 						static_cast<unsigned long long>(e.timestamp),
 						e.pid, e.query_type, e.response_code, e.ttl,
 						dom,
 						fmt_ip_v4(e.resolved_addr).c_str(),
-						pid_match ? 1u : 0u);
+						pid_match ? 1u : 0u,
+						pid_unknown ? 1u : 0u);
 					r.parsed.push_back({ std::string(label), std::string(val) });
 					++printed;
 				}
 			}
 			std::free(req);
-			if (matches_name_and_pid > 0u || any_self_pid_rows > 0u) break;
+			if (matches_name_self_or_unknown_pid > 0u) break;
 		}
+
+		voyager::detail::net_cap_ctrl_request stop_req{};
+		stop_req.operation = 1u;
+		std::uint32_t br_stop = 0;
+		device->send_ioctl_raw(ioctl_codes::NCAP(), &stop_req, sizeof(stop_req), br_stop);
+		r.parsed.push_back({ "dns_capture_stop_ok", "1" });
 
 		r.parsed.push_back({ "dns_entry_count_total", fmt_u32(after_total) });
 		r.parsed.push_back({ "matches_name_and_pid", fmt_u32(matches_name_and_pid) });
+		r.parsed.push_back({ "matches_name_any_pid", fmt_u32(matches_name_any_pid) });
+		r.parsed.push_back({ "matches_name_self_or_unknown_pid", fmt_u32(matches_name_self_or_unknown_pid) });
 		r.parsed.push_back({ "any_self_pid_rows", fmt_u32(any_self_pid_rows) });
+		r.parsed.push_back({ "unknown_pid_rows", fmt_u32(unknown_pid_rows) });
 		if (!matched_host.empty()) {
 			r.parsed.push_back({ "matched_host", matched_host });
 		}
 		const std::uint32_t delta = (after_total >= baseline_total) ? (after_total - baseline_total) : 0u;
 		r.parsed.push_back({ "delta_dns_entries", fmt_u32(delta) });
 
-		if (matches_name_and_pid > 0u) {
+		if (matches_name_self_or_unknown_pid > 0u) {
 			r.ntstatus = 0;
 			r.ok = true;
+		} else if (matches_name_any_pid > 0u) {
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			r.ok = false;
+			r.error = "DNS logger captured probe hostnames but attributed them to a different nonzero PID";
 		} else if (any_self_pid_rows > 0u) {
-			r.ntstatus = 0;
-			r.ok = true;
-			r.error.clear();
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			r.ok = false;
+			r.error = "DNS logger captured self-PID rows but none contained the probe hostnames";
 		} else if (delta > 0u && after_total > 0u) {
-			r.ntstatus = 0;
-			r.ok = true;
-			r.error.clear();
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			r.ok = false;
+			r.error = "DNS table changed during probe but no row matched both current PID and probe hostname";
 		} else {
-			r.ntstatus = 0;
-			r.ok = true;
-			r.error = "DNS logging not capturing self-PID queries; may need external traffic";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			r.ok = false;
+			r.error = "DNS logging did not capture the current process DNS probes";
 		}
 
 		ctx->done = true;
@@ -503,10 +672,32 @@ namespace {
 		(void)s;
 		if (!ensure_driver(r)) return;
 
+		const std::uint32_t self_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
+		voyager::detail::net_cap_ctrl_request start_req{};
+		start_req.operation = 0u;
+		start_req.filter_pid = self_pid;
+		start_req.filter_port = 0u;
+		start_req.filter_protocol = 0u;
+		start_req.max_packet_bytes = 1500u;
+		std::uint32_t br_start = 0;
+		bool cap_started = device->send_ioctl_raw(ioctl_codes::NCAP(), &start_req, sizeof(start_req), br_start);
+		r.parsed.push_back({ "stats_capture_start_ok", cap_started ? "1" : "0" });
+		r.parsed.push_back({ "stats_capture_filter_pid", fmt_u32(self_pid) });
+		if (!cap_started) {
+			r.ok = false;
+			r.error = "NCAP start failed before NSTS probe";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			return;
+		}
+
 		voyager::detail::net_stats_request base_req{};
 		std::uint32_t br1 = 0;
 		bool ok1 = device->send_ioctl_raw(ioctl_codes::NSTS(), &base_req, sizeof(base_req), br1);
 		if (!ok1) {
+			voyager::detail::net_cap_ctrl_request stop_req{};
+			stop_req.operation = 1u;
+			std::uint32_t br_stop = 0;
+			device->send_ioctl_raw(ioctl_codes::NCAP(), &stop_req, sizeof(stop_req), br_stop);
 			r.ok = false;
 			r.error = "NSTS baseline ioctl failed";
 			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
@@ -531,11 +722,20 @@ namespace {
 		bool ok2 = device->send_ioctl_raw(ioctl_codes::NSTS(), &after_req, sizeof(after_req), br2);
 		r.bytes_returned = br2;
 		if (!ok2) {
+			voyager::detail::net_cap_ctrl_request stop_req{};
+			stop_req.operation = 1u;
+			std::uint32_t br_stop = 0;
+			device->send_ioctl_raw(ioctl_codes::NCAP(), &stop_req, sizeof(stop_req), br_stop);
 			r.ok = false;
 			r.error = "NSTS post-traffic ioctl failed";
 			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 			return;
 		}
+		voyager::detail::net_cap_ctrl_request stop_req{};
+		stop_req.operation = 1u;
+		std::uint32_t br_stop = 0;
+		device->send_ioctl_raw(ioctl_codes::NCAP(), &stop_req, sizeof(stop_req), br_stop);
+		r.parsed.push_back({ "stats_capture_stop_ok", "1" });
 		r.parsed.push_back({ "after_bytes_sent", fmt_u64(after_req.bytes_sent) });
 		r.parsed.push_back({ "after_bytes_received", fmt_u64(after_req.bytes_received) });
 		r.parsed.push_back({ "after_packets_sent", fmt_u64(after_req.packets_sent) });

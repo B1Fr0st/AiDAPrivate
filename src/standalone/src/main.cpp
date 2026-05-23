@@ -40,6 +40,7 @@
 #include "settings_overlay.hpp"
 #include "work_queue.hpp"
 #include "core/session/session_health.hpp"
+#include "core/testlab/test_all_features.hpp"
 #include "helpers/stb_image.h"
 
 #include "embedded_resources.hpp"
@@ -912,9 +913,11 @@ static LONG CALLBACK aida_diagnostic_veh(EXCEPTION_POINTERS* ep)
     uintptr_t rip_off_exe = ep->ContextRecord->Rip - reinterpret_cast<uintptr_t>(exe_base);
     uintptr_t addr_off_mod = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress)
         - reinterpret_cast<uintptr_t>(crash_mod);
+    char test_all_snapshot[1200] = {};
+    test_all_features::format_debug_snapshot(test_all_snapshot, sizeof(test_all_snapshot));
     diag::log_tagged_critical_fmt("veh",
         "code=0x%08X addr=0x%016llX rip=0x%016llX rip_off_exe=0x%llX "
-        "mod=%s mod_off=0x%llX tid=%lu params=%lu p0=0x%016llX p1=0x%016llX",
+        "mod=%s mod_off=0x%llX tid=%lu params=%lu p0=0x%016llX p1=0x%016llX test_all={%s}",
         code,
         (unsigned long long)reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress),
         (unsigned long long)ep->ContextRecord->Rip,
@@ -925,7 +928,8 @@ static LONG CALLBACK aida_diagnostic_veh(EXCEPTION_POINTERS* ep)
         (unsigned long long)(ep->ExceptionRecord->NumberParameters > 0
             ? ep->ExceptionRecord->ExceptionInformation[0] : 0ULL),
         (unsigned long long)(ep->ExceptionRecord->NumberParameters > 1
-            ? ep->ExceptionRecord->ExceptionInformation[1] : 0ULL));
+            ? ep->ExceptionRecord->ExceptionInformation[1] : 0ULL),
+        test_all_snapshot);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -977,6 +981,8 @@ int main(int, char**)
         HMODULE exe_base = GetModuleHandleA(nullptr);
         uintptr_t rip_offset = ep->ContextRecord->Rip - reinterpret_cast<uintptr_t>(exe_base);
         uintptr_t addr_offset = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress) - reinterpret_cast<uintptr_t>(crash_mod);
+        char test_all_snapshot[1200] = {};
+        test_all_features::format_debug_snapshot(test_all_snapshot, sizeof(test_all_snapshot));
 
         char stack_buf[512] = {};
         {
@@ -1003,6 +1009,7 @@ int main(int, char**)
             "R12=%016llX R13=%016llX R14=%016llX R15=%016llX\n"
             "Rip=%016llX\n"
             "Stack: %s\n"
+            "TestAllSnapshot=%s\n"
             "LastError=%lu\n",
             ep->ExceptionRecord->ExceptionCode,
             reinterpret_cast<unsigned long long>(ep->ExceptionRecord->ExceptionAddress),
@@ -1025,6 +1032,7 @@ int main(int, char**)
             ep->ContextRecord->R14, ep->ContextRecord->R15,
             ep->ContextRecord->Rip,
             stack_buf,
+            test_all_snapshot,
             GetLastError());
 
         crash_log_write(buf);

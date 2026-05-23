@@ -1,4 +1,5 @@
 #include "resident_state.h"
+#include "test_log.h"
 
 #include <cstdio>
 #include <cstdarg>

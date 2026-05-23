@@ -1,4 +1,5 @@
 #include "memory_tests.h"
+#include "test_log.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>

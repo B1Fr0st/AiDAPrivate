@@ -1,6 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
+#include <chrono>
+#include <limits>
 #include <string>
 #include <vector>
 #include <cstring>
@@ -53,6 +56,11 @@ struct pe_info_t {
 };
 
 namespace detail {
+
+inline bool deadline_expired(const std::chrono::steady_clock::time_point* deadline)
+{
+	return deadline && std::chrono::steady_clock::now() >= *deadline;
+}
 
 inline bool read_mem(uint64_t addr, void* buf, size_t size)
 {
@@ -114,11 +122,23 @@ inline std::string format_characteristics(uint32_t chars)
 	return result;
 }
 
-inline bool parse_exports(uint64_t module_base, const pe_info_t& pe, std::vector<export_entry_t>& out)
+inline bool parse_exports(uint64_t module_base, const pe_info_t& pe, std::vector<export_entry_t>& out,
+	size_t max_entries = (std::numeric_limits<size_t>::max)(),
+	const std::chrono::steady_clock::time_point* deadline = nullptr,
+	bool* truncated = nullptr)
 {
 	out.clear();
+	if (truncated) *truncated = false;
 	if (pe.export_dir_rva == 0 || pe.export_dir_size == 0)
 		return true;
+	if (max_entries == 0) {
+		if (truncated) *truncated = true;
+		return true;
+	}
+	if (detail::deadline_expired(deadline)) {
+		if (truncated) *truncated = true;
+		return false;
+	}
 
 	uint64_t export_dir_addr = module_base + pe.export_dir_rva;
 
@@ -145,21 +165,39 @@ inline bool parse_exports(uint64_t module_base, const pe_info_t& pe, std::vector
 	if (num_names > num_functions)
 		num_names = num_functions;
 
+	const bool bounded = max_entries != (std::numeric_limits<size_t>::max)();
+	uint32_t names_to_read = num_names;
+	if (bounded) {
+		size_t name_cap = max_entries * 4;
+		if (name_cap < max_entries)
+			name_cap = max_entries;
+		if (name_cap > 4096)
+			name_cap = 4096;
+		if (names_to_read > name_cap) {
+			names_to_read = static_cast<uint32_t>(name_cap);
+			if (truncated) *truncated = true;
+		}
+	}
+
 	std::vector<uint32_t> addr_table(num_functions);
 	if (!detail::read_mem(module_base + addr_table_rva, addr_table.data(), num_functions * 4))
 		return false;
 
-	std::vector<uint32_t> name_ptrs(num_names);
-	std::vector<uint16_t> ordinals(num_names);
-	if (num_names > 0) {
-		if (!detail::read_mem(module_base + name_table_rva, name_ptrs.data(), num_names * 4))
+	std::vector<uint32_t> name_ptrs(names_to_read);
+	std::vector<uint16_t> ordinals(names_to_read);
+	if (names_to_read > 0) {
+		if (!detail::read_mem(module_base + name_table_rva, name_ptrs.data(), names_to_read * 4))
 			return false;
-		if (!detail::read_mem(module_base + ordinal_table_rva, ordinals.data(), num_names * 2))
+		if (!detail::read_mem(module_base + ordinal_table_rva, ordinals.data(), names_to_read * 2))
 			return false;
 	}
 
 	std::vector<std::string> name_lookup(num_functions);
-	for (uint32_t i = 0; i < num_names; ++i) {
+	for (uint32_t i = 0; i < names_to_read; ++i) {
+		if (detail::deadline_expired(deadline)) {
+			if (truncated) *truncated = true;
+			return true;
+		}
 		if (ordinals[i] < num_functions) {
 			std::string fname;
 			detail::read_string_at(module_base + name_ptrs[i], 512, fname);
@@ -170,8 +208,16 @@ inline bool parse_exports(uint64_t module_base, const pe_info_t& pe, std::vector
 	uint32_t exp_start = pe.export_dir_rva;
 	uint32_t exp_end = pe.export_dir_rva + pe.export_dir_size;
 
-	out.reserve(num_functions);
+	out.reserve(std::min<size_t>(num_functions, max_entries));
 	for (uint32_t i = 0; i < num_functions; ++i) {
+		if (out.size() >= max_entries) {
+			if (truncated) *truncated = true;
+			break;
+		}
+		if (detail::deadline_expired(deadline)) {
+			if (truncated) *truncated = true;
+			break;
+		}
 		if (addr_table[i] == 0)
 			continue;
 
@@ -192,15 +238,31 @@ inline bool parse_exports(uint64_t module_base, const pe_info_t& pe, std::vector
 	return true;
 }
 
-inline bool parse_imports(uint64_t module_base, const pe_info_t& pe, std::vector<import_entry_t>& out)
+inline bool parse_imports(uint64_t module_base, const pe_info_t& pe, std::vector<import_entry_t>& out,
+	size_t max_entries = (std::numeric_limits<size_t>::max)(),
+	const std::chrono::steady_clock::time_point* deadline = nullptr,
+	bool* truncated = nullptr)
 {
 	out.clear();
+	if (truncated) *truncated = false;
 	if (pe.import_dir_rva == 0 || pe.import_dir_size == 0)
 		return true;
+	if (max_entries == 0) {
+		if (truncated) *truncated = true;
+		return true;
+	}
 
 	uint64_t import_dir_addr = module_base + pe.import_dir_rva;
 
 	for (uint32_t desc_idx = 0; desc_idx < 4096; ++desc_idx) {
+		if (out.size() >= max_entries) {
+			if (truncated) *truncated = true;
+			break;
+		}
+		if (detail::deadline_expired(deadline)) {
+			if (truncated) *truncated = true;
+			break;
+		}
 		uint8_t desc_buf[20];
 		if (!detail::read_mem(import_dir_addr + desc_idx * 20, desc_buf, 20))
 			break;
@@ -222,6 +284,14 @@ inline bool parse_imports(uint64_t module_base, const pe_info_t& pe, std::vector
 		uint32_t lookup_rva = (ilt_rva != 0) ? ilt_rva : iat_rva;
 
 		for (uint32_t thunk_idx = 0; thunk_idx < 0x10000; ++thunk_idx) {
+			if (out.size() >= max_entries) {
+				if (truncated) *truncated = true;
+				break;
+			}
+			if (detail::deadline_expired(deadline)) {
+				if (truncated) *truncated = true;
+				break;
+			}
 			uint64_t thunk_addr = module_base + lookup_rva + (pe.is_64bit ? thunk_idx * 8 : thunk_idx * 4);
 			uint64_t thunk_val = 0;
 

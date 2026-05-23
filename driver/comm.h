@@ -3,6 +3,7 @@
 #include <winioctl.h>
 #include <tlhelp32.h>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string_view>
 #include <memory>
@@ -166,6 +167,25 @@ namespace voyager {
 
         __forceinline std::uint32_t get_heartbeat_magic() {
             return 0xDEADBEEFu ^ dynamic_key::get();
+        }
+        __forceinline void debug_ioctl_raw_log(const char* phase,
+                                               std::uint32_t ioctl_code,
+                                               std::uint32_t buffer_size,
+                                               DWORD bytes_returned,
+                                               DWORD gle,
+                                               HANDLE handle,
+                                               std::uint32_t pid) noexcept {
+            char buf[512];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "[AIDA-IOCTL-RAW] %s ioctl=0x%08X size=%u bytes=%lu gle=%lu handle=0x%llX pid=%u\n",
+                phase ? phase : "?",
+                ioctl_code,
+                buffer_size,
+                static_cast<unsigned long>(bytes_returned),
+                static_cast<unsigned long>(gle),
+                reinterpret_cast<unsigned long long>(handle),
+                pid);
+            OutputDebugStringA(buf);
         }
         constexpr std::uint64_t HEARTBEAT_REFRESH_INTERVAL = 200000000ULL;
 
@@ -1715,9 +1735,11 @@ namespace voyager {
                             std::uint32_t& bytes_returned) const noexcept {
             bytes_returned = 0;
             if (!is_connected() || in_out_buffer == nullptr || buffer_size == 0) {
+                detail::debug_ioctl_raw_log("REJECT", ioctl_code, buffer_size, 0, GetLastError(), driver_handle_, process_id_);
                 return false;
             }
             DWORD br = 0;
+            const DWORD start_tick = GetTickCount();
             BOOL ok = DeviceIoControl(
                 driver_handle_,
                 static_cast<DWORD>(ioctl_code),
@@ -1729,6 +1751,12 @@ namespace voyager {
                 nullptr
             );
             bytes_returned = static_cast<std::uint32_t>(br);
+            DWORD gle = ok ? 0 : GetLastError();
+            DWORD elapsed = GetTickCount() - start_tick;
+            if (!ok || br == 0 || elapsed > 250) {
+                detail::debug_ioctl_raw_log(ok ? "OK_SUSPICIOUS" : "FAILED",
+                    ioctl_code, buffer_size, br, gle, driver_handle_, process_id_);
+            }
             return ok != FALSE;
         }
 

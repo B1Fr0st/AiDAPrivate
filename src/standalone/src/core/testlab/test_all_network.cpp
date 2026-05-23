@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace test_all_features {
@@ -183,21 +184,77 @@ namespace {
 
     void test_mitm_repeat_request(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "mitm_repeat";
-        log_msg(hf, tag, "START -- mitm_proxy::repeat_request to localhost:18080");
-        std::string raw = "GET / HTTP/1.1\r\nHost: localhost:18080\r\nConnection: close\r\n\r\n";
+        (void)skipped;
+        log_msg(hf, tag, "START -- mitm_proxy::repeat_request to 127.0.0.1:18080");
+        SOCKET listener = INVALID_SOCKET;
+        SOCKET accepted = INVALID_SOCKET;
+        std::atomic<bool> server_ready{ false };
+        std::atomic<bool> server_done{ false };
+        std::thread server_thread([&]() {
+            listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (listener == INVALID_SOCKET) {
+                server_done.store(true);
+                return;
+            }
+            sockaddr_in bind_addr = {};
+            bind_addr.sin_family = AF_INET;
+            bind_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            bind_addr.sin_port = htons(18080);
+            int opt = 1;
+            setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
+            if (bind(listener, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) == SOCKET_ERROR ||
+                listen(listener, 1) == SOCKET_ERROR) {
+                closesocket(listener);
+                listener = INVALID_SOCKET;
+                server_done.store(true);
+                return;
+            }
+            server_ready.store(true);
+            accepted = accept(listener, nullptr, nullptr);
+            if (accepted != INVALID_SOCKET) {
+                char req_buf[512];
+                recv(accepted, req_buf, sizeof(req_buf), 0);
+                const char* resp = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 4\r\nContent-Type: text/plain\r\n\r\nAIDA";
+                send(accepted, resp, static_cast<int>(std::strlen(resp)), 0);
+                closesocket(accepted);
+                accepted = INVALID_SOCKET;
+            }
+            closesocket(listener);
+            listener = INVALID_SOCKET;
+            server_done.store(true);
+        });
+        for (int i = 0; i < 50 && !server_ready.load() && !server_done.load(); ++i)
+            Sleep(20);
+        std::string raw = "GET / HTTP/1.1\r\nHost: 127.0.0.1:18080\r\nConnection: close\r\n\r\n";
         std::vector<uint8_t> raw_bytes(raw.begin(), raw.end());
 
-        auto result = mitm_proxy::repeat_request("localhost", 18080, false, raw_bytes);
+        auto result = mitm_proxy::repeat_request("127.0.0.1", 18080, false, raw_bytes);
+        int attempts = 1;
+        while (!result.success && attempts < 3) {
+            log_msg(hf, tag, "attempt %d failed quickly: %s", attempts, result.error.c_str());
+            Sleep(100);
+            result = mitm_proxy::repeat_request("127.0.0.1", 18080, false, raw_bytes);
+            ++attempts;
+        }
         if (result.success) {
-            log_msg(hf, tag, "PASS -- repeat_request succeeded, status=%d response_size=%zu latency=%llu ms",
+            log_msg(hf, tag, "PASS -- repeat_request succeeded after %d attempt(s), status=%d response_size=%zu latency=%llu ms",
+                attempts,
                 result.exchange.response.status_code,
                 result.exchange.response_size,
                 (unsigned long long)result.exchange.latency_ms);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "SKIP -- repeat_request failed: %s (test target HTTP server likely not running)",
-                result.error.c_str());
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- repeat_request failed after %d attempt(s): %s",
+                attempts, result.error.c_str());
+            failed.fetch_add(1);
+        }
+        if (listener != INVALID_SOCKET)
+            closesocket(listener);
+        if (server_thread.joinable()) {
+            for (int i = 0; i < 50 && !server_done.load(); ++i)
+                Sleep(20);
+            if (server_thread.joinable())
+                server_thread.join();
         }
     }
 
@@ -453,9 +510,13 @@ namespace {
         WSADATA wsa{};
         WSAStartup(MAKEWORD(2, 2), &wsa);
 
-        SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (s == INVALID_SOCKET) {
-            log_msg(hf, tag, "FAIL -- socket() failed, WSAGetLastError=%d", WSAGetLastError());
+        SOCKET rx = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        SOCKET tx = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (rx == INVALID_SOCKET || tx == INVALID_SOCKET) {
+            log_msg(hf, tag, "FAIL -- socket() failed rx=%p tx=%p WSAGetLastError=%d",
+                reinterpret_cast<void*>(rx), reinterpret_cast<void*>(tx), WSAGetLastError());
+            if (rx != INVALID_SOCKET) closesocket(rx);
+            if (tx != INVALID_SOCKET) closesocket(tx);
             failed.fetch_add(1);
             return;
         }
@@ -464,40 +525,44 @@ namespace {
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         addr.sin_port = htons(0);
-        if (bind(s, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+        if (bind(rx, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
             log_msg(hf, tag, "FAIL -- bind() failed, WSAGetLastError=%d", WSAGetLastError());
-            closesocket(s);
+            closesocket(tx);
+            closesocket(rx);
             failed.fetch_add(1);
             return;
         }
 
         int namelen = sizeof(addr);
-        getsockname(s, reinterpret_cast<struct sockaddr*>(&addr), &namelen);
+        getsockname(rx, reinterpret_cast<struct sockaddr*>(&addr), &namelen);
         uint16_t bound_port = ntohs(addr.sin_port);
         log_msg(hf, tag, "bound UDP on loopback:%u", (unsigned)bound_port);
 
-        const char payload[] = "AiDA_UDP_TEST_1234";
-        int sent = sendto(s, payload, (int)sizeof(payload) - 1, 0,
-            reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
-
         DWORD timeout_ms = 2000;
-        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+        setsockopt(rx, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+
+        const char payload[] = "AiDA_UDP_TEST_1234";
+        int sent = sendto(tx, payload, (int)sizeof(payload) - 1, 0,
+            reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+        const int send_err = (sent == SOCKET_ERROR) ? WSAGetLastError() : 0;
 
         char buf[128] = {};
         struct sockaddr_in from{};
         int fromlen = sizeof(from);
-        int recvd = recvfrom(s, buf, sizeof(buf), 0,
+        int recvd = recvfrom(rx, buf, sizeof(buf), 0,
             reinterpret_cast<struct sockaddr*>(&from), &fromlen);
+        const int recv_err = (recvd == SOCKET_ERROR) ? WSAGetLastError() : 0;
 
-        closesocket(s);
+        closesocket(tx);
+        closesocket(rx);
 
         if (sent == (int)(sizeof(payload) - 1) && recvd == sent &&
             std::memcmp(buf, payload, static_cast<size_t>(recvd)) == 0) {
             log_msg(hf, tag, "PASS -- sent %d bytes, received %d bytes, payload matches", sent, recvd);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- sent=%d recvd=%d match=%s",
-                sent, recvd,
+            log_msg(hf, tag, "FAIL -- sent=%d send_err=%d recvd=%d recv_err=%d match=%s",
+                sent, send_err, recvd, recv_err,
                 (recvd > 0 && std::memcmp(buf, payload, static_cast<size_t>(recvd)) == 0) ? "true" : "false");
             failed.fetch_add(1);
         }
@@ -1142,16 +1207,22 @@ namespace {
             return;
         }
         uint32_t rule_id = 0;
-        bool added = driver_bridge::add_filter_rule(0, 2, 0, 0, 0, nullptr, nullptr, &rule_id);
+        bool added = driver_bridge::add_filter_rule(0, 2, 6, GetCurrentProcessId(), 0, nullptr, nullptr, &rule_id);
         if (added && rule_id != 0) {
             bool removed = driver_bridge::remove_filter_rule(rule_id);
-            log_msg(hf, tag, "PASS -- added rule_id=%u, removed=%s",
-                (unsigned)rule_id, removed ? "true" : "false");
-            passed.fetch_add(1);
+            if (removed) {
+                log_msg(hf, tag, "PASS -- added rule_id=%u, removed=true",
+                    (unsigned)rule_id);
+                passed.fetch_add(1);
+            } else {
+                log_msg(hf, tag, "FAIL -- added rule_id=%u but remove_filter_rule failed",
+                    (unsigned)rule_id);
+                failed.fetch_add(1);
+            }
         } else {
-            log_msg(hf, tag, "PASS -- add_filter_rule returned added=%s (driver may not support)",
+            log_msg(hf, tag, "FAIL -- add_filter_rule returned added=%s rule_id=%u",
                 added ? "true" : "false");
-            passed.fetch_add(1);
+            failed.fetch_add(1);
         }
     }
 
@@ -1388,10 +1459,10 @@ namespace {
         }
         uint8_t spoof_addr[4] = { 127, 0, 0, 1 };
         uint32_t rule_id = 0;
-        bool added = driver_bridge::dns_spoof_op(1, 0, "aida-test-internal.invalid",
+        bool added = driver_bridge::dns_spoof_op(0, 0, "aida-test-internal.invalid",
             spoof_addr, 2, 60, &rule_id);
         if (added && rule_id != 0) {
-            bool removed = driver_bridge::dns_spoof_op(2, rule_id);
+            bool removed = driver_bridge::dns_spoof_op(1, rule_id);
             log_msg(hf, tag, "PASS -- dns_spoof added rule_id=%u, removed=%s",
                 (unsigned)rule_id, removed ? "true" : "false");
         } else {
@@ -1411,17 +1482,25 @@ namespace {
         }
         uint32_t rule_id = 0;
         uint8_t loopback[4] = { 127, 0, 0, 1 };
-        bool added = driver_bridge::traffic_redirect_op(1, 0, 6,
+        bool added = driver_bridge::traffic_redirect_op(0, 0, 6,
             19999, loopback, 19998, loopback, 2, &rule_id, GetCurrentProcessId());
         if (added && rule_id != 0) {
-            bool removed = driver_bridge::traffic_redirect_op(2, rule_id);
-            log_msg(hf, tag, "PASS -- redirect added rule_id=%u, removed=%s",
-                (unsigned)rule_id, removed ? "true" : "false");
+            bool removed = driver_bridge::traffic_redirect_op(1, rule_id);
+            driver_bridge::traffic_redirect_op(3);
+            if (removed) {
+                log_msg(hf, tag, "PASS -- redirect added rule_id=%u and removed cleanly",
+                    (unsigned)rule_id);
+                passed.fetch_add(1);
+            } else {
+                log_msg(hf, tag, "FAIL -- redirect added rule_id=%u but remove failed; clear-all attempted",
+                    (unsigned)rule_id);
+                failed.fetch_add(1);
+            }
         } else {
-            log_msg(hf, tag, "PASS -- traffic_redirect_op add returned %s",
-                added ? "true" : "false");
+            log_msg(hf, tag, "FAIL -- traffic_redirect_op add returned %s rule_id=%u",
+                added ? "true" : "false", (unsigned)rule_id);
+            failed.fetch_add(1);
         }
-        passed.fetch_add(1);
     }
 
     void test_driver_stream_reassemble(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -1432,12 +1511,32 @@ namespace {
             skipped.fetch_add(1);
             return;
         }
+        constexpr uint32_t src_port = 49152;
+        constexpr uint32_t dst_port = 80;
+        const uint32_t pid = GetCurrentProcessId();
+        bool started = driver_bridge::stream_reassemble_op(0, src_port, dst_port, pid, nullptr, nullptr,
+            nullptr, nullptr, nullptr);
+        if (!started) {
+            log_msg(hf, tag, "FAIL -- stream_reassemble_op start failed src_port=%u dst_port=%u pid=%u",
+                (unsigned)src_port, (unsigned)dst_port, (unsigned)pid);
+            failed.fetch_add(1);
+            return;
+        }
         std::vector<uint8_t> data;
         uint32_t packets = 0, truncated = 0;
-        bool ok = driver_bridge::stream_reassemble_op(2, 0, 0, 0, nullptr, nullptr,
+        bool ok = driver_bridge::stream_reassemble_op(2, src_port, dst_port, pid, nullptr, nullptr,
             &data, &packets, &truncated);
-        log_msg(hf, tag, "PASS -- stream_reassemble_op ok=%s data_size=%zu packets=%u truncated=%u",
-            ok ? "true" : "false", data.size(), (unsigned)packets, (unsigned)truncated);
+        bool stopped = driver_bridge::stream_reassemble_op(1, src_port, dst_port, pid, nullptr, nullptr,
+            nullptr, nullptr, nullptr);
+        if (!ok || !stopped) {
+            log_msg(hf, tag, "FAIL -- stream_reassemble_op lifecycle failed get=%s stopped=%s data_size=%zu packets=%u truncated=%u",
+                ok ? "true" : "false",
+                stopped ? "true" : "false", data.size(), (unsigned)packets, (unsigned)truncated);
+            failed.fetch_add(1);
+            return;
+        }
+        log_msg(hf, tag, "PASS -- stream_reassemble_op lifecycle start/get/stop ok data_size=%zu packets=%u truncated=%u stopped=%s",
+            data.size(), (unsigned)packets, (unsigned)truncated, stopped ? "true" : "false");
         passed.fetch_add(1);
     }
 
@@ -1449,9 +1548,9 @@ namespace {
             skipped.fetch_add(1);
             return;
         }
-        driver_bridge::fingerprint_op(1);
-        auto fps = driver_bridge::get_fingerprints();
         driver_bridge::fingerprint_op(0);
+        auto fps = driver_bridge::get_fingerprints();
+        driver_bridge::fingerprint_op(1);
         log_msg(hf, tag, "PASS -- fingerprint cycle completed, %zu results", fps.size());
         if (!fps.empty()) {
             log_msg(hf, tag, "  first: ttl=%u window=%u mss=%u os=%s",
@@ -1472,8 +1571,14 @@ namespace {
         uint32_t held_count = 0;
         bool active = false;
         bool ok = driver_bridge::intercept_op(2, 0, 0, 0, 0, nullptr, 0, &held_count, &active);
-        log_msg(hf, tag, "PASS -- intercept_op query ok=%s held=%u active=%s",
-            ok ? "true" : "false", (unsigned)held_count, active ? "true" : "false");
+        if (!ok) {
+            log_msg(hf, tag, "FAIL -- intercept_op query ok=false held=%u active=%s",
+                (unsigned)held_count, active ? "true" : "false");
+            failed.fetch_add(1);
+            return;
+        }
+        log_msg(hf, tag, "PASS -- intercept_op query ok=true held=%u active=%s",
+            (unsigned)held_count, active ? "true" : "false");
         passed.fetch_add(1);
     }
 
@@ -1490,7 +1595,12 @@ namespace {
         uint8_t payload[] = { 'A', 'i', 'D', 'A' };
         bool ok = driver_bridge::inject_packet(1, 17, 2,
             19876, 19877, src_addr, dst_addr, payload, sizeof(payload));
-        log_msg(hf, tag, "PASS -- inject_packet returned %s", ok ? "true" : "false");
+        if (!ok) {
+            log_msg(hf, tag, "FAIL -- inject_packet returned false");
+            failed.fetch_add(1);
+            return;
+        }
+        log_msg(hf, tag, "PASS -- inject_packet returned true");
         passed.fetch_add(1);
     }
 
@@ -1719,39 +1829,69 @@ namespace {
         }
 
         SOCKET client_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (client_sock == INVALID_SOCKET) {
+            log_msg(hf, tag, "FAIL -- client socket() failed err=%d", WSAGetLastError());
+            closesocket(listen_sock);
+            failed.fetch_add(1);
+            return;
+        }
+
         struct sockaddr_in conn_addr{};
         conn_addr.sin_family = AF_INET;
         conn_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         conn_addr.sin_port = htons(port);
 
-        u_long non_block = 1;
-        ioctlsocket(listen_sock, FIONBIO, &non_block);
-
         int rc = connect(client_sock, reinterpret_cast<struct sockaddr*>(&conn_addr), sizeof(conn_addr));
+        if (rc != 0) {
+            log_msg(hf, tag, "FAIL -- connect() to 127.0.0.1:%u failed err=%d",
+                (unsigned)port, WSAGetLastError());
+            closesocket(client_sock);
+            closesocket(listen_sock);
+            failed.fetch_add(1);
+            return;
+        }
 
-        SOCKET accept_sock = INVALID_SOCKET;
-        for (int retry = 0; retry < 20 && accept_sock == INVALID_SOCKET; retry++) {
-            accept_sock = accept(listen_sock, nullptr, nullptr);
-            if (accept_sock == INVALID_SOCKET) Sleep(10);
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(listen_sock, &readfds);
+        timeval tv{};
+        tv.tv_sec = 2;
+        tv.tv_usec = 0;
+        int ready = select(0, &readfds, nullptr, nullptr, &tv);
+        if (ready <= 0) {
+            log_msg(hf, tag, "FAIL -- select() waiting for accept ready=%d err=%d",
+                ready, ready == SOCKET_ERROR ? WSAGetLastError() : 0);
+            closesocket(client_sock);
+            closesocket(listen_sock);
+            failed.fetch_add(1);
+            return;
+        }
+
+        SOCKET accept_sock = accept(listen_sock, nullptr, nullptr);
+        if (accept_sock == INVALID_SOCKET) {
+            log_msg(hf, tag, "FAIL -- accept() failed err=%d", WSAGetLastError());
+            closesocket(client_sock);
+            closesocket(listen_sock);
+            failed.fetch_add(1);
+            return;
         }
 
         const char msg[] = "AiDA_TCP_TEST";
         int sent = send(client_sock, msg, (int)sizeof(msg) - 1, 0);
+        const int send_err = (sent == SOCKET_ERROR) ? WSAGetLastError() : 0;
 
         DWORD timeout = 2000;
         setsockopt(accept_sock, SOL_SOCKET, SO_RCVTIMEO,
             reinterpret_cast<const char*>(&timeout), sizeof(timeout));
 
         char recv_buf[64] = {};
-        int recvd = 0;
-        if (accept_sock != INVALID_SOCKET) {
-            recvd = recv(accept_sock, recv_buf, sizeof(recv_buf), 0);
-        }
+        int recvd = recv(accept_sock, recv_buf, sizeof(recv_buf), 0);
+        const int recv_err = (recvd == SOCKET_ERROR) ? WSAGetLastError() : 0;
 
         bool data_ok = (sent > 0 && recvd == sent &&
             std::memcmp(recv_buf, msg, static_cast<size_t>(recvd)) == 0);
 
-        if (accept_sock != INVALID_SOCKET) closesocket(accept_sock);
+        closesocket(accept_sock);
         closesocket(client_sock);
         closesocket(listen_sock);
 
@@ -1759,7 +1899,8 @@ namespace {
             log_msg(hf, tag, "PASS -- TCP loopback connect/send/recv on port %u", (unsigned)port);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- data mismatch sent=%d recvd=%d", sent, recvd);
+            log_msg(hf, tag, "FAIL -- data mismatch sent=%d send_err=%d recvd=%d recv_err=%d",
+                sent, send_err, recvd, recv_err);
             failed.fetch_add(1);
         }
     }

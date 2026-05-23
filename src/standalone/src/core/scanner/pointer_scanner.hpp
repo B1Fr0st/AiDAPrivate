@@ -233,6 +233,10 @@ inline void build_reverse_map()
 		for (auto& r : readable) total_bytes += r.size;
 		if (total_bytes == 0) total_bytes = 1;
 		uint64_t scanned = 0;
+		std::sort(readable.begin(), readable.end(),
+			[](const driver_bridge::memory_region_t& a, const driver_bridge::memory_region_t& b) {
+				return a.base < b.base;
+			});
 
 		std::map<uint64_t, std::vector<pointer_data_t>> new_map;
 		size_t entry_count = 0;
@@ -262,14 +266,15 @@ inline void build_reverse_map()
 					if (value < 0x10000 || value > 0x00007FFFFFFFFFFF)
 						continue;
 
-					bool valid = false;
-					for (auto& r : readable) {
-						if (value >= r.base && value < r.base + r.size) {
-							valid = true;
-							break;
-						}
-					}
-					if (!valid) continue;
+					auto rit = std::upper_bound(readable.begin(), readable.end(), value,
+						[](uint64_t needle, const driver_bridge::memory_region_t& r) {
+							return needle < r.base;
+						});
+					if (rit == readable.begin())
+						continue;
+					--rit;
+					if (value < rit->base || value >= rit->base + rit->size)
+						continue;
 
 					pointer_data_t pd;
 					pd.address = region.base + off + i;

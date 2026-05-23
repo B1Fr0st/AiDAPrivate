@@ -53,6 +53,25 @@ namespace {
 constexpr DWORD kDllMainBadHostFastFailCode  = 0xA1DAB10Fu;
 constexpr DWORD kDllMainBadNameFastFailCode  = 0xA1DAB110u;
 
+bool env_flag_enabled(const char* name)
+{
+    if (!name || !*name)
+        return false;
+    char value[16] = {};
+    DWORD n = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+    if (n == 0)
+        return false;
+    if (n >= sizeof(value))
+        return true;
+    return value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+}
+
+bool destructive_plugin_action_suppressed()
+{
+    return env_flag_enabled("AIDA_FULL_TEST_RUNNING") ||
+           env_flag_enabled("AIDA_DISABLE_DESTRUCTIVE_ENFORCEMENT");
+}
+
 bool is_manual_mapped()
 {
     return aida_manual_map_marker == aida_manual_map::kMarkerValue;
@@ -145,6 +164,11 @@ bool plugin_own_filename_is_canonical(HINSTANCE self_module)
 DWORD WINAPI plugin_kill_thread(LPVOID param)
 {
     DWORD reason = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(param));
+    if (destructive_plugin_action_suppressed())
+    {
+        msg("AiDA: plugin kill suppressed in full-test/destructive-disabled mode reason=0x%08X\n", reason);
+        return 0;
+    }
     Sleep(50);
     bool driver_ok = false;
     __try {
@@ -312,6 +336,11 @@ void trigger_self_re_bsod(const char* full_path, const uint8_t matched_hash[32])
 {
     msg(OBFSTR_C("AiDA: self-reverse-engineering attempt detected. target=%s\n"),
         full_path ? full_path : "(null)");
+    if (destructive_plugin_action_suppressed())
+    {
+        msg(OBFSTR_C("AiDA: self-reverse-engineering destructive response suppressed by test-safe environment.\n"));
+        return;
+    }
     std::uint64_t evidence = 0;
     if (matched_hash)
         std::memcpy(&evidence, matched_hash, sizeof(evidence));

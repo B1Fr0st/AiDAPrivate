@@ -394,20 +394,35 @@ bool firewall_remove_rule(const std::string& rule_name_utf8) {
 }
 
 void spawn_watchdog_kill(HANDLE process_handle, HANDLE job_handle, uint32_t sec, uint32_t pid) {
-	if (sec == 0) return;
-	if (process_handle == nullptr) return;
+	if (sec == 0) {
+		diag::log_tagged_critical_fmt("run_target", "watchdog not installed pid=%u reason=timeout_zero", pid);
+		return;
+	}
+	if (process_handle == nullptr) {
+		diag::log_tagged_critical_fmt("run_target", "watchdog not installed pid=%u reason=null_process_handle", pid);
+		return;
+	}
 
 	HANDLE dup_proc = nullptr;
 	HANDLE dup_job = nullptr;
 	HANDLE me = GetCurrentProcess();
 	if (!DuplicateHandle(me, process_handle, me, &dup_proc, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+		diag::log_tagged_critical_fmt("run_target",
+			"watchdog DuplicateHandle(process) FAILED pid=%u err=%lu",
+			pid, GetLastError());
 		return;
 	}
 	if (job_handle != nullptr) {
 		if (!DuplicateHandle(me, job_handle, me, &dup_job, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+			diag::log_tagged_critical_fmt("run_target",
+				"watchdog DuplicateHandle(job) FAILED pid=%u err=%lu",
+				pid, GetLastError());
 			dup_job = nullptr;
 		}
 	}
+	diag::log_tagged_critical_fmt("run_target",
+		"watchdog installed pid=%u timeout_sec=%u dup_proc=%p dup_job=%p",
+		pid, sec, dup_proc, dup_job);
 
 	const uint32_t timeout_ms = sec * 1000u;
 	uint32_t local_pid = pid;
@@ -1005,10 +1020,15 @@ bool launch_jobbed(const launch_options_t& opts, launch_result_t& out, bool /*in
 	PROCESS_INFORMATION pi{};
 	const wchar_t* cwd_ptr = opts.working_dir.empty() ? nullptr : opts.working_dir.c_str();
 	DWORD flags = CREATE_SUSPENDED | CREATE_NEW_CONSOLE | CREATE_DEFAULT_ERROR_MODE;
+	std::string exe_utf8 = narrow_utf8(opts.exe_path);
+	std::string args_utf8 = narrow_utf8(opts.args);
+	std::string cwd_utf8 = narrow_utf8(opts.working_dir);
 	diag::log_tagged_critical_fmt("run",
-		"CreateProcessW.invoke flags=0x%08lX cwd=%s",
+		"CreateProcessW.invoke flags=0x%08lX exe='%s' args='%.160s' cwd='%s'",
 		static_cast<unsigned long>(flags),
-		cwd_ptr ? "<set>" : "<inherit>");
+		exe_utf8.c_str(),
+		args_utf8.c_str(),
+		cwd_ptr ? cwd_utf8.c_str() : "<inherit>");
 
 	BOOL cp_ok = CreateProcessW(
 		nullptr,
@@ -1028,10 +1048,12 @@ bool launch_jobbed(const launch_options_t& opts, launch_result_t& out, bool /*in
 		static_cast<unsigned long>(cp_gle),
 		static_cast<unsigned long>(flags));
 	diag::log_tagged_critical_fmt("run_target",
-		"launch_jobbed CreateProcessW ok=%d pid=%lu tid=%lu gle=%lu",
+		"launch_jobbed CreateProcessW ok=%d pid=%lu tid=%lu proc=%p thread=%p gle=%lu",
 		cp_ok ? 1 : 0,
 		cp_ok ? pi.dwProcessId : 0u,
 		cp_ok ? pi.dwThreadId : 0u,
+		cp_ok ? pi.hProcess : nullptr,
+		cp_ok ? pi.hThread : nullptr,
 		static_cast<unsigned long>(cp_gle));
 	if (!cp_ok) {
 		out.error = format_error("CreateProcessW", cp_gle);

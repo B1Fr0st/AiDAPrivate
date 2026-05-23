@@ -20,8 +20,100 @@
 #include "http_server_tests.h"
 #include "traffic_generator.h"
 #include "resident_state.h"
+#include "test_log.h"
 
 static std::atomic<bool> g_running{ true };
+static std::atomic<bool> g_absorb_external_single_step{ false };
+static volatile LONG     g_absorbed_single_step_count = 0;
+static PVOID             g_debugger_veh_handle = nullptr;
+
+static LONG CALLBACK debugger_exception_veh(EXCEPTION_POINTERS* ep) {
+    if (!ep || !ep->ExceptionRecord || !ep->ContextRecord)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP &&
+        g_absorb_external_single_step.load(std::memory_order_acquire)) {
+#ifdef _M_X64
+        ep->ContextRecord->EFlags &= ~0x100UL;
+        const unsigned long long ip = static_cast<unsigned long long>(ep->ContextRecord->Rip);
+#else
+        ep->ContextRecord->EFlags &= ~0x100UL;
+        const unsigned long long ip = static_cast<unsigned long long>(ep->ContextRecord->Eip);
+#endif
+        const LONG count = InterlockedIncrement(&g_absorbed_single_step_count);
+        if (count <= 32 || (count % 256) == 0) {
+            aida_target_printf("[target-debugger] absorbed external SINGLE_STEP count=%ld ip=0x%llX pid=%lu tid=%lu\n",
+                count,
+                ip,
+                static_cast<unsigned long>(GetCurrentProcessId()),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static LONG WINAPI target_unhandled_exception_filter(EXCEPTION_POINTERS* ep) {
+    DWORD code = 0;
+    void* addr = nullptr;
+    if (ep && ep->ExceptionRecord) {
+        code = ep->ExceptionRecord->ExceptionCode;
+        addr = ep->ExceptionRecord->ExceptionAddress;
+    }
+
+    aida_target_printf("[target-crash] UNHANDLED_EXCEPTION code=0x%08lX addr=%p pid=%lu tid=%lu\n",
+        static_cast<unsigned long>(code),
+        addr,
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+
+    if (ep && ep->ContextRecord) {
+#ifdef _M_X64
+        aida_target_printf("[target-crash] RIP=0x%016llX RSP=0x%016llX RBP=0x%016llX RAX=0x%016llX RCX=0x%016llX RDX=0x%016llX RFLAGS=0x%08lX\n",
+            static_cast<unsigned long long>(ep->ContextRecord->Rip),
+            static_cast<unsigned long long>(ep->ContextRecord->Rsp),
+            static_cast<unsigned long long>(ep->ContextRecord->Rbp),
+            static_cast<unsigned long long>(ep->ContextRecord->Rax),
+            static_cast<unsigned long long>(ep->ContextRecord->Rcx),
+            static_cast<unsigned long long>(ep->ContextRecord->Rdx),
+            static_cast<unsigned long>(ep->ContextRecord->EFlags));
+
+        const auto* sp = reinterpret_cast<const unsigned long long*>(ep->ContextRecord->Rsp);
+        for (int i = 0; i < 8; ++i) {
+            unsigned long long value = 0;
+            __try {
+                value = sp ? sp[i] : 0;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                aida_target_printf("[target-crash] stack[%02d]=<unreadable>\n", i);
+                break;
+            }
+            aida_target_printf("[target-crash] stack[%02d]=0x%016llX\n", i, value);
+        }
+#else
+        aida_target_printf("[target-crash] EIP=0x%08lX ESP=0x%08lX EBP=0x%08lX EAX=0x%08lX ECX=0x%08lX EDX=0x%08lX EFLAGS=0x%08lX\n",
+            static_cast<unsigned long>(ep->ContextRecord->Eip),
+            static_cast<unsigned long>(ep->ContextRecord->Esp),
+            static_cast<unsigned long>(ep->ContextRecord->Ebp),
+            static_cast<unsigned long>(ep->ContextRecord->Eax),
+            static_cast<unsigned long>(ep->ContextRecord->Ecx),
+            static_cast<unsigned long>(ep->ContextRecord->Edx),
+            static_cast<unsigned long>(ep->ContextRecord->EFlags));
+#endif
+    }
+
+    aida_target_log_close();
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void install_target_crash_handlers() {
+    SetUnhandledExceptionFilter(target_unhandled_exception_filter);
+    g_debugger_veh_handle = AddVectoredExceptionHandler(1, debugger_exception_veh);
+    aida_target_printf("[target-log] crash handlers installed veh=%p pid=%lu tid=%lu\n",
+        g_debugger_veh_handle,
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+}
 
 static BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
     if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT || ctrl_type == CTRL_CLOSE_EVENT) {
@@ -179,6 +271,7 @@ struct cli_args_t {
     bool     skip_network;
     uint32_t net_rate_ms;
     bool     no_external;
+    bool     absorb_external_single_step;
 };
 
 static cli_args_t parse_args(int argc, char* argv[]) {
@@ -190,6 +283,7 @@ static cli_args_t parse_args(int argc, char* argv[]) {
     args.skip_network = false;
     args.net_rate_ms = 1000;
     args.no_external = false;
+    args.absorb_external_single_step = false;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -207,6 +301,10 @@ static cli_args_t parse_args(int argc, char* argv[]) {
             if (args.net_rate_ms < 50) args.net_rate_ms = 50;
         } else if (strcmp(argv[i], "--no-external") == 0) {
             args.no_external = true;
+        } else if (strcmp(argv[i], "--absorb-external-single-step") == 0) {
+            args.absorb_external_single_step = true;
+        } else if (strcmp(argv[i], "--disable-single-step-absorber") == 0) {
+            args.absorb_external_single_step = false;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("AiDA Test Target - CLI test surface for AiDAStandalone.exe\n");
             printf("Usage: AiDA_TestTarget.exe [options]\n");
@@ -217,6 +315,8 @@ static cli_args_t parse_args(int argc, char* argv[]) {
             printf("  --skip-network    Skip network tests\n");
             printf("  --net-rate <ms>   Traffic generator base interval in ms (default: 1000, min: 50)\n");
             printf("  --no-external     Disable opportunistic external DNS/HTTP attempts (loopback only)\n");
+            printf("  --absorb-external-single-step  Enable hostile external SINGLE_STEP absorption\n");
+            printf("  --disable-single-step-absorber Keep external SINGLE_STEP absorption disabled (default)\n");
             printf("  --help, -h        Show this help\n");
             exit(0);
         }
@@ -227,6 +327,16 @@ static cli_args_t parse_args(int argc, char* argv[]) {
 
 static cli_args_t s_args{};
 static HANDLE     s_listener_thread = nullptr;
+
+static void log_work_boundary(const char* name, const char* state) {
+    printf("[work] %s %s tick=%llu pid=%lu tid=%lu\n",
+           state ? state : "?",
+           name ? name : "?",
+           (unsigned long long)GetTickCount64(),
+           GetCurrentProcessId(),
+           GetCurrentThreadId());
+    fflush(stdout);
+}
 
 static DWORD WINAPI tcp_listener_thread(LPVOID param) {
     (void)param;
@@ -245,51 +355,71 @@ static DWORD WINAPI workload_orchestrator(LPVOID param) {
     fflush(stdout);
 
     if (g_running.load()) {
+        log_work_boundary("structs", "BEGIN");
         test_target::structs::config_t scfg{};
         scfg.verbose = args.verbose;
         test_target::structs::run_all(scfg, g_running);
+        log_work_boundary("structs", "END");
     }
 
     if (g_running.load()) {
+        log_work_boundary("memory", "BEGIN");
         test_target::memory::config_t mcfg{};
         mcfg.verbose = args.verbose;
         test_target::memory::run_all(mcfg, g_running);
+        log_work_boundary("memory", "END");
     }
 
     if (g_running.load()) {
+        log_work_boundary("threads", "BEGIN");
         test_target::threads::config_t tcfg{};
         tcfg.verbose = args.verbose;
         test_target::threads::run_all(tcfg, g_running);
+        log_work_boundary("threads", "END");
     }
 
     if (g_running.load()) {
+        log_work_boundary("crypto", "BEGIN");
         test_target::crypto::config_t ccfg{};
         ccfg.verbose = args.verbose;
         test_target::crypto::run_all(ccfg, g_running);
+        log_work_boundary("crypto", "END");
     }
 
     if (g_running.load()) {
+        log_work_boundary("exceptions", "BEGIN");
         test_target::exceptions::config_t ecfg{};
         ecfg.verbose = args.verbose;
         test_target::exceptions::run_all(ecfg, g_running);
+        log_work_boundary("exceptions", "END");
+        g_absorb_external_single_step.store(args.absorb_external_single_step, std::memory_order_release);
+        printf("[target-debugger] external SINGLE_STEP absorber %s after exception tests\n",
+            args.absorb_external_single_step ? "enabled" : "disabled");
+        fflush(stdout);
     }
 
     if (g_running.load()) {
+        log_work_boundary("debug_surface", "BEGIN");
         test_target::debug_surface::config_t dcfg{};
         dcfg.verbose = args.verbose;
         test_target::debug_surface::run_all(dcfg, g_running);
+        log_work_boundary("debug_surface", "END");
     }
 
     if (g_running.load()) {
+        log_work_boundary("file_io", "BEGIN");
         test_target::file_io::config_t fcfg{};
         fcfg.verbose = args.verbose;
         test_target::file_io::run_all(fcfg, g_running);
+        log_work_boundary("file_io", "END");
     }
 
     if (g_running.load()) {
+        log_work_boundary("modules", "BEGIN");
         test_target::modules::config_t modcfg{};
         modcfg.verbose = args.verbose;
         test_target::modules::run_all(modcfg, g_running);
+        log_work_boundary("modules", "END");
     }
 
     if (args.skip_network) {
@@ -301,11 +431,14 @@ static DWORD WINAPI workload_orchestrator(LPVOID param) {
     }
 
     if (g_running.load()) {
+        log_work_boundary("http_server", "BEGIN");
         test_target::http_server::config_t hcfg{};
         hcfg.port = args.http_port;
         hcfg.verbose = args.verbose;
         test_target::http_server::run_all(hcfg, g_running);
+        log_work_boundary("http_server", "END");
 
+        log_work_boundary("traffic", "BEGIN");
         test_target::traffic::config_t gcfg{};
         gcfg.base_port = args.port;
         gcfg.http_port = args.http_port;
@@ -314,6 +447,7 @@ static DWORD WINAPI workload_orchestrator(LPVOID param) {
         gcfg.no_external = args.no_external;
         gcfg.skip_network = args.skip_network;
         test_target::traffic::run_all(gcfg, g_running);
+        log_work_boundary("traffic", "END");
     }
 
     if (g_running.load()) {
@@ -327,10 +461,12 @@ static DWORD WINAPI workload_orchestrator(LPVOID param) {
     }
 
     if (g_running.load() && !args.no_external) {
+        log_work_boundary("network", "BEGIN");
         test_target::network::config_t ncfg{};
         ncfg.listen_port = args.port;
         ncfg.verbose = args.verbose;
         test_target::network::run_all(ncfg, g_running);
+        log_work_boundary("network", "END");
     } else if (args.no_external) {
         printf("[work] external network probes skipped (--no-external, loopback only)\n");
         fflush(stdout);
@@ -341,43 +477,47 @@ static DWORD WINAPI workload_orchestrator(LPVOID param) {
     return 0;
 }
 
+static void log_sync_event_create(const char* name, HANDLE handle, DWORD gle, bool unavailable) {
+    if (handle) {
+        ResetEvent(handle);
+        printf("[sync] created/reset %s ok existed=%d\n", name ? name : "", gle == ERROR_ALREADY_EXISTS ? 1 : 0);
+    } else {
+        printf("[sync] created %s %s (err=%lu)\n", name ? name : "", unavailable ? "unavailable" : "FAILED", gle);
+    }
+    fflush(stdout);
+}
+
 int main(int argc, char* argv[]) {
+    char target_log_path[MAX_PATH * 2] = {};
+    DWORD target_log_len = GetEnvironmentVariableA(
+        "AIDA_TARGET_LOG_PATH",
+        target_log_path,
+        static_cast<DWORD>(sizeof(target_log_path)));
+    if (target_log_len > 0 && target_log_len < sizeof(target_log_path))
+        aida_target_log_set_file(target_log_path);
+    else
+        aida_target_log_set_file("C:\\Users\\Public\\Desktop\\aida_full_test.log");
+    install_target_crash_handlers();
     s_args = parse_args(argc, argv);
     const cli_args_t& args = s_args;
 
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
 
     HANDLE h_ready_local = CreateEventW(nullptr, TRUE, FALSE, L"Local\\WhosWhoTestReady");
-    if (h_ready_local) {
-        printf("[sync] created Local\\WhosWhoTestReady ok\n");
-    } else {
-        printf("[sync] created Local\\WhosWhoTestReady FAILED (err=%lu)\n", GetLastError());
-    }
-    fflush(stdout);
+    DWORD h_ready_local_gle = GetLastError();
+    log_sync_event_create("Local\\WhosWhoTestReady", h_ready_local, h_ready_local_gle, false);
 
     HANDLE h_done_local = CreateEventW(nullptr, TRUE, FALSE, L"Local\\WhosWhoTestDone");
-    if (h_done_local) {
-        printf("[sync] created Local\\WhosWhoTestDone ok\n");
-    } else {
-        printf("[sync] created Local\\WhosWhoTestDone FAILED (err=%lu)\n", GetLastError());
-    }
-    fflush(stdout);
+    DWORD h_done_local_gle = GetLastError();
+    log_sync_event_create("Local\\WhosWhoTestDone", h_done_local, h_done_local_gle, false);
 
     HANDLE h_ready_global = CreateEventW(nullptr, TRUE, FALSE, L"Global\\WhosWhoTestReady");
-    if (h_ready_global) {
-        printf("[sync] created Global\\WhosWhoTestReady ok\n");
-    } else {
-        printf("[sync] created Global\\WhosWhoTestReady unavailable (err=%lu)\n", GetLastError());
-    }
-    fflush(stdout);
+    DWORD h_ready_global_gle = GetLastError();
+    log_sync_event_create("Global\\WhosWhoTestReady", h_ready_global, h_ready_global_gle, true);
 
     HANDLE h_done_global = CreateEventW(nullptr, TRUE, FALSE, L"Global\\WhosWhoTestDone");
-    if (h_done_global) {
-        printf("[sync] created Global\\WhosWhoTestDone ok\n");
-    } else {
-        printf("[sync] created Global\\WhosWhoTestDone unavailable (err=%lu)\n", GetLastError());
-    }
-    fflush(stdout);
+    DWORD h_done_global_gle = GetLastError();
+    log_sync_event_create("Global\\WhosWhoTestDone", h_done_global, h_done_global_gle, true);
 
     printf("[MAIN] AiDA Test Target starting (port=%u, duration=%u, verbose=%s)\n",
            args.port, args.duration_sec, args.verbose ? "true" : "false");
@@ -423,9 +563,9 @@ int main(int argc, char* argv[]) {
 
     HANDLE orchestrator_thread = CreateThread(nullptr, 0, workload_orchestrator, nullptr, 0, nullptr);
     if (orchestrator_thread) {
-        printf("[MAIN] Workload orchestrator dispatched on background thread\n");
+        printf("[MAIN] Workload orchestrator dispatched on background thread handle=%p\n", orchestrator_thread);
     } else {
-        printf("[MAIN] Workload orchestrator FAILED to start (err=%lu)\n", GetLastError());
+        printf("[MAIN] Workload orchestrator FAILED to start (err=%lu); READY will still be signaled for attach diagnostics\n", GetLastError());
     }
     fflush(stdout);
 
@@ -447,6 +587,7 @@ int main(int argc, char* argv[]) {
     printf("[MAIN] Entering main loop (Ctrl+C to stop)\n");
     fflush(stdout);
 
+    bool done_event_shutdown = false;
     uint64_t loop_counter = 0;
     while (g_running.load()) {
         DWORD wait_result;
@@ -456,6 +597,7 @@ int main(int argc, char* argv[]) {
             if (wait_result == WAIT_OBJECT_0 || wait_result == WAIT_OBJECT_0 + 1) {
                 printf("[sync] WhosWhoTestDone signaled -- exiting\n");
                 fflush(stdout);
+                done_event_shutdown = true;
                 g_running.store(false);
             }
         } else if (h_done_local) {
@@ -463,12 +605,35 @@ int main(int argc, char* argv[]) {
             if (wait_result == WAIT_OBJECT_0) {
                 printf("[sync] WhosWhoTestDone signaled -- exiting\n");
                 fflush(stdout);
+                done_event_shutdown = true;
+                g_running.store(false);
+            }
+        } else if (h_done_global) {
+            wait_result = WaitForSingleObject(h_done_global, 1000);
+            if (wait_result == WAIT_OBJECT_0) {
+                printf("[sync] WhosWhoTestDone signaled -- exiting\n");
+                fflush(stdout);
+                done_event_shutdown = true;
                 g_running.store(false);
             }
         } else {
             Sleep(1000);
         }
         loop_counter++;
+
+        if ((loop_counter % 5) == 0) {
+            ULONGLONG elapsed = (GetTickCount64() - start_tick) / 1000;
+            DWORD orch_wait = orchestrator_thread ? WaitForSingleObject(orchestrator_thread, 0) : WAIT_FAILED;
+            DWORD listener_wait = s_listener_thread ? WaitForSingleObject(s_listener_thread, 0) : WAIT_FAILED;
+            printf("[MAIN] Heartbeat: elapsed=%llu sec loop=%llu running=%d orchestrator_wait=0x%08lX listener_wait=0x%08lX single_steps=%ld\n",
+                elapsed,
+                static_cast<unsigned long long>(loop_counter),
+                g_running.load() ? 1 : 0,
+                static_cast<unsigned long>(orch_wait),
+                static_cast<unsigned long>(listener_wait),
+                static_cast<long>(g_absorbed_single_step_count));
+            fflush(stdout);
+        }
 
         if (args.verbose && loop_counter % 10 == 0) {
             ULONGLONG elapsed = (GetTickCount64() - start_tick) / 1000;
@@ -489,8 +654,47 @@ int main(int argc, char* argv[]) {
     printf("[MAIN] Shutting down...\n");
     fflush(stdout);
 
+    if (done_event_shutdown) {
+        // The full-test harness force-kills after 6s; keep the done-event path bounded.
+        printf("[MAIN] Done-event fast shutdown path active\n");
+        fflush(stdout);
+
+        if (orchestrator_thread) {
+            DWORD wr = WaitForSingleObject(orchestrator_thread, 1500);
+            printf("[MAIN] Workload orchestrator fast wait result=0x%08lX err=%lu\n",
+                   wr, wr == WAIT_FAILED ? GetLastError() : 0);
+            CloseHandle(orchestrator_thread);
+            orchestrator_thread = nullptr;
+        }
+
+        if (s_listener_thread) {
+            DWORD wr = WaitForSingleObject(s_listener_thread, 1000);
+            printf("[net] tcp listener fast wait result=0x%08lX err=%lu\n",
+                   wr, wr == WAIT_FAILED ? GetLastError() : 0);
+            CloseHandle(s_listener_thread);
+            s_listener_thread = nullptr;
+        }
+
+        if (g_debugger_veh_handle) {
+            RemoveVectoredExceptionHandler(g_debugger_veh_handle);
+            g_debugger_veh_handle = nullptr;
+        }
+
+        if (h_ready_local) CloseHandle(h_ready_local);
+        if (h_done_local) CloseHandle(h_done_local);
+        if (h_ready_global) CloseHandle(h_ready_global);
+        if (h_done_global) CloseHandle(h_done_global);
+
+        printf("[MAIN] AiDA Test Target exited via done-event fast path\n");
+        fflush(stdout);
+        aida_target_log_close();
+        ExitProcess(0);
+    }
+
     if (orchestrator_thread) {
-        WaitForSingleObject(orchestrator_thread, 10000);
+        DWORD wr = WaitForSingleObject(orchestrator_thread, 10000);
+        printf("[MAIN] Workload orchestrator wait result=0x%08lX err=%lu\n",
+               wr, wr == WAIT_FAILED ? GetLastError() : 0);
         CloseHandle(orchestrator_thread);
         orchestrator_thread = nullptr;
         printf("[MAIN] Workload orchestrator joined\n");
@@ -498,7 +702,9 @@ int main(int argc, char* argv[]) {
     }
 
     if (s_listener_thread) {
-        WaitForSingleObject(s_listener_thread, 5000);
+        DWORD wr = WaitForSingleObject(s_listener_thread, 5000);
+        printf("[net] tcp listener wait result=0x%08lX err=%lu\n",
+               wr, wr == WAIT_FAILED ? GetLastError() : 0);
         CloseHandle(s_listener_thread);
         s_listener_thread = nullptr;
         printf("[net] tcp listener thread joined\n");
@@ -517,6 +723,7 @@ int main(int argc, char* argv[]) {
 
     printf("[MAIN] AiDA Test Target exited cleanly\n");
     fflush(stdout);
+    aida_target_log_close();
 
     return 0;
 }

@@ -108,6 +108,54 @@ inline void build_cfg(uint64_t entry_address);
 
 namespace detail {
 
+inline float estimate_text_width_for_cfg(const char* text, float font_size)
+{
+	if (!text || font_size <= 0.f)
+		return 0.f;
+	float width = 0.f;
+	for (const unsigned char* p = reinterpret_cast<const unsigned char*>(text); *p; ++p) {
+		const unsigned char c = *p;
+		if (c == '\t') {
+			width += font_size * 2.0f;
+		} else if (c == ' ') {
+			width += font_size * 0.35f;
+		} else if (std::strchr("ilI.,:;!|'", c)) {
+			width += font_size * 0.34f;
+		} else if (std::strchr("mwMW@#%&", c)) {
+			width += font_size * 0.86f;
+		} else {
+			width += font_size * 0.58f;
+		}
+	}
+	return width;
+}
+
+inline float estimate_text_width_for_cfg(const std::string& text, float font_size)
+{
+	return estimate_text_width_for_cfg(text.c_str(), font_size);
+}
+
+inline bool safe_decode_for_cfg(const uint8_t* code, int avail, uint64_t va, AsmInstr& out)
+{
+#if defined(_MSC_VER)
+	__try {
+		out = zydis_decode_one(code, avail, va);
+		return true;
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		std::snprintf(out.mnem, sizeof(out.mnem), "db");
+		std::snprintf(out.ops, sizeof(out.ops), "0x%02X", (code && avail > 0) ? code[0] : 0);
+		out.addr = va;
+		out.len = 1;
+		if (code && avail > 0)
+			out.raw[0] = code[0];
+		return false;
+	}
+#else
+	out = zydis_decode_one(code, avail, va);
+	return true;
+#endif
+}
+
 inline std::atomic<bool>&                    pdb_subscription_armed_flag()
 {
 	static std::atomic<bool> armed{false};
@@ -440,6 +488,13 @@ inline void build_cfg(uint64_t entry_address)
 	}
 
 	work_queue::post([entry_address]() {
+		struct build_guard_t {
+			~build_guard_t()
+			{
+				g_state.building.store(false);
+			}
+		} build_guard;
+
 		auto t_start = std::chrono::steady_clock::now();
 		const size_t max_bytes = 0x10000;
 		const size_t max_insns = 4096;
@@ -480,7 +535,18 @@ inline void build_cfg(uint64_t entry_address)
 			int avail = sz - pos;
 			if (avail > 15) avail = 15;
 			uint64_t va = entry_address + pos;
-			AsmInstr ins = zydis_decode_one(data + pos, avail, va);
+			AsmInstr ins = {};
+			if (!detail::safe_decode_for_cfg(data + pos, avail, va, ins)) {
+				diag::log_tagged_fmt("cfg", "build_cfg decode_seh addr=0x%llX",
+					static_cast<unsigned long long>(va));
+			}
+			if (ins.len <= 0) {
+				ins.addr = va;
+				ins.len = 1;
+				std::snprintf(ins.mnem, sizeof(ins.mnem), "db");
+				std::snprintf(ins.ops, sizeof(ins.ops), "0x%02X", data[pos]);
+				ins.raw[0] = data[pos];
+			}
 
 			decoded_insn_t d;
 			d.ins = ins;
@@ -595,12 +661,8 @@ inline void build_cfg(uint64_t entry_address)
 			}
 		}
 
-		ImFont* code_font = aida::ui::fonts::code();
-		if (!code_font) code_font = ImGui::GetFont();
-		ImFont* ui_font = aida::ui::fonts::body_em();
-		if (!ui_font) ui_font = ImGui::GetFont();
-		float code_base = code_font && code_font->FontSize > 0.f ? code_font->FontSize : 13.f;
-		float ui_base = ui_font && ui_font->FontSize > 0.f ? ui_font->FontSize : 13.f;
+		const float code_base = 13.f;
+		const float ui_base = 13.f;
 
 		const float line_gap = 5.f;
 		const float line_h = code_base + line_gap;
@@ -641,11 +703,10 @@ inline void build_cfg(uint64_t entry_address)
 				char ab[24];
 				std::snprintf(ab, sizeof(ab), "%llX",
 					static_cast<unsigned long long>(ln.addr));
-				float aw = code_font->CalcTextSizeA(code_base, FLT_MAX, 0.f, ab).x;
+				float aw = detail::estimate_text_width_for_cfg(ab, code_base);
 				if (aw > addr_w) addr_w = aw;
 				if (!ln.text.empty()) {
-					float tw = code_font->CalcTextSizeA(code_base, FLT_MAX, 0.f,
-						ln.text.c_str()).x;
+					float tw = detail::estimate_text_width_for_cfg(ln.text, code_base);
 					if (tw > text_w) text_w = tw;
 				}
 			}
@@ -656,8 +717,7 @@ inline void build_cfg(uint64_t entry_address)
 				inj_lines = it_inj->second.size();
 				for (const auto& r : it_inj->second) {
 					if (r.text.empty()) continue;
-					float tw = code_font->CalcTextSizeA(code_base, FLT_MAX, 0.f,
-						r.text.c_str()).x;
+					float tw = detail::estimate_text_width_for_cfg(r.text, code_base);
 					if (tw > text_w) text_w = tw;
 				}
 			}
@@ -684,7 +744,7 @@ inline void build_cfg(uint64_t entry_address)
 				std::snprintf(header_buf, sizeof(header_buf), "%s  %llX",
 					kind, static_cast<unsigned long long>(blocks[i].start_addr));
 			}
-			float header_w = ui_font->CalcTextSizeA(ui_base, FLT_MAX, 0.f, header_buf).x;
+			float header_w = detail::estimate_text_width_for_cfg(header_buf, ui_base);
 
 			n.addr_col_w = addr_w + addr_gap;
 
@@ -714,6 +774,10 @@ inline void build_cfg(uint64_t entry_address)
 		}
 
 		cfg_layout::layout(graph, 60.f, 60.f);
+
+		const std::size_t block_count = blocks.size();
+		const std::size_t node_count = graph.nodes.size();
+		const std::size_t edge_count = graph.edges.size();
 
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -745,12 +809,10 @@ inline void build_cfg(uint64_t entry_address)
 		uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
 		diag::log_tagged_fmt("cfg", "build_cfg DONE entry=0x%llX blocks=%zu nodes=%zu edges=%zu duration_ms=%llu",
 			static_cast<unsigned long long>(entry_address),
-			g_state.blocks.size(),
-			g_state.graph.nodes.size(),
-			g_state.graph.edges.size(),
+			block_count,
+			node_count,
+			edge_count,
 			static_cast<unsigned long long>(dur_ms));
-
-		g_state.building.store(false);
 	});
 }
 

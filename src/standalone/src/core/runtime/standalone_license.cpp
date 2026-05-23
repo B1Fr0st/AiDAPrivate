@@ -23,6 +23,7 @@
 #include "reason_ids.hpp"
 #include "hardware_id/hardware_id_v2.hpp"
 #include "plaintext_window.hpp"
+#include "../testlab/test_all_features.hpp"
 
 #include <windows.h>
 #include <winioctl.h>
@@ -2391,6 +2392,17 @@ namespace
         s_arc_fetch_deferred.store(true, std::memory_order_release);
     }
 
+    bool defer_arc_fetch_if_full_test_running(const char* reason)
+    {
+        if (!test_all_features::is_running())
+            return false;
+        defer_arc_fetch();
+        if (s_activation_completed_at_ms.load(std::memory_order_acquire) == 0)
+            mark_activation_completed();
+        lic_log_fmt("%s_deferred_full_test_running", reason ? reason : "arc_fetch");
+        return true;
+    }
+
     std::mutex s_driver_proof_cache_mtx;
     uint64_t s_driver_proof_cache_value = 0;
     std::string s_driver_proof_cache_nonce;
@@ -2433,6 +2445,9 @@ namespace
     {
         static const uint32_t kRetryDelayMs[3] = { 0u, 2000u, 5000u };
 
+        if (defer_arc_fetch_if_full_test_running("arc_load"))
+            return false;
+
         s_arc_download_in_progress.store(true, std::memory_order_release);
         struct progress_clear_guard
         {
@@ -2465,6 +2480,8 @@ namespace
     bool attempt_deferred_arc_fetch(settings_sa_t& settings, const std::string& hwid)
     {
         if (!s_arc_fetch_deferred.load(std::memory_order_acquire) || s_arc_loaded)
+            return false;
+        if (defer_arc_fetch_if_full_test_running("arc_deferred_fetch"))
             return false;
         if (s_activation_completed_at_ms.load(std::memory_order_acquire) == 0)
             return false;
@@ -4799,6 +4816,9 @@ namespace
 
     bool download_and_load_arc(settings_sa_t& settings, const std::string& hwid, uint32_t attempt_number)
     {
+        if (defer_arc_fetch_if_full_test_running("arc_download"))
+            return false;
+
         std::unique_lock<std::mutex> lk(s_arc_mtx);
 
 
@@ -6072,6 +6092,11 @@ namespace
             if (!check_obfuscated_valid() || settings->license_key.empty() || settings->license_session_token.empty())
                 continue;
 
+            if (test_all_features::is_running()) {
+                lic_log("heartbeat_deferred_full_test_running");
+                continue;
+            }
+
             const std::string nonce = generate_nonce();
             std::string error;
             json response;
@@ -6192,6 +6217,11 @@ namespace
 
             if (!check_obfuscated_valid() || settings->license_session_token.empty())
                 continue;
+
+            if (test_all_features::is_running()) {
+                lic_log("srv_refresh_deferred_full_test_running");
+                continue;
+            }
 
             if (!driver_bridge::is_loaded() || !driver_bridge::using_kernel_driver())
                 continue;
@@ -6498,7 +6528,14 @@ namespace standalone_license
         lic_log("activate_applied_response");
 
         lic_log("activate_downloading_arc");
-        if (try_load_arc_with_retries(settings, hwid))
+        bool arc_deferred_for_full_test = false;
+        if (test_all_features::is_running())
+        {
+            arc_deferred_for_full_test = true;
+            defer_arc_fetch_if_full_test_running("activate_arc");
+            lic_log("activate_arc_deferred_full_test_running");
+        }
+        else if (try_load_arc_with_retries(settings, hwid))
         {
             lic_log("activate_arc_done");
         }
@@ -6514,6 +6551,8 @@ namespace standalone_license
         }
 
         mark_activation_completed();
+        if (arc_deferred_for_full_test)
+            lic_log("activate_arc_deferred_after_validation");
         lic_log("activate_snapshot_hashes");
         snapshot_code_hashes();
         lic_log("activate_snapshot_done");

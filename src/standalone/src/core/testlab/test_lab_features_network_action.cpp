@@ -235,15 +235,27 @@ namespace {
 		}
 	}
 
+	BOOL CALLBACK init_test_winsock_once(PINIT_ONCE, PVOID parameter, PVOID*) {
+		bool* ok = static_cast<bool*>(parameter);
+		WSADATA d{};
+		*ok = (WSAStartup(MAKEWORD(2, 2), &d) == 0);
+		return TRUE;
+	}
+
+	bool ensure_test_winsock_ready() {
+		static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+		static bool ok = false;
+		if (!InitOnceExecuteOnce(&once, init_test_winsock_once, &ok, nullptr))
+			return false;
+		return ok;
+	}
+
 	struct wsa_guard_t {
 		bool ok = false;
 		wsa_guard_t() {
-			WSADATA d{};
-			ok = (WSAStartup(MAKEWORD(2, 2), &d) == 0);
+			ok = ensure_test_winsock_ready();
 		}
-		~wsa_guard_t() {
-			if (ok) WSACleanup();
-		}
+		~wsa_guard_t() = default;
 		wsa_guard_t(const wsa_guard_t&) = delete;
 		wsa_guard_t& operator=(const wsa_guard_t&) = delete;
 	};
@@ -399,7 +411,7 @@ namespace {
 		std::uint32_t bytes_returned = 0;
 		if (ui_op == 1u) {
 			voyager::detail::traffic_redirect_list req{};
-			req.operation = 0u;
+			req.operation = 2u;
 			req.rule_count = 0u;
 			bool ok = device->send_ioctl_raw(ioctl_codes::PRED(),
 				&req,
@@ -591,6 +603,15 @@ namespace {
 		push_u32(r, "Step1 START Dst port", req.dst_port);
 		push_u32(r, "Step1 START PID", req.pid);
 
+		auto stop_stream_slot = [&]() {
+			voyager::detail::stream_reassemble_request cleanup_req{};
+			cleanup_req.operation = 1u;
+			cleanup_req.src_port = pair.client_port;
+			cleanup_req.dst_port = pair.listen_port;
+			cleanup_req.pid = 0u;
+			(void)strm_send_ioctl("stop_ioctl_cleanup", cleanup_req, r);
+		};
+
 		const char* probe_payload = "AIDA-STRM-PROBE-PAYLOAD-0123456789";
 		int probe_len = static_cast<int>(std::strlen(probe_payload));
 		int sent = send(pair.client, probe_payload, probe_len, 0);
@@ -598,6 +619,7 @@ namespace {
 			"send()=%d errno=%lu", sent,
 			(sent < 0) ? static_cast<unsigned long>(WSAGetLastError()) : 0ul);
 		if (sent <= 0) {
+			stop_stream_slot();
 			r.error = "send() to accepted socket failed";
 			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 			r.ok = false;

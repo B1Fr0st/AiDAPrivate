@@ -78,6 +78,34 @@ struct local_state_t {
 
 static local_state_t s_state;
 
+inline constexpr const char* s_tab_labels[] = { "Trace", "Deobfuscation", "Slice", "Solver", "Constraints", "Expression" };
+
+inline int tab_count()
+{
+	return static_cast<int>(sizeof(s_tab_labels) / sizeof(s_tab_labels[0]));
+}
+
+inline void set_active_tab(int idx)
+{
+	if (idx < 0 || idx >= tab_count())
+		return;
+	s_state.prev_tab = s_state.active_tab;
+	s_state.active_tab = idx;
+	s_state.content_swap.start(aida::motion::dur::md, aida::motion::ease::out_cubic);
+}
+
+inline int active_tab()
+{
+	return s_state.active_tab;
+}
+
+inline const char* tab_label(int idx)
+{
+	if (idx < 0 || idx >= tab_count())
+		return "";
+	return s_tab_labels[idx];
+}
+
 namespace detail {
 
 inline std::vector<std::string> parse_reg_list(const char* buf) {
@@ -578,8 +606,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float content_y = cy + toolbar_h + 6.f;
 	float content_h = height - toolbar_h - 12.f;
 
-	const char* tab_labels[] = { "Trace", "Deobfuscation", "Slice", "Solver", "Constraints", "Expression" };
-	const int tab_count = 6;
+	const int tab_count = symbolic_view::tab_count();
 	float tab_x = cx + pad;
 	float tab_strip_y = content_y;
 
@@ -594,12 +621,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImFont* tab_fn = aida::ui::fonts::body_em();
 	float tab_fs = tab_fn ? tab_fn->FontSize : ImGui::GetFontSize();
 	for (int i = 0; i < tab_count; ++i) {
-		ImVec2 lsz = tab_fn->CalcTextSizeA(tab_fs, FLT_MAX, 0.f, tab_labels[i]);
+		const char* tab_label_text = symbolic_view::tab_label(i);
+		ImVec2 lsz = tab_fn->CalcTextSizeA(tab_fs, FLT_MAX, 0.f, tab_label_text);
 		float tab_btn_w = lsz.x + 28.f;
 		if (i == st.active_tab) { target_ux = tab_x; target_uw = tab_btn_w; }
 
 		ImGui::SetCursorScreenPos(ImVec2(tab_x, tab_strip_y));
-		ImGui::InvisibleButton(tab_labels[i], ImVec2(tab_btn_w, 30.f));
+		ImGui::InvisibleButton(tab_label_text, ImVec2(tab_btn_w, 30.f));
 		bool hov = ImGui::IsItemHovered();
 		bool clicked = ImGui::IsItemClicked();
 		if (clicked) {
@@ -618,7 +646,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		dl->AddText(tab_fn, tab_fs,
 			ImVec2(tab_x + 14.f, tab_strip_y + (30.f - tab_fs) * 0.5f),
-			aida::ui::with_alpha(t.text_primary, text_alpha_val * alpha), tab_labels[i]);
+			aida::ui::with_alpha(t.text_primary, text_alpha_val * alpha), tab_label_text);
 
 		tab_x += tab_btn_w + 4.f;
 	}

