@@ -1438,26 +1438,37 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
     srv.register_tool({
         "debugger_get_callstack",
         "Return the cached call stack of the active debugger thread (each frame: address, return_addr, module, function_name, module_offset).",
-        {},
+        {{"tid", "string", "Optional thread ID. Defaults to the active debugger thread.", false},
+         {"max_depth", "number", "Maximum stack frames to unwind (default 64, max 256)", false},
+         {"target_pid", "number", "Optional PID override. Switches the active attach context for this call.", false}},
         true,
-        [](const json&) -> tool_result_t {
+        [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "debugger_get_callstack: entry");
-            auto frames = debugger_engine::get_call_stack();
-            diag::log_tagged_fmt("dbg_tools", "debugger_get_callstack: got %zu frames", frames.size());
-            json arr = json::array();
-            for (const auto& f : frames) {
-                json o;
-                o["address"]     = sa_format_address(f.address);
-                o["return_addr"] = sa_format_address(f.return_addr);
-                if (!f.module_name.empty())   o["module"]        = f.module_name;
-                if (!f.function_name.empty()) o["function_name"] = f.function_name;
-                o["module_offset"] = sa_format_address(f.module_offset);
-                arr.push_back(std::move(o));
+            if (auto err = ensure_attached(params))
+                return *err;
+
+            json call_params = params.is_object() ? params : json::object();
+            if (!parse_tid(call_params)) {
+                std::uint32_t tid = debugger_engine::g_state.active_tid;
+                if (tid == 0) {
+                    const std::uint32_t pid = driver_bridge::attached_pid();
+                    for (const auto& th : driver_bridge::enumerate_threads()) {
+                        if (th.owner_pid == pid && th.tid != 0) {
+                            tid = th.tid;
+                            break;
+                        }
+                    }
+                }
+                if (tid == 0) {
+                    diag::log_tagged_fmt("dbg_tools", "debugger_get_callstack: no live thread");
+                    return tool_result_t::error(OBFSTR("No live target thread available."));
+                }
+                call_params["tid"] = std::to_string(tid);
             }
-            json result;
-            result["count"]  = arr.size();
-            result["frames"] = std::move(arr);
-            return tool_result_t::ok(result);
+
+            auto result = dbg_get_callstack(call_params);
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_callstack: delegated success=%d", result.success ? 1 : 0);
+            return result;
         }
     });
 

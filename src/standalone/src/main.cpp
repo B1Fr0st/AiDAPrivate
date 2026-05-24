@@ -1371,9 +1371,11 @@ int main(int, char**)
 
 
         int cur_state = 0;
+        const bool runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
+        const bool license_ready = license::validated && !runtime_locked;
         if (globals::ui::load_timer >= 3.0f) cur_state = 1;
-        if (globals::ui::welcome_done && !license::validated) cur_state = 2;
-        if (globals::ui::welcome_done && license::validated) cur_state = 3;
+        if (globals::ui::welcome_done && !license_ready) cur_state = 2;
+        if (globals::ui::welcome_done && license_ready) cur_state = 3;
         bool state_changed = (cur_state != prev_state);
         if (state_changed) prev_state = cur_state;
 
@@ -1774,7 +1776,9 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         bool bottom = pt.y > rc.bottom - border;
 
 
-        if (globals::ui::welcome_done && license::validated && !globals::ui::maximized) {
+        if (globals::ui::welcome_done && license::validated &&
+            !anti_tamper::state::get().violation_latched.load(std::memory_order_acquire) &&
+            !globals::ui::maximized) {
             if (top    && left)  return HTTOPLEFT;
             if (top    && right) return HTTOPRIGHT;
             if (bottom && left)  return HTBOTTOMLEFT;

@@ -78,10 +78,12 @@ inline void start(uint64_t base_address, int struct_size, const std::string& nam
 	if (!struct_recon::g_state.active) {
 		struct_recon::reconstruct_from_snapshot(base_address, struct_size, name);
 		int wait = 0;
-		while (struct_recon::g_state.monitoring.load() && wait < 200) {
+		while (struct_recon::g_state.monitoring.load() && wait < 20) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));
 			++wait;
 		}
+		if (struct_recon::g_state.monitoring.load())
+			struct_recon::cancel();
 	}
 
 	work_queue::post([base_address, struct_size, pid]() {

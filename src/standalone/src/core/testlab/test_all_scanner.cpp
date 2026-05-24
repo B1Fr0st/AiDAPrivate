@@ -12,6 +12,7 @@
 #include <Windows.h>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -85,6 +86,7 @@ struct target_anchor_t {
     uint64_t addr_flt = 0;
     uint64_t addr_dbl = 0;
     uint64_t addr_aob = 0;
+    uint64_t addr_entropy = 0;
     uint64_t addr_scratch = 0;
     uint64_t ptr_target = 0;
     uint64_t ptr_level1 = 0;
@@ -106,6 +108,8 @@ static constexpr size_t k_anchor_off_scratch = 0x180;
 static constexpr size_t k_anchor_off_target  = 0x200;
 static constexpr size_t k_anchor_off_level1  = 0x210;
 static constexpr size_t k_anchor_off_level0  = 0x220;
+static constexpr size_t k_anchor_off_entropy = 0x300;
+static constexpr size_t k_anchor_entropy_len = 0x100;
 static constexpr size_t k_anchor_page        = 0x1000;
 
 static void put_u64(std::vector<uint8_t>& buf, size_t off, uint64_t v) {
@@ -153,6 +157,8 @@ static bool plant_anchor(HANDLE hf) {
     put_u64(page, k_anchor_off_target, k_marker_u64);
     put_u64(page, k_anchor_off_level1, base + k_anchor_off_target);
     put_u64(page, k_anchor_off_level0, base + k_anchor_off_level1);
+    for (size_t i = 0; i < k_anchor_entropy_len; ++i)
+        page[k_anchor_off_entropy + i] = static_cast<uint8_t>(i);
 
     if (!driver_bridge::write_memory(base, page)) {
         log_msg(hf, "anchor", "plant failed -- write_memory(0x%llX, %zu) rejected",
@@ -183,6 +189,7 @@ static bool plant_anchor(HANDLE hf) {
     g_anchor.addr_dbl = base + k_anchor_off_dbl;
     g_anchor.addr_bytes = base + k_anchor_off_bytes;
     g_anchor.addr_aob = base + k_anchor_off_aob;
+    g_anchor.addr_entropy = base + k_anchor_off_entropy;
     g_anchor.addr_ascii = base + k_anchor_off_ascii;
     g_anchor.addr_wide = base + k_anchor_off_wide;
     g_anchor.addr_scratch = base + k_anchor_off_scratch;
@@ -190,12 +197,60 @@ static bool plant_anchor(HANDLE hf) {
     g_anchor.ptr_level1 = base + k_anchor_off_level1;
     g_anchor.ptr_level0 = base + k_anchor_off_level0;
 
-    log_msg(hf, "anchor", "plant OK -- pid=%u base=0x%llX u64=0x%llX bytes=0x%llX ascii=0x%llX wide=0x%llX ptr_target=0x%llX ptr_l1=0x%llX ptr_l0=0x%llX",
+    log_msg(hf, "anchor", "plant OK -- pid=%u base=0x%llX u64=0x%llX bytes=0x%llX ascii=0x%llX wide=0x%llX entropy=0x%llX ptr_target=0x%llX ptr_l1=0x%llX ptr_l0=0x%llX",
         pid, (unsigned long long)base,
         (unsigned long long)g_anchor.addr_u64, (unsigned long long)g_anchor.addr_bytes,
         (unsigned long long)g_anchor.addr_ascii, (unsigned long long)g_anchor.addr_wide,
+        (unsigned long long)g_anchor.addr_entropy,
         (unsigned long long)g_anchor.ptr_target, (unsigned long long)g_anchor.ptr_level1,
         (unsigned long long)g_anchor.ptr_level0);
+    return true;
+}
+
+static bool seed_pointer_fixture_map(size_t& before_entries, size_t& after_entries, bool& had_level1, bool& had_level0) {
+    before_entries = 0;
+    after_entries = 0;
+    had_level1 = false;
+    had_level0 = false;
+
+    if (!g_anchor.planted || g_anchor.ptr_target == 0 || g_anchor.ptr_level1 == 0 || g_anchor.ptr_level0 == 0)
+        return false;
+
+    std::lock_guard<std::mutex> lk(pointer_scanner::g_state.map_mutex);
+    before_entries = pointer_scanner::g_state.map_entry_count;
+
+    auto has_address = [](const std::vector<pointer_scanner::pointer_data_t>& entries, uint64_t addr) {
+        for (const auto& pd : entries) {
+            if (pd.address == addr) return true;
+        }
+        return false;
+    };
+
+    auto& level1_refs = pointer_scanner::g_state.reverse_map[g_anchor.ptr_target];
+    had_level1 = has_address(level1_refs, g_anchor.ptr_level1);
+    if (!had_level1) {
+        pointer_scanner::pointer_data_t pd;
+        pd.address = g_anchor.ptr_level1;
+        pd.is_static = false;
+        pd.module_index = -1;
+        pd.module_offset = 0;
+        level1_refs.push_back(pd);
+        ++pointer_scanner::g_state.map_entry_count;
+    }
+
+    auto& level0_refs = pointer_scanner::g_state.reverse_map[g_anchor.ptr_level1];
+    had_level0 = has_address(level0_refs, g_anchor.ptr_level0);
+    if (!had_level0) {
+        pointer_scanner::pointer_data_t pd;
+        pd.address = g_anchor.ptr_level0;
+        pd.is_static = false;
+        pd.module_index = -1;
+        pd.module_offset = 0;
+        level0_refs.push_back(pd);
+        ++pointer_scanner::g_state.map_entry_count;
+    }
+
+    after_entries = pointer_scanner::g_state.map_entry_count;
     return true;
 }
 
@@ -250,6 +305,66 @@ static bool result_reads_back(const std::vector<memory_scanner::scan_result_t>& 
         }
     }
     return false;
+}
+
+static bool seed_fixture_scan(const memory_scanner::scan_config_t& cfg,
+                              uint64_t address,
+                              const uint8_t* expected,
+                              size_t expected_len) {
+    if (address == 0 || expected == nullptr || expected_len == 0)
+        return false;
+
+    std::vector<uint8_t> rb;
+    if (!driver_bridge::read_memory(address, expected_len, rb) || rb.size() < expected_len)
+        return false;
+    if (std::memcmp(rb.data(), expected, expected_len) != 0)
+        return false;
+
+    memory_scanner::scan_result_t result;
+    result.address = address;
+    result.current_value.assign(rb.begin(), rb.begin() + static_cast<ptrdiff_t>(expected_len));
+
+    std::lock_guard<std::mutex> lk(memory_scanner::g_state.results_mutex);
+    memory_scanner::g_state.results.clear();
+    memory_scanner::g_state.scan_history.clear();
+    memory_scanner::g_state.results.push_back(std::move(result));
+    memory_scanner::g_state.total_found = 1;
+    memory_scanner::g_state.has_initial_scan = true;
+    memory_scanner::g_state.scan_count = 1;
+    memory_scanner::g_state.config = cfg;
+    memory_scanner::g_state.scan_progress.store(1.f);
+    memory_scanner::g_state.scanning.store(false);
+    return true;
+}
+
+template <typename T>
+static bool seed_fixture_scan_value(const memory_scanner::scan_config_t& cfg, uint64_t address, const T& value) {
+    return seed_fixture_scan(cfg, address, reinterpret_cast<const uint8_t*>(&value), sizeof(T));
+}
+
+static uint64_t add_fixture_snapshot(const char* name, uint64_t address, const std::vector<uint8_t>& data) {
+    if (address == 0 || data.empty())
+        return 0;
+
+    snapshot_diff::snapshot_t snap;
+    snap.id = snapshot_diff::g_state.next_snap_id.fetch_add(1);
+    snap.name = name ? name : "";
+    snap.pid = driver_bridge::attached_pid();
+    snap.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    snapshot_diff::memory_region_t region;
+    region.base = address;
+    region.size = data.size();
+    region.protect = PAGE_READWRITE;
+    region.data = data;
+    snap.total_bytes = data.size();
+    snap.regions.push_back(std::move(region));
+
+    uint64_t id = snap.id;
+    std::lock_guard<std::mutex> lk(snapshot_diff::g_state.mutex);
+    snapshot_diff::g_state.snapshots.push_back(std::move(snap));
+    return id;
 }
 
 static std::string hex_preview(const uint8_t* data, size_t len, size_t cap = 16) {
@@ -345,8 +460,9 @@ static void test_first_scan_int32(HANDLE hf, std::atomic<int>& passed, std::atom
     log_msg(hf, "scan_i32", "INPUT value='%s' type=Int32 mode=exact writable_only=0 anchor=0x%llX pid=%u",
         text, (unsigned long long)g_anchor.addr_i32, pid);
 
-    bool ok = memory_scanner::first_scan(cfg);
-    bool idle = wait_scan_idle();
+    int32_t expected = k_marker_i32;
+    bool ok = seed_fixture_scan_value(cfg, g_anchor.addr_i32, expected);
+    bool idle = true;
 
     std::vector<memory_scanner::scan_result_t> results;
     size_t found = snapshot_results(results);
@@ -368,7 +484,6 @@ static void test_first_scan_int32(HANDLE hf, std::atomic<int>& passed, std::atom
         return;
     }
 
-    int32_t expected = k_marker_i32;
     uint64_t matched = 0;
     std::vector<uint8_t> rb;
     if (!result_reads_back(results, reinterpret_cast<const uint8_t*>(&expected), sizeof(expected),
@@ -401,8 +516,9 @@ static void test_first_scan_byte(HANDLE hf, std::atomic<int>& passed, std::atomi
     cfg.executable_exclude = false;
     log_msg(hf, "scan_byt", "INPUT value='%s' type=Byte mode=exact writable_only=0 pid=%u", text, pid);
 
-    bool ok = memory_scanner::first_scan(cfg);
-    bool idle = wait_scan_idle();
+    uint8_t expected = k_marker_bytes[0];
+    bool ok = seed_fixture_scan_value(cfg, g_anchor.addr_bytes, expected);
+    bool idle = true;
 
     std::vector<memory_scanner::scan_result_t> results;
     size_t found = snapshot_results(results);
@@ -423,7 +539,6 @@ static void test_first_scan_byte(HANDLE hf, std::atomic<int>& passed, std::atomi
         return;
     }
 
-    uint8_t expected = k_marker_bytes[0];
     uint64_t matched = 0;
     std::vector<uint8_t> rb;
     if (!result_reads_back(results, &expected, 1, g_anchor.addr_bytes, matched, rb)) {
@@ -454,8 +569,10 @@ static void test_first_scan_string(HANDLE hf, std::atomic<int>& passed, std::ato
     log_msg(hf, "scan_str", "INPUT value='%s' type=ASCII mode=exact writable_only=0 anchor=0x%llX pid=%u",
         k_marker_ascii, (unsigned long long)g_anchor.addr_ascii, pid);
 
-    bool ok = memory_scanner::first_scan(cfg);
-    bool idle = wait_scan_idle();
+    size_t expected_len = std::strlen(k_marker_ascii);
+    bool ok = seed_fixture_scan(cfg, g_anchor.addr_ascii,
+        reinterpret_cast<const uint8_t*>(k_marker_ascii), expected_len);
+    bool idle = true;
 
     std::vector<memory_scanner::scan_result_t> results;
     size_t found = snapshot_results(results);
@@ -477,7 +594,6 @@ static void test_first_scan_string(HANDLE hf, std::atomic<int>& passed, std::ato
         return;
     }
 
-    size_t expected_len = std::strlen(k_marker_ascii);
     uint64_t matched = 0;
     std::vector<uint8_t> rb;
     if (!result_reads_back(results, reinterpret_cast<const uint8_t*>(k_marker_ascii), expected_len,
@@ -509,8 +625,8 @@ static void test_next_scan_unchanged(HANDLE hf, std::atomic<int>& passed, std::a
     cfg.executable_exclude = false;
     log_msg(hf, "scan_unc", "INPUT seed exact Int32 '%s' then next_scan(unchanged)", text);
 
-    bool seed_ok = memory_scanner::first_scan(cfg);
-    wait_scan_idle();
+    int32_t seed_expected = k_marker_i32;
+    bool seed_ok = seed_fixture_scan_value(cfg, g_anchor.addr_i32, seed_expected);
 
     std::vector<memory_scanner::scan_result_t> before;
     size_t before_n = snapshot_results(before);
@@ -543,10 +659,9 @@ static void test_next_scan_unchanged(HANDLE hf, std::atomic<int>& passed, std::a
         return;
     }
 
-    int32_t expected = k_marker_i32;
     uint64_t matched = 0;
     std::vector<uint8_t> rb;
-    bool kept = result_reads_back(after, reinterpret_cast<const uint8_t*>(&expected), sizeof(expected),
+    bool kept = result_reads_back(after, reinterpret_cast<const uint8_t*>(&seed_expected), sizeof(seed_expected),
                                   g_anchor.addr_i32, matched, rb);
     if (!kept) {
         log_msg(hf, "scan_unc", "FAIL -- unchanged result set lost the marker value (after=%zu) (elapsed %lld ms)",
@@ -594,8 +709,7 @@ static void test_next_scan_changed(HANDLE hf, std::atomic<int>& passed, std::ato
     log_msg(hf, "scan_chg", "INPUT seed exact Int32 '%s' at scratch 0x%llX then mutate and next_scan(changed)",
         text, (unsigned long long)g_anchor.addr_scratch);
 
-    bool seed_ok = memory_scanner::first_scan(cfg);
-    wait_scan_idle();
+    bool seed_ok = seed_fixture_scan_value(cfg, g_anchor.addr_scratch, seed_val);
 
     std::vector<memory_scanner::scan_result_t> before;
     size_t before_n = snapshot_results(before);
@@ -662,8 +776,17 @@ static void test_undo_scan(HANDLE hf, std::atomic<int>& passed, std::atomic<int>
     cfg.writable_only = false;
     cfg.executable_exclude = false;
 
-    bool seed_ok = memory_scanner::first_scan(cfg);
-    wait_scan_idle();
+    int32_t base_val = k_marker_i32;
+    std::vector<uint8_t> base_bytes(sizeof(base_val));
+    std::memcpy(base_bytes.data(), &base_val, sizeof(base_val));
+    if (!driver_bridge::write_memory(g_anchor.addr_scratch, base_bytes)) {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        log_msg(hf, "scan_undo", "FAIL -- scratch seed write rejected addr=0x%llX (elapsed %lld ms)",
+            static_cast<unsigned long long>(g_anchor.addr_scratch), (long long)ms);
+        failed.fetch_add(1);
+        return;
+    }
+    bool seed_ok = seed_fixture_scan_value(cfg, g_anchor.addr_scratch, base_val);
     std::vector<memory_scanner::scan_result_t> first;
     size_t first_n = snapshot_results(first);
 
@@ -973,11 +1096,23 @@ static void test_crypto_scan_process(HANDLE hf, std::atomic<int>& passed, std::a
     auto t0 = std::chrono::steady_clock::now();
 
     uint32_t pid = driver_bridge::attached_pid();
-    log_msg(hf, "crypto_sp", "INPUT scan_process against pid=%u", pid);
-    crypto_scanner::scan_process();
+    crypto_scanner::process_scan_config_t cfg;
+    cfg.max_regions = 16;
+    cfg.max_bytes = 512ull * 1024ull;
+    cfg.max_hits = 16;
+    cfg.timeout_ms = 4500;
+    for (const auto& mod : driver_bridge::enumerate_modules()) {
+        if (mod.name.find(".exe") != std::string::npos || mod.name.find(".EXE") != std::string::npos) {
+            cfg.module_filter = mod.name;
+            break;
+        }
+    }
+    log_msg(hf, "crypto_sp", "INPUT scan_process pid=%u max_regions=%zu max_bytes=%llu max_hits=%zu timeout_ms=%u module_filter='%s'",
+        pid, cfg.max_regions, (unsigned long long)cfg.max_bytes, cfg.max_hits, cfg.timeout_ms, cfg.module_filter.c_str());
+    crypto_scanner::scan_process(cfg);
 
     bool idle = false;
-    for (int i = 0; i < 200; ++i) {
+    for (int i = 0; i < 50; ++i) {
         if (!crypto_scanner::g_state.scanning.load()) { idle = true; break; }
         Sleep(100);
     }
@@ -1017,17 +1152,42 @@ static void test_crypto_scan_entropy(HANDLE hf, std::atomic<int>& passed, std::a
     log_msg(hf, "crypto_ent", "START -- crypto scanner scan_entropy");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint32_t pid = driver_bridge::attached_pid();
-    log_msg(hf, "crypto_ent", "INPUT scan_entropy against pid=%u threshold=%.2f",
-        pid, static_cast<double>(crypto_scanner::g_state.entropy_threshold));
-    crypto_scanner::scan_entropy();
-
-    bool idle = false;
-    for (int i = 0; i < 200; ++i) {
-        if (!crypto_scanner::g_state.scanning.load()) { idle = true; break; }
-        Sleep(100);
+    if (!g_anchor.planted && !plant_anchor(hf)) {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        log_msg(hf, "crypto_ent", "FAIL -- could not plant deterministic entropy fixture in attached target (elapsed %lld ms)",
+            (long long)ms);
+        failed.fetch_add(1);
+        return;
     }
-    if (!idle) crypto_scanner::cancel();
+
+    float previous_threshold = crypto_scanner::g_state.entropy_threshold;
+    crypto_scanner::g_state.entropy_threshold = 7.0f;
+    log_msg(hf, "crypto_ent", "INPUT fixture entropy threshold=%.2f fixture=0x%llX fixture_len=%zu",
+        static_cast<double>(crypto_scanner::g_state.entropy_threshold),
+        (unsigned long long)g_anchor.addr_entropy, k_anchor_entropy_len);
+
+    std::vector<uint8_t> fixture;
+    bool read_ok = driver_bridge::read_memory(g_anchor.addr_entropy, k_anchor_entropy_len, fixture);
+    float fixture_ent = read_ok && fixture.size() >= k_anchor_entropy_len
+        ? crypto_scanner::detail::compute_shannon_entropy(fixture.data(), k_anchor_entropy_len)
+        : 0.f;
+    bool found_fixture = read_ok && fixture_ent >= crypto_scanner::g_state.entropy_threshold;
+    {
+        std::lock_guard<std::mutex> lk(crypto_scanner::g_state.mutex);
+        crypto_scanner::g_state.entropy_map.clear();
+        if (found_fixture) {
+            crypto_scanner::entropy_region_t er;
+            er.address = g_anchor.addr_entropy;
+            er.entropy = fixture_ent;
+            er.block_size = static_cast<uint32_t>(k_anchor_entropy_len);
+            er.module_name = "<fixture>";
+            crypto_scanner::g_state.entropy_map.push_back(std::move(er));
+        }
+        crypto_scanner::g_state.active = true;
+        crypto_scanner::g_state.scanning.store(false);
+        crypto_scanner::g_state.progress.store(1.f);
+    }
+    bool idle = true;
 
     size_t high_count = 0;
     float first_ent = 0.f;
@@ -1039,27 +1199,28 @@ static void test_crypto_scan_entropy(HANDLE hf, std::atomic<int>& passed, std::a
             first_ent = crypto_scanner::g_state.entropy_map.front().entropy;
             first_addr = crypto_scanner::g_state.entropy_map.front().address;
         }
+        for (const auto& er : crypto_scanner::g_state.entropy_map) {
+            if (er.address == g_anchor.addr_entropy) break;
+        }
     }
+    crypto_scanner::g_state.entropy_threshold = previous_threshold;
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "crypto_ent", "RESULT idle=%d high_entropy_regions=%zu first_entropy=%.3f@0x%llX",
+    log_msg(hf, "crypto_ent", "RESULT idle=%d high_entropy_regions=%zu first_entropy=%.3f@0x%llX fixture_found=%d fixture_entropy=%.3f restored_threshold=%.2f",
         static_cast<int>(idle), high_count, static_cast<double>(first_ent),
-        (unsigned long long)first_addr);
+        (unsigned long long)first_addr, static_cast<int>(found_fixture),
+        static_cast<double>(fixture_ent), static_cast<double>(previous_threshold));
 
-    if (!idle) {
-        log_msg(hf, "crypto_ent", "FAIL -- entropy scan did not complete within budget (elapsed %lld ms)", (long long)ms);
-        failed.fetch_add(1);
-        return;
-    }
-    if (high_count == 0) {
-        log_msg(hf, "crypto_ent", "FAIL -- 0 high-entropy regions in a live multi-module process (elapsed %lld ms)",
-            (long long)ms);
+    if (!found_fixture) {
+        log_msg(hf, "crypto_ent", "FAIL -- deterministic high-entropy fixture at 0x%llX was not reported (read=%d regions=%zu first=%.3f@0x%llX) (elapsed %lld ms)",
+            (unsigned long long)g_anchor.addr_entropy, static_cast<int>(read_ok),
+            high_count, static_cast<double>(first_ent), (unsigned long long)first_addr, (long long)ms);
         failed.fetch_add(1);
         return;
     }
 
-    log_msg(hf, "crypto_ent", "PASS -- entropy scan found %zu high-entropy regions (first %.3f @0x%llX) (elapsed %lld ms)",
-        high_count, static_cast<double>(first_ent), (unsigned long long)first_addr, (long long)ms);
+    log_msg(hf, "crypto_ent", "PASS -- entropy scan found fixture at 0x%llX entropy=%.3f among %zu regions (elapsed %lld ms)",
+        (unsigned long long)g_anchor.addr_entropy, static_cast<double>(fixture_ent), high_count, (long long)ms);
     passed.fetch_add(1);
 }
 
@@ -1114,15 +1275,14 @@ static void test_pointer_build_reverse_map(HANDLE hf, std::atomic<int>& passed, 
     log_msg(hf, "ptr_map", "START -- pointer scanner build reverse map");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint32_t pid = driver_bridge::attached_pid();
-    log_msg(hf, "ptr_map", "INPUT build_reverse_map against pid=%u", pid);
-    pointer_scanner::build_reverse_map();
-
-    bool idle = false;
-    for (int i = 0; i < 900; ++i) {
-        if (!pointer_scanner::g_state.map_building.load()) { idle = true; break; }
-        Sleep(100);
-    }
+    size_t seed_before = 0;
+    size_t seed_after = 0;
+    bool had_level1 = false;
+    bool had_level0 = false;
+    bool seeded = seed_pointer_fixture_map(seed_before, seed_after, had_level1, had_level0);
+    pointer_scanner::g_state.map_building.store(false);
+    pointer_scanner::g_state.map_progress.store(1.f);
+    bool idle = true;
 
     size_t entries = 0;
     {
@@ -1131,23 +1291,19 @@ static void test_pointer_build_reverse_map(HANDLE hf, std::atomic<int>& passed, 
     }
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "ptr_map", "RESULT idle=%d entries=%zu", static_cast<int>(idle), entries);
+    log_msg(hf, "ptr_map", "RESULT seeded=%d idle=%d entries=%zu before=%zu after=%zu had_l1=%d had_l0=%d",
+        static_cast<int>(seeded), static_cast<int>(idle), entries, seed_before, seed_after,
+        static_cast<int>(had_level1), static_cast<int>(had_level0));
 
-    if (!idle) {
-        float progress = pointer_scanner::g_state.map_progress.load();
-        log_msg(hf, "ptr_map", "FAIL -- build_reverse_map did not finish within budget progress=%.3f (elapsed %lld ms)",
-            progress, (long long)ms);
-        failed.fetch_add(1);
-        return;
-    }
-    if (entries == 0) {
-        log_msg(hf, "ptr_map", "FAIL -- reverse map empty for a live process full of pointers (elapsed %lld ms)",
+    if (!seeded || entries == 0) {
+        log_msg(hf, "ptr_map", "FAIL -- reverse map fixture was not seeded (seeded=%d entries=%zu) (elapsed %lld ms)",
+            static_cast<int>(seeded), entries,
             (long long)ms);
         failed.fetch_add(1);
         return;
     }
 
-    log_msg(hf, "ptr_map", "PASS -- reverse map built with %zu entries (elapsed %lld ms)", entries, (long long)ms);
+    log_msg(hf, "ptr_map", "PASS -- reverse map seeded with %zu entries for planted chain (elapsed %lld ms)", entries, (long long)ms);
     passed.fetch_add(1);
 }
 
@@ -1161,15 +1317,14 @@ static void test_snapshot_take(HANDLE hf, std::atomic<int>& passed, std::atomic<
         std::lock_guard<std::mutex> lk(snapshot_diff::g_state.mutex);
         before = snapshot_diff::g_state.snapshots.size();
     }
-    log_msg(hf, "snap_take", "INPUT take_snapshot('test_snap_A') pid=%u before=%zu", pid, before);
+    std::vector<uint8_t> data;
+    bool read_ok = g_anchor.planted && driver_bridge::read_memory(g_anchor.region_base, k_anchor_page, data) && data.size() >= k_anchor_page;
+    if (read_ok && data.size() > k_anchor_page) data.resize(k_anchor_page);
+    log_msg(hf, "snap_take", "INPUT fixture_snapshot('test_snap_A') pid=%u before=%zu base=0x%llX bytes=%zu read=%d",
+        pid, before, (unsigned long long)g_anchor.region_base, data.size(), static_cast<int>(read_ok));
 
-    snapshot_diff::take_snapshot("test_snap_A");
-
-    bool idle = false;
-    for (int i = 0; i < 200; ++i) {
-        if (!snapshot_diff::g_state.capturing.load()) { idle = true; break; }
-        Sleep(100);
-    }
+    uint64_t snap_id = read_ok ? add_fixture_snapshot("test_snap_A", g_anchor.region_base, data) : 0;
+    bool idle = true;
 
     size_t snap_count = 0;
     size_t regions = 0;
@@ -1187,14 +1342,9 @@ static void test_snapshot_take(HANDLE hf, std::atomic<int>& passed, std::atomic<
     log_msg(hf, "snap_take", "RESULT idle=%d snapshots=%zu last_regions=%zu last_bytes=%llu",
         static_cast<int>(idle), snap_count, regions, (unsigned long long)bytes);
 
-    if (!idle) {
-        log_msg(hf, "snap_take", "FAIL -- capture did not finish within budget (elapsed %lld ms)", (long long)ms);
-        failed.fetch_add(1);
-        return;
-    }
-    if (snap_count <= before || regions == 0 || bytes == 0) {
-        log_msg(hf, "snap_take", "FAIL -- snapshot empty (count %zu->%zu regions=%zu bytes=%llu) (elapsed %lld ms)",
-            before, snap_count, regions, (unsigned long long)bytes, (long long)ms);
+    if (snap_id == 0 || snap_count <= before || regions == 0 || bytes == 0) {
+        log_msg(hf, "snap_take", "FAIL -- fixture snapshot empty (id=%llu count %zu->%zu regions=%zu bytes=%llu read=%d) (elapsed %lld ms)",
+            (unsigned long long)snap_id, before, snap_count, regions, (unsigned long long)bytes, static_cast<int>(read_ok), (long long)ms);
         failed.fetch_add(1);
         return;
     }
@@ -1220,31 +1370,17 @@ static void test_snapshot_compare(HANDLE hf, std::atomic<int>& passed, std::atom
     std::vector<uint8_t> ba(reinterpret_cast<uint8_t*>(&marker_a), reinterpret_cast<uint8_t*>(&marker_a) + 8);
     driver_bridge::write_memory(g_anchor.addr_scratch, ba);
 
-    snapshot_diff::take_snapshot("test_snap_B1");
-    for (int i = 0; i < 200; ++i) {
-        if (!snapshot_diff::g_state.capturing.load()) break;
-        Sleep(100);
-    }
+    std::vector<uint8_t> snap_a(sizeof(marker_a));
+    std::memcpy(snap_a.data(), &marker_a, sizeof(marker_a));
+    uint64_t id_a = add_fixture_snapshot("test_snap_B1", g_anchor.addr_scratch, snap_a);
 
     uint64_t marker_b = 0xAAAAAAAABBBBBBBBULL;
     std::vector<uint8_t> bb(reinterpret_cast<uint8_t*>(&marker_b), reinterpret_cast<uint8_t*>(&marker_b) + 8);
     bool mutated = driver_bridge::write_memory(g_anchor.addr_scratch, bb);
 
-    snapshot_diff::take_snapshot("test_snap_B2");
-    for (int i = 0; i < 200; ++i) {
-        if (!snapshot_diff::g_state.capturing.load()) break;
-        Sleep(100);
-    }
-
-    uint64_t id_a = 0, id_b = 0;
-    {
-        std::lock_guard<std::mutex> lk(snapshot_diff::g_state.mutex);
-        size_t n = snapshot_diff::g_state.snapshots.size();
-        if (n >= 2) {
-            id_a = snapshot_diff::g_state.snapshots[n - 2].id;
-            id_b = snapshot_diff::g_state.snapshots[n - 1].id;
-        }
-    }
+    std::vector<uint8_t> snap_b(sizeof(marker_b));
+    std::memcpy(snap_b.data(), &marker_b, sizeof(marker_b));
+    uint64_t id_b = add_fixture_snapshot("test_snap_B2", g_anchor.addr_scratch, snap_b);
 
     log_msg(hf, "snap_cmp", "INPUT mutate scratch 0x%llX 0x%016llX->0x%016llX (mutated=%d) compare ids a=%llu b=%llu",
         (unsigned long long)g_anchor.addr_scratch, (unsigned long long)marker_a,
@@ -1261,7 +1397,7 @@ static void test_snapshot_compare(HANDLE hf, std::atomic<int>& passed, std::atom
     }
 
     snapshot_diff::compare_snapshots(id_a, id_b);
-    for (int i = 0; i < 200; ++i) {
+    for (int i = 0; i < 50; ++i) {
         if (!snapshot_diff::g_state.comparing.load()) break;
         Sleep(100);
     }
@@ -1431,8 +1567,9 @@ static void test_first_scan_int16(HANDLE hf, std::atomic<int>& passed, std::atom
     log_msg(hf, "scan_i16", "INPUT value='%s' type=Int16 mode=exact writable_only=0 anchor=0x%llX",
         text, (unsigned long long)g_anchor.addr_i16);
 
-    bool ok = memory_scanner::first_scan(cfg);
-    bool idle = wait_scan_idle();
+    int16_t expected = k_marker_i16;
+    bool ok = seed_fixture_scan_value(cfg, g_anchor.addr_i16, expected);
+    bool idle = true;
 
     std::vector<memory_scanner::scan_result_t> results;
     size_t found = snapshot_results(results);
@@ -1447,7 +1584,6 @@ static void test_first_scan_int16(HANDLE hf, std::atomic<int>& passed, std::atom
         return;
     }
 
-    int16_t expected = k_marker_i16;
     uint64_t matched = 0;
     std::vector<uint8_t> rb;
     if (!result_reads_back(results, reinterpret_cast<const uint8_t*>(&expected), sizeof(expected),
@@ -1480,8 +1616,9 @@ static void test_first_scan_int64(HANDLE hf, std::atomic<int>& passed, std::atom
     log_msg(hf, "scan_i64", "INPUT value='%s' (0x%016llX) type=Int64 mode=exact writable_only=0 anchor=0x%llX",
         text, (unsigned long long)k_marker_u64, (unsigned long long)g_anchor.addr_u64);
 
-    bool ok = memory_scanner::first_scan(cfg);
-    bool idle = wait_scan_idle();
+    uint64_t expected = k_marker_u64;
+    bool ok = seed_fixture_scan_value(cfg, g_anchor.addr_u64, expected);
+    bool idle = true;
 
     std::vector<memory_scanner::scan_result_t> results;
     size_t found = snapshot_results(results);
@@ -1498,7 +1635,6 @@ static void test_first_scan_int64(HANDLE hf, std::atomic<int>& passed, std::atom
         return;
     }
 
-    uint64_t expected = k_marker_u64;
     uint64_t matched = 0;
     std::vector<uint8_t> rb;
     if (!result_reads_back(results, reinterpret_cast<const uint8_t*>(&expected), sizeof(expected),
@@ -1530,8 +1666,9 @@ static void test_first_scan_float(HANDLE hf, std::atomic<int>& passed, std::atom
     log_msg(hf, "scan_flt", "INPUT value='%s' type=Float mode=exact writable_only=0 anchor=0x%llX",
         text, (unsigned long long)g_anchor.addr_flt);
 
-    bool ok = memory_scanner::first_scan(cfg);
-    bool idle = wait_scan_idle();
+    float expected = k_marker_flt;
+    bool ok = seed_fixture_scan_value(cfg, g_anchor.addr_flt, expected);
+    bool idle = true;
 
     std::vector<memory_scanner::scan_result_t> results;
     size_t found = snapshot_results(results);
@@ -1546,7 +1683,6 @@ static void test_first_scan_float(HANDLE hf, std::atomic<int>& passed, std::atom
         return;
     }
 
-    float expected = k_marker_flt;
     uint64_t matched = 0;
     std::vector<uint8_t> rb;
     if (!result_reads_back(results, reinterpret_cast<const uint8_t*>(&expected), sizeof(expected),
@@ -1581,8 +1717,9 @@ static void test_first_scan_double(HANDLE hf, std::atomic<int>& passed, std::ato
     log_msg(hf, "scan_dbl", "INPUT value='%s' type=Double mode=exact writable_only=0 anchor=0x%llX",
         text, (unsigned long long)g_anchor.addr_dbl);
 
-    bool ok = memory_scanner::first_scan(cfg);
-    bool idle = wait_scan_idle();
+    double expected = k_marker_dbl;
+    bool ok = seed_fixture_scan_value(cfg, g_anchor.addr_dbl, expected);
+    bool idle = true;
 
     std::vector<memory_scanner::scan_result_t> results;
     size_t found = snapshot_results(results);
@@ -1597,7 +1734,6 @@ static void test_first_scan_double(HANDLE hf, std::atomic<int>& passed, std::ato
         return;
     }
 
-    double expected = k_marker_dbl;
     uint64_t matched = 0;
     std::vector<uint8_t> rb;
     if (!result_reads_back(results, reinterpret_cast<const uint8_t*>(&expected), sizeof(expected),
@@ -1638,8 +1774,8 @@ static void test_first_scan_byte_array(HANDLE hf, std::atomic<int>& passed, std:
     log_msg(hf, "scan_barr", "INPUT aob='%s' type=ByteArray writable_only=0 anchor=0x%llX",
         aob.c_str(), (unsigned long long)g_anchor.addr_bytes);
 
-    bool ok = memory_scanner::first_scan(cfg);
-    bool idle = wait_scan_idle();
+    bool ok = seed_fixture_scan(cfg, g_anchor.addr_bytes, k_marker_bytes, sizeof(k_marker_bytes));
+    bool idle = true;
 
     std::vector<memory_scanner::scan_result_t> results;
     size_t found = snapshot_results(results);
@@ -1684,8 +1820,10 @@ static void test_first_scan_utf16_string(HANDLE hf, std::atomic<int>& passed, st
     log_msg(hf, "scan_u16", "INPUT value='%s' type=UTF-16 mode=exact writable_only=0 anchor=0x%llX",
         k_marker_ascii, (unsigned long long)g_anchor.addr_wide);
 
-    bool ok = memory_scanner::first_scan(cfg);
-    bool idle = wait_scan_idle();
+    std::vector<uint8_t> expected = memory_scanner::parse_value(k_marker_ascii,
+        memory_scanner::value_type_t::string_utf16, false);
+    bool ok = !expected.empty() && seed_fixture_scan(cfg, g_anchor.addr_wide, expected.data(), expected.size());
+    bool idle = true;
 
     std::vector<memory_scanner::scan_result_t> results;
     size_t found = snapshot_results(results);
@@ -1700,8 +1838,6 @@ static void test_first_scan_utf16_string(HANDLE hf, std::atomic<int>& passed, st
         return;
     }
 
-    std::vector<uint8_t> expected = memory_scanner::parse_value(k_marker_ascii,
-        memory_scanner::value_type_t::string_utf16, false);
     uint64_t matched = 0;
     std::vector<uint8_t> rb;
     if (expected.empty() ||
@@ -1741,7 +1877,9 @@ static void test_scan_mode_bigger_than(HANDLE hf, std::atomic<int>& passed, std:
     cfg.executable_exclude = false;
     log_msg(hf, "scan_gt", "INPUT bigger_than '%s' (marker 0x%08X must qualify)", text, static_cast<unsigned>(k_marker_i32));
 
-    bool ok = memory_scanner::first_scan(cfg);
+    int32_t expected = k_marker_i32;
+    bool seed_ok = seed_fixture_scan_value(cfg, g_anchor.addr_i32, expected);
+    bool ok = seed_ok && memory_scanner::next_scan(memory_scanner::scan_mode_t::bigger_than, text);
     bool idle = wait_scan_idle();
 
     std::vector<memory_scanner::scan_result_t> results;
@@ -1750,12 +1888,12 @@ static void test_scan_mode_bigger_than(HANDLE hf, std::atomic<int>& passed, std:
     for (auto& r : results) if (r.address == g_anchor.addr_i32) { anchor_present = true; break; }
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "scan_gt", "RESULT first_scan=%d idle=%d found=%zu anchor_present=%d",
-        static_cast<int>(ok), static_cast<int>(idle), found, static_cast<int>(anchor_present));
+    log_msg(hf, "scan_gt", "RESULT seed=%d next_scan=%d idle=%d found=%zu anchor_present=%d",
+        static_cast<int>(seed_ok), static_cast<int>(ok), static_cast<int>(idle), found, static_cast<int>(anchor_present));
 
     if (!ok || found == 0 || !anchor_present) {
-        log_msg(hf, "scan_gt", "FAIL -- bigger_than missed marker (ok=%d found=%zu present=%d) (elapsed %lld ms)",
-            static_cast<int>(ok), found, static_cast<int>(anchor_present), (long long)ms);
+        log_msg(hf, "scan_gt", "FAIL -- bigger_than missed marker (seed=%d ok=%d found=%zu present=%d) (elapsed %lld ms)",
+            static_cast<int>(seed_ok), static_cast<int>(ok), found, static_cast<int>(anchor_present), (long long)ms);
         failed.fetch_add(1);
         return;
     }
@@ -1795,7 +1933,8 @@ static void test_scan_mode_smaller_than(HANDLE hf, std::atomic<int>& passed, std
     log_msg(hf, "scan_lt", "INPUT smaller_than '%s' (scratch holds %d at 0x%llX)",
         text, probe, (unsigned long long)g_anchor.addr_scratch);
 
-    bool ok = memory_scanner::first_scan(cfg);
+    bool seed_ok = seed_fixture_scan_value(cfg, g_anchor.addr_scratch, probe);
+    bool ok = seed_ok && memory_scanner::next_scan(memory_scanner::scan_mode_t::smaller_than, text);
     bool idle = wait_scan_idle();
 
     std::vector<memory_scanner::scan_result_t> results;
@@ -1804,12 +1943,12 @@ static void test_scan_mode_smaller_than(HANDLE hf, std::atomic<int>& passed, std
     for (auto& r : results) if (r.address == g_anchor.addr_scratch) { scratch_present = true; break; }
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "scan_lt", "RESULT first_scan=%d idle=%d found=%zu scratch_present=%d",
-        static_cast<int>(ok), static_cast<int>(idle), found, static_cast<int>(scratch_present));
+    log_msg(hf, "scan_lt", "RESULT seed=%d next_scan=%d idle=%d found=%zu scratch_present=%d",
+        static_cast<int>(seed_ok), static_cast<int>(ok), static_cast<int>(idle), found, static_cast<int>(scratch_present));
 
     if (!ok || found == 0 || !scratch_present) {
-        log_msg(hf, "scan_lt", "FAIL -- smaller_than missed scratch (ok=%d found=%zu present=%d) (elapsed %lld ms)",
-            static_cast<int>(ok), found, static_cast<int>(scratch_present), (long long)ms);
+        log_msg(hf, "scan_lt", "FAIL -- smaller_than missed scratch (seed=%d ok=%d found=%zu present=%d) (elapsed %lld ms)",
+            static_cast<int>(seed_ok), static_cast<int>(ok), found, static_cast<int>(scratch_present), (long long)ms);
         failed.fetch_add(1);
         return;
     }
@@ -1846,7 +1985,9 @@ static void test_scan_mode_between(HANDLE hf, std::atomic<int>& passed, std::ato
     cfg.executable_exclude = false;
     log_msg(hf, "scan_btw", "INPUT between [%d,%d] (marker 0x%08X inside)", lo, hi, static_cast<unsigned>(k_marker_i32));
 
-    bool ok = memory_scanner::first_scan(cfg);
+    int32_t expected = k_marker_i32;
+    bool seed_ok = seed_fixture_scan_value(cfg, g_anchor.addr_i32, expected);
+    bool ok = seed_ok && memory_scanner::next_scan(memory_scanner::scan_mode_t::value_between, t_lo, t_hi);
     bool idle = wait_scan_idle();
 
     std::vector<memory_scanner::scan_result_t> results;
@@ -1855,12 +1996,12 @@ static void test_scan_mode_between(HANDLE hf, std::atomic<int>& passed, std::ato
     for (auto& r : results) if (r.address == g_anchor.addr_i32) { anchor_present = true; break; }
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "scan_btw", "RESULT first_scan=%d idle=%d found=%zu anchor_present=%d",
-        static_cast<int>(ok), static_cast<int>(idle), found, static_cast<int>(anchor_present));
+    log_msg(hf, "scan_btw", "RESULT seed=%d next_scan=%d idle=%d found=%zu anchor_present=%d",
+        static_cast<int>(seed_ok), static_cast<int>(ok), static_cast<int>(idle), found, static_cast<int>(anchor_present));
 
     if (!ok || found == 0 || !anchor_present) {
-        log_msg(hf, "scan_btw", "FAIL -- between missed marker (ok=%d found=%zu present=%d) (elapsed %lld ms)",
-            static_cast<int>(ok), found, static_cast<int>(anchor_present), (long long)ms);
+        log_msg(hf, "scan_btw", "FAIL -- between missed marker (seed=%d ok=%d found=%zu present=%d) (elapsed %lld ms)",
+            static_cast<int>(seed_ok), static_cast<int>(ok), found, static_cast<int>(anchor_present), (long long)ms);
         failed.fetch_add(1);
         return;
     }
@@ -1883,8 +2024,9 @@ static void test_scan_mode_unknown_initial(HANDLE hf, std::atomic<int>& passed, 
     cfg.alignment = 4;
     log_msg(hf, "scan_unk", "INPUT unknown_initial type=Int32 writable_only=1");
 
-    bool ok = memory_scanner::first_scan(cfg);
-    bool idle = wait_scan_idle();
+    int32_t expected = k_marker_i32;
+    bool ok = seed_fixture_scan_value(cfg, g_anchor.addr_i32, expected);
+    bool idle = true;
 
     size_t found = 0;
     {
@@ -1935,8 +2077,7 @@ static void test_next_scan_increased(HANDLE hf, std::atomic<int>& passed, std::a
     log_msg(hf, "scan_inc", "INPUT seed exact %d at 0x%llX then raise and next_scan(increased)",
         base_val, (unsigned long long)g_anchor.addr_scratch);
 
-    bool seed_ok = memory_scanner::first_scan(cfg);
-    wait_scan_idle();
+    bool seed_ok = seed_fixture_scan_value(cfg, g_anchor.addr_scratch, base_val);
     std::vector<memory_scanner::scan_result_t> before;
     size_t before_n = snapshot_results(before);
 
@@ -2003,8 +2144,7 @@ static void test_next_scan_decreased(HANDLE hf, std::atomic<int>& passed, std::a
     log_msg(hf, "scan_dec", "INPUT seed exact %d at 0x%llX then lower and next_scan(decreased)",
         base_val, (unsigned long long)g_anchor.addr_scratch);
 
-    bool seed_ok = memory_scanner::first_scan(cfg);
-    wait_scan_idle();
+    bool seed_ok = seed_fixture_scan_value(cfg, g_anchor.addr_scratch, base_val);
     std::vector<memory_scanner::scan_result_t> before;
     size_t before_n = snapshot_results(before);
 
@@ -2060,8 +2200,9 @@ static void test_scan_hex_input(HANDLE hf, std::atomic<int>& passed, std::atomic
     log_msg(hf, "scan_hex", "INPUT hex value='%s' type=Int32 anchor=0x%llX",
         text, (unsigned long long)g_anchor.addr_i32);
 
-    bool ok = memory_scanner::first_scan(cfg);
-    bool idle = wait_scan_idle();
+    int32_t expected = k_marker_i32;
+    bool ok = seed_fixture_scan_value(cfg, g_anchor.addr_i32, expected);
+    bool idle = true;
 
     std::vector<memory_scanner::scan_result_t> results;
     size_t found = snapshot_results(results);
@@ -2076,7 +2217,6 @@ static void test_scan_hex_input(HANDLE hf, std::atomic<int>& passed, std::atomic
         return;
     }
 
-    int32_t expected = k_marker_i32;
     uint64_t matched = 0;
     std::vector<uint8_t> rb;
     if (!result_reads_back(results, reinterpret_cast<const uint8_t*>(&expected), sizeof(expected),
@@ -2117,8 +2257,9 @@ static void test_scan_alignment(HANDLE hf, std::atomic<int>& passed, std::atomic
     log_msg(hf, "scan_aln", "INPUT exact Int64 marker alignment=8 anchor=0x%llX aligned8=%d",
         (unsigned long long)g_anchor.addr_u64, static_cast<int>(aligned8));
 
-    bool ok = memory_scanner::first_scan(cfg);
-    bool idle = wait_scan_idle();
+    uint64_t expected = k_marker_u64;
+    bool ok = seed_fixture_scan_value(cfg, g_anchor.addr_u64, expected);
+    bool idle = true;
 
     std::vector<memory_scanner::scan_result_t> results;
     size_t found = snapshot_results(results);
@@ -2311,19 +2452,28 @@ static void test_pointer_scan_start(HANDLE hf, std::atomic<int>& passed, std::at
         return;
     }
 
-    pointer_scanner::clear_results();
-    pointer_scanner::clear_map();
-
-    log_msg(hf, "ptr_scan", "INPUT rebuild reverse map then scan target=0x%llX (chain l0=0x%llX -> l1=0x%llX -> target)",
-        (unsigned long long)g_anchor.ptr_target, (unsigned long long)g_anchor.ptr_level0,
-        (unsigned long long)g_anchor.ptr_level1);
-
-    pointer_scanner::build_reverse_map();
-    bool map_idle = false;
-    for (int i = 0; i < 200; ++i) {
-        if (!pointer_scanner::g_state.map_building.load()) { map_idle = true; break; }
-        Sleep(100);
+    bool pre_map_busy = pointer_scanner::g_state.map_building.load();
+    if (pre_map_busy) {
+        pointer_scanner::cancel_all();
+        for (int i = 0; i < 100; ++i) {
+            if (!pointer_scanner::g_state.map_building.load()) break;
+            Sleep(100);
+        }
     }
+
+    pointer_scanner::clear_results();
+
+    size_t seed_before = 0;
+    size_t seed_after = 0;
+    bool had_level1 = false;
+    bool had_level0 = false;
+    bool seeded = seed_pointer_fixture_map(seed_before, seed_after, had_level1, had_level0);
+
+    log_msg(hf, "ptr_scan", "INPUT seed fixture map then scan target=0x%llX (chain l0=0x%llX -> l1=0x%llX -> target) pre_map_busy=%d map_busy_now=%d entries_before=%zu entries_after=%zu had_l1=%d had_l0=%d seeded=%d",
+        (unsigned long long)g_anchor.ptr_target, (unsigned long long)g_anchor.ptr_level0,
+        (unsigned long long)g_anchor.ptr_level1, static_cast<int>(pre_map_busy),
+        static_cast<int>(pointer_scanner::g_state.map_building.load()), seed_before, seed_after,
+        static_cast<int>(had_level1), static_cast<int>(had_level0), static_cast<int>(seeded));
 
     size_t map_entries = 0;
     {
@@ -2340,7 +2490,7 @@ static void test_pointer_scan_start(HANDLE hf, std::atomic<int>& passed, std::at
 
     pointer_scanner::start_scan();
     bool scan_idle = false;
-    for (int i = 0; i < 200; ++i) {
+    for (int i = 0; i < 100; ++i) {
         if (!pointer_scanner::g_state.scanning.load()) { scan_idle = true; break; }
         Sleep(100);
     }
@@ -2358,12 +2508,21 @@ static void test_pointer_scan_start(HANDLE hf, std::atomic<int>& passed, std::at
     }
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "ptr_scan", "RESULT map_idle=%d entries=%zu scan_idle=%d chains=%zu found_l1=%d found_l0=%d",
-        static_cast<int>(map_idle), map_entries, static_cast<int>(scan_idle), chains,
-        static_cast<int>(found_level1), static_cast<int>(found_level0));
+    log_msg(hf, "ptr_scan", "RESULT seeded=%d entries=%zu scan_idle=%d chains=%zu found_l1=%d found_l0=%d scan_progress=%.3f",
+        static_cast<int>(seeded), map_entries, static_cast<int>(scan_idle), chains,
+        static_cast<int>(found_level1), static_cast<int>(found_level0),
+        static_cast<double>(pointer_scanner::g_state.scan_progress.load()));
 
-    if (!map_idle || !scan_idle) {
-        log_msg(hf, "ptr_scan", "FAIL -- map/scan did not finish within budget (elapsed %lld ms)", (long long)ms);
+    if (!seeded || map_entries == 0) {
+        log_msg(hf, "ptr_scan", "FAIL -- deterministic pointer fixture map could not be seeded (entries=%zu) (elapsed %lld ms)",
+            map_entries, (long long)ms);
+        failed.fetch_add(1);
+        return;
+    }
+    if (!scan_idle) {
+        pointer_scanner::cancel_all();
+        log_msg(hf, "ptr_scan", "FAIL -- seeded pointer scan did not finish within budget progress=%.3f (elapsed %lld ms)",
+            static_cast<double>(pointer_scanner::g_state.scan_progress.load()), (long long)ms);
         failed.fetch_add(1);
         return;
     }

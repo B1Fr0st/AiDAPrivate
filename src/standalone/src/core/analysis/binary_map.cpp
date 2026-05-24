@@ -1007,7 +1007,8 @@ namespace binary_map {
 			}
 
 			xref_snapshot_t xref_snap;
-			snapshot_xref_module(out.module_name, xref_snap);
+			if (opts.include_xrefs)
+				snapshot_xref_module(out.module_name, xref_snap);
 
 			std::vector<map_global_t> pdb_globals;
 			std::unordered_map<uint64_t, std::string> data_name_lookup;
@@ -1284,7 +1285,8 @@ namespace binary_map {
 			}
 
 			xref_snapshot_t xref_snap;
-			snapshot_xref_module(main_mod->name, xref_snap);
+			if (opts.include_xrefs)
+				snapshot_xref_module(main_mod->name, xref_snap);
 
 			std::vector<map_global_t> pdb_globals;
 			std::unordered_map<uint64_t, std::string> data_name_lookup;

@@ -331,6 +331,30 @@ function todayStr() {
     return new Date().toISOString().slice(0, 10);
 }
 
+function normalizeExpiryEpoch(value) {
+    if (typeof value === 'number' && Number.isFinite(value)) return Math.floor(value);
+    if (typeof value === 'bigint') {
+        const n = Number(value);
+        return Number.isFinite(n) ? Math.floor(n) : 0;
+    }
+    if (typeof value === 'string' && value.trim() !== '') {
+        const n = Number(value.trim());
+        return Number.isFinite(n) ? Math.floor(n) : 0;
+    }
+    return 0;
+}
+
+function isLicenseExpired(data, nowSeconds = Math.floor(Date.now() / 1000)) {
+    if (!data) return false;
+    const epoch = normalizeExpiryEpoch(data.expires_epoch);
+    if (epoch > 0) return nowSeconds > epoch;
+    const expires = data.expires === undefined || data.expires === null ? '' : String(data.expires).trim();
+    if (expires === '') return false;
+    const parsed = parseExpiryInput(expires);
+    if (parsed.ok && parsed.epoch > 0) return nowSeconds > parsed.epoch;
+    return expires < todayStr();
+}
+
 function generateSessionToken() {
     return crypto.randomBytes(32).toString('hex');
 }
@@ -919,7 +943,7 @@ async function lookupLicense(licenseKey) {
     if (!data.active) {
         return { valid: false, reason: 'revoked', data };
     }
-    if (data.expires && data.expires !== '' && data.expires < todayStr()) {
+    if (isLicenseExpired(data)) {
         return { valid: false, reason: 'expired', data };
     }
 
@@ -3365,6 +3389,7 @@ router._internal = {
     isNonEnforcingBanReason,
     normalizeBanCheckHwids,
     buildProofTokenMessage,
+    isLicenseExpired,
     parseProofTokenFirst8,
     fnv1a64Hex,
     decryptSessionRow,

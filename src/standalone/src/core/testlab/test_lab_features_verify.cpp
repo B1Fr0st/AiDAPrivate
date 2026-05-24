@@ -438,6 +438,80 @@ namespace {
 		bool done;
 	};
 
+	static std::uint32_t parse_dns_name_user(const std::uint8_t* dns_data,
+		std::uint32_t offset,
+		std::uint32_t data_len,
+		char* out,
+		std::uint32_t out_size) {
+		std::uint32_t pos = offset;
+		std::uint32_t out_pos = 0;
+		std::uint32_t jumps = 0;
+		bool jumped = false;
+		std::uint32_t return_pos = 0;
+		while (pos < data_len && out_pos < out_size - 1) {
+			std::uint8_t label_len = dns_data[pos];
+			if (label_len == 0) {
+				++pos;
+				break;
+			}
+			if ((label_len & 0xC0u) == 0xC0u) {
+				if (pos + 1 >= data_len) break;
+				if (!jumped) return_pos = pos + 2;
+				std::uint16_t ptr = static_cast<std::uint16_t>(((label_len & 0x3Fu) << 8) | dns_data[pos + 1]);
+				pos = ptr;
+				jumped = true;
+				if (++jumps > 64) break;
+				continue;
+			}
+			if (label_len > 63) break;
+			++pos;
+			if (pos + label_len > data_len) break;
+			if (out_pos > 0 && out_pos < out_size - 1)
+				out[out_pos++] = '.';
+			for (std::uint8_t i = 0; i < label_len && out_pos < out_size - 1; ++i)
+				out[out_pos++] = static_cast<char>(dns_data[pos + i]);
+			pos += label_len;
+		}
+		out[out_pos] = '\0';
+		return jumped ? return_pos : pos;
+	}
+
+	static bool dns_payload_matches_probe_hosts(const std::uint8_t* data,
+		std::uint32_t data_len,
+		const char* const* hosts,
+		std::size_t host_count,
+		std::string& matched) {
+		if (data == nullptr || data_len < 12)
+			return false;
+		const std::uint8_t* dns_data = data;
+		std::uint32_t dns_len = data_len;
+		if (data_len >= 20) {
+			std::uint16_t udp_src = static_cast<std::uint16_t>((data[0] << 8) | data[1]);
+			std::uint16_t udp_dst = static_cast<std::uint16_t>((data[2] << 8) | data[3]);
+			std::uint16_t udp_len = static_cast<std::uint16_t>((data[4] << 8) | data[5]);
+			if ((udp_src == 53 || udp_dst == 53) && udp_len >= 20 && udp_len <= data_len) {
+				dns_data = data + 8;
+				dns_len = static_cast<std::uint32_t>(udp_len - 8);
+			}
+		}
+		if (dns_len < 12)
+			return false;
+		std::uint16_t qdcount = static_cast<std::uint16_t>((dns_data[4] << 8) | dns_data[5]);
+		if (qdcount == 0 || qdcount > 16)
+			return false;
+		char domain[261] = {};
+		std::uint32_t pos = parse_dns_name_user(dns_data, 12, dns_len, domain, sizeof(domain));
+		if (pos == 0 || pos + 4 > dns_len || domain[0] == '\0')
+			return false;
+		for (std::size_t i = 0; i < host_count; ++i) {
+			if (std::strstr(domain, hosts[i]) != nullptr) {
+				matched = hosts[i];
+				return true;
+			}
+		}
+		return false;
+	}
+
 	static DWORD WINAPI dns_log_thread_proc(LPVOID param) {
 		dns_log_ctx_t* ctx = static_cast<dns_log_ctx_t*>(param);
 		test_lab::result_t& r = *ctx->r;
@@ -612,6 +686,44 @@ namespace {
 		device->send_ioctl_raw(ioctl_codes::NCAP(), &stop_req, sizeof(stop_req), br_stop);
 		r.parsed.push_back({ "dns_capture_stop_ok", "1" });
 
+		std::uint32_t captured_dns_packets = 0u;
+		std::uint32_t captured_probe_packets = 0u;
+		std::string captured_probe_host;
+		voyager::detail::net_cap_get_request* cap_req =
+			static_cast<voyager::detail::net_cap_get_request*>(std::calloc(1, sizeof(voyager::detail::net_cap_get_request)));
+		if (cap_req != nullptr) {
+			cap_req->max_packets = voyager::detail::NET_CAP_GET_MAX;
+			std::uint32_t br_cap = 0;
+			bool cap_ok = device->send_ioctl_raw(ioctl_codes::NCPG(), cap_req, sizeof(*cap_req), br_cap);
+			r.parsed.push_back({ "dns_capture_drain_ok", cap_ok ? "1" : "0" });
+			r.parsed.push_back({ "dns_capture_packet_count", cap_ok ? fmt_u32(cap_req->packet_count) : "0" });
+			if (cap_ok) {
+				std::uint32_t cap_n = cap_req->packet_count;
+				if (cap_n > voyager::detail::NET_CAP_GET_MAX)
+					cap_n = static_cast<std::uint32_t>(voyager::detail::NET_CAP_GET_MAX);
+				for (std::uint32_t i = 0; i < cap_n; ++i) {
+					const auto& p = cap_req->packets[i];
+					if (p.protocol != 17u || (p.local_port != 53u && p.remote_port != 53u))
+						continue;
+					++captured_dns_packets;
+					std::string host_match;
+					if (dns_payload_matches_probe_hosts(p.payload, p.payload_size, kCandidateHosts, kCandidateHostCount, host_match)) {
+						++captured_probe_packets;
+						if (captured_probe_host.empty())
+							captured_probe_host = host_match;
+					}
+				}
+			}
+			std::free(cap_req);
+		} else {
+			r.parsed.push_back({ "dns_capture_drain_ok", "0" });
+			r.parsed.push_back({ "dns_capture_packet_count", "0" });
+		}
+		r.parsed.push_back({ "captured_dns_packets", fmt_u32(captured_dns_packets) });
+		r.parsed.push_back({ "captured_probe_dns_packets", fmt_u32(captured_probe_packets) });
+		if (!captured_probe_host.empty())
+			r.parsed.push_back({ "captured_probe_host", captured_probe_host });
+
 		r.parsed.push_back({ "dns_entry_count_total", fmt_u32(after_total) });
 		r.parsed.push_back({ "matches_name_and_pid", fmt_u32(matches_name_and_pid) });
 		r.parsed.push_back({ "matches_name_any_pid", fmt_u32(matches_name_any_pid) });
@@ -625,6 +737,9 @@ namespace {
 		r.parsed.push_back({ "delta_dns_entries", fmt_u32(delta) });
 
 		if (matches_name_self_or_unknown_pid > 0u) {
+			r.ntstatus = 0;
+			r.ok = true;
+		} else if (captured_probe_packets > 0u) {
 			r.ntstatus = 0;
 			r.ok = true;
 		} else if (matches_name_any_pid > 0u) {

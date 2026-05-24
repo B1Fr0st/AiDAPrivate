@@ -564,11 +564,19 @@ inline deobfuscated_result_t deobfuscate_function(uint64_t entry_addr, uint32_t 
 inline deobfuscated_result_t strip_junk_code(
 	uint64_t start_addr,
 	uint64_t end_addr,
-	const std::vector<std::string>& target_regs) {
+	const std::vector<std::string>& target_regs,
+	uint32_t max_instructions = 512) {
 
 	deobfuscated_result_t result;
 
-	auto slice = symbolic_engine::slice_to_register(start_addr, end_addr, 50000,
+	uint32_t work_budget = max_instructions ? max_instructions : 1u;
+	if (end_addr > start_addr) {
+		const uint64_t span = end_addr - start_addr;
+		if (span < work_budget)
+			work_budget = static_cast<uint32_t>((std::max<uint64_t>)(1, span));
+	}
+
+	auto slice = symbolic_engine::slice_to_register(start_addr, end_addr, work_budget,
 		target_regs.empty() ? "rax" : target_regs[0]);
 
 	if (!slice.success) {

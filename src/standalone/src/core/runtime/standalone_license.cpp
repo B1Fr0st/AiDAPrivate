@@ -49,8 +49,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdarg>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <memory>
 #include <mutex>
@@ -410,6 +412,7 @@ struct SimpleHttpResponse {
     std::string body;
     bool   ok    = false;
     std::string error;
+    std::string debug_reason;
 };
 
 struct resolved_addr_t {
@@ -1918,6 +1921,7 @@ static SimpleHttpResponse raw_https_request(
     bool ok = aida::license::transport::send(req, resp, transport_err);
 
     out.status = static_cast<int>(resp.http_status);
+    out.debug_reason = resp.debug_reason;
     if (!resp.body.empty())
         out.body.assign(reinterpret_cast<const char*>(resp.body.data()), resp.body.size());
 
@@ -2182,14 +2186,18 @@ namespace
 
     std::atomic<bool> s_valid{false};
     std::atomic<bool> s_stop{false};
+    std::atomic<uint64_t> s_worker_epoch{1};
     std::atomic<bool> s_heartbeat_done{true};
     std::atomic<bool> s_srv_refresh_done{true};
+    std::atomic<uint64_t> s_heartbeat_running_epoch{0};
+    std::atomic<uint64_t> s_srv_refresh_running_epoch{0};
     std::mutex        s_state_mtx;
     std::string       s_plan;
     std::string       s_error;
 
     std::atomic<int64_t> s_last_heartbeat_time{0};
     std::atomic<uint32_t> s_heartbeat_counter{0};
+    std::atomic<uint64_t> s_replay_request_seq{0};
 
     std::atomic<uint32_t> s_gate_bitmap{0};
 
@@ -2346,6 +2354,44 @@ namespace
     uint64_t license_now_ms()
     {
         return static_cast<uint64_t>(GetTickCount64());
+    }
+
+    int64_t license_unix_ms()
+    {
+        const auto now = std::chrono::system_clock::now().time_since_epoch();
+        return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+    }
+
+    uint64_t next_replay_req_seq()
+    {
+        const uint64_t wall_seq = static_cast<uint64_t>((std::max<int64_t>)(1, license_unix_ms() / 1000));
+        uint64_t observed = s_replay_request_seq.load(std::memory_order_acquire);
+        for (;;) {
+            const uint64_t next = (std::max)(observed + 1, wall_seq);
+            if (s_replay_request_seq.compare_exchange_weak(
+                    observed, next, std::memory_order_acq_rel, std::memory_order_acquire))
+                return next;
+        }
+    }
+
+    bool worker_active(uint64_t worker_epoch)
+    {
+        return !s_stop.load(std::memory_order_acquire) &&
+               worker_epoch == s_worker_epoch.load(std::memory_order_acquire);
+    }
+
+    bool wait_for_worker_done(std::atomic<bool>& done, const char* name, uint32_t timeout_ms)
+    {
+        const uint64_t deadline = license_now_ms() + timeout_ms;
+        while (!done.load(std::memory_order_acquire)) {
+            if (license_now_ms() >= deadline) {
+                lic_log_fmt("worker_stop_wait_timeout worker=%s timeout_ms=%u",
+                    name ? name : "unknown", timeout_ms);
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return true;
     }
 
     void log_arc_status(const char* detail)
@@ -3343,6 +3389,75 @@ namespace
         return true;
     }
 
+    std::string canonical_license_reject_reason(std::string reason)
+    {
+        while (!reason.empty() && (reason.front() == ' ' || reason.front() == '\t' || reason.front() == '\r' || reason.front() == '\n'))
+            reason.erase(reason.begin());
+        while (!reason.empty() && (reason.back() == ' ' || reason.back() == '\t' || reason.back() == '\r' || reason.back() == '\n'))
+            reason.pop_back();
+        for (char& ch : reason)
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+
+        auto strip_prefix = [&reason](const char* prefix) {
+            const size_t len = std::strlen(prefix);
+            if (reason.size() >= len && reason.compare(0, len, prefix) == 0) {
+                reason.erase(0, len);
+                return true;
+            }
+            return false;
+        };
+
+        if (strip_prefix("rate_limited:"))
+            return "rate_limited";
+        if (strip_prefix("banned:"))
+            return "banned";
+
+        for (int i = 0; i < 4; ++i) {
+            if (strip_prefix("invalid:")) continue;
+            if (strip_prefix("hb:")) continue;
+            if (strip_prefix("replay:")) continue;
+            if (strip_prefix("lookup:")) continue;
+            if (strip_prefix("tpm_attest_lookup:")) continue;
+            if (strip_prefix("challenge:")) continue;
+            break;
+        }
+
+        if (strip_prefix("rate_limited:"))
+            return "rate_limited";
+        if (strip_prefix("banned:"))
+            return "banned";
+
+        if (reason == "req_ts_drift")
+            return "clock_drift";
+
+        static const char* kAllowed[] = {
+            "not_found",
+            "revoked",
+            "expired",
+            "session_mismatch",
+            "session_expired",
+            "hwid_mismatch",
+            "clock_drift",
+            "invalid_format",
+            "missing_key",
+            "challenge_expired",
+            "challenge_missing",
+            "challenge_signature",
+            "challenge_stale",
+            "rate_limited",
+            "banned",
+            "req_seq_missing",
+            "replay_blocked",
+            "heartbeat_too_fast",
+            "heartbeat_window_exceeded"
+        };
+        for (const char* allowed : kAllowed) {
+            if (reason == allowed)
+                return reason;
+        }
+        return {};
+    }
+
     bool call_validation_endpoint_once(
         const std::string& action,
         const std::string& key,
@@ -3394,7 +3509,10 @@ namespace
             return false;
         }
         if (resp.status != 200) {
-            error_out = "License service returned HTTP " + std::to_string(resp.status);
+            const std::string canonical = canonical_license_reject_reason(resp.debug_reason);
+            error_out = canonical.empty()
+                ? "License service returned HTTP " + std::to_string(resp.status)
+                : canonical;
             return false;
         }
 
@@ -3503,6 +3621,8 @@ namespace
             body["license_key"] = key;
             body["hwid"] = hwid;
             body["timestamp"] = static_cast<int64_t>(std::time(nullptr));
+            const int64_t req_ts_ms = license_unix_ms();
+            body["req_ts_ms"] = req_ts_ms;
             body["public_ip"] = "";
             lic_log("call_validation_public_ip_skipped");
             if (action == "validate") {
@@ -3568,7 +3688,9 @@ namespace
                 body["heartbeat_nonce"] = nonce;
                 body["plugin_version"] = "aida-standalone";
                 const uint32_t heartbeat_index = s_heartbeat_counter.load(std::memory_order_acquire) + 1;
+                const uint64_t req_seq = next_replay_req_seq();
                 body["heartbeat_count"] = static_cast<int>(heartbeat_index);
+                body["req_seq"] = std::to_string(req_seq);
 
                 {
                     std::lock_guard<std::mutex> lk(s_session_ratchet_mtx);
@@ -3869,7 +3991,7 @@ namespace
                     _snprintf_s(dbg_sum, sizeof(dbg_sum), _TRUNCATE,
                         "heartbeat_compose_summary action=%.16s hb_count=%u session_age_s=%lld "
                         "issued_at=%lld ttl=%lld code_hash_set=%d proof_token_set=%d driver_proof_set=%d "
-                        "honeypot_count=%d gate_bitmap=0x%llX session_token_len=%zu hwid_len=%zu",
+                        "honeypot_count=%d gate_bitmap=0x%llX req_seq=%llu req_ts_ms=%lld session_token_len=%zu hwid_len=%zu",
                         action.c_str(),
                         heartbeat_index,
                         static_cast<long long>(age),
@@ -3881,6 +4003,8 @@ namespace
                         static_cast<int>(body.contains("called_honeypot_names")
                             ? body["called_honeypot_names"].size() : 0),
                         static_cast<unsigned long long>(s_gate_bitmap.load(std::memory_order_acquire) & 0x00FFFFFFu),
+                        static_cast<unsigned long long>(req_seq),
+                        static_cast<long long>(req_ts_ms),
                         session_token.size(),
                         hwid.size());
                     lic_log(dbg_sum);
@@ -3904,6 +4028,16 @@ namespace
             reset_license_clients();
 
             error_out.clear();
+            if (action != "validate") {
+                const int64_t retry_req_ts_ms = license_unix_ms();
+                const uint64_t retry_req_seq = next_replay_req_seq();
+                body["req_ts_ms"] = retry_req_ts_ms;
+                body["req_seq"] = std::to_string(retry_req_seq);
+                body_str = body.dump();
+                lic_log_fmt("heartbeat_retry_replay_fields req_seq=%llu req_ts_ms=%lld",
+                    static_cast<unsigned long long>(retry_req_seq),
+                    static_cast<long long>(retry_req_ts_ms));
+            }
             return call_validation_endpoint_once(action, key, hwid, session_token, nonce,
                                                 body_str, error_out, response_out);
         } catch (const std::exception& e) {
@@ -4471,7 +4605,11 @@ namespace
         lic_log("apply_valid_response_post_validity_commit");
 
         lic_log("apply_valid_response_pre_save");
-        settings.license_arc_load_ok = s_arc_loaded;
+        const bool arc_cache_ok =
+            s_arc_loaded ||
+            s_arc_fetch_deferred.load(std::memory_order_acquire) ||
+            settings.license_arc_load_ok;
+        settings.license_arc_load_ok = arc_cache_ok;
         settings.save();
         lic_log("apply_valid_response_post_save");
 
@@ -5889,19 +6027,8 @@ namespace
         if (settings.license_key.empty() || settings.license_sig_payload.empty())
             return false;
 
-        if (!settings.license_arc_load_ok) {
-            error_out = "Previous activation did not complete; please re-enter your license key.";
-            settings.license_sig_payload.clear();
-            settings.license_session_token.clear();
-            settings.license_server_sig.clear();
-            settings.license_server_nonce.clear();
-            settings.license_client_nonce.clear();
-            settings.license_key_seed.clear();
-            settings.license_bind_proof.clear();
-            settings.license_issued_at = 0;
-            settings.save();
-            return false;
-        }
+        if (!settings.license_arc_load_ok)
+            lic_log("cached_activation_incomplete_recovering_online");
 
         auto payload = json::parse(settings.license_sig_payload, nullptr, false);
         if (payload.is_discarded() || !payload.is_object()) {
@@ -6005,6 +6132,12 @@ namespace
             return "System clock drift blocked license validation.\nSync Windows time and activate again.";
         if (error == "invalid_format" || error == "missing_key")
             return "Enter a valid AiDA license key and press Activate.";
+        if (error == "challenge_expired" || error == "challenge_stale" || error == "challenge_missing" || error == "challenge_signature")
+            return "License activation challenge expired.\nPress Activate again.";
+        if (error == "rate_limited")
+            return "Too many activation attempts.\nWait briefly and press Activate again.";
+        if (error == "banned")
+            return "This machine or network is blocked from activation.\nContact support if you believe this is wrong.";
         return error;
     }
 
@@ -6054,6 +6187,7 @@ namespace
         }
         s_proof_hash.store(0, std::memory_order_release);
         s_heartbeat_counter.store(0, std::memory_order_release);
+        s_replay_request_seq.store(0, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lk(s_state_mtx);
             s_magic.store(S_MAGIC_INIT, std::memory_order_release);
@@ -6063,7 +6197,7 @@ namespace
         }
     }
 
-    void heartbeat_worker(settings_sa_t* settings)
+    void heartbeat_worker(settings_sa_t* settings, uint64_t worker_epoch)
     {
         std::mt19937 rng(static_cast<unsigned>(
             std::chrono::steady_clock::now().time_since_epoch().count() ^
@@ -6071,7 +6205,7 @@ namespace
 
         int consecutive_failures = 0;
 
-        while (!s_stop.load(std::memory_order_acquire)) {
+        while (worker_active(worker_epoch)) {
 
 
             int wait_s;
@@ -6080,13 +6214,13 @@ namespace
                 const int heartbeat_jitter_s = 10;
                 wait_s = heartbeat_base_s + static_cast<int>(rng() % (heartbeat_jitter_s + 1));
             } else {
-                wait_s = (std::min)(2 << (consecutive_failures - 1), 15);
+                wait_s = (std::max)(11, (std::min)(2 << (consecutive_failures - 1), 30));
             }
 
-            for (int waited = 0; waited < wait_s && !s_stop.load(std::memory_order_acquire); waited += 1)
+            for (int waited = 0; waited < wait_s && worker_active(worker_epoch); waited += 1)
                 std::this_thread::sleep_for(std::chrono::seconds(1));
 
-            if (s_stop.load(std::memory_order_acquire))
+            if (!worker_active(worker_epoch))
                 break;
 
             if (!check_obfuscated_valid() || settings->license_key.empty() || settings->license_session_token.empty())
@@ -6108,6 +6242,8 @@ namespace
             const bool hb_ok = call_validation_endpoint(*settings, "heartbeat", settings->license_key,
                                           s_cached_hwid, hb_session_token,
                                           nonce, error, response);
+            if (!worker_active(worker_epoch))
+                break;
             {
                 char hbr[256];
                 _snprintf_s(hbr, sizeof(hbr), _TRUNCATE,
@@ -6205,14 +6341,14 @@ namespace
         }
     }
 
-    void srv_refresh_worker(settings_sa_t* settings)
+    void srv_refresh_worker(settings_sa_t* settings, uint64_t worker_epoch)
     {
-        while (!s_stop.load(std::memory_order_acquire))
+        while (worker_active(worker_epoch))
         {
-            for (int w = 0; w < 10 && !s_stop.load(std::memory_order_acquire); ++w)
+            for (int w = 0; w < 10 && worker_active(worker_epoch); ++w)
                 std::this_thread::sleep_for(std::chrono::seconds(1));
 
-            if (s_stop.load(std::memory_order_acquire))
+            if (!worker_active(worker_epoch))
                 break;
 
             if (!check_obfuscated_valid() || settings->license_session_token.empty())
@@ -6245,6 +6381,8 @@ namespace
                 fnv1a_str(settings->license_session_token) & 0xFFFFFFFF);
 
             uint64_t driver_proof = 0;
+            if (!worker_active(worker_epoch))
+                break;
             if (relay_server_token_v2_if_ready(token_hash, srv_nonce_val, &driver_proof) && driver_proof != 0)
                 store_driver_proof_cache(driver_proof, srv_nonce_str);
         }
@@ -6252,20 +6390,21 @@ namespace
 
     void restart_heartbeat(settings_sa_t& settings)
     {
+        const uint64_t worker_epoch = s_worker_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
         s_stop.store(true, std::memory_order_release);
-        while (!s_heartbeat_done.load(std::memory_order_acquire))
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        while (!s_srv_refresh_done.load(std::memory_order_acquire))
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        wait_for_worker_done(s_heartbeat_done, "heartbeat", 3000);
+        wait_for_worker_done(s_srv_refresh_done, "srv_refresh", 3000);
 
         s_stop.store(false, std::memory_order_release);
 
         settings_sa_t* settings_ptr = &settings;
 
         s_heartbeat_done.store(false, std::memory_order_release);
-        if (work_queue::post([settings_ptr]() {
-                heartbeat_worker(settings_ptr);
-                s_heartbeat_done.store(true, std::memory_order_release);
+        s_heartbeat_running_epoch.store(worker_epoch, std::memory_order_release);
+        if (work_queue::post([settings_ptr, worker_epoch]() {
+                heartbeat_worker(settings_ptr, worker_epoch);
+                if (s_heartbeat_running_epoch.load(std::memory_order_acquire) == worker_epoch)
+                    s_heartbeat_done.store(true, std::memory_order_release);
             }))
         {
             lic_log("heartbeat_thread_started");
@@ -6273,13 +6412,16 @@ namespace
         else
         {
             s_heartbeat_done.store(true, std::memory_order_release);
+            s_heartbeat_running_epoch.store(0, std::memory_order_release);
             lic_log("heartbeat_thread_failed_skipped");
         }
 
         s_srv_refresh_done.store(false, std::memory_order_release);
-        if (work_queue::post([settings_ptr]() {
-                srv_refresh_worker(settings_ptr);
-                s_srv_refresh_done.store(true, std::memory_order_release);
+        s_srv_refresh_running_epoch.store(worker_epoch, std::memory_order_release);
+        if (work_queue::post([settings_ptr, worker_epoch]() {
+                srv_refresh_worker(settings_ptr, worker_epoch);
+                if (s_srv_refresh_running_epoch.load(std::memory_order_acquire) == worker_epoch)
+                    s_srv_refresh_done.store(true, std::memory_order_release);
             }))
         {
             lic_log("srv_refresh_thread_started");
@@ -6287,6 +6429,7 @@ namespace
         else
         {
             s_srv_refresh_done.store(true, std::memory_order_release);
+            s_srv_refresh_running_epoch.store(0, std::memory_order_release);
             lic_log("srv_refresh_thread_failed_skipped");
         }
     }
@@ -6433,28 +6576,25 @@ namespace standalone_license
     bool activate(settings_sa_t& settings, const std::string& key, std::string& error_out)
     {
         lic_log("activate_enter");
-        {
-            char dbg[256];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "activate_key len=%zu first=%.6s last=%.6s",
-                key.size(),
-                key.c_str(),
-                key.size() >= 6 ? key.c_str() + key.size() - 6 : key.c_str());
-            lic_log(dbg);
-            std::string hex_dump;
-            hex_dump.reserve(key.size() * 3);
-            for (unsigned char c : key) {
-                static const char kHex[] = "0123456789abcdef";
-                hex_dump.push_back(kHex[(c >> 4) & 0xF]);
-                hex_dump.push_back(kHex[c & 0xF]);
-                hex_dump.push_back(' ');
-            }
-            char dbg2[512];
-            _snprintf_s(dbg2, sizeof(dbg2), _TRUNCATE,
-                "activate_key_hex=%.450s", hex_dump.c_str());
-            lic_log(dbg2);
-        }
+        lic_log_fmt("activate_key_submitted len=%zu", key.size());
         ensure_modules_initialized();
+        if (check_obfuscated_valid() &&
+            settings.license_arc_load_ok &&
+            key == settings.license_key &&
+            !settings.license_session_token.empty())
+        {
+            lic_log("activate_already_valid");
+            error_out.clear();
+            anti_tamper::state::get().license_pending_activation.store(false, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lk(s_state_mtx);
+                s_error.clear();
+            }
+            if (s_heartbeat_done.load(std::memory_order_acquire) ||
+                s_srv_refresh_done.load(std::memory_order_acquire))
+                restart_heartbeat(settings);
+            return true;
+        }
         reset_arc_fetch_state();
         reset_activation_completed_at();
         anti_tamper::state::get().license_pending_activation.store(true, std::memory_order_release);
@@ -6533,6 +6673,8 @@ namespace standalone_license
         {
             arc_deferred_for_full_test = true;
             defer_arc_fetch_if_full_test_running("activate_arc");
+            settings.license_arc_load_ok = true;
+            settings.save();
             lic_log("activate_arc_deferred_full_test_running");
         }
         else if (try_load_arc_with_retries(settings, hwid))
@@ -6582,11 +6724,10 @@ namespace standalone_license
 
     void shutdown()
     {
+        s_worker_epoch.fetch_add(1, std::memory_order_acq_rel);
         s_stop.store(true, std::memory_order_release);
-        while (!s_heartbeat_done.load(std::memory_order_acquire))
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        while (!s_srv_refresh_done.load(std::memory_order_acquire))
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        wait_for_worker_done(s_heartbeat_done, "heartbeat", 5000);
+        wait_for_worker_done(s_srv_refresh_done, "srv_refresh", 5000);
         reset_arc_fetch_state();
         reset_activation_completed_at();
         reset_license_clients();

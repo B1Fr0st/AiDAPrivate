@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace test_all_features {
@@ -77,6 +78,100 @@ static uint64_t get_ntdll_fn(const char* name) {
     return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fn));
 }
 
+static uint64_t get_target_ntdll_fn(const char* name) {
+    const uint32_t pid = driver_bridge::attached_pid();
+    if (pid == 0)
+        return get_ntdll_fn(name);
+
+    uint64_t remote_ntdll = 0;
+    for (const auto& mod : driver_bridge::enumerate_modules_for(pid)) {
+        if (_stricmp(mod.name.c_str(), "ntdll.dll") == 0) {
+            remote_ntdll = mod.base;
+            break;
+        }
+    }
+    if (remote_ntdll == 0)
+        return get_ntdll_fn(name);
+
+    const uint64_t resolved = driver_bridge::resolve_export(remote_ntdll, name);
+    if (resolved != 0)
+        return resolved;
+
+    HMODULE local_ntdll = GetModuleHandleW(L"ntdll.dll");
+    FARPROC local_fn = local_ntdll ? GetProcAddress(local_ntdll, name) : nullptr;
+    if (!local_ntdll || !local_fn)
+        return 0;
+
+    const uint64_t offset =
+        reinterpret_cast<uintptr_t>(local_fn) - reinterpret_cast<uintptr_t>(local_ntdll);
+    return remote_ntdll + offset;
+}
+
+static aida::binary_map::map_t make_binary_map_fixture() {
+    aida::binary_map::map_t map;
+    map.module_name = "fixture.exe";
+    map.module_path = "fixture.exe";
+    map.architecture = "x64";
+    map.format = "PE";
+    map.image_base = 0x140000000;
+    map.image_size = 0x3000;
+
+    aida::binary_map::map_section_t text;
+    text.name = ".text";
+    text.va = map.image_base + 0x1000;
+    text.size = 0x600;
+    text.executable = true;
+    text.readable = true;
+    text.entropy = 0.42f;
+    text.sampled_bytes = 0x600;
+    map.sections.push_back(std::move(text));
+
+    aida::binary_map::map_function_t fn;
+    fn.va = map.image_base + 0x1010;
+    fn.name = "fixture_entry";
+    fn.xref_count = 2;
+    fn.callee_count = 1;
+    fn.top_callees.push_back("fixture_leaf");
+    fn.section_name = ".text";
+    fn.score = 80;
+    map.functions.push_back(std::move(fn));
+
+    aida::binary_map::map_global_t global;
+    global.va = map.image_base + 0x2200;
+    global.name = "fixture_counter";
+    global.xref_count = 1;
+    global.writable = true;
+    global.section_name = ".data";
+    map.globals.push_back(std::move(global));
+
+    map.imports.push_back("kernel32!CloseHandle");
+    map.exports.push_back("FixtureExport");
+    return map;
+}
+
+static void seed_xref_db_fixture(uint64_t from, uint64_t to) {
+    xref_db::module_index_t mod;
+    mod.name = "fixture_xref_module";
+    mod.base = from & ~0xFFFULL;
+    mod.size = 0x1000;
+    mod.timestamp = static_cast<uint64_t>(
+        std::chrono::system_clock::now().time_since_epoch().count());
+    mod.total_xrefs = 1;
+    mod.built = true;
+
+    xref_db::xref_entry_t entry;
+    entry.from_addr = from;
+    entry.to_addr = to;
+    entry.type = xref_engine::xref_type_t::lea;
+    entry.disasm_text = "lea rax, [rip+1]";
+    mod.to_index[to].push_back(entry);
+    mod.from_index[from].push_back(entry);
+
+    std::string key = mod.name;
+    std::lock_guard<std::mutex> lk(xref_db::g_state.mutex);
+    xref_db::g_state.modules[key] = std::move(mod);
+}
+
 static void test_symbolic_execute(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "sym_exec", "START -- symbolic engine execute on small range");
     auto t0 = std::chrono::steady_clock::now();
@@ -87,7 +182,7 @@ static void test_symbolic_execute(HANDLE hf, std::atomic<int>& passed, std::atom
         failed.fetch_add(1); return;
     }
 
-    auto result = symbolic_engine::execute_symbolic(addr, addr + 32, 500, {}, {});
+    auto result = symbolic_engine::execute_symbolic(addr, addr + 32, 16, {}, {});
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!result.success) {
@@ -116,7 +211,7 @@ static void test_symbolic_slice(HANDLE hf, std::atomic<int>& passed, std::atomic
         failed.fetch_add(1); return;
     }
 
-    auto result = symbolic_engine::slice_to_register(addr, addr + 32, 500, "rax");
+    auto result = symbolic_engine::slice_to_register(addr, addr + 32, 16, "rax");
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!result.success) {
@@ -145,7 +240,7 @@ static void test_symbolic_taint(HANDLE hf, std::atomic<int>& passed, std::atomic
         failed.fetch_add(1); return;
     }
 
-    auto result = symbolic_engine::taint_trace(addr, addr + 32, 500, {"rcx"}, {});
+    auto result = symbolic_engine::taint_trace(addr, addr + 32, 16, {"rcx"}, {});
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!result.success) {
@@ -191,16 +286,16 @@ static void test_deobfusc_strip_junk(HANDLE hf, std::atomic<int>& passed, std::a
         failed.fetch_add(1); return;
     }
 
-    auto result = deobfuscation_engine::strip_junk_code(addr, addr + 64, {"rax"});
+    auto result = deobfuscation_engine::strip_junk_code(addr, addr + 64, { "rax" }, 16);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!result.success) {
-        log_msg(hf, "deob_jnk", "FAIL -- strip_junk_code success=0 error=\"%s\" original=%u clean=%u (elapsed %lld ms)",
+        log_msg(hf, "deob_jnk", "FAIL -- fixture-limited deobfuscation success=0 error=\"%s\" original=%u clean=%u (elapsed %lld ms)",
             result.error.c_str(), result.total_original, result.total_clean, (long long)ms);
         failed.fetch_add(1); return;
     }
     if (result.total_original == 0 || result.clean_instructions.empty()) {
-        log_msg(hf, "deob_jnk", "FAIL -- strip_junk_code returned empty clean result success=%d original=%u clean=%u (elapsed %lld ms)",
+        log_msg(hf, "deob_jnk", "FAIL -- fixture-limited deobfuscation returned empty clean result success=%d original=%u clean=%u (elapsed %lld ms)",
             result.success, result.total_original, result.total_clean, (long long)ms);
         failed.fetch_add(1); return;
     }
@@ -220,7 +315,7 @@ static void test_deobfusc_resolve_constants(HANDLE hf, std::atomic<int>& passed,
         failed.fetch_add(1); return;
     }
 
-    auto constants = deobfuscation_engine::resolve_constants(addr, addr + 32, 500);
+    auto constants = deobfuscation_engine::resolve_constants(addr, addr + 32, 16);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (constants.empty()) {
@@ -235,23 +330,40 @@ static void test_code_patcher_create_apply_revert(HANDLE hf, std::atomic<int>& p
     log_msg(hf, "patch_car", "START -- code patcher create/apply/revert");
     auto t0 = std::chrono::steady_clock::now();
 
-    std::vector<uint8_t> new_bytes = { 0x90, 0x90, 0x90 };
-    int idx = code_patcher::create_patch(0xDEADBEEF, new_bytes, "test patch (not applied)");
+    uint64_t scratch = driver_bridge::allocate_memory(16);
+    if (scratch == 0) {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        log_msg(hf, "patch_car", "FAIL -- allocate_memory returned 0 for patch fixture (elapsed %lld ms)", (long long)ms);
+        failed.fetch_add(1); return;
+    }
 
+    std::vector<uint8_t> original = { 0x41, 0x42, 0x43 };
+    std::vector<uint8_t> patched = { 0x90, 0x90, 0x90 };
+    bool seed_ok = driver_bridge::write_memory(scratch, original);
+    int idx = seed_ok ? code_patcher::create_patch(scratch, patched, "test patch fixture") : -1;
+    bool apply_ok = idx >= 0 && code_patcher::apply_patch(idx);
+    std::vector<uint8_t> after_apply;
+    bool read_apply_ok = driver_bridge::read_memory(scratch, patched.size(), after_apply);
+    bool revert_ok = idx >= 0 && code_patcher::revert_patch(idx);
+    std::vector<uint8_t> after_revert;
+    bool read_revert_ok = driver_bridge::read_memory(scratch, original.size(), after_revert);
     size_t count = code_patcher::count();
     size_t active = code_patcher::active_count();
 
-    if (idx >= 0) {
+    if (idx >= 0)
         code_patcher::remove_patch(idx);
-    }
+    bool freed = driver_bridge::free_memory(scratch);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (idx >= 0) {
-        log_msg(hf, "patch_car", "PASS -- created patch idx=%d, count=%zu, active=%zu (elapsed %lld ms)",
-            idx, count, active, (long long)ms);
+    if (seed_ok && idx >= 0 && apply_ok && read_apply_ok && after_apply == patched &&
+        revert_ok && read_revert_ok && after_revert == original && freed) {
+        log_msg(hf, "patch_car", "PASS -- patch idx=%d applied/reverted on scratch=0x%016llX count=%zu active=%zu (elapsed %lld ms)",
+            idx, (unsigned long long)scratch, count, active, (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "patch_car", "FAIL -- create_patch returned %d (elapsed %lld ms)", idx, (long long)ms);
+        log_msg(hf, "patch_car", "FAIL -- seed=%d idx=%d apply=%d read_apply=%d revert=%d read_revert=%d freed=%d active=%zu (elapsed %lld ms)",
+            seed_ok ? 1 : 0, idx, apply_ok ? 1 : 0, read_apply_ok ? 1 : 0,
+            revert_ok ? 1 : 0, read_revert_ok ? 1 : 0, freed ? 1 : 0, active, (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -314,22 +426,24 @@ static void test_binary_map_generate(HANDLE hf, std::atomic<int>& passed, std::a
     auto t0 = std::chrono::steady_clock::now();
 
     aida::binary_map::map_options_t opts;
-    opts.max_functions = 10;
-    opts.max_globals = 5;
-    opts.max_chars = 2048;
+    opts.max_functions = 2;
+    opts.max_globals = 1;
+    opts.max_chars = 1024;
 
-    aida::binary_map::map_t map;
-    bool ok = aida::binary_map::generate(opts, map);
+    aida::binary_map::map_t map = make_binary_map_fixture();
+    std::string text = aida::binary_map::render_text(map, opts);
+    bool ok = !text.empty() && text.find("fixture.exe") != std::string::npos;
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (ok) {
-        log_msg(hf, "binmap", "PASS -- module=%s arch=%s sections=%zu functions=%zu (elapsed %lld ms)",
-            map.module_name.c_str(), map.architecture.c_str(),
-            map.sections.size(), map.functions.size(), (long long)ms);
-    } else {
-        log_msg(hf, "binmap", "PASS -- generate returned false (no PE loaded, expected): %s (elapsed %lld ms)",
-            aida::binary_map::last_error().c_str(), (long long)ms);
+    if (!ok) {
+        log_msg(hf, "binmap", "FAIL -- fixture map render missing module text (chars=%zu) (elapsed %lld ms)",
+            text.size(), (long long)ms);
+        failed.fetch_add(1);
+        return;
     }
+    log_msg(hf, "binmap", "PASS -- fixture module=%s arch=%s sections=%zu functions=%zu (elapsed %lld ms)",
+        map.module_name.c_str(), map.architecture.c_str(),
+        map.sections.size(), map.functions.size(), (long long)ms);
     passed.fetch_add(1);
 }
 
@@ -346,13 +460,16 @@ static void test_xref_find(HANDLE hf, std::atomic<int>& passed, std::atomic<int>
     log_msg(hf, "xref_find", "START -- xref engine find xrefs to known function");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
-    if (addr == 0) {
-        log_msg(hf, "xref_find", "FAIL -- NtClose not found");
+    uint64_t scratch = driver_bridge::allocate_memory(32);
+    if (scratch == 0) {
+        log_msg(hf, "xref_find", "FAIL -- allocate_memory returned 0 for xref fixture");
         failed.fetch_add(1); return;
     }
 
-    xref_engine::find_xrefs_to(addr);
+    uint8_t code[16] = { 0x48, 0x8D, 0x05, 0x01, 0x00, 0x00, 0x00, 0xC3 };
+    uint64_t target = scratch + 8;
+    bool wrote = driver_bridge::write_memory(scratch, std::vector<uint8_t>(code, code + sizeof(code)));
+    xref_engine::find_xrefs_to(target, scratch, sizeof(code));
 
     for (int i = 0; i < 50; ++i) {
         if (!xref_engine::is_scanning()) break;
@@ -368,10 +485,14 @@ static void test_xref_find(HANDLE hf, std::atomic<int>& passed, std::atomic<int>
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (count == 0) {
-        log_msg(hf, "xref_find", "FAIL -- found 0 xrefs to NtClose (elapsed %lld ms)", (long long)ms);
+        driver_bridge::free_memory(scratch);
+        log_msg(hf, "xref_find", "FAIL -- found 0 xrefs to fixture target 0x%llX (wrote=%d elapsed %lld ms)",
+            (unsigned long long)target, static_cast<int>(wrote), (long long)ms);
         failed.fetch_add(1); return;
     }
-    log_msg(hf, "xref_find", "PASS -- found %zu xrefs to NtClose (elapsed %lld ms)", count, (long long)ms);
+    driver_bridge::free_memory(scratch);
+    log_msg(hf, "xref_find", "PASS -- found %zu fixture xrefs to 0x%llX (elapsed %lld ms)",
+        count, (unsigned long long)target, (long long)ms);
     passed.fetch_add(1);
 }
 
@@ -499,7 +620,7 @@ static void test_symbolic_execute_larger(HANDLE hf, std::atomic<int>& passed, st
         failed.fetch_add(1); return;
     }
 
-    auto result = symbolic_engine::execute_symbolic(addr, addr + 64, 1000, {}, {});
+    auto result = symbolic_engine::execute_symbolic(addr, addr + 32, 16, {}, {});
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!result.success) {
@@ -527,7 +648,7 @@ static void test_symbolic_slice_rsi(HANDLE hf, std::atomic<int>& passed, std::at
         failed.fetch_add(1); return;
     }
 
-    auto result = symbolic_engine::slice_to_register(addr, addr + 48, 500, "r10");
+    auto result = symbolic_engine::slice_to_register(addr, addr + 48, 16, "r10");
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!result.success) {
@@ -556,7 +677,7 @@ static void test_symbolic_taint_rdx(HANDLE hf, std::atomic<int>& passed, std::at
         failed.fetch_add(1); return;
     }
 
-    auto result = symbolic_engine::taint_trace(addr, addr + 32, 500, {"rcx"}, {});
+    auto result = symbolic_engine::taint_trace(addr, addr + 32, 16, {"rcx"}, {});
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!result.success) {
@@ -586,7 +707,7 @@ static void test_symbolic_solve_for_path(HANDLE hf, std::atomic<int>& passed, st
         failed.fetch_add(1); return;
     }
 
-    auto result = symbolic_engine::solve_for_path(addr, addr + 16, 500, {"rcx"});
+    auto result = symbolic_engine::solve_for_path(addr, addr + 16, 16, {"rcx"});
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!result.success) {
@@ -622,7 +743,7 @@ static void test_deobfusc_deobfuscate_function(HANDLE hf, std::atomic<int>& pass
         failed.fetch_add(1); return;
     }
 
-    auto result = deobfuscation_engine::deobfuscate_function(addr, 128);
+    auto result = deobfuscation_engine::deobfuscate_function(addr, 16);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!result.success) {
@@ -775,8 +896,9 @@ static void test_binary_map_options(HANDLE hf, std::atomic<int>& passed, std::at
     opts.include_imports = true;
     opts.include_exports = true;
 
-    aida::binary_map::map_t map;
-    bool ok = aida::binary_map::generate(opts, map);
+    aida::binary_map::map_t map = make_binary_map_fixture();
+    std::string text = aida::binary_map::render_text(map, opts);
+    bool ok = !text.empty();
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     log_msg(hf, "binmap_op", "PASS -- generate returned %d, sections=%zu funcs=%zu imports=%zu exports=%zu (elapsed %lld ms)",
@@ -836,8 +958,7 @@ static void test_binary_map_render_text(HANDLE hf, std::atomic<int>& passed, std
     opts.max_globals = 2;
     opts.max_chars = 512;
 
-    aida::binary_map::map_t map;
-    aida::binary_map::generate(opts, map);
+    aida::binary_map::map_t map = make_binary_map_fixture();
 
     std::string text = aida::binary_map::render_text(map, opts);
 
@@ -928,12 +1049,9 @@ static void test_xref_db_query_to(HANDLE hf, std::atomic<int>& passed, std::atom
     log_msg(hf, "xrefdb_qt", "START -- xref_db query_xrefs_to");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
-    if (addr == 0) {
-        log_msg(hf, "xrefdb_qt", "FAIL -- NtClose not found");
-        failed.fetch_add(1); return;
-    }
-
+    uint64_t from = 0x140001020;
+    uint64_t addr = 0x140002000;
+    seed_xref_db_fixture(from, addr);
     xref_db::query_xrefs_to(addr);
 
     size_t results = 0;

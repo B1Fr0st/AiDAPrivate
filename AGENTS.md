@@ -91,6 +91,10 @@ The `encrypt_*.py` scripts accept `--from-binary <path>` to encrypt directly fro
 .\deploy_server.ps1 -ProvisionPgHba
 ```
 
+If you make any change to any file under `server/`, deploy those server changes with the PowerShell deployment scripts before reporting completion. Run the relevant server verification first, then use `.\deploy_server.ps1` for server source/config/schema/script changes. Use `.\deploy_to_server.ps1` when the ARC blob must be encrypted and uploaded after a build. If deployment fails, report the exact failing step and do not claim the server-side change is live.
+
+`.\deploy_server.ps1` may create a smoke-test license key. Treat generated `AIDA-...` license keys as secrets: do not paste full keys into chat or logs. After deployment, report whether key generation succeeded and direct the user to retrieve the key through an authorized server/admin channel outside chat if they need the full value.
+
 Server: `ruarr@23.88.62.199`, SSH key path: `~/.ssh/aida_server`. Do not expose key contents.
 
 ## Key Patterns and Conventions
@@ -253,8 +257,8 @@ Before final response:
 - Confirm secrets were not printed or modified.
 - Confirm generated files were not hand-edited.
 - Run relevant focused tests and the canonical build for code changes.
-- For server changes, run `cd server; npm test`.
-- For driver changes, follow the driver rebuild pipeline and mention reboot requirement.
+- For server changes, run `cd server; npm test`, then deploy changed `server/` files through the PowerShell deployment scripts before reporting completion.
+- For driver changes, follow the driver rebuild pipeline and always remind the user that reboot is required to load updated kernel drivers.
 - For library/API changes, mention Context7 docs consulted when relevant.
 - For symbol-level code work, mention Serena navigation/refactoring used when relevant.
 - Report any checks that could not be run.

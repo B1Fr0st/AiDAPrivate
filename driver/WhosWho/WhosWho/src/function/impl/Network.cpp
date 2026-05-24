@@ -183,6 +183,9 @@ static const GUID GUID_LAYER_INBOUND_V4 =
 static const GUID GUID_LAYER_OUTBOUND_V4 =
     { 0x09e61aea, 0xd214, 0x46e2, { 0x9b, 0x21, 0xb2, 0x6b, 0x0b, 0x2f, 0x28, 0xc8 } };
 
+static const GUID GUID_LAYER_DATAGRAM_V4 =
+    { 0x3d08bf4e, 0x45f6, 0x4930, { 0xa9, 0x22, 0x41, 0x70, 0x98, 0xe2, 0x00, 0x27 } };
+
 static const GUID GUID_LAYER_ALE_CONNECT_V4 =
     { 0xc38d57d1, 0x05a7, 0x4c33, { 0x90, 0x4f, 0x7f, 0xbc, 0xee, 0xe6, 0x0e, 0x82 } };
 
@@ -202,6 +205,13 @@ static const GUID GUID_LAYER_ALE_RECV_V4 =
 #define FWPS_FIELD_OUT_TRANS_V4_REMOTE_ADDR  3
 #define FWPS_FIELD_OUT_TRANS_V4_LOCAL_PORT   4
 #define FWPS_FIELD_OUT_TRANS_V4_REMOTE_PORT  5
+
+#define FWPS_FIELD_DATAGRAM_V4_PROTOCOL      0
+#define FWPS_FIELD_DATAGRAM_V4_LOCAL_ADDR    1
+#define FWPS_FIELD_DATAGRAM_V4_REMOTE_ADDR   2
+#define FWPS_FIELD_DATAGRAM_V4_LOCAL_PORT    4
+#define FWPS_FIELD_DATAGRAM_V4_REMOTE_PORT   5
+#define FWPS_FIELD_DATAGRAM_V4_DIRECTION     9
 
 
 #define FWPS_FIELD_ALE_V4_IP_LOCAL_ADDR     1
@@ -259,6 +269,14 @@ namespace net_capture {
         UINT64 flowContext,
         FWPS_CLASSIFY_OUT0_COMPAT* classifyOut);
     void NTAPI classify_outbound(
+        const FWPS_INCOMING_VALUES0_COMPAT* inFixedValues,
+        const FWPS_INCOMING_METADATA_VALUES0_COMPAT* inMetaValues,
+        void* layerData,
+        const void* classifyContext,
+        const void* filter,
+        UINT64 flowContext,
+        FWPS_CLASSIFY_OUT0_COMPAT* classifyOut);
+    void NTAPI classify_datagram_v4(
         const FWPS_INCOMING_VALUES0_COMPAT* inFixedValues,
         const FWPS_INCOMING_METADATA_VALUES0_COMPAT* inMetaValues,
         void* layerData,
@@ -389,10 +407,12 @@ namespace net_capture {
 
     inline UINT32 g_callout_id_inbound = 0;
     inline UINT32 g_callout_id_outbound = 0;
+    inline UINT32 g_callout_id_datagram = 0;
     inline UINT32 g_callout_id_ale_connect = 0;
     inline UINT32 g_callout_id_ale_recv = 0;
     inline UINT64 g_filter_id_inbound = 0;
     inline UINT64 g_filter_id_outbound = 0;
+    inline UINT64 g_filter_id_datagram = 0;
     inline UINT64 g_filter_id_ale_connect = 0;
     inline UINT64 g_filter_id_ale_recv = 0;
 
@@ -401,6 +421,8 @@ namespace net_capture {
         { 0x7a8b3c1d, 0x2e4f, 0x5a6b, { 0x8c, 0x9d, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6 } };
     static const GUID GUID_AIDA_CALLOUT_OUTBOUND =
         { 0x7a8b3c1e, 0x2e4f, 0x5a6b, { 0x8c, 0x9d, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf7 } };
+    static const GUID GUID_AIDA_CALLOUT_DATAGRAM =
+        { 0x7a8b3c22, 0x2e4f, 0x5a6b, { 0x8c, 0x9d, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xfb } };
     static const GUID GUID_AIDA_CALLOUT_ALE_CONNECT =
         { 0x7a8b3c20, 0x2e4f, 0x5a6b, { 0x8c, 0x9d, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf9 } };
     static const GUID GUID_AIDA_CALLOUT_ALE_RECV =
@@ -1533,6 +1555,195 @@ namespace net_capture {
     }
 
 
+    void NTAPI classify_datagram_v4(
+        const FWPS_INCOMING_VALUES0_COMPAT* inFixedValues,
+        const FWPS_INCOMING_METADATA_VALUES0_COMPAT* inMetaValues,
+        void* layerData,
+        const void* classifyContext,
+        const void* filter,
+        UINT64 flowContext,
+        FWPS_CLASSIFY_OUT0_COMPAT* classifyOut)
+    {
+        UNREFERENCED_PARAMETER(classifyContext);
+        UNREFERENCED_PARAMETER(filter);
+        UNREFERENCED_PARAMETER(flowContext);
+
+        if (!classifyOut) return;
+
+        classifyOut->actionType = FWP_ACTION_PERMIT_;
+
+        if (layerData && net_inject::_FwpsQueryPacketInjectionState0) {
+            if (net_inject::g_inject_handle_v4) {
+                UINT32 state = net_inject::_FwpsQueryPacketInjectionState0(
+                    net_inject::g_inject_handle_v4, layerData, nullptr);
+                if (state == 1 || state == 3) return;
+            }
+            if (net_inject::g_inject_handle_net_v4) {
+                UINT32 state = net_inject::_FwpsQueryPacketInjectionState0(
+                    net_inject::g_inject_handle_net_v4, layerData, nullptr);
+                if (state == 1 || state == 3) return;
+            }
+        }
+
+        if (!inFixedValues || !inMetaValues) return;
+        if (!should_process_packet_pipeline()) return;
+
+        __try {
+        UINT8* pkt_data = nullptr;
+        __try {
+            UINT32 protocol = 0;
+            UINT32 local_port = 0;
+            UINT32 remote_port = 0;
+            UINT32 direction = 1;
+            UINT8 local_ip[16] = {};
+            UINT8 remote_ip[16] = {};
+            UINT32 pid = 0;
+
+            if (inFixedValues->valueCount > FWPS_FIELD_DATAGRAM_V4_PROTOCOL) {
+                protocol = inFixedValues->incomingValue[FWPS_FIELD_DATAGRAM_V4_PROTOCOL].value.uint8;
+            }
+            if (inFixedValues->valueCount > FWPS_FIELD_DATAGRAM_V4_LOCAL_PORT) {
+                local_port = inFixedValues->incomingValue[FWPS_FIELD_DATAGRAM_V4_LOCAL_PORT].value.uint16;
+            }
+            if (inFixedValues->valueCount > FWPS_FIELD_DATAGRAM_V4_REMOTE_PORT) {
+                remote_port = inFixedValues->incomingValue[FWPS_FIELD_DATAGRAM_V4_REMOTE_PORT].value.uint16;
+            }
+            if (inFixedValues->valueCount > FWPS_FIELD_DATAGRAM_V4_LOCAL_ADDR) {
+                UINT32 ip = inFixedValues->incomingValue[FWPS_FIELD_DATAGRAM_V4_LOCAL_ADDR].value.uint32;
+                copy_ipv4_fixed_value(ip, local_ip);
+            }
+            if (inFixedValues->valueCount > FWPS_FIELD_DATAGRAM_V4_REMOTE_ADDR) {
+                UINT32 ip = inFixedValues->incomingValue[FWPS_FIELD_DATAGRAM_V4_REMOTE_ADDR].value.uint32;
+                copy_ipv4_fixed_value(ip, remote_ip);
+            }
+            if (inFixedValues->valueCount > FWPS_FIELD_DATAGRAM_V4_DIRECTION) {
+                UINT32 fwp_direction = inFixedValues->incomingValue[FWPS_FIELD_DATAGRAM_V4_DIRECTION].value.uint32;
+                direction = (fwp_direction == 0) ? 1u : 0u;
+            }
+
+            if (protocol != 17) __leave;
+
+            if ((inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID_) != 0) {
+                pid = (UINT32)inMetaValues->processId;
+            }
+            if (pid != 0 && inMetaValues->transportEndpointHandle != 0) {
+                aida_store_cached_endpoint_pid(inMetaValues->transportEndpointHandle,
+                    protocol, local_port, pid);
+            }
+            if (pid == 0) {
+                pid = aida_resolve_packet_pid(inMetaValues->transportEndpointHandle,
+                    protocol, local_port, remote_port);
+            }
+            if (pid == 0) {
+                pid = aida_lookup_cached_port_pid(protocol, local_port, remote_port);
+            }
+            if (pid == 0) {
+                UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
+                             ((UINT32)local_ip[2] << 8) | local_ip[3];
+                UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
+                             ((UINT32)remote_ip[2] << 8) | remote_ip[3];
+                if (direction == 0) {
+                    pid = net_udp_cache::lookup(rip, lip, (UINT16)remote_port, (UINT16)local_port);
+                } else {
+                    pid = net_udp_cache::lookup(lip, rip, (UINT16)local_port, (UINT16)remote_port);
+                }
+            }
+            if (pid != 0) {
+                aida_store_cached_port_pid(protocol, local_port, pid);
+                aida_store_cached_port_pid(protocol, remote_port, pid);
+                UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
+                             ((UINT32)local_ip[2] << 8) | local_ip[3];
+                UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
+                             ((UINT32)remote_ip[2] << 8) | remote_ip[3];
+                if (direction == 0) {
+                    net_udp_cache::store(rip, lip, (UINT16)remote_port, (UINT16)local_port, pid);
+                } else {
+                    net_udp_cache::store(lip, rip, (UINT16)local_port, (UINT16)remote_port, pid);
+                }
+            }
+
+            UINT32 data_length = get_transport_data_length(layerData);
+            if (direction == 0) {
+                _InterlockedIncrement64(&g_global_pkts_recv);
+                _InterlockedExchangeAdd64(&g_global_bytes_recv, static_cast<LONG64>(data_length));
+                net_bw::record_traffic(pid, 0, data_length);
+            } else {
+                _InterlockedIncrement64(&g_global_pkts_sent);
+                _InterlockedExchangeAdd64(&g_global_bytes_sent, static_cast<LONG64>(data_length));
+                net_bw::record_traffic(pid, 1, data_length);
+            }
+
+            BOOLEAN malsafe_log = FALSE;
+            if (pid != 0 && malware_safe::any_sandboxed()) {
+                HANDLE pid_handle_check = reinterpret_cast<HANDLE>((ULONG_PTR)pid);
+                if (malware_safe::sandbox_has_net_logging(pid_handle_check)) {
+                    malsafe_log = TRUE;
+                }
+            }
+
+            BOOLEAN need_full_pipeline = FALSE;
+            if (g_active_rule_count != 0) need_full_pipeline = TRUE;
+            if (!need_full_pipeline && net_mod::has_active_rules()) need_full_pipeline = TRUE;
+            if (!need_full_pipeline && net_intercept::is_active()) need_full_pipeline = TRUE;
+            if (!need_full_pipeline && net_dpi::is_active()) need_full_pipeline = TRUE;
+            if (!need_full_pipeline && net_dns_spoof::has_active_rules()) need_full_pipeline = TRUE;
+            if (!need_full_pipeline && net_redirect::has_active_rules()) need_full_pipeline = TRUE;
+            if (!need_full_pipeline && malsafe_log) need_full_pipeline = TRUE;
+            if (!need_full_pipeline) {
+                if (!g_capture_active || (g_filter_pid != 0 && pid != g_filter_pid))
+                    __leave;
+            }
+
+            pkt_data = (UINT8*)ExAllocatePool2(POOL_FLAG_NON_PAGED, NET_PKT_MAX_PAYLOAD, 'pdNW');
+            if (!pkt_data) __leave;
+
+            UINT32 pkt_len = copy_transport_bytes(layerData, pkt_data, NET_PKT_MAX_PAYLOAD);
+            if (pkt_len == 0) __leave;
+
+            {
+                LARGE_INTEGER dpi_ts;
+                KeQuerySystemTime(&dpi_ts);
+                net_dpi::analyze_packet(dpi_ts.QuadPart, direction, protocol,
+                    local_port, remote_port, local_ip, remote_ip, 2, pid,
+                    pkt_data, pkt_len);
+            }
+
+            if (net_intercept::try_hold_packet(direction, protocol, local_port, remote_port,
+                    local_ip, remote_ip, 2, pid, pkt_data, pkt_len)) {
+                NET_DBG("classify_datagram_v4: HELD by intercept dir=%u proto=%u pid=%u port=%u",
+                    direction, protocol, pid, remote_port);
+                classifyOut->actionType = FWP_ACTION_BLOCK_;
+                classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
+                __leave;
+            }
+
+            if (g_capture_active) {
+                store_packet(direction, protocol, pid, local_port, remote_port,
+                    2, local_ip, remote_ip, pkt_data, pkt_len);
+                if (local_port == 53 || remote_port == 53) {
+                    try_parse_dns(pid, pkt_data, pkt_len, local_port, remote_port);
+                }
+            }
+
+            if (malsafe_log) {
+                HANDLE pid_handle = reinterpret_cast<HANDLE>((ULONG_PTR)pid);
+                malware_safe::record_packet_for_pid(pid_handle,
+                    (UINT8)(direction & 0xFFu),
+                    (UINT8)(protocol & 0xFFu),
+                    (UINT16)(local_port & 0xFFFFu),
+                    (UINT16)(remote_port & 0xFFFFu),
+                    (UINT16)2,
+                    local_ip, remote_ip,
+                    pkt_len, 0, pkt_data);
+            }
+        } __finally {
+            if (pkt_data) ExFreePoolWithTag(pkt_data, 'pdNW');
+        }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+
+
     void NTAPI classify_ale_connect(
         const FWPS_INCOMING_VALUES0_COMPAT* inFixedValues,
         const FWPS_INCOMING_METADATA_VALUES0_COMPAT* inMetaValues,
@@ -1806,6 +2017,25 @@ namespace net_capture {
             return status;
         }
 
+        FWPS_CALLOUT2_COMPAT callout_datagram = {};
+        callout_datagram.calloutKey = GUID_AIDA_CALLOUT_DATAGRAM;
+        callout_datagram.flags = 0;
+        callout_datagram.classifyFn = (PVOID)classify_datagram_v4;
+        callout_datagram.notifyFn = (PVOID)callout_notify;
+        callout_datagram.flowDeleteFn = nullptr;
+
+        status = _FwpsCalloutRegister2(devObj, &callout_datagram, &g_callout_id_datagram);
+        NET_DBG("register_wfp: datagram callout register status=0x%08x id=%u", status, g_callout_id_datagram);
+        if (!NT_SUCCESS(status)) {
+            NET_ERR("register_wfp: datagram callout register FAILED 0x%08x", status);
+            _FwpsCalloutUnregisterById0(g_callout_id_inbound);
+            _FwpsCalloutUnregisterById0(g_callout_id_outbound);
+            _FwpmTransactionAbort0(g_engine_handle);
+            _FwpmEngineClose0(g_engine_handle);
+            g_engine_handle = nullptr;
+            return status;
+        }
+
 
         FWPM_DISPLAY_DATA0 callout_display = {};
         wchar_t co_name[] = L"AiDANetCallout";
@@ -1823,6 +2053,7 @@ namespace net_capture {
         if (!NT_SUCCESS(status)) {
             _FwpsCalloutUnregisterById0(g_callout_id_inbound);
             _FwpsCalloutUnregisterById0(g_callout_id_outbound);
+            _FwpsCalloutUnregisterById0(g_callout_id_datagram);
             _FwpmTransactionAbort0(g_engine_handle);
             _FwpmEngineClose0(g_engine_handle);
             g_engine_handle = nullptr;
@@ -1838,6 +2069,23 @@ namespace net_capture {
         if (!NT_SUCCESS(status)) {
             _FwpsCalloutUnregisterById0(g_callout_id_inbound);
             _FwpsCalloutUnregisterById0(g_callout_id_outbound);
+            _FwpsCalloutUnregisterById0(g_callout_id_datagram);
+            _FwpmTransactionAbort0(g_engine_handle);
+            _FwpmEngineClose0(g_engine_handle);
+            g_engine_handle = nullptr;
+            return status;
+        }
+
+        FWPM_CALLOUT0_COMPAT fwpm_callout_datagram = {};
+        fwpm_callout_datagram.calloutKey = GUID_AIDA_CALLOUT_DATAGRAM;
+        fwpm_callout_datagram.displayData = callout_display;
+        fwpm_callout_datagram.applicableLayer = GUID_LAYER_DATAGRAM_V4;
+
+        status = _FwpmCalloutAdd0(g_engine_handle, &fwpm_callout_datagram, nullptr, &unused_id);
+        if (!NT_SUCCESS(status)) {
+            _FwpsCalloutUnregisterById0(g_callout_id_inbound);
+            _FwpsCalloutUnregisterById0(g_callout_id_outbound);
+            _FwpsCalloutUnregisterById0(g_callout_id_datagram);
             _FwpmTransactionAbort0(g_engine_handle);
             _FwpmEngineClose0(g_engine_handle);
             g_engine_handle = nullptr;
@@ -1865,6 +2113,7 @@ namespace net_capture {
         if (!NT_SUCCESS(status)) {
             _FwpsCalloutUnregisterById0(g_callout_id_inbound);
             _FwpsCalloutUnregisterById0(g_callout_id_outbound);
+            _FwpsCalloutUnregisterById0(g_callout_id_datagram);
             _FwpmTransactionAbort0(g_engine_handle);
             _FwpmEngineClose0(g_engine_handle);
             g_engine_handle = nullptr;
@@ -1885,6 +2134,29 @@ namespace net_capture {
             _FwpmFilterDeleteById0(g_engine_handle, g_filter_id_inbound);
             _FwpsCalloutUnregisterById0(g_callout_id_inbound);
             _FwpsCalloutUnregisterById0(g_callout_id_outbound);
+            _FwpsCalloutUnregisterById0(g_callout_id_datagram);
+            _FwpmTransactionAbort0(g_engine_handle);
+            _FwpmEngineClose0(g_engine_handle);
+            g_engine_handle = nullptr;
+            return status;
+        }
+
+        FWPM_FILTER0_COMPAT filter_datagram = {};
+        strong::kmemset(&filter_datagram, 0, sizeof(filter_datagram));
+        filter_datagram.displayData = filter_display;
+        filter_datagram.layerKey = GUID_LAYER_DATAGRAM_V4;
+        filter_datagram.subLayerKey = GUID_AIDA_SUBLAYER;
+        filter_datagram.weight.type = FWP_EMPTY_;
+        filter_datagram.action.type = FWP_ACTION_CALLOUT_TERMINATING_;
+        filter_datagram.action.calloutKey = GUID_AIDA_CALLOUT_DATAGRAM;
+        filter_datagram.numFilterConditions = 0;
+        status = _FwpmFilterAdd0(g_engine_handle, &filter_datagram, nullptr, &g_filter_id_datagram);
+        if (!NT_SUCCESS(status)) {
+            _FwpmFilterDeleteById0(g_engine_handle, g_filter_id_inbound);
+            _FwpmFilterDeleteById0(g_engine_handle, g_filter_id_outbound);
+            _FwpsCalloutUnregisterById0(g_callout_id_inbound);
+            _FwpsCalloutUnregisterById0(g_callout_id_outbound);
+            _FwpsCalloutUnregisterById0(g_callout_id_datagram);
             _FwpmTransactionAbort0(g_engine_handle);
             _FwpmEngineClose0(g_engine_handle);
             g_engine_handle = nullptr;
@@ -1982,6 +2254,7 @@ namespace net_capture {
             NET_ERR("register_wfp: FwpmTransactionCommit0 FAILED 0x%08x", status);
             _FwpsCalloutUnregisterById0(g_callout_id_inbound);
             _FwpsCalloutUnregisterById0(g_callout_id_outbound);
+            _FwpsCalloutUnregisterById0(g_callout_id_datagram);
             _FwpmEngineClose0(g_engine_handle);
             g_engine_handle = nullptr;
             return status;
@@ -2011,6 +2284,10 @@ namespace net_capture {
                 _FwpmFilterDeleteById0(g_engine_handle, g_filter_id_outbound);
                 g_filter_id_outbound = 0;
             }
+            if (g_filter_id_datagram) {
+                _FwpmFilterDeleteById0(g_engine_handle, g_filter_id_datagram);
+                g_filter_id_datagram = 0;
+            }
             if (_FwpmSubLayerDeleteByKey0) {
                 _FwpmSubLayerDeleteByKey0(g_engine_handle, &GUID_AIDA_SUBLAYER);
             }
@@ -2019,6 +2296,8 @@ namespace net_capture {
                     _FwpmCalloutDeleteById0(g_engine_handle, g_callout_id_inbound);
                 if (g_callout_id_outbound)
                     _FwpmCalloutDeleteById0(g_engine_handle, g_callout_id_outbound);
+                if (g_callout_id_datagram)
+                    _FwpmCalloutDeleteById0(g_engine_handle, g_callout_id_datagram);
                 if (g_callout_id_ale_connect)
                     _FwpmCalloutDeleteById0(g_engine_handle, g_callout_id_ale_connect);
                 if (g_callout_id_ale_recv)
@@ -2042,6 +2321,10 @@ namespace net_capture {
         if (g_callout_id_outbound) {
             _FwpsCalloutUnregisterById0(g_callout_id_outbound);
             g_callout_id_outbound = 0;
+        }
+        if (g_callout_id_datagram) {
+            _FwpsCalloutUnregisterById0(g_callout_id_datagram);
+            g_callout_id_datagram = 0;
         }
     }
 
@@ -3662,6 +3945,13 @@ namespace net_wfp_enum {
             &net_capture::GUID_AIDA_CALLOUT_OUTBOUND,
             &GUID_LAYER_OUTBOUND_V4,
             (UINT64)net_capture::classify_outbound,
+            (UINT64)net_capture::callout_notify,
+            0);
+        append_registered_callout(request, &total_filled,
+            net_capture::g_callout_id_datagram,
+            &net_capture::GUID_AIDA_CALLOUT_DATAGRAM,
+            &GUID_LAYER_DATAGRAM_V4,
+            (UINT64)net_capture::classify_datagram_v4,
             (UINT64)net_capture::callout_notify,
             0);
         request->callout_count = total_filled;

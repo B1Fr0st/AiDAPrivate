@@ -102,6 +102,8 @@ struct scan_config_t {
 	size_t        alignment = 4;
 	bool          writable_only = true;
 	bool          executable_exclude = true;
+	uint64_t      range_base = 0;
+	uint64_t      range_size = 0;
 };
 
 struct state_t {

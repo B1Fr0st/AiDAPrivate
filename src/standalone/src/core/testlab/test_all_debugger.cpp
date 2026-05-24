@@ -96,6 +96,170 @@ static bool require_attached_live_target(HANDLE hf, const char* tag, std::atomic
     return true;
 }
 
+static uint32_t first_attached_target_tid() {
+    const uint32_t pid = driver_bridge::attached_pid();
+    if (pid == 0)
+        return 0;
+
+    const uint32_t active = debugger_engine::g_state.active_tid;
+    auto threads = driver_bridge::enumerate_threads();
+    if (active != 0) {
+        for (const auto& t : threads) {
+            if (t.owner_pid == pid && t.tid == active)
+                return active;
+        }
+    }
+    for (const auto& t : threads) {
+        if (t.owner_pid == pid)
+            return t.tid;
+    }
+    return 0;
+}
+
+struct controlled_step_fixture_t {
+    uint32_t tid = 0;
+    uint32_t original_suspend_count = 0;
+    uint64_t code = 0;
+    uint64_t stack = 0;
+    uint64_t rsp = 0;
+    uint64_t expected_rip = 0;
+    driver_bridge::thread_context_t before{};
+    bool context_valid = false;
+    bool context_entered = false;
+};
+
+static bool restore_context_and_suspend_count(uint32_t tid,
+                                              const driver_bridge::thread_context_t& ctx,
+                                              uint32_t desired_suspend_count) {
+    if (tid == 0)
+        return false;
+    uint32_t prev = 0;
+    if (!driver_bridge::suspend_thread(tid, &prev))
+        return false;
+    uint32_t current = prev < 0xFFFFFFFFu ? prev + 1 : prev;
+    bool ctx_ok = driver_bridge::set_thread_context(tid, ctx, ~0ULL);
+    bool depth_ok = true;
+    for (int guard = 0; current > desired_suspend_count && guard < 64; ++guard) {
+        uint32_t resume_prev = 0;
+        if (!driver_bridge::resume_thread(tid, &resume_prev)) {
+            depth_ok = false;
+            break;
+        }
+        current = resume_prev > 0 ? resume_prev - 1 : 0;
+    }
+    return ctx_ok && depth_ok && current == desired_suspend_count;
+}
+
+static bool cleanup_controlled_step_fixture(controlled_step_fixture_t& fx,
+                                            bool* restored,
+                                            bool* freed_code,
+                                            bool* freed_stack) {
+    bool restore_ok = true;
+    bool code_ok = true;
+    bool stack_ok = true;
+
+    if (fx.context_valid && fx.tid != 0)
+        restore_ok = restore_context_and_suspend_count(fx.tid, fx.before, fx.original_suspend_count);
+
+    if (fx.code != 0 && (!fx.context_entered || restore_ok)) {
+        code_ok = driver_bridge::free_memory(fx.code);
+        fx.code = 0;
+    }
+    if (fx.stack != 0 && (!fx.context_entered || restore_ok)) {
+        stack_ok = driver_bridge::free_memory(fx.stack);
+        fx.stack = 0;
+    }
+
+    if (restored) *restored = restore_ok;
+    if (freed_code) *freed_code = code_ok;
+    if (freed_stack) *freed_stack = stack_ok;
+    return restore_ok && code_ok && stack_ok;
+}
+
+static bool prepare_controlled_step_fixture(HANDLE hf,
+                                            const char* tag,
+                                            controlled_step_fixture_t& fx,
+                                            const std::vector<uint8_t>& code_bytes,
+                                            bool use_stack_return) {
+    fx.tid = first_attached_target_tid();
+    if (fx.tid == 0) {
+        log_msg(hf, tag, "FAIL -- no live target thread available for controlled step fixture");
+        return false;
+    }
+
+    debugger_engine::g_state.active_tid = fx.tid;
+    if (!driver_bridge::suspend_thread(fx.tid, &fx.original_suspend_count)) {
+        log_msg(hf, tag, "FAIL -- could not suspend tid=%u for controlled step fixture", fx.tid);
+        return false;
+    }
+
+    if (!driver_bridge::get_thread_context(fx.tid, fx.before) || fx.before.rip == 0 || fx.before.rsp == 0) {
+        driver_bridge::resume_thread(fx.tid);
+        log_msg(hf, tag, "FAIL -- could not read context for controlled step fixture tid=%u", fx.tid);
+        return false;
+    }
+    fx.context_valid = true;
+
+    fx.code = driver_bridge::allocate_memory(64);
+    if (use_stack_return)
+        fx.stack = driver_bridge::allocate_memory(0x1000);
+
+    bool ok = fx.code != 0 && (!use_stack_return || fx.stack != 0);
+    if (ok) {
+        std::vector<uint8_t> code(64, 0x90);
+        for (size_t i = 0; i < code_bytes.size() && i < code.size(); ++i)
+            code[i] = code_bytes[i];
+        ok = driver_bridge::write_memory(fx.code, code);
+    }
+    if (ok) {
+        uint32_t old_protect = 0;
+        ok = driver_bridge::protect_memory(fx.code, 64, PAGE_EXECUTE_READWRITE, &old_protect);
+    }
+    if (ok && use_stack_return) {
+        fx.expected_rip = fx.code + 0x10;
+        fx.rsp = fx.stack + 0x800;
+        std::vector<uint8_t> stack_bytes(8, 0);
+        std::memcpy(stack_bytes.data(), &fx.expected_rip, sizeof(fx.expected_rip));
+        ok = driver_bridge::write_memory(fx.rsp, stack_bytes);
+    } else if (ok) {
+        fx.expected_rip = fx.code + 1;
+    }
+    if (ok) {
+        auto ctx = fx.before;
+        ctx.rip = fx.code;
+        if (use_stack_return)
+            ctx.rsp = fx.rsp;
+        ctx.rflags &= ~0x100ULL;
+        ok = driver_bridge::set_thread_context(fx.tid, ctx, ~0ULL);
+        fx.context_entered = ok;
+    }
+
+    if (!ok) {
+        uint64_t failed_code = fx.code;
+        uint64_t failed_stack = fx.stack;
+        bool restored = false;
+        bool freed_code = false;
+        bool freed_stack = false;
+        cleanup_controlled_step_fixture(fx, &restored, &freed_code, &freed_stack);
+        log_msg(hf, tag, "FAIL -- could not build controlled step fixture tid=%u code=0x%llX stack=0x%llX restored=%d free_code=%d free_stack=%d",
+            fx.tid,
+            (unsigned long long)failed_code,
+            (unsigned long long)failed_stack,
+            (int)restored,
+            (int)freed_code,
+            (int)freed_stack);
+        return false;
+    }
+
+    log_msg(hf, tag, "INFO -- controlled step fixture tid=%u entry=0x%llX expected=0x%llX stack=0x%llX original_suspend=%u",
+        fx.tid,
+        (unsigned long long)fx.code,
+        (unsigned long long)fx.expected_rip,
+        (unsigned long long)fx.rsp,
+        (unsigned)fx.original_suspend_count);
+    return true;
+}
+
 static void scrub_target_hardware_breakpoints(HANDLE hf, const char* reason) {
     debugger_engine::clear_all_breakpoints();
 
@@ -1077,79 +1241,174 @@ static void test_set_register(HANDLE hf, std::atomic<int>& passed, std::atomic<i
 }
 
 static void test_step_into(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "dbg_si", "START -- step_into single-step");
+    log_msg(hf, "dbg_si", "START -- step_into controlled nop fixture");
     auto t0 = std::chrono::steady_clock::now();
 
+    if (!require_attached_live_target(hf, "dbg_si", failed))
+        return;
+
+    controlled_step_fixture_t fixture;
+    std::vector<uint8_t> code{0x90, 0x90, 0x90, 0xC3};
+    if (!prepare_controlled_step_fixture(hf, "dbg_si", fixture, code, false)) {
+        failed.fetch_add(1);
+        return;
+    }
+
     auto before = debugger_engine::get_registers();
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_si inputs: step_into() before_rip=0x%llX attached_pid=%u",
-        (unsigned long long)before.rip, (unsigned)driver_bridge::attached_pid());
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_si inputs: step_into() before_rip=0x%llX expected=0x%llX attached_pid=%u tid=%u",
+        (unsigned long long)before.rip,
+        (unsigned long long)fixture.expected_rip,
+        (unsigned)driver_bridge::attached_pid(),
+        (unsigned)fixture.tid);
 
     bool ok = debugger_engine::step_into();
     auto after = debugger_engine::get_registers();
     std::string err = debugger_engine::last_error();
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_si result: step_into=>%d before_rip=0x%llX after_rip=0x%llX last_error='%s'",
-        (int)ok, (unsigned long long)before.rip, (unsigned long long)after.rip, err.c_str());
+    bool restored = false;
+    bool freed_code = false;
+    bool freed_stack = false;
+    cleanup_controlled_step_fixture(fixture, &restored, &freed_code, &freed_stack);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_si result: step_into=>%d before_rip=0x%llX after_rip=0x%llX expected=0x%llX restored=%d free_code=%d last_error='%s'",
+        (int)ok,
+        (unsigned long long)before.rip,
+        (unsigned long long)after.rip,
+        (unsigned long long)fixture.expected_rip,
+        (int)restored,
+        (int)freed_code,
+        err.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (ok && after.rip != 0) {
-        log_msg(hf, "dbg_si", "PASS -- step_into advanced rip 0x%llX -> 0x%llX (elapsed %lld ms)",
-            (unsigned long long)before.rip, (unsigned long long)after.rip, (long long)ms);
+    if (ok && after.rip == fixture.expected_rip && restored && freed_code && ms <= 5000) {
+        log_msg(hf, "dbg_si", "PASS -- step_into advanced controlled rip 0x%llX -> 0x%llX and restored context (elapsed %lld ms)",
+            (unsigned long long)before.rip,
+            (unsigned long long)after.rip,
+            (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_si", "FAIL -- step_into returned %d (after_rip=0x%llX); last_error=\"%s\" (elapsed %lld ms)",
-            (int)ok, (unsigned long long)after.rip, err.empty() ? "(none)" : err.c_str(), (long long)ms);
+        log_msg(hf, "dbg_si", "FAIL -- step_into returned %d (after_rip=0x%llX expected=0x%llX restored=%d free_code=%d); last_error=\"%s\" (elapsed %lld ms)",
+            (int)ok,
+            (unsigned long long)after.rip,
+            (unsigned long long)fixture.expected_rip,
+            (int)restored,
+            (int)freed_code,
+            err.empty() ? "(none)" : err.c_str(),
+            (long long)ms);
         failed.fetch_add(1);
     }
 }
 
 static void test_step_over(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "dbg_so", "START -- step_over");
+    log_msg(hf, "dbg_so", "START -- step_over controlled nop fixture");
     auto t0 = std::chrono::steady_clock::now();
 
+    if (!require_attached_live_target(hf, "dbg_so", failed))
+        return;
+
+    controlled_step_fixture_t fixture;
+    std::vector<uint8_t> code{0x90, 0x90, 0x90, 0xC3};
+    if (!prepare_controlled_step_fixture(hf, "dbg_so", fixture, code, false)) {
+        failed.fetch_add(1);
+        return;
+    }
+
     auto before = debugger_engine::get_registers();
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_so inputs: step_over() before_rip=0x%llX attached_pid=%u",
-        (unsigned long long)before.rip, (unsigned)driver_bridge::attached_pid());
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_so inputs: step_over() before_rip=0x%llX expected=0x%llX attached_pid=%u tid=%u",
+        (unsigned long long)before.rip,
+        (unsigned long long)fixture.expected_rip,
+        (unsigned)driver_bridge::attached_pid(),
+        (unsigned)fixture.tid);
 
     bool ok = debugger_engine::step_over();
     auto after = debugger_engine::get_registers();
     std::string err = debugger_engine::last_error();
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_so result: step_over=>%d before_rip=0x%llX after_rip=0x%llX last_error='%s'",
-        (int)ok, (unsigned long long)before.rip, (unsigned long long)after.rip, err.c_str());
+    bool restored = false;
+    bool freed_code = false;
+    bool freed_stack = false;
+    cleanup_controlled_step_fixture(fixture, &restored, &freed_code, &freed_stack);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_so result: step_over=>%d before_rip=0x%llX after_rip=0x%llX expected=0x%llX restored=%d free_code=%d last_error='%s'",
+        (int)ok,
+        (unsigned long long)before.rip,
+        (unsigned long long)after.rip,
+        (unsigned long long)fixture.expected_rip,
+        (int)restored,
+        (int)freed_code,
+        err.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (ok && after.rip != 0) {
-        log_msg(hf, "dbg_so", "PASS -- step_over completed, rip 0x%llX -> 0x%llX (elapsed %lld ms)",
-            (unsigned long long)before.rip, (unsigned long long)after.rip, (long long)ms);
+    if (ok && after.rip == fixture.expected_rip && restored && freed_code && ms <= 5000) {
+        log_msg(hf, "dbg_so", "PASS -- step_over advanced controlled rip 0x%llX -> 0x%llX and restored context (elapsed %lld ms)",
+            (unsigned long long)before.rip,
+            (unsigned long long)after.rip,
+            (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_so", "FAIL -- step_over returned %d (after_rip=0x%llX); last_error=\"%s\" (elapsed %lld ms)",
-            (int)ok, (unsigned long long)after.rip, err.empty() ? "(none)" : err.c_str(), (long long)ms);
+        log_msg(hf, "dbg_so", "FAIL -- step_over returned %d (after_rip=0x%llX expected=0x%llX restored=%d free_code=%d); last_error=\"%s\" (elapsed %lld ms)",
+            (int)ok,
+            (unsigned long long)after.rip,
+            (unsigned long long)fixture.expected_rip,
+            (int)restored,
+            (int)freed_code,
+            err.empty() ? "(none)" : err.c_str(),
+            (long long)ms);
         failed.fetch_add(1);
     }
 }
 
 static void test_step_out(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "dbg_sout", "START -- step_out");
+    log_msg(hf, "dbg_sout", "START -- step_out controlled return fixture");
     auto t0 = std::chrono::steady_clock::now();
 
+    if (!require_attached_live_target(hf, "dbg_sout", failed))
+        return;
+
+    controlled_step_fixture_t fixture;
+    std::vector<uint8_t> code{0xC3, 0x90, 0x90, 0x90};
+    if (!prepare_controlled_step_fixture(hf, "dbg_sout", fixture, code, true)) {
+        failed.fetch_add(1);
+        return;
+    }
+
     auto before = debugger_engine::get_registers();
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_sout inputs: step_out() before_rip=0x%llX before_rsp=0x%llX attached_pid=%u",
-        (unsigned long long)before.rip, (unsigned long long)before.rsp, (unsigned)driver_bridge::attached_pid());
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_sout inputs: step_out() before_rip=0x%llX before_rsp=0x%llX expected=0x%llX attached_pid=%u tid=%u",
+        (unsigned long long)before.rip,
+        (unsigned long long)before.rsp,
+        (unsigned long long)fixture.expected_rip,
+        (unsigned)driver_bridge::attached_pid(),
+        (unsigned)fixture.tid);
 
     bool ok = debugger_engine::step_out();
     auto after = debugger_engine::get_registers();
     std::string err = debugger_engine::last_error();
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_sout result: step_out=>%d after_rip=0x%llX last_error='%s'",
-        (int)ok, (unsigned long long)after.rip, err.c_str());
+    bool restored = false;
+    bool freed_code = false;
+    bool freed_stack = false;
+    cleanup_controlled_step_fixture(fixture, &restored, &freed_code, &freed_stack);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_sout result: step_out=>%d after_rip=0x%llX after_rsp=0x%llX expected=0x%llX restored=%d free_code=%d free_stack=%d last_error='%s'",
+        (int)ok,
+        (unsigned long long)after.rip,
+        (unsigned long long)after.rsp,
+        (unsigned long long)fixture.expected_rip,
+        (int)restored,
+        (int)freed_code,
+        (int)freed_stack,
+        err.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (ok && after.rip != 0) {
-        log_msg(hf, "dbg_sout", "PASS -- step_out completed, rip now 0x%llX (elapsed %lld ms)",
-            (unsigned long long)after.rip, (long long)ms);
+    if (ok && after.rip == fixture.expected_rip && restored && freed_code && freed_stack && ms <= 5000) {
+        log_msg(hf, "dbg_sout", "PASS -- step_out reached controlled return 0x%llX and restored context (elapsed %lld ms)",
+            (unsigned long long)after.rip,
+            (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_sout", "FAIL -- step_out returned %d (after_rip=0x%llX); last_error=\"%s\" (elapsed %lld ms)",
-            (int)ok, (unsigned long long)after.rip, err.empty() ? "(none)" : err.c_str(), (long long)ms);
+        log_msg(hf, "dbg_sout", "FAIL -- step_out returned %d (after_rip=0x%llX expected=0x%llX restored=%d free_code=%d free_stack=%d); last_error=\"%s\" (elapsed %lld ms)",
+            (int)ok,
+            (unsigned long long)after.rip,
+            (unsigned long long)fixture.expected_rip,
+            (int)restored,
+            (int)freed_code,
+            (int)freed_stack,
+            err.empty() ? "(none)" : err.c_str(),
+            (long long)ms);
         failed.fetch_add(1);
     }
 }

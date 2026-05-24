@@ -1116,6 +1116,36 @@ void helpers::render_title()
 			standalone_license::gate_ui_render_loop, gt);
 	}
 
+	{
+		const bool runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
+		static bool s_runtime_lock_logged = false;
+		if (runtime_locked) {
+			license::validated = false;
+			license::checking = false;
+			license::check_failed = false;
+			license::error_msg = "Runtime integrity check failed. Restart AiDAStandalone.exe.";
+			if (!s_runtime_lock_logged) {
+				std::string reason;
+				{
+					auto& rt = anti_tamper::state::get();
+					std::lock_guard<std::mutex> lk(rt.mtx);
+					reason = rt.violation_reason;
+				}
+				diag::log_tagged_fmt("license",
+					"DIAG_DIALOG_SUPPRESSED_LICENSE_INPUT source=render_title reason=%.160s",
+					reason.c_str());
+				s_runtime_lock_logged = true;
+			}
+		} else if (!license::validated && standalone_license::is_valid()) {
+			license::validated = true;
+			license::checking = false;
+			license::check_failed = false;
+			license::error_msg.clear();
+			s_runtime_lock_logged = false;
+			diag::log_tagged("license", "DIAG_DIALOG_RECOVERED_RUNTIME_VALIDITY");
+		}
+	}
+
 	g_render_section = "theme_resolve";
 	if (custom_themes::active_custom >= 0 &&
 	    custom_themes::active_custom < (int)custom_themes::list.size()) {
@@ -1959,6 +1989,47 @@ void helpers::render_title()
 
 		float gs = ImGui::GetIO().FontGlobalScale;
 		(void)gs;
+
+		const bool runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
+		if (runtime_locked) {
+			dl->AddRectFilled(card_a, card_b, aida::ui::with_alpha(th.panel_bg, 0.82f * la), 16.f);
+			dl->AddRect(card_a, card_b, aida::ui::with_alpha(th.border_subtle, la), 16.f, 0, 1.2f);
+
+			const char* title = "Runtime integrity lock";
+			float title_size = 25.f;
+			ImVec2 title_ts = h1f->CalcTextSizeA(title_size, FLT_MAX, 0.f, title);
+			dl->AddText(h1f, title_size,
+				ImVec2(cx - title_ts.x * 0.5f + shake_x, content_y + 76.f),
+				aida::ui::with_alpha(th.text_primary, la), title);
+
+			const char* sub = "AiDA stopped this runtime session. Restart AiDAStandalone.exe.";
+			float sub_size = body->FontSize;
+			ImVec2 sub_ts = body->CalcTextSizeA(sub_size, inner_w, 0.f, sub);
+			dl->AddText(body, sub_size,
+				ImVec2(cx - sub_ts.x * 0.5f + shake_x, content_y + 76.f + title_size + 16.f),
+				aida::ui::with_alpha(th.text_secondary, la), sub);
+
+			std::string reason;
+			{
+				auto& rt = anti_tamper::state::get();
+				std::lock_guard<std::mutex> lk(rt.mtx);
+				reason = rt.violation_reason;
+			}
+			if (!reason.empty()) {
+				std::string msg = "Reason: " + reason;
+				ImFont* code = aida::ui::fonts::code();
+				if (!code) code = ImGui::GetFont();
+				float msg_size = 13.f;
+				ImVec2 reason_ts = code->CalcTextSizeA(msg_size, inner_w, 0.f, msg.c_str());
+				dl->AddText(code, msg_size,
+					ImVec2(cx - reason_ts.x * 0.5f + shake_x, content_y + 76.f + title_size + 48.f),
+					aida::ui::with_alpha(th.text_dim, la), msg.c_str(), nullptr, inner_w);
+			}
+
+			ImGui::End();
+			return;
+		}
+
 		const char* title = "Welcome to AiDA";
 		float title_size = 26.f;
 		ImVec2 title_ts = h1f->CalcTextSizeA(title_size, FLT_MAX, 0.f, title);
@@ -7858,12 +7929,17 @@ void helpers::render_title()
 		if (++s_lic_check_counter >= 120) {
 			s_lic_check_counter = 0;
 			if (license::validated && !standalone_license::is_valid()) {
+				const bool runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
 				license::validated = false;
-				license::error_msg = standalone_license::last_error();
-				output_log::push(bottom_tab_t::output, "[license] Session invalidated: " + license::error_msg);
+				license::error_msg = runtime_locked
+					? std::string("Runtime integrity check failed. Restart AiDAStandalone.exe.")
+					: standalone_license::last_error();
+				output_log::push(bottom_tab_t::output, runtime_locked
+					? std::string("[license] Runtime integrity lock, activation screen suppressed")
+					: std::string("[license] Session invalidated: " + license::error_msg));
 				diag::log_tagged_fmt("license",
-					"DIAG_DIALOG_TRIGGER source=periodic_check_120f frame=%d err=%.200s",
-					ImGui::GetFrameCount(), license::error_msg.c_str());
+					"DIAG_DIALOG_TRIGGER source=periodic_check_120f frame=%d runtime_locked=%d err=%.200s",
+					ImGui::GetFrameCount(), runtime_locked ? 1 : 0, license::error_msg.c_str());
 			}
 		}
 	}

@@ -48,6 +48,7 @@ namespace binary_map {
 		size_t max_chars = 4096;
 		bool   include_imports = true;
 		bool   include_exports = true;
+		bool   include_xrefs = true;
 	};
 
 	struct map_t

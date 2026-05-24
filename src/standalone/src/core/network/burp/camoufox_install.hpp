@@ -32,9 +32,12 @@ struct status_t
 bool      initialize();
 void      shutdown();
 status_t  probe();
+bool      ensure_ready(std::string& out_log);
 bool      pip_install_module(std::string& out_log);
+bool      repair_runtime_dependencies(std::string& out_log);
 bool      fetch_browser(std::string& out_log);
 bool      pip_install_async();
+bool      repair_runtime_dependencies_async();
 bool      fetch_browser_async();
 status_t  get_status();
 std::string last_error();

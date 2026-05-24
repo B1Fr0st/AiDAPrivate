@@ -106,6 +106,11 @@ inline state_t g_state;
 
 namespace detail {
 
+inline bool pc_in_requested_range(uint64_t pc, uint64_t start_addr, uint64_t end_addr) {
+	if (end_addr == 0) return true;
+	return pc >= start_addr && pc < end_addr;
+}
+
 inline triton::arch::register_e name_to_triton_reg(const std::string& name) {
 	static const std::unordered_map<std::string, triton::arch::register_e> map = {
 		{"rax", triton::arch::ID_REG_X86_RAX},
@@ -269,7 +274,7 @@ inline symbolic_result_t execute_symbolic(
 	uint32_t count = 0;
 
 	while (count < max_instructions) {
-		if (end_addr != 0 && pc == end_addr) break;
+		if (!detail::pc_in_requested_range(pc, start_addr, end_addr)) break;
 
 		auto code_bytes = emulation::driver_read_bytes(pc, 16);
 		if (code_bytes.empty()) {
@@ -399,7 +404,7 @@ inline slice_result_t slice_to_register(
 	uint32_t count = 0;
 
 	while (count < max_instructions) {
-		if (end_addr != 0 && pc == end_addr) break;
+		if (!detail::pc_in_requested_range(pc, start_addr, end_addr)) break;
 
 		auto code_bytes = emulation::driver_read_bytes(pc, 16);
 		if (code_bytes.empty()) break;
@@ -629,7 +634,7 @@ inline taint_result_t taint_trace(
 	uint32_t count = 0;
 
 	while (count < max_instructions) {
-		if (end_addr != 0 && pc == end_addr) break;
+		if (!detail::pc_in_requested_range(pc, start_addr, end_addr)) break;
 
 		auto code_bytes = emulation::driver_read_bytes(pc, 16);
 		if (code_bytes.empty()) break;

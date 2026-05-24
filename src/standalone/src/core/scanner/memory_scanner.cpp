@@ -13,6 +13,7 @@
 #include <map>
 #include <sstream>
 #include <iomanip>
+#include <limits>
 #include <type_traits>
 
 namespace memory_scanner {
@@ -263,13 +264,21 @@ static void first_scan_thread(scan_config_t config) {
 
 	auto t_start = std::chrono::steady_clock::now();
 	auto regions = driver_bridge::enumerate_memory_regions(4096);
-	diag::log_tagged_fmt("mem_scanner", "first_scan_thread enter pid=%u regions=%zu val_type=%s mode=%s writable_only=%d exec_exclude=%d hex=%d align=%zu",
+	diag::log_tagged_fmt("mem_scanner", "first_scan_thread enter pid=%u regions=%zu val_type=%s mode=%s writable_only=%d exec_exclude=%d hex=%d align=%zu range=0x%llX+0x%llX",
 		driver_bridge::attached_pid(), regions.size(),
 		value_type_name(config.value_type), scan_mode_name(config.scan_mode),
 		static_cast<int>(config.writable_only), static_cast<int>(config.executable_exclude),
-		static_cast<int>(config.hex_input), config.alignment);
+		static_cast<int>(config.hex_input), config.alignment,
+		static_cast<unsigned long long>(config.range_base),
+		static_cast<unsigned long long>(config.range_size));
 
 	std::vector<driver_bridge::memory_region_t> scan_regions;
+	const bool has_range = config.range_base != 0 && config.range_size != 0;
+	const uint64_t range_start = config.range_base;
+	const uint64_t max_u64 = std::numeric_limits<uint64_t>::max();
+	const uint64_t range_end = has_range
+		? (max_u64 - config.range_base < config.range_size ? max_u64 : config.range_base + config.range_size)
+		: 0;
 	for (const auto& r : regions) {
 		if (r.state != 0x1000) continue;
 		if (r.protect & 0x100) continue;
@@ -278,7 +287,19 @@ static void first_scan_thread(scan_config_t config) {
 		if (config.writable_only && !(base_prot & 0xCC)) continue;
 		if (config.executable_exclude && (base_prot & 0xF0)) continue;
 		if (r.type == 0x40000) continue;
-		scan_regions.push_back(r);
+		if (has_range) {
+			const uint64_t region_start = r.base;
+			const uint64_t region_end = max_u64 - r.base < r.size ? max_u64 : r.base + r.size;
+			const uint64_t clipped_start = std::max(region_start, range_start);
+			const uint64_t clipped_end = std::min(region_end, range_end);
+			if (clipped_start >= clipped_end) continue;
+			auto clipped = r;
+			clipped.base = clipped_start;
+			clipped.size = clipped_end - clipped_start;
+			scan_regions.push_back(clipped);
+		} else {
+			scan_regions.push_back(r);
+		}
 	}
 
 	if (scan_regions.empty()) {

@@ -17,7 +17,7 @@ namespace camoufox {
 
 struct launch_config_t
 {
-    bool                     headless           = true;
+    bool                     headless           = false;
     std::string              proxy;
     std::string              os                 = "auto";
     std::string              locale             = "auto";
@@ -27,7 +27,7 @@ struct launch_config_t
     std::string              python_executable;
     std::string              server_module      = "camoufox_reverse_mcp";
     std::vector<std::string> extra_args;
-    int                      launch_timeout_ms  = 60000;
+    int                      launch_timeout_ms  = 5000;
 };
 
 enum class bridge_state_t : int

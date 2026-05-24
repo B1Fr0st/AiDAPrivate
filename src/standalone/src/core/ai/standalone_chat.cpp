@@ -39,6 +39,7 @@
 #include "file_context_tracker.hpp"
 #include "standalone_context.hpp"
 #include "skills.hpp"
+#include "../anti-tamper/state.hpp"
 #include "../ui/components.hpp"
 #include "../ui/fonts.hpp"
 
@@ -2103,12 +2104,15 @@ void poll_ai_chat()
     if (!s_initialized) return;
 
     if (license::validated && !standalone_license::is_valid()) {
+        const bool runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
         license::validated = false;
         license::check_failed = true;
-        license::error_msg = standalone_license::last_error();
+        license::error_msg = runtime_locked
+            ? std::string("Runtime integrity check failed. Restart AiDAStandalone.exe.")
+            : standalone_license::last_error();
         diag::log_tagged_fmt("license",
-            "DIAG_DIALOG_TRIGGER source=poll_ai_chat tid=%lu err=%.200s",
-            GetCurrentThreadId(), license::error_msg.c_str());
+            "DIAG_DIALOG_TRIGGER source=poll_ai_chat tid=%lu runtime_locked=%d err=%.200s",
+            GetCurrentThreadId(), runtime_locked ? 1 : 0, license::error_msg.c_str());
     }
 
 

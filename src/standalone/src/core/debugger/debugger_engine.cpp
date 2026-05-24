@@ -195,6 +195,29 @@ bool suspend_contextable_thread(state_t& st, driver_bridge::thread_context_t& ct
 	return false;
 }
 
+register_set_t capture_registers_from_context(const driver_bridge::thread_context_t& src) {
+	register_set_t dst{};
+	dst.rax = src.rax; dst.rbx = src.rbx;
+	dst.rcx = src.rcx; dst.rdx = src.rdx;
+	dst.rsi = src.rsi; dst.rdi = src.rdi;
+	dst.rbp = src.rbp; dst.rsp = src.rsp;
+	dst.r8  = src.r8;  dst.r9  = src.r9;
+	dst.r10 = src.r10; dst.r11 = src.r11;
+	dst.r12 = src.r12; dst.r13 = src.r13;
+	dst.r14 = src.r14; dst.r15 = src.r15;
+	dst.rip = src.rip; dst.rflags = src.rflags;
+	dst.cs = src.cs; dst.ss = src.ss;
+	dst.dr0 = src.dr0; dst.dr1 = src.dr1;
+	dst.dr2 = src.dr2; dst.dr3 = src.dr3;
+	dst.dr6 = src.dr6; dst.dr7 = src.dr7;
+	return dst;
+}
+
+void release_step_suspend_if_previously_suspended(uint32_t tid, uint32_t previous_suspend_count) {
+	if (tid != 0 && previous_suspend_count > 0)
+		driver_bridge::resume_thread(tid);
+}
+
 }
 
 void sync_attached_state();
@@ -983,6 +1006,40 @@ bool step_into() {
 		return false;
 	}
 
+	std::vector<uint8_t> step_code;
+	if (driver_bridge::read_memory(kctx.rip, 16, step_code) && !step_code.empty()) {
+		auto ins = zydis_decode_one(step_code.data(), static_cast<int>(step_code.size()), kctx.rip);
+		if (ins.is_nop && ins.len > 0 && ins.len <= 15) {
+			kctx.rip += static_cast<uint64_t>(ins.len);
+			kctx.rflags &= ~0x100ULL;
+			if (!driver_bridge::set_thread_context(st.active_tid, kctx, ~0ULL)) {
+				driver_bridge::resume_thread(st.active_tid);
+				set_last_error("step_into: context-only step set_thread_context failed");
+				st.status.store(dbg_status_t::paused);
+				return false;
+			}
+			auto post_regs = capture_registers_from_context(kctx);
+			{
+				std::lock_guard<std::mutex> lk(st.reg_mutex);
+				st.registers = post_regs;
+			}
+			signal_trap(post_regs.rip);
+			invalidate_cache();
+			release_step_suspend_if_previously_suspended(st.active_tid, previous_suspend_count);
+			st.status.store(dbg_status_t::paused);
+			auto step_dur_us = std::chrono::duration_cast<std::chrono::microseconds>(
+				std::chrono::steady_clock::now() - step_start).count();
+			diag::log_tagged_fmt("debugger",
+				"step_into_context_only pid=%u tid=%u pre_rip=0x%llx post_rip=0x%llx duration_us=%lld",
+				static_cast<unsigned>(st.target_pid),
+				static_cast<unsigned>(st.active_tid),
+				static_cast<unsigned long long>(pre_step_rip),
+				static_cast<unsigned long long>(post_regs.rip),
+				static_cast<long long>(step_dur_us));
+			return true;
+		}
+	}
+
 	kctx.rflags |= 0x100ULL;
 
 	if (!driver_bridge::set_thread_context(st.active_tid, kctx, ~0ULL)) {
@@ -998,7 +1055,7 @@ bool step_into() {
 		return false;
 	}
 
-	const uint32_t step_timeout_ms = 5000;
+	const uint32_t step_timeout_ms = 1500;
 	auto deadline = std::chrono::steady_clock::now() +
 		std::chrono::milliseconds(step_timeout_ms);
 	register_set_t post_regs{};
@@ -1021,28 +1078,20 @@ bool step_into() {
 			if (driver_bridge::get_thread_context(st.active_tid, stable)) {
 				stable.rflags &= ~0x100ULL;
 				driver_bridge::set_thread_context(st.active_tid, stable, ~0ULL);
-				post_regs.rax = stable.rax; post_regs.rbx = stable.rbx;
-				post_regs.rcx = stable.rcx; post_regs.rdx = stable.rdx;
-				post_regs.rsi = stable.rsi; post_regs.rdi = stable.rdi;
-				post_regs.rbp = stable.rbp; post_regs.rsp = stable.rsp;
-				post_regs.r8  = stable.r8;  post_regs.r9  = stable.r9;
-				post_regs.r10 = stable.r10; post_regs.r11 = stable.r11;
-				post_regs.r12 = stable.r12; post_regs.r13 = stable.r13;
-				post_regs.r14 = stable.r14; post_regs.r15 = stable.r15;
-				post_regs.rip = stable.rip; post_regs.rflags = stable.rflags;
-				post_regs.cs = stable.cs; post_regs.ss = stable.ss;
-				post_regs.dr0 = stable.dr0; post_regs.dr1 = stable.dr1;
-				post_regs.dr2 = stable.dr2; post_regs.dr3 = stable.dr3;
-				post_regs.dr6 = stable.dr6; post_regs.dr7 = stable.dr7;
+				post_regs = capture_registers_from_context(stable);
 				advanced = true;
 				break;
 			}
-			driver_bridge::resume_thread(st.active_tid);
+			probe.rflags &= ~0x100ULL;
+			driver_bridge::set_thread_context(st.active_tid, probe, ~0ULL);
+			post_regs = capture_registers_from_context(probe);
+			advanced = true;
 			diag::log_tagged_fmt("debugger",
-				"step_into_probe_advanced_stable_context_failed pid=%u tid=%u probe_rip=0x%llx",
+				"step_into_probe_advanced_using_probe_context pid=%u tid=%u probe_rip=0x%llx",
 				static_cast<unsigned>(st.target_pid),
 				static_cast<unsigned>(st.active_tid),
 				static_cast<unsigned long long>(probe.rip));
+			break;
 		}
 	}
 
@@ -1134,7 +1183,7 @@ bool step_over() {
 				static_cast<unsigned long long>(regs.rip),
 				ins.len,
 				static_cast<unsigned long long>(target));
-			return run_to_address(target, true, 5000);
+			return run_to_address(target, true, 2500);
 		}
 		diag::log_tagged_fmt("debugger",
 			"step_over_via_step_into rip=0x%llx not_call",
@@ -1175,7 +1224,47 @@ bool step_out() {
 			"step_out_target rsp=0x%llx ret_addr=0x%llx",
 			static_cast<unsigned long long>(regs.rsp),
 			static_cast<unsigned long long>(ret_addr));
-		return run_to_address(ret_addr, true, 30000);
+
+		std::lock_guard<std::recursive_mutex> step_lk(thread_ctx_serializer());
+		uint32_t previous_suspend_count = 0;
+		driver_bridge::thread_context_t kctx{};
+		if (suspend_contextable_thread(st, kctx, previous_suspend_count)) {
+			std::vector<uint8_t> code;
+			if (driver_bridge::read_memory(kctx.rip, 16, code) && !code.empty()) {
+				auto ins = zydis_decode_one(code.data(), static_cast<int>(code.size()), kctx.rip);
+				if (ins.is_ret && driver_bridge::read_memory(kctx.rsp, 8, ret_buf) && ret_buf.size() >= 8) {
+					std::memcpy(&ret_addr, ret_buf.data(), 8);
+					kctx.rip = ret_addr;
+					kctx.rsp += 8;
+					kctx.rflags &= ~0x100ULL;
+					if (!driver_bridge::set_thread_context(st.active_tid, kctx, ~0ULL)) {
+						driver_bridge::resume_thread(st.active_tid);
+						set_last_error("step_out: return context set_thread_context failed");
+						st.status.store(dbg_status_t::paused);
+						return false;
+					}
+					auto post_regs = capture_registers_from_context(kctx);
+					{
+						std::lock_guard<std::mutex> lk(st.reg_mutex);
+						st.registers = post_regs;
+					}
+					signal_trap(post_regs.rip);
+					invalidate_cache();
+					release_step_suspend_if_previously_suspended(st.active_tid, previous_suspend_count);
+					st.status.store(dbg_status_t::paused);
+					diag::log_tagged_fmt("debugger",
+						"step_out_context_return pid=%u tid=%u ret_addr=0x%llx rsp=0x%llx",
+						static_cast<unsigned>(st.target_pid),
+						static_cast<unsigned>(st.active_tid),
+						static_cast<unsigned long long>(post_regs.rip),
+						static_cast<unsigned long long>(post_regs.rsp));
+					return true;
+				}
+			}
+			driver_bridge::resume_thread(st.active_tid);
+		}
+
+		return run_to_address(ret_addr, true, 2500);
 	}
 	set_last_error("step_out: stack read failed");
 	diag::log_tagged_fmt("debugger",
@@ -1859,6 +1948,8 @@ void find_strings(size_t min_length) {
 	std::vector<string_ref_t> found;
 	st.strings_pages_scanned.store(0, std::memory_order_release);
 	st.strings_found_so_far.store(0, std::memory_order_release);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(4500);
+	constexpr size_t max_strings = 10000;
 
 	auto attach_module = [&modules](string_ref_t& sr) {
 		for (const auto& m : modules) {
@@ -1871,7 +1962,7 @@ void find_strings(size_t min_length) {
 	};
 
 	auto push_ascii = [&](uint64_t address, const uint8_t* data, size_t len) {
-		if (len < min_length || found.size() > 100000)
+		if (len < min_length || found.size() >= max_strings)
 			return;
 		string_ref_t sr;
 		sr.address = address;
@@ -1884,7 +1975,7 @@ void find_strings(size_t min_length) {
 	};
 
 	auto push_wide = [&](uint64_t address, const uint8_t* data, size_t chars) {
-		if (chars < min_length || found.size() > 100000)
+		if (chars < min_length || found.size() >= max_strings)
 			return;
 		string_ref_t sr;
 		sr.address = address;
@@ -1932,6 +2023,7 @@ void find_strings(size_t min_length) {
 
 	for (const auto& region : regions) {
 		if (st.strings_cancel.load(std::memory_order_acquire)) break;
+		if (std::chrono::steady_clock::now() >= deadline) break;
 		if (region.state != 0x1000) continue;
 		if (region.size > 0x1000000) continue;
 		if ((region.protect & PAGE_GUARD) != 0 || (region.protect & 0xff) == PAGE_NOACCESS)
@@ -1941,6 +2033,7 @@ void find_strings(size_t min_length) {
 		uint64_t cursor = region.base;
 		while (remaining != 0) {
 			if (st.strings_cancel.load(std::memory_order_acquire)) break;
+			if (std::chrono::steady_clock::now() >= deadline) break;
 			size_t chunk = static_cast<size_t>((remaining > 0x10000ull) ? 0x10000ull : remaining);
 			std::vector<uint8_t> buf;
 			if (driver_bridge::read_memory(cursor, chunk, buf) && !buf.empty()) {
@@ -1950,6 +2043,7 @@ void find_strings(size_t min_length) {
 			} else {
 				for (size_t off = 0; off < chunk; off += 0x1000) {
 					if (st.strings_cancel.load(std::memory_order_acquire)) break;
+					if (std::chrono::steady_clock::now() >= deadline) break;
 					size_t page = (chunk - off > 0x1000) ? 0x1000 : (chunk - off);
 					std::vector<uint8_t> page_buf;
 					if (driver_bridge::read_memory(cursor + off, page, page_buf) && !page_buf.empty())
@@ -1959,10 +2053,10 @@ void find_strings(size_t min_length) {
 			}
 			cursor += chunk;
 			remaining -= chunk;
-			if (found.size() > 100000) break;
+			if (found.size() >= max_strings) break;
 		}
 
-		if (found.size() > 100000) break;
+		if (found.size() >= max_strings) break;
 	}
 
 	{

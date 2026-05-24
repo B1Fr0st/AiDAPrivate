@@ -46,6 +46,7 @@ struct state_t {
 	std::mutex mutex;
 	std::atomic<bool> scanning{false};
 	std::atomic<bool> cancel{false};
+	std::atomic<bool> timed_out{false};
 	std::atomic<float> progress{0.f};
 	std::atomic<int> total_xrefs{0};
 	std::atomic<int> processed_xrefs{0};
@@ -170,12 +171,14 @@ inline uint64_t find_function_start(uint64_t addr)
 
 }
 
-inline void scan_and_decrypt(uint64_t region_address, uint64_t region_size)
+inline void scan_and_decrypt(uint64_t region_address, uint64_t region_size, uint32_t timeout_ms = 5000,
+	uint64_t search_start = 0, uint64_t search_size = 0)
 {
 #ifdef __NT__
 	if (g_state.scanning.load()) return;
 	g_state.scanning.store(true);
 	g_state.cancel.store(false);
+	g_state.timed_out.store(false);
 	g_state.progress.store(0.f);
 	g_state.total_xrefs.store(0);
 	g_state.processed_xrefs.store(0);
@@ -188,8 +191,9 @@ inline void scan_and_decrypt(uint64_t region_address, uint64_t region_size)
 
 	g_state.config.region_address = region_address;
 	g_state.config.region_size = region_size;
+	g_state.config.timeout_ms = timeout_ms == 0 ? 5000 : timeout_ms;
 
-	work_queue::post([region_address, region_size]() {
+	work_queue::post([region_address, region_size, search_start, search_size]() {
 		uint32_t pid = driver_bridge::attached_pid();
 		if (pid == 0) {
 			std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -202,17 +206,25 @@ inline void scan_and_decrypt(uint64_t region_address, uint64_t region_size)
 		uint32_t tid = threads.empty() ? 0 : threads[0].tid;
 
 		std::vector<xref_engine::xref_t> xrefs;
-		xref_engine::find_xrefs_to(region_address);
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(g_state.config.timeout_ms);
+		if (search_start != 0 && search_size != 0)
+			xref_engine::find_xrefs_to(region_address, search_start, search_size);
+		else
+			xref_engine::find_xrefs_to(region_address);
 
-		int wait = 0;
-		while (xref_engine::is_scanning() && wait < 600) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(100));
-			++wait;
+		while (xref_engine::is_scanning() && std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
 			if (g_state.cancel.load()) {
 				xref_engine::cancel_scan();
 				g_state.scanning.store(false);
 				return;
 			}
+		}
+		if (xref_engine::is_scanning()) {
+			g_state.timed_out.store(true);
+			xref_engine::cancel_scan();
+			g_state.scanning.store(false);
+			return;
 		}
 
 		{
@@ -239,6 +251,12 @@ inline void scan_and_decrypt(uint64_t region_address, uint64_t region_size)
 
 		for (auto& xref : xrefs) {
 			if (g_state.cancel.load()) break;
+			auto now = std::chrono::steady_clock::now();
+			if (now >= deadline) {
+				g_state.timed_out.store(true);
+				g_state.cancel.store(true);
+				break;
+			}
 
 			uint64_t func_start = detail::find_function_start(xref.from_addr);
 
@@ -258,7 +276,11 @@ inline void scan_and_decrypt(uint64_t region_address, uint64_t region_size)
 			config.record_mem_writes = true;
 			config.record_registers = false;
 			config.analyze_effective_ops = false;
-			config.timeout_us = static_cast<uint64_t>(g_state.config.timeout_ms) * 1000;
+			uint64_t remaining_ms = static_cast<uint64_t>(
+				std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+			if (remaining_ms == 0) remaining_ms = 1;
+			if (remaining_ms > g_state.config.timeout_ms) remaining_ms = g_state.config.timeout_ms;
+			config.timeout_us = remaining_ms * 1000;
 
 			auto result = emulation::driver_snapshot_and_emulate(pid, tid, config, 0, 0);
 

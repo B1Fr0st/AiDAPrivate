@@ -90,7 +90,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			{"max_regions", "integer", "Maximum committed readable regions to scan (default 4096)", false},
 			{"max_bytes", "integer", "Maximum bytes to scan before stopping (0 = unlimited)", false},
 			{"max_hits", "integer", "Maximum hits before stopping (0 = unlimited)", false},
-			{"timeout_ms", "integer", "Maximum scan time before cancellation (default 60000)", false}
+			{"timeout_ms", "integer", "Maximum scan time before cancellation (default 4500, max 60000)", false}
 		},
 		true,
 		[](const json& params) -> tool_result_t {
@@ -99,9 +99,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			cfg.max_regions = params.value("max_regions", static_cast<size_t>(4096));
 			cfg.max_bytes = params.value("max_bytes", static_cast<uint64_t>(0));
 			cfg.max_hits = params.value("max_hits", static_cast<size_t>(0));
-			cfg.timeout_ms = params.value("timeout_ms", static_cast<uint32_t>(60000));
-			if (cfg.timeout_ms == 0 || cfg.timeout_ms > 60000)
-				cfg.timeout_ms = 60000;
+			cfg.timeout_ms = bounded_u32_param(params, "timeout_ms", 4500, 100, 60000);
 			diag::log_tagged_fmt("analysis", "scan_crypto_constants entry module_filter='%s' max_regions=%zu max_bytes=%llu max_hits=%zu timeout_ms=%u",
 				cfg.module_filter.c_str(),
 				cfg.max_regions,
@@ -116,16 +114,16 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			diag::log_tagged("analysis", "scan_crypto_constants scan_process called waiting");
 
 			int wait = 0;
-			int max_wait = static_cast<int>((cfg.timeout_ms + 99) / 100) + 20;
+			int max_wait = static_cast<int>((cfg.timeout_ms + 49) / 50);
 			while (crypto_scanner::g_state.scanning.load() && wait < max_wait) {
-				Sleep(100);
+				Sleep(50);
 				++wait;
 			}
 			bool timed_out = crypto_scanner::g_state.scanning.load();
 			if (timed_out) {
 				crypto_scanner::cancel();
-				for (int stop_wait = 0; crypto_scanner::g_state.scanning.load() && stop_wait < 50; ++stop_wait)
-					Sleep(100);
+				for (int stop_wait = 0; crypto_scanner::g_state.scanning.load() && stop_wait < 10; ++stop_wait)
+					Sleep(50);
 			}
 
 			std::lock_guard<std::mutex> lk(crypto_scanner::g_state.mutex);
@@ -236,13 +234,15 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		{
 			{"address", "string", "Base address of the struct instance in hex", true},
 			{"size", "integer", "Size in bytes to analyze (default: 256)", false},
-			{"name", "string", "Name for the struct (default: 'struct_t')", false}
+			{"name", "string", "Name for the struct (default: 'struct_t')", false},
+			{"timeout_ms", "integer", "Maximum wait time before returning the current partial layout (default: 4500, max 4500)", false}
 		},
 		true,
 		[](const json& params) -> tool_result_t {
 			std::string addr_str = params.value("address", "");
 			int size = params.value("size", 256);
 			std::string name = params.value("name", "struct_t");
+			uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 4500, 100, 4500);
 			diag::log_tagged_fmt("analysis", "reconstruct_struct entry addr=%s size=%d name=%s",
 				addr_str.c_str(), size, name.c_str());
 
@@ -262,10 +262,14 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			struct_recon::reconstruct_from_snapshot(addr, size, name);
 
 			int wait = 0;
-			while (struct_recon::g_state.monitoring.load() && wait < 300) {
-				Sleep(100);
+			int max_wait = static_cast<int>((timeout_ms + 49) / 50);
+			while (struct_recon::g_state.monitoring.load() && wait < max_wait) {
+				Sleep(50);
 				++wait;
 			}
+			bool timed_out = struct_recon::g_state.monitoring.load();
+			if (timed_out)
+				struct_recon::cancel();
 
 			struct_recon::reconstructed_struct_t result_struct;
 			{
@@ -288,6 +292,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			result["field_count"] = result_struct.fields.size();
 			result["has_vtable"] = result_struct.has_vtable;
 			result["cpp_definition"] = cpp_output;
+			result["timed_out"] = timed_out;
+			result["timeout_ms"] = timeout_ms;
 
 			json fields_arr = json::array();
 			for (auto& f : result_struct.fields) {
@@ -424,15 +430,20 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		{
 			{"region_address", "string", "Hex address of the encrypted string region", true},
 			{"region_size", "integer", "Size of the region in bytes (default: 4096)", false},
-			{"timeout_ms", "integer", "Maximum wait time before cancellation (default: 60000)", false}
+			{"timeout_ms", "integer", "Maximum wait time before cancellation (default: 4500, max 4500)", false},
+			{"search_start", "string", "Optional hex address limiting xref search to a specific range", false},
+			{"search_size", "integer", "Optional xref search range size in bytes", false}
 		},
 		true,
 		[](const json& params) -> tool_result_t {
 			std::string addr_str = params.value("region_address", "");
 			uint64_t size = params.value("region_size", 4096);
-			uint32_t timeout_ms = params.value("timeout_ms", static_cast<uint32_t>(60000));
-			if (timeout_ms == 0 || timeout_ms > 60000)
-				timeout_ms = 60000;
+			uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 4500, 100, 4500);
+			std::string search_start_str = params.value("search_start", "");
+			uint64_t search_start = search_start_str.empty()
+				? 0
+				: std::strtoull(search_start_str.c_str(), nullptr, 16);
+			uint64_t search_size = static_cast<uint64_t>(bounded_size_param(params, "search_size", 0, 0, 64ULL * 1024ULL * 1024ULL));
 			diag::log_tagged_fmt("analysis", "auto_decrypt_strings entry addr=%s size=%llu",
 				addr_str.c_str(), static_cast<unsigned long long>(size));
 
@@ -449,7 +460,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 
 			diag::log_tagged_fmt("analysis", "auto_decrypt_strings scanning addr=0x%llX size=%llu",
 				static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size));
-			decrypt_oracle::scan_and_decrypt(addr, size);
+			decrypt_oracle::scan_and_decrypt(addr, size, timeout_ms, search_start, search_size);
 
 			int wait = 0;
 			int max_wait = static_cast<int>((timeout_ms + 99) / 100);
@@ -463,12 +474,14 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				++wait;
 			}
 
-			bool timed_out = decrypt_oracle::g_state.scanning.load();
+			bool timed_out = decrypt_oracle::g_state.scanning.load() ||
+				decrypt_oracle::g_state.timed_out.load();
 			if (timed_out) {
+				decrypt_oracle::g_state.timed_out.store(true, std::memory_order_release);
 				decrypt_oracle::g_state.cancel.store(true, std::memory_order_release);
 				xref_engine::cancel_scan();
-				for (int stop_wait = 0; decrypt_oracle::g_state.scanning.load() && stop_wait < 50; ++stop_wait)
-					Sleep(100);
+				for (int stop_wait = 0; decrypt_oracle::g_state.scanning.load() && stop_wait < 10; ++stop_wait)
+					Sleep(50);
 			}
 
 			std::lock_guard<std::mutex> lk(decrypt_oracle::g_state.mutex);
@@ -511,13 +524,13 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		{
 			{"target_address", "string", "Hex address of the code region to protect", true},
 			{"target_size", "integer", "Size of the region to monitor (default: 4096)", false},
-			{"duration_ms", "integer", "How long to monitor in milliseconds (default: 10000)", false}
+			{"duration_ms", "integer", "How long to monitor in milliseconds (default: 1000, max 4500)", false}
 		},
 		true,
 		[](const json& params) -> tool_result_t {
 			std::string addr_str = params.value("target_address", "");
 			uint64_t size = params.value("target_size", 4096);
-			int duration = params.value("duration_ms", 10000);
+			int duration = static_cast<int>(bounded_u32_param(params, "duration_ms", 1000, 100, 4500));
 
 			if (addr_str.empty()) {
 				return tool_result_t::error("target_address parameter is required");
@@ -536,17 +549,17 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			integrity_hunter::start_hunt(addr, size);
 
 			int wait = 0;
-			int max_wait = duration / 100;
+			int max_wait = (duration + 49) / 50;
 			while (integrity_hunter::g_state.hunting.load() && wait < max_wait) {
-				Sleep(100);
+				Sleep(50);
 				++wait;
 			}
 
 			integrity_hunter::stop_hunt();
 
 			int stop_wait = 0;
-			while (integrity_hunter::g_state.hunting.load() && stop_wait < 50) {
-				Sleep(100);
+			while (integrity_hunter::g_state.hunting.load() && stop_wait < 10) {
+				Sleep(50);
 				++stop_wait;
 			}
 
@@ -627,13 +640,15 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		{
 			{"address", "string", "Base address of the struct in hex", true},
 			{"size", "integer", "Size of the struct in bytes (default: 256)", false},
-			{"name", "string", "Name for the struct (default: 'struct_t')", false}
+			{"name", "string", "Name for the struct (default: 'struct_t')", false},
+			{"timeout_ms", "integer", "Maximum backend startup wait in milliseconds (default: 3000, max 3500)", false}
 		},
 		true,
 		[](const json& params) -> tool_result_t {
 			std::string addr_str = params.value("address", "");
 			int size = params.value("size", 256);
 			std::string name = params.value("name", "struct_t");
+			uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 3000, 100, 3500);
 			diag::log_tagged_fmt("analysis", "start_live_monitor entry addr=%s size=%d name=%s",
 				addr_str.c_str(), size, name.c_str());
 
@@ -662,7 +677,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				static_cast<unsigned long long>(addr), size, name.c_str());
 			struct_monitor::start(addr, size, name);
 
-			for (int wait = 0; wait < 60; ++wait) {
+			int max_wait = static_cast<int>((timeout_ms + 49) / 50);
+			for (int wait = 0; wait < max_wait; ++wait) {
 				if (!struct_monitor::g_state.active.load())
 					break;
 				if (struct_monitor::g_state.session.using_page_guard ||
@@ -679,7 +695,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 					"start_live_monitor failed backend active=%d page_guard=%d hwbp=%d",
 					active ? 1 : 0, page_guard ? 1 : 0, hwbp ? 1 : 0);
 				struct_monitor::stop();
-				for (int wait = 0; wait < 50 && struct_monitor::g_state.active.load(); ++wait)
+				for (int wait = 0; wait < 10 && struct_monitor::g_state.active.load(); ++wait)
 					Sleep(50);
 				return tool_result_t::error("live monitor backend did not become active");
 			}
@@ -710,8 +726,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			struct_monitor::stop();
 
 			int wait = 0;
-			while (struct_monitor::g_state.active.load() && wait < 50) {
-				Sleep(100);
+			while (struct_monitor::g_state.active.load() && wait < 10) {
+				Sleep(50);
 				++wait;
 			}
 
@@ -1536,18 +1552,36 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 	srv.register_tool({
 		"analysis_get_binary_map_overview",
 		"Generate the binary map overview (top functions, globals, sections, imports/exports) used by the Binary Map panel and return it as JSON.",
-		{{"max_functions", "number", "Maximum functions to include (default 50)", false},
-		 {"max_globals",   "number", "Maximum globals to include (default 30)", false}},
+		{{"max_functions", "number", "Maximum functions to include (default 24)", false},
+		 {"max_globals",   "number", "Maximum globals to include (default 12)", false},
+		 {"include_imports", "boolean", "Include import summaries (default false for MCP speed)", false},
+		 {"include_exports", "boolean", "Include export summaries (default false for MCP speed)", false},
+		 {"include_xrefs", "boolean", "Include cached xref scoring/callees/globals (default false for MCP speed)", false}},
 		true,
 		[](const json& params) -> tool_result_t {
 			diag::log_tagged("analysis", "analysis_get_binary_map_overview entry");
 			aida::binary_map::map_options_t opts;
+			opts.max_functions = 24;
+			opts.max_globals = 12;
+			opts.max_callees_per_function = 2;
+			opts.include_imports = false;
+			opts.include_exports = false;
+			opts.include_xrefs = false;
 			if (params.contains("max_functions") && params["max_functions"].is_number_integer())
 				opts.max_functions = params["max_functions"].get<int>();
 			if (params.contains("max_globals") && params["max_globals"].is_number_integer())
 				opts.max_globals = params["max_globals"].get<int>();
-			diag::log_tagged_fmt("analysis", "analysis_get_binary_map_overview generating max_funcs=%d max_globals=%d",
-				opts.max_functions, opts.max_globals);
+			if (params.contains("include_imports") && params["include_imports"].is_boolean())
+				opts.include_imports = params["include_imports"].get<bool>();
+			if (params.contains("include_exports") && params["include_exports"].is_boolean())
+				opts.include_exports = params["include_exports"].get<bool>();
+			if (params.contains("include_xrefs") && params["include_xrefs"].is_boolean())
+				opts.include_xrefs = params["include_xrefs"].get<bool>();
+			diag::log_tagged_fmt("analysis", "analysis_get_binary_map_overview generating max_funcs=%d max_globals=%d imports=%d exports=%d xrefs=%d",
+				opts.max_functions, opts.max_globals,
+				opts.include_imports ? 1 : 0,
+				opts.include_exports ? 1 : 0,
+				opts.include_xrefs ? 1 : 0);
 
 			aida::binary_map::map_t m;
 			if (!aida::binary_map::generate(opts, m)) {
@@ -1654,13 +1688,13 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 
 	srv.register_tool({
 		"crypto_scanner_run",
-		"Trigger a fresh crypto-constant scan over the attached process memory (AES S-Box, SHA, MD5, CRC32, Blowfish, ChaCha20, Base64, etc.). Blocks until the scan worker finishes (up to 60s).",
+		"Trigger a fresh crypto-constant scan over the attached process memory (AES S-Box, SHA, MD5, CRC32, Blowfish, ChaCha20, Base64, etc.). Blocks until the scan worker finishes or the timeout expires.",
 		{
 			{"module_filter", "string", "Optional case-insensitive module name substring to scan", false},
 			{"max_regions", "integer", "Maximum committed readable regions to scan (default 4096)", false},
 			{"max_bytes", "integer", "Maximum bytes to scan before stopping (0 = unlimited)", false},
 			{"max_hits", "integer", "Maximum hits before stopping (0 = unlimited)", false},
-			{"timeout_ms", "integer", "Maximum scan time before cancellation (default 60000)", false}
+			{"timeout_ms", "integer", "Maximum scan time before cancellation (default 4500, max 60000)", false}
 		},
 		false,
 		[](const json& params) -> tool_result_t {
@@ -1669,9 +1703,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			cfg.max_regions = params.value("max_regions", static_cast<size_t>(4096));
 			cfg.max_bytes = params.value("max_bytes", static_cast<uint64_t>(0));
 			cfg.max_hits = params.value("max_hits", static_cast<size_t>(0));
-			cfg.timeout_ms = params.value("timeout_ms", static_cast<uint32_t>(60000));
-			if (cfg.timeout_ms == 0 || cfg.timeout_ms > 60000)
-				cfg.timeout_ms = 60000;
+			cfg.timeout_ms = bounded_u32_param(params, "timeout_ms", 4500, 100, 60000);
 			diag::log_tagged_fmt("analysis", "crypto_scanner_run entry module_filter='%s' max_regions=%zu max_bytes=%llu max_hits=%zu timeout_ms=%u",
 				cfg.module_filter.c_str(),
 				cfg.max_regions,
@@ -1685,16 +1717,16 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			crypto_scanner::scan_process(cfg);
 			diag::log_tagged("analysis", "crypto_scanner_run scan_process called waiting");
 			int wait = 0;
-			int max_wait = static_cast<int>((cfg.timeout_ms + 99) / 100) + 20;
+			int max_wait = static_cast<int>((cfg.timeout_ms + 49) / 50);
 			while (crypto_scanner::g_state.scanning.load() && wait < max_wait) {
-				Sleep(100);
+				Sleep(50);
 				++wait;
 			}
 			bool timed_out = crypto_scanner::g_state.scanning.load();
 			if (timed_out) {
 				crypto_scanner::cancel();
-				for (int stop_wait = 0; crypto_scanner::g_state.scanning.load() && stop_wait < 50; ++stop_wait)
-					Sleep(100);
+				for (int stop_wait = 0; crypto_scanner::g_state.scanning.load() && stop_wait < 10; ++stop_wait)
+					Sleep(50);
 			}
 			std::lock_guard<std::mutex> lk(crypto_scanner::g_state.mutex);
 			json result;

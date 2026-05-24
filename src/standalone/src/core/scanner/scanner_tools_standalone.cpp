@@ -284,16 +284,26 @@ static tool_result_t handle_pointer_scan(const json& params) {
 		max_depth = params["max_depth"].get<int>();
 	if (params.contains("max_offset") && params["max_offset"].is_number())
 		max_offset = params["max_offset"].get<int>();
+	int timeout_ms = 4500;
+	if (params.contains("timeout_ms") && params["timeout_ms"].is_number_integer()) {
+		timeout_ms = params["timeout_ms"].get<int>();
+		if (timeout_ms < 100) timeout_ms = 100;
+		if (timeout_ms > 5000) timeout_ms = 5000;
+	}
 
-	diag::log_tagged_fmt("scanner", "mcp pointer_scan request addr=0x%llX depth=%d offset=0x%X",
-		static_cast<unsigned long long>(addr), max_depth, max_offset);
+	diag::log_tagged_fmt("scanner", "mcp pointer_scan request addr=0x%llX depth=%d offset=0x%X timeout_ms=%d",
+		static_cast<unsigned long long>(addr), max_depth, max_offset, timeout_ms);
 
 	memory_scanner::start_pointer_scan(addr, max_depth, max_offset);
 
-	for (int i = 0; i < 600; ++i) {
+	const int loops = (timeout_ms + 49) / 50;
+	for (int i = 0; i < loops; ++i) {
 		if (!memory_scanner::g_state.pointer_scanning.load()) break;
-		Sleep(100);
+		Sleep(50);
 	}
+	const bool timed_out = memory_scanner::g_state.pointer_scanning.load();
+	if (timed_out)
+		memory_scanner::cancel_pointer_scan();
 
 	auto& st = memory_scanner::g_state;
 	std::lock_guard<std::mutex> lk(st.pointer_mutex);
@@ -320,6 +330,7 @@ static tool_result_t handle_pointer_scan(const json& params) {
 	json result;
 	result["total"] = st.pointer_results.size();
 	result["showing"] = n;
+	result["timed_out"] = timed_out;
 	result["results"] = std::move(arr);
 	return tool_result_t::ok(result.dump(2));
 }
@@ -427,7 +438,8 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 		OBFSTR("Perform a pointer scan to find pointer chains that lead to the target address. Useful for finding stable pointers. Operates on the currently active binary_id session; pass binary_id explicitly in multi-target sessions."),
 		{{OBFSTR("address"), OBFSTR("string"), OBFSTR("Target address to find pointers to"), true},
 		 {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum pointer chain depth (1-7, default 4)"), false},
-		 {OBFSTR("max_offset"), OBFSTR("number"), OBFSTR("Maximum offset from pointer base (default 0x1000)"), false}},
+		 {OBFSTR("max_offset"), OBFSTR("number"), OBFSTR("Maximum offset from pointer base (default 0x1000)"), false},
+		 {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Maximum wait time, capped at 5000 ms"), false}},
 		handle_pointer_scan, true});
 
 	register_compat(srv, {OBFSTR("scanner_cancel_pointer_scan"), OBFSTR("memory_scanner"),

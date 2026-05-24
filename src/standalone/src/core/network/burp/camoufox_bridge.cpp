@@ -17,6 +17,7 @@
 #include <shellapi.h>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -47,6 +48,7 @@ struct singleton_t
     std::atomic<uint64_t>                   total_calls{0};
     std::atomic<uint64_t>                   total_errors{0};
     bool                                    browser_open       = false;
+    bool                                    setup_launch_pending = false;
     std::string                             active_page_url;
     std::string                             cached_python_path;
     launch_config_t                         active_cfg;
@@ -100,12 +102,8 @@ bool try_search_path(const wchar_t* exe_name, std::string& out_path)
     return !out_path.empty();
 }
 
-bool try_local_appdata_python(std::string& out_path)
+bool try_python_directory(const std::wstring& base, std::string& out_path)
 {
-    wchar_t local_app[MAX_PATH] = {0};
-    DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", local_app, MAX_PATH);
-    if (got == 0 || got >= MAX_PATH) return false;
-    std::wstring base = std::wstring(local_app) + L"\\Programs\\Python";
     DWORD attr = GetFileAttributesW(base.c_str());
     if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) return false;
 
@@ -132,6 +130,8 @@ bool try_local_appdata_python(std::string& out_path)
             else minor = digits[1] - L'0';
         }
         if (major < 3) continue;
+        if (major == 3 && (minor < 10 || minor > 13)) continue;
+        if (major > 3) continue;
         if (major > best_major || (major == best_major && minor > best_minor))
         {
             std::wstring candidate = base + L"\\" + name + L"\\python.exe";
@@ -148,6 +148,25 @@ bool try_local_appdata_python(std::string& out_path)
     if (best.empty()) return false;
     out_path = wide_to_utf8(best);
     return !out_path.empty();
+}
+
+bool try_env_python_root(const wchar_t* env_name, const wchar_t* suffix, std::string& out_path)
+{
+    wchar_t root[MAX_PATH] = {0};
+    DWORD got = GetEnvironmentVariableW(env_name, root, MAX_PATH);
+    if (got == 0 || got >= MAX_PATH) return false;
+    std::wstring base = std::wstring(root) + suffix;
+    return try_python_directory(base, out_path);
+}
+
+bool try_known_python_roots(std::string& out_path)
+{
+    if (try_env_python_root(L"ProgramFiles", L"", out_path)) return true;
+    if (try_env_python_root(L"ProgramFiles", L"\\Python", out_path)) return true;
+    if (try_env_python_root(L"ProgramFiles(x86)", L"", out_path)) return true;
+    if (try_env_python_root(L"ProgramFiles(x86)", L"\\Python", out_path)) return true;
+    if (try_env_python_root(L"LOCALAPPDATA", L"\\Programs\\Python", out_path)) return true;
+    return false;
 }
 
 bool spawn_capture(const std::string& cmdline, DWORD timeout_ms, DWORD& out_exit_code, std::string& out_stdout)
@@ -217,6 +236,79 @@ bool spawn_capture(const std::string& cmdline, DWORD timeout_ms, DWORD& out_exit
     CloseHandle(pi.hProcess);
     CloseHandle(rd);
     return true;
+}
+
+std::string compact_child_output(std::string s, size_t limit = 1600)
+{
+    size_t a = 0, b = s.size();
+    while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n')) ++a;
+    while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n')) --b;
+    s = s.substr(a, b - a);
+    for (char& c : s) {
+        if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+    }
+    if (s.size() > limit) {
+        s.resize(limit);
+        s += "...";
+    }
+    return s;
+}
+
+bool query_python_version(const std::string& python_path, int& major, int& minor, std::string& detail)
+{
+    major = 0;
+    minor = 0;
+    detail.clear();
+    DWORD code = 0;
+    std::string captured;
+    std::string cmd = std::string("\"") + python_path + "\" -c \"import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')\"";
+    if (!spawn_capture(cmd, 3000, code, captured))
+    {
+        detail = "version probe timed out or failed to spawn";
+        return false;
+    }
+    if (code != 0)
+    {
+        detail = compact_child_output(captured);
+        if (detail.empty()) detail = "version probe exit=" + std::to_string(code);
+        return false;
+    }
+    int maj = 0;
+    int min = 0;
+    if (sscanf_s(captured.c_str(), "%d.%d", &maj, &min) != 2)
+    {
+        detail = compact_child_output(captured);
+        if (detail.empty()) detail = "version probe returned no version";
+        return false;
+    }
+    major = maj;
+    minor = min;
+    detail = compact_child_output(captured);
+    return true;
+}
+
+bool supported_camoufox_python(const std::string& python_path, std::string* reason = nullptr)
+{
+    int major = 0;
+    int minor = 0;
+    std::string detail;
+    if (!query_python_version(python_path, major, minor, detail))
+    {
+        if (reason) *reason = detail;
+        return false;
+    }
+    if (major == 3 && minor >= 10 && minor <= 13)
+    {
+        if (reason) *reason = "python " + detail;
+        return true;
+    }
+    if (reason)
+    {
+        char buf[96];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "python %d.%d outside supported camoufox range 3.10-3.13", major, minor);
+        *reason = buf;
+    }
+    return false;
 }
 
 void publish_state(bridge_state_t st, const std::string& err)
@@ -386,7 +478,7 @@ bool probe_module_installed_locked(const std::string& python_path)
     std::string cmdline = std::string("\"") + python_path + "\" -c \"import camoufox_reverse_mcp\"";
     DWORD code = 0;
     std::string captured;
-    if (!spawn_capture(cmdline, 15000, code, captured))
+    if (!spawn_capture(cmdline, 3000, code, captured))
     {
         sg().last_error = "camoufox_reverse_mcp not installed; run: pip install -e C:/Users/ruar1337/AiDAPrivate/camoufox-reverse-mcp";
         diag::log_tagged("camoufox", sg().last_error.c_str());
@@ -396,6 +488,130 @@ bool probe_module_installed_locked(const std::string& python_path)
     {
         sg().last_error = "camoufox_reverse_mcp not installed; run: pip install -e C:/Users/ruar1337/AiDAPrivate/camoufox-reverse-mcp";
         diag::log_tagged_fmt("camoufox", "module probe exit=%lu out=%.200s", code, captured.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool preflight_server_entry_locked(const std::string& python_path, const launch_config_t& cfg)
+{
+    const std::string module = cfg.server_module.empty() ? std::string("camoufox_reverse_mcp") : cfg.server_module;
+    std::string cmdline;
+    if (module == "camoufox_reverse_mcp")
+        cmdline = std::string("\"") + python_path + "\" -m camoufox_reverse_mcp --help";
+    else
+        cmdline = std::string("\"") + python_path + "\" -c \"import importlib; importlib.import_module('" + module + "')\"";
+
+    DWORD code = 0;
+    std::string captured;
+    if (!spawn_capture(cmdline, 4000, code, captured))
+    {
+        sg().last_error = std::string("camoufox MCP server preflight failed to spawn or timed out: ") + module;
+        diag::log_tagged("camoufox", sg().last_error.c_str());
+        return false;
+    }
+    if (code != 0)
+    {
+        std::string detail = compact_child_output(captured);
+        sg().last_error = std::string("camoufox MCP server preflight failed: ") + (detail.empty() ? std::string("exit=") + std::to_string(code) : detail);
+        diag::log_tagged_fmt("camoufox", "server preflight failed module=%s exit=%lu out=%.400s",
+            module.c_str(), code, detail.c_str());
+        return false;
+    }
+    diag::log_tagged_fmt("camoufox", "server preflight ok module=%s", module.c_str());
+    return true;
+}
+
+bool is_auto_setup_message(const std::string& msg)
+{
+    return msg.find("Camoufox setup") != std::string::npos ||
+           msg.find("camoufox setup") != std::string::npos;
+}
+
+bool queue_setup_for_launch_locked(const launch_config_t& cfg)
+{
+    if (sg().setup_launch_pending)
+    {
+        sg().last_error = "Camoufox setup is already running; browser will open automatically when setup finishes";
+        return true;
+    }
+
+    sg().setup_launch_pending = true;
+    launch_config_t cfg_copy = cfg;
+    bool posted = work_queue::post([cfg_copy]() {
+        std::string log;
+        bool ready = false;
+        try { ready = install::ensure_ready(log); } catch (...) { ready = false; }
+        if (!ready)
+        {
+            std::string err = install::last_error();
+            if (err.empty()) err = "Camoufox automatic setup failed";
+            {
+                std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+                sg().setup_launch_pending = false;
+                sg().state = bridge_state_t::error;
+                sg().last_error = err;
+                sg().browser_open = false;
+                sg().active_page_url.clear();
+            }
+            publish_state(bridge_state_t::error, err);
+            diag::log_tagged_fmt("camoufox", "automatic setup failed err=%s", err.c_str());
+            return;
+        }
+
+        {
+            std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+            sg().setup_launch_pending = false;
+            sg().state = bridge_state_t::stopped;
+            sg().last_error.clear();
+        }
+        diag::log_tagged_fmt("camoufox", "automatic setup ready; launching visible browser");
+        start_bridge(cfg_copy);
+    });
+
+    if (!posted)
+    {
+        sg().setup_launch_pending = false;
+        sg().last_error = "Camoufox setup could not be queued";
+        return false;
+    }
+
+    sg().last_error = "Camoufox setup started automatically; browser will open automatically when setup finishes";
+    return true;
+}
+
+bool prepare_install_for_launch_locked(std::string& python_path, const launch_config_t& cfg)
+{
+    install::status_t st = install::get_status();
+    if (st.state == install::install_state_t::unknown ||
+        st.state == install::install_state_t::checking)
+        st = install::probe();
+    if (!st.python_path.empty()) python_path = st.python_path;
+
+    if (st.state == install::install_state_t::missing_module)
+    {
+        bool posted = queue_setup_for_launch_locked(cfg);
+        diag::log_tagged_fmt("camoufox", "prepare_install_for_launch queued_auto_setup posted=%d state=%d err=%s",
+            static_cast<int>(posted), static_cast<int>(st.state), sg().last_error.c_str());
+        return false;
+    }
+
+    if (st.state == install::install_state_t::missing_browser ||
+        st.state == install::install_state_t::available ||
+        st.state == install::install_state_t::install_failed)
+    {
+        bool posted = queue_setup_for_launch_locked(cfg);
+        diag::log_tagged_fmt("camoufox", "prepare_install_for_launch queued_auto_fetch posted=%d state=%d err=%s",
+            static_cast<int>(posted), static_cast<int>(st.state), sg().last_error.c_str());
+        return false;
+    }
+
+    if (st.state != install::install_state_t::ok)
+    {
+        sg().last_error = st.last_message.empty() ? install::last_error() : st.last_message;
+        if (sg().last_error.empty()) sg().last_error = "camoufox dependency chain is not ready";
+        diag::log_tagged_fmt("camoufox", "prepare_install_for_launch failed state=%d err=%s",
+            static_cast<int>(st.state), sg().last_error.c_str());
         return false;
     }
     return true;
@@ -422,42 +638,70 @@ bool ensure_python_available(std::string& out_python_path)
     std::lock_guard<std::recursive_mutex> lk(sg().mtx);
     if (!sg().cached_python_path.empty() && path_exists_w(utf8_to_wide(sg().cached_python_path)))
     {
-        diag::log_tagged_fmt("camoufox", "ensure_python_available cached path=%s", sg().cached_python_path.c_str());
-        out_python_path = sg().cached_python_path;
-        return true;
+        std::string reason;
+        if (supported_camoufox_python(sg().cached_python_path, &reason))
+        {
+            diag::log_tagged_fmt("camoufox", "ensure_python_available cached path=%s %s", sg().cached_python_path.c_str(), reason.c_str());
+            out_python_path = sg().cached_python_path;
+            return true;
+        }
+        diag::log_tagged_fmt("camoufox", "ensure_python_available cached rejected path=%s reason=%s",
+            sg().cached_python_path.c_str(), reason.c_str());
+        sg().cached_python_path.clear();
     }
+    std::vector<std::string> candidates;
     std::string found;
-    if (try_search_path(L"python.exe", found)
-        || try_search_path(L"py.exe", found)
-        || try_search_path(L"python3.exe", found)
-        || try_local_appdata_python(found))
+    if (try_search_path(L"python.exe", found)) candidates.push_back(found);
+    found.clear();
+    if (try_search_path(L"python3.exe", found)) candidates.push_back(found);
+    found.clear();
+    if (try_known_python_roots(found)) candidates.push_back(found);
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+    for (const std::string& candidate : candidates)
     {
-        diag::log_tagged_fmt("camoufox", "ensure_python_available found path=%s", found.c_str());
-        sg().cached_python_path = found;
-        out_python_path         = found;
+        std::string reason;
+        if (!supported_camoufox_python(candidate, &reason))
+        {
+            diag::log_tagged_fmt("camoufox", "ensure_python_available rejected path=%s reason=%s", candidate.c_str(), reason.c_str());
+            continue;
+        }
+        diag::log_tagged_fmt("camoufox", "ensure_python_available found path=%s %s", candidate.c_str(), reason.c_str());
+        sg().cached_python_path = candidate;
+        out_python_path         = candidate;
         return true;
     }
     diag::log_tagged_fmt("camoufox", "ensure_python_available python_not_found");
-    set_error_locked("python interpreter not found on PATH or in %LOCALAPPDATA%\\Programs\\Python");
+    set_error_locked("supported Python 3.10-3.13 interpreter not found for camoufox");
     return false;
 }
 
 bool start_bridge(const launch_config_t& cfg)
 {
+    launch_config_t effective_cfg = cfg;
+    if (effective_cfg.headless)
+    {
+        diag::log_tagged_fmt("camoufox", "start_bridge forcing_visible requested_headless=1");
+        effective_cfg.headless = false;
+    }
     diag::log_tagged_fmt("camoufox", "start_bridge entry headless=%d module=%s",
-        static_cast<int>(cfg.headless), cfg.server_module.c_str());
+        static_cast<int>(effective_cfg.headless), effective_cfg.server_module.c_str());
     std::lock_guard<std::recursive_mutex> lk(sg().mtx);
 
     if (sg().state == bridge_state_t::ready && sg().client)
     {
         diag::log_tagged_fmt("camoufox", "start_bridge already_ready reusing");
-        sg().active_cfg = cfg;
+        sg().active_cfg = effective_cfg;
         return true;
     }
     if (sg().state == bridge_state_t::starting)
     {
-        diag::log_tagged_fmt("camoufox", "start_bridge already_starting rejected");
-        set_error_locked("camoufox bridge already starting");
+        diag::log_tagged_fmt("camoufox", "start_bridge already_starting rejected setup=%d",
+            sg().setup_launch_pending ? 1 : 0);
+        if (sg().setup_launch_pending)
+            set_error_locked("Camoufox setup is already running; browser will open automatically when setup finishes");
+        else
+            set_error_locked("camoufox bridge already starting");
         return false;
     }
     diag::log_tagged_fmt("camoufox", "start_bridge state->starting");
@@ -466,7 +710,17 @@ bool start_bridge(const launch_config_t& cfg)
     sg().last_error.clear();
     publish_state(bridge_state_t::starting, std::string());
 
-    std::string python_path = cfg.python_executable;
+    std::string python_path = effective_cfg.python_executable;
+    if (!python_path.empty())
+    {
+        std::string reason;
+        if (!supported_camoufox_python(python_path, &reason))
+        {
+            diag::log_tagged_fmt("camoufox", "start_bridge explicit_python_rejected path=%s reason=%s",
+                python_path.c_str(), reason.c_str());
+            python_path.clear();
+        }
+    }
     if (python_path.empty())
     {
         if (!ensure_python_available(python_path))
@@ -477,7 +731,29 @@ bool start_bridge(const launch_config_t& cfg)
         }
     }
 
+    if (!prepare_install_for_launch_locked(python_path, effective_cfg))
+    {
+        if (sg().setup_launch_pending || is_auto_setup_message(sg().last_error))
+        {
+            sg().state = bridge_state_t::starting;
+            publish_state(bridge_state_t::starting, sg().last_error);
+        }
+        else
+        {
+            sg().state = bridge_state_t::error;
+            publish_state(bridge_state_t::error, sg().last_error);
+        }
+        return false;
+    }
+
     if (!probe_module_installed_locked(python_path))
+    {
+        sg().state = bridge_state_t::error;
+        publish_state(bridge_state_t::error, sg().last_error);
+        return false;
+    }
+
+    if (!preflight_server_entry_locked(python_path, effective_cfg))
     {
         sg().state = bridge_state_t::error;
         publish_state(bridge_state_t::error, sg().last_error);
@@ -489,8 +765,8 @@ bool start_bridge(const launch_config_t& cfg)
     scfg.transport = mcp_client::transport_type_t::stdio;
     scfg.command   = python_path;
     scfg.args.push_back("-m");
-    scfg.args.push_back(cfg.server_module.empty() ? std::string("camoufox_reverse_mcp") : cfg.server_module);
-    for (const auto& a : cfg.extra_args) scfg.args.push_back(a);
+    scfg.args.push_back(effective_cfg.server_module.empty() ? std::string("camoufox_reverse_mcp") : effective_cfg.server_module);
+    for (const auto& a : effective_cfg.extra_args) scfg.args.push_back(a);
     scfg.env["PYTHONIOENCODING"] = "utf-8";
     scfg.enabled                 = true;
     scfg.auto_connect            = false;
@@ -509,7 +785,8 @@ bool start_bridge(const launch_config_t& cfg)
         return false;
     }
 
-    int wait_ms = cfg.launch_timeout_ms > 0 ? cfg.launch_timeout_ms : 60000;
+    int wait_ms = effective_cfg.launch_timeout_ms > 0 ? effective_cfg.launch_timeout_ms : 5000;
+    if (wait_ms > 5000) wait_ms = 5000;
     if (!wait_for_tool_listed(sg().client.get(), "launch_browser", wait_ms))
     {
         std::string inner = sg().client->last_error();
@@ -522,11 +799,11 @@ bool start_bridge(const launch_config_t& cfg)
         return false;
     }
 
-    sg().server_command = python_path + " -m " + (cfg.server_module.empty() ? std::string("camoufox_reverse_mcp") : cfg.server_module);
+    sg().server_command = python_path + " -m " + (effective_cfg.server_module.empty() ? std::string("camoufox_reverse_mcp") : effective_cfg.server_module);
     sg().launched_ms    = now_ms();
-    sg().active_cfg     = cfg;
+    sg().active_cfg     = effective_cfg;
 
-    nlohmann::json args = build_launch_args(cfg);
+    nlohmann::json args = build_launch_args(effective_cfg);
     mcp_client::call_result_t launch = sg().client->call_tool("launch_browser", args);
     if (!launch.success)
     {
@@ -601,15 +878,17 @@ bool ensure_ready()
         return true;
     }
     install::status_t st = install::get_status();
-    if (st.state != install::install_state_t::ok &&
-        st.state != install::install_state_t::available)
+    if (st.state == install::install_state_t::unknown ||
+        st.state == install::install_state_t::checking)
+        st = install::probe();
+    if (st.state == install::install_state_t::missing_python)
     {
         diag::log_tagged_fmt("camoufox", "ensure_ready install_not_ready state=%d", static_cast<int>(st.state));
         return false;
     }
     diag::log_tagged_fmt("camoufox", "ensure_ready starting_bridge python=%s", st.python_path.c_str());
     launch_config_t cfg;
-    cfg.headless = true;
+    cfg.headless = false;
     cfg.python_executable = st.python_path;
     return start_bridge(cfg);
 }
@@ -663,6 +942,12 @@ bool navigate(const std::string& url, const std::string& wait_until, int timeout
     {
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked("navigate: url is empty");
+        return false;
+    }
+    if (!ensure_ready())
+    {
+        std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+        if (sg().last_error.empty()) set_error_locked("navigate: camoufox bridge not ready");
         return false;
     }
     nlohmann::json a;

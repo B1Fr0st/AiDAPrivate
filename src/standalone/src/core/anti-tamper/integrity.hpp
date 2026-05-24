@@ -905,6 +905,19 @@ __forceinline uint64_t hash_memory_fixed_key(const void* data, size_t size,
     return siphash::hash(static_cast<const uint8_t*>(data), size, k0, k1);
 }
 
+struct block_chain_verify_result_t
+{
+    uint32_t block_index = 0;
+    uint32_t chain_count = 0;
+    uint64_t block_base = 0;
+    uint32_t block_size = 0;
+    uint64_t expected_hash = 0;
+    uint64_t actual_hash = 0;
+    uint64_t prev_hash = 0;
+    bool checked = false;
+    bool layout_mismatch = false;
+};
+
 inline bool build_block_chain(const state::code_snapshot_t& snap,
                               std::vector<state::block_hash_t>& chain)
 {
@@ -940,15 +953,38 @@ inline bool build_block_chain(const state::code_snapshot_t& snap,
 }
 
 inline bool verify_block_chain(const state::code_snapshot_t& snap,
-                               const std::vector<state::block_hash_t>& chain)
+                               const std::vector<state::block_hash_t>& chain,
+                               block_chain_verify_result_t* result = nullptr)
 {
+    if (result) *result = {};
     if (chain.empty()) return true;
 
     uint64_t k0 = detail::load_k0();
     uint64_t k1 = detail::load_k1();
     uint64_t prev_hash = 0;
+    uint32_t index = 0;
     for (const auto& block : chain)
     {
+        const bool block_inside_snapshot =
+            snap.text_base == 0 || snap.text_size == 0 ||
+            (block.block_base >= snap.text_base &&
+             block.block_base + block.block_size <= snap.text_base + snap.text_size);
+        if (block.block_size > 4096 || !block_inside_snapshot)
+        {
+            if (result)
+            {
+                result->block_index = index;
+                result->chain_count = static_cast<uint32_t>(chain.size());
+                result->block_base = block.block_base;
+                result->block_size = block.block_size;
+                result->expected_hash = block.chained_hash;
+                result->actual_hash = 0;
+                result->prev_hash = prev_hash;
+                result->checked = true;
+                result->layout_mismatch = true;
+            }
+            return false;
+        }
         const auto* block_ptr = reinterpret_cast<const uint8_t*>(block.block_base);
 
         uint8_t buf[4096 + 8];
@@ -958,9 +994,24 @@ inline bool verify_block_chain(const state::code_snapshot_t& snap,
         uint64_t h = siphash::hash(buf, block.block_size + 8, k0, k1);
 
         if (h != block.chained_hash)
+        {
+            if (result)
+            {
+                result->block_index = index;
+                result->chain_count = static_cast<uint32_t>(chain.size());
+                result->block_base = block.block_base;
+                result->block_size = block.block_size;
+                result->expected_hash = block.chained_hash;
+                result->actual_hash = h;
+                result->prev_hash = prev_hash;
+                result->checked = true;
+                result->layout_mismatch = false;
+            }
             return false;
+        }
 
         prev_hash = h;
+        ++index;
     }
     return true;
 }

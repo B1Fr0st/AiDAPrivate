@@ -864,7 +864,7 @@ inline void reconstruct_from_snapshot(uint64_t base_address, int struct_size, co
 		std::map<uint64_t, struct_field_t> field_map;
 
 		int offset = 0;
-		while (offset < struct_size && offset < static_cast<int>(data.size())) {
+		while (offset < struct_size && offset < static_cast<int>(data.size()) && !g_state.cancel.load()) {
 			int remaining = struct_size - offset;
 			int field_size = 0;
 
@@ -895,7 +895,8 @@ inline void reconstruct_from_snapshot(uint64_t base_address, int struct_size, co
 
 		g_state.progress.store(0.6f);
 
-		detail::detect_vtable(base_address, struct_size, result.fields);
+		if (!g_state.cancel.load())
+			detail::detect_vtable(base_address, struct_size, result.fields);
 
 		g_state.progress.store(0.8f);
 
@@ -914,10 +915,13 @@ inline void reconstruct_from_snapshot(uint64_t base_address, int struct_size, co
 				return a.offset < b.offset;
 			});
 
-		detail::merge_compound_types(result.fields, base_address);
-		detect_arrays(result.fields);
+		if (!g_state.cancel.load()) {
+			detail::merge_compound_types(result.fields, base_address);
+			detect_arrays(result.fields);
+		}
 
 		for (auto& f : result.fields) {
+			if (g_state.cancel.load()) break;
 			int elem_size = f.size;
 			if (f.array_count > 1) elem_size = f.size / f.array_count;
 			if (f.offset + static_cast<uint64_t>(elem_size) <= data.size()) {

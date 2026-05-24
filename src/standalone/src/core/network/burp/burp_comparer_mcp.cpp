@@ -176,6 +176,13 @@ tool_result_t handle_diff(const json& p)
 
     aida::burp::comparer::diff_stats_t stats;
     auto blocks = aida::burp::comparer::compute_diff_with_stats(sa, sb, mode, stats);
+    if (blocks.empty()) {
+        const std::string err = aida::burp::comparer::last_error();
+        if (err == "slot_a_not_found" || err == "slot_b_not_found") {
+            diag::log_tagged_fmt("mcp_burp", "comparer_diff missing_slot err=%s", err.c_str());
+            return tool_result_t::error(err);
+        }
+    }
     diag::log_tagged_fmt("mcp_burp", "comparer_diff ok blocks=%zu truncated=%d", blocks.size(), (int)stats.truncated);
 
     json arr = json::array();

@@ -74,6 +74,11 @@ static std::string lower_copy(std::string s)
     return s;
 }
 
+static bool loaded_static_file_available()
+{
+    return g_disasm.file.loaded && !g_disasm.file.sections.empty() && g_disasm.file.image_base != 0;
+}
+
 static int find_instr_index(const DisasmFile& file, uint64_t addr)
 {
     int lo = 0;
@@ -312,6 +317,9 @@ static tool_result_t handle_get_function_disassembly(const json& params)
 
 static tool_result_t handle_list_functions(const json& params)
 {
+    if (!loaded_static_file_available())
+        return tool_result_t::error("No disassembly file is loaded. Open a file session before listing static functions.");
+
     std::string filter;
     if (params.contains("filter") && params["filter"].is_string())
         filter = lower_copy(params["filter"].get<std::string>());
@@ -487,6 +495,8 @@ static tool_result_t handle_set_comment(const json& params)
     std::string text;
     if (params.contains("comment") && params["comment"].is_string())
         text = params["comment"].get<std::string>();
+    else if (params.contains("text") && params["text"].is_string())
+        text = params["text"].get<std::string>();
     diag::log_tagged_fmt("disasm_tools", "set_comment addr=0x%llX action=%s text=%s",
         static_cast<unsigned long long>(addr),
         text.empty() ? "delete" : "set", text.c_str());
@@ -523,6 +533,8 @@ static tool_result_t handle_rename_function(const json& params)
     std::string new_name;
     if (params.contains("new_name") && params["new_name"].is_string())
         new_name = params["new_name"].get<std::string>();
+    else if (params.contains("name") && params["name"].is_string())
+        new_name = params["name"].get<std::string>();
     diag::log_tagged_fmt("disasm_tools", "rename_function addr=0x%llX new_name=%s action=%s",
         static_cast<unsigned long long>(addr), new_name.c_str(),
         new_name.empty() ? "clear" : "rename");
@@ -537,6 +549,9 @@ static tool_result_t handle_rename_function(const json& params)
 
 static tool_result_t handle_get_section_info(const json&)
 {
+    if (!loaded_static_file_available())
+        return tool_result_t::error("No disassembly file is loaded. Open a file session before requesting section info.");
+
     diag::log_tagged_fmt("disasm_tools", "get_section_info image_base=0x%llX sections=%zu filename=%s",
         static_cast<unsigned long long>(g_disasm.file.image_base),
         g_disasm.file.sections.size(), g_disasm.file.filename.c_str());
@@ -602,6 +617,9 @@ static bool parse_hex_pattern(const std::string& in, std::vector<uint8_t>& bytes
 
 static tool_result_t handle_search_bytes(const json& params)
 {
+    if (!loaded_static_file_available())
+        return tool_result_t::error("No disassembly file is loaded. Open a file session before searching static bytes.");
+
     if (!params.contains("pattern") || !params["pattern"].is_string()) {
         diag::log_tagged_fmt("disasm_tools", "search_bytes_bad_params");
         return tool_result_t::error("'pattern' is required (hex string, supports '??' wildcards).");
@@ -663,6 +681,9 @@ static bool is_printable_ascii(uint8_t b)
 
 static tool_result_t handle_get_strings(const json& params)
 {
+    if (!loaded_static_file_available())
+        return tool_result_t::error("No disassembly file is loaded. Open a file session before extracting static strings.");
+
     diag::log_tagged_fmt("disasm_tools", "get_strings_enter");
     size_t min_len = 4;
     if (params.contains("min_length") && params["min_length"].is_number_unsigned()) {

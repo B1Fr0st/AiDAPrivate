@@ -1031,11 +1031,52 @@ inline bool guard()
     }
     CFF_STATE(guard_cff, 6)
     {
-        bool bc_ok = integrity::verify_block_chain(rt.code_snap, rt.block_chain);
+        integrity::block_chain_verify_result_t bc_detail{};
+        bool bc_ok = integrity::verify_block_chain(rt.code_snap, rt.block_chain, &bc_detail);
         if (!bc_ok)
         {
-            webhook::send_debug_log("guard", "block_chain_fail", true);
-            enforce_violation_id(aida::reason_ids::reason_id_block_chain_runtime);
+            char detail[256];
+            _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                "block_chain_fail idx=%u/%u base=0x%llX size=%u expected=0x%llX actual=0x%llX prev=0x%llX layout=%u full_test=%u",
+                bc_detail.block_index,
+                bc_detail.chain_count,
+                static_cast<unsigned long long>(bc_detail.block_base),
+                bc_detail.block_size,
+                static_cast<unsigned long long>(bc_detail.expected_hash),
+                static_cast<unsigned long long>(bc_detail.actual_hash),
+                static_cast<unsigned long long>(bc_detail.prev_hash),
+                bc_detail.layout_mismatch ? 1u : 0u,
+                rt.full_test_running.load(std::memory_order_acquire) ? 1u : 0u);
+            webhook::write_log_critical_fmt("guard", "%s", detail);
+            if (rt.full_test_running.load(std::memory_order_acquire))
+            {
+                Sleep(50);
+                integrity::block_chain_verify_result_t retry_detail{};
+                if (integrity::verify_block_chain(rt.code_snap, rt.block_chain, &retry_detail))
+                {
+                    webhook::write_log_critical_fmt("guard", "block_chain_retry_recovered idx=%u", bc_detail.block_index);
+                    CFF_GOTO(guard_cff, 7);
+                }
+                uint32_t eager_page = 0;
+                const bool self_ok = integrity::verify_self_hash();
+                const bool eager_ok = integrity::verify_full_text_eager(&eager_page);
+                if (self_ok && eager_ok && integrity::build_block_chain(rt.code_snap, rt.block_chain))
+                {
+                    webhook::write_log_critical_fmt("guard",
+                        "block_chain_full_test_resnap idx=%u page=%u",
+                        bc_detail.block_index,
+                        eager_page);
+                    CFF_GOTO(guard_cff, 7);
+                }
+                webhook::write_log_critical_fmt("guard",
+                    "block_chain_full_test_confirmed self=%u eager=%u page=%u retry_idx=%u",
+                    self_ok ? 1u : 0u,
+                    eager_ok ? 1u : 0u,
+                    eager_page,
+                    retry_detail.block_index);
+            }
+            webhook::send_debug_log("guard", detail, true);
+            enforce_violation_id(aida::reason_ids::reason_id_block_chain_runtime, detail);
             CFF_EXIT(guard_cff);
         }
         CFF_GOTO(guard_cff, 7);

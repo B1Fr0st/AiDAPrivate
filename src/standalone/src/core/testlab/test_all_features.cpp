@@ -18,6 +18,7 @@
 #include "../network/mitm_proxy.hpp"
 #include "../runtime/run_target.hpp"
 #include "../runtime/standalone_driver.hpp"
+#include "../anti-tamper/state.hpp"
 #include "../scanner/memory_scanner.hpp"
 #include "../scanner/aob_generator.hpp"
 #include "../disasm/cfg_view.hpp"
@@ -1106,6 +1107,7 @@ namespace test_all_features {
 			if (!require_target(hf, tag)) return;
 
 			std::uint32_t pid = current_target_pid();
+			std::uint64_t image_base = current_target_image_base();
 
 			memory_scanner::reset_scan();
 			memory_scanner::scan_config_t cfg;
@@ -1114,8 +1116,13 @@ namespace test_all_features {
 			cfg.value_text = "This program cannot be run in DOS mode";
 			cfg.writable_only = false;
 			cfg.executable_exclude = false;
+			cfg.range_base = image_base;
+			cfg.range_size = image_base != 0 ? 0x1000 : 0;
 
-			log_msg(hf, tag, "first_scan ASCII \"%s\" against pid=%u", cfg.value_text.c_str(), pid);
+			log_msg(hf, tag, "first_scan ASCII \"%s\" against pid=%u range=0x%016llX+0x%llX",
+				cfg.value_text.c_str(), pid,
+				static_cast<unsigned long long>(cfg.range_base),
+				static_cast<unsigned long long>(cfg.range_size));
 			bool ok = memory_scanner::first_scan(cfg);
 
 			for (int i = 0; i < 100; ++i) {
@@ -1149,7 +1156,6 @@ namespace test_all_features {
 			log_msg(hf, tag, "scanner string scan empty (ok=%d found=%zu); falling back to direct driver read of image base",
 				static_cast<int>(ok), found);
 
-			std::uint64_t image_base = current_target_image_base();
 			std::vector<std::uint8_t> sample;
 			bool read_ok = (image_base != 0) &&
 				driver_bridge::read_memory_for(pid, image_base, 2, sample);
@@ -1502,12 +1508,14 @@ namespace test_all_features {
 			bool active = false;
 
 			explicit full_test_env_guard_t(HANDLE* handle) : hf(handle), active(true) {
+				anti_tamper::state::get().full_test_running.store(true, std::memory_order_release);
 				set_full_test_env(hf ? *hf : INVALID_HANDLE_VALUE, true, "run_all begin");
 			}
 
 			void clear(const char* reason) {
 				if (!active) return;
 				set_full_test_env(hf ? *hf : INVALID_HANDLE_VALUE, false, reason ? reason : "run_all end");
+				anti_tamper::state::get().full_test_running.store(false, std::memory_order_release);
 				active = false;
 			}
 
@@ -1520,18 +1528,24 @@ namespace test_all_features {
 			std::atomic<bool> stop{ false };
 			std::thread worker;
 
-			void start() {
-				worker = std::thread([this]() {
-					while (!stop.load(std::memory_order_acquire)) {
-						for (int i = 0; i < 50; ++i) {
-							if (stop.load(std::memory_order_acquire)) return;
-							Sleep(100);
+			void start(HANDLE hf) {
+				try {
+					worker = std::thread([this]() {
+						while (!stop.load(std::memory_order_acquire)) {
+							for (int i = 0; i < 50; ++i) {
+								if (stop.load(std::memory_order_acquire)) return;
+								Sleep(100);
+							}
+							HANDLE hh = open_log_file();
+							log_debug_snapshot(hh, "heartbeat", "FULL-TEST live heartbeat");
+							if (hh != INVALID_HANDLE_VALUE) CloseHandle(hh);
 						}
-						HANDLE hh = open_log_file();
-						log_debug_snapshot(hh, "heartbeat", "FULL-TEST live heartbeat");
-						if (hh != INVALID_HANDLE_VALUE) CloseHandle(hh);
-					}
-				});
+					});
+				} catch (const std::exception& ex) {
+					log_msg(hf, "heartbeat", "disabled live heartbeat worker: %s", ex.what());
+				} catch (...) {
+					log_msg(hf, "heartbeat", "disabled live heartbeat worker: unknown exception");
+				}
 			}
 
 			void stop_and_join() {
@@ -1551,7 +1565,7 @@ namespace test_all_features {
 			std::uint32_t target_pid = 0;
 			run_cleanup_guard_t cleanup_guard{ &hf, &target_pid, true };
 			run_heartbeat_t heartbeat;
-			heartbeat.start();
+			heartbeat.start(hf);
 			const std::uint64_t this_run = g_run_id.fetch_add(1, std::memory_order_acq_rel) + 1;
 			g_run_start_tick.store(now_ms_tick(), std::memory_order_release);
 			set_step("run_all entry");

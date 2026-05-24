@@ -32,6 +32,13 @@ const char* state_label(camoufox::bridge_state_t s)
     return "unknown";
 }
 
+bool auto_setup_pending(const camoufox::bridge_status_t& s)
+{
+    return s.state == camoufox::bridge_state_t::starting &&
+           (s.last_error.find("Camoufox setup") != std::string::npos ||
+            s.last_error.find("camoufox setup") != std::string::npos);
+}
+
 json status_to_json(const camoufox::bridge_status_t& s)
 {
     json j;
@@ -82,6 +89,13 @@ tool_result_t tool_headless_start(const json& params)
     if (!ok)
     {
         std::string err = s.last_error.empty() ? camoufox::last_error() : s.last_error;
+        if (auto_setup_pending(s))
+        {
+            j["setup_started"] = true;
+            j["message"] = err;
+            diag::log_tagged_fmt("mcp_burp", "headless_start setup_started msg=%s", err.c_str());
+            return tool_result_t::ok(j);
+        }
         diag::log_tagged_fmt("mcp_burp", "headless_start failed err=%s", err.c_str());
         return tool_result_t::error(err.empty() ? std::string("camoufox start failed") : err);
     }
@@ -130,6 +144,23 @@ tool_result_t tool_headless_navigate(const json& params)
     if (params.contains("timeout_ms") && params["timeout_ms"].is_number_integer())
         timeout_ms = params["timeout_ms"].get<int>();
     diag::log_tagged_fmt("mcp_burp", "headless_navigate url=%s wait_until=%s timeout_ms=%d", url.c_str(), wait_until.c_str(), timeout_ms);
+    if (!camoufox::ensure_ready())
+    {
+        std::string err = camoufox::last_error();
+        auto s = camoufox::get_status();
+        if (auto_setup_pending(s))
+        {
+            json j = status_to_json(s);
+            j["setup_started"] = true;
+            j["pending_url"] = url;
+            j["message"] = err.empty() ? s.last_error : err;
+            diag::log_tagged_fmt("mcp_burp", "headless_navigate setup_started url=%s msg=%s",
+                url.c_str(), j["message"].get<std::string>().c_str());
+            return tool_result_t::ok(j);
+        }
+        diag::log_tagged_fmt("mcp_burp", "headless_navigate bridge_not_ready err=%s", err.c_str());
+        return tool_result_t::error(err.empty() ? std::string("camoufox bridge not ready") : err);
+    }
     if (!camoufox::navigate(url, wait_until, timeout_ms))
     {
         diag::log_tagged_fmt("mcp_burp", "headless_navigate failed err=%s", camoufox::last_error().c_str());
@@ -388,11 +419,11 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
     register_compat(srv, {
         "burp_headless_start",
         "headless_browser",
-        "Start the Camoufox anti-detect headless browser bridge. Spawns the Python MCP server "
+        "Start the visible Camoufox anti-detect browser bridge. Spawns the Python MCP server "
         "in-process and launches a Firefox-derived browser with engine-level fingerprint spoofing. "
         "Optional proxy points at AiDA's MITM proxy for capturing intercepted DOM-XSS traffic.",
         {
-            {"headless",          "boolean", "Run browser headless (default true)", false},
+            {"headless",          "boolean", "Compatibility flag; AiDA forces visible headed Camoufox", false},
             {"proxy",             "string",  "Proxy URL, e.g. http://127.0.0.1:8443", false},
             {"os",                "string",  "Spoofed OS: auto/windows/macos/linux", false},
             {"locale",            "string",  "Browser locale, default auto", false},
@@ -401,7 +432,7 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
             {"block_webrtc",      "boolean", "Block WebRTC to prevent IP leaks", false},
             {"python_executable", "string",  "Override python interpreter path", false},
             {"server_module",     "string",  "MCP server module name (default camoufox_reverse_mcp)", false},
-            {"launch_timeout_ms", "number",  "Launch handshake timeout in ms (default 60000)", false},
+            {"launch_timeout_ms", "number",  "Launch handshake timeout in ms (default 5000, max 5000)", false},
         },
         tool_headless_start,
         false
@@ -428,7 +459,7 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
     register_compat(srv, {
         "burp_headless_navigate",
         "headless_browser",
-        "Navigate the headless browser to a URL. Returns page info with final URL/title/status.",
+        "Open visible Camoufox if needed, then navigate it to a URL. Returns page info with final URL/title/status.",
         {
             {"url",        "string", "Target URL", true},
             {"wait_until", "string", "load/domcontentloaded/networkidle (default load)", false},

@@ -49,7 +49,7 @@ struct state_t
     std::string eval_output;
     std::string last_screenshot_path;
 
-    bool        cfg_headless        = true;
+    bool        cfg_headless        = false;
     bool        cfg_humanize        = false;
     bool        cfg_block_images    = false;
     bool        cfg_block_webrtc    = false;

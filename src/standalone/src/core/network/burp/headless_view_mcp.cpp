@@ -45,6 +45,13 @@ json bridge_status_to_json(const aida::burp::camoufox::bridge_status_t& s)
     return j;
 }
 
+bool auto_setup_pending(const aida::burp::camoufox::bridge_status_t& s)
+{
+    return s.state == aida::burp::camoufox::bridge_state_t::starting &&
+           (s.last_error.find("Camoufox setup") != std::string::npos ||
+            s.last_error.find("camoufox setup") != std::string::npos);
+}
+
 json install_status_to_json(const aida::burp::camoufox::install::status_t& s)
 {
     json j;
@@ -58,9 +65,9 @@ json install_status_to_json(const aida::burp::camoufox::install::status_t& s)
 
 tool_result_t tool_status(const json& params)
 {
-    (void)params;
     diag::log_tagged_fmt("mcp_burp", "headless_view_status entry");
     json out;
+    const bool refresh = params.is_object() && params.value("refresh", false);
     try {
         aida::burp::camoufox::bridge_status_t bs = aida::burp::camoufox::get_status();
         out["bridge"] = bridge_status_to_json(bs);
@@ -68,7 +75,9 @@ tool_result_t tool_status(const json& params)
         out["bridge"] = nullptr;
     }
     try {
-        aida::burp::camoufox::install::status_t is = aida::burp::camoufox::install::probe();
+        aida::burp::camoufox::install::status_t is = refresh
+            ? aida::burp::camoufox::install::probe()
+            : aida::burp::camoufox::install::get_status();
         out["install"] = install_status_to_json(is);
     } catch (...) {
         out["install"] = nullptr;
@@ -97,9 +106,20 @@ tool_result_t tool_quick_navigate(const json& params)
         if (v > 0 && v <= 120000) wait_ms = static_cast<int>(v);
     }
 
-    if (!aida::burp::camoufox::is_ready()) {
-        diag::log_tagged_fmt("mcp_burp", "headless_view_quick_navigate bridge_not_ready");
-        return tool_result_t::error("bridge_not_ready");
+    if (!aida::burp::camoufox::ensure_ready()) {
+        std::string msg = aida::burp::camoufox::last_error();
+        auto bs = aida::burp::camoufox::get_status();
+        if (auto_setup_pending(bs)) {
+            json out;
+            out["setup_started"] = true;
+            out["pending_url"] = url;
+            out["bridge"] = bridge_status_to_json(bs);
+            out["message"] = msg.empty() ? bs.last_error : msg;
+            diag::log_tagged_fmt("mcp_burp", "headless_view_quick_navigate setup_started url=%s", url.c_str());
+            return tool_result_t::ok(out);
+        }
+        diag::log_tagged_fmt("mcp_burp", "headless_view_quick_navigate bridge_not_ready err=%s", msg.c_str());
+        return tool_result_t::error(msg.empty() ? std::string("bridge_not_ready") : msg);
     }
 
     bool nav_ok = false;
@@ -196,7 +216,9 @@ void register_headless_view_tools(mcp_standalone::server_t& srv)
         t.description = "Return the current Camoufox headless view state snapshot: bridge process status "
                         "(state/pid/uptime/last_error) and install status (python, module, browser). "
                         "Read-only and safe to call from agentic loops to gate downstream actions.";
-        t.params = {};
+        t.params = {
+            {"refresh", "boolean", "Run a synchronous dependency probe instead of returning the cached install snapshot.", false},
+        };
         t.read_only = true;
         t.handler = tool_status;
         srv.register_tool(std::move(t));
@@ -204,9 +226,9 @@ void register_headless_view_tools(mcp_standalone::server_t& srv)
     {
         tool_def_t t;
         t.name = "burp_headless_view_quick_navigate";
-        t.description = "Navigate the Camoufox-controlled page to the supplied URL and (optionally) run a "
+        t.description = "Open visible Camoufox if needed, navigate to the supplied URL, and optionally run a "
                         "JS expression immediately after load. Returns navigation status plus the eval result "
-                        "if provided. Requires the bridge to already be in the 'ready' state.";
+                        "if provided.";
         t.params = {
             {"url", "string", "Target URL to navigate to (must be a fully-qualified scheme://host[/path]).", true},
             {"eval_after_load", "string", "Optional JavaScript expression evaluated after the page reports 'load'.", false},

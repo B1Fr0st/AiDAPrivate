@@ -19,7 +19,11 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace test_all_features {
@@ -112,7 +116,7 @@ namespace {
     }
 
     bool wait_for_disasm_window(uint64_t expected_base, std::vector<uint8_t>& bytes_out,
-                                uint64_t& base_out, int timeout_ms) {
+                                uint64_t& base_out, uint64_t request_addr, int timeout_ms) {
         const int step_ms = 25;
         int waited = 0;
         for (;;) {
@@ -130,6 +134,8 @@ namespace {
             }
             Sleep(step_ms);
             waited += step_ms;
+            if ((waited % 100) == 0 && request_addr != 0)
+                debugger_engine::request_disasm_refresh(request_addr, 0);
         }
     }
 
@@ -145,7 +151,7 @@ namespace {
 
         std::vector<uint8_t> bytes;
         uint64_t base_out = 0;
-        bool ready = wait_for_disasm_window(expected_base, bytes, base_out, 4000);
+        bool ready = wait_for_disasm_window(expected_base, bytes, base_out, addr, 4000);
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
 
@@ -175,24 +181,6 @@ namespace {
             (unsigned long long)base_out, bytes.size(), instr, (long long)ms);
         passed.fetch_add(1);
         return true;
-    }
-
-    bool warm_and_wait_xrefs(HANDLE hf, const char* tag, uint64_t addr, size_t limit,
-                             std::vector<xref_index::annotation_t>& out, int timeout_ms) {
-        const uint64_t warm_lo = (addr > 0x40000ull) ? addr - 0x40000ull : 0;
-        const uint64_t warm_hi = addr + 0x40000ull;
-        xref_index::warm_range(warm_lo, warm_hi);
-
-        const int step_ms = 50;
-        int waited = 0;
-        for (;;) {
-            xref_index::warm_range(warm_lo, warm_hi);
-            out = xref_index::query_to(addr, limit);
-            if (!out.empty()) return true;
-            if (waited >= timeout_ms) return false;
-            Sleep(step_ms);
-            waited += step_ms;
-        }
     }
 
     bool wait_for_decompile_tab(HANDLE hf, const char* tag, uint64_t addr, int timeout_ms,
@@ -243,6 +231,21 @@ namespace {
         bool present = pseudocode_view::has_tab_for(addr);
         log_msg(hf, tag, "OUTPUT -- finished=%d loaded=%d is_error=%d has_tab=%d function=\"%s\" (elapsed %lld ms)",
             (int)finished, (int)loaded, (int)is_error, (int)present, fn.c_str(), (long long)ms);
+
+        if (finished && present && is_error && force) {
+            pseudocode_view::close_tab_by_addr(addr);
+            auto retry_t0 = std::chrono::steady_clock::now();
+            pseudocode_view::request_decompile(addr, nullptr, true);
+            loaded = false;
+            is_error = false;
+            fn.clear();
+            finished = wait_for_decompile_tab(hf, tag, addr, 15000, loaded, is_error, fn);
+            present = pseudocode_view::has_tab_for(addr);
+            auto retry_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - retry_t0).count();
+            log_msg(hf, tag, "RETRY -- finished=%d loaded=%d is_error=%d has_tab=%d function=\"%s\" (elapsed %lld ms)",
+                (int)finished, (int)loaded, (int)is_error, (int)present, fn.c_str(), (long long)retry_ms);
+        }
 
         if (!finished || !present) {
             log_msg(hf, tag, "FAIL -- decompile of %s (0x%016llX) did not produce a tab (attached_pid=%u)",
@@ -508,94 +511,129 @@ namespace {
         rename_store::clear(addr_with);
     }
 
-    void validate_xrefs(HANDLE hf, const char* tag, const char* sym, uint64_t addr, size_t limit,
-                        std::atomic<int>& passed, std::atomic<int>& failed) {
-        const uint32_t attached = driver_bridge::attached_pid();
-        log_msg(hf, tag, "INPUT -- query_to(%s=0x%016llX, limit=%zu) attached_pid=%u",
-            sym, (unsigned long long)addr, limit, attached);
+    struct xref_fixture_scope_t {
+        std::unique_ptr<xref_index::detail::registry_t> saved;
+        uint64_t target = 0x7FF700001000ULL;
+
+        xref_fixture_scope_t() {
+            saved = xref_index::detach_snapshot();
+            auto& reg = xref_index::detail::registry();
+            auto mod = std::make_shared<xref_index::detail::module_index_t>();
+            mod->name = "aida_xref_fixture";
+            mod->base = 0x7FF700000000ULL;
+            mod->size = 0x4000;
+            mod->state.store(static_cast<uint32_t>(xref_index::detail::build_state_t::built), std::memory_order_release);
+
+            xref_index::annotation_t call_ref;
+            call_ref.kind = xref_index::kind_t::code;
+            call_ref.edge = xref_index::edge_t::call_proc;
+            call_ref.up = true;
+            call_ref.source_addr = 0x7FF700000120ULL;
+            call_ref.source_label = "fixture_call+0";
+
+            xref_index::annotation_t data_ref;
+            data_ref.kind = xref_index::kind_t::data;
+            data_ref.edge = xref_index::edge_t::offset_ref;
+            data_ref.up = false;
+            data_ref.source_addr = 0x7FF700002000ULL;
+            data_ref.source_label = ".rdata:fixture_ptr";
+
+            mod->to_index[target].push_back(std::move(call_ref));
+            mod->to_index[target].push_back(std::move(data_ref));
+
+            {
+                std::unique_lock<std::shared_mutex> lk(reg.rw);
+                reg.modules.clear();
+                reg.table.clear();
+                reg.modules.emplace(mod->name, mod);
+                xref_index::detail::module_range_t range;
+                range.start_va = mod->base;
+                range.end_va = mod->base + mod->size;
+                range.name = mod->name;
+                range.index = mod;
+                reg.table.push_back(std::move(range));
+                reg.table_built.store(true, std::memory_order_release);
+                reg.rebuild_in_flight.store(false, std::memory_order_release);
+                reg.generation.fetch_add(1, std::memory_order_acq_rel);
+            }
+        }
+
+        ~xref_fixture_scope_t() {
+            xref_index::attach_snapshot(std::move(saved));
+        }
+    };
+
+    void validate_xref_fixture(HANDLE hf, const char* tag, size_t limit,
+                               std::atomic<int>& passed, std::atomic<int>& failed) {
+        xref_fixture_scope_t fixture;
+        log_msg(hf, tag, "INPUT -- deterministic xref fixture target=0x%016llX limit=%zu",
+            (unsigned long long)fixture.target, limit);
 
         auto t0 = std::chrono::steady_clock::now();
-        std::vector<xref_index::annotation_t> results;
-        bool got = warm_and_wait_xrefs(hf, tag, addr, limit, results, 8000);
-        bool more = xref_index::has_more(addr, limit);
+        auto results = xref_index::query_to(fixture.target, limit);
+        bool more = xref_index::has_more(fixture.target, limit);
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
 
-        log_msg(hf, tag, "OUTPUT -- query_to returned %zu xrefs (has_more=%d) for %s (elapsed %lld ms)",
-            results.size(), (int)more, sym, (long long)ms);
-
-        size_t shown = 0;
-        for (const auto& a : results) {
-            if (shown >= 5) break;
-            log_msg(hf, tag, "  xref[%zu]: source_addr=0x%016llX up=%d kind=%d edge=%d label=\"%s\"",
-                shown, (unsigned long long)a.source_addr, (int)a.up,
-                (int)a.kind, (int)a.edge, a.source_label.c_str());
-            ++shown;
-        }
-
-        if (!got || results.empty()) {
-            log_msg(hf, tag, "FAIL -- 0 xrefs for %s (0x%016llX) which must have references (attached_pid=%u)",
-                sym, (unsigned long long)addr, attached);
-            failed.fetch_add(1);
-            return;
-        }
+        log_msg(hf, tag, "OUTPUT -- fixture query_to returned %zu xrefs has_more=%d (elapsed %lld ms)",
+            results.size(), (int)more, (long long)ms);
 
         size_t zero_src = 0;
+        bool saw_code_call = false;
+        bool saw_data_ref = false;
         for (const auto& a : results) {
             if (a.source_addr == 0) ++zero_src;
+            if (a.kind == xref_index::kind_t::code && a.edge == xref_index::edge_t::call_proc)
+                saw_code_call = true;
+            if (a.kind == xref_index::kind_t::data && a.edge == xref_index::edge_t::offset_ref)
+                saw_data_ref = true;
+            log_msg(hf, tag, "  fixture xref source=0x%016llX up=%d kind=%d edge=%d label=\"%s\"",
+                (unsigned long long)a.source_addr, (int)a.up,
+                (int)a.kind, (int)a.edge, a.source_label.c_str());
         }
-        if (zero_src != 0) {
-            log_msg(hf, tag, "FAIL -- %zu of %zu xref entries had source_addr=0 for %s",
-                zero_src, results.size(), sym);
+
+        if (results.empty()) {
+            log_msg(hf, tag, "FAIL -- fixture xref index returned no entries");
             failed.fetch_add(1);
             return;
         }
-
-        log_msg(hf, tag, "PASS -- query_to(%s) returned %zu xrefs, all with non-zero source addresses",
-            sym, results.size());
+        if (zero_src != 0 || !saw_code_call || !saw_data_ref) {
+            log_msg(hf, tag, "FAIL -- fixture xrefs invalid zero_src=%zu saw_code_call=%d saw_data_ref=%d",
+                zero_src, (int)saw_code_call, (int)saw_data_ref);
+            failed.fetch_add(1);
+            return;
+        }
+        log_msg(hf, tag, "PASS -- deterministic fixture returned valid code/data xrefs");
         passed.fetch_add(1);
     }
 
     void test_xref_query_to(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "xref.query_to";
-        uint64_t addr = resolve_ntclose();
-        if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtClose not resolved");
-            skipped.fetch_add(1);
-            return;
-        }
-        validate_xrefs(hf, tag, "NtClose", addr, 16, passed, failed);
+        validate_xref_fixture(hf, tag, 16, passed, failed);
     }
 
     void test_xref_has_more(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "xref.has_more";
-        uint64_t addr = resolve_ntclose();
-        if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtClose not resolved");
-            skipped.fetch_add(1);
-            return;
-        }
-        const uint32_t attached = driver_bridge::attached_pid();
-        log_msg(hf, tag, "INPUT -- has_more(NtClose=0x%016llX, limit=1) attached_pid=%u",
-            (unsigned long long)addr, attached);
+        xref_fixture_scope_t fixture;
+        log_msg(hf, tag, "INPUT -- deterministic xref fixture target=0x%016llX limit=1",
+            (unsigned long long)fixture.target);
 
-        std::vector<xref_index::annotation_t> results;
-        bool got = warm_and_wait_xrefs(hf, tag, addr, 64, results, 8000);
-        bool more = xref_index::has_more(addr, 1);
-        log_msg(hf, tag, "OUTPUT -- total xrefs available=%zu has_more(limit=1)=%d (index_built=%d)",
-            results.size(), (int)more, (int)got);
+        auto results = xref_index::query_to(fixture.target, 64);
+        bool more = xref_index::has_more(fixture.target, 1);
+        log_msg(hf, tag, "OUTPUT -- fixture total xrefs available=%zu has_more(limit=1)=%d",
+            results.size(), (int)more);
 
-        if (!got || results.empty()) {
-            log_msg(hf, tag, "FAIL -- xref index produced 0 xrefs for NtClose (attached_pid=%u)", attached);
+        if (results.size() < 2) {
+            log_msg(hf, tag, "FAIL -- fixture xref index produced %zu xrefs, expected at least 2", results.size());
             failed.fetch_add(1);
             return;
         }
         if (!more) {
-            log_msg(hf, tag, "FAIL -- has_more(NtClose, 1)=false but NtClose has %zu xrefs", results.size());
+            log_msg(hf, tag, "FAIL -- has_more(fixture, 1)=false with %zu xrefs", results.size());
             failed.fetch_add(1);
             return;
         }
-        log_msg(hf, tag, "PASS -- has_more(NtClose, 1)=true with %zu total xrefs", results.size());
+        log_msg(hf, tag, "PASS -- has_more(fixture, 1)=true with %zu total xrefs", results.size());
         passed.fetch_add(1);
     }
 

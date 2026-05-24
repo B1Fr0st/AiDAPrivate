@@ -62,6 +62,31 @@ test('legacy heuristic ban reasons are not enforcement bans', () => {
     assert.equal(licenseRouter._internal.isNonEnforcingBanReason('honeypot_export_called'), false);
 });
 
+test('license expiry prefers exact epoch over legacy date string', () => {
+    const now = 2000000000;
+    assert.equal(licenseRouter._internal.isLicenseExpired({
+        expires: '2000-01-01',
+        expires_epoch: now + 60,
+    }, now), false);
+    assert.equal(licenseRouter._internal.isLicenseExpired({
+        expires: '2999-01-01',
+        expires_epoch: now - 1,
+    }, now), true);
+});
+
+test('license expiry keeps legacy date keys valid through the UTC expiry day', () => {
+    const sameDay = Math.floor(Date.parse('2026-05-24T12:00:00Z') / 1000);
+    const nextDay = Math.floor(Date.parse('2026-05-25T00:00:00Z') / 1000);
+    assert.equal(licenseRouter._internal.isLicenseExpired({
+        expires: '2026-05-24',
+        expires_epoch: 0,
+    }, sameDay), false);
+    assert.equal(licenseRouter._internal.isLicenseExpired({
+        expires: '2026-05-24',
+        expires_epoch: 0,
+    }, nextDay), true);
+});
+
 test('startup ban check accepts unique current and legacy hwids', () => {
     const hwids = licenseRouter._internal.normalizeBanCheckHwids({
         hwid: 'CURRENT-HWID-1234',
