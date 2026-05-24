@@ -228,13 +228,103 @@ bool evp_digest_bytes(const EVP_MD* md, const uint8_t* data, size_t len_in, std:
     return ok;
 }
 
+uint32_t md4_rol(uint32_t value, uint32_t bits)
+{
+    return (value << bits) | (value >> (32u - bits));
+}
+
+bool md4_fallback_bytes(const uint8_t* data, size_t len, std::vector<uint8_t>& out)
+{
+    if (!data && len != 0)
+        return false;
+
+    std::vector<uint8_t> msg;
+    msg.reserve(len + 72);
+    msg.insert(msg.end(), data, data + len);
+    msg.push_back(0x80);
+    while ((msg.size() & 63u) != 56u)
+        msg.push_back(0);
+
+    const uint64_t bit_len = static_cast<uint64_t>(len) * 8u;
+    for (int i = 0; i < 8; ++i)
+        msg.push_back(static_cast<uint8_t>((bit_len >> (i * 8)) & 0xFFu));
+
+    uint32_t a0 = 0x67452301u;
+    uint32_t b0 = 0xefcdab89u;
+    uint32_t c0 = 0x98badcfeu;
+    uint32_t d0 = 0x10325476u;
+
+    auto f = [](uint32_t x, uint32_t y, uint32_t z) { return (x & y) | (~x & z); };
+    auto g = [](uint32_t x, uint32_t y, uint32_t z) { return (x & y) | (x & z) | (y & z); };
+    auto h = [](uint32_t x, uint32_t y, uint32_t z) { return x ^ y ^ z; };
+
+    for (size_t off = 0; off < msg.size(); off += 64) {
+        uint32_t x[16];
+        for (int i = 0; i < 16; ++i) {
+            const size_t p = off + static_cast<size_t>(i) * 4u;
+            x[i] = static_cast<uint32_t>(msg[p]) |
+                   (static_cast<uint32_t>(msg[p + 1]) << 8) |
+                   (static_cast<uint32_t>(msg[p + 2]) << 16) |
+                   (static_cast<uint32_t>(msg[p + 3]) << 24);
+        }
+
+        uint32_t a = a0;
+        uint32_t b = b0;
+        uint32_t c = c0;
+        uint32_t d = d0;
+
+        auto r1 = [&](uint32_t& aa, uint32_t bb, uint32_t cc, uint32_t dd, int k, uint32_t sft) {
+            aa = md4_rol(aa + f(bb, cc, dd) + x[k], sft);
+        };
+        auto r2 = [&](uint32_t& aa, uint32_t bb, uint32_t cc, uint32_t dd, int k, uint32_t sft) {
+            aa = md4_rol(aa + g(bb, cc, dd) + x[k] + 0x5a827999u, sft);
+        };
+        auto r3 = [&](uint32_t& aa, uint32_t bb, uint32_t cc, uint32_t dd, int k, uint32_t sft) {
+            aa = md4_rol(aa + h(bb, cc, dd) + x[k] + 0x6ed9eba1u, sft);
+        };
+
+        r1(a, b, c, d, 0, 3);  r1(d, a, b, c, 1, 7);  r1(c, d, a, b, 2, 11);  r1(b, c, d, a, 3, 19);
+        r1(a, b, c, d, 4, 3);  r1(d, a, b, c, 5, 7);  r1(c, d, a, b, 6, 11);  r1(b, c, d, a, 7, 19);
+        r1(a, b, c, d, 8, 3);  r1(d, a, b, c, 9, 7);  r1(c, d, a, b, 10, 11); r1(b, c, d, a, 11, 19);
+        r1(a, b, c, d, 12, 3); r1(d, a, b, c, 13, 7); r1(c, d, a, b, 14, 11); r1(b, c, d, a, 15, 19);
+
+        r2(a, b, c, d, 0, 3);  r2(d, a, b, c, 4, 5);  r2(c, d, a, b, 8, 9);   r2(b, c, d, a, 12, 13);
+        r2(a, b, c, d, 1, 3);  r2(d, a, b, c, 5, 5);  r2(c, d, a, b, 9, 9);   r2(b, c, d, a, 13, 13);
+        r2(a, b, c, d, 2, 3);  r2(d, a, b, c, 6, 5);  r2(c, d, a, b, 10, 9);  r2(b, c, d, a, 14, 13);
+        r2(a, b, c, d, 3, 3);  r2(d, a, b, c, 7, 5);  r2(c, d, a, b, 11, 9);  r2(b, c, d, a, 15, 13);
+
+        r3(a, b, c, d, 0, 3);  r3(d, a, b, c, 8, 9);  r3(c, d, a, b, 4, 11);  r3(b, c, d, a, 12, 15);
+        r3(a, b, c, d, 2, 3);  r3(d, a, b, c, 10, 9); r3(c, d, a, b, 6, 11);  r3(b, c, d, a, 14, 15);
+        r3(a, b, c, d, 1, 3);  r3(d, a, b, c, 9, 9);  r3(c, d, a, b, 5, 11);  r3(b, c, d, a, 13, 15);
+        r3(a, b, c, d, 3, 3);  r3(d, a, b, c, 11, 9); r3(c, d, a, b, 7, 11);  r3(b, c, d, a, 15, 15);
+
+        a0 += a;
+        b0 += b;
+        c0 += c;
+        d0 += d;
+    }
+
+    out.assign(16, 0);
+    const uint32_t words[4] = { a0, b0, c0, d0 };
+    for (int i = 0; i < 4; ++i) {
+        out[static_cast<size_t>(i) * 4u] = static_cast<uint8_t>(words[i] & 0xFFu);
+        out[static_cast<size_t>(i) * 4u + 1u] = static_cast<uint8_t>((words[i] >> 8) & 0xFFu);
+        out[static_cast<size_t>(i) * 4u + 2u] = static_cast<uint8_t>((words[i] >> 16) & 0xFFu);
+        out[static_cast<size_t>(i) * 4u + 3u] = static_cast<uint8_t>((words[i] >> 24) & 0xFFu);
+    }
+    return true;
+}
+
 bool evp_md4_bytes(const uint8_t* data, size_t len, std::vector<uint8_t>& out)
 {
     EVP_MD* md4 = EVP_MD_fetch(nullptr, "MD4", nullptr);
-    if (!md4) return false;
-    bool ok = evp_digest_bytes(md4, data, len, out);
-    EVP_MD_free(md4);
-    return ok;
+    if (md4) {
+        bool ok = evp_digest_bytes(md4, data, len, out);
+        EVP_MD_free(md4);
+        if (ok)
+            return true;
+    }
+    return md4_fallback_bytes(data, len, out);
 }
 
 bool evp_md5_bytes(const uint8_t* data, size_t len, std::vector<uint8_t>& out)
@@ -278,16 +368,20 @@ bool ensure_legacy_provider_loaded()
         return true;
     }
     diag::log_tagged_fmt("auth_lab", "ensure_legacy_provider_loaded loading_providers");
-    OSSL_PROVIDER* def = OSSL_PROVIDER_load(nullptr, "default");
+    OSSL_PROVIDER* def = st.default_p ? nullptr : OSSL_PROVIDER_load(nullptr, "default");
     OSSL_PROVIDER* legacy = OSSL_PROVIDER_load(nullptr, "legacy");
     if (!legacy) {
         diag::log_tagged_fmt("auth_lab", "ensure_legacy_provider_loaded error legacy_load_failed");
-        if (def) OSSL_PROVIDER_unload(def);
+        if (def && !st.default_p)
+            st.default_p = def;
+        else if (def)
+            OSSL_PROVIDER_unload(def);
         set_err("legacy provider load failed");
         return false;
     }
     st.legacy = legacy;
-    st.default_p = def;
+    if (def)
+        st.default_p = def;
     st.legacy_loaded.store(true, std::memory_order_release);
     diag::log_tagged_fmt("auth_lab", "ensure_legacy_provider_loaded success");
     return true;
@@ -351,11 +445,84 @@ std::vector<uint8_t> random_bytes(size_t n)
     return out;
 }
 
+struct url_log_t
+{
+    std::string scheme;
+    std::string host;
+    std::string path;
+    uint16_t port = 0;
+    bool has_query = false;
+    size_t length = 0;
+};
+
+url_log_t summarize_url_for_log(const std::string& url)
+{
+    url_log_t out;
+    out.length = url.size();
+    size_t schema_end = url.find("://");
+    size_t cursor = 0;
+    if (schema_end != std::string::npos)
+    {
+        out.scheme = ascii_lower(url.substr(0, schema_end));
+        cursor = schema_end + 3;
+    }
+    size_t path_start = url.find('/', cursor);
+    size_t auth_end = path_start == std::string::npos ? url.find_first_of("?#", cursor) : path_start;
+    if (auth_end == std::string::npos) auth_end = url.size();
+    std::string authority = auth_end > cursor ? url.substr(cursor, auth_end - cursor) : std::string();
+    size_t colon = authority.find(':');
+    out.host = colon == std::string::npos ? authority : authority.substr(0, colon);
+    if (colon != std::string::npos)
+    {
+        int v = 0;
+        for (char c : authority.substr(colon + 1))
+        {
+            if (c < '0' || c > '9') { v = 0; break; }
+            v = v * 10 + (c - '0');
+        }
+        if (v > 0 && v <= 65535) out.port = static_cast<uint16_t>(v);
+    }
+    if (out.port == 0) out.port = out.scheme == "http" ? 80 : 443;
+    out.has_query = url.find('?', cursor) != std::string::npos;
+    size_t path_end = url.size();
+    size_t q = url.find('?', cursor);
+    size_t f = url.find('#', cursor);
+    if (q != std::string::npos) path_end = q;
+    if (f != std::string::npos && f < path_end) path_end = f;
+    if (path_start != std::string::npos && path_start < path_end) out.path = url.substr(path_start, path_end - path_start);
+    if (out.path.empty()) out.path = "/";
+    if (out.host.empty()) out.host = "<missing>";
+    if (out.path.size() > 240)
+    {
+        out.path.resize(240);
+        out.path += "...";
+    }
+    return out;
+}
+
 bool http_post_form(const std::string& token_endpoint,
                     const std::vector<std::pair<std::string, std::string>>& form,
                     std::string& body_out)
 {
     body_out.clear();
+    const url_log_t endpoint_log = summarize_url_for_log(token_endpoint);
+    bool has_client_id = false;
+    bool has_code = false;
+    bool has_redirect_uri = false;
+    bool has_code_verifier = false;
+    bool has_refresh_token = false;
+    for (const auto& kv : form)
+    {
+        if (kv.first == "client_id") has_client_id = !kv.second.empty();
+        else if (kv.first == "code") has_code = !kv.second.empty();
+        else if (kv.first == "redirect_uri") has_redirect_uri = !kv.second.empty();
+        else if (kv.first == "code_verifier") has_code_verifier = !kv.second.empty();
+        else if (kv.first == "refresh_token") has_refresh_token = !kv.second.empty();
+    }
+    diag::log_tagged_fmt("auth_lab", "http_post_form entry scheme=%s host=%s port=%u path=%s query=%d fields=%zu has_client_id=%d has_code=%d has_redirect_uri=%d has_verifier=%d has_refresh=%d endpoint_len=%zu",
+        endpoint_log.scheme.c_str(), endpoint_log.host.c_str(), static_cast<unsigned>(endpoint_log.port), endpoint_log.path.c_str(),
+        (int)endpoint_log.has_query, form.size(), (int)has_client_id, (int)has_code, (int)has_redirect_uri,
+        (int)has_code_verifier, (int)has_refresh_token, endpoint_log.length);
     std::string scheme, host, path;
     uint16_t port = 0;
     bool is_https = false;
@@ -363,6 +530,7 @@ bool http_post_form(const std::string& token_endpoint,
         std::string u = token_endpoint;
         size_t schema_end = u.find("://");
         if (schema_end == std::string::npos) {
+            diag::log_tagged_fmt("auth_lab", "http_post_form invalid_endpoint endpoint_len=%zu", token_endpoint.size());
             set_err("invalid token endpoint");
             return false;
         }
@@ -392,31 +560,40 @@ bool http_post_form(const std::string& token_endpoint,
         body.push_back('=');
         body.append(url_encode(form[i].second));
     }
-
-    std::string origin = (is_https ? "https://" : "http://") + host + ":" + std::to_string(port);
-    httplib::Client cli(origin);
-    cli.set_connection_timeout(15, 0);
-    cli.set_read_timeout(20, 0);
-    cli.set_write_timeout(20, 0);
-    cli.enable_server_certificate_verification(true);
-    cli.set_follow_location(false);
+    diag::log_tagged_fmt("auth_lab", "http_post_form body_built body_len=%zu host=%s path=%s", body.size(), host.c_str(), endpoint_log.path.c_str());
 
     httplib::Headers headers = {
         { "Content-Type", "application/x-www-form-urlencoded" },
         { "Accept", "application/json" },
         { "User-Agent", "AiDA-AuthLab/1.0" }
     };
-    auto res = cli.Post(path, headers, body, "application/x-www-form-urlencoded");
-    if (!res) {
-        set_err("http_post_form: no response");
-        return false;
+    std::string origin = (is_https ? "https://" : "http://") + host + ":" + std::to_string(port);
+    std::string last_transport_error;
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        httplib::Client cli(origin);
+        cli.set_connection_timeout(15, 0);
+        cli.set_read_timeout(20, 0);
+        cli.set_write_timeout(20, 0);
+        cli.enable_server_certificate_verification(true);
+        cli.set_follow_location(false);
+        auto res = cli.Post(path, headers, body, "application/x-www-form-urlencoded");
+        if (res) {
+            body_out = res->body;
+            diag::log_tagged_fmt("auth_lab", "http_post_form response attempt=%d status=%d response_len=%zu host=%s path=%s",
+                attempt, res->status, body_out.size(), host.c_str(), endpoint_log.path.c_str());
+            if (res->status < 200 || res->status >= 300) {
+                set_err("http_post_form: HTTP " + std::to_string(res->status));
+                return false;
+            }
+            return true;
+        }
+        last_transport_error = httplib::to_string(res.error());
+        diag::log_tagged_fmt("auth_lab", "http_post_form no_response attempt=%d host=%s port=%u path=%s body_len=%zu err=%s",
+            attempt, host.c_str(), static_cast<unsigned>(port), endpoint_log.path.c_str(), body.size(), last_transport_error.c_str());
+        Sleep(static_cast<DWORD>(25 * attempt));
     }
-    body_out = res->body;
-    if (res->status < 200 || res->status >= 300) {
-        set_err("http_post_form: HTTP " + std::to_string(res->status));
-        return false;
-    }
-    return true;
+    set_err(last_transport_error.empty() ? "http_post_form: no response" : ("http_post_form: no response (" + last_transport_error + ")"));
+    return false;
 }
 
 }
@@ -670,11 +847,7 @@ std::string ntlm_type3(const std::string& type2_b64,
         target_info.assign(t2 + target_info_off, t2 + target_info_off + target_info_len);
     }
 
-    if (!ensure_legacy_provider_loaded()) {
-        diag::log_tagged_fmt("auth_lab", "ntlm_type3 error legacy_provider_unavailable");
-        set_err("ntlm_type3: legacy provider unavailable for MD4");
-        return std::string();
-    }
+    (void)ensure_legacy_provider_loaded();
 
     std::vector<uint8_t> pass_utf16 = utf16le(pass);
     std::vector<uint8_t> ntlm_hash;
@@ -847,8 +1020,11 @@ std::string oauth2_build_auth_url(const std::string& authorize_endpoint,
                                   const std::string& state,
                                   const std::string& code_challenge)
 {
-    diag::log_tagged_fmt("auth_lab", "oauth2_build_auth_url entry endpoint=%s client_id=%s scope=%s has_pkce=%d",
-        authorize_endpoint.c_str(), client_id.c_str(), scope.c_str(), !code_challenge.empty());
+    const url_log_t endpoint_log = summarize_url_for_log(authorize_endpoint);
+    diag::log_tagged_fmt("auth_lab", "oauth2_build_auth_url entry host=%s port=%u path=%s query=%d endpoint_len=%zu client_id_len=%zu scope_len=%zu redirect_uri_len=%zu has_state=%d has_pkce=%d",
+        endpoint_log.host.c_str(), static_cast<unsigned>(endpoint_log.port), endpoint_log.path.c_str(),
+        (int)endpoint_log.has_query, endpoint_log.length, client_id.size(), scope.size(),
+        redirect_uri.size(), (int)!state.empty(), !code_challenge.empty());
     std::string out = authorize_endpoint;
     out += (authorize_endpoint.find('?') == std::string::npos) ? "?" : "&";
     out += "response_type=code";
@@ -873,8 +1049,11 @@ bool oauth2_exchange_code(const std::string& token_endpoint,
                           std::string& refresh_token,
                           int& expires_in)
 {
-    diag::log_tagged_fmt("auth_lab", "oauth2_exchange_code entry endpoint=%s client_id=%s has_verifier=%d",
-        token_endpoint.c_str(), client_id.c_str(), !code_verifier.empty());
+    const url_log_t endpoint_log = summarize_url_for_log(token_endpoint);
+    diag::log_tagged_fmt("auth_lab", "oauth2_exchange_code entry host=%s port=%u path=%s query=%d endpoint_len=%zu client_id_len=%zu code_len=%zu redirect_uri_len=%zu has_verifier=%d",
+        endpoint_log.host.c_str(), static_cast<unsigned>(endpoint_log.port), endpoint_log.path.c_str(),
+        (int)endpoint_log.has_query, endpoint_log.length, client_id.size(), code.size(),
+        redirect_uri.size(), !code_verifier.empty());
     access_token.clear();
     refresh_token.clear();
     expires_in = 0;
@@ -886,7 +1065,8 @@ bool oauth2_exchange_code(const std::string& token_endpoint,
     if (!code_verifier.empty()) form.emplace_back("code_verifier", code_verifier);
     std::string body;
     if (!http_post_form(token_endpoint, form, body)) {
-        diag::log_tagged_fmt("auth_lab", "oauth2_exchange_code error http_post_failed endpoint=%s", token_endpoint.c_str());
+        diag::log_tagged_fmt("auth_lab", "oauth2_exchange_code error http_post_failed host=%s path=%s",
+            endpoint_log.host.c_str(), endpoint_log.path.c_str());
         return false;
     }
     diag::log_tagged_fmt("auth_lab", "oauth2_exchange_code http_ok body_len=%zu parsing_response", body.size());
@@ -914,8 +1094,10 @@ bool oauth2_refresh(const std::string& token_endpoint,
                     std::string& access_token,
                     int& expires_in)
 {
-    diag::log_tagged_fmt("auth_lab", "oauth2_refresh entry endpoint=%s client_id=%s refresh_token_len=%zu",
-        token_endpoint.c_str(), client_id.c_str(), refresh_token.size());
+    const url_log_t endpoint_log = summarize_url_for_log(token_endpoint);
+    diag::log_tagged_fmt("auth_lab", "oauth2_refresh entry host=%s port=%u path=%s query=%d endpoint_len=%zu client_id_len=%zu refresh_token_len=%zu",
+        endpoint_log.host.c_str(), static_cast<unsigned>(endpoint_log.port), endpoint_log.path.c_str(),
+        (int)endpoint_log.has_query, endpoint_log.length, client_id.size(), refresh_token.size());
     access_token.clear();
     expires_in = 0;
     std::vector<std::pair<std::string, std::string>> form;
@@ -924,7 +1106,8 @@ bool oauth2_refresh(const std::string& token_endpoint,
     form.emplace_back("refresh_token", refresh_token);
     std::string body;
     if (!http_post_form(token_endpoint, form, body)) {
-        diag::log_tagged_fmt("auth_lab", "oauth2_refresh error http_post_failed endpoint=%s", token_endpoint.c_str());
+        diag::log_tagged_fmt("auth_lab", "oauth2_refresh error http_post_failed host=%s path=%s",
+            endpoint_log.host.c_str(), endpoint_log.path.c_str());
         return false;
     }
     diag::log_tagged_fmt("auth_lab", "oauth2_refresh http_ok body_len=%zu parsing_response", body.size());
@@ -1032,6 +1215,8 @@ std::string saml_decode_request(const std::string& saml_b64)
         }
         urldecoded = tmp;
     }
+    diag::log_tagged_fmt("auth_lab", "saml_decode_request url_decoded_len=%zu had_url_encoding=%d",
+        urldecoded.size(), (int)(urldecoded.size() != saml_b64.size() || saml_b64.find('%') != std::string::npos));
     std::string raw;
     if (!base64_decode_internal(urldecoded, raw)) {
         diag::log_tagged_fmt("auth_lab", "saml_decode_request error b64_decode_failed");
@@ -1043,6 +1228,7 @@ std::string saml_decode_request(const std::string& saml_b64)
     inflated.reserve(raw.size() * 4 + 32);
     z_stream strm{};
     if (inflateInit2(&strm, -15) != Z_OK) {
+        diag::log_tagged_fmt("auth_lab", "saml_decode_request inflate_init_failed raw_len=%zu using_raw_xml", raw.size());
         return pretty_xml(raw);
     }
     strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(raw.data()));
@@ -1055,6 +1241,7 @@ std::string saml_decode_request(const std::string& saml_b64)
         ret = inflate(&strm, Z_NO_FLUSH);
         if (ret == Z_NEED_DICT || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
             inflateEnd(&strm);
+            diag::log_tagged_fmt("auth_lab", "saml_decode_request inflate_failed ret=%d raw_len=%zu using_raw_xml", ret, raw.size());
             return pretty_xml(raw);
         }
         const size_t produced = sizeof(chunk) - strm.avail_out;

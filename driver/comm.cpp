@@ -1978,6 +1978,27 @@ std::uint64_t voyager::device_t::virtual_to_physical(std::uint64_t virtual_addre
     return req.physical_address;
 }
 
+bool voyager::device_t::query_ssdt(ssdt_info& info) noexcept {
+    std::memset(&info, 0, sizeof(info));
+    if (!is_connected()) {
+        return false;
+    }
+
+    voyager::detail::ssdt_query_request req{};
+    if (!send_request(ioctl_codes::SSDT(), &req, sizeof(req))) {
+        return false;
+    }
+
+    info.lstar = req.lstar;
+    info.descriptor_address = req.descriptor_address;
+    info.service_table = req.service_table;
+    info.counter_table = req.counter_table;
+    info.argument_table = req.argument_table;
+    info.service_limit = req.service_limit;
+    info.flags = req.flags;
+    return info.descriptor_address != 0 && info.service_table != 0 && info.service_limit != 0;
+}
+
 bool voyager::device_t::set_hardware_breakpoint(std::uint32_t tid, int index, std::uint64_t address, int type, int size) noexcept {
     if (!is_connected() || process_id_ == 0 || tid == 0 || index < 0 || index > 3) {
         return false;

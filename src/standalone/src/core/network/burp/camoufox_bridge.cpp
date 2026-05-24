@@ -25,6 +25,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -48,7 +49,6 @@ struct singleton_t
     std::atomic<uint64_t>                   total_calls{0};
     std::atomic<uint64_t>                   total_errors{0};
     bool                                    browser_open       = false;
-    bool                                    setup_launch_pending = false;
     std::string                             active_page_url;
     std::string                             cached_python_path;
     launch_config_t                         active_cfg;
@@ -91,6 +91,91 @@ bool path_exists_w(const std::wstring& path)
 {
     DWORD attr = GetFileAttributesW(path.c_str());
     return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+std::wstring parent_dir_w(const std::wstring& path)
+{
+    size_t pos = path.find_last_of(L"\\/");
+    if (pos == std::wstring::npos) return {};
+    return path.substr(0, pos);
+}
+
+std::wstring join_path_w(const std::wstring& a, const std::wstring& b)
+{
+    if (a.empty()) return b;
+    if (b.empty()) return a;
+    wchar_t last = a.back();
+    if (last == L'\\' || last == L'/') return a + b;
+    return a + L"\\" + b;
+}
+
+bool append_unique_path(std::vector<std::wstring>& paths, const std::wstring& path)
+{
+    if (path.empty()) return false;
+    for (const auto& existing : paths)
+    {
+        if (_wcsicmp(existing.c_str(), path.c_str()) == 0) return false;
+    }
+    paths.push_back(path);
+    return true;
+}
+
+std::wstring executable_dir_w()
+{
+    std::vector<wchar_t> buffer(MAX_PATH);
+    for (;;)
+    {
+        DWORD got = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (got == 0) return {};
+        if (got < buffer.size())
+            return parent_dir_w(std::wstring(buffer.data(), got));
+        buffer.resize(buffer.size() * 2);
+        if (buffer.size() > 32768) return {};
+    }
+}
+
+std::wstring current_dir_w()
+{
+    DWORD need = GetCurrentDirectoryW(0, nullptr);
+    if (need == 0) return {};
+    std::wstring out;
+    out.resize(need);
+    DWORD got = GetCurrentDirectoryW(need, out.data());
+    if (got == 0 || got >= need) return {};
+    out.resize(got);
+    return out;
+}
+
+std::vector<std::wstring> runtime_base_dirs()
+{
+    std::vector<std::wstring> bases;
+    std::wstring exe_dir = executable_dir_w();
+    append_unique_path(bases, exe_dir);
+    append_unique_path(bases, current_dir_w());
+    append_unique_path(bases, parent_dir_w(exe_dir));
+    return bases;
+}
+
+void append_bundled_python_candidates(std::vector<std::string>& candidates)
+{
+    std::vector<std::wstring> rels = {
+        L"python\\python.exe",
+        L"python-3.12\\python.exe",
+        L"Python312\\python.exe",
+        L"runtime\\python\\python.exe",
+        L"deps\\python\\python.exe",
+        L"deps\\python-3.12\\python.exe",
+        L"deps\\Python312\\python.exe"
+    };
+    for (const auto& base : runtime_base_dirs())
+    {
+        for (const auto& rel : rels)
+        {
+            std::wstring candidate = join_path_w(base, rel);
+            if (path_exists_w(candidate))
+                candidates.push_back(wide_to_utf8(candidate));
+        }
+    }
 }
 
 bool try_search_path(const wchar_t* exe_name, std::string& out_path)
@@ -196,6 +281,9 @@ bool spawn_capture(const std::string& cmdline, DWORD timeout_ms, DWORD& out_exit
     CloseHandle(wr);
     if (!ok)
     {
+        DWORD gle = GetLastError();
+        diag::log_tagged_fmt("camoufox", "spawn_capture create_failed gle=%lu cmd_len=%zu timeout_ms=%lu",
+            gle, cmdline.size(), static_cast<unsigned long>(timeout_ms));
         CloseHandle(rd);
         return false;
     }
@@ -219,6 +307,8 @@ bool spawn_capture(const std::string& cmdline, DWORD timeout_ms, DWORD& out_exit
         if (timeout_ms != INFINITE && elapsed >= timeout_ms)
         {
             TerminateProcess(pi.hProcess, 1);
+            diag::log_tagged_fmt("camoufox", "spawn_capture timeout elapsed_ms=%lu cmd_len=%zu captured_len=%zu",
+                static_cast<unsigned long>(elapsed), cmdline.size(), out_stdout.size());
             CloseHandle(pi.hProcess);
             CloseHandle(rd);
             return false;
@@ -233,6 +323,8 @@ bool spawn_capture(const std::string& cmdline, DWORD timeout_ms, DWORD& out_exit
         out_stdout.append(buf, buf + got);
     }
     GetExitCodeProcess(pi.hProcess, &out_exit_code);
+    diag::log_tagged_fmt("camoufox", "spawn_capture exit code=%lu cmd_len=%zu captured_len=%zu",
+        out_exit_code, cmdline.size(), out_stdout.size());
     CloseHandle(pi.hProcess);
     CloseHandle(rd);
     return true;
@@ -252,6 +344,78 @@ std::string compact_child_output(std::string s, size_t limit = 1600)
         s += "...";
     }
     return s;
+}
+
+const char* json_type_name(const nlohmann::json& j)
+{
+    if (j.is_object()) return "object";
+    if (j.is_array()) return "array";
+    if (j.is_string()) return "string";
+    if (j.is_boolean()) return "boolean";
+    if (j.is_number()) return "number";
+    if (j.is_null()) return "null";
+    return "other";
+}
+
+std::string json_shape(const nlohmann::json& j, size_t max_keys = 12)
+{
+    std::ostringstream oss;
+    oss << json_type_name(j);
+    if (j.is_object())
+    {
+        oss << "{";
+        size_t n = 0;
+        for (auto it = j.begin(); it != j.end() && n < max_keys; ++it, ++n)
+        {
+            if (n) oss << ",";
+            oss << it.key() << ":" << json_type_name(it.value());
+        }
+        if (j.size() > max_keys) oss << ",...";
+        oss << "}";
+    }
+    else if (j.is_array())
+    {
+        oss << "[" << j.size() << "]";
+    }
+    return oss.str();
+}
+
+struct url_log_t
+{
+    std::string host;
+    std::string path;
+    bool has_query = false;
+    bool has_fragment = false;
+    size_t length = 0;
+};
+
+url_log_t summarize_url_for_log(const std::string& url)
+{
+    url_log_t out;
+    out.length = url.size();
+    size_t host_start = 0;
+    size_t scheme = url.find("://");
+    if (scheme != std::string::npos) host_start = scheme + 3;
+    size_t host_end = url.find_first_of("/?#", host_start);
+    if (host_end == std::string::npos) host_end = url.size();
+    if (host_end > host_start) out.host = url.substr(host_start, host_end - host_start);
+    size_t path_start = url.find('/', host_start);
+    size_t query_pos = url.find('?', host_start);
+    size_t frag_pos = url.find('#', host_start);
+    out.has_query = query_pos != std::string::npos;
+    out.has_fragment = frag_pos != std::string::npos;
+    size_t path_end = url.size();
+    if (query_pos != std::string::npos) path_end = query_pos;
+    if (frag_pos != std::string::npos && frag_pos < path_end) path_end = frag_pos;
+    if (path_start != std::string::npos && path_start < path_end) out.path = url.substr(path_start, path_end - path_start);
+    if (out.path.empty()) out.path = "/";
+    if (out.path.size() > 240)
+    {
+        out.path.resize(240);
+        out.path += "...";
+    }
+    if (out.host.empty()) out.host = "<relative>";
+    return out;
 }
 
 bool query_python_version(const std::string& python_path, int& major, int& minor, std::string& detail)
@@ -370,6 +534,8 @@ call_result_t to_bridge_result(const mcp_client::call_result_t& r)
         out.ok    = false;
         out.error = out.data["error"].get<std::string>();
     }
+    diag::log_tagged_fmt("camoufox", "mcp_result_shape success=%d text_len=%zu data_shape=%s error_len=%zu",
+        static_cast<int>(r.success), r.text.size(), json_shape(out.data).c_str(), out.error.size());
     return out;
 }
 
@@ -383,7 +549,14 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         if (sg().state != bridge_state_t::ready || !sg().client)
         {
-            fail.error = "camoufox bridge not ready";
+            fail.error = sg().last_error;
+            if (fail.error.empty())
+                fail.error = sg().state == bridge_state_t::stopped
+                    ? "camoufox bridge is not running; call burp_headless_start with headless=false first"
+                    : "camoufox bridge not ready";
+            diag::log_tagged_fmt("camoufox", "call_with_deadline rejected tool=%s state=%d client=%d err_len=%zu args_shape=%s",
+                tool_name.c_str(), static_cast<int>(sg().state), static_cast<int>(sg().client != nullptr),
+                fail.error.size(), json_shape(args).c_str());
             return fail;
         }
         cli = sg().client;
@@ -402,6 +575,8 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
 
     const uint64_t t0 = now_ms();
     sg().total_calls.fetch_add(1, std::memory_order_relaxed);
+    diag::log_tagged_fmt("camoufox", "call_with_deadline dispatch tool=%s timeout_ms=%d args_shape=%s",
+        tool_name.c_str(), timeout_ms, json_shape(args).c_str());
 
     bool posted = work_queue::post([state, cli, tool_name, args]() {
         mcp_client::call_result_t r = cli->call_tool(tool_name, args);
@@ -417,6 +592,7 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
     {
         fail.error = "work_queue::post failed";
         sg().total_errors.fetch_add(1, std::memory_order_relaxed);
+        diag::log_tagged_fmt("camoufox", "call_with_deadline post_failed tool=%s", tool_name.c_str());
         return fail;
     }
 
@@ -455,6 +631,9 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
     if (!out.ok) sg().total_errors.fetch_add(1, std::memory_order_relaxed);
     bridge_call_completed_t ev{tool_name, out.ok, now_ms() - t0};
     aida::events::publish(kBridgeCallCompleted, ev);
+    diag::log_tagged_fmt("camoufox", "call_with_deadline complete tool=%s ok=%d elapsed_ms=%llu data_shape=%s error_len=%zu",
+        tool_name.c_str(), static_cast<int>(out.ok), static_cast<unsigned long long>(ev.duration_ms),
+        json_shape(out.data).c_str(), out.error.size());
     return out;
 }
 
@@ -476,20 +655,24 @@ bool wait_for_tool_listed(mcp_client::client_t* cli, const std::string& tool_nam
 bool probe_module_installed_locked(const std::string& python_path)
 {
     std::string cmdline = std::string("\"") + python_path + "\" -c \"import camoufox_reverse_mcp\"";
+    diag::log_tagged_fmt("camoufox", "module_probe start python=%s module=camoufox_reverse_mcp", python_path.c_str());
     DWORD code = 0;
     std::string captured;
     if (!spawn_capture(cmdline, 3000, code, captured))
     {
-        sg().last_error = "camoufox_reverse_mcp not installed; run: pip install -e C:/Users/ruar1337/AiDAPrivate/camoufox-reverse-mcp";
+        sg().last_error = "camoufox_reverse_mcp not installed and automatic setup did not complete";
         diag::log_tagged("camoufox", sg().last_error.c_str());
         return false;
     }
     if (code != 0)
     {
-        sg().last_error = "camoufox_reverse_mcp not installed; run: pip install -e C:/Users/ruar1337/AiDAPrivate/camoufox-reverse-mcp";
-        diag::log_tagged_fmt("camoufox", "module probe exit=%lu out=%.200s", code, captured.c_str());
+        sg().last_error = "camoufox_reverse_mcp not installed and automatic setup did not complete";
+        const std::string detail = compact_child_output(captured, 400);
+        diag::log_tagged_fmt("camoufox", "module_probe failed exit=%lu captured_len=%zu out=%.400s",
+            code, captured.size(), detail.c_str());
         return false;
     }
+    diag::log_tagged_fmt("camoufox", "module_probe ok exit=%lu captured_len=%zu", code, captured.size());
     return true;
 }
 
@@ -501,6 +684,7 @@ bool preflight_server_entry_locked(const std::string& python_path, const launch_
         cmdline = std::string("\"") + python_path + "\" -m camoufox_reverse_mcp --help";
     else
         cmdline = std::string("\"") + python_path + "\" -c \"import importlib; importlib.import_module('" + module + "')\"";
+    diag::log_tagged_fmt("camoufox", "server_preflight start python=%s module=%s", python_path.c_str(), module.c_str());
 
     DWORD code = 0;
     std::string captured;
@@ -518,69 +702,11 @@ bool preflight_server_entry_locked(const std::string& python_path, const launch_
             module.c_str(), code, detail.c_str());
         return false;
     }
-    diag::log_tagged_fmt("camoufox", "server preflight ok module=%s", module.c_str());
+    diag::log_tagged_fmt("camoufox", "server preflight ok module=%s captured_len=%zu", module.c_str(), captured.size());
     return true;
 }
 
-bool is_auto_setup_message(const std::string& msg)
-{
-    return msg.find("Camoufox setup") != std::string::npos ||
-           msg.find("camoufox setup") != std::string::npos;
-}
-
-bool queue_setup_for_launch_locked(const launch_config_t& cfg)
-{
-    if (sg().setup_launch_pending)
-    {
-        sg().last_error = "Camoufox setup is already running; browser will open automatically when setup finishes";
-        return true;
-    }
-
-    sg().setup_launch_pending = true;
-    launch_config_t cfg_copy = cfg;
-    bool posted = work_queue::post([cfg_copy]() {
-        std::string log;
-        bool ready = false;
-        try { ready = install::ensure_ready(log); } catch (...) { ready = false; }
-        if (!ready)
-        {
-            std::string err = install::last_error();
-            if (err.empty()) err = "Camoufox automatic setup failed";
-            {
-                std::lock_guard<std::recursive_mutex> lk(sg().mtx);
-                sg().setup_launch_pending = false;
-                sg().state = bridge_state_t::error;
-                sg().last_error = err;
-                sg().browser_open = false;
-                sg().active_page_url.clear();
-            }
-            publish_state(bridge_state_t::error, err);
-            diag::log_tagged_fmt("camoufox", "automatic setup failed err=%s", err.c_str());
-            return;
-        }
-
-        {
-            std::lock_guard<std::recursive_mutex> lk(sg().mtx);
-            sg().setup_launch_pending = false;
-            sg().state = bridge_state_t::stopped;
-            sg().last_error.clear();
-        }
-        diag::log_tagged_fmt("camoufox", "automatic setup ready; launching visible browser");
-        start_bridge(cfg_copy);
-    });
-
-    if (!posted)
-    {
-        sg().setup_launch_pending = false;
-        sg().last_error = "Camoufox setup could not be queued";
-        return false;
-    }
-
-    sg().last_error = "Camoufox setup started automatically; browser will open automatically when setup finishes";
-    return true;
-}
-
-bool prepare_install_for_launch_locked(std::string& python_path, const launch_config_t& cfg)
+bool prepare_install_for_launch_locked(std::string& python_path)
 {
     install::status_t st = install::get_status();
     if (st.state == install::install_state_t::unknown ||
@@ -588,31 +714,33 @@ bool prepare_install_for_launch_locked(std::string& python_path, const launch_co
         st = install::probe();
     if (!st.python_path.empty()) python_path = st.python_path;
 
-    if (st.state == install::install_state_t::missing_module)
-    {
-        bool posted = queue_setup_for_launch_locked(cfg);
-        diag::log_tagged_fmt("camoufox", "prepare_install_for_launch queued_auto_setup posted=%d state=%d err=%s",
-            static_cast<int>(posted), static_cast<int>(st.state), sg().last_error.c_str());
-        return false;
-    }
-
-    if (st.state == install::install_state_t::missing_browser ||
-        st.state == install::install_state_t::available ||
-        st.state == install::install_state_t::install_failed)
-    {
-        bool posted = queue_setup_for_launch_locked(cfg);
-        diag::log_tagged_fmt("camoufox", "prepare_install_for_launch queued_auto_fetch posted=%d state=%d err=%s",
-            static_cast<int>(posted), static_cast<int>(st.state), sg().last_error.c_str());
-        return false;
-    }
-
     if (st.state != install::install_state_t::ok)
     {
-        sg().last_error = st.last_message.empty() ? install::last_error() : st.last_message;
-        if (sg().last_error.empty()) sg().last_error = "camoufox dependency chain is not ready";
-        diag::log_tagged_fmt("camoufox", "prepare_install_for_launch failed state=%d err=%s",
-            static_cast<int>(st.state), sg().last_error.c_str());
-        return false;
+        if (st.state == install::install_state_t::missing_python)
+        {
+            sg().last_error = st.last_message.empty() ? install::last_error() : st.last_message;
+            if (sg().last_error.empty()) sg().last_error = "supported Python 3.10-3.13 interpreter not found for Camoufox";
+            diag::log_tagged_fmt("camoufox", "prepare_install_for_launch missing_python err=%s", sg().last_error.c_str());
+            return false;
+        }
+
+        std::string setup_log;
+        bool ready = false;
+        try { ready = install::ensure_ready(setup_log); } catch (...) { ready = false; }
+        st = install::get_status();
+        if (!st.python_path.empty()) python_path = st.python_path;
+        if (!ready || st.state != install::install_state_t::ok)
+        {
+            sg().last_error = install::last_error();
+            if (sg().last_error.empty()) sg().last_error = st.last_message;
+            if (sg().last_error.empty()) sg().last_error = "camoufox dependency setup did not reach ready state";
+            const std::string detail = compact_child_output(setup_log);
+            if (!detail.empty() && sg().last_error.find(detail) == std::string::npos)
+                sg().last_error += ": " + detail;
+            diag::log_tagged_fmt("camoufox", "prepare_install_for_launch setup_failed state=%d err=%s",
+                static_cast<int>(st.state), sg().last_error.c_str());
+            return false;
+        }
     }
     return true;
 }
@@ -650,6 +778,7 @@ bool ensure_python_available(std::string& out_python_path)
         sg().cached_python_path.clear();
     }
     std::vector<std::string> candidates;
+    append_bundled_python_candidates(candidates);
     std::string found;
     if (try_search_path(L"python.exe", found)) candidates.push_back(found);
     found.clear();
@@ -696,12 +825,8 @@ bool start_bridge(const launch_config_t& cfg)
     }
     if (sg().state == bridge_state_t::starting)
     {
-        diag::log_tagged_fmt("camoufox", "start_bridge already_starting rejected setup=%d",
-            sg().setup_launch_pending ? 1 : 0);
-        if (sg().setup_launch_pending)
-            set_error_locked("Camoufox setup is already running; browser will open automatically when setup finishes");
-        else
-            set_error_locked("camoufox bridge already starting");
+        diag::log_tagged_fmt("camoufox", "start_bridge already_starting rejected");
+        set_error_locked("camoufox bridge already starting");
         return false;
     }
     diag::log_tagged_fmt("camoufox", "start_bridge state->starting");
@@ -725,24 +850,25 @@ bool start_bridge(const launch_config_t& cfg)
     {
         if (!ensure_python_available(python_path))
         {
-            sg().state = bridge_state_t::error;
-            publish_state(bridge_state_t::error, sg().last_error);
-            return false;
+            std::string setup_log;
+            bool ready = false;
+            try { ready = install::ensure_ready(setup_log); } catch (...) { ready = false; }
+            if (!ready || !ensure_python_available(python_path))
+            {
+                sg().last_error = install::last_error();
+                if (sg().last_error.empty()) sg().last_error = compact_child_output(setup_log);
+                if (sg().last_error.empty()) sg().last_error = "supported Python 3.10-3.13 interpreter not found for Camoufox";
+                sg().state = bridge_state_t::error;
+                publish_state(bridge_state_t::error, sg().last_error);
+                return false;
+            }
         }
     }
 
-    if (!prepare_install_for_launch_locked(python_path, effective_cfg))
+    if (!prepare_install_for_launch_locked(python_path))
     {
-        if (sg().setup_launch_pending || is_auto_setup_message(sg().last_error))
-        {
-            sg().state = bridge_state_t::starting;
-            publish_state(bridge_state_t::starting, sg().last_error);
-        }
-        else
-        {
-            sg().state = bridge_state_t::error;
-            publish_state(bridge_state_t::error, sg().last_error);
-        }
+        sg().state = bridge_state_t::error;
+        publish_state(bridge_state_t::error, sg().last_error);
         return false;
     }
 
@@ -883,8 +1009,20 @@ bool ensure_ready()
         st = install::probe();
     if (st.state == install::install_state_t::missing_python)
     {
-        diag::log_tagged_fmt("camoufox", "ensure_ready install_not_ready state=%d", static_cast<int>(st.state));
-        return false;
+        std::string setup_log;
+        bool setup_ready = false;
+        try { setup_ready = install::ensure_ready(setup_log); } catch (...) { setup_ready = false; }
+        st = install::get_status();
+        if (!setup_ready || st.state != install::install_state_t::ok)
+        {
+            std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+            sg().last_error = install::last_error();
+            if (sg().last_error.empty()) sg().last_error = compact_child_output(setup_log);
+            if (sg().last_error.empty()) sg().last_error = "camoufox dependency setup did not reach ready state";
+            diag::log_tagged_fmt("camoufox", "ensure_ready install_not_ready state=%d err=%s",
+                static_cast<int>(st.state), sg().last_error.c_str());
+            return false;
+        }
     }
     diag::log_tagged_fmt("camoufox", "ensure_ready starting_bridge python=%s", st.python_path.c_str());
     launch_config_t cfg;
@@ -907,18 +1045,21 @@ bridge_status_t get_status()
     s.total_errors    = sg().total_errors.load(std::memory_order_relaxed);
     s.browser_open    = sg().browser_open;
     s.active_page_url = sg().active_page_url;
-    diag::log_tagged_fmt("camoufox", "get_status state=%d browser_open=%d calls=%llu errors=%llu url=%s",
+    const url_log_t u = summarize_url_for_log(s.active_page_url);
+    diag::log_tagged_fmt("camoufox", "get_status state=%d browser_open=%d calls=%llu errors=%llu active_host=%s active_path=%s query=%d url_len=%zu",
         static_cast<int>(s.state), static_cast<int>(s.browser_open),
         static_cast<unsigned long long>(s.total_calls),
-        static_cast<unsigned long long>(s.total_errors), s.active_page_url.c_str());
+        static_cast<unsigned long long>(s.total_errors), u.host.c_str(), u.path.c_str(),
+        static_cast<int>(u.has_query), u.length);
     return s;
 }
 
 call_result_t call_tool(const std::string& tool_name, const nlohmann::json& args, int timeout_ms)
 {
-    diag::log_tagged_fmt("camoufox", "call_tool entry tool=%s timeout_ms=%d", tool_name.c_str(), timeout_ms);
+    diag::log_tagged_fmt("camoufox", "call_tool entry tool=%s timeout_ms=%d args_shape=%s", tool_name.c_str(), timeout_ms, json_shape(args).c_str());
     call_result_t r = call_with_deadline(tool_name, args.is_null() ? nlohmann::json::object() : args, timeout_ms);
-    diag::log_tagged_fmt("camoufox", "call_tool result tool=%s ok=%d", tool_name.c_str(), static_cast<int>(r.ok));
+    diag::log_tagged_fmt("camoufox", "call_tool result tool=%s ok=%d data_shape=%s text_len=%zu error_len=%zu",
+        tool_name.c_str(), static_cast<int>(r.ok), json_shape(r.data).c_str(), r.text.size(), r.error.size());
     return r;
 }
 
@@ -936,8 +1077,9 @@ bool close_browser()
 
 bool navigate(const std::string& url, const std::string& wait_until, int timeout_ms)
 {
-    diag::log_tagged_fmt("camoufox", "navigate entry url=%s wait_until=%s timeout_ms=%d",
-        url.c_str(), wait_until.c_str(), timeout_ms);
+    const url_log_t u = summarize_url_for_log(url);
+    diag::log_tagged_fmt("camoufox", "navigate entry host=%s path=%s query=%d fragment=%d url_len=%zu wait_until=%s timeout_ms=%d",
+        u.host.c_str(), u.path.c_str(), static_cast<int>(u.has_query), static_cast<int>(u.has_fragment), u.length, wait_until.c_str(), timeout_ms);
     if (url.empty())
     {
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
@@ -959,7 +1101,7 @@ bool navigate(const std::string& url, const std::string& wait_until, int timeout
     call_result_t r = call_with_deadline("navigate", a, call_timeout);
     if (!r.ok)
     {
-        diag::log_tagged_fmt("camoufox", "navigate failed url=%s err=%s", url.c_str(), r.error.c_str());
+        diag::log_tagged_fmt("camoufox", "navigate failed host=%s path=%s err=%s", u.host.c_str(), u.path.c_str(), r.error.c_str());
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked(std::string("navigate failed: ") + r.error);
         return false;
@@ -968,9 +1110,11 @@ bool navigate(const std::string& url, const std::string& wait_until, int timeout
     {
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         sg().active_page_url = r.data["url"].get<std::string>();
-        diag::log_tagged_fmt("camoufox", "navigate ok final_url=%s", sg().active_page_url.c_str());
+        const url_log_t f = summarize_url_for_log(sg().active_page_url);
+        diag::log_tagged_fmt("camoufox", "navigate ok final_host=%s final_path=%s query=%d url_len=%zu",
+            f.host.c_str(), f.path.c_str(), static_cast<int>(f.has_query), f.length);
     } else {
-        diag::log_tagged_fmt("camoufox", "navigate ok url=%s", url.c_str());
+        diag::log_tagged_fmt("camoufox", "navigate ok host=%s path=%s query=%d", u.host.c_str(), u.path.c_str(), static_cast<int>(u.has_query));
     }
     return true;
 }
@@ -992,7 +1136,9 @@ bool reload(const std::string& wait_until)
     {
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         sg().active_page_url = r.data["url"].get<std::string>();
-        diag::log_tagged_fmt("camoufox", "reload ok url=%s", sg().active_page_url.c_str());
+        const url_log_t u = summarize_url_for_log(sg().active_page_url);
+        diag::log_tagged_fmt("camoufox", "reload ok host=%s path=%s query=%d url_len=%zu",
+            u.host.c_str(), u.path.c_str(), static_cast<int>(u.has_query), u.length);
     } else {
         diag::log_tagged_fmt("camoufox", "reload ok");
     }
@@ -1107,7 +1253,9 @@ call_result_t get_page_info()
     {
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         sg().active_page_url = r.data["url"].get<std::string>();
-        diag::log_tagged_fmt("camoufox", "get_page_info ok url=%s", sg().active_page_url.c_str());
+        const url_log_t u = summarize_url_for_log(sg().active_page_url);
+        diag::log_tagged_fmt("camoufox", "get_page_info ok host=%s path=%s query=%d url_len=%zu",
+            u.host.c_str(), u.path.c_str(), static_cast<int>(u.has_query), u.length);
     } else {
         diag::log_tagged_fmt("camoufox", "get_page_info ok no_url_in_result");
     }

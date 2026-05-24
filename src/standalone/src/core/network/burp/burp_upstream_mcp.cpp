@@ -42,6 +42,34 @@ json chain_json(const upstream_chain_t& c)
     return j;
 }
 
+bool json_u64(const json& j, uint64_t& out)
+{
+    if (j.is_number_unsigned())
+    {
+        out = j.get<uint64_t>();
+        return true;
+    }
+    if (j.is_number_integer())
+    {
+        int64_t v = j.get<int64_t>();
+        if (v >= 0)
+        {
+            out = static_cast<uint64_t>(v);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool json_u32(const json& j, uint32_t& out)
+{
+    uint64_t v = 0;
+    if (!json_u64(j, v) || v > 0xFFFFFFFFull)
+        return false;
+    out = static_cast<uint32_t>(v);
+    return true;
+}
+
 bool parse_hops(const json& src, std::vector<upstream_hop_t>& out, std::string& err)
 {
     if (!src.is_array()) { err = "hops_not_array"; return false; }
@@ -53,8 +81,8 @@ bool parse_hops(const json& src, std::vector<upstream_hop_t>& out, std::string& 
         if (h.type != "http_connect" && h.type != "socks5") { err = "hop_unsupported_type"; return false; }
         if (!j.contains("host") || !j["host"].is_string()) { err = "hop_missing_host"; return false; }
         h.host = j["host"].get<std::string>();
-        if (!j.contains("port") || !j["port"].is_number_unsigned()) { err = "hop_missing_port"; return false; }
-        uint32_t p = j["port"].get<uint32_t>();
+        uint32_t p = 0;
+        if (!j.contains("port") || !json_u32(j["port"], p)) { err = "hop_missing_port"; return false; }
         if (p == 0 || p > 65535) { err = "hop_bad_port"; return false; }
         h.port = static_cast<uint16_t>(p);
         if (j.contains("username") && j["username"].is_string()) h.username = j["username"].get<std::string>();
@@ -92,12 +120,12 @@ tool_result_t tool_add(const json& params)
 tool_result_t tool_remove(const json& params)
 {
     diag::log_tagged_fmt("mcp_burp", "upstream_remove entry");
-    if (!params.is_object() || !params.contains("id") || !params["id"].is_number_unsigned())
+    uint64_t id = 0;
+    if (!params.is_object() || !params.contains("id") || !json_u64(params["id"], id))
     {
         diag::log_tagged_fmt("mcp_burp", "upstream_remove missing_id");
         return tool_result_t::error("missing_id");
     }
-    uint64_t id = params["id"].get<uint64_t>();
     diag::log_tagged_fmt("mcp_burp", "upstream_remove id=%llu", static_cast<unsigned long long>(id));
     bool ok = remove_chain(id);
     diag::log_tagged_fmt("mcp_burp", "upstream_remove ok id=%llu removed=%d", static_cast<unsigned long long>(id), (int)ok);
@@ -125,12 +153,12 @@ tool_result_t tool_list(const json& params)
 tool_result_t tool_set_active(const json& params)
 {
     diag::log_tagged_fmt("mcp_burp", "upstream_set_active entry");
-    if (!params.is_object() || !params.contains("id") || !params["id"].is_number_unsigned())
+    uint64_t id = 0;
+    if (!params.is_object() || !params.contains("id") || !json_u64(params["id"], id))
     {
         diag::log_tagged_fmt("mcp_burp", "upstream_set_active missing_id");
         return tool_result_t::error("missing_id");
     }
-    uint64_t id = params["id"].get<uint64_t>();
     diag::log_tagged_fmt("mcp_burp", "upstream_set_active id=%llu", static_cast<unsigned long long>(id));
     bool ok = set_active_chain(id);
     if (!ok)
@@ -159,17 +187,17 @@ tool_result_t tool_get_active(const json& params)
 tool_result_t tool_test(const json& params)
 {
     diag::log_tagged_fmt("mcp_burp", "upstream_test entry");
+    uint64_t id = 0;
+    uint32_t port = 0;
     if (!params.is_object() ||
-        !params.contains("id") || !params["id"].is_number_unsigned() ||
+        !params.contains("id") || !json_u64(params["id"], id) ||
         !params.contains("target_host") || !params["target_host"].is_string() ||
-        !params.contains("target_port") || !params["target_port"].is_number_unsigned())
+        !params.contains("target_port") || !json_u32(params["target_port"], port))
     {
         diag::log_tagged_fmt("mcp_burp", "upstream_test missing_params");
         return tool_result_t::error("missing_id_target_host_or_target_port");
     }
-    uint64_t id = params["id"].get<uint64_t>();
     std::string host = params["target_host"].get<std::string>();
-    uint32_t port = params["target_port"].get<uint32_t>();
     diag::log_tagged_fmt("mcp_burp", "upstream_test id=%llu host=%s port=%u", static_cast<unsigned long long>(id), host.c_str(), port);
     if (port == 0 || port > 65535)
     {

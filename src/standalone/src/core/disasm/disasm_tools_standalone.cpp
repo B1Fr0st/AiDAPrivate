@@ -119,6 +119,251 @@ static const char* xref_type_label(int t)
     }
 }
 
+struct resolved_function_t
+{
+    uint64_t start = 0;
+    uint64_t end = 0;
+    std::string name;
+    std::string section;
+    std::string module;
+    std::string source;
+};
+
+static bool read_routed_process_bytes(uint64_t address, size_t size, std::vector<uint8_t>& out)
+{
+    out.clear();
+    if (size == 0)
+        return false;
+    if (function_index::detail::read_routed_bytes(address, size, out) && !out.empty())
+        return true;
+    return driver_bridge::read_memory(address, size, out) && !out.empty();
+}
+
+static bool decode_instruction_at(uint64_t address, AsmInstr& out)
+{
+    std::vector<uint8_t> bytes;
+    if (!read_routed_process_bytes(address, 16, bytes))
+        return false;
+    const int avail = static_cast<int>(std::min<size_t>(bytes.size(), 16));
+    if (avail <= 0)
+        return false;
+    out = zydis_decode_one(bytes.data(), avail, address);
+    return true;
+}
+
+static bool activate_live_disassembly_for_address(uint64_t address)
+{
+    const uint32_t attached = driver_bridge::attached_pid();
+    if (attached == 0)
+        return false;
+
+    if (g_disasm.live_mode &&
+        g_disasm.live_pid == attached &&
+        g_disasm.live_base != 0 &&
+        address >= g_disasm.live_base &&
+        address < g_disasm.live_base + g_disasm.live_size) {
+        g_disasm.live_view_addr = address;
+        g_disasm.live_floor_va = address;
+        g_disasm.live_needs_refresh = true;
+        disasm::request_live_decode(g_disasm);
+        return true;
+    }
+
+    for (const auto& mod : driver_bridge::enumerate_modules()) {
+        if (mod.base == 0 || mod.size == 0)
+            continue;
+        const uint64_t end = mod.base + static_cast<uint64_t>(mod.size);
+        if (address < mod.base || address >= end)
+            continue;
+        if (!disasm::start_live(g_disasm, attached, mod.base, mod.size, mod.name))
+            return false;
+        g_disasm.live_view_addr = address;
+        g_disasm.live_floor_va = address;
+        g_disasm.live_needs_refresh = true;
+        disasm::request_live_decode(g_disasm);
+        return true;
+    }
+
+    return false;
+}
+
+static bool section_for_address(const pe_parser::pe_info_t& pe,
+                                uint64_t module_base,
+                                uint64_t address,
+                                std::string& out_section,
+                                uint64_t& out_section_end)
+{
+    if (address < module_base)
+        return false;
+    const uint64_t rva = address - module_base;
+    for (const auto& sec : pe.sections) {
+        uint64_t sec_size = std::max<uint32_t>(sec.virtual_size, sec.raw_size);
+        if (sec_size == 0)
+            continue;
+        const uint64_t sec_start = sec.virtual_address;
+        const uint64_t sec_end = sec_start + sec_size;
+        if (rva >= sec_start && rva < sec_end) {
+            out_section = sec.name;
+            out_section_end = module_base + sec_end;
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::string export_name_for_address(const pe_parser::pe_info_t& pe, uint64_t address)
+{
+    for (const auto& exp : pe.exports) {
+        if (!exp.is_forwarded && exp.address == address && !exp.name.empty())
+            return exp.name;
+    }
+    return {};
+}
+
+static bool decode_function_end(uint64_t start, uint64_t max_end, uint64_t& out_end)
+{
+    if (max_end <= start)
+        return false;
+    const uint64_t bounded = std::min<uint64_t>(max_end - start, 4096);
+    std::vector<uint8_t> bytes;
+    if (!read_routed_process_bytes(start, static_cast<size_t>(bounded), bytes))
+        return false;
+
+    size_t off = 0;
+    int decoded = 0;
+    uint64_t last_end = start;
+    while (off < bytes.size() && decoded < 512) {
+        const int avail = static_cast<int>(std::min<size_t>(bytes.size() - off, 16));
+        if (avail <= 0)
+            break;
+        AsmInstr ins = zydis_decode_one(bytes.data() + off, avail, start + off);
+        const int ins_len = std::max(1, ins.len);
+        if (off + static_cast<size_t>(ins_len) > bytes.size())
+            break;
+        last_end = start + off + static_cast<uint64_t>(ins_len);
+        ++decoded;
+        if (ins.is_ret || std::strcmp(ins.mnem, "jmp") == 0 || std::strcmp(ins.mnem, "int3") == 0) {
+            out_end = last_end;
+            return true;
+        }
+        off += static_cast<size_t>(ins_len);
+    }
+
+    if (decoded == 0)
+        return false;
+    out_end = last_end;
+    return true;
+}
+
+static bool resolve_cached_function(uint64_t addr, resolved_function_t& out)
+{
+    auto& c = function_index::detail::cache();
+    uint64_t start = 0;
+    {
+        std::shared_lock<std::shared_mutex> lk(c.mutex);
+        auto m = c.addr_to_func_start.find(addr);
+        if (m != c.addr_to_func_start.end()) {
+            start = m->second;
+        } else {
+            auto& sorted = c.sorted_starts;
+            auto it = std::upper_bound(sorted.begin(), sorted.end(), addr);
+            if (it == sorted.begin())
+                return false;
+            --it;
+            start = *it;
+        }
+
+        auto r = c.by_start.find(start);
+        if (r == c.by_start.end())
+            return false;
+        if (addr < r->second.start || (r->second.end > 0 && addr >= r->second.end))
+            return false;
+        out.start = r->second.start;
+        out.end = r->second.end;
+        out.name = r->second.display_name.empty() ? function_index::synthetic_name(start) : r->second.display_name;
+        out.section = r->second.section;
+        out.module = c.cached_module_name;
+        out.source = "function_index";
+        return out.end > out.start;
+    }
+}
+
+static bool resolve_live_function(uint64_t addr, resolved_function_t& out)
+{
+    uint64_t module_base = 0;
+    uint32_t module_size = 0;
+    std::string module_name;
+    if (!function_index::detail::resolve_module_for_address(addr, module_base, module_size, module_name))
+        return false;
+    if (module_base == 0 || module_size == 0 || addr < module_base || addr >= module_base + module_size)
+        return false;
+
+    pe_parser::pe_info_t pe;
+    if (!pe_parser::parse(module_base, pe, false))
+        return false;
+
+    std::string section;
+    uint64_t section_end = module_base + module_size;
+    section_for_address(pe, module_base, addr, section, section_end);
+
+    std::vector<uint64_t> rf_starts;
+    std::vector<uint32_t> rf_sizes;
+    if (functions_panel::detail::read_runtime_function_table(module_base, pe, rf_starts, rf_sizes)) {
+        for (size_t i = 0; i < rf_starts.size() && i < rf_sizes.size(); ++i) {
+            const uint64_t start = rf_starts[i];
+            const uint64_t end = start + rf_sizes[i];
+            if (rf_sizes[i] == 0 || addr < start || addr >= end)
+                continue;
+            out.start = start;
+            out.end = std::min<uint64_t>(end, module_base + module_size);
+            out.name = function_index::synthetic_name(start);
+            out.section = section.empty() ? function_index::detail::section_name_for_va(pe, module_base, start) : section;
+            out.module = module_name;
+            out.source = "live_pdata";
+            return out.end > out.start;
+        }
+    }
+
+    pe_parser::parse_exports(module_base, pe, pe.exports, 4096);
+    std::string export_name = export_name_for_address(pe, addr);
+    if (export_name.empty())
+        return false;
+
+    uint64_t decoded_end = 0;
+    if (!decode_function_end(addr, section_end, decoded_end))
+        return false;
+    out.start = addr;
+    out.end = decoded_end;
+    out.name = export_name;
+    out.section = section;
+    out.module = module_name;
+    out.source = "live_export_decode";
+    return out.end > out.start;
+}
+
+static bool resolve_function_for_address(uint64_t addr, resolved_function_t& out)
+{
+    if (resolve_cached_function(addr, out))
+        return true;
+    return resolve_live_function(addr, out);
+}
+
+static json instruction_to_json(const AsmInstr& ins)
+{
+    json entry;
+    entry["address"]  = hex_u64(ins.addr);
+    entry["mnemonic"] = std::string(ins.mnem);
+    entry["operands"] = std::string(ins.ops);
+    entry["length"]   = ins.len;
+    entry["bytes"]    = bytes_to_hex(ins.raw, std::min(ins.len, 15));
+    entry["is_branch"] = ins.is_branch;
+    entry["is_call"]   = ins.is_call;
+    entry["is_ret"]    = ins.is_ret;
+    std::string c = comment_store::get(ins.addr);
+    if (!c.empty()) entry["comment"] = c;
+    return entry;
+}
+
 static tool_result_t handle_jump_to_address(const json& params)
 {
     uint64_t addr = 0;
@@ -131,9 +376,28 @@ static tool_result_t handle_jump_to_address(const json& params)
 
     int idx = find_instr_index(g_disasm.file, addr);
     if (idx < 0) {
-        diag::log_tagged_fmt("disasm_tools", "jump_to_address_not_found addr=0x%llX instrs=%zu",
-            static_cast<unsigned long long>(addr), g_disasm.file.instrs.size());
-        return tool_result_t::error("Address not found in current disassembly listing.");
+        AsmInstr live{};
+        if (!decode_instruction_at(addr, live)) {
+            diag::log_tagged_fmt("disasm_tools", "jump_to_address_not_found addr=0x%llX instrs=%zu live_decode=0",
+                static_cast<unsigned long long>(addr), g_disasm.file.instrs.size());
+            return tool_result_t::error("Address not found in current disassembly listing and live memory decode failed.");
+        }
+
+        const bool live_active = activate_live_disassembly_for_address(addr);
+        diag::log_tagged_fmt("disasm_tools", "jump_to_address_live addr=0x%llX live_active=%d mnemonic=%s len=%d",
+            static_cast<unsigned long long>(addr),
+            live_active ? 1 : 0,
+            live.mnem,
+            live.len);
+
+        globals::ui::active_center_view = center_view_t::disassembly;
+        json result;
+        result["address"] = hex_u64(addr);
+        result["row_index"] = -1;
+        result["active_center_view"] = "disassembly";
+        result["source"] = live_active ? "live_disassembly" : "live_memory_decode";
+        result["instruction"] = instruction_to_json(live);
+        return tool_result_t::ok(result);
     }
     diag::log_tagged_fmt("disasm_tools", "jump_to_address_resolved addr=0x%llX row=%d",
         static_cast<unsigned long long>(addr), idx);
@@ -160,9 +424,15 @@ static tool_result_t handle_get_instruction(const json& params)
 
     int idx = find_instr_index(g_disasm.file, addr);
     if (idx < 0) {
-        diag::log_tagged_fmt("disasm_tools", "get_instruction_not_found addr=0x%llX",
-            static_cast<unsigned long long>(addr));
-        return tool_result_t::error("Address not found in disassembly listing.");
+        AsmInstr live{};
+        if (!decode_instruction_at(addr, live)) {
+            diag::log_tagged_fmt("disasm_tools", "get_instruction_not_found addr=0x%llX",
+                static_cast<unsigned long long>(addr));
+            return tool_result_t::error("Address not found in disassembly listing and live memory decode failed.");
+        }
+        json result = instruction_to_json(live);
+        result["source"] = "live_memory";
+        return tool_result_t::ok(result);
     }
 
     const AsmInstr& ins = g_disasm.file.instrs[static_cast<size_t>(idx)];
@@ -170,17 +440,11 @@ static tool_result_t handle_get_instruction(const json& params)
         static_cast<unsigned long long>(ins.addr), ins.mnem, ins.len,
         ins.is_call ? 1 : 0, ins.is_ret ? 1 : 0);
 
-    json result;
-    result["address"]  = hex_u64(ins.addr);
-    result["mnemonic"] = std::string(ins.mnem);
-    result["operands"] = std::string(ins.ops);
-    result["length"]   = ins.len;
-    result["bytes"]    = bytes_to_hex(ins.raw, std::min(ins.len, 15));
+    json result = instruction_to_json(ins);
     result["is_branch"]= ins.is_branch;
     result["is_call"]  = ins.is_call;
     result["is_ret"]   = ins.is_ret;
-    std::string c = comment_store::get(addr);
-    if (!c.empty()) result["comment"] = c;
+    result["source"] = "disassembly_listing";
     return tool_result_t::ok(result);
 }
 
@@ -194,49 +458,21 @@ static tool_result_t handle_get_function_bounds(const json& params)
     diag::log_tagged_fmt("disasm_tools", "get_function_bounds addr=0x%llX",
         static_cast<unsigned long long>(addr));
 
-    auto& c = function_index::detail::cache();
-    uint64_t start = 0;
-    uint64_t end = 0;
-    std::string name;
-    std::string section;
-    bool found = false;
-    {
-        std::shared_lock<std::shared_mutex> lk(c.mutex);
-        auto m = c.addr_to_func_start.find(addr);
-        if (m != c.addr_to_func_start.end()) {
-            start = m->second;
-        } else {
-            auto& sorted = c.sorted_starts;
-            auto it = std::upper_bound(sorted.begin(), sorted.end(), addr);
-            if (it == sorted.begin())
-                return tool_result_t::error("No function found containing this address.");
-            --it;
-            start = *it;
-        }
-        auto r = c.by_start.find(start);
-        if (r != c.by_start.end()) {
-            end = r->second.end;
-            name = r->second.display_name;
-            section = r->second.section;
-            found = true;
-        }
-    }
-    if (!found)
-        return tool_result_t::error("Function record missing for resolved start address.");
-    if (addr < start || (end > 0 && addr >= end))
-        return tool_result_t::error("Address is not within the resolved function bounds.");
-
-    if (name.empty()) name = function_index::synthetic_name(start);
+    resolved_function_t fn;
+    if (!resolve_function_for_address(addr, fn))
+        return tool_result_t::error("No function found containing this address.");
 
     diag::log_tagged_fmt("disasm_tools", "get_function_bounds_result addr=0x%llX start=0x%llX end=0x%llX name=%s",
-        static_cast<unsigned long long>(addr), static_cast<unsigned long long>(start),
-        static_cast<unsigned long long>(end), name.c_str());
+        static_cast<unsigned long long>(addr), static_cast<unsigned long long>(fn.start),
+        static_cast<unsigned long long>(fn.end), fn.name.c_str());
     json result;
-    result["start"]   = hex_u64(start);
-    result["end"]     = hex_u64(end);
-    result["size"]    = (end > start) ? (end - start) : 0;
-    result["name"]    = name;
-    result["section"] = section;
+    result["start"]   = hex_u64(fn.start);
+    result["end"]     = hex_u64(fn.end);
+    result["size"]    = (fn.end > fn.start) ? (fn.end - fn.start) : 0;
+    result["name"]    = fn.name;
+    result["section"] = fn.section;
+    result["module"]  = fn.module;
+    result["source"]  = fn.source;
     return tool_result_t::ok(result);
 }
 
@@ -256,59 +492,54 @@ static tool_result_t handle_get_function_disassembly(const json& params)
         if (v > 0 && v <= 8192) max_instrs = v;
     }
 
-    auto& c = function_index::detail::cache();
-    uint64_t start = 0;
-    uint64_t end = 0;
-    {
-        std::shared_lock<std::shared_mutex> lk(c.mutex);
-        auto m = c.addr_to_func_start.find(addr);
-        if (m != c.addr_to_func_start.end()) {
-            start = m->second;
-        } else {
-            auto& sorted = c.sorted_starts;
-            auto it = std::upper_bound(sorted.begin(), sorted.end(), addr);
-            if (it == sorted.begin())
-                return tool_result_t::error("No function found containing this address.");
-            --it;
-            start = *it;
-        }
-        auto r = c.by_start.find(start);
-        if (r != c.by_start.end()) end = r->second.end;
-    }
-    if (end == 0 || end <= start)
+    resolved_function_t fn;
+    if (!resolve_function_for_address(addr, fn))
+        return tool_result_t::error("No function found containing this address.");
+    if (fn.end == 0 || fn.end <= fn.start)
         return tool_result_t::error("Resolved function has no valid end address.");
 
-    int first = find_instr_index(g_disasm.file, start);
-    if (first < 0)
-        return tool_result_t::error("Function start not found in disassembly listing.");
+    int first = find_instr_index(g_disasm.file, fn.start);
 
     json arr = json::array();
     int emitted = 0;
-    for (size_t i = static_cast<size_t>(first); i < g_disasm.file.instrs.size() && emitted < max_instrs; ++i) {
-        const AsmInstr& ins = g_disasm.file.instrs[i];
-        if (ins.addr >= end) break;
-        json entry;
-        entry["address"]  = hex_u64(ins.addr);
-        entry["mnemonic"] = std::string(ins.mnem);
-        entry["operands"] = std::string(ins.ops);
-        entry["length"]   = ins.len;
-        entry["bytes"]    = bytes_to_hex(ins.raw, std::min(ins.len, 15));
-        if (ins.is_branch) entry["is_branch"] = true;
-        if (ins.is_call)   entry["is_call"]   = true;
-        if (ins.is_ret)    entry["is_ret"]    = true;
-        std::string c2 = comment_store::get(ins.addr);
-        if (!c2.empty()) entry["comment"] = c2;
-        arr.push_back(std::move(entry));
-        ++emitted;
+    if (first >= 0) {
+        for (size_t i = static_cast<size_t>(first); i < g_disasm.file.instrs.size() && emitted < max_instrs; ++i) {
+            const AsmInstr& ins = g_disasm.file.instrs[i];
+            if (ins.addr >= fn.end) break;
+            arr.push_back(instruction_to_json(ins));
+            ++emitted;
+        }
+    } else {
+        const uint64_t span = std::min<uint64_t>(fn.end - fn.start, static_cast<uint64_t>(max_instrs) * 16ULL);
+        std::vector<uint8_t> bytes;
+        if (!read_routed_process_bytes(fn.start, static_cast<size_t>(span), bytes))
+            return tool_result_t::error("Function bytes could not be read from live memory.");
+        size_t off = 0;
+        while (off < bytes.size() && emitted < max_instrs) {
+            const uint64_t va = fn.start + off;
+            if (va >= fn.end)
+                break;
+            const int avail = static_cast<int>(std::min<size_t>(bytes.size() - off, 16));
+            AsmInstr ins = zydis_decode_one(bytes.data() + off, avail, va);
+            const int ins_len = std::max(1, ins.len);
+            if (off + static_cast<size_t>(ins_len) > bytes.size())
+                break;
+            arr.push_back(instruction_to_json(ins));
+            ++emitted;
+            off += static_cast<size_t>(ins_len);
+        }
     }
 
     diag::log_tagged_fmt("disasm_tools", "get_function_disasm_result start=0x%llX end=0x%llX instr_count=%d truncated=%d",
-        static_cast<unsigned long long>(start), static_cast<unsigned long long>(end),
+        static_cast<unsigned long long>(fn.start), static_cast<unsigned long long>(fn.end),
         emitted, (emitted >= max_instrs) ? 1 : 0);
     json result;
-    result["function_start"] = hex_u64(start);
-    result["function_end"]   = hex_u64(end);
-    result["function_name"]  = function_index::synthetic_name(start);
+    result["function_start"] = hex_u64(fn.start);
+    result["function_end"]   = hex_u64(fn.end);
+    result["function_name"]  = fn.name.empty() ? function_index::synthetic_name(fn.start) : fn.name;
+    result["module"] = fn.module;
+    result["section"] = fn.section;
+    result["source"] = fn.source;
     result["instruction_count"] = emitted;
     result["truncated"] = (emitted >= max_instrs);
     result["instructions"] = std::move(arr);
@@ -317,13 +548,22 @@ static tool_result_t handle_get_function_disassembly(const json& params)
 
 static tool_result_t handle_list_functions(const json& params)
 {
-    if (!loaded_static_file_available())
+    if (!loaded_static_file_available()) {
+        diag::log_tagged_fmt("disasm_tools", "list_functions refused no_static_file instrs=%zu sections=%zu image_base=0x%llX",
+            g_disasm.file.instrs.size(),
+            g_disasm.file.sections.size(),
+            static_cast<unsigned long long>(g_disasm.file.image_base));
         return tool_result_t::error("No disassembly file is loaded. Open a file session before listing static functions.");
+    }
 
     std::string filter;
     if (params.contains("filter") && params["filter"].is_string())
         filter = lower_copy(params["filter"].get<std::string>());
-    diag::log_tagged_fmt("disasm_tools", "list_functions filter=%s", filter.c_str());
+    diag::log_tagged_fmt("disasm_tools", "list_functions filter=%s instrs=%zu sections=%zu image_base=0x%llX",
+        filter.c_str(),
+        g_disasm.file.instrs.size(),
+        g_disasm.file.sections.size(),
+        static_cast<unsigned long long>(g_disasm.file.image_base));
 
     size_t offset = 0;
     if (params.contains("offset") && params["offset"].is_number_unsigned())
@@ -343,6 +583,15 @@ static tool_result_t handle_list_functions(const json& params)
     std::vector<std::string> sections;
     {
         std::shared_lock<std::shared_mutex> lk(c.mutex);
+        diag::log_tagged_fmt("disasm_tools",
+            "list_functions cache sorted=%zu by_start=%zu status=%zu module_base=0x%llX module_size=0x%X module='%s' built_seq=%llu",
+            c.sorted_starts.size(),
+            c.by_start.size(),
+            c.status_by_start.size(),
+            static_cast<unsigned long long>(c.cached_module_base),
+            c.cached_module_size,
+            c.cached_module_name.c_str(),
+            static_cast<unsigned long long>(c.built_seq.load()));
         starts.reserve(c.sorted_starts.size());
         names.reserve(c.sorted_starts.size());
         ends.reserve(c.sorted_starts.size());
@@ -392,8 +641,8 @@ static tool_result_t handle_list_functions(const json& params)
         ++emitted;
     }
 
-    diag::log_tagged_fmt("disasm_tools", "list_functions_result total=%zu returned=%zu filter=%s",
-        total_matching, emitted, filter.c_str());
+    diag::log_tagged_fmt("disasm_tools", "list_functions_result total=%zu returned=%zu skipped=%zu filter=%s",
+        total_matching, emitted, skipped, filter.c_str());
     json result;
     result["total"]    = total_matching;
     result["offset"]   = offset;
@@ -681,8 +930,13 @@ static bool is_printable_ascii(uint8_t b)
 
 static tool_result_t handle_get_strings(const json& params)
 {
-    if (!loaded_static_file_available())
+    if (!loaded_static_file_available()) {
+        diag::log_tagged_fmt("disasm_tools", "get_strings refused no_static_file instrs=%zu sections=%zu image_base=0x%llX",
+            g_disasm.file.instrs.size(),
+            g_disasm.file.sections.size(),
+            static_cast<unsigned long long>(g_disasm.file.image_base));
         return tool_result_t::error("No disassembly file is loaded. Open a file session before extracting static strings.");
+    }
 
     diag::log_tagged_fmt("disasm_tools", "get_strings_enter");
     size_t min_len = 4;
@@ -709,10 +963,18 @@ static tool_result_t handle_get_strings(const json& params)
     size_t total_found = 0;
     size_t per_section_limit = 65536;
 
-    for (const PESection& sec : g_disasm.file.sections) {
+    for (size_t sec_index = 0; sec_index < g_disasm.file.sections.size(); ++sec_index) {
+        const PESection& sec = g_disasm.file.sections[sec_index];
+        size_t before_section = total_found;
         const uint8_t* p = sec.bytes.data();
         size_t sz = sec.bytes.size();
-        if (sz > per_section_limit * 1024) continue;
+        if (sz > per_section_limit * 1024) {
+            diag::log_tagged_fmt("disasm_tools", "get_strings section_skipped index=%zu va=0x%llX bytes=%zu reason=too_large",
+                sec_index,
+                static_cast<unsigned long long>(sec.va),
+                sz);
+            continue;
+        }
 
         if (want_ascii) {
             size_t run_start = 0;
@@ -768,10 +1030,17 @@ static tool_result_t handle_get_strings(const json& params)
                 }
             }
         }
+        diag::log_tagged_fmt("disasm_tools", "get_strings section index=%zu va=0x%llX bytes=%zu found_delta=%zu total=%zu returned=%zu",
+            sec_index,
+            static_cast<unsigned long long>(sec.va),
+            sz,
+            total_found - before_section,
+            total_found,
+            arr.size());
     }
 
-    diag::log_tagged_fmt("disasm_tools", "get_strings_result total=%zu returned=%zu encoding=%s min_len=%zu",
-        total_found, arr.size(), encoding.c_str(), min_len);
+    diag::log_tagged_fmt("disasm_tools", "get_strings_result total=%zu returned=%zu encoding=%s min_len=%zu sections=%zu",
+        total_found, arr.size(), encoding.c_str(), min_len, g_disasm.file.sections.size());
     json result;
     result["total_found"] = total_found;
     result["returned"]    = arr.size();

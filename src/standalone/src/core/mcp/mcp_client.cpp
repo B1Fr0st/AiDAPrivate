@@ -101,6 +101,130 @@ static std::string json_dump_safe(const json& j, int indent = -1)
     catch (...) { return "{}"; }
 }
 
+static std::string lower_ascii_copy(std::string text)
+{
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return text;
+}
+
+static std::string redact_labeled_log_text(std::string text)
+{
+    static const char* labels[] = {
+        "token", "access_token", "refresh_token", "password", "passwd", "pass",
+        "secret", "client_secret", "api_key", "apikey", "authorization",
+        "cookie", "set-cookie", "license", "session"
+    };
+    for (const char* label : labels) {
+        std::string lowered = lower_ascii_copy(text);
+        std::size_t pos = 0;
+        const std::string needle(label);
+        while ((pos = lowered.find(needle, pos)) != std::string::npos) {
+            std::size_t value_start = pos + needle.size();
+            while (value_start < text.size() && (text[value_start] == ' ' || text[value_start] == '\t' ||
+                   text[value_start] == ':' || text[value_start] == '=' || text[value_start] == '"' ||
+                   text[value_start] == '\'')) {
+                ++value_start;
+            }
+            if (value_start >= text.size()) {
+                pos += needle.size();
+                continue;
+            }
+            std::size_t value_end = value_start;
+            while (value_end < text.size()) {
+                const char c = text[value_end];
+                if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '"' ||
+                    c == '\'' || c == ',' || c == ';' || c == '&' || c == '}')
+                    break;
+                ++value_end;
+            }
+            if (value_end > value_start) {
+                text.replace(value_start, value_end - value_start, "<redacted>");
+                lowered = lower_ascii_copy(text);
+                pos = value_start + 10;
+            } else {
+                pos += needle.size();
+            }
+        }
+    }
+    return text;
+}
+
+static std::string compact_log_text(std::string text, size_t cap)
+{
+    text = sanitize_utf8(text);
+    text = redact_labeled_log_text(std::move(text));
+    for (char& c : text) {
+        if (c == '\n' || c == '\r' || c == '\t')
+            c = ' ';
+    }
+    if (text.size() > cap)
+        text = text.substr(0, cap) + "...(truncated)";
+    return text;
+}
+
+static unsigned first_byte_or_zero(const std::string& text)
+{
+    if (text.empty())
+        return 0;
+    return static_cast<unsigned>(static_cast<unsigned char>(text.front()));
+}
+
+static std::string rpc_error_summary_for_log(const json& err)
+{
+    if (!err.is_object())
+        return "type=" + std::string(err.type_name());
+    std::string message;
+    if (err.contains("message") && err["message"].is_string())
+        message = compact_log_text(err["message"].get<std::string>(), 500);
+    std::string data_type = "missing";
+    std::size_t data_size = 0;
+    if (err.contains("data")) {
+        data_type = err["data"].type_name();
+        if (err["data"].is_array() || err["data"].is_object())
+            data_size = err["data"].size();
+    }
+    long long code = 0;
+    bool has_code = false;
+    if (err.contains("code") && err["code"].is_number_integer()) {
+        code = err["code"].get<long long>();
+        has_code = true;
+    }
+    std::ostringstream oss;
+    oss << "code=" << (has_code ? std::to_string(code) : "missing")
+        << " message='" << message << "'"
+        << " data_type=" << data_type
+        << " data_size=" << data_size;
+    return oss.str();
+}
+
+static std::string request_method_for_log(const json& request)
+{
+    if (request.is_object() && request.contains("method") && request["method"].is_string())
+        return request["method"].get<std::string>();
+    return {};
+}
+
+static json initialize_params(bool include_interactive_capabilities)
+{
+    json capabilities = json::object();
+    if (include_interactive_capabilities) {
+        capabilities["roots"] = {{"listChanged", true}};
+        capabilities["sampling"] = json::object();
+    }
+
+    json client_info = json::object();
+    client_info["name"] = "AiDA Standalone";
+    client_info["version"] = "1.0.0";
+
+    json params = json::object();
+    params["protocolVersion"] = "2024-11-05";
+    params["capabilities"] = std::move(capabilities);
+    params["clientInfo"] = std::move(client_info);
+    return params;
+}
+
 static std::string sanitize_identifier(const std::string& input)
 {
     std::string out;
@@ -1010,14 +1134,7 @@ bool client_t::perform_remote_handshake()
         probe_headers.emplace("Authorization", "Bearer " + stored.access);
     }
 
-    json init_req = rpc_request("initialize", {
-        {"protocolVersion", "2024-11-05"},
-        {"capabilities", {{"roots", {{"listChanged", true}}}, {"sampling", json::object()}}},
-        {"clientInfo", {
-            {"name", "AiDA Standalone"},
-            {"version", "1.0.0"}
-        }}
-    });
+    json init_req = rpc_request("initialize", initialize_params(true));
     const std::string init_body = json_dump_safe(init_req);
 
     auto streamable_res = do_https_post(purl.origin, purl.path, probe_headers,
@@ -1132,14 +1249,7 @@ bool client_t::detect_oauth_metadata(const std::string& www_authenticate_hdr)
 
 bool client_t::perform_initialize_locked()
 {
-    json init_req = rpc_request("initialize", {
-        {"protocolVersion", "2024-11-05"},
-        {"capabilities", {}},
-        {"clientInfo", {
-            {"name", "AiDA Standalone"},
-            {"version", "1.0.0"}
-        }}
-    });
+    json init_req = rpc_request("initialize", initialize_params(false));
 
     json response;
     if (!send_rpc(response, init_req)) {
@@ -2164,8 +2274,14 @@ bool client_t::write_to_stdin(const std::string& data)
 bool client_t::send_stdio(json& out, const json& request)
 {
     const std::string body = json_dump_safe(request);
-    if (!write_to_stdin(body))
+    const std::string method = request_method_for_log(request);
+    diag::log_tagged_fmt("mcp_stdio", "send request server='%s' method='%s' has_id=%d body_bytes=%zu",
+        _cfg.name.c_str(), method.c_str(), request.contains("id") ? 1 : 0, body.size());
+    if (!write_to_stdin(body)) {
+        diag::log_tagged_fmt("mcp_stdio", "send write_failed server='%s' method='%s' err='%s'",
+            _cfg.name.c_str(), method.c_str(), compact_log_text(_last_error, 500).c_str());
         return false;
+    }
 
     if (!request.contains("id")) {
         out = json::object();
@@ -2174,24 +2290,45 @@ bool client_t::send_stdio(json& out, const json& request)
 
     while (true) {
         std::string response_str;
-        if (!read_line_from_stdout(response_str))
+        if (!read_line_from_stdout(response_str)) {
+            diag::log_tagged_fmt("mcp_stdio", "recv failed server='%s' method='%s' err='%s'",
+                _cfg.name.c_str(), method.c_str(), compact_log_text(_last_error, 500).c_str());
             return false;
+        }
+        diag::log_tagged_fmt("mcp_stdio", "recv line server='%s' method='%s' bytes=%zu",
+            _cfg.name.c_str(), method.c_str(), response_str.size());
 
         json response = json::parse(response_str, nullptr, false);
         if (response.is_discarded()) {
             _last_error = "stdio: invalid JSON response";
+            diag::log_tagged_fmt("mcp_stdio", "recv invalid_json server='%s' method='%s' bytes=%zu first_byte=0x%02X",
+                _cfg.name.c_str(), method.c_str(), response_str.size(),
+                first_byte_or_zero(response_str));
             return false;
         }
 
         if (response.is_object() && response.contains("method") && !response.contains("id")) {
+            diag::log_tagged_fmt("mcp_stdio", "recv notification server='%s' method='%s' notif='%s'",
+                _cfg.name.c_str(), method.c_str(), response.value("method", std::string()).c_str());
             process_notification(response);
             continue;
         }
         if (response.is_object() && response.contains("method") && response.contains("id")) {
+            diag::log_tagged_fmt("mcp_stdio", "recv inbound_request server='%s' method='%s' inbound='%s'",
+                _cfg.name.c_str(), method.c_str(), response.value("method", std::string()).c_str());
             json inbound_response;
             if (dispatch_inbound_request(response, inbound_response))
                 send_inbound_response(inbound_response);
             continue;
+        }
+        if (response.is_object() && response.contains("error")) {
+            const auto& err = response["error"];
+            diag::log_tagged_fmt("mcp_stdio", "recv rpc_error server='%s' method='%s' error='%s'",
+                _cfg.name.c_str(), method.c_str(), rpc_error_summary_for_log(err).c_str());
+        } else {
+            diag::log_tagged_fmt("mcp_stdio", "recv response server='%s' method='%s' has_result=%d",
+                _cfg.name.c_str(), method.c_str(),
+                response.is_object() && response.contains("result") ? 1 : 0);
         }
         out = std::move(response);
         return true;

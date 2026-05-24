@@ -25,6 +25,7 @@ namespace functions {
     NTSTATUS handle_spoof_debug_flags(p_spoof_debug request);
     NTSTATUS handle_get_module_export(p_module_export request);
     NTSTATUS handle_virt_to_phys(p_virt_to_phys request);
+    NTSTATUS handle_query_ssdt(p_ssdt_query request);
 
 
     NTSTATUS handle_net_enum_conn(p_net_enum_conn request);

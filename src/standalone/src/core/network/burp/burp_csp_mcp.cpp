@@ -104,8 +104,9 @@ tool_result_t tool_analyze_url(const json& params)
     auto resp = audit_http::send(req, host, port, tls, opt);
     if (!resp.has_value())
     {
-        diag::log_tagged_fmt("mcp_burp", "csp_analyze_url send_failed err=%s", audit_http::last_error().c_str());
-        return tool_result_t::error(std::string("send_failed: ") + audit_http::last_error());
+        std::string err = audit_http::last_error();
+        diag::log_tagged_fmt("mcp_burp", "csp_analyze_url send_failed err=%s", err.c_str());
+        return tool_result_t::error(std::string("send_failed: ") + err);
     }
     auto res = analyze_for_response(resp->resp_headers);
     diag::log_tagged_fmt("mcp_burp", "csp_analyze_url ok status=%d score=%d findings=%zu", resp->status_code, res.score, res.findings.size());

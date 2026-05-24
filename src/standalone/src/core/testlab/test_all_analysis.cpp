@@ -14,6 +14,7 @@
 #include "../analysis/decrypt_oracle.hpp"
 #include "../analysis/pdb_downloader.hpp"
 #include "../analysis/analysis_hub_view.hpp"
+#include "../analysis/types_hub_view.hpp"
 #include "../disasm/comment_store.hpp"
 #include "../disasm/rename_store.hpp"
 #include "../editor/expression_eval.hpp"
@@ -71,40 +72,101 @@ static void log_msg(HANDLE hf, const char* tag, const char* fmt, ...) {
     OutputDebugStringA(s.c_str());
 }
 
-static uint64_t get_ntdll_fn(const char* name) {
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    if (!ntdll) return 0;
-    FARPROC fn = GetProcAddress(ntdll, name);
-    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fn));
-}
+struct symbolic_fixture_t {
+    uint64_t address = 0;
+    size_t size = 0;
 
-static uint64_t get_target_ntdll_fn(const char* name) {
-    const uint32_t pid = driver_bridge::attached_pid();
-    if (pid == 0)
-        return get_ntdll_fn(name);
-
-    uint64_t remote_ntdll = 0;
-    for (const auto& mod : driver_bridge::enumerate_modules_for(pid)) {
-        if (_stricmp(mod.name.c_str(), "ntdll.dll") == 0) {
-            remote_ntdll = mod.base;
-            break;
+    symbolic_fixture_t() = default;
+    symbolic_fixture_t(const symbolic_fixture_t&) = delete;
+    symbolic_fixture_t& operator=(const symbolic_fixture_t&) = delete;
+    symbolic_fixture_t(symbolic_fixture_t&& other) noexcept {
+        address = other.address;
+        size = other.size;
+        other.address = 0;
+        other.size = 0;
+    }
+    symbolic_fixture_t& operator=(symbolic_fixture_t&& other) noexcept {
+        if (this != &other) {
+            reset();
+            address = other.address;
+            size = other.size;
+            other.address = 0;
+            other.size = 0;
+        }
+        return *this;
+    }
+    ~symbolic_fixture_t() {
+        reset();
+    }
+    void reset() {
+        if (address != 0) {
+            driver_bridge::free_memory(address);
+            address = 0;
+            size = 0;
         }
     }
-    if (remote_ntdll == 0)
-        return get_ntdll_fn(name);
+};
 
-    const uint64_t resolved = driver_bridge::resolve_export(remote_ntdll, name);
-    if (resolved != 0)
-        return resolved;
+static symbolic_fixture_t make_symbolic_fixture(HANDLE hf, const char* tag, const std::vector<uint8_t>& code) {
+    symbolic_fixture_t fx;
+    fx.size = code.empty() ? 1 : ((code.size() + 0xFFFu) & ~0xFFFu);
+    fx.address = driver_bridge::allocate_memory(fx.size);
+    if (fx.address == 0) {
+        log_msg(hf, tag, "FAIL -- allocate_memory returned 0 for symbolic fixture");
+        fx.size = 0;
+        return fx;
+    }
+    std::vector<uint8_t> page(fx.size, 0x90);
+    if (!code.empty())
+        std::memcpy(page.data(), code.data(), code.size());
+    if (!driver_bridge::write_memory(fx.address, page)) {
+        log_msg(hf, tag, "FAIL -- write_memory failed for symbolic fixture addr=0x%016llX size=%zu",
+            static_cast<unsigned long long>(fx.address), page.size());
+        fx.reset();
+        return fx;
+    }
+    uint32_t old_protect = 0;
+    if (!driver_bridge::protect_memory(fx.address, fx.size, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        log_msg(hf, tag, "FAIL -- protect_memory failed for symbolic fixture addr=0x%016llX size=%zu",
+            static_cast<unsigned long long>(fx.address), fx.size);
+        fx.reset();
+        return fx;
+    }
+    log_msg(hf, tag, "fixture addr=0x%016llX size=%zu bytes=%zu",
+        static_cast<unsigned long long>(fx.address), fx.size, code.size());
+    return fx;
+}
 
-    HMODULE local_ntdll = GetModuleHandleW(L"ntdll.dll");
-    FARPROC local_fn = local_ntdll ? GetProcAddress(local_ntdll, name) : nullptr;
-    if (!local_ntdll || !local_fn)
-        return 0;
+static std::vector<uint8_t> symbolic_arithmetic_fixture() {
+    return {
+        0x48, 0x89, 0xC8,
+        0x48, 0x83, 0xC0, 0x05,
+        0x48, 0x31, 0xD0,
+        0x48, 0x85, 0xC0,
+        0x75, 0x03,
+        0x48, 0xFF, 0xC0,
+        0xC3
+    };
+}
 
-    const uint64_t offset =
-        reinterpret_cast<uintptr_t>(local_fn) - reinterpret_cast<uintptr_t>(local_ntdll);
-    return remote_ntdll + offset;
+static std::vector<uint8_t> symbolic_r10_fixture() {
+    return {
+        0x4C, 0x8B, 0xD1,
+        0x49, 0x83, 0xC2, 0x01,
+        0x4C, 0x89, 0xD0,
+        0xC3
+    };
+}
+
+static std::vector<uint8_t> symbolic_branch_fixture() {
+    return {
+        0x48, 0x85, 0xC9,
+        0x75, 0x03,
+        0x31, 0xC0,
+        0xC3,
+        0xB8, 0x01, 0x00, 0x00, 0x00,
+        0xC3
+    };
 }
 
 static aida::binary_map::map_t make_binary_map_fixture() {
@@ -176,13 +238,13 @@ static void test_symbolic_execute(HANDLE hf, std::atomic<int>& passed, std::atom
     log_msg(hf, "sym_exec", "START -- symbolic engine execute on small range");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
-    if (addr == 0) {
-        log_msg(hf, "sym_exec", "FAIL -- NtClose not found");
+    const auto code = symbolic_arithmetic_fixture();
+    auto fx = make_symbolic_fixture(hf, "sym_exec", code);
+    if (fx.address == 0) {
         failed.fetch_add(1); return;
     }
 
-    auto result = symbolic_engine::execute_symbolic(addr, addr + 32, 16, {}, {});
+    auto result = symbolic_engine::execute_symbolic(fx.address, fx.address + code.size(), 16, {"rcx"}, {});
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!result.success) {
@@ -205,13 +267,13 @@ static void test_symbolic_slice(HANDLE hf, std::atomic<int>& passed, std::atomic
     log_msg(hf, "sym_slice", "START -- symbolic engine slice to register");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
-    if (addr == 0) {
-        log_msg(hf, "sym_slice", "FAIL -- NtClose not found");
+    const auto code = symbolic_arithmetic_fixture();
+    auto fx = make_symbolic_fixture(hf, "sym_slice", code);
+    if (fx.address == 0) {
         failed.fetch_add(1); return;
     }
 
-    auto result = symbolic_engine::slice_to_register(addr, addr + 32, 16, "rax");
+    auto result = symbolic_engine::slice_to_register(fx.address, fx.address + code.size(), 16, "rax");
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!result.success) {
@@ -234,13 +296,13 @@ static void test_symbolic_taint(HANDLE hf, std::atomic<int>& passed, std::atomic
     log_msg(hf, "sym_taint", "START -- symbolic engine taint trace");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
-    if (addr == 0) {
-        log_msg(hf, "sym_taint", "FAIL -- NtClose not found");
+    const auto code = symbolic_arithmetic_fixture();
+    auto fx = make_symbolic_fixture(hf, "sym_taint", code);
+    if (fx.address == 0) {
         failed.fetch_add(1); return;
     }
 
-    auto result = symbolic_engine::taint_trace(addr, addr + 32, 16, {"rcx"}, {});
+    auto result = symbolic_engine::taint_trace(fx.address, fx.address + code.size(), 16, {"rcx"}, {});
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!result.success) {
@@ -262,16 +324,16 @@ static void test_symbolic_opaque_predicate(HANDLE hf, std::atomic<int>& passed, 
     log_msg(hf, "sym_opq", "START -- symbolic engine check opaque predicate");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
-    if (addr == 0) {
-        log_msg(hf, "sym_opq", "FAIL -- NtClose not found");
+    const auto code = symbolic_branch_fixture();
+    auto fx = make_symbolic_fixture(hf, "sym_opq", code);
+    if (fx.address == 0) {
         failed.fetch_add(1); return;
     }
 
-    bool is_opaque = symbolic_engine::is_opaque_predicate(addr, 16);
+    bool is_opaque = symbolic_engine::is_opaque_predicate(fx.address + 3, 8);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "sym_opq", "PASS -- is_opaque_predicate(NtClose)=%d (elapsed %lld ms)",
+    log_msg(hf, "sym_opq", "PASS -- is_opaque_predicate(fixture_branch)=%d (elapsed %lld ms)",
         is_opaque, (long long)ms);
     passed.fetch_add(1);
 }
@@ -280,13 +342,13 @@ static void test_deobfusc_strip_junk(HANDLE hf, std::atomic<int>& passed, std::a
     log_msg(hf, "deob_jnk", "START -- deobfuscation engine strip junk code");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
-    if (addr == 0) {
-        log_msg(hf, "deob_jnk", "FAIL -- NtClose not found");
+    const auto code = symbolic_arithmetic_fixture();
+    auto fx = make_symbolic_fixture(hf, "deob_jnk", code);
+    if (fx.address == 0) {
         failed.fetch_add(1); return;
     }
 
-    auto result = deobfuscation_engine::strip_junk_code(addr, addr + 64, { "rax" }, 16);
+    auto result = deobfuscation_engine::strip_junk_code(fx.address, fx.address + code.size(), { "rax" }, 16);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!result.success) {
@@ -309,13 +371,13 @@ static void test_deobfusc_resolve_constants(HANDLE hf, std::atomic<int>& passed,
     log_msg(hf, "deob_cst", "START -- deobfuscation engine resolve constants");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
-    if (addr == 0) {
-        log_msg(hf, "deob_cst", "FAIL -- NtClose not found");
+    const auto code = symbolic_arithmetic_fixture();
+    auto fx = make_symbolic_fixture(hf, "deob_cst", code);
+    if (fx.address == 0) {
         failed.fetch_add(1); return;
     }
 
-    auto constants = deobfuscation_engine::resolve_constants(addr, addr + 32, 16);
+    auto constants = deobfuscation_engine::resolve_constants(fx.address, fx.address + code.size(), 16);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (constants.empty()) {
@@ -614,13 +676,15 @@ static void test_symbolic_execute_larger(HANDLE hf, std::atomic<int>& passed, st
     log_msg(hf, "sym_exlg", "START -- symbolic engine execute on larger range");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtQuerySystemInformation");
-    if (addr == 0) {
-        log_msg(hf, "sym_exlg", "FAIL -- NtQuerySystemInformation not found");
+    auto code = symbolic_arithmetic_fixture();
+    const auto r10 = symbolic_r10_fixture();
+    code.insert(code.end(), r10.begin(), r10.end());
+    auto fx = make_symbolic_fixture(hf, "sym_exlg", code);
+    if (fx.address == 0) {
         failed.fetch_add(1); return;
     }
 
-    auto result = symbolic_engine::execute_symbolic(addr, addr + 32, 16, {}, {});
+    auto result = symbolic_engine::execute_symbolic(fx.address, fx.address + code.size(), 32, {"rcx", "rdx"}, {});
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!result.success) {
@@ -642,13 +706,13 @@ static void test_symbolic_slice_rsi(HANDLE hf, std::atomic<int>& passed, std::at
     log_msg(hf, "sym_slrsi", "START -- symbolic engine slice to syscall argument mirror r10");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtQuerySystemInformation");
-    if (addr == 0) {
-        log_msg(hf, "sym_slrsi", "FAIL -- NtQuerySystemInformation not found");
+    const auto code = symbolic_r10_fixture();
+    auto fx = make_symbolic_fixture(hf, "sym_slrsi", code);
+    if (fx.address == 0) {
         failed.fetch_add(1); return;
     }
 
-    auto result = symbolic_engine::slice_to_register(addr, addr + 48, 16, "r10");
+    auto result = symbolic_engine::slice_to_register(fx.address, fx.address + code.size(), 16, "r10");
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!result.success) {
@@ -671,13 +735,13 @@ static void test_symbolic_taint_rdx(HANDLE hf, std::atomic<int>& passed, std::at
     log_msg(hf, "sym_trdx", "START -- symbolic engine taint trace syscall input rcx");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
-    if (addr == 0) {
-        log_msg(hf, "sym_trdx", "FAIL -- NtClose not found");
+    const auto code = symbolic_arithmetic_fixture();
+    auto fx = make_symbolic_fixture(hf, "sym_trdx", code);
+    if (fx.address == 0) {
         failed.fetch_add(1); return;
     }
 
-    auto result = symbolic_engine::taint_trace(addr, addr + 32, 16, {"rcx"}, {});
+    auto result = symbolic_engine::taint_trace(fx.address, fx.address + code.size(), 16, {"rcx"}, {});
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!result.success) {
@@ -701,13 +765,13 @@ static void test_symbolic_solve_for_path(HANDLE hf, std::atomic<int>& passed, st
     log_msg(hf, "sym_solv", "START -- symbolic engine solve_for_path");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
-    if (addr == 0) {
-        log_msg(hf, "sym_solv", "FAIL -- NtClose not found");
+    const auto code = symbolic_branch_fixture();
+    auto fx = make_symbolic_fixture(hf, "sym_solv", code);
+    if (fx.address == 0) {
         failed.fetch_add(1); return;
     }
 
-    auto result = symbolic_engine::solve_for_path(addr, addr + 16, 16, {"rcx"});
+    auto result = symbolic_engine::solve_for_path(fx.address, fx.address + 8, 16, {"rcx"});
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!result.success) {
@@ -737,13 +801,13 @@ static void test_deobfusc_deobfuscate_function(HANDLE hf, std::atomic<int>& pass
     log_msg(hf, "deob_fn", "START -- deobfuscation engine deobfuscate_function");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = get_ntdll_fn("NtClose");
-    if (addr == 0) {
-        log_msg(hf, "deob_fn", "FAIL -- NtClose not found");
+    const auto code = symbolic_arithmetic_fixture();
+    auto fx = make_symbolic_fixture(hf, "deob_fn", code);
+    if (fx.address == 0) {
         failed.fetch_add(1); return;
     }
 
-    auto result = deobfuscation_engine::deobfuscate_function(addr, 16);
+    auto result = deobfuscation_engine::deobfuscate_function(fx.address, 16);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!result.success) {
@@ -1467,6 +1531,44 @@ static void test_analysis_hub_tab_protection(HANDLE hf, std::atomic<int>& passed
     select_analysis_hub_tab(hf, passed, failed, "analysis_hub_tab.protection", analysis_hub_view::sub_tab_t::stealth);
 }
 
+static void select_types_hub_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
+                                 const char* tag, types_hub_view::sub_tab_t value) {
+    types_hub_view::set_sub_tab(value);
+    types_hub_view::sub_tab_t got = types_hub_view::active_sub_tab();
+    const char* label = types_hub_view::sub_tab_label(value);
+    if (got == value && label[0] != '\0') {
+        log_msg(hf, tag, "PASS -- types_hub sub_tab selected and read back (%d label=%s)",
+            static_cast<int>(value), label);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, tag, "FAIL -- types_hub sub_tab set %d but read back %d label=\"%s\"",
+            static_cast<int>(value), static_cast<int>(got), label);
+        failed.fetch_add(1);
+    }
+}
+
+static void test_types_hub_tab_structs(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_types_hub_tab(hf, passed, failed, "types_hub_tab.structs", types_hub_view::sub_tab_t::structs);
+}
+static void test_types_hub_tab_unions(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_types_hub_tab(hf, passed, failed, "types_hub_tab.unions", types_hub_view::sub_tab_t::unions);
+}
+static void test_types_hub_tab_enums(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_types_hub_tab(hf, passed, failed, "types_hub_tab.enums", types_hub_view::sub_tab_t::enums);
+}
+static void test_types_hub_tab_typedefs(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_types_hub_tab(hf, passed, failed, "types_hub_tab.typedefs", types_hub_view::sub_tab_t::typedefs);
+}
+static void test_types_hub_tab_functions(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_types_hub_tab(hf, passed, failed, "types_hub_tab.functions", types_hub_view::sub_tab_t::functions);
+}
+static void test_types_hub_tab_inferred(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_types_hub_tab(hf, passed, failed, "types_hub_tab.inferred", types_hub_view::sub_tab_t::inferred);
+}
+static void test_types_hub_tab_dissector(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    select_types_hub_tab(hf, passed, failed, "types_hub_tab.dissector", types_hub_view::sub_tab_t::dissector);
+}
+
 static void test_symbolic_inner_trace(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     select_symbolic_inner_tab(hf, passed, failed, "symbolic_inner.trace", 0, "Trace");
 }
@@ -1565,6 +1667,13 @@ void phase_analysis_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
         { "analysis_hub_tab_deobfusc",   test_analysis_hub_tab_deobfuscation },
         { "analysis_hub_tab_fuzzer",     test_analysis_hub_tab_fuzzer     },
         { "analysis_hub_tab_protection", test_analysis_hub_tab_protection },
+        { "types_hub_tab_structs",       test_types_hub_tab_structs       },
+        { "types_hub_tab_unions",        test_types_hub_tab_unions        },
+        { "types_hub_tab_enums",         test_types_hub_tab_enums         },
+        { "types_hub_tab_typedefs",      test_types_hub_tab_typedefs      },
+        { "types_hub_tab_functions",     test_types_hub_tab_functions     },
+        { "types_hub_tab_inferred",      test_types_hub_tab_inferred      },
+        { "types_hub_tab_dissector",     test_types_hub_tab_dissector     },
         { "symbolic_inner_trace",        test_symbolic_inner_trace        },
         { "symbolic_inner_deobfusc",     test_symbolic_inner_deobfuscation },
         { "symbolic_inner_slice",        test_symbolic_inner_slice        },

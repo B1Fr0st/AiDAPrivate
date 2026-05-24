@@ -213,6 +213,15 @@ namespace function_index {
 			return g;
 		}
 
+		inline std::vector<std::shared_ptr<cache_t>>& retired_cache_snapshots() {
+			static std::vector<std::shared_ptr<cache_t>> snapshots;
+			return snapshots;
+		}
+
+		inline void retain_cache_snapshot_locked(const std::shared_ptr<cache_t>& snap) {
+			if (snap) retired_cache_snapshots().push_back(snap);
+		}
+
 		inline std::atomic<uint64_t>& cache_lifecycle_log_counter() {
 			static std::atomic<uint64_t> n{0};
 			return n;
@@ -241,29 +250,21 @@ namespace function_index {
 		}
 
 		inline cache_t& cache() {
-			static thread_local std::shared_ptr<cache_t> tl_keepalive;
-			static thread_local uint64_t tl_generation = 0;
-			uint64_t gen = cache_holder_generation().load(std::memory_order_acquire);
-			if (!tl_keepalive || tl_generation != gen) {
-				auto snap = active_cache_snapshot();
-				if (should_log_cache_lifecycle()) {
-					diag::log_tagged_critical_fmt("fn_index_cache",
-						"cache pre_tls_assign tid=%lu gen=%llu old_tls_raw=%p new_snap_raw=%p",
-						static_cast<unsigned long>(GetCurrentThreadId()),
-						static_cast<unsigned long long>(gen),
-						tl_keepalive.get(), snap.get());
-				}
-				tl_keepalive = std::move(snap);
-				tl_generation = gen;
-				if (should_log_cache_lifecycle()) {
-					diag::log_tagged_critical_fmt("fn_index_cache",
-						"cache post_tls_assign tid=%lu gen=%llu tls_raw=%p",
-						static_cast<unsigned long>(GetCurrentThreadId()),
-						static_cast<unsigned long long>(tl_generation),
-						tl_keepalive.get());
-				}
+			std::lock_guard<std::mutex> lk(holder_swap_mtx());
+			auto& holder = cache_holder_sp();
+			if (!holder) {
+				holder = std::make_shared<cache_t>();
+				cache_holder_generation().fetch_add(1, std::memory_order_acq_rel);
 			}
-			return *tl_keepalive;
+			if (should_log_cache_lifecycle()) {
+				diag::log_tagged_critical_fmt("fn_index_cache",
+					"cache access tid=%lu gen=%llu active_raw=%p retired=%zu",
+					static_cast<unsigned long>(GetCurrentThreadId()),
+					static_cast<unsigned long long>(cache_holder_generation().load(std::memory_order_acquire)),
+					holder.get(),
+					retired_cache_snapshots().size());
+			}
+			return *holder;
 		}
 
 		inline std::string format_hex_upper(uint64_t v) {
@@ -3879,6 +3880,7 @@ namespace function_index {
 				detail::cache_holder_sp().get(),
 				new_cache.get());
 			out = detail::cache_holder_sp();
+			detail::retain_cache_snapshot_locked(out);
 			detail::cache_holder_sp() = new_cache;
 			uint64_t gen = detail::cache_holder_generation().fetch_add(1, std::memory_order_acq_rel) + 1;
 			diag::log_tagged_critical_fmt("fn_index_cache",
@@ -3899,6 +3901,7 @@ namespace function_index {
 			static_cast<unsigned long>(GetCurrentThreadId()),
 			detail::cache_holder_sp().get(),
 			snap.get());
+		detail::retain_cache_snapshot_locked(detail::cache_holder_sp());
 		detail::cache_holder_sp() = std::move(snap);
 		uint64_t gen = detail::cache_holder_generation().fetch_add(1, std::memory_order_acq_rel) + 1;
 		diag::log_tagged_critical_fmt("fn_index_cache",

@@ -87,6 +87,27 @@ namespace
         return text;
     }
 
+    std::string wide_to_utf8_lossy(const std::wstring& text)
+    {
+        if (text.empty())
+            return {};
+        int len = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+        if (len <= 0) {
+            const DWORD err = GetLastError();
+            diag::log_tagged_fmt("mcp_tools", "wide_to_utf8 failed len=%zu err=%lu",
+                text.size(), static_cast<unsigned long>(err));
+            return {};
+        }
+        std::string out(static_cast<size_t>(len), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), out.data(), len, nullptr, nullptr);
+        return out;
+    }
+
+    std::string path_to_utf8(const fs::path& path)
+    {
+        return wide_to_utf8_lossy(path.native());
+    }
+
     std::string prot_string(uint32_t protect)
     {
         switch (protect & 0xFF) {
@@ -624,19 +645,49 @@ namespace
             !params.contains("pattern") || !params["pattern"].is_string())
             return error("Provide root and pattern.");
 
-        const fs::path root = params["root"].get<std::string>();
+        const fs::path root = fs::u8path(params["root"].get<std::string>());
         const std::string needle = to_lower(params["pattern"].get<std::string>());
+        const size_t limit = static_cast<size_t>(params.value("limit", 100));
+        diag::log_tagged_fmt("mcp_tools", "handle_search_files root='%s' pattern='%s' limit=%zu",
+            path_to_utf8(root).c_str(), needle.c_str(), limit);
         json matches = json::array();
         std::error_code ec;
+        size_t visited = 0;
+        size_t conversion_failures = 0;
         for (const auto& entry : fs::recursive_directory_iterator(root, ec)) {
-            if (ec)
+            if (ec) {
+                diag::log_tagged_fmt("mcp_tools", "handle_search_files iterator_error after=%zu err=%s",
+                    visited, ec.message().c_str());
                 break;
-            if (to_lower(entry.path().filename().string()).find(needle) != std::string::npos)
-                matches.push_back(entry.path().string());
-            if (matches.size() >= static_cast<size_t>(params.value("limit", 100)))
+            }
+            ++visited;
+            std::string filename = path_to_utf8(entry.path().filename());
+            std::string full_path = path_to_utf8(entry.path());
+            if (filename.empty() && !entry.path().filename().empty()) {
+                ++conversion_failures;
+                diag::log_tagged_fmt("mcp_tools", "handle_search_files path_conversion_empty visited=%zu native_len=%zu",
+                    visited, entry.path().native().size());
+                continue;
+            }
+            if (to_lower(filename).find(needle) != std::string::npos) {
+                matches.push_back(full_path);
+                diag::log_tagged_fmt("mcp_tools", "handle_search_files match[%zu]='%s'",
+                    matches.size(), full_path.c_str());
+            }
+            if (matches.size() >= limit)
                 break;
         }
-        return tool_result_t::ok("Searched files.", json{{"matches", matches}});
+        if (ec) {
+            diag::log_tagged_fmt("mcp_tools", "handle_search_files final_iterator_error visited=%zu matches=%zu err=%s",
+                visited, matches.size(), ec.message().c_str());
+        }
+        diag::log_tagged_fmt("mcp_tools", "handle_search_files done visited=%zu matches=%zu conversion_failures=%zu",
+            visited, matches.size(), conversion_failures);
+        return tool_result_t::ok("Searched files.", json{
+            {"matches", matches},
+            {"visited", visited},
+            {"conversion_failures", conversion_failures}
+        });
     }
 
     tool_result_t handle_grep_in_files(const json& params)
@@ -710,6 +761,11 @@ namespace
             httplib::SSLClient client("api.duckduckgo.com");
             client.set_connection_timeout(10);
             client.set_read_timeout(15);
+            client.set_follow_location(true);
+            client.set_default_headers({
+                {"Accept", "application/json"},
+                {"User-Agent", "AiDAStandalone/1.0"}
+            });
             client.enable_server_certificate_verification(false);
 
             std::string path = "/?q=" + encoded_query + "&format=json&no_redirect=1&no_html=1";
@@ -751,8 +807,61 @@ namespace
             transport_error = "unknown network error";
         }
 
-        if (!transport_error.empty()) {
-            const std::string msg = "web_search: " + transport_error;
+        std::string wikipedia_error;
+        if (results.empty()) {
+            try {
+                httplib::SSLClient wiki("en.wikipedia.org");
+                wiki.set_connection_timeout(10);
+                wiki.set_read_timeout(15);
+                wiki.set_follow_location(true);
+                wiki.set_default_headers({
+                    {"Accept", "application/json"},
+                    {"User-Agent", "AiDAStandalone/1.0"}
+                });
+                wiki.enable_server_certificate_verification(false);
+                std::string path = "/w/api.php?action=opensearch&search=" + encoded_query +
+                                   "&limit=" + std::to_string(std::max(1, max_results)) +
+                                   "&namespace=0&format=json";
+                auto res = wiki.Get(path.c_str());
+                if (!res) {
+                    wikipedia_error = "no response from en.wikipedia.org";
+                } else if (res->status != 200) {
+                    wikipedia_error = "HTTP status " + std::to_string(res->status);
+                } else {
+                    auto j = json::parse(res->body, nullptr, false);
+                    if (j.is_discarded() || !j.is_array() || j.size() < 4 ||
+                        !j[1].is_array() || !j[2].is_array() || !j[3].is_array()) {
+                        wikipedia_error = "invalid JSON in Wikipedia opensearch response";
+                    } else {
+                        const size_t take = std::min<size_t>(
+                            static_cast<size_t>(std::max(1, max_results)), j[1].size());
+                        for (size_t i = 0; i < take; ++i) {
+                            if (!j[1][i].is_string())
+                                continue;
+                            const std::string title = j[1][i].get<std::string>();
+                            const std::string snippet =
+                                i < j[2].size() && j[2][i].is_string() ? j[2][i].get<std::string>() : std::string();
+                            const std::string url =
+                                i < j[3].size() && j[3][i].is_string() ? j[3][i].get<std::string>() : std::string();
+                            results.push_back({
+                                {"title", title},
+                                {"snippet", snippet.empty() ? title : snippet},
+                                {"url", url}
+                            });
+                        }
+                    }
+                }
+            } catch (const std::exception& e) {
+                wikipedia_error = e.what();
+            } catch (...) {
+                wikipedia_error = "unknown Wikipedia network error";
+            }
+        }
+
+        if (!transport_error.empty() && results.empty()) {
+            std::string msg = "web_search: " + transport_error;
+            if (!wikipedia_error.empty())
+                msg += "; wikipedia: " + wikipedia_error;
             set_last_web_error(msg);
             return tool_result_t::error(msg);
         }
@@ -1284,9 +1393,9 @@ namespace
     {
         diag::log_tagged_fmt("mcp_tools", "handle_reconstruct_cancel entry");
         if (!source_reconstructor::is_running())
-            return error("No reconstruction is running.");
+            return tool_result_t::ok("No reconstruction is running.", json{{"running", false}, {"cancelled", false}});
         source_reconstructor::cancel();
-        return tool_result_t::ok("Reconstruction cancellation requested.");
+        return tool_result_t::ok("Reconstruction cancellation requested.", json{{"running", true}, {"cancelled", true}});
     }
 }
 

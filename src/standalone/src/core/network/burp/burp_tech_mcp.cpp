@@ -66,8 +66,9 @@ tool_result_t tool_fingerprint(const json& params)
     auto resp = audit_http::send(req, host, port, tls, opt);
     if (!resp.has_value())
     {
-        diag::log_tagged_fmt("mcp_burp", "tech_fingerprint send_failed err=%s", audit_http::last_error().c_str());
-        return tool_result_t::error(std::string("send_failed: ") + audit_http::last_error());
+        std::string err = audit_http::last_error();
+        diag::log_tagged_fmt("mcp_burp", "tech_fingerprint send_failed err=%s", err.c_str());
+        return tool_result_t::error(std::string("send_failed: ") + err);
     }
     auto items = fingerprint(resp->resp_headers, resp->resp_body, url);
     diag::log_tagged_fmt("mcp_burp", "tech_fingerprint ok url=%s status=%d techs=%zu", url.c_str(), resp->status_code, items.size());

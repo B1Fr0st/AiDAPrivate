@@ -83,11 +83,14 @@ bool set_nonblocking(SOCKET sock, bool nb)
 
 bool poll_wait(SOCKET sock, int timeout_ms, bool for_write)
 {
+    if (timeout_ms <= 0) return false;
     WSAPOLLFD pfd{};
     pfd.fd = sock;
     pfd.events = static_cast<short>(for_write ? POLLOUT : POLLIN);
     int rc = WSAPoll(&pfd, 1, timeout_ms);
-    return rc > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) == 0;
+    if (rc <= 0 || (pfd.revents & POLLNVAL) != 0) return false;
+    const short wanted = static_cast<short>(for_write ? POLLOUT : (POLLIN | POLLRDNORM));
+    return (pfd.revents & wanted) != 0 && (pfd.revents & POLLERR) == 0;
 }
 
 bool tcp_connect_timeout(SOCKET sock, const sockaddr* sa, int sa_len, int timeout_ms)
@@ -805,15 +808,24 @@ bool set_active_chain(uint64_t id)
         save_to_disk();
         return true;
     }
-    std::lock_guard<std::mutex> lk(st.mtx);
-    for (const auto& c : st.chains) {
-        if (c.id == id) {
-            diag::log_tagged_fmt("upstream", "set_active_chain ok id=%llu label=%s",
-                static_cast<unsigned long long>(id), c.label.c_str());
-            st.active_id.store(id);
-            save_to_disk();
-            return true;
+    bool found = false;
+    std::string label;
+    {
+        std::lock_guard<std::mutex> lk(st.mtx);
+        for (const auto& c : st.chains) {
+            if (c.id == id) {
+                found = true;
+                label = c.label;
+                break;
+            }
         }
+    }
+    if (found) {
+        diag::log_tagged_fmt("upstream", "set_active_chain ok id=%llu label=%s",
+            static_cast<unsigned long long>(id), label.c_str());
+        st.active_id.store(id);
+        save_to_disk();
+        return true;
     }
     diag::log_tagged_fmt("upstream", "set_active_chain not_found id=%llu",
         static_cast<unsigned long long>(id));

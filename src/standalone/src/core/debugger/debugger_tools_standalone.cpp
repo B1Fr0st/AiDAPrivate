@@ -2676,7 +2676,8 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {OBFSTR("max_modules"), OBFSTR("number"), OBFSTR("Maximum modules to inspect deeply"), false},
          {OBFSTR("max_exports"), OBFSTR("number"), OBFSTR("Maximum exports per module"), false},
          {OBFSTR("max_imports"), OBFSTR("number"), OBFSTR("Maximum imports per module"), false},
-         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Maximum elapsed time before returning partial results"), false}},
+         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Maximum elapsed time before returning partial results"), false},
+         {OBFSTR("allow_partial"), OBFSTR("boolean"), OBFSTR("Return partial results without marking the payload as timed out"), false}},
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_get_modules_detail: entry");
             if (auto err = ensure_attached(params)) return *err;
@@ -2693,6 +2694,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             const int max_modules = int_param_clamped(params, "max_modules", default_modules, 1, 256);
             const int max_exports = int_param_clamped(params, "max_exports", 50, 0, 1000);
             const int max_imports = int_param_clamped(params, "max_imports", 50, 0, 1000);
+            const bool allow_partial = params.value("allow_partial", false);
             std::vector<driver_bridge::module_info_t> mods;
             {
                 std::lock_guard<std::mutex> lk(module_view::g_ui.modules_mutex);
@@ -2777,7 +2779,8 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             json result;
             result["count"] = arr.size();
             result["truncated"] = truncated;
-            result["timed_out"] = timed_out;
+            result["timed_out"] = timed_out && !allow_partial;
+            result["partial"] = timed_out;
             result["max_modules"] = max_modules;
             result["max_exports"] = max_exports;
             result["max_imports"] = max_imports;

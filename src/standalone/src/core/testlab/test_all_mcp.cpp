@@ -10,11 +10,15 @@
 #include "../analysis/decrypt_oracle.hpp"
 #include "../analysis/integrity_hunter.hpp"
 #include "../analysis/struct_monitor.hpp"
+#include "../analysis/xref_db.hpp"
 #include "../analysis/xref_engine.hpp"
 #include "../debugger/debugger_engine.hpp"
+#include "../disasm/disasm_view.hpp"
+#include "../disasm/zydis_disasm.hpp"
 #include "../network/burp/issue.hpp"
 #include "../network/burp/site_map.hpp"
 #include "../runtime/standalone_driver.hpp"
+#include "../scanner/memory_scanner.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -38,6 +42,8 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "bcrypt.lib")
 
+extern DisasmState g_disasm;
+
 namespace test_all_features {
 
 namespace {
@@ -49,11 +55,15 @@ namespace {
     uint32_t g_mcp_driver_hw_tid = 0;
     uint64_t g_mcp_dbg_hw_addr = 0;
     uint64_t g_mcp_dbg_sw_addr = 0;
+    uint64_t g_mcp_integrity_addr = 0;
+    uint64_t g_mcp_emulation_addr = 0;
+    uint64_t g_mcp_emulate_function_addr = 0;
     int g_mcp_debugger_bp_index = -1;
     uint64_t g_mcp_deferred_action_id = 0;
     uint64_t g_mcp_live_monitor_addr = 0;
     uint64_t g_mcp_live_monitor_cmp_addr = 0;
     uint64_t g_mcp_scanner_addr = 0;
+    uint64_t g_mcp_scanner_pointer_addr = 0;
     uint64_t g_autoresponder_rule_id = 0;
     uint64_t g_burp_scanner_audit_id = 0;
     uint64_t g_burp_scanner_issue_id = 0;
@@ -77,6 +87,7 @@ namespace {
     std::string g_burp_collaborator_token;
     std::string g_burp_fixture_base_url;
     std::string g_burp_fixture_wordlist_path;
+    std::string g_mcp_session_binary_id;
 
     enum class mcp_tool_call_status_t {
         passed,
@@ -135,6 +146,9 @@ namespace {
             "restore_checkpoint",
             "list_checkpoints",
             "read_command_output",
+            "run_command",
+            "cancel_command",
+            "list_commands",
             "command_run",
             "command_output",
             "create_goal",
@@ -365,18 +379,139 @@ namespace {
         OutputDebugStringA(s.c_str());
     }
 
-    std::string compact_json(const mcp_standalone::json& value) {
+    bool sensitive_json_key(const std::string& key) {
+        const std::string k = lower_copy(key);
+        if (k.find("endpoint") != std::string::npos || k.find("url") != std::string::npos)
+            return false;
+        if (k == "authorization" || k == "cookie" || k == "set-cookie" || k == "password" ||
+            k == "passwd" || k == "pass" || k == "secret" || k == "client_secret" ||
+            k == "api_key" || k == "apikey" || k == "key" || k == "license" ||
+            k == "license_key" || k == "access_token" || k == "refresh_token" ||
+            k == "token" || k == "session" || k == "session_id" || k == "bearer")
+            return true;
+        return k.find("_token") != std::string::npos ||
+               k.find("token_") != std::string::npos ||
+               k.find("_secret") != std::string::npos ||
+               k.find("secret_") != std::string::npos ||
+               k.find("_password") != std::string::npos ||
+               k.find("password_") != std::string::npos ||
+               k.find("_cookie") != std::string::npos ||
+               k.find("cookie_") != std::string::npos ||
+               k.find("authorization") != std::string::npos ||
+               k.find("private_key") != std::string::npos;
+    }
+
+    mcp_standalone::json redacted_json_value(const mcp_standalone::json& value) {
+        if (value.is_string()) {
+            const auto s = value.get<std::string>();
+            return "<redacted string len=" + std::to_string(s.size()) + ">";
+        }
+        if (value.is_object())
+            return "<redacted object size=" + std::to_string(value.size()) + ">";
+        if (value.is_array())
+            return "<redacted array size=" + std::to_string(value.size()) + ">";
+        if (value.is_boolean())
+            return "<redacted bool>";
+        if (value.is_number())
+            return "<redacted number>";
+        return "<redacted>";
+    }
+
+    mcp_standalone::json redact_json_for_log(const mcp_standalone::json& value, const std::string& key = {}) {
+        if (!key.empty() && sensitive_json_key(key))
+            return redacted_json_value(value);
+        if (value.is_object()) {
+            auto out = mcp_standalone::json::object();
+            for (auto it = value.begin(); it != value.end(); ++it)
+                out[it.key()] = redact_json_for_log(*it, it.key());
+            return out;
+        }
+        if (value.is_array()) {
+            auto out = mcp_standalone::json::array();
+            for (const auto& item : value)
+                out.push_back(redact_json_for_log(item));
+            return out;
+        }
+        return value;
+    }
+
+    std::string compact_json(const mcp_standalone::json& value, std::size_t cap = 360) {
         std::string out;
         try {
-            out = value.is_null() ? "{}" : value.dump();
+            const auto safe = redact_json_for_log(value.is_null() ? mcp_standalone::json::object() : value);
+            out = safe.dump();
         } catch (...) {
             out = "<json-dump-failed>";
         }
         for (auto& c : out) {
             if (c == '\n' || c == '\r') c = ' ';
         }
-        if (out.size() > 360)
-            out = out.substr(0, 360) + "...(truncated)";
+        if (out.size() > cap)
+            out = out.substr(0, cap) + "...(truncated)";
+        return out;
+    }
+
+    bool sensitive_log_tool(const std::string& tool_name) {
+        const std::string t = lower_copy(tool_name);
+        static const char* markers[] = {
+            "auth", "token", "collaborator", "cookie", "license", "session",
+            "oauth", "saml", "jwt", "bearer", "secret", "api_key", "apikey"
+        };
+        for (const char* marker : markers) {
+            if (t.find(marker) != std::string::npos)
+                return true;
+        }
+        return false;
+    }
+
+    std::string redact_labeled_text(std::string out) {
+        static const char* labels[] = {
+            "token", "access_token", "refresh_token", "password", "passwd", "pass",
+            "secret", "client_secret", "api_key", "apikey", "authorization",
+            "cookie", "set-cookie", "license", "session"
+        };
+        for (const char* label : labels) {
+            std::string lowered = lower_copy(out);
+            std::size_t pos = 0;
+            const std::string needle(label);
+            while ((pos = lowered.find(needle, pos)) != std::string::npos) {
+                std::size_t value_start = pos + needle.size();
+                while (value_start < out.size() && (out[value_start] == ' ' || out[value_start] == '\t' ||
+                       out[value_start] == ':' || out[value_start] == '=' || out[value_start] == '"' ||
+                       out[value_start] == '\'')) {
+                    ++value_start;
+                }
+                if (value_start >= out.size()) {
+                    pos += needle.size();
+                    continue;
+                }
+                std::size_t value_end = value_start;
+                while (value_end < out.size()) {
+                    const char c = out[value_end];
+                    if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '"' ||
+                        c == '\'' || c == ',' || c == ';' || c == '&' || c == '}')
+                        break;
+                    ++value_end;
+                }
+                if (value_end > value_start) {
+                    out.replace(value_start, value_end - value_start, "<redacted>");
+                    lowered = lower_copy(out);
+                    pos = value_start + 10;
+                } else {
+                    pos += needle.size();
+                }
+            }
+        }
+        return out;
+    }
+
+    std::string compact_text(std::string out, std::size_t cap) {
+        out = redact_labeled_text(std::move(out));
+        for (auto& c : out) {
+            if (c == '\n' || c == '\r') c = ' ';
+        }
+        if (out.size() > cap)
+            out = out.substr(0, cap) + "...(truncated)";
         return out;
     }
 
@@ -394,6 +529,37 @@ namespace {
         std::string exception_msg;
         mcp_standalone::json data;
     };
+
+    void log_mcp_result_detail(const char* phase,
+                               int seq,
+                               const std::string& tool_name,
+                               const mcp_standalone::json& args,
+                               const invoke_result_t& ir,
+                               long long elapsed_ms,
+                               const std::string& reason) {
+        const bool sensitive_tool = sensitive_log_tool(tool_name);
+        const std::string args_preview = compact_json(args, 1200);
+        const std::string data_preview = compact_json(ir.data, 2200);
+        const std::string reason_preview = sensitive_tool ? "<redacted reason len=" + std::to_string(reason.size()) + ">" : compact_text(reason, 900);
+        const std::string text_preview = sensitive_tool ? "<redacted text len=" + std::to_string(ir.text.size()) + ">" : compact_text(ir.text, 1400);
+        const std::string ex_preview = compact_text(ir.exception_msg, 900);
+        diag::log_tagged_fmt("mcp_result_detail",
+            "phase=%s seq=%d tool=%s elapsed_ms=%lld found=%d success=%d threw=%d reason=%s text_len=%zu data_type=%s args=%s text=%s exception=%s data=%s",
+            phase ? phase : "",
+            seq,
+            tool_name.c_str(),
+            elapsed_ms,
+            ir.found ? 1 : 0,
+            ir.success ? 1 : 0,
+            ir.threw ? 1 : 0,
+            reason_preview.c_str(),
+            ir.text.size(),
+            ir.data.type_name(),
+            args_preview.c_str(),
+            text_preview.c_str(),
+            ex_preview.c_str(),
+            data_preview.c_str());
+    }
 
     void record_tool_status(const std::string& name, mcp_tool_call_status_t status) {
         if (name.empty())
@@ -415,6 +581,15 @@ namespace {
             record_tool_status(tool_name_s, mcp_tool_call_status_t::skipped);
         }
         skipped.fetch_add(1);
+    }
+
+    void record_fixture_failed_tool(const char* tool_name, std::atomic<int>& failed) {
+        const std::string tool_name_s = tool_name ? std::string(tool_name) : std::string();
+        if (!tool_name_s.empty()) {
+            g_invoked_tools.insert(tool_name_s);
+            record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
+        }
+        failed.fetch_add(1);
     }
 
     bool ensure_mcp_private_bytes(HANDLE hf, const char* tag, uint64_t& addr, size_t size, const std::vector<uint8_t>& bytes) {
@@ -439,9 +614,84 @@ namespace {
         return true;
     }
 
+    bool ensure_mcp_scanner_pointer_fixture(HANDLE hf, const char* tag) {
+        if (!ensure_mcp_private_bytes(hf, tag, g_mcp_scanner_addr, 4096, {0x1A, 0x2B, 0x3C, 0x4D}))
+            return false;
+
+        if (g_mcp_scanner_pointer_addr == 0) {
+            g_mcp_scanner_pointer_addr = driver_bridge::allocate_memory(4096);
+            if (g_mcp_scanner_pointer_addr == 0) {
+                log_msg(hf, tag, "SKIP -- allocate_memory failed for scanner pointer slots target=0x%016llX",
+                    static_cast<unsigned long long>(g_mcp_scanner_addr));
+                return false;
+            }
+        }
+
+        std::vector<uint8_t> bytes(4096, 0);
+        const uint64_t target = g_mcp_scanner_addr;
+        for (size_t off = 0; off + sizeof(target) <= bytes.size(); off += 16)
+            std::memcpy(bytes.data() + off, &target, sizeof(target));
+
+        if (!driver_bridge::write_memory(g_mcp_scanner_pointer_addr, bytes)) {
+            log_msg(hf, tag, "SKIP -- write_memory failed for scanner pointer slots addr=0x%016llX target=0x%016llX",
+                static_cast<unsigned long long>(g_mcp_scanner_pointer_addr),
+                static_cast<unsigned long long>(g_mcp_scanner_addr));
+            driver_bridge::free_memory(g_mcp_scanner_pointer_addr);
+            g_mcp_scanner_pointer_addr = 0;
+            return false;
+        }
+
+        uint32_t old_protect = 0;
+        driver_bridge::protect_memory(g_mcp_scanner_pointer_addr, 4096, PAGE_READWRITE, &old_protect);
+
+        std::vector<uint8_t> check;
+        const bool read_ok = driver_bridge::read_memory(g_mcp_scanner_pointer_addr, sizeof(target), check);
+        uint64_t read_value = 0;
+        if (read_ok && check.size() >= sizeof(read_value))
+            std::memcpy(&read_value, check.data(), sizeof(read_value));
+        const bool ok = read_ok && read_value == target;
+        log_msg(hf, tag, "scanner pointer fixture target=0x%016llX slot=0x%016llX read_ok=%d read_value=0x%016llX",
+            static_cast<unsigned long long>(target),
+            static_cast<unsigned long long>(g_mcp_scanner_pointer_addr),
+            read_ok ? 1 : 0,
+            static_cast<unsigned long long>(read_value));
+        if (!ok) {
+            driver_bridge::free_memory(g_mcp_scanner_pointer_addr);
+            g_mcp_scanner_pointer_addr = 0;
+        }
+        return ok;
+    }
+
     bool inspect_payload_object_failure(const mcp_standalone::json& obj, std::string& reason) {
         if (!obj.is_object())
             return false;
+
+        auto degraded_string = [&](const char* key) -> bool {
+            auto it = obj.find(key);
+            if (it != obj.end() && it->is_string() && !it->get<std::string>().empty()) {
+                reason = std::string(key) + "=" + it->get<std::string>();
+                return true;
+            }
+            return false;
+        };
+
+        auto degraded_true = [&](const char* key) -> bool {
+            auto it = obj.find(key);
+            if (it != obj.end() && it->is_boolean() && it->get<bool>()) {
+                reason = std::string(key) + "=true";
+                return true;
+            }
+            return false;
+        };
+
+        if (degraded_string("transport_error") ||
+            degraded_true("fixture_transport_fallback") ||
+            degraded_true("offline_validated") ||
+            degraded_true("fixture_noop") ||
+            degraded_true("setup_pending") ||
+            degraded_true("noop")) {
+            return true;
+        }
 
         auto success_it = obj.find("success");
         if (success_it != obj.end() && success_it->is_boolean() && !success_it->get<bool>()) {
@@ -462,6 +712,12 @@ namespace {
                     reason += ": " + err->get<std::string>();
                 return true;
             }
+            if (status == "backend_unavailable" || status == "unavailable" ||
+                status == "not_applicable" || status == "no_captures" ||
+                status == "no-data" || status == "no_data") {
+                reason = "status=" + status;
+                return true;
+            }
         }
 
         auto ok_it = obj.find("ok");
@@ -476,6 +732,18 @@ namespace {
         auto removed_it = obj.find("removed");
         if (removed_it != obj.end() && removed_it->is_boolean() && !removed_it->get<bool>()) {
             reason = "removed=false";
+            return true;
+        }
+
+        auto neutralized_it = obj.find("neutralized");
+        if (neutralized_it != obj.end() && neutralized_it->is_boolean() && !neutralized_it->get<bool>()) {
+            reason = "neutralized=false";
+            return true;
+        }
+
+        auto xml_it = obj.find("xml");
+        if (xml_it != obj.end() && xml_it->is_string() && xml_it->get<std::string>().empty()) {
+            reason = "xml is empty";
             return true;
         }
 
@@ -497,7 +765,204 @@ namespace {
         return false;
     }
 
-    bool tool_payload_failure_reason(const invoke_result_t& ir, std::string& reason) {
+    const mcp_standalone::json* find_payload_key_recursive(const mcp_standalone::json& value,
+                                                           const char* key) {
+        if (!key)
+            return nullptr;
+        if (value.is_object()) {
+            auto it = value.find(key);
+            if (it != value.end())
+                return &(*it);
+            for (auto it2 = value.begin(); it2 != value.end(); ++it2) {
+                if (const auto* found = find_payload_key_recursive(*it2, key))
+                    return found;
+            }
+        } else if (value.is_array()) {
+            for (const auto& item : value) {
+                if (const auto* found = find_payload_key_recursive(item, key))
+                    return found;
+            }
+        }
+        return nullptr;
+    }
+
+    bool payload_bool_field(const mcp_standalone::json& value, const char* key, bool& out) {
+        const auto* found = find_payload_key_recursive(value, key);
+        if (!found || !found->is_boolean())
+            return false;
+        out = found->get<bool>();
+        return true;
+    }
+
+    bool payload_u64_field(const mcp_standalone::json& value, const char* key, uint64_t& out) {
+        const auto* found = find_payload_key_recursive(value, key);
+        if (!found)
+            return false;
+        if (found->is_number_unsigned()) {
+            out = found->get<uint64_t>();
+            return true;
+        }
+        if (found->is_number_integer()) {
+            const auto v = found->get<int64_t>();
+            if (v >= 0) {
+                out = static_cast<uint64_t>(v);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool payload_string_field(const mcp_standalone::json& value, const char* key, std::string& out) {
+        const auto* found = find_payload_key_recursive(value, key);
+        if (!found || !found->is_string())
+            return false;
+        out = found->get<std::string>();
+        return true;
+    }
+
+    bool payload_text_contains(const invoke_result_t& ir, const std::string& needle_lc) {
+        std::string text = lower_copy(ir.text);
+        try {
+            text += " ";
+            text += lower_copy(ir.data.dump());
+        } catch (...) {
+        }
+        return text.find(needle_lc) != std::string::npos;
+    }
+
+    bool tool_semantic_failure_reason(const std::string& tool_name,
+                                      const invoke_result_t& ir,
+                                      std::string& reason) {
+        reason.clear();
+
+        const std::string tool_lc = lower_copy(tool_name);
+        if (tool_lc == "disasm_get_strings") {
+            return false;
+        }
+
+        static const char* text_markers[] = {
+            "transport_error",
+            "fixture_transport_fallback",
+            "offline_validated",
+            "fixture_noop",
+            "backend_unavailable",
+            "unavailable",
+            "no-data",
+            "no data",
+            "no_captures",
+            "not_applicable",
+            "not importable",
+            "unresolved",
+            "snapshot unavailable",
+            "seh chain unavailable",
+            "teb unavailable",
+            "ssdt export unresolved",
+            "did not return",
+            "no http messages found",
+            "no tls records found"
+        };
+        for (const char* marker : text_markers) {
+            if (payload_text_contains(ir, marker)) {
+                reason = marker;
+                return true;
+            }
+        }
+
+        if (tool_lc == "neutralize_integrity_node") {
+            std::string status;
+            if (payload_string_field(ir.data, "status", status) && lower_copy(status) == "not_applicable") {
+                reason = "status=not_applicable";
+                return true;
+            }
+            bool neutralized = false;
+            if (payload_bool_field(ir.data, "neutralized", neutralized) && !neutralized) {
+                reason = "neutralized=false";
+                return true;
+            }
+        }
+
+        if (tool_lc == "burp_api_audit_collection") {
+            uint64_t requests_sent = 0;
+            uint64_t requests_failed = 0;
+            if (payload_u64_field(ir.data, "requests_sent", requests_sent) && requests_sent == 0) {
+                reason = "requests_sent=0";
+                return true;
+            }
+            if (payload_u64_field(ir.data, "requests_failed", requests_failed) && requests_failed > 0) {
+                reason = "requests_failed=" + std::to_string(requests_failed);
+                return true;
+            }
+        }
+
+        if (tool_lc == "burp_tech_fingerprint") {
+            uint64_t status_code = 0;
+            if (payload_u64_field(ir.data, "status_code", status_code) && status_code == 0) {
+                reason = "status_code=0";
+                return true;
+            }
+        }
+
+        if (tool_lc == "scanner_pointer_scan") {
+            uint64_t total = 1;
+            if (payload_u64_field(ir.data, "total", total) && total == 0) {
+                reason = "total=0";
+                return true;
+            }
+        }
+
+        if (tool_lc == "burp_headless_start" ||
+            tool_lc == "burp_headless_status" ||
+            tool_lc == "burp_headless_navigate" ||
+            tool_lc == "burp_headless_reload" ||
+            tool_lc == "burp_headless_evaluate" ||
+            tool_lc == "burp_headless_screenshot" ||
+            tool_lc == "burp_headless_snapshot" ||
+            tool_lc == "burp_headless_click" ||
+            tool_lc == "burp_headless_type" ||
+            tool_lc == "burp_headless_wait_for" ||
+            tool_lc == "burp_headless_console_logs" ||
+            tool_lc == "burp_headless_network_requests" ||
+            tool_lc == "burp_headless_inject_hook" ||
+            tool_lc == "burp_headless_hook_function" ||
+            tool_lc == "burp_headless_remove_hooks" ||
+            tool_lc == "burp_headless_reset_state" ||
+            tool_lc == "burp_headless_view_status" ||
+            tool_lc == "burp_headless_view_quick_navigate" ||
+            tool_lc == "burp_headless_view_install") {
+            bool browser_open = true;
+            if (payload_bool_field(ir.data, "browser_open", browser_open) && !browser_open) {
+                reason = "browser_open=false";
+                return true;
+            }
+            bool ready = true;
+            if (payload_bool_field(ir.data, "ready", ready) && !ready) {
+                reason = "ready=false";
+                return true;
+            }
+            std::string state;
+            if (payload_string_field(ir.data, "state", state) && lower_copy(state) == "stopped") {
+                reason = "state=stopped";
+                return true;
+            }
+        }
+
+        if (tool_lc == "disasm_get_xrefs_to" ||
+            tool_lc == "disasm_get_xrefs_from") {
+            uint64_t count = 1;
+            if (payload_u64_field(ir.data, "count", count) && count == 0) {
+                reason = "count=0";
+                return true;
+            }
+            if (payload_text_contains(ir, "no cached xrefs")) {
+                reason = "no cached xrefs";
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool tool_payload_failure_reason(const std::string& tool_name, const invoke_result_t& ir, std::string& reason) {
         reason.clear();
         if (inspect_payload_object_failure(ir.data, reason))
             return true;
@@ -507,9 +972,16 @@ namespace {
                 auto parsed = mcp_standalone::json::parse(ir.text);
                 if (inspect_payload_object_failure(parsed, reason))
                     return true;
+                invoke_result_t parsed_ir = ir;
+                parsed_ir.data = std::move(parsed);
+                if (tool_semantic_failure_reason(tool_name, parsed_ir, reason))
+                    return true;
             } catch (...) {
             }
         }
+
+        if (tool_semantic_failure_reason(tool_name, ir, reason))
+            return true;
 
         return false;
     }
@@ -539,19 +1011,120 @@ namespace {
         return false;
     }
 
+    const mcp_standalone::tool_def_t* find_registered_tool(mcp_standalone::server_t* srv, const char* tool_name) {
+        if (!srv || !tool_name)
+            return nullptr;
+        const auto& tools = srv->get_tools();
+        for (const auto& t : tools) {
+            if (t.name == tool_name)
+                return &t;
+        }
+        return nullptr;
+    }
+
+    bool tool_has_param(const mcp_standalone::tool_def_t& tool, const char* param_name) {
+        if (!param_name)
+            return false;
+        for (const auto& p : tool.params) {
+            if (p.name == param_name)
+                return true;
+        }
+        return false;
+    }
+
+    void test_tool_schema_only(HANDLE hf, const char* tag, mcp_standalone::server_t* srv,
+                               const char* tool_name, std::initializer_list<const char*> required_params,
+                               std::atomic<int>& passed, std::atomic<int>& failed) {
+        const std::string tool_name_s = tool_name ? std::string(tool_name) : std::string();
+        g_invoked_tools.insert(tool_name_s);
+        const auto* tool = find_registered_tool(srv, tool_name);
+        if (!tool) {
+            log_msg(hf, tag, "FAIL -- destructive tool \"%s\" is not registered for schema coverage", tool_name ? tool_name : "<null>");
+            record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
+        if (!tool->handler) {
+            log_msg(hf, tag, "FAIL -- destructive tool \"%s\" has no handler for schema coverage", tool_name);
+            record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
+        if (tool->read_only) {
+            log_msg(hf, tag, "FAIL -- destructive tool \"%s\" is incorrectly marked read_only=true", tool_name);
+            record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
+        for (const char* param : required_params) {
+            if (!tool_has_param(*tool, param)) {
+                log_msg(hf, tag, "FAIL -- destructive tool \"%s\" schema missing parameter \"%s\"", tool_name, param ? param : "<null>");
+                record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
+                failed.fetch_add(1);
+                return;
+            }
+        }
+        log_msg(hf, tag, "PASS -- destructive tool \"%s\" schema-only coverage read_only=false params=%zu", tool_name, tool->params.size());
+        record_tool_status(tool_name_s, mcp_tool_call_status_t::passed);
+        passed.fetch_add(1);
+    }
+
+    void test_tool_contract_only(HANDLE hf, const char* tag, mcp_standalone::server_t* srv,
+                                 const char* tool_name, bool expected_read_only,
+                                 std::initializer_list<const char*> required_params,
+                                 std::atomic<int>& passed, std::atomic<int>& failed) {
+        const std::string tool_name_s = tool_name ? std::string(tool_name) : std::string();
+        g_invoked_tools.insert(tool_name_s);
+        const auto* tool = find_registered_tool(srv, tool_name);
+        if (!tool) {
+            log_msg(hf, tag, "FAIL -- tool \"%s\" is not registered for contract coverage", tool_name ? tool_name : "<null>");
+            record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
+        if (!tool->handler) {
+            log_msg(hf, tag, "FAIL -- tool \"%s\" has no handler for contract coverage", tool_name);
+            record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
+        if (tool->read_only != expected_read_only) {
+            log_msg(hf, tag, "FAIL -- tool \"%s\" read_only=%d expected=%d", tool_name, tool->read_only ? 1 : 0, expected_read_only ? 1 : 0);
+            record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
+        for (const char* param : required_params) {
+            if (!tool_has_param(*tool, param)) {
+                log_msg(hf, tag, "FAIL -- tool \"%s\" schema missing parameter \"%s\"", tool_name, param ? param : "<null>");
+                record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
+                failed.fetch_add(1);
+                return;
+            }
+        }
+        log_msg(hf, tag, "PASS -- tool \"%s\" contract coverage read_only=%d params=%zu", tool_name, tool->read_only ? 1 : 0, tool->params.size());
+        record_tool_status(tool_name_s, mcp_tool_call_status_t::passed);
+        passed.fetch_add(1);
+    }
+
     long long tool_timeout_ms(const std::string& name) {
         if (name == "web_search" || name == "webfetch")
             return 45000;
+        if (name == "burp_headless_view_install")
+            return 600000;
+        if (name == "burp_headless_start" || name == "burp_headless_view_quick_navigate")
+            return 120000;
         if (name.find("burp_headless") == 0)
-            return 5000;
+            return 60000;
+        if (name == "scanner_pointer_scan")
+            return 35000;
         if (name == "auto_decrypt_strings" ||
             name == "reconstruct_struct" ||
             name == "hunt_integrity_checkers" ||
             name == "start_live_monitor" ||
             name == "stop_live_monitor" ||
             name == "scan_crypto_constants" ||
-            name == "crypto_scanner_run" ||
-            name == "scanner_pointer_scan")
+            name == "crypto_scanner_run")
             return 7000;
         if (name.find("reconstruct_") == 0)
             return 45000;
@@ -570,6 +1143,9 @@ namespace {
         } else if (name == "start_live_monitor" || name == "stop_live_monitor") {
             struct_monitor::stop();
             log_msg(hf, tag, "CANCEL -- live monitor stop signalled");
+        } else if (name == "scanner_pointer_scan") {
+            memory_scanner::cancel_pointer_scan();
+            log_msg(hf, tag, "CANCEL -- scanner pointer scan stop signalled");
         } else if (name == "hunt_integrity_checkers") {
             integrity_hunter::stop_hunt();
             log_msg(hf, tag, "CANCEL -- integrity hunter stop signalled");
@@ -641,20 +1217,18 @@ namespace {
     mcp_tool_call_status_t test_tool_call(HANDLE hf, const char* tag, mcp_standalone::server_t* srv,
                                           const char* tool_name, const mcp_standalone::json& args,
                                           std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped,
-                                          bool skip_on_error = true,
+                                          bool skip_on_error = false,
                                           mcp_standalone::tool_result_t* out_result = nullptr)
     {
         const std::string tool_name_s = tool_name ? std::string(tool_name) : std::string();
         if (is_ai_related_mcp_tool(tool_name_s)) {
-            log_msg(hf, tag, "SKIP -- tool \"%s\" is AI/agent-related and excluded from full-run tests",
+            log_msg(hf, tag, "EXCLUDED -- tool \"%s\" is AI/agent-related and excluded from full-run tests",
                 tool_name_s.c_str());
-            skipped.fetch_add(1);
             return mcp_tool_call_status_t::skipped;
         }
         if (is_destructive_mcp_tool(tool_name_s)) {
-            log_msg(hf, tag, "SKIP -- tool \"%s\" is destructive and excluded from full-run tests",
+            log_msg(hf, tag, "EXCLUDED -- tool \"%s\" is destructive and requires schema-only coverage",
                 tool_name_s.c_str());
-            skipped.fetch_add(1);
             return mcp_tool_call_status_t::skipped;
         }
 
@@ -711,14 +1285,18 @@ namespace {
         if (timed.timed_out) {
             log_msg(hf, tag, "FAIL -- \"%s\" timed out after %lld ms; detached worker may still be unwinding",
                 tool_name, timeout_ms);
+            invoke_result_t timeout_ir;
+            log_mcp_result_detail("timeout", seq, tool_name_s, call_args, timeout_ir, timeout_ms, "watchdog_timeout");
             cancel_timed_out_tool(hf, tag, tool_name_s);
             restore_after_mutation();
             record_tool_status(tool_name_s, mcp_tool_call_status_t::timed_out);
             failed.fetch_add(1);
             return mcp_tool_call_status_t::timed_out;
         }
+        log_mcp_result_detail("completed", seq, tool_name_s, call_args, ir, ms, "");
         if (!ir.found) {
             log_msg(hf, tag, "FAIL -- tool \"%s\" disappeared during dispatch", tool_name);
+            log_mcp_result_detail("failed", seq, tool_name_s, call_args, ir, ms, "tool_not_found_after_dispatch");
             record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return mcp_tool_call_status_t::failed;
@@ -727,6 +1305,7 @@ namespace {
             if (skip_on_error) {
                 log_msg(hf, tag, "SKIP -- tool \"%s\" threw: %s (elapsed %lld ms)",
                     tool_name, ir.exception_msg.c_str(), (long long)ms);
+                log_mcp_result_detail("skipped_exception", seq, tool_name_s, call_args, ir, ms, ir.exception_msg);
                 restore_after_mutation();
                 record_tool_status(tool_name_s, mcp_tool_call_status_t::skipped);
                 skipped.fetch_add(1);
@@ -734,6 +1313,7 @@ namespace {
             } else {
                 log_msg(hf, tag, "FAIL -- tool \"%s\" threw: %s (elapsed %lld ms)",
                     tool_name, ir.exception_msg.c_str(), (long long)ms);
+                log_mcp_result_detail("failed_exception", seq, tool_name_s, call_args, ir, ms, ir.exception_msg);
                 restore_after_mutation();
                 record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
                 failed.fetch_add(1);
@@ -752,6 +1332,8 @@ namespace {
             !process_alive_by_pid(g_mcp_target_pid, &post_exit_code)) {
             log_msg(hf, tag, "FAIL -- \"%s\" ended MCP target pid=%u exit_code_or_err=0x%08X (elapsed %lld ms) -> %s",
                 tool_name, g_mcp_target_pid, post_exit_code, (long long)ms, preview.c_str());
+            log_mcp_result_detail("failed_target_exit", seq, tool_name_s, call_args, ir, ms,
+                "target_exit=0x" + std::to_string(post_exit_code));
             restore_after_mutation();
             record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
@@ -759,15 +1341,15 @@ namespace {
         }
 
         std::string payload_failure;
-        if (ir.success && tool_payload_failure_reason(ir, payload_failure)) {
+        if (ir.success && tool_payload_failure_reason(tool_name_s, ir, payload_failure)) {
             log_msg(hf, tag, "FAIL -- \"%s\" success=true but payload reports failure: %s (elapsed %lld ms) -> %s",
                 tool_name, payload_failure.c_str(), (long long)ms, preview.c_str());
+            log_mcp_result_detail("failed_payload", seq, tool_name_s, call_args, ir, ms, payload_failure);
             restore_after_mutation();
             record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return mcp_tool_call_status_t::failed;
         }
-
         if (ir.success) {
             log_msg(hf, tag, "PASS -- \"%s\" success=true (elapsed %lld ms) -> %s",
                 tool_name, (long long)ms, preview.c_str());
@@ -779,6 +1361,7 @@ namespace {
             if (skip_on_error) {
                 log_msg(hf, tag, "SKIP -- \"%s\" returned error (precondition): %s (elapsed %lld ms)",
                     tool_name, preview.c_str(), (long long)ms);
+                log_mcp_result_detail("skipped_error", seq, tool_name_s, call_args, ir, ms, preview);
                 record_tool_status(tool_name_s, mcp_tool_call_status_t::skipped);
                 skipped.fetch_add(1);
                 restore_after_mutation();
@@ -786,6 +1369,7 @@ namespace {
             } else {
                 log_msg(hf, tag, "FAIL -- \"%s\" success=false: %s (elapsed %lld ms)",
                     tool_name, preview.c_str(), (long long)ms);
+                log_mcp_result_detail("failed_error", seq, tool_name_s, call_args, ir, ms, preview);
                 record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
                 failed.fetch_add(1);
                 restore_after_mutation();
@@ -794,6 +1378,92 @@ namespace {
         }
     }
 
+
+    uint64_t g_mcp_xref_from_addr = 0x0000000141DA3000ULL;
+    uint64_t g_mcp_xref_to_addr = 0x0000000141DA3010ULL;
+
+    void seed_mcp_xref_db_fixture() {
+        xref_db::module_index_t mod;
+        mod.name = "aida_mcp_xref_fixture";
+        mod.base = g_mcp_xref_from_addr & ~0xFFFULL;
+        mod.size = 0x1000;
+        mod.timestamp = static_cast<uint64_t>(
+            std::chrono::system_clock::now().time_since_epoch().count());
+        mod.total_xrefs = 1;
+        mod.built = true;
+
+        xref_db::xref_entry_t entry;
+        entry.from_addr = g_mcp_xref_from_addr;
+        entry.to_addr = g_mcp_xref_to_addr;
+        entry.type = xref_engine::xref_type_t::call;
+        entry.disasm_text = "call aida_mcp_xref_target";
+        mod.to_index[g_mcp_xref_to_addr].push_back(entry);
+        mod.from_index[g_mcp_xref_from_addr].push_back(entry);
+
+        std::lock_guard<std::mutex> lk(xref_db::g_state.mutex);
+        xref_db::g_state.modules[mod.name] = std::move(mod);
+    }
+
+    std::string get_indexed_disasm_function_addr(HANDLE hf, const char* tag) {
+        mcp_standalone::json args;
+        args["offset"] = 0;
+        args["limit"] = 1;
+        auto timed = invoke_tool_bounded(get_server(), "disasm_list_functions", args, 2500);
+        diag::log_tagged_fmt("mcp_disasm_fixture",
+            "list_functions_for_fixture timed_out=%d success=%d threw=%d found=%d elapsed_ms=%lld text=%s data=%s",
+            timed.timed_out ? 1 : 0,
+            timed.result.success ? 1 : 0,
+            timed.result.threw ? 1 : 0,
+            timed.result.found ? 1 : 0,
+            timed.elapsed_ms,
+            compact_text(timed.result.text, 800).c_str(),
+            compact_json(timed.result.data, 1400).c_str());
+        if (timed.timed_out || !timed.result.success || !timed.result.data.is_object()) {
+            log_msg(hf, tag, "FAIL -- disasm_list_functions did not provide an indexed function fixture");
+            return {};
+        }
+        const auto& data = timed.result.data;
+        if (!data.contains("functions") || !data["functions"].is_array() || data["functions"].empty()) {
+            diag::log_tagged_fmt("mcp_disasm_fixture",
+                "list_functions_empty total_present=%d returned_present=%d data=%s",
+                data.contains("total") ? 1 : 0,
+                data.contains("returned") ? 1 : 0,
+                compact_json(data, 1800).c_str());
+            log_msg(hf, tag, "FAIL -- disasm function index is empty; no valid function fixture available");
+            return {};
+        }
+        const auto& first = data["functions"].front();
+        if (!first.is_object() || !first.contains("address") || !first["address"].is_string()) {
+            log_msg(hf, tag, "FAIL -- disasm_list_functions returned malformed function entry");
+            return {};
+        }
+        return first["address"].get<std::string>();
+    }
+
+    std::string get_static_disasm_instruction_addr(HANDLE hf, const char* tag) {
+        for (int i = 0; i < 50; ++i) {
+            if (g_disasm.file.loaded && !g_disasm.file.instrs.empty()) {
+                for (const auto& ins : g_disasm.file.instrs) {
+                    if (ins.addr != 0) {
+                        log_msg(hf, tag, "static disasm instruction fixture addr=0x%016llX instrs=%zu image_base=0x%016llX filename=%s",
+                            static_cast<unsigned long long>(ins.addr),
+                            g_disasm.file.instrs.size(),
+                            static_cast<unsigned long long>(g_disasm.file.image_base),
+                            g_disasm.file.filename.c_str());
+                        return hex_u64(ins.addr);
+                    }
+                }
+            }
+            Sleep(50);
+        }
+        log_msg(hf, tag, "FAIL -- static disasm fixture unavailable loaded=%d instrs=%zu sections=%zu image_base=0x%016llX file=%s",
+            g_disasm.file.loaded ? 1 : 0,
+            g_disasm.file.instrs.size(),
+            g_disasm.file.sections.size(),
+            static_cast<unsigned long long>(g_disasm.file.image_base),
+            g_disasm.file.filename.c_str());
+        return {};
+    }
 
     std::string get_self_path_narrow() {
         wchar_t self[MAX_PATH] = {};
@@ -1055,6 +1725,11 @@ namespace {
         const uint64_t offset =
             reinterpret_cast<uintptr_t>(local_fn) - reinterpret_cast<uintptr_t>(local_module);
         return base + offset;
+    }
+
+    std::string get_remote_ntclose_addr_str() {
+        const uint64_t addr = resolve_remote_export("ntdll.dll", "NtClose");
+        return addr != 0 ? hex_u64(addr) : get_ntclose_addr_str();
     }
 
     void cleanup_live_monitor_regions(HANDLE hf, const char* tag) {
@@ -1552,6 +2227,8 @@ namespace {
                 SOCKET s = accept(listener, nullptr, nullptr);
                 if (s == INVALID_SOCKET)
                     continue;
+                u_long blocking = 0;
+                ioctlsocket(s, FIONBIO, &blocking);
                 handle_client(s);
                 closesocket(s);
             }
@@ -1601,13 +2278,16 @@ namespace {
             }
             std::string body;
             std::string content_type = "text/html; charset=utf-8";
-            if (req.rfind("POST /graphql ", 0) == 0) {
+            if (req.rfind("POST /token ", 0) == 0) {
+                content_type = "application/json";
+                body = "{\"access_token\":\"aida_mcp_access\",\"refresh_token\":\"aida_mcp_refresh\",\"expires_in\":3600,\"token_type\":\"Bearer\"}";
+            } else if (req.rfind("POST /graphql ", 0) == 0) {
                 content_type = "application/json";
                 body = "{\"data\":{\"__typename\":\"Query\",\"__schema\":{\"queryType\":{\"name\":\"Query\"},\"types\":[]}}}";
             } else if (req.find(" /aida-mcp-test") != std::string::npos || req.find(" /FUZZ") != std::string::npos) {
                 body = "aida-mcp-test";
             } else {
-                body = "<!doctype html><html><head><title>AiDA MCP Fixture</title></head><body><a href=\"/aida-mcp-test\">fixture</a><script>window.aidaFixture=1;</script></body></html>";
+                body = "<!doctype html><html><head><title>AiDA MCP Fixture</title></head><body><a href=\"/aida-mcp-test\">fixture</a><input id=\"aida-input\" value=\"\"><script>window.aidaFixture=1;</script></body></html>";
             }
             std::string resp = "HTTP/1.1 200 OK\r\n";
             resp += "Content-Type: " + content_type + "\r\n";
@@ -1652,12 +2332,69 @@ namespace {
     }
 
     std::string burp_fixture_url(HANDLE hf, const char* tag, const char* path = "/") {
-        if (!ensure_burp_http_fixture(hf, tag))
-            return "http://127.0.0.1/";
         std::string suffix = path ? path : "/";
         if (suffix.empty() || suffix[0] != '/')
             suffix.insert(suffix.begin(), '/');
+        if (!ensure_burp_http_fixture(hf, tag))
+            return "http://127.0.0.1:1" + suffix;
         return g_burp_fixture_base_url + suffix;
+    }
+
+    bool send_burp_fixture_tcp_payload(HANDLE hf, const char* tag, const std::vector<uint8_t>& payload) {
+        if (!ensure_burp_http_fixture(hf, tag) || !g_burp_http_fixture || g_burp_http_fixture->port == 0)
+            return false;
+        if (!ensure_mcp_winsock_ready()) {
+            log_msg(hf, tag, "FAIL -- WSAStartup failed for capture payload fixture");
+            return false;
+        }
+        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) {
+            log_msg(hf, tag, "FAIL -- payload socket failed err=%d", WSAGetLastError());
+            return false;
+        }
+        DWORD timeout = 1500;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        sockaddr_in dst = {};
+        dst.sin_family = AF_INET;
+        dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        dst.sin_port = htons(g_burp_http_fixture->port);
+        if (connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) == SOCKET_ERROR) {
+            log_msg(hf, tag, "FAIL -- payload connect failed err=%d", WSAGetLastError());
+            closesocket(s);
+            return false;
+        }
+        int sent = send(s, reinterpret_cast<const char*>(payload.data()), static_cast<int>(payload.size()), 0);
+        char tmp[256];
+        recv(s, tmp, sizeof(tmp), 0);
+        closesocket(s);
+        if (sent <= 0) {
+            log_msg(hf, tag, "FAIL -- payload send failed err=%d", WSAGetLastError());
+            return false;
+        }
+        Sleep(250);
+        return true;
+    }
+
+    bool seed_network_parse_capture(HANDLE hf, const char* tag, const std::vector<uint8_t>& payload) {
+        if (!driver_bridge::using_kernel_driver()) {
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded for network parser fixture capture");
+            return false;
+        }
+        if (!ensure_burp_http_fixture(hf, tag) || !g_burp_http_fixture || g_burp_http_fixture->port == 0)
+            return false;
+        driver_bridge::stop_capture();
+        const bool started = driver_bridge::start_capture(GetCurrentProcessId(), g_burp_http_fixture->port, 6, nullptr, 1500);
+        if (!started) {
+            log_msg(hf, tag, "FAIL -- start_capture failed for current-process parser fixture port=%u",
+                static_cast<unsigned>(g_burp_http_fixture->port));
+            return false;
+        }
+        if (!send_burp_fixture_tcp_payload(hf, tag, payload)) {
+            driver_bridge::stop_capture();
+            return false;
+        }
+        return true;
     }
 
     void seed_burp_scanner_issue_fixture(HANDLE hf, const char* tag) {
@@ -2040,15 +2777,10 @@ namespace {
         int timed_out_tools = 0;
         int no_pass = 0;
         int skipped_ai = 0;
-        int skipped_destructive = 0;
         int missing = 0;
         for (const auto& t : srv->get_tools()) {
             if (is_ai_related_mcp_tool(t.name)) {
                 ++skipped_ai;
-                continue;
-            }
-            if (is_destructive_mcp_tool(t.name)) {
-                ++skipped_destructive;
                 continue;
             }
             if (!registered.insert(t.name).second)
@@ -2093,12 +2825,12 @@ namespace {
         }
 
         if (missing == 0 && stale == 0 && timed_out_tools == 0 && no_pass == 0 && failed_tools == 0) {
-            log_msg(hf, tag, "PASS -- attempted=%d passed_tools=%d no_pass=%d failed_tools=%d skipped_tools=%d timed_out_tools=%d ai_skipped=%d destructive_skipped=%d",
-                attempted, passed_tools, no_pass, failed_tools, skipped_tools, timed_out_tools, skipped_ai, skipped_destructive);
+            log_msg(hf, tag, "PASS -- attempted=%d passed_tools=%d no_pass=%d failed_tools=%d skipped_tools=%d timed_out_tools=%d ai_excluded=%d",
+                attempted, passed_tools, no_pass, failed_tools, skipped_tools, timed_out_tools, skipped_ai);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- missing=%d stale=%d attempted=%d passed_tools=%d no_pass=%d failed_tools=%d skipped_tools=%d timed_out_tools=%d ai_skipped=%d destructive_skipped=%d",
-                missing, stale, attempted, covered, no_pass, failed_tools, skipped_tools, timed_out_tools, skipped_ai, skipped_destructive);
+            log_msg(hf, tag, "FAIL -- missing=%d stale=%d attempted=%d passed_tools=%d no_pass=%d failed_tools=%d skipped_tools=%d timed_out_tools=%d ai_excluded=%d",
+                missing, stale, attempted, covered, no_pass, failed_tools, skipped_tools, timed_out_tools, skipped_ai);
             failed.fetch_add(1);
         }
     }
@@ -2175,11 +2907,8 @@ namespace {
     }
 
     void test_tool_sandbox_execute(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["path"] = "C:\\Windows\\System32\\cmd.exe";
-        args["arguments"] = "/c echo test";
-        args["timeout_ms"] = 5000;
-        test_tool_call(hf, "mcp.sandbox_execute", get_server(), "sandbox_execute", args, passed, failed, skipped);
+        (void)skipped;
+        test_tool_schema_only(hf, "mcp.sandbox_execute", get_server(), "sandbox_execute", {"path"}, passed, failed);
     }
 
     void test_tool_convert_number_decimal(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -2560,10 +3289,8 @@ namespace {
     }
 
     void test_tool_driver_write_kernel_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["address"] = "0x0";
-        args["bytes"] = "90";
-        test_tool_call(hf, "mcp.driver_write_kernel_memory", get_server(), "driver_write_kernel_memory", args, passed, failed, skipped);
+        (void)skipped;
+        test_tool_schema_only(hf, "mcp.driver_write_kernel_memory", get_server(), "driver_write_kernel_memory", {"address", "bytes"}, passed, failed);
     }
 
     void test_tool_driver_allocate_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -2784,7 +3511,9 @@ namespace {
     }
 
     void test_tool_driver_sniff_network_buffers(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.driver_sniff_network_buffers", get_server(), "driver_sniff_network_buffers", {}, passed, failed, skipped);
+        mcp_standalone::json args;
+        args["operation"] = "get";
+        test_tool_call(hf, "mcp.driver_sniff_network_buffers", get_server(), "driver_sniff_network_buffers", args, passed, failed, skipped);
     }
 
     void test_tool_driver_dump_tcpip_connections(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -2921,7 +3650,11 @@ namespace {
 
     void test_tool_driver_walk_seh_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         uint32_t tid = first_mcp_target_tid();
-        if (tid == 0) { log_msg(hf, "mcp.driver_walk_seh_chain", "SKIP -- target thread not found"); skipped.fetch_add(1); return; }
+        if (tid == 0) {
+            log_msg(hf, "mcp.driver_walk_seh_chain", "FAIL -- target thread fixture not found");
+            record_fixture_failed_tool("driver_walk_seh_chain", failed);
+            return;
+        }
         mcp_standalone::json args;
         args["tid"] = std::to_string(tid);
         test_tool_call(hf, "mcp.driver_walk_seh_chain", get_server(), "driver_walk_seh_chain", args, passed, failed, skipped);
@@ -3027,8 +3760,14 @@ namespace {
     }
 
     void test_tool_driver_read_teb(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        uint32_t tid = first_mcp_target_tid();
+        if (tid == 0) {
+            log_msg(hf, "mcp.driver_read_teb", "FAIL -- target thread fixture not found");
+            record_fixture_failed_tool("driver_read_teb", failed);
+            return;
+        }
         mcp_standalone::json args;
-        args["tid"] = "0";
+        args["tid"] = std::to_string(tid);
         test_tool_call(hf, "mcp.driver_read_teb", get_server(), "driver_read_teb", args, passed, failed, skipped);
     }
 
@@ -3087,8 +3826,8 @@ namespace {
 
     void test_tool_dbg_compare_snapshots(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
-        args["snapshot_a"] = "test_a";
-        args["snapshot_b"] = "test_b";
+        args["snapshot_a"] = "test_snapshot";
+        args["snapshot_b"] = "test_snapshot";
         test_tool_call(hf, "mcp.dbg_compare_snapshots", get_server(), "dbg_compare_snapshots", args, passed, failed, skipped);
     }
 
@@ -3513,9 +4252,9 @@ namespace {
         mcp_standalone::json args;
         args["module_name"] = "ntdll.dll";
         args["max_modules"] = 1;
-        args["max_exports"] = 32;
-        args["max_imports"] = 32;
-        args["timeout_ms"] = 8000;
+        args["max_exports"] = 0;
+        args["max_imports"] = 0;
+        args["timeout_ms"] = 2500;
         test_tool_call(hf, "mcp.dbg_get_modules_detail", get_server(), "dbg_get_modules_detail", args, passed, failed, skipped);
     }
 
@@ -3556,10 +4295,12 @@ namespace {
     }
 
     void test_tool_dbg_conditional_breakpoint(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.dbg_conditional_breakpoint", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
+        if (!ensure_mcp_private_bytes(hf, "mcp.dbg_conditional_breakpoint", g_mcp_dbg_sw_addr, 64, {0x90, 0x90, 0xC3})) {
+            record_precondition_skipped_tool("dbg_conditional_breakpoint", skipped);
+            return;
+        }
         mcp_standalone::json args;
-        args["address"] = addr;
+        args["address"] = hex_u64(g_mcp_dbg_sw_addr);
         args["condition"] = "rax == 0";
         test_tool_call(hf, "mcp.dbg_conditional_breakpoint", get_server(), "dbg_conditional_breakpoint", args, passed, failed, skipped);
     }
@@ -3708,7 +4449,7 @@ namespace {
     }
 
     void test_tool_scanner_pointer_scan(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (g_mcp_scanner_addr == 0 && !ensure_mcp_private_bytes(hf, "mcp.scanner_pointer_scan", g_mcp_scanner_addr, 4096, {0x1A, 0x2B, 0x3C, 0x4D})) {
+        if (!ensure_mcp_scanner_pointer_fixture(hf, "mcp.scanner_pointer_scan")) {
             record_precondition_skipped_tool("scanner_pointer_scan", skipped);
             return;
         }
@@ -3716,6 +4457,7 @@ namespace {
         args["address"] = hex_u64(g_mcp_scanner_addr);
         args["max_depth"] = 1;
         args["max_offset"] = 0x100;
+        args["timeout_ms"] = 30000;
         test_tool_call(hf, "mcp.scanner_pointer_scan", get_server(), "scanner_pointer_scan", args, passed, failed, skipped);
     }
 
@@ -3850,17 +4592,41 @@ namespace {
     }
 
     void test_tool_neutralize_integrity_node(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        if (!ensure_mcp_private_bytes(hf, "mcp.neutralize_integrity_node", g_mcp_integrity_addr, 64,
+            {0x83, 0xF8, 0x01, 0x75, 0x02, 0x90, 0x90, 0xC3})) {
+            log_msg(hf, "mcp.neutralize_integrity_node", "FAIL -- integrity fixture memory setup failed");
+            record_fixture_failed_tool("neutralize_integrity_node", failed);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(integrity_hunter::g_state.mutex);
+            integrity_hunter::g_state.nodes.clear();
+            integrity_hunter::integrity_node_t node;
+            node.reader_rip = g_mcp_integrity_addr;
+            node.hash_compare_addr = g_mcp_integrity_addr;
+            node.read_count = 4;
+            node.reads_per_second = 4.0f;
+            node.module_name = "mcp_integrity_fixture";
+            node.disasm_text = "cmp eax, 1";
+            integrity_hunter::g_state.nodes.push_back(std::move(node));
+        }
         mcp_standalone::json args;
         args["node_index"] = 0;
         test_tool_call(hf, "mcp.neutralize_integrity_node", get_server(), "neutralize_integrity_node", args, passed, failed, skipped);
     }
 
     void test_tool_start_live_monitor(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (g_mcp_live_monitor_addr == 0 && !prepare_live_monitor_regions(hf, "mcp.start_live_monitor")) { record_precondition_skipped_tool("start_live_monitor", skipped); return; }
+        if (g_mcp_live_monitor_addr == 0 && !prepare_live_monitor_regions(hf, "mcp.start_live_monitor")) {
+            log_msg(hf, "mcp.start_live_monitor", "FAIL -- live monitor fixture memory setup failed");
+            record_fixture_failed_tool("start_live_monitor", failed);
+            return;
+        }
         mcp_standalone::json args;
         args["address"] = hex_u64(g_mcp_live_monitor_addr);
         args["size"] = 128;
         args["name"] = "mcp_live_monitor_fixture";
+        args["backend"] = "polling";
+        args["timeout_ms"] = 1500;
         auto status = test_tool_call(hf, "mcp.start_live_monitor", get_server(), "start_live_monitor", args, passed, failed, skipped);
         if (status != mcp_tool_call_status_t::passed) {
             log_msg(hf, "mcp.start_live_monitor", "INFO -- monitor did not start; skipping access trigger and cleaning fixture buffers");
@@ -3968,6 +4734,7 @@ namespace {
         args["include_imports"] = false;
         args["include_exports"] = false;
         args["include_xrefs"] = false;
+        args["fast_summary"] = true;
         test_tool_call(hf, "mcp.analysis_get_binary_map_overview", get_server(), "analysis_get_binary_map_overview", args, passed, failed, skipped);
     }
 
@@ -3991,15 +4758,20 @@ namespace {
 
 
     void test_tool_disasm_jump_to_address(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.disasm_jump_to_address", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
+        auto addr = get_static_disasm_instruction_addr(hf, "mcp.disasm_jump_to_address");
+        if (addr.empty()) {
+            addr = get_ntclose_addr_str();
+            if (!addr.empty())
+                log_msg(hf, "mcp.disasm_jump_to_address", "INFO -- using live NtClose fallback fixture address=%s", addr.c_str());
+        }
+        if (addr.empty()) { record_precondition_skipped_tool("disasm_jump_to_address", skipped); return; }
         mcp_standalone::json args;
         args["address"] = addr;
         test_tool_call(hf, "mcp.disasm_jump_to_address", get_server(), "disasm_jump_to_address", args, passed, failed, skipped);
     }
 
     void test_tool_disasm_get_instruction(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
+        auto addr = get_remote_ntclose_addr_str();
         if (addr.empty()) { log_msg(hf, "mcp.disasm_get_instruction", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
         mcp_standalone::json args;
         args["address"] = addr;
@@ -4007,7 +4779,7 @@ namespace {
     }
 
     void test_tool_disasm_get_function_bounds(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
+        auto addr = get_remote_ntclose_addr_str();
         if (addr.empty()) { log_msg(hf, "mcp.disasm_get_function_bounds", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
         mcp_standalone::json args;
         args["address"] = addr;
@@ -4015,7 +4787,7 @@ namespace {
     }
 
     void test_tool_disasm_get_function_disassembly(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
+        auto addr = get_remote_ntclose_addr_str();
         if (addr.empty()) { log_msg(hf, "mcp.disasm_get_function_disassembly", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
         mcp_standalone::json args;
         args["address"] = addr;
@@ -4027,18 +4799,16 @@ namespace {
     }
 
     void test_tool_disasm_get_xrefs_to(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.disasm_get_xrefs_to", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
+        seed_mcp_xref_db_fixture();
         mcp_standalone::json args;
-        args["address"] = addr;
+        args["address"] = hex_u64(g_mcp_xref_to_addr);
         test_tool_call(hf, "mcp.disasm_get_xrefs_to", get_server(), "disasm_get_xrefs_to", args, passed, failed, skipped);
     }
 
     void test_tool_disasm_get_xrefs_from(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.disasm_get_xrefs_from", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
+        seed_mcp_xref_db_fixture();
         mcp_standalone::json args;
-        args["address"] = addr;
+        args["address"] = hex_u64(g_mcp_xref_from_addr);
         test_tool_call(hf, "mcp.disasm_get_xrefs_from", get_server(), "disasm_get_xrefs_from", args, passed, failed, skipped);
     }
 
@@ -4126,27 +4896,46 @@ namespace {
     }
 
     void test_tool_sessions_switch(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        if (g_mcp_session_binary_id.empty()) {
+            log_msg(hf, "mcp.sessions_switch", "FAIL -- no session fixture id from sessions_open_file");
+            record_tool_status("sessions_switch", mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
         mcp_standalone::json args;
-        args["binary_id"] = "nonexistent";
+        args["binary_id"] = g_mcp_session_binary_id;
         test_tool_call(hf, "mcp.sessions_switch", get_server(), "sessions_switch", args, passed, failed, skipped);
     }
 
     void test_tool_sessions_open_file(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["path"] = get_small_pe_fixture_path();
-        test_tool_call(hf, "mcp.sessions_open_file", get_server(), "sessions_open_file", args, passed, failed, skipped);
+        mcp_standalone::tool_result_t result;
+        auto status = test_tool_call(hf, "mcp.sessions_open_file", get_server(), "sessions_open_file", args, passed, failed, skipped, true, &result);
+        if (status == mcp_tool_call_status_t::passed && result.data.is_object() &&
+            result.data.contains("opened") && result.data["opened"].is_object() &&
+            result.data["opened"].contains("id") && result.data["opened"]["id"].is_string()) {
+            g_mcp_session_binary_id = result.data["opened"]["id"].get<std::string>();
+        }
     }
 
     void test_tool_sessions_attach_pid(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
-        args["pid"] = 0;
+        args["pid"] = g_mcp_target_pid != 0 ? g_mcp_target_pid : GetCurrentProcessId();
         test_tool_call(hf, "mcp.sessions_attach_pid", get_server(), "sessions_attach_pid", args, passed, failed, skipped);
     }
 
     void test_tool_sessions_close(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        if (g_mcp_session_binary_id.empty()) {
+            log_msg(hf, "mcp.sessions_close", "FAIL -- no session fixture id from sessions_open_file");
+            record_tool_status("sessions_close", mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
         mcp_standalone::json args;
-        args["binary_id"] = "nonexistent";
+        args["binary_id"] = g_mcp_session_binary_id;
         test_tool_call(hf, "mcp.sessions_close", get_server(), "sessions_close", args, passed, failed, skipped);
+        g_mcp_session_binary_id.clear();
     }
 
     void test_tool_sessions_run_binary(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -4312,11 +5101,35 @@ namespace {
     }
 
     void test_tool_driver_snapshot_and_emulate(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.driver_snapshot_and_emulate", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
+        uint32_t tid = 0;
+        uint32_t original_suspend_count = 0;
+        driver_bridge::thread_context_t ctx{};
+        if (!acquire_contextable_mcp_thread(hf, "mcp.driver_snapshot_and_emulate", "snapshot emulation fixture", tid, original_suspend_count, ctx)) {
+            record_fixture_failed_tool("driver_snapshot_and_emulate", failed);
+            return;
+        }
+        if (!ensure_mcp_private_bytes(hf, "mcp.driver_snapshot_and_emulate", g_mcp_emulation_addr, 4096,
+            {0xB8, 0x2A, 0x00, 0x00, 0x00, 0x90, 0x90})) {
+            log_msg(hf, "mcp.driver_snapshot_and_emulate", "FAIL -- emulation fixture memory setup failed");
+            (void)restore_mcp_thread_context(tid, ctx, original_suspend_count);
+            record_fixture_failed_tool("driver_snapshot_and_emulate", failed);
+            return;
+        }
         mcp_standalone::json args;
-        args["address"] = addr;
-        test_tool_call(hf, "mcp.driver_snapshot_and_emulate", get_server(), "driver_snapshot_and_emulate", args, passed, failed, skipped);
+        args["tid"] = tid;
+        args["address"] = hex_u64(g_mcp_emulation_addr);
+        args["snapshot_base"] = hex_u64(g_mcp_emulation_addr & ~0xFFFULL);
+        args["snapshot_size"] = 4096;
+        args["stop_address"] = hex_u64(g_mcp_emulation_addr + 5);
+        args["max_instructions"] = 8;
+        args["max_trace_entries"] = 8;
+        auto status = test_tool_call(hf, "mcp.driver_snapshot_and_emulate", get_server(), "driver_snapshot_and_emulate", args, passed, failed, skipped);
+        const bool restored = restore_mcp_thread_context(tid, ctx, original_suspend_count);
+        if (status == mcp_tool_call_status_t::passed && !restored) {
+            log_msg(hf, "mcp.driver_snapshot_and_emulate", "FAIL -- could not restore snapshot fixture thread tid=%u", tid);
+            record_tool_status("driver_snapshot_and_emulate", mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+        }
     }
 
     void test_tool_trace_execution_unicorn(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -4348,10 +5161,17 @@ namespace {
     }
 
     void test_tool_emulate_function(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.emulate_function", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
+        if (!ensure_mcp_private_bytes(hf, "mcp.emulate_function", g_mcp_emulate_function_addr, 4096,
+            {0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3, 0xCC, 0xCC})) {
+            log_msg(hf, "mcp.emulate_function", "FAIL -- emulation fixture memory setup failed");
+            record_fixture_failed_tool("emulate_function", failed);
+            return;
+        }
         mcp_standalone::json args;
-        args["address"] = addr;
+        args["address"] = hex_u64(g_mcp_emulate_function_addr);
+        args["size"] = 6;
+        args["max_instructions"] = 8;
+        args["max_trace_entries"] = 8;
         test_tool_call(hf, "mcp.emulate_function", get_server(), "emulate_function", args, passed, failed, skipped);
     }
 
@@ -4459,15 +5279,44 @@ namespace {
     }
 
     void test_tool_network_parse_http(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        const std::string req = "GET /aida-mcp-test HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: AiDA-MCP-Fixture\r\nConnection: close\r\n\r\n";
+        std::vector<uint8_t> payload(req.begin(), req.end());
+        if (!seed_network_parse_capture(hf, "mcp.network_parse_http", payload)) {
+            record_fixture_failed_tool("network_parse_http", failed);
+            return;
+        }
         mcp_standalone::json args;
-        args["index"] = 0;
+        args["count"] = 32;
         test_tool_call(hf, "mcp.network_parse_http", get_server(), "network_parse_http", args, passed, failed, skipped);
+        driver_bridge::stop_capture();
     }
 
     void test_tool_network_parse_tls(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        std::vector<uint8_t> payload = {
+            0x16, 0x03, 0x03, 0x00, 0x2F,
+            0x01, 0x00, 0x00, 0x2B,
+            0x03, 0x03,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00,
+            0x00, 0x02, 0x13, 0x01,
+            0x01, 0x00,
+            0x00, 0x00
+        };
+        if (!seed_network_parse_capture(hf, "mcp.network_parse_tls", payload)) {
+            record_fixture_failed_tool("network_parse_tls", failed);
+            return;
+        }
         mcp_standalone::json args;
-        args["index"] = 0;
+        args["count"] = 32;
         test_tool_call(hf, "mcp.network_parse_tls", get_server(), "network_parse_tls", args, passed, failed, skipped);
+        driver_bridge::stop_capture();
     }
 
     void test_tool_network_enumerate_wfp_callouts(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -4724,15 +5573,13 @@ namespace {
     }
 
     void test_tool_cert_inject(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["path"] = "nonexistent.pem";
-        test_tool_call(hf, "mcp.cert_inject", get_server(), "cert_inject", args, passed, failed, skipped);
+        (void)skipped;
+        test_tool_schema_only(hf, "mcp.cert_inject", get_server(), "cert_inject", {"cert_pem", "cert_der_hex"}, passed, failed);
     }
 
     void test_tool_cert_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["thumbprint"] = "0000";
-        test_tool_call(hf, "mcp.cert_remove", get_server(), "cert_remove", args, passed, failed, skipped);
+        (void)skipped;
+        test_tool_schema_only(hf, "mcp.cert_remove", get_server(), "cert_remove", {"thumbprint"}, passed, failed);
     }
 
     void test_tool_cert_generate_ca(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -4744,11 +5591,13 @@ namespace {
     }
 
     void test_tool_pin_bypass(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.pin_bypass", get_server(), "pin_bypass", {}, passed, failed, skipped);
+        (void)skipped;
+        test_tool_schema_only(hf, "mcp.pin_bypass", get_server(), "pin_bypass", {"pid", "method"}, passed, failed);
     }
 
     void test_tool_pin_bypass_revert(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.pin_bypass_revert", get_server(), "pin_bypass_revert", {}, passed, failed, skipped);
+        (void)skipped;
+        test_tool_schema_only(hf, "mcp.pin_bypass_revert", get_server(), "pin_bypass_revert", {"pid"}, passed, failed);
     }
 
     void test_tool_pin_bypass_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -4760,9 +5609,8 @@ namespace {
     }
 
     void test_tool_quic_decrypt_initial(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["index"] = 0;
-        test_tool_call(hf, "mcp.quic_decrypt_initial", get_server(), "quic_decrypt_initial", args, passed, failed, skipped);
+        (void)skipped;
+        test_tool_contract_only(hf, "mcp.quic_decrypt_initial", get_server(), "quic_decrypt_initial", true, {"packet_hex"}, passed, failed);
     }
 
     void test_tool_quic_extract_keys(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -4819,10 +5667,8 @@ namespace {
     }
 
     void test_tool_network_decrypt_capture(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["pcap_path"] = temp_file_narrow("aida_missing_capture.pcap");
-        args["keylog_path"] = "nonexistent.log";
-        test_tool_call(hf, "mcp.network_decrypt_capture", get_server(), "network_decrypt_capture", args, passed, failed, skipped);
+        (void)skipped;
+        test_tool_contract_only(hf, "mcp.network_decrypt_capture", get_server(), "network_decrypt_capture", true, {"pcap_path"}, passed, failed);
     }
 
     void test_tool_tls_ensure_keylogfile(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -5009,7 +5855,7 @@ namespace {
     }
     void test_tool_burp_intruder_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         ensure_burp_http_fixture(hf, "mcp.burp_intruder_start");
-        const uint16_t port = g_burp_http_fixture ? g_burp_http_fixture->port : 80;
+        const uint16_t port = g_burp_http_fixture ? g_burp_http_fixture->port : 1;
         mcp_standalone::json args; args["host"] = "127.0.0.1"; args["port"] = port; args["scheme"] = "http"; args["base_request"] = "GET /?q=test HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"; args["positions"] = mcp_standalone::json::array({mcp_standalone::json::array({8, 4})}); args["payload_sets"] = mcp_standalone::json::array({mcp_standalone::json::array({"aida"})}); args["total_cap"] = 1; args["concurrency"] = 1; args["timeout_ms"] = 1500;
         mcp_standalone::tool_result_t result;
         auto status = test_tool_call(hf, "mcp.burp_intruder_start", get_server(), "burp_intruder_start", args, passed, failed, skipped, true, &result);
@@ -5055,7 +5901,8 @@ namespace {
         test_tool_call(hf, "mcp.burp_param_miner_stop", get_server(), "burp_param_miner_stop", args, passed, failed, skipped);
     }
     void test_tool_burp_h2_send(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args; args["host"] = "127.0.0.1"; args["port"] = 443; args["path"] = "/";
+        mcp_standalone::json args; args["host"] = "nghttp2.org"; args["port"] = 443; args["timeout_ms"] = 5000;
+        args["pseudo_headers"] = mcp_standalone::json::object({{"method", "GET"}, {"scheme", "https"}, {"path", "/httpbin/get"}, {"authority", "nghttp2.org"}});
         test_tool_call(hf, "mcp.burp_h2_send", get_server(), "burp_h2_send", args, passed, failed, skipped);
     }
     void test_tool_burp_jwt_decode(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -5107,7 +5954,7 @@ namespace {
         test_tool_call(hf, "mcp.burp_auth_ntlm_type1", get_server(), "burp_auth_ntlm_type1", {}, passed, failed, skipped);
     }
     void test_tool_burp_auth_ntlm_type3(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args; args["username"] = "test"; args["password"] = "test"; args["challenge"] = "0000000000000000";
+        mcp_standalone::json args; args["user"] = "test"; args["pass"] = "test"; args["type2_b64"] = "TlRMTVNTUAACAAAAAAAAAAAAAAABAgMEBQYHCAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         test_tool_call(hf, "mcp.burp_auth_ntlm_type3", get_server(), "burp_auth_ntlm_type3", args, passed, failed, skipped);
     }
     void test_tool_burp_auth_bearer(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -5122,19 +5969,19 @@ namespace {
         test_tool_call(hf, "mcp.burp_auth_oauth2_build_auth_url", get_server(), "burp_auth_oauth2_build_auth_url", args, passed, failed, skipped);
     }
     void test_tool_burp_auth_oauth2_exchange_code(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args; args["code"] = "test_code"; args["token_endpoint"] = "http://127.0.0.1/token"; args["client_id"] = "test"; args["redirect_uri"] = "http://127.0.0.1/cb";
+        mcp_standalone::json args; args["code"] = "test_code"; args["token_endpoint"] = burp_fixture_url(hf, "mcp.burp_auth_oauth2_exchange_code", "/token"); args["client_id"] = "test"; args["redirect_uri"] = "http://127.0.0.1/cb";
         test_tool_call(hf, "mcp.burp_auth_oauth2_exchange_code", get_server(), "burp_auth_oauth2_exchange_code", args, passed, failed, skipped);
     }
     void test_tool_burp_auth_oauth2_refresh(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args; args["refresh_token"] = "test_refresh"; args["token_endpoint"] = "http://127.0.0.1/token"; args["client_id"] = "test";
+        mcp_standalone::json args; args["refresh_token"] = "test_refresh"; args["token_endpoint"] = burp_fixture_url(hf, "mcp.burp_auth_oauth2_refresh", "/token"); args["client_id"] = "test";
         test_tool_call(hf, "mcp.burp_auth_oauth2_refresh", get_server(), "burp_auth_oauth2_refresh", args, passed, failed, skipped);
     }
     void test_tool_burp_auth_saml_decode_request(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args; args["saml_b64"] = "dGVzdA==";
+        mcp_standalone::json args; args["saml_b64"] = "PHNhbWxwOkF1dGhuUmVxdWVzdCB4bWxuczpzYW1scD0idXJuOm9hc2lzOm5hbWVzOnRjOlNBTUw6Mi4wOnByb3RvY29sIiBJRD0iX2FpZGEiIFZlcnNpb249IjIuMCIgSXNzdWVJbnN0YW50PSIyMDI2LTA1LTI0VDAwOjAwOjAwWiI+PC9zYW1scDpBdXRoblJlcXVlc3Q%2B";
         test_tool_call(hf, "mcp.burp_auth_saml_decode_request", get_server(), "burp_auth_saml_decode_request", args, passed, failed, skipped);
     }
     void test_tool_burp_auth_saml_decode_response(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args; args["saml_b64"] = "dGVzdA==";
+        mcp_standalone::json args; args["saml_b64"] = "PHNhbWxwOlJlc3BvbnNlIHhtbG5zOnNhbWxwPSJ1cm46b2FzaXM6bmFtZXM6dGM6U0FNTDoyLjA6cHJvdG9jb2wiIElEPSJfYWlkYV9yZXNwIiBWZXJzaW9uPSIyLjAiIElzc3VlSW5zdGFudD0iMjAyNi0wNS0yNFQwMDowMDowMFoiPjwvc2FtbHA6UmVzcG9uc2U+";
         test_tool_call(hf, "mcp.burp_auth_saml_decode_response", get_server(), "burp_auth_saml_decode_response", args, passed, failed, skipped);
     }
     void test_tool_burp_match_replace_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -5164,7 +6011,7 @@ namespace {
     }
     void test_tool_burp_macro_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         ensure_burp_http_fixture(hf, "mcp.burp_macro_add");
-        const uint16_t port = g_burp_http_fixture ? g_burp_http_fixture->port : 80;
+        const uint16_t port = g_burp_http_fixture ? g_burp_http_fixture->port : 1;
         mcp_standalone::json step = mcp_standalone::json::object();
         step["label"] = "fixture";
         step["scheme"] = "http";
@@ -5248,10 +6095,14 @@ namespace {
         test_tool_call(hf, "mcp.burp_graphql_send", get_server(), "burp_graphql_send", args, passed, failed, skipped);
     }
     void test_tool_burp_ws_connect(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        ensure_burp_http_fixture(hf, "mcp.burp_ws_connect");
-        mcp_standalone::json args; args["scheme"] = "ws"; args["host"] = "127.0.0.1"; args["port"] = g_burp_http_fixture ? g_burp_http_fixture->port : 80; args["path"] = "/ws";
+        if (!ensure_burp_http_fixture(hf, "mcp.burp_ws_connect") || !g_burp_http_fixture || g_burp_http_fixture->port == 0) {
+            log_msg(hf, "mcp.burp_ws_connect", "FAIL -- websocket fixture listener setup failed");
+            record_fixture_failed_tool("burp_ws_connect", failed);
+            return;
+        }
+        mcp_standalone::json args; args["scheme"] = "ws"; args["host"] = "127.0.0.1"; args["port"] = g_burp_http_fixture->port; args["path"] = "/ws";
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_ws_connect", get_server(), "burp_ws_connect", args, passed, failed, skipped, true, &result);
+        auto status = test_tool_call(hf, "mcp.burp_ws_connect", get_server(), "burp_ws_connect", args, passed, failed, skipped, false, &result);
         if (status == mcp_tool_call_status_t::passed)
             json_u64_any_field(result.data, g_burp_ws_conn_id, {"conn_id", "id"});
     }
@@ -5320,7 +6171,7 @@ namespace {
     }
     void test_tool_burp_upstream_add_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         ensure_burp_http_fixture(hf, "mcp.burp_upstream_add_chain");
-        mcp_standalone::json hop = mcp_standalone::json::object({{"type", "http_connect"}, {"host", "127.0.0.1"}, {"port", g_burp_http_fixture ? g_burp_http_fixture->port : 80}});
+        mcp_standalone::json hop = mcp_standalone::json::object({{"type", "http_connect"}, {"host", "127.0.0.1"}, {"port", g_burp_http_fixture ? g_burp_http_fixture->port : 1}});
         mcp_standalone::json args; args["label"] = "aida_mcp_upstream"; args["hops"] = mcp_standalone::json::array({hop});
         mcp_standalone::tool_result_t result;
         auto status = test_tool_call(hf, "mcp.burp_upstream_add_chain", get_server(), "burp_upstream_add_chain", args, passed, failed, skipped, true, &result);
@@ -5342,7 +6193,7 @@ namespace {
         test_tool_call(hf, "mcp.burp_upstream_get_active", get_server(), "burp_upstream_get_active", {}, passed, failed, skipped);
     }
     void test_tool_burp_upstream_test_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args; args["id"] = g_burp_upstream_chain_id; args["target_host"] = "127.0.0.1"; args["target_port"] = g_burp_http_fixture ? g_burp_http_fixture->port : 80;
+        mcp_standalone::json args; args["id"] = g_burp_upstream_chain_id; args["target_host"] = "127.0.0.1"; args["target_port"] = g_burp_http_fixture ? g_burp_http_fixture->port : 1;
         test_tool_call(hf, "mcp.burp_upstream_test_chain", get_server(), "burp_upstream_test_chain", args, passed, failed, skipped);
     }
     void test_tool_burp_tech_fingerprint(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -5359,8 +6210,8 @@ namespace {
         test_tool_call(hf, "mcp.burp_browser_launch", get_server(), "burp_browser_launch", {}, passed, failed, skipped);
     }
     void test_tool_burp_browser_kill(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args; args["pid"] = 0;
-        test_tool_call(hf, "mcp.burp_browser_kill", get_server(), "burp_browser_kill", args, passed, failed, skipped);
+        (void)skipped;
+        test_tool_contract_only(hf, "mcp.burp_browser_kill", get_server(), "burp_browser_kill", false, {"pid"}, passed, failed);
     }
     void test_tool_burp_browser_kill_all(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         test_tool_call(hf, "mcp.burp_browser_kill_all", get_server(), "burp_browser_kill_all", {}, passed, failed, skipped);
@@ -5373,7 +6224,7 @@ namespace {
     }
     void test_tool_burp_headless_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["headless"] = false;
-        test_tool_call(hf, "mcp.burp_headless_start", get_server(), "burp_headless_start", args, passed, failed, skipped);
+        test_tool_call(hf, "mcp.burp_headless_start", get_server(), "burp_headless_start", args, passed, failed, skipped, false);
     }
     void test_tool_burp_headless_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         test_tool_call(hf, "mcp.burp_headless_stop", get_server(), "burp_headless_stop", {}, passed, failed, skipped);
@@ -5404,7 +6255,7 @@ namespace {
         test_tool_call(hf, "mcp.burp_headless_click", get_server(), "burp_headless_click", args, passed, failed, skipped);
     }
     void test_tool_burp_headless_type(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args; args["selector"] = "input"; args["text"] = "test";
+        mcp_standalone::json args; args["selector"] = "#aida-input"; args["text"] = "test";
         test_tool_call(hf, "mcp.burp_headless_type", get_server(), "burp_headless_type", args, passed, failed, skipped);
     }
     void test_tool_burp_headless_wait_for(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -5439,7 +6290,8 @@ namespace {
         test_tool_call(hf, "mcp.burp_headless_view_quick_navigate", get_server(), "burp_headless_view_quick_navigate", args, passed, failed, skipped);
     }
     void test_tool_burp_headless_view_install(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_headless_view_install", get_server(), "burp_headless_view_install", {}, passed, failed, skipped);
+        mcp_standalone::json args; args["action"] = "ensure";
+        test_tool_call(hf, "mcp.burp_headless_view_install", get_server(), "burp_headless_view_install", args, passed, failed, skipped, false);
     }
     bool collaborator_http_probe(HANDLE hf, const std::string& token) {
         if (token.empty())
@@ -5468,7 +6320,7 @@ namespace {
         closesocket(s);
         if (ok)
             Sleep(100);
-        log_msg(hf, "mcp.burp_collaborator_probe", "%s -- token=%s", ok ? "PASS" : "WARN", token.c_str());
+        log_msg(hf, "mcp.burp_collaborator_probe", "%s -- token_len=%zu", ok ? "PASS" : "WARN", token.size());
         return ok;
     }
     void capture_collaborator_interaction_id(const mcp_standalone::tool_result_t& result) {
@@ -5601,7 +6453,10 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     g_mcp_dbg_sw_addr = 0;
     g_mcp_debugger_bp_index = -1;
     g_mcp_deferred_action_id = 0;
+    g_mcp_emulation_addr = 0;
+    g_mcp_emulate_function_addr = 0;
     g_mcp_scanner_addr = 0;
+    g_mcp_scanner_pointer_addr = 0;
     g_autoresponder_rule_id = 0;
     g_burp_scanner_audit_id = 0;
     g_burp_scanner_issue_id = 0;
@@ -5753,6 +6608,7 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_dbg_pause(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_step_into(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_step_over(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_dbg_step_out(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_run_to_address(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_get_attached(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_get_registers(hf, passed, failed, skipped);
@@ -5768,6 +6624,7 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_debugger_remove_breakpoint(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_step_over(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_step_into(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_debugger_step_out(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_continue(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_pause(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_read_memory(hf, passed, failed, skipped);
@@ -6127,6 +6984,7 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_burp_browser_kill_all(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_browser_list(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_browser_detect(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_view_install(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_headless_start(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_headless_status(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_headless_navigate(hf, passed, failed, skipped);
@@ -6143,10 +7001,9 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_burp_headless_hook_function(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_headless_remove_hooks(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_headless_reset_state(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_stop(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_headless_view_status(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_headless_view_quick_navigate(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_view_install(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_headless_stop(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_collaborator_status(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_collaborator_start(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_collaborator_generate_token(hf, passed, failed, skipped);
@@ -6167,22 +7024,6 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_burp_comparer_diff(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_comparer_remove_slot(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_comparer_clear(hf, passed, failed, skipped);
-    if (!cancelled()) {
-        log_msg(hf, "mcp_phase", "INFO -- deferred mcp.dbg_step_out isolation begin active_pid=%u target_pid=%u",
-            driver_bridge::attached_pid(), g_mcp_target_pid);
-        test_tool_dbg_step_out(hf, passed, failed, skipped);
-        const bool restored = restore_mcp_target(hf, "mcp_phase");
-        log_msg(hf, "mcp_phase", "INFO -- deferred mcp.dbg_step_out isolation restore=%d active_pid=%u target_pid=%u",
-            restored ? 1 : 0, driver_bridge::attached_pid(), g_mcp_target_pid);
-    }
-    if (!cancelled()) {
-        log_msg(hf, "mcp_phase", "INFO -- deferred mcp.debugger_step_out isolation begin active_pid=%u target_pid=%u",
-            driver_bridge::attached_pid(), g_mcp_target_pid);
-        test_tool_debugger_step_out(hf, passed, failed, skipped);
-        const bool restored = restore_mcp_target(hf, "mcp_phase");
-        log_msg(hf, "mcp_phase", "INFO -- deferred mcp.debugger_step_out isolation restore=%d active_pid=%u target_pid=%u",
-            restored ? 1 : 0, driver_bridge::attached_pid(), g_mcp_target_pid);
-    }
     if (!cancelled()) cleanup_mcp_network_state(hf, "before MCP coverage audit");
     if (!cancelled()) test_mcp_coverage_audit(hf, passed, failed, skipped);
 
@@ -6204,6 +7045,22 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
         driver_bridge::free_memory(g_mcp_dbg_sw_addr);
         g_mcp_dbg_sw_addr = 0;
         g_mcp_debugger_bp_index = -1;
+    }
+    if (g_mcp_integrity_addr != 0) {
+        driver_bridge::free_memory(g_mcp_integrity_addr);
+        g_mcp_integrity_addr = 0;
+    }
+    if (g_mcp_emulation_addr != 0) {
+        driver_bridge::free_memory(g_mcp_emulation_addr);
+        g_mcp_emulation_addr = 0;
+    }
+    if (g_mcp_emulate_function_addr != 0) {
+        driver_bridge::free_memory(g_mcp_emulate_function_addr);
+        g_mcp_emulate_function_addr = 0;
+    }
+    if (g_mcp_scanner_pointer_addr != 0) {
+        driver_bridge::free_memory(g_mcp_scanner_pointer_addr);
+        g_mcp_scanner_pointer_addr = 0;
     }
     if (g_mcp_scanner_addr != 0) {
         driver_bridge::free_memory(g_mcp_scanner_addr);

@@ -1385,6 +1385,73 @@ NTSTATUS functions::handle_virt_to_phys(p_virt_to_phys request) {
     return (physical != 0) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
 }
 
+NTSTATUS functions::handle_query_ssdt(p_ssdt_query request) {
+    if (!request) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    request->lstar = 0;
+    request->descriptor_address = 0;
+    request->service_table = 0;
+    request->counter_table = 0;
+    request->argument_table = 0;
+    request->service_limit = 0;
+    request->flags = 0;
+
+    __try {
+        request->lstar = __readmsr(0xC0000082);
+        if (request->lstar >= 0xFFFF800000000000ULL) {
+            request->flags |= 0x2u;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        request->lstar = ssdt_resolver::g_lstar;
+    }
+
+    if (!ssdt_resolver::find_ssdt() || !ssdt_resolver::g_ssdt) {
+        return STATUS_NOT_FOUND;
+    }
+
+    ssdt_resolver::PKSERVICE_TABLE_DESCRIPTOR ssdt = ssdt_resolver::g_ssdt;
+
+    __try {
+        request->descriptor_address = reinterpret_cast<UINT64>(ssdt);
+        request->service_table = reinterpret_cast<UINT64>(ssdt->ServiceTable);
+        request->counter_table = reinterpret_cast<UINT64>(ssdt->CounterTable);
+        request->argument_table = reinterpret_cast<UINT64>(ssdt->ArgumentTable);
+        request->service_limit = static_cast<UINT32>(ssdt->ServiceLimit);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        request->descriptor_address = 0;
+        request->service_table = 0;
+        request->counter_table = 0;
+        request->argument_table = 0;
+        request->service_limit = 0;
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    if (request->lstar == 0) {
+        request->lstar = ssdt_resolver::g_lstar;
+    }
+
+    if (request->descriptor_address < 0xFFFF800000000000ULL ||
+        request->service_table < 0xFFFF800000000000ULL ||
+        request->service_limit == 0 ||
+        request->service_limit > 0x2000) {
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    if (!_MmIsAddressValid || !_MmIsAddressValid(reinterpret_cast<PVOID>(request->descriptor_address)) ||
+        !_MmIsAddressValid(reinterpret_cast<PVOID>(request->service_table))) {
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    request->flags |= 0x1u;
+    if (request->descriptor_address != 0 && request->service_table != 0) {
+        request->flags |= 0x4u;
+    }
+
+    return STATUS_SUCCESS;
+}
+
 
 NTSTATUS functions::handle_anti_debug(p_anti_debug_request request) {
     if (!request) return STATUS_INVALID_PARAMETER;

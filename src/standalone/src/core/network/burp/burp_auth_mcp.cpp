@@ -13,6 +13,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <sstream>
 #include <string>
 
 namespace aida {
@@ -22,6 +23,78 @@ namespace {
 
 using json = nlohmann::json;
 using tool_result_t = mcp_standalone::tool_result_t;
+
+struct url_log_t
+{
+    std::string host;
+    std::string path;
+    bool has_query = false;
+    size_t length = 0;
+};
+
+url_log_t summarize_url_for_log(const std::string& url)
+{
+    url_log_t out;
+    out.length = url.size();
+    size_t cursor = 0;
+    size_t scheme = url.find("://");
+    if (scheme != std::string::npos) cursor = scheme + 3;
+    size_t host_end = url.find_first_of("/?#", cursor);
+    if (host_end == std::string::npos) host_end = url.size();
+    if (host_end > cursor) out.host = url.substr(cursor, host_end - cursor);
+    size_t path_start = url.find('/', cursor);
+    size_t path_end = url.size();
+    size_t q = url.find('?', cursor);
+    size_t f = url.find('#', cursor);
+    if (q != std::string::npos) path_end = q;
+    if (f != std::string::npos && f < path_end) path_end = f;
+    out.has_query = q != std::string::npos;
+    if (path_start != std::string::npos && path_start < path_end) out.path = url.substr(path_start, path_end - path_start);
+    if (out.host.empty()) out.host = "<missing>";
+    if (out.path.empty()) out.path = "/";
+    if (out.path.size() > 240)
+    {
+        out.path.resize(240);
+        out.path += "...";
+    }
+    return out;
+}
+
+std::string sanitize_utf8_for_json(const std::string& input, bool& changed, size_t& first_bad)
+{
+    changed = false;
+    first_bad = static_cast<size_t>(-1);
+    std::string result;
+    result.reserve(input.size());
+    for (size_t i = 0; i < input.size();) {
+        unsigned char c = static_cast<unsigned char>(input[i]);
+        if (c < 0x80) {
+            result.push_back(static_cast<char>(c));
+            ++i;
+        } else if ((c & 0xE0) == 0xC0 && i + 1 < input.size() &&
+            (static_cast<unsigned char>(input[i + 1]) & 0xC0) == 0x80) {
+            result.append(input, i, 2);
+            i += 2;
+        } else if ((c & 0xF0) == 0xE0 && i + 2 < input.size() &&
+            (static_cast<unsigned char>(input[i + 1]) & 0xC0) == 0x80 &&
+            (static_cast<unsigned char>(input[i + 2]) & 0xC0) == 0x80) {
+            result.append(input, i, 3);
+            i += 3;
+        } else if ((c & 0xF8) == 0xF0 && i + 3 < input.size() &&
+            (static_cast<unsigned char>(input[i + 1]) & 0xC0) == 0x80 &&
+            (static_cast<unsigned char>(input[i + 2]) & 0xC0) == 0x80 &&
+            (static_cast<unsigned char>(input[i + 3]) & 0xC0) == 0x80) {
+            result.append(input, i, 4);
+            i += 4;
+        } else {
+            if (!changed) first_bad = i;
+            changed = true;
+            result += "\xEF\xBF\xBD";
+            ++i;
+        }
+    }
+    return result;
+}
 
 tool_result_t handle_basic_encode(const json& params)
 {
@@ -116,33 +189,41 @@ tool_result_t handle_pkce(const json&)
 
 tool_result_t handle_build_auth_url(const json& params)
 {
-    diag::log_tagged_fmt("mcp_burp", "auth_oauth2_build_auth_url ep=%s", params.value("authorize_endpoint", std::string()).c_str());
     const std::string ep = params.value("authorize_endpoint", std::string());
     const std::string cid = params.value("client_id", std::string());
     const std::string ru = params.value("redirect_uri", std::string());
     const std::string scope = params.value("scope", std::string());
     const std::string state = params.value("state", std::string());
     const std::string chal = params.value("code_challenge", std::string());
+    const url_log_t endpoint_log = summarize_url_for_log(ep);
+    diag::log_tagged_fmt("mcp_burp", "auth_oauth2_build_auth_url host=%s path=%s query=%d endpoint_len=%zu client_id_len=%zu redirect_uri_len=%zu scope_len=%zu has_state=%d has_challenge=%d",
+        endpoint_log.host.c_str(), endpoint_log.path.c_str(), (int)endpoint_log.has_query,
+        endpoint_log.length, cid.size(), ru.size(), scope.size(), (int)!state.empty(), (int)!chal.empty());
     if (ep.empty() || cid.empty()) return tool_result_t::error("missing authorize_endpoint or client_id");
     json out;
     out["url"] = auth_lab::oauth2_build_auth_url(ep, cid, ru, scope, state, chal);
-    diag::log_tagged_fmt("mcp_burp", "auth_oauth2_build_auth_url ok ep=%s", ep.c_str());
+    diag::log_tagged_fmt("mcp_burp", "auth_oauth2_build_auth_url ok host=%s path=%s url_len=%zu",
+        endpoint_log.host.c_str(), endpoint_log.path.c_str(), out["url"].is_string() ? out["url"].get_ref<const std::string&>().size() : 0);
     return tool_result_t::ok(out);
 }
 
 tool_result_t handle_exchange_code(const json& params)
 {
-    diag::log_tagged_fmt("mcp_burp", "auth_oauth2_exchange_code ep=%s", params.value("token_endpoint", std::string()).c_str());
     const std::string te = params.value("token_endpoint", std::string());
     const std::string cid = params.value("client_id", std::string());
     const std::string code = params.value("code", std::string());
     const std::string ru = params.value("redirect_uri", std::string());
     const std::string ver = params.value("code_verifier", std::string());
+    const url_log_t endpoint_log = summarize_url_for_log(te);
+    diag::log_tagged_fmt("mcp_burp", "auth_oauth2_exchange_code host=%s path=%s query=%d endpoint_len=%zu client_id_len=%zu code_len=%zu redirect_uri_len=%zu has_verifier=%d",
+        endpoint_log.host.c_str(), endpoint_log.path.c_str(), (int)endpoint_log.has_query,
+        endpoint_log.length, cid.size(), code.size(), ru.size(), (int)!ver.empty());
     if (te.empty() || cid.empty() || code.empty()) return tool_result_t::error("missing required field");
     std::string at, rt;
     int exp = 0;
     if (!auth_lab::oauth2_exchange_code(te, cid, code, ru, ver, at, rt, exp)) { diag::log_tagged_fmt("mcp_burp", "auth_oauth2_exchange_code failed err=%s", auth_lab::last_error().c_str()); return tool_result_t::error(std::string("exchange failed: ") + auth_lab::last_error()); }
-    diag::log_tagged_fmt("mcp_burp", "auth_oauth2_exchange_code ok ep=%s expires_in=%d", te.c_str(), exp);
+    diag::log_tagged_fmt("mcp_burp", "auth_oauth2_exchange_code ok host=%s path=%s access_token_len=%zu refresh_token_len=%zu expires_in=%d",
+        endpoint_log.host.c_str(), endpoint_log.path.c_str(), at.size(), rt.size(), exp);
     json out;
     out["access_token"] = at;
     out["refresh_token"] = rt;
@@ -152,15 +233,19 @@ tool_result_t handle_exchange_code(const json& params)
 
 tool_result_t handle_refresh(const json& params)
 {
-    diag::log_tagged_fmt("mcp_burp", "auth_oauth2_refresh ep=%s", params.value("token_endpoint", std::string()).c_str());
     const std::string te = params.value("token_endpoint", std::string());
     const std::string cid = params.value("client_id", std::string());
     const std::string rt = params.value("refresh_token", std::string());
+    const url_log_t endpoint_log = summarize_url_for_log(te);
+    diag::log_tagged_fmt("mcp_burp", "auth_oauth2_refresh host=%s path=%s query=%d endpoint_len=%zu client_id_len=%zu refresh_token_len=%zu",
+        endpoint_log.host.c_str(), endpoint_log.path.c_str(), (int)endpoint_log.has_query,
+        endpoint_log.length, cid.size(), rt.size());
     if (te.empty() || cid.empty() || rt.empty()) return tool_result_t::error("missing required field");
     std::string at;
     int exp = 0;
     if (!auth_lab::oauth2_refresh(te, cid, rt, at, exp)) { diag::log_tagged_fmt("mcp_burp", "auth_oauth2_refresh failed err=%s", auth_lab::last_error().c_str()); return tool_result_t::error(std::string("refresh failed: ") + auth_lab::last_error()); }
-    diag::log_tagged_fmt("mcp_burp", "auth_oauth2_refresh ok ep=%s expires_in=%d", te.c_str(), exp);
+    diag::log_tagged_fmt("mcp_burp", "auth_oauth2_refresh ok host=%s path=%s access_token_len=%zu expires_in=%d",
+        endpoint_log.host.c_str(), endpoint_log.path.c_str(), at.size(), exp);
     json out;
     out["access_token"] = at;
     out["expires_in"] = exp;
@@ -171,10 +256,21 @@ tool_result_t handle_saml_request(const json& params)
 {
     diag::log_tagged_fmt("mcp_burp", "auth_saml_decode_request entry");
     const std::string in = params.value("saml_b64", std::string());
+    diag::log_tagged_fmt("mcp_burp", "auth_saml_decode_request input_len=%zu", in.size());
     if (in.empty()) return tool_result_t::error("missing saml_b64");
     json out;
-    out["xml"] = auth_lab::saml_decode_request(in);
-    diag::log_tagged_fmt("mcp_burp", "auth_saml_decode_request ok");
+    bool changed = false;
+    size_t first_bad = 0;
+    std::string decoded = auth_lab::saml_decode_request(in);
+    std::string safe = sanitize_utf8_for_json(decoded, changed, first_bad);
+    out["xml"] = safe;
+    out["xml_sanitized"] = changed;
+    diag::log_tagged_fmt("mcp_burp", "auth_saml_decode_request ok xml_len=%zu",
+        out["xml"].is_string() ? out["xml"].get_ref<const std::string&>().size() : 0);
+    if (changed) {
+        diag::log_tagged_fmt("mcp_burp", "auth_saml_decode_request sanitized invalid_utf8 first_bad=%zu decoded_len=%zu safe_len=%zu",
+            first_bad, decoded.size(), safe.size());
+    }
     return tool_result_t::ok(out);
 }
 
@@ -182,10 +278,21 @@ tool_result_t handle_saml_response(const json& params)
 {
     diag::log_tagged_fmt("mcp_burp", "auth_saml_decode_response entry");
     const std::string in = params.value("saml_b64", std::string());
+    diag::log_tagged_fmt("mcp_burp", "auth_saml_decode_response input_len=%zu", in.size());
     if (in.empty()) return tool_result_t::error("missing saml_b64");
     json out;
-    out["xml"] = auth_lab::saml_decode_response(in);
-    diag::log_tagged_fmt("mcp_burp", "auth_saml_decode_response ok");
+    bool changed = false;
+    size_t first_bad = 0;
+    std::string decoded = auth_lab::saml_decode_response(in);
+    std::string safe = sanitize_utf8_for_json(decoded, changed, first_bad);
+    out["xml"] = safe;
+    out["xml_sanitized"] = changed;
+    diag::log_tagged_fmt("mcp_burp", "auth_saml_decode_response ok xml_len=%zu",
+        out["xml"].is_string() ? out["xml"].get_ref<const std::string&>().size() : 0);
+    if (changed) {
+        diag::log_tagged_fmt("mcp_burp", "auth_saml_decode_response sanitized invalid_utf8 first_bad=%zu decoded_len=%zu safe_len=%zu",
+            first_bad, decoded.size(), safe.size());
+    }
     return tool_result_t::ok(out);
 }
 

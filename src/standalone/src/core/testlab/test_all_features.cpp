@@ -12,7 +12,6 @@
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 
-#include "../infra/work_queue.hpp"
 #include "../ui/theme.hpp"
 #include "../debugger/debugger_engine.hpp"
 #include "../network/mitm_proxy.hpp"
@@ -36,6 +35,7 @@
 #pragma comment(lib, "ws2_32.lib")
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -96,7 +96,7 @@ namespace test_all_features {
 		constexpr int kExtendedFeatureTests = 6;
 		constexpr int kDebuggerFeatureTests = 83;
 		constexpr int kScannerFeatureTests = 64;
-		constexpr int kAnalysisFeatureTests = 70;
+		constexpr int kAnalysisFeatureTests = 77;
 		constexpr int kNetworkFeatureTests = 119;
 		constexpr int kBurpFeatureTests = 183;
 		constexpr int kDisasmFeatureTests = 110;
@@ -348,6 +348,92 @@ namespace test_all_features {
 
 		int running_done() {
 			return g_passed.load() + g_failed.load() + g_skipped.load();
+		}
+
+		bool memory_scanner_scan_idle() {
+			auto& st = memory_scanner::g_state;
+			return !st.scanning.load(std::memory_order_acquire) &&
+				st.scan_thread_done.load(std::memory_order_acquire);
+		}
+
+		bool memory_scanner_all_idle() {
+			auto& st = memory_scanner::g_state;
+			return memory_scanner_scan_idle() &&
+				!st.pointer_scanning.load(std::memory_order_acquire) &&
+				st.pointer_thread_done.load(std::memory_order_acquire);
+		}
+
+		void request_memory_scanner_stop() {
+			auto& st = memory_scanner::g_state;
+			st.scanning.store(false, std::memory_order_release);
+			st.pointer_scanning.store(false, std::memory_order_release);
+		}
+
+		bool wait_memory_scanner_scan_idle(DWORD timeout_ms) {
+			const std::uint64_t deadline = now_ms_tick() + timeout_ms;
+			while (!memory_scanner_scan_idle()) {
+				if (now_ms_tick() >= deadline) return memory_scanner_scan_idle();
+				Sleep(10);
+			}
+			return true;
+		}
+
+		bool wait_memory_scanner_all_idle(DWORD timeout_ms) {
+			const std::uint64_t deadline = now_ms_tick() + timeout_ms;
+			while (!memory_scanner_all_idle()) {
+				if (now_ms_tick() >= deadline) return memory_scanner_all_idle();
+				Sleep(10);
+			}
+			return true;
+		}
+
+		bool snapshot_memory_scan_results(std::size_t& found, std::uint64_t& first_addr, DWORD timeout_ms) {
+			auto& st = memory_scanner::g_state;
+			const std::uint64_t deadline = now_ms_tick() + timeout_ms;
+			for (;;) {
+				try {
+					if (st.results_mutex.try_lock()) {
+						std::lock_guard<std::mutex> lk(st.results_mutex, std::adopt_lock);
+						found = st.results.size();
+						first_addr = st.results.empty() ? 0 : st.results.front().address;
+						return true;
+					}
+				} catch (...) {
+					return false;
+				}
+				if (now_ms_tick() >= deadline) return false;
+				Sleep(5);
+			}
+		}
+
+		void cleanup_memory_scanner_runtime(HANDLE hf, const char* reason, DWORD timeout_ms) {
+			auto& st = memory_scanner::g_state;
+			const bool active =
+				st.scanning.load(std::memory_order_acquire) ||
+				!st.scan_thread_done.load(std::memory_order_acquire) ||
+				st.pointer_scanning.load(std::memory_order_acquire) ||
+				!st.pointer_thread_done.load(std::memory_order_acquire);
+			if (!active) return;
+
+			log_msg(hf, "memscan-cleanup",
+				"BEGIN -- %s scanning=%d scan_done=%d pointer_scanning=%d pointer_done=%d",
+				reason ? reason : "unspecified",
+				st.scanning.load(std::memory_order_acquire) ? 1 : 0,
+				st.scan_thread_done.load(std::memory_order_acquire) ? 1 : 0,
+				st.pointer_scanning.load(std::memory_order_acquire) ? 1 : 0,
+				st.pointer_thread_done.load(std::memory_order_acquire) ? 1 : 0);
+
+			request_memory_scanner_stop();
+			const bool idle = wait_memory_scanner_all_idle(timeout_ms);
+
+			log_msg(hf, "memscan-cleanup",
+				"END -- %s idle=%d scanning=%d scan_done=%d pointer_scanning=%d pointer_done=%d",
+				reason ? reason : "unspecified",
+				idle ? 1 : 0,
+				st.scanning.load(std::memory_order_acquire) ? 1 : 0,
+				st.scan_thread_done.load(std::memory_order_acquire) ? 1 : 0,
+				st.pointer_scanning.load(std::memory_order_acquire) ? 1 : 0,
+				st.pointer_thread_done.load(std::memory_order_acquire) ? 1 : 0);
 		}
 
 		void log_phase_begin(HANDLE hf, const char* phase) {
@@ -777,13 +863,13 @@ namespace test_all_features {
 				const char* cat  = (f.category != nullptr) ? f.category : "?";
 
 				if (is_destructive(f.name)) {
-					log_msg(hf, "testlab", "[%d/%d] SKIP %s/%s (destructive)", i + 1, total, cat, name);
+					log_msg(hf, "testlab", "[%d/%d] SKIP %s/%s (destructive guard)", i + 1, total, cat, name);
 					g_skipped.fetch_add(1);
 					continue;
 				}
 				if (f.run == nullptr) {
-					log_msg(hf, "testlab", "[%d/%d] SKIP %s/%s (no run fn)", i + 1, total, cat, name);
-					g_skipped.fetch_add(1);
+					log_msg(hf, "testlab", "[%d/%d] FAIL %s/%s (no run fn)", i + 1, total, cat, name);
+					g_failed.fetch_add(1);
 					continue;
 				}
 
@@ -1100,76 +1186,128 @@ namespace test_all_features {
 
 		void test_memory_scanner(HANDLE hf) {
 			const char* tag = "memscan";
+			const int done_before = running_done();
 			set_phase("Memory scanner");
-			log_msg(hf, tag, "START -- scan attached target for resident PE marker string");
-			auto t0 = std::chrono::steady_clock::now();
+			try {
+				log_msg(hf, tag, "START -- scan attached target for resident PE marker string");
+				auto t0 = std::chrono::steady_clock::now();
 
-			if (!require_target(hf, tag)) return;
+				if (!require_target(hf, tag)) return;
 
-			std::uint32_t pid = current_target_pid();
-			std::uint64_t image_base = current_target_image_base();
+				std::uint32_t pid = current_target_pid();
+				std::uint64_t image_base = current_target_image_base();
 
-			memory_scanner::reset_scan();
-			memory_scanner::scan_config_t cfg;
-			cfg.value_type = memory_scanner::value_type_t::string_ascii;
-			cfg.scan_mode = memory_scanner::scan_mode_t::exact;
-			cfg.value_text = "This program cannot be run in DOS mode";
-			cfg.writable_only = false;
-			cfg.executable_exclude = false;
-			cfg.range_base = image_base;
-			cfg.range_size = image_base != 0 ? 0x1000 : 0;
+				cleanup_memory_scanner_runtime(hf, "before memory scanner feature", 3000);
+				memory_scanner::reset_scan();
+				memory_scanner::scan_config_t cfg;
+				cfg.value_type = memory_scanner::value_type_t::string_ascii;
+				cfg.scan_mode = memory_scanner::scan_mode_t::exact;
+				cfg.value_text = "This program cannot be run in DOS mode";
+				cfg.writable_only = false;
+				cfg.executable_exclude = false;
+				cfg.range_base = image_base;
+				cfg.range_size = image_base != 0 ? 0x1000 : 0;
 
-			log_msg(hf, tag, "first_scan ASCII \"%s\" against pid=%u range=0x%016llX+0x%llX",
-				cfg.value_text.c_str(), pid,
-				static_cast<unsigned long long>(cfg.range_base),
-				static_cast<unsigned long long>(cfg.range_size));
-			bool ok = memory_scanner::first_scan(cfg);
-
-			for (int i = 0; i < 100; ++i) {
-				if (cancelled()) break;
-				if (!memory_scanner::g_state.scanning.load()) break;
-				Sleep(100);
-			}
-
-			std::size_t found = 0;
-			{
-				std::lock_guard<std::mutex> lk(memory_scanner::g_state.results_mutex);
-				found = memory_scanner::g_state.results.size();
-			}
-
-			auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-				std::chrono::steady_clock::now() - t0).count();
-
-			if (ok && found > 0) {
-				std::uint64_t first_addr = 0;
-				{
-					std::lock_guard<std::mutex> lk(memory_scanner::g_state.results_mutex);
-					if (!memory_scanner::g_state.results.empty())
-						first_addr = memory_scanner::g_state.results.front().address;
+				log_msg(hf, tag, "first_scan ASCII \"%s\" against pid=%u range=0x%016llX+0x%llX",
+					cfg.value_text.c_str(), pid,
+					static_cast<unsigned long long>(cfg.range_base),
+					static_cast<unsigned long long>(cfg.range_size));
+				bool ok = memory_scanner::first_scan(cfg);
+				if (!ok) {
+					auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+						std::chrono::steady_clock::now() - t0).count();
+					log_msg(hf, tag, "FAIL -- first_scan rejected attached target pid=%u range=0x%016llX+0x%llX (elapsed %lld ms)",
+						pid,
+						static_cast<unsigned long long>(cfg.range_base),
+						static_cast<unsigned long long>(cfg.range_size),
+						(long long)ms);
+					g_failed.fetch_add(1);
+					return;
 				}
-				log_msg(hf, tag, "PASS -- scanner found %zu live matches in target (first=0x%016llX) (elapsed %lld ms)",
-					found, static_cast<unsigned long long>(first_addr), (long long)ms);
-				g_passed.fetch_add(1);
-				return;
-			}
 
-			log_msg(hf, tag, "scanner string scan empty (ok=%d found=%zu); falling back to direct driver read of image base",
-				static_cast<int>(ok), found);
+				bool idle = false;
+				for (int i = 0; i < 100; ++i) {
+					if (cancelled()) break;
+					if (memory_scanner_scan_idle()) {
+						idle = true;
+						break;
+					}
+					Sleep(100);
+				}
+				if (!idle)
+					idle = wait_memory_scanner_scan_idle(5000);
+				if (!idle) {
+					request_memory_scanner_stop();
+					wait_memory_scanner_scan_idle(3000);
+					auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+						std::chrono::steady_clock::now() - t0).count();
+					auto& st = memory_scanner::g_state;
+					log_msg(hf, tag, "FAIL -- first_scan timed out before results became idle scanning=%d scan_done=%d progress=%.3f (elapsed %lld ms)",
+						st.scanning.load(std::memory_order_acquire) ? 1 : 0,
+						st.scan_thread_done.load(std::memory_order_acquire) ? 1 : 0,
+						st.scan_progress.load(std::memory_order_acquire),
+						(long long)ms);
+					g_failed.fetch_add(1);
+					return;
+				}
 
-			std::vector<std::uint8_t> sample;
-			bool read_ok = (image_base != 0) &&
-				driver_bridge::read_memory_for(pid, image_base, 2, sample);
-			ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-				std::chrono::steady_clock::now() - t0).count();
+				std::size_t found = 0;
+				std::uint64_t first_addr = 0;
+				if (!snapshot_memory_scan_results(found, first_addr, 2000)) {
+					auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+						std::chrono::steady_clock::now() - t0).count();
+					log_msg(hf, tag, "FAIL -- scanner results mutex remained busy after idle scan (elapsed %lld ms)",
+						(long long)ms);
+					g_failed.fetch_add(1);
+					return;
+				}
 
-			if (read_ok && sample.size() >= 2 && sample[0] == 'M' && sample[1] == 'Z') {
-				log_msg(hf, tag, "PASS -- fallback driver read confirmed MZ at target image base 0x%016llX (elapsed %lld ms)",
-					static_cast<unsigned long long>(image_base), (long long)ms);
-				g_passed.fetch_add(1);
-			} else {
-				log_msg(hf, tag, "FAIL -- scanner found 0 matches and fallback read failed (read_ok=%d bytes=%zu) (elapsed %lld ms)",
-					static_cast<int>(read_ok), sample.size(), (long long)ms);
+				auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now() - t0).count();
+
+				if (found > 0) {
+					log_msg(hf, tag, "PASS -- scanner found %zu live matches in target (first=0x%016llX) (elapsed %lld ms)",
+						found, static_cast<unsigned long long>(first_addr), (long long)ms);
+					g_passed.fetch_add(1);
+					return;
+				}
+
+				log_msg(hf, tag, "scanner string scan empty after successful idle scan; validating target memory directly");
+
+				std::vector<std::uint8_t> sample;
+				bool read_ok = (image_base != 0) &&
+					driver_bridge::read_memory_for(pid, image_base, 0x1000, sample);
+				ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now() - t0).count();
+
+				const std::string marker = cfg.value_text;
+				bool marker_present = read_ok && sample.size() >= marker.size() &&
+					std::search(sample.begin(), sample.end(), marker.begin(), marker.end()) != sample.end();
+				bool mz_present = read_ok && sample.size() >= 2 && sample[0] == 'M' && sample[1] == 'Z';
+
+				if (marker_present) {
+					log_msg(hf, tag, "FAIL -- scanner missed readable PE marker at target image base 0x%016llX (read bytes=%zu elapsed %lld ms)",
+						static_cast<unsigned long long>(image_base), sample.size(), (long long)ms);
+				} else if (mz_present) {
+					log_msg(hf, tag, "FAIL -- target image base was readable but expected PE marker was absent from first page (bytes=%zu elapsed %lld ms)",
+						sample.size(), (long long)ms);
+				} else {
+					log_msg(hf, tag, "FAIL -- scanner found 0 matches and direct target read failed or returned non-PE data (read_ok=%d bytes=%zu elapsed %lld ms)",
+						static_cast<int>(read_ok), sample.size(), (long long)ms);
+				}
 				g_failed.fetch_add(1);
+			} catch (const std::exception& ex) {
+				request_memory_scanner_stop();
+				wait_memory_scanner_scan_idle(3000);
+				log_msg(hf, tag, "FAIL -- memory scanner test raised C++ exception: %s", ex.what());
+				if (running_done() == done_before)
+					g_failed.fetch_add(1);
+			} catch (...) {
+				request_memory_scanner_stop();
+				wait_memory_scanner_scan_idle(3000);
+				log_msg(hf, tag, "FAIL -- memory scanner test raised unknown C++ exception");
+				if (running_done() == done_before)
+					g_failed.fetch_add(1);
 			}
 		}
 
@@ -1455,11 +1593,21 @@ namespace test_all_features {
 			log_msg(hf, "cleanup", "signaling test_target done event for pid=%u", pid);
 
 			HANDLE hDone = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Global\\WhosWhoTestDone");
-			if (!hDone) hDone = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Local\\WhosWhoTestDone");
+			if (!hDone) {
+				DWORD global_err = GetLastError();
+				log_msg(hf, "cleanup", "OpenEvent Global\\WhosWhoTestDone failed err=%lu", static_cast<unsigned long>(global_err));
+				hDone = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Local\\WhosWhoTestDone");
+				if (!hDone) {
+					DWORD local_err = GetLastError();
+					log_msg(hf, "cleanup", "OpenEvent Local\\WhosWhoTestDone failed err=%lu", static_cast<unsigned long>(local_err));
+				}
+			}
 			if (hDone) {
-				SetEvent(hDone);
+				BOOL signaled = SetEvent(hDone);
+				DWORD signal_err = signaled ? 0 : GetLastError();
 				CloseHandle(hDone);
-				log_msg(hf, "cleanup", "WhosWhoTestDone signaled; waiting for process to exit...");
+				log_msg(hf, "cleanup", "WhosWhoTestDone signal_result=%d err=%lu; waiting for process to exit...",
+					signaled ? 1 : 0, static_cast<unsigned long>(signal_err));
 			} else {
 				log_msg(hf, "cleanup", "could not open WhosWhoTestDone event; sending TerminateProcess directly");
 			}
@@ -1468,11 +1616,32 @@ namespace test_all_features {
 			if (hProc) {
 				DWORD wait_result = WaitForSingleObject(hProc, 6000);
 				if (wait_result != WAIT_OBJECT_0) {
-					log_msg(hf, "cleanup", "process pid=%u did not exit in 6s (wait_result=%lu); forcing TerminateProcess", pid, static_cast<unsigned long>(wait_result));
-					TerminateProcess(hProc, 0);
-					WaitForSingleObject(hProc, 2000);
+					DWORD exit_code = 0;
+					BOOL got_exit = GetExitCodeProcess(hProc, &exit_code);
+					log_msg(hf, "cleanup", "process pid=%u did not exit in 6s wait_result=%lu get_exit=%d exit_code=0x%08lX wait_err=%lu; forcing TerminateProcess",
+						pid,
+						static_cast<unsigned long>(wait_result),
+						got_exit ? 1 : 0,
+						static_cast<unsigned long>(exit_code),
+						static_cast<unsigned long>(GetLastError()));
+					BOOL term_ok = TerminateProcess(hProc, 0);
+					DWORD term_err = term_ok ? 0 : GetLastError();
+					DWORD post_wait = WaitForSingleObject(hProc, 2000);
+					DWORD post_exit = 0;
+					BOOL got_post_exit = GetExitCodeProcess(hProc, &post_exit);
+					log_msg(hf, "cleanup", "TerminateProcess result=%d err=%lu post_wait=%lu get_exit=%d exit_code=0x%08lX",
+						term_ok ? 1 : 0,
+						static_cast<unsigned long>(term_err),
+						static_cast<unsigned long>(post_wait),
+						got_post_exit ? 1 : 0,
+						static_cast<unsigned long>(post_exit));
 				} else {
-					log_msg(hf, "cleanup", "process pid=%u exited cleanly", pid);
+					DWORD exit_code = 0;
+					BOOL got_exit = GetExitCodeProcess(hProc, &exit_code);
+					log_msg(hf, "cleanup", "process pid=%u exited cleanly get_exit=%d exit_code=0x%08lX",
+						pid,
+						got_exit ? 1 : 0,
+						static_cast<unsigned long>(exit_code));
 				}
 				CloseHandle(hProc);
 			} else {
@@ -1491,6 +1660,10 @@ namespace test_all_features {
 				if (!active) return;
 				HANDLE h = hf ? *hf : INVALID_HANDLE_VALUE;
 				log_msg(h, "cleanup", "abnormal/early exit cleanup guard fired");
+				try {
+					cleanup_memory_scanner_runtime(h, "abnormal/early exit", 5000);
+				} catch (...) {
+				}
 				cleanup_network_runtime(h, "abnormal/early exit");
 				if (target_pid) {
 					phase_stop_target(h, *target_pid);
@@ -1779,6 +1952,10 @@ namespace test_all_features {
 				message ? message : "",
 				snap);
 			set_full_test_env(hf, false, "worker exception escape");
+			try {
+				cleanup_memory_scanner_runtime(hf, "worker exception escape", 5000);
+			} catch (...) {
+			}
 			cleanup_network_runtime(hf, "worker exception escape");
 			std::uint32_t pid = g_target_pid.load(std::memory_order_acquire);
 			if (pid != 0)
@@ -1842,19 +2019,28 @@ namespace test_all_features {
 
 			diag::log_tagged_fmt("test_all", "user triggered Test All Features");
 
-			bool posted = work_queue::post([]() {
-				(void)run_all_seh_guarded();
-			});
-			if (!posted) {
+			try {
+				std::thread([]() {
+					(void)run_all_seh_guarded();
+				}).detach();
+			} catch (const std::exception& ex) {
 				HANDLE hf = open_log_file();
-				log_msg(hf, "start", "FAIL -- work_queue::post returned false; run not queued");
+				log_msg(hf, "start", "FAIL -- full-test worker thread could not start: %s", ex.what());
 				g_failed.fetch_add(1);
 				g_running.store(false, std::memory_order_release);
 				if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
-				diag::log_tagged("test_all", "work_queue::post failed for full test");
+				diag::log_tagged_fmt("test_all", "full-test worker thread start failed: %s", ex.what());
+				return false;
+			} catch (...) {
+				HANDLE hf = open_log_file();
+				log_msg(hf, "start", "FAIL -- full-test worker thread could not start: unknown exception");
+				g_failed.fetch_add(1);
+				g_running.store(false, std::memory_order_release);
+				if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+				diag::log_tagged("test_all", "full-test worker thread start failed: unknown exception");
 				return false;
 			}
-			diag::log_tagged("test_all", "work_queue::post accepted full test worker");
+			diag::log_tagged("test_all", "dedicated full test worker thread started");
 			return true;
 		}
 

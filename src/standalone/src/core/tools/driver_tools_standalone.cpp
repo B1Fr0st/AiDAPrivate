@@ -414,6 +414,78 @@ static std::optional<std::uint32_t> parse_tid_param(const json& params)
     return tid;
 }
 
+static bool is_probably_kernel_address(std::uint64_t address);
+
+struct native_client_id_t
+{
+    void* unique_process = nullptr;
+    void* unique_thread = nullptr;
+};
+
+struct native_thread_basic_information_t
+{
+    NTSTATUS exit_status = 0;
+    void* teb_base_address = nullptr;
+    native_client_id_t client_id{};
+    std::uintptr_t affinity_mask = 0;
+    LONG priority = 0;
+    LONG base_priority = 0;
+};
+
+static bool query_thread_teb_address(std::uint32_t tid, std::uint64_t& out_teb, std::string& error)
+{
+    out_teb = 0;
+    native_thread_basic_information_t tbi{};
+    std::uint32_t returned = 0;
+    if (!driver_bridge::query_thread_information(tid, 0, &tbi, static_cast<std::uint32_t>(sizeof(tbi)), &returned))
+    {
+        error = OBFSTR("NtQueryInformationThread(ThreadBasicInformation) failed for TID ") + std::to_string(tid);
+        return false;
+    }
+
+    const std::uint64_t teb = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(tbi.teb_base_address));
+    if (teb == 0 || is_probably_kernel_address(teb))
+    {
+        error = OBFSTR("ThreadBasicInformation returned an invalid TEB address for TID ") + std::to_string(tid);
+        return false;
+    }
+
+    const std::uint32_t attached_pid = driver_bridge::attached_pid();
+    const std::uint32_t tbi_pid = static_cast<std::uint32_t>(
+        reinterpret_cast<std::uintptr_t>(tbi.client_id.unique_process) & 0xFFFFFFFFu);
+    if (attached_pid != 0 && tbi_pid != 0 && tbi_pid != attached_pid)
+    {
+        error = OBFSTR("TID ") + std::to_string(tid) + OBFSTR(" belongs to PID ") +
+            std::to_string(tbi_pid) + OBFSTR(", not attached PID ") + std::to_string(attached_pid);
+        return false;
+    }
+
+    out_teb = teb;
+    return true;
+}
+
+static bool resolve_teb_address_for_thread(std::uint32_t tid,
+                                           const voyager::device_t::thread_context& ctx,
+                                           std::uint64_t& out_teb,
+                                           std::string& source,
+                                           std::string& error)
+{
+    out_teb = ctx.kernel_gs_base;
+    source = OBFSTR("thread_context.kernel_gs_base");
+    if (out_teb != 0 && !is_probably_kernel_address(out_teb))
+        return true;
+
+    if (query_thread_teb_address(tid, out_teb, error))
+    {
+        source = OBFSTR("NtQueryInformationThread.ThreadBasicInformation.TebBaseAddress");
+        return true;
+    }
+
+    if (ctx.kernel_gs_base != 0 && is_probably_kernel_address(ctx.kernel_gs_base))
+        error = OBFSTR("thread context reported a kernel GS base instead of a user TEB and ") + error;
+    return false;
+}
+
 static bool is_probably_kernel_address(std::uint64_t address)
 {
     return address >= 0xFFFF000000000000ULL;
@@ -9009,7 +9081,7 @@ tool_result_t driver_detect_integrity_checks(const json& params)
 }
 
 
-tool_result_t driver_detect_ssdt_hooks(const json& params)
+tool_result_t driver_detect_ssdt_hooks(const json&)
 {
     diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks entry");
     if (!device->is_connected())
@@ -9020,10 +9092,16 @@ tool_result_t driver_detect_ssdt_hooks(const json& params)
     std::vector<uint8_t> buf;
     sys_module_info_t* info = nullptr;
     std::string err;
-    if (!query_kernel_modules(buf, info, err))
+    if (!query_kernel_modules(buf, info, err)) {
+        diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks query_kernel_modules_failed err=%s", err.c_str());
         return tool_result_t::error(OBFSTR("Failed to enumerate kernel modules: ") + err);
+    }
+    diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks modules=%lu kernel_dtb=0x%llX",
+        static_cast<unsigned long>(info ? info->NumberOfModules : 0),
+        static_cast<unsigned long long>(device->get_kernel_dtb()));
 
     std::uint64_t ntos_base = 0, ntos_size = 0;
+    std::string ntos_path;
     for (ULONG i = 0; i < info->NumberOfModules; ++i)
     {
         std::string fp(reinterpret_cast<const char*>(info->Modules[i].FullPathName));
@@ -9033,17 +9111,24 @@ tool_result_t driver_detect_ssdt_hooks(const json& params)
         {
             ntos_base = reinterpret_cast<std::uint64_t>(info->Modules[i].ImageBase);
             ntos_size = info->Modules[i].ImageSize;
+            ntos_path = reinterpret_cast<const char*>(info->Modules[i].FullPathName);
             break;
         }
     }
-    if (ntos_base == 0)
+    if (ntos_base == 0) {
+        for (ULONG i = 0; i < info->NumberOfModules && i < 12; ++i) {
+            diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks module[%lu] base=0x%llX size=0x%lX path=%s",
+                static_cast<unsigned long>(i),
+                static_cast<unsigned long long>(reinterpret_cast<std::uint64_t>(info->Modules[i].ImageBase)),
+                static_cast<unsigned long>(info->Modules[i].ImageSize),
+                reinterpret_cast<const char*>(info->Modules[i].FullPathName));
+        }
         return tool_result_t::error(OBFSTR("Could not find ntoskrnl base address"));
-
-
-    std::uint64_t ssdt_addr = device->resolve_export(ntos_base, "KeServiceDescriptorTable");
-    if (ssdt_addr == 0)
-        return tool_result_t::error(OBFSTR("Could not resolve KeServiceDescriptorTable export"));
-
+    }
+    diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks ntos base=0x%llX size=0x%llX path=%s",
+        static_cast<unsigned long long>(ntos_base),
+        static_cast<unsigned long long>(ntos_size),
+        ntos_path.c_str());
 
     struct ssdt_entry_t {
         std::uint64_t service_table;
@@ -9053,19 +9138,87 @@ tool_result_t driver_detect_ssdt_hooks(const json& params)
         std::uint64_t param_table;
     };
     ssdt_entry_t ssdt{};
-    if (device->read_kernel_raw(ssdt_addr, &ssdt, sizeof(ssdt)) < sizeof(ssdt))
-        return tool_result_t::error(OBFSTR("Failed to read SSDT structure"));
 
-    if (ssdt.num_services == 0 || ssdt.num_services > 2048)
+    std::uint64_t ssdt_addr = device->resolve_export(ntos_base, "KeServiceDescriptorTable");
+    const bool export_available = (ssdt_addr != 0);
+    std::string ssdt_resolution_source = "export";
+    std::uint64_t ssdt_lstar = 0;
+    std::uint32_t ssdt_flags = 0;
+
+    if (export_available) {
+        diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks ssdt_addr=0x%llX source=export",
+            static_cast<unsigned long long>(ssdt_addr));
+
+        size_t ssdt_read = device->read_kernel_raw(ssdt_addr, &ssdt, sizeof(ssdt));
+        if (ssdt_read < sizeof(ssdt)) {
+            diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks read_ssdt_failed addr=0x%llX read=%zu need=%zu",
+                static_cast<unsigned long long>(ssdt_addr), ssdt_read, sizeof(ssdt));
+            return tool_result_t::error(OBFSTR("Failed to read SSDT structure"));
+        }
+    } else {
+        std::uint64_t shadow_addr = device->resolve_export(ntos_base, "KeServiceDescriptorTableShadow");
+        std::uint64_t nt_close = device->resolve_export(ntos_base, "NtClose");
+        std::uint64_t zw_close = device->resolve_export(ntos_base, "ZwClose");
+        diag::log_tagged_fmt("drv_tools",
+            "driver_detect_ssdt_hooks ssdt_export_missing ntos=0x%llX shadow=0x%llX NtClose=0x%llX ZwClose=0x%llX",
+            static_cast<unsigned long long>(ntos_base),
+            static_cast<unsigned long long>(shadow_addr),
+            static_cast<unsigned long long>(nt_close),
+            static_cast<unsigned long long>(zw_close));
+
+        voyager::device_t::ssdt_info query{};
+        if (!device->query_ssdt(query)) {
+            diag::log_tagged_fmt("drv_tools",
+                "driver_detect_ssdt_hooks ssdt_query_failed ntos=0x%llX kernel_dtb=0x%llX",
+                static_cast<unsigned long long>(ntos_base),
+                static_cast<unsigned long long>(device->get_kernel_dtb()));
+            return tool_result_t::error(OBFSTR("Could not resolve SSDT through export or syscall-entry fallback"));
+        }
+
+        ssdt_addr = query.descriptor_address;
+        ssdt.service_table = query.service_table;
+        ssdt.counter_table = query.counter_table;
+        ssdt.num_services = query.service_limit;
+        ssdt.param_table = query.argument_table;
+        ssdt_lstar = query.lstar;
+        ssdt_flags = query.flags;
+        ssdt_resolution_source = "lstar_syscall_entry";
+
+        diag::log_tagged_fmt("drv_tools",
+            "driver_detect_ssdt_hooks ssdt_query_ok lstar=0x%llX desc=0x%llX table=0x%llX counter=0x%llX arg=0x%llX limit=%u flags=0x%X",
+            static_cast<unsigned long long>(query.lstar),
+            static_cast<unsigned long long>(query.descriptor_address),
+            static_cast<unsigned long long>(query.service_table),
+            static_cast<unsigned long long>(query.counter_table),
+            static_cast<unsigned long long>(query.argument_table),
+            query.service_limit,
+            query.flags);
+    }
+    diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks ssdt service_table=0x%llX counter=0x%llX num=%u param=0x%llX",
+        static_cast<unsigned long long>(ssdt.service_table),
+        static_cast<unsigned long long>(ssdt.counter_table),
+        ssdt.num_services,
+        static_cast<unsigned long long>(ssdt.param_table));
+
+    if (ssdt.num_services == 0 || ssdt.num_services > 2048) {
+        diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks invalid_service_count=%u", ssdt.num_services);
         return tool_result_t::error(OBFSTR("Invalid SSDT service count: ") + std::to_string(ssdt.num_services));
-    if (!is_probably_kernel_address(ssdt.service_table))
+    }
+    if (!is_probably_kernel_address(ssdt.service_table)) {
+        diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks invalid_service_table=0x%llX",
+            static_cast<unsigned long long>(ssdt.service_table));
         return tool_result_t::error(OBFSTR("ServiceTableBase is not a valid kernel address"));
+    }
 
 
     std::vector<std::int32_t> entries(ssdt.num_services);
     size_t read_sz = ssdt.num_services * sizeof(std::int32_t);
-    if (device->read_kernel_raw(ssdt.service_table, entries.data(), read_sz) < read_sz)
+    size_t entries_read = device->read_kernel_raw(ssdt.service_table, entries.data(), read_sz);
+    if (entries_read < read_sz) {
+        diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks read_entries_failed table=0x%llX read=%zu need=%zu",
+            static_cast<unsigned long long>(ssdt.service_table), entries_read, read_sz);
         return tool_result_t::error(OBFSTR("Failed to read SSDT entries"));
+    }
 
     json hooked = json::array();
     json clean_count_json;
@@ -9109,6 +9262,11 @@ tool_result_t driver_detect_ssdt_hooks(const json& params)
 
     json result;
     result["ssdt_address"]      = sa_format_address(static_cast<uint64_t>(ssdt_addr));
+    result["ssdt_descriptor_address"] = sa_format_address(static_cast<uint64_t>(ssdt_addr));
+    result["ssdt_resolution_source"] = ssdt_resolution_source;
+    result["export_available"] = export_available;
+    result["lstar"] = sa_format_address(static_cast<uint64_t>(ssdt_lstar));
+    result["ssdt_flags"] = ssdt_flags;
     result["service_table"]     = sa_format_address(static_cast<uint64_t>(ssdt.service_table));
     result["total_services"]    = ssdt.num_services;
     result["hooks_found"]       = hooks_found;
@@ -10016,9 +10174,12 @@ tool_result_t driver_walk_seh_chain(const json& params)
         return tool_result_t::error(OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
 
 
-    const std::uint64_t teb_addr = ctx.kernel_gs_base;
-    if (teb_addr == 0)
-        return tool_result_t::error(OBFSTR("TEB address is null (kernel_gs_base=0)"));
+    std::uint64_t teb_addr = 0;
+    std::string teb_source;
+    std::string teb_error;
+    if (!resolve_teb_address_for_thread(tid, ctx, teb_addr, teb_source, teb_error))
+        return tool_result_t::error(OBFSTR("TEB address unavailable for TID ") +
+                                    std::to_string(tid) + OBFSTR(": ") + teb_error);
 
 
     std::uint64_t seh_head = device->read<std::uint64_t>(teb_addr);
@@ -10230,6 +10391,8 @@ tool_result_t driver_walk_seh_chain(const json& params)
     json result;
     result["thread_id"] = tid;
     result["teb_address"] = sa_format_address(static_cast<uint64_t>(teb_addr));
+    result["teb_source"] = teb_source;
+    result["teb_available"] = true;
     result["seh_entries"] = seh_chain.size();
     result["seh_chain"] = std::move(seh_chain);
     result["veh_entries"] = veh_chain.size();
@@ -11496,14 +11659,18 @@ tool_result_t driver_read_teb(const json& params)
     if (!device->get_thread_context(tid, ctx))
         return tool_result_t::error(OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
 
-    const std::uint64_t teb_addr = ctx.kernel_gs_base;
-    if (teb_addr == 0)
-        return tool_result_t::error(OBFSTR("TEB address is null"));
+    std::uint64_t teb_addr = 0;
+    std::string teb_source;
+    std::string teb_error;
+    if (!resolve_teb_address_for_thread(tid, ctx, teb_addr, teb_source, teb_error))
+        return tool_result_t::error(OBFSTR("TEB address unavailable for TID ") +
+                                    std::to_string(tid) + OBFSTR(": ") + teb_error);
 
 
     json teb;
     teb["teb_address"] = sa_format_address(static_cast<uint64_t>(teb_addr));
     teb["thread_id"] = tid;
+    teb["teb_source"] = teb_source;
 
 
     teb["exception_list"] = sa_format_address(static_cast<uint64_t>(device->read<std::uint64_t>(teb_addr + 0x00)));

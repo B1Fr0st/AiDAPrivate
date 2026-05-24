@@ -448,7 +448,7 @@ inline deobfuscated_result_t deobfuscate_function(uint64_t entry_addr, uint32_t 
 	uint32_t tid = 0;
 	if (!threads.empty()) tid = threads[0].tid;
 
-	auto snapshot = emulation::driver_snapshot(pid, tid, entry_addr, 0x10000);
+	auto snapshot = emulation::driver_snapshot(pid, tid, entry_addr, 0x1000);
 	if (!snapshot.success) {
 		result.error = "Failed to take process snapshot";
 		return result;
@@ -509,7 +509,12 @@ inline deobfuscated_result_t deobfuscate_function(uint64_t entry_addr, uint32_t 
 
 	g_state.progress_current.store(4);
 
-	auto sym_result = symbolic_engine::execute_symbolic(entry_addr, 0, max_instructions, {}, {});
+	uint64_t symbolic_end = 0;
+	for (const auto& block : blocks) {
+		if (block.end > symbolic_end)
+			symbolic_end = block.end;
+	}
+	auto sym_result = symbolic_engine::execute_symbolic(entry_addr, symbolic_end, max_instructions, {}, {});
 	if (sym_result.success) {
 		result.opaques = sym_result.opaque_predicates;
 		result.constants = sym_result.constants_resolved;

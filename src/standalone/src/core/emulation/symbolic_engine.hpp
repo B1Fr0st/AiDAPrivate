@@ -111,6 +111,34 @@ inline bool pc_in_requested_range(uint64_t pc, uint64_t start_addr, uint64_t end
 	return pc >= start_addr && pc < end_addr;
 }
 
+inline uint64_t snapshot_size_for_range(uint64_t start_addr, uint64_t end_addr) {
+	if (end_addr > start_addr) {
+		uint64_t span = end_addr - start_addr;
+		if (span < 0x1000)
+			return 0x1000;
+		uint64_t aligned = (span + 0xFFFull) & ~0xFFFull;
+		return (std::min<uint64_t>)(aligned, 0x10000ull);
+	}
+	return 0x10000;
+}
+
+inline bool is_ret_opcode(const std::vector<uint8_t>& code_bytes) {
+	if (code_bytes.empty())
+		return false;
+	uint8_t op = code_bytes[0];
+	return op == 0xC3 || op == 0xCB || op == 0xC2 || op == 0xCA;
+}
+
+inline uint64_t next_pc_or_fallthrough(triton::Context& ctx, triton::arch::Instruction& insn, uint64_t pc) {
+	uint64_t next_pc = static_cast<uint64_t>(ctx.getConcreteRegisterValue(ctx.getRegister("rip")));
+	if (next_pc == 0 || next_pc == pc) {
+		uint32_t size = insn.getSize();
+		if (size != 0)
+			next_pc = pc + size;
+	}
+	return next_pc;
+}
+
 inline triton::arch::register_e name_to_triton_reg(const std::string& name) {
 	static const std::unordered_map<std::string, triton::arch::register_e> map = {
 		{"rax", triton::arch::ID_REG_X86_RAX},
@@ -248,11 +276,19 @@ inline symbolic_result_t execute_symbolic(
 	uint32_t tid = 0;
 	if (!threads.empty()) tid = threads[0].tid;
 
-	auto snapshot = emulation::driver_snapshot(pid, tid, start_addr, 0x10000);
+	diag::log_tagged_fmt("symbolic", "execute_snapshot entry=0x%llX end=0x%llX max=%u",
+		static_cast<unsigned long long>(start_addr),
+		static_cast<unsigned long long>(end_addr),
+		max_instructions);
+	auto snapshot = emulation::driver_snapshot(pid, tid, start_addr, detail::snapshot_size_for_range(start_addr, end_addr));
 	if (!snapshot.success) {
 		result.error = "Failed to take process snapshot: " + snapshot.error;
 		return result;
 	}
+	diag::log_tagged_fmt("symbolic", "execute_snapshot_ok entry=0x%llX bytes=%llu regions=%zu",
+		static_cast<unsigned long long>(start_addr),
+		static_cast<unsigned long long>(snapshot.total_snapshot_bytes),
+		snapshot.regions.size());
 
 	detail::load_snapshot_into_context(ctx, snapshot);
 
@@ -297,6 +333,8 @@ inline symbolic_result_t execute_symbolic(
 		}
 
 		auto traced = detail::build_traced_insn(ctx, insn);
+		const bool ret_insn = detail::is_ret_opcode(code_bytes);
+		const uint64_t next_pc = detail::next_pc_or_fallthrough(ctx, insn, pc);
 
 		if (insn.isBranch()) {
 			auto path_constraints = ctx.getPathConstraints();
@@ -342,9 +380,11 @@ inline symbolic_result_t execute_symbolic(
 
 		result.trace.push_back(std::move(traced));
 
-		pc = static_cast<uint64_t>(ctx.getConcreteRegisterValue(ctx.getRegister("rip")));
 		++count;
 		g_state.progress_current.store(count);
+		if (ret_insn)
+			break;
+		pc = next_pc;
 	}
 
 	result.total_instructions = count;
@@ -384,7 +424,7 @@ inline slice_result_t slice_to_register(
 	uint32_t tid = 0;
 	if (!threads.empty()) tid = threads[0].tid;
 
-	auto snapshot = emulation::driver_snapshot(pid, tid, start_addr, 0x10000);
+	auto snapshot = emulation::driver_snapshot(pid, tid, start_addr, detail::snapshot_size_for_range(start_addr, end_addr));
 	if (!snapshot.success) {
 		result.error = "Failed to take process snapshot";
 		return result;
@@ -417,10 +457,14 @@ inline slice_result_t slice_to_register(
 		if (exc != triton::arch::NO_FAULT) break;
 
 		auto traced = detail::build_traced_insn(ctx, insn);
+		const bool ret_insn = detail::is_ret_opcode(code_bytes);
+		const uint64_t next_pc = detail::next_pc_or_fallthrough(ctx, insn, pc);
 		records.push_back({insn, std::move(traced)});
 
-		pc = static_cast<uint64_t>(ctx.getConcreteRegisterValue(ctx.getRegister("rip")));
 		++count;
+		if (ret_insn)
+			break;
+		pc = next_pc;
 	}
 
 	result.total_instructions = count;
@@ -486,7 +530,8 @@ inline solve_result_t solve_for_path(
 	uint32_t tid = 0;
 	if (!threads.empty()) tid = threads[0].tid;
 
-	auto snapshot = emulation::driver_snapshot(pid, tid, start_addr, 0x10000);
+	uint64_t snapshot_end = target_addr > start_addr ? target_addr + 0x100 : 0;
+	auto snapshot = emulation::driver_snapshot(pid, tid, start_addr, detail::snapshot_size_for_range(start_addr, snapshot_end));
 	if (!snapshot.success) {
 		result.error = "Failed to take process snapshot";
 		return result;
@@ -521,8 +566,10 @@ inline solve_result_t solve_for_path(
 		auto exc = ctx.processing(insn);
 		if (exc != triton::arch::NO_FAULT) break;
 
-		pc = static_cast<uint64_t>(ctx.getConcreteRegisterValue(ctx.getRegister("rip")));
 		++count;
+		if (detail::is_ret_opcode(code_bytes))
+			break;
+		pc = detail::next_pc_or_fallthrough(ctx, insn, pc);
 	}
 
 	if (!reached) {
@@ -606,7 +653,7 @@ inline taint_result_t taint_trace(
 	uint32_t tid = 0;
 	if (!threads.empty()) tid = threads[0].tid;
 
-	auto snapshot = emulation::driver_snapshot(pid, tid, start_addr, 0x10000);
+	auto snapshot = emulation::driver_snapshot(pid, tid, start_addr, detail::snapshot_size_for_range(start_addr, end_addr));
 	if (!snapshot.success) {
 		result.error = "Failed to take process snapshot";
 		return result;
@@ -646,14 +693,19 @@ inline taint_result_t taint_trace(
 		auto exc = ctx.processing(insn);
 		if (exc != triton::arch::NO_FAULT) break;
 
+		const bool ret_insn = detail::is_ret_opcode(code_bytes);
+		const uint64_t next_pc = detail::next_pc_or_fallthrough(ctx, insn, pc);
+
 		if (insn.isTainted()) {
 			auto traced = detail::build_traced_insn(ctx, insn);
 			result.tainted_instructions.push_back(std::move(traced));
 		}
 
-		pc = static_cast<uint64_t>(ctx.getConcreteRegisterValue(ctx.getRegister("rip")));
 		++count;
 		g_state.progress_current.store(count);
+		if (ret_insn)
+			break;
+		pc = next_pc;
 	}
 
 	result.total_processed = count;
@@ -690,7 +742,7 @@ inline std::string get_register_expression(
 	uint32_t tid = 0;
 	if (!threads.empty()) tid = threads[0].tid;
 
-	auto snapshot = emulation::driver_snapshot(pid, tid, start_addr, 0x10000);
+	auto snapshot = emulation::driver_snapshot(pid, tid, start_addr, 0x1000);
 	if (!snapshot.success) return "<error: snapshot failed>";
 
 	detail::load_snapshot_into_context(ctx, snapshot);
@@ -716,8 +768,10 @@ inline std::string get_register_expression(
 		auto exc = ctx.processing(insn);
 		if (exc != triton::arch::NO_FAULT) break;
 
-		pc = static_cast<uint64_t>(ctx.getConcreteRegisterValue(ctx.getRegister("rip")));
 		++count;
+		if (detail::is_ret_opcode(code_bytes))
+			break;
+		pc = detail::next_pc_or_fallthrough(ctx, insn, pc);
 	}
 
 	auto target_id = detail::name_to_triton_reg(target_reg);
@@ -783,7 +837,11 @@ inline bool is_opaque_predicate(
 		insn.setOpcode(code_bytes.data(), static_cast<triton::uint32>(code_bytes.size()));
 		insn.setAddress(pc);
 
-		ctx.processing(insn);
+		auto exc = ctx.processing(insn);
+		if (exc != triton::arch::NO_FAULT)
+			break;
+		const bool ret_insn = detail::is_ret_opcode(code_bytes);
+		const uint64_t next_pc = detail::next_pc_or_fallthrough(ctx, insn, pc);
 
 		if (pc == branch_addr && insn.isBranch()) {
 			auto path_constraints = ctx.getPathConstraints();
@@ -796,8 +854,10 @@ inline bool is_opaque_predicate(
 			}
 		}
 
-		pc = static_cast<uint64_t>(ctx.getConcreteRegisterValue(ctx.getRegister("rip")));
 		++count;
+		if (ret_insn)
+			break;
+		pc = next_pc;
 	}
 
 	return false;

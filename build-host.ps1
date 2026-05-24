@@ -64,8 +64,14 @@ function Invoke-CmdStep {
     Write-Host "[$($started.ToString('HH:mm:ss'))] START $($Step.Name)"
     Write-Host "[$($started.ToString('HH:mm:ss'))] LOG   $($Step.Log)"
     $cmdLine = "call `"$VsVars`" && cd /d `"$Root`" && $($Step.Command)"
-    & $env:ComSpec /d /s /c $cmdLine *> $Step.Log
-    $code = $LASTEXITCODE
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $env:ComSpec /d /s /c $cmdLine *> $Step.Log
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
     $stepWatch.Stop()
     if ($Step.StableLog) {
         Copy-Item -LiteralPath $Step.Log -Destination $Step.StableLog -Force

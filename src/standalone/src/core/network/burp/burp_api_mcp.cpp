@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace aida {
@@ -32,6 +33,58 @@ namespace {
 
 using tool_result_t = mcp_standalone::tool_result_t;
 using json = nlohmann::json;
+
+struct url_log_t
+{
+    std::string host;
+    std::string path;
+    bool has_query = false;
+    size_t length = 0;
+};
+
+url_log_t summarize_url_for_log(const std::string& url)
+{
+    url_log_t out;
+    out.length = url.size();
+    std::string scheme, host, path;
+    uint16_t port = 0;
+    if (audit_http::parse_url(url, scheme, host, port, path))
+    {
+        out.host = host;
+        size_t q = path.find('?');
+        size_t f = path.find('#');
+        out.has_query = q != std::string::npos;
+        size_t path_end = path.size();
+        if (q != std::string::npos) path_end = q;
+        if (f != std::string::npos && f < path_end) path_end = f;
+        out.path = path.substr(0, path_end);
+    }
+    else
+    {
+        size_t cursor = 0;
+        size_t scheme_pos = url.find("://");
+        if (scheme_pos != std::string::npos) cursor = scheme_pos + 3;
+        size_t host_end = url.find_first_of("/?#", cursor);
+        if (host_end == std::string::npos) host_end = url.size();
+        if (host_end > cursor) out.host = url.substr(cursor, host_end - cursor);
+        size_t path_start = url.find('/', cursor);
+        size_t q = url.find('?', cursor);
+        size_t f = url.find('#', cursor);
+        out.has_query = q != std::string::npos;
+        size_t path_end = url.size();
+        if (q != std::string::npos) path_end = q;
+        if (f != std::string::npos && f < path_end) path_end = f;
+        if (path_start != std::string::npos && path_start < path_end) out.path = url.substr(path_start, path_end - path_start);
+    }
+    if (out.host.empty()) out.host = "<missing>";
+    if (out.path.empty()) out.path = "/";
+    if (out.path.size() > 240)
+    {
+        out.path.resize(240);
+        out.path += "...";
+    }
+    return out;
+}
 
 std::map<std::string, std::string> json_obj_to_map(const json& j)
 {
@@ -230,8 +283,9 @@ tool_result_t tool_api_send(const json& params)
     auto ex = audit_http::send(raw, host, port, tls, opts);
     if (!ex.has_value())
     {
-        diag::log_tagged_fmt("mcp_burp", "api_send send_failed err=%s", audit_http::last_error().c_str());
-        return tool_result_t::error(audit_http::last_error());
+        std::string err = audit_http::last_error();
+        diag::log_tagged_fmt("mcp_burp", "api_send send_failed err=%s", err.c_str());
+        return tool_result_t::error(err);
     }
 
     burp::logger::record(burp::logger::source_t::api, *ex);
@@ -278,7 +332,10 @@ tool_result_t tool_api_audit(const json& params)
 tool_result_t tool_gql_introspect(const json& params)
 {
     std::string ep = params.value("endpoint", std::string());
-    diag::log_tagged_fmt("mcp_burp", "gql_introspect endpoint=%s", ep.c_str());
+    const url_log_t endpoint_log = summarize_url_for_log(ep);
+    diag::log_tagged_fmt("mcp_burp", "gql_introspect host=%s path=%s query=%d endpoint_len=%zu params_keys=%zu",
+        endpoint_log.host.c_str(), endpoint_log.path.c_str(), (int)endpoint_log.has_query, endpoint_log.length,
+        params.is_object() ? params.size() : 0);
     if (ep.empty())
     {
         diag::log_tagged_fmt("mcp_burp", "gql_introspect missing_endpoint");
@@ -289,10 +346,12 @@ tool_result_t tool_gql_introspect(const json& params)
     std::string raw;
     if (!graphql::introspect(ep, hdrs, sch, raw))
     {
-        diag::log_tagged_fmt("mcp_burp", "gql_introspect failed err=%s", graphql::last_error().c_str());
-        return tool_result_t::error(graphql::last_error());
+        std::string err = graphql::last_error();
+        diag::log_tagged_fmt("mcp_burp", "gql_introspect failed err=%s", err.c_str());
+        return tool_result_t::error(err);
     }
-    diag::log_tagged_fmt("mcp_burp", "gql_introspect ok endpoint=%s", ep.c_str());
+    diag::log_tagged_fmt("mcp_burp", "gql_introspect ok host=%s path=%s raw_len=%zu types=%zu",
+        endpoint_log.host.c_str(), endpoint_log.path.c_str(), raw.size(), sch.types.size());
     json j = graphql::schema_to_json(sch);
     return tool_result_t::ok(j.dump(2), j);
 }
@@ -302,7 +361,10 @@ tool_result_t tool_gql_example(const json& params)
     std::string ep    = params.value("endpoint", std::string());
     std::string field = params.value("field_name", std::string());
     int depth         = params.value("depth", 2);
-    diag::log_tagged_fmt("mcp_burp", "gql_example endpoint=%s field=%s depth=%d", ep.c_str(), field.c_str(), depth);
+    const url_log_t endpoint_log = summarize_url_for_log(ep);
+    diag::log_tagged_fmt("mcp_burp", "gql_example host=%s path=%s query=%d endpoint_len=%zu field=%s depth=%d",
+        endpoint_log.host.c_str(), endpoint_log.path.c_str(), (int)endpoint_log.has_query, endpoint_log.length,
+        field.c_str(), depth);
     if (field.empty())
     {
         diag::log_tagged_fmt("mcp_burp", "gql_example missing_field_name");
@@ -310,12 +372,14 @@ tool_result_t tool_gql_example(const json& params)
     }
     graphql::gql_schema_t sch;
     if (!graphql::get_cached_schema(ep, sch)) {
-        diag::log_tagged_fmt("mcp_burp", "gql_example no_cached_schema introspecting endpoint=%s", ep.c_str());
+        diag::log_tagged_fmt("mcp_burp", "gql_example no_cached_schema introspecting host=%s path=%s",
+            endpoint_log.host.c_str(), endpoint_log.path.c_str());
         std::string raw;
         if (!graphql::introspect(ep, {}, sch, raw))
         {
-            diag::log_tagged_fmt("mcp_burp", "gql_example introspect_failed err=%s", graphql::last_error().c_str());
-            return tool_result_t::error(graphql::last_error());
+            std::string err = graphql::last_error();
+            diag::log_tagged_fmt("mcp_burp", "gql_example introspect_failed err=%s", err.c_str());
+            return tool_result_t::error(err);
         }
     }
     std::string q = graphql::build_example_query(sch, field, depth);
@@ -328,7 +392,10 @@ tool_result_t tool_gql_example(const json& params)
 tool_result_t tool_gql_send(const json& params)
 {
     std::string ep = params.value("endpoint", std::string());
-    diag::log_tagged_fmt("mcp_burp", "gql_send endpoint=%s", ep.c_str());
+    const url_log_t endpoint_log = summarize_url_for_log(ep);
+    diag::log_tagged_fmt("mcp_burp", "gql_send host=%s path=%s query=%d endpoint_len=%zu params_keys=%zu",
+        endpoint_log.host.c_str(), endpoint_log.path.c_str(), (int)endpoint_log.has_query, endpoint_log.length,
+        params.is_object() ? params.size() : 0);
     if (ep.empty())
     {
         diag::log_tagged_fmt("mcp_burp", "gql_send missing_endpoint");
@@ -347,10 +414,12 @@ tool_result_t tool_gql_send(const json& params)
     std::string raw;
     if (!graphql::send_query(ep, hdrs, q, variables, resp, raw))
     {
-        diag::log_tagged_fmt("mcp_burp", "gql_send failed err=%s", graphql::last_error().c_str());
-        return tool_result_t::error(graphql::last_error());
+        std::string err = graphql::last_error();
+        diag::log_tagged_fmt("mcp_burp", "gql_send failed err=%s", err.c_str());
+        return tool_result_t::error(err);
     }
-    diag::log_tagged_fmt("mcp_burp", "gql_send ok endpoint=%s", ep.c_str());
+    diag::log_tagged_fmt("mcp_burp", "gql_send ok host=%s path=%s raw_len=%zu response_type=%s",
+        endpoint_log.host.c_str(), endpoint_log.path.c_str(), raw.size(), resp.type_name());
     return tool_result_t::ok(resp.dump(2), resp);
 }
 
@@ -374,8 +443,9 @@ tool_result_t tool_ws_connect(const json& params)
     uint64_t id = ws_editor::connect(cfg);
     if (id == 0)
     {
-        diag::log_tagged_fmt("mcp_burp", "ws_connect failed err=%s", ws_editor::last_error().c_str());
-        return tool_result_t::error(ws_editor::last_error());
+        std::string err = ws_editor::last_error();
+        diag::log_tagged_fmt("mcp_burp", "ws_connect failed err=%s", err.c_str());
+        return tool_result_t::error(err);
     }
     diag::log_tagged_fmt("mcp_burp", "ws_connect ok conn_id=%llu", static_cast<unsigned long long>(id));
     json out;
@@ -389,8 +459,9 @@ tool_result_t tool_ws_disconnect(const json& params)
     diag::log_tagged_fmt("mcp_burp", "ws_disconnect conn_id=%llu", static_cast<unsigned long long>(id));
     if (!ws_editor::disconnect(id))
     {
-        diag::log_tagged_fmt("mcp_burp", "ws_disconnect failed err=%s", ws_editor::last_error().c_str());
-        return tool_result_t::error(ws_editor::last_error());
+        std::string err = ws_editor::last_error();
+        diag::log_tagged_fmt("mcp_burp", "ws_disconnect failed err=%s", err.c_str());
+        return tool_result_t::error(err);
     }
     diag::log_tagged_fmt("mcp_burp", "ws_disconnect ok conn_id=%llu", static_cast<unsigned long long>(id));
     return tool_result_t::ok("disconnected");
@@ -403,8 +474,9 @@ tool_result_t tool_ws_send_text(const json& params)
     diag::log_tagged_fmt("mcp_burp", "ws_send_text conn_id=%llu msg_len=%zu", static_cast<unsigned long long>(id), msg.size());
     if (!ws_editor::send_text(id, msg))
     {
-        diag::log_tagged_fmt("mcp_burp", "ws_send_text failed err=%s", ws_editor::last_error().c_str());
-        return tool_result_t::error(ws_editor::last_error());
+        std::string err = ws_editor::last_error();
+        diag::log_tagged_fmt("mcp_burp", "ws_send_text failed err=%s", err.c_str());
+        return tool_result_t::error(err);
     }
     diag::log_tagged_fmt("mcp_burp", "ws_send_text ok conn_id=%llu", static_cast<unsigned long long>(id));
     return tool_result_t::ok("sent");
@@ -418,8 +490,9 @@ tool_result_t tool_ws_send_binary(const json& params)
     auto bin = base64_decode(b64);
     if (!ws_editor::send_binary(id, bin))
     {
-        diag::log_tagged_fmt("mcp_burp", "ws_send_binary failed err=%s", ws_editor::last_error().c_str());
-        return tool_result_t::error(ws_editor::last_error());
+        std::string err = ws_editor::last_error();
+        diag::log_tagged_fmt("mcp_burp", "ws_send_binary failed err=%s", err.c_str());
+        return tool_result_t::error(err);
     }
     diag::log_tagged_fmt("mcp_burp", "ws_send_binary ok conn_id=%llu bytes=%zu", static_cast<unsigned long long>(id), bin.size());
     return tool_result_t::ok("sent");
@@ -436,8 +509,9 @@ tool_result_t tool_ws_send_raw(const json& params)
     auto bin = base64_decode(b64);
     if (!ws_editor::send_raw_frame(id, static_cast<uint8_t>(opcode), fin, masked, bin))
     {
-        diag::log_tagged_fmt("mcp_burp", "ws_send_raw failed err=%s", ws_editor::last_error().c_str());
-        return tool_result_t::error(ws_editor::last_error());
+        std::string err = ws_editor::last_error();
+        diag::log_tagged_fmt("mcp_burp", "ws_send_raw failed err=%s", err.c_str());
+        return tool_result_t::error(err);
     }
     diag::log_tagged_fmt("mcp_burp", "ws_send_raw ok conn_id=%llu bytes=%zu", static_cast<unsigned long long>(id), bin.size());
     return tool_result_t::ok("sent");
@@ -473,6 +547,13 @@ tool_result_t tool_ws_frames(const json& params)
     size_t start = params.value("start", 0u);
     size_t maxv  = params.value("max", 256u);
     diag::log_tagged_fmt("mcp_burp", "ws_frames conn_id=%llu start=%zu max=%zu", static_cast<unsigned long long>(id), start, maxv);
+    ws_editor::ws_status_t st;
+    if (!ws_editor::get_status(id, st))
+    {
+        std::string err = "ws_editor.frames: not found";
+        diag::log_tagged_fmt("mcp_burp", "ws_frames failed conn_id=%llu err=%s", static_cast<unsigned long long>(id), err.c_str());
+        return tool_result_t::error(err);
+    }
     auto rows = ws_editor::frames(id, start, maxv);
     json arr = json::array();
     for (const auto& f : rows) {
@@ -495,6 +576,13 @@ tool_result_t tool_ws_clear(const json& params)
 {
     uint64_t id = params.value("conn_id", 0ull);
     diag::log_tagged_fmt("mcp_burp", "ws_clear conn_id=%llu", static_cast<unsigned long long>(id));
+    ws_editor::ws_status_t st;
+    if (!ws_editor::get_status(id, st))
+    {
+        std::string err = "ws_editor.clear_frames: not found";
+        diag::log_tagged_fmt("mcp_burp", "ws_clear failed conn_id=%llu err=%s", static_cast<unsigned long long>(id), err.c_str());
+        return tool_result_t::error(err);
+    }
     ws_editor::clear_frames(id);
     diag::log_tagged_fmt("mcp_burp", "ws_clear ok conn_id=%llu", static_cast<unsigned long long>(id));
     return tool_result_t::ok("cleared");

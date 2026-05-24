@@ -45,13 +45,6 @@ json bridge_status_to_json(const aida::burp::camoufox::bridge_status_t& s)
     return j;
 }
 
-bool auto_setup_pending(const aida::burp::camoufox::bridge_status_t& s)
-{
-    return s.state == aida::burp::camoufox::bridge_state_t::starting &&
-           (s.last_error.find("Camoufox setup") != std::string::npos ||
-            s.last_error.find("camoufox setup") != std::string::npos);
-}
-
 json install_status_to_json(const aida::burp::camoufox::install::status_t& s)
 {
     json j;
@@ -61,6 +54,34 @@ json install_status_to_json(const aida::burp::camoufox::install::status_t& s)
     j["browser_path"]    = s.browser_path;
     j["last_message"]    = s.last_message;
     return j;
+}
+
+std::string compact_text(std::string s, size_t limit = 900)
+{
+    size_t a = 0;
+    while (a < s.size() && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n')) ++a;
+    size_t b = s.size();
+    while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n')) --b;
+    s = s.substr(a, b - a);
+    for (char& c : s) {
+        if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+    }
+    if (s.size() > limit) {
+        s.resize(limit);
+        s += "...";
+    }
+    return s;
+}
+
+std::string install_error_message(const char* action, const aida::burp::camoufox::install::status_t& s, const std::string& log)
+{
+    std::string msg = aida::burp::camoufox::install::last_error();
+    if (msg.empty()) msg = s.last_message;
+    if (msg.empty()) msg = action ? std::string(action) + " failed" : std::string("camoufox setup failed");
+    const std::string detail = compact_text(log);
+    if (!detail.empty() && msg.find(detail) == std::string::npos)
+        msg += ": " + detail;
+    return msg;
 }
 
 tool_result_t tool_status(const json& params)
@@ -108,16 +129,6 @@ tool_result_t tool_quick_navigate(const json& params)
 
     if (!aida::burp::camoufox::ensure_ready()) {
         std::string msg = aida::burp::camoufox::last_error();
-        auto bs = aida::burp::camoufox::get_status();
-        if (auto_setup_pending(bs)) {
-            json out;
-            out["setup_started"] = true;
-            out["pending_url"] = url;
-            out["bridge"] = bridge_status_to_json(bs);
-            out["message"] = msg.empty() ? bs.last_error : msg;
-            diag::log_tagged_fmt("mcp_burp", "headless_view_quick_navigate setup_started url=%s", url.c_str());
-            return tool_result_t::ok(out);
-        }
         diag::log_tagged_fmt("mcp_burp", "headless_view_quick_navigate bridge_not_ready err=%s", msg.c_str());
         return tool_result_t::error(msg.empty() ? std::string("bridge_not_ready") : msg);
     }
@@ -155,7 +166,7 @@ tool_result_t tool_quick_navigate(const json& params)
 
 tool_result_t tool_install(const json& params)
 {
-    std::string action = "probe";
+    std::string action = "ensure";
     if (params.is_object() && params.contains("action") && params["action"].is_string()) {
         action = params["action"].get<std::string>();
     }
@@ -168,38 +179,52 @@ tool_result_t tool_install(const json& params)
         diag::log_tagged_fmt("mcp_burp", "headless_view_install probe ok ready=%d", (int)(s.state == aida::burp::camoufox::install::install_state_t::ok));
         return tool_result_t::ok(install_status_to_json(s));
     }
-    if (action == "install_module" || action == "pip_install" || action == "install") {
+    if (action == "ensure" || action == "setup" || action == "install") {
+        std::string log;
         bool ok = false;
-        try { ok = aida::burp::camoufox::install::pip_install_async(); } catch (...) { ok = false; }
-        if (!ok) {
-            aida::burp::camoufox::install::status_t s;
-            try { s = aida::burp::camoufox::install::probe(); } catch (...) {}
-            std::string msg = s.last_message;
-            if (msg.empty()) msg = "pip_install_async returned false";
+        try { ok = aida::burp::camoufox::install::ensure_ready(log); } catch (...) { ok = false; }
+        aida::burp::camoufox::install::status_t s;
+        try { s = aida::burp::camoufox::install::get_status(); } catch (...) {}
+        if (!ok || s.state != aida::burp::camoufox::install::install_state_t::ok) {
+            std::string msg = install_error_message("camoufox setup", s, log);
+            diag::log_tagged_fmt("mcp_burp", "headless_view_install ensure failed err=%s", msg.c_str());
+            return tool_result_t::error(msg);
+        }
+        json out = install_status_to_json(s);
+        out["action"] = "ensure";
+        diag::log_tagged_fmt("mcp_burp", "headless_view_install ensure ok");
+        return tool_result_t::ok(out);
+    }
+    if (action == "install_module" || action == "pip_install") {
+        std::string log;
+        bool ok = false;
+        try { ok = aida::burp::camoufox::install::pip_install_module(log); } catch (...) { ok = false; }
+        aida::burp::camoufox::install::status_t s;
+        try { s = aida::burp::camoufox::install::probe(); } catch (...) {}
+        if (!ok || s.state == aida::burp::camoufox::install::install_state_t::missing_module) {
+            std::string msg = install_error_message("camoufox module install", s, log);
             diag::log_tagged_fmt("mcp_burp", "headless_view_install install_module failed err=%s", msg.c_str());
             return tool_result_t::error(msg);
         }
-        diag::log_tagged_fmt("mcp_burp", "headless_view_install install_module dispatched");
-        json out;
-        out["dispatched"] = true;
+        json out = install_status_to_json(s);
         out["action"] = "install_module";
+        diag::log_tagged_fmt("mcp_burp", "headless_view_install install_module ok");
         return tool_result_t::ok(out);
     }
     if (action == "fetch_browser" || action == "download_browser") {
+        std::string log;
         bool ok = false;
-        try { ok = aida::burp::camoufox::install::fetch_browser_async(); } catch (...) { ok = false; }
-        if (!ok) {
-            aida::burp::camoufox::install::status_t s;
-            try { s = aida::burp::camoufox::install::probe(); } catch (...) {}
-            std::string msg = s.last_message;
-            if (msg.empty()) msg = "fetch_browser_async returned false";
+        try { ok = aida::burp::camoufox::install::fetch_browser(log); } catch (...) { ok = false; }
+        aida::burp::camoufox::install::status_t s;
+        try { s = aida::burp::camoufox::install::probe(); } catch (...) {}
+        if (!ok || s.state == aida::burp::camoufox::install::install_state_t::missing_browser) {
+            std::string msg = install_error_message("camoufox browser fetch", s, log);
             diag::log_tagged_fmt("mcp_burp", "headless_view_install fetch_browser failed err=%s", msg.c_str());
             return tool_result_t::error(msg);
         }
-        diag::log_tagged_fmt("mcp_burp", "headless_view_install fetch_browser dispatched");
-        json out;
-        out["dispatched"] = true;
+        json out = install_status_to_json(s);
         out["action"] = "fetch_browser";
+        diag::log_tagged_fmt("mcp_burp", "headless_view_install fetch_browser ok");
         return tool_result_t::ok(out);
     }
     diag::log_tagged_fmt("mcp_burp", "headless_view_install unsupported_action action=%s", action.c_str());
@@ -242,12 +267,12 @@ void register_headless_view_tools(mcp_standalone::server_t& srv)
         tool_def_t t;
         t.name = "burp_headless_view_install";
         t.description = "Trigger an install/setup action for the Camoufox headless dependency chain. "
-                        "Action 'probe' re-evaluates python/module/browser presence (default). "
-                        "Action 'install_module' dispatches pip install. "
-                        "Action 'fetch_browser' downloads the embedded Firefox build. "
-                        "Install runs asynchronously; poll burp_headless_view_status to observe progress.";
+                        "Action 'ensure' installs missing module/runtime/browser dependencies and returns ready only when setup is complete. "
+                        "Action 'probe' only re-evaluates python/module/browser presence. "
+                        "Action 'install_module' runs pip install. "
+                        "Action 'fetch_browser' downloads the embedded Firefox build.";
         t.params = {
-            {"action", "string", "One of: probe, install_module, fetch_browser.", false},
+            {"action", "string", "One of: ensure, probe, install_module, fetch_browser. Default ensure.", false},
         };
         t.read_only = false;
         t.handler = tool_install;

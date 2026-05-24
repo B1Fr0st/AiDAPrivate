@@ -134,6 +134,7 @@ namespace ioctl_codes {
     __forceinline DWORD USBX() { return make(56); }
     __forceinline DWORD NLOG() { return make(57); }
     __forceinline DWORD NPKT() { return make(58); }
+    __forceinline DWORD SSDT() { return make(59); }
 
     __forceinline DWORD HWID() {
         return static_cast<DWORD>(CTL_CODE(FILE_DEVICE_UNKNOWN, 0xA1D0, METHOD_BUFFERED, FILE_READ_DATA));
@@ -408,6 +409,17 @@ namespace voyager {
             std::uint64_t physical_address;
         };
         static_assert(sizeof(virt_to_phys_request) == 24, "virt_to_phys_request size mismatch");
+
+        struct ssdt_query_request {
+            std::uint64_t lstar;
+            std::uint64_t descriptor_address;
+            std::uint64_t service_table;
+            std::uint64_t counter_table;
+            std::uint64_t argument_table;
+            std::uint32_t service_limit;
+            std::uint32_t flags;
+        };
+        static_assert(sizeof(ssdt_query_request) == 48, "ssdt_query_request size mismatch");
 
 
 #pragma pack(push, 8)
@@ -1381,6 +1393,16 @@ namespace voyager {
             std::uint64_t process_heaps;
         };
 
+        struct ssdt_info {
+            std::uint64_t lstar;
+            std::uint64_t descriptor_address;
+            std::uint64_t service_table;
+            std::uint64_t counter_table;
+            std::uint64_t argument_table;
+            std::uint32_t service_limit;
+            std::uint32_t flags;
+        };
+
         bool get_thread_context(std::uint32_t tid, thread_context& ctx) noexcept;
         bool set_thread_context(std::uint32_t tid, const thread_context& ctx, std::uint64_t register_mask) noexcept;
         std::vector<thread_info> enumerate_threads() noexcept;
@@ -1393,6 +1415,7 @@ namespace voyager {
         bool spoof_debug_flags(std::uint32_t* result_flags = nullptr) noexcept;
         std::uint64_t resolve_export(std::uint64_t module_base, const char* export_name) noexcept;
         std::uint64_t virtual_to_physical(std::uint64_t virtual_address) noexcept;
+        bool query_ssdt(ssdt_info& info) noexcept;
         bool set_hardware_breakpoint(std::uint32_t tid, int index, std::uint64_t address, int type = 0, int size = 0) noexcept;
         bool clear_hardware_breakpoint(std::uint32_t tid, int index) noexcept;
 

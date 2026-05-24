@@ -763,6 +763,19 @@ inline constexpr aida::ui::hub_strip::tab_t s_tabs[] = {
 	{ "Dissector",  "live struct dissector", "Dis" },
 };
 
+inline sub_tab_t active_sub_tab()
+{
+	return static_cast<sub_tab_t>(g_state.strip.active);
+}
+
+inline const char* sub_tab_label(sub_tab_t tab)
+{
+	int idx = static_cast<int>(tab);
+	if (idx < 0 || idx >= static_cast<int>(sub_tab_t::COUNT))
+		return "";
+	return s_tabs[idx].label;
+}
+
 inline void flash(const std::string& msg, ImU32 col)
 {
 	g_state.flash_message = msg;

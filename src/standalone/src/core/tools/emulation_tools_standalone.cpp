@@ -237,9 +237,18 @@ tool_result_t driver_snapshot_and_emulate(const json& params)
     if (tid == 0)
     {
         auto threads = driver_bridge::enumerate_threads();
+        diag::log_tagged_fmt("emul_tools", "driver_snapshot_and_emulate thread_enum count=%zu", threads.size());
+        for (size_t i = 0; i < threads.size() && i < 8; ++i) {
+            diag::log_tagged_fmt("emul_tools", "driver_snapshot_and_emulate thread[%zu] tid=%u", i, threads[i].tid);
+        }
         if (threads.empty())
             return tool_result_t::error(OBFSTR("No threads found in target process"));
         tid = threads[0].tid;
+        diag::log_tagged_fmt("emul_tools", "driver_snapshot_and_emulate selected_tid=%u", tid);
+    }
+    else
+    {
+        diag::log_tagged_fmt("emul_tools", "driver_snapshot_and_emulate requested_tid=%u", tid);
     }
 
     auto addr = sa_parse_address(params.value("address", std::string()));
@@ -283,12 +292,25 @@ tool_result_t driver_snapshot_and_emulate(const json& params)
     if (params.contains("snapshot_size"))
         snap_size = params.value("snapshot_size", 0);
 
-    diag::log_tagged_fmt("emul_tools", "driver_snapshot_and_emulate running pid=%u tid=%u addr=0x%llx max_insns=%u",
-        pid, tid, static_cast<unsigned long long>(config.start_address), config.max_instructions);
+    diag::log_tagged_fmt("emul_tools",
+        "driver_snapshot_and_emulate running pid=%u tid=%u addr=0x%llx max_insns=%u trace=%u snap_base=0x%llX snap_size=0x%llX timeout_us=%llu",
+        pid, tid, static_cast<unsigned long long>(config.start_address), config.max_instructions,
+        config.max_trace_entries,
+        static_cast<unsigned long long>(snap_base),
+        static_cast<unsigned long long>(snap_size),
+        static_cast<unsigned long long>(config.timeout_us));
     auto result = emulation::driver_snapshot_and_emulate(pid, tid, config, snap_base, snap_size);
     if (!result.success)
     {
-        diag::log_tagged_fmt("emul_tools", "driver_snapshot_and_emulate failed err='%s'", result.error.c_str());
+        diag::log_tagged_fmt("emul_tools",
+            "driver_snapshot_and_emulate failed pid=%u tid=%u addr=0x%llX err='%s' total=%u trace=%zu end=0x%llX",
+            pid,
+            tid,
+            static_cast<unsigned long long>(config.start_address),
+            result.error.c_str(),
+            result.total_instructions,
+            result.trace.size(),
+            static_cast<unsigned long long>(result.end_address));
         return tool_result_t::error(OBFSTR("Emulation failed: ") + result.error);
     }
 
@@ -1026,12 +1048,45 @@ tool_result_t emulate_function(const json& params)
         out["error"] = result.error;
     }
 
+    if (!result.success)
+    {
+        diag::log_tagged_fmt("emul_tools",
+            "emulate_function failed addr=0x%llX err='%s' total=%u trace=%zu end=0x%llX regions=%zu",
+            static_cast<unsigned long long>(*addr),
+            result.error.c_str(),
+            result.total_instructions,
+            result.trace.size(),
+            static_cast<unsigned long long>(result.end_address),
+            snapshot.regions.size());
+        return tool_result_t::error(OBFSTR("Function emulation failed: ") + result.error);
+    }
+
+    if (!returned_normally) {
+        std::string last_trace;
+        if (!result.trace.empty()) {
+            const auto& tail = result.trace.back();
+            last_trace = sa_format_address(static_cast<uint64_t>(tail.address)) + " " + tail.disasm;
+        }
+        diag::log_tagged_fmt("emul_tools",
+            "emulate_function did_not_return addr=0x%llX end=0x%llX sentinel=0x%llX total=%u trace=%zu last='%s' regions=%zu",
+            static_cast<unsigned long long>(*addr),
+            static_cast<unsigned long long>(result.end_address),
+            static_cast<unsigned long long>(SENTINEL_RET),
+            result.total_instructions,
+            result.trace.size(),
+            last_trace.c_str(),
+            snapshot.regions.size());
+        return tool_result_t::error(OBFSTR("Function emulation ") + sa_format_address(*addr) +
+                                    OBFSTR(" did not return") +
+                                    (kernel_mode ? OBFSTR(" [kernel]") : OBFSTR(" [user]")));
+    }
+
     diag::log_tagged_fmt("emul_tools", "emulate_function ok returned=%d total=%u junk=%u",
         (int)returned_normally, result.success ? result.total_instructions : 0u,
         result.success ? result.junk_instruction_count : 0u);
     return tool_result_t::ok(
         OBFSTR("Function emulation ") + sa_format_address(*addr) +
-        (returned_normally ? OBFSTR(": returned normally") : OBFSTR(": did not return")) +
+        OBFSTR(": returned normally") +
         (kernel_mode ? OBFSTR(" [kernel]") : OBFSTR(" [user]")), out);
 }
 

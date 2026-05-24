@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,40 @@ namespace {
 
 using json = nlohmann::json;
 using tool_result_t = mcp_standalone::tool_result_t;
+
+const char* json_type_name(const json& j)
+{
+    if (j.is_object()) return "object";
+    if (j.is_array()) return "array";
+    if (j.is_string()) return "string";
+    if (j.is_boolean()) return "boolean";
+    if (j.is_number()) return "number";
+    if (j.is_null()) return "null";
+    return "other";
+}
+
+std::string json_shape(const json& j, size_t max_keys = 12)
+{
+    std::ostringstream oss;
+    oss << json_type_name(j);
+    if (j.is_object())
+    {
+        oss << "{";
+        size_t n = 0;
+        for (auto it = j.begin(); it != j.end() && n < max_keys; ++it, ++n)
+        {
+            if (n) oss << ",";
+            oss << it.key() << ":" << json_type_name(it.value());
+        }
+        if (j.size() > max_keys) oss << ",...";
+        oss << "}";
+    }
+    else if (j.is_array())
+    {
+        oss << "[" << j.size() << "]";
+    }
+    return oss.str();
+}
 
 std::vector<uint8_t> b64_decode(const std::string& s)
 {
@@ -340,23 +375,53 @@ static tool_result_t burp_param_miner_stop(const json& params)
 
 static tool_result_t burp_h2_send(const json& params)
 {
-    diag::log_tagged_fmt("mcp_burp", "h2_send host=%s port=%d",
+    diag::log_tagged_fmt("mcp_burp", "h2_send entry params_shape=%s host=%s port=%d",
+        json_shape(params).c_str(),
         params.contains("host") && params["host"].is_string() ? params["host"].get<std::string>().c_str() : "<missing>",
         params.value("port", 443));
     h2_editor::request_t req;
-    if (!params.contains("host") || !params["host"].is_string()) return tool_result_t::error("host required");
+    if (!params.contains("host") || !params["host"].is_string()) {
+        diag::log_tagged_fmt("mcp_burp", "h2_send missing_host");
+        return tool_result_t::error("host required");
+    }
     req.host = params["host"].get<std::string>();
     req.port = static_cast<uint16_t>(params.value("port", 443));
     req.timeout_ms = params.value("timeout_ms", 15000);
+    if (params.value("offline_validate", false)) {
+        diag::log_tagged_fmt("mcp_burp", "h2_send offline_validate host=%s port=%u timeout_ms=%d",
+            req.host.c_str(), static_cast<unsigned>(req.port), req.timeout_ms);
+        h2_editor::frame_t settings;
+        settings.type = 4;
+        settings.flags = 0;
+        settings.stream_id = 0;
+        std::vector<uint8_t> wire = h2_editor::encode_frame(settings);
+        std::vector<h2_editor::frame_t> frames;
+        bool decoded = h2_editor::decode_frames(wire, frames);
+        json out;
+        out["ok"] = decoded && frames.size() == 1 && frames[0].type == 4 && frames[0].stream_id == 0;
+        out["offline_validate"] = true;
+        out["frames"] = frames.size();
+        out["raw_wire_out_b64"] = b64_encode(wire);
+        out["body_size"] = 0;
+        out["latency_ms"] = 0;
+        diag::log_tagged_fmt("mcp_burp", "h2_send offline_validate result ok=%d frames=%zu wire_len=%zu",
+            (int)out["ok"].get<bool>(), frames.size(), wire.size());
+        return tool_result_t::ok(out);
+    }
 
     if (params.contains("raw_frames_b64") && params["raw_frames_b64"].is_string()) {
-        auto bytes = b64_decode(params["raw_frames_b64"].get<std::string>());
+        const std::string& raw_b64 = params["raw_frames_b64"].get_ref<const std::string&>();
+        auto bytes = b64_decode(raw_b64);
         std::vector<h2_editor::frame_t> frames;
         if (!h2_editor::decode_frames(bytes, frames)) {
+            diag::log_tagged_fmt("mcp_burp", "h2_send raw_frames_decode_failed b64_len=%zu bytes=%zu",
+                raw_b64.size(), bytes.size());
             return tool_result_t::error("raw_frames_b64 decode failed");
         }
         req.use_raw_frames = true;
         req.raw_frames = std::move(frames);
+        diag::log_tagged_fmt("mcp_burp", "h2_send raw_frames mode frames=%zu b64_len=%zu bytes=%zu",
+            req.raw_frames.size(), raw_b64.size(), bytes.size());
     } else {
         if (params.contains("pseudo_headers") && params["pseudo_headers"].is_object()) {
             const auto& ph = params["pseudo_headers"];
@@ -373,15 +438,22 @@ static tool_result_t burp_h2_send(const json& params)
             }
         }
         if (params.contains("body_b64") && params["body_b64"].is_string()) {
-            req.body = b64_decode(params["body_b64"].get<std::string>());
+            const std::string& body_b64 = params["body_b64"].get_ref<const std::string&>();
+            req.body = b64_decode(body_b64);
+            diag::log_tagged_fmt("mcp_burp", "h2_send body_from_b64 b64_len=%zu body_len=%zu", body_b64.size(), req.body.size());
         } else if (params.contains("body") && params["body"].is_string()) {
             const std::string& s = params["body"].get_ref<const std::string&>();
             req.body.assign(s.begin(), s.end());
+            diag::log_tagged_fmt("mcp_burp", "h2_send body_from_text body_len=%zu", req.body.size());
         }
         if (params.contains("flags") && params["flags"].is_number_unsigned()) {
             req.flags = params["flags"].get<uint32_t>();
         }
     }
+    diag::log_tagged_fmt("mcp_burp", "h2_send dispatch host=%s port=%u method=%s path_len=%zu has_query=%d headers=%zu body_len=%zu use_raw=%d raw_frames=%zu timeout_ms=%d",
+        req.host.c_str(), static_cast<unsigned>(req.port), req.pseudo.method.c_str(),
+        req.pseudo.path.size(), (int)(req.pseudo.path.find('?') != std::string::npos),
+        req.headers.size(), req.body.size(), (int)req.use_raw_frames, req.raw_frames.size(), req.timeout_ms);
 
     h2_editor::response_t r = h2_editor::send(req);
     json out;
@@ -401,7 +473,9 @@ static tool_result_t burp_h2_send(const json& params)
     out["body_size"] = r.body.size();
     out["raw_wire_in_b64"]  = b64_encode(r.raw_wire_in);
     out["raw_wire_out_b64"] = b64_encode(r.raw_wire_out);
-    diag::log_tagged_fmt("mcp_burp", "h2_send ok status=%d latency=%dms ok=%d", r.status_code, r.latency_ms, (int)r.ok);
+    diag::log_tagged_fmt("mcp_burp", "h2_send result ok=%d status=%d latency=%llums err_len=%zu headers=%zu body_len=%zu wire_in=%zu wire_out=%zu",
+        (int)r.ok, r.status_code, static_cast<unsigned long long>(r.latency_ms), r.error_msg.size(),
+        r.headers.size(), r.body.size(), r.raw_wire_in.size(), r.raw_wire_out.size());
     return tool_result_t::ok(out);
 }
 
@@ -517,7 +591,8 @@ void register_intruder_tools(mcp_standalone::server_t& srv)
             { "body", "string", "Body text", false },
             { "body_b64", "string", "Body, base64 encoded (preferred for binary)", false },
             { "flags", "number", "Bitfield: 1=END_STREAM 2=END_HEADERS 4=PADDED 8=PRIORITY", false },
-            { "raw_frames_b64", "string", "Pre-encoded HTTP/2 frames as base64 (raw mode bypasses HEADERS/DATA construction)", false }
+            { "raw_frames_b64", "string", "Pre-encoded HTTP/2 frames as base64 (raw mode bypasses HEADERS/DATA construction)", false },
+            { "offline_validate", "boolean", "Validate HTTP/2 frame encode/decode without opening a socket", false }
         },
         burp_h2_send, false });
 

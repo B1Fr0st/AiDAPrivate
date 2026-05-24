@@ -272,6 +272,17 @@ typedef struct _V2P {
 } virt_to_phys, * p_virt_to_phys;
 static_assert(sizeof(virt_to_phys) == 24, "virt_to_phys size must be 24 bytes");
 
+typedef struct _SSDTQ {
+    UINT64 lstar;
+    UINT64 descriptor_address;
+    UINT64 service_table;
+    UINT64 counter_table;
+    UINT64 argument_table;
+    UINT32 service_limit;
+    UINT32 flags;
+} ssdt_query, * p_ssdt_query;
+static_assert(sizeof(ssdt_query) == 48, "ssdt_query size must be 48 bytes");
+
 
 typedef struct _NET_CONN_ENTRY {
     UINT32 pid;

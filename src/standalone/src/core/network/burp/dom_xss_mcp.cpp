@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,55 @@ uint64_t now_ms_wall()
 {
     using namespace std::chrono;
     return static_cast<uint64_t>(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
+}
+
+const char* json_type_name(const json& j)
+{
+    if (j.is_object()) return "object";
+    if (j.is_array()) return "array";
+    if (j.is_string()) return "string";
+    if (j.is_boolean()) return "boolean";
+    if (j.is_number()) return "number";
+    if (j.is_null()) return "null";
+    return "other";
+}
+
+std::string json_shape(const json& j, size_t max_keys = 12)
+{
+    std::ostringstream oss;
+    oss << json_type_name(j);
+    if (j.is_object())
+    {
+        oss << "{";
+        size_t n = 0;
+        for (auto it = j.begin(); it != j.end() && n < max_keys; ++it, ++n)
+        {
+            if (n) oss << ",";
+            oss << it.key() << ":" << json_type_name(it.value());
+        }
+        if (j.size() > max_keys) oss << ",...";
+        oss << "}";
+    }
+    else if (j.is_array())
+    {
+        oss << "[" << j.size() << "]";
+    }
+    return oss.str();
+}
+
+std::string path_without_query(std::string path)
+{
+    size_t q = path.find('?');
+    if (q != std::string::npos) path.resize(q);
+    size_t f = path.find('#');
+    if (f != std::string::npos) path.resize(f);
+    if (path.empty()) path = "/";
+    if (path.size() > 240)
+    {
+        path.resize(240);
+        path += "...";
+    }
+    return path;
 }
 
 std::vector<uint8_t> base64_decode(const std::string& s)
@@ -126,7 +176,7 @@ tool_result_t tool_status(const json& params)
 
 tool_result_t tool_test_payload(const json& params)
 {
-    diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload entry");
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload entry params_shape=%s", json_shape(params).c_str());
     if (!params.is_object())
     {
         diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload invalid_params");
@@ -145,7 +195,8 @@ tool_result_t tool_test_payload(const json& params)
 
     const std::string target_url = params["target_url"].get<std::string>();
     const std::string payload_tpl = params["payload"].get<std::string>();
-    diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload url=%s payload_len=%zu", target_url.c_str(), payload_tpl.size());
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload request url_len=%zu payload_len=%zu has_capture=%d has_timeout=%d",
+        target_url.size(), payload_tpl.size(), (int)params.contains("capture_screenshot"), (int)params.contains("timeout_ms"));
     bool capture = false;
     if (params.contains("capture_screenshot") && params["capture_screenshot"].is_boolean())
         capture = params["capture_screenshot"].get<bool>();
@@ -156,14 +207,28 @@ tool_result_t tool_test_payload(const json& params)
     if (per_timeout > 30000) per_timeout = 30000;
 
     if (!camoufox::is_ready())
+    {
+        auto st = camoufox::get_status();
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload bridge_not_ready state=%d errors=%llu last_error_len=%zu",
+            static_cast<int>(st.state), static_cast<unsigned long long>(st.total_errors), st.last_error.size());
         return tool_result_t::error("camoufox bridge not ready");
+    }
     if (!scope::in_scope(target_url))
+    {
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload out_of_scope url_len=%zu", target_url.size());
         return tool_result_t::error("target out of scope");
+    }
 
     std::string scheme, host, path;
     uint16_t port = 0;
     if (!audit_http::parse_url(target_url, scheme, host, port, path))
+    {
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload invalid_url url_len=%zu", target_url.size());
         return tool_result_t::error("invalid target_url");
+    }
+    const std::string safe_path = path_without_query(path);
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload parsed scheme=%s host=%s port=%u path=%s query=%d timeout_ms=%d capture=%d",
+        scheme.c_str(), host.c_str(), static_cast<unsigned>(port), safe_path.c_str(), (int)(path.find('?') != std::string::npos), per_timeout, (int)capture);
 
     auto raw = synthesize_get_request(path, host);
     auto points = insertion_points::analyze(raw, target_url);
@@ -177,12 +242,18 @@ tool_result_t tool_test_payload(const json& params)
         }
     }
     if (!chosen)
+    {
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload no_insertion_point host=%s path=%s points=%zu",
+            host.c_str(), safe_path.c_str(), points.size());
         return tool_result_t::error("no query or path insertion point available for the target");
+    }
 
     auto s = dom_xss::make_sentinel();
     auto r = dom_xss::fire_payload(*chosen, payload_tpl, s, capture, per_timeout, scheme, port);
     total_payloads_slot().fetch_add(1);
-    diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload ok canary_fired=%d url=%s", (int)r.canary_fired, target_url.c_str());
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload result ok=%d canary_fired=%d host=%s path=%s chosen_kind=%s chosen_name=%s error_len=%zu sink_entries=%zu screenshot_len=%zu",
+        (int)r.ok, (int)r.canary_fired, host.c_str(), safe_path.c_str(), chosen->kind.c_str(), chosen->name.c_str(),
+        r.error.size(), r.sink_log.size(), r.last_screenshot_path.size());
 
     json data;
     data["ok"] = r.ok;
@@ -197,7 +268,7 @@ tool_result_t tool_test_payload(const json& params)
 
 tool_result_t tool_scan(const json& params)
 {
-    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan entry");
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan entry params_shape=%s", json_shape(params).c_str());
     if (!params.is_object()) {
         diag::log_tagged_fmt("mcp_burp", "dom_xss_scan invalid_params");
         return tool_result_t::error("expected object params");
@@ -208,32 +279,48 @@ tool_result_t tool_scan(const json& params)
     }
 
     const std::string target_url = params["target_url"].get<std::string>();
-    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan url=%s", target_url.c_str());
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan request url_len=%zu has_raw=%d has_raw_b64=%d",
+        target_url.size(), (int)params.contains("raw_request"), (int)params.contains("raw_request_b64"));
     if (!camoufox::is_ready()) {
-        diag::log_tagged_fmt("mcp_burp", "dom_xss_scan bridge_not_ready");
+        auto st = camoufox::get_status();
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_scan bridge_not_ready state=%d errors=%llu last_error_len=%zu",
+            static_cast<int>(st.state), static_cast<unsigned long long>(st.total_errors), st.last_error.size());
         return tool_result_t::error("camoufox bridge not ready");
     }
     if (!scope::in_scope(target_url)) {
-        diag::log_tagged_fmt("mcp_burp", "dom_xss_scan out_of_scope url=%s", target_url.c_str());
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_scan out_of_scope url_len=%zu", target_url.size());
         return tool_result_t::error("target out of scope");
     }
 
     std::string scheme, host, path;
     uint16_t port = 0;
     if (!audit_http::parse_url(target_url, scheme, host, port, path))
+    {
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_scan invalid_url url_len=%zu", target_url.size());
         return tool_result_t::error("invalid target_url");
+    }
+    const std::string safe_path = path_without_query(path);
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan parsed scheme=%s host=%s port=%u path=%s query=%d",
+        scheme.c_str(), host.c_str(), static_cast<unsigned>(port), safe_path.c_str(), (int)(path.find('?') != std::string::npos));
 
     std::vector<uint8_t> raw_request;
     if (params.contains("raw_request_b64") && params["raw_request_b64"].is_string()) {
-        raw_request = base64_decode(params["raw_request_b64"].get<std::string>());
-        if (raw_request.empty()) return tool_result_t::error("raw_request_b64 invalid base64");
+        const std::string& raw_b64 = params["raw_request_b64"].get_ref<const std::string&>();
+        raw_request = base64_decode(raw_b64);
+        if (raw_request.empty()) {
+            diag::log_tagged_fmt("mcp_burp", "dom_xss_scan raw_b64_decode_failed b64_len=%zu", raw_b64.size());
+            return tool_result_t::error("raw_request_b64 invalid base64");
+        }
         ensure_double_crlf_terminated(raw_request);
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_scan raw_request_from_b64 b64_len=%zu raw_len=%zu", raw_b64.size(), raw_request.size());
     } else if (params.contains("raw_request") && params["raw_request"].is_string()) {
         const auto& s = params["raw_request"].get_ref<const std::string&>();
         raw_request.assign(s.begin(), s.end());
         ensure_double_crlf_terminated(raw_request);
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_scan raw_request_from_text raw_len=%zu", raw_request.size());
     } else {
         raw_request = synthesize_get_request(path, host);
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_scan synthesized_get raw_len=%zu", raw_request.size());
     }
 
     dom_xss::scan_options_t opts;
@@ -260,8 +347,12 @@ tool_result_t tool_scan(const json& params)
     opts.scheme = scheme;
     opts.host   = host;
     opts.port   = port;
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan options polyglot=%d standard=%d dom_only=%d screenshots=%d per_timeout_ms=%d max_payloads=%zu raw_len=%zu",
+        (int)opts.include_polyglot, (int)opts.include_standard, (int)opts.include_dom_only,
+        (int)opts.capture_screenshots, opts.per_payload_timeout_ms, opts.max_payloads_per_point, raw_request.size());
 
     auto points = insertion_points::analyze(raw_request, target_url);
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan insertion_points total=%zu host=%s path=%s", points.size(), host.c_str(), safe_path.c_str());
     size_t total_emitted = 0;
     json per_point = json::array();
     for (const auto& ip : points) {
@@ -287,7 +378,9 @@ tool_result_t tool_scan(const json& params)
     data["per_point"]     = per_point;
     data["issues_emitted"] = total_emitted;
     data["last_engine_error"] = dom_xss::last_error();
-    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan ok url=%s points_scanned=%zu issues_emitted=%zu", target_url.c_str(), per_point.size(), total_emitted);
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan ok host=%s path=%s points_total=%zu points_scanned=%zu issues_emitted=%zu engine_error_len=%zu response_shape=%s",
+        host.c_str(), safe_path.c_str(), points.size(), per_point.size(), total_emitted,
+        dom_xss::last_error().size(), json_shape(data).c_str());
     return tool_result_t::ok(data);
 }
 

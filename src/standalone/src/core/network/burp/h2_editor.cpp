@@ -277,6 +277,23 @@ static int s_on_close_cb(nghttp2_session*, int32_t sid, uint32_t ec, void* ud)
     return 0;
 }
 
+std::string path_without_query(std::string path)
+{
+    size_t q = path.find('?');
+    size_t f = path.find('#');
+    size_t end = path.size();
+    if (q != std::string::npos) end = q;
+    if (f != std::string::npos && f < end) end = f;
+    path.resize(end);
+    if (path.empty()) path = "/";
+    if (path.size() > 240)
+    {
+        path.resize(240);
+        path += "...";
+    }
+    return path;
+}
+
 }
 
 std::vector<uint8_t> encode_frame(const frame_t& f)
@@ -331,10 +348,11 @@ bool decode_frames(const std::vector<uint8_t>& data, std::vector<frame_t>& out)
 
 response_t send(const request_t& req)
 {
-    diag::log_tagged_fmt("h2_edit", "send entry host=%s port=%u method=%s path=%s body=%zu use_raw=%d timeout_ms=%d",
+    const std::string safe_path = path_without_query(req.pseudo.path.empty() ? std::string("/") : req.pseudo.path);
+    diag::log_tagged_fmt("h2_edit", "send entry host=%s port=%u method=%s path=%s query=%d body=%zu use_raw=%d raw_frames=%zu timeout_ms=%d",
         req.host.c_str(), static_cast<unsigned>(req.port),
-        req.pseudo.method.c_str(), req.pseudo.path.c_str(),
-        req.body.size(), static_cast<int>(req.use_raw_frames), req.timeout_ms);
+        req.pseudo.method.c_str(), safe_path.c_str(), (int)(req.pseudo.path.find('?') != std::string::npos),
+        req.body.size(), static_cast<int>(req.use_raw_frames), req.raw_frames.size(), req.timeout_ms);
     response_t r;
     conn_t c;
     diag::log_tagged_fmt("h2_edit", "send tls_connecting host=%s port=%u", req.host.c_str(), static_cast<unsigned>(req.port));
@@ -343,22 +361,22 @@ response_t send(const request_t& req)
         r.error_msg = "tls_connect_failed (ALPN must be h2)";
         return r;
     }
-    diag::log_tagged_fmt("h2_edit", "send tls_ok host=%s sending_preface", req.host.c_str());
-
-    static const uint8_t kPreface[] = {
-        'P','R','I',' ','*',' ','H','T','T','P','/','2','.','0','\r','\n','\r','\n',
-        'S','M','\r','\n','\r','\n'
-    };
-    if (!ssl_send_all(c.ssl, kPreface, sizeof(kPreface), req.timeout_ms)) {
-        diag::log_tagged_fmt("h2_edit", "send preface_send_failed host=%s", req.host.c_str());
-        r.error_msg = "preface_send_failed";
-        close_conn(c);
-        return r;
-    }
-    r.raw_wire_out.insert(r.raw_wire_out.end(), kPreface, kPreface + sizeof(kPreface));
-    diag::log_tagged_fmt("h2_edit", "send preface_ok");
+    diag::log_tagged_fmt("h2_edit", "send tls_ok host=%s", req.host.c_str());
 
     if (req.use_raw_frames) {
+        static const uint8_t kPreface[] = {
+            'P','R','I',' ','*',' ','H','T','T','P','/','2','.','0','\r','\n','\r','\n',
+            'S','M','\r','\n','\r','\n'
+        };
+        diag::log_tagged_fmt("h2_edit", "send raw_frames_sending_preface");
+        if (!ssl_send_all(c.ssl, kPreface, sizeof(kPreface), req.timeout_ms)) {
+            diag::log_tagged_fmt("h2_edit", "send raw_preface_send_failed host=%s", req.host.c_str());
+            r.error_msg = "preface_send_failed";
+            close_conn(c);
+            return r;
+        }
+        r.raw_wire_out.insert(r.raw_wire_out.end(), kPreface, kPreface + sizeof(kPreface));
+        diag::log_tagged_fmt("h2_edit", "send raw_preface_ok");
         diag::log_tagged_fmt("h2_edit", "send raw_frames_mode frames=%zu", req.raw_frames.size());
         for (auto& f : req.raw_frames) {
             std::vector<uint8_t> enc = encode_frame(f);
@@ -456,8 +474,8 @@ response_t send(const request_t& req)
         return static_cast<ssize_t>(take);
     };
 
-    diag::log_tagged_fmt("h2_edit", "send submitting_request headers=%zu body=%zu",
-        nva.size(), req.body.size());
+    diag::log_tagged_fmt("h2_edit", "send submitting_request headers=%zu body=%zu authority_len=%zu path=%s",
+        nva.size(), req.body.size(), authority.size(), safe_path.c_str());
     int32_t sid = nghttp2_submit_request(st.session, nullptr, nva.data(), nva.size(),
                                          req.body.empty() ? nullptr : &prd, nullptr);
     if (sid < 0) {

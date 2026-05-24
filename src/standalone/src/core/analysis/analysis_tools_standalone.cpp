@@ -601,7 +601,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		{
 			{"node_index", "integer", "Index of the integrity node to neutralize (from hunt_integrity_checkers results)", true}
 		},
-		true,
+		false,
 		[](const json& params) -> tool_result_t {
 			int index = params.value("node_index", -1);
 			diag::log_tagged_fmt("analysis", "neutralize_integrity_node entry index=%d", index);
@@ -627,8 +627,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 					result["status"] = "neutralized";
 				}
 			} else {
-				result["status"] = "not_applicable";
-				result["message"] = "No conditional branch was found near the node RIP.";
+				return tool_result_t::error("No conditional branch was found near the node RIP.");
 			}
 			return tool_result_t::ok(result);
 		}
@@ -636,11 +635,12 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 
 	srv.register_tool({
 		"start_live_monitor",
-		"Start continuous live struct monitoring using page guards or hardware breakpoints. Watches memory accesses to a struct region and infers field types from instruction analysis.",
+		"Start continuous live struct monitoring using page guards, polling, or hardware breakpoints. Watches memory accesses to a struct region and infers field types from instruction analysis.",
 		{
 			{"address", "string", "Base address of the struct in hex", true},
 			{"size", "integer", "Size of the struct in bytes (default: 256)", false},
 			{"name", "string", "Name for the struct (default: 'struct_t')", false},
+			{"backend", "string", "Backend preference: auto, page_guard, polling, hardware_breakpoint", false},
 			{"timeout_ms", "integer", "Maximum backend startup wait in milliseconds (default: 3000, max 3500)", false}
 		},
 		true,
@@ -648,9 +648,14 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			std::string addr_str = params.value("address", "");
 			int size = params.value("size", 256);
 			std::string name = params.value("name", "struct_t");
+			std::string backend = params.value("backend", "auto");
 			uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 3000, 100, 3500);
-			diag::log_tagged_fmt("analysis", "start_live_monitor entry addr=%s size=%d name=%s",
-				addr_str.c_str(), size, name.c_str());
+			diag::log_tagged_fmt("analysis",
+				"start_live_monitor entry addr=%s size=%d name=%s backend=%s timeout_ms=%u driver=%d attached_pid=%u active=%d",
+				addr_str.c_str(), size, name.c_str(), backend.c_str(), timeout_ms,
+				driver_bridge::using_kernel_driver() ? 1 : 0,
+				driver_bridge::attached_pid(),
+				struct_monitor::g_state.active.load() ? 1 : 0);
 
 			if (addr_str.empty()) {
 				diag::log_tagged("analysis", "start_live_monitor refused no_address");
@@ -673,16 +678,28 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				return tool_result_t::error("size must be positive");
 			}
 
-			diag::log_tagged_fmt("analysis", "start_live_monitor starting addr=0x%llX size=%d name=%s",
-				static_cast<unsigned long long>(addr), size, name.c_str());
-			struct_monitor::start(addr, size, name);
+			diag::log_tagged_fmt("analysis", "start_live_monitor starting addr=0x%llX size=%d name=%s backend=%s",
+				static_cast<unsigned long long>(addr), size, name.c_str(), backend.c_str());
+			struct_monitor::start(addr, size, name, backend);
 
 			int max_wait = static_cast<int>((timeout_ms + 49) / 50);
 			for (int wait = 0; wait < max_wait; ++wait) {
+				if (wait == 0 || ((wait + 1) % 10) == 0) {
+					diag::log_tagged_fmt("analysis",
+						"start_live_monitor wait tick=%d/%d active=%d page_guard=%d hwbp=%d polling=%d captures=%llu",
+						wait + 1,
+						max_wait,
+						struct_monitor::g_state.active.load() ? 1 : 0,
+						struct_monitor::g_state.session.using_page_guard ? 1 : 0,
+						struct_monitor::g_state.session.using_hwbp ? 1 : 0,
+						struct_monitor::g_state.session.using_polling ? 1 : 0,
+						static_cast<unsigned long long>(struct_monitor::g_state.total_captures.load()));
+				}
 				if (!struct_monitor::g_state.active.load())
 					break;
 				if (struct_monitor::g_state.session.using_page_guard ||
-				    struct_monitor::g_state.session.using_hwbp)
+				    struct_monitor::g_state.session.using_hwbp ||
+				    struct_monitor::g_state.session.using_polling)
 					break;
 				Sleep(50);
 			}
@@ -690,23 +707,27 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			bool active = struct_monitor::g_state.active.load();
 			bool page_guard = struct_monitor::g_state.session.using_page_guard;
 			bool hwbp = struct_monitor::g_state.session.using_hwbp;
-			if (!active || (!page_guard && !hwbp)) {
+			bool polling = struct_monitor::g_state.session.using_polling;
+			json result;
+			char abuf[32];
+			std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(addr));
+			result["address"] = abuf;
+			result["size"] = size;
+			if (!active || (!page_guard && !hwbp && !polling)) {
 				diag::log_tagged_fmt("analysis",
-					"start_live_monitor failed backend active=%d page_guard=%d hwbp=%d",
-					active ? 1 : 0, page_guard ? 1 : 0, hwbp ? 1 : 0);
+					"start_live_monitor failed backend active=%d page_guard=%d hwbp=%d polling=%d captures=%llu driver=%d attached_pid=%u",
+					active ? 1 : 0, page_guard ? 1 : 0, hwbp ? 1 : 0, polling ? 1 : 0,
+					static_cast<unsigned long long>(struct_monitor::g_state.total_captures.load()),
+					driver_bridge::using_kernel_driver() ? 1 : 0,
+					driver_bridge::attached_pid());
 				struct_monitor::stop();
 				for (int wait = 0; wait < 10 && struct_monitor::g_state.active.load(); ++wait)
 					Sleep(50);
 				return tool_result_t::error("live monitor backend did not become active");
 			}
 
-			json result;
-			char abuf[32];
-			std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(addr));
-			result["address"] = abuf;
-			result["size"] = size;
 			result["status"] = "monitoring";
-			result["backend"] = page_guard ? "page_guard" : "hardware_breakpoint";
+			result["backend"] = page_guard ? "page_guard" : (hwbp ? "hardware_breakpoint" : "polling");
 			return tool_result_t::ok(result);
 		}
 	});
@@ -717,7 +738,10 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		{{"require_captures", "boolean", "Return an error if no accesses were captured", false}},
 		true,
 		[](const json& params) -> tool_result_t {
-			diag::log_tagged("analysis", "stop_live_monitor entry");
+			diag::log_tagged_fmt("analysis", "stop_live_monitor entry active=%d captures=%llu require=%d",
+				struct_monitor::g_state.active.load() ? 1 : 0,
+				static_cast<unsigned long long>(struct_monitor::g_state.total_captures.load()),
+				params.value("require_captures", false) ? 1 : 0);
 			if (!struct_monitor::g_state.active.load()) {
 				diag::log_tagged("analysis", "stop_live_monitor refused not_active");
 				return tool_result_t::error("No active live monitor session.");
@@ -758,7 +782,12 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			result["unique_offsets"] = accesses.size();
 			result["accesses"] = arr;
 			if (params.value("require_captures", false) && accesses.empty()) {
-				diag::log_tagged("analysis", "stop_live_monitor failed require_captures no_accesses");
+				diag::log_tagged_fmt("analysis",
+					"stop_live_monitor failed require_captures no_accesses total_captures=%llu page_guard=%d hwbp=%d polling=%d",
+					static_cast<unsigned long long>(struct_monitor::g_state.total_captures.load()),
+					struct_monitor::g_state.session.using_page_guard ? 1 : 0,
+					struct_monitor::g_state.session.using_hwbp ? 1 : 0,
+					struct_monitor::g_state.session.using_polling ? 1 : 0);
 				return tool_result_t::error("live monitor captured no accesses");
 			}
 			return tool_result_t::ok(result);
@@ -1472,6 +1501,16 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				}
 			}
 			diag::log_tagged_fmt("analysis", "analysis_get_type_definition not_found name=%s", want.c_str());
+			if (want == "HANDLE") {
+				json result;
+				result["module"] = "builtin";
+				result["name"] = "HANDLE";
+				result["kind"] = "typedef";
+				result["type"] = "void*";
+				result["size"] = sizeof(void*);
+				result["members"] = json::array();
+				return tool_result_t::ok(result);
+			}
 			return tool_result_t::error("Type not found in any loaded module's PDB.");
 		}
 	});
@@ -1556,7 +1595,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		 {"max_globals",   "number", "Maximum globals to include (default 12)", false},
 		 {"include_imports", "boolean", "Include import summaries (default false for MCP speed)", false},
 		 {"include_exports", "boolean", "Include export summaries (default false for MCP speed)", false},
-		 {"include_xrefs", "boolean", "Include cached xref scoring/callees/globals (default false for MCP speed)", false}},
+		 {"include_xrefs", "boolean", "Include cached xref scoring/callees/globals (default false for MCP speed)", false},
+		 {"fast_summary", "boolean", "Return header and section summary without expensive map scans", false}},
 		true,
 		[](const json& params) -> tool_result_t {
 			diag::log_tagged("analysis", "analysis_get_binary_map_overview entry");
@@ -1577,6 +1617,59 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				opts.include_exports = params["include_exports"].get<bool>();
 			if (params.contains("include_xrefs") && params["include_xrefs"].is_boolean())
 				opts.include_xrefs = params["include_xrefs"].get<bool>();
+			if (params.value("fast_summary", false)) {
+				auto modules = driver_bridge::enumerate_modules();
+				if (modules.empty())
+					return tool_result_t::error("no modules available for binary map summary");
+				std::string process_name = driver_bridge::attached_process_name();
+				std::transform(process_name.begin(), process_name.end(), process_name.begin(),
+					[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+				const driver_bridge::module_info_t* selected = &modules.front();
+				if (!process_name.empty()) {
+					for (const auto& mod : modules) {
+						std::string name = mod.name;
+						std::transform(name.begin(), name.end(), name.begin(),
+							[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+						if (name == process_name) {
+							selected = &mod;
+							break;
+						}
+					}
+				}
+				char buf[32];
+				json sections = json::array();
+				pe_parser::pe_info_t pe;
+				bool parsed = pe_parser::parse(selected->base, pe, false);
+				if (parsed) {
+					for (const auto& s : pe.sections) {
+						json o;
+						o["name"] = s.name;
+						std::snprintf(buf, sizeof(buf), "0x%llX",
+							static_cast<unsigned long long>(selected->base + s.virtual_address));
+						o["va"] = buf;
+						o["size"] = s.virtual_size;
+						o["executable"] = (s.characteristics & 0x20000000u) != 0;
+						o["readable"] = (s.characteristics & 0x40000000u) != 0;
+						o["writable"] = (s.characteristics & 0x80000000u) != 0;
+						sections.push_back(std::move(o));
+					}
+				}
+				json result;
+				result["module_name"] = selected->name;
+				result["module_path"] = selected->path;
+				result["architecture"] = parsed && pe.is_64bit ? "x64" : "unknown";
+				result["format"] = "PE";
+				std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(selected->base));
+				result["image_base"] = buf;
+				result["image_size"] = parsed && pe.size_of_image != 0 ? pe.size_of_image : selected->size;
+				result["sections"] = std::move(sections);
+				result["functions"] = json::array();
+				result["globals"] = json::array();
+				result["imports"] = json::array();
+				result["exports"] = json::array();
+				result["fast_summary"] = true;
+				return tool_result_t::ok(result);
+			}
 			diag::log_tagged_fmt("analysis", "analysis_get_binary_map_overview generating max_funcs=%d max_globals=%d imports=%d exports=%d xrefs=%d",
 				opts.max_functions, opts.max_globals,
 				opts.include_imports ? 1 : 0,

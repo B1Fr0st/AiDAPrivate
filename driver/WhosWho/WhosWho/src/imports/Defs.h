@@ -290,7 +290,8 @@ namespace ssdt_resolver {
     typedef struct _KSERVICE_TABLE_DESCRIPTOR {
         PLONG   ServiceTable;
         PVOID   CounterTable;
-        ULONG64 ServiceLimit;
+        ULONG   ServiceLimit;
+        ULONG   Reserved;
         PUCHAR  ArgumentTable;
     } KSERVICE_TABLE_DESCRIPTOR, *PKSERVICE_TABLE_DESCRIPTOR;
 
@@ -307,6 +308,7 @@ namespace ssdt_resolver {
     inline volatile LONG g_ssdt_found = 0;
     inline volatile LONG g_funcs_resolved = 0;
     inline volatile LONG g_ctx_funcs_resolved = 0;
+    inline volatile UINT64 g_lstar = 0;
 
 
     constexpr ULONG KTHREAD_PREVIOUSMODE_OFFSET = 0x232;
@@ -323,6 +325,7 @@ namespace ssdt_resolver {
         __try {
 
             UINT64 lstar = __readmsr(0xC0000082);
+            g_lstar = lstar;
             if (lstar < 0xFFFF800000000000ULL) {
                 _InterlockedExchange(&g_ssdt_found, 2);
                 return FALSE;

@@ -117,6 +117,7 @@ namespace ioctl_codes {
     __forceinline ULONG USBX() { return make(56); }
     __forceinline ULONG NLOG() { return make(57); }
     __forceinline ULONG NPKT() { return make(58); }
+    __forceinline ULONG SSDT() { return make(59); }
 }
 
 namespace phase3_msg {
@@ -708,6 +709,15 @@ namespace dispatcher {
             if (input_size >= sizeof(virt_to_phys) && output_size >= sizeof(virt_to_phys)) {
                 status = functions::handle_virt_to_phys((p_virt_to_phys)buffer);
                 bytes = sizeof(virt_to_phys);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::SSDT()) {
+            if (input_size >= sizeof(ssdt_query) && output_size >= sizeof(ssdt_query)) {
+                status = functions::handle_query_ssdt((p_ssdt_query)buffer);
+                bytes = sizeof(ssdt_query);
             }
             else {
                 status = STATUS_INFO_LENGTH_MISMATCH;

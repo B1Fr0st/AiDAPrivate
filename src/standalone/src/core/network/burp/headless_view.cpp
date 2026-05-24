@@ -291,8 +291,9 @@ void run_async_install_module()
     ::diag::log_tagged("headless_v", "install_module_start");
     append_install_log_line(std::string("[install_module] starting pip install"));
     work_queue::post([]() {
+        std::string log;
         bool ok = false;
-        try { ok = aida::burp::camoufox::install::pip_install_async(); } catch (...) { ok = false; }
+        try { ok = aida::burp::camoufox::install::pip_install_module(log); } catch (...) { ok = false; }
         ::diag::log_tagged_fmt("headless_v", "install_module_result ok=%d", ok ? 1 : 0);
         std::string detail;
         {
@@ -300,10 +301,11 @@ void run_async_install_module()
             detail = g_state.install_status.last_message;
         }
         if (!ok) {
-            if (detail.empty()) detail = "pip_install_async returned false";
+            if (detail.empty()) detail = aida::burp::camoufox::install::last_error();
+            if (detail.empty()) detail = "pip install returned false";
             append_install_log_line(std::string("[install_module] ") + detail);
         } else {
-            append_install_log_line(std::string("[install_module] dispatched"));
+            append_install_log_line(std::string("[install_module] completed"));
         }
         schedule_install_probe(true);
     });
@@ -314,8 +316,9 @@ void run_async_fetch_browser()
     ::diag::log_tagged("headless_v", "fetch_browser_start");
     append_install_log_line(std::string("[fetch_browser] starting download"));
     work_queue::post([]() {
+        std::string log;
         bool ok = false;
-        try { ok = aida::burp::camoufox::install::fetch_browser_async(); } catch (...) { ok = false; }
+        try { ok = aida::burp::camoufox::install::fetch_browser(log); } catch (...) { ok = false; }
         ::diag::log_tagged_fmt("headless_v", "fetch_browser_result ok=%d", ok ? 1 : 0);
         std::string detail;
         {
@@ -323,10 +326,11 @@ void run_async_fetch_browser()
             detail = g_state.install_status.last_message;
         }
         if (!ok) {
-            if (detail.empty()) detail = "fetch_browser_async returned false";
+            if (detail.empty()) detail = aida::burp::camoufox::install::last_error();
+            if (detail.empty()) detail = "browser fetch returned false";
             append_install_log_line(std::string("[fetch_browser] ") + detail);
         } else {
-            append_install_log_line(std::string("[fetch_browser] dispatched"));
+            append_install_log_line(std::string("[fetch_browser] completed"));
         }
         schedule_install_probe(true);
     });
@@ -360,7 +364,7 @@ void run_start_bridge()
             set_err(msg);
             ::diag::log_tagged_fmt("headless_v", "start_bridge_failed msg='%s'", msg.c_str());
         } else {
-            ::diag::log_tagged("headless_v", "start_bridge_dispatched");
+            ::diag::log_tagged("headless_v", "start_bridge_completed");
         }
         schedule_status_poll();
     });
@@ -377,7 +381,7 @@ void run_stop_bridge()
             set_err(msg);
             ::diag::log_tagged_fmt("headless_v", "stop_bridge_failed msg='%s'", msg.c_str());
         } else {
-            ::diag::log_tagged("headless_v", "stop_bridge_dispatched");
+            ::diag::log_tagged("headless_v", "stop_bridge_completed");
         }
         schedule_status_poll();
     });

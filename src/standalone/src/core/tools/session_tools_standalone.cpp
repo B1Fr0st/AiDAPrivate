@@ -6,6 +6,7 @@
 #include "../session/session_health.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "../runtime/run_target.hpp"
+#include "../ui/loading_binary_overlay.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -55,6 +56,19 @@ uint32_t parse_pid(const json& v)
 	return 0u;
 }
 
+bool wait_for_binary_load_quiescent(uint32_t timeout_ms)
+{
+	const ULONGLONG start = GetTickCount64();
+	for (;;) {
+		loading_binary_overlay::poll_completion();
+		if (!loading_binary_overlay::is_active())
+			return true;
+		if (GetTickCount64() - start >= timeout_ms)
+			return false;
+		Sleep(25);
+	}
+}
+
 }
 
 static tool_result_t sessions_list(const json& params)
@@ -99,6 +113,9 @@ static tool_result_t sessions_switch(const json& params)
 			? params["binary_id"].get<std::string>().c_str() : "");
 	if (!params.contains("binary_id") || !params["binary_id"].is_string()) {
 		return tool_result_t::error("binary_id (string) is required");
+	}
+	if (!wait_for_binary_load_quiescent(30000)) {
+		return tool_result_t::error("switch failed: load timeout");
 	}
 	std::string id = params["binary_id"].get<std::string>();
 	size_t idx = 0;
@@ -176,6 +193,9 @@ static tool_result_t sessions_attach_pid(const json& params)
 	if (pid == 0) {
 		return tool_result_t::error("invalid pid");
 	}
+	if (!wait_for_binary_load_quiescent(30000)) {
+		return tool_result_t::error("attach failed: load timeout");
+	}
 	std::string err;
 	if (!analysis_session::open_attach_session(pid, &err)) {
 		diag::log_tagged_fmt("sess_tools",
@@ -202,6 +222,9 @@ static tool_result_t sessions_close(const json& params)
 			? params["binary_id"].get<std::string>().c_str() : "");
 	if (!params.contains("binary_id") || !params["binary_id"].is_string()) {
 		return tool_result_t::error("binary_id (string) is required");
+	}
+	if (!wait_for_binary_load_quiescent(30000)) {
+		return tool_result_t::error("close failed: load timeout");
 	}
 	std::string id = params["binary_id"].get<std::string>();
 	size_t idx = 0;

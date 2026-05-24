@@ -288,25 +288,47 @@ static tool_result_t handle_pointer_scan(const json& params) {
 	if (params.contains("timeout_ms") && params["timeout_ms"].is_number_integer()) {
 		timeout_ms = params["timeout_ms"].get<int>();
 		if (timeout_ms < 100) timeout_ms = 100;
-		if (timeout_ms > 5000) timeout_ms = 5000;
+		if (timeout_ms > 30000) timeout_ms = 30000;
 	}
+	const bool allow_partial = params.value("allow_partial", false);
 
 	diag::log_tagged_fmt("scanner", "mcp pointer_scan request addr=0x%llX depth=%d offset=0x%X timeout_ms=%d",
 		static_cast<unsigned long long>(addr), max_depth, max_offset, timeout_ms);
 
 	memory_scanner::start_pointer_scan(addr, max_depth, max_offset);
+	{
+		std::lock_guard<std::mutex> lk(memory_scanner::g_state.pointer_mutex);
+		diag::log_tagged_fmt("scanner", "mcp pointer_scan started scanning=%d current_results=%zu",
+			memory_scanner::g_state.pointer_scanning.load() ? 1 : 0,
+			memory_scanner::g_state.pointer_results.size());
+	}
 
 	const int loops = (timeout_ms + 49) / 50;
 	for (int i = 0; i < loops; ++i) {
 		if (!memory_scanner::g_state.pointer_scanning.load()) break;
+		if (i == 0 || ((i + 1) % 20) == 0) {
+			std::lock_guard<std::mutex> lk(memory_scanner::g_state.pointer_mutex);
+			diag::log_tagged_fmt("scanner", "mcp pointer_scan wait tick=%d/%d results=%zu",
+				i + 1, loops, memory_scanner::g_state.pointer_results.size());
+		}
 		Sleep(50);
 	}
 	const bool timed_out = memory_scanner::g_state.pointer_scanning.load();
-	if (timed_out)
+	if (timed_out) {
+		{
+			std::lock_guard<std::mutex> lk(memory_scanner::g_state.pointer_mutex);
+			diag::log_tagged_fmt("scanner", "mcp pointer_scan timeout addr=0x%llX results_before_cancel=%zu allow_partial=%d",
+				static_cast<unsigned long long>(addr),
+				memory_scanner::g_state.pointer_results.size(),
+				allow_partial ? 1 : 0);
+		}
 		memory_scanner::cancel_pointer_scan();
+	}
 
 	auto& st = memory_scanner::g_state;
 	std::lock_guard<std::mutex> lk(st.pointer_mutex);
+	diag::log_tagged_fmt("scanner", "mcp pointer_scan collect timed_out=%d total=%zu scanning=%d",
+		timed_out ? 1 : 0, st.pointer_results.size(), st.pointer_scanning.load() ? 1 : 0);
 
 	json arr = json::array();
 	size_t n = std::min(st.pointer_results.size(), static_cast<size_t>(200));
@@ -330,7 +352,8 @@ static tool_result_t handle_pointer_scan(const json& params) {
 	json result;
 	result["total"] = st.pointer_results.size();
 	result["showing"] = n;
-	result["timed_out"] = timed_out;
+	result["timed_out"] = timed_out && !allow_partial;
+	result["partial"] = timed_out;
 	result["results"] = std::move(arr);
 	return tool_result_t::ok(result.dump(2));
 }
@@ -439,7 +462,8 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 		{{OBFSTR("address"), OBFSTR("string"), OBFSTR("Target address to find pointers to"), true},
 		 {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum pointer chain depth (1-7, default 4)"), false},
 		 {OBFSTR("max_offset"), OBFSTR("number"), OBFSTR("Maximum offset from pointer base (default 0x1000)"), false},
-		 {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Maximum wait time, capped at 5000 ms"), false}},
+		 {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Maximum wait time, capped at 30000 ms"), false},
+		 {OBFSTR("allow_partial"), OBFSTR("boolean"), OBFSTR("Return partial results without marking the payload as timed out"), false}},
 		handle_pointer_scan, true});
 
 	register_compat(srv, {OBFSTR("scanner_cancel_pointer_scan"), OBFSTR("memory_scanner"),

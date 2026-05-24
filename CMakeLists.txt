@@ -1504,6 +1504,54 @@ if(WIN32)
             add_dependencies(AiDAStandalone encrypt_drivers)
         endif()
 
+        set(AIDA_CAMOUFOX_MCP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-reverse-mcp")
+        if(EXISTS "${AIDA_CAMOUFOX_MCP_DIR}/pyproject.toml")
+            add_custom_command(TARGET AiDAStandalone POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:AiDAStandalone>/deps"
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${AIDA_CAMOUFOX_MCP_DIR}"
+                    "$<TARGET_FILE_DIR:AiDAStandalone>/deps/camoufox-reverse-mcp"
+                COMMENT "Staging camoufox-reverse-mcp beside AiDAStandalone.exe..."
+                VERBATIM
+            )
+        endif()
+
+        set(AIDA_CAMOUFOX_BROWSER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-135.0.1-beta.24-win.x86_64")
+        if(EXISTS "${AIDA_CAMOUFOX_BROWSER_DIR}/camoufox.exe")
+            add_custom_command(TARGET AiDAStandalone POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:AiDAStandalone>/deps"
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${AIDA_CAMOUFOX_BROWSER_DIR}"
+                    "$<TARGET_FILE_DIR:AiDAStandalone>/deps/camoufox-135.0.1-beta.24-win.x86_64"
+                COMMENT "Staging bundled Camoufox browser payload beside AiDAStandalone.exe..."
+                VERBATIM
+            )
+        endif()
+
+        set(AIDA_BUNDLED_PYTHON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/python-3.12")
+        if(EXISTS "${AIDA_BUNDLED_PYTHON_DIR}/python.exe")
+            add_custom_command(TARGET AiDAStandalone POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:AiDAStandalone>/deps"
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${AIDA_BUNDLED_PYTHON_DIR}"
+                    "$<TARGET_FILE_DIR:AiDAStandalone>/deps/python-3.12"
+                COMMENT "Staging bundled Python runtime beside AiDAStandalone.exe..."
+                VERBATIM
+            )
+        endif()
+
+        set(AIDA_PYTHON_INSTALLER "${CMAKE_CURRENT_SOURCE_DIR}/python-3.12.10-amd64.exe")
+        if(EXISTS "${AIDA_PYTHON_INSTALLER}")
+            add_custom_command(TARGET AiDAStandalone POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:AiDAStandalone>/deps"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${AIDA_PYTHON_INSTALLER}"
+                    "$<TARGET_FILE_DIR:AiDAStandalone>/deps/python-3.12.10-amd64.exe"
+                COMMENT "Staging Python installer beside AiDAStandalone.exe..."
+                VERBATIM
+            )
+        endif()
+
         # Post-build copies removed — libz3.dll and ghidra_specs are now
         # embedded as Win32 resources inside the .exe via aida_embedded.rc.
 

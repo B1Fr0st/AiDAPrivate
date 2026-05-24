@@ -2350,6 +2350,8 @@ namespace
                                   const std::string& nonce,
                                   std::string& error_out,
                                   json& response_out);
+    bool is_authoritative_stop_response(const json& response);
+    std::string license_response_reason(const json& response, const std::string& default_reason);
 
     uint64_t license_now_ms()
     {
@@ -2733,28 +2735,16 @@ namespace
         s_proof_hash.store(fnv1a_str(combined), std::memory_order_release);
     }
 
-    bool is_hex_session_token(const std::string& s)
-    {
-        if (s.size() < 16 || s.size() > 256) return false;
-        for (char c : s) {
-            const bool is_hex = (c >= '0' && c <= '9')
-                || (c >= 'a' && c <= 'f')
-                || (c >= 'A' && c <= 'F');
-            if (!is_hex) return false;
-        }
-        return true;
-    }
-
     std::string select_heartbeat_session_token(const settings_sa_t& settings)
     {
+        if (!settings.license_session_token.empty())
+            return settings.license_session_token;
         std::string cached_copy;
         {
             std::lock_guard<std::mutex> lk(s_state_mtx);
             cached_copy = s_cached_session_token;
         }
-        if (is_hex_session_token(cached_copy))
-            return cached_copy;
-        return settings.license_session_token;
+        return cached_copy;
     }
 
     uint64_t vm_generate_proof_token(uint64_t session_seed, uint64_t heartbeat_count,
@@ -3492,8 +3482,8 @@ namespace
         {
             char rl[384];
             _snprintf_s(rl, sizeof(rl), _TRUNCATE,
-                "endpoint_once_response ok=%d status=%d err=%.80s body=%.150s",
-                (int)resp.ok, resp.status, resp.error.c_str(), resp.body.c_str());
+                "endpoint_once_response ok=%d status=%d err=%.80s body_len=%zu",
+                (int)resp.ok, resp.status, resp.error.c_str(), resp.body.size());
             lic_log(rl);
         }
         if (!resp.ok) {
@@ -4588,8 +4578,6 @@ namespace
             if (ratchet_advance(settings.license_server_nonce, next_token_hex) &&
                 !next_token_hex.empty())
             {
-                std::lock_guard<std::mutex> lk(s_state_mtx);
-                s_cached_session_token = next_token_hex;
                 lic_log_fmt("session_ratchet_advanced len=%zu", next_token_hex.size());
             }
         }
@@ -6082,7 +6070,12 @@ namespace
         settings.license_ttl = payload.value("ttl", settings.license_ttl);
 
 
-        s_cached_hwid = hwid;
+        {
+            std::lock_guard<std::mutex> lk(s_state_mtx);
+            s_cached_hwid = hwid;
+            s_cached_session_token = settings.license_session_token;
+            s_cached_arc_bind_token = settings.license_session_token;
+        }
         update_proof_hash(settings.license_session_token, hwid);
 
         if (!settings.license_key_seed.empty())
@@ -6114,6 +6107,67 @@ namespace
                error == "clock_drift" ||
                error == "invalid_format" ||
                error == "missing_key";
+    }
+
+    bool can_revalidate_auth_reject(const std::string& error)
+    {
+        return error == "session_mismatch" ||
+               error == "session_expired";
+    }
+
+    bool refresh_online_session_after_auth_reject(settings_sa_t& settings,
+                                                 const std::string& trigger_error,
+                                                 std::string& pending_error)
+    {
+        if (settings.license_key.empty())
+            return false;
+
+        const std::string reval_nonce = generate_nonce();
+        std::string reval_error;
+        std::string reval_hwid;
+        json reval_response;
+
+        lic_log_fmt("heartbeat_revalidation_before_pending reason=%.96s",
+            trigger_error.c_str());
+
+        if (!call_validation_endpoint_for_current_hwid(settings, "validate",
+                                                       settings.license_key, {},
+                                                       reval_nonce, reval_hwid,
+                                                       reval_error, reval_response))
+        {
+            lic_log_fmt("heartbeat_revalidation_before_pending_failed err=%.120s",
+                reval_error.c_str());
+            if (!reval_error.empty())
+                pending_error = reval_error;
+            if (is_authoritative_stop_response(reval_response)) {
+                lic_log("heartbeat_revalidation_before_pending_killed_by_server");
+                license_failfast("server_killed_session",
+                    "reason=" + license_response_reason(reval_response, "server_killed_session"));
+            }
+            return false;
+        }
+
+        if (!apply_valid_response(settings, settings.license_key, reval_hwid, reval_response))
+        {
+            lic_log("heartbeat_revalidation_before_pending_apply_failed");
+            std::lock_guard<std::mutex> lk(s_state_mtx);
+            if (!s_error.empty())
+                pending_error = s_error;
+            return false;
+        }
+
+        if (s_arc_loaded && !try_load_arc_with_retries(settings, reval_hwid))
+        {
+            lic_log("heartbeat_revalidation_before_pending_arc_reseed_failed");
+            const std::string arc_error = arc_loader::last_error();
+            if (!arc_error.empty())
+                pending_error = arc_error;
+            return false;
+        }
+
+        cancel_silent_kill();
+        lic_log("heartbeat_revalidation_before_pending_ok");
+        return true;
     }
 
     std::string user_facing_license_error(const std::string& error)
@@ -6266,7 +6320,14 @@ namespace
                 }
 
                 if (is_reactivation_required_error(error)) {
-                    enter_pending_activation(*settings, error);
+                    std::string pending_error = error;
+                    if (can_revalidate_auth_reject(error) &&
+                        refresh_online_session_after_auth_reject(*settings, error, pending_error))
+                    {
+                        consecutive_failures = 0;
+                        continue;
+                    }
+                    enter_pending_activation(*settings, pending_error);
                     break;
                 }
 

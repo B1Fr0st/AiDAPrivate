@@ -12,13 +12,18 @@
 #include "../../../helpers/diag_log.hpp"
 
 #include <windows.h>
+#include <winhttp.h>
+#include <softpub.h>
+#include <wintrust.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -96,6 +101,508 @@ std::string quote_arg(const std::string& s)
     }
     out.push_back('"');
     return out;
+}
+
+bool spawn_capture_streaming(const std::string& cmdline, DWORD timeout_ms, DWORD& out_exit_code, std::string& out_log);
+std::string trim_view(const std::string& s);
+std::string compact_log(std::string s, size_t limit = 1200);
+void set_status_locked(install_state_t st, const std::string& msg);
+
+bool file_exists_w(const std::wstring& path)
+{
+    DWORD attr = GetFileAttributesW(path.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+std::wstring parent_dir_w(const std::wstring& path)
+{
+    size_t pos = path.find_last_of(L"\\/");
+    if (pos == std::wstring::npos) return {};
+    return path.substr(0, pos);
+}
+
+std::wstring join_path_w(const std::wstring& a, const std::wstring& b)
+{
+    if (a.empty()) return b;
+    if (b.empty()) return a;
+    wchar_t last = a.back();
+    if (last == L'\\' || last == L'/') return a + b;
+    return a + L"\\" + b;
+}
+
+bool append_unique_path(std::vector<std::wstring>& paths, const std::wstring& path)
+{
+    if (path.empty()) return false;
+    for (const auto& existing : paths)
+    {
+        if (_wcsicmp(existing.c_str(), path.c_str()) == 0) return false;
+    }
+    paths.push_back(path);
+    return true;
+}
+
+std::wstring executable_dir_w()
+{
+    std::vector<wchar_t> buffer(MAX_PATH);
+    for (;;)
+    {
+        DWORD got = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (got == 0) return {};
+        if (got < buffer.size())
+            return parent_dir_w(std::wstring(buffer.data(), got));
+        buffer.resize(buffer.size() * 2);
+        if (buffer.size() > 32768) return {};
+    }
+}
+
+std::wstring current_dir_w()
+{
+    DWORD need = GetCurrentDirectoryW(0, nullptr);
+    if (need == 0) return {};
+    std::wstring out;
+    out.resize(need);
+    DWORD got = GetCurrentDirectoryW(need, out.data());
+    if (got == 0 || got >= need) return {};
+    out.resize(got);
+    return out;
+}
+
+std::vector<std::wstring> runtime_base_dirs()
+{
+    std::vector<std::wstring> bases;
+    std::wstring exe_dir = executable_dir_w();
+    append_unique_path(bases, exe_dir);
+    append_unique_path(bases, current_dir_w());
+    append_unique_path(bases, parent_dir_w(exe_dir));
+    return bases;
+}
+
+bool discover_reverse_mcp_source_dir(std::wstring& out_dir)
+{
+    const std::wstring name = L"camoufox-reverse-mcp";
+    for (const auto& base : runtime_base_dirs())
+    {
+        std::wstring candidate = join_path_w(join_path_w(base, L"deps"), name);
+        if (file_exists_w(join_path_w(candidate, L"pyproject.toml")))
+        {
+            out_dir = candidate;
+            return true;
+        }
+        candidate = join_path_w(base, name);
+        if (file_exists_w(join_path_w(candidate, L"pyproject.toml")))
+        {
+            out_dir = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool discover_bundled_browser_dir(std::wstring& out_dir)
+{
+    const std::wstring name = L"camoufox-135.0.1-beta.24-win.x86_64";
+    for (const auto& base : runtime_base_dirs())
+    {
+        std::wstring candidate = join_path_w(join_path_w(base, L"deps"), name);
+        if (file_exists_w(join_path_w(candidate, L"camoufox.exe")))
+        {
+            out_dir = candidate;
+            return true;
+        }
+        candidate = join_path_w(base, name);
+        if (file_exists_w(join_path_w(candidate, L"camoufox.exe")))
+        {
+            out_dir = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool discover_bundled_python_installer(std::wstring& out_path)
+{
+    const std::wstring name = L"python-3.12.10-amd64.exe";
+    for (const auto& base : runtime_base_dirs())
+    {
+        std::wstring candidate = join_path_w(join_path_w(base, L"deps"), name);
+        if (file_exists_w(candidate))
+        {
+            out_path = candidate;
+            return true;
+        }
+        candidate = join_path_w(base, name);
+        if (file_exists_w(candidate))
+        {
+            out_path = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+std::wstring local_appdata_camoufox_cache()
+{
+    wchar_t root[MAX_PATH] = {};
+    DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", root, MAX_PATH);
+    if (got == 0 || got >= MAX_PATH) return {};
+    return join_path_w(join_path_w(join_path_w(root, L"camoufox"), L"camoufox"), L"Cache");
+}
+
+std::wstring local_appdata_python_target()
+{
+    wchar_t root[MAX_PATH] = {};
+    DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", root, MAX_PATH);
+    if (got == 0 || got >= MAX_PATH) return {};
+    return join_path_w(join_path_w(join_path_w(root, L"Programs"), L"Python"), L"Python312");
+}
+
+std::wstring local_appdata_setup_cache()
+{
+    wchar_t root[MAX_PATH] = {};
+    DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", root, MAX_PATH);
+    if (got == 0 || got >= MAX_PATH) return {};
+    return join_path_w(join_path_w(root, L"AiDA"), L"setup-cache");
+}
+
+bool write_text_file_w(const std::wstring& path, const char* data, std::string& log)
+{
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        log += "CreateFile failed for " + wide_to_utf8(path) + " err=" + std::to_string(GetLastError()) + "\n";
+        return false;
+    }
+    DWORD len = static_cast<DWORD>(std::strlen(data));
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, data, len, &written, nullptr);
+    CloseHandle(h);
+    if (!ok || written != len)
+    {
+        log += "WriteFile failed for " + wide_to_utf8(path) + " err=" + std::to_string(GetLastError()) + "\n";
+        return false;
+    }
+    return true;
+}
+
+struct winhttp_handle_t
+{
+    HINTERNET h = nullptr;
+    explicit winhttp_handle_t(HINTERNET v = nullptr) : h(v) {}
+    ~winhttp_handle_t() { if (h) WinHttpCloseHandle(h); }
+    winhttp_handle_t(const winhttp_handle_t&) = delete;
+    winhttp_handle_t& operator=(const winhttp_handle_t&) = delete;
+};
+
+bool download_python_installer_w(const std::wstring& destination, std::string& log)
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(fs::path(parent_dir_w(destination)), ec);
+    if (ec)
+    {
+        log += "create_directories failed for Python setup cache: " + ec.message() + "\n";
+        return false;
+    }
+
+    const wchar_t* host = L"www.python.org";
+    const wchar_t* path = L"/ftp/python/3.12.10/python-3.12.10-amd64.exe";
+    winhttp_handle_t session(WinHttpOpen(L"AiDA-CamoufoxSetup/1.0",
+                                         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                                         WINHTTP_NO_PROXY_NAME,
+                                         WINHTTP_NO_PROXY_BYPASS,
+                                         0));
+    if (!session.h)
+        session.h = WinHttpOpen(L"AiDA-CamoufoxSetup/1.0",
+                                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                WINHTTP_NO_PROXY_NAME,
+                                WINHTTP_NO_PROXY_BYPASS,
+                                0);
+    if (!session.h)
+    {
+        log += "WinHttpOpen failed err=" + std::to_string(GetLastError()) + "\n";
+        return false;
+    }
+    WinHttpSetTimeouts(session.h, 30000, 30000, 30000, 300000);
+
+    winhttp_handle_t connect(WinHttpConnect(session.h, host, INTERNET_DEFAULT_HTTPS_PORT, 0));
+    if (!connect.h)
+    {
+        log += "WinHttpConnect failed err=" + std::to_string(GetLastError()) + "\n";
+        return false;
+    }
+
+    winhttp_handle_t request(WinHttpOpenRequest(connect.h,
+                                                L"GET",
+                                                path,
+                                                nullptr,
+                                                WINHTTP_NO_REFERER,
+                                                WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                                WINHTTP_FLAG_SECURE));
+    if (!request.h)
+    {
+        log += "WinHttpOpenRequest failed err=" + std::to_string(GetLastError()) + "\n";
+        return false;
+    }
+
+    if (!WinHttpSendRequest(request.h, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(request.h, nullptr))
+    {
+        log += "Python installer download request failed err=" + std::to_string(GetLastError()) + "\n";
+        return false;
+    }
+
+    DWORD status = 0;
+    DWORD status_size = sizeof(status);
+    if (!WinHttpQueryHeaders(request.h,
+                             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                             WINHTTP_HEADER_NAME_BY_INDEX,
+                             &status,
+                             &status_size,
+                             WINHTTP_NO_HEADER_INDEX) ||
+        status < 200 || status >= 300)
+    {
+        log += "Python installer download returned HTTP status " + std::to_string(status) + "\n";
+        return false;
+    }
+
+    std::wstring tmp = destination + L".tmp";
+    HANDLE hf = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hf == INVALID_HANDLE_VALUE)
+    {
+        log += "CreateFile failed for Python installer err=" + std::to_string(GetLastError()) + "\n";
+        return false;
+    }
+
+    uint64_t total = 0;
+    std::vector<char> chunk;
+    for (;;)
+    {
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(request.h, &available))
+        {
+            log += "WinHttpQueryDataAvailable failed err=" + std::to_string(GetLastError()) + "\n";
+            CloseHandle(hf);
+            DeleteFileW(tmp.c_str());
+            return false;
+        }
+        if (available == 0) break;
+        chunk.resize(available);
+        DWORD read = 0;
+        if (!WinHttpReadData(request.h, chunk.data(), available, &read))
+        {
+            log += "WinHttpReadData failed err=" + std::to_string(GetLastError()) + "\n";
+            CloseHandle(hf);
+            DeleteFileW(tmp.c_str());
+            return false;
+        }
+        if (read == 0) break;
+        DWORD written = 0;
+        if (!WriteFile(hf, chunk.data(), read, &written, nullptr) || written != read)
+        {
+            log += "WriteFile failed for Python installer err=" + std::to_string(GetLastError()) + "\n";
+            CloseHandle(hf);
+            DeleteFileW(tmp.c_str());
+            return false;
+        }
+        total += read;
+    }
+    CloseHandle(hf);
+
+    if (total < 10ull * 1024ull * 1024ull)
+    {
+        DeleteFileW(tmp.c_str());
+        log += "Python installer download was unexpectedly small\n";
+        return false;
+    }
+    if (!MoveFileExW(tmp.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        log += "MoveFileEx failed for Python installer err=" + std::to_string(GetLastError()) + "\n";
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    log += "downloaded Python installer bytes=" + std::to_string(total) + "\n";
+    return true;
+}
+
+bool verify_authenticode_w(const std::wstring& path, std::string& log)
+{
+    WINTRUST_FILE_INFO file_info{};
+    file_info.cbStruct = sizeof(file_info);
+    file_info.pcwszFilePath = path.c_str();
+
+    WINTRUST_DATA data{};
+    data.cbStruct = sizeof(data);
+    data.dwUIChoice = WTD_UI_NONE;
+    data.fdwRevocationChecks = WTD_REVOKE_NONE;
+    data.dwUnionChoice = WTD_CHOICE_FILE;
+    data.dwStateAction = WTD_STATEACTION_VERIFY;
+    data.pFile = &file_info;
+    data.dwProvFlags = WTD_SAFER_FLAG;
+
+    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    LONG status = WinVerifyTrust(nullptr, &action, &data);
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(nullptr, &action, &data);
+    if (status == ERROR_SUCCESS) return true;
+    log += "Authenticode verification failed for " + wide_to_utf8(path) + " status=" + std::to_string(status) + "\n";
+    return false;
+}
+
+bool copy_directory_tree_w(const std::wstring& src, const std::wstring& dst, std::string& log)
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(fs::path(dst), ec);
+    if (ec)
+    {
+        log += "create_directories failed for " + wide_to_utf8(dst) + ": " + ec.message() + "\n";
+        return false;
+    }
+    fs::path src_path(src);
+    fs::path dst_path(dst);
+    for (fs::recursive_directory_iterator it(src_path, ec), end; it != end && !ec; it.increment(ec))
+    {
+        fs::path rel = fs::relative(it->path(), src_path, ec);
+        if (ec) break;
+        fs::path target = dst_path / rel;
+        if (it->is_directory(ec))
+        {
+            fs::create_directories(target, ec);
+        }
+        else if (it->is_regular_file(ec))
+        {
+            fs::create_directories(target.parent_path(), ec);
+            if (!ec)
+                fs::copy_file(it->path(), target, fs::copy_options::overwrite_existing, ec);
+        }
+    }
+    if (ec)
+    {
+        log += "copy_directory failed from " + wide_to_utf8(src) + " to " + wide_to_utf8(dst) + ": " + ec.message() + "\n";
+        return false;
+    }
+    return true;
+}
+
+bool bootstrap_python_runtime(std::string& out_log)
+{
+    std::wstring target_dir = local_appdata_python_target();
+    if (target_dir.empty())
+    {
+        out_log += "LOCALAPPDATA not available for Python bootstrap\n";
+        return false;
+    }
+    std::wstring python_exe = join_path_w(target_dir, L"python.exe");
+    if (file_exists_w(python_exe)) return true;
+
+    std::wstring cache_dir = local_appdata_setup_cache();
+    if (cache_dir.empty())
+    {
+        out_log += "LOCALAPPDATA not available for setup cache\n";
+        return false;
+    }
+    std::wstring installer = join_path_w(cache_dir, L"python-3.12.10-amd64.exe");
+
+    {
+        std::lock_guard<std::mutex> lk(sg().mtx);
+        set_status_locked(install_state_t::installing, "downloading Python 3.12 runtime");
+    }
+
+    if (!file_exists_w(installer))
+    {
+        std::wstring bundled_installer;
+        if (discover_bundled_python_installer(bundled_installer))
+            installer = bundled_installer;
+        else if (!download_python_installer_w(installer, out_log))
+            return false;
+    }
+    if (!verify_authenticode_w(installer, out_log))
+        return false;
+
+    {
+        std::lock_guard<std::mutex> lk(sg().mtx);
+        set_status_locked(install_state_t::installing, "installing Python 3.12 runtime");
+    }
+
+    std::string cmd = quote_arg(wide_to_utf8(installer)) +
+        " /quiet InstallAllUsers=0 PrependPath=0 AppendPath=0 Include_launcher=0 Include_pip=1 Include_test=0 Include_doc=0 Include_tcltk=0 Shortcuts=0 SimpleInstall=1 TargetDir=" +
+        quote_arg(wide_to_utf8(target_dir));
+    DWORD code = 0;
+    std::string install_log;
+    if (!spawn_capture_streaming(cmd, 1200000, code, install_log))
+    {
+        out_log += install_log;
+        out_log += "Python installer timed out or failed to spawn\n";
+        return false;
+    }
+    out_log += install_log;
+    if (code != 0 && code != 3010)
+    {
+        out_log += "Python installer exited with code=" + std::to_string(code) + "\n";
+        return false;
+    }
+    if (!file_exists_w(python_exe))
+    {
+        out_log += "Python installer completed but python.exe was not found at " + wide_to_utf8(python_exe) + "\n";
+        return false;
+    }
+    out_log += "installed Python runtime at " + wide_to_utf8(python_exe) + "\n";
+    return true;
+}
+
+bool ensure_python_for_setup(std::string& python, std::string& out_log)
+{
+    if (camoufox::ensure_python_available(python)) return true;
+    if (bootstrap_python_runtime(out_log) && camoufox::ensure_python_available(python)) return true;
+    std::lock_guard<std::mutex> lk(sg().mtx);
+    sg().last_error = out_log.empty() ? "python interpreter not found" : compact_log(out_log);
+    set_status_locked(install_state_t::missing_python, sg().last_error);
+    return false;
+}
+
+bool query_camoufox_install_dir(const std::string& python, std::wstring& out_dir, std::string& out_log)
+{
+    DWORD code = 0;
+    std::string captured;
+    std::string cmd = quote_arg(python) + " -c \"from camoufox.pkgman import INSTALL_DIR; print(INSTALL_DIR)\"";
+    if (spawn_capture_streaming(cmd, 30000, code, captured) && code == 0)
+    {
+        std::string path = trim_view(captured);
+        if (!path.empty())
+        {
+            out_dir = utf8_to_wide(path);
+            return !out_dir.empty();
+        }
+    }
+    out_log += captured;
+    out_dir = local_appdata_camoufox_cache();
+    return !out_dir.empty();
+}
+
+bool install_browser_from_bundle(const std::string& python, std::string& out_log)
+{
+    std::wstring source;
+    if (!discover_bundled_browser_dir(source)) return false;
+
+    std::wstring install_dir;
+    if (!query_camoufox_install_dir(python, install_dir, out_log))
+    {
+        out_log += "could not resolve Camoufox install cache directory\n";
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(sg().mtx);
+        set_status_locked(install_state_t::installing, "installing bundled camoufox browser payload");
+    }
+
+    if (!copy_directory_tree_w(source, install_dir, out_log)) return false;
+    const char* version_json = "{\"version\":\"135.0.1\",\"release\":\"beta.24\"}";
+    if (!write_text_file_w(join_path_w(install_dir, L"version.json"), version_json, out_log)) return false;
+
+    out_log += "installed bundled Camoufox browser from " + wide_to_utf8(source) + "\n";
+    return true;
 }
 
 bool find_executable(const wchar_t* exe_name, std::string& out_path)
@@ -183,7 +690,7 @@ std::string trim_view(const std::string& s)
     return s.substr(a, b - a);
 }
 
-std::string compact_log(std::string s, size_t limit = 1200)
+std::string compact_log(std::string s, size_t limit)
 {
     s = trim_view(s);
     for (char& c : s) {
@@ -268,8 +775,9 @@ struct probe_guard_t
     }
 };
 
-constexpr DWORD kInteractiveProbeTimeoutMs = 1500;
-constexpr DWORD kBackgroundProbeTimeoutMs = 1500;
+constexpr DWORD kInteractiveProbeTimeoutMs = 30000;
+constexpr DWORD kBackgroundProbeTimeoutMs = 30000;
+constexpr DWORD kSetupProbeTimeoutMs = 30000;
 
 status_t probe_impl(bool allow_when_busy, DWORD timeout_ms);
 
@@ -347,10 +855,13 @@ status_t probe_impl(bool allow_when_busy, DWORD timeout_ms)
     }
     if (exit_code != 0)
     {
+        std::string detail = compact_log(captured);
         std::lock_guard<std::mutex> lk(sg().mtx);
-        set_status_locked(install_state_t::missing_module, "camoufox_reverse_mcp not importable");
+        sg().last_error = detail.empty()
+            ? std::string("camoufox_reverse_mcp not importable")
+            : std::string("camoufox_reverse_mcp not importable: ") + detail;
+        set_status_locked(install_state_t::missing_module, sg().last_error);
         sg().status.module_version.clear();
-        sg().last_error = "camoufox_reverse_mcp not importable";
         return sg().status;
     }
     {
@@ -392,10 +903,13 @@ status_t probe_impl(bool allow_when_busy, DWORD timeout_ms)
     }
     if (browser_exit != 0)
     {
+        std::string detail = compact_log(browser_log);
         std::lock_guard<std::mutex> lk(sg().mtx);
-        set_status_locked(install_state_t::missing_browser, "camoufox browser not installed (run python -m camoufox fetch)");
+        sg().last_error = detail.empty()
+            ? std::string("camoufox browser not installed")
+            : std::string("camoufox browser not installed: ") + detail;
+        set_status_locked(install_state_t::missing_browser, sg().last_error);
         sg().status.browser_path.clear();
-        sg().last_error = "camoufox browser not installed";
         return sg().status;
     }
     {
@@ -419,9 +933,13 @@ bool ensure_ready(std::string& out_log)
 {
     out_log.clear();
 
-    status_t st = probe_impl(true, 5000);
+    status_t st = probe_impl(true, kSetupProbeTimeoutMs);
     if (st.state == install_state_t::missing_python)
-        return false;
+    {
+        std::string python;
+        if (!ensure_python_for_setup(python, out_log)) return false;
+        st = probe_impl(true, kSetupProbeTimeoutMs);
+    }
 
     if (st.state == install_state_t::missing_module)
     {
@@ -431,12 +949,12 @@ bool ensure_ready(std::string& out_log)
         else
             ok = pip_install_module(out_log);
         if (!ok) return false;
-        st = probe_impl(true, 5000);
+        st = probe_impl(true, kSetupProbeTimeoutMs);
         if (st.state == install_state_t::missing_module &&
             st.last_message.find("camoufox runtime import") != std::string::npos)
         {
             if (!repair_runtime_dependencies(out_log)) return false;
-            st = probe_impl(true, 5000);
+            st = probe_impl(true, kSetupProbeTimeoutMs);
         }
     }
 
@@ -444,7 +962,7 @@ bool ensure_ready(std::string& out_log)
         st.state == install_state_t::available)
     {
         if (!fetch_browser(out_log)) return false;
-        st = probe_impl(true, 5000);
+        st = probe_impl(true, kSetupProbeTimeoutMs);
     }
 
     if (st.state == install_state_t::ok)
@@ -461,18 +979,22 @@ bool pip_install_module(std::string& out_log)
     out_log.clear();
 
     std::string python;
-    if (!camoufox::ensure_python_available(python))
+    if (!ensure_python_for_setup(python, out_log)) return false;
+
+    std::wstring module_dir;
+    if (!discover_reverse_mcp_source_dir(module_dir))
     {
         std::lock_guard<std::mutex> lk(sg().mtx);
-        sg().last_error = "python interpreter not found";
-        set_status_locked(install_state_t::missing_python, sg().last_error);
+        sg().last_error = "camoufox-reverse-mcp package source not found beside AiDAStandalone";
+        set_status_locked(install_state_t::install_failed, sg().last_error);
         return false;
     }
 
+    const std::string module_arg = quote_arg(wide_to_utf8(module_dir));
     if (!run_install_command(python,
         "installing camoufox-reverse-mcp",
-        "-e C:/Users/ruar1337/AiDAPrivate/camoufox-reverse-mcp",
-        "--upgrade-strategy only-if-needed -e C:/Users/ruar1337/AiDAPrivate/camoufox-reverse-mcp",
+        "-e " + module_arg,
+        "--upgrade-strategy only-if-needed -e " + module_arg,
         "camoufox-reverse-mcp install failed",
         out_log))
         return false;
@@ -487,13 +1009,7 @@ bool repair_runtime_dependencies(std::string& out_log)
     out_log.clear();
 
     std::string python;
-    if (!camoufox::ensure_python_available(python))
-    {
-        std::lock_guard<std::mutex> lk(sg().mtx);
-        sg().last_error = "python interpreter not found";
-        set_status_locked(install_state_t::missing_python, sg().last_error);
-        return false;
-    }
+    if (!ensure_python_for_setup(python, out_log)) return false;
 
     if (!run_install_command(python,
         "repairing camoufox runtime dependencies",
@@ -513,12 +1029,14 @@ bool fetch_browser(std::string& out_log)
     out_log.clear();
 
     std::string python;
-    if (!camoufox::ensure_python_available(python))
+    if (!ensure_python_for_setup(python, out_log)) return false;
+
+    if (install_browser_from_bundle(python, out_log))
     {
         std::lock_guard<std::mutex> lk(sg().mtx);
-        sg().last_error = "python interpreter not found";
-        set_status_locked(install_state_t::missing_python, sg().last_error);
-        return false;
+        set_status_locked(install_state_t::available, "bundled camoufox browser installed");
+        sg().last_error.clear();
+        return true;
     }
 
     {
@@ -536,8 +1054,11 @@ bool fetch_browser(std::string& out_log)
     }
     if (code != 0)
     {
+        std::string detail = compact_log(out_log);
         std::lock_guard<std::mutex> lk(sg().mtx);
-        sg().last_error = "camoufox fetch exited with non-zero status";
+        sg().last_error = detail.empty()
+            ? std::string("camoufox fetch exited with non-zero status")
+            : std::string("camoufox fetch exited with non-zero status: ") + detail;
         set_status_locked(install_state_t::install_failed, sg().last_error);
         return false;
     }

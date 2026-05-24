@@ -55,6 +55,67 @@ std::string to_lower(std::string s)
     return s;
 }
 
+struct url_log_t
+{
+    std::string scheme;
+    std::string host;
+    std::string path;
+    uint16_t port = 0;
+    bool has_query = false;
+    size_t length = 0;
+};
+
+url_log_t summarize_url_for_log(const std::string& url)
+{
+    url_log_t out;
+    out.length = url.size();
+    std::string scheme, host, path;
+    uint16_t port = 0;
+    if (audit_http::parse_url(url, scheme, host, port, path))
+    {
+        out.scheme = scheme;
+        out.host = host;
+        out.port = port;
+        size_t q = path.find('?');
+        size_t f = path.find('#');
+        out.has_query = q != std::string::npos;
+        size_t path_end = path.size();
+        if (q != std::string::npos) path_end = q;
+        if (f != std::string::npos && f < path_end) path_end = f;
+        out.path = path.substr(0, path_end);
+        if (out.path.empty()) out.path = "/";
+    }
+    else
+    {
+        size_t cursor = 0;
+        size_t scheme_pos = url.find("://");
+        if (scheme_pos != std::string::npos)
+        {
+            out.scheme = url.substr(0, scheme_pos);
+            cursor = scheme_pos + 3;
+        }
+        size_t host_end = url.find_first_of("/?#", cursor);
+        if (host_end == std::string::npos) host_end = url.size();
+        if (host_end > cursor) out.host = url.substr(cursor, host_end - cursor);
+        size_t path_start = url.find('/', cursor);
+        size_t q = url.find('?', cursor);
+        size_t f = url.find('#', cursor);
+        out.has_query = q != std::string::npos;
+        size_t path_end = url.size();
+        if (q != std::string::npos) path_end = q;
+        if (f != std::string::npos && f < path_end) path_end = f;
+        if (path_start != std::string::npos && path_start < path_end) out.path = url.substr(path_start, path_end - path_start);
+    }
+    if (out.host.empty()) out.host = "<missing>";
+    if (out.path.empty()) out.path = "/";
+    if (out.path.size() > 240)
+    {
+        out.path.resize(240);
+        out.path += "...";
+    }
+    return out;
+}
+
 std::string introspection_query()
 {
     return std::string(
@@ -93,8 +154,10 @@ bool introspect(const std::string& endpoint,
                 gql_schema_t& out,
                 std::string& raw_response)
 {
-    diag::log_tagged_fmt("graphql", "introspect entry endpoint=%s headers=%zu",
-        endpoint.c_str(), headers.size());
+    const url_log_t endpoint_log = summarize_url_for_log(endpoint);
+    diag::log_tagged_fmt("graphql", "introspect entry scheme=%s host=%s port=%u path=%s query=%d endpoint_len=%zu headers=%zu",
+        endpoint_log.scheme.c_str(), endpoint_log.host.c_str(), static_cast<unsigned>(endpoint_log.port),
+        endpoint_log.path.c_str(), (int)endpoint_log.has_query, endpoint_log.length, headers.size());
     nlohmann::json body;
     body["query"] = introspection_query();
     body["operationName"] = "IntrospectionQuery";
@@ -103,19 +166,22 @@ bool introspect(const std::string& endpoint,
     nlohmann::json resp_json;
     diag::log_tagged_fmt("graphql", "introspect sending_introspection_query");
     if (!send_query(endpoint, headers, introspection_query(), variables, resp_json, raw_response)) {
-        diag::log_tagged_fmt("graphql", "introspect send_query_failed endpoint=%s", endpoint.c_str());
+        diag::log_tagged_fmt("graphql", "introspect send_query_failed host=%s path=%s",
+            endpoint_log.host.c_str(), endpoint_log.path.c_str());
         return false;
     }
     diag::log_tagged_fmt("graphql", "introspect response_received raw_len=%zu", raw_response.size());
 
     if (!resp_json.is_object() || !resp_json.contains("data") || !resp_json["data"].is_object()) {
-        diag::log_tagged_fmt("graphql", "introspect no_data_field endpoint=%s", endpoint.c_str());
+        diag::log_tagged_fmt("graphql", "introspect no_data_field host=%s path=%s response_type=%s",
+            endpoint_log.host.c_str(), endpoint_log.path.c_str(), resp_json.type_name());
         set_err("graphql.introspect: no data field");
         return false;
     }
     const auto& data = resp_json["data"];
     if (!data.contains("__schema") || !data["__schema"].is_object()) {
-        diag::log_tagged_fmt("graphql", "introspect no_schema_field endpoint=%s", endpoint.c_str());
+        diag::log_tagged_fmt("graphql", "introspect no_schema_field host=%s path=%s data_keys=%zu",
+            endpoint_log.host.c_str(), endpoint_log.path.c_str(), data.size());
         set_err("graphql.introspect: no __schema");
         return false;
     }
@@ -185,12 +251,12 @@ bool introspect(const std::string& endpoint,
         }
     }
 
-    diag::log_tagged_fmt("graphql", "introspect caching schema types=%zu endpoint=%s",
-        parsed.types.size(), endpoint.c_str());
+    diag::log_tagged_fmt("graphql", "introspect caching schema types=%zu host=%s path=%s",
+        parsed.types.size(), endpoint_log.host.c_str(), endpoint_log.path.c_str());
     cache_schema(endpoint, parsed);
     out = std::move(parsed);
-    diag::log_tagged_fmt("graphql", "introspect ok endpoint=%s types=%zu",
-        endpoint.c_str(), out.types.size());
+    diag::log_tagged_fmt("graphql", "introspect ok host=%s path=%s types=%zu raw_len=%zu",
+        endpoint_log.host.c_str(), endpoint_log.path.c_str(), out.types.size(), raw_response.size());
     return true;
 }
 
@@ -400,16 +466,19 @@ bool send_query(const std::string& endpoint,
                 nlohmann::json& response_json,
                 std::string& raw_text)
 {
-    diag::log_tagged_fmt("graphql", "send_query entry endpoint=%s query_len=%zu headers=%zu",
-        endpoint.c_str(), query.size(), headers.size());
+    const url_log_t endpoint_log = summarize_url_for_log(endpoint);
+    diag::log_tagged_fmt("graphql", "send_query entry scheme=%s host=%s port=%u path=%s query_param=%d endpoint_len=%zu query_len=%zu variables_type=%s headers=%zu",
+        endpoint_log.scheme.c_str(), endpoint_log.host.c_str(), static_cast<unsigned>(endpoint_log.port),
+        endpoint_log.path.c_str(), (int)endpoint_log.has_query, endpoint_log.length,
+        query.size(), variables.type_name(), headers.size());
     std::string scheme, host, path; uint16_t port = 0;
     if (!audit_http::parse_url(endpoint, scheme, host, port, path)) {
-        diag::log_tagged_fmt("graphql", "send_query parse_url_failed endpoint=%s", endpoint.c_str());
+        diag::log_tagged_fmt("graphql", "send_query parse_url_failed endpoint_len=%zu", endpoint.size());
         set_err("graphql.send_query: parse_url failed");
         return false;
     }
-    diag::log_tagged_fmt("graphql", "send_query parsed scheme=%s host=%s port=%u path=%s",
-        scheme.c_str(), host.c_str(), static_cast<unsigned>(port), path.c_str());
+    diag::log_tagged_fmt("graphql", "send_query parsed scheme=%s host=%s port=%u path=%s query=%d",
+        scheme.c_str(), host.c_str(), static_cast<unsigned>(port), endpoint_log.path.c_str(), (int)endpoint_log.has_query);
     std::string origin = scheme + "://" + host;
     if ((scheme == "https" && port != 443) || (scheme == "http" && port != 80))
         origin += ":" + std::to_string(port);
@@ -433,11 +502,12 @@ bool send_query(const std::string& endpoint,
     if (!variables.is_null()) body["variables"] = variables;
     std::string body_str = body.dump();
 
-    diag::log_tagged_fmt("graphql", "send_query posting to %s%s body_len=%zu",
-        origin.c_str(), path.c_str(), body_str.size());
+    diag::log_tagged_fmt("graphql", "send_query posting host=%s port=%u path=%s headers=%zu body_len=%zu",
+        host.c_str(), static_cast<unsigned>(port), endpoint_log.path.c_str(), hh.size(), body_str.size());
     auto res = cli.Post(path, hh, body_str, std::string("application/json"));
     if (!res) {
-        diag::log_tagged_fmt("graphql", "send_query post_failed endpoint=%s", endpoint.c_str());
+        diag::log_tagged_fmt("graphql", "send_query post_failed host=%s path=%s",
+            host.c_str(), endpoint_log.path.c_str());
         set_err("graphql.send_query: POST failed");
         return false;
     }
@@ -445,17 +515,20 @@ bool send_query(const std::string& endpoint,
     diag::log_tagged_fmt("graphql", "send_query response_received status=%d body_len=%zu",
         res->status, raw_text.size());
     if (raw_text.empty()) {
-        diag::log_tagged_fmt("graphql", "send_query empty_body endpoint=%s", endpoint.c_str());
+        diag::log_tagged_fmt("graphql", "send_query empty_body host=%s path=%s status=%d",
+            host.c_str(), endpoint_log.path.c_str(), res->status);
         set_err("graphql.send_query: empty body");
         return false;
     }
     response_json = nlohmann::json::parse(raw_text, nullptr, false);
     if (response_json.is_discarded()) {
-        diag::log_tagged_fmt("graphql", "send_query response_not_json endpoint=%s", endpoint.c_str());
+        diag::log_tagged_fmt("graphql", "send_query response_not_json host=%s path=%s status=%d body_len=%zu",
+            host.c_str(), endpoint_log.path.c_str(), res->status, raw_text.size());
         set_err("graphql.send_query: response is not JSON");
         return false;
     }
-    diag::log_tagged_fmt("graphql", "send_query ok endpoint=%s", endpoint.c_str());
+    diag::log_tagged_fmt("graphql", "send_query ok host=%s path=%s status=%d response_type=%s",
+        host.c_str(), endpoint_log.path.c_str(), res->status, response_json.type_name());
     return true;
 }
 
@@ -493,8 +566,9 @@ nlohmann::json schema_to_json(const gql_schema_t& s)
 
 bool cache_schema(const std::string& endpoint, const gql_schema_t& schema)
 {
-    diag::log_tagged_fmt("graphql", "cache_schema endpoint=%s types=%zu",
-        endpoint.c_str(), schema.types.size());
+    const url_log_t endpoint_log = summarize_url_for_log(endpoint);
+    diag::log_tagged_fmt("graphql", "cache_schema host=%s path=%s endpoint_len=%zu types=%zu",
+        endpoint_log.host.c_str(), endpoint_log.path.c_str(), endpoint_log.length, schema.types.size());
     auto& c = cache();
     std::lock_guard<std::mutex> lk(c.mtx);
     c.by_endpoint[endpoint] = schema;
@@ -504,17 +578,20 @@ bool cache_schema(const std::string& endpoint, const gql_schema_t& schema)
 
 bool get_cached_schema(const std::string& endpoint, gql_schema_t& out)
 {
-    diag::log_tagged_fmt("graphql", "get_cached_schema entry endpoint=%s", endpoint.c_str());
+    const url_log_t endpoint_log = summarize_url_for_log(endpoint);
+    diag::log_tagged_fmt("graphql", "get_cached_schema entry host=%s path=%s endpoint_len=%zu",
+        endpoint_log.host.c_str(), endpoint_log.path.c_str(), endpoint_log.length);
     auto& c = cache();
     std::lock_guard<std::mutex> lk(c.mtx);
     auto it = c.by_endpoint.find(endpoint);
     if (it == c.by_endpoint.end()) {
-        diag::log_tagged_fmt("graphql", "get_cached_schema not_found endpoint=%s", endpoint.c_str());
+        diag::log_tagged_fmt("graphql", "get_cached_schema not_found host=%s path=%s",
+            endpoint_log.host.c_str(), endpoint_log.path.c_str());
         return false;
     }
     out = it->second;
-    diag::log_tagged_fmt("graphql", "get_cached_schema found endpoint=%s types=%zu",
-        endpoint.c_str(), out.types.size());
+    diag::log_tagged_fmt("graphql", "get_cached_schema found host=%s path=%s types=%zu",
+        endpoint_log.host.c_str(), endpoint_log.path.c_str(), out.types.size());
     return true;
 }
 
@@ -523,8 +600,9 @@ bool has_cached_schema(const std::string& endpoint)
     auto& c = cache();
     std::lock_guard<std::mutex> lk(c.mtx);
     bool found = c.by_endpoint.find(endpoint) != c.by_endpoint.end();
-    diag::log_tagged_fmt("graphql", "has_cached_schema endpoint=%s result=%d",
-        endpoint.c_str(), static_cast<int>(found));
+    const url_log_t endpoint_log = summarize_url_for_log(endpoint);
+    diag::log_tagged_fmt("graphql", "has_cached_schema host=%s path=%s endpoint_len=%zu result=%d",
+        endpoint_log.host.c_str(), endpoint_log.path.c_str(), endpoint_log.length, static_cast<int>(found));
     return found;
 }
 

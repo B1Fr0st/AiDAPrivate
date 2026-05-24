@@ -260,8 +260,14 @@ tool_result_t network_analyze_packet(const json& params)
 
     auto packets = driver_bridge::get_captured_packets(1);
     diag::log_tagged_fmt("net_tools", "network_analyze_packet packets_avail=%zu", packets.size());
-    if (packets.empty())
-        return tool_result_t::error(OBFSTR("No packets available. Start capture first."));
+    if (packets.empty()) {
+        json result;
+        result["packet_count"] = 0;
+        result["index"] = params.value("index", 0);
+        result["capture_empty"] = true;
+        result["message"] = "No packets are currently available for analysis.";
+        return tool_result_t::ok(OBFSTR("No packets available"), result);
+    }
 
     const auto& p = packets[0];
     json result;
@@ -942,6 +948,15 @@ tool_result_t network_follow_tcp_stream(const json& params)
         std::uint32_t total_packets = 0, truncated = 0;
         bool ok = driver_bridge::stream_reassemble_op(2, src_port, dst_port, pid, nullptr, nullptr, &stream_data, &total_packets, &truncated);
         diag::log_tagged_fmt("net_tools", "network_follow_tcp_stream get result=%d bytes=%zu packets=%u truncated=%u", (int)ok, stream_data.size(), total_packets, truncated);
+        if (!ok && src_port == 0 && dst_port == 0 && pid == 0) {
+            json r;
+            r["total_bytes"] = 0;
+            r["total_packets"] = 0;
+            r["truncated"] = 0;
+            r["stream_empty"] = true;
+            r["message"] = "No stream selector was provided and no active reassembly data is available.";
+            return tool_result_t::ok(OBFSTR("0 bytes reassembled"), r);
+        }
         if (!ok) return tool_result_t::error(OBFSTR("Failed to get reassembled stream data."));
         json r;
         r["total_bytes"] = stream_data.size();

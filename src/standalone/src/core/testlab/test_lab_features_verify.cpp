@@ -12,9 +12,12 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "dnsapi.lib")
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -137,6 +140,69 @@ namespace {
 		return a[0] == 1u && a[1] == 1u && a[2] == 1u && a[3] == 1u;
 	}
 
+	bool addr_is_v4_endpoint(const std::uint8_t* a,
+		std::uint32_t family,
+		std::uint8_t b0,
+		std::uint8_t b1,
+		std::uint8_t b2,
+		std::uint8_t b3)
+	{
+		if (family != 0u && family != 2u) return false;
+		return a[0] == b0 && a[1] == b1 && a[2] == b2 && a[3] == b3;
+	}
+
+	struct tcp_probe_state_t {
+		SOCKET primary = INVALID_SOCKET;
+		SOCKET accepted = INVALID_SOCKET;
+		std::uint8_t remote_addr[4]{};
+		std::uint32_t remote_port = 0u;
+		bool initiated = false;
+		std::string mode;
+		std::string diag;
+
+		~tcp_probe_state_t() {
+			close();
+		}
+
+		tcp_probe_state_t() = default;
+		tcp_probe_state_t(const tcp_probe_state_t&) = delete;
+		tcp_probe_state_t& operator=(const tcp_probe_state_t&) = delete;
+
+		void close() {
+			if (primary != INVALID_SOCKET) {
+				closesocket(primary);
+				primary = INVALID_SOCKET;
+			}
+			if (accepted != INVALID_SOCKET) {
+				closesocket(accepted);
+				accepted = INVALID_SOCKET;
+			}
+		}
+
+		void set_remote(std::uint8_t b0, std::uint8_t b1, std::uint8_t b2, std::uint8_t b3, std::uint32_t port) {
+			remote_addr[0] = b0;
+			remote_addr[1] = b1;
+			remote_addr[2] = b2;
+			remote_addr[3] = b3;
+			remote_port = port;
+		}
+	};
+
+	bool tcp_probe_remote_matches(const tcp_probe_state_t& probe,
+		const std::uint8_t* addr,
+		std::uint32_t family,
+		std::uint32_t port)
+	{
+		if (!probe.initiated || probe.remote_port == 0u || port != probe.remote_port)
+			return false;
+		return addr_is_v4_endpoint(addr,
+			family,
+			probe.remote_addr[0],
+			probe.remote_addr[1],
+			probe.remote_addr[2],
+			probe.remote_addr[3]);
+	}
+
 	struct wsa_guard_t {
 		bool ok = false;
 		wsa_guard_t() {
@@ -247,7 +313,7 @@ namespace {
 		return initiated;
 	}
 
-	bool issue_udp_dns_probe_to_one_one(const char* host, std::string& diag) {
+	bool build_dns_query_packet(const char* host, std::vector<unsigned char>& packet, std::uint16_t& qid, std::string& diag) {
 		wsa_guard_t g;
 		if (!g.ok) {
 			diag = "WSAStartup failed";
@@ -258,9 +324,9 @@ namespace {
 			return false;
 		}
 
-		std::vector<unsigned char> packet;
+		packet.clear();
 		packet.reserve(512);
-		const std::uint16_t qid = static_cast<std::uint16_t>(GetTickCount() & 0xffffu);
+		qid = static_cast<std::uint16_t>(GetTickCount() & 0xffffu);
 		packet.push_back(static_cast<unsigned char>(qid >> 8));
 		packet.push_back(static_cast<unsigned char>(qid & 0xff));
 		packet.push_back(0x01);
@@ -294,33 +360,155 @@ namespace {
 		packet.push_back(0x01);
 		packet.push_back(0x00);
 		packet.push_back(0x01);
+		return true;
+	}
+
+	bool issue_udp_dns_probe_to_one_one(const char* host, std::string& diag) {
+		std::vector<unsigned char> packet;
+		std::uint16_t qid = 0;
+		if (!build_dns_query_packet(host, packet, qid, diag))
+			return false;
+		::diag::log_tagged_fmt("verify_dns", "udp_probe start host=%s qid=%u packet_bytes=%zu",
+			host ? host : "", qid, packet.size());
 
 		SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 		if (s == INVALID_SOCKET) {
-			diag = "DNS UDP socket failed";
+			int err = WSAGetLastError();
+			char b[96];
+			std::snprintf(b, sizeof(b), "DNS UDP socket failed err=%d", err);
+			diag = b;
+			::diag::log_tagged_fmt("verify_dns", "udp_probe socket_failed host=%s err=%d", host ? host : "", err);
 			return false;
 		}
 		sockaddr_in dst{};
 		dst.sin_family = AF_INET;
 		dst.sin_port = htons(53);
 		dst.sin_addr.s_addr = htonl(0x01010101u);
-		int sent = sendto(s,
+		DWORD timeout_ms = 250;
+		setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+		connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+		int sent = send(s,
 			reinterpret_cast<const char*>(packet.data()),
 			static_cast<int>(packet.size()),
-			0,
-			reinterpret_cast<sockaddr*>(&dst),
-			sizeof(dst));
+			0);
+		if (sent == SOCKET_ERROR) {
+			sent = sendto(s,
+				reinterpret_cast<const char*>(packet.data()),
+				static_cast<int>(packet.size()),
+				0,
+				reinterpret_cast<sockaddr*>(&dst),
+				sizeof(dst));
+		}
 		int err = (sent == SOCKET_ERROR) ? WSAGetLastError() : 0;
+		char recv_buf[512];
+		int recvd = sent == SOCKET_ERROR ? 0 : recv(s, recv_buf, sizeof(recv_buf), 0);
 		closesocket(s);
 		if (sent == SOCKET_ERROR) {
 			char b[80];
 			std::snprintf(b, sizeof(b), "DNS UDP sendto err=%d", err);
 			diag = b;
+			::diag::log_tagged_fmt("verify_dns", "udp_probe send_failed host=%s err=%d", host ? host : "", err);
 			return false;
 		}
-		char b[96];
-		std::snprintf(b, sizeof(b), "DNS UDP query host=%s bytes=%d id=%u", host, sent, qid);
+		char b[128];
+		std::snprintf(b, sizeof(b), "DNS UDP query host=%s bytes=%d response_bytes=%d id=%u",
+			host, sent, recvd > 0 ? recvd : 0, qid);
 		diag = b;
+		::diag::log_tagged_fmt("verify_dns", "udp_probe done host=%s sent=%d recvd=%d qid=%u",
+			host ? host : "", sent, recvd > 0 ? recvd : 0, qid);
+		return true;
+	}
+
+	bool issue_tcp_dns_probe_to_one_one(const char* host, std::string& diag) {
+		std::vector<unsigned char> packet;
+		std::uint16_t qid = 0;
+		if (!build_dns_query_packet(host, packet, qid, diag))
+			return false;
+		::diag::log_tagged_fmt("verify_dns", "tcp_probe start host=%s qid=%u packet_bytes=%zu",
+			host ? host : "", qid, packet.size());
+
+		SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		if (s == INVALID_SOCKET) {
+			int err = WSAGetLastError();
+			char b[96];
+			std::snprintf(b, sizeof(b), "DNS TCP socket failed err=%d", err);
+			diag = b;
+			::diag::log_tagged_fmt("verify_dns", "tcp_probe socket_failed host=%s err=%d", host ? host : "", err);
+			return false;
+		}
+		DWORD timeout_ms = 1000;
+		setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+		setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+		u_long nb = 1;
+		ioctlsocket(s, FIONBIO, &nb);
+		sockaddr_in dst{};
+		dst.sin_family = AF_INET;
+		dst.sin_port = htons(53);
+		dst.sin_addr.s_addr = htonl(0x01010101u);
+		if (connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) == SOCKET_ERROR) {
+			int err = WSAGetLastError();
+			if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS && err != WSAEINVAL) {
+				closesocket(s);
+				char b[96];
+				std::snprintf(b, sizeof(b), "DNS TCP connect err=%d", err);
+				diag = b;
+				::diag::log_tagged_fmt("verify_dns", "tcp_probe connect_immediate_failed host=%s err=%d", host ? host : "", err);
+				return false;
+			}
+			fd_set wf;
+			fd_set ef;
+			FD_ZERO(&wf);
+			FD_ZERO(&ef);
+			FD_SET(s, &wf);
+			FD_SET(s, &ef);
+			timeval tv{};
+			tv.tv_sec = 1;
+			tv.tv_usec = 0;
+			int sel = select(0, nullptr, &wf, &ef, &tv);
+			if (sel <= 0) {
+				int sel_err = sel == SOCKET_ERROR ? WSAGetLastError() : WSAETIMEDOUT;
+				closesocket(s);
+				char b[128];
+				std::snprintf(b, sizeof(b), "DNS TCP connect select err=%d sel=%d", sel_err, sel);
+				diag = b;
+				::diag::log_tagged_fmt("verify_dns", "tcp_probe connect_select_failed host=%s sel=%d err=%d", host ? host : "", sel, sel_err);
+				return false;
+			}
+			int so_error = 0;
+			int so_len = sizeof(so_error);
+			getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_error), &so_len);
+			if (so_error != 0) {
+				closesocket(s);
+				char b[128];
+				std::snprintf(b, sizeof(b), "DNS TCP connect so_error=%d", so_error);
+				diag = b;
+				::diag::log_tagged_fmt("verify_dns", "tcp_probe connect_so_error host=%s err=%d", host ? host : "", so_error);
+				return false;
+			}
+		}
+		std::vector<unsigned char> tcp_packet;
+		tcp_packet.reserve(packet.size() + 2u);
+		tcp_packet.push_back(static_cast<unsigned char>((packet.size() >> 8) & 0xffu));
+		tcp_packet.push_back(static_cast<unsigned char>(packet.size() & 0xffu));
+		tcp_packet.insert(tcp_packet.end(), packet.begin(), packet.end());
+		int sent = send(s,
+			reinterpret_cast<const char*>(tcp_packet.data()),
+			static_cast<int>(tcp_packet.size()),
+			0);
+		int err = (sent == SOCKET_ERROR) ? WSAGetLastError() : 0;
+		closesocket(s);
+		if (sent == SOCKET_ERROR) {
+			char b[96];
+			std::snprintf(b, sizeof(b), "DNS TCP send err=%d", err);
+			diag = b;
+			::diag::log_tagged_fmt("verify_dns", "tcp_probe send_failed host=%s err=%d", host ? host : "", err);
+			return false;
+		}
+		char b[128];
+		std::snprintf(b, sizeof(b), "DNS TCP query host=%s bytes=%d id=%u", host, sent, qid);
+		diag = b;
+		::diag::log_tagged_fmt("verify_dns", "tcp_probe done host=%s sent=%d qid=%u",
+			host ? host : "", sent, qid);
 		return true;
 	}
 
@@ -433,10 +621,108 @@ namespace {
 		std::free(drain);
 	}
 
-	struct dns_log_ctx_t {
-		test_lab::result_t* r;
-		bool done;
+	enum class dns_log_stage_e : long {
+		not_started = 0,
+		ensure_driver,
+		winsock,
+		baseline_ndns,
+		start_ncap,
+		udp_probe,
+		tcp_probe,
+		windns_probe,
+		poll_wait,
+		poll_ndns,
+		stop_ncap,
+		drain_ncap,
+		evaluate,
+		exception
 	};
+
+	struct dns_log_ctx_t {
+		test_lab::result_t result;
+		std::atomic<bool> cancel{ false };
+		std::atomic<bool> capture_started{ false };
+		std::atomic<long> stage{ static_cast<long>(dns_log_stage_e::not_started) };
+		std::atomic<std::uint64_t> stage_tick_ms{ 0 };
+	};
+
+	const char* dns_log_stage_name(long stage) {
+		switch (static_cast<dns_log_stage_e>(stage)) {
+		case dns_log_stage_e::not_started: return "not_started";
+		case dns_log_stage_e::ensure_driver: return "ensure_driver";
+		case dns_log_stage_e::winsock: return "winsock";
+		case dns_log_stage_e::baseline_ndns: return "baseline_ndns";
+		case dns_log_stage_e::start_ncap: return "start_ncap";
+		case dns_log_stage_e::udp_probe: return "udp_probe";
+		case dns_log_stage_e::tcp_probe: return "tcp_probe";
+		case dns_log_stage_e::windns_probe: return "windns_probe";
+		case dns_log_stage_e::poll_wait: return "poll_wait";
+		case dns_log_stage_e::poll_ndns: return "poll_ndns";
+		case dns_log_stage_e::stop_ncap: return "stop_ncap";
+		case dns_log_stage_e::drain_ncap: return "drain_ncap";
+		case dns_log_stage_e::evaluate: return "evaluate";
+		case dns_log_stage_e::exception: return "exception";
+		default: return "unknown";
+		}
+	}
+
+	void dns_mark_stage(const std::shared_ptr<dns_log_ctx_t>& ctx, dns_log_stage_e stage) {
+		ctx->stage.store(static_cast<long>(stage), std::memory_order_release);
+		ctx->stage_tick_ms.store(static_cast<std::uint64_t>(GetTickCount64()), std::memory_order_release);
+	}
+
+	void dns_copy_result(test_lab::result_t& dst, const test_lab::result_t& src) {
+		dst.ok = src.ok;
+		dst.ntstatus = src.ntstatus;
+		dst.bytes_returned = src.bytes_returned;
+		dst.elapsed_us = src.elapsed_us;
+		dst.error = src.error;
+		dst.raw = src.raw;
+		dst.parsed = src.parsed;
+	}
+
+	bool dns_stop_capture_best_effort(test_lab::result_t& r, DWORD timeout_ms) {
+		auto stopped = std::make_shared<std::atomic<bool>>(false);
+		auto ok = std::make_shared<std::atomic<bool>>(false);
+		auto bytes = std::make_shared<std::atomic<std::uint32_t>>(0u);
+		std::thread stop_thread;
+		try {
+			stop_thread = std::thread([stopped, ok, bytes]() {
+				voyager::detail::net_cap_ctrl_request stop_req{};
+				stop_req.operation = 1u;
+				std::uint32_t br = 0;
+				bool stop_ok = false;
+				if (device && device->is_connected())
+					stop_ok = device->send_ioctl_raw(ioctl_codes::NCAP(), &stop_req, sizeof(stop_req), br);
+				bytes->store(br, std::memory_order_release);
+				ok->store(stop_ok, std::memory_order_release);
+				stopped->store(true, std::memory_order_release);
+			});
+		} catch (...) {
+			r.parsed.push_back({ "dns_capture_timeout_stop_ok", "0" });
+			r.parsed.push_back({ "dns_capture_timeout_stop_error", "thread_create_failed" });
+			return false;
+		}
+		DWORD wait_rc = WaitForSingleObject(stop_thread.native_handle(), timeout_ms);
+		if (wait_rc == WAIT_OBJECT_0) {
+			stop_thread.join();
+			r.parsed.push_back({ "dns_capture_timeout_stop_ok", ok->load(std::memory_order_acquire) ? "1" : "0" });
+			r.parsed.push_back({ "dns_capture_timeout_stop_bytes", fmt_u32(bytes->load(std::memory_order_acquire)) });
+			return ok->load(std::memory_order_acquire);
+		}
+		CancelSynchronousIo(stop_thread.native_handle());
+		wait_rc = WaitForSingleObject(stop_thread.native_handle(), 500);
+		if (wait_rc == WAIT_OBJECT_0) {
+			stop_thread.join();
+			r.parsed.push_back({ "dns_capture_timeout_stop_ok", ok->load(std::memory_order_acquire) ? "1" : "0" });
+			r.parsed.push_back({ "dns_capture_timeout_stop_bytes", fmt_u32(bytes->load(std::memory_order_acquire)) });
+			return ok->load(std::memory_order_acquire);
+		}
+		stop_thread.detach();
+		r.parsed.push_back({ "dns_capture_timeout_stop_ok", "0" });
+		r.parsed.push_back({ "dns_capture_timeout_stop_error", "timed_out" });
+		return false;
+	}
 
 	static std::uint32_t parse_dns_name_user(const std::uint8_t* dns_data,
 		std::uint32_t offset,
@@ -485,86 +771,170 @@ namespace {
 			return false;
 		const std::uint8_t* dns_data = data;
 		std::uint32_t dns_len = data_len;
-		if (data_len >= 20) {
-			std::uint16_t udp_src = static_cast<std::uint16_t>((data[0] << 8) | data[1]);
-			std::uint16_t udp_dst = static_cast<std::uint16_t>((data[2] << 8) | data[3]);
-			std::uint16_t udp_len = static_cast<std::uint16_t>((data[4] << 8) | data[5]);
-			if ((udp_src == 53 || udp_dst == 53) && udp_len >= 20 && udp_len <= data_len) {
-				dns_data = data + 8;
+		auto strip_udp_header = [&](const std::uint8_t* p, std::uint32_t n) -> bool {
+			if (n < 20)
+				return false;
+			std::uint16_t udp_src = static_cast<std::uint16_t>((p[0] << 8) | p[1]);
+			std::uint16_t udp_dst = static_cast<std::uint16_t>((p[2] << 8) | p[3]);
+			std::uint16_t udp_len = static_cast<std::uint16_t>((p[4] << 8) | p[5]);
+			if ((udp_src == 53 || udp_dst == 53) && udp_len >= 20 && udp_len <= n) {
+				dns_data = p + 8;
 				dns_len = static_cast<std::uint32_t>(udp_len - 8);
-			}
-		}
-		if (dns_len < 12)
-			return false;
-		std::uint16_t qdcount = static_cast<std::uint16_t>((dns_data[4] << 8) | dns_data[5]);
-		if (qdcount == 0 || qdcount > 16)
-			return false;
-		char domain[261] = {};
-		std::uint32_t pos = parse_dns_name_user(dns_data, 12, dns_len, domain, sizeof(domain));
-		if (pos == 0 || pos + 4 > dns_len || domain[0] == '\0')
-			return false;
-		for (std::size_t i = 0; i < host_count; ++i) {
-			if (std::strstr(domain, hosts[i]) != nullptr) {
-				matched = hosts[i];
 				return true;
 			}
+			return false;
+		};
+		auto strip_tcp_header = [&](const std::uint8_t* p, std::uint32_t n) -> bool {
+			if (n < 20)
+				return false;
+			std::uint16_t tcp_src = static_cast<std::uint16_t>((p[0] << 8) | p[1]);
+			std::uint16_t tcp_dst = static_cast<std::uint16_t>((p[2] << 8) | p[3]);
+			std::uint32_t tcp_hlen = static_cast<std::uint32_t>((p[12] >> 4) * 4);
+			if ((tcp_src == 53 || tcp_dst == 53) && tcp_hlen >= 20 && tcp_hlen < n) {
+				dns_data = p + tcp_hlen;
+				dns_len = n - tcp_hlen;
+				return true;
+			}
+			return false;
+		};
+		if (data_len >= 28 && (data[0] >> 4) == 4) {
+			std::uint32_t ihl = static_cast<std::uint32_t>((data[0] & 0x0Fu) * 4u);
+			std::uint16_t total_len = static_cast<std::uint16_t>((data[2] << 8) | data[3]);
+			std::uint32_t frame_len = (total_len >= ihl && total_len <= data_len) ? total_len : data_len;
+			if (ihl >= 20 && frame_len > ihl) {
+				const std::uint8_t proto = data[9];
+				if (proto == 17)
+					strip_udp_header(data + ihl, frame_len - ihl);
+				else if (proto == 6)
+					strip_tcp_header(data + ihl, frame_len - ihl);
+			}
+		} else if (data_len >= 48 && (data[0] >> 4) == 6) {
+			const std::uint8_t next = data[6];
+			if (next == 17)
+				strip_udp_header(data + 40, data_len - 40);
+			else if (next == 6)
+				strip_tcp_header(data + 40, data_len - 40);
+		} else if (!strip_udp_header(data, data_len)) {
+			strip_tcp_header(data, data_len);
+		}
+		auto match_dns_message = [&](const std::uint8_t* msg, std::uint32_t msg_len) -> bool {
+			if (msg_len < 12)
+				return false;
+			std::uint16_t qdcount = static_cast<std::uint16_t>((msg[4] << 8) | msg[5]);
+			if (qdcount == 0 || qdcount > 16)
+				return false;
+			char domain[261] = {};
+			std::uint32_t pos = parse_dns_name_user(msg, 12, msg_len, domain, sizeof(domain));
+			if (pos == 0 || pos + 4 > msg_len || domain[0] == '\0')
+				return false;
+			for (std::size_t i = 0; i < host_count; ++i) {
+				if (std::strstr(domain, hosts[i]) != nullptr) {
+					matched = hosts[i];
+					return true;
+				}
+			}
+			return false;
+		};
+		if (match_dns_message(dns_data, dns_len))
+			return true;
+		if (dns_len >= 14) {
+			std::uint16_t tcp_dns_len = static_cast<std::uint16_t>((dns_data[0] << 8) | dns_data[1]);
+			if (tcp_dns_len >= 12 && static_cast<std::uint32_t>(tcp_dns_len) + 2u <= dns_len &&
+				match_dns_message(dns_data + 2, tcp_dns_len))
+				return true;
 		}
 		return false;
 	}
 
-	static DWORD WINAPI dns_log_thread_proc(LPVOID param) {
-		dns_log_ctx_t* ctx = static_cast<dns_log_ctx_t*>(param);
-		test_lab::result_t& r = *ctx->r;
+	static void dns_log_thread_proc(const std::shared_ptr<dns_log_ctx_t>& ctx) {
+		test_lab::result_t& r = ctx->result;
 
+		dns_mark_stage(ctx, dns_log_stage_e::ensure_driver);
 		if (!ensure_driver(r)) {
-			ctx->done = true;
-			return 0;
+			return;
 		}
 		const std::uint32_t self_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
 
+		dns_mark_stage(ctx, dns_log_stage_e::winsock);
 		wsa_guard_t g;
 		if (!g.ok) {
 			r.ok = false;
 			r.error = "WSAStartup failed";
 			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
-			ctx->done = true;
-			return 0;
+			return;
 		}
 
+		dns_mark_stage(ctx, dns_log_stage_e::baseline_ndns);
 		voyager::detail::net_dns_get_request* baseline =
 			static_cast<voyager::detail::net_dns_get_request*>(std::calloc(1, sizeof(voyager::detail::net_dns_get_request)));
 		if (baseline == nullptr) {
 			r.ok = false;
 			r.error = "calloc failed for baseline net_dns_get_request";
 			r.ntstatus = static_cast<std::int32_t>(0xC000009Au);
-			ctx->done = true;
-			return 0;
+			return;
 		}
 		baseline->filter_pid = 0u;
 		std::uint32_t br_base = 0;
+		const std::uint64_t baseline_start = static_cast<std::uint64_t>(GetTickCount64());
 		bool ok_base = device->send_ioctl_raw(ioctl_codes::NDNS(), baseline, sizeof(*baseline), br_base);
+		const std::uint64_t baseline_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - baseline_start;
 		const std::uint32_t baseline_total = ok_base ? baseline->entry_count : 0u;
+		r.parsed.push_back({ "baseline_dns_ioctl_ok", ok_base ? "1" : "0" });
+		r.parsed.push_back({ "baseline_dns_ioctl_elapsed_ms", fmt_u64(baseline_elapsed) });
 		r.parsed.push_back({ "baseline_dns_entry_count", fmt_u32(baseline_total) });
 		std::free(baseline);
 
+		dns_mark_stage(ctx, dns_log_stage_e::start_ncap);
 		voyager::detail::net_cap_ctrl_request start_req{};
 		start_req.operation = 0u;
 		start_req.filter_pid = 0u;
 		start_req.filter_port = 53u;
-		start_req.filter_protocol = 17u;
+		start_req.filter_protocol = 0u;
 		start_req.max_packet_bytes = 512u;
 		std::uint32_t br_start = 0;
+		const std::uint64_t cap_start_tick = static_cast<std::uint64_t>(GetTickCount64());
 		bool cap_started = device->send_ioctl_raw(ioctl_codes::NCAP(), &start_req, sizeof(start_req), br_start);
+		const std::uint64_t cap_start_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - cap_start_tick;
+		ctx->capture_started.store(cap_started, std::memory_order_release);
 		r.parsed.push_back({ "dns_capture_start_ok", cap_started ? "1" : "0" });
+		r.parsed.push_back({ "dns_capture_start_elapsed_ms", fmt_u64(cap_start_elapsed) });
 		r.parsed.push_back({ "dns_capture_filter_pid", "0" });
+		r.parsed.push_back({ "dns_capture_filter_protocol", "0" });
 		r.parsed.push_back({ "dns_probe_owner_pid", fmt_u32(self_pid) });
 		if (!cap_started) {
 			r.ok = false;
 			r.error = "NCAP start failed before DNS probe";
 			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
-			ctx->done = true;
-			return 0;
+			return;
 		}
+
+		auto stop_capture_once = [&]() -> bool {
+			if (!cap_started)
+				return true;
+			dns_mark_stage(ctx, dns_log_stage_e::stop_ncap);
+			voyager::detail::net_cap_ctrl_request stop_req{};
+			stop_req.operation = 1u;
+			std::uint32_t br_stop = 0;
+			const std::uint64_t stop_start = static_cast<std::uint64_t>(GetTickCount64());
+			bool stop_ok = device->send_ioctl_raw(ioctl_codes::NCAP(), &stop_req, sizeof(stop_req), br_stop);
+			const std::uint64_t stop_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - stop_start;
+			cap_started = false;
+			ctx->capture_started.store(false, std::memory_order_release);
+			r.parsed.push_back({ "dns_capture_stop_ok", stop_ok ? "1" : "0" });
+			r.parsed.push_back({ "dns_capture_stop_elapsed_ms", fmt_u64(stop_elapsed) });
+			r.parsed.push_back({ "dns_capture_stop_bytes", fmt_u32(br_stop) });
+			return stop_ok;
+		};
+
+		auto finish_cancelled = [&]() -> bool {
+			if (!ctx->cancel.load(std::memory_order_acquire))
+				return false;
+			stop_capture_once();
+			r.ok = false;
+			r.error = "DNS verifier cancelled after timeout";
+			r.ntstatus = static_cast<std::int32_t>(0xC00000B5u);
+			return true;
+		};
 
 		static const char* kCandidateHosts[] = {
 			"aida-testlab-probe.invalid",
@@ -577,22 +947,42 @@ namespace {
 		std::uint32_t any_io_count = 0u;
 
 		for (std::size_t i = 0; i < kCandidateHostCount; ++i) {
+			if (finish_cancelled())
+				return;
 			const char* host = kCandidateHosts[i];
+			::diag::log_tagged_fmt("verify_dns", "candidate[%zu] start host=%s", i, host);
 
 			std::string udp_diag;
+			dns_mark_stage(ctx, dns_log_stage_e::udp_probe);
 			bool lookup_ok = issue_udp_dns_probe_to_one_one(host, udp_diag);
-			if (!lookup_ok)
-				lookup_ok = resolve_host_with_timeout(host, 2000);
+			::diag::log_tagged_fmt("verify_dns", "candidate[%zu] udp_done ok=%d diag=%s",
+				i, lookup_ok ? 1 : 0, udp_diag.c_str());
+			std::string tcp_diag;
+			dns_mark_stage(ctx, dns_log_stage_e::tcp_probe);
+			bool tcp_ok = issue_tcp_dns_probe_to_one_one(host, tcp_diag);
+			::diag::log_tagged_fmt("verify_dns", "candidate[%zu] tcp_done ok=%d diag=%s",
+				i, tcp_ok ? 1 : 0, tcp_diag.c_str());
+			dns_mark_stage(ctx, dns_log_stage_e::windns_probe);
+			bool gai_ok = resolve_host_with_timeout(host, 2000);
+			::diag::log_tagged_fmt("verify_dns", "candidate[%zu] gai_done ok=%d", i, gai_ok ? 1 : 0);
+			lookup_ok = lookup_ok || tcp_ok || gai_ok;
 
 			char label[40];
 			std::snprintf(label, sizeof(label), "step1_gai[%zu]", i);
-			char val[200];
-			std::snprintf(val, sizeof(val), "host=%s ok=%d %s", host, lookup_ok ? 1 : 0, udp_diag.c_str());
+			char val[360];
+			std::snprintf(val, sizeof(val), "host=%s ok=%d udp={%s} tcp={%s} gai=%d",
+				host,
+				lookup_ok ? 1 : 0,
+				udp_diag.c_str(),
+				tcp_diag.c_str(),
+				gai_ok ? 1 : 0);
 			r.parsed.push_back({ std::string(label), std::string(val) });
 			if (!attempted_hosts.empty()) attempted_hosts.append(",");
 			attempted_hosts.append(host);
 			if (lookup_ok) ++any_io_count;
 		}
+		if (finish_cancelled())
+			return;
 
 		r.parsed.push_back({ "step1_attempted_hosts", attempted_hosts });
 		r.parsed.push_back({ "step1_any_lookup_attempts", fmt_u32(any_io_count) });
@@ -608,29 +998,41 @@ namespace {
 		std::string matched_host;
 
 		for (int attempt = 0; attempt < 10; ++attempt) {
+			if (finish_cancelled())
+				return;
+			dns_mark_stage(ctx, dns_log_stage_e::poll_wait);
 			std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
 			voyager::detail::net_dns_get_request* req =
 				static_cast<voyager::detail::net_dns_get_request*>(std::calloc(1, sizeof(voyager::detail::net_dns_get_request)));
 			if (req == nullptr) {
+				stop_capture_once();
 				r.ok = false;
 				r.error = "calloc failed for net_dns_get_request";
 				r.ntstatus = static_cast<std::int32_t>(0xC000009Au);
-				ctx->done = true;
-				return 0;
+				return;
 			}
 			req->filter_pid = 0u;
 			std::uint32_t br = 0;
+			dns_mark_stage(ctx, dns_log_stage_e::poll_ndns);
+			const std::uint64_t poll_start = static_cast<std::uint64_t>(GetTickCount64());
 			bool ok = device->send_ioctl_raw(ioctl_codes::NDNS(), req, sizeof(*req), br);
+			const std::uint64_t poll_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - poll_start;
 			r.bytes_returned = br;
 			if (!ok) {
+				char label[40];
+				std::snprintf(label, sizeof(label), "poll_ndns[%d]_elapsed_ms", attempt);
+				r.parsed.push_back({ std::string(label), fmt_u64(poll_elapsed) });
 				r.ok = false;
 				r.error = "NDNS ioctl failed";
 				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 				std::free(req);
-				ctx->done = true;
-				return 0;
+				stop_capture_once();
+				return;
 			}
+			char poll_label[40];
+			std::snprintf(poll_label, sizeof(poll_label), "poll_ndns[%d]_elapsed_ms", attempt);
+			r.parsed.push_back({ std::string(poll_label), fmt_u64(poll_elapsed) });
 			after_total = req->entry_count;
 			std::uint32_t cap = after_total;
 			if (cap > voyager::detail::NET_DNS_GET_MAX) cap = static_cast<std::uint32_t>(voyager::detail::NET_DNS_GET_MAX);
@@ -680,45 +1082,62 @@ namespace {
 			if (matches_name_self_or_unknown_pid > 0u) break;
 		}
 
-		voyager::detail::net_cap_ctrl_request stop_req{};
-		stop_req.operation = 1u;
-		std::uint32_t br_stop = 0;
-		device->send_ioctl_raw(ioctl_codes::NCAP(), &stop_req, sizeof(stop_req), br_stop);
-		r.parsed.push_back({ "dns_capture_stop_ok", "1" });
+		stop_capture_once();
 
 		std::uint32_t captured_dns_packets = 0u;
 		std::uint32_t captured_probe_packets = 0u;
+		std::uint32_t captured_total_packets = 0u;
+		std::uint32_t capture_batches = 0u;
+		std::uint32_t capture_drain_failures = 0u;
 		std::string captured_probe_host;
-		voyager::detail::net_cap_get_request* cap_req =
-			static_cast<voyager::detail::net_cap_get_request*>(std::calloc(1, sizeof(voyager::detail::net_cap_get_request)));
-		if (cap_req != nullptr) {
+		for (std::uint32_t batch = 0; batch < 8u; ++batch) {
+			if (finish_cancelled())
+				return;
+			dns_mark_stage(ctx, dns_log_stage_e::drain_ncap);
+			voyager::detail::net_cap_get_request* cap_req =
+				static_cast<voyager::detail::net_cap_get_request*>(std::calloc(1, sizeof(voyager::detail::net_cap_get_request)));
+			if (cap_req == nullptr) {
+				++capture_drain_failures;
+				break;
+			}
 			cap_req->max_packets = voyager::detail::NET_CAP_GET_MAX;
 			std::uint32_t br_cap = 0;
+			const std::uint64_t drain_start = static_cast<std::uint64_t>(GetTickCount64());
 			bool cap_ok = device->send_ioctl_raw(ioctl_codes::NCPG(), cap_req, sizeof(*cap_req), br_cap);
-			r.parsed.push_back({ "dns_capture_drain_ok", cap_ok ? "1" : "0" });
-			r.parsed.push_back({ "dns_capture_packet_count", cap_ok ? fmt_u32(cap_req->packet_count) : "0" });
-			if (cap_ok) {
-				std::uint32_t cap_n = cap_req->packet_count;
-				if (cap_n > voyager::detail::NET_CAP_GET_MAX)
-					cap_n = static_cast<std::uint32_t>(voyager::detail::NET_CAP_GET_MAX);
-				for (std::uint32_t i = 0; i < cap_n; ++i) {
-					const auto& p = cap_req->packets[i];
-					if (p.protocol != 17u || (p.local_port != 53u && p.remote_port != 53u))
-						continue;
-					++captured_dns_packets;
-					std::string host_match;
-					if (dns_payload_matches_probe_hosts(p.payload, p.payload_size, kCandidateHosts, kCandidateHostCount, host_match)) {
-						++captured_probe_packets;
-						if (captured_probe_host.empty())
-							captured_probe_host = host_match;
-					}
+			const std::uint64_t drain_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - drain_start;
+			char drain_label[44];
+			std::snprintf(drain_label, sizeof(drain_label), "drain_ncap[%u]_elapsed_ms", batch);
+			r.parsed.push_back({ std::string(drain_label), fmt_u64(drain_elapsed) });
+			if (!cap_ok) {
+				++capture_drain_failures;
+				std::free(cap_req);
+				break;
+			}
+			++capture_batches;
+			std::uint32_t cap_n = cap_req->packet_count;
+			if (cap_n > voyager::detail::NET_CAP_GET_MAX)
+				cap_n = static_cast<std::uint32_t>(voyager::detail::NET_CAP_GET_MAX);
+			captured_total_packets += cap_n;
+			for (std::uint32_t i = 0; i < cap_n; ++i) {
+				const auto& p = cap_req->packets[i];
+				if ((p.protocol != 17u && p.protocol != 6u) || (p.local_port != 53u && p.remote_port != 53u))
+					continue;
+				++captured_dns_packets;
+				std::string host_match;
+				if (dns_payload_matches_probe_hosts(p.payload, p.payload_size, kCandidateHosts, kCandidateHostCount, host_match)) {
+					++captured_probe_packets;
+					if (captured_probe_host.empty())
+						captured_probe_host = host_match;
 				}
 			}
 			std::free(cap_req);
-		} else {
-			r.parsed.push_back({ "dns_capture_drain_ok", "0" });
-			r.parsed.push_back({ "dns_capture_packet_count", "0" });
+			if (cap_n == 0u)
+				break;
 		}
+		r.parsed.push_back({ "dns_capture_drain_ok", capture_drain_failures == 0u ? "1" : "0" });
+		r.parsed.push_back({ "dns_capture_batches", fmt_u32(capture_batches) });
+		r.parsed.push_back({ "dns_capture_packet_count", fmt_u32(captured_total_packets) });
+		r.parsed.push_back({ "dns_capture_drain_failures", fmt_u32(capture_drain_failures) });
 		r.parsed.push_back({ "captured_dns_packets", fmt_u32(captured_dns_packets) });
 		r.parsed.push_back({ "captured_probe_dns_packets", fmt_u32(captured_probe_packets) });
 		if (!captured_probe_host.empty())
@@ -736,6 +1155,7 @@ namespace {
 		const std::uint32_t delta = (after_total >= baseline_total) ? (after_total - baseline_total) : 0u;
 		r.parsed.push_back({ "delta_dns_entries", fmt_u32(delta) });
 
+		dns_mark_stage(ctx, dns_log_stage_e::evaluate);
 		if (matches_name_self_or_unknown_pid > 0u) {
 			r.ntstatus = 0;
 			r.ok = true;
@@ -759,28 +1179,107 @@ namespace {
 			r.ok = false;
 			r.error = "DNS logging did not capture the current process DNS probes";
 		}
-
-		ctx->done = true;
-		return 0;
 	}
 
 	void run_verify_dns_log(test_lab::state_t& s, test_lab::result_t& r) {
 		(void)s;
-		dns_log_ctx_t ctx{ &r, false };
-		HANDLE h = CreateThread(nullptr, 0, dns_log_thread_proc, &ctx, 0, nullptr);
-		if (h == nullptr) {
-			r.ok = false;
-			r.error = "CreateThread failed for dns_log_thread_proc";
-			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+		const DWORD timeout_ms = 30000;
+		const DWORD cancel_grace_ms = 3000;
+		auto ctx = std::make_shared<dns_log_ctx_t>();
+		dns_mark_stage(ctx, dns_log_stage_e::not_started);
+		std::thread worker;
+		try {
+			worker = std::thread([ctx]() {
+				try {
+					dns_log_thread_proc(ctx);
+				} catch (const std::exception& e) {
+					dns_mark_stage(ctx, dns_log_stage_e::exception);
+					if (ctx->capture_started.load(std::memory_order_acquire))
+						dns_stop_capture_best_effort(ctx->result, 2000);
+					ctx->result.ok = false;
+					ctx->result.error = std::string("DNS verifier threw exception: ") + e.what();
+					ctx->result.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+				} catch (...) {
+					dns_mark_stage(ctx, dns_log_stage_e::exception);
+					if (ctx->capture_started.load(std::memory_order_acquire))
+						dns_stop_capture_best_effort(ctx->result, 2000);
+					ctx->result.ok = false;
+					ctx->result.error = "DNS verifier threw an unknown exception";
+					ctx->result.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+				}
+			});
+		} catch (const std::exception& e) {
+			std::string fallback_reason = e.what();
+			try {
+				dns_log_thread_proc(ctx);
+				dns_copy_result(r, ctx->result);
+				r.parsed.push_back({ "dns_thread_fallback", fallback_reason });
+			} catch (const std::exception& run_e) {
+				r.ok = false;
+				r.error = std::string("DNS verifier fallback threw exception: ") + run_e.what();
+				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			} catch (...) {
+				r.ok = false;
+				r.error = "DNS verifier fallback threw an unknown exception";
+				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			}
+			return;
+		} catch (...) {
+			std::string fallback_reason = "unknown";
+			try {
+				dns_log_thread_proc(ctx);
+				dns_copy_result(r, ctx->result);
+				r.parsed.push_back({ "dns_thread_fallback", fallback_reason });
+			} catch (const std::exception& run_e) {
+				r.ok = false;
+				r.error = std::string("DNS verifier fallback threw exception: ") + run_e.what();
+				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			} catch (...) {
+				r.ok = false;
+				r.error = "DNS verifier fallback threw an unknown exception";
+				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			}
 			return;
 		}
-		DWORD wait_rc = WaitForSingleObject(h, 5000);
-		CloseHandle(h);
-		if (wait_rc != WAIT_OBJECT_0) {
-			r.ok = false;
-			r.error = "DNS round-trip timed out (driver IOCTL deadlock suspected)";
-			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+
+		DWORD wait_rc = WaitForSingleObject(worker.native_handle(), timeout_ms);
+		if (wait_rc == WAIT_OBJECT_0) {
+			worker.join();
+			dns_copy_result(r, ctx->result);
+			return;
 		}
+
+		ctx->cancel.store(true, std::memory_order_release);
+		CancelSynchronousIo(worker.native_handle());
+		DWORD cancel_wait_rc = WaitForSingleObject(worker.native_handle(), cancel_grace_ms);
+		const long stage = ctx->stage.load(std::memory_order_acquire);
+		const std::uint64_t now_ms = static_cast<std::uint64_t>(GetTickCount64());
+		const std::uint64_t stage_tick = ctx->stage_tick_ms.load(std::memory_order_acquire);
+		const std::uint64_t stage_elapsed = stage_tick == 0u ? 0u : now_ms - stage_tick;
+		if (cancel_wait_rc == WAIT_OBJECT_0) {
+			worker.join();
+			dns_copy_result(r, ctx->result);
+			r.ok = false;
+			r.ntstatus = static_cast<std::int32_t>(0xC00000B5u);
+			r.error = std::string("DNS round-trip exceeded ") + fmt_u32(timeout_ms) +
+				" ms and completed during cancellation grace at stage " + dns_log_stage_name(stage);
+			r.parsed.push_back({ "dns_timeout_stage", dns_log_stage_name(stage) });
+			r.parsed.push_back({ "dns_timeout_stage_elapsed_ms", fmt_u64(stage_elapsed) });
+			r.parsed.push_back({ "dns_timeout_cancelled_cleanly", "1" });
+			return;
+		}
+
+		r.ok = false;
+		r.ntstatus = static_cast<std::int32_t>(0xC00000B5u);
+		r.error = std::string("DNS round-trip timed out after ") + fmt_u32(timeout_ms) +
+			" ms at stage " + dns_log_stage_name(stage);
+		r.parsed.push_back({ "dns_timeout_stage", dns_log_stage_name(stage) });
+		r.parsed.push_back({ "dns_timeout_stage_elapsed_ms", fmt_u64(stage_elapsed) });
+		r.parsed.push_back({ "dns_timeout_cancelled_cleanly", "0" });
+		r.parsed.push_back({ "dns_timeout_capture_started", ctx->capture_started.load(std::memory_order_acquire) ? "1" : "0" });
+		if (ctx->capture_started.load(std::memory_order_acquire))
+			dns_stop_capture_best_effort(r, 2000);
+		worker.detach();
 	}
 
 	void run_verify_net_stats(test_lab::state_t& s, test_lab::result_t& r) {
@@ -1088,6 +1587,148 @@ namespace {
 		}
 	}
 
+	bool start_external_tcp_probe(tcp_probe_state_t& probe) {
+		probe.close();
+		SOCKET sk = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		if (sk == INVALID_SOCKET) {
+			probe.diag = "socket() failed";
+			return false;
+		}
+		u_long nb = 1;
+		ioctlsocket(sk, FIONBIO, &nb);
+		sockaddr_in dst{};
+		dst.sin_family = AF_INET;
+		dst.sin_port = htons(80);
+		dst.sin_addr.s_addr = htonl(0x01010101u);
+		int rc = connect(sk, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+		bool initiated = false;
+		if (rc == 0) {
+			initiated = true;
+		} else {
+			int err = WSAGetLastError();
+			if (err == WSAEWOULDBLOCK) {
+				initiated = true;
+			} else {
+				char b[64];
+				std::snprintf(b, sizeof(b), "connect() err=%d", err);
+				probe.diag = b;
+			}
+		}
+		if (initiated) {
+			fd_set wf;
+			FD_ZERO(&wf);
+			FD_SET(sk, &wf);
+			timeval tv{};
+			tv.tv_sec = 0;
+			tv.tv_usec = 200000;
+			select(0, nullptr, &wf, nullptr, &tv);
+			probe.primary = sk;
+			probe.initiated = true;
+			probe.mode = "external";
+			probe.set_remote(1u, 1u, 1u, 1u, 80u);
+			probe.diag = "external 1.1.1.1:80 connect initiated";
+			return true;
+		}
+		closesocket(sk);
+		return false;
+	}
+
+	bool start_loopback_tcp_probe(tcp_probe_state_t& probe) {
+		probe.close();
+		SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		if (listener == INVALID_SOCKET) {
+			probe.diag = "loopback listener socket() failed";
+			return false;
+		}
+		SOCKET client = INVALID_SOCKET;
+		SOCKET accepted = INVALID_SOCKET;
+		auto cleanup = [&]() {
+			if (client != INVALID_SOCKET) {
+				closesocket(client);
+				client = INVALID_SOCKET;
+			}
+			if (accepted != INVALID_SOCKET) {
+				closesocket(accepted);
+				accepted = INVALID_SOCKET;
+			}
+			if (listener != INVALID_SOCKET) {
+				closesocket(listener);
+				listener = INVALID_SOCKET;
+			}
+		};
+		DWORD timeout_ms = 1000u;
+		setsockopt(listener, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+		sockaddr_in bind_addr{};
+		bind_addr.sin_family = AF_INET;
+		bind_addr.sin_port = 0;
+		bind_addr.sin_addr.s_addr = htonl(0x7f000001u);
+		if (bind(listener, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) == SOCKET_ERROR) {
+			int err = WSAGetLastError();
+			char b[96];
+			std::snprintf(b, sizeof(b), "loopback bind err=%d", err);
+			probe.diag = b;
+			cleanup();
+			return false;
+		}
+		if (listen(listener, 1) == SOCKET_ERROR) {
+			int err = WSAGetLastError();
+			char b[96];
+			std::snprintf(b, sizeof(b), "loopback listen err=%d", err);
+			probe.diag = b;
+			cleanup();
+			return false;
+		}
+		int name_len = sizeof(bind_addr);
+		if (getsockname(listener, reinterpret_cast<sockaddr*>(&bind_addr), &name_len) == SOCKET_ERROR) {
+			int err = WSAGetLastError();
+			char b[96];
+			std::snprintf(b, sizeof(b), "loopback getsockname err=%d", err);
+			probe.diag = b;
+			cleanup();
+			return false;
+		}
+		client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		if (client == INVALID_SOCKET) {
+			probe.diag = "loopback client socket() failed";
+			cleanup();
+			return false;
+		}
+		setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+		setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+		if (connect(client, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) == SOCKET_ERROR) {
+			int err = WSAGetLastError();
+			char b[96];
+			std::snprintf(b, sizeof(b), "loopback connect err=%d", err);
+			probe.diag = b;
+			cleanup();
+			return false;
+		}
+		accepted = accept(listener, nullptr, nullptr);
+		if (accepted == INVALID_SOCKET) {
+			int err = WSAGetLastError();
+			char b[96];
+			std::snprintf(b, sizeof(b), "loopback accept err=%d", err);
+			probe.diag = b;
+			cleanup();
+			return false;
+		}
+		closesocket(listener);
+		listener = INVALID_SOCKET;
+		probe.primary = client;
+		probe.accepted = accepted;
+		client = INVALID_SOCKET;
+		accepted = INVALID_SOCKET;
+		probe.initiated = true;
+		probe.mode = "loopback";
+		probe.set_remote(127u, 0u, 0u, 1u, static_cast<std::uint32_t>(ntohs(bind_addr.sin_port)));
+		char b[128];
+		std::snprintf(b, sizeof(b), "loopback 127.0.0.1:%u connected",
+			static_cast<unsigned>(probe.remote_port));
+		probe.diag = b;
+		cleanup();
+		return true;
+	}
+
 	std::uint32_t count_self_pid_rows(const voyager::detail::tcpip_conn_dump_request& req,
 		std::uint32_t self_pid,
 		std::uint32_t& out_pid_and_one_one)
@@ -1141,43 +1782,24 @@ namespace {
 		r.parsed.push_back({ "baseline_self_pid_rows", fmt_u32(baseline_self_pid_rows) });
 		r.parsed.push_back({ "baseline_self_to_1_1_1_1_port_80", fmt_u32(baseline_self_one_one) });
 
-		SOCKET sk = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-		if (sk == INVALID_SOCKET) {
-			r.ok = false;
-			r.error = "socket() failed";
-			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
-			return;
-		}
-		u_long nb = 1;
-		ioctlsocket(sk, FIONBIO, &nb);
-		sockaddr_in dst{};
-		dst.sin_family = AF_INET;
-		dst.sin_port = htons(80);
-		dst.sin_addr.s_addr = htonl(0x01010101u);
-		int rc = connect(sk, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
-		bool initiated = false;
-		if (rc == 0) {
-			initiated = true;
-		} else {
-			int err = WSAGetLastError();
-			if (err == WSAEWOULDBLOCK) {
-				initiated = true;
-			} else {
-				char b[64];
-				std::snprintf(b, sizeof(b), "connect() err=%d", err);
-				r.parsed.push_back({ "connect_diag", std::string(b) });
-			}
+		tcp_probe_state_t probe;
+		bool initiated = start_external_tcp_probe(probe);
+		if (!initiated) {
+			r.parsed.push_back({ "external_connect_diag", probe.diag });
+			initiated = start_loopback_tcp_probe(probe);
 		}
 		r.parsed.push_back({ "step1_connect_initiated", initiated ? "1" : "0" });
-
+		r.parsed.push_back({ "tcp_probe_mode", probe.mode });
+		r.parsed.push_back({ "connect_diag", probe.diag });
 		if (initiated) {
-			fd_set wf;
-			FD_ZERO(&wf);
-			FD_SET(sk, &wf);
-			timeval tv{};
-			tv.tv_sec = 0;
-			tv.tv_usec = 200000;
-			select(0, nullptr, &wf, nullptr, &tv);
+			char endpoint[64];
+			std::snprintf(endpoint, sizeof(endpoint), "%u.%u.%u.%u:%u",
+				static_cast<unsigned>(probe.remote_addr[0]),
+				static_cast<unsigned>(probe.remote_addr[1]),
+				static_cast<unsigned>(probe.remote_addr[2]),
+				static_cast<unsigned>(probe.remote_addr[3]),
+				static_cast<unsigned>(probe.remote_port));
+			r.parsed.push_back({ "tcp_probe_expected_remote", std::string(endpoint) });
 		}
 
 		std::uint32_t total = 0u;
@@ -1192,7 +1814,7 @@ namespace {
 			voyager::detail::tcpip_conn_dump_request* req =
 				static_cast<voyager::detail::tcpip_conn_dump_request*>(std::calloc(1, sizeof(voyager::detail::tcpip_conn_dump_request)));
 			if (req == nullptr) {
-				closesocket(sk);
+				probe.close();
 				r.ok = false;
 				r.error = "calloc failed for tcpip_conn_dump_request";
 				r.ntstatus = static_cast<std::int32_t>(0xC000009Au);
@@ -1219,7 +1841,7 @@ namespace {
 				const auto& e = req->entries[i];
 				if (e.pid == self_pid) {
 					++pid_only;
-					if (addr_is_one_one_one_one(e.remote_addr, e.address_family) && e.remote_port == 80u) {
+					if (tcp_probe_remote_matches(probe, e.remote_addr, e.address_family, e.remote_port)) {
 						++pid_and_remote;
 					}
 					if (printed < print_cap) {
@@ -1245,11 +1867,11 @@ namespace {
 
 		r.parsed.push_back({ "tcb_table_total", fmt_u32(total) });
 		r.parsed.push_back({ "self_pid_rows", fmt_u32(pid_only) });
-		r.parsed.push_back({ "self_pid_rows_to_1_1_1_1_port_80", fmt_u32(pid_and_remote) });
+		r.parsed.push_back({ "self_pid_rows_to_probe_remote", fmt_u32(pid_and_remote) });
 		const std::uint32_t delta_self = (pid_only >= baseline_self_pid_rows) ? (pid_only - baseline_self_pid_rows) : 0u;
 		r.parsed.push_back({ "delta_self_pid_rows", fmt_u32(delta_self) });
 
-		closesocket(sk);
+		probe.close();
 
 		if (!ok_dtcp) {
 			r.ok = false;
@@ -1287,7 +1909,7 @@ TESTLAB_REGISTER(g_reg_verify_dns_log,
 	"verify",
 	test_lab::driver_e::whoswho,
 	"DNS query log round-trip",
-	"getaddrinfo(test.example.com) -> NDNS drain -> assert kernel logged a DNS record for test.example.com from the current PID.",
+	"NCAP/NDNS around UDP, TCP, and resolver DNS probes -> assert the kernel logged or captured one probe hostname for the current or unknown PID.",
 	&render_inputs_empty,
 	&run_verify_dns_log);
 

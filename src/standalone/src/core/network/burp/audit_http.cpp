@@ -134,11 +134,14 @@ bool set_nonblocking(SOCKET s, bool nb)
 
 bool wait_socket(SOCKET s, int timeout_ms, bool for_write)
 {
+    if (timeout_ms <= 0) return false;
     WSAPOLLFD pfd{};
     pfd.fd = s;
     pfd.events = static_cast<short>(for_write ? POLLOUT : POLLIN);
     int rc = WSAPoll(&pfd, 1, timeout_ms);
-    return rc > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) == 0;
+    if (rc <= 0 || (pfd.revents & POLLNVAL) != 0) return false;
+    const short wanted = static_cast<short>(for_write ? POLLOUT : (POLLIN | POLLRDNORM));
+    return (pfd.revents & wanted) != 0 && (pfd.revents & POLLERR) == 0;
 }
 
 bool tcp_connect(SOCKET s, const sockaddr* sa, int sa_len, int timeout_ms)
