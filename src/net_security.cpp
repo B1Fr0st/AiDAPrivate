@@ -1574,8 +1574,7 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
         }
     }
 
-    result.success = (result.decrypted_packets > 0) || !result.error_message.empty();
-    if (result.decrypted_packets > 0) result.success = true;
+    result.success = (result.decrypted_packets > 0);
 
     return result;
 }

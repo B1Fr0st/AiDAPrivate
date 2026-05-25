@@ -1,5 +1,14 @@
 #pragma once
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <windows.h>
+
 #include <atomic>
 #include "work_queue.hpp"
 #include <algorithm>
@@ -428,6 +437,37 @@ inline std::vector<uint64_t> find_pattern_in_region(const uint8_t* data, size_t 
 	return hits;
 }
 
+inline bool read_target_region(uint32_t pid, uint64_t address, size_t size, std::vector<uint8_t>& out)
+{
+	out.clear();
+	if (size == 0)
+		return false;
+
+	if (pid != 0) {
+		HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+		if (hp) {
+			out.resize(size);
+			SIZE_T br = 0;
+			BOOL ok = ReadProcessMemory(hp, reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(address)), out.data(), size, &br);
+			DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
+			CloseHandle(hp);
+			if (ok && br > 0) {
+				out.resize(static_cast<size_t>(br));
+				return true;
+			}
+			out.clear();
+			diag::log_tagged_fmt("crypto_scan", "read_target_region rpm failed pid=%u addr=0x%llX size=%zu gle=%lu bytes=%llu",
+				pid,
+				static_cast<unsigned long long>(address),
+				size,
+				static_cast<unsigned long>(gle),
+				static_cast<unsigned long long>(br));
+		}
+	}
+
+	return driver_bridge::read_memory(address, size, out) && !out.empty();
+}
+
 }
 
 inline std::vector<crypto_signature_t> get_signatures()
@@ -561,6 +601,7 @@ struct process_scan_config_t {
 	size_t      max_hits = 0;
 	uint32_t    timeout_ms = 0;
 	std::string module_filter;
+	bool        label_references = true;
 };
 
 inline void scan_process(const process_scan_config_t& cfg)
@@ -615,6 +656,7 @@ inline void scan_process(const process_scan_config_t& cfg)
 			signatures.push_back(sig);
 		}
 
+		uint32_t pid = driver_bridge::attached_pid();
 		auto regions = driver_bridge::enumerate_memory_regions(4096);
 		auto modules = driver_bridge::enumerate_modules();
 
@@ -675,7 +717,7 @@ inline void scan_process(const process_scan_config_t& cfg)
 			uint64_t remaining = cfg.max_bytes == 0 ? region.size : cfg.max_bytes - scanned;
 			uint64_t read_size64 = (std::min)(region.size, remaining);
 			size_t read_size = static_cast<size_t>((std::min)(read_size64, static_cast<uint64_t>(0x10000000)));
-			driver_bridge::read_memory(region.base, read_size, data);
+			detail::read_target_region(pid, region.base, read_size, data);
 			if (data.empty()) {
 				scanned += read_size64;
 				g_state.progress.store(static_cast<float>(scanned) / static_cast<float>(total_bytes));
@@ -724,7 +766,7 @@ inline void scan_process(const process_scan_config_t& cfg)
 			g_state.progress.store(static_cast<float>(scanned) / static_cast<float>(total_bytes));
 		}
 
-		if (!g_state.cancel.load())
+		if (!g_state.cancel.load() && cfg.label_references)
 			auto_label_references();
 
 		auto t_end = std::chrono::steady_clock::now();

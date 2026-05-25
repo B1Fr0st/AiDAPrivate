@@ -490,6 +490,15 @@ void set_error_locked(const std::string& msg)
     diag::log_tagged("camoufox", msg.c_str());
 }
 
+void clear_error_locked()
+{
+    if (!sg().last_error.empty())
+    {
+        diag::log_tagged_fmt("camoufox", "clearing_last_error previous_len=%zu", sg().last_error.size());
+        sg().last_error.clear();
+    }
+}
+
 bool parse_text_to_json(const std::string& text, nlohmann::json& out)
 {
     if (text.empty())
@@ -539,6 +548,105 @@ call_result_t to_bridge_result(const mcp_client::call_result_t& r)
     return out;
 }
 
+std::string trim_ascii_lower(std::string s)
+{
+    size_t first = 0;
+    while (first < s.size())
+    {
+        char c = s[first];
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') break;
+        ++first;
+    }
+    size_t last = s.size();
+    while (last > first)
+    {
+        char c = s[last - 1];
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') break;
+        --last;
+    }
+    std::string out = s.substr(first, last - first);
+    for (char& c : out)
+    {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+    }
+    return out;
+}
+
+bool is_document_click_selector(const std::string& selector)
+{
+    const std::string s = trim_ascii_lower(selector);
+    return s == "body" || s == "html" || s == ":root" || s == "document" || s == "document.body";
+}
+
+call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::json& args, int timeout_ms);
+
+std::string evaluate_result_error(const call_result_t& r)
+{
+    if (!r.error.empty()) return r.error;
+    try
+    {
+        if (r.data.is_object())
+        {
+            auto err = r.data.find("error");
+            if (err != r.data.end() && err->is_string()) return err->get<std::string>();
+            auto value = r.data.find("value");
+            if (value != r.data.end() && value->is_object())
+            {
+                auto value_err = value->find("error");
+                if (value_err != value->end() && value_err->is_string()) return value_err->get<std::string>();
+            }
+        }
+    }
+    catch (...) {}
+    return {};
+}
+
+bool dispatch_dom_click(const std::string& selector, std::string& out_error)
+{
+    const std::string quoted = nlohmann::json(selector).dump();
+    std::string expr;
+    expr.reserve(quoted.size() + 2400);
+    expr += "(()=>{";
+    expr += "const selector=" + quoted + ";";
+    expr += "const normalized=String(selector).trim().toLowerCase();";
+    expr += "const directDocument=normalized==='document'||normalized==='document.body';";
+    expr += "const el=directDocument?(document.body||document.documentElement):document.querySelector(selector);";
+    expr += "if(!el)return {error:'Element not found: '+selector};";
+    expr += "const target=el===document?document.body||document.documentElement:el;";
+    expr += "if(!target)return {error:'No clickable target: '+selector};";
+    expr += "let rect={left:0,top:0,width:1,height:1};";
+    expr += "try{if(target.getBoundingClientRect)rect=target.getBoundingClientRect();}catch(e){}";
+    expr += "const vw=window.innerWidth||document.documentElement.clientWidth||1;";
+    expr += "const vh=window.innerHeight||document.documentElement.clientHeight||1;";
+    expr += "let x=rect.left+(rect.width>0?rect.width/2:1);";
+    expr += "let y=rect.top+(rect.height>0?rect.height/2:1);";
+    expr += "x=Math.max(0,Math.min(vw-1,Math.round(x)));";
+    expr += "y=Math.max(0,Math.min(vh-1,Math.round(y)));";
+    expr += "if(target.scrollIntoView)try{target.scrollIntoView({block:'center',inline:'center',behavior:'instant'});}catch(e){}";
+    expr += "const init={bubbles:true,cancelable:true,composed:true,view:window,button:0,buttons:1,clientX:x,clientY:y,screenX:x,screenY:y};";
+    expr += "function fire(type){let ev=null;try{ev=type.indexOf('pointer')===0&&window.PointerEvent?new PointerEvent(type,Object.assign({pointerId:1,pointerType:'mouse',isPrimary:true},init)):new MouseEvent(type,init);}catch(e){ev=document.createEvent('MouseEvents');ev.initMouseEvent(type,true,true,window,1,x,y,x,y,false,false,false,false,0,null);}target.dispatchEvent(ev);}";
+    expr += "try{if(target.focus)target.focus({preventScroll:true});}catch(e){}";
+    expr += "fire('pointerover');fire('mouseover');fire('pointermove');fire('mousemove');fire('pointerdown');fire('mousedown');fire('pointerup');fire('mouseup');";
+    expr += "if(typeof target.click==='function')target.click();else fire('click');";
+    expr += "return {status:'clicked',selector:selector,mode:'dom_dispatch',x:x,y:y};";
+    expr += "})()";
+
+    nlohmann::json args;
+    args["expression"] = expr;
+    args["await_promise"] = false;
+    call_result_t r = call_with_deadline("evaluate_js", args, 15000);
+    out_error = evaluate_result_error(r);
+    if (!r.ok || !out_error.empty())
+    {
+        if (out_error.empty()) out_error = "DOM click dispatch failed";
+        diag::log_tagged_fmt("camoufox", "dispatch_dom_click failed selector=%s ok=%d err=%s",
+            selector.c_str(), static_cast<int>(r.ok), out_error.c_str());
+        return false;
+    }
+    diag::log_tagged_fmt("camoufox", "dispatch_dom_click ok selector=%s", selector.c_str());
+    return true;
+}
+
 call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::json& args, int timeout_ms)
 {
     call_result_t fail;
@@ -547,19 +655,51 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
     std::shared_ptr<mcp_client::client_t> cli;
     {
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
-        if (sg().state != bridge_state_t::ready || !sg().client)
+        if (sg().state == bridge_state_t::ready && sg().client)
         {
+            cli = sg().client;
+        }
+    }
+
+    if (!cli)
+    {
+        bridge_state_t old_state = bridge_state_t::stopped;
+        bool had_client = false;
+        std::string old_error;
+        {
+            std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+            old_state = sg().state;
+            had_client = sg().client != nullptr;
+            old_error = sg().last_error;
+        }
+        diag::log_tagged_fmt("camoufox", "call_with_deadline recovering tool=%s state=%d client=%d old_err_len=%zu",
+            tool_name.c_str(), static_cast<int>(old_state), static_cast<int>(had_client), old_error.size());
+        if (!ensure_ready())
+        {
+            std::lock_guard<std::recursive_mutex> lk(sg().mtx);
             fail.error = sg().last_error;
             if (fail.error.empty())
-                fail.error = sg().state == bridge_state_t::stopped
+                fail.error = old_state == bridge_state_t::stopped
                     ? "camoufox bridge is not running; call burp_headless_start with headless=false first"
                     : "camoufox bridge not ready";
-            diag::log_tagged_fmt("camoufox", "call_with_deadline rejected tool=%s state=%d client=%d err_len=%zu args_shape=%s",
+            diag::log_tagged_fmt("camoufox", "call_with_deadline recovery_failed tool=%s state=%d client=%d err_len=%zu args_shape=%s",
                 tool_name.c_str(), static_cast<int>(sg().state), static_cast<int>(sg().client != nullptr),
                 fail.error.size(), json_shape(args).c_str());
             return fail;
         }
-        cli = sg().client;
+        {
+            std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+            if (sg().state == bridge_state_t::ready && sg().client)
+                cli = sg().client;
+            else
+                fail.error = sg().last_error.empty() ? std::string("camoufox bridge not ready after recovery") : sg().last_error;
+        }
+        if (!cli)
+        {
+            diag::log_tagged_fmt("camoufox", "call_with_deadline recovery_no_client tool=%s err=%s",
+                tool_name.c_str(), fail.error.c_str());
+            return fail;
+        }
     }
 
     if (timeout_ms <= 0) timeout_ms = 30000;
@@ -600,17 +740,31 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
     bool got = state->cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&state]() { return state->done; });
     if (!got)
     {
+        std::shared_ptr<mcp_client::client_t> timed_out_client;
         {
             std::lock_guard<std::recursive_mutex> g(sg().mtx);
-            if (sg().client)
+            if (sg().client == cli)
             {
-                diag::log_tagged_fmt("camoufox", "timeout %dms on %s; disconnecting", timeout_ms, tool_name.c_str());
-                sg().client->disconnect();
+                timed_out_client = sg().client;
+                sg().client.reset();
+                diag::log_tagged_fmt("camoufox", "timeout %dms on %s; detaching client for recovery", timeout_ms, tool_name.c_str());
                 sg().state           = bridge_state_t::error;
                 sg().last_error      = std::string("call_tool timeout: ") + tool_name;
                 sg().browser_open    = false;
                 sg().active_page_url.clear();
             }
+            else
+            {
+                diag::log_tagged_fmt("camoufox", "timeout %dms on %s; current client already changed", timeout_ms, tool_name.c_str());
+            }
+        }
+        if (timed_out_client)
+        {
+            std::thread([timed_out_client, tool_name]() {
+                diag::log_tagged_fmt("camoufox", "timeout_disconnect_async start tool=%s", tool_name.c_str());
+                timed_out_client->disconnect();
+                diag::log_tagged_fmt("camoufox", "timeout_disconnect_async done tool=%s", tool_name.c_str());
+            }).detach();
         }
         publish_state(bridge_state_t::error, std::string("timeout on ") + tool_name);
         sg().total_errors.fetch_add(1, std::memory_order_relaxed);
@@ -627,6 +781,7 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
     {
         std::lock_guard<std::recursive_mutex> g(sg().mtx);
         sg().last_call_ms = now_ms();
+        if (out.ok) clear_error_locked();
     }
     if (!out.ok) sg().total_errors.fetch_add(1, std::memory_order_relaxed);
     bridge_call_completed_t ev{tool_name, out.ok, now_ms() - t0};
@@ -831,6 +986,15 @@ bool start_bridge(const launch_config_t& cfg)
     }
     diag::log_tagged_fmt("camoufox", "start_bridge state->starting");
 
+    if (sg().client)
+    {
+        diag::log_tagged_fmt("camoufox", "start_bridge disconnecting_stale_client state=%d browser_open=%d",
+            static_cast<int>(sg().state), static_cast<int>(sg().browser_open));
+        sg().client->disconnect();
+        sg().client.reset();
+        sg().browser_open = false;
+        sg().active_page_url.clear();
+    }
     sg().state          = bridge_state_t::starting;
     sg().last_error.clear();
     publish_state(bridge_state_t::starting, std::string());
@@ -956,6 +1120,7 @@ bool start_bridge(const launch_config_t& cfg)
 
     sg().browser_open = true;
     sg().state        = bridge_state_t::ready;
+    sg().last_error.clear();
     diag::log_tagged_fmt("camoufox", "bridge ready (python=%s)", python_path.c_str());
     publish_state(bridge_state_t::ready, std::string());
     return true;
@@ -1024,10 +1189,16 @@ bool ensure_ready()
             return false;
         }
     }
-    diag::log_tagged_fmt("camoufox", "ensure_ready starting_bridge python=%s", st.python_path.c_str());
     launch_config_t cfg;
+    {
+        std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+        cfg = sg().active_cfg;
+    }
     cfg.headless = false;
-    cfg.python_executable = st.python_path;
+    if (cfg.server_module.empty()) cfg.server_module = "camoufox_reverse_mcp";
+    if (cfg.python_executable.empty()) cfg.python_executable = st.python_path;
+    diag::log_tagged_fmt("camoufox", "ensure_ready starting_bridge python=%s module=%s has_proxy=%d",
+        cfg.python_executable.c_str(), cfg.server_module.c_str(), static_cast<int>(!cfg.proxy.empty()));
     return start_bridge(cfg);
 }
 
@@ -1454,6 +1625,18 @@ bool click(const std::string& selector)
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         set_error_locked("click: selector is empty");
         return false;
+    }
+    if (is_document_click_selector(selector))
+    {
+        std::string dispatch_error;
+        if (!dispatch_dom_click(selector, dispatch_error))
+        {
+            std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+            set_error_locked(std::string("click failed: ") + dispatch_error);
+            return false;
+        }
+        diag::log_tagged_fmt("camoufox", "click ok selector=%s mode=dom_dispatch", selector.c_str());
+        return true;
     }
     nlohmann::json a;
     a["selector"] = selector;

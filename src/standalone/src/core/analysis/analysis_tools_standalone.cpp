@@ -102,6 +102,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			cfg.max_bytes = params.value("max_bytes", static_cast<uint64_t>(0));
 			cfg.max_hits = params.value("max_hits", static_cast<size_t>(0));
 			cfg.timeout_ms = bounded_u32_param(params, "timeout_ms", 4500, 100, 60000);
+			cfg.label_references = false;
 			diag::log_tagged_fmt("analysis", "scan_crypto_constants entry module_filter='%s' max_regions=%zu max_bytes=%llu max_hits=%zu timeout_ms=%u",
 				cfg.module_filter.c_str(),
 				cfg.max_regions,
@@ -1873,6 +1874,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			cfg.max_bytes = params.value("max_bytes", static_cast<uint64_t>(0));
 			cfg.max_hits = params.value("max_hits", static_cast<size_t>(0));
 			cfg.timeout_ms = bounded_u32_param(params, "timeout_ms", 4500, 100, 60000);
+			cfg.label_references = false;
 			diag::log_tagged_fmt("analysis", "crypto_scanner_run entry module_filter='%s' max_regions=%zu max_bytes=%llu max_hits=%zu timeout_ms=%u",
 				cfg.module_filter.c_str(),
 				cfg.max_regions,

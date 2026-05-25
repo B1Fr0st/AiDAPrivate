@@ -320,6 +320,16 @@ namespace {
             name == "taint_trace_register";
     }
 
+    bool tool_allows_host_dependency_skip(const std::string& name) {
+        static const std::set<std::string> names = {
+            "sandbox_execute",
+            "network_decrypt_capture",
+            "firefox_profile_prepare",
+            "firefox_profile_launch"
+        };
+        return names.find(name) != names.end();
+    }
+
     bool json_u64_field(const mcp_standalone::json& j, const char* key, uint64_t& out) {
         if (!key || !j.is_object() || !j.contains(key))
             return false;
@@ -4175,6 +4185,10 @@ namespace {
                     ++covered;
                     log_msg(hf, tag, "INFO -- registered tool \"%s\" covered by live-target precondition skip after attempted=%d skipped=%d",
                         t.name.c_str(), st.attempted, st.skipped);
+                } else if (tool_allows_host_dependency_skip(t.name) && st.skipped > 0 && st.failed == 0 && st.timed_out == 0) {
+                    ++covered;
+                    log_msg(hf, tag, "INFO -- registered tool \"%s\" covered by explicit host-dependency skip after attempted=%d skipped=%d",
+                        t.name.c_str(), st.attempted, st.skipped);
                 } else {
                     ++no_pass;
                     log_msg(hf, tag, "NO-PASS -- registered tool \"%s\" attempted=%d failed=%d skipped=%d timed_out=%d",
@@ -4290,7 +4304,6 @@ namespace {
     }
 
     void test_tool_sandbox_execute(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
         const char* tool_name = "sandbox_execute";
         mcp_standalone::json args;
         args["path"] = "C:\\Windows\\System32\\cmd.exe";
@@ -4318,10 +4331,10 @@ namespace {
              text_lc.find("windows sandbox") != std::string::npos ||
              text_lc.find("not available") != std::string::npos ||
              text_lc.find("not installed") != std::string::npos)) {
-            log_msg(hf, "mcp.sandbox_execute.guard", "PASS -- sandbox_execute reported explicit Windows Sandbox availability diagnostic without host execution: %s",
+            log_msg(hf, "mcp.sandbox_execute.guard", "SKIP -- Windows Sandbox host dependency unavailable: %s",
                 compact_text(ir.text, 700).c_str());
-            record_tool_status(tool_name, mcp_tool_call_status_t::passed);
-            passed.fetch_add(1);
+            record_tool_status(tool_name, mcp_tool_call_status_t::skipped);
+            skipped.fetch_add(1);
             return;
         }
         std::string stdout_text;
@@ -5714,11 +5727,48 @@ namespace {
     }
 
     void test_tool_dbg_find_code_caves(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntdll_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.dbg_find_code_caves", "SKIP -- ntdll not loaded"); skipped.fetch_add(1); return; }
+        const char* tool_name = "dbg_find_code_caves";
+        const char* tag = "mcp.dbg_find_code_caves";
+        uint64_t addr = 0;
+        std::vector<uint8_t> bytes(256, 0x00);
+        if (!ensure_mcp_private_bytes(hf, tag, addr, bytes.size(), bytes)) {
+            record_precondition_skipped_tool(tool_name, skipped);
+            return;
+        }
         mcp_standalone::json args;
-        args["address"] = addr;
-        test_tool_call(hf, "mcp.dbg_find_code_caves", get_server(), "dbg_find_code_caves", args, passed, failed, skipped);
+        args["address"] = hex_u64(addr);
+        args["size"] = static_cast<uint32_t>(bytes.size());
+        args["min_cave_size"] = 64;
+        g_invoked_tools.insert(tool_name);
+        auto timed = invoke_tool_bounded(get_server(), tool_name, args, tool_timeout_ms(tool_name));
+        const auto& ir = timed.result;
+        log_mcp_result_detail("completed", 0, tool_name, args, ir, timed.elapsed_ms, "");
+        if (!timed.timed_out)
+            driver_bridge::free_memory(addr);
+        if (timed.timed_out || !ir.found || ir.threw || !ir.success) {
+            log_msg(hf, tag, "FAIL -- dbg_find_code_caves dispatch failed found=%s threw=%s success=%s timeout=%s err=%s",
+                ir.found ? "true" : "false",
+                ir.threw ? "true" : "false",
+                ir.success ? "true" : "false",
+                timed.timed_out ? "true" : "false",
+                compact_text(ir.exception_msg.empty() ? ir.text : ir.exception_msg, 700).c_str());
+            record_tool_status(tool_name, timed.timed_out ? mcp_tool_call_status_t::timed_out : mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
+        uint64_t count = 0;
+        payload_u64_field(ir.data, "count", count);
+        if (count > 0) {
+            log_msg(hf, tag, "PASS -- dbg_find_code_caves found %llu deterministic private code cave(s)",
+                static_cast<unsigned long long>(count));
+            record_tool_status(tool_name, mcp_tool_call_status_t::passed);
+            passed.fetch_add(1);
+            return;
+        }
+        log_msg(hf, tag, "FAIL -- dbg_find_code_caves returned success without finding the deterministic private zero-filled cave: %s",
+            compact_text(ir.text, 700).c_str());
+        record_tool_status(tool_name, mcp_tool_call_status_t::failed);
+        failed.fetch_add(1);
     }
 
     void test_tool_dbg_conditional_breakpoint(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -7420,7 +7470,6 @@ namespace {
     }
 
     void test_tool_firefox_profile_prepare(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
         mcp_standalone::json args;
         args["proxy_host"] = "127.0.0.1";
         args["proxy_port"] = 18443;
@@ -7441,6 +7490,15 @@ namespace {
             return;
         }
         if (ir.success) {
+            bool firefox_detected = false;
+            payload_bool_field(ir.data, "firefox_detected", firefox_detected);
+            if (!firefox_detected) {
+                log_msg(hf, "mcp.firefox_profile_prepare.guard", "SKIP -- Firefox host dependency unavailable after profile prepare diagnostic: %s",
+                    compact_text(ir.text, 700).c_str());
+                record_tool_status(tool_name, mcp_tool_call_status_t::skipped);
+                skipped.fetch_add(1);
+                return;
+            }
             log_msg(hf, "mcp.firefox_profile_prepare.guard", "PASS -- Firefox profile prepare completed success=%s",
                 compact_text(ir.text, 700).c_str());
             record_tool_status(tool_name, mcp_tool_call_status_t::passed);
@@ -7455,11 +7513,19 @@ namespace {
             bool runtime_checked = true;
             bool runtime_valid = true;
             bool prepared = true;
+            bool firefox_detected = false;
             payload_bool_field(status_ir.data, "profile_files_valid", profile_files_valid);
             payload_bool_field(status_ir.data, "trust_readiness_verified", trust_verified);
             payload_bool_field(status_ir.data, "runtime_validation_performed", runtime_checked);
             payload_bool_field(status_ir.data, "runtime_validation_valid", runtime_valid);
             payload_bool_field(status_ir.data, "prepared", prepared);
+            payload_bool_field(status_ir.data, "firefox_detected", firefox_detected);
+            if (!status_timed.timed_out && status_ir.found && !status_ir.threw && status_ir.success && !firefox_detected) {
+                log_msg(hf, "mcp.firefox_profile_prepare.guard", "SKIP -- Firefox host dependency unavailable; profile file diagnostics were recorded without counting as runtime success");
+                record_tool_status(tool_name, mcp_tool_call_status_t::skipped);
+                skipped.fetch_add(1);
+                return;
+            }
             if (!status_timed.timed_out && status_ir.found && !status_ir.threw && status_ir.success &&
                 profile_files_valid && !trust_verified && !runtime_checked && !runtime_valid && !prepared) {
                 log_msg(hf, "mcp.firefox_profile_prepare.guard", "PASS -- Firefox profile files prepared; current-user CA trust is explicitly reported as unavailable without mutating trust stores");
@@ -7485,7 +7551,6 @@ namespace {
     }
 
     void test_tool_firefox_profile_launch(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
         mcp_standalone::json args;
         args["proxy_host"] = "127.0.0.1";
         args["proxy_port"] = 18443;
@@ -7507,10 +7572,18 @@ namespace {
         bool launched = true;
         bool runtime_checked = true;
         bool runtime_valid = true;
+        bool firefox_detected = false;
         bool has_validate_note = payload_text_contains(ir, "launch validation only");
         payload_bool_field(ir.data, "launched", launched);
         payload_bool_field(ir.data, "runtime_validation_performed", runtime_checked);
         payload_bool_field(ir.data, "runtime_validation_valid", runtime_valid);
+        payload_bool_field(ir.data, "firefox_detected", firefox_detected);
+        if (!firefox_detected) {
+            log_msg(hf, "mcp.firefox_profile_launch.guard", "SKIP -- Firefox host dependency unavailable for launch validation");
+            record_tool_status("firefox_profile_launch", mcp_tool_call_status_t::skipped);
+            skipped.fetch_add(1);
+            return;
+        }
         if (!launched && !runtime_checked && !runtime_valid && has_validate_note) {
             log_msg(hf, "mcp.firefox_profile_launch.guard", "PASS -- Firefox launch readiness is behaviorally validated without starting a browser");
             record_tool_status("firefox_profile_launch", mcp_tool_call_status_t::passed);
@@ -7590,7 +7663,6 @@ namespace {
     }
 
     void test_tool_network_decrypt_capture(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
         const char* tool_name = "network_decrypt_capture";
         const char* tag = "mcp.network_decrypt_capture";
         const std::string pcap_path = temp_file_narrow("aida_mcp_empty_tls_fixture.pcap");
@@ -7635,15 +7707,20 @@ namespace {
         }
         if (text_lc.find("tshark not found") != std::string::npos ||
             text_lc.find("failed to launch tshark") != std::string::npos) {
-            log_msg(hf, tag, "PASS -- network_decrypt_capture emitted explicit tshark dependency diagnostic for deterministic pcap/keylog fixture: %s",
+            log_msg(hf, tag, "SKIP -- tshark host dependency unavailable for deterministic pcap/keylog fixture: %s",
                 compact_text(ir.text, 900).c_str());
-            record_tool_status(tool_name, mcp_tool_call_status_t::passed);
-            passed.fetch_add(1);
+            record_tool_status(tool_name, mcp_tool_call_status_t::skipped);
+            skipped.fetch_add(1);
             return;
         }
-        if (ir.success || text_lc.find("no matching packets") != std::string::npos || text_lc.find("no packets matched") != std::string::npos) {
-            log_msg(hf, tag, "PASS -- network_decrypt_capture exercised deterministic pcap/keylog fixture success=%d text=%s",
-                ir.success ? 1 : 0,
+        uint64_t decrypted_packets = 0;
+        uint64_t total_packets = 0;
+        payload_u64_field(ir.data, "decrypted_packets", decrypted_packets);
+        payload_u64_field(ir.data, "total_packets", total_packets);
+        if (ir.success && decrypted_packets > 0) {
+            log_msg(hf, tag, "PASS -- network_decrypt_capture decrypted deterministic pcap/keylog fixture packets=%llu total=%llu text=%s",
+                static_cast<unsigned long long>(decrypted_packets),
+                static_cast<unsigned long long>(total_packets),
                 compact_text(ir.text, 700).c_str());
             record_tool_status(tool_name, mcp_tool_call_status_t::passed);
             passed.fetch_add(1);

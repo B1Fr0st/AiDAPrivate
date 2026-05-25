@@ -232,6 +232,8 @@ namespace {
 	{
 		if (!probe.initiated || probe.remote_port == 0u || port != probe.remote_port)
 			return false;
+		if (probe.mode == "loopback" && addr_is_v4_endpoint(addr, family, 0u, 0u, 0u, 0u))
+			return true;
 		return addr_is_v4_endpoint(addr,
 			family,
 			probe.remote_addr[0],
@@ -1565,7 +1567,7 @@ namespace {
 		} else {
 			r.parsed.push_back({ "step2_sandbox_root", sandbox_root_utf8 });
 		}
-		const char* sandbox_cow_parent_utf8 = "C:\\Users\\Public\\Desktop\\aida_sandbox_test\\__cow\\Users\\Public\\Desktop\\";
+		const char* sandbox_cow_parent_utf8 = "C:\\Users\\Public\\Desktop\\aida_sandbox_test\\__cow\\Users\\Public\\Documents\\";
 		DWORD cow_err = 0u;
 		bool cow_ok = ensure_directory_tree_ascii(sandbox_cow_parent_utf8, &cow_err);
 		r.parsed.push_back({ "step2_cow_parent", sandbox_cow_parent_utf8 });
@@ -1600,7 +1602,8 @@ namespace {
 		r.parsed.push_back({ "baseline_copies", fmt_u64(static_cast<std::uint64_t>(before.copies)) });
 		r.parsed.push_back({ "baseline_denials", fmt_u64(static_cast<std::uint64_t>(before.denials)) });
 
-		const char* test_path = "C:\\Users\\Public\\Desktop\\aida_outside_sandbox_test.txt";
+		const char* test_path = "C:\\Users\\Public\\Documents\\aida_outside_sandbox_test.txt";
+		DeleteFileA(test_path);
 		HANDLE h = CreateFileA(test_path,
 			GENERIC_WRITE,
 			FILE_SHARE_READ,
@@ -1666,15 +1669,10 @@ namespace {
 
 		bool any_change = (d_red > 0) || (d_cop > 0) || (d_den > 0);
 		if (!write_complete) {
-			if (any_change) {
-				r.ntstatus = 0;
-				r.ok = true;
-				r.parsed.push_back({ "shadowfs_write_materialization_degraded", "1" });
-			} else {
-				r.ok = false;
-				r.error = !create_ok ? "ShadowFS write probe did not exercise CreateFileA successfully" : "ShadowFS write probe did not complete WriteFile successfully";
-				r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
-			}
+			r.ok = false;
+			r.error = !create_ok ? "ShadowFS write probe did not exercise CreateFileA successfully" : "ShadowFS write probe did not complete WriteFile successfully";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			r.parsed.push_back({ "shadowfs_write_materialization_degraded", any_change ? "1" : "0" });
 		} else if (any_change) {
 			r.ntstatus = 0;
 			r.ok = true;
@@ -1991,8 +1989,9 @@ namespace {
 			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
 			r.parsed.push_back({ "tcpip_pass_path", "none_probe_not_initiated" });
 		} else if (delta_self > 0u) {
-			r.ok = true;
-			r.ntstatus = 0;
+			r.ok = false;
+			r.error = "DTCP captured self-PID rows but none matched the expected remote endpoint";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
 			r.parsed.push_back({ "tcpip_pass_path", "self_pid_delta_endpoint_degraded" });
 			r.parsed.push_back({ "tcpip_endpoint_attribution_degraded", "1" });
 		} else if (pid_only > 0u) {
