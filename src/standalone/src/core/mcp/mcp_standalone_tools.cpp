@@ -1405,6 +1405,17 @@ namespace mcp_standalone
     {
         diag::log_tagged_fmt("mcp_tools", "register_standalone_tools entry");
 
+        srv.register_tool({"get_tool_descriptions",
+            "Return full descriptions and parameter schemas for selected MCP tool names.",
+            {{"names", "array", "Tool names to describe", false},
+             {"name", "string", "Single tool name to describe", false},
+             {"prefix", "string", "Tool name prefix to search", false},
+             {"query", "string", "Tool name or description search text", false},
+             {"limit", "number", "Maximum matching tools to return", false},
+             {"include_schema", "boolean", "Include parameter names, types, and descriptions", false}},
+            true,
+            [&srv](const json& params) { return srv.describe_tools(params); }});
+
         srv.register_tool({"driver_load", "Load and connect the kernel driver backend for deep runtime analysis.", {}, false, handle_driver_load});
         srv.register_tool({"driver_detach", "Detach from the current live process.", {}, false, handle_driver_detach});
         srv.register_tool({"list_processes", "Enumerate currently running processes.",

@@ -1,6 +1,7 @@
 #include "browser_view.hpp"
 #include "browser_launch.hpp"
 #include "../mitm_proxy.hpp"
+#include "../cert_generator.hpp"
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -27,7 +28,7 @@ struct view_state_t
     char        initial_url[512] = "about:blank";
     char        profile_subdir[128] = "BurpBrowser";
     bool        prefer_chrome = false;
-    bool        ignore_cert_errors = true;
+    int         certificate_strategy = static_cast<int>(certificate_strategy_t::chromium_spki_allowlist);
     bool        clear_profile_first = false;
     int         proxy_port_override = 0;
     bool        use_proxy_override = false;
@@ -35,6 +36,10 @@ struct view_state_t
     std::atomic<bool> launching{false};
     std::mutex  status_mtx;
     float       anim_time = 0.f;
+    uint64_t    cert_status_checked_ms = 0;
+    bool        ca_ready = false;
+    bool        ca_installed = false;
+    std::string spki_prefix;
 };
 
 view_state_t& vs()
@@ -70,6 +75,33 @@ std::string format_elapsed(uint64_t launched_ms)
     return std::string(buf);
 }
 
+certificate_strategy_t selected_certificate_strategy(view_state_t& st)
+{
+    certificate_strategy_t strategy = static_cast<certificate_strategy_t>(st.certificate_strategy);
+    if (strategy == certificate_strategy_t::unsafe_ignore_all_for_debug_builds_only &&
+        !certificate_strategy_debug_only_available()) {
+        strategy = certificate_strategy_t::chromium_spki_allowlist;
+        st.certificate_strategy = static_cast<int>(strategy);
+    }
+    return strategy;
+}
+
+void refresh_cert_status(view_state_t& st)
+{
+    uint64_t now = now_ms();
+    if (st.cert_status_checked_ms != 0 && now - st.cert_status_checked_ms < 1500)
+        return;
+    st.cert_status_checked_ms = now;
+    st.ca_ready = ::cert_generator::is_ready();
+    st.ca_installed = false;
+    st.spki_prefix.clear();
+    if (st.ca_ready) {
+        const auto& ca = ::cert_generator::get_root_ca();
+        st.ca_installed = ::cert_generator::is_root_ca_installed(ca);
+        st.spki_prefix = spki_hash_prefix(::cert_generator::spki_sha256_base64(ca));
+    }
+}
+
 }
 
 void render(float pos_x, float pos_y, float width, float height,
@@ -98,11 +130,17 @@ void render(float pos_x, float pos_y, float width, float height,
     std::string edge_path, chrome_path;
     edge_ok = detect_edge_path(edge_path);
     chrome_ok = detect_chrome_path(chrome_path);
+    refresh_cert_status(st);
 
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
                        "Detected: Edge %s   Chrome %s",
                        edge_ok ? "yes" : "no",
                        chrome_ok ? "yes" : "no");
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
+                       "CA ready %s   Installed %s   SPKI %s",
+                       st.ca_ready ? "yes" : "no",
+                       st.ca_installed ? "yes" : "no",
+                       st.spki_prefix.empty() ? "-" : st.spki_prefix.c_str());
 
     ImGui::Spacing();
 
@@ -120,7 +158,28 @@ void render(float pos_x, float pos_y, float width, float height,
 
     ImGui::Checkbox("Prefer Chrome", &st.prefer_chrome);
     ImGui::SameLine();
-    ImGui::Checkbox("Ignore certificate errors", &st.ignore_cert_errors);
+    const char* strategy_names[] = {
+        "trust_store_only",
+        "chromium_spki_allowlist",
+        "unsafe_ignore_all_for_debug_builds_only"
+    };
+    int strategy_values[] = {
+        static_cast<int>(certificate_strategy_t::trust_store_only),
+        static_cast<int>(certificate_strategy_t::chromium_spki_allowlist),
+        static_cast<int>(certificate_strategy_t::unsafe_ignore_all_for_debug_builds_only)
+    };
+    int strategy_count = certificate_strategy_debug_only_available() ? 3 : 2;
+    int strategy_index = 1;
+    for (int i = 0; i < strategy_count; ++i) {
+        if (strategy_values[i] == st.certificate_strategy) {
+            strategy_index = i;
+            break;
+        }
+    }
+    ImGui::SetNextItemWidth(250.f);
+    if (ImGui::Combo("Certificate strategy", &strategy_index, strategy_names, strategy_count)) {
+        st.certificate_strategy = strategy_values[strategy_index];
+    }
     ImGui::SameLine();
     ImGui::Checkbox("Clear profile first", &st.clear_profile_first);
 
@@ -142,7 +201,7 @@ void render(float pos_x, float pos_y, float width, float height,
         cfg.initial_url = std::string(st.initial_url);
         cfg.profile_subdir = std::string(st.profile_subdir);
         cfg.prefer_chrome = st.prefer_chrome;
-        cfg.ignore_cert_errors = st.ignore_cert_errors;
+        cfg.certificate_strategy = selected_certificate_strategy(st);
         cfg.clear_profile_first = st.clear_profile_first;
         cfg.proxy_host = "127.0.0.1";
         if (st.use_proxy_override && st.proxy_port_override > 0) {
@@ -157,8 +216,9 @@ void render(float pos_x, float pos_y, float width, float height,
         st.launching.store(false);
         char buf[256];
         if (ok) {
-            _snprintf_s(buf, sizeof(buf), _TRUNCATE, "Launched pid=%u proxy=127.0.0.1:%u",
-                        pid, static_cast<unsigned>(cfg.proxy_port));
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE, "Launched pid=%u proxy=127.0.0.1:%u strategy=%s",
+                        pid, static_cast<unsigned>(cfg.proxy_port),
+                        certificate_strategy_name(cfg.certificate_strategy));
         } else {
             _snprintf_s(buf, sizeof(buf), _TRUNCATE, "Launch failed: %s", last_error().c_str());
         }
@@ -196,8 +256,10 @@ void render(float pos_x, float pos_y, float width, float height,
     const float col_pid = 72.f;
     const float col_port = 80.f;
     const float col_elapsed = 90.f;
+    const float col_strategy = 172.f;
+    const float col_spki = 88.f;
     const float col_actions = 96.f;
-    const float remain = (width - 12.f) - col_pid - col_port - col_elapsed - col_actions - 24.f;
+    const float remain = (width - 12.f) - col_pid - col_port - col_elapsed - col_strategy - col_spki - col_actions - 24.f;
     const float col_profile = std::max(160.f, remain * 0.5f);
     const float col_browser = std::max(160.f, remain - col_profile);
 
@@ -208,6 +270,8 @@ void render(float pos_x, float pos_y, float width, float height,
     dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "PID");       cx += col_pid;
     dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Proxy");     cx += col_port;
     dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Uptime");    cx += col_elapsed;
+    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Strategy");  cx += col_strategy;
+    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "SPKI");      cx += col_spki;
     dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Browser");   cx += col_browser;
     dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Profile");   cx += col_profile;
     dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Actions");
@@ -243,6 +307,11 @@ void render(float pos_x, float pos_y, float width, float height,
 
         std::string elapsed = format_elapsed(r.launched_ms);
         dl->AddText(ImVec2(lx, ty), status_col, elapsed.c_str()); lx += col_elapsed;
+
+        dl->AddText(ImVec2(lx, ty), txt, certificate_strategy_name(r.certificate_strategy)); lx += col_strategy;
+
+        const char* spki = r.spki_hash_prefix.empty() ? "-" : r.spki_hash_prefix.c_str();
+        dl->AddText(ImVec2(lx, ty), txt, spki); lx += col_spki;
 
         const char* bp = r.browser_path.c_str();
         dl->AddText(ImVec2(lx, ty), txt, bp); lx += col_browser;

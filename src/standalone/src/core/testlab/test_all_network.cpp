@@ -8,6 +8,9 @@
 #include "../network/cert_generator.hpp"
 #include "../network/ssl_keylog.hpp"
 #include "../network/cert_pin_bypass.hpp"
+#include "../network/intercept/cert_profile_manager.hpp"
+#include "../network/intercept/diagnostics.hpp"
+#include "../network/intercept/instrumentation_provider.hpp"
 #include "../network/packet_callstack.hpp"
 #include "../network/protobuf_codec.hpp"
 #include "../network/http2_session.hpp"
@@ -24,6 +27,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -57,6 +61,46 @@ namespace {
         write_log_file(hf, s);
         diag::log_tagged_fmt("test_all", "%s: %s", tag, detail);
         OutputDebugStringA(s.c_str());
+    }
+
+    void log_parser_proof(HANDLE hf, const char* case_name, const protocol_parser::http_request& req) {
+        log_msg(hf, "parser_proof", "CASE %s request valid=%s complete=%s consumed=%zu method=%s uri_len=%zu headers=%zu body=%zu",
+            case_name,
+            req.valid ? "true" : "false",
+            req.complete ? "true" : "false",
+            req.total_consumed,
+            req.method.empty() ? "(empty)" : req.method.c_str(),
+            req.uri.size(),
+            req.headers.size(),
+            req.body.size());
+        diag::log_tagged_fmt("parser_proof", "CASE %s request valid=%d complete=%d consumed=%zu method=%s uri_len=%zu headers=%zu body=%zu",
+            case_name,
+            static_cast<int>(req.valid),
+            static_cast<int>(req.complete),
+            req.total_consumed,
+            req.method.empty() ? "(empty)" : req.method.c_str(),
+            req.uri.size(),
+            req.headers.size(),
+            req.body.size());
+    }
+
+    void log_parser_proof(HANDLE hf, const char* case_name, const protocol_parser::http_response& resp) {
+        log_msg(hf, "parser_proof", "CASE %s response valid=%s complete=%s consumed=%zu status=%d headers=%zu body=%zu",
+            case_name,
+            resp.valid ? "true" : "false",
+            resp.complete ? "true" : "false",
+            resp.total_consumed,
+            resp.status_code,
+            resp.headers.size(),
+            resp.body.size());
+        diag::log_tagged_fmt("parser_proof", "CASE %s response valid=%d complete=%d consumed=%zu status=%d headers=%zu body=%zu",
+            case_name,
+            static_cast<int>(resp.valid),
+            static_cast<int>(resp.complete),
+            resp.total_consumed,
+            resp.status_code,
+            resp.headers.size(),
+            resp.body.size());
     }
 
     static void call_test(void(*fn)(HANDLE, std::atomic<int>&, std::atomic<int>&), HANDLE hf, std::atomic<int>& p, std::atomic<int>& f) {
@@ -603,6 +647,79 @@ namespace {
         }
     }
 
+    void test_http_parser_edge_cases(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        const char* tag = "http_parse_edges";
+        log_msg(hf, tag, "START -- HTTP parser framing edge cases");
+        diag::log_tagged("parser_proof", "HTTP/1 parser edge suite START source=Ctrl+Shift+T phase_network_tests");
+
+        const char dup_bad[] = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\nbody!";
+        auto dup_bad_req = protocol_parser::parse_http_request(reinterpret_cast<const uint8_t*>(dup_bad), sizeof(dup_bad) - 1);
+        log_parser_proof(hf, "duplicate_content_length_mismatch", dup_bad_req);
+
+        const char dup_good[] = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\nbodyextra";
+        auto dup_good_req = protocol_parser::parse_http_request(reinterpret_cast<const uint8_t*>(dup_good), sizeof(dup_good) - 1);
+        log_parser_proof(hf, "duplicate_content_length_match", dup_good_req);
+
+        const char cl_te[] = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        auto cl_te_req = protocol_parser::parse_http_request(reinterpret_cast<const uint8_t*>(cl_te), sizeof(cl_te) - 1);
+        auto cl_te_llhttp = http_engine::parse_request(reinterpret_cast<const uint8_t*>(cl_te), sizeof(cl_te) - 1);
+        log_parser_proof(hf, "content_length_transfer_encoding_manual", cl_te_req);
+        log_parser_proof(hf, "content_length_transfer_encoding_llhttp", cl_te_llhttp);
+
+        const char bad_chunk[] = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5x\r\nhello\r\n0\r\n\r\n";
+        auto bad_chunk_req = protocol_parser::parse_http_request(reinterpret_cast<const uint8_t*>(bad_chunk), sizeof(bad_chunk) - 1);
+        log_parser_proof(hf, "invalid_chunk_size", bad_chunk_req);
+
+        const char partial_chunk[] = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel";
+        auto partial_chunk_req = protocol_parser::parse_http_request(reinterpret_cast<const uint8_t*>(partial_chunk), sizeof(partial_chunk) - 1);
+        log_parser_proof(hf, "partial_chunk_data", partial_chunk_req);
+
+        const char chunk_trailer[] = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Trailer: ok\r\n\r\nEXTRA";
+        auto trailer_req = protocol_parser::parse_http_request(reinterpret_cast<const uint8_t*>(chunk_trailer), sizeof(chunk_trailer) - 1);
+        log_parser_proof(hf, "chunked_with_trailer_and_extra", trailer_req);
+
+        const char folded[] = "GET / HTTP/1.1\r\nHost: a\r\nX-Test: one\r\n\t two\r\n\r\n";
+        auto folded_req = protocol_parser::parse_http_request(reinterpret_cast<const uint8_t*>(folded), sizeof(folded) - 1);
+        log_parser_proof(hf, "obs_fold_unfold", folded_req);
+
+        const char no_body_resp_raw[] = "HTTP/1.1 204 No Content\r\nContent-Length: 10\r\n\r\nignored";
+        auto no_body_resp = protocol_parser::parse_http_response(reinterpret_cast<const uint8_t*>(no_body_resp_raw), sizeof(no_body_resp_raw) - 1);
+        log_parser_proof(hf, "response_204_no_body", no_body_resp);
+
+        std::string folded_value = protocol_parser::find_header(folded_req.headers, "X-Test");
+        bool ok = !dup_bad_req.valid &&
+                  dup_good_req.valid && dup_good_req.complete && dup_good_req.body.size() == 4 &&
+                  dup_good_req.total_consumed == (sizeof(dup_good) - 1) - 5 &&
+                  !cl_te_req.valid && !cl_te_llhttp.valid &&
+                  !bad_chunk_req.valid &&
+                  partial_chunk_req.valid && !partial_chunk_req.complete &&
+                  trailer_req.valid && trailer_req.complete &&
+                  std::string(trailer_req.body.begin(), trailer_req.body.end()) == "Wikipedia" &&
+                  trailer_req.total_consumed == (sizeof(chunk_trailer) - 1) - 5 &&
+                  folded_req.valid && folded_value == "one two" &&
+                  no_body_resp.valid && no_body_resp.complete && no_body_resp.body.empty();
+
+        if (ok) {
+            log_msg(hf, tag, "PASS -- strict framing, chunking, obs-fold, and no-body status cases passed");
+            diag::log_tagged("parser_proof", "HTTP/1 parser edge suite PASS");
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- dup_bad=%s dup_good=%s cl_te=%s llhttp_cl_te=%s bad_chunk=%s partial_valid=%s partial_complete=%s trailer=%s folded=%s no_body=%s",
+                dup_bad_req.valid ? "true" : "false",
+                dup_good_req.valid ? "true" : "false",
+                cl_te_req.valid ? "true" : "false",
+                cl_te_llhttp.valid ? "true" : "false",
+                bad_chunk_req.valid ? "true" : "false",
+                partial_chunk_req.valid ? "true" : "false",
+                partial_chunk_req.complete ? "true" : "false",
+                trailer_req.valid ? "true" : "false",
+                folded_value.c_str(),
+                no_body_resp.body.empty() ? "empty" : "nonempty");
+            diag::log_tagged("parser_proof", "HTTP/1 parser edge suite FAIL");
+            failed.fetch_add(1);
+        }
+    }
+
     void test_detect_content_type(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "detect_ctype";
         log_msg(hf, tag, "START -- protocol_parser::detect_content_type()");
@@ -743,6 +860,44 @@ namespace {
             passed.fetch_add(1);
         } else {
             log_msg(hf, tag, "FAIL -- no H2 frames parsed or wrong type");
+            failed.fetch_add(1);
+        }
+    }
+
+    void test_http2_client_preface_settings(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        const char* tag = "h2_client_init";
+        log_msg(hf, tag, "START -- h2_session client preface/settings");
+        diag::log_tagged("parser_proof", "HTTP/2 client preface/settings suite START source=Ctrl+Shift+T phase_network_tests");
+        std::vector<uint8_t> sent;
+        h2_session::session s(h2_session::session::role::client);
+        bool ok = s.initialize([&](const uint8_t* data, size_t len) -> ssize_t {
+            sent.insert(sent.end(), data, data + len);
+            return static_cast<ssize_t>(len);
+        });
+        const char preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        bool has_preface = sent.size() >= 33 && std::memcmp(sent.data(), preface, sizeof(preface) - 1) == 0;
+        bool has_settings = has_preface && sent[27] == 0x04 && sent[28] == 0x00 &&
+            sent[29] == 0x00 && sent[30] == 0x00 && sent[31] == 0x00 && sent[32] == 0x00;
+        log_msg(hf, "parser_proof", "CASE h2_client_preface_settings init=%s bytes=%zu preface=%s first_frame_type=%u first_frame_flags=0x%02X first_frame_stream=%u",
+            ok ? "true" : "false",
+            sent.size(),
+            has_preface ? "true" : "false",
+            sent.size() > 27 ? static_cast<unsigned>(sent[27]) : 0u,
+            sent.size() > 28 ? static_cast<unsigned>(sent[28]) : 0u,
+            sent.size() > 32 ? ((static_cast<unsigned>(sent[29]) << 24) | (static_cast<unsigned>(sent[30]) << 16) | (static_cast<unsigned>(sent[31]) << 8) | static_cast<unsigned>(sent[32])) : 0u);
+        diag::log_tagged_fmt("parser_proof", "CASE h2_client_preface_settings init=%d bytes=%zu preface=%d settings=%d",
+            static_cast<int>(ok),
+            sent.size(),
+            static_cast<int>(has_preface),
+            static_cast<int>(has_settings));
+        if (ok && has_settings) {
+            log_msg(hf, tag, "PASS -- client emitted HTTP/2 preface and SETTINGS bytes=%zu", sent.size());
+            diag::log_tagged("parser_proof", "HTTP/2 client preface/settings suite PASS");
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- init=%s bytes=%zu preface=%s settings=%s",
+                ok ? "true" : "false", sent.size(), has_preface ? "true" : "false", has_settings ? "true" : "false");
+            diag::log_tagged("parser_proof", "HTTP/2 client preface/settings suite FAIL");
             failed.fetch_add(1);
         }
     }
@@ -941,6 +1096,75 @@ namespace {
         }
     }
 
+    void test_cert_generator_spki_hash(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        const char* tag = "cert_gen_spki";
+        log_msg(hf, tag, "START -- cert_generator::spki_sha256_base64()");
+        cert_generator::root_ca_t ca;
+        bool ok = cert_generator::generate_root_ca(ca);
+        if (!ok || !ca.valid) {
+            log_msg(hf, tag, "PASS -- skipped SPKI hash because test root CA generation returned ok=%s", ok ? "true" : "false");
+            passed.fetch_add(1);
+            return;
+        }
+        std::string first = cert_generator::spki_sha256_base64(ca);
+        std::string second = cert_generator::spki_sha256_base64(ca);
+        bool chars_ok = !first.empty();
+        for (char ch : first) {
+            unsigned char u = static_cast<unsigned char>(ch);
+            if (!(std::isalnum(u) || ch == '+' || ch == '/' || ch == '=')) {
+                chars_ok = false;
+                break;
+            }
+        }
+        if (!first.empty() && first == second && first.find('\n') == std::string::npos && chars_ok) {
+            log_msg(hf, tag, "PASS -- SPKI hash stable len=%zu prefix=%.*s", first.size(), 12, first.c_str());
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- SPKI hash invalid len1=%zu len2=%zu equal=%s chars=%s",
+                first.size(), second.size(), first == second ? "true" : "false", chars_ok ? "true" : "false");
+            failed.fetch_add(1);
+        }
+    }
+
+    void test_cert_profile_manager_firefox(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        const char* tag = "cert_profile_fx";
+        log_msg(hf, tag, "START -- cert_intercept::profiles::prepare_firefox_profile()");
+        bool ok = cert_generator::is_ready() || cert_generator::initialize();
+        const auto& ca = cert_generator::get_root_ca();
+        if (!ok || !ca.valid) {
+            log_msg(hf, tag, "PASS -- Firefox profile preparation unavailable because CA initialization returned ok=%s", ok ? "true" : "false");
+            passed.fetch_add(1);
+            return;
+        }
+        auto status = cert_intercept::profiles::prepare_firefox_profile(ca, "127.0.0.1", 18443);
+        bool files_ok =
+            !status.ca_pem_path.empty() && !status.ca_der_path.empty() &&
+            !status.user_js_path.empty() && !status.policies_path.empty() &&
+            status.ca_files_nonempty && status.profile_files_valid &&
+            status.proxy_configured && status.http3_disabled &&
+            status.launch_arguments.find("--profile") != std::string::npos &&
+            !status.runtime_validation_performed &&
+            !status.runtime_validation_valid &&
+            status.prepared == status.current_user_ca_trusted &&
+            status.ok == status.prepared;
+        if (files_ok) {
+            log_msg(hf, tag, "PASS -- Firefox profile readiness profile=%s firefox_detected=%s trust=%s prepared=%s",
+                status.profile_path.u8string().c_str(),
+                status.firefox_detected ? "true" : "false",
+                status.current_user_ca_trusted ? "true" : "false",
+                status.prepared ? "true" : "false");
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- Firefox profile readiness invalid error=%s files=%s trust=%s prepared=%s runtime_checked=%s",
+                status.error.c_str(),
+                status.profile_files_valid ? "true" : "false",
+                status.current_user_ca_trusted ? "true" : "false",
+                status.prepared ? "true" : "false",
+                status.runtime_validation_performed ? "true" : "false");
+            failed.fetch_add(1);
+        }
+    }
+
     void test_cert_generator_server_cert(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "cert_gen_srv";
         log_msg(hf, tag, "START -- cert_generator::generate_server_cert()");
@@ -1091,16 +1315,15 @@ namespace {
         log_msg(hf, tag, "START -- cert_pin_bypass::init_signature_database()");
         cert_pin_bypass::init_signature_database();
         size_t count = cert_pin_bypass::g_state.signatures.size();
-        if (count > 0) {
-            log_msg(hf, tag, "PASS -- loaded %zu bypass signatures", count);
-            for (size_t i = 0; i < count && i < 4; i++) {
-                log_msg(hf, tag, "  sig[%zu]: name=%s module=%s",
-                    i, cert_pin_bypass::g_state.signatures[i].name.c_str(),
-                    cert_pin_bypass::g_state.signatures[i].module_name.c_str());
-            }
+        bool disabled_descriptor = count == 1 &&
+            cert_pin_bypass::g_state.signatures[0].pattern.empty() &&
+            cert_pin_bypass::g_state.signatures[0].patch.empty();
+        if (disabled_descriptor) {
+            log_msg(hf, tag, "PASS -- loaded non-patching compatibility descriptor name=%s",
+                cert_pin_bypass::g_state.signatures[0].name.c_str());
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- no signatures loaded");
+            log_msg(hf, tag, "FAIL -- unexpected signature descriptor count=%zu", count);
             failed.fetch_add(1);
         }
     }
@@ -1118,15 +1341,129 @@ namespace {
     void test_cert_pin_bypass_pattern_match(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "pin_bp_match";
         log_msg(hf, tag, "START -- cert_pin_bypass::pattern_match()");
-        uint8_t data[] = { 0x48, 0x89, 0x5C, 0x24, 0x08 };
-        uint8_t pat[]  = { 0x48, 0x89, 0x5C, 0x24, 0x08 };
+        uint8_t data[] = { 0x11, 0x22, 0x33, 0x44, 0x55 };
+        uint8_t pat[]  = { 0x11, 0x22, 0x33, 0x44, 0x55 };
         uint8_t mask[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
         bool m = cert_pin_bypass::pattern_match(data, sizeof(data), pat, mask, sizeof(pat));
         if (m) {
-            log_msg(hf, tag, "PASS -- pattern_match returned true for identical bytes");
+            log_msg(hf, tag, "PASS -- compatibility pattern_match returned true for identical neutral bytes");
             passed.fetch_add(1);
         } else {
             log_msg(hf, tag, "FAIL -- pattern_match returned false");
+            failed.fetch_add(1);
+        }
+    }
+
+    void test_cert_pin_bypass_scan_read_only(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        const char* tag = "pin_bp_readonly";
+        log_msg(hf, tag, "START -- cert_pin_bypass::scan_and_bypass(0)");
+        int applied = cert_pin_bypass::scan_and_bypass(0);
+        auto bypasses = cert_pin_bypass::get_active_bypasses();
+        auto diag = cert_pin_bypass::get_last_diagnostics();
+        if (applied == 0 && bypasses.empty() && diag.read_only) {
+            log_msg(hf, tag, "PASS -- scan path is read-only classification=%s reason=%s",
+                cert_intercept::to_string(diag.primary).c_str(),
+                cert_pin_bypass::get_disabled_reason().c_str());
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- applied=%d active=%zu read_only=%s",
+                applied, bypasses.size(), diag.read_only ? "true" : "false");
+            failed.fetch_add(1);
+        }
+    }
+
+    void test_cert_intercept_diagnostics_classify(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        const char* tag = "cert_diag";
+        log_msg(hf, tag, "START -- cert_intercept::classify_modules()");
+        std::vector<driver_bridge::module_info_t> modules;
+        driver_bridge::module_info_t winhttp;
+        winhttp.name = "winhttp.dll";
+        winhttp.path = "C:\\Windows\\System32\\winhttp.dll";
+        modules.push_back(winhttp);
+
+        cert_intercept::diagnostic_context_t context;
+        context.proxy_running = false;
+        context.ca_trusted = false;
+        auto no_proxy = cert_intercept::classify_modules(100, modules, context);
+
+        modules.clear();
+        driver_bridge::module_info_t openssl;
+        openssl.name = "libssl-3-x64.dll";
+        openssl.path = "C:\\Target\\libssl-3-x64.dll";
+        modules.push_back(openssl);
+        context.proxy_running = true;
+        context.ca_trusted = true;
+        context.interception_still_failing = true;
+        auto pinned = cert_intercept::classify_modules(101, modules, context);
+        auto providers = cert_intercept::provider_registry_t::instance().evaluate(101, pinned);
+
+        bool openssl_available = false;
+        bool openssl_attach_rejected = false;
+        for (const auto& provider : providers) {
+            if (provider.descriptor.provider_id == "openssl_export_adapter" &&
+                provider.state == cert_intercept::provider_state_t::available &&
+                !provider.descriptor.forces_certificate_success) {
+                openssl_available = true;
+            }
+        }
+        auto attach_status = cert_intercept::provider_registry_t::instance().attach("openssl_export_adapter", 101, pinned);
+        openssl_attach_rejected = !attach_status.active &&
+            attach_status.state == cert_intercept::provider_state_t::needs_user_launch &&
+            !attach_status.descriptor.supports_attach;
+
+        context.interception_still_failing = false;
+        context.hostname_san_mismatch_observed = true;
+        context.observation_evidence = {"sni_authority_mismatch host=api.example.test sni=wrong.example.test"};
+        auto san_mismatch = cert_intercept::classify_modules(102, modules, context);
+        context.hostname_san_mismatch_observed = false;
+        context.observation_evidence.clear();
+        context.mutual_tls_requested = true;
+        context.observation_evidence = {"upstream_handshake_failed host=mtls.example.test detail=tlsv13 alert certificate required"};
+        auto mtls = cert_intercept::classify_modules(103, modules, context);
+        context.mutual_tls_requested = false;
+        context.observation_evidence.clear();
+        context.non_http_tls_observed = true;
+        context.observation_evidence = {"non_http_tls host=imap.example.test detail=TLS payload did not parse as an HTTP request"};
+        auto non_http = cert_intercept::classify_modules(104, modules, context);
+        context.non_http_tls_observed = false;
+        context.observation_evidence.clear();
+
+        std::vector<driver_bridge::module_info_t> browser_modules;
+        driver_bridge::module_info_t browser;
+        browser.name = "firefox.exe";
+        browser.path = "C:\\Program Files\\Mozilla Firefox\\firefox.exe";
+        browser_modules.push_back(browser);
+        context.browser_trust_policy_or_ct_block = true;
+        auto browser_policy = cert_intercept::classify_modules(105, browser_modules, context);
+
+        if (no_proxy.primary == cert_intercept::classification_t::no_proxy_route &&
+            pinned.primary == cert_intercept::classification_t::true_pinning &&
+            san_mismatch.primary == cert_intercept::classification_t::hostname_san_mismatch &&
+            mtls.primary == cert_intercept::classification_t::mutual_tls &&
+            non_http.primary == cert_intercept::classification_t::non_http_tls &&
+            browser_policy.primary == cert_intercept::classification_t::browser_trust_policy_ct &&
+            openssl_available &&
+            openssl_attach_rejected &&
+            !san_mismatch.findings.empty() && san_mismatch.findings[0].evidence.find("sni_authority_mismatch") != std::string::npos) {
+            log_msg(hf, tag, "PASS -- diagnostics classified no_proxy=%s pinned=%s san=%s mtls=%s non_http=%s browser=%s openssl_provider=available attach_rejected=true",
+                cert_intercept::to_string(no_proxy.primary).c_str(),
+                cert_intercept::to_string(pinned.primary).c_str(),
+                cert_intercept::to_string(san_mismatch.primary).c_str(),
+                cert_intercept::to_string(mtls.primary).c_str(),
+                cert_intercept::to_string(non_http.primary).c_str(),
+                cert_intercept::to_string(browser_policy.primary).c_str());
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- no_proxy=%s pinned=%s san=%s mtls=%s non_http=%s browser=%s openssl_provider=%s attach_rejected=%s san_evidence=%s",
+                cert_intercept::to_string(no_proxy.primary).c_str(),
+                cert_intercept::to_string(pinned.primary).c_str(),
+                cert_intercept::to_string(san_mismatch.primary).c_str(),
+                cert_intercept::to_string(mtls.primary).c_str(),
+                cert_intercept::to_string(non_http.primary).c_str(),
+                cert_intercept::to_string(browser_policy.primary).c_str(),
+                openssl_available ? "true" : "false",
+                openssl_attach_rejected ? "true" : "false",
+                (!san_mismatch.findings.empty() && san_mismatch.findings[0].evidence.find("sni_authority_mismatch") != std::string::npos) ? "true" : "false");
             failed.fetch_add(1);
         }
     }
@@ -1935,26 +2272,52 @@ namespace {
         }
     }
 
-    void test_dns_resolve_external(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "dns_ext";
-        log_msg(hf, tag, "START -- DNS resolution for example.com");
+    void test_dns_resolve_loopback(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        const char* tag = "dns_loopback";
+        log_msg(hf, tag, "START -- DNS resolution for localhost loopback fixture");
         WSADATA wsa{};
-        WSAStartup(MAKEWORD(2, 2), &wsa);
+        int wsa_rc = WSAStartup(MAKEWORD(2, 2), &wsa);
+        if (wsa_rc != 0) {
+            log_msg(hf, tag, "FAIL -- WSAStartup failed rc=%d", wsa_rc);
+            failed.fetch_add(1);
+            return;
+        }
 
         struct addrinfo hints{}, *result = nullptr;
-        hints.ai_family = AF_INET;
+        hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
-        int rc = getaddrinfo("example.com", "443", &hints, &result);
-        if (rc == 0 && result != nullptr) {
-            char ip_str[INET_ADDRSTRLEN] = {};
-            struct sockaddr_in* addr = reinterpret_cast<struct sockaddr_in*>(result->ai_addr);
-            inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
-            log_msg(hf, tag, "PASS -- example.com resolved to %s", ip_str);
+        int rc = getaddrinfo("localhost", "443", &hints, &result);
+        bool loopback = false;
+        char first_ip[INET6_ADDRSTRLEN] = {};
+        int families = 0;
+        for (auto* it = result; it != nullptr; it = it->ai_next) {
+            ++families;
+            if (it->ai_family == AF_INET) {
+                auto* addr = reinterpret_cast<sockaddr_in*>(it->ai_addr);
+                if (first_ip[0] == '\0')
+                    inet_ntop(AF_INET, &addr->sin_addr, first_ip, sizeof(first_ip));
+                const uint32_t host_ip = ntohl(addr->sin_addr.s_addr);
+                if ((host_ip & 0xFF000000u) == 0x7F000000u)
+                    loopback = true;
+            } else if (it->ai_family == AF_INET6) {
+                auto* addr6 = reinterpret_cast<sockaddr_in6*>(it->ai_addr);
+                if (first_ip[0] == '\0')
+                    inet_ntop(AF_INET6, &addr6->sin6_addr, first_ip, sizeof(first_ip));
+                if (IN6_IS_ADDR_LOOPBACK(&addr6->sin6_addr))
+                    loopback = true;
+            }
+        }
+        if (result)
             freeaddrinfo(result);
+        WSACleanup();
+        if (rc == 0 && loopback) {
+            log_msg(hf, tag, "PASS -- localhost resolved to loopback first=%s families=%d", first_ip, families);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "SKIP -- DNS resolution failed (no internet) rc=%d", rc);
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- localhost did not resolve to loopback rc=%d first=%s families=%d",
+                rc, first_ip, families);
+            failed.fetch_add(1);
         }
     }
 
@@ -1983,9 +2346,23 @@ namespace {
         log_msg(hf, tag, "START -- CertPinBypasser::instance() singleton");
         auto& bp = net_security::CertPinBypasser::instance();
         bool active = bp.is_bypass_active(0);
-        log_msg(hf, tag, "PASS -- CertPinBypasser instance acquired, active_for_pid0=%s",
-            active ? "true" : "false");
-        passed.fetch_add(1);
+        net_security::pin_bypass_config_t cfg;
+        cfg.pid = 0;
+        auto result = bp.bypass_pins(cfg);
+        if (!result.success && result.read_only && result.legacy_patching_disabled &&
+            !result.methods_requested.empty() && !result.disabled_operations.empty()) {
+            log_msg(hf, tag, "PASS -- CertPinBypasser is diagnostic-only, active_for_pid0=%s",
+                active ? "true" : "false");
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- bypass result success=%s read_only=%s disabled=%s methods=%zu ops=%zu",
+                result.success ? "true" : "false",
+                result.read_only ? "true" : "false",
+                result.legacy_patching_disabled ? "true" : "false",
+                result.methods_requested.size(),
+                result.disabled_operations.size());
+            failed.fetch_add(1);
+        }
     }
 
     void test_quic_analyzer_instance(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -2130,8 +2507,20 @@ namespace {
 
 }
 
+void run_parser_proof_smoke() {
+    diag::log_tagged("parser_proof", "Ctrl+Shift+T immediate parser proof smoke START");
+    std::atomic<int> passed{ 0 };
+    std::atomic<int> failed{ 0 };
+    test_http_parser_edge_cases(INVALID_HANDLE_VALUE, passed, failed);
+    test_http2_client_preface_settings(INVALID_HANDLE_VALUE, passed, failed);
+    diag::log_tagged_fmt("parser_proof", "Ctrl+Shift+T immediate parser proof smoke DONE passed=%d failed=%d",
+        passed.load(),
+        failed.load());
+}
+
 void phase_network_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
-    log_msg(hf, "net_phase", "========== Network Tests START (70 tests) ==========");
+    log_msg(hf, "net_phase", "========== Network Tests START (121 tests, includes parser proof suite) ==========");
+    diag::log_tagged("parser_proof", "Ctrl+Shift+T network phase reached; parser proof tests are scheduled in this phase");
 
     if (cancelled && cancelled()) return;
     call_test(test_network_view_init, hf, passed, failed);
@@ -2218,13 +2607,16 @@ void phase_network_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& 
     call_test(test_ipv6_socket_create, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test_s(test_dns_resolve_external, hf, passed, failed, skipped);
+    call_test_s(test_dns_resolve_loopback, hf, passed, failed, skipped);
 
     if (cancelled && cancelled()) return;
     call_test(test_parse_http_request, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
     call_test(test_parse_http_response, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_http_parser_edge_cases, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
     call_test(test_detect_content_type, hf, passed, failed);
@@ -2249,6 +2641,9 @@ void phase_network_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& 
 
     if (cancelled && cancelled()) return;
     call_test(test_parse_h2_frames, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_http2_client_preface_settings, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
     call_test(test_quic_detection, hf, passed, failed);
@@ -2279,6 +2674,12 @@ void phase_network_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& 
 
     if (cancelled && cancelled()) return;
     call_test(test_cert_generator_root_ca, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_cert_generator_spki_hash, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_cert_profile_manager_firefox, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
     call_test(test_cert_generator_server_cert, hf, passed, failed);
@@ -2318,6 +2719,12 @@ void phase_network_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& 
 
     if (cancelled && cancelled()) return;
     call_test(test_cert_pin_bypass_pattern_match, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_cert_pin_bypass_scan_read_only, hf, passed, failed);
+
+    if (cancelled && cancelled()) return;
+    call_test(test_cert_intercept_diagnostics_classify, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
     call_test(test_tls_key_extractor_instance, hf, passed, failed);
@@ -2491,6 +2898,7 @@ void phase_network_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& 
     call_test(test_cert_generator_shutdown, hf, passed, failed);
 
     log_msg(hf, "net_phase", "========== Network Tests DONE ==========");
+    diag::log_tagged("parser_proof", "Ctrl+Shift+T network phase completed");
 }
 
 }

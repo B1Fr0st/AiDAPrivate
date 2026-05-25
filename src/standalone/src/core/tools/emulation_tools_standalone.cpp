@@ -899,18 +899,28 @@ tool_result_t emulate_function(const json& params)
 
     const bool kernel_mode = is_kernel_address(*addr);
 
+    const bool explicit_size = params.contains("size") && params["size"].is_number();
     std::uint32_t fn_size = params.value("size", 4096);
     if (fn_size > 1024 * 1024) fn_size = 1024 * 1024;
+    if (fn_size == 0) fn_size = 1;
 
     std::uint32_t map_size = std::max(fn_size * 2, 8192u);
     if (map_size > 1024 * 1024) map_size = 1024 * 1024;
+    std::uint32_t read_size = explicit_size ? fn_size : map_size;
+    if (read_size > map_size) read_size = map_size;
+    if (read_size == 0) read_size = 1;
 
-    auto code = emulation::driver_read_bytes(*addr, map_size);
+    auto code = emulation::driver_read_bytes(*addr, read_size);
     if (code.empty())
         return tool_result_t::error(OBFSTR("Failed to read function bytes at ") +
                                     sa_format_address(*addr));
+    if (explicit_size && code.size() < read_size)
+        return tool_result_t::error(OBFSTR("Short function read at ") +
+                                    sa_format_address(*addr) +
+                                    OBFSTR(": requested ") + std::to_string(read_size) +
+                                    OBFSTR(" bytes, got ") + std::to_string(code.size()));
 
-    constexpr std::uint64_t SENTINEL_RET = 0xDEAD000000000000ULL;
+    const std::uint64_t sentinel_ret = kernel_mode ? 0xFFFFFAFEFFFF0000ULL : 0x000000007FFC0000ULL;
     std::uint64_t stack_base = kernel_mode ? KERNEL_SYNTH_STACK_BASE : USER_SYNTH_STACK_BASE;
     std::uint64_t stack_top  = stack_base + SYNTH_STACK_SIZE - 0x1000;
 
@@ -944,12 +954,12 @@ tool_result_t emulate_function(const json& params)
     stack_region.size = SYNTH_STACK_SIZE;
     stack_region.data.resize(static_cast<std::size_t>(SYNTH_STACK_SIZE), 0);
 
-    std::uint64_t sentinel = SENTINEL_RET;
+    std::uint64_t sentinel = sentinel_ret;
     std::memcpy(stack_region.data.data() + (stack_top - stack_base), &sentinel, 8);
     snapshot.regions.push_back(std::move(stack_region));
 
     emulation::memory_snapshot_region_t sentinel_region;
-    sentinel_region.base = SENTINEL_RET & ~0xFFFULL;
+    sentinel_region.base = sentinel_ret & ~0xFFFULL;
     sentinel_region.size = 0x1000;
     sentinel_region.data.resize(0x1000, 0xCC);
     snapshot.regions.push_back(std::move(sentinel_region));
@@ -958,7 +968,7 @@ tool_result_t emulate_function(const json& params)
 
     emulation::emulation_config_t config;
     config.start_address     = *addr;
-    config.stop_address      = SENTINEL_RET;
+    config.stop_address      = sentinel_ret;
     config.max_instructions  = params.value("max_instructions", 100000);
     config.max_trace_entries  = params.value("max_trace_entries", 10000);
     config.record_mem_reads   = params.value("record_mem_reads", true);
@@ -966,22 +976,30 @@ tool_result_t emulate_function(const json& params)
     config.record_registers   = true;
     config.analyze_effective_ops = true;
     config.timeout_us         = params.value("timeout_us", 15000000);
-    config.breakpoint_addresses.insert(SENTINEL_RET);
+    config.breakpoint_addresses.insert(sentinel_ret);
 
-    diag::log_tagged_fmt("emul_tools", "emulate_function running addr=0x%llx fn_size=%u kernel=%d",
-        static_cast<unsigned long long>(*addr), fn_size, (int)kernel_mode);
+    diag::log_tagged_fmt("emul_tools", "emulate_function running addr=0x%llx fn_size=%u read_size=%u map_size=%u sentinel=0x%llX kernel=%d",
+        static_cast<unsigned long long>(*addr),
+        fn_size,
+        read_size,
+        map_size,
+        static_cast<unsigned long long>(sentinel_ret),
+        (int)kernel_mode);
     auto result = emulation::emulate_from_snapshot(snapshot, config);
 
     json out;
     out["function_address"] = sa_format_address(*addr);
     out["function_size"]    = fn_size;
     out["mapped_size"]      = map_size;
+    out["read_size"]        = read_size;
     out["kernel_mode"]      = kernel_mode;
     out["success"]          = result.success;
 
     bool returned_normally = result.success &&
-        (result.end_address == SENTINEL_RET || result.end_address == SENTINEL_RET + 1);
+        (result.hit_ret || result.end_address == sentinel_ret || result.end_address == sentinel_ret + 1);
     out["returned_normally"] = returned_normally;
+    out["hit_ret"] = result.hit_ret;
+    out["hit_breakpoint"] = result.hit_breakpoint;
 
     if (result.success)
     {
@@ -992,7 +1010,7 @@ tool_result_t emulate_function(const json& params)
 
         for (const auto& d : result.reg_deltas)
         {
-            if (d.name == "rax")
+            if (d.name == "RAX" || d.name == "rax")
             {
                 out["return_value"] = sa_format_address(static_cast<uint64_t>(d.after));
                 break;
@@ -1071,7 +1089,7 @@ tool_result_t emulate_function(const json& params)
             "emulate_function did_not_return addr=0x%llX end=0x%llX sentinel=0x%llX total=%u trace=%zu last='%s' regions=%zu",
             static_cast<unsigned long long>(*addr),
             static_cast<unsigned long long>(result.end_address),
-            static_cast<unsigned long long>(SENTINEL_RET),
+            static_cast<unsigned long long>(sentinel_ret),
             result.total_instructions,
             result.trace.size(),
             last_trace.c_str(),

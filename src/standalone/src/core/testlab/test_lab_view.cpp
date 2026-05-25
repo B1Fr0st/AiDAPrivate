@@ -77,25 +77,15 @@ namespace test_lab_view {
 			return "C:\\Users\\Public\\Desktop\\aida_test_results.log";
 		}
 
-		bool is_destructive_by_name(const char* name) {
-			if (name == nullptr) return false;
-			static const std::unordered_set<std::string> kSkip = {
-				"ABRT",
-				"DBGA",
-				"RECU",
-				"ADMP",
-				"RC",
-				"CR",
-				"SRVT",
-				"SRV2",
-				"PINJ",
-				"TSR",
-				"PCEX",
-				"HVDT",
-				"CANR",
-				"CANQ"
-			};
-			return kSkip.find(std::string(name)) != kSkip.end();
+		bool is_destructive_feature(const char* category, const char* name) {
+			if (category == nullptr || name == nullptr) return false;
+			return
+				(std::strcmp(category, "tamper") == 0 && std::strcmp(name, "ABRT") == 0) ||
+				(std::strcmp(category, "evidence") == 0 && std::strcmp(name, "RECU") == 0) ||
+				(std::strcmp(category, "remote-call") == 0 && std::strcmp(name, "RC") == 0) ||
+				(std::strcmp(category, "thread") == 0 && std::strcmp(name, "TSR") == 0) ||
+				(std::strcmp(category, "module") == 0 && std::strcmp(name, "PINJ") == 0) ||
+				(std::strcmp(category, "anti-debug") == 0 && std::strcmp(name, "DBGA") == 0);
 		}
 
 		void populate_safe_defaults(test_lab::state_t& s) {
@@ -372,8 +362,33 @@ namespace test_lab_view {
 				return;
 			}
 			if (name_starts_with(name, "CANR")) {
-				s.addr = 0x7FFE0000ULL;
-				s.size = 64;
+				static std::uint8_t canary_scratch[0x1000];
+				s.addr = reinterpret_cast<std::uint64_t>(&canary_scratch[0]);
+				s.size = sizeof(canary_scratch);
+				s.u32_a = 0;
+				return;
+			}
+			if (name_starts_with(name, "ADMP")) {
+				s.u32_a = 4u;
+				s.pid = 0;
+				return;
+			}
+			if (name_starts_with(name, "SRVT")) {
+				s.text_a = "00112233445566778899AABBCCDDEEFF";
+				return;
+			}
+			if (name_starts_with(name, "SRV2")) {
+				s.text_a = "00112233445566778899AABBCCDDEEFF";
+				s.u32_a = 1u;
+				return;
+			}
+			if (name_starts_with(name, "PCEX")) {
+				char tmp[MAX_PATH];
+				GetTempPathA(MAX_PATH, tmp);
+				s.text_a = std::string(tmp) + "aida_test_capture.pcap";
+				return;
+			}
+			if (name_starts_with(name, "CR")) {
 				s.u32_a = 0;
 				return;
 			}
@@ -475,7 +490,7 @@ namespace test_lab_view {
 						g_run_all_current_name = (f.name != nullptr ? f.name : "?");
 					}
 
-					if (is_destructive_by_name(f.name)) {
+					if (is_destructive_feature(f.category, f.name)) {
 						g_run_all_skipped.fetch_add(1);
 						append_log_skip(hFile, f, "destructive (BSOD/kill)");
 						test_lab_format::testlab_diag_log_skip(f, "destructive (BSOD/kill)");

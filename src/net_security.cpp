@@ -1771,7 +1771,8 @@ bool CertificateInjector::remove_certificate(const std::string& thumbprint, cons
 
 bool CertificateInjector::generate_ca_certificate(const std::string& cn, std::uint32_t validity_days,
                                                     std::vector<std::uint8_t>& out_cert_der,
-                                                    std::vector<std::uint8_t>& out_key_der) {
+                                                    std::vector<std::uint8_t>& out_key_der,
+                                                    bool export_private_key) {
     std::lock_guard<std::mutex> lock(_mutex);
 
     HCRYPTPROV hProv = 0;
@@ -1855,11 +1856,14 @@ bool CertificateInjector::generate_ca_certificate(const std::string& cn, std::ui
         out_cert_der.assign(cert->pbCertEncoded, cert->pbCertEncoded + cert->cbCertEncoded);
 
 
-        DWORD key_blob_size = 0;
-        if (CryptExportKey(hKey, 0, PRIVATEKEYBLOB, 0, nullptr, &key_blob_size)) {
-            out_key_der.resize(key_blob_size);
-            CryptExportKey(hKey, 0, PRIVATEKEYBLOB, 0, out_key_der.data(), &key_blob_size);
-            out_key_der.resize(key_blob_size);
+        out_key_der.clear();
+        if (export_private_key) {
+            DWORD key_blob_size = 0;
+            if (CryptExportKey(hKey, 0, PRIVATEKEYBLOB, 0, nullptr, &key_blob_size)) {
+                out_key_der.resize(key_blob_size);
+                CryptExportKey(hKey, 0, PRIVATEKEYBLOB, 0, out_key_der.data(), &key_blob_size);
+                out_key_der.resize(key_blob_size);
+            }
         }
 
         CertFreeCertificateContext(cert);
@@ -1936,408 +1940,64 @@ CertPinBypasser& CertPinBypasser::instance() {
     return inst;
 }
 
-bool CertPinBypasser::patch_wintrust(std::uint32_t pid) {
-    if (!device || !device->is_connected()) return false;
+namespace {
 
-
-    std::uint64_t wintrust_base = 0;
-    std::uint32_t wintrust_size = 0;
-
-    auto& extractor = TlsKeyExtractor::instance();
-    if (!extractor.find_module_in_process(pid, "wintrust.dll", wintrust_base, wintrust_size))
-        return false;
-
-
-    std::uint32_t saved_pid = device->get_process_id();
-    device->set_process_id(pid);
-    device->solve_dtb();
-
-    std::uint64_t wvt_addr = device->resolve_export(wintrust_base, "WinVerifyTrust");
-    if (wvt_addr == 0) {
-        device->set_process_id(saved_pid);
-        if (saved_pid != 0) device->solve_dtb();
-        return false;
+std::string pin_method_name(pin_bypass_method method) {
+    switch (method) {
+    case pin_bypass_method::windows_trust: return "windows_trust";
+    case pin_bypass_method::windows_chain_policy: return "windows_chain_policy";
+    case pin_bypass_method::windows_tls: return "windows_tls";
+    case pin_bypass_method::chromium_browser: return "chromium_browser";
+    case pin_bypass_method::managed_dotnet: return "managed_dotnet";
+    default: return "all";
     }
-
-
-    std::uint8_t original[16] = {};
-    if (device->read_raw(wvt_addr, original, 16) != 16) {
-        device->set_process_id(saved_pid);
-        if (saved_pid != 0) device->solve_dtb();
-        return false;
-    }
-
-
-    std::uint8_t patch[] = { 0x31, 0xC0, 0xC3 };
-
-
-    device->protect_memory(wvt_addr, 4096, 0x40);
-
-
-    bool ok = (device->write_raw(wvt_addr, patch, 3) == 3);
-
-    if (ok) {
-        std::lock_guard<std::mutex> lock(_mutex);
-        _active_patches[pid].push_back({wvt_addr, {original, original + 16}, "WinVerifyTrust"});
-    }
-
-    device->set_process_id(saved_pid);
-    if (saved_pid != 0) device->solve_dtb();
-    return ok;
 }
 
-bool CertPinBypasser::patch_crypt32(std::uint32_t pid) {
-    if (!device || !device->is_connected()) return false;
-
-
-    std::uint64_t crypt32_base = 0;
-    std::uint32_t crypt32_size = 0;
-
-    auto& extractor = TlsKeyExtractor::instance();
-    if (!extractor.find_module_in_process(pid, "crypt32.dll", crypt32_base, crypt32_size))
-        return false;
-
-    std::uint32_t saved_pid = device->get_process_id();
-    device->set_process_id(pid);
-    device->solve_dtb();
-
-    std::uint64_t func_addr = device->resolve_export(crypt32_base, "CertVerifyCertificateChainPolicy");
-    if (func_addr == 0) {
-        device->set_process_id(saved_pid);
-        if (saved_pid != 0) device->solve_dtb();
-        return false;
-    }
-
-    std::uint8_t original[16] = {};
-    device->read_raw(func_addr, original, 16);
-
-
-    std::uint8_t patch[] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
-
-    device->protect_memory(func_addr, 4096, 0x40);
-    bool ok = (device->write_raw(func_addr, patch, 6) == 6);
-
-    if (ok) {
-        std::lock_guard<std::mutex> lock(_mutex);
-        _active_patches[pid].push_back({func_addr, {original, original + 16}, "CertVerifyCertificateChainPolicy"});
-    }
-
-    device->set_process_id(saved_pid);
-    if (saved_pid != 0) device->solve_dtb();
-    return ok;
-}
-
-bool CertPinBypasser::patch_schannel_validation(std::uint32_t pid) {
-    if (!device || !device->is_connected()) return false;
-
-
-    std::uint64_t schannel_base = 0;
-    std::uint32_t schannel_size = 0;
-
-    auto& extractor = TlsKeyExtractor::instance();
-    if (!extractor.find_module_in_process(pid, "schannel.dll", schannel_base, schannel_size))
-        return false;
-
-    std::uint32_t saved_pid = device->get_process_id();
-    device->set_process_id(pid);
-    device->solve_dtb();
-
-
-    std::uint64_t export_addr = device->resolve_export(schannel_base, "SslEmptyCacheA");
-    if (export_addr == 0) {
-        device->set_process_id(saved_pid);
-        if (saved_pid != 0) device->solve_dtb();
-        return false;
-    }
-
-
-    auto regions = device->enumerate_memory_regions(schannel_base, schannel_base + schannel_size, false);
-    bool patched = false;
-
-
-    const std::uint8_t cert_unknown_cmp[] = { 0x3D, 0x27, 0x03, 0x09, 0x80 };
-    const std::uint8_t cert_expired_cmp[] = { 0x3D, 0x28, 0x03, 0x09, 0x80 };
-
-    for (const auto& region : regions) {
-        if (region.state != 0x1000) continue;
-        if (!(region.protect == 0x20 || region.protect == 0x40 || region.protect == 0x10)) continue;
-        if (region.size > 0x1000000 || region.size < 32) continue;
-
-        constexpr std::size_t CHUNK = 0x20000;
-        std::vector<std::uint8_t> buf(CHUNK);
-
-        for (std::uint64_t off = 0; off < region.size && !patched; off += CHUNK - 16) {
-            std::size_t to_read = static_cast<std::size_t>(
-                std::min(static_cast<std::uint64_t>(CHUNK), region.size - off));
-            if (to_read < 16) break;
-
-            std::size_t actual = device->read_raw(region.base + off, buf.data(), to_read);
-            if (actual < 16) continue;
-
-            for (std::size_t i = 0; i + 12 <= actual && !patched; i++) {
-                bool is_cert_check = false;
-
-
-                if (std::memcmp(buf.data() + i, cert_unknown_cmp, 5) == 0)
-                    is_cert_check = true;
-
-
-                if (!is_cert_check && std::memcmp(buf.data() + i, cert_expired_cmp, 5) == 0)
-                    is_cert_check = true;
-
-                if (!is_cert_check) continue;
-
-
-                std::size_t jmp_pos = i + 5;
-
-
-                while (jmp_pos < actual && buf[jmp_pos] == 0x90) jmp_pos++;
-
-                if (jmp_pos >= actual) continue;
-
-                std::uint64_t patch_addr = 0;
-                std::size_t patch_size = 0;
-
-                if (buf[jmp_pos] == 0x74) {
-
-                    patch_addr = region.base + off + jmp_pos;
-                    patch_size = 2;
-                } else if (buf[jmp_pos] == 0x0F && jmp_pos + 1 < actual && buf[jmp_pos + 1] == 0x84) {
-
-                    patch_addr = region.base + off + jmp_pos;
-                    patch_size = 6;
-                } else if (buf[jmp_pos] == 0x75) {
-
-                    continue;
-                } else {
-                    continue;
-                }
-
-
-                std::vector<std::uint8_t> original(patch_size);
-                device->read_raw(patch_addr, original.data(), patch_size);
-
-
-                std::vector<std::uint8_t> nops(patch_size, 0x90);
-                device->protect_memory(patch_addr, 4096, 0x40);
-                if (device->write_raw(patch_addr, nops.data(), patch_size) == patch_size) {
-                    std::lock_guard<std::mutex> lock2(_mutex);
-                    _active_patches[pid].push_back({patch_addr, original, "SChannel-CertValidation"});
-                    patched = true;
-                }
-            }
-        }
-        if (patched) break;
-    }
-
-    device->set_process_id(saved_pid);
-    if (saved_pid != 0) device->solve_dtb();
-    return patched;
-}
-
-bool CertPinBypasser::patch_chrome_pins(std::uint32_t pid) {
-    if (!device || !device->is_connected()) return false;
-
-
-    std::uint64_t chrome_base = 0;
-    std::uint32_t chrome_size = 0;
-
-    auto& extractor = TlsKeyExtractor::instance();
-    bool has_chrome = extractor.find_module_in_process(pid, "chrome.dll", chrome_base, chrome_size) ||
-                      extractor.find_module_in_process(pid, "msedge.dll", chrome_base, chrome_size);
-    if (!has_chrome) return false;
-
-    std::uint32_t saved_pid = device->get_process_id();
-    device->set_process_id(pid);
-    device->solve_dtb();
-
-
-    const std::uint8_t pin_error_sig[] = {
-        0x48, 0x8D, 0x0D
+std::vector<std::string> requested_pin_methods(pin_bypass_method method) {
+    if (method != pin_bypass_method::all) return { pin_method_name(method) };
+    return {
+        pin_method_name(pin_bypass_method::windows_trust),
+        pin_method_name(pin_bypass_method::windows_chain_policy),
+        pin_method_name(pin_bypass_method::windows_tls),
+        pin_method_name(pin_bypass_method::chromium_browser),
+        pin_method_name(pin_bypass_method::managed_dotnet)
     };
-
-
-    auto regions = device->enumerate_memory_regions(chrome_base, chrome_base + chrome_size, false);
-    bool patched = false;
-
-    for (const auto& region : regions) {
-        if (region.state != 0x1000) continue;
-
-        if (!(region.protect == 0x20 || region.protect == 0x40 || region.protect == 0x10)) continue;
-        if (region.size > 0x10000000) continue;
-
-
-        constexpr std::size_t CHUNK = 0x40000;
-        std::vector<std::uint8_t> buf(CHUNK);
-
-        for (std::uint64_t off = 0; off < region.size && !patched; off += CHUNK - 32) {
-            std::size_t to_read = static_cast<std::size_t>(
-                std::min(static_cast<std::uint64_t>(CHUNK), region.size - off));
-            if (to_read < 64) break;
-
-            std::size_t actual = device->read_raw(region.base + off, buf.data(), to_read);
-            if (actual < 64) continue;
-
-
-            for (std::size_t i = 0; i + 16 <= actual; i++) {
-
-                if (buf[i] == 0x3D && buf[i+1] == 0x6A && buf[i+2] == 0xFF &&
-                    buf[i+3] == 0xFF && buf[i+4] == 0xFF) {
-
-
-                    if (i + 6 < actual && (buf[i+5] == 0x74 || buf[i+5] == 0x75)) {
-                        std::uint64_t patch_addr = region.base + off + i + 5;
-
-                        std::uint8_t orig[2] = {};
-                        device->read_raw(patch_addr, orig, 2);
-                        device->protect_memory(patch_addr, 4096, 0x40);
-                        std::uint8_t nops[] = { 0x90, 0x90 };
-                        device->write_raw(patch_addr, nops, 2);
-
-                        std::lock_guard<std::mutex> lock2(_mutex);
-                        _active_patches[pid].push_back({patch_addr, {orig, orig + 2}, "Chrome-PKP-Check"});
-                        patched = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if (patched) break;
-    }
-
-    device->set_process_id(saved_pid);
-    if (saved_pid != 0) device->solve_dtb();
-    return patched;
 }
 
-bool CertPinBypasser::patch_dotnet_callback(std::uint32_t pid) {
-    if (!device || !device->is_connected()) return false;
-
-
-    auto& extractor = TlsKeyExtractor::instance();
-
-    std::uint64_t clr_base = 0;
-    std::uint32_t clr_size = 0;
-    bool has_clr = extractor.find_module_in_process(pid, "coreclr.dll", clr_base, clr_size) ||
-                   extractor.find_module_in_process(pid, "clr.dll", clr_base, clr_size);
-
-    if (!has_clr) return false;
-
-    std::uint32_t saved_pid = device->get_process_id();
-    device->set_process_id(pid);
-    device->solve_dtb();
-
-
-    std::uint64_t snsec_base = 0;
-    std::uint32_t snsec_size = 0;
-    bool has_snsec = extractor.find_module_in_process(pid, "system.net.security", snsec_base, snsec_size);
-
-    if (has_snsec && snsec_size > 0) {
-
-
-        const std::uint8_t pattern[] = { 0xC7, 0x44, 0x24 };
-        auto regions = device->enumerate_memory_regions(snsec_base, snsec_base + snsec_size, false);
-
-        for (const auto& region : regions) {
-            if (region.state != 0x1000) continue;
-            if (region.size > 0x10000000 || region.size < 32) continue;
-            if (!(region.protect == 0x20 || region.protect == 0x40 || region.protect == 0x10)) continue;
-
-            constexpr std::size_t CHUNK = 0x20000;
-            std::vector<std::uint8_t> buf(CHUNK);
-
-            for (std::uint64_t off = 0; off < region.size; off += CHUNK - 16) {
-                std::size_t to_read = static_cast<std::size_t>(
-                    std::min(static_cast<std::uint64_t>(CHUNK), region.size - off));
-                if (to_read < 16) break;
-
-                std::size_t actual = device->read_raw(region.base + off, buf.data(), to_read);
-                if (actual < 16) continue;
-
-                for (std::size_t i = 0; i + 8 <= actual; i++) {
-                    if (buf[i] == pattern[0] && buf[i+1] == pattern[1] && buf[i+2] == pattern[2]) {
-
-                        if (buf[i+4] == 0x08 && buf[i+5] == 0x00 &&
-                            buf[i+6] == 0x00 && buf[i+7] == 0x00) {
-
-                            std::uint64_t patch_addr = region.base + off + i + 4;
-                            std::uint8_t original[4];
-                            device->read_raw(patch_addr, original, 4);
-
-
-                            std::uint8_t new_flags[] = { 0x18, 0x18, 0x00, 0x00 };
-                            device->protect_memory(patch_addr, 4096, 0x40);
-                            if (device->write_raw(patch_addr, new_flags, 4) == 4) {
-                                std::lock_guard<std::mutex> lock2(_mutex);
-                                _active_patches[pid].push_back({patch_addr, {original, original + 4}, "DotNet-SCH_CRED-Flags"});
-
-                                device->set_process_id(saved_pid);
-                                if (saved_pid != 0) device->solve_dtb();
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-
-    device->set_process_id(saved_pid);
-    if (saved_pid != 0) device->solve_dtb();
-    return true;
 }
 
 pin_bypass_result_t CertPinBypasser::bypass_pins(const pin_bypass_config_t& config) {
-    std::lock_guard<std::mutex> lock(_mutex);
     pin_bypass_result_t result;
 
     std::uint32_t pid = config.pid;
     if (pid == 0 && device && device->is_connected())
         pid = device->get_process_id();
-    if (pid == 0) {
-        result.success = false;
-        return result;
-    }
 
-    auto try_patch = [&](pin_bypass_method method, auto fn, const char* name) {
-        if (config.method == pin_bypass_method::all || config.method == method) {
-            if (fn(pid)) {
-                result.patches_applied.push_back(name);
-            } else {
-                result.patches_failed.push_back(name);
-            }
-        }
+    result.success = false;
+    result.read_only = true;
+    result.legacy_patching_disabled = true;
+    result.methods_requested = requested_pin_methods(config.method);
+    result.disabled_operations = {
+        "target_process_code_writes",
+        "certificate_verification_force_success",
+        "browser_tls_internal_scanning",
+        "managed_runtime_flag_rewrites"
     };
-
-    try_patch(pin_bypass_method::patch_wintrust,
-              [this](std::uint32_t p) { return patch_wintrust(p); },
-              "WinVerifyTrust");
-
-    try_patch(pin_bypass_method::patch_crypt32,
-              [this](std::uint32_t p) { return patch_crypt32(p); },
-              "CertVerifyCertificateChainPolicy");
-
-    try_patch(pin_bypass_method::patch_schannel,
-              [this](std::uint32_t p) { return patch_schannel_validation(p); },
-              "SChannel-Validation");
-
-    try_patch(pin_bypass_method::patch_chrome_pins,
-              [this](std::uint32_t p) { return patch_chrome_pins(p); },
-              "Chrome-PKP");
-
-    try_patch(pin_bypass_method::patch_dotnet_callback,
-              [this](std::uint32_t p) { return patch_dotnet_callback(p); },
-              "DotNet-CertCallback");
-
-    result.success = !result.patches_applied.empty();
+    result.diagnostic_summary = pid == 0
+        ? "No target process was selected; normal certificate interception uses proxy, trust, profile, and provider diagnostics"
+        : "Legacy in-process certificate validation modification is disabled for normal builds";
+    result.recommended_action = "Use cert_intercept diagnostics, controlled browser profiles, Firefox profile preparation, or script handoff for explicit authorized analysis";
     return result;
 }
 
 bool CertPinBypasser::revert_bypass(std::uint32_t pid) {
-    std::lock_guard<std::mutex> lock(_mutex);
-    auto it = _active_patches.find(pid);
-    if (it == _active_patches.end()) return false;
+    std::vector<patch_record_t> records;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        auto it = _active_patches.find(pid);
+        if (it == _active_patches.end()) return false;
+        records = it->second;
+    }
 
     if (!device || !device->is_connected()) return false;
 
@@ -2346,7 +2006,7 @@ bool CertPinBypasser::revert_bypass(std::uint32_t pid) {
     device->solve_dtb();
 
     bool all_ok = true;
-    for (const auto& patch : it->second) {
+    for (const auto& patch : records) {
         device->protect_memory(patch.address, 4096, 0x40);
         if (device->write_raw(patch.address, patch.original_bytes.data(),
                                patch.original_bytes.size()) != patch.original_bytes.size()) {
@@ -2357,7 +2017,10 @@ bool CertPinBypasser::revert_bypass(std::uint32_t pid) {
     device->set_process_id(saved_pid);
     if (saved_pid != 0) device->solve_dtb();
 
-    _active_patches.erase(it);
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _active_patches.erase(pid);
+    }
     return all_ok;
 }
 

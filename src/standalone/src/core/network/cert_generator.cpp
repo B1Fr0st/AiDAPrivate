@@ -7,13 +7,18 @@
 #include "helpers/diag_log.hpp"
 
 #include <openssl/bn.h>
+#include <openssl/bio.h>
+#include <openssl/buffer.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <openssl/x509v3.h>
 
+#include <climits>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <vector>
 
@@ -28,6 +33,9 @@ static bool         g_initialized = false;
 
 static std::unordered_map<std::string, ssl_ctx_ptr> g_ctx_cache;
 static std::mutex g_ctx_mutex;
+
+static constexpr char kProtectedKeyPrefix[] = "AIDA-DPAPI-CAKEY-v1\n";
+static constexpr char kPrivateKeyEntropy[] = "AiDA:standalone:proxy:ca-key:v1";
 
 
 static bool add_ext(X509* cert, int nid, const char* value) {
@@ -151,6 +159,187 @@ static bool write_file_bytes(const std::string& path, const uint8_t* data, size_
     return out.good();
 }
 
+static void secure_zero_bytes(std::vector<uint8_t>& bytes) {
+    if (!bytes.empty())
+        SecureZeroMemory(bytes.data(), bytes.size());
+}
+
+static bool has_protected_key_prefix(const std::vector<uint8_t>& bytes) {
+    constexpr size_t prefix_len = sizeof(kProtectedKeyPrefix) - 1;
+    return bytes.size() >= prefix_len &&
+        std::memcmp(bytes.data(), kProtectedKeyPrefix, prefix_len) == 0;
+}
+
+static bool protect_private_key_pem(const std::vector<uint8_t>& pem, std::vector<uint8_t>& out) {
+    out.clear();
+    if (pem.empty() || pem.size() > static_cast<size_t>((std::numeric_limits<DWORD>::max)()))
+        return false;
+
+    DATA_BLOB input_blob{
+        static_cast<DWORD>(pem.size()),
+        const_cast<BYTE*>(reinterpret_cast<const BYTE*>(pem.data()))
+    };
+    DATA_BLOB entropy_blob{
+        static_cast<DWORD>(sizeof(kPrivateKeyEntropy) - 1),
+        reinterpret_cast<BYTE*>(const_cast<char*>(kPrivateKeyEntropy))
+    };
+    DATA_BLOB output_blob{};
+    if (!CryptProtectData(&input_blob, L"AiDA Proxy Root CA Key", &entropy_blob,
+                          nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &output_blob)) {
+        diag::log_tagged_fmt("cert", "protect_private_key_pem CryptProtectData failed gle=%lu", GetLastError());
+        return false;
+    }
+
+    constexpr size_t prefix_len = sizeof(kProtectedKeyPrefix) - 1;
+    out.assign(kProtectedKeyPrefix, kProtectedKeyPrefix + prefix_len);
+    out.insert(out.end(), output_blob.pbData, output_blob.pbData + output_blob.cbData);
+    SecureZeroMemory(output_blob.pbData, output_blob.cbData);
+    LocalFree(output_blob.pbData);
+    return true;
+}
+
+static bool unprotect_private_key_pem(const std::vector<uint8_t>& protected_bytes, std::vector<uint8_t>& pem) {
+    pem.clear();
+    constexpr size_t prefix_len = sizeof(kProtectedKeyPrefix) - 1;
+    if (protected_bytes.size() <= prefix_len || !has_protected_key_prefix(protected_bytes))
+        return false;
+
+    const size_t cipher_len = protected_bytes.size() - prefix_len;
+    if (cipher_len > static_cast<size_t>((std::numeric_limits<DWORD>::max)()))
+        return false;
+
+    DATA_BLOB input_blob{
+        static_cast<DWORD>(cipher_len),
+        const_cast<BYTE*>(reinterpret_cast<const BYTE*>(protected_bytes.data() + prefix_len))
+    };
+    DATA_BLOB entropy_blob{
+        static_cast<DWORD>(sizeof(kPrivateKeyEntropy) - 1),
+        reinterpret_cast<BYTE*>(const_cast<char*>(kPrivateKeyEntropy))
+    };
+    DATA_BLOB output_blob{};
+    if (!CryptUnprotectData(&input_blob, nullptr, &entropy_blob, nullptr, nullptr,
+                            CRYPTPROTECT_UI_FORBIDDEN, &output_blob)) {
+        diag::log_tagged_fmt("cert", "unprotect_private_key_pem CryptUnprotectData failed gle=%lu", GetLastError());
+        return false;
+    }
+
+    pem.assign(output_blob.pbData, output_blob.pbData + output_blob.cbData);
+    SecureZeroMemory(output_blob.pbData, output_blob.cbData);
+    LocalFree(output_blob.pbData);
+    return !pem.empty();
+}
+
+static bool write_protected_private_key_pem(const std::string& key_path, const std::vector<uint8_t>& pem) {
+    std::vector<uint8_t> protected_bytes;
+    if (!protect_private_key_pem(pem, protected_bytes))
+        return false;
+    bool ok = write_file_bytes(key_path, protected_bytes.data(), protected_bytes.size());
+    secure_zero_bytes(protected_bytes);
+    return ok;
+}
+
+static bool encode_private_key_pem(const root_ca_t& ca, std::vector<uint8_t>& out) {
+    out.clear();
+    if (!ca.valid || !ca.key)
+        return false;
+
+    BIO* kbio = BIO_new(BIO_s_mem());
+    if (!kbio)
+        return false;
+
+    int wrote = PEM_write_bio_PrivateKey(kbio, ca.key.get(), nullptr, nullptr, 0, nullptr, nullptr);
+    diag::log_tagged_fmt("cert", "encode_private_key_pem PEM_write_bio_PrivateKey wrote=%d", wrote);
+    if (!wrote) {
+        BIO_free(kbio);
+        return false;
+    }
+
+    BUF_MEM* km = nullptr;
+    BIO_get_mem_ptr(kbio, &km);
+    if (!km || km->length == 0) {
+        BIO_free(kbio);
+        return false;
+    }
+
+    out.assign(reinterpret_cast<const uint8_t*>(km->data),
+               reinterpret_cast<const uint8_t*>(km->data) + km->length);
+    SecureZeroMemory(km->data, km->length);
+    BIO_free(kbio);
+    return true;
+}
+
+static EVP_PKEY* read_private_key_from_pem(const std::vector<uint8_t>& pem) {
+    if (pem.empty() || pem.size() > static_cast<size_t>(INT_MAX))
+        return nullptr;
+    BIO* kbio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+    if (!kbio)
+        return nullptr;
+    EVP_PKEY* raw_key = PEM_read_bio_PrivateKey(kbio, nullptr, nullptr, nullptr);
+    BIO_free(kbio);
+    return raw_key;
+}
+
+static X509* read_certificate_from_pem(const std::vector<uint8_t>& pem) {
+    if (pem.empty() || pem.size() > static_cast<size_t>(INT_MAX))
+        return nullptr;
+    BIO* cbio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+    if (!cbio)
+        return nullptr;
+    X509* raw_cert = PEM_read_bio_X509(cbio, nullptr, nullptr, nullptr);
+    BIO_free(cbio);
+    return raw_cert;
+}
+
+static bool encode_x509_der(X509* cert, std::vector<uint8_t>& out) {
+    out.clear();
+    if (!cert)
+        return false;
+    int der_len = i2d_X509(cert, nullptr);
+    if (der_len <= 0)
+        return false;
+    out.resize(static_cast<size_t>(der_len));
+    uint8_t* p = out.data();
+    int written = i2d_X509(cert, &p);
+    if (written != der_len) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+static bool base64_encode_no_newlines(const uint8_t* data, size_t len, std::string& out) {
+    out.clear();
+    if (!data || len == 0 || len > static_cast<size_t>(INT_MAX))
+        return false;
+
+    BIO* b64 = BIO_new(BIO_f_base64());
+    BIO* bmem = BIO_new(BIO_s_mem());
+    if (!b64 || !bmem) {
+        if (b64) BIO_free(b64);
+        if (bmem) BIO_free(bmem);
+        return false;
+    }
+
+    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+    BIO* chain = BIO_push(b64, bmem);
+    int wrote = BIO_write(chain, data, static_cast<int>(len));
+    if (wrote != static_cast<int>(len) || BIO_flush(chain) != 1) {
+        BIO_free_all(chain);
+        return false;
+    }
+
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(bmem, &bptr);
+    if (!bptr || !bptr->data || bptr->length == 0) {
+        BIO_free_all(chain);
+        return false;
+    }
+
+    out.assign(bptr->data, bptr->length);
+    BIO_free_all(chain);
+    return true;
+}
+
 bool load_root_ca(const std::string& key_path, const std::string& cert_path, root_ca_t& ca) {
     diag::log_tagged_fmt("cert", "load_root_ca entry key_path=%s cert_path=%s", key_path.c_str(), cert_path.c_str());
     std::vector<uint8_t> key_bytes;
@@ -160,42 +349,73 @@ bool load_root_ca(const std::string& key_path, const std::string& cert_path, roo
     }
     diag::log_tagged_fmt("cert", "load_root_ca key file read size=%zu", key_bytes.size());
 
-    BIO* kbio = BIO_new_mem_buf(key_bytes.data(), static_cast<int>(key_bytes.size()));
-    if (!kbio) {
-        diag::log_tagged("cert", "load_root_ca BIO_new_mem_buf for key failed");
-        return false;
+    bool key_protected = has_protected_key_prefix(key_bytes);
+    std::vector<uint8_t> key_pem;
+    if (key_protected) {
+        if (!unprotect_private_key_pem(key_bytes, key_pem)) {
+            diag::log_tagged("cert", "load_root_ca DPAPI private key unwrap failed");
+            return false;
+        }
+        diag::log_tagged_fmt("cert", "load_root_ca DPAPI private key unwrapped pem_size=%zu", key_pem.size());
+    } else {
+        key_pem = key_bytes;
+        diag::log_tagged("cert", "load_root_ca using legacy plaintext private key PEM");
     }
-    EVP_PKEY* raw_key = PEM_read_bio_PrivateKey(kbio, nullptr, nullptr, nullptr);
-    BIO_free(kbio);
-    diag::log_tagged_fmt("cert", "load_root_ca PEM_read_bio_PrivateKey raw_key=%p", raw_key);
-    if (!raw_key) {
+
+    evp_pkey_ptr parsed_key(read_private_key_from_pem(key_pem));
+    diag::log_tagged_fmt("cert", "load_root_ca PEM_read_bio_PrivateKey raw_key=%p", parsed_key.get());
+    if (!parsed_key) {
+        secure_zero_bytes(key_pem);
+        if (!key_protected)
+            secure_zero_bytes(key_bytes);
         diag::log_tagged("cert", "load_root_ca PEM_read_bio_PrivateKey failed");
         return false;
     }
-    ca.key.reset(raw_key);
 
     std::vector<uint8_t> cert_bytes;
     if (!read_file_bytes(cert_path, cert_bytes) || cert_bytes.empty()) {
         diag::log_tagged_fmt("cert", "load_root_ca read cert file failed path=%s", cert_path.c_str());
+        secure_zero_bytes(key_pem);
+        if (!key_protected)
+            secure_zero_bytes(key_bytes);
         return false;
     }
     diag::log_tagged_fmt("cert", "load_root_ca cert file read size=%zu", cert_bytes.size());
 
-    BIO* cbio = BIO_new_mem_buf(cert_bytes.data(), static_cast<int>(cert_bytes.size()));
-    if (!cbio) {
-        diag::log_tagged("cert", "load_root_ca BIO_new_mem_buf for cert failed");
-        return false;
-    }
-    X509* raw_cert = PEM_read_bio_X509(cbio, nullptr, nullptr, nullptr);
-    BIO_free(cbio);
-    diag::log_tagged_fmt("cert", "load_root_ca PEM_read_bio_X509 raw_cert=%p", raw_cert);
-    if (!raw_cert) {
+    x509_ptr parsed_cert(read_certificate_from_pem(cert_bytes));
+    diag::log_tagged_fmt("cert", "load_root_ca PEM_read_bio_X509 raw_cert=%p", parsed_cert.get());
+    if (!parsed_cert) {
+        secure_zero_bytes(key_pem);
+        if (!key_protected)
+            secure_zero_bytes(key_bytes);
         diag::log_tagged("cert", "load_root_ca PEM_read_bio_X509 failed");
         return false;
     }
-    ca.cert.reset(raw_cert);
+
+    if (X509_check_private_key(parsed_cert.get(), parsed_key.get()) != 1) {
+        secure_zero_bytes(key_pem);
+        if (!key_protected)
+            secure_zero_bytes(key_bytes);
+        diag::log_tagged("cert", "load_root_ca certificate/private key mismatch");
+        return false;
+    }
+
+    if (!key_protected) {
+        if (!write_protected_private_key_pem(key_path, key_pem)) {
+            secure_zero_bytes(key_pem);
+            secure_zero_bytes(key_bytes);
+            diag::log_tagged("cert", "load_root_ca legacy private key migration failed");
+            return false;
+        }
+        diag::log_tagged("cert", "load_root_ca legacy private key migrated to DPAPI storage");
+        secure_zero_bytes(key_bytes);
+    }
+
+    ca.key = std::move(parsed_key);
+    ca.cert = std::move(parsed_cert);
 
     ca.valid = true;
+    secure_zero_bytes(key_pem);
     diag::log_tagged("cert", "load_root_ca success");
     return true;
 }
@@ -211,28 +431,19 @@ bool save_root_ca(const root_ca_t& ca, const std::string& key_path, const std::s
     if (kp.has_parent_path())
         std::filesystem::create_directories(kp.parent_path());
 
-    BIO* kbio = BIO_new(BIO_s_mem());
-    if (!kbio) {
-        diag::log_tagged("cert", "save_root_ca BIO_new for key failed");
+    std::vector<uint8_t> key_pem;
+    if (!encode_private_key_pem(ca, key_pem)) {
+        diag::log_tagged("cert", "save_root_ca encode private key PEM failed");
         return false;
     }
-    int wrote = PEM_write_bio_PrivateKey(kbio, ca.key.get(), nullptr, nullptr, 0, nullptr, nullptr);
-    diag::log_tagged_fmt("cert", "save_root_ca PEM_write_bio_PrivateKey wrote=%d", wrote);
-    if (!wrote) {
-        BIO_free(kbio);
-        diag::log_tagged("cert", "save_root_ca PEM_write_bio_PrivateKey failed");
+    bool key_ok = write_protected_private_key_pem(key_path, key_pem);
+    size_t key_len = key_pem.size();
+    secure_zero_bytes(key_pem);
+    if (!key_ok) {
+        diag::log_tagged_fmt("cert", "save_root_ca write protected key file failed path=%s", key_path.c_str());
         return false;
     }
-    BUF_MEM* km = nullptr;
-    BIO_get_mem_ptr(kbio, &km);
-    if (!km || km->length == 0 ||
-        !write_file_bytes(key_path, reinterpret_cast<const uint8_t*>(km->data), km->length)) {
-        BIO_free(kbio);
-        diag::log_tagged_fmt("cert", "save_root_ca write key file failed path=%s", key_path.c_str());
-        return false;
-    }
-    diag::log_tagged_fmt("cert", "save_root_ca key file written len=%zu path=%s", km->length, key_path.c_str());
-    BIO_free(kbio);
+    diag::log_tagged_fmt("cert", "save_root_ca protected key file written pem_len=%zu path=%s", key_len, key_path.c_str());
 
     std::filesystem::path cp(std::filesystem::u8path(cert_path));
     if (cp.has_parent_path())
@@ -243,7 +454,7 @@ bool save_root_ca(const root_ca_t& ca, const std::string& key_path, const std::s
         diag::log_tagged("cert", "save_root_ca BIO_new for cert failed");
         return false;
     }
-    wrote = PEM_write_bio_X509(cbio, ca.cert.get());
+    int wrote = PEM_write_bio_X509(cbio, ca.cert.get());
     diag::log_tagged_fmt("cert", "save_root_ca PEM_write_bio_X509 wrote=%d", wrote);
     if (!wrote) {
         BIO_free(cbio);
@@ -265,6 +476,88 @@ bool save_root_ca(const root_ca_t& ca, const std::string& key_path, const std::s
     return true;
 }
 
+std::string spki_sha256_base64(const root_ca_t& ca) {
+    diag::log_tagged_fmt("cert", "spki_sha256_base64 entry ca_valid=%d ca_cert=%p", (int)ca.valid, ca.cert.get());
+    if (!ca.valid || !ca.cert)
+        return {};
+
+    const X509_PUBKEY* pubkey = X509_get_X509_PUBKEY(ca.cert.get());
+    if (!pubkey) {
+        diag::log_tagged("cert", "spki_sha256_base64 X509_get_X509_PUBKEY failed");
+        return {};
+    }
+
+    int der_len = i2d_X509_PUBKEY(pubkey, nullptr);
+    diag::log_tagged_fmt("cert", "spki_sha256_base64 SPKI DER len=%d", der_len);
+    if (der_len <= 0)
+        return {};
+
+    std::vector<uint8_t> der(static_cast<size_t>(der_len));
+    uint8_t* p = der.data();
+    int written = i2d_X509_PUBKEY(pubkey, &p);
+    if (written != der_len) {
+        diag::log_tagged_fmt("cert", "spki_sha256_base64 i2d_X509_PUBKEY written=%d expected=%d", written, der_len);
+        return {};
+    }
+
+    uint8_t digest[EVP_MAX_MD_SIZE] = {};
+    unsigned int digest_len = 0;
+    int rc = EVP_Digest(der.data(), der.size(), digest, &digest_len, EVP_sha256(), nullptr);
+    if (rc != 1 || digest_len != 32) {
+        diag::log_tagged_fmt("cert", "spki_sha256_base64 EVP_Digest failed rc=%d digest_len=%u", rc, digest_len);
+        return {};
+    }
+
+    std::string encoded;
+    if (!base64_encode_no_newlines(digest, digest_len, encoded)) {
+        diag::log_tagged("cert", "spki_sha256_base64 base64 encode failed");
+        return {};
+    }
+    diag::log_tagged_fmt("cert", "spki_sha256_base64 success len=%zu", encoded.size());
+    return encoded;
+}
+
+bool export_ca_certificate_der(const root_ca_t& ca, std::vector<uint8_t>& out) {
+    diag::log_tagged_fmt("cert", "export_ca_certificate_der entry ca_valid=%d ca_cert=%p", (int)ca.valid, ca.cert.get());
+    if (!ca.valid || !ca.cert) {
+        out.clear();
+        return false;
+    }
+    bool ok = encode_x509_der(ca.cert.get(), out);
+    diag::log_tagged_fmt("cert", "export_ca_certificate_der ok=%d len=%zu", (int)ok, out.size());
+    return ok;
+}
+
+bool export_ca_certificate_pem(const root_ca_t& ca, std::string& out) {
+    diag::log_tagged_fmt("cert", "export_ca_certificate_pem entry ca_valid=%d ca_cert=%p", (int)ca.valid, ca.cert.get());
+    out.clear();
+    if (!ca.valid || !ca.cert)
+        return false;
+
+    BIO* cbio = BIO_new(BIO_s_mem());
+    if (!cbio)
+        return false;
+
+    int wrote = PEM_write_bio_X509(cbio, ca.cert.get());
+    diag::log_tagged_fmt("cert", "export_ca_certificate_pem PEM_write_bio_X509 wrote=%d", wrote);
+    if (!wrote) {
+        BIO_free(cbio);
+        return false;
+    }
+
+    BUF_MEM* cm = nullptr;
+    BIO_get_mem_ptr(cbio, &cm);
+    if (!cm || !cm->data || cm->length == 0) {
+        BIO_free(cbio);
+        return false;
+    }
+
+    out.assign(cm->data, cm->length);
+    BIO_free(cbio);
+    diag::log_tagged_fmt("cert", "export_ca_certificate_pem success len=%zu", out.size());
+    return true;
+}
+
 
 bool install_root_ca(const root_ca_t& ca) {
     diag::log_tagged_fmt("cert", "install_root_ca entry ca_valid=%d ca_cert=%p", (int)ca.valid, ca.cert.get());
@@ -273,16 +566,12 @@ bool install_root_ca(const root_ca_t& ca) {
         return false;
     }
 
-    int der_len = i2d_X509(ca.cert.get(), nullptr);
-    diag::log_tagged_fmt("cert", "install_root_ca DER encode len=%d", der_len);
-    if (der_len <= 0) {
+    std::vector<uint8_t> der;
+    if (!encode_x509_der(ca.cert.get(), der)) {
         diag::log_tagged("cert", "install_root_ca i2d_X509 failed");
         return false;
     }
-
-    std::vector<uint8_t> der(der_len);
-    uint8_t* p = der.data();
-    i2d_X509(ca.cert.get(), &p);
+    diag::log_tagged_fmt("cert", "install_root_ca DER encode len=%zu", der.size());
 
     HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, 0,
         CERT_SYSTEM_STORE_CURRENT_USER, L"ROOT");
@@ -306,16 +595,12 @@ bool remove_root_ca(const root_ca_t& ca) {
         return false;
     }
 
-    int der_len = i2d_X509(ca.cert.get(), nullptr);
-    diag::log_tagged_fmt("cert", "remove_root_ca DER encode len=%d", der_len);
-    if (der_len <= 0) {
+    std::vector<uint8_t> der;
+    if (!encode_x509_der(ca.cert.get(), der)) {
         diag::log_tagged("cert", "remove_root_ca i2d_X509 failed");
         return false;
     }
-
-    std::vector<uint8_t> der(der_len);
-    uint8_t* p = der.data();
-    i2d_X509(ca.cert.get(), &p);
+    diag::log_tagged_fmt("cert", "remove_root_ca DER encode len=%zu", der.size());
 
     HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, 0,
         CERT_SYSTEM_STORE_CURRENT_USER, L"ROOT");
@@ -354,16 +639,12 @@ bool is_root_ca_installed(const root_ca_t& ca) {
         return false;
     }
 
-    int der_len = i2d_X509(ca.cert.get(), nullptr);
-    diag::log_tagged_fmt("cert", "is_root_ca_installed DER encode len=%d", der_len);
-    if (der_len <= 0) {
+    std::vector<uint8_t> der;
+    if (!encode_x509_der(ca.cert.get(), der)) {
         diag::log_tagged("cert", "is_root_ca_installed i2d_X509 failed");
         return false;
     }
-
-    std::vector<uint8_t> der(der_len);
-    uint8_t* p = der.data();
-    i2d_X509(ca.cert.get(), &p);
+    diag::log_tagged_fmt("cert", "is_root_ca_installed DER encode len=%zu", der.size());
 
     HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, 0,
         CERT_SYSTEM_STORE_CURRENT_USER, L"ROOT");
@@ -578,6 +859,11 @@ bool initialize() {
     }
     bool save_ok = save_root_ca(g_root_ca, key_path, cert_path);
     diag::log_tagged_fmt("cert", "initialize save_root_ca ok=%d", (int)save_ok);
+    if (!save_ok) {
+        diag::log_tagged("cert", "initialize save_root_ca failed");
+        g_root_ca = root_ca_t{};
+        return false;
+    }
 
     g_initialized = true;
     diag::log_tagged("cert", "initialize complete");

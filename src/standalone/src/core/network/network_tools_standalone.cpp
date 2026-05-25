@@ -73,6 +73,18 @@ static std::string protocol_name(std::uint32_t proto) {
     }
 }
 
+static bool process_exists(std::uint32_t pid) {
+    if (pid == 0 || pid == 4)
+        return false;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h)
+        return false;
+    DWORD exit_code = 0;
+    const bool alive = GetExitCodeProcess(h, &exit_code) && exit_code == STILL_ACTIVE;
+    CloseHandle(h);
+    return alive;
+}
+
 static std::string tcp_state_name(std::uint32_t state) {
     switch (state) {
         case 0: return "CLOSED";
@@ -581,6 +593,10 @@ tool_result_t network_block_process(const json& params)
 
     std::uint32_t pid = params["pid"].get<std::uint32_t>();
     diag::log_tagged_fmt("net_tools", "network_block_process pid=%u", pid);
+    if (!process_exists(pid)) {
+        diag::log_tagged_fmt("net_tools", "network_block_process rejected missing pid=%u", pid);
+        return tool_result_t::error(OBFSTR("Cannot block network traffic for a process that is not running."));
+    }
 
     std::uint32_t rule_id = 0;
     bool proc_ok = driver_bridge::add_filter_rule(1, 2, 0, pid, 0, nullptr, nullptr, &rule_id);
@@ -1479,6 +1495,14 @@ tool_result_t network_release_packet(const json& params)
 
     std::uint64_t hold_id = params["hold_id"].get<std::uint64_t>();
     diag::log_tagged_fmt("net_tools", "network_release_packet hold_id=%llu", static_cast<unsigned long long>(hold_id));
+    auto held = driver_bridge::get_held_packets();
+    const bool hold_exists = std::any_of(held.begin(), held.end(), [hold_id](const auto& h) {
+        return h.hold_id == hold_id;
+    });
+    diag::log_tagged_fmt("net_tools", "network_release_packet held_count=%zu hold_exists=%d", held.size(), hold_exists ? 1 : 0);
+    if (!hold_exists)
+        return tool_result_t::error(OBFSTR("Held packet ID was not found."));
+
     std::vector<std::uint8_t> modify_payload;
     std::uint32_t operation = 3;
 
@@ -2284,7 +2308,13 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         {{OBFSTR("name"), OBFSTR("string"), OBFSTR("Script name to unload"), true}},
         [](const json& args) -> tool_result_t {
             std::string name = args.value("name", "");
-            script_engine::unload_script(name);
+            diag::log_tagged_fmt("net_tools", "network_script_unload name=%s", name.c_str());
+            if (name.empty())
+                return tool_result_t::error("Missing required parameter: name");
+            if (!script_engine::unload_script(name)) {
+                diag::log_tagged_fmt("net_tools", "network_script_unload not_loaded name=%s", name.c_str());
+                return tool_result_t::error("Script '" + name + "' is not loaded");
+            }
             return tool_result_t::ok("Script '" + name + "' unloaded");
         }, false});
 
@@ -2472,6 +2502,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         OBFSTR("Pre-encryption page guard sniffer. Installs a VEH-based PAGE_GUARD trap on a "
                "target memory region in another process to capture all reads/writes before "
                "encryption occurs. Uses page-fault + single-step re-arm (no HW breakpoint limit). "
+               "Capture output includes bounded plaintext and hex previews from the guarded region. "
                "Operations: 'install' (pid, address, size) returns session_id; "
                "'get_captures' (session_id) drains pending captures; "
                "'uninstall' (session_id) removes the guard and restores protection; "
@@ -2533,30 +2564,32 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                     return tool_result_t::error("'session_id' is required");
 
                 diag::log_tagged_fmt("net_tools", "network_pg_sniff get_captures sid=%u", sid);
-                auto caps = page_guard_engine::g_pg_engine.get_captures(sid);
+                auto caps = page_guard_engine::g_pg_engine.get_capture_records(sid);
                 diag::log_tagged_fmt("net_tools", "network_pg_sniff get_captures count=%zu", caps.size());
                 json arr  = json::array();
                 for (auto& c : caps) {
+                    const auto& meta = c.metadata;
                     json o;
                     char buf[32];
                     snprintf(buf, sizeof(buf), "0x%llX",
-                             static_cast<unsigned long long>(c.fault_addr));
+                             static_cast<unsigned long long>(meta.fault_addr));
                     o["fault_addr"]     = buf;
                     snprintf(buf, sizeof(buf), "0x%llX",
-                             static_cast<unsigned long long>(c.rip));
+                             static_cast<unsigned long long>(meta.rip));
                     o["rip"]            = buf;
                     snprintf(buf, sizeof(buf), "0x%llX",
-                             static_cast<unsigned long long>(c.ctx_rax));
+                             static_cast<unsigned long long>(meta.ctx_rax));
                     o["rax"]            = buf;
                     snprintf(buf, sizeof(buf), "0x%llX",
-                             static_cast<unsigned long long>(c.ctx_rcx));
+                             static_cast<unsigned long long>(meta.ctx_rcx));
                     o["rcx"]            = buf;
                     snprintf(buf, sizeof(buf), "0x%llX",
-                             static_cast<unsigned long long>(c.ctx_rdx));
+                             static_cast<unsigned long long>(meta.ctx_rdx));
                     o["rdx"]            = buf;
-                    o["timestamp"]      = c.timestamp;
-                    o["exception_code"] = c.exception_code;
-                    o["access_type"]    = c.access_type == 0 ? "read" : "write";
+                    o["timestamp"]      = meta.timestamp;
+                    o["exception_code"] = meta.exception_code;
+                    o["access_type"]    = meta.access_type == 0 ? "read" : (meta.access_type == 8 ? "execute" : "write");
+                    page_guard_engine::serialize_payload_fields(o, c);
                     arr.push_back(o);
                 }
                 json r;
@@ -2681,10 +2714,10 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         OBFSTR("network_pre_encrypt_hook"), OBFSTR("network"),
         OBFSTR("Hook SSL/TLS encryption functions to capture plaintext data before encryption. "
                "Auto-detects SSL_write, PR_Write, EncryptMessage, send, WSASend across OpenSSL, NSS, Schannel, Winsock. "
-               "Uses hardware breakpoints (DR0-DR3) to intercept buffers without code modification. "
+               "Uses hardware breakpoints (DR0-DR3) with normal Windows debug-event delivery for authorized lab targets. "
                "Operations: auto_hook (auto-detect and hook), hook_address (manual), unhook_all, get_captures, clear, status."),
         {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("Operation: auto_hook|hook_address|unhook_all|get_captures|clear|status"), true},
-         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID for auto_hook"), false},
+         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID for auto_hook or hook_address"), false},
          {OBFSTR("address"), OBFSTR("string"), OBFSTR("Hex address for hook_address (e.g. '0x7FFA1234')"), false},
          {OBFSTR("name"), OBFSTR("string"), OBFSTR("Function name label for hook_address"), false},
          {OBFSTR("buffer_reg"), OBFSTR("number"), OBFSTR("Register index for buffer ptr: 0=RCX 1=RDX 2=R8 3=R9"), false},
@@ -2705,21 +2738,30 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                     diag::log_tagged_fmt("net_tools", "network_pre_encrypt_hook auto_hook failed pid=%u", pid);
                     return tool_result_t::error("Failed to auto-hook encryption functions in PID " + std::to_string(pid));
                 }
-                pre_encrypt_hook::start_polling();
+                if (!pre_encrypt_hook::start_polling()) {
+                    DWORD err = pre_encrypt_hook::g_state.debugger_error.load();
+                    pre_encrypt_hook::unhook_all();
+                    return tool_result_t::error("Failed to start authorized debug capture for PID " + std::to_string(pid) +
+                                                ", error=" + std::to_string(static_cast<unsigned long>(err)));
+                }
                 json r;
                 std::lock_guard<std::mutex> lock(pre_encrypt_hook::g_state.mutex);
                 diag::log_tagged_fmt("net_tools", "network_pre_encrypt_hook auto_hook hooks=%zu", pre_encrypt_hook::g_state.targets.size());
                 r["hooks_installed"] = static_cast<int>(pre_encrypt_hook::g_state.targets.size());
+                uint32_t armed_thread_breakpoints = 0;
                 json hooks = json::array();
                 for (const auto& t : pre_encrypt_hook::g_state.targets) {
+                    armed_thread_breakpoints += static_cast<uint32_t>(t.armed_tids.size());
                     if (t.active) {
                         json h;
                         h["name"] = t.function_name;
                         h["address"] = (std::ostringstream() << "0x" << std::hex << t.address).str();
                         h["bp_slot"] = t.bp_index;
+                        h["armed_threads"] = static_cast<int>(t.armed_tids.size());
                         hooks.push_back(h);
                     }
                 }
+                r["armed_thread_breakpoints"] = armed_thread_breakpoints;
                 r["hooks"] = hooks;
                 return tool_result_t::ok("Hooked " + std::to_string(hooks.size()) + " encryption functions", r);
             }
@@ -2727,13 +2769,37 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 std::string addr_str = args.value("address", "");
                 if (addr_str.empty())
                     return tool_result_t::error("Missing 'address' parameter");
+                uint32_t pid = args.value("pid", static_cast<uint32_t>(0));
+                if (pid != 0 && driver_bridge::attached_pid() != pid) {
+                    bool already_attached = false;
+                    const auto attached = driver_bridge::attached_pids();
+                    for (uint32_t attached_pid : attached) {
+                        if (attached_pid == pid) {
+                            already_attached = true;
+                            break;
+                        }
+                    }
+                    if (already_attached) {
+                        if (!driver_bridge::set_active_pid(pid))
+                            return tool_result_t::error("Failed to select PID " + std::to_string(pid));
+                    } else if (!driver_bridge::attach(pid)) {
+                        return tool_result_t::error("Failed to attach PID " + std::to_string(pid));
+                    }
+                }
+                if (pid == 0 && driver_bridge::attached_pid() == 0)
+                    return tool_result_t::error("Missing 'pid' parameter and no driver target is attached");
                 uint64_t addr = std::strtoull(addr_str.c_str(), nullptr, 16);
                 std::string name = args.value("name", "custom_hook");
                 uint32_t buf_reg = args.value("buffer_reg", static_cast<uint32_t>(1));
                 uint32_t sz_reg = args.value("size_reg", static_cast<uint32_t>(2));
                 if (!pre_encrypt_hook::hook_address(addr, name, buf_reg, sz_reg))
                     return tool_result_t::error("Failed to hook address " + addr_str);
-                pre_encrypt_hook::start_polling();
+                if (!pre_encrypt_hook::start_polling()) {
+                    DWORD err = pre_encrypt_hook::g_state.debugger_error.load();
+                    pre_encrypt_hook::unhook_all();
+                    return tool_result_t::error("Failed to start authorized debug capture for address " + addr_str +
+                                                ", error=" + std::to_string(static_cast<unsigned long>(err)));
+                }
                 return tool_result_t::ok("Hooked " + name + " at " + addr_str);
             }
             if (op == "unhook_all") {
@@ -2780,9 +2846,16 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             if (op == "status") {
                 json r;
                 r["active"] = pre_encrypt_hook::is_active();
+                r["debug_attached"] = pre_encrypt_hook::g_state.debug_attached.load();
+                r["debug_loop_running"] = pre_encrypt_hook::g_state.debug_loop_running.load();
+                r["debugger_error"] = static_cast<unsigned long>(pre_encrypt_hook::g_state.debugger_error.load());
                 std::lock_guard<std::mutex> lock(pre_encrypt_hook::g_state.mutex);
                 r["hook_count"] = static_cast<int>(pre_encrypt_hook::g_state.targets.size());
                 r["capture_count"] = static_cast<int>(pre_encrypt_hook::g_state.captures.size());
+                uint32_t armed_thread_breakpoints = 0;
+                for (const auto& t : pre_encrypt_hook::g_state.targets)
+                    armed_thread_breakpoints += static_cast<uint32_t>(t.armed_tids.size());
+                r["armed_thread_breakpoints"] = armed_thread_breakpoints;
                 return tool_result_t::ok(pre_encrypt_hook::is_active() ? "Active" : "Inactive", r);
             }
             return tool_result_t::error("Unknown operation '" + op + "'. Use auto_hook|hook_address|unhook_all|get_captures|clear|status");

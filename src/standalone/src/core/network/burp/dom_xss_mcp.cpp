@@ -206,12 +206,13 @@ tool_result_t tool_test_payload(const json& params)
     if (per_timeout < 1000)  per_timeout = 1000;
     if (per_timeout > 30000) per_timeout = 30000;
 
-    if (!camoufox::is_ready())
+    if (!camoufox::ensure_ready())
     {
         auto st = camoufox::get_status();
+        std::string err = st.last_error.empty() ? camoufox::last_error() : st.last_error;
         diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload bridge_not_ready state=%d errors=%llu last_error_len=%zu",
             static_cast<int>(st.state), static_cast<unsigned long long>(st.total_errors), st.last_error.size());
-        return tool_result_t::error("camoufox bridge not ready");
+        return tool_result_t::error(err.empty() ? std::string("camoufox bridge not ready") : err);
     }
     if (!scope::in_scope(target_url))
     {
@@ -281,11 +282,12 @@ tool_result_t tool_scan(const json& params)
     const std::string target_url = params["target_url"].get<std::string>();
     diag::log_tagged_fmt("mcp_burp", "dom_xss_scan request url_len=%zu has_raw=%d has_raw_b64=%d",
         target_url.size(), (int)params.contains("raw_request"), (int)params.contains("raw_request_b64"));
-    if (!camoufox::is_ready()) {
+    if (!camoufox::ensure_ready()) {
         auto st = camoufox::get_status();
+        std::string err = st.last_error.empty() ? camoufox::last_error() : st.last_error;
         diag::log_tagged_fmt("mcp_burp", "dom_xss_scan bridge_not_ready state=%d errors=%llu last_error_len=%zu",
             static_cast<int>(st.state), static_cast<unsigned long long>(st.total_errors), st.last_error.size());
-        return tool_result_t::error("camoufox bridge not ready");
+        return tool_result_t::error(err.empty() ? std::string("camoufox bridge not ready") : err);
     }
     if (!scope::in_scope(target_url)) {
         diag::log_tagged_fmt("mcp_burp", "dom_xss_scan out_of_scope url_len=%zu", target_url.size());

@@ -10,6 +10,7 @@
 
 #include "browser_launch.hpp"
 
+#include "../cert_generator.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -33,6 +34,8 @@ struct tracked_pid_t
     std::string profile_path;
     uint16_t    proxy_port = 0;
     uint64_t    launched_ms = 0;
+    certificate_strategy_t certificate_strategy = certificate_strategy_t::chromium_spki_allowlist;
+    std::string spki_hash_prefix;
 };
 
 struct state_t
@@ -162,6 +165,45 @@ bool quote_path(const std::string& in, std::wstring& out)
     out.append(w);
     out.push_back(L'"');
     return true;
+}
+
+certificate_strategy_t release_safe_strategy(certificate_strategy_t strategy)
+{
+    if (strategy == certificate_strategy_t::unsafe_ignore_all_for_debug_builds_only &&
+        !certificate_strategy_debug_only_available()) {
+        return certificate_strategy_t::trust_store_only;
+    }
+    return strategy;
+}
+
+std::string resolve_spki_allowlist(const browser_launch_config_t& cfg)
+{
+    if (release_safe_strategy(cfg.certificate_strategy) != certificate_strategy_t::chromium_spki_allowlist)
+        return std::string();
+    if (!cfg.spki_allowlist.empty()) return cfg.spki_allowlist;
+    if (!::cert_generator::is_ready()) {
+        if (!::cert_generator::initialize()) {
+            diag::log_tagged("browser", "spki initialize_failed");
+            return std::string();
+        }
+    }
+    if (!::cert_generator::is_ready()) {
+        diag::log_tagged("browser", "spki cert_not_ready");
+        return std::string();
+    }
+    std::string hash = ::cert_generator::spki_sha256_base64(::cert_generator::get_root_ca());
+    if (hash.empty()) {
+        diag::log_tagged("browser", "spki hash_empty");
+    }
+    return hash;
+}
+
+browser_launch_config_t effective_config(const browser_launch_config_t& cfg)
+{
+    browser_launch_config_t effective = cfg;
+    effective.certificate_strategy = release_safe_strategy(cfg.certificate_strategy);
+    effective.spki_allowlist = resolve_spki_allowlist(effective);
+    return effective;
 }
 
 }
@@ -301,6 +343,61 @@ std::string compute_profile_path(const std::string& subdir)
     return base;
 }
 
+bool certificate_strategy_debug_only_available()
+{
+#if defined(_DEBUG) || !defined(NDEBUG)
+    return true;
+#else
+    return false;
+#endif
+}
+
+const char* certificate_strategy_name(certificate_strategy_t strategy)
+{
+    switch (strategy) {
+    case certificate_strategy_t::trust_store_only:
+        return "trust_store_only";
+    case certificate_strategy_t::chromium_spki_allowlist:
+        return "chromium_spki_allowlist";
+    case certificate_strategy_t::unsafe_ignore_all_for_debug_builds_only:
+        return "unsafe_ignore_all_for_debug_builds_only";
+    default:
+        return "trust_store_only";
+    }
+}
+
+bool certificate_strategy_from_string(const std::string& name, certificate_strategy_t& out)
+{
+    if (name == "trust_store_only") {
+        out = certificate_strategy_t::trust_store_only;
+        return true;
+    }
+    if (name == "chromium_spki_allowlist") {
+        out = certificate_strategy_t::chromium_spki_allowlist;
+        return true;
+    }
+    if (name == "unsafe_ignore_all_for_debug_builds_only") {
+        out = certificate_strategy_t::unsafe_ignore_all_for_debug_builds_only;
+        return true;
+    }
+    return false;
+}
+
+std::string spki_hash_prefix(const std::string& allowlist)
+{
+    if (allowlist.empty()) return std::string();
+    size_t end = allowlist.find(',');
+    std::string first = allowlist.substr(0, end == std::string::npos ? allowlist.size() : end);
+    while (!first.empty() && (first.back() == ' ' || first.back() == '\t' || first.back() == '\r' || first.back() == '\n'))
+        first.pop_back();
+    size_t start = 0;
+    while (start < first.size() && (first[start] == ' ' || first[start] == '\t' || first[start] == '\r' || first[start] == '\n'))
+        ++start;
+    if (start > 0) first.erase(0, start);
+    if (first.size() <= 12) return first;
+    return first.substr(0, 12);
+}
+
 namespace {
 
 void remove_directory_recursive(const std::string& path)
@@ -326,22 +423,30 @@ std::wstring build_command_line(const std::string& browser_path,
     cmd.append(utf8_to_wide(proxy_arg));
 
     std::wstring quoted_profile;
-    if (quote_path(std::string("--user-data-dir=") + profile_path, quoted_profile)) {
-        cmd.push_back(L' ');
-        cmd.append(quoted_profile);
-    }
+    if (!quote_path(std::string("--user-data-dir=") + profile_path, quoted_profile)) return std::wstring();
+    cmd.push_back(L' ');
+    cmd.append(quoted_profile);
 
     cmd.append(L" --no-first-run");
     cmd.append(L" --no-default-browser-check");
     cmd.append(L" --disable-features=msEdgeUserDataIntegrity");
     cmd.append(L" --disable-sync");
     cmd.append(L" --proxy-bypass-list=<-loopback>");
+    cmd.append(L" --disable-quic");
     cmd.append(L" --disable-features=ChromeWhatsNewUI,MSAccountAuthMenu");
 
-    if (cfg.ignore_cert_errors) {
+    if (cfg.certificate_strategy == certificate_strategy_t::chromium_spki_allowlist &&
+        !cfg.spki_allowlist.empty()) {
+        cmd.append(L" --ignore-certificate-errors-spki-list=");
+        cmd.append(utf8_to_wide(cfg.spki_allowlist));
+    }
+
+#if defined(_DEBUG) || !defined(NDEBUG)
+    if (cfg.certificate_strategy == certificate_strategy_t::unsafe_ignore_all_for_debug_builds_only) {
         cmd.append(L" --ignore-certificate-errors");
         cmd.append(L" --test-type");
     }
+#endif
 
     if (!cfg.initial_url.empty()) {
         std::wstring qurl;
@@ -358,12 +463,23 @@ std::wstring build_command_line(const std::string& browser_path,
 
 }
 
+std::wstring build_command_line_for_test(const std::string& browser_path,
+                                         const browser_launch_config_t& cfg,
+                                         const std::string& profile_path)
+{
+    browser_launch_config_t effective = cfg;
+    effective.certificate_strategy = release_safe_strategy(effective.certificate_strategy);
+    return build_command_line(browser_path, effective, profile_path);
+}
+
 bool launch(const browser_launch_config_t& cfg, uint32_t& out_pid)
 {
-    diag::log_tagged_fmt("browser", "launch entry prefer_chrome=%d proxy=%s:%u url=%s ignore_cert=%d",
+    browser_launch_config_t effective = effective_config(cfg);
+    diag::log_tagged_fmt("browser", "launch entry prefer_chrome=%d proxy=%s:%u url=%s cert_strategy=%s spki_prefix=%s",
         static_cast<int>(cfg.prefer_chrome), cfg.proxy_host.c_str(),
         static_cast<unsigned>(cfg.proxy_port), cfg.initial_url.c_str(),
-        static_cast<int>(cfg.ignore_cert_errors));
+        certificate_strategy_name(effective.certificate_strategy),
+        spki_hash_prefix(effective.spki_allowlist).c_str());
     out_pid = 0;
     auto& st = s();
     if (!st.initialized.load()) initialize();
@@ -400,7 +516,7 @@ bool launch(const browser_launch_config_t& cfg, uint32_t& out_pid)
         std::filesystem::create_directories(profile_path, ec);
     }
 
-    std::wstring cmdline = build_command_line(browser_path, cfg, profile_path);
+    std::wstring cmdline = build_command_line(browser_path, effective, profile_path);
     if (cmdline.empty()) {
         diag::log_tagged_fmt("browser", "launch build_cmdline_failed");
         set_err("build_cmdline_failed");
@@ -444,8 +560,10 @@ bool launch(const browser_launch_config_t& cfg, uint32_t& out_pid)
     rec.pid = out_pid;
     rec.browser_path = browser_path;
     rec.profile_path = profile_path;
-    rec.proxy_port = cfg.proxy_port;
+    rec.proxy_port = effective.proxy_port;
     rec.launched_ms = now_ms();
+    rec.certificate_strategy = effective.certificate_strategy;
+    rec.spki_hash_prefix = spki_hash_prefix(effective.spki_allowlist);
 
     {
         std::lock_guard<std::mutex> lk(st.mtx);
@@ -548,6 +666,8 @@ std::vector<browser_status_t> list_running()
         s.profile_path = r.profile_path;
         s.proxy_port = r.proxy_port;
         s.launched_ms = r.launched_ms;
+        s.certificate_strategy = r.certificate_strategy;
+        s.spki_hash_prefix = r.spki_hash_prefix;
         s.running = is_process_alive(r.pid);
         if (!s.running) {
             diag::log_tagged_fmt("browser", "list_running dead_process pid=%u removing", r.pid);

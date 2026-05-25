@@ -106,6 +106,48 @@ static std::string snake_to_title(const std::string& name)
     return result;
 }
 
+static std::string lower_ascii(std::string text)
+{
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return text;
+}
+
+static bool json_bool_param(const json& params, const char* name)
+{
+    if (!params.is_object() || !params.contains(name))
+        return false;
+    const auto& value = params[name];
+    if (value.is_boolean())
+        return value.get<bool>();
+    if (value.is_string()) {
+        const std::string v = lower_ascii(value.get<std::string>());
+        return v == "1" || v == "true" || v == "yes" || v == "full";
+    }
+    return false;
+}
+
+static bool wants_full_tool_list(const json& params)
+{
+    if (!params.is_object())
+        return false;
+    if (json_bool_param(params, "full") ||
+        json_bool_param(params, "includeDescriptions") ||
+        json_bool_param(params, "include_descriptions") ||
+        json_bool_param(params, "includeSchema") ||
+        json_bool_param(params, "include_schema")) {
+        return true;
+    }
+    if (params.contains("detail") && params["detail"].is_string()) {
+        const std::string detail = lower_ascii(params["detail"].get<std::string>());
+        return detail == "full" || detail == "description" ||
+               detail == "descriptions" || detail == "schema" ||
+               detail == "schemas";
+    }
+    return false;
+}
+
 static std::string format_sse_event(const std::string& event_type, const std::string& data)
 {
     std::string result;
@@ -289,8 +331,9 @@ bool server_t::register_tool(tool_def_t tool)
     for (const auto& p : tool.params) {
         if (p.name == "binary_id") { already_has_binary_id = true; break; }
     }
-    bool is_session_tool = tool.name.rfind("sessions_", 0) == 0;
-    if (!already_has_binary_id && !is_session_tool) {
+    bool is_targetless_tool = tool.name.rfind("sessions_", 0) == 0 ||
+                              tool.name == "get_tool_descriptions";
+    if (!already_has_binary_id && !is_targetless_tool) {
         tool.params.push_back(tool_param_t{
             "binary_id",
             "string",
@@ -340,8 +383,15 @@ json server_t::make_error(const json& id, int code, const std::string& msg)
     return r;
 }
 
-json server_t::tool_schema(const tool_def_t& tool) const
+json server_t::tool_schema(const tool_def_t& tool, bool compact) const
 {
+    if (compact && tool.name != "get_tool_descriptions") {
+        return json{
+            {"name", tool.name},
+            {"inputSchema", json{{"type", "object"}}}
+        };
+    }
+
     json input_schema;
     input_schema["type"] = "object";
     json properties = json::object();
@@ -373,6 +423,116 @@ json server_t::tool_schema(const tool_def_t& tool) const
     return t;
 }
 
+tool_result_t server_t::describe_tools(const json& params)
+{
+    std::vector<std::string> names;
+    if (params.is_object()) {
+        if (params.contains("names") && params["names"].is_array()) {
+            for (const auto& n : params["names"]) {
+                if (n.is_string())
+                    names.push_back(n.get<std::string>());
+            }
+        } else if (params.contains("names") && params["names"].is_string()) {
+            names.push_back(params["names"].get<std::string>());
+        }
+        if (params.contains("name") && params["name"].is_string())
+            names.push_back(params["name"].get<std::string>());
+    }
+
+    std::string prefix;
+    std::string query;
+    bool include_schema = true;
+    int limit = 40;
+    if (params.is_object()) {
+        if (params.contains("prefix") && params["prefix"].is_string())
+            prefix = params["prefix"].get<std::string>();
+        if (params.contains("query") && params["query"].is_string())
+            query = params["query"].get<std::string>();
+        if (params.contains("include_schema") && params["include_schema"].is_boolean())
+            include_schema = params["include_schema"].get<bool>();
+        if (params.contains("limit") && params["limit"].is_number_integer())
+            limit = params["limit"].get<int>();
+    }
+    limit = (std::max)(1, (std::min)(limit, 100));
+
+    std::vector<tool_def_t> matches;
+    {
+        std::lock_guard<std::mutex> lk(_tools_mtx);
+        if (!names.empty()) {
+            for (const auto& wanted : names) {
+                for (const auto& tool : _tools) {
+                    if (tool.visibility != tool_visibility_t::external_visible)
+                        continue;
+                    if (tool.name == wanted) {
+                        auto dup = std::find_if(matches.begin(), matches.end(),
+                            [&](const tool_def_t& existing) { return existing.name == tool.name; });
+                        if (dup == matches.end())
+                            matches.push_back(tool);
+                        break;
+                    }
+                }
+            }
+        } else if (!prefix.empty() || !query.empty()) {
+            const std::string prefix_l = lower_ascii(prefix);
+            const std::string query_l = lower_ascii(query);
+            for (const auto& tool : _tools) {
+                if (tool.visibility != tool_visibility_t::external_visible)
+                    continue;
+                const std::string name_l = lower_ascii(tool.name);
+                const std::string desc_l = lower_ascii(tool.description);
+                bool ok = true;
+                if (!prefix_l.empty())
+                    ok = name_l.rfind(prefix_l, 0) == 0;
+                if (ok && !query_l.empty())
+                    ok = name_l.find(query_l) != std::string::npos ||
+                         desc_l.find(query_l) != std::string::npos;
+                if (ok)
+                    matches.push_back(tool);
+            }
+        }
+    }
+
+    if (names.empty() && prefix.empty() && query.empty())
+        return tool_result_t::ok("Pass `names`, `name`, `prefix`, or `query` to retrieve full tool descriptions.");
+
+    if (matches.empty())
+        return tool_result_t::ok("No matching tools found.");
+
+    const size_t shown = (std::min)(matches.size(), static_cast<size_t>(limit));
+    std::string result;
+    result.reserve(shown * 256);
+    if (matches.size() > shown) {
+        result += "Showing " + std::to_string(shown) + " of " +
+                  std::to_string(matches.size()) +
+                  " matching tools. Refine with `name`, `names`, `prefix`, or `query`.\n\n";
+    }
+    for (size_t i = 0; i < shown; ++i) {
+        const auto& tool = matches[i];
+        result += "### " + tool.name + "\n";
+        if (!tool.description.empty())
+            result += tool.description + "\n";
+        result += std::string("Read-only: ") + (tool.read_only ? "true" : "false") + "\n";
+        if (include_schema) {
+            if (tool.params.empty()) {
+                result += "Parameters: none\n";
+            } else {
+                result += "Parameters:\n";
+                for (const auto& p : tool.params) {
+                    result += "- `" + p.name + "` (" + p.type;
+                    if (p.required)
+                        result += ", required";
+                    result += ")";
+                    if (!p.description.empty())
+                        result += ": " + p.description;
+                    result += "\n";
+                }
+            }
+        }
+        result += "\n";
+    }
+    return tool_result_t::ok(result);
+}
+
 json server_t::handle_initialize(const json& id, const json&)
 {
     diag::log_tagged_fmt("mcp_srv", "handle_initialize entry");
@@ -402,7 +562,8 @@ json server_t::handle_initialize(const json& id, const json&)
         "- Call `driver_attach` with a PID or process name before memory operations\n"
         "- Use `disassemble_address` for live memory; `disassemble_file` for PE files\n"
         "- Use `sandbox_execute` for running untrusted binaries safely\n"
-        "- For number conversions, ALWAYS use `convert_number` - never convert manually\n";
+        "- For number conversions, ALWAYS use `convert_number` - never convert manually\n"
+        "- Tool discovery is compact: call `get_tool_descriptions` with selected tool names before using unfamiliar tools\n";
 
     json result;
     result["protocolVersion"] = PROTOCOL_VERSION;
@@ -417,18 +578,23 @@ json server_t::handle_ping(const json& id, const json&)
     return make_result(id, json::object());
 }
 
-json server_t::handle_tools_list(const json& id, const json&)
+json server_t::handle_tools_list(const json& id, const json& params)
 {
     json tools_arr = json::array();
+    const bool compact = !wants_full_tool_list(params);
     {
         std::lock_guard<std::mutex> lk(_tools_mtx);
         for (const auto& t : _tools) {
             if (t.visibility != tool_visibility_t::external_visible) continue;
-            tools_arr.push_back(tool_schema(t));
+            tools_arr.push_back(tool_schema(t, compact));
         }
     }
     json result;
     result["tools"] = tools_arr;
+    result["_meta"] = {
+        {"aidaToolListMode", compact ? "compact" : "full"},
+        {"aidaToolDetailTool", "get_tool_descriptions"}
+    };
     return make_result(id, result);
 }
 
@@ -891,7 +1057,7 @@ void server_t::server_thread_func(int port)
         { std::lock_guard<std::mutex> lk(_tools_mtx);
           for (const auto& t : _tools) {
               if (t.visibility != tool_visibility_t::external_visible) continue;
-              tools_arr.push_back(tool_schema(t));
+              tools_arr.push_back(tool_schema(t, false));
           } }
         res.set_content(json_dump_safe(tools_arr, 2), "application/json");
     });
@@ -1167,22 +1333,24 @@ static bool write_json_file(const std::string& path, const json& data)
     return write_string_to_file(path, json_dump_safe(data, 2) + "\n");
 }
 
-static const char* MCP_NAME = "aida-standalone-mcp";
+static const char* MCP_NAME = "AiDA-Pro-MCP";
 
 struct client_cfg_t {
     const char* name;
-    enum { URL, SERVERURL, VSCODE, VSCODE_JSON, CLINE, ZED, CODEX, CLAUDE_CODE, CLAUDE_BRIDGE } format;
+    enum { URL, SERVERURL, OPENCODE, VSCODE, VSCODE_JSON, CLINE, ZED, CODEX, CLAUDE_CODE, CLAUDE_BRIDGE } format;
     const char* win_path;
 };
 
 static const client_cfg_t g_clients[] = {
     { "Amazon Q",        client_cfg_t::URL,          "~/.aws/amazonq/mcp_config.json" },
+    { "Antigravity IDE", client_cfg_t::SERVERURL,    "~/.gemini/antigravity/mcp_config.json" },
     { "Claude",          client_cfg_t::CLAUDE_BRIDGE, "%APPDATA%/Claude/claude_desktop_config.json" },
     { "Copilot CLI",     client_cfg_t::URL,          "~/.copilot/mcp-config.json" },
     { "Cursor",          client_cfg_t::URL,          "~/.cursor/mcp.json" },
     { "Gemini CLI",      client_cfg_t::URL,          "~/.gemini/settings.json" },
     { "Kiro",            client_cfg_t::URL,          "~/.kiro/mcp_config.json" },
     { "LM Studio",       client_cfg_t::URL,          "~/.lmstudio/mcp.json" },
+    { "Opencode",        client_cfg_t::OPENCODE,     "~/.config/opencode/opencode.json" },
     { "Windsurf",        client_cfg_t::SERVERURL,    "~/.codeium/windsurf/mcp_config.json" },
     { "VS Code",         client_cfg_t::VSCODE,       "%APPDATA%/Code/User/settings.json" },
     { "VS Code Insiders",client_cfg_t::VSCODE,       "%APPDATA%/Code - Insiders/User/settings.json" },
@@ -1194,6 +1362,26 @@ static const client_cfg_t g_clients[] = {
     { "Claude Code",     client_cfg_t::CLAUDE_CODE,  "~/.claude.json" },
 };
 
+static bool is_managed_key(const std::string& key)
+{
+    return key == MCP_NAME ||
+           key == "aida-standalone-mcp" ||
+           key == "aida-pro-mcp";
+}
+
+static void erase_managed_keys(json& root)
+{
+    if (!root.is_object())
+        return;
+    std::vector<std::string> keys;
+    for (auto it = root.begin(); it != root.end(); ++it) {
+        if (is_managed_key(it.key()))
+            keys.push_back(it.key());
+    }
+    for (const auto& key : keys)
+        root.erase(key);
+}
+
 static bool write_mcpservers(const std::string& path, const std::string& url, const char* key)
 {
     json config;
@@ -1201,9 +1389,22 @@ static bool write_mcpservers(const std::string& path, const std::string& url, co
     if (!config.is_object()) config = json::object();
     if (!config.contains("mcpServers") || !config["mcpServers"].is_object())
         config["mcpServers"] = json::object();
+    erase_managed_keys(config["mcpServers"]);
     config["mcpServers"][MCP_NAME] = json::object();
-    config["mcpServers"][MCP_NAME]["type"] = "sse";
+    config["mcpServers"][MCP_NAME]["type"] = "http";
     config["mcpServers"][MCP_NAME][key] = url;
+    return write_json_file(path, config);
+}
+
+static bool write_opencode(const std::string& path, const std::string& url)
+{
+    json config;
+    if (std::filesystem::exists(path)) parse_json_file(path, config, true);
+    if (!config.is_object()) config = json::object();
+    if (!config.contains("mcp") || !config["mcp"].is_object())
+        config["mcp"] = json::object();
+    erase_managed_keys(config["mcp"]);
+    config["mcp"][MCP_NAME] = {{"type", "remote"}, {"url", url}, {"enabled", true}};
     return write_json_file(path, config);
 }
 
@@ -1215,7 +1416,8 @@ static bool write_vscode(const std::string& path, const std::string& url)
     if (!config.contains("mcp") || !config["mcp"].is_object()) config["mcp"] = json::object();
     if (!config["mcp"].contains("servers") || !config["mcp"]["servers"].is_object())
         config["mcp"]["servers"] = json::object();
-    config["mcp"]["servers"][MCP_NAME] = {{"type", "sse"}, {"url", url}};
+    erase_managed_keys(config["mcp"]["servers"]);
+    config["mcp"]["servers"][MCP_NAME] = {{"type", "http"}, {"url", url}};
     return write_json_file(path, config);
 }
 
@@ -1226,7 +1428,8 @@ static bool write_vscode_json(const std::string& path, const std::string& url)
     if (!config.is_object()) config = json::object();
     if (!config.contains("servers") || !config["servers"].is_object())
         config["servers"] = json::object();
-    config["servers"][MCP_NAME] = {{"type", "sse"}, {"url", url}};
+    erase_managed_keys(config["servers"]);
+    config["servers"][MCP_NAME] = {{"type", "http"}, {"url", url}};
     return write_json_file(path, config);
 }
 
@@ -1237,7 +1440,9 @@ static bool write_cline(const std::string& path, const std::string& url)
     if (!config.is_object()) config = json::object();
     if (!config.contains("mcpServers") || !config["mcpServers"].is_object())
         config["mcpServers"] = json::object();
+    erase_managed_keys(config["mcpServers"]);
     json entry;
+    entry["type"] = "http";
     entry["url"] = url;
     entry["disabled"] = false;
     entry["autoApprove"] = json::array();
@@ -1252,6 +1457,7 @@ static bool write_zed(const std::string& path, const std::string& url)
     if (!config.is_object()) config = json::object();
     if (!config.contains("context_servers") || !config["context_servers"].is_object())
         config["context_servers"] = json::object();
+    erase_managed_keys(config["context_servers"]);
     config["context_servers"][MCP_NAME] = {{"settings", {{"url", url}}}};
     return write_json_file(path, config);
 }
@@ -1260,17 +1466,22 @@ static bool write_codex(const std::string& path, const std::string& url)
 {
     std::string content;
     if (std::filesystem::exists(path)) read_file_to_string(path, content);
-    std::string marker = "[mcp_servers.aida-standalone-mcp]";
-    size_t pos = content.find(marker);
-    std::string section = marker + "\ntype = \"sse\"\nurl = \"" + url + "\"\n";
-    if (pos != std::string::npos) {
-        size_t end = content.find("\n[", pos + marker.size());
-        if (end == std::string::npos) end = content.size(); else end += 1;
-        content.replace(pos, end - pos, section);
-    } else {
-        if (!content.empty() && content.back() != '\n') content += "\n";
-        content += "\n" + section;
+    auto strip_section = [](std::string& doc, const std::string& marker) {
+        size_t pos = doc.find(marker);
+        while (pos != std::string::npos) {
+            size_t end = doc.find("\n[", pos + marker.size());
+            if (end == std::string::npos) end = doc.size(); else end += 1;
+            doc.erase(pos, end - pos);
+            pos = doc.find(marker);
+        }
+    };
+    strip_section(content, "[mcp_servers.aida-standalone-mcp]");
+    strip_section(content, "[mcp_servers.aida-pro-mcp]");
+    strip_section(content, std::string("[mcp_servers.") + MCP_NAME + "]");
+    if (!content.empty() && content.back() != '\n') {
+        content += "\n";
     }
+    content += "\n[mcp_servers." + std::string(MCP_NAME) + "]\nurl = \"" + url + "\"\n";
     return write_string_to_file(path, content);
 }
 
@@ -1281,7 +1492,8 @@ static bool write_claude_code(const std::string& path, const std::string& url)
     if (!config.is_object()) config = json::object();
     if (!config.contains("mcpServers") || !config["mcpServers"].is_object())
         config["mcpServers"] = json::object();
-    config["mcpServers"][MCP_NAME] = {{"type", "sse"}, {"url", url}};
+    erase_managed_keys(config["mcpServers"]);
+    config["mcpServers"][MCP_NAME] = {{"type", "http"}, {"url", url}};
     return write_json_file(path, config);
 }
 
@@ -1292,6 +1504,7 @@ static bool write_claude_bridge(const std::string& path, const std::string& url)
     if (!config.is_object()) config = json::object();
     if (!config.contains("mcpServers") || !config["mcpServers"].is_object())
         config["mcpServers"] = json::object();
+    erase_managed_keys(config["mcpServers"]);
     config["mcpServers"][MCP_NAME] = {{"command", "npx"}, {"args", json::array({"-y", "mcp-bridge", url})}};
     return write_json_file(path, config);
 }
@@ -1320,14 +1533,15 @@ void server_t::write_client_configs() const
 
         bool success = false;
         switch (def.format) {
-        case client_cfg_t::URL:          success = write_mcpservers(path, sse_url, "url"); break;
-        case client_cfg_t::SERVERURL:    success = write_mcpservers(path, sse_url, "serverUrl"); break;
-        case client_cfg_t::VSCODE:       success = write_vscode(path, sse_url); break;
-        case client_cfg_t::VSCODE_JSON:  success = write_vscode_json(path, sse_url); break;
-        case client_cfg_t::CLINE:        success = write_cline(path, sse_url); break;
+        case client_cfg_t::URL:          success = write_mcpservers(path, http_url, "url"); break;
+        case client_cfg_t::SERVERURL:    success = write_mcpservers(path, http_url, "serverUrl"); break;
+        case client_cfg_t::OPENCODE:     success = write_opencode(path, http_url); break;
+        case client_cfg_t::VSCODE:       success = write_vscode(path, http_url); break;
+        case client_cfg_t::VSCODE_JSON:  success = write_vscode_json(path, http_url); break;
+        case client_cfg_t::CLINE:        success = write_cline(path, http_url); break;
         case client_cfg_t::ZED:          success = write_zed(path, http_url); break;
-        case client_cfg_t::CODEX:        success = write_codex(path, sse_url); break;
-        case client_cfg_t::CLAUDE_CODE:  success = write_claude_code(path, sse_url); break;
+        case client_cfg_t::CODEX:        success = write_codex(path, http_url); break;
+        case client_cfg_t::CLAUDE_CODE:  success = write_claude_code(path, http_url); break;
         case client_cfg_t::CLAUDE_BRIDGE:success = write_claude_bridge(path, sse_url); break;
         }
 

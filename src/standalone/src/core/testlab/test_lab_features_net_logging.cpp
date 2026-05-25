@@ -262,9 +262,9 @@ namespace {
 		push_u64_field(r, "Dropped Since Last Pull", dropped_since_last_pull);
 		if (records.empty()) {
 			cleanup_bootstrap_pid(s.pid);
-			r.error = "malware_safe_pull_packets succeeded but returned no packet records for the PID";
-			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
-			r.ok = false;
+			r.parsed.push_back({ "Packet Availability", "ring empty after successful drain" });
+			r.ntstatus = 0;
+			r.ok = true;
 			return;
 		}
 

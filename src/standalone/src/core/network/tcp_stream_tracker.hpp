@@ -2,9 +2,12 @@
 
 #include "standalone_driver.hpp"
 #include "work_queue.hpp"
+#include "helpers/diag_log.hpp"
 
+#include <Windows.h>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -96,19 +99,44 @@ public:
     tcp_stream_tracker_t& operator=(const tcp_stream_tracker_t&) = delete;
 
     void start(uint32_t filter_pid = 0) {
-        if (running_.load()) return;
+        bool expected = false;
+        if (!running_.compare_exchange_strong(expected, true)) return;
         filter_pid_ = filter_pid;
-        running_.store(true);
         {
             std::lock_guard<std::mutex> lk(streams_mutex_);
             streams_.clear();
         }
-        work_queue::post([this]() { poll_loop(); });
+        {
+            std::lock_guard<std::mutex> lk(worker_mutex_);
+            worker_active_ = true;
+        }
+        diag::log_tagged_fmt("tcp_tracker", "start this=%p filter_pid=%u", this, filter_pid_);
+        if (!work_queue::post([this]() {
+            diag::log_tagged_fmt("tcp_tracker", "worker_enter this=%p tid=%lu", this, static_cast<unsigned long>(GetCurrentThreadId()));
+            poll_loop();
+            {
+                std::lock_guard<std::mutex> lk(worker_mutex_);
+                worker_active_ = false;
+            }
+            worker_cv_.notify_all();
+            diag::log_tagged_fmt("tcp_tracker", "worker_exit this=%p tid=%lu", this, static_cast<unsigned long>(GetCurrentThreadId()));
+        })) {
+            running_.store(false);
+            {
+                std::lock_guard<std::mutex> lk(worker_mutex_);
+                worker_active_ = false;
+            }
+            worker_cv_.notify_all();
+            diag::log_tagged_fmt("tcp_tracker", "start_post_failed this=%p", this);
+        }
     }
 
     void stop() {
-        if (!running_.load()) return;
         running_.store(false);
+        std::unique_lock<std::mutex> lk(worker_mutex_);
+        worker_cv_.wait(lk, [this]() { return !worker_active_; });
+        diag::log_tagged_fmt("tcp_tracker", "stop this=%p worker_active=%d",
+            this, worker_active_ ? 1 : 0);
     }
 
     bool is_running() const noexcept { return running_.load(); }
@@ -238,6 +266,9 @@ private:
     std::atomic<bool>     running_{false};
     uint32_t              filter_pid_     = 0;
     uint32_t              evict_counter_  = 0;
+    std::mutex            worker_mutex_;
+    std::condition_variable worker_cv_;
+    bool                  worker_active_ = false;
 };
 
 inline tcp_stream_tracker_t g_stream_tracker;

@@ -56,6 +56,7 @@ namespace test_all_features {
 
 		std::atomic<bool> g_running{ false };
 		std::atomic<bool> g_cancel_requested{ false };
+		std::atomic<bool> g_target_unavailable{ false };
 
 		std::atomic<int>  g_total{ 0 };
 		std::atomic<int>  g_current{ 0 };
@@ -97,10 +98,10 @@ namespace test_all_features {
 		constexpr int kDebuggerFeatureTests = 83;
 		constexpr int kScannerFeatureTests = 64;
 		constexpr int kAnalysisFeatureTests = 77;
-		constexpr int kNetworkFeatureTests = 119;
-		constexpr int kBurpFeatureTests = 183;
+		constexpr int kNetworkFeatureTests = 125;
+		constexpr int kBurpFeatureTests = 184;
 		constexpr int kDisasmFeatureTests = 110;
-		constexpr int kMcpFeatureTests = 525;
+		constexpr int kMcpFeatureTests = 509;
 
 
 		void format_timestamp(char* out, std::size_t cap) {
@@ -199,13 +200,14 @@ namespace test_all_features {
 			const std::uint64_t step_age = (step_start != 0 && now >= step_start) ? (now - step_start) : 0;
 
 			_snprintf_s(out, cap, _TRUNCATE,
-				"run_id=%llu running=%d cancel=%d phase=\"%.160s\" phase_age_ms=%llu "
+				"run_id=%llu running=%d cancel=%d target_unavailable=%d phase=\"%.160s\" phase_age_ms=%llu "
 				"step=\"%.220s\" step_age_ms=%llu run_age_ms=%llu total=%d current=%d "
 				"pass=%d fail=%d skip=%d suspect=%d target_pid=%u driver_attached=%d "
 				"image_base=0x%016llX target_addr=0x%016llX saved_dtb=0x%016llX",
 				static_cast<unsigned long long>(g_run_id.load(std::memory_order_acquire)),
 				g_running.load(std::memory_order_acquire) ? 1 : 0,
 				g_cancel_requested.load(std::memory_order_acquire) ? 1 : 0,
+				g_target_unavailable.load(std::memory_order_acquire) ? 1 : 0,
 				phase,
 				static_cast<unsigned long long>(phase_age),
 				step,
@@ -448,18 +450,64 @@ namespace test_all_features {
 			log_debug_snapshot(hf, "phase", "END snapshot");
 		}
 
+		bool target_unavailable() {
+			return g_target_unavailable.load(std::memory_order_acquire);
+		}
 
-		bool is_destructive(const char* name) {
-			if (name == nullptr) return false;
-			static const char* kSkip[] = {
-				"ABRT", "DBGA", "RECU", "ADMP", "RC", "CR",
-				"SRVT", "SRV2", "PINJ", "TSR", "PCEX",
-				"HVDT", "CANR", "CANQ"
+		void mark_target_unavailable(HANDLE hf, const char* tag, const char* reason, std::uint32_t pid, std::uint32_t attached, std::uint32_t exit_code) {
+			g_driver_attached.store(false, std::memory_order_release);
+			g_target_unavailable.store(true, std::memory_order_release);
+			log_msg(hf, tag ? tag : "target-live", "TARGET-UNAVAILABLE -- %s pid=%u attached=%u exit_code_or_err=0x%08X",
+				reason ? reason : "target unavailable",
+				pid,
+				attached,
+				exit_code);
+		}
+
+		void skip_phase_target_unavailable(HANDLE hf, const char* phase, int tests) {
+			const char* label = phase ? phase : "target-dependent phase";
+			set_phase(label);
+			set_stepf("skip phase: %s", label);
+			log_phase_begin(hf, label);
+			if (tests > 0)
+				g_skipped.fetch_add(tests);
+			log_msg(hf, "phase", "SKIP -- %s requires a live attached target; target unavailable; skipped=%d",
+				label,
+				tests);
+			log_phase_end(hf, label);
+		}
+
+
+		bool is_destructive(const char* category, const char* name) {
+			if (category == nullptr || name == nullptr) return false;
+			struct destructive_feature_t {
+				const char* category;
+				const char* name;
+				const char* reason;
 			};
-			for (const auto* s : kSkip) {
-				if (std::strncmp(name, s, std::strlen(s)) == 0) return true;
+			static const destructive_feature_t kSkip[] = {
+				{ "tamper", "ABRT", "kernel tamper abort can bugcheck" },
+				{ "evidence", "RECU", "kernel evidence recovery can bugcheck" },
+				{ "remote-call", "RC", "executes a target-process remote call" },
+				{ "thread", "TSR", "suspends or resumes a target thread" },
+				{ "module", "PINJ", "injects a transport-layer packet" },
+				{ "anti-debug", "DBGA", "debug-attach evidence path may bugcheck on positive detection" }
+			};
+			for (const auto& s : kSkip) {
+				if (std::strcmp(category, s.category) == 0 && std::strcmp(name, s.name) == 0) return true;
 			}
 			return false;
+		}
+
+		const char* destructive_reason(const char* category, const char* name) {
+			if (category == nullptr || name == nullptr) return "unknown destructive guard";
+			if (std::strcmp(category, "tamper") == 0 && std::strcmp(name, "ABRT") == 0) return "kernel tamper abort can bugcheck";
+			if (std::strcmp(category, "evidence") == 0 && std::strcmp(name, "RECU") == 0) return "kernel evidence recovery can bugcheck";
+			if (std::strcmp(category, "remote-call") == 0 && std::strcmp(name, "RC") == 0) return "executes a target-process remote call";
+			if (std::strcmp(category, "thread") == 0 && std::strcmp(name, "TSR") == 0) return "suspends or resumes a target thread";
+			if (std::strcmp(category, "module") == 0 && std::strcmp(name, "PINJ") == 0) return "injects a transport-layer packet";
+			if (std::strcmp(category, "anti-debug") == 0 && std::strcmp(name, "DBGA") == 0) return "debug-attach evidence path may bugcheck on positive detection";
+			return "unknown destructive guard";
 		}
 
 		bool name_starts_with(const char* name, const char* prefix) {
@@ -481,8 +529,10 @@ namespace test_all_features {
 		}
 
 		bool verify_target_liveness(HANDLE hf, const char* checkpoint, bool abort_on_dead = true) {
+			(void)abort_on_dead;
 			const std::uint32_t pid = current_target_pid();
 			if (pid == 0) {
+				g_target_unavailable.store(true, std::memory_order_release);
 				log_msg(hf, "target-live", "SKIP -- no target pid at %s",
 					checkpoint ? checkpoint : "checkpoint");
 				return false;
@@ -505,19 +555,20 @@ namespace test_all_features {
 			const bool alive = (attached == pid) && driver_bridge::attached_process_alive(&exit_code);
 			if (alive) {
 				g_driver_attached.store(true, std::memory_order_release);
+				g_target_unavailable.store(false, std::memory_order_release);
 				log_msg(hf, "target-live", "OK -- target alive at %s pid=%u attached=%u exit_code=0x%08X",
 					checkpoint ? checkpoint : "checkpoint", pid, attached, exit_code);
 				return true;
 			}
 
-			g_driver_attached.store(false, std::memory_order_release);
 			g_failed.fetch_add(1);
-			log_msg(hf, "target-live", "FAIL -- target is not alive at %s pid=%u attached=%u exit_code_or_err=0x%08X; stale target-dependent phases will be aborted",
-				checkpoint ? checkpoint : "checkpoint", pid, attached, exit_code);
+			mark_target_unavailable(hf, "target-live", "target is not alive; target-dependent phases will be skipped", pid, attached, exit_code);
+			log_msg(hf, "target-live", "FAIL -- target is not alive at %s pid=%u attached=%u exit_code_or_err=0x%08X",
+				checkpoint ? checkpoint : "checkpoint",
+				pid,
+				attached,
+				exit_code);
 			log_debug_snapshot(hf, "target-live", "DEAD target snapshot");
-			if (abort_on_dead) {
-				g_cancel_requested.store(true, std::memory_order_release);
-			}
 			return false;
 		}
 
@@ -862,9 +913,11 @@ namespace test_all_features {
 				const char* name = (f.name != nullptr) ? f.name : "?";
 				const char* cat  = (f.category != nullptr) ? f.category : "?";
 
-				if (is_destructive(f.name)) {
-					log_msg(hf, "testlab", "[%d/%d] SKIP %s/%s (destructive guard)", i + 1, total, cat, name);
-					g_skipped.fetch_add(1);
+				if (is_destructive(f.category, f.name)) {
+					const int before = g_skipped.load(std::memory_order_acquire);
+					const int after = g_skipped.fetch_add(1, std::memory_order_acq_rel) + 1;
+					log_msg(hf, "testlab", "[%d/%d] SKIP %s/%s (destructive guard reason=\"%s\" skip_before=%d skip_after=%d)",
+						i + 1, total, cat, name, destructive_reason(f.category, f.name), before, after);
 					continue;
 				}
 				if (f.run == nullptr) {
@@ -908,6 +961,19 @@ namespace test_all_features {
 					char tmp[MAX_PATH];
 					GetTempPathA(MAX_PATH, tmp);
 					s.text_a = std::string(tmp) + "aida_test_capture.pcap";
+				} else if (name_starts_with(name, "ADMP")) {
+					s.u32_a = 4;
+					s.pid = 0;
+				} else if (name_starts_with(name, "SRVT")) {
+					s.text_a = "00112233445566778899AABBCCDDEEFF";
+				} else if (name_starts_with(name, "SRV2")) {
+					s.text_a = "00112233445566778899AABBCCDDEEFF";
+					s.u32_a = 1;
+				} else if (name_starts_with(name, "CANR")) {
+					static std::uint8_t canary_scratch[0x1000];
+					s.addr = reinterpret_cast<std::uint64_t>(&canary_scratch[0]);
+					s.size = sizeof(canary_scratch);
+					s.u32_a = 0;
 				} else if (name_starts_with(name, "FM")) {
 					std::uint64_t alloc = driver_bridge::allocate_memory(0x1000);
 					if (alloc != 0) {
@@ -1092,6 +1158,7 @@ namespace test_all_features {
 			std::uint32_t pid = current_target_pid();
 			bool attached = g_driver_attached.load(std::memory_order_acquire);
 			if (pid == 0 || !attached || driver_bridge::attached_pid() != pid) {
+				mark_target_unavailable(hf, tag, "no verified attached target", pid, driver_bridge::attached_pid(), 0);
 				log_msg(hf, tag, "FAIL -- no verified attached target (pid=%u attached=%d driver_pid=%u)",
 					pid, static_cast<int>(attached), driver_bridge::attached_pid());
 				g_failed.fetch_add(1);
@@ -1099,9 +1166,8 @@ namespace test_all_features {
 			}
 			std::uint32_t exit_code = 0;
 			if (!driver_bridge::attached_process_alive(&exit_code)) {
-				g_driver_attached.store(false, std::memory_order_release);
-				g_cancel_requested.store(true, std::memory_order_release);
-				log_msg(hf, tag, "FAIL -- attached target pid=%u is dead exit_code_or_err=0x%08X; cancelling target-dependent tests",
+				mark_target_unavailable(hf, tag, "attached target is dead; target-dependent tests will be skipped", pid, driver_bridge::attached_pid(), exit_code);
+				log_msg(hf, tag, "FAIL -- attached target pid=%u is dead exit_code_or_err=0x%08X",
 					pid, exit_code);
 				g_failed.fetch_add(1);
 				return false;
@@ -1328,17 +1394,27 @@ namespace test_all_features {
 
 			std::uint32_t pid = current_target_pid();
 
-			auto conns = driver_bridge::enumerate_connections(pid, 0);
-			auto sockets = driver_bridge::get_socket_handles(pid);
-			auto tcpip = driver_bridge::dump_tcpip_connections(pid, 0);
-
-			std::size_t observed = conns.size() + sockets.size() + tcpip.size();
+			std::vector<driver_bridge::net_connection_info_t> conns;
+			std::vector<driver_bridge::socket_info_t> sockets;
+			std::vector<driver_bridge::tcpip_connection_t> tcpip;
+			std::size_t observed = 0;
+			std::uint32_t attempts = 0;
+			for (std::uint32_t attempt = 0; attempt < 20; ++attempt) {
+				++attempts;
+				conns = driver_bridge::enumerate_connections(pid, 0);
+				sockets = driver_bridge::get_socket_handles(pid);
+				tcpip = driver_bridge::dump_tcpip_connections(pid, 0);
+				observed = conns.size() + sockets.size() + tcpip.size();
+				if (observed > 0)
+					break;
+				std::this_thread::sleep_for(std::chrono::milliseconds(250));
+			}
 
 			auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 				std::chrono::steady_clock::now() - t0).count();
 
-			log_msg(hf, tag, "target pid=%u connections=%zu sockets=%zu tcpip=%zu",
-				pid, conns.size(), sockets.size(), tcpip.size());
+			log_msg(hf, tag, "target pid=%u connections=%zu sockets=%zu tcpip=%zu attempts=%u",
+				pid, conns.size(), sockets.size(), tcpip.size(), attempts);
 
 			if (observed > 0) {
 				std::uint32_t lport = 0, rport = 0;
@@ -1360,12 +1436,14 @@ namespace test_all_features {
 				ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 					std::chrono::steady_clock::now() - t0).count();
 				if (!all_conns.empty()) {
-					log_msg(hf, tag, "FAIL -- target had 0 endpoints though driver enumerated %zu system-wide; target not network-active (elapsed %lld ms)",
+					log_msg(hf, tag, "SKIP -- target had 0 live endpoints after %u attempts while driver enumerated %zu system-wide; target not network-active at sample time (elapsed %lld ms)",
+						attempts,
 						all_conns.size(), (long long)ms);
+					g_skipped.fetch_add(1);
 				} else {
 					log_msg(hf, tag, "FAIL -- driver returned 0 connections target-scoped and system-wide (elapsed %lld ms)", (long long)ms);
+					g_failed.fetch_add(1);
 				}
-				g_failed.fetch_add(1);
 			}
 		}
 
@@ -1590,6 +1668,30 @@ namespace test_all_features {
 		void phase_stop_target(HANDLE hf, std::uint32_t pid) {
 			if (pid == 0) return;
 			set_phase("Stopping test_target");
+			auto threads = driver_bridge::enumerate_threads_for(pid);
+			uint32_t observed_threads = 0;
+			uint32_t resume_calls = 0;
+			uint32_t resume_failures = 0;
+			for (const auto& th : threads) {
+				if (th.owner_pid != pid || th.tid == 0)
+					continue;
+				++observed_threads;
+				for (int guard = 0; guard < 8; ++guard) {
+					uint32_t prev_count = 0;
+					if (!driver_bridge::resume_thread(th.tid, &prev_count)) {
+						++resume_failures;
+						break;
+					}
+					++resume_calls;
+					if (prev_count <= 1)
+						break;
+				}
+			}
+			log_msg(hf, "cleanup", "pre-signal thread resume sweep pid=%u threads=%u resume_calls=%u failures=%u",
+				pid,
+				observed_threads,
+				resume_calls,
+				resume_failures);
 			log_msg(hf, "cleanup", "signaling test_target done event for pid=%u", pid);
 
 			HANDLE hDone = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Global\\WhosWhoTestDone");
@@ -1794,6 +1896,7 @@ namespace test_all_features {
 				set_step("phase call: launch target");
 				log_debug_snapshot(hf, "checkpoint", "BEFORE phase_launch_target");
 				attach_ok = phase_launch_target(hf, target_pid);
+				g_target_unavailable.store(!attach_ok, std::memory_order_release);
 				log_debug_snapshot(hf, "checkpoint", "AFTER phase_launch_target");
 			}
 
@@ -1815,29 +1918,41 @@ namespace test_all_features {
 			cleanup_network_runtime(hf, "after testlab features");
 
 			if (!cancelled()) {
-				set_step("phase call: extended features");
-				log_debug_snapshot(hf, "checkpoint", "BEFORE phase_extended_features");
-				phase_extended_features(hf);
-				log_debug_snapshot(hf, "checkpoint", "AFTER phase_extended_features");
-				verify_target_liveness(hf, "after extended features");
+				if (target_unavailable()) {
+					skip_phase_target_unavailable(hf, "extended features", kExtendedFeatureTests);
+				} else {
+					set_step("phase call: extended features");
+					log_debug_snapshot(hf, "checkpoint", "BEFORE phase_extended_features");
+					phase_extended_features(hf);
+					log_debug_snapshot(hf, "checkpoint", "AFTER phase_extended_features");
+					verify_target_liveness(hf, "after extended features");
+				}
 			}
 
 			if (!cancelled()) {
-				set_phase("Debugger feature tests");
-				set_step("phase call: debugger feature tests");
-				log_phase_begin(hf, "debugger feature tests");
-				phase_debugger_tests(hf, g_passed, g_failed, g_skipped, cancelled);
-				log_phase_end(hf, "debugger feature tests");
-				verify_target_liveness(hf, "after debugger feature tests");
+				if (target_unavailable()) {
+					skip_phase_target_unavailable(hf, "debugger feature tests", kDebuggerFeatureTests);
+				} else {
+					set_phase("Debugger feature tests");
+					set_step("phase call: debugger feature tests");
+					log_phase_begin(hf, "debugger feature tests");
+					phase_debugger_tests(hf, g_passed, g_failed, g_skipped, cancelled);
+					log_phase_end(hf, "debugger feature tests");
+					verify_target_liveness(hf, "after debugger feature tests");
+				}
 			}
 
 			if (!cancelled()) {
-				set_phase("Scanner feature tests");
-				set_step("phase call: scanner feature tests");
-				log_phase_begin(hf, "scanner feature tests");
-				phase_scanner_tests(hf, g_passed, g_failed, g_skipped, cancelled);
-				log_phase_end(hf, "scanner feature tests");
-				verify_target_liveness(hf, "after scanner feature tests");
+				if (target_unavailable()) {
+					skip_phase_target_unavailable(hf, "scanner feature tests", kScannerFeatureTests);
+				} else {
+					set_phase("Scanner feature tests");
+					set_step("phase call: scanner feature tests");
+					log_phase_begin(hf, "scanner feature tests");
+					phase_scanner_tests(hf, g_passed, g_failed, g_skipped, cancelled);
+					log_phase_end(hf, "scanner feature tests");
+					verify_target_liveness(hf, "after scanner feature tests");
+				}
 			}
 
 			if (!cancelled()) {
@@ -1846,7 +1961,8 @@ namespace test_all_features {
 				log_phase_begin(hf, "analysis feature tests");
 				phase_analysis_tests(hf, g_passed, g_failed, g_skipped, cancelled);
 				log_phase_end(hf, "analysis feature tests");
-				verify_target_liveness(hf, "after analysis feature tests");
+				if (!target_unavailable())
+					verify_target_liveness(hf, "after analysis feature tests");
 			}
 
 			if (!cancelled()) {
@@ -1855,7 +1971,8 @@ namespace test_all_features {
 				log_phase_begin(hf, "network feature tests");
 				phase_network_tests(hf, g_passed, g_failed, g_skipped, cancelled);
 				log_phase_end(hf, "network feature tests");
-				verify_target_liveness(hf, "after network feature tests");
+				if (!target_unavailable())
+					verify_target_liveness(hf, "after network feature tests");
 			}
 
 			cleanup_network_runtime(hf, "after network feature tests");
@@ -1866,16 +1983,21 @@ namespace test_all_features {
 				log_phase_begin(hf, "burp suite feature tests");
 				phase_burp_tests(hf, g_passed, g_failed, g_skipped, cancelled);
 				log_phase_end(hf, "burp suite feature tests");
-				verify_target_liveness(hf, "after burp suite feature tests");
+				if (!target_unavailable())
+					verify_target_liveness(hf, "after burp suite feature tests");
 			}
 
 			if (!cancelled()) {
-				set_phase("Disassembly & decompiler tests");
-				set_step("phase call: disassembly & decompiler tests");
-				log_phase_begin(hf, "disassembly & decompiler tests");
-				phase_disasm_tests(hf, g_passed, g_failed, g_skipped, cancelled);
-				log_phase_end(hf, "disassembly & decompiler tests");
-				verify_target_liveness(hf, "after disassembly & decompiler tests");
+				if (target_unavailable()) {
+					skip_phase_target_unavailable(hf, "disassembly & decompiler tests", kDisasmFeatureTests);
+				} else {
+					set_phase("Disassembly & decompiler tests");
+					set_step("phase call: disassembly & decompiler tests");
+					log_phase_begin(hf, "disassembly & decompiler tests");
+					phase_disasm_tests(hf, g_passed, g_failed, g_skipped, cancelled);
+					log_phase_end(hf, "disassembly & decompiler tests");
+					verify_target_liveness(hf, "after disassembly & decompiler tests");
+				}
 			}
 
 			if (!cancelled()) {
@@ -1897,12 +2019,14 @@ namespace test_all_features {
 			int p = g_passed.load();
 			int f = g_failed.load();
 			int s = g_skipped.load();
-			int t = p + f + s;
+			int executed = p + f + s;
+			int planned = g_total.load();
 
 			log_msg(hf, "summary", "================ VALIDATION SUMMARY ================");
-			log_msg(hf, "summary", "target_pid=%u driver_attached=%d image_base=0x%016llX known_good_addr=0x%016llX",
+			log_msg(hf, "summary", "target_pid=%u driver_attached=%d target_unavailable=%d image_base=0x%016llX known_good_addr=0x%016llX",
 				current_target_pid(),
 				static_cast<int>(g_driver_attached.load()),
+				target_unavailable() ? 1 : 0,
 				static_cast<unsigned long long>(current_target_image_base()),
 				static_cast<unsigned long long>(current_target_addr()));
 
@@ -1918,18 +2042,27 @@ namespace test_all_features {
 				log_msg(hf, "summary", "no SUSPECT (empty-pass) tests detected by orchestrator");
 			}
 
-			log_msg(hf, "summary", "TOTAL=%d PASSED=%d FAILED=%d SKIPPED=%d SUSPECT=%d", t, p, f, s, suspect);
+			if (planned > executed) {
+				log_msg(hf, "summary", "INCOMPLETE -- planned=%d executed=%d remaining=%d cancel=%d target_unavailable=%d",
+					planned,
+					executed,
+					planned - executed,
+					cancelled() ? 1 : 0,
+					target_unavailable() ? 1 : 0);
+			}
+
+			log_msg(hf, "summary", "TOTAL=%d EXECUTED=%d PASSED=%d FAILED=%d SKIPPED=%d SUSPECT=%d", planned, executed, p, f, s, suspect);
 
 			format_timestamp(ts, sizeof(ts));
 			char footer[512];
 			_snprintf_s(footer, sizeof(footer), _TRUNCATE,
-				"[%s] AiDA Full Feature Test -- DONE  (passed=%d failed=%d skipped=%d suspect=%d)\n"
+				"[%s] AiDA Full Feature Test -- DONE  (total=%d executed=%d passed=%d failed=%d skipped=%d suspect=%d)\n"
 				"================================================================\n\n",
-				ts, p, f, s, suspect);
+				ts, planned, executed, p, f, s, suspect);
 			write_log_file(hf, std::string(footer));
 			push_log(footer);
 
-			diag::log_tagged_fmt("test_all", "========== Full Feature Test DONE: passed=%d failed=%d skipped=%d suspect=%d ==========", p, f, s, suspect);
+			diag::log_tagged_fmt("test_all", "========== Full Feature Test DONE: total=%d executed=%d passed=%d failed=%d skipped=%d suspect=%d ==========", planned, executed, p, f, s, suspect);
 
 			full_test_env_guard.clear("run_all normal completion");
 
@@ -1998,6 +2131,7 @@ namespace test_all_features {
 			}
 
 			g_cancel_requested.store(false);
+			g_target_unavailable.store(false);
 			g_total.store(0);
 			g_current.store(0);
 			g_passed.store(0);

@@ -20,6 +20,7 @@
 #include "xref_db.hpp"
 #include "binary_map.hpp"
 #include "standalone_driver.hpp"
+#include "../disasm/function_index.hpp"
 #include "../helpers/globals.h"
 #include "../../helpers/diag_log.hpp"
 
@@ -28,6 +29,7 @@
 #include <cctype>
 #include <cinttypes>
 #include <sstream>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 #include <chrono>
@@ -1663,7 +1665,81 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				result["image_base"] = buf;
 				result["image_size"] = parsed && pe.size_of_image != 0 ? pe.size_of_image : selected->size;
 				result["sections"] = std::move(sections);
-				result["functions"] = json::array();
+				json functions = json::array();
+				if (g_disasm.file.loaded && !g_disasm.file.sections.empty() &&
+					g_disasm.file.image_base != 0) {
+					bool rebuild = false;
+					{
+						auto& c = function_index::detail::cache();
+						std::shared_lock<std::shared_mutex> lk(c.mutex);
+						rebuild = c.sorted_starts.empty() ||
+							c.cached_module_base != g_disasm.file.image_base;
+						diag::log_tagged_fmt("analysis",
+							"binary_map_fast function_cache pre sorted=%zu cached_base=0x%llX file_base=0x%llX rebuild=%d",
+							c.sorted_starts.size(),
+							static_cast<unsigned long long>(c.cached_module_base),
+							static_cast<unsigned long long>(g_disasm.file.image_base),
+							rebuild ? 1 : 0);
+					}
+					if (rebuild) {
+						std::string name = g_disasm.file.filename.empty() ? g_disasm.file.path : g_disasm.file.filename;
+						function_index::detail::rebuild_bounds_index_static(name);
+					}
+					auto& c = function_index::detail::cache();
+					std::shared_lock<std::shared_mutex> lk(c.mutex);
+					int emitted = 0;
+					for (uint64_t s : c.sorted_starts) {
+						if (emitted >= opts.max_functions) break;
+						auto it = c.by_start.find(s);
+						json fn;
+						std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(s));
+						fn["va"] = buf;
+						if (it != c.by_start.end()) {
+							fn["name"] = it->second.display_name.empty()
+								? function_index::synthetic_name(s)
+								: it->second.display_name;
+							if (!it->second.section.empty()) fn["section"] = it->second.section;
+							fn["size"] = it->second.end > s ? it->second.end - s : 0;
+						} else {
+							fn["name"] = function_index::synthetic_name(s);
+							fn["size"] = 0;
+						}
+						functions.push_back(std::move(fn));
+						++emitted;
+					}
+					diag::log_tagged_fmt("analysis",
+						"binary_map_fast function_cache post sorted=%zu emitted=%d",
+						c.sorted_starts.size(),
+						emitted);
+				}
+				if (functions.empty() && parsed && pe.entry_point != 0 && opts.max_functions > 0) {
+					const uint64_t image_size = pe.size_of_image != 0 ? pe.size_of_image : selected->size;
+					if (pe.entry_point >= selected->base && image_size != 0 && pe.entry_point < selected->base + image_size) {
+						std::string ep_section;
+						const uint64_t rva = pe.entry_point - selected->base;
+						for (const auto& s : pe.sections) {
+							const uint64_t sec_size = s.virtual_size != 0 ? s.virtual_size : s.raw_size;
+							if (rva >= s.virtual_address && rva < static_cast<uint64_t>(s.virtual_address) + sec_size) {
+								ep_section = s.name;
+								break;
+							}
+						}
+						json fn;
+						std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(pe.entry_point));
+						fn["va"] = buf;
+						fn["name"] = "entry_point";
+						fn["size"] = 1;
+						fn["source"] = "entry_point_fallback";
+						if (!ep_section.empty()) fn["section"] = ep_section;
+						functions.push_back(std::move(fn));
+						diag::log_tagged_fmt("analysis",
+							"binary_map_fast synthesized_entry_point va=0x%llX image_base=0x%llX image_size=0x%llX",
+							static_cast<unsigned long long>(pe.entry_point),
+							static_cast<unsigned long long>(selected->base),
+							static_cast<unsigned long long>(image_size));
+					}
+				}
+				result["functions"] = std::move(functions);
 				result["globals"] = json::array();
 				result["imports"] = json::array();
 				result["exports"] = json::array();

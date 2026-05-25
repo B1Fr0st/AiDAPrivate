@@ -2,6 +2,7 @@
 
 
 #include "protocol_parser.hpp"
+#include "helpers/diag_log.hpp"
 
 #ifdef _WIN32
 #  include <BaseTsd.h>
@@ -10,6 +11,7 @@
 
 #include <nghttp2/nghttp2.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <climits>
 #include <cstdint>
@@ -102,6 +104,7 @@ public:
         : role_(other.role_)
         , session_(other.session_)
         , streams_(std::move(other.streams_))
+        , body_sources_(std::move(other.body_sources_))
         , send_cb_(std::move(other.send_cb_))
         , on_request_(std::move(other.on_request_))
         , on_response_(std::move(other.on_response_))
@@ -116,6 +119,7 @@ public:
             role_       = other.role_;
             session_    = other.session_;
             streams_    = std::move(other.streams_);
+            body_sources_ = std::move(other.body_sources_);
             send_cb_    = std::move(other.send_cb_);
             on_request_ = std::move(other.on_request_);
             on_response_= std::move(other.on_response_);
@@ -128,9 +132,14 @@ public:
 
     bool initialize(send_callback_t send_cb) {
         send_cb_ = std::move(send_cb);
+        diag::log_tagged_fmt("h2_session", "initialize role=%s", role_ == role::server ? "server" : "client");
 
         nghttp2_session_callbacks* callbacks = nullptr;
-        nghttp2_session_callbacks_new(&callbacks);
+        int cb_rv = nghttp2_session_callbacks_new(&callbacks);
+        if (cb_rv != 0 || !callbacks) {
+            diag::log_tagged_fmt("h2_session", "initialize callbacks_new_failed role=%s rv=%d", role_ == role::server ? "server" : "client", cb_rv);
+            return false;
+        }
 
         nghttp2_session_callbacks_set_send_callback(callbacks, send_callback);
         nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, on_frame_recv);
@@ -147,19 +156,29 @@ public:
         }
         nghttp2_session_callbacks_del(callbacks);
 
-        if (rv != 0) return false;
-
-
-        if (role_ == role::server) {
-            nghttp2_settings_entry iv[] = {
-                { NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100 },
-                { NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 65535 }
-            };
-            rv = nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, iv, 2);
-            if (rv != 0) return false;
+        if (rv != 0) {
+            diag::log_tagged_fmt("h2_session", "initialize session_new_failed role=%s rv=%d", role_ == role::server ? "server" : "client", rv);
+            return false;
         }
 
-        return flush_send() >= 0;
+
+        nghttp2_settings_entry iv[] = {
+            { NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100 },
+            { NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 65535 }
+        };
+        rv = nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, iv, 2);
+        if (rv != 0) {
+            diag::log_tagged_fmt("h2_session", "initialize submit_settings_failed role=%s rv=%d", role_ == role::server ? "server" : "client", rv);
+            return false;
+        }
+
+        ssize_t flush_rv = flush_send();
+        diag::log_tagged_fmt("h2_session", "initialize complete role=%s flush=%lld want_read=%d want_write=%d",
+            role_ == role::server ? "server" : "client",
+            static_cast<long long>(flush_rv),
+            nghttp2_session_want_read(session_) != 0,
+            nghttp2_session_want_write(session_) != 0);
+        return flush_rv >= 0;
     }
 
     void set_on_request(on_request_t cb)  { on_request_  = std::move(cb); }
@@ -167,10 +186,18 @@ public:
 
 
     ssize_t feed(const uint8_t* data, size_t len) {
-        ssize_t rv = nghttp2_session_mem_recv(session_, data, len);
+        auto rv = nghttp2_session_mem_recv2(session_, data, len);
+        diag::log_tagged_fmt("h2_session", "feed role=%s len=%zu rv=%lld streams=%zu",
+            role_ == role::server ? "server" : "client",
+            len,
+            static_cast<long long>(rv),
+            streams_.size());
         if (rv < 0) return -1;
-        if (flush_send() < 0) return -1;
-        return rv;
+        if (flush_send() < 0) {
+            diag::log_tagged_fmt("h2_session", "feed flush_failed role=%s", role_ == role::server ? "server" : "client");
+            return -1;
+        }
+        return static_cast<ssize_t>(rv);
     }
 
 
@@ -190,7 +217,7 @@ public:
             nv.namelen = n.size();
             nv.value = reinterpret_cast<uint8_t*>(const_cast<char*>(v.data()));
             nv.valuelen = v.size();
-            nv.flags = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE;
+            nv.flags = NGHTTP2_NV_FLAG_NONE;
             nva.push_back(nv);
         };
 
@@ -201,19 +228,39 @@ public:
 
         for (auto& h : headers) push_nv(h.name, h.value);
 
-        nghttp2_data_provider prd;
-        body_source src;
-        src.data = body.data();
-        src.len  = body.size();
-        src.pos  = 0;
-        prd.source.ptr = &src;
-        prd.read_callback = body_read_callback;
+        nghttp2_data_provider prd{};
+        std::shared_ptr<body_source> src;
+        if (!body.empty()) {
+            src = std::make_shared<body_source>();
+            src->data = body;
+            src->pos = 0;
+            prd.source.ptr = src.get();
+            prd.read_callback = body_read_callback;
+        }
 
         int32_t stream_id = nghttp2_submit_request(session_, nullptr,
             nva.data(), nva.size(),
             body.empty() ? nullptr : &prd, nullptr);
 
-        if (stream_id < 0) return -1;
+        if (stream_id < 0) {
+            diag::log_tagged_fmt("h2_session", "submit_request failed rv=%d method=%s path_len=%zu authority_len=%zu headers=%zu body=%zu",
+                stream_id,
+                method.c_str(),
+                path.size(),
+                authority.size(),
+                headers.size(),
+                body.size());
+            return -1;
+        }
+        if (src) body_sources_[stream_id] = std::move(src);
+        diag::log_tagged_fmt("h2_session", "submit_request stream=%d method=%s path_len=%zu authority_len=%zu headers=%zu body=%zu source_retained=%d",
+            stream_id,
+            method.c_str(),
+            path.size(),
+            authority.size(),
+            headers.size(),
+            body.size(),
+            body_sources_.find(stream_id) != body_sources_.end());
 
         auto& sd = streams_[stream_id];
         sd.stream_id  = stream_id;
@@ -251,7 +298,7 @@ public:
         status_nv.namelen  = 7;
         status_nv.value = reinterpret_cast<uint8_t*>(const_cast<char*>(status_str.data()));
         status_nv.valuelen = status_str.size();
-        status_nv.flags = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE;
+        status_nv.flags = NGHTTP2_NV_FLAG_NONE;
         nva.push_back(status_nv);
 
         for (auto& h : headers) {
@@ -260,23 +307,40 @@ public:
             nv.namelen = h.name.size();
             nv.value = reinterpret_cast<uint8_t*>(const_cast<char*>(h.value.data()));
             nv.valuelen = h.value.size();
-            nv.flags = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE;
+            nv.flags = NGHTTP2_NV_FLAG_NONE;
             nva.push_back(nv);
         }
 
-        nghttp2_data_provider prd;
-        body_source src;
-        src.data = body.data();
-        src.len  = body.size();
-        src.pos  = 0;
-        prd.source.ptr = &src;
-        prd.read_callback = body_read_callback;
+        nghttp2_data_provider prd{};
+        std::shared_ptr<body_source> src;
+        if (!body.empty()) {
+            src = std::make_shared<body_source>();
+            src->data = body;
+            src->pos = 0;
+            prd.source.ptr = src.get();
+            prd.read_callback = body_read_callback;
+        }
 
         int rv = nghttp2_submit_response(session_, stream_id,
             nva.data(), nva.size(),
             body.empty() ? nullptr : &prd);
 
-        if (rv != 0) return false;
+        if (rv != 0) {
+            diag::log_tagged_fmt("h2_session", "submit_response failed stream=%d status=%d rv=%d headers=%zu body=%zu",
+                stream_id,
+                status_code,
+                rv,
+                headers.size(),
+                body.size());
+            return false;
+        }
+        if (src) body_sources_[stream_id] = std::move(src);
+        diag::log_tagged_fmt("h2_session", "submit_response stream=%d status=%d headers=%zu body=%zu source_retained=%d",
+            stream_id,
+            status_code,
+            headers.size(),
+            body.size(),
+            body_sources_.find(stream_id) != body_sources_.end());
         return flush_send() >= 0;
     }
 
@@ -297,19 +361,19 @@ public:
     }
 
 private:
+    struct body_source {
+        std::vector<uint8_t> data;
+        size_t pos = 0;
+    };
+
     role                          role_;
     nghttp2_session*              session_ = nullptr;
     std::map<int32_t, stream_data> streams_;
+    std::map<int32_t, std::shared_ptr<body_source>> body_sources_;
     send_callback_t               send_cb_;
     on_request_t                  on_request_;
     on_response_t                 on_response_;
 
-
-    struct body_source {
-        const uint8_t* data = nullptr;
-        size_t len = 0;
-        size_t pos = 0;
-    };
 
     static ssize_t body_read_callback(nghttp2_session* , int32_t ,
                                       uint8_t* buf, size_t length,
@@ -317,15 +381,21 @@ private:
                                       nghttp2_data_source* source,
                                       void* ) {
         auto* src = static_cast<body_source*>(source->ptr);
-        size_t remaining = src->len - src->pos;
+        size_t remaining = src->data.size() - src->pos;
         size_t to_copy = (std::min)(remaining, length);
         if (to_copy > 0) {
-            memcpy(buf, src->data + src->pos, to_copy);
+            memcpy(buf, src->data.data() + src->pos, to_copy);
             src->pos += to_copy;
         }
-        if (src->pos >= src->len) {
+        if (src->pos >= src->data.size()) {
             *data_flags |= NGHTTP2_DATA_FLAG_EOF;
         }
+        diag::log_tagged_fmt("h2_session", "body_read requested=%zu copied=%zu pos=%zu total=%zu eof=%d",
+            length,
+            to_copy,
+            src->pos,
+            src->data.size(),
+            (*data_flags & NGHTTP2_DATA_FLAG_EOF) != 0);
         return static_cast<ssize_t>(to_copy);
     }
 
@@ -359,6 +429,10 @@ private:
         if (frame->hd.type == NGHTTP2_HEADERS) {
             auto& sd = self->streams_[frame->hd.stream_id];
             sd.stream_id = frame->hd.stream_id;
+            diag::log_tagged_fmt("h2_session", "begin_headers role=%s stream=%d cat=%d",
+                self->role_ == role::server ? "server" : "client",
+                frame->hd.stream_id,
+                static_cast<int>(frame->headers.cat));
         }
         return 0;
     }
@@ -376,10 +450,30 @@ private:
         std::string v(reinterpret_cast<const char*>(value), valuelen);
 
 
-        if (n == ":method")    { sd.method    = v; return 0; }
-        if (n == ":path")      { sd.path      = v; return 0; }
-        if (n == ":authority") { sd.authority  = v; return 0; }
-        if (n == ":scheme")    { sd.scheme     = v; return 0; }
+        if (n == ":method")    {
+            sd.method = v;
+            diag::log_tagged_fmt("h2_session", "pseudo_header role=%s stream=%d name=:method value_len=%zu",
+                self->role_ == role::server ? "server" : "client", frame->hd.stream_id, v.size());
+            return 0;
+        }
+        if (n == ":path")      {
+            sd.path = v;
+            diag::log_tagged_fmt("h2_session", "pseudo_header role=%s stream=%d name=:path value_len=%zu",
+                self->role_ == role::server ? "server" : "client", frame->hd.stream_id, v.size());
+            return 0;
+        }
+        if (n == ":authority") {
+            sd.authority = v;
+            diag::log_tagged_fmt("h2_session", "pseudo_header role=%s stream=%d name=:authority value_len=%zu",
+                self->role_ == role::server ? "server" : "client", frame->hd.stream_id, v.size());
+            return 0;
+        }
+        if (n == ":scheme")    {
+            sd.scheme = v;
+            diag::log_tagged_fmt("h2_session", "pseudo_header role=%s stream=%d name=:scheme value_len=%zu",
+                self->role_ == role::server ? "server" : "client", frame->hd.stream_id, v.size());
+            return 0;
+        }
         if (n == ":status")    {
             char* end = nullptr;
             errno = 0;
@@ -387,6 +481,11 @@ private:
             if (errno == 0 && end != v.c_str() && code >= 100 && code <= 999) {
                 sd.status_code = static_cast<int>(code);
             }
+            diag::log_tagged_fmt("h2_session", "pseudo_header role=%s stream=%d name=:status value_len=%zu status=%d",
+                self->role_ == role::server ? "server" : "client",
+                frame->hd.stream_id,
+                v.size(),
+                sd.status_code);
             return 0;
         }
 
@@ -394,6 +493,12 @@ private:
         protocol_parser::http_header hdr;
         hdr.name  = std::move(n);
         hdr.value = std::move(v);
+        diag::log_tagged_fmt("h2_session", "header role=%s stream=%d cat=%d name=%s value_len=%zu",
+            self->role_ == role::server ? "server" : "client",
+            frame->hd.stream_id,
+            static_cast<int>(frame->headers.cat),
+            hdr.name.c_str(),
+            hdr.value.size());
 
 
         if (frame->headers.cat == NGHTTP2_HCAT_REQUEST ||
@@ -421,8 +526,16 @@ private:
 
         if (!sd.request_complete && self->role_ == role::server) {
             sd.request_body.insert(sd.request_body.end(), data, data + len);
+            diag::log_tagged_fmt("h2_session", "data_chunk request stream=%d len=%zu total=%zu",
+                stream_id,
+                len,
+                sd.request_body.size());
         } else {
             sd.response_body.insert(sd.response_body.end(), data, data + len);
+            diag::log_tagged_fmt("h2_session", "data_chunk response stream=%d len=%zu total=%zu",
+                stream_id,
+                len,
+                sd.response_body.size());
         }
         return 0;
     }
@@ -432,6 +545,11 @@ private:
         auto* self = static_cast<session*>(user_data);
 
         if (frame->hd.type == NGHTTP2_HEADERS || frame->hd.type == NGHTTP2_DATA) {
+            diag::log_tagged_fmt("h2_session", "frame_recv role=%s stream=%d type=%d flags=0x%02x",
+                self->role_ == role::server ? "server" : "client",
+                frame->hd.stream_id,
+                static_cast<int>(frame->hd.type),
+                frame->hd.flags);
             if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
                 auto it = self->streams_.find(frame->hd.stream_id);
                 if (it != self->streams_.end()) {
@@ -442,12 +560,23 @@ private:
                             sd.request_grpc_messages = stream_data::parse_grpc_frames(sd.request_body);
                         }
                         if (self->on_request_) self->on_request_(sd);
+                        diag::log_tagged_fmt("h2_session", "request_complete stream=%d headers=%zu body=%zu grpc=%d",
+                            frame->hd.stream_id,
+                            sd.request_headers.size(),
+                            sd.request_body.size(),
+                            static_cast<int>(sd.is_grpc));
                     } else {
                         sd.response_complete = true;
                         if (sd.is_grpc && !sd.response_body.empty()) {
                             sd.response_grpc_messages = stream_data::parse_grpc_frames(sd.response_body);
                         }
                         if (self->on_response_) self->on_response_(sd);
+                        diag::log_tagged_fmt("h2_session", "response_complete stream=%d status=%d headers=%zu body=%zu grpc=%d",
+                            frame->hd.stream_id,
+                            sd.status_code,
+                            sd.response_headers.size(),
+                            sd.response_body.size(),
+                            static_cast<int>(sd.is_grpc));
                     }
                 }
             }
@@ -459,8 +588,11 @@ private:
                                uint32_t , void* user_data) {
         auto* self = static_cast<session*>(user_data);
 
-        (void)self;
-        (void)stream_id;
+        self->body_sources_.erase(stream_id);
+        diag::log_tagged_fmt("h2_session", "stream_close role=%s stream=%d sources_remaining=%zu",
+            self->role_ == role::server ? "server" : "client",
+            stream_id,
+            self->body_sources_.size());
         return 0;
     }
 };

@@ -1639,6 +1639,7 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
 
 bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ctx) noexcept {
     if (!is_connected() || process_id_ == 0 || tid == 0) {
+        RC_UM_DBG("TCTX get skip connected=%d pid=%u tid=%u", is_connected() ? 1 : 0, process_id_, tid);
         return false;
     }
 
@@ -1649,16 +1650,22 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
     req.register_mask = 0;
 
     bool ok = send_request(ioctl_codes::TCTX(), &req, sizeof(req));
+    DWORD first_gle = ok ? ERROR_SUCCESS : GetLastError();
     if (!ok) {
         std::uint32_t prev_count = 0;
         bool suspended = suspend_thread(tid, &prev_count);
+        DWORD suspend_gle = suspended ? ERROR_SUCCESS : GetLastError();
         if (suspended) {
             ok = send_request(ioctl_codes::TCTX(), &req, sizeof(req));
+            first_gle = ok ? ERROR_SUCCESS : GetLastError();
             std::uint32_t ignored = 0;
             (void)resume_thread(tid, &ignored);
+        } else {
+            RC_UM_DBG("TCTX get suspend_failed pid=%u tid=%u gle=%lu", process_id_, tid, suspend_gle);
         }
     }
     if (!ok) {
+        RC_UM_DBG("TCTX get send_failed pid=%u tid=%u gle=%lu ioctl=0x%08X", process_id_, tid, first_gle, ioctl_codes::TCTX());
         return false;
     }
 
@@ -1677,6 +1684,7 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
 
 bool voyager::device_t::set_thread_context(std::uint32_t tid, const thread_context& ctx, std::uint64_t register_mask) noexcept {
     if (!is_connected() || process_id_ == 0 || tid == 0) {
+        RC_UM_DBG("TCTX set skip connected=%d pid=%u tid=%u mask=0x%llX", is_connected() ? 1 : 0, process_id_, tid, register_mask);
         return false;
     }
 
@@ -1696,14 +1704,35 @@ bool voyager::device_t::set_thread_context(std::uint32_t tid, const thread_conte
     req.dr6 = ctx.dr6; req.dr7 = ctx.dr7;
 
     bool ok = send_request(ioctl_codes::TCTX(), &req, sizeof(req));
+    DWORD first_gle = ok ? ERROR_SUCCESS : GetLastError();
     if (!ok) {
         std::uint32_t prev_count = 0;
         bool suspended = suspend_thread(tid, &prev_count);
+        DWORD suspend_gle = suspended ? ERROR_SUCCESS : GetLastError();
         if (suspended) {
             ok = send_request(ioctl_codes::TCTX(), &req, sizeof(req));
+            first_gle = ok ? ERROR_SUCCESS : GetLastError();
             std::uint32_t ignored = 0;
             (void)resume_thread(tid, &ignored);
+        } else {
+            RC_UM_DBG("TCTX set suspend_failed pid=%u tid=%u mask=0x%llX rip=0x%llX rsp=0x%llX gle=%lu",
+                process_id_,
+                tid,
+                register_mask,
+                ctx.rip,
+                ctx.rsp,
+                suspend_gle);
         }
+    }
+    if (!ok) {
+        RC_UM_DBG("TCTX set send_failed pid=%u tid=%u mask=0x%llX rip=0x%llX rsp=0x%llX gle=%lu ioctl=0x%08X",
+            process_id_,
+            tid,
+            register_mask,
+            ctx.rip,
+            ctx.rsp,
+            first_gle,
+            ioctl_codes::TCTX());
     }
     return ok;
 }
@@ -3335,6 +3364,11 @@ bool voyager::device_t::tier_a_driver_present_query(bool& out_present, std::uint
 
 bool voyager::device_t::canary_register(std::uint64_t va, std::uint64_t size) noexcept
 {
+    return canary_register_for_pid(va, size, process_id_ != 0 ? process_id_ : GetCurrentProcessId());
+}
+
+bool voyager::device_t::canary_register_for_pid(std::uint64_t va, std::uint64_t size, std::uint32_t pid) noexcept
+{
     if (!is_connected()) {
         RC_UM_DBG("CANR skip not_connected va=0x%llX size=0x%llX", va, size);
         return false;
@@ -3345,14 +3379,12 @@ bool voyager::device_t::canary_register(std::uint64_t va, std::uint64_t size) no
     req.session_key = session_key_;
     req.va = va;
     req.size = size;
-    req.pid = process_id_ != 0 ? process_id_ : GetCurrentProcessId();
+    req.pid = pid != 0 ? pid : GetCurrentProcessId();
 
-    RC_UM_DBG("CANR request va=0x%llX size=0x%llX pid=%u session=0x%08X magic=0x%08X ioctl=0x%08X",
+    RC_UM_DBG("CANR request va=0x%llX size=0x%llX pid=%u ioctl=0x%08X",
         req.va,
         req.size,
         req.pid,
-        req.session_key,
-        req.magic,
         ioctl_codes::CANR());
 
     if (!send_request(ioctl_codes::CANR(), &req, static_cast<DWORD>(sizeof(req)))) {
@@ -3371,6 +3403,31 @@ bool voyager::device_t::canary_register(std::uint64_t va, std::uint64_t size) no
         req.result);
 
     return req.result != 0;
+}
+
+bool voyager::device_t::canary_query_count(std::uint32_t& out_count) noexcept
+{
+    out_count = 0;
+    if (!is_connected()) {
+        RC_UM_DBG("CANQ skip not_connected");
+        return false;
+    }
+
+    detail::canary_register_request req{};
+    req.magic = session_key_ ^ dynamic_key::get() ^ 0xCA110013u;
+    req.session_key = session_key_;
+    req.pid = process_id_ != 0 ? process_id_ : GetCurrentProcessId();
+
+    RC_UM_DBG("CANQ request pid=%u ioctl=0x%08X", req.pid, ioctl_codes::CANQ());
+
+    if (!send_request(ioctl_codes::CANQ(), &req, static_cast<DWORD>(sizeof(req)))) {
+        RC_UM_DBG("CANQ send_failed pid=%u last_error=%lu", req.pid, GetLastError());
+        return false;
+    }
+
+    out_count = req.result;
+    RC_UM_DBG("CANQ response pid=%u count=%u", req.pid, out_count);
+    return true;
 }
 
 bool voyager::device_t::re_confirmed_usermode_bsod(const detail::re_evidence_blob_t& evidence) noexcept

@@ -170,6 +170,106 @@ static std::optional<std::uint32_t> parse_tid(const json& params)
     return (tid != 0) ? std::optional<std::uint32_t>{tid} : std::nullopt;
 }
 
+static bool thread_belongs_to_attached_process(HANDLE thread, std::uint32_t tid, const char* caller)
+{
+    const std::uint32_t attached_pid = driver_bridge::attached_pid();
+    if (attached_pid == 0)
+        return false;
+
+    const DWORD owner_pid = GetProcessIdOfThread(thread);
+    if (owner_pid == 0) {
+        diag::log_tagged_fmt("dbg_tools", "%s: GetProcessIdOfThread failed tid=%u gle=%lu", caller, tid, static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+    if (owner_pid != attached_pid) {
+        diag::log_tagged_fmt("dbg_tools", "%s: tid=%u owner_pid=%lu attached_pid=%u mismatch", caller, tid, static_cast<unsigned long>(owner_pid), attached_pid);
+        return false;
+    }
+    return true;
+}
+
+static void copy_native_context(const CONTEXT& native, voyager::device_t::thread_context& ctx)
+{
+    ctx.rax = native.Rax;
+    ctx.rbx = native.Rbx;
+    ctx.rcx = native.Rcx;
+    ctx.rdx = native.Rdx;
+    ctx.rsi = native.Rsi;
+    ctx.rdi = native.Rdi;
+    ctx.rbp = native.Rbp;
+    ctx.rsp = native.Rsp;
+    ctx.r8 = native.R8;
+    ctx.r9 = native.R9;
+    ctx.r10 = native.R10;
+    ctx.r11 = native.R11;
+    ctx.r12 = native.R12;
+    ctx.r13 = native.R13;
+    ctx.r14 = native.R14;
+    ctx.r15 = native.R15;
+    ctx.rip = native.Rip;
+    ctx.rflags = native.EFlags;
+    ctx.cs = native.SegCs;
+    ctx.ss = native.SegSs;
+    ctx.dr0 = native.Dr0;
+    ctx.dr1 = native.Dr1;
+    ctx.dr2 = native.Dr2;
+    ctx.dr3 = native.Dr3;
+    ctx.dr6 = native.Dr6;
+    ctx.dr7 = native.Dr7;
+    ctx.kernel_gs_base = 0;
+}
+
+static bool get_thread_context_win32_fallback(std::uint32_t tid,
+                                              voyager::device_t::thread_context& ctx,
+                                              bool suspend_for_context,
+                                              const char* caller)
+{
+    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+    if (!thread) {
+        diag::log_tagged_fmt("dbg_tools", "%s: fallback OpenThread failed tid=%u gle=%lu", caller, tid, static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+
+    auto close_and_return = [&](bool result) {
+        CloseHandle(thread);
+        return result;
+    };
+
+    if (!thread_belongs_to_attached_process(thread, tid, caller))
+        return close_and_return(false);
+
+    bool suspended = false;
+    DWORD suspend_previous = 0;
+    if (suspend_for_context) {
+        suspend_previous = SuspendThread(thread);
+        if (suspend_previous == static_cast<DWORD>(-1)) {
+            diag::log_tagged_fmt("dbg_tools", "%s: fallback SuspendThread failed tid=%u gle=%lu", caller, tid, static_cast<unsigned long>(GetLastError()));
+            return close_and_return(false);
+        }
+        suspended = true;
+    }
+
+    CONTEXT native{};
+    native.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS | CONTEXT_SEGMENTS;
+    const bool ok = GetThreadContext(thread, &native) != FALSE;
+    if (!ok) {
+        diag::log_tagged_fmt("dbg_tools", "%s: fallback GetThreadContext failed tid=%u gle=%lu", caller, tid, static_cast<unsigned long>(GetLastError()));
+    } else {
+        copy_native_context(native, ctx);
+        diag::log_tagged_fmt("dbg_tools", "%s: fallback GetThreadContext succeeded tid=%u rip=0x%llX rsp=0x%llX suspend_previous=%lu",
+            caller,
+            tid,
+            static_cast<unsigned long long>(ctx.rip),
+            static_cast<unsigned long long>(ctx.rsp),
+            static_cast<unsigned long>(suspend_previous));
+    }
+
+    if (suspended && ResumeThread(thread) == static_cast<DWORD>(-1))
+        diag::log_tagged_fmt("dbg_tools", "%s: fallback ResumeThread failed tid=%u gle=%lu", caller, tid, static_cast<unsigned long>(GetLastError()));
+
+    return close_and_return(ok && ctx.rip != 0 && ctx.rsp != 0);
+}
+
 static int int_param_clamped(const json& params, const char* key, int fallback, int lo, int hi)
 {
     int value = fallback;
@@ -365,9 +465,11 @@ static tool_result_t dbg_get_callstack(const json& params)
     if (!device->get_thread_context(tid, ctx))
     {
         diag::log_tagged_fmt("dbg_tools", "dbg_get_callstack: get_thread_context failed for tid=%u", tid);
-        if (did_suspend) device->resume_thread(tid);
-        return tool_result_t::error(
-            OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
+        if (!get_thread_context_win32_fallback(tid, ctx, true, "dbg_get_callstack")) {
+            if (did_suspend) device->resume_thread(tid);
+            return tool_result_t::error(
+                OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
+        }
     }
     diag::log_tagged_fmt("dbg_tools", "dbg_get_callstack: thread context RIP=0x%llX RSP=0x%llX RBP=0x%llX", (unsigned long long)ctx.rip, (unsigned long long)ctx.rsp, (unsigned long long)ctx.rbp);
 
@@ -554,9 +656,12 @@ static tool_result_t dbg_snapshot_state(const json& params)
     voyager::device_t::thread_context ctx{};
     if (!device->get_thread_context(tid, ctx))
     {
-        if (did_suspend) device->resume_thread(tid);
-        return tool_result_t::error(
-            OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
+        diag::log_tagged_fmt("dbg_tools", "dbg_snapshot_state: get_thread_context failed for tid=%u", tid);
+        if (!get_thread_context_win32_fallback(tid, ctx, true, "dbg_snapshot_state")) {
+            if (did_suspend) device->resume_thread(tid);
+            return tool_result_t::error(
+                OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
+        }
     }
 
     execution_snapshot snap;
@@ -2648,7 +2753,16 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             if (auto err = ensure_attached(params)) return *err;
             diag::log_tagged_fmt("dbg_tools", "dbg_get_seh_chain: calling seh_view::refresh");
             seh_view::refresh();
-            Sleep(500);
+            int waited_ms = 0;
+            for (int i = 0; i < 150; ++i) {
+                if (!seh_view::g_ui.refreshing.load(std::memory_order_acquire)) break;
+                Sleep(20);
+                waited_ms += 20;
+            }
+            diag::log_tagged_fmt("dbg_tools",
+                "dbg_get_seh_chain: refresh_wait waited_ms=%d still_refreshing=%d",
+                waited_ms,
+                seh_view::g_ui.refreshing.load(std::memory_order_acquire) ? 1 : 0);
             std::lock_guard<std::mutex> lk(seh_view::g_ui.mutex);
             json arr = json::array();
             for (const auto& e : seh_view::g_ui.entries) {
@@ -2931,10 +3045,21 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             auto addr = sa_parse_address(params["address"].get<std::string>());
             if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
             uint32_t size = static_cast<uint32_t>(params.value("size", 0x1000));
+            bool inferred_size = false;
+            if (!params.contains("size") || size == 0 || size == 0x1000) {
+                auto modules = driver_bridge::enumerate_modules();
+                for (const auto& m : modules) {
+                    if (*addr == m.base && m.size > 0) {
+                        size = m.size;
+                        inferred_size = true;
+                        break;
+                    }
+                }
+            }
             if (size == 0) size = 0x1000;
             size_t min_size = static_cast<size_t>(params.value("min_cave_size", 16));
             if (min_size == 0) min_size = 16;
-            diag::log_tagged_fmt("dbg_tools", "dbg_find_code_caves: addr=0x%llX size=0x%X min_size=%zu", (unsigned long long)*addr, size, min_size);
+            diag::log_tagged_fmt("dbg_tools", "dbg_find_code_caves: addr=0x%llX size=0x%X min_size=%zu inferred_size=%d", (unsigned long long)*addr, size, min_size, inferred_size ? 1 : 0);
             auto caves = code_patcher::find_code_caves(*addr, size, min_size);
             json arr = json::array();
             for (const auto& c : caves) {

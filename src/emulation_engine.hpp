@@ -71,6 +71,8 @@ struct emulation_result_t {
     std::uint64_t start_address = 0;
     std::uint64_t end_address   = 0;
     std::uint32_t total_instructions = 0;
+    bool          hit_ret = false;
+    bool          hit_breakpoint = false;
 
     std::vector<trace_entry_t> trace;
     std::vector<mem_write_t>   mem_writes;

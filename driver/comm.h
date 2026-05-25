@@ -1681,6 +1681,8 @@ namespace voyager {
         bool tier_a_driver_present_query(bool& out_present, std::uint32_t* out_mask = nullptr,
                                          std::uint64_t* out_first_base = nullptr) noexcept;
         bool canary_register(std::uint64_t va, std::uint64_t size) noexcept;
+        bool canary_register_for_pid(std::uint64_t va, std::uint64_t size, std::uint32_t pid) noexcept;
+        bool canary_query_count(std::uint32_t& out_count) noexcept;
         bool re_confirmed_usermode_bsod(const detail::re_evidence_blob_t& evidence) noexcept;
 
         struct anti_debug_result {
@@ -1797,6 +1799,7 @@ namespace voyager {
 
         void set_process_id(std::uint32_t pid) noexcept { process_id_ = pid; }
         void set_base_address(std::uint64_t base) noexcept { base_address_ = base; }
+        void set_dtb(std::uint64_t dtb) noexcept { dtb_ = dtb; }
         void set_kernel_dtb(std::uint64_t dtb) noexcept { kernel_dtb_ = dtb; }
 
     private:

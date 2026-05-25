@@ -154,14 +154,26 @@ std::vector<std::uint8_t> driver_read_bytes(
 
     std::vector<std::uint8_t> buffer(size, 0);
     constexpr std::size_t CHUNK_SIZE = 65536;
+    std::size_t total_read = 0;
     for (std::size_t offset = 0; offset < size; offset += CHUNK_SIZE)
     {
         std::size_t chunk = std::min(CHUNK_SIZE, size - offset);
+        std::size_t bytes_read = 0;
         if (kernel_addr)
-            device->read_kernel_raw(address + offset, buffer.data() + offset, chunk);
+            bytes_read = device->read_kernel_raw(address + offset, buffer.data() + offset, chunk);
         else
-            device->read_raw(address + offset, buffer.data() + offset, chunk);
+            bytes_read = device->read_raw(address + offset, buffer.data() + offset, chunk);
+        if (bytes_read == 0)
+            break;
+        if (bytes_read > chunk)
+            bytes_read = chunk;
+        total_read += bytes_read;
+        if (bytes_read < chunk)
+            break;
     }
+    if (total_read == 0)
+        return {};
+    buffer.resize(total_read);
     return buffer;
 }
 
@@ -202,10 +214,19 @@ process_snapshot_t driver_snapshot(
     voyager::device_t::thread_context ctx{};
     if (!device->get_thread_context(tid, ctx))
     {
-        if (did_suspend)
+        if (did_suspend) {
             device->resume_thread(tid);
-        snap.error = "Failed to read thread context for TID " + std::to_string(tid);
-        return snap;
+            did_suspend = false;
+        }
+        if (region_base == 0 || region_size == 0)
+        {
+            snap.error = "Failed to read thread context for TID " + std::to_string(tid);
+            return snap;
+        }
+        ctx.rip = 0;
+        ctx.rsp = 0;
+        ctx.rbp = 0;
+        ctx.rflags = 0x202;
     }
 
     snap.rax = ctx.rax; snap.rbx = ctx.rbx; snap.rcx = ctx.rcx; snap.rdx = ctx.rdx;
@@ -341,6 +362,50 @@ static void uc_read_regs(uc_engine* uc, trace_entry_t& entry)
     uc_reg_read(uc, UC_X86_REG_EFLAGS, &entry.rflags);
 }
 
+static bool is_kernel_address(std::uint64_t address)
+{
+    return address >= 0xFFFF800000000000ULL;
+}
+
+static void add_synthetic_stack(process_snapshot_t& snapshot, bool kernel_mode)
+{
+    constexpr std::uint64_t KERNEL_STACK_BASE = 0xFFFFFAFF00000000ULL;
+    constexpr std::uint64_t USER_STACK_BASE = 0x000000007FFD0000ULL;
+    constexpr std::uint64_t STACK_SIZE = 0x20000ULL;
+    const std::uint64_t stack_base = kernel_mode ? KERNEL_STACK_BASE : USER_STACK_BASE;
+    const std::uint64_t stack_top = stack_base + STACK_SIZE - 0x1000ULL;
+
+    for (const auto& region : snapshot.regions)
+    {
+        if (stack_top >= region.base && stack_top + 8 <= region.base + region.size)
+        {
+            snapshot.rsp = stack_top;
+            if (snapshot.rbp == 0)
+                snapshot.rbp = stack_top + 0x100ULL;
+            return;
+        }
+    }
+
+    memory_snapshot_region_t stack_region;
+    stack_region.base = stack_base;
+    stack_region.size = STACK_SIZE;
+    stack_region.data.resize(static_cast<std::size_t>(STACK_SIZE), 0);
+    snapshot.regions.push_back(std::move(stack_region));
+    snapshot.rsp = stack_top;
+    if (snapshot.rbp == 0)
+        snapshot.rbp = stack_top + 0x100ULL;
+}
+
+static void prepare_snapshot_for_config(process_snapshot_t& snapshot, const emulation_config_t& config)
+{
+    if (config.start_address != 0)
+        snapshot.rip = config.start_address;
+    if (snapshot.rflags == 0)
+        snapshot.rflags = 0x202;
+    if (snapshot.rsp == 0)
+        add_synthetic_stack(snapshot, is_kernel_address(snapshot.rip));
+}
+
 static void hook_code_cb(uc_engine* uc, uint64_t address, uint32_t size, void* user_data)
 {
     auto* ctx = static_cast<uc_trace_ctx_t*>(user_data);
@@ -370,6 +435,22 @@ static void hook_code_cb(uc_engine* uc, uint64_t address, uint32_t size, void* u
         return;
     }
 
+    decoded_insn_t decoded;
+    bool decoded_current = false;
+    if (ctx->mapped_code && address >= ctx->mapped_code_base)
+    {
+        std::uint64_t off = address - ctx->mapped_code_base;
+        if (off < ctx->mapped_code_size)
+        {
+            decoded = disassemble_one(
+                ctx->mapped_code + off,
+                ctx->mapped_code_size - static_cast<std::size_t>(off),
+                address);
+            decoded_current = true;
+            if (decoded.is_ret)
+                ctx->hit_ret = true;
+        }
+    }
 
     if (ctx->trace && ctx->trace->size() < ctx->config->max_trace_entries)
     {
@@ -378,21 +459,8 @@ static void hook_code_cb(uc_engine* uc, uint64_t address, uint32_t size, void* u
         entry.insn_size = size;
 
 
-        if (ctx->mapped_code && address >= ctx->mapped_code_base)
-        {
-            std::uint64_t off = address - ctx->mapped_code_base;
-            if (off + size <= ctx->mapped_code_size)
-            {
-                auto decoded = disassemble_one(
-                    ctx->mapped_code + off,
-                    ctx->mapped_code_size - static_cast<std::size_t>(off),
-                    address);
-                entry.disasm = decoded.full_text;
-
-                if (decoded.is_ret)
-                    ctx->hit_ret = true;
-            }
-        }
+        if (decoded_current)
+            entry.disasm = decoded.full_text;
 
         if (ctx->config->record_registers)
             uc_read_regs(uc, entry);
@@ -645,6 +713,8 @@ emulation_result_t emulate_from_snapshot(
     result.trace              = std::move(trace_log);
     result.mem_writes         = std::move(write_log);
     result.mem_reads          = std::move(read_log);
+    result.hit_ret            = trace_ctx.hit_ret;
+    result.hit_breakpoint     = trace_ctx.hit_bp;
 
 
     trace_entry_t final_regs;
@@ -706,6 +776,7 @@ emulation_result_t driver_snapshot_and_emulate(
         return fail;
     }
 
+    prepare_snapshot_for_config(snapshot, config);
     return emulate_from_snapshot(snapshot, config);
 }
 

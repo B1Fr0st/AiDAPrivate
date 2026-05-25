@@ -740,6 +740,17 @@ std::string execute_tool(const std::string& raw_name, const json& arguments)
                 for (const auto& rt : remote_tools) {
                     if (("mcp::" + rt.name) == n || rt.name == n) {
                         result += "### mcp::" + rt.name + " (from " + rt.server_name + ")\n";
+                        if (rt.description.empty() && !rt.original_name.empty()) {
+                            json detail_args = {
+                                {"names", json::array({rt.original_name})}
+                            };
+                            auto detail = s_mcp_client_mgr.call_tool(rt.server_name + "::get_tool_descriptions", detail_args);
+                            if (detail.success && !detail.text.empty()) {
+                                result += detail.text + "\n";
+                                found = true;
+                                break;
+                            }
+                        }
                         result += rt.description + "\n";
                         if (rt.input_schema.contains("properties") && rt.input_schema["properties"].is_object()) {
                             result += "Parameters:\n";

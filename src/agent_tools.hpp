@@ -178,6 +178,11 @@ namespace python_tools
     void register_tools();
 }
 
+namespace ida_pro_mcp_compat_tools
+{
+    void register_tools();
+}
+
 namespace navigation_tools
 {
     tool_result_t jump_to_address(const nlohmann::json& params);

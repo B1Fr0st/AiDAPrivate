@@ -1386,10 +1386,13 @@ void helpers::render_title()
 			char snap_before[1200] = {};
 			test_all_features::format_debug_snapshot(snap_before, sizeof(snap_before));
 			diag::log_tagged_fmt("ui", "test_all_start hotkey=Ctrl+Shift+T before={%s}", snap_before);
+			diag::log_tagged_fmt("parser_proof", "Ctrl+Shift+T pressed; starting full Test Lab before={%s}", snap_before);
+			test_all_features::run_parser_proof_smoke();
 			bool accepted = test_all_features::start_tests();
 			char snap_after[1200] = {};
 			test_all_features::format_debug_snapshot(snap_after, sizeof(snap_after));
 			diag::log_tagged_fmt("ui", "test_all_start accepted=%d after={%s}", accepted ? 1 : 0, snap_after);
+			diag::log_tagged_fmt("parser_proof", "Ctrl+Shift+T start_tests accepted=%d after={%s}", accepted ? 1 : 0, snap_after);
 		}
 
 		if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) {

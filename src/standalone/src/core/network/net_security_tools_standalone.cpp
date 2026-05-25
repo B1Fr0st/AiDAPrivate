@@ -7,6 +7,11 @@
 #include "standalone_compat.hpp"
 #include "comm.h"
 #include "net_security.hpp"
+#include "cert_generator.hpp"
+#include "mitm_proxy.hpp"
+#include "intercept/cert_profile_manager.hpp"
+#include "intercept/diagnostics.hpp"
+#include "intercept/instrumentation_provider.hpp"
 #include "obfuscation.hpp"
 #include "pro.h"
 #include "helpers/diag_log.hpp"
@@ -14,10 +19,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <initializer_list>
 #include <map>
 #include <mutex>
 #include <regex>
@@ -59,6 +66,194 @@ static std::vector<std::uint8_t> ns_hex_to_bytes(const std::string& hex) {
         if (h >= 0 && l >= 0) out.push_back(static_cast<std::uint8_t>((h << 4) | l));
     }
     return out;
+}
+
+static json ns_module_to_json(const cert_intercept::module_summary_t& module) {
+    json out;
+    out["name"] = module.name;
+    out["path"] = module.path;
+    out["base"] = module.base;
+    out["size"] = module.size;
+    out["browser_runtime"] = module.browser_runtime;
+    out["system_tls"] = module.system_tls;
+    out["app_tls_stack"] = module.app_tls_stack;
+    out["managed_runtime"] = module.managed_runtime;
+    out["quic_capable"] = module.quic_capable;
+    out["proxy_aware"] = module.proxy_aware;
+    out["stable_export_candidate"] = module.stable_export_candidate;
+    out["evidence"] = module.evidence;
+    return out;
+}
+
+static json ns_finding_to_json(const cert_intercept::diagnostic_finding_t& finding) {
+    json out;
+    out["classification"] = cert_intercept::to_string(finding.classification);
+    out["severity"] = cert_intercept::to_string(finding.severity);
+    out["title"] = finding.title;
+    out["evidence"] = finding.evidence;
+    out["next_action"] = finding.next_action;
+    return out;
+}
+
+static json ns_diagnostics_to_json(const cert_intercept::process_diagnostics_t& diagnostics) {
+    json out;
+    out["pid"] = diagnostics.pid;
+    out["process_name"] = diagnostics.process_name;
+    out["primary"] = cert_intercept::to_string(diagnostics.primary);
+    out["read_only"] = diagnostics.read_only;
+    out["recommended_tier"] = diagnostics.recommended_tier;
+    out["summary"] = diagnostics.summary;
+    out["modules"] = json::array();
+    for (const auto& module : diagnostics.modules) out["modules"].push_back(ns_module_to_json(module));
+    out["findings"] = json::array();
+    for (const auto& finding : diagnostics.findings) out["findings"].push_back(ns_finding_to_json(finding));
+    return out;
+}
+
+static json ns_provider_to_json(const cert_intercept::provider_status_t& provider) {
+    json out;
+    out["provider_id"] = provider.descriptor.provider_id;
+    out["display_name"] = provider.descriptor.display_name;
+    out["state"] = cert_intercept::to_string(provider.state);
+    out["active"] = provider.active;
+    out["intent"] = provider.descriptor.intent;
+    out["behavior"] = provider.descriptor.behavior;
+    out["forces_certificate_success"] = provider.descriptor.forces_certificate_success;
+    out["requires_explicit_target"] = provider.descriptor.requires_explicit_target;
+    out["supports_attach"] = provider.descriptor.supports_attach;
+    out["reason"] = provider.reason;
+    out["evidence"] = provider.evidence;
+    return out;
+}
+
+static json ns_firefox_status_to_json(const cert_intercept::profiles::firefox_profile_status_t& status) {
+    json out;
+    out["ok"] = status.ok;
+    out["prepared"] = status.prepared;
+    out["firefox_detected"] = status.firefox_detected;
+    out["ca_exported"] = status.ca_exported;
+    out["enterprise_roots_enabled"] = status.enterprise_roots_enabled;
+    out["policy_install_declared"] = status.policy_install_declared;
+    out["proxy_configured"] = status.proxy_configured;
+    out["http3_disabled"] = status.http3_disabled;
+    out["profile_files_valid"] = status.profile_files_valid;
+    out["ca_files_nonempty"] = status.ca_files_nonempty;
+    out["current_user_ca_trusted"] = status.current_user_ca_trusted;
+    out["trust_readiness_verified"] = status.trust_readiness_verified;
+    out["runtime_validation_performed"] = status.runtime_validation_performed;
+    out["runtime_validation_valid"] = status.runtime_validation_valid;
+    out["post_launch_profile_validated"] = status.post_launch_profile_validated;
+    out["firefox_path"] = status.firefox_path;
+    out["profile_path"] = status.profile_path.u8string();
+    out["user_js_path"] = status.user_js_path.u8string();
+    out["policies_path"] = status.policies_path.u8string();
+    out["ca_pem_path"] = status.ca_pem_path.u8string();
+    out["ca_der_path"] = status.ca_der_path.u8string();
+    out["proxy_endpoint"] = status.proxy_endpoint;
+    out["launch_arguments"] = status.launch_arguments;
+    out["launched"] = status.launched;
+    out["launched_pid"] = status.launched_pid;
+    out["error"] = status.error;
+    out["notes"] = status.notes;
+    return out;
+}
+
+static std::string ns_lower_copy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+static bool ns_has_any(const std::string& value, std::initializer_list<const char*> needles) {
+    const std::string lowered = ns_lower_copy(value);
+    for (const char* needle : needles) {
+        if (lowered.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+static void ns_apply_proxy_observations(cert_intercept::diagnostic_context_t& context) {
+    auto observations = mitm_proxy::get_tls_observations(64);
+    for (const auto& obs : observations) {
+        std::string evidence = std::string(mitm_proxy::to_string(obs.kind)) + " host=" + obs.target_host;
+        if (!obs.sni.empty()) evidence += " sni=" + obs.sni;
+        if (!obs.alpn.empty()) evidence += " alpn=" + obs.alpn;
+        if (!obs.detail.empty()) evidence += " detail=" + obs.detail;
+        switch (obs.kind) {
+        case mitm_proxy::tls_observation_kind_t::http_tls:
+            context.interception_observed = true;
+            break;
+        case mitm_proxy::tls_observation_kind_t::sni_authority_mismatch:
+            context.hostname_san_mismatch_observed = true;
+            context.interception_still_failing = true;
+            context.observation_evidence.push_back(std::move(evidence));
+            break;
+        case mitm_proxy::tls_observation_kind_t::client_handshake_failed:
+            if (ns_has_any(obs.detail, {"certificate", "unknown ca", "bad certificate", "required", "alert"})) {
+                context.browser_trust_policy_or_ct_block = true;
+                context.interception_still_failing = true;
+                context.observation_evidence.push_back(std::move(evidence));
+            }
+            break;
+        case mitm_proxy::tls_observation_kind_t::upstream_handshake_failed:
+            if (ns_has_any(obs.detail, {"certificate required", "bad certificate", "handshake failure", "alert certificate"})) {
+                context.mutual_tls_requested = true;
+                context.interception_still_failing = true;
+                context.observation_evidence.push_back(std::move(evidence));
+            }
+            break;
+        case mitm_proxy::tls_observation_kind_t::non_http_tls:
+            context.non_http_tls_observed = true;
+            context.interception_still_failing = true;
+            context.observation_evidence.push_back(std::move(evidence));
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+static cert_intercept::diagnostic_context_t ns_make_diagnostic_context(const json& params) {
+    cert_intercept::diagnostic_context_t context;
+    context.proxy_running = params.value("proxy_running", mitm_proxy::is_running());
+    context.controlled_browser = params.value("controlled_browser", false);
+    if (params.value("use_proxy_observations", true)) ns_apply_proxy_observations(context);
+    if (params.value("quic_observed", false)) context.quic_observed = true;
+    if (params.value("interception_observed", false)) context.interception_observed = true;
+    if (params.value("interception_still_failing", false)) context.interception_still_failing = true;
+    if (params.value("hostname_san_mismatch_observed", false)) context.hostname_san_mismatch_observed = true;
+    if (params.value("browser_trust_policy_or_ct_block", false)) context.browser_trust_policy_or_ct_block = true;
+    if (params.value("mutual_tls_requested", false)) context.mutual_tls_requested = true;
+    if (params.value("non_http_tls_observed", false)) context.non_http_tls_observed = true;
+    context.process_name = params.value("process_name", std::string());
+    if (params.contains("proxy_endpoint") && params["proxy_endpoint"].is_string()) {
+        context.proxy_endpoint = params["proxy_endpoint"].get<std::string>();
+    } else {
+        const auto& cfg = mitm_proxy::g_state.config;
+        context.proxy_endpoint = cfg.bind_addr + ":" + std::to_string(static_cast<unsigned>(cfg.bind_port));
+    }
+    if (cert_generator::is_ready()) {
+        const auto& ca = cert_generator::get_root_ca();
+        context.ca_trusted = cert_generator::is_root_ca_installed(ca);
+        context.ca_certificate_path = cert_generator::get_ca_storage_dir() + "\\aida_root_ca.pem";
+    } else {
+        context.ca_trusted = false;
+    }
+    if (params.contains("ca_trusted") && params["ca_trusted"].is_boolean())
+        context.ca_trusted = params["ca_trusted"].get<bool>();
+    if (params.contains("ca_certificate_path") && params["ca_certificate_path"].is_string())
+        context.ca_certificate_path = params["ca_certificate_path"].get<std::string>();
+    return context;
+}
+
+static net_security::pin_bypass_method ns_pin_method_from_string(const std::string& method) {
+    if (method == "wintrust" || method == "windows_trust") return net_security::pin_bypass_method::windows_trust;
+    if (method == "crypt32" || method == "chain_policy") return net_security::pin_bypass_method::windows_chain_policy;
+    if (method == "schannel" || method == "windows_tls") return net_security::pin_bypass_method::windows_tls;
+    if (method == "chrome" || method == "edge" || method == "chromium") return net_security::pin_bypass_method::chromium_browser;
+    if (method == "dotnet" || method == "managed") return net_security::pin_bypass_method::managed_dotnet;
+    return net_security::pin_bypass_method::all;
 }
 
 static std::string ns_get_downloads_folder() {
@@ -230,17 +425,25 @@ tool_result_t cert_generate_ca(const json& params) {
     diag::log_tagged_fmt("net_sec", "cert_generate_ca entry cn=%s days=%u", cn.c_str(), days);
 
     std::vector<std::uint8_t> cert_der, key_der;
-    bool ok = net_security::CertificateInjector::instance().generate_ca_certificate(cn, days, cert_der, key_der);
-    diag::log_tagged_fmt("net_sec", "cert_generate_ca ok=%d cert_size=%zu key_size=%zu cn=%s", (int)ok, cert_der.size(), key_der.size(), cn.c_str());
+    bool ok = net_security::CertificateInjector::instance().generate_ca_certificate(cn, days, cert_der, key_der, false);
+    diag::log_tagged_fmt("net_sec", "cert_generate_ca ok=%d cert_size=%zu cn=%s", (int)ok, cert_der.size(), cn.c_str());
     if (ok) {
         json r;
         r["success"] = true;
         r["cert_der_hex"] = ns_bytes_to_hex(cert_der.data(), cert_der.size());
-        r["key_der_hex"] = ns_bytes_to_hex(key_der.data(), key_der.size());
+        if (!key_der.empty()) {
+            SecureZeroMemory(key_der.data(), key_der.size());
+            key_der.clear();
+        }
+        r["private_key_exported"] = false;
         r["cert_size"] = cert_der.size();
         r["subject_cn"] = cn;
         r["validity_days"] = days;
-        return tool_result_t::ok(OBFSTR("Generated CA certificate: ") + cn, r);
+        return tool_result_t::ok(OBFSTR("Generated public CA certificate: ") + cn, r);
+    }
+    if (!key_der.empty()) {
+        SecureZeroMemory(key_der.data(), key_der.size());
+        key_der.clear();
     }
     return tool_result_t::error(OBFSTR("Failed to generate CA certificate"));
 }
@@ -273,30 +476,33 @@ tool_result_t pin_bypass(const json& params) {
     std::uint32_t pid = params.value("pid", 0u);
     std::string method = params.value("method", "all");
     diag::log_tagged_fmt("net_sec", "pin_bypass entry pid=%u method=%s", pid, method.c_str());
-    if (!device || !device->is_connected()) {
-        diag::log_tagged("net_sec", "pin_bypass driver not connected");
-        return tool_result_t::error(OBFSTR("Driver not connected"));
-    }
+    if (pid == 0 && device && device->is_connected()) pid = device->get_process_id();
 
     net_security::pin_bypass_config_t config;
     config.pid = pid;
-    if (method == "wintrust") config.method = net_security::pin_bypass_method::patch_wintrust;
-    else if (method == "crypt32") config.method = net_security::pin_bypass_method::patch_crypt32;
-    else if (method == "schannel") config.method = net_security::pin_bypass_method::patch_schannel;
-    else if (method == "chrome") config.method = net_security::pin_bypass_method::patch_chrome_pins;
-    else if (method == "dotnet") config.method = net_security::pin_bypass_method::patch_dotnet_callback;
-    else config.method = net_security::pin_bypass_method::all;
+    config.method = ns_pin_method_from_string(method);
 
-    auto result = net_security::CertPinBypasser::instance().bypass_pins(config);
-    diag::log_tagged_fmt("net_sec", "pin_bypass result success=%d patches_applied=%zu patches_failed=%zu pid=%u",
-        (int)result.success, result.patches_applied.size(), result.patches_failed.size(), pid);
+    auto legacy = net_security::CertPinBypasser::instance().bypass_pins(config);
+    auto context = ns_make_diagnostic_context(params);
+    auto diagnostics = cert_intercept::diagnose_process(pid, context);
+    auto providers = cert_intercept::provider_registry_t::instance().evaluate(pid, diagnostics);
+    diag::log_tagged_fmt("net_sec", "pin_bypass diagnostics primary=%s providers=%zu pid=%u",
+        cert_intercept::to_string(diagnostics.primary).c_str(), providers.size(), pid);
+
     json r;
-    r["success"] = result.success;
-    r["patches_applied"] = result.patches_applied;
-    r["patches_failed"] = result.patches_failed;
-    if (result.success)
-        return tool_result_t::ok(OBFSTR("Pin bypass applied: ") + std::to_string(result.patches_applied.size()) + OBFSTR(" patches"), r);
-    return tool_result_t::error(OBFSTR("Pin bypass failed for all methods"));
+    r["success"] = false;
+    r["pid"] = pid;
+    r["read_only"] = true;
+    r["target_process_modified"] = false;
+    r["legacy_patching_disabled"] = legacy.legacy_patching_disabled;
+    r["diagnostic_summary"] = legacy.diagnostic_summary;
+    r["recommended_action"] = legacy.recommended_action;
+    r["methods_requested"] = legacy.methods_requested;
+    r["disabled_operations"] = legacy.disabled_operations;
+    r["diagnostics"] = ns_diagnostics_to_json(diagnostics);
+    r["providers"] = json::array();
+    for (const auto& provider : providers) r["providers"].push_back(ns_provider_to_json(provider));
+    return tool_result_t::ok(OBFSTR("Certificate interception diagnostics completed without process modification"), r);
 }
 
 tool_result_t pin_bypass_revert(const json& params) {
@@ -318,7 +524,11 @@ tool_result_t pin_bypass_revert(const json& params) {
         r["pid"] = pid;
         return tool_result_t::ok(OBFSTR("Pin bypass reverted for PID ") + std::to_string(pid), r);
     }
-    return tool_result_t::error(OBFSTR("No active bypass to revert for this PID"));
+    json r;
+    r["reverted"] = false;
+    r["pid"] = pid;
+    r["target_process_modified"] = false;
+    return tool_result_t::ok(OBFSTR("No active bypass to revert for this PID"), r);
 }
 
 tool_result_t pin_bypass_status(const json& params) {
@@ -329,8 +539,58 @@ tool_result_t pin_bypass_status(const json& params) {
     diag::log_tagged_fmt("net_sec", "pin_bypass_status pid=%u active=%d", pid, (int)active);
     json r;
     r["pid"] = pid;
-    r["bypass_active"] = active;
-    return tool_result_t::ok(active ? OBFSTR("Pin bypass is ACTIVE") : OBFSTR("No active pin bypass"), r);
+    r["legacy_cleanup_pending"] = active;
+    r["read_only"] = true;
+    r["target_process_modified"] = false;
+    r["normal_bypass_available"] = false;
+    r["recommended_action"] = "Use certificate interception diagnostics, controlled profiles, and provider handoff";
+    return tool_result_t::ok(active ? OBFSTR("Legacy cleanup is pending") : OBFSTR("No legacy certificate bypass state"), r);
+}
+
+tool_result_t firefox_profile_status(const json&) {
+    auto status = cert_intercept::profiles::inspect_firefox_profile();
+    return tool_result_t::ok(OBFSTR("Firefox interception profile status"), ns_firefox_status_to_json(status));
+}
+
+tool_result_t firefox_profile_prepare(const json& params) {
+    std::string proxy_host = params.value("proxy_host", std::string());
+    uint16_t proxy_port = static_cast<uint16_t>(params.value("proxy_port", 0u));
+    if (proxy_host.empty()) proxy_host = mitm_proxy::g_state.config.bind_addr;
+    if (proxy_port == 0) proxy_port = mitm_proxy::g_state.config.bind_port;
+
+    if (!cert_generator::is_ready() && !cert_generator::initialize())
+        return tool_result_t::error(OBFSTR("AiDA CA is not ready"));
+
+    auto status = cert_intercept::profiles::prepare_firefox_profile(
+        cert_generator::get_root_ca(), proxy_host, proxy_port);
+    if (!status.ok)
+        return tool_result_t::error(OBFSTR("Firefox profile preparation failed: ") + status.error);
+    return tool_result_t::ok(OBFSTR("Firefox interception profile prepared"), ns_firefox_status_to_json(status));
+}
+
+tool_result_t firefox_profile_launch(const json& params) {
+    std::string proxy_host = params.value("proxy_host", std::string());
+    uint16_t proxy_port = static_cast<uint16_t>(params.value("proxy_port", 0u));
+    bool validate_only = params.value("validate_only", false);
+    if (proxy_host.empty()) proxy_host = mitm_proxy::g_state.config.bind_addr;
+    if (proxy_port == 0) proxy_port = mitm_proxy::g_state.config.bind_port;
+
+    if (!cert_generator::is_ready() && !cert_generator::initialize())
+        return tool_result_t::error(OBFSTR("AiDA CA is not ready"));
+
+    auto status = cert_intercept::profiles::prepare_firefox_profile(
+        cert_generator::get_root_ca(), proxy_host, proxy_port);
+    if (validate_only) {
+        status.notes.push_back("Launch validation only; Firefox was not started");
+        return tool_result_t::ok(OBFSTR("Firefox launch readiness validated without starting a browser"), ns_firefox_status_to_json(status));
+    }
+    if (!status.ok)
+        return tool_result_t::error(OBFSTR("Firefox profile preparation failed: ") + status.error);
+
+    status = cert_intercept::profiles::launch_firefox_profile(status);
+    if (!status.ok)
+        return tool_result_t::error(OBFSTR("Firefox launch failed: ") + status.error);
+    return tool_result_t::ok(OBFSTR("Firefox launched with the AiDA interception profile"), ns_firefox_status_to_json(status));
 }
 
 tool_result_t quic_detect_connections(const json& params) {
@@ -709,6 +969,9 @@ tool_result_t cert_list(const json&) { return tool_result_t::error("Not supporte
 tool_result_t pin_bypass(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t pin_bypass_revert(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t pin_bypass_status(const json&) { return tool_result_t::error("Not supported on this platform"); }
+tool_result_t firefox_profile_status(const json&) { return tool_result_t::error("Not supported on this platform"); }
+tool_result_t firefox_profile_prepare(const json&) { return tool_result_t::error("Not supported on this platform"); }
+tool_result_t firefox_profile_launch(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t quic_detect_connections(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t quic_decrypt_initial(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t quic_extract_keys(const json&) { return tool_result_t::error("Not supported on this platform"); }
@@ -785,8 +1048,7 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
     register_compat(srv, {
         OBFSTR("cert_generate_ca"), OBFSTR("network_security"),
         OBFSTR("Generate a self-signed CA certificate with a 2048-bit RSA key pair. "
-               "Returns the certificate and private key in DER format (hex-encoded). "
-               "The CA certificate can then be injected into the trust store for MITM purposes."),
+               "Returns only the public certificate DER in hex form; private key material is never returned."),
         {{OBFSTR("cn"), OBFSTR("string"), OBFSTR("Common Name for the CA (default: 'AiDA Proxy CA')"), false},
          {OBFSTR("validity_days"), OBFSTR("number"), OBFSTR("Validity period in days (default: 3650)"), false}},
         cert_generate_ca, false});
@@ -799,24 +1061,47 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
 
     register_compat(srv, {
         OBFSTR("pin_bypass"), OBFSTR("network_security"),
-        OBFSTR("Bypass certificate pinning in a target process by patching validation functions in memory. "
-               "Supports WinVerifyTrust, CertVerifyCertificateChainPolicy (crypt32), SChannel validation, "
-               "Chrome/Edge public key pins, and .NET certificate callbacks. Reverted on session end."),
+        OBFSTR("Run read-only certificate interception diagnostics for a target process. Reports proxy, CA trust, "
+               "browser/profile, provider, and handoff readiness; normal builds do not modify target process code."),
         {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID (0 = current attached)"), false},
-         {OBFSTR("method"), OBFSTR("string"), OBFSTR("Bypass method: 'all', 'wintrust', 'crypt32', 'schannel', 'chrome', 'dotnet' (default: all)"), false}},
-        pin_bypass, false});
+         {OBFSTR("method"), OBFSTR("string"), OBFSTR("Diagnostic focus: 'all', 'wintrust', 'crypt32', 'schannel', 'chrome', 'edge', 'dotnet' (default: all)"), false},
+         {OBFSTR("proxy_running"), OBFSTR("boolean"), OBFSTR("Override proxy route readiness"), false},
+         {OBFSTR("ca_trusted"), OBFSTR("boolean"), OBFSTR("Override AiDA CA trust readiness"), false},
+         {OBFSTR("interception_still_failing"), OBFSTR("boolean"), OBFSTR("Set when proxy and trust are present but interception still fails"), false}},
+        pin_bypass, true});
 
     register_compat(srv, {
         OBFSTR("pin_bypass_revert"), OBFSTR("network_security"),
-        OBFSTR("Revert all certificate pinning bypass patches for a target process, restoring original function prologues."),
+        OBFSTR("Cleanup only: revert recorded legacy certificate interception code modifications for a target process if any exist."),
         {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID"), false}},
         pin_bypass_revert, false});
 
     register_compat(srv, {
         OBFSTR("pin_bypass_status"), OBFSTR("network_security"),
-        OBFSTR("Check if certificate pin bypass is currently active for a process."),
+        OBFSTR("Check whether legacy certificate interception cleanup is pending for a process. Normal bypass is disabled."),
         {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID (0 = current)"), false}},
         pin_bypass_status, true});
+
+    register_compat(srv, {
+        OBFSTR("firefox_profile_status"), OBFSTR("network_security"),
+        OBFSTR("Inspect the dedicated AiDA Firefox interception profile, public CA exports, policy declaration, and proxy preferences."),
+        {},
+        firefox_profile_status, true});
+
+    register_compat(srv, {
+        OBFSTR("firefox_profile_prepare"), OBFSTR("network_security"),
+        OBFSTR("Prepare the dedicated AiDA Firefox profile with public CA trust declarations and scoped proxy preferences."),
+        {{OBFSTR("proxy_host"), OBFSTR("string"), OBFSTR("Proxy host (default: current AiDA proxy bind address)"), false},
+         {OBFSTR("proxy_port"), OBFSTR("number"), OBFSTR("Proxy port (default: current AiDA proxy port)"), false}},
+        firefox_profile_prepare, false});
+
+    register_compat(srv, {
+        OBFSTR("firefox_profile_launch"), OBFSTR("network_security"),
+        OBFSTR("Launch Firefox with the dedicated AiDA interception profile and scoped proxy preferences without changing the system proxy."),
+        {{OBFSTR("proxy_host"), OBFSTR("string"), OBFSTR("Proxy host (default: current AiDA proxy bind address)"), false},
+         {OBFSTR("proxy_port"), OBFSTR("number"), OBFSTR("Proxy port (default: current AiDA proxy port)"), false},
+         {OBFSTR("validate_only"), OBFSTR("boolean"), OBFSTR("Validate launch readiness without starting Firefox"), false}},
+        firefox_profile_launch, false});
 
     register_compat(srv, {
         OBFSTR("quic_detect_connections"), OBFSTR("network_security"),

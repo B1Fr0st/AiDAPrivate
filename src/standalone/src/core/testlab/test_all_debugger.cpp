@@ -96,24 +96,36 @@ static bool require_attached_live_target(HANDLE hf, const char* tag, std::atomic
     return true;
 }
 
-static uint32_t first_attached_target_tid() {
+static std::vector<uint32_t> attached_target_tids() {
+    std::vector<uint32_t> result;
     const uint32_t pid = driver_bridge::attached_pid();
     if (pid == 0)
-        return 0;
+        return result;
 
     const uint32_t active = debugger_engine::g_state.active_tid;
     auto threads = driver_bridge::enumerate_threads();
+    auto add_tid = [&](uint32_t tid) {
+        if (tid == 0)
+            return;
+        for (uint32_t existing : result) {
+            if (existing == tid)
+                return;
+        }
+        result.push_back(tid);
+    };
     if (active != 0) {
         for (const auto& t : threads) {
-            if (t.owner_pid == pid && t.tid == active)
-                return active;
+            if (t.owner_pid == pid && t.tid == active) {
+                add_tid(active);
+                break;
+            }
         }
     }
     for (const auto& t : threads) {
         if (t.owner_pid == pid)
-            return t.tid;
+            add_tid(t.tid);
     }
-    return 0;
+    return result;
 }
 
 struct controlled_step_fixture_t {
@@ -181,83 +193,119 @@ static bool prepare_controlled_step_fixture(HANDLE hf,
                                             controlled_step_fixture_t& fx,
                                             const std::vector<uint8_t>& code_bytes,
                                             bool use_stack_return) {
-    fx.tid = first_attached_target_tid();
-    if (fx.tid == 0) {
+    auto candidates = attached_target_tids();
+    if (candidates.empty()) {
         log_msg(hf, tag, "FAIL -- no live target thread available for controlled step fixture");
         return false;
     }
 
-    debugger_engine::g_state.active_tid = fx.tid;
-    if (!driver_bridge::suspend_thread(fx.tid, &fx.original_suspend_count)) {
-        log_msg(hf, tag, "FAIL -- could not suspend tid=%u for controlled step fixture", fx.tid);
-        return false;
-    }
+    std::string last_detail = "none";
+    for (uint32_t tid : candidates) {
+        controlled_step_fixture_t trial;
+        trial.tid = tid;
+        debugger_engine::g_state.active_tid = trial.tid;
+        if (!driver_bridge::suspend_thread(trial.tid, &trial.original_suspend_count)) {
+            char detail[96];
+            std::snprintf(detail, sizeof(detail), "suspend tid=%u failed", trial.tid);
+            last_detail = detail;
+            log_msg(hf, tag, "INFO -- controlled step fixture candidate rejected: %s", last_detail.c_str());
+            continue;
+        }
 
-    if (!driver_bridge::get_thread_context(fx.tid, fx.before) || fx.before.rip == 0 || fx.before.rsp == 0) {
-        driver_bridge::resume_thread(fx.tid);
-        log_msg(hf, tag, "FAIL -- could not read context for controlled step fixture tid=%u", fx.tid);
-        return false;
-    }
-    fx.context_valid = true;
+        if (!driver_bridge::get_thread_context(trial.tid, trial.before) || trial.before.rip == 0 || trial.before.rsp == 0) {
+            driver_bridge::resume_thread(trial.tid);
+            char detail[128];
+            std::snprintf(detail, sizeof(detail), "context tid=%u rip=0x%llX rsp=0x%llX failed",
+                trial.tid,
+                (unsigned long long)trial.before.rip,
+                (unsigned long long)trial.before.rsp);
+            last_detail = detail;
+            log_msg(hf, tag, "INFO -- controlled step fixture candidate rejected: %s", last_detail.c_str());
+            continue;
+        }
+        trial.context_valid = true;
 
-    fx.code = driver_bridge::allocate_memory(64);
-    if (use_stack_return)
-        fx.stack = driver_bridge::allocate_memory(0x1000);
-
-    bool ok = fx.code != 0 && (!use_stack_return || fx.stack != 0);
-    if (ok) {
-        std::vector<uint8_t> code(64, 0x90);
-        for (size_t i = 0; i < code_bytes.size() && i < code.size(); ++i)
-            code[i] = code_bytes[i];
-        ok = driver_bridge::write_memory(fx.code, code);
-    }
-    if (ok) {
-        uint32_t old_protect = 0;
-        ok = driver_bridge::protect_memory(fx.code, 64, PAGE_EXECUTE_READWRITE, &old_protect);
-    }
-    if (ok && use_stack_return) {
-        fx.expected_rip = fx.code + 0x10;
-        fx.rsp = fx.stack + 0x800;
-        std::vector<uint8_t> stack_bytes(8, 0);
-        std::memcpy(stack_bytes.data(), &fx.expected_rip, sizeof(fx.expected_rip));
-        ok = driver_bridge::write_memory(fx.rsp, stack_bytes);
-    } else if (ok) {
-        fx.expected_rip = fx.code + 1;
-    }
-    if (ok) {
-        auto ctx = fx.before;
-        ctx.rip = fx.code;
+        trial.code = driver_bridge::allocate_memory(64);
         if (use_stack_return)
-            ctx.rsp = fx.rsp;
-        ctx.rflags &= ~0x100ULL;
-        ok = driver_bridge::set_thread_context(fx.tid, ctx, ~0ULL);
-        fx.context_entered = ok;
-    }
+            trial.stack = driver_bridge::allocate_memory(0x1000);
 
-    if (!ok) {
-        uint64_t failed_code = fx.code;
-        uint64_t failed_stack = fx.stack;
-        bool restored = false;
-        bool freed_code = false;
-        bool freed_stack = false;
-        cleanup_controlled_step_fixture(fx, &restored, &freed_code, &freed_stack);
-        log_msg(hf, tag, "FAIL -- could not build controlled step fixture tid=%u code=0x%llX stack=0x%llX restored=%d free_code=%d free_stack=%d",
+        bool ok = trial.code != 0 && (!use_stack_return || trial.stack != 0);
+        if (ok) {
+            std::vector<uint8_t> code(64, 0x90);
+            for (size_t i = 0; i < code_bytes.size() && i < code.size(); ++i)
+                code[i] = code_bytes[i];
+            ok = driver_bridge::write_memory(trial.code, code);
+        }
+        if (ok) {
+            uint32_t old_protect = 0;
+            ok = driver_bridge::protect_memory(trial.code, 64, PAGE_EXECUTE_READWRITE, &old_protect);
+        }
+        if (ok && use_stack_return) {
+            trial.expected_rip = trial.code + 0x10;
+            trial.rsp = trial.stack + 0x800;
+            std::vector<uint8_t> stack_bytes(8, 0);
+            std::memcpy(stack_bytes.data(), &trial.expected_rip, sizeof(trial.expected_rip));
+            ok = driver_bridge::write_memory(trial.rsp, stack_bytes);
+        } else if (ok) {
+            trial.expected_rip = trial.code + 1;
+        }
+
+        driver_bridge::thread_context_t entry_ctx{};
+        if (ok) {
+            entry_ctx = trial.before;
+            entry_ctx.rip = trial.code;
+            if (use_stack_return)
+                entry_ctx.rsp = trial.rsp;
+            entry_ctx.rflags &= ~0x100ULL;
+            ok = driver_bridge::set_thread_context(trial.tid, entry_ctx, ~0ULL);
+            trial.context_entered = ok;
+        }
+        if (ok) {
+            auto verify_ctx = entry_ctx;
+            verify_ctx.rip = trial.expected_rip;
+            if (use_stack_return)
+                verify_ctx.rsp = trial.rsp + 8;
+            bool verify_set = driver_bridge::set_thread_context(trial.tid, verify_ctx, ~0ULL);
+            bool restore_entry = verify_set && driver_bridge::set_thread_context(trial.tid, entry_ctx, ~0ULL);
+            ok = verify_set && restore_entry;
+        }
+
+        if (!ok) {
+            uint64_t failed_code = trial.code;
+            uint64_t failed_stack = trial.stack;
+            bool restored = false;
+            bool freed_code = false;
+            bool freed_stack = false;
+            cleanup_controlled_step_fixture(trial, &restored, &freed_code, &freed_stack);
+            char detail[220];
+            std::snprintf(detail, sizeof(detail),
+                "build tid=%u code=0x%llX stack=0x%llX restored=%d free_code=%d free_stack=%d failed",
+                tid,
+                (unsigned long long)failed_code,
+                (unsigned long long)failed_stack,
+                (int)restored,
+                (int)freed_code,
+                (int)freed_stack);
+            last_detail = detail;
+            log_msg(hf, tag, "INFO -- controlled step fixture candidate rejected: %s", last_detail.c_str());
+            continue;
+        }
+
+        fx = trial;
+        log_msg(hf, tag, "INFO -- controlled step fixture tid=%u entry=0x%llX expected=0x%llX stack=0x%llX original_suspend=%u candidates=%zu",
             fx.tid,
-            (unsigned long long)failed_code,
-            (unsigned long long)failed_stack,
-            (int)restored,
-            (int)freed_code,
-            (int)freed_stack);
-        return false;
+            (unsigned long long)fx.code,
+            (unsigned long long)fx.expected_rip,
+            (unsigned long long)fx.rsp,
+            (unsigned)fx.original_suspend_count,
+            candidates.size());
+        return true;
     }
 
-    log_msg(hf, tag, "INFO -- controlled step fixture tid=%u entry=0x%llX expected=0x%llX stack=0x%llX original_suspend=%u",
-        fx.tid,
-        (unsigned long long)fx.code,
-        (unsigned long long)fx.expected_rip,
-        (unsigned long long)fx.rsp,
-        (unsigned)fx.original_suspend_count);
-    return true;
+    log_msg(hf, tag, "FAIL -- could not build controlled step fixture across %zu candidate thread(s); last=%s",
+        candidates.size(),
+        last_detail.c_str());
+    return false;
 }
 
 static void scrub_target_hardware_breakpoints(HANDLE hf, const char* reason) {
@@ -288,6 +336,49 @@ static void scrub_target_hardware_breakpoints(HANDLE hf, const char* reason) {
         target_threads,
         clear_ok,
         clear_fail);
+}
+
+static bool verify_target_hardware_breakpoints_cleared(HANDLE hf, const char* reason) {
+    const uint32_t pid = driver_bridge::attached_pid();
+    auto threads = driver_bridge::enumerate_threads();
+    int target_threads = 0;
+    int context_ok = 0;
+    int context_fail = 0;
+    int enabled_residual = 0;
+
+    for (const auto& t : threads) {
+        if (t.owner_pid != pid) continue;
+        ++target_threads;
+        driver_bridge::thread_context_t ctx{};
+        if (!driver_bridge::get_thread_context(t.tid, ctx)) {
+            ++context_fail;
+            continue;
+        }
+        ++context_ok;
+        if ((ctx.dr7 & 0xFFULL) != 0) {
+            ++enabled_residual;
+            log_msg(hf, "dbg_hwclr",
+                "RESIDUAL -- reason=%s tid=%u dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
+                reason ? reason : "unspecified",
+                static_cast<unsigned>(t.tid),
+                static_cast<unsigned long long>(ctx.dr0),
+                static_cast<unsigned long long>(ctx.dr1),
+                static_cast<unsigned long long>(ctx.dr2),
+                static_cast<unsigned long long>(ctx.dr3),
+                static_cast<unsigned long long>(ctx.dr6),
+                static_cast<unsigned long long>(ctx.dr7));
+        }
+    }
+
+    log_msg(hf, "dbg_hwclr",
+        "verify reason=%s pid=%u target_threads=%d context_ok=%d context_fail=%d enabled_residual=%d",
+        reason ? reason : "unspecified",
+        static_cast<unsigned>(pid),
+        target_threads,
+        context_ok,
+        context_fail,
+        enabled_residual);
+    return enabled_residual == 0;
 }
 
 static void test_add_remove_hw_bp_common(HANDLE hf,
@@ -324,22 +415,25 @@ static void test_add_remove_hw_bp_common(HANDLE hf,
         removed = debugger_engine::remove_breakpoint(idx);
 
     scrub_target_hardware_breakpoints(hf, tag);
+    bool regs_clear = verify_target_hardware_breakpoints_cleared(hf, tag);
     bool freed = driver_bridge::free_memory(addr);
 
     diag::log_tagged_fmt("test_dbg_detail",
-        "%s result: private_target_addr=0x%llX add_breakpoint=>idx=%d remove_breakpoint=>%d free=>%d",
+        "%s result: private_target_addr=0x%llX add_breakpoint=>idx=%d remove_breakpoint=>%d regs_clear=>%d free=>%d",
         tag,
         (unsigned long long)addr,
         idx,
         (int)removed,
+        (int)regs_clear,
         (int)freed);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (idx >= 0 && removed) {
+    if (idx >= 0 && removed && regs_clear && freed) {
         log_msg(hf, tag, "PASS -- %s idx=%d, removed ok (elapsed %lld ms)", label, idx, (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, tag, "FAIL -- idx=%d (<0 means add failed) removed=%d (elapsed %lld ms)", idx, (int)removed, (long long)ms);
+        log_msg(hf, tag, "FAIL -- idx=%d (<0 means add failed) removed=%d regs_clear=%d free=%d (elapsed %lld ms)",
+            idx, (int)removed, (int)regs_clear, (int)freed, (long long)ms);
         failed.fetch_add(1);
     }
 }

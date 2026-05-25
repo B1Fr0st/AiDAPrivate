@@ -20,8 +20,8 @@ namespace mcp_standalone
     static constexpr int JSONRPC_INVALID_PARAMS   = -32602;
     static constexpr int JSONRPC_INTERNAL_ERROR   = -32603;
 
-    static constexpr const char* PROTOCOL_VERSION = "2024-11-05";
-    static constexpr const char* SERVER_NAME      = "AiDA Standalone";
+    static constexpr const char* PROTOCOL_VERSION = "2025-06-18";
+    static constexpr const char* SERVER_NAME      = "AiDA-Pro-MCP";
     static constexpr const char* SERVER_VERSION   = "1.0.0";
 
     struct tool_result_t
@@ -75,6 +75,7 @@ namespace mcp_standalone
         bool is_running() const { return _running.load(); }
         int  get_port() const { return _port; }
         bool register_tool(tool_def_t tool);
+        tool_result_t describe_tools(const json& params);
         void write_client_configs() const;
         const std::vector<tool_def_t>& get_tools() const { return _tools; }
 
@@ -92,7 +93,7 @@ namespace mcp_standalone
         json route_request(const json& request);
         json make_result(const json& id, const json& result);
         json make_error(const json& id, int code, const std::string& msg);
-        json tool_schema(const tool_def_t& tool) const;
+        json tool_schema(const tool_def_t& tool, bool compact) const;
         std::vector<tool_def_t> _tools;
         std::mutex _tools_mtx;
         std::atomic<bool> _server_done{true};

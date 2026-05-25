@@ -108,6 +108,55 @@ static void close_socket(SOCKET s) {
     }
 }
 
+const char* to_string(tls_observation_kind_t kind) {
+    switch (kind) {
+    case tls_observation_kind_t::http_tls: return "http_tls";
+    case tls_observation_kind_t::client_handshake_failed: return "client_handshake_failed";
+    case tls_observation_kind_t::upstream_handshake_failed: return "upstream_handshake_failed";
+    case tls_observation_kind_t::sni_authority_mismatch: return "sni_authority_mismatch";
+    case tls_observation_kind_t::non_http_tls: return "non_http_tls";
+    case tls_observation_kind_t::tunnel_passthrough: return "tunnel_passthrough";
+    default: return "unknown";
+    }
+}
+
+static std::string openssl_error_text() {
+    unsigned long code = ERR_get_error();
+    if (code == 0) return std::string();
+    char buf[256] = {};
+    ERR_error_string_n(code, buf, sizeof(buf));
+    return std::string(buf);
+}
+
+static void record_tls_observation(state_t& state,
+                                   tls_observation_kind_t kind,
+                                   const std::string& target_host,
+                                   uint16_t target_port,
+                                   const std::string& client_addr,
+                                   uint16_t client_port,
+                                   const std::string& sni,
+                                   const std::string& alpn,
+                                   const std::string& detail) {
+    tls_observation_t obs;
+    obs.timestamp = GetTickCount64();
+    obs.kind = kind;
+    obs.target_host = target_host;
+    obs.target_port = target_port;
+    obs.client_addr = client_addr;
+    obs.client_port = client_port;
+    obs.sni = sni;
+    obs.alpn = alpn;
+    obs.detail = detail;
+    {
+        std::lock_guard<std::mutex> lock(state.tls_observation_mutex);
+        state.tls_observations.push_back(obs);
+        while (state.tls_observations.size() > 256)
+            state.tls_observations.pop_front();
+    }
+    diag::log_tagged_fmt("mitm", "tls_observation kind=%s host=%s:%u sni=%s alpn=%s detail=%s",
+        to_string(kind), target_host.c_str(), target_port, sni.c_str(), alpn.c_str(), detail.c_str());
+}
+
 
 struct hold_outcome_t {
     hold_decision_t       decision = hold_decision_t::forward;
@@ -1202,6 +1251,9 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
         2, 'h', '2',
         8, 'h', 't', 't', 'p', '/', '1', '.', '1'
     };
+    static const unsigned char alpn_h1[] = {
+        8, 'h', 't', 't', 'p', '/', '1', '.', '1'
+    };
 
     if (state.config.enable_h2) {
 
@@ -1230,10 +1282,18 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
     bool accept_ok = ssl_handshake_with_timeout(client_ssl, SSL_accept);
     diag::log_tagged_fmt("mitm", "handle_tls_connection SSL_accept host=%s ok=%d", target_host.c_str(), (int)accept_ok);
     if (!accept_ok) {
+        std::string detail = openssl_error_text();
+        if (detail.empty()) detail = "client_tls_handshake_failed";
+        record_tls_observation(state, tls_observation_kind_t::client_handshake_failed,
+            target_host, target_port, client_addr, client_port, std::string(), std::string(), detail);
         SSL_free(client_ssl);
         close_socket(client_sock);
         return;
     }
+
+    std::string client_sni;
+    const char* ssl_sni = SSL_get_servername(client_ssl, TLSEXT_NAMETYPE_host_name);
+    if (ssl_sni && *ssl_sni) client_sni = ssl_sni;
 
     const unsigned char* alpn_data = nullptr;
     unsigned int alpn_len = 0;
@@ -1241,7 +1301,13 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
     std::string client_alpn;
     if (alpn_data && alpn_len > 0)
         client_alpn.assign(reinterpret_cast<const char*>(alpn_data), alpn_len);
-    diag::log_tagged_fmt("mitm", "handle_tls_connection client_alpn=%s host=%s", client_alpn.c_str(), target_host.c_str());
+    diag::log_tagged_fmt("mitm", "handle_tls_connection client_alpn=%s client_sni=%s host=%s",
+        client_alpn.c_str(), client_sni.c_str(), target_host.c_str());
+    if (!client_sni.empty() && _stricmp(client_sni.c_str(), target_host.c_str()) != 0) {
+        record_tls_observation(state, tls_observation_kind_t::sni_authority_mismatch,
+            target_host, target_port, client_addr, client_port, client_sni, client_alpn,
+            "client SNI differs from CONNECT authority");
+    }
 
     SOCKET target_sock = connect_to_target(target_host, target_port);
     diag::log_tagged_fmt("mitm", "handle_tls_connection connect_to_target host=%s:%u sock=%lld",
@@ -1266,7 +1332,10 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
 
 
     if (state.config.enable_h2) {
-        SSL_CTX_set_alpn_protos(target_ctx, alpn_h2_h1, sizeof(alpn_h2_h1));
+        if (client_alpn == "h2")
+            SSL_CTX_set_alpn_protos(target_ctx, alpn_h2_h1, sizeof(alpn_h2_h1));
+        else
+            SSL_CTX_set_alpn_protos(target_ctx, alpn_h1, sizeof(alpn_h1));
     }
 
     SSL* target_ssl = SSL_new(target_ctx);
@@ -1285,6 +1354,10 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
     diag::log_tagged_fmt("mitm", "handle_tls_connection SSL_connect host=%s ok=%d", target_host.c_str(), (int)connect_ok);
     if (!connect_ok) {
         diag::log_tagged_fmt("mitm", "handle_tls_connection SSL_connect failed host=%s:%u", target_host.c_str(), target_port);
+        std::string detail = openssl_error_text();
+        if (detail.empty()) detail = "upstream_tls_handshake_failed";
+        record_tls_observation(state, tls_observation_kind_t::upstream_handshake_failed,
+            target_host, target_port, client_addr, client_port, client_sni, client_alpn, detail);
         SSL_free(target_ssl);
         SSL_CTX_free(target_ctx);
         close_socket(target_sock);
@@ -1300,12 +1373,21 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
     std::string target_alpn;
     if (target_alpn_data && target_alpn_len > 0)
         target_alpn.assign(reinterpret_cast<const char*>(target_alpn_data), target_alpn_len);
+    record_tls_observation(state, tls_observation_kind_t::http_tls,
+        target_host, target_port, client_addr, client_port, client_sni, target_alpn.empty() ? client_alpn : target_alpn,
+        "TLS handshake completed through proxy");
 
     state.active_connections.fetch_add(1);
-    diag::log_tagged_fmt("mitm", "handle_tls_connection target_alpn=%s use_h2=%d host=%s:%u",
-        target_alpn.c_str(), (int)(target_alpn == "h2" && state.config.enable_h2), target_host.c_str(), target_port);
+    bool use_h2 = state.config.enable_h2 && client_alpn == "h2" && target_alpn == "h2";
+    diag::log_tagged_fmt("mitm", "handle_tls_connection client_alpn=%s target_alpn=%s use_h2=%d host=%s:%u",
+        client_alpn.c_str(), target_alpn.c_str(), (int)use_h2, target_host.c_str(), target_port);
 
-    if (target_alpn == "h2" && state.config.enable_h2) {
+    if (state.config.enable_h2 && client_alpn == "h2" && target_alpn != "h2") {
+        diag::log_tagged_fmt("mitm", "handle_tls_connection h2 client without h2 upstream host=%s:%u", target_host.c_str(), target_port);
+        goto cleanup_no_history;
+    }
+
+    if (use_h2) {
         diag::log_tagged_fmt("mitm", "handle_tls_connection dispatching to handle_h2_session host=%s:%u", target_host.c_str(), target_port);
         handle_h2_session(client_ssl, target_ssl, target_host, target_port,
                           client_addr, client_port, state);
@@ -1327,13 +1409,20 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
             exchange.target_host = target_host;
             exchange.target_port = target_port;
             exchange.is_tls = true;
-            exchange.tls_sni = target_host;
+            exchange.tls_sni = client_sni.empty() ? target_host : client_sni;
             exchange.alpn_protocol = target_alpn.empty() ? "http/1.1" : target_alpn;
             exchange.raw_request = request_data;
             exchange.request_size = request_data.size();
             exchange.request_time = GetTickCount64();
             exchange.request = protocol_parser::parse_http_request(request_data.data(), request_data.size());
             exchange.state = http_exchange::state_t::pending;
+            if (!exchange.request.valid) {
+                diag::log_tagged_fmt("mitm", "handle_tls_connection invalid HTTP/1 request size=%zu host=%s:%u", request_data.size(), target_host.c_str(), target_port);
+                record_tls_observation(state, tls_observation_kind_t::non_http_tls,
+                    target_host, target_port, client_addr, client_port, client_sni, exchange.alpn_protocol,
+                    "TLS payload did not parse as an HTTP request");
+                goto cleanup_no_history;
+            }
 
             state.total_requests.fetch_add(1);
             state.total_bytes_in.fetch_add(request_data.size());
@@ -1391,6 +1480,11 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
                         exchange.raw_request = request_data;
                         exchange.request_size = request_data.size();
                         exchange.request = protocol_parser::parse_http_request(request_data.data(), request_data.size());
+                        if (!exchange.request.valid) {
+                            diag::log_tagged_fmt("mitm", "handle_tls_connection modified request invalid exchange_id=%llu", static_cast<unsigned long long>(exchange.id));
+                            exchange.state = http_exchange::state_t::dropped;
+                            should_forward = false;
+                        }
                     }
                 }
             }
@@ -1619,6 +1713,11 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
                 exchange.raw_request = request_data;
                 exchange.request_size = request_data.size();
                 exchange.request = protocol_parser::parse_http_request(request_data.data(), request_data.size());
+                if (!exchange.request.valid) {
+                    diag::log_tagged_fmt("mitm", "handle_plain_connection modified request invalid exchange_id=%llu", static_cast<unsigned long long>(exchange.id));
+                    exchange.state = http_exchange::state_t::dropped;
+                    should_forward = false;
+                }
             }
         }
     }
@@ -1748,6 +1847,9 @@ static void handle_client(SOCKET client_sock, sockaddr_in client_addr_in, state_
             handle_tls_connection(client_sock, target_host, target_port, client_addr, client_port, state);
         } else {
             diag::log_tagged_fmt("mitm", "handle_client dispatch_tunnel host=%s port=%u client=%s:%u", target_host.c_str(), target_port, client_addr.c_str(), client_port);
+            record_tls_observation(state, tls_observation_kind_t::tunnel_passthrough,
+                target_host, target_port, client_addr, client_port, std::string(), std::string(),
+                "CONNECT tunnel passed without TLS decoding");
             SOCKET target_sock = connect_to_target(target_host, target_port);
             if (target_sock == INVALID_SOCKET) {
                 diag::log_tagged_fmt("mitm", "handle_client tunnel_connect_failed host=%s port=%u client=%s:%u", target_host.c_str(), target_port, client_addr.c_str(), client_port);
@@ -1894,6 +1996,23 @@ bool start(const proxy_config& config) {
     if (config.decode_tls && !cert_generator::is_ready()) {
         if (!cert_generator::initialize()) {
             diag::log_tagged("network", "mitm_proxy_start_failed cert_generator_init");
+            return false;
+        }
+    }
+
+    if (config.decode_tls) {
+        const auto& ca = cert_generator::get_root_ca();
+        if (!ca.valid || !ca.cert) {
+            diag::log_tagged("network", "mitm_proxy_start_failed ca_not_ready");
+            return false;
+        }
+        bool installed = cert_generator::is_root_ca_installed(ca);
+        if (!installed) {
+            diag::log_tagged("network", "mitm_proxy_start installing_current_user_root_ca");
+            installed = cert_generator::install_root_ca(ca);
+        }
+        if (!installed || !cert_generator::is_root_ca_installed(ca)) {
+            diag::log_tagged("network", "mitm_proxy_start_failed current_user_root_ca_not_verified");
             return false;
         }
     }
@@ -2112,6 +2231,26 @@ void clear_history() {
 size_t history_count() {
     std::lock_guard<std::mutex> lock(g_state.history_mutex);
     return g_state.history.size();
+}
+
+std::vector<tls_observation_t> get_tls_observations(size_t max_count) {
+    std::lock_guard<std::mutex> lock(g_state.tls_observation_mutex);
+    std::vector<tls_observation_t> result;
+    size_t count = g_state.tls_observations.size();
+    size_t take = (max_count == 0 || max_count >= count) ? count : max_count;
+    result.reserve(take);
+    size_t skip = count - take;
+    size_t i = 0;
+    for (const auto& obs : g_state.tls_observations) {
+        if (i++ < skip) continue;
+        result.push_back(obs);
+    }
+    return result;
+}
+
+void clear_tls_observations() {
+    std::lock_guard<std::mutex> lock(g_state.tls_observation_mutex);
+    g_state.tls_observations.clear();
 }
 
 void set_intercept_enabled(bool enabled) {

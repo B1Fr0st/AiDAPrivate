@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <openssl/evp.h>
 #include <openssl/x509.h>
@@ -42,6 +43,15 @@ bool load_root_ca(const std::string& key_path, const std::string& cert_path, roo
 
 
 bool save_root_ca(const root_ca_t& ca, const std::string& key_path, const std::string& cert_path);
+
+
+std::string spki_sha256_base64(const root_ca_t& ca);
+
+
+bool export_ca_certificate_der(const root_ca_t& ca, std::vector<uint8_t>& out);
+
+
+bool export_ca_certificate_pem(const root_ca_t& ca, std::string& out);
 
 
 bool install_root_ca(const root_ca_t& ca);

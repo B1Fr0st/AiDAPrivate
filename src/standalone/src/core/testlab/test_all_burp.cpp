@@ -2434,6 +2434,37 @@ namespace {
         }
     }
 
+    void test_browser_command_line_certificate_strategy(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        const char* tag = "browser_cmd_cert";
+        log_msg(hf, tag, "START -- browser command line certificate strategy");
+        aida::burp::browser::browser_launch_config_t cfg;
+        cfg.proxy_host = "127.0.0.1";
+        cfg.proxy_port = 18888;
+        cfg.initial_url = "https://example.com/";
+        cfg.certificate_strategy = aida::burp::browser::certificate_strategy_t::chromium_spki_allowlist;
+        cfg.spki_allowlist = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        std::wstring cmd = aida::burp::browser::build_command_line_for_test(
+            "C:\\Program Files\\Browser\\browser.exe",
+            cfg,
+            "C:\\Users\\Test User\\AppData\\Local\\AiDA\\BurpBrowser");
+        bool has_proxy = cmd.find(L"--proxy-server=127.0.0.1:18888") != std::wstring::npos;
+        bool has_profile = cmd.find(L"--user-data-dir=C:\\Users\\Test User\\AppData\\Local\\AiDA\\BurpBrowser") != std::wstring::npos;
+        bool has_spki = cmd.find(L"--ignore-certificate-errors-spki-list=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=") != std::wstring::npos;
+        bool lacks_global = cmd.find(L" --ignore-certificate-errors ") == std::wstring::npos &&
+            cmd.find(L"--test-type") == std::wstring::npos;
+        if (has_proxy && has_profile && has_spki && lacks_global) {
+            log_msg(hf, tag, "PASS -- SPKI command line emitted scoped flag and omitted global ignore flags");
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- proxy=%s profile=%s spki=%s lacks_global=%s",
+                has_proxy ? "true" : "false",
+                has_profile ? "true" : "false",
+                has_spki ? "true" : "false",
+                lacks_global ? "true" : "false");
+            failed.fetch_add(1);
+        }
+    }
+
     void test_browser_list_running(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "browser_running";
         log_msg(hf, tag, "START -- browser::list_running()");
@@ -3100,6 +3131,8 @@ void phase_burp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fai
     call_test(test_browser_detect_chrome, hf, passed, failed);
     if (cancelled && cancelled()) return;
     call_test(test_browser_profile_root, hf, passed, failed);
+    if (cancelled && cancelled()) return;
+    call_test(test_browser_command_line_certificate_strategy, hf, passed, failed);
     if (cancelled && cancelled()) return;
     call_test(test_browser_list_running, hf, passed, failed);
 

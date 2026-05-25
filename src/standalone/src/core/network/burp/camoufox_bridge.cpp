@@ -1233,6 +1233,78 @@ call_result_t list_network_requests(size_t max_records)
     diag::log_tagged_fmt("camoufox", "list_network_requests entry max_records=%zu", max_records);
     nlohmann::json a;
     call_result_t r = call_with_deadline("list_network_requests", a, 30000);
+    if (r.ok && (!r.data.is_array() || r.data.empty()))
+    {
+        static const char* kPerfEntriesJs = R"JS((function(){
+var out=[];
+try {
+var nav=performance.getEntriesByType('navigation') || [];
+var res=performance.getEntriesByType('resource') || [];
+function push(e, kind) {
+out.push({
+url: String(e.name || location.href || ''),
+entry_type: kind,
+initiator_type: String(e.initiatorType || kind),
+start_time: Number(e.startTime || 0),
+duration: Number(e.duration || 0),
+transfer_size: Number(e.transferSize || 0)
+});
+}
+for (var i=0;i<nav.length;i++) push(nav[i], 'navigation');
+for (var j=0;j<res.length;j++) push(res[j], 'resource');
+} catch(e) {}
+return JSON.stringify(out);
+})())JS";
+        call_result_t fb = evaluate_js(kPerfEntriesJs, true);
+        nlohmann::json records = nlohmann::json::array();
+        if (fb.ok)
+        {
+            if (fb.data.is_array())
+            {
+                records = fb.data;
+            }
+            else if (fb.data.is_string())
+            {
+                nlohmann::json parsed;
+                parse_text_to_json(fb.data.get<std::string>(), parsed);
+                if (parsed.is_array()) records = std::move(parsed);
+            }
+            else if (fb.data.is_object())
+            {
+                for (const char* key : {"value", "result", "data"})
+                {
+                    auto it = fb.data.find(key);
+                    if (it == fb.data.end())
+                        continue;
+                    if (it->is_array())
+                    {
+                        records = *it;
+                        break;
+                    }
+                    if (it->is_string())
+                    {
+                        nlohmann::json parsed;
+                        parse_text_to_json(it->get<std::string>(), parsed);
+                        if (parsed.is_array())
+                        {
+                            records = std::move(parsed);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (!records.empty())
+        {
+            diag::log_tagged_fmt("camoufox", "list_network_requests performance_fallback count=%zu", records.size());
+            r.data = std::move(records);
+        }
+        else
+        {
+            diag::log_tagged_fmt("camoufox", "list_network_requests performance_fallback empty ok=%d err=%s",
+                static_cast<int>(fb.ok), fb.error.c_str());
+        }
+    }
     if (r.ok && r.data.is_array() && max_records > 0 && r.data.size() > max_records)
     {
         nlohmann::json trimmed = nlohmann::json::array();

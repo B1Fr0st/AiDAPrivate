@@ -13,8 +13,6 @@
 
 #include "../../../helpers/diag_log.hpp"
 
-#include <httplib.h>
-
 #include <algorithm>
 #include <cctype>
 #include <cstring>
@@ -479,23 +477,19 @@ bool send_query(const std::string& endpoint,
     }
     diag::log_tagged_fmt("graphql", "send_query parsed scheme=%s host=%s port=%u path=%s query=%d",
         scheme.c_str(), host.c_str(), static_cast<unsigned>(port), endpoint_log.path.c_str(), (int)endpoint_log.has_query);
-    std::string origin = scheme + "://" + host;
-    if ((scheme == "https" && port != 443) || (scheme == "http" && port != 80))
-        origin += ":" + std::to_string(port);
-
-    httplib::Client cli(origin);
-    cli.set_connection_timeout(0, 5000000);
-    cli.set_read_timeout(20, 0);
-    cli.set_write_timeout(20, 0);
-    cli.enable_server_certificate_verification(true);
-
-    httplib::Headers hh;
+    std::vector<std::pair<std::string, std::string>> hh;
     bool has_ct = false;
+    bool has_accept = false;
     for (const auto& kv : headers) {
-        hh.emplace(kv.first, kv.second);
-        if (to_lower(kv.first) == "content-type") has_ct = true;
+        std::string key_lc = to_lower(kv.first);
+        if (key_lc == "host" || key_lc == "content-length" || key_lc == "connection")
+            continue;
+        hh.push_back(kv);
+        if (key_lc == "content-type") has_ct = true;
+        if (key_lc == "accept") has_accept = true;
     }
-    if (!has_ct) hh.emplace("Content-Type", std::string("application/json"));
+    if (!has_ct) hh.push_back({"Content-Type", "application/json"});
+    if (!has_accept) hh.push_back({"Accept", "application/json"});
 
     nlohmann::json body;
     body["query"] = query;
@@ -504,31 +498,58 @@ bool send_query(const std::string& endpoint,
 
     diag::log_tagged_fmt("graphql", "send_query posting host=%s port=%u path=%s headers=%zu body_len=%zu",
         host.c_str(), static_cast<unsigned>(port), endpoint_log.path.c_str(), hh.size(), body_str.size());
-    auto res = cli.Post(path, hh, body_str, std::string("application/json"));
+
+    std::ostringstream raw;
+    raw << "POST " << (path.empty() ? std::string("/") : path) << " HTTP/1.1\r\n";
+    raw << "Host: " << host;
+    if ((scheme == "https" && port != 443) || (scheme == "http" && port != 80))
+        raw << ":" << static_cast<unsigned>(port);
+    raw << "\r\n";
+    for (const auto& h : hh)
+        raw << h.first << ": " << h.second << "\r\n";
+    raw << "Connection: close\r\n";
+    raw << "Content-Length: " << body_str.size() << "\r\n\r\n";
+    raw << body_str;
+
+    std::string raw_request = raw.str();
+    std::vector<uint8_t> request_bytes(raw_request.begin(), raw_request.end());
+    audit_http::send_options_t opts;
+    opts.timeout_ms = 20000;
+    opts.follow_redirects = false;
+    opts.enforce_scope = false;
+
+    auto res = audit_http::send(request_bytes, host, port, scheme == "https", opts);
     if (!res) {
         diag::log_tagged_fmt("graphql", "send_query post_failed host=%s path=%s",
             host.c_str(), endpoint_log.path.c_str());
-        set_err("graphql.send_query: POST failed");
+        std::string err = audit_http::last_error();
+        set_err(err.empty() ? std::string("graphql.send_query: POST failed") : std::string("graphql.send_query: ") + err);
         return false;
     }
-    raw_text = res->body;
+    if (res->status_code < 200 || res->status_code >= 300) {
+        diag::log_tagged_fmt("graphql", "send_query http_error host=%s path=%s status=%d",
+            host.c_str(), endpoint_log.path.c_str(), res->status_code);
+        set_err("graphql.send_query: HTTP " + std::to_string(res->status_code));
+        return false;
+    }
+    raw_text.assign(res->resp_body.begin(), res->resp_body.end());
     diag::log_tagged_fmt("graphql", "send_query response_received status=%d body_len=%zu",
-        res->status, raw_text.size());
+        res->status_code, raw_text.size());
     if (raw_text.empty()) {
         diag::log_tagged_fmt("graphql", "send_query empty_body host=%s path=%s status=%d",
-            host.c_str(), endpoint_log.path.c_str(), res->status);
+            host.c_str(), endpoint_log.path.c_str(), res->status_code);
         set_err("graphql.send_query: empty body");
         return false;
     }
     response_json = nlohmann::json::parse(raw_text, nullptr, false);
     if (response_json.is_discarded()) {
         diag::log_tagged_fmt("graphql", "send_query response_not_json host=%s path=%s status=%d body_len=%zu",
-            host.c_str(), endpoint_log.path.c_str(), res->status, raw_text.size());
+            host.c_str(), endpoint_log.path.c_str(), res->status_code, raw_text.size());
         set_err("graphql.send_query: response is not JSON");
         return false;
     }
     diag::log_tagged_fmt("graphql", "send_query ok host=%s path=%s status=%d response_type=%s",
-        host.c_str(), endpoint_log.path.c_str(), res->status, response_json.type_name());
+        host.c_str(), endpoint_log.path.c_str(), res->status_code, response_json.type_name());
     return true;
 }
 

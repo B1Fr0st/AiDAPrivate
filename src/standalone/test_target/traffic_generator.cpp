@@ -420,14 +420,9 @@ static DWORD WINAPI dns_query_thread(LPVOID param) {
         const char* host = queries[idx % 8].host;
         uint16_t qtype = queries[idx % 8].type;
         const char* tname = queries[idx % 8].tname;
-        const char* server = servers[idx % 2];
+        const bool loopback_mode = s_cfg.no_external || !s_external_ok.load();
+        const char* server = loopback_mode ? "127.0.0.1" : servers[idx % 2];
         idx++;
-
-        if (s_cfg.no_external || !s_external_ok.load()) {
-            log("dns query %s/%s -> skipped (external disabled)", host, tname);
-            interruptible_sleep(s_cfg.rate_ms);
-            continue;
-        }
 
         SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (s == INVALID_SOCKET) { interruptible_sleep(s_cfg.rate_ms); continue; }
@@ -441,9 +436,10 @@ static DWORD WINAPI dns_query_thread(LPVOID param) {
         build_dns_query(q, qid++, host, qtype);
 
         int sent = sendto(s, (const char*)q.data(), (int)q.size(), 0, (struct sockaddr*)&dest, sizeof(dest));
-        log("dns query %s/%s id=%u -> %s:53 (%d bytes)", host, tname, qid - 1, server, sent);
+        log("dns query %s/%s id=%u -> %s:53 mode=%s (%d bytes)",
+            host, tname, qid - 1, server, loopback_mode ? "loopback" : "external", sent);
 
-        DWORD timeout = 2000;
+        DWORD timeout = loopback_mode ? 100 : 2000;
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
         uint8_t rbuf[1024]{};
         struct sockaddr_in from{};
@@ -452,6 +448,8 @@ static DWORD WINAPI dns_query_thread(LPVOID param) {
         if (recvd >= 12) {
             uint16_t ancount = (uint16_t)((rbuf[6] << 8) | rbuf[7]);
             log("dns response %s/%s answers=%u (%d bytes)", host, tname, ancount, recvd);
+        } else if (loopback_mode) {
+            log("dns response %s/%s loopback probe sent no listener", host, tname);
         } else {
             log("dns response %s/%s timeout/offline", host, tname);
             s_external_ok.store(false);

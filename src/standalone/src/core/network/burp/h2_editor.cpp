@@ -218,6 +218,9 @@ struct session_state_t
     std::unordered_map<int32_t, stream_cap_t>   streams;
     std::vector<uint8_t>                        out_buf;
     std::atomic<bool>                           goaway{false};
+    uint64_t                                    frames_seen = 0;
+    uint64_t                                    headers_seen = 0;
+    uint64_t                                    data_chunks_seen = 0;
 };
 
 static ssize_t s_send_cb(nghttp2_session*, const uint8_t* data, size_t length, int, void* ud)
@@ -238,6 +241,14 @@ static int s_on_header_cb(nghttp2_session*, const nghttp2_frame* frame,
     std::string v(reinterpret_cast<const char*>(value), vl);
     if (n == ":status") cap.status = atoi(v.c_str());
     else cap.headers.push_back({ n, v });
+    ++st->headers_seen;
+    diag::log_tagged_fmt("h2_edit",
+        "recv_header sid=%d name=%s value_len=%zu status=%d total_headers=%llu",
+        frame->hd.stream_id,
+        n.c_str(),
+        v.size(),
+        cap.status,
+        static_cast<unsigned long long>(st->headers_seen));
     return 0;
 }
 
@@ -251,12 +262,25 @@ static int s_on_data_cb(nghttp2_session*, uint8_t, int32_t sid,
     size_t room = cap.body_cap > cap.body.size() ? cap.body_cap - cap.body.size() : 0;
     size_t take = len < room ? len : room;
     if (take > 0) cap.body.insert(cap.body.end(), data, data + take);
+    ++st->data_chunks_seen;
+    diag::log_tagged_fmt("h2_edit",
+        "recv_data sid=%d len=%zu take=%zu body=%zu chunks=%llu",
+        sid, len, take, cap.body.size(),
+        static_cast<unsigned long long>(st->data_chunks_seen));
     return 0;
 }
 
 static int s_on_frame_cb(nghttp2_session*, const nghttp2_frame* frame, void* ud)
 {
     auto* st = static_cast<session_state_t*>(ud);
+    ++st->frames_seen;
+    diag::log_tagged_fmt("h2_edit",
+        "recv_frame type=%u flags=0x%02x sid=%d len=%u frames=%llu",
+        static_cast<unsigned>(frame->hd.type),
+        static_cast<unsigned>(frame->hd.flags),
+        frame->hd.stream_id,
+        static_cast<unsigned>(frame->hd.length),
+        static_cast<unsigned long long>(st->frames_seen));
     if (frame->hd.type == NGHTTP2_GOAWAY) { st->goaway.store(true); return 0; }
     if ((frame->hd.type == NGHTTP2_HEADERS || frame->hd.type == NGHTTP2_DATA)
         && (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
@@ -274,6 +298,9 @@ static int s_on_close_cb(nghttp2_session*, int32_t sid, uint32_t ec, void* ud)
         if (ec != 0) it->second.errored = true;
         it->second.complete = true;
     }
+    diag::log_tagged_fmt("h2_edit",
+        "stream_close sid=%d ec=%u found=%d",
+        sid, ec, it != st->streams.end() ? 1 : 0);
     return 0;
 }
 
@@ -442,23 +469,30 @@ response_t send(const request_t& req)
     }
     diag::log_tagged_fmt("h2_edit", "send settings_ok");
 
-    std::vector<nghttp2_nv> nva;
-    nva.reserve(req.headers.size() + 4);
-    auto push = [&](const std::string& n, const std::string& v) {
-        nghttp2_nv nv;
-        nv.name = reinterpret_cast<uint8_t*>(const_cast<char*>(n.data()));
-        nv.namelen = n.size();
-        nv.value = reinterpret_cast<uint8_t*>(const_cast<char*>(v.data()));
-        nv.valuelen = v.size();
-        nv.flags = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE;
-        nva.push_back(nv);
-    };
+    std::vector<std::pair<std::string, std::string>> header_storage;
+    header_storage.reserve(req.headers.size() + 4);
     std::string authority = req.pseudo.authority.empty() ? req.host : req.pseudo.authority;
-    push(":method", req.pseudo.method.empty() ? std::string("GET") : req.pseudo.method);
-    push(":scheme", req.pseudo.scheme.empty() ? std::string("https") : req.pseudo.scheme);
-    push(":path", req.pseudo.path.empty() ? std::string("/") : req.pseudo.path);
-    push(":authority", authority);
-    for (auto& h : req.headers) push(h.first, h.second);
+    header_storage.emplace_back(":method", req.pseudo.method.empty() ? std::string("GET") : req.pseudo.method);
+    header_storage.emplace_back(":scheme", req.pseudo.scheme.empty() ? std::string("https") : req.pseudo.scheme);
+    header_storage.emplace_back(":path", req.pseudo.path.empty() ? std::string("/") : req.pseudo.path);
+    header_storage.emplace_back(":authority", authority);
+    for (auto& h : req.headers) header_storage.emplace_back(h.first, h.second);
+
+    std::vector<nghttp2_nv> nva;
+    nva.reserve(header_storage.size());
+    for (auto& hv : header_storage) {
+        nghttp2_nv nv;
+        nv.name = reinterpret_cast<uint8_t*>(const_cast<char*>(hv.first.data()));
+        nv.namelen = hv.first.size();
+        nv.value = reinterpret_cast<uint8_t*>(const_cast<char*>(hv.second.data()));
+        nv.valuelen = hv.second.size();
+        nv.flags = NGHTTP2_NV_FLAG_NONE;
+        nva.push_back(nv);
+        diag::log_tagged_fmt("h2_edit",
+            "send_header_prepared name=%s value_len=%zu",
+            hv.first.c_str(),
+            hv.second.size());
+    }
 
     nghttp2_data_provider prd{};
     struct src_t { const uint8_t* data; size_t len; size_t pos; };
@@ -486,10 +520,11 @@ response_t send(const request_t& req)
         return r;
     }
     diag::log_tagged_fmt("h2_edit", "send stream_id=%d sending", sid);
+    st.streams.emplace(sid, stream_cap_t{});
 
     auto t0 = std::chrono::steady_clock::now();
     int rv = nghttp2_session_send(st.session);
-    (void)rv;
+    diag::log_tagged_fmt("h2_edit", "send initial_session_send rv=%d out_buf=%zu", rv, st.out_buf.size());
     if (!st.out_buf.empty()) {
         r.raw_wire_out.insert(r.raw_wire_out.end(), st.out_buf.begin(), st.out_buf.end());
         if (!ssl_send_all(c.ssl, st.out_buf.data(), st.out_buf.size(), req.timeout_ms)) {
@@ -526,15 +561,25 @@ response_t send(const request_t& req)
             break;
         }
         r.raw_wire_in.insert(r.raw_wire_in.end(), tmp, tmp + n);
+        diag::log_tagged_fmt("h2_edit",
+            "send recv_bytes n=%d wire_in=%zu want_read=%d want_write=%d",
+            n,
+            r.raw_wire_in.size(),
+            nghttp2_session_want_read(st.session) ? 1 : 0,
+            nghttp2_session_want_write(st.session) ? 1 : 0);
         ssize_t mr = nghttp2_session_mem_recv(st.session, tmp, static_cast<size_t>(n));
         if (mr < 0) {
             diag::log_tagged_fmt("h2_edit", "send mem_recv_failed mr=%d sid=%d", static_cast<int>(mr), sid);
             break;
         }
         rv = nghttp2_session_send(st.session);
-        (void)rv;
+        diag::log_tagged_fmt("h2_edit", "send loop_session_send rv=%d out_buf=%zu", rv, st.out_buf.size());
         if (!st.out_buf.empty()) {
-            ssl_send_all(c.ssl, st.out_buf.data(), st.out_buf.size(), req.timeout_ms);
+            r.raw_wire_out.insert(r.raw_wire_out.end(), st.out_buf.begin(), st.out_buf.end());
+            if (!ssl_send_all(c.ssl, st.out_buf.data(), st.out_buf.size(), req.timeout_ms)) {
+                diag::log_tagged_fmt("h2_edit", "send loop_write_failed out_buf=%zu", st.out_buf.size());
+                break;
+            }
             st.out_buf.clear();
         }
     }
@@ -553,9 +598,13 @@ response_t send(const request_t& req)
         r.error_msg = "h2_stream_missing";
     }
     r.latency_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
-    diag::log_tagged_fmt("h2_edit", "send done ok=%d status=%d latency_ms=%llu body=%zu err=%s",
+    diag::log_tagged_fmt("h2_edit", "send done ok=%d status=%d latency_ms=%llu body=%zu err=%s frames=%llu headers=%llu data_chunks=%llu streams=%zu",
         static_cast<int>(r.ok), r.status_code, static_cast<unsigned long long>(r.latency_ms),
-        r.body.size(), r.error_msg.c_str());
+        r.body.size(), r.error_msg.c_str(),
+        static_cast<unsigned long long>(st.frames_seen),
+        static_cast<unsigned long long>(st.headers_seen),
+        static_cast<unsigned long long>(st.data_chunks_seen),
+        st.streams.size());
 
     nghttp2_session_del(st.session);
     close_conn(c);

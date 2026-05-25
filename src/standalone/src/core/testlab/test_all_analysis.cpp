@@ -780,6 +780,12 @@ static void test_symbolic_solve_for_path(HANDLE hf, std::atomic<int>& passed, st
             result.variable_values.size(), result.solving_time_ms, (long long)ms);
         failed.fetch_add(1); return;
     }
+    if (!result.satisfiable || result.variable_values.empty()) {
+        log_msg(hf, "sym_solv", "FAIL -- solve_for_path returned no satisfying input satisfiable=%d vars=%zu solve_ms=%u (elapsed %lld ms)",
+            result.satisfiable,
+            result.variable_values.size(), result.solving_time_ms, (long long)ms);
+        failed.fetch_add(1); return;
+    }
     log_msg(hf, "sym_solv", "PASS -- success=%d satisfiable=%d vars=%zu solve_ms=%u (elapsed %lld ms)",
         result.success, result.satisfiable,
         result.variable_values.size(), result.solving_time_ms, (long long)ms);

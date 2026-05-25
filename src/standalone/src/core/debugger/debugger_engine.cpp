@@ -452,7 +452,10 @@ int add_breakpoint(uint64_t address, bp_type_t type, const std::string& name,
 			return -1;
 		}
 		if (any_failed) {
-			set_last_error("add_breakpoint: partial DRx programming");
+			diag::log_tagged_fmt("bp",
+				"add_breakpoint_partial_drx addr=0x%llx slot=%d",
+				static_cast<unsigned long long>(address),
+				slot);
 		}
 	}
 
@@ -1005,6 +1008,7 @@ bool step_into() {
 		st.status.store(dbg_status_t::paused);
 		return false;
 	}
+	driver_bridge::thread_context_t original_step_ctx = kctx;
 
 	std::vector<uint8_t> step_code;
 	if (driver_bridge::read_memory(kctx.rip, 16, step_code) && !step_code.empty()) {
@@ -1013,7 +1017,15 @@ bool step_into() {
 			kctx.rip += static_cast<uint64_t>(ins.len);
 			kctx.rflags &= ~0x100ULL;
 			if (!driver_bridge::set_thread_context(st.active_tid, kctx, ~0ULL)) {
-				driver_bridge::resume_thread(st.active_tid);
+				driver_bridge::set_thread_context(st.active_tid, original_step_ctx, ~0ULL);
+				diag::log_tagged_fmt("debugger",
+					"step_into_context_only_set_FAILED pid=%u tid=%u pre_rip=0x%llx desired_rip=0x%llx rsp=0x%llx prev_suspend=%u",
+					static_cast<unsigned>(st.target_pid),
+					static_cast<unsigned>(st.active_tid),
+					static_cast<unsigned long long>(original_step_ctx.rip),
+					static_cast<unsigned long long>(kctx.rip),
+					static_cast<unsigned long long>(original_step_ctx.rsp),
+					static_cast<unsigned>(previous_suspend_count));
 				set_last_error("step_into: context-only step set_thread_context failed");
 				st.status.store(dbg_status_t::paused);
 				return false;
@@ -1043,7 +1055,14 @@ bool step_into() {
 	kctx.rflags |= 0x100ULL;
 
 	if (!driver_bridge::set_thread_context(st.active_tid, kctx, ~0ULL)) {
-		driver_bridge::resume_thread(st.active_tid);
+		driver_bridge::set_thread_context(st.active_tid, original_step_ctx, ~0ULL);
+		diag::log_tagged_fmt("debugger",
+			"step_into_trap_set_FAILED pid=%u tid=%u rip=0x%llx rsp=0x%llx prev_suspend=%u",
+			static_cast<unsigned>(st.target_pid),
+			static_cast<unsigned>(st.active_tid),
+			static_cast<unsigned long long>(original_step_ctx.rip),
+			static_cast<unsigned long long>(original_step_ctx.rsp),
+			static_cast<unsigned>(previous_suspend_count));
 		set_last_error("step_into: set_thread_context failed");
 		st.status.store(dbg_status_t::paused);
 		return false;
@@ -1200,77 +1219,100 @@ bool step_over() {
 bool step_out() {
 	auto& st = g_state;
 	sync_attached_state();
-	if (st.target_pid == 0) {
-		set_last_error("step_out: no target attached");
+	if (st.target_pid == 0 || st.active_tid == 0) {
+		set_last_error("step_out: no attached target or active thread");
 		diag::log_tagged_fmt("debugger",
-			"step_out_REJECTED no_target");
+			"step_out_REJECTED pid=%u tid=%u",
+			static_cast<unsigned>(st.target_pid),
+			static_cast<unsigned>(st.active_tid));
 		return false;
 	}
 
-	auto regs = get_registers();
-	if (regs.rsp == 0) {
-		set_last_error("step_out: rsp cache is zero");
-		diag::log_tagged_fmt("debugger",
-			"step_out_REJECTED rsp_zero pid=%u",
-			static_cast<unsigned>(st.target_pid));
-		return false;
-	}
+	st.status.store(dbg_status_t::stepping);
+	uint64_t ret_addr = 0;
+	uint32_t selected_tid = 0;
 
-	std::vector<uint8_t> ret_buf;
-	if (driver_bridge::read_memory(regs.rsp, 8, ret_buf) && ret_buf.size() >= 8) {
-		uint64_t ret_addr;
-		std::memcpy(&ret_addr, ret_buf.data(), 8);
-		diag::log_tagged_fmt("debugger",
-			"step_out_target rsp=0x%llx ret_addr=0x%llx",
-			static_cast<unsigned long long>(regs.rsp),
-			static_cast<unsigned long long>(ret_addr));
-
+	{
 		std::lock_guard<std::recursive_mutex> step_lk(thread_ctx_serializer());
 		uint32_t previous_suspend_count = 0;
 		driver_bridge::thread_context_t kctx{};
-		if (suspend_contextable_thread(st, kctx, previous_suspend_count)) {
-			std::vector<uint8_t> code;
-			if (driver_bridge::read_memory(kctx.rip, 16, code) && !code.empty()) {
-				auto ins = zydis_decode_one(code.data(), static_cast<int>(code.size()), kctx.rip);
-				if (ins.is_ret && driver_bridge::read_memory(kctx.rsp, 8, ret_buf) && ret_buf.size() >= 8) {
-					std::memcpy(&ret_addr, ret_buf.data(), 8);
-					kctx.rip = ret_addr;
-					kctx.rsp += 8;
-					kctx.rflags &= ~0x100ULL;
-					if (!driver_bridge::set_thread_context(st.active_tid, kctx, ~0ULL)) {
-						driver_bridge::resume_thread(st.active_tid);
-						set_last_error("step_out: return context set_thread_context failed");
-						st.status.store(dbg_status_t::paused);
-						return false;
-					}
-					auto post_regs = capture_registers_from_context(kctx);
-					{
-						std::lock_guard<std::mutex> lk(st.reg_mutex);
-						st.registers = post_regs;
-					}
-					signal_trap(post_regs.rip);
-					invalidate_cache();
-					release_step_suspend_if_previously_suspended(st.active_tid, previous_suspend_count);
-					st.status.store(dbg_status_t::paused);
-					diag::log_tagged_fmt("debugger",
-						"step_out_context_return pid=%u tid=%u ret_addr=0x%llx rsp=0x%llx",
-						static_cast<unsigned>(st.target_pid),
-						static_cast<unsigned>(st.active_tid),
-						static_cast<unsigned long long>(post_regs.rip),
-						static_cast<unsigned long long>(post_regs.rsp));
-					return true;
-				}
-			}
-			driver_bridge::resume_thread(st.active_tid);
+		if (!suspend_contextable_thread(st, kctx, previous_suspend_count)) {
+			set_last_error("step_out: no contextable target thread");
+			st.status.store(dbg_status_t::paused);
+			return false;
+		}
+		selected_tid = st.active_tid;
+
+		std::vector<uint8_t> ret_buf;
+		if (!driver_bridge::read_memory(kctx.rsp, 8, ret_buf) || ret_buf.size() < 8) {
+			release_step_suspend_if_previously_suspended(selected_tid, previous_suspend_count);
+			set_last_error("step_out: stack read failed");
+			st.status.store(dbg_status_t::paused);
+			diag::log_tagged_fmt("debugger",
+				"step_out_stack_read_FAILED tid=%u rsp=0x%llx",
+				static_cast<unsigned>(selected_tid),
+				static_cast<unsigned long long>(kctx.rsp));
+			return false;
 		}
 
-		return run_to_address(ret_addr, true, 2500);
+		std::memcpy(&ret_addr, ret_buf.data(), 8);
+		diag::log_tagged_fmt("debugger",
+			"step_out_target tid=%u rip=0x%llx rsp=0x%llx ret_addr=0x%llx",
+			static_cast<unsigned>(selected_tid),
+			static_cast<unsigned long long>(kctx.rip),
+			static_cast<unsigned long long>(kctx.rsp),
+			static_cast<unsigned long long>(ret_addr));
+
+		std::vector<uint8_t> code;
+		if (driver_bridge::read_memory(kctx.rip, 16, code) && !code.empty()) {
+			auto ins = zydis_decode_one(code.data(), static_cast<int>(code.size()), kctx.rip);
+			if (ins.is_ret) {
+				kctx.rip = ret_addr;
+				kctx.rsp += 8;
+				kctx.rflags &= ~0x100ULL;
+				if (!driver_bridge::set_thread_context(selected_tid, kctx, ~0ULL)) {
+					diag::log_tagged_fmt("debugger",
+						"step_out_return_set_FAILED pid=%u tid=%u ret_addr=0x%llx rsp=0x%llx prev_suspend=%u",
+						static_cast<unsigned>(st.target_pid),
+						static_cast<unsigned>(selected_tid),
+						static_cast<unsigned long long>(ret_addr),
+						static_cast<unsigned long long>(kctx.rsp),
+						static_cast<unsigned>(previous_suspend_count));
+					set_last_error("step_out: return context set_thread_context failed");
+					st.status.store(dbg_status_t::paused);
+					return false;
+				}
+				auto post_regs = capture_registers_from_context(kctx);
+				{
+					std::lock_guard<std::mutex> lk(st.reg_mutex);
+					st.registers = post_regs;
+				}
+				signal_trap(post_regs.rip);
+				invalidate_cache();
+				release_step_suspend_if_previously_suspended(selected_tid, previous_suspend_count);
+				st.status.store(dbg_status_t::paused);
+				diag::log_tagged_fmt("debugger",
+					"step_out_context_return pid=%u tid=%u ret_addr=0x%llx rsp=0x%llx",
+					static_cast<unsigned>(st.target_pid),
+					static_cast<unsigned>(selected_tid),
+					static_cast<unsigned long long>(post_regs.rip),
+					static_cast<unsigned long long>(post_regs.rsp));
+				return true;
+			}
+		}
+
+		if (!resume_thread_for_controlled_run(selected_tid, previous_suspend_count)) {
+			set_last_error("step_out: resume_thread failed");
+			st.status.store(dbg_status_t::paused);
+			return false;
+		}
 	}
-	set_last_error("step_out: stack read failed");
+
 	diag::log_tagged_fmt("debugger",
-		"step_out_stack_read_FAILED rsp=0x%llx",
-		static_cast<unsigned long long>(regs.rsp));
-	return false;
+		"step_out_via_runto tid=%u ret_addr=0x%llx",
+		static_cast<unsigned>(selected_tid),
+		static_cast<unsigned long long>(ret_addr));
+	return run_to_address(ret_addr, true, 2500);
 }
 
 bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout_ms) {

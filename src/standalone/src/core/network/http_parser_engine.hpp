@@ -2,12 +2,14 @@
 
 
 #include "protocol_parser.hpp"
+#include "helpers/diag_log.hpp"
 
 #include <llhttp.h>
 
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace http_engine {
@@ -29,11 +31,31 @@ struct parse_ctx {
 
 
     bool message_complete = false;
+    bool parse_error = false;
     size_t bytes_consumed = 0;
 };
 
 
 namespace detail {
+
+inline void commit_header(parse_ctx* ctx) {
+    if (!ctx || ctx->cur_header_field.empty()) return;
+    size_t count_before = ctx->is_request ? ctx->req.headers.size() : ctx->resp.headers.size();
+    diag::log_tagged_fmt("http_parser", "llhttp_commit_header side=%s index=%zu name=%s value_len=%zu",
+        ctx->is_request ? "request" : "response",
+        count_before,
+        ctx->cur_header_field.c_str(),
+        ctx->cur_header_value.size());
+    protocol_parser::http_header hdr;
+    hdr.name  = std::move(ctx->cur_header_field);
+    hdr.value = std::move(ctx->cur_header_value);
+    if (ctx->is_request)
+        ctx->req.headers.push_back(std::move(hdr));
+    else
+        ctx->resp.headers.push_back(std::move(hdr));
+    ctx->cur_header_field.clear();
+    ctx->cur_header_value.clear();
+}
 
 inline int on_url(llhttp_t* p, const char* at, size_t len) {
     auto* ctx = static_cast<parse_ctx*>(p->data);
@@ -50,17 +72,8 @@ inline int on_status(llhttp_t* p, const char* at, size_t len) {
 inline int on_header_field(llhttp_t* p, const char* at, size_t len) {
     auto* ctx = static_cast<parse_ctx*>(p->data);
 
-    if (ctx->header_field_active && !ctx->cur_header_value.empty()) {
-        protocol_parser::http_header hdr;
-        hdr.name  = std::move(ctx->cur_header_field);
-        hdr.value = std::move(ctx->cur_header_value);
-        if (ctx->is_request)
-            ctx->req.headers.push_back(std::move(hdr));
-        else
-            ctx->resp.headers.push_back(std::move(hdr));
-        ctx->cur_header_field.clear();
-        ctx->cur_header_value.clear();
-    }
+    if (!ctx->header_field_active)
+        commit_header(ctx);
     ctx->cur_header_field.append(at, len);
     ctx->header_field_active = true;
     return 0;
@@ -76,17 +89,7 @@ inline int on_header_value(llhttp_t* p, const char* at, size_t len) {
 inline int on_headers_complete(llhttp_t* p) {
     auto* ctx = static_cast<parse_ctx*>(p->data);
 
-    if (!ctx->cur_header_field.empty()) {
-        protocol_parser::http_header hdr;
-        hdr.name  = std::move(ctx->cur_header_field);
-        hdr.value = std::move(ctx->cur_header_value);
-        if (ctx->is_request)
-            ctx->req.headers.push_back(std::move(hdr));
-        else
-            ctx->resp.headers.push_back(std::move(hdr));
-        ctx->cur_header_field.clear();
-        ctx->cur_header_value.clear();
-    }
+    commit_header(ctx);
 
     if (ctx->is_request) {
         ctx->req.method  = llhttp_method_name(static_cast<llhttp_method_t>(p->method));
@@ -151,21 +154,42 @@ inline protocol_parser::http_request parse_request(const uint8_t* data, size_t l
     parser.data = &ctx;
 
     llhttp_errno_t err = llhttp_execute(&parser, reinterpret_cast<const char*>(data), len);
+    diag::log_tagged_fmt("http_parser", "parse_request llhttp_execute len=%zu err=%d err_name=%s valid=%d complete=%d headers=%zu body=%zu",
+        len,
+        static_cast<int>(err),
+        llhttp_errno_name(err),
+        static_cast<int>(ctx.req.valid),
+        static_cast<int>(ctx.message_complete),
+        ctx.req.headers.size(),
+        ctx.body.size());
+    if (err != HPE_OK && err != HPE_PAUSED && err != HPE_PAUSED_UPGRADE) {
+        diag::log_tagged_fmt("http_parser", "parse_request strict_reject err=%d err_name=%s", static_cast<int>(err), llhttp_errno_name(err));
+        return {};
+    }
 
     if (ctx.message_complete || ctx.req.valid) {
-
-
         const char* error_pos = llhttp_get_error_pos(&parser);
-        if (error_pos && err == HPE_PAUSED) {
+        if (err == HPE_PAUSED_UPGRADE)
+            ctx.req.complete = true;
+        if (error_pos && (err == HPE_PAUSED || err == HPE_PAUSED_UPGRADE)) {
             ctx.req.total_consumed = static_cast<size_t>(
                 error_pos - reinterpret_cast<const char*>(data));
         } else {
             ctx.req.total_consumed = len;
         }
+        diag::log_tagged_fmt("http_parser", "parse_request result valid=%d complete=%d consumed=%zu method=%s uri_len=%zu headers=%zu body=%zu",
+            static_cast<int>(ctx.req.valid),
+            static_cast<int>(ctx.req.complete),
+            ctx.req.total_consumed,
+            ctx.req.method.c_str(),
+            ctx.req.uri.size(),
+            ctx.req.headers.size(),
+            ctx.req.body.size());
         return ctx.req;
     }
 
 
+    diag::log_tagged_fmt("http_parser", "parse_request fallback_manual len=%zu", len);
     return protocol_parser::parse_http_request(data, len);
 }
 
@@ -183,18 +207,40 @@ inline protocol_parser::http_response parse_response(const uint8_t* data, size_t
     parser.data = &ctx;
 
     llhttp_errno_t err = llhttp_execute(&parser, reinterpret_cast<const char*>(data), len);
+    diag::log_tagged_fmt("http_parser", "parse_response llhttp_execute len=%zu err=%d err_name=%s valid=%d complete=%d headers=%zu body=%zu",
+        len,
+        static_cast<int>(err),
+        llhttp_errno_name(err),
+        static_cast<int>(ctx.resp.valid),
+        static_cast<int>(ctx.message_complete),
+        ctx.resp.headers.size(),
+        ctx.body.size());
+    if (err != HPE_OK && err != HPE_PAUSED && err != HPE_PAUSED_UPGRADE) {
+        diag::log_tagged_fmt("http_parser", "parse_response strict_reject err=%d err_name=%s", static_cast<int>(err), llhttp_errno_name(err));
+        return {};
+    }
 
     if (ctx.message_complete || ctx.resp.valid) {
         const char* error_pos = llhttp_get_error_pos(&parser);
-        if (error_pos && err == HPE_PAUSED) {
+        if (err == HPE_PAUSED_UPGRADE)
+            ctx.resp.complete = true;
+        if (error_pos && (err == HPE_PAUSED || err == HPE_PAUSED_UPGRADE)) {
             ctx.resp.total_consumed = static_cast<size_t>(
                 error_pos - reinterpret_cast<const char*>(data));
         } else {
             ctx.resp.total_consumed = len;
         }
+        diag::log_tagged_fmt("http_parser", "parse_response result valid=%d complete=%d consumed=%zu status=%d headers=%zu body=%zu",
+            static_cast<int>(ctx.resp.valid),
+            static_cast<int>(ctx.resp.complete),
+            ctx.resp.total_consumed,
+            ctx.resp.status_code,
+            ctx.resp.headers.size(),
+            ctx.resp.body.size());
         return ctx.resp;
     }
 
+    diag::log_tagged_fmt("http_parser", "parse_response fallback_manual len=%zu", len);
     return protocol_parser::parse_http_response(data, len);
 }
 
@@ -223,14 +269,36 @@ public:
         if (ctx_.message_complete) return true;
         llhttp_errno_t err = llhttp_execute(&parser_,
             reinterpret_cast<const char*>(data), len);
+        diag::log_tagged_fmt("http_parser", "stream_feed side=%s len=%zu err=%d err_name=%s complete=%d headers_req=%zu headers_resp=%zu body=%zu",
+            ctx_.is_request ? "request" : "response",
+            len,
+            static_cast<int>(err),
+            llhttp_errno_name(err),
+            static_cast<int>(ctx_.message_complete),
+            ctx_.req.headers.size(),
+            ctx_.resp.headers.size(),
+            ctx_.body.size());
         if (err == HPE_PAUSED) {
 
             llhttp_resume(&parser_);
+        } else if (err == HPE_PAUSED_UPGRADE) {
+            if (ctx_.is_request)
+                ctx_.req.complete = true;
+            else
+                ctx_.resp.complete = true;
+            ctx_.message_complete = true;
+        } else if (err != HPE_OK) {
+            ctx_.parse_error = true;
+            diag::log_tagged_fmt("http_parser", "stream_feed strict_error side=%s err=%d err_name=%s",
+                ctx_.is_request ? "request" : "response",
+                static_cast<int>(err),
+                llhttp_errno_name(err));
         }
         return ctx_.message_complete;
     }
 
     bool complete() const { return ctx_.message_complete; }
+    bool error() const { return ctx_.parse_error; }
 
     protocol_parser::http_request  get_request()  const { return ctx_.req; }
     protocol_parser::http_response get_response() const { return ctx_.resp; }

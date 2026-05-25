@@ -414,6 +414,92 @@ static std::optional<std::uint32_t> parse_tid_param(const json& params)
     return tid;
 }
 
+static bool thread_belongs_to_attached_process(HANDLE thread, std::uint32_t tid)
+{
+    const std::uint32_t attached_pid = driver_bridge::attached_pid();
+    if (attached_pid == 0)
+        return false;
+    const DWORD owner_pid = GetProcessIdOfThread(thread);
+    if (owner_pid == 0) {
+        diag::log_tagged_fmt("drv_tools", "thread owner lookup failed tid=%u gle=%lu", tid, static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+    if (owner_pid != attached_pid) {
+        diag::log_tagged_fmt("drv_tools", "thread owner mismatch tid=%u owner_pid=%lu attached_pid=%u", tid, static_cast<unsigned long>(owner_pid), attached_pid);
+        return false;
+    }
+    return true;
+}
+
+static bool set_thread_context_win32_fallback(std::uint32_t tid,
+                                              const voyager::device_t::thread_context& requested,
+                                              std::uint64_t mask)
+{
+    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+    if (!thread) {
+        diag::log_tagged_fmt("drv_tools", "set_thread_context fallback OpenThread failed tid=%u gle=%lu", tid, static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+
+    auto close_and_return = [&](bool result) {
+        CloseHandle(thread);
+        return result;
+    };
+
+    if (!thread_belongs_to_attached_process(thread, tid))
+        return close_and_return(false);
+
+    const DWORD suspend_previous = SuspendThread(thread);
+    if (suspend_previous == static_cast<DWORD>(-1)) {
+        diag::log_tagged_fmt("drv_tools", "set_thread_context fallback SuspendThread failed tid=%u gle=%lu", tid, static_cast<unsigned long>(GetLastError()));
+        return close_and_return(false);
+    }
+
+    CONTEXT native{};
+    native.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(thread, &native)) {
+        diag::log_tagged_fmt("drv_tools", "set_thread_context fallback GetThreadContext failed tid=%u gle=%lu", tid, static_cast<unsigned long>(GetLastError()));
+        (void)ResumeThread(thread);
+        return close_and_return(false);
+    }
+
+    if (mask & (1ULL << 0)) native.Rax = requested.rax;
+    if (mask & (1ULL << 1)) native.Rbx = requested.rbx;
+    if (mask & (1ULL << 2)) native.Rcx = requested.rcx;
+    if (mask & (1ULL << 3)) native.Rdx = requested.rdx;
+    if (mask & (1ULL << 4)) native.Rsi = requested.rsi;
+    if (mask & (1ULL << 5)) native.Rdi = requested.rdi;
+    if (mask & (1ULL << 6)) native.Rbp = requested.rbp;
+    if (mask & (1ULL << 7)) native.Rsp = requested.rsp;
+    if (mask & (1ULL << 8)) native.R8 = requested.r8;
+    if (mask & (1ULL << 9)) native.R9 = requested.r9;
+    if (mask & (1ULL << 10)) native.R10 = requested.r10;
+    if (mask & (1ULL << 11)) native.R11 = requested.r11;
+    if (mask & (1ULL << 12)) native.R12 = requested.r12;
+    if (mask & (1ULL << 13)) native.R13 = requested.r13;
+    if (mask & (1ULL << 14)) native.R14 = requested.r14;
+    if (mask & (1ULL << 15)) native.R15 = requested.r15;
+    if (mask & (1ULL << 16)) native.Rip = requested.rip;
+    if (mask & (1ULL << 17)) native.EFlags = static_cast<DWORD>(requested.rflags);
+    if (mask & (1ULL << 18)) native.Dr0 = requested.dr0;
+    if (mask & (1ULL << 19)) native.Dr1 = requested.dr1;
+    if (mask & (1ULL << 20)) native.Dr2 = requested.dr2;
+    if (mask & (1ULL << 21)) native.Dr3 = requested.dr3;
+    if (mask & (1ULL << 22)) native.Dr6 = requested.dr6;
+    if (mask & (1ULL << 23)) native.Dr7 = requested.dr7;
+
+    const bool ok = SetThreadContext(thread, &native) != FALSE;
+    if (!ok)
+        diag::log_tagged_fmt("drv_tools", "set_thread_context fallback SetThreadContext failed tid=%u mask=0x%llX gle=%lu", tid, static_cast<unsigned long long>(mask), static_cast<unsigned long>(GetLastError()));
+    else
+        diag::log_tagged_fmt("drv_tools", "set_thread_context fallback succeeded tid=%u mask=0x%llX suspend_previous=%lu", tid, static_cast<unsigned long long>(mask), static_cast<unsigned long>(suspend_previous));
+
+    if (ResumeThread(thread) == static_cast<DWORD>(-1))
+        diag::log_tagged_fmt("drv_tools", "set_thread_context fallback ResumeThread failed tid=%u gle=%lu", tid, static_cast<unsigned long>(GetLastError()));
+
+    return close_and_return(ok);
+}
+
 static bool is_probably_kernel_address(std::uint64_t address);
 
 struct native_client_id_t
@@ -6533,8 +6619,11 @@ tool_result_t driver_set_thread_context(const json& params)
 
     if (mask == 0) return tool_result_t::error(OBFSTR("No registers specified to set"));
 
-    if (!device->set_thread_context(tid, ctx, mask))
-        return tool_result_t::error(OBFSTR("Failed to set thread context for TID ") + std::to_string(tid));
+    if (!device->set_thread_context(tid, ctx, mask)) {
+        diag::log_tagged_fmt("drv_tools", "driver_set_thread_context kernel path failed tid=%u mask=0x%llX", tid, static_cast<unsigned long long>(mask));
+        if (!set_thread_context_win32_fallback(tid, ctx, mask))
+            return tool_result_t::error(OBFSTR("Failed to set thread context for TID ") + std::to_string(tid));
+    }
 
     json result;
     result["tid"] = tid;
@@ -9930,6 +10019,15 @@ tool_result_t driver_walk_heap(const json& params)
 
     const std::uint32_t num_heaps = device->read<std::uint32_t>(peb_addr + 0xE8);
     const std::uint64_t heaps_ptr = device->read<std::uint64_t>(peb_addr + 0xF0);
+    diag::log_tagged_fmt("drv_tools",
+        "driver_walk_heap peb=0x%llX num_heaps=%u heaps_ptr=0x%llX limit=%d min=%llu max=%llu free_only=%d",
+        static_cast<unsigned long long>(peb_addr),
+        num_heaps,
+        static_cast<unsigned long long>(heaps_ptr),
+        max_entries,
+        static_cast<unsigned long long>(filter_min),
+        static_cast<unsigned long long>(filter_max),
+        free_only ? 1 : 0);
 
     if (num_heaps == 0 || num_heaps > 256 || heaps_ptr == 0)
         return tool_result_t::error(OBFSTR("No heaps found or invalid PEB heap data"));
@@ -9946,6 +10044,13 @@ tool_result_t driver_walk_heap(const json& params)
         const std::uint32_t signature = device->read<std::uint32_t>(heap_base);
         const std::uint64_t total_free = device->read<std::uint64_t>(heap_base + 0x40);
         const std::uint64_t num_pages = device->read<std::uint64_t>(heap_base + 0x38);
+        diag::log_tagged_fmt("drv_tools",
+            "driver_walk_heap heap[%u] base=0x%llX sig=0x%08X total_free=%llu pages=%llu",
+            h,
+            static_cast<unsigned long long>(heap_base),
+            signature,
+            static_cast<unsigned long long>(total_free),
+            static_cast<unsigned long long>(num_pages));
 
         json heap_info;
         heap_info["heap_index"] = h;
@@ -9970,6 +10075,15 @@ tool_result_t driver_walk_heap(const json& params)
             const std::uint32_t seg_num_pages = device->read<std::uint32_t>(segment_base + 0x10);
             const std::uint64_t first_entry = device->read<std::uint64_t>(segment_base + 0x28);
             const std::uint64_t last_entry = device->read<std::uint64_t>(segment_base + 0x48);
+            diag::log_tagged_fmt("drv_tools",
+                "driver_walk_heap heap[%u] segment[%d] segment_base=0x%llX seg_base_addr=0x%llX pages=%u first=0x%llX last=0x%llX",
+                h,
+                seg_iter - 1,
+                static_cast<unsigned long long>(segment_base),
+                static_cast<unsigned long long>(seg_base_addr),
+                seg_num_pages,
+                static_cast<unsigned long long>(first_entry),
+                static_cast<unsigned long long>(last_entry));
 
 
             std::uint64_t entry_addr = first_entry;
@@ -10031,11 +10145,57 @@ tool_result_t driver_walk_heap(const json& params)
         heaps_arr.push_back(std::move(heap_info));
     }
 
+    json fallback_regions = json::array();
+    std::string walk_mode = "heap_entries";
+    if (total_entries == 0)
+    {
+        int fallback_count = 0;
+        auto regions = enumerate_all_memory_regions_paginated(
+            device.get(), 0x10000, 0x7FFFFFFFFFFF, false);
+        diag::log_tagged_fmt("drv_tools",
+            "driver_walk_heap no_entries fallback_regions_scan regions=%zu",
+            regions.size());
+        for (const auto& region : regions)
+        {
+            if (fallback_count >= max_entries) break;
+            if ((region.state & 0x1000) == 0) continue;
+            if (region.type != 0x20000) continue;
+            const std::uint32_t prot = region.protect & 0xFF;
+            if ((prot & 0xCC) == 0) continue;
+            if (filter_min > 0 && region.size < filter_min) continue;
+            if (filter_max > 0 && region.size > filter_max) continue;
+            json entry;
+            entry["address"] = sa_format_address(static_cast<uint64_t>(region.base));
+            entry["user_address"] = sa_format_address(static_cast<uint64_t>(region.base));
+            entry["block_size"] = region.size;
+            entry["user_size"] = region.size;
+            entry["flags"] = {
+                {"busy", true},
+                {"extra", false},
+                {"fill", false},
+                {"virtual_alloc", true},
+                {"last_entry", false}
+            };
+            entry["protection"] = sa_format_address(static_cast<uint64_t>(region.protect));
+            entry["source"] = "committed_private_region_fallback";
+            fallback_regions.push_back(std::move(entry));
+            ++fallback_count;
+        }
+        total_entries = fallback_count;
+        walk_mode = "committed_private_region_fallback";
+        diag::log_tagged_fmt("drv_tools",
+            "driver_walk_heap fallback_done returned=%d",
+            fallback_count);
+    }
+
     json result;
     result["process_id"] = pid;
     result["heap_count"] = num_heaps;
     result["entries_returned"] = total_entries;
+    result["walk_mode"] = walk_mode;
     result["heaps"] = std::move(heaps_arr);
+    if (!fallback_regions.empty())
+        result["fallback_regions"] = std::move(fallback_regions);
     return tool_result_t::ok(OBFSTR("Walked ") + std::to_string(num_heaps) + OBFSTR(" heaps, ") +
                              std::to_string(total_entries) + OBFSTR(" entries"), result);
 }
@@ -10183,6 +10343,58 @@ tool_result_t driver_walk_seh_chain(const json& params)
 
 
     std::uint64_t seh_head = device->read<std::uint64_t>(teb_addr);
+    std::string seh_source = "teb_nt_tib";
+    diag::log_tagged_fmt("drv_tools",
+        "driver_walk_seh_chain tid=%u teb=0x%llX source=%s rip=0x%llX rsp=0x%llX head=0x%llX",
+        tid,
+        static_cast<unsigned long long>(teb_addr),
+        teb_source.c_str(),
+        static_cast<unsigned long long>(ctx.rip),
+        static_cast<unsigned long long>(ctx.rsp),
+        static_cast<unsigned long long>(seh_head));
+    if ((seh_head == 0 || seh_head == 0xFFFFFFFFFFFFFFFFULL) && ctx.rsp != 0)
+    {
+        auto modules_snapshot = enumerate_ldr_modules_for_iat(device.get());
+        std::vector<std::uint8_t> stack_buf(4096);
+        const std::size_t stack_read = device->read_raw(ctx.rsp, stack_buf.data(), stack_buf.size());
+        diag::log_tagged_fmt("drv_tools",
+            "driver_walk_seh_chain stack_probe rsp=0x%llX read=%zu modules=%zu",
+            static_cast<unsigned long long>(ctx.rsp),
+            stack_read,
+            modules_snapshot.size());
+        if (stack_read >= 16)
+        {
+            for (std::size_t i = 8; i + 8 <= stack_read; i += 8)
+            {
+                std::uint64_t candidate = 0;
+                std::memcpy(&candidate, stack_buf.data() + i, sizeof(candidate));
+                bool candidate_in_module = false;
+                for (const auto& m : modules_snapshot)
+                {
+                    if (m.base != 0 && candidate >= m.base && candidate < m.base + m.size)
+                    {
+                        candidate_in_module = true;
+                        break;
+                    }
+                }
+                if (!candidate_in_module)
+                    continue;
+                std::uint64_t potential_next = 0;
+                std::memcpy(&potential_next, stack_buf.data() + i - 8, sizeof(potential_next));
+                if (potential_next > ctx.rsp && potential_next < ctx.rsp + 0x100000)
+                {
+                    seh_head = ctx.rsp + i - 8;
+                    seh_source = "stack_probe";
+                    diag::log_tagged_fmt("drv_tools",
+                        "driver_walk_seh_chain stack_probe_hit frame=0x%llX handler=0x%llX next=0x%llX",
+                        static_cast<unsigned long long>(seh_head),
+                        static_cast<unsigned long long>(candidate),
+                        static_cast<unsigned long long>(potential_next));
+                    break;
+                }
+            }
+        }
+    }
 
     json seh_chain = json::array();
     int max_walk = 256;
@@ -10392,6 +10604,7 @@ tool_result_t driver_walk_seh_chain(const json& params)
     result["thread_id"] = tid;
     result["teb_address"] = sa_format_address(static_cast<uint64_t>(teb_addr));
     result["teb_source"] = teb_source;
+    result["seh_source"] = seh_source;
     result["teb_available"] = true;
     result["seh_entries"] = seh_chain.size();
     result["seh_chain"] = std::move(seh_chain);

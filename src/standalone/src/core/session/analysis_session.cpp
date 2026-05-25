@@ -237,11 +237,13 @@ bool open_attach_session(uint32_t pid, std::string* out_err) {
 		return false;
 	}
 
-	if (loading_binary_overlay::is_active()) {
+	if (loading_binary_overlay::is_active() &&
+		!loading_binary_overlay::is_waiting_for_user_decision()) {
 		state().last_error = "load_in_flight";
 		if (out_err) *out_err = "load_in_flight";
 		diag::log_tagged_fmt("analysis_session",
-			"open_attach_session_load_in_flight pid=%u", pid);
+			"open_attach_session_load_in_flight pid=%u phase=%s", pid,
+			loading_binary_overlay::current_phase_name());
 		return false;
 	}
 
@@ -322,13 +324,6 @@ bool open_attach_session(uint32_t pid, std::string* out_err) {
 }
 
 bool switch_session(size_t idx) {
-	if (loading_binary_overlay::is_active()) {
-		state().last_error = "load_in_flight";
-		diag::log_tagged_fmt("analysis_session",
-			"switch_session_refused_load_in_flight requested_idx=%llu",
-			static_cast<unsigned long long>(idx));
-		return false;
-	}
 	std::lock_guard<std::mutex> lk(state().mu);
 	if (idx >= state().sessions.size()) {
 		state().last_error = "idx_out_of_range";
@@ -348,7 +343,20 @@ bool switch_session(size_t idx) {
 		state().sessions[idx]->path.c_str());
 	if (state().active_idx == static_cast<int>(idx)) {
 		state().sessions[idx]->last_active_steady_ms = now_steady_ms();
+		diag::log_tagged_fmt("analysis_session",
+			"switch_session_noop idx=%llu phase=%s",
+			static_cast<unsigned long long>(idx),
+			loading_binary_overlay::current_phase_name());
 		return true;
+	}
+	if (loading_binary_overlay::is_active() &&
+		!loading_binary_overlay::is_waiting_for_user_decision()) {
+		state().last_error = "load_in_flight";
+		diag::log_tagged_fmt("analysis_session",
+			"switch_session_refused_load_in_flight requested_idx=%llu phase=%s",
+			static_cast<unsigned long long>(idx),
+			loading_binary_overlay::current_phase_name());
+		return false;
 	}
 	int cur = state().active_idx;
 	if (cur >= 0 && cur < static_cast<int>(state().sessions.size())) {
@@ -364,11 +372,13 @@ bool switch_session(size_t idx) {
 }
 
 bool close_session(size_t idx) {
-	if (loading_binary_overlay::is_active()) {
+	if (loading_binary_overlay::is_active() &&
+		!loading_binary_overlay::is_waiting_for_user_decision()) {
 		state().last_error = "load_in_flight";
 		diag::log_tagged_fmt("analysis_session",
-			"close_session_refused_load_in_flight idx=%llu",
-			static_cast<unsigned long long>(idx));
+			"close_session_refused_load_in_flight idx=%llu phase=%s",
+			static_cast<unsigned long long>(idx),
+			loading_binary_overlay::current_phase_name());
 		return false;
 	}
 	std::lock_guard<std::mutex> lk(state().mu);

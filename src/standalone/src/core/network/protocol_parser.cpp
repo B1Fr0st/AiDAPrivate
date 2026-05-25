@@ -11,10 +11,13 @@
 #include <cctype>
 #include <cerrno>
 #include <climits>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <sstream>
+#include <utility>
 
 namespace protocol_parser {
 
@@ -46,68 +49,382 @@ static std::string make_string(const uint8_t* data, size_t len) {
     return std::string(reinterpret_cast<const char*>(data), len);
 }
 
+static std::string escaped_preview(const std::string& s, size_t cap = 96) {
+    std::string out;
+    const size_t n = std::min(s.size(), cap);
+    out.reserve(n + 16);
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c == '\\') out += "\\\\";
+        else if (c == '"') out += "\\\"";
+        else if (c == '\r') out += "\\r";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\t') out += "\\t";
+        else if (c >= 0x20 && c <= 0x7E) out.push_back(static_cast<char>(c));
+        else {
+            char b[5];
+            std::snprintf(b, sizeof(b), "\\x%02X", static_cast<unsigned>(c));
+            out += b;
+        }
+    }
+    if (s.size() > n)
+        out += "...";
+    return out;
+}
 
-static bool parse_headers(const uint8_t* data, size_t len, size_t& pos,
-                           std::vector<http_header>& headers) {
+static std::string hex_preview(const std::string& s, size_t cap = 48) {
+    std::string out;
+    const size_t n = std::min(s.size(), cap);
+    out.reserve(n * 3);
+    for (size_t i = 0; i < n; ++i) {
+        char b[4];
+        std::snprintf(b, sizeof(b), "%02X", static_cast<unsigned>(static_cast<unsigned char>(s[i])));
+        if (!out.empty())
+            out.push_back(' ');
+        out += b;
+    }
+    if (s.size() > n)
+        out += " ...";
+    return out;
+}
+
+static bool is_ows(char c) {
+    return c == ' ' || c == '\t';
+}
+
+static std::string trim_ows(std::string s) {
+    size_t first = 0;
+    while (first < s.size() && is_ows(s[first])) ++first;
+    size_t last = s.size();
+    while (last > first && is_ows(s[last - 1])) --last;
+    return s.substr(first, last - first);
+}
+
+static bool is_tchar(char c) {
+    unsigned char uc = static_cast<unsigned char>(c);
+    if (std::isalnum(uc)) return true;
+    switch (c) {
+    case '!': case '#': case '$': case '%': case '&': case '\'':
+    case '*': case '+': case '-': case '.': case '^': case '_':
+    case '`': case '|': case '~':
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool valid_token(const std::string& s) {
+    if (s.empty()) return false;
+    for (char c : s) {
+        if (!is_tchar(c)) return false;
+    }
+    return true;
+}
+
+static bool parse_decimal_size(const std::string& raw, size_t& out) {
+    std::string s = trim_ows(raw);
+    if (s.empty()) return false;
+    size_t value = 0;
+    for (char c : s) {
+        if (c < '0' || c > '9') return false;
+        size_t digit = static_cast<size_t>(c - '0');
+        if (value > (std::numeric_limits<size_t>::max() - digit) / 10)
+            return false;
+        value = value * 10 + digit;
+    }
+    out = value;
+    return true;
+}
+
+static bool parse_hex_size(const std::string& raw, size_t& out) {
+    std::string s = trim_ows(raw);
+    if (s.empty()) return false;
+    size_t value = 0;
+    for (char c : s) {
+        size_t digit;
+        if (c >= '0' && c <= '9')
+            digit = static_cast<size_t>(c - '0');
+        else if (c >= 'a' && c <= 'f')
+            digit = static_cast<size_t>(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F')
+            digit = static_cast<size_t>(c - 'A' + 10);
+        else
+            return false;
+        if (value > (std::numeric_limits<size_t>::max() - digit) / 16)
+            return false;
+        value = value * 16 + digit;
+    }
+    out = value;
+    return true;
+}
+
+struct header_parse_result {
+    bool complete = false;
+    bool valid = true;
+};
+
+static header_parse_result parse_headers(const uint8_t* data, size_t len, size_t& pos,
+                                         std::vector<http_header>& headers) {
+    size_t start_pos = pos;
+    size_t header_index = headers.size();
+    diag::log_tagged_fmt("proto", "parse_headers start pos=%zu len=%zu existing=%zu", pos, len, headers.size());
     while (pos + 1 < len) {
         if (data[pos] == '\r' && data[pos + 1] == '\n') {
             pos += 2;
-            return true;
+            diag::log_tagged_fmt("proto", "parse_headers complete start=%zu end=%zu added=%zu", start_pos, pos, headers.size() - header_index);
+            return { true, true };
         }
         size_t eol = find_crlf(data, len, pos);
-        if (eol == std::string::npos) return false;
+        if (eol == std::string::npos) {
+            diag::log_tagged_fmt("proto", "parse_headers incomplete pos=%zu remaining=%zu", pos, len - pos);
+            return { false, true };
+        }
 
         std::string line = make_string(data + pos, eol - pos);
         pos = eol + 2;
 
+        if (!line.empty() && is_ows(line[0])) {
+            if (headers.empty()) {
+                diag::log_tagged("proto", "parse_headers invalid obs_fold_without_previous");
+                return { true, false };
+            }
+            std::string folded = trim_ows(line);
+            if (!folded.empty()) {
+                if (!headers.back().value.empty())
+                    headers.back().value.push_back(' ');
+                headers.back().value += folded;
+                diag::log_tagged_fmt("proto", "parse_headers obs_fold name=%s appended_len=%zu total_value_len=%zu",
+                    headers.back().name.c_str(),
+                    folded.size(),
+                    headers.back().value.size());
+            }
+            continue;
+        }
+
         size_t colon = line.find(':');
-        if (colon == std::string::npos) continue;
+        if (colon == std::string::npos || colon == 0) {
+            diag::log_tagged_fmt("proto", "parse_headers invalid_line colon=%lld line_len=%zu line=\"%s\" hex=%s",
+                colon == std::string::npos ? -1LL : static_cast<long long>(colon),
+                line.size(),
+                escaped_preview(line).c_str(),
+                hex_preview(line).c_str());
+            return { true, false };
+        }
 
         http_header hdr;
         hdr.name = line.substr(0, colon);
+        if (!valid_token(hdr.name)) {
+            diag::log_tagged_fmt("proto", "parse_headers invalid_name name_len=%zu", hdr.name.size());
+            return { true, false };
+        }
         size_t val_start = colon + 1;
-        while (val_start < line.size() && line[val_start] == ' ') val_start++;
-        hdr.value = line.substr(val_start);
+        while (val_start < line.size() && is_ows(line[val_start])) val_start++;
+        hdr.value = trim_ows(line.substr(val_start));
+        diag::log_tagged_fmt("proto", "parse_headers header index=%zu name=%s value_len=%zu",
+            headers.size(),
+            hdr.name.c_str(),
+            hdr.value.size());
         headers.push_back(std::move(hdr));
     }
-    return false;
+    diag::log_tagged_fmt("proto", "parse_headers incomplete_tail pos=%zu len=%zu added=%zu", pos, len, headers.size() - header_index);
+    return { false, true };
 }
 
-static std::vector<uint8_t> decode_chunked(const uint8_t* data, size_t len) {
-    std::vector<uint8_t> result;
+struct content_length_parse_result {
+    bool present = false;
+    bool valid = true;
+    size_t value = 0;
+};
+
+static content_length_parse_result parse_content_lengths(const std::vector<http_header>& headers) {
+    content_length_parse_result result;
+    size_t matches = 0;
+    for (const auto& h : headers) {
+        if (!iequals(h.name, "Content-Length")) continue;
+        ++matches;
+        size_t start = 0;
+        while (start <= h.value.size()) {
+            size_t comma = h.value.find(',', start);
+            std::string part = h.value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+            size_t parsed = 0;
+            if (!parse_decimal_size(part, parsed)) {
+                result.valid = false;
+                diag::log_tagged_fmt("proto", "parse_content_lengths invalid token_index=%zu raw_len=%zu", matches, part.size());
+                return result;
+            }
+            if (!result.present) {
+                result.present = true;
+                result.value = parsed;
+            } else if (result.value != parsed) {
+                result.valid = false;
+                diag::log_tagged_fmt("proto", "parse_content_lengths conflict expected=%zu actual=%zu", result.value, parsed);
+                return result;
+            }
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+    }
+    diag::log_tagged_fmt("proto", "parse_content_lengths present=%d valid=%d value=%zu headers=%zu",
+        static_cast<int>(result.present),
+        static_cast<int>(result.valid),
+        result.value,
+        matches);
+    return result;
+}
+
+struct transfer_encoding_parse_result {
+    bool present = false;
+    bool chunked = false;
+    bool valid = true;
+};
+
+static transfer_encoding_parse_result parse_transfer_encoding(const std::vector<http_header>& headers) {
+    transfer_encoding_parse_result result;
+    std::vector<std::string> codings;
+    size_t header_matches = 0;
+    for (const auto& h : headers) {
+        if (!iequals(h.name, "Transfer-Encoding")) continue;
+        result.present = true;
+        ++header_matches;
+        size_t start = 0;
+        while (start <= h.value.size()) {
+            size_t comma = h.value.find(',', start);
+            std::string part = trim_ows(h.value.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+            size_t semi = part.find(';');
+            std::string token = to_lower(trim_ows(part.substr(0, semi)));
+            if (token.empty() || !valid_token(token)) {
+                result.valid = false;
+                diag::log_tagged_fmt("proto", "parse_transfer_encoding invalid token_len=%zu headers=%zu", token.size(), header_matches);
+                return result;
+            }
+            diag::log_tagged_fmt("proto", "parse_transfer_encoding coding index=%zu token=%s", codings.size(), token.c_str());
+            codings.push_back(token);
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+    }
+    size_t chunked_count = 0;
+    for (size_t i = 0; i < codings.size(); ++i) {
+        if (codings[i] == "chunked") {
+            result.chunked = true;
+            ++chunked_count;
+            if (i + 1 != codings.size()) result.valid = false;
+        }
+    }
+    if (chunked_count > 1) result.valid = false;
+    diag::log_tagged_fmt("proto", "parse_transfer_encoding present=%d valid=%d chunked=%d codings=%zu",
+        static_cast<int>(result.present),
+        static_cast<int>(result.valid),
+        static_cast<int>(result.chunked),
+        codings.size());
+    return result;
+}
+
+struct chunked_decode_result {
+    std::vector<uint8_t> body;
+    bool complete = false;
+    bool valid = true;
+    size_t consumed = 0;
+};
+
+static chunked_decode_result decode_chunked(const uint8_t* data, size_t len) {
+    chunked_decode_result result;
     size_t pos = 0;
+    size_t chunk_index = 0;
+    diag::log_tagged_fmt("proto", "decode_chunked start len=%zu", len);
     while (pos < len) {
         size_t eol = find_crlf(data, len, pos);
-        if (eol == std::string::npos) break;
+        if (eol == std::string::npos) {
+            result.consumed = len;
+            diag::log_tagged_fmt("proto", "decode_chunked incomplete_size_line pos=%zu len=%zu chunks=%zu", pos, len, chunk_index);
+            return result;
+        }
 
         std::string chunk_sz_str = make_string(data + pos, eol - pos);
         size_t ext_pos = chunk_sz_str.find(';');
         if (ext_pos != std::string::npos) chunk_sz_str.resize(ext_pos);
-        while (!chunk_sz_str.empty() && (chunk_sz_str.back() == ' ' || chunk_sz_str.back() == '\t'))
-            chunk_sz_str.pop_back();
 
-        char* sz_end = nullptr;
-        errno = 0;
-        unsigned long long chunk_sz_ull = strtoull(chunk_sz_str.c_str(), &sz_end, 16);
-        if (errno != 0 || sz_end == chunk_sz_str.c_str() || chunk_sz_ull > 0x40000000ULL) break;
-        size_t chunk_sz = static_cast<size_t>(chunk_sz_ull);
+        size_t chunk_sz = 0;
+        if (!parse_hex_size(chunk_sz_str, chunk_sz)) {
+            result.valid = false;
+            result.consumed = pos;
+            diag::log_tagged_fmt("proto", "decode_chunked invalid_size chunk=%zu raw_len=%zu pos=%zu", chunk_index, chunk_sz_str.size(), pos);
+            return result;
+        }
 
         pos = eol + 2;
-        if (chunk_sz == 0) break;
-        if (pos + chunk_sz > len) break;
+        diag::log_tagged_fmt("proto", "decode_chunked chunk=%zu size=%zu data_pos=%zu", chunk_index, chunk_sz, pos);
+        if (chunk_sz == 0) {
+            std::vector<http_header> trailers;
+            size_t trailer_pos = pos;
+            auto trailers_result = parse_headers(data, len, trailer_pos, trailers);
+            if (!trailers_result.valid) {
+                result.valid = false;
+                result.consumed = trailer_pos;
+                diag::log_tagged_fmt("proto", "decode_chunked invalid_trailers pos=%zu trailers=%zu", trailer_pos, trailers.size());
+                return result;
+            }
+            if (!trailers_result.complete) {
+                result.consumed = len;
+                diag::log_tagged_fmt("proto", "decode_chunked incomplete_trailers pos=%zu len=%zu trailers=%zu", pos, len, trailers.size());
+                return result;
+            }
+            result.complete = true;
+            result.consumed = trailer_pos;
+            diag::log_tagged_fmt("proto", "decode_chunked complete chunks=%zu body=%zu trailers=%zu consumed=%zu",
+                chunk_index,
+                result.body.size(),
+                trailers.size(),
+                result.consumed);
+            return result;
+        }
+        if (chunk_sz > len - pos) {
+            result.consumed = len;
+            diag::log_tagged_fmt("proto", "decode_chunked incomplete_data chunk=%zu need=%zu have=%zu", chunk_index, chunk_sz, len - pos);
+            return result;
+        }
 
-        result.insert(result.end(), data + pos, data + pos + chunk_sz);
+        result.body.insert(result.body.end(), data + pos, data + pos + chunk_sz);
         pos += chunk_sz;
-        if (pos + 1 < len && data[pos] == '\r' && data[pos + 1] == '\n')
-            pos += 2;
+        if (pos + 1 >= len) {
+            result.consumed = len;
+            diag::log_tagged_fmt("proto", "decode_chunked incomplete_crlf chunk=%zu pos=%zu len=%zu", chunk_index, pos, len);
+            return result;
+        }
+        if (data[pos] != '\r' || data[pos + 1] != '\n') {
+            result.valid = false;
+            result.consumed = pos;
+            diag::log_tagged_fmt("proto", "decode_chunked invalid_chunk_crlf chunk=%zu pos=%zu", chunk_index, pos);
+            return result;
+        }
+        pos += 2;
+        ++chunk_index;
     }
+    result.consumed = pos;
+    diag::log_tagged_fmt("proto", "decode_chunked incomplete_no_zero chunks=%zu body=%zu consumed=%zu", chunk_index, result.body.size(), result.consumed);
     return result;
+}
+
+static bool response_status_has_body(int status_code) {
+    if (status_code >= 100 && status_code < 200) return false;
+    return status_code != 204 && status_code != 304;
+}
+
+static bool valid_http_version(const std::string& version) {
+    if (version.rfind("HTTP/", 0) != 0) return false;
+    size_t dot = version.find('.', 5);
+    if (dot == std::string::npos || dot == 5 || dot + 1 >= version.size()) return false;
+    for (size_t i = 5; i < version.size(); ++i) {
+        if (i == dot) continue;
+        if (!std::isdigit(static_cast<unsigned char>(version[i]))) return false;
+    }
+    return true;
 }
 
 http_request parse_http_request(const uint8_t* data, size_t len) {
     diag::log_tagged_fmt("proto", "parse_http_request entry len=%zu", len);
     http_request req;
-    if (len < 16) {
+    if (!data || len == 0) {
         diag::log_tagged_fmt("proto", "parse_http_request too short len=%zu", len);
         return req;
     }
@@ -120,8 +437,13 @@ http_request parse_http_request(const uint8_t* data, size_t len) {
 
     std::string request_line = make_string(data, first_eol);
     size_t sp1 = request_line.find(' ');
+    if (sp1 == std::string::npos) {
+        diag::log_tagged_fmt("proto", "parse_http_request invalid request line: %s", request_line.c_str());
+        return req;
+    }
     size_t sp2 = request_line.find(' ', sp1 + 1);
-    if (sp1 == std::string::npos || sp2 == std::string::npos) {
+    if (sp2 == std::string::npos ||
+        request_line.find(' ', sp2 + 1) != std::string::npos) {
         diag::log_tagged_fmt("proto", "parse_http_request invalid request line: %s", request_line.c_str());
         return req;
     }
@@ -131,21 +453,23 @@ http_request parse_http_request(const uint8_t* data, size_t len) {
     req.version = request_line.substr(sp2 + 1);
     diag::log_tagged_fmt("proto", "parse_http_request method=%s uri=%s version=%s", req.method.c_str(), req.uri.c_str(), req.version.c_str());
 
-    static const char* methods[] = { "GET", "POST", "PUT", "DELETE", "PATCH",
-                                      "HEAD", "OPTIONS", "CONNECT", "TRACE" };
-    bool method_ok = false;
-    for (auto m : methods) {
-        if (req.method == m) { method_ok = true; break; }
-    }
-    if (!method_ok) {
-        diag::log_tagged_fmt("proto", "parse_http_request unknown method=%s", req.method.c_str());
+    if (!valid_token(req.method) || req.uri.empty() || !valid_http_version(req.version)) {
+        diag::log_tagged_fmt("proto", "parse_http_request invalid start line fields method=%s uri=%s version=%s", req.method.c_str(), req.uri.c_str(), req.version.c_str());
         return req;
     }
 
     req.valid = true;
     size_t pos = first_eol + 2;
 
-    if (!parse_headers(data, len, pos, req.headers)) {
+    auto headers_result = parse_headers(data, len, pos, req.headers);
+    if (!headers_result.valid) {
+        diag::log_tagged_fmt("proto", "parse_http_request malformed headers headers_count=%zu", req.headers.size());
+        req.valid = false;
+        req.complete = false;
+        req.total_consumed = len;
+        return req;
+    }
+    if (!headers_result.complete) {
         diag::log_tagged_fmt("proto", "parse_http_request parse_headers incomplete headers_count=%zu", req.headers.size());
         req.complete = false;
         req.total_consumed = len;
@@ -153,34 +477,42 @@ http_request parse_http_request(const uint8_t* data, size_t len) {
     }
     diag::log_tagged_fmt("proto", "parse_http_request headers_count=%zu", req.headers.size());
 
-    std::string cl_str = find_header(req.headers, "Content-Length");
-    std::string te = to_lower(find_header(req.headers, "Transfer-Encoding"));
-
-    if (te.find("chunked") != std::string::npos) {
-        size_t body_start = pos;
-        req.body = decode_chunked(data + body_start, len - body_start);
-        req.complete = true;
+    auto cl = parse_content_lengths(req.headers);
+    auto te = parse_transfer_encoding(req.headers);
+    if (!cl.valid || !te.valid || (te.present && cl.present) || (te.present && !te.chunked)) {
+        diag::log_tagged_fmt("proto", "parse_http_request invalid framing cl_present=%d cl_valid=%d te_present=%d te_valid=%d te_chunked=%d",
+            (int)cl.present, (int)cl.valid, (int)te.present, (int)te.valid, (int)te.chunked);
+        req.valid = false;
+        req.complete = false;
         req.total_consumed = len;
-        diag::log_tagged_fmt("proto", "parse_http_request chunked body body_size=%zu", req.body.size());
-    } else if (!cl_str.empty()) {
-        size_t cl = 0;
-        {
-            char* cl_end = nullptr;
-            errno = 0;
-            unsigned long long cl_ull = strtoull(cl_str.c_str(), &cl_end, 10);
-            if (errno == 0 && cl_end != cl_str.c_str() && cl_ull <= static_cast<unsigned long long>(SIZE_MAX))
-                cl = static_cast<size_t>(cl_ull);
+        return req;
+    }
+
+    if (te.chunked) {
+        size_t body_start = pos;
+        auto decoded = decode_chunked(data + body_start, len - body_start);
+        if (!decoded.valid) {
+            req.valid = false;
+            req.complete = false;
+            req.total_consumed = body_start + decoded.consumed;
+            diag::log_tagged("proto", "parse_http_request invalid chunked body");
+            return req;
         }
-        if (pos + cl <= len) {
-            req.body.assign(data + pos, data + pos + cl);
+        req.body = std::move(decoded.body);
+        req.complete = decoded.complete;
+        req.total_consumed = decoded.complete ? body_start + decoded.consumed : len;
+        diag::log_tagged_fmt("proto", "parse_http_request chunked body body_size=%zu", req.body.size());
+    } else if (cl.present) {
+        if (cl.value <= len - pos) {
+            req.body.assign(data + pos, data + pos + cl.value);
             req.complete = true;
-            req.total_consumed = pos + cl;
-            diag::log_tagged_fmt("proto", "parse_http_request content-length body cl=%zu complete=true", cl);
+            req.total_consumed = pos + cl.value;
+            diag::log_tagged_fmt("proto", "parse_http_request content-length body cl=%zu complete=true", cl.value);
         } else {
             req.body.assign(data + pos, data + len);
             req.complete = false;
             req.total_consumed = len;
-            diag::log_tagged_fmt("proto", "parse_http_request content-length body partial cl=%zu have=%zu", cl, len - pos);
+            diag::log_tagged_fmt("proto", "parse_http_request content-length body partial cl=%zu have=%zu", cl.value, len - pos);
         }
     } else {
         req.complete = true;
@@ -194,7 +526,7 @@ http_request parse_http_request(const uint8_t* data, size_t len) {
 http_response parse_http_response(const uint8_t* data, size_t len) {
     diag::log_tagged_fmt("proto", "parse_http_response entry len=%zu", len);
     http_response resp;
-    if (len < 12) {
+    if (!data || len == 0) {
         diag::log_tagged_fmt("proto", "parse_http_response too short len=%zu", len);
         return resp;
     }
@@ -206,7 +538,7 @@ http_response parse_http_response(const uint8_t* data, size_t len) {
     }
 
     std::string status_line = make_string(data, first_eol);
-    if (status_line.size() < 12 || status_line.substr(0, 5) != "HTTP/") {
+    if (status_line.substr(0, 5) != "HTTP/") {
         diag::log_tagged_fmt("proto", "parse_http_response invalid status line: %.40s", status_line.c_str());
         return resp;
     }
@@ -223,23 +555,29 @@ http_response parse_http_response(const uint8_t* data, size_t len) {
         ? status_line.substr(sp1 + 1, sp2 - sp1 - 1)
         : status_line.substr(sp1 + 1);
 
-    {
-        char* code_end = nullptr;
-        errno = 0;
-        long code_val = strtol(code_str.c_str(), &code_end, 10);
-        if (errno != 0 || code_end == code_str.c_str() || code_val < 100 || code_val > 999) {
-            diag::log_tagged_fmt("proto", "parse_http_response invalid status code str=%s", code_str.c_str());
-            return resp;
-        }
-        resp.status_code = static_cast<int>(code_val);
+    if (!valid_http_version(resp.version) || code_str.size() != 3 ||
+        !std::isdigit(static_cast<unsigned char>(code_str[0])) ||
+        !std::isdigit(static_cast<unsigned char>(code_str[1])) ||
+        !std::isdigit(static_cast<unsigned char>(code_str[2]))) {
+        diag::log_tagged_fmt("proto", "parse_http_response invalid status/version status=%s version=%s", code_str.c_str(), resp.version.c_str());
+        return resp;
     }
+    resp.status_code = (code_str[0] - '0') * 100 + (code_str[1] - '0') * 10 + (code_str[2] - '0');
     if (sp2 != std::string::npos) resp.reason = status_line.substr(sp2 + 1);
     diag::log_tagged_fmt("proto", "parse_http_response status_code=%d reason=%s version=%s", resp.status_code, resp.reason.c_str(), resp.version.c_str());
 
     resp.valid = true;
     size_t pos = first_eol + 2;
 
-    if (!parse_headers(data, len, pos, resp.headers)) {
+    auto headers_result = parse_headers(data, len, pos, resp.headers);
+    if (!headers_result.valid) {
+        diag::log_tagged_fmt("proto", "parse_http_response malformed headers headers_count=%zu", resp.headers.size());
+        resp.valid = false;
+        resp.complete = false;
+        resp.total_consumed = len;
+        return resp;
+    }
+    if (!headers_result.complete) {
         diag::log_tagged_fmt("proto", "parse_http_response parse_headers incomplete headers_count=%zu", resp.headers.size());
         resp.complete = false;
         resp.total_consumed = len;
@@ -247,37 +585,57 @@ http_response parse_http_response(const uint8_t* data, size_t len) {
     }
     diag::log_tagged_fmt("proto", "parse_http_response headers_count=%zu", resp.headers.size());
 
-    std::string cl_str = find_header(resp.headers, "Content-Length");
-    std::string te = to_lower(find_header(resp.headers, "Transfer-Encoding"));
+    if (!response_status_has_body(resp.status_code)) {
+        resp.complete = true;
+        resp.total_consumed = pos;
+        diag::log_tagged_fmt("proto", "parse_http_response no-body status=%d", resp.status_code);
+        return resp;
+    }
 
-    if (te.find("chunked") != std::string::npos) {
-        resp.body = decode_chunked(data + pos, len - pos);
+    auto cl = parse_content_lengths(resp.headers);
+    auto te = parse_transfer_encoding(resp.headers);
+    if (!cl.valid || !te.valid || (te.present && cl.present)) {
+        diag::log_tagged_fmt("proto", "parse_http_response invalid framing cl_present=%d cl_valid=%d te_present=%d te_valid=%d te_chunked=%d",
+            (int)cl.present, (int)cl.valid, (int)te.present, (int)te.valid, (int)te.chunked);
+        resp.valid = false;
+        resp.complete = false;
+        resp.total_consumed = len;
+        return resp;
+    }
+
+    if (te.chunked) {
+        auto decoded = decode_chunked(data + pos, len - pos);
+        if (!decoded.valid) {
+            resp.valid = false;
+            resp.complete = false;
+            resp.total_consumed = pos + decoded.consumed;
+            diag::log_tagged("proto", "parse_http_response invalid chunked body");
+            return resp;
+        }
+        resp.body = std::move(decoded.body);
+        resp.complete = decoded.complete;
+        resp.total_consumed = decoded.complete ? pos + decoded.consumed : len;
+        diag::log_tagged_fmt("proto", "parse_http_response chunked body body_size=%zu", resp.body.size());
+    } else if (te.present) {
+        resp.body.assign(data + pos, data + len);
         resp.complete = true;
         resp.total_consumed = len;
-        diag::log_tagged_fmt("proto", "parse_http_response chunked body body_size=%zu", resp.body.size());
-    } else if (!cl_str.empty()) {
-        size_t cl = 0;
-        {
-            char* cl_end = nullptr;
-            errno = 0;
-            unsigned long long cl_ull = strtoull(cl_str.c_str(), &cl_end, 10);
-            if (errno == 0 && cl_end != cl_str.c_str() && cl_ull <= static_cast<unsigned long long>(SIZE_MAX))
-                cl = static_cast<size_t>(cl_ull);
-        }
-        if (pos + cl <= len) {
-            resp.body.assign(data + pos, data + pos + cl);
+        diag::log_tagged_fmt("proto", "parse_http_response close-delimited transfer coding body_size=%zu", resp.body.size());
+    } else if (cl.present) {
+        if (cl.value <= len - pos) {
+            resp.body.assign(data + pos, data + pos + cl.value);
             resp.complete = true;
-            resp.total_consumed = pos + cl;
-            diag::log_tagged_fmt("proto", "parse_http_response content-length body cl=%zu complete=true", cl);
+            resp.total_consumed = pos + cl.value;
+            diag::log_tagged_fmt("proto", "parse_http_response content-length body cl=%zu complete=true", cl.value);
         } else {
             resp.body.assign(data + pos, data + len);
             resp.complete = false;
             resp.total_consumed = len;
-            diag::log_tagged_fmt("proto", "parse_http_response content-length partial cl=%zu have=%zu", cl, len - pos);
+            diag::log_tagged_fmt("proto", "parse_http_response content-length partial cl=%zu have=%zu", cl.value, len - pos);
         }
     } else {
         resp.body.assign(data + pos, data + len);
-        resp.complete = (len == pos);
+        resp.complete = true;
         resp.total_consumed = len;
         diag::log_tagged_fmt("proto", "parse_http_response no cl/te body_size=%zu complete=%d", resp.body.size(), (int)resp.complete);
     }
@@ -437,6 +795,44 @@ static uint16_t read_u16(const uint8_t* p) {
     return static_cast<uint16_t>((p[0] << 8) | p[1]);
 }
 
+static bool validate_h2_frame(uint8_t type, uint32_t length, uint8_t flags,
+                              uint32_t stream_id, const uint8_t* payload) {
+    switch (static_cast<h2_frame_type>(type)) {
+    case h2_frame_type::DATA:
+        if (stream_id == 0) return false;
+        if ((flags & 0x08) != 0 && length == 0) return false;
+        return true;
+    case h2_frame_type::HEADERS:
+        if (stream_id == 0) return false;
+        if ((flags & 0x08) != 0 && length == 0) return false;
+        if ((flags & 0x20) != 0 && length < ((flags & 0x08) != 0 ? 6u : 5u)) return false;
+        return true;
+    case h2_frame_type::PRIORITY:
+        return stream_id != 0 && length == 5;
+    case h2_frame_type::RST_STREAM:
+        return stream_id != 0 && length == 4;
+    case h2_frame_type::SETTINGS:
+        if (stream_id != 0) return false;
+        if ((flags & 0x01) != 0) return length == 0;
+        return (length % 6) == 0;
+    case h2_frame_type::PUSH_PROMISE:
+        if (stream_id == 0 || length < 4) return false;
+        if ((flags & 0x08) != 0 && length < 5) return false;
+        return true;
+    case h2_frame_type::PING:
+        return stream_id == 0 && length == 8;
+    case h2_frame_type::GOAWAY:
+        return stream_id == 0 && length >= 8;
+    case h2_frame_type::WINDOW_UPDATE:
+        if (length != 4 || !payload) return false;
+        return (read_u32(payload) & 0x7FFFFFFF) != 0;
+    case h2_frame_type::CONTINUATION:
+        return stream_id != 0;
+    default:
+        return true;
+    }
+}
+
 std::vector<h2_frame> parse_h2_frames(const uint8_t* data, size_t len) {
     diag::log_tagged_fmt("proto", "parse_h2_frames entry len=%zu", len);
     std::vector<h2_frame> frames;
@@ -458,12 +854,18 @@ std::vector<h2_frame> parse_h2_frames(const uint8_t* data, size_t len) {
         f.stream_id = read_u32(data + offset + 5) & 0x7FFFFFFF;
         offset += 9;
 
-        if (f.length > 16384 * 4) {
+        if (f.length > 16777215u) {
             diag::log_tagged_fmt("proto", "parse_h2_frames frame too large length=%u breaking", f.length);
             break;
         }
         if (offset + f.length > len) {
             diag::log_tagged_fmt("proto", "parse_h2_frames frame truncated need=%u have=%zu", f.length, len - offset);
+            break;
+        }
+
+        if (!validate_h2_frame(static_cast<uint8_t>(f.type), f.length, f.flags, f.stream_id, data + offset)) {
+            diag::log_tagged_fmt("proto", "parse_h2_frames invalid frame type=0x%02x flags=0x%02x stream_id=%u length=%u",
+                static_cast<unsigned>(static_cast<uint8_t>(f.type)), f.flags, f.stream_id, f.length);
             break;
         }
 
@@ -728,20 +1130,30 @@ h2_parsed_headers decode_hpack(const uint8_t* data, size_t len, hpack_context& c
         if (b & 0x80) {
             uint32_t index = hpack_decode_integer(data, len, pos, 7);
             auto field = hpack_get_indexed(index, ctx);
-            if (!field.name.empty()) {
-                diag::log_tagged_fmt("proto", "decode_hpack indexed idx=%u name=%s value=%s", index, field.name.c_str(), field.value.c_str());
-                result.fields.push_back(field);
+            if (field.name.empty()) {
+                result.valid = false;
+                return result;
             }
+            diag::log_tagged_fmt("proto", "decode_hpack indexed idx=%u name=%s value=%s", index, field.name.c_str(), field.value.c_str());
+            result.fields.push_back(field);
         }
         else if (b & 0x40) {
             uint32_t index = hpack_decode_integer(data, len, pos, 6);
             h2_header_field field;
             if (index > 0) {
                 field = hpack_get_indexed(index, ctx);
+                if (field.name.empty()) {
+                    result.valid = false;
+                    return result;
+                }
                 field.value = hpack_decode_string(data, len, pos);
             } else {
                 field.name = hpack_decode_string(data, len, pos);
                 field.value = hpack_decode_string(data, len, pos);
+            }
+            if (field.name.empty()) {
+                result.valid = false;
+                return result;
             }
             diag::log_tagged_fmt("proto", "decode_hpack literal-with-index name=%s value=%s", field.name.c_str(), field.value.c_str());
             hpack_add_to_dynamic(ctx, field);
@@ -764,10 +1176,18 @@ h2_parsed_headers decode_hpack(const uint8_t* data, size_t len, hpack_context& c
             h2_header_field field;
             if (index > 0) {
                 field = hpack_get_indexed(index, ctx);
+                if (field.name.empty()) {
+                    result.valid = false;
+                    return result;
+                }
                 field.value = hpack_decode_string(data, len, pos);
             } else {
                 field.name = hpack_decode_string(data, len, pos);
                 field.value = hpack_decode_string(data, len, pos);
+            }
+            if (field.name.empty()) {
+                result.valid = false;
+                return result;
             }
             diag::log_tagged_fmt("proto", "decode_hpack literal-never-index=%d name=%s value=%s", (int)never_index, field.name.c_str(), field.value.c_str());
             result.fields.push_back(field);

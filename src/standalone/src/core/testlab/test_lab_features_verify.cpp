@@ -66,6 +66,43 @@ namespace {
 		return out;
 	}
 
+	bool ensure_directory_tree_ascii(const char* path, DWORD* out_error = nullptr) {
+		if (out_error) *out_error = 0u;
+		if (path == nullptr || path[0] == '\0') {
+			if (out_error) *out_error = ERROR_INVALID_PARAMETER;
+			return false;
+		}
+		std::string p(path);
+		for (char& ch : p) {
+			if (ch == '/')
+				ch = '\\';
+		}
+		while (!p.empty() && (p.back() == '\\' || p.back() == '/'))
+			p.pop_back();
+		if (p.empty()) {
+			if (out_error) *out_error = ERROR_INVALID_PARAMETER;
+			return false;
+		}
+		std::size_t start = 0;
+		if (p.size() >= 3 && p[1] == ':' && p[2] == '\\')
+			start = 3;
+		for (std::size_t i = start; i <= p.size(); ++i) {
+			if (i != p.size() && p[i] != '\\')
+				continue;
+			std::string part = p.substr(0, i);
+			if (part.empty() || (part.size() == 2 && part[1] == ':'))
+				continue;
+			if (!CreateDirectoryA(part.c_str(), nullptr)) {
+				DWORD err = GetLastError();
+				if (err != ERROR_ALREADY_EXISTS) {
+					if (out_error) *out_error = err;
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
 	struct dns_query_context_t {
 		OVERLAPPED overlapped{};
 		PADDRINFOEXW result = nullptr;
@@ -1156,28 +1193,59 @@ namespace {
 		r.parsed.push_back({ "delta_dns_entries", fmt_u32(delta) });
 
 		dns_mark_stage(ctx, dns_log_stage_e::evaluate);
-		if (matches_name_self_or_unknown_pid > 0u) {
+		r.parsed.push_back({ "dns_eval_stage", dns_log_stage_name(ctx->stage.load(std::memory_order_acquire)) });
+		r.parsed.push_back({ "dns_stage", dns_log_stage_name(ctx->stage.load(std::memory_order_acquire)) });
+		r.parsed.push_back({ "dns_eval_pid", fmt_u32(self_pid) });
+		r.parsed.push_back({ "dns_pid", fmt_u32(self_pid) });
+		r.parsed.push_back({ "dns_ndns_attributed_probe", matches_name_self_or_unknown_pid > 0u ? "1" : "0" });
+		r.parsed.push_back({ "dns_ndns_self_pid_probe_matches", fmt_u32(matches_name_and_pid) });
+		r.parsed.push_back({ "dns_ndns_self_or_unknown_probe_matches", fmt_u32(matches_name_self_or_unknown_pid) });
+		r.parsed.push_back({ "dns_ndns_any_pid_probe_matches", fmt_u32(matches_name_any_pid) });
+		r.parsed.push_back({ "dns_packet_fallback_probe_matches", fmt_u32(captured_probe_packets) });
+		r.parsed.push_back({ "dns_packet_fallback_dns_packets", fmt_u32(captured_dns_packets) });
+		const std::string dns_eval_host = !matched_host.empty() ? matched_host : (!captured_probe_host.empty() ? captured_probe_host : attempted_hosts);
+		if (!dns_eval_host.empty()) {
+			r.parsed.push_back({ "dns_eval_hostname", dns_eval_host });
+			r.parsed.push_back({ "dns_hostname", dns_eval_host });
+		}
+		const bool packet_probe_seen = captured_probe_packets > 0u;
+		const bool ndns_hostname_seen = matches_name_any_pid > 0u;
+		const bool ndns_pid_attributed = matches_name_self_or_unknown_pid > 0u;
+		r.parsed.push_back({ "dns_feature_capture_verified", (ndns_pid_attributed || (ndns_hostname_seen && packet_probe_seen)) ? "1" : "0" });
+		r.parsed.push_back({ "dns_ndns_pid_attribution_degraded", (!ndns_pid_attributed && ndns_hostname_seen && packet_probe_seen) ? "1" : "0" });
+		if (ndns_pid_attributed) {
 			r.ntstatus = 0;
 			r.ok = true;
-		} else if (captured_probe_packets > 0u) {
+			r.parsed.push_back({ "dns_pass_path", matches_name_and_pid > 0u ? "ndns_self_pid" : "ndns_unknown_pid" });
+		} else if (ndns_hostname_seen && packet_probe_seen) {
 			r.ntstatus = 0;
 			r.ok = true;
-		} else if (matches_name_any_pid > 0u) {
+			r.parsed.push_back({ "dns_pass_path", "ndns_hostname_packet_capture_pid_degraded" });
+		} else if (packet_probe_seen) {
 			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
 			r.ok = false;
-			r.error = "DNS logger captured probe hostnames but attributed them to a different nonzero PID";
+			r.error = "DNS packet capture saw probe traffic but NDNS did not record the probe hostname";
+			r.parsed.push_back({ "dns_pass_path", "none_packet_fallback_only" });
+		} else if (ndns_hostname_seen) {
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			r.ok = false;
+			r.error = "DNS logger contains probe hostnames without fresh packet evidence and attributed them to a different nonzero PID";
+			r.parsed.push_back({ "dns_pass_path", "none_wrong_pid" });
 		} else if (any_self_pid_rows > 0u) {
 			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
 			r.ok = false;
 			r.error = "DNS logger captured self-PID rows but none contained the probe hostnames";
+			r.parsed.push_back({ "dns_pass_path", "none_self_pid_without_probe" });
 		} else if (delta > 0u && after_total > 0u) {
 			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
 			r.ok = false;
 			r.error = "DNS table changed during probe but no row matched both current PID and probe hostname";
+			r.parsed.push_back({ "dns_pass_path", "none_table_changed" });
 		} else {
 			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
 			r.ok = false;
 			r.error = "DNS logging did not capture the current process DNS probes";
+			r.parsed.push_back({ "dns_pass_path", "none" });
 		}
 	}
 
@@ -1488,15 +1556,21 @@ namespace {
 		r.parsed.push_back({ "step1_shadowfs_connected", "1" });
 
 		const char* sandbox_root_utf8 = "C:\\Users\\Public\\Desktop\\aida_sandbox_test\\";
-		BOOL cd = CreateDirectoryA(sandbox_root_utf8, nullptr);
-		DWORD cd_err = cd ? 0u : GetLastError();
-		if (cd_err != 0u && cd_err != ERROR_ALREADY_EXISTS) {
+		DWORD cd_err = 0u;
+		BOOL cd = ensure_directory_tree_ascii(sandbox_root_utf8, &cd_err) ? TRUE : FALSE;
+		if (!cd) {
 			char b[96];
-			std::snprintf(b, sizeof(b), "CreateDirectoryA err=%lu", static_cast<unsigned long>(cd_err));
+			std::snprintf(b, sizeof(b), "ensure_directory_tree_ascii err=%lu", static_cast<unsigned long>(cd_err));
 			r.parsed.push_back({ "step2_mkdir_warning", std::string(b) });
 		} else {
 			r.parsed.push_back({ "step2_sandbox_root", sandbox_root_utf8 });
 		}
+		const char* sandbox_cow_parent_utf8 = "C:\\Users\\Public\\Desktop\\aida_sandbox_test\\__cow\\Users\\Public\\Desktop\\";
+		DWORD cow_err = 0u;
+		bool cow_ok = ensure_directory_tree_ascii(sandbox_cow_parent_utf8, &cow_err);
+		r.parsed.push_back({ "step2_cow_parent", sandbox_cow_parent_utf8 });
+		r.parsed.push_back({ "step2_cow_parent_ready", cow_ok ? "1" : "0" });
+		r.parsed.push_back({ "step2_cow_parent_error", fmt_u32(cow_err) });
 
 		const std::wstring root = L"C:\\Users\\Public\\Desktop\\aida_sandbox_test\\";
 		const std::uint32_t self_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
@@ -1534,20 +1608,34 @@ namespace {
 			CREATE_ALWAYS,
 			FILE_ATTRIBUTE_NORMAL,
 			nullptr);
-		bool wrote = false;
+		bool create_ok = (h != INVALID_HANDLE_VALUE);
+		bool write_ok = false;
+		DWORD create_err = create_ok ? 0u : GetLastError();
+		DWORD write_err = 0u;
+		DWORD written = 0;
 		if (h != INVALID_HANDLE_VALUE) {
 			const char* payload = "round-trip test";
-			DWORD written = 0;
-			WriteFile(h, payload, static_cast<DWORD>(std::strlen(payload)), &written, nullptr);
+			write_ok = WriteFile(h, payload, static_cast<DWORD>(std::strlen(payload)), &written, nullptr) != FALSE;
+			write_err = write_ok ? 0u : GetLastError();
 			CloseHandle(h);
-			wrote = (written == std::strlen(payload));
 		} else {
-			DWORD err = GetLastError();
 			char b[96];
-			std::snprintf(b, sizeof(b), "CreateFileA err=%lu", static_cast<unsigned long>(err));
+			std::snprintf(b, sizeof(b), "CreateFileA err=%lu", static_cast<unsigned long>(create_err));
 			r.parsed.push_back({ "step5_write_err", std::string(b) });
 		}
-		r.parsed.push_back({ "step5_write_attempted", wrote ? "1" : "0" });
+		bool write_complete = create_ok && write_ok && written == static_cast<DWORD>(std::strlen("round-trip test"));
+		if (create_ok && !write_ok) {
+			char b[96];
+			std::snprintf(b, sizeof(b), "WriteFile err=%lu", static_cast<unsigned long>(write_err));
+			r.parsed.push_back({ "step5_write_err", std::string(b) });
+		}
+		r.parsed.push_back({ "step5_createfile_ok", create_ok ? "1" : "0" });
+		r.parsed.push_back({ "step5_createfile_error", fmt_u32(create_err) });
+		r.parsed.push_back({ "step5_writefile_ok", write_ok ? "1" : "0" });
+		r.parsed.push_back({ "step5_writefile_error", fmt_u32(write_err) });
+		r.parsed.push_back({ "step5_write_bytes", fmt_u32(written) });
+		r.parsed.push_back({ "step5_write_attempted", write_complete ? "1" : "0" });
+		r.parsed.push_back({ "step5_write_complete", write_complete ? "1" : "0" });
 
 		std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
@@ -1577,9 +1665,20 @@ namespace {
 		r.parsed.push_back({ "delta_denials", std::string(b3) });
 
 		bool any_change = (d_red > 0) || (d_cop > 0) || (d_den > 0);
-		if (any_change) {
+		if (!write_complete) {
+			if (any_change) {
+				r.ntstatus = 0;
+				r.ok = true;
+				r.parsed.push_back({ "shadowfs_write_materialization_degraded", "1" });
+			} else {
+				r.ok = false;
+				r.error = !create_ok ? "ShadowFS write probe did not exercise CreateFileA successfully" : "ShadowFS write probe did not complete WriteFile successfully";
+				r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			}
+		} else if (any_change) {
 			r.ntstatus = 0;
 			r.ok = true;
+			r.parsed.push_back({ "shadowfs_write_materialization_degraded", "0" });
 		} else {
 			r.ok = false;
 			r.error = "registration ok but minifilter did not intercept our write -- check Altitude / minifilter state";
@@ -1783,10 +1882,10 @@ namespace {
 		r.parsed.push_back({ "baseline_self_to_1_1_1_1_port_80", fmt_u32(baseline_self_one_one) });
 
 		tcp_probe_state_t probe;
-		bool initiated = start_external_tcp_probe(probe);
+		bool initiated = start_loopback_tcp_probe(probe);
 		if (!initiated) {
-			r.parsed.push_back({ "external_connect_diag", probe.diag });
-			initiated = start_loopback_tcp_probe(probe);
+			r.parsed.push_back({ "loopback_connect_diag", probe.diag });
+			initiated = start_external_tcp_probe(probe);
 		}
 		r.parsed.push_back({ "step1_connect_initiated", initiated ? "1" : "0" });
 		r.parsed.push_back({ "tcp_probe_mode", probe.mode });
@@ -1861,7 +1960,6 @@ namespace {
 			}
 			std::free(req);
 			if (pid_and_remote > 0u) break;
-			if (pid_only > baseline_self_pid_rows) break;
 			std::this_thread::sleep_for(std::chrono::milliseconds(250));
 		}
 
@@ -1870,6 +1968,9 @@ namespace {
 		r.parsed.push_back({ "self_pid_rows_to_probe_remote", fmt_u32(pid_and_remote) });
 		const std::uint32_t delta_self = (pid_only >= baseline_self_pid_rows) ? (pid_only - baseline_self_pid_rows) : 0u;
 		r.parsed.push_back({ "delta_self_pid_rows", fmt_u32(delta_self) });
+		r.parsed.push_back({ "tcpip_expected_remote_seen", pid_and_remote > 0u ? "1" : "0" });
+		r.parsed.push_back({ "tcpip_self_pid_only_seen", pid_only > 0u ? "1" : "0" });
+		r.parsed.push_back({ "tcpip_probe_initiated", initiated ? "1" : "0" });
 
 		probe.close();
 
@@ -1882,16 +1983,28 @@ namespace {
 		if (pid_and_remote > 0u) {
 			r.ntstatus = 0;
 			r.ok = true;
+			r.parsed.push_back({ "tcpip_pass_path", "self_pid_expected_remote" });
+			r.parsed.push_back({ "tcpip_endpoint_attribution_degraded", "0" });
+		} else if (!initiated) {
+			r.ok = false;
+			r.error = "TCP probe was not initiated, so the expected remote endpoint row could not be verified";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			r.parsed.push_back({ "tcpip_pass_path", "none_probe_not_initiated" });
 		} else if (delta_self > 0u) {
-			r.ntstatus = 0;
 			r.ok = true;
-		} else if (pid_only > 0u && initiated) {
 			r.ntstatus = 0;
-			r.ok = true;
+			r.parsed.push_back({ "tcpip_pass_path", "self_pid_delta_endpoint_degraded" });
+			r.parsed.push_back({ "tcpip_endpoint_attribution_degraded", "1" });
+		} else if (pid_only > 0u) {
+			r.ok = false;
+			r.error = "DTCP captured self-PID rows but none matched the expected remote endpoint";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			r.parsed.push_back({ "tcpip_pass_path", "none_self_pid_only" });
 		} else {
 			r.ok = false;
-			r.error = "no newly-appearing self-PID row seen in DTCP output after probe -- connection may have RST'd before snapshot or TCB attribution path is broken";
+			r.error = "DTCP did not expose a self-PID row for the expected remote endpoint after probe";
 			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			r.parsed.push_back({ "tcpip_pass_path", "none" });
 		}
 	}
 
@@ -1909,7 +2022,7 @@ TESTLAB_REGISTER(g_reg_verify_dns_log,
 	"verify",
 	test_lab::driver_e::whoswho,
 	"DNS query log round-trip",
-	"NCAP/NDNS around UDP, TCP, and resolver DNS probes -> assert the kernel logged or captured one probe hostname for the current or unknown PID.",
+	"NCAP/NDNS around UDP, TCP, and resolver DNS probes -> assert NDNS attributed one probe hostname to the current or unknown PID.",
 	&render_inputs_empty,
 	&run_verify_dns_log);
 
@@ -1933,7 +2046,7 @@ TESTLAB_REGISTER(g_reg_verify_shadowfs_round_trip,
 	"verify",
 	test_lab::driver_e::shadowfs,
 	"ShadowFS sandbox round-trip",
-	"Connect shadowfs port -> mkdir sandbox -> register self PID -> CreateFile in sandbox path -> query_stats and assert redirects/copies/denials counter incremented -> unregister.",
+	"Connect shadowfs port -> mkdir sandbox -> register self PID -> complete CreateFile/WriteFile probe -> query_stats and assert redirects/copies/denials counter incremented -> unregister.",
 	&render_inputs_empty,
 	&run_verify_shadowfs_round_trip);
 

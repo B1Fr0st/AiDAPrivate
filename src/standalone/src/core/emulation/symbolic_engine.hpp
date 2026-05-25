@@ -10,9 +10,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -122,6 +124,36 @@ inline uint64_t snapshot_size_for_range(uint64_t start_addr, uint64_t end_addr) 
 	return 0x10000;
 }
 
+inline void prepare_snapshot_for_context(emulation::process_snapshot_t& snap, uint64_t start_addr) {
+	constexpr uint64_t stack_base = 0x0000007FFF000000ull;
+	constexpr uint64_t stack_size = 0x20000ull;
+	constexpr uint64_t stack_top = stack_base + stack_size - 0x1000ull;
+	constexpr uint64_t sentinel_ret = 0xDEAD000000000000ull;
+
+	snap.rip = start_addr;
+	snap.rsp = stack_top;
+	snap.rbp = stack_top + 0x100ull;
+	if (snap.rflags == 0)
+		snap.rflags = 0x202;
+
+	for (auto& region : snap.regions) {
+		uint64_t region_end = region.base + region.size;
+		if (stack_top >= region.base && stack_top + sizeof(sentinel_ret) <= region_end) {
+			if (region.data.size() >= region.size)
+				std::memcpy(region.data.data() + (stack_top - region.base), &sentinel_ret, sizeof(sentinel_ret));
+			return;
+		}
+	}
+
+	emulation::memory_snapshot_region_t stack;
+	stack.base = stack_base;
+	stack.size = stack_size;
+	stack.protect = 0x04;
+	stack.data.resize(static_cast<std::size_t>(stack_size), 0);
+	std::memcpy(stack.data.data() + (stack_top - stack_base), &sentinel_ret, sizeof(sentinel_ret));
+	snap.regions.push_back(std::move(stack));
+}
+
 inline bool is_ret_opcode(const std::vector<uint8_t>& code_bytes) {
 	if (code_bytes.empty())
 		return false;
@@ -194,6 +226,7 @@ inline void load_snapshot_into_context(triton::Context& ctx, const emulation::pr
 	ctx.setConcreteRegisterValue(ctx.getRegister("r14"), snap.r14);
 	ctx.setConcreteRegisterValue(ctx.getRegister("r15"), snap.r15);
 	ctx.setConcreteRegisterValue(ctx.getRegister("rip"), snap.rip);
+	ctx.setConcreteRegisterValue(ctx.getRegister(triton::arch::ID_REG_X86_EFLAGS), snap.rflags);
 
 	for (auto& region : snap.regions) {
 		if (!region.data.empty()) {
@@ -290,6 +323,7 @@ inline symbolic_result_t execute_symbolic(
 		static_cast<unsigned long long>(snapshot.total_snapshot_bytes),
 		snapshot.regions.size());
 
+	detail::prepare_snapshot_for_context(snapshot, start_addr);
 	detail::load_snapshot_into_context(ctx, snapshot);
 
 	for (auto& reg_name : symbolize_regs) {
@@ -430,6 +464,7 @@ inline slice_result_t slice_to_register(
 		return result;
 	}
 
+	detail::prepare_snapshot_for_context(snapshot, start_addr);
 	detail::load_snapshot_into_context(ctx, snapshot);
 
 	ctx.symbolizeRegister(ctx.getRegister(target_reg_id), target_reg_name + "_sym");
@@ -537,6 +572,7 @@ inline solve_result_t solve_for_path(
 		return result;
 	}
 
+	detail::prepare_snapshot_for_context(snapshot, start_addr);
 	detail::load_snapshot_into_context(ctx, snapshot);
 
 	for (auto& reg_name : symbolic_regs) {
@@ -549,6 +585,26 @@ inline solve_result_t solve_for_path(
 	uint64_t pc = start_addr;
 	uint32_t count = 0;
 	bool reached = false;
+	auto solve_predicate = [&](const triton::ast::SharedAbstractNode& pred) -> bool {
+		if (!pred)
+			return false;
+		triton::engines::solver::status_e status;
+		uint32_t solve_time = 0;
+		auto model = ctx.getModel(pred, &status, 10000, &solve_time);
+		result.solving_time_ms = solve_time;
+		if (status != triton::engines::solver::SAT)
+			return false;
+		result.satisfiable = true;
+		for (auto& [var_id, sol_model] : model) {
+			auto sym_var = ctx.getSymbolicVariable(var_id);
+			if (sym_var) {
+				result.variable_values[sym_var->getAlias()] =
+					static_cast<uint64_t>(sol_model.getValue());
+			}
+		}
+		result.success = true;
+		return true;
+	};
 
 	while (count < max_instructions && !reached) {
 		if (pc == target_addr) {
@@ -575,30 +631,35 @@ inline solve_result_t solve_for_path(
 	if (!reached) {
 		auto predicates = ctx.getPredicatesToReachAddress(target_addr);
 		if (predicates.empty()) {
+			auto ast = ctx.getAstContext();
+			auto accumulated = ast->bvtrue();
+			bool attempted_branch_predicate = false;
+			for (const auto& pc_entry : ctx.getPathConstraints()) {
+				for (const auto& branch : pc_entry.getBranchConstraints()) {
+					const auto dst_addr = static_cast<uint64_t>(std::get<2>(branch));
+					const auto& branch_predicate = std::get<3>(branch);
+					if (dst_addr == target_addr && branch_predicate) {
+						attempted_branch_predicate = true;
+						if (solve_predicate(ast->land(accumulated, branch_predicate)))
+							return result;
+					}
+				}
+				auto taken = pc_entry.getTakenPredicate();
+				if (taken)
+					accumulated = ast->land(accumulated, taken);
+			}
+			if (attempted_branch_predicate) {
+				result.satisfiable = false;
+				result.success = true;
+				return result;
+			}
 			result.error = "No path constraint found to reach target address";
 			return result;
 		}
 
 		for (auto& pred_ast : predicates) {
-			triton::engines::solver::status_e status;
-			uint32_t solve_time = 0;
-			auto model = ctx.getModel(pred_ast, &status, 10000, &solve_time);
-
-			if (status == triton::engines::solver::SAT) {
-				result.satisfiable = true;
-				result.solving_time_ms = solve_time;
-
-				for (auto& [var_id, sol_model] : model) {
-					auto sym_var = ctx.getSymbolicVariable(var_id);
-					if (sym_var) {
-						result.variable_values[sym_var->getAlias()] =
-							static_cast<uint64_t>(sol_model.getValue());
-					}
-				}
-
-				result.success = true;
+			if (solve_predicate(pred_ast))
 				return result;
-			}
 		}
 
 		result.satisfiable = false;
@@ -659,6 +720,7 @@ inline taint_result_t taint_trace(
 		return result;
 	}
 
+	detail::prepare_snapshot_for_context(snapshot, start_addr);
 	detail::load_snapshot_into_context(ctx, snapshot);
 
 	for (auto& reg_name : taint_regs) {
@@ -745,6 +807,7 @@ inline std::string get_register_expression(
 	auto snapshot = emulation::driver_snapshot(pid, tid, start_addr, 0x1000);
 	if (!snapshot.success) return "<error: snapshot failed>";
 
+	detail::prepare_snapshot_for_context(snapshot, start_addr);
 	detail::load_snapshot_into_context(ctx, snapshot);
 
 	for (auto& reg_name : symbolize_regs) {
@@ -817,6 +880,7 @@ inline bool is_opaque_predicate(
 	auto snapshot = emulation::driver_snapshot(pid, tid, start_addr, 0x1000);
 	if (!snapshot.success) return false;
 
+	detail::prepare_snapshot_for_context(snapshot, start_addr);
 	detail::load_snapshot_into_context(ctx, snapshot);
 
 	auto all_regs = ctx.getParentRegisters();

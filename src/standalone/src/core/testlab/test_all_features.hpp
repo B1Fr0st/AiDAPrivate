@@ -9,5 +9,6 @@ namespace test_all_features {
 	bool is_running();
 	void set_progress_step(const char* label);
 	void format_debug_snapshot(char* out, std::size_t cap);
+	void run_parser_proof_smoke();
 
 }

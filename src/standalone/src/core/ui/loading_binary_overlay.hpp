@@ -93,6 +93,20 @@ inline phase_t get_phase()
 	return static_cast<phase_t>(state().phase.load(std::memory_order_acquire));
 }
 
+inline const char* phase_name(phase_t p)
+{
+	switch (p) {
+	case phase_t::idle: return "idle";
+	case phase_t::loading: return "loading";
+	case phase_t::awaiting_analysis: return "awaiting_analysis";
+	case phase_t::awaiting_pdb_decision: return "awaiting_pdb_decision";
+	case phase_t::loading_pdb: return "loading_pdb";
+	case phase_t::finalizing: return "finalizing";
+	case phase_t::complete: return "complete";
+	default: return "unknown";
+	}
+}
+
 inline void set_milestone(float pct, const char* label, unsigned int id)
 {
 	state_t& s = state();
@@ -390,6 +404,52 @@ inline bool is_active()
 {
 	phase_t p = detail::get_phase();
 	return p != phase_t::idle && p != phase_t::complete;
+}
+
+inline phase_t current_phase()
+{
+	return detail::get_phase();
+}
+
+inline const char* current_phase_name()
+{
+	return detail::phase_name(detail::get_phase());
+}
+
+inline bool is_waiting_for_user_decision()
+{
+	return detail::get_phase() == phase_t::awaiting_pdb_decision;
+}
+
+inline void log_state(const char* tag)
+{
+	detail::state_t& s = detail::state();
+	std::string path;
+	std::string filename;
+	std::string milestone;
+	{
+		std::lock_guard<std::mutex> lk(s.text_mtx);
+		path = s.path;
+		filename = s.filename;
+		milestone = s.milestone_label;
+	}
+	diag::log_tagged_fmt("loading_binary_overlay",
+		"%s phase=%u phase_name=%s active=%d worker_finished=%d completion_applied=%d load_succeeded=%d action=%u progress=%.3f ia_running=%d ia_finished=%d ia_step=%d path=%s filename=%s milestone=%s",
+		tag ? tag : "state",
+		static_cast<unsigned int>(current_phase()),
+		current_phase_name(),
+		is_active() ? 1 : 0,
+		s.worker_finished.load(std::memory_order_acquire) ? 1 : 0,
+		s.completion_applied.load(std::memory_order_acquire) ? 1 : 0,
+		s.load_succeeded.load(std::memory_order_acquire) ? 1 : 0,
+		s.completion_action.load(std::memory_order_acquire),
+		s.progress.load(std::memory_order_acquire),
+		initial_analysis::g_state.running.load(std::memory_order_acquire) ? 1 : 0,
+		initial_analysis::g_state.finished.load(std::memory_order_acquire) ? 1 : 0,
+		initial_analysis::g_state.active_step_index.load(std::memory_order_acquire),
+		path.c_str(),
+		filename.c_str(),
+		milestone.c_str());
 }
 
 inline bool is_blocking_views()

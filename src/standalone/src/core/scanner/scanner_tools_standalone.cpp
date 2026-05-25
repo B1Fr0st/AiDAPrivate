@@ -45,6 +45,29 @@ static memory_scanner::scan_mode_t parse_scan_mode(const std::string& s) {
 	return memory_scanner::scan_mode_t::exact;
 }
 
+static bool parse_u64_param(const json& params, const char* key, uint64_t& out) {
+	if (!params.contains(key))
+		return false;
+	const auto& v = params[key];
+	if (v.is_string()) {
+		auto parsed = sa_parse_address(v.get<std::string>());
+		if (!parsed) return false;
+		out = *parsed;
+		return true;
+	}
+	if (v.is_number_unsigned()) {
+		out = v.get<uint64_t>();
+		return true;
+	}
+	if (v.is_number_integer()) {
+		int64_t s = v.get<int64_t>();
+		if (s < 0) return false;
+		out = static_cast<uint64_t>(s);
+		return true;
+	}
+	return false;
+}
+
 static std::string results_to_json(size_t limit = 100) {
 	auto& st = memory_scanner::g_state;
 	std::lock_guard<std::mutex> lk(st.results_mutex);
@@ -91,13 +114,22 @@ static tool_result_t handle_first_scan(const json& params) {
 		cfg.hex_input = params["hex"].get<bool>();
 	if (params.contains("writable_only") && params["writable_only"].is_boolean())
 		cfg.writable_only = params["writable_only"].get<bool>();
+	if (params.contains("executable_exclude") && params["executable_exclude"].is_boolean())
+		cfg.executable_exclude = params["executable_exclude"].get<bool>();
 	if (params.contains("alignment") && params["alignment"].is_number())
 		cfg.alignment = params["alignment"].get<size_t>();
+	parse_u64_param(params, "range_base", cfg.range_base);
+	parse_u64_param(params, "range_size", cfg.range_size);
 
-	diag::log_tagged_fmt("scanner", "mcp first_scan request value='%s' type=%s mode=%s",
+	diag::log_tagged_fmt("scanner", "mcp first_scan request value='%s' type=%s mode=%s writable_only=%d executable_exclude=%d alignment=%zu range=0x%llX+0x%llX",
 		cfg.value_text.c_str(),
 		memory_scanner::value_type_name(cfg.value_type),
-		memory_scanner::scan_mode_name(cfg.scan_mode));
+		memory_scanner::scan_mode_name(cfg.scan_mode),
+		cfg.writable_only ? 1 : 0,
+		cfg.executable_exclude ? 1 : 0,
+		cfg.alignment,
+		static_cast<unsigned long long>(cfg.range_base),
+		static_cast<unsigned long long>(cfg.range_size));
 
 	if (!memory_scanner::first_scan(cfg)) {
 		diag::log_tagged("scanner", "mcp first_scan refused");
@@ -110,8 +142,10 @@ static tool_result_t handle_first_scan(const json& params) {
 		Sleep(100);
 	}
 
-	diag::log_tagged_fmt("scanner", "mcp first_scan completed total=%zu",
-		memory_scanner::g_state.total_found);
+	diag::log_tagged_fmt("scanner", "mcp first_scan completed total=%zu scan_count=%d scanning=%d",
+		memory_scanner::g_state.total_found,
+		memory_scanner::g_state.scan_count,
+		memory_scanner::g_state.scanning.load() ? 1 : 0);
 
 	return tool_result_t::ok(results_to_json());
 }
@@ -150,6 +184,11 @@ static tool_result_t handle_get_results(const json& params) {
 	size_t limit = 100;
 	if (params.contains("limit") && params["limit"].is_number())
 		limit = params["limit"].get<size_t>();
+	diag::log_tagged_fmt("scanner", "mcp get_results limit=%zu total=%zu scan_count=%d scanning=%d",
+		limit,
+		memory_scanner::g_state.total_found,
+		memory_scanner::g_state.scan_count,
+		memory_scanner::g_state.scanning.load() ? 1 : 0);
 	return tool_result_t::ok(results_to_json(limit));
 }
 
@@ -398,7 +437,10 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 		 {OBFSTR("value2"), OBFSTR("string"), OBFSTR("Second value for 'between' mode"), false},
 		 {OBFSTR("hex"), OBFSTR("boolean"), OBFSTR("Interpret value as hexadecimal"), false},
 		 {OBFSTR("writable_only"), OBFSTR("boolean"), OBFSTR("Only scan writable pages (default true)"), false},
-		 {OBFSTR("alignment"), OBFSTR("number"), OBFSTR("Scan alignment in bytes (default: type size)"), false}},
+		 {OBFSTR("executable_exclude"), OBFSTR("boolean"), OBFSTR("Exclude executable pages (default true)"), false},
+		 {OBFSTR("alignment"), OBFSTR("number"), OBFSTR("Scan alignment in bytes (default: type size)"), false},
+		 {OBFSTR("range_base"), OBFSTR("string"), OBFSTR("Optional scan range base address"), false},
+		 {OBFSTR("range_size"), OBFSTR("number"), OBFSTR("Optional scan range size in bytes"), false}},
 		handle_first_scan, false});
 
 	register_compat(srv, {OBFSTR("scanner_next_scan"), OBFSTR("memory_scanner"),

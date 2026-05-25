@@ -1,6 +1,7 @@
 #include "test_lab.hpp"
 #include "test_lab_format.hpp"
 #include "../../../../driver/comm.h"
+#include "../runtime/standalone_driver.hpp"
 #include "imgui/imgui.h"
 
 #include <atomic>
@@ -10,6 +11,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -69,6 +71,16 @@ namespace {
 		}
 		out_address = req.allocated_address;
 		return true;
+	}
+
+	bool free_scratch(std::uint32_t pid, std::uint64_t address) {
+		if (pid == 0 || address == 0 || !device || !device->is_connected())
+			return false;
+		voyager::detail::free_mem_request req{};
+		req.pid = pid;
+		req.address = address;
+		std::uint32_t br = 0;
+		return device->send_ioctl_raw(ioctl_codes::FM(), &req, static_cast<std::uint32_t>(sizeof(req)), br);
 	}
 
 	void push_hex_field(test_lab::result_t& r, const char* label, std::uint64_t value) {
@@ -193,8 +205,45 @@ namespace {
 				found = true;
 			}
 		}
+		bool synthetic_fixture = false;
+		if (!found && s.u32_a == 0u) {
+			std::string err;
+			std::uint64_t dtb = 0;
+			if (!resolve_dtb(s.pid, dtb, err)) {
+				r.error = "synthetic CR fixture DTB failed: " + err;
+				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+				r.ok = false;
+				return;
+			}
+			std::uint64_t scratch = 0;
+			if (!alloc_scratch(s.pid, static_cast<std::uint64_t>(voyager::detail::SHELLCODE_ALLOC_SIZE), scratch, err)) {
+				r.error = "synthetic CR fixture allocation failed: " + err;
+				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+				r.ok = false;
+				return;
+			}
+			std::vector<std::uint8_t> ctx(320u, 0u);
+			const std::uint64_t synthetic_result = 0xA1DA7782C0DEF00Dull;
+			const std::uint64_t synthetic_done = 0xDEADC0DE12345678ull;
+			std::memcpy(ctx.data() + 0x30, &synthetic_result, sizeof(synthetic_result));
+			std::memcpy(ctx.data() + 0x50, &synthetic_done, sizeof(synthetic_done));
+			if (!driver_bridge::write_memory_for(s.pid, scratch, ctx)) {
+				free_scratch(s.pid, scratch);
+				r.error = "synthetic CR fixture write_memory_for failed: " + driver_bridge::last_error();
+				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+				r.ok = false;
+				return;
+			}
+			rec.pid = s.pid;
+			rec.dtb = dtb;
+			rec.shellcode_address = scratch;
+			rec.target_function = 0;
+			rec.arg1 = 0;
+			found = true;
+			synthetic_fixture = true;
+		}
 		if (!found) {
-			r.error = "unknown call_id (issue RC first to populate the call_id table)";
+			r.error = "unknown call_id (issue RC first to populate the call_id table, or use call_id 0 for the deterministic CR fixture)";
 			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
 			r.ok = false;
 			return;
@@ -206,6 +255,10 @@ namespace {
 		req.completed = 0;
 		std::uint32_t bytes_returned = 0;
 		bool ok = device->send_ioctl_raw(ioctl_codes::CR(), &req, static_cast<std::uint32_t>(sizeof(req)), bytes_returned);
+		if (synthetic_fixture) {
+			bool freed = free_scratch(s.pid, rec.shellcode_address);
+			r.parsed.push_back({ "Synthetic Fixture Freed", freed ? "yes" : "no" });
+		}
 		r.bytes_returned = bytes_returned;
 		r.raw.resize(sizeof(req));
 		std::memcpy(r.raw.data(), &req, sizeof(req));
@@ -223,6 +276,8 @@ namespace {
 		push_hex_field(r, "Arg1", rec.arg1);
 		push_hex_field(r, "Result Value", req.result);
 		push_hex_field(r, "Completed Flag", req.completed);
+		if (synthetic_fixture)
+			r.parsed.push_back({ "Fixture", "deterministic completed context" });
 		r.parsed.push_back({ "Status", (req.completed != 0ull) ? std::string("DONE") : std::string("PENDING") });
 		r.ok = true;
 	}

@@ -1093,6 +1093,10 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/network/cert_generator.cpp"
             "${STANDALONE_ROOT}/core/network/mitm_proxy.cpp"
             "${STANDALONE_ROOT}/core/network/network_view.cpp"
+            "${STANDALONE_ROOT}/core/network/intercept/cert_profile_manager.cpp"
+            "${STANDALONE_ROOT}/core/network/intercept/diagnostics.cpp"
+            "${STANDALONE_ROOT}/core/network/intercept/instrumentation_provider.cpp"
+            "${STANDALONE_ROOT}/core/network/intercept/script_handoff.cpp"
             "${STANDALONE_ROOT}/core/network/burp/active_scanner.cpp"
             "${STANDALONE_ROOT}/core/network/burp/api_definition.cpp"
             "${STANDALONE_ROOT}/core/network/burp/api_view.cpp"
@@ -1273,6 +1277,69 @@ if(WIN32)
             "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/hardware_id/hardware_id_v2.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/telemetry/telemetry_client.cpp"
         )
+
+        set(AIDA_CERT_PIN_BYPASS_GUARD_FILES
+            "${STANDALONE_ROOT}/core/network/cert_pin_bypass.hpp"
+            "${STANDALONE_ROOT}/core/network/net_security_tools_standalone.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/net_security.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/net_security.hpp"
+        )
+        set(AIDA_FORBIDDEN_CERT_BYPASS_TOKENS
+                "0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3"
+                "0x31, 0xC0, 0xC3"
+                "ssl_verify_cert_chain"
+                "BoringSSL verify_cert_chain"
+                "Schannel CertVerifyCertificateChainPolicy"
+                "WinHTTP SSL validation"
+                "WinINet SSL error handler"
+                "NSS ssl3_HandleCertificate"
+                "patch_wintrust"
+                "patch_crypt32"
+                "patch_schannel_validation"
+                "patch_chrome_pins"
+                "patch_dotnet_callback"
+                "Pin bypass applied"
+                "Bypass certificate pinning in a target process by patching"
+                "Chrome-PKP"
+                "DotNet-SCH_CRED"
+                "SChannel-CertValidation")
+        foreach(_aida_cert_guard_file IN LISTS AIDA_CERT_PIN_BYPASS_GUARD_FILES)
+            file(READ "${_aida_cert_guard_file}" AIDA_CERT_PIN_BYPASS_TEXT)
+            foreach(_aida_forbidden_cert_bypass_token IN LISTS AIDA_FORBIDDEN_CERT_BYPASS_TOKENS)
+                string(FIND "${AIDA_CERT_PIN_BYPASS_TEXT}" "${_aida_forbidden_cert_bypass_token}" _aida_forbidden_cert_bypass_pos)
+                if(NOT _aida_forbidden_cert_bypass_pos EQUAL -1)
+                    message(FATAL_ERROR "AiDA: legacy certificate bypass token found in ${_aida_cert_guard_file}: ${_aida_forbidden_cert_bypass_token}")
+                endif()
+            endforeach()
+        endforeach()
+
+        file(READ "${STANDALONE_ROOT}/core/testlab/test_all_mcp.cpp" AIDA_CERT_TESTLAB_MCP_TEXT)
+        foreach(_aida_required_cert_test_token IN ITEMS
+                "mcp.pin_bypass.guard"
+                "target_process_modified"
+                "mcp.cert_generate_ca.guard"
+                "private_key_exported"
+                "mcp.firefox_profile_status.guard"
+                "mcp.firefox_profile_launch.guard"
+                "validate_only"
+                "runtime_validation_performed")
+            string(FIND "${AIDA_CERT_TESTLAB_MCP_TEXT}" "${_aida_required_cert_test_token}" _aida_required_cert_test_pos)
+            if(_aida_required_cert_test_pos EQUAL -1)
+                message(FATAL_ERROR "AiDA: certificate interception regression guard missing MCP test token: ${_aida_required_cert_test_token}")
+            endif()
+        endforeach()
+
+        file(READ "${STANDALONE_ROOT}/core/testlab/test_all_network.cpp" AIDA_CERT_TESTLAB_NETWORK_TEXT)
+        foreach(_aida_required_cert_network_token IN ITEMS
+                "openssl_attach_rejected"
+                "sni_authority_mismatch"
+                "runtime_validation_performed"
+                "current_user_ca_trusted")
+            string(FIND "${AIDA_CERT_TESTLAB_NETWORK_TEXT}" "${_aida_required_cert_network_token}" _aida_required_cert_network_pos)
+            if(_aida_required_cert_network_pos EQUAL -1)
+                message(FATAL_ERROR "AiDA: certificate interception regression guard missing network test token: ${_aida_required_cert_network_token}")
+            endif()
+        endforeach()
 
         set_source_files_properties(
             "${DEPS_DIR}/sqlite-amalgamation-3530000/sqlite3.c"
@@ -1503,6 +1570,86 @@ if(WIN32)
         if(TARGET encrypt_drivers)
             add_dependencies(AiDAStandalone encrypt_drivers)
         endif()
+
+        add_executable(AiDAParserProof
+            "${STANDALONE_ROOT}/core/testlab/parser_proof_runner.cpp"
+            "${STANDALONE_ROOT}/core/network/protocol_parser.cpp"
+        )
+
+        target_include_directories(AiDAParserProof PRIVATE
+            "${STANDALONE_ROOT}"
+            "${STANDALONE_ROOT}/core"
+            "${STANDALONE_ROOT}/core/network"
+            "${STANDALONE_ROOT}/core/testlab"
+            "${zlib_SOURCE_DIR}"
+            "${zlib_BINARY_DIR}"
+        )
+
+        target_compile_definitions(AiDAParserProof PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+            NOMINMAX
+        )
+
+        target_compile_options(AiDAParserProof PRIVATE
+            /W3
+            /EHsc
+            /Zc:__cplusplus
+            /permissive-
+            /MD
+        )
+
+        target_link_libraries(AiDAParserProof PRIVATE
+            llhttp_static
+            nghttp2_static
+            zlibstatic
+            brotlidec
+            brotlicommon
+        )
+
+        if(TARGET aida_hardening)
+            target_link_libraries(AiDAParserProof PRIVATE aida_hardening)
+        endif()
+
+        add_executable(AiDA_NetworkHookSidecar
+            "${STANDALONE_ROOT}/core/testlab/network_hook_sidecar.cpp"
+        )
+
+        target_include_directories(AiDA_NetworkHookSidecar PRIVATE
+            "${STANDALONE_ROOT}"
+            "${STANDALONE_ROOT}/core"
+            "${STANDALONE_ROOT}/core/testlab"
+        )
+
+        target_compile_definitions(AiDA_NetworkHookSidecar PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+        )
+
+        target_compile_options(AiDA_NetworkHookSidecar PRIVATE
+            /W3
+            /EHsc
+            /Zc:__cplusplus
+            /permissive-
+            /MD
+        )
+
+        target_link_libraries(AiDA_NetworkHookSidecar PRIVATE
+            ws2_32
+        )
+
+        set_target_properties(AiDA_NetworkHookSidecar PROPERTIES
+            CXX_STANDARD 17
+            CXX_STANDARD_REQUIRED YES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+            RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/Debug"
+            RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
+            RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
+        )
+
+        set_target_properties(AiDA_NetworkHookSidecar PROPERTIES
+            OUTPUT_NAME "AiDA_NetworkHookSidecar"
+        )
 
         set(AIDA_CAMOUFOX_MCP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-reverse-mcp")
         if(EXISTS "${AIDA_CAMOUFOX_MCP_DIR}/pyproject.toml")
@@ -2046,6 +2193,57 @@ if(BUILD_PROTECTOR)
         OUTPUT_NAME "aida_protector"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
     )
+
+    if(DEFINED STANDALONE_ROOT AND EXISTS "${STANDALONE_ROOT}/core/testlab/network_hook_sidecar.cpp")
+        add_executable(AiDA_NetworkHookSidecar_Protected
+            "${STANDALONE_ROOT}/core/testlab/network_hook_sidecar.cpp"
+        )
+
+        target_include_directories(AiDA_NetworkHookSidecar_Protected PRIVATE
+            "${STANDALONE_ROOT}"
+            "${STANDALONE_ROOT}/core"
+            "${STANDALONE_ROOT}/core/testlab"
+        )
+
+        target_compile_definitions(AiDA_NetworkHookSidecar_Protected PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+            AIDA_SIDECAR_PROTECTED_BUILD=1
+        )
+
+        target_compile_options(AiDA_NetworkHookSidecar_Protected PRIVATE
+            /W3
+            /EHsc
+            /Zc:__cplusplus
+            /permissive-
+            /MD
+        )
+
+        target_link_libraries(AiDA_NetworkHookSidecar_Protected PRIVATE
+            ws2_32
+        )
+
+        set_target_properties(AiDA_NetworkHookSidecar_Protected PROPERTIES
+            CXX_STANDARD 17
+            CXX_STANDARD_REQUIRED YES
+            OUTPUT_NAME "AiDA_NetworkHookSidecar_Protected"
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+            RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/Debug"
+            RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
+            RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
+        )
+
+        add_dependencies(AiDA_NetworkHookSidecar_Protected AiDAProtector)
+        add_custom_command(TARGET AiDA_NetworkHookSidecar_Protected POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                "-DRETRY_LABEL=AiDA_NetworkHookSidecar_Protected.exe-protect"
+                "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA_NetworkHookSidecar_Protected>;--output;$<TARGET_FILE:AiDA_NetworkHookSidecar_Protected>;--all;--no-encrypt-imports;--tamper-level;2;--no-llm-poison;--verbose"
+                -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
+            COMMENT "Protecting AiDA_NetworkHookSidecar_Protected.exe..."
+            VERBATIM
+        )
+    endif()
 
     add_executable(AiDAExtractPayload tools/protector/payload/extract_payload.cpp)
     target_compile_options(AiDAExtractPayload PRIVATE /W4 /WX /EHsc $<IF:$<CONFIG:Debug>,/Od,/O2> /Zc:__cplusplus /std:c++17)

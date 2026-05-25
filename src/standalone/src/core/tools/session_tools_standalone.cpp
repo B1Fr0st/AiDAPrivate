@@ -59,12 +59,37 @@ uint32_t parse_pid(const json& v)
 bool wait_for_binary_load_quiescent(uint32_t timeout_ms)
 {
 	const ULONGLONG start = GetTickCount64();
+	ULONGLONG last_log = 0;
+	loading_binary_overlay::log_state("session_wait_begin");
 	for (;;) {
 		loading_binary_overlay::poll_completion();
-		if (!loading_binary_overlay::is_active())
+		if (!loading_binary_overlay::is_active()) {
+			diag::log_tagged_fmt("sess_tools",
+				"session_wait_done elapsed_ms=%llu phase=%s",
+				static_cast<unsigned long long>(GetTickCount64() - start),
+				loading_binary_overlay::current_phase_name());
 			return true;
-		if (GetTickCount64() - start >= timeout_ms)
+		}
+		if (loading_binary_overlay::is_waiting_for_user_decision()) {
+			diag::log_tagged_fmt("sess_tools",
+				"session_wait_quiescent_user_decision elapsed_ms=%llu phase=%s",
+				static_cast<unsigned long long>(GetTickCount64() - start),
+				loading_binary_overlay::current_phase_name());
+			return true;
+		}
+		const ULONGLONG elapsed = GetTickCount64() - start;
+		if (elapsed - last_log >= 1000) {
+			last_log = elapsed;
+			diag::log_tagged_fmt("sess_tools",
+				"session_wait_pending elapsed_ms=%llu timeout_ms=%u phase=%s",
+				static_cast<unsigned long long>(elapsed),
+				timeout_ms,
+				loading_binary_overlay::current_phase_name());
+		}
+		if (elapsed >= timeout_ms) {
+			loading_binary_overlay::log_state("session_wait_timeout");
 			return false;
+		}
 		Sleep(25);
 	}
 }
@@ -114,15 +139,32 @@ static tool_result_t sessions_switch(const json& params)
 	if (!params.contains("binary_id") || !params["binary_id"].is_string()) {
 		return tool_result_t::error("binary_id (string) is required");
 	}
-	if (!wait_for_binary_load_quiescent(30000)) {
-		return tool_result_t::error("switch failed: load timeout");
-	}
 	std::string id = params["binary_id"].get<std::string>();
 	size_t idx = 0;
 	if (!analysis_session::find_session_by_id(id, &idx)) {
 		diag::log_tagged_fmt("sess_tools",
 			"sessions_switch id='%s' not_found", id.c_str());
 		return tool_result_t::error("binary_id not found: " + id);
+	}
+	const size_t active = analysis_session::active_session_idx();
+	diag::log_tagged_fmt("sess_tools",
+		"sessions_switch resolved id='%s' idx=%llu active=%llu phase=%s",
+		id.c_str(),
+		static_cast<unsigned long long>(idx),
+		static_cast<unsigned long long>(active),
+		loading_binary_overlay::current_phase_name());
+	if (idx == active) {
+		auto sum = analysis_session::summarize_session_at(idx);
+		json root;
+		root["switched_to"] = summary_to_json(sum);
+		root["already_active"] = true;
+		diag::log_tagged_fmt("sess_tools",
+			"sessions_switch id='%s' already_active idx=%llu",
+			id.c_str(), static_cast<unsigned long long>(idx));
+		return tool_result_t::ok(root);
+	}
+	if (!wait_for_binary_load_quiescent(30000)) {
+		return tool_result_t::error("switch failed: load timeout");
 	}
 	if (!analysis_session::switch_session(idx)) {
 		std::string err = analysis_session::last_error();
@@ -155,6 +197,9 @@ static tool_result_t sessions_open_file(const json& params)
 		std::string err = analysis_session::last_error();
 		size_t idx = 0;
 		if (analysis_session::find_session_by_path(path, &idx)) {
+			if (!wait_for_binary_load_quiescent(30000)) {
+				return tool_result_t::error("open failed: load timeout");
+			}
 			auto sum = analysis_session::summarize_session_at(idx);
 			json root;
 			root["opened"] = summary_to_json(sum);
@@ -168,6 +213,9 @@ static tool_result_t sessions_open_file(const json& params)
 			"sessions_open_file path='%s' open_failed err='%s'",
 			path.c_str(), err.c_str());
 		return tool_result_t::error(std::string("open failed: ") + err);
+	}
+	if (!wait_for_binary_load_quiescent(30000)) {
+		return tool_result_t::error("open failed: load timeout");
 	}
 	size_t idx = 0;
 	if (!analysis_session::find_session_by_path(path, &idx)) {
@@ -192,6 +240,24 @@ static tool_result_t sessions_attach_pid(const json& params)
 	uint32_t pid = parse_pid(params["pid"]);
 	if (pid == 0) {
 		return tool_result_t::error("invalid pid");
+	}
+	diag::log_tagged_fmt("sess_tools",
+		"sessions_attach_pid parsed pid=%u attached_pid=%u phase=%s",
+		pid,
+		driver_bridge::attached_pid(),
+		loading_binary_overlay::current_phase_name());
+	size_t existing_idx = 0;
+	if (analysis_session::find_session_by_pid(pid, &existing_idx)) {
+		auto sum = analysis_session::summarize_session_at(existing_idx);
+		json root;
+		root["attached"] = summary_to_json(sum);
+		root["already_attached"] = true;
+		diag::log_tagged_fmt("sess_tools",
+			"sessions_attach_pid pid=%u existing_session idx=%llu id='%s'",
+			pid,
+			static_cast<unsigned long long>(existing_idx),
+			sum.id.c_str());
+		return tool_result_t::ok(root);
 	}
 	if (!wait_for_binary_load_quiescent(30000)) {
 		return tool_result_t::error("attach failed: load timeout");
@@ -223,16 +289,25 @@ static tool_result_t sessions_close(const json& params)
 	if (!params.contains("binary_id") || !params["binary_id"].is_string()) {
 		return tool_result_t::error("binary_id (string) is required");
 	}
-	if (!wait_for_binary_load_quiescent(30000)) {
-		return tool_result_t::error("close failed: load timeout");
-	}
 	std::string id = params["binary_id"].get<std::string>();
 	size_t idx = 0;
 	if (!analysis_session::find_session_by_id(id, &idx)) {
 		return tool_result_t::error("binary_id not found: " + id);
 	}
+	diag::log_tagged_fmt("sess_tools",
+		"sessions_close resolved id='%s' idx=%llu active=%llu phase=%s",
+		id.c_str(),
+		static_cast<unsigned long long>(idx),
+		static_cast<unsigned long long>(analysis_session::active_session_idx()),
+		loading_binary_overlay::current_phase_name());
+	if (!wait_for_binary_load_quiescent(30000)) {
+		return tool_result_t::error("close failed: load timeout");
+	}
 	if (!analysis_session::close_session(idx)) {
 		std::string err = analysis_session::last_error();
+		diag::log_tagged_fmt("sess_tools",
+			"sessions_close id='%s' close_failed err='%s'",
+			id.c_str(), err.c_str());
 		return tool_result_t::error(std::string("close failed: ") + err);
 	}
 	json root;

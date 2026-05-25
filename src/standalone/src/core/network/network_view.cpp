@@ -4,6 +4,7 @@
 #include "protocol_parser.hpp"
 #include "mitm_proxy.hpp"
 #include "cert_pin_bypass.hpp"
+#include "cert_generator.hpp"
 #include "ssl_keylog.hpp"
 #include "script_engine.hpp"
 #include "decoder_pipeline.hpp"
@@ -46,8 +47,13 @@
 #include "burp/csp_view.hpp"
 #include "burp/upstream_view.hpp"
 #include "burp/browser_view.hpp"
+#include "burp/browser_launch.hpp"
 #include "burp/report_view.hpp"
 #include "burp/headless_view.hpp"
+#include "intercept/cert_profile_manager.hpp"
+#include "intercept/diagnostics.hpp"
+#include "intercept/instrumentation_provider.hpp"
+#include "intercept/script_handoff.hpp"
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -62,12 +68,14 @@
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -225,6 +233,73 @@ static float capture_rate_tick(size_t total_packets) {
 
 static aida::ui::transition_t s_tab_content_in;
 static int s_last_active_tab = -1;
+
+struct cert_diagnostics_ui_t {
+    int target_pid = 0;
+    bool has_report = false;
+    cert_intercept::process_diagnostics_t report;
+    std::vector<cert_intercept::provider_status_t> providers;
+    std::string status;
+    std::string handoff_status;
+    cert_intercept::profiles::firefox_profile_status_t firefox_status;
+};
+static cert_diagnostics_ui_t s_cert_diag_ui;
+
+static std::string cert_diag_lower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+static bool cert_diag_has_any(const std::string& value, std::initializer_list<const char*> needles) {
+    const std::string lowered = cert_diag_lower(value);
+    for (const char* needle : needles) {
+        if (lowered.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+static void cert_diag_apply_proxy_observations(cert_intercept::diagnostic_context_t& context) {
+    auto observations = mitm_proxy::get_tls_observations(64);
+    for (const auto& obs : observations) {
+        std::string evidence = std::string(mitm_proxy::to_string(obs.kind)) + " host=" + obs.target_host;
+        if (!obs.sni.empty()) evidence += " sni=" + obs.sni;
+        if (!obs.alpn.empty()) evidence += " alpn=" + obs.alpn;
+        if (!obs.detail.empty()) evidence += " detail=" + obs.detail;
+        switch (obs.kind) {
+        case mitm_proxy::tls_observation_kind_t::http_tls:
+            context.interception_observed = true;
+            break;
+        case mitm_proxy::tls_observation_kind_t::sni_authority_mismatch:
+            context.hostname_san_mismatch_observed = true;
+            context.interception_still_failing = true;
+            context.observation_evidence.push_back(std::move(evidence));
+            break;
+        case mitm_proxy::tls_observation_kind_t::client_handshake_failed:
+            if (cert_diag_has_any(obs.detail, {"certificate", "unknown ca", "bad certificate", "required", "alert"})) {
+                context.browser_trust_policy_or_ct_block = true;
+                context.interception_still_failing = true;
+                context.observation_evidence.push_back(std::move(evidence));
+            }
+            break;
+        case mitm_proxy::tls_observation_kind_t::upstream_handshake_failed:
+            if (cert_diag_has_any(obs.detail, {"certificate required", "bad certificate", "handshake failure", "alert certificate"})) {
+                context.mutual_tls_requested = true;
+                context.interception_still_failing = true;
+                context.observation_evidence.push_back(std::move(evidence));
+            }
+            break;
+        case mitm_proxy::tls_observation_kind_t::non_http_tls:
+            context.non_http_tls_observed = true;
+            context.interception_still_failing = true;
+            context.observation_evidence.push_back(std::move(evidence));
+            break;
+        default:
+            break;
+        }
+    }
+}
 
 static std::string format_ip(const uint8_t* addr, uint8_t af) {
     char buf[INET6_ADDRSTRLEN] = {};
@@ -1878,19 +1953,181 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
 
 
     ImGui::Spacing();
-    if (cert_pin_bypass::is_bypass_active()) {
-        char pin_buf[96];
-        snprintf(pin_buf, sizeof(pin_buf), "Pin bypass active  -  %zu patches",
-                 cert_pin_bypass::get_active_bypasses().size());
-        aida::ui::pill_kind(pin_buf, aida::ui::pill_kind_t::success, aida::ui::size_t_::sm, false);
+    bool ca_ready = cert_generator::is_ready();
+    bool ca_installed = false;
+    std::string spki_prefix;
+    if (ca_ready) {
+        const auto& ca = cert_generator::get_root_ca();
+        ca_installed = cert_generator::is_root_ca_installed(ca);
+        spki_prefix = aida::burp::browser::spki_hash_prefix(cert_generator::spki_sha256_base64(ca));
+    }
+    auto controlled_browsers = aida::burp::browser::list_running();
+    bool controlled_browser_running = false;
+    for (const auto& browser : controlled_browsers) {
+        if (browser.running) {
+            controlled_browser_running = true;
+            break;
+        }
+    }
+
+    aida::ui::pill_kind("Interception readiness", aida::ui::pill_kind_t::info, aida::ui::size_t_::sm, false);
+    ImGui::SameLine();
+    aida::ui::pill_kind(mitm_proxy::is_running() ? "Proxy running" : "Proxy stopped",
+        mitm_proxy::is_running() ? aida::ui::pill_kind_t::success : aida::ui::pill_kind_t::warning,
+        aida::ui::size_t_::sm, false);
+    ImGui::SameLine();
+    aida::ui::pill_kind(ca_installed ? "AiDA CA trusted" : "AiDA CA not trusted",
+        ca_installed ? aida::ui::pill_kind_t::success : aida::ui::pill_kind_t::warning,
+        aida::ui::size_t_::sm, false);
+    ImGui::SameLine();
+    aida::ui::pill_kind(controlled_browser_running ? "Controlled active" : "Controlled ready",
+        controlled_browser_running ? aida::ui::pill_kind_t::success : aida::ui::pill_kind_t::neutral,
+        aida::ui::size_t_::sm, false);
+    ImGui::SameLine();
+    aida::ui::pill_kind("QUIC disabled", aida::ui::pill_kind_t::info, aida::ui::size_t_::sm, false);
+    if (!spki_prefix.empty()) {
         ImGui::SameLine();
-        if (aida::ui::button("Revert Bypasses", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+        char spki_buf[64];
+        snprintf(spki_buf, sizeof(spki_buf), "SPKI %s", spki_prefix.c_str());
+        aida::ui::pill_kind(spki_buf, aida::ui::pill_kind_t::neutral, aida::ui::size_t_::sm, false);
+    }
+    ImGui::Spacing();
+    if (aida::ui::button("Prepare controlled browser", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+        state.prev_tab = state.active_tab;
+        state.active_tab = sub_tab_t::browser;
+    }
+    ImGui::SameLine();
+    if (aida::ui::button("Repair trust", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+        bool ok = cert_generator::initialize();
+        if (ok && cert_generator::is_ready()) {
+            ok = cert_generator::install_root_ca(cert_generator::get_root_ca());
+        }
+        toast_notification::push(ok ? "AiDA CA trust repaired." : "AiDA CA trust repair failed.",
+            ok ? toast_notification::toast_type_t::success : toast_notification::toast_type_t::error);
+    }
+    ImGui::SameLine();
+    if (aida::ui::button("Prepare Firefox profile", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+        bool ok = cert_generator::initialize();
+        if (ok && cert_generator::is_ready()) {
+            uint16_t proxy_port = state.proxy_port > 0 && state.proxy_port <= 65535
+                ? static_cast<uint16_t>(state.proxy_port)
+                : static_cast<uint16_t>(8443);
+            s_cert_diag_ui.firefox_status = cert_intercept::profiles::prepare_firefox_profile(
+                cert_generator::get_root_ca(), state.proxy_bind_addr, proxy_port);
+            ok = s_cert_diag_ui.firefox_status.ok;
+        }
+        toast_notification::push(ok ? "Firefox profile prepared." : "Firefox profile preparation failed.",
+            ok ? toast_notification::toast_type_t::success : toast_notification::toast_type_t::error);
+    }
+    if (cert_pin_bypass::is_bypass_active()) {
+        auto active_bypasses = cert_pin_bypass::get_active_bypasses();
+        ImGui::SameLine();
+        char legacy_buf[96];
+        snprintf(legacy_buf, sizeof(legacy_buf), "Legacy cleanup  -  %zu patches", active_bypasses.size());
+        aida::ui::pill_kind(legacy_buf, aida::ui::pill_kind_t::warning, aida::ui::size_t_::sm, false);
+        ImGui::SameLine();
+        if (aida::ui::button("Revert legacy patches", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
             diag::log_tagged_fmt("network", "cert_pin_revert_clicked patches=%zu",
-                cert_pin_bypass::get_active_bypasses().size());
+                active_bypasses.size());
             cert_pin_bypass::revert_all_bypasses();
         }
     }
 
+    ImGui::Spacing();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
+        "Target PID:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(110.f);
+    ImGui::InputInt("##cert_diag_pid", &s_cert_diag_ui.target_pid, 1, 100, ImGuiInputTextFlags_CharsDecimal);
+    if (s_cert_diag_ui.target_pid < 0) s_cert_diag_ui.target_pid = 0;
+    ImGui::SameLine();
+    if (aida::ui::button("Diagnose target", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+        cert_intercept::diagnostic_context_t context;
+        context.proxy_running = mitm_proxy::is_running();
+        context.ca_trusted = ca_installed;
+        context.controlled_browser = controlled_browser_running;
+        context.proxy_endpoint = std::string(state.proxy_bind_addr) + ":" + std::to_string(state.proxy_port);
+        cert_diag_apply_proxy_observations(context);
+        if (s_cert_diag_ui.target_pid > 0) {
+            s_cert_diag_ui.report = cert_intercept::diagnose_process(static_cast<uint32_t>(s_cert_diag_ui.target_pid), context);
+            s_cert_diag_ui.providers = cert_intercept::provider_registry_t::instance().evaluate(
+                static_cast<uint32_t>(s_cert_diag_ui.target_pid), s_cert_diag_ui.report);
+            s_cert_diag_ui.has_report = true;
+            s_cert_diag_ui.status = cert_intercept::to_string(s_cert_diag_ui.report.primary) + " - " + s_cert_diag_ui.report.summary;
+            s_cert_diag_ui.handoff_status.clear();
+        } else {
+            s_cert_diag_ui.has_report = false;
+            s_cert_diag_ui.status = "Select a live PID before diagnostics";
+        }
+    }
+    if (!s_cert_diag_ui.status.empty()) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
+            "%s", s_cert_diag_ui.status.c_str());
+    }
+    if (s_cert_diag_ui.firefox_status.prepared) {
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
+            "Firefox profile: %s", s_cert_diag_ui.firefox_status.launch_arguments.c_str());
+    }
+    if (s_cert_diag_ui.has_report) {
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
+            "Recommended tier: %s", s_cert_diag_ui.report.recommended_tier.c_str());
+        int shown = 0;
+        for (const auto& finding : s_cert_diag_ui.report.findings) {
+            if (shown++ >= 3) break;
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
+                "%s: %s", cert_intercept::to_string(finding.severity).c_str(), finding.title.c_str());
+            ImGui::SameLine();
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha * th.disabled_alpha)),
+                "%s", finding.next_action.c_str());
+        }
+        if (!s_cert_diag_ui.providers.empty()) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
+                "Providers:");
+            for (const auto& provider : s_cert_diag_ui.providers) {
+                ImGui::SameLine();
+                char provider_buf[160];
+                snprintf(provider_buf, sizeof(provider_buf), "%s:%s",
+                    provider.descriptor.provider_id.c_str(),
+                    cert_intercept::to_string(provider.state).c_str());
+                aida::ui::pill_kind(provider_buf,
+                    provider.state == cert_intercept::provider_state_t::available ? aida::ui::pill_kind_t::success : aida::ui::pill_kind_t::neutral,
+                    aida::ui::size_t_::sm, false);
+            }
+        }
+        bool can_handoff = s_cert_diag_ui.report.primary == cert_intercept::classification_t::true_pinning ||
+            s_cert_diag_ui.report.primary == cert_intercept::classification_t::app_specific_tls_stack;
+        if (can_handoff) {
+            if (aida::ui::button("Generate handoff", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+                bool ok = cert_generator::initialize();
+                cert_intercept::profiles::public_ca_export_t exported;
+                if (ok && cert_generator::is_ready()) {
+                    exported = cert_intercept::profiles::export_public_ca_files(cert_generator::get_root_ca());
+                    ok = exported.ok;
+                }
+                if (ok) {
+                    cert_intercept::handoff_request_t request;
+                    request.diagnostics = s_cert_diag_ui.report;
+                    request.provider_statuses = s_cert_diag_ui.providers;
+                    request.target_label = s_cert_diag_ui.report.process_name.empty() ? "target" : s_cert_diag_ui.report.process_name;
+                    request.proxy_endpoint = std::string(state.proxy_bind_addr) + ":" + std::to_string(state.proxy_port);
+                    request.ca_cert_pem_path = exported.pem_path.u8string();
+                    request.ca_cert_der_path = exported.der_path.u8string();
+                    auto handoff = cert_intercept::generate_handoff(request);
+                    ok = handoff.ok;
+                    s_cert_diag_ui.handoff_status = ok ? handoff.metadata_path.u8string() : handoff.error;
+                } else {
+                    s_cert_diag_ui.handoff_status = exported.error.empty() ? "ca_export_failed" : exported.error;
+                }
+            }
+            if (!s_cert_diag_ui.handoff_status.empty()) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
+                    "%s", s_cert_diag_ui.handoff_status.c_str());
+            }
+        }
+    }
     ImGui::Spacing();
 
 

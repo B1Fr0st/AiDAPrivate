@@ -79,6 +79,39 @@ static bool loaded_static_file_available()
     return g_disasm.file.loaded && !g_disasm.file.sections.empty() && g_disasm.file.image_base != 0;
 }
 
+static void ensure_static_function_index_ready(const char* reason)
+{
+    if (!loaded_static_file_available())
+        return;
+    bool needs_rebuild = false;
+    {
+        auto& c = function_index::detail::cache();
+        std::shared_lock<std::shared_mutex> lk(c.mutex);
+        needs_rebuild = c.sorted_starts.empty() ||
+            c.cached_module_base != g_disasm.file.image_base;
+        diag::log_tagged_fmt("disasm_tools",
+            "ensure_static_function_index_ready reason=%s need=%d sorted=%zu cached_base=0x%llX file_base=0x%llX cached_module='%s'",
+            reason ? reason : "",
+            needs_rebuild ? 1 : 0,
+            c.sorted_starts.size(),
+            static_cast<unsigned long long>(c.cached_module_base),
+            static_cast<unsigned long long>(g_disasm.file.image_base),
+            c.cached_module_name.c_str());
+    }
+    if (needs_rebuild) {
+        std::string name = g_disasm.file.filename.empty() ? g_disasm.file.path : g_disasm.file.filename;
+        function_index::detail::rebuild_bounds_index_static(name);
+        auto& c = function_index::detail::cache();
+        std::shared_lock<std::shared_mutex> lk(c.mutex);
+        diag::log_tagged_fmt("disasm_tools",
+            "ensure_static_function_index_ready rebuilt reason=%s sorted=%zu cached_base=0x%llX module='%s'",
+            reason ? reason : "",
+            c.sorted_starts.size(),
+            static_cast<unsigned long long>(c.cached_module_base),
+            c.cached_module_name.c_str());
+    }
+}
+
 static int find_instr_index(const DisasmFile& file, uint64_t addr)
 {
     int lo = 0;
@@ -555,6 +588,7 @@ static tool_result_t handle_list_functions(const json& params)
             static_cast<unsigned long long>(g_disasm.file.image_base));
         return tool_result_t::error("No disassembly file is loaded. Open a file session before listing static functions.");
     }
+    ensure_static_function_index_ready("list_functions");
 
     std::string filter;
     if (params.contains("filter") && params["filter"].is_string())
@@ -616,6 +650,31 @@ static tool_result_t handle_list_functions(const json& params)
             names.push_back(n.empty() ? function_index::synthetic_name(s) : n);
             kinds.push_back(std::move(kind));
             sections.push_back(std::move(sec));
+        }
+    }
+    if (starts.empty() && g_disasm.file.entry_point != 0 && g_disasm.file.image_base != 0) {
+        const uint64_t image_size = static_analysis::total_image_size(g_disasm.file);
+        const uint64_t ep = g_disasm.file.entry_point;
+        if (ep >= g_disasm.file.image_base && image_size != 0 && ep < g_disasm.file.image_base + image_size) {
+            std::string ep_section;
+            for (size_t sec_i = 0; sec_i < g_disasm.file.sections.size(); ++sec_i) {
+                const auto& s = g_disasm.file.sections[sec_i];
+                const uint64_t sec_size = static_cast<uint64_t>(s.bytes.size());
+                if (sec_size != 0 && ep >= s.va && ep < s.va + sec_size) {
+                    ep_section = s.is_executable ? ".text" : (std::string("section_") + std::to_string(sec_i));
+                    break;
+                }
+            }
+            starts.push_back(ep);
+            ends.push_back(ep + 1);
+            names.push_back("entry_point");
+            kinds.push_back("entry");
+            sections.push_back(std::move(ep_section));
+            diag::log_tagged_fmt("disasm_tools",
+                "list_functions synthesized_entry_point va=0x%llX image_base=0x%llX image_size=0x%llX",
+                static_cast<unsigned long long>(ep),
+                static_cast<unsigned long long>(g_disasm.file.image_base),
+                static_cast<unsigned long long>(image_size));
         }
     }
 

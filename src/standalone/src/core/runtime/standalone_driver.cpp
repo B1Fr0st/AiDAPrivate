@@ -875,6 +875,58 @@ namespace driver_bridge
         return true;
     }
 
+    bool refresh_kernel_context_locked(uint32_t pid, process_ctx_t& ctx)
+    {
+        if (!g_kernel_mode || !device || !device->is_connected()) {
+            ctx.kernel_attached = false;
+            return false;
+        }
+
+        const auto* vtable = get_arc_vtable();
+        if (vtable && vtable->set_process_id)
+            vtable->set_process_id(pid);
+        device->set_process_id(pid);
+
+        uint64_t arc_dtb = 0;
+        if (vtable && vtable->solve_dtb)
+            arc_dtb = vtable->solve_dtb();
+
+        device->solve_dtb();
+        if (device->get_dtb() == 0 && arc_dtb != 0)
+            device->set_dtb(arc_dtb);
+        if (device->get_dtb() == 0 && ctx.cached_dtb != 0)
+            device->set_dtb(ctx.cached_dtb);
+        if (device->get_dtb() == 0) {
+            ctx.kernel_attached = false;
+            return false;
+        }
+
+        ctx.kernel_attached = true;
+        ctx.cached_dtb = device->get_dtb();
+
+        if (ctx.cached_image_base == 0) {
+            uint64_t image_base = 0;
+            if (vtable && vtable->find_image)
+                image_base = vtable->find_image();
+            if (image_base == 0)
+                image_base = device->find_image();
+            ctx.cached_image_base = image_base;
+        }
+        if (ctx.cached_image_base != 0) {
+            device->set_base_address(ctx.cached_image_base);
+            if (vtable && vtable->set_base_address)
+                vtable->set_base_address(ctx.cached_image_base);
+        }
+
+        if (ctx.cached_kernel_dtb != 0) {
+            device->set_kernel_dtb(ctx.cached_kernel_dtb);
+        } else {
+            device->solve_kernel_dtb();
+            ctx.cached_kernel_dtb = device->get_kernel_dtb();
+        }
+        return true;
+    }
+
     bool set_active_pid(uint32_t pid)
     {
         if (pid == 0)
@@ -882,37 +934,17 @@ namespace driver_bridge
 
         std::lock_guard<std::mutex> lk(g_state_mtx);
         if (g_pid == pid) {
-            bool kernel_mode = g_kernel_mode && device && device->is_connected();
-            if (kernel_mode) {
-                const auto* vtable = get_arc_vtable();
-                if (vtable && vtable->set_process_id)
-                    vtable->set_process_id(pid);
-                device->set_process_id(pid);
-                if (device->get_dtb() == 0)
-                    device->solve_dtb();
-                if (device->get_dtb() != 0) {
-                    g_kernel_attached = true;
-                    auto it = g_processes.find(pid);
-                    if (it != g_processes.end()) {
-                        it->second.kernel_attached = true;
-                        it->second.cached_dtb = device->get_dtb();
-                        it->second.cached_kernel_dtb = device->get_kernel_dtb();
-                        if (it->second.cached_image_base == 0) {
-                            const auto image_base = device->find_image();
-                            if (image_base != 0) {
-                                it->second.cached_image_base = image_base;
-                                device->set_base_address(image_base);
-                                if (vtable && vtable->set_base_address)
-                                    vtable->set_base_address(image_base);
-                            }
-                        }
-                    }
-                }
+            auto it = g_processes.find(pid);
+            process_ctx_t transient;
+            process_ctx_t& ctx = (it != g_processes.end()) ? it->second : transient;
+            if (g_kernel_mode && device && device->is_connected()) {
+                g_kernel_attached = refresh_kernel_context_locked(pid, ctx);
             }
-            diag::log_tagged_fmt("driver", "set_active_pid_same pid=%u kernel_attached=%d dtb=0x%llX",
+            diag::log_tagged_fmt("driver", "set_active_pid_same pid=%u kernel_attached=%d dtb=0x%llX cached_dtb=0x%llX",
                 pid,
                 g_kernel_attached ? 1 : 0,
-                static_cast<unsigned long long>((device && device->is_connected()) ? device->get_dtb() : 0));
+                static_cast<unsigned long long>((device && device->is_connected()) ? device->get_dtb() : 0),
+                static_cast<unsigned long long>(ctx.cached_dtb));
             return true;
         }
 
@@ -951,32 +983,13 @@ namespace driver_bridge
 
         bool kernel_mode = g_kernel_mode && device && device->is_connected();
         if (kernel_mode) {
-            const auto* vtable = get_arc_vtable();
-            if (vtable && vtable->set_process_id)
-                vtable->set_process_id(pid);
-            device->set_process_id(pid);
-            if (target.cached_image_base != 0) {
-                device->set_base_address(target.cached_image_base);
-                if (vtable && vtable->set_base_address)
-                    vtable->set_base_address(target.cached_image_base);
-            }
-            bool needs_resolve = !g_kernel_attached || target.cached_dtb == 0;
-            if (needs_resolve) {
-                device->solve_dtb();
-                if (device->get_dtb() != 0) {
-                    g_kernel_attached = true;
-                    const auto image_base = device->find_image();
-                    if (image_base != 0) {
-                        device->set_base_address(image_base);
-                        target.cached_image_base = image_base;
-                    }
-                    target.cached_dtb = device->get_dtb();
-                    device->solve_kernel_dtb();
-                    target.cached_kernel_dtb = device->get_kernel_dtb();
-                }
-            }
+            g_kernel_attached = refresh_kernel_context_locked(pid, target);
         }
-        diag::log_tagged_fmt("driver", "set_active_pid_ok pid=%u kernel_attached=%d", pid, g_kernel_attached ? 1 : 0);
+        diag::log_tagged_fmt("driver", "set_active_pid_ok pid=%u kernel_attached=%d dtb=0x%llX cached_dtb=0x%llX",
+            pid,
+            g_kernel_attached ? 1 : 0,
+            static_cast<unsigned long long>((device && device->is_connected()) ? device->get_dtb() : 0),
+            static_cast<unsigned long long>(target.cached_dtb));
         return true;
     }
 
@@ -1715,11 +1728,13 @@ namespace driver_bridge
                 bytes_written = vtable->write_raw(address, data.data(), data.size());
             }
 
-            if (bytes_written == 0 && device && device->get_dtb() != 0) {
-                bytes_written = device->write_raw(address, data.data(), data.size());
+            if (bytes_written != data.size() && device && device->get_dtb() != 0) {
+                const size_t direct_written = device->write_raw(address, data.data(), data.size());
+                if (direct_written > bytes_written)
+                    bytes_written = direct_written;
             }
 
-            if (bytes_written == 0) {
+            if (bytes_written != data.size()) {
                 bool re_resolved = false;
                 {
                     std::lock_guard<std::mutex> lk(g_state_mtx);
@@ -1735,16 +1750,27 @@ namespace driver_bridge
 
                 if (re_resolved) {
                     if (vtable && vtable->write_raw) {
-                        bytes_written = vtable->write_raw(address, data.data(), data.size());
+                        const size_t retry_written = vtable->write_raw(address, data.data(), data.size());
+                        if (retry_written > bytes_written)
+                            bytes_written = retry_written;
                     }
-                    if (bytes_written == 0) {
-                        bytes_written = device->write_raw(address, data.data(), data.size());
+                    if (bytes_written != data.size() && device) {
+                        const size_t retry_direct_written = device->write_raw(address, data.data(), data.size());
+                        if (retry_direct_written > bytes_written)
+                            bytes_written = retry_direct_written;
                     }
                 }
             }
 
-            if (bytes_written > 0)
+            if (bytes_written == data.size())
                 return true;
+            if (bytes_written > 0) {
+                diag::log_tagged_fmt("driver",
+                    "write_memory kernel partial addr=0x%llX sz=%llu bytes=%llu",
+                    static_cast<unsigned long long>(address),
+                    static_cast<unsigned long long>(data.size()),
+                    static_cast<unsigned long long>(bytes_written));
+            }
         }
 
         if (process) {
@@ -1876,9 +1902,16 @@ namespace driver_bridge
     {
         driver_bridge_pid_call::pid_scope_t scope;
         if (!driver_bridge_pid_call::enter(scope, pid)) {
+            const std::string err = last_error();
             diag::log_tagged_fmt("driver_bridge",
-                "read_memory_for pid=%u addr=0x%llX size=%zu enter_failed",
-                pid, static_cast<unsigned long long>(address), size);
+                "read_memory_for pid=%u addr=0x%llX size=%zu enter_failed active_pid=%u status=%s last_error=%s gle=%lu",
+                pid,
+                static_cast<unsigned long long>(address),
+                size,
+                attached_pid(),
+                status().c_str(),
+                err.empty() ? "(empty)" : err.c_str(),
+                static_cast<unsigned long>(GetLastError()));
             return false;
         }
         bool ok = read_memory(address, size, out);
@@ -2161,7 +2194,18 @@ namespace driver_bridge
         kctx.cs  = ctx.cs;   kctx.ss  = ctx.ss;
         kctx.dr0 = ctx.dr0;  kctx.dr1 = ctx.dr1;  kctx.dr2 = ctx.dr2;  kctx.dr3 = ctx.dr3;
         kctx.dr6 = ctx.dr6;  kctx.dr7 = ctx.dr7;
-        return device->set_thread_context(tid, kctx, register_mask);
+        bool ok = device->set_thread_context(tid, kctx, register_mask);
+        if (!ok) {
+            diag::log_tagged_fmt("driver",
+                "set_thread_context_FAILED tid=%u mask=0x%llX rip=0x%llX rsp=0x%llX attached_pid=%u kernel_mode=%d",
+                tid,
+                static_cast<unsigned long long>(register_mask),
+                static_cast<unsigned long long>(ctx.rip),
+                static_cast<unsigned long long>(ctx.rsp),
+                attached_pid(),
+                kernel_mode ? 1 : 0);
+        }
+        return ok;
     }
 
     bool suspend_thread(uint32_t tid, uint32_t* prev_count)

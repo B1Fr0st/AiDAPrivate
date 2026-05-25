@@ -79,6 +79,27 @@ struct http_exchange {
     size_t      response_size = 0;
 };
 
+enum class tls_observation_kind_t {
+    http_tls,
+    client_handshake_failed,
+    upstream_handshake_failed,
+    sni_authority_mismatch,
+    non_http_tls,
+    tunnel_passthrough
+};
+
+struct tls_observation_t {
+    uint64_t timestamp = 0;
+    tls_observation_kind_t kind = tls_observation_kind_t::http_tls;
+    std::string client_addr;
+    uint16_t client_port = 0;
+    std::string target_host;
+    uint16_t target_port = 0;
+    std::string sni;
+    std::string alpn;
+    std::string detail;
+};
+
 struct held_wait_t {
     std::mutex                mtx;
     std::condition_variable   cv;
@@ -160,6 +181,9 @@ struct state_t {
     std::deque<std::shared_ptr<http_exchange>>  history;
     std::atomic<uint64_t>                       next_id{1};
 
+    std::mutex                                  tls_observation_mutex;
+    std::deque<tls_observation_t>               tls_observations;
+
 
     std::mutex                                                           held_mutex;
     std::condition_variable                                              held_cv;
@@ -197,6 +221,10 @@ std::vector<http_exchange> get_history(size_t max_count = 0);
 const http_exchange* find_exchange(uint64_t id);
 void clear_history();
 size_t history_count();
+
+std::vector<tls_observation_t> get_tls_observations(size_t max_count = 0);
+void clear_tls_observations();
+const char* to_string(tls_observation_kind_t kind);
 
 
 void set_intercept_enabled(bool enabled);

@@ -315,7 +315,7 @@ void instance_registry_t::compute_self_identity(int port, const std::string& bas
 std::string instance_registry_t::compute_config_entry_name(const std::string& base)
 {
     std::string sanitized = sanitize_basename_for_entry(base);
-    std::string entry = "aida-ida-" + sanitized;
+    std::string entry = "AiDA-IDA-MCP-" + sanitized;
     uint64_t h = hash_string(_self.instance_id);
     char suffix[16] = {};
     qsnprintf(suffix, sizeof(suffix), "-%04x", static_cast<unsigned>(h & 0xffff));

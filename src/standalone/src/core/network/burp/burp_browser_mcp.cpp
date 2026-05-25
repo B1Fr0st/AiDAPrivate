@@ -25,16 +25,38 @@ uint16_t default_proxy_port()
     return p == 0 ? static_cast<uint16_t>(8443) : p;
 }
 
-tool_result_t status_to_json(const browser_status_t& s)
+json status_json_body(const browser_status_t& s)
 {
     json j;
-    j["pid"]          = s.pid;
-    j["running"]      = s.running;
-    j["browser_path"] = s.browser_path;
-    j["profile_path"] = s.profile_path;
-    j["proxy_port"]   = s.proxy_port;
-    j["launched_ms"]  = s.launched_ms;
-    return tool_result_t::ok(j);
+    j["pid"]              = s.pid;
+    j["running"]          = s.running;
+    j["browser_path"]     = s.browser_path;
+    j["profile_path"]     = s.profile_path;
+    j["proxy_port"]       = s.proxy_port;
+    j["launched_ms"]      = s.launched_ms;
+    j["strategy"]         = certificate_strategy_name(s.certificate_strategy);
+    j["spki_hash_prefix"] = s.spki_hash_prefix;
+    return j;
+}
+
+bool apply_certificate_strategy_param(const json& params, browser_launch_config_t& cfg, std::string& error)
+{
+    if (params.contains("certificate_strategy") && params["certificate_strategy"].is_string()) {
+        certificate_strategy_t parsed = certificate_strategy_t::chromium_spki_allowlist;
+        if (!certificate_strategy_from_string(params["certificate_strategy"].get<std::string>(), parsed)) {
+            error = "invalid_certificate_strategy";
+            return false;
+        }
+        if (parsed == certificate_strategy_t::unsafe_ignore_all_for_debug_builds_only &&
+            !certificate_strategy_debug_only_available()) {
+            error = "unsafe_ignore_all_unavailable_in_release";
+            return false;
+        }
+        cfg.certificate_strategy = parsed;
+    }
+    if (params.contains("spki_allowlist") && params["spki_allowlist"].is_string())
+        cfg.spki_allowlist = params["spki_allowlist"].get<std::string>();
+    return true;
 }
 
 tool_result_t tool_launch(const json& params)
@@ -57,8 +79,9 @@ tool_result_t tool_launch(const json& params)
             cfg.initial_url = params["initial_url"].get<std::string>();
         if (params.contains("prefer_chrome") && params["prefer_chrome"].is_boolean())
             cfg.prefer_chrome = params["prefer_chrome"].get<bool>();
-        if (params.contains("ignore_cert_errors") && params["ignore_cert_errors"].is_boolean())
-            cfg.ignore_cert_errors = params["ignore_cert_errors"].get<bool>();
+        std::string strategy_error;
+        if (!apply_certificate_strategy_param(params, cfg, strategy_error))
+            return tool_result_t::error(strategy_error);
         if (params.contains("clear_profile_first") && params["clear_profile_first"].is_boolean())
             cfg.clear_profile_first = params["clear_profile_first"].get<bool>();
     }
@@ -75,6 +98,16 @@ tool_result_t tool_launch(const json& params)
     j["proxy_host"]   = cfg.proxy_host;
     j["proxy_port"]   = cfg.proxy_port;
     j["profile_path"] = compute_profile_path(cfg.profile_subdir);
+    j["strategy"]     = certificate_strategy_name(cfg.certificate_strategy);
+    j["spki_hash_prefix"] = spki_hash_prefix(cfg.spki_allowlist);
+    auto items = list_running();
+    for (const auto& s : items) {
+        if (s.pid == pid) {
+            j["strategy"] = certificate_strategy_name(s.certificate_strategy);
+            j["spki_hash_prefix"] = s.spki_hash_prefix;
+            break;
+        }
+    }
     return tool_result_t::ok(j);
 }
 
@@ -120,14 +153,7 @@ tool_result_t tool_list(const json& params)
     auto items = list_running();
     json arr = json::array();
     for (const auto& s : items) {
-        json j;
-        j["pid"]          = s.pid;
-        j["running"]      = s.running;
-        j["browser_path"] = s.browser_path;
-        j["profile_path"] = s.profile_path;
-        j["proxy_port"]   = s.proxy_port;
-        j["launched_ms"]  = s.launched_ms;
-        arr.push_back(j);
+        arr.push_back(status_json_body(s));
     }
     diag::log_tagged_fmt("mcp_burp", "browser_list ok count=%zu", items.size());
     json out;
@@ -150,6 +176,8 @@ tool_result_t tool_detect(const json& params)
     j["chrome_detected"] = chrome_ok;
     j["chrome_path"]     = chrome;
     j["profile_root"]    = profile_root();
+    j["default_strategy"] = certificate_strategy_name(certificate_strategy_t::chromium_spki_allowlist);
+    j["unsafe_ignore_all_available"] = certificate_strategy_debug_only_available();
     return tool_result_t::ok(j);
 }
 
@@ -169,7 +197,8 @@ void register_browser_tools(mcp_standalone::server_t& srv)
             {"profile_subdir", "string", "Subdirectory under %LOCALAPPDATA%\\AiDA for the browser profile", false},
             {"initial_url", "string", "URL to open initially. Defaults to about:blank.", false},
             {"prefer_chrome", "boolean", "Prefer Chrome over Edge when both are installed", false},
-            {"ignore_cert_errors", "boolean", "Pass --ignore-certificate-errors", false},
+            {"certificate_strategy", "string", "trust_store_only or chromium_spki_allowlist. Debug builds also allow unsafe_ignore_all_for_debug_builds_only", false},
+            {"spki_allowlist", "string", "Comma-separated Chromium SPKI SHA-256 base64 allowlist. Defaults to AiDA root CA SPKI", false},
             {"clear_profile_first", "boolean", "Delete the profile directory before launching", false},
         };
         t.read_only = false;

@@ -40,6 +40,14 @@ constexpr int64_t k_oauth_refresh_safety_margin_sec = 30;
 
 std::string s_last_error;
 
+nlohmann::json compact_tool_parameters()
+{
+    return nlohmann::json{
+        {"type", "object"},
+        {"properties", nlohmann::json::object()}
+    };
+}
+
 const char* oauth_store_key_for_profile_kind(const std::string& kind)
 {
     if (kind == "anthropic")      return "anthropic";
@@ -1086,8 +1094,8 @@ nlohmann::json standalone_ai_client_t::build_anthropic_tools(
         if (!emitted.insert(t.name).second) continue;
         arr.push_back({
             {"name", t.name},
-            {"description", t.description.substr(0, std::min(t.description.size(), static_cast<size_t>(60)))},
-            {"input_schema", {{"type", "object"}, {"properties", json::object()}}}
+            {"description", ""},
+            {"input_schema", compact_tool_parameters()}
         });
     }
 
@@ -1097,16 +1105,10 @@ nlohmann::json standalone_ai_client_t::build_anthropic_tools(
         if (qualified.empty()) continue;
         std::string prefixed = std::string("mcp::") + qualified;
         if (!emitted.insert(prefixed).second) continue;
-        std::string desc = m.value("description", std::string());
-        if (desc.size() > 200) desc.resize(200);
-        json schema = m.value("input_schema",
-                              json{{"type", "object"}, {"properties", json::object()}});
-        if (!schema.is_object())
-            schema = json{{"type", "object"}, {"properties", json::object()}};
         arr.push_back({
             {"name", prefixed},
-            {"description", desc},
-            {"input_schema", schema}
+            {"description", ""},
+            {"input_schema", compact_tool_parameters()}
         });
     }
     return arr;
@@ -1233,26 +1235,12 @@ nlohmann::json standalone_ai_client_t::build_openai_tools(
     for (auto& t : tools) {
         if (t.name == "get_tool_descriptions") continue;
         if (!seen_names.insert(t.name).second) continue;
-        json props = json::object();
-        json req   = json::array();
-        for (auto& p : t.params) {
-            json prop = {{"type", p.type}, {"description", p.description}};
-            props[p.name] = prop;
-            if (p.required) req.push_back(p.name);
-        }
-        json schema = {
-            {"type", "object"},
-            {"properties", props},
-            {"additionalProperties", false}
-        };
-        if (!req.empty()) schema["required"] = req;
-
         arr.push_back({
             {"type", "function"},
             {"function", {
                 {"name", t.name},
-                {"description", t.description.substr(0, (std::min)(t.description.size(), static_cast<size_t>(200)))},
-                {"parameters", schema}
+                {"description", ""},
+                {"parameters", compact_tool_parameters()}
             }}
         });
     }
@@ -1263,18 +1251,12 @@ nlohmann::json standalone_ai_client_t::build_openai_tools(
         if (qualified.empty()) continue;
         std::string prefixed = std::string("mcp::") + qualified;
         if (!seen_names.insert(prefixed).second) continue;
-        std::string desc = m.value("description", std::string());
-        if (desc.size() > 200) desc.resize(200);
-        json schema = m.value("input_schema",
-                              json{{"type", "object"}, {"properties", json::object()}});
-        if (!schema.is_object())
-            schema = json{{"type", "object"}, {"properties", json::object()}};
         arr.push_back({
             {"type", "function"},
             {"function", {
                 {"name", prefixed},
-                {"description", desc},
-                {"parameters", schema}
+                {"description", ""},
+                {"parameters", compact_tool_parameters()}
             }}
         });
     }
@@ -1313,23 +1295,10 @@ nlohmann::json standalone_ai_client_t::build_gemini_tools(
     for (auto& t : tools) {
         if (t.name == "get_tool_descriptions") continue;
         if (!seen_names.insert(t.name).second) continue;
-        json props = json::object();
-        json req   = json::array();
-        for (auto& p : t.params) {
-            json prop = {{"type", p.type}, {"description", p.description}};
-            props[p.name] = prop;
-            if (p.required) req.push_back(p.name);
-        }
-        json schema = {
-            {"type", "object"},
-            {"properties", props}
-        };
-        if (!req.empty()) schema["required"] = req;
-
         decls.push_back({
             {"name", t.name},
-            {"description", t.description.substr(0, (std::min)(t.description.size(), static_cast<size_t>(200)))},
-            {"parametersJsonSchema", schema}
+            {"description", ""},
+            {"parametersJsonSchema", compact_tool_parameters()}
         });
     }
 
@@ -1339,16 +1308,10 @@ nlohmann::json standalone_ai_client_t::build_gemini_tools(
         if (qualified.empty()) continue;
         std::string prefixed = std::string("mcp::") + qualified;
         if (!seen_names.insert(prefixed).second) continue;
-        std::string desc = m.value("description", std::string());
-        if (desc.size() > 200) desc.resize(200);
-        json schema = m.value("input_schema",
-                              json{{"type", "object"}, {"properties", json::object()}});
-        if (!schema.is_object())
-            schema = json{{"type", "object"}, {"properties", json::object()}};
         decls.push_back({
             {"name", prefixed},
-            {"description", desc},
-            {"parametersJsonSchema", schema}
+            {"description", ""},
+            {"parametersJsonSchema", compact_tool_parameters()}
         });
     }
     return json::array({{{"functionDeclarations", decls}}});

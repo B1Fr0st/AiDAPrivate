@@ -454,6 +454,7 @@ inline deobfuscated_result_t deobfuscate_function(uint64_t entry_addr, uint32_t 
 		return result;
 	}
 
+	symbolic_engine::detail::prepare_snapshot_for_context(snapshot, entry_addr);
 	symbolic_engine::detail::load_snapshot_into_context(ctx, snapshot);
 
 	g_state.progress_current.store(2);
@@ -484,6 +485,7 @@ inline deobfuscated_result_t deobfuscate_function(uint64_t entry_addr, uint32_t 
 
 		triton::Context block_ctx(triton::arch::ARCH_X86_64);
 		block_ctx.setMode(triton::modes::ALIGNED_MEMORY, true);
+		symbolic_engine::detail::prepare_snapshot_for_context(snapshot, block.start);
 		symbolic_engine::detail::load_snapshot_into_context(block_ctx, snapshot);
 
 		auto clean_insns = detail::strip_junk_from_block(block_ctx, block, live_out);

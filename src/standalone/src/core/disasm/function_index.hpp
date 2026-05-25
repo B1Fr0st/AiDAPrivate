@@ -487,7 +487,6 @@ namespace function_index {
 		}
 
 		inline bool static_pe_active() {
-			if (driver_bridge::attached_pid() != 0) return false;
 			if (!g_disasm.file.loaded) return false;
 			if (g_disasm.file.path.empty()) return false;
 			if (g_disasm.file.path.compare(0, 7, "live://") == 0) return false;

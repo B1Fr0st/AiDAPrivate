@@ -279,20 +279,27 @@ static void first_scan_thread(scan_config_t config) {
 	const uint64_t range_end = has_range
 		? (max_u64 - config.range_base < config.range_size ? max_u64 : config.range_base + config.range_size)
 		: 0;
+	size_t skipped_state = 0;
+	size_t skipped_guard = 0;
+	size_t skipped_protect = 0;
+	size_t skipped_writable = 0;
+	size_t skipped_exec = 0;
+	size_t skipped_type = 0;
+	size_t skipped_range = 0;
 	for (const auto& r : regions) {
-		if (r.state != 0x1000) continue;
-		if (r.protect & 0x100) continue;
+		if (r.state != 0x1000) { ++skipped_state; continue; }
+		if (r.protect & 0x100) { ++skipped_guard; continue; }
 		uint32_t base_prot = r.protect & 0xFF;
-		if (base_prot == 0x01 || base_prot == 0x00) continue;
-		if (config.writable_only && !(base_prot & 0xCC)) continue;
-		if (config.executable_exclude && (base_prot & 0xF0)) continue;
-		if (r.type == 0x40000) continue;
+		if (base_prot == 0x01 || base_prot == 0x00) { ++skipped_protect; continue; }
+		if (config.writable_only && !(base_prot & 0xCC)) { ++skipped_writable; continue; }
+		if (config.executable_exclude && (base_prot & 0xF0)) { ++skipped_exec; continue; }
+		if (r.type == 0x40000) { ++skipped_type; continue; }
 		if (has_range) {
 			const uint64_t region_start = r.base;
 			const uint64_t region_end = max_u64 - r.base < r.size ? max_u64 : r.base + r.size;
 			const uint64_t clipped_start = std::max(region_start, range_start);
 			const uint64_t clipped_end = std::min(region_end, range_end);
-			if (clipped_start >= clipped_end) continue;
+			if (clipped_start >= clipped_end) { ++skipped_range; continue; }
 			auto clipped = r;
 			clipped.base = clipped_start;
 			clipped.size = clipped_end - clipped_start;
@@ -301,6 +308,17 @@ static void first_scan_thread(scan_config_t config) {
 			scan_regions.push_back(r);
 		}
 	}
+	diag::log_tagged_fmt("mem_scanner",
+		"first_scan_thread region_filter raw=%zu eligible=%zu skipped_state=%zu skipped_guard=%zu skipped_protect=%zu skipped_writable=%zu skipped_exec=%zu skipped_type=%zu skipped_range=%zu",
+		regions.size(),
+		scan_regions.size(),
+		skipped_state,
+		skipped_guard,
+		skipped_protect,
+		skipped_writable,
+		skipped_exec,
+		skipped_type,
+		skipped_range);
 
 	if (scan_regions.empty()) {
 		diag::log_tagged_fmt("mem_scanner", "first_scan_thread no_eligible_regions raw=%zu filtered=0", regions.size());
@@ -347,6 +365,9 @@ static void first_scan_thread(scan_config_t config) {
 
 	std::vector<scan_result_t> all_results;
 	std::mutex results_mtx;
+	std::atomic<size_t> read_failures{0};
+	std::atomic<size_t> read_successes{0};
+	std::atomic<size_t> matched_regions{0};
 
 	size_t total_bytes = 0;
 	for (const auto& r : scan_regions) total_bytes += r.size;
@@ -354,8 +375,18 @@ static void first_scan_thread(scan_config_t config) {
 
 	auto scan_region = [&](const driver_bridge::memory_region_t& region) {
 		std::vector<uint8_t> buf;
-		if (!driver_bridge::read_memory(region.base, static_cast<size_t>(region.size), buf))
+		if (!driver_bridge::read_memory(region.base, static_cast<size_t>(region.size), buf)) {
+			size_t failures = read_failures.fetch_add(1, std::memory_order_acq_rel) + 1;
+			if (failures <= 16 || (failures % 256) == 0) {
+				diag::log_tagged_fmt("mem_scanner",
+					"first_scan_thread read_failed base=0x%llX size=0x%llX failures=%zu",
+					static_cast<unsigned long long>(region.base),
+					static_cast<unsigned long long>(region.size),
+					failures);
+			}
 			return;
+		}
+		read_successes.fetch_add(1, std::memory_order_acq_rel);
 
 		std::vector<scan_result_t> local;
 		local.reserve(256);
@@ -423,6 +454,14 @@ static void first_scan_thread(scan_config_t config) {
 		}
 
 		if (!local.empty()) {
+			size_t matched = matched_regions.fetch_add(1, std::memory_order_acq_rel) + 1;
+			if (matched <= 16) {
+				diag::log_tagged_fmt("mem_scanner",
+					"first_scan_thread matched_region base=0x%llX size=0x%llX local_hits=%zu",
+					static_cast<unsigned long long>(region.base),
+					static_cast<unsigned long long>(region.size),
+					local.size());
+			}
 			std::lock_guard<std::mutex> lk(results_mtx);
 			all_results.insert(all_results.end(),
 				std::make_move_iterator(local.begin()),
@@ -484,8 +523,14 @@ static void first_scan_thread(scan_config_t config) {
 
 	auto t_end = std::chrono::steady_clock::now();
 	uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
-	diag::log_tagged_fmt("mem_scanner", "first_scan_thread done regions=%zu bytes=%zu hits=%zu duration_ms=%llu",
-		scan_regions.size(), total_bytes, total, static_cast<unsigned long long>(dur_ms));
+	diag::log_tagged_fmt("mem_scanner", "first_scan_thread done regions=%zu bytes=%zu hits=%zu duration_ms=%llu read_ok=%zu read_failed=%zu matched_regions=%zu",
+		scan_regions.size(),
+		total_bytes,
+		total,
+		static_cast<unsigned long long>(dur_ms),
+		read_successes.load(std::memory_order_acquire),
+		read_failures.load(std::memory_order_acquire),
+		matched_regions.load(std::memory_order_acquire));
 
 	st.scan_progress.store(1.f);
 	st.scanning.store(false);

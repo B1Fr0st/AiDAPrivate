@@ -57,11 +57,11 @@ struct cert_injection_result_t {
 
 
 enum class pin_bypass_method {
-    patch_wintrust,
-    patch_crypt32,
-    patch_schannel,
-    patch_chrome_pins,
-    patch_dotnet_callback,
+    windows_trust,
+    windows_chain_policy,
+    windows_tls,
+    chromium_browser,
+    managed_dotnet,
     all
 };
 
@@ -73,8 +73,12 @@ struct pin_bypass_config_t {
 
 struct pin_bypass_result_t {
     bool success = false;
-    std::vector<std::string> patches_applied;
-    std::vector<std::string> patches_failed;
+    bool read_only = true;
+    bool legacy_patching_disabled = true;
+    std::string diagnostic_summary;
+    std::string recommended_action;
+    std::vector<std::string> methods_requested;
+    std::vector<std::string> disabled_operations;
 };
 
 
@@ -297,7 +301,8 @@ public:
 
     bool generate_ca_certificate(const std::string& cn, std::uint32_t validity_days,
                                  std::vector<std::uint8_t>& out_cert_der,
-                                 std::vector<std::uint8_t>& out_key_der);
+                                 std::vector<std::uint8_t>& out_key_der,
+                                 bool export_private_key = false);
 
 
     struct cert_info_t {
@@ -335,13 +340,6 @@ public:
 
 private:
     CertPinBypasser() = default;
-
-    bool patch_wintrust(std::uint32_t pid);
-    bool patch_crypt32(std::uint32_t pid);
-    bool patch_schannel_validation(std::uint32_t pid);
-    bool patch_chrome_pins(std::uint32_t pid);
-    bool patch_dotnet_callback(std::uint32_t pid);
-
 
     struct patch_record_t {
         std::uint64_t address;
